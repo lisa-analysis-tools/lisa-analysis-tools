@@ -19,12 +19,84 @@ except (ImportError, ModuleNotFoundError) as e:
 from scipy.interpolate import CubicSpline as CubicSpline_scipy
 from gpubackendtools.interpolate import CubicSplineInterpolant
 
+
+# ---------------------------------------------------------------------------
+# Configured-orbits cache
+# ---------------------------------------------------------------------------
+# ``TDIonTheFly`` is constructed once per waveform evaluation, and its
+# ``orbits`` setter used to ``deepcopy`` the incoming (unconfigured) Orbits and
+# then trigger lazy configuration. ``Orbits._configure`` re-runs a scipy
+# CubicSpline over every orbit table component, which profiling (job 12930220)
+# measured at ~752 s of the 984 s spent in the MBH waveform call -- ~76% of the
+# whole run, redone identically on every call.
+#
+# ``_configure`` writes only plain numpy state (_ltt/_x/_n/_v, t, dt,
+# pycppdetector_args) and is backend-independent, so one configured instance is
+# reusable everywhere the configuration inputs match. Entries are shared, not
+# copied: copying a configured Orbits is itself GBs of memcpy. The response
+# path treats orbits as read-only; set ``LISATOOLS_ORBITS_CACHE=0`` to restore
+# the old per-instance deepcopy if you need to mutate them.
+_ORBITS_CONFIGURED_CACHE: dict = {}
+
+
+def _orbits_cache_key(orbits) -> Optional[tuple]:
+    """Identity of everything ``Orbits._configure`` depends on, or None."""
+    try:
+        parts = [
+            type(orbits).__module__,
+            type(orbits).__name__,
+            getattr(orbits, "frame", None),
+            getattr(orbits, "armlength", None),
+            getattr(orbits, "t0", None),
+            getattr(orbits, "filename", None),
+        ]
+        for name, val in sorted(getattr(orbits, "_configure_kwargs", {}).items()):
+            if isinstance(val, np.ndarray):
+                # hash contents: t_arr defines the output grid exactly
+                parts.append((name, val.shape, val.dtype.str, hash(val.tobytes())))
+            else:
+                parts.append((name, val))
+        return tuple(parts)
+    except Exception:
+        # Anything unhashable / unexpected -> no caching, old behaviour.
+        return None
+
+
+def _get_configured_orbits(orbits):
+    """Return a configured Orbits for ``orbits``, reusing an identical one."""
+    import os
+
+    if os.environ.get("LISATOOLS_ORBITS_CACHE", "1") == "0":
+        out = deepcopy(orbits)
+        out.pycppdetector_args
+        return out
+
+    if getattr(orbits, "configured", False):
+        # Already configured by the caller: honour it, don't re-spline.
+        return orbits
+
+    key = _orbits_cache_key(orbits)
+    if key is None:
+        out = deepcopy(orbits)
+        out.pycppdetector_args
+        return out
+
+    cached = _ORBITS_CONFIGURED_CACHE.get(key)
+    if cached is None:
+        cached = deepcopy(orbits)
+        # Force the (expensive) lazy configuration exactly once per key.
+        cached.pycppdetector_args
+        _ORBITS_CONFIGURED_CACHE[key] = cached
+    return cached
+
 from lisatools.detector import EqualArmlengthOrbits, Orbits
 from lisatools.utils.utility import AET
 from lisatools.utils.constants import C_SI, YRSID_SI
 from gpubackendtools import wrapper
             
 from .parallelbase import FastLISAResponseParallelModule
+from ..utils.stagetimer import TIMING, TIMERS, TIMER_COUNTS
+from ..utils.stagetimer import stage as _stage
 from .tdiconfig import TDIConfig
 
 def get_factorial(n):
@@ -96,8 +168,10 @@ class TDIonTheFly(FastLISAResponseParallelModule):
         super().__init__(force_backend=force_backend)
 
         # setup orbits
-        self.orbits = orbits
-        self.tdi_config = tdi_config
+        with _stage("3a_orbits_setter", self.xp):
+            self.orbits = orbits
+        with _stage("3b_tdi_config_setter", self.xp):
+            self.tdi_config = tdi_config
         # setup TDI info
         
     @property
@@ -137,10 +211,14 @@ class TDIonTheFly(FastLISAResponseParallelModule):
         else:
             assert isinstance(orbits, Orbits)
 
-        self._orbits = deepcopy(orbits)
+        # Reuses an identically-configured Orbits instead of re-splining the
+        # orbit tables on every waveform call. See _get_configured_orbits.
+        with _stage("3a1_get_configured_orbits", self.xp):
+            self._orbits = _get_configured_orbits(orbits)
 
         # pycppdetector_args triggers lazy configuration if needed.
-        self.cpp_orbits = self.backend.OrbitsWrap(*self._orbits.pycppdetector_args)
+        with _stage("3a2_OrbitsWrap", self.xp):
+            self.cpp_orbits = self.backend.OrbitsWrap(*self._orbits.pycppdetector_args)
     
     @property
     def citation(self):
@@ -169,22 +247,35 @@ class TDIonTheFly(FastLISAResponseParallelModule):
         phase_ref = self.xp.zeros((self.N * self.num_sub), dtype=float)
         assert int(np.prod(self.t_arr.shape)) == self.N * self.num_sub
 
-        self.wave_gen.run_wave_tdi_wrap(
-            tdi_channels_arr,
-            tdi_amp, tdi_phase,
-            phase_ref,
-            params, self.t_arr.flatten().copy(),
-            self.N, self.num_sub, self.n_params, self.tdi_config.nchannels
-        )
+        _wg = self.wave_gen
+        with _stage("4b_run_wave_tdi_kernel", self.xp):
+            _wg.run_wave_tdi_wrap(
+                tdi_channels_arr,
+                tdi_amp, tdi_phase,
+                phase_ref,
+                params, self.t_arr.flatten().copy(),
+                self.N, self.num_sub, self.n_params, self.tdi_config.nchannels
+            )
         
         reshape_shape = (self.num_sub, self.tdi_config.nchannels, self.N)
-        return self.from_tdi_output(TDIOutput(
-            self.t_arr, 
-            tdi_amp.reshape(reshape_shape), 
-            tdi_phase.reshape(reshape_shape), 
-            phase_ref.reshape(self.t_arr.shape)
+        # Propagate THIS generator's backend to the output object (as the four
+        # sibling from_tdi_output constructors do): without it the TDIOutput
+        # falls back to get_first_backend(supported_backends()), which resolves
+        # to CUDA on any cupy-equipped box regardless of the generator's actual
+        # backend -- so a CPU/numpy generator's arrays hit a cuda interpolant
+        # in build_spline and raise the nanobind device mismatch.
+        return self._timed_from_tdi_output(TDIOutput(
+            self.t_arr,
+            tdi_amp.reshape(reshape_shape),
+            tdi_phase.reshape(reshape_shape),
+            phase_ref.reshape(self.t_arr.shape),
+            force_backend=self.backend.name.split("_")[-1],
         ), fill_splines=return_spline)
     
+    def _timed_from_tdi_output(self, tdi_output, fill_splines=False):
+        with _stage("4c_from_tdi_output_splines", self.xp):
+            return self.from_tdi_output(tdi_output, fill_splines=fill_splines)
+
     def from_tdi_output(self, tdi_output: TDIOutput, fill_splines: Optional[bool] = False) -> FDTDIOutput:
         return tdi_output
 
@@ -226,8 +317,9 @@ class TDTDIonTheFly(TDIonTheFly):
             phase = self.xp.atleast_2d(self.xp.asarray(phase))
 
             # TODO: improve when gbt is fixed up
-            amp = CubicSplineInterpolant(t_input.copy(), amp, force_backend=self.backend.name.split("_")[-1])
-            phase = CubicSplineInterpolant(t_input.copy(), phase, force_backend=self.backend.name.split("_")[-1])
+            with _stage("3c_ampphase_spline_build", self.xp):
+                amp = CubicSplineInterpolant(t_input.copy(), amp, force_backend=self.backend.name.split("_")[-1])
+                phase = CubicSplineInterpolant(t_input.copy(), phase, force_backend=self.backend.name.split("_")[-1])
             
         elif isinstance(amp, CubicSpline_scipy):
             raise NotImplementedError
@@ -284,9 +376,10 @@ class TDTDIonTheFly(TDIonTheFly):
         # time.sleep(1.0)
     @property
     def wave_gen(self) -> callable:
-        self.cpp_amp = self.backend.CubicSplineWrap(*self.amp.cpp_class_args)
-        self.cpp_phase = self.backend.CubicSplineWrap(*self.phase.cpp_class_args)
-        self._wave_gen = self.backend.TDSplineTDIWaveformWrap(self.cpp_orbits, self.cpp_tdi_config, self.cpp_amp, self.cpp_phase)
+        with _stage("4a_wave_gen_wrap_build", self.xp):
+            self.cpp_amp = self.backend.CubicSplineWrap(*self.amp.cpp_class_args)
+            self.cpp_phase = self.backend.CubicSplineWrap(*self.phase.cpp_class_args)
+            self._wave_gen = self.backend.TDSplineTDIWaveformWrap(self.cpp_orbits, self.cpp_tdi_config, self.cpp_amp, self.cpp_phase)
         return self._wave_gen
     
     def from_tdi_output(self, tdi_output: TDIOutput, fill_splines: Optional[bool] = False) -> FDTDIOutput:
