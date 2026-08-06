@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from copy import deepcopy
 from typing import Any, Callable, TYPE_CHECKING
@@ -69,7 +70,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         inner_moves: list of moves and their corresponding weights to be used for proposing new sources for the leaf.
         Tmax: maximum temperature for the temperature control.
         betas_all: array of betas for all leaves and temperatures. Shape is (nleaves_max, ntemps). If None, betas will be initialized as in TemperatureControl.
-        permute_every: number of repeats after which to permute the walkers during a temperature swap. This helps with the mixing of the chains.
+        permute_every: gate for the walker-permuting (fancy) temperature swap: ``> 0`` enables it -- it fires exactly ONCE per leaf visit, on the final in-model repeat -- and ``<= 0`` disables it entirely (``{BRANCH}_PERMUTE_EVERY`` env override). The numeric value is no longer a cadence.
         pad_out_of_prior: whether to pad proposed sources that are out of the prior bounds to avoid JIT compilation issues. If True, proposed sources that are out of the prior bounds will be replaced with the first in-prior point.
         flow_buffer_thin: keep only every ``flow_buffer_thin``-th repeat's cold-chain snapshot
             (plus the final one) in the ring buffer submitted to the flow trainer. Appending
@@ -146,7 +147,25 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
                 skip_swap_branches=None,  # will fill in after first run through move
             )
         
-        self.permute_every = permute_every
+        # ``permute_every`` is a pure gate, not a cadence: > 0 fires the
+        # walker-permuting swap once per leaf visit (on the final repeat),
+        # <= 0 disables it. Env override for a running config.
+        _p = self.branch_name.upper()
+        self.permute_every = int(
+            os.environ.get(f"{_p}_PERMUTE_EVERY", permute_every)
+        )
+
+        # Expose-invariant check (``_verify_entry_vs_acs``): "1" warn (default),
+        # "strict" raise, "0" off. ``_CHECK_LL_EVERY`` thins its cost.
+        self.check_ll_mode = (
+            os.environ.get(f"{_p}_CHECK_LL")
+            or os.environ.get("ADDREMOVE_CHECK_LL", "1")
+        ).lower()
+        self.check_ll_every = max(
+            1, int(os.environ.get(f"{_p}_CHECK_LL_EVERY", "1"))
+        )
+        self._dbg_step = 0
+
         self.pad_out_of_prior = pad_out_of_prior
         self.flow_buffer_thin = max(1, int(flow_buffer_thin))
         
@@ -231,9 +250,17 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
     def _apply_cold_chain_sources(self, coords, sign):
         """One-at-a-time waveform generation + apply to keep peak RAM flat.
 
-        ``sign=-1`` subtracts (add_back), ``sign=+1`` adds (remove). Matches
-        the previous batched path semantically but never holds more than a
-        single source's waveform in memory.
+        The ``sign`` is the sign of the template in the *residual*:
+        ``sign=+1`` adds it back (``add_back_in_cold_chain_sources``, the
+        EXPOSE step, ``r = d - h -> d``) and ``sign=-1`` subtracts it
+        (``remove_cold_chain_sources``, the FOLD-BACK step, ``r = d -> d - h``).
+        The method names describe what happens to the *fit*, the sign what
+        happens to the residual -- they read as opposites on purpose. Getting
+        this pairing backwards exposes ``d - 2h`` instead of ``d`` and silently
+        corrupts every proposal (see ``_verify_entry_vs_acs``).
+
+        Matches the previous batched path semantically but never holds more
+        than a single source's waveform in memory.
         """
         _free_pool()
         import gc
@@ -357,6 +384,85 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             coords_in, data_index, signal_gen=self.waveform_gen, **self.waveform_like_kwargs
         )
 
+    def _fancy_swap_now(self, repeat):
+        """Whether the walker-permuting (fancy) temperature swap fires now.
+
+        It fires exactly ONCE per leaf visit, on the FINAL in-model repeat:
+        the in-model stretch repeats run undisturbed, then the ensemble
+        permutes across the ladder before the updated sources fold back.
+        :attr:`permute_every` is a pure gate -- ``> 0`` enables, ``<= 0``
+        disables -- not a cadence. The old ``repeat % permute_every`` trigger
+        made the swap unreachable at stock settings (``num_repeats=10`` vs
+        ``permute_every=20`` -> it never fired in any production run) and
+        raised ``ZeroDivisionError`` at ``permute_every == 0``.
+
+        Args:
+            repeat: index of the current in-model repeat.
+
+        Returns:
+            ``True`` if the swap should permute walkers on this repeat.
+        """
+        return self.permute_every > 0 and repeat == self.num_repeats - 1
+
+    def _verify_entry_vs_acs(self, prev_logl, cold_ref, leaf):
+        """The expose invariant: the cold-chain ``prev_logl`` scored against the
+        freshly EXPOSED residual must reproduce the full ACS likelihoods from
+        just before the expose.
+
+        Algebraically ``r_exposed - h_current == r_full``, so
+        ``template_likelihood(h)`` on the exposed residual and
+        ``acs.likelihood()`` on the pre-expose residual are the same number.
+        A large per-walker SPREAD in the difference means the expose/fold
+        choreography (or the scoring path) is inconsistent with the residual
+        state -- this is the check that catches the ``d - 2h`` expose-sign
+        class of bug. A constant offset with ~zero spread is a benign
+        normalization convention.
+
+        Warns by default; ``{BRANCH}_CHECK_LL=strict`` raises, ``=0`` disables.
+
+        Args:
+            prev_logl: likelihoods at the current coords scored against the
+                exposed residual. Shape ``(ntemps, nwalkers)``; row 0 is cold.
+            cold_ref: ``acs.likelihood()`` captured before the expose.
+            leaf: leaf index, for the message.
+        """
+        if cold_ref is None:
+            return
+
+        cold = np.asarray(asnumpy(prev_logl[0]), dtype=float)
+        ref = np.asarray(asnumpy(cold_ref), dtype=float).reshape(-1)
+        if ref.size != cold.size:
+            # e.g. the ACS array holds more containers than this move's
+            # walkers -- nothing to compare against, so stay quiet.
+            return
+        ref = ref.reshape(cold.shape)
+
+        both = (
+            np.isfinite(cold) & np.isfinite(ref)
+            & (cold > -1e299) & (ref > -1e299)
+        )
+        if not np.any(both):
+            return
+
+        diff = cold[both] - ref[both]
+        spread = float(diff.max() - diff.min())
+        med = float(np.median(diff))
+        if spread <= 1e-1 and abs(med) <= 5.0:
+            return
+
+        msg = (
+            f"{self.branch_name} leaf {leaf}: EXPOSE INVARIANT VIOLATED -- "
+            f"cold prev_logl vs pre-expose ACS lnL: median offset "
+            f"{med:.6e}, spread {spread:.6e} over {int(both.sum())} walkers. "
+            "Large spread/offset means the exposed residual or scoring path "
+            "is wrong (e.g. template subtracted instead of added at expose)."
+        )
+        if self.check_ll_mode == "strict":
+            raise ValueError(msg)
+        logger.warning(msg)
+        if DEBUG_MODE:
+            breakpoint()
+
     def setup(self, model, state):
         """Per-iteration setup hook."""
         
@@ -429,6 +535,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         """
         self.setup(model, state)
         tic = time.time()
+        self._dbg_step += 1
 
         if not np.any(state.branches[self.branch_name].inds):
             ntemps, nwalkers = state.branches[self.branch_name].shape[:2]
@@ -473,7 +580,18 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
 
             ntemps_full, _, _, ndim = new_state.branches[self.branch_name].coords.shape
 
-            # remove cold chain sources
+            # Cold-chain ACS reference BEFORE the expose, consumed by the
+            # expose invariant: scoring the current coords against the exposed
+            # residual must reproduce these values.
+            _cold_ref = None
+            if (
+                self.check_ll_mode != "0"
+                and self._dbg_step % self.check_ll_every == 0
+            ):
+                _cold_ref = asnumpy(self.acs.likelihood())
+
+            # remove the cold chain sources FROM THE FIT: add their templates
+            # back into the residual (r = d - h  ->  r = d), exposing this leaf.
             removal_coords = new_state.branches[self.branch_name].coords[0, :, leaf]
             removal_coords_in = self.transform_fn.both_transforms(removal_coords)
             self.add_back_in_cold_chain_sources(removal_coords_in)
@@ -517,6 +635,12 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             #             breakpoint()
             #         else:
             #             raise ValueError(f"Large difference in log likelihood encountered: {np.abs(diff).max()}. This could be a sign of numerical issues.")
+
+            if (
+                self.check_ll_mode != "0"
+                and self._dbg_step % self.check_ll_every == 0
+            ):
+                self._verify_entry_vs_acs(prev_logl, _cold_ref, leaf)
 
             if np.any(prev_logl < -1e10) or np.any(prev_logl > 1e30):
                 logger.warning(f"Very low log likelihood encountered in propose: min = {prev_logl.min()}, max = {prev_logl.max()}. This could be a sign of numerical issues.")
@@ -691,9 +815,13 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
                     ].copy()[:, :, None]
                 }
 
-                fancy_swap = (repeat % self.permute_every == 0) and (repeat > 0)
-                #if fancy_swap:
-                    # logger.debug(f"Permuting walkers before swap.")
+                fancy_swap = self._fancy_swap_now(repeat)
+                if fancy_swap:
+                    logger.debug(
+                        "%s leaf %d repeat %d: fancy (walker-permuting) "
+                        "temperature swap",
+                        self.branch_name, leaf, repeat,
+                    )
                 compute_log_like = self.log_like_for_fancy_swaping
 
                 # TODO: check permute make sure it is okay
@@ -742,6 +870,8 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
 
             add_coords = new_state.branches[self.branch_name].coords[0, :, leaf]
             add_coords_in = self.transform_fn.both_transforms(add_coords)
+            # fold the (updated) cold-chain sources back INTO the fit:
+            # subtract their templates from the residual (r = d -> d - h_new).
             self.remove_cold_chain_sources(add_coords_in)
 
             # read out all betas from temperature controls
@@ -867,7 +997,7 @@ class MultiGPUResidualAddRemoveMove(ResidualAddOneRemoveOneMove, MultiGPUMoveBas
     inner_moves: list of moves and their corresponding weights to be used for proposing new sources for each leaf.
     Tmax: maximum temperature for the temperature control.
     betas_all: array of betas for all leaves and temperatures. Shape is (nleaves_max, ntemps). If None, betas will be initialized as in TemperatureControl.
-    permute_every: number of repeats after which to permute the walkers during a temperature swap. 
+    permute_every: gate for the walker-permuting (fancy) temperature swap: ``> 0`` enables it -- once per leaf visit, on the final in-model repeat -- ``<= 0`` disables it. Not a cadence.
     pad_out_of_prior: whether to pad proposed sources that are out of the prior bounds to avoid JIT compilation issues. If True, proposed sources that are out of the prior bounds will be replaced with the first in-prior point. 
     run_async: whether to run the waveform generation and likelihood computation asynchronously for each GPU. If True, the synchronization will happen on the python side after the kernel calls. 
     run_threaded: whether to run the waveform generation and likelihood computation in separate threads for each GPU.
