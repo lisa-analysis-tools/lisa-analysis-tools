@@ -1068,6 +1068,12 @@ def subtract_initial_signal(
                 acs.add_signal_to_residual(signals_in)
                 counter += 1
 
+                # Release the per-leaf template allocation before the next
+                # leaf's wave_gen call. Without it the pool grows by one
+                # full (nwalkers, nchannels, basis) template per injected
+                # leaf, which OOMs a many-leaf seed on a single device.
+                acs.free_gpu_memory()
+
                 # if acs.gpus is not None:
                 #     acs.synchronize()  # Ensure GPU computations are complete before logging
                 #     # acs.xp.get_default_memory_pool().free_all_blocks()
