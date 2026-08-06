@@ -117,6 +117,38 @@ class WDMComputationsBase(FastLISAResponseParallelModule):
         """
         super().__init__(force_backend=force_backend)
 
+        # ---- multi-GPU replica metadata (see ``_device_local_gb_comp`` in
+        # ``lisatools.utils.devicereplicas``) ------------------------------
+        # Everything this constructor allocates -- the chunk geometry, the
+        # WDM window, ``cpp_orbits`` / ``cpp_tdi_config`` -- lands on
+        # whatever CUDA device is current RIGHT NOW and is never migrated.
+        # Record (a) that device, so a routed launch can assert its shard's
+        # kernels are reading device-local pointers, and (b) the constructor
+        # arguments, so a non-primary shard can rebuild an equivalent comp
+        # inside its own device context. Same "remember your constructor
+        # arguments so a replica can be rebuilt" contract ``Orbits.args`` /
+        # ``DomainSettingsBase.args`` already carry; the recorded objects are
+        # the ones this instance already holds, so nothing new reaches the
+        # settings tree (pickle-safety rule).
+        #
+        # ``force_backend`` is recorded as the RESOLVED ``self.backend``, not
+        # the raw argument: a bare ``None`` would make the replica re-resolve
+        # the *process-wide* backend instead of this comp's, so a
+        # ``force_backend="cpu"`` comp on a GPU node would spawn cuda
+        # replicas. That is the same defect class as GBGPU ``3cf0f78`` /
+        # LAT ``9c224b3``; recording the object closes it here.
+        from .utils.device import current_device as _current_device
+
+        self._build_device = _current_device(self.xp)
+        self._ctor_args = (wdm_settings, t_ref)
+        self._ctor_kwargs = dict(
+            Nt_sub=Nt_sub, n_pad=n_pad, N_sparse=N_sparse,
+            tukey_alpha=tukey_alpha, use_tukey=use_tukey,
+            N_cp_sig=N_cp_sig, N_cp_orbit=N_cp_orbit,
+            orbits=orbits, tdi_config=tdi_config,
+            force_backend=self.backend, d_d=d_d, tdi_type=tdi_type,
+        )
+
         if not isinstance(wdm_settings, WDMSettings):
             raise TypeError(
                 "wdm_settings must be a lisatools.domains.WDMSettings "
@@ -231,6 +263,23 @@ class WDMComputationsBase(FastLISAResponseParallelModule):
     @property
     def xp(self) -> object:
         return self.backend.xp
+
+    @property
+    def args(self) -> tuple:
+        """Positional arguments for recreating this comp (``(wdm_settings, t_ref)``).
+
+        Mirrors :attr:`lisatools.detector.Orbits.args` /
+        :attr:`lisatools.domains.DomainSettingsBase.args`: the per-device
+        replica helper rebuilds ``type(comp)(*comp.args, **comp.kwargs)``
+        inside the owning device context so every buffer and every ``*Wrap``
+        pointer field is device-local.
+        """
+        return self._ctor_args
+
+    @property
+    def kwargs(self) -> dict:
+        """Keyword arguments for recreating this comp (see :attr:`args`)."""
+        return dict(self._ctor_kwargs)
 
     @property
     def orbits(self) -> object:
@@ -355,8 +404,25 @@ class WDMComputationsBase(FastLISAResponseParallelModule):
         inferred from where the container's residual lives so the repack stays
         on-device.
         """
-        # Already an ACA (or anything exposing the flat buffers) -> pass through.
+        # Already an ACA (or anything exposing the flat buffers) -> pass
+        # through, but ONLY if it is single-shard. The kernels read
+        # ``linear_data_arr[0]`` and index it with the caller's
+        # ``data_index``; on a multi-shard holder those indices are GLOBAL
+        # row ids while buffer 0 holds only shard 0's rows, so passing one
+        # through reads the wrong cells (or past the end) and returns a
+        # silently wrong likelihood. Multi-shard callers must go through the
+        # router, which presents one single-shard view per split.
         if hasattr(wdm_holder, "linear_data_arr"):
+            if len(wdm_holder.linear_data_arr) != 1:
+                raise NotImplementedError(
+                    "the *_wdm kernels are single-shard by contract (they "
+                    "consume linear_data_arr[0]). Multi-shard holders must "
+                    "go through the LAT shard router (lisatools.globalfit."
+                    "moves.gbbands._RoutedBandEngine), which presents one "
+                    "per-split view per call (engine ops via the instance "
+                    "router; raw-comp information matrices via the "
+                    "route_information_matrix classmethod)."
+                )
             return wdm_holder
         from .analysiscontainer import AnalysisContainer, AnalysisContainerArray
         if isinstance(wdm_holder, AnalysisContainer):

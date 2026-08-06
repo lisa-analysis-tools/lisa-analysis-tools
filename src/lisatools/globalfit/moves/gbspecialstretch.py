@@ -362,6 +362,8 @@ from .gbbands import (
     BandSorter,
     Buffer,
     SubBandBuffer,
+    _RoutedBandEngine,
+    make_routed_band_engine,
     pack_special_index,
     return_x,
     unpack_special_index,
@@ -872,8 +874,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # the parent ACA has no per-slot ``min_freq_inds``, so the FD engine
         # falls back to ``start_freq_inds`` (one shared window start per
         # walker row).
-        self._likelihood_engine = make_band_likelihood_engine(
+        self._likelihood_engine = make_routed_band_engine(
             self._basis_settings,
+            xp=self.xp,
             gb=self.gb,
             gb_fd_comp=self.gb_fd_comp,
             gb_wdm_comp=self.gb_wdm_comp,
@@ -2269,21 +2272,29 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         _test_inds = np.asarray(self.parameter_transforms.fill_dict["test_inds"])
         walker_inds = band_sorter.walker_inds[ids].astype(xp.int32)
 
+        # Routed per shard: this runs against the PARENT residual ACA, which
+        # is sharded across GPUs on a multi-GPU run (``run.py`` builds it with
+        # ``gpus=``), while every ``information_matrix`` implementation is
+        # single-shard by contract -- the FD binding and
+        # ``STFTGBComputations._resolve_info_group`` both raise on a
+        # multi-split holder, and the WDM one would read shard 0's rows with
+        # global indices. ``route_information_matrix`` partitions the sources
+        # by the owning shard of their walker (each source's Fisher depends
+        # only on its walker's PSD), runs each group inside its owning device
+        # context against a device-local comp replica, and reassembles the
+        # ``(num_bin, nd, nd)`` stack. Single-shard holders pass straight
+        # through, byte-identical.
         if isinstance(self._basis_settings, STFTSettings):
-            info_phys = self.gb_stft_comp.information_matrix(
-                params_phys, model.analysis_container_arr,
-                inds=_test_inds, noise_index=walker_inds,
-            )
+            _info_comp = self.gb_stft_comp
         elif isinstance(self._basis_settings, FDSettings):
-            info_phys = self.gb_fd_comp.information_matrix(
-                params_phys, model.analysis_container_arr,
-                inds=_test_inds, noise_index=walker_inds,
-            )
+            _info_comp = self.gb_fd_comp
         else:
-            info_phys = self.gb_wdm_comp.information_matrix(
-                params_phys, model.analysis_container_arr,
-                inds=_test_inds, noise_index=walker_inds,
-            )
+            _info_comp = self.gb_wdm_comp
+
+        info_phys = _RoutedBandEngine.route_information_matrix(
+            _info_comp, model.analysis_container_arr, params_phys,
+            inds=_test_inds, noise_index=walker_inds,
+        )
 
         # Conditioning scales for the sampling basis (fdot spans ~1e-13 in
         # sampled units; without the rescale the Fisher inversion is
@@ -3319,13 +3330,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # assert np.all(start_diffs < 2.0)
         num_active_leaves = new_state.branches["gb"].inds[0].sum(axis=-1) # cold chain only
         logger.info(f"Number of active leaves before proposal: {num_active_leaves}")
-        # TODO: make sure band temps transfers out
+
         st_prop = time.perf_counter()
         with tm.span("run_proposal"):
             ll_change_log, prop_counts, acc_counts = self.run_proposal(
                 model, new_state, band_sorter, band_temps
             )
         et_prop = time.perf_counter()
+        
         # Diagnostic: per-temperature alive source counts after run_proposal
         _alive_per_temp_post_prop = [
             int(band_sorter.inds[band_sorter.temp_inds == _t].sum()) for _t in range(ntemps)
@@ -3333,10 +3345,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         logger.info(f"Alive sources per temp after run_proposal: {_alive_per_temp_post_prop}")
         logger.info(f"Runtime of {self.name} proposal is {round(et_prop - st_prop,3)} seconds.")
 
-        # TODO ask michael about this print("NEED TO FIX ANALYSIS CONTAINER extra factor")
         ll_change_sum = ll_change_log.sum(axis=-1)
         new_state.log_like[0] += _to_numpy(ll_change_sum[0])
 
+        # ! THIS HAS CHANGED, WHY and should we be more thourough with checking (domain dependent)?
         with tm.span("ll_checks"):
             ll_after = model.analysis_container_arr.likelihood()
         check = ll_after - new_state.log_like[0] - start_diffs
@@ -3362,9 +3374,6 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self.temperature_control.swaps_accepted = np.zeros(ntemps - 1)
         self.temperature_control.swaps_proposed = np.zeros(ntemps - 1)
 
-        # TODO: move this and check if it is needed
-        # self.nchannels = model.analysis_container_arr.nchannels
-
         band_swaps_accepted = self.xp.zeros((len(self.band_edges) - 1, self.ntemps - 1), dtype=int)
         band_swaps_proposed = self.xp.zeros((len(self.band_edges) - 1, self.ntemps - 1), dtype=int)
 
@@ -3377,8 +3386,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # and False
         ):
             st_temp = time.perf_counter()
-            with tm.span("ll_checks"):
-                ll_before1 = model.analysis_container_arr.likelihood()
+            # with tm.span("ll_checks"):
+            #     ll_before1 = model.analysis_container_arr.likelihood()
 
             with tm.span("run_tempering"):
                 ll_change_sum_temp, band_swaps_accepted, band_swaps_proposed = self.run_tempering(
@@ -3411,7 +3420,6 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # ]
             # logger.info(f"Alive sources per temp after run_tempering: {_alive_per_temp_post_temp}")
 
-        # TODO ask michael about this print("make sure this works for rj")
         with tm.span("write_back"):
             self._write_back_state(new_state, band_sorter)
 

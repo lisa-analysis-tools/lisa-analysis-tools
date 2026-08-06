@@ -49,6 +49,8 @@ from ...analysiscontainer import (
 )
 from ...domains import DomainSettingsBase, FDSettings, STFTSettings, WDMSettings
 from ...sensitivity import SensitivityMatrixBase
+from ...utils.device import device_context
+from ...utils.devicereplicas import device_local_gb_comp, device_local_orbits
 from ...utils.parallelbase import LISAToolsParallelModule
 from ...utils.utility import asnumpy, get_array_module
 
@@ -59,6 +61,7 @@ __all__ = [
     "Buffer",
     "BandSorter",
     "BandScheduler",
+    "make_routed_band_engine",
 ]
 
 logger = logging.getLogger(__name__)
@@ -192,6 +195,783 @@ class BandScheduler:
         return inds_fill, self.cell_specials[new_cells]
 
 
+class _ShardHolderView:
+    """Single-shard holder view over one GPU split of a multi-shard ACA.
+
+    The gbgpu FD and WDM band engines are single-shard by contract: they
+    consume ``holder.linear_data_arr[0]`` / ``linear_psd_arr[0]``, index rows
+    by an intra-buffer ``data_index``, and cache pointer-bound bindings on the
+    holder. This view presents ONE split of a multi-shard
+    :class:`~lisatools.analysiscontainer.AnalysisContainerArray` (a
+    :class:`SubBandBuffer` or the parent residual ACA) through exactly that
+    protocol:
+
+    * ``linear_data_arr`` / ``linear_psd_arr`` are one-element lists holding
+      the owning split's live buffer (zero-copy);
+    * ``acs_total_entries`` is the split's row count -- engine row indices
+      are INTRA-shard (:class:`_RoutedBandEngine` translates);
+    * ``min_freq_inds`` / ``start_freq_ind`` / ``slab_min_f`` are persistent
+      per-shard stores refreshed IN PLACE from the parent
+      (:meth:`refresh_row_metadata`) so the engines' pointer-binding contract
+      survives cell swaps;
+    * everything else (settings, df, xp, ...) delegates to the parent.
+
+    Engine bindings (``_gb_fd_binding``) cache on this object, so a view must
+    live exactly as long as its shard buffers: the router stores views on the
+    holder itself (``holder._shard_holder_views``), which dies with the holder
+    at proposal teardown (memory-lifecycle rule).
+
+    .. note::
+       The STFT engine does NOT use this view -- it shards internally via
+       ``STFTBandLikelihoodEngine._split_plan`` and needs the real
+       multi-shard ACA (it indexes ``cpp_splits`` alongside
+       ``linear_data_arr``). See :func:`make_routed_band_engine`.
+    """
+
+    def __init__(self, parent, split_index: int):
+        self._parent = parent
+        self._split = int(split_index)
+        rows = np.asarray(asnumpy(parent.gpu_splits[self._split]), dtype=int)
+        self._rows = rows
+        self.acs_total_entries = int(rows.shape[0])
+        self.device = (
+            None if parent.gpus is None else int(parent.gpus[self._split])
+        )
+        self.gpus = None if parent.gpus is None else [self.device]
+        self.gpu_splits = [np.arange(rows.shape[0])]
+        self.split_map = np.zeros(rows.shape[0], dtype=int)
+        self.gpu_map = (
+            np.zeros(rows.shape[0], dtype=int)
+            if self.device is None
+            else np.full(rows.shape[0], self.device, dtype=int)
+        )
+        # Intra-shard row id per row, i.e. the identity on a single-shard
+        # view. Mirrors AnalysisContainerArray.ac_to_intra so anything that
+        # resolves intra-shard positions off the holder keeps working.
+        self.ac_to_intra = np.arange(rows.shape[0], dtype=np.int32)
+        self._min_freq_inds_view = None
+        self._start_freq_ind_view = None
+        self._slab_min_f_view = None
+        self.refresh_row_metadata()
+
+    @property
+    def rows(self):
+        """Global row ids owned by this shard (ascending)."""
+        return self._rows
+
+    @property
+    def linear_data_arr(self):
+        return [self._parent.linear_data_arr[self._split]]
+
+    @property
+    def linear_psd_arr(self):
+        return [self._parent.linear_psd_arr[self._split]]
+
+    @property
+    def data_shaped(self):
+        return [self._parent.data_shaped[self._split]]
+
+    @property
+    def psd_shaped(self):
+        return [self._parent.psd_shaped[self._split]]
+
+    @property
+    def cpp_splits(self):
+        """This shard's computation group, as a ONE-element list.
+
+        MUST be explicit for the same reason as :attr:`slab_min_f`:
+        ``__getattr__`` would forward the parent's FULL split list, so a view
+        that is single-shard in every other respect would advertise
+        ``len(cpp_splits) > 1``. The live consumer is
+        ``STFTGBComputations._resolve_info_group``, which reads
+        ``len(cpp_splits)`` to decide whether it is looking at a single split
+        and raises ``NotImplementedError`` otherwise -- so the delegated form
+        makes :meth:`_RoutedBandEngine.route_information_matrix` fail on
+        exactly the multi-shard holders it exists to serve.
+
+        Absent on the parent (FD / WDM holders carry no computation groups)
+        -> ``None``, matching ``getattr(holder, "cpp_splits", None)`` at the
+        call sites.
+        """
+        splits = getattr(self._parent, "cpp_splits", None)
+        return None if splits is None else [splits[self._split]]
+
+    @property
+    def xp(self):
+        return self._parent.xp
+
+    @property
+    def min_freq_inds(self):
+        return self._min_freq_inds_view
+
+    @property
+    def start_freq_ind(self):
+        return self._start_freq_ind_view
+
+    @property
+    def slab_min_f(self):
+        """Per-slot narrow-slab layer origins SLICED to this shard's rows.
+
+        MUST be an explicit property: ``__getattr__`` delegation would hand
+        back the parent's **global-slot** array while every index the engines
+        pass is **intra-shard** -- so a source in shard-1 row 0 would be
+        folded against buffer slot 0's slab origin instead of its own.
+
+        ``None`` on this branch in practice: the per-band narrow-slab
+        machinery (``band_slab_Nf`` / ``recommend_band_slab_layers``, dev's
+        ``dd23c5b``) is not ported here, so no holder carries ``slab_min_f``.
+        Kept because it costs nothing and because getting this wrong is
+        silent -- when the slab work lands, the correct slice is already in
+        place rather than needing to be rediscovered.
+
+        ``band_slab_Nf`` needs no such override: it is a scalar extent shared
+        by every slab, hence shard-invariant, and keeps delegating.
+        """
+        return self._slab_min_f_view
+
+    def refresh_row_metadata(self) -> None:
+        """Re-slice per-row metadata from the parent.
+
+        Updates the persistent per-shard ``min_freq_inds`` / ``slab_min_f``
+        stores IN PLACE (the FD binding holds a pointer to the former)
+        instead of rebinding.
+        """
+        xp = self._parent.xp
+        starts = getattr(self._parent, "min_freq_inds", None)
+        if starts is None:
+            self._min_freq_inds_view = None
+        else:
+            vals_host = np.ascontiguousarray(
+                np.asarray(asnumpy(starts))[self._rows].astype(np.int32)
+            )
+            with device_context(xp, self.device):
+                if (
+                    self._min_freq_inds_view is not None
+                    and self._min_freq_inds_view.shape == vals_host.shape
+                ):
+                    self._min_freq_inds_view[...] = xp.asarray(vals_host)
+                else:
+                    self._min_freq_inds_view = xp.ascontiguousarray(
+                        xp.asarray(vals_host)
+                    )
+        sfi = getattr(self._parent, "start_freq_ind", None)
+        if sfi is None:
+            self._start_freq_ind_view = None
+        else:
+            arr = np.asarray(asnumpy(sfi))
+            self._start_freq_ind_view = arr[self._rows] if arr.ndim else arr
+        # Narrow per-band slab origins: one value PER BUFFER SLOT, so the
+        # shard's view must carry its own rows' values in intra-shard order
+        # (see the ``slab_min_f`` property). Refreshed in place like
+        # ``min_freq_inds`` so a cell swap on the parent reaches every view.
+        slab = getattr(self._parent, "slab_min_f", None)
+        if slab is None:
+            self._slab_min_f_view = None
+        else:
+            slab_host = np.ascontiguousarray(
+                np.asarray(asnumpy(slab))[self._rows].astype(np.int32)
+            )
+            with device_context(xp, self.device):
+                if (
+                    self._slab_min_f_view is not None
+                    and self._slab_min_f_view.shape == slab_host.shape
+                ):
+                    self._slab_min_f_view[...] = xp.asarray(slab_host)
+                else:
+                    self._slab_min_f_view = xp.ascontiguousarray(
+                        xp.asarray(slab_host)
+                    )
+
+    def __len__(self) -> int:
+        # The engines read ``len(holder)`` as the shard's row (cell) count
+        # -> ``num_data``/``num_noise`` for the flat single-shard buffer.
+        # MUST be an explicit dunder: ``len()`` resolves ``__len__`` on the
+        # TYPE, bypassing ``__getattr__`` delegation, so a parent-forwarded
+        # ``__len__`` is never seen. Mirrors AnalysisContainerArray.__len__
+        # (== the number of containers on this split).
+        return int(self.acs_total_entries)
+
+    def __getattr__(self, name):
+        # Guard dunder/underscore probing (deepcopy/pickle safety rule);
+        # delegate the public long tail (settings, df, nchannels, ...).
+        # NOTE: implicitly-invoked dunders (len(), iter(), ...) resolve on
+        # the type and never reach here -- define each one explicitly above.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._parent, name)
+
+
+class _RoutedBandEngine:
+    """Multi-shard router in front of a single-shard band likelihood engine.
+
+    Wraps a :func:`gbgpu.gb_likelihood.make_band_likelihood_engine` product.
+    Single-shard holders pass straight through (no overhead). For multi-shard
+    holders each call's rows are partitioned by owning split
+    (``holder.split_map``), run per shard inside the owning device context
+    against a persistent :class:`_ShardHolderView`, and the outputs are
+    reassembled full-length on the caller's device. Cross-shard movement is
+    host-routed (no P2P), matching the ACA conventions. Per-launch
+    host->device upload of wrapper structs (LAT-wide convention) keeps kernel
+    config device-local under each context.
+
+    The GB comps a shard's kernels read (chunk geometry, WDM window,
+    ``OrbitsWrap`` / ``TDIConfigWrap`` pointer fields, and under sig-het the
+    whole heterodyne reference stash) are allocated once, on the device
+    current at variant-build time. A shard launching on a different device
+    would dereference them across the PCIe link -- a silent peer-access tax
+    with P2P, an illegal access without it -- and, for sig-het, would share
+    ONE reference stash, ONE slot->reference map and ONE ``_in_model`` flag
+    between shards whose slot ids both start at zero. Both are closed by
+    per-device replicas: ``engine_factory`` (supplied by
+    :func:`make_routed_band_engine`) rebuilds the whole engine around
+    device-local comps for any shard whose device differs from the
+    prototype's, and the raw-comp class methods resolve the same replica
+    through :meth:`_comp_for`. The prototype's own device reuses the existing
+    engine object, so single-shard / primary-shard behaviour is unchanged and
+    allocates nothing.
+    """
+
+    #: fill_template kwargs holding one value PER BUFFER SLOT -- sliced to the
+    #: shard's rows so intra-shard indexing stays aligned.
+    _PER_SLOT_KWARGS = ("slab_min_f",)
+
+    def __init__(self, engine, engine_factory=None):
+        self._engine = engine
+        # device -> engine replica, populated lazily on the first multi-shard
+        # call that lands on a non-prototype device. The prototype's device
+        # maps to ``engine`` ITSELF (never a copy), so ``len(gpus) <= 1``
+        # returns the same object and allocates nothing.
+        self._engine_factory = engine_factory
+        self._engine_by_device = {}
+
+    @property
+    def wrapped_engine(self):
+        """The underlying single-shard engine."""
+        return self._engine
+
+    @property
+    def device_engines(self) -> dict:
+        """``{device: engine replica}`` built so far (diagnostics/tests)."""
+        return self._engine_by_device
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._engine, name)
+
+    # ---------------- per-device comp / engine replicas ----------------
+
+    @staticmethod
+    def _comp_build_device(comp):
+        """The CUDA device a GB comp's buffers were allocated on, or None.
+
+        ``_build_device`` is recorded by ``WDMComputationsBase.__init__``,
+        ``GBFDComputations.__init__`` and ``STFTGBComputations.__init__``. The
+        sig-het wrapper records none of its own -- ``for_band_engine`` runs in
+        the same device context as its chunked delegate -- so it reports the
+        delegate's. The final fallback reads residency straight off a known
+        device buffer, which keeps the answer meaningful for a comp built
+        before the recording existed.
+        """
+        dev = getattr(comp, "_build_device", None)
+        if dev is None:
+            dev = getattr(getattr(comp, "chunked", None), "_build_device", None)
+        if dev is None:
+            dev = getattr(getattr(comp, "wdm_window", None), "device", None)
+            dev = getattr(dev, "id", None)
+        return None if dev is None else int(dev)
+
+    @classmethod
+    def _engine_comp(cls, engine):
+        """The GB comp an engine scores through (WDM, FD or STFT), or None."""
+        for attr in ("gb_comps", "gb_fd_comp", "gb_stft_comp"):
+            comp = getattr(engine, attr, None)
+            if comp is not None:
+                return comp
+        return None
+
+    @classmethod
+    def _primary_device(cls, comp, holder):
+        """Device whose shard reuses ``comp`` unchanged.
+
+        The comp's OWN build device when it recorded one -- not blindly
+        ``gpus[0]``: a comp constructed before the run pinned its main device
+        lives on device 0 even when ``gpus=[2, 3]``, and keying on the
+        recorded value replicates for every shard (correct) instead of
+        handing device-0 pointers to the ``gpus[0]`` shard (wrong).
+        """
+        dev = None if comp is None else cls._comp_build_device(comp)
+        if dev is not None:
+            return dev
+        gpus = getattr(holder, "gpus", None)
+        return None if not gpus else int(gpus[0])
+
+    @classmethod
+    def _assert_comp_device(cls, comp, view):
+        """Fail loudly when a shard is about to launch on foreign buffers.
+
+        Cheap permanent guard: the moment a new comp-level device buffer is
+        added without a matching replica path, this turns "mysteriously slow,
+        or an illegal access on a non-P2P node" into a message that names the
+        fix. A comp that records nothing (CPU, or an unrecognised comp type)
+        is skipped rather than guessed at.
+        """
+        dev = getattr(view, "device", None)
+        if comp is None or dev is None:
+            return
+        build_dev = cls._comp_build_device(comp)
+        if build_dev is not None and build_dev != int(dev):
+            raise RuntimeError(
+                f"GB comp {type(comp).__name__} holds buffers on device "
+                f"{build_dev} but this shard launches on device {dev}: the "
+                "kernel would read across devices (a silent P2P tax, or an "
+                "illegal access on a node without peer access). A per-device "
+                "comp replica is needed -- see device_local_gb_comp in "
+                "lisatools.utils.devicereplicas."
+            )
+
+    @classmethod
+    def _comp_for(cls, comp, holder, view):
+        """The device-local replica of ``comp`` for this shard's device."""
+        dev = getattr(view, "device", None)
+        if comp is None or dev is None:
+            return comp
+        out = device_local_gb_comp(
+            comp, holder.xp, int(dev), cls._primary_device(comp, holder)
+        )
+        cls._assert_comp_device(out, view)
+        return out
+
+    def _engine_for(self, holder, view):
+        """The likelihood engine this shard must run on.
+
+        The prototype's device (and any holder/engine without the metadata to
+        do better) gets ``self._engine`` itself. Every other device gets one
+        cached replica built through ``engine_factory`` -- which rebuilds the
+        engine around device-local comps -- so the shard's kernels, its
+        coefficient stash and its ``_in_model`` state are all its own.
+        """
+        dev = getattr(view, "device", None)
+        if dev is None or self._engine_factory is None:
+            return self._engine
+        primary = self._primary_device(self._engine_comp(self._engine), holder)
+        if primary is not None and int(dev) == int(primary):
+            return self._engine
+        engine = self._engine_by_device.get(int(dev))
+        if engine is None:
+            engine = self._engine_factory(int(dev), primary)
+            self._engine_by_device[int(dev)] = engine
+        self._assert_comp_device(self._engine_comp(engine), view)
+        return engine
+
+    # ---------------- shard bookkeeping ----------------
+
+    @staticmethod
+    def _is_multi(holder) -> bool:
+        return len(holder.linear_data_arr) > 1
+
+    @staticmethod
+    def _shard_views(holder):
+        views = getattr(holder, "_shard_holder_views", None)
+        n = len(holder.linear_data_arr)
+        if views is None or len(views) != n:
+            views = [_ShardHolderView(holder, s) for s in range(n)]
+            holder._shard_holder_views = views
+        else:
+            for v in views:
+                v.refresh_row_metadata()
+        return views
+
+    @staticmethod
+    def _partition(holder, data_index, noise_index=None):
+        """Per-shard ``(positions, intra_data, intra_noise)`` partition.
+
+        ``positions`` index into the call's row batch; ``intra_*`` are the
+        corresponding intra-shard buffer rows. ``data_index`` and
+        ``noise_index`` rows must be co-located on the same shard.
+        """
+        idx = np.asarray(asnumpy(data_index), dtype=int)
+        split_map = np.asarray(asnumpy(holder.split_map), dtype=int)
+        intra = np.empty(int(holder.acs_total_entries), dtype=int)
+        for rows in holder.gpu_splits:
+            rr = np.asarray(asnumpy(rows), dtype=int)
+            intra[rr] = np.arange(rr.shape[0])
+        nidx = None
+        if noise_index is not None:
+            nidx = np.asarray(asnumpy(noise_index), dtype=int)
+            if not np.array_equal(split_map[idx], split_map[nidx]):
+                raise ValueError(
+                    "data_index and noise_index rows must live on the same "
+                    "shard (cross-shard noise rows are unsupported)."
+                )
+        parts = []
+        for s in range(len(holder.linear_data_arr)):
+            pos = np.where(split_map[idx] == s)[0]
+            parts.append((
+                pos,
+                intra[idx[pos]],
+                None if nidx is None else intra[nidx[pos]],
+            ))
+        return parts
+
+    @staticmethod
+    def _assemble(num, pieces, default, xp):
+        """Host-assemble per-shard outputs into one xp array (row order).
+
+        ``pieces`` is ``[(positions, host_values_or_None), ...]``. Returns
+        None when every shard produced None (e.g. ``phase_angle`` without
+        phase maximisation).
+        """
+        first = next(
+            (np.asarray(v) for _, v in pieces if v is not None), None
+        )
+        if first is None:
+            return None
+        out = np.full(
+            (num,) + tuple(first.shape[1:]), default, dtype=first.dtype
+        )
+        for pos, vals in pieces:
+            if vals is None or len(pos) == 0:
+                continue
+            out[pos] = np.asarray(vals)
+        return xp.asarray(out)
+
+    def _mirror_engine_outputs(self):
+        """Refresh routed-output attrs from the wrapped engine after a
+        passthrough call so stale routed values never shadow them."""
+        for name in ("d_h_out", "h_h_out", "phase_angle", "kept_out"):
+            if hasattr(self._engine, name):
+                setattr(self, name, getattr(self._engine, name))
+
+    # ---------------- routed engine protocol ----------------
+
+    def fill_template(self, holder, params_phys, params_index, N_vals, *,
+                      factor, waveform_kwargs, **kwargs):
+        if not self._is_multi(holder):
+            return self._engine.fill_template(
+                holder, params_phys, params_index, N_vals,
+                factor=factor, waveform_kwargs=waveform_kwargs, **kwargs)
+        xp = holder.xp
+        views = self._shard_views(holder)
+        parts = self._partition(holder, params_index)
+        params_host = asnumpy(params_phys)
+        N_host = None if N_vals is None else asnumpy(N_vals)
+        slot_kwargs_host = {
+            k: np.asarray(asnumpy(kwargs[k]))
+            for k in self._PER_SLOT_KWARGS
+            if kwargs.get(k) is not None
+        }
+        for view, (pos, intra, _) in zip(views, parts):
+            if pos.shape[0] == 0:
+                continue
+            kw_s = dict(kwargs)
+            engine = self._engine_for(holder, view)
+            with device_context(xp, view.device):
+                for k, host_vals in slot_kwargs_host.items():
+                    kw_s[k] = xp.asarray(host_vals[view.rows])
+                engine.fill_template(
+                    view, xp.asarray(params_host[pos]), intra,
+                    None if N_host is None else xp.asarray(N_host[pos]),
+                    factor=factor, waveform_kwargs=waveform_kwargs, **kw_s)
+
+    def get_ll(self, holder, params_phys, *, data_index, noise_index,
+               N_vals, phase_maximize=False, waveform_kwargs, **kwargs):
+        if not self._is_multi(holder):
+            out = self._engine.get_ll(
+                holder, params_phys, data_index=data_index,
+                noise_index=noise_index, N_vals=N_vals,
+                phase_maximize=phase_maximize,
+                waveform_kwargs=waveform_kwargs, **kwargs)
+            self._mirror_engine_outputs()
+            return out
+        xp = holder.xp
+        views = self._shard_views(holder)
+        parts = self._partition(holder, data_index, noise_index)
+        num = int(params_phys.shape[0])
+        params_host = asnumpy(params_phys)
+        N_host = None if N_vals is None else asnumpy(N_vals)
+        ll_p, dh_p, hh_p, ang_p, kept_p = [], [], [], [], []
+        for view, (pos, intra, intra_noise) in zip(views, parts):
+            if pos.shape[0] == 0:
+                continue
+            engine = self._engine_for(holder, view)
+            with device_context(xp, view.device):
+                ll_s = engine.get_ll(
+                    view, xp.asarray(params_host[pos]),
+                    data_index=intra,
+                    noise_index=intra if intra_noise is None else intra_noise,
+                    N_vals=None if N_host is None else xp.asarray(N_host[pos]),
+                    phase_maximize=phase_maximize,
+                    waveform_kwargs=waveform_kwargs, **kwargs)
+                ll_p.append((pos, asnumpy(ll_s)))
+                dh_p.append((pos, asnumpy(engine.d_h_out)))
+                hh_p.append((pos, asnumpy(engine.h_h_out)))
+                ang = getattr(engine, "phase_angle", None)
+                ang_p.append((pos, None if ang is None else asnumpy(ang)))
+                kept = getattr(engine, "kept_out", None)
+                kept_p.append((pos, None if kept is None else asnumpy(kept)))
+        ll = self._assemble(num, ll_p, -1e300, xp)
+        if ll is None:
+            ll = xp.full(num, -1e300)
+        self.d_h_out = self._assemble(num, dh_p, 0.0, xp)
+        self.h_h_out = self._assemble(num, hh_p, 0.0, xp)
+        self.phase_angle = self._assemble(num, ang_p, 0.0, xp)
+        kept_arr = self._assemble(num, kept_p, False, xp)
+        self.kept_out = (
+            xp.ones(num, dtype=bool) if kept_arr is None else kept_arr
+        )
+        return ll
+
+    def get_swap_ll(self, holder, params_remove_phys, params_add_phys, *,
+                    data_index, noise_index, N_vals, phase_maximize=False,
+                    waveform_kwargs, **kwargs):
+        if not self._is_multi(holder):
+            return self._engine.get_swap_ll(
+                holder, params_remove_phys, params_add_phys,
+                data_index=data_index, noise_index=noise_index,
+                N_vals=N_vals, phase_maximize=phase_maximize,
+                waveform_kwargs=waveform_kwargs, **kwargs)
+        from gbgpu.gb_likelihood import SwapLLResult
+
+        xp = holder.xp
+        views = self._shard_views(holder)
+        parts = self._partition(holder, data_index, noise_index)
+        num = int(params_add_phys.shape[0])
+        rem_host = asnumpy(params_remove_phys)
+        add_host = asnumpy(params_add_phys)
+        N_host = None if N_vals is None else asnumpy(N_vals)
+        fields = ("ll_diff", "d_h_add", "d_h_remove", "hh_add",
+                  "hh_remove", "hh_cross", "opt_snr_add", "phase_angle",
+                  "kept")
+        pieces = {f: [] for f in fields}
+        for view, (pos, intra, intra_noise) in zip(views, parts):
+            if pos.shape[0] == 0:
+                continue
+            engine = self._engine_for(holder, view)
+            with device_context(xp, view.device):
+                res = engine.get_swap_ll(
+                    view, xp.asarray(rem_host[pos]), xp.asarray(add_host[pos]),
+                    data_index=intra,
+                    noise_index=intra if intra_noise is None else intra_noise,
+                    N_vals=None if N_host is None else xp.asarray(N_host[pos]),
+                    phase_maximize=phase_maximize,
+                    waveform_kwargs=waveform_kwargs, **kwargs)
+                for f in fields:
+                    v = getattr(res, f)
+                    pieces[f].append((pos, None if v is None else asnumpy(v)))
+        defaults = dict(ll_diff=-1e300, opt_snr_add=0.0, kept=False)
+        out = {}
+        for f in fields:
+            out[f] = self._assemble(num, pieces[f], defaults.get(f, 0.0), xp)
+        if out["ll_diff"] is None:
+            out["ll_diff"] = xp.full(num, -1e300)
+        if out["opt_snr_add"] is None:
+            out["opt_snr_add"] = xp.zeros(num)
+        if out["kept"] is None:
+            out["kept"] = xp.zeros(num, dtype=bool)
+        return SwapLLResult(**out)
+
+    def setup_in_model(self, holder, params_phys, data_index, N_vals=None):
+        """Route the per-shard in-model reference build (sig-het).
+
+        A truthy return means the comp built heterodyne references: a
+        coefficient stash, a slot->reference map and an ``_in_model`` flag,
+        all held on the comp and all indexed by INTRA-shard slot ids. Two
+        shards therefore need two comps -- their slot ids both start at zero,
+        so a shared comp would have the second shard's build silently PATCH
+        the first shard's references (the ``_in_model`` flag makes the second
+        call take the mid-block patch branch), and every subsequent
+        ``get_ll`` would resolve references through the wrong map. With
+        ``engine_factory`` supplied each shard resolves to its own engine and
+        its own comp, so each takes the fresh-build branch against its own
+        residual slabs. Without one, the collision is refused loudly rather
+        than computed wrongly.
+        """
+        if not self._is_multi(holder):
+            return self._engine.setup_in_model(
+                holder, params_phys, data_index, N_vals=N_vals)
+        xp = holder.xp
+        views = self._shard_views(holder)
+        parts = self._partition(holder, data_index)
+        params_host = asnumpy(params_phys)
+        N_host = None if N_vals is None else asnumpy(N_vals)
+        built_on = set()
+        for view, (pos, intra, _) in zip(views, parts):
+            if pos.shape[0] == 0:
+                continue
+            engine = self._engine_for(holder, view)
+            with device_context(xp, view.device):
+                ret = engine.setup_in_model(
+                    view, xp.asarray(params_host[pos]), intra,
+                    N_vals=None if N_host is None else xp.asarray(N_host[pos]))
+            if not ret:
+                continue
+            if id(engine) in built_on:
+                self.clear_in_model()
+                raise NotImplementedError(
+                    "sig-het in-model references are per-comp state, but two "
+                    "shards resolved to the SAME likelihood engine: the "
+                    "second shard's build would patch the first's references "
+                    "(intra-shard slot ids collide by construction). Build "
+                    "the router with engine_factory= so every shard device "
+                    "gets its own comp replica, or run the sig-het in-model "
+                    "path on a single GPU."
+                )
+            built_on.add(id(engine))
+        return None
+
+    def clear_in_model(self):
+        """Clear the in-model reference on EVERY per-device engine.
+
+        Missed fan-out is a silent bug, not an error: a replica that keeps
+        ``_in_model`` set makes the next block's first ``setup_in_model`` on
+        that device take the mid-block patch branch against a stale slot map.
+        """
+        for engine in self._engine_by_device.values():
+            engine.clear_in_model()
+        return self._engine.clear_in_model()
+
+    def _route_matrix(self, method_name, holder, params_phys, *, data_index,
+                      noise_index, N_vals, **kwargs):
+        """Shared row-wise routing for matrix-valued outputs (grad/hessian)."""
+        if not self._is_multi(holder):
+            return getattr(self._engine, method_name)(
+                holder, params_phys, data_index=data_index,
+                noise_index=noise_index, N_vals=N_vals, **kwargs)
+        xp = holder.xp
+        views = self._shard_views(holder)
+        parts = self._partition(holder, data_index, noise_index)
+        num = int(params_phys.shape[0])
+        params_host = asnumpy(params_phys)
+        N_host = None if N_vals is None else asnumpy(N_vals)
+        pieces = []
+        for view, (pos, intra, intra_noise) in zip(views, parts):
+            if pos.shape[0] == 0:
+                continue
+            method = getattr(self._engine_for(holder, view), method_name)
+            with device_context(xp, view.device):
+                out_s = method(
+                    view, xp.asarray(params_host[pos]),
+                    data_index=intra,
+                    noise_index=intra if intra_noise is None else intra_noise,
+                    N_vals=None if N_host is None else xp.asarray(N_host[pos]),
+                    **kwargs)
+                pieces.append((pos, asnumpy(out_s)))
+        return self._assemble(num, pieces, 0.0, xp)
+
+    def get_ll_grad(self, holder, params_phys, *, data_index, noise_index,
+                    N_vals, **kwargs):
+        return self._route_matrix(
+            "get_ll_grad", holder, params_phys, data_index=data_index,
+            noise_index=noise_index, N_vals=N_vals, **kwargs)
+
+    def hessian(self, holder, params_phys, *, data_index, noise_index,
+                N_vals, **kwargs):
+        return self._route_matrix(
+            "hessian", holder, params_phys, data_index=data_index,
+            noise_index=noise_index, N_vals=N_vals, **kwargs)
+
+    @classmethod
+    def route_information_matrix(cls, comp, holder, params_phys, *, inds,
+                                 noise_index, **swap_kwargs):
+        """Route ``comp.information_matrix`` per shard.
+
+        The Fisher/information matrix is computed on the RAW GB comp
+        (``gb_wdm_comp`` / ``gb_fd_comp`` / ``gb_stft_comp``) for the proposal
+        Cholesky, not on the wrapped likelihood engine -- so it can't go
+        through the instance router and needs its own entry point. Each
+        binary's matrix depends only on its walker's PSD (``noise_index``; the
+        data slab is irrelevant, per ``information_matrix``), so partition
+        binaries by the owning shard of their walker, compute per shard
+        against a persistent :class:`_ShardHolderView` inside the owning
+        device context, and reassemble the ``(num_bin, nd, nd)`` stack on the
+        caller's device. Single-shard holders pass straight through.
+
+        Each shard runs against its own device-local comp replica
+        (:meth:`_comp_for`), so the kernel never dereferences another
+        device's chunk geometry / window / wrap pointers.
+        """
+        if not cls._is_multi(holder):
+            return comp.information_matrix(
+                params_phys, holder, inds=inds,
+                noise_index=noise_index, **swap_kwargs)
+        xp = holder.xp
+        views = cls._shard_views(holder)
+        # info matrix weights by noise only -> data_index == noise_index.
+        parts = cls._partition(holder, noise_index, noise_index)
+        params_host = np.atleast_2d(asnumpy(params_phys))
+        num = int(params_host.shape[0])
+        pieces = []
+        for view, (pos, intra, intra_noise) in zip(views, parts):
+            if pos.shape[0] == 0:
+                continue
+            comp_s = cls._comp_for(comp, holder, view)
+            with device_context(xp, view.device):
+                out_s = comp_s.information_matrix(
+                    xp.asarray(params_host[pos]), view, inds=inds,
+                    noise_index=intra if intra_noise is None else intra_noise,
+                    **swap_kwargs)
+                pieces.append((pos, asnumpy(out_s)))
+        return cls._assemble(num, pieces, 0.0, xp)
+
+
+def make_routed_band_engine(basis_settings, *, xp, gb_wdm_comp=None,
+                            gb_fd_comp=None, gb_stft_comp=None,
+                            **engine_kwargs):
+    """Build the shard-safe band likelihood engine for a holder.
+
+    Returns exactly the
+    :func:`gbgpu.gb_likelihood.make_band_likelihood_engine` product the two
+    construction sites (:class:`SubBandBuffer` and the move-level parent-ACA
+    engine in ``gbspecialstretch``) built before, wrapped in a
+    :class:`_RoutedBandEngine` for the domains that need one. Single-GPU
+    behaviour is unchanged either way: the router's fast path is a straight
+    passthrough on single-shard holders.
+
+    **The STFT engine is returned unwrapped.** ``STFTBandLikelihoodEngine``
+    already shards internally -- ``_split_plan`` partitions rows by
+    ``split_map``, enters each owning ``device_context`` and indexes
+    ``linear_data_arr[s]`` with intra-shard ids -- so it needs the REAL
+    multi-shard ACA. Wrapping it would hand it a :class:`_ShardHolderView`
+    whose ``linear_data_arr`` is 1-element while ``cpp_splits`` still
+    delegates to the parent's full list, and its own per-split loop would
+    then index past the end. Its device-locality comes from the per-split
+    comp replica resolved inside that loop, not from this wrapper.
+
+    The ``engine_factory`` closure rebuilds the SAME engine around per-device
+    comp replicas (:func:`lisatools.utils.devicereplicas.device_local_gb_comp`)
+    the first time a shard lands on a device other than the comps' own --
+    giving that shard device-local chunk geometry / window / orbit + TDI
+    wraps, and, under sig-het, its own heterodyne reference stash.
+
+    Replicas are module-cached and allocate-once; they deliberately do NOT
+    follow the holder's proposal lifetime (rebuilding a ``GBTDIonTheFly`` per
+    proposal would be ruinous) and never reach the settings tree.
+    """
+    from gbgpu.gb_likelihood import make_band_likelihood_engine
+
+    prototype = make_band_likelihood_engine(
+        basis_settings, gb_wdm_comp=gb_wdm_comp, gb_fd_comp=gb_fd_comp,
+        gb_stft_comp=gb_stft_comp, **engine_kwargs)
+
+    if isinstance(basis_settings, STFTSettings):
+        return prototype
+
+    def _engine_factory(device, primary):
+        with device_context(xp, device):
+            return make_band_likelihood_engine(
+                basis_settings,
+                gb_wdm_comp=device_local_gb_comp(
+                    gb_wdm_comp, xp, device, primary),
+                gb_fd_comp=device_local_gb_comp(
+                    gb_fd_comp, xp, device, primary),
+                gb_stft_comp=gb_stft_comp,
+                **engine_kwargs,
+            )
+
+    return _RoutedBandEngine(prototype, engine_factory=_engine_factory)
+
+
 class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
     """Per-(temp, walker, band) scratch buffers for the GB special moves.
 
@@ -287,10 +1067,6 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         *args,
         **kwargs,
     ):
-        # Deferred import: gb_likelihood imports nothing from here, but keep
-        # the module import graph acyclic if that ever changes.
-        from gbgpu.gb_likelihood import make_band_likelihood_engine
-
         self.force_backend = force_backend
         LISAToolsParallelModule.__init__(self, force_backend=force_backend)
         assert self.backend.name.split("_")[-1] == gb.backend.name.split("_")[-1]
@@ -418,8 +1194,9 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                 # reach both FD comps clones).
                 self._acs_template_buffer.min_freq_inds = self._min_freq_inds_store
 
-        self._likelihood_engine = make_band_likelihood_engine(
+        self._likelihood_engine = make_routed_band_engine(
             self._basis_settings,
+            xp=self.xp,
             gb=self.gb,
             gb_fd_comp=self.gb_fd_comp,
             gb_wdm_comp=self.gb_wdm_comp,
@@ -689,41 +1466,70 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                 )
             parent_group = self.gb_stft_comp.stft_comps
 
-        ac_list = []
-        for _ in range(self.num_bands_now):
-            res_data = self.xp.zeros(data_shape, dtype=data_dtype)
-            data_domain = per_band_settings.associated_class(res_data, per_band_settings)
-            if is_stft:
-                # Unlike the FD/WDM band ACAs (whose engines never touch
-                # cpp_splits), the STFT engine drives the band ACA's own
-                # per-split STFTComputationGroup, and that group's
-                # ``build_cpp_objects`` reconstructs a sensitivity backend
-                # from the split's first AC -- requiring a REAL backend
-                # (``orbits`` + ``kwargs``), not a bare SensitivityMatrixBase.
-                # Clone the parent group's backend per band (construction is
-                # lazy and shares the parent's configured orbits) and
-                # overwrite the buffers with band-local zeros.
-                parent_sb = parent_group.sensitivity_backend
-                sm = type(parent_sb)(**parent_sb.kwargs)
-            else:
-                sm = SensitivityMatrixBase(per_band_settings, skip_inv_det=True)
-            sm.sens_mat = self.xp.zeros(sens_shape, dtype=sens_dtype)
-            sm.invC = self.xp.zeros(sens_shape, dtype=sens_dtype)
-            sm.channel_shape = sens_shape[: -len(per_band_settings.basis_shape_active)]
-            ac_list.append(AnalysisContainer(data_domain, sm))
-
+        # Multi-GPU at the GB band-tree level: a striped band assignment so
+        # consecutive bands land on different GPUs. The BandSorter even/odd
+        # within-pass invariant keeps bands in one pass non-overlapping in
+        # time-frequency support, so striping is safe. The per-band accessors
+        # (band_buffer / psd_buffer / template_buffer) automatically fall back
+        # to a single ndarray view for single-GPU runs and return a BandView
+        # (multi-shard router) otherwise -- see the accessor block above.
+        #
+        # Resolved BEFORE the allocation loop because each band's sensitivity
+        # backend has to be built for its OWN device (see below).
         gpus_in = getattr(self.gb, "gpus", None) if self.backend.uses_cupy else None
-        # Multi-GPU at the GB band-tree level: pass the full gpus list and a
-        # striped band assignment so consecutive bands land on different
-        # GPUs. The BandSorter even/odd within-pass invariant keeps bands in
-        # one pass non-overlapping in time-frequency support, so striping is
-        # safe. The per-band accessors (band_buffer / psd_buffer /
-        # template_buffer) automatically fall back to a single ndarray view
-        # for single-GPU runs and return a BandView (multi-shard router)
-        # otherwise -- see the accessor block above.
         gpu_assignment = (
-            band_gpu_assignment(len(ac_list), list(gpus_in)) if gpus_in else None
+            band_gpu_assignment(self.num_bands_now, list(gpus_in))
+            if gpus_in else None
         )
+        primary_device = int(gpus_in[0]) if gpus_in else None
+
+        ac_list = []
+        for _b in range(self.num_bands_now):
+            band_device = (
+                None if gpu_assignment is None else int(gpu_assignment[_b])
+            )
+            # Allocate this band's buffers, and build its sensitivity backend,
+            # ON THE DEVICE THAT WILL OWN THE BAND. The ACA repacks the data
+            # arrays into its per-shard linear buffers, but the sensitivity
+            # backend object is kept as-is -- its C++ orbit tables are never
+            # migrated.
+            with device_context(self.xp, band_device):
+                res_data = self.xp.zeros(data_shape, dtype=data_dtype)
+                data_domain = per_band_settings.associated_class(
+                    res_data, per_band_settings)
+                if is_stft:
+                    # Unlike the FD/WDM band ACAs (whose engines never touch
+                    # cpp_splits), the STFT engine drives the band ACA's own
+                    # per-split STFTComputationGroup, and that group's
+                    # ``build_cpp_objects`` reconstructs a sensitivity backend
+                    # from the split's first AC -- requiring a REAL backend
+                    # (``orbits`` + ``kwargs``), not a bare
+                    # SensitivityMatrixBase. Clone the parent group's backend
+                    # per band and overwrite the buffers with band-local
+                    # zeros.
+                    #
+                    # ``parent_sb.kwargs`` carries the run's SHARED ``orbits``
+                    # object, whose C++ tables live on the device it was built
+                    # on. Handing that to a band striped onto another device
+                    # makes ``build_cpp_objects`` -- and every kernel reached
+                    # through this group -- dereference foreign pointers:
+                    # measured as an illegal memory access in
+                    # ``Detector.cu``, on a node where P2P is ENABLED (the
+                    # orbit pointers are not peer-mapped). Swap in the
+                    # device-local orbits replica.
+                    parent_sb = parent_group.sensitivity_backend
+                    sb_kwargs = dict(parent_sb.kwargs)
+                    if band_device is not None and sb_kwargs.get("orbits") is not None:
+                        sb_kwargs["orbits"] = device_local_orbits(
+                            sb_kwargs["orbits"], self.xp, primary_device)
+                    sm = type(parent_sb)(**sb_kwargs)
+                else:
+                    sm = SensitivityMatrixBase(per_band_settings, skip_inv_det=True)
+                sm.sens_mat = self.xp.zeros(sens_shape, dtype=sens_dtype)
+                sm.invC = self.xp.zeros(sens_shape, dtype=sens_dtype)
+                sm.channel_shape = sens_shape[
+                    : -len(per_band_settings.basis_shape_active)]
+                ac_list.append(AnalysisContainer(data_domain, sm))
         aca_kwargs = dict(
             gpus=list(gpus_in) if gpus_in else None,
             # STFT invC is complex128 (see _per_band_sens_dtype); FD/WDM
