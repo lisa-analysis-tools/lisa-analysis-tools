@@ -241,10 +241,10 @@ class WDMComputationsBase(FastLISAResponseParallelModule):
         """Set response orbits and (re)build the backend orbits wrap."""
 
         if orbits is None:
-            orbits = EqualArmlengthOrbits()
+            orbits = EqualArmlengthOrbits(force_backend=self.backend)
 
         elif not isinstance(orbits, Orbits) and issubclass(orbits, Orbits):
-            orbits = orbits()
+            orbits = orbits(force_backend=self.backend)
 
         else:
             assert isinstance(orbits, Orbits)

@@ -998,7 +998,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 d_h_1 = buffer_obj.d_h_out.copy()
                 h_h_1 = buffer_obj.h_h_out.copy()
                 eng = buffer_obj._likelihood_engine
-                params_phys = self.transform_fn.both_transforms(params[d], xp=cp)
+                params_phys = self.transform_fn.both_transforms(params[d], xp=self.xp)
                 di = slots[d].astype(xp.int32)
                 eng.fill_template(buffer_obj, params_phys, di, N_vals[d],
                                   factor=+1, waveform_kwargs=self.waveform_kwargs)
@@ -1059,7 +1059,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             return
         xp = self.xp
         eng = buffer_obj._likelihood_engine
-        params_phys = self.transform_fn.both_transforms(params_add, xp=cp)
+        params_phys = self.transform_fn.both_transforms(params_add, xp=self.xp)
         di = data_index.astype(xp.int32)
         eng.fill_template(buffer_obj.acs_buffer, params_phys, di, swap_N_vals,
                           factor=-1, waveform_kwargs=self.waveform_kwargs)
@@ -1138,7 +1138,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
             self._dbg_seq_done = True
             f0_old = float(_to_numpy(
-                self.transform_fn.both_transforms(curr[idx:idx + 1], xp=cp)[0, 1]))
+                self.transform_fn.both_transforms(curr[idx:idx + 1], xp=self.xp)[0, 1]))
             return dict(
                 idx=idx,
                 slot=int(_to_numpy(slots)[idx]),
@@ -1183,8 +1183,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             if n_src == 0:
                 return np.zeros((nc, Nf_a, Nt_a))
             coords = band_sorter.coords[mask]
-            params_phys = self.transform_fn.both_transforms(coords, xp=cp)
-            scratch = cp.zeros(nc * Nf_a * Nt_a)
+            params_phys = self.transform_fn.both_transforms(coords, xp=self.xp)
+            scratch = self.xp.zeros(nc * Nf_a * Nt_a)
 
             class _Scratch:
                 linear_data_arr = [scratch]
@@ -1194,9 +1194,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
             buffer_obj._likelihood_engine.fill_template(
                 _Scratch(), params_phys,
-                cp.zeros(n_src, dtype=cp.int32),
+                self.xp.zeros(n_src, dtype=self.xp.int32),
                 band_sorter.band_N_vals[
-                    cp.full(n_src, b, dtype=int)
+                    self.xp.full(n_src, b, dtype=int)
                 ],
                 factor=+1, waveform_kwargs=self.waveform_kwargs,
             )
@@ -1688,7 +1688,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 plotted.add(stage)
             pos.sort(key=lambda i: int(temps_all[orig[i]]))
 
-            params_phys = self.transform_fn.both_transforms(params_add, xp=cp)
+            params_phys = self.transform_fn.both_transforms(params_add, xp=self.xp)
             di_np = _to_numpy(data_index)
             ll_np = _to_numpy(xp.asarray(ll_diff_kept))
 
@@ -1787,9 +1787,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         arrays have shape ``(2, ntemps, nwalkers, num_bands)`` with row 0 =
         RJ proposals and row 1 = in-model proposals.
         """
-        ll_change_log = cp.zeros((self.ntemps, self.nwalkers, self.num_bands))
-        prop_counts = cp.zeros((2, self.ntemps, self.nwalkers, self.num_bands), dtype=int)
-        acc_counts = cp.zeros_like(prop_counts)
+        ll_change_log = self.xp.zeros((self.ntemps, self.nwalkers, self.num_bands))
+        prop_counts = self.xp.zeros((2, self.ntemps, self.nwalkers, self.num_bands), dtype=int)
+        acc_counts = self.xp.zeros_like(prop_counts)
 
         # One debug figure per STAGE per run_proposal call (i.e. per sampler
         # step): _debug_plot_band consumes this set. The band-null log fires
@@ -2006,9 +2006,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         params = band_sorter.coords[ids].copy()
         params[:] = self.periodic.wrap({"gb": params[:, None, :]}, xp=xp)["gb"][:, 0]
 
-        logp = cp.asarray(self.gpu_priors["gb"].logpdf(params))
-        prev_logp = cp.zeros_like(logp)
-        curr_logp = cp.zeros_like(logp)
+        logp = self.xp.asarray(self.gpu_priors["gb"].logpdf(params))
+        prev_logp = self.xp.zeros_like(logp)
+        curr_logp = self.xp.zeros_like(logp)
         prev_logp[alive] = logp[alive]
         curr_logp[~alive] = logp[~alive]
 
@@ -2055,10 +2055,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             )
             curr_logp[(~alive) & over_cap] = -np.inf
 
-        delta_ll = cp.full_like(logp, -1e300)
-        d_h = cp.zeros_like(logp)
-        h_h = cp.zeros_like(logp)
-        keep = ~cp.isinf(curr_logp)
+        delta_ll = self.xp.full_like(logp, -1e300)
+        d_h = self.xp.zeros_like(logp)
+        h_h = self.xp.zeros_like(logp)
+        keep = ~self.xp.isinf(curr_logp)
 
         if bool(keep.any()):
             k_ids = xp.arange(len(ids))[keep]
@@ -2105,7 +2105,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         beta = band_temps[picked["band_inds"], picked["temp_inds"]]
         factors = band_sorter.factors[ids]
         lnpdiff = beta * delta_ll + (curr_logp - prev_logp) + factors
-        accept = lnpdiff >= cp.log(cp.random.rand(*lnpdiff.shape))
+        accept = lnpdiff >= self.xp.log(self.xp.random.rand(*lnpdiff.shape))
 
         # Coordinates outside the prior can only be accepted at beta == 0;
         # everything else is a bug -> warn and reject.
@@ -2202,7 +2202,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         xp = self.xp
         coords = band_sorter.coords[ids]
         n_src, ndim = coords.shape
-        params_phys = self.transform_fn.both_transforms(coords, xp=cp)
+        params_phys = self.transform_fn.both_transforms(coords, xp=self.xp)
         _test_inds = np.asarray(self.parameter_transforms.fill_dict["test_inds"])
         walker_inds = band_sorter.walker_inds[ids].astype(xp.int32)
 
@@ -2240,8 +2240,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             up[:, i] += h
             dn[:, i] -= h
             dphys = (
-                self.transform_fn.both_transforms(up, xp=cp)[:, _test_inds[i]]
-                - self.transform_fn.both_transforms(dn, xp=cp)[:, _test_inds[i]]
+                self.transform_fn.both_transforms(up, xp=self.xp)[:, _test_inds[i]]
+                - self.transform_fn.both_transforms(dn, xp=self.xp)[:, _test_inds[i]]
             )
             J[:, i] = dphys / (2.0 * h) * s[i]
 
@@ -2383,7 +2383,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # sig-het reference was built at (see the refresh block below).
         ref_track = curr.copy() if sighet_active else None
         ll_ref = buffer_obj.get_add_ll(curr, slots, slots, N_vals)
-        curr_prior = cp.asarray(self.gpu_priors["gb"].logpdf(curr))
+        curr_prior = self.xp.asarray(self.gpu_priors["gb"].logpdf(curr))
 
         n4 = (N_vals / 4).astype(int)
         lo_bin = (buffer_obj.frequency_lims[0][slots] / self.df).astype(int)
@@ -2393,18 +2393,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             new, factors = self.in_model_proposal(curr, chol, band_sorter, ids, model)
             new[:] = self.periodic.wrap({"gb": new[:, None, :]}, xp=xp)["gb"][:, 0]
 
-            new_logp = cp.asarray(self.gpu_priors["gb"].logpdf(new))
+            new_logp = self.xp.asarray(self.gpu_priors["gb"].logpdf(new))
             # In-model steps stay within +- N/4 bins of the current source
             # and inside the band window (widened by N/4).
-            new_bin = cp.abs(new[:, 1] / 1e3 / self.df).astype(int)
+            new_bin = self.xp.abs(new[:, 1] / 1e3 / self.df).astype(int)
             new_logp[
-                (cp.abs(new[:, 1] / 1e3 - curr[:, 1] / 1e3) / self.df).astype(int) > n4
+                (self.xp.abs(new[:, 1] / 1e3 - curr[:, 1] / 1e3) / self.df).astype(int) > n4
             ] = -np.inf
             new_logp[new_bin < lo_bin - n4] = -np.inf
             new_logp[new_bin > hi_bin + n4] = -np.inf
 
-            keep = ~cp.isinf(new_logp)
-            new_ll = cp.full(len(ids), -1e300)
+            keep = ~self.xp.isinf(new_logp)
+            new_ll = self.xp.full(len(ids), -1e300)
             if bool(keep.any()):
                 new_ll[keep] = buffer_obj.get_add_ll(
                     new[keep], slots[keep], slots[keep], N_vals[keep],
@@ -2418,7 +2418,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
             delta_ll = new_ll - ll_ref
             lnpdiff = beta * delta_ll + (new_logp - curr_prior) + factors
-            accept = lnpdiff >= cp.log(cp.random.rand(*lnpdiff.shape))
+            accept = lnpdiff >= self.xp.log(self.xp.random.rand(*lnpdiff.shape))
 
             bad_mask = (new_ll <= -1e299) | (new_logp <= -1e229)
             bad_accepts = accept & bad_mask
@@ -2459,11 +2459,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 and move_i + 1 < self.num_repeat_proposals
             ):
                 Tobs = float(self._basis_settings.Tobs)
-                df0_hz = cp.abs(curr[:, 1] - ref_track[:, 1]) / 1e3
-                dfdot = cp.abs(curr[:, 2] - ref_track[:, 2])
+                df0_hz = self.xp.abs(curr[:, 1] - ref_track[:, 1]) / 1e3
+                dfdot = self.xp.abs(curr[:, 2] - ref_track[:, 2])
                 drift = 2.0 * np.pi * df0_hz * Tobs + np.pi * dfdot * Tobs**2
                 far = (drift > self.sighet_refresh_dphase) | (
-                    cp.abs(curr[:, 0] - ref_track[:, 0]) > np.log(2.0)
+                    self.xp.abs(curr[:, 0] - ref_track[:, 0]) > np.log(2.0)
                 )
                 # Hot cells keep their stale reference: the ll error is
                 # beta-suppressed and each refresh is a full setup.
@@ -2501,7 +2501,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 buffer_obj, seq["slot"])
             seq["f0_new"] = float(_to_numpy(
                 self.transform_fn.both_transforms(
-                    curr[seq["idx"]:seq["idx"] + 1], xp=cp)[0, 1]))
+                    curr[seq["idx"]:seq["idx"] + 1], xp=self.xp)[0, 1]))
             self._debug_plot_band_sequence(buffer_obj, seq)
 
     def _tempering_swap_grid(self, band_sorter, start):
@@ -2519,17 +2519,17 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """
         if self.num_bands == 1:
             num_bands_tempered = 1
-            band_index_arr = cp.arange(1)
+            band_index_arr = self.xp.arange(1)
         else:
             num_bands_tempered = self.num_bands - 2
-            band_index_arr = cp.arange(1, self.num_bands - 1)
+            band_index_arr = self.xp.arange(1, self.num_bands - 1)
 
         num_bands_unit = np.arange(num_bands_tempered)[start::2].shape[0]
 
         walkers_permuted = (
-            cp.asarray(
+            self.xp.asarray(
                 [
-                    cp.random.permutation(cp.arange(self.nwalkers))
+                    self.xp.random.permutation(self.xp.arange(self.nwalkers))
                     for _ in range(self.ntemps * num_bands_tempered)
                 ]
             )
@@ -2537,12 +2537,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             .transpose(0, 2, 1)[start::2]
         )
         temp_index = (
-            cp.repeat(cp.arange(self.ntemps), num_bands_tempered * self.nwalkers)
+            self.xp.repeat(self.xp.arange(self.ntemps), num_bands_tempered * self.nwalkers)
             .reshape(self.ntemps, num_bands_tempered, self.nwalkers)
             .transpose(1, 2, 0)[start::2]
         )
         band_index = (
-            cp.repeat(band_index_arr, self.ntemps * self.nwalkers)
+            self.xp.repeat(band_index_arr, self.ntemps * self.nwalkers)
             .reshape(num_bands_tempered, self.ntemps, self.nwalkers)
             .transpose(0, 2, 1)[start::2]
         )
@@ -2568,7 +2568,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # instead of propagating NaN into the ladder (at ntemps > 2 a NaN
         # here corrupts band_temps for the edge bands' middle temps, which
         # then NaN-poisons every acceptance in those bands).
-        _prop_safe = cp.maximum(band_swaps_proposed, 1)
+        _prop_safe = self.xp.maximum(band_swaps_proposed, 1)
         ratios = (band_swaps_accepted / _prop_safe).T
         betas0 = band_temps.copy().T
         betas1 = betas0.copy()
@@ -2583,19 +2583,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         dSs = kappa * (ratios[:-1] - ratios[1:])
 
         # Compute new ladder (hottest and coldest chains don't move).
-        deltaTs = cp.diff(1 / betas1[:-1], axis=0)
+        deltaTs = self.xp.diff(1 / betas1[:-1], axis=0)
 
-        deltaTs *= cp.exp(dSs)
-        betas1[1:-1] = 1 / (cp.cumsum(deltaTs, axis=0) + 1 / betas1[0])
+        deltaTs *= self.xp.exp(dSs)
+        betas1[1:-1] = 1 / (self.xp.cumsum(deltaTs, axis=0) + 1 / betas1[0])
 
         dbetas = betas1 - betas0
         band_temps += self.xp.asarray(dbetas.T)
 
     def run_tempering(self, model, state, band_sorter, band_temps):
-        ll_change_log_temp = cp.zeros((self.ntemps, self.nwalkers, self.num_bands))
+        ll_change_log_temp = self.xp.zeros((self.ntemps, self.nwalkers, self.num_bands))
 
-        band_swaps_accepted = cp.zeros((len(self.band_edges) - 1, self.ntemps - 1), dtype=int)
-        band_swaps_proposed = cp.zeros((len(self.band_edges) - 1, self.ntemps - 1), dtype=int)
+        band_swaps_accepted = self.xp.zeros((len(self.band_edges) - 1, self.ntemps - 1), dtype=int)
+        band_swaps_proposed = self.xp.zeros((len(self.band_edges) - 1, self.ntemps - 1), dtype=int)
 
         units = 2
         tmp_start = np.random.randint(units)
@@ -2645,8 +2645,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
                     # Buffer slots interleave temperatures: column t of a
                     # grid row is slot (row * ntemps + t).
-                    buffer_i1 = cp.arange(buffer_obj.num_bands_now)[i1 :: self.ntemps]
-                    buffer_i2 = cp.arange(buffer_obj.num_bands_now)[i2 :: self.ntemps]
+                    buffer_i1 = self.xp.arange(buffer_obj.num_bands_now)[i1 :: self.ntemps]
+                    buffer_i2 = self.xp.arange(buffer_obj.num_bands_now)[i2 :: self.ntemps]
 
                     buffer_obj.swap_template_slots(buffer_i1, buffer_i2)
 
@@ -2667,7 +2667,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     ) # ! this is changed because it think this was wrong, below is the previous paccept (comparing with paccept in paper, it should now be good)
                     # paccept = bi * (band_here_i1->swapped_like - band_here_i->current_like) + bi1 * (band_here_i->swapped_like - band_here_i1->current_like);
 
-                    raccept = cp.log(cp.random.uniform(size=paccept.shape))
+                    raccept = self.xp.log(self.xp.random.uniform(size=paccept.shape))
                     sel = paccept > raccept
 
                     current_lls[sel, i2 : i1 + 1] = new_lls[sel]
@@ -2686,11 +2686,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     _nb_tot = band_swaps_accepted.shape[0]
                     _acc_bands = band_inds_now[sel, 0]
                     if _acc_bands.size:
-                        band_swaps_accepted[:, i2] += cp.bincount(
+                        band_swaps_accepted[:, i2] += self.xp.bincount(
                             _acc_bands, minlength=_nb_tot
                         ).astype(band_swaps_accepted.dtype)
                     if band_inds_now.size:
-                        band_swaps_proposed[:, i2] += cp.bincount(
+                        band_swaps_proposed[:, i2] += self.xp.bincount(
                             band_inds_now[:, 0], minlength=_nb_tot
                         ).astype(band_swaps_proposed.dtype)
 
@@ -2758,17 +2758,17 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             band_sorter.temp_inds[alive] * self.nwalkers
             + band_sorter.walker_inds[alive]
         )
-        sorted_inds = cp.argsort(special_indices_finish)
+        sorted_inds = self.xp.argsort(special_indices_finish)
 
-        uni, uni_inds, uni_inverse, uni_counts = cp.unique(
+        uni, uni_inds, uni_inverse, uni_counts = self.xp.unique(
             special_inds_temp_walker[sorted_inds],
             return_index=True,
             return_counts=True,
             return_inverse=True,
         )
 
-        leaf_inds_new_tmp = cp.arange(special_indices_finish.shape[0]) - uni_inds[uni_inverse]
-        leaf_inds_new = cp.zeros_like(leaf_inds_new_tmp)
+        leaf_inds_new_tmp = self.xp.arange(special_indices_finish.shape[0]) - uni_inds[uni_inverse]
+        leaf_inds_new = self.xp.zeros_like(leaf_inds_new_tmp)
         leaf_inds_new[sorted_inds] = leaf_inds_new_tmp
 
         inds_new = (
@@ -2997,12 +2997,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         new_state = GFState(state, copy=True)
         assert new_state.log_like is not None
 
-        band_temps = cp.asarray(state.sub_states["gb"].band_info["band_temps"].copy())
+        band_temps = self.xp.asarray(state.sub_states["gb"].band_info["band_temps"].copy())
 
         if self.is_rj_prop:
             orig_store = new_state.log_like[0].copy()
 
-        gb_coords = cp.asarray(new_state.branches["gb"].coords)
+        gb_coords = self.xp.asarray(new_state.branches["gb"].coords)
 
         self.mempool.free_all_blocks()
 
@@ -3064,7 +3064,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # default so this baseline stays in the same convention as the
         # incremental checks below and check_ll_inject().
         with tm.span("ll_checks"):
-            ll_after = model.analysis_container_arr.likelihood()  #  - cp.sum(cp.log(cp.asarray(psd[:2])), axis=(0, 2))).get()
+            ll_after = model.analysis_container_arr.likelihood()  #  - self.xp.sum(self.xp.log(self.xp.asarray(psd[:2])), axis=(0, 2))).get()
 
         # print(np.abs(new_state.log_like - ll_after).max())        
         # store_max_diff = np.abs(new_state.log_like[0] - ll_after).max()
@@ -3130,8 +3130,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # TODO: move this and check if it is needed
         # self.nchannels = model.analysis_container_arr.nchannels
 
-        band_swaps_accepted = cp.zeros((len(self.band_edges) - 1, self.ntemps - 1), dtype=int)
-        band_swaps_proposed = cp.zeros((len(self.band_edges) - 1, self.ntemps - 1), dtype=int)
+        band_swaps_accepted = self.xp.zeros((len(self.band_edges) - 1, self.ntemps - 1), dtype=int)
+        band_swaps_proposed = self.xp.zeros((len(self.band_edges) - 1, self.ntemps - 1), dtype=int)
 
         if (
             self.temperature_control is not None
@@ -3185,7 +3185,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         num_active_leaves = new_state.branches["gb"].inds[0].sum(axis=-1)
         logger.info(f"Number of active leaves in cold chain after proposal: {num_active_leaves}")
 
-        new_inds = cp.asarray(new_state.branches_inds["gb"])
+        new_inds = self.xp.asarray(new_state.branches_inds["gb"])
         del band_sorter
         with tm.span("mempool_free"):
             self.mempool.free_all_blocks()
@@ -3205,19 +3205,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             )
 
         # in-model inds will not change
-        tmp_freqs_find_bands = cp.asarray(new_state.branches_coords["gb"][:, :, :, 1])
+        tmp_freqs_find_bands = self.xp.asarray(new_state.branches_coords["gb"][:, :, :, 1])
 
         # calculate current band counts
         band_here = (
-            cp.searchsorted(self.band_edges, tmp_freqs_find_bands.flatten() / 1e3, side="right") - 1
+            self.xp.searchsorted(self.band_edges, tmp_freqs_find_bands.flatten() / 1e3, side="right") - 1
         ).reshape(tmp_freqs_find_bands.shape)
 
         group_temp_finder = [
-            cp.repeat(cp.arange(ntemps), nwalkers * nleaves_max).reshape(
+            self.xp.repeat(self.xp.arange(ntemps), nwalkers * nleaves_max).reshape(
                 ntemps, nwalkers, nleaves_max
             ),
-            cp.tile(cp.arange(nwalkers), (ntemps, nleaves_max, 1)).transpose((0, 2, 1)),
-            cp.tile(cp.arange(nleaves_max), ((ntemps, nwalkers, 1))),
+            self.xp.tile(self.xp.arange(nwalkers), (ntemps, nleaves_max, 1)).transpose((0, 2, 1)),
+            self.xp.tile(self.xp.arange(nleaves_max), ((ntemps, nwalkers, 1))),
         ]
 
         # TEMPERING
@@ -4267,7 +4267,7 @@ class GBSpecialRJRefitMove(GBSpecialBase):
                 # )
 
             weights, means, covs, invcovs, dets, mins, maxs = vec_fit_gmm_min_bic(
-                cp.asarray(samples_here),
+                self.xp.asarray(samples_here),
                 min_comp=1,
                 max_comp=30,
                 n_samp_bic_test=5000,

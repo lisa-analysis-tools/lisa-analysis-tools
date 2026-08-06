@@ -245,16 +245,17 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
 
     def get_index(self, special_inds_test):
         """Map a special-index test value to its position inside the buffer."""
+        xp = get_array_module(self.special_indices_unique)
         now_index = (
             self.special_indices_unique_sort[
-                cp.searchsorted(
+                xp.searchsorted(
                     self.special_indices_unique[self.special_indices_unique_sort],
                     special_inds_test,
                     side="right",
                 )
                 - 1
             ]
-        ).astype(cp.int32)
+        ).astype(xp.int32)
         return now_index
 
     def __init__(
@@ -690,7 +691,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
 
         ac_list = []
         for _ in range(self.num_bands_now):
-            res_data = cp.zeros(data_shape, dtype=data_dtype)
+            res_data = self.xp.zeros(data_shape, dtype=data_dtype)
             data_domain = per_band_settings.associated_class(res_data, per_band_settings)
             if is_stft:
                 # Unlike the FD/WDM band ACAs (whose engines never touch
@@ -706,8 +707,8 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                 sm = type(parent_sb)(**parent_sb.kwargs)
             else:
                 sm = SensitivityMatrixBase(per_band_settings, skip_inv_det=True)
-            sm.sens_mat = cp.zeros(sens_shape, dtype=sens_dtype)
-            sm.invC = cp.zeros(sens_shape, dtype=sens_dtype)
+            sm.sens_mat = self.xp.zeros(sens_shape, dtype=sens_dtype)
+            sm.invC = self.xp.zeros(sens_shape, dtype=sens_dtype)
             sm.channel_shape = sens_shape[: -len(per_band_settings.basis_shape_active)]
             ac_list.append(AnalysisContainer(data_domain, sm))
 
@@ -744,7 +745,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
 
     def update_special_indices(self, new_special_indices, inds_fill=None):
         if inds_fill is None:
-            inds_fill = cp.arange(self.num_bands_now)
+            inds_fill = self.xp.arange(self.num_bands_now)
 
         assert inds_fill.shape[0] == new_special_indices.shape[0]
         _tmp_indices = self.special_indices_unique.copy()
@@ -908,7 +909,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             # b=bands, i/j=channels, k=flattened basis
             source_term = (
                 - (1.0 / 2.0) * 4.0 * dc
-                * cp.einsum(
+                * self.xp.einsum(
                     "bik,bijk,bjk->b", num_flat.conj(), psd_flat, num_flat
                 ).real
             )
@@ -920,17 +921,17 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             psd_flat = psd_buffer.reshape(nb, nc, -1)
             source_term = (
                 - (1.0 / 2.0) * 4.0 * dc
-                * cp.sum((num_flat.conj() * num_flat) * psd_flat, axis=(1, 2)).real
+                * self.xp.sum((num_flat.conj() * num_flat) * psd_flat, axis=(1, 2)).real
             )
 
             if noise_only:
-                return -cp.sum(cp.log(cp.abs(1 / psd_buffer[psd_buffer != 0.0])))
+                return -self.xp.sum(self.xp.log(self.xp.abs(1 / psd_buffer[psd_buffer != 0.0])))
 
         if source_only:
             return source_term
 
         # Diagonal noise_term fall_back # TODO check if this is sufficient not used currently anyway
-        psd_term = -cp.sum(cp.log(cp.abs(psd_buffer[psd_buffer != 0.0])))
+        psd_term = -self.xp.sum(self.xp.log(self.xp.abs(psd_buffer[psd_buffer != 0.0])))
         if self.tdi_channel_setup == "XYZ":
             warnings.warn("The current psd ll calculation is not correct for XYZ CSD channel setup.")
 
@@ -951,8 +952,8 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         rejection-sampling clamp and the phase-maximisation correction live
         here so the engine stays a thin wrapper around the kernel.
         """
-        params_remove_phys = self.transform_fn.both_transforms(params_remove, xp=cp)
-        params_add_phys = self.transform_fn.both_transforms(params_add, xp=cp)
+        params_remove_phys = self.transform_fn.both_transforms(params_remove, xp=self.xp)
+        params_add_phys = self.transform_fn.both_transforms(params_add, xp=self.xp)
 
         result = self._likelihood_engine.get_swap_ll(
             self,
@@ -1000,7 +1001,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         :attr:`d_h_out` / :attr:`h_h_out`, and :attr:`phase_angle` carries
         the maximising rotation when ``phase_maximize=True``.
         """
-        params_phys = self.transform_fn.both_transforms(params, xp=cp)
+        params_phys = self.transform_fn.both_transforms(params, xp=self.xp)
         ll = self._likelihood_engine.get_ll(
             self,
             params_phys,
@@ -1036,7 +1037,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         Returns the engine hook's value: truthy when a sig-het reference
         is now active (the move uses this to arm its mid-block drift
         refresh), ``None`` from the no-op hooks."""
-        params_phys = self.transform_fn.both_transforms(params, xp=cp)
+        params_phys = self.transform_fn.both_transforms(params, xp=self.xp)
         return self._likelihood_engine.setup_in_model(
             self, params_phys, data_index, N_vals=N_vals)
 
@@ -1098,7 +1099,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         rule there is no runtime ``backend=`` kwarg; build a JAX-
         backed ``gb_wdm_comp`` if you need the autograd path.
         """
-        params_phys = self.transform_fn.both_transforms(params, xp=cp)
+        params_phys = self.transform_fn.both_transforms(params, xp=self.xp)
         return self._likelihood_engine.get_ll_grad(
             self,
             params_phys,
@@ -1131,7 +1132,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         sprint-wide rule the backend is fixed on the underlying
         ``gb_wdm_comp`` instance -- no runtime ``backend=`` kwarg.
         """
-        params_phys = self.transform_fn.both_transforms(params, xp=cp)
+        params_phys = self.transform_fn.both_transforms(params, xp=self.xp)
         return self._likelihood_engine.hessian(
             self,
             params_phys,
@@ -1146,12 +1147,12 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
 
     def reset_residual_buffers(self, inds_fill=None):
         if inds_fill is None:
-            inds_fill = cp.arange(self.num_bands_now)
+            inds_fill = self.xp.arange(self.num_bands_now)
         self.band_buffer[inds_fill] = 0.0
 
     def reset_psd_buffers(self, inds_fill=None):
         if inds_fill is None:
-            inds_fill = cp.arange(self.num_bands_now)
+            inds_fill = self.xp.arange(self.num_bands_now)
         self.psd_buffer[inds_fill] = 0.0
 
     def fill_buffer_residual_and_psd_from_acs(
@@ -1164,7 +1165,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         # single-shard ACAs the reshape view is touched directly. No
         # outer-buffer materialisation needed.
         if inds_fill is None:
-            inds_fill = cp.arange(self.num_bands_now)
+            inds_fill = self.xp.arange(self.num_bands_now)
 
         outer_data_view = acs.data_shaped_view()
         outer_psd_view = acs.psd_shaped_view()
@@ -1202,7 +1203,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             # out of the parent ACA. The data axis position is taken from
             # unique_band_combos[:, 1] (the parent data index for that band).
             if inds_fill is None:
-                inds_fill = cp.arange(self.num_bands_now)
+                inds_fill = self.xp.arange(self.num_bands_now)
 
             Nf_active = self._basis_settings.Nf_active
             Nt_active = self._basis_settings.Nt_active
@@ -1216,17 +1217,17 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                 # index axis 0 with the raw walker index and need a full
                 # 5-tuple to cover all five axes.
                 inds1 = self.unique_band_combos[inds_fill, 1][:, None, None, None, None]
-                inds2 = cp.arange(self.nchannels)[None, :, None, None, None]
-                inds3 = cp.arange(self.nchannels)[None, None, :, None, None]
-                inds4 = cp.arange(Nf_active)[None, None, None, :, None]
-                inds5 = cp.arange(Nt_active)[None, None, None, None, :]
+                inds2 = self.xp.arange(self.nchannels)[None, :, None, None, None]
+                inds3 = self.xp.arange(self.nchannels)[None, None, :, None, None]
+                inds4 = self.xp.arange(Nf_active)[None, None, None, :, None]
+                inds5 = self.xp.arange(Nt_active)[None, None, None, None, :]
                 return inds1, inds2, inds3, inds4, inds5
 
             # target shape: (len(inds_fill), nchannels, Nf_active, Nt_active)
             inds1 = self.unique_band_combos[inds_fill, 1][:, None, None, None]
-            inds2 = cp.arange(self.nchannels)[None, :, None, None]
-            inds3 = cp.arange(Nf_active)[None, None, :, None]
-            inds4 = cp.arange(Nt_active)[None, None, None, :]
+            inds2 = self.xp.arange(self.nchannels)[None, :, None, None]
+            inds3 = self.xp.arange(Nf_active)[None, None, :, None]
+            inds4 = self.xp.arange(Nt_active)[None, None, None, :]
             return inds1, inds2, inds3, inds4
         if isinstance(self._basis_settings, STFTSettings):
             # First-cut STFT fill index map (WDM parity): per-band buffers
@@ -1236,7 +1237,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             # the STFT axis order is (NT, NF_active) -- time-major, the
             # transpose of the WDM (Nf, Nt) slab above.
             if inds_fill is None:
-                inds_fill = cp.arange(self.num_bands_now)
+                inds_fill = self.xp.arange(self.num_bands_now)
 
             NT = self._basis_settings.NT
             NF_active = self._basis_settings.NF_active
@@ -1245,17 +1246,17 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                 # target shape:
                 # (len(inds_fill), nchannels, nchannels, NT, NF_active)
                 inds1 = self.unique_band_combos[inds_fill, 1][:, None, None, None, None]
-                inds2 = cp.arange(self.nchannels)[None, :, None, None, None]
-                inds3 = cp.arange(self.nchannels)[None, None, :, None, None]
-                inds4 = cp.arange(NT)[None, None, None, :, None]
-                inds5 = cp.arange(NF_active)[None, None, None, None, :]
+                inds2 = self.xp.arange(self.nchannels)[None, :, None, None, None]
+                inds3 = self.xp.arange(self.nchannels)[None, None, :, None, None]
+                inds4 = self.xp.arange(NT)[None, None, None, :, None]
+                inds5 = self.xp.arange(NF_active)[None, None, None, None, :]
                 return inds1, inds2, inds3, inds4, inds5
 
             # target shape: (len(inds_fill), nchannels, NT, NF_active)
             inds1 = self.unique_band_combos[inds_fill, 1][:, None, None, None]
-            inds2 = cp.arange(self.nchannels)[None, :, None, None]
-            inds3 = cp.arange(NT)[None, None, :, None]
-            inds4 = cp.arange(NF_active)[None, None, None, :]
+            inds2 = self.xp.arange(self.nchannels)[None, :, None, None]
+            inds3 = self.xp.arange(NT)[None, None, :, None]
+            inds4 = self.xp.arange(NF_active)[None, None, None, :]
             return inds1, inds2, inds3, inds4
         if not isinstance(self._basis_settings, FDSettings):
             raise NotImplementedError(
@@ -1263,7 +1264,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             )
 
         if inds_fill is None:
-            inds_fill = cp.arange(self.num_bands_now)
+            inds_fill = self.xp.arange(self.num_bands_now)
 
         assert np.all(acs.start_freq_ind[0] == acs.start_freq_ind)
         start_freq_ind = acs.start_freq_ind[0]
@@ -1286,9 +1287,9 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             # (num_walkers, nchan, nchan, n_bins) -- axis 0 is the raw
             # walker index (mirrors the WDM XYZ 5-tuple below).
             inds1 = self.unique_band_combos[inds_fill, 1][:, None, None, None]
-            inds2 = cp.arange(self.nchannels)[None, :, None, None]
-            inds3 = cp.arange(self.nchannels)[None, None, :, None]
-            inds4 = start_inds[:, None, None, None] + cp.arange(
+            inds2 = self.xp.arange(self.nchannels)[None, :, None, None]
+            inds3 = self.xp.arange(self.nchannels)[None, None, :, None]
+            inds4 = start_inds[:, None, None, None] + self.xp.arange(
                 self.band_buffer.shape[-1]
             )[None, None, None, :]
             return inds1, inds2, inds3, inds4
@@ -1296,8 +1297,8 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         else:
             # Target output shape: (len(inds_fill), self.nchannels, self.band_buffer.shape[-1])
             inds1 = self.unique_band_combos[inds_fill, 1][:, None, None]
-            inds2 = cp.arange(self.nchannels)[None, :, None]
-            inds3 = start_inds[:, None, None] + cp.arange(self.band_buffer.shape[-1])[None, None, :]
+            inds2 = self.xp.arange(self.nchannels)[None, :, None]
+            inds3 = start_inds[:, None, None] + self.xp.arange(self.band_buffer.shape[-1])[None, None, :]
 
         return inds1, inds2, inds3
 
@@ -1330,7 +1331,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         one it's filling.
         """
         assert isinstance(factor, int) and (factor == -1 or factor == +1)
-        params_phys = self.transform_fn.both_transforms(params, xp=cp)
+        params_phys = self.transform_fn.both_transforms(params, xp=self.xp)
         self._likelihood_engine.fill_template(
             target_aca,
             params_phys,
@@ -1889,7 +1890,7 @@ class BandSorter(LISAToolsParallelModule):
 
     def get_band_info(self):
 
-        uni_special, uni_special_counts = cp.unique(
+        uni_special, uni_special_counts = self.xp.unique(
             self.special_band_inds[self.inds], return_counts=True
         )
         uni_temp_inds, uni_walker_inds, uni_band_inds = self.get_separate_inds_from_special_index(
