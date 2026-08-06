@@ -135,7 +135,7 @@ def build_fixture(seed=42):
     nch = 3
     data_shape = (nch, settings.NT, settings.NF_active)
     sens_shape = (nch, nch, settings.NT, settings.NF_active)
-    orbits = EqualArmlengthOrbits()
+    orbits = EqualArmlengthOrbits(force_backend="cpu")
     ac_list = []
     for _ in range(NWALKERS):
         res_data = np.zeros(data_shape, dtype=np.complex128)
@@ -179,7 +179,7 @@ def build_fixture(seed=42):
         T=Tobs,
         t_ref=0.0,
         orbits=orbits,
-        tdi_config=TDIConfig("1st generation"),
+        tdi_config=TDIConfig("1st generation", force_backend="cpu"),
         force_backend="cpu",
         n_side_bins=3,
         window_factor=1.0,
@@ -213,7 +213,7 @@ def build_fixture(seed=42):
     move_kwargs = dict(
         rj_proposal_distribution=None,
         orbits=orbits,
-        tdi_config=TDIConfig("1st generation"),
+        tdi_config=TDIConfig("1st generation", force_backend="cpu"),
         t_ref=0.0,
         max_data_store_size=512,
         waveform_kwargs=waveform_kwargs,

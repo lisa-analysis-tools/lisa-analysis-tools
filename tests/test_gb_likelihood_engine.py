@@ -596,7 +596,7 @@ class STFTEngineNumericTest(unittest.TestCase):
         # The band ACA's cpp_splits group rebuilds a sensitivity backend from
         # the first AC, so each AC needs a REAL backend (orbits + kwargs) --
         # same construction Buffer._build_stft_band_aca uses.
-        orbits = EqualArmlengthOrbits()
+        orbits = EqualArmlengthOrbits(force_backend="cpu")
         ac_list = []
         for _ in range(2):
             res_data = np.zeros(data_shape, dtype=np.complex128)

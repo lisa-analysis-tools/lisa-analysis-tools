@@ -168,7 +168,7 @@ def build_fixture(seed=42):
     move_kwargs = dict(
         rj_proposal_distribution=None,
         orbits=orbits,
-        tdi_config=TDIConfig("1st generation"),
+        tdi_config=TDIConfig("1st generation", force_backend="cpu"),
         t_ref=0.0,
         max_data_store_size=512,
         waveform_kwargs=waveform_kwargs,
