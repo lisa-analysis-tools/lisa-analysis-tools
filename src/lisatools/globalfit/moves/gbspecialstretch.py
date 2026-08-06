@@ -542,6 +542,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         sighet_refresh_every=20,
         sighet_refresh_dphase=0.5,
         sighet_refresh_min_beta=0.1,
+        sighet_trust_dlna=1.5,
+        sighet_trust_dphase=0.5,
+        sighet_trust_snr_c=30.0,
+        sighet_trust_dlna_min=0.3,
+        sighet_anchor_check=False,
+        sighet_drift_check=False,
         debug_seq_pick="first",
         debug=False,
         debug_plot_dir="./gf_output/gb_debug/",
@@ -640,6 +646,58 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # grids; hot junk sources otherwise trip the drift test at nearly
         # every checkpoint).
         self.sighet_refresh_min_beta = float(sighet_refresh_min_beta)
+        # Sig-het TRUST REGION (prior = -inf outside): in-model candidates
+        # whose PHYSICAL-amplitude ratio vs the block's heterodyne anchor
+        # exceeds ``sighet_trust_dlna`` e-folds (or whose carrier-phase
+        # drift exceeds ``sighet_trust_dphase`` rad) are rejected before
+        # scoring. The expansion is only trusted near its reference
+        # (measured: exact to ~3e-6 through |dlnA| ~ 8 on a clean source,
+        # but in-run weak-source offenders corrupt at large excursions),
+        # and a detectable source's posterior never comes near the gate
+        # (lnA width ~ 1/SNR). MH-valid as a proposal-support restriction:
+        # the anchor is the block-start state (re-anchored on refresh), so
+        # the current point always sits inside its own region and the
+        # indicator is symmetric in (x, y). 0 disables. Inert on
+        # chunked-het / FD / STFT (no sig-het reference active).
+        self.sighet_trust_dlna = float(sighet_trust_dlna)
+        self.sighet_trust_dphase = float(sighet_trust_dphase)
+        # PER-SOURCE SNR SCALING of the amplitude gate. The sig-het
+        # truncation error is RELATIVE to the source's own template power,
+        # so the ABSOLUTE lnL error a walker can accrue at the gate
+        # boundary scales with h_h ~ SNR^2: a uniform gate lets an SNR-80
+        # source carry an O(1) absolute error at |dlnA| = 1.5 while an
+        # SNR-3 source's error there is negligible. Scaling the gate as
+        #
+        #     dlnA_max(i) = clip(C / snr_ref(i), dlna_min, sighet_trust_dlna)
+        #
+        # makes the absolute error ceiling roughly uniform across the
+        # catalogue. snr_ref = sqrt(h_h) at the block anchor -- free from
+        # the ll_ref evaluation. Statistically the scaled gate never binds
+        # for detectable sources: their lnA posterior width is ~1/SNR, so
+        # C = 30 sits ~30 sigma out; weak sources keep the global cap,
+        # where their absolute error is small. C = 0 reverts to the
+        # uniform gate (back-compat); the whole gate still disables via
+        # sighet_trust_dlna = 0. Refresh re-anchors snr_ref along with
+        # the reference.
+        self.sighet_trust_snr_c = float(sighet_trust_snr_c)
+        self.sighet_trust_dlna_min = float(sighet_trust_dlna_min)
+        # ANCHOR CHECK (debug, GB_SIGHET_ANCHOR_CHECK=1): at block start,
+        # after the reference build and ll_ref evaluation, score the SAME
+        # anchor coordinates through the exact engine and compare. At the
+        # anchor the heterodyne ratio is exactly 1, so any discrepancy is
+        # an ANCHOR-LEVEL offset in the reference/coefficients for that
+        # source (window/slab truncation, geometry) -- cleanly separated
+        # from candidate-displacement error, which the end-of-block audit
+        # measures. Costs one exact batched call + one reference rebuild
+        # per block.
+        self.sighet_anchor_check = bool(sighet_anchor_check)
+        # DRIFT + LIKELIHOOD AUDIT (debug, GB_SIGHET_DRIFT_CHECK=1): at the
+        # end of the repeat block, report how far each source walked from
+        # its expansion point (pure arithmetic) and re-score the block's
+        # FINAL coordinates through the EXACT engine to measure the
+        # accumulated sig-het likelihood error at the chain's actual
+        # operating points. Costs one exact batched call per block.
+        self.sighet_drift_check = bool(sighet_drift_check)
 
         self.priors = priors
         self.gb = gb
@@ -1768,6 +1826,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         except Exception as e:
             logger.warning("[GB_DEBUG %s] band plot skipped: %r", self.name, e)
 
+    # * ========================================================================
+    # * The main proposal loop: per-band RJ + in-model repeats.
+    # * ========================================================================
+    
     def run_proposal(self, model, state, band_sorter, band_temps):
         """One full pass of per-band proposals.
 
@@ -1897,6 +1959,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # 100-repeat in-model loop is kernel-launch-overhead-bound.
                 tm.count("picked_sources", int(len(picked["specials"])))
 
+            #? Why rj_prop before in_model repeats? eryn/ensemble.py does the reverse
             if self.is_rj_prop:
                 # RJ before/after trace of the chosen cell: snapshots
                 # bracket the RJ step; figures save only when the cell's RJ
@@ -2301,6 +2364,57 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         return new_coords, factors
 
+    def _sighet_drift_metrics(self, curr, ref_track):
+        """Per-source drift vs the heterodyne expansion point, PHYSICAL basis.
+
+        Returns ``(drift, damp)``: accumulated carrier-phase drift
+        ``2*pi*|df0|*Tobs + pi*|dfdot|*Tobs**2`` (rad) and the amplitude
+        ratio ``|ln(A/A_ref)|``. Computed by transforming BOTH coordinate
+        sets to physical parameters, so it is branch-agnostic: reduced
+        sampling bases get exactly-zero contributions from the fixed
+        parameters. Reading sampling columns directly (the old form) would
+        silently misread a reduced basis whose column 1 is not f0.
+
+        Callers must be inside a ``sighet_active`` branch -- ``Tobs``
+        exists only on the time-domain / WDM settings, and sig-het is only
+        ever active on the WDM arm (see :meth:`_run_in_model_repeats`).
+        """
+        xp = self.xp
+        pc = self.transform_fn.both_transforms(curr, xp=xp)
+        pr = self.transform_fn.both_transforms(ref_track, xp=xp)
+        Tobs = float(self._basis_settings.Tobs)
+        drift = (2.0 * np.pi * xp.abs(pc[:, 1] - pr[:, 1]) * Tobs
+                 + np.pi * xp.abs(pc[:, 2] - pr[:, 2]) * Tobs**2)
+        damp = xp.abs(xp.log(xp.abs(pc[:, 0]) / xp.abs(pr[:, 0])))
+        return drift, damp
+
+    def _sighet_trust_dlna_vec(self, buffer_obj, n):
+        """Per-source amplitude gate ``clip(C/snr_ref, dlna_min, dlna_cap)``.
+
+        Reads the reference template power ``h_h_out`` stashed on the
+        buffer by the most recent ``get_ll``/``get_add_ll`` call (i.e. the
+        block's ``ll_ref`` evaluation, or a refresh's re-basing call for
+        the refreshed subset). ``C = 0`` returns the uniform cap."""
+        xp = self.xp
+        if self.sighet_trust_snr_c <= 0.0:
+            return xp.full(n, self.sighet_trust_dlna)
+        hh = xp.asarray(buffer_obj.h_h_out).real
+        snr_ref = xp.sqrt(xp.clip(hh, 0.0, None))
+        return xp.clip(
+            self.sighet_trust_snr_c / xp.maximum(snr_ref, 1e-30),
+            self.sighet_trust_dlna_min, self.sighet_trust_dlna,
+        )
+
+    def _sighet_anchor_phys(self, ref_track):
+        """Anchor-side physical quantities for the trust-region gate.
+
+        Returns ``(|A|, f0, fdot)`` of the heterodyne expansion points so
+        the per-repeat gate only transforms the CANDIDATES (the anchor side
+        is fixed for the block, modulo mid-block refresh)."""
+        xp = self.xp
+        pr = self.transform_fn.both_transforms(ref_track, xp=xp)
+        return xp.abs(pr[:, 0]), pr[:, 1].copy(), pr[:, 2].copy()
+
     def _run_in_model_repeats(self, model, band_sorter, buffer_obj, band_temps,
                               picked, ll_change_log, prop_counts, acc_counts):
         """``num_repeat_proposals`` in-model rounds on the picked live sources.
@@ -2382,8 +2496,52 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # Drift-refresh anchor: the sampling-basis coords each source's
         # sig-het reference was built at (see the refresh block below).
         ref_track = curr.copy() if sighet_active else None
+        # Trust-region gate cache: anchor-side (|A|, f0, fdot) in the
+        # physical basis, so each repeat only transforms the candidates.
+        anchor_phys = (
+            self._sighet_anchor_phys(ref_track)
+            if sighet_active and self.sighet_trust_dlna > 0.0
+            else None
+        )
+        # Tobs only exists on time-frequency bases (WDM/TD) -- NOT on
+        # STFTSettings or FDSettings -- and is only consumed by the
+        # trust-region gate math, which is active exactly when
+        # ``anchor_phys`` is. An unconditional read here would AttributeError
+        # on every FD and STFT GB flow.
+        trust_Tobs = (
+            float(self._basis_settings.Tobs) if anchor_phys is not None else 0.0
+        )
         ll_ref = buffer_obj.get_add_ll(curr, slots, slots, N_vals)
         curr_prior = self.xp.asarray(self.gpu_priors["gb"].logpdf(curr))
+        # Per-source SNR-scaled amplitude gate (see the ctor comment):
+        # snr_ref = sqrt(h_h) at the anchor, stashed by the ll_ref
+        # evaluation just above. Vectorized once per block; the repeat
+        # loop compares candidates against ``trust_dlna``.
+        trust_dlna = None
+        if anchor_phys is not None:
+            trust_dlna = self._sighet_trust_dlna_vec(buffer_obj, len(ids))
+        # Anchor check (debug knob; see ctor comment): sig-het vs exact at
+        # the block anchor itself, where the ratio is exactly 1. Rebuilds
+        # the reference afterwards (fresh == patched is bit-exact).
+        if sighet_active and self.sighet_anchor_check:
+            tm = getattr(self, "_prop_timer", None)
+            with _tspan(tm, "inmodel_anchor_check"):
+                buffer_obj.clear_in_model_likelihood()
+                _ll_ex0 = buffer_obj.get_add_ll(curr, slots, slots, N_vals)
+                buffer_obj.setup_in_model_likelihood(curr, slots, N_vals)
+            _e0 = self.xp.abs(ll_ref - _ll_ex0)
+            _i0 = int(self.xp.argmax(_e0))
+            _f0_0 = float(_to_numpy(self.transform_fn.both_transforms(
+                curr[_i0:_i0 + 1], xp=self.xp)[0, 1]))
+            logger.info(
+                f"{self.name}: sig-het ANCHOR check ({len(ids)} sources): "
+                f"|dll@anchor| max={float(_e0.max()):.3e} "
+                f"median={float(self.xp.median(_e0)):.3e}; worst: "
+                f"temp={int(t_i[_i0])} walker={int(w_i[_i0])} "
+                f"band={int(b_i[_i0])} f0={_f0_0:.6e} Hz "
+                f"ll_het={float(ll_ref[_i0]):.3e} "
+                f"ll_exact={float(_ll_ex0[_i0]):.3e}"
+            )
 
         n4 = (N_vals / 4).astype(int)
         lo_bin = (buffer_obj.frequency_lims[0][slots] / self.df).astype(int)
@@ -2402,6 +2560,26 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             ] = -np.inf
             new_logp[new_bin < lo_bin - n4] = -np.inf
             new_logp[new_bin > hi_bin + n4] = -np.inf
+
+            # Sig-het TRUST REGION: reject candidates outside the
+            # expansion's validity region around the block anchor
+            # (physical |dlnA| / carrier-phase gates; see the ctor
+            # comment for thresholds + MH-validity). Gated rows drop out
+            # of ``keep`` below, so they also skip the ll kernel.
+            if anchor_phys is not None:
+                _pc = self.transform_fn.both_transforms(new, xp=self.xp)
+                _damp_n = self.xp.abs(self.xp.log(
+                    self.xp.abs(_pc[:, 0]) / anchor_phys[0]))
+                _drift_n = (
+                    2.0 * np.pi * self.xp.abs(_pc[:, 1] - anchor_phys[1])
+                    * trust_Tobs
+                    + np.pi * self.xp.abs(_pc[:, 2] - anchor_phys[2])
+                    * trust_Tobs**2
+                )
+                new_logp[
+                    (_damp_n > trust_dlna)
+                    | (_drift_n > self.sighet_trust_dphase)
+                ] = -np.inf
 
             keep = ~self.xp.isinf(new_logp)
             new_ll = self.xp.full(len(ids), -1e300)
@@ -2458,13 +2636,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 and (move_i + 1) % self.sighet_refresh_every == 0
                 and move_i + 1 < self.num_repeat_proposals
             ):
-                Tobs = float(self._basis_settings.Tobs)
-                df0_hz = self.xp.abs(curr[:, 1] - ref_track[:, 1]) / 1e3
-                dfdot = self.xp.abs(curr[:, 2] - ref_track[:, 2])
-                drift = 2.0 * np.pi * df0_hz * Tobs + np.pi * dfdot * Tobs**2
-                far = (drift > self.sighet_refresh_dphase) | (
-                    self.xp.abs(curr[:, 0] - ref_track[:, 0]) > np.log(2.0)
-                )
+                drift, damp = self._sighet_drift_metrics(curr, ref_track)
+                far = (drift > self.sighet_refresh_dphase) | (damp > np.log(2.0))
                 # Hot cells keep their stale reference: the ll error is
                 # beta-suppressed and each refresh is a full setup.
                 far = far & (beta >= self.sighet_refresh_min_beta)
@@ -2476,16 +2649,78 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         curr[far], slots[far], slots[far], N_vals[far]
                     )
                     ref_track[far] = curr[far]
+                    # Re-anchor the trust-region cache with the refreshed
+                    # references (refresh is rare; full recompute is cheap).
+                    # The re-basing get_add_ll above stashed h_h for the
+                    # refreshed subset, so the SNR-scaled gate re-anchors
+                    # from the same call.
+                    if anchor_phys is not None:
+                        anchor_phys = self._sighet_anchor_phys(ref_track)
+                        trust_dlna[far] = self._sighet_trust_dlna_vec(
+                            buffer_obj, int(far.sum()))
                     logger.debug(
                         f"{self.name}: sig-het reference refresh for "
                         f"{int(far.sum())}/{len(ids)} sources at repeat "
                         f"{move_i + 1}."
                     )
 
+        # End-of-block sig-het DRIFT audit (debug knob): report exactly
+        # how far each source walked from its heterodyne expansion point
+        # over the block -- same parameter-space metric the refresh gates
+        # on -- WITHOUT changing the sampling. Pure arithmetic, no kernel.
+        _audit = sighet_active and self.sighet_drift_check
+        if _audit:
+            drift, damp = self._sighet_drift_metrics(curr, ref_track)
+            n_over = int((drift > self.sighet_refresh_dphase).sum())
+            _gate = (
+                f" gate=[{float(trust_dlna.min()):.2f}"
+                f"..{float(trust_dlna.max()):.2f}]"
+                if trust_dlna is not None else ""
+            )
+            logger.info(
+                f"{self.name}: sig-het end-of-block drift ({len(ids)} sources, "
+                f"{self.num_repeat_proposals} repeats): phase max="
+                f"{float(drift.max()):.3e} median="
+                f"{float(self.xp.median(drift)):.3e} rad, "
+                f"{n_over} over dphase={self.sighet_refresh_dphase}; "
+                f"|dlnA| max={float(damp.max()):.3e}.{_gate}"
+            )
+            # The sig-het delta the CHAIN actually used at the final coords
+            # (tracked ll_ref), captured before the engine reverts.
+            _ll_het_final = ll_ref.copy()
+
         # Repeat block over: deactivate the per-source likelihood setup so
         # everything outside the block (RJ, removal, fills) scores through
         # the standard engine path again.
         buffer_obj.clear_in_model_likelihood()
+
+        # End-of-block LIKELIHOOD accuracy AUDIT (same knob as the drift
+        # audit): re-score the block's FINAL coordinates through the EXACT
+        # engine -- after clear_in_model the buffer routes to the chunked
+        # delegate natively -- and compare against the sig-het value the MH
+        # chain used. This is the accuracy tracker for the fixed-reference
+        # policy at the chain's actual operating points: |dll| is directly
+        # comparable to the het budget (dlnL ~ SNR^2 * mm), reported for all
+        # temps and for the COLD chain separately (hot walkers legitimately
+        # roam where the linearization is worst and beta suppresses the
+        # error's effect there). Costs ONE exact batched call per block.
+        if _audit:
+            tm = getattr(self, "_prop_timer", None)
+            with _tspan(tm, "inmodel_accuracy_check"):
+                _ll_exact = buffer_obj.get_add_ll(
+                    curr, slots, slots, N_vals,
+                    phase_maximize=self.phase_maximize)
+            _err = self.xp.abs(_ll_het_final - _ll_exact)
+            _cold = beta > 0.999
+            _n_c = int(_cold.sum())
+            _cmax = float(_err[_cold].max()) if _n_c else float("nan")
+            _cmed = float(self.xp.median(_err[_cold])) if _n_c else float("nan")
+            logger.info(
+                f"{self.name}: sig-het end-of-block ll AUDIT vs exact "
+                f"({len(ids)} sources): |dll| max={float(_err.max()):.3e} "
+                f"median={float(self.xp.median(_err)):.3e}; COLD ({_n_c}): "
+                f"max={_cmax:.3e} median={_cmed:.3e}."
+            )
 
         # Final coordinates back into the residual and the sorter.
         band_sorter.coords[ids] = curr
@@ -3276,6 +3511,31 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         num_active_sources = new_state.branches["gb"].inds.sum(axis=-1)[0]
         logger.info(f"Current number of active sources in cold chain is {num_active_sources}")
+
+        # ACCEPTANCE RATES for this propose, split RJ vs in-model, cold chain
+        # (temp 0) and all-temperature. Nothing logged them before, which made
+        # every proposal-machinery A/B unjudgeable -- whether the pure in_model
+        # move still earns its place, a changed jump scale, the trust-region
+        # gate's cost in rejected candidates. Pure logging; counters already
+        # exist.
+        try:
+            _pc, _ac = _to_numpy(prop_counts), _to_numpy(acc_counts)
+
+            def _rate(row, cold_only):
+                pr = _pc[row][0] if cold_only else _pc[row]
+                ac = _ac[row][0] if cold_only else _ac[row]
+                tot = float(pr.sum())
+                return (float(ac.sum()) / tot if tot > 0 else float("nan"), tot)
+
+            (rj_c, rj_cn), (rj_a, rj_an) = _rate(0, True), _rate(0, False)
+            (im_c, im_cn), (im_a, im_an) = _rate(1, True), _rate(1, False)
+            logger.info(
+                "[GB_ACCEPT %s] rj cold %.4f (n=%.0f) all %.4f (n=%.0f) | "
+                "in-model cold %.4f (n=%.0f) all %.4f (n=%.0f)",
+                self.name, rj_c, rj_cn, rj_a, rj_an, im_c, im_cn, im_a, im_an,
+            )
+        except Exception as exc:  # never break a propose for a log line
+            logger.debug("[GB_ACCEPT %s] skipped: %r", self.name, exc)
 
         # Stage-timing breakdown for this propose (see _ProposeTimer).
         logger.info(
