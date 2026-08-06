@@ -31,7 +31,7 @@ from lisatools.globalfit.stock.erebor import (
 )
 
 from lisatools.globalfit.engine import GlobalFitSettings, GeneralSetup, GeneralSettings, RankInfo
-from lisatools.globalfit.recipe_steps import subtract_initial_signal
+from lisatools.globalfit.recipe import subtract_initial_signal
 from lisatools.utils.constants import YRSID_SI
 from lisatools.globalfit.generatefuncs import *
 
@@ -42,7 +42,7 @@ from eryn.utils import TransformContainer
 
 
 from lisatools.globalfit.preprocessing import L1ProcessingStep
-from lisatools.globalfit.recipe_steps import (
+from lisatools.globalfit.recipe import (
     SearchRecipeStep,
     PERecipeStep,
     RJRecipeStep,

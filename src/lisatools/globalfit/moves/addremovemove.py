@@ -70,7 +70,15 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         Tmax: maximum temperature for the temperature control.
         betas_all: array of betas for all leaves and temperatures. Shape is (nleaves_max, ntemps). If None, betas will be initialized as in TemperatureControl.
         permute_every: number of repeats after which to permute the walkers during a temperature swap. This helps with the mixing of the chains.
-        pad_out_of_prior: whether to pad proposed sources that are out of the prior bounds to avoid JIT compilation issues. If True, proposed sources that are out of the prior bounds will be replaced with the first in-prior point. 
+        pad_out_of_prior: whether to pad proposed sources that are out of the prior bounds to avoid JIT compilation issues. If True, proposed sources that are out of the prior bounds will be replaced with the first in-prior point.
+        flow_buffer_thin: keep only every ``flow_buffer_thin``-th repeat's cold-chain snapshot
+            (plus the final one) in the ring buffer submitted to the flow trainer. Appending
+            every repeat feeds the trainer runs of near-duplicate rows (at ~0.3 acceptance,
+            ~70% of consecutive snapshots are identical) — thin walker-track "worms" that a
+            flexible flow memorizes, collapsing its density onto sub-posterior-scale filaments
+            and killing the flow-move acceptance. Thinning to roughly the walker decorrelation
+            scale (~5 repeats) keeps the submitted rows semi-independent. 1 restores the old
+            append-every-repeat behaviour.
         **kwargs: additional keyword arguments for the Move class.
     """
 
@@ -90,6 +98,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         betas_all: np.ndarray = None,
         permute_every: int = 20,
         pad_out_of_prior: bool = False,
+        flow_buffer_thin: int = 5,
         **kwargs,
     ):
 
@@ -111,6 +120,14 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         self.moves = moves_tmp
         self.move_weights = move_weights / np.sum(move_weights)
 
+        # `propose` is never called on the inner moves -- this move drives them
+        # through `get_proposal` directly -- so nothing else initialises their
+        # acceptance counters. Do it here so `sub_moves` can promise that
+        # `acceptance_fraction` is valid on every child.
+        for inner_move in self.moves:
+            inner_move.accepted = np.zeros((self.ntemps, self.nwalkers))
+            inner_move.num_proposals = 0
+
         self.temperature_controls = [None for _ in range(self.nleaves_max)]
         for i in range(self.nleaves_max):
             if betas_all is not None:
@@ -131,6 +148,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         
         self.permute_every = permute_every
         self.pad_out_of_prior = pad_out_of_prior
+        self.flow_buffer_thin = max(1, int(flow_buffer_thin))
         
         # make sure to propagate the periodic information to the inner moves if it is included in kwargs
         if 'periodic' in kwargs:
@@ -152,21 +170,39 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
                     tmp_move.periodic = periodic
     
     @property
-    def inner_moves_acceptance_fractions(self):
+    def sub_moves(self):
+        """Inner moves driven by this move; each keeps its own acceptance counters.
+
+        Returns a fresh list (mirroring :class:`eryn.moves.CombineMove.sub_moves`)
+        so a caller mutating the returned list cannot corrupt ``self.moves``.
         """
-        Return the acceptance fractions for each inner move at each step.
+        return list(self.moves)
+
+    def _record_inner_acceptance(self, inner_move, accepted):
+        """Fold one repeat's result into ``inner_move``'s standard counters.
+
+        Args:
+            inner_move (:class:`eryn.moves.Move`): The move that was drawn.
+            accepted (np.ndarray): Boolean acceptance for this repeat, shape
+                ``(ntemps_full, nwalkers)``. Only the temperatures this move
+                uses are ever set, so the tail is dropped.
+
+        An inner move instance can also be shared with an ``EnsembleSampler``
+        (e.g. via ``mbh_info["pe_info"]["inner_moves"]``), which unconditionally
+        overwrites ``move.accepted`` with a freshly zeroed ``(ntemps, nwalkers)``
+        buffer of its own on every run; if that buffer's shape does not match
+        ours we re-seed it here instead of raising inside ``propose`` and
+        taking down a multi-hour run.
         """
-        if hasattr(self, "_inner_moves_acceptance_fractions"):
-            return self._inner_moves_acceptance_fractions
-        
-        return None
-    
-    @inner_moves_acceptance_fractions.setter
-    def inner_moves_acceptance_fractions(self, acceptance_fractions):
-        """
-        Set the acceptance fractions for each inner move at each step.
-        """
-        self._inner_moves_acceptance_fractions = acceptance_fractions
+        # the counter array is float: `bool += bool` saturates at 1 and would
+        # cap every per-move count at a single accept per walker
+        expected = (self.ntemps, self.nwalkers)
+        current = getattr(inner_move, "_accepted", None)
+        if current is None or current.shape != expected:
+            inner_move.accepted = np.zeros(expected)
+            inner_move.num_proposals = 0
+        inner_move.accepted += accepted[: self.ntemps]
+        inner_move.num_proposals += 1
 
     def free_gpu_memory(self):
         if self.xp is not np:
@@ -412,12 +448,6 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         leaves_random_order = np.random.permutation(np.arange(self.nleaves_max))
 
         ring_buffer = dict() # prepare a ring buffer to store the proposed points to be submitted to an eventual flow proposal.
-        
-        inner_moves_accepted = dict() # prepare a dictionary to store the accepted fraction for each inner move
-        inner_moves_counter = dict() # prepare a dictionary to store the number of proposals for each inner move
-        for move in self.moves:
-            inner_moves_accepted[move.__class__.__name__] = None
-            inner_moves_counter[move.__class__.__name__] = 0
 
         for leaf in leaves_random_order:
 
@@ -518,6 +548,11 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
                 if flow_move_available:
                     if isinstance(move_here, ConditionalFlowMove):
                         move_here.active_condition = leaf
+                        # Temperature-scaled base (see ConditionalFlowMove.active_betas):
+                        # refresh every repeat from this leaf's live beta ladder, the
+                        # same object the acceptance step below reads via
+                        # temperature_control_here.betas.
+                        move_here.active_betas = temperature_control_here.betas
 
                 # Split the ensemble in half and iterate over these two halves.
                 accepted = np.zeros((ntemps_full, self.nwalkers), dtype=bool)
@@ -645,15 +680,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
                 # print(self.accepted[0])
                 self.num_proposals += 1
 
-                inner_moves_counter[move_name] += 1
-                if inner_moves_accepted[move_name] is None:
-                    # int, not bool: `bool += bool` saturates at 1 and would cap
-                    # every per-move acceptance count at a single accept per walker.
-                    # Only the used temperatures (:self.ntemps) are ever set in
-                    # `accepted`; track those and drop the ntemps_full tail.
-                    inner_moves_accepted[move_name] = accepted[: self.ntemps].astype(int)
-                else:
-                    inner_moves_accepted[move_name] += accepted[: self.ntemps]
+                self._record_inner_acceptance(move_here, accepted)
 
                 # TODO: include PSD likelihood in swaps?
                 # temperature swaps
@@ -696,9 +723,17 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
                     self.branch_name
                 ][:, :, 0]
 
-                leaf_buffer.append(
-                    new_state.branches_coords[self.branch_name][0, :, leaf].copy()
-                )
+                # Thin the flow-trainer feed: only every flow_buffer_thin-th
+                # snapshot (and always the last) is kept, so the submitted
+                # rows are semi-independent instead of near-duplicate runs
+                # (see flow_buffer_thin in the class docstring).
+                if (
+                    (repeat + 1) % self.flow_buffer_thin == 0
+                    or repeat == self.num_repeats - 1
+                ):
+                    leaf_buffer.append(
+                        new_state.branches_coords[self.branch_name][0, :, leaf].copy()
+                    )
 
             # ll_tmp1 = -1/2 * 4 * self.df * xp.sum(data_residuals[:2].conj() * data_residuals[:2] / psd[:2], axis=(0, 2)).get()
             ring_buffer[leaf] = np.array(leaf_buffer).reshape(-1, ndim)
@@ -776,30 +811,11 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
 
         self.free_gpu_memory()
 
-        # mean acceptance fraction per used temperature (averaged over walkers);
-        # shape (self.ntemps,) per move, or the -1. sentinel if the move was never drawn.
-        latest_acceptance_fraction = {
-            k: inner_moves_accepted[k].mean(axis=1) / inner_moves_counter[k]
-            if inner_moves_counter[k] > 0
-            else -1.
-            for k in inner_moves_accepted.keys()
-        }
-
-        if hasattr(self, "_inner_moves_acceptance_fractions"):
-            for move in self.moves:
-                move_name = move.__class__.__name__
-                self._inner_moves_acceptance_fractions[move_name].append(
-                    latest_acceptance_fraction[move_name]
-                    )
-        else:
-            self._inner_moves_acceptance_fractions = dict()
-            for move in self.moves:
-                move_name = move.__class__.__name__
-                self._inner_moves_acceptance_fractions[move_name] = [
-                    latest_acceptance_fraction[move_name]
-                ]
-
-        logger.debug(f"inner moves acceptance fractions: {latest_acceptance_fraction}. elapsed: {time.time() - tic}")
+        logger.debug(
+            "inner moves acceptance fractions: "
+            f"{ {m.__class__.__name__: (float(np.mean(m.acceptance_fraction[0])) if m.num_proposals else -1.0) for m in self.moves} }. "
+            f"elapsed: {time.time() - tic}"
+        )
         logger.debug(f"mean accepted fraction: {np.mean(self.accepted[0] / self.num_proposals)}. elapsed: {time.time() - tic}")
 
 
@@ -860,7 +876,7 @@ class MultiGPUResidualAddRemoveMove(ResidualAddOneRemoveOneMove, MultiGPUMoveBas
     def __init__(
         self, 
         dcga: AnalysisContainerArray | DomainComputationGroupArray,
-        waveform_gen: Any,
+        waveform_gen: Any | list[Any],
         branch_name: str,
         coords_shape: tuple,
         waveform_gen_method: str,
@@ -910,11 +926,29 @@ class MultiGPUResidualAddRemoveMove(ResidualAddOneRemoveOneMove, MultiGPUMoveBas
             batch_size_per_gpu=batch_size_per_gpu,
         )
 
-        self.waveform_gen = waveform_gen
         self.waveform_gen_method = waveform_gen_method
         self.waveform_like_method = waveform_like_method or waveform_gen_method
 
-        self.create_waveform_gen_replicas()
+        self.ensure_waveform_gen_replicas(waveform_gen)
+
+    def ensure_waveform_gen_replicas(self, waveform_gen: Any | list[Any]):
+        """
+        Ensure that the waveform generator replicas are created for each GPU.
+
+        Args:
+            waveform_gen: waveform generator class that generates the waveforms for the sources given their coordinates. 
+                            If a list is provided, assume that the entries are already the correct replicas for each GPU and do not create new ones. If a single waveform generator is provided, create replicas for each GPU.
+        """
+
+        if isinstance(waveform_gen, list):
+            if len(waveform_gen) != self.acs.num_splits:
+                raise ValueError(f"Number of waveform generator replicas ({len(waveform_gen)}) does not match number of splits ({self.acs.num_splits}).")
+            self._waveform_generators = waveform_gen
+            self.waveform_gen = waveform_gen[0]
+        else:
+            self.waveform_gen = waveform_gen
+            self.create_waveform_gen_replicas()
+        
 
     def create_waveform_gen_replicas(self, ):
         """
@@ -929,10 +963,6 @@ class MultiGPUResidualAddRemoveMove(ResidualAddOneRemoveOneMove, MultiGPUMoveBas
                 raise ValueError("Waveform generator must have a 'kwargs' attribute that contains the keyword arguments to initialize the waveform generator.")    
             
             with self.acs.device_context(device):
-                # if i == 0:
-                #     # Reuse the initial waveform generator for the first split to save memory
-                #     self._waveform_generators.append(self.waveform_gen)
-                # else:
                 init_kwargs = self.waveform_gen.kwargs.copy()
                 if "orbits" in init_kwargs:
                     init_kwargs["orbits"] = self.acs.cpp_split(i).orbits

@@ -272,6 +272,27 @@ class PERecipeStep(BaseRecipeStep):
         return False
 
 
+class IterationCountRecipeStep(BaseRecipeStep):
+    """Recipe step that runs for N iterations before moving to the next step."""
+
+    def __init__(self, moves: list, weights: typing.Optional[list] = None, num_iters: int = 100):
+        super().__init__(moves, weights)
+        self.num_iters = num_iters
+
+    def setup_run(self, iteration, last_sample, sampler):
+        super().setup_run(iteration, last_sample, sampler)
+
+        self.start_iteration = iteration
+
+    def stopping_function(self, iteration, last_sample, sampler):
+        """Stop after num_iters iterations."""
+        stop = (iteration - self.start_iteration) >= self.num_iters
+        if stop:
+            logger.info(f"IterationCountRecipeStep stopping after {self.num_iters} iterations.")
+
+        return stop
+
+
 class RJRecipeStep(BaseRecipeStep):
     """Reversible-jump recipe step that stops once GB leaf count plateaus.
 
@@ -518,17 +539,23 @@ def scatter_around_injection(
         state.branches_inds[branch_name][:, :, leaf] = True
 
 
-def mbh_catalogue_to_sampling_basis(catalogue_entry: dict, trim_duration: float = 0.0) -> np.ndarray:
+def mbh_catalogue_to_sampling_basis(
+    catalogue_entry: dict,
+    trim_duration: float = 0.0,
+    to_lisa_frame: typing.Optional[callable] = None,
+) -> np.ndarray:
     """Convert a single Mojito MBHB catalogue entry to MBH sampling basis.
 
     The sampling basis is:
     ``[logM, q, s1z, s2z, dist, phi_ref, cos_iota, psi, lam, sin_beta, t_plunge]``
 
-    Sky / polarization / time parameters are returned in the **SSB
-    ecliptic frame** — the sprint-wide sampling frame. (LISA-frame
-    sampling is handled by the moves themselves, e.g.
-    :class:`lisatools.sampling.moves.skymodehop.SkyMove` with
-    ``coord_frame="ssb_ecliptic"``.)
+    By default sky / polarization / time parameters are returned raw in
+    **ICRS** (ra, sin_dec, psi_icrs; time SSB) — the sprint-wide run frame.
+    If ``to_lisa_frame`` is provided (a partial of
+    :func:`lisatools.sources.utils.to_lisa_frame` with ``orbits`` bound),
+    they are instead converted to the LISA frame consistently with the
+    orbits' own frame (``orbits.frame``), matching the sampling-side
+    inverse transform used by the MBH transform container.
 
     Parameters
     ----------
@@ -560,29 +587,75 @@ def mbh_catalogue_to_sampling_basis(catalogue_entry: dict, trim_duration: float 
     phi_ref = float(catalogue_entry["PhaseReferenceSourceFrame"]) % (2 * np.pi)
     cos_iota = np.cos(float(catalogue_entry["InclinationAngle"]))
 
-    # Sky coordinates: ICRS -> ecliptic -> SSB -> LISA
+    # Sky coordinates: catalogue is ICRS
     ra = float(catalogue_entry["RightAscension"]) % (2 * np.pi)
     dec = float(catalogue_entry["Declination"])
     sin_dec = np.sin(dec)
     psi_icrs = float(catalogue_entry["PolarisationAngle"]) % np.pi  # ensure polarization is within [0, pi]
-    lam_ecl, beta_ecl, psi_ssb = icrs_to_ecliptic(ra, dec, psi_icrs)
     t_ssb = float(catalogue_entry["TimeCoalescencePhenomTPHMSSBFrame"])
+
+    if to_lisa_frame is not None:
+        # ``to_lisa_frame`` interprets its input angles in the frame the orbit
+        # positions are expressed in, and the sampling-side inverse
+        # (``from_lisa_frame`` -> alpha, delta, psi via the MBH transform
+        # container) hands its output directly to the ICRS-frame waveform
+        # basis.  The input angles must therefore be given in the orbits' own
+        # frame: no ecliptic detour for ICRS orbits.
+        orbits = getattr(to_lisa_frame, "keywords", {}).get("orbits")
+        frame = getattr(orbits, "frame", "icrs")
+        if frame == "icrs":
+            lam, beta, psi = ra, dec, psi_icrs
+        elif frame == "ecliptic":
+            lam, beta, psi = icrs_to_ecliptic(ra, dec, psi_icrs)
+        else:
+            raise ValueError(
+                f"Unsupported orbits frame {frame!r} for LISA-frame conversion."
+            )
+        t_L, lam_L, beta_L, psi_L = to_lisa_frame(t_ssb, lam, beta, psi)
+        return np.array([logM, Q, s1z, s2z, dist, phi_ref, cos_iota, psi_L % np.pi, lam_L % (2 * np.pi), np.sin(beta_L), t_L])
 
     # ICRS sampling basis (stft_tof + 2026-06 run-frame directive): sky and
     # polarization are kept in ICRS (ra, sin_dec, psi_icrs); time stays SSB.
     # Erebor's stock MBH transform (MBHSetup.init_sampling_info /
     # make_mbh_transform_container) uses the same direct-ICRS basis.
-    # logger.debug(f"Catalogue entry: RA={ra}, Dec={dec}, psi_icrs={psi_icrs}, t_ssb={t_ssb}")
-
-    # t_L, lam_L, beta_L, psi_L = SSB_to_LISA(t_ssb, lam_ecl, beta_ecl, psi_ssb)
-
-    # lam_L = lam_L % (2 * np.pi)
-    # psi_L = psi_L % np.pi
-    # logger.debug(f"Converted to LISA frame: t_L={t_L}, lambda_L={lam_L}, beta_L={beta_L}, psi_L={psi_L}")
-    # sin_beta_L = np.sin(beta_L)
-
-    #return np.array([logM, Q, s1z, s2z, dist, phi_ref, cos_iota, psi_L, lam_L, sin_beta_L, t_L])
     return np.array([logM, Q, s1z, s2z, dist, phi_ref, cos_iota, psi_icrs, ra, sin_dec, t_ssb])
+
+
+def emri_catalogue_to_sampling_basis(catalogue_entry: dict, trim_duration: float = 0.0) -> np.ndarray:
+    """Convert a single Mojito EMRI catalogue entry to EMRI sampling basis.
+
+    The sampling basis is:
+    ``["logm1", "m2", "a", "p0", "e0", "dist", "cosqK", "phiK", "Phi_phi0", "Phi_r0", "alpha", "sin_delta",]``
+
+    Parameters
+    ----------
+    catalogue_entry : dict
+        Dictionary of catalogue parameters for one EMRI source, as
+        stored by ``L1DataLoader.catalogue['EMRI'][source_id]``.
+
+    Returns
+    -------
+    np.ndarray
+        Parameter vector of shape ``(12,)`` in the EMRI sampling basis
+        (ICRS for sky parameters).
+    """
+    m1 = float(catalogue_entry['PrimaryMassSSBFrame'])
+    m2 = float(catalogue_entry['SecondaryMassSSBFrame'])
+    a = float(catalogue_entry['PrimarySpinParameter'])
+    p0 = float(catalogue_entry['SemiLatusRectum'])
+    e0 = float(catalogue_entry['Eccentricity'])
+    xI0= float(np.cos(catalogue_entry['InclinationAngle']))
+    dist = float(catalogue_entry['LuminosityDistance'] * 1e-3) # convert to Gpc
+    ra = float(catalogue_entry['RightAscension']) % (2 * np.pi)
+    dec = float(catalogue_entry['Declination'])
+
+    qK = float(catalogue_entry['PolarAnglePrimarySpin'])
+    phiK = float(catalogue_entry['AzimuthalAnglePrimarySpin']) % (2 * np.pi)
+
+    Phi_phi0 = float(catalogue_entry['AzimuthalPhase']) % (2 * np.pi)
+    Phi_r0 = float(catalogue_entry['RadialPhase']) % (2 * np.pi)
+
+    return np.array([np.log(m1), m2, a * xI0, p0, e0, dist, np.cos(qK), phiK, Phi_phi0, Phi_r0, ra, np.sin(dec)])
 
 
 def gb_catalogue_to_sampling_basis(catalogue_entry: dict, trim_duration: float = 0.0) -> np.ndarray:
