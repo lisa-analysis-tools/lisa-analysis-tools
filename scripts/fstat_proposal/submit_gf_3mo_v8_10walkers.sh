@@ -2235,5 +2235,35 @@ if os.path.exists(store):
     )
 PYEOF
 
+# ===== REWIND CONTROL ARM (2026-09-10): the job-465 SCIENCE configuration =====
+# Job 467 (windowed stash + one-batch in-model + N_SUBBANDS 16384 + valve fix)
+# shed 148 cold leaves and 8,300 lnL starting at its FIRST RJ call after a
+# clean resume; the credited-vs-actual per-cell ll check ([GB_CELL_LL]) went
+# 2.0 -> 10.5 per cell (cold worst-cell |diff| 77 -> 582 lnL) at that relaunch
+# while every per-source sig-het metric, the proposal scales and the RJ
+# acceptance counters stayed put. No single change is identified yet, so the
+# control arm reverts ALL of them at once on the CURRENT code: submit with
+#   sbatch --export=ALL,GB_SCIENCE_465=1 <this script>
+# after `scripts/fstat_proposal/rewind_to_465.sh 3mo --apply` (store back to
+# iteration 151, gb_search re-opened, sidecars + epochs 4/5 moved aside).
+# Expect on the first units: [GB_CELL_LL rj_*] per-cell mean back near 2,
+# cold worst-cell diffs ~80 lnL, leaves flat-to-rising as in 465. Bisect from
+# there by re-enabling one line at a time. Unset = the production block above.
+if [ "${GB_SCIENCE_465:-0}" = "1" ]; then
+  echo "[GB_SCIENCE_465] control arm: reverting the 2026-09-09/10 knobs to job 465"
+  export GB_N_SUBBANDS=8192                 # 16384 -> 32768 since; 3 buffer batches per unit as in 465
+  export GB_SIGHET_INMODEL_WINDOWED=0       # full-band stash expansion (the 465 path; UNSET would mean windowed)
+  export GB_INMODEL_SETUP_BATCH=1024        # batched staging (0 since)
+  export GB_RJ_INMODEL_CHUNK=4096           # RJ in-model chunk width (32768/65536 since)
+  export GB_INFOMAT_MEMPOOL_FREE=1
+  export GB_INMODEL_BATCH_MEMPOOL_FREE=1
+  export GB_SIGHET_DRIFT_CHECK=0            # was 0 on 465 (diagnostic only, but keep the arm exact)
+  export GB_PSD_SHARED_MIRROR=0             # per-slot invC copies (parity-verified identical, but keep the arm exact)
+  export GB_PSD_MIRROR_PARITY_PROPOSES=0
+  export GB_TEMPER_PRELOAD_CELLS=2400
+  unset GB_SIGHET_FOLD_MAX_BYTES            # code default 1 GiB
+  export GB_PE_RJ_DRAW_ONE=0                # PE-stage exclusive draw off (search stage anyway until it 175)
+  export GB_RJ_BAND_SHUTOFF_SCOPE=off       # the valve was inert on 465 (gate bug, fixed 2983d912); keep it inert
+fi
 mpiexec -n 3 python scripts/fstat_proposal/run_combined_staged.py
 # python scripts/fstat_proposal/run_combined_staged.py   # single-process fallback

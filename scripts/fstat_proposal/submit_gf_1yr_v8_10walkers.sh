@@ -2303,5 +2303,28 @@ if os.path.exists(store):
         print(f"[V8-NOISE] resume identity OK: {a}")
 PYEOF
 
+# ===== REWIND CONTROL ARM (2026-09-10): the job-466 SCIENCE configuration =====
+# Twin of the 3mo block (see submit_gf_3mo_v8_10walkers.sh for the evidence).
+# At 1 yr the leaf count kept growing through 468/470, but the same
+# credited-vs-actual per-cell check doubled at the 468 relaunch (6.3 -> 13.7
+# per cell), so the arm exists here too. Submit with
+#   sbatch --export=ALL,GB_SCIENCE_465=1 <this script>
+# after `scripts/fstat_proposal/rewind_to_465.sh 1yr --apply` (store back to
+# iteration 29 = the row job 468 resumed from). Unset = the production block.
+if [ "${GB_SCIENCE_465:-0}" = "1" ]; then
+  echo "[GB_SCIENCE_465] control arm: reverting the 2026-09-09/10 knobs to job 466"
+  export GB_N_SUBBANDS=1024                 # 466 value (2048 -> 4096 since)
+  export GB_SIGHET_INMODEL_WINDOWED=0       # full-band stash expansion (the 466 path)
+  export GB_INMODEL_SETUP_BATCH=256         # 466 value (0 since)
+  export GB_RJ_INMODEL_CHUNK=4096
+  export GB_INFOMAT_MEMPOOL_FREE=1
+  export GB_INMODEL_BATCH_MEMPOOL_FREE=1
+  export GB_PSD_SHARED_MIRROR=0
+  export GB_PSD_MIRROR_PARITY_PROPOSES=0
+  export GB_TEMPER_PRELOAD_CELLS=2400
+  unset GB_SIGHET_FOLD_MAX_BYTES
+  export GB_PE_RJ_DRAW_ONE=0
+  export GB_RJ_BAND_SHUTOFF_SCOPE=off
+fi
 mpiexec -n 3 python scripts/fstat_proposal/run_combined_staged.py
 # python scripts/fstat_proposal/run_combined_staged.py   # single-process fallback
