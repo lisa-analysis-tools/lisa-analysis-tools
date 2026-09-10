@@ -1944,6 +1944,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         num_band_preload=20000,
         wdm_band_slab_layers=None,
         wdm_slab_guard_layers=1,
+        psd_shared_mirror=False,
+        psd_mirror_parity_proposes=0,
+        psd_mirror_parity_rows=64,
         run_swaps=True,
         temper_every_proposes=1,
         max_data_store_size=6000,
@@ -2026,6 +2029,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # BandSorter -> SubBandBuffer.
         self.wdm_band_slab_layers = wdm_band_slab_layers
         self.wdm_slab_guard_layers = wdm_slab_guard_layers
+        # Shared-psd mirror (GB_PSD_SHARED_MIRROR, default OFF) + parity gate
+        # knobs: forwarded to every BandSorter -> SubBandBuffer exactly like
+        # the slab knobs above. See SubBandBuffer.__init__.
+        self.psd_shared_mirror = bool(psd_shared_mirror)
+        self.psd_mirror_parity_proposes = int(psd_mirror_parity_proposes)
+        self.psd_mirror_parity_rows = int(psd_mirror_parity_rows)
         self.band_preload_size = self.max_data_store_size = max_data_store_size
         self.use_prior_removal = use_prior_removal
         # Search-mode RJ variants (see the class docstring): removal-only
@@ -3730,17 +3739,26 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             nc = buffer_obj.nchannels
 
             band_np = _to_numpy(buffer_obj._materialize(buffer_obj.band_buffer))
-            psd_np = _to_numpy(buffer_obj._materialize(buffer_obj.psd_buffer))
+            # Shared-psd mirror: psd_buffer is a slot-indexed GATHERER (no
+            # per-slot storage) -- materialize only the rows this debug
+            # readout touches, never the whole buffer.
+            _psd_src = buffer_obj.psd_buffer
+            psd_np = (None if getattr(buffer_obj, "_psd_shared_mirror", False)
+                      else _to_numpy(buffer_obj._materialize(_psd_src)))
+
+            def _psd_row(i):
+                return (psd_np[i] if psd_np is not None
+                        else _to_numpy(_psd_src[int(i)]))
             msgs = []
             for i in sorted(rows, key=lambda i: int(combos[i, 0])):
                 t = int(combos[i, 0])
                 r = band_np[i].reshape(nc, Nf_a, Nt_a)[:, k0:k1]
                 if buffer_obj.tdi_channel_setup == "XYZ":
-                    ic = psd_np[i].reshape(nc, nc, Nf_a, Nt_a)[:, :, k0:k1]
+                    ic = _psd_row(i).reshape(nc, nc, Nf_a, Nt_a)[:, :, k0:k1]
                     ll = -0.5 * 4.0 * dc * float(
                         np.einsum("ifk,ijfk,jfk->", r, ic.real, r))
                 else:
-                    ic = psd_np[i].reshape(nc, Nf_a, Nt_a)[:, k0:k1]
+                    ic = _psd_row(i).reshape(nc, Nf_a, Nt_a)[:, k0:k1]
                     ll = -0.5 * 4.0 * dc * float(np.sum(r * ic.real * r))
                 msgs.append(f"T{t}: {ll:.6e}")
             logger.info(
@@ -11038,9 +11056,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     dat = cp.asarray(
                         buffer_obj.linear_data_arr[0]).reshape(
                         -1, 3, Wd, Ta)
-                    ivc = cp.asarray(
-                        buffer_obj.linear_psd_arr[0]).reshape(
-                        -1, 3, 3, Wd, Ta)
+                    # Shared-psd mirror: linear_psd_arr[0] is the parent's
+                    # per-walker plane there -- read the slots through the
+                    # buffer's gatherer instead of a per-slot reshape.
+                    ivc = (None if getattr(buffer_obj, "_psd_shared_mirror", False)
+                           else cp.asarray(
+                               buffer_obj.linear_psd_arr[0]).reshape(
+                               -1, 3, 3, Wd, Ta))
                     sl = _to_numpy(slots).astype(int)
                     phys_top = _to_numpy(self.transform_fn.both_transforms(
                         curr[cp.asarray(top)], xp=cp,
@@ -11051,7 +11073,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         raw_idx=top,
                         raw_params_phys=phys_top,
                         raw_slab_data=_to_numpy(dat[sl[top]]),
-                        raw_slab_invc=_to_numpy(ivc[sl[top]]),
+                        raw_slab_invc=(_to_numpy(ivc[sl[top]]) if ivc is not None
+                                       else _to_numpy(buffer_obj.psd_buffer[
+                                           cp.asarray(sl[top])])),
                         raw_slab_min_f=(_to_numpy(cp.asarray(_slo))[sl[top]]
                                         if _slo is not None else
                                         np.full(len(top), -1)),
@@ -16410,6 +16434,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 gb_fd_comp=self.gb_fd_comp,
                 wdm_band_slab_layers=self.wdm_band_slab_layers,
                 wdm_slab_guard_layers=self.wdm_slab_guard_layers,
+                psd_shared_mirror=self.psd_shared_mirror,
+                psd_mirror_parity_proposes=self.psd_mirror_parity_proposes,
+                psd_mirror_parity_rows=self.psd_mirror_parity_rows,
                 waveform_kwargs=self.waveform_kwargs,
                 rj_prop=rj_prop,
                 keep_all_inds=keep_all_inds,
@@ -16707,6 +16734,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 gb_fd_comp=self.gb_fd_comp,
                 wdm_band_slab_layers=self.wdm_band_slab_layers,
                 wdm_slab_guard_layers=self.wdm_slab_guard_layers,
+                psd_shared_mirror=self.psd_shared_mirror,
+                psd_mirror_parity_proposes=self.psd_mirror_parity_proposes,
+                psd_mirror_parity_rows=self.psd_mirror_parity_rows,
                 waveform_kwargs=self.waveform_kwargs,
             )
 
@@ -17468,6 +17498,9 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             gb_fd_comp=self.gb_fd_comp,
             wdm_band_slab_layers=self.wdm_band_slab_layers,
             wdm_slab_guard_layers=self.wdm_slab_guard_layers,
+            psd_shared_mirror=self.psd_shared_mirror,
+            psd_mirror_parity_proposes=self.psd_mirror_parity_proposes,
+            psd_mirror_parity_rows=self.psd_mirror_parity_rows,
             waveform_kwargs=self.waveform_kwargs,
             # None = no rj proposal (the BandSorter sentinel; its guard is
             # ``rj_prop is not None``, so False would be TREATED AS a

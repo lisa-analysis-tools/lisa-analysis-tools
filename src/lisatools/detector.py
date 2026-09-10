@@ -461,11 +461,22 @@ class Orbits(LISAToolsParallelModule, ABC):
 
         # prepare cpp class args to load when needed
         if make_cpp:
+            # The C++ ``Orbits`` locates its window as ``int((t - t0) / dt)``
+            # over ``len(self.t)`` nodes, so the start time handed to it MUST
+            # be the configured grid's first node. The ``linear_interp_setup``
+            # and ``dt`` branches build ``t_arr`` from ``self.t0``, so this is
+            # identical to the old ``self.t0`` there; the explicit ``t_arr``
+            # branch can start anywhere in the file (a short window around a
+            # late ``t_obs_start``), and handing it ``self.t0`` put every
+            # evaluation time past the last node -> ``get_window`` = -1 ->
+            # zero unit vectors / positions -> EXACTLY ZERO templates
+            # (GBGPU tests/psd_mirror_fixture.py, 2026-09-09).
+            t_cpp_start = float(t_arr[0])
             self.pycppdetector_args = [ # duplicate ltts and positions informations when using the more general c++ class
-                self.t0,
+                t_cpp_start,
                 dt,
                 len(self.t),
-                self.t0,
+                t_cpp_start,
                 dt,
                 len(self.t),
                 self.xp.asarray(self.n.flatten().copy()),

@@ -534,7 +534,58 @@ export GB_NLEAVES_MAX=10000
 # below is raised to match so it cannot silently re-cap the pool. WATCH:
 # "GPU pool used X / total Y" plateau and the first rj_fstat_search after
 # resume. ESCALATE (32768/GPU) only after one clean iteration.
-export GB_N_SUBBANDS=16384  # (was 8192) PER GPU; TRUE per-slot cost incl. XYZ invC (~1 MB @3mo, ~8 MB @23mo) x 2 move caches -- job-183 sizing   # PER GPU (LAT >= this commit): total = x n_gpus
+# 16384 -> 32768 (2026-09-09, SHARED-PSD MIRROR relaunch -- read the
+# GB_PSD_SHARED_MIRROR block right below and the gate block by
+# GB_INMODEL_SETUP_BATCH before resubmitting). With the mirror ON a slot
+# holds DATA ONLY (0.25 MB here: 3 ch x 5 layers x 2160 x 8 B); the 0.76 MB
+# per-slot invC copy (75% of the old 1.02 MB) is gone. So 32768 x 0.25 MB
+# = 8.2 GB per GPU is LESS than the 16384 x 1.02 MB = 16.7 GB this line
+# cost on job 467 (-8.5 GB/GPU on the RJ buffer; the 2400-slot tempering
+# twin drops its never-read 1.8 GB invC too; +0.28 GB per device for the
+# walker-plane replica). This is the sub-band capacity the 2026-09-09
+# pool-at-cap measurement asked for (pool hit the 4096 cap in 40% of 1yr
+# blocks). GB_RJ_INMODEL_CHUNK below is raised to 65536 to match.
+# ROLLBACK: if GB_PSD_SHARED_MIRROR is unset/0, per-slot invC RETURNS and
+# this value must go back to 16384 (32768 x 1.02 MB = 33 GB/GPU would not
+# fit next to the F-stat grid) -- the two knobs move TOGETHER.
+export GB_N_SUBBANDS=32768  # (was 16384 pre-mirror, 8192 before that) PER GPU; per-slot cost = data only with the mirror (0.25 MB @3mo), data + XYZ invC (1.02 MB) without   # PER GPU (LAT >= this commit): total = x n_gpus
+# ######################################################################### #
+# ##  SHARED-PSD MIRROR (2026-09-09): the sub-band buffers stop copying    ##
+# ##  each slot's inverse-PSD slab out of the parent's per-walker plane   ##
+# ##  and read ONE per-device replica of that plane through a per-slot    ##
+# ##  walker-row map (LAT gbbands.bind_psd_mirror + GBGPU kernels' new    ##
+# ##  trailing (invC_Nf, invC_row) args). Same bytes, same kernels, no    ##
+# ##  invC representation change ("leave invC alone" ruling: this is     ##
+# ##  deduplication of COPIES only). Default OFF in code; ON here.        ##
+# ##  ⚠ GATE: needs the cluster to PULL BOTH LAT and GBGPU and REBUILD    ##
+# ##  GBGPU (`pip install -e .` in GBGPU: bindings + kernels changed, and ##
+# ##  GBGPU compiles LAT's lat_chunked_het_kernels.hh in). On the OLD    ##
+# ##  wheel the engine raises a TypeError at the first get_ll (the mirror ##
+# ##  args are passed unconditionally) -- loud, not silent.               ##
+# ##  CONFIRM in globalfit_run.log at the first buffer build:             ##
+# ##    "GB psd mirror: SHARED (per-device replica: 10 walkers x 28 MB    ##
+# ##     = 0.28 GB per device, 2 devices; per-slot invC 0 MB, twin psd:   ##
+# ##     none) [GB_PSD_SHARED_MIRROR=1]"                                  ##
+# ##    and the SubBandBuffer line reads "... + ~0 MB invC = ...".        ##
+# ##  If it says "GB psd mirror: OFF (per-slot copies: ...)" the knob did ##
+# ##  not apply (spooled copy of an old script): scancel, NEW sbatch.     ##
+# ##  PARITY GATE (armed below for the first 3 unit fills of EVERY        ##
+# ##  buffer): each get_ll / swap_ll / fstat / sig-het setup is re-scored ##
+# ##  through the old per-slot layout on 64 rows and compared             ##
+# ##  bit-for-bit. Expect, per armed fill:                                ##
+# ##    "[GB_PSD_MIRROR parity] armed for unit fill 1 (2 more after ...)" ##
+# ##    "[GB_PSD_MIRROR parity resid get_ll] unit 1 rows=64 slots=...:    ##
+# ##     IDENTICAL (bit-for-bit; ...)"  (one per engine call)             ##
+# ##    "[GB_PSD_MIRROR parity] gate retired after 3 proposes, no          ##
+# ##     divergence"                                                      ##
+# ##  Any mismatch is a RuntimeError naming the slot / walker row / slab  ##
+# ##  origin and both values -- the job dies, it never warns.             ##
+# ######################################################################### #
+export GB_PSD_SHARED_MIRROR=1
+# First 3 unit fills of each buffer shadow-checked (see the gate box above);
+# 0 = disarmed (production setting once the gate has retired cleanly on
+# both runs). 64 rows per check is the code default (GB_PSD_MIRROR_PARITY_ROWS).
+export GB_PSD_MIRROR_PARITY_PROPOSES=3
 # RJ pick thinning. UNSET as of 2026-08-28 -- the value now lives in code
 # (_SEARCH_RJ_FLIP_DEFAULT / _PE_RJ_FLIP_DEFAULT in recipe.py, both 0.2),
 # so behavior is UNCHANGED from the 0.2 this line used to export.
@@ -1148,8 +1199,9 @@ export VGB_BAND_LAYERS=8
 # ##    "sig-het in-model stash: COMPACT per-reference windows [v5=1, ...]"  ##
 # ##  If it says "full band (Nf_active=...)" the port is NOT live: scancel.  ##
 # ##  ALSO CONFIRM the raised capacity took: the first RJ buffer build     ##
-# ##  line must read "buffer build (32768-slot alloc, ..." (16384/GPU x 2).##
-# ##  If it still says 16384-slot, the knob did not apply. n_subbands is   ##
+# ##  line must read "buffer build (65536-slot alloc, ..." (32768/GPU x 2  ##
+# ##  since the 2026-09-09 mirror relaunch; it read 32768-slot on job 467).##
+# ##  If it still says 32768-slot, the knob did not apply. n_subbands is   ##
 # ##  never persisted and the only resume check is the noise-model         ##
 # ##  identity, so the way a raised value fails to apply is a REQUEUED job ##
 # ##  re-running the SPOOLED copy of this script. Relaunch with scancel +  ##
@@ -1188,7 +1240,9 @@ export GB_INMODEL_SETUP_BATCH=0
 # KEEP THIS >= GB_N_SUBBANDS x n_gpus whenever that knob is raised, or it
 # silently re-caps the pool. Depends on the windowed-stash port being
 # deployed on the cluster (see the gate block above).
-export GB_RJ_INMODEL_CHUNK=32768
+# 32768 -> 65536 (2026-09-09, mirror relaunch): capacity is now 32768/GPU x
+# 2 = 65536, so the value tracks it (rule above).
+export GB_RJ_INMODEL_CHUNK=65536
 # 1 -> 0, BOTH (2026-09-09). The memory-safe-mode pair this script
 # re-enabled ("slower ... but memory-safe") to reclaim the PRE-PORT stash
 # churn: the staging-cap sweep (_free_inmodel_batch_pools, gated by

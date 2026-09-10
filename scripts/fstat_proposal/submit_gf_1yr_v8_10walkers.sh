@@ -536,7 +536,61 @@ export GB_NLEAVES_MAX=25000
 # in-pool memory the logs do not itemize is the remaining uncertainty; the
 # post-port envelope is ~4,000/GPU before the slab (4.09 MB/slot, 75% invC)
 # becomes the binding term.
-export GB_N_SUBBANDS=2048  # (was 1024) PER GPU; per-slot cost ~4 MB @1yr (Tobs-linear) x 2 move caches -- HALVED TWICE from the 3-mo 8192 so the byte budget matches (8192@3mo->4096@6mo->2048@1yr). This is the #1 GPU-MEMORY WATCH: the old 1yr_v5 dropped to 1024 under a v5-era memory ceiling; v8 retired the F-stat centers so 2048 was tried first, but jobs 443/446 OOM'd on the FIRST rj_fstat_search of gb_search -- dev0 hit 88.72/99.9 GB (89%) loading the complete F-stat grid + move caches, then a 2.08 GB SubBandBuffer alloc tipped it over (batch 512 made NO difference: identical 88.72 GB -- this OOM is the F-stat-search path, not the in-model stash). Halved to 1024 (2026-09-06) per this line's own ceiling rule; frees ~8 GB/GPU. If it still OOMs, either halve again to 512 or add GPUs (--gres=gpu:4 + GPUS=0,1,2,3 ~halves per-GPU load; dev0/dev1 are imbalanced ~2:1).   # PER GPU: total = x n_gpus
+# 2048 -> 4096 (2026-09-09, SHARED-PSD MIRROR relaunch -- read the
+# GB_PSD_SHARED_MIRROR block right below and the gate block by
+# GB_INMODEL_SETUP_BATCH before resubmitting). With the mirror ON a slot
+# holds DATA ONLY (1.02 MB here: 3 ch x 5 layers x 8640 x 8 B); the 3.07 MB
+# per-slot invC copy (75% of the old 4.09 MB) is gone. So 4096 x 1.02 MB
+# = 4.2 GB per GPU is LESS than the 2048 x 4.09 MB = 8.4 GB this line cost
+# on job 468 (-4.2 GB/GPU on the RJ buffer; the 2400-slot tempering twin
+# drops its never-read 7.4 GB invC too; +1.1 GB per device for the
+# 10-walker plane replica: net ~-10 GB/GPU). This is the capacity the
+# 2026-09-09 measurement asked for: the picked pool sat AT the 4096-slot
+# cap in 40% of job-468 blocks (mean 1,171, p90 = max = 2048/GPU), so the
+# cap was clipping the in-model pool every other block. GB_RJ_INMODEL_CHUNK
+# (16384) already covers 4096/GPU x 2.
+# ROLLBACK: if GB_PSD_SHARED_MIRROR is unset/0, per-slot invC RETURNS and
+# this value must go back to 2048 (4096 x 4.09 MB = 16.8 GB/GPU on top of
+# the ~89 GB dev0 F-stat-search baseline = OOM) -- the two knobs move
+# TOGETHER.
+export GB_N_SUBBANDS=4096  # (was 2048 pre-mirror, 1024 before that) PER GPU; per-slot cost = data only with the mirror (1.02 MB @1yr), data + XYZ invC (4.09 MB) without. Pre-mirror history: ~4 MB @1yr (Tobs-linear) x 2 move caches -- HALVED TWICE from the 3-mo 8192 so the byte budget matches (8192@3mo->4096@6mo->2048@1yr). This is the #1 GPU-MEMORY WATCH: the old 1yr_v5 dropped to 1024 under a v5-era memory ceiling; v8 retired the F-stat centers so 2048 was tried first, but jobs 443/446 OOM'd on the FIRST rj_fstat_search of gb_search -- dev0 hit 88.72/99.9 GB (89%) loading the complete F-stat grid + move caches, then a 2.08 GB SubBandBuffer alloc tipped it over (batch 512 made NO difference: identical 88.72 GB -- this OOM is the F-stat-search path, not the in-model stash). Halved to 1024 (2026-09-06) per this line's own ceiling rule; frees ~8 GB/GPU. If it still OOMs, either halve again to 512 or add GPUs (--gres=gpu:4 + GPUS=0,1,2,3 ~halves per-GPU load; dev0/dev1 are imbalanced ~2:1).   # PER GPU: total = x n_gpus
+# ######################################################################### #
+# ##  SHARED-PSD MIRROR (2026-09-09): the sub-band buffers stop copying    ##
+# ##  each slot's inverse-PSD slab out of the parent's per-walker plane   ##
+# ##  and read ONE per-device replica of that plane through a per-slot    ##
+# ##  walker-row map (LAT gbbands.bind_psd_mirror + GBGPU kernels' new    ##
+# ##  trailing (invC_Nf, invC_row) args). Same bytes, same kernels, no    ##
+# ##  invC representation change ("leave invC alone" ruling: this is     ##
+# ##  deduplication of COPIES only). Default OFF in code; ON here.        ##
+# ##  ⚠ GATE: needs the cluster to PULL BOTH LAT and GBGPU and REBUILD    ##
+# ##  GBGPU (`pip install -e .` in GBGPU: bindings + kernels changed, and ##
+# ##  GBGPU compiles LAT's lat_chunked_het_kernels.hh in). On the OLD    ##
+# ##  wheel the engine raises a TypeError at the first get_ll (the mirror ##
+# ##  args are passed unconditionally) -- loud, not silent.               ##
+# ##  CONFIRM in globalfit_run.log at the first buffer build:             ##
+# ##    "GB psd mirror: SHARED (per-device replica: 10 walkers x 111 MB   ##
+# ##     = 1.11 GB per device, 2 devices; per-slot invC 0 MB, twin psd:   ##
+# ##     none) [GB_PSD_SHARED_MIRROR=1]"                                  ##
+# ##    and the SubBandBuffer line reads "... + ~0 MB invC = ...".        ##
+# ##  If it says "GB psd mirror: OFF (per-slot copies: ...)" the knob did ##
+# ##  not apply (spooled copy of an old script): scancel, NEW sbatch.     ##
+# ##  PARITY GATE (armed below for the first 3 unit fills of EVERY        ##
+# ##  buffer): each get_ll / swap_ll / fstat / sig-het setup is re-scored ##
+# ##  through the old per-slot layout on 64 rows and compared             ##
+# ##  bit-for-bit. Expect, per armed fill:                                ##
+# ##    "[GB_PSD_MIRROR parity] armed for unit fill 1 (2 more after ...)" ##
+# ##    "[GB_PSD_MIRROR parity resid get_ll] unit 1 rows=64 slots=...:    ##
+# ##     IDENTICAL (bit-for-bit; ...)"  (one per engine call)             ##
+# ##    "[GB_PSD_MIRROR parity] gate retired after 3 proposes, no          ##
+# ##     divergence"                                                      ##
+# ##  Any mismatch is a RuntimeError naming the slot / walker row / slab  ##
+# ##  origin and both values -- the job dies, it never warns.             ##
+# ######################################################################### #
+export GB_PSD_SHARED_MIRROR=1
+# First 3 unit fills of each buffer shadow-checked (see the gate box above);
+# 0 = disarmed (production setting once the gate has retired cleanly on
+# both runs). 64 rows per check is the code default (GB_PSD_MIRROR_PARITY_ROWS).
+export GB_PSD_MIRROR_PARITY_PROPOSES=3
 # RJ pick thinning. UNSET as of 2026-08-28 -- the value now lives in code
 # (_SEARCH_RJ_FLIP_DEFAULT / _PE_RJ_FLIP_DEFAULT in recipe.py, both 0.2),
 # so behavior is UNCHANGED from the 0.2 this line used to export.
@@ -1128,8 +1182,9 @@ export VGB_BAND_LAYERS=8
 # ##    "sig-het in-model stash: COMPACT per-reference windows [v5=1, ...]"  ##
 # ##  If it says "full band (Nf_active=...)" the port is NOT live: scancel.  ##
 # ##  ALSO CONFIRM the raised capacity took: the first RJ buffer build     ##
-# ##  line must read "buffer build (4096-slot alloc, ..." (2048/GPU x 2).  ##
-# ##  If it still says 2048-slot, the knob did not apply. The NWALKERS     ##
+# ##  line must read "buffer build (8192-slot alloc, ..." (4096/GPU x 2    ##
+# ##  since the 2026-09-09 mirror relaunch; it read 4096-slot on job 468). ##
+# ##  If it still says 4096-slot, the knob did not apply. The NWALKERS     ##
 # ##  line's old "resume trap" note is NOT a store-side refusal (the only  ##
 # ##  resume check is the noise-model identity; n_subbands is never        ##
 # ##  persisted): it is that a REQUEUED job re-runs the SPOOLED copy of    ##
@@ -1173,13 +1228,14 @@ export GB_INMODEL_SETUP_BATCH=0
 # limiter: residency is then governed ONLY by GB_INMODEL_SETUP_BATCH and
 # the buffer capacity -- the two dials the user ruled must be separately
 # adjustable.
-# LIVE as of the 2026-09-09 resume relaunch: capacity is now 4096
-# (2048 x 2 GPUs) and SETUP_BATCH=0 above no longer binds, so
-# min(n_slots=4096, 16384) collapses to capacity -- the whole picked pool
-# goes into one stash, which is the intent. KEEP THIS >= GB_N_SUBBANDS x
-# n_gpus whenever that knob is raised (16384 covers up to 8192/GPU), or it
-# silently re-caps the pool. Depends on the windowed-stash port being
-# deployed on the cluster (see the gate block above).
+# LIVE as of the 2026-09-09 resume relaunch: capacity was 4096
+# (2048 x 2 GPUs) on job 468 and is 8192 (4096 x 2) since the mirror
+# relaunch; SETUP_BATCH=0 above no longer binds, so min(n_slots=8192,
+# 16384) collapses to capacity -- the whole picked pool goes into one
+# stash, which is the intent. KEEP THIS >= GB_N_SUBBANDS x n_gpus whenever
+# that knob is raised (16384 covers up to 8192/GPU), or it silently re-caps
+# the pool. Depends on the windowed-stash port being deployed on the
+# cluster (see the gate block above).
 export GB_RJ_INMODEL_CHUNK=16384
 # 1 -> 0, BOTH (2026-09-09). These are the memory-safe-mode pair this script
 # re-enabled ("slower ... but memory-safe") to reclaim the PRE-PORT stash

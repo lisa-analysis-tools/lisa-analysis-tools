@@ -1205,7 +1205,18 @@ void wdm_het_get_ll_kernel(
     // the unique value whose rotation Re(e^{i delta} W) tracks a carrier
     // phase shift; its Im is accumulated against the data alongside w.
     // EXACT algebra, no approximation -- see gbgpu tests/test_phase_max_fused.
-    double    *d_h_im_out = nullptr)
+    double    *d_h_im_out = nullptr,
+    // Shared-psd MIRROR (2026-09-09; default-off = bit-identical). invC_Nf > 0
+    // declares ``invC`` to be the parent ACA's per-WALKER full-active-band
+    // inverse-covariance plane -- row stride ((XYZ ? 9 : 3) * invC_Nf *
+    // Nt_active), layer origin ind_min_f -- and invC_row[slot] the walker
+    // row each buffer slot reads. OFF (0 / nullptr) keeps ``invC`` in the
+    // per-slot slab layout above (row = noise_ind, origin = the slot's slab
+    // origin, stride from Nf_slab): the address arithmetic then reduces to
+    // the pre-mirror expressions term by term. Only invC ADDRESSING changes;
+    // the data reads and every floating-point expression are untouched.
+    int        invC_Nf = 0,
+    const int *invC_row = nullptr)
 {
     // One binary per block (grid.X); chunks iterated sequentially inside the
     // block. See the kernel-section header comment above for the full design.
@@ -1322,11 +1333,20 @@ void wdm_het_get_ll_kernel(
         // (backward compatible). Layout mirrors the active-band data/invC
         // read math below (g_d / g_inv).
         const size_t per_data = (size_t) nchannels * slab_Nf * Nt_active;
+        // Shared-psd mirror (invC_Nf > 0 / invC_row != null): invC is the
+        // parent's per-walker full-band plane -- layer extent invC_Nf,
+        // origin ind_min_f, row invC_row[slot]. OFF: the per-slot slab
+        // (extent slab_Nf, origin band_min_f, row noise_ind) -- i.e. exactly
+        // the pre-mirror per_invC / invC_b expressions.
+        const int inv_Nf    = (invC_Nf > 0) ? invC_Nf : slab_Nf;
+        const int inv_min_f = (invC_Nf > 0) ? ind_min_f : band_min_f;
+        const int inv_row   = (invC_row != nullptr) ? invC_row[noise_ind]
+                                                    : noise_ind;
         const size_t per_invC = (size_t) ((tdi_type == TDI_XYZ)
                                     ? nchannels * nchannels : nchannels)
-                                * slab_Nf * Nt_active;
-        const double *data_d_b = data_d + (size_t) data_ind  * per_data;
-        const double *invC_b   = invC   + (size_t) noise_ind * per_invC;
+                                * inv_Nf * Nt_active;
+        const double *data_d_b = data_d + (size_t) data_ind * per_data;
+        const double *invC_b   = invC   + (size_t) inv_row  * per_invC;
 
         // Per-binary inner-product accumulators (in registers).
         double tmp_dh = 0.0;
@@ -1477,6 +1497,7 @@ void wdm_het_get_ll_kernel(
             const double scale_fd     = 0.5 * dt_sparse / dt;
             for (int m = m_lo; m < m_hi; ++m) {
                 const int m_act = m - band_min_f;
+                const int m_inv = m - inv_min_f;   // invC layer (== m_act when mirror off)
 
                 // ---- 5) window + rearrange for layer m: fd_chunk_buf -> layer_buf ----
                 //
@@ -1570,7 +1591,7 @@ void wdm_het_get_ll_kernel(
                         for (int c = 0; c < nchannels; ++c) {
                             const size_t g_inv =
                                 (((size_t) c * nchannels + c)
-                                   * slab_Nf + m_act) * Nt_active + n_act;
+                                   * inv_Nf + m_inv) * Nt_active + n_act;
                             const double inv = invC_b[g_inv];
                             tmp_dh += d_arr[c] * w_arr[c] * inv;
                             tmp_hh += w_arr[c] * w_arr[c] * inv;
@@ -1580,7 +1601,7 @@ void wdm_het_get_ll_kernel(
                             for (int c2 = c1 + 1; c2 < nchannels; ++c2) {
                                 const size_t g_inv =
                                     (((size_t) c1 * nchannels + c2)
-                                       * slab_Nf + m_act) * Nt_active + n_act;
+                                       * inv_Nf + m_inv) * Nt_active + n_act;
                                 const double inv = invC_b[g_inv];
                                 tmp_dh += (d_arr[c1] * w_arr[c2]
                                             + d_arr[c2] * w_arr[c1]) * inv;
@@ -1592,7 +1613,7 @@ void wdm_het_get_ll_kernel(
                     } else {
                         // TDI_AET / TDI_AE: invC is diagonal in channels.
                         for (int c = 0; c < nchannels; ++c) {
-                            const size_t g_inv = ((size_t) c * slab_Nf + m_act)
+                            const size_t g_inv = ((size_t) c * inv_Nf + m_inv)
                                                   * Nt_active + n_act;
                             const double inv = invC_b[g_inv];
                             tmp_dh += d_arr[c] * w_arr[c] * inv;
@@ -1935,7 +1956,11 @@ void wdm_het_swap_ll_kernel(
     // (<d|h_add> and <h_add|h_rem>) at add-phi0 + pi/2 (nullptr -> not
     // stored). Same exact parity-map construction as wdm_het_get_ll_kernel.
     double    *d_h_add_im_out = nullptr,
-    double    *add_remove_im_out = nullptr)
+    double    *add_remove_im_out = nullptr,
+    // Shared-psd mirror (default-off = bit-identical); see
+    // wdm_het_get_ll_kernel for the contract.
+    int        invC_Nf = 0,
+    const int *invC_row = nullptr)
 {
     // Same per-(chunk, m_layer) flow as get_ll, but with TWO template builds
     // (add + rem) and 5 inner-product partials (<d|h_add>, <d|h_rem>,
@@ -2021,11 +2046,20 @@ void wdm_het_swap_ll_kernel(
                                    ? slab_min_f[data_ind] : ind_min_f;
         const int slab_Nf    = (Nf_slab > 0) ? Nf_slab : Nf_active;
         const size_t per_data = (size_t) nchannels * slab_Nf * Nt_active;
+        // Shared-psd mirror (invC_Nf > 0 / invC_row != null): invC is the
+        // parent's per-walker full-band plane -- layer extent invC_Nf,
+        // origin ind_min_f, row invC_row[slot]. OFF: the per-slot slab
+        // (extent slab_Nf, origin band_min_f, row noise_ind) -- i.e. exactly
+        // the pre-mirror per_invC / invC_b expressions.
+        const int inv_Nf    = (invC_Nf > 0) ? invC_Nf : slab_Nf;
+        const int inv_min_f = (invC_Nf > 0) ? ind_min_f : band_min_f;
+        const int inv_row   = (invC_row != nullptr) ? invC_row[noise_ind]
+                                                    : noise_ind;
         const size_t per_invC = (size_t) ((tdi_type == TDI_XYZ)
                                     ? nchannels * nchannels : nchannels)
-                                * slab_Nf * Nt_active;
-        const double *data_d_b = data_d + (size_t) data_ind  * per_data;
-        const double *invC_b   = invC   + (size_t) noise_ind * per_invC;
+                                * inv_Nf * Nt_active;
+        const double *data_d_b = data_d + (size_t) data_ind * per_data;
+        const double *invC_b   = invC   + (size_t) inv_row  * per_invC;
 
         // Per-thread accumulators.
         double tmp_dh_a = 0.0, tmp_dh_r = 0.0;
@@ -2182,6 +2216,7 @@ void wdm_het_swap_ll_kernel(
             constexpr int K_MAX_REG   = FAST_WDM_K_PER_THREAD_MAX;
             for (int m = m_lo; m < m_hi; ++m) {
                 const int m_act        = m - band_min_f;
+                const int m_inv        = m - inv_min_f;   // invC layer (== m_act when mirror off)
                 const int fft_offset_a = m * half_Nt_sub - half_Nt_sub - k_f0_a;
                 const int fft_offset_r = m * half_Nt_sub - half_Nt_sub - k_f0_r;
 
@@ -2292,7 +2327,7 @@ void wdm_het_swap_ll_kernel(
                                 for (int c = 0; c < nchannels; ++c) {
                                     const size_t g_inv =
                                         (((size_t) c * nchannels + c)
-                                          * slab_Nf + m_act)
+                                          * inv_Nf + m_inv)
                                           * Nt_active + n_act;
                                     const double inv = invC_b[g_inv];
                                     tmp_dh_a += d_arr[c]   * w_a_arr[c] * inv;
@@ -2307,7 +2342,7 @@ void wdm_het_swap_ll_kernel(
                                     for (int c2 = c1 + 1; c2 < nchannels; ++c2) {
                                         const size_t g_inv =
                                             (((size_t) c1 * nchannels + c2)
-                                              * slab_Nf + m_act)
+                                              * inv_Nf + m_inv)
                                               * Nt_active + n_act;
                                         const double inv = invC_b[g_inv];
                                         tmp_dh_a += (d_arr[c1]   * w_a_arr[c2]
@@ -2326,7 +2361,7 @@ void wdm_het_swap_ll_kernel(
                                 }
                             } else {
                                 for (int c = 0; c < nchannels; ++c) {
-                                    const size_t g_inv = ((size_t) c * slab_Nf + m_act)
+                                    const size_t g_inv = ((size_t) c * inv_Nf + m_inv)
                                                           * Nt_active + n_act;
                                     const double inv = invC_b[g_inv];
                                     tmp_dh_a += d_arr[c]   * w_a_arr[c] * inv;
@@ -2438,7 +2473,11 @@ void wdm_het_get_fstat_ll_kernel(
     // the orbit tables once per chunk and routes the TD-build through
     // get_tdi_Xf_single_cached. The F-stat then scores with EXACTLY the
     // same orbit approximation the get_ll likelihood uses.
-    int        N_cp_orbit = 0)
+    int        N_cp_orbit = 0,
+    // Shared-psd mirror (default-off = bit-identical); see
+    // wdm_het_get_ll_kernel for the contract.
+    int        invC_Nf = 0,
+    const int *invC_row = nullptr)
 {
     // F-stat: build 4 basis waveforms per Cornish & Crowder '05 with fixed
     //   (A, iota, psi, phi0) = (2, pi/2, {0, pi/4, 0, pi/4}, {0, pi, 3pi/2, pi/2})
@@ -2610,11 +2649,20 @@ void wdm_het_get_fstat_ll_kernel(
                                    ? slab_min_f[data_ind] : ind_min_f;
         const int slab_Nf    = (Nf_slab > 0) ? Nf_slab : Nf_active;
         const size_t per_data = (size_t) nchannels * slab_Nf * Nt_active;
+        // Shared-psd mirror (invC_Nf > 0 / invC_row != null): invC is the
+        // parent's per-walker full-band plane -- layer extent invC_Nf,
+        // origin ind_min_f, row invC_row[slot]. OFF: the per-slot slab
+        // (extent slab_Nf, origin band_min_f, row noise_ind) -- i.e. exactly
+        // the pre-mirror per_invC / invC_b expressions.
+        const int inv_Nf    = (invC_Nf > 0) ? invC_Nf : slab_Nf;
+        const int inv_min_f = (invC_Nf > 0) ? ind_min_f : band_min_f;
+        const int inv_row   = (invC_row != nullptr) ? invC_row[noise_ind]
+                                                    : noise_ind;
         const size_t per_invC = (size_t) ((tdi_type == TDI_XYZ)
                                     ? nchannels * nchannels : nchannels)
-                                * slab_Nf * Nt_active;
-        const double *data_d_b = data_d + (size_t) data_ind  * per_data;
-        const double *invC_b   = invC   + (size_t) noise_ind * per_invC;
+                                * inv_Nf * Nt_active;
+        const double *data_d_b = data_d + (size_t) data_ind * per_data;
+        const double *invC_b   = invC   + (size_t) inv_row  * per_invC;
 
         // Per-thread accumulators.
         double tmp_N[N_FILTERS] = {0.0, 0.0, 0.0, 0.0};
@@ -2766,6 +2814,7 @@ void wdm_het_get_fstat_ll_kernel(
             constexpr int K_MAX_REG  = FAST_WDM_K_PER_THREAD_MAX;
             for (int m = m_lo; m < m_hi; ++m) {
                 const int m_act = m - band_min_f;
+                const int m_inv = m - inv_min_f;   // invC layer (== m_act when mirror off)
                 // Per-thread storage for THIS m's 4 basis WDM coefs.
                 double w_basis_reg[N_FILTERS * FAST_WDM_NCHANNELS_MAX * K_MAX_REG];
                 const int fft_offset = m * half_Nt_sub - half_Nt_sub - k_f0;
@@ -2865,8 +2914,8 @@ void wdm_het_get_fstat_ll_kernel(
                             for (int c = 0; c < nchannels; ++c) {
                                 const size_t g_inv = (tdi_type == TDI_XYZ)
                                     ? (((size_t) c * nchannels + c)
-                                        * slab_Nf + m_act) * Nt_active + n_act
-                                    : ((size_t) c * slab_Nf + m_act)
+                                        * inv_Nf + m_inv) * Nt_active + n_act
+                                    : ((size_t) c * inv_Nf + m_inv)
                                         * Nt_active + n_act;
                                 inv_diag[c] = invC_b[g_inv];
                             }
@@ -2876,7 +2925,7 @@ void wdm_het_get_fstat_ll_kernel(
                                     for (int c2 = c1 + 1; c2 < nchannels; ++c2) {
                                         const size_t g_inv =
                                             (((size_t) c1 * nchannels + c2)
-                                              * slab_Nf + m_act)
+                                              * inv_Nf + m_inv)
                                               * Nt_active + n_act;
                                         inv_offd[p_off++] = invC_b[g_inv];
                                     }
@@ -3257,7 +3306,10 @@ inline void wdm_het_get_ll_impl(
     // Task-b per-band slab addressing (default-off = bit-identical).
     int Nf_slab = 0, const int *slab_min_f = nullptr,
     // Fused phase-max quadrature output (nullptr -> not stored).
-    double *d_h_im_out = nullptr)
+    double *d_h_im_out = nullptr,
+    // Shared-psd mirror (default-off = bit-identical): forwarded verbatim to
+    // the kernel on BOTH launch lines below (see wdm_het_get_ll_kernel).
+    int invC_Nf = 0, const int *invC_row = nullptr)
 {
     // New kernel does not use group-grouping path: each block handles one
     // binary and determines its own narrow m-band internally. Layer-grouping
@@ -3319,7 +3371,7 @@ inline void wdm_het_get_ll_impl(
         Nt_sub, log2_Nt_sub, N_sparse, log2_N_sparse,
         nchannels, n_rfft_chunk,
         T_chunk, dt, T, t_ref, tdi_type, tukey_alpha, m_band_half_width,
-        N_cp_orbit, Nf_slab, slab_min_f, d_h_im_out);
+        N_cp_orbit, Nf_slab, slab_min_f, d_h_im_out, invC_Nf, invC_row);
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
     gpuErrchk(cudaFree(orbits_gpu));
@@ -3336,7 +3388,7 @@ inline void wdm_het_get_ll_impl(
         Nt_sub, log2_Nt_sub, N_sparse, log2_N_sparse,
         nchannels, n_rfft_chunk,
         T_chunk, dt, T, t_ref, tdi_type, tukey_alpha, m_band_half_width,
-        N_cp_orbit, Nf_slab, slab_min_f, d_h_im_out);
+        N_cp_orbit, Nf_slab, slab_min_f, d_h_im_out, invC_Nf, invC_row);
 #endif
 }
 
@@ -3368,7 +3420,10 @@ inline void wdm_het_swap_ll_impl(
     // Task-b per-band slab addressing (default-off = bit-identical).
     int Nf_slab = 0, const int *slab_min_f = nullptr,
     // Fused phase-max quadratures of the ADD-linear terms (nullptr -> off).
-    double *d_h_add_im_out = nullptr, double *add_remove_im_out = nullptr)
+    double *d_h_add_im_out = nullptr, double *add_remove_im_out = nullptr,
+    // Shared-psd mirror (default-off = bit-identical); forwarded on both
+    // launch lines below.
+    int invC_Nf = 0, const int *invC_row = nullptr)
 {
     (void) N_cp_sig; (void) N_cp_orbit;
     (void) binary_perm; (void) group_starts; (void) group_ends;
@@ -3419,7 +3474,8 @@ inline void wdm_het_swap_ll_impl(
         Nt_sub, log2_Nt_sub, N_sparse, log2_N_sparse,
         nchannels, n_rfft_chunk,
         T_chunk, dt, T, t_ref, tdi_type, tukey_alpha, m_band_half_width,
-        Nf_slab, slab_min_f, d_h_add_im_out, add_remove_im_out);
+        Nf_slab, slab_min_f, d_h_add_im_out, add_remove_im_out,
+        invC_Nf, invC_row);
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
     gpuErrchk(cudaFree(orbits_gpu));
@@ -3438,7 +3494,8 @@ inline void wdm_het_swap_ll_impl(
         Nt_sub, log2_Nt_sub, N_sparse, log2_N_sparse,
         nchannels, n_rfft_chunk,
         T_chunk, dt, T, t_ref, tdi_type, tukey_alpha, m_band_half_width,
-        Nf_slab, slab_min_f, d_h_add_im_out, add_remove_im_out);
+        Nf_slab, slab_min_f, d_h_add_im_out, add_remove_im_out,
+        invC_Nf, invC_row);
 #endif
 }
 
@@ -3471,7 +3528,10 @@ inline void wdm_het_get_fstat_ll_impl(
     int fstat_fold = 0,
     // Orbit spline-cache density per chunk (0 = direct lookups). See the
     // kernel's note; static shared, so no shared_bytes contribution here.
-    int N_cp_orbit = 0)
+    int N_cp_orbit = 0,
+    // Shared-psd mirror (default-off = bit-identical); forwarded on both
+    // launch lines below.
+    int invC_Nf = 0, const int *invC_row = nullptr)
 {
 #ifdef __CUDACC__
     // One binary per block on grid.X (always). The grid_dim arg is
@@ -3528,7 +3588,7 @@ inline void wdm_het_get_fstat_ll_impl(
         Nt_sub, log2_Nt_sub, N_sparse, log2_N_sparse,
         nchannels, n_rfft_chunk,
         T_chunk, dt, T, t_ref, tdi_type, tukey_alpha, m_band_half_width,
-        Nf_slab, slab_min_f, fstat_fold, N_cp_orbit);
+        Nf_slab, slab_min_f, fstat_fold, N_cp_orbit, invC_Nf, invC_row);
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
     gpuErrchk(cudaFree(orbits_gpu));
@@ -3546,7 +3606,7 @@ inline void wdm_het_get_fstat_ll_impl(
         Nt_sub, log2_Nt_sub, N_sparse, log2_N_sparse,
         nchannels, n_rfft_chunk,
         T_chunk, dt, T, t_ref, tdi_type, tukey_alpha, m_band_half_width,
-        Nf_slab, slab_min_f, fstat_fold, N_cp_orbit);
+        Nf_slab, slab_min_f, fstat_fold, N_cp_orbit, invC_Nf, invC_row);
 #endif
 }
 

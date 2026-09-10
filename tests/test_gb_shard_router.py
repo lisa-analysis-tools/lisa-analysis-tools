@@ -661,6 +661,69 @@ class ShardRouterTest(unittest.TestCase):
         view = self.ShardView(self.holder, 0)
         self.assertIsNone(view.slab_min_f)
 
+    # ---------------- per-slot psd_row_index shard slice (shared-psd mirror) ----
+
+    def test_shard_view_slices_psd_row_index(self):
+        """``psd_row_index`` (slot -> parent WALKER row, mirror mode) is per
+        BUFFER SLOT like ``slab_min_f``: each shard's view must carry its OWN
+        rows in intra-shard order, values untouched (global walker rows --
+        every device holds the whole plane)."""
+        self.holder.psd_row_index = np.array(
+            [3, 1, 4, 1, 5, 9, 2][:self.NUM_ACS], dtype=np.int32)
+        try:
+            for s in range(self.NUM_SHARDS):
+                view = self.ShardView(self.holder, s)
+                np.testing.assert_array_equal(
+                    np.asarray(view.psd_row_index),
+                    self.holder.psd_row_index[view.rows],
+                )
+                self.assertEqual(np.asarray(view.psd_row_index).dtype, np.int32)
+        finally:
+            del self.holder.psd_row_index
+
+    def test_shard_view_psd_row_index_survives_cell_swap(self):
+        self.holder.psd_row_index = np.arange(self.NUM_ACS, dtype=np.int32)
+        try:
+            views = self.RoutedEngine._shard_views(self.holder)
+            first = [np.asarray(v.psd_row_index).copy() for v in views]
+            ptrs = [np.asarray(v.psd_row_index) for v in views]
+            self.holder.psd_row_index = (self.holder.psd_row_index + 7).astype(np.int32)
+            self.RoutedEngine._shard_views(self.holder)
+            for v, before, p in zip(views, first, ptrs):
+                np.testing.assert_array_equal(
+                    np.asarray(v.psd_row_index),
+                    self.holder.psd_row_index[v.rows],
+                )
+                self.assertFalse(np.array_equal(np.asarray(v.psd_row_index), before))
+                # refreshed IN PLACE (pointer-stable for cached bindings)
+                self.assertIs(np.asarray(v.psd_row_index), p)
+        finally:
+            del self.holder.psd_row_index
+
+    def test_shard_view_psd_row_index_none_without_parent_metadata(self):
+        view = self.ShardView(self.holder, 0)
+        self.assertIsNone(view.psd_row_index)
+
+    def test_partition_noise_stays_slot_indexed(self):
+        """The router partitions by SLOT (data_index / noise_index are buffer
+        slots); the mirror's walker-row map never enters the partition --
+        intra rows are unchanged whether or not the holder carries one."""
+        noise = self.data_index.copy()
+        parts_off = self.RoutedEngine._partition(self.holder, self.data_index, noise)
+        self.holder.psd_row_index = np.array(
+            [6, 6, 6, 6, 6, 6, 6][:self.NUM_ACS], dtype=np.int32)
+        try:
+            parts_on = self.RoutedEngine._partition(self.holder, self.data_index, noise)
+        finally:
+            del self.holder.psd_row_index
+        self.assertEqual(len(parts_off), len(parts_on))
+        for (pos_a, d_a, n_a), (pos_b, d_b, n_b) in zip(parts_off, parts_on):
+            np.testing.assert_array_equal(pos_a, pos_b)
+            np.testing.assert_array_equal(d_a, d_b)
+            np.testing.assert_array_equal(n_a, n_b)
+            np.testing.assert_array_equal(
+                n_b, self._expected_intra(noise[pos_b]))
+
     # ---------------- per-device comp replicas ----------------
 
     def _fake_comp(self):

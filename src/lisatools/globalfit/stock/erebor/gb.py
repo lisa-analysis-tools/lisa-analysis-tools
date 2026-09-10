@@ -660,6 +660,39 @@ class GBSettings(Settings):
     wdm_slab_guard_layers: int = dataclasses.field(
         default_factory=env_default("GB_WDM_SLAB_GUARD_LAYERS", 1, int)
     )
+    # Shared-psd MIRROR for the GB sub-band buffers (2026-09-09). Env:
+    # GB_PSD_SHARED_MIRROR (1/0/true/false/yes/no/on/off). Default OFF.
+    #   False -> every buffer slot stores its own inverse-covariance slab,
+    #            copied out of the parent ACA's per-walker psd plane on every
+    #            unit fill (3.07 of the 4.09 MB per slot at 1 yr; the
+    #            template twin allocates a second, never-read copy).
+    #   True  -> no per-slot invC: each device holds ONE replica of the
+    #            parent's per-walker plane (nwalkers x 110 MB at 1 yr), every
+    #            slot carries its walker row + absolute layer origin, and the
+    #            chunked-het kernels / sig-het builds index the replica
+    #            directly. Values, dtype and the time axis are untouched --
+    #            deduplication of copies only, bit-identical by construction.
+    #            Requires a GBGPU wheel built against the mirror kernel args
+    #            (hard error otherwise; never a silent fallback). WDM-only.
+    # Rollback = unset the env var; no rebuild needed.
+    psd_shared_mirror: bool = dataclasses.field(
+        default_factory=env_default("GB_PSD_SHARED_MIRROR", False, bool)
+    )
+    # Runtime parity gate for the mirror: for the first N unit fills
+    # (proposes) of every buffer, every get_ll / swap_ll / F-stat / sig-het
+    # setup on that buffer is shadow-checked against the per-slot layout on a
+    # row sample and the run RAISES on the first differing bit (one INFO line
+    # per check; a retire line once N is exhausted). 0 = gate off. Meaningful
+    # only with psd_shared_mirror=True (logs "disarmed" otherwise).
+    # Env: GB_PSD_MIRROR_PARITY_PROPOSES.
+    psd_mirror_parity_proposes: int = dataclasses.field(
+        default_factory=env_default("GB_PSD_MIRROR_PARITY_PROPOSES", 0, int)
+    )
+    # Rows sampled per parity check (bounds the shadow scratch: rows x 4 MB
+    # at 1 yr). Env: GB_PSD_MIRROR_PARITY_ROWS.
+    psd_mirror_parity_rows: int = dataclasses.field(
+        default_factory=env_default("GB_PSD_MIRROR_PARITY_ROWS", 64, int)
+    )
     start_freq_ind: Optional[int] = 0  # goes into GPU for start of data stream
     t0: Optional[float] = 0.0
     tdi_setup: Optional[str] = "XYZ" # other options are AET and AE.
@@ -909,6 +942,17 @@ class GBSetup(Setup, GBSettings):
         )
         self.group_proposal_kwargs.setdefault(
             "wdm_slab_guard_layers", self.wdm_slab_guard_layers
+        )
+        # Shared-psd mirror + its parity gate (plumbed like the slab knobs:
+        # move ctor kwargs -> BandSorter -> SubBandBuffer).
+        self.group_proposal_kwargs.setdefault(
+            "psd_shared_mirror", bool(self.psd_shared_mirror)
+        )
+        self.group_proposal_kwargs.setdefault(
+            "psd_mirror_parity_proposes", int(self.psd_mirror_parity_proposes)
+        )
+        self.group_proposal_kwargs.setdefault(
+            "psd_mirror_parity_rows", int(self.psd_mirror_parity_rows)
         )
         # Band-unit stride for the concurrent sub-band scheduling
         # (GB_BAND_UNIT_STRIDE; default 2 = legacy parity, bit-identical).

@@ -171,6 +171,33 @@ class WDMComputationsBase(LISAToolsParallelModule):
     #: kernel only. Seeded from ``GB_FSTAT_ORBIT_CACHE`` at import; override
     #: per instance.
     fstat_orbit_cache = _GB_FSTAT_ORBIT_CACHE
+    #: Whether this comp's C++ ``get_ll`` / ``swap_ll`` / ``get_fstat_ll``
+    #: BINDINGS accept the trailing shared-psd MIRROR args ``(invC_Nf,
+    #: invC_row)`` (2026-09-09). Same opt-in contract as
+    #: ``_FUSED_QUAD_KERNELS``: GBGPU sets True after its binding TU grew the
+    #: params; bbhx/SOBBH stays False and appends nothing. A mirror-layout
+    #: holder (``psd_row_index`` set: ``linear_psd_arr[0]`` is the parent's
+    #: per-walker full-band invC plane) meeting a False class is a HARD
+    #: error, never a silent per-slot fallback (plan risk R2).
+    _PSD_MIRROR_KERNELS = False
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        # The mirror args are the LAST positional pair of the kernel
+        # signatures, after the fused-quadrature / fstat_fold / N_cp_orbit
+        # params. A class that appends them while skipping any of the earlier
+        # opt-ins would splat them into the wrong slots (plan risk R6).
+        if cls.__dict__.get("_PSD_MIRROR_KERNELS", False) and not (
+            cls._FUSED_QUAD_KERNELS
+            and cls._FSTAT_FOLD_KERNELS
+            and cls._FSTAT_ORBIT_CACHE_KERNELS
+        ):
+            raise TypeError(
+                f"{cls.__name__}: _PSD_MIRROR_KERNELS=True requires "
+                "_FUSED_QUAD_KERNELS, _FSTAT_FOLD_KERNELS and "
+                "_FSTAT_ORBIT_CACHE_KERNELS to be True as well (the mirror "
+                "args are positional AFTER those)."
+            )
 
     def __init__(self, wdm_settings, t_ref,
                  Nt_sub=256, n_pad=32, N_sparse=256,
@@ -525,6 +552,69 @@ class WDMComputationsBase(LISAToolsParallelModule):
             return (0,)
         return (int(self.N_cp_orbit),)
 
+    def _psd_kernel_args(self, holder):
+        """Trailing shared-psd MIRROR args ``(invC_Nf, invC_row)`` for the C++
+        ``get_ll`` / ``swap_ll`` / ``get_fstat_ll`` kernels (2026-09-09).
+
+        Splatted LAST (after the fused quadratures on get_ll/swap_ll, after
+        ``N_cp_orbit`` on get_fstat_ll). Returns:
+
+        * ``()`` on the JAX backend and on any source class whose binding TU
+          has not grown the params (``_PSD_MIRROR_KERNELS`` False) -- and a
+          HARD error there if the holder is in mirror layout (a mirror holder
+          scored through per-slot addressing would read the wrong bytes).
+        * ``(0, empty_int32)`` -- the OFF state, bit-identical to the
+          pre-mirror per-slot slab addressing -- when the holder carries no
+          ``psd_row_index``.
+        * ``(int(Nf_active), psd_row_index_int32)`` when the holder exposes
+          ``psd_row_index`` (a GB ``SubBandBuffer`` bound to the parent's
+          psd mirror): ``linear_psd_arr[0]`` is then the parent ACA's
+          per-WALKER full-active-band invC plane and slot ``s`` reads row
+          ``psd_row_index[s]`` at its own absolute layers.
+
+        Under ``GB_INDEX_ASSERTS`` the row map and the slab origins are
+        bounds-checked against the plane (the buffer's ``bind_psd_mirror``
+        does the same check unconditionally at bind time).
+        """
+        rows = getattr(holder, "psd_row_index", None)
+        if self.backend.name == self._BACKEND_PREFIX + "_jax":
+            if rows is not None:
+                raise NotImplementedError(
+                    "shared-psd mirror holders (psd_row_index) are C++-only; "
+                    "the JAX chunked-het kernels keep the per-slot invC layout.")
+            return ()
+        if not self._PSD_MIRROR_KERNELS:
+            if rows is not None:
+                raise RuntimeError(
+                    f"{type(self).__name__} does not carry the shared-psd "
+                    "mirror kernel args (_PSD_MIRROR_KERNELS is False) but the "
+                    "holder is in mirror layout (psd_row_index set). Refusing "
+                    "to score a mirror plane through per-slot addressing.")
+            return ()
+        if rows is None:
+            return (0, self.xp.zeros(0, dtype=np.int32))
+        ws = self.wdm_settings
+        Nf_active = int(getattr(ws, "Nf_active", self.Nf))
+        rows = self.xp.ascontiguousarray(self.xp.asarray(rows, dtype=np.int32))
+        if _GB_INDEX_ASSERTS:
+            Nt_active = int(getattr(ws, "Nt_active", self.Nt))
+            nch = int(self.nchannels)
+            per_row = (nch * nch if self.tdi_type == "XYZ" else nch) * Nf_active * Nt_active
+            n_rows = int(holder.linear_psd_arr[0].size) // per_row
+            assert n_rows * per_row == int(holder.linear_psd_arr[0].size), (
+                "mirror plane size is not a whole number of per-walker rows")
+            assert int(rows.max()) < n_rows, (
+                f"psd_row_index max {int(rows.max())} >= mirror rows {n_rows}")
+            slab_min_f = getattr(holder, "slab_min_f", None)
+            band_slab_Nf = getattr(holder, "band_slab_Nf", None)
+            if slab_min_f is not None and band_slab_Nf is not None:
+                ind_min_f = int(getattr(ws, "ind_min_f", 0))
+                smf = self.xp.asarray(slab_min_f)
+                assert int(smf.min()) >= ind_min_f and (
+                    int(smf.max()) + int(band_slab_Nf) <= ind_min_f + Nf_active), (
+                    "a slab origin runs outside the parent active band")
+        return (Nf_active, rows)
+
     def _slab_args_from(self, band_slab_Nf, slab_min_f):
         """Build the trailing C++ slab kernel args from explicit values.
 
@@ -766,6 +856,7 @@ class WDMComputationsBase(LISAToolsParallelModule):
             int(m_band_half_width),
             *self._slab_kernel_args(wdm_holder),
             *quad_args,
+            *self._psd_kernel_args(wdm_holder),
         )
 
         self.d_h_out = d_h_out
@@ -879,6 +970,7 @@ class WDMComputationsBase(LISAToolsParallelModule):
             int(m_band_half_width),
             *self._slab_kernel_args(wdm_holder),
             *quad_args,
+            *self._psd_kernel_args(wdm_holder),
         )
 
         self.d_h_add_out       = d_h_a
@@ -1364,6 +1456,7 @@ class WDMComputationsBase(LISAToolsParallelModule):
             *self._slab_kernel_args(wdm_holder),
             *self._fstat_fold_kernel_args(fstat_fold),
             *self._fstat_orbit_cache_kernel_args(),
+            *self._psd_kernel_args(wdm_holder),
         )
 
         # WDM coefs are real -> imag is identically 0.

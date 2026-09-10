@@ -90,7 +90,13 @@ def to_current_device(xp, arr):
     dev = getattr(arr, "device", None)
     if dev is None:
         return arr
-    if int(dev.id) == int(xp.cuda.runtime.getDevice()):
+    dev_id = getattr(dev, "id", None)
+    if dev_id is None:
+        # A HOST array under a CuPy ``xp`` (numpy >= 2 exposes
+        # ``ndarray.device == "cpu"``, a plain string): upload it to the
+        # current device -- that IS "resident on the current device".
+        return xp.asarray(arr)
+    if int(dev_id) == int(xp.cuda.runtime.getDevice()):
         return arr
     return xp.asarray(xp.asnumpy(arr))
 

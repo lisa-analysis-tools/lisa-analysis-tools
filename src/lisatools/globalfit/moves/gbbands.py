@@ -711,6 +711,7 @@ class _ShardHolderView:
         self._min_freq_inds_view = None
         self._start_freq_ind_view = None
         self._slab_min_f_view = None
+        self._psd_row_index_view = None
         self.refresh_row_metadata()
 
     @property
@@ -767,6 +768,18 @@ class _ShardHolderView:
         by every slab, hence shard-invariant, and keeps delegating.
         """
         return self._slab_min_f_view
+
+    @property
+    def psd_row_index(self):
+        """Per-slot parent WALKER rows (shared-psd mirror) SLICED to this
+        shard's rows, in intra-shard order -- the same reason ``slab_min_f``
+        is an explicit property: the kernels index it by intra-shard
+        ``noise_index``, and a delegated global-slot array would hand shard
+        1's row 0 the walker of buffer slot 0 (plan risk R3). The values stay
+        GLOBAL walker rows: every device holds the whole plane. ``None`` when
+        the parent is not in mirror mode.
+        """
+        return self._psd_row_index_view
 
     def refresh_row_metadata(self) -> None:
         """Re-slice per-row metadata from the parent.
@@ -835,6 +848,26 @@ class _ShardHolderView:
                 else:
                     self._slab_min_f_view = xp.ascontiguousarray(
                         xp.asarray(slab_host)
+                    )
+        # Shared-psd mirror: per-slot walker rows, sliced + refreshed in
+        # place exactly like ``slab_min_f`` (see the ``psd_row_index``
+        # property).
+        prow = getattr(self._parent, "psd_row_index", None)
+        if prow is None:
+            self._psd_row_index_view = None
+        else:
+            prow_host = np.ascontiguousarray(
+                np.asarray(asnumpy(prow))[self._rows].astype(np.int32)
+            )
+            with device_context(xp, self.device):
+                if (
+                    self._psd_row_index_view is not None
+                    and self._psd_row_index_view.shape == prow_host.shape
+                ):
+                    self._psd_row_index_view[...] = xp.asarray(prow_host)
+                else:
+                    self._psd_row_index_view = xp.ascontiguousarray(
+                        xp.asarray(prow_host)
                     )
 
     def __len__(self) -> int:
@@ -1829,6 +1862,14 @@ class _RoutedBandEngine:
         walker's shard, which is exactly the case that reads foreign
         device pointers when the comp is shared.
         """
+        # Shared-psd mirror parity gate on a mirror-mode buffer (no-op unless
+        # armed; the production F-stat holders are the parent ACA, which has
+        # no gate).
+        _pcheck = getattr(holder, "_psd_mirror_parity_check", None)
+        if _pcheck is not None and getattr(holder, "_psd_mirror_parity", False):
+            _pcheck("fstat", params_phys, data_index,
+                    data_index if noise_index is None else noise_index,
+                    fstat_fold=kwargs.get("fstat_fold"))
         if not cls._is_multi(holder):
             return getattr(comp, method_name)(
                 params_phys, holder, data_index=data_index,
@@ -2074,9 +2115,30 @@ class _RoutedBandEngine:
             data_row_host = np.ascontiguousarray(asnumpy(
                 xp.asarray(view.linear_data_arr[0]).reshape(
                     n_slabs, -1)[int(intra_data)]))
-            psd_row_host = np.ascontiguousarray(asnumpy(
-                xp.asarray(view.linear_psd_arr[0]).reshape(
-                    n_slabs, -1)[int(intra_noise)]))
+            _prow = getattr(view, "psd_row_index", None)
+            if _prow is not None:
+                # Shared-psd mirror: linear_psd_arr[0] is the parent's
+                # per-walker FULL-BAND plane; the slot's row is the map
+                # entry (only reachable for a full-band buffer in mirror
+                # mode -- the production F-stat holders are the parent ACA).
+                # One psd row = prod(shape_sens) x (Nf_active x Nt_active)
+                # = prod(shape_sens) x (data row size / nchannels).
+                _plane = xp.asarray(view.linear_psd_arr[0])
+                _row = int(np.asarray(asnumpy(_prow))[int(intra_noise)])
+                _per_row = (int(np.prod(holder.shape_sens))
+                            * (int(data_row_host.size) // int(holder.nchannels)))
+                _n_rows = int(_plane.size) // _per_row
+                if _n_rows * _per_row != int(_plane.size) or _row >= _n_rows:
+                    raise RuntimeError(
+                        "sig-het F-stat: mirror plane / row map mismatch "
+                        f"(plane {int(_plane.size)} elements, per row {_per_row}, "
+                        f"row {_row})")
+                psd_row_host = np.ascontiguousarray(asnumpy(
+                    _plane.reshape(_n_rows, -1)[_row]))
+            else:
+                psd_row_host = np.ascontiguousarray(asnumpy(
+                    xp.asarray(view.linear_psd_arr[0]).reshape(
+                        n_slabs, -1)[int(intra_noise)]))
 
         lanes = []
         lane_comps = []
@@ -2412,6 +2474,203 @@ def make_routed_band_engine(basis_settings, *, xp, gb_wdm_comp=None,
     )
 
 
+#: Mirror-mode ``SubBandBuffer.likelihood()`` MATERIALIZES the requested
+#: rows' invC from the replica (a zero-copy view in OFF mode): bound that
+#: transient at this many slots per pass (x 3.07 MB at 1 yr = ~400 MB).
+#: Chunking cannot change a bit -- every cell is an independent per-row
+#: reduction.
+_PSD_MIRROR_LL_CHUNK = 128
+
+
+class _MirrorPsdSlots:
+    """Read-only, slot-indexed inverse-PSD gatherer for a :class:`SubBandBuffer`
+    in shared-psd MIRROR mode (what ``buf.psd_buffer`` returns there).
+
+    ``obj[slots]`` materializes ``(k, *shape_sens, W, Nt_active)`` -- the
+    per-slot slab the OFF layout stores -- from the device replica: slot
+    ``s`` reads walker row ``psd_row_index[s]`` at absolute layers
+    ``[slab_min_f[s], slab_min_f[s] + W)`` (``W = band_slab_Nf``; the full
+    active band from ``ind_min_f`` when narrow slabs are off) -- the SAME
+    bytes the per-unit fill used to copy into the slot. Accepts an int, a
+    slice or a 1-D int array on the leading (slot) axis. Writes raise: the
+    replica is the parent's plane.
+
+    ``split`` (multi-shard): the object indexes INTRA-shard rows of that
+    split and gathers from that split's replica on its own device, which is
+    what ``SubBandBuffer.likelihood``'s BandView branch does shard by shard;
+    :attr:`_shards` hands out one such object per split. A global object on
+    a multi-shard buffer routes each slot to its owning split and
+    concatenates through the host (debug readers only).
+    """
+
+    def __init__(self, buf, split=None):
+        self._buf = buf
+        self._split = None if split is None else int(split)
+
+    @property
+    def _n(self) -> int:
+        if self._split is None:
+            return int(self._buf.num_bands_now)
+        return int(len(self._buf.gpu_splits[self._split]))
+
+    def _slab_geometry(self):
+        buf = self._buf
+        ws = buf._basis_settings
+        Nf_active = int(ws.Nf_active)
+        W = buf.band_slab_Nf
+        W = Nf_active if W is None else int(W)
+        return Nf_active, int(ws.Nt_active), int(ws.ind_min_f), W
+
+    @property
+    def shape(self) -> tuple:
+        _, Nt_active, _, W = self._slab_geometry()
+        return (self._n,) + tuple(self._buf.shape_sens) + (W, Nt_active)
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+    @property
+    def dtype(self):
+        return self._buf.linear_psd_arr[0].dtype
+
+    def __len__(self) -> int:
+        return self._n
+
+    @property
+    def _shards(self):
+        return [_MirrorPsdSlots(self._buf, split=s)
+                for s in range(len(self._buf.linear_psd_arr))]
+
+    def _resolve(self, idx):
+        """-> (global slot ids (host int array), scalar?)"""
+        n = self._n
+        scalar = False
+        if isinstance(idx, slice):
+            local = np.arange(*idx.indices(n), dtype=int)
+        elif isinstance(idx, (int, np.integer)):
+            i = int(idx)
+            if i < 0:
+                i += n
+            if not (0 <= i < n):
+                raise IndexError(f"slot {int(idx)} out of range for {n} bound slots")
+            local = np.array([i], dtype=int)
+            scalar = True
+        else:
+            local = np.asarray(asnumpy(idx))
+            if local.dtype == bool:
+                local = np.where(local)[0]
+            local = local.astype(int).reshape(-1)
+            if local.size and (int(local.min()) < 0 or int(local.max()) >= n):
+                raise IndexError(
+                    f"slot index range [{int(local.min())}, {int(local.max())}] "
+                    f"out of range for {n} bound slots")
+        if self._split is None:
+            slots = local
+        else:
+            slots = np.asarray(asnumpy(self._buf.gpu_splits[self._split]),
+                               dtype=int)[local]
+        return slots, scalar
+
+    def _gather_on_split(self, s, slots):
+        """Gather ``slots`` (global ids, all owned by split ``s``) on that
+        split's device from its replica. Returns a device array."""
+        buf = self._buf
+        xp = buf.xp
+        Nf_active, Nt_active, ind_min_f, W = self._slab_geometry()
+        shape_sens = tuple(buf.shape_sens)
+        rows_all = np.asarray(asnumpy(buf.psd_row_index), dtype=int)
+        smf = buf.slab_min_f
+        if smf is None:
+            lo_all = np.zeros(rows_all.shape[0], dtype=int)
+        else:
+            lo_all = np.asarray(asnumpy(smf), dtype=int) - ind_min_f
+        plane = buf.linear_psd_arr[int(s)]
+        per_row = int(np.prod(shape_sens)) * Nf_active * Nt_active
+        n_rows = int(plane.size) // max(per_row, 1)
+        if n_rows == 0 or n_rows * per_row != int(plane.size):
+            raise RuntimeError(
+                "shared-psd mirror is not bound on this buffer (call "
+                "bind_psd_mirror via BandSorter.get_buffer first) or the "
+                f"replica size {int(plane.size)} is not a whole number of "
+                f"per-walker rows ({per_row})")
+        plane = plane.reshape((n_rows,) + shape_sens + (Nf_active, Nt_active))
+        r = xp.asarray(rows_all[slots])
+        lo = xp.asarray(lo_all[slots])
+        L = lo[:, None] + xp.arange(W)[None, :]            # (k, W) active-local
+        ch = xp.arange(shape_sens[0])
+        if len(shape_sens) == 2:
+            return plane[r[:, None, None, None], ch[None, :, None, None],
+                         ch[None, None, :, None], L[:, None, None, :], :]
+        return plane[r[:, None, None], ch[None, :, None], L[:, None, :], :]
+
+    def __getitem__(self, idx):
+        buf = self._buf
+        xp = buf.xp
+        slots, scalar = self._resolve(idx)
+        if self._split is not None or len(buf.linear_psd_arr) == 1:
+            s = 0 if self._split is None else self._split
+            dev = None if buf.gpus is None else int(buf.gpus[s])
+            with device_context(xp, dev):
+                out = self._gather_on_split(s, slots)
+        else:
+            owner = np.asarray(buf.split_map, dtype=int)[slots]
+            parts = np.empty(slots.shape[0], dtype=object)
+            for s in np.unique(owner):
+                pos = np.where(owner == s)[0]
+                dev = None if buf.gpus is None else int(buf.gpus[int(s)])
+                with device_context(xp, dev):
+                    g = asnumpy(self._gather_on_split(int(s), slots[pos]))
+                for j, p in enumerate(pos):
+                    parts[p] = g[j]
+            out = xp.asarray(np.stack(list(parts), axis=0)) if slots.shape[0] else (
+                xp.zeros((0,) + self.shape[1:], dtype=self.dtype))
+        return out[0] if scalar else out
+
+    def __setitem__(self, idx, value):
+        raise TypeError(
+            "the inverse-PSD is read-only in shared-psd mirror mode (the "
+            "buffer reads the parent's per-walker plane through a replica; "
+            "there is no per-slot psd to write)")
+
+
+class _PsdParityHolder:
+    """Throwaway single-shard holder for the shared-psd mirror PARITY GATE.
+
+    A K-slot subset of a :class:`SubBandBuffer` presented in EITHER invC
+    layout to the raw chunked-het comp: per-slot (``psd_row_index=None``,
+    ``linear_psd_arr[0]`` = the K slabs the mirror gather produced) or mirror
+    (``linear_psd_arr[0]`` = the device replica, ``psd_row_index`` = the K
+    slots' walker rows). The two must score bit-identically. Every layout
+    attribute is set EXPLICITLY (never delegated) so a missing one cannot
+    fall through to the parent buffer's value. Lives only for one check.
+    """
+
+    def __init__(self, parent, device, data_flat, psd_flat, n_slots,
+                 band_slab_Nf, slab_min_f, psd_row_index):
+        self._parent = parent
+        self.device = None if device is None else int(device)
+        self.gpus = None if self.device is None else [self.device]
+        self.acs_total_entries = int(n_slots)
+        self.linear_data_arr = [data_flat]
+        self.linear_psd_arr = [psd_flat]
+        self.band_slab_Nf = None if band_slab_Nf is None else int(band_slab_Nf)
+        self.slab_min_f = slab_min_f
+        self.psd_row_index = psd_row_index
+
+    @property
+    def xp(self):
+        return self._parent.xp
+
+    def __len__(self) -> int:
+        return int(self.acs_total_entries)
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._parent, name)
+
+
 class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
     """Per-(temp, walker, band) scratch buffers for the GB special moves.
 
@@ -2522,6 +2781,9 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         wdm_band_slab_layers: Optional[int] = None,
         wdm_slab_guard_layers: int = 1,
         alloc_capacity: Optional[int] = None,
+        psd_shared_mirror: bool = False,
+        psd_mirror_parity_proposes: int = 0,
+        psd_mirror_parity_rows: int = 64,
         *args,
         **kwargs,
     ):
@@ -2684,6 +2946,43 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             )
         self._basis_settings = basis_settings
 
+        # Shared-psd MIRROR (2026-09-09; ``GB_PSD_SHARED_MIRROR``, default
+        # OFF). OFF: every slot stores its own invC slab, copied out of the
+        # parent ACA's per-walker plane on every unit fill (today's layout,
+        # byte-for-byte). ON: no per-slot invC at all -- each device holds ONE
+        # replica of the parent's plane (``AnalysisContainerArray
+        # .psd_mirror_for_device``), every slot carries its parent WALKER row
+        # (``psd_row_index``) next to its absolute layer origin
+        # (``slab_min_f``), and the chunked-het kernels / sig-het builds index
+        # the replica by (row, absolute layer). Values, dtype and time axis
+        # are untouched: deduplication of COPIES only. The template twin's
+        # never-read invC copy disappears too. Hard-fails (never a silent
+        # per-slot fallback) on FD, on JAX and on a wheel whose kernels lack
+        # the mirror args.
+        self._psd_shared_mirror = bool(psd_shared_mirror)
+        self._psd_mirror_parity_proposes = int(psd_mirror_parity_proposes)
+        self._psd_mirror_parity_rows = int(psd_mirror_parity_rows)
+        self._psd_mirror_bound_version = None
+        self._psd_mirror_plane_rows = None
+        self._psd_mirror_parity = False
+        if self._psd_shared_mirror:
+            if not isinstance(self._basis_settings, WDMSettings):
+                raise NotImplementedError(
+                    "GB_PSD_SHARED_MIRROR=1 is WDM-only (production basis); the "
+                    "FD sub-band buffers keep per-slot invC storage.")
+            _comp = self.gb_wdm_comp
+            _inner = getattr(_comp, "chunked", _comp)
+            if _inner is None or not getattr(type(_inner), "_PSD_MIRROR_KERNELS", False):
+                raise RuntimeError(
+                    "GB_PSD_SHARED_MIRROR=1 but the WDM computation class "
+                    f"{type(_inner).__name__} does not carry the shared-psd "
+                    "mirror kernel args (_PSD_MIRROR_KERNELS is False): rebuild "
+                    "GBGPU against the current LAT lat_chunked_het_kernels.hh.")
+            if str(getattr(getattr(_inner, "backend", None), "name", "")).endswith("_jax"):
+                raise NotImplementedError(
+                    "GB_PSD_SHARED_MIRROR=1 is not available on the JAX backend "
+                    "(its chunked-het kernels keep the per-slot invC layout).")
+
         # Build the per-cell AnalysisContainers and initialise *ourselves* as
         # the AnalysisContainerArray that owns them. On the WDM path the ACA
         # layout metadata (``data_length = Nf_active * Nt_active``,
@@ -2736,6 +3035,11 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         # Memory geometry follows the ALLOCATED slot count (capacity when
         # fixed-capacity is active), not the bound count.
         _n_geom = self._n_slots_alloc
+        # Shared-psd mirror accounting: per-slot invC is 0 in mirror mode;
+        # the per-device replica (nwalkers x full-band plane) is reported on
+        # its own line below, in BOTH modes (say it out loud).
+        _mirror_on = bool(getattr(self, "_psd_shared_mirror", False))
+        _invc_slot_mb = 0.0 if _mirror_on else _invc_mb
         logger.info(
             "SubBandBuffer: %d cells%s x %s per-cell (%s) ~ %.0f MB data "
             "+ ~%.0f MB invC = ~%.1f GB total%s [band_slab_Nf=%s]%s",
@@ -2746,11 +3050,39 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             tuple(self._per_band_data_shape),
             np.dtype(self._per_band_data_dtype).name,
             _n_copies * _n_geom * _cell_mb,
-            _n_geom * _invc_mb,
-            (_n_copies * _n_geom * _cell_mb + _n_geom * _invc_mb) / 1e3,
+            _n_geom * _invc_slot_mb,
+            (_n_copies * _n_geom * _cell_mb + _n_geom * _invc_slot_mb) / 1e3,
             " (incl. template twin)" if self.use_template_arr else "",
             self.band_slab_Nf, _pool,
         )
+        _n_dev = max(1, len(self.linear_psd_arr))
+        _env = os.environ.get("GB_PSD_SHARED_MIRROR")
+        _env_txt = "unset" if _env is None else _env
+        if _mirror_on:
+            _plane_mb = (
+                float(np.prod(self.shape_sens))
+                * float(self._basis_settings.Nf_active)
+                * float(self._basis_settings.Nt_active)
+                * np.dtype(self._per_band_data_dtype).itemsize / 1e6
+            )
+            logger.info(
+                "GB psd mirror: SHARED (per-device replica: %d walkers x %.0f MB "
+                "= %.2f GB per device, %d device%s; per-slot invC 0 MB, twin "
+                "psd: none) [GB_PSD_SHARED_MIRROR=%s]",
+                int(self.nwalkers), _plane_mb,
+                int(self.nwalkers) * _plane_mb / 1e3, _n_dev,
+                "" if _n_dev == 1 else "s", _env_txt,
+            )
+        else:
+            logger.info(
+                "GB psd mirror: OFF (per-slot copies: %d slots x %.2f MB = "
+                "%.2f GB%s) [GB_PSD_SHARED_MIRROR=%s]",
+                _n_geom, _invc_mb, _n_geom * _invc_mb / 1e3,
+                (f"; twin invC ~{_n_geom * _invc_mb / 1e3:.2f} GB allocated, "
+                 "never read, not counted above"
+                 if self.use_template_arr else ""),
+                _env_txt,
+            )
 
         # Build the domain-aware likelihood engine. Dispatch is on
         # ``isinstance(basis_settings, ...)`` -- no string-level mode flag.
@@ -2864,6 +3196,10 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         :class:`BandView` multi-shard). Without capacity this is verbatim
         the legacy accessor.
         """
+        # Shared-psd mirror: no per-slot psd storage; hand back the read-only
+        # slot-indexed gatherer over the device replica (see _MirrorPsdSlots).
+        if kind == "psd" and acs is self and getattr(self, "_psd_shared_mirror", False):
+            return _MirrorPsdSlots(self)
         if len(acs.linear_data_arr) == 1:
             arr = acs.data_shaped[0] if kind == "data" else acs.psd_shaped[0]
             if (
@@ -2882,6 +3218,11 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         )
 
     def _flat_or_raise(self, acs, kind: str):
+        if kind == "psd" and acs is self and getattr(self, "_psd_shared_mirror", False):
+            raise RuntimeError(
+                "psd_buffer_tmp has no per-slot flat layout in shared-psd mirror "
+                "mode (linear_psd_arr[0] is the parent's per-walker plane); "
+                "use psd_buffer[slots].")
         if len(acs.linear_data_arr) == 1:
             return (
                 acs.linear_data_arr[0] if kind == "data" else acs.linear_psd_arr[0]
@@ -2933,6 +3274,21 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         """
         return self._shaped_or_view(self._acs_template_buffer, "data")
 
+    @property
+    def psd_shaped(self):
+        """Per-split per-slot inverse-PSD reshapes (OFF mode only).
+
+        Mirror mode has no per-slot psd storage -- ``linear_psd_arr[s]`` is
+        the parent's per-walker plane -- so a per-slot reshape would be
+        garbage; raise instead (read :attr:`psd_buffer`).
+        """
+        if getattr(self, "_psd_shared_mirror", False):
+            raise RuntimeError(
+                "psd_shaped is undefined in shared-psd mirror mode (the split "
+                "arrays are the parent's per-walker plane); use "
+                "psd_buffer[slots].")
+        return AnalysisContainerArray.psd_shaped.fget(self)
+
     # ------------------------------------------------------------------
     # Domain-aware allocation helpers
     # ------------------------------------------------------------------
@@ -2973,6 +3329,9 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         # bit-identical; the two caches below DO consume the live binding and
         # must still go. See tests/test_band_slab_nf_cache.py.
         self.__dict__.pop("_slab_min_f_cached", None)
+        # Shared-psd mirror: the per-slot parent-walker row map follows the
+        # same binding (unique_band_combos[:, 1]).
+        self.__dict__.pop("_psd_row_index_cached", None)
         # WDM per-slot start-layer store (see ``min_freq_inds``): constant
         # per bind (every entry is the parent ``ind_min_f``), invalidated on
         # the same rebind/resize hooks as the slab metadata.
@@ -3207,6 +3566,278 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             ])
         return out
 
+    # -- Shared-psd mirror (2026-09-09) ---------------------------------
+
+    @property
+    def psd_row_index(self):
+        """Per-slot PARENT WALKER row of each slot's inverse-PSD (mirror mode).
+
+        ``unique_band_combos[:, 1]`` -- the same axis-0 index the per-unit
+        fill used to pick each slot's invC slab out of the parent's per-walker
+        plane -- as int32, padded to the ALLOCATED slot count like
+        :attr:`slab_min_f` (tail values are valid rows, never consumed). Read
+        by the chunked-het kernels (``WDMComputationsBase._psd_kernel_args``)
+        and the sig-het builds next to ``slab_min_f``. ``None`` when the
+        mirror is OFF (per-slot copies). Cached per bind, invalidated with the
+        slab metadata.
+        """
+        if not getattr(self, "_psd_shared_mirror", False):
+            return None
+        if "_psd_row_index_cached" in self.__dict__:
+            return self._psd_row_index_cached
+        out = SubBandBuffer._compute_psd_row_index(self)
+        self._psd_row_index_cached = out
+        return out
+
+    def _compute_psd_row_index(self):
+        xp = self.xp
+        rows = xp.asarray(self.unique_band_combos[:, 1]).astype(xp.int32)
+        n_alloc = int(self._n_slots_alloc)
+        if int(rows.shape[0]) < n_alloc:
+            rows = xp.concatenate([
+                rows,
+                xp.zeros(n_alloc - int(rows.shape[0]), dtype=xp.int32),
+            ])
+        return xp.ascontiguousarray(rows)
+
+    def bind_psd_mirror(self, acs) -> None:
+        """Point every split's ``linear_psd_arr`` at the parent ACA's
+        per-device inverse-PSD replica (mirror mode; called by
+        ``BandSorter.get_buffer`` at the exact moment the per-slot psd copy
+        used to happen, so noise-update visibility is unchanged).
+
+        Host-side bounds checks (plan risk R5) run unconditionally: every
+        walker row must exist in the plane and every slab must lie inside the
+        parent active band, so the kernels can never read outside the
+        replica.
+        """
+        if not getattr(self, "_psd_shared_mirror", False):
+            raise RuntimeError("bind_psd_mirror called on a buffer with the "
+                               "shared-psd mirror OFF")
+        if not isinstance(self._basis_settings, WDMSettings):
+            raise NotImplementedError("shared-psd mirror is WDM-only")
+        ws = self._basis_settings
+        Nf_active = int(ws.Nf_active)
+        Nt_active = int(ws.Nt_active)
+        ind_min_f = int(ws.ind_min_f)
+        n_rows = int(acs.acs_total_entries)
+        rows_h = np.asarray(asnumpy(self.psd_row_index), dtype=int)
+        n_bound = int(self.num_bands_now)
+        if rows_h.size == 0 or n_bound == 0:
+            raise RuntimeError("bind_psd_mirror: no bound slots")
+        if int(rows_h[:n_bound].min()) < 0 or int(rows_h[:n_bound].max()) >= n_rows:
+            raise ValueError(
+                f"psd_row_index out of range: [{int(rows_h[:n_bound].min())}, "
+                f"{int(rows_h[:n_bound].max())}] vs parent plane rows {n_rows}")
+        smf = self.slab_min_f
+        if smf is not None:
+            smf_h = np.asarray(asnumpy(smf), dtype=int)[:n_bound]
+            W = int(self.band_slab_Nf)
+            if int(smf_h.min()) < ind_min_f or int(smf_h.max()) + W > ind_min_f + Nf_active:
+                raise ValueError(
+                    f"slab origins [{int(smf_h.min())}, {int(smf_h.max())}] + "
+                    f"W={W} run outside the parent active band "
+                    f"[{ind_min_f}, {ind_min_f + Nf_active})")
+        # The parent's per-walker row must be this buffer's channel layout
+        # over the FULL active band.
+        per_row_expected = int(np.prod(self.shape_sens)) * Nf_active * Nt_active
+        per_row_parent = int(acs.psd_data_length) * int(np.prod(acs.shape_sens))
+        if per_row_expected != per_row_parent:
+            raise ValueError(
+                "parent inverse-PSD row layout does not match this buffer's "
+                f"channel/active-band layout ({per_row_parent} vs "
+                f"{per_row_expected} elements per walker)")
+        for s in range(len(self.linear_psd_arr)):
+            dev = None if self.gpus is None else int(self.gpus[s])
+            self.linear_psd_arr[s] = acs.psd_mirror_for_device(dev)
+        self._psd_mirror_bound_version = int(acs.psd_version)
+        self._psd_mirror_plane_rows = n_rows
+
+    def _arm_psd_mirror_parity(self) -> None:
+        """Parity-gate counter (``GB_PSD_MIRROR_PARITY_PROPOSES``), ticked
+        once per unit fill by ``BandSorter.get_buffer`` right after
+        :meth:`bind_psd_mirror`. While the counter is positive every engine
+        call on this buffer is shadow-checked against the per-slot layout
+        (see ``_psd_mirror_parity_check``); the retire line fires once the
+        last armed fill is over.
+        """
+        n = int(getattr(self, "_psd_mirror_parity_proposes", 0))
+        was = bool(getattr(self, "_psd_mirror_parity", False))
+        unit = int(getattr(self, "_psd_mirror_parity_unit", 0))
+        if n > 0:
+            self._psd_mirror_parity = True
+            self._psd_mirror_parity_proposes = n - 1
+            self._psd_mirror_parity_unit = unit + 1
+            logger.info(
+                "[GB_PSD_MIRROR parity] armed for unit fill %d (%d more after "
+                "this one): every get_ll / swap_ll / fstat / sig-het setup on "
+                "this buffer is re-scored through the per-slot layout and "
+                "compared bit-for-bit", unit + 1, n - 1)
+        else:
+            self._psd_mirror_parity = False
+            if was:
+                logger.info(
+                    "[GB_PSD_MIRROR parity] gate retired after %d proposes, "
+                    "no divergence", unit)
+
+    @staticmethod
+    def _psd_mirror_parity_fail(tag, what, a, b, slots, rows_h, smf_h):
+        """Raise with the first differing element located (row -> slot ->
+        walker row / slab origin, both values). Never a warning."""
+        a = np.asarray(a)
+        b = np.asarray(b)
+        if a.shape != b.shape:
+            raise RuntimeError(
+                f"{tag}: {what} SHAPE differs: mirror {a.shape} vs per-slot "
+                f"{b.shape}")
+        bad = np.argwhere(a != b)
+        if bad.shape[0] == 0:
+            # NaN != NaN would land here; treat as divergence too.
+            bad = np.argwhere(~(np.isnan(a) & np.isnan(b)) & (a != b))
+        idx = tuple(int(v) for v in bad[0])
+        r = idx[0]
+        slot = int(slots[r]) if r < len(slots) else -1
+        walker = int(rows_h[slot]) if 0 <= slot < len(rows_h) else -1
+        smf = (int(smf_h[slot]) if (smf_h is not None and 0 <= slot < len(smf_h))
+               else None)
+        raise RuntimeError(
+            f"{tag}: {what} DIVERGES at row {r} (slot {slot}, walker row "
+            f"{walker}, slab_min_f {smf}), index {idx}: mirror {a[idx]!r} vs "
+            f"per-slot {b[idx]!r} ({int(bad.shape[0])} differing elements)")
+
+    def _psd_mirror_parity_check(self, entry, params_phys, data_index,
+                                 noise_index=None, params_remove_phys=None,
+                                 fstat_fold=None):
+        """Shadow-check one engine call against the per-slot layout
+        (``GB_PSD_MIRROR_PARITY_PROPOSES``; runs only while armed).
+
+        Two bit-for-bit comparisons on a sample of the call's rows (the first
+        ``GB_PSD_MIRROR_PARITY_ROWS`` rows whose data and noise slots agree):
+
+        (a) ``psd_buffer[slots]`` -- the invC the mirror addresses for these
+            slots -- versus the PRE-MIRROR per-unit fill copy of the same
+            slots straight out of the parent ACA
+            (``psd_shaped_view()[_get_fill_buffer_ind_map(...)]``): the
+            replica + row map must reproduce the old copy exactly.
+        (b) the raw chunked-het kernel (get_ll / swap_ll / get_fstat_ll)
+            scored on those slots' production bytes TWICE -- once through
+            the mirror args (replica + row map), once through the per-slot
+            args (the slabs from (a)) -- every returned accumulator equal.
+
+        One INFO line per check; ``RuntimeError`` naming the first differing
+        element on any mismatch (the GB_ORTHO lesson: never a warning).
+        """
+        if not getattr(self, "_psd_mirror_parity", False):
+            return
+        xp = self.xp
+        if noise_index is None:
+            noise_index = data_index
+        K = max(1, int(getattr(self, "_psd_mirror_parity_rows", 64)))
+        di_h = np.asarray(asnumpy(data_index), dtype=int).reshape(-1)
+        ni_h = np.asarray(asnumpy(noise_index), dtype=int).reshape(-1)
+        unit = int(getattr(self, "_psd_mirror_parity_unit", 0))
+        tag = (f"[GB_PSD_MIRROR parity "
+               f"{'tmpl' if self.use_template_arr else 'resid'} {entry}] "
+               f"unit {unit}")
+        n = min(int(di_h.size), int(ni_h.size))
+        if n == 0:
+            logger.info("%s: no rows, nothing to check", tag)
+            return
+        same = np.where(di_h[:n] == ni_h[:n])[0]
+        if same.size == 0:
+            logger.info("%s: no rows with data_index == noise_index; skipped",
+                        tag)
+            return
+        sel = same[:K]
+        acs = getattr(self, "parent_acs", None)
+        if acs is None:
+            raise RuntimeError(
+                f"{tag}: gate armed but parent_acs is unset (the buffer did "
+                "not come through BandSorter.get_buffer)")
+        u = np.unique(ni_h[sel])
+        pos = np.searchsorted(u, ni_h[sel]).astype(np.int32)
+        rows_h = np.asarray(asnumpy(self.psd_row_index), dtype=int)
+        smf = self.slab_min_f
+        smf_h = None if smf is None else np.asarray(asnumpy(smf), dtype=int)
+        u_dev = xp.asarray(u)
+
+        # ---- (a) replica gather == the pre-mirror per-slot fill copy -------
+        A = self.psd_buffer[u_dev]
+        inds = self._get_fill_buffer_ind_map(acs, inds_fill=u_dev, is_psd=True)
+        B = acs.psd_shaped_view()[inds]
+        if xp.iscomplexobj(B) and not xp.iscomplexobj(A):
+            B = B.real
+        A_h = np.asarray(asnumpy(A))
+        B_h = np.asarray(asnumpy(B))
+        if A_h.shape != B_h.shape or not np.array_equal(A_h, B_h):
+            self._psd_mirror_parity_fail(tag, "invC gather (mirror vs parent "
+                                         "fill copy)", A_h, B_h, u, rows_h,
+                                         smf_h)
+        del B, B_h
+
+        # ---- (b) kernel addressing: mirror args vs per-slot args ----------
+        comp = self.gb_wdm_comp
+        comp = getattr(comp, "chunked", comp)
+        if comp is None:
+            raise RuntimeError(f"{tag}: no WDM computation object to shadow")
+        dev = getattr(comp, "_build_device", None)
+        from ...utils.device import to_current_device
+        with device_context(xp, dev):
+            data_k = xp.asarray(self.band_buffer[u_dev])
+            data_flat = xp.ascontiguousarray(to_current_device(xp, data_k)).ravel()
+            psd_ps = xp.ascontiguousarray(to_current_device(xp, xp.asarray(A))).ravel()
+            plane = acs.psd_mirror_for_device(dev, refresh="auto")
+            W = self.band_slab_Nf
+            smf_u = (None if smf_h is None
+                     else xp.ascontiguousarray(xp.asarray(smf_h[u], dtype=xp.int32)))
+            rows_u = xp.ascontiguousarray(xp.asarray(rows_h[u], dtype=xp.int32))
+            h_ps = _PsdParityHolder(self, dev, data_flat, psd_ps, len(u),
+                                    W, smf_u, None)
+            h_mi = _PsdParityHolder(self, dev, data_flat, plane, len(u),
+                                    W, smf_u, rows_u)
+            sel_dev = xp.asarray(sel)
+            p = to_current_device(xp, xp.asarray(params_phys)[sel_dev])
+            pos_dev = xp.asarray(pos, dtype=xp.int32)
+            outs = []
+            for h in (h_ps, h_mi):
+                if entry in ("get_ll", "sighet_setup"):
+                    comp.get_ll_wdm(p, h, data_index=pos_dev, noise_index=pos_dev)
+                    o = dict(d_h=comp.d_h_out, h_h=comp.h_h_out)
+                    if getattr(comp, "d_h_im_out", None) is not None:
+                        o["d_h_im"] = comp.d_h_im_out
+                elif entry == "swap_ll":
+                    pr = to_current_device(xp, xp.asarray(params_remove_phys)[sel_dev])
+                    res = comp.get_swap_ll_wdm(p, pr, h, data_index=pos_dev,
+                                               noise_index=pos_dev)
+                    o = dict(zip(("like_add", "like_rem", "d_h_add", "d_h_rem",
+                                  "add_add", "rem_rem", "add_rem"), res))
+                    for k_im in ("d_h_add_im_out", "add_remove_im_out"):
+                        v = getattr(comp, k_im, None)
+                        if v is not None:
+                            o[k_im] = v
+                elif entry == "fstat":
+                    N, M = comp.get_fstat_ll_wdm(p, h, data_index=pos_dev,
+                                                 noise_index=pos_dev,
+                                                 fstat_fold=fstat_fold)
+                    o = dict(N=N, M=M)
+                else:
+                    raise ValueError(f"unknown parity entry {entry!r}")
+                outs.append({k: np.asarray(asnumpy(v)).copy() for k, v in o.items()})
+        per_slot, mirror = outs
+        # map row -> slot for the failure report
+        row_slots = ni_h[sel]
+        for k in per_slot:
+            if not np.array_equal(mirror[k], per_slot[k]):
+                self._psd_mirror_parity_fail(
+                    tag, f"kernel {entry} output '{k}'", mirror[k], per_slot[k],
+                    row_slots, rows_h, smf_h)
+        logger.info(
+            "%s rows=%d slots=%d walkers=%d: IDENTICAL (bit-for-bit; invC "
+            "gather == parent fill copy, mirror-addressed kernel == per-slot "
+            "kernel on %s)",
+            tag, int(sel.size), int(u.size), int(np.unique(rows_h[u]).size),
+            "/".join(sorted(per_slot)))
+
     @property
     def _per_band_data_shape(self) -> tuple:
         """Shape of a single band's residual buffer (one AC's data_res_arr)."""
@@ -3369,7 +4000,15 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             data_domain = per_band_settings.associated_class(res_data, per_band_settings)
             sm = SensitivityMatrixBase(per_band_settings, skip_inv_det=True)
             sm.sens_mat = _forward_sens()
-            sm.invC = cp.zeros(sens_shape, dtype=sens_dtype)
+            if getattr(self, "_psd_shared_mirror", False):
+                # Mirror mode: NO per-slot invC (the slots read the parent's
+                # per-walker plane through the device replica bound in
+                # ``bind_psd_mirror``; the template twin never reads invC).
+                # A zero-storage broadcast view keeps the shape metadata the
+                # ACA derives -- the ``_forward_sens`` idiom above.
+                sm.invC = cp.broadcast_to(cp.zeros((), dtype=sens_dtype), sens_shape)
+            else:
+                sm.invC = cp.zeros(sens_shape, dtype=sens_dtype)
             sm.channel_shape = sens_shape[: -len(per_band_settings.basis_shape_active)]
             ac_list.append(AnalysisContainer(data_domain, sm))
 
@@ -3412,6 +4051,12 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             gpus=list(gpus_in) if gpus_in else None,
             complex_psd=False,
             gpu_assignment=gpu_assignment,
+            # Mirror mode: zero-length linear_psd_arr per split (both this
+            # buffer, whose splits are rebound to the replicas at bind time,
+            # and the template twin, which never reads invC -- ~7.4 GB of
+            # zeros at 1 yr x 2400 slots otherwise).
+            psd_storage=("none" if getattr(self, "_psd_shared_mirror", False)
+                         else "per_ac"),
         )
         return ac_list, aca_kwargs
 
@@ -3693,6 +4338,13 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         nc = self.nchannels
         dc = float(self.settings.differential_component)
         chunk = max(1, int(os.environ.get("GB_BAND_LL_CHUNK", "1024")))
+        if getattr(self, "_psd_shared_mirror", False):
+            # Mirror mode: ``psd_b[rows]`` MATERIALIZES the rows' invC from
+            # the replica (a view in OFF mode), so bound the transient at
+            # _PSD_MIRROR_LL_CHUNK slots (x 3.07 MB at 1 yr). Every cell's
+            # value is an independent per-row reduction, so the chunk size
+            # cannot change a single bit.
+            chunk = min(chunk, _PSD_MIRROR_LL_CHUNK)
         xyz = self.tdi_channel_setup == "XYZ"
 
         def _reduce(num, psd):
@@ -3881,6 +4533,10 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
 
         ll_diff = result.ll_diff
         kept = result.kept
+        # Shared-psd mirror parity gate (no-op unless armed).
+        self._psd_mirror_parity_check(
+            "swap_ll", params_add_phys, data_index, data_index,
+            params_remove_phys=params_remove_phys)
 
         if np.any(~kept):
             logger.info(f"NOT KEEPING: {(~kept).sum()}")
@@ -3945,6 +4601,9 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             self._likelihood_engine, "kept_out",
             self.xp.ones(params.shape[0], dtype=bool),
         )
+        # Shared-psd mirror parity gate (no-op unless armed).
+        self._psd_mirror_parity_check("get_ll", params_phys, data_index,
+                                      noise_index)
         if return_inner_products:
             return ll, self.d_h_out, self.h_h_out, self.phase_angle
         return ll
@@ -3965,8 +4624,14 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         is now active (the move uses this to arm its mid-block drift
         refresh), ``None`` from the no-op hooks."""
         params_phys = self._to_phys(params, leaf_inds=leaf_inds)
-        return self._likelihood_engine.setup_in_model(
+        out = self._likelihood_engine.setup_in_model(
             self, params_phys, data_index, N_vals=N_vals)
+        # Shared-psd mirror parity gate (no-op unless armed): the sig-het
+        # reference build consumed these slots' invC -- prove the gather is
+        # the parent's fill copy and the chunked kernel agrees on them.
+        self._psd_mirror_parity_check("sighet_setup", params_phys, data_index,
+                                      data_index)
+        return out
 
     def clear_in_model_likelihood(self) -> None:
         """Deactivate the per-source in-model setup (no-op engines ignore)."""
@@ -4171,6 +4836,9 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         self.band_buffer[inds_fill] = 0.0
 
     def reset_psd_buffers(self, inds_fill=None):
+        if getattr(self, "_psd_shared_mirror", False):
+            # Mirror mode: no per-slot psd storage to reset.
+            return
         if inds_fill is None:
             inds_fill = cp.arange(self.num_bands_now)
         self.psd_buffer[inds_fill] = 0.0
@@ -4251,6 +4919,12 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                 band_buf[inds_fill] += data_vals
             del data_vals
         del inds_get_data
+
+        if getattr(self, "_psd_shared_mirror", False):
+            # Mirror mode: the slots read the parent plane through the
+            # per-device replica bound in ``bind_psd_mirror`` (get_buffer runs
+            # it right before this fill) -- no per-slot psd copy.
+            return
 
         with _tspan(_ftm, "fill_indmap_psd"):
             inds_get_psd = self._get_fill_buffer_ind_map(acs, inds_fill=inds_fill, is_psd=True)
@@ -4517,6 +5191,9 @@ class BandSorter(LISAToolsParallelModule):
         wdm_slab_guard_layers: int = 1,
         opt_snr_rej_samp_limit: float = 5.0,
         snr_rej_detected: bool = False,
+        psd_shared_mirror: bool = False,
+        psd_mirror_parity_proposes: int = 0,
+        psd_mirror_parity_rows: int = 64,
     ):
 
         LISAToolsParallelModule.__init__(self, force_backend=force_backend)
@@ -4527,6 +5204,13 @@ class BandSorter(LISAToolsParallelModule):
         # value (attribute copy loop), keeping one source of truth.
         self.opt_snr_rej_samp_limit = float(opt_snr_rej_samp_limit)
         self.snr_rej_detected = bool(snr_rej_detected)
+        # Shared-psd mirror knobs (GB_PSD_SHARED_MIRROR /
+        # GB_PSD_MIRROR_PARITY_PROPOSES / GB_PSD_MIRROR_PARITY_ROWS): plain
+        # scalars forwarded to every SubBandBuffer built in get_buffer; the
+        # copy-constructor loop below carries them like the clamp above.
+        self.psd_shared_mirror = bool(psd_shared_mirror)
+        self.psd_mirror_parity_proposes = int(psd_mirror_parity_proposes)
+        self.psd_mirror_parity_rows = int(psd_mirror_parity_rows)
 
         dc = deepcopy if copy else return_x
         if hasattr(gb_branch, "num_sources"):
@@ -5269,6 +5953,12 @@ class BandSorter(LISAToolsParallelModule):
                         self, "opt_snr_rej_samp_limit", 5.0),
                     snr_rej_detected=getattr(
                         self, "snr_rej_detected", False),
+                    psd_shared_mirror=bool(getattr(
+                        self, "psd_shared_mirror", False)),
+                    psd_mirror_parity_proposes=int(getattr(
+                        self, "psd_mirror_parity_proposes", 0)),
+                    psd_mirror_parity_rows=int(getattr(
+                        self, "psd_mirror_parity_rows", 64)),
                     **kwargs,
                 )
 
@@ -5322,6 +6012,15 @@ class BandSorter(LISAToolsParallelModule):
                 "get_buffer(fill_slots=...) must be a subset of inds_fill."
             )
 
+        if getattr(buffer_obj, "_psd_shared_mirror", False):
+            # Shared-psd mirror: (re)bind every split to the parent's
+            # per-device replica HERE -- the exact moment the per-slot psd
+            # copy happens in OFF mode -- so a noise update published to the
+            # parent between two unit fills reaches the slots at the same
+            # fill boundary either way.
+            with _tspan(timer, "buffill_psd_mirror"):
+                buffer_obj.bind_psd_mirror(acs)
+                buffer_obj._arm_psd_mirror_parity()
         with _tspan(timer, "buffill_resid_psd"):
             # A fully-skipped binding (every bound cell sourceless) copies
             # nothing at all -- the empty index arrays would otherwise walk

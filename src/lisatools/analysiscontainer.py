@@ -2064,9 +2064,28 @@ class AnalysisContainerArray:
         complex_psd: bool = False,
         gpu_assignment: Optional[np.ndarray] = None,
         run_threaded: bool = False,
+        psd_storage: str = "per_ac",
     ) -> None:
         self.run_threaded = bool(run_threaded)
         self._thread_pool = None
+        # Inverse-PSD storage (GB shared-psd mirror, 2026-09-09):
+        #   "per_ac" (default) -- one invC slab per container, repacked into
+        #     the contiguous per-split ``linear_psd_arr`` (today's layout).
+        #   "none" -- NO per-container invC storage: ``linear_psd_arr`` holds
+        #     zero-length arrays and ``reset_linear_psd_arr`` is a no-op. Used
+        #     by the GB SubBandBuffer in mirror mode (its slots read the
+        #     parent ACA's per-walker plane through a per-device replica; the
+        #     template twin never reads invC at all). Any accidental read of
+        #     the zero-length buffer raises instead of returning zeros.
+        if psd_storage not in ("per_ac", "none"):
+            raise ValueError(
+                f"psd_storage must be 'per_ac' or 'none'; got {psd_storage!r}")
+        self._psd_storage = psd_storage
+        # Monotonic version of the inverse-PSD plane: bumped by every writer
+        # (``reset_linear_psd_arr`` / ``scatter_linear_psd_arr``) so a cached
+        # per-device replica (``psd_mirror_for_device``) can tell it is stale.
+        self._psd_version = 0
+        self._psd_mirror = {}
 
         if isinstance(analysis_containers, AnalysisContainer):
             acs = np.array([analysis_containers], dtype=object)
@@ -2214,6 +2233,11 @@ class AnalysisContainerArray:
         self.split_map = np.zeros(self.acs_total_entries, dtype=int)
         self.linear_data_arr = []
         self.linear_psd_arr = []
+        # psd_storage="none": zero-length per split (see __init__ docstring).
+        _psd_len = (
+            0 if self._psd_storage == "none"
+            else self.psd_data_length * np.prod(shape_sens)
+        )
         for i, split in enumerate(gpu_splits):
             if gpus is not None:
                 self.gpu_map[split] = gpus[i]
@@ -2227,7 +2251,7 @@ class AnalysisContainerArray:
                     )
                     self.linear_psd_arr.append(
                         self.xp.zeros(
-                            self.psd_data_length * np.prod(shape_sens) * len(split),
+                            _psd_len * len(split),
                             dtype=self.noise_dtype,
                         )
                     )
@@ -2241,7 +2265,7 @@ class AnalysisContainerArray:
                 )
                 self.linear_psd_arr.append(
                     self.xp.zeros(
-                        self.psd_data_length * np.prod(shape_sens) * len(split),
+                        _psd_len * len(split),
                         dtype=self.noise_dtype,
                     )
                 )
@@ -2374,7 +2398,17 @@ class AnalysisContainerArray:
             self.xp.cuda.runtime.setDevice(main_gpu)
 
     def reset_linear_psd_arr(self):
-        """Repack each container's inverse-PSD into the contiguous per-GPU PSD buffer."""
+        """Repack each container's inverse-PSD into the contiguous per-GPU PSD buffer.
+
+        Every call bumps ``_psd_version`` (the plane's content changed, or may
+        have): per-device replicas handed out by :meth:`psd_mirror_for_device`
+        key their refresh off it. With ``psd_storage="none"`` there is no
+        plane to repack and this returns immediately (the containers keep
+        whatever ``invC`` they hold).
+        """
+        if getattr(self, "_psd_storage", "per_ac") == "none":
+            return
+        self._psd_version = int(getattr(self, "_psd_version", 0)) + 1
         if self.gpus is not None:
             main_gpu = self.xp.cuda.runtime.getDevice()
 
@@ -3340,8 +3374,80 @@ class AnalysisContainerArray:
 
     def scatter_linear_psd_arr(self, flat):
         """Write a flat gathered inverse-PSD buffer (from
-        :meth:`gather_linear_psd_arr`) back into the per-shard buffers."""
+        :meth:`gather_linear_psd_arr`) back into the per-shard buffers.
+
+        Bumps ``_psd_version`` (second writer of the plane; see
+        :meth:`reset_linear_psd_arr`)."""
+        self._psd_version = int(getattr(self, "_psd_version", 0)) + 1
         self._scatter_single_to_per_gpu(flat, self.linear_psd_arr)
+
+    @property
+    def psd_version(self) -> int:
+        """Monotonic version of the inverse-PSD plane (bumped by every writer)."""
+        return int(getattr(self, "_psd_version", 0))
+
+    def psd_mirror_for_device(self, device: Optional[int] = None, refresh: str = "always"):
+        """Per-device replica of this ACA's WHOLE inverse-PSD plane.
+
+        The GB shared-psd mirror (2026-09-09): instead of copying each
+        sub-band slot's invC slab out of this per-walker plane on every unit
+        fill, every buffer on a device reads ONE replica of the plane
+        (``nwalkers x shape_sens x psd_end_shape``, ``float64``) through a
+        per-slot walker-row map. The replica is allocated ONCE per device and
+        thereafter refreshed IN PLACE (same array object, so kernel bindings
+        that cached its pointer stay valid -- plan risks R9/R11):
+
+        * ``refresh="always"`` (default; what the buffer's ``bind_psd_mirror``
+          uses at every unit fill) re-copies the plane on every call. That is
+          exactly today's "snapshot at fill" semantics -- the copy is the same
+          bytes the per-slot fill would have gathered -- and costs one
+          plane-sized memcpy per fill instead of one per slot.
+        * ``refresh="auto"`` re-copies only when :attr:`psd_version` moved
+          since the replica was last written (both writers bump it).
+
+        Multi-shard planes are gathered in global-AC order via
+        :meth:`gather_linear_psd_arr` and routed through the host onto the
+        target device (no peer-to-peer). On a single split the replica is a
+        device-local copy (never an alias of the live plane). Requires a real
+        ``float64`` plane (the WDM chunked-het kernels' contract) and
+        ``psd_storage="per_ac"``.
+        """
+        if getattr(self, "_psd_storage", "per_ac") == "none":
+            raise RuntimeError(
+                "psd_mirror_for_device: this ACA stores no inverse-PSD plane "
+                "(psd_storage='none')."
+            )
+        if np.dtype(self.noise_dtype) != np.dtype(np.float64):
+            raise TypeError(
+                "psd_mirror_for_device requires a real float64 inverse-PSD "
+                f"plane; this ACA's noise_dtype is {np.dtype(self.noise_dtype)}."
+            )
+        if refresh not in ("always", "auto"):
+            raise ValueError(f"refresh must be 'always' or 'auto'; got {refresh!r}")
+        key = None if device is None else int(device)
+        cache = self.__dict__.setdefault("_psd_mirror", {})
+        version = self.psd_version
+        entry = cache.get(key)
+        if entry is not None and refresh == "auto" and entry[1] == version:
+            return entry[0]
+
+        from .utils.device import device_context, to_current_device
+
+        # Source plane: the live single-split buffer, or the global-AC-order
+        # gather of a multi-shard plane (host copy on GPU multi-shard).
+        src = self.gather_linear_psd_arr()
+        xp = self.xp
+        with device_context(xp, key):
+            if entry is not None and int(entry[0].size) == int(src.size):
+                mirror = entry[0]
+                # in place: device-local source copies directly, a foreign
+                # device's plane hops through the host (no P2P).
+                mirror[...] = to_current_device(xp, src)
+            else:
+                mirror = xp.array(to_current_device(xp, src), copy=True)
+                mirror = xp.ascontiguousarray(mirror)
+        cache[key] = [mirror, version]
+        return mirror
 
     def gather_data_shaped(self):
         """Return the full ``(num_acs, nchannels, *end_shape)`` residual ndarray.
@@ -3382,6 +3488,12 @@ class AnalysisContainerArray:
 
         Companion to :meth:`data_shaped_view`. Same semantics.
         """
+        if getattr(self, "_psd_storage", "per_ac") == "none":
+            raise RuntimeError(
+                "psd_shaped_view: this ACA stores no per-container inverse-PSD "
+                "plane (psd_storage='none'); in GB mirror mode read the buffer's "
+                "psd_buffer gather object instead."
+            )
         return BandView(self, kind="psd", n_bands=n_bands)
 
     @property

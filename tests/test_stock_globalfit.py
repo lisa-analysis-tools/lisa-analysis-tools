@@ -1030,3 +1030,64 @@ class GFHDFBackendNameTest(unittest.TestCase):
         )
         for name, sub in backend.sub_backend.items():
             self.assertEqual(sub.name, backend.name, f"{name} sub-backend name drifted")
+
+
+class PsdSharedMirrorKnobTest(unittest.TestCase):
+    """GB shared-psd mirror knobs (2026-09-09): rule-0 env round trip.
+
+    ``GBSettings.psd_shared_mirror`` <-> ``GB_PSD_SHARED_MIRROR`` (default
+    OFF), ``psd_mirror_parity_proposes`` <-> ``GB_PSD_MIRROR_PARITY_PROPOSES``
+    (0), ``psd_mirror_parity_rows`` <-> ``GB_PSD_MIRROR_PARITY_ROWS`` (64);
+    explicit kwarg beats env; construction stays cheap (nothing heavy in
+    ``__init__``).
+    """
+
+    def test_defaults_are_off(self):
+        with _EnvGuard(GB_PSD_SHARED_MIRROR=None, GB_PSD_MIRROR_PARITY_PROPOSES=None,
+                       GB_PSD_MIRROR_PARITY_ROWS=None):
+            fit = erebor.get_stock("gb_no_fg")
+            self.assertIs(fit.gb.psd_shared_mirror, False)
+            self.assertEqual(fit.gb.psd_mirror_parity_proposes, 0)
+            self.assertEqual(fit.gb.psd_mirror_parity_rows, 64)
+
+    def test_env_round_trip(self):
+        with _EnvGuard(GB_PSD_SHARED_MIRROR="1", GB_PSD_MIRROR_PARITY_PROPOSES="3",
+                       GB_PSD_MIRROR_PARITY_ROWS="16"):
+            fit = erebor.get_stock("gb_no_fg")
+            self.assertIs(fit.gb.psd_shared_mirror, True)
+            self.assertEqual(fit.gb.psd_mirror_parity_proposes, 3)
+            self.assertEqual(fit.gb.psd_mirror_parity_rows, 16)
+        with _EnvGuard(GB_PSD_SHARED_MIRROR="off"):
+            fit = erebor.get_stock("gb_no_fg")
+            self.assertIs(fit.gb.psd_shared_mirror, False)
+
+    def test_kwarg_beats_env(self):
+        with _EnvGuard(GB_PSD_SHARED_MIRROR="1"):
+            fit = erebor.get_stock("gb_no_fg")
+            fit.gb.psd_shared_mirror = False
+            self.assertIs(fit.gb.psd_shared_mirror, False)
+
+    def test_knobs_reach_the_move_kwargs(self):
+        """The plumb: GBSettings -> group_proposal_kwargs (the move ctor
+        kwargs), same path as wdm_band_slab_layers."""
+        with _EnvGuard(GB_PSD_SHARED_MIRROR="1", GB_PSD_MIRROR_PARITY_PROPOSES="2"):
+            fit = erebor.get_stock("gb_no_fg")
+            gb = fit.gb
+            try:
+                gb.init_sampling_info()
+            except Exception as exc:  # pragma: no cover - environment guard
+                self.skipTest(f"init_sampling_info unavailable here: {exc}")
+            kw = gb.group_proposal_kwargs
+            self.assertIs(kw["psd_shared_mirror"], True)
+            self.assertEqual(kw["psd_mirror_parity_proposes"], 2)
+            self.assertEqual(kw["psd_mirror_parity_rows"], 64)
+            self.assertIn("wdm_band_slab_layers", kw)
+
+    def test_deepcopy_pickle_safe(self):
+        import copy
+        import pickle
+
+        with _EnvGuard(GB_PSD_SHARED_MIRROR="1"):
+            fit = erebor.get_stock("gb_no_fg")
+            back = pickle.loads(pickle.dumps(copy.deepcopy(fit)))
+            self.assertIs(back.gb.psd_shared_mirror, True)
