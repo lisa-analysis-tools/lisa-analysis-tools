@@ -569,10 +569,13 @@ export GB_N_SUBBANDS=32768  # (was 16384 pre-mirror, 8192 before that) PER GPU; 
 # ##    and the SubBandBuffer line reads "... + ~0 MB invC = ...".        ##
 # ##  If it says "GB psd mirror: OFF (per-slot copies: ...)" the knob did ##
 # ##  not apply (spooled copy of an old script): scancel, NEW sbatch.     ##
-# ##  PARITY GATE (armed below for the first 3 unit fills of EVERY        ##
-# ##  buffer): each get_ll / swap_ll / fstat / sig-het setup is re-scored ##
-# ##  through the old per-slot layout on 64 rows and compared             ##
-# ##  bit-for-bit. Expect, per armed fill:                                ##
+# ##  PARITY GATE: DISARMED below (=0) since 2026-09-10. Job 469 ran it  ##
+# ##  armed for 7 h: 9,172 shadow re-scorings (7,187 get_ll + 1,985      ##
+# ##  sig-het setups), ALL IDENTICAL, 0 divergences. Armed it costs 1.5% ##
+# ##  of wall here (vgb_pe rebuilds its buffer every unit and re-arms).  ##
+# ##  RE-ARM (=3) after ANY kernel / mirror / buffer code change; each   ##
+# ##  armed fill re-scores get_ll / swap_ll / fstat / sig-het setup      ##
+# ##  through the old per-slot layout on 64 rows, bit-for-bit. Expect:   ##
 # ##    "[GB_PSD_MIRROR parity] armed for unit fill 1 (2 more after ...)" ##
 # ##    "[GB_PSD_MIRROR parity resid get_ll] unit 1 rows=64 slots=...:    ##
 # ##     IDENTICAL (bit-for-bit; ...)"  (one per engine call)             ##
@@ -582,10 +585,9 @@ export GB_N_SUBBANDS=32768  # (was 16384 pre-mirror, 8192 before that) PER GPU; 
 # ##  origin and both values -- the job dies, it never warns.             ##
 # ######################################################################### #
 export GB_PSD_SHARED_MIRROR=1
-# First 3 unit fills of each buffer shadow-checked (see the gate box above);
-# 0 = disarmed (production setting once the gate has retired cleanly on
-# both runs). 64 rows per check is the code default (GB_PSD_MIRROR_PARITY_ROWS).
-export GB_PSD_MIRROR_PARITY_PROPOSES=3
+# 3 -> 0 (2026-09-10): disarmed after the clean armed run (see the box);
+# 3 re-arms. 64 rows per check is the code default (GB_PSD_MIRROR_PARITY_ROWS).
+export GB_PSD_MIRROR_PARITY_PROPOSES=0
 # RJ pick thinning. UNSET as of 2026-08-28 -- the value now lives in code
 # (_SEARCH_RJ_FLIP_DEFAULT / _PE_RJ_FLIP_DEFAULT in recipe.py, both 0.2),
 # so behavior is UNCHANGED from the 0.2 this line used to export.
@@ -770,7 +772,18 @@ export GB_TEMPER_EVERY_PROPOSES=1
 # headroom (peaks 90.5/90.6 of 95.8 GB with leaves still climbing) --
 # WATCH gpu_util_*.csv per-card max after restart and REVERT to 1200 if
 # peaks cross ~93 GB. Unset = code default 1200.
-export GB_TEMPER_PRELOAD_CELLS=2400
+# 2400 -> 4800 (2026-09-10, mirror follow-up). The memory argument that
+# capped this at 2400 is gone: under the shared-psd mirror the twin is
+# data-only (1.2 GB at 2400 -> 2.4 GB at 4800 here) and job 469 peaked at
+# 38 GB of 96. Halves the tempering chunk count again with BIT-IDENTICAL
+# math (chunking is pure scheduling); run_tempering + temper_buffer was
+# ~85 s of a ~350 s rj unit. Twin capacity follows (GB_BUFFER_FIXED_CAPACITY
+# twin = budget // ntemps x ntemps = 4800 at 24 rungs = 200 rows/chunk --
+# the row count that once OOM'd a 64 GB HOST staging alloc in July, when a
+# cell was a full-band slab; a cell is a 0.25 MB narrow slab now, so 4800
+# cells stage in ~1.2 GB. WATCH "[host maxRSS ...]" (28 GB on job 469).
+# Rollback: 2400.
+export GB_TEMPER_PRELOAD_CELLS=4800
 # ===== RELAUNCH EFFICIENCY (2026-09-04, wall-time relaunch) =====
 # Two env-only tempering scheduling wins, both exactness-preserving and
 # now A/B-validated by 11 clean snapshots (TEMPER_CHECK MATCH throughout).
@@ -1221,6 +1234,18 @@ export GB_SIGHET_INMODEL_WINDOWED=1
 # capacity as one batch is ~3.4 GB. The reference BUILD stays chunked by
 # GB_SIGHET_FOLD_MAX_BYTES (1 GiB), bounding the transient at any pool size.
 export GB_INMODEL_SETUP_BATCH=0
+# Sig-het reference BUILD batch, in bytes of per-chunk transient (Ec + En +
+# dense c0 per source; code default 1 GiB): 1 -> 8 GiB (2026-09-10). A
+# source's transient is ~3.6 MB here, so 1 GiB meant ~300-source chunks
+# and the every-25-repeats refresh of ~7-8.5k in-model sources
+# (GB_SIGHET_REFRESH_EVERY) ran as ~25-30 chunks; 8 GiB -> ~2,400-source
+# chunks, 3-4 per refresh. The math is unchanged (chunking is scheduling
+# only; DenseTransientChunkingTest pins chunk=1 vs one-shot bit-identical)
+# -- only the per-chunk launch/loop overhead goes. Smaller lever here than
+# at 1 yr (refresh+setup ~20 s of a ~350 s rj unit). COST: up to +8 GB
+# transient on the build device, against a 38 GB peak on job 469.
+# Rollback: unset (1 GiB).
+export GB_SIGHET_FOLD_MAX_BYTES=8589934592
 # RJ-path in-model chunk width (2026-09-09). Sits UPSTREAM of the staging cap:
 # `_im_w = min(n_slots, GB_RJ_INMODEL_CHUNK)` (gbspecialstretch, job-194
 # forensics), then GB_INMODEL_SETUP_BATCH re-caps residency at EVERY call
@@ -1460,6 +1485,22 @@ export GB_SEARCH_RJ_REPLACE=0
 # center-table inputs are gone -- installed-but-inert machinery in a
 # production run is surface area with no upside. =1 restores it.
 export GB_PE_RJ_REPLACE=0
+# PE-ONLY exclusive RJ draw (user ruling 2026-09-10). The full_pe stage's
+# combine move drew len(moves) sub-moves per iteration with equal weights,
+# so BOTH rj_fstat_pe and rj_prior_pe ran ~once per iteration (job 469:
+# 27 + 27 firings over 27 PE iterations, ~280 s each = the whole ~9.4 min
+# PE iteration). With GB_PE_RJ_DRAW_ONE=1 the stage runs exactly ONE of the
+# two per iteration, drawn from the sampler RNG with
+# P(rj_fstat_pe) = GB_PE_RJ_FSTAT_FRACTION; rj_warm_pe / gb_ridge_gibbs (when
+# present) still run once per iteration in their fixed order. Search and
+# rj stages are untouched by construction (stage-kind gate in
+# GFCombineMove._pe_rj_draw_one_plan). Expect the PE iteration to drop to
+# ~5 min (one RJ block + overhead) and the log line
+#   "[GB_PE_RJ_DRAW_ONE] stage=full_pe: ONE of rj_fstat_pe/rj_prior_pe per
+#    iteration, P(rj_fstat_pe)=0.80 P(rj_prior_pe)=0.20 ..."
+# at the first PE propose. Runtime env, resume-safe. Rollback: unset.
+export GB_PE_RJ_DRAW_ONE=1
+export GB_PE_RJ_FSTAT_FRACTION=0.8
 # ORTHOGONALITY PREMISE MONITOR (v7-aligned). NOT GB_ORTHO_LL_CHECK (the lnL
 # bookkeeping reconcile, already on). This measures what the band decomposition
 # RESTS on: normalized |<h_i|h_j>| between concurrently-open adjacent-band cold

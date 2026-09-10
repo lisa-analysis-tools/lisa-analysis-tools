@@ -931,6 +931,112 @@ class _FStatRefRowHolder:
         return getattr(self._parent, name)
 
 
+#: Depth guard for the ``_parent`` walk in :func:`_parity_target` (today's
+#: deepest chain is one hop: view -> buffer).
+_PARITY_CHAIN_MAX_DEPTH = 8
+
+
+def _parity_target(holder):
+    """Resolve the shared-psd MIRROR parity gate that owns an engine call.
+
+    The gate (``GB_PSD_MIRROR_PARITY_PROPOSES``) lives on the
+    :class:`SubBandBuffer` that binds the mirror, but the engine calls it is
+    meant to shadow-score arrive at the router through VIEWS
+    (:class:`_ShardHolderView`, :class:`_FStatRefRowHolder`,
+    :class:`_PsdParityHolder`) that carry no gate of their own -- so a bare
+    ``getattr(holder, "_psd_mirror_parity_check", None)`` finds nothing and
+    the check silently never runs. That was the measured coverage gap: on the
+    production runs only the two entries hooked on the buffer's OWN methods
+    ("get_ll" via :meth:`SubBandBuffer.get_ll`, "sighet_setup") ever fired.
+
+    Walks the ``_parent`` chain until an object exposing
+    ``_psd_mirror_parity_check`` turns up, and returns ``(buffer, rows)``
+    where ``rows`` maps the CALLER's row index space onto the buffer's
+    GLOBAL slot ids (``None`` == identity: the holder IS the buffer, which is
+    the production case). ``(None, None)`` when no gated buffer owns the
+    holder -- the parent residual ACA, e.g., which is what the in-fit F-stat
+    scores against and which has no mirror at all.
+
+    Index space is the whole point of the ``rows`` half: the check indexes
+    ``self.psd_buffer[...]`` and ``_get_fill_buffer_ind_map(..., is_psd=True)``
+    with GLOBAL slots, while a ``_ShardHolderView`` hands the engines
+    INTRA-shard rows. A hop that re-indexes rows without publishing the map
+    (``_FStatRefRowHolder``, whose single row is a device-local COPY, or
+    ``_PsdParityHolder``) is refused rather than translated wrongly: the gate
+    logs that it skipped instead of comparing the wrong slots.
+    """
+    obj = holder
+    rows = None
+    unmapped = False
+    for _ in range(_PARITY_CHAIN_MAX_DEPTH):
+        if obj is None:
+            return None, None
+        if getattr(obj, "_psd_mirror_parity_check", None) is not None:
+            if unmapped:
+                if getattr(obj, "_psd_mirror_parity", False):
+                    logger.info(
+                        "[GB_PSD_MIRROR parity] armed buffer reached through "
+                        "%s, which re-indexes rows without a global row map; "
+                        "check SKIPPED (never compared against the wrong "
+                        "slots)", type(holder).__name__)
+                return None, None
+            return obj, rows
+        parent = getattr(obj, "_parent", None)
+        if parent is None:
+            return None, None
+        # Only a view that PUBLISHES its global rows can be translated.
+        # ``rows`` is deliberately not duck-typed: every view delegates its
+        # public long tail to the parent, so a stray parent attribute of the
+        # same name would masquerade as a row map.
+        if isinstance(obj, _ShardHolderView):
+            r = np.asarray(asnumpy(obj.rows), dtype=int)
+            rows = r if rows is None else r[rows]
+        else:
+            unmapped = True
+        obj = parent
+    return None, None
+
+
+def _fire_psd_mirror_parity(holder, entry, params_phys, data_index,
+                            noise_index=None, **check_kwargs):
+    """Run the shared-psd MIRROR parity gate for ONE production engine call.
+
+    No-op unless :func:`_parity_target` finds an ARMED buffer behind the
+    holder. Row indices are translated into the buffer's global slot space
+    before the check sees them, and the check itself is what raises on a
+    mismatch (never a warning) and writes the one INFO line per entry.
+
+    Called at the TOP of the routed entry points -- before the production
+    kernel runs -- so the shadow scoring can never clobber the accumulators
+    (``comp.d_h_out`` & co.) the caller is about to read. This is a
+    diagnostic: it must not change a single likelihood value.
+    """
+    # Hot-path escape (this runs on EVERY routed engine call): a holder that
+    # neither carries an armed gate nor sits on a ``_parent`` chain -- the
+    # parent residual ACA, or a buffer whose gate is off/retired -- can reach
+    # no gate, and two failed attribute lookups is the whole cost.
+    if not (getattr(holder, "_psd_mirror_parity", False)
+            or getattr(holder, "_parent", None) is not None):
+        return
+    buf, rows = _parity_target(holder)
+    if buf is None or not getattr(buf, "_psd_mirror_parity", False):
+        return
+    if data_index is None:
+        logger.info("[GB_PSD_MIRROR parity %s]: call carries no data_index; "
+                    "skipped", entry)
+        return
+    di = np.asarray(asnumpy(data_index), dtype=int).reshape(-1)
+    ni = (di if noise_index is None
+          else np.asarray(asnumpy(noise_index), dtype=int).reshape(-1))
+    if rows is not None:
+        di = rows[di]
+        ni = rows[ni]
+    p = params_phys
+    if getattr(p, "ndim", 2) == 1:
+        p = p[None]
+    buf._psd_mirror_parity_check(entry, p, di, ni, **check_kwargs)
+
+
 class _RoutedBandEngine:
     """Multi-shard router in front of a single-shard band likelihood engine.
 
@@ -1323,6 +1429,12 @@ class _RoutedBandEngine:
 
     def get_ll(self, holder, params_phys, *, data_index, noise_index,
                N_vals, phase_maximize=False, waveform_kwargs, **kwargs):
+        # Shared-psd mirror parity gate, hooked where PRODUCTION calls land
+        # (no-op unless the owning buffer's gate is armed). Fires before the
+        # kernel so the shadow scoring cannot clobber the accumulators the
+        # caller reads off the engine afterwards.
+        _fire_psd_mirror_parity(holder, "get_ll", params_phys, data_index,
+                                noise_index)
         if not self._is_multi(holder):
             _rtm0 = getattr(holder, "_prop_timer", None)
             if _rtm0 is not None:
@@ -1425,6 +1537,14 @@ class _RoutedBandEngine:
     def get_swap_ll(self, holder, params_remove_phys, params_add_phys, *,
                     data_index, noise_index, N_vals, phase_maximize=False,
                     waveform_kwargs, **kwargs):
+        # Shared-psd mirror parity gate (see get_ll). The RJ production path
+        # calls the ROUTED entry, never SubBandBuffer.get_swap_ll, so the
+        # "swap_ll" entry never fired before this hook existed. The remove
+        # rows are row-aligned with the add rows, which is what the check's
+        # sampled-row subset assumes.
+        _fire_psd_mirror_parity(holder, "swap_ll", params_add_phys, data_index,
+                                noise_index,
+                                params_remove_phys=params_remove_phys)
         if not self._is_multi(holder):
             return self._engine.get_swap_ll(
                 holder, params_remove_phys, params_add_phys,
@@ -1864,12 +1984,12 @@ class _RoutedBandEngine:
         """
         # Shared-psd mirror parity gate on a mirror-mode buffer (no-op unless
         # armed; the production F-stat holders are the parent ACA, which has
-        # no gate).
-        _pcheck = getattr(holder, "_psd_mirror_parity_check", None)
-        if _pcheck is not None and getattr(holder, "_psd_mirror_parity", False):
-            _pcheck("fstat", params_phys, data_index,
-                    data_index if noise_index is None else noise_index,
-                    fstat_fold=kwargs.get("fstat_fold"))
+        # no gate). Resolved through the ``_parent`` chain: the bare getattr
+        # this used to do found nothing whenever the holder was a VIEW, so
+        # the "fstat" entry silently skipped itself.
+        _fire_psd_mirror_parity(holder, "fstat", params_phys, data_index,
+                                noise_index,
+                                fstat_fold=kwargs.get("fstat_fold"))
         if not cls._is_multi(holder):
             return getattr(comp, method_name)(
                 params_phys, holder, data_index=data_index,
@@ -2965,6 +3085,8 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         self._psd_mirror_bound_version = None
         self._psd_mirror_plane_rows = None
         self._psd_mirror_parity = False
+        # Armed-check counter (double-fire guard; see _psd_mirror_parity_check)
+        self._psd_mirror_parity_ncheck = 0
         if self._psd_shared_mirror:
             if not isinstance(self._basis_settings, WDMSettings):
                 raise NotImplementedError(
@@ -3729,6 +3851,15 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         """
         if not getattr(self, "_psd_mirror_parity", False):
             return
+        # Re-entrancy / double-fire counter: the buffer's own get_ll /
+        # get_swap_ll forward to the routed engine, which now fires the gate
+        # itself, so those methods only fall back to their own check when
+        # this counter did NOT move across the engine call (i.e. the engine
+        # was not a router, or the holder resolved to no gate). Bumped for
+        # every ARMED invocation, including the early "nothing to check"
+        # returns below -- a skipped check is still one check.
+        self._psd_mirror_parity_ncheck = int(
+            getattr(self, "_psd_mirror_parity_ncheck", 0)) + 1
         xp = self.xp
         if noise_index is None:
             noise_index = data_index
@@ -4520,6 +4651,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         params_remove_phys = self._to_phys(params_remove, leaf_inds=leaf_inds)
         params_add_phys = self._to_phys(params_add, leaf_inds=leaf_inds)
 
+        _pn = int(getattr(self, "_psd_mirror_parity_ncheck", 0))
         result = self._likelihood_engine.get_swap_ll(
             self,
             params_remove_phys,
@@ -4533,10 +4665,14 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
 
         ll_diff = result.ll_diff
         kept = result.kept
-        # Shared-psd mirror parity gate (no-op unless armed).
-        self._psd_mirror_parity_check(
-            "swap_ll", params_add_phys, data_index, data_index,
-            params_remove_phys=params_remove_phys)
+        # Shared-psd mirror parity gate (no-op unless armed). FALLBACK only:
+        # a routed engine already fired the gate for this very call (with the
+        # same global slot ids), and the counter says so -- checking twice
+        # would double every log line and double the shadow cost.
+        if int(getattr(self, "_psd_mirror_parity_ncheck", 0)) == _pn:
+            self._psd_mirror_parity_check(
+                "swap_ll", params_add_phys, data_index, data_index,
+                params_remove_phys=params_remove_phys)
 
         if np.any(~kept):
             logger.info(f"NOT KEEPING: {(~kept).sum()}")
@@ -4584,6 +4720,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             _dtm.count("gll_rows", int(params.shape[0]))
         with _tspan(_dtm, "gll_to_phys"):
             params_phys = self._to_phys(params, leaf_inds=leaf_inds)
+        _pn = int(getattr(self, "_psd_mirror_parity_ncheck", 0))
         with _tspan(_dtm, "gll_engine"):
             ll = self._likelihood_engine.get_ll(
                 self,
@@ -4601,9 +4738,12 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             self._likelihood_engine, "kept_out",
             self.xp.ones(params.shape[0], dtype=bool),
         )
-        # Shared-psd mirror parity gate (no-op unless armed).
-        self._psd_mirror_parity_check("get_ll", params_phys, data_index,
-                                      noise_index)
+        # Shared-psd mirror parity gate (no-op unless armed). FALLBACK only:
+        # skipped when the routed engine already fired it for this call (see
+        # get_swap_ll).
+        if int(getattr(self, "_psd_mirror_parity_ncheck", 0)) == _pn:
+            self._psd_mirror_parity_check("get_ll", params_phys, data_index,
+                                          noise_index)
         if return_inner_products:
             return ll, self.d_h_out, self.h_h_out, self.phase_angle
         return ll

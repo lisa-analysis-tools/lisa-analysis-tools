@@ -574,10 +574,15 @@ export GB_N_SUBBANDS=4096  # (was 2048 pre-mirror, 1024 before that) PER GPU; pe
 # ##    and the SubBandBuffer line reads "... + ~0 MB invC = ...".        ##
 # ##  If it says "GB psd mirror: OFF (per-slot copies: ...)" the knob did ##
 # ##  not apply (spooled copy of an old script): scancel, NEW sbatch.     ##
-# ##  PARITY GATE (armed below for the first 3 unit fills of EVERY        ##
-# ##  buffer): each get_ll / swap_ll / fstat / sig-het setup is re-scored ##
-# ##  through the old per-slot layout on 64 rows and compared             ##
-# ##  bit-for-bit. Expect, per armed fill:                                ##
+# ##  PARITY GATE: DISARMED below (=0) since 2026-09-10. Job 470 ran it  ##
+# ##  armed for 7 h: 11,474 shadow re-scorings (get_ll + sig-het setups) ##
+# ##  ALL IDENTICAL, 0 divergences. Armed it cost ~7.5% of wall here     ##
+# ##  (vgb_pe rebuilds its buffer every unit and re-arms: 21 -> 46 s per ##
+# ##  unit x 84 units per 7 h), which is what ate the rj_fstat_search    ##
+# ##  gain (1386 -> 1284 s). RE-ARM (=3) after ANY kernel / mirror /      ##
+# ##  buffer code change; each armed fill re-scores get_ll / swap_ll /   ##
+# ##  fstat / sig-het setup through the old per-slot layout on 64 rows,  ##
+# ##  bit-for-bit. Expect:                                                ##
 # ##    "[GB_PSD_MIRROR parity] armed for unit fill 1 (2 more after ...)" ##
 # ##    "[GB_PSD_MIRROR parity resid get_ll] unit 1 rows=64 slots=...:    ##
 # ##     IDENTICAL (bit-for-bit; ...)"  (one per engine call)             ##
@@ -587,10 +592,9 @@ export GB_N_SUBBANDS=4096  # (was 2048 pre-mirror, 1024 before that) PER GPU; pe
 # ##  origin and both values -- the job dies, it never warns.             ##
 # ######################################################################### #
 export GB_PSD_SHARED_MIRROR=1
-# First 3 unit fills of each buffer shadow-checked (see the gate box above);
-# 0 = disarmed (production setting once the gate has retired cleanly on
-# both runs). 64 rows per check is the code default (GB_PSD_MIRROR_PARITY_ROWS).
-export GB_PSD_MIRROR_PARITY_PROPOSES=3
+# 3 -> 0 (2026-09-10): disarmed after the clean armed run (see the box);
+# 3 re-arms. 64 rows per check is the code default (GB_PSD_MIRROR_PARITY_ROWS).
+export GB_PSD_MIRROR_PARITY_PROPOSES=0
 # RJ pick thinning. UNSET as of 2026-08-28 -- the value now lives in code
 # (_SEARCH_RJ_FLIP_DEFAULT / _PE_RJ_FLIP_DEFAULT in recipe.py, both 0.2),
 # so behavior is UNCHANGED from the 0.2 this line used to export.
@@ -775,7 +779,18 @@ export GB_TEMPER_EVERY_PROPOSES=1
 # headroom (peaks 90.5/90.6 of 95.8 GB with leaves still climbing) --
 # WATCH gpu_util_*.csv per-card max after restart and REVERT to 1200 if
 # peaks cross ~93 GB. Unset = code default 1200.
-export GB_TEMPER_PRELOAD_CELLS=2400
+# 2400 -> 4800 (2026-09-10, mirror follow-up). The memory argument that
+# capped this at 2400 is gone: under the shared-psd mirror the twin is
+# data-only (4.9 GB at 2400 -> 9.8 GB at 4800 here) and job 470 peaked at
+# 56-65 GB of 96. Halves the tempering chunk count again with
+# BIT-IDENTICAL math (chunking is pure scheduling); run_tempering +
+# temper_buffer = 192 s of a 1284 s rj_fstat_search unit on job 470 (15%).
+# Twin capacity follows (GB_BUFFER_FIXED_CAPACITY twin = budget // ntemps x
+# ntemps = 4800 at 24 rungs = 200 rows/chunk -- the row count that once
+# OOM'd a 64 GB HOST staging alloc in July, when a cell was a full-band
+# slab; a cell is a 1.02 MB narrow slab now, so 4800 cells stage in ~5 GB).
+# WATCH "[host maxRSS ...]" (32 GB on job 470). Rollback: 2400.
+export GB_TEMPER_PRELOAD_CELLS=4800
 # Per-block EXACT info matrices through the sig-het fast route
 # (~2.4 ms/src vs ~29-46 chunked). The data_index misindex is FIXED and
 # multi-GPU slots now route by the BUFFER's slot shards. First
@@ -1212,6 +1227,18 @@ export GB_SIGHET_INMODEL_WINDOWED=1
 # still chunked internally by GB_SIGHET_FOLD_MAX_BYTES (1 GiB, ~75 src),
 # so the build transient is bounded regardless of pool size.
 export GB_INMODEL_SETUP_BATCH=0
+# Sig-het reference BUILD batch, in bytes of per-chunk transient (Ec + En +
+# dense c0 per source; code default 1 GiB): 1 -> 8 GiB (2026-09-10). A
+# source's transient is ~14.3 MB at 1 yr, so 1 GiB meant ~75-source chunks:
+# the every-25-repeats refresh of ~5.2-5.5k in-model sources
+# (GB_SIGHET_REFRESH_EVERY) ran as ~70 chunks, and refresh + setup cost
+# 210 s of a 1284 s rj_fstat_search unit on job 470 (16%). 8 GiB ->
+# ~600-source chunks, ~10 per refresh. The math is unchanged (chunking is
+# scheduling only; DenseTransientChunkingTest pins chunk=1 vs one-shot
+# bit-identical) -- only the per-chunk launch/loop overhead goes. COST: up
+# to +8 GB transient on the build device, inside the ~30 GB the mirror
+# freed (dev0/dev1 peaks 56/65 GB of 96 on job 470). Rollback: unset (1 GiB).
+export GB_SIGHET_FOLD_MAX_BYTES=8589934592
 # RJ-path in-model chunk width (2026-09-09). Sits UPSTREAM of the staging cap:
 # `_im_w = min(n_slots, GB_RJ_INMODEL_CHUNK)` (gbspecialstretch, job-194
 # forensics), then GB_INMODEL_SETUP_BATCH re-caps residency at EVERY call
@@ -1456,6 +1483,22 @@ export GB_SEARCH_RJ_REPLACE=0
 # center-table inputs are gone -- installed-but-inert machinery in a
 # production run is surface area with no upside. =1 restores it.
 export GB_PE_RJ_REPLACE=0
+# PE-ONLY exclusive RJ draw (user ruling 2026-09-10). The full_pe stage's
+# combine move draws len(moves) sub-moves per iteration with equal weights,
+# so BOTH rj_fstat_pe and rj_prior_pe run ~once per iteration (measured on
+# the 3-month run: 27 + 27 firings over 27 PE iterations, each RJ block
+# being the bulk of the iteration). With GB_PE_RJ_DRAW_ONE=1 the stage runs
+# exactly ONE of the two per iteration, drawn from the sampler RNG with
+# P(rj_fstat_pe) = GB_PE_RJ_FSTAT_FRACTION; rj_warm_pe / gb_ridge_gibbs
+# (when present) still run once per iteration in their fixed order. Search
+# and rj stages are untouched by construction (stage-kind gate in
+# GFCombineMove._pe_rj_draw_one_plan). This run is still in gb_search; the
+# knob arms when it reaches full_pe. Expect the log line
+#   "[GB_PE_RJ_DRAW_ONE] stage=full_pe: ONE of rj_fstat_pe/rj_prior_pe per
+#    iteration, P(rj_fstat_pe)=0.80 P(rj_prior_pe)=0.20 ..."
+# at the first PE propose. Runtime env, resume-safe. Rollback: unset.
+export GB_PE_RJ_DRAW_ONE=1
+export GB_PE_RJ_FSTAT_FRACTION=0.8
 # ORTHOGONALITY PREMISE MONITOR (v7-aligned). NOT GB_ORTHO_LL_CHECK (the lnL
 # bookkeeping reconcile, already on). This measures what the band decomposition
 # RESTS on: normalized |<h_i|h_j>| between concurrently-open adjacent-band cold

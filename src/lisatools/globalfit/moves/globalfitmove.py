@@ -8,6 +8,7 @@ materialization with a :class:`MoveBuildContext`.
 """
 
 import dataclasses
+import logging
 import os
 import resource
 import sys
@@ -18,6 +19,8 @@ import numpy as np
 from eryn.moves import CombineMove
 
 from .. import midit_checkpoint
+
+logger = logging.getLogger(__name__)
 
 
 def ensure_fine_noise_covariance_current(acs, coarse_runtime) -> None:
@@ -555,7 +558,94 @@ class GFCombineMove(CombineMove, GlobalFitMove):
         if acs is not None:
             ensure_fine_noise_covariance_current(acs, runtime)
 
+    # ---- PE-only exclusive RJ draw (user ruling 2026-09-10) ----------------
+    #: The two PE RJ proposals that become mutually exclusive per iteration
+    #: under ``GB_PE_RJ_DRAW_ONE=1`` (matched on the declarative move name
+    #: the Stage stamps as ``gf_move_name``).
+    _PE_RJ_DRAW_ONE_MEMBERS = ("rj_fstat_pe", "rj_prior_pe")
+
+    @staticmethod
+    def _pe_rj_draw_one_config():
+        """``(enabled, p_fstat)`` from the env, read at CALL time.
+
+        ``GB_PE_RJ_DRAW_ONE`` (default ``0``) switches the mode on;
+        ``GB_PE_RJ_FSTAT_FRACTION`` (default ``0.8``) is P(rj_fstat_pe) per
+        iteration, in [0, 1]. Read per call like ``GF_MOVE_TIMING`` so a
+        resumed run takes the runbook's value with no code change.
+        """
+        if os.environ.get("GB_PE_RJ_DRAW_ONE", "0") != "1":
+            return False, None
+        raw = os.environ.get("GB_PE_RJ_FSTAT_FRACTION", "0.8")
+        p = float(raw)
+        if not np.isfinite(p) or not (0.0 <= p <= 1.0):
+            raise ValueError(
+                f"GB_PE_RJ_FSTAT_FRACTION={raw!r} must lie in [0, 1] "
+                "(P(rj_fstat_pe) per PE iteration)."
+            )
+        return True, p
+
+    def _pe_rj_draw_one_plan(self, model):
+        """Sub-move sequence for THIS propose under the PE-only exclusive
+        RJ draw, or ``None`` when the mode does not apply.
+
+        In a stage of kind ``"pe"`` whose wrapped moves include BOTH
+        ``rj_fstat_pe`` and ``rj_prior_pe``, exactly ONE of the two runs per
+        iteration, drawn from ``model.random`` with
+        P(rj_fstat_pe) = ``GB_PE_RJ_FSTAT_FRACTION`` (so a fixed seed
+        reproduces the draws). Every other wrapped move runs once per
+        iteration in its fixed order; the drawn RJ move takes the slot of
+        the first RJ member (``rj_warm_pe`` still precedes it,
+        ``gb_ridge_gibbs`` still follows). Search / rj stages are never
+        touched (kind gate), nor is a PE stage carrying only one of the
+        pair -- both fall through to the stage's configured mode
+        (``weighted_cycle`` / ``random_choice`` / sequential).
+
+        Why: with the PE cycle drawn as ``len(moves)`` weighted draws, both
+        RJ moves ran ~once per iteration (3-month job 469: 27 + 27 firings
+        over 27 PE iterations, ~280 s each = the whole ~9.4 min iteration).
+        One RJ move per stored row at 0.8/0.2 halves the PE iteration and
+        tilts the birth mix toward the F-stat grid, without changing what
+        either move does when it runs.
+        """
+        enabled, p_fstat = self._pe_rj_draw_one_config()
+        if not enabled or getattr(self, "gf_stage_kind", None) != "pe":
+            return None
+        moves = [m[0] if isinstance(m, tuple) else m for m in self.moves]
+        names = [getattr(m, "gf_move_name", type(m).__name__) for m in moves]
+        members = self._PE_RJ_DRAW_ONE_MEMBERS
+        if not all(n in names for n in members):
+            return None
+        pick = members[0] if float(model.random.uniform()) < p_fstat else members[1]
+        plan = []
+        placed = False
+        for m, n in zip(moves, names):
+            if n in members:
+                if not placed:
+                    plan.append(moves[names.index(pick)])
+                    placed = True
+                continue
+            plan.append(m)
+        stage = getattr(self, "gf_stage_name", "?")
+        if not getattr(self, "_pe_rj_draw_one_announced", False):
+            logger.info(
+                "[GB_PE_RJ_DRAW_ONE] stage=%s: ONE of %s per iteration, "
+                "P(rj_fstat_pe)=%.2f P(rj_prior_pe)=%.2f, drawn from the sampler "
+                "RNG; the other %d wrapped move(s) run once per iteration in "
+                "fixed order [GB_PE_RJ_DRAW_ONE=1]",
+                stage, "/".join(members), p_fstat, 1.0 - p_fstat,
+                len(plan) - 1,
+            )
+            self._pe_rj_draw_one_announced = True
+        if os.environ.get("GF_MOVE_TIMING", "0") == "1":
+            print(f"[GF_TIMING] stage={stage} pe_rj_draw_one -> {pick}",
+                  flush=True)
+        return plan
+
     def _propose_moves(self, model, state):
+        plan = self._pe_rj_draw_one_plan(model)
+        if plan is not None:
+            return self._run_sequence(model, state, plan)
+
         if getattr(self, "weighted_cycle", False) and len(self.moves) > 1:
             # GB PE cycle style (user ruling 2026-08-26): one propose runs
             # a full drawn cycle -- len(moves) sub-moves drawn WITH
@@ -623,11 +713,17 @@ class GFCombineMove(CombineMove, GlobalFitMove):
             and self._gf_sidecar_runtime_lookup() is None
         ):
             return super().propose(model, state)
+        return self._run_sequence(model, state, self.moves)
 
-        # Unified sequential loop: eryn CombineMove.propose semantics plus
-        # optional [GF_TIMING] instrumentation and mid-iteration checkpoints
-        # at the sub-move boundaries (each wrapped move returns a coherent
-        # state -- cold rows synced -- so every boundary is a resume point).
+    def _run_sequence(self, model, state, moves):
+        """Run ``moves`` in order -- eryn CombineMove.propose semantics plus
+        optional [GF_TIMING] instrumentation and mid-iteration checkpoints
+        at the sub-move boundaries (each wrapped move returns a coherent
+        state -- cold rows synced -- so every boundary is a resume point).
+        ``moves`` is normally ``self.moves``; the PE-only exclusive RJ draw
+        passes its per-iteration plan instead.
+        """
+        timing = os.environ.get("GF_MOVE_TIMING", "0") == "1"
         self._gf_timing_iter = getattr(self, "_gf_timing_iter", 0) + 1
         it = self._gf_timing_iter
         stage = getattr(self, "gf_stage_name", "?")
@@ -635,7 +731,7 @@ class GFCombineMove(CombineMove, GlobalFitMove):
 
         accepted_out = None
         t_all = time.perf_counter()
-        for move in self.moves:
+        for move in moves:
             if isinstance(move, tuple):
                 move = move[0]
             rss0 = _gf_rss_mb()
