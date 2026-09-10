@@ -757,6 +757,22 @@ export GB_INMODEL_REPEATS_SURVIVOR=100
 # vertical swap exchanges occupancy without updating the drift-gate
 # census (self-corrects next block). =0 reverts.
 export GB_TEMPER_VERTICAL=1
+# VERTICAL-SWAP CONTROL ARM (2026-09-10 forensics): accepted in-model vertical
+# rung swaps at the cold pair (T0-T1) jumped 334 -> 16,205 per 100-repeat block
+# at the 467 relaunch (1yr: 33 -> 1,156 -> 3,328), the largest discontinuity in
+# the logs, because one-block staging (GB_INMODEL_SETUP_BATCH=0) makes every
+# rung pair co-resident (pair availability 5-10% -> 140-180%). The swap is a
+# closed-form relabel on the SIG-HET ll_ref of both rows (never re-scored
+# exactly); the [GB_CELL_LL] cold worst-cell discrepancy rose 77 -> 582 lnL in
+# lock-step, in the bands holding SNR 50-184 sources with 2-5 occupants.
+# Submit with  sbatch --export=ALL,GB_VERT_OFF=1 <this script>  to keep every
+# other 469/470 knob and switch ONLY the vertical swaps off (the tempering
+# move's whole-cell swaps are untouched). If [GB_CELL_LL] cold worst diffs
+# drop back to ~80 and the leaves stop shedding, this is the cause.
+if [ "${GB_VERT_OFF:-0}" = "1" ]; then
+  echo "[GB_VERT_OFF] control arm: in-model vertical rung swaps OFF"
+  export GB_TEMPER_VERTICAL=0
+fi
 
 # PERMUTED-SWAP CADENCE 3 -> 1 (user ruling 2026-08-26): fire the
 # permuted band swaps after EVERY GB propose -- 3x/iteration in search
