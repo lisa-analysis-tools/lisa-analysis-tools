@@ -232,6 +232,10 @@ class BandShutoffTest(unittest.TestCase):
         m.rj_removal_only = False
         m.rj_replace = False
         m.rj_fstat_dist_birth = True
+        # The valve is gated on the per-iteration DESIGNATED move
+        # (``leaf_cap_update``) since 2983d912, not on the distance-draw
+        # flag above (which every production script sets to 0).
+        m.leaf_cap_update = True
         m.band_edges = np.array([5e-3, 8e-3, 11e-3, 14e-3, 17e-3])
         m._band_leaf_cap = cap
         return m

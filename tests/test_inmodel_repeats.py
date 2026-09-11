@@ -212,6 +212,12 @@ class _FakeBuffer:
     def setup_in_model_likelihood(self, *a, **k):
         return False
 
+    def band_likelihoods(self, source_only=False, slots=None):
+        """Per-slot slab likelihood (the vertical sweep's L_free base):
+        the fake holds no data, so every slab scores 0."""
+        n = len(self.frequency_lims[0]) if slots is None else int(len(slots))
+        return np.zeros(n)
+
     def clear_in_model_likelihood(self):
         pass
 

@@ -750,6 +750,13 @@ export GB_INMODEL_REPEATS_SURVIVOR=100
 # vertical swap exchanges occupancy without updating the drift-gate
 # census (self-corrects next block). =0 reverts.
 export GB_TEMPER_VERTICAL=1
+# REQUIRED with vertical swaps (user ruling 2026-09-10): every rung of a
+# (walker, band) column staged together -- scheduler cell order (band,
+# walker, temp). Built 08-18, never exported here before: jobs 465-469 all
+# ran order=count with vertical partners by coincidence. The move now
+# defaults to "band" whenever GB_TEMPER_VERTICAL=1; exported explicitly so
+# the log line [GB_VERT ...] order=band is unambiguous.
+export GB_TEMPER_CELL_ORDER=band
 # VERTICAL-SWAP CONTROL ARM (2026-09-10 forensics): accepted in-model vertical
 # rung swaps at the cold pair (T0-T1) jumped 334 -> 16,205 per 100-repeat block
 # at the 467 relaunch (1yr: 33 -> 1,156 -> 3,328), the largest discontinuity in

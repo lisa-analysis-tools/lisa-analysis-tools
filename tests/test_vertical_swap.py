@@ -223,8 +223,14 @@ class VerticalPairsTest(unittest.TestCase):
 class _SweepFixture:
     """A single (walker, band) column with one picked row per temperature."""
 
-    def __init__(self, ll, seed=3):
+    def __init__(self, ll, seed=3, base=None):
+        # ``ll`` = per-row add-delta ll_ref; ``base`` = per-row source-free
+        # slab likelihood L_free = -<r|r>/2 (zeros by default, so L_with ==
+        # ll_ref and the ratio tests read directly in ``ll``).
         self.mv = _make_move(seed)
+        self.base = (
+            np.zeros(NTEMPS) if base is None else np.asarray(base, dtype=float)
+        )
         self.t, self.w, self.b = _rows()
         self.slots = np.arange(NTEMPS, dtype=int)
         self.band_temps = _ladder()
@@ -246,6 +252,7 @@ class _SweepFixture:
             self.sorter, self.band_temps, self.t, self.w, self.b,
             self.slots, self.beta, self.ll_ref, self.ll_change,
             self.prop, self.acc, self.cell_ll, parity,
+            cell_ll_base=self.base,
         )
 
 
@@ -818,6 +825,7 @@ class VerticalCensusDeSyncTest(unittest.TestCase):
             fx.sorter, fx.band_temps, fx.t, fx.w, fx.b,
             fx.slots, fx.beta, fx.ll_ref, fx.ll_change,
             fx.prop, fx.acc, fx.cell_ll, 0, census=cn,
+            cell_ll_base=fx.base,
         )
         return fx, cn, n_acc
 
@@ -840,6 +848,211 @@ class VerticalCensusDeSyncTest(unittest.TestCase):
         before = cn["prop_by_rung"].copy()
         fx.mv._vertical_census_flush(cn)
         np.testing.assert_array_equal(cn["prop_by_rung"], before)
+
+
+class VerticalLWithTest(unittest.TestCase):
+    """The ratio compares WHOLE-cell likelihoods, L_with = L_free + ll_ref.
+
+    ``ll_ref`` is the picked source's add-delta ``<r|h> - <h|h>/2`` against
+    the cell's SOURCE-FREE residual ``r``; ``L_free = -<r|r>/2`` is the
+    slab term the block measures once after the removal. Inside a cell
+    L_free cancels; between two cells it does not (2026-09-10 correction).
+    """
+
+    def test_missing_base_is_refused(self):
+        fx = _SweepFixture(ll=[-100.0, -10.0, -100.0, -100.0])
+        fx.base = None
+        with self.assertRaises(ValueError):
+            fx.sweep(parity=0)
+
+    def test_equal_deltas_do_not_mean_equal_cells(self):
+        """Cold cell {A, B} (picked A) vs hot cell {A'} (picked A').
+
+        Both cells see the SAME add-delta for A (A improves each cell by
+        SNR_A^2/2 = 800), so the 2026-08-18 statistic was 0 and the swap
+        was accepted at every draw. The source-free residual of the hot
+        cell still contains B (L_free = -SNR_B^2/2 = -450); the cold
+        cell's is clean (L_free = 0). L_with: cold 800, hot 350 -> the
+        cold model is better by 450 and the swap must be rejected.
+        """
+        ll = [800.0, 800.0, -10.0, -1e6]         # rows: t0 (cold), t1 (hot), ...
+        base = [0.0, -450.0, 0.0, 0.0]
+        fx = _SweepFixture(ll=ll, base=base)
+        n = fx.sweep(parity=0)                  # pair (t1, t0)
+        self.assertEqual(n, 0)
+        np.testing.assert_array_equal(fx.t, np.arange(NTEMPS))
+
+    def test_equal_deltas_swap_when_the_hot_residual_is_cleaner(self):
+        """Mirror image: the hot cell holds the extra (good) companion."""
+        ll = [800.0, 800.0, -10.0, -1e6]
+        base = [-450.0, 0.0, 0.0, 0.0]          # cold residual still has B
+        fx = _SweepFixture(ll=ll, base=base)
+        n = fx.sweep(parity=0)
+        self.assertEqual(n, 1)
+        self.assertEqual(fx.t[1], 0)
+        self.assertEqual(fx.t[0], 1)
+
+    def test_base_and_ll_ref_stay_with_their_rows(self):
+        """Rows keep their slots, so neither per-row array is swapped."""
+        ll = [800.0, 800.0, -10.0, -1e6]
+        base = [-450.0, 0.0, 0.0, 0.0]
+        fx = _SweepFixture(ll=ll, base=base)
+        ll_before, base_before = fx.ll_ref.copy(), fx.base.copy()
+        self.assertEqual(fx.sweep(parity=0), 1)
+        np.testing.assert_array_equal(fx.ll_ref, ll_before)
+        np.testing.assert_array_equal(fx.base, base_before)
+
+    def test_sole_occupants_reduce_to_the_delta_form(self):
+        """Two sole-occupant cells share the bare data slab: equal bases, so
+        the decision is the 2026-08-18 one (exact there)."""
+        ll = [-100.0, -10.0, -100.0, -100.0]
+        fx_a = _SweepFixture(ll=ll, base=[-5.0, -5.0, -5.0, -5.0], seed=3)
+        fx_b = _SweepFixture(ll=ll, base=None, seed=3)
+        self.assertEqual(fx_a.sweep(parity=0), fx_b.sweep(parity=0))
+        np.testing.assert_array_equal(fx_a.t, fx_b.t)
+
+
+class ColumnStagingTest(unittest.TestCase):
+    """Every rung of a (walker, band) column is staged together
+    (user requirement 2026-09-10)."""
+
+    @staticmethod
+    def _pool(t, w, b):
+        t, w, b = (np.asarray(x, dtype=int) for x in (t, w, b))
+        n = t.size
+        return {
+            "ids": np.arange(n), "temp_inds": t, "walker_inds": w,
+            "band_inds": b, "slot_index": np.arange(n, dtype=np.int32),
+            "specials": pack_special_index(t, w, b, NWALKERS),
+        }
+
+    def test_order_is_band_walker_temp(self):
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            _order_pool_by_column,
+        )
+        # pick order: scrambled rungs of two columns
+        pool = self._pool(t=[2, 0, 1, 3, 1, 0], w=[1, 0, 1, 0, 0, 1],
+                          b=[2, 2, 2, 2, 2, 2])
+        out = _order_pool_by_column(pool, np, NBANDS)
+        key = out["walker_inds"] * NBANDS + out["band_inds"]
+        # columns contiguous, temperature ascending inside each
+        self.assertEqual(key.tolist(), [2, 2, 2, 5, 5, 5])
+        self.assertEqual(out["temp_inds"].tolist(), [0, 1, 3, 0, 1, 2])
+        # identity when already ordered (same object)
+        self.assertIs(_order_pool_by_column(out, np, NBANDS), out)
+        # every parallel array permuted together
+        np.testing.assert_array_equal(
+            out["specials"],
+            pack_special_index(out["temp_inds"], out["walker_inds"],
+                               out["band_inds"], NWALKERS))
+
+    def test_chunks_never_split_a_column(self):
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            _column_chunks, _order_pool_by_column,
+        )
+        # three columns of 4, 3, 4 rows; width 6 -> [4], [3], [4]
+        t = [0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 3]
+        w = [0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0]
+        b = [0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1]
+        pool = _order_pool_by_column(self._pool(t, w, b), np, NBANDS)
+        chunks = list(_column_chunks(pool, 6, NBANDS))
+        sizes = [int(c["ids"].size) for c in chunks]
+        self.assertEqual(sizes, [4, 3, 4])
+        for c in chunks:
+            key = c["walker_inds"] * NBANDS + c["band_inds"]
+            self.assertEqual(len(np.unique(key)), 1)
+        # rows are conserved and in order
+        np.testing.assert_array_equal(
+            np.concatenate([c["ids"] for c in chunks]), pool["ids"])
+        # width >= pool -> the same object back
+        self.assertIs(next(_column_chunks(pool, 11, NBANDS)), pool)
+
+    def test_newborn_class_is_lifted_to_the_column(self):
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            _column_atomic_newborn,
+        )
+        pool = self._pool(t=[0, 1, 2, 0, 1], w=[0, 0, 0, 1, 1],
+                          b=[1, 1, 1, 1, 1])
+        pool["newborn"] = np.array([False, True, False, False, False])
+        out = _column_atomic_newborn(pool, np, NBANDS)
+        self.assertEqual(out["newborn"].tolist(),
+                         [True, True, True, False, False])
+
+    def test_capacity_is_a_multiple_of_ntemps_with_swaps_on(self):
+        mv = _make_move()
+        mv.num_band_preload = 1000
+        mv.gb = SimpleNamespace(gpus=None)      # CPU backend: gpus unused
+        mv.temper_vertical = True          # NTEMPS = 4 -> 1000
+        self.assertEqual(mv.num_band_preload_total, 1000)
+        mv.ntemps = 3                      # -> 999
+        self.assertEqual(mv.num_band_preload_total, 999)
+        mv.num_band_preload = 2            # never below one column
+        self.assertEqual(mv.num_band_preload_total, 3)
+        mv.temper_vertical = False         # untouched with swaps off
+        self.assertEqual(mv.num_band_preload_total, 2)
+
+    def test_band_order_is_the_default_with_swaps_on(self):
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            _resolve_temper_cell_order,
+        )
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GB_TEMPER_CELL_ORDER", None)
+            self.assertEqual(
+                _resolve_temper_cell_order("gb", None, default="band"), "band")
+            self.assertEqual(
+                _resolve_temper_cell_order("gb", None, default="count"),
+                "count")
+        with mock.patch.dict(os.environ, {"GB_TEMPER_CELL_ORDER": "count"}):
+            self.assertEqual(
+                _resolve_temper_cell_order("gb", None, default="band"),
+                "count")
+
+
+class SchedulerRelabelTest(unittest.TestCase):
+    """``BandScheduler.relabel_slots``: counters and slot->cell follow the
+    model through a vertical relabel."""
+
+    def _sched(self):
+        from lisatools.globalfit.moves.gbbands import BandScheduler
+        # one column, 3 rungs; cell t0 has 3 sources, t1 has 1, t2 has 2
+        t = np.array([0, 0, 0, 1, 2, 2])
+        w = np.zeros(6, dtype=int)
+        b = np.ones(6, dtype=int)
+        spec = pack_special_index(t, w, b, NWALKERS)
+        return BandScheduler(spec, 3, xp=np, cell_order="band",
+                             nwalkers=NWALKERS), spec
+
+    def test_counters_and_slots_follow_the_model(self):
+        sch, spec = self._sched()
+        s0 = pack_special_index(0, 0, 1, NWALKERS)
+        s1 = pack_special_index(1, 0, 1, NWALKERS)
+        sch.record_picks(np.array([s0, s1]))     # one pick each
+        slot0 = int(np.flatnonzero(sch.slot_specials == s0)[0])
+        slot1 = int(np.flatnonzero(sch.slot_specials == s1)[0])
+        # swap t0 <-> t1: slot0's model is now labelled s1, slot1's s0
+        sch.relabel_slots(np.array([slot0, slot1]), np.array([s1, s0]))
+        self.assertEqual(int(sch.slot_specials[slot0]), s1)
+        self.assertEqual(int(sch.slot_specials[slot1]), s0)
+        # the 3-source model (now labelled s1) keeps its budget 3 / run 1
+        p1 = int(sch._cells_of(np.array([s1]))[0])
+        p0 = int(sch._cells_of(np.array([s0]))[0])
+        self.assertEqual(int(sch.cell_counts[p1]), 3)
+        self.assertEqual(int(sch.cell_run[p1]), 1)
+        self.assertEqual(int(sch.cell_counts[p0]), 1)
+        self.assertEqual(int(sch.cell_run[p0]), 1)
+        # advance retires exactly the finished (1-source) model's slot
+        fin = sch.slot_active & (
+            sch.cell_run[sch.slot_cell] >= sch.cell_counts[sch.slot_cell])
+        self.assertEqual(np.flatnonzero(fin).tolist(), [slot1])
+
+    def test_unchanged_labels_are_a_noop(self):
+        sch, spec = self._sched()
+        before = (sch.slot_cell.copy(), sch.cell_run.copy(),
+                  sch.cell_counts.copy())
+        sch.relabel_slots(np.arange(3), sch.slot_specials.copy())
+        np.testing.assert_array_equal(sch.slot_cell, before[0])
+        np.testing.assert_array_equal(sch.cell_run, before[1])
+        np.testing.assert_array_equal(sch.cell_counts, before[2])
 
 
 if __name__ == "__main__":

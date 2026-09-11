@@ -825,7 +825,7 @@ def tempering_swap_cap_ok(occ_a, occ_b, from_band_a, from_band_b, cap):
     correction 2026-08-30). The RJ ``curr_logp = -inf`` cap gate is a
     PROPOSAL-level veto on birth rows; it is not a prior term, and
     tempering's ratio is pure likelihood --
-    ``(b_cold - b_hot) * (ll_ref[hot] - ll_ref[cold])`` -- so the cap has
+    ``(b_cold - b_hot) * (L_with[hot] - L_with[cold])`` -- so the cap has
     never entered a swap's acceptance and cannot be said to be "already in
     the target". Vetoing a swap here ADDS a constraint the sampled density
     does not carry. That is admissible under the search policy (search
@@ -1698,6 +1698,94 @@ def _picked_batches(picked, cap):
         return
     for start in range(0, n, cap):
         yield {k: v[start:start + cap] for k, v in picked.items()}
+
+
+def _pool_column_key(pool, num_bands):
+    """Per-row (walker, band) COLUMN id: ``walker * num_bands + band``.
+
+    A vertical ladder column is every temperature of one walker's one
+    sub-band; the in-model vertical swap pairs rows within a column only
+    (``_vertical_pairs``: same walker, same band, adjacent temps).
+    """
+    w = pool["walker_inds"]
+    b = pool["band_inds"]
+    return w.astype(np.int64) * int(num_bands) + b.astype(np.int64)
+
+
+def _order_pool_by_column(pool, xp, num_bands):
+    """Reorder a picked pool by ``(band, walker, temp)`` -- temperature LAST.
+
+    User requirement 2026-09-10: when one (walker, band) column is run,
+    ALL of its rungs must be staged together. With temperature as the
+    innermost key a column is one contiguous run of rows in ladder order,
+    so any contiguous cut that lands on a column boundary keeps every
+    rung of every column in one block (:func:`_column_chunks`). Identity
+    (the same dict object) when the pool is already in that order, so a
+    pool the RJ direct path pre-ordered costs one comparison here.
+    Row order carries no meaning for the repeat block itself: every
+    per-row array is gathered by row, and the RNG stream is re-shaped per
+    block exactly as it is by the staging cap.
+    """
+    n = int(pool["ids"].shape[0])
+    if n <= 1:
+        return pool
+    t = xp.asarray(pool["temp_inds"]).astype(xp.int64)
+    w = xp.asarray(pool["walker_inds"]).astype(xp.int64)
+    b = xp.asarray(pool["band_inds"]).astype(xp.int64)
+    # lexsort: the LAST key is primary -> (band, walker, temp).
+    order = xp.lexsort(xp.stack((t, w, b)))
+    if bool(xp.all(order == xp.arange(n))):
+        return pool
+    return {k: v[order] for k, v in pool.items()}
+
+
+def _column_chunks(pool, width, num_bands):
+    """Contiguous chunks of a COLUMN-ORDERED pool, at most ``width`` rows
+    each, that NEVER split a (walker, band) column.
+
+    The pool must come from :func:`_order_pool_by_column`. A chunk closes
+    at the last column boundary within ``width`` rows of its start; a
+    column wider than ``width`` (impossible once the caller floors
+    ``width`` to a multiple of ``ntemps``, since a column holds at most
+    one row per rung) is taken whole rather than split. Yields the
+    original dict when it already fits.
+    """
+    n = int(pool["ids"].shape[0])
+    if width <= 0 or n <= width:
+        yield pool
+        return
+    key = np.asarray(_to_numpy(_pool_column_key(pool, num_bands)))
+    starts = np.flatnonzero(np.r_[True, key[1:] != key[:-1]])
+    bounds = np.r_[starts, n]
+    s = 0
+    while s < n:
+        inside = bounds[(bounds > s) & (bounds <= s + width)]
+        if inside.size:
+            e = int(inside.max())
+        else:  # a single column wider than the cap: never split it
+            e = int(bounds[bounds > s].min())
+        yield {k: v[s:e] for k, v in pool.items()}
+        s = e
+
+
+def _column_atomic_newborn(pool, xp, num_bands):
+    """Lift the ``newborn`` flag to whole columns.
+
+    The RJ direct path polishes newborn survivors and mature survivors in
+    separate blocks (different repeat budgets). Splitting a column across
+    the two classes would strand its rungs in different blocks; with
+    vertical swaps on, a column with ANY newborn row is polished as a
+    whole in the newborn class (the mature rungs simply get the newborn
+    budget). Returns a new dict with the lifted flag.
+    """
+    nb = xp.asarray(pool["newborn"]).astype(bool)
+    key = xp.asarray(_pool_column_key(pool, num_bands))
+    uni, inv = xp.unique(key, return_inverse=True)
+    col_nb = xp.zeros(int(uni.shape[0]), dtype=bool)
+    col_nb[inv[nb]] = True
+    out = dict(pool)
+    out["newborn"] = col_nb[inv]
+    return out
 
 
 def _buffer_fixed_capacity_active(sorter, kwargs) -> bool:
@@ -2701,8 +2789,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # Cell -> slot ordering. "band" makes sub-band columns contiguous so
         # vertical swap partners are co-resident; separate knob from
         # ``temper_vertical`` so its packing cost is measurable alone.
+        # Default follows the swap: vertical swaps REQUIRE every rung of a
+        # (walker, band) column staged together (user requirement
+        # 2026-09-10), which is what "band" ordering delivers. The knob was
+        # opt-in from 08-18 to 09-10 and no production script set it, so
+        # every v8 job ran vertical swaps on "count" order with partners by
+        # coincidence only. An explicit knob/kwarg still wins.
         self.temper_cell_order = _resolve_temper_cell_order(
-            branch_name, kwargs.get("temper_cell_order", None)
+            branch_name, kwargs.get("temper_cell_order", None),
+            default=("band" if self.temper_vertical else "count"),
         )
         self.use_info_mat_proposal = bool(use_info_mat_proposal)
         self.swap_on_in_model = bool(swap_on_in_model)
@@ -4703,7 +4798,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         budget and total residency scales with the allocation."""
         gpus = (getattr(self.gb, "gpus", None)
                 if self.backend.uses_cupy else None)
-        return int(self.num_band_preload) * (len(gpus) if gpus else 1)
+        total = int(self.num_band_preload) * (len(gpus) if gpus else 1)
+        # VERTICAL LADDER CAPACITY (user requirement 2026-09-10): with the
+        # in-model vertical rung swaps on, the staged capacity is the
+        # largest multiple of ntemps that fits GB_N_SUBBANDS, so a full
+        # (walker, band) column -- one cell per rung -- never straddles a
+        # capacity boundary. Never below one column.
+        nt = int(getattr(self, "ntemps", 1) or 1)
+        if bool(getattr(self, "temper_vertical", False)) and nt > 1:
+            total = max(nt, (total // nt) * nt)
+        return total
 
     def _cached_get_buffer(self, sorter, acs, specials, fill_slots=None, **kwargs):
         """SubBandBuffer reuse: ONE live buffer per construction signature.
@@ -5847,6 +5951,35 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     n_slots,
                     max(1, int(os.environ.get("GB_RJ_INMODEL_CHUNK", "4096"))),
                 )
+                # VERTICAL-LADDER STAGING (user requirement 2026-09-10):
+                # with the in-model vertical rung swaps on, one (walker,
+                # band) column -- every rung that survived RJ -- is
+                # polished in ONE chunk: pool ordered (band, walker, temp),
+                # the newborn/mature class lifted to whole columns, the
+                # chunk width a multiple of ntemps, and chunk cuts only on
+                # column boundaries. Before this the pool sat in pick order
+                # and was sliced blind, so a column's rungs landed in
+                # different chunks and the sweep found partners only by
+                # coincidence (job 465: none at T0-T1).
+                _vert_stage = (
+                    bool(getattr(self, "temper_vertical", False))
+                    and self.ntemps > 1
+                )
+                if _vert_stage:
+                    merged = _order_pool_by_column(merged, xp, self.num_bands)
+                    merged = _column_atomic_newborn(merged, xp, self.num_bands)
+                    _im_w = max(
+                        min(int(self.ntemps), n_slots),
+                        (_im_w // int(self.ntemps)) * int(self.ntemps),
+                    )
+
+                def _chunk_iter(_cls):
+                    if _vert_stage:
+                        return _column_chunks(_cls, _im_w, self.num_bands)
+                    return (
+                        {k: v[_st:_st + _im_w] for k, v in _cls.items()}
+                        for _st in range(0, int(len(_cls["specials"])), _im_w)
+                    )
                 # PER-CLASS chunk sequences (user ruling 2026-08-15):
                 # newborns and mature survivors run separate fixed repeat
                 # budgets (search 200 / 25, PE 100 / 100 stock), so the
@@ -5857,10 +5990,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # classes (the host-side dedup above is class-blind).
                 for _cls_name, _cls in _split_by_newborn(merged, xp):
                     _cls_census[_cls_name] = int(len(_cls["specials"]))
-                    for _st in range(0, _cls_census[_cls_name], _im_w):
-                        chunk = {
-                            k: v[_st:_st + _im_w] for k, v in _cls.items()
-                        }
+                    for chunk in _chunk_iter(_cls):
                         buffer_obj = _rebind(chunk["specials"])
                         # RJ-time slot indices are stale after the rebind.
                         chunk["slot_index"] = buffer_obj.get_index(
@@ -5993,6 +6123,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                             merged, ll_change_log, prop_counts, acc_counts,
                             num_repeats=self.inmodel_repeats_survivor,
                             cell_ll_state=cell_ll_state,
+                            scheduler=scheduler,
                         )
                     n_flushes += 1
                     flush_sum += n_flushed
@@ -6051,6 +6182,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     # single survivor/mature budget; pure in-model moves
                     # (is_rj_prop=False -- the search "in_model" move,
                     # VGB) keep the plain ``num_repeat_proposals``.
+                    # Picks are recorded BEFORE the block: a vertical swap
+                    # inside it relabels cells, and the scheduler's per-cell
+                    # run/finish counters then follow the model through
+                    # ``relabel_slots`` (called at the block end). Recording
+                    # afterwards with the pre-swap specials would credit the
+                    # pick to the label the model no longer carries.
+                    scheduler.record_picks(picked["specials"])
                     self._run_in_model_repeats(
                         model, band_sorter, buffer_obj, band_temps, picked,
                         ll_change_log, prop_counts, acc_counts,
@@ -6059,9 +6197,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                             if self.is_rj_prop else None
                         ),
                         cell_ll_state=cell_ll_state,
+                        scheduler=scheduler,
                     )
 
-                scheduler.record_picks(picked["specials"])
                 _advance_and_refill()
                 round_i += 1
                 _free_mempool_each_round()
@@ -11629,8 +11767,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     def _ladder_debug_line(self, t_i, w_i, b_i, ll_ref, band, walker):
         """``walker``'s per-temperature cell ll at ``band``, cold(t0)->hot.
 
-        Read off the vertical swap's ``ll_ref`` (the per-cell ll WITH the
-        picked source in). The store keeps NO per-temp per-walker
+        Read off the vertical swap's ``L_with = base + ll_ref`` (the
+        per-cell ll WITH its whole model in; the ``ll_ref`` parameter name
+        is historical). The store keeps NO per-temp per-walker
         log_like -- ``band_cold_ll`` / ``cap_cell_cold_ll`` are COLD-only
         (per walker) and the band-swap counts are aggregated over walkers
         -- so a stuck walker's VERTICAL ladder is otherwise invisible.
@@ -11652,7 +11791,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     def _vertical_swap_sweep(self, band_sorter, band_temps, t_i, w_i, b_i,
                              slots, beta, ll_ref, ll_change_log, prop_counts,
                              acc_counts, cell_ll_state, parity, census=None,
-                             swap_census=None):
+                             swap_census=None, cell_ll_base=None):
         """ONE vertical swap sweep. Returns the number of accepted swaps.
 
         Pure RELABEL: no buffer is touched and no likelihood is evaluated.
@@ -11668,15 +11807,68 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             paccept = b1*(L1' - L1) + b2*(L2' - L2)
                     = (b1 - b2) * (L2 - L1)          [L1' = L2, L2' = L1]
 
-        ``ll_ref`` is the per-row cell likelihood (``get_add_ll`` of the
-        cell's picked source against the source-free cell residual, i.e.
-        the cell's ll WITH its model in), maintained by the repeat loop.
+        **What ``L`` is (the 2026-09-10 correction).** Every row of the
+        block is one picked source ``h`` in one cell. At block open that
+        source is taken OUT of its cell slab, so the slab holds the cell's
+        SOURCE-FREE residual ``r`` (data minus every OTHER resident of the
+        cell), and the repeat loop's ``ll_ref`` is the add-delta of ``h``
+        against it::
+
+            ll_ref  = <r|h> - <h|h>/2                     (get_add_ll)
+
+        The likelihood of the cell WITH its whole model in is::
+
+            L_with  = -<r - h | r - h>/2
+                    = -<r|r>/2 + <r|h> - <h|h>/2
+                    = L_free + ll_ref,     L_free = -<r|r>/2
+
+        ``L_free`` is the slab likelihood measured ONCE per block right
+        after the removal (``cell_ll_base``, per row = per slot). It is a
+        constant of the block: the slab is never touched between repeats,
+        only the tracked coordinates move. INSIDE a cell it cancels --
+        ``new_ll - ll_ref = L_with(new) - L_with(ref)`` exactly -- which is
+        why the in-model MH ratio is right with the delta alone. BETWEEN
+        two cells it does NOT cancel: ``r_hot`` and ``r_cold`` differ by
+        the two cells' other residents (and by which source each cell
+        picked), so a swap has to compare ``L_with``::
+
+            paccept = (b_cold - b_hot) * (L_with[hot] - L_with[cold])
+                    = (b_cold - b_hot) * ((base + ll_ref)[hot]
+                                          - (base + ll_ref)[cold])
+
+        The 2026-08-18 form used ``ll_ref`` alone, i.e. it dropped
+        ``(b_cold - b_hot) * (L_free[hot] - L_free[cold])
+        = (b_cold - b_hot) * (<r_cold|r_cold> - <r_hot|r_hot>) / 2``.
+        That is zero for a pair of SOLE-occupant cells (both ``r`` are the
+        bare data slab of the same walker) and otherwise about
+        ``+(b_cold - b_hot) * SNR^2/2`` of the cold cell's companions: the
+        cold cell's residual is clean, the sparser hot cell's is not, and
+        the missing term pushed the ratio toward accepting the sparser
+        hot cell INTO the cold chain. Measured on the 3mo v8 10-walker run
+        (job 467, first block with the cold rung co-resident): cold leaves
+        822 -> 790 with ZERO RJ deaths, lnL -3,100 in two iterations,
+        75.6% of proposed cold swaps accepted.
+
+        ``cell_ll_base`` is therefore REQUIRED: a sweep without it cannot
+        form the ratio and raises rather than fall back to the delta.
 
         On acceptance the two rows exchange their (temperature) labels and
         every per-cell ledger keyed by that label follows the MODEL, so the
-        slot contents stay valid where they are.
+        slot contents stay valid where they are. ``cell_ll_base`` and
+        ``ll_ref`` are per ROW and rows keep their slots, so neither is
+        swapped (each keeps describing the model that stays in its slot).
+        The buffer's own slot -> special map is re-based ONCE per block
+        by the caller (``update_special_indices`` on the block's slots)
+        so any later pick on the same residency lands on the right slab.
         """
         xp = self.xp
+        if cell_ll_base is None:
+            raise ValueError(
+                f"{self.name}: _vertical_swap_sweep needs cell_ll_base (the "
+                "per-row source-free slab likelihood -<r|r>/2): the ratio "
+                "compares L_with = base + ll_ref between two cells, and "
+                "ll_ref alone is an add-delta against DIFFERENT residuals."
+            )
         hot, cold = self._vertical_pairs(t_i, w_i, b_i)
         if census is not None:
             census["sweeps"] += 1
@@ -11695,13 +11887,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         b_hot = band_temps[b_i[hot], t_i[hot]]
         b_cold = band_temps[b_i[cold], t_i[cold]]
-        paccept = (b_cold - b_hot) * (ll_ref[hot] - ll_ref[cold])
+        # L_with = L_free + ll_ref per row (see the docstring): the whole
+        # cell's likelihood, comparable across cells of one (walker, band)
+        # because both slabs carry the same data, the same out-of-band
+        # model and the same walker-indexed invC.
+        L_with = xp.asarray(cell_ll_base) + ll_ref
+        paccept = (b_cold - b_hot) * (L_with[hot] - L_with[cold])
         # LADDER DEBUG (default off): one line/propose with a target walker's
         # per-temp cell ll at a target band -- the vertical-ladder view the
         # store cannot hold. Guarded by env; fires once per propose.
         _lt = self._ladder_debug_target()
         if _lt is not None and not getattr(self, "_ladder_dbg_fired", False):
-            _line = self._ladder_debug_line(t_i, w_i, b_i, ll_ref, _lt[0], _lt[1])
+            _line = self._ladder_debug_line(t_i, w_i, b_i, L_with, _lt[0], _lt[1])
             if _line is not None:
                 logger.info("%s: %s", self.name, _line)
                 self._ladder_dbg_fired = True
@@ -12275,7 +12472,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
     def _run_in_model_repeats(self, model, band_sorter, buffer_obj, band_temps,
                               picked, ll_change_log, prop_counts, acc_counts,
-                              num_repeats=None, cell_ll_state=None):
+                              num_repeats=None, cell_ll_state=None,
+                              scheduler=None):
         """``num_repeats`` in-model rounds on the picked live sources.
 
         The picked source is first taken OUT of its cell residual, so every
@@ -12304,6 +12502,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         identical results.
         """
         xp = self.xp
+        # VERTICAL-LADDER STAGING (user requirement 2026-09-10): when the
+        # in-model vertical rung swaps are on, every rung of one (walker,
+        # band) column must be in the SAME repeat block -- a vertical pair
+        # is (t, w, b) / (t+1, w, b) and the sweep can only pair rows of
+        # the block it runs in. Order the pool by (band, walker, temp),
+        # temperature LAST, so a column is one contiguous run of rows, and
+        # never cut a sub-block inside a column. Row order is otherwise
+        # immaterial to the block (every per-row array is gathered by row).
+        _vert_stage = (
+            bool(getattr(self, "temper_vertical", False)) and self.ntemps > 1
+        )
+        if _vert_stage and int(picked["ids"].shape[0]) > 1:
+            picked = _order_pool_by_column(picked, xp, self.num_bands)
         # STAGING BATCH CAP (GB_INMODEL_SETUP_BATCH, 2026-08-21): bound the
         # sig-het reference-stash residency by splitting the picked pool
         # into sequential sub-blocks HERE, so every call site shares the one
@@ -12315,11 +12526,21 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         _batch_cap = int(os.environ.get("GB_INMODEL_SETUP_BATCH", "0") or 0)
         if _batch_cap > 0 and int(picked["ids"].shape[0]) > _batch_cap:
             _n_picked = int(picked["ids"].shape[0])
+            if _vert_stage:
+                # A column is at most ntemps rows: a cap that is a multiple
+                # of ntemps always fits whole columns (job 465 ran 1024-row
+                # sub-blocks over a count-ordered pool and the cold rung had
+                # no partner in its block).
+                _batch_cap = max(
+                    int(self.ntemps),
+                    (_batch_cap // int(self.ntemps)) * int(self.ntemps),
+                )
             logger.info(
                 "%s: [GB_INMODEL_BATCH] staging %d picked sources in %d "
-                "sub-blocks of <= %d (GB_INMODEL_SETUP_BATCH).",
+                "sub-blocks of <= %d (GB_INMODEL_SETUP_BATCH%s).",
                 self.name, _n_picked,
                 -(-_n_picked // _batch_cap), _batch_cap,
+                ", column-atomic" if _vert_stage else "",
             )
             # Cached-pool sweep before the FIRST sub-block and between the
             # sub-blocks: this staging path exists to bound sig-het
@@ -12327,7 +12548,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # cudaMalloc, which cannot reuse CuPy's cached blocks -- see
             # _free_inmodel_batch_pools for the OOM this prevents.
             self._free_inmodel_batch_pools(model, "staging entry")
-            for _i_sub, _sub in enumerate(_picked_batches(picked, _batch_cap)):
+            _subs = (
+                _column_chunks(picked, _batch_cap, self.num_bands)
+                if _vert_stage else _picked_batches(picked, _batch_cap)
+            )
+            for _i_sub, _sub in enumerate(_subs):
                 if _i_sub:
                     self._free_inmodel_batch_pools(
                         model, f"before sub-block {_i_sub}")
@@ -12335,6 +12560,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     model, band_sorter, buffer_obj, band_temps, _sub,
                     ll_change_log, prop_counts, acc_counts,
                     num_repeats=num_repeats, cell_ll_state=cell_ll_state,
+                    scheduler=scheduler,
                 )
             return
         n_rep = (
@@ -12629,6 +12855,27 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         _vert_on = bool(getattr(self, "temper_vertical", False)) and self.ntemps > 1
         _vert_acc = 0
         _vert_census = self._vertical_census_new(self.ntemps) if _vert_on else None
+        # VERTICAL SWAP BASE (2026-09-10): the per-row SOURCE-FREE slab
+        # likelihood L_free = -<r|r>/2, measured once per block AFTER the
+        # picked sources were taken out of their slabs (the removal above)
+        # and BEFORE any repeat. The slab is not touched again until the
+        # write-back, so this is a block constant; the sweep adds the live
+        # ``ll_ref`` to it to form each cell's whole-model likelihood
+        # L_with = L_free + <r|h> - <h|h>/2 = -<r-h|r-h>/2, the quantity a
+        # rung swap has to compare (see _vertical_swap_sweep). Per-slot
+        # subset call: only the block's slots are reduced.
+        _vert_base = None
+        if _vert_on:
+            with _tspan(tm, "inmodel_vertical_base"):
+                _vert_base = xp.asarray(
+                    buffer_obj.band_likelihoods(source_only=True, slots=slots)
+                ).astype(xp.float64)
+                if int(_vert_base.shape[0]) != int(slots.shape[0]):
+                    raise RuntimeError(
+                        f"{self.name}: band_likelihoods(slots=...) returned "
+                        f"{int(_vert_base.shape[0])} values for "
+                        f"{int(slots.shape[0])} block slots."
+                    )
         # NOTE(vertical ll audit): the ratio reads ``ll_ref`` -- the cell
         # ll WITH its picked source in. Do NOT audit that against
         # ``band_likelihoods`` mid-block: that measures the slab with the
@@ -13207,17 +13454,21 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
           # difference carries the ordinary sig-het approximation error the
           # MH acceptance already carries, not a systematic offset.
           # Runs at REPEAT scope (after every parity half has moved), so
-          # each row has an up-to-date ``ll_ref`` -- the cell likelihood the
-          # closed-form ratio needs. Alternating parity of the cold rung
-          # keeps every row in at most one pair per sweep while still
-          # visiting the whole ladder.
+          # each row has an up-to-date ``ll_ref``. The ratio compares the
+          # WHOLE-cell likelihood ``L_with = _vert_base + ll_ref`` (the
+          # block-constant source-free slab term plus the picked source's
+          # add-delta -- see the sweep docstring for the algebra); ll_ref
+          # alone is an add-delta against a residual that differs between
+          # the two cells. Alternating parity of the cold rung keeps every
+          # row in at most one pair per sweep while still visiting the
+          # whole ladder.
           if _vert_on:
               with _tspan(tm, "inmodel_vertical_swap"):
                   _n = self._vertical_swap_sweep(
                       band_sorter, band_temps, t_i, w_i, b_i, slots, beta,
                       ll_ref, ll_change_log, prop_counts, acc_counts,
                       cell_ll_state, move_i % 2, census=_vert_census,
-                      swap_census=_swap_cens,
+                      swap_census=_swap_cens, cell_ll_base=_vert_base,
                   )
               if _n:
                   _vert_acc += _n
@@ -13303,6 +13554,23 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     f"(temp_inds, walker_inds, band_inds) after "
                     f"{_vert_acc} accepted swap(s) in this repeat block."
                 )
+            if _vert_acc:
+                # SLOT-MAP RE-BASE (2026-09-10). Rows kept their slots but
+                # their cells traded temperature labels, and the BUFFER's
+                # special -> slot map (``get_index``) still names the
+                # pre-swap labels -- so would a later ``_pick_sources`` on
+                # this residency, which resolves each pick's slot through
+                # that map and would then take a source out of the OTHER
+                # cell's slab. The RJ direct path rebinds a fresh buffer per
+                # chunk and never re-picks, but the scheduler paths do. Re-
+                # base the map from the rows' FINAL labels: one setter call
+                # per block, slot metadata unchanged (walker and band of
+                # every slot are the same, only the temperature moved).
+                _spec_final = band_sorter.get_special_band_index(t_i, w_i, b_i)
+                if hasattr(buffer_obj, "update_special_indices"):
+                    buffer_obj.update_special_indices(_spec_final, inds_fill=slots)
+                if scheduler is not None and hasattr(scheduler, "relabel_slots"):
+                    scheduler.relabel_slots(slots, _spec_final)
             _cn = _vert_census
             self._vertical_census_flush(_cn)
             _avail = _cn["paired"] / max(_cn["rows"], 1)

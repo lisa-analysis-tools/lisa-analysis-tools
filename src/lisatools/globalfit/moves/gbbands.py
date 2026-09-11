@@ -663,6 +663,40 @@ class BandScheduler:
         self.slot_active[finished_slots[n_replace:]] = False
         return inds_fill, self.cell_specials[new_cells]
 
+    def relabel_slots(self, slots, new_specials) -> None:
+        """Follow a vertical rung swap: slot ``slots[k]`` now holds the model
+        labelled ``new_specials[k]``.
+
+        The in-model vertical sweep (2026-08-18) is a pure RELABEL -- the
+        slab stays in its slot, the cell's sources take the partner cell's
+        (temperature) label. This scheduler tracks per-CELL run/finish
+        budgets by label and per-SLOT occupancy by cell position, so after
+        a swap both must follow the model: the label's counters become the
+        counters of the model that now carries it (a permutation among the
+        swapped cells, exact) and the slot points at that label's cell.
+        Without this, ``record_picks`` on the new label credited the wrong
+        model and ``advance`` retired slots on the wrong budget (2026-09-10).
+        Labels that did not change are a no-op.
+        """
+        xp = self.xp
+        slots = xp.asarray(slots)
+        new_specials = xp.asarray(new_specials)
+        if int(slots.shape[0]) == 0:
+            return
+        p_old = self.slot_cell[slots]
+        p_new = self._cells_of(new_specials)
+        changed = p_old != p_new
+        if not bool(changed.any()):
+            return
+        p_old, p_new, slots = p_old[changed], p_new[changed], slots[changed]
+        run = self.cell_run.copy()
+        counts = self.cell_counts.copy()
+        run[p_new] = self.cell_run[p_old]
+        counts[p_new] = self.cell_counts[p_old]
+        self.cell_run = run
+        self.cell_counts = counts
+        self.slot_cell[slots] = p_new
+
 
 class _ShardHolderView:
     """Single-shard holder view over one GPU split of a multi-shard ACA.
