@@ -739,7 +739,11 @@ export GB_RJ_SNR_TRUNC_DIST=1      # birth distance draw truncated at the
 # faster and give more permuted + vertical swap rounds per hour.
 # NOTE these env pins beat the PE mode default as well — both phases
 # run 250/25.
-export GB_INMODEL_REPEATS_NEWBORN=250
+# 100 (2026-09-11 user ruling, was 250): with the vertical ladder working,
+# hot-rung newborns descend over the following iterations and are
+# polished as survivors at every rung they visit; the newborn class had
+# become 83% of the 1yr repeat-rows (3,347 rows @250) and ~50% at 3mo.
+export GB_INMODEL_REPEATS_NEWBORN=100
 # SURVIVOR 25 -> 100 (user ruling 2026-08-29, aligned with v7), restoring the
 # value the high-f probe ran (200/100). In-model f0 drift is the ONLY mechanism
 # that moves a source across a sub-band edge -- there is no merge operator, RJ
@@ -751,7 +755,10 @@ export GB_INMODEL_REPEATS_NEWBORN=250
 # ⚠ The per-class split applies on the DIRECT-batch path only; the grouped
 # scheduler takes ONE budget for the whole pool from _SURVIVOR, so with
 # GB_RJ_GROUPED_INMODEL=1 this raises the effective budget for newborns too.
-export GB_INMODEL_REPEATS_SURVIVOR=100
+# 50 (2026-09-11 user ruling, was 100): vertical sweeps run once per repeat,
+# so this also halves the vertical mixing per block -- judge by progress
+# per wall-clock hour with the [GB_CELL_LL] / sig-het cold audit as guards.
+export GB_INMODEL_REPEATS_SURVIVOR=50
 
 # VERTICAL TEMPERING ON (2026-08-26 user ruling: "this is crucial").
 # Per-repeat vertical band-temperature swaps inside the in-model loop
