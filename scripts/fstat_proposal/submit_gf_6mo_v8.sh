@@ -24,6 +24,19 @@
 #      (sobbh -> mbh -> emri banking order). Knob values lifted from the
 #      probe's latest rulings (submit_gf_6mo_sources_probe.sh).
 #
+#   4. (2026-09-11, user ruling) 10-WALKER REBASE: this run builds off the
+#      VALIDATED 10-walker 3mo arm (submit_gf_3mo_v8_10walkers.sh, jobs
+#      465/473) rather than the 24-walker base. NWALKERS=10 plus the whole
+#      09-08..11 correctness/perf stack that arm carries: PSD shared
+#      MIRROR, column-atomic staging + GB_TEMPER_CELL_ORDER=band (the
+#      vertical-swap fix set b3f5acbd -- REQUIRED with GB_TEMPER_VERTICAL=1
+#      below), windowed sig-het stash + one-block SETUP_BATCH, refresh
+#      threshold 0.1 rad, adaptive gb_search noise rider, fused accept
+#      kernel, PE draw-one. Tobs-scaled here: GB_N_SUBBANDS 16384/GPU and
+#      GB_RJ_INMODEL_CHUNK 32768 (byte-parity with the 3mo twin's
+#      32768/65536 at half the per-slot/-cell cost -- 6mo slots are ~2x
+#      3mo bytes).
+#
 # V8-PARITY NOTES (deliberate divergences from the old 6mo_v1 draft --
 # the exact-copy rule wins for every non-Tobs knob): GB_USE_GALAXY_PRIOR
 # stays 1 (6mo_v1 had it 0, an 08-24 test-only ruling) and
@@ -484,7 +497,12 @@ echo "[V8-NOISE] coarse: Q=${COARSE_Q} mode=${COARSE_GPU_MODE} \
 use_ws=${COARSE_USE_WS} fiducial=${COARSE_FIDUCIAL}"
 
 # ---- sampler shape ---------------------------------------------------------
-export NWALKERS=24                 # 24 walkers / 24 GB temps (user ruling)
+export NWALKERS=10                 # 10-walker rebase (2026-09-11 ruling: build
+                                   # off the validated 10w 3mo arm, jobs
+                                   # 465/473); GB rungs stay GB_NTEMPS=24 --
+                                   # walkers and temps are independent axes.
+                                   # Noise-block floor 2*ndim (galfor ndim 5
+                                   # -> 10) still satisfied.
 export NUM_ITERATIONS=2000         # total engine iterations (resume-safe; NITER was a dead name)
 
 # ---- band + domain ---------------------------------------------------------
@@ -544,7 +562,17 @@ export GB_NLEAVES_MAX=15000        # 6 mo: deeper confusion resolved; 3-mo ran 1
 # 2.4s host round-trips. ~4.2 GB buffer; post-fix profile at 4096 was
 # flat 42-45/31 GB on 96 GB cards. If the unit-open lines stay flat,
 # full residency (50000 -> 44,352 slots, ~11.3 GB) is the next step.
-export GB_N_SUBBANDS=4096  # PER GPU; TRUE per-slot cost incl. XYZ invC (~1 MB @3mo, ~2 MB @6mo, ~8 MB @23mo) x 2 move caches -- job-183 sizing; halved vs 3mo so the byte budget matches   # PER GPU (LAT >= this commit): total = x n_gpus
+export GB_N_SUBBANDS=16384  # PER GPU; WITH THE MIRROR a slot carries data only
+                            # (~0.5 MB @6mo vs ~0.25 @3mo) -- 16384 x 0.5 MB
+                            # ~ 8.4 GB/GPU = byte-parity with the 3mo twin's
+                            # 32768 x 0.25. (Pre-mirror this line was 4096 at
+                            # ~2 MB/slot incl. XYZ invC.)   # total = x n_gpus
+# PSD SHARED MIRROR (386f25ce, validated jobs 469/470: 3mo dev0 68->44 GB,
+# 1yr 85->61 GB with capacity DOUBLED; parity 11k+ IDENTICAL). Parity gate
+# disarmed: vgb_pe rebuilds its buffer every unit so the gate never retires
+# (+25 s/unit at 1yr); the gate already banked its evidence on 469/470.
+export GB_PSD_SHARED_MIRROR=1
+export GB_PSD_MIRROR_PARITY_PROPOSES=0
 # RJ pick thinning. UNSET as of 2026-08-28 -- the value now lives in code
 # (_SEARCH_RJ_FLIP_DEFAULT / _PE_RJ_FLIP_DEFAULT in recipe.py, both 0.2),
 # so behavior is UNCHANGED from the 0.2 this line used to export.
@@ -716,6 +744,24 @@ export GB_TEMPER_VERTICAL=1
 # per-repeat during polish -- the full transport stack. Probe cost
 # ~+40 s/it (tempering block x3); production ~+3%. =3 reverts.
 export GB_TEMPER_EVERY_PROPOSES=1
+# ---- 10-WALKER-ARM TEMPERING STACK (ported 2026-09-11) --------------------
+# COLUMN STAGING (b3f5acbd): every rung of a (walker, band) column staged
+# together, pools ordered (band, walker, temp). REQUIRED with
+# GB_TEMPER_VERTICAL=1 above -- jobs 465-469 ran order=count and the
+# vertical sweep starved/biased (the leaf-shedding root cause pair); job
+# 473 on order=band + the whole-cell L_with ratio is the validated config.
+export GB_TEMPER_CELL_ORDER=band
+export GB_TEMPER_PRELOAD_CELLS=4800
+# One occupancy census per unit (assert-guarded exact) + drop inert rows.
+export GB_TEMPER_CENSUS_HOIST=1
+export GB_TEMPER_COMPACT_ROWS=1
+# Adaptive gb_search noise rider (379ae2e1): keep taking MaxLogL rounds
+# while a round improves by > tol, stop at the first flat one.
+export GB_SEARCH_NOISE_CHECKS=1
+export GB_SEARCH_NOISE_ITERS_PER_STEP=0
+# PE-only exclusive RJ draw (b9aae51f).
+export GB_PE_RJ_DRAW_ONE=1
+export GB_PE_RJ_FSTAT_FRACTION=0.8
 # Per-block EXACT info matrices through the sig-het fast route
 # (~2.4 ms/src vs ~29-46 chunked). The data_index misindex is FIXED and
 # multi-GPU slots now route by the BUFFER's slot shards. First
@@ -816,7 +862,15 @@ export FSTAT_SIGHET_MULTIDEV=1
 # buys mixing while PRESERVING accuracy; widening buys the same mixing by
 # SPENDING accuracy. Same reason GB_SIGHET_TRUST_PHASE_C stays at 0 here.
 export GB_SIGHET_REFRESH_EVERY=25
-export GB_SIGHET_REFRESH_DPHASE=0
+# DPHASE 0 -> 0.1 rad (2026-09-11, ported from the 10w arm 379ae2e1):
+# refresh only sources drifted past 0.1 rad since their reference build.
+# Error bound at 0.1 rad = 2.4e-7 x SNR^2/2 = 0.004 lnL at SNR 184
+# (Experiment A); at DPHASE=0 job 473 refreshed 89% of sources every
+# check for ~20 s/it of pure rebuild. The 2026-08-18 "ALL RUNGS REFRESH"
+# ruling below was written against the 0.1 DEFAULT's rung gating -- this
+# knob is a drift threshold, not a rung filter, so hot rungs still
+# refresh once they drift.
+export GB_SIGHET_REFRESH_DPHASE=0.1
 # ALL RUNGS REFRESH (user ruling 2026-08-18). The default 0.1 keeps a stale
 # reference on everything hotter, justified in the code as "the ll error is
 # beta-suppressed". That reasoning covers the WITHIN-rung accept test, where
@@ -1093,7 +1147,17 @@ export VGB_BAND_LAYERS=8
 # launches over ~14 ms of physics at width 2048) -- doubling the width
 # halves the number of 100/250-step trains and with them the
 # launch-train overhead. Same full_pe revert rule as above.
-export GB_INMODEL_SETUP_BATCH=2048  # stash law LINEAR in N_sparse_t -> half the 3-mo 4096 (same bytes); GPU0 ran 3.3 GB from the ceiling at 3 mo -- do NOT raise
+# ONE-BLOCK STAGING (2026-09-11, ported from the 10w arm). The old
+# "SETUP_BATCH=2048, do NOT raise" sizing predates the WINDOWED sig-het
+# stash (faadf82: stash bytes go per-source window, not per-band extent)
+# and the PSD mirror; the 10w arm runs SETUP_BATCH=0 (whole pool, column-
+# atomic per b3f5acbd) with the fold cap below. SAFE ONLY on b3f5acbd+
+# code: one-block staging is what raised vertical-pair co-residency, and
+# the fixed whole-cell swap ratio is what makes that correct.
+export GB_SIGHET_INMODEL_WINDOWED=1
+export GB_INMODEL_SETUP_BATCH=0
+export GB_SIGHET_FOLD_MAX_BYTES=8589934592
+export GB_RJ_INMODEL_CHUNK=32768  # byte-parity with the 3mo twin's 65536 (6mo cells ~2x bytes); floored to ntemps multiples by the column-atomic staging
 export GB_INFOMAT_MEMPOOL_FREE=0
 export GB_INMODEL_BATCH_MEMPOOL_FREE=0
 # ######################################################################### #
@@ -1557,7 +1621,11 @@ export GB_CELL_LABEL_DEFERRED=1
 # gpu_util_*.csv show a clear multi-GPU improvement. Requires ./install.sh
 # to have built the binary; without it the loaders degrade to the python
 # chain with a one-line warning (safe, just not faster).
-export GB_INMODEL_ACCEPT_KERNEL=0
+# >>> FLIPPED TO 1 (2026-09-11, ported from the 10w arm de903711): first
+# >>> production arming was the 3mo relaunch after job 473; est. -30..-40
+# >>> s/it. VERIFY on this run: in-model acceptance rates + [GB_CELL_LL]
+# >>> + sig-het audit unchanged vs the python chain. =0 reverts.
+export GB_INMODEL_ACCEPT_KERNEL=1
 # ---- THE v8 EXPERIMENT: OBSERVABLE-BASIS IN-MODEL PROPOSAL ----------
 # Pinned EXPLICITLY even though it is now the code default, so this run
 # does not silently change meaning if the default is ever revisited, and
@@ -1878,9 +1946,9 @@ export VGB_NTEMPS=8
 # any factor failure). Pinned =stretch FOR THIS RUN because:
 #   (a) VGB_SIGHET_INMODEL=0 above (loud-VGB sig-het accuracy unverified)
 #       forces the matrices through the CHUNKED engine at ~29-46 ms per
-#       source INSTANCE, and VGB has 55 leaves x 8 rungs x 24 walkers
-#       ~ 10.6k instances ~ 5-8 min of factor builds EVERY vgb propose;
-#       with the sig-het route validated that drops ~12-19x (~25-40 s).
+#       source INSTANCE, and VGB has 55 leaves x 8 rungs x 10 walkers
+#       ~ 4.4k instances ~ 2-3.5 min of factor builds EVERY vgb propose;
+#       with the sig-het route validated that drops ~12-19x (~11-17 s).
 #   (b) the vgb reduced-basis factor path has ZERO cluster exposure (it
 #       degrades to stretch with one warning, but the build attempts are
 #       then pure cost).
@@ -1994,11 +2062,11 @@ export EMRI_INNER_MOVE_KIND=eigen
 # TABLE SCOPE (user ruling 2026-09-08). SOBBH: per-(temperature, walker)
 # -- every point its own matrix against its own walker's data, ONE batched
 # corner sweep (the red/blue seam slices the full table per split). Cost
-# at this shape: 12 rungs x 24 walkers = 288 points x ~245 rows ~ 70k
-# batched likelihood rows ~ 3.3 min per LEAF REFRESH at the measured
-# 2.78 ms/row -- first visit + every SOBBH_EIGEN_REFRESH-th (10), i.e.
-# ~+2 min/iteration averaged over 6 leaves, concentrated in refresh
-# iterations. If that bites: SOBBH_EIGEN_SCOPE=walker_max drops a refresh
+# at this shape (10 walkers, 2026-09-11): 12 rungs x 10 walkers = 120
+# points x ~245 rows ~ 29k batched likelihood rows ~ 1.4 min per LEAF
+# REFRESH at the measured 2.78 ms/row -- first visit + every
+# SOBBH_EIGEN_REFRESH-th (10), i.e. under a minute per iteration averaged
+# over 6 leaves, concentrated in refresh iterations. If that bites: SOBBH_EIGEN_SCOPE=walker_max drops a refresh
 # to ~245 rows (~0.7 s); SOBBH_EIGEN_REFRESH stretches the cadence.
 export SOBBH_EIGEN_SCOPE=per_walker
 export SOBBH_EIGEN_REFRESH=10
