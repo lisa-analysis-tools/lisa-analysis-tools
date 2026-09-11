@@ -773,6 +773,16 @@ export GB_TEMPER_CELL_ORDER=band
 # 10-round ceiling. Consumed by run_combined_staged.py.
 export GB_SEARCH_NOISE_CHECKS=1
 export GB_SEARCH_NOISE_ITERS_PER_STEP=0
+# Mirrored from the 3mo script (2026-09-11; both default OFF in code and
+# were never set here). CENSUS_HOIST: one occupancy census per tempering
+# unit instead of per chunk (assert-guarded exact). COMPACT_ROWS: drop
+# inert (all-temp-sourceless) grid rows before chunking -- payoff scales
+# with the empty-cell fraction (~78-85% of tempering pairs are
+# empty-vs-empty); the vacuous pairs' counter contribution and the
+# TEMPER_CHECK reconciliation are restored analytically. Unset either to
+# revert bit-for-bit.
+export GB_TEMPER_CENSUS_HOIST=1
+export GB_TEMPER_COMPACT_ROWS=1
 # VERTICAL-SWAP CONTROL ARM (2026-09-10 forensics): accepted in-model vertical
 # rung swaps at the cold pair (T0-T1) jumped 334 -> 16,205 per 100-repeat block
 # at the 467 relaunch (1yr: 33 -> 1,156 -> 3,328), the largest discontinuity in

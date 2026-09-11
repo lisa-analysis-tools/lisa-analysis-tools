@@ -37,13 +37,34 @@
 #      using at it 150. (1yr has only epoch_0000; nothing to move.)
 # Nothing is deleted: everything goes to STORE_DIR/rewind_<stamp>/.
 set -euo pipefail
-RUN="${1:?usage: rewind_to_465.sh 3mo|1yr [--apply]}"
-APPLY="${2:-}"
+# Usage: rewind_to_465.sh 3mo|1yr [--apply] [--iteration N]
+#   --iteration N overrides the default rewind point (3mo 151, 1yr 29).
+#   For the 1yr run, N=5 is "rewind the whole GB search": gb_search began
+#   at row ~4-5 there (rows 0-3 hold 0 GB leaves, row 6 already 246), so
+#   the converged noise stages are kept and the search restarts from its
+#   first iteration on the fixed code.
+RUN="${1:?usage: rewind_to_465.sh 3mo|1yr [--apply] [--iteration N]}"
+shift
+APPLY=""; IT_OVERRIDE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) APPLY=1; shift ;;
+    --iteration) IT_OVERRIDE="${2:?--iteration needs a number}"; shift 2 ;;
+    *) echo "unknown argument $1"; exit 2 ;;
+  esac
+done
 case "$RUN" in
   3mo) DIR=/shared/data/global_fit_output/gf_prod_3mo_v8_10walkers; BASE=gf_prod_3mo_testing; IT=151; EPOCHS="epoch_0004 epoch_0005"; JOBNAME=gf3mo_v8 ;;
   1yr) DIR=/shared/data/global_fit_output/gf_prod_1yr_v8_10walkers; BASE=gf_prod_1yr_testing; IT=29;  EPOCHS="";                      JOBNAME=gf1yr_v8 ;;
   *) echo "unknown run $RUN"; exit 2 ;;
 esac
+[ -n "$IT_OVERRIDE" ] && IT="$IT_OVERRIDE"
+if [ "$RUN" = "1yr" ] && [ "$IT" -lt 29 ]; then
+  # A deeper 1yr rewind also invalidates any F-stat epoch fitted after it
+  # (the move loads the LATEST epoch dir); epoch_0000 was fitted at the
+  # search start and stays.
+  EPOCHS=$(ls "$DIR/gb_fstat_fit/shared" 2>/dev/null | grep -E "^epoch_[0-9]+$" | grep -v "^epoch_0000$" | tr '\n' ' ')
+fi
 STORE="$DIR/$BASE.h5"
 STAMP=$(date +%Y%m%d_%H%M%S)
 ASIDE="$DIR/rewind_$STAMP"
