@@ -4596,8 +4596,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     # births plus the tails; see the accumulation site.
                     logger.info(
                         "[GB_BIRTH_STALE %s] scored births %d: detected/"
-                        "F-stat SNR geo-mean %.3f; ratio < 0.5 (peak gone "
-                        "from the residual): %.1f%%; > 1.5: %.1f%%",
+                        "optimal SNR of the drawn template, geo-mean %.3f; "
+                        "ratio < 0.5 (peak gone from the residual): %.1f%%; "
+                        "> 1.5: %.1f%%",
                         self.name, int(_sn),
                         float(np.exp(sp.get("stale_lnr_sum", 0.0) / _sn)),
                         100.0 * sp.get("stale_lo", 0.0) / _sn,
@@ -8334,6 +8335,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         _split_over_cap = None
         _split_snr = None
         _split_kernel_rows = None
+        # Birth staleness statistic (see the amplitude-pin block): per birth
+        # row, detected/optimal SNR of the DRAWN template, and which rows
+        # count. Proposal-independent -- it needs no F-stat centre table.
+        _stale_ratio = None
+        _stale_mask = None
         # Cap cells of the picked rows AT THE PRIOR GATE (drawn frequency
         # for births); reused by the accept block's cap-transition budget.
         # Overlap mode also carries the second covering cell + membership.
@@ -8731,6 +8737,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 good = hh_b > 0.0
                 hh_safe = xp.where(good, hh_b, 1.0)
                 s = xp.where(good, d_h[birth_k] / hh_safe, 1.0)
+                # BIRTH STALENESS (2026-09-11): ``s`` = detected/optimal SNR
+                # of the DRAWN template = <r|h>/<h|h>. A birth drawn at a
+                # peak that is still in this walker's residual scores s ~ 1
+                # (the F-stat amplitude was right); a peak already claimed
+                # (found and subtracted) leaves only noise under the
+                # template and s << 1 -- and after this pin its SNR is
+                # s * sqrt(h_h), which is what the opt-SNR floor then drops.
+                # Job 473 dropped 58% of scored births that way (~40 s/it
+                # at 3mo, ~260 s/it at 1yr). Stashed here, folded into the
+                # [GB_ACCEPT rj-split] accounting at the end of the step.
+                _stale_ratio = s
+                _stale_mask = good & keep[birth_k]
                 if _gb_use_distance(self):
                     # A propto 1/dist  ->  dist_new = dist / s
                     params[birth_k, 0] = xp.where(
@@ -8914,19 +8932,17 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # claimed-peak question) or an SNR calibration offset. Pure
             # diagnostic, folded into the [GB_ACCEPT rj-split] line.
             try:
-                if len(birth_k) and ln_snr_b is not None:
-                    _sc = keep[birth_k]
-                    if bool(_sc.any()):
-                        _det = xp.sqrt(xp.maximum(h_h[birth_k][_sc], 0.0))
-                        _rat = _det / xp.exp(xp.asarray(ln_snr_b)[_sc])
-                        _lr = xp.log(xp.maximum(_rat, 1e-12))
-                        _v3 = _to_numpy(xp.stack([
-                            _lr.sum(), _sc.sum(), (_rat < 0.5).sum(),
-                            (_rat > 1.5).sum()]))
-                        for _kname, _v in zip(
-                            ("stale_lnr_sum", "stale_n", "stale_lo",
-                             "stale_hi"), _v3):
-                            _sp[_kname] = _sp.get(_kname, 0.0) + float(_v)
+                if _stale_ratio is not None and _stale_mask is not None \
+                        and bool(_stale_mask.any()):
+                    _rat = _stale_ratio[_stale_mask]
+                    _lr = xp.log(xp.maximum(_rat, 1e-12))
+                    _v3 = _to_numpy(xp.stack([
+                        _lr.sum(), _stale_mask.sum(), (_rat < 0.5).sum(),
+                        (_rat > 1.5).sum()]))
+                    for _kname, _v in zip(
+                        ("stale_lnr_sum", "stale_n", "stale_lo",
+                         "stale_hi"), _v3):
+                        _sp[_kname] = _sp.get(_kname, 0.0) + float(_v)
             except (NameError, TypeError, IndexError) as _e:
                 logger.debug("%s: birth staleness stat skipped: %r",
                              self.name, _e)

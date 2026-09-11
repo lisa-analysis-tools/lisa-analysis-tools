@@ -1919,7 +1919,12 @@ export GB_RJ_AMP_MAXIMIZE=0
 # see (a device-routing fault in factors) is exactly what this catches.
 # 979/979 matched in the r2 probes; any MISMATCH line here is a stop
 # signal. =0 disarms.
-export GB_INMODEL_TRACE=1
+# 0 (2026-09-11, was 1): the per-repeat MH trace is a DEBUG knob (DEBUG
+# lines per repeat, host syncs) and, while armed, the fused accept kernel
+# stands down -- job 474 logged "[GB_INMODEL_ACCEPT_KERNEL] GB_INMODEL_TRACE
+# / GB_JUMP_TRACE are armed; standing down", so GB_INMODEL_ACCEPT_KERNEL=1
+# never engaged. Re-arm only for a diagnostic run.
+export GB_INMODEL_TRACE=0
 # DIFF DISCIPLINE: v7 exported GB_CAP_DIAG=1 and it costs time. Leaving it
 # on in v7 and off in v8 would make v8 look faster for reasons unrelated
 # to the proposal, so it is pinned ON here -- and the cap census is wanted
