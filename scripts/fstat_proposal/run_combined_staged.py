@@ -407,6 +407,32 @@ def build_fit():
             flush=True,
         )
 
+    # REMOVE_BRANCHES (user ask 2026-09-11: "run for everything except the
+    # GBs and galfor. We will not inject them."): comma list of whole
+    # branches to drop -- from the fit, from every stage's move list, and
+    # from the DEFAULT injection streams below. Only the branches the stage
+    # lists know how to drop are accepted; psd anchors the joint noise
+    # criteria (JointMaxLogLSearch branch="psd") and the sensitivity model,
+    # so it cannot go. With "gb" removed there is no F-stat machinery and
+    # no RJ: the gb stages collapse to ONE full_pe over what remains.
+    _removable = ("gb", "galfor", "vgb")
+    remove_branches = tuple(
+        b.strip().lower()
+        for b in os.environ.get("REMOVE_BRANCHES", "").split(",")
+        if b.strip()
+    )
+    for _b in remove_branches:
+        if _b not in _removable:
+            raise ValueError(
+                f"REMOVE_BRANCHES entry {_b!r} is not removable here "
+                f"(supported: {', '.join(_removable)})."
+            )
+    if gb_only and remove_branches:
+        raise ValueError(
+            "GB_ONLY=1 is already the gb-only composition; "
+            "REMOVE_BRANCHES makes no sense with it."
+        )
+
     # Every sampled branch needs a stream: NOISE for psd/galfor, GB, VGB --
     # plus the armed source classes' streams (their data must contain the
     # signals the branches fit). Explicit SOURCE_TYPES always wins.
@@ -414,7 +440,13 @@ def build_fit():
     # injection (noise + GB galaxy + VGBs) as the production runs -- only the
     # SAMPLED branch set shrinks to gb. Unmodeled content stays in the
     # residual; that is the accepted trade for not waiting on a noise fit.
-    _default_src = "NOISE,GB,VGB" + "".join(
+    # REMOVE_BRANCHES is the opposite contract ("we will not inject them"):
+    # a removed gb/vgb also leaves the DEFAULT stream list.
+    _default_src = ",".join(
+        ["NOISE"]
+        + (["GB"] if "gb" not in remove_branches else [])
+        + (["VGB"] if "vgb" not in remove_branches else [])
+    ) + "".join(
         f",{cls}" for br, _env, cls in _SOURCE_BRANCH_ENVS
         if br in armed_sources
     )
@@ -443,6 +475,13 @@ def build_fit():
                         if br in armed_sources),
             flush=True,
         )
+
+    for _b in remove_branches:
+        if _b in fit.branches:
+            fit.remove_branch(_b)
+    if remove_branches:
+        print(f"[combined] branches REMOVED (not sampled, not in the "
+              f"default injection): {list(remove_branches)}", flush=True)
 
     if gb_only:
         # Branch-set sanity: gb only, or the composition is not what the
@@ -521,21 +560,27 @@ def build_fit():
     # used to sit here and was referenced by no stage -- removed 2026-09-08.
     # `setup_recipe` still BUILDS psd_search/galfor_search stock moves for
     # every present noise branch; this driver simply never requests them.)
-    noise_pe = [Move("psd_pe", branch="psd"),
-                Move("galfor_pe", branch="galfor")]
+    # Branch-aware lists (REMOVE_BRANCHES): a removed galfor/vgb drops out
+    # of every move list and joint criterion below with no other change.
+    _has_galfor = "galfor" in fit.branches
+    _has_vgb = "vgb" in fit.branches
+    noise_pe = [Move("psd_pe", branch="psd")] + (
+        [Move("galfor_pe", branch="galfor")] if _has_galfor else [])
     # VGBs are KNOWN sources: fixed-dimensional, no RJ, nothing to search
     # for. They sample from the first stage onward so their power is being
     # fitted while the noise converges, rather than sitting in the residual
     # and biasing the PSD.
-    vgb = [Move("vgb_pe", branch="vgb")]
+    vgb = [Move("vgb_pe", branch="vgb")] if _has_vgb else []
+    _noise_names = ["psd_pe"] + (["galfor_pe"] if _has_galfor else [])
 
     # Stage 1: noise alone. Stage 2 and the GB search: noise + VGBs, with the
     # max-logl criterion spanning ALL of them -- one object per stage, so the
     # convergence is joint rather than each move plateauing separately.
     noise_only = [JointMaxLogLSearch(
-        "noise_joint_search", ["psd_pe", "galfor_pe"], branch="psd")]
+        "noise_joint_search", list(_noise_names), branch="psd")]
     noise_vgb = [JointMaxLogLSearch(
-        "noise_vgb_joint_search", ["psd_pe", "galfor_pe", "vgb_pe"],
+        "noise_vgb_joint_search",
+        _noise_names + (["vgb_pe"] if _has_vgb else []),
         branch="psd")]
     # The SAME joint move riding inside gb_search, with its OWN plateau rule.
     # It never plateaus for good there -- the GB residual moves every
@@ -553,7 +598,8 @@ def build_fit():
     _gb_noise_checks = int(os.environ.get("GB_SEARCH_NOISE_CHECKS", "1"))
     _gb_noise_cap = int(os.environ.get("GB_SEARCH_NOISE_ITERS_PER_STEP", "0"))
     noise_vgb_gb = [JointMaxLogLSearch(
-        "noise_vgb_joint_search", ["psd_pe", "galfor_pe", "vgb_pe"],
+        "noise_vgb_joint_search",
+        _noise_names + (["vgb_pe"] if _has_vgb else []),
         branch="psd", num_checks=(_gb_noise_checks or None),
         iters_per_step=(_gb_noise_cap or None))]
 
@@ -590,10 +636,12 @@ def build_fit():
             name="noise_search", kind="search", moves=noise_only,
             combine_kwargs=dict(share_temperature_control=False),
         ))
-        stages.append(Stage(
-            name="noise_vgb_search", kind="search", moves=noise_vgb,
-            combine_kwargs=dict(share_temperature_control=False),
-        ))
+        if _has_vgb:
+            # without a vgb branch this stage would duplicate noise_search
+            stages.append(Stage(
+                name="noise_vgb_search", kind="search", moves=noise_vgb,
+                combine_kwargs=dict(share_temperature_control=False),
+            ))
     if _env_flag("STAGE_NOISE_ONLY"):
         # Stages 1-2 only: watch the joint psd+galfor search converge without
         # paying for the F-stat grid fit (which lives in the gb_search RJ
@@ -615,6 +663,20 @@ def build_fit():
         stages.append(Stage(
             name="noise_vgb_pe", kind="pe",
             moves=noise_pe + vgb,
+            combine_kwargs=_pe_combine_kwargs(),
+        ))
+        fit.recipe = Recipe(stages)
+        return fit
+
+    if "gb" not in fit.branches:
+        # REMOVE_BRANCHES took gb: no F-stat machinery, no RJ, nothing to
+        # search for. Everything that remains PE-samples together in one
+        # full_pe -- the same composition as the stage below minus every
+        # gb move (name kept so monitor/digests/resume statuses read the
+        # same). PE never stops on its own; NUM_ITERATIONS bounds the run.
+        stages.append(Stage(
+            name="full_pe", kind="pe",
+            moves=noise_pe + source_pe() + vgb,
             combine_kwargs=_pe_combine_kwargs(),
         ))
         fit.recipe = Recipe(stages)
