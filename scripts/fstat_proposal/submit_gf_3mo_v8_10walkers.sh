@@ -1834,7 +1834,12 @@ export GB_CELL_LABEL_DEFERRED=1
 # [GB_CELL_LL] and sig-het audit lines, and the inmodel_accept/gate/prior
 # spans (~36 s/it on job 473) must all hold. GB_INMODEL_ACCEPT_KERNEL=0
 # restores the python chain.
-export GB_INMODEL_ACCEPT_KERNEL=1
+# BACK TO 0 (2026-09-11, user ruling): it fuses only the inmodel_gate +
+# inmodel_accept launches, ~18 s/it at 250/100 repeats and ~9 s at 100/50
+# (3mo; under 1% at 1yr) -- not worth a first production exposure on an
+# overnight run. Turn on only after tests/test_gb_inmodel_accept_kernel.py
+# has been run on a cluster GPU node.
+export GB_INMODEL_ACCEPT_KERNEL=0
 # ---- THE v8 EXPERIMENT: OBSERVABLE-BASIS IN-MODEL PROPOSAL ----------
 # Pinned EXPLICITLY even though it is now the code default, so this run
 # does not silently change meaning if the default is ever revisited, and
