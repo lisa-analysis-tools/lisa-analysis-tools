@@ -602,6 +602,15 @@ export GB_PSD_MIRROR_PARITY_PROPOSES=0
 # 0.2; that contradiction is gone with the line.
 # In-model repeats are unaffected either way -- they cover ALL alive
 # sources; the flip gate is rj-only by construction.
+# PER-STAGE flip knobs (2026-09-11, user ruling): the recipe's 0.2 stay the
+# code defaults; these override search and PE separately (the global
+# GB_RJ_FLIP_FRACTION above would land on BOTH and still beats them).
+# 0.1 = half the birth attempts per iteration: job 476 spent 42% of its
+# 1yr iteration scoring 3.1M births for 6,028 accepts (35 cold), job 474
+# 17% at 3mo. Deaths are gated per pick at the same fraction; alive rows
+# still pool for their in-model repeats regardless.
+export GB_SEARCH_RJ_FLIP_FRACTION=0.1
+export GB_PE_RJ_FLIP_FRACTION=0.1
 # export GB_RJ_FLIP_FRACTION=0.2   # <- re-export ONLY to force ALL stages
 # In-model info-matrix jump scale: 0.005 default measured 95% cold
 # acceptance; 0.2 -> 0.61; 0.4 -> 0.60 (job 196). Job 197 flipped the

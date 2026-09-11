@@ -517,8 +517,10 @@ def _resolve_rj_flip_fraction(branch_name, kwarg_value, default=1.0):
     """Resolve ``rj_flip_fraction`` for a move (kwarg > env > ``default``).
 
     ``default`` is the stock/mode default the builder chose (the recipe
-    passes ``_SEARCH_RJ_FLIP_DEFAULT`` = 1.0 for search-cycle RJ moves and
-    ``_PE_RJ_FLIP_DEFAULT`` = 0.3 for PE-cycle ones); a user env
+    passes ``_search_rj_flip_default()`` for search-cycle RJ moves and
+    ``_pe_rj_flip_default()`` for PE-cycle ones -- the 0.2 code constants
+    unless ``GB_SEARCH_RJ_FLIP_FRACTION`` / ``GB_PE_RJ_FLIP_FRACTION`` are
+    exported, 2026-09-11); a user env
     ``{BRANCH}_RJ_FLIP_FRACTION`` overrides it, an explicit kwarg overrides
     both. NOTE the env var is GLOBAL across stages -- one exported value
     lands on every RJ move in every stage, so setting it to force a search

@@ -101,6 +101,80 @@ _SEARCH_RJ_FLIP_DEFAULT = 0.2
 _PE_RJ_FLIP_DEFAULT = 0.2
 
 
+def _stage_rj_flip_default(env_name: str, code_default: float) -> float:
+    """Per-STAGE flip-fraction default: ``env_name`` if exported, else the
+    code constant (user ruling 2026-09-11: the 0.2s stay the defaults, but
+    each stage gets its own environment knob so a launch script can thin
+    search and PE separately -- ``GB_SEARCH_RJ_FLIP_FRACTION`` /
+    ``GB_PE_RJ_FLIP_FRACTION``). Precedence is unchanged above this: an
+    explicit per-move kwarg, then the GLOBAL ``{BRANCH}_RJ_FLIP_FRACTION``,
+    then this stage default. Validated like the move-level resolver.
+    """
+    raw = os.environ.get(env_name, None)
+    if raw is None or not str(raw).strip():
+        return float(code_default)
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{env_name} must be a float in (0, 1], got {raw!r}.") from exc
+    if not (0.0 < value <= 1.0):
+        raise ValueError(f"{env_name} must be in (0, 1], got {value}.")
+    return value
+
+
+def _search_rj_flip_default() -> float:
+    return _stage_rj_flip_default("GB_SEARCH_RJ_FLIP_FRACTION", _SEARCH_RJ_FLIP_DEFAULT)
+
+
+def _pe_rj_flip_default() -> float:
+    return _stage_rj_flip_default("GB_PE_RJ_FLIP_FRACTION", _PE_RJ_FLIP_DEFAULT)
+
+
+def warm_search_move_overrides() -> dict:
+    """``rj_warm_search``'s deltas vs ``rj_fstat_search`` -- the auditable seam.
+
+    User ruling 2026-09-02: the warm move is "built exactly like
+    fstat_search, with the distribution switched out", so ``phase_maximize``
+    follows the SAME ``GB_RJ_PHASE_MAXIMIZE`` seeding as rj_fstat_search
+    (it was hardcoded False on the carried-phases theory; at a longer Tobs
+    the carried phase degrades with the fdot uncertainty, and the ruling
+    supersedes it). The remaining two are CYCLE INVARIANTS, not proposal
+    behavior, and stay pinned: ``run_swaps=False`` (exactly one GB move
+    tempers per iteration -- rj_fstat_search/removal own it) and
+    ``leaf_cap_update=False`` (rj_fstat_search is the designated cap
+    updater; a second updater would double-advance the cap counters).
+    """
+    return dict(
+        phase_maximize=bool(int(os.environ.get("GB_RJ_PHASE_MAXIMIZE", "0"))),
+        run_swaps=False,
+        leaf_cap_update=False,
+    )
+
+
+def warm_pe_move_overrides() -> dict:
+    """``rj_warm_pe``'s deltas vs ``rj_warm_search`` -- the PE seam.
+
+    User ruling 2026-09-07: the warm move gets a PE twin that "mirrors the
+    fstat search <-> pe differences". Mirrored deltas: ``phase_maximize``
+    is UNCONDITIONALLY False (the no-maximization-in-PE policy -- exact
+    detailed balance; ``GB_RJ_PHASE_MAXIMIZE`` never leaks in);
+    ``run_swaps=True`` under the PE tempering BUDGET
+    (``GB_TEMPER_EVERY_PROPOSES``, the same cadence rj_fstat_pe carries --
+    at most one band-swap stage per N total proposes across the PE cycle's
+    swap-enabled moves); ``leaf_cap_update`` stays False (never a cap
+    updater, same as the search twin). Exactness of the charged density
+    itself is the container's job: the PE instance is built with
+    ``circ_images > 0`` (wrapped-normal image sums).
+    """
+    return dict(
+        phase_maximize=False,
+        run_swaps=True,
+        temper_every_proposes=int(
+            os.environ.get("GB_TEMPER_EVERY_PROPOSES", "3")),
+        leaf_cap_update=False,
+    )
+
+
 class Recipe:
     """The global-fit recipe: declarative stage list + runtime step engine, one object.
 
@@ -2882,7 +2956,7 @@ def build_gb_moves(
         # Leaf-cap counters advance once per iteration: the prior RJ move is
         # the designated updater; the other RJ moves only enforce the gate.
         **{**gb_move_kwargs, "leaf_cap_update": False,
-           "rj_flip_fraction_default": _SEARCH_RJ_FLIP_DEFAULT, **_imr_search}
+           "rj_flip_fraction_default": _search_rj_flip_default(), **_imr_search}
     )
     gb_search_fstat_mcmc_move.accepted = np.zeros((ntemps, nwalkers))
 
@@ -2906,7 +2980,7 @@ def build_gb_moves(
             phase_maximize=True,  # gb_info["pe_info"]["rj_phase_maximize"],
             gpus=[],
             **{**gb_move_kwargs, "leaf_cap_update": False,
-               "rj_flip_fraction_default": _SEARCH_RJ_FLIP_DEFAULT}
+               "rj_flip_fraction_default": _search_rj_flip_default()}
         )
         gb_search_refit_move.accepted = np.zeros((ntemps, nwalkers))
 
@@ -2951,7 +3025,7 @@ def build_gb_moves(
             run_swaps=_temper_all_moves,
             gpus=[],
             **{**gb_move_kwargs, "leaf_cap_update": False,
-               "rj_flip_fraction_default": _SEARCH_RJ_FLIP_DEFAULT, **_imr_search},
+               "rj_flip_fraction_default": _search_rj_flip_default(), **_imr_search},
         )
         # The center-table recentering IS this move's proposal, so it must
         # not depend on the phase-max chain the ctor default follows
@@ -3016,7 +3090,7 @@ def build_gb_moves(
             # Removal pools are 100% mature -- the survivor budget (25)
             # is the one that binds here.
             **{**gb_move_kwargs, "leaf_cap_update": False,
-               "rj_flip_fraction_default": _SEARCH_RJ_FLIP_DEFAULT, **_imr_search},
+               "rj_flip_fraction_default": _search_rj_flip_default(), **_imr_search},
         )
         gb_prior_removal_move.accepted = np.zeros((ntemps, nwalkers))
 
@@ -3031,9 +3105,10 @@ def build_gb_moves(
     # warm-start f0-windowed Gaussian mixture
     # (lisatools.sampling.warmstart_proposal.WarmStartComponents):
     #
-    #   * births draw FULL 9-column GB parameters -- the warm draws carry
-    #     their own phases/amplitudes from the previous posterior, so
-    #     phase_maximize stays OFF;
+    #   * births draw FULL 9-column GB parameters from the previous
+    #     posterior; phase_maximize follows GB_RJ_PHASE_MAXIMIZE exactly
+    #     like rj_fstat_search (user ruling 2026-09-02 -- the carried
+    #     phase degrades with fdot uncertainty at a longer Tobs);
     #   * mixture weights ~ inclusion probability p (mult IGNORED --
     #     PROVISIONAL v1 policy); cross-Tobs v1 = stored widths, f0 windows
     #     re-derived against the NEW run's 1/Tobs (no Fisher rescale);
@@ -3052,14 +3127,15 @@ def build_gb_moves(
     # GBSettings, unused in v1 -- the future in-move mixture weight vs the
     # F-stat proposal; v1 runs them as separate sequential moves).
     gb_warm_move = None
+    _warm_floor_lo = _warm_floor_hi = None
     _warm_path = str(
         getattr(gb_info, "warm_start_components", "")
         or os.environ.get("GB_WARM_START_COMPONENTS", "")
         or ""
     ).strip()
-    if include_search and _warm_path:
-        from ..sampling.warmstart_proposal import WarmStartComponents
-
+    if _warm_path:
+        # Shared by BOTH twins (rj_warm_search here, rj_warm_pe in the PE
+        # section below): the 9-col basis guard and the floor box.
         if int(engine_info.ndims["gb"]) != 9:
             raise ValueError(
                 "GB_WARM_START_COMPONENTS requires the 9-column sampled GB "
@@ -3082,6 +3158,9 @@ def build_gb_moves(
             _dist_lims[-1], float(band_edges[_f0_hi_i]) * 1e3, _mc_lims[-1],
             2.0 * np.pi, 1.0, np.pi, 2.0 * np.pi, 1.0, _ratio_max,
         ]
+    if include_search and _warm_path:
+        from ..sampling.warmstart_proposal import WarmStartComponents
+
         _warm_container = WarmStartComponents.from_npz(
             _warm_path,
             new_tobs=float(general_info.Tobs),
@@ -3096,13 +3175,15 @@ def build_gb_moves(
             rj_proposal_distribution={"gb": _warm_container},
             name="rj_warm_search",
             use_prior_removal=False,
-            # NO phase maximization: warm draws carry their own
-            # phases/amplitudes from the previous posterior.
-            phase_maximize=False,
-            run_swaps=False,
+            # Phase maximization follows GB_RJ_PHASE_MAXIMIZE exactly like
+            # rj_fstat_search (user ruling 2026-09-02: "built exactly like
+            # fstat_search, with the distribution switched out"); the cycle
+            # invariants (run_swaps / leaf_cap_update False) ride along --
+            # see warm_search_move_overrides.
             gpus=[],
-            **{**gb_move_kwargs, "leaf_cap_update": False,
-               "rj_flip_fraction_default": _SEARCH_RJ_FLIP_DEFAULT, **_imr_search},
+            **{**gb_move_kwargs,
+               "rj_flip_fraction_default": _search_rj_flip_default(),
+               **_imr_search, **warm_search_move_overrides()},
         )
         gb_warm_move.accepted = np.zeros((ntemps, nwalkers))
         gb_search_moves = list(gb_search_moves) + [gb_warm_move]
@@ -3134,7 +3215,7 @@ def build_gb_moves(
     # removed (2026-08-28) this wiring is what holds them at 0.2.
     # {BRANCH}_RJ_FLIP_FRACTION / an explicit kwarg still override.
     _rj_flip_default = (
-        _SEARCH_RJ_FLIP_DEFAULT if _gb_mode_search else _PE_RJ_FLIP_DEFAULT
+        _search_rj_flip_default() if _gb_mode_search else _pe_rj_flip_default()
     )
     # Per-class repeat defaults for the pe-NAMED moves follow the mode the
     # same way the flip fraction does (search campaigns that run through
@@ -3229,6 +3310,58 @@ def build_gb_moves(
     # reverse-density convention, per its docstring).
     if not _gb_mode_search or _pe_strict:
         gb_pe_prior_move.rj_fstat_dist_birth = _fstat_dist_birth_stamp()
+
+    #* ===================== WARM-START PE TWIN (rj_warm_pe) =====================
+    # USER RULING 2026-09-07: "rj_warm_search should also have a pe twin,
+    # rj_warm_pe. It should mirror the fstat search <-> pe differences."
+    # Mirrored deltas (see warm_pe_move_overrides): phase_maximize
+    # unconditionally False (no maximization in PE), run_swaps=True under
+    # the PE tempering budget, never a cap updater; flip fraction and
+    # in-model repeats follow rj_fstat_pe's mode-following defaults
+    # (_rj_flip_default / _imr_defaults / _pe_cap_off). Deliberately NOT
+    # stamped with rj_fstat_dist_birth and pe_extrinsic_draw=False -- the
+    # warm container's births carry their OWN full-9-column draws with
+    # exactly charged densities, the same rationale the stamp comment
+    # gives for rj_refit ("births and densities come from the GMM refit
+    # file"). EXACTNESS: the PE container is built with circ_images > 0
+    # (GB_WARM_START_CIRC_IMAGES, default 3) so the charged logpdf is the
+    # wrapped-normal density of the actual draws -- the minimal-image
+    # approximation the SEARCH twin uses is not detailed-balance-exact for
+    # wide circular components (the container's RuntimeWarning regime).
+    gb_warm_pe_move = None
+    if _warm_path:
+        from ..sampling.warmstart_proposal import WarmStartComponents
+
+        _warm_pe_container = WarmStartComponents.from_npz(
+            _warm_path,
+            new_tobs=float(general_info.Tobs),
+            use_cupy=use_gpu_priors,
+            floor_box=(_warm_floor_lo, _warm_floor_hi),
+            floor_eps=float(os.environ.get("GB_WARM_START_FLOOR_EPS", "0.05")),
+            p_floor=float(os.environ.get("GB_WARM_START_P_FLOOR", "0")),
+            circ_images=int(os.environ.get("GB_WARM_START_CIRC_IMAGES", "3")),
+            seed=general_info.random_seed,
+        )
+        gb_warm_pe_move = GBSpecialRJPriorMove(
+            *gb_move_args,
+            rj_proposal_distribution={"gb": _warm_pe_container},
+            name="rj_warm_pe",
+            use_prior_removal=False,
+            pe_extrinsic_draw=False,
+            gpus=[],
+            **{**gb_move_kwargs,
+               "rj_flip_fraction_default": _rj_flip_default,
+               **_imr_defaults, **_pe_cap_off,
+               **warm_pe_move_overrides()},
+        )
+        gb_warm_pe_move.accepted = np.zeros((ntemps, nwalkers))
+        logger.info(
+            "build_gb_moves: rj_warm_pe armed from %s (%d components; "
+            "circ_images=%s, floor_eps=%s).",
+            _warm_path, _warm_pe_container.n_components,
+            os.environ.get("GB_WARM_START_CIRC_IMAGES", "3"),
+            os.environ.get("GB_WARM_START_FLOOR_EPS", "0.05"),
+        )
 
     #* ------------------------- PE REPLACE (rj_replace_pe) -------------------------
     # USER DIRECTIVE 2026-08-28: "we need a PE replace that also uses the
@@ -3360,6 +3493,8 @@ def build_gb_moves(
     # recipe move list is what actually orders the GFCombineMove cycle;
     # this order is the registration order the filter preserves.
     gb_pe_moves = [gb_pe_prior_move]
+    if gb_warm_pe_move is not None:
+        gb_pe_moves.append(gb_warm_pe_move)
     if gb_pe_replace_move is not None:
         gb_pe_moves.append(gb_pe_replace_move)
     gb_pe_moves += [gb_pe_prior_birth_move, gb_pe_fstat_mcmc_move]

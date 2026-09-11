@@ -3,6 +3,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
+import os
+
 from lisatools.globalfit.moves.gbspecialstretch import (
     GBSpecialStretchMove,
     _resolve_rj_flip_fraction,
@@ -444,6 +446,71 @@ class ModeDefaultPolicyTest(unittest.TestCase):
         )
         for v in (_SEARCH_RJ_FLIP_DEFAULT, _PE_RJ_FLIP_DEFAULT):
             self.assertEqual(_resolve_rj_flip_fraction("gb", None, v), v)
+
+
+class StageFlipEnvKnobTest(unittest.TestCase):
+    """Per-stage environment knobs over the 0.2 code defaults (2026-09-11).
+
+    ``GB_SEARCH_RJ_FLIP_FRACTION`` / ``GB_PE_RJ_FLIP_FRACTION`` override
+    one stage each; unset, each stage keeps its constant. The GLOBAL
+    ``GB_RJ_FLIP_FRACTION`` still beats both (resolved later, per move).
+    """
+
+    def _clear(self):
+        for k in ("GB_SEARCH_RJ_FLIP_FRACTION", "GB_PE_RJ_FLIP_FRACTION"):
+            os.environ.pop(k, None)
+
+    def setUp(self):
+        self._clear()
+        self.addCleanup(self._clear)
+
+    def test_unset_gives_the_code_defaults(self):
+        from lisatools.globalfit.recipe import (
+            _PE_RJ_FLIP_DEFAULT, _SEARCH_RJ_FLIP_DEFAULT,
+            _pe_rj_flip_default, _search_rj_flip_default,
+        )
+        self.assertEqual(_search_rj_flip_default(), _SEARCH_RJ_FLIP_DEFAULT)
+        self.assertEqual(_pe_rj_flip_default(), _PE_RJ_FLIP_DEFAULT)
+        self.assertEqual(_search_rj_flip_default(), 0.2)
+
+    def test_search_knob_moves_only_search(self):
+        from lisatools.globalfit.recipe import (
+            _pe_rj_flip_default, _search_rj_flip_default,
+        )
+        os.environ["GB_SEARCH_RJ_FLIP_FRACTION"] = "0.1"
+        self.assertEqual(_search_rj_flip_default(), 0.1)
+        self.assertEqual(_pe_rj_flip_default(), 0.2)
+
+    def test_pe_knob_moves_only_pe(self):
+        from lisatools.globalfit.recipe import (
+            _pe_rj_flip_default, _search_rj_flip_default,
+        )
+        os.environ["GB_PE_RJ_FLIP_FRACTION"] = "0.05"
+        self.assertEqual(_pe_rj_flip_default(), 0.05)
+        self.assertEqual(_search_rj_flip_default(), 0.2)
+
+    def test_empty_export_means_unset(self):
+        from lisatools.globalfit.recipe import _search_rj_flip_default
+        os.environ["GB_SEARCH_RJ_FLIP_FRACTION"] = "  "
+        self.assertEqual(_search_rj_flip_default(), 0.2)
+
+    def test_out_of_range_and_garbage_are_rejected(self):
+        from lisatools.globalfit.recipe import _search_rj_flip_default
+        for bad in ("0", "1.5", "-0.1", "lots"):
+            os.environ["GB_SEARCH_RJ_FLIP_FRACTION"] = bad
+            with self.assertRaises(ValueError):
+                _search_rj_flip_default()
+
+    def test_global_knob_still_wins_at_the_move(self):
+        """The stage default is what the recipe hands the move; the move's
+        resolver puts the GLOBAL branch knob above it."""
+        os.environ["GB_SEARCH_RJ_FLIP_FRACTION"] = "0.1"
+        os.environ["GB_RJ_FLIP_FRACTION"] = "0.7"
+        self.addCleanup(os.environ.pop, "GB_RJ_FLIP_FRACTION", None)
+        from lisatools.globalfit.recipe import _search_rj_flip_default
+        self.assertEqual(
+            _resolve_rj_flip_fraction("gb", None, default=_search_rj_flip_default()),
+            0.7)
 
 
 if __name__ == "__main__":
