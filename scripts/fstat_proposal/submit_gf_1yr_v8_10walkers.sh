@@ -2010,6 +2010,13 @@ export GB_RJ_BAND_SHUTOFF_SCOPE=search
 # should re-open the question on its own. 100 = 2x the refit cadence
 # below, so it only bites if refitting stalls or is turned off.
 export GB_RJ_BAND_SHUTOFF_RESET_ITERS=100
+# USER RULING 2026-08-28: a shut-off band is frozen "for RJ and fancy
+# swaps until it resets". The RJ half is enforced in run_proposal; the
+# swap half is this knob (default OFF in code) and it had never been
+# exported here -- shut-off bands kept being built, scored and swapped in
+# the horizontal tempering. ON from 2026-09-11. Safe because shutoff
+# revives on every F-stat epoch (REFIT_EVERY=50) and after RESET_ITERS.
+export GB_TEMPER_SKIP_SHUTOFF_BANDS=1
 # 100 -> 50 (2026-08-18): the refit re-derives the peaks against the LIVE
 # residual and the UPDATED foreground/PSD, which is the whole point of
 # refitting -- and the foreground converges well inside 20 iterations, so a
