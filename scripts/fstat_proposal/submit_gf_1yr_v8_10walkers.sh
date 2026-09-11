@@ -553,7 +553,15 @@ export GB_NLEAVES_MAX=25000
 # this value must go back to 2048 (4096 x 4.09 MB = 16.8 GB/GPU on top of
 # the ~89 GB dev0 F-stat-search baseline = OOM) -- the two knobs move
 # TOGETHER.
-export GB_N_SUBBANDS=4096  # (was 2048 pre-mirror, 1024 before that) PER GPU; per-slot cost = data only with the mirror (1.02 MB @1yr), data + XYZ invC (4.09 MB) without. Pre-mirror history: ~4 MB @1yr (Tobs-linear) x 2 move caches -- HALVED TWICE from the 3-mo 8192 so the byte budget matches (8192@3mo->4096@6mo->2048@1yr). This is the #1 GPU-MEMORY WATCH: the old 1yr_v5 dropped to 1024 under a v5-era memory ceiling; v8 retired the F-stat centers so 2048 was tried first, but jobs 443/446 OOM'd on the FIRST rj_fstat_search of gb_search -- dev0 hit 88.72/99.9 GB (89%) loading the complete F-stat grid + move caches, then a 2.08 GB SubBandBuffer alloc tipped it over (batch 512 made NO difference: identical 88.72 GB -- this OOM is the F-stat-search path, not the in-model stash). Halved to 1024 (2026-09-06) per this line's own ceiling rule; frees ~8 GB/GPU. If it still OOMs, either halve again to 512 or add GPUs (--gres=gpu:4 + GPUS=0,1,2,3 ~halves per-GPU load; dev0/dev1 are imbalanced ~2:1).   # PER GPU: total = x n_gpus
+# 2026-09-11 DOUBLED 4096 -> 8192 (user ruling). Job 476 measured: the RJ
+# stage ran 4 batches over 8,184 slots (5,077 pick rounds of ~830 rows,
+# rj_step 887 s of which rj_getll 659 s and rj_fill 200 s -- the biggest
+# bucket of the 2,040 s iteration), a 1yr slot is a (3,5,8521) float64
+# slab ~1 MB with no twin and no per-slot invC (mirror), so 8192/GPU adds
+# ~8 GB per card against peaks of 74.2 GB (dev0) / 57.6 GB (dev1) of 93.6.
+# Expect 2 batches, ~half the rounds and fills. WATCH dev0's first-iteration
+# peak; 16384 (one batch) would push dev0 to ~90 GB -- not on two cards.
+export GB_N_SUBBANDS=8192  # (was 4096; 2048 pre-mirror, 1024 before that) PER GPU; per-slot cost = data only with the mirror (1.02 MB @1yr), data + XYZ invC (4.09 MB) without. Pre-mirror history: ~4 MB @1yr (Tobs-linear) x 2 move caches -- HALVED TWICE from the 3-mo 8192 so the byte budget matches (8192@3mo->4096@6mo->2048@1yr). This is the #1 GPU-MEMORY WATCH: the old 1yr_v5 dropped to 1024 under a v5-era memory ceiling; v8 retired the F-stat centers so 2048 was tried first, but jobs 443/446 OOM'd on the FIRST rj_fstat_search of gb_search -- dev0 hit 88.72/99.9 GB (89%) loading the complete F-stat grid + move caches, then a 2.08 GB SubBandBuffer alloc tipped it over (batch 512 made NO difference: identical 88.72 GB -- this OOM is the F-stat-search path, not the in-model stash). Halved to 1024 (2026-09-06) per this line's own ceiling rule; frees ~8 GB/GPU. If it still OOMs, either halve again to 512 or add GPUs (--gres=gpu:4 + GPUS=0,1,2,3 ~halves per-GPU load; dev0/dev1 are imbalanced ~2:1).   # PER GPU: total = x n_gpus
 # ######################################################################### #
 # ##  SHARED-PSD MIRROR (2026-09-09): the sub-band buffers stop copying    ##
 # ##  each slot's inverse-PSD slab out of the parent's per-walker plane   ##
