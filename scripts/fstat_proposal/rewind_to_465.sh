@@ -25,9 +25,12 @@
 #      mid-iteration state of ~it 204 [41]; a checkpoint NEWER than the store
 #      is what resume prefers, so left in place it would silently re-apply
 #      the post-rewind state.
-#   3. gf_prod_*_testing_running_backup_copy.h5 -> moved aside. It sits at
-#      the LATER iteration; a torn-store self-heal would promote it over the
-#      rewound store (this fired once already on job 469).
+#   3. gf_prod_*_testing_running_backup_copy.h5 -> REWOUND IN PLACE (same
+#      reset as the store) and left beside it, so a torn-store self-heal
+#      promotes a copy that is already at the rewound iteration. It used to
+#      be moved aside, which left the 2026-09-10 torn 3mo store with
+#      nothing to self-heal from. A backup that is itself unreadable is
+#      moved aside.
 #   4. gb_fstat_fit/shared/epoch_0004, epoch_0005 -> moved aside (3mo only).
 #      The move loads the LATEST epoch dir; those two were fitted at it 170
 #      and 204 against the degraded residual. epoch_0003 is what the run was
@@ -37,8 +40,8 @@ set -euo pipefail
 RUN="${1:?usage: rewind_to_465.sh 3mo|1yr [--apply]}"
 APPLY="${2:-}"
 case "$RUN" in
-  3mo) DIR=/shared/data/global_fit_output/gf_prod_3mo_v8_10walkers; BASE=gf_prod_3mo_testing; IT=151; EPOCHS="epoch_0004 epoch_0005" ;;
-  1yr) DIR=/shared/data/global_fit_output/gf_prod_1yr_v8_10walkers; BASE=gf_prod_1yr_testing; IT=29;  EPOCHS="" ;;
+  3mo) DIR=/shared/data/global_fit_output/gf_prod_3mo_v8_10walkers; BASE=gf_prod_3mo_testing; IT=151; EPOCHS="epoch_0004 epoch_0005"; JOBNAME=gf3mo_v8 ;;
+  1yr) DIR=/shared/data/global_fit_output/gf_prod_1yr_v8_10walkers; BASE=gf_prod_1yr_testing; IT=29;  EPOCHS="";                      JOBNAME=gf1yr_v8 ;;
   *) echo "unknown run $RUN"; exit 2 ;;
 esac
 STORE="$DIR/$BASE.h5"
@@ -47,18 +50,46 @@ ASIDE="$DIR/rewind_$STAMP"
 LAT="${LAT_ROOT:-$HOME/lisa-analysis-tools}"
 
 echo "== rewind $RUN: $STORE -> iteration $IT (resume from row $((IT-1))) apply=${APPLY:-no}"
-if lsof "$STORE" >/dev/null 2>&1; then echo "STORE IS OPEN (job still running?) -- scancel first"; exit 3; fi
+# ONE-WRITER-PER-STORE GUARD. ``lsof`` on the head node cannot see a
+# compute node's open handle, so it passed while a job was still writing
+# the store (2026-09-10: the rewind ran under a live job, the store was
+# torn, and the moved-aside backup left nothing for the resume self-heal
+# to promote). Ask Slurm instead: any RUNNING or PENDING job of this user
+# with the run's job name blocks the rewind. Pending counts too -- it would
+# start writing the moment the rewind finished.
+if command -v squeue >/dev/null 2>&1; then
+  LIVE=$(squeue -h -u "$USER" -n "$JOBNAME" -o "%i %T %M" 2>/dev/null || true)
+  if [ -n "$LIVE" ]; then
+    echo "JOB(S) NAMED $JOBNAME ARE RUNNING/PENDING -- scancel them first, then re-run:"; echo "$LIVE"; exit 3
+  fi
+fi
+if lsof "$STORE" >/dev/null 2>&1; then echo "STORE IS OPEN locally -- scancel first"; exit 3; fi
 
 # 1. counter + stage (dry run unless --apply)
 python "$LAT/scripts/fstat_proposal/reset_recipe_stage.py" "$STORE" gb_search --iteration "$IT" ${APPLY:+--apply}
 
-# 2-4. sidecars
-for f in "$DIR/${BASE}_midit_checkpoint.pkl" "$DIR/${BASE}_running_backup_copy.h5"; do
-  if [ -e "$f" ]; then
-    echo "   sidecar: $f -> $ASIDE/"
-    [ -n "$APPLY" ] && mkdir -p "$ASIDE" && mv "$f" "$ASIDE/"
+# 2. mid-iteration checkpoint -> aside (a checkpoint newer than the store
+#    is what resume prefers; it would re-apply the post-rewind state).
+f="$DIR/${BASE}_midit_checkpoint.pkl"
+if [ -e "$f" ]; then
+  echo "   sidecar: $f -> $ASIDE/"
+  [ -n "$APPLY" ] && mkdir -p "$ASIDE" && mv "$f" "$ASIDE/"
+fi
+# 3. running backup -> REWOUND IN PLACE, never moved aside (2026-09-10
+#    lesson: the 3mo store was torn and the resume self-heal had nothing to
+#    promote because this script had moved the backup away). Rewinding the
+#    backup to the same iteration makes it safe to keep beside the store:
+#    if the primary is unreadable the self-heal promotes a copy that is
+#    already at iteration $IT. A backup that cannot be rewound (itself
+#    torn) is moved aside instead.
+b="$DIR/${BASE}_running_backup_copy.h5"
+if [ -e "$b" ]; then
+  echo "   backup: rewinding $b in place"
+  if ! python "$LAT/scripts/fstat_proposal/reset_recipe_stage.py" "$b" gb_search --iteration "$IT" ${APPLY:+--apply}; then
+    echo "   backup unreadable -> $ASIDE/"
+    [ -n "$APPLY" ] && mkdir -p "$ASIDE" && mv "$b" "$ASIDE/"
   fi
-done
+fi
 for e in $EPOCHS; do
   d="$DIR/gb_fstat_fit/shared/$e"
   if [ -d "$d" ]; then
