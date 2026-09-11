@@ -8728,27 +8728,36 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         band_sorter.inds.shape[0],
                     )
 
+            # BIRTH STALENESS (2026-09-11): per scored birth, ``s = d_h/h_h``
+            # = <r|h>/<h|h> = detected/optimal SNR of the DRAWN template,
+            # read straight off the engine outputs BEFORE any rescaling. A
+            # birth drawn at a peak still in this walker's residual scores
+            # s ~ 1 (the peak's amplitude was right); a peak already claimed
+            # (found and subtracted) leaves noise under the template and
+            # s << 1. Independent of the proposal (no centre table) and of
+            # the amplitude pin below (OFF in production: GB_RJ_AMP_MAXIMIZE=0
+            # -- production births are PHASE-maximized only, so the opt-SNR
+            # floor below tests sqrt(h_h) of the drawn template as is).
+            # Folded into the [GB_ACCEPT rj-split] accounting at step end:
+            # tells stale peaks from a floor-boundary effect (the peak
+            # table's SNR floor and the opt-SNR limit are both 8).
+            if len(birth_k):
+                _hh_b0 = h_h[birth_k]
+                _ok0 = _hh_b0 > 0.0
+                _stale_ratio = xp.where(
+                    _ok0, d_h[birth_k] / xp.where(_ok0, _hh_b0, 1.0), 1.0)
+                _stale_mask = _ok0 & keep[birth_k]
+
             # Legacy step-1 amplitude pin: scale the drawn amplitude by the
             # empirical residual ratio ``s = d_h/h_h`` (a 1-parameter fit at the
             # drawn iota/psi). Superseded by the F-stat distance proposal above
-            # and only runs when that path is OFF (GB_RJ_FSTAT_DIST_BIRTH=0).
+            # and only runs when that path is OFF (GB_RJ_FSTAT_DIST_BIRTH=0)
+            # AND GB_RJ_AMP_MAXIMIZE=1 (production: 0 -> never runs).
             if (not self.rj_fstat_dist_birth) and self.rj_amp_maximize and len(birth_k):
                 hh_b = h_h[birth_k]
                 good = hh_b > 0.0
                 hh_safe = xp.where(good, hh_b, 1.0)
                 s = xp.where(good, d_h[birth_k] / hh_safe, 1.0)
-                # BIRTH STALENESS (2026-09-11): ``s`` = detected/optimal SNR
-                # of the DRAWN template = <r|h>/<h|h>. A birth drawn at a
-                # peak that is still in this walker's residual scores s ~ 1
-                # (the F-stat amplitude was right); a peak already claimed
-                # (found and subtracted) leaves only noise under the
-                # template and s << 1 -- and after this pin its SNR is
-                # s * sqrt(h_h), which is what the opt-SNR floor then drops.
-                # Job 473 dropped 58% of scored births that way (~40 s/it
-                # at 3mo, ~260 s/it at 1yr). Stashed here, folded into the
-                # [GB_ACCEPT rj-split] accounting at the end of the step.
-                _stale_ratio = s
-                _stale_mask = good & keep[birth_k]
                 if _gb_use_distance(self):
                     # A propto 1/dist  ->  dist_new = dist / s
                     params[birth_k, 0] = xp.where(
