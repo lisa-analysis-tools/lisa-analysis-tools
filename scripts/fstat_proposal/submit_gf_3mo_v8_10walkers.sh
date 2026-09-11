@@ -938,7 +938,11 @@ export GB_SIGHET_REFRESH_EVERY=25
 # cold audit error. 1e-2 would refresh nearly everything (drift per
 # 25-repeat check is ~0.25 rad median), i.e. no saving; 0.3 saves more but
 # accuracy is the primary concern (user ruling), so 0.1.
-export GB_SIGHET_REFRESH_DPHASE=0.1
+# REVERTED to 0 (2026-09-11 evening): 0.1 rad refreshed 81% of sources
+# instead of 89% at 3mo and 94% instead of 97% at 1yr -- no measurable
+# wall-clock saving -- while the 1yr cold audit max rose 15 -> 22 in the
+# same relaunch (cause not isolated). Accuracy is primary: back to 0.
+export GB_SIGHET_REFRESH_DPHASE=0
 # ALL RUNGS REFRESH (user ruling 2026-08-18). The default 0.1 keeps a stale
 # reference on everything hotter, justified in the code as "the ll error is
 # beta-suppressed". That reasoning covers the WITHIN-rung accept test, where
