@@ -13648,8 +13648,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 f"({_cn['paired']}/{_cn['rows']} rows had a partner over "
                 f"{_cn['sweeps']} sweeps) | proposed {_cn['proposed']} "
                 f"accepted {_cn['accepted']} ({100.0 * _rate:.1f}%) over "
-                f"{n_rep} repeats x {len(ids)} sources | per rung pair -- "
-                f"{_rungs or 'none'}"
+                f"{n_rep} repeats x {len(ids)} sources | "
+                f"cap-vetoed {int(_cn.get('cap_vetoed', 0))}"
+                f"{'' if _swap_cens is not None else ' (gate off)'} | "
+                f"per rung pair -- {_rungs or 'none'}"
             )
 
 
@@ -14659,7 +14661,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         f"[GB_TEMPER_CHECK {self.name}] census/device accept "
                         f"counters MATCH: {_ec['acc']} accepted "
                         f"({_bs_cold} at the cold pair); unit label checks "
-                        f"passed.")
+                        f"passed; cap-vetoed so far this process "
+                        f"{int(getattr(self, '_temper_cap_vetoed', 0))}"
+                        f"{'' if _swap_cens_t is not None else ' (gate off)'}.")
                 else:
                     logger.warning(
                         f"[GB_TEMPER_CHECK {self.name}] accept-counter "
