@@ -262,13 +262,16 @@ class JointMaxLogLSearch(Move):
     (LISA Analysis Tools-wide rule), so a local class would break it.
     """
 
-    def __init__(self, name, inner_names, iters_per_step=None, **kwargs):
+    def __init__(self, name, inner_names, iters_per_step=None,
+                 num_checks=None, **kwargs):
         super().__init__(name, **kwargs)
         self.inner_names = list(inner_names)
-        # Per-propose inner-iteration cap handed to MaxLogLCombineMove.
-        # None = the global MAXLOGL_ITERS_PER_STEP budget (the standalone
-        # noise stages); the gb_search rider sets a small cap (2026-09-11).
+        # Per-propose inner-iteration cap and plateau length handed to
+        # MaxLogLCombineMove. None = the global knobs (MAXLOGL_ITERS_PER_STEP
+        # / NOISE_SEARCH_CHECKS, the standalone noise stages); the gb_search
+        # rider overrides both (2026-09-11).
         self.iters_per_step = iters_per_step
+        self.num_checks = num_checks
 
     def stock_dependencies(self):
         """The stock moves this wraps -- without this they are never BUILT.
@@ -292,7 +295,10 @@ class JointMaxLogLSearch(Move):
             )
         mv = MaxLogLCombineMove(
             [ctx.stock_moves[n] for n in self.inner_names],
-            num_checks=int(os.environ.get("NOISE_SEARCH_CHECKS", "5")),
+            num_checks=(
+                int(os.environ.get("NOISE_SEARCH_CHECKS", "5"))
+                if self.num_checks is None else int(self.num_checks)
+            ),
             share_temperature_control=False,
             iters_per_step=self.iters_per_step,
         )
@@ -531,18 +537,25 @@ def build_fit():
     noise_vgb = [JointMaxLogLSearch(
         "noise_vgb_joint_search", ["psd_pe", "galfor_pe", "vgb_pe"],
         branch="psd")]
-    # The SAME joint move riding inside gb_search, with a per-propose cap
-    # on its inner rounds (GB_SEARCH_NOISE_ITERS_PER_STEP, default 2). It
-    # never plateaus for good there -- the GB residual moves every
-    # iteration -- so under the global 10-round budget it took ~6 rounds
-    # of 16 s per GB iteration (93 s, 15% of the iteration, 3mo job 473)
-    # to re-track a noise model whose epoch drift is 6e-7. Two rounds keep
-    # it tracking at a third of the cost; the standalone noise stages above
-    # are untouched. 0 = no cap (the old behaviour).
-    _gb_noise_cap = int(os.environ.get("GB_SEARCH_NOISE_ITERS_PER_STEP", "2"))
+    # The SAME joint move riding inside gb_search, with its OWN plateau rule.
+    # It never plateaus for good there -- the GB residual moves every
+    # iteration -- so under NOISE_SEARCH_CHECKS=5 it took ~6 rounds of 16 s
+    # per GB iteration (93 s, 15% of the iteration, 3mo job 473). The
+    # [MAXLOGL] trace shows the re-tracking happens in ROUND 1 (the
+    # IMPROVED jumps of hundreds of lnL land there); rounds 2+ add ~5 lnL
+    # per round, the tol-level wobble of a stretch ensemble near the mode.
+    # GB_SEARCH_NOISE_CHECKS (default 1): keep taking rounds while a round
+    # still improves by more than tol, stop at the first flat one -- so
+    # after a big residual change the noise gets as many rounds as it
+    # needs, and otherwise ~2. GB_SEARCH_NOISE_ITERS_PER_STEP (default 0 =
+    # the global MAXLOGL_ITERS_PER_STEP ceiling) is only a hard cap. The
+    # standalone noise stages above are untouched.
+    _gb_noise_checks = int(os.environ.get("GB_SEARCH_NOISE_CHECKS", "1"))
+    _gb_noise_cap = int(os.environ.get("GB_SEARCH_NOISE_ITERS_PER_STEP", "0"))
     noise_vgb_gb = [JointMaxLogLSearch(
         "noise_vgb_joint_search", ["psd_pe", "galfor_pe", "vgb_pe"],
-        branch="psd", iters_per_step=(_gb_noise_cap or None))]
+        branch="psd", num_checks=(_gb_noise_checks or None),
+        iters_per_step=(_gb_noise_cap or None))]
 
     def source_pe():
         # Fresh Move descriptors per stage (never share one instance):

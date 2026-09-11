@@ -764,12 +764,15 @@ export GB_TEMPER_VERTICAL=1
 # defaults to "band" whenever GB_TEMPER_VERTICAL=1; exported explicitly so
 # the log line [GB_VERT ...] order=band is unambiguous.
 export GB_TEMPER_CELL_ORDER=band
-# Joint noise+VGB max-lnL rider inside gb_search: cap its inner rounds per
-# GB iteration (2026-09-11; the 3mo twin measured ~6 rounds x 16 s = 93 s
-# per iteration re-tracking a noise model that drifts 6e-7 per epoch).
-# 0 = uncapped (the global MAXLOGL_ITERS_PER_STEP budget). Consumed by
-# run_combined_staged.py.
-export GB_SEARCH_NOISE_ITERS_PER_STEP=2
+# Joint noise+VGB max-lnL rider inside gb_search (2026-09-11; the 3mo twin
+# measured ~6 rounds x 16 s = 93 s/it). Its [MAXLOGL] trace shows the
+# foreground/PSD re-tracking lands in ROUND 1 of each GB iteration;
+# rounds 2+ add ~5 lnL per round (tol-level wobble). CHECKS=1: keep taking
+# rounds while a round still improves by > tol (5 lnL), stop at the first
+# flat one -- adaptive. ITERS_PER_STEP=0: no hard cap beyond the global
+# 10-round ceiling. Consumed by run_combined_staged.py.
+export GB_SEARCH_NOISE_CHECKS=1
+export GB_SEARCH_NOISE_ITERS_PER_STEP=0
 # VERTICAL-SWAP CONTROL ARM (2026-09-10 forensics): accepted in-model vertical
 # rung swaps at the cold pair (T0-T1) jumped 334 -> 16,205 per 100-repeat block
 # at the 467 relaunch (1yr: 33 -> 1,156 -> 3,328), the largest discontinuity in
@@ -920,13 +923,14 @@ export FSTAT_SIGHET_MULTIDEV=1
 # buys mixing while PRESERVING accuracy; widening buys the same mixing by
 # SPENDING accuracy. Same reason GB_SIGHET_TRUST_PHASE_C stays at 0 here.
 export GB_SIGHET_REFRESH_EVERY=25
-# 0.3 rad (2026-09-11, was 0 = refresh every drifted source): the 3mo
+# 0.1 rad (2026-09-11, was 0 = refresh every drifted source): the 3mo
 # twin refreshed 89% of sources at every 25-repeat check (34 s/it) while
 # the end-of-block drift median was 0.55 rad over 100 repeats. Experiment
-# A (windowed stash, CPU): the sig-het error at 0.3 rad displacement is
-# ~2e-6 x SNR^2/2 = 0.03 lnL for SNR 184 -- under the 0.07 median cold
-# audit error. 0.3 is also the tightest trust-gate width.
-export GB_SIGHET_REFRESH_DPHASE=0.3
+# A (windowed stash, CPU) sig-het error vs displacement: 0.02 rad 1.3e-8,
+# 0.1 rad 2.4e-7, 0.3 rad 2e-6 (x SNR^2/2) -- 0.004 lnL for SNR 184 at
+# 0.1 rad. 1e-2 would refresh nearly everything (no saving); accuracy is
+# the primary concern (user ruling), so 0.1 rather than 0.3.
+export GB_SIGHET_REFRESH_DPHASE=0.1
 # ALL RUNGS REFRESH (user ruling 2026-08-18). The default 0.1 keeps a stale
 # reference on everything hotter, justified in the code as "the ll error is
 # beta-suppressed". That reasoning covers the WITHIN-rung accept test, where
