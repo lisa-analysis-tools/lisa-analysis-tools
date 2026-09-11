@@ -5,12 +5,22 @@ The run this builds toward: mojito data, ``T_obs`` = 3 months, one composition
 carrying **gb + vgb + psd + galfor**, driven by a THREE-stage recipe rather
 than the single combined PE stage ``all_sources`` ships with.
 
-    1. ``noise_search``  kind="search"  psd_search + galfor_search
-       Both are ``PSDMove(max_logl_mode=True)``; ``run_move_max_likelihood``
-       loops internally until the cold-chain max lnL plateaus, and
-       ``SearchRecipeStep`` is done on its first check because the criterion
-       lives INSIDE the move. So this stage converges the noise model before
-       a single GB is subtracted.
+    1. ``noise_search``  kind="search"  noise_joint_search (psd_pe+galfor_pe)
+       The stage is a "search" in the sense of being convergence-gated, but
+       its sub-moves are the PE ones: psd and galfor are fixed-dimensional,
+       so there is nothing to search FOR and a maximizing proposal would be
+       the wrong tool. ``JointMaxLogLSearch`` supplies the criterion --
+       ``run_move_max_likelihood`` loops internally until the cold-chain max
+       lnL plateaus ACROSS ALL its sub-moves jointly, and ``SearchRecipeStep``
+       is done on its first check because the criterion lives INSIDE the
+       move. So this stage converges the noise model before a single GB is
+       subtracted.
+
+    1b. ``noise_vgb_search`` kind="search" noise_vgb_joint_search
+       The same, plus the 55 VGBs. They are KNOWN sources -- seeded from the
+       catalogue, fixed-dimensional, no RJ -- so they too are fitted rather
+       than searched for, and their power leaves the residual before the GB
+       search starts.
 
     2. ``gb_search``     kind="rj"      psd_pe + galfor_pe + GB search moves
        ``RJRecipeStep`` watches the cold-chain leaf count on ``plateau_branch
@@ -85,6 +95,22 @@ Key env knobs
                          unset = stage lists unchanged, bit-identical run.
                          full_pe is NOT touched (the ruling names search;
                          the warm move is search-configured).
+    MBHB_IDS / EMRI_IDS / SOBHB_IDS
+                         comma id lists arming the mbh/emri/sobbh branches
+                         (campaign gate S6, docs/6mo-campaign.md; user
+                         ruling 2026-09-02 "we are adding MBHB EMRI
+                         SOBHB"). Absent/empty = branch dropped (today's
+                         4-branch behavior, bit-identical). Armed: a
+                         ``source_search`` stage (joint max-lnL over the
+                         armed source PE moves) runs FIRST -- sources
+                         converge and subtract before the noise stages
+                         fit the PSD ("MBH search first, full_year
+                         pattern") -- and the armed PE moves join
+                         gb_search + full_pe in the sobbh -> mbh -> emri
+                         banking order. Ids land on
+                         ``general.mojito_source_ids``; SOURCE_TYPES
+                         defaults gain the armed classes (explicit env
+                         still wins). Incompatible with GB_ONLY=1.
     GB_SEARCH_RJ_REPLACE gb_search F-stat REPLACEMENT move (default 1,
                          2026-08-24 exact-MH reinstatement): ``rj_replace``
                          runs IMMEDIATELY AFTER ``rj_fstat_search`` in the
@@ -236,9 +262,13 @@ class JointMaxLogLSearch(Move):
     (LISA Analysis Tools-wide rule), so a local class would break it.
     """
 
-    def __init__(self, name, inner_names, **kwargs):
+    def __init__(self, name, inner_names, iters_per_step=None, **kwargs):
         super().__init__(name, **kwargs)
         self.inner_names = list(inner_names)
+        # Per-propose inner-iteration cap handed to MaxLogLCombineMove.
+        # None = the global MAXLOGL_ITERS_PER_STEP budget (the standalone
+        # noise stages); the gb_search rider sets a small cap (2026-09-11).
+        self.iters_per_step = iters_per_step
 
     def stock_dependencies(self):
         """The stock moves this wraps -- without this they are never BUILT.
@@ -264,9 +294,36 @@ class JointMaxLogLSearch(Move):
             [ctx.stock_moves[n] for n in self.inner_names],
             num_checks=int(os.environ.get("NOISE_SEARCH_CHECKS", "5")),
             share_temperature_control=False,
+            iters_per_step=self.iters_per_step,
         )
         mv.gf_move_name = self.name
         return mv
+
+
+# mbh/emri/sobbh arming (campaign S6): branch -> (env, mojito class), in the
+# sobbh -> mbh -> emri BANKING order (user ruling 2026-08-27: the cheap
+# branch banks its progress before the minutes-per-leaf MBH/EMRI proposals
+# put the iteration at risk; move order is not a sampling statement).
+_SOURCE_BRANCH_ENVS = (
+    ("sobbh", "SOBHB_IDS", "SOBHB"),
+    ("mbh", "MBHB_IDS", "MBHB"),
+    ("emri", "EMRI_IDS", "EMRI"),
+)
+
+
+def _source_ids_from_env() -> dict:
+    """Armed source branches: {branch: [ids]} from MBHB_IDS/EMRI_IDS/SOBHB_IDS.
+
+    Absent or empty env = branch NOT armed (it is removed, today's
+    behavior). Mirrors source_runtime.default_source_ids' parsing.
+    """
+    armed = {}
+    for branch, env, _cls in _SOURCE_BRANCH_ENVS:
+        raw = os.environ.get(env, "")
+        ids = [int(x) for x in raw.split(",") if x.strip() != ""]
+        if ids:
+            armed[branch] = ids
+    return armed
 
 
 def build_fit():
@@ -275,6 +332,12 @@ def build_fit():
 
     nwalkers = int(os.environ.get("NWALKERS", "16"))
     gb_only = _env_flag("GB_ONLY")
+    armed_sources = _source_ids_from_env()
+    if gb_only and armed_sources:
+        raise ValueError(
+            f"GB_ONLY=1 is the gb-only composition; source id envs "
+            f"{sorted(armed_sources)} cannot be armed with it."
+        )
     # GB_ONLY: the gb_no_fg stock variant IS the GB-only design (no psd /
     # galfor / vgb branch anywhere in it; fixed injection PSD via its
     # adjust_general -> fixed_psd_kwargs -> setup_acs no-psd-branch path).
@@ -292,6 +355,16 @@ def build_fit():
         # set, so the descriptor must be knob-conditional too). Fresh Move
         # descriptor per call (never share one instance across stages).
         return ([Move("rj_warm_search", branch="gb")]
+                if os.environ.get("GB_WARM_START_COMPONENTS", "").strip()
+                else [])
+
+    def warm_pe():
+        # rj_warm_pe (user ruling 2026-09-07: the PE twin, mirroring the
+        # fstat search <-> pe differences): warm-start births in the PE
+        # cycle, IMMEDIATELY BEFORE rj_fstat_pe -- the same relative
+        # position the search twin takes vs rj_fstat_search. Same knob
+        # arms both twins; fresh Move descriptor per call.
+        return ([Move("rj_warm_pe", branch="gb")]
                 if os.environ.get("GB_WARM_START_COMPONENTS", "").strip()
                 else [])
 
@@ -328,21 +401,42 @@ def build_fit():
             flush=True,
         )
 
-    # Every sampled branch needs a stream: NOISE for psd/galfor, GB, VGB.
+    # Every sampled branch needs a stream: NOISE for psd/galfor, GB, VGB --
+    # plus the armed source classes' streams (their data must contain the
+    # signals the branches fit). Explicit SOURCE_TYPES always wins.
     # GB_ONLY keeps the same default DELIBERATELY: the data is the SAME full
     # injection (noise + GB galaxy + VGBs) as the production runs -- only the
     # SAMPLED branch set shrinks to gb. Unmodeled content stays in the
     # residual; that is the accepted trade for not waiting on a noise fit.
-    src = os.environ.get("SOURCE_TYPES", "NOISE,GB,VGB")
+    _default_src = "NOISE,GB,VGB" + "".join(
+        f",{cls}" for br, _env, cls in _SOURCE_BRANCH_ENVS
+        if br in armed_sources
+    )
+    src = os.environ.get("SOURCE_TYPES", _default_src)
     fit.general.source_types = tuple(
         s.strip().upper() for s in src.split(",") if s.strip()
     )
 
     # gb_no_fg carries ONLY the gb branch; remove_branch raises on absent
-    # names, so guard (all_sources still drops its three heavy branches).
+    # names, so guard. Unarmed source branches drop (the pre-S6 4-branch
+    # behavior); armed ones STAY and get their mojito catalogue id lists
+    # (mojito_source_ids gates inclusion; GB/VGB entries preserved).
     for branch in ("mbh", "emri", "sobbh"):
-        if branch in fit.branches:
+        if branch in fit.branches and branch not in armed_sources:
             fit.remove_branch(branch)
+    if armed_sources:
+        _ids = dict(fit.general.mojito_source_ids)
+        for branch, _env, cls in _SOURCE_BRANCH_ENVS:
+            if branch in armed_sources:
+                _ids[cls] = list(armed_sources[branch])
+        fit.general.mojito_source_ids = _ids
+        print(
+            f"[combined] source branches armed: "
+            + ", ".join(f"{br}={armed_sources[br]}"
+                        for br, _e, _c in _SOURCE_BRANCH_ENVS
+                        if br in armed_sources),
+            flush=True,
+        )
 
     if gb_only:
         # Branch-set sanity: gb only, or the composition is not what the
@@ -388,7 +482,9 @@ def build_fit():
             ),
             Stage(
                 name="full_pe", kind="pe",
-                moves=[
+                # rj_warm_pe (when armed) runs IMMEDIATELY BEFORE
+                # rj_fstat_pe -- the PE mirror of the search-stage order.
+                moves=warm_pe() + [
                     Move("rj_fstat_pe", branch="gb"),
                     Move("rj_prior_pe", branch="gb"),
                 ] + ridge(),
@@ -402,8 +498,23 @@ def build_fit():
     #   rj_prior_removal = removal-only prior pruning (search cycle)
     #   rj_fstat_pe      = F-stat grid births, strict-PE config
     #   rj_prior_pe      = pure prior births, strict-PE config
-    noise_search = [Move("psd_search", branch="psd"),
-                    Move("galfor_search", branch="galfor")]
+    # NOTE ON NAMING (2026-09-08). The noise/VGB STAGES are called "*_search"
+    # but their sub-moves are the "*_pe" ones, and that is deliberate, not a
+    # leftover: psd (2 params), galfor (5) and vgb (55 KNOWN sources) are all
+    # FIXED-DIMENSIONAL with nothing to search FOR. In this codebase a
+    # "_search" proposal means maximize-and-skip-detailed-balance, which is
+    # the right tool for finding unknown GBs and the wrong one for a
+    # 2-parameter noise level. "search" in the STAGE name refers to the
+    # stage's role in the ladder -- a convergence-gated burn-in -- and that
+    # is what JointMaxLogLSearch supplies: a joint max-logL criterion
+    # spanning all its sub-moves, so the stage advances when they have
+    # JOINTLY plateaued. Hence `[GF_TIMING] stage=..._search move=psd_pe`,
+    # which reads oddly but is correct.
+    #
+    # (A `noise_search = [Move("psd_search"), Move("galfor_search")]` list
+    # used to sit here and was referenced by no stage -- removed 2026-09-08.
+    # `setup_recipe` still BUILDS psd_search/galfor_search stock moves for
+    # every present noise branch; this driver simply never requests them.)
     noise_pe = [Move("psd_pe", branch="psd"),
                 Move("galfor_pe", branch="galfor")]
     # VGBs are KNOWN sources: fixed-dimensional, no RJ, nothing to search
@@ -420,8 +531,47 @@ def build_fit():
     noise_vgb = [JointMaxLogLSearch(
         "noise_vgb_joint_search", ["psd_pe", "galfor_pe", "vgb_pe"],
         branch="psd")]
+    # The SAME joint move riding inside gb_search, with a per-propose cap
+    # on its inner rounds (GB_SEARCH_NOISE_ITERS_PER_STEP, default 2). It
+    # never plateaus for good there -- the GB residual moves every
+    # iteration -- so under the global 10-round budget it took ~6 rounds
+    # of 16 s per GB iteration (93 s, 15% of the iteration, 3mo job 473)
+    # to re-track a noise model whose epoch drift is 6e-7. Two rounds keep
+    # it tracking at a third of the cost; the standalone noise stages above
+    # are untouched. 0 = no cap (the old behaviour).
+    _gb_noise_cap = int(os.environ.get("GB_SEARCH_NOISE_ITERS_PER_STEP", "2"))
+    noise_vgb_gb = [JointMaxLogLSearch(
+        "noise_vgb_joint_search", ["psd_pe", "galfor_pe", "vgb_pe"],
+        branch="psd", iters_per_step=(_gb_noise_cap or None))]
+
+    def source_pe():
+        # Fresh Move descriptors per stage (never share one instance):
+        # the armed source PE moves, sobbh -> mbh -> emri (banking order).
+        return [Move(f"{br}_pe", branch=br)
+                for br, _env, _cls in _SOURCE_BRANCH_ENVS
+                if br in armed_sources]
 
     stages = []
+    if armed_sources:
+        # SOURCE SEARCH FIRST (campaign S6: "MBH search first, full_year
+        # pattern"): the armed source branches converge under ONE joint
+        # max-lnL criterion before anything else runs, so their (loud)
+        # power is out of the residual before the noise stages fit the
+        # PSD. They start near truth (*_START_FACTOR seeding), so this is
+        # a refinement loop, not a blind search. Afterwards they keep
+        # PE-sampling through gb_search and full_pe (live residual); they
+        # sit converged-and-subtracted during the noise stages.
+        _src_branch = next(br for br, _e, _c in _SOURCE_BRANCH_ENVS
+                           if br in armed_sources)
+        stages.append(Stage(
+            name="source_search", kind="search",
+            moves=[JointMaxLogLSearch(
+                "source_joint_search",
+                [f"{br}_pe" for br, _e, _c in _SOURCE_BRANCH_ENVS
+                 if br in armed_sources],
+                branch=_src_branch)],
+            combine_kwargs=dict(share_temperature_control=False),
+        ))
     if not _env_flag("STAGE_SKIP_NOISE"):
         stages.append(Stage(
             name="noise_search", kind="search", moves=noise_only,
@@ -479,7 +629,9 @@ def build_fit():
             # grid births (user ruling 2026-08-24); rj_replace (default
             # on) IMMEDIATELY AFTER them -- the exact-MH F-stat
             # replacement pass before the removal judge.
-            moves=noise_vgb + warm() + [
+            # Armed source PE moves ride between the noise joint search
+            # and the GB RJ cycle (sobbh -> mbh -> emri banking order).
+            moves=noise_vgb_gb + source_pe() + warm() + [
                 Move("rj_fstat_search", branch="gb"),
             ] + replace() + [
                 Move("rj_prior_removal", branch="gb"),
@@ -495,8 +647,12 @@ def build_fit():
             name="full_pe", kind="pe",
             # No rj_fstat_mcmc: the pe-named serial MCMC has the same
             # FD-kernel-on-WDM-data fstat scoring as its search twin.
-            # rj_fstat_pe + rj_prior_pe are the GB PE moves.
-            moves=noise_pe + [
+            # rj_fstat_pe + rj_prior_pe are the GB PE moves. Armed source
+            # PE moves follow the noise moves (the full_year composition:
+            # noise, then sobbh -> mbh -> emri, then gb).
+            # rj_warm_pe (when armed) runs IMMEDIATELY BEFORE rj_fstat_pe
+            # -- the PE mirror of the search-stage order.
+            moves=noise_pe + source_pe() + warm_pe() + [
                 Move("rj_fstat_pe", branch="gb"),
                 Move("rj_prior_pe", branch="gb"),
             ] + ([Move("gb_ridge_gibbs", branch="gb")]

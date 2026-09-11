@@ -757,6 +757,12 @@ export GB_TEMPER_VERTICAL=1
 # defaults to "band" whenever GB_TEMPER_VERTICAL=1; exported explicitly so
 # the log line [GB_VERT ...] order=band is unambiguous.
 export GB_TEMPER_CELL_ORDER=band
+# Joint noise+VGB max-lnL rider inside gb_search: cap its inner rounds per
+# GB iteration (2026-09-11; job 473 measured ~6 rounds x 16 s = 93 s/it,
+# 15% of the iteration, re-tracking a noise model that drifts 6e-7 per
+# epoch). 2 rounds = ~32 s/it. 0 = uncapped (the global
+# MAXLOGL_ITERS_PER_STEP budget). Consumed by run_combined_staged.py.
+export GB_SEARCH_NOISE_ITERS_PER_STEP=2
 # VERTICAL-SWAP CONTROL ARM (2026-09-10 forensics): accepted in-model vertical
 # rung swaps at the cold pair (T0-T1) jumped 334 -> 16,205 per 100-repeat block
 # at the 467 relaunch (1yr: 33 -> 1,156 -> 3,328), the largest discontinuity in
@@ -918,7 +924,14 @@ export FSTAT_SIGHET_MULTIDEV=1
 # buys mixing while PRESERVING accuracy; widening buys the same mixing by
 # SPENDING accuracy. Same reason GB_SIGHET_TRUST_PHASE_C stays at 0 here.
 export GB_SIGHET_REFRESH_EVERY=25
-export GB_SIGHET_REFRESH_DPHASE=0
+# 0.3 rad (2026-09-11, was 0 = refresh every drifted source): job 473
+# refreshed 89% of sources at every 25-repeat check (34 s/it) while the
+# end-of-block drift median was 0.55 rad over 100 repeats. Experiment A
+# (windowed stash, CPU): the sig-het error at 0.3 rad displacement is
+# ~2e-6 x SNR^2/2 = 0.03 lnL for SNR 184 -- under the 0.07 median cold
+# audit error. 0.3 is also the tightest trust-gate width, so a bright
+# source refreshes once it has walked one full gate.
+export GB_SIGHET_REFRESH_DPHASE=0.3
 # ALL RUNGS REFRESH (user ruling 2026-08-18). The default 0.1 keeps a stale
 # reference on everything hotter, justified in the code as "the ll error is
 # beta-suppressed". That reasoning covers the WITHIN-rung accept test, where
@@ -1787,7 +1800,14 @@ export GB_CELL_LABEL_DEFERRED=1
 # gpu_util_*.csv show a clear multi-GPU improvement. Requires ./install.sh
 # to have built the binary; without it the loaders degrade to the python
 # chain with a one-line warning (safe, just not faster).
-export GB_INMODEL_ACCEPT_KERNEL=0
+# 1 (2026-09-11, was 0): the fused gate/accept kernels replace ~110-150
+# array launches per repeat with 3 backend calls; decisions are documented
+# bit-identical to the python chain (tests/test_gb_inmodel_accept_kernel.py).
+# First production use -- verify on this run: in-model acceptance, the
+# [GB_CELL_LL] and sig-het audit lines, and the inmodel_accept/gate/prior
+# spans (~36 s/it on job 473) must all hold. GB_INMODEL_ACCEPT_KERNEL=0
+# restores the python chain.
+export GB_INMODEL_ACCEPT_KERNEL=1
 # ---- THE v8 EXPERIMENT: OBSERVABLE-BASIS IN-MODEL PROPOSAL ----------
 # Pinned EXPLICITLY even though it is now the code default, so this run
 # does not silently change meaning if the default is ever revisited, and

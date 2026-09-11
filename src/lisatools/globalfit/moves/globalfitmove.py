@@ -808,10 +808,21 @@ class MaxLogLCombineMove(GFCombineMove):
     """
 
     def __init__(
-        self, *args, num_checks: int = 5, max_iter: int = 0, tol: float = 5.0, **kwargs
+        self, *args, num_checks: int = 5, max_iter: int = 0, tol: float = 5.0,
+        iters_per_step=None, **kwargs
     ):
         super().__init__(*args, **kwargs)
         self.num_checks = int(num_checks)
+        # Per-instance cap on inner iterations per propose() call. ``None``
+        # defers to MAXLOGL_ITERS_PER_STEP (10). The joint noise move that
+        # rides along inside gb_search never reaches a lasting plateau (the
+        # GB residual moves every iteration, so it re-climbs each call) and
+        # was taking ~6 x 16 s rounds per GB iteration; the gb_search
+        # instance caps this at GB_SEARCH_NOISE_ITERS_PER_STEP (2026-09-11)
+        # while the standalone noise stages keep the full budget.
+        self.iters_per_step = (
+            None if iters_per_step is None else int(iters_per_step)
+        )
         # Absolute lnL units. The default is deliberately soft (a search
         # stage only needs the noise model roughly converged before the next
         # stage samples it in PE mode); MAXLOGL_TOL overrides, 0 restores
@@ -838,7 +849,12 @@ class MaxLogLCombineMove(GFCombineMove):
         # stage (the joint noise move rides along in gb_search), a plateaued
         # instance keeps taking one inner iteration per call, so the noise
         # model keeps sampling underneath.
-        max_inner = int(os.environ.get("MAXLOGL_ITERS_PER_STEP", "10"))
+        # getattr: test harnesses build this move without __init__.
+        _cap = getattr(self, "iters_per_step", None)
+        max_inner = (
+            int(os.environ.get("MAXLOGL_ITERS_PER_STEP", "10"))
+            if _cap is None else int(_cap)
+        )
         if not hasattr(self, "_ml_state"):
             self._ml_state = dict(
                 num_so_far=0,

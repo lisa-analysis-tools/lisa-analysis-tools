@@ -4590,6 +4590,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     sp.get("capped", 0), sp.get("snr", 0),
                     sp.get("kernel", 0), sp.get("deaths", 0),
                     sp.get("death_acc", 0))
+                _sn = float(sp.get("stale_n", 0.0))
+                if _sn > 0:
+                    # Geometric-mean detected/F-stat SNR ratio of the scored
+                    # births plus the tails; see the accumulation site.
+                    logger.info(
+                        "[GB_BIRTH_STALE %s] scored births %d: detected/"
+                        "F-stat SNR geo-mean %.3f; ratio < 0.5 (peak gone "
+                        "from the residual): %.1f%%; > 1.5: %.1f%%",
+                        self.name, int(_sn),
+                        float(np.exp(sp.get("stale_lnr_sum", 0.0) / _sn)),
+                        100.0 * sp.get("stale_lo", 0.0) / _sn,
+                        100.0 * sp.get("stale_hi", 0.0) / _sn)
                 self._rj_split = None
             # ---- GB_CAP_DIAG report (read-only) --------------------------
             # THE DECISIVE LINE. into_at_cap > 0 => the birth gate leaked
@@ -8889,6 +8901,35 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                  "deaths", "death_acc"), _vals,
             ):
                 _sp[_kname] = _sp.get(_kname, 0) + int(_v)
+            # BIRTH STALENESS (2026-09-11): detected SNR of each SCORED
+            # birth against the F-stat SNR of the peak it was drawn from
+            # (``ln_snr_b``, the centre-table value the SNR-truncated
+            # distance draw already uses). After amplitude maximisation
+            # ``h_h`` is the detected SNR^2, so the ratio is "how much of
+            # the peak is still in this walker's residual": ~1 = live peak,
+            # << 1 = already claimed (found and subtracted) and the scoring
+            # was wasted. Job 473 dropped 58% of scored births at the
+            # opt-SNR floor (788K of 1.35M per iteration, ~40 s/it): this
+            # says whether that is stale peaks (a refit-cadence /
+            # claimed-peak question) or an SNR calibration offset. Pure
+            # diagnostic, folded into the [GB_ACCEPT rj-split] line.
+            try:
+                if len(birth_k) and ln_snr_b is not None:
+                    _sc = keep[birth_k]
+                    if bool(_sc.any()):
+                        _det = xp.sqrt(xp.maximum(h_h[birth_k][_sc], 0.0))
+                        _rat = _det / xp.exp(xp.asarray(ln_snr_b)[_sc])
+                        _lr = xp.log(xp.maximum(_rat, 1e-12))
+                        _v3 = _to_numpy(xp.stack([
+                            _lr.sum(), _sc.sum(), (_rat < 0.5).sum(),
+                            (_rat > 1.5).sum()]))
+                        for _kname, _v in zip(
+                            ("stale_lnr_sum", "stale_n", "stale_lo",
+                             "stale_hi"), _v3):
+                            _sp[_kname] = _sp.get(_kname, 0.0) + float(_v)
+            except (NameError, TypeError, IndexError) as _e:
+                logger.debug("%s: birth staleness stat skipped: %r",
+                             self.name, _e)
 
         _mark("rj_accept")
         if bool(accept.any()):
