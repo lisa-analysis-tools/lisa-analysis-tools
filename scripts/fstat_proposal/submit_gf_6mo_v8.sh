@@ -37,6 +37,13 @@
 #      32768/65536 at half the per-slot/-cell cost -- 6mo slots are ~2x
 #      3mo bytes).
 #
+#   5. (2026-09-14, user ruling) GB OBSERVABLE + EIGENBASIS: this run is
+#      the 6mo GB eigenbasis test -- GB_INMODEL_OBSERVABLE_EIGEN=full
+#      combines the observable-basis step with the whitened information-
+#      matrix eigen table (see the block by GB_INMODEL_OBSERVABLE_SHEAR),
+#      and the warm-start refit proposal (change 1) rides along, rebuilt
+#      from the MOST RECENT 3mo run (the 10-walker science arm).
+#
 # V8-PARITY NOTES (deliberate divergences from the old 6mo_v1 draft --
 # the exact-copy rule wins for every non-Tobs knob): GB_USE_GALAXY_PRIOR
 # stays 1 (6mo_v1 had it 0, an 08-24 test-only ruling) and
@@ -62,10 +69,16 @@
 # ##   * W4 warm-start A/B: rj_warm_search acceptance healthy on a short   ##
 # ##     3-mo rewind before arming here.                                   ##
 # ##   * GB_WARM_START_COMPONENTS below must point at the REFEREED npz     ##
-# ##     fit from the FULL FINAL 3mo_v8 store (never the make_snapshots    ##
-# ##     tars -- their chain slabs are keep-window extracts):              ##
+# ##     fit from the FULL FINAL store of the MOST RECENT 3mo run -- the   ##
+# ##     10-WALKER science arm gf_prod_3mo_v8_10walkers (2026-09-14        ##
+# ##     ruling; never the make_snapshots tars -- their chain slabs are    ##
+# ##     keep-window extracts):                                            ##
 # ##       warmstart_fit_from_store.py --last-k 10 -> warmstart_match_    ##
 # ##       referee.py -> warmstart_referee_apply.py                        ##
+# ##   * GB OBSERVABLE+EIGEN (2026-09-14): first 6mo exposure of           ##
+# ##     GB_INMODEL_OBSERVABLE_EIGEN=full -- read the 3mo probe            ##
+# ##     (submit_gf_3mo_v8_10w_eigenaxis_probe.sh) first; empty knob =     ##
+# ##     bit-identical fallback. Tests: tests.test_gb_observable_eigen.    ##
 # ##   * EIGEN INNER MOVES (2026-09-08): first cluster exposure of the     ##
 # ##     EigenAxisMove defaults pinned below (sobbh per-walker tables,     ##
 # ##     mbh/emri max-lnL-walker tables). Requires Eryn dev >= the        ##
@@ -1673,6 +1686,30 @@ export GB_INMODEL_OBSERVABLE_MC_STEP=0.05
 # determinant 1 for ANY coefficient (verified for 0, T/2, 0.41T, T, -3T),
 # so a wrong value here costs acceptance and never correctness.
 export GB_INMODEL_OBSERVABLE_SHEAR=0.5
+# ---- COMBINED WITH THE EIGENBASIS (user ruling 2026-09-14: "GB in model
+# should always be observed basis. We should combine that with the
+# eigenbasis.") ------------------------------------------------------------
+# The step STAYS in observable z with the same log-Jacobian factors, but
+# instead of independent per-coordinate steps it draws along the eigen
+# table of each source's own information matrix congruenced into z (exact
+# chain rule through the transform -- no extra waveform calls) and
+# whitened by the analytic step scales above. "full" = the JOINT
+# correlated draw over all axes per repeat, the whitened shear-free modern
+# version of the legacy full-covariance infomat draw (the old proposal was
+# never diagonal -- user preference 2026-09-14); "axis" = one uniformly
+# picked eigen-axis per repeat is the one-knob alternative; empty/0
+# reverts to the independent per-coordinate draw BIT-IDENTICALLY, RNG
+# stream included. Rows without a table yet (fresh births before their
+# first infomat visit) silently take the diagonal draw -- by design.
+# GB_INMODEL_OBSERVABLE_EIGEN_SMAX (default 10.0) caps the whitened
+# sigmas. Watch the [GB_TIMING] span "infomat_obs_eigen" (the per-block
+# Gamma_z stash) and the obs_basis cold acceptance vs the 3mo arm's ~0.2.
+# The 3mo probe (submit_gf_3mo_v8_10w_eigenaxis_probe.sh) is the intended
+# FIRST exposure of this path -- read it before this run reaches
+# gb_search; launch with GB_INMODEL_OBSERVABLE_EIGEN= (explicitly empty)
+# to fall back if it reads badly.
+export GB_INMODEL_OBSERVABLE_EIGEN=${GB_INMODEL_OBSERVABLE_EIGEN-full}
+echo "[GB-OBS-EIGEN] GB_INMODEL_OBSERVABLE_EIGEN='${GB_INMODEL_OBSERVABLE_EIGEN}' (empty = diagonal draw)"
 # ---- AND THE F-STAT GRID IN THE SAME BASIS -------------------------
 # fdot becomes a FIRST-CLASS grid axis instead of the r = 0 manifold the
 # grid searches today. Measured in v7: 39.6% of low-f and 10.5% of high-f
@@ -1979,22 +2016,30 @@ export GB_ROUTER_THREADED=1
 # GB_RJ_PHASE_MAXIMIZE=1 exported above; run_swaps/leaf_cap_update stay
 # off (cycle invariants -- fstat_search owns tempering + cap counters).
 #
-# BUILD THE NPZ from the FULL FINAL 3mo_v8 store (NEVER the
+# BUILD THE NPZ from the MOST RECENT 3mo run (user ruling 2026-09-14:
+# the refit proposal rides the eigenbasis test and is based on the most
+# recent 3-month data run) -- that is the 10-WALKER SCIENCE arm this whole
+# file is rebased on (gf_prod_3mo_v8_10walkers, the GB_SCIENCE_465
+# relaunch of 2026-09-11, jobs 465->479 lineage), NOT the old 24-walker
+# gf_prod_3mo_v8 store. Use the FULL FINAL store h5 (NEVER the
 # make_snapshots tars -- their chain slabs are keep-window extracts and
 # the fitter would warn + fit on ~3 iterations):
 #   python scripts/gb/warmstart_fit_from_store.py \
-#       --store <...>/gf_prod_3mo_v8/gf_prod_3mo_testing.h5 \
-#       --last-k 10 --tobs 7776000 --out v8_last10.npz
+#       --store <...>/gf_prod_3mo_v8_10walkers/gf_prod_3mo_testing.h5 \
+#       --last-k 10 --tobs 7776000 --out v8_10w_last10.npz
 #   python scripts/gb/warmstart_match_referee.py \
-#       --npz v8_last10.npz --store <same h5>
-#   python scripts/gb/warmstart_referee_apply.py --fit v8_last10.npz \
-#       --referee v8_last10_referee.npz --out gf_prod_3mo_v8_refereed.npz
+#       --npz v8_10w_last10.npz --store <same h5>
+#   python scripts/gb/warmstart_referee_apply.py --fit v8_10w_last10.npz \
+#       --referee v8_10w_last10_referee.npz \
+#       --out gf_prod_3mo_v8_10w_refereed.npz
 # (the machinery was audited end-to-end on the v7 final store,
 # 2026-09-02: p-accounting exact, 93-95% of p>0.9 comps on real
 # sources, logpdf finite at every leaf under the production floor box.)
-# Explicitly-empty GB_WARM_START_COMPONENTS= runs WITHOUT the warm move
+# The preflight below REFUSES to start while the npz is missing, so the
+# refit proposal cannot silently drop out of the run; explicitly-empty
+# GB_WARM_START_COMPONENTS= is the only way to run WITHOUT the warm move
 # (stage lists bit-identical to 3mo_v8's).
-export GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS-/shared/data/global_fit_output/warmstart/gf_prod_3mo_v8_refereed.npz}
+export GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS-/shared/data/global_fit_output/warmstart/gf_prod_3mo_v8_10w_refereed.npz}
 if [ -n "${GB_WARM_START_COMPONENTS}" ] && [ ! -f "${GB_WARM_START_COMPONENTS}" ]; then
   echo "[WARMSTART] FATAL: GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS} does not exist."
   echo "[WARMSTART] Build it with the fit -> referee -> apply recipe in the comment above,"

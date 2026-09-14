@@ -1,32 +1,52 @@
 #!/bin/bash
 # ============================================================================
-# GB EIGEN-AXIS PROBE (2026-09-14, user: "we need to test the GBs as well
-# with the eigen axis"). EXACT COPY of submit_gf_3mo_v8_10walkers.sh with
-# ONE knob family flipped at the very end (the probe block just before the
-# launch line -- last export wins):
+# GB OBSERVABLE + EIGENBASIS PROBE (2026-09-14, user ruling: "GB in model
+# should always be observed basis. We should combine that with the
+# eigenbasis."). EXACT COPY of submit_gf_3mo_v8_10walkers.sh with ONE knob
+# added at the very end (the probe block just before the launch line --
+# last export wins):
 #
-#   GB_INMODEL_PROPOSAL=legacy + GB_INMODEL_EIGEN_AXIS=1
+#   GB_INMODEL_OBSERVABLE_EIGEN=full     (GB_INMODEL_PROPOSAL stays
+#                                         observable, the v8 default)
 #
-# i.e. the GB in-model proposal becomes the ONE-EIGEN-AXIS draw (each
-# source's own information matrix, fiber-projected, analytic shear ridge
-# installed as the last axis; one uniformly picked axis per repeat,
-# factors=0) instead of the v8 OBSERVABLE-basis proposal. Everything else
-# -- F-stat fdot grid, mirror, band staging, vertical swaps, tempering,
-# caps -- is byte-identical to the production 10-walker arm, so the A/B
-# baseline is the main 10w run itself.
+# i.e. the in-model step STAYS in the observable basis z = [lnA, f_mid,
+# fdot, phi0, cos_iota, psi, alpha, sin_delta, Mc] with the same
+# log-Jacobian factors -- but instead of INDEPENDENT per-coordinate steps
+# it draws along the eigen table of each source's own information matrix
+# congruenced into z (exact chain rule through the transform, no extra
+# waveform calls) and whitened by the analytic step scales. "full" is the
+# JOINT correlated draw over all axes per repeat -- the whitened, shear-
+# free modern version of the legacy full-covariance infomat draw (user's
+# preference; the old proposal was full-covariance too, never diagonal).
+# The alternative =axis draws ONE uniformly picked eigen-axis per repeat;
+# =0/unset is byte-identical to the production arm INCLUDING the RNG
+# stream. The fiber projection keeps every non-fiber axis exactly Mc-free
+# (GB_INMODEL_OBSERVABLE_FIBER_WEIGHT=0.0 rides along unchanged);
+# GB_INMODEL_OBSERVABLE_EIGEN_SMAX (default 10.0) caps the whitened
+# sigmas. Everything else -- F-stat fdot grid, mirror, band staging,
+# vertical swaps, tempering, caps -- is byte-identical to the production
+# 10-walker arm, so the A/B baseline is the main 10w run itself.
 #
-# FIRST EVER SAMPLING EXPOSURE of the eigen-axis path on GBs (it was
-# unit-tested against the real flagship information matrix but superseded
-# by the observable basis before any run armed it; the primitives now
-# live in eryn.moves.eigenaxis -- pull Eryn dev >= 02fd92a with LAT).
+# FIRST EVER SAMPLING EXPOSURE of the combined path (unit-tested on the
+# flagship information matrix, tests/test_gb_observable_eigen.py; the
+# eigen primitives live in eryn.moves.eigenaxis -- pull BOTH repos, Eryn
+# dev >= 02fd92a with LAT).
 #
 # FRESH STORE (gf_prod_3mo_v8_10w_eigenprobe). READ:
-#   * [GB_ACCEPT ...] in-model by proposal type -- expect "eigen_axis"
-#     (NOT obs_basis); cold acceptance vs the 10w arm's obs_basis ~0.2.
-#   * the per-axis acceptance census ([GB_EIGEN/axis] report lines) --
-#     the ridge axis (last column) is the one that must move fdot.
-#   * flagship-band diagnostics: does the 20.38 mHz source walk its
-#     ridge (the observable arm solved it in ~10 iterations)?
+#   * [GB_ACCEPT ...] in-model by proposal type -- still "obs_basis"
+#     (the eigen table changes the draw INSIDE the observable proposal);
+#     cold acceptance vs the 10w arm's obs_basis ~0.2. Higher at equal
+#     step size = the correlations are doing work.
+#   * [GB_TIMING ...] span "infomat_obs_eigen" -- the per-block stash of
+#     Gamma_z (central-difference M = dx/dz + einsum); should be a small
+#     fraction of the existing infomat span.
+#   * [GB_OBS_BASIS ...] motion lines -- mean |dln_fdot| / |df_mid| in
+#     bins: the eigen draw should move fdot at least as well as the
+#     diagonal draw did.
+#   * NaN table rows fall back to the diagonal draw silently BY DESIGN
+#     (fresh births before their first infomat visit); a persistent
+#     all-diagonal run means the stash gate never armed -- check that
+#     GB_INMODEL_PROPOSAL=observable was not overridden.
 # KNOWN LIMITATION (recorded in code, deferred 2026-08-31): no interval
 # REFLECTION for cos_iota / sin_delta -- out-of-range steps just reject.
 # Costs acceptance on near-edge sources, never correctness.
@@ -2400,10 +2420,19 @@ fi
 # ============================================================================
 # THE PROBE KNOBS (the whole diff vs the 10-walker arm; placed LAST so no
 # earlier block can override them).
+#
+# GB_INMODEL_PROPOSAL=observable is already exported by the production block
+# above (it is the v8 default); re-exported here so the probe's contract
+# survives any future edit of that block. The ONE real diff is the eigen
+# mode: "full" = joint correlated draw over the whitened eigen table each
+# repeat (the modern full-covariance draw, user preference 2026-09-14);
+# "axis" = one eigen-axis per repeat is the one-knob alternative if full
+# reads poorly; unset/0 reverts to the production diagonal draw
+# bit-identically, RNG stream included.
 # ============================================================================
-export GB_INMODEL_PROPOSAL=legacy
-export GB_INMODEL_EIGEN_AXIS=1
-echo "[EIGEN-PROBE] GB in-model proposal = legacy + eigen-axis draw"
+export GB_INMODEL_PROPOSAL=observable
+export GB_INMODEL_OBSERVABLE_EIGEN=full
+echo "[EIGEN-PROBE] GB in-model proposal = observable + eigenbasis (mode=${GB_INMODEL_OBSERVABLE_EIGEN})"
 
 mpiexec -n 3 python scripts/fstat_proposal/run_combined_staged.py
 # python scripts/fstat_proposal/run_combined_staged.py   # single-process fallback

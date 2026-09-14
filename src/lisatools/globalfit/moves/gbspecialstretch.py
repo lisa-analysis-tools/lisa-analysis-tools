@@ -1201,6 +1201,41 @@ def _observable_knob(name, default):
         return float(default)
 
 
+def _observable_eigen_mode() -> str:
+    """``GB_INMODEL_OBSERVABLE_EIGEN``: observable basis + EIGENBASIS.
+
+    User ruling 2026-09-14: "GB in model should always be observed basis.
+    We should combine that with the eigenbasis." The step stays a
+    SYMMETRIC draw in the internal observable coordinates z -- ``factors``
+    remain exactly the observable log-Jacobian -- but the draw directions
+    become the eigenvectors of the information matrix congruenced into z
+    and whitened by the analytic step scales. A diagonal ``Gamma_z``
+    therefore reduces the combined proposal to the current per-coordinate
+    draw; what the eigenbasis ADDS is the residual correlations (the
+    extrinsic block -- the measured coordinates are already
+    principal-axis-aligned by the basis itself: the shear lives in
+    ``f_mid`` and the fiber IS the ``Mc`` axis, which is projected out
+    exactly).
+
+    ``0`` / ``off`` (default): the current diagonal draw, bit-identical
+    (RNG stream included). ``full``: one joint correlated step across all
+    axes per repeat -- the modern, whitened version of the legacy
+    full-covariance draw, all coordinates moving per repeat like today.
+    ``1`` / ``axis``: ONE whitened eigen-axis per repeat.
+    """
+    raw = os.environ.get("GB_INMODEL_OBSERVABLE_EIGEN", "0").strip().lower()
+    if raw in ("", "0", "off"):
+        return "off"
+    if raw in ("1", "axis"):
+        return "axis"
+    if raw == "full":
+        return "full"
+    logger.warning(
+        "GB_INMODEL_OBSERVABLE_EIGEN=%r not recognized (0/off, 1/axis, "
+        "full); using 'off'", raw)
+    return "off"
+
+
 def gb_fiber_tangent(coords, dist_col, mc_col, r_col):
     """Unit tangent of the EXACT ``(dist, Mc, r)`` likelihood fiber.
 
@@ -10559,6 +10594,89 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             jump=_observable_knob("GB_INMODEL_OBSERVABLE_JUMP", 1.0),
         )
 
+    def _observable_stash_gamma_z(self, info_y, coords, s, ids, n_src):
+        """Information matrix congruenced into the OBSERVABLE basis z.
+
+        ``Gamma_z = M^T Gamma_x M`` with ``M = dx/dz`` (the
+        ``from_internal`` Jacobian -- pure transform algebra, no waveform,
+        so none of the grid-quantization hazards of engine-side
+        derivatives) and ``Gamma_x = diag(1/s) info_y diag(1/s)`` undoing
+        the fdot conditioning of the y congruence. Scattered by SOURCE ID
+        like the rho snapshot; consumed once per block by
+        :meth:`_observable_eigen_prepare`.
+        """
+        xp = self.xp
+        m = self._observable_map()
+        n, ndim = coords.shape
+        z = m.to_internal(coords)
+        # Per-column central-difference steps: relative, with per-column
+        # ABSOLUTE floors (the fdot column lives at ~1e-16; the angle
+        # columns are pure passthrough in both maps, so a tiny h is exact
+        # there). The chain-rule invariance test in
+        # tests/test_gb_observable_eigen.py is the guard on these choices.
+        floors = xp.asarray([1e-1, 1e-6, 1e-22, 1e-3, 1e-3, 1e-3, 1e-3,
+                             1e-3, 1e-3])[:ndim]
+        M = xp.zeros((n, ndim, ndim))
+        for i in range(ndim):
+            h = 1e-6 * xp.maximum(xp.abs(z[:, i]), floors[i])
+            up = z.copy()
+            dn = z.copy()
+            up[:, i] = up[:, i] + h
+            dn[:, i] = dn[:, i] - h
+            dx = (xp.asarray(m.from_internal(up, template=coords))
+                  - xp.asarray(m.from_internal(dn, template=coords)))
+            M[:, :, i] = dx / (2.0 * h)[:, None]
+        s_inv = 1.0 / xp.asarray(s).ravel()
+        gamma_x = info_y * s_inv[None, :, None] * s_inv[None, None, :]
+        gamma_z = xp.einsum("nai,nab,nbj->nij", M, gamma_x, M)
+        store = getattr(self, "_obs_gamma_z", None)
+        if (store is None or int(store.shape[0]) != int(n_src)
+                or int(store.shape[-1]) != int(ndim)):
+            store = xp.full((int(n_src), ndim, ndim), xp.nan)
+        store[xp.asarray(ids).ravel()] = gamma_z
+        self._obs_gamma_z = store
+
+    def _observable_eigen_prepare(self, chol, ids, n_src):
+        """Once-per-block eigen table in z, frozen across the repeats.
+
+        Whiten ``Gamma_z`` by the SAME step scales the diagonal path
+        uses (so a diagonal matrix reproduces the diagonal proposal
+        exactly), eigen-decompose with the Mc fiber projected out EXACTLY
+        (``t_fiber = e_Mc`` -- the analytic manifold is a coordinate axis
+        in this basis), cap the whitened widths, and un-whiten. The table
+        column k is ``sigma_k * a_k`` in z units. Frozen for the block =>
+        the draw stays symmetric and ``factors`` stay the plain
+        observable log-Jacobian.
+        """
+        xp = self.xp
+        gz_store = getattr(self, "_obs_gamma_z", None)
+        if gz_store is None:
+            return
+        m = self._observable_map()
+        ids_x = xp.asarray(ids).ravel()
+        gz = gz_store[ids_x]
+        ndim = int(gz.shape[-1])
+        ok = xp.isfinite(gz.reshape(gz.shape[0], -1)).all(axis=1)
+        w = xp.asarray(self._observable_step_scales(chol, ids, ndim))
+        gw = gz * w[:, :, None] * w[:, None, :]
+        gw = xp.where(ok[:, None, None], gw,
+                      xp.broadcast_to(xp.eye(ndim), gw.shape))
+        t_fiber = xp.zeros((int(gw.shape[0]), ndim))
+        t_fiber[:, m.FIBER_INDEX] = 1.0
+        smax = _observable_knob("GB_INMODEL_OBSERVABLE_EIGEN_SMAX", 10.0)
+        axes_w, sig_w = _eigen_axis_set_generic(
+            gw, t_fiber=t_fiber, sigma_max=smax)
+        # table column = sigma_z_k * axis_z_k; the normalize/rescale of the
+        # un-whitening cancels in the product: w*a_w*sigma_w exactly.
+        table = (w[:, :, None] * axes_w) * sig_w[:, None, :]
+        store = getattr(self, "_obs_eigen_table", None)
+        if (store is None or int(store.shape[0]) != int(n_src)
+                or int(store.shape[-1]) != int(ndim)):
+            store = xp.full((int(n_src), ndim, ndim), xp.nan)
+        store[ids_x] = xp.where(ok[:, None, None], table,
+                                xp.full_like(table, xp.nan))
+        self._obs_eigen_table = store
+
     def _observable_proposal(self, coords, chol, source_ids):
         """One composite observable step. ``(new_coords, factors)``.
 
@@ -10578,11 +10696,50 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         z = m.to_internal(coords)
         scales = self._observable_step_scales(chol, source_ids,
                                               int(coords.shape[1]))
-        dz = xp.asarray(xp.random.randn(*z.shape)) * scales
+        # OBSERVABLE + EIGENBASIS (GB_INMODEL_OBSERVABLE_EIGEN, user ruling
+        # 2026-09-14): draw along the block-frozen eigen table in z when a
+        # row has one; rows without a table (or knob off) take the diagonal
+        # draw below, byte-identical to the pre-eigen path INCLUDING the
+        # RNG stream (the off branch executes exactly the old statements).
+        dz = None
+        _mode = _observable_eigen_mode()
+        if _mode != "off":
+            _tab_store = getattr(self, "_obs_eigen_table", None)
+            if _tab_store is not None:
+                _ids_x = xp.asarray(source_ids).ravel()
+                T = _tab_store[_ids_x]
+                nrow, ndim_z = z.shape
+                ok = xp.isfinite(T.reshape(int(nrow), -1)).all(axis=1)
+                if bool(ok.any()):
+                    _fw = _observable_knob(
+                        "GB_INMODEL_OBSERVABLE_FIBER_WEIGHT", 0.0)
+                    T_safe = xp.where(ok[:, None, None], T,
+                                      xp.zeros_like(T))
+                    if _mode == "axis":
+                        # the LAST table column is the pure-fiber axis
+                        # (prepare sorts it there); drop it from the picks
+                        # when the fiber weight is 0
+                        naxes = int(ndim_z) - (1 if _fw == 0.0 else 0)
+                        pick = xp.asarray(
+                            np.random.randint(0, naxes, size=int(nrow)))
+                        _zz = xp.asarray(xp.random.randn(int(nrow)))
+                        dz_e = (T_safe[xp.arange(int(nrow)), :, pick]
+                                * _zz[:, None])
+                    else:  # "full": joint correlated step, all axes
+                        _rnd = xp.asarray(
+                            xp.random.randn(int(nrow), int(ndim_z)))
+                        dz_e = xp.einsum("nij,nj->ni", T_safe, _rnd)
+                    dz_diag = xp.asarray(
+                        xp.random.randn(*z.shape)) * scales
+                    dz = xp.where(ok[:, None], dz_e, dz_diag)
+        if dz is None:
+            dz = xp.asarray(xp.random.randn(*z.shape)) * scales
         # Fiber weight defaults to 0.0 at first arming: the change under
         # test is the 8-observable step, and ``gb_ridge_gibbs`` already
         # supplies fiber mixing on the main state for free. Independent
-        # A/B rather than a coupled one.
+        # A/B rather than a coupled one. (On the eigen path the non-fiber
+        # axes are exactly Mc-free by the fiber projection, so this
+        # multiplier only guards the last-axis / full-mode Mc component.)
         dz[:, m.FIBER_INDEX] = dz[:, m.FIBER_INDEX] * _observable_knob(
             "GB_INMODEL_OBSERVABLE_FIBER_WEIGHT", 0.0)
         new = m.from_internal(z + dz, template=coords)
@@ -10688,6 +10845,17 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             J = self._infomat_jacobian(coords, _test_inds, s)
 
         info_y = xp.einsum("nai,nab,nbj->nij", J, info_phys, J)
+
+        # OBSERVABLE + EIGENBASIS: pull the same information matrix into
+        # the internal observable basis while it is in hand (a from_internal
+        # Jacobian + one einsum -- no extra engine work). Consumed once per
+        # block by _observable_eigen_prepare at the rho-snapshot point.
+        if (_observable_eigen_mode() != "off"
+                and self._observable_basis_ready()):
+            with _tspan(_tm, "infomat_obs_eigen"):
+                self._observable_stash_gamma_z(
+                    info_y, coords, s, ids,
+                    int(band_sorter.inds.shape[0]))
 
         # Opt-in only (perf, 2026-08-15): this sat INSIDE the per-block
         # info-matrix path, so every in-model block paid a full CuPy pool
@@ -12798,6 +12966,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         if self._observable_basis_ready():
             self._observable_rho_snapshot(
                 buffer_obj, ids, int(band_sorter.inds.shape[0]))
+            # OBSERVABLE + EIGENBASIS: build the block-frozen eigen table
+            # HERE -- after the rho snapshot (the whitening scales need it)
+            # and never inside the repeat loop (the freeze is what keeps
+            # the draw symmetric and factors = Jacobian only).
+            if _observable_eigen_mode() != "off":
+                self._observable_eigen_prepare(
+                    chol, ids, int(band_sorter.inds.shape[0]))
 
         # Per-source SNR-scaled amplitude gate (see the ctor comment):
         # snr_ref = sqrt(h_h) at the anchor, stashed by the ll_ref
