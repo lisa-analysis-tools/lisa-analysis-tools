@@ -201,6 +201,29 @@ class RemoveBranchesWiringTest(unittest.TestCase):
         fit = _build_fit()
         self.assertEqual(fit.general.source_types, ("NOISE", "GB", "VGB"))
 
+    def test_synthetic_interim_no_vgb_composition(self):
+        # the 6mo_v8_nogb SYNTHETIC interim (user 2026-09-14): vgb sits out
+        # too (all_sources synthetic has no VGB stream), and the redundant
+        # noise_vgb_search stage drops with it
+        os.environ.update(ALL_IDS)
+        os.environ["REMOVE_BRANCHES"] = "gb,galfor,vgb"
+        os.environ["DATA_MODE"] = "synthetic"
+        try:
+            fit = _build_fit()
+        finally:
+            os.environ.pop("DATA_MODE", None)
+        for b in ("gb", "galfor", "vgb"):
+            self.assertNotIn(b, fit.branches)
+        self.assertEqual(
+            [st.name for st in fit.recipe.stages],
+            ["source_search", "noise_search", "full_pe"])
+        self.assertEqual(
+            self._stages(fit)["full_pe"],
+            ["psd_pe", "sobbh_pe", "mbh_pe", "emri_pe"])
+        self.assertEqual(
+            fit.general.source_types,
+            ("NOISE", "SOBHB", "MBHB", "EMRI"))
+
     def test_unknown_or_anchor_branch_rejected(self):
         for bad in ("psd", "nonsense"):
             os.environ["REMOVE_BRANCHES"] = bad

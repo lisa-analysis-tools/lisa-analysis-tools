@@ -2051,10 +2051,37 @@ export GB_WARM_START_CIRC_IMAGES=${GB_WARM_START_CIRC_IMAGES:-3}
 # Drop the gb + galfor BRANCHES (driver REMOVE_BRANCHES support,
 # tests/test_staged_sources_wiring.py::RemoveBranchesWiringTest) and pin the
 # injection WITHOUT the galaxy stream. psd stays (instrument noise is still
-# fit); VGBs stay (known sources, separate vgb stream); the armed source
-# classes below stay.
-export REMOVE_BRANCHES=gb,galfor
-export SOURCE_TYPES=NOISE,VGB,SOBHB,MBHB,EMRI
+# fit); the armed source classes below stay.
+#
+# DATA MODE (user 2026-09-14: "can we use synthetic data ... I am still
+# transferring things to the cluster"). Default = synthetic until the
+# mojito transfer completes; NOGB_DATA=mojito sbatch ... (or flip the
+# default) restores the real-data configuration.
+NOGB_DATA=${NOGB_DATA:-synthetic}
+if [ "${NOGB_DATA}" = "synthetic" ]; then
+  export DATA_MODE=synthetic
+  # VGB SITS OUT of the synthetic interim: all_sources' synthetic
+  # composition has NO VGB stream (the vgb variant's synthetic injection
+  # reads the catalogue file via MOJITO_DATA_PATH), and PE-fitting 55
+  # UNINJECTED sources would poison the residual. Restored in mojito mode.
+  export REMOVE_BRANCHES=gb,galfor,vgb
+  export SOURCE_TYPES=NOISE,SOBHB,MBHB,EMRI
+  # synthetic carries no link-delay table -- UNEQUAL_ARM=1 is refused
+  # loudly (all_sources adjust): force the equal-arm instrument model.
+  # (Overrides the v8 noise block's export above; python sees this value.)
+  export UNEQUAL_ARM=0
+  echo "[NOGB-DATA] SYNTHETIC interim: UNEQUAL_ARM forced 0 (no delay"
+  echo "[NOGB-DATA] table), vgb removed (no synthetic VGB stream), mojito"
+  echo "[NOGB-DATA] preflights skipped. NOTE the *_IDS lists below set the"
+  echo "[NOGB-DATA] synthetic injection COUNTS (stock tables, same seed on"
+  echo "[NOGB-DATA] data + branch side => residual nulls at start); they"
+  echo "[NOGB-DATA] are NOT mojito catalogue systems in this mode."
+else
+  export DATA_MODE=mojito
+  # VGBs stay in mojito mode (known sources, separate vgb stream).
+  export REMOVE_BRANCHES=gb,galfor
+  export SOURCE_TYPES=NOISE,VGB,SOBHB,MBHB,EMRI
+fi
 export MBHB_IDS=2,5,16,18          # t_c 173.3 / 104.7 / 111.4 / 92.0 d
 export EMRI_IDS=0,1,2,3,4,5,6,7    # all 8 -- S4 census may trim
 export SOBHB_IDS=0,1,2,3,4,5       # all 6 -- expected mostly sub-threshold
@@ -2227,6 +2254,9 @@ fi
 #   * an existing store must have been sampled under THIS noise identity
 #     (the run.py resume guard is authoritative; this is the cheap copy).
 # ============================================================================
+if [ "${DATA_MODE}" = "synthetic" ]; then
+  echo "[NOGB-DATA] synthetic: skipping the mojito NOISE-brick/modulation preflight."
+else
 python - "${GALFOR_MODULATION_PATH}" "${MOJITO_DATA_PATH}" "${NOISE_FILE:-}"   "${STORE_DIR}/${BASE_FILE_NAME}_testing.h5" "${WDM_PSD_METHOD}" <<'PYEOF' || exit 2
 import glob, os, sys
 import h5py
@@ -2278,6 +2308,7 @@ if os.path.exists(store):
             raise SystemExit(2)
         print(f"[V8-NOISE] resume identity OK: {a}")
 PYEOF
+fi
 
 # ============================================================================
 # SOURCES PREFLIGHT (6mo_v8). Hard-check the mojito bricks for every armed
@@ -2287,6 +2318,9 @@ PYEOF
 # loud raise at build remains the authoritative per-ID gate; this catches
 # the whole-class-missing case in seconds.
 # ============================================================================
+if [ "${DATA_MODE}" = "synthetic" ]; then
+  echo "[NOGB-DATA] synthetic: skipping the mojito source-ids preflight (ids = stock counts)."
+else
 python - "${MOJITO_DATA_PATH}" "${MBHB_IDS:-}" "${EMRI_IDS:-}" "${SOBHB_IDS:-}" <<'PYEOF' || exit 2
 import glob, os, sys
 mojito, mbhb, emri, sobhb = sys.argv[1:5]
@@ -2309,6 +2343,7 @@ if bad:
     raise SystemExit(2)
 print("[SOURCES] preflight OK.")
 PYEOF
+fi
 
 mpiexec -n 3 python scripts/fstat_proposal/run_combined_staged.py
 # python scripts/fstat_proposal/run_combined_staged.py   # single-process fallback
