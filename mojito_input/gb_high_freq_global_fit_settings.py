@@ -10,18 +10,21 @@ import logging
 try:
     import cupy as cp
 
-    gpu_available = True
+    gpu_available = bool(cp.cuda.is_available())
+    if not gpu_available:
+        import numpy as cp
 except (ModuleNotFoundError, ImportError) as e:
     import numpy as cp
 
     gpu_available = False
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from lisatools.detector import L1Orbits
-from lisatools.domains import FDSettings, STFTSettings, WDMSettings
+from lisatools.domains import FDSettings, STFTSettings, WDMSettings, DomainSettingsBase
 from lisatools.domaincomputation import DomainComputationGroupArray
 from lisatools.utils.constants import *
+from lisatools.sensitivity import XYZSensitivityBackend
 from eryn.state import BranchSupplemental
 from lisatools.globalfit.run import CurrentInfoGlobalFit
 from lisatools.globalfit.stock.erebor import PSDSetup, PSDSettings, MBHSetup, MBHSettings, GBSetup, GBSettings, get_fdot_mojito
@@ -58,6 +61,10 @@ from lisatools.globalfit.postprocessing import (
     SourceMetadata
 )
 
+from gbgpu.gbcomps import STFTGBComputations
+from lisatools.globalfit.moves.gbdebug import GBDebugSettings
+from lisatools.globalfit.moves.gbspecialmove import GBSigHetSettings, GBLeafCapSettings
+
 if TYPE_CHECKING:
     from lisatools.globalfit.recipe import Recipe
     from lisatools.analysiscontainer import AnalysisContainerArray
@@ -86,85 +93,100 @@ def setup_recipe(
     state
 ):
     general_info = curr.general_info
+    assert general_info.nwalkers and general_info.ntemps, "nwalkers and ntemps must be set in general_info"
     nwalkers: int = general_info.nwalkers
     ntemps: int = general_info.ntemps
+    
     if gpu_available:
-        cp.cuda.runtime.setDevice(curr.general_info.gpus[0])
-
+        gpus = general_info.gpus
+        assert gpus is not None and len(gpus) > 0, "No GPUs specified in general_info.gpus"
+        getattr(cp, "cuda").runtime.setDevice(gpus[0])
+        
     #* =============================== INJECT SOURCES =================================
-    # Sampling basis: ``[logA, f0 [mHz], fdot, phi0, cos_iota, psi, lam, sin_beta]``
-    spread_gb = np.array([1e-9, 1e-11, 1e-17, 1e-9, 1e-9, 1e-9, 1e-9, 1e-9])
-    # iteratively_resolved_population = np.load("iteratively_resolved_gbs_075yrs_snr7.npy")
-    # subset_inds = np.array([int(name.split('_')[1]) for name in iteratively_resolved_population["Name"]])
-    subset_inds = None
-    # setup_state_for_injection(curr, state, "GB", "gb", spread=spread_gb, subset_inds=subset_inds)
+    # Sampling basis: ``[logA, f0 [mHz], fdot, phi0, cos_iota, psi, alpha, sin_delta]``
+    spread_gb = 0.0 
+    
+    data_input_path = str(general_info.input_data_link)
+    iteratively_resolved_population_path = os.path.join(data_input_path + "/catalogues", "iteratively_resolved_gbs_075yrs_snr7.npy")
+    iteratively_resolved_population = np.load(iteratively_resolved_population_path, allow_pickle=True)
 
-    #* ============== Chunked-heterodyne (WDM) GB likelihood ==============
-    # When the run domain is WDM, the GB branch uses the chunked-het
-    # likelihood (``gb_wdm_het.GBWDMHeterodyne``). Built lazily here, not on
-    # the settings dataclass: ``CurrentInfoGlobalFit.__init__`` deepcopies
-    # the settings tree and the underlying C++ orbit wrap is not picklable.
-    # ``N_cp_sig=48`` / ``N_cp_orbit=32`` are the validated defaults
-    # (median mm5 ~1e-9; see sprint-root CLAUDE.md). Mirrors the
-    # ``gb_and_foreground_global_fit_settings.py`` wiring.
-    gb_info = curr.source_info["gb"]
-    if (
-        isinstance(general_info.domain_settings, WDMSettings)
-        and gb_info.gb_wdm_comp is None
-    ):
-        _gb_wdm_het_dir = os.path.abspath(
-            os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "..", "scripts", "gb_chunked_het",
-            )
-        )
-        if _gb_wdm_het_dir not in sys.path:
-            sys.path.insert(0, _gb_wdm_het_dir)
-        from gb_wdm_het import GBWDMHeterodyne
+    frequencies = iteratively_resolved_population["Frequency"]
+    in_band = (frequencies > curr.source_info["gb"].f0_lims[0]) & (frequencies < curr.source_info["gb"].f0_lims[1])
+    iteratively_resolved_population = iteratively_resolved_population[in_band]
+    logger.info(f"Keeping {np.sum(in_band)} out of {len(iteratively_resolved_population)} iteratively resolved GB sources within the band limits {curr.source_info['gb'].f0_lims[0]} - {curr.source_info['gb'].f0_lims[1]}")
+    
+    subset_inds = np.array([int(name.split('_')[1]) for name in iteratively_resolved_population["Name"]])
+    logger.info(f"Injecting {len(subset_inds)} GB sources from iteratively resolved population.")
+    
+    # subset_inds = None
+    setup_state_for_injection(curr, state, "GB", "gb", spread=spread_gb, subset_inds=subset_inds, priors=priors)
+    
+        
+    # #* ============== Chunked-heterodyne (WDM) GB likelihood ==============
+    # # When the run domain is WDM, the GB branch uses the chunked-het
+    # # likelihood (``gb_wdm_het.GBWDMHeterodyne``). Built lazily here, not on
+    # # the settings dataclass: ``CurrentInfoGlobalFit.__init__`` deepcopies
+    # # the settings tree and the underlying C++ orbit wrap is not picklable.
+    # # ``N_cp_sig=48`` / ``N_cp_orbit=32`` are the validated defaults
+    # # (median mm5 ~1e-9; see sprint-root CLAUDE.md). Mirrors the
+    # # ``gb_and_foreground_global_fit_settings.py`` wiring.
+    # gb_info = curr.source_info["gb"]
+    # if (
+    #     isinstance(general_info.domain_settings, WDMSettings)
+    #     and gb_info.gb_wdm_comp is None
+    # ):
+    #     _gb_wdm_het_dir = os.path.abspath(
+    #         os.path.join(
+    #             os.path.dirname(os.path.abspath(__file__)),
+    #             "..", "scripts", "gb_chunked_het",
+    #         )
+    #     )
+    #     if _gb_wdm_het_dir not in sys.path:
+    #         sys.path.insert(0, _gb_wdm_het_dir)
+    #     from gb_wdm_het import GBWDMHeterodyne
 
-        _wdm = general_info.domain_settings
-        # Anchor the chunked-het grid at the runtime data start
-        # (``times[0]`` after the preprocess trim), not at 0.
-        _t_obs_start = float(getattr(general_info, "data_t0", 0.0))
-        _jax_chunk_env = os.environ.get("CHUNKED_JAX_CHUNK")
-        _jax_chunk = int(_jax_chunk_env) if _jax_chunk_env else None
-        gb_info.gb_wdm_comp = GBWDMHeterodyne(
-            Nf=_wdm.Nf, Nt=_wdm.Nt, dt=general_info.dt,
-            T_full=general_info.Tobs, t_ref_full=gb_info.t0,
-            Nt_sub=int(os.environ.get("CHUNKED_NT_SUB", 256)),
-            n_pad=int(os.environ.get("CHUNKED_N_PAD", 32)),
-            N_sparse=int(os.environ.get("CHUNKED_N_SPARSE", 256)),
-            nchannels=3,
-            force_backend=general_info.force_backend,
-            tdi_gen="2nd generation",
-            orbits=general_info.gpu_orbits,
-            t_obs_start=_t_obs_start,
-            N_cp_sig=int(os.environ.get("CHUNKED_N_CP_SIG", 48)),
-            N_cp_orbit=int(os.environ.get("CHUNKED_N_CP_ORBIT", 32)),
-            jax_chunk=_jax_chunk,
-        )
-        logger.info(
-            "Chunked-het GB likelihood: Nf=%d Nt=%d Nt_sub=%d N_sparse=%d "
-            "N_cp_sig=%d N_cp_orbit=%d (t_obs_start=%.3e t_ref=%.3e)",
-            _wdm.Nf, _wdm.Nt,
-            gb_info.gb_wdm_comp.Nt_sub, gb_info.gb_wdm_comp.N_sparse,
-            gb_info.gb_wdm_comp.N_cp_sig, gb_info.gb_wdm_comp.N_cp_orbit,
-            _t_obs_start, gb_info.t0,
-        )
+    #     _wdm = general_info.domain_settings
+    #     # Anchor the chunked-het grid at the runtime data start
+    #     # (``times[0]`` after the preprocess trim), not at 0.
+    #     _t_obs_start = float(getattr(general_info, "data_t0", 0.0))
+    #     _jax_chunk_env = os.environ.get("CHUNKED_JAX_CHUNK")
+    #     _jax_chunk = int(_jax_chunk_env) if _jax_chunk_env else None
+    #     gb_info.gb_wdm_comp = GBWDMHeterodyne(
+    #         Nf=_wdm.Nf, Nt=_wdm.Nt, dt=general_info.dt,
+    #         T_full=general_info.Tobs, t_ref_full=gb_info.t0,
+    #         Nt_sub=int(os.environ.get("CHUNKED_NT_SUB", 256)),
+    #         n_pad=int(os.environ.get("CHUNKED_N_PAD", 32)),
+    #         N_sparse=int(os.environ.get("CHUNKED_N_SPARSE", 256)),
+    #         nchannels=3,
+    #         force_backend=general_info.force_backend,
+    #         tdi_gen="2nd generation",
+    #         orbits=general_info.gpu_orbits,
+    #         t_obs_start=_t_obs_start,
+    #         N_cp_sig=int(os.environ.get("CHUNKED_N_CP_SIG", 48)),
+    #         N_cp_orbit=int(os.environ.get("CHUNKED_N_CP_ORBIT", 32)),
+    #         jax_chunk=_jax_chunk,
+    #     )
+    #     logger.info(
+    #         "Chunked-het GB likelihood: Nf=%d Nt=%d Nt_sub=%d N_sparse=%d "
+    #         "N_cp_sig=%d N_cp_orbit=%d (t_obs_start=%.3e t_ref=%.3e)",
+    #         _wdm.Nf, _wdm.Nt,
+    #         gb_info.gb_wdm_comp.Nt_sub, gb_info.gb_wdm_comp.N_sparse,
+    #         gb_info.gb_wdm_comp.N_cp_sig, gb_info.gb_wdm_comp.N_cp_orbit,
+    #         _t_obs_start, gb_info.t0,
+    #     )
 
     #* ================================= BUILD MOVES ==================================
-    gb_search_moves, gb_pe_moves = build_gb_moves(
+    _, gb_pe_moves = build_gb_moves(
         engine_info, curr, acs, priors, state
     )
 
     #* ================================= SETUP SEARCH ================================= 
-    search_weights = [0.8, 0.2]
-    recipe.add_recipe_component(RJRecipeStep(moves=gb_search_moves, weights=search_weights, convergence_iter=10), name="gb search")
+    # search_weights = [0.8, 0.2]
+    # recipe.add_recipe_component(RJRecipeStep(moves=gb_search_moves, weights=search_weights, convergence_iter=10), name="gb search")
     
     #* ========================== SETUP PARAMETER ESTIMATION ========================== 
-    all_pe_moves = gb_pe_moves 
-    pe_weights = [0.8, 0.16, 0.04] # [0.05, 0.45, 0.5] # 
-    recipe.add_recipe_component(PERecipeStep(moves=all_pe_moves, weights=pe_weights, thin_by=1, convergence_iter=500), name="gb_pe")
+    pe_weights = None # [0.8, 0.16, 0.04] # [0.05, 0.45, 0.5] # 
+    recipe.add_recipe_component(PERecipeStep(moves=gb_pe_moves, weights=pe_weights), name="gb_pe")
     
     # moves_info = "".join([f"Move {all_pe_moves[i].name} has weight {w}, " for i, w in enumerate(pe_weights)])
     # logger.info(f"For PE: {moves_info}")
@@ -196,9 +218,8 @@ def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMe
     delta_lims = [-np.pi / 2.0 + delta_safe, np.pi / 2.0 - delta_safe]
     
     input_data_arr: DataResidualArray = general_set.input_data_residual_array
-    # Band from the resolved domain settings (works for FD and WDM); fall
-    # back to the FD frequency grid if the domain doesn't expose min/max.
-    domain_settings = general_set.domain_settings
+
+    domain_settings: DomainSettingsBase = general_set.domain_settings
     if getattr(domain_settings, "min_freq", None) is not None:
         start_freq = float(domain_settings.min_freq)
         end_freq = float(domain_settings.max_freq)
@@ -218,12 +239,12 @@ def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMe
         orbits=general_set.gpu_orbits if gpu_available else general_set.orbits, 
         t0=general_set.data_t0,
         force_backend=general_set.gpu_backend
-        )
+    )
 
     # geometric spacing 
+    assert general_set.ntemps is not None, "ntemps must be set in general_info" # TODO add post init method of settings
     betas = 1 / 1.2 ** np.arange(general_set.ntemps)
     betas[-1] = 0.0001
-
 
     search_kwargs = dict(
         nwalkers = 32,
@@ -237,7 +258,8 @@ def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMe
         nsteps_2 = 500,
         refit_start_iteration = 5
     )
-
+    stretch_probability = 0.0
+    
     waveform_kwargs = dict(
         dt=general_set.dt,
         T=Tobs,
@@ -250,7 +272,52 @@ def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMe
         window_alpha=general_set.window_alpha
     )
     
+    gb_stft_kwargs = dict(
+        n_side_bins=10, 
+        freq_from_tdi_phase=True,
+        use_midpoint=True,
+        linear_envelope=True
+    )
+
+    # * plot_dir=None puts the debug plots in <artifacts_file_dir>/gb_debug/.
+    debug_settings = GBDebugSettings(
+        enabled=True,
+        plot_walker=0,
+        plot_band=None,
+        seq_pick="first",
+    )
+    leaf_cap_settings = None
+    # leaf_cap_settings = GBLeafCapSettings(
+    #     start=None,
+    #     min_iters=int(os.environ.get("GB_LEAF_CAP_MIN_ITERS", "50")),
+    #     ll_nsigma=float(os.environ.get("GB_LEAF_CAP_LL_NSIGMA", "3.0")),
+    #     require_occupancy=bool(int(os.environ.get("GB_LEAF_CAP_OCCUPANCY", "1"))),
+    # )
+    sighet_settings = None
+    # sighet_settings = GBSigHetSettings(
+    #     refresh_every=int(os.environ.get("GB_SIGHET_REFRESH_EVERY", "20")),
+    #     refresh_dphase=float(os.environ.get("GB_SIGHET_REFRESH_DPHASE", "0.5")),
+    #     refresh_min_beta=float(os.environ.get("GB_SIGHET_REFRESH_MIN_BETA", "0.1")),
+    #     trust_dlna=float(os.environ.get("GB_SIGHET_TRUST_DLNA", "1.5")),
+    #     trust_dphase=float(os.environ.get("GB_SIGHET_TRUST_DPHASE", "0.5")),
+    #     trust_snr_c=float(os.environ.get("GB_SIGHET_TRUST_SNR_C", "30")),
+    #     trust_dlna_min=float(os.environ.get("GB_SIGHET_TRUST_DLNA_MIN", "0.3")),
+    #     anchor_check=os.environ.get("GB_SIGHET_ANCHOR_CHECK", "0") == "1",
+    #     drift_check=os.environ.get("GB_SIGHET_DRIFT_CHECK", "0") == "1",
+    # )
+
     gb_settings = GBSettings(
+        #* Settings
+        Tobs=Tobs,
+        dt=general_set.dt,
+        initialize_kwargs=initialize_kwargs,
+        # Transform, Priors, and Periodic handled later
+        nleaves_max=20,
+        nleaves_min=0,
+        ndim=8,
+        betas=betas,
+        log_dir=general_set.file_store_dir,
+        #* GB settings
         A_lims=A_lims,
         f0_lims=f0_lims,
         m_chirp_lims=m_chirp_lims,
@@ -265,27 +332,25 @@ def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMe
         oversample=oversample,
         extra_buffer=extra_buffer,
         # Start_resample_iter, Iter_count_per_resample, !group_proposal_kwargs (handled later?)
+        search_kwargs=search_kwargs,
+        stretch_probability=stretch_probability,
         start_freq_ind=start_freq_ind,
+        num_repeat_proposals=50,
         t0=general_set.data_t0,
-        # tdi_setup="XYZ",
+        # tdi_setup="XYZ", degenerate with waveform_kwargs, skipped if provided
         # use_tdi2=True,
-        Tobs=Tobs,
-        dt=general_set.dt,
-        initialize_kwargs=initialize_kwargs,
         waveform_kwargs=waveform_kwargs,
         # Run domain + chunked-het GB likelihood. ``gb_wdm_comp`` is built
         # lazily in ``setup_recipe`` (the C++ orbit wrap is not picklable, and
         # CurrentInfoGlobalFit deepcopies the settings tree).
         domain_settings=domain_settings,
         gb_wdm_comp=None,
-        # Transform, Priors, Periodic (handled later!)
-        nleaves_max=20,
-        nleaves_min=0,
-        ndim=8,
-        betas=betas,
-        log_dir=general_set.file_store_dir,
-        num_repeat_proposals=100,
-        search_kwargs=search_kwargs
+        gb_stft_comp=STFTGBComputations,
+        gb_stft_kwargs=gb_stft_kwargs,
+        stft_band_alpha=getattr(general_set, "window_alpha", None),
+        debug_settings=debug_settings,
+        leaf_cap_settings=leaf_cap_settings,
+        sighet_settings=sighet_settings,
     )
 
     gb_setup = GBSetup(gb_settings)
@@ -314,26 +379,29 @@ def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMe
 def get_general_erebor_settings() -> GeneralSetup:
 
     global_fit_codename = "erebor"
-    global_fit_version = "TEST_highf_gb_v2"
+    global_fit_version = "TEST_highf_gb_stft_multi_gpu"
     global_fit_contact = "ereborl2d@googlegroups.com"
     global_fit_code_link = "https://github.com/Erebor-L2D"
-    global_fit_input_data_link = ""
+    global_fit_input_data_link = "/workspace/ggfitlisa/ldc/mojito_light/"
     global_fit_input_reference = "mojito light"
     global_fit_noise_model = "parametric"
-    global_fit_noise_model_code_link = "https://github.com/Erebor-L2D" #todo populate repositories
-    comment = "Testing equatorial coordinates to obtain results on 2nd highest GB. Now with correct t0"
+    global_fit_noise_model_code_link = "https://github.com/Erebor-L2D"
+    comment = "Testing STFT multi-gpu"
 
+    submission_folder = None
+    
+    num_iterations = 100
+    
     Tobs = 9.0 * YRSID_SI / 12.0
     dt = 5.0
-    start_freq, end_freq = [0.0193, 0.0200433]
+    start_freq, end_freq = [0.014, 0.022]
 
-    head_dir = "/workspace/rrondeel/erebor/"
+    head_dir = "/workspace/rrondeel/dev_gb_stft/_results/"
     data_input_path = "/workspace/ggfitlisa/ldc/mojito_light/"
     base_file_name = global_fit_version #"test_mbh_18_with_covariance"
-    file_store_dir = head_dir + "testing/highf_gb/"
-    submission_folder = file_store_dir
-    
-    gpus = [0]
+    file_store_dir = head_dir + "gb_testing/"
+
+    gpus = [0] if gpu_available else None
     if gpu_available:
         cp.cuda.runtime.setDevice(gpus[0])
         # Restrict JAX to only see the target GPU — must be set before JAX backend init
@@ -342,38 +410,48 @@ def get_general_erebor_settings() -> GeneralSetup:
         jax.config.update("jax_cuda_visible_devices", ",".join(str(gpu) for gpu in gpus))
 
     backend = "cuda12x" if gpus is not None else "cpu"
-    nwalkers = 32
-    ntemps = 24
+    nwalkers = 8
+    ntemps = 4
+    
+    #* =============================== DOMAIN SETTINGS =================================
+    domain_cls = STFTSettings
+ 
+    if domain_cls == STFTSettings:
+        stft_dt = 1 * 24 * 3600.0  # hours
+        domain_settings = STFTSettings.make_factory(
+            big_dt=stft_dt, min_freq=start_freq, max_freq=end_freq
+        )
+    if domain_cls == FDSettings:
+        domain_settings = FDSettings.make_factory(
+            min_freq=start_freq, max_freq=end_freq
+        )
+    if domain_cls == WDMSettings:
+        # WDM grid: ~1-hour wavelets via adjust_to_even_bins, which also snaps
+        # Tobs to an exact Nf*Nt*dt span.
+        WAVELET_DUR_BOUNDS = (
+            float(os.environ.get("WAVELET_DUR_MIN", 3600.0)),
+            float(os.environ.get("WAVELET_DUR_MAX", 4400.0)),
+        )
+        NF, NT, WAVELET_DURATION = WDMSettings.adjust_to_even_bins(
+            t_min=WAVELET_DUR_BOUNDS[0], t_max=WAVELET_DUR_BOUNDS[1], dt=dt, Tobs=Tobs,
+        )
+        Tobs = NF * NT * dt  # exact WDM span
+        logger.info(
+            "WDM grid: Nf=%d Nt=%d wavelet_duration=%.1f s Tobs=%.6e s",
+            NF, NT, WAVELET_DURATION, Tobs,
+        )
+        domain_settings = domain_cls.make_factory(
+            Nf=NF, Nt=NT, min_freq=start_freq, max_freq=end_freq,
+            min_time=20 * WAVELET_DURATION, max_time=(NT - 20) * WAVELET_DURATION,
+        ) # type: ignore
 
+    # base_file_name += f"_{domain_cls.__name__}"
+
+    # * =============================== DATA PROCESSOR =================================    
     window_type = "tukey"
     window_taper_duration = 1 / start_freq
     normalize_window = True
-
-    # Run domain. The choice is a ``DomainSettingsBase`` (sub)class whose
-    # ``make_factory`` builds the factory the engine consumes — NOT a string
-    # flag (sprint rule: domains are communicated as a DomainSettingsBase /
-    # factory and dispatched by isinstance). WDM drives the chunked-heterodyne
-    # GB likelihood (built lazily in setup_recipe).
-    domain_cls = WDMSettings
-
-    # WDM grid: ~1-hour wavelets via adjust_to_even_bins, which also snaps
-    # Tobs to an exact Nf*Nt*dt span.
-    WAVELET_DUR_BOUNDS = (
-        float(os.environ.get("WAVELET_DUR_MIN", 3600.0)),
-        float(os.environ.get("WAVELET_DUR_MAX", 4400.0)),
-    )
-    NF, NT, WAVELET_DURATION = WDMSettings.adjust_to_even_bins(
-        t_min=WAVELET_DUR_BOUNDS[0], t_max=WAVELET_DUR_BOUNDS[1], dt=dt, Tobs=Tobs,
-    )
-    Tobs = NF * NT * dt  # exact WDM span
-    logger.info(
-        "WDM grid: Nf=%d Nt=%d wavelet_duration=%.1f s Tobs=%.6e s",
-        NF, NT, WAVELET_DURATION, Tobs,
-    )
-
-    stft_dt = None
-    base_file_name += f"_{domain_cls.__name__.replace('Settings', '').lower()}"
-
+    
     processor_init_kwargs = dict(
         L1_folder=data_input_path,
         source_types=["gb", "noise"],  #'vgb', 'gb', "mbhb",
@@ -381,7 +459,11 @@ def get_general_erebor_settings() -> GeneralSetup:
         verbose=True,
         do_plots=True,
         orbits_class=L1Orbits,
-        orbits_kwargs=dict(force_backend=backend, frame="icrs", armlength=2493162305.42235),  # icrs
+        orbits_kwargs=dict(
+            force_backend=backend, 
+            frame="icrs", 
+            armlength=2493162305.42235
+        ), 
     )
 
     downsample_kwargs = {
@@ -405,8 +487,8 @@ def get_general_erebor_settings() -> GeneralSetup:
     }
 
     trim_kwargs = {
-        "duration": 0.02,  # seconds — duration to trim from each end
-        "is_percent": True,  # If True, 'duration' is interpreted as a percentage of the total signal length
+        "duration": 200 * 3600,  # seconds — duration to trim from each end
+        "is_percent": False,  # If True, 'duration' is interpreted as a percentage of the total signal length
         "trimming_type": "from_each_end",  # "from_each_end" or "from_start"
     }
 
@@ -418,17 +500,10 @@ def get_general_erebor_settings() -> GeneralSetup:
         Tobs=Tobs,
     )
 
-    sensitivity_init_kwargs = dict(tdi_generation=2, mask_percentage=0.02)
-
-    # Build the factory from the chosen domain class (above). The engine
-    # calls ``factory(times, dt, force_backend)`` after loading the data so
-    # the grid is sized against the real time array. To switch domains,
-    # reassign ``domain_cls`` and the matching ``make_factory`` call:
-    #   FD  : FDSettings.make_factory(min_freq=start_freq, max_freq=end_freq)
-    #   STFT: STFTSettings.make_factory(big_dt=24*3600.0, min_freq=start_freq, max_freq=end_freq)
-    domain_settings = domain_cls.make_factory(
-        Nf=NF, Nt=NT, min_freq=start_freq, max_freq=end_freq,
-        min_time=20 * WAVELET_DURATION, max_time=(NT - 20) * WAVELET_DURATION,
+    sensitivity_init_kwargs = dict(
+        tdi_generation=2, 
+        mask_percentage=0.02, 
+        average_transfer_functions=True
     )
 
     general_settings = GeneralSettings(
@@ -441,13 +516,16 @@ def get_general_erebor_settings() -> GeneralSetup:
         backup_iter=5,
         nwalkers=nwalkers,
         ntemps=ntemps,
+        num_iterations=num_iterations,
         window_type=window_type,
         window_taper_duration=window_taper_duration,
         gpus=gpus,
+        gpu_backend=backend,
         data_processor_class=L1ProcessingStep,
         processor_init_kwargs=processor_init_kwargs,
         preprocess_kwargs=preprocess_kwargs,
         normalize_window=normalize_window,
+        sensitivity_backend_class=XYZSensitivityBackend,
         sensitivity_init_kwargs=sensitivity_init_kwargs,
         global_fit_codename=global_fit_codename,
         global_fit_version=global_fit_version,
@@ -462,12 +540,15 @@ def get_general_erebor_settings() -> GeneralSetup:
     )
 
     general_setup = GeneralSetup(general_settings)
+    
+    #? do we still need this?
     # Band/STFT metadata consumed by the per-source setup functions
     # (no longer GeneralSettings fields post-merge; the analysis band
     # itself lives on domain_settings).
-    general_setup.start_freq = start_freq
-    general_setup.end_freq = end_freq
-    general_setup.stft_dt = stft_dt
+    # general_setup.start_freq = start_freq
+    # general_setup.end_freq = end_freq
+    # general_setup.stft_dt = stft_dt
+    
     return general_setup
 
 

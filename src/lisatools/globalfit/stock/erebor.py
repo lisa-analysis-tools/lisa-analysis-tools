@@ -24,15 +24,21 @@ from eryn.state import State as ErynState
 from eryn.state import Branch as ErynBranch
 from eryn.utils import TransformContainer
 from gbgpu.utils.utility import get_fdot, get_N
+from gbgpu.gbcomps import STFTGBComputations
 
 from lisatools.sources.utils import ecliptic_to_icrs
 from lisatools.utils.utility import AET, detrend, tukey
 from lisatools.utils.constants import YRSID_SI, PC_SI
 
-from ...domains import DomainSettingsBase, FDSettings, WDMSettings
+from ...domains import DomainSettingsBase, FDSettings, WDMSettings, STFTSettings
 from ..engine import Settings, Setup, GeneralSetup
+from ..moves.gbbandstructure import stft_band_structure
 from ..loginfo import init_logger
 from ..priors.gbpriors import get_fdot_mojito
+
+if typing.TYPE_CHECKING:
+    from ..moves.gbdebug import GBDebugSettings
+    from ..moves.gbspecialmove import GBLeafCapSettings, GBSigHetSettings
 
 
 @dataclasses.dataclass
@@ -54,12 +60,13 @@ class GBSettings(Settings):
     delta_lims: typing.List[float] = dataclasses.field(default_factory=list)
     start_freq: float = 0.0001  # this might get adjusted ?
     end_freq: float = 0.025
-    oversample: int = 4. # FD
+    oversample: int = 4 # FD
     extra_buffer: int = 5
     start_resample_iter: Optional[typing.Tuple[int]] = (-1,)  # -1 so that it starts right at the start of PE
     iter_count_per_resample: Optional[int] = 10
     num_repeat_proposals: int = 100
     search_kwargs: Optional[dict] = None
+    stretch_probability: float = 0.5
     group_proposal_kwargs: Optional[dict] = None
     start_freq_ind: Optional[int] = 0  # goes into GPU for start of data stream
     t0: Optional[float] = 0.0
@@ -82,7 +89,23 @@ class GBSettings(Settings):
     # ``gbgpu.gbcomps.STFTGBComputations`` instance, built around the parent
     # ``STFTComputationGroup``). Required when ``domain_settings`` is a
     # :class:`STFTSettings`; ignored otherwise.
-    gb_stft_comp: typing.Any = None
+    gb_stft_comp: Optional[STFTGBComputations] = None
+    gb_stft_kwargs: Optional[dict[str, Any]] = None
+    stft_band_alpha: Optional[float] = None
+    # Forwarded to :func:`stft_band_structure` (k_safety_factor, q,
+    # floor_correction, convention). Empty means the decided recipe.
+    stft_band_kwargs: Optional[dict[str, Any]] = None
+    # Maximum bands preloaded into memory during proposal / RJ moves.
+    # When None, automatically estimated based on GPU memory and basis grid.
+    num_band_preload: Optional[int] = None
+    # Maximum (band, walker) units preloaded per tempering chunk.
+    # When None, automatically estimated based on GPU memory and ntemps.
+    num_bands_preload_temp: Optional[int] = None
+    # GB move options, passed to every GB move by build_gb_moves.
+    # None gives each class's defaults; debug is then disabled.
+    debug_settings: Optional[GBDebugSettings] = None
+    sighet_settings: Optional[GBSigHetSettings] = None
+    leaf_cap_settings: Optional[GBLeafCapSettings] = None
 
 # basic transform functions for pickling
 def f_ms_to_s(x):
@@ -191,7 +214,7 @@ class GBSetup(Setup, GBSettings):
             gb_transform_fn_in = {
                 "A": np.exp,
                 "f0": f_ms_to_s,
-                "phi0": lambda x: -1 * x,  # flip sign of phi0 to match JaxGB convention.
+                # "phi0": lambda x: -1 * x,  # flip sign of phi0 to match JaxGB convention.
                 "cos_iota": np.arccos,
                 "sin_delta": np.arcsin,
 
@@ -221,11 +244,6 @@ class GBSetup(Setup, GBSettings):
                 input_basis[1]: uniform_dist(*(np.asarray(self.f0_lims) * 1e3)),  # AmplitudeFrequencySNRPrior(rho_star, frequency_prior, L, Tobs, fd=fd),  # use sangria as a default
                 input_basis[2]: uniform_dist(self.fdot_lims[0], self.fdot_lims[1]),
                 input_basis[3]: uniform_dist(self.phi0_lims[0], self.phi0_lims[1]),
-                # cos is DECREASING on [0, pi]: cos(iota_lims) comes out
-                # (max, min), so sort into increasing order before handing
-                # it to uniform_dist -- never rely on the dist silently
-                # swapping reversed bounds. (Same defensive sort on the
-                # sin(delta) line even though sin is increasing there.)
                 input_basis[4]: uniform_dist(*np.sort(np.cos(self.iota_lims))),
                 input_basis[5]: uniform_dist(self.psi_lims[0], self.psi_lims[1]),
                 input_basis[6]: uniform_dist(self.alpha_lims[0], self.alpha_lims[1]),
@@ -239,7 +257,10 @@ class GBSetup(Setup, GBSettings):
             #     [1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 7.5, 10.0,
             #      15.0, 20.0, 35.0, 50.0, 75.0, 125.0, 250.0, 5e2]
             # )
-            ntemps_pe = 24 # len(snrs_ladder)
+            if self.ntemps is None:
+                ntemps_pe = 24 # len(snrs_ladder)
+            else:
+                ntemps_pe = self.ntemps
             # betas =  1 / snrs_ladder ** 2  # make_ladder(ndim * 10, Tmax=5e6, ntemps=ntemps_pe)
             betas = 1 / 1.2 ** np.arange(ntemps_pe)
             betas[-1] = 0.0001
@@ -272,7 +293,10 @@ class GBSetup(Setup, GBSettings):
 
         if self.group_proposal_kwargs is None:
             self.group_proposal_kwargs: typing.Dict[str, Any] = dict(
-                n_iter_update=1, live_dangerously=True, a=1.75, num_repeat_proposals=200
+                n_iter_update=1, 
+                live_dangerously=True, 
+                a=1.75, 
+                num_repeat_proposals=200
             )
         
         if self.search_kwargs is None:
@@ -331,13 +355,21 @@ class GBSetup(Setup, GBSettings):
     def init_band_structure(self):
         """Compute :attr:`band_edges` and :attr:`band_N_vals` from the GB frequency range.
 
-        Both FD and WDM domains use a frequency-banded layout. The edges
-        are derived from ``df = 1/Tobs`` (always meaningful for either
-        basis) and the FD-oversampled per-band N. For WDM runs the
-        per-band ``band_N_vals`` is unused by the WDM likelihood engine
-        (which sizes its buffers from ``WDMSettings.Nf_active`` /
-        ``Nt_active``) but is preserved for shape parity.
+        FD and WDM use a frequency-banded layout whose edges are derived from
+        ``df = 1/Tobs`` (always meaningful for either basis) and the
+        FD-oversampled per-band N. For WDM runs the per-band ``band_N_vals``
+        is unused by the WDM likelihood engine (which sizes its buffers from
+        ``WDMSettings.Nf_active`` / ``Nt_active``) but is preserved for shape
+        parity.
+
+        STFT instead uses the sub-bin containment recipe from
+        :mod:`lisatools.globalfit.moves.gbbandstructure`, and additionally
+        sets :attr:`band_structure` so the store-window helper is reachable.
         """
+        #: Only the STFT path builds one; FD and WDM leave it None so a reader
+        #: gets None rather than an AttributeError.
+        self.band_structure = None
+
         # band separation setup
         if self.oversample is None and self.Tobs < YRSID_SI / 2.0:
             self.oversample = 2
@@ -389,7 +421,7 @@ class GBSetup(Setup, GBSettings):
                     for edge in self.band_edges[:-1]
                 ]
             )
-        else:
+        elif isinstance(self.domain_settings, FDSettings):
             # FD path: bands sized in multiples of ``df = 1/Tobs`` using the
             # FD-oversampled per-band N. Walks down from ``end_freq``
             # (stft_tof refinements: half-bin start, min_N stop guard, and
@@ -416,6 +448,38 @@ class GBSetup(Setup, GBSettings):
             self.band_edges = band_edges[2:-1]
             self.band_N_vals = band_N_vals[2:-1]
 
+        elif isinstance(self.domain_settings, STFTSettings):
+            # STFT path: the sub-bin containment recipe, W_band = k * B_q.
+            if self.stft_band_alpha is None:
+                raise ValueError(
+                    "STFT band structure needs stft_band_alpha (the Tukey "
+                    "taper fraction). Pass general_setup.window_alpha, which "
+                    "the data processor sets to window_taper_duration / "
+                    "DT_STFT."
+                )
+            band_structure = stft_band_structure(
+                self.domain_settings, self.stft_band_alpha,
+                **(self.stft_band_kwargs or {})
+            )
+            self.band_edges = band_structure.edges_hz
+            self.band_N_vals = band_structure.band_N_vals(
+                oversample=self.oversample
+            )
+            self.band_structure = band_structure
+            self.logger.info(
+                "STFT band structure: %d bands, alpha=%.5f, median width "
+                "%.4g coherent elements (%.4g STFT pixels)",
+                band_structure.n_bands, self.stft_band_alpha,
+                float(np.median(band_structure.width_coherent_elements)),
+                float(np.median(band_structure.width_grid_pixels)),
+            )
+
+        else:
+            raise ValueError(
+                "GBSetup only supports FDSettings, WDMSettings, or STFTSettings for "
+                "domain_settings; got {}.".format(type(self.domain_settings))
+            )
+        
         self.f0_lims = [self.band_edges[1].min(), self.band_edges[-2].max()]
 
         self.fdot_lims = [

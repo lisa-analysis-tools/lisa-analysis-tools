@@ -16,6 +16,7 @@ import time
 import logging
 import typing
 from copy import deepcopy
+import dataclasses
 from dataclasses import dataclass
 
 import numpy as np
@@ -28,9 +29,11 @@ except ModuleNotFoundError:
 # DataResidualArray is now a deprecation shim; we pass DomainBase children
 # (or raw arrays via the AnalysisContainer/template APIs) directly.
 from lisatools.domains import FDSettings, STFTSettings, WDMSettings
+from lisatools.response.tdiconfig import TDIConfig
 
 from bbhx.utils.transform import SSB_to_LISA
 from gbgpu.gbgpu import GBGPU
+from gbgpu.gbcomps import STFTGBComputations
 from eryn.moves.tempering import TemperatureControl, make_ladder
 from eryn.prior import ProbDistContainer
 
@@ -39,11 +42,18 @@ from ..utils.utility import asnumpy
 from .moves import (
     PSDMove,
     ResidualAddOneRemoveOneMove,
-    GBSpecialRJPriorMove,
+    # GBSpecialRJPriorMove,
+    # GBSpecialRJSerialSearchMCMC,
+    # GBSpecialRJRefitMove,
+)
+from .moves.gbbandstructure import stft_store_window_layout
+from .moves.gbspecialmove import (
+    GBSpecialRJPriorMove, 
     GBSpecialRJSerialSearchMCMC,
     GBSpecialRJRefitMove,
+    GBSpecialBase   
 )
-from .moves.gbspecialstretch import GBSpecialBase
+# from .moves.gbspecialstretch import GBSpecialBase
 
 # Type-only imports. These live under TYPE_CHECKING because ``run`` imports this
 # module (``run.py`` -> ``from .recipe import Recipe``); importing ``.run`` /
@@ -61,6 +71,7 @@ if typing.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MOJITO_REFERENCE_TIME = 97729089.327664
+MOJITO_AVERAGE_ARMLENGTH = 2493162305.42235
 
 class Recipe:
     """Ordered sequence of :class:`RecipeStep` instances driving the sampler.
@@ -691,7 +702,7 @@ def gb_catalogue_to_sampling_basis(catalogue_entry: dict, trim_duration: float =
     del trim_duration  # accepted for signature compat; anchor is REF
     f_init = np.array(catalogue_entry["GW22FrequencySSBFrame"])
     fdot = np.array(catalogue_entry["GW22FrequencyDerivativeSourceFrame"])
-    phi_init = (-np.array(catalogue_entry["TrueAnomaly"])) % (2 * np.pi)
+    phi_init = (np.array(catalogue_entry["TrueAnomaly"])) % (2 * np.pi)
 
     f0_mHz = f_init * 1e3
     cos_iota = np.cos(np.array(catalogue_entry["InclinationAngle"]))# % (np.pi)
@@ -1242,9 +1253,11 @@ def build_gb_moves(
     state: GFState,
     *,
     Tmax: float = 1e6,
-    include_search: bool = True,
+    search_move_names: typing.Optional[typing.Sequence[str]] = None,
+    pe_move_names: typing.Optional[typing.Sequence[str]] = None,
+    include_search: typing.Optional[bool] = None,
     include_refit: bool = True,
-    pe_move_names: typing.List[str] | None = None,
+    **kwargs,
 ) -> typing.Tuple[typing.List[GBSpecialBase], typing.List[GBSpecialBase]]:
     """Build GB search and PE moves.
 
@@ -1270,16 +1283,21 @@ def build_gb_moves(
         Shared priors dict (passed by reference).
     Tmax : float, optional
         Maximum temperature for ``TemperatureControl``. Default 1e6.
+    search_move_names : sequence of str, optional
+        Explicit names of search moves to build (e.g. ``["rj_prior_search"]``).
+        If ``None`` and ``include_search`` is not ``False``, defaults to
+        ``["rj_fstat_mcmc_search", "rj_prior_search"]`` for FD, or ``[]`` for STFT/WDM.
+    pe_move_names : sequence of str, optional
+        Explicit names of PE moves to build (e.g. ``["rj_prior"]``). If ``None``,
+        defaults to ``["rj_prior", "rj_fstat_mcmc"]`` (plus refit if available) for FD,
+        or ``["rj_prior"]`` for STFT/WDM.
     include_search : bool, optional
-        When ``False``, return an empty search-move list (PE-only recipes).
-        Default ``True``.
+        Deprecated in favor of ``search_move_names``. When ``False``, return an empty
+        search-move list. Default ``None``.
     include_refit : bool, optional
         When ``False``, never build the GMM-refit moves even if the refit
         file is present. Default ``True`` (refit is still gated on the file
         existing).
-    pe_move_names : list of str, optional
-        When given, keep only the PE moves whose ``name`` is in this list
-        (and in this order-preserving subset). ``None`` keeps all PE moves.
 
     Returns
     -------
@@ -1290,7 +1308,6 @@ def build_gb_moves(
     general_info: GeneralSetup = curr.general_info
     nwalkers: int = general_info.nwalkers
     ntemps: int = general_info.ntemps
-    data_start_freq_ind = int(acs.start_freq_ind[0])
     
     gb_betas = gb_info.betas
     gpus: list[int] = general_info.gpus
@@ -1306,49 +1323,100 @@ def build_gb_moves(
     _gb_backend = gbgpu.get_backend(gb_force_backend)
     if gpus is not None:
         _gb_backend.set_cuda_device(gpus[0])
-    # NOTE: ``GBGPU.__init__`` no longer accepts ``t0``; it gets the
-    # reference time from the orbits object's t0. We keep ``gb_info.t0``
-    # around because the WDM-domain ``GBWDMComputations`` consumes it
-    # directly.
-    gb = GBGPU(force_backend=gb_force_backend, orbits=general_info.gpu_orbits)
+        
+    gb = GBGPU(**gb_info.initialize_kwargs)
     if gpus is not None:
         cp.cuda.runtime.setDevice(gpus[0])
         gb.gpus = gpus
     else:
         gb.gpus = None
 
+    logger.debug(f"GBGPU initialized at t0 = {gb_info.initialize_kwargs['t0']}")
     logger.debug(f"GBGPU initialized with gpus: {gb.gpus} and backend: {gb.backend}")
+    
+    #* Ensure gb computations frames are initialized. (currently STFT only)
+    if isinstance(gb_info.gb_stft_comp, type) and issubclass(gb_info.gb_stft_comp, STFTGBComputations):
+        assert gb_info.gb_stft_kwargs is not None
+        
+        if acs.domain_group_kwargs is None or acs.domain_group_kwargs == dict():
+            domain_kwargs = dict(
+                tdi_type="XYZ",
+                window_alpha=general_info.window_alpha,
+                use_midpoint=gb_info.gb_stft_kwargs["use_midpoint"],
+                linear_envelope=gb_info.gb_stft_kwargs["linear_envelope"]
+            )
+            acs.domain_group_kwargs = domain_kwargs
+            acs._ensure_cpp_splits()
+        
+        tdi_config = TDIConfig(
+            tdi='2nd generation', 
+            force_backend=general_info.force_backend
+        )
+
+        gb_stft_comp = STFTGBComputations(
+            stft_comps=acs.cpp_splits[0],
+            T=gb_info.Tobs,
+            t_ref=MOJITO_REFERENCE_TIME,
+            orbits=general_info.gpu_orbits,
+            tdi_config=tdi_config,
+            force_backend=general_info.force_backend,
+            n_side_bins=gb_info.gb_stft_kwargs["n_side_bins"],
+            freq_from_tdi_phase=gb_info.gb_stft_kwargs["freq_from_tdi_phase"],
+            window_alpha=general_info.window_alpha,
+            use_midpoint=gb_info.gb_stft_kwargs["use_midpoint"],
+            linear_envelope=gb_info.gb_stft_kwargs["linear_envelope"]
+        )
+        gb_info.gb_stft_comp = gb_stft_comp
+
+    #* STFT store windows are sized here, where the comp's stencil, its t_ref and data_t0 are all known.
+    gb_info.stft_store_windows = None
+    band_structure = getattr(gb_info, "band_structure", None)
+    if isinstance(acs.settings, STFTSettings) and band_structure is not None:
+        if (float(band_structure.grid_df_hz) != float(acs.settings.df)
+                or not np.isclose(float(asnumpy(band_structure.edges_hz)[0]), float(acs.settings.min_freq))):
+            raise ValueError(
+                "the GB band structure was built on a different STFT grid than the analysis container; "
+                "its store windows would index the wrong bins."
+            )
+        gb_info.stft_store_windows = stft_store_window_layout(
+            band_structure,
+            acs.settings,
+            n_side_bins=gb_info.gb_stft_comp.n_side_bins,
+            epoch_offset_s=gb_info.gb_stft_comp.t_ref - curr.general_info.data_t0,
+        )
+        logger.info(
+            "STFT store windows: tier widths %s bins, buffer width %d of NF_active=%d",
+            gb_info.stft_store_windows.tier_width,
+            gb_info.stft_store_windows.buffer_width,
+            int(acs.settings.NF_active),
+        )
 
     #* Make sure that priors are evaluated on gpus (when available).
-    # On CPU runs we keep ``use_cupy=False`` because eryn's prior.xp reads
-    # ``cp`` unconditionally when ``use_cupy=True`` and raises NameError
-    # if cupy isn't installed.
     use_gpu_priors = gpus is not None
-    gpu_priors_in = deepcopy(priors["gb"].priors_in)
-    for _, item in gpu_priors_in.items():
-        item.use_cupy = use_gpu_priors
-    _gpu_gb_prior = ProbDistContainer(gpu_priors_in, use_cupy=use_gpu_priors)
-    # ``priors_in`` is the ORIGINAL insertion-order dict, so a fresh container
-    # lays multi-column tuple priors (the (dist,alpha,sin_delta) sky/distance
-    # joint and the (f0,Mc) GMM) out at CONSECUTIVE columns. The CPU prior
-    # ``priors["gb"]`` may have had ``reset_key_order`` applied to scatter them
-    # to their true basis columns (dist->0, f0->1, Mc->2, alpha->6,
-    # sin_delta->7); re-apply that same key order here or the GPU prior the GB
-    # moves evaluate against is column-misaligned and forbids every RJ birth
-    # (logp=-inf on in-band F-stat draws). No-op when the CPU prior was never
-    # reordered (its key_order already equals insertion order).
-    _cpu_key_order = list(getattr(priors["gb"], "key_order", []))
-    if _cpu_key_order and list(_gpu_gb_prior.key_order) != _cpu_key_order:
-        _gpu_gb_prior.reset_key_order(_cpu_key_order)
-    gpu_priors = {"gb": _gpu_gb_prior}
+    gpu_priors = {}
+    for key, prior_container in priors.items():
+        if "gb" in key:
+            gpu_priors_in = deepcopy(prior_container.priors_in)
+            
+            # Update cupy status for each prior object
+            for item in gpu_priors_in.values():
+                item.use_cupy = use_gpu_priors
+            
+            gpu_prior = ProbDistContainer(gpu_priors_in, use_cupy=use_gpu_priors)
+            
+            # Safely preserve CPU key order if defined and different
+            cpu_key_order = list(getattr(prior_container, "key_order", []))
+            if cpu_key_order and list(gpu_prior.key_order) != cpu_key_order:
+                gpu_prior.reset_key_order(cpu_key_order)
+                
+            gpu_priors[key] = gpu_prior
+            
     
     nleaves_max_gb = state.branches["gb"].shape[-2]
     
     #* Get band information
     band_edges = gb_info.band_edges
     band_N_vals = gb_info.band_N_vals
-    assert band_edges is not None
-    assert band_N_vals is not None
 
     #* This checks if the initialization has any gbs in it (when injecting gbs) and adjusts acs accordingly.
     #* Skipped when a GB ``signal_gen`` is registered — the engine's
@@ -1379,39 +1447,28 @@ def build_gb_moves(
 
         coords_in_in = gb_info.transform.both_transforms(coords_out_gb)
 
-        band_inds = np.searchsorted(band_edges, coords_in_in[:, 1], side="right") - 1
-
         walker_vals = np.tile(
             np.arange(nwalkers), (nleaves_max_gb, 1)
         ).transpose((1, 0))[state.branches["gb"].inds[0]]
 
         data_index_1 = walker_vals  # ((band_inds % 2) + 0) * nwalkers + walker_vals
 
-        # Build index/factor arrays on the ACA's backend (== the run's
-        # force_backend, shared by ``gb`` / ``gb_wdm_comp``), NOT the
-        # module-level ``cp`` (cupy on any node with cupy importable, even a
-        # CPU run) — otherwise a cupy array reaches the numpy ``gb_wdm_comp.xp``
-        # / numpy ``gb`` consumer below and raises the implicit-conversion
-        # TypeError.
+        # Build index/factor arrays on the ACA's backend
         _xp = acs.xp
         data_index = _xp.asarray(data_index_1).astype(_xp.int32)
-        # goes in as -h (subtract initial template from data residual)
-        factors = -_xp.ones_like(data_index, dtype=_xp.float64)
+        factors = -_xp.ones_like(data_index, dtype=_xp.float64) # -1 for subtraction
 
-        N_vals = band_N_vals[band_inds]
 
         logger.debug("Generating global GB template")
         if gpus is not None:
             gb.gpus = gpus
 
+        template_in = deepcopy(acs.linear_data_arr)
         if isinstance(domain_settings, FDSettings):
             #* TODO: add test to make sure the generator matches the general information.
-            template_in = deepcopy(acs.linear_data_arr)
-            # acs lays walkers out in contiguous blocks of ``len(gpu_splits[0])`` per
-            # GPU, so ``walker % num_per_gpu_walker`` recovers the intra-split residual
-            # index inside generate_global_template. Required (and only valid) for >1
-            # GPU; left None for single-GPU so GBGPU keeps its 1-GPU fast path. Mirrors
-            # GBSpecialBase.adjust_sources_in_residual_buffer. (stft_tof fix.)
+            band_inds = np.searchsorted(band_edges, coords_in_in[:, 1], side="right") - 1
+            N_vals = band_N_vals[band_inds]
+            
             num_per_gpu_walker = (
                 len(acs.gpu_splits[0]) if (acs.gpus is not None and len(acs.gpus) > 1) else None
             )
@@ -1424,7 +1481,7 @@ def build_gb_moves(
                 data_splits=acs.gpu_map,
                 num_per_gpu=num_per_gpu_walker,
                 N=N_vals,
-                **waveform_kwargs,
+                **gb_info.waveform_kwargs,
             )
             max_diff_templates = _xp.abs(template_in[0] - acs.linear_data_arr[0]).max()
             del template_in
@@ -1442,10 +1499,7 @@ def build_gb_moves(
             num_bin = coords_in_in.shape[0]
             xp = gb_info.gb_wdm_comp.xp
             factors_arr = xp.asarray(factors).astype(xp.float64)
-            # GB WDM init writes templates into a single flat buffer.
-            # Use gather_linear_data_arr so multi-GPU ACAs gather to one
-            # buffer first; single-GPU runs return the underlying buffer
-            # directly (no copy).
+
             gb_info.gb_wdm_comp.fill_global_wdm(
                 coords_in_in,
                 acs.gather_linear_data_arr(),
@@ -1453,20 +1507,15 @@ def build_gb_moves(
                 factors=factors_arr,
             )
         elif isinstance(domain_settings, STFTSettings):
-            if getattr(gb_info, "gb_stft_comp", None) is None:
-                raise ValueError(
-                    "STFT-domain GB initialization requires "
-                    "gb_info.gb_stft_comp; build an STFTGBComputations in the "
-                    "settings file and pass it via GBSettings.gb_stft_comp."
-                )
+            assert gb_info.gb_stft_comp is not None, (
+                "STFT-domain GB initialization requires "
+                "gb_info.gb_stft_comp; build an STFTGBComputations in the "
+                "settings file and pass it via GBSettings.gb_stft_comp."
+            )
+            
             xp = gb_info.gb_stft_comp.xp
             factors_arr = xp.asarray(factors).astype(xp.float64)
-            # Mirrors the WDM arm: the parent linear buffer IS the
-            # (num_walkers, nchannels, NT, NF_active) template stack the
-            # Fresnel fill kernel scatters into, keyed by walker data_index.
-            # gb_stft_comp.stft_comps is the PARENT STFTComputationGroup here
-            # (the settings file builds the comp around it), so the kernel's
-            # cpp_domain matches this buffer.
+            
             gb_info.gb_stft_comp.fill_global_stft(
                 coords_in_in,
                 acs.gather_linear_data_arr(),
@@ -1479,8 +1528,6 @@ def build_gb_moves(
                 f"supported for GB initialization."
             )
 
-    # Optional post-subtraction diagnostic plot. Only FD/STFT signal containers
-    # implement ``.plot``; WDMSignal (and other domains) do not, so guard it.
     _post_sub = acs[0].data_res_arr.data_res_arr
     if hasattr(_post_sub, "plot"):
         _post_sub.plot(channel=0, filename=curr.general_info.artifacts_file_dir + "data_post_subtraction.png")
@@ -1495,10 +1542,6 @@ def build_gb_moves(
 
     band_temps = np.tile(np.asarray(gb_betas), (len(band_edges) - 1, 1))
     state.sub_states["gb"].initialize_band_information(nwalkers, ntemps, band_edges, band_temps)
-    # initialize_band_information is idempotent (it used to silently
-    # re-initialize on every call due to a broken initialized check, which
-    # this assignment relied on): the state may arrive here with band_temps
-    # zero-initialized by load_info, so set the actual ladder explicitly.
     state.sub_states["gb"].band_info["band_temps"][:] = band_temps
     if adjust_temps:
         state.sub_states["gb"].band_info["band_temps"][:] = band_info_check["band_temps"][0, :]
@@ -1521,10 +1564,15 @@ def build_gb_moves(
     #* ``fd`` is no longer a positional — the move derives it from
     #* ``acs.settings`` so the same call works for FDSettings and
     #* WDMSettings (and any future domain).
+    start_freq_ind_val = (
+        int(acs.start_freq_ind[0])
+        if (acs.start_freq_ind is not None and acs.start_freq_ind[0] is not None)
+        else None
+    )
     gb_move_args = (
         gb,
         priors,
-        data_start_freq_ind,
+        start_freq_ind_val,
         acs.end_shape[0],
         acs,
         band_edges,
@@ -1536,6 +1584,17 @@ def build_gb_moves(
     temperature_control = TemperatureControl(
         effective_ndim, nwalkers, ntemps=ntemps, Tmax=Tmax, permute=False
     )
+    
+    # * GB move options come from the settings file through gb_info; None gives each class's defaults.
+    debug_settings = getattr(gb_info, "debug_settings", None)
+    if debug_settings is not None and debug_settings.plot_dir is None:
+        debug_settings = dataclasses.replace(
+            debug_settings,
+            plot_dir=os.path.join(curr.general_info.artifacts_file_dir, "gb_debug", ""),
+        )
+    leaf_cap_settings = getattr(gb_info, "leaf_cap_settings", None)
+    sighet_settings = getattr(gb_info, "sighet_settings", None)
+
     gb_move_kwargs = dict(
         waveform_kwargs=gb_info.waveform_kwargs,
         parameter_transforms=gb_info.transform,
@@ -1545,202 +1604,159 @@ def build_gb_moves(
         force_backend=general_info.force_backend,
         nfriends=nwalkers,
         temperature_control=temperature_control,
-        # ``use_gpu=True`` (stft_tof) dropped: backend choice is fixed at
-        # construction via force_backend per the sprint-wide rule.
         num_repeat_proposals=gb_info.num_repeat_proposals,
         search_kwargs=gb_info.search_kwargs,
-        # gb_wdm_comp is None for the FD path (default) and a
-        # GBWDMComputations instance for the WDM path. The move's Buffer
-        # then dispatches on the AC's DomainSettings to pick the right
-        # likelihood engine -- no string-level mode flag. On the FD path the
-        # move builds a GBFDComputations prototype (the gb_fd_* kernels
-        # replaced the legacy SharedMemory family, 2026-07 rework), which
-        # needs the orbits / TDI configuration and the phase reference time.
-        gb_wdm_comp=gb_info.gb_wdm_comp,
+        stretch_probability=gb_info.stretch_probability,
+        gb_wdm_comp=getattr(gb_info, "gb_wdm_comp", None),
         gb_fd_comp=getattr(gb_info, "gb_fd_comp", None),
-        # gb_stft_comp is None for the FD/WDM paths and an STFTGBComputations
-        # instance for the STFT path (built in the settings file around the
-        # parent STFTComputationGroup, like gb_wdm_comp).
         gb_stft_comp=getattr(gb_info, "gb_stft_comp", None),
         orbits=getattr(gb_info, "orbits", None),
         tdi_config=getattr(gb_info, "tdi_config", None),
         t_ref=float(getattr(gb_info, "t0", 0.0) or 0.0),
-        # GB-sampler verification instrumentation (band residual round-trip /
-        # get_ll consistency checks + begin/middle/end band plots). Off unless
-        # GB_DEBUG=1; direct kwarg on the move class (no GBSettings field).
-        debug=bool(int(os.environ.get("GB_DEBUG", "0"))),
-        debug_plot_dir=os.environ.get("GB_DEBUG_DIR", "./gf_output/gb_debug/"),
-        # Plot ONLY this (walker, band) cell (all temperatures, one figure
-        # per plotted step). Band default None -> central band at plot time;
-        # gb_no_foreground setdefaults these to walker 0 / the central GB
-        # band.
-        debug_plot_walker=int(os.environ.get("GB_DEBUG_PLOT_WALKER", "0")),
-        debug_plot_band=(int(os.environ["GB_DEBUG_PLOT_BAND"])
-                         if os.environ.get("GB_DEBUG_PLOT_BAND") else None),
-        # Which of the traced cell's sources the sequence figures follow:
-        # "first" (default), "loudest", or a target f0 in mHz.
-        debug_seq_pick=os.environ.get("GB_DEBUG_SEQ_PICK", "first"),
-        # Per-band progressive leaf cap (search mode). Armed only when
-        # GB_LEAF_CAP_START is set (gb_no_foreground sets it under
-        # GB_MODE=search): every band starts capped at that many leaves per
-        # (temp, walker) cell; a band's cap increments -- independently of
-        # other bands -- once it has spent GB_LEAF_CAP_MIN_ITERS iterations
-        # at the current cap AND every cold walker's band residual ll is
-        # within GB_LEAF_CAP_LL_NSIGMA * sqrt(N_dof/2) of the running best
-        # (AND, with GB_LEAF_CAP_OCCUPANCY=1, some cold walker actually
-        # holds cap leaves there). See GBSpecialBase._update_band_leaf_caps.
-        leaf_cap_start=(int(os.environ["GB_LEAF_CAP_START"])
-                        if os.environ.get("GB_LEAF_CAP_START") else None),
-        leaf_cap_min_iters=int(os.environ.get("GB_LEAF_CAP_MIN_ITERS", "50")),
-        leaf_cap_ll_nsigma=float(os.environ.get("GB_LEAF_CAP_LL_NSIGMA", "3.0")),
-        leaf_cap_require_occupancy=bool(
-            int(os.environ.get("GB_LEAF_CAP_OCCUPANCY", "1"))
-        ),
-        leaf_cap_update=True,
-        # Sig-het in-model drift refresh: every N repeats, re-anchor the
-        # heterodyne references of sources whose accumulated carrier-phase
-        # drift exceeds the threshold (radians). Inert on chunked/FD.
-        sighet_refresh_every=int(os.environ.get("GB_SIGHET_REFRESH_EVERY", "20")),
-        sighet_refresh_dphase=float(os.environ.get("GB_SIGHET_REFRESH_DPHASE", "0.5")),
-        sighet_refresh_min_beta=float(
-            os.environ.get("GB_SIGHET_REFRESH_MIN_BETA", "0.1")),
-        # Trust region: reject in-model candidates beyond these gates from
-        # the block's heterodyne anchor (physical |dlnA| e-folds / carrier
-        # phase rad); 0 disables. Inert on chunked-het / FD / STFT.
-        sighet_trust_dlna=float(os.environ.get("GB_SIGHET_TRUST_DLNA", "1.5")),
-        sighet_trust_dphase=float(
-            os.environ.get("GB_SIGHET_TRUST_DPHASE", "0.5")),
-        # SNR scaling of the amplitude gate: per-source dlnA_max =
-        # clip(C/snr_ref, dlna_min, GB_SIGHET_TRUST_DLNA); C=0 -> uniform.
-        sighet_trust_snr_c=float(
-            os.environ.get("GB_SIGHET_TRUST_SNR_C", "30")),
-        sighet_trust_dlna_min=float(
-            os.environ.get("GB_SIGHET_TRUST_DLNA_MIN", "0.3")),
-        # Diagnostics (one exact batched engine call per block each).
-        sighet_anchor_check=os.environ.get(
-            "GB_SIGHET_ANCHOR_CHECK", "0") == "1",
-        sighet_drift_check=os.environ.get("GB_SIGHET_DRIFT_CHECK", "0") == "1",
-        **{
-            k: v
-            for k, v in gb_info.group_proposal_kwargs.items()
-            if k != "num_repeat_proposals"
-        },
+        debug_settings=debug_settings,
+        leaf_cap_settings=leaf_cap_settings,
+        sighet_settings=sighet_settings,
+        num_band_preload=getattr(gb_info, "num_band_preload", None),
+        num_bands_preload_temp=getattr(gb_info, "num_bands_preload_temp", None),
+        ntemps=ntemps,
+        stft_store_windows=gb_info.stft_store_windows,
     )
 
-    # Phase-maximised RJ births for the prior moves (two-quadrature
-    # analytic maximisation in the band engines; the accepted phi0 is
-    # rotated to the maximum). GB_RJ_PHASE_MAXIMIZE=1 turns it on --
-    # gb_no_foreground defaults it ON under GB_MODE=search (the
-    # "annealing" configuration) and OFF otherwise.
     _rj_phase_max = bool(int(os.environ.get("GB_RJ_PHASE_MAXIMIZE", "0")))
 
-    #* ============================================= SEARCH MOVES =============================================
-    gb_search_prune_move = GBSpecialRJPriorMove(
-        *gb_move_args,
-        rj_proposal_distribution=gpu_priors,
-        name="rj_prior_search",
-        use_prior_removal=True,
-        phase_maximize=_rj_phase_max,
-        ranks_needed=0,
-        run_swaps=True,
-        gpus=[],
-        **gb_move_kwargs
-    )
-    gb_search_prune_move.accepted = np.zeros((ntemps, nwalkers))
-    
-    gb_search_fstat_mcmc_move = GBSpecialRJSerialSearchMCMC(
-        *gb_move_args, 
-        rj_proposal_distribution=None,
-        is_rj_prop=True,
-        run_swaps=False, 
-        name="rj_fstat_mcmc_search",
-        phase_maximize=True,
-        ranks_needed=0,
-        gpus=[],
-        # Leaf-cap counters advance once per iteration: the prior RJ move is
-        # the designated updater; the other RJ moves only enforce the gate.
-        **{**gb_move_kwargs, "leaf_cap_update": False}
-    )
-    gb_search_fstat_mcmc_move.accepted = np.zeros((ntemps, nwalkers))
+    # Check aliases in kwargs if any
+    if "pe_search_names" in kwargs and pe_move_names is None:
+        pe_move_names = kwargs.pop("pe_search_names")
+    if "search_moves_names" in kwargs and search_move_names is None:
+        search_move_names = kwargs.pop("search_moves_names")
 
-    # The RJ refit moves load a GMM-refit proposal file (``main_file_path``)
-    # produced during a run. When it is absent (fresh run / smoke, or refit
-    # disabled) the refit moves are optional and skipped: the search refit move
-    # is already excluded from ``gb_search_moves``, and the PE refit move is
-    # dropped from ``gb_pe_moves`` below. This keeps the prior + fstat moves
-    # (incl. GBSpecialRJPriorMove) buildable without the refit artifact.
+    # Resolve search_move_names
+    if search_move_names is None:
+        if include_search is False:
+            search_move_names = []
+        elif include_search is True:
+            if isinstance(domain_settings, FDSettings):
+                search_move_names = ["rj_fstat_mcmc_search", "rj_prior_search"]
+            else:
+                search_move_names = ["rj_prior_search"]
+        else:
+            # search_move_names is None and include_search is None
+            if isinstance(domain_settings, FDSettings):
+                search_move_names = ["rj_fstat_mcmc_search", "rj_prior_search"]
+            else:
+                search_move_names = []
+    else:
+        search_move_names = list(search_move_names)
+
+    # Refit file check
     _refit_fp = getattr(general_info, "main_file_path", None)
     _refit_available = include_refit and isinstance(_refit_fp, str) and os.path.exists(_refit_fp)
 
-    if _refit_available:
-        gb_search_refit_move = GBSpecialRJRefitMove(
-            *gb_move_args,
-            rj_proposal_distribution=None,
-            is_rj_prop=True,
-            run_swaps=False,
-            name="rj_refit_search",
-            fp=_refit_fp,
-            phase_maximize=True,  # gb_info["pe_info"]["rj_phase_maximize"],
-            ranks_needed=0,
-            gpus=[],
-            **{**gb_move_kwargs, "leaf_cap_update": False}
-        )
-        gb_search_refit_move.accepted = np.zeros((ntemps, nwalkers))
+    # Resolve pe_move_names
+    if pe_move_names is None:
+        if isinstance(domain_settings, FDSettings):
+            pe_move_names = (
+                ["rj_prior", "rj_refit", "rj_fstat_mcmc"]
+                if _refit_available
+                else ["rj_prior", "rj_fstat_mcmc"]
+            )
+        else:
+            pe_move_names = ["rj_prior"]
+    else:
+        pe_move_names = list(pe_move_names)
 
-    # gb_search_refit_move, Refit currently not used for search
-    gb_search_moves = (
-        [gb_search_fstat_mcmc_move, gb_search_prune_move] if include_search else []
-    )
+    # Validate domain compatibility
+    fd_only_moves = {"rj_fstat_mcmc_search", "rj_fstat_mcmc", "rj_refit_search", "rj_refit"}
+    if not isinstance(domain_settings, FDSettings):
+        for name in search_move_names + pe_move_names:
+            if name in fd_only_moves:
+                raise NotImplementedError(
+                    f"GB move '{name}' requires FD basis, but domain is {type(domain_settings).__name__}."
+                )
 
-    #* ============================================= PARAMETER ESTIMATION MOVES =============================================
-    gb_pe_prior_move = GBSpecialRJPriorMove(
-        *gb_move_args, 
-        rj_proposal_distribution=gpu_priors,
-        name="rj_prior",
-        use_prior_removal=False,  # gb_info["pe_info"]["use_prior_removal"],
-        phase_maximize=_rj_phase_max,
-        ranks_needed=0,
-        run_swaps=True, 
-        gpus=[],
-        **gb_move_kwargs
-    )
-    gb_pe_prior_move.accepted = np.zeros((ntemps, nwalkers))
+    # Validate refit availability if explicitly requested
+    for name in search_move_names + pe_move_names:
+        if name in ("rj_refit", "rj_refit_search") and not _refit_available:
+            raise FileNotFoundError(
+                f"GB refit move '{name}' was requested, but refit file '{_refit_fp}' "
+                f"does not exist or include_refit is False."
+            )
 
-    gb_pe_fstat_mcmc_move = GBSpecialRJSerialSearchMCMC(
-        *gb_move_args, 
-        rj_proposal_distribution=None,
-        run_swaps=True,
-        name="rj_fstat_mcmc",
-        phase_maximize=False,
-        ranks_needed=0,
-        gpus=[],
-        **{**gb_move_kwargs, "leaf_cap_update": False}
-    )
-    gb_pe_fstat_mcmc_move.accepted = np.zeros((ntemps, nwalkers))
+    def _create_move(name: str) -> GBSpecialBase:
+        if name == "rj_prior_search":
+            move = GBSpecialRJPriorMove(
+                *gb_move_args,
+                rj_proposal_distribution=gpu_priors,
+                name="rj_prior_search",
+                use_prior_removal=True,
+                phase_maximize=_rj_phase_max,
+                ranks_needed=0,
+                run_swaps=True,
+                **gb_move_kwargs,
+            )
+        elif name == "rj_fstat_mcmc_search":
+            move = GBSpecialRJSerialSearchMCMC(
+                *gb_move_args,
+                rj_proposal_distribution=None,
+                is_rj_prop=True,
+                run_swaps=False,
+                name="rj_fstat_mcmc_search",
+                phase_maximize=True,
+                ranks_needed=0,
+                **{**gb_move_kwargs, "leaf_cap_update": False},
+            )
+        elif name == "rj_refit_search":
+            move = GBSpecialRJRefitMove(
+                *gb_move_args,
+                rj_proposal_distribution=None,
+                is_rj_prop=True,
+                run_swaps=False,
+                name="rj_refit_search",
+                fp=_refit_fp,
+                phase_maximize=True,
+                ranks_needed=0,
+                **{**gb_move_kwargs, "leaf_cap_update": False},
+            )
+        elif name == "rj_prior":
+            move = GBSpecialRJPriorMove(
+                *gb_move_args,
+                rj_proposal_distribution=gpu_priors,
+                name="rj_prior",
+                use_prior_removal=False,
+                phase_maximize=_rj_phase_max,
+                ranks_needed=0,
+                run_swaps=True,
+                **gb_move_kwargs,
+            )
+        elif name == "rj_fstat_mcmc":
+            move = GBSpecialRJSerialSearchMCMC(
+                *gb_move_args,
+                rj_proposal_distribution=None,
+                run_swaps=True,
+                name="rj_fstat_mcmc",
+                phase_maximize=False,
+                ranks_needed=0,
+                **{**gb_move_kwargs, "leaf_cap_update": False},
+            )
+        elif name == "rj_refit":
+            move = GBSpecialRJRefitMove(
+                *gb_move_args,
+                rj_proposal_distribution=None,
+                run_swaps=True,
+                name="rj_refit",
+                fp=_refit_fp,
+                phase_maximize=False,
+                ranks_needed=0,
+                **{**gb_move_kwargs, "leaf_cap_update": False},
+            )
+        else:
+            raise ValueError(f"Unknown GB move name '{name}'.")
 
-    # Prior + fstat moves always build; the refit move is inserted only when
-    # its GMM-refit file is available (see ``_refit_available`` above).
-    gb_pe_moves = [gb_pe_prior_move, gb_pe_fstat_mcmc_move]
-    if _refit_available:
-        gb_pe_refit_move = GBSpecialRJRefitMove(
-            *gb_move_args,
-            rj_proposal_distribution=None,
-            run_swaps=True,
-            name="rj_refit",
-            fp=_refit_fp,
-            phase_maximize=False,  # gb_info["pe_info"]["rj_phase_maximize"],
-            ranks_needed=0,
-            gpus=[],
-            **{**gb_move_kwargs, "leaf_cap_update": False}
-        )
-        gb_pe_refit_move.accepted = np.zeros((ntemps, nwalkers))
-        gb_pe_moves.insert(1, gb_pe_refit_move)  # [prior, refit, fstat]
+        move.accepted = np.zeros((ntemps, nwalkers))
+        return move
 
-    # Design knob: keep only the requested PE moves (order-preserving subset).
-    # Absorbs the ``[m for m in gb_pe_moves if "prior" in m.name]`` filtering the
-    # GB settings files used to do post-hoc.
-    if pe_move_names is not None:
-        gb_pe_moves = [m for m in gb_pe_moves if m.name in pe_move_names]
+    gb_search_moves = [_create_move(name) for name in search_move_names]
+    gb_pe_moves = [_create_move(name) for name in pe_move_names]
 
     return gb_search_moves, gb_pe_moves
 
@@ -1912,15 +1928,19 @@ class GBMoveBuilder(SourceMoveBuilder):
         self,
         *,
         Tmax: float = 1e6,
-        include_search: bool = True,
+        search_move_names: typing.Optional[typing.Sequence[str]] = None,
+        pe_move_names: typing.Optional[typing.Sequence[str]] = None,
+        include_search: typing.Optional[bool] = None,
         include_refit: bool = True,
-        pe_move_names: typing.Optional[list] = None,
+        **kwargs,
     ):
         super().__init__(branch_name="gb")
         self.Tmax = Tmax
+        self.search_move_names = search_move_names
+        self.pe_move_names = pe_move_names
         self.include_search = include_search
         self.include_refit = include_refit
-        self.pe_move_names = pe_move_names
+        self.extra_kwargs = kwargs
 
     def build(self, engine_info, curr, acs, priors, state):
         return build_gb_moves(
@@ -1930,9 +1950,11 @@ class GBMoveBuilder(SourceMoveBuilder):
             priors,
             state,
             Tmax=self.Tmax,
+            search_move_names=self.search_move_names,
+            pe_move_names=self.pe_move_names,
             include_search=self.include_search,
             include_refit=self.include_refit,
-            pe_move_names=self.pe_move_names,
+            **self.extra_kwargs,
         )
 
 
