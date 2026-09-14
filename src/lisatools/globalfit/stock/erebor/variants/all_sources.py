@@ -193,6 +193,14 @@ class AllSourcesGeneralSettings(EreborGeneralSettings):
             "GB": [0], "VGB": [0], "MBHB": [0], "EMRI": [1], "SOBHB": [0]
         }
     )
+    # HYBRID mojito (2026-09-14): when a per-source MBHB/EMRI/SOBHB L1 brick
+    # is missing from the mojito folder (transfer incomplete), synthesize
+    # that source's stream in-process from its CATALOGUE parameters (same
+    # converters as the branch preps, mojito epochs, the run's real orbits)
+    # instead of failing. Default off: a missing brick stays a loud error.
+    synthesize_missing_bricks: bool = dataclasses.field(
+        default_factory=env_default("SYNTHESIZE_MISSING_BRICKS", False, bool)
+    )
     # Mojito L1 signals are noiseless: add instrument noise so the psd branch
     # has something to fit (the loaded GB galaxy itself plays the role of the
     # foreground for the galfor branch). True (default) auto-resolves to
@@ -478,6 +486,13 @@ class AllSourcesGlobalFit(EreborFit):
                     "all_sources data_mode='mojito' has no loadable classes "
                     "(check mojito_source_ids vs the present branches)."
                 )
+            # HYBRID missing-brick fill needs the MBH phenom kwargs so a
+            # synthesized MBH stream matches the branch template exactly.
+            _mbh = (
+                self.mbh
+                if "mbh" in self._branch_names
+                else AllSourcesMBHSettings()
+            )
             gs.data_processor_class = L1ProcessingStepWithSyntheticNoise
             gs.processor_init_kwargs = dict(
                 L1_folder=gs.mojito_data_path,
@@ -493,6 +508,20 @@ class AllSourcesGlobalFit(EreborFit):
                 noise_sa_a=gs.noise_sa_a,
                 noise_seed=gs.noise_seed,
                 tdi_generation=tdi_generation_info(gs.tdi_chan)[0],
+                synthesize_missing=gs.synthesize_missing_bricks,
+                tdi_chan=gs.tdi_chan,
+                tdi_gen_str=gs.tdi_gen_str,
+                synth_force_backend=force_backend,
+                mbh_phenom_kwargs=dict(
+                    waveform_duration=_mbh.waveform_duration,
+                    higher_modes=_mbh.higher_modes,
+                    phenom_tol=_mbh.phenom_tol,
+                    start_freq=_mbh.start_freq,
+                    response_order=_mbh.response_order,
+                    buffer_time=_mbh.buffer_time,
+                    min_freq=gs.min_freq,
+                    max_freq=gs.max_freq,
+                ),
             )
             return
         if gs.data_mode == "sangria":

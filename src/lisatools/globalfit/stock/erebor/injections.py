@@ -1048,6 +1048,7 @@ def build_synthetic_source_streams(
     sobbh_reference_time: Optional[float] = None,
     mbh_wave_gen=None,
     mbh_transform=None,
+    orbits=None,
 ) -> tuple:
     """Build per-class TD signal sums via the cached response wrappers.
 
@@ -1055,6 +1056,12 @@ def build_synthetic_source_streams(
     -> the window start; mojito mode passes ``MOJITO_REFERENCE_TIME``).
     ``mbh_wave_gen`` (a ``PhenomTHMTDIWaveform``) and ``mbh_transform`` are
     required only when ``mbh_injections`` is non-empty.
+
+    ``orbits`` (default ``None`` = the stock analytic orbits, the synthetic-
+    mode behavior) is threaded into the EMRI/SOBBH generators; the HYBRID
+    missing-brick fill passes the run's REAL loader orbits so synthesized
+    streams null against the branch templates exactly (the caller builds
+    ``mbh_wave_gen`` with the same orbits itself).
     """
     tdi_config = TDIConfig(tdi_gen_str, force_backend=force_backend)
     zero = np.zeros((nchannels, target_N), dtype=np.float64)
@@ -1067,6 +1074,7 @@ def build_synthetic_source_streams(
             Tobs=Tobs, dt=dt, t_start=t_start,
             tdi_config=tdi_config, tdi_chan=tdi_chan,
             role="injection", force_backend=force_backend,
+            orbits=orbits,
         )
         for ii, params in enumerate(emri_injections):
             logger.info(f"EMRI inject signal {ii + 1} of {len(emri_injections)} [start]")
@@ -1093,6 +1101,7 @@ def build_synthetic_source_streams(
             tdi_config=tdi_config,
             reference_time=sobbh_reference_time,
             force_backend=force_backend,
+            orbits=orbits,
         )
         t_arr_sobbh = np.arange(target_N) * dt + t_start
         sobbh_wrap = SOBBHTDIonFlyWaveWrap(
@@ -1173,6 +1182,11 @@ class L1ProcessingStepWithSyntheticNoise(L1ProcessingStep):
         annual_amp: float = 0.10,
         annual_phase0: float = 0.0,
         tdi_generation: int = 2,
+        synthesize_missing: bool = False,
+        tdi_chan: str = "XYZ",
+        tdi_gen_str: str = "2nd generation",
+        synth_force_backend: str = "cpu",
+        mbh_phenom_kwargs: Optional[dict] = None,
     ):
         if add_instrument_noise not in (False, True, "synthetic", "mojito"):
             raise ValueError(
@@ -1204,6 +1218,7 @@ class L1ProcessingStepWithSyntheticNoise(L1ProcessingStep):
             do_plots=do_plots,
             Tobs=Tobs,
             window_start_offset=window_start_offset,
+            allow_missing_bricks=synthesize_missing,
         )
         # super().__init__ already called load_data() and stored .data,
         # .times, .fs, .orbits, .catalogue.
@@ -1239,6 +1254,118 @@ class L1ProcessingStepWithSyntheticNoise(L1ProcessingStep):
                 place_td_signal_on_grid(fg_td[:nch], grid).arr
             )
         self.data = combined
+
+        # ---- HYBRID missing-brick fill (2026-09-14) --------------------
+        # Bricks still in transfer: synthesize the recorded misses from
+        # their CATALOGUE parameters -- the same catalogue->basis
+        # converters the branch preps use, the mojito epochs, and the
+        # run's REAL loader orbits -- so the synthesized sources null
+        # against the branch templates exactly. Only MBHB/EMRI/SOBHB have
+        # this fill; a missing GB/VGB brick stays a loud failure.
+        self.synthesized_sources: list = []
+        _missing = list(getattr(self, "missing_source_bricks", []) or [])
+        if _missing:
+            _bad = [m for m in _missing if m[0] not in
+                    ("MBHB", "EMRI", "SOBHB")]
+            if _bad:
+                raise ValueError(
+                    f"missing bricks {_bad} cannot be synthesized "
+                    "(catalogue-parameter fill exists only for "
+                    "MBHB/EMRI/SOBHB) -- transfer those bricks or drop "
+                    "the branch."
+                )
+            self.data = self.data + self._synthesize_missing_streams(
+                _missing,
+                tdi_chan=tdi_chan,
+                tdi_gen_str=tdi_gen_str,
+                force_backend=synth_force_backend,
+                mbh_phenom_kwargs=mbh_phenom_kwargs,
+            )
+            self.synthesized_sources = list(_missing)
+
+    def _synthesize_missing_streams(self, missing, *, tdi_chan,
+                                    tdi_gen_str, force_backend,
+                                    mbh_phenom_kwargs=None):
+        """TD sum of the missing sources, built from catalogue truths.
+
+        Provenance is logged loudly per source; brick-backed sources carry
+        mojito's waveform conventions, synthesized ones are exact against
+        our own generators by construction.
+        """
+        # recipe hosts MOJITO_REFERENCE_TIME + the MBH converter; imported
+        # lazily (recipe imports pieces of this module at top level)
+        from ...recipe import (
+            MOJITO_REFERENCE_TIME,
+            mbh_catalogue_to_sampling_basis,
+        )
+        from lisatools.sources.emri.waveform import (
+            emri_catalogue_to_waveform_basis,
+        )
+
+        by_cls: dict = {"MBHB": [], "EMRI": [], "SOBHB": []}
+        for cls, sid in missing:
+            by_cls[cls].append(sid)
+
+        def _rows(cls, conv, width):
+            ids = sorted(by_cls[cls])
+            if not ids:
+                return np.zeros((0, width))
+            return np.asarray(
+                [conv(self.catalogue[cls][sid]) for sid in ids],
+                dtype=float,
+            )
+
+        rows_mbh = _rows("MBHB", mbh_catalogue_to_sampling_basis, 11)
+        rows_emri = _rows("EMRI", emri_catalogue_to_waveform_basis, 14)
+        rows_sobbh = _rows("SOBHB", sobbh_catalogue_to_waveform_basis, 11)
+
+        target_N = int(round(self.T / self.dt))
+        t0 = float(self.times[0])
+        nch = self.data.shape[0]
+
+        mbh_wave_gen = None
+        mbh_transform = None
+        if rows_mbh.shape[0] > 0:
+            grid = TDSettings(
+                N=target_N, dt=self.dt, t0=t0, force_backend="cpu"
+            )
+            mbh_wave_gen = get_mbh_phenom_wave_gen(
+                data_td_settings=grid,
+                waveform_t0=MOJITO_REFERENCE_TIME,  # mojito t_plunge epoch
+                dt=self.dt,
+                orbits=self.orbits,
+                output_domain_settings=None,
+                force_backend=force_backend,
+                data_span=self.T,
+                tdi_gen_str=tdi_gen_str,
+                tdi_chan=tdi_chan,
+                **(mbh_phenom_kwargs or {}),
+            )
+            mbh_transform = make_mbh_transform_container()
+
+        logger.warning(
+            "[HYBRID] synthesizing %d source(s) with missing bricks from "
+            "catalogue parameters (real orbits, mojito epochs): %s",
+            len(missing), missing,
+        )
+        emri_td, sobbh_td, mbh_td = build_synthetic_source_streams(
+            Tobs=self.T,
+            dt=self.dt,
+            t_start=t0,
+            target_N=target_N,
+            nchannels=nch,
+            force_backend=force_backend,
+            emri_injections=rows_emri,
+            sobbh_injections=rows_sobbh,
+            mbh_injections=rows_mbh,
+            tdi_chan=tdi_chan,
+            tdi_gen_str=tdi_gen_str,
+            sobbh_reference_time=MOJITO_REFERENCE_TIME,  # mojito f_low epoch
+            mbh_wave_gen=mbh_wave_gen,
+            mbh_transform=mbh_transform,
+            orbits=self.orbits,
+        )
+        return emri_td + sobbh_td + mbh_td
 
 
 class SyntheticDataProcessor(BaseProcessingStep):

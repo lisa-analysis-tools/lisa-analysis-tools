@@ -215,11 +215,21 @@ class L1DataLoader:
         orbits_kwargs: dict = None,
         verbose: bool = True,
         store_individual_timeseries: bool = False,  # whether to store individual timeseries for each source type and ID
+        allow_missing_bricks: bool = False,
     ):
         self.data_folder = os.path.join(L1_folder, "data")
         self.catalogues_folder = os.path.join(L1_folder, "catalogues")
 
         self.catalogue = {}
+        # HYBRID support (2026-09-14): when ``allow_missing_bricks`` is on, a
+        # missing per-source L1 brick is RECORDED here (its catalogue
+        # parameters are still loaded) instead of raising -- the caller is
+        # then responsible for synthesizing the missing sources' streams
+        # (see erebor's ``L1ProcessingStepWithSyntheticNoise
+        # (synthesize_missing=True)``). Default off: a missing file stays a
+        # loud failure.
+        self.allow_missing_bricks = bool(allow_missing_bricks)
+        self.missing_source_bricks: list = []
 
         source_types = [st.upper() for st in source_types]
 
@@ -526,15 +536,9 @@ class L1DataLoader:
                 for source_id in tqdm(
                     ids, desc=f"Loading {source_type} sources", disable=not self.verbose
                 ):
-                    # Resolve the per-class brick ONLY when its waveform is
-                    # actually needed: under COMBINED the signal is already in
-                    # the data, so requiring the file to exist would make the
-                    # combined stream depend on bricks it does not read.
-                    file_path = (
-                        None if combined_base
-                        else find_file(subfolder, source_type, source_id)
-                    )
-
+                    # Catalogue parameters load UNCONDITIONALLY -- for a
+                    # missing brick under allow_missing_bricks they are what
+                    # the synthetic fill builds the source from.
                     self.catalogue[source_type][source_id] = self.load_single_binary(
                         binary_params, source_id, source_type
                     )
@@ -547,6 +551,26 @@ class L1DataLoader:
                         # Catalogue read; the waveform is ALREADY in the
                         # combined stream, so loading the brick would
                         # double-count it (and cost a multi-GB read).
+                        continue
+
+                    # Resolve the per-class brick ONLY when its waveform is
+                    # actually needed: under COMBINED the signal is already in
+                    # the data, so requiring the file to exist would make the
+                    # combined stream depend on bricks it does not read.
+                    try:
+                        file_path = find_file(subfolder, source_type, source_id)
+                    except FileNotFoundError:
+                        if not self.allow_missing_bricks:
+                            raise
+                        self.missing_source_bricks.append(
+                            (source_type, source_id)
+                        )
+                        logger.warning(
+                            f"[HYBRID] {source_type} source {source_id}: no "
+                            "L1 brick found -- catalogue parameters kept; "
+                            "the caller must synthesize this source's "
+                            "stream (allow_missing_bricks=True)."
+                        )
                         continue
 
                     with self._open(file_path) as f:
@@ -580,6 +604,16 @@ class L1DataLoader:
                             _individual_timeseries[f"{source_type}_{source_id}"] = (
                                 _xyz.T.copy()
                             )  # store individual timeseries for this source
+
+        if xyz is None:
+            raise RuntimeError(
+                "No L1 brick could be loaded at all"
+                + (f" (missing: {self.missing_source_bricks})"
+                   if self.missing_source_bricks else "")
+                + "; the hybrid fill still needs at least one real brick "
+                "for the time grid and orbits -- use data_mode='synthetic' "
+                "instead."
+            )
 
         xyz = xyz.T  # Transpose to have shape (n_channels, n_times)
         assert (
@@ -1262,6 +1296,7 @@ class L1ProcessingStep(L1DataLoader, BaseProcessingStep):
         do_plots: bool = False,
         Tobs: float = None,
         window_start_offset: float = 0.0,
+        allow_missing_bricks: bool = False,
     ):
         L1DataLoader.__init__(
             self,
@@ -1272,6 +1307,7 @@ class L1ProcessingStep(L1DataLoader, BaseProcessingStep):
             orbits_kwargs=orbits_kwargs,
             verbose=verbose,
             store_individual_timeseries=store_individual_timeseries,
+            allow_missing_bricks=allow_missing_bricks,
         )
 
         times, fs, data_xyz, orbits = self.load_data()
