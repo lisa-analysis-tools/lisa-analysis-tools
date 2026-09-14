@@ -2936,7 +2936,17 @@ def build_gb_moves(
         phase_maximize=_rj_phase_max,
         run_swaps=_temper_all_moves or not _temper_on_removal,
         gpus=[],
-        **{**gb_move_kwargs, **_imr_search}
+        # FLIP DEFAULT WAS MISSING HERE (found 2026-09-14 on the 3mo/1yr
+        # overnight runs): every other RJ move carried
+        # ``rj_flip_fraction_default``, this one -- the production search
+        # birth move -- did not, so it resolved to the ctor default 1.0 and
+        # visited EVERY dead row each iteration (jobs 474/476/480: births
+        # drawn ~78-90% of all dead rows, the remainder being at-cap cells),
+        # while the 08-28 "0.2 everywhere" ruling and the 09-11 stage knob
+        # only ever thinned the other moves. Now wired like the rest.
+        **{**gb_move_kwargs,
+           "rj_flip_fraction_default": _search_rj_flip_default(),
+           **_imr_search}
     )
     gb_search_prune_move.accepted = np.zeros((ntemps, nwalkers))
     

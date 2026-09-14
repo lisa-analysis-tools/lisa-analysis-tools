@@ -624,7 +624,14 @@ export GB_PSD_MIRROR_PARITY_PROPOSES=0
 # iteration scoring 3.1M births for 6,028 accepts (35 cold). Deaths are
 # gated per pick at the same fraction; alive rows still pool for their
 # in-model repeats regardless.
-export GB_SEARCH_RJ_FLIP_FRACTION=0.1
+# SEARCH 0.5, NOT 0.1 (2026-09-14): rj_fstat_search never received the flip
+# default (recipe wiring miss, fixed the same day), so it ran at 1.0 -- every
+# dead row visited every iteration -- in jobs 476/480 while this line said
+# 0.1 (job 480: 4.55M births drawn per iteration). The intended "half the
+# birth attempts" against what actually ran is therefore 0.5; 0.1 would be a
+# 10x cut of the search feed. PE moves DID carry 0.2 before, so 0.1 there is
+# the intended halving.
+export GB_SEARCH_RJ_FLIP_FRACTION=0.5
 export GB_PE_RJ_FLIP_FRACTION=0.1
 # export GB_RJ_FLIP_FRACTION=0.2   # <- re-export ONLY to force ALL stages
 # In-model info-matrix jump scale: 0.005 default measured 95% cold

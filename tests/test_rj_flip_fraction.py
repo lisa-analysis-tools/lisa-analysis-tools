@@ -513,5 +513,41 @@ class StageFlipEnvKnobTest(unittest.TestCase):
             0.7)
 
 
+class RecipeWiringPinTest(unittest.TestCase):
+    """Every RJ move the recipe builds must carry ``rj_flip_fraction_default``.
+
+    Found 2026-09-14: ``rj_fstat_search`` -- the production search birth
+    move -- was the one constructor without it, so it resolved to the ctor
+    default 1.0 and visited every dead row each iteration while the 08-28
+    "0.2 everywhere" ruling and the 09-11 stage knobs only thinned the other
+    moves. A source scan is the cheapest pin: building the recipe needs the
+    full stock stack. ``rj_refit`` is exempt (not wired into any stage).
+    """
+
+    EXEMPT = {"rj_refit"}
+
+    def test_every_rj_constructor_carries_the_flip_default(self):
+        import re
+        import lisatools.globalfit.recipe as recipe
+        src = open(recipe.__file__).read()
+        missing = []
+        for m in re.finditer(r'name="(rj_[a-z_]+)"', src):
+            # scan forward to the constructor's closing paren
+            j, depth = m.start(), 1
+            while j < len(src) - 1 and depth > 0:
+                j += 1
+                if src[j] == "(":
+                    depth += 1
+                elif src[j] == ")":
+                    depth -= 1
+            # ...and back to the constructor's opening line
+            start = src.rfind("\n", 0, src.rfind("(", 0, m.start()))
+            block = src[start:j + 1]
+            if ("rj_flip_fraction_default" not in block
+                    and m.group(1) not in self.EXEMPT):
+                missing.append(m.group(1))
+        self.assertEqual(missing, [], f"RJ moves without a flip default: {missing}")
+
+
 if __name__ == "__main__":
     unittest.main()
