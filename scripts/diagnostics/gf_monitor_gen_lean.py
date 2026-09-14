@@ -42,6 +42,11 @@ Optional inputs, read from the run directory or the working directory:
 Without them the recovery section degrades to a note; every other section
 still builds.
 
+Env knobs: GF_MONITOR_MATCH_STATS=1 (match-criterion panels),
+GF_MONITOR_ARM_TAG=<tag> (arm-cache name override),
+GF_MONITOR_PNG_DIR=<dir> (also write every rendered figure as a PNG there;
+the page itself stays self-contained either way).
+
 COLOUR CONVENTION, one meaning per hue (the previous page used red for five
 different things):
   cyan   injected data / the injected catalogue / arm v2
@@ -81,6 +86,27 @@ plt.rcParams.update({
 
 IMGS, MISSING = {}, []
 
+# PNG SIDE-OUTPUT (2026-09-14, user request): the page inlines every figure
+# as a base64 data URI and nothing is ever written to disk. Set
+# GF_MONITOR_PNG_DIR=<dir> to ALSO write each rendered image there --
+# <dir>/<key>.png for the page panels (key = the alt/IMGS key, e.g. ll,
+# gb_cap_cells, f11_psd), <dir>/corners/<label>.png for the per-source
+# corner plots, <dir>/gb_cap_divisor.png for the pre-rendered study image.
+# Unset (default) = exactly the old behaviour.
+PNG_DIR = os.environ.get("GF_MONITOR_PNG_DIR", "").strip() or None
+if PNG_DIR:
+    os.makedirs(os.path.join(PNG_DIR, "corners"), exist_ok=True)
+
+
+def _dump_png(name, raw, sub=None):
+    """Write ``raw`` PNG bytes to PNG_DIR/[sub/]<name>.png when enabled."""
+    if not PNG_DIR:
+        return
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("_") or "figure"
+    d = os.path.join(PNG_DIR, sub) if sub else PNG_DIR
+    with open(os.path.join(d, safe + ".png"), "wb") as fh:
+        fh.write(raw)
+
 # MATCH-CRITERION CONTENT GATE (user ruling 2026-08-19). The page's
 # completeness / purity / matched-pair numbers all come from the 2-bin f0
 # PROXY match, not the real phase-maximised overlap statistic (too heavy to
@@ -95,6 +121,7 @@ def fig_b64(fig, key, dpi=None):
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=dpi)
     plt.close(fig)
     IMGS[key] = base64.b64encode(buf.getvalue()).decode()
+    _dump_png(key, buf.getvalue())
 
 def img(key, alt=""):
     if key not in IMGS:
@@ -1126,7 +1153,7 @@ for _dp in (os.path.join(RUN_DIR, "gb_cap_divisor_study.png"),
             "gb_cap_divisor_study.png"):
     if os.path.exists(_dp):
         with open(_dp, "rb") as _fh:
-            IMGS["gb_cap_divisor"] = base64.b64encode(_fh.read()).decode()
+            _raw = _fh.read(); IMGS["gb_cap_divisor"] = base64.b64encode(_raw).decode(); _dump_png("gb_cap_divisor", _raw)
         break
 
 # ---- 5b. GB BIRTH FATE (from [GB_ACCEPT rj-split]) ----
@@ -2973,6 +3000,7 @@ try:
         plt.close(fig_)
         raw = buf.getvalue()
         (CORNER_BYTES if tally is None else tally).append(len(raw))
+        _dump_png(title, raw, sub="corners")
         return base64.b64encode(raw).decode()
 
     def vgb_corner_png(leaf, title):
