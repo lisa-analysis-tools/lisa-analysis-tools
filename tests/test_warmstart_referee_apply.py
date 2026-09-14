@@ -1,4 +1,4 @@
-"""Tests for scripts/gb/warmstart_referee_apply.py — the stage-2.5 step that
+"""Tests for lisatools.globalfit.warmstart.referee_apply — the stage-2.5 step that
 turns (fit npz, referee npz) into the REFEREED components npz production arms
 via GB_WARM_START_COMPONENTS (docs/6mo-run-prep.md warm-start workstream):
 
@@ -24,16 +24,11 @@ from lisatools.sampling.warmstart_proposal import (
 
 TOBS = 7776000.0
 
-_APPLY = (Path(__file__).resolve().parents[1]
-          / "scripts" / "gb" / "warmstart_referee_apply.py")
-
-
 def _load_apply_module():
-    spec = importlib.util.spec_from_file_location(
-        "warmstart_referee_apply", _APPLY)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    # installed code (2026-09-14 move): no path loading
+    from lisatools.globalfit.warmstart import referee_apply
+
+    return referee_apply
 
 
 def _make_cov(sigmas, corr_off=0.15):
@@ -64,14 +59,16 @@ def _fit_npz(path, means, covs, p, mult=None, island_id=None):
     )
 
 
-def _referee_npz(path, n, pairs, cross, med_ratio=None):
+def _referee_npz(path, n, pairs, cross, med_ratio=None, med_match=None):
     med = np.full(n, np.nan) if med_ratio is None else np.asarray(
         med_ratio, dtype=float)
     refereed = np.flatnonzero(np.isfinite(med))
     np.savez_compressed(
         path,
         referee=refereed.astype(np.int64),
-        med_match=np.where(np.isfinite(med), 0.95, np.nan),
+        med_match=(np.where(np.isfinite(med), 0.95, np.nan)
+                   if med_match is None
+                   else np.asarray(med_match, dtype=float)),
         min_match=np.where(np.isfinite(med), 0.5, np.nan),
         med_ratio=med,
         n_sampled=np.where(np.isfinite(med), 8, 0).astype(np.int64),
@@ -112,6 +109,28 @@ class RefereeApplyTest(unittest.TestCase):
         out = os.path.join(self.dir, "refereed.npz")
         self.mod.apply(self.fit, ref, out, **kwargs)
         return np.load(out, allow_pickle=False)
+
+    def test_wide_blend_flagged_by_mult_and_match(self):
+        # The 2026-09-08 gap: WIDE blends (absorbed sources bins apart)
+        # carry HIGH med_ratio -- the member f0 spread makes the sinc
+        # prediction tiny, so ratio ~1 excuses a raw match of ~0.35 -- and
+        # escaped the ratio-only flag. Discriminators that work: mult > 2
+        # (comp 0) or raw med_match < 0.6 (comp 2).
+        fit = os.path.join(self.dir, "fit_wide.npz")
+        _fit_npz(fit, self.means, self.covs,
+                 p=np.array([1.0, 0.95, 0.9]),
+                 mult=[2.8, 1.0, 1.4], island_id=[0, 1, 2])
+        ref = os.path.join(self.dir, "ref_wide.npz")
+        _referee_npz(ref, 3, np.empty((0, 2)), [],
+                     med_ratio=[1.05, 1.0, 1.1],
+                     med_match=[0.45, 0.99, 0.35])
+        out = os.path.join(self.dir, "refereed_wide.npz")
+        self.mod.apply(fit, ref, out)
+        z = np.load(out, allow_pickle=False)
+        blend = np.array(z["blend"], dtype=bool)
+        self.assertTrue(blend[0], "mult-2.8 wide blend must be flagged")
+        self.assertFalse(blend[1], "clean comp must not be flagged")
+        self.assertTrue(blend[2], "med_match-0.35 blend must be flagged")
 
     def test_merges_high_cross_pair(self):
         out = self._run([[0, 1]], [0.95])

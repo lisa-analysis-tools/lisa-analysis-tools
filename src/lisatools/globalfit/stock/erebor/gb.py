@@ -461,10 +461,10 @@ class GBSettings(Settings):
     rj_birth_distribution: typing.Optional[typing.Any] = None
     # Warm-start components npz path (workstream B, user ruling 2026-08-24):
     # the clustered previous-run posterior components file produced by
-    # scripts/gb/warmstart_fit_from_store.py. Non-empty -> build_gb_moves
+    # lisatools.globalfit.warmstart.fit_from_store. Non-empty -> build_gb_moves
     # constructs the ``rj_warm_search`` RJ birth move (the prior-RJ move
     # class drawing full 9-column births from
-    # ``lisatools.sampling.warmstart_proposal.WarmStartComponents``: mixture
+    # ``lisatools.globalfit.warmstart.proposal.WarmStartComponents``: mixture
     # weights ~ inclusion probability p, f0 windows re-derived against the
     # NEW run's 1/Tobs, no phase maximization); the staged search recipes
     # order it IMMEDIATELY BEFORE ``rj_fstat_search``. Empty/unset (default)

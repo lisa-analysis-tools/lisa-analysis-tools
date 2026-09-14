@@ -2,17 +2,18 @@
 
 The warm-start refit proposal (``rj_warm_search`` / ``rj_warm_pe``) needs a
 REFEREED components npz built from the previous run's store by the three-step
-pipeline fit -> referee -> apply (``scripts/gb/warmstart_fit_from_store.py``
--> ``warmstart_match_referee.py`` -> ``warmstart_referee_apply.py``). The 6mo
-campaign's first launch failed on that npz being missing, so
-:func:`ensure_warm_start_components` now runs the pipeline automatically at
-recipe build when the npz is absent and ``GB_WARM_START_SOURCE_STORE`` names
-the source store.
+pipeline fit -> referee -> apply. The 6mo campaign's first launch failed on
+that npz being missing, so :func:`ensure_warm_start_components` runs the
+pipeline automatically at recipe build when the npz is absent and
+``GB_WARM_START_SOURCE_STORE`` names the source store.
 
-The steps run IN-PROCESS -- each script module is imported and its
-``main()`` called under a swapped ``sys.argv`` (user ruling 2026-09-14:
-"python imports right? not like calling bash") -- no subprocess, no
-interpreter spawn.
+The pipeline stages are INSTALLED sibling modules of this one
+(:mod:`.fit_from_store`, :mod:`.match_referee`, :mod:`.referee_apply` --
+user ruling 2026-09-14: "All the warmstart code should be part of the
+globalfit/lisatools package"), and each step is a plain in-process python
+call to that module's ``main(argv)`` (earlier ruling the same day: "python
+imports right? not like calling bash") -- no subprocess, no interpreter
+spawn, no script files.
 
 MPI-safe by a lock DIRECTORY next to the target: ``run_combined_staged.py``
 builds on every rank before roles resolve, so one rank wins ``os.mkdir`` on
@@ -31,10 +32,8 @@ SOURCE store's Tobs, default 7776000.0 = 3 months -- NOT this run's Tobs;
 
 from __future__ import annotations
 
-import importlib.util
 import logging
 import os
-import sys
 import time
 import typing
 
@@ -42,13 +41,7 @@ __all__ = ["ensure_warm_start_components"]
 
 logger = logging.getLogger(__name__)
 
-_MODULE_CACHE: dict = {}
-
-_SCRIPTS = (
-    "warmstart_fit_from_store.py",
-    "warmstart_match_referee.py",
-    "warmstart_referee_apply.py",
-)
+_STEPS = ("fit_from_store", "match_referee", "referee_apply")
 
 
 def _manual_recipe(path: str, store: str) -> str:
@@ -56,72 +49,35 @@ def _manual_recipe(path: str, store: str) -> str:
     fit = os.path.join(os.path.dirname(path) or ".", stem + "_fit.npz")
     ref = os.path.splitext(fit)[0] + "_referee.npz"
     return (
-        f"python scripts/gb/warmstart_fit_from_store.py --store {store} "
-        f"--last-k 10 --tobs 7776000 --out {fit}\n"
-        f"python scripts/gb/warmstart_match_referee.py --npz {fit} "
-        f"--store {store}\n"
-        f"python scripts/gb/warmstart_referee_apply.py --fit {fit} "
-        f"--referee {ref} --out {path}"
+        f"python -m lisatools.globalfit.warmstart.fit_from_store "
+        f"--store {store} --last-k 10 --tobs 7776000 --out {fit}\n"
+        f"python -m lisatools.globalfit.warmstart.match_referee "
+        f"--npz {fit} --store {store}\n"
+        f"python -m lisatools.globalfit.warmstart.referee_apply "
+        f"--fit {fit} --referee {ref} --out {path}"
     )
 
 
-def _script_path(name: str) -> str:
-    """Resolve ``scripts/gb/<name>`` -- repo root (editable src layout:
-    ``<repo>/src/lisatools/...``) first, then the current directory (the
-    staged driver runs from the repo root)."""
-    import lisatools
+def _default_runner(cmd: typing.Sequence) -> None:
+    """Run one pipeline step: a PLAIN PYTHON CALL to the installed sibling
+    module's ``main(argv)`` (``cmd`` = ``[step_name, *args]``). SystemExit
+    with a non-zero code (argparse errors, explicit exits) surfaces as a
+    RuntimeError; the stage modules import lazily so the exists-check fast
+    path of :func:`ensure_warm_start_components` stays light."""
+    from . import fit_from_store, match_referee, referee_apply
 
-    repo = os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.abspath(lisatools.__file__))))
-    for base in (repo, os.getcwd()):
-        cand = os.path.join(base, "scripts", "gb", name)
-        if os.path.isfile(cand):
-            return cand
-    raise FileNotFoundError(
-        f"cannot locate scripts/gb/{name} (looked under {repo!r} and the "
-        "current directory) -- the warm-start auto-build needs the LAT "
-        "repo checkout, not just the installed package."
-    )
-
-
-def _run_script(script_path: str, argv: typing.Sequence[str]) -> None:
-    """Run one pipeline script IN-PROCESS: import the module (cached) and
-    call its ``main()`` under a temporarily swapped ``sys.argv``.
-
-    User ruling 2026-09-14 ("python imports right? not like calling
-    bash"): no subprocess, no interpreter spawn -- the step executes
-    inside the calling rank's python, which sidesteps cluster fork/exec
-    restrictions and reuses the already-imported heavy stack. All three
-    scripts are ``if __name__ == "__main__"`` guarded (import runs no
-    work) and expose a zero-argument argparse ``main()``.
-    """
-    script_path = os.path.abspath(script_path)
-    mod = _MODULE_CACHE.get(script_path)
-    if mod is None:
-        name = "_warmstart_step_" + os.path.splitext(
-            os.path.basename(script_path))[0]
-        spec = importlib.util.spec_from_file_location(name, script_path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        _MODULE_CACHE[script_path] = mod
-    old_argv = list(sys.argv)
-    sys.argv = [script_path] + [str(a) for a in argv]
+    mods = {"fit_from_store": fit_from_store,
+            "match_referee": match_referee,
+            "referee_apply": referee_apply}
+    step, argv = str(cmd[0]), [str(a) for a in cmd[1:]]
+    logger.info("[WARMSTART-BUILD] running %s %s", step, " ".join(argv))
     try:
-        mod.main()
-    except SystemExit as exc:  # argparse errors / explicit exits
+        mods[step].main(argv)
+    except SystemExit as exc:
         if exc.code not in (None, 0):
             raise RuntimeError(
-                f"{os.path.basename(script_path)} exited with code "
-                f"{exc.code}."
+                f"warmstart {step} exited with code {exc.code}."
             ) from exc
-    finally:
-        sys.argv = old_argv
-
-
-def _default_runner(cmd: typing.Sequence[str]) -> None:
-    logger.info("[WARMSTART-BUILD] running (in-process): %s",
-                " ".join(map(str, cmd)))
-    _run_script(str(cmd[0]), [str(a) for a in cmd[1:]])
 
 
 def _require(path: str, step: str) -> None:
@@ -223,17 +179,14 @@ def ensure_warm_start_components(
             "(last_k=%d, source tobs=%.0f s). fit -> referee -> apply; "
             "other ranks wait on the lock.", path, store, last_k, tobs)
         t0 = time.perf_counter()
-        runner([_script_path(_SCRIPTS[0]),
-                "--store", store, "--last-k", str(last_k),
+        runner([_STEPS[0], "--store", store, "--last-k", str(last_k),
                 "--tobs", str(tobs), "--out", fit_npz])
-        _require(fit_npz, "warmstart_fit_from_store.py")
-        runner([_script_path(_SCRIPTS[1]),
-                "--npz", fit_npz, "--store", store])
-        _require(referee_npz, "warmstart_match_referee.py")
-        runner([_script_path(_SCRIPTS[2]),
-                "--fit", fit_npz, "--referee", referee_npz,
+        _require(fit_npz, "fit_from_store")
+        runner([_STEPS[1], "--npz", fit_npz, "--store", store])
+        _require(referee_npz, "match_referee")
+        runner([_STEPS[2], "--fit", fit_npz, "--referee", referee_npz,
                 "--out", tmp_out])
-        _require(tmp_out, "warmstart_referee_apply.py")
+        _require(tmp_out, "referee_apply")
         os.replace(tmp_out, path)
         log.warning(
             "[WARMSTART-BUILD] built %s in %.1f s.",

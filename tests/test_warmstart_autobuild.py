@@ -15,33 +15,39 @@ import time
 import unittest
 from unittest import mock
 
-from lisatools.globalfit.warmstart_build import ensure_warm_start_components
+from lisatools.globalfit.warmstart.build import ensure_warm_start_components
 
 
 class _Runner:
-    """Fake step runner: records commands, fabricates each step's output."""
+    """Fake step runner: records (step, args), fabricates each output.
+
+    Steps are INSTALLED-MODULE names (user ruling 2026-09-14: all the
+    warm-start code lives in lisatools.globalfit.warmstart; the runner
+    dispatches to those modules' main(argv), never to script files)."""
 
     def __init__(self, fail_on=None):
         self.calls = []
-        self.fail_on = fail_on  # substring of the script name to fail on
+        self.fail_on = fail_on  # step name to fail on
 
     def __call__(self, cmd):
         self.calls.append(list(cmd))
-        script = next(a for a in cmd if a.endswith(".py"))
-        if self.fail_on and self.fail_on in os.path.basename(script):
-            raise RuntimeError(f"fake failure in {script}")
+        step = cmd[0]
+        if self.fail_on and self.fail_on == step:
+            raise RuntimeError(f"fake failure in {step}")
         args = {cmd[i]: cmd[i + 1] for i in range(len(cmd) - 1)
                 if str(cmd[i]).startswith("--")}
-        if "warmstart_fit_from_store" in script:
+        if step == "fit_from_store":
             with open(args["--out"], "w") as fh:
                 fh.write("fit")
-        elif "warmstart_match_referee" in script:
+        elif step == "match_referee":
             ref = os.path.splitext(args["--npz"])[0] + "_referee.npz"
             with open(ref, "w") as fh:
                 fh.write("referee")
-        elif "warmstart_referee_apply" in script:
+        elif step == "referee_apply":
             with open(args["--out"], "w") as fh:
                 fh.write("refereed")
+        else:
+            raise AssertionError(f"unknown step {step!r}")
 
 
 class ExistingPathTest(unittest.TestCase):
@@ -69,11 +75,12 @@ class MissingStoreTest(unittest.TestCase):
                 with self.assertRaises(FileNotFoundError) as cm:
                     ensure_warm_start_components(path, runner=_Runner())
             msg = str(cm.exception)
-            # the manual recipe must travel with the refusal
-            for script in ("warmstart_fit_from_store.py",
-                           "warmstart_match_referee.py",
-                           "warmstart_referee_apply.py"):
-                self.assertIn(script, msg)
+            # the manual recipe must travel with the refusal -- the
+            # installed-module commands (-m lisatools.globalfit.warmstart.*)
+            for step in ("fit_from_store", "match_referee",
+                         "referee_apply"):
+                self.assertIn(
+                    f"-m lisatools.globalfit.warmstart.{step}", msg)
             self.assertIn("GB_WARM_START_SOURCE_STORE", msg)
 
     def test_nonexistent_store_raises(self):
@@ -105,17 +112,14 @@ class BuildTest(unittest.TestCase):
                 path, store=store, last_k=10, tobs=7776000.0, runner=runner)
             self.assertEqual(got, path)
             self.assertTrue(os.path.exists(path))
-            # step commands are [script_path, *args] -- the scripts run
-            # IN-PROCESS via import (user ruling 2026-09-14: "python
-            # imports right? not like calling bash"), so no interpreter
-            # element leads the command.
-            for c in runner.calls:
-                self.assertTrue(str(c[0]).endswith(".py"), c[0])
-            names = [os.path.basename(next(a for a in c if a.endswith(".py")))
-                     for c in runner.calls]
-            self.assertEqual(names, ["warmstart_fit_from_store.py",
-                                     "warmstart_match_referee.py",
-                                     "warmstart_referee_apply.py"])
+            # step commands are [installed_module_step, *args] -- pure
+            # python calls into lisatools.globalfit.warmstart (user
+            # rulings 2026-09-14: in-process, and all warm-start code in
+            # the package), no interpreter, no script paths.
+            names = [c[0] for c in runner.calls]
+            self.assertEqual(names, ["fit_from_store",
+                                     "match_referee",
+                                     "referee_apply"])
             fit_cmd, ref_cmd, apply_cmd = runner.calls
             self.assertIn("--store", fit_cmd)
             self.assertEqual(fit_cmd[fit_cmd.index("--store") + 1], store)
@@ -139,8 +143,7 @@ class BuildTest(unittest.TestCase):
         import tempfile
 
         with tempfile.TemporaryDirectory() as d:
-            path, store, runner = self._build(
-                d, fail_on="warmstart_match_referee")
+            path, store, runner = self._build(d, fail_on="match_referee")
             with self.assertRaises(RuntimeError):
                 ensure_warm_start_components(
                     path, store=store, runner=runner)
@@ -207,59 +210,39 @@ class LockTest(unittest.TestCase):
             self.assertIn(lock, str(cm.exception))
 
 
-class InProcessExecutionTest(unittest.TestCase):
-    """The default step executor IMPORTS the script module and calls its
-    ``main()`` inside this python process (sys.argv swapped) -- it never
-    spawns a subprocess. Proven by pid identity."""
+class DefaultRunnerTest(unittest.TestCase):
+    """The default step runner calls the INSTALLED modules' main(argv)
+    directly -- a plain python function call inside this process."""
 
-    def test_run_script_executes_in_this_process(self):
-        import json
-        import tempfile
+    def test_dispatches_to_installed_module_main(self):
+        from lisatools.globalfit.warmstart import build as wb
 
-        from lisatools.globalfit.warmstart_build import _run_script
+        with mock.patch(
+            "lisatools.globalfit.warmstart.fit_from_store.main",
+            return_value=0,
+        ) as m:
+            wb._default_runner(["fit_from_store", "--store", "s.h5",
+                                "--last-k", 10])
+        m.assert_called_once_with(["--store", "s.h5", "--last-k", "10"])
 
-        with tempfile.TemporaryDirectory() as d:
-            script = os.path.join(d, "fake_step.py")
-            out = os.path.join(d, "out.json")
-            with open(script, "w") as fh:
-                fh.write(
-                    "import json, os, sys\n"
-                    "def main():\n"
-                    "    args = sys.argv[1:]\n"
-                    "    out = args[args.index('--out') + 1]\n"
-                    "    with open(out, 'w') as fh:\n"
-                    "        json.dump({'pid': os.getpid(),"
-                    " 'argv': args}, fh)\n"
-                    "if __name__ == '__main__':\n"
-                    "    main()\n"
-                )
-            import sys as _sys
+    def test_nonzero_systemexit_becomes_runtimeerror(self):
+        from lisatools.globalfit.warmstart import build as wb
 
-            argv_before = list(_sys.argv)
-            _run_script(script, ["--out", out, "--flag", "7"])
-            with open(out) as fh:
-                got = json.load(fh)
-            self.assertEqual(got["pid"], os.getpid())  # in-process, no fork
-            self.assertEqual(got["argv"], ["--out", out, "--flag", "7"])
-            self.assertEqual(_sys.argv, argv_before)  # argv restored
-
-    def test_run_script_raises_on_nonzero_exit(self):
-        import tempfile
-
-        from lisatools.globalfit.warmstart_build import _run_script
-
-        with tempfile.TemporaryDirectory() as d:
-            script = os.path.join(d, "fail_step.py")
-            with open(script, "w") as fh:
-                fh.write(
-                    "import sys\n"
-                    "def main():\n"
-                    "    sys.exit(3)\n"
-                    "if __name__ == '__main__':\n"
-                    "    main()\n"
-                )
+        with mock.patch(
+            "lisatools.globalfit.warmstart.referee_apply.main",
+            side_effect=SystemExit(3),
+        ):
             with self.assertRaises(RuntimeError):
-                _run_script(script, [])
+                wb._default_runner(["referee_apply", "--fit", "f"])
+
+    def test_zero_systemexit_is_success(self):
+        from lisatools.globalfit.warmstart import build as wb
+
+        with mock.patch(
+            "lisatools.globalfit.warmstart.match_referee.main",
+            side_effect=SystemExit(0),
+        ):
+            wb._default_runner(["match_referee", "--npz", "n"])
 
 
 class RecipeWiringTest(unittest.TestCase):

@@ -1,7 +1,7 @@
 """Tests for the warm-start GB RJ-birth proposal (workstream B, B3).
 
 CPU-only and hermetic: a tiny synthetic components npz is built in ``setUp``
-with the EXACT writer schema of ``scripts/gb/warmstart_fit_from_store.py``
+with the EXACT writer schema of ``lisatools.globalfit.warmstart.fit_from_store``
 (means/covs/p/mult/n_members/island_id/f0_window_edges/meta-json). Covers:
 
 * rvs/logpdf mutual consistency (importance identity ``E_q[p_ref/q] ~ 1`` on
@@ -14,9 +14,14 @@ with the EXACT writer schema of ``scripts/gb/warmstart_fit_from_store.py``
 * from_npz round trip + schema validation;
 * cross-Tobs candidate-window re-derivation (v1: widths unchanged);
 * stage wiring: with GB_WARM_START_COMPONENTS set the gb_search stage lists
-  ``rj_warm_search`` IMMEDIATELY BEFORE ``rj_fstat_search``; unset leaves the
-  stage lists unchanged (asserted on the constructed recipe spec, no data
-  built).
+  ``rj_warm_search`` IMMEDIATELY BEFORE ``rj_fstat_search`` and the full_pe
+  stage lists ``rj_warm_pe`` IMMEDIATELY BEFORE ``rj_fstat_pe`` (the PE
+  twin, user ruling 2026-09-07); unset leaves the stage lists unchanged
+  (asserted on the constructed recipe spec, no data built);
+* wrapped-normal image sums (``circ_images``, the rj_warm_pe exactness
+  requirement): K>0 logpdf == brute-force wrapped density on a wide
+  circular component, K=0 bit-identical to the pre-knob minimal image,
+  draws unaffected either way.
 """
 
 import importlib.util
@@ -398,7 +403,223 @@ class WarmStartWiringTest(unittest.TestCase):
         # removing the warm move recovers the baseline exactly
         self.assertEqual([m for m in armed if m != "rj_warm_search"],
                          baseline)
-        self.assertEqual(stages2["full_pe"], baseline_pe)
+
+        # PE TWIN (user ruling 2026-09-07): rj_warm_pe IMMEDIATELY BEFORE
+        # rj_fstat_pe in full_pe; the search twin never leaks into full_pe
+        # and the pe twin never leaks into gb_search.
+        armed_pe = stages2["full_pe"]
+        self.assertIn("rj_warm_pe", armed_pe)
+        self.assertNotIn("rj_warm_search", armed_pe)
+        self.assertNotIn("rj_warm_pe", armed)
+        i_warm_pe = armed_pe.index("rj_warm_pe")
+        i_fstat_pe = armed_pe.index("rj_fstat_pe")
+        self.assertEqual(i_fstat_pe, i_warm_pe + 1,
+                         f"rj_warm_pe must be IMMEDIATELY BEFORE "
+                         f"rj_fstat_pe; stage is {armed_pe}")
+        self.assertEqual([m for m in armed_pe if m != "rj_warm_pe"],
+                         baseline_pe)
+        self.assertNotIn("rj_warm_pe", baseline_pe)
+
+
+class CircImagesTest(unittest.TestCase):
+    """Wrapped-normal image sums (``circ_images``) -- the PE exactness fix.
+
+    The minimal-image logpdf under-charges wide circular components (the
+    RuntimeWarning case); ``rj_warm_pe`` needs the charged density to equal
+    the ACTUAL density of the wrapped draws (exact detailed balance).
+    ``circ_images=K`` sums the full multivariate normal over +-K period
+    images per circular column (per-component count derived from sigma);
+    ``circ_images=0`` (default) is the bit-identical search behavior."""
+
+    # ONE component with WIDE phi0/psi (the warning regime) and the
+    # rank-1 correlation uplift so the image sum cannot factorize.
+    WIDE_MEANS = np.array([[8.0, 2.0000, 0.60, 3.00, 0.30, 1.20, 4.00,
+                            0.20, 0.05]])
+    WIDE_SIG = [0.5, 2.0e-5, 0.01, 2.20, 0.05, 1.10, 0.05, 0.05, 0.02]
+
+    def _wide_container(self, circ_images=0, seed=5):
+        covs = np.stack([_make_cov(self.WIDE_SIG)])
+        return WarmStartComponents(
+            self.WIDE_MEANS, covs, np.array([1.0]), new_tobs=TOBS,
+            circ_images=circ_images, seed=seed,
+        )
+
+    def _narrow_container(self, circ_images=0, seed=5):
+        means, covs, p = _synthetic_components()
+        return WarmStartComponents(means, covs, p, new_tobs=TOBS,
+                                   circ_images=circ_images, seed=seed)
+
+    @staticmethod
+    def _brute_force_logpdf(means, covs, weights, x, n_images=8):
+        """Reference: full-lattice wrapped MVN sum around the minimal image.
+
+        Implementation-independent -- built from the RAW means/covs, never
+        from container internals."""
+        x = np.atleast_2d(np.asarray(x, dtype=np.float64))
+        means = np.array(means, dtype=np.float64)
+        # wrap the stored circular means exactly as the ctor does
+        for c, period in CIRCULAR_COLS.items():
+            means[:, c] = means[:, c] % period
+        chol = np.linalg.cholesky(covs)
+        chol_inv = np.stack([np.linalg.solve(L, np.eye(NDIM)) for L in chol])
+        log_norm = -0.5 * (NDIM * np.log(2 * np.pi)
+                           + 2 * np.sum(np.log(np.diagonal(
+                               chol, axis1=1, axis2=2)), axis=1))
+        out = np.full(len(x), -np.inf)
+        rng = range(-n_images, n_images + 1)
+        for i, xi in enumerate(x):
+            tot = -np.inf
+            for k in range(len(weights)):
+                d = xi - means[k]
+                for c, period in CIRCULAR_COLS.items():
+                    d[c] = d[c] - period * np.round(d[c] / period)
+                acc = -np.inf
+                for j3 in rng:
+                    for j5 in rng:
+                        for j6 in (-1, 0, 1):
+                            s = d.copy()
+                            s[3] += j3 * CIRCULAR_COLS[3]
+                            s[5] += j5 * CIRCULAR_COLS[5]
+                            s[6] += j6 * CIRCULAR_COLS[6]
+                            y = chol_inv[k] @ s
+                            acc = np.logaddexp(
+                                acc, log_norm[k] - 0.5 * y @ y)
+                tot = np.logaddexp(tot, np.log(weights[k]) + acc)
+            out[i] = tot
+        return out
+
+    def test_images_match_bruteforce_wrapped_density(self):
+        ws0 = self._wide_container(circ_images=0)
+        ws3 = self._wide_container(circ_images=3)
+        pts = np.asarray(ws0.rvs(size=120))
+        ref = self._brute_force_logpdf(
+            self.WIDE_MEANS, np.stack([_make_cov(self.WIDE_SIG)]),
+            np.array([1.0]), pts)
+        lp3 = np.asarray(ws3.logpdf(pts))
+        np.testing.assert_allclose(lp3, ref, rtol=0, atol=5e-6)
+        # ... and the minimal-image approximation really is materially
+        # wrong here (otherwise this test proves nothing).
+        lp0 = np.asarray(ws0.logpdf(pts))
+        self.assertGreater(np.max(np.abs(lp0 - ref)), 0.05)
+
+    def test_zero_images_bit_identical_and_narrow_noop(self):
+        # default ctor == explicit circ_images=0, exactly.
+        ws_default = self._narrow_container()
+        ws0 = self._narrow_container(circ_images=0)
+        pts = np.asarray(ws_default.rvs(size=200))
+        np.testing.assert_array_equal(
+            np.asarray(ws_default.logpdf(pts)), np.asarray(ws0.logpdf(pts)))
+        # narrow circular sigmas: images are a numerical no-op.
+        ws3 = self._narrow_container(circ_images=3)
+        np.testing.assert_allclose(
+            np.asarray(ws3.logpdf(pts)), np.asarray(ws0.logpdf(pts)),
+            rtol=0, atol=1e-10)
+
+    def test_images_leave_rvs_unchanged(self):
+        # circ_images changes CHARGING only, never the draw stream.
+        a = np.asarray(self._wide_container(circ_images=0, seed=11).rvs(500))
+        b = np.asarray(self._wide_container(circ_images=3, seed=11).rvs(500))
+        np.testing.assert_array_equal(a, b)
+
+
+class BoundedColsTest(unittest.TestCase):
+    """Truncated-normal treatment of the BOUNDED columns (ruling
+    2026-09-11, benched: truncated normal beats plain Gaussian on 92%/97%
+    of components for cos_iota / fdot_ratio and beats the atanh basis).
+
+    ``bounded_cols={col: (lo, hi)}`` truncates the joint mixture on those
+    columns: logpdf subtracts each component's rectangle normalization
+    and is -inf outside the box; rvs rejects out-of-box draws. Everything
+    stays in x-space."""
+
+    BC = {4: (-1.0, 1.0), 8: (-5.0, 5.0)}
+
+    def _one_comp(self, rho=0.0, **kw):
+        mean = np.array([[8.0, 2.0000, 0.60, 3.00, 0.85, 1.20, 4.00,
+                          0.20, 3.5]])
+        sig = np.array([0.5, 2.0e-5, 0.01, 0.30, 0.30, 0.15, 0.05,
+                        0.05, 2.5])
+        cov = np.diag(sig ** 2)
+        cov[4, 8] = cov[8, 4] = rho * sig[4] * sig[8]
+        return WarmStartComponents(
+            mean, cov[None], np.array([1.0]), new_tobs=TOBS, seed=5, **kw)
+
+    def test_draws_in_box_and_outside_is_neginf(self):
+        ws = self._one_comp(bounded_cols=self.BC)
+        dr = np.asarray(ws.rvs(size=50_000))
+        self.assertTrue((dr[:, 4] >= -1).all() and (dr[:, 4] <= 1).all())
+        self.assertTrue((dr[:, 8] >= -5).all() and (dr[:, 8] <= 5).all())
+        pt = self._one_comp().rvs(size=4)
+        pt = np.asarray(pt)
+        pt[0, 4] = 1.2
+        pt[1, 4] = -1.01
+        pt[2, 8] = 5.3
+        lp = np.asarray(ws.logpdf(pt))
+        self.assertTrue(np.isneginf(lp[:3]).all())
+        self.assertTrue(np.isfinite(lp[3]))
+
+    def test_diagonal_matches_scipy_truncnorm(self):
+        from scipy.stats import truncnorm
+        ws = self._one_comp(bounded_cols=self.BC)
+        mean = np.array([8.0, 2.0000, 0.60, 3.00, 0.85, 1.20, 4.00,
+                         0.20, 3.5])
+        # vary ONLY col 4: logpdf differences must equal truncnorm's
+        grid = np.linspace(-0.95, 0.98, 25)
+        pts = np.tile(mean, (len(grid), 1))
+        pts[:, 4] = grid
+        lp = np.asarray(ws.logpdf(pts))
+        a, b = (-1 - 0.85) / 0.30, (1 - 0.85) / 0.30
+        ref = truncnorm.logpdf(grid, a, b, loc=0.85, scale=0.30)
+        np.testing.assert_allclose(lp - lp[0], ref - ref[0], atol=1e-7)
+
+    def test_bivariate_normalization_constant(self):
+        from scipy.stats import multivariate_normal as mvn
+        rho = 0.6
+        wsb = self._one_comp(rho=rho, bounded_cols=self.BC)
+        ws0 = self._one_comp(rho=rho)
+        pt = np.array([[8.0, 2.0000, 0.60, 3.00, 0.5, 1.20, 4.00,
+                        0.20, 1.0]])
+        dz = (np.asarray(wsb.logpdf(pt))
+              - np.asarray(ws0.logpdf(pt)))[0]
+        mu = np.array([0.85, 3.5])
+        cv = np.array([[0.30 ** 2, rho * 0.30 * 2.5],
+                       [rho * 0.30 * 2.5, 2.5 ** 2]])
+        f = lambda x4, x8: mvn.cdf([x4, x8], mean=mu, cov=cv)
+        z = f(1, 5) - f(-1, 5) - f(1, -5) + f(-1, -5)
+        self.assertAlmostEqual(dz, -np.log(z), places=5)
+
+    def test_backcompat_absent_meta_identical(self):
+        means, covs, p = _synthetic_components()
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "c.npz")
+            _write_npz(path, means, covs, p)
+            ws_old = WarmStartComponents.from_npz(path, new_tobs=TOBS,
+                                                  seed=2)
+            ws_new = WarmStartComponents.from_npz(path, new_tobs=TOBS,
+                                                  seed=2)
+            pts = np.asarray(ws_old.rvs(size=200))
+            np.testing.assert_array_equal(
+                np.asarray(ws_old.logpdf(pts)),
+                np.asarray(ws_new.logpdf(pts)))
+            self.assertEqual(getattr(ws_new, "bounded_cols", None) or {},
+                             {})
+
+    def test_from_npz_reads_bounded_meta(self):
+        means, covs, p = _synthetic_components()
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "c.npz")
+            _write_npz(path, means, covs, p)
+            # rewrite meta with bounded_cols
+            z = dict(np.load(path, allow_pickle=False))
+            meta = json.loads(str(z.pop("meta")))
+            meta["bounded_cols"] = {"4": [-1.0, 1.0], "8": [-5.0, 5.0]}
+            np.savez_compressed(path, **z, meta=json.dumps(meta))
+            ws = WarmStartComponents.from_npz(path, new_tobs=TOBS, seed=2)
+            self.assertEqual(ws.bounded_cols, {4: (-1.0, 1.0),
+                                               8: (-5.0, 5.0)})
+            dr = np.asarray(ws.rvs(size=20_000))
+            self.assertTrue((np.abs(dr[:, 4]) <= 1).all())
+            self.assertTrue((np.abs(dr[:, 8]) <= 5).all())
 
 
 if __name__ == "__main__":

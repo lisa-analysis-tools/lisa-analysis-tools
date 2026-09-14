@@ -3109,11 +3109,11 @@ def build_gb_moves(
     # ... BEFORE the fstat proposal"). GB_WARM_START_COMPONENTS (or
     # ``GBSettings.warm_start_components``) points at the clustered
     # previous-run posterior components npz produced OFFLINE by
-    # scripts/gb/warmstart_fit_from_store.py; when set (and a search recipe
+    # lisatools.globalfit.warmstart.fit_from_store; when set (and a search recipe
     # is being built) this constructs ``rj_warm_search`` -- the EXISTING
     # prior-RJ move class with its birth distribution swapped for the
     # warm-start f0-windowed Gaussian mixture
-    # (lisatools.sampling.warmstart_proposal.WarmStartComponents):
+    # (lisatools.globalfit.warmstart.proposal.WarmStartComponents):
     #
     #   * births draw FULL 9-column GB parameters from the previous
     #     posterior; phase_maximize follows GB_RJ_PHASE_MAXIMIZE exactly
@@ -3152,7 +3152,7 @@ def build_gb_moves(
         # at the choke point shared by BOTH twins, before either loads it.
         # MPI-safe: one rank builds under a lock, the others wait. With the
         # npz present this is a pure existence check.
-        from .warmstart_build import ensure_warm_start_components
+        from .warmstart.build import ensure_warm_start_components
 
         _warm_path = ensure_warm_start_components(_warm_path, log=logger)
         # Shared by BOTH twins (rj_warm_search here, rj_warm_pe in the PE
@@ -3180,7 +3180,7 @@ def build_gb_moves(
             2.0 * np.pi, 1.0, np.pi, 2.0 * np.pi, 1.0, _ratio_max,
         ]
     if include_search and _warm_path:
-        from ..sampling.warmstart_proposal import WarmStartComponents
+        from .warmstart.proposal import WarmStartComponents
 
         _warm_container = WarmStartComponents.from_npz(
             _warm_path,
@@ -3351,7 +3351,7 @@ def build_gb_moves(
     # wide circular components (the container's RuntimeWarning regime).
     gb_warm_pe_move = None
     if _warm_path:
-        from ..sampling.warmstart_proposal import WarmStartComponents
+        from .warmstart.proposal import WarmStartComponents
 
         _warm_pe_container = WarmStartComponents.from_npz(
             _warm_path,

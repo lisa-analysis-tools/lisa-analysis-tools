@@ -2105,12 +2105,12 @@ export GB_ROUTER_THREADED=1
 # gf_prod_3mo_v8 store. Use the FULL FINAL store h5 (NEVER the
 # make_snapshots tars -- their chain slabs are keep-window extracts and
 # the fitter would warn + fit on ~3 iterations):
-#   python scripts/gb/warmstart_fit_from_store.py \
+#   python -m lisatools.globalfit.warmstart.fit_from_store \
 #       --store <...>/gf_prod_3mo_v8_10walkers/gf_prod_3mo_testing.h5 \
 #       --last-k 10 --tobs 7776000 --out v8_10w_last10.npz
-#   python scripts/gb/warmstart_match_referee.py \
+#   python -m lisatools.globalfit.warmstart.match_referee \
 #       --npz v8_10w_last10.npz --store <same h5>
-#   python scripts/gb/warmstart_referee_apply.py --fit v8_10w_last10.npz \
+#   python -m lisatools.globalfit.warmstart.referee_apply --fit v8_10w_last10.npz \
 #       --referee v8_10w_last10_referee.npz \
 #       --out gf_prod_3mo_v8_10w_refereed.npz
 # (the machinery was audited end-to-end on the v7 final store,
@@ -2150,10 +2150,10 @@ if [ -n "${GB_WARM_START_COMPONENTS}" ] && [ ! -f "${GB_WARM_START_COMPONENTS}" 
     echo "[WARMSTART]   GB_WARM_START_SOURCE_STORE=${GB_WARM_START_SOURCE_STORE}"
     echo "[WARMSTART] Point GB_WARM_START_SOURCE_STORE at the previous run's FULL FINAL h5,"
     echo "[WARMSTART] or build the npz by hand:"
-    echo "[WARMSTART]   python scripts/gb/warmstart_fit_from_store.py --store <store.h5> \\"
+    echo "[WARMSTART]   python -m lisatools.globalfit.warmstart.fit_from_store --store <store.h5> \\"
     echo "[WARMSTART]       --last-k 10 --tobs 7776000 --out <dir>/gf_prod_3mo_v8_10w_fit.npz"
-    echo "[WARMSTART]   python scripts/gb/warmstart_match_referee.py --npz <...fit.npz> --store <store.h5>"
-    echo "[WARMSTART]   python scripts/gb/warmstart_referee_apply.py --fit <...fit.npz> \\"
+    echo "[WARMSTART]   python -m lisatools.globalfit.warmstart.match_referee --npz <...fit.npz> --store <store.h5>"
+    echo "[WARMSTART]   python -m lisatools.globalfit.warmstart.referee_apply --fit <...fit.npz> \\"
     echo "[WARMSTART]       --referee <...fit_referee.npz> --out ${GB_WARM_START_COMPONENTS}"
     echo "[WARMSTART] or launch with GB_WARM_START_COMPONENTS= (explicitly empty) to run without it."
     exit 2
