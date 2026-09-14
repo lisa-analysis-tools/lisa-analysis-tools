@@ -73,6 +73,10 @@ plt.rcParams.update({
     "axes.grid": True, "grid.linewidth": 0.6, "grid.alpha": 0.5,
     "font.size": 10, "font.family": "monospace", "axes.titlesize": 11,
     "legend.frameon": False, "figure.dpi": 110,
+    # Never route text through LaTeX: a matplotlibrc with text.usetex=True
+    # makes every unescaped underscore in these titles ("psd: Soms_d") a TeX
+    # RuntimeError, and the page needs nothing beyond built-in mathtext.
+    "text.usetex": False,
 })
 
 IMGS, MISSING = {}, []
