@@ -3144,6 +3144,17 @@ def build_gb_moves(
         or ""
     ).strip()
     if _warm_path:
+        # AUTO-BUILD (user ruling 2026-09-14: "Check if it is done, if not
+        # run it. I would like it to be automatic." -- the 6mo campaign's
+        # first launch died on the missing npz). When the refereed npz is
+        # absent and GB_WARM_START_SOURCE_STORE names the previous run's
+        # FULL FINAL store, the fit -> referee -> apply pipeline runs HERE,
+        # at the choke point shared by BOTH twins, before either loads it.
+        # MPI-safe: one rank builds under a lock, the others wait. With the
+        # npz present this is a pure existence check.
+        from .warmstart_build import ensure_warm_start_components
+
+        _warm_path = ensure_warm_start_components(_warm_path, log=logger)
         # Shared by BOTH twins (rj_warm_search here, rj_warm_pe in the PE
         # section below): the 9-col basis guard and the floor box.
         if int(engine_info.ndims["gb"]) != 9:

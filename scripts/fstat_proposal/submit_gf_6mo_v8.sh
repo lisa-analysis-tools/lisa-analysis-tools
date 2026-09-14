@@ -81,13 +81,13 @@
 # ##     exposure of source_search + sources-in-gb_search.                 ##
 # ##   * W4 warm-start A/B: rj_warm_search acceptance healthy on a short   ##
 # ##     3-mo rewind before arming here.                                   ##
-# ##   * GB_WARM_START_COMPONENTS below must point at the REFEREED npz     ##
-# ##     fit from the FULL FINAL store of the MOST RECENT 3mo run -- the   ##
-# ##     10-WALKER science arm gf_prod_3mo_v8_10walkers (2026-09-14        ##
-# ##     ruling; never the make_snapshots tars -- their chain slabs are    ##
-# ##     keep-window extracts):                                            ##
-# ##       warmstart_fit_from_store.py --last-k 10 -> warmstart_match_    ##
-# ##       referee.py -> warmstart_referee_apply.py                        ##
+# ##   * GB_WARM_START_COMPONENTS: the REFEREED npz from the FULL FINAL    ##
+# ##     store of the MOST RECENT 3mo run -- the 10-WALKER science arm     ##
+# ##     gf_prod_3mo_v8_10walkers (2026-09-14 ruling; never the            ##
+# ##     make_snapshots tars). AUTO-BUILT at recipe build when missing     ##
+# ##     (fit -> referee -> apply from GB_WARM_START_SOURCE_STORE; watch   ##
+# ##     the [WARMSTART-BUILD] lines) -- the 09-14 first launch died on    ##
+# ##     the old hard preflight refusal, hence the automation.             ##
 # ##   * GB OBSERVABLE+EIGEN (2026-09-14): first 6mo exposure of           ##
 # ##     GB_INMODEL_OBSERVABLE_EIGEN=full -- read the 3mo probe            ##
 # ##     (submit_gf_3mo_v8_10w_eigenaxis_probe.sh) first; empty knob =     ##
@@ -2119,11 +2119,36 @@ export GB_ROUTER_THREADED=1
 # GB_WARM_START_COMPONENTS= is the only way to run WITHOUT the warm move
 # (stage lists bit-identical to 3mo_v8's).
 export GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS-/shared/data/global_fit_output/warmstart/gf_prod_3mo_v8_10w_refereed.npz}
+# AUTO-BUILD (2026-09-14, after the first launch died on the missing npz;
+# user: "Check if it is done, if not run it. I would like it to be
+# automatic."). When the npz is missing, recipe build now runs the
+# fit -> referee -> apply pipeline ITSELF from this store (one MPI rank
+# builds under a lock, the others wait; watch the [WARMSTART-BUILD]
+# lines). SOURCE_TOBS is the SOURCE store's Tobs (3 months), not this
+# run's -- the proposal container rescales to the run Tobs at load.
+export GB_WARM_START_SOURCE_STORE=${GB_WARM_START_SOURCE_STORE-/shared/data/global_fit_output/gf_prod_3mo_v8_10walkers/gf_prod_3mo_testing.h5}
+export GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-7776000}
+export GB_WARM_START_LAST_K=${GB_WARM_START_LAST_K:-10}
 if [ -n "${GB_WARM_START_COMPONENTS}" ] && [ ! -f "${GB_WARM_START_COMPONENTS}" ]; then
-  echo "[WARMSTART] FATAL: GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS} does not exist."
-  echo "[WARMSTART] Build it with the fit -> referee -> apply recipe in the comment above,"
-  echo "[WARMSTART] or launch with GB_WARM_START_COMPONENTS= (explicitly empty) to run without it."
-  exit 2
+  if [ -f "${GB_WARM_START_SOURCE_STORE}" ]; then
+    echo "[WARMSTART] ${GB_WARM_START_COMPONENTS} missing -- it will be BUILT"
+    echo "[WARMSTART] automatically at recipe build (fit -> referee -> apply) from"
+    echo "[WARMSTART]   ${GB_WARM_START_SOURCE_STORE}"
+    echo "[WARMSTART] (last_k=${GB_WARM_START_LAST_K}, source tobs=${GB_WARM_START_SOURCE_TOBS})."
+  else
+    echo "[WARMSTART] FATAL: GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS} does not exist"
+    echo "[WARMSTART] and the auto-build source store is also missing:"
+    echo "[WARMSTART]   GB_WARM_START_SOURCE_STORE=${GB_WARM_START_SOURCE_STORE}"
+    echo "[WARMSTART] Point GB_WARM_START_SOURCE_STORE at the previous run's FULL FINAL h5,"
+    echo "[WARMSTART] or build the npz by hand:"
+    echo "[WARMSTART]   python scripts/gb/warmstart_fit_from_store.py --store <store.h5> \\"
+    echo "[WARMSTART]       --last-k 10 --tobs 7776000 --out <dir>/gf_prod_3mo_v8_10w_fit.npz"
+    echo "[WARMSTART]   python scripts/gb/warmstart_match_referee.py --npz <...fit.npz> --store <store.h5>"
+    echo "[WARMSTART]   python scripts/gb/warmstart_referee_apply.py --fit <...fit.npz> \\"
+    echo "[WARMSTART]       --referee <...fit_referee.npz> --out ${GB_WARM_START_COMPONENTS}"
+    echo "[WARMSTART] or launch with GB_WARM_START_COMPONENTS= (explicitly empty) to run without it."
+    exit 2
+  fi
 fi
 # Uniform-floor weight over the 9-col prior box (keeps death factors
 # finite at every leaf) and the p floor: recipe defaults, pinned for the
