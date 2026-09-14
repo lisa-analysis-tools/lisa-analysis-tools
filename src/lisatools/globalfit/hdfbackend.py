@@ -551,6 +551,15 @@ class GFHDFBackend(eryn_HDFBackend):
 class GBHDFBackend(eryn_HDFBackend):
     """Sub-backend that persists per-band GB sampler counters."""
 
+    def __init__(
+            self,
+            *args,
+            name: str = "global_fit",
+            **kwargs,
+        ):
+    
+            super().__init__(*args, name=name, **kwargs)
+    
     def reset(self, nwalkers, *args, ntemps=1, num_bands=None, band_edges=None, **kwargs):
         """Create the per-band datasets used to back :class:`GBState`."""
         if num_bands is None or band_edges is None:

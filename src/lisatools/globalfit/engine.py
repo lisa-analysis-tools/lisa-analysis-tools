@@ -119,10 +119,12 @@ class Settings:
     """
     Tobs: float | None = None
     dt: float | None = None
-    initialize_kwargs: dict | None = None
+    initialize_kwargs: dict[str, Any] | None = None
     transform: Optional[TransformContainer] = None
     priors: Optional[typing.Dict[str, ProbDistContainer]] = None
     periodic: Optional[dict] = None
+    nwalkers: Optional[int] = None
+    ntemps: Optional[int] = None
     nleaves_max: Optional[int] = None
     nleaves_min: Optional[int] = None
     ndim: Optional[int] = None

@@ -779,6 +779,8 @@ class GlobalFit:
                 # before the sampler is constructed). Without it, the
                 # sampler's later ``self.key_order != self.backend.key_order``
                 # check fires.
+                #! This is very prone to errors if using hierarchical priors 
+                #! There, priors may included more keys than eryn branches.
                 key_order = {
                     key: value.key_order for key, value in priors.items()
                 }

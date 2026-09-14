@@ -973,18 +973,27 @@ class BaseProcessingStep(SignalProcessor):
         #      window arrays in settings files) are not auto-converted —
         #      DomainBase.with_backend / xp.asarray at the boundary is the
         #      pattern to use, one transfer per array, when they fire.
-        if self.td_signal.settings == settings:
-            data_signal = self.td_signal
+
+        # resolve backends (for possible mismatch)
+        backend_td_signal = self.td_signal.settings.backend
+        backend_output_signal = settings.backend
+        if backend_td_signal != backend_output_signal: 
+            td_signal: TDSignal = self.td_signal.with_backend(backend_output_signal)
+        else:
+            td_signal = self.td_signal
+    
+        if td_signal.settings == settings:
+            data_signal = td_signal
         else:
             # TODO: fix this to be chopped based on Tobs originally
-            if isinstance(settings, TDSettings) and self.td_signal.N != settings.N:
-                assert settings.N < self.td_signal.N            
-                _td_sig = TDSignal(self.td_signal[:, :settings.N], TDSettings(settings.N, self.td_signal.dt))
+            if isinstance(settings, TDSettings) and td_signal.N != settings.N:
+                assert settings.N < td_signal.N            
+                _td_sig = TDSignal(td_signal[:, :settings.N], TDSettings(settings.N, td_signal.dt))
             elif isinstance(settings, FDSettings):
-                target_td_n = round(1 / (settings.df * self.td_signal.dt))
-                _td_sig = TDSignal(self.td_signal[:, :target_td_n], TDSettings(target_td_n, self.td_signal.dt))
+                target_td_n = round(1 / (settings.df * td_signal.dt))
+                _td_sig = TDSignal(td_signal[:, :target_td_n], TDSettings(target_td_n, td_signal.dt))
             else:
-                _td_sig = self.td_signal
+                _td_sig = td_signal
             data_signal = _td_sig.transform(settings, window=window)
 
         if return_orbits:

@@ -841,7 +841,7 @@ class TDSignal(DomainBase, TDSettings):
             _arr = self.arr[..., :required_samples]
 
         stft_arr = self.dt *self.xp.fft.rfft(
-            window[None, :] * _arr.reshape(self.outer_shape + (Nsegments, nperseg)),
+            self.xp.asarray(window[None, :]) * _arr.reshape(self.outer_shape + (Nsegments, nperseg)),
             axis=-1,
         )
 
@@ -1900,16 +1900,21 @@ class STFTSignal(STFTSettings, DomainBase):
             f"min_freq={self.min_freq}, max_freq={self.max_freq}, backend={self.backend_name.split('_')[-1]})"
         )
 
-    def _plot_stft(self, channel=0, ax=None, **kwargs):
+    def _plot_stft(self, channel=0, ax=None, scale="linear", **kwargs):
         if ax is None:
             fig, ax = plt.subplots(figsize=(10, 6))
 
         t_arr = asnumpy(self.t_arr)
         f_arr = asnumpy(self.f_arr)
 
-        arr_here = asnumpy(self.arr[channel])
+        arr_here = np.abs(asnumpy(self.arr[channel]) ** 2).T
+        if scale == "log10":
+            arr_here = np.log10(arr_here)
+        if scale == "log":
+            arr_here = np.log(arr_here)
+        
         cb = ax.pcolormesh(
-            t_arr, f_arr, (np.abs(arr_here) ** 2).T, shading="auto", cmap="cividis", **kwargs
+            t_arr, f_arr, arr_here, shading="auto", cmap="cividis", **kwargs
         )
 
         ax.set_yscale("log")
