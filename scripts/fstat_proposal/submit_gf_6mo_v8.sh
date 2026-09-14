@@ -30,9 +30,11 @@
 #      09-08..11 correctness/perf stack that arm carries: PSD shared
 #      MIRROR, column-atomic staging + GB_TEMPER_CELL_ORDER=band (the
 #      vertical-swap fix set b3f5acbd -- REQUIRED with GB_TEMPER_VERTICAL=1
-#      below), windowed sig-het stash + one-block SETUP_BATCH, refresh
-#      threshold 0.1 rad, adaptive gb_search noise rider, fused accept
-#      kernel, PE draw-one. Tobs-scaled here: GB_N_SUBBANDS 16384/GPU and
+#      below), windowed sig-het stash + one-block SETUP_BATCH,
+#      adaptive gb_search noise rider, PE draw-one (the 09-11 refresh
+#      threshold and fused accept kernel were both REVERTED on that arm
+#      and are reverted here too -- see items 6). Tobs-scaled here:
+#      GB_N_SUBBANDS 16384/GPU and
 #      GB_RJ_INMODEL_CHUNK 32768 (byte-parity with the 3mo twin's
 #      32768/65536 at half the per-slot/-cell cost -- 6mo slots are ~2x
 #      3mo bytes).
@@ -43,6 +45,17 @@
 #      matrix eigen table (see the block by GB_INMODEL_OBSERVABLE_SHEAR),
 #      and the warm-start refit proposal (change 1) rides along, rebuilt
 #      from the MOST RECENT 3mo run (the 10-walker science arm).
+#
+#   6. (2026-09-14, user ruling) THE 6MO TESTING CAMPAIGN, ON THE
+#      COMBINED DATA: "This is going to be our 6mo testing campaign until
+#      full running." SOURCE_TYPES=COMBINED,... -- mojito's pre-summed L1
+#      stream is the data (see the COMBINED block by the id lists) -- and
+#      every post-rebase improvement from the 3mo 10-walker science arm
+#      is ported: per-stage RJ flip fractions (search 0.5 / PE 0.1),
+#      GB_TEMPER_SKIP_SHUTOFF_BANDS=1, BACKUP_ITER=10, repeats 100/50,
+#      GALFOR_ALPHA_MAX=20, and the 09-11 reverts (accept kernel 0,
+#      trace 0, ortho premise check 0, anchor audit retired, sig-het
+#      refresh threshold back to 0).
 #
 # V8-PARITY NOTES (deliberate divergences from the old 6mo_v1 draft --
 # the exact-copy rule wins for every non-Tobs knob): GB_USE_GALAXY_PRIOR
@@ -506,6 +519,11 @@ export COARSE_Q=8
 export COARSE_GPU_MODE=delayed_acceptance
 export COARSE_USE_WS=1
 export COARSE_FIDUCIAL=injection
+# Galfor slope-index cap (2026-09-04 diagnostic, KEPT on the 3mo science
+# arm; ported): alpha railed at the stock 5.0 cap (~60% of samples at the
+# edge). Widened [1e-3, 20] so the slope can explore; revert = drop the
+# line. The prior is rebuilt from code each run.
+export GALFOR_ALPHA_MAX=20.0
 echo "[V8-NOISE] coarse: Q=${COARSE_Q} mode=${COARSE_GPU_MODE} \
 use_ws=${COARSE_USE_WS} fiducial=${COARSE_FIDUCIAL}"
 
@@ -601,6 +619,14 @@ export GB_PSD_MIRROR_PARITY_PROPOSES=0
 # In-model repeats are unaffected either way -- they cover ALL alive
 # sources; the flip gate is rj-only by construction.
 # export GB_RJ_FLIP_FRACTION=0.2   # <- re-export ONLY to force ALL stages
+# PER-STAGE flip knobs (2026-09-11 user ruling, values corrected 09-14 --
+# ported from the 3mo 10-walker arm): rj_fstat_search never received the
+# flip default (recipe wiring miss, fixed 09-14), so the search ran at 1.0
+# in jobs 474/479; the intended "half the birth attempts" against what
+# actually ran is 0.5 (0.1 would be a 10x cut of the search feed). PE
+# moves DID carry 0.2 before, so 0.1 there is the intended halving.
+export GB_SEARCH_RJ_FLIP_FRACTION=0.5
+export GB_PE_RJ_FLIP_FRACTION=0.1
 # In-model info-matrix jump scale: 0.005 default measured 95% cold
 # acceptance; 0.2 -> 0.61; 0.4 -> 0.60 (job 196). Job 197 flipped the
 # story: with the EXACT per-block SIGHET info matrices live, cold
@@ -722,7 +748,12 @@ export GB_RJ_SNR_TRUNC_DIST=1      # birth distance draw truncated at the
 # faster and give more permuted + vertical swap rounds per hour.
 # NOTE these env pins beat the PE mode default as well — both phases
 # run 250/25.
-export GB_INMODEL_REPEATS_NEWBORN=250
+# 100 (2026-09-11 user ruling, was 250 -- ported from the 3mo 10-walker
+# arm): with the vertical ladder working, hot-rung newborns descend over
+# the following iterations and are polished as survivors at every rung
+# they visit; the newborn class had become 83% of the 1yr repeat-rows
+# (3,347 rows @250) and ~50% at 3mo.
+export GB_INMODEL_REPEATS_NEWBORN=100
 # SURVIVOR 25 -> 100 (user ruling 2026-08-29, aligned with v7), restoring the
 # value the high-f probe ran (200/100). In-model f0 drift is the ONLY mechanism
 # that moves a source across a sub-band edge -- there is no merge operator, RJ
@@ -734,7 +765,11 @@ export GB_INMODEL_REPEATS_NEWBORN=250
 # ⚠ The per-class split applies on the DIRECT-batch path only; the grouped
 # scheduler takes ONE budget for the whole pool from _SURVIVOR, so with
 # GB_RJ_GROUPED_INMODEL=1 this raises the effective budget for newborns too.
-export GB_INMODEL_REPEATS_SURVIVOR=100
+# 50 (2026-09-11 user ruling, was 100 -- ported from the 3mo 10-walker
+# arm): vertical sweeps run once per repeat, so this also halves the
+# vertical mixing per block -- judge by progress per wall-clock hour with
+# the [GB_CELL_LL] / sig-het cold audit as guards.
+export GB_INMODEL_REPEATS_SURVIVOR=50
 
 # VERTICAL TEMPERING ON (2026-08-26 user ruling: "this is crucial").
 # Per-repeat vertical band-temperature swaps inside the in-model loop
@@ -764,6 +799,14 @@ export GB_TEMPER_EVERY_PROPOSES=1
 # vertical sweep starved/biased (the leaf-shedding root cause pair); job
 # 473 on order=band + the whole-cell L_with ratio is the validated config.
 export GB_TEMPER_CELL_ORDER=band
+# RUNNING-BACKUP CADENCE (2026-09-14, ported from the 3mo 10-walker arm):
+# job 479 spent 60-80 s of every 5.4 min PE iteration in [SAVE] save_step
+# -- the sampler's blocking handoff waiting for the saver rank to finish
+# copying + fsyncing the 14 GB store into *_running_backup_copy.h5 after
+# EVERY save. Every 10th save instead; the 600 s mid-iteration checkpoint
+# still bounds a torn-store loss to that interval. The 6mo store will be
+# larger still, so this matters MORE here.
+export BACKUP_ITER=10
 export GB_TEMPER_PRELOAD_CELLS=4800
 # One occupancy census per unit (assert-guarded exact) + drop inert rows.
 export GB_TEMPER_CENSUS_HOIST=1
@@ -883,7 +926,12 @@ export GB_SIGHET_REFRESH_EVERY=25
 # ruling below was written against the 0.1 DEFAULT's rung gating -- this
 # knob is a drift threshold, not a rung filter, so hot rungs still
 # refresh once they drift.
-export GB_SIGHET_REFRESH_DPHASE=0.1
+# REVERTED to 0 (2026-09-11 evening, ported from the 3mo 10-walker arm):
+# 0.1 rad refreshed 81% of sources instead of 89% at 3mo and 94% instead
+# of 97% at 1yr -- no measurable wall-clock saving -- while the 1yr cold
+# audit max rose 15 -> 22 in the same relaunch (cause not isolated).
+# Accuracy is primary: refresh every check.
+export GB_SIGHET_REFRESH_DPHASE=0
 # ALL RUNGS REFRESH (user ruling 2026-08-18). The default 0.1 keeps a stale
 # reference on everything hotter, justified in the code as "the ll error is
 # beta-suppressed". That reasoning covers the WITHIN-rung accept test, where
@@ -941,7 +989,11 @@ export GB_SIGHET_TRUST_PHASE_C=49
 # climbs with rung count, stop and investigate before spending days on it.
 # Cost: one extra exact batched call per in-model block (measured 0.053 s
 # against inmodel_repeats ~4-5 s).
-export GB_SIGHET_ANCHOR_CHECK=1
+# SIG-HET ANCHOR AUDIT RETIRED (2026-09-04 gate PASSED on the 3mo arm:
+# all-rung delta-vs-delta p50 0.054, cold max 5.48, well inside tolerance
+# over the whole run; ~18 s/iter while armed). Re-arm (=1) if a sig-het
+# accuracy question reopens. Ported from the 3mo 10-walker arm.
+export GB_SIGHET_ANCHOR_CHECK=0
 export GB_SIGHET_DRIFT_CHECK=1
 # TIER SCAN RETIRED FOR THE CLEAN RESTART (2026-08-19). It has NO iteration
 # cap (the "first-few-iterations" note above it was wrong): it ran 13 extra
@@ -1380,7 +1432,13 @@ export GB_PE_RJ_REPLACE=0
 # bookkeeping reconcile, already on). This measures what the band decomposition
 # RESTS on: normalized |<h_i|h_j>| between concurrently-open adjacent-band cold
 # sources. 8 pairs per unit at unit close, diagnostic only, never mutates state.
-export GB_ORTHO_CHECK=1
+# DISARMED (2026-09-04, ported from the 3mo 10-walker arm): this premise
+# check DIES on the 2-GPU path (get_swap_ll shards index a numpy
+# data_index with a cupy keep_idx -> guarded TypeError skip, ~166/snapshot
+# of pure log spam, never runs). The companion GB_ORTHO_LL_CHECK
+# (credited-vs-direct) still runs and stays on. Re-arm =1 only after the
+# gb_likelihood.py:907 cupy/numpy fix lands.
+export GB_ORTHO_CHECK=0
 # STAGGER ON (2026-08-29) -- the half-cell shift is the whole point of
 # this configuration; see the GB_CAP_DIVISOR block above for the measured
 # cell-membership numbers. It is meaningless without divisor > 1 (the move
@@ -1638,7 +1696,13 @@ export GB_CELL_LABEL_DEFERRED=1
 # >>> production arming was the 3mo relaunch after job 473; est. -30..-40
 # >>> s/it. VERIFY on this run: in-model acceptance rates + [GB_CELL_LL]
 # >>> + sig-het audit unchanged vs the python chain. =0 reverts.
-export GB_INMODEL_ACCEPT_KERNEL=1
+# BACK TO 0 (2026-09-11 user ruling, ported from the 3mo 10-walker arm):
+# it fuses only the inmodel_gate + inmodel_accept launches, ~18 s/it at
+# 250/100 repeats and ~9 s at 100/50 -- not worth a first production
+# exposure. Turn on only after tests/test_gb_inmodel_accept_kernel.py has
+# been run on a cluster GPU node. (With GB_INMODEL_TRACE armed it stood
+# down anyway -- job 474 logged "standing down".)
+export GB_INMODEL_ACCEPT_KERNEL=0
 # ---- THE v8 EXPERIMENT: OBSERVABLE-BASIS IN-MODEL PROPOSAL ----------
 # Pinned EXPLICITLY even though it is now the code default, so this run
 # does not silently change meaning if the default is ever revisited, and
@@ -1704,10 +1768,12 @@ export GB_INMODEL_OBSERVABLE_SHEAR=0.5
 # GB_INMODEL_OBSERVABLE_EIGEN_SMAX (default 10.0) caps the whitened
 # sigmas. Watch the [GB_TIMING] span "infomat_obs_eigen" (the per-block
 # Gamma_z stash) and the obs_basis cold acceptance vs the 3mo arm's ~0.2.
-# The 3mo probe (submit_gf_3mo_v8_10w_eigenaxis_probe.sh) is the intended
-# FIRST exposure of this path -- read it before this run reaches
-# gb_search; launch with GB_INMODEL_OBSERVABLE_EIGEN= (explicitly empty)
-# to fall back if it reads badly.
+# THIS RUN IS THE TEST (user ruling 2026-09-14: "Let's just go to the
+# full 6mo run test") -- the 3mo probe script
+# (submit_gf_3mo_v8_10w_eigenaxis_probe.sh) remains available as an
+# ISOLATION arm if the combined draw needs to be separated from the 6mo
+# changes. Launch with GB_INMODEL_OBSERVABLE_EIGEN= (explicitly empty)
+# to fall back to the diagonal draw bit-identically if it reads badly.
 export GB_INMODEL_OBSERVABLE_EIGEN=${GB_INMODEL_OBSERVABLE_EIGEN-full}
 echo "[GB-OBS-EIGEN] GB_INMODEL_OBSERVABLE_EIGEN='${GB_INMODEL_OBSERVABLE_EIGEN}' (empty = diagonal draw)"
 # ---- AND THE F-STAT GRID IN THE SAME BASIS -------------------------
@@ -1767,7 +1833,11 @@ export GB_RJ_AMP_MAXIMIZE=0
 # see (a device-routing fault in factors) is exactly what this catches.
 # 979/979 matched in the r2 probes; any MISMATCH line here is a stop
 # signal. =0 disarms.
-export GB_INMODEL_TRACE=1
+# 0 (2026-09-11, was 1 -- ported from the 3mo 10-walker arm): the
+# per-repeat MH trace is a DEBUG knob (DEBUG lines per repeat, host
+# syncs) and, while armed, the fused accept kernel stands down. Re-arm
+# only for a diagnostic run.
+export GB_INMODEL_TRACE=0
 # DIFF DISCIPLINE: v7 exported GB_CAP_DIAG=1 and it costs time. Leaving it
 # on in v7 and off in v8 would make v8 look faster for reasons unrelated
 # to the proposal, so it is pinned ON here -- and the cap census is wanted
@@ -1860,6 +1930,15 @@ export GB_RJ_BAND_SHUTOFF_SCOPE=search
 # should re-open the question on its own. 100 = 2x the refit cadence
 # below, so it only bites if refitting stalls or is turned off.
 export GB_RJ_BAND_SHUTOFF_RESET_ITERS=100
+# USER RULING 2026-08-28: a shut-off band is frozen "for RJ and fancy
+# swaps until it resets". The RJ half is enforced in run_proposal; the
+# swap half is this knob (default OFF in code) and it had never been
+# exported -- shut-off bands kept being built, scored and swapped in the
+# horizontal tempering. ON since 2026-09-11 on the 3mo arm; ported here.
+# Safe because shutoff revives on every F-stat epoch (REFIT_EVERY=50) and
+# after RESET_ITERS. 6MO TODO (memory note): MEASURE the saving -- read
+# temper_cells_filled + run_tempering span vs the unskipped baseline.
+export GB_TEMPER_SKIP_SHUTOFF_BANDS=1
 # 100 -> 50 (2026-08-18): the refit re-derives the peaks against the LIVE
 # residual and the UPDATED foreground/PSD, which is the whole point of
 # refitting -- and the foreground converges well inside 20 iterations, so a
@@ -2064,13 +2143,34 @@ export GB_WARM_START_CIRC_IMAGES=${GB_WARM_START_CIRC_IMAGES:-3}
 # stage (joint max-lnL over the source PE moves) runs FIRST so the loud
 # sources converge + subtract before the noise stages fit the PSD; the
 # PE moves then ride gb_search + full_pe (sobbh -> mbh -> emri banking
-# order). SOURCE_TYPES gains the armed classes' mojito streams
-# automatically. Ids = the 2026-08-24 census (user "yes in general",
+# order). Ids = the 2026-08-24 census (user "yes in general",
 # 2026-09-02): MBHB only the 4 systems with t_merge <= 6 mo; EMRI/SOBHB
 # full census pending the S4 readout.
 export MBHB_IDS=2,5,16,18          # t_c 173.3 / 104.7 / 111.4 / 92.0 d
 export EMRI_IDS=0,1,2,3,4,5,6,7    # all 8 -- S4 census may trim
 export SOBHB_IDS=0,1,2,3,4,5       # all 6 -- expected mostly sub-threshold
+# ---- THE COMBINED DATA SET (user ruling 2026-09-14: the 6mo testing
+# campaign runs on the "combined" data) --------------------------------
+# COMBINED = mojito's PRE-SUMMED L1 stream (${MOJITO_DATA_PATH}/data/
+# COMBINED/L1/): it establishes the data AND the orbits, and it already
+# contains EVERYTHING -- instrument noise, the full GB galaxy (resolved +
+# confusion), VGBs, and ALL sources of every class. The per-class entries
+# after it contribute CATALOGUES ONLY (VGB seeding, nleaves sizing,
+# F-stat overlays, source-branch priors/starts); their L1 bricks are NOT
+# read, so per-id brick presence stops mattering. The loader REFUSES
+# COMBINED+NOISE and COMBINED+GALFOR (double-count guards) -- do not add
+# them. The NOISE brick must still EXIST on disk: UNEQUAL_ARM=1 reads its
+# /ltts delay table and the psd start estimates read its noise_estimates,
+# both resolved by PATH (NOISE_FILE / data/INSTRUMENT/L1/NOISE_*),
+# independent of this list.
+# ⚠ MODELING CONSEQUENCE vs the per-brick default (NOISE,GB,VGB,+armed):
+# the data now also contains the NON-ARMED sources (the other MBHBs
+# beyond ids 2,5,16,18, any catalogue rows outside the id lists). Nothing
+# samples them, so they sit in the residual as unmodeled content -- the
+# realistic full-data-challenge configuration, accepted by the 09-14
+# ruling. Explicitly-set SOURCE_TYPES always wins over this line.
+export SOURCE_TYPES=${SOURCE_TYPES-COMBINED,GB,VGB,MBHB,EMRI,SOBHB}
+echo "[DATA] SOURCE_TYPES=${SOURCE_TYPES} (COMBINED = pre-summed stream; classes after it are catalogue-only)"
 # Ladders / repeats / swap cadence / start scatter: the probe's latest
 # rulings (submit_gf_6mo_sources_probe.sh, 2026-08-26..28 -- see its
 # comment blocks for the measured cost arithmetic).
@@ -2289,31 +2389,73 @@ if os.path.exists(store):
 PYEOF
 
 # ============================================================================
-# SOURCES PREFLIGHT (6mo_v8). Hard-check the mojito bricks for every armed
-# source class before taking a slurm allocation (user ruling 2026-09-02:
-# "script hard-checks brick presence at launch"). Layout mirrors the NOISE
-# preflight above: ${MOJITO_DATA_PATH}/data/<CLASS>/L1/. The loader's own
-# loud raise at build remains the authoritative per-ID gate; this catches
-# the whole-class-missing case in seconds.
+# SOURCES PREFLIGHT (6mo_v8). Hard-check the data before taking a slurm
+# allocation (user ruling 2026-09-02: "script hard-checks brick presence
+# at launch"). COMBINED-aware (2026-09-14): when SOURCE_TYPES carries
+# COMBINED, the per-class L1 bricks are never read -- the checks become
+# (a) the COMBINED file resolves exactly the way the loader's
+# find_combined_file will resolve it (single .h5 / COMBINED_ prefix /
+# MOJITO_COMBINED_FILE override), and (b) NOISE/GALFOR are not also
+# listed (the loader refuses the double-count at build; fail it here in
+# seconds instead). Without COMBINED, the old per-class brick check.
 # ============================================================================
-python - "${MOJITO_DATA_PATH}" "${MBHB_IDS:-}" "${EMRI_IDS:-}" "${SOBHB_IDS:-}" <<'PYEOF' || exit 2
+python - "${MOJITO_DATA_PATH}" "${MBHB_IDS:-}" "${EMRI_IDS:-}" "${SOBHB_IDS:-}" "${SOURCE_TYPES:-}" <<'PYEOF' || exit 2
 import glob, os, sys
-mojito, mbhb, emri, sobhb = sys.argv[1:5]
+mojito, mbhb, emri, sobhb, src_types = sys.argv[1:6]
+types = [s.strip().upper() for s in src_types.split(",") if s.strip()]
 armed = {"MBHB": mbhb, "EMRI": emri, "SOBHB": sobhb}
 bad = False
-for cls, ids in armed.items():
-    if not ids.strip():
-        print(f"[SOURCES] {cls}: not armed (empty id list).")
-        continue
-    d = os.path.join(mojito, "data", cls, "L1")
-    hits = sorted(glob.glob(os.path.join(d, "*")))
-    if not hits:
-        print(f"[SOURCES] REFUSING: {cls} armed (ids {ids}) but no bricks "
-              f"under {d!r}.")
+if "COMBINED" in types:
+    for clash in ("NOISE", "GALFOR"):
+        if clash in types:
+            print(f"[SOURCES] REFUSING: SOURCE_TYPES lists COMBINED and "
+                  f"{clash} -- the combined stream already contains it "
+                  "(the loader refuses this at build).")
+            bad = True
+    folder = os.path.join(mojito, "data", "COMBINED", "L1")
+    override = os.environ.get("MOJITO_COMBINED_FILE", "").strip()
+    if override:
+        p = override if os.path.isabs(override) else os.path.join(folder, override)
+        if not os.path.exists(p):
+            print(f"[SOURCES] REFUSING: MOJITO_COMBINED_FILE={override!r} "
+                  f"does not exist (looked at {p}).")
+            bad = True
+        else:
+            print(f"[SOURCES] COMBINED file (override): {p}")
+    elif not os.path.isdir(folder):
+        print(f"[SOURCES] REFUSING: no combined-data folder at {folder!r}.")
         bad = True
     else:
-        print(f"[SOURCES] {cls}: {len(hits)} brick file(s) under {d}; "
-              f"ids {ids} (per-id resolution is the loader's).")
+        cands = sorted(f for f in os.listdir(folder)
+                       if f.endswith(".h5") and not f.startswith("."))
+        named = [f for f in cands if f.upper().startswith("COMBINED_")]
+        if not cands:
+            print(f"[SOURCES] REFUSING: no .h5 file in {folder!r}.")
+            bad = True
+        elif len(cands) > 1 and len(named) != 1:
+            print(f"[SOURCES] REFUSING: {len(cands)} .h5 files in "
+                  f"{folder!r} ({cands}); set MOJITO_COMBINED_FILE.")
+            bad = True
+        else:
+            pick = named[0] if len(cands) > 1 else cands[0]
+            print(f"[SOURCES] COMBINED file: {os.path.join(folder, pick)}")
+    for cls, ids in armed.items():
+        state = f"ids {ids}" if ids.strip() else "not armed"
+        print(f"[SOURCES] {cls}: catalogue-only under COMBINED ({state}).")
+else:
+    for cls, ids in armed.items():
+        if not ids.strip():
+            print(f"[SOURCES] {cls}: not armed (empty id list).")
+            continue
+        d = os.path.join(mojito, "data", cls, "L1")
+        hits = sorted(glob.glob(os.path.join(d, "*")))
+        if not hits:
+            print(f"[SOURCES] REFUSING: {cls} armed (ids {ids}) but no bricks "
+                  f"under {d!r}.")
+            bad = True
+        else:
+            print(f"[SOURCES] {cls}: {len(hits)} brick file(s) under {d}; "
+                  f"ids {ids} (per-id resolution is the loader's).")
 if bad:
     raise SystemExit(2)
 print("[SOURCES] preflight OK.")
