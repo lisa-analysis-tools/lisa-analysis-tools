@@ -2053,11 +2053,18 @@ export GB_WARM_START_CIRC_IMAGES=${GB_WARM_START_CIRC_IMAGES:-3}
 # injection WITHOUT the galaxy stream. psd stays (instrument noise is still
 # fit); the armed source classes below stay.
 #
-# DATA MODE (user 2026-09-14: "can we use synthetic data ... I am still
-# transferring things to the cluster"). Default = synthetic until the
-# mojito transfer completes; NOGB_DATA=mojito sbatch ... (or flip the
-# default) restores the real-data configuration.
-NOGB_DATA=${NOGB_DATA:-synthetic}
+# DATA MODE (updated 2026-09-14 evening, user: "combination of synthetic
+# and real (where possible)"). Default = mojito HYBRID: real bricks where
+# present, and any MISSING MBHB/EMRI/SOBHB brick is synthesized in-process
+# from its CATALOGUE parameters (same converters as the branch preps,
+# mojito epochs, the run's REAL orbits => nulls against the branch
+# template exactly; grid + orbits from the first real brick; VGBs + the
+# NOISE brick load normally). SYNTHESIZE_MISSING_BRICKS below is the
+# whole mechanism -- watch the loader's "[HYBRID] ..." lines for the
+# per-source provenance (brick vs synthesized).
+# NOGB_DATA=synthetic remains the all-synthetic escape (no mojito files
+# touched at all).
+NOGB_DATA=${NOGB_DATA:-mojito}
 if [ "${NOGB_DATA}" = "synthetic" ]; then
   export DATA_MODE=synthetic
   # VGB SITS OUT of the synthetic interim: all_sources' synthetic
@@ -2081,6 +2088,10 @@ else
   # VGBs stay in mojito mode (known sources, separate vgb stream).
   export REMOVE_BRANCHES=gb,galfor
   export SOURCE_TYPES=NOISE,VGB,SOBHB,MBHB,EMRI
+  # HYBRID fill for bricks still in transfer (some SOBHB/EMRI): missing
+  # MBHB/EMRI/SOBHB bricks are synthesized from catalogue parameters.
+  # A missing VGB/NOISE brick (or catalogue file) is still a loud failure.
+  export SYNTHESIZE_MISSING_BRICKS=1
 fi
 export MBHB_IDS=2,5,16,18          # t_c 173.3 / 104.7 / 111.4 / 92.0 d
 export EMRI_IDS=0,1,2,3,4,5,6,7    # all 8 -- S4 census may trim
@@ -2321,24 +2332,50 @@ fi
 if [ "${DATA_MODE}" = "synthetic" ]; then
   echo "[NOGB-DATA] synthetic: skipping the mojito source-ids preflight (ids = stock counts)."
 else
-python - "${MOJITO_DATA_PATH}" "${MBHB_IDS:-}" "${EMRI_IDS:-}" "${SOBHB_IDS:-}" <<'PYEOF' || exit 2
+python - "${MOJITO_DATA_PATH}" "${MBHB_IDS:-}" "${EMRI_IDS:-}" "${SOBHB_IDS:-}" "${SYNTHESIZE_MISSING_BRICKS:-0}" <<'PYEOF' || exit 2
 import glob, os, sys
-mojito, mbhb, emri, sobhb = sys.argv[1:5]
+mojito, mbhb, emri, sobhb, hybrid = sys.argv[1:6]
+hybrid = hybrid.strip() == "1"
 armed = {"MBHB": mbhb, "EMRI": emri, "SOBHB": sobhb}
+cat_files = {
+    "MBHB": "mbhb_cat_mojito_lite_processed_MT_rounding_fixed.hdf5",
+    "EMRI": "emri_cat_mojito_lite_processed_MT.hdf5",
+    "SOBHB": "sobhb_cat_mojito_lite_processed_MT.hdf5",
+}
 bad = False
 for cls, ids in armed.items():
     if not ids.strip():
         print(f"[SOURCES] {cls}: not armed (empty id list).")
         continue
     d = os.path.join(mojito, "data", cls, "L1")
-    hits = sorted(glob.glob(os.path.join(d, "*")))
-    if not hits:
-        print(f"[SOURCES] REFUSING: {cls} armed (ids {ids}) but no bricks "
-              f"under {d!r}.")
-        bad = True
+    id_list = [i.strip() for i in ids.split(",") if i.strip()]
+    have = [i for i in id_list
+            if glob.glob(os.path.join(d, f"{cls}_*source{i}_*"))]
+    miss = [i for i in id_list if i not in have]
+    if hybrid:
+        # the fill builds missing sources from CATALOGUE parameters, so
+        # the catalogue file is the hard requirement, not the bricks
+        cat = os.path.join(mojito, "catalogues", cat_files[cls])
+        if not os.path.exists(cat):
+            print(f"[SOURCES] REFUSING: {cls} armed but its catalogue "
+                  f"{cat!r} is missing -- the hybrid fill has no truths.")
+            bad = True
+            continue
+        print(f"[SOURCES] {cls}: bricks for ids {have or '[]'}; "
+              f"[HYBRID] will synthesize ids {miss or '[]'} from the "
+              f"catalogue.")
     else:
-        print(f"[SOURCES] {cls}: {len(hits)} brick file(s) under {d}; "
-              f"ids {ids} (per-id resolution is the loader's).")
+        if not have:
+            print(f"[SOURCES] REFUSING: {cls} armed (ids {ids}) but no "
+                  f"bricks under {d!r}.")
+            bad = True
+        elif miss:
+            print(f"[SOURCES] REFUSING: {cls} ids {miss} have no brick "
+                  f"under {d!r} (set SYNTHESIZE_MISSING_BRICKS=1 for the "
+                  f"hybrid fill).")
+            bad = True
+        else:
+            print(f"[SOURCES] {cls}: all {len(have)} bricks present.")
 if bad:
     raise SystemExit(2)
 print("[SOURCES] preflight OK.")
