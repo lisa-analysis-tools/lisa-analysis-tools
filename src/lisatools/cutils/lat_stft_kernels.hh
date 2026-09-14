@@ -87,54 +87,45 @@ static CUDA_DEVICE cmplx stft_block_reduce_cmplx(cmplx* sdata)
 #endif
 
 // ---------------------------------------------------------------------------
-// Doppler-corrected instantaneous frequency / frequency-rate of the TDI signal
-// at time `t`, derived from the TDI phase (the VALUES never use the
-// astrophysical get_f/get_fdot model), per channel, in the kernel's chirp
-// convention (phase = arg(conj(TDI))). ONE central-difference stencil at a
-// small half-width D spanning a fixed fraction of a carrier cycle,
+// Instantaneous frequency and frequency rate of the TDI signal at time `t`, per
+// channel, in the kernel's chirp convention (phase = arg(conj(TDI))).
 //
-//     D = STFT_FREQ_FDOT_STENCIL_CYCLES / f_astro   (quarter-cycle stencil),
+//     f0    = f_astro + arg( conj(z+) * z- * e^{-i 4 pi f_astro D} ) / (4 pi D)
+//     fdot0 = fdot_astro - f0 * (k . a_sc / c)
 //
-// i.e. tens of seconds at mHz -- always local, never the STFT segment width.
-// f_astro sets only the step SCALE (any O(1)-correct scale gives the same
-// answer); the derivatives themselves are pure phase differences:
-//
-//     f0    =  arg( conj(z+) * z-              ) / (4 pi D)
-//     fdot0 =  arg( conj(z+) * conj(z-) * z0^2 ) / (2 pi D^2)
-//
-// Both are principal-valued args of complex PRODUCTS (never differences of
-// separate arg() calls), so there is no wrapping/branch-cut bookkeeping:
-//   * first difference: |4 pi f D| = pi * (f/f_astro)/2 ~ pi/2 -- wrap-free
-//     with a 2x margin at every carrier (f differs from f_astro only by the
-//     ~1e-4-relative Doppler).
-//   * second difference: 2 pi fdot D^2 ~ 1e-9 rad -- never wraps.
-//
-// Step-size budget (why neither extreme works): the TDI-phase evaluation
-// noise is eps_phi ~ few 1e-10 rad (double roundoff on ~1e5-rad carrier
-// phases), so fdot carries noise ~ eps_phi/(pi D^2) and the spurious
-// curvature accumulated across one STFT segment is ~ eps_phi*(dt_seg/D)^2:
-//   * a relative-to-t or sub-second step (D ~ 0.01 s) gives HUNDREDS of
-//     radians -- catastrophic;
-//   * a fixed few-second step fails long segments / high carriers
-//     (measured: mm 3.2e-3 at 17 h segments, 8 mHz, D = 4 s);
-//   * the quarter-cycle step gives eps_phi*(4*f*dt_seg)^2/... ~ 1e-4..1e-2
-//     rad^0.5 budgets -> mm 1e-8..1e-5 across the LISA band. fdot0 remains
-//     O(1)-noisy relative to the Doppler rate itself, which is fine: the
-//     Fresnel value's 1/sqrt(2|fdot0|) prefactor cancels analytically
-//     against the C/S increments in the near-monochromatic limit, so only
-//     the accumulated curvature phase matters.
-//
-// NOTE: samples the TDI (hence the orbit) only at t +- D, so the stencil
-// stays inside the observation except within D of its very ends.
-// Identically-zero TDI samples (the response zeroes retarded times outside
-// the orbit span, e.g. the first samples when the observation is pinned at
-// the orbit's t0) carry no phase: such pixels degrade to the astro model,
-// as the legacy estimator did implicitly. Near-null CHANNELS (power < 1e-24
-// of the loudest) copy the loudest channel's estimate so the f0[0]-driven
-// carrier placement can never be thrown out of the band by roundoff phase.
+// Rate fdot0 is analytic via orbit acceleration differencing across DT_ORB = 2000 s.
+// Carrier demodulation shifts the first difference to baseband (|arg| < 1e-3 rad),
+// enabling wide baseline D = 2000 s and suppressing frequency noise as 1/D.
 // ---------------------------------------------------------------------------
-constexpr double STFT_FREQ_FDOT_STENCIL_CYCLES = 0.125;  ///< carrier cycles per half-width
 constexpr double STFT_FREQ_FDOT_DT_MAX = 3600.0;         ///< half-width cap [s]
+constexpr double STFT_DT_STENCIL_DEMOD = 2000.0;         ///< demodulated half-width [s]
+
+// Spacecraft acceleration for the analytic Doppler rate. DT_ORB spans 4x the 500 s
+// linear interpolation grid to prevent node aliasing.
+template <class SourceT>
+CUDA_DEVICE inline Vec stft_get_spacecraft_acc(SourceT& src, double t, int sc)
+{
+    constexpr double DT_ORB = 2000.0; // [s] Spans 4x the 500 s position grid
+    constexpr double DT_ORB2_INV = 1.0 / (DT_ORB * DT_ORB);
+
+    double t_lo = src.orbits->sc_t0;
+    double t_hi = src.orbits->sc_t0
+                + (double)(src.orbits->sc_N - 2) * src.orbits->sc_dt;
+
+    double t_anchor = t;
+    if (t_anchor < t_lo + DT_ORB)
+        t_anchor = t_lo + DT_ORB;
+    if (t_anchor > t_hi - DT_ORB)
+        t_anchor = t_hi - DT_ORB;
+
+    Vec x_p = src.orbits->get_pos(t_anchor + DT_ORB, sc);
+    Vec x_0 = src.orbits->get_pos(t_anchor, sc);
+    Vec x_m = src.orbits->get_pos(t_anchor - DT_ORB, sc);
+
+    return Vec((x_p.x - 2.0 * x_0.x + x_m.x) * DT_ORB2_INV,
+               (x_p.y - 2.0 * x_0.y + x_m.y) * DT_ORB2_INV,
+               (x_p.z - 2.0 * x_0.z + x_m.z) * DT_ORB2_INV);
+}
 
 // Astro-model degradation shared by the guards below: fires only where the
 // TDI has no differentiable phase (identically-zero response samples at the
@@ -163,10 +154,6 @@ CUDA_DEVICE void stft_freq_fdot_from_tdi_phase(
     double* f0_out, double* fdot0_out,
     double* amp_p_out, double* amp_m_out, double* D_out)
 {
-    // Linear-envelope exports: per-channel stencil amplitudes |z+-| and the
-    // half-width D, consumed by FresnelColumn::setup as the slope
-    // a_j = (|z+|-|z-|)/(2 D |z0|). Default 0 so any astro-fallback / degenerate
-    // early-return below carries NO slope (a_j = 0); the normal path fills them.
     for (int ch = 0; ch < 3; ch += 1)
     {
         amp_p_out[ch] = 0.0;
@@ -174,7 +161,7 @@ CUDA_DEVICE void stft_freq_fdot_from_tdi_phase(
     }
     *D_out = STFT_FREQ_FDOT_DT_MAX;
 
-    // Quarter-cycle stencil: f_astro sets only the step SCALE.
+    // f_astro sets the demodulation carrier and nothing else.
     double f_scale = src.get_f(t, params, bin_i);
     if (!(f_scale > 0.0))
     {
@@ -182,20 +169,46 @@ CUDA_DEVICE void stft_freq_fdot_from_tdi_phase(
                                                f0_out, fdot0_out);
         return;
     }
-    double D = STFT_FREQ_FDOT_STENCIL_CYCLES / f_scale;
+    double D = STFT_DT_STENCIL_DEMOD;
     if (D > STFT_FREQ_FDOT_DT_MAX)
         D = STFT_FREQ_FDOT_DT_MAX;
     *D_out = D;
 
+    // Active domain is the intersection of position and light travel time tables.
+    // Retardation buffer covers the 8 L/c (66.7 s) maximum link delay chain.
+    constexpr double DT_RETARD_BUFFER = 70.0; // [s] covers 8 * L/c
+
+    double sc_t_min = src.orbits->sc_t0;
+    double sc_t_max = src.orbits->sc_t0
+                    + (double)(src.orbits->sc_N - 2) * src.orbits->sc_dt;
+    double ltt_t_min = src.orbits->ltt_t0;
+    double ltt_t_max = src.orbits->ltt_t0
+                     + (double)(src.orbits->ltt_N - 2) * src.orbits->ltt_dt;
+
+    double t_valid_min = (sc_t_min > ltt_t_min ? sc_t_min : ltt_t_min)
+                       + DT_RETARD_BUFFER;
+    double t_valid_max = (sc_t_max < ltt_t_max ? sc_t_max : ltt_t_max);
+
+    if (t < t_valid_min || t > t_valid_max)
+    {
+        stft_freq_fdot_astro_fallback<SourceT>(src, t, params, bin_i,
+                                               f0_out, fdot0_out);
+        return;
+    }
+
+    double t_anchor = t;
+    if (t_anchor < t_valid_min + D)
+        t_anchor = t_valid_min + D;
+    else if (t_anchor > t_valid_max - D)
+        t_anchor = t_valid_max - D;
+
     cmplx tdi_p[3];
     cmplx tdi_m[3];
-    src.get_tdi_Xf_single(&tdi_p[0], t + D, params, k, u, v,
+    src.get_tdi_Xf_single(&tdi_p[0], t_anchor + D, params, k, u, v,
                           link_space_craft_rec, link_space_craft_em, bin_i);
-    src.get_tdi_Xf_single(&tdi_m[0], t - D, params, k, u, v,
+    src.get_tdi_Xf_single(&tdi_m[0], t_anchor - D, params, k, u, v,
                           link_space_craft_rec, link_space_craft_em, bin_i);
 
-    // Channel powers at the center; the loudest channel anchors the
-    // degenerate cases below.
     double pow_ch[3];
     int ch_ref = 0;
     for (int ch = 0; ch < 3; ch += 1)
@@ -206,8 +219,6 @@ CUDA_DEVICE void stft_freq_fdot_from_tdi_phase(
             ch_ref = ch;
     }
 
-    // Degenerate pixel: identically-zero TDI at the center or in the stencil
-    // (see the header comment). arg(0) == 0 carries no phase information.
     double pow_p = tdi_p[ch_ref].real() * tdi_p[ch_ref].real()
                  + tdi_p[ch_ref].imag() * tdi_p[ch_ref].imag();
     double pow_m = tdi_m[ch_ref].real() * tdi_m[ch_ref].real()
@@ -219,27 +230,41 @@ CUDA_DEVICE void stft_freq_fdot_from_tdi_phase(
         return;
     }
 
+    double fdot_astro = src.get_fdot(t, params, bin_i);
+
+    // Counter-rotating carrier demodulation phasor: exp(-i * 4 * pi * f_scale * D) 
+    // so arg() evaluates only the small residual Doppler/null perturbation .
+    double phi_carrier = 4.0 * M_PI * f_scale * D;
+    cmplx demod_phasor(cos(phi_carrier), -sin(phi_carrier));
+
     for (int ch = 0; ch < 3; ch += 1)
     {
-        // With phi = arg(conj(TDI)):
-        //   phi(t+D) - phi(t-D)          = arg( conj(z+) * z- )
-        //   phi(t+D) + phi(t-D) - 2phi(t) = arg( conj(z+) * conj(z-) * z0^2 )
-        cmplx c0 = tdi_center[ch];
-        double dphi1 = gcmplx::arg(gcmplx::conj(tdi_p[ch]) * tdi_m[ch]);
-        double dphi2 = gcmplx::arg(gcmplx::conj(tdi_p[ch]) *
-                                   gcmplx::conj(tdi_m[ch]) * c0 * c0);
-        f0_out[ch] = dphi1 / (4.0 * M_PI * D);
-        fdot0_out[ch] = dphi2 / (2.0 * M_PI * D * D);
-        // Exact-zero fdot0 would hit 0/0 in the Fresnel zeta/amplitude; the
-        // value is in the fdot-insensitive sinc regime anyway, so any
-        // astro-scale floor is equivalent.
-        if (fdot0_out[ch] == 0.0)
-            fdot0_out[ch] = 1.0e-18;
-    }
+        // First difference with carrier demodulation:
+        // arg(conj(z+) * z- * exp(-i * 4 * pi * f_scale * D))
+        cmplx z_diff = gcmplx::conj(tdi_p[ch]) * tdi_m[ch] * demod_phasor;
+        double dphi1_res = gcmplx::arg(z_diff);
 
+        // Instantaneous frequency = f_astro + delta_f
+        f0_out[ch] = f_scale + dphi1_res / (4.0 * M_PI * D);
+
+        // Vertex spacecraft of each channel (X, Y, Z -> SC 1, 2, 3).
+        int sc_id = ch + 1;
+        Vec a_sc = stft_get_spacecraft_acc(src, t, sc_id);
+        double k_dot_a = k.dot(a_sc);
+
+        // fdot_0 = fdot_astro - f_0 * (k . a_sc / c)
+        fdot0_out[ch] = fdot_astro - f0_out[ch] * (k_dot_a * C_inv);
+
+        // Sign-preserving zero guard (protects float64 range across side-bins)
+        // We only want to guard for exact cancellation of fdot that happen 
+        // twice a year for binaries that are dominated by doppler modulation.
+        if (std::fabs(fdot0_out[ch]) < 1.0e-22)
+        {
+            fdot0_out[ch] = std::signbit(fdot0_out[ch]) ? -1.0e-22 : 1.0e-22;
+        }
+    }
     if (isnan(f0_out[ch_ref]) || isnan(fdot0_out[ch_ref]))
     {
-        // Loudest channel unusable (e.g. NaN response sample): degrade.
         stft_freq_fdot_astro_fallback<SourceT>(src, t, params, bin_i,
                                                f0_out, fdot0_out);
         return;
@@ -374,16 +399,36 @@ struct FresnelColumn
         for (int j = 0; j < 3; j += 1)
             fresnel->get_amp_phase(&s.amp[j], &s.phase[j],
                                    gcmplx::conj(tdi_channel_val[j]));
-        // Linear-envelope slope a_j = (|z+|-|z-|)/(2 D |z0|) per channel (the
-        // fractional amplitude drift across the segment). Astro-fallback /
-        // degenerate pixels export amp_p==amp_m==0 -> a_j = 0; guard the
-        // near-null channels (|z0|~0) against 0/0. Consumed by value() only when
-        // fresnel->linear_envelope is on.
+    
+        // Identify loudest channel for relative amplitude thresholding and carrier bin anchoring
+        int ch_loudest = 0;
+        for (int j = 1; j < 3; j += 1)
+        {
+            if (s.amp[j] > s.amp[ch_loudest])
+                ch_loudest = j;
+        }
+        
+        constexpr double A_J_AMP_GUARD = 1.0e-12;   // relative amplitude floor
+        double a_j_max = (s.fresnel->use_midpoint ? 2.0 : 1.0) / s.fresnel->dt;
+        double amp_floor = A_J_AMP_GUARD * s.amp[ch_loudest];
         for (int j = 0; j < 3; j += 1)
-            s.a[j] = (s.amp[j] > 0.0)
-                         ? (amp_p[j] - amp_m[j]) / (2.0 * D_stencil * s.amp[j])
-                         : 0.0;
-        s.carrier_j = stft->get_freq_index(s.f0[0]);
+        {
+            if (s.amp[j] > 0.0 && s.amp[j] > amp_floor)
+            {
+                double slope = (amp_p[j] - amp_m[j])
+                             / (2.0 * D_stencil * s.amp[j]);
+                if (slope > a_j_max)
+                    slope = a_j_max;
+                else if (slope < -a_j_max)
+                    slope = -a_j_max;
+                s.a[j] = slope;
+            }
+            else
+            {
+                s.a[j] = 0.0;
+            }
+        }
+        s.carrier_j = stft->get_freq_index(s.f0[ch_loudest]);
     }
 
     CUDA_DEVICE static cmplx value(const State& s, int j, int freq_j_here,
@@ -414,7 +459,7 @@ CUDA_DEVICE void stft_eval_block_ll(
     SourceT& src, STFTFresnel* fresnel, STFTDomain* stft,
     double* params,
     int* link_space_craft_rec, int* link_space_craft_em, int bin_i,
-    int data_index, int noise_index,
+    int data_index, int noise_index, int start_j,
     int n_side_bins, double window_factor, bool freq_from_tdi_phase,
     cmplx* d_h_tmp, cmplx* h_h_tmp, int tid,
     cmplx* d_h_val, cmplx* h_h_val)
@@ -453,8 +498,12 @@ CUDA_DEVICE void stft_eval_block_ll(
         int freq_j = col.carrier_j;
         for (int diff = -n_side_bins; diff <= +n_side_bins; diff += 1)
         {
+            //  Two indices from here on: freq_j_here is the ACTIVE bin (0 at the domain's
+            //  f_min) and sets the frequency; freq_j_local is where this cell STORES it.
+            //  They differ by the cell's window start; start_j = 0 is the full grid.
             int freq_j_here = freq_j + diff;
-            if ((freq_j_here >= 0) && (freq_j_here <= num_freqs - 1))
+            int freq_j_local = freq_j_here - start_j;
+            if ((freq_j_local >= 0) && (freq_j_local <= num_freqs - 1))
             {
                 double freq_here = f_min + freq_j_here * df;
                 for (int j = 0; j < 3; j += 1)
@@ -463,7 +512,7 @@ CUDA_DEVICE void stft_eval_block_ll(
                                                           freq_here);
                 }
                 stft->add_ip_contrib(d_h_tmp, h_h_tmp, fresnel_val,
-                                     time_i, freq_j_here, data_index, noise_index);
+                                     time_i, freq_j_local, data_index, noise_index);
             }
         }
     }
@@ -492,7 +541,8 @@ void stft_get_ll_kernel(
     STFTFresnel* fresnel, STFTDomain* stft,
     double* params_all, int* data_index_all, int* noise_index_all,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    int* start_freq_inds)
 {
     CUDA_SHARED cmplx d_h_tmp[NUM_THREADS_HERE];
     CUDA_SHARED cmplx h_h_tmp[NUM_THREADS_HERE];
@@ -515,6 +565,8 @@ void stft_get_ll_kernel(
     {
         int data_index = data_index_all[bin_i];
         int noise_index = noise_index_all[bin_i];
+        // * Window start of the cell this binary is evaluated against; 0 is the full grid.
+        int start_j = (start_freq_inds == nullptr) ? 0 : start_freq_inds[data_index];
         for (int i = THREAD_START_X; i < nparams; i += BLOCK_INCR_X)
             params[i] = params_all[bin_i * nparams + i];
         CUDA_SYNC_THREADS;
@@ -523,7 +575,7 @@ void stft_get_ll_kernel(
         stft_eval_block_ll<SourceT, ColumnT>(
             src, fresnel, stft, params,
             link_space_craft_rec, link_space_craft_em, bin_i,
-            data_index, noise_index,
+            data_index, noise_index, start_j,
             n_side_bins, window_factor, freq_from_tdi_phase,
             d_h_tmp, h_h_tmp, tid, &d_h_val, &h_h_val);
 
@@ -543,7 +595,8 @@ inline void stft_get_ll_impl(
     STFTFresnel* fresnel, STFTDomain* stft,
     double* params_all, int* data_index_all, int* noise_index_all,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    int* start_freq_inds = nullptr)
 {
 #ifdef __CUDACC__
     static Orbits*      orbits_gpu     = nullptr;
@@ -563,14 +616,16 @@ inline void stft_get_ll_impl(
     stft_get_ll_kernel<SourceT, ColumnT><<<grid, NUM_THREADS_HERE>>>(
         d_h_out, h_h_out, orbits_gpu, tdi_config_gpu, fresnel_gpu, stft_gpu,
         params_all, data_index_all, noise_index_all,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase);
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
+        start_freq_inds);
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
 #else
     stft_get_ll_kernel<SourceT, ColumnT>(
         d_h_out, h_h_out, orbits, tdi_config, fresnel, stft,
         params_all, data_index_all, noise_index_all,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase);
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
+        start_freq_inds);
 #endif
 }
 
@@ -594,7 +649,8 @@ void stft_fill_global_kernel(
     STFTFresnel* fresnel, STFTDomain* stft,
     double* params_all, int* data_index_all, double* factors_all,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase, bool active_band)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase, bool active_band,
+    int* start_freq_inds)
 {
     (void) active_band;  // STFT grid == active band; layout is (.., num_times, num_freqs)
     CUDA_SHARED double params[N_PARAMS_MAX];
@@ -629,6 +685,7 @@ void stft_fill_global_kernel(
     for (int bin_i = BLOCK_START_X; bin_i < num_bin; bin_i += GRID_INCR_X)
     {
         data_index = data_index_all[bin_i];
+        int start_j = (start_freq_inds == nullptr) ? 0 : start_freq_inds[data_index];
         double factor = factors_all[bin_i];
         for (int i = THREAD_START_X; i < nparams; i += BLOCK_INCR_X)
             params[i] = params_all[bin_i * nparams + i];
@@ -647,16 +704,17 @@ void stft_fill_global_kernel(
             for (int diff = -n_side_bins; diff <= +n_side_bins; diff += 1)
             {
                 int freq_j_here = freq_j + diff;
-                if ((freq_j_here >= 0) && (freq_j_here <= num_freqs - 1))
+                int freq_j_local = freq_j_here - start_j;
+                if ((freq_j_local >= 0) && (freq_j_local <= num_freqs - 1))
                 {
                     double freq_here = f_min + freq_j_here * df;
                     for (int j = 0; j < 3; j += 1)
                     {
                         cmplx val = factor * 0.5 * ColumnT::value(col, j, freq_j_here,
                                                                   freq_here);
-                        // template_fill[(((data_index*nch + j)*num_times + time_i)*num_freqs) + freq_j_here]
+                        // template_fill[(((data_index*nch + j)*num_times + time_i)*num_freqs) + freq_j_local]
                         size_t idx = ((((size_t) data_index * nchannels + j) * num_times
-                                       + time_i) * num_freqs) + freq_j_here;
+                                       + time_i) * num_freqs) + freq_j_local;
 #ifdef __CUDACC__
                         atomicAdd(((double*) &template_fill[idx]) + 0, val.real());
                         atomicAdd(((double*) &template_fill[idx]) + 1, val.imag());
@@ -678,7 +736,8 @@ inline void stft_fill_global_impl(
     STFTFresnel* fresnel, STFTDomain* stft,
     double* params_all, int* data_index_all, double* factors_all,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase, bool active_band)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase, bool active_band,
+    int* start_freq_inds = nullptr)
 {
 #ifdef __CUDACC__
     static Orbits*      orbits_gpu     = nullptr;
@@ -699,7 +758,7 @@ inline void stft_fill_global_impl(
         template_fill, orbits_gpu, tdi_config_gpu, fresnel_gpu, stft_gpu,
         params_all, data_index_all, factors_all,
         num_bin, nparams, T, t_ref, n_side_bins, window_factor,
-        freq_from_tdi_phase, active_band);
+        freq_from_tdi_phase, active_band, start_freq_inds);
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
 #else
@@ -707,7 +766,7 @@ inline void stft_fill_global_impl(
         template_fill, orbits, tdi_config, fresnel, stft,
         params_all, data_index_all, factors_all,
         num_bin, nparams, T, t_ref, n_side_bins, window_factor,
-        freq_from_tdi_phase, active_band);
+        freq_from_tdi_phase, active_band, start_freq_inds);
 #endif
 }
 
@@ -741,7 +800,7 @@ CUDA_DEVICE void stft_eval_block_swap(
     SourceT& src, STFTFresnel* fresnel, STFTDomain* stft,
     double* params_add, double* params_remove,
     int* link_space_craft_rec, int* link_space_craft_em, int bin_i,
-    int data_index, int noise_index,
+    int data_index, int noise_index, int start_j,
     int n_side_bins, double window_factor, bool freq_from_tdi_phase,
     cmplx* d_h_add_tmp, cmplx* d_h_remove_tmp, cmplx* add_add_tmp,
     cmplx* remove_remove_tmp, cmplx* add_remove_tmp, int tid,
@@ -799,7 +858,8 @@ CUDA_DEVICE void stft_eval_block_swap(
         for (int freq_j_here = freq_j_min - n_side_bins;
              freq_j_here <= freq_j_max + n_side_bins; freq_j_here += 1)
         {
-            if ((freq_j_here >= 0) && (freq_j_here <= num_freqs - 1))
+            int freq_j_local = freq_j_here - start_j;
+            if ((freq_j_local >= 0) && (freq_j_local <= num_freqs - 1))
             {
                 double freq_here = f_min + freq_j_here * df;
                 for (int j = 0; j < 3; j += 1)
@@ -812,7 +872,7 @@ CUDA_DEVICE void stft_eval_block_swap(
                 stft->add_ip_swap_contrib(
                     d_h_add_tmp, d_h_remove_tmp, add_add_tmp, remove_remove_tmp,
                     add_remove_tmp, fresnel_val_add, fresnel_val_remove,
-                    time_i, freq_j_here, data_index, noise_index);
+                    time_i, freq_j_local, data_index, noise_index);
             }
         }
     }
@@ -852,7 +912,8 @@ void stft_swap_ll_kernel(
     double* params_add_all, double* params_remove_all,
     int* data_index_all, int* noise_index_all,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    int* start_freq_inds)
 {
     CUDA_SHARED cmplx d_h_add_tmp[NUM_THREADS_HERE];
     CUDA_SHARED cmplx d_h_remove_tmp[NUM_THREADS_HERE];
@@ -879,6 +940,7 @@ void stft_swap_ll_kernel(
     {
         int data_index = data_index_all[bin_i];
         int noise_index = noise_index_all[bin_i];
+        int start_j = (start_freq_inds == nullptr) ? 0 : start_freq_inds[data_index];
         for (int i = THREAD_START_X; i < nparams; i += BLOCK_INCR_X)
         {
             params_add[i] = params_add_all[bin_i * nparams + i];
@@ -890,7 +952,7 @@ void stft_swap_ll_kernel(
         stft_eval_block_swap<SourceT, ColumnT>(
             src, fresnel, stft, params_add, params_remove,
             link_space_craft_rec, link_space_craft_em, bin_i,
-            data_index, noise_index, n_side_bins, window_factor, freq_from_tdi_phase,
+            data_index, noise_index, start_j, n_side_bins, window_factor, freq_from_tdi_phase,
             d_h_add_tmp, d_h_remove_tmp, add_add_tmp, remove_remove_tmp, add_remove_tmp, tid,
             &d_h_add_val, &d_h_remove_val, &add_add_val, &remove_remove_val, &add_remove_val);
 
@@ -915,7 +977,8 @@ inline void stft_swap_ll_impl(
     double* params_add_all, double* params_remove_all,
     int* data_index_all, int* noise_index_all,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    int* start_freq_inds = nullptr)
 {
 #ifdef __CUDACC__
     static Orbits*      orbits_gpu     = nullptr;
@@ -936,7 +999,8 @@ inline void stft_swap_ll_impl(
         d_h_add_out, d_h_remove_out, add_add_out, remove_remove_out, add_remove_out,
         orbits_gpu, tdi_config_gpu, fresnel_gpu, stft_gpu,
         params_add_all, params_remove_all, data_index_all, noise_index_all,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase);
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
+        start_freq_inds);
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
 #else
@@ -944,7 +1008,8 @@ inline void stft_swap_ll_impl(
         d_h_add_out, d_h_remove_out, add_add_out, remove_remove_out, add_remove_out,
         orbits, tdi_config, fresnel, stft,
         params_add_all, params_remove_all, data_index_all, noise_index_all,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase);
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
+        start_freq_inds);
 #endif
 }
 
@@ -978,7 +1043,8 @@ void stft_get_fstat_ll_kernel(
     STFTFresnel* fresnel, STFTDomain* stft,
     double* params_all, int* data_index_all, int* noise_index_all,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    int* start_freq_inds)
 {
     constexpr int N_FILTERS = 4;
     constexpr int N_M = (N_FILTERS * (N_FILTERS + 1)) / 2;   // = 10
@@ -1025,6 +1091,7 @@ void stft_get_fstat_ll_kernel(
     {
         int data_index = data_index_all[bin_i];
         int noise_index = noise_index_all[bin_i];
+        int start_j = (start_freq_inds == nullptr) ? 0 : start_freq_inds[data_index];
 
         // --- N_i = (d|A_i) and the M diagonal M_ii = (A_i|A_i) ---
         for (int fi = 0; fi < N_FILTERS; ++fi)
@@ -1045,7 +1112,7 @@ void stft_get_fstat_ll_kernel(
             stft_eval_block_ll<SourceT, ColumnT>(
                 src, fresnel, stft, params_i,
                 link_space_craft_rec, link_space_craft_em, bin_i,
-                data_index, noise_index,
+                data_index, noise_index, start_j,
                 n_side_bins, window_factor, freq_from_tdi_phase,
                 tmp0, tmp1, tid, &d_h_val, &h_h_val);
 
@@ -1084,7 +1151,8 @@ void stft_get_fstat_ll_kernel(
                 stft_eval_block_swap<SourceT, ColumnT>(
                     src, fresnel, stft, params_i, params_j,
                     link_space_craft_rec, link_space_craft_em, bin_i,
-                    data_index, noise_index, n_side_bins, window_factor, freq_from_tdi_phase,
+                    data_index, noise_index, start_j,
+                    n_side_bins, window_factor, freq_from_tdi_phase,
                     tmp0, tmp1, tmp2, tmp3, tmp4, tid,
                     &d_h_add_val, &d_h_remove_val, &add_add_val, &remove_remove_val,
                     &add_remove_val);
@@ -1109,7 +1177,8 @@ inline void stft_get_fstat_ll_impl(
     STFTFresnel* fresnel, STFTDomain* stft,
     double* params_all, int* data_index_all, int* noise_index_all,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    int* start_freq_inds = nullptr)
 {
 #ifdef __CUDACC__
     static Orbits*      orbits_gpu     = nullptr;
@@ -1130,7 +1199,8 @@ inline void stft_get_fstat_ll_impl(
         N_re_out, N_im_out, M_re_out, M_im_out,
         orbits_gpu, tdi_config_gpu, fresnel_gpu, stft_gpu,
         params_all, data_index_all, noise_index_all,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase);
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
+        start_freq_inds);
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
 #else
@@ -1138,7 +1208,8 @@ inline void stft_get_fstat_ll_impl(
         N_re_out, N_im_out, M_re_out, M_im_out,
         orbits, tdi_config, fresnel, stft,
         params_all, data_index_all, noise_index_all,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase);
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
+        start_freq_inds);
 #endif
 }
 
@@ -1162,7 +1233,8 @@ void stft_get_ll_grad_kernel(
     double* params_all, int* data_index_all, int* noise_index_all,
     double* param_eps,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    int* start_freq_inds)
 {
     CUDA_SHARED cmplx d_h_tmp[NUM_THREADS_HERE];
     CUDA_SHARED cmplx h_h_tmp[NUM_THREADS_HERE];
@@ -1185,6 +1257,7 @@ void stft_get_ll_grad_kernel(
     {
         int data_index = data_index_all[bin_i];
         int noise_index = noise_index_all[bin_i];
+        int start_j = (start_freq_inds == nullptr) ? 0 : start_freq_inds[data_index];
         for (int i = THREAD_START_X; i < nparams; i += BLOCK_INCR_X)
             params[i] = params_all[bin_i * nparams + i];
         CUDA_SYNC_THREADS;
@@ -1208,7 +1281,8 @@ void stft_get_ll_grad_kernel(
             stft_eval_block_ll<SourceT, ColumnT>(
                 src, fresnel, stft, params,
                 link_space_craft_rec, link_space_craft_em, bin_i,
-                data_index, noise_index, n_side_bins, window_factor, freq_from_tdi_phase,
+                data_index, noise_index, start_j,
+                n_side_bins, window_factor, freq_from_tdi_phase,
                 d_h_tmp, h_h_tmp, tid, &d_h_p, &h_h_p);
             double q_p = d_h_p.real() - 0.5 * h_h_p.real();
 
@@ -1218,7 +1292,8 @@ void stft_get_ll_grad_kernel(
             stft_eval_block_ll<SourceT, ColumnT>(
                 src, fresnel, stft, params,
                 link_space_craft_rec, link_space_craft_em, bin_i,
-                data_index, noise_index, n_side_bins, window_factor, freq_from_tdi_phase,
+                data_index, noise_index, start_j,
+                n_side_bins, window_factor, freq_from_tdi_phase,
                 d_h_tmp, h_h_tmp, tid, &d_h_m, &h_h_m);
             double q_m = d_h_m.real() - 0.5 * h_h_m.real();
 
@@ -1239,7 +1314,8 @@ inline void stft_get_ll_grad_impl(
     double* params_all, int* data_index_all, int* noise_index_all,
     double* param_eps,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    int* start_freq_inds = nullptr)
 {
 #ifdef __CUDACC__
     static Orbits*      orbits_gpu     = nullptr;
@@ -1259,14 +1335,16 @@ inline void stft_get_ll_grad_impl(
     stft_get_ll_grad_kernel<SourceT, ColumnT><<<grid, NUM_THREADS_HERE>>>(
         grad_out, orbits_gpu, tdi_config_gpu, fresnel_gpu, stft_gpu,
         params_all, data_index_all, noise_index_all, param_eps,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase);
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
+        start_freq_inds);
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
 #else
     stft_get_ll_grad_kernel<SourceT, ColumnT>(
         grad_out, orbits, tdi_config, fresnel, stft,
         params_all, data_index_all, noise_index_all, param_eps,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase);
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
+        start_freq_inds);
 #endif
 }
 
@@ -1291,7 +1369,8 @@ void stft_swap_ll_grad_kernel(
     int* data_index_all, int* noise_index_all,
     double* param_eps_add, double* param_eps_remove,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    int* start_freq_inds)
 {
     CUDA_SHARED cmplx d_h_add_tmp[NUM_THREADS_HERE];
     CUDA_SHARED cmplx d_h_remove_tmp[NUM_THREADS_HERE];
@@ -1318,6 +1397,7 @@ void stft_swap_ll_grad_kernel(
     {
         int data_index = data_index_all[bin_i];
         int noise_index = noise_index_all[bin_i];
+        int start_j = (start_freq_inds == nullptr) ? 0 : start_freq_inds[data_index];
         for (int i = THREAD_START_X; i < nparams; i += BLOCK_INCR_X)
         {
             params_add[i] = params_add_all[bin_i * nparams + i];
@@ -1343,7 +1423,8 @@ void stft_swap_ll_grad_kernel(
             stft_eval_block_swap<SourceT, ColumnT>(
                 src, fresnel, stft, params_add, params_remove,
                 link_space_craft_rec, link_space_craft_em, bin_i,
-                data_index, noise_index, n_side_bins, window_factor, freq_from_tdi_phase,
+                data_index, noise_index, start_j,
+                n_side_bins, window_factor, freq_from_tdi_phase,
                 d_h_add_tmp, d_h_remove_tmp, add_add_tmp, remove_remove_tmp, add_remove_tmp, tid,
                 &dha_p, &dhr_p, &aa_p, &rr_p, &ar_p);
             double S_p = dha_p.real() - dhr_p.real()
@@ -1355,7 +1436,8 @@ void stft_swap_ll_grad_kernel(
             stft_eval_block_swap<SourceT, ColumnT>(
                 src, fresnel, stft, params_add, params_remove,
                 link_space_craft_rec, link_space_craft_em, bin_i,
-                data_index, noise_index, n_side_bins, window_factor, freq_from_tdi_phase,
+                data_index, noise_index, start_j,
+                n_side_bins, window_factor, freq_from_tdi_phase,
                 d_h_add_tmp, d_h_remove_tmp, add_add_tmp, remove_remove_tmp, add_remove_tmp, tid,
                 &dha_m, &dhr_m, &aa_m, &rr_m, &ar_m);
             double S_m = dha_m.real() - dhr_m.real()
@@ -1386,7 +1468,8 @@ void stft_swap_ll_grad_kernel(
             stft_eval_block_swap<SourceT, ColumnT>(
                 src, fresnel, stft, params_add, params_remove,
                 link_space_craft_rec, link_space_craft_em, bin_i,
-                data_index, noise_index, n_side_bins, window_factor, freq_from_tdi_phase,
+                data_index, noise_index, start_j,
+                n_side_bins, window_factor, freq_from_tdi_phase,
                 d_h_add_tmp, d_h_remove_tmp, add_add_tmp, remove_remove_tmp, add_remove_tmp, tid,
                 &dha_p, &dhr_p, &aa_p, &rr_p, &ar_p);
             double S_p = dha_p.real() - dhr_p.real()
@@ -1398,7 +1481,8 @@ void stft_swap_ll_grad_kernel(
             stft_eval_block_swap<SourceT, ColumnT>(
                 src, fresnel, stft, params_add, params_remove,
                 link_space_craft_rec, link_space_craft_em, bin_i,
-                data_index, noise_index, n_side_bins, window_factor, freq_from_tdi_phase,
+                data_index, noise_index, start_j,
+                n_side_bins, window_factor, freq_from_tdi_phase,
                 d_h_add_tmp, d_h_remove_tmp, add_add_tmp, remove_remove_tmp, add_remove_tmp, tid,
                 &dha_m, &dhr_m, &aa_m, &rr_m, &ar_m);
             double S_m = dha_m.real() - dhr_m.real()
@@ -1422,7 +1506,8 @@ inline void stft_swap_ll_grad_impl(
     int* data_index_all, int* noise_index_all,
     double* param_eps_add, double* param_eps_remove,
     int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase)
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    int* start_freq_inds = nullptr)
 {
 #ifdef __CUDACC__
     static Orbits*      orbits_gpu     = nullptr;
@@ -1443,7 +1528,8 @@ inline void stft_swap_ll_grad_impl(
         grad_add_out, grad_remove_out, orbits_gpu, tdi_config_gpu, fresnel_gpu, stft_gpu,
         params_add_all, params_remove_all, data_index_all, noise_index_all,
         param_eps_add, param_eps_remove,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase);
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
+        start_freq_inds);
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
 #else
@@ -1451,7 +1537,8 @@ inline void stft_swap_ll_grad_impl(
         grad_add_out, grad_remove_out, orbits, tdi_config, fresnel, stft,
         params_add_all, params_remove_all, data_index_all, noise_index_all,
         param_eps_add, param_eps_remove,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase);
+        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
+        start_freq_inds);
 #endif
 }
 
