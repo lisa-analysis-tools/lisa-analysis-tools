@@ -396,6 +396,15 @@ def save_to_backend_asynchronously_and_plot(
             it only widened the recovery gap. Since a torn primary is
             recovered from this file, "every iteration" means losing at most
             ONE iteration instead of up to five. ``None`` is treated as 1.
+            MEASURED LIMIT (2026-09-14, 3mo v8 job 479): the copy is a
+            full-file copy + fsync, and the sampler's ``save_step`` is a
+            BLOCKING pickled send to this rank -- so once the store is
+            large the sampler waits for the previous copy: 60-80 s per
+            iteration on a 14 GB store (24% of a 5.4 min PE iteration),
+            0.5 s on a 1.5 GB one. The production scripts now export
+            ``BACKUP_ITER=10`` (``general_info.backup_iter``); the
+            mid-iteration checkpoint (600 s) still bounds the loss of a
+            torn store to that interval.
         coalesce_threshold: Queue depth above which intermediate states are
             dropped in favour of the newest.
     """

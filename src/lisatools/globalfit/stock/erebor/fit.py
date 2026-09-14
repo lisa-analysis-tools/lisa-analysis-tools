@@ -65,7 +65,16 @@ class EreborGeneralSettings(GeneralSettings):
     # a real engine ladder for simple-API branches.
     ntemps: int = dataclasses.field(default_factory=engine_ntemps_default())
     random_seed: int = 103209
-    backup_iter: int = 1
+    # Save-step cadence of the running backup copy (env BACKUP_ITER). 1 =
+    # every save. The copy is a full-file copy + fsync on the saver rank, and
+    # the sampler's next save is a BLOCKING pickled send to that rank, so
+    # once the store is large the sampler waits for the copy: 3mo v8 job 479
+    # measured [SAVE] save_step 60-80 s per iteration on a 14 GB store (24%
+    # of a 5.4 min PE iteration; 0.5 s at 1.5 GB). With the mid-iteration
+    # checkpoint (MIDIT_CHECKPOINT, 600 s) covering the tail, a cadence of
+    # ~10 bounds a torn-store loss to the checkpoint interval, not 10
+    # iterations. Production scripts export BACKUP_ITER=10 (2026-09-14).
+    backup_iter: int = dataclasses.field(default_factory=env_default("BACKUP_ITER", 1, int))
     # Mid-iteration checkpointing (env MIDIT_CHECKPOINT /
     # MIDIT_CHECKPOINT_MIN_INTERVAL; see GeneralSettings for semantics).
     midit_checkpoint: bool = dataclasses.field(

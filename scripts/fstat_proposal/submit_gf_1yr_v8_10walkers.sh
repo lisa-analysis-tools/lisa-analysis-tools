@@ -795,6 +795,14 @@ export GB_TEMPER_VERTICAL=1
 # defaults to "band" whenever GB_TEMPER_VERTICAL=1; exported explicitly so
 # the log line [GB_VERT ...] order=band is unambiguous.
 export GB_TEMPER_CELL_ORDER=band
+# RUNNING-BACKUP CADENCE (2026-09-14): the 3mo twin spent 60-80 s of every
+# 5.4 min PE iteration in [SAVE] save_step once its store reached 14 GB --
+# the sampler's blocking handoff waits for the saver rank to copy + fsync
+# the whole store into *_running_backup_copy.h5 after EVERY save. This
+# store is 1.5 GB (0.5 s) today and grows ~13 MB/iteration; every 10th
+# save keeps it off the critical path as it grows. The 600 s mid-iteration
+# checkpoint still bounds a torn-store loss to that interval.
+export BACKUP_ITER=10
 # Joint noise+VGB max-lnL rider inside gb_search (2026-09-11; the 3mo twin
 # measured ~6 rounds x 16 s = 93 s/it). Its [MAXLOGL] trace shows the
 # foreground/PSD re-tracking lands in ROUND 1 of each GB iteration;
