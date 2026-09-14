@@ -349,3 +349,86 @@ class VariantKnobTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CombinedStreamTest(unittest.TestCase):
+    """COMBINED data (user ruling 2026-09-14): the all_sources mojito path
+    must honor ``general.source_types`` when it lists COMBINED -- the 6mo
+    first launch died on an EMRI brick lookup because the variant derived
+    its own NOISE+classes list and the env SOURCE_TYPES never reached the
+    loader."""
+
+    def setUp(self):
+        import tempfile
+
+        self.tmp = tempfile.mkdtemp(prefix="combined_mojito_")
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _fit(self, **gs_over):
+        from lisatools.globalfit.stock import erebor
+
+        fit = erebor.all_sources(nwalkers=4)
+        fit.general.mojito_source_ids = {"SOBHB": [0]}
+        for k, v in gs_over.items():
+            setattr(fit.general, k, v)
+        return fit
+
+    def test_variant_combined_passes_source_types_through(self):
+        fit = self._fit(
+            source_types=("COMBINED", "GB", "VGB", "SOBHB"),
+            add_instrument_noise="mojito",
+        )
+        fit.set_default_processor(fit.general)
+        kw = fit.general.processor_init_kwargs
+        self.assertEqual(kw["source_types"],
+                         ["COMBINED", "GB", "VGB", "SOBHB"])
+
+    def test_variant_without_combined_omits_the_override(self):
+        fit = self._fit()
+        fit.set_default_processor(fit.general)
+        self.assertNotIn("source_types",
+                         fit.general.processor_init_kwargs)
+
+    def test_processor_combined_refuses_double_counting(self):
+        # synthetic noise / foreground would sum ON TOP of a stream that
+        # already contains them -- refused before any file access.
+        for bad in (dict(add_instrument_noise="synthetic"),
+                    dict(add_instrument_noise=True),
+                    dict(add_galactic_foreground=True)):
+            with self.assertRaises(ValueError, msg=bad):
+                _StubHybridStep(
+                    L1_folder=os.path.join(self.tmp, "nonexistent"),
+                    source_ids={"SOBHB": [0]},
+                    source_types=["COMBINED", "SOBHB"],
+                    orbits_class=_FakeOrbits,
+                    verbose=False,
+                    **bad,
+                )
+
+    def test_processor_combined_reads_stream_not_bricks(self):
+        _make_fake_mojito(self.tmp, sobhb_ids=(0, 1), sobhb_bricks=(0,))
+        d = os.path.join(self.tmp, "data", "COMBINED", "L1")
+        os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, "mojito_light_test_L1_0_0.h5"), "wb").close()
+        # SOBHB brick id 1 does NOT exist -- under COMBINED that must not
+        # matter (catalogues only; the waveform is already in the stream).
+        step = _StubHybridStep(
+            L1_folder=self.tmp,
+            source_ids={"SOBHB": [0, 1]},
+            source_types=["COMBINED", "SOBHB"],
+            orbits_class=_FakeOrbits,
+            verbose=False,
+            add_instrument_noise="mojito",
+        )
+        # data is EXACTLY the combined stream (a summed id-0 brick would
+        # read 2.0 here), orbits came from the combined file, no brick
+        # was recorded missing, both catalogue rows loaded.
+        np.testing.assert_allclose(step.data, np.ones((3, N_FAKE)))
+        self.assertIn("COMBINED", step.orbits.path)
+        self.assertEqual(list(step.missing_source_bricks), [])
+        self.assertIn(0, step.catalogue["SOBHB"])
+        self.assertIn(1, step.catalogue["SOBHB"])

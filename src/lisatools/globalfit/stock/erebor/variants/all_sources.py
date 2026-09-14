@@ -493,10 +493,20 @@ class AllSourcesGlobalFit(EreborFit):
                 if "mbh" in self._branch_names
                 else AllSourcesMBHSettings()
             )
+            # COMBINED stream (user ruling 2026-09-14): when the run's
+            # source_types lists COMBINED, pass the list through VERBATIM
+            # -- the processor otherwise derives NOISE+classes from
+            # source_ids and the pre-summed stream never reaches the
+            # loader (the 6mo first-launch EMRI brick FileNotFoundError).
+            _types = [str(s).upper() for s in (gs.source_types or ())]
+            _combined_kw = (
+                {"source_types": _types} if "COMBINED" in _types else {}
+            )
             gs.data_processor_class = L1ProcessingStepWithSyntheticNoise
             gs.processor_init_kwargs = dict(
                 L1_folder=gs.mojito_data_path,
                 source_ids=source_ids,
+                **_combined_kw,
                 orbits_kwargs=dict(
                     force_backend=force_backend, frame=gs.orbits_frame
                 ),

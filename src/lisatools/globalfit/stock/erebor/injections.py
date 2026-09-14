@@ -1187,23 +1187,52 @@ class L1ProcessingStepWithSyntheticNoise(L1ProcessingStep):
         tdi_gen_str: str = "2nd generation",
         synth_force_backend: str = "cpu",
         mbh_phenom_kwargs: Optional[dict] = None,
+        source_types: Optional[list] = None,
     ):
         if add_instrument_noise not in (False, True, "synthetic", "mojito"):
             raise ValueError(
                 f"add_instrument_noise={add_instrument_noise!r} not recognised; "
                 "use False, True, 'synthetic', or 'mojito'."
             )
-        # Drop any class whose source_ids list is empty (mojito's
-        # L1DataLoader raises on missing IDs). GB / VGB load the whole
-        # galaxy file (ids just gate inclusion). "mojito" instrument noise
-        # rides the base loader ("NOISE" reads INSTRUMENT/L1 and sums it
-        # into the data on the shared time grid); the synthetic instrument
-        # noise + galactic foreground come from the synthetic generators.
-        source_types = [
-            t for t in ["GB", "VGB", "MBHB", "EMRI", "SOBHB"] if source_ids.get(t)
-        ]
-        if add_instrument_noise == "mojito":
-            source_types = ["NOISE"] + source_types
+        if source_types is not None:
+            # EXPLICIT stream list, used VERBATIM (2026-09-14, the COMBINED
+            # ruling: the 6mo first launch died on an EMRI brick lookup
+            # because this class derived NOISE+classes itself and the run's
+            # SOURCE_TYPES never reached the loader). With COMBINED the
+            # stream already contains instrument noise AND the foreground,
+            # so summing either on top double-counts -- refuse loudly here,
+            # before any file access ("mojito" noise is satisfied BY the
+            # combined stream and needs no NOISE entry; the base loader
+            # refuses COMBINED+NOISE itself).
+            source_types = [str(s).upper() for s in source_types]
+            if "COMBINED" in source_types:
+                if add_instrument_noise in (True, "synthetic"):
+                    raise ValueError(
+                        "source_types lists COMBINED but "
+                        f"add_instrument_noise={add_instrument_noise!r}: the "
+                        "combined stream already contains the instrument "
+                        "noise; use 'mojito' or False."
+                    )
+                if add_galactic_foreground:
+                    raise ValueError(
+                        "source_types lists COMBINED but "
+                        "add_galactic_foreground=True: the combined stream "
+                        "already contains the galactic foreground."
+                    )
+        else:
+            # Drop any class whose source_ids list is empty (mojito's
+            # L1DataLoader raises on missing IDs). GB / VGB load the whole
+            # galaxy file (ids just gate inclusion). "mojito" instrument
+            # noise rides the base loader ("NOISE" reads INSTRUMENT/L1 and
+            # sums it into the data on the shared time grid); the synthetic
+            # instrument noise + galactic foreground come from the
+            # synthetic generators.
+            source_types = [
+                t for t in ["GB", "VGB", "MBHB", "EMRI", "SOBHB"]
+                if source_ids.get(t)
+            ]
+            if add_instrument_noise == "mojito":
+                source_types = ["NOISE"] + source_types
         if orbits_class is None:
             from lisatools.detector import L1Orbits
             orbits_class = L1Orbits
