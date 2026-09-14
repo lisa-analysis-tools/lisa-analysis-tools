@@ -85,9 +85,11 @@
 # ##     store of the MOST RECENT 3mo run -- the 10-WALKER science arm     ##
 # ##     gf_prod_3mo_v8_10walkers (2026-09-14 ruling; never the            ##
 # ##     make_snapshots tars). AUTO-BUILT at recipe build when missing     ##
-# ##     (fit -> referee -> apply from GB_WARM_START_SOURCE_STORE; watch   ##
-# ##     the [WARMSTART-BUILD] lines) -- the 09-14 first launch died on    ##
-# ##     the old hard preflight refusal, hence the automation.             ##
+# ##     (fit -> referee -> apply from GB_WARM_START_SOURCE_STORE, run     ##
+# ##     IN-PROCESS via imports; watch the [WARMSTART-BUILD] lines) --     ##
+# ##     the 09-14 first launch died on the old hard preflight refusal,    ##
+# ##     hence the automation. The npz lives INSIDE ${STORE_DIR}           ##
+# ##     (warmstart/ subdir) so it travels with the run.                   ##
 # ##   * GB OBSERVABLE+EIGEN (2026-09-14): first 6mo exposure of           ##
 # ##     GB_INMODEL_OBSERVABLE_EIGEN=full -- read the 3mo probe            ##
 # ##     (submit_gf_3mo_v8_10w_eigenaxis_probe.sh) first; empty knob =     ##
@@ -2118,14 +2120,21 @@ export GB_ROUTER_THREADED=1
 # refit proposal cannot silently drop out of the run; explicitly-empty
 # GB_WARM_START_COMPONENTS= is the only way to run WITHOUT the warm move
 # (stage lists bit-identical to 3mo_v8's).
-export GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS-/shared/data/global_fit_output/warmstart/gf_prod_3mo_v8_10w_refereed.npz}
+# The npz LIVES INSIDE THE RUN STORE (user ruling 2026-09-14: "The
+# warmstart store should be within the 6mo folder") -- so snapshot zips
+# of ${STORE_DIR} capture it, a resume finds it, and a fresh store
+# (rm -rf) rebuilds its own. The fit/referee intermediates land next to
+# it automatically (same directory as the target).
+export GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS-${STORE_DIR}warmstart/gf_prod_3mo_v8_10w_refereed.npz}
 # AUTO-BUILD (2026-09-14, after the first launch died on the missing npz;
 # user: "Check if it is done, if not run it. I would like it to be
 # automatic."). When the npz is missing, recipe build now runs the
-# fit -> referee -> apply pipeline ITSELF from this store (one MPI rank
-# builds under a lock, the others wait; watch the [WARMSTART-BUILD]
-# lines). SOURCE_TOBS is the SOURCE store's Tobs (3 months), not this
-# run's -- the proposal container rescales to the run Tobs at load.
+# fit -> referee -> apply pipeline ITSELF from this store, IN-PROCESS
+# (the three scripts are imported and their main() called -- no
+# subprocess; one MPI rank builds under a lock, the others wait; watch
+# the [WARMSTART-BUILD] lines). SOURCE_TOBS is the SOURCE store's Tobs
+# (3 months), not this run's -- the proposal container rescales to the
+# run Tobs at load.
 export GB_WARM_START_SOURCE_STORE=${GB_WARM_START_SOURCE_STORE-/shared/data/global_fit_output/gf_prod_3mo_v8_10walkers/gf_prod_3mo_testing.h5}
 export GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-7776000}
 export GB_WARM_START_LAST_K=${GB_WARM_START_LAST_K:-10}

@@ -9,6 +9,11 @@ campaign's first launch failed on that npz being missing, so
 recipe build when the npz is absent and ``GB_WARM_START_SOURCE_STORE`` names
 the source store.
 
+The steps run IN-PROCESS -- each script module is imported and its
+``main()`` called under a swapped ``sys.argv`` (user ruling 2026-09-14:
+"python imports right? not like calling bash") -- no subprocess, no
+interpreter spawn.
+
 MPI-safe by a lock DIRECTORY next to the target: ``run_combined_staged.py``
 builds on every rank before roles resolve, so one rank wins ``os.mkdir`` on
 the lock and builds while the others poll for the npz. A crashed builder
@@ -26,9 +31,9 @@ SOURCE store's Tobs, default 7776000.0 = 3 months -- NOT this run's Tobs;
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
-import subprocess
 import sys
 import time
 import typing
@@ -36,6 +41,8 @@ import typing
 __all__ = ["ensure_warm_start_components"]
 
 logger = logging.getLogger(__name__)
+
+_MODULE_CACHE: dict = {}
 
 _SCRIPTS = (
     "warmstart_fit_from_store.py",
@@ -77,9 +84,44 @@ def _script_path(name: str) -> str:
     )
 
 
+def _run_script(script_path: str, argv: typing.Sequence[str]) -> None:
+    """Run one pipeline script IN-PROCESS: import the module (cached) and
+    call its ``main()`` under a temporarily swapped ``sys.argv``.
+
+    User ruling 2026-09-14 ("python imports right? not like calling
+    bash"): no subprocess, no interpreter spawn -- the step executes
+    inside the calling rank's python, which sidesteps cluster fork/exec
+    restrictions and reuses the already-imported heavy stack. All three
+    scripts are ``if __name__ == "__main__"`` guarded (import runs no
+    work) and expose a zero-argument argparse ``main()``.
+    """
+    script_path = os.path.abspath(script_path)
+    mod = _MODULE_CACHE.get(script_path)
+    if mod is None:
+        name = "_warmstart_step_" + os.path.splitext(
+            os.path.basename(script_path))[0]
+        spec = importlib.util.spec_from_file_location(name, script_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _MODULE_CACHE[script_path] = mod
+    old_argv = list(sys.argv)
+    sys.argv = [script_path] + [str(a) for a in argv]
+    try:
+        mod.main()
+    except SystemExit as exc:  # argparse errors / explicit exits
+        if exc.code not in (None, 0):
+            raise RuntimeError(
+                f"{os.path.basename(script_path)} exited with code "
+                f"{exc.code}."
+            ) from exc
+    finally:
+        sys.argv = old_argv
+
+
 def _default_runner(cmd: typing.Sequence[str]) -> None:
-    logger.info("[WARMSTART-BUILD] running: %s", " ".join(map(str, cmd)))
-    subprocess.run(list(map(str, cmd)), check=True)
+    logger.info("[WARMSTART-BUILD] running (in-process): %s",
+                " ".join(map(str, cmd)))
+    _run_script(str(cmd[0]), [str(a) for a in cmd[1:]])
 
 
 def _require(path: str, step: str) -> None:
@@ -181,14 +223,14 @@ def ensure_warm_start_components(
             "(last_k=%d, source tobs=%.0f s). fit -> referee -> apply; "
             "other ranks wait on the lock.", path, store, last_k, tobs)
         t0 = time.perf_counter()
-        runner([sys.executable, _script_path(_SCRIPTS[0]),
+        runner([_script_path(_SCRIPTS[0]),
                 "--store", store, "--last-k", str(last_k),
                 "--tobs", str(tobs), "--out", fit_npz])
         _require(fit_npz, "warmstart_fit_from_store.py")
-        runner([sys.executable, _script_path(_SCRIPTS[1]),
+        runner([_script_path(_SCRIPTS[1]),
                 "--npz", fit_npz, "--store", store])
         _require(referee_npz, "warmstart_match_referee.py")
-        runner([sys.executable, _script_path(_SCRIPTS[2]),
+        runner([_script_path(_SCRIPTS[2]),
                 "--fit", fit_npz, "--referee", referee_npz,
                 "--out", tmp_out])
         _require(tmp_out, "warmstart_referee_apply.py")

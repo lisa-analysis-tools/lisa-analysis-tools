@@ -105,6 +105,12 @@ class BuildTest(unittest.TestCase):
                 path, store=store, last_k=10, tobs=7776000.0, runner=runner)
             self.assertEqual(got, path)
             self.assertTrue(os.path.exists(path))
+            # step commands are [script_path, *args] -- the scripts run
+            # IN-PROCESS via import (user ruling 2026-09-14: "python
+            # imports right? not like calling bash"), so no interpreter
+            # element leads the command.
+            for c in runner.calls:
+                self.assertTrue(str(c[0]).endswith(".py"), c[0])
             names = [os.path.basename(next(a for a in c if a.endswith(".py")))
                      for c in runner.calls]
             self.assertEqual(names, ["warmstart_fit_from_store.py",
@@ -199,6 +205,61 @@ class LockTest(unittest.TestCase):
                     path, store=store, runner=_Runner(), timeout=0.2,
                     poll=0.05)
             self.assertIn(lock, str(cm.exception))
+
+
+class InProcessExecutionTest(unittest.TestCase):
+    """The default step executor IMPORTS the script module and calls its
+    ``main()`` inside this python process (sys.argv swapped) -- it never
+    spawns a subprocess. Proven by pid identity."""
+
+    def test_run_script_executes_in_this_process(self):
+        import json
+        import tempfile
+
+        from lisatools.globalfit.warmstart_build import _run_script
+
+        with tempfile.TemporaryDirectory() as d:
+            script = os.path.join(d, "fake_step.py")
+            out = os.path.join(d, "out.json")
+            with open(script, "w") as fh:
+                fh.write(
+                    "import json, os, sys\n"
+                    "def main():\n"
+                    "    args = sys.argv[1:]\n"
+                    "    out = args[args.index('--out') + 1]\n"
+                    "    with open(out, 'w') as fh:\n"
+                    "        json.dump({'pid': os.getpid(),"
+                    " 'argv': args}, fh)\n"
+                    "if __name__ == '__main__':\n"
+                    "    main()\n"
+                )
+            import sys as _sys
+
+            argv_before = list(_sys.argv)
+            _run_script(script, ["--out", out, "--flag", "7"])
+            with open(out) as fh:
+                got = json.load(fh)
+            self.assertEqual(got["pid"], os.getpid())  # in-process, no fork
+            self.assertEqual(got["argv"], ["--out", out, "--flag", "7"])
+            self.assertEqual(_sys.argv, argv_before)  # argv restored
+
+    def test_run_script_raises_on_nonzero_exit(self):
+        import tempfile
+
+        from lisatools.globalfit.warmstart_build import _run_script
+
+        with tempfile.TemporaryDirectory() as d:
+            script = os.path.join(d, "fail_step.py")
+            with open(script, "w") as fh:
+                fh.write(
+                    "import sys\n"
+                    "def main():\n"
+                    "    sys.exit(3)\n"
+                    "if __name__ == '__main__':\n"
+                    "    main()\n"
+                )
+            with self.assertRaises(RuntimeError):
+                _run_script(script, [])
 
 
 class RecipeWiringTest(unittest.TestCase):
