@@ -162,6 +162,26 @@ def env_is_set(var: str) -> bool:
     return _env_lookup(var) is not None
 
 
+def bool_or_str(raw: str):
+    """``cast`` for env-backed ``Union[bool, str]`` fields.
+
+    A boolean spelling (1/0, true/false, yes/no, on/off) becomes the bool;
+    anything else is passed through as the stripped string. Used by knobs
+    that take either a flag or a named mode — e.g.
+    ``add_instrument_noise`` (``ADD_INSTRUMENT_NOISE``), where ``True`` means
+    "auto-resolve" and ``"mojito"``/``"synthetic"`` force a specific source.
+
+    Module level and named (never a lambda) so the settings tree stays
+    pickle/deepcopy-safe.
+    """
+    low = raw.strip().lower()
+    if low in _BOOL_TRUE:
+        return True
+    if low in _BOOL_FALSE:
+        return False
+    return raw.strip()
+
+
 def env_default(var: str, default, cast=str):
     """``dataclasses.field(default_factory=...)`` helper for env-backed defaults.
 

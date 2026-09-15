@@ -125,6 +125,21 @@ Key env knobs
     STAGE_NOISE_ONLY=1   run only the two noise search stages, then stop
     STAGE_NOISE_VGB_PE=1 searches, then PE-sample psd+galfor+vgb (no GB);
                          bounded by NUM_ITERATIONS
+    REMOVE_BRANCHES      comma list of whole branches to drop: gb, galfor,
+                         vgb, psd. Removed branches leave the fit, every
+                         stage move list, AND the DEFAULT injection stream
+                         list ("we will not inject them"). Removing psd
+                         (2026-09-14, the TRUTH-INJECTION NULL TEST) also
+                         drops both noise stages and the NOISE stream, and
+                         switches the likelihood to the FIXED-sensitivity
+                         path -- it REQUIRES gb + galfor removed,
+                         ADD_INSTRUMENT_NOISE=0 and UNEQUAL_ARM=0, all
+                         enforced here.
+    PSD_FIXED_PARAMS     comma floats [Soms_d, Sa_a], PHYSICAL (linear)
+    GALFOR_FIXED_PARAMS  comma floats (amp, fk, alpha, f_1, f_2), PHYSICAL
+                         -> general.fixed_psd_kwargs, the only sensitivity
+                         the no-psd-branch path reads. See the basis note at
+                         the wiring below before setting them.
 """
 from __future__ import annotations
 
@@ -411,11 +426,23 @@ def build_fit():
     # GBs and galfor. We will not inject them."): comma list of whole
     # branches to drop -- from the fit, from every stage's move list, and
     # from the DEFAULT injection streams below. Only the branches the stage
-    # lists know how to drop are accepted; psd anchors the joint noise
-    # criteria (JointMaxLogLSearch branch="psd") and the sensitivity model,
-    # so it cannot go. With "gb" removed there is no F-stat machinery and
-    # no RJ: the gb stages collapse to ONE full_pe over what remains.
-    _removable = ("gb", "galfor", "vgb")
+    # lists know how to drop are accepted. With "gb" removed there is no
+    # F-stat machinery and no RJ: the gb stages collapse to ONE full_pe over
+    # what remains.
+    #
+    # "psd" became removable 2026-09-14 evening (the TRUTH-INJECTION NULL
+    # TEST ruling: "remove the psd fitting, use best fit values for psd and
+    # galfor from the 3mo run"). Removing it drops the joint noise criteria
+    # (JointMaxLogLSearch branch="psd") and both noise stages, and hands the
+    # likelihood to run.py setup_acs's FIXED-sensitivity path
+    # (``sensitivity_backend(..., **general.fixed_psd_kwargs)``) -- see the
+    # PSD_FIXED_PARAMS / GALFOR_FIXED_PARAMS block below, which is the only
+    # way the 3mo best fit reaches that path. Guarded hard: gb and galfor
+    # machinery both assume a SAMPLED psd (the GB band engine reads the
+    # per-walker linear_psd_arr the psd branch drives; galfor's foreground is
+    # a component OF the psd branch's sensitivity), so psd can only go once
+    # those are already gone.
+    _removable = ("gb", "galfor", "vgb", "psd")
     remove_branches = tuple(
         b.strip().lower()
         for b in os.environ.get("REMOVE_BRANCHES", "").split(",")
@@ -432,6 +459,54 @@ def build_fit():
             "GB_ONLY=1 is already the gb-only composition; "
             "REMOVE_BRANCHES makes no sense with it."
         )
+    if "psd" in remove_branches:
+        # Both of these are silent-wrongness traps rather than crashes, so
+        # refuse at COMPOSITION time (seconds) instead of discovering it
+        # from a null that never reaches zero after hours of allocation.
+        for _need in ("galfor", "gb"):
+            if _need not in remove_branches:
+                raise ValueError(
+                    f"REMOVE_BRANCHES removes 'psd' but keeps {_need!r}: "
+                    f"the {_need} machinery samples against the psd "
+                    "branch's sensitivity (galfor's foreground is a "
+                    "component of it; the GB band engine reads the "
+                    "per-walker linear_psd_arr it drives). Remove "
+                    f"{_need!r} too, or keep psd."
+                )
+        # "NO INJECTED NOISE" (ruling 2026-09-14): with no psd branch there
+        # is nothing to fit a noise realization with, so an injected one
+        # sits unmodelled in the residual and the truth null cannot reach
+        # zero. all_sources defaults add_instrument_noise=True (auto), so
+        # this is the easy way to get a quietly-wrong null.
+        if fit.general.add_instrument_noise:
+            raise ValueError(
+                "REMOVE_BRANCHES removes 'psd' but "
+                f"add_instrument_noise={fit.general.add_instrument_noise!r}: "
+                "an injected noise realization would sit unmodelled in the "
+                "residual (no psd branch fits it), so a truth-injection "
+                "null could not reach zero. Export ADD_INSTRUMENT_NOISE=0."
+            )
+        # The noise-stage flags have no stage to act on any more (same
+        # reasoning as the GB_ONLY block below).
+        for _flag in ("STAGE_NOISE_ONLY", "STAGE_NOISE_VGB_PE",
+                      "STAGE_SKIP_NOISE"):
+            if _env_flag(_flag):
+                raise ValueError(
+                    f"REMOVE_BRANCHES removes 'psd', so there are no noise "
+                    f"stages; {_flag}=1 makes no sense here."
+                )
+        # UNEQUAL_ARM swaps the PSD BRANCH's instrument component
+        # (all_sources._wire_unequal_arm raises "unequal_arm=1 requires the
+        # psd branch"), so the fixed-sensitivity path runs the plain
+        # analytic equal-arm model. Caught here rather than at build.
+        if fit.general.unequal_arm:
+            raise ValueError(
+                "REMOVE_BRANCHES removes 'psd' but UNEQUAL_ARM=1: the "
+                "unequal-arm model is installed ON the psd branch's "
+                "instrument component, which no longer exists. Export "
+                "UNEQUAL_ARM=0 (at the null point the residual cancels, so "
+                "the PSD weighting only scales small deviations)."
+            )
 
     # Every sampled branch needs a stream: NOISE for psd/galfor, GB, VGB --
     # plus the armed source classes' streams (their data must contain the
@@ -441,9 +516,12 @@ def build_fit():
     # SAMPLED branch set shrinks to gb. Unmodeled content stays in the
     # residual; that is the accepted trade for not waiting on a noise fit.
     # REMOVE_BRANCHES is the opposite contract ("we will not inject them"):
-    # a removed gb/vgb also leaves the DEFAULT stream list.
+    # a removed gb/vgb also leaves the DEFAULT stream list. A removed PSD
+    # takes the NOISE stream with it -- nothing models a noise realization
+    # any more, so injecting one would leave it in the residual and the
+    # truth-injection null could never reach zero ("NO INJECTED NOISE").
     _default_src = ",".join(
-        ["NOISE"]
+        (["NOISE"] if "psd" not in remove_branches else [])
         + (["GB"] if "gb" not in remove_branches else [])
         + (["VGB"] if "vgb" not in remove_branches else [])
     ) + "".join(
@@ -482,6 +560,57 @@ def build_fit():
     if remove_branches:
         print(f"[combined] branches REMOVED (not sampled, not in the "
               f"default injection): {list(remove_branches)}", flush=True)
+
+    # FIXED SENSITIVITY (psd removed): PSD_FIXED_PARAMS / GALFOR_FIXED_PARAMS
+    # -> general.fixed_psd_kwargs, the ONE thing run.py setup_acs's
+    # no-psd-branch path reads (``sensitivity_backend(f"walker_{w}",
+    # **general_info.fixed_psd_kwargs)``, run.py:1515-1517).
+    #
+    # BASIS -- READ THIS BEFORE SETTING THEM. The fixed path applies NO
+    # transform: whatever is in the dict goes straight to the backend as
+    # ``psd_params`` / ``galfor_params``, so both must already be in the
+    # PHYSICAL basis the backend documents -- psd = [Soms_d, Sa_a] as LINEAR
+    # (square-root) values, galfor = the 5-vector (amp, fk, alpha, f_1, f_2)
+    # linear. (The SAMPLED path is the one that has to call
+    # ``both_transforms`` first, run.py:1472-1486; every stock psd/galfor
+    # transform is None at the default PSD_LOG_SAMPLING=0 /
+    # GALFOR_LOG_SAMPLING=0, which is why the 3mo store's raw chain
+    # coordinates ARE physical and can be used verbatim.)
+    #
+    # The submit script fills these from the 3mo store's best-logL cold
+    # walker via ``lisatools.globalfit.warmstart.opt_snr.best_logl_noise``,
+    # which returns exactly those raw chain rows (no transform) -- so the
+    # two ends agree by construction. If a future run is launched with
+    # PSD_LOG_SAMPLING=1 / GALFOR_LOG_SAMPLING=1, that extraction returns
+    # LOG values and this wiring would silently under-weight the noise.
+    _psd_fixed = os.environ.get("PSD_FIXED_PARAMS", "").strip()
+    _gal_fixed = os.environ.get("GALFOR_FIXED_PARAMS", "").strip()
+    if _psd_fixed or _gal_fixed:
+        import numpy as np
+
+        def _floats(raw, name):
+            try:
+                return np.array([float(x) for x in raw.split(",")
+                                 if x.strip()])
+            except ValueError as exc:
+                raise ValueError(
+                    f"{name} must be a comma list of floats, got {raw!r}."
+                ) from exc
+
+        _kw = dict(fit.general.fixed_psd_kwargs or {})
+        if _psd_fixed:
+            _kw["psd_params"] = _floats(_psd_fixed, "PSD_FIXED_PARAMS")
+        if _gal_fixed:
+            _kw["galfor_params"] = _floats(_gal_fixed, "GALFOR_FIXED_PARAMS")
+        _kw.setdefault("galfor_params", None)
+        fit.general.fixed_psd_kwargs = _kw
+        print(f"[combined] FIXED sensitivity (physical basis): "
+              f"psd_params={_kw.get('psd_params')} "
+              f"galfor_params={_kw.get('galfor_params')}", flush=True)
+        if "psd" in fit.branches:
+            print("[combined] WARNING: PSD_FIXED_PARAMS set while the psd "
+                  "branch is SAMPLED -- setup_acs takes the sampled "
+                  "coordinates and ignores fixed_psd_kwargs.", flush=True)
 
     if gb_only:
         # Branch-set sanity: gb only, or the composition is not what the
@@ -564,14 +693,20 @@ def build_fit():
     # of every move list and joint criterion below with no other change.
     _has_galfor = "galfor" in fit.branches
     _has_vgb = "vgb" in fit.branches
-    noise_pe = [Move("psd_pe", branch="psd")] + (
-        [Move("galfor_pe", branch="galfor")] if _has_galfor else [])
+    # psd too (2026-09-14): with it removed there is no noise move at all and
+    # no noise STAGE -- the sensitivity is fixed, so there is nothing to
+    # converge. Same branch-aware pattern as galfor/vgb.
+    _has_psd = "psd" in fit.branches
+    noise_pe = (
+        ([Move("psd_pe", branch="psd")] if _has_psd else [])
+        + ([Move("galfor_pe", branch="galfor")] if _has_galfor else []))
     # VGBs are KNOWN sources: fixed-dimensional, no RJ, nothing to search
     # for. They sample from the first stage onward so their power is being
     # fitted while the noise converges, rather than sitting in the residual
     # and biasing the PSD.
     vgb = [Move("vgb_pe", branch="vgb")] if _has_vgb else []
-    _noise_names = ["psd_pe"] + (["galfor_pe"] if _has_galfor else [])
+    _noise_names = (["psd_pe"] if _has_psd else []) + (
+        ["galfor_pe"] if _has_galfor else [])
 
     # Stage 1: noise alone. Stage 2 and the GB search: noise + VGBs, with the
     # max-logl criterion spanning ALL of them -- one object per stage, so the
@@ -631,7 +766,7 @@ def build_fit():
                 branch=_src_branch)],
             combine_kwargs=dict(share_temperature_control=False),
         ))
-    if not _env_flag("STAGE_SKIP_NOISE"):
+    if _has_psd and not _env_flag("STAGE_SKIP_NOISE"):
         stages.append(Stage(
             name="noise_search", kind="search", moves=noise_only,
             combine_kwargs=dict(share_temperature_control=False),

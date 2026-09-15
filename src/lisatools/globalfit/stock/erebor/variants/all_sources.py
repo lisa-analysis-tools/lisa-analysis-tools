@@ -47,7 +47,7 @@ from ....engine import GeneralSetup, Settings
 from ....moves import Move, MoveBuildContext
 from .....utils.device import pin_main_device
 from ....recipe import MOJITO_REFERENCE_TIME, Recipe, Stage, build_noise_moves
-from ...base import env_default
+from ...base import bool_or_str, env_default
 from ..common import tdi_generation_info
 from ..emri import EMRISetup
 from ..fit import EreborFit, EreborGeneralSettings
@@ -175,7 +175,17 @@ class AllSourcesGeneralSettings(EreborGeneralSettings):
     )
     # The psd branch is FIT here, so keep the noise-normalization
     # ``-logdet_factor * sum log det C`` term in the likelihood.
-    likelihood_source_only: bool = False
+    # Env-backed (rule 0) for the compositions that REMOVE the psd branch:
+    # the truth-injection null test (REMOVE_BRANCHES=...,psd) runs on a FIXED
+    # sensitivity, where the noise term is an additive constant and the user
+    # wants the readout to be the residual inner product alone -- "our
+    # injection log-likelihood WITHOUT the noise term" (ruling 2026-09-14).
+    # run.py force-disables it whenever a psd branch IS present, so a stray
+    # LIKELIHOOD_SOURCE_ONLY=1 on a psd-sampling run cannot corrupt the
+    # acceptance ratios; it only warns.
+    likelihood_source_only: bool = dataclasses.field(
+        default_factory=env_default("LIKELIHOOD_SOURCE_ONLY", False, bool)
+    )
     # Data source: "mojito" (default) loads the GB galaxy + selected
     # MBHB/EMRI/SOBHB sources from a mojito L1 folder (+ synthetic
     # instrument noise for the psd branch); "synthetic" builds every
@@ -207,7 +217,17 @@ class AllSourcesGeneralSettings(EreborGeneralSettings):
     # "mojito" — the real NOISE brick summed in by the L1 loader — when the
     # run uses mojito data and the brick is found, else "synthetic" (the
     # FD-correlated draw). Explicit "mojito"/"synthetic"/False force it.
-    add_instrument_noise: typing.Union[bool, str] = True
+    # Env-backed (rule 0): ADD_INSTRUMENT_NOISE=0 is what the truth-injection
+    # null test needs -- "NO INJECTED NOISE" (ruling 2026-09-14). With no psd
+    # branch there is nothing to fit a noise realization with, so injecting
+    # one would leave it unmodelled in the residual and the null would not
+    # reach zero. A boolean spelling gives the bool; "mojito"/"synthetic"
+    # pass through as the named mode.
+    add_instrument_noise: typing.Union[bool, str] = dataclasses.field(
+        default_factory=env_default(
+            "ADD_INSTRUMENT_NOISE", True, bool_or_str
+        )
+    )
     # None -> auto at build: [Soms_d, Sa_a] fit to the NOISE brick's
     # tabulated estimates when available, else the stock 15e-12 / 3e-15.
     # Feed the synthetic draw (and the psd-branch reference) so data and
