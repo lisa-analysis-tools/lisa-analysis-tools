@@ -447,6 +447,45 @@ class STFTComputationGroup(DomainKernelStrategy):
             raise ValueError("C++ Fresnel object has not been created yet.")
         return self._cpp_fresnel
 
+    @contextmanager
+    def envelope_override(self, linear_envelope: bool | None):
+        """Temporarily run on an evaluator with a different `linear_envelope`.
+
+        The first-moment correction improves a forward template by two orders of
+        magnitude and raises the evaluation noise 4 to 7 times, so derivative
+        paths want it off while template paths want it on. The flag is baked into
+        the C++ evaluator at construction, so switching means swapping the object:
+        a second wrap is built once per setting and cached.
+
+        ``None`` keeps the group's own setting.
+        """
+        if (linear_envelope is None
+                or bool(linear_envelope) == bool(self.linear_envelope)):
+            yield
+            return
+        cache = getattr(self, "_cpp_fresnel_alt", None)
+        if cache is None:
+            cache = self._cpp_fresnel_alt = {}
+        wanted = bool(linear_envelope)
+        if wanted not in cache:
+            # Built in the group's own device context, as _create_cpp_domain is.
+            with self.group_device_context():
+                cache[wanted] = self.backend.STFTFresnelWrap(
+                    self.settings.NT, self.settings.NF_active,
+                    self.num_channels, self.settings.t0,
+                    self.settings.min_freq, self.settings.max_freq,
+                    self.settings.dt, self.settings.df,
+                    window_alpha=self.window_alpha,
+                    use_midpoint=self.use_midpoint,
+                    linear_envelope=wanted,
+                )
+        saved = self._cpp_fresnel
+        self._cpp_fresnel = cache[wanted]
+        try:
+            yield
+        finally:
+            self._cpp_fresnel = saved
+
     def compute_signal_likelihood_terms(
         self,
         data_index: NDArrayLike,
