@@ -10206,7 +10206,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self._proposal_param_scales = s
         return band_sorter.draw_infomat(ids)
 
-    def _infomat_jacobian(self, coords, test_inds, s):
+    def _infomat_jacobian(self, coords, test_inds, s, leaf_inds=None):
         """FULL Jacobian ``J[n, a, i] = d(phys[test_inds[a]]) / d(y_i)``.
 
         ``y = x / s`` are the conditioned sampling coordinates, so the
@@ -10243,10 +10243,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         deliberately left alone: this feeds the proposal covariance and a
         silently-wrong Jacobian would bias every in-model jump. The
         ``infomat_jacobian`` span measures whether it is worth revisiting.
+
+        ``leaf_inds`` (per-row leaf indices, shape ``coords.shape[:-1]``) is
+        REQUIRED when the transform container carries per-leaf fills -- the
+        vgb container does, one dict per catalogue source pinning that
+        leaf's f0/sky, so a row differentiated against another leaf's fills
+        is differentiating the wrong source. ``None`` (GB, whose fills are
+        scalar) leaves both calls below byte-identical.
         """
         xp = self.xp
         n_src, ndim = coords.shape
         J = xp.zeros((n_src, ndim, ndim))
+        _lk = {} if leaf_inds is None else {"leaf_inds": leaf_inds}
         for i in range(ndim):
             h = 1e-6 * xp.maximum(xp.abs(coords[:, i]), 1e-3)
             up = coords.copy()
@@ -10254,8 +10262,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             up[:, i] += h
             dn[:, i] -= h
             dphys = (
-                self.transform_fn.both_transforms(up, xp=cp)
-                - self.transform_fn.both_transforms(dn, xp=cp)
+                self.transform_fn.both_transforms(up, xp=cp, **_lk)
+                - self.transform_fn.both_transforms(dn, xp=cp, **_lk)
             )[:, test_inds]
             J[:, :, i] = dphys / (2.0 * h)[:, None] * s[i]
         return J
@@ -10779,7 +10787,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         xp = self.xp
         coords = band_sorter.coords[ids]
         n_src, ndim = coords.shape
-        params_phys = self.transform_fn.both_transforms(coords, xp=cp)
+        # PER-LEAF FILLS. A vgb-style container holds one fill dict per leaf
+        # (that catalogue source's pinned f0/sky), so every transform call
+        # on this path must say which leaf each ROW belongs to -- the
+        # container RAISES otherwise. Omitting it took the whole vgb eigen
+        # proposal down to stretch on its first cluster run (6mo job 501,
+        # 2026-09-15), and the warn-once degrade made it a single log line.
+        # Derived exactly as the working scoring path derives it (see the
+        # ``band_sorter.leaf_inds[ids]`` uses around the buffer calls); empty
+        # for GB, whose fills are scalar, so those calls are unchanged.
+        _leaf_kw = ({"leaf_inds": band_sorter.leaf_inds[ids]}
+                    if self._per_leaf_fill else {})
+        params_phys = self.transform_fn.both_transforms(
+            coords, xp=cp, **_leaf_kw)
         _test_inds = np.asarray(self.parameter_transforms.fill_dict["test_inds"])
         walker_inds = band_sorter.walker_inds[ids].astype(xp.int32)
 
@@ -10842,7 +10862,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self._proposal_param_scales = s
 
         with _tspan(_tm, "infomat_jacobian"):
-            J = self._infomat_jacobian(coords, _test_inds, s)
+            J = self._infomat_jacobian(coords, _test_inds, s, **_leaf_kw)
 
         info_y = xp.einsum("nai,nab,nbj->nij", J, info_phys, J)
 
