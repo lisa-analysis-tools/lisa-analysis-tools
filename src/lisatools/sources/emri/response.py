@@ -31,7 +31,15 @@ EMRI_INSPIRAL_KWARGS = {
     "force_backend": "cpu",
 }
 EMRI_SUM_KWARGS = {"pad_output": True}
-# 1e-2 threshold keeps things fast; tighten once on GPU.
+# WARNING (traced 2026-09-14): this constructor value is INERT on the run
+# path. FEW's ``_generate_waveform`` has its own call-time default
+# (``mode_selection_threshold=1e-5``, few/waveform/base.py:143) which it hands
+# to the selector unconditionally, and the selector consults the value below
+# only when the call-time argument is None (few/utils/modeselector.py:243-244).
+# So the effective threshold is whatever the CALL carries -- 1e-5 unless
+# something supplies it. To actually change it, set the ``EMRI_EPS`` knob
+# (EMRISettings.eps): it rides the per-call kwargs (branch
+# ``waveform_kwargs``) and the wave wrap's ``runtime_kwargs``.
 EMRI_MODE_SELECTOR_KWARGS = {"mode_selection_threshold": 1e-2}
 
 # Process-wide cache so the injection and template paths share one generator

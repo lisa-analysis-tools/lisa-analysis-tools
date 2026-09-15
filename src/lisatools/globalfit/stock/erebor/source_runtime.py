@@ -729,6 +729,32 @@ def source_catalogue(general_setup: GeneralSetup, cls: str) -> typing.Optional[d
     return None
 
 
+EMRI_MODE_SELECTION_THRESHOLD_KEY = "mode_selection_threshold"
+
+
+def apply_emri_mode_selection_threshold(emri) -> typing.Optional[float]:
+    """Resolve the EMRI ``eps`` knob into the PER-CALL waveform kwargs.
+
+    FEW 2.x spells the mode-selection threshold ``mode_selection_threshold``
+    (the old ``eps`` name is now swallowed by ``**kwargs`` with no effect),
+    and ``_generate_waveform`` hands its OWN call-time default (1e-5) to the
+    selector unconditionally -- the selector falls back to its constructor
+    value only when the call-time argument is ``None``. So the constructor
+    pin in :mod:`lisatools.sources.emri.response` never applies, and the knob
+    has to ride the per-call kwargs to have any effect at all.
+
+    An explicit ``waveform_kwargs[mode_selection_threshold]`` wins over the
+    ``eps`` field; ``eps=None`` leaves the dict untouched (FEW's default
+    stands). Idempotent, and returns the effective value (None = FEW default)
+    so :func:`source_signal_cfg` can hand the same number to the wave wrap.
+    """
+    kwargs = emri.waveform_kwargs if emri.waveform_kwargs is not None else {}
+    eps = getattr(emri, "eps", None)
+    if eps is not None:
+        kwargs.setdefault(EMRI_MODE_SELECTION_THRESHOLD_KEY, float(eps))
+    return kwargs.get(EMRI_MODE_SELECTION_THRESHOLD_KEY)
+
+
 def prepare_emri_branch(emri, general_setup: GeneralSetup, gs):
     from eryn.moves import StretchMove
 
@@ -778,6 +804,7 @@ def prepare_emri_branch(emri, general_setup: GeneralSetup, gs):
             setattr(emri, lims, None)
     if emri.waveform_kwargs is None:
         emri.waveform_kwargs = dict()
+    apply_emri_mode_selection_threshold(emri)
     if emri.inner_moves is None:
         resolve_inner_moves(emri)
     emri.nleaves_max = n
@@ -970,6 +997,11 @@ def source_signal_cfg(gs, mbh, sobbh, emri) -> dict:
         sobbh_use_tdionfly=sobbh.use_tdionfly,
         mbh_tdionfly_margin=mbh.tdionfly_margin,
         emri_response_order=emri.response_order,
+        # Effective FEW mode-selection threshold (the ``eps`` knob). Carried
+        # here so EVERY call through the EMRI wave wrap gets it -- including
+        # the engine-side template/residual generation, which does not pass
+        # the branch ``waveform_kwargs``.
+        emri_mode_selection_threshold=apply_emri_mode_selection_threshold(emri),
         sobbh_response_order=sobbh.response_order,
         sobbh_n_grid=sobbh.n_grid,
         sobbh_buffer_time=sobbh.buffer_time,
@@ -1014,7 +1046,11 @@ def get_emri_wave_wrap(general_info, cfg):
     to the old path.
     """
     xp, dev, orbits, domain_settings = _wrap_device_and_orbits(general_info)
-    key = ("emri", id(general_info), cfg["nchannels"], dev)
+    # The mode-selection threshold is part of the key: it changes the template
+    # (kept harmonics), so a wrap built at one value must never be handed back
+    # for another.
+    mode_threshold = cfg.get("emri_mode_selection_threshold")
+    key = ("emri", id(general_info), cfg["nchannels"], dev, mode_threshold)
     if key in _WAVE_WRAP_CACHE:
         return _WAVE_WRAP_CACHE[key]
     force_backend = general_info.force_backend
@@ -1050,6 +1086,17 @@ def get_emri_wave_wrap(general_info, cfg):
             general_info.data_td_settings,
             domain_settings,
             td_window=None,
+            # Per-call FLOOR for the mode-selection threshold: FEW ignores
+            # its selector's constructor value whenever the call supplies one
+            # (and its own call default, 1e-5, always does), so the only way
+            # the knob bites is through the call kwargs. Unset -> empty dict,
+            # i.e. byte-identical to the pre-knob path. An explicit per-call
+            # entry still wins (``EMRIWaveWrap.__call__`` updates over this).
+            runtime_kwargs=(
+                {EMRI_MODE_SELECTION_THRESHOLD_KEY: mode_threshold}
+                if mode_threshold is not None
+                else None
+            ),
             nchannels=cfg["nchannels"],
             offset_int=offset_int,
         )

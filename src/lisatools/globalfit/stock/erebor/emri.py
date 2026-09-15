@@ -41,6 +41,18 @@ class EMRISettings(Settings):
     p0_lims: typing.List[float] = dataclasses.field(default_factory=list)
     e0_lims: typing.List[float] = dataclasses.field(default_factory=list)
     waveform_kwargs: Optional[dict] = None
+    # Mode-selection threshold (FEW's ``mode_selection_threshold``; ``eps`` was
+    # its FEW 1.x name and is what everyone still calls it). Raising it drops
+    # harmonics -> faster, less accurate; lowering it keeps more. None keeps
+    # FEW's own per-call default (1e-5, ``few/waveform/base.py:143``) -- the
+    # LAT constructor pin in ``lisatools.sources.emri.response`` does NOT
+    # apply, because FEW passes its call-time default to the selector
+    # unconditionally. ``prepare_emri_branch`` threads a set value into
+    # ``waveform_kwargs`` so it rides EVERY likelihood evaluation; an explicit
+    # ``waveform_kwargs["mode_selection_threshold"]`` wins over this field.
+    eps: Optional[float] = dataclasses.field(
+        default_factory=env_default("EMRI_EPS", None, float)
+    )
     injection: Optional[np.ndarray] = None  # AS here only for the starting state
     info_matrix_gen: Optional[Any] = None  # todo change name to info matrix or smth
     # ``[xI0, Phi_theta0]`` transform fills. None -> resolved per leaf from

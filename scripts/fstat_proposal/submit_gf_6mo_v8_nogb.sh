@@ -2155,6 +2155,35 @@ export EMRI_EIGEN_REFRESH=100
 # tables (correct but slow -- MH corrects the shape); a steady stream of
 # them means arm the stretch escape and file the traceback.
 
+# EMRI MODE-SELECTION THRESHOLD (user ruling 2026-09-14). FEW's kwarg is
+# ``mode_selection_threshold``; ``eps`` is its FEW 1.x name and what we still
+# call the knob. The EFFECTIVE value was 1e-5 (the generator default), NOT the
+# 1e-2 pinned in lisatools/sources/emri/response.py: that pin is a mode
+# SELECTOR CONSTRUCTOR value, and FEW's _generate_waveform hands its own
+# call-time default (1e-5, few/waveform/base.py:143) to the selector
+# unconditionally, so the constructor value never applied. EMRI_EPS is wired
+# at CALL time (it rides the branch waveform_kwargs AND the wave wrap's
+# runtime_kwargs), so it does bite.
+# 1e-5 -> 1e-3 LOOSENS the cut: FEW keeps modes until the cumulative mode
+# SNR^2 is within (1-threshold)^2 of the total (few/utils/modeselector.py:426),
+# so fewer harmonics are kept = direct speedup on the dominant EMRI cost
+# (EMRI likelihood rows measure ~1 s each at 6mo). FEW documents the trade as
+# "Increasing this value removes modes from consideration and can have a
+# considerable affect on the speed of the waveform, albeit at the cost of some
+# accuracy (usually an acceptable loss)" (few/utils/modeselector.py class
+# docstring), and its tutorial measures the two bracketing endpoints: 455
+# modes at 1e-5 vs 25 modes at 1e-2, mismatch 1.5e-3 between them
+# (examples/FastEMRIWaveforms_tutorial.ipynb, stored output). 1e-3 sits inside
+# that bracket. The tiered-accuracy policy tolerates it, and the campaign IS
+# the test.
+# RESUME-SAFE: a template/proposal accuracy knob only -- no data, grid, or
+# store-layout change, and nothing stamps waveform_kwargs into a store
+# identity (the only semantic resume guard is the noise-model identity in
+# globalfit/hdfbackend.py). Corollary: a resumed store will NOT flag the
+# change, so it has to be recorded with the run.
+# Unset or empty reverts to the generator default (1e-5).
+export EMRI_EPS=1e-3
+
 # ============================================================================
 # FRESH-RUN GUARD (2026-08-15). This submission starts a NEW run in a NEW
 # store dir: every piece of state -- the VGB beta ladder, the GB cap-cell
