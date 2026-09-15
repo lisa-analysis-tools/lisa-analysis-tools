@@ -426,6 +426,11 @@ class _ShardHolderView:
         # view. Mirrors AnalysisContainerArray.ac_to_intra so anything that
         # resolves intra-shard positions off the holder keeps working.
         self.ac_to_intra = np.arange(rows.shape[0], dtype=np.int32)
+        # * Both tables on this shard's own device, as the parent ACA carries them: a consumer
+        # * gathers its kernel index arrays from them inside the shard's context.
+        with device_context(parent.xp, self.device):
+            self.split_map_by_split = [parent.xp.asarray(self.split_map)]
+            self.ac_to_intra_by_split = [parent.xp.asarray(self.ac_to_intra)]
         self._min_freq_inds_view = None
         self._start_freq_ind_view = None
         self._slab_min_f_view = None
@@ -1078,7 +1083,9 @@ class _RoutedBandEngine:
         parts = cls._partition(holder, noise_index, noise_index)
         params_host = np.atleast_2d(asnumpy(params_phys))
         num = int(params_host.shape[0])
-        pieces = []
+        # * Launch every shard before collecting any, so the shard kernels overlap. Safe because a
+        # * shard reads only host arrays uploaded inside its own device context, never caller memory.
+        launched = []
         for view, (pos, intra, intra_noise) in zip(views, parts):
             if pos.shape[0] == 0:
                 continue
@@ -1088,6 +1095,10 @@ class _RoutedBandEngine:
                     xp.asarray(params_host[pos]), view, inds=inds,
                     noise_index=intra if intra_noise is None else intra_noise,
                     **swap_kwargs)
+            launched.append((pos, view.device, out_s))
+        pieces = []
+        for pos, device, out_s in launched:
+            with device_context(xp, device):
                 pieces.append((pos, asnumpy(out_s)))
         return cls._assemble(num, pieces, 0.0, xp)
 
@@ -2016,60 +2027,29 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             return buf.gather()
         return buf
 
-    def likelihood(self, source_only: bool = False, noise_only: bool = False) -> float:
-        """Band-level log-likelihood over all cells in the buffer.
+    def likelihood(self, source_only: bool = False, noise_only: bool = False, cells=None) -> float:
+        """Band-level log-likelihood over the cells in the buffer.
 
         Overrides the inherited per-AC ``AnalysisContainerArray.likelihood``
         dispatch: the buffer computes its cell likelihoods directly from the
         shaped residual / PSD views (vectorized over cells).
+
+        ``cells`` picks the cells to score with ``source_only``, as global cell ids of any shape;
+        the result has the same shape, and ``None`` scores every cell.
         """
         assert not (source_only and noise_only)
-
-        # band_buffer / template_buffer / psd_buffer are either ndarrays
-        # (single-GPU; in-place mutation rolls back into the underlying
-        # buffer) or BandView (multi-GPU; mutating after materialisation
-        # has no effect on the shards). Either way numerator_in needs the
-        # explicit ``.copy()`` so the in-place ``-= self.template_buffer``
-        # below doesn't corrupt the residual buffer.
-        numerator_in = self._materialize(self.band_buffer).copy()
-        if self.use_template_arr:
-            numerator_in -= self._materialize(self.template_buffer)
-        psd_buffer = self._materialize(self.psd_buffer)
-
-        # Domain-generic inner product: <a|b> = 4 sum(a* invC b) * dc where
-        # dc is the basis measure (FD: df; WDM: the pixel measure) -- the
-        # same convention as lisatools.diagnostic.inner_product. Trailing
-        # basis axes (FD: k; WDM: (Nf, Nt)) are flattened.
-        nb = numerator_in.shape[0]
-        nc = self.nchannels
-        num_flat = numerator_in.reshape(nb, nc, -1)
-        dc = float(self.settings.differential_component)
-
-        if self.tdi_channel_setup == "XYZ":
-            psd_flat = psd_buffer.reshape(nb, nc, nc, -1)
-            # b=bands, i/j=channels, k=flattened basis
-            source_term = (
-                - (1.0 / 2.0) * 4.0 * dc
-                * self.xp.einsum(
-                    "bik,bijk,bjk->b", num_flat.conj(), psd_flat, num_flat
-                ).real
-            )
-
-            if noise_only:
-                raise NotImplementedError("Noise-only likelihood requires log=determinant over frequency for XYZ CSD.")
-
-        else:
-            psd_flat = psd_buffer.reshape(nb, nc, -1)
-            source_term = (
-                - (1.0 / 2.0) * 4.0 * dc
-                * self.xp.sum((num_flat.conj() * num_flat) * psd_flat, axis=(1, 2)).real
-            )
-
-            if noise_only:
-                return -self.xp.sum(self.xp.log(self.xp.abs(1 / psd_buffer[psd_buffer != 0.0])))
+        assert cells is None or source_only, "cells selects source terms only"
 
         if source_only:
-            return source_term
+            return self._source_terms(cells)
+
+        psd_buffer = self._materialize(self.psd_buffer)
+        if noise_only:
+            if self.tdi_channel_setup == "XYZ":
+                raise NotImplementedError("Noise-only likelihood requires log=determinant over frequency for XYZ CSD.")
+            return -self.xp.sum(self.xp.log(self.xp.abs(1 / psd_buffer[psd_buffer != 0.0])))
+
+        source_term = self._source_terms()
 
         # Diagonal noise_term fall_back # TODO check if this is sufficient not used currently anyway
         psd_term = -self.xp.sum(self.xp.log(self.xp.abs(psd_buffer[psd_buffer != 0.0])))
@@ -2077,6 +2057,80 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             warnings.warn("The current psd ll calculation is not correct for XYZ CSD channel setup.")
 
         return source_term + psd_term
+
+    def _source_terms(self, cells=None):
+        """Per-cell source term of ``cells`` (global ids, any shape), on the caller's device.
+
+        Each shard contracts its own cells and only the per-cell values cross devices. The
+        contraction couples no two cells, so this equals contracting a gathered buffer, which
+        copied the residual, template and inverse CSD of every cell onto ``gpus[0]`` per call.
+        """
+        xp = self.xp
+        cells = (np.arange(int(self.num_bands_now)) if cells is None
+                 else np.atleast_1d(np.asarray(asnumpy(cells), dtype=np.int64)))
+        # * Each row is one block, so a row that is a stride of the buffer reads shards as views.
+        blocks = cells.reshape(-1, cells.shape[-1]) if cells.ndim > 1 else cells[None, :]
+        split_map = np.asarray(self.split_map)
+        ac_to_intra = np.asarray(self.ac_to_intra)
+        data_shards = self.data_shaped
+        psd_shards = self.psd_shaped
+        template_shards = self._acs_template_buffer.data_shaped if self.use_template_arr else None
+
+        launched = []
+        for block_i, block in enumerate(blocks):
+            block_split = split_map[block]
+            for split in np.unique(block_split):
+                where = np.nonzero(block_split == split)[0]
+                device = None if self.gpus is None else int(self.gpus[split])
+                with device_context(xp, device):
+                    select = _stride_or_index(xp, ac_to_intra[block[where]])
+                    residual = data_shards[split][select]
+                    if isinstance(select, slice):
+                        # ! A slice is a view: copy it, or subtracting the template changes the residual buffer.
+                        residual = residual.copy()
+                    if template_shards is not None:
+                        residual -= template_shards[split][select]
+                    terms = self._contract_source_term(residual, psd_shards[split][select])
+                    ready = None
+                    if device is not None:
+                        ready = xp.cuda.Event(block=False, disable_timing=True)
+                        ready.record()
+                launched.append((block_i * blocks.shape[1] + where, terms, ready))
+
+        # * Collect only after every shard has launched, so the contractions on different devices overlap.
+        with device_context(xp, None if self.gpus is None else int(self.gpus[0])):
+            out = xp.empty(cells.size, dtype=xp.float64)
+            for positions, terms, ready in launched:
+                if ready is not None:
+                    xp.cuda.get_current_stream().wait_event(ready)
+                out[xp.asarray(positions)] = xp.asarray(terms)
+        return out.reshape(cells.shape)
+
+    def _contract_source_term(self, residual, psd):
+        """``-2 dc <r|r>`` per cell of ``residual``, against the matching inverse CSD rows ``psd``."""
+        # Domain-generic inner product: <a|b> = 4 sum(a* invC b) * dc where
+        # dc is the basis measure (FD: df; WDM: the pixel measure) -- the
+        # same convention as lisatools.diagnostic.inner_product. Trailing
+        # basis axes (FD: k; WDM: (Nf, Nt)) are flattened.
+        nb = residual.shape[0]
+        nc = self.nchannels
+        num_flat = residual.reshape(nb, nc, -1)
+        dc = float(self.settings.differential_component)
+
+        if self.tdi_channel_setup == "XYZ":
+            psd_flat = psd.reshape(nb, nc, nc, -1)
+            # b=bands, i/j=channels, k=flattened basis
+            return (
+                - (1.0 / 2.0) * 4.0 * dc
+                * self.xp.einsum(
+                    "bik,bijk,bjk->b", num_flat.conj(), psd_flat, num_flat
+                ).real
+            )
+        psd_flat = psd.reshape(nb, nc, -1)
+        return (
+            - (1.0 / 2.0) * 4.0 * dc
+            * self.xp.sum((num_flat.conj() * num_flat) * psd_flat, axis=(1, 2)).real
+        )
 
     # Explicit alias while callers migrate off the ``likelihood`` name (which
     # shadows the inherited per-AC ACA dispatch).
