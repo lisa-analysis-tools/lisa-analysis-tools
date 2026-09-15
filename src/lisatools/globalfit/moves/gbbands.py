@@ -21,9 +21,10 @@ from __future__ import annotations
 
 import logging
 import warnings
+import copy as copy_module
 from copy import deepcopy
 from types import ModuleType
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy
@@ -62,6 +63,7 @@ __all__ = [
     "BandSorter",
     "BandScheduler",
     "make_routed_band_engine",
+    "estimate_buffer_preload_limits",
 ]
 
 logger = logging.getLogger(__name__)
@@ -71,6 +73,105 @@ _to_numpy = asnumpy
 # Encoding base for the band part of a special index. Bands live in
 # ``[0, _SPECIAL_INDEX_BASE)``; everything above encodes (temp, walker).
 _SPECIAL_INDEX_BASE = int(1e6)
+
+
+def estimate_buffer_preload_limits(
+    basis_settings: DomainSettingsBase,
+    nchannels: int = 3,
+    tdi_setup: str = "XYZ",
+    max_data_store_size: int = 6000,
+    ntemps: int = 1,
+    xp=np,
+    gpus: Optional[List[int]] = None,
+    max_budget_fraction: float = 0.10,
+    max_budget_bytes: int = 4 * 1024**3,
+) -> Tuple[int, int]:
+    """Estimate safe (num_band_preload, num_bands_preload_temp) from device memory and basis grid.
+
+    Calculates the memory footprint per buffer cell (data residual, inverse-PSD,
+    ACA linear buffers, and twin template buffers), queries available/total device
+    memory, and determines maximum safe preload limits so that proposal moves and
+    tempering passes never exceed the allocated memory budget.
+
+    Parameters
+    ----------
+    basis_settings : DomainSettingsBase
+        Active domain settings (FDSettings, STFTSettings, WDMSettings).
+    nchannels : int
+        Number of data channels (default 3 for XYZ).
+    tdi_setup : str
+        Channel setup (e.g. 'XYZ', 'AE', 'AET').
+    max_data_store_size : int
+        Window length for FD buffers.
+    ntemps : int
+        Number of temperature rungs (tempering chunks have ntemps cells per row).
+    xp : module
+        Active array module (numpy or cupy).
+    gpus : list of int, optional
+        List of configured GPU device IDs.
+    max_budget_fraction : float
+        Fraction of total device memory budgeted for sub-band buffers (default 0.10).
+    max_budget_bytes : int
+        Absolute cap on buffer memory budget in bytes (default 4 GB).
+
+    Returns
+    -------
+    num_band_preload : int
+        Suggested preload capacity for in-model / RJ proposal moves.
+    num_bands_preload_temp : int
+        Suggested number of (band, walker) units preloaded per tempering chunk.
+    """
+    if isinstance(basis_settings, FDSettings):
+        length = int(max_data_store_size)
+        data_bytes = nchannels * length * 16  # complex128
+        sens_channels = nchannels * nchannels if tdi_setup == "XYZ" else nchannels
+        sens_bytes = sens_channels * length * 8  # float64
+    elif isinstance(basis_settings, WDMSettings):
+        length = int(basis_settings.Nf_active * basis_settings.Nt_active)
+        data_bytes = nchannels * length * 8   # float64
+        sens_channels = nchannels * nchannels if tdi_setup == "XYZ" else nchannels
+        sens_bytes = sens_channels * length * 8  # float64
+    elif isinstance(basis_settings, STFTSettings):
+        length = int(basis_settings.NT * basis_settings.NF_active)
+        data_bytes = nchannels * length * 16  # complex128
+        sens_channels = nchannels * nchannels if tdi_setup == "XYZ" else nchannels
+        sens_bytes = sens_channels * length * 16  # complex128
+    else:
+        length = int(max_data_store_size)
+        data_bytes = nchannels * length * 16
+        sens_bytes = (nchannels * nchannels) * length * 16
+
+    # In SubBandBuffer with template twin:
+    # ~4 * data_bytes + 4 * sens_bytes
+    bytes_per_cell = max(1, 4 * data_bytes + 4 * sens_bytes)
+
+    device_mem = None
+    if getattr(xp, "__name__", "") == "cupy":
+        try:
+            device_id = int(gpus[0]) if (gpus is not None and len(gpus) > 0) else int(xp.cuda.runtime.getDevice())
+            props = xp.cuda.runtime.getDeviceProperties(device_id)
+            device_mem = int(props["totalGlobalMem"])
+        except Exception:
+            device_mem = None
+
+    if device_mem is None:
+        try:
+            import psutil
+            device_mem = int(psutil.virtual_memory().total)
+        except Exception:
+            device_mem = 16 * 1024**3  # fallback 16 GB
+
+    budget = min(int(device_mem * max_budget_fraction), int(max_budget_bytes))
+    max_cells = max(1, budget // bytes_per_cell)
+
+    if isinstance(basis_settings, FDSettings):
+        num_band_preload = min(20000, max(200, max_cells))
+        num_bands_preload_temp = min(200, max(1, max_cells // max(1, ntemps)))
+    else:
+        num_band_preload = max(1, max_cells)
+        num_bands_preload_temp = max(1, max_cells // max(1, ntemps))
+
+    return int(num_band_preload), int(num_bands_preload_temp)
 
 
 def pack_special_index(temp_inds, walker_inds, band_inds, nwalkers: int):
@@ -127,7 +228,7 @@ class BandScheduler:
         # Store a flag, not the module (see the ``xp`` property).
         self._uses_cupy = (getattr(xp, "__name__", "numpy") == "cupy")
         uni, counts = xp.unique(special_band_inds, return_counts=True)
-        order = xp.argsort(counts)
+        order = xp.argsort(counts)[::-1]
         self.cell_specials = uni[order]
         self.cell_counts = counts[order]
         self.cell_run = xp.zeros_like(self.cell_counts)
@@ -1161,6 +1262,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         # move path consumes the FD-style value.
         ac_list, aca_kwargs = self._build_band_ac_list()
         AnalysisContainerArray.__init__(self, ac_list, **aca_kwargs)
+        self._skip_eager_dd = True
         if self.use_template_arr:
             # Templates mirror the band-buffer layout in a twin ACA so they
             # share the same managed memory region. The per-band sensitivity
@@ -1170,6 +1272,18 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             self._acs_template_buffer = AnalysisContainerArray(
                 template_ac_list, **template_aca_kwargs
             )
+            self._acs_template_buffer._skip_eager_dd = True
+            self._share_template_psd_blocks()
+
+        for _acs in (self, self._acs_template_buffer) if self.use_template_arr else (self,):
+            for _ac in _acs.acs.flatten():
+                _ac.sens_mat._sens_mat = _ac.sens_mat.invC
+
+        if isinstance(self._basis_settings, STFTSettings):
+            self._refresh_stft_split_start_inds()
+            if self.use_template_arr:
+                # * Same list object: an in-place refill of the starts reaches the twin's kernels too.
+                self._acs_template_buffer.stft_split_start_inds = self.stft_split_start_inds
 
         # psd_shape is exposed for back-compat with downstream consumers that
         # inspect it; it tracks the shape of the per-band PSD view.
@@ -1257,6 +1371,28 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             "(multi-GPU buffers are a list of per-GPU shards). Use the "
             "engine path or BandView accessors instead."
         )
+
+    def _share_template_psd_blocks(self) -> None:
+        """Point the template twin's inverse-CSD views at THIS buffer's blocks.
+
+        Nothing reads the twin's inverse CSD: :meth:`likelihood` takes ``self.psd_buffer``, and
+        the twin only ever receives templates. Its blocks are needed as a valid pointer for the
+        twin's C++ domain, so they are shared rather than dropped. That saves one psd-shaped
+        block per cell, which on the tempering path is 3 of the 5 blocks a cell held.
+
+        Both ACAs are built from the same cell list, so a cell sits at the same split and the
+        same offset in each. Must run BEFORE the twin's ``cpp_splits`` are built, because a
+        computation group captures ``linear_psd_arr[split]`` when it is constructed.
+        """
+        twin = self._acs_template_buffer
+        block = int(np.prod(self.shape_sens) * self.data_length)
+        twin.linear_psd_arr = self.linear_psd_arr
+        for i, ac in enumerate(twin.acs.flatten()):
+            split = int(twin.split_map[i])
+            intra = int(np.where(twin.gpu_splits[split] == i)[0][0])
+            ac.sens_mat.invC = self.linear_psd_arr[split][
+                intra * block:(intra + 1) * block
+            ].reshape(self.shape_sens + self.end_shape)
 
     @property
     def band_buffer_tmp(self):
@@ -1477,11 +1613,16 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         # Resolved BEFORE the allocation loop because each band's sensitivity
         # backend has to be built for its OWN device (see below).
         gpus_in = getattr(self.gb, "gpus", None) if self.backend.uses_cupy else None
+        if gpus_in:
+            gpus_in = list(gpus_in)[: max(1, int(self.num_bands_now))]
         gpu_assignment = (
             band_gpu_assignment(self.num_bands_now, list(gpus_in))
             if gpus_in else None
         )
         primary_device = int(gpus_in[0]) if gpus_in else None
+
+        sens_prototypes = {}
+        zero_sens_blocks = {}
 
         ac_list = []
         for _b in range(self.num_bands_now):
@@ -1517,16 +1658,24 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                     # ``Detector.cu``, on a node where P2P is ENABLED (the
                     # orbit pointers are not peer-mapped). Swap in the
                     # device-local orbits replica.
-                    parent_sb = parent_group.sensitivity_backend
-                    sb_kwargs = dict(parent_sb.kwargs)
-                    if band_device is not None and sb_kwargs.get("orbits") is not None:
-                        sb_kwargs["orbits"] = device_local_orbits(
-                            sb_kwargs["orbits"], self.xp, primary_device)
-                    sm = type(parent_sb)(**sb_kwargs)
+                    prototype = sens_prototypes.get(band_device)
+                    if prototype is None:
+                        parent_sb = parent_group.sensitivity_backend
+                        sb_kwargs = dict(parent_sb.kwargs)
+                        if band_device is not None and sb_kwargs.get("orbits") is not None:
+                            sb_kwargs["orbits"] = device_local_orbits(
+                                sb_kwargs["orbits"], self.xp, primary_device)
+                        prototype = sens_prototypes[band_device] = type(parent_sb)(**sb_kwargs)
+                    sm = copy_module.copy(prototype)
+                    sm.data_shape = per_band_settings.basis_shape_active
                 else:
                     sm = SensitivityMatrixBase(per_band_settings, skip_inv_det=True)
-                sm.sens_mat = self.xp.zeros(sens_shape, dtype=sens_dtype)
-                sm.invC = self.xp.zeros(sens_shape, dtype=sens_dtype)
+                zero_sens = zero_sens_blocks.get(band_device)
+                if zero_sens is None:
+                    zero_sens = zero_sens_blocks[band_device] = self.xp.zeros(
+                        sens_shape, dtype=sens_dtype)
+                sm.sens_mat = zero_sens
+                sm.invC = zero_sens
                 sm.channel_shape = sens_shape[
                     : -len(per_band_settings.basis_shape_active)]
                 ac_list.append(AnalysisContainer(data_domain, sm))

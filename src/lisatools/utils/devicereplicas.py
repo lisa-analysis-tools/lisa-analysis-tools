@@ -225,6 +225,27 @@ _SIGHET_REPLICA_KNOBS = {
 }
 
 
+def release_gb_comp_groups(comp, parent_acs) -> None:
+    """Point ``comp`` and its replicas back at ``parent_acs``'s groups.
+
+    The band engine binds a buffer's group onto the shared comp on every call and never
+    clears it, so a finished buffer's arrays stay reachable through the comp. Callers release
+    when a buffer is finished with; the next engine call rebinds to the next buffer.
+ """
+    if comp is None or parent_acs is None or not hasattr(comp, "stft_comps"):
+        return
+    splits = parent_acs.cpp_splits
+    if not splits:
+        return
+    gpus = list(parent_acs.gpus) if getattr(parent_acs, "gpus", None) else []
+    comp.stft_comps = splits[0]
+    for (_comp_id, device_id), (prototype, replica) in _DEVICE_GB_COMP_REPLICAS.items():
+        if prototype is not comp or not hasattr(replica, "stft_comps"):
+            continue
+        split_index = gpus.index(device_id) if device_id in gpus else 0
+        replica.stft_comps = splits[split_index]
+
+
 def device_local_gb_comp(comp, xp, device, primary_device):
     """A GB comp replica resident on ``device``.
 

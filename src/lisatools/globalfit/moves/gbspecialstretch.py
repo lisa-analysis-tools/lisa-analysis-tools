@@ -363,6 +363,7 @@ from .gbbands import (
     Buffer,
     SubBandBuffer,
     _RoutedBandEngine,
+    estimate_buffer_preload_limits,
     make_routed_band_engine,
     pack_special_index,
     return_x,
@@ -521,8 +522,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         use_prior_removal=False,
         phase_maximize=False,
         ranks_needed=0,
-        gpus=[],
-        num_band_preload=20000,
+        num_band_preload=None,
+        num_bands_preload_temp=None,
         run_swaps=True,
         max_data_store_size=6000,
         force_backend=None,
@@ -572,14 +573,36 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         self.force_backend = force_backend
         self.ranks_needed = ranks_needed
-        self.gpus = gpus
         self.gpu_priors = gpu_priors
         self.num_repeat_proposals = num_repeat_proposals
-        # ``n_subbands`` is the user-facing alias for the number of
-        # (temp, walker, band) cells held in the sub-band buffer at once.
-        if kwargs.get("n_subbands") is not None:
+
+        # Buffer preload sizing: use estimate_buffer_preload_limits if not explicitly set
+        est_preload, est_preload_temp = estimate_buffer_preload_limits(
+            basis_settings=getattr(acs, "settings", None),
+            nchannels=getattr(acs, "nchannels", 3),
+            tdi_setup=getattr(acs, "tdi_channel_setup", "XYZ"),
+            max_data_store_size=max_data_store_size,
+            ntemps=int(kwargs.get("ntemps", 4) or 4),
+            xp=self.xp,
+            gpus=kwargs.get("gpus", None),
+        )
+
+        if "GB_NUM_BAND_PRELOAD" in os.environ:
+            num_band_preload = int(os.environ["GB_NUM_BAND_PRELOAD"])
+        elif kwargs.get("n_subbands") is not None:
             num_band_preload = int(kwargs["n_subbands"])
-        self.num_band_preload = self.n_subbands = num_band_preload
+        elif num_band_preload is None:
+            num_band_preload = est_preload
+
+        if "GB_NUM_BANDS_PRELOAD_TEMP" in os.environ:
+            num_bands_preload_temp = int(os.environ["GB_NUM_BANDS_PRELOAD_TEMP"])
+        elif num_bands_preload_temp is None:
+            num_bands_preload_temp = kwargs.get("num_bands_preload_temp", est_preload_temp)
+        if num_bands_preload_temp is None:
+            num_bands_preload_temp = est_preload_temp
+
+        self.num_band_preload = self.n_subbands = int(num_band_preload)
+        self.num_bands_preload_temp = int(num_bands_preload_temp)
         self.band_preload_size = self.max_data_store_size = max_data_store_size
         self.use_prior_removal = use_prior_removal
         self.has_setup_group = False
@@ -2862,7 +2885,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             (band_index, temp_index, walkers_permuted, special_index,
              num_bands_unit) = self._tempering_swap_grid(band_sorter, start)
 
-            num_bands_preload_temp = 200
+            num_bands_preload_temp = self.num_bands_preload_temp
             num_bands_run = 0
             while num_bands_run < self.nwalkers * num_bands_unit:
                 start_ind = num_bands_run
@@ -2965,6 +2988,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     )
                 ] = diffs.flatten()
                 num_bands_run += num_bands_preload_temp
+                del buffer_obj
 
             # ll_before3 = model.analysis_container_arr.likelihood()
             with _tspan(getattr(self, "_prop_timer", None), "temper_open_close"):

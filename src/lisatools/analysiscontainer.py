@@ -2355,7 +2355,9 @@ class AnalysisContainerArray:
                     )
                 )
         self._cpp_splits = splits
-        self.compute_d_d_terms()
+       
+        if not getattr(self, "_skip_eager_dd", False):
+            self.compute_d_d_terms()
 
     def _ensure_cpp_splits(self) -> None:
         if self._cpp_splits is None:
