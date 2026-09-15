@@ -82,7 +82,10 @@ from eryn.utils.utility import groups_from_inds
 from ...diagnostic import inner_product
 from ...sampling.prior import FullGaussianMixtureModel, GBPriorWrap
 from ...sampling.gb_observable_basis import (
+    OBSERVABLE_CD_FLOORS,
+    OBSERVABLE_CD_FLOOR_DEFAULT,
     GBObservableFiberBasis,
+    VGBObservableBasis,
     fdot_gr,
     gb_observable_step_scales,
 )
@@ -1135,6 +1138,15 @@ def _eigen_axis_on() -> bool:
 _INMODEL_PROPOSAL_DEFAULT = "observable"
 _INMODEL_PROPOSAL_KINDS = ("observable", "legacy")
 
+#: VGB in-model proposal kinds (``VGB_INMODEL_PROPOSAL``). ``observable``
+#: is the reduced GB composite step (user ruling 2026-09-15, see
+#: :func:`_vgb_inmodel_proposal_kind`); ``eigen`` is the 09-15-morning
+#: default it supersedes -- the plain SAMPLING-basis one-axis eigen draw,
+#: whose ``fdot_astro_ratio`` axis carries EXACTLY zero curvature in this
+#: basis; ``stretch`` is the pure-stretch legacy.
+_VGB_INMODEL_PROPOSAL_DEFAULT = "observable"
+_VGB_INMODEL_PROPOSAL_KINDS = ("observable", "eigen", "stretch")
+
 #: Cached refusal marker for :meth:`_observable_map` -- distinct from
 #: ``None`` so "not built yet" and "ineligible basis" cannot be confused.
 _OBS_MAP_INELIGIBLE = object()
@@ -1160,32 +1172,56 @@ def _rj_amp_maximize_on() -> bool:
     return os.environ.get("GB_RJ_AMP_MAXIMIZE", "0").strip() == "1"
 
 
-def _inmodel_proposal_kind() -> str:
-    """Which in-model proposal runs: ``"observable"`` or ``"legacy"``.
-
-    Two spellings of one decision. ``GB_INMODEL_PROPOSAL`` is the master
-    switch; ``GB_INMODEL_OBSERVABLE_BASIS`` is the per-feature arm and
-    WINS when set, so a runbook that armed the feature explicitly keeps
-    meaning what it meant after the default flips.
+def _proposal_kind_from_env(var, kinds, default) -> str:
+    """Read an in-model-proposal selector env var. ONE implementation.
 
     An unrecognised value warns rather than falling through silently: an
     unknown env var is otherwise ignored without a trace (see
     ``CLAUDE.md``), which is exactly how a typo downgrades a production
     run to the proposal it was launched to replace.
     """
+    kind = os.environ.get(var, "").strip().lower()
+    if not kind:
+        return default
+    if kind not in kinds:
+        logger.warning(
+            "%s=%r is not one of %s -- falling back to %r. "
+            "This is a typo, not a feature: fix the runbook.",
+            var, kind, kinds, default)
+        return default
+    return kind
+
+
+def _inmodel_proposal_kind() -> str:
+    """Which GB in-model proposal runs: ``"observable"`` or ``"legacy"``.
+
+    Two spellings of one decision. ``GB_INMODEL_PROPOSAL`` is the master
+    switch; ``GB_INMODEL_OBSERVABLE_BASIS`` is the per-feature arm and
+    WINS when set, so a runbook that armed the feature explicitly keeps
+    meaning what it meant after the default flips.
+    """
     explicit = os.environ.get("GB_INMODEL_OBSERVABLE_BASIS")
     if explicit is not None and explicit.strip() != "":
         return "observable" if explicit.strip() == "1" else "legacy"
-    kind = os.environ.get("GB_INMODEL_PROPOSAL", "").strip().lower()
-    if not kind:
-        return _INMODEL_PROPOSAL_DEFAULT
-    if kind not in _INMODEL_PROPOSAL_KINDS:
-        logger.warning(
-            "GB_INMODEL_PROPOSAL=%r is not one of %s -- falling back to %r. "
-            "This is a typo, not a feature: fix the runbook.",
-            kind, _INMODEL_PROPOSAL_KINDS, _INMODEL_PROPOSAL_DEFAULT)
-        return _INMODEL_PROPOSAL_DEFAULT
-    return kind
+    return _proposal_kind_from_env(
+        "GB_INMODEL_PROPOSAL", _INMODEL_PROPOSAL_KINDS,
+        _INMODEL_PROPOSAL_DEFAULT)
+
+
+def _vgb_inmodel_proposal_kind() -> str:
+    """Which VGB in-model proposal runs. ``VGB_INMODEL_PROPOSAL``.
+
+    ``observable`` (DEFAULT, user ruling 2026-09-15: "we should be sampling
+    the VGBs just like the GBs now ... still sampling in the observed basis
+    for VGBs (just without f0, sky coords)") composes the reduced
+    observable step with ``VGB_INMODEL_OBSERVABLE_EIGEN`` exactly as GB
+    composes its own pair. ``eigen`` is the previous default (the plain
+    SAMPLING-basis one-axis eigen draw) and ``stretch`` the pure-stretch
+    legacy; both remain reachable as escapes.
+    """
+    return _proposal_kind_from_env(
+        "VGB_INMODEL_PROPOSAL", _VGB_INMODEL_PROPOSAL_KINDS,
+        _VGB_INMODEL_PROPOSAL_DEFAULT)
 
 
 def _observable_knob(name, default):
@@ -1199,6 +1235,25 @@ def _observable_knob(name, default):
         logger.warning("%s=%r is not a float -- using %g", name, raw,
                        float(default))
         return float(default)
+
+
+def _eigen_mode_from_env(var) -> str:
+    """Read an ``*_INMODEL_OBSERVABLE_EIGEN`` knob. ONE implementation.
+
+    ``0`` / ``off`` (default) | ``1`` / ``axis`` | ``full``; anything else
+    warns and stays off. Shared verbatim by the GB and VGB knobs so their
+    semantics cannot drift apart.
+    """
+    raw = os.environ.get(var, "0").strip().lower()
+    if raw in ("", "0", "off"):
+        return "off"
+    if raw in ("1", "axis"):
+        return "axis"
+    if raw == "full":
+        return "full"
+    logger.warning(
+        "%s=%r not recognized (0/off, 1/axis, full); using 'off'", var, raw)
+    return "off"
 
 
 def _observable_eigen_mode() -> str:
@@ -1223,17 +1278,20 @@ def _observable_eigen_mode() -> str:
     full-covariance draw, all coordinates moving per repeat like today.
     ``1`` / ``axis``: ONE whitened eigen-axis per repeat.
     """
-    raw = os.environ.get("GB_INMODEL_OBSERVABLE_EIGEN", "0").strip().lower()
-    if raw in ("", "0", "off"):
-        return "off"
-    if raw in ("1", "axis"):
-        return "axis"
-    if raw == "full":
-        return "full"
-    logger.warning(
-        "GB_INMODEL_OBSERVABLE_EIGEN=%r not recognized (0/off, 1/axis, "
-        "full); using 'off'", raw)
-    return "off"
+    return _eigen_mode_from_env("GB_INMODEL_OBSERVABLE_EIGEN")
+
+
+def _vgb_observable_eigen_mode() -> str:
+    """``VGB_INMODEL_OBSERVABLE_EIGEN``: the VGB half of the same pair.
+
+    Identical semantics to :func:`_observable_eigen_mode` (same reader),
+    applied to the REDUCED observable basis: ``off`` is the byte-identical
+    diagonal observable draw, ``axis`` one whitened eigen-axis per repeat,
+    ``full`` one joint correlated step. Separate knob because the two
+    branches are validated separately -- a knob that silently follows
+    another is how machinery gets rearmed with no line saying so.
+    """
+    return _eigen_mode_from_env("VGB_INMODEL_OBSERVABLE_EIGEN")
 
 
 def gb_fiber_tangent(coords, dist_col, mc_col, r_col):
@@ -10206,6 +10264,43 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self._proposal_param_scales = s
         return band_sorter.draw_infomat(ids)
 
+    def _infomat_phys_inds(self):
+        """PHYSICAL output slots the information matrix is taken over.
+
+        Normally the container's own ``test_inds`` -- the output slots the
+        sampled columns scatter into -- which is what both the engine
+        (``inds=``) and :meth:`_infomat_jacobian` must agree on.
+
+        ONE substitution, and it is the fix for a dead sampled parameter.
+        The distance/chirp-mass GB basis routes ``fdot_astro_ratio`` to the
+        ``fddot`` output slot (``key_map``), and the astro transform emits
+        ``fddot`` EXACTLY 0 -- ``r``'s real physical target is ``fdot``,
+        which the same ``key_map`` feeds from ``Mc``. On the GB branch
+        ``Mc`` is SAMPLED, so ``fdot`` is already in ``test_inds`` and
+        ``r`` gets its curvature through the full congruence (retired
+        freeze, 2026-08-17). On the VGB branch ``Mc`` is a per-leaf FILL,
+        so ``fdot`` sits OUTSIDE ``test_inds`` and the only column ``r``
+        could score against is identically zero:
+        ``J[:, :, r] == 0`` exactly, ``info_y`` rank-deficient in ``r``,
+        and its eigen step the prior-box width -- a blind jump in the one
+        coordinate the VGB branch exists to measure. Substituting the live
+        ``fdot`` slot for the dead ``fddot`` one asks the engine for the
+        derivative that actually exists.
+
+        A NO-OP wherever ``fdot`` is already scored (every GB basis: the
+        9-column one has both slots, the 8-column ``(A, fdot)`` one has
+        ``fddot`` as a scalar fill and never in ``test_inds``), so this is
+        one implementation serving both branches rather than a VGB fork.
+        """
+        ti = [int(i) for i in
+              np.asarray(self.parameter_transforms.fill_dict["test_inds"])]
+        ob = list(getattr(self.parameter_transforms, "output_basis", []) or [])
+        if "fdot" in ob and "fddot" in ob:
+            dead, live = ob.index("fddot"), ob.index("fdot")
+            if dead in ti and live not in ti:
+                ti[ti.index(dead)] = live
+        return np.asarray(ti)
+
     def _infomat_jacobian(self, coords, test_inds, s, leaf_inds=None):
         """FULL Jacobian ``J[n, a, i] = d(phys[test_inds[a]]) / d(y_i)``.
 
@@ -10472,6 +10567,46 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     # ``lisatools.sampling.gb_observable_basis`` for WHY the sampling basis
     # is the wrong basis to propose in.
 
+    #: The ``y <-> z`` map class for this branch. The VGB move swaps in the
+    #: reduced (pinned f0/sky/Mc) restriction; everything downstream reads
+    #: the map's own ``INTERNAL_BASIS`` / ``FIBER_INDEX`` so ONE composite
+    #: code path serves both.
+    _observable_map_class = GBObservableFiberBasis
+
+    #: Sampling-basis column attributes the observable map needs on this
+    #: branch. GB requires all four (an 8-column ``(A, fdot)`` basis has
+    #: none of them and must keep the legacy draw); the VGB restriction
+    #: pins ``f0``/``Mc`` per leaf and so requires only ``dist``/``r``.
+    _observable_required_cols = ("_dist_col", "_mc_col", "_fdot_astro_col",
+                                 "_f0_col")
+
+    def _inmodel_kind(self) -> str:
+        """Which in-model proposal this branch runs (env-selected).
+
+        A per-branch hook rather than a direct module-function call: the VGB
+        move reads ``VGB_INMODEL_PROPOSAL`` (whose kinds differ), and the
+        composite code path below must not have to know which branch it is
+        serving.
+        """
+        return _inmodel_proposal_kind()
+
+    def _obs_eigen_mode(self) -> str:
+        """``off`` / ``axis`` / ``full`` for this branch's eigen knob."""
+        return _observable_eigen_mode()
+
+    def _observable_leaf_kw(self, band_sorter, source_ids):
+        """``{"leaf_inds": ...}`` on a per-leaf-fill branch, else ``{}``.
+
+        Derived exactly as the working scoring path and
+        :meth:`_compute_proposal_cholesky` derive it
+        (``band_sorter.leaf_inds[ids]``; the 2026-09-15 job-501 fix). EMPTY
+        for GB, whose fills are scalar -- so the GB calls below pass no new
+        kwarg at all and stay byte-identical.
+        """
+        if not getattr(self, "_per_leaf_fill", False) or band_sorter is None:
+            return {}
+        return {"leaf_inds": band_sorter.leaf_inds[source_ids]}
+
     def _observable_map(self):
         """Cached ``y <-> z`` map; ``None`` when the basis is ineligible.
 
@@ -10486,7 +10621,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         if m is not None:
             return None if m is _OBS_MAP_INELIGIBLE else m
         try:
-            m = GBObservableFiberBasis(
+            m = self._observable_map_class(
                 self.transform_fn,
                 Tobs=1.0 / float(self.df),
                 shear=_observable_knob("GB_INMODEL_OBSERVABLE_SHEAR", 0.5),
@@ -10505,18 +10640,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         return m
 
     def _observable_basis_ready(self) -> bool:
-        """Armed AND the basis carries the observable columns.
+        """Armed AND the basis carries this branch's observable columns.
 
-        Guarded rather than asserted: VGB's 5-column basis and the
-        8-column ``(A, fdot)`` basis have no ``dist`` / ``Mc`` /
-        ``fdot_astro_ratio``, and must keep the legacy draw.
+        Guarded rather than asserted: the 8-column ``(A, fdot)`` basis has
+        no ``dist`` / ``Mc`` / ``fdot_astro_ratio`` and must keep the legacy
+        draw. The required set is per-branch
+        (:attr:`_observable_required_cols`) because the VGB restriction
+        pins ``f0`` and ``Mc`` per leaf instead of sampling them -- the GB
+        list would reject the very basis the reduced map exists to serve.
         """
         return (
-            _inmodel_proposal_kind() == "observable"
-            and getattr(self, "_dist_col", None) is not None
-            and getattr(self, "_mc_col", None) is not None
-            and getattr(self, "_fdot_astro_col", None) is not None
-            and getattr(self, "_f0_col", None) is not None
+            self._inmodel_kind() == "observable"
+            and all(getattr(self, c, None) is not None
+                    for c in self._observable_required_cols)
             and self._observable_map() is not None
         )
 
@@ -10592,17 +10728,24 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         # ``Mc`` as a FRACTION of its prior box: the absolute width of
         # m_chirp_lims is a run setting, and a step quoted in solar masses
-        # would silently mean something different in every run.
-        mc_box = float(self._eigen_axis_widths(ndim)[self._mc_col])
+        # would silently mean something different in every run. A layout
+        # with no ``Mc`` column (the VGB restriction pins it per leaf) has
+        # no fiber to step along and never reads this.
+        mc_step = 0.0
+        if "Mc" in m.INTERNAL_BASIS:
+            mc_box = float(self._eigen_axis_widths(ndim)[self._mc_col])
+            mc_step = mc_box * _observable_knob(
+                "GB_INMODEL_OBSERVABLE_MC_STEP", 0.05)
         return gb_observable_step_scales(
             r, m.Tobs,
             extrinsic_scales=ex,
-            mc_step=mc_box * _observable_knob(
-                "GB_INMODEL_OBSERVABLE_MC_STEP", 0.05),
+            mc_step=mc_step,
             jump=_observable_knob("GB_INMODEL_OBSERVABLE_JUMP", 1.0),
+            internal_basis=m.INTERNAL_BASIS,
         )
 
-    def _observable_stash_gamma_z(self, info_y, coords, s, ids, n_src):
+    def _observable_stash_gamma_z(self, info_y, coords, s, ids, n_src,
+                                  leaf_inds=None):
         """Information matrix congruenced into the OBSERVABLE basis z.
 
         ``Gamma_z = M^T Gamma_x M`` with ``M = dx/dz`` (the
@@ -10612,35 +10755,47 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         the fdot conditioning of the y congruence. Scattered by SOURCE ID
         like the rho snapshot; consumed once per block by
         :meth:`_observable_eigen_prepare`.
+
+        ``leaf_inds`` is REQUIRED when the map pins per-leaf constants (the
+        VGB restriction: a row mapped with another leaf's f0/Mc is a
+        different physical source); ``None`` leaves the GB calls
+        byte-identical (empty-kwarg guard, no new kwarg at all).
         """
         xp = self.xp
         m = self._observable_map()
         n, ndim = coords.shape
-        z = m.to_internal(coords)
+        _lk = {} if leaf_inds is None else {"leaf_inds": leaf_inds}
+        z = m.to_internal(coords, **_lk)
         # Per-column central-difference steps: relative, with per-column
         # ABSOLUTE floors (the fdot column lives at ~1e-16; the angle
         # columns are pure passthrough in both maps, so a tiny h is exact
-        # there). The chain-rule invariance test in
-        # tests/test_gb_observable_eigen.py is the guard on these choices.
-        floors = xp.asarray([1e-1, 1e-6, 1e-22, 1e-3, 1e-3, 1e-3, 1e-3,
-                             1e-3, 1e-3])[:ndim]
-        M = xp.zeros((n, ndim, ndim))
-        for i in range(ndim):
+        # there). Keyed by the map's own coordinate NAMES -- a positional
+        # list sliced to ndim hands a REDUCED layout the 9-column floors
+        # (the VGB fdot column would inherit f_mid's 1e-6 and its
+        # derivative would come out pure roundoff). The chain-rule
+        # invariance tests in tests/test_gb_observable_eigen.py and
+        # tests/test_vgb_observable_basis.py are the guard on these choices.
+        floors = xp.asarray([
+            OBSERVABLE_CD_FLOORS.get(nm, OBSERVABLE_CD_FLOOR_DEFAULT)
+            for nm in m.INTERNAL_BASIS])
+        ndim_z = int(z.shape[1])
+        M = xp.zeros((n, ndim, ndim_z))
+        for i in range(ndim_z):
             h = 1e-6 * xp.maximum(xp.abs(z[:, i]), floors[i])
             up = z.copy()
             dn = z.copy()
             up[:, i] = up[:, i] + h
             dn[:, i] = dn[:, i] - h
-            dx = (xp.asarray(m.from_internal(up, template=coords))
-                  - xp.asarray(m.from_internal(dn, template=coords)))
+            dx = (xp.asarray(m.from_internal(up, template=coords, **_lk))
+                  - xp.asarray(m.from_internal(dn, template=coords, **_lk)))
             M[:, :, i] = dx / (2.0 * h)[:, None]
         s_inv = 1.0 / xp.asarray(s).ravel()
         gamma_x = info_y * s_inv[None, :, None] * s_inv[None, None, :]
         gamma_z = xp.einsum("nai,nab,nbj->nij", M, gamma_x, M)
         store = getattr(self, "_obs_gamma_z", None)
         if (store is None or int(store.shape[0]) != int(n_src)
-                or int(store.shape[-1]) != int(ndim)):
-            store = xp.full((int(n_src), ndim, ndim), xp.nan)
+                or int(store.shape[-1]) != ndim_z):
+            store = xp.full((int(n_src), ndim_z, ndim_z), xp.nan)
         store[xp.asarray(ids).ravel()] = gamma_z
         self._obs_gamma_z = store
 
@@ -10669,8 +10824,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         gw = gz * w[:, :, None] * w[:, None, :]
         gw = xp.where(ok[:, None, None], gw,
                       xp.broadcast_to(xp.eye(ndim), gw.shape))
-        t_fiber = xp.zeros((int(gw.shape[0]), ndim))
-        t_fiber[:, m.FIBER_INDEX] = 1.0
+        # No fiber in a layout whose ``Mc`` is pinned (the VGB restriction):
+        # ``t_fiber=None`` is eigen_axis_set's own generic branch -- plain
+        # eigenvectors of the whitened matrix, nothing projected out, no
+        # last-column fiber axis.
+        t_fiber = None
+        if m.FIBER_INDEX is not None:
+            t_fiber = xp.zeros((int(gw.shape[0]), ndim))
+            t_fiber[:, m.FIBER_INDEX] = 1.0
         smax = _observable_knob("GB_INMODEL_OBSERVABLE_EIGEN_SMAX", 10.0)
         axes_w, sig_w = _eigen_axis_set_generic(
             gw, t_fiber=t_fiber, sigma_max=smax)
@@ -10685,7 +10846,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                                 xp.full_like(table, xp.nan))
         self._obs_eigen_table = store
 
-    def _observable_proposal(self, coords, chol, source_ids):
+    def _observable_proposal(self, coords, chol, source_ids,
+                             leaf_inds=None):
         """One composite observable step. ``(new_coords, factors)``.
 
         The 8 observable components and the ``Mc`` fiber component come
@@ -10701,16 +10863,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """
         xp = self.xp
         m = self._observable_map()
-        z = m.to_internal(coords)
+        _lk = {} if leaf_inds is None else {"leaf_inds": leaf_inds}
+        z = m.to_internal(coords, **_lk)
         scales = self._observable_step_scales(chol, source_ids,
                                               int(coords.shape[1]))
-        # OBSERVABLE + EIGENBASIS (GB_INMODEL_OBSERVABLE_EIGEN, user ruling
-        # 2026-09-14): draw along the block-frozen eigen table in z when a
-        # row has one; rows without a table (or knob off) take the diagonal
-        # draw below, byte-identical to the pre-eigen path INCLUDING the
-        # RNG stream (the off branch executes exactly the old statements).
+        # OBSERVABLE + EIGENBASIS (GB_INMODEL_OBSERVABLE_EIGEN /
+        # VGB_INMODEL_OBSERVABLE_EIGEN, user rulings 2026-09-14/15): draw
+        # along the block-frozen eigen table in z when a row has one; rows
+        # without a table (or knob off) take the diagonal draw below,
+        # byte-identical to the pre-eigen path INCLUDING the RNG stream
+        # (the off branch executes exactly the old statements).
         dz = None
-        _mode = _observable_eigen_mode()
+        _mode = self._obs_eigen_mode()
         if _mode != "off":
             _tab_store = getattr(self, "_obs_eigen_table", None)
             if _tab_store is not None:
@@ -10726,8 +10890,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     if _mode == "axis":
                         # the LAST table column is the pure-fiber axis
                         # (prepare sorts it there); drop it from the picks
-                        # when the fiber weight is 0
-                        naxes = int(ndim_z) - (1 if _fw == 0.0 else 0)
+                        # when the fiber weight is 0. A FIBERLESS layout
+                        # (Mc pinned) has no such column, so every axis
+                        # stays in the pick set.
+                        naxes = int(ndim_z) - (
+                            1 if (_fw == 0.0 and m.FIBER_INDEX is not None)
+                            else 0)
                         pick = xp.asarray(
                             np.random.randint(0, naxes, size=int(nrow)))
                         _zz = xp.asarray(xp.random.randn(int(nrow)))
@@ -10748,16 +10916,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # A/B rather than a coupled one. (On the eigen path the non-fiber
         # axes are exactly Mc-free by the fiber projection, so this
         # multiplier only guards the last-axis / full-mode Mc component.)
-        dz[:, m.FIBER_INDEX] = dz[:, m.FIBER_INDEX] * _observable_knob(
-            "GB_INMODEL_OBSERVABLE_FIBER_WEIGHT", 0.0)
-        new = m.from_internal(z + dz, template=coords)
+        # No-op guard for a FIBERLESS map: there is no Mc column to weight.
+        if m.FIBER_INDEX is not None:
+            dz[:, m.FIBER_INDEX] = dz[:, m.FIBER_INDEX] * _observable_knob(
+                "GB_INMODEL_OBSERVABLE_FIBER_WEIGHT", 0.0)
+        new = m.from_internal(z + dz, template=coords, **_lk)
         # ``factors`` MUST be device-resident, float64, C-contiguous, 1-D.
         # ``_imk_layout_problem`` checks dtype and contiguity only, and
         # ``cupy.float64 is numpy.float64``, so a HOST array passes the
         # gate and is then dereferenced as a device pointer: garbage
         # acceptance, no exception, plausible-looking chains.
         factors = xp.ascontiguousarray(
-            xp.asarray(m.factors(coords, new)).ravel(), dtype=xp.float64)
+            xp.asarray(m.factors(coords, new, **_lk)).ravel(),
+            dtype=xp.float64)
         return new, factors
 
     def _compute_proposal_cholesky(self, model, band_sorter, ids, slots=None,
@@ -10800,7 +10971,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     if self._per_leaf_fill else {})
         params_phys = self.transform_fn.both_transforms(
             coords, xp=cp, **_leaf_kw)
-        _test_inds = np.asarray(self.parameter_transforms.fill_dict["test_inds"])
+        _test_inds = self._infomat_phys_inds()
         walker_inds = band_sorter.walker_inds[ids].astype(xp.int32)
 
         # Route the Fisher matrix per shard: the comp is single-shard by
@@ -10870,12 +11041,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # the internal observable basis while it is in hand (a from_internal
         # Jacobian + one einsum -- no extra engine work). Consumed once per
         # block by _observable_eigen_prepare at the rho-snapshot point.
-        if (_observable_eigen_mode() != "off"
+        if (self._obs_eigen_mode() != "off"
                 and self._observable_basis_ready()):
             with _tspan(_tm, "infomat_obs_eigen"):
                 self._observable_stash_gamma_z(
                     info_y, coords, s, ids,
-                    int(band_sorter.inds.shape[0]))
+                    int(band_sorter.inds.shape[0]), **_leaf_kw)
 
         # Opt-in only (perf, 2026-08-15): this sat INSIDE the per-block
         # info-matrix path, so every in-model block paid a full CuPy pool
@@ -11018,6 +11189,23 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             {self.branch_name: new[:, None, :]}, xp=xp)[self.branch_name][:, 0]
         return new, xp.zeros(n)
 
+    def _maybe_observable_proposal(self, coords, chol, band_sorter,
+                                   source_ids):
+        """The composite observable step, or ``None`` when not armed.
+
+        ONE entry point for every branch: the GB default path and the VGB
+        move call this, so the leaf-index derivation, the ``_last_im_kind``
+        label and the proposal itself exist once. ``None`` means "not
+        armed for this branch" and the caller falls through to its own
+        legacy component.
+        """
+        if not self._observable_basis_ready():
+            return None
+        self._last_im_kind = "obs_basis"
+        return self._observable_proposal(
+            coords, chol, source_ids,
+            **self._observable_leaf_kw(band_sorter, source_ids))
+
     def in_model_proposal(self, coords, chol, band_sorter, source_ids, model):
         """Default in-model proposal: group-stretch / info-matrix mix.
 
@@ -11052,9 +11240,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         if self._doppler_jump_should_fire(coords):
             self._last_im_kind = "doppler"
             return self._doppler_jump_proposal(coords)
-        if self._observable_basis_ready():
-            self._last_im_kind = "obs_basis"
-            return self._observable_proposal(coords, chol, source_ids)
+        obs = self._maybe_observable_proposal(coords, chol, band_sorter,
+                                              source_ids)
+        if obs is not None:
+            return obs
 
         use_stretch = (
             self.stretch_probability > 0.0
@@ -12990,7 +13179,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # HERE -- after the rho snapshot (the whitening scales need it)
             # and never inside the repeat loop (the freeze is what keeps
             # the draw symmetric and factors = Jacobian only).
-            if _observable_eigen_mode() != "off":
+            if self._obs_eigen_mode() != "off":
                 self._observable_eigen_prepare(
                     chol, ids, int(band_sorter.inds.shape[0]))
 
@@ -17457,33 +17646,31 @@ class GBSpecialStretchMove(GBSpecialBase):
 def _vgb_inmodel_defaults(kwargs):
     """Apply the ``VGB_INMODEL_PROPOSAL`` env default to a VGB move's kwargs.
 
-    ``eigen`` (DEFAULT, user ruling 2026-09-15): arm the inherited
-    info-matrix machinery (``use_info_mat_proposal=True``) with the
-    one-axis generic eigen draw (``stretch_probability=0.0``). With
-    exact-truth VGB starts (``VGB_START_FACTOR=0``) a stretch ensemble
-    has zero spread and can never move, so eigen is also the only draw
-    that samples from identical starts. ``stretch`` (escape): the legacy
+    ``observable`` (DEFAULT, user ruling 2026-09-15: "we should be sampling
+    the VGBs just like the GBs now ... still sampling in the observed basis
+    for VGBs (just without f0, sky coords)") and ``eigen`` (the 09-15
+    morning default it supersedes) both arm the inherited info-matrix
+    machinery (``use_info_mat_proposal=True``, ``stretch_probability=0.0``):
+    the observable composite needs the same per-block information matrix,
+    for the extrinsic step widths and for the eigen table in ``z``. With
+    exact-truth VGB starts (``VGB_START_FACTOR=0``) a stretch ensemble has
+    zero spread and can never move, so both are also the only draws that
+    sample from identical starts. ``stretch`` (escape): the legacy
     pure-stretch configuration, bit-identical to the pre-eigen behavior
     — a run that must not change mid-campaign pins
-    ``VGB_INMODEL_PROPOSAL=stretch`` explicitly (the 09-15 flip reversed
-    the earlier live-campaign-guard default). Cost note: with
+    ``VGB_INMODEL_PROPOSAL=stretch`` explicitly. Cost note: with
     ``VGB_SIGHET_INMODEL=0`` the per-block exact information matrices
     route through the CHUNKED engine (~29-46 ms/instance; 55 leaves x
     ntemps x nwalkers instances per propose). Explicitly passed kwargs
     always win (``setdefault``).
     """
-    kind = os.environ.get("VGB_INMODEL_PROPOSAL", "eigen").strip().lower()
-    if kind not in ("eigen", "stretch"):
-        logger.warning(
-            "VGB_INMODEL_PROPOSAL=%r not recognized (use 'eigen' or "
-            "'stretch'); using 'eigen'", kind)
-        kind = "eigen"
-    if kind == "eigen":
-        kwargs.setdefault("use_info_mat_proposal", True)
-        kwargs.setdefault("stretch_probability", 0.0)
-    else:
+    kind = _vgb_inmodel_proposal_kind()
+    if kind == "stretch":
         kwargs.setdefault("use_info_mat_proposal", False)
         kwargs.setdefault("stretch_probability", 1.0)
+    else:                                   # observable | eigen
+        kwargs.setdefault("use_info_mat_proposal", True)
+        kwargs.setdefault("stretch_probability", 0.0)
     return kwargs
 
 
@@ -17491,10 +17678,25 @@ class VGBSpecialStretchMove(GBSpecialBase):
     """In-model move for known (verification) galactic binaries.
 
     Fixed-dimensional (``nleaves_min == nleaves_max``, leaf i = one specific
-    physical source at every walker/temperature), NO RJ. Two proposal
-    components, selected by ``VGB_INMODEL_PROPOSAL`` (default ``eigen``
-    since 2026-09-15; ``stretch`` is the bit-identical legacy escape):
+    physical source at every walker/temperature), NO RJ. Three proposal
+    components, selected by ``VGB_INMODEL_PROPOSAL`` (default
+    ``observable`` since 2026-09-15; ``eigen`` and ``stretch`` are the
+    escapes):
 
+    * **observable** (DEFAULT) — the SAME composite step the GB branch
+      runs, through the SAME code path, with the reduced
+      :class:`~lisatools.sampling.gb_observable_basis.VGBObservableBasis`
+      map swapped in: a symmetric draw in
+      ``z = [lnA, fdot, phi0, cos_iota, psi]`` (per-leaf pinned ``f0`` /
+      sky / ``Mc``, no ``f_mid`` because a pinned ``f0`` has no shear, no
+      fiber because ``(dist, r) -> (A, fdot)`` is 2->2), composed with the
+      whitened information-matrix eigen table in ``z`` under
+      ``VGB_INMODEL_OBSERVABLE_EIGEN`` (off / axis / full, GB semantics
+      verbatim). ``factors`` are the map's log-Jacobian difference. This is
+      also the FIX for the dead ``fdot_astro_ratio`` column: ``fdot`` is a
+      raw coordinate in ``z``, and
+      :meth:`GBSpecialBase._infomat_phys_inds` asks the engine for the
+      physical ``fdot`` slot instead of the identically-zero ``fddot`` one.
     * **eigen** — the inherited GB info-matrix machinery computes a
       per-block EXACT information matrix for every vgb source (the
       cold-chain borrow table is skipped: every leaf is a DIFFERENT
@@ -17503,6 +17705,11 @@ class VGBSpecialStretchMove(GBSpecialBase):
       eigen-axis (no GB fiber/ridge — the reduced basis pins f0/sky per
       leaf, so the f0-shear disease those exist for is absent). Any
       failure to build the factor degrades to stretch with one warning.
+      NOTE this draw is in the SAMPLING basis, where the
+      ``fdot_astro_ratio`` axis was prior-box-wide rather than
+      curvature-set until :meth:`GBSpecialBase._infomat_phys_inds`
+      repaired the scored physical slot -- so it is a meaningful escape
+      now rather than a blind jump in that one direction.
     * **stretch** — a plain Goodman-Weare affine-invariant stretch over
       the sampled columns: each picked source is stretched against a
       random OTHER walker of the SAME physical source (same leaf, same
@@ -17555,6 +17762,28 @@ class VGBSpecialStretchMove(GBSpecialBase):
     # physical source, so the cold-chain nearest-in-frequency borrow table
     # would hand one source another's covariance.
     infomat_per_block = True
+
+    # ---- the observable composite, reduced (user ruling 2026-09-15) ----
+    # The GB machinery is PARAMETERIZED by these three, not duplicated:
+    # the map class, the sampling columns it needs, and which env knobs
+    # select it. Everything else -- _observable_proposal,
+    # _observable_stash_gamma_z, _observable_eigen_prepare,
+    # _observable_step_scales, the eigen draw branch -- is the GB code
+    # running against a narrower INTERNAL_BASIS.
+    _observable_map_class = VGBObservableBasis
+
+    #: f0 and Mc are per-leaf FILLS here, so ``_f0_col`` / ``_mc_col`` are
+    #: legitimately ``None``; requiring them (the GB list) would reject the
+    #: exact basis the reduced map exists for.
+    _observable_required_cols = ("_dist_col", "_fdot_astro_col")
+
+    def _inmodel_kind(self) -> str:
+        """``VGB_INMODEL_PROPOSAL``: observable (default) | eigen | stretch."""
+        return _vgb_inmodel_proposal_kind()
+
+    def _obs_eigen_mode(self) -> str:
+        """``VGB_INMODEL_OBSERVABLE_EIGEN``: off (default) | axis | full."""
+        return _vgb_observable_eigen_mode()
 
     def _proposal_cholesky(self, model, band_sorter, ids, slots=None,
                            buffer_obj=None):
@@ -17625,7 +17854,8 @@ class VGBSpecialStretchMove(GBSpecialBase):
 
     def in_model_proposal(self, coords, chol, band_sorter, source_ids, model):
         """One parity HALF of a Goodman-Weare red-blue sweep, via eryn's stretch.
-        (VGB is pure stretch: fixed-dimensional, no info-matrix branch.)
+        (The stretch component; the observable / eigen components above it
+        take the draw first when armed.)
 
         The base repeat block (``sequential_parity_repeats = True``) calls
         this once per parity half per repeat -- even-parity movers first,
@@ -17644,11 +17874,23 @@ class VGBSpecialStretchMove(GBSpecialBase):
         ``get_proposal``'s internal dispatch on the plain stretch rather
         than GroupMove's friend-table overrides.
 
-        Under ``VGB_INMODEL_PROPOSAL=eigen`` (the default) the eigen
-        one-axis draw runs instead whenever the per-block info-matrix
-        table was built (see :meth:`_vgb_eigen_axis_draw`); the stretch
-        below remains the mix-in / fallback component.
+        Under ``VGB_INMODEL_PROPOSAL=observable`` (the DEFAULT) the
+        composite observable step takes the whole draw -- the same
+        structure the GB base uses, where the observable path likewise
+        supersedes the legacy components entirely rather than mixing with
+        them (``stretch_probability`` is 0.0 under that default anyway).
+        It does not require ``chol``: without an information matrix the
+        extrinsic widths fall back to a prior-box fraction and the step is
+        still a real move, which a stretch draw off a zero-spread
+        ensemble is not. Under ``=eigen`` the SAMPLING-basis one-axis draw
+        runs whenever the per-block table was built (see
+        :meth:`_vgb_eigen_axis_draw`); the stretch below remains the
+        mix-in / fallback component.
         """
+        obs = self._maybe_observable_proposal(coords, chol, band_sorter,
+                                              source_ids)
+        if obs is not None:
+            return obs
         if self._vgb_use_eigen_draw(chol):
             return self._vgb_eigen_axis_draw(coords, chol)
         self._last_im_kind = "stretch"

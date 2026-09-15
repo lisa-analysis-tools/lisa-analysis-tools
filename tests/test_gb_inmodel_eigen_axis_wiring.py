@@ -52,10 +52,20 @@ def _stub(**over):
     # this file runs with GB_INMODEL_PROPOSAL=legacy -- these cover the
     # legacy path, and _stub carries no transform_fn / df to build a map
     # with anyway.
+    s._observable_map_class = GBSpecialStretchMove._observable_map_class
+    s._observable_required_cols = (
+        GBSpecialStretchMove._observable_required_cols)
+    s._per_leaf_fill = False
     s._eigen_axis_ready = lambda: GBSpecialStretchMove._eigen_axis_ready(s)
+    s._inmodel_kind = lambda: GBSpecialStretchMove._inmodel_kind(s)
+    s._obs_eigen_mode = lambda: GBSpecialStretchMove._obs_eigen_mode(s)
     s._observable_basis_ready = (
         lambda: GBSpecialStretchMove._observable_basis_ready(s))
     s._observable_map = lambda: GBSpecialStretchMove._observable_map(s)
+    s._observable_leaf_kw = (
+        lambda bs, ids: GBSpecialStretchMove._observable_leaf_kw(s, bs, ids))
+    s._maybe_observable_proposal = (
+        lambda *a: GBSpecialStretchMove._maybe_observable_proposal(s, *a))
     s._doppler_jump_should_fire = (
         lambda coords: GBSpecialStretchMove._doppler_jump_should_fire(
             s, coords))

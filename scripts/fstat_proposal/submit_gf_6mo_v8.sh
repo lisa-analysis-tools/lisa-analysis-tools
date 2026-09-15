@@ -2094,21 +2094,53 @@ export VGB_CHIRP_MASS_BASIS=0
 # with the matching "8" argument (it recreates every rung-dimensioned
 # vgb dataset: temps ladder, counters zeroed, 7 swap pairs).
 export VGB_NTEMPS=8
-# VGB IN-MODEL PROPOSAL = EIGEN (user ruling 2026-09-15: "make that the
-# default. the eigen proposal" -- the CODE default flipped the same day):
-# per-block EXACT per-(temp,walker,leaf) information matrices + the
-# generic one-axis eigen draw, graceful stretch fallback on any factor
-# failure. REQUIRED by the exact-truth flow above: VGB_START_FACTOR=0
-# gives a zero-spread ensemble that a stretch draw could never move.
-# COST (accepted): VGB_SIGHET_INMODEL=0 above routes the matrices
-# through the CHUNKED engine at ~29-46 ms/instance x (55 leaves x 8
-# rungs x 10 walkers ~ 4.4k instances) ~ 2-3.5 min of factor builds per
-# vgb propose; validating VGB_SIGHET_INMODEL=1 at the loudest-VGB SNRs
-# drops that ~12-19x (~11-17 s) and remains the standing optimization.
-# THIS RUN IS THE FIRST CLUSTER EXPOSURE of the vgb factor path -- watch
-# the first vgb_pe [GF_TIMING] wall and any "vgb eigen ... falling back
-# to stretch" warnings. =stretch remains the bit-identical legacy escape.
-export VGB_INMODEL_PROPOSAL=eigen
+# VGB IN-MODEL PROPOSAL = OBSERVABLE + EIGEN=FULL. SUPERSEDES the 09-15
+# morning "=eigen" arming (user ruling, same day, later: "we should be
+# sampling the VGBs just like the GBs now (in terms of the basis/proposal
+# type not RJ, still fixed model. f0 should be filled. sky location should
+# be filled. Everything else is just like the GB setup. We should be
+# sampling still in the observed basis for VGBs (just without f0, sky
+# coords)"). Both are the CODE defaults now; pinned here anyway because a
+# proposal swap is exactly the change a runbook must state.
+#
+# WHAT IT IS: the SAME composite step the GB branch runs, with the reduced
+# map swapped in -- a symmetric draw in z = [lnA, fdot, phi0, cos_iota,
+# psi] (f0 / alpha / sin_delta / Mc pinned per leaf; no f_mid because a
+# pinned f0 has no shear, no Mc fiber because (dist, r) -> (A, fdot) is
+# 2->2), whitened by the per-block information-matrix eigenbasis in z
+# (=full: one joint correlated step per repeat, all coordinates moving).
+# factors are the map's log-Jacobian difference.
+#
+# WHY IT SUPERSEDES =eigen -- the r-column verdict. The =eigen draw was in
+# the SAMPLING basis, where the ONLY physical quantity fdot_astro_ratio
+# drives is fdot = fdot_gr(f0, Mc)(1+r); with Mc a per-leaf FILL, Mc
+# occupies the physical fdot output slot through the container key_map, so
+# fdot sits OUTSIDE test_inds and r's only scored target is the fddot slot
+# -- which McDistFdotAstroQuad emits as exactly f0*0.0. Measured on the
+# real stock container: J[:, :, r] == 0 EXACTLY, info_y rank-deficient,
+# and the r eigen step set by the prior box (U[-5, 5]) instead of by
+# curvature. That is a blind jump in the one coordinate a known-f0 /
+# known-sky branch exists to measure, and every VGB run before this one
+# had it (commit 2bb484e2 recorded the suspicion; it is now confirmed and
+# fixed -- _infomat_phys_inds asks the engine for the live fdot slot).
+#
+# REQUIRED by the exact-truth flow above: VGB_START_FACTOR=0 gives a
+# zero-spread ensemble that a stretch draw could never move; the
+# observable step comes from the map + step scales, not the spread.
+# COST (accepted, unchanged): VGB_SIGHET_INMODEL=0 above routes the
+# matrices through the CHUNKED engine at ~29-46 ms/instance x (55 leaves
+# x 8 rungs x 10 walkers ~ 4.4k instances) ~ 2-3.5 min of factor builds
+# per vgb propose; validating VGB_SIGHET_INMODEL=1 at the loudest-VGB
+# SNRs drops that ~12-19x (~11-17 s) and remains the standing
+# optimization.
+# FIRST CLUSTER EXPOSURE of the vgb observable path -- watch the first
+# vgb_pe [GF_TIMING] wall, any "observable-basis proposal unavailable"
+# or "falling back to the stretch proposal" warnings, and the vgb fdot
+# spread actually opening up. Escapes: VGB_INMODEL_PROPOSAL=eigen (the
+# sampling-basis one-axis draw, now with a live r column) and =stretch
+# (the bit-identical legacy).
+export VGB_INMODEL_PROPOSAL=observable
+export VGB_INMODEL_OBSERVABLE_EIGEN=full
 # GB rung count. 24 is already the code default (stock/erebor/gb.py
 # env_default("GB_NTEMPS", 24)) -- pinned here anyway because the rung count
 # is the one knob whose failure mode is completely silent: resume derives it
@@ -2321,8 +2353,12 @@ export EMRI_EIGEN_REFRESH=100
 # SELECTOR CONSTRUCTOR value, and FEW's _generate_waveform hands its own
 # call-time default (1e-5, few/waveform/base.py:143) to the selector
 # unconditionally, so the constructor value never applied. EMRI_EPS is wired
-# at CALL time (it rides the branch waveform_kwargs AND the wave wrap's
-# runtime_kwargs), so it does bite.
+# at CALL time, through the EMRI wave wrap's runtime_kwargs -- the ONE wrap
+# both the engine-side generator (template + residual) and the move-side
+# generator resolve through, so it is on every EMRI waveform the run builds.
+# It is deliberately NOT stamped into the branch waveform_kwargs: for EMRI
+# those double as the move's LIKELIHOOD kwargs, and inner_product has no such
+# parameter -- doing so crashed the 6mo run on 2026-09-15 (fixed same day).
 # 1e-5 -> 1e-3 LOOSENS the cut: FEW keeps modes until the cumulative mode
 # SNR^2 is within (1-threshold)^2 of the total (few/utils/modeselector.py:426),
 # so fewer harmonics are kept = direct speedup on the dominant EMRI cost

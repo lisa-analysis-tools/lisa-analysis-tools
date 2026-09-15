@@ -2270,8 +2270,12 @@ export EMRI_EIGEN_REFRESH=100
 # SELECTOR CONSTRUCTOR value, and FEW's _generate_waveform hands its own
 # call-time default (1e-5, few/waveform/base.py:143) to the selector
 # unconditionally, so the constructor value never applied. EMRI_EPS is wired
-# at CALL time (it rides the branch waveform_kwargs AND the wave wrap's
-# runtime_kwargs), so it does bite.
+# at CALL time, through the EMRI wave wrap's runtime_kwargs -- the ONE wrap
+# both the engine-side generator (template + residual) and the move-side
+# generator resolve through, so it is on every EMRI waveform the run builds.
+# It is deliberately NOT stamped into the branch waveform_kwargs: for EMRI
+# those double as the move's LIKELIHOOD kwargs, and inner_product has no such
+# parameter -- doing so crashed the 6mo run on 2026-09-15 (fixed same day).
 # 1e-5 -> 1e-3 LOOSENS the cut: FEW keeps modes until the cumulative mode
 # SNR^2 is within (1-threshold)^2 of the total (few/utils/modeselector.py:426),
 # so fewer harmonics are kept = direct speedup on the dominant EMRI cost

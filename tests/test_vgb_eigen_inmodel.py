@@ -10,7 +10,11 @@ ran pure stretch. These tests pin the eigen enablement:
   whitened-eigen axes with prior-bounded widths, and stay None when not
   opted in.
 * ``_vgb_inmodel_defaults`` — the ``VGB_INMODEL_PROPOSAL`` env knob
-  (default ``eigen``: info-matrix proposal armed, stretch escape via env).
+  (the default arms the info-matrix proposal; ``stretch`` is the escape).
+  The default kind itself moved from ``eigen`` to ``observable`` later on
+  2026-09-15 — see ``tests/test_vgb_observable_basis.py``, which owns the
+  observable composite; this file keeps pinning the ``eigen`` escape it
+  was written for.
 * The VGB draw branch — one-axis symmetric steps off the (axes * sigma)
   table, graceful fallback to stretch when no table could be built.
 * ``PerLeafFillFactorTest`` — the info-matrix path through a transform
@@ -104,12 +108,19 @@ class GenericAxesFromInfoTest(unittest.TestCase):
 
 
 class VGBInmodelDefaultsTest(unittest.TestCase):
-    def test_default_is_eigen(self):
-        # USER RULING 2026-09-15 ("yes make that the default. the eigen
-        # proposal"): the unset-env default arms the info-matrix eigen
-        # draw. The former stretch default was a live-campaign guard for
-        # runs whose scripts predate the knob; those runs pin
-        # VGB_INMODEL_PROPOSAL=stretch explicitly if they must not change.
+    def test_default_arms_the_info_matrix_machinery(self):
+        # USER RULING 2026-09-15, twice. First "yes make that the default.
+        # the eigen proposal"; then, later the same day, "we should be
+        # sampling the VGBs just like the GBs now ... still sampling in the
+        # observed basis for VGBs (just without f0, sky coords)" -- so the
+        # default is now ``observable``. Either way the unset-env default
+        # arms the per-block information matrix (the observable composite
+        # needs it for the extrinsic widths and for the eigen table in z),
+        # which is what this test pins; which DRAW it feeds is pinned in
+        # tests/test_vgb_observable_basis.py. The former stretch default
+        # was a live-campaign guard for runs whose scripts predate the
+        # knob; those runs pin VGB_INMODEL_PROPOSAL=stretch explicitly if
+        # they must not change.
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("VGB_INMODEL_PROPOSAL", None)
             kw = {}
@@ -391,6 +402,7 @@ def _factor_stub(container, **over):
     s._observable_basis_ready = lambda: False
     s._infomat_route_check = lambda *a, **k: None
     for name in ("_compute_proposal_cholesky", "_infomat_jacobian",
+                 "_infomat_phys_inds", "_obs_eigen_mode",
                  "_eigen_axes_from_info"):
         setattr(s, name, types.MethodType(getattr(GBSpecialBase, name), s))
     for k, v in over.items():

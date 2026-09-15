@@ -78,6 +78,12 @@ def _stub(**over):
         name="rj_fstat_search",
         branch_name="gb",
         _dist_col=DIST, _mc_col=MC, _fdot_astro_col=R, _f0_col=F0,
+        # per-branch observable hooks (the VGB reduction parameterizes
+        # these; GB takes the class defaults)
+        _observable_map_class=GBSpecialStretchMove._observable_map_class,
+        _observable_required_cols=(
+            GBSpecialStretchMove._observable_required_cols),
+        _per_leaf_fill=False,
         _eigen_axis_min_dim=NDIM,
         _eigen_axis_widths_cache=None,
         _observable_map_cache=None,
@@ -98,7 +104,9 @@ def _stub(**over):
     for meth in ("_observable_basis_ready", "_observable_map",
                  "_observable_step_scales", "_observable_proposal",
                  "_eigen_axis_ready", "_eigen_axis_widths",
-                 "_doppler_jump_should_fire"):
+                 "_doppler_jump_should_fire", "_inmodel_kind",
+                 "_obs_eigen_mode", "_observable_leaf_kw",
+                 "_maybe_observable_proposal"):
         setattr(s, meth, getattr(GBSpecialStretchMove, meth).__get__(s))
     return s
 

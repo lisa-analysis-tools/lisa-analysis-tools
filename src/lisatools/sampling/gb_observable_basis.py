@@ -51,6 +51,33 @@ per run from the current span with no risk.
 Consumed by the in-model proposal (chain side, via the class) and by the
 F-stat grid (scalar half only -- grid rows are the physical waveform layout
 and carry no ``transform_container``).
+
+THE VGB RESTRICTION
+-------------------
+:class:`VGBObservableBasis` is the SAME map with fewer columns, not a second
+implementation: the verification-binary branch pins ``f0``, ``alpha``,
+``sin_delta`` (and, in the default basis, ``Mc``) per LEAF in the transform
+container's per-leaf ``fill_dict``, so its sampled side is
+``y = [dist, phi0, cos_iota, psi, r]`` and its observable side is
+``z = [lnA, fdot, phi0, cos_iota, psi]``. Every formula below is shared; the
+subclass only says which columns are sampled and where the pinned constants
+come from. Two structural consequences, both deliberate:
+
+* **No f_mid.** The shear exists to decorrelate a SAMPLED ``f0`` from
+  ``fdot``. With ``f0`` pinned there is nothing to decorrelate and a
+  ``f_mid`` column would be ``fdot`` in disguise (``f_mid = f0 + c_t*fdot``
+  at constant ``f0``).
+* **No fiber.** ``(dist, Mc, r) -> (A, fdot)`` is 3->2 only when all three
+  are sampled. With ``Mc`` pinned it is 2->2, ``FIBER_INDEX`` is ``None``,
+  and the generic (no-fiber) eigen set applies. (Under
+  ``VGB_CHIRP_MASS_BASIS=1`` ``Mc`` IS sampled, the derived layout grows the
+  ``Mc`` column back, and the fiber returns -- same code path.)
+
+``|dy/dz| = dist / fdot_gr(f0, Mc)`` is UNCHANGED by the restriction: with
+``f0``/``Mc`` constant the map is block-DIAGONAL (``ddist/dlnA = -dist``,
+``dr/dfdot = 1/fdot_gr``) rather than block-triangular, and the determinant
+comes out to the same expression -- which is why both bases call the one
+:meth:`GBObservableFiberBasis.log_jacobian`.
 """
 from __future__ import annotations
 
@@ -60,7 +87,11 @@ from ..utils.utility import get_array_module
 
 __all__ = [
     "FDOT_K",
+    "GB_INTERNAL_BASIS",
+    "OBSERVABLE_CD_FLOORS",
+    "OBSERVABLE_CD_FLOOR_DEFAULT",
     "GBObservableFiberBasis",
+    "VGBObservableBasis",
     "f0_from_f_mid",
     "f_mid_from_f0",
     "fdot_axis_bounds",
@@ -108,6 +139,29 @@ _TWO_POW_1_5 = 2.0 ** (1.0 / 5.0)
 STEP_C_LNA = 1.0        # dimensionless
 STEP_C_FMID = 0.5513    # in frequency bins (1/Tobs)
 STEP_C_FDOT = 4.2705    # in bins per Tobs (1/Tobs**2)
+
+#: Internal (observable) coordinate names of the FULL 9-column GB basis.
+#: Every consumer of a reduced layout must read the map's own
+#: ``INTERNAL_BASIS`` instead of assuming these positions -- the VGB
+#: restriction drops ``f_mid`` / ``alpha`` / ``sin_delta`` / ``Mc``, so a
+#: hard-coded "column 2 is fdot" is right for GB and wrong for VGB.
+GB_INTERNAL_BASIS = ("lnA", "f_mid", "fdot", "phi0", "cos_iota", "psi",
+                     "alpha", "sin_delta", "Mc")
+
+#: Pass-through (extrinsic) coordinates, in canonical internal order. A map
+#: carries exactly the ones its sampling basis carries -- the VGB branch
+#: pins ``alpha``/``sin_delta`` per leaf, so its layout has neither.
+_EXTRINSIC_NAMES = ("phi0", "cos_iota", "psi", "alpha", "sin_delta")
+
+#: ABSOLUTE floors for a central-difference step in the internal basis,
+#: keyed by NAME. ``fdot`` lives at ~1e-16 and ``lnA`` at ~1e1, so one
+#: relative step size cannot serve both; the angle columns are pure
+#: passthrough in both directions of the map, so a tiny step is exact
+#: there. Keyed by name rather than by position precisely so a REDUCED
+#: layout cannot silently inherit the 9-column ordering (``[:ndim]`` of a
+#: positional list hands the VGB ``fdot`` column ``f_mid``'s floor).
+OBSERVABLE_CD_FLOORS = {"lnA": 1e-1, "f_mid": 1e-6, "fdot": 1e-22}
+OBSERVABLE_CD_FLOOR_DEFAULT = 1e-3
 
 
 def fdot_gr(f0_hz, mc):
@@ -350,8 +404,9 @@ def r_from_fdot(fdot, f0_hz, mc):
 
 
 def gb_observable_step_scales(snr, tobs, *, extrinsic_scales, mc_step,
-                              jump=1.0, snr_clip=(1.0, 1.0e4)):
-    """Per-column step scales in the INTERNAL basis. ``(n,) -> (n, 9)``.
+                              jump=1.0, snr_clip=(1.0, 1.0e4),
+                              internal_basis=GB_INTERNAL_BASIS):
+    """Per-column step scales in the INTERNAL basis. ``(n,) -> (n, n_z)``.
 
     **This function deliberately cannot see ``coords``.** State-dependence
     belongs in the coordinate change, never in the step size: a scale that
@@ -364,19 +419,42 @@ def gb_observable_step_scales(snr, tobs, *, extrinsic_scales, mc_step,
     block is supplied by the caller (from the information matrix, whose
     unreliability is confined to derivatives through ``f0``); ``Mc`` is
     prior-set because the likelihood is flat along the fiber.
+
+    ``internal_basis`` names the columns, so a REDUCED layout (the VGB
+    restriction: no ``f_mid``, no ``alpha``/``sin_delta``, no ``Mc``) gets
+    each coordinate's own rule rather than the 9-column positions. The
+    default is the GB layout and reproduces the pre-generalization array
+    value for value; ``extrinsic_scales`` supplies the pass-through columns
+    the layout actually carries, in order, and ``mc_step`` is consumed only
+    by a layout that HAS an ``Mc`` column.
     """
     xp = get_array_module(snr)
     rho = xp.clip(xp.abs(xp.asarray(snr, dtype=xp.float64)),
                   float(snr_clip[0]), float(snr_clip[1]))
     n = rho.shape[0]
     bin_hz = 1.0 / float(tobs)
-    out = xp.zeros((n, 9), dtype=xp.float64)
-    out[:, 0] = STEP_C_LNA / rho
-    out[:, 1] = (STEP_C_FMID / rho) * bin_hz
-    out[:, 2] = (STEP_C_FDOT / rho) * bin_hz / float(tobs)
+    names = tuple(internal_basis)
     ex = xp.asarray(extrinsic_scales, dtype=xp.float64)
-    out[:, 3:8] = ex if ex.ndim == 2 else ex[None, :]
-    out[:, 8] = float(mc_step)
+    ex = ex if ex.ndim == 2 else ex[None, :]
+    out = xp.zeros((n, len(names)), dtype=xp.float64)
+    k = 0
+    for j, nm in enumerate(names):
+        if nm == "lnA":
+            out[:, j] = STEP_C_LNA / rho
+        elif nm == "f_mid":
+            out[:, j] = (STEP_C_FMID / rho) * bin_hz
+        elif nm == "fdot":
+            out[:, j] = (STEP_C_FDOT / rho) * bin_hz / float(tobs)
+        elif nm == "Mc":
+            out[:, j] = float(mc_step)
+        else:
+            out[:, j] = ex[:, k]
+            k += 1
+    if k != int(ex.shape[-1]):
+        raise ValueError(
+            f"extrinsic_scales has {int(ex.shape[-1])} columns but the "
+            f"internal basis {names} carries {k} pass-through coordinates."
+        )
     return out * float(jump)
 
 
@@ -403,8 +481,11 @@ class GBObservableFiberBasis:
     """
 
     _REQUIRED = ("dist", "f0", "Mc", "fdot_astro_ratio")
-    INTERNAL_BASIS = ("lnA", "f_mid", "fdot", "phi0", "cos_iota", "psi",
-                      "alpha", "sin_delta", "Mc")
+    #: Output-basis names this map takes from the container's PER-LEAF fills
+    #: rather than from a sampled column (empty for GB: everything is
+    #: sampled). Only entries absent from ``input_basis`` are looked up.
+    _PINNED = ()
+    INTERNAL_BASIS = GB_INTERNAL_BASIS
     FIBER_INDEX = 8
 
     def __init__(self, transform_container, *, Tobs, shear=0.5,
@@ -413,10 +494,10 @@ class GBObservableFiberBasis:
         missing = [n for n in self._REQUIRED if n not in basis]
         if missing:
             raise ValueError(
-                "GBObservableFiberBasis requires the (dist, f0, Mc, "
-                f"fdot_astro_ratio) GB sampling basis; input_basis {basis} is "
-                f"missing {missing}. 8-column (A / fdot) and VGB bases are not "
-                "eligible."
+                f"{type(self).__name__} requires "
+                f"{', '.join(self._REQUIRED)} in the sampling basis; "
+                f"input_basis {basis} is missing {missing}. 8-column "
+                "(A / fdot) bases are not eligible."
             )
         if fiber_coord not in ("Mc", "lnMc"):
             raise ValueError(f"fiber_coord must be 'Mc' or 'lnMc', got {fiber_coord!r}")
@@ -424,74 +505,184 @@ class GBObservableFiberBasis:
             raise ValueError(f"Tobs must be finite and positive, got {Tobs!r}")
         self.input_basis = basis
         self.dist_index = basis.index("dist")
-        self.f0_index = basis.index("f0")
-        self.mc_index = basis.index("Mc")
+        # ``None`` = pinned per leaf rather than sampled (the VGB
+        # restriction); every read below goes through _f0_hz / _mc so the
+        # two cases share one expression.
+        self.f0_index = basis.index("f0") if "f0" in basis else None
+        self.mc_index = basis.index("Mc") if "Mc" in basis else None
         self.ratio_index = basis.index("fdot_astro_ratio")
-        self._extrinsic = [basis.index(n) for n in
-                           ("phi0", "cos_iota", "psi", "alpha", "sin_delta")
-                           if n in basis]
+        self._extrinsic_names = tuple(n for n in _EXTRINSIC_NAMES
+                                      if n in basis)
+        self._extrinsic = [basis.index(n) for n in self._extrinsic_names]
         self.Tobs = float(Tobs)
         self.shear = float(shear)
         self.fiber_coord = fiber_coord
+        self._pinned = self._read_pinned(transform_container)
+        # DERIVED internal layout. For the full GB basis this reproduces
+        # ``GB_INTERNAL_BASIS`` and ``FIBER_INDEX = 8`` exactly (pinned by
+        # test_gb_observable_basis); a reduced basis simply carries fewer
+        # names, in the same canonical order, whatever order it SAMPLES in.
+        names = ["lnA"]
+        if self.f0_index is not None:
+            names.append("f_mid")           # no sampled f0 => no shear
+        names.append("fdot")
+        names.extend(self._extrinsic_names)
+        if self.mc_index is not None:
+            names.append("Mc")              # the fiber coordinate
+        self.INTERNAL_BASIS = tuple(names)
+        self._z = {n: i for i, n in enumerate(self.INTERNAL_BASIS)}
+        #: ``None`` when the layout has no fiber (``Mc`` pinned): the
+        #: consumer then uses the generic no-fiber eigen set.
+        self.FIBER_INDEX = self._z.get("Mc")
+
+    def _read_pinned(self, transform_container):
+        """``{name: (nleaves,) values}`` for the per-leaf pinned constants.
+
+        Empty for GB (``_PINNED = ()``), so the container is not touched at
+        all -- a stand-in exposing only ``input_basis`` stays valid. The VGB
+        restriction reads the SAMPLING-unit fill values (f0 in mHz) out of
+        the container's per-leaf ``fill_dict`` list, which is the single
+        source of those constants; rows are selected by ``leaf_inds`` at
+        call time exactly as ``TransformContainer.fill_values`` selects them.
+        """
+        need = [k for k in self._PINNED if k not in self.input_basis]
+        if not need:
+            return {}
+        fills = getattr(transform_container, "original_fill_dict", None)
+        if isinstance(fills, dict):
+            fills = [fills]
+        if not fills:
+            raise ValueError(
+                f"{type(self).__name__} needs per-leaf fill values for "
+                f"{need} (they are not sampled columns of {self.input_basis}) "
+                "but the transform container carries no fill_dict."
+            )
+        absent = [k for k in need if k not in fills[0]]
+        if absent:
+            raise ValueError(
+                f"{type(self).__name__}: {absent} are neither sampled "
+                f"columns of {self.input_basis} nor per-leaf fill keys "
+                f"{list(fills[0])}."
+            )
+        return {k: np.asarray([float(d[k]) for d in fills], dtype=float)
+                for k in need}
+
+    @property
+    def n_leaves(self):
+        """Number of pinned leaves, or ``None`` when nothing is pinned."""
+        for v in self._pinned.values():
+            return int(v.shape[0])
+        return None
 
     @property
     def _c_t(self):
         return self.shear * self.Tobs
 
-    # ---- the bijection -------------------------------------------------
-    def to_internal(self, coords):
-        """``(n, ndim)`` sampling -> ``(n, 9)`` internal."""
+    def _pinned_row(self, key, coords, leaf_inds):
+        """Per-ROW value of a pinned constant, selected by leaf index."""
         xp = get_array_module(coords)
-        f0 = coords[:, self.f0_index] * 1e-3                 # mHz -> Hz
-        mc = coords[:, self.mc_index]
+        vals = self._pinned[key]
+        if leaf_inds is None:
+            if vals.shape[0] == 1:
+                return xp.full(coords.shape[0], float(vals[0]))
+            raise ValueError(
+                f"{type(self).__name__} pins {key!r} per leaf "
+                f"({vals.shape[0]} leaves); pass leaf_inds (shape "
+                "coords.shape[:-1]) -- a row mapped with another leaf's "
+                "constants is a different physical source."
+            )
+        return xp.asarray(vals)[xp.asarray(leaf_inds).astype(int)]
+
+    def _f0_hz(self, coords, leaf_inds=None):
+        """``f0`` in Hz: the sampled mHz column, or the pinned constant."""
+        f0_ms = (coords[:, self.f0_index] if self.f0_index is not None
+                 else self._pinned_row("f0", coords, leaf_inds))
+        return f0_ms * 1e-3                                  # mHz -> Hz
+
+    def _mc(self, coords, leaf_inds=None):
+        """``Mc`` (Msol): the sampled column, or the pinned constant."""
+        if self.mc_index is not None:
+            return coords[:, self.mc_index]
+        return self._pinned_row("Mc", coords, leaf_inds)
+
+    # ---- the bijection -------------------------------------------------
+    def to_internal(self, coords, leaf_inds=None):
+        """``(n, ndim)`` sampling -> ``(n, n_z)`` internal.
+
+        ``leaf_inds`` is required only when the map pins a per-leaf constant
+        (the VGB restriction); the GB map ignores it.
+        """
+        xp = get_array_module(coords)
+        f0 = self._f0_hz(coords, leaf_inds)
+        mc = self._mc(coords, leaf_inds)
         fd = fdot_gr(f0, mc) * (1.0 + coords[:, self.ratio_index])
         amp = self._amp(f0, mc, coords[:, self.dist_index])
-        z = xp.zeros((coords.shape[0], 9), dtype=xp.float64)
-        z[:, 0] = xp.log(amp)
-        z[:, 1] = f0 + self._c_t * fd
-        z[:, 2] = fd
-        for k, c in enumerate(self._extrinsic):
-            z[:, 3 + k] = coords[:, c]
-        z[:, 8] = xp.log(mc) if self.fiber_coord == "lnMc" else mc
+        z = xp.zeros((coords.shape[0], len(self.INTERNAL_BASIS)),
+                     dtype=xp.float64)
+        z[:, self._z["lnA"]] = xp.log(amp)
+        if "f_mid" in self._z:
+            z[:, self._z["f_mid"]] = f0 + self._c_t * fd
+        z[:, self._z["fdot"]] = fd
+        for name, c in zip(self._extrinsic_names, self._extrinsic):
+            z[:, self._z[name]] = coords[:, c]
+        if "Mc" in self._z:
+            z[:, self._z["Mc"]] = (xp.log(mc) if self.fiber_coord == "lnMc"
+                                   else mc)
         return z
 
-    def from_internal(self, z, template=None):
-        """``(n, 9)`` internal -> ``(n, ndim)`` sampling."""
+    def from_internal(self, z, template=None, leaf_inds=None):
+        """``(n, n_z)`` internal -> ``(n, ndim)`` sampling."""
         xp = get_array_module(z)
         ndim = len(self.input_basis)
         out = (xp.zeros((z.shape[0], ndim), dtype=xp.float64)
                if template is None else xp.array(template, dtype=xp.float64))
-        mc = xp.exp(z[:, 8]) if self.fiber_coord == "lnMc" else z[:, 8]
-        fd = z[:, 2]
-        f0 = z[:, 1] - self._c_t * fd
-        out[:, self.f0_index] = f0 * 1e3                      # Hz -> mHz
-        out[:, self.mc_index] = mc
+        if "Mc" in self._z:
+            _zmc = z[:, self._z["Mc"]]
+            mc = xp.exp(_zmc) if self.fiber_coord == "lnMc" else _zmc
+        else:
+            mc = self._pinned_row("Mc", z, leaf_inds)
+        fd = z[:, self._z["fdot"]]
+        if "f_mid" in self._z:
+            f0 = z[:, self._z["f_mid"]] - self._c_t * fd
+        else:
+            f0 = self._pinned_row("f0", z, leaf_inds) * 1e-3
+        if self.f0_index is not None:
+            out[:, self.f0_index] = f0 * 1e3                  # Hz -> mHz
+        if self.mc_index is not None:
+            out[:, self.mc_index] = mc
         out[:, self.ratio_index] = fd / fdot_gr(f0, mc) - 1.0
         # A is strictly propto 1/dist, so dist = A(f0, Mc, 1 kpc) / A.
-        out[:, self.dist_index] = self._amp(f0, mc, 1.0) / xp.exp(z[:, 0])
-        for k, c in enumerate(self._extrinsic):
-            out[:, c] = z[:, 3 + k]
+        out[:, self.dist_index] = (self._amp(f0, mc, 1.0)
+                                   / xp.exp(z[:, self._z["lnA"]]))
+        for name, c in zip(self._extrinsic_names, self._extrinsic):
+            out[:, c] = z[:, self._z[name]]
         return out
 
     # ---- the measure ---------------------------------------------------
-    def log_jacobian(self, coords):
+    def log_jacobian(self, coords, leaf_inds=None):
         """``ln|dy/dz|`` at a SAMPLING point, up to an additive constant.
 
         ``= ln(dist) - ln(fdot_gr(f0, Mc))``, plus ``+ln(Mc)`` when the fiber
         coordinate is ``lnMc``. Only differences are ever used, so the
         constant is irrelevant -- but it must be the SAME constant at both
         ends, which is why both ends call this one function.
+
+        The reduced (pinned-f0/Mc) map has the SAME expression: the map is
+        then block-diagonal instead of block-triangular and the determinant
+        is unchanged. The ``fdot_gr`` term is a per-leaf constant there, so
+        it cancels in :meth:`factors` -- correctly, and without a second
+        formula.
         """
         xp = get_array_module(coords)
-        f0 = coords[:, self.f0_index] * 1e-3
-        mc = coords[:, self.mc_index]
+        f0 = self._f0_hz(coords, leaf_inds)
+        mc = self._mc(coords, leaf_inds)
         with np.errstate(invalid="ignore", divide="ignore"):
             lj = xp.log(coords[:, self.dist_index]) - xp.log(fdot_gr(f0, mc))
-            if self.fiber_coord == "lnMc":
+            if self.fiber_coord == "lnMc" and self.mc_index is not None:
                 lj = lj + xp.log(mc)
         return lj
 
-    def factors(self, old_coords, new_coords):
+    def factors(self, old_coords, new_coords, leaf_inds=None):
         """MH log-factor for the move ``old -> new``: **NEW minus OLD**.
 
         Sign confirmed by prior-invariance simulation -- correct preserves all
@@ -505,7 +696,8 @@ class GBObservableFiberBasis:
         kernel. A finite ``-1e300`` is rejected identically by both.
         """
         xp = get_array_module(new_coords)
-        f = self.log_jacobian(new_coords) - self.log_jacobian(old_coords)
+        f = (self.log_jacobian(new_coords, leaf_inds)
+             - self.log_jacobian(old_coords, leaf_inds))
         return xp.where(xp.isfinite(f), f, -1e300)
 
     # ---- internals -----------------------------------------------------
@@ -515,3 +707,50 @@ class GBObservableFiberBasis:
         from gbgpu.utils.utility import get_amplitude
         m = mc * _TWO_POW_1_5
         return get_amplitude(m, m, f0_hz, dist_kpc)
+
+
+class VGBObservableBasis(GBObservableFiberBasis):
+    """The VGB restriction of :class:`GBObservableFiberBasis`.
+
+    Same map, same measure, same code -- only the column set differs. The
+    verification-binary branch is fixed-dimensional and its sources are
+    KNOWN, so ``f0``, ``alpha``, ``sin_delta`` (and ``Mc``, unless
+    ``VGB_CHIRP_MASS_BASIS=1``) are pinned PER LEAF in the transform
+    container's per-leaf ``fill_dict``. That leaves
+
+        y = [dist, phi0, cos_iota, psi, r]   ->
+        z = [lnA,  fdot, phi0, cos_iota, psi]
+
+    (see the module docstring for why there is no ``f_mid`` and no fiber).
+    Every coordinate read routes through the base class's ``_f0_hz`` /
+    ``_mc``, which take the pinned constant when the column is absent --
+    so ``leaf_inds`` must be supplied on every call, the same contract
+    ``TransformContainer.fill_values`` imposes on the transform path.
+
+    WHY THIS MATTERS BEYOND THE PROPOSAL SHAPE. In the SAMPLING basis the
+    only physical quantity ``r`` drives is ``fdot = fdot_gr(f0, Mc)(1 + r)``
+    -- and with ``Mc`` pinned, ``Mc`` occupies the physical ``fdot`` slot in
+    the container's ``key_map``, so ``fdot`` sits OUTSIDE ``test_inds`` and
+    ``r``'s only scored target is the dead ``fddot`` slot (identically
+    zero). The information matrix therefore had EXACTLY zero curvature in
+    the ``r`` direction and its eigen step was the prior-box width: a blind
+    jump. Proposing in ``z``, where ``fdot`` is a raw coordinate, is half
+    the fix; the other half is asking the engine for the physical ``fdot``
+    slot in the first place (see ``_infomat_phys_inds`` in
+    ``globalfit/moves/gbspecialstretch.py``).
+    """
+
+    #: ``f0`` is pinned, so it is NOT required in the sampling basis (the
+    #: base's requirement list would reject the reduced basis outright).
+    _REQUIRED = ("dist", "fdot_astro_ratio")
+    _PINNED = ("f0", "Mc")
+    #: Documented default layout (``VGB_CHIRP_MASS_BASIS=0``). The instance
+    #: attribute is DERIVED in ``__init__`` from the actual basis, so the
+    #: chirp-mass variant grows its ``Mc`` column (and its fiber) back
+    #: without a second class.
+    INTERNAL_BASIS = ("lnA", "fdot", "phi0", "cos_iota", "psi")
+    FIBER_INDEX = None
+
+    # NOTE: ``shear`` is accepted (inherited signature, one construction
+    # path) and never consulted -- with ``f0`` pinned there is no ``f_mid``
+    # column for it to act on, so ``_c_t`` is unreachable in this layout.
