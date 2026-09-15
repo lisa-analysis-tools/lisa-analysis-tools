@@ -427,8 +427,9 @@
 
 # ---- fill these in ---------------------------------------------------------
 #SBATCH --job-name=gf6mo_null        # job name
-#SBATCH --partition=gpu-80-spot   # GPU partition
-#SBATCH --gres=gpu:2              # 2 GPUs (GPUS=0,1 below are LOCAL indices)
+#SBATCH --partition=gpu-80-spot   # DEFAULT partition (2-GPU flow); the
+                                  # NGPUS self-dispatch below overrides it
+#SBATCH --gres=gpu:2              # DEFAULT 2 GPUs (GPUS below are LOCAL indices)
 #SBATCH --nodes=1                 # single node
 #SBATCH --ntasks=3                # main + stopped spare + SAVER rank (mpiexec -n 3)
 #SBATCH --cpus-per-task=2
@@ -438,6 +439,27 @@
 # ----------------------------------------------------------------------------
 
 set -euo pipefail
+
+# ---- GPU-count self-dispatch (2026-09-14 user ruling, same as the main
+# ---- 6mo script: 2 -> gpu-80-spot, 4 -> gpu-160-spot) ----------------------
+# #SBATCH lines are static, so run this script DIRECTLY to pick the count:
+#     NGPUS=4 ./submit_gf_6mo_v8_nogb_null.sh   # gpu-160-spot, gpu:4
+#     NGPUS=2 ./submit_gf_6mo_v8_nogb_null.sh   # gpu-80-spot,  gpu:2
+#     sbatch  ./submit_gf_6mo_v8_nogb_null.sh   # header defaults (2 GPUs)
+# In-job GPUS derives from SLURM_GPUS_ON_NODE, so manual sbatch overrides
+# also work. (The null test's readout prints minutes after setup either
+# way -- 4 GPUs only shortens the sampling that follows it.)
+if [ -z "${SLURM_JOB_ID:-}" ]; then
+  NGPUS=${NGPUS:-2}
+  case "${NGPUS}" in
+    2) _NGPU_PART=gpu-80-spot ;;
+    4) _NGPU_PART=gpu-160-spot ;;
+    *) echo "[SUBMIT] NGPUS=${NGPUS} unsupported (2 or 4)."; exit 2 ;;
+  esac
+  echo "[SUBMIT] NGPUS=${NGPUS} -> sbatch --partition=${_NGPU_PART} --gres=gpu:${NGPUS}"
+  exec sbatch --partition="${_NGPU_PART}" --gres="gpu:${NGPUS}" \
+       --export=ALL,NGPUS="${NGPUS}" "$0" "$@"
+fi
 
 # ---- environment (fill in your activation) ---------------------------------
 # module load FILLME_cuda_module
@@ -544,7 +566,13 @@ export PROGRESS=0
 export MOJITO_DATA_PATH=/shared/data/mojito_cache
 export USE_GPU=1
 export GPU_BACKEND=cuda13x
-export GPUS=0,1
+# GPU list follows what slurm actually granted (self-dispatch above).
+_NGPUS_EFF=${SLURM_GPUS_ON_NODE:-${NGPUS:-2}}
+# printf join, NOT `seq -s,` (BSD seq trails a separator the GPUS parser
+# would choke on).
+GPUS=$(printf ",%d" $(seq 0 $((_NGPUS_EFF - 1)))); GPUS=${GPUS:1}
+export GPUS
+echo "[GPUS] ${_NGPUS_EFF} GPUs -> GPUS=${GPUS} (partition ${SLURM_JOB_PARTITION:-n/a})"
 
 # ---- output ----------------------------------------------------------------
 export FILE_STORE_DIR=${STORE_DIR}

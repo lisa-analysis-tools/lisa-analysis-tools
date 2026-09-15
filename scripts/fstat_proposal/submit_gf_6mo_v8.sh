@@ -2253,9 +2253,26 @@ export SOBBH_NUM_PROP_REPEATS=25
 export MBH_PERMUTE_EVERY=10
 export EMRI_PERMUTE_EVERY=10
 export SOBBH_PERMUTE_EVERY=10
-export MBH_START_FACTOR=1e-8
-export EMRI_START_FACTOR=1e-8
-export SOBBH_START_FACTOR=1e-8
+# EXACT-TRUTH STARTS + NO SOURCE_SEARCH STAGE (user ruling 2026-09-14
+# late): "start all the emri, mbh, vgb, sobhb at the true points exactly
+# ... they switched to the eigen proposal, we do not [need] a spread like
+# with the stretch proposal." *_START_FACTOR=0 is exact truth (the
+# run.py seeders are x*(1+f*randn), no floor; VGB's additive ratio
+# jitter also scales by its factor, so 0 = exact truth-null there too).
+# With nothing to converge, the source_search stage is SKIPPED: sources
+# are subtracted at truth from setup_acs onward, sit frozen through the
+# noise stages, and their eigen PE proposals run only in gb_search +
+# full_pe (where they already ride).
+# ⚠ VGB caveat: this script pins VGB_INMODEL_PROPOSAL=stretch, and a
+# stretch ensemble started with ZERO spread can never move -- VGB stays
+# frozen at exact truth (a perfect subtraction; degenerate VGB
+# posteriors). Flip VGB_INMODEL_PROPOSAL=eigen if VGB should actually
+# sample from identical starts.
+export STAGE_SKIP_SOURCE_SEARCH=1
+export MBH_START_FACTOR=0.0
+export EMRI_START_FACTOR=0.0
+export SOBBH_START_FACTOR=0.0
+export VGB_START_FACTOR=0.0
 # SOBBH chunked scoring width: converged value (S3 ruling; the 11-h-layer
 # stress result -- cheap insurance on this 1-h-layer production grid too).
 export SOBBH_M_BAND_HALF_WIDTH=3

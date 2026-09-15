@@ -122,6 +122,10 @@ Key env knobs
                          =0 removes it (stage lists bit-identical to the
                          pre-replace runs). full_pe is NOT touched.
     STAGE_SKIP_NOISE=1   start at stage 2 (noise already converged)
+    STAGE_SKIP_SOURCE_SEARCH=1  no source_search stage: armed sources
+                         start (and stay subtracted) at their seeded
+                         coords; source proposals only in gb_search +
+                         full_pe (exact-truth-start flow, 2026-09-14)
     STAGE_NOISE_ONLY=1   run only the two noise search stages, then stop
     STAGE_NOISE_VGB_PE=1 searches, then PE-sample psd+galfor+vgb (no GB);
                          bounded by NUM_ITERATIONS
@@ -746,7 +750,27 @@ def build_fit():
                 if br in armed_sources]
 
     stages = []
-    if armed_sources:
+    _skip_src_search = _env_flag("STAGE_SKIP_SOURCE_SEARCH")
+    if _skip_src_search and not armed_sources:
+        raise ValueError(
+            "STAGE_SKIP_SOURCE_SEARCH=1 but no source branches are armed "
+            "(MBHB_IDS/EMRI_IDS/SOBHB_IDS empty) -- there is no "
+            "source_search stage to skip."
+        )
+    if armed_sources and _skip_src_search:
+        # User ruling 2026-09-14 late: with exact-truth starts
+        # (*_START_FACTOR=0, valid now that the source inner moves are
+        # eigen rather than stretch and need no ensemble spread) there is
+        # nothing for the joint source search to converge. The sources
+        # stay SUBTRACTED the whole time exactly as before -- their
+        # templates enter the residual at setup_acs from the state
+        # coords -- and their PE proposals run only where they already
+        # ride: gb_search and full_pe.
+        print("[combined] STAGE_SKIP_SOURCE_SEARCH=1: no source_search "
+              "stage; sources subtracted at their start coords through "
+              "the noise stages, proposals armed in gb_search + full_pe.",
+              flush=True)
+    if armed_sources and not _skip_src_search:
         # SOURCE SEARCH FIRST (campaign S6: "MBH search first, full_year
         # pattern"): the armed source branches converge under ONE joint
         # max-lnL criterion before anything else runs, so their (loud)

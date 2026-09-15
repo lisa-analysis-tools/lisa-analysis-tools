@@ -31,7 +31,8 @@ ALL_IDS = {"MBHB_IDS": "2,5,16,18",
            "EMRI_IDS": "0,1,2,3,4,5,6,7",
            "SOBHB_IDS": "0,1,2,3,4,5"}
 SRC_ENVS = tuple(ALL_IDS) + ("SOURCE_TYPES",)
-STAGE_ENVS = ("GB_ONLY", "STAGE_SKIP_NOISE", "STAGE_NOISE_ONLY",
+STAGE_ENVS = ("GB_ONLY", "STAGE_SKIP_NOISE", "STAGE_SKIP_SOURCE_SEARCH",
+              "STAGE_NOISE_ONLY",
               "STAGE_NOISE_VGB_PE", "COMBINED_SMOKE", "TOBS_TARGET",
               "GB_WARM_START_COMPONENTS", "REMOVE_BRANCHES")
 
@@ -108,6 +109,30 @@ class StagedSourcesWiringTest(unittest.TestCase):
                              f"{stage}: {names}")
             self.assertIn("rj_fstat_search" if stage == "gb_search"
                           else "rj_fstat_pe", names)
+
+    def test_skip_source_search_keeps_moves_in_gb_stages(self):
+        # User ruling 2026-09-14 late: with exact-truth starts
+        # (*_START_FACTOR=0) there is nothing for the joint source search
+        # to converge -- sources stay SUBTRACTED throughout (templates
+        # ride the residual from setup) and their proposals run only in
+        # gb_search + full_pe.
+        os.environ.update(ALL_IDS)
+        os.environ["STAGE_SKIP_SOURCE_SEARCH"] = "1"
+        fit = _build_fit()
+        stages = self._stages(fit)
+        self.assertEqual(list(stages),
+                         ["noise_search", "noise_vgb_search",
+                          "gb_search", "full_pe"])
+        for mv in ("sobbh_pe", "mbh_pe", "emri_pe"):
+            self.assertIn(mv, stages["gb_search"])
+            self.assertIn(mv, stages["full_pe"])
+
+    def test_skip_source_search_without_sources_is_refused(self):
+        # the flag has no stage to skip when nothing is armed -- refuse
+        # rather than silently no-op (the STAGE_* flag convention).
+        os.environ["STAGE_SKIP_SOURCE_SEARCH"] = "1"
+        with self.assertRaises(ValueError):
+            _build_fit()
 
     def test_partial_arming_mbh_only(self):
         os.environ["MBHB_IDS"] = "2,5"
