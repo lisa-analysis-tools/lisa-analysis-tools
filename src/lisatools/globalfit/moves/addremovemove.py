@@ -6,6 +6,7 @@ import inspect
 import logging
 import os
 import time
+import warnings
 from copy import deepcopy
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
@@ -1394,28 +1395,31 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         path when active, else the container path with the engine-installed
         generator and ``waveform_like_kwargs``. This recomputes the SAME
         current-state points through :meth:`compute_acs_like` with the move's
-        OWN generator and ``source_only=True`` (the resurrected intent of the
-        original commented validation). Any bookkeeping drift between the
-        residual state and the scoring path — the failure mode that silently
-        walks a chain away from truth — shows up here as a per-point
-        difference. Default mode warns loudly; ``{BRANCH}_CHECK_LL=strict``
-        raises; ``0`` disables; ``{BRANCH}_CHECK_LL_EVERY=N`` thins the cost.
+        OWN generator and the move's own ``waveform_like_kwargs`` VERBATIM —
+        the same convention ``compute_like`` applies. It must NEVER force
+        ``source_only=True``: on runs with a sampled psd branch the full lnL
+        carries a walker-indexed noise term (~1e8 here), so a forced
+        source-only recompute differs by exactly that per-walker constant and
+        the old pooled-spread gate read the WALKER-TO-WALKER noise variation
+        (~2e6) as "drift" — 8 false warnings per iteration on the healthy 6mo
+        job 487, verified benign 2026-09-14 (the convention-matched
+        ``_verify_entry_vs_acs`` stayed silent at a 0.1 gate; SOBBH's
+        override predates this fix for the same reason).
 
-        A CONSTANT per-walker offset (identical across temperatures) can also
-        arise from a benign ``source_only`` convention mismatch — the warning
-        distinguishes the two by reporting the spread of the difference in
-        addition to its maximum.
+        The gate is the WITHIN-walker spread — the difference varying across
+        temperatures of ONE walker. Real residual/scoring bookkeeping drift
+        (the failure mode that silently walks a chain away from truth) shows
+        up there; ANY per-walker-constant convention offset (e.g. the DCGA
+        replica path's source-only lnL) cancels out of it identically.
+        Default mode warns loudly; ``{BRANCH}_CHECK_LL=strict`` raises; ``0``
+        disables; ``{BRANCH}_CHECK_LL_EVERY=N`` thins the cost.
         """
-        like_kwargs = {
-            k: v for k, v in self.waveform_like_kwargs.items() if k != "source_only"
-        }
         acs_like = (
             self.compute_acs_like(
                 old_coords_in,
                 data_index=data_index_in,
                 signal_gen=self.waveform_gen,
-                source_only=True,
-                **like_kwargs,
+                **self.waveform_like_kwargs,
             )
             .reshape(prev_logl.shape)
             .real
@@ -1428,18 +1432,32 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         )
         if not np.any(both):
             return
-        diff = prev_logl[both] - acs_like[both]
-        max_abs = float(np.abs(diff).max())
-        if max_abs <= 1e-1:
+        diff_full = np.where(both, prev_logl - acs_like, np.nan)
+        with warnings.catch_warnings():
+            # all-NaN walker columns are fine (fully invalid walkers)
+            warnings.simplefilter("ignore", RuntimeWarning)
+            within = np.nanmax(diff_full, axis=0) - np.nanmin(diff_full, axis=0)
+            within_max = float(np.nanmax(np.nan_to_num(within, nan=0.0)))
+        max_abs = float(np.abs(diff_full[both]).max())
+        if within_max <= 1e-1:
+            # No within-walker drift. A residual constant offset per walker
+            # is a convention difference (source-only replica paths), not a
+            # bookkeeping bug — record it quietly for forensics only.
+            if max_abs > 5.0:
+                logger.debug(
+                    "%s leaf %s: prev_logl vs ACS differ by a per-walker "
+                    "CONSTANT (max|diff|=%.3e, within-walker spread %.3e) — "
+                    "convention offset, not drift.",
+                    self.branch_name, leaf, max_abs, within_max,
+                )
             return
-        spread = float(diff.max() - diff.min())
         msg = (
             f"{self.branch_name} leaf {leaf}: prev_logl (move scoring path) vs "
-            f"ACS container path disagree: max|diff|={max_abs:.6e}, "
-            f"spread={spread:.6e} over {int(both.sum())} points. A large SPREAD "
-            "means residual/scoring bookkeeping drift (real bug); a constant "
-            "offset (spread ~ 0) can be a benign source_only convention "
-            "difference."
+            f"ACS container path show WITHIN-WALKER drift: max per-walker "
+            f"spread={within_max:.6e} across temperatures "
+            f"(max|diff|={max_abs:.6e} over {int(both.sum())} points). This is "
+            "residual/scoring bookkeeping drift (real bug) — per-walker "
+            "constant conventions cannot produce it."
         )
         if self.check_ll_mode == "strict":
             raise ValueError(msg)
