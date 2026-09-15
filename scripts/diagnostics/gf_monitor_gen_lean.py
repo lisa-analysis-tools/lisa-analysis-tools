@@ -14,6 +14,10 @@
 #      extract's keep-window instead of drawing zero-filled rows.
 #   4. completeness panel y-limit 0-100 (0-60 clipped every arm above 60%).
 #   5. lnL panel title uses the real walker count.
+#   6. the two pooled-sample windows are env knobs (GF_MONITOR_POOL_ITS /
+#      GF_MONITOR_POOL_ITS_POSTERIOR) and no longer share a value: the
+#      corner window defaults to 300, the scatter window stays at 30. They
+#      answer to different limits -- see the POOLED SAMPLE WINDOWS block.
 # Run from a directory holding gb_truth_3to21.npz, kappa_grid.npz and the
 # gf_arm_*.npz caches; set GF_MONITOR_MATCH_STATS=1 for the match panels.
 """GF run status page: <run_dir> -> one self-contained HTML file.
@@ -300,12 +304,27 @@ gb_alive_last = g["inds/gb"][NIT-1, 0, 0]           # (24, 10000)
 # Pooling the last few stored iterations makes each panel the thing the
 # reader already believes they are looking at.
 #
-# Two windows, deliberately different:
-#   * POOL_ITS_SAMPLES    -- scatter / explorer / marginal panels.
-#   * POOL_ITS_POSTERIOR  -- corner plots, which need the extra rows before
-#     their 2-D contours mean anything (this is the window the VGB and GB
-#     corners already used; it is routed through the helper now so every
-#     pooling site in the file reads from ONE place).
+# Two windows, deliberately different -- they answer to DIFFERENT limits,
+# which is why they must never be tied together (they had both drifted to 30,
+# which is the scatter limit applied to a panel that does not share it):
+#   * POOL_ITS_SAMPLES    -- scatter / explorer / marginal panels. These draw
+#     EVERY alive leaf, so the row count is its x nwalk x nleaves and the
+#     binding limit is PAGE WEIGHT: every row is JSON text in the page, and
+#     anything past EXPL_CAP (150k) is strided away again. Past
+#     ~EXPL_CAP/(nwalk*nleaves) stored iterations you pay the read and the
+#     memory for rows that are then decimated out, and the picture does not
+#     change. On a mature 10-walker 3-month store (~1.1k leaves) that ceiling
+#     is ~13 iterations, so 30 is already generous; raising it is waste.
+#   * POOL_ITS_POSTERIOR  -- corner plots, which draw ONE leaf (or one
+#     frequency-associated group), so the row count is its x nwalk and page
+#     weight is irrelevant. The binding limit is the CORRELATION TIME: the
+#     stored GB chain has tau_int ~ 4-8 stored iterations, so a 30-iteration
+#     window is ~4-8 independent draws per walker (~40-80 rows of real
+#     information behind a 2-D contour). 300 buys ~40-75 per walker, which is
+#     what makes the contours mean anything. This is the window to raise.
+#
+# Both are overridable per invocation (the run being read decides how many
+# rows are actually there): GF_MONITOR_POOL_ITS / GF_MONITOR_POOL_ITS_POSTERIOR.
 #
 # THREE RULES, none of them optional:
 #   1. min(requested, available) -- a store with three written rows pools
@@ -320,8 +339,9 @@ gb_alive_last = g["inds/gb"][NIT-1, 0, 0]           # (24, 10000)
 #      coordinates are actually populated. (The full production store this
 #      was validated on is NOT an extract, so the clamp is a no-op there;
 #      it exists because the same generator is pointed at extracts.)
-POOL_ITS_SAMPLES = 30
-POOL_ITS_POSTERIOR = 30
+POOL_ITS_SAMPLES = max(1, int(os.environ.get("GF_MONITOR_POOL_ITS", 30)))
+POOL_ITS_POSTERIOR = max(
+    1, int(os.environ.get("GF_MONITOR_POOL_ITS_POSTERIOR", 300)))
 EXTRACT_STORE = "_extract" in os.path.basename(h5path)
 _POOL_FLOOR = {}
 
@@ -2915,9 +2935,11 @@ VGB_POST_JSON = json.dumps({
 # plots too (2026-08-20), so both selectors are now image swaps.
 #
 # Samples: the last POOL_ITS_POSTERIOR stored iterations x every cold walker
-# (~240 rows), wider than the POOL_ITS_SAMPLES window the scatter/marginal
-# panels use -- a corner needs the extra rows for its 2-D contours to mean
-# anything. Both windows come from the shared pooling helper.
+# (300 x nwalk where the store has the rows), an order of magnitude wider than
+# the POOL_ITS_SAMPLES window the scatter/marginal panels use -- a corner draws
+# one leaf, so it pays no page weight for the extra rows, and at tau_int ~ 4-8
+# stored iterations it needs them before its 2-D contours mean anything. Both
+# windows come from the shared pooling helper.
 VGB_CORNER_ROWS = _vgb_pool_rows(POOL_ITS_POSTERIOR)
 CORNER_ITS = int(VGB_CORNER_ROWS.size)
 CORNER_DPI, CORNER_IN = 68, 7.0        # size-budget tuned (see below)
