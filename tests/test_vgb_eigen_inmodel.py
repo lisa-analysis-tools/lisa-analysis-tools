@@ -99,26 +99,27 @@ class GenericAxesFromInfoTest(unittest.TestCase):
 
 
 class VGBInmodelDefaultsTest(unittest.TestCase):
-    def test_default_is_the_legacy_stretch(self):
-        # LIVE-CAMPAIGN GUARD: 3mo_v8 / 1yr_v8 submit scripts predate the
-        # knob, so the unset-env default MUST be the pre-eigen pure-stretch
-        # config — eigen is an explicit opt-in until its arming gate
-        # (VGB sig-het accuracy / chunked cost probe) clears
+    def test_default_is_eigen(self):
+        # USER RULING 2026-09-15 ("yes make that the default. the eigen
+        # proposal"): the unset-env default arms the info-matrix eigen
+        # draw. The former stretch default was a live-campaign guard for
+        # runs whose scripts predate the knob; those runs pin
+        # VGB_INMODEL_PROPOSAL=stretch explicitly if they must not change.
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("VGB_INMODEL_PROPOSAL", None)
             kw = {}
             _vgb_inmodel_defaults(kw)
-        self.assertFalse(kw["use_info_mat_proposal"])
-        self.assertEqual(kw["stretch_probability"], 1.0)
+        self.assertTrue(kw["use_info_mat_proposal"])
+        self.assertEqual(kw["stretch_probability"], 0.0)
 
-    def test_env_arms_eigen(self):
+    def test_env_stretch_escape(self):
         with mock.patch.dict(
-            os.environ, {"VGB_INMODEL_PROPOSAL": "eigen"}
+            os.environ, {"VGB_INMODEL_PROPOSAL": "stretch"}
         ):
             kw = {}
             _vgb_inmodel_defaults(kw)
-        self.assertTrue(kw["use_info_mat_proposal"])
-        self.assertEqual(kw["stretch_probability"], 0.0)
+        self.assertFalse(kw["use_info_mat_proposal"])
+        self.assertEqual(kw["stretch_probability"], 1.0)
 
     def test_explicit_kwargs_win(self):
         with mock.patch.dict(
@@ -130,7 +131,8 @@ class VGBInmodelDefaultsTest(unittest.TestCase):
         self.assertFalse(kw["use_info_mat_proposal"])
         self.assertEqual(kw["stretch_probability"], 0.25)
 
-    def test_unknown_value_warns_and_stays_stretch(self):
+    def test_unknown_value_warns_and_falls_to_the_default(self):
+        # junk falls to the DEFAULT (eigen since 2026-09-15), loudly
         with mock.patch.dict(
             os.environ, {"VGB_INMODEL_PROPOSAL": "banana"}
         ):
@@ -140,7 +142,7 @@ class VGBInmodelDefaultsTest(unittest.TestCase):
                 level="WARNING",
             ):
                 _vgb_inmodel_defaults(kw)
-        self.assertFalse(kw["use_info_mat_proposal"])
+        self.assertTrue(kw["use_info_mat_proposal"])
 
 
 class VGBEigenDrawTest(unittest.TestCase):

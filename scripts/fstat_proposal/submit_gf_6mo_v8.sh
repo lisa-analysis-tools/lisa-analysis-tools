@@ -2094,22 +2094,21 @@ export VGB_CHIRP_MASS_BASIS=0
 # with the matching "8" argument (it recreates every rung-dimensioned
 # vgb dataset: temps ladder, counters zeroed, 7 swap pairs).
 export VGB_NTEMPS=8
-# VGB IN-MODEL PROPOSAL -- DELIBERATE DIVERGENCE FROM THE NEW CODE DEFAULT
-# (which is =eigen since 2026-09-05: per-block EXACT per-(temp,walker,leaf)
-# information matrices + a generic one-axis eigen draw, stretch fallback on
-# any factor failure). Pinned =stretch FOR THIS RUN because:
-#   (a) VGB_SIGHET_INMODEL=0 above (loud-VGB sig-het accuracy unverified)
-#       forces the matrices through the CHUNKED engine at ~29-46 ms per
-#       source INSTANCE, and VGB has 55 leaves x 8 rungs x 10 walkers
-#       ~ 4.4k instances ~ 2-3.5 min of factor builds EVERY vgb propose;
-#       with the sig-het route validated that drops ~12-19x (~11-17 s).
-#   (b) the vgb reduced-basis factor path has ZERO cluster exposure (it
-#       degrades to stretch with one warning, but the build attempts are
-#       then pure cost).
-# ARMING GATE: validate VGB_SIGHET_INMODEL=1 at the loudest-VGB SNRs (or
-# accept the chunked cost on a probe first), then delete this pin or set
-# =eigen. =stretch is bit-identical to the pre-eigen pure-stretch config.
-export VGB_INMODEL_PROPOSAL=stretch
+# VGB IN-MODEL PROPOSAL = EIGEN (user ruling 2026-09-15: "make that the
+# default. the eigen proposal" -- the CODE default flipped the same day):
+# per-block EXACT per-(temp,walker,leaf) information matrices + the
+# generic one-axis eigen draw, graceful stretch fallback on any factor
+# failure. REQUIRED by the exact-truth flow above: VGB_START_FACTOR=0
+# gives a zero-spread ensemble that a stretch draw could never move.
+# COST (accepted): VGB_SIGHET_INMODEL=0 above routes the matrices
+# through the CHUNKED engine at ~29-46 ms/instance x (55 leaves x 8
+# rungs x 10 walkers ~ 4.4k instances) ~ 2-3.5 min of factor builds per
+# vgb propose; validating VGB_SIGHET_INMODEL=1 at the loudest-VGB SNRs
+# drops that ~12-19x (~11-17 s) and remains the standing optimization.
+# THIS RUN IS THE FIRST CLUSTER EXPOSURE of the vgb factor path -- watch
+# the first vgb_pe [GF_TIMING] wall and any "vgb eigen ... falling back
+# to stretch" warnings. =stretch remains the bit-identical legacy escape.
+export VGB_INMODEL_PROPOSAL=eigen
 # GB rung count. 24 is already the code default (stock/erebor/gb.py
 # env_default("GB_NTEMPS", 24)) -- pinned here anyway because the rung count
 # is the one knob whose failure mode is completely silent: resume derives it
@@ -2263,11 +2262,9 @@ export SOBBH_PERMUTE_EVERY=10
 # are subtracted at truth from setup_acs onward, sit frozen through the
 # noise stages, and their eigen PE proposals run only in gb_search +
 # full_pe (where they already ride).
-# ⚠ VGB caveat: this script pins VGB_INMODEL_PROPOSAL=stretch, and a
-# stretch ensemble started with ZERO spread can never move -- VGB stays
-# frozen at exact truth (a perfect subtraction; degenerate VGB
-# posteriors). Flip VGB_INMODEL_PROPOSAL=eigen if VGB should actually
-# sample from identical starts.
+# VGB pairs with VGB_INMODEL_PROPOSAL=eigen (block below, 09-15 ruling):
+# the eigen draw samples fine from identical starts, so VGB is NOT
+# frozen at truth -- it PE-samples around it from the first propose.
 export STAGE_SKIP_SOURCE_SEARCH=1
 export MBH_START_FACTOR=0.0
 export EMRI_START_FACTOR=0.0

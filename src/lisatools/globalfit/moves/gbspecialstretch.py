@@ -17437,22 +17437,27 @@ class GBSpecialStretchMove(GBSpecialBase):
 def _vgb_inmodel_defaults(kwargs):
     """Apply the ``VGB_INMODEL_PROPOSAL`` env default to a VGB move's kwargs.
 
-    ``stretch`` (DEFAULT): the legacy pure-stretch configuration, identical
-    to the pre-eigen behavior — the default is deliberately the no-change
-    option because live campaigns (3mo_v8, 1yr_v8) pull dev mid-run with
-    submit scripts that predate this knob. ``eigen`` (opt-in): arm the
-    inherited info-matrix machinery (``use_info_mat_proposal=True``) with
-    the one-axis generic eigen draw (``stretch_probability=0.0``); its
-    arming gate is the VGB sig-het accuracy validation (or accepting the
-    chunked per-instance factor cost) — see the 6mo_v8 submit script's
-    VGB block. Explicitly passed kwargs always win (``setdefault``).
+    ``eigen`` (DEFAULT, user ruling 2026-09-15): arm the inherited
+    info-matrix machinery (``use_info_mat_proposal=True``) with the
+    one-axis generic eigen draw (``stretch_probability=0.0``). With
+    exact-truth VGB starts (``VGB_START_FACTOR=0``) a stretch ensemble
+    has zero spread and can never move, so eigen is also the only draw
+    that samples from identical starts. ``stretch`` (escape): the legacy
+    pure-stretch configuration, bit-identical to the pre-eigen behavior
+    — a run that must not change mid-campaign pins
+    ``VGB_INMODEL_PROPOSAL=stretch`` explicitly (the 09-15 flip reversed
+    the earlier live-campaign-guard default). Cost note: with
+    ``VGB_SIGHET_INMODEL=0`` the per-block exact information matrices
+    route through the CHUNKED engine (~29-46 ms/instance; 55 leaves x
+    ntemps x nwalkers instances per propose). Explicitly passed kwargs
+    always win (``setdefault``).
     """
-    kind = os.environ.get("VGB_INMODEL_PROPOSAL", "stretch").strip().lower()
+    kind = os.environ.get("VGB_INMODEL_PROPOSAL", "eigen").strip().lower()
     if kind not in ("eigen", "stretch"):
         logger.warning(
             "VGB_INMODEL_PROPOSAL=%r not recognized (use 'eigen' or "
-            "'stretch'); using 'stretch'", kind)
-        kind = "stretch"
+            "'stretch'); using 'eigen'", kind)
+        kind = "eigen"
     if kind == "eigen":
         kwargs.setdefault("use_info_mat_proposal", True)
         kwargs.setdefault("stretch_probability", 0.0)
@@ -17467,8 +17472,8 @@ class VGBSpecialStretchMove(GBSpecialBase):
 
     Fixed-dimensional (``nleaves_min == nleaves_max``, leaf i = one specific
     physical source at every walker/temperature), NO RJ. Two proposal
-    components, selected by ``VGB_INMODEL_PROPOSAL`` (default ``stretch``
-    — the no-change option for live campaigns; ``eigen`` is the opt-in):
+    components, selected by ``VGB_INMODEL_PROPOSAL`` (default ``eigen``
+    since 2026-09-15; ``stretch`` is the bit-identical legacy escape):
 
     * **eigen** — the inherited GB info-matrix machinery computes a
       per-block EXACT information matrix for every vgb source (the
