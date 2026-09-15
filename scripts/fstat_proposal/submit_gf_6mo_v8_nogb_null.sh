@@ -456,6 +456,15 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
     4) _NGPU_PART=gpu-160-spot ;;
     *) echo "[SUBMIT] NGPUS=${NGPUS} unsupported (2 or 4)."; exit 2 ;;
   esac
+  if [ "${NGPUS}" = "4" ]; then
+    echo "[SUBMIT] ⚠ NGPUS=4 needs a SINGLE node carrying 4 GPUs (the engine"
+    echo "[SUBMIT]   is single-process multi-GPU: one rank drives local CUDA"
+    echo "[SUBMIT]   devices; MPI ranks are roles, not workers -- it CANNOT"
+    echo "[SUBMIT]   span nodes). --nodes=1 stays pinned, so on a partition"
+    echo "[SUBMIT]   with 2-GPU nodes this job will PEND FOREVER rather than"
+    echo "[SUBMIT]   silently waste half the cards. If gpu-160-spot has no"
+    echo "[SUBMIT]   4-GPU nodes, use two 2-GPU jobs instead (main + null)."
+  fi
   echo "[SUBMIT] NGPUS=${NGPUS} -> sbatch --partition=${_NGPU_PART} --gres=gpu:${NGPUS}"
   exec sbatch --partition="${_NGPU_PART}" --gres="gpu:${NGPUS}" \
        --export=ALL,NGPUS="${NGPUS}" "$0" "$@"
