@@ -398,24 +398,33 @@ gb_alive_last = g["inds/gb"][NIT-1, 0, 0]           # (24, 10000)
 # Pooling the last few stored iterations makes each panel the thing the
 # reader already believes they are looking at.
 #
-# Two windows, deliberately different -- they answer to DIFFERENT limits,
-# which is why they must never be tied together (they had both drifted to 30,
-# which is the scatter limit applied to a panel that does not share it):
-#   * POOL_ITS_SAMPLES    -- scatter / explorer / marginal panels. These draw
-#     EVERY alive leaf, so the row count is its x nwalk x nleaves and the
-#     binding limit is PAGE WEIGHT: every row is JSON text in the page, and
-#     anything past EXPL_CAP (150k) is strided away again. Past
-#     ~EXPL_CAP/(nwalk*nleaves) stored iterations you pay the read and the
-#     memory for rows that are then decimated out, and the picture does not
-#     change. On a mature 10-walker 3-month store (~1.1k leaves) that ceiling
-#     is ~13 iterations, so 30 is already generous; raising it is waste.
-#   * POOL_ITS_POSTERIOR  -- corner plots, which draw ONE leaf (or one
-#     frequency-associated group), so the row count is its x nwalk and page
-#     weight is irrelevant. The binding limit is the CORRELATION TIME: the
+# Two windows, deliberately different. THE LINE BETWEEN THEM IS NOT "scatter
+# vs corner" -- it is WHERE THE ROWS END UP, which is the only thing that
+# actually constrains the count:
+#
+#   * POOL_ITS_SAMPLES -- panels whose rows are serialized into the page as
+#     JSON, i.e. the interactive explorer clouds and nothing else. Those draw
+#     EVERY leaf, so the row count is its x nwalk x nleaves and the binding
+#     limit is PAGE WEIGHT: anything past EXPL_CAP (150k) is strided away
+#     again, so past ~EXPL_CAP/(nwalk*nleaves) stored iterations you pay the
+#     read and the memory for rows that are then decimated back out and the
+#     picture does not change. On a mature 10-walker 3-month store (~1.1k
+#     leaves) that ceiling is ~13 iterations; 30 is already generous.
+#
+#   * POOL_ITS_POSTERIOR -- panels RENDERED TO A PNG by fig_b64(): the corner
+#     plots, and equally the VGB credible intervals / distance / SNR / trace /
+#     marginal panels and the psd posterior histograms. A rendered panel costs
+#     the page the same bytes whether it pooled 3 rows or 3000, so page weight
+#     says nothing here and the binding limit is the CORRELATION TIME: the
 #     stored GB chain has tau_int ~ 4-8 stored iterations, so a 30-iteration
-#     window is ~4-8 independent draws per walker (~40-80 rows of real
-#     information behind a 2-D contour). 300 buys ~40-75 per walker, which is
-#     what makes the contours mean anything. This is the window to raise.
+#     window is only ~4-8 independent draws per walker. That is what made the
+#     VGB error bars jitter between arms and the 2-D contours look like noise.
+#     300 buys ~40-75 per walker. This is the window to raise.
+#
+# The 2026-08-27 pooling rework put the rendered VGB panels on the SAMPLES
+# window because they sit next to the explorer in the file. They do not share
+# its constraint, and tying them together meant the page-weight ceiling of one
+# panel silently capped the statistics of six others (2026-09-15).
 #
 # Both are overridable per invocation (the run being read decides how many
 # rows are actually there): GF_MONITOR_POOL_ITS / GF_MONITOR_POOL_ITS_POSTERIOR.
@@ -766,10 +775,15 @@ fig_b64(fig, "psd_trace")
 
 fig, ax = plt.subplots(1, 2, figsize=(11, 2.9))
 for j, (name, inj) in enumerate([("Soms_d", SOMS_INJ), ("Sa_a", SA_INJ)]):
-    v = psd_cold[-min(3, SUB_NIT):, :, j].ravel()
+    # Same argument as the VGB panels: this is a rendered PNG, so the row
+    # count is free, and a 3-iteration window was ~1 independent draw per
+    # walker. The psd chains are NOT last-K in the extract (they carry full
+    # history), so the posterior window is always available here.
+    _psd_its = min(POOL_ITS_POSTERIOR, SUB_NIT)
+    v = psd_cold[-_psd_its:, :, j].ravel()
     ax[j].hist(v, bins=24, color=CYAN, alpha=0.85)
     ax[j].axvline(inj, color=RED, lw=1.4, ls=":")
-    ax[j].set_title(f"{name} posterior (last {min(3,NIT)} iters x 24 walkers)")
+    ax[j].set_title(f"{name} posterior (last {_psd_its} iters x {nwalk} walkers)")
 fig_b64(fig, "psd_hist")
 
 fig, ax = plt.subplots(1, 5, figsize=(14, 2.7))
@@ -2614,11 +2628,22 @@ if TRU is not None:
 # with nothing distinguishing them -- a reader inevitably read the flat ones
 # as failures of the fit rather than as an absence of signal. The headline
 # panel is therefore the detectable subset; the rest are stated, not plotted.
-# POOLED (2026-08-27): was a hard-coded 3-iteration window; it is now the
-# shared POOL_ITS_SAMPLES window, so every VGB sample panel below (the
-# detectable-subset credible intervals, the full-55 distance panel, the
-# pooled marginals and the zoomable posterior cloud) draws the same rows.
-VGB_SAMP_ROWS = _vgb_pool_rows(POOL_ITS_SAMPLES)
+# POOLED (2026-08-27): was a hard-coded 3-iteration window; it became the
+# shared POOL_ITS_SAMPLES window, so every VGB sample panel below drew the
+# same rows as the explorer cloud.
+#
+# RE-SPLIT (2026-09-15): that lumped two panels with OPPOSITE constraints.
+# Everything below here -- the detectable-subset credible intervals, the
+# full-55 distance panel, the SNR panel, the traces, the pooled marginals --
+# is RENDERED TO A PNG by fig_b64(), so its row count costs the page nothing
+# and the only thing that matters is how many INDEPENDENT draws are behind a
+# median and its 16/84 band. At tau_int ~ 4-8 stored iterations a 30-row
+# window is ~4-8 of them per walker, which is what made these error bars
+# jitter between arms. They take the POSTERIOR window, like the corners.
+# POOL_ITS_SAMPLES keeps only the one panel it was really sized for: the
+# explorer's VGB cloud further down, where every row is JSON text in the page.
+# Cost of the wider window here is (300, nwalk, 55, 5) float64 ~ 6.6 MB.
+VGB_SAMP_ROWS = _vgb_pool_rows(POOL_ITS_POSTERIOR)
 VGB_SAMP_ITS = int(VGB_SAMP_ROWS.size)
 vgb_last = vgb_c[VGB_SAMP_ROWS].reshape(-1, 55, 5)       # (S, 55, 5)
 snr = np.sqrt(np.clip(np.nanmean(vgb_hh[-1], axis=0), 0, None))  # (55,)
@@ -2838,9 +2863,15 @@ EXPL_DEC_NOTE = ("" if EXPL_STRIDE <= 1 else
 print(f"[explorer] GB cloud: {EXPL_RAW} alive-leaf rows pooled over "
       f"{EXPL_ITS} stored iteration(s) x {nwalk} cold walkers; "
       f"{len(expl['gb'])} drawn (stride {EXPL_STRIDE}).")
-# The VGB side of the explorer pools the same window (fixed-dimension branch,
-# so every leaf contributes one row per pooled iteration per walker).
-_Spool = vgb_c[VGB_SAMP_ROWS]                        # (P, 24, 55, 5)
+# The VGB side of the explorer pools the SAMPLES window, not the wider one the
+# rendered VGB panels above use: this branch is fixed-dimension, so every leaf
+# contributes one row per pooled iteration per walker (its x nwalk x 55) and
+# every one of those rows is JSON text in the page. At 30 x 10 x 55 that is
+# 16.5k rows; the posterior window would make it 165k, i.e. the explorer's
+# whole EXPL_CAP budget spent on the 55 VGBs before a single GB is drawn.
+VGB_EXPL_ROWS = _vgb_pool_rows(POOL_ITS_SAMPLES)
+VGB_EXPL_ITS = int(VGB_EXPL_ROWS.size)
+_Spool = vgb_c[VGB_EXPL_ROWS]                        # (P, nwalk, 55, 5)
 for _p in range(_Spool.shape[0]):
     S = _Spool[_p]                                   # (24, 55, 5)
     for w in range(nwalk):
@@ -2848,7 +2879,7 @@ for _p in range(_Spool.shape[0]):
             _x = float(VGB_F0[leaf]) if VGB_F0 is not None else int(leaf)
             expl["vgb"].append([_x, float(1.0 / max(S[w, leaf, 0], 1e-6)),
                                 float(snr[leaf])])
-expl["vgb_its"] = int(VGB_SAMP_ITS)
+expl["vgb_its"] = int(VGB_EXPL_ITS)
 expl["vgb_axis"] = "f0 [mHz] (catalogue)" if VGB_F0 is not None else "VGB leaf index"
 
 # ---- GB catalogue truth cloud for the explorer (Task 3) -------------------
@@ -4333,7 +4364,7 @@ function viewCtl(px, cv, api) {{
   let showT = TRUTH.length > 0;
   const baseCap = (hasGB
     ? `GB samples: ${{DATA.gb.length}} alive-source rows pooled over the last ${{DATA.gb_its}} stored iterations x all cold walkers${{DATA.gb_stride > 1 ? ` (1-in-${{DATA.gb_stride}} of ${{DATA.gb_raw}} for page weight)` : ""}}; y = log10 amplitude from (dist, f0, Mc).`
-    : `No GB sources alive yet - showing the 55 VGBs (${{DATA.vgb_its}} stored iterations x 24 walker samples each) as 1/dist vs leaf index. GB samples take over automatically once births land.`);
+    : `No GB sources alive yet - showing the 55 VGBs (${{DATA.vgb_its}} stored iterations x {nwalk} walker samples each) as 1/dist vs leaf index. GB samples take over automatically once births land.`);
   const setCap = () => {{
     cap.textContent = baseCap + (TRUTH.length
       ? (showT ? " " + (DATA.truth_cap || "") : ` ${{TRUTH.length}} catalogue truth points available - press "show catalogue truths".`)
