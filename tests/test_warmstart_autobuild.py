@@ -266,3 +266,59 @@ class RecipeWiringTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RefereeOrbitSourceTest(unittest.TestCase):
+    """match_referee's orbit-source L1 file resolves from MOJITO_DATA_PATH
+    (the same env every run exports) -- the 6mo launch died on a
+    hardcoded laptop dev-cache path. GB brick preferred, COMBINED stream
+    fallback, loud error naming what was tried."""
+
+    def _tree(self, d, gb=False, combined=False):
+        if gb:
+            p = os.path.join(d, "data", "GB", "L1")
+            os.makedirs(p, exist_ok=True)
+            open(os.path.join(p, "GB_test_source0_0.h5"), "wb").close()
+        if combined:
+            p = os.path.join(d, "data", "COMBINED", "L1")
+            os.makedirs(p, exist_ok=True)
+            open(os.path.join(p, "mojito_light_x.h5"), "wb").close()
+
+    def test_gb_brick_preferred(self):
+        import tempfile
+
+        from lisatools.globalfit.warmstart.match_referee import (
+            _orbit_source_file,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            self._tree(d, gb=True, combined=True)
+            with mock.patch.dict(os.environ, {"MOJITO_DATA_PATH": d}):
+                got = _orbit_source_file()
+            self.assertIn(os.path.join("GB", "L1"), got)
+
+    def test_combined_fallback(self):
+        import tempfile
+
+        from lisatools.globalfit.warmstart.match_referee import (
+            _orbit_source_file,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            self._tree(d, gb=False, combined=True)
+            with mock.patch.dict(os.environ, {"MOJITO_DATA_PATH": d}):
+                got = _orbit_source_file()
+            self.assertIn(os.path.join("COMBINED", "L1"), got)
+
+    def test_neither_is_a_loud_error(self):
+        import tempfile
+
+        from lisatools.globalfit.warmstart.match_referee import (
+            _orbit_source_file,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.dict(os.environ, {"MOJITO_DATA_PATH": d}):
+                with self.assertRaises(FileNotFoundError) as cm:
+                    _orbit_source_file()
+            self.assertIn("MOJITO_DATA_PATH", str(cm.exception))

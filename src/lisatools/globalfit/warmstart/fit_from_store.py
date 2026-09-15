@@ -561,9 +561,14 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
         isl_id[order])
 
     try:
+        # provenance: the LAT repo this module runs from (editable src
+        # layout: <repo>/src/lisatools/globalfit/warmstart/), not a
+        # hardcoded checkout path.
+        from pathlib import Path
+
         git_head = subprocess.run(
             ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
-            cwd="/Users/mkatz/Research/lisa_sprint_2026/LISAanalysistools",
+            cwd=str(Path(__file__).resolve().parents[4]),
         ).stdout.strip()
     except Exception:
         git_head = "unknown"

@@ -48,8 +48,37 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 import numpy as np
 
-MOJITO_GB_L1 = ("/Users/mkatz/.mojito_cache/brickmarket/mojito_light_v1_0_0/"
-                "data/GB/L1")
+def _orbit_source_file() -> str:
+    """An L1 file to read ORBITS from, resolved the way the runs resolve
+    data: ``MOJITO_DATA_PATH`` (the env every submit script exports;
+    default the local dev cache) -> the GB brick, else the COMBINED
+    stream file. The 6mo campaign's launch died here on a hardcoded
+    laptop dev-cache path (2026-09-14)."""
+    from lisatools.globalfit.preprocessing import (
+        find_combined_file,
+        find_file,
+    )
+
+    root = os.environ.get(
+        "MOJITO_DATA_PATH",
+        os.path.expanduser(
+            "~/.mojito_cache/brickmarket/mojito_light_v1_0_0"),
+    )
+    tried = []
+    gb = os.path.join(root, "data", "GB", "L1")
+    try:
+        return find_file(gb, "GB", 0)
+    except FileNotFoundError:
+        tried.append(gb)
+    comb = os.path.join(root, "data", "COMBINED", "L1")
+    try:
+        return find_combined_file(comb)
+    except (FileNotFoundError, ValueError):
+        tried.append(comb)
+    raise FileNotFoundError(
+        "warmstart match_referee needs an L1 file to read orbits from; "
+        f"tried {tried} under MOJITO_DATA_PATH={root!r}."
+    )
 DATA_T0 = 97729089.327664  # mojito data start (gb_mojito_match.py REF)
 CIRC = {3: 2.0 * np.pi, 5: np.pi, 6: 2.0 * np.pi}  # sampled-basis periods
 ASSIGN_RADIUS = 6.0        # whitened-sigma junk cut for member assignment
@@ -131,10 +160,9 @@ def assign_members(X, means, covs, island_id, f0_window_edges):
 # ------------------------------------------------------------------
 def build_wave_gen(tobs: float):
     from lisatools.detector import L1Orbits
-    from lisatools.globalfit.preprocessing import find_file
     from gbgpu.gbgpu import GBGPU
 
-    orb = L1Orbits(find_file(MOJITO_GB_L1, "GB", 0),
+    orb = L1Orbits(_orbit_source_file(),
                    force_backend="cpu", frame="icrs")
     pad = 1.0e5
     lt = np.asarray(orb.ltt_t)
