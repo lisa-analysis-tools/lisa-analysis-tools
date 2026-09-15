@@ -37,7 +37,7 @@ from ...domaincomputation import DomainComputationGroupArray
 from ...domains import DomainBase, DomainBaseArray
 from ...utils.utility import asnumpy, get_array_module
 from .. import midit_checkpoint
-from . import eigen_refresh
+from . import eigen_refresh, eigen_table_persist
 from .globalfitmove import GlobalFitMove
 
 logger = logging.getLogger(__name__)
@@ -279,6 +279,14 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         honest (the same adaptive-kernel status the GB in-model tables
         carry: refresh only at block boundaries, never inside the repeat
         sweep).
+
+        The first visit to a leaf looks in the run's eigen-table sidecar
+        first (:mod:`~lisatools.globalfit.moves.eigen_table_persist`), so
+        a restarted process does not repay minutes of information-matrix
+        build per leaf; every build is written back through. That changes
+        NOTHING about detailed balance — the table was already frozen
+        between refreshes, and a frozen symmetric proposal is correct MH
+        whatever point its curvature came from.
         """
         eigen_moves = [m for m in self.moves if isinstance(m, EigenAxisMove)]
         if not eigen_moves:
@@ -287,11 +295,14 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             self._eigen_tables = {}
             self._eigen_visit_count = {}
         leaf = int(leaf)
+        if leaf not in self._eigen_tables:
+            self._adopt_persisted_eigen_table(leaf)
         visits = self._eigen_visit_count.get(leaf, 0)
         self._eigen_visit_count[leaf] = visits + 1
         if (leaf not in self._eigen_tables
                 or visits % self._eigen_refresh_cadence() == 0):
             self._eigen_tables[leaf] = self._build_eigen_table(leaf, work)
+            self._persist_eigen_table(leaf)
         axes, sigmas = self._eigen_tables[leaf]
         if getattr(axes, "ndim", 2) == 4:
             # per-(temp, walker) tables: the red/blue seam installs the
@@ -299,6 +310,116 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             return
         for move in eigen_moves:
             move.set_axes(self.branch_name, axes, sigmas)
+
+    # ------------------------------------------------------------------
+    # eigen table persistence (the sidecar next to the run's store)
+    # ------------------------------------------------------------------
+
+    def _eigen_sidecar_path(self):
+        """Sidecar path for this run, or ``None`` when persistence is off.
+
+        The store path reaches the move layer exactly the way the GB
+        refit move's ``fp`` does: stamped by the builder from
+        ``curr.general_info.main_file_path`` (``eigen_store_path``), with
+        the armed mid-iteration-checkpoint singleton
+        (:func:`~lisatools.globalfit.midit_checkpoint.main_store_path`) as
+        the fallback for moves built outside the recipe. Both are set on
+        the sampling rank only, which is what keeps the writer single.
+        """
+        if not eigen_table_persist.persist_enabled():
+            return None
+        store = getattr(self, "eigen_store_path", None)
+        if not store:
+            store = midit_checkpoint.main_store_path()
+        return eigen_table_persist.sidecar_path(store)
+
+    def _eigen_data_identity(self):
+        """The data's ``df`` (= 1/Tobs), or ``None`` if unreachable.
+
+        A physics guard for the sidecar: a table built against a
+        different observation length is meaningless. Best effort only —
+        domains that do not expose ``df`` leave the guard abstaining
+        (the sidecar path is already run-scoped, so it is belt and
+        braces, not the primary protection).
+        """
+        try:
+            return float(self.acs[0].data_res_arr.df)
+        except Exception:  # noqa: BLE001 — a guard must not raise
+            return None
+
+    def _eigen_persist_guards(self):
+        """The STRICT guard set shared by the load and the write."""
+        return dict(
+            scope=self._eigen_scope(),
+            ndim=int(self.ndim),
+            ntemps=int(self.ntemps),
+            nwalkers=int(self.nwalkers),
+            data_identity=self._eigen_data_identity(),
+        )
+
+    def _note_eigen_expansion_point(self, leaf, x0):
+        """Record where a table was built (sidecar diagnostics only)."""
+        if not hasattr(self, "_eigen_x0"):
+            self._eigen_x0 = {}
+        self._eigen_x0[int(leaf)] = np.asarray(x0, dtype=float).copy()
+
+    def _adopt_persisted_eigen_table(self, leaf):
+        """Reload ``leaf``'s table + visit counter; ``True`` if adopted.
+
+        Adopting the counter as well is what keeps the refresh cadence
+        continuous across a restart: the stored value is the counter as
+        of the last build, so the next refresh lands a cadence interval
+        after that build rather than a cadence interval after the
+        relaunch.
+        """
+        path = self._eigen_sidecar_path()
+        if path is None:
+            return False
+        try:
+            got = eigen_table_persist.load_entry(
+                path, self.branch_name, leaf, **self._eigen_persist_guards()
+            )
+        except Exception as exc:  # never fail a run over its own cache
+            eigen_refresh.logger.warning(
+                "[eigen_refresh] %s leaf %d: eigen-table sidecar read "
+                "failed (%r); rebuilding", self.branch_name, leaf, exc,
+            )
+            return False
+        if got is None:
+            return False
+        axes, sigmas, visits = got
+        self._eigen_tables[leaf] = (axes, sigmas)
+        self._eigen_visit_count[leaf] = int(visits)
+        eigen_refresh.logger.info(
+            "[eigen_refresh] %s leaf %d: adopted the persisted eigen table "
+            "(shape %s, visits %d) from %s — skipping the information-"
+            "matrix build", self.branch_name, leaf,
+            getattr(axes, "shape", None), int(visits), path,
+        )
+        return True
+
+    def _persist_eigen_table(self, leaf):
+        """Write-through the table just built for ``leaf``."""
+        path = self._eigen_sidecar_path()
+        if path is None:
+            return
+        try:
+            axes, sigmas = self._eigen_tables[int(leaf)]
+            entry = eigen_table_persist.make_entry(
+                axes, sigmas,
+                self._eigen_visit_count.get(int(leaf), 0),
+                x0=getattr(self, "_eigen_x0", {}).get(int(leaf)),
+                store_iteration=getattr(self, "_dbg_step", None),
+                **self._eigen_persist_guards(),
+            )
+            eigen_table_persist.save_entry(
+                path, self.branch_name, leaf, entry
+            )
+        except Exception as exc:  # never fail a run over its own cache
+            eigen_refresh.logger.warning(
+                "[eigen_refresh] %s leaf %d: eigen-table sidecar write "
+                "failed (%r); continuing", self.branch_name, leaf, exc,
+            )
 
     def _install_eigen_split_table(self, move_here, leaf, split_mask):
         """Install the (temp, walker)-sliced eigen table for one split.
@@ -373,6 +494,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
                 "(%r); using walker 0", self.branch_name, leaf, exc,
             )
         x0 = cold[best]
+        self._note_eigen_expansion_point(leaf, x0)
 
         def call_ll(x):
             x = np.atleast_2d(x)
@@ -401,6 +523,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             asnumpy(work.coords[:nt, :, leaf]), dtype=np.float64
         ).reshape(nt * nw, -1)
         point_walker = np.tile(np.arange(nw, dtype=np.int32), nt)
+        self._note_eigen_expansion_point(leaf, pts.reshape(nt, nw, -1))
 
         def call_ll(x):
             x = np.atleast_2d(x)

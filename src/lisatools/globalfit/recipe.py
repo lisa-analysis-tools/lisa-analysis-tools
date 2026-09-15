@@ -4061,6 +4061,11 @@ class SingleSourcePEBuilder(SourceMoveBuilder):
         )
         if getattr(info, "info_matrix_gen", None) is not None:
             move.eigen_table_builder = info.info_matrix_gen
+        # where the eigen tables persist to: the same store path the
+        # mid-iteration checkpoint sidecars off (moves.eigen_table_persist),
+        # so a restarted process reloads the tables instead of repaying
+        # minutes of information-matrix build per leaf
+        move.eigen_store_path = getattr(gi, "main_file_path", None)
         move.accepted = np.zeros((ntemps, nwalkers))
         return [], [move]
 

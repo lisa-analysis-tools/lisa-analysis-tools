@@ -47,6 +47,7 @@ __all__ = [
     "checkpoint_path",
     "disarm",
     "load_for_resume",
+    "main_store_path",
     "maybe_write",
     "note_saved",
     "self_test",
@@ -114,6 +115,17 @@ def disarm() -> None:
 def armed() -> bool:
     """Whether this process writes mid-iteration checkpoints."""
     return bool(_STATE["enabled"])
+
+
+def main_store_path() -> typing.Optional[str]:
+    """The run's main HDF backend path, or ``None`` if never armed.
+
+    The single accessor for the store path this process was armed with,
+    for the other sidecars that live next to the same h5 (the eigen
+    proposal tables, ``moves.eigen_table_persist``). Armed on the
+    sampling rank only, so a reader also inherits that rank guard.
+    """
+    return _STATE["main_path"]
 
 
 def note_saved() -> None:
