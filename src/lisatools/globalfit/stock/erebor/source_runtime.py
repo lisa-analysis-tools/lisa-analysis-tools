@@ -733,7 +733,7 @@ EMRI_MODE_SELECTION_THRESHOLD_KEY = "mode_selection_threshold"
 
 
 def apply_emri_mode_selection_threshold(emri) -> typing.Optional[float]:
-    """Resolve the EMRI ``eps`` knob into the PER-CALL waveform kwargs.
+    """Resolve the effective EMRI mode-selection threshold (the ``eps`` knob).
 
     FEW 2.x spells the mode-selection threshold ``mode_selection_threshold``
     (the old ``eps`` name is now swallowed by ``**kwargs`` with no effect),
@@ -743,16 +743,28 @@ def apply_emri_mode_selection_threshold(emri) -> typing.Optional[float]:
     pin in :mod:`lisatools.sources.emri.response` never applies, and the knob
     has to ride the per-call kwargs to have any effect at all.
 
+    RESOLUTION ONLY -- the branch ``waveform_kwargs`` are NEVER stamped
+    (2026-09-15, 6mo production crash). For EMRI that dict doubles as the
+    move's likelihood kwargs (``EMRIMoveBuilder.like_kwargs_from_waveform_kwargs``),
+    and ``inner_product`` has no ``mode_selection_threshold`` parameter, so
+    stamping it killed the run's first likelihood call. Delivery is the wave
+    wrap alone: :func:`source_signal_cfg` carries the value returned here into
+    ``cfg["emri_mode_selection_threshold"]``, and
+    :func:`get_emri_wave_wrap` installs it as the wrap's per-call
+    ``runtime_kwargs`` -- the ONE wrap both the engine-side generator
+    (:class:`SourceSignalGen`, template + residual builds) and the move-side
+    :class:`DeviceLocalWaveGen` resolve through, so it is on every EMRI
+    waveform this run builds.
+
     An explicit ``waveform_kwargs[mode_selection_threshold]`` wins over the
-    ``eps`` field; ``eps=None`` leaves the dict untouched (FEW's default
-    stands). Idempotent, and returns the effective value (None = FEW default)
-    so :func:`source_signal_cfg` can hand the same number to the wave wrap.
+    ``eps`` field; ``eps=None`` means FEW's own default stands. Pure and
+    idempotent; returns ``None`` for "FEW default".
     """
     kwargs = emri.waveform_kwargs if emri.waveform_kwargs is not None else {}
+    if EMRI_MODE_SELECTION_THRESHOLD_KEY in kwargs:
+        return kwargs[EMRI_MODE_SELECTION_THRESHOLD_KEY]
     eps = getattr(emri, "eps", None)
-    if eps is not None:
-        kwargs.setdefault(EMRI_MODE_SELECTION_THRESHOLD_KEY, float(eps))
-    return kwargs.get(EMRI_MODE_SELECTION_THRESHOLD_KEY)
+    return None if eps is None else float(eps)
 
 
 def prepare_emri_branch(emri, general_setup: GeneralSetup, gs):
@@ -804,7 +816,9 @@ def prepare_emri_branch(emri, general_setup: GeneralSetup, gs):
             setattr(emri, lims, None)
     if emri.waveform_kwargs is None:
         emri.waveform_kwargs = dict()
-    apply_emri_mode_selection_threshold(emri)
+    # NOTE: the mode-selection threshold is deliberately NOT stamped here --
+    # see apply_emri_mode_selection_threshold; source_signal_cfg resolves it
+    # and the wave wrap delivers it.
     if emri.inner_moves is None:
         resolve_inner_moves(emri)
     emri.nleaves_max = n

@@ -47,9 +47,13 @@ class EMRISettings(Settings):
     # FEW's own per-call default (1e-5, ``few/waveform/base.py:143``) -- the
     # LAT constructor pin in ``lisatools.sources.emri.response`` does NOT
     # apply, because FEW passes its call-time default to the selector
-    # unconditionally. ``prepare_emri_branch`` threads a set value into
-    # ``waveform_kwargs`` so it rides EVERY likelihood evaluation; an explicit
-    # ``waveform_kwargs["mode_selection_threshold"]`` wins over this field.
+    # unconditionally. A set value is delivered as the per-call
+    # ``runtime_kwargs`` of the EMRI wave wrap (the one wrap both the
+    # engine-side and move-side generators resolve through), NOT through the
+    # branch ``waveform_kwargs`` -- those double as the EMRI move's LIKELIHOOD
+    # kwargs, where this key is a TypeError in ``inner_product``. An explicit
+    # ``waveform_kwargs["mode_selection_threshold"]`` still wins over this
+    # field as the source of the value.
     eps: Optional[float] = dataclasses.field(
         default_factory=env_default("EMRI_EPS", None, float)
     )

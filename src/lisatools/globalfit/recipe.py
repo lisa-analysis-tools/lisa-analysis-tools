@@ -3913,6 +3913,11 @@ class SingleSourcePEBuilder(SourceMoveBuilder):
     #: the subclass while the construction stays shared.
     like_kwargs_from_waveform_kwargs: bool = False
 
+    #: Waveform-only keys this source's branch ``waveform_kwargs`` may carry
+    #: that the LIKELIHOOD path cannot accept. Empty here, so every source
+    #: except the ones that override it assembles an unfiltered copy.
+    like_kwargs_strip_keys: typing.FrozenSet[str] = frozenset()
+
     #: The move class this builder constructs — subclasses override to swap in
     #: a fast-likelihood ResidualAddOneRemoveOneMove subclass.
     move_class: type = ResidualAddOneRemoveOneMove
@@ -3949,6 +3954,35 @@ class SingleSourcePEBuilder(SourceMoveBuilder):
         self.permute_every = permute_every
         self.move_name = move_name
         self.move_kwargs = move_kwargs
+
+    def assemble_gen_kwargs(self, info) -> dict:
+        """The move's WAVEFORM-generation kwargs (an explicit dict wins)."""
+        return (
+            self.waveform_gen_kwargs
+            if self.waveform_gen_kwargs is not None
+            else info.waveform_kwargs
+        ).copy()
+
+    def assemble_like_kwargs(self, info) -> dict:
+        """The move's LIKELIHOOD kwargs (an explicit dict wins).
+
+        :attr:`like_kwargs_strip_keys` is dropped on the way out: these kwargs
+        end up at ``inner_product(**kwargs)`` (via ``compute_like`` ->
+        ``compute_acs_like`` -> ``AnalysisContainer.template_likelihood``),
+        which has no ``**kwargs`` sink, so a waveform-only key in the branch
+        ``waveform_kwargs`` is a TypeError on the run's first likelihood call
+        (the 2026-09-15 6mo crash: ``mode_selection_threshold``). Sources that
+        strip nothing get an unfiltered copy, exactly as before.
+        """
+        if self.waveform_like_kwargs is not None:
+            like_kw = self.waveform_like_kwargs.copy()
+        elif self.like_kwargs_from_waveform_kwargs:
+            like_kw = info.waveform_kwargs.copy()
+        else:
+            return dict()
+        for key in self.like_kwargs_strip_keys:
+            like_kw.pop(key, None)
+        return like_kw
 
     def build(self, engine_info, curr, acs, priors, state):
         info = curr.source_info[self.branch_name]
@@ -4000,17 +4034,8 @@ class SingleSourcePEBuilder(SourceMoveBuilder):
 
         coords_shape = (ntemps, nwalkers, info.nleaves_max, info.ndim)
 
-        wf_gen_kw = (
-            self.waveform_gen_kwargs
-            if self.waveform_gen_kwargs is not None
-            else info.waveform_kwargs
-        ).copy()
-        if self.waveform_like_kwargs is not None:
-            wf_like_kw = self.waveform_like_kwargs.copy()
-        elif self.like_kwargs_from_waveform_kwargs:
-            wf_like_kw = info.waveform_kwargs.copy()
-        else:
-            wf_like_kw = dict()
+        wf_gen_kw = self.assemble_gen_kwargs(info)
+        wf_like_kw = self.assemble_like_kwargs(info)
 
         # Multi-GPU spread (one move structure): hand the run-shared DCGA to
         # the unified move when the generator can be replicated per device —
@@ -4088,6 +4113,13 @@ class EMRIMoveBuilder(SingleSourcePEBuilder):
 
     branch_name = "emri"
     like_kwargs_from_waveform_kwargs = True
+    #: FEW's per-call mode-selection threshold (the ``EMRI_EPS`` knob) is a
+    #: WAVEFORM-build kwarg; it reaches the generator through the wave wrap's
+    #: ``runtime_kwargs`` (``stock.erebor.source_runtime.get_emri_wave_wrap``),
+    #: never through the likelihood. A hand-written
+    #: ``emri.waveform_kwargs["mode_selection_threshold"]`` would otherwise
+    #: ride this branch's like-kwargs into ``inner_product`` and TypeError.
+    like_kwargs_strip_keys = frozenset({"mode_selection_threshold"})
 
 
 class SOBBHMoveBuilder(SingleSourcePEBuilder):

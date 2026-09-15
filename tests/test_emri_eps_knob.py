@@ -81,7 +81,13 @@ class SettingsFieldTest(unittest.TestCase):
 
 
 class EffectiveWaveformKwargsTest(unittest.TestCase):
-    """``apply_emri_mode_selection_threshold`` -- the one resolution point."""
+    """``apply_emri_mode_selection_threshold`` -- the one resolution point.
+
+    It RESOLVES only (2026-09-15 crash fix): the branch ``waveform_kwargs``
+    are never stamped, because for EMRI they double as the move's LIKELIHOOD
+    kwargs and ``inner_product`` has no such parameter. Delivery is the wave
+    wrap's ``runtime_kwargs`` alone (see :class:`RuntimeWiringTest`).
+    """
 
     def setUp(self):
         from lisatools.globalfit.stock.erebor.source_runtime import (
@@ -97,10 +103,11 @@ class EffectiveWaveformKwargsTest(unittest.TestCase):
         self.assertIsNone(self.apply(emri))
         self.assertEqual(emri.waveform_kwargs, {})
 
-    def test_field_threads_into_the_call_kwargs(self):
+    def test_field_resolves_without_stamping_waveform_kwargs(self):
         emri = self.Settings(eps=1e-3, waveform_kwargs=dict())
         self.assertEqual(self.apply(emri), 1e-3)
-        self.assertEqual(emri.waveform_kwargs, {MODE_KEY: 1e-3})
+        # The crash channel: this dict becomes ``waveform_like_kwargs``.
+        self.assertEqual(emri.waveform_kwargs, {})
 
     def test_explicit_waveform_kwargs_wins(self):
         emri = self.Settings(eps=1e-3, waveform_kwargs={MODE_KEY: 5e-4})
@@ -111,7 +118,135 @@ class EffectiveWaveformKwargsTest(unittest.TestCase):
         emri = self.Settings(eps=1e-3, waveform_kwargs=dict())
         self.apply(emri)
         self.assertEqual(self.apply(emri), 1e-3)
-        self.assertEqual(emri.waveform_kwargs, {MODE_KEY: 1e-3})
+        self.assertEqual(emri.waveform_kwargs, {})
+
+    def test_none_waveform_kwargs_is_not_materialized(self):
+        emri = self.Settings(eps=1e-3, waveform_kwargs=None)
+        self.assertEqual(self.apply(emri), 1e-3)
+        self.assertIsNone(emri.waveform_kwargs)
+
+
+class LikeKwargsAssemblyTest(unittest.TestCase):
+    """The 6mo production crash (2026-09-15) and its fix.
+
+    ``EMRIMoveBuilder.like_kwargs_from_waveform_kwargs`` routes the branch
+    ``waveform_kwargs`` into the move's ``waveform_like_kwargs``, which flow
+    ``compute_like`` -> ``compute_acs_like`` ->
+    ``AnalysisContainer.template_likelihood`` -> ``inner_product(**kwargs)``.
+    A waveform-only key in there is a ``TypeError`` at the first likelihood
+    call of the run.
+    """
+
+    def _info(self, **waveform_kwargs):
+        import types
+
+        return types.SimpleNamespace(waveform_kwargs=dict(waveform_kwargs))
+
+    def _builders(self):
+        from lisatools.globalfit.recipe import EMRIMoveBuilder, SOBBHMoveBuilder
+
+        gen = _RecordingGen()
+        return (
+            EMRIMoveBuilder(wave_gen=gen),
+            SOBBHMoveBuilder(wave_gen=gen),
+        )
+
+    def test_emri_like_kwargs_drop_the_waveform_only_key(self):
+        emri_builder, _ = self._builders()
+        info = self._info(**{MODE_KEY: 1e-3})
+        like_kw = emri_builder.assemble_like_kwargs(info)
+        self.assertNotIn(MODE_KEY, like_kw)
+        # ... while the WAVEFORM-side kwargs keep it (and the branch dict is
+        # not mutated as a side effect of assembling either one).
+        self.assertEqual(
+            emri_builder.assemble_gen_kwargs(info), {MODE_KEY: 1e-3}
+        )
+        self.assertEqual(info.waveform_kwargs, {MODE_KEY: 1e-3})
+
+    def test_emri_like_kwargs_keep_every_other_key(self):
+        emri_builder, _ = self._builders()
+        info = self._info(**{MODE_KEY: 1e-3, "complex": True})
+        self.assertEqual(
+            emri_builder.assemble_like_kwargs(info), {"complex": True}
+        )
+
+    def test_sobbh_like_kwargs_are_an_unfiltered_copy(self):
+        """SOBBH shares the flag but strips nothing -- byte-identical."""
+        _, sobbh_builder = self._builders()
+        payload = {MODE_KEY: 1e-3, "complex": True}
+        info = self._info(**payload)
+        self.assertEqual(sobbh_builder.assemble_like_kwargs(info), payload)
+
+    def test_explicit_like_kwargs_are_stripped_too(self):
+        """The invariant is about what ``inner_product`` accepts, so it holds
+        whichever dict the like-kwargs came from."""
+        from lisatools.globalfit.recipe import EMRIMoveBuilder
+
+        builder = EMRIMoveBuilder(
+            wave_gen=_RecordingGen(),
+            waveform_like_kwargs={MODE_KEY: 1e-3, "complex": True},
+        )
+        self.assertEqual(
+            builder.assemble_like_kwargs(self._info()), {"complex": True}
+        )
+
+    def test_base_builder_strips_nothing(self):
+        from lisatools.globalfit.recipe import MBHMoveBuilder
+
+        self.assertEqual(MBHMoveBuilder.like_kwargs_strip_keys, frozenset())
+
+
+class InnerProductConsumerTest(unittest.TestCase):
+    """Bind the assembled like-kwargs against the REAL consumer signatures.
+
+    This is the crash reproduced without numerics: the production traceback is
+    ``inner_product() got an unexpected keyword argument
+    'mode_selection_threshold'`` from ``analysiscontainer.py`` (the ``d_d``
+    term), and ``inner_product`` has no ``**kwargs`` sink to absorb it.
+    """
+
+    def _like_kwargs(self):
+        import types
+
+        from lisatools.globalfit.recipe import EMRIMoveBuilder
+
+        info = types.SimpleNamespace(waveform_kwargs={MODE_KEY: 1e-3})
+        return EMRIMoveBuilder(wave_gen=_RecordingGen()).assemble_like_kwargs(info)
+
+    def test_inner_product_rejects_the_waveform_only_key(self):
+        """Negative control: the PRE-FIX dict still raises."""
+        from lisatools.diagnostic import inner_product
+
+        sig = inspect.signature(inner_product)
+        with self.assertRaises(TypeError):
+            sig.bind(object(), object(), psd=object(), **{MODE_KEY: 1e-3})
+
+    def test_assembled_like_kwargs_bind_to_the_whole_chain(self):
+        from lisatools.analysiscontainer import AnalysisContainer
+        from lisatools.diagnostic import inner_product
+
+        like_kw = self._like_kwargs()
+        # ``template_likelihood`` forwards its **kwargs verbatim (minus psd /
+        # complex) into ``inner_product``; both have to accept them.
+        inspect.signature(AnalysisContainer.template_likelihood).bind(
+            object(), object(), **like_kw
+        )
+        inspect.signature(inner_product).bind(
+            object(), object(), psd=object(), **like_kw
+        )
+
+    def test_mock_consumer_accepts_the_assembled_kwargs(self):
+        """A stand-in with ``inner_product``'s exact parameter list."""
+
+        def fake_inner_product(
+            sig1, sig2, basis_settings=None, psd="LISASens", psd_args=(),
+            psd_kwargs={}, normalize=False, complex=False,
+        ):
+            return 0.0
+
+        self.assertEqual(
+            fake_inner_product(object(), object(), **self._like_kwargs()), 0.0
+        )
 
 
 class CallTimeArrivalTest(unittest.TestCase):
@@ -208,6 +343,7 @@ class EnvKnobSubprocessTest(unittest.TestCase):
         "    SourceEMRISettings, apply_emri_mode_selection_threshold,\n"
         "    source_signal_cfg,\n"
         ")\n"
+        "from lisatools.globalfit.recipe import EMRIMoveBuilder\n"
         "from unittest import mock\n"
         "import os\n"
         "want = os.environ.get('WANT_EPS')\n"
@@ -217,10 +353,11 @@ class EnvKnobSubprocessTest(unittest.TestCase):
         "eff = apply_emri_mode_selection_threshold(emri)\n"
         "assert eff == want, (eff, want)\n"
         "key = 'mode_selection_threshold'\n"
-        "if want is None:\n"
-        "    assert key not in emri.waveform_kwargs, emri.waveform_kwargs\n"
-        "else:\n"
-        "    assert emri.waveform_kwargs[key] == want, emri.waveform_kwargs\n"
+        "# the branch dict doubles as the move's LIKELIHOOD kwargs: the knob\n"
+        "# must never be stamped into it (2026-09-15 inner_product crash)\n"
+        "assert key not in emri.waveform_kwargs, emri.waveform_kwargs\n"
+        "like_kw = EMRIMoveBuilder(wave_gen=None).assemble_like_kwargs(emri)\n"
+        "assert key not in like_kw, like_kw\n"
         "cfg = source_signal_cfg(mock.MagicMock(), mock.MagicMock(),\n"
         "                        mock.MagicMock(), emri)\n"
         "assert cfg['emri_mode_selection_threshold'] == want, cfg[\n"
