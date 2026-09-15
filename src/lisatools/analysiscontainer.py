@@ -1420,6 +1420,10 @@ class BandView:
         main = (
             self._aca.xp.cuda.runtime.getDevice() if self._aca.gpus is not None else None
         )
+        payload_ready = None
+        if self._aca.gpus is not None and mode != "get":
+            payload_ready = self._aca.xp.cuda.Event(block=False, disable_timing=True)
+            payload_ready.record()
         try:
             for s in np.unique(shard_ids):
                 rows = np.where(shard_ids == s)[0]
@@ -1444,10 +1448,15 @@ class BandView:
                     if mode == "get":
                         with self._aca.xp.cuda.Device(int(self._aca.gpus[s])):
                             vals = self._shards[s][shard_idx]
+                            vals_ready = self._aca.xp.cuda.Event(
+                                block=False, disable_timing=True)
+                            vals_ready.record()
                         with self._aca.xp.cuda.Device(int(self._aca.gpus[0])):
+                            self._aca.xp.cuda.get_current_stream().wait_event(vals_ready)
                             out_flat[rows] = self._aca.xp.asarray(vals)
                     else:
                         with self._aca.xp.cuda.Device(int(self._aca.gpus[s])):
+                            self._aca.xp.cuda.get_current_stream().wait_event(payload_ready)
                             if is_scalar_val:
                                 self._shards[s][shard_idx] = val
                             else:
@@ -1500,7 +1509,10 @@ class BandView:
                 rows = np.where(shard_ids == s)[0]
                 with self._aca.xp.cuda.Device(int(self._aca.gpus[s])):
                     src = self._shards[s][intra[rows]]
+                    src_ready = self._aca.xp.cuda.Event(block=False, disable_timing=True)
+                    src_ready.record()
                 with self._aca.xp.cuda.Device(int(target)):
+                    self._aca.xp.cuda.get_current_stream().wait_event(src_ready)
                     out[rows] = self._aca.xp.asarray(src)
             return out
         finally:
@@ -1524,15 +1536,31 @@ class BandView:
             return
 
         main = self._aca.xp.cuda.runtime.getDevice()
+        val_device = getattr(getattr(val, "device", None), "id", main)
+        with self._aca.xp.cuda.Device(int(val_device)):
+            val_ready = self._aca.xp.cuda.Event(block=False, disable_timing=True)
+            val_ready.record()
         try:
+            written = []
             for s in np.unique(shard_ids):
                 rows = np.where(shard_ids == s)[0]
                 with self._aca.xp.cuda.Device(int(self._aca.gpus[s])):
+                    self._aca.xp.cuda.get_current_stream().wait_event(val_ready)
                     if is_scalar:
                         self._shards[s][intra[rows]] = val
                     else:
                         sub = val[rows] if hasattr(val, "__getitem__") else val
                         self._shards[s][intra[rows]] = self._aca.xp.asarray(sub)
+                    shard_done = self._aca.xp.cuda.Event(block=False, disable_timing=True)
+                    shard_done.record()
+                    written.append(shard_done)
+            # ! Each shard reads `val` on its own stream. The caller may free `val` as soon as this
+            # ! returns, and its pool orders reuse only on val's own stream, so that stream waits
+            # ! for every shard's read first.
+            with self._aca.xp.cuda.Device(int(val_device)):
+                stream = self._aca.xp.cuda.get_current_stream()
+                for shard_done in written:
+                    stream.wait_event(shard_done)
         finally:
             self._aca.xp.cuda.runtime.setDevice(main)
 
@@ -3151,10 +3179,15 @@ class AnalysisContainerArray:
                 gathered = self.xp.zeros(
                     self.acs_total_entries * per_ac, dtype=per_gpu_list[0].dtype
                 )
-                for i, gpu in enumerate(self.gpus):
-                    split = self.gpu_splits[i]
-                    if len(split) == 0:
-                        continue
+            for i, gpu in enumerate(self.gpus):
+                split = self.gpu_splits[i]
+                if len(split) == 0:
+                    continue
+                with self.xp.cuda.Device(int(gpu)):
+                    shard_ready = self.xp.cuda.Event(block=False, disable_timing=True)
+                    shard_ready.record()
+                with self.xp.cuda.Device(int(target_gpu)):
+                    self.xp.cuda.get_current_stream().wait_event(shard_ready)
                     # Move this shard's buffer onto target_gpu, then scatter
                     # back into AC order in `gathered`.
                     src = self.xp.asarray(per_gpu_list[i])

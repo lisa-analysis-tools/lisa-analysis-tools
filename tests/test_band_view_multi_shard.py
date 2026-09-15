@@ -57,6 +57,25 @@ class _FakeMultiShardACA:
 
                 return _Ctx()
 
+            # BandView orders its cross-device copies with an event on the producing stream
+            # and a wait on the consuming one. There are no streams here: this fake stands in
+            # for cupy so the ROUTING can be tested on a CPU, so both are no-ops.
+            @staticmethod
+            def Event(**_kwargs):
+                class _Event:
+                    def record(self_inner):
+                        return None
+
+                return _Event()
+
+            @staticmethod
+            def get_current_stream():
+                class _Stream:
+                    def wait_event(self_inner, _event):
+                        return None
+
+                return _Stream()
+
         cuda = _FakeCuda()
 
         @staticmethod
