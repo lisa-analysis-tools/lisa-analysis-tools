@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 from .domains import FDSettings, STFTSettings, WDMSettings
+from .utils.devicereplicas import device_local_orbits
 from .utils.parallelbase import LISAToolsParallelModule
 
 if TYPE_CHECKING:
@@ -86,6 +87,8 @@ class DomainKernelStrategy(LISAToolsParallelModule):
         self.split_acs: list[AnalysisContainer] = [all_acs[i] for i in split_container_ids]
         self.device = acs.gpus[split_index] if acs.gpus is not None else None
 
+        self.primary_device = int(acs.gpus[0]) if acs.gpus else None
+
         if self.backend.name.split("_")[-1] == "cpu":
             assert (
                 self.device == None
@@ -151,11 +154,9 @@ class DomainKernelStrategy(LISAToolsParallelModule):
             # Check if the sensitivity matrix array lives on the same device
             # (or CPU equivalent default). Using split_index == 0 ensures
             # the original instance mapped to device 0 is reused on device 0.
-            # if self.split_index == 0:
-            #     self._orbits = sensitivity_backend.orbits
-            #     self._sensitivity_backend = sensitivity_backend
-            # else:
-            self._orbits = sensitivity_backend.orbits.__class__(*sensitivity_backend.orbits.args, **sensitivity_backend.orbits.kwargs)
+            self._orbits = device_local_orbits(
+                sensitivity_backend.orbits, self.xp, self.primary_device
+            )
 
             sensitivity_backend_kwargs["orbits"] = self._orbits
             self._sensitivity_backend = sensitivity_backend.__class__(**sensitivity_backend_kwargs)

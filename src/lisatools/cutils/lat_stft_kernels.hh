@@ -42,6 +42,8 @@
 
 #include "domains.hpp"            // STFTSettings / STFTDomain / STFTFresnel + global.hpp (cmplx, CUDA_* macros, gcmplx)
 #include "lat_tdi_on_the_fly.hh"  // LISATDIonTheFly base (SourceT) + Vec / Orbits / TDIConfig
+#include <cstring>                // std::memcmp / std::memcpy for the per-device launch structs
+#include <stdexcept>              // std::runtime_error
 
 // blockDim.x for these kernels (GPU) / single-thread CPU mirror. Normally
 // already defined by lat_chunked_het_kernels.hh (pulled in ahead of this header
@@ -63,6 +65,70 @@
 // header self-contained in any translation unit.
 #ifndef N_PARAMS_MAX
 #define N_PARAMS_MAX 20
+#endif
+
+// ---------------------------------------------------------------------------
+// Device copies of the four host structs every STFT launch reads, one set per device. The objects
+// never change after construction, so a launch uploads a struct only when its bytes differ from the
+// device's copy: a comp's Orbits and TDIConfig once per device, a group's Fresnel and domain when
+// launches switch group. Launches do not synchronise, so the shards of one call overlap.
+// ---------------------------------------------------------------------------
+#ifdef __CUDACC__
+#ifndef STFT_MAX_DEVICES
+#define STFT_MAX_DEVICES 64
+#endif
+
+struct STFTDeviceStructs
+{
+    Orbits*      orbits     = nullptr;
+    TDIConfig*   tdi_config = nullptr;
+    STFTFresnel* fresnel    = nullptr;
+    STFTDomain*  stft       = nullptr;
+    unsigned char orbits_bytes[sizeof(Orbits)];
+    unsigned char tdi_config_bytes[sizeof(TDIConfig)];
+    unsigned char fresnel_bytes[sizeof(STFTFresnel)];
+    unsigned char stft_bytes[sizeof(STFTDomain)];
+};
+
+template <class StructT>
+inline void stft_upload_struct(StructT* device_copy, unsigned char* held_bytes, StructT* host)
+{
+    gpuErrchk(cudaMemcpy(device_copy, host, sizeof(StructT), cudaMemcpyHostToDevice));
+    std::memcpy(held_bytes, host, sizeof(StructT));
+}
+
+inline const STFTDeviceStructs& stft_device_structs(
+    Orbits* orbits, TDIConfig* tdi_config, STFTFresnel* fresnel, STFTDomain* stft)
+{
+    static STFTDeviceStructs per_device[STFT_MAX_DEVICES];
+    int device = 0;
+    gpuErrchk(cudaGetDevice(&device));
+    if (device < 0 || device >= STFT_MAX_DEVICES)
+        throw std::runtime_error("stft_device_structs: device id is not below STFT_MAX_DEVICES.");
+    STFTDeviceStructs& held = per_device[device];
+
+    const bool first = (held.orbits == nullptr);
+    if (first)
+    {
+        gpuErrchk(cudaMalloc(&held.orbits,     sizeof(Orbits)));
+        gpuErrchk(cudaMalloc(&held.tdi_config, sizeof(TDIConfig)));
+        gpuErrchk(cudaMalloc(&held.fresnel,    sizeof(STFTFresnel)));
+        gpuErrchk(cudaMalloc(&held.stft,       sizeof(STFTDomain)));
+    }
+    const bool new_orbits     = first || std::memcmp(held.orbits_bytes,     orbits,     sizeof(Orbits)) != 0;
+    const bool new_tdi_config = first || std::memcmp(held.tdi_config_bytes, tdi_config, sizeof(TDIConfig)) != 0;
+    const bool new_fresnel    = first || std::memcmp(held.fresnel_bytes,    fresnel,    sizeof(STFTFresnel)) != 0;
+    const bool new_stft       = first || std::memcmp(held.stft_bytes,       stft,       sizeof(STFTDomain)) != 0;
+    if (!(new_orbits || new_tdi_config || new_fresnel || new_stft))
+        return held;
+
+    cudaDeviceSynchronize();
+    if (new_orbits)     stft_upload_struct(held.orbits,     held.orbits_bytes,     orbits);
+    if (new_tdi_config) stft_upload_struct(held.tdi_config, held.tdi_config_bytes, tdi_config);
+    if (new_fresnel)    stft_upload_struct(held.fresnel,    held.fresnel_bytes,    fresnel);
+    if (new_stft)       stft_upload_struct(held.stft,       held.stft_bytes,       stft);
+    return held;
+}
 #endif
 
 // ---------------------------------------------------------------------------
@@ -599,26 +665,14 @@ inline void stft_get_ll_impl(
     int* start_freq_inds = nullptr)
 {
 #ifdef __CUDACC__
-    static Orbits*      orbits_gpu     = nullptr;
-    static TDIConfig*   tdi_config_gpu = nullptr;
-    static STFTFresnel* fresnel_gpu    = nullptr;
-    static STFTDomain*  stft_gpu       = nullptr;
-    if (orbits_gpu     == nullptr) gpuErrchk(cudaMalloc(&orbits_gpu,     sizeof(Orbits)));
-    if (tdi_config_gpu == nullptr) gpuErrchk(cudaMalloc(&tdi_config_gpu, sizeof(TDIConfig)));
-    if (fresnel_gpu    == nullptr) gpuErrchk(cudaMalloc(&fresnel_gpu,    sizeof(STFTFresnel)));
-    if (stft_gpu       == nullptr) gpuErrchk(cudaMalloc(&stft_gpu,       sizeof(STFTDomain)));
-    gpuErrchk(cudaMemcpy(orbits_gpu,     orbits,     sizeof(Orbits),     cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(tdi_config_gpu, tdi_config, sizeof(TDIConfig),  cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(fresnel_gpu,    fresnel,    sizeof(STFTFresnel), cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(stft_gpu,       stft,       sizeof(STFTDomain), cudaMemcpyHostToDevice));
+    const STFTDeviceStructs& dev = stft_device_structs(orbits, tdi_config, fresnel, stft);
 
     dim3 grid((unsigned) num_bin, 1u, 1u);
     stft_get_ll_kernel<SourceT, ColumnT><<<grid, NUM_THREADS_HERE>>>(
-        d_h_out, h_h_out, orbits_gpu, tdi_config_gpu, fresnel_gpu, stft_gpu,
+        d_h_out, h_h_out, dev.orbits, dev.tdi_config, dev.fresnel, dev.stft,
         params_all, data_index_all, noise_index_all,
         num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
         start_freq_inds);
-    cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
 #else
     stft_get_ll_kernel<SourceT, ColumnT>(
@@ -740,26 +794,14 @@ inline void stft_fill_global_impl(
     int* start_freq_inds = nullptr)
 {
 #ifdef __CUDACC__
-    static Orbits*      orbits_gpu     = nullptr;
-    static TDIConfig*   tdi_config_gpu = nullptr;
-    static STFTFresnel* fresnel_gpu    = nullptr;
-    static STFTDomain*  stft_gpu       = nullptr;
-    if (orbits_gpu     == nullptr) gpuErrchk(cudaMalloc(&orbits_gpu,     sizeof(Orbits)));
-    if (tdi_config_gpu == nullptr) gpuErrchk(cudaMalloc(&tdi_config_gpu, sizeof(TDIConfig)));
-    if (fresnel_gpu    == nullptr) gpuErrchk(cudaMalloc(&fresnel_gpu,    sizeof(STFTFresnel)));
-    if (stft_gpu       == nullptr) gpuErrchk(cudaMalloc(&stft_gpu,       sizeof(STFTDomain)));
-    gpuErrchk(cudaMemcpy(orbits_gpu,     orbits,     sizeof(Orbits),     cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(tdi_config_gpu, tdi_config, sizeof(TDIConfig),  cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(fresnel_gpu,    fresnel,    sizeof(STFTFresnel), cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(stft_gpu,       stft,       sizeof(STFTDomain), cudaMemcpyHostToDevice));
+    const STFTDeviceStructs& dev = stft_device_structs(orbits, tdi_config, fresnel, stft);
 
     dim3 grid((unsigned) num_bin, 1u, 1u);
     stft_fill_global_kernel<SourceT, ColumnT><<<grid, NUM_THREADS_HERE>>>(
-        template_fill, orbits_gpu, tdi_config_gpu, fresnel_gpu, stft_gpu,
+        template_fill, dev.orbits, dev.tdi_config, dev.fresnel, dev.stft,
         params_all, data_index_all, factors_all,
         num_bin, nparams, T, t_ref, n_side_bins, window_factor,
         freq_from_tdi_phase, active_band, start_freq_inds);
-    cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
 #else
     stft_fill_global_kernel<SourceT, ColumnT>(
@@ -981,27 +1023,15 @@ inline void stft_swap_ll_impl(
     int* start_freq_inds = nullptr)
 {
 #ifdef __CUDACC__
-    static Orbits*      orbits_gpu     = nullptr;
-    static TDIConfig*   tdi_config_gpu = nullptr;
-    static STFTFresnel* fresnel_gpu    = nullptr;
-    static STFTDomain*  stft_gpu       = nullptr;
-    if (orbits_gpu     == nullptr) gpuErrchk(cudaMalloc(&orbits_gpu,     sizeof(Orbits)));
-    if (tdi_config_gpu == nullptr) gpuErrchk(cudaMalloc(&tdi_config_gpu, sizeof(TDIConfig)));
-    if (fresnel_gpu    == nullptr) gpuErrchk(cudaMalloc(&fresnel_gpu,    sizeof(STFTFresnel)));
-    if (stft_gpu       == nullptr) gpuErrchk(cudaMalloc(&stft_gpu,       sizeof(STFTDomain)));
-    gpuErrchk(cudaMemcpy(orbits_gpu,     orbits,     sizeof(Orbits),     cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(tdi_config_gpu, tdi_config, sizeof(TDIConfig),  cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(fresnel_gpu,    fresnel,    sizeof(STFTFresnel), cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(stft_gpu,       stft,       sizeof(STFTDomain), cudaMemcpyHostToDevice));
+    const STFTDeviceStructs& dev = stft_device_structs(orbits, tdi_config, fresnel, stft);
 
     dim3 grid((unsigned) num_bin, 1u, 1u);
     stft_swap_ll_kernel<SourceT, ColumnT><<<grid, NUM_THREADS_HERE>>>(
         d_h_add_out, d_h_remove_out, add_add_out, remove_remove_out, add_remove_out,
-        orbits_gpu, tdi_config_gpu, fresnel_gpu, stft_gpu,
+        dev.orbits, dev.tdi_config, dev.fresnel, dev.stft,
         params_add_all, params_remove_all, data_index_all, noise_index_all,
         num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
         start_freq_inds);
-    cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
 #else
     stft_swap_ll_kernel<SourceT, ColumnT>(
@@ -1181,27 +1211,15 @@ inline void stft_get_fstat_ll_impl(
     int* start_freq_inds = nullptr)
 {
 #ifdef __CUDACC__
-    static Orbits*      orbits_gpu     = nullptr;
-    static TDIConfig*   tdi_config_gpu = nullptr;
-    static STFTFresnel* fresnel_gpu    = nullptr;
-    static STFTDomain*  stft_gpu       = nullptr;
-    if (orbits_gpu     == nullptr) gpuErrchk(cudaMalloc(&orbits_gpu,     sizeof(Orbits)));
-    if (tdi_config_gpu == nullptr) gpuErrchk(cudaMalloc(&tdi_config_gpu, sizeof(TDIConfig)));
-    if (fresnel_gpu    == nullptr) gpuErrchk(cudaMalloc(&fresnel_gpu,    sizeof(STFTFresnel)));
-    if (stft_gpu       == nullptr) gpuErrchk(cudaMalloc(&stft_gpu,       sizeof(STFTDomain)));
-    gpuErrchk(cudaMemcpy(orbits_gpu,     orbits,     sizeof(Orbits),     cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(tdi_config_gpu, tdi_config, sizeof(TDIConfig),  cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(fresnel_gpu,    fresnel,    sizeof(STFTFresnel), cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(stft_gpu,       stft,       sizeof(STFTDomain), cudaMemcpyHostToDevice));
+    const STFTDeviceStructs& dev = stft_device_structs(orbits, tdi_config, fresnel, stft);
 
     dim3 grid((unsigned) num_bin, 1u, 1u);
     stft_get_fstat_ll_kernel<SourceT, ColumnT><<<grid, NUM_THREADS_HERE>>>(
         N_re_out, N_im_out, M_re_out, M_im_out,
-        orbits_gpu, tdi_config_gpu, fresnel_gpu, stft_gpu,
+        dev.orbits, dev.tdi_config, dev.fresnel, dev.stft,
         params_all, data_index_all, noise_index_all,
         num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
         start_freq_inds);
-    cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
 #else
     stft_get_fstat_ll_kernel<SourceT, ColumnT>(
@@ -1318,26 +1336,14 @@ inline void stft_get_ll_grad_impl(
     int* start_freq_inds = nullptr)
 {
 #ifdef __CUDACC__
-    static Orbits*      orbits_gpu     = nullptr;
-    static TDIConfig*   tdi_config_gpu = nullptr;
-    static STFTFresnel* fresnel_gpu    = nullptr;
-    static STFTDomain*  stft_gpu       = nullptr;
-    if (orbits_gpu     == nullptr) gpuErrchk(cudaMalloc(&orbits_gpu,     sizeof(Orbits)));
-    if (tdi_config_gpu == nullptr) gpuErrchk(cudaMalloc(&tdi_config_gpu, sizeof(TDIConfig)));
-    if (fresnel_gpu    == nullptr) gpuErrchk(cudaMalloc(&fresnel_gpu,    sizeof(STFTFresnel)));
-    if (stft_gpu       == nullptr) gpuErrchk(cudaMalloc(&stft_gpu,       sizeof(STFTDomain)));
-    gpuErrchk(cudaMemcpy(orbits_gpu,     orbits,     sizeof(Orbits),     cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(tdi_config_gpu, tdi_config, sizeof(TDIConfig),  cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(fresnel_gpu,    fresnel,    sizeof(STFTFresnel), cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(stft_gpu,       stft,       sizeof(STFTDomain), cudaMemcpyHostToDevice));
+    const STFTDeviceStructs& dev = stft_device_structs(orbits, tdi_config, fresnel, stft);
 
     dim3 grid((unsigned) num_bin, 1u, 1u);
     stft_get_ll_grad_kernel<SourceT, ColumnT><<<grid, NUM_THREADS_HERE>>>(
-        grad_out, orbits_gpu, tdi_config_gpu, fresnel_gpu, stft_gpu,
+        grad_out, dev.orbits, dev.tdi_config, dev.fresnel, dev.stft,
         params_all, data_index_all, noise_index_all, param_eps,
         num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
         start_freq_inds);
-    cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
 #else
     stft_get_ll_grad_kernel<SourceT, ColumnT>(
@@ -1510,27 +1516,15 @@ inline void stft_swap_ll_grad_impl(
     int* start_freq_inds = nullptr)
 {
 #ifdef __CUDACC__
-    static Orbits*      orbits_gpu     = nullptr;
-    static TDIConfig*   tdi_config_gpu = nullptr;
-    static STFTFresnel* fresnel_gpu    = nullptr;
-    static STFTDomain*  stft_gpu       = nullptr;
-    if (orbits_gpu     == nullptr) gpuErrchk(cudaMalloc(&orbits_gpu,     sizeof(Orbits)));
-    if (tdi_config_gpu == nullptr) gpuErrchk(cudaMalloc(&tdi_config_gpu, sizeof(TDIConfig)));
-    if (fresnel_gpu    == nullptr) gpuErrchk(cudaMalloc(&fresnel_gpu,    sizeof(STFTFresnel)));
-    if (stft_gpu       == nullptr) gpuErrchk(cudaMalloc(&stft_gpu,       sizeof(STFTDomain)));
-    gpuErrchk(cudaMemcpy(orbits_gpu,     orbits,     sizeof(Orbits),     cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(tdi_config_gpu, tdi_config, sizeof(TDIConfig),  cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(fresnel_gpu,    fresnel,    sizeof(STFTFresnel), cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(stft_gpu,       stft,       sizeof(STFTDomain), cudaMemcpyHostToDevice));
+    const STFTDeviceStructs& dev = stft_device_structs(orbits, tdi_config, fresnel, stft);
 
     dim3 grid((unsigned) num_bin, 1u, 1u);
     stft_swap_ll_grad_kernel<SourceT, ColumnT><<<grid, NUM_THREADS_HERE>>>(
-        grad_add_out, grad_remove_out, orbits_gpu, tdi_config_gpu, fresnel_gpu, stft_gpu,
+        grad_add_out, grad_remove_out, dev.orbits, dev.tdi_config, dev.fresnel, dev.stft,
         params_add_all, params_remove_all, data_index_all, noise_index_all,
         param_eps_add, param_eps_remove,
         num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
         start_freq_inds);
-    cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
 #else
     stft_swap_ll_grad_kernel<SourceT, ColumnT>(

@@ -163,6 +163,18 @@ def _coerce_to_domain_base(obj) -> DomainBase:
 
 logger = logging.getLogger(__name__)
 
+
+def _on_device(arr, device: Optional[int]) -> bool:
+    """True when ``arr`` already lives on ``device``, so a copy needs no host round trip.
+
+    ``device`` is None on the CPU backend and on single-GPU runs, where the array cannot be
+    on the wrong device. A cupy array that cannot report its device is treated as foreign.
+    """
+    if device is None:
+        return True
+    arr_device = getattr(arr, "device", None)
+    return getattr(arr_device, "id", None) == int(device)
+
 class AnalysisContainer:
     """Combinatorial container that combines sensitivity and data information.
 
@@ -1871,15 +1883,26 @@ class AnalysisContainerArray:
         for split_id, ids in enumerate(gpu_splits):
             self.ac_to_intra[ids] = np.arange(len(ids), dtype=np.int32)
 
+        # * One copy of both routing tables per shard, on that shard's own device, built here
+        # * rather than per call: a kernel's index arrays are gathered from them inside the shard's
+        # * context, and building them on the caller instead makes every launch copy across devices.
+        if gpus is None:
+            self.split_map_by_split = [self.split_map] * len(gpu_splits)
+            self.ac_to_intra_by_split = [self.ac_to_intra] * len(gpu_splits)
+        else:
+            self.split_map_by_split = []
+            self.ac_to_intra_by_split = []
+            for split_id in range(len(gpu_splits)):
+                with self.xp.cuda.Device(int(gpus[split_id])):
+                    self.split_map_by_split.append(self.xp.asarray(self.split_map))
+                    self.ac_to_intra_by_split.append(self.xp.asarray(self.ac_to_intra))
+
         self.num_acs = len(acs.flatten())
         self.reset_linear_data_arr()
         self.reset_linear_psd_arr()
         if gpus is not None:
             # Restore whatever device the caller was on before __init__.
             self.xp.cuda.runtime.setDevice(self._main_device_at_init)
-
-    def flatten(self):
-        return self.acs.flatten()
     
     def synchronize(self):
         if self.gpus is not None:
@@ -1921,7 +1944,10 @@ class AnalysisContainerArray:
             end_index = (intra_split_index + 1) * (self.nchannels * self.data_length)
 
             flat_data_res_here = ac.data_res_arr.flatten()
-            if hasattr(flat_data_res_here, "get"):
+
+            if hasattr(flat_data_res_here, "get") and not _on_device(
+                flat_data_res_here, gpu if self.gpus is not None else None
+            ):
                 flat_data_res_here = flat_data_res_here.get()
             self.linear_data_arr[split][start_index:end_index] = self.xp.asarray(
                 flat_data_res_here
@@ -1955,7 +1981,7 @@ class AnalysisContainerArray:
             # invC may live on a different GPU (always computed on GPU 0).
             # Route through CPU to avoid broken P2P cross-device copies.
             invC_src = ac.sens_mat.invC
-            if hasattr(invC_src, 'get'):
+            if hasattr(invC_src, 'get') and not _on_device(invC_src, gpu if self.gpus is not None else None):
                 invC_src = invC_src.get()
             self.linear_psd_arr[split][start_index:end_index] = self.xp.asarray(
                 invC_src.flatten()
