@@ -122,6 +122,10 @@ Key env knobs
                          =0 removes it (stage lists bit-identical to the
                          pre-replace runs). full_pe is NOT touched.
     STAGE_SKIP_NOISE=1   start at stage 2 (noise already converged)
+    GB_SEARCH_SOURCE_EVERY   mbh/emri gb_search cadence (default 10):
+                         they propose on every Nth gb_search iteration,
+                         staying subtracted in between; sobbh + full_pe
+                         uncadenced (2026-09-15 ruling)
     STAGE_SKIP_SOURCE_SEARCH=1  no source_search stage: armed sources
                          start (and stay subtracted) at their seeded
                          coords; source proposals only in gb_search +
@@ -742,10 +746,26 @@ def build_fit():
         branch="psd", num_checks=(_gb_noise_checks or None),
         iters_per_step=(_gb_noise_cap or None))]
 
-    def source_pe():
+    # gb_search source cadence (user ruling 2026-09-15: "run them in
+    # gb_search as before, but make them run every 10 iterations"): the
+    # mbh/emri dense rows cost minutes per pass at near-zero GPU, so in
+    # gb_search they propose on every Nth stage iteration (stage-local —
+    # full_pe runs them every iteration). Between cadence hits they stay
+    # SUBTRACTED at their current coords exactly as before. sobbh's cheap
+    # chunked-het rows ride every iteration.
+    _gb_search_src_every = int(os.environ.get("GB_SEARCH_SOURCE_EVERY", "10"))
+    if _gb_search_src_every < 1:
+        raise ValueError(
+            f"GB_SEARCH_SOURCE_EVERY={_gb_search_src_every} must be >= 1.")
+
+    def source_pe(gb_search_cadence=False):
         # Fresh Move descriptors per stage (never share one instance):
         # the armed source PE moves, sobbh -> mbh -> emri (banking order).
-        return [Move(f"{br}_pe", branch=br)
+        # ``gb_search_cadence`` puts mbh/emri on the 1-in-N schedule.
+        def _every(br):
+            return (_gb_search_src_every
+                    if gb_search_cadence and br in ("mbh", "emri") else 1)
+        return [Move(f"{br}_pe", branch=br, every=_every(br))
                 for br, _env, _cls in _SOURCE_BRANCH_ENVS
                 if br in armed_sources]
 
@@ -865,7 +885,9 @@ def build_fit():
             # replacement pass before the removal judge.
             # Armed source PE moves ride between the noise joint search
             # and the GB RJ cycle (sobbh -> mbh -> emri banking order).
-            moves=noise_vgb_gb + source_pe() + warm() + [
+            # mbh/emri ride at the 1-in-N gb_search cadence (block above);
+            # sobbh every iteration.
+            moves=noise_vgb_gb + source_pe(gb_search_cadence=True) + warm() + [
                 Move("rj_fstat_search", branch="gb"),
             ] + replace() + [
                 Move("rj_prior_removal", branch="gb"),

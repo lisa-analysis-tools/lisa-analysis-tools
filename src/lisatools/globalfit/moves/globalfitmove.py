@@ -121,12 +121,25 @@ class Move:
         *,
         branch: typing.Optional[str] = None,
         debug: typing.Optional[typing.Union[bool, dict]] = None,
+        every: int = 1,
     ):
         if not isinstance(name, str) or not name:
             raise ValueError(f"Move needs a non-empty string name, got {name!r}.")
+        # ``every``: run this move on every Nth iteration of ITS STAGE
+        # (user ruling 2026-09-15: mbh/emri ride gb_search at a 1-in-10
+        # cadence). Stage-local by construction — the counter lives on the
+        # stage's GFCombineMove, so the SAME shared stock runtime move is
+        # uncadenced in another stage that declares every=1. A skipped
+        # iteration leaves the branch exactly as it was (still subtracted
+        # at its current coords); cyclic deterministic thinning of a
+        # kernel cycle preserves detailed balance.
+        every = int(every)
+        if every < 1:
+            raise ValueError(f"Move {name!r}: every must be >= 1, got {every}.")
         self.name = name
         self.branch = branch
         self.debug = debug
+        self.every = every
         self._runtime = None
 
     @property
@@ -185,6 +198,8 @@ class Move:
 
     def __repr__(self):
         extra = f", branch={self.branch!r}" if self.branch else ""
+        if getattr(self, "every", 1) != 1:
+            extra += f", every={self.every}"
         return f"{type(self).__name__}({self.name!r}{extra})"
 
 
@@ -453,12 +468,66 @@ class GFCombineMove(CombineMove, GlobalFitMove):
         random_choice: bool = False,
         weighted_cycle: bool = False,
         move_weights=None,
+        move_every=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.random_choice = bool(random_choice)
         self.weighted_cycle = bool(weighted_cycle)
         self.move_weights = self._validate_move_weights(move_weights)
+        # Per-sub-move iteration cadence (aligned with ``moves``): sub-move
+        # i runs only when (stage propose count) % move_every[i] == 0. The
+        # counter is THIS combine's, i.e. stage-local — the same shared
+        # stock runtime move stays uncadenced in a stage that declares 1.
+        # Only the fixed sequential path supports it (a drawn cycle has no
+        # per-iteration slot to skip).
+        self.gf_move_every = self._validate_move_every(move_every)
+        self._gf_cadence_idx = 0
+
+    def _validate_move_every(self, move_every):
+        if move_every is None:
+            return None
+        ev = [int(e) for e in move_every]
+        if len(ev) != len(self.moves):
+            raise ValueError(
+                f"move_every has length {len(ev)}; expected "
+                f"{len(self.moves)} to match the wrapped moves."
+            )
+        if any(e < 1 for e in ev):
+            raise ValueError("move_every entries must be >= 1.")
+        if all(e == 1 for e in ev):
+            return None
+        if self.random_choice or self.weighted_cycle:
+            raise ValueError(
+                "move_every > 1 is only supported on the fixed sequential "
+                "path (random_choice/weighted_cycle draw their own cycle)."
+            )
+        return ev
+
+    def _gf_cadence_plan(self, moves):
+        """``(due_moves, skipped_names)`` for this propose under the cadence.
+
+        Advances the stage-local counter once per call. With no cadence
+        configured this is a passthrough that never touches the counter.
+        """
+        every = self.gf_move_every
+        if every is None:
+            return moves, None
+        idx = self._gf_cadence_idx
+        self._gf_cadence_idx = idx + 1
+        by_id = {}
+        for m, e in zip(self.moves, every):
+            mm = m[0] if isinstance(m, tuple) else m
+            by_id[id(mm)] = e
+        due, skipped = [], []
+        for m in moves:
+            mm = m[0] if isinstance(m, tuple) else m
+            if idx % by_id.get(id(mm), 1) == 0:
+                due.append(m)
+            else:
+                skipped.append(
+                    getattr(mm, "gf_move_name", type(mm).__name__))
+        return due, skipped
 
     def _validate_move_weights(self, move_weights):
         """Normalize ``move_weights`` to a probability vector (or None).
@@ -644,7 +713,22 @@ class GFCombineMove(CombineMove, GlobalFitMove):
     def _propose_moves(self, model, state):
         plan = self._pe_rj_draw_one_plan(model)
         if plan is not None:
+            plan, _skipped = self._gf_cadence_plan(plan)
+            if _skipped and os.environ.get("GF_MOVE_TIMING", "0") == "1":
+                print(
+                    f"[GF_TIMING] stage={getattr(self, 'gf_stage_name', '?')} "
+                    f"cadence skip: {','.join(_skipped)}", flush=True)
             return self._run_sequence(model, state, plan)
+
+        if self.gf_move_every is not None:
+            due, _skipped = self._gf_cadence_plan(self.moves)
+            if _skipped and os.environ.get("GF_MOVE_TIMING", "0") == "1":
+                print(
+                    f"[GF_TIMING] stage={getattr(self, 'gf_stage_name', '?')} "
+                    f"cadence skip: {','.join(_skipped)}", flush=True)
+            if not due:  # every wrapped move cadenced off this iteration
+                return state, np.zeros_like(self.accepted)
+            return self._run_sequence(model, state, due)
 
         if getattr(self, "weighted_cycle", False) and len(self.moves) > 1:
             # GB PE cycle style (user ruling 2026-08-26): one propose runs

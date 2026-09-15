@@ -1030,6 +1030,13 @@ class Stage:
                 runtime.progress = run_verbose
         combine_kwargs = dict(self.combine_kwargs)
         combine_kwargs.setdefault("verbose", run_verbose)
+        # Per-move iteration cadence (Move(every=N), user ruling
+        # 2026-09-15): stage-local by riding THIS stage's combine — the
+        # same shared stock runtime move stays uncadenced in a stage
+        # whose descriptor says every=1.
+        _everies = [int(getattr(mv, "every", 1)) for mv in self.moves]
+        if any(e != 1 for e in _everies):
+            combine_kwargs.setdefault("move_every", _everies)
         combined = GFCombineMove(moves=runtime_moves, **combine_kwargs)
         combined.gf_stage_name = self.name
         # ... and the stage KIND, which the coarse-noise mode resolver reads

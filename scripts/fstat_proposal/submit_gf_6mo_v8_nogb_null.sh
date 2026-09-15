@@ -2164,6 +2164,13 @@ export GB_WARM_START_CIRC_IMAGES=${GB_WARM_START_CIRC_IMAGES:-3}
 # with psd; no injected noise; no UNEQUAL_ARM; no STAGE_NOISE_* flag).
 export DATA_MODE=mojito
 export REMOVE_BRANCHES=gb,galfor,vgb,psd
+# MIRRORED from the main 6mo script (user ruling 2026-09-15 "mirror any
+# updates into the nogb_null test as well"): with exact-truth starts the
+# joint source search has nothing to converge -- skip straight to
+# full_pe. The null READOUT (initial lnL) prints before any stage either
+# way; this only removes burn-in sweeps after it. GB_SEARCH_SOURCE_EVERY
+# does not apply here (no gb_search stage; full_pe is uncadenced).
+export STAGE_SKIP_SOURCE_SEARCH=1
 # "NO INJECTED NOISE": no NOISE stream, no VGB stream, no galaxy. Source
 # streams only. (The driver's DEFAULT list would already drop NOISE with the
 # psd branch, but state it -- a submit script names its own injection.)

@@ -32,6 +32,7 @@ ALL_IDS = {"MBHB_IDS": "2,5,16,18",
            "SOBHB_IDS": "0,1,2,3,4,5"}
 SRC_ENVS = tuple(ALL_IDS) + ("SOURCE_TYPES",)
 STAGE_ENVS = ("GB_ONLY", "STAGE_SKIP_NOISE", "STAGE_SKIP_SOURCE_SEARCH",
+              "GB_SEARCH_SOURCE_EVERY",
               "STAGE_NOISE_ONLY",
               "STAGE_NOISE_VGB_PE", "COMBINED_SMOKE", "TOBS_TARGET",
               "GB_WARM_START_COMPONENTS", "REMOVE_BRANCHES")
@@ -43,6 +44,12 @@ def _build_fit():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod.build_fit()
+
+
+def _everies(fit, stage_name):
+    st = next(s for s in fit.recipe.stages if s.name == stage_name)
+    return {m.name: getattr(m, "every", 1) for m in st.moves
+            if m.name in ("sobbh_pe", "mbh_pe", "emri_pe")}
 
 
 class StagedSourcesWiringTest(unittest.TestCase):
@@ -99,7 +106,12 @@ class StagedSourcesWiringTest(unittest.TestCase):
         self.assertEqual([m.name for m in st0.moves],
                          ["source_joint_search"])
         # armed source PE moves ride gb_search and full_pe in the
-        # full_year banking order (sobbh -> mbh -> emri)
+        # full_year banking order (sobbh -> mbh -> emri). In gb_search
+        # the mbh/emri moves carry a 1-in-N iteration CADENCE (user
+        # ruling 2026-09-15: "run them in gb_search as before, but make
+        # them run every 10 iterations" -- their dense rows cost minutes
+        # per pass at near-zero GPU); sobbh's cheap chunked-het rows run
+        # every iteration, and full_pe runs everything uncadenced.
         stages = self._stages(fit)
         for stage in ("gb_search", "full_pe"):
             names = stages[stage]
@@ -107,8 +119,19 @@ class StagedSourcesWiringTest(unittest.TestCase):
                    if n in ("sobbh_pe", "mbh_pe", "emri_pe")]
             self.assertEqual(sub, ["sobbh_pe", "mbh_pe", "emri_pe"],
                              f"{stage}: {names}")
-            self.assertIn("rj_fstat_search" if stage == "gb_search"
-                          else "rj_fstat_pe", names)
+        self.assertIn("rj_fstat_search", stages["gb_search"])
+        self.assertIn("rj_fstat_pe", stages["full_pe"])
+        self.assertEqual(_everies(fit, "gb_search"),
+                         {"sobbh_pe": 1, "mbh_pe": 10, "emri_pe": 10})
+        self.assertEqual(_everies(fit, "full_pe"),
+                         {"sobbh_pe": 1, "mbh_pe": 1, "emri_pe": 1})
+
+    def test_gb_search_source_every_env_override(self):
+        os.environ.update(ALL_IDS)
+        os.environ["GB_SEARCH_SOURCE_EVERY"] = "5"
+        fit = _build_fit()
+        self.assertEqual(_everies(fit, "gb_search"),
+                         {"sobbh_pe": 1, "mbh_pe": 5, "emri_pe": 5})
 
     def test_skip_source_search_keeps_moves_in_gb_stages(self):
         # User ruling 2026-09-14 late: with exact-truth starts
@@ -123,9 +146,14 @@ class StagedSourcesWiringTest(unittest.TestCase):
         self.assertEqual(list(stages),
                          ["noise_search", "noise_vgb_search",
                           "gb_search", "full_pe"])
+        # user ruling 2026-09-15 (superseding the brief PE-only form):
+        # mbh/emri ride gb_search at a 1-in-10 cadence; all three in
+        # full_pe uncadenced.
         for mv in ("sobbh_pe", "mbh_pe", "emri_pe"):
             self.assertIn(mv, stages["gb_search"])
             self.assertIn(mv, stages["full_pe"])
+        self.assertEqual(_everies(fit, "gb_search"),
+                         {"sobbh_pe": 1, "mbh_pe": 10, "emri_pe": 10})
 
     def test_skip_source_search_without_sources_is_refused(self):
         # the flag has no stage to skip when nothing is armed -- refuse
@@ -321,3 +349,56 @@ class WarmPeOverridesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CadenceFilterTest(unittest.TestCase):
+    """GFCombineMove's stage-local 1-in-N sub-move cadence (Move(every=N),
+    user ruling 2026-09-15: mbh/emri ride gb_search every 10 iterations)."""
+
+    def _combine(self, everies):
+        from lisatools.globalfit.moves.globalfitmove import GFCombineMove
+
+        obj = GFCombineMove.__new__(GFCombineMove)
+        obj.moves = [object() for _ in everies]
+        obj.random_choice = False
+        obj.weighted_cycle = False
+        obj.gf_move_every = obj._validate_move_every(everies)
+        obj._gf_cadence_idx = 0
+        return obj
+
+    def test_skip_pattern_over_a_cycle(self):
+        c = self._combine([1, 3, 3])
+        ran = []
+        for _ in range(6):
+            due, skipped = c._gf_cadence_plan(c.moves)
+            ran.append([c.moves.index(m) for m in due])
+        # move 0 every iteration; moves 1/2 on iterations 0 and 3 only
+        self.assertEqual(ran, [[0, 1, 2], [0], [0],
+                               [0, 1, 2], [0], [0]])
+
+    def test_all_ones_is_a_passthrough(self):
+        c = self._combine([1, 1])
+        for _ in range(3):
+            due, skipped = c._gf_cadence_plan(c.moves)
+            self.assertIs(due, c.moves)
+            self.assertIsNone(skipped)
+        self.assertEqual(c._gf_cadence_idx, 0)  # counter untouched
+
+    def test_validation(self):
+        from lisatools.globalfit.moves.globalfitmove import GFCombineMove
+
+        c = self._combine([1, 1])
+        with self.assertRaises(ValueError):
+            c._validate_move_every([1])          # length mismatch
+        with self.assertRaises(ValueError):
+            c._validate_move_every([0, 1])       # < 1
+        c.weighted_cycle = True
+        with self.assertRaises(ValueError):
+            c._validate_move_every([1, 5])       # cadence + drawn cycle
+
+    def test_move_descriptor_validates_every(self):
+        from lisatools.globalfit.moves.globalfitmove import Move
+
+        self.assertEqual(Move("x_pe", every=10).every, 10)
+        with self.assertRaises(ValueError):
+            Move("x_pe", every=0)
