@@ -14,6 +14,11 @@
 #      extract's keep-window instead of drawing zero-filled rows.
 #   4. completeness panel y-limit 0-100 (0-60 clipped every arm above 60%).
 #   5. lnL panel title uses the real walker count.
+#   7. LaTeX is refused process-wide, not just defaulted off: the
+#      LaTeX-invoking rcParams are locked at the class level (so rcdefaults,
+#      style.use, rc_context and chainconsumer cannot re-enable them), the
+#      pgf backend is refused, and chainconsumer's non-rcParam usetex path is
+#      pinned off. mathtext is untouched. See _refuse_latex().
 #   6. the two pooled-sample windows are env knobs (GF_MONITOR_POOL_ITS /
 #      GF_MONITOR_POOL_ITS_POSTERIOR) and no longer share a value: the
 #      corner window defaults to 300, the scatter window stays at 30. They
@@ -67,7 +72,96 @@ import numpy as np
 import h5py
 import matplotlib
 matplotlib.use("Agg")
+
+# ---- LaTeX is REFUSED, not merely defaulted off ---------------------------
+# A matplotlibrc with text.usetex=True makes every unescaped underscore in
+# these titles ("psd: Soms_d") a TeX RuntimeError four minutes into a run, and
+# the page needs nothing beyond matplotlib's built-in mathtext. Setting the
+# rcParam once (as this file used to) is NOT enough: rcdefaults(), style.use(),
+# rc_context() and any library that stamps its own rcParams can all turn it
+# back on afterwards. ChainConsumer is exactly that library -- its PlotConfig
+# carries a usetex field and its plotter pushes it into rcParams at plot time,
+# which lands in the middle of the corner-rendering loop.
+#
+# So the LaTeX-invoking rcParams are LOCKED at the class level: every write
+# through RcParams.__setitem__ -- which is the path rcdefaults, update(),
+# style.use() and rc_context() all funnel through -- is coerced back to the
+# safe value and the attempt is reported once, loudly, on stderr.
+#
+# MATHTEXT IS DELIBERATELY UNTOUCHED. mathtext is matplotlib's own TeX-like
+# parser; it invokes no external LaTeX, needs no TeX installation, and is what
+# renders the axis labels this page actually wants (r"$|\Delta f_0|$"). The
+# thing being refused is the external-latex path, not the notation.
+# pgf.rcfonts is deliberately NOT in this list: it selects which fonts the pgf
+# backend uses, it invokes nothing on its own, and the pgf BACKEND is refused
+# outright below -- locking it would only fight matplotlib's own default.
+_LATEX_SAFE = {
+    "text.usetex": False,
+    "text.latex.preamble": "",
+    "pgf.preamble": "",
+}
+_LATEX_SAFE = {k: v for k, v in _LATEX_SAFE.items() if k in matplotlib.rcParams}
+_LATEX_REFUSED = []
+
+
+def _refuse_latex(pyplot=None):
+    """Lock every LaTeX-invoking rcParam off for the life of the process."""
+    rc_cls = type(matplotlib.rcParams)
+    if not getattr(rc_cls, "_gf_latex_locked", False):
+        _orig_setitem = rc_cls.__setitem__
+
+        def _setitem(self, key, val, _orig=_orig_setitem):
+            if key not in _LATEX_SAFE:
+                return _orig(self, key, val)
+            safe = _LATEX_SAFE[key]
+            # Let matplotlib VALIDATE first, then compare: rcParams arrive
+            # from a matplotlibrc as raw strings, so comparing the incoming
+            # value directly would report the string "False" as a refusal.
+            try:
+                _orig(self, key, val)
+            except Exception:
+                return _orig(self, key, safe)
+            if dict.__getitem__(self, key) == safe:
+                return None
+            if key not in _LATEX_REFUSED:
+                _LATEX_REFUSED.append(key)
+                print(f"[latex] REFUSED {key}={val!r} -> {safe!r} "
+                      f"(this page never routes text through LaTeX)",
+                      file=sys.stderr)
+            return _orig(self, key, safe)
+
+        rc_cls.__setitem__ = _setitem
+        rc_cls._gf_latex_locked = True
+    for _k, _v in _LATEX_SAFE.items():
+        matplotlib.rcParams[_k] = _v
+
+    # The other door into a TeX binary is the pgf backend: Agg is forced
+    # above, but savefig("x.pgf") or a stray switch_backend would still reach
+    # for one. matplotlib.use() before pyplot exists only sets rcParams;
+    # afterwards it delegates to pyplot.switch_backend, so both are wrapped.
+    def _guard_backend(mod, name):
+        orig = getattr(mod, name)
+        if getattr(orig, "_gf_latex_locked", False):
+            return
+
+        def _wrapped(backend, *a, _orig=orig, **kw):
+            if str(backend).lower().startswith("pgf"):
+                print(f"[latex] REFUSED backend {backend!r} -> 'Agg'",
+                      file=sys.stderr)
+                backend = "Agg"
+            return _orig(backend, *a, **kw)
+
+        _wrapped._gf_latex_locked = True
+        setattr(mod, name, _wrapped)
+
+    _guard_backend(matplotlib, "use")
+    if pyplot is not None:
+        _guard_backend(pyplot, "switch_backend")
+
+
+_refuse_latex()
 import matplotlib.pyplot as plt
+_refuse_latex(plt)   # pyplot import re-reads matplotlibrc; re-assert after it
 
 RUN_DIR = sys.argv[1] if len(sys.argv) > 1 else "prod3mo/gf_prod_3mo"
 OUT = sys.argv[2] if len(sys.argv) > 2 else "gf_monitor.html"
@@ -82,9 +176,9 @@ plt.rcParams.update({
     "axes.grid": True, "grid.linewidth": 0.6, "grid.alpha": 0.5,
     "font.size": 10, "font.family": "monospace", "axes.titlesize": 11,
     "legend.frameon": False, "figure.dpi": 110,
-    # Never route text through LaTeX: a matplotlibrc with text.usetex=True
-    # makes every unescaped underscore in these titles ("psd: Soms_d") a TeX
-    # RuntimeError, and the page needs nothing beyond built-in mathtext.
+    # Never route text through LaTeX. This line is now belt-and-braces: the
+    # value is LOCKED at the class level by _refuse_latex() above, so it
+    # cannot be turned back on later either. See that block for why.
     "text.usetex": False,
 })
 
@@ -2959,6 +3053,19 @@ try:
     # informational -- an unconstrained VGB angle is a RESULT, not a fault).
     logging.getLogger("chainconsumer").setLevel(logging.ERROR)
 
+    # LaTeX refusal, chainconsumer edition. Its plotter has TWO usetex paths:
+    # plotter.py stamps ``plt.rc("text", usetex=config.usetex)`` (caught by the
+    # class-level rcParams lock at the top of this file) but ALSO hands
+    # ``config.usetex`` straight to matplotlib's TextPath() when it measures
+    # tick labels -- an argument, not an rcParam, so the lock cannot see it.
+    # The field defaults to None (= don't touch), which is already safe; pin it
+    # to False anyway so a future default flip cannot reach a TeX binary.
+    _PC_NO_TEX = ({"usetex": False}
+                  if "usetex" in (getattr(PlotConfig, "model_fields", None)
+                                  or getattr(PlotConfig, "__fields__", None)
+                                  or {})
+                  else {})
+
     def corner_png(Sm, names, truth, title, size_in=None, tally=None,
                    dpi=None, label_fs=8, tick_fs=7, smooth=None, bins=None):
         """Samples -> a base64 PNG of their ChainConsumer corner.
@@ -3013,7 +3120,8 @@ try:
                 labels={nm_: nm_ for nm_ in names}, extents=ext,
                 label_font_size=label_fs, tick_font_size=tick_fs, max_ticks=3,
                 diagonal_tick_labels=False,
-                show_legend=False, summarise=False, dpi=_dpi))
+                show_legend=False, summarise=False, dpi=_dpi,
+                **_PC_NO_TEX))
             _sz = size_in or CORNER_IN
             fig_ = cc.plotter.plot(figsize=(_sz, _sz))
         fig_.suptitle(title, fontsize=9 if _dpi <= 80 else 11, color=FG)
