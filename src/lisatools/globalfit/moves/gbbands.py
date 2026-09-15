@@ -50,10 +50,12 @@ from ...analysiscontainer import (
 )
 from ...domains import DomainSettingsBase, FDSettings, STFTSettings, WDMSettings
 from ...sensitivity import SensitivityMatrixBase
-from ...utils.device import device_context
+from ...utils.constants import AU_SI, C_SI, YRSID_SI
+from ...utils.device import assert_peer_access, device_context
 from ...utils.devicereplicas import device_local_gb_comp, device_local_orbits
 from ...utils.parallelbase import LISAToolsParallelModule
 from ...utils.utility import asnumpy, get_array_module
+from .gbbandstructure import STFT_F0_LIMIT_FRACTION
 
 __all__ = [
     "pack_special_index",
@@ -198,6 +200,80 @@ def unpack_special_index(special_band_inds, nwalkers: int) -> tuple:
 def return_x(x):
     """Identity helper used as a no-op replacement for :func:`copy.deepcopy`."""
     return x
+
+
+class StoreWindowTrackCounter:
+    """Kernel rows whose predicted carrier span leaves their cell's store window.
+
+    Counts only: nothing is rejected, so the posterior is unchanged. Rows are kept on the device
+    until :meth:`summary`, which synchronises once.
+    """
+
+    def __init__(self):
+        self.rows_evaluated = 0
+        self.rows_outside = 0
+        self._cells_outside = set()
+        self._pending = []
+
+    def record(self, outside, cell_specials) -> None:
+        """Queue one launch: ``outside`` per row, and the special index of each row's cell."""
+        xp = get_array_module(outside)
+        self.rows_evaluated += int(outside.shape[0])
+        # ? -1 marks rows inside their window; special indices are never negative.
+        self._pending.append(xp.where(outside, cell_specials, -1))
+
+    def _flush(self) -> None:
+        if not self._pending:
+            return
+        xp = get_array_module(self._pending[0])
+        marked = xp.concatenate(self._pending)
+        self._pending = []
+        outside = marked[marked >= 0]
+        self.rows_outside += int(outside.shape[0])
+        self._cells_outside.update(asnumpy(xp.unique(outside)).tolist())
+
+    def summary(self) -> str:
+        self._flush()
+        return (
+            f"store-window track check: {self.rows_outside} of {self.rows_evaluated} rows "
+            f"outside their window, {len(self._cells_outside)} cells affected"
+        )
+
+
+def _stft_window_copy_kernel():
+    """CuPy kernel copying ``nf_dst`` bins per row block from ``src`` into ``dst``, both flat.
+
+    Cell ``k`` writes ``dst[dst_rows[k], l, f] = src[src_rows[k], l, starts[k] + f]``, where ``l``
+    runs over the ``lead`` (channel x time) entries of one cell.
+    """
+    kernel = getattr(_stft_window_copy_kernel, "_kernel", None)
+    if kernel is None:
+        kernel = cp.ElementwiseKernel(
+            "raw T src, raw int64 src_rows, raw int64 dst_rows, raw int64 starts, "
+            "int64 lead, int64 nf_src, int64 nf_dst",
+            "raw T dst",
+            """
+            const long long block = lead * nf_dst;
+            const long long cell = i / block;
+            const long long row_offset = (i % block) / nf_dst;
+            const long long bin = (i % block) % nf_dst;
+            dst[(dst_rows[cell] * lead + row_offset) * nf_dst + bin] =
+                src[(src_rows[cell] * lead + row_offset) * nf_src + starts[cell] + bin];
+            """,
+            "lat_stft_window_copy",
+        )
+        _stft_window_copy_kernel._kernel = kernel
+    return kernel
+
+
+def _stride_or_index(xp, rows: np.ndarray):
+    """A slice when ``rows`` is one ascending stride, so indexing a shard makes a view; else an index array."""
+    if rows.shape[0] == 1:
+        return slice(int(rows[0]), int(rows[0]) + 1)
+    steps = np.diff(rows)
+    if steps[0] > 0 and bool((steps == steps[0]).all()):
+        return slice(int(rows[0]), int(rows[-1]) + 1, int(steps[0]))
+    return xp.asarray(rows)
 
 
 class BandScheduler:
@@ -1097,6 +1173,10 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
     adding a source to the model subtracts it (``factor=-1``).
     """
 
+    stft_store_windows = None
+    track_counter = None
+    _stft_cell_width_value = None
+
     @property
     def xp(self) -> Union[ModuleType, numpy, cupy]:
         """Active array module (NumPy or CuPy) for this buffer.
@@ -1165,6 +1245,8 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         gb_wdm_comp=None,
         gb_fd_comp=None,
         gb_stft_comp=None,
+        stft_store_windows=None,
+        track_counter: Optional[StoreWindowTrackCounter] = None,
         *args,
         **kwargs,
     ):
@@ -1196,18 +1278,39 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         # FD store length of one cell window; kept distinct from the ACA's
         # ``data_length`` layout attribute (see :attr:`_fd_store_length`).
         self._fd_store_length_value = data_length
-        self.band_N_vals = self.xp.asarray(band_N_vals)
+        self.band_N_vals = self.xp.asarray(band_N_vals) if band_N_vals is not None else None
         # TODO: adjust this
         self.edge_buffer = 2000
         self.is_rj = is_rj
+        
+        if basis_settings is None:
+            basis_settings = FDSettings(
+                N=self.data_length,
+                df=float(self.df) if not hasattr(self.df, "item") else self.df.item(),
+            )
+        self._basis_settings = basis_settings
 
-        # Frequency-clipped parent domains (FDSettings with min/max_freq)
-        # store only bins [ind_min, ind_max]. Every per-cell FD window (and
-        # its start index) must live inside that range: clamp the window
-        # length here -- BEFORE the ``special_indices_unique`` setter below
-        # computes start indices and before the buffers are allocated -- and
-        # record the parent bounds for the start-index clamp in the setter.
-        # WDM and legacy full-grid FD paths are untouched.
+        # * STFT cells hold a store window of the parent grid; without windows a cell is the full grid.
+        self.stft_store_windows = None
+        self.track_counter = None
+        if isinstance(basis_settings, STFTSettings):
+            self.stft_store_windows = stft_store_windows
+            self.track_counter = track_counter if stft_store_windows is not None else None
+            if stft_store_windows is None:
+                self._stft_cell_width_value = int(basis_settings.NF_active)
+            else:
+                if gb_stft_comp is not None and stft_store_windows.n_side_bins != gb_stft_comp.n_side_bins:
+                    raise ValueError(
+                        f"store windows were sized for n_side_bins={stft_store_windows.n_side_bins}, "
+                        f"the STFT comp evaluates {gb_stft_comp.n_side_bins}."
+                    )
+                if stft_store_windows.n_grid_bins != int(basis_settings.NF_active):
+                    raise ValueError(
+                        f"store windows index a {stft_store_windows.n_grid_bins}-bin grid, the parent "
+                        f"has NF_active={int(basis_settings.NF_active)}."
+                    )
+                self._stft_cell_width_value = stft_store_windows.buffer_width
+
         self._parent_ind_min = None
         self._parent_stored_len = None
         if (
@@ -1241,18 +1344,6 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         else:
             assert "A" in self.tdi_channel_setup and "E" in self.tdi_channel_setup
             logger.warning("using AE(T) channels where we assume ortogonality. This may not be sufficient for realistic orbtis.")
-
-        # Resolve the parent basis-domain settings. Defaults to an FD grid
-        # consistent with the legacy Buffer behavior (data_length bins on the
-        # parent's df). When invoked via BandSorter.get_buffer, the parent
-        # AnalysisContainerArray's settings are forwarded so this buffer can
-        # branch on the actual domain (FD vs WDM).
-        if basis_settings is None:
-            basis_settings = FDSettings(
-                N=self.data_length,
-                df=float(self.df) if not hasattr(self.df, "item") else self.df.item(),
-            )
-        self._basis_settings = basis_settings
 
         # Build the per-cell AnalysisContainers and initialise *ourselves* as
         # the AnalysisContainerArray that owns them. On the WDM path the ACA
@@ -1445,6 +1536,13 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         return self._basis_settings
 
     @property
+    def _stft_cell_width(self) -> int:
+        """Frequency bins one STFT cell holds: its store window, or the whole active grid."""
+        if self._stft_cell_width_value is None:
+            return int(self._basis_settings.NF_active)
+        return int(self._stft_cell_width_value)
+
+    @property
     def _per_band_data_shape(self) -> tuple:
         """Shape of a single band's residual buffer (one AC's data_res_arr)."""
         if isinstance(self._basis_settings, FDSettings):
@@ -1459,13 +1557,11 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             Nt_active = self._basis_settings.Nt_active
             return (self.nchannels, Nf_active, Nt_active)
         elif isinstance(self._basis_settings, STFTSettings):
-            # First-cut: full STFT active grid per band, mirroring the WDM
-            # first-cut above (the Fresnel kernels address the domain-global
-            # (NT, NF_active) grid; per-band frequency slicing is a follow-on).
+            # * A cell holds its store window; the kernels place pixels through the per-cell starts.
             return (
                 self.nchannels,
                 self._basis_settings.NT,
-                self._basis_settings.NF_active,
+                self._stft_cell_width,
             )
         else:
             raise NotImplementedError(
@@ -1487,10 +1583,9 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             return (self.nchannels, Nf_active, Nt_active)
         elif isinstance(self._basis_settings, STFTSettings):
             NT = self._basis_settings.NT
-            NF_active = self._basis_settings.NF_active
             if self.tdi_channel_setup == "XYZ":
-                return (self.nchannels, self.nchannels, NT, NF_active)
-            return (self.nchannels, NT, NF_active)
+                return (self.nchannels, self.nchannels, NT, self._stft_cell_width)
+            return (self.nchannels, NT, self._stft_cell_width)
         else:
             raise NotImplementedError(
                 f"Buffer does not support basis domain {type(self._basis_settings).__name__}."
@@ -1565,12 +1660,24 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                 max_time=parent.ind_max_t * parent.layer_dt,
             )
         elif isinstance(self._basis_settings, STFTSettings):
-            # First-cut: per-band settings replicate the parent grid (full
-            # active band per band buffer, like the WDM branch above). The
-            # args/kwargs round-trip reconstructs from the RAW min/max_freq
+            # The args/kwargs round-trip reconstructs from the RAW min/max_freq
             # inputs, keeping ind_min/ind_max identical to the parent's.
             parent = self._basis_settings
-            return type(parent)(*parent.args, **parent.kwargs)
+            if self.stft_store_windows is None:
+                return type(parent)(*parent.args, **parent.kwargs)
+            width = self._stft_cell_width
+            cell_settings = type(parent)(
+                *parent.args,
+                min_freq=max(parent.ind_min - 0.5, 0.0) * parent.df,
+                max_freq=(parent.ind_min + width - 0.5) * parent.df,
+                force_backend=parent.kwargs["force_backend"],
+            )
+            if cell_settings.NF_active != width or cell_settings.min_freq != parent.min_freq:
+                raise RuntimeError(
+                    f"windowed cell settings have NF_active={cell_settings.NF_active} and "
+                    f"min_freq={cell_settings.min_freq}; expected {width} and {parent.min_freq}."
+                )
+            return cell_settings
         else:
             raise NotImplementedError(
                 f"Buffer does not support basis domain {type(self._basis_settings).__name__}."
@@ -1722,60 +1829,144 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
 
         self.unique_band_combos = self.xp.array([_temp_inds, _walker_inds, _band_inds]).T
 
-        if self.num_bands == 1:
-            tmp_buffer_start_index = (self.band_edges[0] / self.df).astype(
-                np.int32
-            ) - self.edge_buffer
-            if getattr(self, "_parent_ind_min", None) is None:
-                # Legacy full-grid parent: the single window must cover the
-                # whole band plus both edge buffers. (With a frequency-
-                # clipped parent this is un-satisfiable by construction --
-                # the clamp below shifts/shrinks the window instead.)
-                assert tmp_buffer_start_index + self._fd_store_length >= (
-                    (self.band_edges[-1] / self.df).astype(np.int32) + self.edge_buffer
+        if isinstance(self._basis_settings, FDSettings):
+            if self.num_bands == 1:
+                tmp_buffer_start_index = (self.band_edges[0] / self.df).astype(
+                    np.int32
+                ) - self.edge_buffer
+                if getattr(self, "_parent_ind_min", None) is None:
+                    # Legacy full-grid parent: the single window must cover the
+                    # whole band plus both edge buffers. (With a frequency-
+                    # clipped parent this is un-satisfiable by construction --
+                    # the clamp below shifts/shrinks the window instead.)
+                    assert tmp_buffer_start_index + self._fd_store_length >= (
+                        (self.band_edges[-1] / self.df).astype(np.int32) + self.edge_buffer
+                    )
+                self.buffer_start_index = self.xp.repeat(
+                    tmp_buffer_start_index, self.unique_band_combos.shape[0]
                 )
-            self.buffer_start_index = self.xp.repeat(
-                tmp_buffer_start_index, self.unique_band_combos.shape[0]
+
+            else:
+                self.buffer_start_index = (
+                    self.band_edges[self.unique_band_combos[:, 2] - 1] / self.df
+                ).astype(np.int32)
+                self.buffer_start_index[self.unique_band_combos[:, 2] == 0] = (
+                    self.band_edges[0] / self.df
+                ).astype(np.int32) - self.edge_buffer
+                # Clamp so buffer end never overflows the data range (band_edges[-1])
+                max_start = int(self.band_edges[-1] / self.df) - self._fd_store_length
+                self.buffer_start_index = np.minimum(self.buffer_start_index, max_start)
+
+            if getattr(self, "_parent_ind_min", None) is not None:
+                # Frequency-clipped parent: clamp every window into the stored
+                # bin range [ind_min, ind_min + stored_len - window]. Edge cells
+                # lose their out-of-domain guard margin (the parent stores
+                # nothing there); the engines read placement from
+                # ``start_freq_inds`` so a shifted window stays consistent.
+                lo = self._parent_ind_min
+                hi = max(lo, lo + self._parent_stored_len - self._fd_store_length)
+                self.buffer_start_index = self.xp.clip(self.buffer_start_index, lo, hi)
+
+            self.start_freq_inds = self.xp.asarray(self.buffer_start_index.copy().astype(np.int32))
+            if hasattr(self, "_min_freq_inds_store"):
+                # in-place: the FD comps clone holds a pointer to this array
+                self._min_freq_inds_store[:] = self.start_freq_inds
+        elif isinstance(self._basis_settings, WDMSettings):
+            self.buffer_start_index = self.xp.full(
+                self.num_bands_now, self._basis_settings.ind_min_f, dtype=self.xp.int32
+            )
+            self.start_freq_inds = self.buffer_start_index
+        elif isinstance(self._basis_settings, STFTSettings):
+            # * Active-bin window start of each slot; 0 everywhere is the full grid.
+            if self.stft_store_windows is None:
+                starts_host = np.zeros(self.num_bands_now, dtype=np.int32)
+            else:
+                starts_host = self.stft_store_windows.window_starts(_band_inds, self._stft_cell_width)
+            self._stft_start_inds_host = starts_host
+            self.buffer_start_index = self.xp.asarray(starts_host)
+            self.start_freq_inds = self.buffer_start_index
+            if getattr(self, "stft_split_start_inds", None) is not None:
+                self._refresh_stft_split_start_inds()
+        else:
+            raise NotImplementedError(
+                f"Buffer does not support basis domain {type(self._basis_settings).__name__}."
             )
 
-        else:
-            self.buffer_start_index = (
-                self.band_edges[self.unique_band_combos[:, 2] - 1] / self.df
-            ).astype(np.int32)
-            self.buffer_start_index[self.unique_band_combos[:, 2] == 0] = (
-                self.band_edges[0] / self.df
-            ).astype(np.int32) - self.edge_buffer
-            # Clamp so buffer end never overflows the data range (band_edges[-1])
-            max_start = int(self.band_edges[-1] / self.df) - self._fd_store_length
-            self.buffer_start_index = np.minimum(self.buffer_start_index, max_start)
+        self.frequency_lims = self._compute_frequency_lims()
 
-        if getattr(self, "_parent_ind_min", None) is not None:
-            # Frequency-clipped parent: clamp every window into the stored
-            # bin range [ind_min, ind_min + stored_len - window]. Edge cells
-            # lose their out-of-domain guard margin (the parent stores
-            # nothing there); the engines read placement from
-            # ``start_freq_inds`` so a shifted window stays consistent.
-            lo = self._parent_ind_min
-            hi = max(lo, lo + self._parent_stored_len - self._fd_store_length)
-            self.buffer_start_index = self.xp.clip(self.buffer_start_index, lo, hi)
+    def _count_window_tracks(self, params_phys, data_index) -> None:
+        """Record the kernel rows whose predicted carrier span leaves their slot's store window.
 
-        self.start_freq_inds = self.xp.asarray(self.buffer_start_index.copy().astype(np.int32))
-        if hasattr(self, "_min_freq_inds_store"):
-            # in-place: the FD comps clone holds a pointer to this array
-            self._min_freq_inds_store[:] = self.start_freq_inds
+        The span is f0 + fdot (t - t_ref) over the data, widened by the largest Doppler amplitude and
+        the stencil. A window edge that is also a grid edge does not count: the full grid drops those
+        pixels too. Carrier jumps near antenna-pattern nulls are not predicted.
+        """
+        if self.track_counter is None:
+            return
+        xp = self.xp
+        settings = self._basis_settings
+        params_phys = xp.atleast_2d(xp.asarray(params_phys))
+        data_index = xp.asarray(data_index).astype(xp.int64)
+        t_ref = float(self.gb_stft_comp.t_ref)
+        time_first = float(settings.t0) - t_ref
+        time_last = float(settings.t0) + int(settings.NT) * float(settings.dt) - t_ref
+        f0, fdot = params_phys[:, 1], params_phys[:, 2]
+        f_first = f0 + fdot * time_first
+        f_last = f0 + fdot * time_last
+        doppler = 2.0 * np.pi * f0 * (AU_SI / C_SI) / YRSID_SI
+        df, f_min = float(settings.df), float(settings.min_freq)
+        n_side = int(self.gb_stft_comp.n_side_bins)
+        bin_lo = xp.rint((xp.minimum(f_first, f_last) - doppler - f_min) / df) - n_side
+        bin_hi = xp.rint((xp.maximum(f_first, f_last) + doppler - f_min) / df) + n_side
+        window_lo = self.buffer_start_index[data_index].astype(xp.int64)
+        window_hi = window_lo + self._stft_cell_width - 1
+        grid_hi = int(settings.NF_active) - 1
+        outside = ((bin_lo < window_lo) & (window_lo > 0)) | ((bin_hi > window_hi) & (window_hi < grid_hi))
+        self.track_counter.record(outside, self.special_indices_unique[data_index])
 
+    def _refresh_stft_split_start_inds(self) -> None:
+        """Copy the slot window starts into the per-split int32 stores the STFT kernels read.
+
+        One store per split, on the split's device and in ``gpu_splits[s]`` order, so a kernel indexes
+        it with the intra-split slot. Updated in place after the first build, so the pointer a kernel
+        receives never changes over the buffer's life.
+        """
+        stores = getattr(self, "stft_split_start_inds", None)
+        first_build = stores is None
+        if first_build:
+            stores = []
+        for split, rows in enumerate(self.gpu_splits):
+            values = np.ascontiguousarray(
+                self._stft_start_inds_host[np.asarray(asnumpy(rows), dtype=int)], dtype=np.int32
+            )
+            device = None if self.gpus is None else int(self.gpus[split])
+            with device_context(self.xp, device):
+                if first_build:
+                    stores.append(self.xp.array(values, dtype=self.xp.int32))
+                else:
+                    stores[split][...] = self.xp.asarray(values)
+        self.stft_split_start_inds = stores
+
+    def _compute_frequency_lims(self):
         lower_f_lim = self.band_edges[
             self.unique_band_combos[:, 2]
-        ]  #  - self.band_N_vals[self.unique_band_combos[:, 2]] * self.df / 4
+        ].copy()
         higher_f_lim = self.band_edges[
             self.unique_band_combos[:, 2] + 1
-        ]  #  + self.band_N_vals[self.unique_band_combos[:, 2]] * self.df / 4
+        ].copy()
 
         # allow to move over band edge when proposing in-model
-        if self.is_rj:
-            lower_f_lim -= self.band_N_vals[self.unique_band_combos[:, 2]] * self.df / 4
-            higher_f_lim += self.band_N_vals[self.unique_band_combos[:, 2]] * self.df / 4
-        self.frequency_lims = [lower_f_lim, higher_f_lim]
+        if isinstance(self._basis_settings, FDSettings):
+            if self.is_rj and self.band_N_vals is not None:
+                lower_f_lim -= self.band_N_vals[self.unique_band_combos[:, 2]] * self.df / 4
+                higher_f_lim += self.band_N_vals[self.unique_band_combos[:, 2]] * self.df / 4
+        else:
+            # WDM and STFT: frequency limits are 1/4th of the current band padded to the band's edges
+            # * The STFT store windows are sized for exactly this padding.
+            band_width = higher_f_lim - lower_f_lim
+            lower_f_lim -= band_width * STFT_F0_LIMIT_FRACTION
+            higher_f_lim += band_width * STFT_F0_LIMIT_FRACTION
+        return [lower_f_lim, higher_f_lim]
 
     @property
     def _fd_store_length(self) -> int:
@@ -1804,12 +1995,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                 self.num_bands_now, self._basis_settings.ind_min_f, dtype=self.xp.int32
             )
         if isinstance(self._basis_settings, STFTSettings):
-            # STFT slabs cover the full active grid; placement is absolute
-            # (the Fresnel kernels address the domain-global grid), so every
-            # slot starts at the parent's active-band FD bin ind_min.
-            return self.xp.full(
-                self.num_bands_now, self._basis_settings.ind_min, dtype=self.xp.int32
-            )
+            return self.buffer_start_index
         return self._min_freq_inds_store
 
     @property
@@ -1909,6 +2095,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         """
         params_remove_phys = self.transform_fn.both_transforms(params_remove, xp=self.xp)
         params_add_phys = self.transform_fn.both_transforms(params_add, xp=self.xp)
+        self._count_window_tracks(params_add_phys, data_index)
 
         result = self._likelihood_engine.get_swap_ll(
             self,
@@ -1957,6 +2144,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         the maximising rotation when ``phase_maximize=True``.
         """
         params_phys = self.transform_fn.both_transforms(params, xp=self.xp)
+        self._count_window_tracks(params_phys, data_index)
         ll = self._likelihood_engine.get_ll(
             self,
             params_phys,
@@ -2055,6 +2243,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         backed ``gb_wdm_comp`` if you need the autograd path.
         """
         params_phys = self.transform_fn.both_transforms(params, xp=self.xp)
+        self._count_window_tracks(params_phys, data_index)
         return self._likelihood_engine.get_ll_grad(
             self,
             params_phys,
@@ -2122,6 +2311,10 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         if inds_fill is None:
             inds_fill = self.xp.arange(self.num_bands_now)
 
+        if isinstance(self._basis_settings, STFTSettings):
+            self._fill_stft_windows(acs, inds_fill)
+            return
+
         outer_data_view = acs.data_shaped_view()
         outer_psd_view = acs.psd_shaped_view()
 
@@ -2147,72 +2340,126 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         self.psd_buffer[inds_fill] = psd_vals
         del inds_get_psd
 
+    def _fill_stft_windows(self, acs: AnalysisContainerArray, inds_fill) -> None:
+        """Copy each slot's store window of its walker's residual and inverse CSD from the parent.
+
+        Writes straight into the buffer rows, with no full-grid temporary and no index array larger
+        than one entry per cell. Cells are grouped by (parent split, buffer split).
+        """
+        slots = np.asarray(asnumpy(inds_fill), dtype=int)
+        walkers = np.asarray(asnumpy(self.unique_band_combos[inds_fill, 1]), dtype=int)
+        starts = self._stft_start_inds_host[slots].astype(np.int64)
+        nf_parent = int(self._basis_settings.NF_active)
+        nf_cell = int(self._stft_cell_width)
+        num_times = int(self._basis_settings.NT)
+        # * Entries of one cell ahead of the frequency axis: channels x times, or channel pairs x times.
+        lead_data = int(self.nchannels) * num_times
+        lead_psd = int(np.prod(self.shape_sens)) * num_times
+
+        parent_split = np.asarray(acs.split_map)[walkers]
+        cell_split = np.asarray(self.split_map)[slots]
+        parent_rows = np.asarray(acs.ac_to_intra)[walkers].astype(np.int64)
+        cell_rows = np.asarray(self.ac_to_intra)[slots].astype(np.int64)
+        for split_src in np.unique(parent_split):
+            for split_dst in np.unique(cell_split):
+                cells = np.where((parent_split == split_src) & (cell_split == split_dst))[0]
+                if cells.size == 0:
+                    continue
+                device_src = None if acs.gpus is None else int(acs.gpus[split_src])
+                device_dst = None if self.gpus is None else int(self.gpus[split_dst])
+                for src, dst, lead in (
+                    (acs.linear_data_arr[split_src], self.linear_data_arr[split_dst], lead_data),
+                    (acs.linear_psd_arr[split_src], self.linear_psd_arr[split_dst], lead_psd),
+                ):
+                    self._copy_stft_windows(
+                        src, dst, parent_rows[cells], cell_rows[cells], starts[cells],
+                        lead, nf_parent, nf_cell, device_src, device_dst,
+                    )
+
+    def _copy_stft_windows(self, src, dst, src_rows, dst_rows, starts, lead, nf_src, nf_dst,
+                           device_src, device_dst) -> None:
+        """``dst[dst_rows[k], l, f] = src[src_rows[k], l, starts[k] + f]`` on flat buffers."""
+        if not self.backend.uses_cupy:
+            src_shaped = src.reshape(-1, lead, nf_src)
+            dst_shaped = dst.reshape(-1, lead, nf_dst)
+            for src_row, dst_row, start in zip(src_rows, dst_rows, starts):
+                dst_shaped[dst_row] = src_shaped[src_row, :, start:start + nf_dst]
+            return
+
+        num_cells = int(src_rows.shape[0])
+        kernel = _stft_window_copy_kernel()
+        same_device = device_src == device_dst
+        with device_context(self.xp, device_src):
+            if same_device:
+                target, target_rows = dst, cp.asarray(dst_rows)
+            else:
+                target = cp.empty(num_cells * lead * nf_dst, dtype=dst.dtype)
+                target_rows = cp.arange(num_cells, dtype=cp.int64)
+            kernel(src, cp.asarray(src_rows), target_rows, cp.asarray(starts),
+                   lead, nf_src, nf_dst, target, size=num_cells * lead * nf_dst)
+            if same_device:
+                return
+            target_ready = cp.cuda.Event(block=False, disable_timing=True)
+            target_ready.record()
+        # * Peer copy: the previous route through pageable host memory was 8x slower on gpu04.
+        assert_peer_access(self.xp, [device_src, device_dst], context="SubBandBuffer window copy")
+        with device_context(self.xp, device_dst):
+            cp.cuda.get_current_stream().wait_event(target_ready)
+            block = cp.asarray(target).reshape(num_cells, lead * nf_dst)
+            dst.reshape(-1, lead * nf_dst)[cp.asarray(dst_rows)] = block
+
+    def verify_against_parent(self, acs: AnalysisContainerArray, inds_fill) -> None:
+        """Check a freshly filled buffer against the parent ACA. ``verify_buffer`` only.
+
+        Every cell's residual and inverse CSD must equal the parent's for that walker, bit for
+        bit, and each cell's ``sens_mat`` must be its own ``invC`` view. This is what the
+        construction path is allowed to affect, so it isolates construction changes from the
+        run-to-run scatter of the sampler itself.
+        """
+        # ! The comparison reads other devices' cells from the caller's device, which orders nothing.
+        if self.gpus is not None and self.backend.uses_cupy:
+            for device in self.gpus:
+                with device_context(self.xp, int(device)):
+                    self.xp.cuda.runtime.deviceSynchronize()
+        outer_data = acs.data_shaped_view()
+        outer_psd = acs.psd_shaped_view()
+        walkers = self.unique_band_combos[inds_fill, 1]
+        data_bad = psd_bad = alias_bad = 0
+        is_stft = isinstance(self._basis_settings, STFTSettings)
+        for slot, walker in zip(_to_numpy(inds_fill).tolist(), _to_numpy(walkers).tolist()):
+            window = slice(None)
+            if is_stft:
+                start = int(self._stft_start_inds_host[slot])
+                window = slice(start, start + self._stft_cell_width)
+            if not bool((self._materialize(self.band_buffer[slot]) == outer_data[walker][..., window]).all()):
+                data_bad += 1
+            if not bool((self._materialize(self.psd_buffer[slot]) == outer_psd[walker][..., window]).all()):
+                psd_bad += 1
+        for acs_here in (self, self._acs_template_buffer) if self.use_template_arr else (self,):
+            for ac in acs_here.acs.flatten():
+                if ac.sens_mat.sens_mat is not ac.sens_mat.invC:
+                    alias_bad += 1
+        logger.info(
+            "[VERIFY_BUFFER] %d cells: residual mismatches %d, inverse CSD mismatches %d, "
+            "sens_mat not aliasing invC %d",
+            len(walkers), data_bad, psd_bad, alias_bad,
+        )
+
     def _get_fill_buffer_ind_map(
         self, acs: AnalysisContainerArray, inds_fill: Optional[cp.ndarray] = None, is_psd: bool = False
-    ) -> Tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
+    ) -> Union[Tuple[Any, ...], Any]:
 
-        if isinstance(self._basis_settings, WDMSettings):
-            # First-cut WDM fill index map. Per-band buffers cover the full
-            # WDM active grid, so the index map is the simplest possible: it
-            # picks each band's entire (channel, Nf_active, Nt_active) slab
-            # out of the parent ACA. The data axis position is taken from
-            # unique_band_combos[:, 1] (the parent data index for that band).
+        if isinstance(self._basis_settings, (WDMSettings, STFTSettings)):
+            # Per-band buffers cover the full active grid (WDM: (Nf_active, Nt_active);
+            # STFT: (NT, NF_active)), so each band takes its entire (channel, ...) slab
+            # out of the parent ACA. Returning the 1D parent walker indices allows
+            # BandView.__getitem__ to route directly to _gather (a direct slice along
+            # axis 0), avoiding multi-gigabyte 4D/5D Cartesian broadcast indexing arrays.
             if inds_fill is None:
                 inds_fill = self.xp.arange(self.num_bands_now)
 
-            Nf_active = self._basis_settings.Nf_active
-            Nt_active = self._basis_settings.Nt_active
+            return self.unique_band_combos[inds_fill, 1]
 
-            if is_psd and self.tdi_channel_setup == "XYZ":
-                # target shape: (len(inds_fill), nchannels, nchannels, Nf_active, Nt_active)
-                # The parent WDM ACA's psd_shaped[0] has shape
-                # ``(num_walkers, nchan, nchan, Nf_active, Nt_active)`` — one
-                # entry per walker with channels as inner axes. Unlike the FD
-                # path (which flattens walker*channel into axis 0), here we
-                # index axis 0 with the raw walker index and need a full
-                # 5-tuple to cover all five axes.
-                inds1 = self.unique_band_combos[inds_fill, 1][:, None, None, None, None]
-                inds2 = self.xp.arange(self.nchannels)[None, :, None, None, None]
-                inds3 = self.xp.arange(self.nchannels)[None, None, :, None, None]
-                inds4 = self.xp.arange(Nf_active)[None, None, None, :, None]
-                inds5 = self.xp.arange(Nt_active)[None, None, None, None, :]
-                return inds1, inds2, inds3, inds4, inds5
-
-            # target shape: (len(inds_fill), nchannels, Nf_active, Nt_active)
-            inds1 = self.unique_band_combos[inds_fill, 1][:, None, None, None]
-            inds2 = self.xp.arange(self.nchannels)[None, :, None, None]
-            inds3 = self.xp.arange(Nf_active)[None, None, :, None]
-            inds4 = self.xp.arange(Nt_active)[None, None, None, :]
-            return inds1, inds2, inds3, inds4
-        if isinstance(self._basis_settings, STFTSettings):
-            # First-cut STFT fill index map (WDM parity): per-band buffers
-            # cover the full STFT active grid, so pick each band's entire
-            # (channel, NT, NF_active) slab out of the parent ACA, keyed by
-            # the band's parent data index (unique_band_combos[:, 1]). Note
-            # the STFT axis order is (NT, NF_active) -- time-major, the
-            # transpose of the WDM (Nf, Nt) slab above.
-            if inds_fill is None:
-                inds_fill = self.xp.arange(self.num_bands_now)
-
-            NT = self._basis_settings.NT
-            NF_active = self._basis_settings.NF_active
-
-            if is_psd and self.tdi_channel_setup == "XYZ":
-                # target shape:
-                # (len(inds_fill), nchannels, nchannels, NT, NF_active)
-                inds1 = self.unique_band_combos[inds_fill, 1][:, None, None, None, None]
-                inds2 = self.xp.arange(self.nchannels)[None, :, None, None, None]
-                inds3 = self.xp.arange(self.nchannels)[None, None, :, None, None]
-                inds4 = self.xp.arange(NT)[None, None, None, :, None]
-                inds5 = self.xp.arange(NF_active)[None, None, None, None, :]
-                return inds1, inds2, inds3, inds4, inds5
-
-            # target shape: (len(inds_fill), nchannels, NT, NF_active)
-            inds1 = self.unique_band_combos[inds_fill, 1][:, None, None, None]
-            inds2 = self.xp.arange(self.nchannels)[None, :, None, None]
-            inds3 = self.xp.arange(NT)[None, None, :, None]
-            inds4 = self.xp.arange(NF_active)[None, None, None, :]
-            return inds1, inds2, inds3, inds4
         if not isinstance(self._basis_settings, FDSettings):
             raise NotImplementedError(
                 f"Buffer does not support basis domain {type(self._basis_settings).__name__}."
@@ -2287,6 +2534,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         """
         assert isinstance(factor, int) and (factor == -1 or factor == +1)
         params_phys = self.transform_fn.both_transforms(params, xp=self.xp)
+        self._count_window_tracks(params_phys, params_index)
         self._likelihood_engine.fill_template(
             target_aca,
             params_phys,
@@ -2379,6 +2627,8 @@ class BandSorter(LISAToolsParallelModule):
         max_data_store_size: int = 6000,
         rj_prop=None,
         keep_all_inds=True,
+        stft_store_windows=None,
+        verify_buffer: bool = False,
     ):
 
         LISAToolsParallelModule.__init__(self, force_backend=force_backend)
@@ -2398,6 +2648,7 @@ class BandSorter(LISAToolsParallelModule):
                         "gb_fd_comp",
                         "gb_stft_comp",
                         "rj_prop",
+                        "stft_store_windows",
                     ]:
                         continue
 
@@ -2427,11 +2678,12 @@ class BandSorter(LISAToolsParallelModule):
             self.gb_wdm_comp = getattr(_band_sorter, "gb_wdm_comp", None)
             self.gb_fd_comp = getattr(_band_sorter, "gb_fd_comp", None)
             self.gb_stft_comp = getattr(_band_sorter, "gb_stft_comp", None)
+            self.stft_store_windows = getattr(_band_sorter, "stft_store_windows", None)
             # need to make sure is not mixed up in loop
             self.set_main_band_sorter_info(main_band_sorter, inds_main_band_sorter)
             return
 
-        assert band_edges is not None and band_N_vals is not None
+        assert band_edges is not None
         self.force_backend = force_backend
         self.gb = gb
         # Domain computation objects, forwarded to the buffer in
@@ -2441,11 +2693,13 @@ class BandSorter(LISAToolsParallelModule):
         self.gb_wdm_comp = gb_wdm_comp
         self.gb_fd_comp = gb_fd_comp
         self.gb_stft_comp = gb_stft_comp
+        self.stft_store_windows = stft_store_windows
+        self.verify_buffer = bool(verify_buffer)
         self.waveform_kwargs = waveform_kwargs
         self.gb_branch_orig = gb_branch
         self.num_bands = len(band_edges) - 1
         self.band_edges = self.xp.asarray(band_edges)
-        self.band_N_vals = self.xp.asarray(band_N_vals)
+        self.band_N_vals = self.xp.asarray(band_N_vals) if band_N_vals is not None else None
         self.ntemps, self.nwalkers, self.nleaves_max, self.ndim = gb_branch.shape
         self.orig_inds = self.xp.asarray(gb_branch.inds)
         self.keep_all_inds = keep_all_inds
@@ -2511,7 +2765,9 @@ class BandSorter(LISAToolsParallelModule):
         self.set_main_band_sorter_info(main_band_sorter, inds_main_band_sorter)
 
         self.freqs = self.coords[:, 1] / 1e3
-        self.band_inds = self.xp.searchsorted(band_edges, self.freqs, side="right") - 1
+        self.band_inds = (
+            self.xp.searchsorted(self.band_edges, self.freqs, side="right") - 1
+        )
         self.max_data_store_size = max_data_store_size
 
         self.temp_inds = self.xp.repeat(
@@ -2599,11 +2855,15 @@ class BandSorter(LISAToolsParallelModule):
         self.walker_inds[keep_b] = walkers_a[take_b]
 
     @property
-    def N_vals(self) -> np.ndarray:
+    def N_vals(self) -> Optional[np.ndarray]:
+        if self.band_N_vals is None:
+            return None
         return self.band_N_vals[self.band_inds]
 
     @property
-    def unique_N(self) -> np.ndarray:
+    def unique_N(self) -> Optional[np.ndarray]:
+        if self.band_N_vals is None:
+            return None
         return self.xp.unique(self.N_vals)
 
     def get_subset(self, *args, **kwargs):
@@ -2746,15 +3006,11 @@ class BandSorter(LISAToolsParallelModule):
                 special_indices_unique,
                 self.transform_fn,
                 self.waveform_kwargs,
-                # Frequency spacing for the band-index math. FDSettings and
-                # STFTSettings use the FD bin resolution ``.df`` (the STFT
-                # engine's bounds mask is FD-bin flavoured); WDMSettings uses
-                # ``.layer_df`` so the ``band_edges / df`` math yields WDM
-                # *layer* indices -- the same quantity the WDM likelihood
-                # engine addresses by (WDMBandLikelihoodEngine uses
-                # ``basis_settings.layer_df``).
-                (acs.settings.layer_df if isinstance(acs.settings, WDMSettings)
-                 else acs.settings.df),
+                (
+                    acs.settings.layer_df 
+                    if isinstance(acs.settings, WDMSettings)
+                    else acs.settings.df
+                ),
                 sources_now_map,
                 sources_inject_now_map,
                 self.main_band_sorter.special_band_inds[sources_now_map],
@@ -2762,6 +3018,7 @@ class BandSorter(LISAToolsParallelModule):
                 gb_wdm_comp=self.gb_wdm_comp,
                 gb_fd_comp=self.gb_fd_comp,
                 gb_stft_comp=self.gb_stft_comp,
+                stft_store_windows=self.stft_store_windows,
                 force_backend=self.force_backend,
                 **kwargs,
             )
@@ -2774,6 +3031,8 @@ class BandSorter(LISAToolsParallelModule):
 
         buffer_obj.fill_buffer_residual_and_psd_from_acs(acs, inds_fill=inds_fill)
         buffer_obj.parent_acs = acs
+        if self.verify_buffer:
+            buffer_obj.verify_against_parent(acs, inds_fill)
         # includes sources in these sub-bands that are no longer getting proposals
         coords_to_inject = self.main_band_sorter.coords[sources_inject_now_map].copy()
         inj_special_indices_now = self.main_band_sorter.special_band_inds[
@@ -2781,9 +3040,13 @@ class BandSorter(LISAToolsParallelModule):
         ].copy()
 
         inject_index = buffer_obj.get_index(inj_special_indices_now)
-        inject_N_vals = self.band_N_vals[
-            self.main_band_sorter.band_inds[sources_inject_now_map]
-        ].copy()
+        inject_N_vals = (
+            self.band_N_vals[
+                self.main_band_sorter.band_inds[sources_inject_now_map]
+            ].copy()
+            if self.band_N_vals is not None
+            else None
+        )
 
         assert len(inject_index) == len(coords_to_inject)
 
