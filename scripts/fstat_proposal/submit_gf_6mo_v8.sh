@@ -115,15 +115,30 @@
 # ##                                                                        ##
 # ## ⚠ 2026-09-16 VGB=GB PARITY: VGB_CHIRP_MASS_BASIS 0 -> 1 (vgb ndim     ##
 # ## 5 -> 6) + the new vgb_ridge_gibbs move. If gf_prod_6mo_v8/ has        ##
-# ## ALREADY been launched on the 5-dim basis, this is NOT a resume: use   ##
-# ## a FRESH store, or run                                                  ##
-# ##   python scripts/fstat_proposal/migrate_vgb_chirp_basis.py \          ##
-# ##       <store.h5> <catalogue_dir>                                       ##
-# ## BEFORE relaunching. run.py refuses the mismatched resume at backend   ##
-# ## construction naming VGB_CHIRP_MASS_BASIS. Fresh store wipes the GB /  ##
-# ## noise chains too; the eigen sidecar and the warm-start npz SURVIVE    ##
-# ## (they are gb/sobbh/mbh/emri artifacts), and the vgb chain restarts at ##
-# ## exact truth anyway under VGB_START_FACTOR=0.                           ##
+# ## ALREADY been launched on the 5-dim basis, this is NOT a plain resume: ##
+# ## run.py refuses it at backend construction naming                       ##
+# ## VGB_CHIRP_MASS_BASIS. TWO ways forward:                                ##
+# ##                                                                        ##
+# ##  (a) KEEP THE RUN, REBORN VGBs (user ruling 2026-09-16, PREFERRED --  ##
+# ##      "keep the hdf backend except for the VGBs (and just start them   ##
+# ##      at injection again)"):                                            ##
+# ##        python scripts/fstat_proposal/migrate_vgb_chirp_basis.py \     ##
+# ##            <store.h5> <catalogue_dir>                                  ##
+# ##      DEFAULT mode = --restart-at-injection. Everything except the vgb ##
+# ##      branch survives byte-for-byte -- GB chains + band state, noise,  ##
+# ##      galfor, mbh/emri/sobbh, log_like, the ITERATION COUNTER -- so    ##
+# ##      the GB search keeps every iteration of progress. The vgb branch  ##
+# ##      is discarded and reseeded at catalogue truth in the 6 columns.   ##
+# ##      It also quarantines the stale 5-column sidecars (the midit       ##
+# ##      checkpoint and the running backup copy, either of which would    ##
+# ##      otherwise silently undo the migration) into                       ##
+# ##      pre_chirp_migration/ next to the store.                           ##
+# ##                                                                        ##
+# ##  (b) FRESH STORE -- also fine, but pays back the whole GB search.     ##
+# ##      The eigen sidecar and the warm-start npz SURVIVE either way      ##
+# ##      (they are gb/sobbh/mbh/emri artifacts, not vgb), and the vgb     ##
+# ##      chain restarts at exact truth in both routes under               ##
+# ##      VGB_START_FACTOR=0.                                               ##
 # ############################################################################
 # ############################################################################
 # ## ⚠ RELAUNCH REQUIRED (2026-08-29): CAP GRID 1 -> 2 + STAGGER.          ##

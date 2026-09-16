@@ -112,6 +112,39 @@ for _id in ${EMRI_SKIP_LIST}; do _row emri  "${_id}" skipped; done
 for _id in ${SOBBH_IDS_LIST}; do NWANT=$((NWANT + 1)); _row sobbh "${_id}" have; done
 for _id in ${SOBBH_SKIP_LIST};do _row sobbh "${_id}" skipped; done
 
+# ---- eps-sweep variants (NULL_EMRI_EPS runs, 2026-09-16) --------------------
+# The launcher tags sweep stores ${STORE_PREFIX}<branch><id>_eps<val>/ so they
+# never collide with the baseline. Auto-discovered here: one row per variant
+# store found, with the delta against its baseline row. delta ~ +|lnL_base|
+# recovered means the deficit WAS mode truncation at the baseline eps.
+_EPS_HEADER=0
+for _d in "${STORE_ROOT}/${STORE_PREFIX}"*_eps*/; do
+  [ -d "${_d}" ] || continue
+  _tag="$(basename "${_d}")"; _tag="${_tag#"${STORE_PREFIX}"}"
+  _base_tag="${_tag%%_eps*}"
+  _eps="${_tag#*_eps}"
+  _val="$(_lnl "${_d}")"
+  _base_val="$(_lnl "${STORE_ROOT}/${STORE_PREFIX}${_base_tag}/")"
+  if [ "${_EPS_HEADER}" = "0" ]; then
+    echo ""
+    echo "  EPS SWEEP VARIANTS (vs their baseline rows above)"
+    printf '  %-10s %8s   %16s   %16s   %s\n' "source" "eps" "lnL" "baseline" "delta"
+    printf '  %-10s %8s   %16s   %16s   %s\n' "------" "-----" "----------------" "----------------" "-----"
+    _EPS_HEADER=1
+  fi
+  if [ -z "${_val}" ]; then
+    printf '  %-10s %8s   %16s   %16s   %s\n' "${_base_tag}" "${_eps}" "--" \
+      "${_base_val:---}" "(running or died early)"
+  elif [ -n "${_base_val}" ]; then
+    printf '  %-10s %8s   %16s   %16s   %s\n' "${_base_tag}" "${_eps}" \
+      "${_val}" "${_base_val}" \
+      "$(awk -v a="${_val}" -v b="${_base_val}" 'BEGIN{printf "%+.4g", a-b}')"
+  else
+    printf '  %-10s %8s   %16s   %16s   %s\n' "${_base_tag}" "${_eps}" \
+      "${_val}" "--" "(no baseline run yet)"
+  fi
+done
+
 SUM="$(printf '%s\n' ${VALUES} | awk '{s += $1} END {printf "%.6g", s+0}')"
 
 echo ""
