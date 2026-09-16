@@ -137,6 +137,16 @@ def _rank_log_filenames(layout, rank):
     return f"globalfit_run.rank{int(rank)}.log", f"global_fit.rank{int(rank)}.log"
 
 
+def _rebuild_state_view(state, walker_block):
+    """The state the residual rebuild reads: the full state, or this rank's walker slice."""
+    if walker_block is None:
+        return state
+    from .communication.walkerslice import slice_state
+
+    w0, w1 = walker_block
+    return slice_state(state, w0, w1, sub_states=[])
+
+
 def _branch_cap_edges(branch_info):
     """Leaf-cap CELL edges for a banded branch (user design 2026-08-15).
 
@@ -1498,7 +1508,12 @@ class GlobalFit:
         )
         return statistic
 
-    def setup_acs(self, state: GFState, rebuild_residuals: bool = False) -> AnalysisContainerArray:
+    def setup_acs(
+        self,
+        state: GFState,
+        rebuild_residuals: bool = False,
+        walker_block: typing.Optional[typing.Tuple[int, int]] = None,
+    ) -> AnalysisContainerArray:
         """
         Set up AnalysisContainerArray for likelihood computations.
 
@@ -1515,12 +1530,21 @@ class GlobalFit:
                 stored arrays are residuals rather than raw data (stft_tof
                 restart/handover path; it was disabled there while the EMRI
                 branch was being debugged, so it stays opt-in here).
+            walker_block: ``(w0, w1)`` global walker range this rank owns;
+                ``None`` builds every walker (single-process behaviour).
 
         Returns:
             AnalysisContainerArray containing data, residuals, and
             sensitivity for all walkers.
         """
         general_info = self.curr.general_info
+        w0, w1 = (
+            (0, self.nwalkers)
+            if walker_block is None
+            else (int(walker_block[0]), int(walker_block[1]))
+        )
+        n_local = w1 - w0
+        state_view = _rebuild_state_view(state, walker_block)
         coarse_stats = self._prepare_coarse_wdm_runtime(state)
         pin_main_device(xp, general_info.gpus)
 
@@ -1564,7 +1588,7 @@ class GlobalFit:
         _walker_device = {}
         if _gpus_for_split is not None and len(_gpus_for_split) > 1:
             for _s, _blk in enumerate(
-                np.array_split(np.arange(self.nwalkers), len(_gpus_for_split))
+                np.array_split(np.arange(w0, w1), len(_gpus_for_split))
             ):
                 for _w in _blk:
                     _walker_device[int(_w)] = int(_gpus_for_split[_s])
@@ -1634,26 +1658,26 @@ class GlobalFit:
         acs_tmp = []
         self.logger.info(
             "setup_acs: building %d walker ACs (RSS %.0f MB)",
-            self.nwalkers, _rss_mb(),
+            n_local, _rss_mb(),
         )
-        for w in range(self.nwalkers):
+        for i, w in enumerate(range(w0, w1)):
             with device_context(xp, _walker_device.get(w)):
                 acs_tmp.append(_build_walker_ac(w))
-            if w % 8 == 7 or w == self.nwalkers - 1:
+            if i % 8 == 7 or i == n_local - 1:
                 self.logger.info(
                     "setup_acs: walker AC %d/%d built (RSS %.0f MB)",
-                    w + 1, self.nwalkers, _rss_mb(),
+                    i + 1, n_local, _rss_mb(),
                 )
 
         gpus = general_info.gpus
-        if gpus is not None and len(gpus) > 1 and self.nwalkers % len(gpus) != 0:
+        if gpus is not None and len(gpus) > 1 and n_local % len(gpus) != 0:
             logger.warning(
                 "nwalkers=%d is not divisible by len(gpus)=%d: contiguous "
                 "np.array_split shards are uneven, so per-shard batch sizes "
                 "differ and any fixed-block intra-shard indexing is invalid "
                 "(GBGPU uses rank-based indexing and stays correct). Prefer "
                 "nwalkers %% ngpus == 0 for balanced device loads.",
-                self.nwalkers, len(gpus),
+                n_local, len(gpus),
             )
         acs = AnalysisContainerArray(
             acs_tmp,
@@ -1680,13 +1704,13 @@ class GlobalFit:
             # keeps the fallback loop from warning about branches that are in
             # fact correctly configured.
             handled_by_signal_gen = set(signal_gen_map)
-            for w, ac in enumerate(acs.flatten()):
+            for i, ac in enumerate(acs.flatten()):
                 # Generate + subtract this walker's templates on the device
                 # that owns its shard: ``ac.data`` is a view into the ACA's
                 # shard buffer (on gpus[split]), so building the template and
                 # the in-place ``add_signal`` (domains.py residual add) both
                 # run on that device -- no cross-device peer access.
-                with device_context(xp, _walker_device.get(w)):
+                with device_context(xp, _walker_device.get(w0 + i)):
                     gen_map = getattr(ac, "_signal_gen", None)
                     if not isinstance(gen_map, dict):
                         continue  # this walker's branches use the fallback below
@@ -1695,10 +1719,10 @@ class GlobalFit:
                     for name in self.curr.engine_info.branch_names:
                         if name in ("psd", "galfor") or name not in gen_map:
                             continue
-                        inds_w = state.branches_inds[name][0, w]
+                        inds_w = state_view.branches_inds[name][0, i]
                         if not inds_w.any():
                             continue
-                        rows = state.branches_coords[name][0, w][inds_w]
+                        rows = state_view.branches_coords[name][0, i][inds_w]
                         tf = getattr(self.curr.source_info.get(name), "transform", None)
                         if getattr(tf, "n_leaf_fills", None) is not None:
                             # PER-LEAF transform fills (e.g. EMRI xI0): the leaf
@@ -1743,7 +1767,7 @@ class GlobalFit:
                     continue
 
                 templates_tmp = xp.asarray(
-                    get_templates(state, source_info, self.curr.general_info)
+                    get_templates(state_view, source_info, self.curr.general_info)
                 )
 
                 # no need to adjust data index or start_freq_ind:
@@ -1776,6 +1800,14 @@ class GlobalFit:
                 logger.debug("post-production pool sweep skipped: %s", exc)
 
         return acs
+
+    def _global_likelihood(self, acs) -> np.ndarray:
+        """The (nwalkers,) likelihood vector: local rows, allgathered across compute ranks."""
+        local = np.asarray(asnumpy(acs.likelihood(complex=False)))
+        fanout = getattr(self, "fanout", None)
+        if fanout is None or self.layout.is_single():
+            return local
+        return fanout.allgather_walker_vector(local)
 
     @property
     def engine_info(self) -> EngineInfo:
@@ -1917,7 +1949,7 @@ class GlobalFit:
         acs = self.setup_acs(state, rebuild_residuals=True)
         self.logger.debug("acs setup done")
 
-        state.log_like[:] = acs.likelihood(complex=False)
+        state.log_like[:] = self._global_likelihood(acs)
         logger.info(f"initial log likelihood: {state.log_like[0]}")
 
         # Localize a non-finite initial likelihood before it trips Eryn's
@@ -2148,7 +2180,7 @@ class GlobalFit:
         # and it runs AFTER the initial-logL print above. Re-evaluate so the
         # logged value -- and the sampler's starting state.log_like -- reflect
         # the post-subtraction residual (no-op when nothing subtracted).
-        state.log_like[:] = acs.likelihood(complex=False)
+        state.log_like[:] = self._global_likelihood(acs)
         logger.info(f"initial log likelihood (after recipe setup): {state.log_like[0]}")
 
         # [layer-chi2 diag; GB_LAYER_CHI2=1] Where does the post-subtraction
@@ -2263,7 +2295,21 @@ class GlobalFit:
         # ``sum_instead_of_trapz`` was a legacy ``inner_product`` knob
         # that no longer exists; the modern inner_product already does
         # the sum-style integration by default.
-        state.log_like[:] = acs.likelihood(complex=False)[None, :]
+        #
+        # NOT a collective: compute ranks have already left the setup phase
+        # by this point, so a fresh allgather here would have no partner.
+        # Multi-rank reuses the post-recipe-setup gather (``_ll_after_setup``,
+        # set by ``_build_acs_and_recipe`` right after that gather) instead
+        # of recomputing; the getattr fallback keeps this call safe before
+        # that wiring lands.
+        if self.layout.is_single():
+            state.log_like[:] = acs.likelihood(complex=False)[None, :]
+        else:
+            _ll_after_setup = getattr(self, "_ll_after_setup", None)
+            if _ll_after_setup is None:
+                state.log_like[:] = acs.likelihood(complex=False)[None, :]
+            else:
+                state.log_like[:] = _ll_after_setup[None, :]
         state.log_prior = np.zeros_like(
             state.log_like
         )  # sampler_mix.compute_log_prior(state.branches_coords, inds=state.branches_inds, supps=supps)

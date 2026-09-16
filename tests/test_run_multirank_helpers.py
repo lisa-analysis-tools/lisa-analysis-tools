@@ -65,5 +65,28 @@ class HelpersTest(unittest.TestCase):
         )
 
 
+class RebuildViewTest(unittest.TestCase):
+    def test_none_block_returns_the_same_state_object(self):
+        from lisatools.globalfit.run import _rebuild_state_view
+        from tests.test_gf_substate_roundtrip import make_state
+        import numpy as np
+
+        state = make_state(np.random.default_rng(3))
+        self.assertIs(_rebuild_state_view(state, None), state)
+
+    def test_block_returns_a_walker_slice_without_sub_states(self):
+        from lisatools.globalfit.run import _rebuild_state_view
+        from tests.test_gf_substate_roundtrip import make_state
+        import numpy as np
+
+        state = make_state(np.random.default_rng(3))
+        part = _rebuild_state_view(state, (1, 3))
+        self.assertEqual(part.branches["gb"].nwalkers, 2)
+        np.testing.assert_array_equal(
+            part.branches["gb"].coords, state.branches["gb"].coords[:, 1:3]
+        )
+        self.assertTrue(all(v is None for v in part.sub_states.values()))
+
+
 if __name__ == "__main__":
     unittest.main()
