@@ -93,7 +93,9 @@ class WalkerBlockLayout:
         return tuple(
             r
             for r, p in sorted(self.placements.items())
-            if p.node == str(node) and int(device) in p.devices and p.role != RankRole.SAVER
+            if p.node == str(node)
+            and int(device) in p.devices
+            and p.role in (RankRole.HEAD, RankRole.COMPUTE)
         )
 
     def make_fanout_comm(self, comm):

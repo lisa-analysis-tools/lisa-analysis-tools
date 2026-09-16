@@ -98,6 +98,13 @@ class BuildLayoutTest(unittest.TestCase):
         self.assertEqual(lay.role_of(1), RankRole.SPARE)
         self.assertEqual(lay.role_of(2), RankRole.SAVER)
 
+    def test_legacy_ranks_on_device_excludes_saver_and_spare(self):
+        # head owns both devices in legacy mode; the spare (rank 1, device 1)
+        # and the saver (rank 2, device 0) must not show up as co-occupants.
+        lay = FakeWorld(3).run(lambda r, c: build_layout(c, 5, [0, 1], legacy=True))[0]
+        self.assertEqual(lay.ranks_on_device("node0", 0), (0,))
+        self.assertEqual(lay.ranks_on_device("node0", 1), (0,))
+
 
 class SeedTest(unittest.TestCase):
     def test_distinct_and_deterministic(self):
