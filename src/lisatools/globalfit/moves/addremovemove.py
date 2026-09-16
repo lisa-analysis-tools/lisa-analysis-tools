@@ -40,6 +40,7 @@ from ...utils.utility import asnumpy, get_array_module
 from .. import midit_checkpoint
 from . import eigen_refresh, eigen_table_persist
 from .globalfitmove import GlobalFitMove
+from .walkerfanout import WalkerFanoutMixin, pooled_ladder_step
 
 logger = logging.getLogger(__name__)
 DEBUG_MODE = False
@@ -84,7 +85,7 @@ class MoveSignalGen:
         return self.waveform_gen(*params, **kwargs)
 
 
-class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
+class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove, Move):
     """
     Move that handles adding and removing sources to and from the residuals stored in the analysis container array.
     This is done by first removing the contribution of the current sources in the cold chain from the residual,
@@ -1540,8 +1541,71 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
 
         return inds
 
-    def propose(self, model, state):
+    # ---- multi-rank fan-out (WalkerFanoutMixin hooks) ------------------------
+    def _fanout_note_swaps(self, leaf, tc):
+        """Accumulate this repeat's swap counts for ``leaf`` (Eryn re-zeroes them per call)."""
+        acc = np.asarray(tc.swaps_accepted, dtype=float).ravel()
+        prop = np.asarray(tc.swaps_proposed, dtype=float).ravel()
+        a, p = self._fanout_swap_tally.get(int(leaf), (0.0, 0.0))
+        self._fanout_swap_tally[int(leaf)] = (a + acc, p + prop)
+
+    def fanout_temperature_controls(self):
+        return list(self.temperature_controls)
+
+    def fanout_payload_extra(self):
+        return {
+            "fancy_swap_clock": int(getattr(self, "_fancy_swap_clock", 0)),
+            "dbg_step": int(getattr(self, "_dbg_step", 0)),
+        }
+
+    def fanout_apply_extra(self, extra):
+        if "fancy_swap_clock" in extra:
+            self._fancy_swap_clock = int(extra["fancy_swap_clock"])
+        if "dbg_step" in extra:
+            self._dbg_step = int(extra["dbg_step"])
+
+    def fanout_reply_extra(self, part):
+        return {
+            "swap_tally": {
+                int(leaf): (np.asarray(a, dtype=float), np.asarray(p, dtype=float))
+                for leaf, (a, p) in getattr(self, "_fanout_swap_tally", {}).items()
+            }
+        }
+
+    def fanout_merge_extra(self, replies, new_state):
+        """Pool the per-leaf swap tallies over ranks; adapt each visited ladder ONCE.
+
+        The authoritative per-leaf ladder lives on the sub-state
+        (``betas_all[leaf]``, read at the top of the leaf loop, written back at
+        its end); ``merge_walkers`` never touches ladders, so the head writes
+        the adapted ladder there itself and mirrors it on its own control.
+        """
+        pooled = {}
+        for extra in replies.values():
+            for leaf, (acc, prop) in extra.get("swap_tally", {}).items():
+                a, p = pooled.get(int(leaf), (0.0, 0.0))
+                pooled[int(leaf)] = (
+                    a + np.asarray(acc, dtype=float), p + np.asarray(prop, dtype=float)
+                )
+        sub = new_state.sub_states[self.branch_name]
+        for leaf in sorted(pooled):
+            acc, prop = pooled[leaf]
+            tc = self.temperature_controls[leaf]
+            ntemps = int(tc.ntemps)
+            betas0 = np.array(sub.betas_all[leaf][:ntemps], copy=True)
+            new = pooled_ladder_step(tc, betas0, acc, prop)
+            sub.betas_all[leaf][:ntemps] = new
+            tc.betas[:] = new
+        if not self._fanout_body:
+            midit_checkpoint.maybe_write(
+                new_state, tag=f"{self.branch_name} propose", prepare=self._sync_cold_row
+            )
+
+    def propose_local(self, model, state):
         """Generate proposals by removing, updating, and re-adding each leaf.
+
+        Runs on the FULL state single-process and on this rank's walker slice
+        under several compute ranks (``WalkerFanoutMixin.propose`` dispatches).
 
         # TODO/DOCS: detailed acceptance/swap accounting; see code for the per-leaf
         loop and the ``compute_like`` calls used to score proposals.
@@ -1561,6 +1625,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         # (user ruling 2026-08-27: iteration 1 -- the build/JIT-transient
         # iteration -- must NOT pay the swap).
         self._fancy_swap_clock = getattr(self, "_fancy_swap_clock", 0) + 1
+        self._fanout_swap_tally = {}
 
         # cold-row agreement between the main state and this branch's
         # sub-state (GF_SUBSTATE_CHECK=0 disables)
@@ -1943,6 +2008,8 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
                     permute_here=fancy_swap,
                 )
 
+                self._fanout_note_swaps(leaf, temperature_control_here)
+
                 if self.swap_debug:
                     _cold_after = np.asarray(prev_logl[0])
                     _drop = _cold_before - _cold_after
@@ -2059,11 +2126,12 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             # loop is carrying. This is the hook that matters for the
             # minutes-per-leaf PE branches (MBH/EMRI), where a whole-branch
             # propose outlives a spot-preemption window.
-            midit_checkpoint.maybe_write(
-                new_state,
-                tag=f"{self.branch_name} leaf {leaf}",
-                prepare=self._sync_cold_row,
-            )
+            if not self._fanout_body:
+                midit_checkpoint.maybe_write(
+                    new_state,
+                    tag=f"{self.branch_name} leaf {leaf}",
+                    prepare=self._sync_cold_row,
+                )
 
         # udpate at the end
         logger.info(f"✓ {self.branch_name} proposal complete — all leaves processed ({time.time() - tic:.1f}s total)")
