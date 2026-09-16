@@ -1640,7 +1640,15 @@ export GB_LEAF_CAP_REQUIRE_IMPROVEMENT=1
 # content" -- with this change the GB side moved too, so a v8-vs-v7 cap or
 # leaf-count difference is NOT purely a noise effect. Set back to 5 if you
 # want the noise comparison fully isolated.
-export GB_LEAF_CAP_MIN_ITERS=4
+# 4 -> 3 (user ruling 2026-09-16): the v4/v5 3-mo campaigns ran 3; 4 was
+# the noise-merge-era compromise kept for v7 isolation, which no longer
+# applies. At 6-mo wall (~33 min/it) each increment cost ~2.2 h at 4 —
+# measured in production: caps raised on exactly the 4th consecutive
+# at-cap iteration (rows 13->16/17). Plateau/occupancy gates, staggered
+# cap grid, at-cap RJ skip, D/2 and GB_CAP_LL_CHECK all still stand.
+# 2 was considered and deferred: a 2-it stagnation window is weak at 10
+# walkers — revisit with the next snapshot's cap trajectory if 3 lags.
+export GB_LEAF_CAP_MIN_ITERS=3
 export GB_CAP_LL_CHECK=1
 # Grouped RJ scheduling: accumulate inds=True picks across RJ rounds
 # (1 proposal per cell per round), then ONE full-width in-model block.
