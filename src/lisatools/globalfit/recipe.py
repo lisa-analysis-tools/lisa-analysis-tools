@@ -234,6 +234,11 @@ class Recipe:
         self._current_recipe_step = None
         self._has_setup_first_step = False
         self.stock_moves: typing.Dict[str, typing.Any] = {}
+        # Cached once here (not re-read every iteration): GF_FANOUT_DIGEST=1
+        # makes __call__ log a head-side [FANOUT_DIGEST] line per iteration
+        # (Plan 5 Task 4 of the multi-rank port). Off by default, so a
+        # single-process run's behaviour is unchanged.
+        self._fanout_digest_enabled = os.environ.get("GF_FANOUT_DIGEST", "0") == "1"
 
     # -- pickling: runtime products never travel with the config ---------------
 
@@ -641,6 +646,15 @@ class Recipe:
         """
         if self.fanout is not None:
             self.fanout.note_iteration(iteration)
+            if self._fanout_digest_enabled:
+                # ``iteration`` here is the index of the iteration whose
+                # moves just ran (this call is eryn's post-iteration
+                # stopping-fn hook) -- NOT the same clock reading a propose
+                # sees via ``note_iteration`` above, which a rank-side body
+                # reads one iteration late (see setup_first_recipe_step).
+                from .communication.fanout import fanout_digest_line
+
+                logger.info(fanout_digest_line(iteration, last_sample))
         stop_here = self._current_recipe_step["adjust"].stopping_function(
             iteration, last_sample, sampler
         )

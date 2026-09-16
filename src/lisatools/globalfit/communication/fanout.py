@@ -17,6 +17,7 @@ Command / reply schemas (host numpy, pickled by mpi4py ``send``/``recv``)::
 from __future__ import annotations
 
 import collections
+import hashlib
 import time
 import traceback
 
@@ -53,6 +54,38 @@ def concat_blocks(results, layout):
 
 def _reply(seq, rank, ok, result, wall_s, error=None):
     return {"seq": seq, "rank": rank, "ok": ok, "result": result, "wall_s": wall_s, "error": error}
+
+
+def _sha1_16(data: bytes) -> str:
+    return hashlib.sha1(data).hexdigest()[:16]
+
+
+def _array_bytes(arr) -> bytes:
+    """Host bytes for one array (device arrays pulled via ``asnumpy``)."""
+    return np.ascontiguousarray(asnumpy(arr)).tobytes()
+
+
+def fanout_digest_line(iteration, state) -> str:
+    """``[FANOUT_DIGEST] it=<n> log_like=<sha1> coords=<sha1> inds=<sha1>``.
+
+    Cluster-gate tool (``docs/multirank-cluster-gates.md`` Step 1): the head
+    logs this once per iteration under ``GF_FANOUT_DIGEST=1`` so three
+    transport-parity layouts (shared-GPU / multi-GPU-one-node / multi-node)
+    can be diffed line-for-line for bit-identical merged state. Host numpy
+    only; ``coords``/``inds`` each hash the byte-concatenation of every
+    branch's array in branch-name-sorted order (branches differ in shape, so
+    concatenating raw bytes -- not ``np.concatenate`` -- is what makes a
+    single hash possible across all of them), independent of dict order.
+    """
+    log_like_hash = _sha1_16(_array_bytes(state.log_like))
+    coords = state.branches_coords
+    coords_hash = _sha1_16(b"".join(_array_bytes(coords[name]) for name in sorted(coords)))
+    inds = state.branches_inds
+    inds_hash = _sha1_16(b"".join(_array_bytes(inds[name]) for name in sorted(inds)))
+    return (
+        f"[FANOUT_DIGEST] it={int(iteration)} log_like={log_like_hash} "
+        f"coords={coords_hash} inds={inds_hash}"
+    )
 
 
 class WalkerFanout:

@@ -1,12 +1,81 @@
 """Digest globalfit_run.log + gpu_util CSVs for the 3-mo production run."""
+import glob
+import os
 import re
 import sys
 from datetime import datetime
 
 import numpy as np
 
+
+def discover_run_logs(run_dir):
+    """Every rank's run log under ``run_dir``: the head's ``globalfit_run.log``
+    first, then ``globalfit_run.rank<k>.log`` files sorted by rank number.
+
+    Each rank writes its own log file under the walker-block layout
+    (``run.py::_rank_log_filenames``); concatenating them (head first) is
+    what lets the parsing below see every rank's lines, not just the
+    head's (Plan 5 Task 4 of the multi-rank port).
+    """
+    head = os.path.join(run_dir, "globalfit_run.log")
+    paths = [head] if os.path.exists(head) else []
+
+    def _rank_num(p):
+        m = re.search(r"\.rank(\d+)\.log$", p)
+        return int(m.group(1)) if m else -1
+
+    rank_paths = glob.glob(os.path.join(run_dir, "globalfit_run.rank*.log"))
+    paths.extend(sorted(rank_paths, key=_rank_num))
+    return paths
+
+
+#: ``communication/fanout.py``'s head-only load-balance line, DEBUG level:
+#: "[FANOUT] op=%s move=%s head_s=%.3f max_rank_s=%.3f wait_s=%.3f"
+FANOUT_RE = re.compile(
+    r"\[FANOUT\] op=(?P<op>\S+) move=(?P<move>\S+) "
+    r"head_s=(?P<head_s>[\d.]+) max_rank_s=(?P<max_rank_s>[\d.]+) "
+    r"wait_s=(?P<wait_s>[\d.]+)"
+)
+
+
+def summarize_fanout(lines):
+    """Per-(op, move) ``[FANOUT]`` stats over ``lines`` (any iterable of str).
+
+    Returns ``{(op, move): {"count", "mean_head_s", "max_rank_s", "mean_wait_s"}}``,
+    empty if no ``[FANOUT]`` line is present.
+    """
+    groups = {}
+    for line in lines:
+        m = FANOUT_RE.search(line)
+        if not m:
+            continue
+        key = (m.group("op"), m.group("move"))
+        bucket = groups.setdefault(
+            key, {"count": 0, "head_s_sum": 0.0, "max_rank_s_max": 0.0, "wait_s_sum": 0.0}
+        )
+        bucket["count"] += 1
+        bucket["head_s_sum"] += float(m.group("head_s"))
+        bucket["max_rank_s_max"] = max(bucket["max_rank_s_max"], float(m.group("max_rank_s")))
+        bucket["wait_s_sum"] += float(m.group("wait_s"))
+    return {
+        key: {
+            "count": b["count"],
+            "mean_head_s": b["head_s_sum"] / b["count"],
+            "max_rank_s": b["max_rank_s_max"],
+            "mean_wait_s": b["wait_s_sum"] / b["count"],
+        }
+        for key, b in groups.items()
+    }
+
+
+if __name__ != "__main__":
+    # Standalone report script, not a library; guard the rest of the file
+    # (which reads sys.argv / real log files unconditionally) so tests can
+    # import discover_run_logs()/summarize_fanout() above without running it.
+    raise SystemExit(0)
+
 RUN = sys.argv[1] if len(sys.argv) > 1 else None
-LOG = f"{RUN}/gf_prod_3mo_artifacts/globalfit_run.log"
+LOG_PATHS = discover_run_logs(f"{RUN}/gf_prod_3mo_artifacts")
 
 TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d+) - (\S+) - (\w+) - (.*)$")
 
@@ -14,11 +83,15 @@ def parse_ts(s, ms):
     return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").timestamp() + int(ms) / 1e3
 
 events = []
-for line in open(LOG, errors="replace"):
-    m = TS.match(line)
-    if m:
-        events.append((parse_ts(m.group(1), m.group(2)), m.group(3),
-                       m.group(4), m.group(5)))
+for LOG in LOG_PATHS:
+    for line in open(LOG, errors="replace"):
+        m = TS.match(line)
+        if m:
+            events.append((parse_ts(m.group(1), m.group(2)), m.group(3),
+                           m.group(4), m.group(5)))
+# Multiple files are read one after another above, not merged chronologically;
+# re-sort so downstream slicing (``ev[-1]`` = latest event) is still correct.
+events.sort(key=lambda e: e[0])
 
 # attempt boundaries: 'Multiple GPUs detected' warnings ~ startup
 starts = [t for t, mod, lvl, msg in events
@@ -120,3 +193,13 @@ for t, _, lvl, msg in ev:
 print("\nwarnings/errors (last attempt):")
 for k, v in sorted(warns.items(), key=lambda x: -x[1])[:8]:
     print(f"  {v:4d}x {k}")
+
+# ---- [FANOUT] load-balance summary (Plan 5 Task 4) --------------------------
+fanout_summary = summarize_fanout(msg for _, _, _, msg in ev)
+if fanout_summary:
+    print("\n=== [FANOUT] summary (last attempt, per op/move) ===")
+    print(f"{'op':<12}{'move':<22}{'n':>6}{'mean_head_s':>13}"
+          f"{'max_rank_s':>12}{'mean_wait_s':>13}")
+    for (op, move), stats in sorted(fanout_summary.items()):
+        print(f"{op:<12}{move:<22}{stats['count']:>6}{stats['mean_head_s']:>13.3f}"
+              f"{stats['max_rank_s']:>12.3f}{stats['mean_wait_s']:>13.3f}")

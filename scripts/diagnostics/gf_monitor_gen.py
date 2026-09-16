@@ -41,6 +41,34 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+
+def discover_run_logs(run_dir):
+    """Every rank's run log under ``run_dir``: the head's ``globalfit_run.log``
+    first, then ``globalfit_run.rank<k>.log`` files sorted by rank number.
+
+    Each rank writes its own log file under the walker-block layout
+    (``run.py::_rank_log_filenames``); concatenating them (head first) is
+    what lets the regex scans below (e.g. ``RJ_SPLIT_RE``) see every rank's
+    ``[GB_ACCEPT rj-split]`` lines, not just the head's (Plan 5 Task 4).
+    """
+    found = {}
+    for root, _, fns in os.walk(run_dir):
+        for fn in fns:
+            if fn == "globalfit_run.log":
+                found[-1] = os.path.join(root, fn)
+            else:
+                m = re.match(r"^globalfit_run\.rank(\d+)\.log$", fn)
+                if m:
+                    found[int(m.group(1))] = os.path.join(root, fn)
+    return [found[k] for k in sorted(found)]
+
+
+if __name__ != "__main__":
+    # Standalone report generator, not a library; guard the rest of the file
+    # (which reads sys.argv / real snapshot files unconditionally) so tests
+    # can import discover_run_logs() above without running it.
+    raise SystemExit(0)
+
 RUN_DIR = sys.argv[1] if len(sys.argv) > 1 else "prod3mo/gf_prod_3mo"
 OUT = sys.argv[2] if len(sys.argv) > 2 else "gf_monitor.html"
 
@@ -289,12 +317,8 @@ if caps is None or not getattr(caps, "size", 0):
     CAP_UNIT, CAP_K = "band", 1
 
 
-logpath = None
-for root, _, fns in os.walk(RUN_DIR):
-    for fn in fns:
-        if fn == "globalfit_run.log":
-            logpath = os.path.join(root, fn)
-log_text = open(logpath, errors="replace").read() if logpath else ""
+logpaths = discover_run_logs(RUN_DIR)
+log_text = "".join(open(p, errors="replace").read() for p in logpaths)
 # REWIND-AWARE (2026-08-19): the run log is CUMULATIVE across launches. On a
 # rewound store the segments before the final relaunch describe the DISCARDED
 # trajectory, and every log-parsed panel (band shutoffs, RJ split, acceptance,
