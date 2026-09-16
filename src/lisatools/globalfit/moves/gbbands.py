@@ -1379,17 +1379,74 @@ class _RoutedBandEngine:
         ``GB_ROUTER_THREADED=0`` restores serial launch-sync-launch
         dispatch (the drift checks / [GB_CELL_LL] reconciles are the
         regression alarms if concurrency ever misbehaves).
+
+        CROSS-DEVICE ORDERING EDGE (2026-09-15, shard-1 accounting
+        defect). The futures above complete when each worker's HOST code
+        returns -- the CUDA kernels are still queued on that shard's
+        stream. The caller then reads shard output from ITS OWN device's
+        stream (assembly scatters, parent-residual rows at unit close,
+        the ortho/drift checks) with no happens-before edge. Production
+        signature: ``|direct - credited|`` was EXACTLY 0.0 for the
+        caller-device walker block and 1e2-1e3 lnL for the other shard's
+        walkers (vgb_pe / rj_warm_search, 6mo 09-15 forensics), plus the
+        first-iteration GB birth asymmetry (334 vs 240 leaves/walker
+        across the device boundary). Fix: each worker records an event
+        on its shard's stream right after its launches (same thread, so
+        per-thread-default-stream builds are covered too), and the
+        caller's stream waits on all of them before this method returns
+        -- everything the caller enqueues afterwards is ordered behind
+        every shard's work. These are stream edges, not device fences:
+        nothing drains, both devices keep running.
+
+        MULTIRANK MERGE NOTE (walker-block port, 2026-09-15): with one
+        GPU per rank this block is a structural no-op -- a single-shard
+        holder never reaches this multi-shard path, and cross-RANK
+        movement is MPI, which forces its own completion at the message
+        boundary. KEEP this edge for any ``gpus_per_rank > 1``
+        configuration: it is the only ordering between shard streams
+        inside one rank. The per-item shard device is discovered
+        generically (first item element carrying ``.device`` -- the
+        shard view/holder in every call site), so new routed legs and
+        re-shaped item tuples inherit the edge unchanged as long as the
+        view stays in the tuple.
         """
+        xp = getattr(holder, "xp", np)
+        get_stream = getattr(getattr(xp, "cuda", None),
+                             "get_current_stream", None)
+        devices = None
+        if get_stream is not None and len(items):
+            devices = []
+            for it in items:
+                dev = next((getattr(e, "device") for e in it
+                            if hasattr(e, "device")), None)
+                dev = getattr(dev, "id", dev)  # cupy Device -> int id
+                devices.append(None if dev is None else int(dev))
+            if not any(d is not None for d in devices):
+                get_stream = None
+        events = [None] * len(items)
+
+        def _run(idx, it):
+            worker(*it)
+            if get_stream is not None and devices[idx] is not None:
+                with device_context(xp, devices[idx]):
+                    events[idx] = get_stream().record()
+
         if (len(items) > 1
                 and os.environ.get("GB_ROUTER_THREADED", "1") == "1"
                 and (state_ids is None or len(set(state_ids)) == len(items))
                 and getattr(holder, "thread_pool", None) is not None):
-            futures = [holder.thread_pool.submit(worker, *it) for it in items]
+            futures = [holder.thread_pool.submit(_run, i, it)
+                       for i, it in enumerate(items)]
             for f in futures:
                 f.result()  # re-raise worker exceptions in caller
         else:
-            for it in items:
-                worker(*it)
+            for i, it in enumerate(items):
+                _run(i, it)
+        if get_stream is not None:
+            stream = get_stream()
+            for ev in events:
+                if ev is not None:
+                    stream.wait_event(ev)
 
     def _mirror_engine_outputs(self):
         """Refresh routed-output attrs from the wrapped engine after a
