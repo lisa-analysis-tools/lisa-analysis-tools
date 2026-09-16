@@ -54,7 +54,7 @@ device); at most one of the two may exceed 1.
 | 2 | ≥2 GPUs, or 1 GPU with `RANKS_PER_GPU=2` | Two COMPUTE ranks (head + rank 1), **no dedicated saver** — the saver role is aliased to the head, so saves are synchronous. |
 | 3 | 2 GPUs | Head + 1 COMPUTE rank + 1 dedicated SAVER (rank 2), one device each. |
 | 3 | 1 GPU | **`ValueError`** from `build_layout`: 2 COMPUTE ranks on a 1-device pool over-subscribes it (`capacity = len(pool) * ranks_per_gpu // gpus_per_rank = 1`). No silent fallback above size 2 — set `RANKS_PER_GPU=2` to share the device deliberately. |
-| 5 | 2 nodes × 2 GPUs | 4 COMPUTE ranks (one per GPU; AUTO `gpus_per_rank` resolves to 1 per node because more than one compute rank shares each node) + 1 dedicated SAVER. Launch with `srun --distribution=cyclic` so ranks land on both nodes. |
+| 5 | 2 nodes × 2 GPUs | 4 COMPUTE ranks (one per GPU; AUTO `gpus_per_rank` resolves to 1 per node because more than one compute rank shares each node) + 1 dedicated SAVER. Launch with `mpiexec -n 5 -ppn 1` (hydra, SLURM bootstrap) so ranks land round-robin on both nodes. |
 
 Only `np=2` gets a silent capacity fallback. At `np ≥ 3`, asking for more
 COMPUTE ranks on a node than its GPU pool can host
@@ -118,9 +118,11 @@ GPUS=0,1 mpiexec -n 3 python scripts/run_global.py --stock <name>
 # two compute ranks sharing one GPU (no second device required)
 GPUS=0 RANKS_PER_GPU=2 mpiexec -n 3 python scripts/run_global.py --stock <name>
 
-# 2 nodes x 2 GPUs -> 4 compute ranks + 1 saver
-srun -N 2 --gres=gpu:2 --ntasks=5 --distribution=cyclic \
-  python scripts/run_global.py --stock <name>
+# 2 nodes x 2 GPUs -> 4 compute ranks + 1 saver (inside a 2-node allocation;
+# Intel MPI's hydra launcher, round-robin over the hosts, tcp fabric -- see
+# docs/multirank-cluster-gates.md "MPI launcher on this cluster")
+export I_MPI_HYDRA_BOOTSTRAP=slurm I_MPI_FABRICS=shm:ofi FI_PROVIDER=tcp
+GPUS=0,1 mpiexec -n 5 -ppn 1 python scripts/run_global.py --stock <name>
 
 # preflight only: print the layout on every rank, build nothing
 GF_LAYOUT_DRY_RUN=1 mpiexec -n 3 python scripts/run_global.py --stock <name>
@@ -197,8 +199,12 @@ sbatch  ./submit_gf_6mo_v8.sh      # legacy flow: static header defaults
   `[SUBMIT]` line rather than failing — `build_layout` itself would raise.
   Its default `NWALKERS=10` is not divisible by `N_COMPUTE=4` at `NGPUS=4`,
   so a first 4-GPU launch rounds to 12 unless `NWALKERS` is set explicitly.
-- Launch line: `srun --ntasks="${SLURM_NTASKS:-3}" --distribution=cyclic ...`
-  when `SLURM_NNODES > 1`, else `mpiexec -n ${SLURM_NTASKS:-3} ...`.
+- Launch line: `mpiexec -n "${SLURM_NTASKS:-3}" -ppn 1 ...` with
+  `I_MPI_HYDRA_BOOTSTRAP=slurm I_MPI_FABRICS=shm:ofi FI_PROVIDER=tcp` exported
+  when `SLURM_NNODES > 1` (Intel MPI's hydra launcher placing ranks
+  round-robin over the hosts; `srun --mpi=pmix` does not bring Intel MPI up
+  on this cluster, see `docs/multirank-cluster-gates.md`), else
+  `mpiexec -n ${SLURM_NTASKS:-3} ...` exactly as before.
 - Under the walker-block (non-legacy) layout, `np=3` on a 2-GPU pool puts a
   real compute rank on each GPU; under the legacy layout rank 1 was a
   stopped spare that occupied a device without using it.

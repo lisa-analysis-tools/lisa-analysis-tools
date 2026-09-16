@@ -104,13 +104,25 @@ class SubmitScriptsInJobBlockTest(unittest.TestCase):
                     text,
                 )
 
-    def test_srun_launch_line_defaults_ntasks(self):
+    def test_multinode_launch_line_is_hydra_round_robin(self):
+        # WP7 Step 0 (2026-09-16): on this cluster `srun --mpi=pmix` bootstraps
+        # Intel MPI but its OFI address exchange fails, and a bare `srun` gives
+        # three size-1 worlds; the launcher that works is hydra with the SLURM
+        # bootstrap, `-ppn 1` (round-robin over hosts = cyclic placement) and
+        # the tcp fabric provider. Pin all of it so a refactor cannot drift
+        # back to `srun`.
         for path in SCRIPTS:
             with self.subTest(script=path):
+                text = self._text(path)
                 self.assertIn(
-                    'srun --ntasks="${SLURM_NTASKS:-3}" --distribution=cyclic',
-                    self._text(path),
+                    'mpiexec -n "${SLURM_NTASKS:-3}" -ppn 1 python', text,
                 )
+                self.assertIn(
+                    "export I_MPI_HYDRA_BOOTSTRAP=slurm I_MPI_FABRICS=shm:ofi "
+                    "FI_PROVIDER=tcp",
+                    text,
+                )
+                self.assertNotIn('srun --ntasks="${SLURM_NTASKS', text)
 
 
 class SubmitScriptsDispatchTest(unittest.TestCase):

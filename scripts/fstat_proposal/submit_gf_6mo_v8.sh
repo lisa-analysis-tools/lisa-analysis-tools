@@ -2806,10 +2806,22 @@ print("[SOURCES] preflight OK.")
 PYEOF
 
 if [ "${SLURM_NNODES:-1}" -gt 1 ]; then
+  # Multi-node launch = Intel MPI's OWN launcher (hydra) bootstrapped from the
+  # SLURM allocation, NOT `srun --mpi=...` (WP7 Step 0, 2026-09-16): on this
+  # cluster `srun` without PMI gives every rank a size-1 world, and
+  # `srun --mpi=pmix` bootstraps but Intel MPI's OFI business-card exchange
+  # then fails ("Missing hostname ... in business card"). `-ppn 1` places
+  # consecutive ranks round-robin over the hosts (A,B,A,B,...) = the cyclic
+  # placement the walker-block layout wants: head + saver on node A, the
+  # compute ranks spread over both nodes. UCX finds no cross-node transport
+  # here (only self/sysv/posix/cma), so the fabric is pinned to libfabric's
+  # tcp provider -- correctness first; a faster provider is a WP7 Step 4
+  # measurement, not a launch requirement.
   # SLURM_NTASKS is always set inside a job step; the :-3 default matches the
   # mpiexec branch below so an odd/manual allocation still launches the
   # head+compute+saver shape instead of dying on an unset var under `set -u`.
-  srun --ntasks="${SLURM_NTASKS:-3}" --distribution=cyclic python scripts/fstat_proposal/run_combined_staged.py
+  export I_MPI_HYDRA_BOOTSTRAP=slurm I_MPI_FABRICS=shm:ofi FI_PROVIDER=tcp
+  mpiexec -n "${SLURM_NTASKS:-3}" -ppn 1 python scripts/fstat_proposal/run_combined_staged.py
 else
   mpiexec -n "${SLURM_NTASKS:-3}" python scripts/fstat_proposal/run_combined_staged.py
 fi

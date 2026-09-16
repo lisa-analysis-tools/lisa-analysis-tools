@@ -33,20 +33,63 @@ multi-GPU router's own gates are in
   grants at the time — they are not load-bearing for the gates themselves,
   only the resulting rank/node/device placement is.
 
+## MPI launcher on this cluster (learned at Step 0, 2026-09-16)
+
+The cluster's MPI is **Intel MPI**; SLURM offers `pmix_v4` (`srun --mpi=list`).
+What was tried, in order, inside a 2-node `salloc`:
+
+| launch | result |
+|---|---|
+| `srun -N 2 --ntasks=3 --distribution=cyclic python ...` (no PMI) | `MPI startup(): PMI server not found` — every rank a **size-1 world**, each printing `r0 head ... walkers=[0,8)`: the placement was right (2 processes on node A, 1 on B) but nothing was shared |
+| `I_MPI_PMI_LIBRARY=/usr/lib64/libpmi2.so`, `--mpi=pmi2` | the library does not exist here; Intel MPI fell back to its own client and garbled the pmi2 wire protocol (`mpi/pmi2: request not begin with 'cmd='`) |
+| `I_MPI_PMI=pmix I_MPI_PMI_LIBRARY=/opt/pmix/4.2.9/lib/libpmix.so`, `--mpi=pmix` | bootstraps, then Intel MPI's OFI layer aborts: `MPIDU_bc_table_create: Missing hostname or invalid host/port description in business card` |
+| `I_MPI_HYDRA_BOOTSTRAP=slurm mpiexec -n 3 -ppn 1 python ...` | ranks launched on both nodes; UCX then finds **no cross-node transport** (`no active messages transport ... self/memory, sysv/memory, posix/memory, cma/memory`) |
+| the same plus `I_MPI_FABRICS=shm:ofi FI_PROVIDER=tcp` | **works** — `size=3 n_compute=2`, `r1 compute` on the second node |
+
+So every multi-node command in this runbook uses Intel MPI's own launcher
+(hydra) bootstrapped from the SLURM allocation, with the fabric pinned to
+libfabric's tcp provider:
+
+```sh
+export I_MPI_HYDRA_BOOTSTRAP=slurm I_MPI_FABRICS=shm:ofi FI_PROVIDER=tcp
+mpiexec -n <ntasks> -ppn 1 python ...        # -ppn 1 = round-robin over the hosts
+```
+
+`-ppn 1` places consecutive ranks A, B, A, B, ... — the "cyclic" placement the
+walker-block layout wants (head + saver on node A, the compute ranks spread
+over both nodes). For a 1-node layout inside the same 2-node allocation use
+`-ppn <ntasks>` so all ranks stay on the first host. TCP is a correctness
+choice: whether a faster provider (`fi_info -l`) matters is Step 4's
+`[FANOUT]` measurement. The campaign submit scripts' multi-node branch
+carries the same three exports and launch line.
+
+Interactive use: `salloc --partition=gpu-80-spot --nodes=2 --gres=gpu:2
+--ntasks-per-node=2 ...` lands you in a shell on the first allocated node;
+`mpiexec` (hydra) started there reads the allocation, so no `srun` wrapper is
+needed. Do **not** add `--gpu-bind`/`--gpus-per-task`: they renumber
+`CUDA_VISIBLE_DEVICES` per task and fight the layout's own pinning from the
+per-node `GPUS` pool. Your shell's exports propagate to the ranks.
+
 ## Step 0 — layout dry runs
 
 Confirm the layout resolves the way you expect, on 1 node and across 2
 nodes, before spending GPU time on anything else:
 
 ```sh
+export I_MPI_HYDRA_BOOTSTRAP=slurm I_MPI_FABRICS=shm:ofi FI_PROVIDER=tcp   # see above
+
 # 1 node, 3 ranks (head + 1 compute + saver on a 2-GPU node)
-GF_LAYOUT_DRY_RUN=1 GPUS=0,1 mpiexec -n 3 \
+GF_LAYOUT_DRY_RUN=1 GPUS=0,1 mpiexec -n 3 -ppn 3 \
   python scripts/run_global.py --stock <name>
 
 # 2 nodes, 3 ranks (head + 1 compute on the other node + saver)
-GF_LAYOUT_DRY_RUN=1 GPUS=0 srun -N 2 --ntasks=3 --distribution=cyclic \
+GF_LAYOUT_DRY_RUN=1 GPUS=0 mpiexec -n 3 -ppn 1 \
   python scripts/run_global.py --stock <name>
 ```
+
+(Both passed on 2026-09-16 with `--stock gb_no_fg`, `NWALKERS=8`.) A run
+that prints `size=1` and `walkers=[0,8)` on every rank is the singleton
+symptom from the launcher table above, not a layout bug.
 
 `GPUS=0` is load-bearing on the 2-node command, not decoration: `GPUS` is
 the **per-node** pool, each node here hosts exactly ONE compute rank, and
@@ -111,23 +154,28 @@ Also check on the first real (non-dry) launch:
 ## Step 1 — three transport-parity layouts
 
 Three launches, all resolving to `n_compute=2`, that should be **bit-
-identical** to each other given the same seed. Exact CLI (adapt only the
-srun partition/gres flags to the cluster; the flags below are the shape,
-not a guarantee they match every allocation):
+identical** to each other given the same seed. Exact CLI, run from inside
+one 2-node `salloc` (the launcher recipe is the "MPI launcher on this
+cluster" section above):
 
 ```sh
+export I_MPI_HYDRA_BOOTSTRAP=slurm I_MPI_FABRICS=shm:ofi FI_PROVIDER=tcp   # see "MPI launcher"
+
 # (a) 2 compute ranks sharing 1 GPU -- cheapest, run this first
-GPUS=0 RANKS_PER_GPU=2 mpiexec -n 3 \
+GPUS=0 RANKS_PER_GPU=2 mpiexec -n 3 -ppn 3 \
   python scripts/run_global.py --stock <name>
 
 # (b) 2 compute ranks on 2 GPUs of 1 node
-GPUS=0,1 mpiexec -n 3 \
+GPUS=0,1 mpiexec -n 3 -ppn 3 \
   python scripts/run_global.py --stock <name>
 
-# (c) 2 compute ranks across 2 nodes (adapt the srun flags to the cluster)
-GPUS=0 srun -N 2 --ntasks=3 --distribution=cyclic \
+# (c) 2 compute ranks across 2 nodes (round-robin: head + saver on A, compute on B)
+GPUS=0 mpiexec -n 3 -ppn 1 \
   python scripts/run_global.py --stock <name>
 ```
+
+(`-ppn 3` on (a)/(b) keeps all three ranks on the first host of a 2-node
+allocation; on a 1-node allocation plain `mpiexec -n 3` is the same thing.)
 
 Each launch is `-n 3` (2 compute ranks + 1 saver, `resolve_roles(3)` gives
 `compute=(0, 1)`, `saver=2`). `GPUS=0` on (c) for the same reason as the
