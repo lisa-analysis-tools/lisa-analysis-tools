@@ -120,6 +120,10 @@ def _fanout_unready_moves(moves):
     and anything that opts in via ``gf_head_only``. They are named in the
     warning rather than silently skipped: "head-only" is a real semantic
     change under multi-rank and the operator has to see which moves take it.
+
+    The addremove (MBH/EMRI/SOBBH) and PSD (psd/galfor/sgwb) families are
+    served through ``moves.walkerfanout.WalkerFanoutMixin`` since Plan 3;
+    GB/VGB remain unready until Plan 4.
     """
     unready, head_only = [], []
     for move in _leaf_moves(moves):

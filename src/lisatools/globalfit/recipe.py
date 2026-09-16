@@ -2306,6 +2306,8 @@ def build_noise_moves(
     pe_move.accepted = np.zeros((ntemps, nwalkers))
     search_move.fanout_branches = list(sampled_branches)
     pe_move.fanout_branches = list(sampled_branches)
+    search_move.install_walker_fanout(curr)
+    pe_move.install_walker_fanout(curr)
 
     return search_move, pe_move
 
@@ -4199,6 +4201,10 @@ class SingleSourcePEBuilder(SourceMoveBuilder):
         # so a restarted process reloads the tables instead of repaying
         # minutes of information-matrix build per leaf
         move.eigen_store_path = getattr(gi, "main_file_path", None)
+        # multi-rank: bind the run's fan-out (no-op single-process); clears the
+        # sidecar path on non-head ranks (single writer) and freezes the ladders
+        # on every rank (the head adapts once per propose from pooled tallies)
+        move.install_walker_fanout(curr)
         move.accepted = np.zeros((ntemps, nwalkers))
         return [], [move]
 
