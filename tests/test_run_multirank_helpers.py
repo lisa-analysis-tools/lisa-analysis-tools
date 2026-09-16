@@ -65,6 +65,29 @@ class HelpersTest(unittest.TestCase):
         )
 
 
+class MaterializedMovesTest(unittest.TestCase):
+    """The flat move list the multi-rank readiness guard is computed from."""
+
+    def test_flattens_step_dicts_and_survives_a_moveless_step(self):
+        from lisatools.globalfit.recipe import RecipeStep
+        from lisatools.globalfit.run import _materialized_moves
+
+        a, b = _Served(name="a"), _Unserved(name="b")
+        recipe = type("R", (), {})()
+        recipe.recipe = [
+            {"name": "s1", "adjust": type("S", (), {"moves": [a]})(), "status": False},
+            # a legacy step that was never given moves: ``moves`` RAISES
+            {"name": "s2", "adjust": RecipeStep(), "status": False},
+            {"name": "s3", "adjust": type("S", (), {"moves": [b]})(), "status": False},
+        ]
+        self.assertEqual(_materialized_moves(recipe), [a, b])
+
+    def test_an_unmaterialized_recipe_is_empty(self):
+        from lisatools.globalfit.run import _materialized_moves
+
+        self.assertEqual(_materialized_moves(object()), [])
+
+
 class RebuildViewTest(unittest.TestCase):
     def test_none_block_returns_the_same_state_object(self):
         from lisatools.globalfit.run import _rebuild_state_view
@@ -86,6 +109,92 @@ class RebuildViewTest(unittest.TestCase):
             part.branches["gb"].coords, state.branches["gb"].coords[:, 1:3]
         )
         self.assertTrue(all(v is None for v in part.sub_states.values()))
+
+
+class RecipeFanoutHooksTest(unittest.TestCase):
+    def test_recipe_forwards_stage_and_iteration_to_the_fanout(self):
+        from lisatools.globalfit.recipe import Recipe
+
+        calls = []
+
+        class _Fanout:
+            def enter_stage(self, name, kind):
+                calls.append(("stage", name, kind))
+
+            def note_iteration(self, i):
+                calls.append(("it", i))
+
+        class _Step:
+            def __init__(self, kind):
+                self.moves = [type("M", (), {"gf_stage_kind": kind})()]
+                self.stops = [False, True]
+
+            def setup_run(self, iteration, last_sample, sampler):
+                calls.append(("setup_run", iteration))
+
+            def stopping_function(self, iteration, last_sample, sampler):
+                return self.stops.pop(0)
+
+        class _Backend:
+            def completed_recipe_step(self, name):
+                calls.append(("done", name))
+
+        recipe = Recipe()
+        recipe._init_runtime()
+        recipe.recipe = [
+            {"name": "a", "adjust": _Step("search"), "status": False},
+            {"name": "b", "adjust": _Step("pe"), "status": False},
+        ]
+        recipe.backend = _Backend()
+        recipe.fanout = _Fanout()
+        recipe.setup_first_recipe_step(0, None, None)
+        self.assertEqual(calls[-1], ("stage", "a", "search"))
+        self.assertFalse(recipe(1, None, None))  # step a not done yet
+        self.assertIn(("it", 1), calls)
+        self.assertFalse(recipe(2, None, None))  # a done -> b set up
+        self.assertEqual(calls[-1], ("stage", "b", "pe"))
+
+    def test_no_fanout_is_a_no_op(self):
+        """Single-process: ``Recipe.fanout`` stays ``None`` and nothing is called."""
+        from lisatools.globalfit.recipe import Recipe
+
+        calls = []
+
+        class _Step:
+            moves = []
+
+            def setup_run(self, iteration, last_sample, sampler):
+                calls.append(("setup_run", iteration))
+
+            def stopping_function(self, iteration, last_sample, sampler):
+                return False
+
+        recipe = Recipe()
+        recipe._init_runtime()
+        recipe.recipe = [{"name": "a", "adjust": _Step(), "status": False}]
+        self.assertIsNone(recipe.fanout)
+        recipe.setup_first_recipe_step(0, None, None)
+        self.assertFalse(recipe(1, None, None))
+        self.assertEqual(calls, [("setup_run", 0)])
+
+
+class StageKindOfTest(unittest.TestCase):
+    def test_reads_the_combine_moves_stage_kind_through_tuples(self):
+        from lisatools.globalfit.recipe import _stage_kind_of
+
+        combined = type("M", (), {"gf_stage_kind": "rj"})()
+        self.assertEqual(_stage_kind_of(type("S", (), {"moves": [combined]})()), "rj")
+        self.assertEqual(
+            _stage_kind_of(type("S", (), {"moves": [(combined, 1.0)]})()), "rj"
+        )
+        self.assertIsNone(_stage_kind_of(type("S", (), {"moves": []})()))
+        self.assertIsNone(_stage_kind_of(object()))
+
+    def test_a_moveless_recipe_step_does_not_raise(self):
+        """``RecipeStep.moves`` RAISES when unset -- the helper must swallow that."""
+        from lisatools.globalfit.recipe import RecipeStep, _stage_kind_of
+
+        self.assertIsNone(_stage_kind_of(RecipeStep()))
 
 
 if __name__ == "__main__":

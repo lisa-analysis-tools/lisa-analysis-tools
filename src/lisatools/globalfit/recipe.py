@@ -175,6 +175,27 @@ def warm_pe_move_overrides() -> dict:
     )
 
 
+def _stage_kind_of(step):
+    """The stage kind (``"search"``/``"rj"``/``"pe"``) stamped on a materialized step.
+
+    :meth:`Stage.setup` stamps ``gf_stage_kind`` on the stage's single
+    :class:`~lisatools.globalfit.moves.combinemove.GFCombineMove`, which is the
+    step's only move; ``(move, weight)`` entries are unwrapped. Returns ``None``
+    for anything that does not carry the stamp -- including a legacy
+    ``RecipeStep`` whose ``moves`` property RAISES when it was never given any.
+    """
+    try:
+        moves = list(getattr(step, "moves", None) or [])
+    except Exception:  # noqa: BLE001 - RecipeStep.moves raises when unset
+        return None
+    if not moves:
+        return None
+    first = moves[0]
+    if isinstance(first, tuple):
+        first = first[0]
+    return getattr(first, "gf_stage_kind", None)
+
+
 class Recipe:
     """The global-fit recipe: declarative stage list + runtime step engine, one object.
 
@@ -194,6 +215,12 @@ class Recipe:
     Args:
         stages: Optional initial list of :class:`Stage` blocks.
     """
+
+    #: Multi-rank fan-out (:class:`~lisatools.globalfit.communication.fanout.WalkerFanout`);
+    #: the runner sets it before the first step so the recipe can publish the stage /
+    #: iteration clock the compute ranks read off each command. ``None`` in a
+    #: single-process run, where both hooks below are no-ops.
+    fanout = None
 
     def __init__(self, stages: typing.Optional[typing.List["Stage"]] = None):
         self.stages: typing.List["Stage"] = list(stages) if stages is not None else []
@@ -220,6 +247,9 @@ class Recipe:
             "_current_recipe_step",
             "_has_setup_first_step",
             "stock_moves",
+            # the fan-out owns an MPI communicator: a runtime product that
+            # must never travel with the (picklable, deepcopy-able) config.
+            "fanout",
         ):
             state.pop(attr, None)
         return state
@@ -578,6 +608,11 @@ class Recipe:
             raise ValueError("Recipe is already finished.")
 
         self._current_recipe_step["adjust"].setup_run(iteration, last_sample, sampler)
+        if self.fanout is not None:
+            self.fanout.enter_stage(
+                self._current_recipe_step["name"],
+                _stage_kind_of(self._current_recipe_step["adjust"]),
+            )
         self._has_setup_first_step = True
 
     @property
@@ -596,6 +631,8 @@ class Recipe:
         Returns:
             ``True`` if the entire recipe has finished, ``False`` otherwise.
         """
+        if self.fanout is not None:
+            self.fanout.note_iteration(iteration)
         stop_here = self._current_recipe_step["adjust"].stopping_function(
             iteration, last_sample, sampler
         )
@@ -607,6 +644,11 @@ class Recipe:
             if self._current_iter >= len(self.recipe):
                 return True
             self._current_recipe_step["adjust"].setup_run(iteration, last_sample, sampler)
+            if self.fanout is not None:
+                self.fanout.enter_stage(
+                    self._current_recipe_step["name"],
+                    _stage_kind_of(self._current_recipe_step["adjust"]),
+                )
 
         return False
 

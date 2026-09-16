@@ -71,7 +71,8 @@ from .communication.ranks import (
     rank_tag,
     resolve_roles,
 )
-from .engine import EngineInfo, GeneralSetup, GlobalFitEngine, GlobalFitSettings, Setup
+from .engine import (EngineInfo, GeneralSetup, GlobalFitEngine, GlobalFitInfo,
+                     GlobalFitSettings, Setup)
 from .hdfbackend import (GFHDFBackend, promote_backup_if_store_unreadable,
                          save_to_backend_asynchronously_and_plot)
 from .loginfo import dump_settings, init_logger, setup_root_file_handler
@@ -128,6 +129,27 @@ def _fanout_unready_moves(moves):
         if type(move).gf_serve is GlobalFitMove.gf_serve:
             unready.append(_move_label(move))
     return unready, head_only
+
+
+def _materialized_moves(recipe):
+    """Every move across a materialized recipe's steps (flat, order-preserving).
+
+    ``recipe.recipe`` is the runtime step list built by
+    :meth:`~lisatools.globalfit.recipe.Recipe.add_recipe_component`: dicts of
+    ``{"name", "adjust", "status"}`` whose ``adjust`` is a ``RecipeStep``
+    holding ``moves``. Defensive on both counts -- a legacy settings-file
+    recipe can register any ``setup_run``/``stopping_function`` object, and
+    ``RecipeStep.moves`` RAISES when the step was never given moves.
+    """
+    out = []
+    for step in getattr(recipe, "recipe", None) or []:
+        adjust = step.get("adjust") if isinstance(step, dict) else step
+        try:
+            moves = list(getattr(adjust, "moves", None) or [])
+        except Exception:  # noqa: BLE001 - RecipeStep.moves raises when unset
+            continue
+        out.extend(moves)
+    return out
 
 
 def _rank_log_filenames(layout, rank):
@@ -1816,32 +1838,15 @@ class GlobalFit:
         """EngineInfo object containing branch configuration for the sampler engine."""
         return self.curr.engine_info
 
-    def prepare_main(self):
-        """Build everything the sampling rank needs: backend, state, ACS, engine, recipe.
+    def _collect_priors_periodic(self):
+        """``(priors, periodic)`` gathered from every branch's ``source_info`` entry.
 
-        Extracted from ``run_global_fit`` (identical behavior): opens the HDF
-        backend, loads/initializes the state, builds the shared analysis
-        containers and likelihood, constructs the :class:`GlobalFitEngine`,
-        invokes the ``setup_function`` (which materializes the recipe), and
-        wires the recipe/backend bookkeeping. Afterwards ``self.sampler`` /
-        ``self.state`` / ``self.priors`` / ``self.acs`` / ``self.run_backend``
-        / ``self.live_ctx`` are set; ``run_global_fit`` and :meth:`sample`
-        both start from here.
+        Moved verbatim out of :meth:`prepare_main` so the computation ranks
+        build the identical dicts without repeating the loop.
         """
-        backend_path = self.curr.general_info.main_file_path
-
-        general_info = self.curr.general_info
-
-        branch_names = self.engine_info.branch_names
-        ndims = self.engine_info.ndims
-        nleaves_max = self.engine_info.nleaves_max
-        nleaves_min = self.engine_info.nleaves_min
-        nwalkers = general_info.nwalkers
-        ntemps = general_info.ntemps
-
         priors = {}
         periodic = {}
-        for name in branch_names:
+        for name in self.engine_info.branch_names:
             # TODO: clean up, but also inform using current_info: Settings? = self.curr.source_info[name]
             if name not in self.curr.source_info:
                 continue
@@ -1872,115 +1877,77 @@ class GlobalFit:
                         periodic[key] = _periodic_names_to_indices(
                             value, getattr(self.curr.source_info[name], "transform", None)
                         )
+        return priors, periodic
 
-        state = self.load_info(priors)
-        self.logger.debug("state loaded (RSS %.0f MB)", _rss_mb())
+    def _attach_walker_supplemental(self, state):
+        """Stamp the state's ``supplemental["walker_inds"]`` (moved verbatim).
 
-        supps_base_shape = (ntemps, nwalkers)
-        walker_vals = np.tile(np.arange(nwalkers), (ntemps, 1))
+        The GLOBAL walker ids; a rank's walker slice remaps them to its own
+        ``0..B-1`` (``communication.walkerslice.slice_state``).
+        """
+        supps_base_shape = (self.ntemps, self.nwalkers)
+        walker_vals = np.tile(np.arange(self.nwalkers), (self.ntemps, 1))
         supps = BranchSupplemental(
             {"walker_inds": walker_vals}, base_shape=supps_base_shape, copy=True
         )
         state.supplemental = supps
-        # breakpoint()
 
-        # backend.reset(
-        #     nwalkers,
-        #     ndims,
-        #     nleaves_max=nleaves_max,
-        #     ntemps=ntemps,
-        #     branch_names=branch_names,
-        #     nbranches=len(branch_names),
-        #     rj=True,
-        #     moves=None,
-        #     num_mbhs=nleaves_max["mbh"],
-        #     num_bands=state.sub_states["gb"].band_info["num_bands"],
-        #     band_edges=state.sub_states["gb"].band_info["band_edges"],
-        # )
+    def _make_fanout(self, model=None):
+        """A :class:`WalkerFanout` for this compute rank (``None`` in single mode).
 
-        # backend.grow(1, None)
+        Built on EVERY compute rank -- the head to drive commands, the rest for
+        the symmetric setup-phase collective
+        (``allgather_walker_vector``). ``model`` is attached later, once the
+        rank has an engine (head) or its own RNG stream (computation ranks).
+        """
+        if self.layout.is_single():
+            return None
+        from .communication.fanout import WalkerFanout
 
-        # gb_backend = HDFBackend("global_fit_output/eighth_run_through_parameter_estimation_gb.h5")
-        # psd_backend = HDFBackend("global_fit_output/eighth_run_through_parameter_estimation_psd.h5")
-        # mbh_backend = HDFBackend("global_fit_output/eighth_run_through_parameter_estimation_mbh.h5")
+        fanout = WalkerFanout(
+            self.fanout_comm, self.layout, self.rank, model=model, logger=self.logger
+        )
+        fanout.clock["seed_base"] = getattr(self.curr.general_info, "random_seed", None)
+        return fanout
 
-        # last_gb = gb_backend.get_last_sample()
-        # last_psd = psd_backend.get_last_sample()
-        # last_mbh = mbh_backend.get_last_sample()
+    def _seed_rank_streams(self):
+        """Distinct, deterministic RNG streams per compute rank (multi-rank only).
 
-        # state.branches["gb"] = deepcopy(last_gb.branches["gb"])
-        # state.branches["psd"].coords[:] = last_psd.branches["psd"].coords[0, :nwalkers]
-        # # order of call function changed for galfor
-        # galfor_coords_orig = last_psd.branches["galfor"].coords[0, :nwalkers]
-        # galfor_coords = np.zeros_like(galfor_coords_orig)
-        # galfor_coords[:, :, 0] = galfor_coords_orig[:, :, 0]
-        # galfor_coords[:, :, 1] = galfor_coords_orig[:, :, 3]
-        # galfor_coords[:, :, 2] = galfor_coords_orig[:, :, 1]
-        # galfor_coords[:, :, 3] = galfor_coords_orig[:, :, 2]
-        # galfor_coords[:, :, 4] = galfor_coords_orig[:, :, 4]
-        # state.branches["galfor"].coords[:] = galfor_coords
-        # state.branches["mbh"].coords[:] = last_mbh.branches["mbh"].coords[0, :nwalkers]
+        Returns the seed, or ``None`` in single mode -- where NOTHING is
+        reseeded, so a single-process run keeps exactly today's stream.
+        """
+        if self.layout.is_single():
+            return None
+        from .communication.ranks import derive_rank_seed
 
-        # # FOR TESTING
-        # state.branches["gb"].coords[:] = state.branches["gb"].coords[0, 0][None, None, :, :]
-        # state.branches["gb"].inds[:] = state.branches["gb"].inds[0, 0][None, None, :]
-        # state.branches["mbh"].coords[:] = state.branches["mbh"].coords[0, 0][None, None, :, :]
-        # state.branches["psd"].coords[:] = state.branches["psd"].coords[0, 0][None, None, :, :]
-        # state.branches["galfor"].coords[:] = state.branches["galfor"].coords[0, 0][None, None, :, :]
+        seed = derive_rank_seed(
+            int(getattr(self.curr.general_info, "random_seed", 0) or 0),
+            self.layout,
+            self.rank,
+        )
+        np.random.seed(seed)
+        if _xp_is_cupy and self.curr.general_info.gpus:
+            xp.random.seed(seed)
+        self.logger.info("rank %d RNG streams seeded with %d", self.rank, seed)
+        return seed
 
-        # accepted = np.zeros((ntemps, nwalkers), dtype=int)
-        # swaps_accepted = np.zeros((ntemps - 1,), dtype=int)
-        # state.log_like = np.zeros((ntemps, nwalkers))
-        # state.log_prior = np.zeros((ntemps, nwalkers))
-        # state.betas = np.ones((ntemps,))
+    def _open_run_backend(self, state, priors):
+        """Open/reset the run's HDF store, stamp its identities, arm mid-iteration saves.
 
-        # backend.save_step(state, accepted, rj_accepted=accepted, swaps_accepted=swaps_accepted)
-
-        # A_inj = general_info.A_inj.copy()
-        # E_inj = general_info.E_inj.copy()
-
-        # generate = GenerateCurrentState(A_inj, E_inj)
-        # self.logger.debug("generate function created")
-
-        # rebuild_residuals=True: branches that registered a params-based
-        # ``signal_gen`` on their Setup get their current templates
-        # subtracted here, under the hood (the converted ``get_templates``
-        # process). Branches without one are skipped with a warning and
-        # may keep subtracting in their recipe (legacy path) -- no
-        # double-subtraction either way.
-        acs = self.setup_acs(state, rebuild_residuals=True)
-        self.logger.debug("acs setup done")
-
-        state.log_like[:] = self._global_likelihood(acs)
-        logger.info(f"initial log likelihood: {state.log_like[0]}")
-
-        # Localize a non-finite initial likelihood before it trips Eryn's
-        # opaque "initial log_like was +/- infinite". Reports, per shard,
-        # whether the NON-finite values live in the residual buffers (a
-        # waveform-production NaN) or the inverse-PSD buffers (a PSD /
-        # sensitivity zero -> inf, e.g. the f=0 noise-model bin). Only runs
-        # on the error path, so no cost to healthy runs.
-        _ll0 = np.asarray(asnumpy(state.log_like[0]))
-        if not np.all(np.isfinite(_ll0)):
-            xp_a = acs.xp
-            for si, (dbuf, pbuf) in enumerate(
-                zip(acs.linear_data_arr, acs.linear_psd_arr)
-            ):
-                with (
-                    xp_a.cuda.Device(int(acs.gpus[si]))
-                    if acs.gpus is not None else _nullcontext()
-                ):
-                    d_bad = int(xp_a.sum(~xp_a.isfinite(dbuf)))
-                    p_bad = int(xp_a.sum(~xp_a.isfinite(pbuf)))
-                logger.warning(
-                    "initial ll non-finite (shard %d): %d non-finite "
-                    "residual value(s), %d non-finite invC value(s). "
-                    "residual-side -> waveform-production NaN; invC-side "
-                    "-> PSD/sensitivity zero (e.g. f=0 bin).",
-                    si, d_bad, p_bad,
-                )
-
-        like_mix = BasicResidualacsLikelihood(acs)
+        HEAD-ONLY: the computation ranks run an in-memory eryn backend and
+        never write. Lifted verbatim out of :meth:`prepare_main`, where it
+        still runs at exactly the same point -- between the initial-likelihood
+        block and the recipe's ``setup_function`` -- as the
+        ``after_first_likelihood`` hook of :meth:`_build_acs_and_recipe`.
+        Performs NO collective. Publishes and returns ``self.run_backend``.
+        """
+        backend_path = self.curr.general_info.main_file_path
+        general_info = self.curr.general_info
+        branch_names = self.engine_info.branch_names
+        ndims = self.engine_info.ndims
+        nleaves_max = self.engine_info.nleaves_max
+        nwalkers = general_info.nwalkers
+        ntemps = general_info.ntemps
 
         backend = GFHDFBackend(
             backend_path,  # self.curr.general_info["file_information"]["fp_main"],
@@ -2149,6 +2116,81 @@ class GlobalFit:
                 ),
             )
 
+        self.run_backend = backend
+        return backend
+
+    def _build_acs_and_recipe(self, state, priors, *, after_first_likelihood=None):
+        """This rank's ACA block, its likelihood, and the materialized recipe.
+
+        Shared by the head and every computation rank, and the ONLY place the
+        setup-phase collectives live: :meth:`_global_likelihood` is called
+        exactly TWICE -- once before the recipe's ``setup_function`` and once
+        after it -- in the same order on every compute rank, so the ranks
+        never desynchronize during setup.
+
+        Args:
+            state: the full (all-walker) state every rank starts from.
+            priors: the prior dict from :meth:`_collect_priors_periodic`.
+            after_first_likelihood: head-only hook ``fn(state, priors)`` run
+                BETWEEN the two gathers, where :meth:`prepare_main` has always
+                opened its HDF store -- this keeps the single-process order of
+                operations byte-for-byte what it was. It must not perform any
+                collective (the computation ranks do not call it).
+
+        Returns:
+            ``(acs, like_mix)`` for this rank's walker block.
+        """
+        # Single process: build EVERY walker exactly as before. ``None``
+        # (rather than the equivalent ``(0, nwalkers)``) keeps setup_acs'
+        # state view the state OBJECT itself instead of a sliced copy.
+        walker_block = (
+            None if self.layout.is_single() else self.layout.block_of(self.rank)
+        )
+        # rebuild_residuals=True: branches that registered a params-based
+        # ``signal_gen`` on their Setup get their current templates
+        # subtracted here, under the hood (the converted ``get_templates``
+        # process). Branches without one are skipped with a warning and
+        # may keep subtracting in their recipe (legacy path) -- no
+        # double-subtraction either way.
+        acs = self.setup_acs(
+            state, rebuild_residuals=True, walker_block=walker_block
+        )
+        self.logger.debug("acs setup done")
+
+        state.log_like[:] = self._global_likelihood(acs)
+        logger.info(f"initial log likelihood: {state.log_like[0]}")
+
+        # Localize a non-finite initial likelihood before it trips Eryn's
+        # opaque "initial log_like was +/- infinite". Reports, per shard,
+        # whether the NON-finite values live in the residual buffers (a
+        # waveform-production NaN) or the inverse-PSD buffers (a PSD /
+        # sensitivity zero -> inf, e.g. the f=0 noise-model bin). Only runs
+        # on the error path, so no cost to healthy runs.
+        _ll0 = np.asarray(asnumpy(state.log_like[0]))
+        if not np.all(np.isfinite(_ll0)):
+            xp_a = acs.xp
+            for si, (dbuf, pbuf) in enumerate(
+                zip(acs.linear_data_arr, acs.linear_psd_arr)
+            ):
+                with (
+                    xp_a.cuda.Device(int(acs.gpus[si]))
+                    if acs.gpus is not None else _nullcontext()
+                ):
+                    d_bad = int(xp_a.sum(~xp_a.isfinite(dbuf)))
+                    p_bad = int(xp_a.sum(~xp_a.isfinite(pbuf)))
+                logger.warning(
+                    "initial ll non-finite (shard %d): %d non-finite "
+                    "residual value(s), %d non-finite invC value(s). "
+                    "residual-side -> waveform-production NaN; invC-side "
+                    "-> PSD/sensitivity zero (e.g. f=0 bin).",
+                    si, d_bad, p_bad,
+                )
+
+        like_mix = BasicResidualacsLikelihood(acs)
+
+        if after_first_likelihood is not None:
+            after_first_likelihood(state, priors)
+
         # setup_info_all = None
         # for name in branch_names:
         #     if name not in self.curr.source_info:
@@ -2173,6 +2215,11 @@ class GlobalFit:
             recipe = Recipe()
         recipe._init_runtime()
         self.recipe = recipe
+        # Published for the builders: MoveBuildContext fills its
+        # layout/fanout/rank from ``curr``, and the recipe forwards the
+        # stage/iteration clock to the fan-out. Both are None in single mode.
+        self.curr.fanout = self.fanout
+        self.recipe.fanout = self.fanout
         setup_info_all = self.curr.settings_dict.setup_function(
             self.recipe, self.engine_info, self.curr, acs, priors, state
         )
@@ -2211,6 +2258,135 @@ class GlobalFit:
                                    _res.ndim, _res.shape)
             except Exception as _e:  # diagnostic only, never break the run
                 logger.warning("[layer-chi2] failed: %r", _e)
+
+        # The post-recipe-setup likelihood, kept for prepare_main's third
+        # likelihood site: that one is NOT a collective (the computation ranks
+        # have left the setup phase by then), so multi-rank reuses this value
+        # instead of recomputing a head-only partial vector.
+        self._ll_after_setup = np.array(state.log_like[0], copy=True)
+
+        # Readiness guard (n_compute > 1 only): every GlobalFitMove leaf must
+        # be able to SERVE its share of the walkers, or the run would silently
+        # sample only the head's block for that move.
+        if not self.layout.is_single():
+            unready, head_only = _fanout_unready_moves(_materialized_moves(self.recipe))
+            if unready:
+                raise RuntimeError(
+                    f"multi-rank run with n_compute={self.layout.n_compute} but these "
+                    f"moves do not serve fan-out commands yet: {unready}. Run with one "
+                    "compute rank (or GF_LEGACY_RANK_LAYOUT=1) until they are ported."
+                )
+            if head_only:
+                self.logger.warning(
+                    "multi-rank run: these moves are not GlobalFitMoves and run on "
+                    "the HEAD against its walker block only: %s",
+                    head_only,
+                )
+        return acs, like_mix
+
+    def prepare_main(self):
+        """Build everything the sampling rank needs: backend, state, ACS, engine, recipe.
+
+        Extracted from ``run_global_fit`` (identical behavior): opens the HDF
+        backend, loads/initializes the state, builds the shared analysis
+        containers and likelihood, constructs the :class:`GlobalFitEngine`,
+        invokes the ``setup_function`` (which materializes the recipe), and
+        wires the recipe/backend bookkeeping. Afterwards ``self.sampler`` /
+        ``self.state`` / ``self.priors`` / ``self.acs`` / ``self.run_backend``
+        / ``self.live_ctx`` are set; ``run_global_fit`` and :meth:`sample`
+        both start from here.
+        """
+        branch_names = self.engine_info.branch_names
+        ndims = self.engine_info.ndims
+        nleaves_max = self.engine_info.nleaves_max
+        nleaves_min = self.engine_info.nleaves_min
+
+        priors, periodic = self._collect_priors_periodic()
+
+        state = self.load_info(priors)
+        self.logger.debug("state loaded (RSS %.0f MB)", _rss_mb())
+
+        # COLLECTIVE 1/3 (multi-rank only): the head's freshly-loaded state is
+        # the one every computation rank builds its block from -- so the store
+        # is read ONCE and no rank can disagree about the starting point.
+        # ``bcast`` returns the very object we passed on the root.
+        if not self.layout.is_single():
+            state = self.fanout_comm.bcast(
+                state, root=self.layout.fanout_rank(self.main_rank)
+            )
+
+        self._attach_walker_supplemental(state)
+        # breakpoint()
+
+        # backend.reset(
+        #     nwalkers,
+        #     ndims,
+        #     nleaves_max=nleaves_max,
+        #     ntemps=ntemps,
+        #     branch_names=branch_names,
+        #     nbranches=len(branch_names),
+        #     rj=True,
+        #     moves=None,
+        #     num_mbhs=nleaves_max["mbh"],
+        #     num_bands=state.sub_states["gb"].band_info["num_bands"],
+        #     band_edges=state.sub_states["gb"].band_info["band_edges"],
+        # )
+
+        # backend.grow(1, None)
+
+        # gb_backend = HDFBackend("global_fit_output/eighth_run_through_parameter_estimation_gb.h5")
+        # psd_backend = HDFBackend("global_fit_output/eighth_run_through_parameter_estimation_psd.h5")
+        # mbh_backend = HDFBackend("global_fit_output/eighth_run_through_parameter_estimation_mbh.h5")
+
+        # last_gb = gb_backend.get_last_sample()
+        # last_psd = psd_backend.get_last_sample()
+        # last_mbh = mbh_backend.get_last_sample()
+
+        # state.branches["gb"] = deepcopy(last_gb.branches["gb"])
+        # state.branches["psd"].coords[:] = last_psd.branches["psd"].coords[0, :nwalkers]
+        # # order of call function changed for galfor
+        # galfor_coords_orig = last_psd.branches["galfor"].coords[0, :nwalkers]
+        # galfor_coords = np.zeros_like(galfor_coords_orig)
+        # galfor_coords[:, :, 0] = galfor_coords_orig[:, :, 0]
+        # galfor_coords[:, :, 1] = galfor_coords_orig[:, :, 3]
+        # galfor_coords[:, :, 2] = galfor_coords_orig[:, :, 1]
+        # galfor_coords[:, :, 3] = galfor_coords_orig[:, :, 2]
+        # galfor_coords[:, :, 4] = galfor_coords_orig[:, :, 4]
+        # state.branches["galfor"].coords[:] = galfor_coords
+        # state.branches["mbh"].coords[:] = last_mbh.branches["mbh"].coords[0, :nwalkers]
+
+        # # FOR TESTING
+        # state.branches["gb"].coords[:] = state.branches["gb"].coords[0, 0][None, None, :, :]
+        # state.branches["gb"].inds[:] = state.branches["gb"].inds[0, 0][None, None, :]
+        # state.branches["mbh"].coords[:] = state.branches["mbh"].coords[0, 0][None, None, :, :]
+        # state.branches["psd"].coords[:] = state.branches["psd"].coords[0, 0][None, None, :, :]
+        # state.branches["galfor"].coords[:] = state.branches["galfor"].coords[0, 0][None, None, :, :]
+
+        # accepted = np.zeros((ntemps, nwalkers), dtype=int)
+        # swaps_accepted = np.zeros((ntemps - 1,), dtype=int)
+        # state.log_like = np.zeros((ntemps, nwalkers))
+        # state.log_prior = np.zeros((ntemps, nwalkers))
+        # state.betas = np.ones((ntemps,))
+
+        # backend.save_step(state, accepted, rj_accepted=accepted, swaps_accepted=swaps_accepted)
+
+        # A_inj = general_info.A_inj.copy()
+        # E_inj = general_info.E_inj.copy()
+
+        # generate = GenerateCurrentState(A_inj, E_inj)
+        # self.logger.debug("generate function created")
+
+        # The fan-out is built BEFORE the recipe's setup_function so every
+        # move builder can read ``ctx.fanout`` / ``ctx.layout`` while it
+        # materializes (MoveBuildContext fills them from ``curr``), and so
+        # ``_global_likelihood`` inside _build_acs_and_recipe finds it.
+        # ``None`` in single mode -- nothing below changes there.
+        self.fanout = self._make_fanout(model=None)
+
+        acs, like_mix = self._build_acs_and_recipe(
+            state, priors, after_first_likelihood=self._open_run_backend
+        )
+        backend = self.run_backend
 
         logger.debug("need to setup moves that use parallel resources")
 
@@ -2317,6 +2493,19 @@ class GlobalFit:
         )  # sampler_mix.compute_log_prior(state.branches_coords, inds=state.branches_inds, supps=supps)
         self.recipe.setup_first_recipe_step(sampler_mix.iteration, state, sampler_mix)
 
+        # Per-rank RNG streams (no-op in single mode: today's stream is kept).
+        self._seed_rank_streams()
+
+        # The head's model is the engine's -- so a fan-out command body runs
+        # against the same ACA/RNG the head's own block uses. The ping is the
+        # first point-to-point traffic of the run and must come AFTER the
+        # computation ranks have finished their own setup (they are in, or
+        # heading into, ComputeService.serve by now): it is NOT a collective,
+        # so a rank still building would simply be met later.
+        if self.fanout is not None:
+            self.fanout.model = sampler_mix.get_model()
+            self.fanout.ping()
+
         if self.curr.general_info.submission_parent_folder is not None:
             gf_plotter = GlobalFitPlotter(curr=self.curr)
             gf_plotter.save_input_data()
@@ -2328,6 +2517,15 @@ class GlobalFit:
         self.priors = priors
         self.acs = acs
         self.run_backend = backend
+        # ``state_local``: the head's OWN walker block, for a builder that must
+        # act on this rank's rows only (``None`` in single mode, where the full
+        # state already IS the block).
+        state_local = None
+        if not self.layout.is_single():
+            from .communication.walkerslice import slice_state
+
+            _w0, _w1 = self.layout.block_of(self.rank)
+            state_local = slice_state(state, _w0, _w1, sub_states=[])
         self.live_ctx = MoveBuildContext(
             recipe=self.recipe,
             engine_info=self.engine_info,
@@ -2338,6 +2536,7 @@ class GlobalFit:
             stock_moves=getattr(self.recipe, "stock_moves", {}),
             ntemps=self.ntemps,
             nwalkers=self.nwalkers,
+            state_local=state_local,
         )
 
         # Checkpoint self-test on the FULLY-BUILT state (sub-state tempered
@@ -2351,6 +2550,120 @@ class GlobalFit:
                 validate=self._midit_checkpoint_validate,
                 logger_=self.logger,
             )
+
+    def prepare_compute(self):
+        """Build what a COMPUTATION rank needs, then hand it to the command loop.
+
+        Mirrors :meth:`prepare_main`'s setup phase collective for collective --
+        one ``bcast`` of the head's state, then the two gathers inside
+        :meth:`_build_acs_and_recipe` -- and nothing else, so both roles reach
+        the sampling phase in lockstep. What differs: this rank's ACA holds
+        only its walker block, its eryn engine is an in-memory shell (no HDF
+        store, no plots, no stopping function) that exists so the recipe steps
+        can stamp ``periodic`` / ``temperature_control`` onto the moves, and it
+        never proposes anything itself -- the head drives every move through
+        :class:`~lisatools.globalfit.communication.fanout.ComputeService`.
+
+        Sets ``self.compute_service`` (plus ``self.sampler`` / ``self.state`` /
+        ``self.priors`` / ``self.acs`` for symmetry with the head).
+        """
+        priors, periodic = self._collect_priors_periodic()
+
+        # COLLECTIVE 1/3: the head's state (it alone reads the store).
+        state = self.fanout_comm.bcast(
+            None, root=self.layout.fanout_rank(self.main_rank)
+        )
+        self._attach_walker_supplemental(state)
+        self.fanout = self._make_fanout(model=None)
+
+        # COLLECTIVES 2/3 and 3/3 live in here (the two likelihood gathers).
+        acs, like_mix = self._build_acs_and_recipe(state, priors)
+
+        from eryn.moves import StretchMove
+        from eryn.utils import PeriodicContainer
+
+        periodic_key_order = {key: value.key_order for key, value in priors.items()}
+        if periodic and not isinstance(periodic, PeriodicContainer):
+            periodic = PeriodicContainer(periodic, key_order=periodic_key_order)
+
+        engine = GlobalFitEngine(
+            acs,
+            self.nwalkers,
+            self.engine_info.ndims,
+            like_mix,
+            priors,
+            tempering_kwargs={"ntemps": self.ntemps},
+            nbranches=len(self.engine_info.branch_names),
+            nleaves_max=self.engine_info.nleaves_max,
+            nleaves_min=self.engine_info.nleaves_min,
+            moves=StretchMove(live_dangerously=True),
+            rj_moves=None,
+            kwargs=None,
+            # in-memory eryn Backend: never written, never read by the saver.
+            backend=None,
+            vectorize=True,
+            periodic=periodic,
+            branch_names=self.engine_info.branch_names,
+            plot_generator=None,
+            plot_iterations=-1,
+            provide_groups=True,
+            provide_supplemental=True,
+            track_moves=False,
+            stopping_fn=None,
+        )
+
+        # Stamp every step's moves once (periodic / temperature_control /
+        # thinning). Best-effort: a legacy step can read sampler state this
+        # shell engine does not carry, and the head re-stamps the stage kind on
+        # every command anyway (ComputeService.handle).
+        for step in self.recipe.recipe:
+            name = step.get("name") if isinstance(step, dict) else None
+            adjust = step.get("adjust") if isinstance(step, dict) else step
+            try:
+                adjust.setup_run(0, state, engine)
+            except Exception as exc:  # noqa: BLE001 - stamping must not kill the rank
+                self.logger.warning(
+                    "rank %d: setup_run stamping for recipe step %r failed (%s: %s); "
+                    "continuing.",
+                    self.rank, name, type(exc).__name__, exc,
+                )
+
+        seed = self._seed_rank_streams()
+        rank_rng = np.random.RandomState(seed)
+        model = GlobalFitInfo(acs, map, rank_rng)
+        self.fanout.model = model
+
+        # Addressable by the name the Stage stamped (``runtime.gf_move_name``):
+        # exactly the leaves the head's readiness guard vetted.
+        registry = {}
+        for move in _leaf_moves(_materialized_moves(self.recipe)):
+            move_name = getattr(move, "gf_move_name", None)
+            if move_name is not None:
+                registry[move_name] = move
+        self.logger.info(
+            "rank %d serving %d move(s): %s",
+            self.rank, len(registry), sorted(registry),
+        )
+
+        from .communication.fanout import ComputeService
+
+        self.compute_service = ComputeService(
+            self.fanout_comm,
+            self.layout,
+            self.rank,
+            registry=registry,
+            model=model,
+            builtins={
+                "likelihood": lambda payload, clock, model: np.asarray(
+                    asnumpy(model.analysis_container_arr.likelihood(complex=False))
+                ),
+            },
+            logger=self.logger,
+        )
+        self.sampler = engine
+        self.state = state
+        self.priors = priors
+        self.acs = acs
 
     def run_global_fit(self):
         """Execute the run for this rank's role (head / compute / saver / legacy spare)."""
@@ -2390,6 +2703,8 @@ class GlobalFit:
         elif self.role == RankRole.COMPUTE:
             self.prepare_compute()
             served = self.compute_service.serve()
+            #: how many commands this rank answered (read by the launch smoke)
+            self.compute_service_served = served
             self._release_rank_gpu_pool()
             self.logger.info("compute rank %d served %d command(s); exiting.", self.rank, served)
         else:  # legacy SPARE: wait for the startup "stop" and exit
