@@ -104,6 +104,22 @@ class MoveBuildContext:
             self.fanout = getattr(curr, "fanout", None)
         if self.rank is None:
             self.rank = getattr(curr, "rank", None)
+        # The rank's OWN walker rows, filled here because the variants build
+        # this ctx themselves and never pass ``state_local`` -- without it
+        # WP3's block-gated builders would silently read the full state.
+        # Sub-states are left out: a builder acting on its block reads
+        # coords/inds, and slicing them is the head's job (WP4/WP5 payloads).
+        if (
+            self.state_local is None
+            and self.state is not None
+            and self.layout is not None
+            and self.rank is not None
+            and not self.layout.is_single()
+        ):
+            from ..communication.walkerslice import slice_state  # lazy: avoids an import cycle
+
+            w0, w1 = self.layout.block_of(self.rank)
+            self.state_local = slice_state(self.state, w0, w1, sub_states=[])
 
 
 class Move:

@@ -154,8 +154,6 @@ from __future__ import annotations
 import logging
 import os
 import sys
-import threading
-import traceback
 
 # GB stage scoping -- MUST be seeded before ANY lisatools.globalfit.stock
 # import: ``erebor``'s module-level default instances snapshot every

@@ -294,6 +294,34 @@ class PickleTest(unittest.TestCase):
         self.assertEqual(clone.gb.a_lims, [1e-25, 1e-20])
 
 
+class RankWiringLifetimeTest(unittest.TestCase):
+    """The per-process rank wiring never survives a reset or a pickle."""
+
+    def test_reset_build_drops_the_rank_wiring(self):
+        fit = erebor.get_stock("gb_no_fg")
+        fit.rank_layout = "L"
+        fit.rank = 2
+        fit.rank_device_mode = "visible"
+        fit.fanout = object()
+        fit.reset_build()
+        self.assertIsNone(fit.rank_layout)
+        self.assertIsNone(fit.rank)
+        self.assertIsNone(fit.rank_device_mode)
+        self.assertIsNone(fit.fanout)
+
+    def test_pickle_drops_the_live_fanout_but_keeps_the_layout(self):
+        fit = erebor.get_stock("gb_no_fg")
+        fit.rank_layout = "L"
+        fit.rank = 2
+        # an UNPICKLABLE stand-in for the live communicator wrapper: the
+        # roundtrip only succeeds because __getstate__ drops it
+        fit.fanout = lambda: None
+        clone = pickle.loads(pickle.dumps(fit))
+        self.assertIsNone(clone.fanout)
+        self.assertEqual(clone.rank_layout, "L")
+        self.assertEqual(clone.rank, 2)
+
+
 def _fn_move(model, state):
     """Named module-level move so fits carrying it stay picklable."""
     return state, None

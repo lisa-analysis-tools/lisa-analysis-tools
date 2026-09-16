@@ -114,14 +114,19 @@ def _fanout_unready_moves(moves):
 
     ``unready``: ``GlobalFitMove`` leaves whose class still has the default
     ``gf_serve`` (they must be ported before running with several compute
-    ranks). ``head_only``: leaves that are not ``GlobalFitMove`` at all (plain
-    eryn moves): they run on the head against its walker block only, which is
-    logged as a warning. ``FunctionMove`` is head-only by design and appears in
-    neither list.
+    ranks). ``head_only``: every leaf that runs on the head against its walker
+    block ONLY -- leaves that are not ``GlobalFitMove`` at all (plain eryn
+    moves), ``FunctionMove`` (its ``fn`` runs on the head's block by design)
+    and anything that opts in via ``gf_head_only``. They are named in the
+    warning rather than silently skipped: "head-only" is a real semantic
+    change under multi-rank and the operator has to see which moves take it.
     """
     unready, head_only = [], []
     for move in _leaf_moves(moves):
+        # set ``gf_head_only = True`` on a GlobalFitMove subclass to declare it
+        # head-only; nothing sets it today.
         if isinstance(move, FunctionMove) or getattr(move, "gf_head_only", False):
+            head_only.append(_move_label(move))
             continue
         if not isinstance(move, GlobalFitMove):
             head_only.append(_move_label(move))
@@ -152,33 +157,47 @@ def _materialized_moves(recipe):
     return out
 
 
-def _serve_registry(moves):
-    """Compute-rank serve registry ``{(stage_name, move_name): leaf move}``.
+def _serve_registry(recipe):
+    """Compute-rank serve registry ``{(step_name, move_name): leaf, name: leaf}``.
 
-    The head addresses a move by the name its Stage stamped (``gf_move_name``)
-    with the current stage in the command clock, and the staged production
-    recipe REUSES move names across stages by design (``psd_pe`` in
-    ``noise_search`` and again in ``full_pe``: distinct runtime objects). Keying
-    by name alone would be last-wins, so the key is ``(gf_stage_name,
-    gf_move_name)``; :meth:`ComputeService.handle` resolves the pair first and
-    falls back to the bare name. A pair seen twice for two DIFFERENT objects is
-    a recipe defect (per-stage move names are unique) and raises; the same
-    object reached twice (shared by two combines) is fine. Leaves without a
-    ``gf_move_name`` are never served and are skipped.
+    Keyed from the materialized STEP LIST (``recipe.recipe``: dicts of
+    ``{"name", "adjust", ...}``), never from ``gf_stage_name`` -- a stock
+    runtime move is one object shared by every stage that lists it and the
+    stamp keeps only the last stage. The head addresses a move by its
+    ``gf_move_name`` with the current stage in the command clock
+    (``ComputeService.handle`` resolves the pair first, then the bare name),
+    so every (stage, name) pair a stage lists is registered; a bare-name entry
+    is added only when the name maps to exactly ONE object across all stages
+    (the safe fallback for a command whose clock carries no stage). Two
+    DIFFERENT objects under one (stage, name) is a recipe defect and raises.
     """
     registry = {}
-    for move in _leaf_moves(moves):
-        move_name = getattr(move, "gf_move_name", None)
-        if move_name is None:
+    objects_by_name = {}
+    for step in getattr(recipe, "recipe", None) or []:
+        step_name = step.get("name") if isinstance(step, dict) else None
+        adjust = step.get("adjust") if isinstance(step, dict) else step
+        try:
+            moves = list(getattr(adjust, "moves", None) or [])
+        except Exception:  # noqa: BLE001 - RecipeStep.moves raises when unset
             continue
-        key = (getattr(move, "gf_stage_name", None), move_name)
-        prior = registry.get(key)
-        if prior is not None and prior is not move:
-            raise RuntimeError(
-                f"two different moves named {move_name!r} in stage {key[0]!r}: the compute-rank "
-                "serve registry cannot address both; give them distinct names."
-            )
-        registry[key] = move
+        for leaf in _leaf_moves(moves):
+            name = getattr(leaf, "gf_move_name", None)
+            if name is None:
+                continue
+            key = (step_name, name)
+            prior = registry.get(key)
+            if prior is not None and prior is not leaf:
+                raise RuntimeError(
+                    f"two different moves named {name!r} in stage {step_name!r}: the "
+                    "compute-rank serve registry cannot address both; give them distinct names."
+                )
+            registry[key] = leaf
+            objects_by_name.setdefault(name, [])
+            if all(obj is not leaf for obj in objects_by_name[name]):
+                objects_by_name[name].append(leaf)
+    for name, objs in objects_by_name.items():
+        if len(objs) == 1:
+            registry[name] = objs[0]
     return registry
 
 
@@ -590,9 +609,6 @@ class GlobalFit:
         self.ranks_to_give = [
             r for r in self.all_ranks if layout.role_of(r) == RankRole.SPARE
         ]
-        self.used_ranks = list(self.compute_ranks)
-        if self.results_rank != self.main_rank:
-            self.used_ranks.append(self.results_rank)
         self.fanout_comm = layout.make_fanout_comm(self.comm) if not layout.is_single() else None
         if isinstance(self.comm, MPI.Comm) and self.comm.Get_size() > 1:
             install_mpi_abort_on_error(self.comm)
@@ -1578,7 +1594,12 @@ class GlobalFit:
         method is FD-specific.
 
         Args:
-            state: GFState object containing current parameter values.
+            state: GFState object containing current parameter values. ALWAYS
+                the full ``nwalkers``-walker state, on every rank -- the walker
+                block narrows what is BUILT, never what is passed in. The only
+                place the ``[w0, w1)`` slice is taken is the residual rebuild
+                below (``_rebuild_state_view``), which needs one template row
+                per local container.
             rebuild_residuals: If ``True``, subtract each non-PSD branch's
                 current templates from the freshly-built containers so the
                 stored arrays are residuals rather than raw data (stft_tof
@@ -1588,8 +1609,8 @@ class GlobalFit:
                 ``None`` builds every walker (single-process behaviour).
 
         Returns:
-            AnalysisContainerArray containing data, residuals, and
-            sensitivity for all walkers.
+            AnalysisContainerArray with one container per walker in
+            ``[w0, w1)`` (every walker when ``walker_block`` is ``None``).
         """
         general_info = self.curr.general_info
         w0, w1 = (
@@ -1726,12 +1747,12 @@ class GlobalFit:
         gpus = general_info.gpus
         if gpus is not None and len(gpus) > 1 and n_local % len(gpus) != 0:
             logger.warning(
-                "nwalkers=%d is not divisible by len(gpus)=%d: contiguous "
-                "np.array_split shards are uneven, so per-shard batch sizes "
-                "differ and any fixed-block intra-shard indexing is invalid "
-                "(GBGPU uses rank-based indexing and stays correct). Prefer "
-                "nwalkers %% ngpus == 0 for balanced device loads.",
-                n_local, len(gpus),
+                "local rows=%d (block [%d, %d) of %d walkers) is not divisible by "
+                "len(gpus)=%d: contiguous np.array_split shards are uneven, so "
+                "per-shard batch sizes differ and any fixed-block intra-shard "
+                "indexing is invalid (GBGPU uses rank-based indexing and stays "
+                "correct). Prefer local rows %% ngpus == 0 for balanced device loads.",
+                n_local, w0, w1, self.nwalkers, len(gpus),
             )
         acs = AnalysisContainerArray(
             acs_tmp,
@@ -1937,8 +1958,30 @@ class GlobalFit:
         fanout = WalkerFanout(
             self.fanout_comm, self.layout, self.rank, model=model, logger=self.logger
         )
-        fanout.clock["seed_base"] = getattr(self.curr.general_info, "random_seed", None)
+        # The resolved base (``_resolve_seed_base``), NOT the raw config field:
+        # every rank got it in the state bcast, so the clock a body reads and
+        # the stream ``_seed_rank_streams`` drew agree by construction. This
+        # runs AFTER that bcast on both sides (prepare_main / prepare_compute).
+        fanout.clock["seed_base"] = getattr(self, "_seed_base", None)
         return fanout
+
+    def _resolve_seed_base(self):
+        """The ONE seed base every rank derives its RNG stream from (head-side).
+
+        ``None`` in single mode: a single-process run reseeds nothing and keeps
+        exactly today's stream. Multi-rank takes ``general.random_seed`` when
+        the user set it and otherwise draws fresh entropy HERE, on the head
+        only -- the previous ``random_seed or 0`` fallback handed every
+        multi-rank run and every resubmit the identical stream (and disagreed
+        with the ``None`` the fan-out clock advertised). The drawn value ships
+        to the computation ranks with the state, so no rank draws its own.
+        """
+        if self.layout.is_single():
+            return None
+        seed = getattr(self.curr.general_info, "random_seed", None)
+        if seed is not None:
+            return int(seed)
+        return int(np.random.SeedSequence().entropy % (2**32 - 1))
 
     def _seed_rank_streams(self):
         """Distinct, deterministic RNG streams per compute rank (multi-rank only).
@@ -1950,11 +1993,7 @@ class GlobalFit:
             return None
         from .communication.ranks import derive_rank_seed
 
-        seed = derive_rank_seed(
-            int(getattr(self.curr.general_info, "random_seed", 0) or 0),
-            self.layout,
-            self.rank,
-        )
+        seed = derive_rank_seed(int(self._seed_base), self.layout, self.rank)
         np.random.seed(seed)
         if _xp_is_cupy and self.curr.general_info.gpus:
             xp.random.seed(seed)
@@ -2315,16 +2354,26 @@ class GlobalFit:
         return acs, like_mix
 
     def prepare_main(self):
-        """Build everything the sampling rank needs: backend, state, ACS, engine, recipe.
+        """Build everything the HEAD needs: state, ACS, engine, recipe, backend.
 
-        Extracted from ``run_global_fit`` (identical behavior): opens the HDF
-        backend, loads/initializes the state, builds the shared analysis
-        containers and likelihood, constructs the :class:`GlobalFitEngine`,
-        invokes the ``setup_function`` (which materializes the recipe), and
-        wires the recipe/backend bookkeeping. Afterwards ``self.sampler`` /
-        ``self.state`` / ``self.priors`` / ``self.acs`` / ``self.run_backend``
-        / ``self.live_ctx`` are set; ``run_global_fit`` and :meth:`sample`
-        both start from here.
+        The head's half of the setup phase, in order: collect priors/periodic,
+        ``load_info`` the state (this rank alone reads the store), resolve the
+        run's seed base and ``bcast`` the ``(state, seed_base)`` pair to the
+        computation ranks, build the fan-out, then the SHARED
+        :meth:`_build_acs_and_recipe` (ACA over this rank's walker block, the
+        two likelihood gathers, recipe materialization) with the head-only
+        :meth:`_open_run_backend` hook running between them to open/reset the
+        HDF store and arm mid-iteration saves. Then the
+        :class:`GlobalFitEngine` over the GLOBAL walker count, the recipe's
+        first step, this rank's RNG streams and finally the fan-out ``ping``
+        handshake -- the first point-to-point traffic of the run, so it comes
+        after every rank has finished its own setup.
+
+        Single-process runs take exactly the same path with the collectives
+        and the seed reseeding skipped (``layout.is_single()``). Afterwards
+        ``self.sampler`` / ``self.state`` / ``self.priors`` / ``self.acs`` /
+        ``self.run_backend`` / ``self.live_ctx`` are set; ``run_global_fit``
+        and :meth:`sample` both start from here.
         """
         branch_names = self.engine_info.branch_names
         ndims = self.engine_info.ndims
@@ -2336,13 +2385,26 @@ class GlobalFit:
         state = self.load_info(priors)
         self.logger.debug("state loaded (RSS %.0f MB)", _rss_mb())
 
+        # The run's ONE seed base, resolved before the bcast so it travels WITH
+        # the state (``None`` in single mode: nothing is reseeded there).
+        seed_base = self._resolve_seed_base()
+        self._seed_base = seed_base
+
         # COLLECTIVE 1/3 (multi-rank only): the head's freshly-loaded state is
         # the one every computation rank builds its block from -- so the store
-        # is read ONCE and no rank can disagree about the starting point.
-        # ``bcast`` returns the very object we passed on the root.
+        # is read ONCE and no rank can disagree about the starting point. The
+        # seed base rides along in the same payload, so one bcast serves both
+        # and every rank makes the SAME number of bcast calls with the same
+        # shape (prepare_compute mirrors this line). ``bcast`` returns the very
+        # object we passed on the root.
         if not self.layout.is_single():
-            state = self.fanout_comm.bcast(
-                state, root=self.layout.fanout_rank(self.main_rank)
+            state, self._seed_base = self.fanout_comm.bcast(
+                (state, seed_base), root=self.layout.fanout_rank(self.main_rank)
+            )
+            self.logger.info(
+                "rank layout seed base %d (set general.random_seed=%d to reproduce; "
+                "the field has no env knob -- there is no RANDOM_SEED env var)",
+                self._seed_base, self._seed_base,
             )
 
         self._attach_walker_supplemental(state)
@@ -2599,8 +2661,11 @@ class GlobalFit:
         """
         priors, periodic = self._collect_priors_periodic()
 
-        # COLLECTIVE 1/3: the head's state (it alone reads the store).
-        state = self.fanout_comm.bcast(
+        # COLLECTIVE 1/3: the head's state and the run's resolved seed base
+        # (it alone reads the store and it alone draws the base). Same call
+        # shape as the head's line in prepare_main -- one bcast of a
+        # ``(state, seed_base)`` pair, so neither side can drift in call count.
+        state, self._seed_base = self.fanout_comm.bcast(
             None, root=self.layout.fanout_rank(self.main_rank)
         )
         self._attach_walker_supplemental(state)
@@ -2616,6 +2681,9 @@ class GlobalFit:
         if periodic and not isinstance(periodic, PeriodicContainer):
             periodic = PeriodicContainer(periodic, key_order=periodic_key_order)
 
+        # The shell engine stays at the GLOBAL nwalkers (ruling): RecipeStep
+        # .setup_run stamps sampler.temperature_control onto every move that
+        # lacks one, so N keeps this rank symmetric with the head's engine.
         engine = GlobalFitEngine(
             acs,
             self.nwalkers,
@@ -2666,15 +2734,16 @@ class GlobalFit:
         model = GlobalFitInfo(acs, map, rank_rng)
         self.fanout.model = model
 
-        # Addressable by (stage, name) as the Stage stamped them
-        # (``runtime.gf_stage_name`` / ``runtime.gf_move_name``): exactly the
-        # leaves the head's readiness guard vetted. Names recur across stages
-        # in the staged recipe, hence the pair (see _serve_registry).
-        registry = _serve_registry(_materialized_moves(self.recipe))
+        # Addressable by (stage, name) -- keyed from the STEP LIST, because a
+        # stock runtime move is ONE object shared by every stage that lists it
+        # and its ``gf_stage_name`` stamp keeps only the last stage
+        # (see _serve_registry). Exactly the leaves the head's readiness
+        # guard vetted, plus an unambiguous bare-name fallback.
+        registry = _serve_registry(self.recipe)
         self.logger.info(
             "rank %d serving %d move(s): %s",
             self.rank, len(registry),
-            sorted(f"{stage}/{name}" for stage, name in registry),
+            sorted(f"{s}/{n}" for k in registry if isinstance(k, tuple) for s, n in (k,)),
         )
 
         from .communication.fanout import LIKELIHOOD_OP, ComputeService
@@ -2708,14 +2777,7 @@ class GlobalFit:
                 self.state, self.curr.general_info.num_iterations, thin_by=1,
                 progress=self.progress, store=True,
             )
-            if self.curr.general_info.submission_parent_folder is not None:
-                self.logger.debug(
-                    f"saving submission to {self.curr.general_info.submission_parent_folder}"
-                )
-                submission_writer = SubmissionWriter(
-                    backend=self.run_backend, curr=self.curr, ess=20_000
-                )
-                submission_writer.write_submission(self.acs)
+            self._write_submission()
             logger.info("Residuals saved.")
             if getattr(self, "fanout", None) is not None:
                 self.fanout.stop()
@@ -2746,6 +2808,32 @@ class GlobalFit:
             info = self.comm.recv(source=self.main_rank)
             logger.info(f"Process {self.rank} finished ({info!r}).")
 
+    def _write_submission(self):
+        """End-of-run submission dump (head-only, single-rank-only).
+
+        Reads the HEAD's ACA, which in a multi-rank run holds just its walker
+        block: ``postprocessing.save_residuals`` would write
+        ``residual_0..residual_{B-1}`` under full-run names and
+        ``_prepare_gb_samples`` would argmax over that block alone, so the
+        dump has to be routed through the fan-out before it can run there.
+        """
+        if not self.layout.is_single():
+            self.logger.warning(
+                "multi-rank run: submission residual dump SKIPPED -- the head's ACA holds only "
+                "walkers [%d, %d) of %d; TODO(multi-rank): route SubmissionWriter through the "
+                "fan-out (gather residuals per block) before enabling it.",
+                *self.layout.block_of(self.rank), self.layout.nwalkers,
+            )
+            return
+        if self.curr.general_info.submission_parent_folder is not None:
+            self.logger.debug(
+                f"saving submission to {self.curr.general_info.submission_parent_folder}"
+            )
+            submission_writer = SubmissionWriter(
+                backend=self.run_backend, curr=self.curr, ess=20_000
+            )
+            submission_writer.write_submission(self.acs)
+
     def _release_rank_gpu_pool(self):
         """Release this rank's build-time GPU memory cache on its OWN device(s).
 
@@ -2765,15 +2853,17 @@ class GlobalFit:
         ``layout.local_gpus(rank)``: the layout's pool ids are the PER-NODE
         pool's own numbering, which in ``"visible"`` pinning mode no longer
         even exist as device indices (the rank's ``CUDA_VISIBLE_DEVICES`` was
-        narrowed to just its own devices, renumbered ``0..k-1``), and in the
-        legacy layout (``GF_LEGACY_RANK_LAYOUT=1``) every rank still builds on
-        the WHOLE ``gpus`` pool (no per-rank pinning runs at all) while
-        ``layout.local_gpus`` gives the saver/spare only one pool device --
-        freeing half the cache instead of all of it. ``general_info.gpus`` is
-        correct in every mode: ``[0..k-1]`` in ``"visible"`` mode, the pinned
-        pool ids in ``"setdevice"`` mode, and the untouched full pool in
-        single-process and legacy runs. A CPU run (``gpus`` empty/``None``)
-        is a no-op.
+        narrowed to just its own devices, renumbered ``0..k-1``). In the legacy
+        layout (``GF_LEGACY_RANK_LAYOUT=1``) ``prepare_rank`` ->
+        ``select_rank_device`` still runs: it leaves the COMPUTE rank's whole
+        pool untouched (mode ``"legacy"``, ``ranks.py`` ~386-387) but narrows
+        the saver/spare ranks' ``general.gpus`` to the single device their
+        placement names (``ranks.py`` ~276-279) -- which is exactly the device
+        those ranks built on. ``general_info.gpus`` is therefore correct in
+        every mode: ``[0..k-1]`` in ``"visible"`` mode, the pinned pool ids in
+        ``"setdevice"`` mode, the untouched full pool for a legacy compute rank
+        and the single placed device for a legacy saver/spare. A CPU run
+        (``gpus`` empty/``None``) is a no-op.
         """
         import gc
 
@@ -2798,9 +2888,6 @@ class GlobalFit:
             "rank %d released ~%.2f GB of cached GPU pool blocks on device(s) %s.",
             self.rank, freed / 1e9, list(devices),
         )
-
-    #: legacy name (pre-multirank); kept for any external caller.
-    _release_helper_gpu_pool = _release_rank_gpu_pool
 
     def sample(
         self,

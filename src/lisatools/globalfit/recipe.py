@@ -609,6 +609,14 @@ class Recipe:
 
         self._current_recipe_step["adjust"].setup_run(iteration, last_sample, sampler)
         if self.fanout is not None:
+            # Seed the fan-out clock BEFORE the first propose -- otherwise it
+            # sits at its constructed 0 through the whole first iteration.
+            # ``__call__`` refreshes it from the stopping-function call that
+            # FOLLOWS each iteration, so once sampling is under way the
+            # ``iteration`` a propose reads is the index of the PREVIOUS
+            # completed iteration: a stable label for tracing, not a counter a
+            # rank-side body may key behaviour on.
+            self.fanout.note_iteration(iteration)
             self.fanout.enter_stage(
                 self._current_recipe_step["name"],
                 _stage_kind_of(self._current_recipe_step["adjust"]),
@@ -2056,8 +2064,14 @@ def _reference_sens_mat(acs):
 
 
 def _local_nwalkers(acs) -> int:
-    """Walkers this rank's ACA holds (== the global count in a single-process run)."""
-    return int(acs.acs_total_entries)
+    """Walkers this rank's ACA holds (== the global count in a single-process run).
+
+    ``acs_total_entries`` is the AnalysisContainerArray's own row count;
+    ``len(acs)`` is the fallback for the lighter ACA stand-ins (test fakes,
+    plain container sequences) that never grew the attribute.
+    """
+    n = getattr(acs, "acs_total_entries", None)
+    return int(len(acs) if n is None else n)
 
 
 def _local_walker_block(curr, acs):

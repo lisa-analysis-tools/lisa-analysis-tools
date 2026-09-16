@@ -13,6 +13,7 @@ from lisatools.globalfit.communication.fanout import (
     WalkerFanout,
     concat_blocks,
 )
+from lisatools.globalfit.communication.ranks import RankRole, build_layout
 
 
 class _Acs:
@@ -23,7 +24,6 @@ class _Acs:
 
     def likelihood(self, complex=False):
         return self.values
-from lisatools.globalfit.communication.ranks import RankRole, build_layout
 
 
 class _StubMove:
@@ -186,6 +186,45 @@ class FanoutFakeCommTest(unittest.TestCase):
         self.assertEqual([c[1] for c in stubs["early"].calls], ["search"])
         self.assertEqual([c[1] for c in stubs["late"].calls], ["pe"])
         self.assertEqual([c[1] for c in stubs["bare"].calls], ["pe"])
+
+    def test_one_shared_object_registered_under_two_stage_keys_serves_both(self):
+        # The production case run.py's step-list registry exists for: a stock
+        # runtime move is ONE object listed by two stages (``psd_pe`` in
+        # noise_search AND full_pe), so both (stage, name) keys map to it and
+        # the head's commands in EITHER stage must be served.
+        world = FakeWorld(2, nodes=[0, 0])
+        stubs = {}
+
+        def fn(rank, comm):
+            layout = build_layout(comm, 4, [0, 1], legacy=False)
+            fcomm = layout.make_fanout_comm(comm)
+            if rank == layout.head_rank:
+                fo = WalkerFanout(fcomm, layout, rank, model="m")
+                kw = dict(
+                    per_rank_payload=lambda r, w0, w1: {"x": np.ones(1)},
+                    local_body=lambda p, m: {"rank_sum": 1.0},
+                    merge=lambda r: r,
+                )
+                try:
+                    fo.enter_stage("noise_search", "search")
+                    fo.run("score", move="stub", **kw)
+                    fo.enter_stage("full_pe", "pe")
+                    fo.run("score", move="stub", **kw)
+                finally:
+                    fo.stop()
+                return "head"
+            stubs["shared"] = _StubMove()
+            registry = {
+                ("noise_search", "stub"): stubs["shared"],
+                ("full_pe", "stub"): stubs["shared"],
+                "stub": stubs["shared"],
+            }
+            return ComputeService(fcomm, layout, rank, registry=registry, model="m").serve()
+
+        out = world.run(fn)
+        self.assertEqual(out[1], 2)
+        self.assertEqual(len(stubs["shared"].calls), 2)
+        self.assertEqual([c[1] for c in stubs["shared"].calls], ["search", "pe"])
 
     def test_gather_likelihood_concatenates_blocks_in_walker_order(self):
         # Head block (0, 2) scored from its own ACA; worker block (2, 4) answered by

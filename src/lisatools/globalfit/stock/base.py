@@ -244,6 +244,11 @@ def engine_ntemps_default():
 # them earlier gets a helpful error instead of a bare AttributeError.
 _BUILT_ONLY_ATTRS = ("settings_dict", "current_info", "backend")
 
+# Per-process multi-rank wiring stamped by communication.ranks.prepare_rank
+# (GlobalFitSetup declares all four with a ``None`` class default): dropped by
+# reset_build, since another process's layout must never survive a reset.
+_RANK_ATTRS = ("rank_layout", "rank", "rank_device_mode", "fanout")
+
 
 @dataclasses.dataclass
 class _InfoBranchSettings(Settings):
@@ -830,8 +835,20 @@ class StockGlobalFit(GlobalFitSetup):
         """Variant hook, called once at the end of :meth:`build`."""
 
     def reset_build(self):
-        """Drop all built products, returning to the cheap configured state."""
-        for attr in ("_general_setup", "_source_info", *_BUILT_ONLY_ATTRS):
+        """Drop all built products, returning to the cheap configured state.
+
+        The rank wiring goes too (``rank_layout`` / ``rank`` /
+        ``rank_device_mode`` / ``fanout``, class defaults ``None``): it is
+        resolved per process by ``communication.ranks.prepare_rank`` just
+        before a build, so a reset config that kept another process's layout
+        (or a dead communicator) would rebuild against the wrong walker block.
+        """
+        for attr in (
+            "_general_setup",
+            "_source_info",
+            *_BUILT_ONLY_ATTRS,
+            *_RANK_ATTRS,
+        ):
             self.__dict__.pop(attr, None)
 
     def run(self, comm=None, **run_kwargs):
@@ -1015,6 +1032,10 @@ class StockGlobalFit(GlobalFitSetup):
         state = self.__dict__.copy()
         for attr in ("_general_setup", "_source_info", "_runner", *_BUILT_ONLY_ATTRS):
             state.pop(attr, None)
+        # ``fanout`` is a LIVE communicator wrapper (mpi4py comm + head-side
+        # command state): not picklable, and meaningless in another process.
+        # ``rank_layout`` is a plain frozen dataclass and stays.
+        state.pop("fanout", None)
         return state
 
     def __setstate__(self, state):
