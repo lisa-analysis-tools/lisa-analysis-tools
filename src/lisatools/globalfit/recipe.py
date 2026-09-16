@@ -2076,6 +2076,28 @@ def _local_walker_block(curr, acs):
     return int(w0), int(w1)
 
 
+def _noise_temperature_control(effective_ndim, nwalkers, *, betas, ntemps, Tmax):
+    """The ladder shared by the psd/galfor/sgwb search and PE moves.
+
+    ``walker_inds`` is pinned OUT of the fancy (walker-permuting) swap. It is the
+    ACA row ``PSDMove.compute_log_like`` scores against (psdmove.py ~679/1881);
+    Eryn scores a fancy swap against the UNPERMUTED destination rows
+    (tempering.py ~778-817) and would then swap the label together with the
+    coords (tempering.py ~607-614), leaving slot ``w`` pointing at another
+    walker's residual for the rest of the propose -- and, under several compute
+    ranks, at an ACA row that does not exist on the rank.
+    """
+    return TemperatureControl(
+        effective_ndim,
+        nwalkers,
+        betas=betas,
+        ntemps=ntemps,
+        Tmax=Tmax,
+        permute=False,
+        skip_swap_supp_names=["walker_inds"],
+    )
+
+
 def get_shared_dcga(acs):
     """The run's ONE shared :class:`DomainComputationGroupArray`.
 
@@ -2227,13 +2249,8 @@ def build_noise_moves(
 
     # the ladder dimension is the sum of the SAMPLED branch ndims
     effective_ndim = sum(engine_info.ndims[b] for b in sampled_branches)
-    temperature_control = TemperatureControl(
-        effective_ndim,
-        nwalkers,
-        betas=lead_info.betas,
-        ntemps=ntemps,
-        Tmax=Tmax,
-        permute=False,
+    temperature_control = _noise_temperature_control(
+        effective_ndim, nwalkers, betas=lead_info.betas, ntemps=ntemps, Tmax=Tmax
     )
 
     move_kwargs = dict(
