@@ -152,6 +152,36 @@ def _materialized_moves(recipe):
     return out
 
 
+def _serve_registry(moves):
+    """Compute-rank serve registry ``{(stage_name, move_name): leaf move}``.
+
+    The head addresses a move by the name its Stage stamped (``gf_move_name``)
+    with the current stage in the command clock, and the staged production
+    recipe REUSES move names across stages by design (``psd_pe`` in
+    ``noise_search`` and again in ``full_pe``: distinct runtime objects). Keying
+    by name alone would be last-wins, so the key is ``(gf_stage_name,
+    gf_move_name)``; :meth:`ComputeService.handle` resolves the pair first and
+    falls back to the bare name. A pair seen twice for two DIFFERENT objects is
+    a recipe defect (per-stage move names are unique) and raises; the same
+    object reached twice (shared by two combines) is fine. Leaves without a
+    ``gf_move_name`` are never served and are skipped.
+    """
+    registry = {}
+    for move in _leaf_moves(moves):
+        move_name = getattr(move, "gf_move_name", None)
+        if move_name is None:
+            continue
+        key = (getattr(move, "gf_stage_name", None), move_name)
+        prior = registry.get(key)
+        if prior is not None and prior is not move:
+            raise RuntimeError(
+                f"two different moves named {move_name!r} in stage {key[0]!r}: the compute-rank "
+                "serve registry cannot address both; give them distinct names."
+            )
+        registry[key] = move
+    return registry
+
+
 def _rank_log_filenames(layout, rank):
     """(root lisatools log, GlobalFit log) for this rank; the head keeps today's names."""
     if int(rank) == int(layout.head_rank):
@@ -2613,19 +2643,22 @@ class GlobalFit:
         )
 
         # Stamp every step's moves once (periodic / temperature_control /
-        # thinning). Best-effort: a legacy step can read sampler state this
-        # shell engine does not carry, and the head re-stamps the stage kind on
-        # every command anyway (ComputeService.handle).
+        # thinning). The ONE tolerated failure is a legacy step reading sampler
+        # state this shell engine does not carry (AttributeError); the head
+        # re-stamps the stage kind on every command anyway
+        # (ComputeService.handle). Anything else is a real defect and
+        # propagates to the abort hook -- a rank that silently serves
+        # half-stamped moves would desync from the head.
         for step in self.recipe.recipe:
             name = step.get("name") if isinstance(step, dict) else None
             adjust = step.get("adjust") if isinstance(step, dict) else step
             try:
                 adjust.setup_run(0, state, engine)
-            except Exception as exc:  # noqa: BLE001 - stamping must not kill the rank
+            except AttributeError as exc:
                 self.logger.warning(
-                    "rank %d: setup_run stamping for recipe step %r failed (%s: %s); "
-                    "continuing.",
-                    self.rank, name, type(exc).__name__, exc,
+                    "rank %d: setup_run stamping for recipe step %r read sampler state the "
+                    "compute shell engine lacks (%s); continuing.",
+                    self.rank, name, exc,
                 )
 
         seed = self._seed_rank_streams()
@@ -2633,16 +2666,15 @@ class GlobalFit:
         model = GlobalFitInfo(acs, map, rank_rng)
         self.fanout.model = model
 
-        # Addressable by the name the Stage stamped (``runtime.gf_move_name``):
-        # exactly the leaves the head's readiness guard vetted.
-        registry = {}
-        for move in _leaf_moves(_materialized_moves(self.recipe)):
-            move_name = getattr(move, "gf_move_name", None)
-            if move_name is not None:
-                registry[move_name] = move
+        # Addressable by (stage, name) as the Stage stamped them
+        # (``runtime.gf_stage_name`` / ``runtime.gf_move_name``): exactly the
+        # leaves the head's readiness guard vetted. Names recur across stages
+        # in the staged recipe, hence the pair (see _serve_registry).
+        registry = _serve_registry(_materialized_moves(self.recipe))
         self.logger.info(
             "rank %d serving %d move(s): %s",
-            self.rank, len(registry), sorted(registry),
+            self.rank, len(registry),
+            sorted(f"{stage}/{name}" for stage, name in registry),
         )
 
         from .communication.fanout import ComputeService

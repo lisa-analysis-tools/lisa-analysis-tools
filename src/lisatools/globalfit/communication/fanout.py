@@ -253,7 +253,12 @@ class ComputeService:
             if op in self.builtins:
                 result = self.builtins[op](cmd.get("payload"), clock, self.model)
             else:
-                move = self.registry[move_name]
+                # Registry keys are ``(stage_name, move_name)`` (run.py
+                # _serve_registry: names recur across stages) with a bare-name
+                # fallback for stage-less registries (tests, hand-built).
+                move = self.registry.get((clock.get("stage"), move_name))
+                if move is None:
+                    move = self.registry[move_name]
                 if "stage_kind" in clock:
                     move.gf_stage_kind = clock["stage_kind"]
                 result = move.gf_serve(op, cmd.get("payload"), clock, self.model)

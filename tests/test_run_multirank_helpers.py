@@ -12,6 +12,7 @@ from lisatools.globalfit.run import (
     _fanout_unready_moves,
     _leaf_moves,
     _rank_log_filenames,
+    _serve_registry,
 )
 
 
@@ -31,6 +32,10 @@ class _Served(GlobalFitMove):
 
 class _Unserved(GlobalFitMove):
     gf_move_name = "unserved"
+
+
+class _NoName(GlobalFitMove):
+    """A leaf no Stage stamped (no ``gf_move_name``)."""
 
 
 def _fn(model, state):
@@ -53,6 +58,27 @@ class HelpersTest(unittest.TestCase):
         )
         self.assertEqual(names, ["unserved"])
         self.assertEqual(head_only, ["CombineMove"])
+
+    def test_serve_registry_keys_by_stage_and_name(self):
+        # The staged recipe reuses a move name across stages (distinct runtime
+        # objects): both must be addressable, never last-wins.
+        early, late = _Served(name="psd_pe"), _Served(name="psd_pe")
+        early.gf_move_name = late.gf_move_name = "psd_pe"
+        early.gf_stage_name, late.gf_stage_name = "noise_search", "full_pe"
+        unnamed = _NoName(name="x")  # never stamped by a Stage: not served, skipped
+        reg = _serve_registry([_Combine([early, unnamed]), _Combine([late, early])])
+        self.assertEqual(
+            reg, {("noise_search", "psd_pe"): early, ("full_pe", "psd_pe"): late}
+        )
+        self.assertIs(reg[("noise_search", "psd_pe")], early)
+        self.assertIs(reg[("full_pe", "psd_pe")], late)
+
+    def test_serve_registry_rejects_two_moves_with_one_name_in_one_stage(self):
+        a, b = _Served(name="a"), _Served(name="a")
+        a.gf_move_name = b.gf_move_name = "a"
+        a.gf_stage_name = b.gf_stage_name = "pe"
+        with self.assertRaisesRegex(RuntimeError, "two different moves named 'a'"):
+            _serve_registry([a, b])
 
     def test_rank_log_filenames(self):
         lay = FakeWorld(3).run(lambda r, c: build_layout(c, 4, [0, 1], legacy=False))[0]

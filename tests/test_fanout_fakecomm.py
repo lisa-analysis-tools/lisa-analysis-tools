@@ -137,6 +137,45 @@ class FanoutFakeCommTest(unittest.TestCase):
         (out, _stubs) = _run_world(3, [0, 0, 0], 4, head)
         self.assertEqual(out[0], "KeyError")
 
+    def test_registry_resolves_stage_and_name_before_the_bare_name(self):
+        # run.py's serve registry is keyed (stage, name): one move name used in two
+        # stages addresses two different objects; a bare-name entry is the fallback.
+        world = FakeWorld(2, nodes=[0, 0])
+        stubs = {}
+
+        def fn(rank, comm):
+            layout = build_layout(comm, 4, [0, 1], legacy=False)
+            fcomm = layout.make_fanout_comm(comm)
+            if rank == layout.head_rank:
+                fo = WalkerFanout(fcomm, layout, rank, model="m")
+                kw = dict(
+                    per_rank_payload=lambda r, w0, w1: {"x": np.ones(1)},
+                    local_body=lambda p, m: {"rank_sum": 1.0},
+                    merge=lambda r: r,
+                )
+                try:
+                    fo.enter_stage("noise_search", "search")
+                    fo.run("score", move="stub", **kw)
+                    fo.enter_stage("full_pe", "pe")
+                    fo.run("score", move="stub", **kw)
+                    fo.run("score", move="other", **kw)
+                finally:
+                    fo.stop()
+                return "head"
+            stubs.update(early=_StubMove(), late=_StubMove(), bare=_StubMove())
+            registry = {
+                ("noise_search", "stub"): stubs["early"],
+                ("full_pe", "stub"): stubs["late"],
+                "other": stubs["bare"],
+            }
+            return ComputeService(fcomm, layout, rank, registry=registry, model="m").serve()
+
+        out = world.run(fn)
+        self.assertEqual(out[1], 3)
+        self.assertEqual([c[1] for c in stubs["early"].calls], ["search"])
+        self.assertEqual([c[1] for c in stubs["late"].calls], ["pe"])
+        self.assertEqual([c[1] for c in stubs["bare"].calls], ["pe"])
+
     def test_saver_never_sees_fanout_traffic(self):
         def saver(rank, comm):
             time.sleep(0.2)
