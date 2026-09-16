@@ -106,10 +106,28 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
 
         # the *_wdm kernels are single-shard by contract (they consume
         # linear_data_arr[0]); multi-shard (multi-GPU walker-shard) ACAs
-        # are served by per-split routing in compute_like (gbbands
-        # _ShardHolderView + partition, each split under its own device
-        # context — the comp re-asserts its geometry arrays per call so
-        # they land on the current device)
+        # are served by per-split routing in compute_like and in the
+        # cold-chain fill (gbbands _ShardHolderView + partition, each split
+        # under its own device context).
+        #
+        # DEVICE DISCIPLINE (2026-09-16). Unlike the GB router, which builds
+        # a per-device comp REPLICA (_RoutedBandEngine._comp_for ->
+        # _device_local_gb_comp, guarded by _assert_comp_device), this move
+        # drives ONE SHARED comp under both devices' contexts. Everything it
+        # hands a kernel out of ``self`` is therefore a home-device pointer
+        # unless something relocates it:
+        #   * the five chunk-geometry / WDM-window arrays now go through
+        #     WDMComputationsBase._geometry_kernel_args() on EVERY kernel
+        #     path (scoring, fill, swap, grads, fstat) — that is the fix for
+        #     the null run's illegal access in wdm_het_fill_global_kernel,
+        #     which was fed device-0 geometry from a device-1 launch.
+        #   * STILL HOME-DEVICE, not yet addressed: self.comp.cpp_orbits /
+        #     cpp_tdi_config / cpp_wdm_settings. The C++ impl memcpy's those
+        #     host structs to the caller's device per call, but their
+        #     POINTER FIELDS (e.g. the orbit spline arrays) still address the
+        #     comp's home device. If a cross-device fault survives this fix,
+        #     that is the next suspect — the durable answer is a per-device
+        #     comp replica here, as GB already does.
         self._n_shards = len(self.acs.linear_data_arr)
 
         # in-band carrier window from the comp's WDM settings: proposals
@@ -167,23 +185,66 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
     # repeat?) and the per-row rate are separately visible.
     # ------------------------------------------------------------------
 
+    #: ``_kernel_ll`` sub-spans accumulated per leaf window, in the order
+    #: they are paid. ``dispatch`` = shard-view/partition routing (move
+    #: side); ``stage`` = the comp's param staging + index prep + layer
+    #: grouping; ``geom`` = its static-geometry re-assert; ``wrap`` = the
+    #: per-call ``*ComputationGroupWrap`` construction; ``launch`` = the
+    #: kernel invocation; ``sync`` = the device sync that drains an async
+    #: launch (so ``launch`` + ``sync`` is the true kernel wall); ``pull``
+    #: = the D2H of ll / d_h_out / h_h_out.
+    _LL_SPAN_KEYS = ("dispatch", "stage", "geom", "wrap", "launch",
+                     "sync", "pull")
+
     def _ll_stats_reset(self):
         self._ll_stats = {"calls": 0, "rows": 0, "host_s": 0.0,
-                          "kernel_s": 0.0, "total_s": 0.0}
+                          "kernel_s": 0.0, "total_s": 0.0,
+                          "shard_calls": 0, "groups": 0}
+        for key in self._LL_SPAN_KEYS:
+            self._ll_stats[key + "_s"] = 0.0
+
+    def _ll_spans_add(self, spans):
+        """Fold one ``_kernel_ll`` shard call's sub-spans into the window."""
+        st = getattr(self, "_ll_stats", None)
+        if st is None:
+            self._ll_stats_reset()
+            st = self._ll_stats
+        st["shard_calls"] += int(spans.get("shard_calls", 0))
+        st["groups"] += int(spans.get("n_groups", 0))
+        for key in self._LL_SPAN_KEYS:
+            st[key + "_s"] = st.get(key + "_s", 0.0) + float(spans.get(key, 0.0))
 
     def _flush_ll_stats(self):
         st = getattr(self, "_ll_stats", None)
         if not st or st["calls"] == 0:
             return
+        prefix = getattr(self, "_dbg_prefix", "SOBBH")
         other = st["total_s"] - st["host_s"] - st["kernel_s"]
         logger.info(
             "[%s_LL_TIMING] leaf window: calls=%d rows=%d total=%.2f s "
             "(host_stage=%.2f, kernel=%.2f, other=%.2f) -> %.0f ms/call, "
             "%.2f ms/row",
-            getattr(self, "_dbg_prefix", "SOBBH"), st["calls"], st["rows"],
+            prefix, st["calls"], st["rows"],
             st["total_s"], st["host_s"], st["kernel_s"], other,
             1e3 * st["total_s"] / st["calls"],
             1e3 * st["total_s"] / max(st["rows"], 1),
+        )
+        # companion line: WHICH part of the kernel call the wall went to.
+        spans = {k: float(st.get(k + "_s", 0.0)) for k in self._LL_SPAN_KEYS}
+        named = sum(spans.values())
+        slowest = max(spans, key=spans.get)
+        shard_calls = max(st["shard_calls"], 1)
+        logger.info(
+            "[%s_LL_TIMING] leaf window internals: shard_calls=%d "
+            "groups/call=%.1f dispatch=%.2f stage=%.2f geom=%.2f wrap=%.2f "
+            "launch=%.2f sync=%.2f pull=%.2f s (named=%.2f of kernel=%.2f) "
+            "-> slowest=%s (%.0f%% of named), %.1f ms/group",
+            prefix, st["shard_calls"], st["groups"] / shard_calls,
+            spans["dispatch"], spans["stage"], spans["geom"], spans["wrap"],
+            spans["launch"], spans["sync"], spans["pull"],
+            named, st["kernel_s"],
+            slowest, 100.0 * spans[slowest] / named if named > 0 else 0.0,
+            1e3 * (spans["launch"] + spans["sync"]) / max(st["groups"], 1),
         )
         self._ll_stats_reset()
 
@@ -299,17 +360,31 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
         # NB do NOT "batch the repeats": the repeat loop is a sequential MH
         # chain, and batching repeats across sources was VETOED for GB
         # (serial-within-band scheduling policy).
+        from ...utils.device import synchronize
+
         if len(self.acs.linear_data_arr) == 1:
+            xp = getattr(self.acs, "xp", None)
+            _t = time.perf_counter()
             ll = self.comp.get_ll_wdm(
                 params, self.acs,
                 data_index=idx, noise_index=idx,
                 m_band_half_width=self.m_band_half_width,
             )
-            return (
+            _t_call = time.perf_counter() - _t
+            _t = time.perf_counter()
+            synchronize(xp)
+            _t_sync = time.perf_counter() - _t
+            _t = time.perf_counter()
+            out = (
                 np.asarray(asnumpy(ll), dtype=float),
                 np.real(np.asarray(asnumpy(self.comp.d_h_out))),
                 np.real(np.asarray(asnumpy(self.comp.h_h_out))),
             )
+            self._ll_spans_add(
+                self._shard_spans(_t_call, _t_sync,
+                                  time.perf_counter() - _t, 0.0)
+            )
+            return out
 
         # multi-GPU walker shards: reuse the GB shard-router primitives —
         # per-split single-shard views + the split partition — and run each
@@ -318,6 +393,7 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
         from ...utils.device import device_context
         from .gbbands import _RoutedBandEngine
 
+        _t = time.perf_counter()
         holder = self.acs
         views = _RoutedBandEngine._shard_views(holder)
         parts = _RoutedBandEngine._partition(holder, idx)
@@ -326,20 +402,61 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
         ll = np.full(n, -1e300, dtype=float)
         d_h = np.full(n, np.nan)
         h_h = np.full(n, np.nan)
+        _t_dispatch = time.perf_counter() - _t
         for view, (pos, intra, _) in zip(views, parts):
             if pos.shape[0] == 0:
                 continue
             with device_context(xp, view.device):
+                _t = time.perf_counter()
                 vals = self.comp.get_ll_wdm(
                     params[pos], view,
                     data_index=np.asarray(intra, dtype=np.int32),
                     noise_index=np.asarray(intra, dtype=np.int32),
                     m_band_half_width=self.m_band_half_width,
                 )
+                _t_call = time.perf_counter() - _t
+                _t = time.perf_counter()
+                synchronize(xp)
+                _t_sync = time.perf_counter() - _t
+                _t = time.perf_counter()
                 ll[pos] = np.asarray(asnumpy(vals), dtype=float)
                 d_h[pos] = np.real(np.asarray(asnumpy(self.comp.d_h_out)))
                 h_h[pos] = np.real(np.asarray(asnumpy(self.comp.h_h_out)))
+                self._ll_spans_add(
+                    self._shard_spans(_t_call, _t_sync,
+                                      time.perf_counter() - _t, _t_dispatch)
+                )
+                # dispatch is per-CALL, not per-shard -- charge it once
+                _t_dispatch = 0.0
         return ll, d_h, h_h
+
+    def _shard_spans(self, t_call, t_sync, t_pull, t_dispatch):
+        """One shard call's sub-spans, comp-internal breakdown folded in.
+
+        ``t_call`` is the whole ``get_ll_wdm`` wall; the comp records its
+        own split of that on ``last_call_spans`` (stage / geom / wrap /
+        launch / total). ``launch`` absorbs whatever ``t_call`` the comp
+        left unattributed, so the named spans always sum to the measured
+        wall -- including the case of a comp that publishes no breakdown at
+        all, where the whole call is charged to ``launch``.
+        """
+        c = getattr(self.comp, "last_call_spans", None) or {}
+        if not c:
+            return {
+                "dispatch": t_dispatch, "stage": 0.0, "geom": 0.0,
+                "wrap": 0.0, "launch": t_call, "sync": t_sync,
+                "pull": t_pull, "shard_calls": 1,
+            }
+        stage = float(c.get("stage", 0.0))
+        geom = float(c.get("geom", 0.0))
+        wrap = float(c.get("wrap", 0.0))
+        launch = float(c.get("launch", 0.0))
+        launch += max(t_call - float(c.get("total", t_call)), 0.0)
+        return {
+            "dispatch": t_dispatch, "stage": stage, "geom": geom,
+            "wrap": wrap, "launch": launch, "sync": t_sync, "pull": t_pull,
+            "shard_calls": 1, "n_groups": int(c.get("n_groups", 0)),
+        }
 
     #: The chunked record is one cheap vectorized call -> default ON
     #: (SOBBH_RECORD_DH=0 disables).

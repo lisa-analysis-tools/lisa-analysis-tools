@@ -20,7 +20,6 @@ the cluster (GB_MULTIGPU_SYNC_DEBUG=1 discriminator).
 from __future__ import annotations
 
 import os
-import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -29,59 +28,11 @@ from unittest import mock
 import numpy as np
 
 try:
-    from tests._multishard import RecordingXp
+    from tests._multishard import RecordingXp, StreamRecordingXp
 except ImportError:  # pragma: no cover - direct invocation from tests/
-    from _multishard import RecordingXp
+    from _multishard import RecordingXp, StreamRecordingXp
 
 from lisatools.globalfit.moves.gbbands import _RoutedBandEngine
-
-
-class _FakeEvent:
-    def __init__(self, device, seq):
-        self.device = device
-        self.seq = seq
-
-
-class StreamRecordingXp(RecordingXp):
-    """RecordingXp + a cupy-like per-device current stream.
-
-    ``cuda.get_current_stream()`` returns a stream bound to the CURRENT
-    device (thread-local, like cupy); ``stream.record()`` appends
-    ("record", device, seq) and returns the event; ``stream.wait_event(ev)``
-    appends ("wait", waiting_device, ev.device, ev.seq, seq). A shared
-    monotone ``seq`` orders records, waits and worker marks across threads.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.stream_log = []
-        self._seq_lock = threading.Lock()
-        self._seq = 0
-
-        outer = self
-
-        class _Stream:
-            def __init__(self, device):
-                self.device = device
-
-            def record(self, event=None):
-                seq = outer.next_seq()
-                ev = _FakeEvent(self.device, seq)
-                outer.stream_log.append(("record", self.device, seq))
-                return ev
-
-            def wait_event(self, ev):
-                seq = outer.next_seq()
-                outer.stream_log.append(
-                    ("wait", self.device, ev.device, ev.seq, seq))
-
-        self.cuda.get_current_stream = (
-            lambda: _Stream(self.cuda.runtime.getDevice()))
-
-    def next_seq(self):
-        with self._seq_lock:
-            self._seq += 1
-            return self._seq
 
 
 def _make_holder(xp, threaded=True):

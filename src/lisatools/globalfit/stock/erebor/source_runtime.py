@@ -1359,6 +1359,67 @@ class SourceSignalGen:
 # ============================================================
 # Runtime move builders
 # ============================================================
+class _LateBoundWaveGenMethod:
+    """A :class:`DeviceLocalWaveGen` method resolved at CALL time.
+
+    ``DeviceLocalWaveGen.__getattr__`` used to hand back
+    ``getattr(self._resolve(), name)`` — a bound method of whatever device
+    replica existed AT ATTRIBUTE-ACCESS TIME. That is per-call dispatch only
+    for a consumer that re-accesses the attribute on every call; a consumer
+    that captures it ONCE gets the primary device's generator forever.
+
+    ``recipe.py::build_mbh_moves_phenom`` is exactly that consumer:
+    ``MBHMoveBuilder(wave_gen=wave_gen.get_signals_for_residuals)`` runs at
+    recipe-build time on the main thread, hence on ``gpus[0]``, and the move
+    keeps the handle for the life of the run
+    (``addremovemove.py`` ``self.waveform_gen``). Under walker sharding a
+    worker thread on ``gpus[1]``
+    (``AnalysisContainerArray._vectorized_dispatch``) then generated its
+    template through the gpu-0 generator, whose cached device arrays — the
+    WDM analysis ``window`` and the ``fold_shift_map`` gather indices read in
+    ``domains.py::FDSignal.wdmtransform`` — met a gpu-1 residual.
+    ``_coerce_transform_backend`` compares array MODULES, never devices, so
+    it waves that through: a peer-access tax where P2P is enabled, and an
+    asynchronous ``cudaErrorIllegalAddress`` where it is not, surfacing at
+    the next allocation (the 2026-09-16 nogb-null ``mbh_pe`` crash).
+
+    EMRI and SOBBH pass the ``DeviceLocalWaveGen`` OBJECT itself (see the
+    build_* functions below), so their ``__call__`` re-resolved every time —
+    which is why only the MBH block crashed, after EMRI and SOBBH had run
+    for ~40 minutes on the same two-GPU sharding.
+
+    ``__self__`` / ``__name__`` are preserved because
+    ``recipe.py::MoveBuilder.build`` duck-types the handle as a bound method
+    to recover a ``.kwargs``-bearing generator for the per-device DCGA
+    replica path; that lookup resolves on the current device, which is what
+    that path wants.
+    """
+
+    __slots__ = ("_owner", "_method_name")
+
+    def __init__(self, owner: "DeviceLocalWaveGen", name: str):
+        self._owner = owner
+        self._method_name = name
+
+    @property
+    def __self__(self):
+        """The generator replica for the CURRENT device (DCGA duck-type)."""
+        return self._owner._resolve()
+
+    @property
+    def __name__(self):
+        return self._method_name
+
+    def __call__(self, *args, **kwargs):
+        return getattr(self._owner._resolve(), self._method_name)(*args, **kwargs)
+
+    def __repr__(self):
+        return (
+            f"<late-bound {self._method_name} of "
+            f"{type(self._owner).__name__}>"
+        )
+
+
 class DeviceLocalWaveGen:
     """Per-call, per-device dispatch for MOVE-side waveform generators.
 
@@ -1391,7 +1452,13 @@ class DeviceLocalWaveGen:
         # dunder/underscore guard (deepcopy/pickle probing rule)
         if name.startswith("_"):
             raise AttributeError(name)
-        return getattr(self._resolve(), name)
+        attr = getattr(self._resolve(), name)
+        if callable(attr):
+            # Late-bind: a captured handle must follow the CALLER's device,
+            # not the device that happened to be current at capture time.
+            # See :class:`_LateBoundWaveGenMethod`.
+            return _LateBoundWaveGenMethod(self, name)
+        return attr
 
 
 def build_emri_move_runtime(curr, acs, priors, state, cfg):

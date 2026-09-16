@@ -902,7 +902,12 @@ def setup_recipe(recipe, engine_info, curr, acs, priors, state):
         stock_moves.update(setup_gb_moves(engine_info, curr, acs, priors, state))
 
     # --- VGB: the fixed-dimensional same-leaf stretch stack ---
-    if "vgb" in curr.source_info and "vgb_pe" in requested:
+    # Any vgb-namespaced move arms the stack (not just "vgb_pe"): since
+    # 2026-09-16 the stack can also carry "vgb_ridge_gibbs", and a recipe
+    # requesting only that one must still get its moves built.
+    if "vgb" in curr.source_info and any(
+        n.startswith("vgb") for n in requested
+    ):
         stock_moves.update(setup_vgb_moves(engine_info, curr, acs, priors, state))
 
     # --- Noise moves (split: psd / galfor / sgwb each with own ladder) ---

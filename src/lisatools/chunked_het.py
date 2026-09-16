@@ -28,6 +28,7 @@ sub-classes in their respective packages for the per-source-class
 constants.
 """
 import os
+import time
 from copy import deepcopy
 from typing import Optional
 
@@ -130,6 +131,12 @@ class WDMComputationsBase(LISAToolsParallelModule):
     layer-grouping logic at the carrier-frequency column of
     ``params``.
     """
+
+    #: Wall breakdown of the most recent :meth:`get_ll_wdm` call --
+    #: ``{stage, geom, wrap, launch, total, num_bin}`` in seconds (``None``
+    #: before the first call). Read by scoring-cost telemetry; no method
+    #: reads it back, so nothing depends on it being present.
+    last_call_spans = None
 
     # Routes ``fill_global_wdm`` / ``get_ll_wdm`` / ``swap_ll_wdm``
     # through ``GBComputationGroupWrap.gb_wdm_het_*`` on the backend.
@@ -488,6 +495,99 @@ class WDMComputationsBase(LISAToolsParallelModule):
         """Resolve ``self._METHOD_PREFIX + '_' + name`` on the comp group."""
         return getattr(self._comp_group(), f"{self._METHOD_PREFIX}_{name}")
 
+    def _geometry_kernel_args(self):
+        """The five STATIC geometry kernel args, device-local and cached.
+
+        ``(chunk_t_starts, chunk_keep_lo, chunk_keep_hi,
+        chunk_n_global_offset, wdm_window)`` in kernel-signature order.
+
+        All five are built once in ``__init__`` and never mutated -- on the
+        comp's HOME device, because that is where ``__init__`` ran. This is
+        the single point every kernel path goes through to get them onto
+        whatever device is current NOW, and it exists because the SOBBH
+        multi-GPU walker-shard route runs ONE SHARED comp under both
+        shards' device contexts (``sobbhspecialmove.py`` enters
+        ``device_context(view.device)`` around ``get_ll_wdm`` for scoring
+        and around ``fill_global_wdm`` for the residual fill). Anything
+        sourced from ``self`` is therefore a home-device pointer until
+        :meth:`_to_device_local` moves it.
+
+        2026-09-16: this used to be ``get_ll_wdm``'s private helper while
+        ``fill_global_wdm`` / ``get_swap_ll_wdm`` / both grad methods passed
+        ``self.chunk_*`` RAW and only ``get_fstat_ll_wdm`` re-asserted. A
+        device-1 launch of ``wdm_het_fill_global_kernel`` fed device-0
+        geometry is the null run's ``GPUassert: an illegal memory access``.
+        ALL SIX kernel paths now share this helper -- do not reintroduce a
+        raw ``self.chunk_*`` in a kernel argument list.
+
+        Cached keyed on the CUDA device current at call time (``None`` on
+        the CPU path). NEVER invalidated: this is fixed geometry, so there
+        is nothing that could go stale. Anything that changed it would have
+        to rebuild the comp anyway. On the home device the cached entry is
+        the comp's own arrays (``asarray`` of an already-resident array is
+        the same object), so single-GPU runs are pointer-identical to
+        before.
+        """
+        from .utils.device import current_device
+
+        # ESCAPE (2026-09-16): SOBBH_GEOM_CACHE=0 restores the pre-cache
+        # per-call re-assert so the cluster can bisect the cache without a
+        # revert. Still device-local -- the escape drops the CACHE, not the
+        # relocation.
+        if os.environ.get("SOBBH_GEOM_CACHE", "1").strip() != "1":
+            return self._geometry_args_fresh()
+
+        cache = getattr(self, "_geom_args_by_device", None)
+        if cache is None:
+            cache = self._geom_args_by_device = {}
+        dev = current_device(self.xp)
+        args = cache.get(dev)
+        if args is None:
+            args = self._geometry_args_fresh()
+            cache[dev] = args
+        return args
+
+    def _geometry_args_fresh(self):
+        """The five geometry args, freshly relocated onto the current device."""
+        return (
+            self._to_device_local(self.chunk_t_starts),
+            self._to_device_local(self.chunk_keep_lo),
+            self._to_device_local(self.chunk_keep_hi),
+            self._to_device_local(self.chunk_n_global_offset),
+            self._to_device_local(self.wdm_window),
+        )
+
+    def _to_device_local(self, arr):
+        """``arr`` resident on the CUDA device that is current RIGHT NOW.
+
+        ``xp.asarray`` uploads HOST data to the current device, but handed
+        an array that ALREADY lives on another device it is not a
+        relocation. That is the whole trap on the multi-GPU walker-shard
+        path: the five geometry arrays are built once in ``__init__`` on
+        the comp's home device, and the SOBBH move routes ONE SHARED comp
+        through both shards' device contexts, so every kernel arg sourced
+        from ``self`` is a home-device pointer unless something moves it.
+        A device-1 kernel dereferencing a device-0 pointer is
+        ``GPUassert: an illegal memory access was encountered``.
+
+        The cross-device leg goes VIA HOST, matching
+        :func:`lisatools.utils.device.to_current_device`: peer access is
+        unavailable between GPUs on some nodes, so a device-to-device copy
+        is not safe to assume.
+
+        CPU / NumPy ``xp`` (no ``cuda`` attribute) and arrays already on
+        the current device take the plain ``asarray`` path, bit-identical
+        to the behaviour before this helper existed.
+        """
+        xp = self.xp
+        if hasattr(xp, "cuda"):
+            dev = getattr(arr, "device", None)
+            dev_id = getattr(dev, "id", None)
+            if (dev_id is not None
+                    and int(dev_id) != int(xp.cuda.runtime.getDevice())):
+                return xp.asarray(xp.asnumpy(arr))
+        return xp.asarray(arr)
+
     def _slab_kernel_args(self, holder):
         """Task-b per-band slab args to splat at the end of the C++ buffer
         kernels (get_ll / swap_ll / fill_global / get_fstat_ll).
@@ -779,7 +879,18 @@ class WDMComputationsBase(LISAToolsParallelModule):
             grid_dim: CUDA launch grid size (use 0 for ``n_chunks``).
             use_layer_groups, group_band_layers, margin_layers: narrow-band
                 grouping controls (see method docstring).
+
+        Records a per-call wall breakdown on :attr:`last_call_spans`
+        (``stage`` = param staging + indices + layer grouping, ``geom`` =
+        the static-geometry re-assert, ``wrap`` = comp-group wrap
+        construction, ``launch`` = the kernel invocation, ``total``,
+        ``num_bin``). Four ``perf_counter`` reads per call; the caller
+        decides whether to sync the device around ``launch`` and what to do
+        with the numbers (the SOBBH move accumulates them per leaf window
+        and logs one [SOBBH_LL_TIMING] companion line).
         """
+        _perf = time.perf_counter
+        _t_entry = _perf()
         params_tmp = self.xp.asarray(self.xp.atleast_2d(params)).copy()
         num_bin = params_tmp.shape[0]
         nparams = int(self._NPARAMS)
@@ -826,16 +937,23 @@ class WDMComputationsBase(LISAToolsParallelModule):
                 data_index=data_index, noise_index=noise_index)
         else:
             groups = self._empty_groups(num_bin)
+        _t_stage = _perf() - _t_entry
 
-        self._kernel("get_ll")(
+        _t_mark = _perf()
+        _geom_args = self._geometry_kernel_args()
+        _t_geom = _perf() - _t_mark
+
+        _t_mark = _perf()
+        _kern = self._kernel("get_ll")
+        _t_wrap = _perf() - _t_mark
+
+        _t_mark = _perf()
+        _kern(
             d_h_out, h_h_out,
             self.cpp_orbits, self.cpp_tdi_config,
             self.cpp_wdm_settings,
             params_in, data_index, noise_index,
-            self.xp.asarray(self.chunk_t_starts),
-            self.xp.asarray(self.chunk_keep_lo), self.xp.asarray(self.chunk_keep_hi),
-            self.xp.asarray(self.chunk_n_global_offset),
-            self.xp.asarray(self.wdm_window),
+            *_geom_args,
             wdm_holder.linear_data_arr[0],
             wdm_holder.linear_psd_arr[0],
             self.n_chunks, int(num_bin), int(nparams),
@@ -858,6 +976,22 @@ class WDMComputationsBase(LISAToolsParallelModule):
             *quad_args,
             *self._psd_kernel_args(wdm_holder),
         )
+        # NB ``launch`` is only the true kernel time if the binding (or the
+        # caller) synchronizes; an un-synced CUDA launch returns at once and
+        # the wall lands on the caller's first blocking D2H instead. The
+        # SOBBH move syncs explicitly and reports the tail separately.
+        self.last_call_spans = {
+            "stage": _t_stage, "geom": _t_geom, "wrap": _t_wrap,
+            "launch": _perf() - _t_mark, "total": _perf() - _t_entry,
+            "num_bin": int(num_bin),
+            # groups are keyed by (m-band, data_index), and each group's
+            # kernel iteration sweeps all n_chunks -- so kernel work scales
+            # with the GROUP count, not the row count. Recorded because it
+            # is the one batch-shape number that can make a SMALLER batch
+            # cost MORE, and job 508's 54-row calls cost 4x job 373's
+            # 288-row calls.
+            "n_groups": int(groups["n_groups"]),
+        }
 
         self.d_h_out = d_h_out
         self.h_h_out = h_h_out
@@ -944,10 +1078,7 @@ class WDMComputationsBase(LISAToolsParallelModule):
             self.cpp_wdm_settings,
             params_add_in, params_remove_in,
             data_index, noise_index,
-            self.chunk_t_starts,
-            self.chunk_keep_lo, self.chunk_keep_hi,
-            self.chunk_n_global_offset,
-            self.wdm_window,
+            *self._geometry_kernel_args(),
             wdm_holder.linear_data_arr[0],
             wdm_holder.linear_psd_arr[0],
             self.n_chunks, int(num_bin), int(nparams),
@@ -1063,10 +1194,7 @@ class WDMComputationsBase(LISAToolsParallelModule):
             grad_out,
             self.cpp_orbits, self.cpp_tdi_config,
             params_in, data_index, noise_index,
-            self.chunk_t_starts,
-            self.chunk_keep_lo, self.chunk_keep_hi,
-            self.chunk_n_global_offset,
-            self.wdm_window,
+            *self._geometry_kernel_args(),
             wdm_holder.linear_data_arr[0],
             wdm_holder.linear_psd_arr[0],
             self.n_chunks, int(num_bin), int(nparams),
@@ -1149,10 +1277,7 @@ class WDMComputationsBase(LISAToolsParallelModule):
             self.cpp_orbits, self.cpp_tdi_config,
             params_add_in, params_remove_in,
             data_index, noise_index,
-            self.chunk_t_starts,
-            self.chunk_keep_lo, self.chunk_keep_hi,
-            self.chunk_n_global_offset,
-            self.wdm_window,
+            *self._geometry_kernel_args(),
             wdm_holder.linear_data_arr[0],
             wdm_holder.linear_psd_arr[0],
             self.n_chunks, int(num_bin), int(nparams),
@@ -1332,10 +1457,13 @@ class WDMComputationsBase(LISAToolsParallelModule):
             self.cpp_wdm_settings,
             params_in, factors,
             data_index,
-            self.chunk_t_starts,
-            self.chunk_keep_lo, self.chunk_keep_hi,
-            self.chunk_n_global_offset,
-            self.wdm_window,
+            # DEVICE-LOCAL (2026-09-16). These were passed RAW -- the comp's
+            # home-device arrays -- while the SOBBH move routes ONE SHARED
+            # comp through both shards' device contexts
+            # (sobbhspecialmove.py::_apply_cold_chain_sources). A device-1
+            # launch of wdm_het_fill_global_kernel then dereferenced
+            # device-0 pointers: the null run's illegal memory access.
+            *self._geometry_kernel_args(),
             self.n_chunks, int(num_bin), int(nparams),
             int(self.Nt_sub), int(self.log2_Nt_sub),
             int(self.N_sparse), int(self.log2_N_sparse),
@@ -1438,10 +1566,7 @@ class WDMComputationsBase(LISAToolsParallelModule):
             self.cpp_orbits, self.cpp_tdi_config,
             self.cpp_wdm_settings,
             params_in, data_index, noise_index,
-            self.xp.asarray(self.chunk_t_starts),
-            self.xp.asarray(self.chunk_keep_lo), self.xp.asarray(self.chunk_keep_hi),
-            self.xp.asarray(self.chunk_n_global_offset),
-            self.xp.asarray(self.wdm_window),
+            *self._geometry_kernel_args(),
             wdm_holder.linear_data_arr[0],
             wdm_holder.linear_psd_arr[0],
             self.n_chunks, int(num_bin), int(nparams),

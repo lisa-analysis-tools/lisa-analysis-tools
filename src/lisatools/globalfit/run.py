@@ -95,6 +95,91 @@ from .utils import BasicResidualacsLikelihood
 
 logger = getLogger(__name__)
 
+#: Truthy/falsy spellings for :func:`null_check_only`, matching
+#: ``stock.base.bool_or_str`` (imported nowhere here: ``stock`` builds ON
+#: this module, so reaching back into it would be a cycle).
+_NULL_CHECK_TRUE = ("1", "true", "yes", "on")
+
+
+def null_check_only() -> bool:
+    """``NULL_CHECK_ONLY=1``: measure the initial lnL, then stop.
+
+    The truth-injection NULL TEST's entire output is ONE line --
+    ``initial log likelihood (after recipe setup)`` -- so the per-source
+    decomposition of it (18 jobs, one (branch, id) pair each) has nothing to
+    sample. With this set, :meth:`GlobalFit.prepare_main` returns right after
+    that print and :meth:`GlobalFit.run_global_fit` skips ``run_mcmc``.
+
+    NOT a ``sys.exit``: the production layout is ``mpiexec -n 3`` (main +
+    saver + spare), and the other two ranks sit in ``comm.recv``. The early
+    return goes through the ORDINARY shutdown -- the spares' ``"stop"`` and
+    the saver's ``{"finish_run": True}`` -- so every rank exits rc 0 in
+    seconds instead of blocking until walltime.
+
+    A present-but-empty value counts as unset (``stock.base._env_lookup``'s
+    rule), so ``NULL_CHECK_ONLY= sbatch ...`` cannot silently skip a run.
+    """
+    return os.environ.get("NULL_CHECK_ONLY", "").strip().lower() in _NULL_CHECK_TRUE
+
+
+def check_store_branch_ndims(stored_ndims, config_ndims, backend_path):
+    """Refuse a resume whose stored per-branch ndim differs from the config.
+
+    The CONSTRUCTION-level half of the resume-safety gate: ``stored_ndims``
+    comes from the backend's ``ndims`` HDF5 *attributes* (a handful of
+    scalars), so this fires before any chain is read. The identical check
+    runs again on the loaded state further down :meth:`GlobalFit.load_info`
+    as a backstop for stores whose attrs cannot be read.
+
+    Only the INTERSECTION of the two branch sets is compared: adding or
+    removing a branch between runs (``REMOVE_BRANCHES``) is legitimate and
+    handled elsewhere.
+
+    The vgb case gets its own message because it is the live one (user
+    ruling 2026-09-16): ``VGB_CHIRP_MASS_BASIS=1`` moves Mc from the
+    per-leaf fills to the sampled side, taking the vgb chain from 5 to 6
+    columns. That is NOT resume-compatible — a store must be fresh, or
+    migrated with ``scripts/fstat_proposal/migrate_vgb_chirp_basis.py``.
+    Never flip the knob mid-store.
+
+    Args:
+        stored_ndims: ``{branch: ndim}`` as the store holds it (``None`` or
+            empty is a no-op).
+        config_ndims: ``{branch: ndim}`` the current run configuration builds.
+        backend_path: Store path, quoted into the message.
+
+    Raises:
+        ValueError: A shared branch disagrees on ndim.
+    """
+    if not stored_ndims:
+        return
+    for name, cfg_nd in (config_ndims or {}).items():
+        if name not in stored_ndims:
+            continue
+        stored_nd = int(stored_ndims[name])
+        if stored_nd == int(cfg_nd):
+            continue
+        if name == "vgb":
+            raise ValueError(
+                f"Cannot resume {backend_path!r}: branch 'vgb' stored with "
+                f"ndim {stored_nd} but the run config expects {int(cfg_nd)}. "
+                "The VGB basis flag (VGB_CHIRP_MASS_BASIS: 5-dim legacy "
+                "distance basis vs 6-dim chirp-mass basis, which samples Mc "
+                "as well as fdot_astro_ratio) differs from the stored run. "
+                "Either set VGB_CHIRP_MASS_BASIS to match the store, start a "
+                "FRESH store, or migrate the file to the 6-dim basis with "
+                "scripts/fstat_proposal/migrate_vgb_chirp_basis.py (never "
+                "reshape silently, and never flip the knob mid-store)."
+            )
+        raise ValueError(
+            f"Cannot resume {backend_path!r}: branch {name!r} stored with "
+            f"ndim {stored_nd} but the run config expects {int(cfg_nd)}. For "
+            "GB this usually means GB_USE_ASTROPHYSICAL_F0_MC_PRIOR / "
+            "GB_USE_CHIRP_MASS differ from the stored run (8-col vs 9-col "
+            "fdot_astro_ratio basis). Start a fresh backend or match the "
+            "original config."
+        )
+
 
 def _leaf_moves(moves):
     """Flatten combine moves (recursively; ``(move, weight)`` tuples unwrapped).
@@ -811,6 +896,24 @@ class GlobalFit:
             )
             if getattr(backend, "initialized", False):
                 _stored_it = int(getattr(backend, "iteration", 0) or 0)
+            # CHEAPEST SEAM where branch ndim meets the store: the ``ndims``
+            # HDF5 attrs, read at backend construction, before any chain
+            # load and before the mid-iteration checkpoint path. Catches the
+            # VGB_CHIRP_MASS_BASIS 5 <-> 6 flip against an existing store
+            # immediately instead of minutes into a build. An unreadable
+            # attrs group is NOT fatal here: the post-load backstop below
+            # repeats the comparison on the loaded state.
+            if _stored_it > 0:
+                try:
+                    _stored_ndims = dict(backend.ndims)
+                except Exception as _nd_err:    # never block a healthy start
+                    logger.debug(
+                        "store ndims attrs unreadable (%r); the post-load "
+                        "ndim guard remains", _nd_err)
+                else:
+                    check_store_branch_ndims(
+                        _stored_ndims, self.curr.ndims, backend_path
+                    )
 
         # Mid-iteration checkpoint (preemption protection): the sidecar
         # snapshot beats the HDF store when it was written at (or after) the
@@ -857,33 +960,23 @@ class GlobalFit:
                 # Guard against resuming a backend whose per-branch sampled
                 # dimensionality no longer matches the run config -- the most
                 # likely cause is toggling GB_USE_ASTROPHYSICAL_F0_MC_PRIOR /
-                # GB_USE_CHIRP_MASS (8 <-> 9 column GB basis) between runs.
-                for _name, _nd in self.curr.ndims.items():
-                    _coords = getattr(state, "branches_coords", {}).get(_name)
-                    if _coords is not None and _coords.shape[-1] != _nd:
-                        if _name == "vgb":
-                            raise ValueError(
-                                f"Cannot resume {backend_path!r}: branch "
-                                f"'vgb' stored with ndim "
-                                f"{_coords.shape[-1]} but the run config "
-                                f"expects {_nd}. The VGB basis flag "
-                                f"(VGB_CHIRP_MASS_BASIS: 5-dim legacy vs "
-                                f"6-dim chirp-mass) differs from the stored "
-                                f"run. Either set VGB_CHIRP_MASS_BASIS to "
-                                f"match the store, or migrate the file to "
-                                f"the 6-dim basis with scripts/"
-                                f"fstat_proposal/migrate_vgb_chirp_basis.py "
-                                f"(never reshape silently)."
-                            )
-                        raise ValueError(
-                            f"Cannot resume {backend_path!r}: branch {_name!r} "
-                            f"stored with ndim {_coords.shape[-1]} but the run "
-                            f"config expects {_nd}. For GB this usually means "
-                            f"GB_USE_ASTROPHYSICAL_F0_MC_PRIOR / "
-                            f"GB_USE_CHIRP_MASS differ from the stored run "
-                            f"(8-col vs 9-col fdot_astro_ratio basis). Start a "
-                            f"fresh backend or match the original config."
-                        )
+                # GB_USE_CHIRP_MASS (8 <-> 9 column GB basis), or
+                # VGB_CHIRP_MASS_BASIS (5 <-> 6 column VGB basis), between
+                # runs. BACKSTOP: the same comparison already ran against the
+                # store's ``ndims`` attrs at backend construction above; this
+                # repeat reads the dimensionality off the LOADED coords, so
+                # it also covers a store whose attrs disagree with its data.
+                check_store_branch_ndims(
+                    {
+                        _name: _coords.shape[-1]
+                        for _name, _coords in (
+                            getattr(state, "branches_coords", {}) or {}
+                        ).items()
+                        if _coords is not None
+                    },
+                    self.curr.ndims,
+                    backend_path,
+                )
 
                 # Guard against resuming a backend whose banded-branch band
                 # grid no longer matches the run config (e.g.
@@ -2328,6 +2421,29 @@ class GlobalFit:
         state.log_like[:] = self._global_likelihood(acs)
         logger.info(f"initial log likelihood (after recipe setup): {state.log_like[0]}")
 
+        # NULL_CHECK_ONLY: that line IS the whole measurement (per-source
+        # truth-injection null test). The flag is only RAISED here -- never
+        # acted on -- and :meth:`prepare_main` stops on it the moment this
+        # method returns, before the sampler, plot container and checkpoint
+        # self-test are built, tearing down through the NORMAL path (spares
+        # released with the usual "stop" sends, compute ranks released with
+        # ``fanout.stop()``, ``run_global_fit`` handing the saver its
+        # {"finish_run": True}). See :func:`null_check_only`.
+        #
+        # DO NOT return early from HERE (dev carried the early return in
+        # ``prepare_main``; this block moved into the shared setup path at
+        # Plan 2). Two reasons: this method owes BOTH its callers
+        # ``(acs, like_mix)``, and it runs on every COMPUTE rank as well --
+        # a compute rank must fall through to ``ComputeService.serve()`` so
+        # the head's fan-out STOP can release it.
+        if null_check_only():
+            self._null_check_only = True
+            logger.info(
+                "[NULL_CHECK_ONLY] initial lnL measured; skipping the "
+                "sampler build and all sampling, and releasing the "
+                "helper ranks."
+            )
+
         # [layer-chi2 diag; GB_LAYER_CHI2=1] Where does the post-subtraction
         # residual live in frequency? Edge layers -> out-of-window source
         # leakage (not subtracted); center -> subtraction bug; even -> global.
@@ -2506,6 +2622,30 @@ class GlobalFit:
         acs, like_mix = self._build_acs_and_recipe(
             state, priors, after_first_likelihood=self._open_run_backend
         )
+
+        # NULL_CHECK_ONLY: the initial-lnL line _build_acs_and_recipe just
+        # logged IS the whole measurement, so stop HERE -- before the
+        # sampler, plot container and checkpoint self-test are built -- and
+        # tear down through the NORMAL path.
+        if getattr(self, "_null_check_only", False):
+            # Legacy spares, waiting on a bare COMM_WORLD "stop" ...
+            self._stop_spare_ranks()
+            # ... and the fan-out compute ranks, which that string never
+            # reaches: they are parked in ComputeService.serve() on the
+            # fan-out communicator and only its STOP command releases them.
+            # Without this a multi-rank NULL_CHECK_ONLY job hangs with every
+            # compute rank waiting forever.
+            if getattr(self, "fanout", None) is not None:
+                try:
+                    self.fanout.stop()
+                except Exception:
+                    logger.exception(
+                        "fanout.stop() failed during NULL_CHECK_ONLY shutdown (ignored)"
+                    )
+            # run_global_fit's _null_check_only branch then hands the saver
+            # its {"finish_run": True} and every rank exits.
+            return
+
         backend = self.run_backend
 
         logger.debug("need to setup moves that use parallel resources")
@@ -2516,14 +2656,8 @@ class GlobalFit:
         # backend.save_step(state, accepted, swaps_accepted=swaps_accepted)
         # exit()
 
-        # Stop the legacy spare processes (empty in the new walker-block
-        # layout; the legacy layout, GF_LEGACY_RANK_LAYOUT=1, still has one
-        # compute rank owning the whole pool and every other non-saver rank
-        # a stopped spare — the old move->rank dispatch that handed spares
-        # to moves was removed with the CPU distribution-fitting workers it
-        # served; parallel-resources plan P3).
-        for rank in self.ranks_to_give:
-            self.comm.send("stop", dest=rank)
+        # Stop the spare processes.
+        self._stop_spare_ranks()
 
         from eryn.moves import StretchMove
 
@@ -2671,6 +2805,30 @@ class GlobalFit:
                 logger_=self.logger,
             )
 
+    def _stop_spare_ranks(self):
+        """Release every LEGACY spare rank by sending it its ``"stop"``.
+
+        A spare sits in ``comm.recv(source=main_rank)`` from startup (see
+        ``run_global_fit``'s ``else`` branch) and exits on the first message,
+        so this MUST run on every path off the main rank -- the normal
+        sampling one and :func:`null_check_only`'s early return alike, which
+        is why it is factored out here.
+
+        ``self.ranks_to_give`` is the layout's ``RankRole.SPARE`` set, which
+        is EMPTY in the walker-block layout; the legacy layout
+        (``GF_LEGACY_RANK_LAYOUT=1``) still has one compute rank owning the
+        whole pool and every other non-saver rank a stopped spare. Compute
+        ranks must never appear here: they are parked in
+        ``ComputeService.serve()`` on the FAN-OUT communicator and are
+        released by ``fanout.stop()``, not by a bare ``"stop"`` string on
+        COMM_WORLD. (The old move->rank dispatch that handed spares to moves
+        was removed with the CPU distribution-fitting workers it served — GPU
+        GMM fitting / neural flows replaced them; parallel-resources plan P3.
+        A future coarse multi-node worker pool would re-enter here.)
+        """
+        for rank in self.ranks_to_give:
+            self.comm.send("stop", dest=rank)
+
     def prepare_compute(self):
         """Build what a COMPUTATION rank needs, then hand it to the command loop.
 
@@ -2801,29 +2959,43 @@ class GlobalFit:
         backend_path = self.curr.general_info.main_file_path
         if self.role == RankRole.HEAD:
             self.prepare_main()
-            try:
-                self.sampler.run_mcmc(
-                    self.state, self.curr.general_info.num_iterations, thin_by=1,
-                    progress=self.progress, store=True,
+
+            if getattr(self, "_null_check_only", False):
+                # NULL_CHECK_ONLY: prepare_main stopped after the initial-lnL
+                # print and has already released the spares AND the fan-out
+                # compute ranks. There is no sampler and no stored iteration,
+                # so there is nothing to sample and nothing to write a
+                # submission from -- fall straight through to the saver's
+                # finish_run below so every rank exits now.
+                logger.info(
+                    "[NULL_CHECK_ONLY] no sampling; finishing the run."
                 )
-                self._write_submission()
-                logger.info("Residuals saved.")
-            finally:
-                # Every compute rank is parked in ``ComputeService.serve()``
-                # waiting for the next command; only STOP releases it. On the
-                # happy path this is the ordinary shutdown, and on a head
-                # exception it is what lets the workers exit instead of
-                # blocking forever (under real MPI the abort hook ends the
-                # job either way -- this makes a FakeWorld / in-process run,
-                # where there is no abort, terminate cleanly too).
-                if getattr(self, "fanout", None) is not None:
-                    try:
-                        self.fanout.stop()
-                    except Exception:
-                        # A failing stop() must never supplant an exception already
-                        # propagating out of run_mcmc (Python `finally` semantics:
-                        # an exception raised here would otherwise replace it).
-                        logger.exception("fanout.stop() failed during shutdown (ignored)")
+            else:
+                try:
+                    self.sampler.run_mcmc(
+                        self.state, self.curr.general_info.num_iterations, thin_by=1,
+                        progress=self.progress, store=True,
+                    )
+                    self._write_submission()
+                    logger.info("Residuals saved.")
+                finally:
+                    # Every compute rank is parked in ``ComputeService.serve()``
+                    # waiting for the next command; only STOP releases it. On the
+                    # happy path this is the ordinary shutdown, and on a head
+                    # exception it is what lets the workers exit instead of
+                    # blocking forever (under real MPI the abort hook ends the
+                    # job either way -- this makes a FakeWorld / in-process run,
+                    # where there is no abort, terminate cleanly too).
+                    if getattr(self, "fanout", None) is not None:
+                        try:
+                            self.fanout.stop()
+                        except Exception:
+                            # A failing stop() must never supplant an exception already
+                            # propagating out of run_mcmc (Python `finally` semantics:
+                            # an exception raised here would otherwise replace it).
+                            logger.exception("fanout.stop() failed during shutdown (ignored)")
+
+
             if self.results_rank != self.main_rank:
                 self.comm.send({"finish_run": True}, dest=self.results_rank)
         elif self.role == RankRole.SAVER:

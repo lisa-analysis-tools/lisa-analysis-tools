@@ -291,6 +291,118 @@ class FixedPsdKwargsTest(unittest.TestCase):
         self.assertIn("PSD_FIXED_PARAMS", out)
 
 
+class FixedSensWalkerShardTest(unittest.TestCase):
+    """The fixed-sensitivity ``else`` branch walker-shards like the psd path.
+
+    ``run.py::setup_acs`` maps each walker to an owning device
+    (``_walker_device``, a contiguous ``np.array_split`` mirroring
+    :class:`AnalysisContainerArray`'s own) and builds that walker's
+    AnalysisContainer INSIDE ``device_context`` so its data + sensitivity
+    are allocated where the shard will live. The null composition has no
+    ``psd`` branch, so it takes the ``fixed_psd_kwargs`` ``else`` branch --
+    a different call into ``general_info.sensitivity_backend``, reached
+    through the SAME device context. This pins that: half the walkers must
+    build on gpus[1], and the ACA must be handed both devices with threaded
+    per-split dispatch armed.
+
+    Structural, CPU-only: ``run.xp`` is swapped for the recording fake, and
+    the AC / ACA constructors for stubs, so nothing allocates.
+    """
+
+    def _run_setup_acs(self, gpus, nwalkers=4, branches_coords=None):
+        import logging
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import numpy as np
+
+        from lisatools.globalfit import run as run_mod
+
+        try:
+            from tests._multishard import RecordingXp
+        except ImportError:  # pragma: no cover
+            from _multishard import RecordingXp
+
+        xp = RecordingXp()
+        build_devices = []
+
+        sens_calls = []
+
+        def _sens_backend(name, *args, **kwargs):
+            build_devices.append(int(xp.cuda.runtime.getDevice()))
+            sens_calls.append((name, args, dict(kwargs)))
+            return SimpleNamespace(tag=name)
+
+        general_info = SimpleNamespace(
+            gpus=gpus,
+            input_data_residual_array=np.zeros(4, dtype=complex),
+            fixed_psd_kwargs={"psd_params": [1.5e-11, 3.0e-15]},
+            sensitivity_backend=_sens_backend,
+            likelihood_source_only=True,
+        )
+        fake_self = SimpleNamespace(
+            curr=SimpleNamespace(
+                general_info=general_info,
+                engine_info=SimpleNamespace(branch_names=["mbh", "emri", "sobbh"]),
+                source_info={},
+            ),
+            nwalkers=nwalkers,
+            logger=logging.getLogger("FixedSensWalkerShardTest"),
+            _prepare_coarse_wdm_runtime=lambda state: None,
+        )
+        state = SimpleNamespace(branches_coords=branches_coords or {})
+        built = {}
+
+        class _ACAStub:
+            def __init__(self, acs_tmp, gpus=None, run_threaded=False, **kw):
+                built["n"] = len(acs_tmp)
+                built["gpus"] = gpus
+                built["run_threaded"] = run_threaded
+
+        with mock.patch.object(run_mod, "xp", xp), \
+                mock.patch.object(run_mod, "AnalysisContainer",
+                                  lambda *a, **k: SimpleNamespace(args=a)), \
+                mock.patch.object(run_mod, "AnalysisContainerArray", _ACAStub):
+            run_mod.GlobalFit.setup_acs(fake_self, state, rebuild_residuals=False)
+
+        built["sens_calls"] = sens_calls
+        return build_devices, built
+
+    def test_fixed_sens_walkers_build_on_their_owning_device(self):
+        build_devices, built = self._run_setup_acs([0, 1], nwalkers=4)
+        # contiguous array_split: walkers 0,1 -> gpu 0; walkers 2,3 -> gpu 1
+        self.assertEqual(build_devices, [0, 0, 1, 1])
+        self.assertEqual(built["gpus"], [0, 1])
+        self.assertTrue(built["run_threaded"])
+        self.assertEqual(built["n"], 4)
+
+    def test_the_fixed_sens_branch_is_the_one_being_exercised(self):
+        """Guard: the ``else`` branch really ran (fixed kwargs, no psd row).
+
+        Without this the device assertions above could be satisfied by the
+        psd-params branch and say nothing about the null composition.
+        """
+        _, built = self._run_setup_acs([0, 1], nwalkers=4)
+        calls = built["sens_calls"]
+        self.assertEqual([c[0] for c in calls],
+                         [f"walker_{w}" for w in range(4)])
+        for _, args, kwargs in calls:
+            self.assertEqual(args, ())  # no positional psd_params row
+            self.assertEqual(kwargs, {"psd_params": [1.5e-11, 3.0e-15]})
+
+    def test_single_gpu_keeps_every_walker_on_the_main_device(self):
+        build_devices, built = self._run_setup_acs([0], nwalkers=4)
+        self.assertEqual(build_devices, [0, 0, 0, 0])
+        self.assertEqual(built["gpus"], [0])
+        self.assertFalse(built["run_threaded"])
+
+    def test_cpu_path_builds_without_a_device_context(self):
+        build_devices, built = self._run_setup_acs(None, nwalkers=3)
+        self.assertEqual(build_devices, [0, 0, 0])
+        self.assertIsNone(built["gpus"])
+        self.assertFalse(built["run_threaded"])
+
+
 class EnvBackedNoiseFieldsTest(unittest.TestCase):
     """rule 0: the knob is the capitalized field name.
 

@@ -1541,6 +1541,46 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
 
         return inds
 
+    def _repeat_split_masks(self, move_here):
+        """Ensemble partition for ONE in-model repeat: a list of row masks.
+
+        ``len(masks)`` IS the number of :meth:`compute_like` calls that
+        repeat will make — each mask is scored in one batch.
+
+        :class:`~eryn.moves.StretchMove` KEEPS the red/blue split: its
+        proposal stretches each walker toward a walker drawn from the
+        COMPLEMENTARY sub-ensemble, so the halves are load-bearing for its
+        detailed balance (updating a walker that another walker is
+        simultaneously being stretched against breaks it). That path is
+        untouched — ``self.nsplits`` masks from :meth:`get_split_inds`,
+        including any subclass override of the shuffle (MBH pins equal
+        per-GPU block sizes there).
+
+        Every other inner move in this stack is MH-style — the production
+        default is :class:`~eryn.moves.EigenAxisMove`, which proposes from
+        each row's own coords and a table frozen for the whole repeat sweep.
+        Such a proposal reads NOTHING from the other rows, and the move does
+        not mutate the residual during the repeat loop, so every
+        ``(temp, walker)`` row is an independent MH step against a target
+        that the other rows cannot change. Splitting it only cuts the
+        scoring batch in half and pays the per-call kernel overhead twice
+        (job 508: 2 calls/repeat at ~54 rows each, cost dominated by the
+        row-independent part of the call). One full-ensemble mask = one
+        call per repeat, the identical Markov kernel.
+
+        ESCAPE (2026-09-16): ``SOBBH_SINGLE_CALL=0`` forces the red/blue
+        halves back on for EVERY inner move, restoring the pre-483953fa
+        two-calls-per-repeat structure without a revert. It exists so the
+        cluster can bisect batch-size effects (a full ensemble is ~120-129
+        rows against the old ~60) against a suspected kernel-side fault.
+        Default ``1`` = the single full-ensemble call.
+        """
+        if (isinstance(move_here, StretchMove)
+                or os.environ.get("SOBBH_SINGLE_CALL", "1").strip() != "1"):
+            inds = self.get_split_inds()
+            return [inds == split for split in range(self.nsplits)]
+        return [np.ones((self.ntemps, self.nwalkers), dtype=bool)]
+
     # ---- multi-rank fan-out (WalkerFanoutMixin hooks) ------------------------
     #: per-propose {leaf: (sum swaps_accepted, sum swaps_proposed)} over repeats;
     #: reset at the top of every propose_local, read by fanout_reply_extra
@@ -1833,27 +1873,30 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
 
                 # logger.debug(f"move here: {move_here.__class__.__name__}")
 
-                # Split the ensemble in half and iterate over these two halves.
+                # Partition the ensemble for this repeat: red/blue halves
+                # for a stretch inner move (complementary ensembles are
+                # load-bearing there), ONE full-ensemble block for an
+                # MH-style one (see _repeat_split_masks). len(split_masks)
+                # is the number of scoring calls this repeat makes.
                 accepted = np.zeros((ntemps_full, self.nwalkers), dtype=bool)
-                inds = self.get_split_inds()
+                split_masks = self._repeat_split_masks(move_here)
 
                 # prepare accepted fraction
                 # accepted_here = np.zeros((self.ntemps, self.nwalkers), dtype=bool)
-                for split in range(self.nsplits):
+                for split, S1 in enumerate(split_masks):
                     # get split information
-                    S1 = inds == split
-                    num_total_here = np.sum(inds == split)
+                    num_total_here = np.sum(S1)
                     nwalkers_here = np.sum(S1[0])
 
-                    temp_inds_here = temp_inds_base[inds == split]
-                    walker_inds_here = walker_inds_base[inds == split]
+                    temp_inds_here = temp_inds_base[S1]
+                    walker_inds_here = walker_inds_base[S1]
 
                     # prepare the sets for each model
                     # goes into the proposal as (ntemps * (nwalkers / subset size), nleaves_max, ndim)
                     sets = [
-                        work.coords[: self.ntemps][inds == j][:, leaf]
+                        work.coords[: self.ntemps][mask_j][:, leaf]
                         .reshape(self.ntemps, -1, 1, ndim)
-                        for j in range(self.nsplits)
+                        for mask_j in split_masks
                     ]
 
                     old_points = sets[split].reshape((self.ntemps, nwalkers_here, ndim))
@@ -1864,9 +1907,7 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
 
                     # per-(temp, walker) eigen tables are sliced to THIS
                     # split's rows (no-op for shared tables / other moves)
-                    self._install_eigen_split_table(
-                        move_here, leaf, inds == split
-                    )
+                    self._install_eigen_split_table(move_here, leaf, S1)
 
                     # Get the move-specific proposal.
                     if isinstance(move_here, StretchMove):
@@ -1921,9 +1962,9 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
                     logl = logl.reshape(self.ntemps, nwalkers_here)
 
                     logp = logp.reshape(self.ntemps, nwalkers_here)
-                    prev_logp_here = prev_logp[inds == split].reshape(self.ntemps, nwalkers_here)
+                    prev_logp_here = prev_logp[S1].reshape(self.ntemps, nwalkers_here)
 
-                    prev_logl_here = prev_logl[inds == split].reshape(self.ntemps, nwalkers_here)
+                    prev_logl_here = prev_logl[S1].reshape(self.ntemps, nwalkers_here)
 
                     prev_logP_here = temperature_control_here.compute_log_posterior_tempered(
                         prev_logl_here, prev_logp_here
