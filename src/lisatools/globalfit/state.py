@@ -613,8 +613,14 @@ class ModuleSubState(eryn_State):
         ``sum_counters`` (a slice starts from zero, so its counters are the
         deltas of the command that produced it).
         """
-        if not self.tempered_initialized or not getattr(part, "tempered_initialized", False):
+        part_initialized = getattr(part, "tempered_initialized", False)
+        if not self.tempered_initialized and not part_initialized:
             return
+        if self.tempered_initialized and not part_initialized:
+            raise ValueError(
+                f"merge_walkers got an uninitialized `part` for walker block [{w0}, {w1}) "
+                "but `self` already has a tempered block; the update would be silently lost."
+            )
         w0, w1 = int(w0), int(w1)
         if not (0 <= w0 < w1 <= int(self.nwalkers)):
             raise ValueError(f"walker block [{w0}, {w1}) is not inside [0, {self.nwalkers}).")

@@ -53,7 +53,9 @@ class SubStateSliceMergeTest(unittest.TestCase):
                 getattr(left, name), np.take(src, np.arange(0, half), axis=axis), err_msg=name
             )
             np.testing.assert_array_equal(
-                getattr(right, name), np.take(src, np.arange(half, NWALKERS), axis=axis), err_msg=name
+                getattr(right, name),
+                np.take(src, np.arange(half, NWALKERS), axis=axis),
+                err_msg=name,
             )
 
         # pretend each body counted something, then merge into a zeroed twin
@@ -114,6 +116,18 @@ class SubStateSliceMergeTest(unittest.TestCase):
         sub = ModuleSubState(None)
         part = sub.slice_walkers(0, 1)
         self.assertFalse(part.tempered_initialized)
+
+    def test_merge_uninitialized_part_raises_but_both_bare_noops(self):
+        sub = _make_sub(ModuleSubState, self.rng)
+        bare_part = sub._bare_like()
+        with self.assertRaises(ValueError):
+            sub.merge_walkers(bare_part, 0, NWALKERS // 2)
+
+        bare_self = ModuleSubState(None)
+        bare_part2 = bare_self._bare_like()
+        # both uninitialized: still a no-op, no exception
+        bare_self.merge_walkers(bare_part2, 0, 1)
+        self.assertFalse(bare_self.tempered_initialized)
 
 
 if __name__ == "__main__":
