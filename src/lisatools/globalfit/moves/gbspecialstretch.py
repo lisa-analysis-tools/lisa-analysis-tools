@@ -17910,7 +17910,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             return self._propose_orchestrated(model, state)
         return self._propose_legacy(model, state)
 
-    def _fanout_cmd(self, op, per_rank_payload):
+    def _fanout_cmd(self, op, per_rank_payload, model):
         """Run ONE fan-out command; return ``({rank: reply}, token)``.
 
         EVERY compute rank -- the head included -- executes
@@ -17918,13 +17918,25 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         ``merge`` is the identity here: the orchestrator merges the replies
         by hand, because each of the three commands merges differently.
 
+        ``model`` is ``propose``'s own argument, closed over for the head's
+        LOCAL body. ``WalkerFanout.run`` hands ``local_body`` its
+        ``fanout.model``, which ``run_global_fit`` binds ONCE at setup and
+        never refreshes -- the object eryn passes ``propose`` is the only
+        one guaranteed to be this iteration's (the whole prologue, and
+        ``_bind_parent_acs`` in particular, already works off it).
+
         The ``finally`` puts ``self.nwalkers`` / ``self.ntemps`` back to the
         head's N. ``gf_serve``'s own ``_exit_rank_block`` already restores
         them (together with ``time``, ``num_proposals``, ``_reseed_firing``,
         ``temper_vertical`` and the cap / shut-off tables), so this is belt
         and braces for the one attribute every flat ``(temp, walker, band)``
         index depends on -- a head-side read at B would silently address the
-        wrong cells (site map risk 8).
+        wrong cells (site map risk 8). ``_prop_timer`` is restored for a
+        different reason: a body BINDS it to its rank session's timer and
+        ``_exit_rank_block`` deliberately does not put it back, so without
+        this the head's ``[GB_TIMING]`` line (and any later head-side span)
+        would land on a closed session's timer instead of the head's own
+        whole-propose one.
 
         ``token`` is ``(seq, call_index)`` of THIS command as the ranks saw
         it: ``WalkerFanout.run`` publishes the command clock on
@@ -17936,17 +17948,22 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """
         n_walkers = getattr(self, "nwalkers", None)
         n_temps = getattr(self, "ntemps", None)
+        prop_timer = getattr(self, "_prop_timer", None)
         try:
             replies = self.fanout.run(
                 op,
                 move=getattr(self, "gf_move_name", None),
                 per_rank_payload=per_rank_payload,
-                local_body=lambda p, m: self.gf_serve(op, p, self.fanout.clock, m),
+                # ``_m`` is ``fanout.model``; the head's body takes the model
+                # ``propose`` was called with (see the docstring)
+                local_body=lambda p, _m: self.gf_serve(
+                    op, p, self.fanout.clock, model),
                 merge=lambda r: r,
             )
         finally:
             self.nwalkers = n_walkers
             self.ntemps = n_temps
+            self._prop_timer = prop_timer
         return replies, self._gb_session_token(self.fanout.clock)
 
     @staticmethod
@@ -18286,7 +18303,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         _unit_starts, _unit_dirs = _draw_unit_scan_schedule(
             model.random, N, units, _per_walker_start, _per_walker_dir,
         )
-        # the FULL N-walker schedule (each rank logs its own block's slice)
+        # The FULL N-walker schedule. Every rank ALSO logs its own block's
+        # slice from inside ``run_proposal`` (rank-tagged there), so the head
+        # prints TWO [GB_UNIT_SCAN] lines per propose -- this ensemble-wide
+        # one, which is the one to read, and its own block's. Suppressing the
+        # second would mean a new flag through ``run_proposal``'s Task 2
+        # signature; the duplicate is the smaller cost.
         logger.info(
             _format_unit_scan_schedule(
                 _unit_starts, _unit_dirs, units, name=self.name
@@ -18320,11 +18342,29 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # The head owns the "does this block run at all" decision: a rank
         # can never return early on its own without desynchronizing the
         # command count (and ``_temper_cadence_fire``'s shared census).
+        #
+        # THE GATE IS THE LEGACY'S OWN ``keep_all_inds`` GATE VARIABLES
+        # (``use_prior_removal or rj_replace`` == ``not keep_all_inds``
+        # above, verbatim from ``_propose_legacy``), applied per BLOCK.
+        # Those moves act on ALIVE leaves only, so their ``BandSorter`` is
+        # built ``coords[inds]`` (gbbands) -- a block with no alive source
+        # gives a ZERO-SOURCE sorter, with nothing to propose on and nothing
+        # to accept, which is exactly what a neutral reply reports (see the
+        # NEUTRAL BLOCKS paragraph of this method's docstring).
+        #
+        # NOT the same set as the legacy's whole-ensemble early return
+        # (``rj_replace or rj_removal_only``, line ~18078): that gate asks
+        # "can this move run at all" and deliberately EXCLUDES
+        # ``use_prior_removal``, because the search BIRTH move carries it
+        # and must still run on a zero-leaf start (the 2026-08-13 defect).
+        # Here the question is the narrower "does this block's alive-only
+        # sorter have anything to act on", which is why the two differ.
         neutral = {}
         for _r in layout.compute_ranks:
             _w0, _w1 = layout.block_of(_r)
             neutral[_r] = bool(
-                (not keep_all_inds) and not np.any(work.inds[:, _w0:_w1]))
+                (self.use_prior_removal or self.rj_replace)
+                and not np.any(work.inds[:, _w0:_w1]))
 
         def _common(rank, w0, w1):
             """Payload keys EVERY command needs (``_enter_rank_block``)."""
@@ -18357,7 +18397,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             return payload
 
         replies_p, session = self._fanout_cmd(
-            "gb_run_proposal", _payload_proposal)
+            "gb_run_proposal", _payload_proposal, model)
 
         prop_counts_sum = np.zeros((2, ntemps, num_bands), dtype=np.int64)
         acc_counts_sum = np.zeros((2, ntemps, num_bands), dtype=np.int64)
@@ -18453,7 +18493,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 })
                 return payload
 
-            replies_t, _ = self._fanout_cmd("gb_run_tempering", _payload_temper)
+            replies_t, _ = self._fanout_cmd(
+                "gb_run_tempering", _payload_temper, model)
             _t_drift = 0.0
             for rank in layout.compute_ranks:
                 w0, w1 = layout.block_of(rank)
@@ -18475,11 +18516,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # in-process call at the end of ``run_tempering``. A rank never
             # adapts (it passes adapt_band_temps=False): the band ladder has
             # no walker axis, so per-rank adaptation would diverge silently.
-            _band_temps = self.xp.asarray(band_temps_host)
+            # THE MODULE-LEVEL ``cp``, which is what ``_adapt_band_temps``
+            # itself uses (``cp.maximum`` / ``cp.diff`` / ``cp.exp`` on these
+            # very arrays): on a cupy box the ladder step must run on the
+            # device the legacy ran it on, and mixing a ``self.xp`` (numpy)
+            # array into those calls is the module-cp-vs-force_backend trap.
+            _band_temps = cp.asarray(band_temps_host)
             self._adapt_band_temps(
                 _band_temps,
-                self.xp.asarray(band_swaps_accepted),
-                self.xp.asarray(band_swaps_proposed),
+                cp.asarray(band_swaps_accepted),
+                cp.asarray(band_swaps_proposed),
             )
             band_temps_host = np.array(_to_numpy(_band_temps), copy=True)
             logger.info(
@@ -18500,7 +18546,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             })
             return payload
 
-        replies_f, _ = self._fanout_cmd("gb_finish", _payload_finish)
+        replies_f, _ = self._fanout_cmd("gb_finish", _payload_finish, model)
 
         sub = new_state.sub_states[branch]
         band_counts = np.zeros((ntemps, N, num_bands), dtype=int)
@@ -18552,6 +18598,24 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # walker: concatenate the blocks on the walker axis.
         cap_stats = None
         if cap_rows:
+            # ``dof`` / ``band_dof`` / ``is_cells`` describe the band (or cap
+            # cell) GRID, not the walkers -- ``_cap_stats_local`` derives them
+            # from the residual-window geometry, which is identical on every
+            # block -- so taking them from the first row is exact. Checked
+            # rather than trusted: a walker-dependent value here would gate
+            # every band on ONE block's geometry, silently.
+            _ref = cap_rows[0]
+            for _s in cap_rows[1:]:
+                if (bool(_s["is_cells"]) != bool(_ref["is_cells"])
+                        or np.shape(_s["dof"]) != np.shape(_ref["dof"])
+                        or np.shape(_s["band_dof"]) != np.shape(
+                            _ref["band_dof"])):
+                    raise RuntimeError(
+                        f"{self.name}: the blocks disagree on the cap "
+                        "statistic's grid (is_cells / dof shapes); those "
+                        "fields are walker-free by construction, so this is "
+                        "a per-rank geometry mismatch, not a merge choice."
+                    )
             cap_stats = {
                 "band_lls": np.concatenate(
                     [np.asarray(s["band_lls"]) for s in cap_rows], axis=0),
@@ -18681,15 +18745,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 int(getattr(self, "_fstat_ctr_fallback_rows", 0)),
             )
 
-        # Stage-timing breakdown. The head's line is its OWN block's timer
-        # (the commands rebind ``_prop_timer`` to the rank session) against
-        # the head's propose wall clock; every block's stages follow at
-        # DEBUG, and fanout.py's [FANOUT] line carries the load balance.
-        _tm = getattr(self, "_prop_timer", None) or tm
+        # Stage-timing breakdown. The head's line is the PROLOGUE's timer
+        # against the head's propose wall clock -- its legacy meaning -- and
+        # ``_fanout_cmd`` restores it after every command precisely so this
+        # stays true (a body binds ``_prop_timer`` to its rank session's
+        # timer). Under fan-out the head's own stage spans therefore live on
+        # the session timer and land in the per-rank DEBUG line below, which
+        # leaves ``untracked`` here carrying the worker wait and transport;
+        # fanout.py's [FANOUT] line carries the load balance.
         logger.info(
             "[GB_TIMING %s] %s",
             self.name,
-            _tm.report(time.perf_counter() - st_all),
+            tm.report(time.perf_counter() - st_all),
         )
         for rank in layout.compute_ranks:
             _snap = (replies_f.get(rank) or {}).get("timing") or {}

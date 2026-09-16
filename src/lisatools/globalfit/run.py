@@ -2778,14 +2778,23 @@ class GlobalFit:
         backend_path = self.curr.general_info.main_file_path
         if self.role == RankRole.HEAD:
             self.prepare_main()
-            self.sampler.run_mcmc(
-                self.state, self.curr.general_info.num_iterations, thin_by=1,
-                progress=self.progress, store=True,
-            )
-            self._write_submission()
-            logger.info("Residuals saved.")
-            if getattr(self, "fanout", None) is not None:
-                self.fanout.stop()
+            try:
+                self.sampler.run_mcmc(
+                    self.state, self.curr.general_info.num_iterations, thin_by=1,
+                    progress=self.progress, store=True,
+                )
+                self._write_submission()
+                logger.info("Residuals saved.")
+            finally:
+                # Every compute rank is parked in ``ComputeService.serve()``
+                # waiting for the next command; only STOP releases it. On the
+                # happy path this is the ordinary shutdown, and on a head
+                # exception it is what lets the workers exit instead of
+                # blocking forever (under real MPI the abort hook ends the
+                # job either way -- this makes a FakeWorld / in-process run,
+                # where there is no abort, terminate cleanly too).
+                if getattr(self, "fanout", None) is not None:
+                    self.fanout.stop()
             if self.results_rank != self.main_rank:
                 self.comm.send({"finish_run": True}, dest=self.results_rank)
         elif self.role == RankRole.SAVER:
