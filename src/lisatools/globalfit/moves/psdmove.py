@@ -69,13 +69,14 @@ from ...utils.device import device_context
 from ...utils.utility import asnumpy
 from ..state import GFState
 from .globalfitmove import GlobalFitMove
+from .walkerfanout import WalkerFanoutMixin, pooled_ladder_step
 
 logger = logging.getLogger(__name__)
 
 DEBUG_MODE = False
 
 
-class PSDMove(GlobalFitMove, StretchMove):
+class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
     """
     Noise-model move: samples ``sampled_branches`` of the noise model
     (``psd``, ``galfor``, ``sgwb``) while the likelihood always evaluates the
@@ -153,6 +154,7 @@ class PSDMove(GlobalFitMove, StretchMove):
     _tally_in_model_accepted = None
     _tally_swaps_proposed = None
     _tally_swaps_accepted = None
+    fanout_assigns_counters = True  # body ASSIGNS sub.in_model_*/swaps_* -> zero, then sum
 
     def __init__(
         self,
@@ -2090,7 +2092,13 @@ class PSDMove(GlobalFitMove, StretchMove):
         _tc = self.temperature_control
         self.temperature_control = None
         try:
-            new_state, accepted1 = super(PSDMove, self).propose(model, state)
+            # WalkerFanoutMixin now sits between PSDMove and GlobalFitMove in
+            # the MRO and defines its own `propose` (the fan-out dispatcher);
+            # `super(PSDMove, self)` would land there instead of the vanilla
+            # RedBlueMove stretch proposal this stage-1 draw needs, so the
+            # hand-off starts one layer further, exactly where it did before
+            # the mixin was inserted.
+            new_state, accepted1 = super(WalkerFanoutMixin, self).propose(model, state)
         finally:
             self.temperature_control = _tc
         acc = np.asarray(accepted1, dtype=bool)
@@ -2171,7 +2179,10 @@ class PSDMove(GlobalFitMove, StretchMove):
         ):
             new_state, accepted = self._propose_delayed_acceptance(model, state)
         else:
-            new_state, accepted = super(PSDMove, self).propose(model, state)
+            # See the matching comment in _propose_delayed_acceptance: skip
+            # past WalkerFanoutMixin's own `propose` to reach the vanilla
+            # RedBlueMove stretch proposal, as this hand-off did pre-mixin.
+            new_state, accepted = super(WalkerFanoutMixin, self).propose(model, state)
 
         # in-model bookkeeping: eryn returns (ntemps, nwalkers) acceptances and
         # every walker is proposed once per call, so the per-temperature deltas
@@ -2276,7 +2287,46 @@ class PSDMove(GlobalFitMove, StretchMove):
 
         return state, accepted
 
-    def propose(self, model, state):
+    # ---- multi-rank fan-out (WalkerFanoutMixin hooks) ------------------------
+    def fanout_temperature_controls(self):
+        return [self.temperature_control]
+
+    def fanout_payload_extra(self):
+        return {"betas": np.array(self.temperature_control.betas, dtype=float, copy=True)}
+
+    def fanout_apply_extra(self, extra):
+        if "betas" in extra:
+            self.temperature_control.betas[:] = np.asarray(extra["betas"], dtype=float)
+
+    @staticmethod
+    def _tally_or_empty(arr):
+        return np.zeros(0) if arr is None else np.asarray(arr, dtype=float).ravel()
+
+    def fanout_reply_extra(self, part):
+        return {
+            "swaps_accepted": self._tally_or_empty(self._tally_swaps_accepted),
+            "swaps_proposed": self._tally_or_empty(self._tally_swaps_proposed),
+        }
+
+    def fanout_merge_extra(self, replies, new_state):
+        """Pool swap tallies over ranks, adapt the shared ladder ONCE, publish it.
+
+        The body copies ``tc.betas`` into every sampled sub-state
+        (``sub.betas[:] = ...``) but ``merge_walkers`` never writes ladders back,
+        so the head republishes the adapted ladder here.
+        """
+        if not replies:
+            return
+        tc = self.temperature_control
+        acc = sum(np.asarray(e["swaps_accepted"], dtype=float) for e in replies.values())
+        prop = sum(np.asarray(e["swaps_proposed"], dtype=float) for e in replies.values())
+        tc.betas[:] = pooled_ladder_step(tc, np.array(tc.betas, copy=True), acc, prop)
+        for key in self.sampled_branches:
+            sub = (getattr(new_state, "sub_states", None) or {}).get(key)
+            if sub is not None and getattr(sub, "betas", None) is not None:
+                sub.betas[:] = tc.betas
+
+    def propose_local(self, model, state):
         """Propose a noise-model update and refresh per-walker sensitivity matrices.
 
         Builds a temporary :class:`GFState` containing only THIS move's
@@ -2285,6 +2335,9 @@ class PSDMove(GlobalFitMove, StretchMove):
         the inner stretch-move loop, then writes the accepted coordinates
         back into a copy of ``state`` and refreshes each walker's
         sensitivity matrix in :attr:`acs`.
+
+        Runs on the FULL state single-process and on this rank's walker slice
+        under several compute ranks (``WalkerFanoutMixin.propose`` dispatches).
 
         Returns:
             Tuple ``(new_state, accepted)``.
