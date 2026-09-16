@@ -1955,8 +1955,21 @@ class GlobalFit:
         the symmetric setup-phase collective
         (``allgather_walker_vector``). ``model`` is attached later, once the
         rank has an engine (head) or its own RNG stream (computation ranks).
+
+        TEST-ONLY HOOK: ``GB_PROPOSE_ORCHESTRATE=1`` also builds it in SINGLE
+        mode, as a direct-call fan-out (``comm`` is ``None`` there, and
+        ``WalkerFanout.run`` simply calls the body). That is the parity lever
+        of ``tests/test_multirank_gb_smoke.py``: GB's ``propose`` dispatches to
+        the orchestrator when a fan-out is present and the env var is set, so
+        the single-rank orchestrator can be compared against ``_propose_legacy``
+        in one process. ``fanout.single`` stays True, so ``fanout_active`` is
+        False everywhere and every other family (addremove, PSD, the readiness
+        guard, ``stop()``, ``_global_likelihood``) keeps its single-mode path.
+        Never set this env var in production.
         """
-        if self.layout.is_single():
+        if self.layout.is_single() and os.environ.get(
+            "GB_PROPOSE_ORCHESTRATE", "0"
+        ) != "1":
             return None
         from .communication.fanout import WalkerFanout
 
