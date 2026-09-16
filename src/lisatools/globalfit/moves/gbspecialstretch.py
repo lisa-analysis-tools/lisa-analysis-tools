@@ -4121,7 +4121,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 "(%r); falling back to walker 0.", self.name, exc)
             return 0
 
-    def run_proposal(self, model, state, band_sorter, band_temps):
+    def run_proposal(self, model, state, band_sorter, band_temps, *,
+                     scan_schedule=None):
         """One full pass of per-band proposals.
 
         Bands are partitioned into ``self.band_units`` units by
@@ -4159,6 +4160,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         and state-independent (detailed balance -- see
         :func:`_draw_unit_scan_schedule`); the schedule is logged once
         per propose as ``[GB_UNIT_SCAN]``.
+
+        ``scan_schedule`` (default ``None`` = draw here, today's
+        behaviour) accepts a ready ``(unit_starts, unit_dirs)`` pair and
+        SKIPS the draw entirely -- no ``model.random`` consumption. Under
+        the multi-rank fan-out the head draws the whole N-walker schedule
+        once and ships each rank its own walker block, so the sweep order
+        is the single-process one no matter how the walkers are split.
+        Whatever is used is still checked by
+        :func:`_assert_unit_scan_partition` and logged.
 
         ORTHOGONALITY UNDER A PER-WALKER ORDER. The concurrency argument
         is already a PER-WALKER property and survives unchanged:
@@ -4238,10 +4248,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # neighbouring class's contribution is seen pre- or post-update.
         _per_walker_start = bool(self.band_unit_start_per_walker) and units > 1
         _per_walker_dir = bool(self.band_unit_dir_per_walker) and units > 2
-        _unit_starts, _unit_dirs = _draw_unit_scan_schedule(
-            model.random, self.nwalkers, units,
-            _per_walker_start, _per_walker_dir,
-        )
+        if scan_schedule is None:
+            _unit_starts, _unit_dirs = _draw_unit_scan_schedule(
+                model.random, self.nwalkers, units,
+                _per_walker_start, _per_walker_dir,
+            )
+        else:  # head-drawn (multi-rank): this rank's block of the N-walker
+            # schedule. The draw is the FIRST model.random consumer in this
+            # method, so shipping it consumes nothing here and the rest of
+            # the rank's stream is untouched.
+            _unit_starts, _unit_dirs = scan_schedule
         _unit_per_walker = _per_walker_start or _per_walker_dir
         # Verify the partition rather than trust it. These knobs run in PE
         # as well as search (user ruling 2026-08-29), so a broken schedule
@@ -4877,6 +4893,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     # branch across every move instance in the process.
     _branch_propose_counts: dict = {}
     _branch_last_temper: dict = {}
+
+    # Per-rank RNG seed for the move's OWN Generator streams (multi-rank
+    # fan-out; set by the rank block entry). ``None`` = today's behaviour:
+    # every Generator is seeded from OS entropy, as it has been since the
+    # vertical-swap rng was added. Ranks need a derived seed instead so a
+    # run is reproducible from the rank layout rather than from entropy.
+    _rank_rng_seed = None
+
+    @staticmethod
+    def _make_temper_rng(move):
+        """The vertical-swap ``Generator``: rank-seeded, or today's entropy."""
+        seed = getattr(move, "_rank_rng_seed", None)
+        return np.random.default_rng() if seed is None else np.random.default_rng(int(seed))
 
     @property
     def _buffer_cache_scope(self):
@@ -13339,7 +13368,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # ``_cell_ll_finalize``'s sampled-vs-realized reconciliation,
         # reported as [GB_CELL_LL] against a temperature-scaled allowance.
         if _vert_on and getattr(self, "_temper_rng", None) is None:
-            self._temper_rng = np.random.default_rng()
+            self._temper_rng = self._make_temper_rng(self)
 
         # Device-resident accept-chain state (flushed ONCE per block in
         # ``imr_accept_flush`` below): per-proposal-kind counters
@@ -14355,7 +14384,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         dbetas = betas1 - betas0
         band_temps += self.xp.asarray(dbetas.T)
 
-    def run_tempering(self, model, state, band_sorter, band_temps):
+    def run_tempering(self, model, state, band_sorter, band_temps, *,
+                      tmp_start=None, adapt_band_temps=True):
+        # ``tmp_start`` (default None = draw here, today's behaviour) takes
+        # the head's per-propose start class under the multi-rank fan-out so
+        # every rank sweeps the same band classes in the same order; an int
+        # is used as is and consumes no draw.
+        #
+        # ``adapt_band_temps=False`` skips the ladder adaptation at the end.
+        # The band ladder has NO walker axis and is head-owned: a rank that
+        # adapted it from its own block's swap counts would silently diverge
+        # from the head's ladder with nothing to catch it, so the rank path
+        # must always pass False (spec ruling, Plan 4).
+        #
         # Per-GPU temperature permutation (parallel-resources plan P1): when
         # the model ACA splits the cold-chain walkers across devices, swap
         # partners are drawn WITHIN each device's walker block so no swap
@@ -14442,7 +14483,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # the ``units`` sequential passes. num_bands == 1 keeps the
         # legacy 2-pass loop verbatim (degenerate single-band case).
         units = self.band_units if self.num_bands > 1 else 2
-        tmp_start = np.random.randint(units)
+        tmp_start = np.random.randint(units) if tmp_start is None else int(tmp_start)
         for tmp in range(units):
             remainder = (tmp_start + tmp) % units
             start = remainder
@@ -15088,15 +15129,21 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 f"{len(self.band_edges) - 1}."
             )
 
-        self._adapt_band_temps(band_temps, band_swaps_accepted, band_swaps_proposed)
+        if adapt_band_temps:
+            self._adapt_band_temps(band_temps, band_swaps_accepted, band_swaps_proposed)
 
         # TODO Ask michael what this is about print("NEED TO FIX ANALYSIS CONTAINER extra factor")
         ll_change_sum_temp = ll_change_log_temp.sum(axis=-1)
 
         return ll_change_sum_temp, band_swaps_accepted, band_swaps_proposed
 
-    def _write_back_state(self, new_state, band_sorter) -> None:
-        """Repack the sorter's live sources into ``new_state.branches['gb']``.
+    def _write_back_state(self, new_state, band_sorter):
+        """Repack the sorter's live sources; return ``(inds_new, alive)``.
+
+        The repack writes into ``new_state.branches['gb']``; the return is
+        the written ``(temp, walker, leaf)`` index triple plus the sorter's
+        alive mask, which the multi-rank head needs to place a rank block's
+        leaves at their GLOBAL walker positions (both branches return it).
 
         Leaves are re-indexed densely per (temp, walker) in frequency order:
         live sources are ranked by the composite key
@@ -15135,7 +15182,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # identity preserved: old positions == new positions
             self._scatter_leaf_products(new_state, alive, inds_new, inds_new)
             self._sync_cold_row(new_state)
-            return
+            return inds_new, alive
         special_indices_finish = (
             band_sorter.temp_inds[alive] * self.nwalkers
             + band_sorter.walker_inds[alive]
@@ -15174,6 +15221,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # work.branch_supplemental[inds_new] = state.branches[self.branch_name].branch_supplemental[inds_old]
         self._scatter_leaf_products(new_state, alive, inds_new, inds_old)
         self._sync_cold_row(new_state)
+        return inds_new, alive
 
     def _scatter_leaf_products(self, new_state, alive, inds_new,
                                inds_old=None) -> None:
@@ -16506,7 +16554,54 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 float(rel[w, b]), tol,
             )
 
-    def _update_band_leaf_caps(self, model, new_state, band_counts) -> None:
+    def _cap_stats_local(self, model, new_state):
+        """The RESIDUAL-dependent half of :meth:`_update_band_leaf_caps`.
+
+        Everything here reads this process's residual / sub-state and
+        nothing else: the per-band cold-walker residual lls, the cap-cell
+        statistic that drives the gate, and their dofs. Split out so the
+        multi-rank fan-out can run it on each rank over that rank's walker
+        block and hand the head the pieces (``band_lls`` / ``lls`` carry a
+        walker axis, so the merge is a concat on axis 0 -- the gate's
+        ``max(axis=0)`` over the concatenation is the N-walker max).
+
+        Returns the dict :meth:`_update_band_leaf_caps` consumes:
+        ``band_lls`` (nwalkers, num_bands), ``lls``/``dof`` (whatever grid
+        drives the gate), ``band_dof`` (set as a side effect of
+        :meth:`_band_residual_lls`) and ``is_cells``.
+
+        NO ``band_info`` writes happen here -- the head owns those, in the
+        order :meth:`_update_band_leaf_caps` has always written them.
+        """
+        # The CELL statistic drives the gate whenever the cap-cell
+        # machinery is live: divisor > 1, OR divisor 1 with overlap
+        # (2026-08-26 aligned-cells config -- there the band residual
+        # windows can be empty on sub-layer band grids while the
+        # source-attributed cell statistic stays defined).
+        is_cells = (
+            not self._cap_is_band_grid
+            or float(getattr(self, "cap_overlap_frac", 0.0) or 0.0) > 0.0
+        )
+
+        # The per-band residual lls are computed and stored EVERY step
+        # regardless of which grid drives the caps: they are the monitor's
+        # series and the auditable trace, and the legacy nsigma gate's
+        # tolerance is scaled by ``self._band_dof`` which this sets.
+        band_lls = self._band_residual_lls(model.analysis_container_arr)
+        if is_cells:
+            lls, dof = self._cap_cell_lls(model, new_state, band_lls)
+        else:
+            lls, dof = band_lls, self._band_dof
+        return {
+            "band_lls": band_lls,
+            "lls": lls,
+            "dof": dof,
+            "band_dof": getattr(self, "_band_dof", None),
+            "is_cells": is_cells,
+        }
+
+    def _update_band_leaf_caps(self, model, new_state, band_counts, *,
+                               precomputed=None) -> None:
         """Advance the progressive leaf caps (once per iteration).
 
         Runs at the very end of ``propose`` (after the final
@@ -16554,24 +16649,31 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         keeps the PARTITION windows (widened windows would double-count
         residual bins and break the band-tiling identity the
         [GB_CAP_LL_CHECK] audit relies on).
+
+        ``precomputed`` (multi-rank fan-out only) supplies the
+        :meth:`_cap_stats_local` dict the head assembled from the rank
+        blocks; ``None`` -- single process -- computes it here, which is
+        exactly what this method has always done inline.
         """
         bi = new_state.sub_states[self.branch_name].band_info
         cap, iters, best = self._cap_state_arrays(bi)
-        # The CELL statistic drives the gate whenever the cap-cell
-        # machinery is live: divisor > 1, OR divisor 1 with overlap
-        # (2026-08-26 aligned-cells config -- there the band residual
-        # windows can be empty on sub-layer band grids while the
-        # source-attributed cell statistic stays defined).
-        is_cells = (
-            not self._cap_is_band_grid
-            or float(getattr(self, "cap_overlap_frac", 0.0) or 0.0) > 0.0
-        )
+        # The residual-dependent statistics: computed here in single
+        # process (``precomputed=None``, identical to what this method
+        # always computed inline), or supplied by the head under the
+        # multi-rank fan-out with the per-rank walker blocks already
+        # concatenated back to the N-walker arrays.
+        stats = (self._cap_stats_local(model, new_state)
+                 if precomputed is None else precomputed)
+        band_dof = stats.get("band_dof")
+        if band_dof is not None:
+            self._band_dof = band_dof
+        band_lls = stats["band_lls"]
+        is_cells = stats["is_cells"]
+        lls, dof = stats["lls"], stats["dof"]
 
-        # The per-band residual lls are computed and stored EVERY step
-        # regardless of which grid drives the caps: they are the monitor's
-        # series and the auditable trace, and the legacy nsigma gate's
-        # tolerance is scaled by ``self._band_dof`` which this sets.
-        band_lls = self._band_residual_lls(model.analysis_container_arr)
+        # The per-band residual lls are stored EVERY step regardless of
+        # which grid drives the caps: they are the monitor's series and the
+        # auditable trace.
         if ("band_cold_ll" in bi
                 and bi["band_cold_ll"].shape == band_lls.shape):
             bi["band_cold_ll"][:] = band_lls
@@ -16581,7 +16683,6 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self._track_band_best_ll(bi, band_lls)
 
         if is_cells:
-            lls, dof = self._cap_cell_lls(model, new_state, band_lls)
             if ("cap_cell_cold_ll" in bi
                     and bi["cap_cell_cold_ll"].shape == lls.shape):
                 bi["cap_cell_cold_ll"][:] = lls
@@ -16592,8 +16693,6 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # (overwriting the residual-window series written above,
                 # which is empty/degenerate on sub-layer band grids).
                 bi["band_cold_ll"][:] = lls
-        else:
-            lls, dof = band_lls, self._band_dof
         cur_max = lls.max(axis=0)
         _occ_max = None
 
@@ -18468,7 +18567,15 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         self._fstat_ctr_table = table
         _FSTAT_CTR_TABLE_REGISTRY[key] = table
 
-    def _install(self, k: int, stacked=None, n_peaks=None):
+    def _install(self, k: int, stacked=None, n_peaks=None, sync_shutoff=True):
+        """Install epoch ``k``'s birth grid (pure in-memory).
+
+        ``sync_shutoff=False`` skips the band-shutoff epoch sync: under the
+        multi-rank fan-out the head owns the valve and ships its state to
+        the ranks, so a rank that re-synced here would silently revive
+        bands the head has shut off (``run_tempering`` reads
+        ``_rj_band_shutoff`` to drop grid rows). Default True = today.
+        """
         from lisatools.sampling.fstat_gridfit import build_gb_birth_distribution
 
         # New epoch container -> re-discover the census surface.
@@ -18540,7 +18647,8 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         # BEFORE the first propose that uses the new grid (user ruling
         # 2026-08-28). No-op when the epoch is unchanged (a resumed mid-fit
         # epoch keeps its number) or when this move carries no shutoff state.
-        self._band_shutoff_epoch_sync()
+        if sync_shutoff:
+            self._band_shutoff_epoch_sync()
         # Last-fit mark on the refit clock. After a real fit DONE.json holds
         # the clock this process just journaled; on a LOAD of an existing
         # epoch it holds the clock the epoch was actually fitted at (0 for
