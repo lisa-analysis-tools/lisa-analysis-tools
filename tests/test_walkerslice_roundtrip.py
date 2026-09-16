@@ -5,7 +5,14 @@ import unittest
 import numpy as np
 from eryn.state import BranchSupplemental
 
+from lisatools.globalfit.communication.walkerslice import merge_state, slice_state
 from lisatools.globalfit.state import GBState, GFState, MBHState, ModuleSubState
+from tests.test_gf_substate_roundtrip import (
+    BRANCH_SHAPES,
+    NTEMPS as RT_NTEMPS,
+    NWALKERS as RT_NWALKERS,
+    make_state,
+)
 
 NTEMPS, NWALKERS, NLEAVES, NDIM = 3, 6, 2, 4
 
@@ -128,6 +135,152 @@ class SubStateSliceMergeTest(unittest.TestCase):
         # both uninitialized: still a no-op, no exception
         bare_self.merge_walkers(bare_part2, 0, 1)
         self.assertFalse(bare_self.tempered_initialized)
+
+
+class GFStateSliceMergeTest(unittest.TestCase):
+    """Whole-state slice/merge over the roundtrip fixture (4 walkers -> two blocks of 2)."""
+
+    def setUp(self):
+        self.rng = np.random.default_rng(99)
+        self.state = make_state(self.rng)
+        nt, nw = RT_NTEMPS, RT_NWALKERS
+        self.state.supplemental = BranchSupplemental(
+            {
+                "walker_inds": np.tile(np.arange(nw), (nt, 1)),
+                "aux": self.rng.standard_normal((nt, nw, 2)),
+            },
+            base_shape=(nt, nw),
+        )
+        self.state.branches["psd"].branch_supplemental = BranchSupplemental(
+            {"tag": self.rng.integers(0, 9, (nt, nw, 1))}, base_shape=(nt, nw, 1)
+        )
+        for sub in self.state.sub_states.values():
+            for name in ("d_h", "h_h"):
+                getattr(sub, name)[...] = self.rng.standard_normal(getattr(sub, name).shape)
+            for name in sub.delta_counter_names:
+                arr = getattr(sub, name)
+                arr[...] = self.rng.integers(0, 5, arr.shape)
+        self.ref = GFState(self.state, copy=True)
+
+    def test_slice_geometry_and_walker_inds_remap(self):
+        part = slice_state(self.state, 2, 4)
+        for name, br in part.branches.items():
+            self.assertEqual(br.nwalkers, 2)
+            np.testing.assert_array_equal(br.coords, self.ref.branches[name].coords[:, 2:4])
+            np.testing.assert_array_equal(br.inds, self.ref.branches[name].inds[:, 2:4])
+        np.testing.assert_array_equal(
+            part.supplemental.holder["walker_inds"], np.tile(np.arange(2), (RT_NTEMPS, 1))
+        )
+        np.testing.assert_array_equal(
+            part.supplemental.holder["aux"], self.ref.supplemental.holder["aux"][:, 2:4]
+        )
+        np.testing.assert_array_equal(
+            part.branches["psd"].branch_supplemental.holder["tag"],
+            self.ref.branches["psd"].branch_supplemental.holder["tag"][:, 2:4],
+        )
+        np.testing.assert_array_equal(part.log_like, self.ref.log_like[:, 2:4])
+        np.testing.assert_array_equal(part.log_prior, self.ref.log_prior[:, 2:4])
+        np.testing.assert_array_equal(part.betas, self.ref.betas)
+        mbh = part.sub_states["mbh"]
+        self.assertEqual(mbh.nwalkers, 2)
+        self.assertEqual(mbh.log_like.shape, (BRANCH_SHAPES["mbh"][0], RT_NTEMPS, 2))
+        np.testing.assert_array_equal(mbh.d_h, self.ref.sub_states["mbh"].d_h[2:4])
+        self.assertEqual(part.sub_state_bases, self.state.sub_state_bases)
+        # a slice is a copy: mutating it never reaches the full state
+        part.branches["gb"].coords[...] = 123.0
+        part.supplemental.holder["aux"][...] = 5.0
+        np.testing.assert_array_equal(
+            self.state.branches["gb"].coords, self.ref.branches["gb"].coords
+        )
+        np.testing.assert_array_equal(
+            self.state.supplemental.holder["aux"], self.ref.supplemental.holder["aux"]
+        )
+
+    def test_sub_state_filter(self):
+        part = slice_state(self.state, 0, 2, sub_states=["mbh"])
+        self.assertIsNotNone(part.sub_states["mbh"])
+        for name in ("gb", "emri", "sobbh", "psd"):
+            self.assertIsNone(part.sub_states[name])
+        none = slice_state(self.state, 0, 2, sub_states=[])
+        self.assertTrue(all(v is None for v in none.sub_states.values()))
+
+    def test_slice_survives_the_gfstate_copy_path(self):
+        part = slice_state(self.state, 0, 2)
+        twin = GFState(part, copy=True)
+        np.testing.assert_array_equal(
+            twin.sub_states["mbh"].coords, part.sub_states["mbh"].coords
+        )
+        self.assertEqual(twin.branches["gb"].nwalkers, 2)
+
+    def test_merge_roundtrip_restores_columns_and_sums_counters(self):
+        target = GFState(self.state, copy=True)
+        for br in target.branches.values():
+            br.coords[...] = 0.0
+            br.inds[...] = False
+        target.log_like[...] = 0.0
+        target.log_prior[...] = 0.0
+        target.supplemental.holder["aux"][...] = 0.0
+        target.branches["psd"].branch_supplemental.holder["tag"][...] = -1
+        for sub in target.sub_states.values():
+            sub.coords[...] = 0.0
+            sub.d_h[...] = 0.0
+        left = slice_state(self.state, 0, 2)
+        right = slice_state(self.state, 2, 4)
+        for part in (left, right):
+            for sub in part.sub_states.values():
+                for name in sub.delta_counter_names:
+                    getattr(sub, name)[...] = 1
+        merge_state(target, left, 0, 2)
+        merge_state(target, right, 2, 4)
+
+        for name, br in target.branches.items():
+            np.testing.assert_array_equal(br.coords, self.ref.branches[name].coords)
+            np.testing.assert_array_equal(br.inds, self.ref.branches[name].inds)
+        np.testing.assert_array_equal(target.log_like, self.ref.log_like)
+        np.testing.assert_array_equal(target.log_prior, self.ref.log_prior)
+        np.testing.assert_array_equal(
+            target.supplemental.holder["aux"], self.ref.supplemental.holder["aux"]
+        )
+        # the head's walker_inds stay GLOBAL ids (a slice's remapped ids never come back)
+        np.testing.assert_array_equal(
+            target.supplemental.holder["walker_inds"], self.ref.supplemental.holder["walker_inds"]
+        )
+        np.testing.assert_array_equal(
+            target.branches["psd"].branch_supplemental.holder["tag"],
+            self.ref.branches["psd"].branch_supplemental.holder["tag"],
+        )
+        for name, sub in target.sub_states.items():
+            ref = self.ref.sub_states[name]
+            for aname in sub.walker_axes:
+                if getattr(ref, aname, None) is not None:
+                    np.testing.assert_array_equal(
+                        getattr(sub, aname), getattr(ref, aname), err_msg=f"{name}.{aname}"
+                    )
+            for cname in sub.delta_counter_names:
+                np.testing.assert_array_equal(
+                    getattr(sub, cname), getattr(ref, cname) + 2, err_msg=f"{name}.{cname}"
+                )
+        # ladders untouched
+        np.testing.assert_array_equal(
+            target.sub_states["mbh"].betas_all, self.ref.sub_states["mbh"].betas_all
+        )
+        np.testing.assert_array_equal(
+            target.sub_states["psd"].betas, self.ref.sub_states["psd"].betas
+        )
+        np.testing.assert_array_equal(
+            target.sub_states["gb"].band_info["band_temps"],
+            self.ref.sub_states["gb"].band_info["band_temps"],
+        )
+
+    def test_gb_band_info_is_never_sliced(self):
+        part = slice_state(self.state, 0, 2)
+        self.assertFalse(hasattr(part.sub_states["gb"], "_band_info"))
+
+    def test_bad_blocks_raise(self):
+        with self.assertRaises(ValueError):
+            slice_state(self.state, 3, 3)
+        with self.assertRaises(ValueError):
+            merge_state(self.state, slice_state(self.state, 0, 2), 0, 3)
 
 
 if __name__ == "__main__":
