@@ -68,15 +68,23 @@ from lisatools.globalfit.run import CurrentInfoGlobalFit, GlobalFit
 
 if __name__ == "__main__":
 
+    # Installed BEFORE prepare_rank (and before argparse/build): a pre-collective
+    # crash on one rank must not leave the others hanging in the layout's allgather.
+    from lisatools.globalfit.communication.ranks import install_mpi_abort_on_error
+
+    install_mpi_abort_on_error(MPI.COMM_WORLD)
+
     import argparse
     parser = argparse.ArgumentParser(
         description="Run the LISA Global Fit with LISA Analysis Tools.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "MPI launch matrix (see docs/global-fit-launch.md):\n"
-            "  python scripts/run_global.py --stock <name>                # np=1: sampler + synchronous saves\n"
-            "  mpiexec -n 2 python scripts/run_global.py --stock <name>   # rank 1 is a spare (stopped at startup)\n"
-            "  mpiexec -n 3 python scripts/run_global.py --stock <name>   # rank 2 = dedicated async saver rank\n"
+            "MPI launch matrix (walker-block layout; see docs/global-fit-launch.md):\n"
+            "  np 1: single rank. np 2 on 1 GPU: head + saver (warns). np 2 on 2\n"
+            "  GPUs: head + compute. np >= 3: head + compute ranks + saver (highest\n"
+            "  rank). prepare_rank resolves this rank's role before the build.\n"
+            "  python scripts/run_global.py --stock <name>\n"
+            "  mpiexec -n 3 python scripts/run_global.py --stock <name>\n"
             "  srun -n 3 --gpus-per-node=<G> python scripts/run_global.py --stock <name>\n"
             "GPU count is a knob, not a rank: GPUS=0,1 selects the local devices the\n"
             "main rank drives (USE_GPU=0 forces CPU). Common env: VERBOSE, NWALKERS, NTEMPS,\n"
@@ -127,17 +135,13 @@ if __name__ == "__main__":
                 "derives from tobs_target.",
                 flush=True,
             )
-        # Only the ranks that consume the built configuration pay for the
-        # heavy data build: the main rank (sampler) and, at np >= 3, the
-        # dedicated saver rank (it needs the backend spec). Spare ranks wait
-        # for the "stop" the main rank sends at startup and exit — no
-        # redundant per-rank data load.
-        _comm = MPI.COMM_WORLD
-        _main, _results, _ = GlobalFit.resolve_rank_roles(_comm, fit.main_rank)
-        if _comm.Get_rank() not in (_main, _results):
-            msg = _comm.recv(source=_main)
-            print(f"Process {_comm.Get_rank()} finished ({msg!r}).")
-            sys.exit(0)
+        # Every rank builds: in the walker-block layout the head and the
+        # computation ranks each own a block of walkers, and the saver needs
+        # the backend spec. prepare_rank resolves this rank's role and pins
+        # its device BEFORE the build allocates on it (no-op at -n 1).
+        from lisatools.globalfit.communication.ranks import prepare_rank
+
+        prepare_rank(fit, MPI.COMM_WORLD)
         curr_info = fit.build()
     else:
         # Define the module name and the full path to the Python file
@@ -161,6 +165,12 @@ if __name__ == "__main__":
 
         # Now you can access functions, classes, or variables from the imported module
         settings_function = getattr(my_module, args.settings_function)
+
+        # Settings-file runs predate the walker-block layout: keep today's
+        # roles (one sampling rank, stopped spares) unless the user opted in.
+        if os.environ.setdefault("GF_LEGACY_RANK_LAYOUT", "1") == "1":
+            print("[legacy settings file] GF_LEGACY_RANK_LAYOUT=1: single-compute layout.",
+                  flush=True)
 
         curr_info = settings_function()
 

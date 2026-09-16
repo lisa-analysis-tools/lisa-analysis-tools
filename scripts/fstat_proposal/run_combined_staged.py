@@ -947,6 +947,10 @@ def main() -> int:
         return 0
 
     print("[combined] fit.build() ...", flush=True)
+    from mpi4py import MPI
+    from lisatools.globalfit.communication.ranks import prepare_rank, RankRole
+
+    layout = prepare_rank(fit, MPI.COMM_WORLD)
     fit.build()
     print("[combined] running", flush=True)
     fit.run()
@@ -962,15 +966,9 @@ def main() -> int:
     # run was still starting its first stage. Alarming and completely
     # false, so say which rank is talking and only claim completion from
     # the rank that actually sampled.
-    _rank, _main = 0, 0
-    try:
-        from mpi4py import MPI
-
-        _rank = MPI.COMM_WORLD.Get_rank()
-        _main = int(getattr(fit.settings_dict.rank_info, "main_rank", 0))
-    except Exception:
-        pass
-    if _rank == _main:
+    _rank = MPI.COMM_WORLD.Get_rank()
+    role = layout.role_of(_rank)
+    if role == RankRole.HEAD:
         print(
             f"[combined] RUN COMPLETE: num_iterations="
             f"{fit.general.num_iterations} reached; residuals saved.",
@@ -978,79 +976,18 @@ def main() -> int:
         )
     else:
         print(
-            f"[combined] rank {_rank} (non-sampling helper) exiting; "
-            f"the run continues on rank {_main}.",
+            f"[combined] rank {_rank} ({role.value}) exiting; the run "
+            f"continues on the head.",
             flush=True,
         )
     return 0
 
 
-def _install_mpi_abort_on_error():
-    """Make ANY rank's uncaught exception tear down the WHOLE job, loudly.
-
-    Motivation (2026-08-15 forensics): job 210's main rank died on a corrupt
-    HDF5 read at startup, but the run kept its Slurm allocation for ELEVEN
-    HOURS at 0% GPU. Under ``mpiexec -n 3`` the dedicated saver rank sits in
-    a blocking async save/plot loop, so when rank 0 exits nothing tells it to
-    stop -- a crash silently becomes a resource-burning hang, and the only
-    trace is a traceback in the sbatch stdout that nobody is watching.
-
-    MPI gives no automatic teardown here: ``mpiexec`` waits on the surviving
-    ranks. ``comm.Abort()`` is the sanctioned way to kill every rank at once,
-    so route every uncaught exception through it AFTER printing the
-    traceback (tagged with the rank, since otherwise it is guesswork which
-    process failed).
-
-    Returns the communicator when MPI is live, else None (a single-process
-    run needs none of this and must keep normal Python exception behaviour).
-    """
-    try:
-        from mpi4py import MPI
-    except Exception:
-        return None
-    comm = MPI.COMM_WORLD
-    if comm.Get_size() < 2:
-        return None  # single process: a plain traceback + exit is correct
-
-    rank = comm.Get_rank()
-    _prev_hook = sys.excepthook
-
-    def _hook(exc_type, exc, tb):
-        # KeyboardInterrupt stays interactive-friendly: still abort (the
-        # other ranks would hang otherwise) but do not dump a scary trace.
-        try:
-            print(
-                f"\n[MPI-ABORT] rank {rank} of {comm.Get_size()} raised "
-                f"{exc_type.__name__}: {exc}\n"
-                f"[MPI-ABORT] aborting ALL ranks so the job fails fast "
-                f"instead of hanging on the surviving ones.",
-                file=sys.stderr, flush=True)
-            if exc_type is not KeyboardInterrupt:
-                traceback.print_exception(exc_type, exc, tb, file=sys.stderr)
-            sys.stderr.flush()
-            sys.stdout.flush()
-        except Exception:
-            pass
-        finally:
-            try:
-                comm.Abort(1)
-            except Exception:
-                os._exit(1)
-
-    sys.excepthook = _hook
-
-    # sys.excepthook is NOT used for exceptions raised in threads; the run
-    # dispatches shard work on threads, so cover them too (3.8+).
-    if hasattr(threading, "excepthook"):
-        def _thread_hook(args):
-            _hook(args.exc_type, args.exc_value, args.exc_traceback)
-        threading.excepthook = _thread_hook
-
-    return comm
-
-
 if __name__ == "__main__":
-    _comm = _install_mpi_abort_on_error()
+    from mpi4py import MPI
+    from lisatools.globalfit.communication.ranks import install_mpi_abort_on_error
+
+    _comm = install_mpi_abort_on_error(MPI.COMM_WORLD)
     try:
         _rc = main()
     except SystemExit:
