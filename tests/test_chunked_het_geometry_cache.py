@@ -15,6 +15,7 @@ after (the arrays are geometry; there is nothing to invalidate).
 
 from __future__ import annotations
 
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -256,6 +257,229 @@ class GetLlWdmUsesTheCacheTest(unittest.TestCase):
             spans["total"],
             spans["stage"] + spans["geom"] + spans["wrap"] - 1e-9,
         )
+
+
+# ----------------------------------------------------------------------
+# MULTI-SHARD DEVICE RESIDENCY (2026-09-16 null-run regression)
+# ----------------------------------------------------------------------
+# The tests above count ``asarray`` calls. They CANNOT see the thing that
+# actually matters on a 2-GPU walker-sharded run, because their fake
+# geometry is host NumPy and NumPy arrays have no device: WHICH DEVICE the
+# array the kernel receives is resident on.
+#
+# In production the five geometry arrays are cupy arrays built in
+# ``__init__`` on the comp's HOME device (chunked_het.py:341-351), and the
+# SOBBH move routes a SINGLE SHARED comp through both shards' device
+# contexts (sobbhspecialmove.py:391 for scoring, :560 for the fill). So
+# every kernel arg sourced from ``self`` is a home-device pointer unless
+# something relocates it. These tests pin the contract:
+#
+#   a call made under device-context 1 must receive arrays resident on
+#   device 1 -- never device 0's.
+#
+# ``DeviceTrackingXp`` models the one cupy behaviour that makes this a
+# trap: ``xp.asarray`` uploads HOST data to the current device but does
+# NOT relocate an array that already lives on another device (which is why
+# ``lisatools.utils.device.to_current_device`` exists and goes via host --
+# P2P is unavailable between GPUs on some nodes).
+
+try:  # pragma: no cover - import shim, both runners
+    from tests._multishard import DeviceTrackingXp, device_of
+except ImportError:  # pragma: no cover
+    from _multishard import DeviceTrackingXp, device_of
+
+
+#: Kernel-signature positions of the five geometry args in ``fill_global``
+#: (templates, orbits, tdi_config, wdm_settings, params, factors,
+#: data_index, THEN the geometry).
+_FILL_GEOM_SLICE = slice(7, 12)
+
+
+def _home_device_comp(cls, xp, home=0):
+    """A comp whose five geometry arrays are resident on ``home``.
+
+    Mirrors production: ``__init__`` uploads them with ``self.xp.asarray``
+    on whatever device is current at build time -- the run's main GPU.
+    """
+    comp = cls(xp)
+    with xp.cuda.Device(home):
+        comp.chunk_t_starts = xp.asarray(comp.chunk_t_starts)
+        comp.chunk_keep_lo = xp.asarray(comp.chunk_keep_lo)
+        comp.chunk_keep_hi = xp.asarray(comp.chunk_keep_hi)
+        comp.chunk_n_global_offset = xp.asarray(comp.chunk_n_global_offset)
+        comp.wdm_window = xp.asarray(comp.wdm_window)
+    xp.asarray_calls = 0  # the fixture upload is not part of any assertion
+    return comp
+
+
+class _FillRecordingComp(_KernelRecordingComp):
+    """``fill_global_wdm`` driven end-to-end with the kernel stubbed.
+
+    ``wdm_het_fill_global_kernel`` is the kernel the cluster crash named
+    (``lat_chunked_het_kernels.hh`` -- the ``gpuErrchk(cudaGetLastError())``
+    immediately after its launch), so the fill path gets its own residency
+    test rather than riding on ``get_ll_wdm``'s.
+    """
+
+    def __init__(self, xp):
+        super().__init__(xp)
+        self.Nf, self.Nt = 4, 8
+        self.wdm_settings = SimpleNamespace(Nf_active=4, Nt_active=8)
+
+    def _slab_args_from(self, band_slab_Nf, slab_min_f):
+        return ()
+
+
+class _FillHolder:
+    """Single-shard fill target: ``nchannels * Nf * Nt`` = 3 * 4 * 8."""
+
+    def __init__(self, xp, device):
+        with xp.cuda.Device(device):
+            self.linear_data_arr = [xp.zeros(96, dtype=float)]
+
+    def __len__(self):
+        return 1
+
+
+class GeometryDeviceResidencyTest(unittest.TestCase):
+    """The core contract: geometry follows the CALLING device context."""
+
+    def test_home_device_call_gets_home_device_geometry(self):
+        xp = DeviceTrackingXp()
+        comp = _home_device_comp(_GeometryOnlyComp, xp, home=0)
+        with xp.cuda.Device(0):
+            args = comp._geometry_kernel_args()
+        for i, arr in enumerate(args):
+            self.assertEqual(device_of(arr), 0, f"geometry arg {i}")
+
+    def test_shard_device_call_gets_shard_device_geometry(self):
+        """RED before the fix: device 1 received device 0's arrays."""
+        xp = DeviceTrackingXp()
+        comp = _home_device_comp(_GeometryOnlyComp, xp, home=0)
+        with xp.cuda.Device(1):
+            args = comp._geometry_kernel_args()
+        for i, arr in enumerate(args):
+            self.assertEqual(
+                device_of(arr), 1,
+                f"geometry arg {i} reached a device-1 launch resident on "
+                f"device {device_of(arr)} -- cross-device pointer",
+            )
+
+    def test_alternating_shards_never_cross(self):
+        """The routed scoring pattern: 25 repeats x 2 shards."""
+        xp = DeviceTrackingXp()
+        comp = _home_device_comp(_GeometryOnlyComp, xp, home=0)
+        for _ in range(25):
+            for dev in (0, 1):
+                with xp.cuda.Device(dev):
+                    args = comp._geometry_kernel_args()
+                for arr in args:
+                    self.assertEqual(device_of(arr), dev)
+
+    def test_each_device_keeps_its_own_copies(self):
+        xp = DeviceTrackingXp()
+        comp = _home_device_comp(_GeometryOnlyComp, xp, home=0)
+        with xp.cuda.Device(0):
+            dev0 = comp._geometry_kernel_args()
+        with xp.cuda.Device(1):
+            dev1 = comp._geometry_kernel_args()
+        for a, b in zip(dev0, dev1):
+            self.assertIsNot(a, b, "the two devices share one array object")
+
+
+class GetLlWdmDeviceResidencyTest(unittest.TestCase):
+    """The scoring kernel must not be handed foreign-device geometry."""
+
+    def _params(self, n=3):
+        p = np.zeros((n, WDMComputationsBase._NPARAMS))
+        p[:, WDMComputationsBase._F0_PARAM_INDEX] = 1e-3
+        return p
+
+    def test_shard_call_passes_device_local_geometry(self):
+        xp = DeviceTrackingXp()
+        comp = _home_device_comp(_KernelRecordingComp, xp, home=0)
+        with xp.cuda.Device(1):
+            comp.get_ll_wdm(self._params(), _FakeHolder())
+        for i, arr in enumerate(comp.kernel_args[0][_GEOM_SLICE]):
+            self.assertEqual(device_of(arr), 1, f"geometry arg {i}")
+
+
+class FillGlobalWdmDeviceResidencyTest(unittest.TestCase):
+    """``wdm_het_fill_global_kernel`` -- the kernel the crash named."""
+
+    def _params(self, n=2):
+        p = np.zeros((n, WDMComputationsBase._NPARAMS))
+        p[:, WDMComputationsBase._F0_PARAM_INDEX] = 1e-3
+        return p
+
+    def test_home_shard_fill_passes_home_device_geometry(self):
+        xp = DeviceTrackingXp()
+        comp = _home_device_comp(_FillRecordingComp, xp, home=0)
+        with xp.cuda.Device(0):
+            comp.fill_global_wdm(self._params(), _FillHolder(xp, 0))
+        for i, arr in enumerate(comp.kernel_args[0][_FILL_GEOM_SLICE]):
+            self.assertEqual(device_of(arr), 0, f"geometry arg {i}")
+
+    def test_shard_fill_passes_device_local_geometry(self):
+        """RED before the fix: the fill never re-asserted at all."""
+        xp = DeviceTrackingXp()
+        comp = _home_device_comp(_FillRecordingComp, xp, home=0)
+        with xp.cuda.Device(1):
+            comp.fill_global_wdm(self._params(), _FillHolder(xp, 1))
+        for i, arr in enumerate(comp.kernel_args[0][_FILL_GEOM_SLICE]):
+            self.assertEqual(
+                device_of(arr), 1,
+                f"fill geometry arg {i} reached a device-1 launch resident "
+                f"on device {device_of(arr)} -- this is the illegal access",
+            )
+
+
+class GeomCacheEnvEscapeTest(unittest.TestCase):
+    """``SOBBH_GEOM_CACHE=0`` restores the per-call re-assert."""
+
+    def setUp(self):
+        self._prev = os.environ.get("SOBBH_GEOM_CACHE")
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop("SOBBH_GEOM_CACHE", None)
+        else:
+            os.environ["SOBBH_GEOM_CACHE"] = self._prev
+
+    def test_default_caches(self):
+        os.environ.pop("SOBBH_GEOM_CACHE", None)
+        xp = _CountingXp()
+        comp = _bare_comp(xp)
+        comp._geometry_kernel_args()
+        comp._geometry_kernel_args()
+        self.assertEqual(xp.asarray_calls, 5)
+
+    def test_disabled_re_asserts_every_call(self):
+        os.environ["SOBBH_GEOM_CACHE"] = "0"
+        xp = _CountingXp()
+        comp = _bare_comp(xp)
+        comp._geometry_kernel_args()
+        comp._geometry_kernel_args()
+        self.assertEqual(
+            xp.asarray_calls, 10,
+            "SOBBH_GEOM_CACHE=0 must re-assert the geometry per call",
+        )
+
+    def test_disabled_stores_nothing(self):
+        os.environ["SOBBH_GEOM_CACHE"] = "0"
+        comp = _bare_comp(_CountingXp())
+        comp._geometry_kernel_args()
+        self.assertEqual(getattr(comp, "_geom_args_by_device", {}), {})
+
+    def test_disabled_is_still_device_local(self):
+        """The escape must not reintroduce the cross-device hand-off."""
+        os.environ["SOBBH_GEOM_CACHE"] = "0"
+        xp = DeviceTrackingXp()
+        comp = _home_device_comp(_GeometryOnlyComp, xp, home=0)
+        with xp.cuda.Device(1):
+            args = comp._geometry_kernel_args()
+        for arr in args:
+            self.assertEqual(device_of(arr), 1)
 
 
 if __name__ == "__main__":

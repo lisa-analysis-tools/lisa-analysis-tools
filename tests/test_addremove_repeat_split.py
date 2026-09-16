@@ -20,6 +20,7 @@ full-ensemble block, i.e. ONE scoring call per repeat.
 
 from __future__ import annotations
 
+import os
 import unittest
 
 import numpy as np
@@ -131,6 +132,57 @@ class EigenSplitTableAcceptsFullBlockTest(unittest.TestCase):
             tuple(np.shape(ax)), (ntemps, nwalkers, 1, ndim, ndim)
         )
         self.assertEqual(tuple(np.shape(sg)), (ntemps, nwalkers, 1, ndim))
+
+
+class SingleCallEnvEscapeTest(unittest.TestCase):
+    """``SOBBH_SINGLE_CALL=0`` restores the red/blue half-call structure.
+
+    A cluster-side bisect lever for the 2026-09-16 null-run crash: it puts
+    the pre-483953fa two-calls-per-repeat partition back for MH inner moves
+    without a revert, so a batch-size-dependent fault can be ruled in or out
+    against otherwise identical code.
+    """
+
+    def setUp(self):
+        self._prev = os.environ.get("SOBBH_SINGLE_CALL")
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop("SOBBH_SINGLE_CALL", None)
+        else:
+            os.environ["SOBBH_SINGLE_CALL"] = self._prev
+
+    def test_default_is_one_full_block(self):
+        os.environ.pop("SOBBH_SINGLE_CALL", None)
+        inst = _bare_move(ntemps=4, nwalkers=6)
+        masks = inst._repeat_split_masks(EigenAxisMove())
+        self.assertEqual(len(masks), 1)
+        self.assertTrue(masks[0].all())
+
+    def test_disabled_restores_the_halves_for_mh(self):
+        os.environ["SOBBH_SINGLE_CALL"] = "0"
+        inst = _bare_move(ntemps=4, nwalkers=6)
+        masks = inst._repeat_split_masks(EigenAxisMove())
+        self.assertEqual(
+            len(masks), inst.nsplits,
+            "SOBBH_SINGLE_CALL=0 must score the ensemble in nsplits calls",
+        )
+        total = np.zeros((4, 6), dtype=int)
+        for m in masks:
+            total += m.astype(int)
+        np.testing.assert_array_equal(total, np.ones((4, 6), dtype=int))
+
+    def test_disabled_leaves_stretch_alone(self):
+        os.environ["SOBBH_SINGLE_CALL"] = "0"
+        inst = _bare_move(ntemps=4, nwalkers=6)
+        self.assertEqual(
+            len(inst._repeat_split_masks(StretchMove())), inst.nsplits
+        )
+
+    def test_explicit_one_is_the_default(self):
+        os.environ["SOBBH_SINGLE_CALL"] = "1"
+        inst = _bare_move(ntemps=4, nwalkers=6)
+        self.assertEqual(len(inst._repeat_split_masks(EigenAxisMove())), 1)
 
 
 if __name__ == "__main__":

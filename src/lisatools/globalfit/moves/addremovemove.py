@@ -1566,8 +1566,16 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         (job 508: 2 calls/repeat at ~54 rows each, cost dominated by the
         row-independent part of the call). One full-ensemble mask = one
         call per repeat, the identical Markov kernel.
+
+        ESCAPE (2026-09-16): ``SOBBH_SINGLE_CALL=0`` forces the red/blue
+        halves back on for EVERY inner move, restoring the pre-483953fa
+        two-calls-per-repeat structure without a revert. It exists so the
+        cluster can bisect batch-size effects (a full ensemble is ~120-129
+        rows against the old ~60) against a suspected kernel-side fault.
+        Default ``1`` = the single full-ensemble call.
         """
-        if isinstance(move_here, StretchMove):
+        if (isinstance(move_here, StretchMove)
+                or os.environ.get("SOBBH_SINGLE_CALL", "1").strip() != "1"):
             inds = self.get_split_inds()
             return [inds == split for split in range(self.nsplits)]
         return [np.ones((self.ntemps, self.nwalkers), dtype=bool)]

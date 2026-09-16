@@ -106,10 +106,28 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
 
         # the *_wdm kernels are single-shard by contract (they consume
         # linear_data_arr[0]); multi-shard (multi-GPU walker-shard) ACAs
-        # are served by per-split routing in compute_like (gbbands
-        # _ShardHolderView + partition, each split under its own device
-        # context — the comp re-asserts its geometry arrays per call so
-        # they land on the current device)
+        # are served by per-split routing in compute_like and in the
+        # cold-chain fill (gbbands _ShardHolderView + partition, each split
+        # under its own device context).
+        #
+        # DEVICE DISCIPLINE (2026-09-16). Unlike the GB router, which builds
+        # a per-device comp REPLICA (_RoutedBandEngine._comp_for ->
+        # _device_local_gb_comp, guarded by _assert_comp_device), this move
+        # drives ONE SHARED comp under both devices' contexts. Everything it
+        # hands a kernel out of ``self`` is therefore a home-device pointer
+        # unless something relocates it:
+        #   * the five chunk-geometry / WDM-window arrays now go through
+        #     WDMComputationsBase._geometry_kernel_args() on EVERY kernel
+        #     path (scoring, fill, swap, grads, fstat) — that is the fix for
+        #     the null run's illegal access in wdm_het_fill_global_kernel,
+        #     which was fed device-0 geometry from a device-1 launch.
+        #   * STILL HOME-DEVICE, not yet addressed: self.comp.cpp_orbits /
+        #     cpp_tdi_config / cpp_wdm_settings. The C++ impl memcpy's those
+        #     host structs to the caller's device per call, but their
+        #     POINTER FIELDS (e.g. the orbit spline arrays) still address the
+        #     comp's home device. If a cross-device fault survives this fix,
+        #     that is the next suspect — the durable answer is a per-device
+        #     comp replica here, as GB already does.
         self._n_shards = len(self.acs.linear_data_arr)
 
         # in-band carrier window from the comp's WDM settings: proposals

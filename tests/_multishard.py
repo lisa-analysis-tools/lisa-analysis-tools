@@ -164,6 +164,110 @@ class StreamRecordingXp(RecordingXp):
             return self._seq
 
 
+class _FakeDevice:
+    """cupy-like ``ndarray.device`` -- carries the ``.id`` readers look for."""
+
+    __slots__ = ("id",)
+
+    def __init__(self, dev_id):
+        self.id = int(dev_id)
+
+    def __eq__(self, other):
+        return isinstance(other, _FakeDevice) and other.id == self.id
+
+    def __hash__(self):
+        return hash(self.id)
+
+    def __repr__(self):
+        return f"<FakeDevice {self.id}>"
+
+
+class DeviceArray(np.ndarray):
+    """NumPy array stamped with the device it was ALLOCATED on.
+
+    ``.device`` is overridden as a subclass property so it shadows numpy
+    >= 2's own ``ndarray.device`` (which reports the string ``"cpu"``) and
+    presents the cupy shape -- an object with ``.id`` -- that
+    ``lisatools.utils.device.to_current_device`` reads.
+    """
+
+    _dev_id = None
+
+    @property
+    def device(self):
+        return None if self._dev_id is None else _FakeDevice(self._dev_id)
+
+    def __array_finalize__(self, obj):
+        if obj is None:
+            return
+        self._dev_id = getattr(obj, "_dev_id", None)
+
+
+def stamp_device(arr, dev_id):
+    """View ``arr`` as a :class:`DeviceArray` resident on ``dev_id``."""
+    out = np.asarray(arr).view(DeviceArray)
+    out._dev_id = None if dev_id is None else int(dev_id)
+    return out
+
+
+def device_of(arr):
+    """The device ``arr`` was allocated on (``None`` for host arrays)."""
+    return getattr(arr, "_dev_id", None)
+
+
+class DeviceTrackingXp(RecordingXp):
+    """RecordingXp whose allocations carry device residency.
+
+    Models the ONE cupy behaviour the multi-GPU contract turns on:
+    ``xp.asarray`` allocates on the CURRENT device when handed HOST data,
+    but handed an array that already lives on ANOTHER device it is **not** a
+    relocation. That is precisely why LAT carries
+    :func:`lisatools.utils.device.to_current_device` -- a host round trip
+    that needs no peer access -- instead of calling ``asarray`` and hoping
+    (``src/lisatools/utils/device.py:76``, whose docstring records that a
+    same-device op against a foreign-device array raises "device where the
+    array resides differs from the current device", and that P2P is
+    unavailable between GPUs on some nodes).
+
+    Any kernel argument that reaches a launch still stamped with a foreign
+    device is the cross-device pointer hand-off that surfaces on the cluster
+    as ``GPUassert: an illegal memory access was encountered``. Tests assert
+    residency with :func:`device_of`.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.asarray_calls = 0
+
+    # --- allocation surface (everything else falls through to numpy) ---
+    def asarray(self, a, dtype=None):
+        self.asarray_calls += 1
+        if device_of(a) is not None:
+            same_dtype = dtype is None or np.dtype(dtype) == np.asarray(a).dtype
+            if same_dtype:
+                # Already device-resident. cupy does NOT move it here, so
+                # neither do we -- the foreign stamp survives to the launch.
+                return a
+        return stamp_device(np.asarray(a, dtype=dtype), self.current_device)
+
+    def asnumpy(self, a):
+        """Device -> host pull (drops the stamp, like ``cupy.asnumpy``)."""
+        return np.asarray(a).view(np.ndarray).copy()
+
+    def zeros(self, *args, **kwargs):
+        return stamp_device(np.zeros(*args, **kwargs), self.current_device)
+
+    def ones(self, *args, **kwargs):
+        return stamp_device(np.ones(*args, **kwargs), self.current_device)
+
+    def ascontiguousarray(self, a, dtype=None):
+        if device_of(a) is not None and (
+                dtype is None or np.dtype(dtype) == np.asarray(a).dtype):
+            return a
+        return stamp_device(
+            np.ascontiguousarray(a, dtype=dtype), self.current_device)
+
+
 class FakeDeviceComp:
     """Duck-typed GB comp recording the device it was constructed on.
 
