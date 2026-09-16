@@ -208,12 +208,25 @@ def _fanout_unready_moves(moves):
 
     ``unready``: ``GlobalFitMove`` leaves whose class still has the default
     ``gf_serve`` (they must be ported before running with several compute
-    ranks). ``head_only``: every leaf that runs on the head against its walker
-    block ONLY -- leaves that are not ``GlobalFitMove`` at all (plain eryn
-    moves), ``FunctionMove`` (its ``fn`` runs on the head's block by design)
+    ranks). ``head_only``: every leaf that runs on the HEAD ALONE -- leaves
+    that are not ``GlobalFitMove`` at all (plain eryn moves), ``FunctionMove``
     and anything that opts in via ``gf_head_only``. They are named in the
     warning rather than silently skipped: "head-only" is a real semantic
     change under multi-rank and the operator has to see which moves take it.
+
+    "Head-only" means two DIFFERENT things, and the difference matters:
+
+    * a ``FunctionMove``'s ``fn`` reads the head's ACA, which under the
+      walker-block layout holds this rank's B rows only -- so it really does
+      act on the head's walker block alone;
+    * a plain eryn move gets the head's ``GFState``, which is the FULL
+      ensemble (all N walkers). A zero-likelihood eryn move such as
+      ``gb_ridge_gibbs`` / ``vgb_ridge_gibbs`` therefore acts on EVERY
+      walker's coords and never touches an ACA at all.
+
+    The one real caveat is the combination: a plain eryn move that DID call
+    the likelihood would score all N walkers against the head's B-row ACA, so
+    such a move must be ported to the fan-out before it is used here.
 
     The addremove (MBH/EMRI/SOBBH) and PSD (psd/galfor/sgwb) families are
     served through ``moves.walkerfanout.WalkerFanoutMixin`` since Plan 3;
@@ -2490,9 +2503,14 @@ class GlobalFit:
                 )
             if head_only:
                 self.logger.warning(
-                    "multi-rank run: these moves are head-only (plain eryn moves, "
-                    "FunctionMoves, gf_head_only) and run on the HEAD against its "
-                    "walker block only: %s",
+                    "multi-rank run: these moves run on the HEAD ALONE (plain eryn "
+                    "moves, FunctionMoves, gf_head_only): %s. A FunctionMove's fn "
+                    "sees the head's walker-block ACA; a plain eryn move instead "
+                    "gets the FULL ensemble state and no ACA at all, so a "
+                    "zero-likelihood move (gb_ridge_gibbs, vgb_ridge_gibbs) acts on "
+                    "every walker's coords -- but one that DID call the likelihood "
+                    "would score all walkers against the head's block and must be "
+                    "ported to the fan-out before use.",
                     head_only,
                 )
         return acs, like_mix

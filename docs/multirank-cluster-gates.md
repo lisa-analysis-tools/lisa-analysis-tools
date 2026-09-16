@@ -190,6 +190,15 @@ explicitly — if it does, pin it to the same value for all three launches.
   initial state) — not for a per-iteration diff against the three layouts,
   and this doc makes no claim about `-n 1` run-to-run reproducibility either
   way.
+  **Dead slots (fix round 4, 2026-09-16):** the `coords` hash — here and in
+  `gf_state_digest.py` — now covers each rank's rejected-birth FILL in dead
+  leaf slots, because `gb_finish` ships the block's whole branch and the head
+  writes it. Nothing reads those values (`inds` is `False` there), and they
+  are identical across the three prescribed layouts because
+  `derive_rank_seed` depends only on `(base_seed, n_compute, fanout_rank)`,
+  which those three share. So a hash mismatch confined to dead slots is not a
+  port bug: compare `coords[inds]` first when a hash differs, and only treat
+  it as a defect if the ALIVE leaves disagree.
 - `python scripts/diagnostics/gf_state_digest.py <store.h5>` — a digest
   over `backend.get_last_sample()` covering the full saved `GFState`
   (coords, inds, log_like, betas, and every sub-state array; design spec
@@ -271,7 +280,12 @@ healthy load-balanced layout has `max_rank_s` close to `head_s` and
 `max_rank_s` well above `head_s` points at an unbalanced walker block or a
 slow node. Cross-check against `route_dispatch` in `[GB_TIMING]`, which
 should drop to ~0 per rank once fan-out is live (the router no longer has
-cross-device work to route within a rank).
+cross-device work to route within a rank). Also weigh the `gb_finish` reply:
+since fix round 4 it carries the block's whole GB branch,
+`ntemps x B x nleaves_max x ndim` float64 plus an `ntemps x B x nleaves_max`
+bool, per rank per propose (search-mode `nleaves_max` is what makes this
+grow). If that shows in the head/route budget, the narrowing is flagged as a
+`TODO(multi-rank, WP7)` at the reply construction in `gbspecialstretch.py`.
 
 **`slice_state` payload size.** `communication/walkerslice.py::slice_state`
 ships every main branch's `coords`/`inds` unconditionally in every payload,

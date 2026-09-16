@@ -5001,11 +5001,45 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     # run is reproducible from the rank layout rather than from entropy.
     _rank_rng_seed = None
 
+    # Per-RUN seed base for the move's OWN Generator streams, stamped on
+    # every GB/VGB move the recipe builds (``recipe.py::
+    # _stamp_temper_seed_base``, domain-separated off
+    # ``general_info.random_seed``). ``None`` = the run set no
+    # ``random_seed``, so the streams stay on OS entropy exactly as they
+    # were. It is what makes the SINGLE-rank derivation identical in
+    # ``_propose_legacy`` and in the orchestrator (fix round 5).
+    gf_temper_seed_base = None
+
     @staticmethod
     def _make_temper_rng(move):
-        """The vertical-swap ``Generator``: rank-seeded, or today's entropy."""
+        """The vertical-swap ``Generator``: ONE derivation, both bodies.
+
+        Three cases, in order, and the ordering is the contract:
+
+        1. ``_rank_rng_seed`` set -- a MULTI-rank compute rank. The head
+           ships one derived seed per rank per propose
+           (``derive_rank_seed(...) + 1000003 * num_proposals``); unchanged.
+        2. ``gf_temper_seed_base`` set -- every other caller: a single-rank
+           run through ``_propose_legacy`` AND the orchestrator at one
+           compute rank, which stamps ``_rank_rng_seed = None`` precisely so
+           it lands HERE. ``SeedSequence([base, num_proposals])`` gives a
+           fresh stream per propose, the way the rank path does.
+        3. neither -- ``random_seed`` is unset for the run: today's entropy.
+
+        Before fix round 5 the orchestrator always took (1) while the legacy
+        body always took (3), so the two bodies drew DIFFERENT vertical-swap
+        streams at one rank and the legacy side was not even reproducible
+        against itself there.
+        """
         seed = getattr(move, "_rank_rng_seed", None)
-        return np.random.default_rng() if seed is None else np.random.default_rng(int(seed))
+        if seed is not None:
+            return np.random.default_rng(int(seed))
+        base = getattr(move, "gf_temper_seed_base", None)
+        if base is None:
+            return np.random.default_rng()
+        return np.random.default_rng(
+            np.random.SeedSequence([int(base), int(getattr(move, "num_proposals", 0))])
+        )
 
     @property
     def _buffer_cache_scope(self):
@@ -17213,6 +17247,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         the SEED CHANGES, so one propose's three commands share one stream
         instead of replaying an identical one three times.
 
+        At ONE compute rank the head ships ``rank_seed=None``, so
+        ``_rank_rng_seed`` is stamped ``None`` here and
+        :meth:`_make_temper_rng` falls through to the SAME
+        ``gf_temper_seed_base`` derivation ``_propose_legacy`` takes (fix
+        round 5). ``None`` also never differs from the ``None`` a fresh move
+        holds, so the Generator is not dropped between the three commands.
+
         ``clock_vals`` defaults, for a head that ships a partial dict:
         ``reseed_firing`` reads as ``False`` (NOT "keep the current value"),
         a missing ``branch_propose_count`` leaves the class census alone,
@@ -17419,7 +17460,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         writes a new one -- so the last flushed ``(epoch, dir)`` is
         remembered and a repeat returns immediately. Without that the head
         re-``fsync``s three already-synced files on a shared filesystem and
-        emits an ``[FSTAT_EPOCH]`` line on every iteration.
+        emits an ``[FSTAT_EPOCH]`` line on every iteration. The memo is
+        recorded only when EVERY expected artifact of the epoch was synced,
+        so a pass that raced the ``setup()`` still writing them retries on
+        the next propose instead of suppressing them for good.
 
         No-op off the F-stat grid moves (no ``_epoch_dir``) and when the head
         installed no epoch. Never fatal on its own: a missing artifact is the
@@ -17441,6 +17485,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             GRID_BASENAME.replace(".npz", "_peaks_stacked.npz"),
             CENTER_TABLE_BASENAME,
         )
+        # EXPECTED set: what a COMPLETE epoch must carry, and so the condition
+        # the memo is judged against below (the sync loop itself is unchanged
+        # -- it still fsyncs every one of ``names`` that exists). The centre
+        # table counts only when this head actually has one, the same
+        # head-side answer the rank directive's ``ctr_table`` flag carries.
+        _ctr = getattr(self, "_fstat_ctr_table_active", None)
+        expected = set(names[:2])
+        if callable(_ctr) and _ctr() is not None:
+            expected.add(CENTER_TABLE_BASENAME)
         flushed = []
         for name in names:
             path = os.path.join(d, name)
@@ -17459,11 +17512,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     "(%r); the ranks' completeness check is the backstop",
                     self.name, int(k), path, exc,
                 )
-        if flushed:
-            # memo AFTER the pass, and only when something was really synced:
-            # recording it up front would let a first call that found NOTHING
-            # (a flush racing ahead of the ``setup()`` that writes the epoch)
-            # permanently suppress the real flush of that epoch on this move.
+        if expected.issubset(flushed):
+            # memo AFTER the pass, and only when EVERY expected artifact was
+            # found and synced. Recording it up front -- or on a PARTIAL pass
+            # (fix round 5) -- would let a flush racing ahead of the
+            # ``setup()`` that writes the epoch permanently suppress the real
+            # flush of the artifacts that were still being written, on this
+            # move, for the whole epoch. An incomplete pass leaves the memo
+            # unset so the next propose retries.
             self._epoch_flushed = (int(k), d)
         logger.info(
             "[FSTAT_EPOCH %s] head flushed epoch %d for the ranks: %s in %s",
@@ -17920,6 +17976,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # ``ntemps x B x nleaves_max x ndim`` float64 per rank per propose
             # (a few MB at production shapes, against a propose measured in
             # tens of seconds).
+            # TODO(multi-rank, WP7): narrow to keep_all_inds sessions if the
+            # [GB_TIMING] head/route budget shows it -- an alive-only session
+            # cannot have mutated the dead slots, so it could ship the alive
+            # leaves alone. ``nleaves_max`` is exactly what search-mode runs
+            # push hard and this rides an MPI pickle.
             block_coords = np.array(_to_numpy(work.coords), copy=True)
             block_inds = np.array(_to_numpy(work.inds), copy=True)
             sub = new_part.sub_states[self.branch_name]
@@ -18580,9 +18641,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 "tables": tables,
                 # distinct per rank AND per propose: a constant seed would
                 # restart every rank's _temper_rng on the same stream every
-                # iteration
-                "rank_seed": int(derive_rank_seed(_seed_base, layout, rank))
-                + 1000003 * int(self.num_proposals),
+                # iteration.
+                #
+                # ``None`` AT ONE COMPUTE RANK (fix round 5). There is no
+                # rank to separate from there, and stamping a derived seed
+                # made ``_make_temper_rng`` take a different branch than the
+                # one ``_propose_legacy`` takes in the same configuration --
+                # a live legacy-vs-orchestrator divergence on every run with
+                # ``temper_vertical`` on. ``None`` falls the rank body
+                # through to the SHARED ``gf_temper_seed_base`` derivation.
+                "rank_seed": (
+                    None if layout.is_single()
+                    else int(derive_rank_seed(_seed_base, layout, rank))
+                    + 1000003 * int(self.num_proposals)
+                ),
             }
 
         # ---- command 1: gb_run_proposal (opens the session) ---------------

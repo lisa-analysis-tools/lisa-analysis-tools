@@ -58,7 +58,32 @@ separate ``d_h``/``h_h`` probe; ``log_like`` is the likelihood-side check.
 legacy-vs-LEGACY pair FIRST -- an invariance claim without a paired negative
 control proves nothing, and a red control means "this fixture does not
 reproduce", never "the orchestrator diverges". ``GB_SMOKE_PARITY_CONTROL=0``
-skips it (one child fewer).
+skips it (one child fewer). The control is asserted with a PLAIN loop, not
+``subTest``: a red control must short-circuit, or the orchestrator arm still
+runs and its meaningless comparison is reported beside it.
+
+Every arm also ASSERTS that the ``lisatools`` it imported lives under this
+worktree's ``src`` (and so does the parent, in ``setUpClass``, before anything
+is spawned) -- printing the path was not enough, see
+:func:`_worktree_import_problem`.
+
+WHAT THIS GATE DOES **NOT** COVER: THE TEMPERING DRAWS (2026-09-16, round 5)
+---------------------------------------------------------------------------
+``GBSpecialBase._temper_rng`` -- the Generator whose single-rank derivation
+fix round 5 unified between ``_propose_legacy`` and the orchestrator
+(``gf_temper_seed_base``) -- has exactly one consumer: the per-repeat VERTICAL
+band-temperature swap, off by default and armed with ``GB_TEMPER_VERTICAL=1``.
+Arming it here was measured and rejected: one legacy arm went 59.8 s -> 63-67 s
+(~10%), the census ran over 5 in-model blocks, and **0 of 1600 rows ever had a
+vertical partner** -- at 4 walkers, 2 temperatures and ~11 alive leaves no
+(walker, band) cell is ever co-resident at two adjacent rungs, so no swap is
+proposed, ``_temper_rng.random`` is never called and the compared arrays carry
+no draw from it. So the knob is NOT in ``SMOKE_ENV``; the stream is covered by
+the unit tests (``tests/test_gb_rank_session.py::MakeTemperRngTest``) and, at
+production scale, by the cluster gate in ``docs/multirank-cluster-gates.md``.
+Each arm still reports what the sweep did (``_VertCounter`` -> the
+``vert_*`` npz keys and the child's ``[gbsmoke-arm]`` line), so the number
+above is re-measurable by setting ``GB_TEMPER_VERTICAL=1`` in the shell.
 
 WHAT THIS GATE CAUGHT, AND THE FIX (2026-09-16)
 -----------------------------------------------
@@ -106,7 +131,9 @@ nor cheap here.
 
 import argparse
 import gc
+import logging
 import os
+import re
 import resource
 import shutil
 import subprocess
@@ -136,9 +163,19 @@ RSS_BUDGET_GB = 5.0
 #: the exact set each arm's child writes into its npz
 PARITY_KEYS = ("log_like", "coords", "inds", "band_temps", "band_num_binaries")
 
+#: also written to the npz, NOT compared: the vertical-swap coverage counters
+#: (see :class:`_VertCounter`). They exist to prove the fixture reaches the
+#: ``_temper_rng`` draws at all, not to be part of the parity claim.
+COVERAGE_KEYS = ("vert_proposed", "vert_blocks")
+
 #: repo root: the child is started as ``python -m tests.test_multirank_gb_smoke``
 #: with this as its cwd, so ``tests`` imports from the worktree under test
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+#: the ``lisatools`` package THIS module's worktree owns. Derived from the test
+#: file's own location, never from an env var, because it is exactly the env
+#: that can be wrong (see :func:`_worktree_import_problem`).
+SRC_ROOT = os.path.join(REPO_ROOT, "src")
 
 #: prefix the child prints its identity/measurement lines with; the parent
 #: echoes exactly those lines into the test log (the child's full log lives in
@@ -190,7 +227,77 @@ SMOKE_ENV = {
     # the debug INSTRUMENTATION (residual round-trip checks, band plots under
     # GB_DEBUG_DIR) off -- it is expensive and writes to the cwd
     "GB_DEBUG": "0",
+    # NOT set here: ``GB_TEMPER_VERTICAL``. See the coverage note in the
+    # module docstring -- arming it costs ~10% wall and still fires no swap
+    # at this fixture size, so it buys the gate nothing. It stays tunable
+    # from a shell (this map is applied with ``setdefault``) and the arms
+    # report what the sweep did either way (``_VertCounter``).
 }
+
+
+class _VertCounter(logging.Handler):
+    """Count vertical-swap proposals off the block-end ``[GB_VERT]`` census.
+
+    The census is an INFO record on the ``lisatools`` logger, whose level
+    ``globalfit.loginfo.init_logger`` sets to DEBUG during ``fit.build()``
+    while leaving its managed console handler at WARNING -- so attaching this
+    handler reads the line and adds no output. Counting records beats reading
+    the run's log file: no path guessing, and it works whatever the run's
+    verbosity knob does.
+    """
+
+    _PAT = re.compile(
+        r"\[GB_VERT[^\]]*\].*\((\d+)/(\d+) rows had a partner.*"
+        r"proposed (\d+) accepted (\d+)")
+
+    def __init__(self):
+        super().__init__(level=logging.INFO)
+        self.blocks = 0
+        self.rows = 0
+        self.paired = 0
+        self.proposed = 0
+        self.accepted = 0
+
+    def emit(self, record):  # pragma: no cover - exercised only in the arms
+        try:
+            match = self._PAT.search(record.getMessage())
+        except Exception:
+            return
+        if match is None:
+            return
+        self.blocks += 1
+        self.paired += int(match.group(1))
+        self.rows += int(match.group(2))
+        self.proposed += int(match.group(3))
+        self.accepted += int(match.group(4))
+
+
+def _worktree_import_problem():
+    """``None`` when ``lisatools`` came from THIS worktree, else the message.
+
+    The three parity arms compare an orchestrator against a legacy body, and
+    that only means anything if both are the ones in the tree under test.
+    Printing the path was not enough: this repo has a documented mechanism
+    that silently defeats it -- the deving env installs lisaanalysistools
+    editable through scikit-build-core, whose redirecting finder hard-maps
+    every ``lisatools.*`` module to the MAIN working tree, and a meta-path
+    finder beats ``sys.path``, so ``PYTHONPATH`` alone cannot shadow it. Run
+    without ``.wtenv/wt_run.sh`` (which exports ``LAT_WORKTREE_SRC`` and the
+    ``sitecustomize.py`` that undoes the redirect) and both the parent and
+    every child import the main checkout, compare it against itself and
+    report GREEN for a tree that need not contain the change at all.
+    """
+    import lisatools
+
+    got = os.path.realpath(lisatools.__file__)
+    root = os.path.realpath(SRC_ROOT)
+    if got.startswith(root + os.sep):
+        return None
+    return (f"imported {got}, expected under {root} -- run this module through "
+            "`.wtenv/wt_run.sh $PWD/src <log> python -m unittest ...` so the "
+            "worktree's lisatools wins over the editable install's redirecting "
+            "finder; the arms would otherwise compare the MAIN checkout "
+            "against itself")
 
 
 def _rss_gb(who=resource.RUSAGE_SELF):
@@ -313,29 +420,52 @@ def _arm_main(args):
 
     import lisatools
 
+    problem = _worktree_import_problem()
+    if problem is not None:
+        # the parent fails the arm on any non-zero return code and dumps this
+        # child's log tail, so the reason lands in the test output
+        raise SystemExit(f"{MARKER} child {args.arm}: {problem}")
     print(f"{MARKER} child {args.arm}: lisatools={lisatools.__file__} "
           f"orchestrate={args.orchestrate} inject={args.inject}", flush=True)
+    counter = _VertCounter()
+    logging.getLogger("lisatools").addHandler(counter)
     started = time.time()
     probe = _world_probe(1, os.path.join(args.store, args.arm), args.inject == "1")[0]
-    np.savez(args.out, **{key: probe[key] for key in PARITY_KEYS})
+    probe["vert_proposed"] = np.int64(counter.proposed)
+    probe["vert_blocks"] = np.int64(counter.blocks)
+    np.savez(args.out, **{key: probe[key] for key in PARITY_KEYS + COVERAGE_KEYS})
     print(f"{MARKER} child {args.arm}: alive leaves={int(np.asarray(probe['inds']).sum())} "
+          f"vert_swaps proposed={counter.proposed} accepted={counter.accepted} "
+          f"(pairs {counter.paired}/{counter.rows} rows over {counter.blocks} block(s)) "
           f"wall={time.time() - started:.1f}s peak_rss={_rss_gb():.2f}GB", flush=True)
 
 
 @unittest.skipUnless(RUN, "set RUN_GF_GB_SMOKE=1 to run the multi-rank GB smoke")
 class MultiRankGBSmokeTest(unittest.TestCase):
 
+    @classmethod
+    def setUpClass(cls):
+        # BEFORE anything is built or spawned: a run that is importing the
+        # wrong tree must fail here, not produce a green comparison of the
+        # main checkout against itself (the children inherit this env)
+        problem = _worktree_import_problem()
+        if problem is not None:
+            raise AssertionError(f"tests.test_multirank_gb_smoke parent {problem}")
+
     def setUp(self):
         self._env0 = dict(os.environ)
         for key, value in SMOKE_ENV.items():
             os.environ.setdefault(key, value)
         self.tmpdir = tempfile.mkdtemp(prefix="gf_multirank_gb_")
-        # the per-branch setup logs ignore file_store_dir and land in the cwd;
-        # remember whether those directories were already there so tearDown only
-        # removes ones THIS test created (the arm children share this cwd)
+        # the per-branch setup logs ignore file_store_dir and land in the
+        # process's cwd; remember whether those directories were already there
+        # so tearDown only removes ones THIS test created. Keyed on REPO_ROOT,
+        # not ``os.getcwd()``: the arm children are spawned with
+        # ``cwd=REPO_ROOT``, so that is where their strays land however the
+        # parent was launched.
         self._strays = []
         for name in ("gf_output_gb_no_fg", "gf_output"):
-            path = os.path.join(os.getcwd(), name)
+            path = os.path.join(REPO_ROOT, name)
             self._strays.append((path, os.path.isdir(path)))
 
     def tearDown(self):
@@ -401,15 +531,21 @@ class MultiRankGBSmokeTest(unittest.TestCase):
         for line in log.splitlines():
             if MARKER in line:
                 print(line, flush=True)
+        # ``ru_maxrss`` over RUSAGE_CHILDREN is the max over ALL reaped
+        # children, so it never decreases: this is the running high-water mark
+        # of the arms so far, NOT this arm's own peak. The per-arm truth is the
+        # child's own ``peak_rss=`` line, echoed just above.
         print(f"{MARKER} parent {subdir}: rc={returncode} wall={time.time() - started:.1f}s "
-              f"children_peak_rss={_rss_gb(resource.RUSAGE_CHILDREN):.2f}GB", flush=True)
+              f"children_peak_rss_max={_rss_gb(resource.RUSAGE_CHILDREN):.2f}GB", flush=True)
         if timed_out or returncode != 0:
+            # the child ran with stderr merged into this log, so the tail
+            # carries its traceback / SystemExit message verbatim
             tail = "\n".join(log.splitlines()[-40:])
             self.fail(f"parity arm {subdir!r} "
                       + ("TIMED OUT" if timed_out else f"failed (rc={returncode})")
-                      + f"; child log tail:\n{tail}")
+                      + f"; child log tail (stdout+stderr):\n{tail}")
         with np.load(out_npz) as data:
-            return {key: data[key] for key in PARITY_KEYS}
+            return {key: data[key] for key in PARITY_KEYS + COVERAGE_KEYS}
 
     def test_two_compute_ranks_run_the_gb_moves(self):
         out = self._run_world(2, inject=True)
@@ -448,19 +584,25 @@ class MultiRankGBSmokeTest(unittest.TestCase):
             # comparison rather than after it.
             ctl = self._run_arm_subprocess("control", orchestrate=False, inject=True)
             signature = _parity_signature(ctl, legacy, legacy["inds"])
+            # a PLAIN loop, not subTest: a red control must SHORT-CIRCUIT, or
+            # the ~60 s orchestrator arm still runs and its (meaningless)
+            # comparison is reported beside the control's failure as if the two
+            # were independent findings
             for key in PARITY_KEYS:
-                with self.subTest(arm="control", key=key):
-                    np.testing.assert_array_equal(
-                        ctl[key], legacy[key],
-                        err_msg=f"CONTROL legacy-vs-legacy differs in {key}: the fixture is "
-                                "non-reproducible here, so the orchestrator comparison "
-                                f"would prove nothing.\n    signature:\n{signature}")
+                if not np.array_equal(ctl[key], legacy[key]):
+                    self.fail(
+                        f"CONTROL legacy-vs-legacy differs in {key}: the fixture is "
+                        "non-reproducible here, so the orchestrator comparison would "
+                        f"prove nothing (not run).\n    signature:\n{signature}")
         orch = self._run_arm_subprocess("orch", orchestrate=True, inject=True)
         # the gate only means something if the run really birthed sources: an
         # empty model never reaches the block merge or the write-back
         self.assertGreater(int(legacy["inds"].sum()), 0,
                            "no GB leaf survived the legacy arm: the parity gate would cover "
                            "only the neutral/early-return branches")
+        # NOT asserted: a fired vertical swap. ``_temper_rng``'s draws stay
+        # outside this gate at laptop scale -- see the coverage note in the
+        # module docstring; the arms print what the sweep did.
         # every key is compared (subTest) rather than stopping at the first:
         # which arrays survive is the whole diagnosis -- identical ``inds`` +
         # ``band_num_binaries`` with differing ``coords`` means "same decisions,

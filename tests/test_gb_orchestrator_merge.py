@@ -88,7 +88,10 @@ def _stub_gf_serve(move, op, payload, clock, model):
     assert set(payload["tables"]) == {
         "cap_leaf_cap", "band_leaf_cap", "rj_band_shutoff"}
     assert "keep_all_inds" in payload
-    assert isinstance(payload["rank_seed"], int)
+    # an int per rank per propose under SEVERAL compute ranks; ``None`` at ONE
+    # (fix round 5), which sends the rank body down the same
+    # ``gf_temper_seed_base`` derivation ``_propose_legacy`` takes
+    assert payload["rank_seed"] is None or isinstance(payload["rank_seed"], int)
     assert B == w1 - w0
 
     if op == "gb_run_proposal":
@@ -570,6 +573,11 @@ class GBOrchestratorMergeTest(unittest.TestCase):
             [p.get("session") for p in head.payloads[1:]], [(0, 1), (0, 1)])
         # the single block IS the whole ensemble
         self.assertEqual(head.payloads[0]["nwalkers"], NWALKERS)
+        # ...and NO rank seed is stamped there: ``_enter_rank_block`` then
+        # leaves ``_rank_rng_seed`` None and ``_make_temper_rng`` takes the
+        # same ``gf_temper_seed_base`` branch ``_propose_legacy`` takes, which
+        # is the only reason the two bodies draw one vertical-swap stream
+        self.assertEqual([p["rank_seed"] for p in head.payloads], [None] * 3)
         np.testing.assert_allclose(
             new_state.log_like[0], 300.0 + np.arange(NWALKERS))
 

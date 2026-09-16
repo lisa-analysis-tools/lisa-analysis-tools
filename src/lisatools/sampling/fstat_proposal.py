@@ -317,22 +317,28 @@ def _reseed_node(node, seed):
     """Reseed one child node when it owns a private ``Generator``.
 
     Nodes with no ``reseed`` are left alone ON PURPOSE: eryn's analytic
-    distributions (``UniformDistribution``, ...) and
-    :class:`~lisatools.sampling.prior.FullGaussianMixtureModel` draw from the
-    MODULE-level ``np.random`` state, which the run seeds per rank in
+    distributions (``UniformDistribution``, ...) draw from the MODULE-level
+    ``np.random`` state, which the run seeds per rank in
     ``run.py::_seed_rank_streams`` -- there is no per-object stream to set.
-    An eryn ``ProbDistContainer`` is recursed into by its ``priors_in``
-    mapping (insertion order, which is the container's construction order).
+
+    Anything exposing a ``priors_in`` MAPPING is recursed into first
+    (insertion order, which is the container's construction order): an eryn
+    ``ProbDistContainer``, and also
+    :class:`~lisatools.sampling.prior.FullGaussianMixtureModel`, whose
+    ``priors_in`` is a *property* forwarding to its ``base_prior`` -- so that
+    class is WALKED, not skipped. It is not in the GB RJ birth tree today, so
+    nothing in production depends on either reading.
 
     The skip is NOT unconditional: a node that owns a private ``_rng`` or
     carries a wrapped child (``base`` / ``components`` / ``grid4``) but
     defines no ``reseed`` raises :class:`TypeError` here, exactly as a bad
     ROOT does in :func:`reseed_birth_tree`. Without that a new wrapper
     inserted INSIDE the tree would leave its whole subtree on OS entropy with
-    no error anywhere -- the failure mode this helper exists to prevent.
-    None of the eryn analytic leaves or
-    :class:`~lisatools.sampling.prior.FullGaussianMixtureModel` define any of
-    those four attributes, so the legitimate skips are unaffected.
+    no error anywhere -- the failure mode this helper exists to prevent. None
+    of the eryn analytic leaves define any of those four attributes, and
+    ``FullGaussianMixtureModel`` returns through the ``priors_in`` branch
+    before the check is reached (its wrapped child is ``base_prior``, not
+    ``base``), so the legitimate skips are unaffected.
     """
     if node is None or seed is None:
         return

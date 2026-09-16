@@ -2507,6 +2507,37 @@ def ridge_gibbs_eligible(info) -> bool:
     return all(name in basis for name in McRatioDistFiber._REQUIRED)
 
 
+def _stamp_temper_seed_base(moves, random_seed):
+    """Give every GB/VGB move the run's temper-RNG seed base; return it.
+
+    ``GBSpecialBase._make_temper_rng`` seeds the vertical-swap ``Generator``
+    from the per-rank ``_rank_rng_seed`` on a MULTI-rank compute rank and
+    from THIS integer everywhere else -- a single-rank run through
+    ``_propose_legacy`` and the orchestrator at one compute rank alike, which
+    is what makes the two bodies draw the identical stream there (fix round
+    5; before it the legacy body ran on OS entropy and the orchestrator on a
+    derived seed).
+
+    Domain-separated off ``general_info.random_seed`` with a fixed tag so it
+    can never collide with the per-rank seeds ``derive_rank_seed`` spawns off
+    the same number. ``None`` when the run sets no seed: every stream stays
+    on today's entropy. No user/env knob -- the run seed is the only input.
+    """
+    base = None
+    if random_seed is not None:
+        base = int(
+            np.random.SeedSequence([int(random_seed), 0x7E4B])
+            .generate_state(1, dtype=np.uint32)[0]
+        )
+    for move in moves:
+        # GBSpecialBase declares the attribute; a plain eryn move in the same
+        # list (the ridge-gibbs fiber) has no Generator of its own and is
+        # deliberately left alone.
+        if hasattr(move, "gf_temper_seed_base"):
+            move.gf_temper_seed_base = base
+    return base
+
+
 def build_gb_moves(
     engine_info: Setup,
     curr: CurrentInfoGlobalFit,
@@ -3771,6 +3802,12 @@ def build_gb_moves(
                     "degeneracy).", _ridge.leaf_fraction
                     if hasattr(_ridge, "leaf_fraction") else "1.0")
 
+    # The vertical-swap Generator's seed base, on every move this builder
+    # returns (see :func:`_stamp_temper_seed_base`).
+    _stamp_temper_seed_base(
+        list(gb_search_moves) + list(gb_pe_moves), general_info.random_seed
+    )
+
     return gb_search_moves, gb_pe_moves
 
 def build_vgb_moves(
@@ -4115,6 +4152,9 @@ def build_vgb_moves(
             "6-column chirp basis (NOT resume-compatible with a 5-dim "
             "store).", input_basis,
         )
+
+    # Same temper-RNG seed base the GB twin stamps (fix round 5).
+    _stamp_temper_seed_base(vgb_moves, general_info.random_seed)
 
     return vgb_moves
 

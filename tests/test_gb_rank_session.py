@@ -300,6 +300,75 @@ class TemperRngSeedTest(unittest.TestCase):
         self._enter(None)
         self.assertIs(self.move._temper_rng, rng)
 
+    def test_one_compute_rank_stamps_none_and_falls_to_the_legacy_branch(self):
+        # the head ships ``rank_seed=None`` at ONE compute rank (fix round 5)
+        # so the rank body takes the SAME derivation ``_propose_legacy``
+        # takes: ``gf_temper_seed_base``, not a derived per-rank seed
+        self.move.gf_temper_seed_base = 99
+        saved = self._enter(None)
+        self.assertIsNone(self.move._rank_rng_seed)
+        rank_side = gbs.GBSpecialBase._make_temper_rng(self.move)
+        n_prop = int(self.move.num_proposals)   # the head's, not the move's
+        self.move._exit_rank_block(saved)
+        self.assertIsNone(self.move._rank_rng_seed)
+        # bit-identical to what ``_propose_legacy`` builds at the same propose
+        legacy_side = np.random.default_rng(np.random.SeedSequence([99, n_prop]))
+        np.testing.assert_array_equal(rank_side.random(5), legacy_side.random(5))
+
+
+class MakeTemperRngTest(unittest.TestCase):
+    """``_make_temper_rng``: ONE derivation shared by both propose bodies.
+
+    Rank seed wins; else the recipe-stamped ``gf_temper_seed_base`` keyed by
+    ``num_proposals``; else entropy. Before fix round 5 the orchestrator
+    always took branch 1 at one rank while ``_propose_legacy`` always took
+    branch 3, so the two bodies drew different vertical-swap streams.
+    """
+
+    @staticmethod
+    def _move(base=None, rank_seed=None, num_proposals=0):
+        move = make_move()
+        move.gf_temper_seed_base = base
+        move._rank_rng_seed = rank_seed
+        move.num_proposals = num_proposals
+        return move
+
+    def test_the_same_base_and_propose_count_give_the_same_stream(self):
+        a = gbs.GBSpecialBase._make_temper_rng(self._move(base=7, num_proposals=4))
+        b = gbs.GBSpecialBase._make_temper_rng(self._move(base=7, num_proposals=4))
+        np.testing.assert_array_equal(a.random(5), b.random(5))
+
+    def test_a_different_propose_count_gives_a_different_stream(self):
+        a = gbs.GBSpecialBase._make_temper_rng(self._move(base=7, num_proposals=4))
+        b = gbs.GBSpecialBase._make_temper_rng(self._move(base=7, num_proposals=5))
+        self.assertNotEqual(a.random(), b.random())
+
+    def test_a_different_base_gives_a_different_stream(self):
+        a = gbs.GBSpecialBase._make_temper_rng(self._move(base=7, num_proposals=4))
+        b = gbs.GBSpecialBase._make_temper_rng(self._move(base=8, num_proposals=4))
+        self.assertNotEqual(a.random(), b.random())
+
+    def test_both_seeds_none_is_entropy(self):
+        a = gbs.GBSpecialBase._make_temper_rng(self._move())
+        b = gbs.GBSpecialBase._make_temper_rng(self._move())
+        self.assertNotEqual(a.random(), b.random())
+
+    def test_the_rank_seed_wins_over_the_base(self):
+        a = gbs.GBSpecialBase._make_temper_rng(
+            self._move(base=7, rank_seed=123, num_proposals=4))
+        # same rank seed, DIFFERENT base and propose count: still one stream
+        b = gbs.GBSpecialBase._make_temper_rng(
+            self._move(base=8, rank_seed=123, num_proposals=9))
+        np.testing.assert_array_equal(a.random(5), b.random(5))
+        c = gbs.GBSpecialBase._make_temper_rng(self._move(rank_seed=123))
+        self.assertEqual(
+            np.random.default_rng(123).random(), c.random())
+
+    def test_the_class_default_is_none_so_an_unstamped_move_is_entropy(self):
+        # a move nobody stamped (a hand-built move, a test skeleton) must keep
+        # today's behaviour rather than silently share one fixed stream
+        self.assertIsNone(gbs.GBSpecialBase.gf_temper_seed_base)
+
 
 class _FakeLayout:
     """Just what ``install_walker_fanout``'s block check reads."""
@@ -605,42 +674,53 @@ class SetupFromDirectiveTest(unittest.TestCase):
 
 
 class FlushEpochArtifactsTest(unittest.TestCase):
-    """The head half of the completeness contract (review C1)."""
+    """The head half of the completeness contract (review C1).
+
+    The memo is judged against the EXPECTED set -- the manifest and the
+    stage-B peaks npz, plus the centre table when this move has a live one
+    (NEW-E4) -- while the sync loop still fsyncs every artifact that is
+    THERE. So these fixtures write ``peaks_npz=True`` wherever the epoch is
+    meant to read as complete.
+    """
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="gb_flush_")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def test_every_present_artifact_is_fsynced(self):
-        move = make_grid_move(root=make_epoch_dir(self.tmp, 3, ctr_npz=True))
+        move = make_grid_move(
+            root=make_epoch_dir(self.tmp, 3, ctr_npz=True, peaks_npz=True))
         synced = []
         with mock.patch.object(gbs.os, "fsync", synced.append):
             move._flush_epoch_artifacts(3)
-        # DONE.json + fstat_centers.npz (no stage-B npz in this fixture)
-        self.assertEqual(len(synced), 2)
+        # DONE.json + the stage-B npz + fstat_centers.npz -- the centre table
+        # is fsynced because it EXISTS, whether or not this move expects it
+        self.assertEqual(len(synced), 3)
 
     def test_the_second_flush_of_the_same_epoch_is_a_no_op(self):
         # the caller sits in the head's propose (every iteration) while an
         # epoch's bytes only change when setup() writes a new one
-        move = make_grid_move(root=make_epoch_dir(self.tmp, 3, ctr_npz=True))
+        move = make_grid_move(
+            root=make_epoch_dir(self.tmp, 3, ctr_npz=True, peaks_npz=True))
         synced = []
         with mock.patch.object(gbs.os, "fsync", synced.append):
             with self.assertLogs(gbs.logger, level="INFO") as log:
                 move._flush_epoch_artifacts(3)
                 move._flush_epoch_artifacts(3)
                 move._flush_epoch_artifacts(3)
-        self.assertEqual(len(synced), 2)  # ONE pass over the two artifacts
+        self.assertEqual(len(synced), 3)  # ONE pass over the three artifacts
         self.assertEqual(
             len([line for line in log.output if "head flushed epoch" in line]), 1)
 
     def test_a_new_epoch_flushes_again(self):
-        move = make_grid_move(root=make_epoch_dir(self.tmp, 3, ctr_npz=True))
-        make_epoch_dir(self.tmp, 4, ctr_npz=True)
+        move = make_grid_move(
+            root=make_epoch_dir(self.tmp, 3, ctr_npz=True, peaks_npz=True))
+        make_epoch_dir(self.tmp, 4, ctr_npz=True, peaks_npz=True)
         synced = []
         with mock.patch.object(gbs.os, "fsync", synced.append):
             move._flush_epoch_artifacts(3)
             move._flush_epoch_artifacts(4)
-        self.assertEqual(len(synced), 4)
+        self.assertEqual(len(synced), 6)
 
     def test_a_missing_epoch_dir_is_not_fatal(self):
         move = make_grid_move(root=os.path.join(self.tmp, "absent"))
@@ -649,18 +729,60 @@ class FlushEpochArtifactsTest(unittest.TestCase):
         self.assertTrue(any("no artifacts" in line for line in log.output))
 
     def test_a_flush_that_found_nothing_does_not_suppress_the_real_one(self):
-        # the memo is recorded AFTER a pass that actually synced something:
-        # a first call racing ahead of the setup() that writes the epoch must
-        # not permanently suppress that epoch's real flush on this move
+        # the memo is recorded AFTER a pass that found the WHOLE epoch:
+        # a first call racing ahead of the setup() that writes it must not
+        # permanently suppress that epoch's real flush on this move
         root = os.path.join(self.tmp, "late")
         move = make_grid_move(root=root)
         synced = []
         with mock.patch.object(gbs.os, "fsync", synced.append):
             move._flush_epoch_artifacts(3)  # epoch dir not written yet
             self.assertEqual(len(synced), 0)
-            make_epoch_dir(root, 3, ctr_npz=True)
+            make_epoch_dir(root, 3, ctr_npz=True, peaks_npz=True)
             move._flush_epoch_artifacts(3)  # now it is there
-        self.assertEqual(len(synced), 2)
+        self.assertEqual(len(synced), 3)
+
+    def test_a_partial_flush_leaves_the_memo_unset_and_retries(self):
+        # NEW-E4: a pass that found the MANIFEST but not the artifacts still
+        # being written must not memoise the epoch -- those two would then
+        # never be fsynced on this move instance, and the ranks would open an
+        # unflushed npz with only their own completeness check as a backstop
+        root = os.path.join(self.tmp, "partial")
+        move = make_grid_move(root=root)
+        make_epoch_dir(root, 3, ctr_npz=False, peaks_npz=False)  # DONE.json only
+        synced = []
+        with mock.patch.object(gbs.os, "fsync", synced.append):
+            move._flush_epoch_artifacts(3)
+            self.assertEqual(len(synced), 1)
+            self.assertIsNone(getattr(move, "_epoch_flushed", None),
+                              "a PARTIAL pass must not set the memo")
+            make_epoch_dir(root, 3, ctr_npz=False, peaks_npz=True)
+            move._flush_epoch_artifacts(3)          # retried, not suppressed
+            self.assertEqual(len(synced), 3)        # DONE.json again + the npz
+            move._flush_epoch_artifacts(3)          # NOW it is memoised
+            self.assertEqual(len(synced), 3)
+        self.assertEqual(move._epoch_flushed[0], 3)
+
+    def test_the_centre_table_is_expected_only_when_the_move_has_one(self):
+        # the same head-side answer the rank directive's ``ctr_table`` flag
+        # carries: with a live table a missing fstat_centers.npz is an
+        # INCOMPLETE epoch, so the memo stays unset and the next pass retries
+        root = os.path.join(self.tmp, "ctr")
+        move = make_grid_move(root=root)
+        make_epoch_dir(root, 3, ctr_npz=False, peaks_npz=True)
+        move._fstat_ctr_table = {"f0_mHz": np.zeros(1)}
+        patcher = mock.patch.dict(os.environ, {"GB_FSTAT_CTR_MODE": "epoch"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.assertIsNotNone(move._fstat_ctr_table_active())
+        synced = []
+        with mock.patch.object(gbs.os, "fsync", synced.append):
+            move._flush_epoch_artifacts(3)
+            self.assertEqual(len(synced), 2)
+            self.assertIsNone(getattr(move, "_epoch_flushed", None))
+            move._fstat_ctr_table = None            # no table -> not expected
+            move._flush_epoch_artifacts(3)
+        self.assertEqual(move._epoch_flushed[0], 3)
 
     def test_no_epoch_and_no_epoch_dir_are_no_ops(self):
         move = make_grid_move(root=self.tmp)

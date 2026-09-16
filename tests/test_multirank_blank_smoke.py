@@ -44,13 +44,15 @@ class MultiRankBlankSmokeTest(unittest.TestCase):
         )
         return fit
 
-    def _run_world(self, size):
+    def _run_world(self, size, subdir=None, env=None):
         from lisatools.globalfit.communication.fakecomm import FakeWorld
         from lisatools.globalfit.communication.ranks import prepare_rank
         from lisatools.globalfit.run import GlobalFit
 
+        store = subdir if subdir is not None else f"n{size}"
+
         def fn(rank, comm):
-            fit = self._make_fit(f"n{size}")
+            fit = self._make_fit(store)
             layout = prepare_rank(fit, comm)
             fit.build()
             gf = GlobalFit(fit, comm)
@@ -58,14 +60,31 @@ class MultiRankBlankSmokeTest(unittest.TestCase):
             out = {
                 "role": layout.role_of(rank).value,
                 "block": layout.block_of(rank),
-                "acs_rows": int(gf.acs.acs_total_entries),
-                "nwalkers_state": int(gf.state.branches["line"].nwalkers),
+                # ``prepare_main`` publishes these LAST, so a head that
+                # returned early (NULL_CHECK_ONLY) has neither
+                "acs_rows": (int(gf.acs.acs_total_entries)
+                             if hasattr(gf, "acs") else None),
+                "nwalkers_state": (int(gf.state.branches["line"].nwalkers)
+                                   if hasattr(gf, "state") else None),
+                "null_check": bool(getattr(gf, "_null_check_only", False)),
+                "has_sampler": hasattr(gf, "sampler"),
             }
             if hasattr(gf, "compute_service"):
                 out["served"] = gf.compute_service_served
             return out
 
-        return FakeWorld(size, timeout=600.0).run(fn)
+        # FakeWorld ranks are THREADS of this process and share os.environ, so
+        # a per-rank write would race: set it outside and restore after.
+        saved = {k: os.environ.get(k) for k in (env or {})}
+        os.environ.update(env or {})
+        try:
+            return FakeWorld(size, timeout=600.0).run(fn)
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
     def test_single_rank_path(self):
         out = self._run_world(1)
@@ -90,6 +109,34 @@ class MultiRankBlankSmokeTest(unittest.TestCase):
         self.assertTrue(h5)
         reader = GFHDFBackend(os.path.join(store, h5[0]))
         self.assertGreaterEqual(reader.iteration, 1)
+
+    def test_null_check_only_releases_every_rank(self):
+        """``NULL_CHECK_ONLY=1`` at size 3: measure the lnL, then everyone exits.
+
+        The dev merge added ``fanout.stop()`` to that early path, and it is
+        load-bearing: without it the compute rank stays parked in
+        ``ComputeService.serve()`` on the fan-out communicator (the bare
+        COMM_WORLD ``"stop"`` that releases legacy spares never reaches it)
+        and a real job hangs until its wall clock runs out. Nothing else in
+        the suite runs a MULTI-RANK null check end to end -- the merge report
+        flagged exactly this gap (concern 2). Size 3 = head + one compute rank
+        + saver; a hang fails on ``FakeWorld``'s own timeout.
+        """
+        out = self._run_world(3, subdir="null3", env={"NULL_CHECK_ONLY": "1"})
+        self.assertEqual(
+            (out[0]["role"], out[1]["role"], out[2]["role"]),
+            ("head", "compute", "saver"))
+        # the head stopped after the initial-lnL print: prepare_main returned
+        # before it built (and published) the sampler
+        self.assertTrue(out[0]["null_check"])
+        self.assertFalse(out[0]["has_sampler"])
+        # the compute rank's serve() RETURNED -- i.e. it was sent the fan-out
+        # STOP. It answered nothing: the head's ``ping`` comes after the early
+        # return, so this is 0 commands, not "the ping and then stop".
+        self.assertIn("served", out[1])
+        self.assertEqual(out[1]["served"], 0)
+        # and the saver finished off its {"finish_run": True}
+        self.assertEqual(out[2]["role"], "saver")
 
 
 if __name__ == "__main__":
