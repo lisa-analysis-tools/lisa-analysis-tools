@@ -220,5 +220,102 @@ class WrapDeviceAndOrbitsTest(unittest.TestCase):
         self.assertIsInstance(ds, _FakeDomainSettings)
 
 
+class _FakeReplicaGen:
+    """Stand-in generator tagged with the device it was resolved on."""
+
+    def __init__(self, device):
+        self.device = device
+        self.kwargs = {"device": device}  # the DCGA duck-type marker
+        self.calls = []
+
+    def get_signals_for_residuals(self, *params, **kwargs):
+        self.calls.append(params)
+        return ("signals", self.device)
+
+    def __call__(self, *params, **kwargs):
+        # the EMRI/SOBBH shape: the resolved wrap is itself callable
+        self.calls.append(params)
+        return ("signals", self.device)
+
+
+class DeviceLocalWaveGenLateBindingTest(unittest.TestCase):
+    """``DeviceLocalWaveGen`` attributes must resolve at CALL time.
+
+    The 2026-09-16 nogb-null ``mbh_pe`` crash: ``recipe.py``'s
+    ``build_mbh_moves_phenom`` captures
+    ``wave_gen.get_signals_for_residuals`` ONCE, at recipe-build time on the
+    main thread (hence on ``gpus[0]``), and the move keeps it for the life of
+    the run. With eager ``__getattr__`` that is permanently the PRIMARY
+    device's generator, so a walker-shard worker thread running on ``gpus[1]``
+    (``AnalysisContainerArray._vectorized_dispatch``) generated its template
+    through gpu-0's cached device arrays -- the WDM window and the
+    ``fold_shift_map`` gather indices read in
+    ``domains.py::FDSignal.wdmtransform`` -- against a gpu-1 residual.
+    Cross-device gather + multiply: an asynchronous
+    ``cudaErrorIllegalAddress`` where P2P is unavailable, surfacing at the
+    next allocation.
+
+    EMRI and SOBBH pass the ``DeviceLocalWaveGen`` OBJECT
+    (``source_runtime.py`` build_emri/build_sobbh), so they re-resolved on
+    every call and were unaffected -- which is exactly why only the MBH block
+    crashed.
+    """
+
+    def setUp(self):
+        from lisatools.globalfit.stock.erebor import source_runtime as sr
+
+        self.sr = sr
+        self.current = {"device": 0}
+        self.resolved = []
+
+        def getter(general_info, cfg):
+            dev = self.current["device"]
+            self.resolved.append(dev)
+            return self.gens.setdefault(dev, _FakeReplicaGen(dev))
+
+        self.gens = {}
+        self.wave_gen = sr.DeviceLocalWaveGen(getter, SimpleNamespace(), {})
+
+    def test_captured_method_follows_the_device_at_call_time(self):
+        # captured on the primary device, the way recipe.py does it
+        fn = self.wave_gen.get_signals_for_residuals
+        # ... then called from a shard worker running on device 1
+        self.current["device"] = 1
+        self.assertEqual(fn(1.0, 2.0), ("signals", 1))
+        # and back on device 0 the same captured handle uses gpu 0 again
+        self.current["device"] = 0
+        self.assertEqual(fn(3.0), ("signals", 0))
+
+        self.assertEqual(self.gens[1].calls, [(1.0, 2.0)])
+        self.assertEqual(self.gens[0].calls, [(3.0,)])
+
+    def test_direct_call_still_resolves_per_call(self):
+        """The ``__call__`` path EMRI/SOBBH use is unchanged."""
+        self.current["device"] = 1
+        self.assertEqual(self.wave_gen(0.0), ("signals", 1))
+
+    def test_dcga_duck_type_is_preserved(self):
+        """``MoveBuilder`` reads ``__self__``/``__name__`` off the handle.
+
+        ``recipe.py::MoveBuilder.build`` recovers the generator object via
+        ``getattr(wave_gen, "__self__")`` and needs it to carry ``.kwargs``
+        for the per-device DCGA replica path; the method name rides along as
+        ``waveform_gen_method``.
+        """
+        fn = self.wave_gen.get_signals_for_residuals
+        self.assertEqual(fn.__name__, "get_signals_for_residuals")
+        owner = getattr(fn, "__self__", None)
+        self.assertIsNotNone(owner)
+        self.assertTrue(hasattr(owner, "kwargs"))
+        self.assertIsInstance(owner, _FakeReplicaGen)
+
+    def test_non_callable_attributes_still_pass_through(self):
+        self.assertEqual(self.wave_gen.kwargs, {"device": 0})
+
+    def test_underscore_attributes_still_raise(self):
+        with self.assertRaises(AttributeError):
+            self.wave_gen.__deepcopy__
+
+
 if __name__ == "__main__":
     unittest.main()

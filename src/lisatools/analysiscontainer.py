@@ -2744,19 +2744,67 @@ class AnalysisContainerArray:
         :attr:`thread_pool`; worker exceptions propagate to the caller.
         The worker is responsible for entering its split's device context
         (GPU splits) — see the call sites.
+
+        CROSS-DEVICE ORDERING EDGE (2026-09-16). This is the ACA twin of the
+        GB shard-router defect fixed in ``beaa60f5``
+        (``gbbands.py::_RoutedBandEngine._dispatch_shards``): a worker
+        returns when its HOST code returns, with that shard's kernels still
+        queued on ITS device's stream, and the caller then reads shard
+        output from its own device's stream with no happens-before edge.
+        :meth:`_vectorized_dispatch` happens to be covered by its per-row
+        ``asnumpy`` (a synchronising D2H on the worker's device), but
+        :meth:`signal_operation` / :meth:`apply_signal_from_params` leave
+        the result purely device-side — an in-place ``add_signal`` into the
+        shard's slice of ``linear_data_arr`` — so nothing ordered the caller
+        behind the other shard's residual writes. Fix: each worker records
+        an event on its shard's stream right after its launches (same
+        thread, so per-thread-default-stream builds are covered), and the
+        caller's stream waits on all of them before this returns. Stream
+        edges only: nothing drains, both devices keep running.
+
+        Engaged only when the dispatch actually spans more than one
+        populated split — a single split runs on the caller's own thread and
+        device, so single-GPU/CPU runs pay nothing. CPU (``gpus is None``)
+        and stream-less ``xp`` fakes are structural no-ops.
+
+        MULTIRANK PORT NOTE: with one GPU per rank this is a structural
+        no-op (a single populated split never reaches the edge; cross-rank
+        movement is MPI, which forces its own completion). KEEP it for any
+        ``gpus_per_rank > 1`` configuration.
         """
         if run_threaded is None:
             run_threaded = self.run_threaded
         items = [(s, rows) for s, rows in split_to_rows.items() if len(rows)]
+
+        get_stream = getattr(
+            getattr(self.xp, "cuda", None), "get_current_stream", None
+        )
+        if self.gpus is None or len(items) < 2:
+            get_stream = None
+        events = [None] * len(items)
+
+        def _run(idx, s, rows):
+            worker(s, rows)
+            if get_stream is not None:
+                with self.xp.cuda.Device(int(self.gpus[s])):
+                    events[idx] = get_stream().record()
+
         if run_threaded and len(items) > 1:
             futures = [
-                self.thread_pool.submit(worker, s, rows) for s, rows in items
+                self.thread_pool.submit(_run, i, s, rows)
+                for i, (s, rows) in enumerate(items)
             ]
             for f in futures:
                 f.result()  # re-raise worker exceptions in caller
         else:
-            for s, rows in items:
-                worker(s, rows)
+            for i, (s, rows) in enumerate(items):
+                _run(i, s, rows)
+
+        if get_stream is not None:
+            caller_stream = get_stream()
+            for ev in events:
+                if ev is not None:
+                    caller_stream.wait_event(ev)
 
     # ------------------------------------------------------------------
     # Vectorized analysis ops (sharded by ``index`` across GPUs)

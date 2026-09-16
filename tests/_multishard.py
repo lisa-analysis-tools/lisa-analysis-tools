@@ -20,6 +20,8 @@ import threading
 
 import numpy as np
 
+from lisatools.analysiscontainer import AnalysisContainerArray
+
 
 class RecordingXp:
     """NumPy-backed fake ``xp`` with a cupy-like ``cuda`` namespace.
@@ -108,6 +110,58 @@ class RecordingXp:
     # numpy passthrough for everything else (asarray, zeros, where, ...)
     def __getattr__(self, name):
         return getattr(np, name)
+
+
+class _FakeEvent:
+    def __init__(self, device, seq):
+        self.device = device
+        self.seq = seq
+
+
+class StreamRecordingXp(RecordingXp):
+    """RecordingXp + a cupy-like per-device current stream.
+
+    ``cuda.get_current_stream()`` returns a stream bound to the CURRENT
+    device (thread-local, like cupy); ``stream.record()`` appends
+    ("record", device, seq) and returns the event; ``stream.wait_event(ev)``
+    appends ("wait", waiting_device, ev.device, ev.seq, seq). A shared
+    monotone ``seq`` orders records, waits and worker marks across threads.
+
+    Used by the cross-device stream-ordering contracts: the GB shard router
+    (``test_router_stream_edges.py``) and the ACA per-split runner
+    (``test_aca_split_stream_edges.py``).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.stream_log = []
+        self._seq_lock = threading.Lock()
+        self._seq = 0
+
+        outer = self
+
+        class _Stream:
+            def __init__(self, device):
+                self.device = device
+
+            def record(self, event=None):
+                seq = outer.next_seq()
+                ev = _FakeEvent(self.device, seq)
+                outer.stream_log.append(("record", self.device, seq))
+                return ev
+
+            def wait_event(self, ev):
+                seq = outer.next_seq()
+                outer.stream_log.append(
+                    ("wait", self.device, ev.device, ev.seq, seq))
+
+        self.cuda.get_current_stream = (
+            lambda: _Stream(self.cuda.runtime.getDevice()))
+
+    def next_seq(self):
+        with self._seq_lock:
+            self._seq += 1
+            return self._seq
 
 
 class FakeDeviceComp:
@@ -304,21 +358,12 @@ class FakeMultiShardACA:
             for s in np.unique(split_per_row)
         }
 
-    def _run_per_split(self, worker, split_to_rows: dict,
-                       run_threaded=None) -> None:
-        """Run ``worker(split, rows)`` once per populated split."""
-        if run_threaded is None:
-            run_threaded = self.run_threaded
-        items = [(s, rows) for s, rows in split_to_rows.items() if len(rows)]
-        if run_threaded and len(items) > 1:
-            futures = [
-                self.thread_pool.submit(worker, s, rows) for s, rows in items
-            ]
-            for f in futures:
-                f.result()
-        else:
-            for s, rows in items:
-                worker(s, rows)
+    # THE PRODUCTION RUNNER ITSELF, not a copy: a duplicated body here would
+    # let every multi-shard consumer test pass against a runner missing
+    # whatever the real one grew (e.g. the 2026-09-16 cross-device stream
+    # edge). The fake supplies exactly the attributes it reads -- ``xp``,
+    # ``gpus``, ``run_threaded``, ``thread_pool``.
+    _run_per_split = AnalysisContainerArray._run_per_split
 
     def reference_rows(self):
         """(num_acs, *per_band_shape) reference in global row order."""
