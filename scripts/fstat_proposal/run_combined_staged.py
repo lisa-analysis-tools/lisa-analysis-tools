@@ -1012,7 +1012,20 @@ def main() -> int:
                 f"{fit.general.num_iterations} reached; residuals saved.",
                 flush=True,
             )
-    else:
+    elif role == RankRole.COMPUTE:
+        # under the walker-block layout a COMPUTE rank's fit.run() only
+        # returns once the head has sent the fan-out STOP (review N-6) --
+        # i.e. the run is over, not "still continuing on the head".
+        print(
+            f"[combined] rank {_rank} ({role.value}) released (head sent "
+            f"STOP); run complete on the head.",
+            flush=True,
+        )
+    elif role == RankRole.SAVER:
+        # the saver's fit.run() returns only after it has handled the
+        # head's {"finish_run": True} (review N-6).
+        print(f"[combined] rank {_rank} ({role.value}) finished.", flush=True)
+    else:  # legacy SPARE
         print(
             f"[combined] rank {_rank} ({role.value}) exiting; the run "
             f"continues on the head.",

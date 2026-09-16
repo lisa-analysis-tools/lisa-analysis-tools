@@ -365,8 +365,18 @@ class MakeTemperRngTest(unittest.TestCase):
             np.random.default_rng(123).random(), c.random())
 
     def test_the_class_default_is_none_so_an_unstamped_move_is_entropy(self):
-        # a move nobody stamped (a hand-built move, a test skeleton) must keep
-        # today's behaviour rather than silently share one fixed stream
+        """The class default is a DELIBERATE fail-open, not an oversight.
+
+        A move nobody stamped (a hand-built move, a test skeleton) must keep
+        today's behaviour rather than silently share one fixed stream.
+        Production is covered -- every GB/VGB move construction in ``src/``
+        goes through ``build_gb_moves`` / ``build_vgb_moves``, which stamp
+        this on the moves they return -- so a move built OUTSIDE those two
+        builders (a hand-rolled script, a legacy settings-file recipe, a
+        test skeleton) is the only one that keeps this ``None`` default and
+        silently reverts to OS entropy rather than raising. Accepted ruling,
+        review N-4.
+        """
         self.assertIsNone(gbs.GBSpecialBase.gf_temper_seed_base)
 
 
@@ -676,11 +686,14 @@ class SetupFromDirectiveTest(unittest.TestCase):
 class FlushEpochArtifactsTest(unittest.TestCase):
     """The head half of the completeness contract (review C1).
 
-    The memo is judged against the EXPECTED set -- the manifest and the
-    stage-B peaks npz, plus the centre table when this move has a live one
-    (NEW-E4) -- while the sync loop still fsyncs every artifact that is
-    THERE. So these fixtures write ``peaks_npz=True`` wherever the epoch is
-    meant to read as complete.
+    The memo is judged COMPLETE by the same rule a rank applies to the
+    epoch dir -- ``_epoch_missing_for_ranks``, which accepts a zero-peak
+    ``DONE.json`` with no stage-B npz -- plus the centre table when this
+    move has a live one (NEW-E4, tightened against the zero-peak case by
+    round 6 / review N-1), while the sync loop still fsyncs every artifact
+    that is THERE. So these fixtures write ``peaks_npz=True`` wherever the
+    epoch is meant to read as complete via the npz, and ``n_peaks=0``
+    wherever it is meant to read as complete WITHOUT one.
     """
 
     def setUp(self):
@@ -761,6 +774,25 @@ class FlushEpochArtifactsTest(unittest.TestCase):
             self.assertEqual(len(synced), 3)        # DONE.json again + the npz
             move._flush_epoch_artifacts(3)          # NOW it is memoised
             self.assertEqual(len(synced), 3)
+        self.assertEqual(move._epoch_flushed[0], 3)
+
+    def test_a_zero_peak_epoch_sets_the_memo_without_the_stacked_npz(self):
+        # review N-1: the legitimate zero-peak F-stat epoch never writes
+        # fstat_grid_peaks_stacked.npz (``_epoch_missing_for_ranks`` and
+        # ``_epoch_complete`` both carve this out); the memo must still be
+        # set on it, or the head re-fsyncs DONE.json and re-logs
+        # [FSTAT_EPOCH] on every propose of the whole run
+        root = os.path.join(self.tmp, "zero_peak")
+        move = make_grid_move(root=make_epoch_dir(
+            root, 3, ctr_npz=False, peaks_npz=False, n_peaks=0))
+        synced = []
+        with mock.patch.object(gbs.os, "fsync", synced.append):
+            with self.assertLogs(gbs.logger, level="INFO") as log:
+                move._flush_epoch_artifacts(3)   # DONE.json only -> complete
+                move._flush_epoch_artifacts(3)   # memoised -> no-op
+        self.assertEqual(len(synced), 1)         # DONE.json is the only file
+        self.assertEqual(
+            len([line for line in log.output if "head flushed epoch" in line]), 1)
         self.assertEqual(move._epoch_flushed[0], 3)
 
     def test_the_centre_table_is_expected_only_when_the_move_has_one(self):

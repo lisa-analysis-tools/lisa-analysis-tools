@@ -2516,7 +2516,11 @@ def _stamp_temper_seed_base(moves, random_seed):
     ``_propose_legacy`` and the orchestrator at one compute rank alike, which
     is what makes the two bodies draw the identical stream there (fix round
     5; before it the legacy body ran on OS entropy and the orchestrator on a
-    derived seed).
+    derived seed). At one rank that stream is seeded ONCE, at whichever
+    propose first arms the vertical swap, and then persists for the rest of
+    the run -- NOT reseeded per propose the way the multi-rank
+    ``_rank_rng_seed`` path is (review N-2); "identical stream" means the two
+    bodies agree with EACH OTHER, not that either refreshes every propose.
 
     Domain-separated off ``general_info.random_seed`` with a fixed tag so it
     can never collide with the per-rank seeds ``derive_rank_seed`` spawns off

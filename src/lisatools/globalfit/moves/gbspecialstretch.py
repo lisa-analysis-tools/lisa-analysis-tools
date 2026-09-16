@@ -5007,7 +5007,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     # ``general_info.random_seed``). ``None`` = the run set no
     # ``random_seed``, so the streams stay on OS entropy exactly as they
     # were. It is what makes the SINGLE-rank derivation identical in
-    # ``_propose_legacy`` and in the orchestrator (fix round 5).
+    # ``_propose_legacy`` and in the orchestrator (fix round 5). The class
+    # default is ``None`` ON PURPOSE (review N-4): every production GB/VGB
+    # move is built through ``build_gb_moves`` / ``build_vgb_moves``, which
+    # stamp this on their returned lists, so this default is a deliberate
+    # FAIL-OPEN for a move built outside those two builders (a hand-rolled
+    # script, a legacy settings-file recipe, a test skeleton) -- it silently
+    # reverts to entropy rather than raising.
     gf_temper_seed_base = None
 
     @staticmethod
@@ -5022,8 +5028,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         2. ``gf_temper_seed_base`` set -- every other caller: a single-rank
            run through ``_propose_legacy`` AND the orchestrator at one
            compute rank, which stamps ``_rank_rng_seed = None`` precisely so
-           it lands HERE. ``SeedSequence([base, num_proposals])`` gives a
-           fresh stream per propose, the way the rank path does.
+           it lands HERE. This does NOT reseed per propose the way the rank
+           path does: ``_run_in_model_repeats`` builds the Generator only
+           when it is still ``None`` and keeps it after that, so it is
+           seeded ONCE -- at whichever propose first arms the vertical
+           swap -- from ``SeedSequence([base, num_proposals])`` with
+           ``num_proposals`` read AT THAT MOMENT, then persists for the
+           rest of the run. Parity between the two bodies only needs both
+           to take this same path (review N-2); it is not a per-propose
+           refresh.
         3. neither -- ``random_seed`` is unset for the run: today's entropy.
 
         Before fix round 5 the orchestrator always took (1) while the legacy
@@ -17461,9 +17474,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         remembered and a repeat returns immediately. Without that the head
         re-``fsync``s three already-synced files on a shared filesystem and
         emits an ``[FSTAT_EPOCH]`` line on every iteration. The memo is
-        recorded only when EVERY expected artifact of the epoch was synced,
-        so a pass that raced the ``setup()`` still writing them retries on
-        the next propose instead of suppressing them for good.
+        recorded once the epoch reads as COMPLETE by the same rule a rank
+        applies to it (:meth:`_epoch_missing_for_ranks`, which already
+        carves out the legitimate zero-peak epoch where no stage-B npz is
+        ever written) plus the centre table when this head actually has one
+        -- so a pass that raced the ``setup()`` still writing them retries
+        on the next propose instead of suppressing them for good.
 
         No-op off the F-stat grid moves (no ``_epoch_dir``) and when the head
         installed no epoch. Never fatal on its own: a missing artifact is the
@@ -17485,15 +17501,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             GRID_BASENAME.replace(".npz", "_peaks_stacked.npz"),
             CENTER_TABLE_BASENAME,
         )
-        # EXPECTED set: what a COMPLETE epoch must carry, and so the condition
-        # the memo is judged against below (the sync loop itself is unchanged
-        # -- it still fsyncs every one of ``names`` that exists). The centre
-        # table counts only when this head actually has one, the same
-        # head-side answer the rank directive's ``ctr_table`` flag carries.
+        # The centre table counts only when this head actually has one, the
+        # same head-side answer the rank directive's ``ctr_table`` flag
+        # carries.
         _ctr = getattr(self, "_fstat_ctr_table_active", None)
-        expected = set(names[:2])
-        if callable(_ctr) and _ctr() is not None:
-            expected.add(CENTER_TABLE_BASENAME)
         flushed = []
         for name in names:
             path = os.path.join(d, name)
@@ -17512,14 +17523,24 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     "(%r); the ranks' completeness check is the backstop",
                     self.name, int(k), path, exc,
                 )
-        if expected.issubset(flushed):
-            # memo AFTER the pass, and only when EVERY expected artifact was
-            # found and synced. Recording it up front -- or on a PARTIAL pass
-            # (fix round 5) -- would let a flush racing ahead of the
-            # ``setup()`` that writes the epoch permanently suppress the real
-            # flush of the artifacts that were still being written, on this
-            # move, for the whole epoch. An incomplete pass leaves the memo
-            # unset so the next propose retries.
+        # COMPLETE for the memo: judged with the same rule a rank applies to
+        # this epoch dir, via the CLASS method (never a per-instance stub) so
+        # it reflects the real files on disk -- ``_epoch_missing_for_ranks``
+        # already accepts a zero-peak ``DONE.json`` with no stage-B npz.
+        # Hard-requiring the stacked npz here (fix round 5) made that
+        # legitimate epoch never memoisable and re-fsynced/re-logged it every
+        # propose (review N-1).
+        complete = type(self)._epoch_missing_for_ranks(d) is None
+        if callable(_ctr) and _ctr() is not None:
+            complete = complete and CENTER_TABLE_BASENAME in flushed
+        if complete:
+            # memo AFTER the pass, and only when the epoch reads COMPLETE.
+            # Recording it up front -- or on a PARTIAL pass (fix round 5) --
+            # would let a flush racing ahead of the ``setup()`` that writes
+            # the epoch permanently suppress the real flush of the artifacts
+            # that were still being written, on this move, for the whole
+            # epoch. An incomplete pass leaves the memo unset so the next
+            # propose retries.
             self._epoch_flushed = (int(k), d)
         logger.info(
             "[FSTAT_EPOCH %s] head flushed epoch %d for the ranks: %s in %s",

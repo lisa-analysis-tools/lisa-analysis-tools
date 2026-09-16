@@ -135,7 +135,12 @@ class MultiRankBlankSmokeTest(unittest.TestCase):
         # return, so this is 0 commands, not "the ping and then stop".
         self.assertIn("served", out[1])
         self.assertEqual(out[1]["served"], 0)
-        # and the saver finished off its {"finish_run": True}
+        # the saver's role is asserted above in the tuple check; what proves
+        # it actually finished handling {"finish_run": True} rather than
+        # hanging is that ``FakeWorld.run`` returned ``out`` AT ALL -- it
+        # joins every rank thread and raises TimeoutError on its own 600 s
+        # deadline if any (the saver included) is still alive. There is no
+        # finer-grained finish flag exposed by this harness to assert on.
         self.assertEqual(out[2]["role"], "saver")
 
 
