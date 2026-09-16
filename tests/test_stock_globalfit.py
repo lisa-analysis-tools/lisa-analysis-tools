@@ -1115,7 +1115,7 @@ class RunPreparesRankTest(unittest.TestCase):
              mock.patch("lisatools.globalfit.run.GlobalFit") as gf:
             gf.return_value.run_global_fit.return_value = "ran"
             self.assertEqual(fit.run(comm=comm), "ran")
-        gf.assert_called_once()
+        gf.assert_called_once_with(fit, comm)
         return order
 
     def test_run_calls_prepare_rank_before_build(self):
