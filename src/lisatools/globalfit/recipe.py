@@ -2506,6 +2506,10 @@ def build_gb_moves(
     gb_info: GBSetup = curr.source_info["gb"]
     general_info: GeneralSetup = curr.general_info
     nwalkers: int = general_info.nwalkers
+    # MOVE/ACA-level sizes (ladders, friend windows, per-move accepted arrays)
+    # follow this rank's walker block; the band tables on the sub-state stay
+    # engine-wide (see initialize_band_information below). Equal single-process.
+    nwalkers_local = _local_nwalkers(acs)
     data_start_freq_ind = int(acs.start_freq_ind[0])
 
     gb_betas = gb_info.betas
@@ -2771,7 +2775,7 @@ def build_gb_moves(
 
     effective_ndim = engine_info.ndims["gb"]
     temperature_control = TemperatureControl(
-        effective_ndim, nwalkers, ntemps=ntemps, Tmax=Tmax, permute=False
+        effective_ndim, nwalkers_local, ntemps=ntemps, Tmax=Tmax, permute=False
     )
     gb_move_kwargs = dict(
         waveform_kwargs=gb_info.waveform_kwargs,
@@ -2780,7 +2784,7 @@ def build_gb_moves(
         skip_supp_names_update=["group_move_points"],
         random_seed=general_info.random_seed,
         force_backend=general_info.force_backend,
-        nfriends=nwalkers,
+        nfriends=nwalkers_local,
         temperature_control=temperature_control,
         # ``use_gpu=True`` (stft_tof) dropped: backend choice is fixed at
         # construction via force_backend per the sprint-wide rule.
@@ -3056,7 +3060,7 @@ def build_gb_moves(
            "rj_flip_fraction_default": _search_rj_flip_default(),
            **_imr_search}
     )
-    gb_search_prune_move.accepted = np.zeros((ntemps, nwalkers))
+    gb_search_prune_move.accepted = np.zeros((ntemps, nwalkers_local))
     
     # LEGACY FD-ONLY (2026-08-12 user ruling): the serial-MCMC moves score
     # through GBGPU's FD get_fstat_ll/get_ll (para_log_like), which
@@ -3076,7 +3080,7 @@ def build_gb_moves(
         **{**gb_move_kwargs, "leaf_cap_update": False,
            "rj_flip_fraction_default": _search_rj_flip_default(), **_imr_search}
     )
-    gb_search_fstat_mcmc_move.accepted = np.zeros((ntemps, nwalkers))
+    gb_search_fstat_mcmc_move.accepted = np.zeros((ntemps, nwalkers_local))
 
     # The RJ refit moves load a GMM-refit proposal file (``main_file_path``)
     # produced during a run. When it is absent (fresh run / smoke, or refit
@@ -3100,7 +3104,7 @@ def build_gb_moves(
             **{**gb_move_kwargs, "leaf_cap_update": False,
                "rj_flip_fraction_default": _search_rj_flip_default()}
         )
-        gb_search_refit_move.accepted = np.zeros((ntemps, nwalkers))
+        gb_search_refit_move.accepted = np.zeros((ntemps, nwalkers_local))
 
     # gb_search_refit_move, Refit currently not used for search
     gb_search_moves = (
@@ -3158,7 +3162,7 @@ def build_gb_moves(
         # center, then priced through the unchanged RJ densities:
         # maximize-then-pretend). A PE replace install must NOT set this.
         gb_replace_move.replace_search_stage = True
-        gb_replace_move.accepted = np.zeros((ntemps, nwalkers))
+        gb_replace_move.accepted = np.zeros((ntemps, nwalkers_local))
     # Pure IN-MODEL move (2026-08-04): no RJ step at all -- ``is_rj_prop=False``
     # skips the birth/death branch in the round loop, so every pick round is
     # just ``num_repeat_proposals`` in-model repeats on the live sources.
@@ -3181,7 +3185,7 @@ def build_gb_moves(
             # this move must not touch them (it changes no dimensions).
             **{**gb_move_kwargs, "leaf_cap_update": False},
         )
-        gb_in_model_move.accepted = np.zeros((ntemps, nwalkers))
+        gb_in_model_move.accepted = np.zeros((ntemps, nwalkers_local))
 
     gb_prior_removal_move = None
     if _gb_mode_search and getattr(gb_info, "search_prior_removal", False):
@@ -3210,7 +3214,7 @@ def build_gb_moves(
             **{**gb_move_kwargs, "leaf_cap_update": False,
                "rj_flip_fraction_default": _search_rj_flip_default(), **_imr_search},
         )
-        gb_prior_removal_move.accepted = np.zeros((ntemps, nwalkers))
+        gb_prior_removal_move.accepted = np.zeros((ntemps, nwalkers_local))
 
     #* ===================== WARM-START RJ BIRTH MOVE (rj_warm_search) =====================
     # Workstream B (user ruling 2026-08-24: "add this proposal in GB search
@@ -3314,7 +3318,7 @@ def build_gb_moves(
                "rj_flip_fraction_default": _search_rj_flip_default(),
                **_imr_search, **warm_search_move_overrides()},
         )
-        gb_warm_move.accepted = np.zeros((ntemps, nwalkers))
+        gb_warm_move.accepted = np.zeros((ntemps, nwalkers_local))
         gb_search_moves = list(gb_search_moves) + [gb_warm_move]
         logger.info(
             "build_gb_moves: rj_warm_search armed from %s (%d components; "
@@ -3414,7 +3418,7 @@ def build_gb_moves(
         **{**gb_move_kwargs, "rj_flip_fraction_default": _rj_flip_default,
            **_imr_defaults, **_pe_cap_off}
     )
-    gb_pe_prior_move.accepted = np.zeros((ntemps, nwalkers))
+    gb_pe_prior_move.accepted = np.zeros((ntemps, nwalkers_local))
 
     # F-STAT DISTANCE-BIRTH ON THE PE SIDE (USER RULING 2026-08-28:
     # *"rj_fstat_pe get the same stamp? yes mirror them. That would be
@@ -3483,7 +3487,7 @@ def build_gb_moves(
                **_imr_defaults, **_pe_cap_off,
                **warm_pe_move_overrides()},
         )
-        gb_warm_pe_move.accepted = np.zeros((ntemps, nwalkers))
+        gb_warm_pe_move.accepted = np.zeros((ntemps, nwalkers_local))
         logger.info(
             "build_gb_moves: rj_warm_pe armed from %s (%d components; "
             "circ_images=%s, floor_eps=%s).",
@@ -3569,7 +3573,7 @@ def build_gb_moves(
         # "table"; search installs stay "perrow" bit-identically, and an
         # explicit GB_REPLACE_CTR_MODE overrides either way.
         gb_pe_replace_move.replace_pe_stage = True
-        gb_pe_replace_move.accepted = np.zeros((ntemps, nwalkers))
+        gb_pe_replace_move.accepted = np.zeros((ntemps, nwalkers_local))
 
     # PURE prior-birth RJ move for the PE stage (2026-08-12 rename/split):
     # births drawn from the GLOBAL PRIOR (never the fstat grids), deaths
@@ -3592,7 +3596,7 @@ def build_gb_moves(
            "rj_flip_fraction_default": _rj_flip_default,
            **_imr_defaults, **_pe_cap_off}
     )
-    gb_pe_prior_birth_move.accepted = np.zeros((ntemps, nwalkers))
+    gb_pe_prior_birth_move.accepted = np.zeros((ntemps, nwalkers_local))
 
     gb_pe_fstat_mcmc_move = GBSpecialRJSerialSearchMCMC(
         *gb_move_args,
@@ -3606,7 +3610,7 @@ def build_gb_moves(
            "rj_flip_fraction_default": _rj_flip_default,
            **_imr_defaults, **_pe_cap_off}
     )
-    gb_pe_fstat_mcmc_move.accepted = np.zeros((ntemps, nwalkers))
+    gb_pe_fstat_mcmc_move.accepted = np.zeros((ntemps, nwalkers_local))
 
     # Prior + fstat moves always build; the refit move is inserted only when
     # its GMM-refit file is available (see ``_refit_available`` above).
@@ -3645,7 +3649,7 @@ def build_gb_moves(
             gpus=[],
             **{**gb_move_kwargs, "leaf_cap_update": False, **_pe_cap_off}
         )
-        gb_pe_refit_move.accepted = np.zeros((ntemps, nwalkers))
+        gb_pe_refit_move.accepted = np.zeros((ntemps, nwalkers_local))
         gb_pe_moves.insert(1, gb_pe_refit_move)  # [prior, refit, fstat]
 
     # Design knob: keep only the requested PE moves (order-preserving subset).
@@ -3677,7 +3681,7 @@ def build_gb_moves(
                 os.environ.get("GB_RIDGE_GIBBS_LEAF_FRACTION", "1.0")),
         )
         _ridge.name = "gb_ridge_gibbs"
-        _ridge.accepted = np.zeros((1, nwalkers))
+        _ridge.accepted = np.zeros((1, nwalkers_local))
         gb_search_moves = list(gb_search_moves) + [_ridge]
         gb_pe_moves = list(gb_pe_moves) + [_ridge]
         logger.info("build_gb_moves: gb_ridge_gibbs registered (leaf_fraction "
@@ -3712,6 +3716,10 @@ def build_vgb_moves(
     vgb_info = curr.source_info["vgb"]
     general_info: GeneralSetup = curr.general_info
     nwalkers: int = general_info.nwalkers
+    # MOVE/ACA-level sizes (ladder, friend window, accepted array) follow
+    # this rank's walker block; the band table on the sub-state stays
+    # engine-wide (see initialize_band_information below). Equal single-process.
+    nwalkers_local = _local_nwalkers(acs)
     # VGB's OWN ladder size (the engine runs cold-chain only); an explicit
     # betas array wins over the ntemps knob
     ntemps: int = (
@@ -3884,7 +3892,7 @@ def build_vgb_moves(
 
     effective_ndim = engine_info.ndims["vgb"]
     temperature_control = TemperatureControl(
-        effective_ndim, nwalkers, ntemps=ntemps, Tmax=Tmax, permute=False
+        effective_ndim, nwalkers_local, ntemps=ntemps, Tmax=Tmax, permute=False
     )
 
     vgb_move = VGBSpecialStretchMove(
@@ -3913,7 +3921,7 @@ def build_vgb_moves(
         skip_supp_names_update=["group_move_points"],
         random_seed=general_info.random_seed,
         force_backend=general_info.force_backend,
-        nfriends=nwalkers,
+        nfriends=nwalkers_local,
         temperature_control=temperature_control,
         num_repeat_proposals=vgb_info.num_repeat_proposals,
         gb_wdm_comp=vgb_info.gb_wdm_comp,
@@ -3960,7 +3968,7 @@ def build_vgb_moves(
             if k != "num_repeat_proposals"
         },
     )
-    vgb_move.accepted = np.zeros((ntemps, nwalkers))
+    vgb_move.accepted = np.zeros((ntemps, nwalkers_local))
     return [vgb_move]
 
 
