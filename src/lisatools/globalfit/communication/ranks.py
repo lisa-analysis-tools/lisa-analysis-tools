@@ -363,18 +363,28 @@ def select_rank_device(
         return list(placement.devices), "legacy"
 
     previous = environ.get("CUDA_VISIBLE_DEVICES")
-    if previous:
-        # pool ids index the CURRENTLY visible set (Slurm may already have narrowed it)
+    if previous is None:
+        # the env var is genuinely unset: the pool ids are physical device ids
+        physical = [str(d) for d in placement.devices]
+    else:
+        # SET (possibly to "", meaning explicitly NO devices visible): pool ids
+        # index the CURRENTLY visible set (Slurm may already have narrowed it,
+        # e.g. via --gpus-per-task/--gpu-bind, down to as little as one device)
         visible = [v.strip() for v in previous.split(",") if v.strip()]
         try:
             physical = [visible[d] for d in placement.devices]
         except IndexError:
             raise ValueError(
-                f"rank {rank}: device pool ids {list(placement.devices)} exceed the visible "
-                f"set CUDA_VISIBLE_DEVICES={previous!r}"
+                f"rank {rank}: device pool ids {list(placement.devices)} index the "
+                f"inherited CUDA_VISIBLE_DEVICES={previous!r} (visible devices={visible!r}), "
+                "which does not have that many entries. This usually means the launcher "
+                "already bound this task to its own device(s) (Slurm "
+                "--gpus-per-task/--gpu-bind), so the layout's pool ids double-count that "
+                "binding. Fix by either launching without per-task GPU binding "
+                "(--gpu-bind=none) so every rank sees the full node pool, or by setting "
+                "GPUS to the per-task pool this rank should see (matching what "
+                "CUDA_VISIBLE_DEVICES already narrowed it to)."
             ) from None
-    else:
-        physical = [str(d) for d in placement.devices]
     environ["CUDA_VISIBLE_DEVICES"] = ",".join(physical)
 
     count = device_count_fn()
@@ -432,6 +442,9 @@ def prepare_rank(
         ranks_per_gpu=int(getattr(general, "ranks_per_gpu", 1) or 1),
         main_rank=int(getattr(fit, "main_rank", 0) or 0),
     )
+    # capture BEFORE select_rank_device narrows/restores it in place
+    env = os.environ if environ is None else environ
+    inherited_cvd = env.get("CUDA_VISIBLE_DEVICES", "<unset>")
     gpus, mode = select_rank_device(
         layout,
         int(comm.Get_rank()),
@@ -445,7 +458,13 @@ def prepare_rank(
     fit.rank_layout = layout
     fit.rank_device_mode = mode
     if logger is not None:
-        logger.info("%s\nrank %d device mode: %s", layout.describe(), comm.Get_rank(), mode)
+        logger.info(
+            "%s\nrank %d device mode: %s (inherited CUDA_VISIBLE_DEVICES=%s)",
+            layout.describe(),
+            comm.Get_rank(),
+            mode,
+            inherited_cvd,
+        )
     return layout
 
 

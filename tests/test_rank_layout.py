@@ -170,7 +170,7 @@ class SelectRankDeviceTest(unittest.TestCase):
 
     def test_pool_index_outside_visible_set_raises(self):
         env = {"CUDA_VISIBLE_DEVICES": "5"}
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as cm:
             select_rank_device(
                 self._layout(),
                 1,
@@ -178,6 +178,21 @@ class SelectRankDeviceTest(unittest.TestCase):
                 device_count_fn=lambda: 1,
                 set_device_fn=lambda d: None,
             )
+        self.assertIn("gpu-bind", str(cm.exception))
+
+    def test_empty_visible_env_raises_actionable_error(self):
+        env = {"CUDA_VISIBLE_DEVICES": ""}
+        with self.assertRaises(ValueError) as cm:
+            select_rank_device(
+                self._layout(),
+                1,  # rank 1 has devices in this layout
+                environ=env,
+                device_count_fn=lambda: 1,
+                set_device_fn=lambda d: None,
+            )
+        msg = str(cm.exception)
+        self.assertIn("CUDA_VISIBLE_DEVICES", msg)
+        self.assertIn("gpu-bind", msg)
 
 
 class _General:

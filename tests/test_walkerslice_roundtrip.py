@@ -282,6 +282,11 @@ class GFStateSliceMergeTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             merge_state(self.state, slice_state(self.state, 0, 2), 0, 3)
 
+    def test_unknown_sub_state_name_raises(self):
+        with self.assertRaises(ValueError) as cm:
+            slice_state(self.state, 0, 2, sub_states=["mhb"])
+        self.assertIn("mhb", str(cm.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

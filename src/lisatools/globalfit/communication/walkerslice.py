@@ -53,6 +53,13 @@ def slice_state(full, w0, w1, *, sub_states="all"):
             slices none.
     """
     w0, w1 = _walker_block(w0, w1, _nwalkers_of(full))
+    if sub_states != "all":
+        unknown = sorted(set(sub_states) - set(full.branches))
+        if unknown:
+            raise ValueError(
+                f"slice_state: unknown sub_states {unknown}; "
+                f"valid branch names are {sorted(full.branches)}"
+            )
     B = w1 - w0
     coords = {name: np.array(br.coords[:, w0:w1], copy=True) for name, br in full.branches.items()}
     inds = {name: np.array(br.inds[:, w0:w1], copy=True) for name, br in full.branches.items()}

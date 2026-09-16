@@ -62,7 +62,20 @@ class WalkerFanout:
         self.head = layout.head_rank
         self.is_head = self.rank == self.head
         self.single = layout.is_single()
+        if not self.single and comm is not None:
+            # `comm` must be the compute-only fan-out comm (layout.make_fanout_comm),
+            # never the world comm; `None` is a test-only placeholder that skips this
+            # check entirely (see tests/test_fanout_fakecomm.py::test_run_on_a_worker_raises).
+            size = int(comm.Get_size())
+            if size != layout.n_compute:
+                raise ValueError(
+                    f"WalkerFanout comm size {size} != layout.n_compute {layout.n_compute}; "
+                    "pass the compute-only fan-out comm (layout.make_fanout_comm(comm)), "
+                    "not the world/full comm"
+                )
         self.seq = 0
+        self.last_wait_s = 0.0
+        self._stopped = False
         self.clock = {
             "iteration": 0,
             "stage": None,
@@ -98,25 +111,59 @@ class WalkerFanout:
         clock["seq"] = self.seq
         self.clock.update(clock)
         requests = []
-        for r in self.layout.worker_ranks:
-            rw0, rw1 = self.layout.block_of(r)
-            cmd = {
-                "seq": self.seq,
-                "op": op,
-                "move": move,
-                "clock": clock,
-                "payload": per_rank_payload(r, rw0, rw1),
-                "shared": shared,
-            }
-            requests.append(self.comm.isend(cmd, dest=self.layout.fanout_rank(r)))
-        t0 = time.perf_counter()
-        local = local_body(per_rank_payload(self.head, w0, w1), self.model)
-        head_wall = time.perf_counter() - t0
-        for req in requests:
-            req.wait()
+        sent_workers = []
+        wait_s = 0.0
+        try:
+            for r in self.layout.worker_ranks:
+                rw0, rw1 = self.layout.block_of(r)
+                cmd = {
+                    "seq": self.seq,
+                    "op": op,
+                    "move": move,
+                    "clock": clock,
+                    "payload": per_rank_payload(r, rw0, rw1),
+                    "shared": shared,
+                }
+                req = self.comm.isend(cmd, dest=self.layout.fanout_rank(r))
+                requests.append(req)
+                sent_workers.append(r)
+            # Wait IMMEDIATELY: under real MPI, large payloads run the rendezvous
+            # protocol, which only makes progress when the sender calls wait/test.
+            # Every worker is already parked in recv, so this cannot block on them;
+            # without this, the transfer stalls until the head reaches this point
+            # anyway, but AFTER local_body -- serializing head and worker compute.
+            t_wait0 = time.perf_counter()
+            for req in requests:
+                req.wait()
+            wait_s = time.perf_counter() - t_wait0
+            self.last_wait_s = wait_s
+            t0 = time.perf_counter()
+            local = local_body(per_rank_payload(self.head, w0, w1), self.model)
+            head_wall = time.perf_counter() - t0
+        except BaseException:
+            # Drain: a worker that was sent a command WILL reply. If we don't
+            # receive it here, it sits in the channel and corrupts the next
+            # run()'s bookkeeping (or blocks stop()'s send). A worker that never
+            # received a command must NOT be recv'ed from (it never sent a reply).
+            for req in requests:
+                try:
+                    req.wait()
+                except Exception:  # noqa: BLE001 - best-effort drain, never masks the raise
+                    pass
+            for r in sent_workers:
+                try:
+                    self.comm.recv(source=self.layout.fanout_rank(r))
+                except Exception:  # noqa: BLE001 - best-effort drain, never masks the raise
+                    pass
+            raise
         replies = {self.head: _reply(self.seq, self.head, True, local, head_wall)}
         for r in self.layout.worker_ranks:
             replies[r] = self.comm.recv(source=self.layout.fanout_rank(r))
+        # seq check FIRST: a stale reply (left over from an earlier, aborted run())
+        # must be reported as a sequence error, not misread as a fresh remote failure.
+        bad_seq = [rep["rank"] for rep in replies.values() if rep["seq"] != self.seq]
+        if bad_seq:
+            raise RuntimeError(f"fan-out sequence mismatch from ranks {bad_seq} (op={op!r})")
         failures = [rep for rep in replies.values() if not rep["ok"]]
         if failures:
             if self.logger is not None:
@@ -130,13 +177,15 @@ class WalkerFanout:
                     )
             first = failures[0]
             raise RemoteWorkerError(first["rank"], op, move, first.get("error"))
-        bad_seq = [rep["rank"] for rep in replies.values() if rep["seq"] != self.seq]
-        if bad_seq:
-            raise RuntimeError(f"fan-out sequence mismatch from ranks {bad_seq} (op={op!r})")
         if self.logger is not None:
             worst = max(rep["wall_s"] for rep in replies.values())
             self.logger.debug(
-                "[FANOUT] op=%s move=%s head_s=%.3f max_rank_s=%.3f", op, move, head_wall, worst
+                "[FANOUT] op=%s move=%s head_s=%.3f max_rank_s=%.3f wait_s=%.3f",
+                op,
+                move,
+                head_wall,
+                worst,
+                wait_s,
             )
         return merge({r: rep["result"] for r, rep in replies.items()})
 
@@ -153,8 +202,9 @@ class WalkerFanout:
         return digests
 
     def stop(self):
-        if self.single or not self.is_head:
+        if self.single or not self.is_head or self._stopped:
             return
+        self._stopped = True
         for r in self.layout.worker_ranks:
             self.comm.send(
                 {

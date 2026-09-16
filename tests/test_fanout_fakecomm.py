@@ -31,12 +31,14 @@ class _StubMove:
         return {"rank_sum": float(np.sum(payload["x"])), "model": model}
 
 
-def _run_world(size, nodes, nwalkers, head_fn, saver_fn=None):
+def _run_world(size, nodes, nwalkers, head_fn, saver_fn=None, ranks_per_gpu=1):
     world = FakeWorld(size, nodes=nodes)
     stubs = {}
 
     def fn(rank, comm):
-        layout = build_layout(comm, nwalkers, [0, 1], legacy=False)
+        layout = build_layout(
+            comm, nwalkers, [0, 1], legacy=False, ranks_per_gpu=ranks_per_gpu
+        )
         fcomm = layout.make_fanout_comm(comm)
         role = layout.role_of(rank)
         if role == RankRole.SAVER:
@@ -196,6 +198,121 @@ class FanoutFakeCommTest(unittest.TestCase):
                 local_body=lambda p, m: None,
                 merge=lambda r: r,
             )
+
+    def test_head_body_failure_drains_and_next_run_succeeds(self):
+        def head(fo, layout):
+            def payload(rank, w0, w1):
+                return {"x": np.arange(w0, w1)}
+
+            calls = {"n": 0}
+
+            def body(p, model):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise ValueError("head boom")
+                return {"rank_sum": float(np.sum(p["x"])), "model": model}
+
+            with self.assertRaises(ValueError) as cm:
+                fo.run(
+                    "score",
+                    move="stub",
+                    per_rank_payload=payload,
+                    local_body=body,
+                    merge=lambda r: r,
+                )
+            self.assertNotIsInstance(cm.exception, RemoteWorkerError)
+            self.assertIn("head boom", str(cm.exception))
+
+            # a second run(), with a normal body, must succeed cleanly: nothing
+            # left over in the channel from the failed first run()
+            return fo.run(
+                "score",
+                move="stub",
+                per_rank_payload=payload,
+                local_body=body,
+                merge=lambda r: r,
+            )
+
+        (out, stubs) = _run_world(3, [0, 0, 0], 4, head)
+        self.assertEqual(
+            out[0],
+            {
+                0: {"rank_sum": 1.0, "model": "model-0"},
+                1: {"rank_sum": 5.0, "model": "model-1"},
+            },
+        )
+        # worker served the (successfully-processed) first command AND the second
+        self.assertEqual(out[1], 2)
+
+    def test_two_workers_both_fail_first_in_rank_order_and_channel_drains(self):
+        def head(fo, layout):
+            def payload(rank, w0, w1):
+                return {"x": np.arange(w0, w1)}
+
+            def body(p, model):
+                return {"rank_sum": float(np.sum(p["x"])), "model": model}
+
+            with self.assertRaises(RemoteWorkerError) as cm:
+                fo.run(
+                    "boom",
+                    move="stub",
+                    per_rank_payload=payload,
+                    local_body=body,
+                    merge=lambda r: r,
+                )
+            self.assertEqual(cm.exception.rank, 1)  # first failure in worker order
+
+            out2 = fo.run(
+                "score",
+                move="stub",
+                per_rank_payload=payload,
+                local_body=body,
+                merge=lambda r: r,
+            )
+            return sorted(out2)
+
+        (out, stubs) = _run_world(5, [0, 0, 0, 0, 0], 8, head, ranks_per_gpu=2)
+        self.assertEqual(out[0], [0, 1, 2, 3])
+        for r in (1, 2, 3):
+            self.assertEqual(out[r], 2)  # boom command + the following success
+        self.assertEqual(out[4], "saver-idle")
+
+    def test_stop_is_idempotent(self):
+        def head(fo, layout):
+            fo.stop()
+            fo.stop()
+            return "done"
+
+        (out, stubs) = _run_world(3, [0, 0, 0], 4, head)
+        self.assertEqual(out[0], "done")
+        self.assertEqual(out[1], 0)  # worker served nothing but the (single) stop
+
+    def test_wait_s_recorded(self):
+        def head(fo, layout):
+            fo.run(
+                "score",
+                move="stub",
+                per_rank_payload=lambda r, w0, w1: {"x": np.arange(w0, w1)},
+                local_body=lambda p, m: {"rank_sum": float(np.sum(p["x"]))},
+                merge=lambda r: r,
+            )
+            return fo.last_wait_s
+
+        (out, stubs) = _run_world(3, [0, 0, 0], 4, head)
+        self.assertIsInstance(out[0], float)
+        self.assertGreaterEqual(out[0], 0.0)
+
+    def test_init_rejects_wrong_comm_size(self):
+        def fn(rank, comm):
+            layout = build_layout(comm, 4, [0, 1], legacy=False)
+            if rank == 0:
+                with self.assertRaises(ValueError):
+                    WalkerFanout(comm, layout, 0)  # WORLD comm (size 3) vs n_compute 2
+                return "raised"
+            return "ok"
+
+        out = FakeWorld(3).run(fn)
+        self.assertEqual(out[0], "raised")
 
 
 if __name__ == "__main__":

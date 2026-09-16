@@ -6,6 +6,18 @@ bcast / allgather / barrier / Split / Split_type / Abort / Free`` with
 pickle-copy transport, so the SAME fan-out code runs on a laptop with no
 MPI installed, in one python process. A test harness, not a performance
 tool.
+
+What the fake does NOT model:
+
+- ``tag`` is ignored: there is one FIFO queue per ``(source, dest)`` pair,
+  not per ``(source, dest, tag)``.
+- ``Split_type`` ignores its ``split_type`` argument and always groups by
+  node (the only grouping this codebase needs).
+- ``send``/``isend`` are a blocking pickle-copy into an unbounded queue:
+  no rendezvous handshake, no backpressure. Ordering bugs that only appear
+  under real MPI's rendezvous protocol for large messages (see fanout.py's
+  ``WalkerFanout.run`` isend/wait ordering, finding F1) cannot be
+  reproduced here.
 """
 
 from __future__ import annotations
