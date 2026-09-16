@@ -181,15 +181,26 @@ class RankBuildSeedTest(unittest.TestCase):
         self.assertIsNone(rank_build_seed(_SeedFit(None)))
         self.assertIsNone(rank_build_seed(_SeedFit(None, self._layout(), 1)))
 
-    def test_no_layout_is_the_plain_run_seed(self):
-        # single process / fit.sample(): prepare_rank never ran
-        self.assertEqual(rank_build_seed(_SeedFit(103209)), 103209)
+    def test_no_layout_is_the_domain_separated_run_seed(self):
+        # single process / fit.sample(): prepare_rank never ran. Still NOT the
+        # bare run seed -- that integer is what _seed_rank_streams feeds
+        # np.random.seed() (domain tag 0xB01D).
+        got = rank_build_seed(_SeedFit(103209))
+        self.assertEqual(got, rank_build_seed(_SeedFit(103209)))  # deterministic
+        self.assertNotEqual(got, 103209)
 
     def test_each_compute_rank_gets_its_own_seed(self):
         lay = self._layout()
         seeds = [rank_build_seed(_SeedFit(103209, lay, r)) for r in lay.compute_ranks]
         self.assertEqual(len(set(seeds)), len(lay.compute_ranks))
         self.assertNotIn(103209, seeds)  # never the bare run seed
+        # ... and never the GLOBAL-stream sub-seed of the same rank either:
+        # the two domains must not coincide by construction, not by luck
+        for rank in lay.compute_ranks:
+            self.assertNotEqual(
+                rank_build_seed(_SeedFit(103209, lay, rank)),
+                derive_rank_seed(103209, lay, rank),
+            )
 
     def test_the_same_rank_twice_is_the_same_seed(self):
         lay = self._layout()

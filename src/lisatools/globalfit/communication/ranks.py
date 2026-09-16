@@ -358,9 +358,19 @@ def rank_build_seed(fit):
     the walker blocks' prior draws and RJ birth candidates would correlate.
     This is the build-time analogue of :func:`derive_rank_seed`.
 
+    DOMAIN SEPARATION. The run seed also feeds ``np.random.seed()`` /
+    ``cupy.random.seed()`` on this rank (``_seed_rank_streams``), so returning
+    it (or ``derive_rank_seed``'s value) unchanged would hand the build-time
+    generators the very integer the global streams run on -- independent only
+    by the accident of different bit-mixing. The build base is therefore
+    ``SeedSequence([run_seed, 0xB01D])`` first, the way ``derive_rank_seed``
+    tags its own domain with ``0x5AFE``; every case below derives from it, so
+    a build seed is never the bare run seed and never equals
+    ``derive_rank_seed(run_seed, layout, rank)``.
+
     * ``general.random_seed is None`` -> ``None`` (entropy, exactly today);
     * a layout is resolved (``prepare_rank`` ran) -> the rank's sub-seed;
-    * no layout (single process, ``fit.sample()``) -> the plain run seed.
+    * no layout (single process, ``fit.sample()``) -> the build base itself.
 
     A rank with no walker block (the saver) has nothing to sample, so it
     takes the head's sub-seed rather than an index error.
@@ -368,14 +378,16 @@ def rank_build_seed(fit):
     seed = getattr(getattr(fit, "general", None), "random_seed", None)
     if seed is None:
         return None
+    base = int(np.random.SeedSequence(
+        [int(seed), 0xB01D]).generate_state(1, dtype=np.uint32)[0])
     layout = getattr(fit, "rank_layout", None)
     if layout is None:
-        return int(seed)
+        return base
     rank = getattr(fit, "rank", None)
     rank = layout.head_rank if rank is None else int(rank)
     if rank not in layout.compute_ranks:
         rank = layout.head_rank
-    return derive_rank_seed(int(seed), layout, rank)
+    return derive_rank_seed(base, layout, rank)
 
 
 # --------------------------------------------------------------------------

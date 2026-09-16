@@ -284,6 +284,83 @@ def _host(x):
     return x.get() if hasattr(x, "get") else np.asarray(x)
 
 
+# ======================================================================
+# RJ birth-container reseeding
+# ======================================================================
+# Every proposal class below builds ``np.random.default_rng(seed)`` at
+# construction, and the RJ birth assembly
+# (``fstat_gridfit.build_gb_birth_distribution``) constructs all of them with
+# ``seed=None`` -- i.e. OS entropy. Under the multi-rank fan-out that makes the
+# birth stream irreproducible even for a legacy-vs-legacy rerun of the same run
+# seed. ``reseed(seed)`` re-derives the whole tree's generators from ONE
+# integer AFTER construction, so:
+#
+# * ``general.random_seed`` set   -> births are seed-determined per rank and
+#                                    per F-stat epoch (the move derives the
+#                                    integer, see ``_birth_seed``);
+# * ``general.random_seed`` unset -> ``seed is None``, every ``reseed`` is a
+#                                    no-op and every stream stays on entropy,
+#                                    exactly as before.
+#
+# Each node gets a DISTINCT generator: the node's own ``_rng`` comes from
+# ``SeedSequence(seed)`` and its children from that sequence's ``spawn``
+# children, in the fixed attribute order each class documents.
+
+
+def _child_seeds(ss, n: int):
+    """``n`` independent integer seeds spawned off ``ss`` (a SeedSequence)."""
+    return [int(kid.generate_state(1, dtype=np.uint32)[0])
+            for kid in ss.spawn(int(n))]
+
+
+def _reseed_node(node, seed):
+    """Reseed one child node when it owns a private ``Generator``.
+
+    Nodes with no ``reseed`` are left alone ON PURPOSE: eryn's analytic
+    distributions (``UniformDistribution``, ...) and
+    :class:`~lisatools.sampling.prior.FullGaussianMixtureModel` draw from the
+    MODULE-level ``np.random`` state, which the run seeds per rank in
+    ``run.py::_seed_rank_streams`` -- there is no per-object stream to set.
+    An eryn ``ProbDistContainer`` is recursed into by its ``priors_in``
+    mapping (insertion order, which is the container's construction order).
+    """
+    if node is None or seed is None:
+        return
+    fn = getattr(node, "reseed", None)
+    if callable(fn):
+        fn(int(seed))
+        return
+    priors_in = getattr(node, "priors_in", None)
+    if isinstance(priors_in, dict) and priors_in:
+        kids = _child_seeds(np.random.SeedSequence(int(seed)), len(priors_in))
+        for child, kid in zip(priors_in.values(), kids):
+            _reseed_node(child, kid)
+
+
+def reseed_birth_tree(obj, seed):
+    """Reseed a whole RJ birth container from one integer; returns ``obj``.
+
+    The strict entry point: ``obj`` must be either a proposal class of this
+    module (any ``reseed`` owner) or an eryn ``ProbDistContainer``. Anything
+    else raises :class:`TypeError` naming the class -- a new wrapper class
+    that forgot ``reseed`` then fails loudly in the birth-seed unit test
+    instead of silently leaving a birth stream on entropy in a production run.
+
+    ``seed=None`` is a no-op (the type check still runs).
+    """
+    if not (callable(getattr(obj, "reseed", None))
+            or isinstance(getattr(obj, "priors_in", None), dict)):
+        raise TypeError(
+            f"reseed_birth_tree: {type(obj).__name__} has no reseed() and is "
+            "not a ProbDistContainer, so its RNG stream cannot be made "
+            "reproducible. Give the class a reseed(seed) method (see "
+            "fstat_proposal's proposal classes) before putting it in the RJ "
+            "birth container."
+        )
+    _reseed_node(obj, seed)
+    return obj
+
+
 # Row-major upper-triangle layout of the symmetric (4, 4) filter Gram matrix
 # as returned by ``get_fstat_ll_wdm``: [M00, M01, M02, M03, M11, M12, M13,
 # M22, M23, M33].
@@ -866,6 +943,18 @@ class FStatProposal4D:
         state["wdm_holder"] = None
         return state
 
+    def reseed(self, seed):
+        """Re-derive :attr:`_rng` from ``seed``; LEAF (no child proposals).
+
+        ``seed is None`` returns immediately and touches nothing, so the
+        entropy stream built at construction survives (the
+        ``general.random_seed is None`` path). See the module's
+        "RJ birth-container reseeding" block.
+        """
+        if seed is None:
+            return
+        self._rng = np.random.default_rng(np.random.SeedSequence(int(seed)))
+
     # ------------------------------------------------------------------
     # construction
     # ------------------------------------------------------------------
@@ -1174,6 +1263,15 @@ class StackedFStatProposal4D:
         from ..utils.utility import get_array_module
 
         return get_array_module(self._chunks[0]["log_wcell"])
+
+    def reseed(self, seed):
+        """Re-derive :attr:`_rng` from ``seed``; LEAF (no child proposals).
+
+        ``seed is None`` returns immediately and touches nothing.
+        """
+        if seed is None:
+            return
+        self._rng = np.random.default_rng(np.random.SeedSequence(int(seed)))
 
     @classmethod
     def from_cache(cls, d, weights=None, seed: Optional[int] = None,
@@ -1499,6 +1597,20 @@ class GroupedStackedFStatProposal:
         self.weights = Wg / Wg.sum()
         self._rng = np.random.default_rng(seed)
 
+    def reseed(self, seed):
+        """Re-derive :attr:`_rng` and every group stack's, from ``seed``.
+
+        CHILD ORDER: ``self.components`` (the group stacks, in group order).
+        ``seed is None`` returns immediately and touches nothing.
+        """
+        if seed is None:
+            return
+        ss = np.random.SeedSequence(int(seed))
+        self._rng = np.random.default_rng(ss)
+        for child, kid in zip(self.components,
+                              _child_seeds(ss, len(self.components))):
+            _reseed_node(child, kid)
+
     # global per-box metadata (group order == f0-sorted global order)
     @property
     def f0_los(self):
@@ -1700,6 +1812,17 @@ class UniformFloorMixture:
         self._rng = np.random.default_rng(seed)
         self._log_vol = float(np.sum(np.log(self.hi - self.lo)))
 
+    def reseed(self, seed):
+        """Re-derive :attr:`_rng` and the wrapped base's, from ``seed``.
+
+        CHILD ORDER: ``self.base``. ``seed is None`` touches nothing.
+        """
+        if seed is None:
+            return
+        ss = np.random.SeedSequence(int(seed))
+        self._rng = np.random.default_rng(ss)
+        _reseed_node(self.base, _child_seeds(ss, 1)[0])
+
     def rvs(self, size=1):
         if isinstance(size, int):
             size = (size,)
@@ -1868,6 +1991,18 @@ class RatioTightenedBirth:
         self.use_cupy = bool(use_cupy)
         self._rng = np.random.default_rng(seed)
 
+    def reseed(self, seed):
+        """Re-derive :attr:`_rng` and the wrapped container's, from ``seed``.
+
+        CHILD ORDER: ``self.base`` (the 8/9-column ``ProbDistContainer``).
+        ``seed is None`` touches nothing.
+        """
+        if seed is None:
+            return
+        ss = np.random.SeedSequence(int(seed))
+        self._rng = np.random.default_rng(ss)
+        _reseed_node(self.base, _child_seeds(ss, 1)[0])
+
     def _xp(self, x=None):
         if x is not None:
             from ..utils.utility import get_array_module
@@ -1981,6 +2116,17 @@ class FdotAxisBirth:
         self.use_cupy = bool(use_cupy)
         self._defect = _defect
         self._rng = np.random.default_rng(seed)
+
+    def reseed(self, seed):
+        """Re-derive :attr:`_rng` and the wrapped 4-D grid's, from ``seed``.
+
+        CHILD ORDER: ``self.grid4``. ``seed is None`` touches nothing.
+        """
+        if seed is None:
+            return
+        ss = np.random.SeedSequence(int(seed))
+        self._rng = np.random.default_rng(ss)
+        _reseed_node(self.grid4, _child_seeds(ss, 1)[0])
 
     @property
     def _c_t(self):
@@ -2100,6 +2246,21 @@ class MixtureProposal:
         self.weights = w / w.sum()
         self._rng = np.random.default_rng(seed)
 
+    def reseed(self, seed):
+        """Re-derive :attr:`_rng` and every component's, from ``seed``.
+
+        CHILD ORDER: ``self.components`` (construction order -- peak stack
+        first, comb second in the RJ birth assembly). ``seed is None``
+        touches nothing.
+        """
+        if seed is None:
+            return
+        ss = np.random.SeedSequence(int(seed))
+        self._rng = np.random.default_rng(ss)
+        for child, kid in zip(self.components,
+                              _child_seeds(ss, len(self.components))):
+            _reseed_node(child, kid)
+
     def rvs(self, size=1):
         if isinstance(size, int):
             size = (size,)
@@ -2195,6 +2356,15 @@ class CombIntrinsicProposal:
         )
         self._rng = np.random.default_rng(seed)
 
+    def reseed(self, seed):
+        """Re-derive :attr:`_rng` from ``seed``; LEAF (no child proposals).
+
+        ``seed is None`` returns immediately and touches nothing.
+        """
+        if seed is None:
+            return
+        self._rng = np.random.default_rng(np.random.SeedSequence(int(seed)))
+
     def _fdot_lo_width(self, f0_mHz, xp=np):
         """Per-row feasible-fdot (lo, width) at ``mc_hi`` -- ONE function
         for rvs and logpdf, so the pair cannot drift apart."""
@@ -2283,6 +2453,21 @@ class ColumnPermutedProposal:
         for i, p in enumerate(self._perm):
             inv[p] = i
         self._inv = tuple(inv)
+
+    def reseed(self, seed):
+        """Forward ``seed`` to the wrapped distribution; owns no ``_rng``.
+
+        CHILD ORDER: ``self.base``. The stock base here is
+        :class:`~lisatools.sampling.prior.FullGaussianMixtureModel`, which
+        draws from the module-level ``np.random`` state rather than a private
+        ``Generator`` -- :func:`_reseed_node` leaves such a node alone, so
+        this is a no-op on the GMM path (its stream is the one
+        ``run.py::_seed_rank_streams`` seeds per rank). The forward exists so
+        a future reseedable base is covered without another edit here.
+        """
+        if seed is None:
+            return
+        _reseed_node(self.base, int(seed))
 
     def rvs(self, size=1):
         out = self.base.rvs(size=size)

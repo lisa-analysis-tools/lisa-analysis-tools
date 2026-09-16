@@ -2986,6 +2986,12 @@ def build_gb_moves(
                 fdot_astro_ratio_max=(
                     gb_info.fdot_astro_ratio_max
                     if getattr(gb_info, "use_fdot_astro", False) else None),
+                # PER-RANK build seed (GBSettings.build_seed, stamped by
+                # stock/base.py::prepare_branch_settings from
+                # communication.ranks.rank_build_seed). The move derives its
+                # per-epoch RJ birth seed from it (_birth_seed); None keeps
+                # every birth stream on OS entropy, as before.
+                build_seed=getattr(gb_info, "build_seed", None),
             ),
         )
         if _custom_birth is not None:

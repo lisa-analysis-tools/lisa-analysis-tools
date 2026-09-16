@@ -93,7 +93,7 @@ on the happy path — a bad layout fails exactly the same way with or without
 Also check on the first real (non-dry) launch:
 
 - **F-stat epoch completeness.** The head's GB `setup()` writes
-  `band_peaks_stacked.npz` / `fstat_centers.npz` / `DONE.json` into
+  `fstat_grid_peaks_stacked.npz` / `fstat_centers.npz` / `DONE.json` into
   `<fit_dir>/shared/epoch_NNNN/` and the ranks open those paths on the very
   next message, so the epoch directory has to be visible and complete on
   every node. The head `fsync`s them (`[FSTAT_EPOCH ...] head flushed epoch
@@ -148,6 +148,19 @@ variants default `EreborGeneralSettings.random_seed` to a fixed int
 (`103209`, no env knob) rather than drawing fresh entropy, so this is
 already automatic unless a driver overrides `fit.general.random_seed`
 explicitly — if it does, pin it to the same value for all three launches.
+
+- **What the seed now covers.** With `general.random_seed` set, the GB
+  build-time prior objects *and* the RJ birth container are seed-determined
+  **per rank and per F-stat epoch**: the rank's build seed
+  (`communication.ranks.rank_build_seed`, domain-tagged so it is never the
+  integer the global `np.random`/`cupy.random` streams run on) reaches the
+  move as `fstat_fit_kwargs["build_seed"]`, and `_birth_seed(k)` derives one
+  birth stream per epoch for `build_gb_birth_distribution(seed=...)`. A
+  resume that re-installs the same epoch on the same rank therefore rebuilds
+  the identical birth container, and two ranks never share a birth stream.
+  With `random_seed` unset nothing is seeded — every birth generator stays on
+  OS entropy, exactly as before — and a bit-identity diff across layouts is
+  then meaningless for any run whose model has alive GB leaves.
 
 **What to diff:**
 - `[FANOUT_DIGEST]` lines — a per-iteration state hash (`log_like` + coords

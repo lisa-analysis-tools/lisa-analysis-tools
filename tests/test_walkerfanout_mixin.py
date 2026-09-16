@@ -233,6 +233,42 @@ class ProposeOverrideGuardTest(unittest.TestCase):
             self.assertIs(cls.propose, WalkerFanoutMixin.propose, cls.__name__)
 
 
+class _ACSModel:
+    """A model whose ACA reports a walker-row count."""
+
+    def __init__(self, entries):
+        self.analysis_container_arr = type("A", (), {"acs_total_entries": entries})()
+
+
+class HeadACAWidthGuardTest(unittest.TestCase):
+    """The mixin's ACA-width rule: the head's ACA is its BLOCK, not the ensemble.
+
+    The raise branch was untested (re-review NEW-3) -- the other mixin tests
+    pass a string model, so ``entries is None`` short-circuits the guard.
+    """
+
+    def _move(self):
+        layout = FakeWorld(3).run(
+            lambda r, c: build_layout(c, NWALKERS, [0, 1], legacy=False))[0]
+        move = _StubMove(0.0)
+        move.install_walker_fanout(_Curr(WalkerFanout(None, layout, 0), 0))
+        self.assertTrue(move.fanout_active)
+        return move, layout
+
+    def test_an_ensemble_width_aca_raises_before_any_fan_out(self):
+        move, layout = self._move()
+        w0, w1 = layout.block_of(0)
+        state = make_state(np.random.default_rng(1))
+        with self.assertRaises(RuntimeError) as ctx:
+            move.propose(_ACSModel(NWALKERS), state)  # block is NWALKERS // 2
+        msg = str(ctx.exception)
+        self.assertIn("_StubMove", msg)
+        self.assertIn(f"{NWALKERS} walker rows", msg)
+        self.assertIn(f"[{w0}, {w1}) ({w1 - w0} walkers)", msg)
+        # raised before the (None) fan-out comm was ever touched
+        self.assertEqual(move.seen_models, [])
+
+
 class SharedControlInstallTest(unittest.TestCase):
     def test_second_install_keeps_the_configured_adaptive(self):
         # the PSD search and PE moves share ONE TemperatureControl: the second

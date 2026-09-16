@@ -84,11 +84,15 @@ def make_grid_move(epoch_complete=True, root="/nowhere"):
     """An F-stat grid move whose install side effects are recorded, not run.
 
     ``_setup_from_directive`` probes the epoch directory before installing
-    anything: ``_epoch_complete`` (the stage-B npz or ``DONE.json``) and,
-    when the head asks for the center table, ``fstat_centers.npz``.
-    ``epoch_complete`` stubs the first; the second is a REAL
-    ``os.path.exists`` against ``root``, so a test that wants it present
-    points ``root`` at a tmpdir and writes the file.
+    anything: ``_epoch_missing_for_ranks`` (``DONE.json`` AND the stage-B
+    npz, the zero-peak manifest aside) and, when the head asks for the
+    center table, ``fstat_centers.npz``. ``epoch_complete`` stubs the first
+    (``True``/``False``); the second is a REAL ``os.path.exists`` against
+    ``root``, so a test that wants it present points ``root`` at a tmpdir
+    and writes the file.
+
+    ``epoch_complete=None`` leaves BOTH completeness predicates as the real
+    implementations, for the tests that exercise them against a directory.
     """
     move = make_move(gbs.GBSpecialRJFStatGridMove)
     move.installs, move.ctr_installs = [], []
@@ -97,18 +101,37 @@ def make_grid_move(epoch_complete=True, root="/nowhere"):
         move.ctr_installs.append((k, model)))
     move._epoch_dir = lambda k: os.path.join(root, f"epoch_{int(k):04d}")
     move._epoch_fit_clock = lambda k: 0
-    move._epoch_complete = lambda d: bool(epoch_complete)
+    if epoch_complete is not None:
+        move._epoch_complete = lambda d: bool(epoch_complete)
+        move._epoch_missing_for_ranks = (
+            lambda d: None if epoch_complete else "DONE.json")
     return move
 
 
-def make_epoch_dir(tmpdir, k=3, ctr_npz=True):
-    """A complete-looking epoch dir under ``tmpdir``; returns its ROOT."""
-    from lisatools.sampling.fstat_gridfit import CENTER_TABLE_BASENAME
+def make_epoch_dir(tmpdir, k=3, ctr_npz=True, done=True, peaks_npz=False,
+                   n_peaks=None):
+    """An epoch dir under ``tmpdir``; returns its ROOT.
+
+    Defaults to the shape the stubbed tests want (``DONE.json`` + the center
+    table). ``done`` / ``peaks_npz`` / ``n_peaks`` build the real
+    combinations ``_epoch_missing_for_ranks`` has to separate.
+    """
+    from lisatools.sampling.fstat_gridfit import (
+        CENTER_TABLE_BASENAME,
+        GRID_BASENAME,
+    )
 
     d = os.path.join(tmpdir, f"epoch_{int(k):04d}")
     os.makedirs(d, exist_ok=True)
-    with open(os.path.join(d, "DONE.json"), "w") as f:
-        f.write('{"clock": 0}')
+    if done:
+        body = '{"clock": 0}' if n_peaks is None else (
+            '{"clock": 0, "n_peaks": %d}' % int(n_peaks))
+        with open(os.path.join(d, "DONE.json"), "w") as f:
+            f.write(body)
+    if peaks_npz:
+        np.savez(os.path.join(
+            d, GRID_BASENAME.replace(".npz", "_peaks_stacked.npz")),
+            logp_grids=np.zeros(1))
     if ctr_npz:
         np.savez(os.path.join(d, CENTER_TABLE_BASENAME), f0_mHz=np.zeros(1))
     return tmpdir
@@ -468,6 +491,49 @@ class SetupFromDirectiveTest(unittest.TestCase):
         self.assertEqual(move.installs, [])
         self.assertEqual(move.ctr_installs, [])
 
+    # ---- and the check is the STRICT one (npz first, manifest last) ----
+    def _real_move(self, **kw):
+        tmp = tempfile.mkdtemp(prefix="gb_epoch_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        root = make_epoch_dir(tmp, 3, ctr_npz=False, **kw)
+        return make_grid_move(epoch_complete=None, root=root)
+
+    def test_the_mid_write_epoch_is_refused_by_name(self):
+        # the head writes the stage-B npz FIRST and DONE.json LAST, so this
+        # is exactly the state a rank must refuse -- and the one
+        # ``_epoch_complete``'s OR accepts
+        move = self._real_move(done=False, peaks_npz=True)
+        move.gf_rank = 1
+        with self.assertRaises(RuntimeError) as ctx:
+            move._setup_from_directive({"epoch": 3, "ctr_table": False})
+        msg = str(ctx.exception)
+        self.assertIn("DONE.json", msg)
+        self.assertIn("incomplete", msg)
+        self.assertEqual(move.installs, [])
+        # the permissive predicate would have let this through
+        self.assertTrue(gbs.GBSpecialRJFStatGridMove._epoch_complete(
+            move._epoch_dir(3)))
+
+    def test_both_artifacts_present_installs(self):
+        move = self._real_move(peaks_npz=True, n_peaks=17)
+        move._setup_from_directive({"epoch": 3, "ctr_table": False})
+        self.assertEqual(move.installs, [(3, {"sync_shutoff": False})])
+
+    def test_a_zero_peak_epoch_needs_no_stage_b_npz(self):
+        # legitimate: the head writes no *_peaks_stacked.npz when the fit
+        # found nothing, records it in the manifest, and falls back to the
+        # prior for births -- the rank must do the same, not die
+        move = self._real_move(peaks_npz=False, n_peaks=0)
+        move._setup_from_directive({"epoch": 3, "ctr_table": False})
+        self.assertEqual(move.installs, [(3, {"sync_shutoff": False})])
+
+    def test_a_manifest_claiming_peaks_still_needs_the_npz(self):
+        move = self._real_move(peaks_npz=False, n_peaks=17)
+        with self.assertRaises(RuntimeError) as ctx:
+            move._setup_from_directive({"epoch": 3, "ctr_table": False})
+        self.assertIn("_peaks_stacked.npz", str(ctx.exception))
+        self.assertEqual(move.installs, [])
+
     def test_an_incomplete_epoch_raises_even_from_the_registry(self):
         # the process-global memo must not short-circuit the check either
         move = make_grid_move(epoch_complete=False)
@@ -553,15 +619,41 @@ class FlushEpochArtifactsTest(unittest.TestCase):
         # DONE.json + fstat_centers.npz (no stage-B npz in this fixture)
         self.assertEqual(len(synced), 2)
 
+    def test_the_second_flush_of_the_same_epoch_is_a_no_op(self):
+        # the caller sits in the head's propose (every iteration) while an
+        # epoch's bytes only change when setup() writes a new one
+        move = make_grid_move(root=make_epoch_dir(self.tmp, 3, ctr_npz=True))
+        synced = []
+        with mock.patch.object(gbs.os, "fsync", synced.append):
+            with self.assertLogs(gbs.logger, level="INFO") as log:
+                move._flush_epoch_artifacts(3)
+                move._flush_epoch_artifacts(3)
+                move._flush_epoch_artifacts(3)
+        self.assertEqual(len(synced), 2)  # ONE pass over the two artifacts
+        self.assertEqual(
+            len([line for line in log.output if "head flushed epoch" in line]), 1)
+
+    def test_a_new_epoch_flushes_again(self):
+        move = make_grid_move(root=make_epoch_dir(self.tmp, 3, ctr_npz=True))
+        make_epoch_dir(self.tmp, 4, ctr_npz=True)
+        synced = []
+        with mock.patch.object(gbs.os, "fsync", synced.append):
+            move._flush_epoch_artifacts(3)
+            move._flush_epoch_artifacts(4)
+        self.assertEqual(len(synced), 4)
+
     def test_a_missing_epoch_dir_is_not_fatal(self):
         move = make_grid_move(root=os.path.join(self.tmp, "absent"))
-        move._flush_epoch_artifacts(3)  # nothing to flush, no raise
+        with self.assertLogs(gbs.logger, level="INFO") as log:
+            move._flush_epoch_artifacts(3)  # nothing to flush, no raise
+        self.assertTrue(any("no artifacts" in line for line in log.output))
 
     def test_no_epoch_and_no_epoch_dir_are_no_ops(self):
         move = make_grid_move(root=self.tmp)
-        move._flush_epoch_artifacts(None)
         base = make_move()  # no ``_epoch_dir`` on the base class
-        base._flush_epoch_artifacts(3)
+        with self.assertNoLogs(gbs.logger, level="INFO"):
+            move._flush_epoch_artifacts(None)
+            base._flush_epoch_artifacts(3)
 
     def test_an_unreadable_artifact_warns_rather_than_raises(self):
         move = make_grid_move(root=make_epoch_dir(self.tmp, 3, ctr_npz=True))
@@ -573,6 +665,43 @@ class FlushEpochArtifactsTest(unittest.TestCase):
             with self.assertLogs(gbs.logger, level="WARNING") as log:
                 move._flush_epoch_artifacts(3)
         self.assertTrue(any("fsync" in line for line in log.output))
+
+
+class BlockACAWidthTest(unittest.TestCase):
+    """The ACA-width rule guard of the orchestrated GB propose.
+
+    Its body runs in the gated two-rank smoke, but the RAISE branch and its
+    message were untested (re-review NEW-3): an ensemble-width ACA on a rank
+    silently scores the wrong walkers, so the message has to name both
+    widths.
+    """
+
+    def _move(self, entries, block=(0, 2)):
+        move = make_move()
+        fanout = _FakeFanoutWithLayout(_FakeLayout(block), is_head=True)
+        fanout.rank = 0
+        move.fanout = fanout
+        acs = _FakeACS()
+        if entries is not None:
+            acs.acs_total_entries = entries
+        return move, acs
+
+    def test_an_ensemble_width_aca_raises_naming_both_widths(self):
+        move, acs = self._move(4)  # 4 = the ensemble, 2 = this block
+        with self.assertRaises(RuntimeError) as ctx:
+            move._check_block_aca_width(acs)
+        msg = str(ctx.exception)
+        self.assertIn("gb_test", msg)
+        self.assertIn("4 walker rows", msg)
+        self.assertIn("[0, 2) (2 walkers)", msg)
+
+    def test_the_block_width_passes(self):
+        move, acs = self._move(2)
+        self.assertIsNone(move._check_block_aca_width(acs))
+
+    def test_an_aca_that_reports_no_rows_is_not_checked(self):
+        move, acs = self._move(None)
+        self.assertIsNone(move._check_block_aca_width(acs))
 
 
 class NeutralBlockTest(unittest.TestCase):

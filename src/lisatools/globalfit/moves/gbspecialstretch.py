@@ -4197,9 +4197,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         ``run_proposal`` (the residual drifts within a proposal, but the
         reference only sets the proposal CENTER, not the accept test).
 
-        TODO (fstat refit cadence): the F-stat PEAK GRID (band_peaks_stacked
-        .npz driving the birth container's intrinsics) is built ONCE up front
-        against the initial residual, so it goes stale as sources are
+        TODO (fstat refit cadence): the F-stat PEAK GRID
+        (fstat_grid_peaks_stacked.npz, driving the birth container's
+        intrinsics) is built ONCE up front against the initial residual, so it
+        goes stale as sources are
         subtracted. Examine refitting the F-stat (grid + this reference) at the
         BEGINNING OF EACH PROPOSAL so births track the evolving residual --
         gated on the wall-time cost of the refit (grid rebuild was ~7s comb +
@@ -17290,12 +17291,33 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         else:
             type(self)._branch_propose_counts[self.branch_name] = count
 
+    def _check_block_aca_width(self, acs):
+        """Refuse an ``AnalysisContainerArray`` that is not this rank's block.
+
+        Under the fan-out every flat ``(temp, walker, band)`` index in the
+        orchestrated propose is computed against the BLOCK width while the
+        fills run against the ACA's rows, so an ensemble-width ACA on a rank
+        silently scores the wrong walkers (spec, ACA-width rule). An ACA with
+        no ``acs_total_entries`` (test stubs) is not checked.
+        """
+        entries = getattr(acs, "acs_total_entries", None)
+        if entries is None:
+            return
+        w0, w1 = self.fanout.layout.block_of(self.fanout.rank)
+        if int(entries) != w1 - w0:
+            raise RuntimeError(
+                f"{self.name}: the head's AnalysisContainerArray carries "
+                f"{int(entries)} walker rows but its block is "
+                f"[{w0}, {w1}) ({w1 - w0} walkers). The per-rank ACA "
+                "must be built at the block width, not the ensemble width."
+            )
+
     def _setup_from_directive(self, directive):
         """The rank-side stand-in for ``setup()``: install epoch tables only.
 
         ``setup()`` on an F-stat grid move can RUN THE FIT -- an expensive
         residual-dependent sweep against a walker chosen by a LOCAL
-        ``argmax``, which then writes ``band_peaks_stacked.npz`` and
+        ``argmax``, which then writes ``fstat_grid_peaks_stacked.npz`` and
         ``DONE.json``. That is head-only work: the head runs ``setup()``
         first, so by the time a rank serves ``gb_run_proposal`` the epoch
         directory is complete and this is a pure in-memory load
@@ -17321,6 +17343,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         silently. Raise instead; the head's ``_flush_epoch_artifacts`` is the
         other half of the contract.
 
+        The test is :meth:`_epoch_missing_for_ranks`, NOT ``_epoch_complete``:
+        the latter is an OR (npz or manifest) and the head writes the npz
+        FIRST, so it accepts the exact "head still writing" state this check
+        exists to reject.
+
         No-op on the base class (only ``GBSpecialRJFStatGridMove`` has an
         ``_install``) and no-op when the head ships no epoch.
         """
@@ -17331,10 +17358,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             return
         k = int(k)
         epoch_dir = self._epoch_dir(k)
-        if not self._epoch_complete(epoch_dir):
+        missing = self._epoch_missing_for_ranks(epoch_dir)
+        if missing is not None:
             raise RuntimeError(
                 f"rank {self.gf_rank}: F-stat epoch {k} incomplete at "
-                f"{epoch_dir} (DONE.json missing) -- the head's setup() must "
+                f"{epoch_dir} ({missing} missing) -- the head's setup() must "
                 "finish and flush before the ranks install it"
             )
         if directive.get("ctr_table"):
@@ -17375,13 +17403,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """HEAD: fsync epoch ``k``'s artifacts before any rank reads them.
 
         The other half of :meth:`_setup_from_directive`'s completeness check.
-        ``setup()`` writes ``band_peaks_stacked.npz`` / ``fstat_centers.npz``
-        / ``DONE.json`` through buffered Python file objects; the next MPI
-        message has every OTHER process open the same paths over a shared
-        filesystem. ``os.sync()`` is not portable and would flush the whole
-        machine, so this re-opens each artifact that exists and ``fsync``s
-        its descriptor -- the narrow, portable "these bytes are on the
-        server" barrier.
+        ``setup()`` writes ``fstat_grid_peaks_stacked.npz`` /
+        ``fstat_centers.npz`` / ``DONE.json`` through buffered Python file
+        objects; the next MPI message has every OTHER process open the same
+        paths over a shared filesystem. ``os.sync()`` is not portable and
+        would flush the whole machine, so this re-opens each artifact that
+        exists and ``fsync``s its descriptor -- the narrow, portable "these
+        bytes are on the server" barrier.
+
+        ONCE PER EPOCH. The caller sits in the head's propose, which runs
+        every iteration, while an epoch's bytes only change when ``setup()``
+        writes a new one -- so the last flushed ``(epoch, dir)`` is
+        remembered and a repeat returns immediately. Without that the head
+        re-``fsync``s three already-synced files on a shared filesystem and
+        emits an ``[FSTAT_EPOCH]`` line on every iteration.
 
         No-op off the F-stat grid moves (no ``_epoch_dir``) and when the head
         installed no epoch. Never fatal on its own: a missing artifact is the
@@ -17396,6 +17431,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         )
 
         d = self._epoch_dir(int(k))
+        if getattr(self, "_epoch_flushed", None) == (int(k), d):
+            return
+        self._epoch_flushed = (int(k), d)
         names = (
             self._EPOCH_MANIFEST,
             GRID_BASENAME.replace(".npz", "_peaks_stacked.npz"),
@@ -18399,16 +18437,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # the head's ACA must carry exactly its own walker block: every
             # flat (temp, walker, band) index below is computed against N
             # while the fills run against these rows (spec, ACA-width rule)
-            _acs = model.analysis_container_arr
-            _w0, _w1 = layout.block_of(fanout.rank)
-            _entries = getattr(_acs, "acs_total_entries", None)
-            if _entries is not None and int(_entries) != _w1 - _w0:
-                raise RuntimeError(
-                    f"{self.name}: the head's AnalysisContainerArray carries "
-                    f"{int(_entries)} walker rows but its block is "
-                    f"[{_w0}, {_w1}) ({_w1 - _w0} walkers). The per-rank ACA "
-                    "must be built at the block width, not the ensemble width."
-                )
+            self._check_block_aca_width(model.analysis_container_arr)
             # ``setup()`` above may have written a NEW epoch; the ranks open
             # those files from the shared filesystem on the very next message
             self._flush_epoch_artifacts(getattr(self, "_fstat_epoch", None))
@@ -20198,12 +20227,54 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         The manifest covers the legitimate zero-peak case, where no
         ``*_peaks_stacked.npz`` is ever written but the fit did run and must
         not be repeated forever.
+
+        THIS PROCESS's own decision only (``_fstat_fit_decision``: load vs
+        refit). The OR is deliberately permissive -- a half-written epoch of
+        THIS process resumes its own checkpoints -- so it is NOT the test a
+        rank may apply to another process's directory; that one is
+        :meth:`_epoch_missing_for_ranks`.
         """
         from lisatools.sampling.fstat_gridfit import GRID_BASENAME
 
         return (os.path.exists(os.path.join(
                     d, GRID_BASENAME.replace(".npz", "_peaks_stacked.npz")))
                 or os.path.exists(os.path.join(d, "DONE.json")))
+
+    @staticmethod
+    def _epoch_missing_for_ranks(d: str):
+        """The artifact a RANK is still missing in epoch dir ``d``, or ``None``.
+
+        The rank-side half of the completeness contract, and strictly
+        stronger than :meth:`_epoch_complete`. The head writes the stage-B
+        npz FIRST (inside ``run_fstat_grid_fit``) and ``DONE.json`` LAST, so
+        "npz present, manifest absent" is exactly the mid-write state a rank
+        must refuse -- and it is the state ``_epoch_complete``'s OR accepts.
+        Both artifacts are therefore required:
+
+        * no ``DONE.json`` -> the head has not finished this epoch;
+        * ``DONE.json`` but no ``*_peaks_stacked.npz`` -> refuse UNLESS the
+          manifest records ``n_peaks == 0``, the legitimate zero-peak epoch
+          for which no npz is ever written (the head then falls back to the
+          prior for births and the rank must do the same, not die).
+
+        The manifest is only read in that second case, so the common path is
+        two ``os.path.exists`` calls.
+        """
+        from lisatools.sampling.fstat_gridfit import GRID_BASENAME
+
+        manifest = os.path.join(d, "DONE.json")
+        if not os.path.exists(manifest):
+            return "DONE.json"
+        stacked = GRID_BASENAME.replace(".npz", "_peaks_stacked.npz")
+        if os.path.exists(os.path.join(d, stacked)):
+            return None
+        try:
+            with open(manifest) as f:
+                if int(json.load(f).get("n_peaks", -1)) == 0:
+                    return None
+        except (OSError, ValueError, TypeError):
+            pass
+        return stacked
 
     def _latest_epoch(self):
         root = self._fstat_root
@@ -20559,6 +20630,29 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         self._fstat_ctr_table = table
         _FSTAT_CTR_TABLE_REGISTRY[key] = table
 
+    def _birth_seed(self, k):
+        """Seed for epoch ``k``'s RJ birth container; ``None`` for entropy.
+
+        ``fstat_fit_kwargs["build_seed"]`` is the PER-RANK build seed the
+        recipe copies off ``GBSettings.build_seed``
+        (``communication.ranks.rank_build_seed`` -> ``stock/base.py
+        ::prepare_branch_settings``), so ranks get independent birth streams
+        and each epoch's re-``_install`` a fresh one -- while a resume that
+        re-installs the SAME epoch on the SAME rank rebuilds the same
+        container. ``0x6B62`` tags this as the BIRTH stream so it can never
+        collide with ``GBSetup._build_sub_seeds``' prior children, which
+        spawn off the same base.
+
+        ``None`` (no ``general.random_seed``) keeps every birth generator on
+        OS entropy, exactly as before this existed. NOT a user knob: the base
+        is machine-stamped per rank.
+        """
+        base = self.fstat_fit_kwargs.get("build_seed")
+        if base is None:
+            return None
+        return int(np.random.SeedSequence(
+            [int(base), int(k), 0x6B62]).generate_state(1, dtype=np.uint32)[0])
+
     def _install(self, k: int, stacked=None, n_peaks=None, *,
                  sync_shutoff=True):
         """Install epoch ``k``'s birth grid (pure in-memory).
@@ -20619,6 +20713,8 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             # residual whose found sources are already gone, so the tilt
             # flattens (see peak_weight_alpha_env).
             epoch=k,
+            # Per-rank, per-epoch RJ birth stream (None -> entropy, as before).
+            seed=self._birth_seed(k),
         )
         if container is None:
             # Zero peaks (or a stage that produced nothing): fall back to the

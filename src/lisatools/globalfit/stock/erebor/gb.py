@@ -246,6 +246,10 @@ class GBSettings(Settings):
     # env knob: a bare run seed here would give every walker block the same
     # prior draws. ``None`` (no ``general.random_seed``) keeps those objects
     # on OS entropy, exactly as before this field existed.
+    # The RJ BIRTH container is seeded from it too, per F-stat epoch: the
+    # recipe copies it into ``fstat_fit_kwargs["build_seed"]`` and
+    # ``GBSpecialRJFStatGridMove._birth_seed(k)`` derives one stream per
+    # (rank, epoch) for ``build_gb_birth_distribution(seed=...)``.
     build_seed: typing.Optional[int] = None
     # GB's own tempering ladder size (the engine runs cold-chain only)
     ntemps: int = dataclasses.field(default_factory=env_default("GB_NTEMPS", 24, int))

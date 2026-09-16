@@ -34,18 +34,30 @@ proves nothing):
   columns. They now take PER-RANK sub-seeds derived from ``random_seed``
   (``communication/ranks.py::rank_build_seed`` -> ``GBSettings.build_seed``
   -> ``GBSetup._build_sub_seeds``).
-* 2026-09-16, with the injection ON: the control diverges in ``log_like``
-  itself (all 4 walkers, O(100) nats) -- and so does legacy vs orchestrator,
-  by the same magnitude. The seeded priors do not help, because a NON-EMPTY
-  model reaches a second entropy family the empty one never touches: once the
-  F-stat fit finds peaks, the RJ birth container
-  (``fstat_gridfit.build_gb_birth_distribution`` ->
-  ``StackedFStatProposal4D`` / ``CombIntrinsicProposal`` /
-  ``MixtureProposal`` / ``UniformFloorMixture`` / ``FdotAxisBirth`` /
-  ``RatioTightenedBirth``) is assembled with ``seed=None`` at every
-  constructor, i.e. ``np.random.default_rng()``. Every birth candidate then
-  comes off an entropy stream. Until those take the run seed, an injected
-  fixture CANNOT support a bit-identity gate -- hence the split above.
+* 2026-09-16, with the injection ON and the build seeds in: the control still
+  diverges in ``log_like`` (all 4 walkers, O(100) nats), so the injected
+  fixture STILL cannot support a bit-identity gate. Bisected (one legacy run
+  vs a second legacy run in the same process, injected):
+  ``start_log_like`` 0/4 differ, ``start_inds`` 0/800 differ (the model
+  starts EMPTY), ``start_coords`` **3200/7200 = 800 leaves x exactly 4 of
+  the 9 columns** differ -- down from 5 columns before the build seeds, i.e.
+  the seeded (f0, Mc) + (dist, alpha, sin_delta) columns now reproduce and
+  the remaining 4 are phi0 / cos_iota / psi / fdot_astro_ratio, the ones
+  eryn's ``uniform_dist`` draws from the MODULE-level ``np.random`` stream.
+  Its position at prior-draw time is not the same for the first and the
+  second fit built in one process (both runs are otherwise exactly
+  reproducible ACROSS processes -- run 1 and run 2 each give the same numbers
+  every time -- so no OS entropy is left anywhere in the path). The dead-leaf
+  fill itself is harmless, but the same stream feeds the birth containers'
+  extrinsic columns during sampling, which is how it reaches ``log_like``.
+  Closing this needs the global stream pinned at a defined point of the
+  build/sample boundary (or the fixture rebuilt one-fit-per-process); it is
+  NOT an entropy-seeded proposal object, so the birth-container seeding of
+  this round does not address it.
+* The RJ birth container itself IS now seeded (per rank, per F-stat epoch:
+  ``build_gb_birth_distribution(seed=...)`` <- ``_birth_seed(k)`` <-
+  ``fstat_fit_kwargs["build_seed"]``), unit-tested in
+  ``tests/test_fstat_birth_seed.py``.
 
 ``GB_SMOKE_PARITY_CONTROL=1`` re-runs the control here and automatically
 promotes the check to the FULL ``coords`` array (dead-leaf fill included)
@@ -76,11 +88,18 @@ RUN = os.environ.get("RUN_GF_GB_SMOKE", "") not in ("", "0")
 #: (legacy vs legacy). Off by default purely for MEMORY -- building this fit
 #: costs ~2.1 GB and the allocator does not give it all back, so measured
 #: 2026-09-16 the control takes the scenario to 5.13 GB peak RSS, past the
-#: 5 GB laptop budget below (the whole module without it measured 4.0-4.7 GB
-#: over five runs). Turn it on (``GB_SMOKE_PARITY_CONTROL=1``) on a bigger box
-#: to re-measure whether the fixture reproduces ``coords``; the last such
-#: measurement is recorded in the module docstring.
+#: 5 GB laptop budget the module otherwise holds (without it the whole module
+#: measured 4.0-4.7 GB over five runs; the parity scenario ALONE with the
+#: control measured 3.0 GB / 128 s, so running just that test is the cheap
+#: way to take this measurement). Turn it on
+#: (``GB_SMOKE_PARITY_CONTROL=1``) to re-measure that the fixture still
+#: reproduces itself; the last such measurement is in the module docstring.
 CONTROL = os.environ.get("GB_SMOKE_PARITY_CONTROL", "") not in ("", "0")
+
+#: peak-RSS ceiling asserted in ``tearDown``. The control run is an opt-in
+#: FOURTH/FIFTH fit in the process, so it gets its own (measured) headroom --
+#: the default gate stays at the 8 GB laptop's 5 GB.
+RSS_BUDGET_GB = 6.0 if CONTROL else 5.0
 
 #: arrays the orchestrator must reproduce bit for bit at one compute rank
 #: (``coords`` is handled separately -- see the module docstring)
@@ -185,7 +204,8 @@ class MultiRankGBSmokeTest(unittest.TestCase):
         # (the GB_DEBUG preset); do not leak them into the next test
         os.environ.clear()
         os.environ.update(self._env0)
-        self.assertLess(_rss_gb(), 5.0, "GB smoke exceeded the 5 GB laptop budget")
+        self.assertLess(_rss_gb(), RSS_BUDGET_GB,
+                        f"GB smoke exceeded the {RSS_BUDGET_GB} GB budget")
 
     def _fit(self, subdir, inject):
         from lisatools.globalfit.stock import erebor
@@ -277,36 +297,37 @@ class MultiRankGBSmokeTest(unittest.TestCase):
         self.assertTrue(inds[0, half:].any(), "worker block has no cold leaf")
 
     def test_orchestrator_at_one_rank_matches_the_legacy_body(self):
-        # NO injection here: with one the fixture stops reproducing (the birth
-        # container's entropy-seeded generators -- module docstring), and the
-        # measured legacy-vs-LEGACY control then diverges in ``log_like`` just
-        # as legacy-vs-orchestrator does, which would make this gate red for a
-        # fixture reason rather than a port one. Alive-source coverage lives in
-        # the two-rank scenario instead.
+        # NO injection here. The RJ birth container IS seeded now, but the
+        # injected fixture still does not reproduce ITSELF: the measured
+        # legacy-vs-LEGACY control diverges in ``log_like``, bisected to the
+        # 4 columns eryn's uniform priors draw off the module-level
+        # ``np.random`` stream (module docstring). Turning the injection on
+        # here would make this gate red for a fixture reason rather than a
+        # port one. Alive-source coverage lives in the two-rank scenario.
         legacy = self._run_world(1, env={"GB_PROPOSE_ORCHESTRATE": "0"}, subdir="legacy")[0]
+        if CONTROL:
+            # paired negative control FIRST: a second legacy run, same seed,
+            # same process. Without it an invariance claim proves nothing --
+            # it is what separates "the orchestrator diverges" from "this fit
+            # does not reproduce", so it is asserted BEFORE the orchestrator
+            # comparison rather than after it.
+            ctl = self._run_world(1, env={"GB_PROPOSE_ORCHESTRATE": "0"}, subdir="control")[0]
+            for key in PARITY_KEYS:
+                np.testing.assert_array_equal(
+                    ctl[key], legacy[key],
+                    err_msg=f"CONTROL legacy-vs-legacy differs in {key}: the fixture is "
+                            "non-reproducible here, so the orchestrator comparison "
+                            "would prove nothing")
         orch = self._run_world(1, env={"GB_PROPOSE_ORCHESTRATE": "1"}, subdir="orch")[0]
         for key in PARITY_KEYS:
             np.testing.assert_array_equal(orch[key], legacy[key], err_msg=key)
         alive = legacy["inds"]
         np.testing.assert_array_equal(
             orch["coords"][alive], legacy["coords"][alive], err_msg="alive coords")
-        if not CONTROL:
-            return
-        # paired negative control: a THIRD run, legacy again, same seed, same
-        # process. Without it an invariance claim proves nothing -- it is what
-        # separates "the orchestrator diverges" from "this fit does not
-        # reproduce" (see the module docstring).
-        ctl = self._run_world(1, env={"GB_PROPOSE_ORCHESTRATE": "0"}, subdir="control")[0]
-        for key in PARITY_KEYS:
-            np.testing.assert_array_equal(
-                ctl[key], legacy[key],
-                err_msg=f"CONTROL legacy-vs-legacy differs in {key}: the fixture is "
-                        "non-reproducible here, so the orchestrator comparison above "
-                        "proves nothing")
-        if np.array_equal(ctl["coords"], legacy["coords"]):
-            # the fixture reproduces its dead-leaf fill (every entropy-seeded
-            # site took the run seed): hold the orchestrator to the whole
-            # array, which is the gate the plan actually wants.
+        # the control decides whether the gate tightens to the WHOLE coords
+        # array (dead-leaf fill included): never weakened silently, never
+        # promoted on a fixture that cannot reproduce it.
+        if CONTROL and np.array_equal(ctl["coords"], legacy["coords"]):
             np.testing.assert_array_equal(orch["coords"], legacy["coords"], err_msg="coords")
 
 

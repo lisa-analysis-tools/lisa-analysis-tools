@@ -1584,7 +1584,8 @@ def build_gb_birth_distribution(*, cache_dir: str, mc_lims, A_lims,
                                 comb_weight: Optional[float] = None,
                                 stacked_live=None,
                                 expected_band_edges=None, epoch=None,
-                                ratio_tight=None, tobs=None):
+                                ratio_tight=None, tobs=None,
+                                seed: Optional[int] = None):
     """Stacked grids (+ optional comb) -> floor -> RJ birth container.
 
     ``stacked_live`` short-circuits the npz reload when the caller just built
@@ -1592,6 +1593,15 @@ def build_gb_birth_distribution(*, cache_dir: str, mc_lims, A_lims,
     :class:`CombIntrinsicProposal` with linear-in-F weighting -- proportional
     mass on EVERY comb peak, which is what successive births need after the
     loudest source is born and subtracted.
+
+    ``seed`` (optional): ONE integer that re-derives the RNG stream of every
+    node of the assembled container -- the cache-loaded / live stacks, the
+    comb, the mixture, the uniform floor and the outer wrappers -- through
+    :func:`~lisatools.sampling.fstat_proposal.reseed_birth_tree`. Every
+    constructor above still builds with ``seed=None``; the single reseed at
+    the end overrides them deterministically. ``seed=None`` changes NOTHING
+    (every stream stays on OS entropy, exactly as before), which is the
+    ``general.random_seed is None`` path.
 
     ``expected_band_edges`` (optional, Hz): when given and the grids come
     from the npz caches (not ``stacked_live``), the cached band grid is
@@ -1608,6 +1618,7 @@ def build_gb_birth_distribution(*, cache_dir: str, mc_lims, A_lims,
         UniformFloorMixture,
         fstat_knob,
         make_gb_rj_birth_container,
+        reseed_birth_tree,
         stacked_from_cache,
     )
 
@@ -1782,11 +1793,15 @@ def build_gb_birth_distribution(*, cache_dir: str, mc_lims, A_lims,
                     "(prior unchanged)", ratio_tight.get("phase_rad", 6.283),
                     ratio_tight.get("w_min", 0.05),
                     ratio_tight.get("eps", 0.1))
-    return make_gb_rj_birth_container(
+    container = make_gb_rj_birth_container(
         mix, A_lims, use_cupy=use_cupy,
         fdot_astro_ratio_max=fdot_astro_ratio_max, dist_lims=dist_lims,
         ratio_tight=ratio_tight, tobs=tobs, mc_lims=mc_lims,
     )
+    # ONE reseed for the whole tree (no-op when seed is None); see the
+    # ``seed`` paragraph above and fstat_proposal's reseeding block.
+    reseed_birth_tree(container, seed)
+    return container
 
 
 # --------------------------------------------------------------------------
