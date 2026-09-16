@@ -59,9 +59,14 @@
 #
 # V8-PARITY NOTES (deliberate divergences from the old 6mo_v1 draft --
 # the exact-copy rule wins for every non-Tobs knob): GB_USE_GALAXY_PRIOR
-# stays 1 (6mo_v1 had it 0, an 08-24 test-only ruling) and
-# VGB_CHIRP_MASS_BASIS stays 0 (6mo_v1 armed the chirp-basis debut; v8
-# production never did). Flip either ONLY with a fresh store.
+# stays 1 (6mo_v1 had it 0, an 08-24 test-only ruling). Flip it ONLY
+# with a fresh store.
+#
+# *** VGB_CHIRP_MASS_BASIS IS NOW 1 (user ruling 2026-09-16) -- the
+# v8-parity exact-copy pin at 0 is SUPERSEDED. See the VGB RELAUNCH
+# BLOCK below for the ruling, the validation numbers, and the LOUD
+# resume caveat (vgb chain ndim 5 -> 6: fresh store or migration, never
+# mid-store). ***
 #
 # Staged recipe: source_search -> noise_search -> noise_vgb_search ->
 # gb_search -> full_pe
@@ -103,9 +108,22 @@
 # ##   * git pull BOTH repos + ./install.sh (native headers) + the tests:  ##
 # ##       python -m unittest tests.test_staged_sources_wiring \          ##
 # ##           tests.test_eigen_refresh tests.test_inner_move_kind \      ##
-# ##           tests.test_vgb_eigen_inmodel                                ##
+# ##           tests.test_vgb_eigen_inmodel tests.test_vgb_ridge_gibbs \  ##
+# ##           tests.test_vgb_observable_basis tests.test_ridge_fiber      ##
 # ## Store gf_prod_6mo_v8/ is NEW -- nothing to migrate; the RELAUNCH      ##
 # ## block below is 3mo_v8 history only.                                   ##
+# ##                                                                        ##
+# ## ⚠ 2026-09-16 VGB=GB PARITY: VGB_CHIRP_MASS_BASIS 0 -> 1 (vgb ndim     ##
+# ## 5 -> 6) + the new vgb_ridge_gibbs move. If gf_prod_6mo_v8/ has        ##
+# ## ALREADY been launched on the 5-dim basis, this is NOT a resume: use   ##
+# ## a FRESH store, or run                                                  ##
+# ##   python scripts/fstat_proposal/migrate_vgb_chirp_basis.py \          ##
+# ##       <store.h5> <catalogue_dir>                                       ##
+# ## BEFORE relaunching. run.py refuses the mismatched resume at backend   ##
+# ## construction naming VGB_CHIRP_MASS_BASIS. Fresh store wipes the GB /  ##
+# ## noise chains too; the eigen sidecar and the warm-start npz SURVIVE    ##
+# ## (they are gb/sobbh/mbh/emri artifacts), and the vgb chain restarts at ##
+# ## exact truth anyway under VGB_START_FACTOR=0.                           ##
 # ############################################################################
 # ############################################################################
 # ## ⚠ RELAUNCH REQUIRED (2026-08-29): CAP GRID 1 -> 2 + STAGGER.          ##
@@ -2103,21 +2121,51 @@ export VGB_SIGHET_INMODEL=0
 # SNR gate -- both fixed in code (76cd3237); pre-fix VGB samples are
 # prior-only. Migration 1 in the header checklist is REQUIRED for the
 # VGB_NTEMPS=8 ladder below.
-# PARAMETERIZATION: the ESTABLISHED 5-dim DISTANCE basis
-# [dist, phi0, cos_iota, psi, fdot_astro_ratio] -- what this store has
-# been sampling all along. (User ruling 2026-08-15, superseding the
-# earlier chirp-basis arming: "revert to the old VGB parameterization
-# ... the old regular parameterization we had before" for these runs.)
-# Keeping it means NO chirp migration and NO ndim 5->6 change on a live
-# store -- one less thing moving while we validate the likelihood fix.
-# The 6-dim chirp basis (Mc sampled, un-collapses fdot_astro_ratio)
-# stays built and tested for the 6-month run: set 1 there and run
-# migrate_vgb_chirp_basis.py first.
-# NOTE: fdot_astro_ratio stays a COLLAPSED dimension in this basis
-# (truth exactly 0 x multiplicative init = zero spread, and the
-# affine-invariant stretch cannot create spread it never had). That is
-# the known, accepted cost of staying on the old parameterization.
-export VGB_CHIRP_MASS_BASIS=0
+# PARAMETERIZATION: the 6-dim CHIRP basis
+# [dist, phi0, cos_iota, psi, Mc, fdot_astro_ratio] -- Mc SAMPLED, only
+# f0 / alpha / sin_delta left as per-leaf fills.
+#
+# USER RULING 2026-09-16, superseding BOTH the 08-15 "revert to the old
+# VGB parameterization" ruling and this script's v8-parity exact-copy
+# pin at 0: "The VGBs should now (with stretch removed) have the exact
+# same mechanics as the GBs except f0 and sky fixed" -- Mc AND
+# fdot_astro_ratio both sampled -- and "really mirror the GBs as much as
+# possible ... VGBs get the ridge-gibbs fiber move too".
+#
+# WHAT THIS FIXES: on the old 5-dim basis fdot_astro_ratio was a
+# COLLAPSED dimension (truth exactly 0 x multiplicative init = zero
+# spread, and the affine-invariant stretch cannot create spread it never
+# had). The chirp basis un-collapses it: the nonzero catalogue Mc gives
+# the multiplicative init real spread, and the zero-truth ratio column
+# gets the documented ADDITIVE init exception
+# (VGB_RATIO_INIT_WIDTH x GB_FDOT_ASTRO_RATIO_MAX, still scaled by
+# VGB_START_FACTOR -- so START_FACTOR=0 below still starts at exact
+# truth).
+#
+# STANDALONE VALIDATION (HM Cnc smoke, 2026-09-16):
+#   * installed VGBObservableBasis log_jacobian EXACT vs analytic;
+#   * observable + eigen=full with fdot-weight 0 freezes Mc BY
+#     CONSTRUCTION (the fiber is exactly flat to the info matrix);
+#   * obs + eigen fw=0 + RIDGE-GIBBS was the BEST arm, cold acceptance
+#     0.593 -- the ridge move is what unfreezes Mc, so the two knobs
+#     ship together;
+#   * McRatioDistFiber works VERBATIM on the VGB layout: it resolves
+#     dist / Mc / fdot_astro_ratio by NAME and never reads f0.
+# The vgb_ridge_gibbs move registers AUTOMATICALLY off this flag --
+# recipe.build_vgb_moves gates on the basis carrying those three column
+# names, and run_combined_staged.py requests it in gb_search + full_pe
+# exactly where gb_ridge_gibbs rides. GB_RIDGE_GIBBS=0 kills both.
+#
+# *** LOUD CAVEAT -- NOT RESUME-COMPATIBLE. ***
+# This takes the vgb chain from ndim 5 to ndim 6. An existing store
+# CANNOT be resumed across the flip: run.py refuses it at backend
+# construction (before any chain load) with a message naming
+# VGB_CHIRP_MASS_BASIS. So this requires EITHER a FRESH store, OR a
+# vgb-branch migration with
+#   python scripts/fstat_proposal/migrate_vgb_chirp_basis.py \
+#       <store.h5> <catalogue_dir>
+# run BEFORE the first launch. NEVER flip this mid-store.
+export VGB_CHIRP_MASS_BASIS=1
 # 8-rung ladder (user ruling 2026-08-15). Resume derives the rung count
 # from the STORED band_temps shape, so the migration above MUST be run
 # with the matching "8" argument (it recreates every rung-dimensioned

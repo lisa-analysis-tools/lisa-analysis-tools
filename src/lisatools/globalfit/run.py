@@ -103,6 +103,65 @@ def null_check_only() -> bool:
     return os.environ.get("NULL_CHECK_ONLY", "").strip().lower() in _NULL_CHECK_TRUE
 
 
+def check_store_branch_ndims(stored_ndims, config_ndims, backend_path):
+    """Refuse a resume whose stored per-branch ndim differs from the config.
+
+    The CONSTRUCTION-level half of the resume-safety gate: ``stored_ndims``
+    comes from the backend's ``ndims`` HDF5 *attributes* (a handful of
+    scalars), so this fires before any chain is read. The identical check
+    runs again on the loaded state further down :meth:`GlobalFit.load_info`
+    as a backstop for stores whose attrs cannot be read.
+
+    Only the INTERSECTION of the two branch sets is compared: adding or
+    removing a branch between runs (``REMOVE_BRANCHES``) is legitimate and
+    handled elsewhere.
+
+    The vgb case gets its own message because it is the live one (user
+    ruling 2026-09-16): ``VGB_CHIRP_MASS_BASIS=1`` moves Mc from the
+    per-leaf fills to the sampled side, taking the vgb chain from 5 to 6
+    columns. That is NOT resume-compatible — a store must be fresh, or
+    migrated with ``scripts/fstat_proposal/migrate_vgb_chirp_basis.py``.
+    Never flip the knob mid-store.
+
+    Args:
+        stored_ndims: ``{branch: ndim}`` as the store holds it (``None`` or
+            empty is a no-op).
+        config_ndims: ``{branch: ndim}`` the current run configuration builds.
+        backend_path: Store path, quoted into the message.
+
+    Raises:
+        ValueError: A shared branch disagrees on ndim.
+    """
+    if not stored_ndims:
+        return
+    for name, cfg_nd in (config_ndims or {}).items():
+        if name not in stored_ndims:
+            continue
+        stored_nd = int(stored_ndims[name])
+        if stored_nd == int(cfg_nd):
+            continue
+        if name == "vgb":
+            raise ValueError(
+                f"Cannot resume {backend_path!r}: branch 'vgb' stored with "
+                f"ndim {stored_nd} but the run config expects {int(cfg_nd)}. "
+                "The VGB basis flag (VGB_CHIRP_MASS_BASIS: 5-dim legacy "
+                "distance basis vs 6-dim chirp-mass basis, which samples Mc "
+                "as well as fdot_astro_ratio) differs from the stored run. "
+                "Either set VGB_CHIRP_MASS_BASIS to match the store, start a "
+                "FRESH store, or migrate the file to the 6-dim basis with "
+                "scripts/fstat_proposal/migrate_vgb_chirp_basis.py (never "
+                "reshape silently, and never flip the knob mid-store)."
+            )
+        raise ValueError(
+            f"Cannot resume {backend_path!r}: branch {name!r} stored with "
+            f"ndim {stored_nd} but the run config expects {int(cfg_nd)}. For "
+            "GB this usually means GB_USE_ASTROPHYSICAL_F0_MC_PRIOR / "
+            "GB_USE_CHIRP_MASS differ from the stored run (8-col vs 9-col "
+            "fdot_astro_ratio basis). Start a fresh backend or match the "
+            "original config."
+        )
+
+
 def _branch_cap_edges(branch_info):
     """Leaf-cap CELL edges for a banded branch (user design 2026-08-15).
 
@@ -649,6 +708,24 @@ class GlobalFit:
             )
             if getattr(backend, "initialized", False):
                 _stored_it = int(getattr(backend, "iteration", 0) or 0)
+            # CHEAPEST SEAM where branch ndim meets the store: the ``ndims``
+            # HDF5 attrs, read at backend construction, before any chain
+            # load and before the mid-iteration checkpoint path. Catches the
+            # VGB_CHIRP_MASS_BASIS 5 <-> 6 flip against an existing store
+            # immediately instead of minutes into a build. An unreadable
+            # attrs group is NOT fatal here: the post-load backstop below
+            # repeats the comparison on the loaded state.
+            if _stored_it > 0:
+                try:
+                    _stored_ndims = dict(backend.ndims)
+                except Exception as _nd_err:    # never block a healthy start
+                    logger.debug(
+                        "store ndims attrs unreadable (%r); the post-load "
+                        "ndim guard remains", _nd_err)
+                else:
+                    check_store_branch_ndims(
+                        _stored_ndims, self.curr.ndims, backend_path
+                    )
 
         # Mid-iteration checkpoint (preemption protection): the sidecar
         # snapshot beats the HDF store when it was written at (or after) the
@@ -695,33 +772,23 @@ class GlobalFit:
                 # Guard against resuming a backend whose per-branch sampled
                 # dimensionality no longer matches the run config -- the most
                 # likely cause is toggling GB_USE_ASTROPHYSICAL_F0_MC_PRIOR /
-                # GB_USE_CHIRP_MASS (8 <-> 9 column GB basis) between runs.
-                for _name, _nd in self.curr.ndims.items():
-                    _coords = getattr(state, "branches_coords", {}).get(_name)
-                    if _coords is not None and _coords.shape[-1] != _nd:
-                        if _name == "vgb":
-                            raise ValueError(
-                                f"Cannot resume {backend_path!r}: branch "
-                                f"'vgb' stored with ndim "
-                                f"{_coords.shape[-1]} but the run config "
-                                f"expects {_nd}. The VGB basis flag "
-                                f"(VGB_CHIRP_MASS_BASIS: 5-dim legacy vs "
-                                f"6-dim chirp-mass) differs from the stored "
-                                f"run. Either set VGB_CHIRP_MASS_BASIS to "
-                                f"match the store, or migrate the file to "
-                                f"the 6-dim basis with scripts/"
-                                f"fstat_proposal/migrate_vgb_chirp_basis.py "
-                                f"(never reshape silently)."
-                            )
-                        raise ValueError(
-                            f"Cannot resume {backend_path!r}: branch {_name!r} "
-                            f"stored with ndim {_coords.shape[-1]} but the run "
-                            f"config expects {_nd}. For GB this usually means "
-                            f"GB_USE_ASTROPHYSICAL_F0_MC_PRIOR / "
-                            f"GB_USE_CHIRP_MASS differ from the stored run "
-                            f"(8-col vs 9-col fdot_astro_ratio basis). Start a "
-                            f"fresh backend or match the original config."
-                        )
+                # GB_USE_CHIRP_MASS (8 <-> 9 column GB basis), or
+                # VGB_CHIRP_MASS_BASIS (5 <-> 6 column VGB basis), between
+                # runs. BACKSTOP: the same comparison already ran against the
+                # store's ``ndims`` attrs at backend construction above; this
+                # repeat reads the dimensionality off the LOADED coords, so
+                # it also covers a store whose attrs disagree with its data.
+                check_store_branch_ndims(
+                    {
+                        _name: _coords.shape[-1]
+                        for _name, _coords in (
+                            getattr(state, "branches_coords", {}) or {}
+                        ).items()
+                        if _coords is not None
+                    },
+                    self.curr.ndims,
+                    backend_path,
+                )
 
                 # Guard against resuming a backend whose banded-branch band
                 # grid no longer matches the run config (e.g.

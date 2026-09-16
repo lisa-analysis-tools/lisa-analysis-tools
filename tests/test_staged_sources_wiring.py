@@ -35,7 +35,12 @@ STAGE_ENVS = ("GB_ONLY", "STAGE_SKIP_NOISE", "STAGE_SKIP_SOURCE_SEARCH",
               "GB_SEARCH_SOURCE_EVERY",
               "STAGE_NOISE_ONLY",
               "STAGE_NOISE_VGB_PE", "COMBINED_SMOKE", "TOBS_TARGET",
-              "GB_WARM_START_COMPONENTS", "REMOVE_BRANCHES")
+              "GB_WARM_START_COMPONENTS", "REMOVE_BRANCHES",
+              # 2026-09-16: =1 adds vgb_ridge_gibbs to the gb_search / PE
+              # stage move lists, so every exact stage-list assertion below
+              # needs it CLEARED rather than inherited from the ambient env
+              # (VGBChirpRidgeWiringTest covers the =1 composition).
+              "VGB_CHIRP_MASS_BASIS")
 
 
 def _build_fit():
@@ -288,6 +293,94 @@ class RemoveBranchesWiringTest(unittest.TestCase):
         os.environ["REMOVE_BRANCHES"] = "galfor"
         with self.assertRaises(ValueError):
             _build_fit()
+
+
+class VGBChirpRidgeWiringTest(unittest.TestCase):
+    """VGB_CHIRP_MASS_BASIS=1 adds ``vgb_ridge_gibbs`` to the stage lists.
+
+    User ruling 2026-09-16 ("VGBs get the ridge-gibbs fiber move too"). The
+    move is registered by ``recipe.build_vgb_moves`` ONLY when the vgb basis
+    carries dist/Mc/fdot_astro_ratio, so the stage must request it only
+    under the 6-column chirp basis -- requesting an unregistered stock name
+    raises at ``Move.setup``. These assertions pin BOTH directions, since
+    the 5-column default is what every other production script still runs.
+    """
+
+    def setUp(self):
+        self._env = os.environ.copy()
+        for k in SRC_ENVS + STAGE_ENVS:
+            os.environ.pop(k, None)
+        os.environ["NWALKERS"] = "4"
+        os.environ.update(ALL_IDS)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._env)
+
+    def _stages(self, fit):
+        return {st.name: [m.name for m in st.moves]
+                for st in fit.recipe.stages}
+
+    def test_absent_on_the_five_column_default(self):
+        stages = self._stages(_build_fit())
+        for name, names in stages.items():
+            self.assertNotIn("vgb_ridge_gibbs", names, f"{name}: {names}")
+
+    def test_present_in_gb_search_and_full_pe_under_the_chirp_basis(self):
+        os.environ["VGB_CHIRP_MASS_BASIS"] = "1"
+        stages = self._stages(_build_fit())
+        # exactly where gb_ridge_gibbs rides
+        for stage_name in ("gb_search", "full_pe"):
+            self.assertIn("vgb_ridge_gibbs", stages[stage_name],
+                          f"{stage_name}: {stages[stage_name]}")
+            self.assertIn("gb_ridge_gibbs", stages[stage_name])
+        # ... and nowhere else (search stages carry the joint criterion only)
+        for name, names in stages.items():
+            if name in ("gb_search", "full_pe"):
+                continue
+            self.assertNotIn("vgb_ridge_gibbs", names, f"{name}: {names}")
+
+    def test_never_inside_the_joint_noise_criterion(self):
+        """It is a zero-likelihood move: a max-logL criterion must not own it."""
+        os.environ["VGB_CHIRP_MASS_BASIS"] = "1"
+        fit = _build_fit()
+        for st in fit.recipe.stages:
+            for mv in st.moves:
+                inner = getattr(mv, "inner_names", None)
+                if inner:
+                    self.assertNotIn("vgb_ridge_gibbs", inner,
+                                     f"{st.name}: {inner}")
+
+    def test_gb_ridge_gibbs_kill_switch_takes_the_vgb_twin_with_it(self):
+        os.environ["VGB_CHIRP_MASS_BASIS"] = "1"
+        os.environ["GB_RIDGE_GIBBS"] = "0"
+        try:
+            stages = self._stages(_build_fit())
+        finally:
+            os.environ.pop("GB_RIDGE_GIBBS", None)
+        for name, names in stages.items():
+            self.assertNotIn("vgb_ridge_gibbs", names, f"{name}: {names}")
+            self.assertNotIn("gb_ridge_gibbs", names, f"{name}: {names}")
+
+    def test_absent_when_the_vgb_branch_is_removed(self):
+        """No vgb branch -> no vgb MOVE, chirp basis or not.
+
+        (The joint-search move keeps its ``noise_vgb_joint_search`` NAME
+        either way; what shrinks is its ``inner_names``. So assert on the
+        move names that actually belong to the branch.)
+        """
+        os.environ["VGB_CHIRP_MASS_BASIS"] = "1"
+        os.environ["REMOVE_BRANCHES"] = "vgb"
+        fit = _build_fit()
+        self.assertNotIn("vgb", fit.branches)
+        stages = self._stages(fit)
+        for name, names in stages.items():
+            for dead in ("vgb_ridge_gibbs", "vgb_pe"):
+                self.assertNotIn(dead, names, f"{name}: {names}")
+        for st in fit.recipe.stages:
+            for mv in st.moves:
+                inner = getattr(mv, "inner_names", None) or []
+                self.assertNotIn("vgb_pe", inner, f"{st.name}: {inner}")
 
 
 class WarmPhaseMaxSeedingTest(unittest.TestCase):

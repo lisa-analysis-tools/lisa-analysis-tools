@@ -713,6 +713,29 @@ def build_fit():
     # fitted while the noise converges, rather than sitting in the residual
     # and biasing the PSD.
     vgb = [Move("vgb_pe", branch="vgb")] if _has_vgb else []
+    # VGB ridge-Gibbs, the GB twin (user ruling 2026-09-16, "VGBs get the
+    # ridge-gibbs fiber move too"). ``build_vgb_moves`` registers
+    # ``vgb_ridge_gibbs`` ONLY when the vgb basis carries dist/Mc/
+    # fdot_astro_ratio -- i.e. under the 6-column VGB_CHIRP_MASS_BASIS=1
+    # chirp basis -- so the stage must request it only there, or Move.setup
+    # raises on the missing stock name. Same GB_RIDGE_GIBBS kill switch as
+    # the GB one, and the same stage placement gb_ridge_gibbs has: BOTH
+    # gb_search and the PE stages. It rides gb_search as its own Move (not
+    # inside the noise_vgb joint-search CRITERION) because it is exactly
+    # likelihood-invariant -- zero likelihood calls, prior x fiber-measure
+    # MH only -- so it cannot perturb a max-logL plateau test, while
+    # WITHOUT it the VGB chirp masses would sit frozen along the fiber for
+    # the whole search stage, which is the disease the move exists to cure.
+    _vgb_ridge_on = (
+        _has_vgb
+        and _env_flag("VGB_CHIRP_MASS_BASIS")
+        and _env_flag("GB_RIDGE_GIBBS", "1")
+    )
+
+    def vgb_ridge():
+        """Fresh Move descriptor per stage (never share one instance)."""
+        return [Move("vgb_ridge_gibbs", branch="vgb")] if _vgb_ridge_on else []
+
     _noise_names = (["psd_pe"] if _has_psd else []) + (
         ["galfor_pe"] if _has_galfor else [])
 
@@ -841,7 +864,7 @@ def build_fit():
         # stops on its own, so NUM_ITERATIONS bounds the run.
         stages.append(Stage(
             name="noise_vgb_pe", kind="pe",
-            moves=noise_pe + vgb,
+            moves=noise_pe + vgb + vgb_ridge(),
             combine_kwargs=_pe_combine_kwargs(),
         ))
         fit.recipe = Recipe(stages)
@@ -855,7 +878,7 @@ def build_fit():
         # same). PE never stops on its own; NUM_ITERATIONS bounds the run.
         stages.append(Stage(
             name="full_pe", kind="pe",
-            moves=noise_pe + source_pe() + vgb,
+            moves=noise_pe + source_pe() + vgb + vgb_ridge(),
             combine_kwargs=_pe_combine_kwargs(),
         ))
         fit.recipe = Recipe(stages)
@@ -892,7 +915,8 @@ def build_fit():
             ] + replace() + [
                 Move("rj_prior_removal", branch="gb"),
             ] + ([Move("gb_ridge_gibbs", branch="gb")]
-                 if os.environ.get("GB_RIDGE_GIBBS", "1") == "1" else []),
+                 if os.environ.get("GB_RIDGE_GIBBS", "1") == "1" else [])
+            + vgb_ridge(),
             step_kwargs=dict(
                 plateau_branch="gb",
                 convergence_iter=int(os.environ.get("GB_PLATEAU_ITERS", "5")),
@@ -912,7 +936,8 @@ def build_fit():
                 Move("rj_fstat_pe", branch="gb"),
                 Move("rj_prior_pe", branch="gb"),
             ] + ([Move("gb_ridge_gibbs", branch="gb")]
-                 if os.environ.get("GB_RIDGE_GIBBS", "1") == "1" else []) + vgb,
+                 if os.environ.get("GB_RIDGE_GIBBS", "1") == "1" else [])
+            + vgb + vgb_ridge(),
             combine_kwargs=_pe_combine_kwargs(),
         ),
     ]

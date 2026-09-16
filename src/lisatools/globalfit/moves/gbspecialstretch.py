@@ -17753,9 +17753,23 @@ class VGBSpecialStretchMove(GBSpecialBase):
     # kernels, so the repeat count is free.
     sequential_parity_repeats = True
 
-    # Generic (no-fiber) eigen axes: the reduced VGB basis has no
-    # dist/Mc/r columns, so the GB fiber/ridge construction cannot apply;
-    # the plain whitened eigenbasis of each source's own matrix can.
+    # Generic (no-fiber) eigen axes. The reason is F0, not the presence of
+    # the fiber columns -- stated precisely because the 6-column chirp basis
+    # (VGB_CHIRP_MASS_BASIS=1, user ruling 2026-09-16) DOES sample
+    # dist/Mc/fdot_astro_ratio, so the old "the reduced VGB basis has no
+    # dist/Mc/r columns" reading is no longer true of every VGB run. What is
+    # true on EVERY vgb basis: f0 is a per-leaf FILL, so ``_f0_col`` is None
+    # and the GB fiber+shear-ridge construction (``eigen_axis_set``, which
+    # needs f0 to build the f0-shear axis the ridge exists for) cannot be
+    # built -- ``_eigen_axis_ready`` returns False on the f0 column alone,
+    # and ``_eigen_axis_min_dim = 9`` excludes a 6-column basis anyway. The
+    # plain whitened eigenbasis of each source's own matrix can be built,
+    # and is what this opt-in selects.
+    #
+    # The (Mc, r, dist) fiber the chirp basis DOES carry is not lost: it is
+    # resampled in closed form by the ``vgb_ridge_gibbs`` move
+    # (``recipe.build_vgb_moves``, gated on the same three column names),
+    # exactly as ``gb_ridge_gibbs`` does for the GB branch.
     eigen_axis_generic_ok = True
 
     # Per-block EXACT info matrices always: every vgb leaf is a DIFFERENT

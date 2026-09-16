@@ -2353,6 +2353,42 @@ def _fstat_dist_birth_stamp(default: bool = True) -> bool:
     return bool(int(env)) if env is not None else bool(default)
 
 
+def ridge_gibbs_eligible(info) -> bool:
+    """Is the ridge-Gibbs fiber move buildable for this branch's basis?
+
+    Decided BY COLUMN NAME on the branch's own sampling basis — never by
+    branch name. :class:`~lisatools.sampling.ridge_fiber.McRatioDistFiber`
+    resolves ``dist`` / ``Mc`` / ``fdot_astro_ratio`` out of the transform
+    container's ``input_basis`` and raises loudly when one is missing, so
+    this is exactly the predicate "the (Mc, r, dist) degeneracy this move
+    resamples EXISTS on the branch":
+
+    * GB 9-column basis -> eligible (unchanged; the historical gate tested
+      only ``fdot_astro_ratio``, and the 9-column basis carries all three).
+    * GB 8-column (A / fdot) bases -> not eligible.
+    * VGB 6-column chirp basis (``VGB_CHIRP_MASS_BASIS=1``: Mc SAMPLED) ->
+      eligible. User ruling 2026-09-16, "VGBs get the ridge-gibbs fiber
+      move too": with f0 and sky per-leaf fills, the fiber is the whole
+      remaining flat direction and the move resamples it in closed form.
+    * VGB 5-column legacy distance basis (Mc a per-leaf FILL) -> not
+      eligible, so every script still on that basis is bit-unchanged.
+
+    ``GB_RIDGE_GIBBS=0`` disables it everywhere (shared knob, mirroring the
+    sig-het reference-policy knobs the VGB move already reads from the GB
+    namespace so the two branches audit identically).
+    """
+    if os.environ.get("GB_RIDGE_GIBBS", "1") != "1":
+        return False
+    if getattr(info, "fdot_astro_ratio_max", None) is None:
+        return False
+    from ..sampling.ridge_fiber import McRatioDistFiber
+
+    basis = list(
+        getattr(getattr(info, "transform", None), "input_basis", []) or []
+    )
+    return all(name in basis for name in McRatioDistFiber._REQUIRED)
+
+
 def build_gb_moves(
     engine_info: Setup,
     curr: CurrentInfoGlobalFit,
@@ -3561,10 +3597,10 @@ def build_gb_moves(
     # chain only (the engine state; hot rungs live inside the band moves and
     # do not need mixed nuisance marginals). Registered for BOTH cycles; the
     # stage lists decide where it actually runs. GB_RIDGE_GIBBS=0 disables.
-    if (os.environ.get("GB_RIDGE_GIBBS", "1") == "1"
-            and getattr(gb_info, "fdot_astro_ratio_max", None) is not None
-            and "fdot_astro_ratio" in list(
-                getattr(gb_info.transform, "input_basis", []) or [])):
+    # Eligibility is ``ridge_gibbs_eligible`` (by COLUMN NAME) since
+    # 2026-09-16, shared with the vgb twin in ``build_vgb_moves``; for the
+    # 9-column GB basis it is the same answer the inline gate gave.
+    if ridge_gibbs_eligible(gb_info):
         from ..sampling.ridge_fiber import make_gb_ridge_gibbs_move
 
         _ridge = make_gb_ridge_gibbs_move(
@@ -3606,7 +3642,14 @@ def build_vgb_moves(
     phase maximization; band-temperature swaps run on this move since no RJ
     move exists to carry them).
 
-    Returns a one-element list (the PE move).
+    Under the 6-column chirp basis (``VGB_CHIRP_MASS_BASIS=1``) a SECOND
+    move is registered: ``"vgb_ridge_gibbs"``, the exact GB twin (user
+    ruling 2026-09-16). See the registration block at the end of this
+    function; on the 5-column legacy basis the return is the historical
+    one-element list.
+
+    Returns the PE move list (``["vgb_pe"]``, plus ``"vgb_ridge_gibbs"``
+    when the basis carries the (dist, Mc, fdot_astro_ratio) fiber).
     """
     vgb_info = curr.source_info["vgb"]
     general_info: GeneralSetup = curr.general_info
@@ -3859,7 +3902,64 @@ def build_vgb_moves(
         },
     )
     vgb_move.accepted = np.zeros((ntemps, nwalkers))
-    return [vgb_move]
+    vgb_moves = [vgb_move]
+
+    # RIDGE-GIBBS fiber move, the GB twin (user ruling 2026-09-16: "really
+    # mirror the GBs as much as possible ... VGBs get the ridge-gibbs fiber
+    # move too"). With f0 and sky per-leaf fills, the (Mc, r, dist)
+    # degeneracy -- Mc^{5/3}(1 + r) = const at fixed fdot, Mc^{5/3}/d =
+    # const at fixed A -- is the ENTIRE remaining flat direction of the
+    # branch, and the in-model observable+eigen draw freezes Mc along it by
+    # construction (fdot-weight 0). This move resamples it in closed form
+    # with ZERO likelihood calls. Standalone HM Cnc validation (2026-09-16):
+    # obs+eigen fw=0 + ridge-gibbs was the best arm, cold acceptance 0.593.
+    #
+    # ``McRatioDistFiber`` is used VERBATIM -- it resolves dist / Mc /
+    # fdot_astro_ratio by NAME and never reads f0 -- so the ONLY vgb-side
+    # condition is that the basis carries those three columns, which is
+    # exactly ``ridge_gibbs_eligible``: true under VGB_CHIRP_MASS_BASIS=1
+    # (6 columns, Mc sampled), false on the 5-column legacy distance basis
+    # where Mc is a per-leaf fill. Every script still on the 5-column basis
+    # therefore builds the identical one-move stack it always did.
+    #
+    # Same prior-box convention as the branch's own priors (vgb.py): Mc ~
+    # U(m_chirp_lims | (0.001, 1.0)), dist ~ U(dist_lims), r ~ U[-rmax,
+    # rmax]. Cold chain only, like the GB one; the move mirrors its
+    # accepted row back onto the vgb sub-state (GFRidgeGibbsMove).
+    if ridge_gibbs_eligible(vgb_info):
+        from ..sampling.ridge_fiber import make_gb_ridge_gibbs_move
+
+        _vgb_ridge = make_gb_ridge_gibbs_move(
+            priors["vgb"], tc,
+            mc_lims=(tuple(vgb_info.m_chirp_lims)
+                     if getattr(vgb_info, "m_chirp_lims", None)
+                     else (0.001, 1.0)),
+            dist_lims=vgb_info.dist_lims,
+            ratio_max=float(vgb_info.fdot_astro_ratio_max),
+            leaf_fraction=float(
+                os.environ.get("GB_RIDGE_GIBBS_LEAF_FRACTION", "1.0")),
+            branch_name="vgb",
+        )
+        _vgb_ridge.name = "vgb_ridge_gibbs"
+        _vgb_ridge.accepted = np.zeros((1, nwalkers))
+        vgb_moves.append(_vgb_ridge)
+        logger.info(
+            "build_vgb_moves: vgb_ridge_gibbs registered (leaf_fraction %s; "
+            "zero-likelihood fiber move on the Mc-ratio-distance degeneracy "
+            "of the %d-column chirp basis %s).",
+            getattr(_vgb_ridge, "leaf_fraction", "1.0"),
+            len(input_basis), input_basis,
+        )
+    else:
+        logger.info(
+            "build_vgb_moves: vgb_ridge_gibbs NOT registered -- the vgb "
+            "basis %s does not carry all of (dist, Mc, fdot_astro_ratio) "
+            "(or GB_RIDGE_GIBBS=0). Set VGB_CHIRP_MASS_BASIS=1 for the "
+            "6-column chirp basis (NOT resume-compatible with a 5-dim "
+            "store).", input_basis,
+        )
+
+    return vgb_moves
 
 
 # ======================================================================
