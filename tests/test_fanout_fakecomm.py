@@ -26,6 +26,8 @@ class _StubMove:
         self.calls.append((op, self.gf_stage_kind, clock["call_index"]))
         if op == "boom":
             raise ValueError("kaboom")
+        if op == "unpicklable":
+            return {"fn": lambda: None}  # pickle.dumps rejects this, like FakeComm.send
         return {"rank_sum": float(np.sum(payload["x"])), "model": model}
 
 
@@ -101,6 +103,22 @@ class FanoutFakeCommTest(unittest.TestCase):
         (out, _stubs) = _run_world(3, [0, 0, 0], 4, head)
         self.assertEqual(out[0], (1, "boom", "stub", True))
         self.assertEqual(out[1], 1)
+
+    def test_unpicklable_result_becomes_a_senderror_reply_not_a_hang(self):
+        def head(fo, layout):
+            with self.assertRaises(RemoteWorkerError) as cm:
+                fo.run(
+                    "unpicklable",
+                    move="stub",
+                    per_rank_payload=lambda r, w0, w1: {"x": np.zeros(1)},
+                    local_body=lambda p, m: {},
+                    merge=lambda r: r,
+                )
+            return cm.exception.rank, cm.exception.error["type"]
+
+        (out, _stubs) = _run_world(3, [0, 0, 0], 4, head)
+        self.assertEqual(out[0], (1, "SendError"))
+        self.assertEqual(out[1], 1)  # the worker still served the command and stopped cleanly
 
     def test_unknown_move_is_an_error_reply_not_a_hang(self):
         def head(fo, layout):

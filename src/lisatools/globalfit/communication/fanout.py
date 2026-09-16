@@ -193,12 +193,13 @@ class ComputeService:
         self._head_local = layout.fanout_rank(layout.head_rank)
 
     def handle(self, cmd):
-        seq = cmd.get("seq")
-        op = cmd["op"]
-        move_name = cmd.get("move")
-        clock = cmd.get("clock") or {}
         t0 = time.perf_counter()
+        seq = op = move_name = None
         try:
+            seq = cmd.get("seq")
+            op = cmd.get("op")
+            move_name = cmd.get("move")
+            clock = cmd.get("clock") or {}
             if op in self.builtins:
                 result = self.builtins[op](cmd.get("payload"), clock, self.model)
             else:
@@ -208,15 +209,18 @@ class ComputeService:
                 result = move.gf_serve(op, cmd.get("payload"), clock, self.model)
             return _reply(seq, self.rank, True, result, time.perf_counter() - t0)
         except Exception as exc:  # noqa: BLE001 - reported to the head, never swallowed
-            if self.logger is not None:
-                self.logger.exception(
-                    "rank %d: command %r for move %r failed", self.rank, op, move_name
-                )
             error = {
                 "type": type(exc).__name__,
                 "msg": str(exc),
                 "traceback": traceback.format_exc(),
             }
+            try:
+                if self.logger is not None:
+                    self.logger.exception(
+                        "rank %d: command %r for move %r failed", self.rank, op, move_name
+                    )
+            except Exception:  # noqa: BLE001 - a failing logger must never mask the reply
+                pass
             return _reply(seq, self.rank, False, None, time.perf_counter() - t0, error)
 
     def serve(self):
@@ -226,5 +230,14 @@ class ComputeService:
             if cmd.get("op") == STOP_OP:
                 return served
             reply = self.handle(cmd)
-            self.comm.send(reply, dest=self._head_local)
+            try:
+                self.comm.send(reply, dest=self._head_local)
+            except Exception as exc:  # noqa: BLE001 - a bad reply must not escape the loop
+                error = {
+                    "type": "SendError",
+                    "msg": f"{type(exc).__name__}: {exc}",
+                    "traceback": traceback.format_exc(),
+                }
+                degraded = _reply(reply["seq"], self.rank, False, None, reply["wall_s"], error)
+                self.comm.send(degraded, dest=self._head_local)
             served += 1
