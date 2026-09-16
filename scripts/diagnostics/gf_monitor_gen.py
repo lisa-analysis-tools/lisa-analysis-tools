@@ -6,10 +6,12 @@ artifact redeploys to the same URL. Sections degrade to labeled
 placeholders when a snapshot lacks their inputs.
 
 The page is a STATUS OBJECT for collaborators, not an engineering worklog.
-Its spine is one frozen denominator -- the 812 catalogue galactic binaries
-detectable (optimal SNR > 7) over 3-21.94 mHz under this run's own fitted
-noise -- against which completeness, purity and per-source recovery are all
-quoted. Run-mechanics forensics live in the collapsed appendix, never in the
+Its spine is one frozen denominator -- the catalogue galactic binaries
+detectable (optimal SNR > 7) over the analysed GB band under this run's own
+fitted noise -- against which completeness, purity and per-source recovery are
+all quoted. The band is not hardcoded here: it is read from the ``band`` field
+the truth npz stamps (``build_truth.py``), so widening the truth set to the
+full 0.5556-21.94 mHz GB band re-labels every caption automatically. Run-mechanics forensics live in the collapsed appendix, never in the
 body.
 
 Optional inputs, read from the run directory or the working directory:
@@ -147,6 +149,10 @@ elif _base.endswith("_v3") or "3mo_v3" in _base:
     # the VARIANT or the two pages are indistinguishable in a browser tab --
     # which is the whole point of running them side by side.
     RUN_LABEL, RUN_KIND = "3-Month v3", "3mo_v3"
+elif "1yr_v8" in _base or (_base.endswith("_v8") and "1yr" in _base):
+    # 2026-09-03: the v8 lineage 1-yr run (submit_gf_1yr_v8.sh). Its own
+    # arm cache + banner so it never collides with the v5 1-yr page.
+    RUN_LABEL, RUN_KIND = "1-Year v8", "1yr_v8"
 elif "1yr" in _base:
     # 2026-08-22: without this branch the 1-yr page fell through to the
     # 3-Month banner AND (worse) the v2 ARM_TAG, clobbering the shared
@@ -156,8 +162,40 @@ elif _base.endswith("_v5") or "3mo_v5" in _base:
     RUN_LABEL, RUN_KIND = "3-Month v5", "3mo_v5"
 elif _base.endswith("_v6") or "3mo_v6" in _base:
     RUN_LABEL, RUN_KIND = "3-Month v6", "3mo_v6"
+elif _base.endswith("_v7") or "3mo_v7" in _base:
+    # 2026-08-26: same trap as the 1-yr branch above -- without this the
+    # v7 page fell through to the plain 3-Month banner AND the v2
+    # ARM_TAG, clobbering gf_arm_v2.npz on its first generation.
+    RUN_LABEL, RUN_KIND = "3-Month v7", "3mo_v7"
+elif "10walker" in _base and ("3mo_v8" in _base or _base.endswith("_v8")):
+    # 2026-09-05: the v8 3-month 10-WALKER twin (gf_prod_3mo_v8_10walkers).
+    # Own arm tag + banner so its overlay curve reads "3mo_v8_10w", distinct
+    # from the 24-walker "3mo_v8_24w" arm -- both otherwise collide on the
+    # plain "3mo_v8" tag and clobber each other's gf_arm_3mo_v8.npz cache.
+    RUN_LABEL, RUN_KIND = "3-Month v8 · 10 Walkers", "3mo_v8_10w"
+elif _base.endswith("_v8") or "3mo_v8" in _base:
+    # 2026-09-02: hit for the THIRD time (1yr, v7, now v8) -- the fall-through
+    # clobbers gf_arm_v2.npz. If a v9 ever exists, generalize this ladder.
+    RUN_LABEL, RUN_KIND = "3-Month v8", "3mo_v8"
 else:
     RUN_LABEL, RUN_KIND = "3-Month", "3mo"
+
+# ---- persistent commentary sidecar (2026-08-27) --------------------------
+# Hand-written notes must survive page regeneration (the page is rebuilt
+# from scratch every snapshot): drop HTML into commentary_{RUN_KIND}.html
+# NEXT TO the output file and it renders as a "Commentary" section at the
+# top of <main>. Absent file -> no section, no cost.
+_comm_path = os.path.join(
+    os.path.dirname(os.path.abspath(OUT)) or ".",
+    f"commentary_{RUN_KIND}.html")
+if os.path.exists(_comm_path):
+    with open(_comm_path, "r") as _cf:
+        COMMENTARY = (
+            '<section id="commentary"><h2>Commentary</h2>\n'
+            + _cf.read() + "\n</section>\n")
+    print(f"[commentary] injected {_comm_path}")
+else:
+    COMMENTARY = ""
 
 sub = g["sub_backend"]
 psd_c = sub["psd/chain"][:NIT]                      # (it, 12, 24, 1, 2)
@@ -204,6 +242,133 @@ VGB_NIT = SUB_NIT
 gb_inds = g["inds/gb"][:NIT, 0, 0]                  # (it, 24, 10000)
 gb_chain_cold = g["chain/gb"][NIT-1, 0, 0]          # (24, 10000, 9) last iter
 gb_alive_last = g["inds/gb"][NIT-1, 0, 0]           # (24, 10000)
+
+# ---- POOLED SAMPLE WINDOWS (2026-08-27, user request) --------------------
+# Every panel that SCATTERS per-leaf cold-chain samples used to draw ONE
+# stored iteration -- the latest. A single iteration of a trans-dimensional
+# branch is not a posterior, it is a snapshot of where the walkers happen to
+# sit at one step: a source alive in 23 of the 24 cold walkers draws 23
+# points, and their spread is walker scatter, not sampler uncertainty.
+# Pooling the last few stored iterations makes each panel the thing the
+# reader already believes they are looking at.
+#
+# Two windows, deliberately different:
+#   * POOL_ITS_SAMPLES    -- scatter / explorer / marginal panels.
+#   * POOL_ITS_POSTERIOR  -- corner plots, which need the extra rows before
+#     their 2-D contours mean anything (this is the window the VGB and GB
+#     corners already used; it is routed through the helper now so every
+#     pooling site in the file reads from ONE place).
+#
+# THREE RULES, none of them optional:
+#   1. min(requested, available) -- a store with three written rows pools
+#      three, and nothing anywhere may assume the full window exists.
+#   2. The alive mask is applied PER ITERATION. ``inds`` at iteration N says
+#      nothing about N-4: the branch is trans-dimensional, a leaf alive now
+#      may be dead then, and a dead row's coordinates are stale-or-zero
+#      garbage that draws as a phantom source (f0 = 0 with the zero fill).
+#   3. A reduced ``*_extract.h5`` store carries real coordinates ONLY inside
+#      its final keep-window -- earlier rows are zero-filled placeholders
+#      that survive as valid-looking arrays. Clamp the window to rows whose
+#      coordinates are actually populated. (The full production store this
+#      was validated on is NOT an extract, so the clamp is a no-op there;
+#      it exists because the same generator is pointed at extracts.)
+POOL_ITS_SAMPLES = 30
+POOL_ITS_POSTERIOR = 30
+EXTRACT_STORE = "_extract" in os.path.basename(h5path)
+_POOL_FLOOR = {}
+
+
+def _pool_floor(branch="gb"):
+    """Earliest stored row of ``branch`` whose coordinates are real.
+
+    0 for a full store (every written row carries its coordinates). For an
+    extract, walk backwards from the newest row and stop at the first one
+    whose alive leaves do NOT carry a non-zero f0 -- that is the edge of the
+    keep-window. Probes ONE walker (the one holding the most alive leaves)
+    and ONE parameter column, so the cost is a couple of chunks per row.
+    """
+    if branch in _POOL_FLOOR:
+        return _POOL_FLOOR[branch]
+    floor = 0
+    if EXTRACT_STORE:
+        floor = max(NIT - 1, 0)
+        for _i in range(NIT - 1, -1, -1):
+            try:
+                _al = g[f"inds/{branch}"][_i, 0, 0]
+                if not _al.any():
+                    break
+                _w = int(np.argmax(_al.sum(axis=1)))
+                _f0 = g[f"chain/{branch}"][_i, 0, 0, _w, :, 1][_al[_w]]
+            except Exception:
+                break
+            if not np.any(_f0 != 0.0):
+                break
+            floor = _i
+        if floor > 0:
+            MISSING.append(
+                f"reduced *_extract.h5 store: {branch} coordinates are real "
+                f"only from stored iteration {floor} onwards, so the pooled "
+                f"sample panels use that keep-window, not the full "
+                f"{POOL_ITS_POSTERIOR}-iteration request.")
+    _POOL_FLOOR[branch] = floor
+    return floor
+
+
+def _pool_its(nwant, branch="gb", nit=None):
+    """Stored-iteration indices a pooled panel should read, oldest first.
+
+    ``nwant`` is the REQUEST (5 or 10); what comes back is
+    ``min(nwant, available)`` indices, floored at the extract keep-window.
+    """
+    n = int(NIT if nit is None else nit)
+    if n <= 0:
+        return np.zeros(0, dtype=int)
+    return np.arange(max(_pool_floor(branch), n - int(nwant)), n)
+
+
+def _pool_gb_iter(nwant, cols=None):
+    """Yield ``(it, alive, chain)`` for each pooled GB iteration, oldest first.
+
+    ``alive`` is THAT iteration's own ``inds`` row -- rule 2 above. ``chain``
+    is ``(nwalk, nleaf, len(cols))``, sliced column-wise because the chain is
+    chunked ``(..., 1)`` on the parameter axis: pulling three columns
+    decompresses a third of the bytes a full-row read would.
+    """
+    for _i in _pool_its(nwant, "gb"):
+        _al = gb_inds[_i]
+        if not _al.any():
+            continue
+        if cols is None:
+            _ch = g["chain/gb"][_i, 0, 0]
+        else:
+            _ch = np.stack([g["chain/gb"][_i, 0, 0, :, :, _c] for _c in cols],
+                           axis=-1)
+        yield int(_i), _al, _ch
+        del _ch
+
+
+def _vgb_pool_rows(nwant):
+    """Row indices of ``vgb_c`` a pooled VGB panel should use, oldest first.
+
+    Same three rules. The VGB branch is fixed-dimension, so there is no
+    alive mask to apply per iteration -- what there IS is a leading block of
+    rows the branch had not started sampling yet (it comes online at stage
+    2) and, on an extract, a zero-filled pre-keep-window block. Both read as
+    "all zero / all NaN" and both would drag every posterior to 0 kpc, so
+    unpopulated rows are dropped from the FRONT of the window.
+    """
+    n = int(VGB_NIT)
+    if n <= 0:
+        return np.zeros(0, dtype=int)
+    lo = max(0, n - int(nwant))
+    while lo < n - 1:
+        _r = vgb_c[lo]
+        if np.isfinite(_r).any() and np.abs(np.nan_to_num(_r)).sum() > 0:
+            break
+        lo += 1
+    return np.arange(lo, n)
+
+
 # TORN-SNAPSHOT TOLERANCE (2026-08-15): a store copied while the run is
 # mid-[SAVE] can carry truncated gzip chunks -- the dataset OPENS fine and
 # only fails when READ ("filter returned failure during read"). That is a
@@ -519,10 +684,24 @@ except Exception as e:
 gb_counts = gb_inds.sum(axis=-1)                    # (it, 24)
 
 # ---- detectable-truth set for the overlays (from the census npz) ----------
-# `census.py` computes optimal SNR for every catalogue GB over 3-21 mHz
-# against the run's OWN sampled sensitivity; the detectable (SNR>7) subset
+# `census.py` computes optimal SNR for every catalogue GB over the analysed
+# band against the run's OWN sampled sensitivity; the detectable (SNR>7) subset
 # is the natural TARGET line for the leaf-count and occupancy panels. It is
 # optional -- without the npz these overlays simply do not draw.
+
+
+def _mhz(x_hz):
+    """A band edge as an mHz string, at a precision that survives the low end.
+
+    The band floor is 0.5556 mHz, and the ``:.0f`` these labels used to carry
+    renders that as "1" -- a label that is wrong by a factor of two and reads
+    as a different band. ``:.4g`` gives "0.5556" and "21.94" from the same
+    format, so every band string on the page is produced HERE and the low and
+    high edges cannot drift apart in precision.
+    """
+    return f"{float(x_hz) * 1e3:.4g}"
+
+
 DET_F0 = None
 for _cp in (os.path.join(RUN_DIR, "gb_hi_f_census.npz"), "gb_hi_f_census.npz"):
     if os.path.exists(_cp):
@@ -595,11 +774,11 @@ if DET_F0 is not None:
     _in = (_f0_it >= DET_LO) & (_f0_it <= DET_HI) & gb_inds
     _cnt = _in.sum(axis=2)                                # (it, walker)
     ax[0].plot(it, _cnt.max(axis=1), color=CYAN, lw=1.6,
-               label=f"{DET_LO*1e3:.0f}-{DET_HI*1e3:.0f} mHz")
+               label=f"{_mhz(DET_LO)}-{_mhz(DET_HI)} mHz")
     ax[0].axhline(DET_F0.size, color=RED, ls=":", lw=1.5)
     ax[0].text(NIT * 0.98, DET_F0.size,
                f"{DET_F0.size} detectable (SNR>7), "
-               f"{DET_LO*1e3:.0f}-{DET_HI*1e3:.0f} mHz ", color=RED,
+               f"{_mhz(DET_LO)}-{_mhz(DET_HI)} mHz ", color=RED,
                fontsize=8, va="bottom", ha="right")
     ax[0].legend(fontsize=8, loc="lower right")
 ax[0].set_title("GB leaf count (cold walkers)"); ax[0].set_xlabel("iteration")
@@ -781,7 +960,7 @@ if cap_cells is not None and cap_cells.size and cap_edges_arr is not None:
         _rng = (fblk >= DET_LO * 1e3) & (fblk <= DET_HI * 1e3)
         ax[2].step(fblk[_rng], _tb[_rng], where="mid", color=RED, lw=1.3,
                    ls=":", label=f"has detectable source "
-                                 f"({DET_LO*1e3:.0f}-{DET_HI*1e3:.0f} mHz)")
+                                 f"({_mhz(DET_LO)}-{_mhz(DET_HI)} mHz)")
         ax[2].legend(fontsize=8, loc="upper right")
     ax[2].axhline(K, color=DIM, ls=":", lw=1)
     ax[2].text(fblk[-1], K, f" all {K} cells", color=DIM, fontsize=8,
@@ -796,10 +975,11 @@ if cap_cells is not None and cap_cells.size and cap_edges_arr is not None:
     # zero at-cap rather than crashing on the empty list.
     _occ_last = _occ[-1] if _occ else 0.0
     _atcap_last = _atcap[-1] if _atcap else 0.0
+    _tot_last = _tot[-1] if _tot else 0.0  # same NIT=0 guard as _occ/_atcap
     _exact1 = float((cc_last == 1).sum() / nw_)
     CAP_TXT = (
         f"At iteration {NIT-1} the median cold walker holds "
-        f"<strong>{_tot[-1]:.0f}</strong> GB sources spread over "
+        f"<strong>{_tot_last:.0f}</strong> GB sources spread over "
         f"<strong>{_occ_last:.0f} of {ncell}</strong> cap cells "
         f"({100*_occ_last/ncell:.0f}%): <strong>{_exact1:.0f}</strong> cells "
         f"hold exactly one source and <strong>{_atcap_last:.0f}</strong> sit "
@@ -1596,12 +1776,12 @@ except Exception as e:
 # ======================= GB RECOVERY (the science block) ====================
 # ONE FROZEN DENOMINATOR. ``gb_truth_3to21.npz`` holds every catalogue GB that
 # survives the kappa_max amplitude prefilter, with its exact optimal SNR under
-# the run's own fitted noise at iteration 78 and its full parameter vector in
-# both the run's 9-column sampling basis and GBGPU's physical basis. The
-# detectable (SNR>7) subset over 3-21.94 mHz is 812 sources, and that number is
-# used as the denominator of EVERY recovery statement on this page. It is
-# deliberately frozen: "detectable" moves as the foreground estimate drops, and
-# a denominator that moves with the numerator cannot measure progress.
+# the run's own fitted noise at the iteration it was built at and its full
+# parameter vector in both the run's 9-column sampling basis and GBGPU's
+# physical basis. Its detectable (SNR>7) subset is used as the denominator of
+# EVERY recovery statement on this page. It is deliberately frozen:
+# "detectable" moves as the foreground estimate drops, and a denominator that
+# moves with the numerator cannot measure progress.
 #
 # Everything downstream is recomputed HERE, at the last stored iteration --
 # none of it is read from the iteration-15 caches the earlier page was built
@@ -1623,7 +1803,25 @@ try:
 except Exception:
     pass
 SCI_DF = 1.0 / SCI_TOBS
-FLO, FHI = 3e-3, 21.94e-3          # the band the frozen denominator covers
+
+# THE BAND COMES FROM THE TRUTH SET (2026-08-23). It used to be hardcoded at
+# 3-21.94 mHz here AND spelled out in three captions, while the truth npz
+# already stamped a ``band`` field -- so widening the truth set to the run's
+# real GB band (band_edges[0] = 0.5556 mHz, not 3 mHz) would have left the
+# page quoting the old band over the new counts, which is worse than either.
+# Read the stamp, with the old hardcoded pair as the fallback for a pre-stamp
+# npz -- the same backward-compatible pattern as the ``tobs`` stamp below.
+# Read BEFORE the Tobs guard, which sets TRU to None: FLO/FHI still label the
+# population panels on a run whose recovery block is skipped.
+FLO, FHI = 3e-3, 21.94e-3          # fallback: the pre-2026-08-23 band
+if TRU is not None and "band" in getattr(TRU, "files", []):
+    try:
+        _tband = np.asarray(TRU["band"], float).reshape(-1)
+        if _tband.size >= 2 and 0 < _tband[0] < _tband[1]:
+            FLO, FHI = float(_tband[0]), float(_tband[1])
+    except Exception:
+        pass
+BAND_TXT = f"{_mhz(FLO)}&ndash;{_mhz(FHI)} mHz"       # HTML captions
 TOL_BINS = 2.0
 NBAND = (FHI - FLO) / SCI_DF       # FD bins in the band
 
@@ -2030,7 +2228,15 @@ if TRU is not None:
         ax.legend(fontsize=8, loc="upper left")
         fig_b64(fig, "f8_sky")
 
-        if SHOW_MATCH_STATS:
+        if SHOW_MATCH_STATS and len(RPHYS[MI]) == 0:
+            # A store with no GB leaves yet (young run, noise stages only)
+            # has ZERO matched sources; every panel below percentiles /
+            # histograms empty arrays and np.percentile raises. Skip with a
+            # reason instead of crashing the whole page (hit on the v7
+            # first snapshot, 2026-08-26).
+            MISSING.append("match-stats figures skipped: zero matched "
+                           "sources in this snapshot (no gb leaves yet).")
+        elif SHOW_MATCH_STATS:
             # ---- F7: recovered vs injected parameters --------------------------
             _R = RPHYS[MI]; _T = T_PHYS[TI]
             _db = DFH / SCI_DF
@@ -2148,8 +2354,13 @@ if TRU is not None:
     if ax1 is not None:
         _lo, _hi = _wilson(_hrec, _hdet)
         _fr = np.where(_hdet > 0, _hrec / np.maximum(_hdet, 1), np.nan)
+        # maximum(.., 0): at p=0 (a zero-recovery bin -- the full band has
+        # them, the old 3-21 mHz band never did) the Wilson lower bound
+        # equals p algebraically but can land ~1e-17 ABOVE it in floating
+        # point, and errorbar refuses negative yerr.
         ax1.errorbar(_fc, 100 * _fr,
-                     yerr=[100 * (_fr - _lo), 100 * (_hi - _fr)], fmt="o",
+                     yerr=[100 * np.maximum(_fr - _lo, 0),
+                           100 * np.maximum(_hi - _fr, 0)], fmt="o",
                      ms=3.5, color=GREEN, ecolor=GREEN, alpha=0.9, capsize=2)
         ax1.set_xscale("log"); ax1.set_ylim(0, 100)
         ax1.set_xlabel("Frequency [Hz]"); ax1.set_ylabel("recovered [%]")
@@ -2176,8 +2387,14 @@ if TRU is not None:
                 _x.append(_j + (_q - (len(_tags) - 1) / 2) * 0.10)
                 _y.append(100 * _p); _el.append(100 * (_p - _l))
                 _eh.append(100 * (_h - _p))
+            if not _x:
+                continue
             _n = int(_D["n_match"][-1])
             _g = int(_D["n_match"].size) - 1 - int(_D["it0"])
+            # An arm from a zero-match store (young run) can produce
+            # degenerate Wilson bounds; matplotlib refuses negative yerr.
+            _el = np.clip(_el, 0.0, None)
+            _eh = np.clip(_eh, 0.0, None)
             ax.errorbar(_x, _y, yerr=[_el, _eh], fmt="o-", ms=5, color=_c, lw=1.6,
                         capsize=3, label=f"{_tag}, {_g} GB-search iterations")
         for _j, (_a2, _b2) in enumerate(zip(_seds[:-1], _seds[1:])):
@@ -2228,7 +2445,13 @@ if TRU is not None:
 # with nothing distinguishing them -- a reader inevitably read the flat ones
 # as failures of the fit rather than as an absence of signal. The headline
 # panel is therefore the detectable subset; the rest are stated, not plotted.
-vgb_last = vgb_c[-min(3, VGB_NIT):].reshape(-1, 55, 5)   # (S, 55, 5)
+# POOLED (2026-08-27): was a hard-coded 3-iteration window; it is now the
+# shared POOL_ITS_SAMPLES window, so every VGB sample panel below (the
+# detectable-subset credible intervals, the full-55 distance panel, the
+# pooled marginals and the zoomable posterior cloud) draws the same rows.
+VGB_SAMP_ROWS = _vgb_pool_rows(POOL_ITS_SAMPLES)
+VGB_SAMP_ITS = int(VGB_SAMP_ROWS.size)
+vgb_last = vgb_c[VGB_SAMP_ROWS].reshape(-1, 55, 5)       # (S, 55, 5)
 snr = np.sqrt(np.clip(np.nanmean(vgb_hh[-1], axis=0), 0, None))  # (55,)
 order = np.argsort(snr)[::-1]
 VGB_DET = np.nonzero(snr > 7.0)[0]
@@ -2252,7 +2475,8 @@ if VGB_TRUTH is not None:
 ax[0].set_yticks(_y); ax[0].set_yticklabels(_lab, fontsize=8)
 ax[0].set_xlabel("distance [kpc]")
 ax[0].set_title(f"the {VGB_N_DET} verification binaries with SNR > 7  "
-                f"(median +/- 1 sigma)", fontsize=10)
+                f"(median +/- 1 sigma, last {VGB_SAMP_ITS} its x {nwalk} "
+                f"walkers)", fontsize=10)
 ax[1].barh(_y, snr[VGB_DET], color=VIOLET, alpha=0.9, height=0.55)
 ax[1].axvline(7, color=RED, ls=":", lw=1.2)
 ax[1].set_xscale("log"); ax[1].set_xlabel("optimal SNR")
@@ -2301,7 +2525,8 @@ if VGB_F0 is not None:
         ax.annotate(VGB_IDS[k], (xs[k], med[k]), fontsize=7, color=FG,
                     xytext=(2, 6), textcoords="offset points")
 ax.set_xlabel(xlab_vgb); ax.set_ylabel("dist [kpc]")
-ax.set_title("VGB distance posteriors (median +/- 1 sigma; last iters x walkers)")
+ax.set_title(f"VGB distance posteriors (median +/- 1 sigma; last "
+             f"{VGB_SAMP_ITS} its x {nwalk} walkers)")
 fig_b64(fig, "vgb_dist")
 
 # SNR evolution over iterations: noise-weighted sqrt(<h|h>) rises as the
@@ -2374,10 +2599,19 @@ for j in range(1, 5):
                    color=RED, alpha=0.8, clip_on=False)
         a.legend(fontsize=7)
     a.set_title(VGB_NAMES[j], fontsize=9)
+fig.suptitle(f"VGB marginals pooled over 55 leaves x the last "
+             f"{VGB_SAMP_ITS} stored iterations x {nwalk} cold walkers "
+             f"({vgb_last.shape[0] * 55} samples)", fontsize=9, y=1.02)
 fig_b64(fig, "vgb_hists")
 
 # GB/VGB explorer data (interactive)
+#
+# POOLED (2026-08-27): this canvas -- the zoomable amplitude-frequency plane,
+# including its "highest-frequency sources" preset -- used to draw the single
+# latest stored iteration. It now pools POOL_ITS_SAMPLES iterations, with the
+# alive mask taken from EACH iteration's own inds row.
 expl = {"gb": [], "vgb": []}
+EXPL_ITS, EXPL_RAW, EXPL_STRIDE = 0, 0, 1
 nz = np.nonzero(gb_alive_last.sum(axis=0))[0]
 if nz.size:
     # f0-AMPLITUDE (user request 2026-08-15): amplitude derived from the
@@ -2386,23 +2620,66 @@ if nz.size:
         from lisatools.globalfit.stock.erebor.transforms import gb_amp_from_dist
     except Exception:
         gb_amp_from_dist = None
-    for w in range(nwalk):
-        al = np.nonzero(gb_alive_last[w])[0]
-        for i_ in al:
-            row = gb_chain_cold[w, i_]
+    _gbstack = []
+    for _it_, _al_, _ch_ in _pool_gb_iter(POOL_ITS_SAMPLES, cols=(0, 1, 2)):
+        EXPL_ITS += 1
+        for w in range(nwalk):
+            al = np.nonzero(_al_[w])[0]
+            if not al.size:
+                continue
+            _d = np.maximum(np.asarray(_ch_[w, al, 0], dtype=float), 1e-6)
+            _f = np.asarray(_ch_[w, al, 1], dtype=float)
+            _mc = np.asarray(_ch_[w, al, 2], dtype=float)
             if gb_amp_from_dist is not None:
-                _amp = float(gb_amp_from_dist(
-                    row[1] * 1e-3, row[2], max(row[0], 1e-6)))
-                _y = float(np.log10(max(_amp, 1e-30)))
+                _amp = np.asarray(gb_amp_from_dist(_f * 1e-3, _mc, _d),
+                                  dtype=float)
+                _y = np.log10(np.maximum(_amp, 1e-30))
             else:
-                _y = float(1.0 / max(row[0], 1e-6))
-            expl["gb"].append([float(row[1]), _y, int(w)])
-S = vgb_c[-1]                                        # (24, 55, 5)
-for w in range(nwalk):
-    for leaf in range(55):
-        _x = float(VGB_F0[leaf]) if VGB_F0 is not None else int(leaf)
-        expl["vgb"].append([_x, float(1.0 / max(S[w, leaf, 0], 1e-6)),
-                            float(snr[leaf])])
+                _y = 1.0 / _d
+            _gbstack.append(np.column_stack(
+                [_f, _y, np.full(al.size, float(w))]))
+    _R = (np.concatenate(_gbstack) if _gbstack
+          else np.zeros((0, 3), dtype=float))
+    EXPL_RAW = int(_R.shape[0])
+    # PAGE-WEIGHT GUARD. Pooling multiplies this array by the window, and
+    # every row is JSON text in the page. On the 3-month store the pooled
+    # cloud is ~47k rows (~1 MB of JSON) and needs no decimation at all; a
+    # denser store would, so the budget is enforced here -- AFTER pooling,
+    # exactly like the truth-cross decimation below, and by striding whole
+    # rows so the f0 coverage stays uniform. The truth-cross rules
+    # (recovery-proximity protection + per-window floor) are untouched.
+    EXPL_CAP = 150000
+    if EXPL_RAW > EXPL_CAP:
+        EXPL_STRIDE = int(np.ceil(EXPL_RAW / EXPL_CAP))
+        _R = _R[::EXPL_STRIDE]
+    # Coordinates are ROUNDED before serialization: f0 to 1e-7 mHz (about
+    # 1e-3 of an FD bin at three months) and log10 A to 1e-4 dex. Both are
+    # far below anything the canvas or the match tolerance can resolve, and
+    # they cut the JSON from ~40 to ~23 bytes a row, which is what keeps the
+    # pooled cloud from ballooning the page.
+    expl["gb"] = [[round(float(_a), 7), round(float(_b), 4), int(_c)]
+                  for _a, _b, _c in _R]
+    del _gbstack, _R
+expl["gb_its"] = int(EXPL_ITS)
+expl["gb_raw"] = int(EXPL_RAW)
+expl["gb_stride"] = int(EXPL_STRIDE)
+EXPL_DEC_NOTE = ("" if EXPL_STRIDE <= 1 else
+                 f", decimated 1-in-{EXPL_STRIDE} to {len(expl['gb']):,} "
+                 f"drawn for page weight")
+print(f"[explorer] GB cloud: {EXPL_RAW} alive-leaf rows pooled over "
+      f"{EXPL_ITS} stored iteration(s) x {nwalk} cold walkers; "
+      f"{len(expl['gb'])} drawn (stride {EXPL_STRIDE}).")
+# The VGB side of the explorer pools the same window (fixed-dimension branch,
+# so every leaf contributes one row per pooled iteration per walker).
+_Spool = vgb_c[VGB_SAMP_ROWS]                        # (P, 24, 55, 5)
+for _p in range(_Spool.shape[0]):
+    S = _Spool[_p]                                   # (24, 55, 5)
+    for w in range(nwalk):
+        for leaf in range(55):
+            _x = float(VGB_F0[leaf]) if VGB_F0 is not None else int(leaf)
+            expl["vgb"].append([_x, float(1.0 / max(S[w, leaf, 0], 1e-6)),
+                                float(snr[leaf])])
+expl["vgb_its"] = int(VGB_SAMP_ITS)
 expl["vgb_axis"] = "f0 [mHz] (catalogue)" if VGB_F0 is not None else "VGB leaf index"
 
 # ---- GB catalogue truth cloud for the explorer (Task 3) -------------------
@@ -2433,17 +2710,104 @@ try:
         keep = np.nonzero(la_band >= cut)[0]
         gb_truth_meta.update(cut=cut, rec_lo=_rec_lo, above_cut=int(keep.size))
         if keep.size > TRUTH_CAP:
-            # tiered decimation: keep EVERY truth in the bright half (where
-            # the completeness statement lives), uniformly subsample the
-            # faint remainder so the tail's SHAPE survives at a known,
-            # quoted density.
-            o = keep[np.argsort(la_band[keep])[::-1]]
-            bright, rest = o[:TRUTH_CAP // 2], o[TRUTH_CAP // 2:]
-            sub = np.random.default_rng(0).choice(
-                rest, size=TRUTH_CAP - bright.size, replace=False)
-            sel = np.concatenate([bright, sub])
-            gb_truth_meta["bright_cut"] = float(la_band[bright].min())
-            gb_truth_meta["faint_frac"] = float(sub.size / max(rest.size, 1))
+            # PER-WINDOW decimation (2026-08-23). The old scheme kept the
+            # globally brightest half of the budget outright, which drew a
+            # hard horizontal red edge (one global brightness cut) across
+            # the whole band with the recovered cloud floating above it --
+            # on the zoom plots that edge read as "truth amplitudes are
+            # wrong". Instead the budget is split across log-spaced f0
+            # windows, and each window keeps the brightest half of ITS quota
+            # outright plus a uniform subsample of the rest: the drawn
+            # fraction is uniform in f0, any brightness cut is local, and no
+            # band-wide edge exists to misread.
+            #
+            # THE QUOTA IS NOT A FLAT FRACTION (2026-08-27). It used to be
+            # ``max(round(pop * TRUTH_CAP / above_cut), 1)``, which decimated
+            # a window holding 2 sources exactly as hard as one holding
+            # 12,000. Two things then broke at the sparse top of the band:
+            #   * a window whose quota rounded to 1 got ``_nb = _q // 2 == 0``
+            #     -- the "brightest half kept outright" guarantee degenerated
+            #     to nothing, and the single point drawn was a COIN FLIP among
+            #     the window's members;
+            #   * so recovered, catalogue-present sources lost that flip and
+            #     drew no red cross under their green dot. Measured on the v7
+            #     3-month page: 470 of the 1,064 detectable catalogue sources
+            #     carried no truth mark, only 12 of the 45 sources above
+            #     10 mHz were drawn at all, and the flagship at 20.380377 mHz
+            #     (SNR 46, recovered in 23/24 walkers) lost a 1-of-2 draw in
+            #     the top window and vanished.
+            # The repair is two rules, both general and budget-neutral:
+            #   1. PROTECT: a catalogue row that a model source sits on (within
+            #      the page's own TOL_BINS match tolerance) is always drawn.
+            #      The panel exists to judge recovered against injected, so a
+            #      recovered dot may never sit on an empty patch of truth.
+            #   2. FLOOR: every window is drawn IN FULL up to _WIN_FULL members
+            #      before any fraction is applied; only what the floor and the
+            #      protected set leave over is spread proportionally. Sparse
+            #      high-f windows cost a few hundred points in total, so there
+            #      is no reason to sample them at all.
+            _rng = np.random.default_rng(0)
+            _NWIN, _WIN_FULL = 64, 200
+            _wedges = np.geomspace(f0_band[keep].min() * (1 - 1e-12),
+                                   f0_band[keep].max() * (1 + 1e-12),
+                                   _NWIN + 1)
+            _wid = np.clip(np.searchsorted(_wedges, f0_band[keep],
+                                           side="right") - 1, 0, _NWIN - 1)
+
+            # rule 1 -- rows a recovered source sits on, by f0 proximity in
+            # the SAME tolerance the recovery panels call a match.
+            _pro = np.zeros(keep.size, dtype=bool)
+            _rf0 = np.unique(np.asarray([p[0] for p in expl["gb"]], dtype=float))
+            if _rf0.size:
+                _tolm = TOL_BINS * SCI_DF * 1e3           # mHz
+                _srt = np.argsort(f0_band[keep])
+                _ks = f0_band[keep][_srt]
+                _plo = np.searchsorted(_ks, _rf0 - _tolm, side="left")
+                _phi = np.searchsorted(_ks, _rf0 + _tolm, side="right")
+                for _a, _b in zip(_plo, _phi):
+                    if _b > _a:
+                        _pro[_srt[_a:_b]] = True
+
+            # rule 2 -- floor first, then spread what is left proportionally.
+            # The floor is raised to the protected count where a window holds
+            # more protected rows than the floor, so the per-window quota can
+            # never be smaller than the rows rule 1 pins.
+            _pop = np.bincount(_wid, minlength=_NWIN)
+            _npro = np.bincount(_wid[_pro], minlength=_NWIN)
+            _base = np.maximum(np.minimum(_pop, _WIN_FULL), _npro)
+            _left = _pop - _base
+            _extra = max(TRUTH_CAP - int(_base.sum()), 0)
+            _frac = _extra / int(_left.sum()) if _left.sum() else 0.0
+            _quota = _base + np.rint(_left * _frac).astype(int)
+
+            _parts = []
+            for _wi in range(_NWIN):
+                _m = _wid == _wi
+                if not _m.any():
+                    continue
+                _kw, _pw = keep[_m], _pro[_m]
+                _q = int(min(_quota[_wi], _kw.size))
+                if _kw.size <= _q:
+                    _parts.append(_kw)
+                    continue
+                _must, _rest = _kw[_pw], _kw[~_pw]
+                _r = _q - _must.size                     # >= 0 by _base above
+                if _r <= 0:
+                    _parts.append(_must)
+                    continue
+                _o = _rest[np.argsort(la_band[_rest])[::-1]]
+                # never 0: a quota of 1 must spend it on the BRIGHTEST member
+                # of the window, not on a random one.
+                _nb = int(min(max(_r // 2, 1), _o.size))
+                _ns = int(min(_r - _nb, _o.size - _nb))
+                _sub = (_rng.choice(_o[_nb:], size=_ns, replace=False)
+                        if _ns > 0 else np.empty(0, dtype=_o.dtype))
+                _parts.append(np.concatenate([_must, _o[:_nb], _sub]))
+            sel = np.unique(np.concatenate(_parts))
+            gb_truth_meta["nwin"] = _NWIN
+            gb_truth_meta["win_full"] = int(_WIN_FULL)
+            gb_truth_meta["protected"] = int(_pro.sum())
+            gb_truth_meta["drawn_frac"] = float(_frac)
         else:
             sel = keep
         gb_truth_pts = [[float(f"{f0_band[i]:.7g}"), round(float(la_band[i]), 4)]
@@ -2455,11 +2819,19 @@ try:
             f"{_tm['above_cut']:,} passing the cut log10 A >= {_tm['cut']:.2f} "
             f"(0.5 dex below the faintest recovered source, {_tm['rec_lo']:.2f}); "
             f"{_tm['in_band']:,} catalogue sources lie in the GB band in total. "
-            + (f"Every truth brighter than log10 A = {_tm['bright_cut']:.2f} is "
-               f"kept; the fainter remainder is a uniform "
-               f"{100 * _tm['faint_frac']:.1f}% random subsample -- the faint "
-               f"tail's DENSITY is diluted by that factor, its shape is not."
-               if "bright_cut" in _tm else "No decimation was needed."))
+            + (f"Decimation is per frequency window ({_tm['nwin']} log-spaced "
+               f"windows). Any window holding at most {_tm['win_full']:,} "
+               f"sources is drawn IN FULL -- which is every window above a few "
+               f"mHz -- and the {_tm['protected']:,} catalogue rows lying "
+               f"within {TOL_BINS:.0f} frequency bins of a model source are "
+               f"always drawn, so no recovered dot can sit on a patch with no "
+               f"truth mark under it. Only what those two rules leave over is "
+               f"decimated, at ~{100 * _tm['drawn_frac']:.1f}% of each crowded "
+               f"window's remainder (brightest half of that share kept "
+               f"outright, the rest a uniform random subsample) -- the drawn "
+               f"density is uniform in f0 and there is NO band-wide "
+               f"brightness edge."
+               if "nwin" in _tm else "No decimation was needed."))
 except Exception as e:
     MISSING.append(f"GB injection catalogue truth overlay unavailable: {e!r}")
 
@@ -2487,12 +2859,14 @@ VGB_POST_JSON = json.dumps({
 # histogram panel it replaced is gone; the GB panel moved to corner
 # plots too (2026-08-20), so both selectors are now image swaps.
 #
-# Samples: the last min(10, NIT) stored iterations x every cold walker
-# (~240 rows), wider than the 3-iteration window the marginal panels use --
-# a corner needs the extra rows for its 2-D contours to mean anything.
-CORNER_ITS = min(10, VGB_NIT)
+# Samples: the last POOL_ITS_POSTERIOR stored iterations x every cold walker
+# (~240 rows), wider than the POOL_ITS_SAMPLES window the scatter/marginal
+# panels use -- a corner needs the extra rows for its 2-D contours to mean
+# anything. Both windows come from the shared pooling helper.
+VGB_CORNER_ROWS = _vgb_pool_rows(POOL_ITS_POSTERIOR)
+CORNER_ITS = int(VGB_CORNER_ROWS.size)
 CORNER_DPI, CORNER_IN = 68, 7.0        # size-budget tuned (see below)
-vgb_corner = vgb_c[-CORNER_ITS:].reshape(-1, 55, 5)      # (S, 55, 5)
+vgb_corner = vgb_c[VGB_CORNER_ROWS].reshape(-1, 55, 5)   # (S, 55, 5)
 VGB_CORNER = {"src": [], "nsamp": int(vgb_corner.shape[0]),
               "nits": int(CORNER_ITS), "nwalk": int(nwalk)}
 CORNER_BYTES = []
@@ -2579,10 +2953,12 @@ try:
                           None if VGB_TRUTH is None else VGB_TRUTH[leaf],
                           title)
 
-    # ALL 55 leaves (2026-08-16): the redesign cut this to the 11
-    # detectable ones. Detectable first so the picker still opens on a
-    # real posterior, then the rest in descending SNR.
-    _corner_order = list(VGB_DET) + [k for k in order if k not in set(VGB_DET)]
+    # DETECTABLE-ONLY (2026-09-05): render corner PNGs only for the SNR>7
+    # detectable set. The 44 prior-dominated leaves render flat, useless
+    # corners and were the dominant page-weight cost after POOL_ITS->30 --
+    # dropping them is the main 16 MB size win. The per-leaf corner selector
+    # panel + JS stay; the picker now lists exactly this detectable set.
+    _corner_order = list(VGB_DET)
     for leaf in _corner_order:
         nm = VGB_IDS[leaf] if VGB_IDS else f"leaf {leaf}"
         _f0 = VGB_F0[leaf] if VGB_F0 is not None else float("nan")
@@ -2648,8 +3024,11 @@ if _rows:
     # the same source from one iteration to the next; rows are associated by
     # f0 proximity instead, at most one per (iteration, walker) cell, taking
     # the alive leaf nearest the cluster centre. Same widened window the VGB
-    # corners already use, and the same reason for it.
-    GB_CORNER_ITS = min(10, NIT)
+    # corners already use, and the same reason for it. Routed through the
+    # shared pooling helper (2026-08-27) so the window, the young-store
+    # clamp and the extract keep-window clamp are defined in ONE place.
+    GB_CORNER_ROWS = _pool_its(POOL_ITS_POSTERIOR, "gb")
+    GB_CORNER_ITS = int(GB_CORNER_ROWS.size)
     # 9 params need far more canvas than the VGB panel's 5. At the VGB's
     # 7in/68dpi the axis labels of a 9x9 collide into an unreadable smear.
     GB_CORNER_IN, GB_CORNER_DPI = 13.0, 96
@@ -2668,8 +3047,8 @@ if _rows:
                 for c in solid[:3]]
     _pool = [[] for _ in _centers]
     _pool_its = [0 for _ in _centers]
-    for _it in range(max(0, NIT - GB_CORNER_ITS), NIT):
-        _al = gb_inds[_it]
+    for _it in GB_CORNER_ROWS:
+        _al = gb_inds[_it]                             # THIS iteration's mask
         if not _al.any():
             continue
         _ch = g["chain/gb"][_it, 0, 0]                 # (nwalk, nleaf, 9)
@@ -3333,14 +3712,14 @@ ul {{ color:var(--dim); font-size:13px; }}
 </header>
 <nav>
   <a href="#status">status</a><a href="#resid">residual</a>
-  <a href="#recovery">recovery</a><a href="#population">population</a><a href="#vgb">vgb zoom</a>
+  <a href="#recovery">recovery</a><a href="#population">population</a>
   {NAV_PARAMS}<a href="#search">search &amp; cap cells</a>
   <a href="#fstat">f-stat</a><a href="#noise">noise</a>
   <a href="#vgb">verification binaries</a><a href="#detect">detectability</a>
   <a href="#appendix">appendix</a>
 </nav>
 <main>
-
+{COMMENTARY}
 <section id="status"><h2>Status</h2>
 <div class="kpi">
   <div><b>{SCI.get("ngbit", 0)}</b><span>GB search iterations</span></div>
@@ -3352,11 +3731,17 @@ ul {{ color:var(--dim); font-size:13px; }}
 <p style="font-size:13px"><strong>The denominator, stated once.</strong> Every
 recovery number on this page is against <strong>{SCI.get("ndet", 812)} galactic
 binaries</strong> &mdash; those in the injected catalogue with optimal
-signal-to-noise above 7 over 3&ndash;21.94 mHz, evaluated under this run&rsquo;s own
-fitted noise. A model source counts as a recovery when it lies within
+signal-to-noise above 7 over {BAND_TXT}, the full band the sampler analyses,
+evaluated under this run&rsquo;s own fitted noise. A model source counts as a
+recovery when it lies within
 {TOL_BINS:.0f} frequency bins ({TOL_BINS / SCI_TOBS * 1e6:.3f} &micro;Hz) of one,
 one-to-one. Those windows cover {pct(SCI["chance"], 1) if SCI else "2.2%"} of the
-band, so that is the rate at which an arbitrary source would match by accident.</p>
+band, so that is the rate at which an arbitrary source would match by accident.
+Below roughly 3 mHz that threshold is an SNR statement and not a resolvability
+one: the sensitivity it is measured against already carries the fitted galactic
+foreground, but the catalogue puts many sources in every frequency bin down
+there, so a binary can clear signal-to-noise 7 and still be inseparable from
+its neighbours.</p>
 {ARM_TABLE}
 <!-- TRACKERS_TOP: the two headline per-iteration trackers live here, first
      thing after the KPIs (moved from Search & Cap Cells, user request
@@ -3403,7 +3788,7 @@ the residual by construction.</div>
 <div class="panel">{img("f10_nn", "nearest-neighbour separation")}
 <div class="caption">{cap_f10}{F10_BLEND_NOTE}</div></div>
 
-<div class="caption" style="margin-top:18px"><strong>Zoom in.</strong> The static panels above are the whole band at once; these two are pannable and zoomable, which is the only way to read an individual galactic binary against its injected counterpart.</div>
+<div class="caption" style="margin-top:18px"><strong>Zoom in.</strong> The static panels above are the whole band at once; these two are pannable and zoomable, which is the only way to read an individual galactic binary against its injected counterpart. The scatter pools the last {EXPL_ITS} stored iterations of the cold chain; the corner posteriors under it pool {gb1_meta.get("corner_its", 0)}. Every pooled iteration is masked by its OWN <code>inds</code> row &mdash; the branch is trans-dimensional, so a leaf alive now was not necessarily alive four iterations ago.</div>
 <div class="panel">
 <div class="btnrow">
   <button id="btn_all">full band</button>
@@ -3425,7 +3810,13 @@ the residual by construction.</div>
 model sources, red crosses = the injected catalogue. Drag to pan and use the
 wheel to zoom, or set the view numerically with the centre and width/height
 controls above &mdash; those hold the window size fixed and slide it across
-the band, which is the steadier way to walk through frequency.</div>
+the band, which is the steadier way to walk through frequency.
+<strong>Green is pooled over the last {EXPL_ITS} stored iterations</strong>
+&times; {nwalk} cold walkers ({EXPL_RAW:,} alive-leaf rows{EXPL_DEC_NOTE}),
+with each iteration&rsquo;s own alive mask applied, so a single source draws a
+cloud whose width is the sampler&rsquo;s spread rather than one snapshot of
+where the walkers happened to sit. Red is unchanged: one cross per catalogue
+source, decimated per frequency window.</div>
 </div>
 
 <div class="panel">
@@ -3528,42 +3919,10 @@ curve above and through the residual, never against a number.</div></div>
 <div class="panel">{img("f9_vgb", "detectable verification binaries")}
 <div class="caption">The {VGB_N_DET} of 55 catalogue verification binaries that clear
 SNR 7 at three months, with their distance posteriors against the catalogue value.
-The other {55 - VGB_N_DET} are prior-dominated &mdash; the median verification-binary
-SNR is {VGB_SNR_MED:.1f}.</div></div>
-<div class="panel">{img("f9_vgb_snr", "verification binary SNRs")}
-<div class="caption">Why: optimal SNR of all 55 against the fitted noise. Three
-months is simply not long enough for most of this set, and their flat posteriors are
-an absence of signal, not a failure of the fit.</div></div>
-<div class="panel">{img("vgb_dist")}
-<div class="caption">Distance posteriors for all 55 leaves against catalogue truth, median
-and 1&sigma;. The 44 prior-dominated ones are the flat error bars.</div></div>
-<div class="panel">
-<div class="btnrow">
-  <button id="vgbpost_reset">reset zoom</button>
-  <span class="caption" style="align-self:center">distance&ndash;f0 posterior cloud:
-  EVERY sample (last stored iterations &times; {nwalk} walkers per leaf), catalogue truth
-  in red &middot; drag = pan &middot; wheel/pinch = zoom</span>
-</div>
-<div class="btnrow viewctl">
-  <button id="vgbpost_pick" title="arm, then click the plot to set the view center">set center by click</button>
-  <label>cx <input id="vgbpost_cx" type="text"></label>
-  <label>cy <input id="vgbpost_cy" type="text"></label>
-  <label>width <input id="vgbpost_wsl" type="range" min="0" max="1000" step="1"><input id="vgbpost_w" type="text"></label>
-  <label>height <input id="vgbpost_hsl" type="range" min="0" max="1000" step="1"><input id="vgbpost_h" type="text"></label>
-</div>
-<canvas id="vgbpost" style="height:340px"></canvas>
-<div class="caption">The zoom is the point: at full extent the 55 posteriors overlap into a
-band, and only zoomed in can an individual leaf be read against its red truth mark. The
-JS for this canvas survived the redesign but its markup did not, so the handler was
-dereferencing a null and killing every later script block on the page.</div>
-</div>
-<div class="panel">{img("vgb_snr")}
-<div class="caption">Optimal signal-to-noise per stored iteration, light to dark with time.
-These should <em>rise</em> as the galactic foreground is fitted down &mdash; the source-side
-twin of the sensitivity decline watch.</div></div>
-<div class="panel">{img("vgb_traces")}
-<div class="caption">Distance traces for the three loudest verification binaries, all cold
-walkers, against catalogue truth.</div></div>
+The other {55 - VGB_N_DET} are prior-dominated. Full-55 SNR-vs-frequency, all-55
+distance posteriors, the SNR-per-iteration trend, and the interactive zoom cloud were
+removed for the 16 MB size budget; the median VGB SNR is {VGB_SNR_MED:.1f} and the
+{55 - VGB_N_DET} prior-dominated leaves are an absence of signal, not a fit failure.</div></div>
 <div class="panel">{img("vgb_hists")}
 <div class="caption">The four remaining sampled parameters pooled over all 55 leaves, so
 the truth is a distribution rather than a line. The frequency-derivative ratio is the
@@ -3588,7 +3947,7 @@ the truth, so a truth line outside the posterior stays visible.</div>
 <div class="caption" style="margin:0 0 10px 0">Optimal SNR of the whole injected
 catalogue at this observation time, under two noise models: the run&rsquo;s own fitted
 instrument and foreground, and the injected instrument noise with the legacy fitted
-foreground. Full band, so these are larger than the 3&ndash;21.94 mHz denominator
+foreground. Whole catalogue, so these are larger than the {BAND_TXT} denominator
 above.</div>
 <table style="border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums">
 <tr style="border-bottom:1px solid var(--line)">
@@ -3607,10 +3966,10 @@ models disagree by 10% overall and, more usefully, in opposite directions either
 of the galactic peak &mdash; treat the second column as a reference point, not truth.
 <br><br>
 Detectability is also a moving target: the same calculation gives
-<strong>{SCI.get("ndet", 812)}</strong> over 3&ndash;21.94 mHz at this run&rsquo;s
-late-iteration noise against 694 at iteration 15, because the foreground estimate
-dropped as sources left the residual. That is exactly why the denominator on this
-page is frozen at one iteration and stated.</div>
+<strong>{SCI.get("ndet", 812)}</strong> over {BAND_TXT} at this run&rsquo;s
+late-iteration noise, and it moved as the foreground estimate dropped and sources
+left the residual. That is exactly why the denominator on this page is frozen at
+one iteration and stated.</div>
 </div>
 </section>
 
@@ -3770,114 +4129,9 @@ function viewCtl(px, cv, api) {{
   sync();
   return {{ sync }};
 }}
-(() => {{
-  const cv = document.getElementById("vgbpost");
-  if (!cv) return;
-  const css = getComputedStyle(document.documentElement);
-  const C = n => css.getPropertyValue(n).trim();
-  const pts = VPOST.pts;
-  const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
-  let X0, X1, Y0, Y1;
-  const pad = (a, b) => [(a - (b - a) * 0.05), (b + (b - a) * 0.05)];
-  const full = () => {{
-    [X0, X1] = pad(Math.min(...xs), Math.max(...xs));
-    [Y0, Y1] = pad(0, Math.max(...ys));
-  }};
-  full();
-  const FW = X1 - X0, FH = Y1 - Y0;
-  let syncCtl = () => {{}};
-  const dpr = window.devicePixelRatio || 1;
-  function draw() {{
-    const w = cv.clientWidth, h = cv.clientHeight;
-    // RESIZE ONLY WHEN THE SIZE ACTUALLY CHANGES (2026-08-19). Assigning to
-    // cv.width reallocates the backing store and resets all context state.
-    // Doing it every frame -- while panning, at pointer-event rate -- was
-    // the biggest cost in these canvases: a multi-megabyte buffer thrown
-    // away and rebuilt per pointermove.
-    const bw = Math.round(w * dpr), bh = Math.round(h * dpr);
-    if (cv.width !== bw || cv.height !== bh) {{ cv.width = bw; cv.height = bh; }}
-    const g = cv.getContext("2d");
-    // setTransform, not scale: scale() would compound now that the buffer
-    // (and with it the identity transform) survives between frames.
-    g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    g.fillStyle = C("--panel"); g.fillRect(0, 0, w, h);
-    const ml = 56, mb = 30, mt = 8, mr = 10;
-    const sx = x => ml + (x - X0) / (X1 - X0) * (w - ml - mr);
-    const sy = y => h - mb - (y - Y0) / (Y1 - Y0) * (h - mb - mt);
-    g.strokeStyle = C("--line"); g.fillStyle = C("--dim"); g.font = "10px monospace";
-    for (let i = 0; i <= 6; i++) {{
-      const xv = X0 + (X1 - X0) * i / 6, yv = Y0 + (Y1 - Y0) * i / 6;
-      g.beginPath(); g.moveTo(sx(xv), mt); g.lineTo(sx(xv), h - mb); g.stroke();
-      g.beginPath(); g.moveTo(ml, sy(yv)); g.lineTo(w - mr, sy(yv)); g.stroke();
-      g.fillText(xv.toPrecision(4), sx(xv) - 14, h - 12);
-      g.fillText(yv.toPrecision(3), 4, sy(yv) + 3);
-    }}
-    g.fillText(VPOST.xlab, w / 2 - 50, h - 2);
-    g.save(); g.translate(10, h / 2); g.rotate(-Math.PI / 2);
-    g.fillText("dist [kpc]", -25, 0); g.restore();
-    g.fillStyle = C("--violet");
-    for (const p of pts) {{
-      const x = sx(p[0]), y = sy(p[1]);
-      if (x < ml || x > w - mr || y < mt || y > h - mb) continue;
-      g.globalAlpha = 0.45;
-      g.beginPath(); g.arc(x, y, 1.4, 0, 6.29); g.fill();
-    }}
-    // catalogue truth distance per leaf (red, the file-wide truth color)
-    g.globalAlpha = 1; g.fillStyle = C("--red");
-    for (const p of (VPOST.truth || [])) {{
-      const x = sx(p[0]), y = sy(p[1]);
-      if (x < ml || x > w - mr || y < mt || y > h - mb) continue;
-      g.beginPath(); g.arc(x, y, 2.6, 0, 6.29); g.fill();
-    }}
-    g.globalAlpha = 1;
-    syncCtl();
-  }}
-  // See the explorer canvas below for why pan/zoom redraws are coalesced
-  // into animation frames rather than run per pointer event.
-  let raf = 0;
-  const redraw = () => {{
-    if (raf) return;
-    raf = requestAnimationFrame(() => {{ raf = 0; draw(); }});
-  }};
-  let drag = null;
-  cv.addEventListener("pointerdown", e => {{ drag = [e.clientX, e.clientY]; cv.setPointerCapture(e.pointerId); }});
-  cv.addEventListener("pointermove", e => {{
-    if (!drag) return;
-    const w = cv.clientWidth, h = cv.clientHeight;
-    const dx = (e.clientX - drag[0]) / (w - 66) * (X1 - X0);
-    const dy = (e.clientY - drag[1]) / (h - 38) * (Y1 - Y0);
-    X0 -= dx; X1 -= dx; Y0 += dy; Y1 += dy; drag = [e.clientX, e.clientY]; redraw();
-  }});
-  cv.addEventListener("pointerup", () => drag = null);
-  // ZOOM ABOUT THE CURSOR, NOT THE VIEW CENTRE (2026-08-19). Centre-anchored
-  // zoom is what made this canvas hard to drive: the source you were aiming
-  // at slid out of frame as you zoomed, so reaching one binary meant
-  // alternating zoom and pan several times. Anchoring on the pointer holds
-  // whatever is under the cursor still, the way every map-style UI behaves.
-  cv.addEventListener("wheel", e => {{
-    e.preventDefault();
-    const s = e.deltaY > 0 ? 1.15 : 0.87;
-    const r = cv.getBoundingClientRect();
-    const w = cv.clientWidth, h = cv.clientHeight;
-    const ml = 56, mb = 30, mt = 8, mr = 10;
-    const cl = v => Math.max(0, Math.min(1, v));
-    // fraction across the plot box; clamped so a cursor sitting in the axis
-    // margins anchors at the edge instead of flinging the view sideways
-    const fx = cl((e.clientX - r.left - ml) / (w - ml - mr));
-    const fy = cl((h - mb - (e.clientY - r.top)) / (h - mb - mt));
-    const ax = X0 + fx * (X1 - X0), ay = Y0 + fy * (Y1 - Y0);
-    X0 = ax + (X0 - ax) * s; X1 = ax + (X1 - ax) * s;
-    Y0 = ay + (Y0 - ay) * s; Y1 = ay + (Y1 - ay) * s; redraw();
-  }}, {{ passive: false }});
-  document.getElementById("vgbpost_reset").onclick = () => {{ full(); draw(); }};
-  syncCtl = viewCtl("vgbpost", cv, {{
-    get: () => [X0, X1, Y0, Y1],
-    set: (a, b, c, d) => {{ X0 = a; X1 = b; Y0 = c; Y1 = d; draw(); }},
-    fullW: FW, fullH: FH,
-  }}).sync;
-  new ResizeObserver(redraw).observe(cv);
-  draw();
-}})();
+// vgbpost dist-f0 posterior cloud REMOVED 2026-09-05 (16 MB size budget); its
+// canvas markup + reset/pick controls were removed, so the whole handler IIFE
+// is deleted here to avoid dereferencing a null #vgbpost and killing later blocks.
 (() => {{
   const cv = document.getElementById("expl"), cap = document.getElementById("expl_cap");
   const css = getComputedStyle(document.documentElement);
@@ -3892,8 +4146,8 @@ function viewCtl(px, cv, api) {{
   // faint tail -- and defaulting it to hidden meant it went unnoticed.
   let showT = TRUTH.length > 0;
   const baseCap = (hasGB
-    ? `GB samples: ${{DATA.gb.length}} alive-source rows (last iteration, all cold walkers; y = log10 amplitude from (dist, f0, Mc)).`
-    : `No GB sources alive yet - showing the 55 VGBs (24 walker samples each) as 1/dist vs leaf index. GB samples take over automatically once births land.`);
+    ? `GB samples: ${{DATA.gb.length}} alive-source rows pooled over the last ${{DATA.gb_its}} stored iterations x all cold walkers${{DATA.gb_stride > 1 ? ` (1-in-${{DATA.gb_stride}} of ${{DATA.gb_raw}} for page weight)` : ""}}; y = log10 amplitude from (dist, f0, Mc).`
+    : `No GB sources alive yet - showing the 55 VGBs (${{DATA.vgb_its}} stored iterations x 24 walker samples each) as 1/dist vs leaf index. GB samples take over automatically once births land.`);
   const setCap = () => {{
     cap.textContent = baseCap + (TRUTH.length
       ? (showT ? " " + (DATA.truth_cap || "") : ` ${{TRUTH.length}} catalogue truth points available - press "show catalogue truths".`)
