@@ -37,6 +37,7 @@ from .diagnostic import (
     residual_source_likelihood_term,
 )
 from .sensitivity import SensitivityMatrix, SensitivityMatrixBase
+from .utils.device import order_after_array
 from .utils.exceptions import WaveformDomainError
 from .stochastic import FittedHyperbolicTangentGalacticForeground, StochasticContribution
 from .utils.constants import *
@@ -1652,9 +1653,15 @@ class BandView:
                         elif is_scalar_val:
                             shards[s][shard_idx] = val
                         else:
+                            # Peer READ of the payload, which was sliced on
+                            # ITS device (_slice_axis0_on_device).
+                            order_after_array(xp, v_part)
                             shards[s][shard_idx] = xp.asarray(v_part)
                     if mode == "get":
                         with xp.cuda.Device(int(self._aca.gpus[0])):
+                            # Staging copy on gpus[0] reading the gather
+                            # above, which ran on shard ``s``'s stream.
+                            order_after_array(xp, vals)
                             out[rows] = xp.asarray(vals)
         finally:
             if self._aca.gpus is not None:
@@ -1848,6 +1855,9 @@ class BandView:
                 with self._aca.xp.cuda.Device(int(self._aca.gpus[s])):
                     src = shards[s][intra[rows]]
                 with self._aca.xp.cuda.Device(int(target)):
+                    # ``src`` was gathered on shard ``s``'s stream; this
+                    # copy runs on ``target``'s (see order_after_array).
+                    order_after_array(self._aca.xp, src)
                     out[rows] = self._aca.xp.asarray(src)
             return out
         finally:
@@ -1879,6 +1889,7 @@ class BandView:
                     if is_scalar:
                         shards[s][intra[rows]] = val
                     else:
+                        order_after_array(self._aca.xp, val)
                         sub = val[rows] if hasattr(val, "__getitem__") else val
                         shards[s][intra[rows]] = self._aca.xp.asarray(sub)
         finally:
@@ -1934,6 +1945,9 @@ class BandView:
                 # (xp.asarray crosses devices directly, no host hop).
                 sub = self._slice_axis0_on_device(val, rows)
                 with self._aca.xp.cuda.Device(int(self._aca.gpus[s])):
+                    # ``sub`` was sliced on the PAYLOAD's device; this add
+                    # reads it from the shard's stream (see order_after_array).
+                    order_after_array(self._aca.xp, sub)
                     shards[s][intra[rows]] += self._aca.xp.asarray(sub)
         finally:
             self._aca.xp.cuda.runtime.setDevice(main)
@@ -2783,7 +2797,16 @@ class AnalysisContainerArray:
             get_stream = None
         events = [None] * len(items)
 
+        # INBOUND EDGE (caller -> split, 2026-09-16): workers read payload
+        # rows the caller staged on ITS stream, so each split's stream must
+        # be ordered behind that staging before its launches. See
+        # ``order_after_array`` for the full argument.
+        stage_event = get_stream().record() if get_stream is not None else None
+
         def _run(idx, s, rows):
+            if stage_event is not None:
+                with self.xp.cuda.Device(int(self.gpus[s])):
+                    get_stream().wait_event(stage_event)
             worker(s, rows)
             if get_stream is not None:
                 with self.xp.cuda.Device(int(self.gpus[s])):
@@ -2801,10 +2824,19 @@ class AnalysisContainerArray:
                 _run(i, s, rows)
 
         if get_stream is not None:
-            caller_stream = get_stream()
-            for ev in events:
-                if ev is not None:
-                    caller_stream.wait_event(ev)
+            # OUTBOUND EDGE, ON EVERY DEVICE (2026-09-16): the caller's next
+            # reads of split output are frequently issued inside
+            # ``with Device(other)`` (BandView per-shard loops, the buffer's
+            # per-shard likelihood reduce), which waited on nothing when only
+            # the caller's current stream was edged.
+            live = [ev for ev in events if ev is not None]
+            wait_devs = {int(self.xp.cuda.runtime.getDevice())}
+            wait_devs.update(int(self.gpus[s]) for s, _ in items)
+            for dev in sorted(wait_devs):
+                with self.xp.cuda.Device(dev):
+                    stream = get_stream()
+                    for ev in live:
+                        stream.wait_event(ev)
 
     # ------------------------------------------------------------------
     # Vectorized analysis ops (sharded by ``index`` across GPUs)
@@ -3329,7 +3361,11 @@ class AnalysisContainerArray:
                     if len(split) == 0:
                         continue
                     # Move this shard's buffer onto target_gpu, then scatter
-                    # back into AC order in `gathered`.
+                    # back into AC order in `gathered`. The peer read is
+                    # ordered behind shard ``i``'s own stream first -- this
+                    # feeds the per-device PSD mirror replicas, so a stale
+                    # read here is baked in for the whole binding.
+                    order_after_array(self.xp, per_gpu_list[i])
                     src = self.xp.asarray(per_gpu_list[i])
                     src = src.reshape(len(split), per_ac)
                     for intra_i, ac_i in enumerate(split):

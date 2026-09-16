@@ -67,23 +67,39 @@ class SplitStreamEdgeTest(unittest.TestCase):
         records = [e for e in log if e[0] == "record"]
         waits = [e for e in log if e[0] == "wait"]
 
-        # one event recorded per populated shard, on that shard's device
-        self.assertEqual(len(records), 2, log)
-        self.assertEqual(sorted(r[1] for r in records), [0, 1])
-        # one wait per recorded event, all issued on the CALLER's device (0)
-        self.assertEqual(len(waits), 2, log)
-        self.assertTrue(all(w[1] == 0 for w in waits), waits)
-        self.assertEqual(sorted(w[2] for w in waits), [0, 1])
+        # 1 caller staging record + one per populated shard (2026-09-16:
+        # the inbound half, mirroring the GB router -- workers peer-read
+        # payload rows the caller staged on ITS stream).
+        self.assertEqual(len(records), 3, log)
+        stage_seq = min(r[2] for r in records)
+        self.assertEqual(records[0][1], 0, log)
+        shard_records = [r for r in records if r[2] != stage_seq]
+        self.assertEqual(sorted(r[1] for r in shard_records), [0, 1])
 
-        # ordering: each shard's record follows its own work mark, and every
-        # wait follows every record and every work mark.
+        inbound = [w for w in waits if w[3] == stage_seq]
+        outbound = [w for w in waits if w[3] != stage_seq]
+        # inbound: each split's stream waits on the staging event first
+        self.assertEqual(sorted(w[1] for w in inbound), [0, 1], waits)
+        # outbound: EVERY involved device waits on EVERY shard event -- the
+        # caller's next reads land inside ``with Device(other)``.
+        self.assertEqual(len(outbound), 4, waits)
+        self.assertEqual(sorted({w[1] for w in outbound}), [0, 1])
+        self.assertEqual(sorted({w[2] for w in outbound}), [0, 1])
+
+        # ordering: each shard's record follows its own work mark; each
+        # inbound wait precedes that shard's work; every outbound wait
+        # follows every record and every work mark.
         self.assertEqual(len(work_log), 2, work_log)
-        for rec in records:
+        for rec in shard_records:
             own_work = [w for w in work_log if w[1] == rec[1]]
             self.assertEqual(len(own_work), 1, work_log)
             self.assertLess(own_work[0][2], rec[2])
-        last_pre_wait = max([r[2] for r in records] + [w[2] for w in work_log])
-        for wait in waits:
+        for w in inbound:
+            own_work = [k for k in work_log if k[1] == w[1]]
+            self.assertLess(w[4], own_work[0][2], log)
+        last_pre_wait = max([r[2] for r in shard_records]
+                            + [w[2] for w in work_log])
+        for wait in outbound:
             self.assertGreater(wait[4], last_pre_wait, log)
 
     def test_serial_path_gets_the_same_edges(self):
@@ -96,8 +112,9 @@ class SplitStreamEdgeTest(unittest.TestCase):
         )
 
         log = aca.xp.stream_log
-        self.assertEqual(len([e for e in log if e[0] == "record"]), 2, log)
-        self.assertEqual(len([e for e in log if e[0] == "wait"]), 2, log)
+        # 1 staging + 2 shard records; 2 inbound + 4 outbound waits
+        self.assertEqual(len([e for e in log if e[0] == "record"]), 3, log)
+        self.assertEqual(len([e for e in log if e[0] == "wait"]), 6, log)
 
     def test_single_populated_split_takes_no_edge(self):
         """One shard == the caller's own stream: no event, no added overhead."""

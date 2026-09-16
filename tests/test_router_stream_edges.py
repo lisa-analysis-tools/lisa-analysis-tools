@@ -59,6 +59,14 @@ def _make_items(xp, devices, work_log, seq_source):
 
 class DispatchStreamEdgeTest(unittest.TestCase):
     def test_event_per_shard_and_caller_waits_after_all_work(self):
+        """The full edge contract (extended 2026-09-16).
+
+        beaa60f5 pinned only the outbound half, on the caller's CURRENT
+        device. The RJ forensics showed two more holes -- shard workers
+        peer-read caller-staged params, and the caller's next reads are
+        issued inside ``with Device(other)`` -- so dispatch now also emits
+        an INBOUND staging edge and waits on EVERY involved device.
+        """
         xp = StreamRecordingXp()
         holder = _make_holder(xp)
         work_log = []
@@ -68,22 +76,35 @@ class DispatchStreamEdgeTest(unittest.TestCase):
 
         records = [e for e in xp.stream_log if e[0] == "record"]
         waits = [e for e in xp.stream_log if e[0] == "wait"]
-        self.assertEqual(len(records), 2, xp.stream_log)
-        self.assertEqual(sorted(r[1] for r in records), [0, 1])
-        # one wait per recorded event, issued on the CALLER's stream (dev 0)
-        self.assertEqual(len(waits), 2, xp.stream_log)
-        self.assertTrue(all(w[1] == 0 for w in waits), waits)
-        self.assertEqual(sorted(w[2] for w in waits), [0, 1])
-        # ordering: every record after its shard's work; every wait after
-        # every record and every work mark
+        # 1 staging record (caller, before any work) + 1 per shard
+        self.assertEqual(len(records), 3, xp.stream_log)
+        stage_seq = min(r[2] for r in records)
+        self.assertEqual(records[0][1], 0, xp.stream_log)
         work_seq = {w[1]: w[3] for w in work_log}
-        for rec in records:
-            si = [it[0] for it in items
-                  if it[1].device == rec[1]][0]
+        self.assertTrue(all(stage_seq < s for s in work_seq.values()))
+        shard_records = [r for r in records if r[2] != stage_seq]
+        self.assertEqual(sorted(r[1] for r in shard_records), [0, 1])
+        # every shard record follows its own shard's work
+        for rec in shard_records:
+            si = [it[0] for it in items if it[1].device == rec[1]][0]
             self.assertGreater(rec[2], work_seq[si])
-        last_pre_wait = max([r[2] for r in records]
+
+        inbound = [w for w in waits if w[3] == stage_seq]
+        outbound = [w for w in waits if w[3] != stage_seq]
+        # inbound: each shard device waits on the caller's staging event
+        # BEFORE its worker runs
+        self.assertEqual(sorted(w[1] for w in inbound), [0, 1], waits)
+        for w in inbound:
+            si = [it[0] for it in items if it[1].device == w[1]][0]
+            self.assertLess(w[4], work_seq[si])
+        # outbound: every involved device waits on every shard event, and
+        # only after all work and all records
+        self.assertEqual(len(outbound), 4, waits)
+        self.assertEqual(sorted({w[1] for w in outbound}), [0, 1])
+        self.assertEqual(sorted({w[2] for w in outbound}), [0, 1])
+        last_pre_wait = max([r[2] for r in shard_records]
                             + [w[3] for w in work_log])
-        for w in waits:
+        for w in outbound:
             self.assertGreater(w[4], last_pre_wait)
 
     def test_serial_path_gets_the_same_edges(self):
@@ -93,10 +114,11 @@ class DispatchStreamEdgeTest(unittest.TestCase):
         items, worker = _make_items(xp, [0, 1], work_log, xp.next_seq)
         with mock.patch.dict(os.environ, {"GB_ROUTER_THREADED": "0"}):
             _RoutedBandEngine._dispatch_shards(holder, items, worker)
+        # 1 staging + 2 shard records; 2 inbound + 4 outbound waits
         self.assertEqual(
-            len([e for e in xp.stream_log if e[0] == "record"]), 2)
+            len([e for e in xp.stream_log if e[0] == "record"]), 3)
         self.assertEqual(
-            len([e for e in xp.stream_log if e[0] == "wait"]), 2)
+            len([e for e in xp.stream_log if e[0] == "wait"]), 6)
 
     def test_none_device_item_records_no_event(self):
         xp = StreamRecordingXp()
@@ -107,8 +129,14 @@ class DispatchStreamEdgeTest(unittest.TestCase):
             holder, items, worker, state_ids=[0, 1])
         records = [e for e in xp.stream_log if e[0] == "record"]
         waits = [e for e in xp.stream_log if e[0] == "wait"]
-        self.assertEqual([r[1] for r in records], [1])
-        self.assertEqual(len(waits), 1)
+        # the staging record is always present; the None-device item adds
+        # neither a record nor an inbound wait of its own
+        stage_seq = min(r[2] for r in records)
+        shard_records = [r for r in records if r[2] != stage_seq]
+        self.assertEqual([r[1] for r in shard_records], [1])
+        self.assertEqual([w[1] for w in waits if w[3] == stage_seq], [1])
+        outbound = [w for w in waits if w[3] != stage_seq]
+        self.assertEqual(sorted({w[1] for w in outbound}), [0, 1])
         self.assertEqual(len(work_log), 2)  # both workers still ran
 
     def test_xp_without_streams_is_a_noop(self):
