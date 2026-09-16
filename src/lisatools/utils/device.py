@@ -26,6 +26,7 @@ __all__ = [
     "pin_main_device",
     "current_device",
     "to_current_device",
+    "synchronize",
     "jax_device_context",
 ]
 
@@ -99,6 +100,27 @@ def to_current_device(xp, arr):
     if int(dev_id) == int(xp.cuda.runtime.getDevice()):
         return arr
     return xp.asarray(xp.asnumpy(arr))
+
+
+def synchronize(xp) -> None:
+    """Block until the current device has finished its queued work.
+
+    FOR TIMING ATTRIBUTION ONLY. CUDA kernel launches return immediately,
+    so an un-synced ``launch`` span reads as microseconds and the whole
+    wall silently lands on whatever device-to-host pull blocks next --
+    which is exactly how job 508's telemetry ended up reporting "kernel =
+    100.0%" with no way to say WHICH part of the call that was. Placing an
+    explicit sync at a span boundary that is immediately followed by a
+    blocking D2H costs nothing: the wait happens either way, this just
+    labels it.
+
+    No-op for NumPy / any ``xp`` without a ``cuda`` attribute, and for
+    ``xp is None``.
+    """
+    cuda = getattr(xp, "cuda", None)
+    if cuda is None:
+        return
+    cuda.runtime.deviceSynchronize()
 
 
 def jax_device_context(device: Optional[int], *, kind: str = "gpu"):
