@@ -59,6 +59,60 @@ class SubmitScriptsSyntaxTest(unittest.TestCase):
             )
 
 
+class SubmitScriptsInJobBlockTest(unittest.TestCase):
+    """The IN-JOB rank-layout block (after the `exec sbatch` self-dispatch).
+
+    The stub-sbatch scenarios below can only observe the PRE-submit dispatch
+    block -- everything after `exec sbatch` never runs without a real job --
+    so these invariants are checked as text. They are the ones that only bite
+    a launch that bypassed the dispatch block entirely (a manual
+    `sbatch --nodes=2 --ntasks=5 <script>`), which is exactly the path no
+    other test covers.
+    """
+
+    def _text(self, path):
+        with open(path) as fh:
+            return fh.read()
+
+    def test_multi_node_forces_walker_block_layout_in_job(self):
+        for path in SCRIPTS:
+            with self.subTest(script=path):
+                text = self._text(path)
+                self.assertIn(
+                    'if [ "${SLURM_NNODES:-1}" -gt 1 ] && '
+                    '[ "${GF_LEGACY_RANK_LAYOUT}" = "1" ]; then',
+                    text,
+                )
+                self.assertIn("FORCING GF_LEGACY_RANK_LAYOUT=0", text)
+
+    def test_in_job_exports_all_three_layout_knobs(self):
+        for path in SCRIPTS:
+            with self.subTest(script=path):
+                text = self._text(path)
+                self.assertIn("export GPUS_PER_RANK RANKS_PER_GPU", text)
+                self.assertIn("export GF_LEGACY_RANK_LAYOUT", text)
+
+    def test_nwalkers_modulo_is_guarded_against_zero_compute_ranks(self):
+        for path in SCRIPTS:
+            with self.subTest(script=path):
+                text = self._text(path)
+                self.assertIn('[ "${N_COMPUTE_EFF}" -gt 0 ]', text)
+                # the division itself must not be reachable unguarded
+                self.assertNotIn(
+                    'if [ "${GF_LEGACY_RANK_LAYOUT}" = "0" ] && '
+                    "[ $(( NWALKERS % N_COMPUTE_EFF )) -ne 0 ]; then",
+                    text,
+                )
+
+    def test_srun_launch_line_defaults_ntasks(self):
+        for path in SCRIPTS:
+            with self.subTest(script=path):
+                self.assertIn(
+                    'srun --ntasks="${SLURM_NTASKS:-3}" --distribution=cyclic',
+                    self._text(path),
+                )
+
+
 class SubmitScriptsDispatchTest(unittest.TestCase):
     """Exercise the pre-submit `exec sbatch ...` dispatch block via a stub."""
 

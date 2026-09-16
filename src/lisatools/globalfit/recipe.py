@@ -646,15 +646,21 @@ class Recipe:
         """
         if self.fanout is not None:
             self.fanout.note_iteration(iteration)
-            if self._fanout_digest_enabled:
-                # ``iteration`` here is the index of the iteration whose
-                # moves just ran (this call is eryn's post-iteration
-                # stopping-fn hook) -- NOT the same clock reading a propose
-                # sees via ``note_iteration`` above, which a rank-side body
-                # reads one iteration late (see setup_first_recipe_step).
-                from .communication.fanout import fanout_digest_line
+        if self._fanout_digest_enabled:
+            # Deliberately OUTSIDE the fan-out guard: ``_make_fanout`` returns
+            # None in single mode, and the single-rank run is exactly the
+            # baseline the cluster gates diff the multi-rank layouts against
+            # (docs/multirank-cluster-gates.md Step 1), so the digest has to
+            # fire there too.
+            #
+            # ``iteration`` here is the index of the iteration whose moves
+            # just ran (this call is eryn's post-iteration stopping-fn hook)
+            # -- NOT the same clock reading a propose sees via
+            # ``note_iteration`` above, which a rank-side body reads one
+            # iteration late (see setup_first_recipe_step).
+            from .communication.fanout import fanout_digest_line
 
-                logger.info(fanout_digest_line(iteration, last_sample))
+            logger.info(fanout_digest_line(iteration, last_sample))
         stop_here = self._current_recipe_step["adjust"].stopping_function(
             iteration, last_sample, sampler
         )

@@ -18,7 +18,11 @@ to the generic ``ModuleSubBackend``/``ModuleSubState``). A plain HDF5 file
 does not self-describe which Python classes wrote its sub-backends -- that
 mapping lives on the run's config, not the file -- so a branch whose data
 does not fit the guessed class is skipped with a one-line warning on
-stderr rather than crashing the whole digest.
+stderr rather than crashing the whole digest. If a wrong guess raises
+earlier than that, inside ``get_last_sample()`` itself, the whole
+reconstruction is retried with a bare ``GFHDFBackend`` and the digest
+prints the main-state arrays (log_like/log_prior/betas, coords, inds)
+without the ``substate/`` rows -- again with a warning on stderr.
 """
 from __future__ import annotations
 
@@ -118,10 +122,30 @@ def state_arrays(state):
 
 
 def digest_store(path):
-    """``{array name: (shape, sha1)}`` for one store's last sample, name-sorted."""
-    backend = open_backend(path)
-    state = backend.get_last_sample()
-    arrays = state_arrays(state)
+    """``{array name: (shape, sha1)}`` for one store's last sample, name-sorted.
+
+    The sub-backend reconstruction is best-effort in the same way
+    :func:`state_arrays` is: the registry above GUESSES which Python class
+    wrote each ``sub_backend/<branch>`` group, and a wrong guess raises
+    inside ``get_last_sample()`` -- before ``state_arrays``' own per-branch
+    guard can catch it -- which would abort the whole digest over one
+    branch. On that failure we warn and retry with a bare
+    :class:`GFHDFBackend`, which reads the main state (log_like, betas,
+    coords/inds) and no sub-states at all: a digest missing the
+    ``substate/`` rows is still a usable transport-parity diff, a crash is
+    not.
+    """
+    try:
+        state = open_backend(path).get_last_sample()
+        arrays = state_arrays(state)
+    except Exception as exc:  # noqa: BLE001 - best-effort, never abort the digest
+        print(
+            f"# WARNING: sub-backend reconstruction failed for {path!r} ({exc}); "
+            "retrying with a bare GFHDFBackend (main-state arrays only)",
+            file=sys.stderr,
+        )
+        state = GFHDFBackend(path).get_last_sample()
+        arrays = state_arrays(state)
     return {
         name: (tuple(np.shape(arrays[name])), array_sha1(arrays[name]))
         for name in sorted(arrays)

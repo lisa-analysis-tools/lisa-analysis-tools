@@ -53,6 +53,7 @@ device); at most one of the two may exceed 1.
 | 2 | 1 GPU | Capacity fallback: rank 1 is demoted to dedicated SAVER with a `UserWarning` (`build_layout`'s `size == 2` branch); the head computes every walker, identical to `np=1`. |
 | 2 | ≥2 GPUs, or 1 GPU with `RANKS_PER_GPU=2` | Two COMPUTE ranks (head + rank 1), **no dedicated saver** — the saver role is aliased to the head, so saves are synchronous. |
 | 3 | 2 GPUs | Head + 1 COMPUTE rank + 1 dedicated SAVER (rank 2), one device each. |
+| 3 | 1 GPU | **`ValueError`** from `build_layout`: 2 COMPUTE ranks on a 1-device pool over-subscribes it (`capacity = len(pool) * ranks_per_gpu // gpus_per_rank = 1`). No silent fallback above size 2 — set `RANKS_PER_GPU=2` to share the device deliberately. |
 | 5 | 2 nodes × 2 GPUs | 4 COMPUTE ranks (one per GPU; AUTO `gpus_per_rank` resolves to 1 per node because more than one compute rank shares each node) + 1 dedicated SAVER. Launch with `srun --distribution=cyclic` so ranks land on both nodes. |
 
 Only `np=2` gets a silent capacity fallback. At `np ≥ 3`, asking for more
@@ -74,12 +75,7 @@ error, not a rounding fallback, when driven directly through `build_layout`
 | `NWALKERS` | variant default | Must be a multiple of `n_compute`; `build_layout` raises otherwise. Rank *r*'s block is `[r*B, (r+1)*B)` in compute-rank order, `B = NWALKERS / n_compute`. |
 | `GF_LEGACY_RANK_LAYOUT` | `0` at the layout level (`ranks.py`'s own default); the campaign submit script keeps `1` at `NGPUS=2` until the WP7 gates pass (see below) | `1` restores today's pre-port roles: one compute rank owns the whole per-node pool, every other non-saver rank is a stopped SPARE. Rollback knob (design spec Risks). |
 | `GF_LAYOUT_DRY_RUN` | unset | Preflight: every rank prints `layout.describe()` and the process exits **before** `fit.build()` allocates anything; a genuinely bad layout still raises inside `build_layout`/`prepare_rank` (Plan 5 Task 2 of this port — see `docs/multirank-cluster-gates.md`'s Step 0 for the exact invocation). |
-| `GF_FANOUT_DIGEST` | unset | Emits a per-iteration `[FANOUT_DIGEST]` residual-hash line, the cluster-gate tool for diffing two layouts for bit-identical transport (Plan 5 Task 4 of this port — see `docs/multirank-cluster-gates.md`'s Step 1). |
-
-`GF_LAYOUT_DRY_RUN` and `GF_FANOUT_DIGEST` are part of the same multi-rank
-port as this document; if your checkout predates Plan 5 Tasks 2/4 they are
-not yet wired into the drivers — `docs/multirank-cluster-gates.md` states
-which of its steps depend on them.
+| `GF_FANOUT_DIGEST` | unset | Emits a per-iteration `[FANOUT_DIGEST]` state-hash line (`log_like` + coords + inds), the cluster-gate tool for diffing two layouts for bit-identical transport (Plan 5 Task 4 of this port — see `docs/multirank-cluster-gates.md`'s Step 1). Emitted from the recipe's post-iteration hook regardless of the rank count, so the single-rank baseline prints it too. |
 
 ## Every rank builds
 
@@ -203,9 +199,14 @@ sbatch  ./submit_gf_6mo_v8.sh      # legacy flow: static header defaults
   so a first 4-GPU launch rounds to 12 unless `NWALKERS` is set explicitly.
 - Launch line: `srun --ntasks=$SLURM_NTASKS --distribution=cyclic ...` when
   `SLURM_NNODES > 1`, else `mpiexec -n ${SLURM_NTASKS:-3} ...`.
-- Under the new default layout, `np=3` on a 2-GPU pool puts a real compute
-  rank on each GPU; under the old legacy layout rank 1 was a stopped spare
-  that occupied a device without using it.
+- Under the walker-block (non-legacy) layout, `np=3` on a 2-GPU pool puts a
+  real compute rank on each GPU; under the legacy layout rank 1 was a
+  stopped spare that occupied a device without using it.
+- In-job, a `SLURM_NNODES > 1` allocation **forces** `GF_LEGACY_RANK_LAYOUT=0`
+  with a loud `[SUBMIT]` line (same rule as `NGPUS=4`, applied to the granted
+  allocation rather than the pre-submit intent): the legacy layout's single
+  compute rank is per-node, so a manual `sbatch --nodes=2 --ntasks=5` under it
+  would leave node B's ranks idle.
 
 ## Semantics that change only when several compute ranks exist
 

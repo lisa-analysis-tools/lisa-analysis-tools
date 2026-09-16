@@ -44,9 +44,19 @@ GF_LAYOUT_DRY_RUN=1 GPUS=0,1 mpiexec -n 3 \
   python scripts/run_global.py --stock <name>
 
 # 2 nodes, 3 ranks (head + 1 compute on the other node + saver)
-GF_LAYOUT_DRY_RUN=1 srun -N 2 --ntasks=3 --distribution=cyclic \
+GF_LAYOUT_DRY_RUN=1 GPUS=0 srun -N 2 --ntasks=3 --distribution=cyclic \
   python scripts/run_global.py --stock <name>
 ```
+
+`GPUS=0` is load-bearing on the 2-node command, not decoration: `GPUS` is
+the **per-node** pool, each node here hosts exactly ONE compute rank, and
+AUTO `gpus_per_rank` gives a lone-per-node compute rank the node's WHOLE
+pool. Left unpinned on a 2-GPU node that rank would own both devices and
+run the in-process cross-device router (the configuration
+`docs/multigpu-cluster-validation.md` flags as unvalidated under several
+ranks) — a different configuration from the single-device layouts (a)/(b)
+below, so the parity gate would be comparing two things that were never
+supposed to match. A one-device pool keeps AUTO at 1 everywhere.
 
 `GF_LAYOUT_DRY_RUN=1` prints `layout.describe()` from every rank and exits
 before `fit.build()` allocates anything (`communication/ranks.py::
@@ -59,12 +69,18 @@ not a captured run):
 walker-block layout: size=3 n_compute=2 nwalkers=<W> block=<W/2> gpus_per_rank=AUTO->1 ranks_per_gpu=1
   r0   head    node=<nodeA> local=0 devices=[0] slot=0 walkers=[0,<W/2>)
   r1   compute node=<nodeA> local=1 devices=[1] slot=0 walkers=[<W/2>,<W>)
-  r2   saver   node=<nodeA> local=0 devices=[0] slot=0 walkers=[0,0)
+  r2   saver   node=<nodeA> local=2 devices=[0] slot=0 walkers=[0,0)
 ```
 
-(`gpus_per_rank=AUTO->1` because two compute ranks share this node, so AUTO
-resolves each to one device — `WalkerBlockLayout.describe()`'s `gpk`
-formatting for the `gpus_per_rank_auto` case.)
+(The schematic is the **1-node** `GPUS=0,1` command above.
+`gpus_per_rank=AUTO->1` there because two compute ranks share the node, so
+AUTO resolves each to one device — `WalkerBlockLayout.describe()`'s `gpk`
+formatting for the `gpus_per_rank_auto` case. The 2-node command reaches the
+same `AUTO->1` by the other route: one compute rank per node, but a pool of
+one device because of the `GPUS=0` above. `local=` is the rank's index
+within its node (`node_comm.Get_rank()`), so on the 1-node launch the saver
+prints `local=2`, and the saver's `devices=` is `pool[local % len(pool)]` —
+it builds on a device like everyone else, then releases it.)
 
 Both dry runs should print an identical `size`/`n_compute`/`block` header
 and the same per-rank role assignment shape; only `node=`/`local=` differ
@@ -105,12 +121,15 @@ GPUS=0,1 mpiexec -n 3 \
   python scripts/run_global.py --stock <name>
 
 # (c) 2 compute ranks across 2 nodes (adapt the srun flags to the cluster)
-srun -N 2 --ntasks=3 --distribution=cyclic \
+GPUS=0 srun -N 2 --ntasks=3 --distribution=cyclic \
   python scripts/run_global.py --stock <name>
 ```
 
 Each launch is `-n 3` (2 compute ranks + 1 saver, `resolve_roles(3)` gives
-`compute=(0, 1)`, `saver=2`).
+`compute=(0, 1)`, `saver=2`). `GPUS=0` on (c) for the same reason as the
+2-node dry run above: one compute rank per node means AUTO `gpus_per_rank`
+would hand it the node's whole pool, so without the pin (c) would be a
+multi-device run being diffed against two single-device ones.
 
 Common env bundle for all three (design spec Verification item 5):
 
@@ -131,18 +150,26 @@ already automatic unless a driver overrides `fit.general.random_seed`
 explicitly — if it does, pin it to the same value for all three launches.
 
 **What to diff:**
-- `[FANOUT_DIGEST]` lines — a per-iteration residual-hash line the head
-  emits when `GF_FANOUT_DIGEST=1` (Plan 5 Task 4 of this port; not yet
-  implemented at every HEAD of this branch — land that task before running
-  this step). All three layouts must print the identical hash at every
-  iteration.
+- `[FANOUT_DIGEST]` lines — a per-iteration state hash (`log_like` + coords
+  + inds) the head emits when `GF_FANOUT_DIGEST=1`. All three layouts must
+  print the identical hash at every iteration. The line is emitted from the
+  recipe's post-iteration hook whether or not a fan-out exists, so a
+  single-rank (`-n 1`) baseline run prints it too and can be diffed against
+  all three.
 - `python scripts/diagnostics/gf_state_digest.py <store.h5>` — a digest
   over `backend.get_last_sample()` covering the full saved `GFState`
   (coords, inds, log_like, betas, and every sub-state array; design spec
-  Verification item 5). Also a Plan 5 Task 4 deliverable, built against
-  exactly this input surface — not yet implemented at every HEAD of this
-  branch. Run it against each layout's final store and diff the outputs;
-  they must match exactly.
+  Verification item 5). Run it against each layout's final store and diff
+  the outputs; they must match exactly. **Sub-state caveat:** an HDF5 file
+  does not record which Python classes wrote its `sub_backend/` groups, so
+  the script guesses from a small branch-name registry
+  (`gb`/`vgb`/`mbh`/`emri`/`sobbh`, else the generic `ModuleSubBackend`). A
+  branch outside that registry — or one whose data does not fit the guessed
+  class — is reported on stderr and its `substate/` rows are absent from
+  the digest (in the worst case the whole reconstruction falls back to a
+  bare `GFHDFBackend` and only main-state arrays are printed). Read the
+  stderr warnings before concluding "identical": a diff over a digest whose
+  sub-state rows were skipped is a weaker gate than a full one.
 
 A mismatch anywhere in this step means the transport or the merge logic
 broke bit-identity for some fan-out op — bisect by op (`WalkerFanoutMixin`

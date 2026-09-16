@@ -79,17 +79,25 @@ Decision 12):
   exactly as validated by Gates 1-4 above, unchanged. A plain single-process
   `GPUS=0,1 python scripts/run_global.py --stock <name>` still exercises
   both devices this way.
-- **Under several compute ranks** (`mpiexec -n <k>` with `k >= 2` compute
-  ranks): each rank's `AnalysisContainerArray` is single-device by default
-  (`gpus_per_rank=1`), so the router runs in its exonerated single-shard
-  passthrough form on every rank — the band-grouped shard assignment,
-  same-shard swap fast path, and per-GPU temperature permutation this
-  runbook validates are simply not exercised (there is nothing to shard).
+- **Under several compute ranks *per node*** (`mpiexec -n <k>` with `k >= 2`
+  compute ranks landing on the same node): each rank's
+  `AnalysisContainerArray` is single-device by default (`gpus_per_rank=1`),
+  so the router runs in its exonerated single-shard passthrough form on
+  every rank — the band-grouped shard assignment, same-shard swap fast path,
+  and per-GPU temperature permutation this runbook validates are simply not
+  exercised (there is nothing to shard).
   Reproducing Gate 2's literal "2-GPU assembly" command as multi-device
   under this layout now additionally requires `GPUS_PER_RANK=2` (or
   `RANKS_PER_GPU`, for sharing rather than multi-device ownership) — a bare
   `GPUS=0,1` at `np=1` still means one rank driving both devices, exactly as
   these gates assume.
+  The *per node* qualifier is load-bearing: AUTO resolves per node, so a
+  multi-node launch whose nodes host exactly ONE compute rank each gives
+  every one of them its node's whole pool and puts the router back in play.
+  Pin `GPUS` to a single device per node (or set `GPUS_PER_RANK=1`) when
+  that is not what you want — `docs/multirank-cluster-gates.md` Steps 0/1
+  do exactly this for their 2-node commands, so that every parity layout is
+  single-device.
 - **`gpus_per_rank > 1` with several compute ranks** (a rank owning more
   than one device while other ranks exist) is layout-supported but
   **unvalidated** by either this runbook or the multi-rank port: it

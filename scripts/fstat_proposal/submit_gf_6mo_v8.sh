@@ -580,17 +580,41 @@ echo "[GPUS] ${_NGPUS_EFF} GPUs -> GPUS=${GPUS} (partition ${SLURM_JOB_PARTITION
 # var under `set -u`.
 GPUS_PER_RANK=${GPUS_PER_RANK:-}
 RANKS_PER_GPU=${RANKS_PER_GPU:-1}
+# Re-exported here for symmetry with GF_LEGACY_RANK_LAYOUT below: all three
+# knobs are read from the environment by build_layout, and a manual
+# `sbatch <script>` never ran the --export=ALL,... dispatch line.
+export GPUS_PER_RANK RANKS_PER_GPU
 _k=${GPUS_PER_RANK:-1}
 if [ "${NGPUS:-2}" = "4" ]; then
   GF_LEGACY_RANK_LAYOUT=${GF_LEGACY_RANK_LAYOUT:-0}
 else
   GF_LEGACY_RANK_LAYOUT=${GF_LEGACY_RANK_LAYOUT:-1}
 fi
+# The legacy layout is per-NODE (one compute rank owns that node's whole GPU
+# pool; every other non-saver rank is a stopped spare), so it cannot span an
+# allocation: on 2 nodes every rank of node B would idle. The self-dispatch
+# block forces GF_LEGACY_RANK_LAYOUT=0 at NGPUS=4, but a manual
+# `sbatch --nodes=2 --ntasks=5 <script>` skips that block entirely -- so
+# force it here too, off the GRANTED allocation, and say so loudly.
+if [ "${SLURM_NNODES:-1}" -gt 1 ] && [ "${GF_LEGACY_RANK_LAYOUT}" = "1" ]; then
+  echo "[SUBMIT] SLURM_NNODES=${SLURM_NNODES} > 1: FORCING GF_LEGACY_RANK_LAYOUT=0"
+  echo "[SUBMIT]   (the legacy single-compute-rank layout is per-node and cannot"
+  echo "[SUBMIT]    span an allocation -- every rank on the other node(s) would"
+  echo "[SUBMIT]    build, idle and waste the node)."
+  GF_LEGACY_RANK_LAYOUT=0
+fi
 export GF_LEGACY_RANK_LAYOUT
 if [ "${GF_LEGACY_RANK_LAYOUT}" = "1" ]; then
   N_COMPUTE_EFF=1
 else
   N_COMPUTE_EFF=$(( ${SLURM_NNODES:-1} * _NGPUS_EFF * RANKS_PER_GPU / _k ))
+  if [ "${N_COMPUTE_EFF}" -lt 1 ]; then
+    echo "[SUBMIT] N_COMPUTE=${N_COMPUTE_EFF} from NNODES=${SLURM_NNODES:-1} x"
+    echo "[SUBMIT]   GPUS=${_NGPUS_EFF} x RANKS_PER_GPU=${RANKS_PER_GPU} /"
+    echo "[SUBMIT]   GPUS_PER_RANK=${_k}: inconsistent knobs (GPUS_PER_RANK larger"
+    echo "[SUBMIT]   than the granted pool?). Leaving NWALKERS alone; build_layout"
+    echo "[SUBMIT]   will raise with the exact reason."
+  fi
 fi
 
 # ---- output ----------------------------------------------------------------
@@ -643,7 +667,8 @@ export NWALKERS=10                 # 10-walker rebase (2026-09-11 ruling: build
                                    # walkers and temps are independent axes.
                                    # Noise-block floor 2*ndim (galfor ndim 5
                                    # -> 10) still satisfied.
-if [ "${GF_LEGACY_RANK_LAYOUT}" = "0" ] && [ $(( NWALKERS % N_COMPUTE_EFF )) -ne 0 ]; then
+if [ "${GF_LEGACY_RANK_LAYOUT}" = "0" ] && [ "${N_COMPUTE_EFF}" -gt 0 ] \
+     && [ $(( NWALKERS % N_COMPUTE_EFF )) -ne 0 ]; then
   echo "[SUBMIT] NWALKERS=${NWALKERS} is not a multiple of N_COMPUTE=${N_COMPUTE_EFF}; using NWALKERS=$(( (NWALKERS / N_COMPUTE_EFF + 1) * N_COMPUTE_EFF )) (user decision at the first 4-GPU launch)"
   export NWALKERS=$(( (NWALKERS / N_COMPUTE_EFF + 1) * N_COMPUTE_EFF ))
 fi
@@ -2704,7 +2729,10 @@ print("[SOURCES] preflight OK.")
 PYEOF
 
 if [ "${SLURM_NNODES:-1}" -gt 1 ]; then
-  srun --ntasks="${SLURM_NTASKS}" --distribution=cyclic python scripts/fstat_proposal/run_combined_staged.py
+  # SLURM_NTASKS is always set inside a job step; the :-3 default matches the
+  # mpiexec branch below so an odd/manual allocation still launches the
+  # head+compute+saver shape instead of dying on an unset var under `set -u`.
+  srun --ntasks="${SLURM_NTASKS:-3}" --distribution=cyclic python scripts/fstat_proposal/run_combined_staged.py
 else
   mpiexec -n "${SLURM_NTASKS:-3}" python scripts/fstat_proposal/run_combined_staged.py
 fi

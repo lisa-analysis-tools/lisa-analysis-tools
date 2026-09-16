@@ -50,16 +50,33 @@ def discover_run_logs(run_dir):
     (``run.py::_rank_log_filenames``); concatenating them (head first) is
     what lets the regex scans below (e.g. ``RJ_SPLIT_RE``) see every rank's
     ``[GB_ACCEPT rj-split]`` lines, not just the head's (Plan 5 Task 4).
+
+    The walk is RECURSIVE and deterministic (directories and file names
+    sorted), identical to ``gf_run_log_digest.py``'s copy of this helper. A
+    second file for a rank already seen (the same run unpacked twice under
+    ``run_dir``) is NOT silently dropped -- the first one found wins and the
+    duplicate is named on stderr.
     """
     found = {}
-    for root, _, fns in os.walk(run_dir):
-        for fn in fns:
+    for root, dirs, fns in os.walk(run_dir):
+        dirs.sort()
+        for fn in sorted(fns):
             if fn == "globalfit_run.log":
-                found[-1] = os.path.join(root, fn)
+                key = -1
             else:
                 m = re.match(r"^globalfit_run\.rank(\d+)\.log$", fn)
-                if m:
-                    found[int(m.group(1))] = os.path.join(root, fn)
+                if m is None:
+                    continue
+                key = int(m.group(1))
+            path = os.path.join(root, fn)
+            if key in found:
+                label = "head" if key < 0 else f"rank {key}"
+                print(
+                    f"# WARNING: duplicate {label} run log {path}; keeping {found[key]}",
+                    file=sys.stderr,
+                )
+                continue
+            found[key] = path
     return [found[k] for k in sorted(found)]
 
 

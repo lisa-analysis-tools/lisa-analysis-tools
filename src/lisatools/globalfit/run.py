@@ -3,9 +3,18 @@
 This module wires together the per-source samplers, the recipe driver, the
 HDF backend, and MPI rank coordination into a runnable end-to-end global fit.
 
-MPI rank roles (see ``GlobalFit.resolve_rank_roles``): the main rank runs the
-sampler; at ``np >= 3`` the highest spare rank becomes a dedicated
-results/saver rank; all other ranks are spares and are stopped at startup.
+MPI rank roles (mirrors ``communication/ranks.py``'s docstring, which owns
+the resolution: ``resolve_roles``/``build_layout``): HEAD (the main rank --
+sequences the recipe, owns the full host ``GFState``, AND computes walker
+block 0 like any other compute rank), COMPUTE (one device list and one
+walker block each, running the ``ComputeService`` command loop), SAVER (the
+highest non-head rank, at communicator size >= 3 only; below that the role
+is aliased to the head and saves are synchronous). Every rank builds the
+full pipeline; only the walker-block size of its ``AnalysisContainerArray``
+differs. SPARE exists only under ``GF_LEGACY_RANK_LAYOUT=1``, which restores
+the pre-port roles (one compute rank owning the whole per-node GPU pool,
+every other non-saver rank built then stopped at startup without computing).
+
 The legacy multi-stage pipeline classes (``GlobalFitSegment``,
 ``MPIControlGlobalFit``) were removed 2026-07 (parallel-resources plan P0).
 """

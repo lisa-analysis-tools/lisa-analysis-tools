@@ -1,5 +1,4 @@
 """Digest globalfit_run.log + gpu_util CSVs for the 3-mo production run."""
-import glob
 import os
 import re
 import sys
@@ -16,17 +15,36 @@ def discover_run_logs(run_dir):
     (``run.py::_rank_log_filenames``); concatenating them (head first) is
     what lets the parsing below see every rank's lines, not just the
     head's (Plan 5 Task 4 of the multi-rank port).
+
+    The walk is RECURSIVE and deterministic (directories and file names
+    sorted), identical to ``gf_monitor_gen.py``'s copy of this helper: a
+    snapshot may nest the artifacts directory one level down. A second file
+    for a rank already seen (the same run unpacked twice under ``run_dir``)
+    is NOT silently dropped -- the first one found wins and the duplicate is
+    named on stderr, so a half-merged snapshot is visible rather than
+    invisible.
     """
-    head = os.path.join(run_dir, "globalfit_run.log")
-    paths = [head] if os.path.exists(head) else []
-
-    def _rank_num(p):
-        m = re.search(r"\.rank(\d+)\.log$", p)
-        return int(m.group(1)) if m else -1
-
-    rank_paths = glob.glob(os.path.join(run_dir, "globalfit_run.rank*.log"))
-    paths.extend(sorted(rank_paths, key=_rank_num))
-    return paths
+    found = {}
+    for root, dirs, fns in os.walk(run_dir):
+        dirs.sort()
+        for fn in sorted(fns):
+            if fn == "globalfit_run.log":
+                key = -1
+            else:
+                m = re.match(r"^globalfit_run\.rank(\d+)\.log$", fn)
+                if m is None:
+                    continue
+                key = int(m.group(1))
+            path = os.path.join(root, fn)
+            if key in found:
+                label = "head" if key < 0 else f"rank {key}"
+                print(
+                    f"# WARNING: duplicate {label} run log {path}; keeping {found[key]}",
+                    file=sys.stderr,
+                )
+                continue
+            found[key] = path
+    return [found[k] for k in sorted(found)]
 
 
 #: ``communication/fanout.py``'s head-only load-balance line, DEBUG level:
@@ -84,20 +102,44 @@ def parse_ts(s, ms):
 
 events = []
 for LOG in LOG_PATHS:
-    for line in open(LOG, errors="replace"):
-        m = TS.match(line)
-        if m:
-            events.append((parse_ts(m.group(1), m.group(2)), m.group(3),
-                           m.group(4), m.group(5)))
+    with open(LOG, errors="replace") as fh:
+        for line in fh:
+            m = TS.match(line)
+            if m:
+                events.append((parse_ts(m.group(1), m.group(2)), m.group(3),
+                               m.group(4), m.group(5)))
 # Multiple files are read one after another above, not merged chronologically;
 # re-sort so downstream slicing (``ev[-1]`` = latest event) is still correct.
 events.sort(key=lambda e: e[0])
 
-# attempt boundaries: 'Multiple GPUs detected' warnings ~ startup
-starts = [t for t, mod, lvl, msg in events
-          if "Multiple GPUs detected" in msg and "analysiscontainer" in mod]
-print("attempt starts:", [datetime.fromtimestamp(t).strftime("%m-%d %H:%M:%S")
-                          for t in starts])
+if not events:
+    print(f"no timestamped log lines under {LOG_PATHS} -- nothing to digest")
+    raise SystemExit(0)
+
+# Attempt boundaries. Primary anchor: the per-rank startup layout line
+# (``run.py`` logs ``layout.describe()`` once per rank right after
+# ``prepare_rank``), which every launch emits. The old anchor -- the
+# 'Multiple GPUs detected' warning -- fires only when ONE rank owns more
+# than one device, so it is absent from every walker-block run (one device
+# per rank); keep it as the fallback for pre-port logs, and fall back again
+# to the first event so an unanchored log still gets a timing summary
+# instead of an IndexError.
+starts = [t for t, mod, lvl, msg in events if "walker-block layout: size=" in msg]
+anchor = "walker-block layout"
+if not starts:
+    starts = [t for t, mod, lvl, msg in events
+              if "Multiple GPUs detected" in msg and "analysiscontainer" in mod]
+    anchor = "Multiple GPUs detected"
+if not starts:
+    starts = [events[0][0]]
+    anchor = "first log line (no layout / multi-GPU anchor found)"
+# Every rank logs the layout line, so one attempt contributes several
+# near-simultaneous stamps once the per-rank logs are merged: collapse a
+# cluster to its first stamp so "attempt starts" stays one entry per attempt
+# and ``t_last`` is the START of the last attempt, not its slowest rank.
+starts = [t for i, t in enumerate(starts) if i == 0 or t - starts[i - 1] > 120.0]
+print(f"attempt starts [{anchor}]:",
+      [datetime.fromtimestamp(t).strftime("%m-%d %H:%M:%S") for t in starts])
 
 # last attempt slice
 t_last = starts[-1]
