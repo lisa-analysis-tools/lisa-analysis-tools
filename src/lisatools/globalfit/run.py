@@ -123,7 +123,8 @@ def _fanout_unready_moves(moves):
 
     The addremove (MBH/EMRI/SOBBH) and PSD (psd/galfor/sgwb) families are
     served through ``moves.walkerfanout.WalkerFanoutMixin`` since Plan 3;
-    GB/VGB remain unready until Plan 4.
+    GB/VGB (GBSpecialBase) serve the three-command protocol since Plan 4;
+    the FD dev-search setups raise under several ranks.
     """
     unready, head_only = [], []
     for move in _leaf_moves(moves):

@@ -3061,6 +3061,7 @@ def build_gb_moves(
            **_imr_search}
     )
     gb_search_prune_move.accepted = np.zeros((ntemps, nwalkers_local))
+    gb_search_prune_move.install_walker_fanout(curr)
     
     # LEGACY FD-ONLY (2026-08-12 user ruling): the serial-MCMC moves score
     # through GBGPU's FD get_fstat_ll/get_ll (para_log_like), which
@@ -3081,6 +3082,7 @@ def build_gb_moves(
            "rj_flip_fraction_default": _search_rj_flip_default(), **_imr_search}
     )
     gb_search_fstat_mcmc_move.accepted = np.zeros((ntemps, nwalkers_local))
+    gb_search_fstat_mcmc_move.install_walker_fanout(curr)
 
     # The RJ refit moves load a GMM-refit proposal file (``main_file_path``)
     # produced during a run. When it is absent (fresh run / smoke, or refit
@@ -3105,6 +3107,7 @@ def build_gb_moves(
                "rj_flip_fraction_default": _search_rj_flip_default()}
         )
         gb_search_refit_move.accepted = np.zeros((ntemps, nwalkers_local))
+        gb_search_refit_move.install_walker_fanout(curr)
 
     # gb_search_refit_move, Refit currently not used for search
     gb_search_moves = (
@@ -3163,6 +3166,7 @@ def build_gb_moves(
         # maximize-then-pretend). A PE replace install must NOT set this.
         gb_replace_move.replace_search_stage = True
         gb_replace_move.accepted = np.zeros((ntemps, nwalkers_local))
+        gb_replace_move.install_walker_fanout(curr)
     # Pure IN-MODEL move (2026-08-04): no RJ step at all -- ``is_rj_prop=False``
     # skips the birth/death branch in the round loop, so every pick round is
     # just ``num_repeat_proposals`` in-model repeats on the live sources.
@@ -3186,6 +3190,7 @@ def build_gb_moves(
             **{**gb_move_kwargs, "leaf_cap_update": False},
         )
         gb_in_model_move.accepted = np.zeros((ntemps, nwalkers_local))
+        gb_in_model_move.install_walker_fanout(curr)
 
     gb_prior_removal_move = None
     if _gb_mode_search and getattr(gb_info, "search_prior_removal", False):
@@ -3215,6 +3220,7 @@ def build_gb_moves(
                "rj_flip_fraction_default": _search_rj_flip_default(), **_imr_search},
         )
         gb_prior_removal_move.accepted = np.zeros((ntemps, nwalkers_local))
+        gb_prior_removal_move.install_walker_fanout(curr)
 
     #* ===================== WARM-START RJ BIRTH MOVE (rj_warm_search) =====================
     # Workstream B (user ruling 2026-08-24: "add this proposal in GB search
@@ -3319,6 +3325,7 @@ def build_gb_moves(
                **_imr_search, **warm_search_move_overrides()},
         )
         gb_warm_move.accepted = np.zeros((ntemps, nwalkers_local))
+        gb_warm_move.install_walker_fanout(curr)
         gb_search_moves = list(gb_search_moves) + [gb_warm_move]
         logger.info(
             "build_gb_moves: rj_warm_search armed from %s (%d components; "
@@ -3419,6 +3426,7 @@ def build_gb_moves(
            **_imr_defaults, **_pe_cap_off}
     )
     gb_pe_prior_move.accepted = np.zeros((ntemps, nwalkers_local))
+    gb_pe_prior_move.install_walker_fanout(curr)
 
     # F-STAT DISTANCE-BIRTH ON THE PE SIDE (USER RULING 2026-08-28:
     # *"rj_fstat_pe get the same stamp? yes mirror them. That would be
@@ -3488,6 +3496,7 @@ def build_gb_moves(
                **warm_pe_move_overrides()},
         )
         gb_warm_pe_move.accepted = np.zeros((ntemps, nwalkers_local))
+        gb_warm_pe_move.install_walker_fanout(curr)
         logger.info(
             "build_gb_moves: rj_warm_pe armed from %s (%d components; "
             "circ_images=%s, floor_eps=%s).",
@@ -3574,6 +3583,7 @@ def build_gb_moves(
         # explicit GB_REPLACE_CTR_MODE overrides either way.
         gb_pe_replace_move.replace_pe_stage = True
         gb_pe_replace_move.accepted = np.zeros((ntemps, nwalkers_local))
+        gb_pe_replace_move.install_walker_fanout(curr)
 
     # PURE prior-birth RJ move for the PE stage (2026-08-12 rename/split):
     # births drawn from the GLOBAL PRIOR (never the fstat grids), deaths
@@ -3597,6 +3607,7 @@ def build_gb_moves(
            **_imr_defaults, **_pe_cap_off}
     )
     gb_pe_prior_birth_move.accepted = np.zeros((ntemps, nwalkers_local))
+    gb_pe_prior_birth_move.install_walker_fanout(curr)
 
     gb_pe_fstat_mcmc_move = GBSpecialRJSerialSearchMCMC(
         *gb_move_args,
@@ -3611,6 +3622,7 @@ def build_gb_moves(
            **_imr_defaults, **_pe_cap_off}
     )
     gb_pe_fstat_mcmc_move.accepted = np.zeros((ntemps, nwalkers_local))
+    gb_pe_fstat_mcmc_move.install_walker_fanout(curr)
 
     # Prior + fstat moves always build; the refit move is inserted only when
     # its GMM-refit file is available (see ``_refit_available`` above).
@@ -3650,6 +3662,7 @@ def build_gb_moves(
             **{**gb_move_kwargs, "leaf_cap_update": False, **_pe_cap_off}
         )
         gb_pe_refit_move.accepted = np.zeros((ntemps, nwalkers_local))
+        gb_pe_refit_move.install_walker_fanout(curr)
         gb_pe_moves.insert(1, gb_pe_refit_move)  # [prior, refit, fstat]
 
     # Design knob: keep only the requested PE moves (order-preserving subset).
@@ -3682,6 +3695,7 @@ def build_gb_moves(
         )
         _ridge.name = "gb_ridge_gibbs"
         _ridge.accepted = np.zeros((1, nwalkers_local))
+        _ridge.install_walker_fanout(curr)
         gb_search_moves = list(gb_search_moves) + [_ridge]
         gb_pe_moves = list(gb_pe_moves) + [_ridge]
         logger.info("build_gb_moves: gb_ridge_gibbs registered (leaf_fraction "
@@ -3969,6 +3983,7 @@ def build_vgb_moves(
         },
     )
     vgb_move.accepted = np.zeros((ntemps, nwalkers_local))
+    vgb_move.install_walker_fanout(curr)
     return [vgb_move]
 
 

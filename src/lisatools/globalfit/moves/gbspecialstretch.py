@@ -19821,8 +19821,11 @@ class VGBSpecialStretchMove(GBSpecialBase):
         self._last_im_kind = "stretch"
         xp = self.xp
         nw = self.nwalkers
+        # TODO(multi-rank): the red/blue complement is this rank's walker
+        # block (design spec, "Cross-rank swaps: assessment")
         assert nw >= 2 and nw % 2 == 0, (
-            "the VGB red-blue stretch needs an even walker count >= 2"
+            "the VGB red-blue stretch needs an even walker count >= 2 "
+            "(this rank's walker block, under fan-out)"
         )
         t_i = band_sorter.temp_inds[source_ids]
         w_i = band_sorter.walker_inds[source_ids]
@@ -20870,6 +20873,12 @@ class GBSpecialRJSerialSearchMCMC(GBSpecialBase):
         return out
 
     def setup(self, model, branches):
+        if getattr(self, "fanout_active", False):
+            raise NotImplementedError(
+                f"{type(self).__name__} (FD dev-search path, scalar-walker "
+                "ParaEnsembleSampler) is not ported to several compute ranks; "
+                "run with one compute rank or GF_LEGACY_RANK_LAYOUT=1"
+            )
         assert isinstance(self.search_kwargs, dict)
         nwalkers: int = self.search_kwargs["nwalkers"]
         ntemps: int = self.search_kwargs["ntemps"]
@@ -21168,6 +21177,12 @@ class GBSpecialRJRefitMove(GBSpecialBase):
         GBSpecialBase.__init__(self, *args, **kwargs)
 
     def setup(self, model, branches):
+        if getattr(self, "fanout_active", False):
+            raise NotImplementedError(
+                f"{type(self).__name__} (FD dev-search path, scalar-walker "
+                "ParaEnsembleSampler) is not ported to several compute ranks; "
+                "run with one compute rank or GF_LEGACY_RANK_LAYOUT=1"
+            )
         samples_keep = self.search_kwargs["refit_start_iteration"]
         nwalkers = self.search_kwargs["nwalkers"]
         num_compare_samples = 1

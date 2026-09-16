@@ -643,6 +643,57 @@ class CensusStashTest(unittest.TestCase):
         self.assertFalse(hasattr(move, "_replace_split_last"))
 
 
+class LegacySetupGuardTest(unittest.TestCase):
+    """``GBSpecialRJSerialSearchMCMC.setup`` refuses several compute ranks.
+
+    This is the FD dev-search path's scalar-walker ``ParaEnsembleSampler``
+    (Task 5, site map section 7) -- not ported to the walker-block fan-out,
+    so it must raise rather than silently run wrong under
+    ``fanout_active``. A skeleton built with ``__new__`` is enough: the
+    guard is the first statement in ``setup``, before anything else on the
+    move is touched.
+    """
+
+    def _move(self):
+        return gbs.GBSpecialRJSerialSearchMCMC.__new__(gbs.GBSpecialRJSerialSearchMCMC)
+
+    def test_fanout_active_setup_raises(self):
+        move = self._move()
+        move.fanout = _FakeFanout(single=False, is_head=True)
+        with self.assertRaises(NotImplementedError) as ctx:
+            move.setup(None, None)
+        msg = str(ctx.exception)
+        self.assertIn("GBSpecialRJSerialSearchMCMC", msg)
+        self.assertIn("several compute ranks", msg)
+
+    def test_no_fanout_proceeds_past_the_guard(self):
+        # fanout=None -> fanout_active is False (single-process default) ->
+        # the guard does not fire and execution reaches the method body.
+        # Prove it by making the first call the body makes raise a sentinel
+        # distinct from NotImplementedError, and asserting THAT sentinel
+        # (not the guard) is what comes out.
+        move = self._move()
+        move.fanout = None
+        move.search_kwargs = {
+            "nwalkers": 4,
+            "ntemps": 2,
+            "shutoff_band_iteration": 1,
+            "shutoff_frequency_threshold": 0.0,
+            "burn_1": 1,
+            "nsteps_1": 1,
+            "snr_threshold": 8.0,
+            "burn_2": 1,
+            "nsteps_2": 1,
+        }
+        sentinel = RuntimeError("reached the guarded body")
+        model = mock.Mock()
+        model.analysis_container_arr.likelihood.side_effect = sentinel
+
+        with self.assertRaises(RuntimeError) as ctx:
+            move.setup(model, None)
+        self.assertIs(ctx.exception, sentinel)
+
+
 class GbHostTest(unittest.TestCase):
     def test_namedtuples_survive_the_host_coercion(self):
         import collections
