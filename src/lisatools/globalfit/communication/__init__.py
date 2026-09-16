@@ -11,6 +11,14 @@ head-directed commands, and the unchanged saver rank. See
 """
 
 from .fakecomm import FakeAbort, FakeComm, FakeCommNull, FakeWorld
+from .fanout import (
+    PING_OP,
+    STOP_OP,
+    ComputeService,
+    RemoteWorkerError,
+    WalkerFanout,
+    concat_blocks,
+)
 from .ranks import (
     LEGACY_ENV,
     RankPlacement,
@@ -35,6 +43,12 @@ __all__ = [
     "FakeComm",
     "FakeCommNull",
     "FakeWorld",
+    "PING_OP",
+    "STOP_OP",
+    "ComputeService",
+    "RemoteWorkerError",
+    "WalkerFanout",
+    "concat_blocks",
     "LEGACY_ENV",
     "RankPlacement",
     "RankRole",
