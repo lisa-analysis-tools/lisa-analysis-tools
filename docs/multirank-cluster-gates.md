@@ -83,8 +83,12 @@ prints `local=2`, and the saver's `devices=` is `pool[local % len(pool)]` —
 it builds on a device like everyone else, then releases it.)
 
 Both dry runs should print an identical `size`/`n_compute`/`block` header
-and the same per-rank role assignment shape; only `node=`/`local=` differ
-between the 1-node and 2-node launches. A layout error (bad divisibility,
+and the same per-rank role assignment shape; `node=`/`local=` differ between
+the 1-node and 2-node launches, and so does `devices=` — the 1-node launch's
+rank 1 gets `devices=[1]` (two compute ranks split a 2-device node pool),
+while the 2-node launch's rank 1 gets `devices=[0]` (the `GPUS=0` pin makes
+each node's pool deliberately one device, so every rank on it draws from a
+pool of one). A layout error (bad divisibility,
 over-subscribed pool) raises inside `build_layout`/`prepare_rank` before any
 `describe()` call, so the dry run's job is mainly to *stop before `build()`*
 on the happy path — a bad layout fails exactly the same way with or without
@@ -164,11 +168,19 @@ explicitly — if it does, pin it to the same value for all three launches.
 
 **What to diff:**
 - `[FANOUT_DIGEST]` lines — a per-iteration state hash (`log_like` + coords
-  + inds) the head emits when `GF_FANOUT_DIGEST=1`. All three layouts must
-  print the identical hash at every iteration. The line is emitted from the
-  recipe's post-iteration hook whether or not a fan-out exists, so a
-  single-rank (`-n 1`) baseline run prints it too and can be diffed against
-  all three.
+  + inds) the head emits when `GF_FANOUT_DIGEST=1`. Only the three
+  `n_compute=2` layouts above are expected to print the identical hash at
+  every iteration. The line is emitted from the recipe's post-iteration hook
+  whether or not a fan-out exists, so a single-rank (`-n 1`) baseline run
+  prints it too, but single mode reseeds nothing (`run.py::
+  _resolve_seed_base`/`_seed_rank_streams` return `None` when
+  `layout.is_single()`; eryn seeds the process-global numpy stream from
+  `random_seed`, the device stream stays unseeded), whereas every rank of an
+  `n_compute=2` layout derives its stream via `derive_rank_seed`. The `-n 1`
+  line is useful for observability and as an `it=0` cross-check (identical
+  initial state) — not for a per-iteration diff against the three layouts,
+  and this doc makes no claim about `-n 1` run-to-run reproducibility either
+  way.
 - `python scripts/diagnostics/gf_state_digest.py <store.h5>` — a digest
   over `backend.get_last_sample()` covering the full saved `GFState`
   (coords, inds, log_like, betas, and every sub-state array; design spec

@@ -75,7 +75,7 @@ error, not a rounding fallback, when driven directly through `build_layout`
 | `NWALKERS` | variant default | Must be a multiple of `n_compute`; `build_layout` raises otherwise. Rank *r*'s block is `[r*B, (r+1)*B)` in compute-rank order, `B = NWALKERS / n_compute`. |
 | `GF_LEGACY_RANK_LAYOUT` | `0` at the layout level (`ranks.py`'s own default); the campaign submit script keeps `1` at `NGPUS=2` until the WP7 gates pass (see below) | `1` restores today's pre-port roles: one compute rank owns the whole per-node pool, every other non-saver rank is a stopped SPARE. Rollback knob (design spec Risks). |
 | `GF_LAYOUT_DRY_RUN` | unset | Preflight: every rank prints `layout.describe()` and the process exits **before** `fit.build()` allocates anything; a genuinely bad layout still raises inside `build_layout`/`prepare_rank` (Plan 5 Task 2 of this port — see `docs/multirank-cluster-gates.md`'s Step 0 for the exact invocation). |
-| `GF_FANOUT_DIGEST` | unset | Emits a per-iteration `[FANOUT_DIGEST]` state-hash line (`log_like` + coords + inds), the cluster-gate tool for diffing two layouts for bit-identical transport (Plan 5 Task 4 of this port — see `docs/multirank-cluster-gates.md`'s Step 1). Emitted from the recipe's post-iteration hook regardless of the rank count, so the single-rank baseline prints it too. |
+| `GF_FANOUT_DIGEST` | unset | Emits a per-iteration `[FANOUT_DIGEST]` state-hash line (`log_like` + coords + inds), the cluster-gate tool for diffing two layouts for bit-identical transport (Plan 5 Task 4 of this port — see `docs/multirank-cluster-gates.md`'s Step 1). Emitted from the recipe's post-iteration hook regardless of the rank count, so a single-rank (`-n 1`) baseline prints it too, but only the three `n_compute=2` layouts are expected bit-identical to each other: single mode reseeds nothing (`run.py::_resolve_seed_base`/`_seed_rank_streams` return `None` when `layout.is_single()`), so the `-n 1` line is for observability and an `it=0` cross-check only, never a per-iteration diff. |
 
 ## Every rank builds
 
@@ -197,8 +197,8 @@ sbatch  ./submit_gf_6mo_v8.sh      # legacy flow: static header defaults
   `[SUBMIT]` line rather than failing — `build_layout` itself would raise.
   Its default `NWALKERS=10` is not divisible by `N_COMPUTE=4` at `NGPUS=4`,
   so a first 4-GPU launch rounds to 12 unless `NWALKERS` is set explicitly.
-- Launch line: `srun --ntasks=$SLURM_NTASKS --distribution=cyclic ...` when
-  `SLURM_NNODES > 1`, else `mpiexec -n ${SLURM_NTASKS:-3} ...`.
+- Launch line: `srun --ntasks="${SLURM_NTASKS:-3}" --distribution=cyclic ...`
+  when `SLURM_NNODES > 1`, else `mpiexec -n ${SLURM_NTASKS:-3} ...`.
 - Under the walker-block (non-legacy) layout, `np=3` on a 2-GPU pool puts a
   real compute rank on each GPU; under the legacy layout rank 1 was a
   stopped spare that occupied a device without using it.

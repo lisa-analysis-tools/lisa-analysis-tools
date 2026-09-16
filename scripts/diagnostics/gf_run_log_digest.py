@@ -137,7 +137,13 @@ if not starts:
 # near-simultaneous stamps once the per-rank logs are merged: collapse a
 # cluster to its first stamp so "attempt starts" stays one entry per attempt
 # and ``t_last`` is the START of the last attempt, not its slowest rank.
-starts = [t for i, t in enumerate(starts) if i == 0 or t - starts[i - 1] > 120.0]
+# Scoped to the walker-block anchor ONLY: the legacy 'Multiple GPUs detected'
+# anchor fires once per ``AnalysisContainer`` construction, not once per
+# attempt, so collapsing it too would re-base the LAST ATTEMPT window of
+# already-reported pre-port snapshots. That anchor keeps its pre-collapse
+# behaviour: ``t_last = starts[-1]`` over every stamp, uncollapsed.
+if anchor == "walker-block layout":
+    starts = [t for i, t in enumerate(starts) if i == 0 or t - starts[i - 1] > 120.0]
 print(f"attempt starts [{anchor}]:",
       [datetime.fromtimestamp(t).strftime("%m-%d %H:%M:%S") for t in starts])
 

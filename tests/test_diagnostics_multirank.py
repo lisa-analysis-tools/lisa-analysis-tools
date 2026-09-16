@@ -200,15 +200,23 @@ class RunLogDigestReportTest(unittest.TestCase):
     SCRIPT = os.path.join(_DIAG_DIR, "gf_run_log_digest.py")
 
     def _run_report(self, lines):
-        """Run the script's main body over a synthetic run dir; return stdout."""
+        """Run the script's main body over a synthetic run dir; return stdout.
+
+        ``RUN`` is nested one level inside the ``TemporaryDirectory`` (not the
+        directory itself) so that ``gf_run_log_digest.py``'s
+        ``f"{RUN}/../mem_series_last.npy"`` write (fired whenever a log has a
+        "GPU pool used" line) lands on ``RUN/..`` == the fixture root, never
+        the real system temp dir.
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
-            artifacts = os.path.join(tmpdir, "gf_prod_3mo_artifacts")
+            run_root = os.path.join(tmpdir, "run")
+            artifacts = os.path.join(run_root, "gf_prod_3mo_artifacts")
             os.makedirs(artifacts)
             with open(os.path.join(artifacts, "globalfit_run.log"), "w") as f:
                 f.writelines(lines)
             buf = io.StringIO()
             saved_argv = sys.argv
-            sys.argv = ["gf_run_log_digest.py", tmpdir]
+            sys.argv = ["gf_run_log_digest.py", run_root]
             try:
                 with contextlib.redirect_stdout(buf):
                     runpy.run_path(self.SCRIPT, run_name="__main__")
@@ -254,6 +262,54 @@ class RunLogDigestReportTest(unittest.TestCase):
     def test_empty_log_does_not_crash(self):
         out = self._run_report(["not a timestamped line\n"])
         self.assertIn("nothing to digest", out)
+
+    def test_legacy_anchor_stamps_are_not_collapsed(self):
+        """MINOR-4 regression: the 120s attempt-collapse must apply ONLY to
+        the walker-block anchor. The legacy 'Multiple GPUs detected' warning
+        fires once per AnalysisContainer construction, not once per attempt,
+        so several stamps inside one attempt must all survive as separate
+        "attempt starts" and t_last must stay the LAST stamp -- exactly the
+        pre-collapse behaviour -- or an already-reported pre-port snapshot's
+        LAST ATTEMPT window silently shifts."""
+        lines = [
+            _log_line("12:00:00", "lisatools.analysiscontainer", "WARNING",
+                      "Multiple GPUs detected, using device 0"),
+            _log_line("12:00:05", "lisatools.analysiscontainer", "WARNING",
+                      "Multiple GPUs detected, using device 0"),
+            _log_line("12:00:10", "lisatools.analysiscontainer", "WARNING",
+                      "Multiple GPUs detected, using device 0"),
+            _log_line("12:00:30", "lisatools.globalfit.moves.gb", "DEBUG",
+                      "gb_pe: buffer lifecycle closed"),
+        ]
+        out = self._run_report(lines)
+        self.assertIn("attempt starts [Multiple GPUs detected]:", out)
+        for stamp in ("12:00:00", "12:00:05", "12:00:10"):
+            self.assertIn(stamp, out)
+        self.assertIn("LAST ATTEMPT (2026-09-16 12:00:10)", out)
+
+    def test_walker_block_anchor_stamps_still_collapse(self):
+        """MINOR-4 companion: the walker-block anchor keeps collapsing -- one
+        attempt's several near-simultaneous per-rank layout lines are one
+        attempt start, not one per rank."""
+        lines = [
+            _log_line("13:00:00", "lisatools.globalfit.run", "INFO",
+                      "walker-block layout: size=3 n_compute=2 nwalkers=8 "
+                      "block=4 gpus_per_rank=AUTO->1 ranks_per_gpu=1"),
+            _log_line("13:00:01", "lisatools.globalfit.run", "INFO",
+                      "walker-block layout: size=3 n_compute=2 nwalkers=8 "
+                      "block=4 gpus_per_rank=AUTO->1 ranks_per_gpu=1"),
+            _log_line("13:00:02", "lisatools.globalfit.run", "INFO",
+                      "walker-block layout: size=3 n_compute=2 nwalkers=8 "
+                      "block=4 gpus_per_rank=AUTO->1 ranks_per_gpu=1"),
+            _log_line("13:00:30", "lisatools.globalfit.moves.gb", "DEBUG",
+                      "gb_pe: buffer lifecycle closed"),
+        ]
+        out = self._run_report(lines)
+        self.assertIn("attempt starts [walker-block layout]:", out)
+        self.assertIn("13:00:00", out)
+        self.assertNotIn("13:00:01", out)
+        self.assertNotIn("13:00:02", out)
+        self.assertIn("LAST ATTEMPT (2026-09-16 13:00:00)", out)
 
 
 class RecipeFanoutDigestHookTest(unittest.TestCase):
@@ -462,7 +518,20 @@ class GfStateDigestTest(unittest.TestCase):
     def test_digest_survives_a_mismatched_sub_backend_class(self):
         """A branch whose sub-backend class the registry guesses WRONG must not
         abort the whole digest: warn, fall back to a bare GFHDFBackend, and
-        still print every main-state array."""
+        still print every main-state array.
+
+        This must pin the NEW ``digest_store`` fallback specifically, not the
+        pre-existing per-branch guard in ``state_arrays`` (both warn on
+        "WARNING", so a bare ``assertIn("WARNING", ...)`` passes either way).
+        ``MBHState`` is ``PerLeafLadderState``-based and its ``from_stored``
+        unconditionally indexes ``arrays["betas_all"]``; the "gb" sub-backend
+        group here was written by ``GBHDFBackend``/``GBState``, which never
+        stores a ``betas_all`` array (GB's ladder is per-band, not per-leaf) --
+        so treating that group as an ``MBHHDFBackend`` raises a ``KeyError``
+        inside ``get_last_sample()`` itself, before ``state_arrays``' own
+        per-branch guard ever runs, which is exactly the case
+        ``digest_store``'s ``except`` exists for.
+        """
         from lisatools.globalfit.hdfbackend import MBHHDFBackend
         from lisatools.globalfit.state import MBHState
 
@@ -479,10 +548,11 @@ class GfStateDigestTest(unittest.TestCase):
             finally:
                 gsd._KNOWN_SUB_BACKENDS.clear()
                 gsd._KNOWN_SUB_BACKENDS.update(saved)
-            self.assertIn("WARNING", err.getvalue())
+            self.assertIn("sub-backend reconstruction failed", err.getvalue())
             for name in ("log_like", "betas", "coords/gb", "inds/gb", "coords/psd"):
                 self.assertIn(name, digest)
                 self.assertEqual(digest[name], good[name])
+            self.assertFalse(any(name.startswith("substate/") for name in digest))
 
 
 if __name__ == "__main__":

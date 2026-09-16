@@ -137,15 +137,17 @@ def digest_store(path):
     """
     try:
         state = open_backend(path).get_last_sample()
-        arrays = state_arrays(state)
     except Exception as exc:  # noqa: BLE001 - best-effort, never abort the digest
         print(
             f"# WARNING: sub-backend reconstruction failed for {path!r} ({exc}); "
             "retrying with a bare GFHDFBackend (main-state arrays only)",
             file=sys.stderr,
         )
+        # No guard here: if the bare retry also fails, that is a real error
+        # (not a sub-backend guess gone wrong) and should say what it is,
+        # not repeat the misleading "sub-backend reconstruction failed" line.
         state = GFHDFBackend(path).get_last_sample()
-        arrays = state_arrays(state)
+    arrays = state_arrays(state)
     return {
         name: (tuple(np.shape(arrays[name])), array_sha1(arrays[name]))
         for name in sorted(arrays)
