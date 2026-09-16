@@ -1542,8 +1542,14 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         return inds
 
     # ---- multi-rank fan-out (WalkerFanoutMixin hooks) ------------------------
+    #: per-propose {leaf: (sum swaps_accepted, sum swaps_proposed)} over repeats;
+    #: reset at the top of every propose_local, read by fanout_reply_extra
+    _fanout_swap_tally = None
+
     def _fanout_note_swaps(self, leaf, tc):
         """Accumulate this repeat's swap counts for ``leaf`` (Eryn re-zeroes them per call)."""
+        if self._fanout_swap_tally is None:
+            self._fanout_swap_tally = {}
         acc = np.asarray(tc.swaps_accepted, dtype=float).ravel()
         prop = np.asarray(tc.swaps_proposed, dtype=float).ravel()
         a, p = self._fanout_swap_tally.get(int(leaf), (0.0, 0.0))
@@ -1596,6 +1602,8 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
             new = pooled_ladder_step(tc, betas0, acc, prop)
             sub.betas_all[leaf][:ntemps] = new
             tc.betas[:] = new
+        # head-side per-propose checkpoint (the per-leaf hook is off in rank bodies);
+        # the guard is defensive: merge only ever runs on the head after gf_serve
         if not self._fanout_body:
             midit_checkpoint.maybe_write(
                 new_state, tag=f"{self.branch_name} propose", prepare=self._sync_cold_row

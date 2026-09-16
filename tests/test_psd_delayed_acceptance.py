@@ -23,6 +23,7 @@ from eryn.state import BranchSupplemental
 
 from lisatools.domains import CoarseWDMSettings, WDMSettings
 from lisatools.globalfit.moves.psdmove import PSDMove
+from lisatools.globalfit.moves.walkerfanout import WalkerFanoutMixin
 from lisatools.globalfit.state import GFState
 
 NW = 6
@@ -115,7 +116,8 @@ class DelayedAcceptanceKernelTest(_Base):
         # eryn shuffles the red/blue split with GLOBAL np.random
         # (red_blue.py:124) — pin it identically for both paths
         np.random.seed(2024)
-        new_p, acc_p = super(PSDMove, move_p).propose(model_p, state_p)
+        # the raw eryn stretch: skip PSDMove AND the fan-out mixin ahead of GlobalFitMove
+        new_p, acc_p = super(WalkerFanoutMixin, move_p).propose(model_p, state_p)
 
         move_d, model_d, _ = self._move(fine, fine, seed=99, ntemps=1)
         state_d = self._state(seed=5, ntemps=1)
@@ -248,7 +250,7 @@ class DelayedAcceptanceTargetsFineTest(_Base):
                 state, _acc = move._propose_delayed_acceptance(model, state)
             else:
                 fine_model = Model(None, fine, _prior_fn, model.temperature_control, map, model.random)
-                state, _acc = super(PSDMove, move).propose(fine_model, state)
+                state, _acc = super(WalkerFanoutMixin, move).propose(fine_model, state)
                 state.log_like = fine({"psd": state.branches["psd"].coords})[0]
             samples.append(np.array(state.branches["psd"].coords[0, :, 0, :]))
         return np.concatenate(samples[iters // 3 :], axis=0)

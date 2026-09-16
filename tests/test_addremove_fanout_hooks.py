@@ -54,7 +54,8 @@ class AddRemoveFanoutHooksTest(unittest.TestCase):
         move._fanout_note_swaps(1, tc)
         acc, prop = move._fanout_swap_tally[1]
         np.testing.assert_array_equal(acc, [1.0, 2.0])
-        np.testing.assert_array_equal(prop, [2.0 * B, 2.0 * B])  # swaps_proposed = nwalkers per call
+        # Eryn holds swaps_proposed = nwalkers per rung on every call
+        np.testing.assert_array_equal(prop, [2.0 * B, 2.0 * B])
         self.assertEqual(move.fanout_reply_extra(None)["swap_tally"].keys(), {1})
 
     def test_clock_round_trip(self):
