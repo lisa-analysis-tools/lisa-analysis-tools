@@ -73,7 +73,7 @@ error, not a rounding fallback, when driven directly through `build_layout`
 | `GPUS_PER_RANK` | AUTO (`None`) | AUTO: a lone compute rank on a node owns the whole per-node pool (today's `-n 1` multi-GPU behavior, `gpus_per_rank = len(pool)`); with several compute ranks on a node AUTO instead gives each one device (`gpus_per_rank = 1`). An explicit int pins it on every node: that many devices per compute rank, sharded in-process by the existing multi-GPU router (`gpu_splits`/`BandView`). Supported by the layout but **not yet validated** at `> 1` with several ranks (see `docs/multigpu-cluster-validation.md`'s addendum). |
 | `RANKS_PER_GPU` | 1 | That many compute ranks share each device, each with its own CUDA context and memory pool (`device_slot` distinguishes them on that device). |
 | `NWALKERS` | variant default | Must be a multiple of `n_compute`; `build_layout` raises otherwise. Rank *r*'s block is `[r*B, (r+1)*B)` in compute-rank order, `B = NWALKERS / n_compute`. |
-| `GF_LEGACY_RANK_LAYOUT` | `0` at the layout level (`ranks.py`'s own default); the campaign submit script keeps `1` at `NGPUS=2` until the WP7 gates pass (see below) | `1` restores today's pre-port roles: one compute rank owns the whole per-node pool, every other non-saver rank is a stopped SPARE. Rollback knob (design spec Risks). |
+| `GF_LEGACY_RANK_LAYOUT` | `0` everywhere (the layout level and, since the 2026-09-16 ruling after the WP7 transport gates passed, the campaign submit scripts at every `NGPUS`) | `1` restores today's pre-port roles: one compute rank owns the whole per-node pool, every other non-saver rank is a stopped SPARE. Rollback knob (design spec Risks). |
 | `GF_LAYOUT_DRY_RUN` | unset | Preflight: every rank prints `layout.describe()` and the process exits **before** `fit.build()` allocates anything; a genuinely bad layout still raises inside `build_layout`/`prepare_rank` (Plan 5 Task 2 of this port — see `docs/multirank-cluster-gates.md`'s Step 0 for the exact invocation). |
 | `GF_FANOUT_DIGEST` | unset | Emits a per-iteration `[FANOUT_DIGEST]` state-hash line (`log_like` + coords + inds), the cluster-gate tool for diffing two layouts for bit-identical transport (Plan 5 Task 4 of this port — see `docs/multirank-cluster-gates.md`'s Step 1). Emitted from the recipe's post-iteration hook regardless of the rank count, so a single-rank (`-n 1`) baseline prints it too, but only the three `n_compute=2` layouts are expected bit-identical to each other: single mode reseeds nothing (`run.py::_resolve_seed_base`/`_seed_rank_streams` return `None` when `layout.is_single()`), so the `-n 1` line is for observability and an `it=0` cross-check only, never a per-iteration diff. |
 
@@ -176,11 +176,14 @@ sbatch  ./submit_gf_6mo_v8.sh      # legacy flow: static header defaults
                                     #   (2 GPUs, gpu-80-spot, --ntasks=3)
 ```
 
-- `NGPUS=2`: `gpu-80-spot`, 1 node, `--gres=gpu:2`. `GF_LEGACY_RANK_LAYOUT`
-  defaults to `1` — the campaign stays on today's roles (one compute rank
-  drives both GPUs, rank 1 a stopped spare, rank 2 the saver;
-  `mpiexec -n 3`) until the WP7 cluster gates pass, byte-identical in effect
-  to the pre-port launch.
+- `NGPUS=2`: `gpu-80-spot`, 1 node, `--gres=gpu:2`, `--ntasks=3`, `mpiexec
+  -n 3`. `GF_LEGACY_RANK_LAYOUT` defaults to `0` (user ruling 2026-09-16,
+  after WP7 Steps 0-2/4 passed on the cluster): head + 1 compute rank (one
+  GPU each, `NWALKERS/2` walkers per rank) + saver. `GF_LEGACY_RANK_LAYOUT=1`
+  is the rollback knob and still launches today's pre-port roles (one
+  compute rank drives both GPUs, rank 1 a stopped spare, rank 2 the saver).
+  `NWALKERS` defaults to `8` (env-overridable): divisible by 2 AND 4, so a run
+  started at `NGPUS=2` continues at `NGPUS=4` from the same store.
 - `NGPUS=4`: `gpu-80-spot`, **2 nodes** × `--gres=gpu:2`,
   `--distribution=cyclic` — the cluster's real 4-GPU shape (there is no
   single 4-GPU node). `GF_LEGACY_RANK_LAYOUT` is **forced to `0`**
@@ -197,7 +200,7 @@ sbatch  ./submit_gf_6mo_v8.sh      # legacy flow: static header defaults
 - `NWALKERS % N_COMPUTE_EFF`: when non-legacy and the check fails, the
   script **rounds `NWALKERS` up** to the next multiple and prints a loud
   `[SUBMIT]` line rather than failing — `build_layout` itself would raise.
-  Its default `NWALKERS=10` is not divisible by `N_COMPUTE=4` at `NGPUS=4`,
+  The former default `NWALKERS=10` was not divisible by `N_COMPUTE=4` at `NGPUS=4`,
   so a first 4-GPU launch rounds to 12 unless `NWALKERS` is set explicitly.
 - Launch line: `mpiexec -n "${SLURM_NTASKS:-3}" -ppn 1 ...` with
   `I_MPI_HYDRA_BOOTSTRAP=slurm I_MPI_FABRICS=shm:ofi FI_PROVIDER=tcp` exported

@@ -436,11 +436,14 @@ set -euo pipefail
 # GPUS_PER_RANK (empty = AUTO) / RANKS_PER_GPU (default 1) size the compute
 # rank count: N_COMPUTE = NGPUS * RANKS_PER_GPU / GPUS_PER_RANK.
 #
-# CAMPAIGN SAFETY: GF_LEGACY_RANK_LAYOUT stays the default (=1) at NGPUS=2
-# so every line below is byte-identical in effect to today's campaign
-# launch (--ntasks=3, mpiexec -n 3) until the WP7 cluster gates pass.
-# NGPUS=4 cannot use the legacy single-compute-rank layout (it cannot span
-# nodes), so it forces GF_LEGACY_RANK_LAYOUT=0 (the walker-block layout)
+# LAYOUT DEFAULT (user ruling 2026-09-16): the walker-block layout
+# (GF_LEGACY_RANK_LAYOUT=0) is the default at EVERY NGPUS. At NGPUS=2 that is
+# head + 1 compute rank + saver (--ntasks=3, one GPU each, NWALKERS/2 walkers
+# per rank); the WP7 transport gates (Steps 0-2, 4) passed on the cluster and
+# the 6mo campaign run itself is the statistical read (Step 3 was skipped by
+# ruling). GF_LEGACY_RANK_LAYOUT=1 still selects today's single-compute-rank
+# layout for a 1-node job (rollback knob). NGPUS=4 cannot use the legacy
+# layout (it cannot span nodes), so it forces GF_LEGACY_RANK_LAYOUT=0
 # regardless of any pre-set value.
 #
 # Inside the job, the GPU list further below derives from what slurm
@@ -460,7 +463,7 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
   if [ "${NGPUS}" = "4" ]; then
     GF_LEGACY_RANK_LAYOUT=0
   else
-    GF_LEGACY_RANK_LAYOUT=${GF_LEGACY_RANK_LAYOUT:-1}
+    GF_LEGACY_RANK_LAYOUT=${GF_LEGACY_RANK_LAYOUT:-0}
   fi
   export GF_LEGACY_RANK_LAYOUT
   N_COMPUTE=$(( NGPUS * RANKS_PER_GPU / _k ))
@@ -621,7 +624,9 @@ _k=${GPUS_PER_RANK:-1}
 if [ "${NGPUS:-2}" = "4" ]; then
   GF_LEGACY_RANK_LAYOUT=${GF_LEGACY_RANK_LAYOUT:-0}
 else
-  GF_LEGACY_RANK_LAYOUT=${GF_LEGACY_RANK_LAYOUT:-1}
+  # walker-block layout by default at NGPUS=2 too (user ruling 2026-09-16;
+  # GF_LEGACY_RANK_LAYOUT=1 = the rollback knob for a 1-node job)
+  GF_LEGACY_RANK_LAYOUT=${GF_LEGACY_RANK_LAYOUT:-0}
 fi
 # The legacy layout is per-NODE (one compute rank owns that node's whole GPU
 # pool; every other non-saver rank is a stopped spare), so it cannot span an
@@ -694,10 +699,16 @@ echo "[V8-NOISE] coarse: Q=${COARSE_Q} mode=${COARSE_GPU_MODE} \
 use_ws=${COARSE_USE_WS} fiducial=${COARSE_FIDUCIAL}"
 
 # ---- sampler shape ---------------------------------------------------------
-export NWALKERS=10                 # 10-walker rebase (2026-09-11 ruling: build
-                                   # off the validated 10w 3mo arm, jobs
-                                   # 465/473); GB rungs stay GB_NTEMPS=24 --
-                                   # walkers and temps are independent axes.
+export NWALKERS=${NWALKERS:-8}     # 8 walkers (user ruling 2026-09-16): divisible
+                                   # by N_COMPUTE=2 (NGPUS=2) AND 4 (NGPUS=4), so
+                                   # a run started on 2 GPUs CONTINUES on 4 GPUs
+                                   # from the same store (the walker block is a
+                                   # runtime property, not stored). Was 10 (the
+                                   # 2026-09-11 rebase off the validated 10w 3mo
+                                   # arm, jobs 465/473). GB rungs stay
+                                   # GB_NTEMPS=24 -- walkers and temps are
+                                   # independent axes. NEVER change NWALKERS on
+                                   # a resume: the store carries the walker axis.
                                    # Noise-block floor 2*ndim (galfor ndim 5
                                    # -> 10) still satisfied.
 if [ "${GF_LEGACY_RANK_LAYOUT}" = "0" ] && [ "${N_COMPUTE_EFF}" -gt 0 ] \

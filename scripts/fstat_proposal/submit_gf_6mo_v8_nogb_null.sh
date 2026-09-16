@@ -484,7 +484,9 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
   if [ "${NGPUS}" = "4" ]; then
     GF_LEGACY_RANK_LAYOUT=0
   else
-    GF_LEGACY_RANK_LAYOUT=${GF_LEGACY_RANK_LAYOUT:-1}
+    # walker-block layout by default at NGPUS=2 too (user ruling 2026-09-16;
+    # GF_LEGACY_RANK_LAYOUT=1 = the rollback knob for a 1-node job)
+    GF_LEGACY_RANK_LAYOUT=${GF_LEGACY_RANK_LAYOUT:-0}
   fi
   export GF_LEGACY_RANK_LAYOUT
   N_COMPUTE=$(( NGPUS * RANKS_PER_GPU / _k ))
@@ -646,7 +648,9 @@ _k=${GPUS_PER_RANK:-1}
 if [ "${NGPUS:-2}" = "4" ]; then
   GF_LEGACY_RANK_LAYOUT=${GF_LEGACY_RANK_LAYOUT:-0}
 else
-  GF_LEGACY_RANK_LAYOUT=${GF_LEGACY_RANK_LAYOUT:-1}
+  # walker-block layout by default at NGPUS=2 too (user ruling 2026-09-16;
+  # GF_LEGACY_RANK_LAYOUT=1 = the rollback knob for a 1-node job)
+  GF_LEGACY_RANK_LAYOUT=${GF_LEGACY_RANK_LAYOUT:-0}
 fi
 # The legacy layout is per-NODE (one compute rank owns that node's whole GPU
 # pool; every other non-saver rank is a stopped spare), so it cannot span an
@@ -725,7 +729,7 @@ echo "[V8-NOISE] coarse: Q=${COARSE_Q} mode=${COARSE_GPU_MODE} \
 use_ws=${COARSE_USE_WS} fiducial=${COARSE_FIDUCIAL}"
 
 # ---- sampler shape ---------------------------------------------------------
-export NWALKERS=10                 # 10-walker rebase (2026-09-11 ruling: build
+export NWALKERS=${NWALKERS:-10}    # env-overridable (2026-09-16); 10-walker rebase (2026-09-11 ruling: build
                                    # off the validated 10w 3mo arm, jobs
                                    # 465/473); GB rungs stay GB_NTEMPS=24 --
                                    # walkers and temps are independent axes.

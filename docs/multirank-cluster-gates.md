@@ -21,12 +21,9 @@ multi-GPU router's own gates are in
 - `pip install -e '.[dev,testing]'` in the environment that will run the
   cluster job (matches the rest of the sprint's build recipe).
 - Export `GF_LEGACY_RANK_LAYOUT=0` explicitly for every command in this
-  runbook. The campaign submit script currently keeps the legacy layout as
-  its own default at `NGPUS=2` (`docs/global-fit-launch.md`, "Campaign
-  submit scripts") specifically so today's production launches are
-  unaffected until this runbook's gates pass — so a gate run must opt in to
-  the new layout, not rely on a script default that is deliberately still
-  legacy.
+  runbook (the layout-level default is already `0`; since the 2026-09-16
+  ruling the campaign submit scripts default to `0` at every `NGPUS` as
+  well, with `GF_LEGACY_RANK_LAYOUT=1` as the rollback knob).
 - gpu-80-spot throughout: `--nodes=1 --gres=gpu:2` for the 1-node runs,
   `--nodes=2 --gres=gpu:2` for the 2-node runs (design spec Verification
   section). Adjust partition/gres flags to whatever the cluster actually
@@ -426,10 +423,11 @@ justification to build `main_branches=`; if it is negligible at production
 
 Once Steps 0-4 are green:
 
-1. **Flip the campaign default.** `submit_gf_6mo_v8.sh` (and siblings) stop
-   defaulting `GF_LEGACY_RANK_LAYOUT` to `1` at `NGPUS=2` — the walker-block
-   layout becomes the default at every `NGPUS`, matching what `NGPUS=4`
-   already forces.
+1. **Flip the campaign default.** DONE 2026-09-16 (user ruling, after Steps
+   0-2 and 4 passed; Step 3 skipped — the live 6mo campaign run at 8 walkers
+   is the statistical read): `submit_gf_6mo_v8.sh` and its null sibling
+   default `GF_LEGACY_RANK_LAYOUT=0` at every `NGPUS`; `NWALKERS` defaults to
+   8 so the run can continue from 2 to 4 GPUs.
 2. **Delete the legacy parity path.** `GBSpecialBase`'s `_propose_legacy`
    (the ~750-line byte-identical copy of the pre-port `propose` body kept
    only as the single-rank parity reference) and the

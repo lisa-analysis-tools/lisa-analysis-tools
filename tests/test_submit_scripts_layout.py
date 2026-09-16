@@ -8,12 +8,13 @@ shadow ``sbatch`` with a stub that prints its argv and exits 0, run the
 script with ``bash``, and inspect what the (never-actually-submitted) job
 would have looked like.
 
-Covers the CAMPAIGN SAFETY invariant: at the ``NGPUS=2`` default the
-scripts must pin ``GF_LEGACY_RANK_LAYOUT=1`` (today's single-compute-rank
-layout, ``--ntasks=3``) so a plain resubmit stays byte-identical in effect
-until the WP7 cluster gates pass; ``NGPUS=4`` must force the walker-block
-layout (``GF_LEGACY_RANK_LAYOUT=0``) across 2 nodes of 2 GPUs each, since
-the legacy layout cannot span nodes.
+Covers the layout invariants (user ruling 2026-09-16, after the WP7
+transport gates passed on the cluster): at the ``NGPUS=2`` default the
+scripts pin the walker-block layout (``GF_LEGACY_RANK_LAYOUT=0``: head +
+1 compute + saver, still ``--ntasks=3``); ``GF_LEGACY_RANK_LAYOUT=1`` remains
+the rollback knob and must still launch today's single-compute-rank shape;
+``NGPUS=4`` must force the walker-block layout across 2 nodes of 2 GPUs each,
+since the legacy layout cannot span nodes.
 """
 
 import os
@@ -172,7 +173,22 @@ class SubmitScriptsDispatchTest(unittest.TestCase):
             f"{needle!r} not found in --export= line(s): {export_lines}",
         )
 
-    def test_ngpus_2_default_is_legacy(self):
+    def test_ngpus_2_explicit_legacy_still_launches_today_shape(self):
+        # GF_LEGACY_RANK_LAYOUT=1 is the rollback knob: same resource request,
+        # --ntasks=3, mpiexec -n 3, the single-compute-rank layout.
+        for script in SCRIPTS:
+            with self.subTest(script=script):
+                lines = self._run_dispatch(
+                    script, {"NGPUS": "2", "GF_LEGACY_RANK_LAYOUT": "1"}
+                )
+                self.assertIn("--ntasks=3", lines)
+                self.assertIn("--nodes=1", lines)
+                self._assert_export_contains(lines, "GF_LEGACY_RANK_LAYOUT=1")
+
+    def test_ngpus_2_default_is_walker_block(self):
+        # user ruling 2026-09-16 (WP7 Steps 0-2/4 green): the walker-block
+        # layout is the default at NGPUS=2 -- head + 1 compute + saver, still
+        # --ntasks=3, but GF_LEGACY_RANK_LAYOUT=0 is what the job sees.
         for script in SCRIPTS:
             with self.subTest(script=script):
                 lines = self._run_dispatch(script, {"NGPUS": "2"})
@@ -180,7 +196,7 @@ class SubmitScriptsDispatchTest(unittest.TestCase):
                 self.assertIn("--nodes=1", lines)
                 self.assertIn("--partition=gpu-80-spot", lines)
                 self.assertIn("--gres=gpu:2", lines)
-                self._assert_export_contains(lines, "GF_LEGACY_RANK_LAYOUT=1")
+                self._assert_export_contains(lines, "GF_LEGACY_RANK_LAYOUT=0")
 
     def test_ngpus_4_forces_walker_block_two_nodes(self):
         for script in SCRIPTS:
