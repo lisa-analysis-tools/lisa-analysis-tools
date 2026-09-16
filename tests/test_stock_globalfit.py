@@ -164,6 +164,17 @@ class KnobTest(unittest.TestCase):
             gs = fit.make_general_settings()
             self.assertIsNone(gs.gpus)
 
+    def test_rank_layout_env_knobs(self):
+        with _EnvGuard(GPUS_PER_RANK="2", RANKS_PER_GPU="1"):
+            fit = erebor.get_stock("gb_no_fg")
+            self.assertEqual(fit.general.gpus_per_rank, 2)
+            self.assertEqual(fit.general.ranks_per_gpu, 1)
+        with _EnvGuard(GPUS_PER_RANK=None, RANKS_PER_GPU=None):
+            fit = erebor.get_stock("gb_no_fg")
+            self.assertIsNone(fit.general.gpus_per_rank)  # AUTO
+            self.assertEqual(fit.general.ranks_per_gpu, 1)
+        self.assertNotIn("gpus_per_rank", erebor.get_stock("gb_no_fg").describe())
+
     def test_construction_is_cheap(self):
         # No directories created, and a nonexistent data path is fine
         # (nothing touches the filesystem until build()).

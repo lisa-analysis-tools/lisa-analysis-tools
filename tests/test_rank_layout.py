@@ -296,5 +296,49 @@ class PrepareRankTest(unittest.TestCase):
         self.assertEqual(FakeWorld(2).run(fn)[1], (None, "cpu"))
 
 
+class AutoGpusPerRankTest(unittest.TestCase):
+    """gpus_per_rank=None: a lone compute rank on a node owns the whole pool (today's -n 1)."""
+
+    def test_single_rank_owns_the_whole_pool(self):
+        lay = FakeWorld(1).run(lambda r, c: build_layout(c, 4, [0, 1], legacy=False))[0]
+        self.assertEqual(lay.local_gpus(0), [0, 1])
+        self.assertEqual(lay.n_compute, 1)
+
+    def test_single_rank_explicit_one_narrows_to_the_first_device(self):
+        lay = FakeWorld(1).run(
+            lambda r, c: build_layout(c, 4, [0, 1], legacy=False, gpus_per_rank=1)
+        )[0]
+        self.assertEqual(lay.local_gpus(0), [0])
+
+    def test_two_compute_ranks_on_a_two_gpu_node_get_one_device_each(self):
+        lay = FakeWorld(3).run(lambda r, c: build_layout(c, 4, [0, 1], legacy=False))[0]
+        self.assertEqual((lay.local_gpus(0), lay.local_gpus(1)), ([0], [1]))
+
+    def test_size2_on_one_gpu_still_demotes_rank1_and_head_owns_the_pool(self):
+        import warnings
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            lay = FakeWorld(2).run(lambda r, c: build_layout(c, 4, [0], legacy=False))[0]
+        self.assertEqual(lay.role_of(1), RankRole.SAVER)
+        self.assertEqual(lay.local_gpus(0), [0])
+
+    def test_head_plus_saver_on_two_gpus_head_owns_both(self):
+        # -n 2 on a 2-GPU pool: rank 1 is a COMPUTE rank (two compute ranks), not a saver
+        lay = FakeWorld(2).run(lambda r, c: build_layout(c, 4, [0, 1], legacy=False))[0]
+        self.assertEqual(lay.n_compute, 2)
+        self.assertEqual((lay.local_gpus(0), lay.local_gpus(1)), ([0], [1]))
+
+    def test_prepare_rank_passes_none_through(self):
+        # the fixture's general block leaves gpus_per_rank unset -> AUTO
+        fit = _Fit()
+        fit.general.gpus_per_rank = None
+        lay = FakeWorld(1).run(
+            lambda r, c: prepare_rank(fit, c, environ={}, device_count_fn=lambda: 2)
+        )[0]
+        self.assertEqual(lay.local_gpus(0), [0, 1])
+        self.assertEqual(fit.general.gpus, [0, 1])
+
+
 if __name__ == "__main__":
     unittest.main()

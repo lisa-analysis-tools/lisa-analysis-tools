@@ -22,6 +22,7 @@ import os
 import sys
 import threading
 import traceback
+import typing
 import warnings
 
 import numpy as np
@@ -60,7 +61,11 @@ class WalkerBlockLayout:
     nwalkers: int
     block: int
     placements: dict
-    gpus_per_rank: int = 1
+    #: resolved value when uniform across nodes; ``None`` when AUTO resolved
+    #: to different per-node values (mixed node shapes)
+    gpus_per_rank: typing.Optional[int] = 1
+    #: True when ``gpus_per_rank`` was requested as AUTO (``None`` input)
+    gpus_per_rank_auto: bool = False
     ranks_per_gpu: int = 1
     legacy: bool = False
     #: human-readable notes about non-default choices (e.g. the size-2 fallback)
@@ -108,10 +113,14 @@ class WalkerBlockLayout:
         return comm.Split(color, key=rank)
 
     def describe(self) -> str:
+        if self.gpus_per_rank_auto:
+            gpk = "AUTO" if self.gpus_per_rank is None else f"AUTO->{self.gpus_per_rank}"
+        else:
+            gpk = str(self.gpus_per_rank)
         head = (
             f"walker-block layout: size={self.size} n_compute={self.n_compute} "
             f"nwalkers={self.nwalkers} block={self.block} "
-            f"gpus_per_rank={self.gpus_per_rank} ranks_per_gpu={self.ranks_per_gpu}"
+            f"gpus_per_rank={gpk} ranks_per_gpu={self.ranks_per_gpu}"
             f"{' LEGACY' if self.legacy else ''}"
         )
         lines = [head]
@@ -187,7 +196,7 @@ def build_layout(
     nwalkers,
     gpu_pool,
     *,
-    gpus_per_rank=1,
+    gpus_per_rank=None,
     ranks_per_gpu=1,
     main_rank=0,
     legacy=None,
@@ -198,22 +207,29 @@ def build_layout(
     ranks on a node are ordered by world rank and assigned blocked:
     ``gpus_per_rank = k > 1`` -> devices ``pool[i*k:(i+1)*k]``;
     ``ranks_per_gpu = m > 1`` -> device ``pool[i // m]``, slot ``i % m``.
+
+    ``gpus_per_rank=None`` (the default) is AUTO, resolved per node: a lone
+    compute rank on a node (with ``ranks_per_gpu=1``) owns the whole
+    per-node pool (``k = len(pool)``, today's in-process ``-n 1`` multi-GPU
+    run); several compute ranks on a node instead get one device each
+    (``k = 1``). An explicit int pins ``k`` on every node.
     """
     if legacy is None:
         legacy = os.environ.get(LEGACY_ENV, "0") == "1"
     size = int(comm.Get_size())
     rank = int(comm.Get_rank())
     head, saver, compute = resolve_roles(size, main_rank)
-    k, m = int(gpus_per_rank), int(ranks_per_gpu)
-    if k < 1 or m < 1:
+    m = int(ranks_per_gpu)
+    k_explicit = None if gpus_per_rank is None else int(gpus_per_rank)
+    if m < 1 or (k_explicit is not None and k_explicit < 1):
         raise ValueError("gpus_per_rank and ranks_per_gpu must both be >= 1")
-    if k > 1 and m > 1:
+    if k_explicit is not None and k_explicit > 1 and m > 1:
         raise ValueError("at most one of gpus_per_rank / ranks_per_gpu may exceed 1")
     pool = [int(g) for g in (gpu_pool or [])]
     if legacy:
         compute = (head,)
     notes = []
-    if size == 2 and not legacy and pool and len(pool) * m // k < 2:
+    if size == 2 and not legacy and pool and len(pool) * m // (k_explicit or 1) < 2:
         # A `-n 2` launch on a pool that cannot host two compute ranks: instead
         # of the over-subscription error, rank 1 becomes the dedicated saver
         # (user ruling 2026-09-15). The head then computes every walker exactly
@@ -223,7 +239,7 @@ def build_layout(
         compute = (head,)
         note = (
             f"size-2 launch on a per-node GPU pool {pool} that supports only "
-            f"{len(pool) * m // k} compute rank(s): rank {other} runs as the "
+            f"{len(pool) * m // (k_explicit or 1)} compute rank(s): rank {other} runs as the "
             "dedicated saver and the head computes all walkers. To use two "
             "compute ranks on this pool set RANKS_PER_GPU=2; for synchronous "
             "saves with no saver rank launch with -n 1."
@@ -253,8 +269,18 @@ def build_layout(
         by_node.setdefault(str(table[r][0]), []).append(r)
 
     placements = {}
+    resolved_ks = []
     for node, ranks in by_node.items():
         comp_here = [r for r in ranks if r in compute]
+        n_comp_here = len(comp_here)
+        if k_explicit is not None:
+            k = k_explicit
+        elif pool and n_comp_here == 1 and m == 1:
+            k = len(pool)  # AUTO: a lone compute rank drives the whole pool (today's -n 1)
+        else:
+            k = 1
+        if comp_here:
+            resolved_ks.append(k)
         if pool and not legacy:
             capacity = len(pool) * m // k
             if len(comp_here) > capacity:
@@ -291,6 +317,12 @@ def build_layout(
             placements[r] = RankPlacement(
                 r, role, node, local_index, devices, slot, bi * block, (bi + 1) * block
             )
+    if k_explicit is not None:
+        resolved_k = k_explicit
+    elif resolved_ks and len(set(resolved_ks)) == 1:
+        resolved_k = resolved_ks[0]
+    else:
+        resolved_k = None
     return WalkerBlockLayout(
         size=size,
         head_rank=head,
@@ -299,7 +331,8 @@ def build_layout(
         nwalkers=nwalkers,
         block=block,
         placements=placements,
-        gpus_per_rank=k,
+        gpus_per_rank=resolved_k,
+        gpus_per_rank_auto=k_explicit is None,
         ranks_per_gpu=m,
         legacy=bool(legacy),
         notes=tuple(notes),
@@ -448,6 +481,8 @@ def prepare_rank(
     pre-build settings ``fit.general.nwalkers`` / ``.gpus`` (the per-node
     pool) / ``.gpus_per_rank`` / ``.ranks_per_gpu``; writes the rank-local
     ``fit.general.gpus``, ``fit.rank_layout`` and ``fit.rank_device_mode``.
+    ``gpus_per_rank`` is passed through unchanged (``None`` stays ``None``,
+    AUTO) — it is never coerced to 1.
     """
     layout = getattr(fit, "rank_layout", None)
     if layout is not None:
@@ -462,7 +497,7 @@ def prepare_rank(
         comm,
         int(general.nwalkers),
         pool,
-        gpus_per_rank=int(getattr(general, "gpus_per_rank", 1) or 1),
+        gpus_per_rank=getattr(general, "gpus_per_rank", None),
         ranks_per_gpu=int(getattr(general, "ranks_per_gpu", 1) or 1),
         main_rank=int(getattr(fit, "main_rank", 0) or 0),
     )

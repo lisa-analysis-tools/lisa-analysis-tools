@@ -59,6 +59,15 @@ class EreborGeneralSettings(GeneralSettings):
         default_factory=env_default("NUM_ITERATIONS", 500, int)
     )
     nwalkers: int = dataclasses.field(default_factory=env_default("NWALKERS", 4, int))
+    #: multi-rank layout (design spec 2026-09-15, Decision 2). ``gpus_per_rank``
+    #: None = AUTO: a lone compute rank on a node drives the node's whole
+    #: ``gpus`` pool (today's in-process multi-GPU run at ``-n 1``); several
+    #: compute ranks on a node get one device each. An int pins it. At most one
+    #: of the two may exceed 1. Plain attributes, never headline knobs.
+    gpus_per_rank: typing.Optional[int] = dataclasses.field(
+        default_factory=env_default("GPUS_PER_RANK", None, int)
+    )
+    ranks_per_gpu: int = dataclasses.field(default_factory=env_default("RANKS_PER_GPU", 1, int))
     # RETIRED as a tempering knob: the engine runs cold-chain only (each
     # branch tempers internally; see the per-branch <BRANCH>_NTEMPS knobs).
     # A set NTEMPS env var raises. erebor.blank overrides this field to keep
