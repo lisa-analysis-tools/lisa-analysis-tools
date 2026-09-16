@@ -10,6 +10,15 @@ head-directed commands, and the unchanged saver rank. See
 :mod:`fakecomm` simulator runs the same code in one process for tests.
 """
 
+from .fakecomm import FakeAbort, FakeComm, FakeCommNull, FakeWorld
 from .walkerslice import WALKER_INDS_KEY, merge_state, slice_state
 
-__all__ = ["WALKER_INDS_KEY", "merge_state", "slice_state"]
+__all__ = [
+    "WALKER_INDS_KEY",
+    "merge_state",
+    "slice_state",
+    "FakeAbort",
+    "FakeComm",
+    "FakeCommNull",
+    "FakeWorld",
+]
