@@ -640,11 +640,23 @@ export GB_NLEAVES_MAX=15000        # 6 mo: deeper confusion resolved; 3-mo ran 1
 # 2.4s host round-trips. ~4.2 GB buffer; post-fix profile at 4096 was
 # flat 42-45/31 GB on 96 GB cards. If the unit-open lines stay flat,
 # full residency (50000 -> 44,352 slots, ~11.3 GB) is the next step.
-export GB_N_SUBBANDS=16384  # PER GPU; WITH THE MIRROR a slot carries data only
-                            # (~0.5 MB @6mo vs ~0.25 @3mo) -- 16384 x 0.5 MB
-                            # ~ 8.4 GB/GPU = byte-parity with the 3mo twin's
-                            # 32768 x 0.25. (Pre-mirror this line was 4096 at
-                            # ~2 MB/slot incl. XYZ invC.)   # total = x n_gpus
+# ---- OOM 2026-09-16 (dev0, 3.68 GB En fold at 88.9 GB allocated, run
+# died overnight in setup_in_model/bin_fold_real): 16384 violated the
+# sig-het stash law documented at the SIGHET_NT_LAYER block below -- the
+# stash goes as CELLS x N_sparse_t and the knobs MULTIPLY. The mirror
+# halved SLAB bytes (the rationale for 16384) but not the fold stash:
+# 6mo N_sparse_t 118 x 16384 = 1.93e6, right at the 2.2e6 product that
+# OOM'd v4@270 (and 4x the calibrated 6-mo-safe 118 x 4096 = 4.8e5).
+# Residency fills toward capacity as rj/tempering matures, so early
+# telemetry (35-45 GB) looks fine and the wall arrives after the first
+# long uninterrupted stretch. 8192 -> product 0.97e6, under the 23-mo
+# 1.1e6 OK precedent; back off to 4096 (the calibrated-safe value) if
+# dev0 max memory trends past ~70 GB in gpu_util_*.csv again.
+export GB_N_SUBBANDS=8192   # PER GPU; total = x n_gpus. Slab ~0.5 MB/slot
+                            # @6mo (mirror) ~ 4.2 GB/GPU; the binding
+                            # constraint is the SIG-HET STASH product above,
+                            # not slab bytes. (History: pre-mirror 4096 at
+                            # ~2 MB/slot; 16384 mirror-era OOM'd 09-16.)
 # PSD SHARED MIRROR (386f25ce, validated jobs 469/470: 3mo dev0 68->44 GB,
 # 1yr 85->61 GB with capacity DOUBLED; parity 11k+ IDENTICAL). Parity gate
 # disarmed: vgb_pe rebuilds its buffer every unit so the gate never retires
