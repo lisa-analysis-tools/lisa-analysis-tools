@@ -116,6 +116,8 @@ DRY_RUN="${DRY_RUN:-0}"
 PARALLEL="${PARALLEL:-0}"
 NGPUS="${NGPUS:-}"
 NULL_PER_SOURCE_ITERS="${NULL_PER_SOURCE_ITERS:-}"
+# Branch subset knob + EMRI mode_selection_threshold sweep (2026-09-16).
+NULL_EMRI_EPS="${NULL_EMRI_EPS:-}"
 
 if [ ! -f "${CANONICAL}" ]; then
   echo "[LAUNCH] FATAL: canonical null script not found: ${CANONICAL}" >&2
@@ -168,6 +170,12 @@ _sed_assert() {  # file  sed_expr  old_fixed  new_fixed  label
 _generate() {
   local branch="$1" id="$2"
   local tag="${branch}${id}"
+  # EMRI eps sweep (2026-09-16): NULL_EMRI_EPS overrides the canonical
+  # EMRI_EPS=1e-3 in emri runs AND suffixes the tag, so eps variants get
+  # their own store/log and never collide with the baseline runs.
+  if [ "${branch}" = "emri" ] && [ -n "${NULL_EMRI_EPS}" ]; then
+    tag="${branch}${id}_eps${NULL_EMRI_EPS}"
+  fi
   local store="${STORE_ROOT}/${STORE_PREFIX}${tag}/"
   local out="${GEN_DIR}/submit_null_${tag}.sh"
 
@@ -235,6 +243,19 @@ _generate() {
     "export SOBHB_IDS=${sobbh_ids}   # PER-SOURCE NULL" \
     "SOBHB ids"
 
+  # (4b) EMRI EPS OVERRIDE (mode_selection_threshold sweep, 2026-09-16:
+  #      per-source nulls measure the mode-truncation share of the truth
+  #      deficit -- emri3 read lnL=-4.9 at the production 1e-3). Only
+  #      meaningful on emri runs; the canonical line is a PLAIN export, so
+  #      env passthrough cannot do this.
+  if [ "${branch}" = "emri" ] && [ -n "${NULL_EMRI_EPS}" ]; then
+    _sed_assert "${out}" \
+      "s|^export EMRI_EPS=.*|export EMRI_EPS=${NULL_EMRI_EPS}   # PER-SOURCE NULL: eps sweep|" \
+      "export EMRI_EPS=1e-3" \
+      "export EMRI_EPS=${NULL_EMRI_EPS}" \
+      "EMRI eps override"
+  fi
+
   # (5) WHERE THE RUN STOPS.
   if [ -n "${NULL_PER_SOURCE_ITERS}" ]; then
     # Escape hatch: a short SAMPLING run instead of the bare readout.
@@ -272,10 +293,21 @@ _generate() {
 }
 
 # ---- build the (branch, id) work list --------------------------------------
+# NULL_BRANCHES (knob, 2026-09-16): space- or comma-separated subset of
+# "mbh emri sobbh" -- only listed branches generate/submit. Default: all.
+#   NULL_BRANCHES=emri NULL_EMRI_EPS=1e-4 bash launch_null_per_source.sh
+NULL_BRANCHES="${NULL_BRANCHES:-mbh emri sobbh}"
+NULL_BRANCHES="$(printf '%s' "${NULL_BRANCHES}" | tr ',' ' ')"
+_want() { case " ${NULL_BRANCHES} " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
 RUNS=""
-for _id in ${MBH_IDS_LIST}; do RUNS="${RUNS} mbh:${_id}"; done
-for _id in ${EMRI_IDS_LIST}; do RUNS="${RUNS} emri:${_id}"; done
-for _id in ${SOBBH_IDS_LIST}; do RUNS="${RUNS} sobbh:${_id}"; done
+if _want mbh;   then for _id in ${MBH_IDS_LIST};   do RUNS="${RUNS} mbh:${_id}";   done; fi
+if _want emri;  then for _id in ${EMRI_IDS_LIST};  do RUNS="${RUNS} emri:${_id}";  done; fi
+if _want sobbh; then for _id in ${SOBBH_IDS_LIST}; do RUNS="${RUNS} sobbh:${_id}"; done; fi
+if [ -z "${RUNS// /}" ]; then
+  echo "[LAUNCH] FATAL: NULL_BRANCHES='${NULL_BRANCHES}' selected no runs (valid: mbh emri sobbh)." >&2
+  exit 2
+fi
 
 _N=0
 for _r in ${RUNS}; do _N=$((_N + 1)); done
@@ -283,7 +315,10 @@ for _r in ${RUNS}; do _N=$((_N + 1)); done
 echo "[LAUNCH] canonical : ${CANONICAL}"
 echo "[LAUNCH] generating: ${GEN_DIR}"
 echo "[LAUNCH] stores    : ${STORE_ROOT}/${STORE_PREFIX}BRANCHID/"
-echo "[LAUNCH] runs      : ${_N}  (mbh:${MBH_IDS_LIST} | emri:${EMRI_IDS_LIST} | sobbh:${SOBBH_IDS_LIST})"
+echo "[LAUNCH] runs      : ${_N}  (branches: ${NULL_BRANCHES} | mbh:${MBH_IDS_LIST} | emri:${EMRI_IDS_LIST} | sobbh:${SOBBH_IDS_LIST})"
+if [ -n "${NULL_EMRI_EPS}" ]; then
+  echo "[LAUNCH] emri eps  : EMRI_EPS=${NULL_EMRI_EPS} (stores/jobs tagged _eps${NULL_EMRI_EPS}; canonical baseline is 1e-3)"
+fi
 if [ -n "${NULL_PER_SOURCE_ITERS}" ]; then
   echo "[LAUNCH] mode      : SAMPLING, NUM_ITERATIONS=${NULL_PER_SOURCE_ITERS}"
 else

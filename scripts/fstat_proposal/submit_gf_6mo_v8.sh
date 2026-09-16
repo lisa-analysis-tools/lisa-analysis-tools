@@ -2165,7 +2165,13 @@ export VGB_SIGHET_INMODEL=0
 #   python scripts/fstat_proposal/migrate_vgb_chirp_basis.py \
 #       <store.h5> <catalogue_dir>
 # run BEFORE the first launch. NEVER flip this mid-store.
-export VGB_CHIRP_MASS_BASIS=1
+# STAGED, NOT YET LIVE (2026-09-16 sequencing): the ruling + machinery
+# above are in the tree and gated by this knob, but the flip to 1 happens
+# at the DELIBERATE VGB restart together with
+# migrate_vgb_chirp_basis.py (restart-at-injection) -- NOT at the next
+# ordinary relaunch, which must keep resuming the current 5-column store
+# untouched. Flip this to 1 only alongside the migration step.
+export VGB_CHIRP_MASS_BASIS=0
 # 8-rung ladder (user ruling 2026-08-15). Resume derives the rung count
 # from the STORED band_temps shape, so the migration above MUST be run
 # with the matching "8" argument (it recreates every rung-dimensioned
