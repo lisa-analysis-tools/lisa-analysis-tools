@@ -18,7 +18,12 @@ from .ranks import (
     WalkerBlockLayout,
     build_layout,
     derive_rank_seed,
+    install_mpi_abort_on_error,
+    prefix_stdout,
+    prepare_rank,
+    rank_tag,
     resolve_roles,
+    select_rank_device,
 )
 from .walkerslice import WALKER_INDS_KEY, merge_state, slice_state
 
@@ -36,5 +41,10 @@ __all__ = [
     "WalkerBlockLayout",
     "build_layout",
     "derive_rank_seed",
+    "install_mpi_abort_on_error",
+    "prefix_stdout",
+    "prepare_rank",
+    "rank_tag",
     "resolve_roles",
+    "select_rank_device",
 ]

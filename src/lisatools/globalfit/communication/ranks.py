@@ -286,3 +286,254 @@ def derive_rank_seed(base_seed, layout, rank) -> int:
     children = sequence.spawn(layout.n_compute)
     child = children[layout.fanout_rank(rank)]
     return int(child.generate_state(1, dtype=np.uint32)[0])
+
+
+# --------------------------------------------------------------------------
+# device pinning (must run BEFORE any CUDA initialisation on the rank)
+# --------------------------------------------------------------------------
+
+_CUDART_NAMES = (
+    "libcudart.so",
+    "libcudart.so.13",
+    "libcudart.so.12",
+    "libcudart.so.11.0",
+    "libcudart.dylib",
+)
+
+
+def _load_cudart():
+    import ctypes
+
+    for name in _CUDART_NAMES:
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    return None
+
+
+def _cudart_device_count():
+    """``cudaGetDeviceCount`` via ctypes, or ``None`` when no runtime is loadable."""
+    import ctypes
+
+    lib = _load_cudart()
+    if lib is None:
+        return None
+    count = ctypes.c_int(0)
+    if lib.cudaGetDeviceCount(ctypes.byref(count)) != 0:
+        return None
+    return int(count.value)
+
+
+def _cudart_set_device(device):
+    lib = _load_cudart()
+    if lib is None:
+        raise RuntimeError("cudaSetDevice fallback requested but no CUDA runtime is loadable")
+    if lib.cudaSetDevice(int(device)) != 0:
+        raise RuntimeError(f"cudaSetDevice({device}) failed")
+
+
+def select_rank_device(
+    layout,
+    rank,
+    *,
+    environ=None,
+    device_count_fn=None,
+    set_device_fn=None,
+    logger=None,
+):
+    """Pin this process to its devices. Returns ``(gpus, mode)``.
+
+    ``gpus`` is what ``general_info.gpus`` must become on this rank
+    (``None`` on CPU). Modes: ``"cpu"``; ``"legacy"`` (pool untouched);
+    ``"visible"`` (``CUDA_VISIBLE_DEVICES`` narrowed, the rank sees its
+    devices as ``0..k-1``); ``"setdevice"`` (the runtime was already
+    initialised, e.g. by a CUDA-aware MPI, so the env is restored and
+    ``cudaSetDevice`` pins the first device; the rank keeps the pool ids).
+    """
+    environ = os.environ if environ is None else environ
+    device_count_fn = _cudart_device_count if device_count_fn is None else device_count_fn
+    set_device_fn = _cudart_set_device if set_device_fn is None else set_device_fn
+    placement = layout.placements[int(rank)]
+    if not placement.devices:
+        return None, "cpu"
+    if layout.legacy:
+        return list(placement.devices), "legacy"
+
+    previous = environ.get("CUDA_VISIBLE_DEVICES")
+    if previous:
+        # pool ids index the CURRENTLY visible set (Slurm may already have narrowed it)
+        visible = [v.strip() for v in previous.split(",") if v.strip()]
+        try:
+            physical = [visible[d] for d in placement.devices]
+        except IndexError:
+            raise ValueError(
+                f"rank {rank}: device pool ids {list(placement.devices)} exceed the visible "
+                f"set CUDA_VISIBLE_DEVICES={previous!r}"
+            ) from None
+    else:
+        physical = [str(d) for d in placement.devices]
+    environ["CUDA_VISIBLE_DEVICES"] = ",".join(physical)
+
+    count = device_count_fn()
+    if count is None or count == len(placement.devices):
+        return list(range(len(placement.devices))), "visible"
+
+    # the runtime saw the pool before we narrowed the env: fall back to cudaSetDevice
+    if previous is None:
+        environ.pop("CUDA_VISIBLE_DEVICES", None)
+    else:
+        environ["CUDA_VISIBLE_DEVICES"] = previous
+    set_device_fn(placement.devices[0])
+    environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    if logger is not None:
+        logger.warning(
+            "rank %d: CUDA runtime already initialised (%d devices visible); pinned device %d "
+            "with cudaSetDevice instead of CUDA_VISIBLE_DEVICES",
+            rank,
+            count,
+            placement.devices[0],
+        )
+    return list(placement.devices), "setdevice"
+
+
+def prepare_rank(
+    fit,
+    comm,
+    *,
+    logger=None,
+    environ=None,
+    device_count_fn=None,
+    set_device_fn=None,
+):
+    """THE driver hook: resolve the layout and pin this rank's device BEFORE ``fit.build()``.
+
+    Idempotent (returns the stored layout on a second call). Reads the
+    pre-build settings ``fit.general.nwalkers`` / ``.gpus`` (the per-node
+    pool) / ``.gpus_per_rank`` / ``.ranks_per_gpu``; writes the rank-local
+    ``fit.general.gpus``, ``fit.rank_layout`` and ``fit.rank_device_mode``.
+    """
+    layout = getattr(fit, "rank_layout", None)
+    if layout is not None:
+        return layout
+    if int(comm.Get_size()) > 1 and bool(getattr(fit, "built", False)):
+        raise RuntimeError(
+            "prepare_rank must run BEFORE fit.build(): the build allocates on the device"
+        )
+    general = fit.general
+    pool = list(general.gpus) if getattr(general, "gpus", None) else []
+    layout = build_layout(
+        comm,
+        int(general.nwalkers),
+        pool,
+        gpus_per_rank=int(getattr(general, "gpus_per_rank", 1) or 1),
+        ranks_per_gpu=int(getattr(general, "ranks_per_gpu", 1) or 1),
+        main_rank=int(getattr(fit, "main_rank", 0) or 0),
+    )
+    gpus, mode = select_rank_device(
+        layout,
+        int(comm.Get_rank()),
+        environ=environ,
+        device_count_fn=device_count_fn,
+        set_device_fn=set_device_fn,
+        logger=logger,
+    )
+    if pool:
+        general.gpus = gpus
+    fit.rank_layout = layout
+    fit.rank_device_mode = mode
+    if logger is not None:
+        logger.info("%s\nrank %d device mode: %s", layout.describe(), comm.Get_rank(), mode)
+    return layout
+
+
+# --------------------------------------------------------------------------
+# failure + logging helpers
+# --------------------------------------------------------------------------
+
+
+def install_mpi_abort_on_error(comm):
+    """Route any rank's uncaught exception (main thread or threads) through ``comm.Abort``.
+
+    Under ``mpiexec`` a crashed rank otherwise leaves the survivors blocked in
+    their receive loops for the whole allocation. Returns ``comm`` when it
+    installed the hooks, ``None`` for a single-process run (normal Python
+    exception behaviour is kept there).
+    """
+    if comm is None or int(comm.Get_size()) < 2:
+        return None
+    rank = int(comm.Get_rank())
+    size = int(comm.Get_size())
+
+    def _hook(exc_type, exc, tb):
+        try:
+            print(
+                f"\n[MPI-ABORT] rank {rank} of {size} raised {exc_type.__name__}: {exc}\n"
+                "[MPI-ABORT] aborting ALL ranks so the job fails fast instead of hanging.",
+                file=sys.stderr,
+                flush=True,
+            )
+            if exc_type is not KeyboardInterrupt:
+                traceback.print_exception(exc_type, exc, tb, file=sys.stderr)
+            sys.stderr.flush()
+            sys.stdout.flush()
+        except Exception:  # noqa: BLE001 - never mask the abort
+            pass
+        finally:
+            try:
+                comm.Abort(1)
+            except Exception:  # noqa: BLE001
+                os._exit(1)
+
+    sys.excepthook = _hook
+    if hasattr(threading, "excepthook"):
+
+        def _thread_hook(args):
+            _hook(args.exc_type, args.exc_value, args.exc_traceback)
+
+        threading.excepthook = _thread_hook
+    return comm
+
+
+def rank_tag(layout, rank) -> str:
+    role = layout.role_of(rank)
+    if role == RankRole.HEAD:
+        return f"r{int(rank)}/head"
+    if role == RankRole.SAVER:
+        return f"r{int(rank)}/saver"
+    if role == RankRole.SPARE:
+        return f"r{int(rank)}/spare"
+    return f"r{int(rank)}/c{layout.fanout_rank(rank)}"
+
+
+class _PrefixedStream:
+    """Line-prefixing wrapper for a text stream (worker-rank stdout)."""
+
+    def __init__(self, stream, prefix):
+        self._stream = stream
+        self._prefix = prefix
+        self._at_line_start = True
+
+    def write(self, text):
+        out = []
+        for chunk in str(text).splitlines(keepends=True):
+            if self._at_line_start:
+                out.append(self._prefix)
+            out.append(chunk)
+            self._at_line_start = chunk.endswith("\n")
+        self._stream.write("".join(out))
+
+    def flush(self):
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        return getattr(self._stream, name)
+
+
+def prefix_stdout(tag):
+    """Prefix every stdout line of this process with ``[tag] `` (idempotent)."""
+    if not isinstance(sys.stdout, _PrefixedStream):
+        sys.stdout = _PrefixedStream(sys.stdout, f"[{tag}] ")
+    return sys.stdout

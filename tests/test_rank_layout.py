@@ -7,7 +7,10 @@ from lisatools.globalfit.communication.ranks import (
     RankRole,
     build_layout,
     derive_rank_seed,
+    prepare_rank,
+    rank_tag,
     resolve_roles,
+    select_rank_device,
 )
 
 
@@ -105,6 +108,128 @@ class SeedTest(unittest.TestCase):
         self.assertEqual(len(set(seeds)), 4)
         self.assertEqual(seeds, [derive_rank_seed(103209, lay, r) for r in lay.compute_ranks])
         self.assertNotEqual(seeds, [derive_rank_seed(103210, lay, r) for r in lay.compute_ranks])
+
+
+class SelectRankDeviceTest(unittest.TestCase):
+    def _layout(self):
+        return FakeWorld(3).run(lambda r, c: build_layout(c, 4, [0, 1], legacy=False))[0]
+
+    def test_visible_mode_narrows_env_and_renumbers(self):
+        env = {}
+        gpus, mode = select_rank_device(
+            self._layout(), 1, environ=env, device_count_fn=lambda: 1, set_device_fn=lambda d: None
+        )
+        self.assertEqual((gpus, mode), ([0], "visible"))
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "1")
+
+    def test_visible_mode_maps_through_a_prenarrowed_env(self):
+        env = {"CUDA_VISIBLE_DEVICES": "2,3"}
+        gpus, mode = select_rank_device(
+            self._layout(), 1, environ=env, device_count_fn=lambda: 1, set_device_fn=lambda d: None
+        )
+        self.assertEqual((gpus, mode), ([0], "visible"))
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "3")
+
+    def test_no_runtime_probe_still_counts_as_visible(self):
+        env = {}
+        gpus, mode = select_rank_device(
+            self._layout(),
+            0,
+            environ=env,
+            device_count_fn=lambda: None,
+            set_device_fn=lambda d: None,
+        )
+        self.assertEqual((gpus, mode), ([0], "visible"))
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0")
+
+    def test_fallback_setdevice_when_the_runtime_is_already_up(self):
+        env = {"CUDA_VISIBLE_DEVICES": "0,1"}
+        pinned = []
+        gpus, mode = select_rank_device(
+            self._layout(), 1, environ=env, device_count_fn=lambda: 2, set_device_fn=pinned.append
+        )
+        self.assertEqual((gpus, mode), ([1], "setdevice"))
+        self.assertEqual(pinned, [1])
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1")
+        self.assertEqual(env["XLA_PYTHON_CLIENT_PREALLOCATE"], "false")
+
+    def test_cpu_and_legacy(self):
+        cpu = FakeWorld(1).run(lambda r, c: build_layout(c, 4, None, legacy=False))[0]
+        self.assertEqual(select_rank_device(cpu, 0, environ={}), (None, "cpu"))
+        legacy = FakeWorld(3).run(lambda r, c: build_layout(c, 4, [0, 1], legacy=True))[0]
+        env = {}
+        self.assertEqual(select_rank_device(legacy, 0, environ=env), ([0, 1], "legacy"))
+        self.assertNotIn("CUDA_VISIBLE_DEVICES", env)
+
+    def test_pool_index_outside_visible_set_raises(self):
+        env = {"CUDA_VISIBLE_DEVICES": "5"}
+        with self.assertRaises(ValueError):
+            select_rank_device(
+                self._layout(),
+                1,
+                environ=env,
+                device_count_fn=lambda: 1,
+                set_device_fn=lambda d: None,
+            )
+
+
+class _General:
+    def __init__(self):
+        self.nwalkers = 4
+        self.gpus = [0, 1]
+        self.gpus_per_rank = 1
+        self.ranks_per_gpu = 1
+
+
+class _Fit:
+    main_rank = 0
+    built = False
+
+    def __init__(self):
+        self.general = _General()
+
+
+class PrepareRankTest(unittest.TestCase):
+    def test_sets_local_gpus_layout_and_mode_on_every_rank(self):
+        def fn(rank, comm):
+            fit = _Fit()
+            env = {}
+            lay = prepare_rank(
+                fit, comm, environ=env, device_count_fn=lambda: 1, set_device_fn=lambda d: None
+            )
+            again = prepare_rank(fit, comm, environ=env)  # idempotent: no second layout
+            return (
+                fit.general.gpus,
+                fit.rank_device_mode,
+                env.get("CUDA_VISIBLE_DEVICES"),
+                lay.block_of(rank),
+                fit.rank_layout is lay and again is lay,
+                rank_tag(lay, rank),
+            )
+
+        out = FakeWorld(3).run(fn)
+        self.assertEqual(out[0], ([0], "visible", "0", (0, 2), True, "r0/head"))
+        self.assertEqual(out[1], ([0], "visible", "1", (2, 4), True, "r1/c1"))
+        self.assertEqual(out[2][:3], ([0], "visible", "0"))
+        self.assertEqual(out[2][5], "r2/saver")
+
+    def test_refuses_to_run_after_build_with_several_ranks(self):
+        def fn(rank, comm):
+            fit = _Fit()
+            fit.built = True
+            return prepare_rank(fit, comm, environ={}, device_count_fn=lambda: 1)
+
+        with self.assertRaises(RuntimeError):
+            FakeWorld(2).run(fn)
+
+    def test_cpu_fit_keeps_gpus_none(self):
+        def fn(rank, comm):
+            fit = _Fit()
+            fit.general.gpus = None
+            prepare_rank(fit, comm, environ={})
+            return fit.general.gpus, fit.rank_device_mode
+
+        self.assertEqual(FakeWorld(2).run(fn)[1], (None, "cpu"))
 
 
 if __name__ == "__main__":
