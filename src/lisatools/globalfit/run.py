@@ -1098,6 +1098,20 @@ class GlobalFit:
 
         allowed = {"psd", "galfor", "sgwb"}
         branches = set(self.curr.engine_info.branch_names)
+        if "psd" not in branches:
+            # A run with no psd branch samples no noise parameters, and the
+            # coarse WDM machinery exists ONLY to accelerate the PSD noise
+            # likelihood -- skip it and keep the fine backend, instead of
+            # refusing to run. Hit in production 2026-09-16: the nogb NULL
+            # test (psd removed, fixed noise params, source-only lnL)
+            # inherits the main campaign's COARSE_* knobs and died here at
+            # launch.
+            logger.warning(
+                "coarse_Q=%d requested but this run has no 'psd' branch "
+                "(branches=%s): the coarse WDM noise likelihood only "
+                "accelerates PSD sampling, so it is skipped and the fine "
+                "backend stands.", Q, sorted(branches))
+            return None
         unsupported = sorted(branches - allowed)
         mode = str(getattr(general_info, "coarse_gpu_mode", "off") or "off")
         all_source_sidecar = bool(unsupported)
@@ -1115,8 +1129,7 @@ class GlobalFit:
                 "coarse_gpu_mode applies to all-source runs only; noise-only "
                 "runs use the CPU backend-replacement coarse path."
             )
-        if "psd" not in branches:
-            raise ValueError("Coarse WDM noise likelihood requires a psd branch.")
+        # (psd-less compositions returned above -- psd is guaranteed here)
         if not all_source_sidecar and general_info.gpus is not None:
             raise ValueError(
                 "Coarse WDM noise likelihood is CPU-only in this implementation; "
