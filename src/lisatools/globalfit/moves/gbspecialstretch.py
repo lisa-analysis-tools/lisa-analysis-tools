@@ -258,6 +258,15 @@ class _ProposeTimer:
         ``_mark`` boundaries inside ``_run_rj_step``)."""
         self.stages[name] = self.stages.get(name, 0.0) + float(dt)
 
+    def snapshot(self) -> dict:
+        """Plain-dict copy of the accumulated stages/counts.
+
+        What a compute rank ships back in a fan-out reply (the head merges
+        the per-rank stage dicts into the one ``[GB_TIMING]`` line); pickles
+        cleanly and cannot alias the live timer.
+        """
+        return {"stages": dict(self.stages), "counts": dict(self.counts)}
+
     def report(self, total: float, top=None) -> str:
         # Top-level stages only: nested spans (buffer_build inside
         # run_proposal, ...) are reported but excluded from the
@@ -1907,6 +1916,85 @@ def _buffer_fixed_capacity_active(sorter, kwargs) -> bool:
             and os.environ.get("GB_BUFFER_FIXED_CAPACITY_TWIN", "1") != "1"):
         return False
     return True
+
+
+#: The three fan-out commands ONE GB propose issues, in the order the head
+#: issues them (multi-rank walker-block port, Plan 4 / design spec "WP5. GB
+#: move fan-out"). Every compute rank -- the head included -- runs all three
+#: on its own walker block against its own B-row ACA, so the command COUNT is
+#: symmetric across ranks even when a block has nothing to do (the head marks
+#: such a block ``payload["neutral"]``; a rank never returns early on its own).
+#: ``gb_run_proposal`` OPENS the per-propose :class:`GBRankSession` and
+#: ``gb_finish`` tears it down.
+GB_OPS = ("gb_run_proposal", "gb_run_tempering", "gb_finish")
+
+
+def _gb_host(obj):
+    """Host-numpy view of a reply value (arrays, dicts and sequences).
+
+    Everything a rank sends back crosses ``mpi4py``'s pickle boundary, so it
+    must not be a device array. Scalars and strings pass through; dicts and
+    sequences are mapped recursively; anything else goes through
+    :func:`_to_numpy` (``asnumpy``).
+    """
+    if obj is None or isinstance(obj, (bool, int, float, str, np.generic)):
+        return obj
+    if isinstance(obj, dict):
+        return {k: _gb_host(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_gb_host(v) for v in obj)
+    return np.asarray(_to_numpy(obj))
+
+
+@dataclass
+class GBRankSession:
+    """One compute rank's state for ONE GB propose, across the three commands.
+
+    The design spec's deliberate departure from "stateless commands": the
+    head runs ``gb_run_proposal`` / ``gb_run_tempering`` / ``gb_finish``
+    strictly sequentially with nothing in between that touches a rank's
+    residual, so the rank can keep its ``BandSorter`` (whose ``orig_*``
+    snapshots ``_write_back_state`` needs), the non-GB residual snapshot and
+    the per-propose caches alive across them. That removes the frozen-label
+    sorter override and the ``d_h``/``h_h`` capture round trip statelessness
+    would otherwise force.
+
+    A session from a PREVIOUS propose scoring against the wrong residual is
+    invisible, so every command after the opening one is checked against
+    :attr:`token` -- the ``(clock["seq"], clock["call_index"])`` pair of the
+    command that opened the session (``seq`` alone does not advance in single
+    mode, so the pair is what actually identifies a propose).
+
+    ``band_sorter is None`` marks a NEUTRAL block (see :attr:`neutral`): the
+    head decided this block runs nothing this propose.
+    """
+
+    #: ``(clock["seq"], clock["call_index"])`` of the opening ``gb_run_proposal``
+    token: tuple
+    #: the propose's RJ ``BandSorter`` (``None`` on a neutral block)
+    band_sorter: object
+    keep_all_inds: bool
+    #: ``|log_like[0] - acs.likelihood()|`` at propose start; the drift checks
+    #: after ``run_proposal`` and after ``run_tempering`` both subtract it
+    start_diffs: object
+    #: the value of ``self.reset_non_gb_linear_data_arr`` for this propose
+    snapshot: object
+    #: the rank's slice ``GFState`` and the working copy the commands mutate
+    part: object
+    new_part: object
+    ntemps: int
+    nwalkers: int
+    #: the per-rank :class:`_ProposeTimer`, shared by all three commands
+    timer: object
+    engine_ntemps: int
+    #: the move attributes ``_enter_rank_block`` saved on the OPENING command.
+    #: Informational: each command restores in its own ``finally``.
+    saved: dict = None
+
+    @property
+    def neutral(self) -> bool:
+        """The head marked this block as having nothing to do."""
+        return self.band_sorter is None
 
 
 # MHMove needs to be to the left here to overwrite GBBruteRejectionRJ RJ proposal method
@@ -16944,6 +17032,768 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             ))
         else:
             self._cap_headroom_deficit = 0
+
+    # ==================================================================
+    # Multi-rank walker-block fan-out -- the RANK side (Plan 4 / WP5).
+    #
+    # ``propose`` is the head orchestrator. Everything below runs on EVERY
+    # compute rank (the head included) over that rank's walker block
+    # ``[w0, w1)`` against that rank's own B-row ACA: one per-propose
+    # :class:`GBRankSession` carried across the three :data:`GB_OPS`
+    # commands. The bodies are the SAME fragments ``propose`` runs, so the
+    # one-compute-rank path stays the single-process path.
+    #
+    # A rank NEVER runs the head's once-per-propose work: no ``setup()`` /
+    # ``_run_fstat_fit`` (no ``DONE.json``, no eigen sidecar), no
+    # ``_adapt_band_temps`` (the band ladder has no walker axis), no
+    # ``_update_band_shutoff`` (a MAX over all N walkers), no cap arming,
+    # no ``_update_band_leaf_caps``, no ``_temper_cadence_fire`` (it mutates
+    # the shared class census, so it must fire exactly once per propose),
+    # and no ``self.time += 1``.
+    # ==================================================================
+
+    #: the run's :class:`~lisatools.globalfit.communication.fanout.WalkerFanout`
+    #: (``None`` single-process)
+    fanout = None
+    #: this process's rank in the run (``None`` single-process)
+    gf_rank = None
+    #: the live :class:`GBRankSession`; ``None`` outside a fanned-out propose
+    _gb_session = None
+
+    @property
+    def fanout_active(self) -> bool:
+        """Is this propose shared by several compute ranks?"""
+        return self.fanout is not None and not self.fanout.single
+
+    def install_walker_fanout(self, curr):
+        """Bind the run's fan-out (``curr.fanout``) and apply the multi-rank rules.
+
+        Same SHAPE as ``moves.walkerfanout.WalkerFanoutMixin``, but GB is
+        deliberately NOT a subclass of it: that mixin owns ``propose`` and
+        serves ONE whole-propose command, which is the wrong shape for GB's
+        three-command session.
+
+        It also does not freeze any ``TemperatureControl``. GB's ladder is
+        the per-band ``band_temps`` array and its adaptation is
+        ``_adapt_band_temps``, which the rank path disables explicitly by
+        passing ``adapt_band_temps=False`` to ``run_tempering`` -- the
+        control's ``adaptive`` flag does not cover it.
+        """
+        self.fanout = getattr(curr, "fanout", None)
+        self.gf_rank = getattr(curr, "rank", None)
+        if not self.fanout_active:
+            return
+        if not self.fanout.is_head and hasattr(self, "eigen_store_path"):
+            self.eigen_store_path = None  # single-writer sidecar (head only)
+
+    # ---- session bookkeeping ------------------------------------------
+    @staticmethod
+    def _gb_session_token(clock):
+        """The token identifying ONE propose's three commands.
+
+        ``(clock["seq"], clock["call_index"])``: ``seq`` does not advance in
+        single mode (``WalkerFanout.run``), so the pair is what actually
+        separates one propose from the next.
+        """
+        clock = clock or {}
+        return (clock.get("seq"), clock.get("call_index"))
+
+    def _rank_tag(self) -> str:
+        """``"[rN] "`` on a fanned-out rank, ``""`` single-process."""
+        return "" if self.gf_rank is None else f"[r{self.gf_rank}] "
+
+    def _gb_require_session(self, payload, op):
+        """The open session for ``payload["session"]``, or raise."""
+        sess = getattr(self, "_gb_session", None)
+        token = (payload or {}).get("session")
+        if sess is None or sess.token != token:
+            have = None if sess is None else sess.token
+            raise RuntimeError(
+                f"stale GB rank session on {op!r} (move {self.name!r}, rank "
+                f"{self.gf_rank}): payload token {token!r} != open session "
+                f"token {have!r}. gb_run_proposal opens the session for a "
+                "propose; gb_run_tempering / gb_finish must carry ITS token."
+            )
+        return sess
+
+    def _rank_block_width(self, payload) -> int:
+        """This command's walker-block width ``B``."""
+        if payload is not None and payload.get("nwalkers") is not None:
+            return int(payload["nwalkers"])
+        part = (payload or {}).get("state")
+        if part is not None:
+            return int(self._work_branch(part).coords.shape[1])
+        sess = getattr(self, "_gb_session", None)
+        if sess is not None:
+            return int(sess.nwalkers)
+        raise ValueError(
+            f"{self.name}: the rank payload carries neither 'nwalkers' nor a "
+            "state slice and no session is open -- cannot size the walker block."
+        )
+
+    #: every attribute ``_enter_rank_block`` overwrites and
+    #: ``_exit_rank_block`` puts back. ``self.nwalkers`` is the load-bearing
+    #: one: it feeds every flat (temp, walker, band) index, so any head-side
+    #: code running between two fan-outs while it still held B would compute
+    #: the wrong cells. A ``try/finally`` around every command is the only
+    #: safe shape.
+    _RANK_BLOCK_SAVED = (
+        "nwalkers", "ntemps", "time", "num_proposals", "_reseed_firing",
+        "temper_vertical", "_cap_leaf_cap", "_band_leaf_cap",
+        "_rj_band_shutoff", "_rank_rng_seed",
+    )
+
+    def _enter_rank_block(self, payload, clock, model):
+        """Bind this rank's ACA and clock for one command; return the saved state.
+
+        Mirrors ``propose``'s prologue for a walker BLOCK: the same three
+        device-binding calls, then ``self.nwalkers = B`` / ``self.ntemps``
+        (which ``propose`` sets from ``work_in.coords.shape``) and the
+        head-shipped clock values, read-only cap/shut-off tables and rank
+        RNG seed. ``self._temper_rng`` is dropped so the vertical-swap
+        Generator is re-created SEEDED from ``_rank_rng_seed``.
+
+        The returned dict goes straight back to :meth:`_exit_rank_block` in
+        a ``finally``; on the head that restores N, and on a pure compute
+        rank the restore is harmless (nothing runs between commands).
+        """
+        acs = model.analysis_container_arr
+        pin_main_device(self.xp, acs.gpus)
+        # Run-time source of truth is the ACA that arrives with the model
+        # (one B-row ACA per rank): refresh the domain quantities and
+        # re-bind the parent engine if this ACA differs from the bound one.
+        self._configure_domain(acs)
+        self._bind_parent_acs(acs)
+
+        branch = self.branch_name
+        saved = {
+            "nwalkers": getattr(self, "nwalkers", None),
+            "ntemps": getattr(self, "ntemps", None),
+            "time": getattr(self, "time", 0),
+            "num_proposals": getattr(self, "num_proposals", 0),
+            "_reseed_firing": getattr(self, "_reseed_firing", False),
+            "temper_vertical": getattr(self, "temper_vertical", False),
+            "_cap_leaf_cap": getattr(self, "_cap_leaf_cap", None),
+            "_band_leaf_cap": getattr(self, "_band_leaf_cap", None),
+            "_rj_band_shutoff": getattr(self, "_rj_band_shutoff", None),
+            "_rank_rng_seed": getattr(self, "_rank_rng_seed", None),
+            # the shared tempering-cadence census is a CLASS dict, not an
+            # attribute: saved here too so a rank command can never leave
+            # the head's census shifted (on the head the shipped value IS
+            # the head's own, so this is a no-op there).
+            "_branch_propose_count": type(self)._branch_propose_counts.get(branch),
+        }
+
+        self.nwalkers = self._rank_block_width(payload)
+        self.ntemps = int(payload["ntemps"])
+        cv = (payload or {}).get("clock_vals") or {}
+        self.time = int(cv.get("time", saved["time"] or 0))
+        self.num_proposals = int(cv.get("num_proposals", saved["num_proposals"] or 0))
+        self._reseed_firing = bool(cv.get("reseed_firing", False))
+        self.temper_vertical = bool(cv.get("temper_vertical", saved["temper_vertical"]))
+        if cv.get("branch_propose_count") is not None:
+            # read by _fstat_clock and _temper_cadence_fire; the head ticks
+            # it ONCE per propose and ships the value
+            type(self)._branch_propose_counts[branch] = int(cv["branch_propose_count"])
+
+        tables = (payload or {}).get("tables") or {}
+        # READ-ONLY on a rank: the head arms, advances and persists them.
+        self._cap_leaf_cap = tables.get("cap_leaf_cap")
+        self._band_leaf_cap = tables.get("band_leaf_cap")
+        self._rj_band_shutoff = tables.get("rj_band_shutoff")
+        self._rank_rng_seed = (payload or {}).get("rank_seed")
+        # re-created SEEDED on first use (see _make_temper_rng); deliberately
+        # NOT restored on exit -- the next command drops it again anyway.
+        self._temper_rng = None
+        return saved
+
+    def _exit_rank_block(self, saved):
+        """Put every attribute :meth:`_enter_rank_block` overwrote back."""
+        if not saved:
+            return
+        for name in self._RANK_BLOCK_SAVED:
+            setattr(self, name, saved[name])
+        count = saved.get("_branch_propose_count")
+        if count is None:
+            type(self)._branch_propose_counts.pop(self.branch_name, None)
+        else:
+            type(self)._branch_propose_counts[self.branch_name] = count
+
+    def _setup_from_directive(self, directive):
+        """The rank-side stand-in for ``setup()``: install epoch tables only.
+
+        ``setup()`` on an F-stat grid move can RUN THE FIT -- an expensive
+        residual-dependent sweep against a walker chosen by a LOCAL
+        ``argmax``, which then writes ``band_peaks_stacked.npz`` and
+        ``DONE.json``. That is head-only work: the head runs ``setup()``
+        first, so by the time a rank serves ``gb_run_proposal`` the epoch
+        directory is complete and this is a pure in-memory load
+        (``_install`` reads the epoch npz; ``_install_ctr_table(model=None)``
+        takes the cheap ``build_fstat_center_table(None, ...)`` branch).
+        The process-global registries make repeats free.
+
+        ``sync_shutoff=False``: ``_install``'s ``_band_shutoff_epoch_sync``
+        would rewrite ``_rj_band_shutoff`` to all-False on a new epoch,
+        silently reviving bands the head has shut off (``run_tempering``
+        reads the valve to drop grid rows). The head owns the valve and
+        ships it.
+
+        No-op on the base class (only ``GBSpecialRJFStatGridMove`` has an
+        ``_install``) and no-op when the head ships no epoch.
+        """
+        if not directive or not hasattr(self, "_install"):
+            return
+        k = directive.get("epoch")
+        if k is None:
+            return
+        k = int(k)
+        # Same process-global memo ``setup()`` consults: another GB move
+        # sharing this fit dir may already hold the epoch on this rank.
+        hit = _FSTAT_GRID_REGISTRY.get(self._epoch_dir(k))
+        if hit is not None:
+            container, epoch, n_peaks = hit
+            logger.info(
+                "%s%s: rank reusing the F-stat birth grid already installed "
+                "in this process (epoch %d, %s peaks).",
+                self._rank_tag(), self.name, epoch, n_peaks,
+            )
+            self.rj_proposal_distribution = container
+            self._fstat_epoch = epoch
+            self._fstat_last_fit_hit = self._epoch_fit_clock(epoch)
+        else:
+            self._install(k, sync_shutoff=False)
+        if directive.get("ctr_table"):
+            # model=None -> npz-only branch, never an F-stat sweep
+            self._install_ctr_table(k, model=None)
+
+    def _make_slice_state(self, payload):
+        """This rank's walker-block ``GFState`` (built by the head).
+
+        ``slice_state(state, w0, w1, sub_states=[branch])`` already produced
+        a self-contained ``GFState`` over ``B`` walkers: the sub-state's
+        tempered ensemble, ``d_h``/``h_h`` and the main-state ``log_like``
+        columns -- everything the bodies touch. ``run_proposal`` and
+        ``run_tempering`` never dereference ``state`` at all; only
+        ``_write_back_state`` / ``_scatter_leaf_products`` / ``_sync_cold_row``
+        and the cap statistics do, and all of those go through
+        ``_work_branch`` and ``sub.d_h``/``h_h``.
+
+        The slice carries NO ``band_info`` (``GBState.slice_walkers`` leaves
+        it unset) -- correct, because nothing on the rank path reads it.
+        """
+        part = (payload or {}).get("state")
+        if part is None:
+            raise ValueError(
+                f"{self.name}: gb_run_proposal payload carries no state slice."
+            )
+        sub = (getattr(part, "sub_states", None) or {}).get(self.branch_name)
+        if sub is None or not getattr(sub, "tempered_initialized", False):
+            raise ValueError(
+                f"{self.name}: the shipped slice has no tempered "
+                f"{self.branch_name!r} sub-state; slice_state must be called "
+                f"with sub_states=[{self.branch_name!r}]."
+            )
+        return part
+
+    # ---- the three commands -------------------------------------------
+    def gf_serve(self, op, payload, clock, model):
+        """Serve one GB fan-out command on a compute rank (see :data:`GB_OPS`)."""
+        if op == "gb_run_proposal":
+            return self._gb_serve_run_proposal(payload, clock, model)
+        if op == "gb_run_tempering":
+            return self._gb_serve_run_tempering(payload, clock, model)
+        if op == "gb_finish":
+            return self._gb_serve_finish(payload, clock, model)
+        raise ValueError(
+            f"move {self.name!r} serves only {GB_OPS}, got {op!r}"
+        )
+
+    def _gb_new_timer(self, model):
+        """``propose``'s per-propose stage timer, per rank."""
+        _tm_sync = None
+        if self.backend.uses_cupy:
+            _tm_sync = _prop_timer_sync_fn(
+                self.xp,
+                getattr(model.analysis_container_arr, "gpus", None),
+                os.environ.get("GB_PROP_TIMING_SYNC", "0"),
+            )
+        return _ProposeTimer(sync_fn=_tm_sync)
+
+    def _gb_neutral_shapes(self, sess):
+        """``(B, ntemps, num_bands)`` for a neutral block's zero replies."""
+        return int(sess.nwalkers), int(sess.ntemps), len(self.band_edges) - 1
+
+    def _gb_serve_run_proposal(self, payload, clock, model):
+        """Open the session and run this block's proposal passes.
+
+        NEUTRAL BLOCKS. ``payload["neutral"]`` means the HEAD decided this
+        block runs nothing this propose; the rank still answers all three
+        commands (command-count symmetry) with zero-valued replies. Those
+        zeros are NOT state: a neutral reply describes "nothing happened",
+        so the head must SKIP the merge for a block it marked neutral --
+        merging ``log_like_cold``/``log_like_final`` from a neutral reply
+        would zero those walkers' likelihood.
+        """
+        saved = self._enter_rank_block(payload, clock, model)
+        try:
+            neutral = bool((payload or {}).get("neutral"))
+            self._setup_from_directive((payload or {}).get("directive"))
+            # The head owns the shut-off valve: re-apply the shipped table
+            # AFTER any epoch install, whose _band_shutoff_epoch_sync would
+            # otherwise have reset it (ordering hazard, spec risk 3).
+            _shut = ((payload or {}).get("tables") or {}).get("rj_band_shutoff")
+            if _shut is not None:
+                self._rj_band_shutoff = _shut
+
+            tm = self._gb_new_timer(model)
+            self._prop_timer = tm
+            self._ladder_dbg_fired = False
+            self._rj_split = {} if self.is_rj_prop else None
+            self._fstat_ctr_fallback_rows = 0
+            if (os.environ.get("GB_BUFFER_PERSIST", "1") != "1"
+                    or getattr(self, "_prop_buffer_cache", None) is None):
+                self._prop_buffer_cache = {}
+            self._prop_buffer_builds = 0
+
+            if neutral:
+                part = (payload or {}).get("state")
+                new_part = None if part is None else GFState(part, copy=True)
+            else:
+                part = self._make_slice_state(payload)
+                new_part = GFState(part, copy=True)
+                assert new_part.log_like is not None
+
+            engine_ntemps = int((payload or {}).get("engine_ntemps") or 0)
+            if not engine_ntemps and part is not None:
+                engine_ntemps = int(part.log_like.shape[0])
+            sess = GBRankSession(
+                token=self._gb_session_token(clock),
+                band_sorter=None,
+                keep_all_inds=bool((payload or {}).get("keep_all_inds", True)),
+                start_diffs=None,
+                snapshot=None,
+                part=part,
+                new_part=new_part,
+                ntemps=int(self.ntemps),
+                nwalkers=int(self.nwalkers),
+                timer=tm,
+                engine_ntemps=engine_ntemps,
+                saved=dict(saved),
+            )
+            self._gb_session = sess
+            if neutral:
+                B, ntemps, nb = self._gb_neutral_shapes(sess)
+                return {
+                    "log_like_cold": np.zeros(B),
+                    "prop_counts": np.zeros((2, ntemps, nb), dtype=int),
+                    "acc_counts": np.zeros((2, ntemps, nb), dtype=int),
+                    "cold_counts": np.zeros((2, 2, B, nb), dtype=int),
+                    "alive_per_temp": [0] * ntemps,
+                    "n_alive": 0,
+                    "start_diffs": np.zeros(B),
+                    "drift": 0.0,
+                    "rj_at_cap": None,
+                    "timing": None,
+                }
+
+            work = self._work_branch(new_part)
+            ntemps = int(self.ntemps)
+            band_temps = self.xp.asarray((payload or {})["band_temps"])
+            self.mempool.free_all_blocks()
+            rj_prop = (
+                None if not self.is_rj_prop
+                else self.rj_proposal_distribution[self.branch_name]
+            )
+            # NOTE: the periodic wrap of the full branch is HEAD work (it has
+            # no walker coupling but must happen once, before the slice).
+            with tm.span("sorter_build"):
+                self._sorter_dh = None
+                self._sorter_hh = None
+                band_sorter = BandSorter(
+                    work,
+                    self.band_edges,
+                    self.band_N_vals,
+                    force_backend=self.force_backend,
+                    transform_fn=self.parameter_transforms,
+                    max_data_store_size=self.max_data_store_size,
+                    gb=self.gb,
+                    gb_wdm_comp=self.gb_wdm_comp,
+                    gb_fd_comp=self.gb_fd_comp,
+                    wdm_band_slab_layers=self.wdm_band_slab_layers,
+                    wdm_slab_guard_layers=self.wdm_slab_guard_layers,
+                    psd_shared_mirror=self.psd_shared_mirror,
+                    psd_mirror_parity_proposes=self.psd_mirror_parity_proposes,
+                    psd_mirror_parity_rows=self.psd_mirror_parity_rows,
+                    waveform_kwargs=self.waveform_kwargs,
+                    rj_prop=rj_prop,
+                    keep_all_inds=sess.keep_all_inds,
+                    opt_snr_rej_samp_limit=self.opt_snr_rej_samp_limit,
+                    snr_rej_detected=self.snr_rej_detected,
+                )
+            sess.band_sorter = band_sorter
+            self._infomat_wdm_logged = False
+            self._tables_indexed = False
+
+            # get non-gb contribution (session-resident: check_ll_inject in
+            # the later commands restores exactly this snapshot)
+            with tm.span("resid_open_close"):
+                self.remove_cold_chain_sources_from_residual(
+                    model, band_sorter, apply_inds=True)
+                self.reset_non_gb_linear_data_arr = self._snapshot_linear_data_arr(
+                    model.analysis_container_arr
+                )
+                self.add_cold_chain_sources_to_residual(
+                    model, band_sorter, apply_inds=True)
+            sess.snapshot = self.reset_non_gb_linear_data_arr
+            with tm.span("ll_checks"):
+                ll_after = model.analysis_container_arr.likelihood()
+            start_diffs = np.abs(new_part.log_like[0] - ll_after)
+            check = ll_after - new_part.log_like[0] - start_diffs
+            logger.debug(f"Start check: {start_diffs=}, {check=}")
+            if not np.abs(check).max() < 1e-4:
+                new_part.log_like[0] = self.check_ll_inject(model, band_sorter)
+                start_diffs = np.abs(new_part.log_like[0] - ll_after)
+            sess.start_diffs = start_diffs
+
+            num_active_leaves = work.inds[0].sum(axis=-1)  # cold chain only
+            logger.info(
+                f"{self._rank_tag()}Number of active leaves before proposal: "
+                f"{num_active_leaves}")
+            st_prop = time.perf_counter()
+            self._replace_accept_forensics = []
+            _reseed_firing = getattr(self, "_reseed_firing", False)
+            _passes = self._cold_reseed_replace_passes() if _reseed_firing else 1
+            _saved_temper_vertical = getattr(self, "temper_vertical", False)
+            if _reseed_firing:
+                self.temper_vertical = True
+            try:
+                with tm.span("run_proposal"):
+                    ll_change_log, prop_counts, acc_counts = self.run_proposal(
+                        model, new_part, band_sorter, band_temps,
+                        scan_schedule=(payload or {}).get("scan_schedule"),
+                    )
+                    for _p in range(1, _passes):
+                        new_part.log_like[0] += _to_numpy(
+                            ll_change_log.sum(axis=-1)[0])
+                        ll_change_log, prop_counts, acc_counts = self.run_proposal(
+                            model, new_part, band_sorter, band_temps,
+                            scan_schedule=(payload or {}).get("scan_schedule"),
+                        )
+            finally:
+                self.temper_vertical = _saved_temper_vertical
+            et_prop = time.perf_counter()
+            _alive_per_temp_post_prop = [
+                int(band_sorter.inds[band_sorter.temp_inds == _t].sum())
+                for _t in range(ntemps)
+            ]
+            logger.info(
+                f"{self._rank_tag()}Alive sources per temp after run_proposal: "
+                f"{_alive_per_temp_post_prop}")
+            logger.info(
+                f"{self._rank_tag()}Runtime of {self.name} proposal is "
+                f"{round(et_prop - st_prop, 3)} seconds.")
+
+            ll_change_sum = ll_change_log.sum(axis=-1)
+            new_part.log_like[0] += _to_numpy(ll_change_sum[0])
+
+            self._debug_sync_all_devices(model)
+            with tm.span("ll_checks"):
+                ll_after = model.analysis_container_arr.likelihood()
+            check = ll_after - new_part.log_like[0] - start_diffs
+            logger.debug(f"After proposal check: {start_diffs=}, {check=}")
+            drift = float(np.abs(check).max())
+            if drift >= 1e-4:
+                logger.warning(
+                    f"{self._rank_tag()}{self.name}: incremental ll drift "
+                    f"{drift:.3e} after proposal; rebuilding log_like from the "
+                    "residual.")
+                try:
+                    _chk = _to_numpy(check)
+                    _off = np.argsort(np.abs(_chk))[::-1][:5]
+                    logger.warning(
+                        f"{self._rank_tag()}{self.name}: drift by walker "
+                        "(top5, LOCAL walker ids): "
+                        + ", ".join(f"w{int(i)}: {float(_chk[int(i)]):+.3e}"
+                                    for i in _off))
+                    _raf = getattr(self, "_replace_accept_forensics", None)
+                    if _raf:
+                        _t = np.concatenate([x[0] for x in _raf])
+                        _w = np.concatenate([x[1] for x in _raf])
+                        _b = np.concatenate([x[2] for x in _raf])
+                        _d = np.concatenate([x[3] for x in _raf])
+                        _c = _t == 0
+                        for i in _off[:3]:
+                            m = _c & (_w == int(i))
+                            logger.warning(
+                                f"{self._rank_tag()}{self.name}: drift "
+                                f"forensics w{int(i)}: {int(m.sum())} cold "
+                                "replace accepts this propose (bands "
+                                f"{sorted(set(_b[m].tolist()))[:8]}), "
+                                f"sum accepted dll {float(_d[m].sum()):+.1f} "
+                                f"vs walker drift {float(_chk[int(i)]):+.3e}")
+                except Exception:
+                    pass
+                with tm.span("ll_inject_drift"):
+                    new_part.log_like[0] = self.check_ll_inject(model, band_sorter)
+
+            _pc, _ac = _to_numpy(prop_counts), _to_numpy(acc_counts)
+            _at_cap = getattr(self, "_rj_at_cap_mask", None)
+            return {
+                "log_like_cold": _gb_host(new_part.log_like[0]),
+                # walker-summed, exactly what accumulate_proposals wants
+                # after a .T: (2, ntemps, num_bands), row 0 = RJ
+                "prop_counts": _pc.sum(axis=2),
+                "acc_counts": _ac.sum(axis=2),
+                # the COLD rows kept per walker for the [GB_ACCEPT] per-walker
+                # decomposition: (2, 2, B, num_bands) = [prop, acc][:, 0]
+                "cold_counts": np.stack([_pc[:, 0], _ac[:, 0]]),
+                "alive_per_temp": [int(x) for x in _alive_per_temp_post_prop],
+                "n_alive": int(sum(_alive_per_temp_post_prop)),
+                "start_diffs": _gb_host(start_diffs),
+                "drift": drift,
+                "rj_at_cap": None if _at_cap is None else int(_to_numpy(_at_cap).sum()),
+                "timing": tm.snapshot(),
+            }
+        finally:
+            self._exit_rank_block(saved)
+
+    def _gb_serve_run_tempering(self, payload, clock, model):
+        """Run this block's band-temperature swaps on the session sorter."""
+        sess = self._gb_require_session(payload, "gb_run_tempering")
+        saved = self._enter_rank_block(payload, clock, model)
+        try:
+            tm = sess.timer
+            self._prop_timer = tm
+            B, ntemps, nb = self._gb_neutral_shapes(sess)
+            if sess.neutral:
+                return {
+                    "log_like_cold": np.zeros(B),
+                    "band_swaps_accepted": np.zeros((nb, ntemps - 1), dtype=int),
+                    "band_swaps_proposed": np.zeros((nb, ntemps - 1), dtype=int),
+                    "ll_change_sum_temp_cold": np.zeros(B),
+                    "drift": 0.0,
+                    "census": None,
+                    "timing": None,
+                }
+            new_part = sess.new_part
+            band_sorter = sess.band_sorter
+            start_diffs = sess.start_diffs
+            band_temps = self.xp.asarray((payload or {})["band_temps"])
+
+            # eryn's scalar ladder counters (unused by GB's band ladder --
+            # pure hygiene, as in propose)
+            self.temperature_control.swaps_accepted = np.zeros(ntemps - 1)
+            self.temperature_control.swaps_proposed = np.zeros(ntemps - 1)
+            band_swaps_accepted = self.xp.zeros((nb, ntemps - 1), dtype=int)
+            band_swaps_proposed = self.xp.zeros((nb, ntemps - 1), dtype=int)
+
+            st_temp = time.perf_counter()
+            with tm.span("ll_checks"):
+                model.analysis_container_arr.likelihood()
+            with tm.span("run_tempering"):
+                (
+                    ll_change_sum_temp,
+                    band_swaps_accepted,
+                    band_swaps_proposed,
+                ) = self.run_tempering(
+                    model, new_part, band_sorter, band_temps,
+                    tmp_start=(payload or {}).get("tmp_start"),
+                    # the band ladder has NO walker axis and is head-owned:
+                    # a rank that adapted it from its own block's swap counts
+                    # would diverge silently
+                    adapt_band_temps=False,
+                )
+            new_part.log_like[0] += _to_numpy(ll_change_sum_temp[0])
+
+            self._debug_sync_all_devices(model)
+            with tm.span("ll_checks"):
+                ll_after = model.analysis_container_arr.likelihood()
+            check = ll_after - new_part.log_like[0] - start_diffs
+            logger.debug(f"After tempering check: {start_diffs=}, {check=}")
+            drift = float(np.abs(check).max())
+            if drift >= 1e-4:
+                logger.warning(
+                    f"{self._rank_tag()}{self.name}: incremental ll drift "
+                    f"{drift:.3e} after tempering; rebuilding log_like from "
+                    "the residual.")
+                try:
+                    _chk = _to_numpy(check)
+                    _off = np.argsort(np.abs(_chk))[::-1][:5]
+                    logger.warning(
+                        f"{self._rank_tag()}{self.name}: tempering drift by "
+                        "walker (top5, LOCAL walker ids): "
+                        + ", ".join(f"w{int(i)}: {float(_chk[int(i)]):+.3e}"
+                                    for i in _off))
+                except Exception:
+                    pass
+                with tm.span("ll_inject_drift"):
+                    new_part.log_like[0] = self.check_ll_inject(model, band_sorter)
+
+            with tm.span("mempool_free"):
+                self.mempool.free_all_blocks()
+            et_temp = time.perf_counter()
+            logger.info(
+                f"{self._rank_tag()}Runtime of {self.name} tempering is "
+                f"{round(et_temp - st_temp, 3)} seconds.")
+            return {
+                "log_like_cold": _gb_host(new_part.log_like[0]),
+                "band_swaps_accepted": _gb_host(band_swaps_accepted),
+                "band_swaps_proposed": _gb_host(band_swaps_proposed),
+                "ll_change_sum_temp_cold": _gb_host(ll_change_sum_temp[0]),
+                "drift": drift,
+                # ``run_tempering``'s GB_TEMPER_SKIP_EMPTY census is a LOCAL
+                # inside that method and is not published on the move today,
+                # so this is None until it is.
+                "census": _gb_host(getattr(self, "_temper_skip_census", None)),
+                "timing": tm.snapshot(),
+            }
+        finally:
+            self._exit_rank_block(saved)
+
+    def _gb_serve_finish(self, payload, clock, model):
+        """Write back, rebuild the residual, export the block and close the session."""
+        sess = self._gb_require_session(payload, "gb_finish")
+        saved = self._enter_rank_block(payload, clock, model)
+        new_band_sorter = None
+        try:
+            tm = sess.timer
+            self._prop_timer = tm
+            B, ntemps, nb = self._gb_neutral_shapes(sess)
+            new_part = sess.new_part
+            if sess.neutral:
+                return self._gb_neutral_finish_reply(sess, B, ntemps, nb)
+
+            band_sorter = sess.band_sorter
+            with tm.span("write_back"):
+                inds_new, alive = self._write_back_state(new_part, band_sorter)
+            # Materialize the alive export to HOST numpy HERE: ``alive`` is a
+            # live reference to ``band_sorter.inds`` and the sorter (and the
+            # device blocks behind it) are released a few lines below.
+            alive_coords = np.asarray(
+                _to_numpy(band_sorter.coords[alive]), dtype=float)
+            alive_twl = np.stack(
+                [np.asarray(_to_numpy(x)).astype(np.int64).ravel() for x in inds_new],
+                axis=1,
+            ) if alive_coords.shape[0] else np.zeros((0, 3), dtype=np.int64)
+            sub = new_part.sub_states[self.branch_name]
+            d_h = np.array(_to_numpy(sub.d_h), copy=True)
+            h_h = np.array(_to_numpy(sub.h_h), copy=True)
+
+            work = self._work_branch(new_part)
+            num_active_leaves = work.inds[0].sum(axis=-1)
+            logger.info(
+                f"{self._rank_tag()}Number of active leaves in cold chain "
+                f"after proposal: {num_active_leaves}")
+
+            sess.band_sorter = None
+            del band_sorter
+            del alive
+            with tm.span("mempool_free"):
+                self.mempool.free_all_blocks()
+            with tm.span("sorter_rebuild"):
+                new_band_sorter = BandSorter(
+                    work,
+                    self.band_edges,
+                    self.band_N_vals,
+                    force_backend=self.force_backend,
+                    transform_fn=self.parameter_transforms,
+                    max_data_store_size=self.max_data_store_size,
+                    gb=self.gb,
+                    gb_wdm_comp=self.gb_wdm_comp,
+                    gb_fd_comp=self.gb_fd_comp,
+                    wdm_band_slab_layers=self.wdm_band_slab_layers,
+                    wdm_slab_guard_layers=self.wdm_slab_guard_layers,
+                    psd_shared_mirror=self.psd_shared_mirror,
+                    psd_mirror_parity_proposes=self.psd_mirror_parity_proposes,
+                    psd_mirror_parity_rows=self.psd_mirror_parity_rows,
+                    waveform_kwargs=self.waveform_kwargs,
+                )
+            self.temperature_control.swaps_accepted = np.zeros(ntemps - 1)
+            self.temperature_control.swaps_proposed = np.zeros(ntemps - 1)
+            with tm.span("mempool_free"):
+                self.mempool.free_all_blocks()
+            with tm.span("band_info"):
+                band_info = new_band_sorter.get_band_info()
+            with tm.span("mempool_free"):
+                self.mempool.free_all_blocks()
+            with tm.span("ll_inject_final"):
+                log_like_final = self.check_ll_inject(model, new_band_sorter)
+
+            # The residual-dependent half of the cap gate, on THIS block. The
+            # head concatenates the walker axis and applies the gate once.
+            # (Verified: nothing here reads ``band_info`` -- the chain is
+            # _band_residual_lls / _window_residual_lls on the ACA and
+            # _cap_cell_source_lls on the sub-state's d_h/h_h -- so the
+            # band_info-free slice is enough.)
+            cap_stats = (
+                self._cap_stats_local(model, new_part)
+                if (payload or {}).get("want_cap_stats") else None
+            )
+            # NOTE: no per-rank ``[GB_TIMING]`` line here. The propose's wall
+            # clock is the HEAD's (it spans the three fan-outs), so a rank has
+            # no honest ``total`` to report against; the head prints the one
+            # merged line from the ``timing`` snapshots, and per-command load
+            # balance is already in fanout.py's ``[FANOUT]`` line.
+            return {
+                "alive_coords": alive_coords,
+                # (temp, LOCAL walker, leaf) of every written leaf
+                "alive_twl": alive_twl,
+                "d_h": d_h,
+                "h_h": h_h,
+                "band_counts": _gb_host(band_info["band_counts"]),
+                "log_like_final": _gb_host(log_like_final),
+                "cap_stats": _gb_host(cap_stats),
+                "fstat_ctr_fallback_rows": int(
+                    getattr(self, "_fstat_ctr_fallback_rows", 0)),
+                "band_dof": _gb_host(getattr(self, "_band_dof", None)),
+                "rj_split": _gb_host(getattr(self, "_rj_split", None)),
+                "replace_census": _gb_host(getattr(self, "_replace_split", None)),
+                "timing": tm.snapshot(),
+            }
+        finally:
+            # session teardown: the next propose opens a fresh one
+            try:
+                if new_band_sorter is not None:
+                    del new_band_sorter
+                self._buffer_cache_teardown()
+                # the per-unit F-stat NM lane adapter pins the reference
+                # walker's rows on every device until it is released
+                self._fstat_nm_lanes = None
+            finally:
+                self._gb_session = None
+                self._exit_rank_block(saved)
+
+    def _gb_neutral_finish_reply(self, sess, B, ntemps, nb):
+        """Zero reply for a block the head marked neutral (nothing happened)."""
+        ndim, nleaves = 0, 0
+        d_h, h_h = np.zeros((B, 0)), np.zeros((B, 0))
+        if sess.new_part is not None:
+            branch = self._work_branch(sess.new_part)
+            ndim = int(branch.coords.shape[-1])
+            nleaves = int(branch.coords.shape[-2])
+            sub = (getattr(sess.new_part, "sub_states", None) or {}).get(
+                self.branch_name)
+            if sub is not None and getattr(sub, "d_h", None) is not None:
+                d_h = np.array(_to_numpy(sub.d_h), copy=True)
+                h_h = np.array(_to_numpy(sub.h_h), copy=True)
+            else:  # "nothing recorded" is the sub-state's own sentinel
+                d_h = np.full((B, nleaves), np.nan)
+                h_h = np.full((B, nleaves), np.nan)
+        return {
+            "alive_coords": np.zeros((0, ndim)),
+            "alive_twl": np.zeros((0, 3), dtype=np.int64),
+            "d_h": d_h,
+            "h_h": h_h,
+            "band_counts": np.zeros((ntemps, B, nb), dtype=int),
+            "log_like_final": np.zeros(B),
+            "cap_stats": None,
+            "fstat_ctr_fallback_rows": int(
+                getattr(self, "_fstat_ctr_fallback_rows", 0)),
+            "band_dof": None,
+            "rj_split": None,
+            "replace_census": None,
+            "timing": None,
+        }
 
     def propose(self, model, state):
         """Use the move to generate a proposal and compute the acceptance
