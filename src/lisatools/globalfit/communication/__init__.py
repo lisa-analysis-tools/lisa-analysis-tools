@@ -11,6 +11,15 @@ head-directed commands, and the unchanged saver rank. See
 """
 
 from .fakecomm import FakeAbort, FakeComm, FakeCommNull, FakeWorld
+from .ranks import (
+    LEGACY_ENV,
+    RankPlacement,
+    RankRole,
+    WalkerBlockLayout,
+    build_layout,
+    derive_rank_seed,
+    resolve_roles,
+)
 from .walkerslice import WALKER_INDS_KEY, merge_state, slice_state
 
 __all__ = [
@@ -21,4 +30,11 @@ __all__ = [
     "FakeComm",
     "FakeCommNull",
     "FakeWorld",
+    "LEGACY_ENV",
+    "RankPlacement",
+    "RankRole",
+    "WalkerBlockLayout",
+    "build_layout",
+    "derive_rank_seed",
+    "resolve_roles",
 ]
