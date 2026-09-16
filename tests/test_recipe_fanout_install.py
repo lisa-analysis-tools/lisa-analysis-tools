@@ -27,7 +27,8 @@ class FanoutInstallTest(unittest.TestCase):
         #   - GB/VGB (build_gb_moves: 13 GBSpecial* moves + the ridge move;
         #     build_vgb_moves: the vgb move): 15
         src = open(recipe_mod.__file__).read()
-        self.assertEqual(src.count("install_walker_fanout(curr)"), 18)
+        # the gb_ridge_gibbs move is a plain eryn move (head-only): no install
+        self.assertEqual(src.count("install_walker_fanout(curr)"), 17)
 
 
 if __name__ == "__main__":

@@ -19,7 +19,9 @@ class GBLocalSizingTest(unittest.TestCase):
         self.assertIn("nwalkers_local = _local_nwalkers(acs)", body)
         # every move-level size reads the local count ...
         self.assertEqual(body.count("np.zeros((ntemps, nwalkers))"), 0)
-        self.assertEqual(body.count("np.zeros((1, nwalkers))"), 0)
+        # the ONE remaining global-width accepted array is gb_ridge_gibbs: a plain
+        # eryn move that runs head-only on the full engine state under fan-out
+        self.assertEqual(body.count("np.zeros((1, nwalkers))"), 1)
         self.assertGreaterEqual(body.count("np.zeros((ntemps, nwalkers_local))"), 13)
         self.assertIn("nfriends=nwalkers_local", body)
         self.assertRegex(body, r"TemperatureControl\(\s*effective_ndim,\s*nwalkers_local")

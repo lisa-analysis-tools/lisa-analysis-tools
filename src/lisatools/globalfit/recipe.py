@@ -3694,8 +3694,11 @@ def build_gb_moves(
                 os.environ.get("GB_RIDGE_GIBBS_LEAF_FRACTION", "1.0")),
         )
         _ridge.name = "gb_ridge_gibbs"
-        _ridge.accepted = np.zeros((1, nwalkers_local))
-        _ridge.install_walker_fanout(curr)
+        # A plain eryn move (coords only, zero likelihood calls): under several
+        # compute ranks it runs HEAD-ONLY on the full engine state, so its
+        # accepted array is engine-wide and it takes no fan-out install (the
+        # readiness guard lists it as head-only).
+        _ridge.accepted = np.zeros((1, nwalkers))
         gb_search_moves = list(gb_search_moves) + [_ridge]
         gb_pe_moves = list(gb_pe_moves) + [_ridge]
         logger.info("build_gb_moves: gb_ridge_gibbs registered (leaf_fraction "
