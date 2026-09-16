@@ -1,4 +1,5 @@
-"""MoveBuildContext exposes the rank layout / fan-out; GlobalFitMove.gf_serve defaults to 'not served'."""
+"""MoveBuildContext exposes the rank layout / fan-out; GlobalFitMove.gf_serve
+defaults to 'not served'."""
 
 import unittest
 
@@ -31,7 +32,10 @@ class MoveBuildContextLayoutTest(unittest.TestCase):
     def test_explicit_fields_win(self):
         curr = _Curr(rank_layout="LAYOUT", fanout="FANOUT", rank=3)
         ctx = self._ctx(curr, layout="MINE", rank=0, state_local="SLICE")
-        self.assertEqual((ctx.layout, ctx.fanout, ctx.rank, ctx.state_local), ("MINE", "FANOUT", 0, "SLICE"))
+        self.assertEqual(
+            (ctx.layout, ctx.fanout, ctx.rank, ctx.state_local),
+            ("MINE", "FANOUT", 0, "SLICE"),
+        )
 
 
 class _PlainMove(GlobalFitMove):
