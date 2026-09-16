@@ -65,6 +65,48 @@ Same run, 1 GPU vs 2 GPUs, ~500 iterations:
 - `GB_MEMPOOL_FREE_EACH_ROUND=0` (default) vs `=1`: the `mempool_free`
   stage time should collapse at 0 with no OOM on the production config.
 
+## Addendum (2026-09): multi-rank walker-block port
+
+The gates above validate the **in-process multi-GPU router** — one process
+switching cupy contexts across several devices. That router is still live
+code and still exercised, but which of its paths run depends on the rank
+layout (`docs/global-fit-launch.md`; design spec
+[`docs/superpowers/specs/2026-09-15-multirank-walker-blocks-design.md`](superpowers/specs/2026-09-15-multirank-walker-blocks-design.md),
+Decision 12):
+
+- **At `-n 1`** (or any layout where a lone compute rank owns its node's
+  whole GPU pool, the AUTO `gpus_per_rank` resolution): the router runs
+  exactly as validated by Gates 1-4 above, unchanged. A plain single-process
+  `GPUS=0,1 python scripts/run_global.py --stock <name>` still exercises
+  both devices this way.
+- **Under several compute ranks** (`mpiexec -n <k>` with `k >= 2` compute
+  ranks): each rank's `AnalysisContainerArray` is single-device by default
+  (`gpus_per_rank=1`), so the router runs in its exonerated single-shard
+  passthrough form on every rank — the band-grouped shard assignment,
+  same-shard swap fast path, and per-GPU temperature permutation this
+  runbook validates are simply not exercised (there is nothing to shard).
+  Reproducing Gate 2's literal "2-GPU assembly" command as multi-device
+  under this layout now additionally requires `GPUS_PER_RANK=2` (or
+  `RANKS_PER_GPU`, for sharing rather than multi-device ownership) — a bare
+  `GPUS=0,1` at `np=1` still means one rank driving both devices, exactly as
+  these gates assume.
+- **`gpus_per_rank > 1` with several compute ranks** (a rank owning more
+  than one device while other ranks exist) is layout-supported but
+  **unvalidated** by either this runbook or the multi-rank port: it
+  re-enables the in-process cross-device paths *inside* a rank, and the
+  09-15 audit that motivated walker-block sharding in the first place
+  (ambiguous `cp.asarray` cross-device semantics, an unfixed
+  `BandView._scatter` bug, an unguarded SOBBH cross-device assertion) is an
+  explicit prerequisite before anyone runs it in that configuration (design
+  spec, Risks).
+
+**New runbook for the rank axis itself** — transport parity across layouts,
+the statistical gate against today's in-process 2-GPU run, and the
+load-balance/payload-size measurements — lives separately in
+[`docs/multirank-cluster-gates.md`](multirank-cluster-gates.md). Run this
+document's Gates 1-4 first (single-rank multi-GPU router still correct),
+then that runbook for the multi-rank transport and statistics gates.
+
 ## Deliberately left for cluster iteration (measure first)
 
 - **BandView index-resolution caching**: `_resolve_array` does host

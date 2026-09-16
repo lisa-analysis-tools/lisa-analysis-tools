@@ -1,26 +1,114 @@
 # Launching the global fit (processes, ranks, GPUs)
 
-*(2026-07: parallel-resources plan P0. See the approved plan for the full
-architecture assessment and later phases.)*
+*(2026-07: parallel-resources plan P0 established the process model below.
+2026-09: the multi-rank walker-block port — one MPI rank per GPU, walker
+blocks sharded across compute ranks — replaced the single-process
+multi-GPU model as the default. Full architecture:
+[`docs/superpowers/specs/2026-09-15-multirank-walker-blocks-design.md`](superpowers/specs/2026-09-15-multirank-walker-blocks-design.md).
+Cluster validation runbook: [`docs/multirank-cluster-gates.md`](multirank-cluster-gates.md).)*
 
-The global fit separates its two parallel axes:
+## The model
 
-- **GPUs are intra-node and knob-controlled** — one python process (the main
-  rank) drives all local devices through the `AnalysisContainerArray` split
-  machinery. `GPUS=0,1,...` (or `fit.general.gpus=[...]`) selects them;
-  `USE_GPU=0` forces CPU. GPU count never changes the MPI layout.
-- **MPI ranks are process roles** — resolved by
-  `GlobalFit.resolve_rank_roles(comm, main_rank)`:
+Each MPI rank owns a **walker block**: a fixed, equal-sized slice of the
+ensemble's walkers, its own `AnalysisContainerArray` (one device, by
+default), and — for every rank except the saver — a copy of the built recipe.
+Fan-out lives inside the moves: a move's `propose` slices the full state into
+per-rank blocks, ships each block to its rank, and merges the replies back
+(`src/lisatools/globalfit/communication/`, `moves/walkerfanout.py`, the GB/VGB
+three-command protocol in `moves/gbspecialstretch.py`). With exactly one
+compute rank this collapses to a direct in-process call — no MPI traffic, no
+pickling, bit-identical to the pre-port single-rank code
+(`communication/ranks.py` module docstring; design spec Decision 9).
 
-| np | layout |
-|---|---|
-| 1 | main rank does everything; HDF5 saves are synchronous. |
-| 2 | rank 1 is a spare: it is sent `"stop"` at startup and exits (no build). Saves stay synchronous on main. |
-| ≥3 | the highest rank becomes the **dedicated saver rank** (asynchronous HDF5 writes off the sampler's critical path); remaining spares are stopped at startup. |
+## Roles
 
-Spare ranks never pay the data build: `scripts/run_global.py` resolves the
-roles *before* building, so only the main rank (and the saver at np≥3)
-construct the heavy `GlobalFitSetup` (formerly `CurrentInfoGlobalFit`).
+- **HEAD** (rank 0 by default, i.e. `main_rank`): sequences the recipe via
+  eryn's `run_mcmc`, owns the full host `GFState`, and **also computes**
+  walker block 0 like any other compute rank.
+- **COMPUTE**: owns a device list and one walker block; runs the
+  `ComputeService` command loop (`comm.recv` is the clock; `{"op": "stop"}`
+  exits). One rank per GPU by default.
+- **SAVER**: the highest-numbered rank in the communicator, *only* at
+  communicator size ≥ 3 (`resolve_roles`); writes HDF5 asynchronously, off
+  the sampler's critical path. Below size 3 the saver role is aliased to the
+  head — saves happen synchronously, exactly like a single-rank run.
+- **SPARE**: exists only under `GF_LEGACY_RANK_LAYOUT=1` — builds like every
+  other rank, then is sent `"stop"` at startup and exits without computing
+  anything.
+
+(`communication/ranks.py::resolve_roles`/`build_layout`; `run.py`'s
+`role`/`RankRole` dispatch in `run_global_fit`.)
+
+## The `np` matrix
+
+`n_compute` is the number of COMPUTE ranks (HEAD included); it is what
+`NWALKERS` must divide evenly. Two settings shape the rank↔GPU mapping:
+`gpus_per_rank` (a rank owns several devices, sharded in-process by the
+existing multi-GPU router) and `ranks_per_gpu` (several ranks share one
+device); at most one of the two may exceed 1.
+
+| `np` | Per-node GPU pool | Resulting layout |
+|---|---|---|
+| 1 | any | One rank: HEAD = SAVER = the only COMPUTE rank. AUTO `gpus_per_rank` resolves to the whole pool (today's single-process multi-GPU behavior, unchanged). |
+| 2 | 1 GPU | Capacity fallback: rank 1 is demoted to dedicated SAVER with a `UserWarning` (`build_layout`'s `size == 2` branch); the head computes every walker, identical to `np=1`. |
+| 2 | ≥2 GPUs, or 1 GPU with `RANKS_PER_GPU=2` | Two COMPUTE ranks (head + rank 1), **no dedicated saver** — the saver role is aliased to the head, so saves are synchronous. |
+| 3 | 2 GPUs | Head + 1 COMPUTE rank + 1 dedicated SAVER (rank 2), one device each. |
+| 5 | 2 nodes × 2 GPUs | 4 COMPUTE ranks (one per GPU; AUTO `gpus_per_rank` resolves to 1 per node because more than one compute rank shares each node) + 1 dedicated SAVER. Launch with `srun --distribution=cyclic` so ranks land on both nodes. |
+
+Only `np=2` gets a silent capacity fallback. At `np ≥ 3`, asking for more
+COMPUTE ranks on a node than its GPU pool can host
+(`len(pool) * ranks_per_gpu // gpus_per_rank`) is a hard `ValueError` from
+`build_layout` — there is no silent fallback above size 2
+(`ranks.py::build_layout`, the per-node `capacity` check under
+`if pool and not legacy`). `NWALKERS % n_compute != 0` is likewise a hard
+error, not a rounding fallback, when driven directly through `build_layout`
+(the campaign submit script rounds `NWALKERS` up instead — see below).
+
+## Knobs
+
+| Knob | Default | Effect |
+|---|---|---|
+| `GPUS` | unset (CUDA sees whatever's visible) | The **per-node** device pool (`fit.general.gpus`) that `build_layout` partitions across the node's compute ranks. Not itself a rank count. |
+| `GPUS_PER_RANK` | AUTO (`None`) | AUTO: a lone compute rank on a node owns the whole per-node pool (today's `-n 1` multi-GPU behavior, `gpus_per_rank = len(pool)`); with several compute ranks on a node AUTO instead gives each one device (`gpus_per_rank = 1`). An explicit int pins it on every node: that many devices per compute rank, sharded in-process by the existing multi-GPU router (`gpu_splits`/`BandView`). Supported by the layout but **not yet validated** at `> 1` with several ranks (see `docs/multigpu-cluster-validation.md`'s addendum). |
+| `RANKS_PER_GPU` | 1 | That many compute ranks share each device, each with its own CUDA context and memory pool (`device_slot` distinguishes them on that device). |
+| `NWALKERS` | variant default | Must be a multiple of `n_compute`; `build_layout` raises otherwise. Rank *r*'s block is `[r*B, (r+1)*B)` in compute-rank order, `B = NWALKERS / n_compute`. |
+| `GF_LEGACY_RANK_LAYOUT` | `0` at the layout level (`ranks.py`'s own default); the campaign submit script keeps `1` at `NGPUS=2` until the WP7 gates pass (see below) | `1` restores today's pre-port roles: one compute rank owns the whole per-node pool, every other non-saver rank is a stopped SPARE. Rollback knob (design spec Risks). |
+| `GF_LAYOUT_DRY_RUN` | unset | Preflight: every rank prints `layout.describe()` and the process exits **before** `fit.build()` allocates anything; a genuinely bad layout still raises inside `build_layout`/`prepare_rank` (Plan 5 Task 2 of this port — see `docs/multirank-cluster-gates.md`'s Step 0 for the exact invocation). |
+| `GF_FANOUT_DIGEST` | unset | Emits a per-iteration `[FANOUT_DIGEST]` residual-hash line, the cluster-gate tool for diffing two layouts for bit-identical transport (Plan 5 Task 4 of this port — see `docs/multirank-cluster-gates.md`'s Step 1). |
+
+`GF_LAYOUT_DRY_RUN` and `GF_FANOUT_DIGEST` are part of the same multi-rank
+port as this document; if your checkout predates Plan 5 Tasks 2/4 they are
+not yet wired into the drivers — `docs/multirank-cluster-gates.md` states
+which of its steps depend on them.
+
+## Every rank builds
+
+`prepare_rank(fit, comm)` runs **before** `fit.build()` in both drivers
+(`scripts/run_global.py`, `scripts/fstat_proposal/run_combined_staged.py`):
+it resolves the layout, pins `CUDA_VISIBLE_DEVICES` (or falls back to
+`cudaSetDevice`) on this rank, and writes `fit.rank_layout` /
+`fit.general.gpus` (narrowed to this rank's device list) before any CUDA
+call. Every rank then calls `fit.build()` — HEAD, COMPUTE, SAVER, and (under
+the legacy layout) SPARE all construct the full data pipeline; only the
+walker-block *size* of each rank's `AnalysisContainerArray` differs (design
+spec Decision 4). There is no "spare that never builds" any more except
+under `GF_LEGACY_RANK_LAYOUT=1`, and even the legacy spare builds, then
+releases its device memory and waits for the startup `"stop"`.
+
+## Per-rank log files and stdout prefixes
+
+The head keeps today's log file names: `globalfit_run.log` /
+`global_fit.log`. Every other rank gets `globalfit_run.rank<k>.log` /
+`global_fit.rank<k>.log` (`run.py::_rank_log_filenames`).
+
+Stdout tag format (`communication/ranks.py::rank_tag`): `r<k>/head` (HEAD),
+`r<k>/c<i>` (COMPUTE, `i` = the rank's 0-based position among compute
+ranks — usually equal to its world rank), `r<k>/saver` (SAVER), `r<k>/spare`
+(legacy SPARE). Only **non-head** ranks actually get their stdout lines
+wrapped in `[tag] ` (`run.py`: `if self.rank != self.main_rank:
+prefix_stdout(rank_tag(...))`) — the head's own console output is never
+prefixed, though its tag still appears inside its own log text. A log/stdout
+grep for a specific rank's output should match `^\[r<k>/`.
 
 ## Commands
 
@@ -28,35 +116,44 @@ construct the heavy `GlobalFitSetup` (formerly `CurrentInfoGlobalFit`).
 # single process (laptop / driver-script development)
 python scripts/run_global.py --stock <name>
 
-# canonical cluster entry: main + dedicated saver
-mpiexec -n 3 python scripts/run_global.py --stock <name>
+# one rank per GPU on a 2-GPU node: head + 1 compute + 1 saver
+GPUS=0,1 mpiexec -n 3 python scripts/run_global.py --stock <name>
 
-# Slurm
-srun -n 3 --gpus-per-node=<G> python scripts/run_global.py --stock <name>
+# two compute ranks sharing one GPU (no second device required)
+GPUS=0 RANKS_PER_GPU=2 mpiexec -n 3 python scripts/run_global.py --stock <name>
 
-# multi-GPU on one node (GPU count is independent of -n)
-GPUS=0,1 mpiexec -n 3 python scripts/run_global.py --stock all_sources
+# 2 nodes x 2 GPUs -> 4 compute ranks + 1 saver
+srun -N 2 --gres=gpu:2 --ntasks=5 --distribution=cyclic \
+  python scripts/run_global.py --stock <name>
+
+# preflight only: print the layout on every rank, build nothing
+GF_LAYOUT_DRY_RUN=1 mpiexec -n 3 python scripts/run_global.py --stock <name>
 ```
 
 A python driver is equivalent — rank logic lives in `GlobalFit`, not the CLI:
 
 ```python
 from lisatools.globalfit.stock import erebor
+from lisatools.globalfit.communication.ranks import prepare_rank
+from mpi4py import MPI
+
 fit = erebor.all_sources(nwalkers=36)
+prepare_rank(fit, MPI.COMM_WORLD)   # BEFORE build(): resolves layout, pins the device
 fit.build()
-fit.run()          # np=1; run under mpiexec for the saver-rank layout
+fit.run()          # every rank in the communicator takes its role
 ```
 
 Common env knobs: `NWALKERS`, `NTEMPS`, `NUM_ITERATIONS`, `DATA_MODE`
-(`mojito`/`synthetic`), `TOBS_TARGET`, `MAKE_DIAGNOSTIC_PLOTS`, `GPUS`, `USE_GPU`,
-`GPU_BACKEND`, `VERBOSE`.
+(`mojito`/`synthetic`), `TOBS_TARGET`, `MAKE_DIAGNOSTIC_PLOTS`, `GPUS`,
+`GPUS_PER_RANK`, `RANKS_PER_GPU`, `USE_GPU`, `GPU_BACKEND`, `VERBOSE`,
+`GF_LEGACY_RANK_LAYOUT`.
 
 **Console output is quiet by default.** Everything is still logged to the
 run's log files (`…_artifacts/global_fit.log`, `globalfit_run.log`,
-`general_setup.log`); only warnings/errors reach the console. Set
-`verbose=True` at construction (`erebor.<variant>(verbose=True)`, a headline
-knob — or `VERBOSE=1`) to stream the logs to stdout and turn the progress
-bars (eryn sampler, per-stage combine, move-internal) back on.
+`general_setup.log`, and their per-rank counterparts above); only
+warnings/errors reach the console. Set `verbose=True` at construction
+(`erebor.<variant>(verbose=True)`, a headline knob — or `VERBOSE=1`) to
+stream the logs to stdout and turn the progress bars back on.
 
 **Threading policy (2026-07): MPI-only — no OMP.** `run_global.py` pins
 `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `MKL_NUM_THREADS` /
@@ -65,6 +162,113 @@ bars (eryn sampler, per-stage combine, move-internal) back on.
 comes from MPI ranks and, when configured, GPUs. Set the env vars
 explicitly to override; python drivers that bypass `run_global.py` should
 pin them the same way before importing numpy/lisatools.
+
+## Campaign submit scripts: the NGPUS dispatch
+
+`scripts/fstat_proposal/submit_gf_6mo_v8.sh` (and its `_nogb`/`_nogb_null`
+siblings) resolve the rank count from a GPU-count knob rather than a fixed
+`--ntasks`. Run the script **directly** (not via a bare `sbatch`) so its
+self-dispatch block can pick the partition/node/task-count and resubmit
+itself:
+
+```sh
+NGPUS=2 ./submit_gf_6mo_v8.sh      # gpu-80-spot, 1 node x gpu:2 (default)
+NGPUS=4 ./submit_gf_6mo_v8.sh      # gpu-80-spot, 2 nodes x gpu:2 each
+sbatch  ./submit_gf_6mo_v8.sh      # legacy flow: static header defaults
+                                    #   (2 GPUs, gpu-80-spot, --ntasks=3)
+```
+
+- `NGPUS=2`: `gpu-80-spot`, 1 node, `--gres=gpu:2`. `GF_LEGACY_RANK_LAYOUT`
+  defaults to `1` — the campaign stays on today's roles (one compute rank
+  drives both GPUs, rank 1 a stopped spare, rank 2 the saver;
+  `mpiexec -n 3`) until the WP7 cluster gates pass, byte-identical in effect
+  to the pre-port launch.
+- `NGPUS=4`: `gpu-80-spot`, **2 nodes** × `--gres=gpu:2`,
+  `--distribution=cyclic` — the cluster's real 4-GPU shape (there is no
+  single 4-GPU node). `GF_LEGACY_RANK_LAYOUT` is **forced to `0`**
+  regardless of any pre-set value, because the legacy layout cannot span
+  nodes.
+- `N_COMPUTE = NGPUS * RANKS_PER_GPU / GPUS_PER_RANK` (`GPUS_PER_RANK` empty
+  counts as 1 for this arithmetic — AUTO resolution itself happens inside
+  `build_layout`); the self-resubmission passes `--ntasks=$((N_COMPUTE+1))`
+  explicitly (the saver) — the static `#SBATCH --ntasks=3` header line is
+  only the legacy/manual-`sbatch` fallback.
+- In-job, `_NGPUS_EFF` follows `SLURM_GPUS_ON_NODE` (the granted truth, not
+  the pre-submit `NGPUS` intent) and `N_COMPUTE_EFF` is recomputed the same
+  way, pinned to `1` under `GF_LEGACY_RANK_LAYOUT=1`.
+- `NWALKERS % N_COMPUTE_EFF`: when non-legacy and the check fails, the
+  script **rounds `NWALKERS` up** to the next multiple and prints a loud
+  `[SUBMIT]` line rather than failing — `build_layout` itself would raise.
+  Its default `NWALKERS=10` is not divisible by `N_COMPUTE=4` at `NGPUS=4`,
+  so a first 4-GPU launch rounds to 12 unless `NWALKERS` is set explicitly.
+- Launch line: `srun --ntasks=$SLURM_NTASKS --distribution=cyclic ...` when
+  `SLURM_NNODES > 1`, else `mpiexec -n ${SLURM_NTASKS:-3} ...`.
+- Under the new default layout, `np=3` on a 2-GPU pool puts a real compute
+  rank on each GPU; under the old legacy layout rank 1 was a stopped spare
+  that occupied a device without using it.
+
+## Semantics that change only when several compute ranks exist
+
+These are accepted, intentional differences from single-rank behavior — see
+the design spec's "Semantics that change only when `n_compute > 1`" and the
+Plan 3/4 fan-out mixins' module docstrings for the code-level detail.
+
+- **Ladder adaptation is pooled, once per propose.** Eryn ladders (addremove
+  MBH/EMRI/SOBBH, PSD/galfor/sgwb) adapt ONCE per propose from the pooled
+  swap ratio (sum accepted / sum proposed over ranks and repeats); `tc.time`
+  advances once per propose instead of once per repeat. Ranks never adapt
+  their own copy — only the head does, after merging
+  (`moves/walkerfanout.py` module docstring; `pooled_ladder_step`). GB's
+  `band_temps` cadence is unchanged (it already adapted once per propose),
+  but the swap counters it adapts from are now summed across ranks by the
+  head orchestrator before the one `_adapt_band_temps` call (design spec
+  line 234; WP5 Architecture, fan-out 2 merge step).
+- **Mid-iteration checkpoint granularity** for the addremove family drops
+  from per-leaf to per-propose (the per-leaf `midit_checkpoint.maybe_write`
+  is guarded off inside a rank body and moved to the head's merge step).
+- **Eigen, info-matrix and F-stat reference tables are rank-local
+  proposal-shaped tables** (still valid MH); the eigen sidecar is written by
+  the head only. `GB_INFOMAT_PER_BLOCK=1` (`infomat_per_block`) retires the
+  old cross-device info-matrix borrow. GB's frequency-window friend table
+  (`BandSorter.build_friend_table`) is likewise rank-local, built from the
+  rank's own walker block only.
+- **Stretch complements are the rank's local block.** PSD `RedBlue` splits,
+  the optional VGB `stretch` kind, and `MBH_INNER_MOVE_KIND=stretch` all draw
+  their complement from the local block, not the full ensemble — stretch
+  proposals were explicitly ruled out of scope for this port (design spec
+  Decision 7).
+- **PSD search-mode termination is per block.** `PSDMove.run_move_max_likelihood`
+  plateaus on the RANK's walker-block maximum, not a pooled maximum across
+  ranks (pooling it would need an in-body collective; deferred).
+- **The PSD ladder's swap population differs by mode.** The pooled
+  adaptation consumes `PSDMove.run_move`'s explicit `temperature_swaps`
+  tallies (fancy swaps included); single-rank mode instead adapts from
+  eryn `RedBlueMove.propose`'s identity `temper_comps` swaps. Both are valid
+  acceptance ratios; the swap population feeding the ladder differs between
+  the two modes.
+- **`move.temperature_control.swaps_accepted`** — what eryn stores to the
+  HDF backend — is the HEAD block's count only; the pooled/summed counters
+  that actually drive adaptation live in the sub-state. Diagnostic-only
+  field; nothing reads the HDF-stored copy back.
+- **No cross-rank tempering swaps in the base port.** GB/VGB in-band cell
+  tempering (`run_tempering`) stays strictly within a rank — the swap unit
+  is device-resident slab state and cross-rank exchange was assessed as very
+  hard (design spec, "Cross-rank swaps: assessment"); `[GB_TEMPER_CHECK ...]`
+  is logged per rank, each rank checking only its own census/device accept
+  counters. Cross-rank fancy swaps for the *non*-GB, non-VGB moves (MBH,
+  EMRI, SOBBH, PSD/galfor/sgwb) are WP8's scope (`cross_rank_swaps`, default
+  off) — GB and VGB keep a `# TODO(multi-rank)` marker either way.
+- **No end-of-run submission dump under several compute ranks.**
+  `GlobalFit._write_submission` returns early with a `logger.warning` when
+  `not layout.is_single()`: the head's ACA holds only its own walker block,
+  so the residual dump would be wrong over the full ensemble. An explicit
+  `TODO(multi-rank)` marks the gap in the warning text itself; routing the
+  submission writer through the fan-out is unscoped follow-up work.
+- **Per-rank accept-split log lines.** `[GB_ACCEPT rj-split ...]` (and the
+  analogous replace-split line) is now printed once per compute rank, into
+  that rank's own log file — a monitor/digest tool that only reads the
+  head's `globalfit_run.log` sees just the head block's births, not the
+  whole ensemble's.
 
 ## Debug-plot instrumentation (per-move residual tracing)
 
@@ -114,3 +318,7 @@ materialization through ``GlobalFitMove.set_debug(...)`` (options:
 - The saver currently writes gzip-9 HDF5 and does not yet plot; moving the
   diagnostic plot set onto it (with saves-take-priority backpressure) is
   plan phase P2.
+- `GlobalFit.resolve_rank_roles` is kept as a legacy-compat wrapper for old
+  callers of the `(main_rank, results_rank, spare_ranks)` shape; its
+  `spare_ranks` return is always `[]`, including under the legacy layout —
+  use `layout.role_of(rank)` / `layout.compute_ranks` for anything new.
