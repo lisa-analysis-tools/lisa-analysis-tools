@@ -38,10 +38,16 @@ def pooled_ladder_step(tc, betas0, acc, prop):
     """One head-side ladder adaptation from pooled swap tallies; advances ``tc.time``.
 
     Returns the new ladder (``betas0`` when the control is not configured
-    adaptive, has one rung, is past ``stop_adaptation``, or has no proposals).
-    Mirrors ``TemperatureControl.adapt_temps`` (Eryn tempering.py ~867-897) with
-    ``ratios = acc / prop`` supplied by the caller.
+    adaptive, has one rung, is past ``stop_adaptation``, or ANY rung has zero
+    proposals -- stricter than Eryn, which would divide by zero). Mirrors
+    ``TemperatureControl.adapt_temps`` (Eryn tempering.py ~867-897) with
+    ``ratios = acc / prop`` supplied by the caller; ``tc.time`` advances once
+    per call regardless (the spec's "once per propose"), where Eryn advances
+    it only while adapting -- unobservable, a non-adaptive control never reads
+    ``time``. Single-sampler ladders only (LAT never builds ``nsamplers > 1``).
     """
+    if int(getattr(tc, "nsamplers", 1)) != 1:
+        raise NotImplementedError("pooled_ladder_step: nsamplers > 1 ladders are not supported")
     betas0 = np.array(betas0, dtype=float, copy=True)
     acc = np.asarray(acc, dtype=float).ravel()
     prop = np.asarray(prop, dtype=float).ravel()
@@ -65,9 +71,13 @@ class WalkerFanoutMixin:
 
     fanout = None  # the run's WalkerFanout (None single-process)
     gf_rank = None
-    fanout_branches = None  # sub-states shipped and merged
+    #: EVERY sub-state the body reads or writes (shipped in the slice, merged
+    #: back). A sub-state the body initializes but does not list is refused at
+    #: the reply boundary (``gf_serve`` raises) -- never silently dropped.
+    fanout_branches = None
     fanout_assigns_counters = False  # body ASSIGNS sub-state delta counters -> zero, then sum
     _fanout_body = False  # True while propose_local runs as a rank body
+    gf_clock = None  # the command clock of the propose being served (rank side)
 
     # ---- subclass hooks --------------------------------------------------
     def fanout_temperature_controls(self):
@@ -75,7 +85,12 @@ class WalkerFanoutMixin:
         raise NotImplementedError
 
     def fanout_payload_extra(self):
-        """Head -> rank clock values (ladders, propose counters). Host numpy only."""
+        """Head -> rank clock values (ladders, propose counters). Host numpy only.
+
+        Return a FRESH dict and treat it as immutable: it is evaluated once per
+        propose, shared by reference with the head's own body and pickled to
+        the workers.
+        """
         return {}
 
     def fanout_apply_extra(self, extra):
@@ -158,6 +173,7 @@ class WalkerFanoutMixin:
     def gf_serve(self, op, payload, clock, model):
         if op != PROPOSE_OP:
             raise ValueError(f"{type(self).__name__} serves only {PROPOSE_OP!r}, got {op!r}")
+        self.gf_clock = dict(clock or {})  # WP8 seeds its synced swap RNG from this
         self.fanout_apply_extra(payload.get("extra") or {})
         self._fanout_body = True
         try:
@@ -170,11 +186,21 @@ class WalkerFanoutMixin:
         # deliberately left ``None`` (branches outside ``fanout_branches``). Restore
         # that invariant on the reply so the head's ``merge_state`` only ever touches
         # the branches this move actually fans out -- a bare sub-state reaching
-        # ``merge_walkers`` on an already-initialized full branch raises there.
+        # ``merge_walkers`` on an already-initialized full branch raises there. A
+        # sub-state the body actually INITIALIZED outside ``fanout_branches`` is a
+        # contract violation (its columns would be lost): refuse loudly.
         fanned = set(self.fanout_branches or [])
         for name in list(getattr(part, "sub_states", None) or {}):
-            if name not in fanned:
-                part.sub_states[name] = None
+            if name in fanned:
+                continue
+            sub = part.sub_states[name]
+            if sub is not None and getattr(sub, "tempered_initialized", False):
+                raise RuntimeError(
+                    f"{type(self).__name__}: the body initialized sub-state {name!r}, which "
+                    f"is not in fanout_branches={sorted(fanned)}; list every sub-state the "
+                    "body reads or writes."
+                )
+            part.sub_states[name] = None
         return {
             "state": part,
             "accepted": np.asarray(accepted),

@@ -26,9 +26,10 @@ class _StubMove(WalkerFanoutMixin):
     fanout_branches = ["mbh"]
     fanout_assigns_counters = True
 
-    def __init__(self, tag):
+    def __init__(self, tag, tc=None, assigns_counters=True):
         self.tag = float(tag)
-        self.tc = TemperatureControl(2, 2, ntemps=NTEMPS, permute=False)
+        self.tc = tc if tc is not None else TemperatureControl(2, 2, ntemps=NTEMPS, permute=False)
+        self.fanout_assigns_counters = assigns_counters
         self.eigen_store_path = "store.h5"
         self.applied = []
         self.merged = None
@@ -55,7 +56,9 @@ class _StubMove(WalkerFanoutMixin):
         new.log_like[...] = np.arange(nw)[None, :] + self.tag  # tag = which rank scored it
         sub = new.sub_states["mbh"]
         sub.in_model_accepted[...] = 1
-        return new, np.ones(new.log_like.shape, dtype=bool)
+        # accepted pattern is rank-dependent so a mis-ordered merge is visible
+        accepted = np.full(new.log_like.shape, self.tag == 0.0, dtype=bool)
+        return new, accepted
 
 
 class MixinSingleTest(unittest.TestCase):
@@ -80,7 +83,9 @@ class MixinSingleTest(unittest.TestCase):
 
 
 class MixinFakeWorldTest(unittest.TestCase):
-    def test_two_compute_ranks_slice_run_merge(self):
+    SEED_COUNTER = 5  # pre-existing delta count on the head's incoming state
+
+    def _run_two_ranks(self, assigns_counters):
         world = FakeWorld(3, nodes=[0, 0, 0])
         moves = {}
 
@@ -91,13 +96,14 @@ class MixinFakeWorldTest(unittest.TestCase):
             if role == RankRole.SAVER:
                 return "saver"
             fo = WalkerFanout(fcomm, layout, rank, model=None)
-            move = _StubMove(10.0 * rank)
+            move = _StubMove(10.0 * rank, assigns_counters=assigns_counters)
             move.install_walker_fanout(_Curr(fo, rank))
             moves[rank] = move
             if role == RankRole.HEAD:
                 fo.enter_stage("pe", "pe")
                 fo.model = "head-model"
                 state = make_state(np.random.default_rng(1))
+                state.sub_states["mbh"].in_model_accepted[...] = self.SEED_COUNTER
                 ref = GFState(state, copy=True)
                 try:
                     new, acc = move.propose("head-model", state)
@@ -109,6 +115,10 @@ class MixinFakeWorldTest(unittest.TestCase):
             ).serve()
 
         out = world.run(fn)
+        return out, moves
+
+    def test_two_compute_ranks_slice_run_merge(self):
+        out, moves = self._run_two_ranks(assigns_counters=True)
         ref, new, acc = out[0]
         self.assertEqual(out[1], 1)  # one propose served
         w0, w1 = 0, NWALKERS // 2
@@ -117,18 +127,24 @@ class MixinFakeWorldTest(unittest.TestCase):
         head_cols = np.arange(w1 - w0) + 0.0
         worker_cols = np.arange(NWALKERS - w1) + 10.0
         np.testing.assert_array_equal(new.log_like[0], np.concatenate([head_cols, worker_cols]))
+        # accepted: head block True, worker block False -> a mis-ordered merge shows
         self.assertEqual(acc.shape, (NTEMPS, NWALKERS))
-        self.assertTrue(acc.all())
-        # delta counters: the head copy is zeroed then the rank values are summed
+        self.assertTrue(acc[:, w0:w1].all())
+        self.assertFalse(acc[:, w1:].any())
+        # the body ASSIGNS counters: the head copy (5) is zeroed, then 1 + 1 summed
         self.assertTrue(np.all(new.sub_states["mbh"].in_model_accepted == 2))
+        # the input state is never mutated by the head's merge
+        self.assertTrue(np.all(ref.sub_states["mbh"].in_model_accepted == self.SEED_COUNTER))
         # untouched sub-states are left alone
         for name, sub in new.sub_states.items():
             if name != "mbh" and sub is not None:
                 np.testing.assert_array_equal(sub.coords, ref.sub_states[name].coords)
-        # clock round trip on both ranks; extras merged per rank
+        # clock round trip on both ranks; extras merged per rank; command clock kept
         self.assertEqual(moves[0].applied, [7])
         self.assertEqual(moves[1].applied, [7])
         self.assertEqual(moves[0].merged, {0: {"nw": w1 - w0}, 1: {"nw": NWALKERS - w1}})
+        self.assertEqual(moves[1].gf_clock["stage"], "pe")
+        self.assertEqual(moves[1].gf_clock["move"], "stub")
         # ranks never adapt; the configured value is remembered on the control
         for rank in (0, 1):
             self.assertFalse(moves[rank].tc.adaptive)
@@ -136,10 +152,52 @@ class MixinFakeWorldTest(unittest.TestCase):
         self.assertEqual(moves[0].eigen_store_path, "store.h5")  # head keeps the sidecar
         self.assertIsNone(moves[1].eigen_store_path)  # worker never writes it
 
+    def test_counters_accumulate_when_the_body_adds(self):
+        out, _moves = self._run_two_ranks(assigns_counters=False)
+        _ref, new, _acc = out[0]
+        # no zeroing: the incoming 5 plus the two rank slices' 1 each
+        self.assertTrue(np.all(new.sub_states["mbh"].in_model_accepted == self.SEED_COUNTER + 2))
+
     def test_gf_serve_rejects_other_ops(self):
         move = _StubMove(0.0)
         with self.assertRaises(ValueError):
             move.gf_serve("score", {}, {}, None)
+
+    def test_gf_serve_refuses_an_initialized_unlisted_sub_state(self):
+        # the body is handed a slice whose unlisted sub-states are None; a body
+        # that INITIALIZES one of them (here: every branch, via a full state)
+        # violates the fanout_branches contract and must not be silently dropped
+        move = _StubMove(0.0)
+        full = make_state(np.random.default_rng(2))  # every sub-state initialized
+        with self.assertRaisesRegex(RuntimeError, "not in fanout_branches"):
+            move.gf_serve("propose", {"state": full, "extra": {"tick": 1}}, {}, None)
+
+    def test_gf_serve_nulls_bare_unlisted_sub_states(self):
+        from lisatools.globalfit.communication.walkerslice import slice_state
+
+        move = _StubMove(0.0)
+        part = slice_state(make_state(np.random.default_rng(2)), 0, 2, sub_states=["mbh"])
+        reply = move.gf_serve("propose", {"state": part, "extra": {"tick": 1}}, {}, None)
+        for name, sub in reply["state"].sub_states.items():
+            if name == "mbh":
+                self.assertTrue(sub.tempered_initialized)
+            else:
+                self.assertIsNone(sub)
+
+
+class SharedControlInstallTest(unittest.TestCase):
+    def test_second_install_keeps_the_configured_adaptive(self):
+        # the PSD search and PE moves share ONE TemperatureControl: the second
+        # install must remember the CONFIGURED value, not the already-False one
+        layout = FakeWorld(3).run(lambda r, c: build_layout(c, NWALKERS, [0, 1], legacy=False))[0]
+        fo = WalkerFanout(None, layout, 0)
+        tc = TemperatureControl(2, 2, ntemps=NTEMPS, permute=False)
+        self.assertTrue(tc.adaptive)
+        first, second = _StubMove(0.0, tc=tc), _StubMove(0.0, tc=tc)
+        first.install_walker_fanout(_Curr(fo, 0))
+        second.install_walker_fanout(_Curr(fo, 0))
+        self.assertFalse(tc.adaptive)
+        self.assertTrue(tc.gf_configured_adaptive)
 
 
 class PooledLadderStepTest(unittest.TestCase):
