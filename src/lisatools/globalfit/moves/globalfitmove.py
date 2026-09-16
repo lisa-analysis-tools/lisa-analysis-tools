@@ -74,8 +74,9 @@ class MoveBuildContext:
     the built :class:`~lisatools.globalfit.run.GlobalFitSetup` (``curr``), the
     shared :class:`~lisatools.analysiscontainer.AnalysisContainerArray`
     (``acs``), the priors dict, the initial state, the variant-provided
-    ``stock_moves`` name lookup, and the sampler shape (``ntemps`` /
-    ``nwalkers``).
+    ``stock_moves`` name lookup, the sampler shape (``ntemps`` / ``nwalkers``),
+    the multi-rank ``layout`` / ``fanout`` / ``rank`` and the head-side
+    ``state_local`` slice (all ``None`` in a single-process run).
     """
 
     recipe: typing.Any
@@ -87,6 +88,22 @@ class MoveBuildContext:
     stock_moves: dict = dataclasses.field(default_factory=dict)
     ntemps: typing.Optional[int] = None
     nwalkers: typing.Optional[int] = None
+    #: multi-rank context (Plan 2 populates ``curr.rank_layout`` / ``curr.fanout``
+    #: / ``curr.rank``; ``state_local`` is the head-side walker slice a
+    #: builder reads when it must act on this rank's block only)
+    layout: typing.Any = None
+    fanout: typing.Any = None
+    rank: typing.Optional[int] = None
+    state_local: typing.Any = None
+
+    def __post_init__(self):
+        curr = self.curr
+        if self.layout is None:
+            self.layout = getattr(curr, "rank_layout", None)
+        if self.fanout is None:
+            self.fanout = getattr(curr, "fanout", None)
+        if self.rank is None:
+            self.rank = getattr(curr, "rank", None)
 
 
 class Move:
@@ -283,6 +300,18 @@ class GlobalFitMove:
             if sub is None or not getattr(sub, "tempered_initialized", False):
                 continue
             sub.check_cold_row(state, name)
+
+    def gf_serve(self, op, payload, clock, model):
+        """Serve one fan-out command on a computation rank.
+
+        The multi-rank moves override this (GB: ``gb_run_proposal`` /
+        ``gb_run_tempering`` / ``gb_finish``; addremove and PSD: ``propose``).
+        ``model`` is this rank's ``GlobalFitInfo`` (local ACA, map, rank RNG).
+        """
+        raise NotImplementedError(
+            f"move {getattr(self, 'gf_move_name', getattr(self, 'name', type(self).__name__))!r} "
+            f"does not serve fan-out command {op!r}"
+        )
 
     def __init__(
         self,
