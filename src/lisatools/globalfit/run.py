@@ -2347,8 +2347,9 @@ class GlobalFit:
                 )
             if head_only:
                 self.logger.warning(
-                    "multi-rank run: these moves are not GlobalFitMoves and run on "
-                    "the HEAD against its walker block only: %s",
+                    "multi-rank run: these moves are head-only (plain eryn moves, "
+                    "FunctionMoves, gf_head_only) and run on the HEAD against its "
+                    "walker block only: %s",
                     head_only,
                 )
         return acs, like_mix
@@ -2740,10 +2741,10 @@ class GlobalFit:
         # (see _serve_registry). Exactly the leaves the head's readiness
         # guard vetted, plus an unambiguous bare-name fallback.
         registry = _serve_registry(self.recipe)
+        stage_keys = sorted(k for k in registry if isinstance(k, tuple))
         self.logger.info(
-            "rank %d serving %d move(s): %s",
-            self.rank, len(registry),
-            sorted(f"{s}/{n}" for k in registry if isinstance(k, tuple) for s, n in (k,)),
+            "rank %d serving %d (stage, move) pair(s): %s",
+            self.rank, len(stage_keys), [f"{s}/{n}" for s, n in stage_keys],
         )
 
         from .communication.fanout import LIKELIHOOD_OP, ComputeService

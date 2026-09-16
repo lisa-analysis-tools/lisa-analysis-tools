@@ -205,6 +205,8 @@ class SeedBaseTest(unittest.TestCase):
         logged = []
         gf = _gf_skeleton(layout, 1, _seed_base=123)
         gf.logger = SimpleNamespace(info=lambda *a: logged.append(a))
+        # _seed_rank_streams reseeds the process-global RNG: restore it afterwards
+        self.addCleanup(np.random.set_state, np.random.get_state())
         seed = gf._seed_rank_streams()
         self.assertEqual(seed, derive_rank_seed(123, layout, 1))
         self.assertNotEqual(seed, derive_rank_seed(123, layout, 0))

@@ -799,7 +799,13 @@ class StockGlobalFit(GlobalFitSetup):
         return self._source_info
 
     def build(self, force: bool = False) -> "StockGlobalFit":
-        """Run the full heavy build and become a usable GlobalFitSetup."""
+        """Run the full heavy build and become a usable GlobalFitSetup.
+
+        ``force=True`` runs :meth:`reset_build` first, which also drops the
+        rank layout / device pin a prior ``prepare_rank`` left on the fit --
+        call ``prepare_rank`` again afterwards under several ranks, or the run
+        falls back to the late (post-build) layout path.
+        """
         if self.built and not force:
             return self
         if force:
