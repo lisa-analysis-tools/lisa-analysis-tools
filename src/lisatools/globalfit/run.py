@@ -2808,7 +2808,13 @@ class GlobalFit:
                 # job either way -- this makes a FakeWorld / in-process run,
                 # where there is no abort, terminate cleanly too).
                 if getattr(self, "fanout", None) is not None:
-                    self.fanout.stop()
+                    try:
+                        self.fanout.stop()
+                    except Exception:
+                        # A failing stop() must never supplant an exception already
+                        # propagating out of run_mcmc (Python `finally` semantics:
+                        # an exception raised here would otherwise replace it).
+                        logger.exception("fanout.stop() failed during shutdown (ignored)")
             if self.results_rank != self.main_rank:
                 self.comm.send({"finish_run": True}, dest=self.results_rank)
         elif self.role == RankRole.SAVER:

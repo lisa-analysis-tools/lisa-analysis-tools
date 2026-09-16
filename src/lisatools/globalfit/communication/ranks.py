@@ -527,6 +527,35 @@ def prepare_rank(
     return layout
 
 
+def layout_dry_run(layout, comm, *, environ=None, out=print) -> bool:
+    """Preflight: print this rank's layout view and stop, iff ``GF_LAYOUT_DRY_RUN=1``.
+
+    Drivers call this right after ``prepare_rank`` and BEFORE ``fit.build()``:
+    ``if layout_dry_run(layout, MPI.COMM_WORLD): sys.exit(0)``. Returns True
+    (armed, caller must stop) or False (unset, no-op -- single-process
+    behaviour is unchanged).
+
+    ``layout.describe()`` is the same full table on every rank (resolved by
+    one collective allgather in ``build_layout``). Under real MPI each rank
+    is its own process calling this once, so "every rank prints" falls out
+    of SPMD execution; the head's copy prints unprefixed, and non-head ranks
+    prefix theirs with ``rank_tag`` since this runs before ``GlobalFit``
+    exists and installs ``prefix_stdout`` for the run proper. With
+    ``comm=None`` (no rank to distinguish) the text is printed unprefixed.
+    """
+    env = os.environ if environ is None else environ
+    if env.get("GF_LAYOUT_DRY_RUN", "0") != "1":
+        return False
+    text = layout.describe()
+    if comm is not None:
+        rank = int(comm.Get_rank())
+        if rank != layout.head_rank:
+            tag = rank_tag(layout, rank)
+            text = "\n".join(f"[{tag}] {line}" for line in text.splitlines())
+    out(text)
+    return True
+
+
 # --------------------------------------------------------------------------
 # failure + logging helpers
 # --------------------------------------------------------------------------

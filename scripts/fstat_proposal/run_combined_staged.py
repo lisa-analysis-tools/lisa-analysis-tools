@@ -946,9 +946,14 @@ def main() -> int:
 
     print("[combined] fit.build() ...", flush=True)
     from mpi4py import MPI
-    from lisatools.globalfit.communication.ranks import prepare_rank, RankRole
+    from lisatools.globalfit.communication.ranks import layout_dry_run, prepare_rank, RankRole
 
     layout = prepare_rank(fit, MPI.COMM_WORLD)
+    # GF_LAYOUT_DRY_RUN=1: print every rank's placement and stop before the
+    # build allocates anything (a bad layout still raises inside prepare_rank).
+    if layout_dry_run(layout, MPI.COMM_WORLD):
+        print("[combined] GF_LAYOUT_DRY_RUN=1 -- layout only, not built.", flush=True)
+        return 0
     fit.build()
     print("[combined] running", flush=True)
     fit.run()

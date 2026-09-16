@@ -25,6 +25,13 @@ class DriverScriptsTest(unittest.TestCase):
             self.assertNotIn('recv(source=_main)', text, path)
             self.assertIn("prepare_rank", text, path)
 
+    def test_layout_dry_run_preflight_wired_before_build(self):
+        for path in SCRIPTS:
+            with open(path) as fh:
+                text = fh.read()
+            self.assertIn("layout_dry_run(", text, path)
+            self.assertIn("GF_LAYOUT_DRY_RUN", text, path)
+
 
 if __name__ == "__main__":
     unittest.main()

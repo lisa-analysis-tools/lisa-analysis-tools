@@ -340,5 +340,17 @@ class AutoGpusPerRankTest(unittest.TestCase):
         self.assertEqual(fit.general.gpus, [0, 1])
 
 
+class LayoutDryRunTest(unittest.TestCase):
+    def test_prints_and_returns_true_only_when_armed(self):
+        from lisatools.globalfit.communication.ranks import layout_dry_run
+
+        lay = FakeWorld(3).run(lambda r, c: build_layout(c, 4, [0, 1], legacy=False))[0]
+        lines = []
+        armed = {"GF_LAYOUT_DRY_RUN": "1"}
+        self.assertTrue(layout_dry_run(lay, None, environ=armed, out=lines.append))
+        self.assertTrue(any("head" in ln for ln in lines))
+        self.assertFalse(layout_dry_run(lay, None, environ={}, out=lines.append))
+
+
 if __name__ == "__main__":
     unittest.main()

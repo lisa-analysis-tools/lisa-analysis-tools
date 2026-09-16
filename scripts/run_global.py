@@ -88,7 +88,9 @@ if __name__ == "__main__":
             "  srun -n 3 --gpus-per-node=<G> python scripts/run_global.py --stock <name>\n"
             "GPU count is a knob, not a rank: GPUS=0,1 selects the local devices the\n"
             "main rank drives (USE_GPU=0 forces CPU). Common env: VERBOSE, NWALKERS, NTEMPS,\n"
-            "NUM_ITERATIONS, DATA_MODE, TOBS_TARGET, MAKE_DIAGNOSTIC_PLOTS."
+            "NUM_ITERATIONS, DATA_MODE, TOBS_TARGET, MAKE_DIAGNOSTIC_PLOTS.\n"
+            "GF_LAYOUT_DRY_RUN=1: print the rank layout from every rank and exit before "
+            "the build."
         ),
     )
 
@@ -139,9 +141,13 @@ if __name__ == "__main__":
         # computation ranks each own a block of walkers, and the saver needs
         # the backend spec. prepare_rank resolves this rank's role and pins
         # its device BEFORE the build allocates on it (no-op at -n 1).
-        from lisatools.globalfit.communication.ranks import prepare_rank
+        from lisatools.globalfit.communication.ranks import layout_dry_run, prepare_rank
 
-        prepare_rank(fit, MPI.COMM_WORLD)
+        layout = prepare_rank(fit, MPI.COMM_WORLD)
+        # Preflight: print every rank's placement and stop before the build
+        # allocates anything (a bad layout still raises inside prepare_rank).
+        if layout_dry_run(layout, MPI.COMM_WORLD):
+            sys.exit(0)
         curr_info = fit.build()
     else:
         # Define the module name and the full path to the Python file
