@@ -23,6 +23,7 @@ from typing import Optional, Sequence, Union
 
 __all__ = [
     "device_context",
+    "order_after_array",
     "pin_main_device",
     "current_device",
     "to_current_device",
@@ -49,6 +50,47 @@ def device_context(xp, device: Optional[int]):
     if device is None or not hasattr(xp, "cuda"):
         return nullcontext()
     return xp.cuda.Device(int(device))
+
+
+def order_after_array(xp, arr) -> None:
+    """Order the CURRENT device's stream behind the device that owns ``arr``.
+
+    THE CROSS-DEVICE COPY EDGE (2026-09-16). A direct peer copy --
+    ``xp.asarray(foreign)`` issued while another device is current, the
+    shape every :class:`~lisatools.analysiscontainer.BandView` per-shard
+    loop and every routed worker's input move desugars to -- reads memory
+    a kernel on the SOURCE device may still be writing. CUDA orders
+    nothing between two devices' streams, so the copy can read stale
+    bytes: silent, deterministic (fixed kernel sequences replay
+    identically) and invisible to any single-GPU test.
+
+    ``beaa60f5`` / ``e3dde390`` closed the dispatcher half of this --
+    shard worker -> the caller's current stream, on the caller's CURRENT
+    device. This closes the rest: it records an event on the source
+    device's current stream and makes the current device's stream wait on
+    it. Same thread throughout, so the source stream really is the one
+    that enqueued the producing kernel (cupy's current stream is
+    thread-local, and per-thread-default-stream builds are covered for
+    the same reason).
+
+    A stream edge, not a fence: nothing drains and both devices keep
+    running. No-op when ``arr`` is already on the current device, when it
+    is a host array, and for NumPy / any ``xp`` without a CuPy-like
+    ``cuda.get_current_stream``.
+    """
+    cuda = getattr(xp, "cuda", None)
+    get_stream = getattr(cuda, "get_current_stream", None)
+    if get_stream is None:
+        return
+    src = getattr(getattr(arr, "device", None), "id", None)
+    if src is None:
+        return  # host array, or a backend without device tags
+    cur = current_device(xp)
+    if cur is None or int(src) == int(cur):
+        return  # same device == same stream in this thread: already ordered
+    with device_context(xp, int(src)):
+        event = get_stream().record()
+    get_stream().wait_event(event)
 
 
 def pin_main_device(xp, gpus: Union[int, Sequence[int], None]) -> Optional[int]:

@@ -1425,10 +1425,23 @@ class _RoutedBandEngine:
                 get_stream = None
         events = [None] * len(items)
 
+        # INBOUND EDGE (caller -> shard, 2026-09-16). The items were STAGED
+        # on the caller's stream: on the default device-resident path
+        # ``_slice_rows`` gathers each shard's params/N_vals slice on the
+        # CALLER's device, and the worker then does ``xp.asarray(part)``
+        # inside its own device context -- a peer read of caller memory on
+        # the shard's stream, ordered against nothing. beaa60f5 added only
+        # the return direction. One event, waited on by every foreign shard.
+        stage_event = get_stream().record() if get_stream is not None else None
+
         def _run(idx, it):
+            dev = None if devices is None else devices[idx]
+            if stage_event is not None and dev is not None:
+                with device_context(xp, dev):
+                    get_stream().wait_event(stage_event)
             worker(*it)
-            if get_stream is not None and devices[idx] is not None:
-                with device_context(xp, devices[idx]):
+            if get_stream is not None and dev is not None:
+                with device_context(xp, dev):
                     events[idx] = get_stream().record()
 
         if (len(items) > 1
@@ -1443,10 +1456,24 @@ class _RoutedBandEngine:
             for i, it in enumerate(items):
                 _run(i, it)
         if get_stream is not None:
-            stream = get_stream()
-            for ev in events:
-                if ev is not None:
-                    stream.wait_event(ev)
+            live = [ev for ev in events if ev is not None]
+            # OUTBOUND EDGE, ON EVERY DEVICE (2026-09-16). beaa60f5 waited
+            # on the caller's current stream on the caller's CURRENT device
+            # only. But the caller's very next reads are issued inside
+            # ``with Device(other)`` -- every BandView per-shard loop and
+            # SubBandBuffer.likelihood's per-shard reduce (the function that
+            # produces the CREDITED cell lls) -- and those streams waited on
+            # nothing. Order each involved device's stream behind ALL shard
+            # events, self-device included: under per-thread default streams
+            # the worker thread's stream on device d is NOT the caller
+            # thread's stream on device d.
+            wait_devs = {current_device(xp)}
+            wait_devs.update(d for d in (devices or []) if d is not None)
+            for dev in sorted(d for d in wait_devs if d is not None):
+                with device_context(xp, dev):
+                    stream = get_stream()
+                    for ev in live:
+                        stream.wait_event(ev)
 
     def _mirror_engine_outputs(self):
         """Refresh routed-output attrs from the wrapped engine after a
