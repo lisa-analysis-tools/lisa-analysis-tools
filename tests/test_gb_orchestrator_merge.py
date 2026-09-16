@@ -125,21 +125,6 @@ def _stub_gf_serve(move, op, payload, clock, model):
         }
 
     if op == "gb_finish":
-        if move.neutral:
-            return {
-                "alive_coords": np.zeros((0, NDIM)),
-                "alive_twl": np.zeros((0, 3), dtype=np.int64),
-                "d_h": np.full((B, NLEAVES), np.nan),
-                "h_h": np.full((B, NLEAVES), np.nan),
-                "band_counts": np.zeros((ntemps, B, nb), dtype=int),
-                "log_like_final": np.zeros(B),
-                "cap_stats": None,
-                "fstat_ctr_fallback_rows": 0,
-                "band_dof": None,
-                "rj_split": None,
-                "replace_census": None,
-                "timing": None,
-            }
         walker_tag = float(w0) + np.arange(B, dtype=float)
         cap = None
         if payload["want_cap_stats"]:
@@ -150,6 +135,24 @@ def _stub_gf_serve(move, op, payload, clock, model):
                 "dof": 7.0,
                 "band_dof": np.full(nb, 5.0),
                 "is_cells": False,
+            }
+        if move.neutral:
+            # A NEUTRAL block ships its cap rows too (Task 3 fix round):
+            # with no sources they are the residual-window values, so the
+            # head's walker-axis concatenation is still N rows.
+            return {
+                "alive_coords": np.zeros((0, NDIM)),
+                "alive_twl": np.zeros((0, 3), dtype=np.int64),
+                "d_h": np.full((B, NLEAVES), np.nan),
+                "h_h": np.full((B, NLEAVES), np.nan),
+                "band_counts": np.zeros((ntemps, B, nb), dtype=int),
+                "log_like_final": np.zeros(B),
+                "cap_stats": cap,
+                "fstat_ctr_fallback_rows": 0,
+                "band_dof": None if cap is None else np.full(nb, 5.0),
+                "rj_split": None,
+                "replace_census": None,
+                "timing": None,
             }
         return {
             # one alive source at (temp 0, LOCAL walker 0, leaf 0)
@@ -448,8 +451,14 @@ class GBOrchestratorMergeTest(unittest.TestCase):
         self.assertEqual(int(work.inds[:, 2:4].sum()), 0)
         bi = new_state.sub_states["gb"].band_info
         np.testing.assert_array_equal(bi["band_num_binaries"][:, 2:4], 0)
-        # a block without cap statistics freezes the caps for this propose
-        self.assertEqual(moves[0].cap_calls, [])
+        # ...but its cap rows DO ride back, so the caps still advance on the
+        # full N-walker statistic (Task 3 fix round; there is no
+        # neutral-block cap skip on the head any more)
+        self.assertEqual(len(moves[0].cap_calls), 1)
+        stats = moves[0].cap_calls[0]
+        self.assertEqual(stats["lls"].shape, (NWALKERS, NUM_BANDS))
+        np.testing.assert_allclose(
+            stats["lls"][:, 0], np.arange(NWALKERS, dtype=float))
 
 
 if __name__ == "__main__":

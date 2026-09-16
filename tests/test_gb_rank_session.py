@@ -44,9 +44,9 @@ class _FakeModel:
         self.analysis_container_arr = _FakeACS()
 
 
-def make_move():
+def make_move(cls=gbs.GBSpecialBase):
     """A skeleton GB move with only the attributes the rank plumbing reads."""
-    move = gbs.GBSpecialBase.__new__(gbs.GBSpecialBase)
+    move = cls.__new__(cls)
     move.branch_name = "gb"
     move.name = "gb_test"
     # ``xp`` / ``backend`` are derived properties (deepcopy-safety rule)
@@ -58,12 +58,15 @@ def make_move():
     move.time = 3
     move.num_proposals = 7
     move.is_rj_prop = False
+    move.use_prior_removal = False
+    move.rj_replace = False
     move._reseed_firing = False
     move.temper_vertical = False
     move._cap_leaf_cap = None
     move._band_leaf_cap = None
     move._rj_band_shutoff = None
     move._gb_session = None
+    move.reset_non_gb_linear_data_arr = None
     move.fanout = None
     move.gf_rank = None
     move.eigen_store_path = "x.h5"
@@ -71,6 +74,18 @@ def make_move():
     # the three heavy binding calls are no-ops on a skeleton
     move._configure_domain = lambda acs: None
     move._bind_parent_acs = lambda acs: None
+    return move
+
+
+def make_grid_move():
+    """An F-stat grid move whose install side effects are recorded, not run."""
+    move = make_move(gbs.GBSpecialRJFStatGridMove)
+    move.installs, move.ctr_installs = [], []
+    move._install = lambda k, **kw: move.installs.append((k, kw))
+    move._install_ctr_table = lambda k, model=None, branches=None: (
+        move.ctr_installs.append((k, model)))
+    move._epoch_dir = lambda k: f"/nowhere/epoch_{int(k):04d}"
+    move._epoch_fit_clock = lambda k: 0
     return move
 
 
@@ -158,6 +173,16 @@ class RankBlockTest(unittest.TestCase):
         self.assertEqual(self.move.nwalkers, B)
         self.move._exit_rank_block(saved)
 
+    def test_reseed_firing_defaults_to_false_not_to_the_current_value(self):
+        # the head ships it every propose; a partial clock_vals must read as
+        # "not firing", never as "keep whatever this move last held"
+        self.move._reseed_firing = True
+        payload = neutral_payload(clock_vals={"time": 4, "num_proposals": 2})
+        saved = self.move._enter_rank_block(payload, {"seq": 1, "call_index": 1}, self.model)
+        self.assertFalse(self.move._reseed_firing)
+        self.move._exit_rank_block(saved)
+        self.assertTrue(self.move._reseed_firing)
+
     def test_exit_restores_the_shipped_tables(self):
         cap = np.arange(NUM_BANDS)
         shut = np.zeros(NUM_BANDS, dtype=bool)
@@ -171,6 +196,61 @@ class RankBlockTest(unittest.TestCase):
         self.assertIsNone(self.move._cap_leaf_cap)
         self.assertIsNone(self.move._band_leaf_cap)
         self.assertIsNone(self.move._rj_band_shutoff)
+
+
+class TemperRngSeedTest(unittest.TestCase):
+    """The seeded vertical-swap Generator survives ONE propose's commands.
+
+    The head ships one ``rank_seed`` per propose and the rank serves three
+    commands with it; dropping the Generator on every command replayed an
+    identical stream three times over.
+    """
+
+    def setUp(self):
+        self.move = make_move()
+        self.model = _FakeModel()
+        patcher = mock.patch.object(gbs, "pin_main_device", lambda xp, gpus: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _enter(self, seed):
+        return self.move._enter_rank_block(
+            neutral_payload(rank_seed=seed), {"seq": 1, "call_index": 1}, self.model
+        )
+
+    def test_two_consecutive_enters_with_the_same_seed_keep_the_generator(self):
+        self._enter(4242)
+        self.assertIsNone(self.move._temper_rng)
+        rng = self.move._temper_rng = np.random.default_rng(4242)
+        self._enter(4242)
+        self.assertIs(self.move._temper_rng, rng)
+
+    def test_the_generator_survives_the_exit_restore_between_commands(self):
+        # the REAL command sequence: every command is enter / body / exit,
+        # and ``_rank_rng_seed`` IS restored on exit -- so the comparison
+        # cannot be against it
+        saved = self._enter(4242)
+        rng = self.move._temper_rng = np.random.default_rng(4242)
+        self.move._exit_rank_block(saved)
+        self.assertIsNone(self.move._rank_rng_seed)  # restore contract intact
+        saved = self._enter(4242)                    # gb_run_tempering
+        self.assertIs(self.move._temper_rng, rng)
+        self.move._exit_rank_block(saved)
+        saved = self._enter(4242)                    # gb_finish
+        self.assertIs(self.move._temper_rng, rng)
+        self.move._exit_rank_block(saved)
+
+    def test_a_different_seed_drops_the_generator(self):
+        saved = self._enter(4242)
+        self.move._temper_rng = np.random.default_rng(4242)
+        self.move._exit_rank_block(saved)
+        self._enter(4243)                            # the NEXT propose
+        self.assertIsNone(self.move._temper_rng)
+
+    def test_a_none_seed_keeps_whatever_generator_there_is(self):
+        rng = self.move._temper_rng = np.random.default_rng()
+        self._enter(None)
+        self.assertIs(self.move._temper_rng, rng)
 
 
 class InstallWalkerFanoutTest(unittest.TestCase):
@@ -234,9 +314,86 @@ class DispatchTest(unittest.TestCase):
         self.assertIn("stale", str(ctx.exception))
 
     def test_setup_from_directive_is_a_no_op_on_the_base_class(self):
-        self.assertIsNone(self.move._setup_from_directive({"epoch": None, "ctr_table": False}))
-        self.assertIsNone(self.move._setup_from_directive({"epoch": 3, "ctr_table": True}))
-        self.assertIsNone(self.move._setup_from_directive(None))
+        # the base class has no ``_install``: the directive must not create
+        # one, nor adopt an epoch, nor raise
+        self.move._setup_from_directive({"epoch": None, "ctr_table": False})
+        self.move._setup_from_directive({"epoch": 3, "ctr_table": True})
+        self.move._setup_from_directive(None)
+        self.assertFalse(hasattr(self.move, "_install"))
+        self.assertFalse(hasattr(self.move, "_install_ctr_table"))
+        self.assertIsNone(getattr(self.move, "_fstat_epoch", None))
+
+
+class SetupFromDirectiveTest(unittest.TestCase):
+    """The rank stand-in for ``setup()`` on a real F-stat grid move.
+
+    ``_install`` / ``_install_ctr_table`` / ``_epoch_dir`` are recording
+    stubs and the process-global epoch registry is patched, so nothing here
+    reads a fit directory, an npz or a ``DONE.json``.
+    """
+
+    def setUp(self):
+        self.move = make_grid_move()
+        self.model = _FakeModel()
+        patcher = mock.patch.object(gbs, "pin_main_device", lambda xp, gpus: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        reg = mock.patch.dict(gbs._FSTAT_GRID_REGISTRY, {}, clear=True)
+        reg.start()
+        self.addCleanup(reg.stop)
+
+    def test_a_missing_epoch_is_installed_without_the_shutoff_sync(self):
+        self.move._setup_from_directive({"epoch": 3, "ctr_table": False})
+        self.assertEqual(self.move.installs, [(3, {"sync_shutoff": False})])
+        self.assertEqual(self.move.ctr_installs, [])
+
+    def test_the_ctr_table_installs_only_when_the_head_asks(self):
+        self.move._setup_from_directive({"epoch": 3, "ctr_table": True})
+        self.assertEqual(self.move.installs, [(3, {"sync_shutoff": False})])
+        # model=None -> the npz-only branch, never an F-stat sweep
+        self.assertEqual(self.move.ctr_installs, [(3, None)])
+
+    def test_an_epoch_already_in_the_registry_is_adopted_not_installed(self):
+        gbs._FSTAT_GRID_REGISTRY[self.move._epoch_dir(3)] = ("container", 3, 17)
+        self.move._setup_from_directive({"epoch": 3, "ctr_table": False})
+        self.assertEqual(self.move.installs, [])
+        self.assertEqual(self.move.rj_proposal_distribution, "container")
+        self.assertEqual(self.move._fstat_epoch, 3)
+
+    def test_no_epoch_installs_nothing(self):
+        self.move._setup_from_directive({"epoch": None, "ctr_table": True})
+        self.move._setup_from_directive(None)
+        self.move._setup_from_directive({})
+        self.assertEqual(self.move.installs, [])
+        self.assertEqual(self.move.ctr_installs, [])
+
+    def test_the_shipped_shutoff_valve_is_reapplied_after_the_install(self):
+        # _install's own _band_shutoff_epoch_sync would revive every band the
+        # head has shut off; gb_run_proposal re-applies the shipped table
+        # AFTER the install, which is what this pins
+        shut = np.zeros(NUM_BANDS, dtype=bool)
+        self.move._install = lambda k, **kw: setattr(
+            self.move, "_rj_band_shutoff", np.ones(NUM_BANDS, dtype=bool))
+        seen = {}
+        real_timer = self.move._gb_new_timer
+
+        def _spy_timer(model):
+            # runs immediately after the re-apply, and before _exit_rank_block
+            # puts the move's own table back
+            seen["shutoff"] = self.move._rj_band_shutoff
+            return real_timer(model)
+
+        self.move._gb_new_timer = _spy_timer
+        payload = neutral_payload(
+            directive={"epoch": 3, "ctr_table": False},
+            tables={"cap_leaf_cap": None, "band_leaf_cap": None,
+                    "rj_band_shutoff": shut},
+        )
+        self.move.gf_serve(
+            "gb_run_proposal", payload, {"seq": 2, "call_index": 1}, self.model
+        )
+        self.move._gb_session = None
+        self.assertIs(seen["shutoff"], shut)
 
 
 class NeutralBlockTest(unittest.TestCase):
@@ -314,6 +471,90 @@ class NeutralBlockTest(unittest.TestCase):
         self.assertIsNone(self.move._gb_session)
         self.assertEqual(self.move.nwalkers, 4)
 
+    def test_the_neutral_path_requires_a_state_slice(self):
+        payload = neutral_payload()
+        payload["state"] = None
+        with self.assertRaises(ValueError) as ctx:
+            self.move.gf_serve("gb_run_proposal", payload, self.clock, self.model)
+        self.assertIn("no state slice", str(ctx.exception))
+
+    def test_a_neutral_block_still_ships_its_cap_rows(self):
+        rows = np.arange(B * NUM_BANDS, dtype=float).reshape(B, NUM_BANDS)
+        self.move._cap_stats_local = lambda model, st: {
+            "band_lls": rows, "lls": rows, "dof": 7.0,
+            "band_dof": np.full(NUM_BANDS, 5.0), "is_cells": False,
+        }
+        self.move.gf_serve(
+            "gb_run_proposal", neutral_payload(), self.clock, self.model
+        )
+        rep = self.move.gf_serve(
+            "gb_finish",
+            neutral_payload(session=self.token, want_cap_stats=True),
+            {"seq": 7, "call_index": 4},
+            self.model,
+        )
+        stats = rep["cap_stats"]
+        self.assertIsNotNone(stats)
+        self.assertEqual(np.shape(stats["band_lls"]), (B, NUM_BANDS))
+        self.assertEqual(np.shape(stats["lls"]), (B, NUM_BANDS))
+        self.assertFalse(stats["is_cells"])
+
+    def test_a_neutral_block_skips_the_cap_work_when_not_asked(self):
+        self.move._cap_stats_local = lambda model, st: self.fail(
+            "cap statistics must not be computed when the head did not ask")
+        self.move.gf_serve(
+            "gb_run_proposal", neutral_payload(), self.clock, self.model
+        )
+        rep = self.move.gf_serve(
+            "gb_finish",
+            neutral_payload(session=self.token, want_cap_stats=False),
+            {"seq": 7, "call_index": 4},
+            self.model,
+        )
+        self.assertIsNone(rep["cap_stats"])
+        self.assertIsNone(rep["band_dof"])
+
+    def test_the_session_snapshot_is_rebound_on_the_later_commands(self):
+        self.move.gf_serve(
+            "gb_run_proposal", neutral_payload(), self.clock, self.model
+        )
+        snap = object()
+        self.move._gb_session.snapshot = snap
+        self.move.reset_non_gb_linear_data_arr = "stale"
+        self.move.gf_serve(
+            "gb_run_tempering",
+            neutral_payload(session=self.token, tmp_start=0),
+            {"seq": 7, "call_index": 3},
+            self.model,
+        )
+        self.assertIs(self.move.reset_non_gb_linear_data_arr, snap)
+        self.move.reset_non_gb_linear_data_arr = "stale"
+        self.move.gf_serve(
+            "gb_finish",
+            neutral_payload(session=self.token, want_cap_stats=False),
+            {"seq": 7, "call_index": 4},
+            self.model,
+        )
+        self.assertIs(self.move.reset_non_gb_linear_data_arr, snap)
+
+    def test_the_finish_reply_carries_the_stashed_censuses(self):
+        self.move.gf_serve(
+            "gb_run_proposal", neutral_payload(), self.clock, self.model
+        )
+        # opening the session clears any previous propose's stashes
+        self.assertIsNone(self.move._rj_split_last)
+        self.assertIsNone(self.move._replace_split_last)
+        self.move._rj_split_last = {"births": 12, "birth_acc": 3}
+        self.move._replace_split_last = {"proposals": 5, "acc": 1}
+        rep = self.move.gf_serve(
+            "gb_finish",
+            neutral_payload(session=self.token, want_cap_stats=False),
+            {"seq": 7, "call_index": 4},
+            self.model,
+        )
+        self.assertEqual(rep["rj_split"], {"births": 12, "birth_acc": 3})
+        self.assertEqual(rep["replace_census"], {"proposals": 5, "acc": 1})
+
     def test_a_wrong_session_token_is_stale(self):
         self.move.gf_serve("gb_run_proposal", neutral_payload(), self.clock, self.model)
         with self.assertRaises(RuntimeError) as ctx:
@@ -325,6 +566,97 @@ class NeutralBlockTest(unittest.TestCase):
             )
         self.assertIn("stale", str(ctx.exception))
         self.move._gb_session = None
+
+
+class KeepAllIndsDefaultTest(unittest.TestCase):
+    """The safety-net default is the LEGACY expression, not ``True``."""
+
+    def setUp(self):
+        self.model = _FakeModel()
+        patcher = mock.patch.object(gbs, "pin_main_device", lambda xp, gpus: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _session_keep_all(self, **attrs):
+        move = make_move()
+        for k, v in attrs.items():
+            setattr(move, k, v)
+        payload = neutral_payload()
+        payload.pop("keep_all_inds")        # the head omitted the key
+        move.gf_serve("gb_run_proposal", payload, {"seq": 1, "call_index": 1}, self.model)
+        keep = move._gb_session.keep_all_inds
+        move._gb_session = None
+        return keep
+
+    def test_rj_replace_defaults_to_alive_only(self):
+        self.assertFalse(self._session_keep_all(rj_replace=True))
+
+    def test_prior_removal_defaults_to_alive_only(self):
+        self.assertFalse(self._session_keep_all(use_prior_removal=True))
+
+    def test_a_plain_move_defaults_to_keeping_every_slot(self):
+        self.assertTrue(self._session_keep_all())
+
+    def test_an_explicit_key_still_wins(self):
+        move = make_move()
+        move.rj_replace = True
+        move.gf_serve(
+            "gb_run_proposal",
+            neutral_payload(keep_all_inds=True),
+            {"seq": 1, "call_index": 1},
+            self.model,
+        )
+        self.assertTrue(move._gb_session.keep_all_inds)
+        move._gb_session = None
+
+
+class CensusStashTest(unittest.TestCase):
+    """``_replace_split`` is cleared by its own report site before gb_finish."""
+
+    def _move(self, fanout_single):
+        move = make_move()
+        move.fanout = _FakeFanout(single=fanout_single, is_head=True)
+        move.gf_rank = 0
+        move._replace_split = dict(
+            proposals=10, proposals_cold=4, acc=3, acc_cold=1, snr=2,
+            nonfinite=0, dll_cold_sum=1.5, dll_cold_max=0.9)
+        return move
+
+    def test_the_report_stashes_a_copy_under_fanout(self):
+        move = self._move(fanout_single=False)
+        live = move._replace_split
+        move._replace_census_report()
+        self.assertIsNone(move._replace_split)      # cleared, as always
+        self.assertEqual(move._replace_split_last["proposals"], 10)
+        self.assertIsNot(move._replace_split_last, live)   # a COPY
+
+    def test_single_process_output_is_untouched(self):
+        move = self._move(fanout_single=True)
+        move._replace_census_report()
+        self.assertIsNone(move._replace_split)
+        self.assertFalse(hasattr(move, "_replace_split_last"))
+
+    def test_no_census_stashes_nothing(self):
+        move = self._move(fanout_single=False)
+        move._replace_split = None
+        move._replace_census_report()
+        self.assertFalse(hasattr(move, "_replace_split_last"))
+
+
+class GbHostTest(unittest.TestCase):
+    def test_namedtuples_survive_the_host_coercion(self):
+        import collections
+
+        Pair = collections.namedtuple("Pair", "lo hi")
+        out = gbs._gb_host(Pair(np.arange(3), 2.0))
+        self.assertIsInstance(out, Pair)
+        np.testing.assert_array_equal(out.lo, np.arange(3))
+        self.assertEqual(out.hi, 2.0)
+
+    def test_plain_sequences_keep_their_type(self):
+        self.assertIsInstance(gbs._gb_host([1, "a", None]), list)
+        self.assertIsInstance(gbs._gb_host((1, "a", None)), tuple)
+        self.assertEqual(gbs._gb_host({"a": [1, 2]})["a"], [1, 2])
 
 
 if __name__ == "__main__":

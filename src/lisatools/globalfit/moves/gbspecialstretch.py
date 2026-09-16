@@ -1938,13 +1938,18 @@ def _gb_host(obj):
     must not be a device array. Scalars and strings pass through; dicts and
     sequences are mapped recursively; anything else goes through
     :func:`_to_numpy` (``asnumpy``).
+
+    A namedtuple is rebuilt POSITIONALLY (``type(obj)(*values)``) -- its
+    constructor takes the fields, not one iterable, so the plain
+    ``type(obj)(gen)`` a tuple takes would raise for it.
     """
     if obj is None or isinstance(obj, (bool, int, float, str, np.generic)):
         return obj
     if isinstance(obj, dict):
         return {k: _gb_host(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
-        return type(obj)(_gb_host(v) for v in obj)
+        vals = [_gb_host(v) for v in obj]
+        return type(obj)(*vals) if hasattr(obj, "_fields") else type(obj)(vals)
     return np.asarray(_to_numpy(obj))
 
 
@@ -4804,6 +4809,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         float(np.exp(sp.get("stale_lnr_sum", 0.0) / _sn)),
                         100.0 * sp.get("stale_lo", 0.0) / _sn,
                         100.0 * sp.get("stale_hi", 0.0) / _sn)
+                if getattr(self, "fanout_active", False):
+                    # multi-rank: the census dies here, before gb_finish can
+                    # ship it, so keep a host copy for that command's reply
+                    self._rj_split_last = dict(sp)
                 self._rj_split = None
             # ---- GB_CAP_DIAG report (read-only) --------------------------
             # THE DECISIVE LINE. into_at_cap > 0 => the birth gate leaked
@@ -9371,6 +9380,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             f" gated: snr {sp['snr']} nonfinite {sp['nonfinite']} |"
             f" cold-accepted dll mean {mean_dll:.1f} max {max_dll:.1f}"
         )
+        if getattr(self, "fanout_active", False):
+            # multi-rank: same reason as ``_rj_split`` -- this runs inside
+            # gb_run_proposal, so gb_finish needs a copy to ship back.
+            self._replace_split_last = dict(sp)
         self._replace_split = None
 
     def _run_replace_step(self, model, band_sorter, buffer_obj, band_temps,
@@ -17080,6 +17093,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         ``_adapt_band_temps``, which the rank path disables explicitly by
         passing ``adapt_band_temps=False`` to ``run_tempering`` -- the
         control's ``adaptive`` flag does not cover it.
+
+        NOTE on ``eigen_store_path``: a GB move does NOT have one and writes
+        no eigen sidecar -- that attribute is set only on the single-source
+        PE moves (``recipe.SingleSourcePEBuilder``). The ``hasattr`` guard
+        below is kept anyway, harmless and one line, so a subclass that ever
+        grows the attribute inherits the single-writer rule for free.
         """
         self.fanout = getattr(curr, "fanout", None)
         self.gf_rank = getattr(curr, "rank", None)
@@ -17152,8 +17171,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         device-binding calls, then ``self.nwalkers = B`` / ``self.ntemps``
         (which ``propose`` sets from ``work_in.coords.shape``) and the
         head-shipped clock values, read-only cap/shut-off tables and rank
-        RNG seed. ``self._temper_rng`` is dropped so the vertical-swap
-        Generator is re-created SEEDED from ``_rank_rng_seed``.
+        RNG seed. ``self._temper_rng`` is dropped -- so the vertical-swap
+        Generator is re-created SEEDED from ``_rank_rng_seed`` -- only when
+        the SEED CHANGES, so one propose's three commands share one stream
+        instead of replaying an identical one three times.
+
+        ``clock_vals`` defaults, for a head that ships a partial dict:
+        ``reseed_firing`` reads as ``False`` (NOT "keep the current value"),
+        a missing ``branch_propose_count`` leaves the class census alone,
+        and ``time`` / ``num_proposals`` / ``temper_vertical`` keep what the
+        move already held.
 
         The returned dict goes straight back to :meth:`_exit_rank_block` in
         a ``finally``; on the head that restores N, and on a pure compute
@@ -17203,10 +17230,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self._cap_leaf_cap = tables.get("cap_leaf_cap")
         self._band_leaf_cap = tables.get("band_leaf_cap")
         self._rj_band_shutoff = tables.get("rj_band_shutoff")
-        self._rank_rng_seed = (payload or {}).get("rank_seed")
-        # re-created SEEDED on first use (see _make_temper_rng); deliberately
-        # NOT restored on exit -- the next command drops it again anyway.
-        self._temper_rng = None
+        new_seed = (payload or {}).get("rank_seed")
+        # The seeded vertical-swap Generator must SURVIVE the three commands
+        # of one propose: nulling it on every command restarted an identical
+        # stream three times over (the head ships ONE rank_seed per propose,
+        # and it already carries a per-propose term). The comparison is
+        # against ``_temper_rng_seed`` -- the seed the LIVE Generator was
+        # built from -- and NOT ``_rank_rng_seed``, which is in
+        # :data:`_RANK_BLOCK_SAVED` and so is restored the moment a command
+        # exits. Like ``_temper_rng`` itself it is deliberately not restored.
+        if new_seed != getattr(self, "_temper_rng_seed", None):
+            self._temper_rng = None  # a fresh SEEDED generator on first use
+        self._temper_rng_seed = new_seed
+        self._rank_rng_seed = new_seed
         return saved
 
     def _exit_rank_block(self, saved):
@@ -17351,27 +17387,39 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             self._prop_timer = tm
             self._ladder_dbg_fired = False
             self._rj_split = {} if self.is_rj_prop else None
+            # the propose-end stashes ``gb_finish`` ships (the live dicts are
+            # cleared by their own report sites before that command runs);
+            # reset here so a previous propose's census can never ride back
+            self._rj_split_last = None
+            self._replace_split_last = None
             self._fstat_ctr_fallback_rows = 0
             if (os.environ.get("GB_BUFFER_PERSIST", "1") != "1"
                     or getattr(self, "_prop_buffer_cache", None) is None):
                 self._prop_buffer_cache = {}
             self._prop_buffer_builds = 0
 
-            if neutral:
-                part = (payload or {}).get("state")
-                new_part = None if part is None else GFState(part, copy=True)
-            else:
-                part = self._make_slice_state(payload)
-                new_part = GFState(part, copy=True)
-                assert new_part.log_like is not None
+            # The slice is REQUIRED for EVERY block, neutral included: it is
+            # what sizes a neutral reply's (B, nleaves) ``d_h``/``h_h`` and
+            # its cap statistics. A missing one is a head bug, and a quiet
+            # zero-width reply would corrupt the merge instead of failing.
+            part = self._make_slice_state(payload)
+            new_part = GFState(part, copy=True)
+            assert new_part.log_like is not None
 
             engine_ntemps = int((payload or {}).get("engine_ntemps") or 0)
-            if not engine_ntemps and part is not None:
+            if not engine_ntemps:
                 engine_ntemps = int(part.log_like.shape[0])
+            # The head ships ``keep_all_inds`` explicitly; this default is
+            # the safety net and must be the LEGACY expression, not ``True``
+            # -- an rj_replace / use_prior_removal move's sorter carries the
+            # ALIVE sources only, and a wrong default silently changes what
+            # the proposal is drawn over.
+            _keep_all_default = not (self.use_prior_removal or self.rj_replace)
             sess = GBRankSession(
                 token=self._gb_session_token(clock),
                 band_sorter=None,
-                keep_all_inds=bool((payload or {}).get("keep_all_inds", True)),
+                keep_all_inds=bool(
+                    (payload or {}).get("keep_all_inds", _keep_all_default)),
                 start_diffs=None,
                 snapshot=None,
                 part=part,
@@ -17566,6 +17614,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         try:
             tm = sess.timer
             self._prop_timer = tm
+            # ``check_ll_inject`` restores THIS propose's non-GB residual
+            # snapshot from ``self.reset_non_gb_linear_data_arr``; rebind it
+            # from the session so a stale attribute (anything that reset it
+            # between two commands) can never be the one that is restored.
+            if sess.snapshot is not None:
+                self.reset_non_gb_linear_data_arr = sess.snapshot
             B, ntemps, nb = self._gb_neutral_shapes(sess)
             if sess.neutral:
                 return {
@@ -17660,10 +17714,23 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         try:
             tm = sess.timer
             self._prop_timer = tm
+            # same reason as in gb_run_tempering: check_ll_inject below
+            # restores exactly this propose's non-GB residual snapshot
+            if sess.snapshot is not None:
+                self.reset_non_gb_linear_data_arr = sess.snapshot
             B, ntemps, nb = self._gb_neutral_shapes(sess)
             new_part = sess.new_part
+            want_cap_stats = bool((payload or {}).get("want_cap_stats"))
             if sess.neutral:
-                return self._gb_neutral_finish_reply(sess, B, ntemps, nb)
+                # A NEUTRAL block still owns its B rows of the N-walker cap
+                # statistic. With no sources those rows ARE the residual-
+                # window values -- exactly what the legacy computes for an
+                # empty walker -- so the head's walker-axis concatenation is
+                # never short and the caps never freeze for want of a block.
+                cap_stats = (self._cap_stats_local(model, new_part)
+                             if want_cap_stats else None)
+                return self._gb_neutral_finish_reply(
+                    sess, B, ntemps, nb, cap_stats=cap_stats)
 
             band_sorter = sess.band_sorter
             with tm.span("write_back"):
@@ -17729,7 +17796,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # band_info-free slice is enough.)
             cap_stats = (
                 self._cap_stats_local(model, new_part)
-                if (payload or {}).get("want_cap_stats") else None
+                if want_cap_stats else None
             )
             # NOTE: no per-rank ``[GB_TIMING]`` line here. The propose's wall
             # clock is the HEAD's (it spans the three fan-outs), so a rank has
@@ -17748,8 +17815,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 "fstat_ctr_fallback_rows": int(
                     getattr(self, "_fstat_ctr_fallback_rows", 0)),
                 "band_dof": _gb_host(getattr(self, "_band_dof", None)),
-                "rj_split": _gb_host(getattr(self, "_rj_split", None)),
-                "replace_census": _gb_host(getattr(self, "_replace_split", None)),
+                # the LIVE dicts are cleared by their own report sites inside
+                # gb_run_proposal; these are the copies stashed just before
+                # (``run_proposal`` / ``_replace_census_report``, both guarded
+                # on ``fanout_active`` so single-process output is untouched)
+                "rj_split": _gb_host(getattr(self, "_rj_split_last", None)),
+                "replace_census": _gb_host(
+                    getattr(self, "_replace_split_last", None)),
                 "timing": tm.snapshot(),
             }
         finally:
@@ -17765,22 +17837,25 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 self._gb_session = None
                 self._exit_rank_block(saved)
 
-    def _gb_neutral_finish_reply(self, sess, B, ntemps, nb):
-        """Zero reply for a block the head marked neutral (nothing happened)."""
-        ndim, nleaves = 0, 0
-        d_h, h_h = np.zeros((B, 0)), np.zeros((B, 0))
-        if sess.new_part is not None:
-            branch = self._work_branch(sess.new_part)
-            ndim = int(branch.coords.shape[-1])
-            nleaves = int(branch.coords.shape[-2])
-            sub = (getattr(sess.new_part, "sub_states", None) or {}).get(
-                self.branch_name)
-            if sub is not None and getattr(sub, "d_h", None) is not None:
-                d_h = np.array(_to_numpy(sub.d_h), copy=True)
-                h_h = np.array(_to_numpy(sub.h_h), copy=True)
-            else:  # "nothing recorded" is the sub-state's own sentinel
-                d_h = np.full((B, nleaves), np.nan)
-                h_h = np.full((B, nleaves), np.nan)
+    def _gb_neutral_finish_reply(self, sess, B, ntemps, nb, cap_stats=None):
+        """Zero reply for a block the head marked neutral (nothing happened).
+
+        The one NON-zero thing a neutral block still owns is ``cap_stats``
+        (computed by the caller when the head asked for it): the cap gate's
+        statistic has a walker axis, so every block must supply its rows or
+        the head's concatenation is short of N and the caps stall.
+        """
+        branch = self._work_branch(sess.new_part)
+        ndim = int(branch.coords.shape[-1])
+        nleaves = int(branch.coords.shape[-2])
+        sub = (getattr(sess.new_part, "sub_states", None) or {}).get(
+            self.branch_name)
+        if sub is not None and getattr(sub, "d_h", None) is not None:
+            d_h = np.array(_to_numpy(sub.d_h), copy=True)
+            h_h = np.array(_to_numpy(sub.h_h), copy=True)
+        else:  # "nothing recorded" is the sub-state's own sentinel
+            d_h = np.full((B, nleaves), np.nan)
+            h_h = np.full((B, nleaves), np.nan)
         return {
             "alive_coords": np.zeros((0, ndim)),
             "alive_twl": np.zeros((0, 3), dtype=np.int64),
@@ -17788,12 +17863,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             "h_h": h_h,
             "band_counts": np.zeros((ntemps, B, nb), dtype=int),
             "log_like_final": np.zeros(B),
-            "cap_stats": None,
+            "cap_stats": _gb_host(cap_stats),
             "fstat_ctr_fallback_rows": int(
                 getattr(self, "_fstat_ctr_fallback_rows", 0)),
-            "band_dof": None,
-            "rj_split": None,
-            "replace_census": None,
+            # _cap_stats_local sets _band_dof as a side effect; without it
+            # there is nothing this block can honestly report
+            "band_dof": (None if cap_stats is None
+                         else _gb_host(getattr(self, "_band_dof", None))),
+            "rj_split": _gb_host(getattr(self, "_rj_split_last", None)),
+            "replace_census": _gb_host(
+                getattr(self, "_replace_split_last", None)),
             "timing": None,
         }
 
@@ -17904,7 +17983,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         a neutral block: its walkers keep the ``log_like`` they came in
         with, their band counts stay zero and their ``inds`` stay all-False
         (which is what "no alive sources" means -- exactly the condition
-        that made the block neutral).
+        that made the block neutral). The ONE exception is ``cap_stats``,
+        which a neutral block computes too: those rows are the residual-
+        window values the legacy computes for an empty walker, so the cap
+        gate's walker-axis concatenation is always N rows and the caps never
+        freeze because some block had nothing to do.
         """
         # ---- prologue: ``_propose_legacy``'s, VERBATIM --------------------
         st_all = time.perf_counter()
@@ -18423,7 +18506,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         band_counts = np.zeros((ntemps, N, num_bands), dtype=int)
         # neutral blocks keep the log_like they came in with
         log_like_final = np.array(new_state.log_like[0], copy=True)
-        cap_rows, cap_missing, fallback_rows = [], False, 0
+        cap_rows, fallback_rows = [], 0
         # every alive leaf is rewritten from the replies (each block owns
         # its own births and deaths); a neutral block has none, and
         # all-False is exactly what made it neutral
@@ -18432,8 +18515,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             w0, w1 = layout.block_of(rank)
             rep = replies_f[rank]
             fallback_rows += int(rep.get("fstat_ctr_fallback_rows") or 0)
+            # Cap statistics come back for EVERY block, a neutral one
+            # included (with no sources its rows are the residual-window
+            # values, which is what the legacy computes for an empty
+            # walker), so the walker-axis concatenation is always N rows.
+            _stats = rep.get("cap_stats")
+            if _stats is not None:
+                cap_rows.append(_stats)
             if neutral[rank]:
-                cap_missing = cap_missing or want_cap_stats
                 continue
             twl = np.asarray(rep["alive_twl"], dtype=np.int64)
             if twl.shape[0]:
@@ -18448,14 +18537,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             log_like_final[w0:w1] = np.asarray(rep["log_like_final"])
             if rep.get("band_dof") is not None:
                 self._band_dof = rep["band_dof"]
-            _stats = rep.get("cap_stats")
-            if _stats is None:
-                cap_missing = cap_missing or want_cap_stats
-            else:
-                cap_rows.append(_stats)
         self._fstat_ctr_fallback_rows = fallback_rows
-        # TODO(Task 3 fix round): ``rj_split`` / ``replace_census`` ride back
-        # in the replies but are None today, so no pooled split line here.
+        # NOTE: ``rj_split`` / ``replace_census`` now ride back in the
+        # replies (each rank stashes its census before the report site
+        # clears it). Pooling them into one head line is a follow-up; each
+        # rank already logs its own.
 
         # the alive writes above moved the sub-state's cold row; the main
         # (engine) state mirrors it (``_write_back_state`` does this per
@@ -18465,7 +18551,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # The cap gate's statistic is an N-walker max, so it needs a row per
         # walker: concatenate the blocks on the walker axis.
         cap_stats = None
-        if cap_rows and not cap_missing:
+        if cap_rows:
             cap_stats = {
                 "band_lls": np.concatenate(
                     [np.asarray(s["band_lls"]) for s in cap_rows], axis=0),
@@ -18537,16 +18623,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # the designated updater move (one RJ move per iteration) advances
         # the counters; every cap-enabled RJ move enforces the gate.
         if self._band_leaf_cap is not None and self.leaf_cap_update:
-            if cap_stats is None:
-                logger.warning(
-                    "%s: leaf caps NOT advanced this propose -- a walker "
-                    "block replied without cap statistics (a block the head "
-                    "marked neutral runs nothing), so the N-walker statistic "
-                    "the gate needs does not exist. The counters are frozen "
-                    "where they stood; nothing else changes.", self.name)
-            else:
-                self._update_band_leaf_caps(
-                    model, new_state, band_counts, precomputed=cap_stats)
+            # EVERY block ships its cap rows (a neutral one included), so
+            # ``cap_stats`` is the full N-walker statistic and the gate runs
+            # on every propose -- there is no neutral-block skip any more.
+            self._update_band_leaf_caps(
+                model, new_state, band_counts, precomputed=cap_stats)
 
         accepted = np.zeros((engine_ntemps, N), dtype=bool)
 
