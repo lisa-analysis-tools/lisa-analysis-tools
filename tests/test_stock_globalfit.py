@@ -1091,3 +1091,35 @@ class PsdSharedMirrorKnobTest(unittest.TestCase):
             fit = erebor.get_stock("gb_no_fg")
             back = pickle.loads(pickle.dumps(copy.deepcopy(fit)))
             self.assertIs(back.gb.psd_shared_mirror, True)
+
+
+class RunPreparesRankTest(unittest.TestCase):
+    """``fit.run(comm)`` resolves the rank layout/device BEFORE the build (multi-rank only)."""
+
+    def _run(self, size):
+        from unittest import mock
+
+        from lisatools.globalfit.communication.fakecomm import FakeWorld
+
+        fit = erebor.blank(nwalkers=4, ntemps=2)
+        comm = FakeWorld(size).comm(0)
+        order = []
+
+        def fake_prepare(fit_, comm_, **kw):
+            order.append("prepare")
+            fit_.rank_layout = "LAYOUT"
+            return "LAYOUT"
+
+        with mock.patch("lisatools.globalfit.communication.ranks.prepare_rank", fake_prepare), \
+             mock.patch.object(type(fit), "build", lambda self_, *a, **k: order.append("build")), \
+             mock.patch("lisatools.globalfit.run.GlobalFit") as gf:
+            gf.return_value.run_global_fit.return_value = "ran"
+            self.assertEqual(fit.run(comm=comm), "ran")
+        gf.assert_called_once()
+        return order
+
+    def test_run_calls_prepare_rank_before_build(self):
+        self.assertEqual(self._run(2), ["prepare", "build"])
+
+    def test_single_rank_run_does_not_prepare(self):
+        self.assertEqual(self._run(1), ["build"])

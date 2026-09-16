@@ -835,16 +835,28 @@ class StockGlobalFit(GlobalFitSetup):
             self.__dict__.pop(attr, None)
 
     def run(self, comm=None, **run_kwargs):
-        """One-shot pipeline: build (if needed) -> GlobalFit -> run_global_fit.
+        """One-shot pipeline: prepare this rank -> build (if needed) -> GlobalFit -> run_global_fit.
 
-        ``comm`` defaults to ``MPI.COMM_WORLD``. ``run_kwargs`` pass through
-        to ``GlobalFit.run_global_fit``.
+        ``comm`` defaults to ``MPI.COMM_WORLD``. Under more than one rank, the
+        walker-block layout and this rank's device are resolved BEFORE the
+        build (``communication.ranks.prepare_rank``: ``CUDA_VISIBLE_DEVICES``
+        must be set before the first CUDA call); a fit that was already
+        prepared or built is left alone. ``run_kwargs`` pass through to
+        ``GlobalFit.run_global_fit``.
         """
-        self.build()
         if comm is None:
             from mpi4py import MPI
 
             comm = MPI.COMM_WORLD
+        if (
+            int(comm.Get_size()) > 1
+            and getattr(self, "rank_layout", None) is None
+            and not self.built
+        ):
+            from ..communication.ranks import prepare_rank
+
+            prepare_rank(self, comm)
+        self.build()
         from ..run import GlobalFit
 
         gf = GlobalFit(self, comm)
