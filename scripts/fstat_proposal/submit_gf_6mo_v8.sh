@@ -2466,10 +2466,17 @@ echo "[DATA] SOURCE_TYPES=${SOURCE_TYPES} (COMBINED = pre-summed stream; classes
 # comment blocks for the measured cost arithmetic).
 export MBH_NTEMPS=2
 export EMRI_NTEMPS=2
-export SOBBH_NTEMPS=12
+# 12 -> 8 (user ruling 2026-09-16, with repeats 25 -> 20: sobbh cost
+# trim now that the single-call fix landed). NOTE: SOBHB's ladder lives
+# in the stored PerLeafLadderState (betas_all per leaf), so on a RESUME
+# the stored 12-rung ladder wins and this value is inert -- 8 rungs
+# take effect at the next FRESH branch init (the deliberate VGB-chirp
+# restart). The persisted eigen sidecar's sobbh tables are
+# per-(temp,walker) shaped and will rebuild once on the shape change.
+export SOBBH_NTEMPS=8
 export MBH_NUM_PROP_REPEATS=2
 export EMRI_NUM_PROP_REPEATS=2
-export SOBBH_NUM_PROP_REPEATS=25
+export SOBBH_NUM_PROP_REPEATS=20   # 25 -> 20 (user ruling 2026-09-16); applies at next relaunch
 export MBH_PERMUTE_EVERY=10
 export EMRI_PERMUTE_EVERY=10
 export SOBBH_PERMUTE_EVERY=10
