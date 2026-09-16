@@ -22,6 +22,7 @@ import os
 import sys
 import threading
 import traceback
+import warnings
 
 import numpy as np
 
@@ -62,6 +63,8 @@ class WalkerBlockLayout:
     gpus_per_rank: int = 1
     ranks_per_gpu: int = 1
     legacy: bool = False
+    #: human-readable notes about non-default choices (e.g. the size-2 fallback)
+    notes: tuple = ()
 
     @property
     def n_compute(self) -> int:
@@ -118,6 +121,8 @@ class WalkerBlockLayout:
                 f"  r{r:<3d} {p.role.value:<7s} node={p.node} local={p.local_index} "
                 f"devices={list(p.devices)} slot={p.device_slot} walkers=[{p.w0},{p.w1})"
             )
+        for note in self.notes:
+            lines.append(f"  note: {note}")
         return "\n".join(lines)
 
     def digest(self) -> str:
@@ -207,6 +212,24 @@ def build_layout(
     pool = [int(g) for g in (gpu_pool or [])]
     if legacy:
         compute = (head,)
+    notes = []
+    if size == 2 and not legacy and pool and len(pool) * m // k < 2:
+        # A `-n 2` launch on a pool that cannot host two compute ranks: instead
+        # of the over-subscription error, rank 1 becomes the dedicated saver
+        # (user ruling 2026-09-15). The head then computes every walker exactly
+        # as a single-rank run does.
+        other = [r for r in range(size) if r != head][0]
+        saver = other
+        compute = (head,)
+        note = (
+            f"size-2 launch on a per-node GPU pool {pool} that supports only "
+            f"{len(pool) * m // k} compute rank(s): rank {other} runs as the "
+            "dedicated saver and the head computes all walkers. To use two "
+            "compute ranks on this pool set RANKS_PER_GPU=2; for synchronous "
+            "saves with no saver rank launch with -n 1."
+        )
+        notes.append(note)
+        warnings.warn(note, UserWarning, stacklevel=2)
     nwalkers = int(nwalkers)
     n_compute = len(compute)
     if nwalkers % n_compute:
@@ -279,6 +302,7 @@ def build_layout(
         gpus_per_rank=k,
         ranks_per_gpu=m,
         legacy=bool(legacy),
+        notes=tuple(notes),
     )
 
 

@@ -105,6 +105,48 @@ class BuildLayoutTest(unittest.TestCase):
         self.assertEqual(lay.ranks_on_device("node0", 0), (0,))
         self.assertEqual(lay.ranks_on_device("node0", 1), (0,))
 
+    def test_size2_single_gpu_demotes_rank1_to_saver_with_warning(self):
+        import warnings
+
+        world = FakeWorld(2)
+
+        def fn(rank, comm):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                lay = build_layout(comm, 4, [0], legacy=False)
+            return lay, [str(w.message) for w in caught]
+
+        out = world.run(fn)
+        lay, messages = out[0]
+        self.assertEqual(lay.compute_ranks, (0,))
+        self.assertEqual(lay.saver_rank, 1)
+        self.assertTrue(lay.is_single())
+        self.assertEqual(lay.role_of(1), RankRole.SAVER)
+        self.assertEqual(lay.block_of(0), (0, 4))
+        self.assertEqual(lay.placements[0].devices, (0,))
+        self.assertEqual(len(lay.notes), 1)
+        self.assertIn("RANKS_PER_GPU=2", lay.notes[0])
+        self.assertIn("-n 1", lay.notes[0])
+        self.assertTrue(any("dedicated saver" in m for m in messages))
+        self.assertIn("dedicated saver", lay.describe())
+        self.assertEqual(out[1][0].describe(), lay.describe())
+
+    def test_size2_with_enough_gpus_keeps_two_compute_ranks(self):
+        lay = FakeWorld(2).run(lambda r, c: build_layout(c, 4, [0, 1], legacy=False))[0]
+        self.assertEqual(lay.compute_ranks, (0, 1))
+        self.assertEqual(lay.notes, ())
+
+    def test_size2_ranks_per_gpu_2_on_one_gpu_keeps_two_compute_ranks(self):
+        lay = FakeWorld(2).run(
+            lambda r, c: build_layout(c, 4, [0], legacy=False, ranks_per_gpu=2)
+        )[0]
+        self.assertEqual(lay.compute_ranks, (0, 1))
+        self.assertEqual(lay.notes, ())
+
+    def test_size3_single_gpu_still_hard_errors(self):
+        with self.assertRaises(RuntimeError):
+            _layouts(FakeWorld(3), 4, [0])
+
 
 class SeedTest(unittest.TestCase):
     def test_distinct_and_deterministic(self):
