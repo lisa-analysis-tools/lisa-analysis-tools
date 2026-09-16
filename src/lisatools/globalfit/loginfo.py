@@ -85,7 +85,7 @@ def _set_console_handler(logger, console, level, quiet_stream):
     logger.addHandler(shandler)
 
 
-def setup_root_file_handler(log_dir, level=logging.DEBUG):
+def setup_root_file_handler(log_dir, level=logging.DEBUG, filename="globalfit_run.log"):
     """Attach a FileHandler to the 'lisatools' root logger.
 
     Since all lisatools sub-loggers propagate to 'lisatools', this single
@@ -94,9 +94,11 @@ def setup_root_file_handler(log_dir, level=logging.DEBUG):
     Args:
         log_dir: Directory where the combined log file will be written.
         level: Logging level for the file handler (default: DEBUG).
+        filename: Log file name (default: "globalfit_run.log"); a non-head
+            rank in a multi-rank run gets its own per-rank file name.
     """
     root_logger = logging.getLogger("lisatools")
-    filepath = os.path.join(log_dir, "globalfit_run.log")
+    filepath = os.path.join(log_dir, filename)
     # Avoid duplicate handlers if called more than once
     for handler in root_logger.handlers:
         if isinstance(handler, logging.FileHandler) and handler.baseFilename == os.path.abspath(filepath):

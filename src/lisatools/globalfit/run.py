@@ -33,6 +33,7 @@ except (ModuleNotFoundError, ImportError):
 from logging import getLogger
 import typing
 
+from eryn.moves import CombineMove
 from eryn.state import BranchSupplemental
 from eryn.state import State as eryn_State
 from eryn.utils.plot import PlotContainer
@@ -62,12 +63,20 @@ from ..sensitivity import (
 )
 from ..utils.device import device_context, pin_main_device
 from ..utils.utility import asnumpy
+from .communication.ranks import (
+    RankRole,
+    build_layout,
+    install_mpi_abort_on_error,
+    prefix_stdout,
+    rank_tag,
+    resolve_roles,
+)
 from .engine import EngineInfo, GeneralSetup, GlobalFitEngine, GlobalFitSettings, Setup
 from .hdfbackend import (GFHDFBackend, promote_backup_if_store_unreadable,
                          save_to_backend_asynchronously_and_plot)
 from .loginfo import dump_settings, init_logger, setup_root_file_handler
 from . import midit_checkpoint
-from .moves import GFCombineMove, GlobalFitMove, MoveBuildContext
+from .moves import FunctionMove, GFCombineMove, GlobalFitMove, MoveBuildContext
 from .postprocessing import GlobalFitPlotter, RunMetadata, SubmissionWriter, save_residuals
 from .recipe import Recipe
 from .state import GFState, make_cap_edges
@@ -75,6 +84,57 @@ from .utils import BasicResidualacsLikelihood
 
 
 logger = getLogger(__name__)
+
+
+def _leaf_moves(moves):
+    """Flatten combine moves (recursively; ``(move, weight)`` tuples unwrapped).
+
+    An EMPTY combine (no sub-moves) is itself returned as a leaf so a caller can
+    still name it.
+    """
+    out = []
+    for move in moves:
+        if isinstance(move, tuple):
+            move = move[0]
+        inner = getattr(move, "moves", None) if isinstance(move, CombineMove) else None
+        if inner:
+            out.extend(_leaf_moves(inner))
+        else:
+            out.append(move)
+    return out
+
+
+def _move_label(move):
+    return getattr(move, "gf_move_name", None) or getattr(move, "name", None) or type(move).__name__
+
+
+def _fanout_unready_moves(moves):
+    """``(unready, head_only)`` leaf-move names for a multi-rank run.
+
+    ``unready``: ``GlobalFitMove`` leaves whose class still has the default
+    ``gf_serve`` (they must be ported before running with several compute
+    ranks). ``head_only``: leaves that are not ``GlobalFitMove`` at all (plain
+    eryn moves): they run on the head against its walker block only, which is
+    logged as a warning. ``FunctionMove`` is head-only by design and appears in
+    neither list.
+    """
+    unready, head_only = [], []
+    for move in _leaf_moves(moves):
+        if isinstance(move, FunctionMove) or getattr(move, "gf_head_only", False):
+            continue
+        if not isinstance(move, GlobalFitMove):
+            head_only.append(_move_label(move))
+            continue
+        if type(move).gf_serve is GlobalFitMove.gf_serve:
+            unready.append(_move_label(move))
+    return unready, head_only
+
+
+def _rank_log_filenames(layout, rank):
+    """(root lisatools log, GlobalFit log) for this rank; the head keeps today's names."""
+    if int(rank) == int(layout.head_rank):
+        return "globalfit_run.log", "global_fit.log"
+    return f"globalfit_run.rank{int(rank)}.log", f"global_fit.rank{int(rank)}.log"
 
 
 def _branch_cap_edges(branch_info):
@@ -172,6 +232,13 @@ class GlobalFitSetup:
         settings: GlobalFitSettings object containing all configuration parameters
             for the global fit run.
     """
+
+    #: multi-rank runtime (set by ``communication.ranks.prepare_rank`` before the
+    #: build and by ``GlobalFit`` at run time; ``None`` in single-process use)
+    rank_layout = None
+    fanout = None
+    rank = None
+    rank_device_mode = None
 
     def __init__(self, settings: GlobalFitSettings):
 
@@ -384,12 +451,16 @@ class GlobalFit:
 
     @classmethod
     def resolve_rank_roles(cls, comm: MPI.Comm, main_rank: int = 0):
-        """Resolve the MPI rank roles for a run on ``comm``.
+        """Compat wrapper around ``communication.ranks.resolve_roles``.
 
         The layout is: ``main_rank`` runs the sampler; at ``size >= 3`` the
-        highest spare rank becomes the dedicated results/saver rank (below
-        that, saving is synchronous on main); every remaining rank is a
-        spare that is sent ``"stop"`` at startup.
+        highest remaining rank becomes the dedicated results/saver rank
+        (below that, saving is synchronous on main). In the current
+        (non-legacy) walker-block layout every other rank computes a walker
+        block, so ``spare_ranks`` is empty; the legacy layout
+        (``GF_LEGACY_RANK_LAYOUT=1``) still stops every non-head, non-saver
+        rank at startup and ``spare_ranks`` lists them, matching the old
+        behavior this method historically returned.
 
         Exposed as a classmethod so launchers (``scripts/run_global.py``)
         can decide which ranks need the heavy data build *before*
@@ -402,13 +473,9 @@ class GlobalFit:
         Returns:
             ``(main_rank, results_rank, spare_ranks)``.
         """
-        all_ranks = list(range(comm.Get_size()))
-        spares = [r for r in all_ranks if r != main_rank]
-        if comm.Get_size() < 3:
-            results_rank = main_rank
-        else:
-            results_rank = spares.pop()
-        return main_rank, results_rank, spares
+        head, saver, compute = resolve_roles(comm.Get_size(), main_rank)
+        spares = [r for r in range(comm.Get_size()) if r not in compute and r != saver]
+        return head, saver, spares
 
     def __init__(self, curr: GlobalFitSetup, comm: typing.Optional[MPI.Comm] = None):
         """Main class for managing the global fit MCMC sampling run.
@@ -430,19 +497,41 @@ class GlobalFit:
         self.nwalkers: int = self.curr.general_info.nwalkers
         self.ntemps: int = self.curr.general_info.ntemps
         self.all_ranks = list(range(self.comm.Get_size()))
-        # head_rank is a legacy alias from the retired multi-stage pipeline;
-        # it gets NO role here. Only ranks with an actual role enter
-        # used_ranks — every other rank (including a legacy distinct head
-        # rank) is a spare and receives "stop" at startup. Putting a
-        # roleless rank in used_ranks deadlocks it in the worker recv.
         self.head_rank = self.curr.rank_info.head_rank
-        self.main_rank = self.curr.rank_info.main_rank
-        self.main_rank, self.results_rank, self.ranks_to_give = self.resolve_rank_roles(
-            self.comm, self.main_rank
-        )
-        self.used_ranks = [self.main_rank]
+        # Layout: resolved before the build by prepare_rank (drivers /
+        # StockGlobalFit.run). The late path covers fit.sample() and legacy
+        # settings-file runs: single process, or CPU, or the legacy switch.
+        layout = getattr(self.curr, "rank_layout", None)
+        if layout is None:
+            layout = build_layout(
+                self.comm,
+                self.nwalkers,
+                list(self.curr.general_info.gpus or []),
+                main_rank=int(self.curr.rank_info.main_rank),
+            )
+            if not layout.is_single() and self.curr.general_info.gpus:
+                self.logger_early_warning = (
+                    "multi-rank layout resolved AFTER the build: device pinning "
+                    "did not run before the build allocated. Call "
+                    "communication.ranks.prepare_rank(fit, comm) before fit.build()."
+                )
+            self.curr.rank_layout = layout
+        self.layout = layout
+        self.curr.rank = self.rank
+        self.role = layout.role_of(self.rank)
+        self.main_rank = layout.head_rank
+        self.results_rank = layout.saver_rank
+        self.compute_ranks = tuple(layout.compute_ranks)
+        self.worker_ranks = tuple(layout.worker_ranks)
+        self.ranks_to_give = [
+            r for r in self.all_ranks if layout.role_of(r) == RankRole.SPARE
+        ]
+        self.used_ranks = list(self.compute_ranks)
         if self.results_rank != self.main_rank:
             self.used_ranks.append(self.results_rank)
+        self.fanout_comm = layout.make_fanout_comm(self.comm) if not layout.is_single() else None
+        if isinstance(self.comm, MPI.Comm) and self.comm.Get_size() > 1:
+            install_mpi_abort_on_error(self.comm)
 
         level = logging.DEBUG
         name = "GlobalFit"
@@ -457,12 +546,17 @@ class GlobalFit:
         _progress = getattr(self.curr.general_info, "progress", None)
         self.progress = self.verbose if _progress is None else bool(_progress)
         artifacts_dir = self.curr.general_info.artifacts_file_dir
-        setup_root_file_handler(artifacts_dir, level=level)
+        root_log, gf_log = _rank_log_filenames(layout, self.rank)
+        setup_root_file_handler(artifacts_dir, level=level, filename=root_log)
         self.logger = init_logger(
-            filename="global_fit.log", level=level, name=name, log_dir=artifacts_dir,
+            filename=gf_log, level=level, name=name, log_dir=artifacts_dir,
             console=self.verbose,
         )
-
+        if self.rank != self.main_rank:
+            prefix_stdout(rank_tag(layout, self.rank))
+        if getattr(self, "logger_early_warning", None):
+            self.logger.warning(self.logger_early_warning)
+        self.logger.info("%s\nthis rank: %s", layout.describe(), rank_tag(layout, self.rank))
         if self.rank == self.main_rank:
             dump_settings(self.curr.settings_dict, artifacts_dir)
 
@@ -2092,14 +2186,13 @@ class GlobalFit:
         # backend.save_step(state, accepted, swaps_accepted=swaps_accepted)
         # exit()
 
-        # Stop the spare processes. (The old move->rank dispatch that
-        # handed spares to moves was removed with the CPU distribution-
-        # fitting workers it served — GPU GMM fitting / neural flows
-        # replaced them; parallel-resources plan P3. A future coarse
-        # multi-node worker pool would re-enter here.)
-        for rank in self.all_ranks:
-            if rank in self.used_ranks:
-                continue
+        # Stop the legacy spare processes (empty in the new walker-block
+        # layout; the legacy layout, GF_LEGACY_RANK_LAYOUT=1, still has one
+        # compute rank owning the whole pool and every other non-saver rank
+        # a stopped spare — the old move->rank dispatch that handed spares
+        # to moves was removed with the CPU distribution-fitting workers it
+        # served; parallel-resources plan P3).
+        for rank in self.ranks_to_give:
             self.comm.send("stop", dest=rank)
 
         from eryn.moves import StretchMove
@@ -2212,104 +2305,92 @@ class GlobalFit:
             )
 
     def run_global_fit(self):
-        """Execute the main global fit MCMC sampling run.
-
-        Coordinates the entire sampling workflow including:
-        - Setting up the backend for storing results (see :meth:`prepare_main`)
-        - Loading or initializing the state
-        - Setting up analysis containers and likelihood
-        - Configuring the sampler with moves and priors
-        - Running the MCMC chain
-        - Distributing tasks across MPI ranks
-        """
-
+        """Execute the run for this rank's role (head / compute / saver / legacy spare)."""
         backend_path = self.curr.general_info.main_file_path
-
-        backend = GFHDFBackend(
-            backend_path,
-            sub_backend=self.engine_info.branch_backends,
-            sub_state_bases=self.engine_info.branch_states,
-        )
-        if self.rank == self.curr.settings_dict.rank_info.main_rank:
+        if self.role == RankRole.HEAD:
             self.prepare_main()
-
-            self.sampler.run_mcmc(self.state, self.curr.general_info.num_iterations, thin_by=1, progress=self.progress, store=True)
-
+            self.sampler.run_mcmc(
+                self.state, self.curr.general_info.num_iterations, thin_by=1,
+                progress=self.progress, store=True,
+            )
             if self.curr.general_info.submission_parent_folder is not None:
-                self.logger.debug(f"saving submission to {self.curr.general_info.submission_parent_folder}")
-                submission_writer = SubmissionWriter(backend=self.run_backend, curr=self.curr, ess=20_000)
+                self.logger.debug(
+                    f"saving submission to {self.curr.general_info.submission_parent_folder}"
+                )
+                submission_writer = SubmissionWriter(
+                    backend=self.run_backend, curr=self.curr, ess=20_000
+                )
                 submission_writer.write_submission(self.acs)
-
             logger.info("Residuals saved.")
-
+            if getattr(self, "fanout", None) is not None:
+                self.fanout.stop()
             if self.results_rank != self.main_rank:
-                # Dedicated saver rank (np >= 3): tell it the run is over.
-                # Below that the saver is aliased to main — a self-send would
-                # only rely on MPI eager buffering for nothing.
                 self.comm.send({"finish_run": True}, dest=self.results_rank)
-
-        elif self.rank == self.results_rank:
-            # Dedicated saver rank (np >= 3): async HDF5 writes + the
-            # diagnostic plots, both off the sampler's critical path
-            # (saves always take priority; see the loop's docstring).
-            # Plot container FIRST (it reads self.curr), then release this
-            # rank's build-time GPU pool cache -- the saver never touches
-            # the device again.
+        elif self.role == RankRole.SAVER:
+            backend = GFHDFBackend(
+                backend_path,
+                sub_backend=self.engine_info.branch_backends,
+                sub_state_bases=self.engine_info.branch_states,
+            )
             plot_container = self.make_plot_container()
-            self._release_helper_gpu_pool()
+            self._release_rank_gpu_pool()
             save_to_backend_asynchronously_and_plot(
-                backend,
-                self.comm,
-                self.main_rank,
-                plot_container=plot_container,
-                plot_iter=self._plot_iterations,
+                backend, self.comm, self.main_rank,
+                plot_container=plot_container, plot_iter=self._plot_iterations,
                 backup_iter=self.curr.general_info.backup_iter,
             )
-
-        else:
-            # Spare rank: wait for the startup "stop" and exit. (The
-            # instruction-dict dispatch that ran move workers here was
-            # removed with the move->rank machinery; plan P3.)
-            self._release_helper_gpu_pool()
+        elif self.role == RankRole.COMPUTE:
+            self.prepare_compute()
+            served = self.compute_service.serve()
+            self._release_rank_gpu_pool()
+            self.logger.info("compute rank %d served %d command(s); exiting.", self.rank, served)
+        else:  # legacy SPARE: wait for the startup "stop" and exit
+            self._release_rank_gpu_pool()
             info = self.comm.recv(source=self.main_rank)
             logger.info(f"Process {self.rank} finished ({info!r}).")
 
-    def _release_helper_gpu_pool(self):
-        """Release this NON-SAMPLING rank's build-time GPU memory cache.
+    def _release_rank_gpu_pool(self):
+        """Release this rank's build-time GPU memory cache on its OWN device(s).
 
-        Under ``mpiexec -n 3`` every rank runs the full ``build()`` (data
+        Under multi-rank launches every rank runs the full ``build()`` (data
         load, WDM transforms, F-stat staging) before the roles resolve, so
-        the saver and spare ranks each sit on device memory they will never
-        use again -- measured via the gpu_procs telemetry on the 2026-08-22
-        production jobs: 3.4 GB/rank at 3 months, 4.6 GB/rank at 1 year,
-        parked on ONE device. Both v5 crashes that night were allocation
-        failures on that same device at ~97-99% -- the helpers' cache was
-        the missing margin. Frees CACHED pool blocks on every visible
-        device after a ``gc.collect()`` (live arrays are untouched, so this
-        is behavior-neutral); a CPU run is a no-op.
+        the saver and (legacy) spare ranks each sit on device memory they
+        will never use again -- measured via the gpu_procs telemetry on the
+        2026-08-22 production jobs: 3.4 GB/rank at 3 months, 4.6 GB/rank at 1
+        year, parked on ONE device. Both v5 crashes that night were
+        allocation failures on that same device at ~97-99% -- the helpers'
+        cache was the missing margin. Frees CACHED pool blocks (after a
+        ``gc.collect()``; live arrays are untouched, so this is
+        behavior-neutral) on this rank's OWN devices only (``layout.
+        local_gpus``) -- not every visible device, so it stays correct when
+        several ranks share a node's GPU pool. A CPU run is a no-op.
         """
         import gc
 
         gc.collect()
         try:
             import cupy as cp
-
-            ndev = cp.cuda.runtime.getDeviceCount()
         except Exception:
             return
+        devices = self.layout.local_gpus(self.rank) or []
+        if not devices:
+            return
         freed = 0
-        for dev in range(ndev):
+        for dev in devices:
             try:
-                with cp.cuda.Device(dev):
+                with cp.cuda.Device(int(dev)):
                     pool = cp.get_default_memory_pool()
                     freed += pool.total_bytes() - pool.used_bytes()
                     pool.free_all_blocks()
             except Exception:
                 continue
         self.logger.info(
-            "helper rank %d released ~%.2f GB of cached GPU pool blocks "
-            "across %d device(s).", self.rank, freed / 1e9, ndev,
+            "rank %d released ~%.2f GB of cached GPU pool blocks on device(s) %s.",
+            self.rank, freed / 1e9, list(devices),
         )
+
+    #: legacy name (pre-multirank); kept for any external caller.
+    _release_helper_gpu_pool = _release_rank_gpu_pool
 
     def sample(
         self,
