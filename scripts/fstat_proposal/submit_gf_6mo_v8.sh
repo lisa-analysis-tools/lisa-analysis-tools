@@ -370,8 +370,13 @@
 #SBATCH --partition=gpu-80-spot   # DEFAULT partition (2-GPU flow); the
                                   # NGPUS self-dispatch below overrides it
 #SBATCH --gres=gpu:2              # DEFAULT 2 GPUs (GPUS below are LOCAL indices)
-#SBATCH --nodes=1                 # single node
-#SBATCH --ntasks=3                # main + stopped spare + SAVER rank (mpiexec -n 3)
+#SBATCH --nodes=1                 # DEFAULT 1 node; NGPUS=4 -> 2 nodes (below)
+#SBATCH --ntasks=3                # DEFAULT/fallback only (legacy layout: main
+                                  # + stopped spare + SAVER rank, mpiexec -n 3);
+                                  # the NGPUS self-dispatch below computes the
+                                  # real rank count from GPUS_PER_RANK/
+                                  # RANKS_PER_GPU/GF_LEGACY_RANK_LAYOUT and
+                                  # passes --ntasks explicitly on `exec sbatch`
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=0                   # whole-node memory
 #SBATCH --time=24:00:00
@@ -380,39 +385,75 @@
 
 set -euo pipefail
 
-# ---- GPU-count self-dispatch (2026-09-14, user ruling: "option for 4 or
-# ---- 2 gpus; 2 -> gpu-80-spot, 4 -> gpu-160-spot") ------------------------
-# #SBATCH lines are static comments, so the PARTITION cannot follow an env
-# var through a plain `sbatch <script>`. Instead, run this script DIRECTLY
-# to pick the GPU count and it submits itself to the matching partition:
+# ---- GPU-count self-dispatch + rank-layout knobs (2026-09-16: rank count
+# ---- now derives from the GPU count) ---------------------------------
+# NGPUS=2 -> gpu-80-spot, 1 node x 2 GPUs (default, unchanged partition);
+# NGPUS=4 -> gpu-80-spot, 2 NODES x 2 GPUs each -- the cluster's real 4-GPU
+# allocation shape (there is no single 4-GPU node; see the design spec's
+# "Context" section). #SBATCH lines are static comments, so neither the
+# partition/node/task count can follow an env var through a plain
+# `sbatch <script>`. Instead, run this script DIRECTLY to pick the GPU
+# count and it submits itself with the matching flags:
 #
-#     NGPUS=4 ./submit_gf_6mo_v8.sh      # gpu-160-spot, --gres=gpu:4
-#     NGPUS=2 ./submit_gf_6mo_v8.sh      # gpu-80-spot,  --gres=gpu:2
-#     sbatch  ./submit_gf_6mo_v8.sh      # legacy flow: the header defaults
-#                                        # above (2 GPUs, gpu-80-spot)
+#     NGPUS=4 ./submit_gf_6mo_v8.sh      # gpu-80-spot, 2 nodes x gpu:2
+#     NGPUS=2 ./submit_gf_6mo_v8.sh      # gpu-80-spot, 1 node  x gpu:2 (default)
+#     sbatch  ./submit_gf_6mo_v8.sh      # legacy flow: header defaults above
+#                                        # (2 GPUs, gpu-80-spot, --ntasks=3)
 #
-# Inside the job, the GPU list below derives from what slurm ACTUALLY
-# granted (SLURM_GPUS_ON_NODE), so a manual
-# `sbatch --partition=gpu-160-spot --gres=gpu:4 <script>` also works.
+# GPUS_PER_RANK (empty = AUTO) / RANKS_PER_GPU (default 1) size the compute
+# rank count: N_COMPUTE = NGPUS * RANKS_PER_GPU / GPUS_PER_RANK.
+#
+# CAMPAIGN SAFETY: GF_LEGACY_RANK_LAYOUT stays the default (=1) at NGPUS=2
+# so every line below is byte-identical in effect to today's campaign
+# launch (--ntasks=3, mpiexec -n 3) until the WP7 cluster gates pass.
+# NGPUS=4 cannot use the legacy single-compute-rank layout (it cannot span
+# nodes), so it forces GF_LEGACY_RANK_LAYOUT=0 (the walker-block layout)
+# regardless of any pre-set value.
+#
+# Inside the job, the GPU list further below derives from what slurm
+# ACTUALLY granted (SLURM_GPUS_ON_NODE), so a manual
+# `sbatch --partition=gpu-80-spot --gres=gpu:2 --nodes=2 <script>` also
+# works.
 if [ -z "${SLURM_JOB_ID:-}" ]; then
   NGPUS=${NGPUS:-2}
+  GPUS_PER_RANK=${GPUS_PER_RANK:-}
+  RANKS_PER_GPU=${RANKS_PER_GPU:-1}
+  _k=${GPUS_PER_RANK:-1}
   case "${NGPUS}" in
-    2) _NGPU_PART=gpu-80-spot ;;
-    4) _NGPU_PART=gpu-160-spot ;;
+    2) _NGPU_PART=gpu-80-spot; _NODES=1; _GRES=gpu:2 ;;
+    4) _NGPU_PART=gpu-80-spot; _NODES=2; _GRES=gpu:2 ;;
     *) echo "[SUBMIT] NGPUS=${NGPUS} unsupported (2 or 4)."; exit 2 ;;
   esac
   if [ "${NGPUS}" = "4" ]; then
-    echo "[SUBMIT] ⚠ NGPUS=4 needs a SINGLE node carrying 4 GPUs (the engine"
-    echo "[SUBMIT]   is single-process multi-GPU: one rank drives local CUDA"
-    echo "[SUBMIT]   devices; MPI ranks are roles, not workers -- it CANNOT"
-    echo "[SUBMIT]   span nodes). --nodes=1 stays pinned, so on a partition"
-    echo "[SUBMIT]   with 2-GPU nodes this job will PEND FOREVER rather than"
-    echo "[SUBMIT]   silently waste half the cards. If gpu-160-spot has no"
-    echo "[SUBMIT]   4-GPU nodes, use two 2-GPU jobs instead (main + null)."
+    GF_LEGACY_RANK_LAYOUT=0
+  else
+    GF_LEGACY_RANK_LAYOUT=${GF_LEGACY_RANK_LAYOUT:-1}
   fi
-  echo "[SUBMIT] NGPUS=${NGPUS} -> sbatch --partition=${_NGPU_PART} --gres=gpu:${NGPUS}"
-  exec sbatch --partition="${_NGPU_PART}" --gres="gpu:${NGPUS}" \
-       --export=ALL,NGPUS="${NGPUS}" "$0" "$@"
+  export GF_LEGACY_RANK_LAYOUT
+  N_COMPUTE=$(( NGPUS * RANKS_PER_GPU / _k ))
+  if [ "${GF_LEGACY_RANK_LAYOUT}" = "1" ]; then
+    NTASKS=3
+  else
+    NTASKS=$(( N_COMPUTE + 1 ))
+  fi
+  if [ "${GF_LEGACY_RANK_LAYOUT}" = "1" ]; then
+    echo "[SUBMIT] GF_LEGACY_RANK_LAYOUT=1: TODAY's roles (one sampling rank"
+    echo "[SUBMIT]   drives all local GPUs; rank 1 stopped spare; rank 2"
+    echo "[SUBMIT]   saver) -- set GF_LEGACY_RANK_LAYOUT=0 for the"
+    echo "[SUBMIT]   walker-block layout after the WP7 gates."
+  else
+    echo "[SUBMIT] GF_LEGACY_RANK_LAYOUT=0: walker-block layout: ${N_COMPUTE}"
+    echo "[SUBMIT]   compute ranks + 1 saver."
+  fi
+  echo "[SUBMIT] NGPUS=${NGPUS} -> sbatch --partition=${_NGPU_PART} --gres=${_GRES} --nodes=${_NODES} --ntasks=${NTASKS} (N_COMPUTE=${N_COMPUTE} compute ranks + 1 saver)"
+  _DIST_FLAG=""
+  if [ "${_NODES}" = "2" ]; then
+    _DIST_FLAG="--distribution=cyclic"
+  fi
+  exec sbatch --partition="${_NGPU_PART}" --gres="${_GRES}" --nodes="${_NODES}" \
+       --ntasks="${NTASKS}" ${_DIST_FLAG} \
+       --export=ALL,NGPUS="${NGPUS}",GPUS_PER_RANK="${GPUS_PER_RANK}",RANKS_PER_GPU="${RANKS_PER_GPU}",GF_LEGACY_RANK_LAYOUT="${GF_LEGACY_RANK_LAYOUT}" \
+       "$0" "$@"
 fi
 
 # ---- environment (fill in your activation) ---------------------------------
@@ -531,6 +572,27 @@ GPUS=$(printf ",%d" $(seq 0 $((_NGPUS_EFF - 1)))); GPUS=${GPUS:1}
 export GPUS
 echo "[GPUS] ${_NGPUS_EFF} GPUs -> GPUS=${GPUS} (partition ${SLURM_JOB_PARTITION:-n/a})"
 
+# ---- rank-layout knobs, re-derived in-job -----------------------------
+# The self-dispatch block above already exports these via `--export=ALL,...`
+# when the script is run directly; a manual `sbatch --gres=... <script>`
+# skips that block entirely (SLURM_JOB_ID is already set at job start), so
+# re-apply the identical defaults here rather than depending on an unset
+# var under `set -u`.
+GPUS_PER_RANK=${GPUS_PER_RANK:-}
+RANKS_PER_GPU=${RANKS_PER_GPU:-1}
+_k=${GPUS_PER_RANK:-1}
+if [ "${NGPUS:-2}" = "4" ]; then
+  GF_LEGACY_RANK_LAYOUT=${GF_LEGACY_RANK_LAYOUT:-0}
+else
+  GF_LEGACY_RANK_LAYOUT=${GF_LEGACY_RANK_LAYOUT:-1}
+fi
+export GF_LEGACY_RANK_LAYOUT
+if [ "${GF_LEGACY_RANK_LAYOUT}" = "1" ]; then
+  N_COMPUTE_EFF=1
+else
+  N_COMPUTE_EFF=$(( ${SLURM_NNODES:-1} * _NGPUS_EFF * RANKS_PER_GPU / _k ))
+fi
+
 # ---- output ----------------------------------------------------------------
 export FILE_STORE_DIR=${STORE_DIR}
 export BASE_FILE_NAME=gf_prod_6mo
@@ -581,6 +643,10 @@ export NWALKERS=10                 # 10-walker rebase (2026-09-11 ruling: build
                                    # walkers and temps are independent axes.
                                    # Noise-block floor 2*ndim (galfor ndim 5
                                    # -> 10) still satisfied.
+if [ "${GF_LEGACY_RANK_LAYOUT}" = "0" ] && [ $(( NWALKERS % N_COMPUTE_EFF )) -ne 0 ]; then
+  echo "[SUBMIT] NWALKERS=${NWALKERS} is not a multiple of N_COMPUTE=${N_COMPUTE_EFF}; using NWALKERS=$(( (NWALKERS / N_COMPUTE_EFF + 1) * N_COMPUTE_EFF )) (user decision at the first 4-GPU launch)"
+  export NWALKERS=$(( (NWALKERS / N_COMPUTE_EFF + 1) * N_COMPUTE_EFF ))
+fi
 export NUM_ITERATIONS=2000         # total engine iterations (resume-safe; NITER was a dead name)
 
 # ---- band + domain ---------------------------------------------------------
@@ -2637,5 +2703,9 @@ if bad:
 print("[SOURCES] preflight OK.")
 PYEOF
 
-mpiexec -n 3 python scripts/fstat_proposal/run_combined_staged.py
+if [ "${SLURM_NNODES:-1}" -gt 1 ]; then
+  srun --ntasks="${SLURM_NTASKS}" --distribution=cyclic python scripts/fstat_proposal/run_combined_staged.py
+else
+  mpiexec -n "${SLURM_NTASKS:-3}" python scripts/fstat_proposal/run_combined_staged.py
+fi
 # python scripts/fstat_proposal/run_combined_staged.py   # single-process fallback
