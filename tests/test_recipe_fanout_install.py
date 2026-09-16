@@ -1,7 +1,6 @@
 """The recipe installs the fan-out on every addremove/PSD move it builds."""
 
 import unittest
-from unittest import mock
 
 from lisatools.globalfit import recipe as recipe_mod
 from lisatools.globalfit.moves.addremovemove import ResidualAddOneRemoveOneMove

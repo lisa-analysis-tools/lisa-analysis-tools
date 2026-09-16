@@ -344,8 +344,13 @@ class BatchedMoveStockParityTest(unittest.TestCase):
         import os
         import tempfile
 
-        os.environ.setdefault("USE_GPU", "0")
-        os.environ.setdefault("MAKE_DIAGNOSTIC_PLOTS", "0")
+        # setdefault LEAKS into every later test module in the same process
+        # (it broke test_stock_globalfit's lite-vs-twin case): only keys this
+        # class actually introduced are unset again when it is done.
+        for key in ("USE_GPU", "MAKE_DIAGNOSTIC_PLOTS"):
+            if key not in os.environ:
+                os.environ[key] = "0"
+                cls.addClassCleanup(os.environ.pop, key, None)
         cls._file_store = tempfile.mkdtemp(prefix="psdbatch_test_")
         cls._old_store = os.environ.get("FILE_STORE_DIR")
         os.environ["FILE_STORE_DIR"] = cls._file_store

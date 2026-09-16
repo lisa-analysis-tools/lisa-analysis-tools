@@ -185,6 +185,45 @@ class MixinFakeWorldTest(unittest.TestCase):
                 self.assertIsNone(sub)
 
 
+class _ProposeOverridingMove(_StubMove):
+    """The trap: a subclass whose preamble lives in ``propose`` runs on the head only."""
+
+    def propose(self, model, state):
+        return self.propose_local(model, state)
+
+
+class ProposeOverrideGuardTest(unittest.TestCase):
+    def _fanout(self, compute_ranks):
+        # one compute rank => a 1-rank world (a size-2 world would demote rank 1
+        # to the saver and warn); several => + the dedicated saver rank
+        size = 1 if len(compute_ranks) == 1 else len(compute_ranks) + 1
+        layout = FakeWorld(size).run(
+            lambda r, c: build_layout(c, NWALKERS, list(compute_ranks), legacy=False)
+        )[0]
+        return WalkerFanout(None, layout, 0)
+
+    def test_multi_rank_install_refuses_a_propose_override(self):
+        move = _ProposeOverridingMove(0.0)
+        with self.assertRaisesRegex(TypeError, "propose_local"):
+            move.install_walker_fanout(_Curr(self._fanout([0, 1]), 0))
+        # refused before anything is touched: the ladder is left configured
+        self.assertTrue(move.tc.adaptive)
+        self.assertFalse(hasattr(move.tc, "gf_configured_adaptive"))
+
+    def test_single_rank_install_allows_it(self):
+        move = _ProposeOverridingMove(0.0)
+        move.install_walker_fanout(_Curr(self._fanout([0]), 0))
+        self.assertFalse(move.fanout_active)
+
+    def test_the_ported_families_do_not_override_propose(self):
+        from lisatools.globalfit.moves.addremovemove import ResidualAddOneRemoveOneMove
+        from lisatools.globalfit.moves.mbhspecialmove import MBHSpecialMove
+        from lisatools.globalfit.moves.psdmove import MultiGPUPSDMove, PSDMove
+
+        for cls in (ResidualAddOneRemoveOneMove, MBHSpecialMove, PSDMove, MultiGPUPSDMove):
+            self.assertIs(cls.propose, WalkerFanoutMixin.propose, cls.__name__)
+
+
 class SharedControlInstallTest(unittest.TestCase):
     def test_second_install_keeps_the_configured_adaptive(self):
         # the PSD search and PE moves share ONE TemperatureControl: the second

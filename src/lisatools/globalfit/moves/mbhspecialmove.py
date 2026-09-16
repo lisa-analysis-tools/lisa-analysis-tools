@@ -671,13 +671,18 @@ class MBHSpecialMove(
                 os.remove(fp)
                 return
 
-    def propose(self, model, state):
-        """Propose MBH updates by delegating to :meth:`ResidualAddOneRemoveOneMove.propose`.
+    def propose_local(self, model, state):
+        """Propose MBH updates via :meth:`ResidualAddOneRemoveOneMove.propose_local`.
 
         Skips work entirely if no MBH leaves are populated and the search has
         already concluded.
+
+        This is the move BODY: ``WalkerFanoutMixin.propose`` owns ``propose``
+        and calls this on every compute rank with that rank's walker block, so
+        the preamble below runs everywhere (overriding ``propose`` instead
+        would run it on the head only).
         """
-        __doc__ = ResidualAddOneRemoveOneMove.propose.__doc__
+        __doc__ = ResidualAddOneRemoveOneMove.propose_local.__doc__
         assert np.all(state.branches["mbh"].nleaves[0, 0] == state.branches["mbh"].nleaves)
         if self.finished_search and state.branches["mbh"].nleaves[0, 0] == 0:
             logger.debug("No MBHs in sampler. Skipping proposal.")
@@ -687,7 +692,7 @@ class MBHSpecialMove(
 
         # TODO: fix so it is generic.
         self.waveform_gen.amp_phase_gen.initial_t_val = 0.0
-        output = ResidualAddOneRemoveOneMove.propose(self, model, state)
+        output = ResidualAddOneRemoveOneMove.propose_local(self, model, state)
         return output
 
     def setup_likelihood_here(self, coords):

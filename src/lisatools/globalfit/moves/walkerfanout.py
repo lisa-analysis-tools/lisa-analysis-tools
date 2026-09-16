@@ -20,6 +20,17 @@ Semantics that change only when several compute ranks exist (design spec,
 * Sub-state delta counters of the fanned-out branches equal the SUM over ranks
   of what the body wrote (the head's copy is zeroed first when the body assigns
   them, ``fanout_assigns_counters``).
+* PSD search mode (``PSDMove.run_move_max_likelihood``) plateaus on the RANK's
+  walker block maximum, so search termination is per block; pooling it would
+  need an in-body collective across ranks (deferred).
+* The pooled PSD ladder adaptation consumes ``PSDMove.run_move``'s explicit
+  ``temperature_swaps`` tallies (the fancy, walker-permuting swaps included),
+  where single mode adapts from the identity swaps ``temper_comps`` makes
+  inside eryn's ``RedBlueMove.propose``. Both are valid acceptance ratios; the
+  swap POPULATION feeding the ladder differs.
+* ``move.temperature_control.swaps_accepted`` -- what eryn stores to HDF -- is
+  the HEAD block's count, while the sub-state swap counters are pooled over
+  ranks. Diagnostic only: nothing reads the control's copy back.
 """
 
 from __future__ import annotations
@@ -114,6 +125,12 @@ class WalkerFanoutMixin:
         self.gf_rank = getattr(curr, "rank", None)
         if not self.fanout_active:
             return
+        # Refuse BEFORE anything is mutated, so a rejected move leaves no trace.
+        if self.fanout_active and type(self).propose is not WalkerFanoutMixin.propose:
+            raise TypeError(
+                f"{type(self).__name__} overrides propose(); under several compute ranks the "
+                "body must live in propose_local() so every rank runs it (the mixin owns propose)"
+            )
         for tc in self.fanout_temperature_controls():
             if tc is None:
                 continue

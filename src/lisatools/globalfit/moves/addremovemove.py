@@ -1548,12 +1548,13 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
 
     def _fanout_note_swaps(self, leaf, tc):
         """Accumulate this repeat's swap counts for ``leaf`` (Eryn re-zeroes them per call)."""
-        if self._fanout_swap_tally is None:
-            self._fanout_swap_tally = {}
+        tally = getattr(self, "_fanout_swap_tally", None)
+        if tally is None:
+            tally = self._fanout_swap_tally = {}
         acc = np.asarray(tc.swaps_accepted, dtype=float).ravel()
         prop = np.asarray(tc.swaps_proposed, dtype=float).ravel()
-        a, p = self._fanout_swap_tally.get(int(leaf), (0.0, 0.0))
-        self._fanout_swap_tally[int(leaf)] = (a + acc, p + prop)
+        a, p = tally.get(int(leaf), (0.0, 0.0))
+        tally[int(leaf)] = (a + acc, p + prop)
 
     def fanout_temperature_controls(self):
         return list(self.temperature_controls)
@@ -1574,7 +1575,7 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         return {
             "swap_tally": {
                 int(leaf): (np.asarray(a, dtype=float), np.asarray(p, dtype=float))
-                for leaf, (a, p) in getattr(self, "_fanout_swap_tally", {}).items()
+                for leaf, (a, p) in (getattr(self, "_fanout_swap_tally", None) or {}).items()
             }
         }
 

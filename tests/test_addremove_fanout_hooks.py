@@ -89,6 +89,19 @@ class AddRemoveFanoutHooksTest(unittest.TestCase):
         move = _skeleton(3)
         self.assertEqual(len(move.fanout_temperature_controls()), 3)
 
+    def test_tally_hooks_survive_the_class_default_none(self):
+        # _fanout_swap_tally's CLASS default is None (a propose that never
+        # reached the leaf loop leaves it there), so both hooks must treat
+        # None as "nothing tallied" rather than dereference it.
+        move = _skeleton()
+        del move._fanout_swap_tally
+        self.assertIsNone(move._fanout_swap_tally)
+        self.assertEqual(move.fanout_reply_extra(None)["swap_tally"], {})
+        tc = move.temperature_controls[0]
+        tc.swaps_accepted = np.array([1, 0])
+        move._fanout_note_swaps(0, tc)
+        np.testing.assert_array_equal(move._fanout_swap_tally[0][0], [1.0, 0.0])
+
 
 if __name__ == "__main__":
     unittest.main()

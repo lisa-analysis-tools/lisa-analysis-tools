@@ -2095,10 +2095,11 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
             # WalkerFanoutMixin now sits between PSDMove and GlobalFitMove in
             # the MRO and defines its own `propose` (the fan-out dispatcher);
             # `super(PSDMove, self)` would land there instead of the vanilla
-            # RedBlueMove stretch proposal this stage-1 draw needs, so the
-            # hand-off starts one layer further, exactly where it did before
-            # the mixin was inserted.
-            new_state, accepted1 = super(WalkerFanoutMixin, self).propose(model, state)
+            # RedBlueMove stretch proposal this stage-1 draw needs. Name that
+            # proposal outright (StretchMove.propose IS RedBlueMove.propose) --
+            # exactly what this hand-off reached before the mixin was inserted,
+            # and independent of where the mixin sits in the MRO.
+            new_state, accepted1 = StretchMove.propose(self, model, state)
         finally:
             self.temperature_control = _tc
         acc = np.asarray(accepted1, dtype=bool)
@@ -2179,10 +2180,11 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         ):
             new_state, accepted = self._propose_delayed_acceptance(model, state)
         else:
-            # See the matching comment in _propose_delayed_acceptance: skip
-            # past WalkerFanoutMixin's own `propose` to reach the vanilla
-            # RedBlueMove stretch proposal, as this hand-off did pre-mixin.
-            new_state, accepted = super(WalkerFanoutMixin, self).propose(model, state)
+            # See the matching comment in _propose_delayed_acceptance: name the
+            # vanilla stretch proposal outright (StretchMove.propose IS
+            # RedBlueMove.propose) rather than walking the MRO past the fan-out
+            # mixin -- the same target this hand-off had pre-mixin.
+            new_state, accepted = StretchMove.propose(self, model, state)
 
         # in-model bookkeeping: eryn returns (ntemps, nwalkers) acceptances and
         # every walker is proposed once per call, so the per-temperature deltas
@@ -2267,6 +2269,11 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         Used in search-style runs (``max_logl_mode=True``). The loop counts
         consecutive iterations during which the cold-chain max log-likelihood
         no longer increases and exits after ``num_checks`` such iterations.
+
+        Under several compute ranks this plateau is the RANK's walker block's
+        maximum, so search termination is per block -- see the module docstring
+        of :mod:`~lisatools.globalfit.moves.walkerfanout` ("Semantics that
+        change").
         """
         num_checks = 5
         num_so_far = 0
@@ -2288,6 +2295,11 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         return state, accepted
 
     # ---- multi-rank fan-out (WalkerFanoutMixin hooks) ------------------------
+    # Multi-rank semantics this family changes (walkerfanout module docstring,
+    # "Semantics that change"): the search-mode plateau is per walker block,
+    # the pooled ladder adapts from run_move's explicit swap tallies (a
+    # different swap population from single mode's), and the control's own
+    # swaps_accepted stored by eryn/HDF is the head block's count.
     def fanout_temperature_controls(self):
         return [self.temperature_control]
 
@@ -2296,7 +2308,8 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
 
     def fanout_apply_extra(self, extra):
         if "betas" in extra:
-            self.temperature_control.betas[:] = np.asarray(extra["betas"], dtype=float)
+            # rebind, never write in place: the control may alias the recipe's betas array
+            self.temperature_control.betas = np.asarray(extra["betas"], dtype=float).copy()
 
     @staticmethod
     def _tally_or_empty(arr):
@@ -2314,14 +2327,21 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         The body copies ``tc.betas`` into every sampled sub-state
         (``sub.betas[:] = ...``) but ``merge_walkers`` never writes ladders back,
         so the head republishes the adapted ladder here.
+
+        The pooled ratio is built from ``run_move``'s explicit
+        ``temperature_swaps`` tallies (fancy swaps included), a different swap
+        population from the single-process ladder's -- see the module docstring
+        of :mod:`~lisatools.globalfit.moves.walkerfanout` ("Semantics that
+        change").
         """
         if not replies:
             return
         tc = self.temperature_control
         acc = sum(np.asarray(e["swaps_accepted"], dtype=float) for e in replies.values())
         prop = sum(np.asarray(e["swaps_proposed"], dtype=float) for e in replies.values())
-        tc.betas[:] = pooled_ladder_step(tc, np.array(tc.betas, copy=True), acc, prop)
-        for key in self.sampled_branches:
+        # rebind, never write in place: the control may alias the recipe's betas array
+        tc.betas = pooled_ladder_step(tc, np.array(tc.betas, copy=True), acc, prop)
+        for key in (self.fanout_branches or self.sampled_branches or []):
             sub = (getattr(new_state, "sub_states", None) or {}).get(key)
             if sub is not None and getattr(sub, "betas", None) is not None:
                 sub.betas[:] = tc.betas
