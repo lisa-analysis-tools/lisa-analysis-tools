@@ -15246,8 +15246,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         The repack writes into ``new_state.branches['gb']``; the return is
         the written ``(temp, walker, leaf)`` index triple plus the sorter's
-        alive mask, which the multi-rank head needs to place a rank block's
-        leaves at their GLOBAL walker positions (both branches return it).
+        alive mask (both branches return it). Note the multi-rank rank body
+        does NOT consume that return: it ships its whole branch block back
+        to the head (``_gb_serve_finish``), because a ``keep_all_inds``
+        sorter also leaves its rejected-birth fill in the DEAD slots of this
+        very array and the head has to carry that too.
 
         Leaves are re-indexed densely per (temp, walker) in frequency order:
         live sources are ranked by the composite key
@@ -17897,21 +17900,32 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
             band_sorter = sess.band_sorter
             with tm.span("write_back"):
-                inds_new, alive = self._write_back_state(new_part, band_sorter)
-            # Materialize the alive export to HOST numpy HERE: ``alive`` is a
-            # live reference to ``band_sorter.inds`` and the sorter (and the
-            # device blocks behind it) are released a few lines below.
-            alive_coords = np.asarray(
-                _to_numpy(band_sorter.coords[alive]), dtype=float)
-            alive_twl = np.stack(
-                [np.asarray(_to_numpy(x)).astype(np.int64).ravel() for x in inds_new],
-                axis=1,
-            ) if alive_coords.shape[0] else np.zeros((0, 3), dtype=np.int64)
+                self._write_back_state(new_part, band_sorter)
+
+            work = self._work_branch(new_part)
+            # THE WHOLE BLOCK'S BRANCH, not just its alive leaves (fix round
+            # 4, 2026-09-16). A ``keep_all_inds`` sorter takes
+            # ``xp.asarray(gb_branch.coords.reshape(-1, ndim))`` as its
+            # coords, which on a CPU-resolved run is a VIEW of the branch
+            # array: its rejected-birth fill of the dead slots is written
+            # straight into ``work.coords``, and ``_propose_legacy`` returns a
+            # state carrying it. Exporting only the alive leaves left the
+            # head's dead slots at their pre-propose values, which is the
+            # whole legacy-vs-orchestrator ``coords`` difference the parity
+            # gate was red on (every cold dead slot, on an EMPTY model, with
+            # the module-level RNG stream consumed identically at every
+            # checkpoint). Shipping the block is also strictly simpler: no
+            # local->global leaf-triple remap on the head, and no ordering
+            # hazard around releasing the sorter. Size is
+            # ``ntemps x B x nleaves_max x ndim`` float64 per rank per propose
+            # (a few MB at production shapes, against a propose measured in
+            # tens of seconds).
+            block_coords = np.array(_to_numpy(work.coords), copy=True)
+            block_inds = np.array(_to_numpy(work.inds), copy=True)
             sub = new_part.sub_states[self.branch_name]
             d_h = np.array(_to_numpy(sub.d_h), copy=True)
             h_h = np.array(_to_numpy(sub.h_h), copy=True)
 
-            work = self._work_branch(new_part)
             num_active_leaves = work.inds[0].sum(axis=-1)
             logger.info(
                 f"{self._rank_tag()}Number of active leaves in cold chain "
@@ -17919,7 +17933,6 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
             sess.band_sorter = None
             del band_sorter
-            del alive
             with tm.span("mempool_free"):
                 self.mempool.free_all_blocks()
             with tm.span("sorter_rebuild"):
@@ -17967,9 +17980,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # merged line from the ``timing`` snapshots, and per-command load
             # balance is already in fanout.py's ``[FANOUT]`` line.
             return {
-                "alive_coords": alive_coords,
-                # (temp, LOCAL walker, leaf) of every written leaf
-                "alive_twl": alive_twl,
+                # the block's WHOLE branch, ``(ntemps, B, nleaves_max, ndim)``
+                # / ``(ntemps, B, nleaves_max)`` -- dead-slot fill included
+                # (see the note at the copy site)
+                "block_coords": block_coords,
+                "block_inds": block_inds,
                 "d_h": d_h,
                 "h_h": h_h,
                 "band_counts": _gb_host(band_info["band_counts"]),
@@ -18022,7 +18037,6 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         not mistake the zeros for state.
         """
         branch = self._work_branch(sess.new_part)
-        ndim = int(branch.coords.shape[-1])
         nleaves = int(branch.coords.shape[-2])
         sub = (getattr(sess.new_part, "sub_states", None) or {}).get(
             self.branch_name)
@@ -18033,8 +18047,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             d_h = np.full((B, nleaves), np.nan)
             h_h = np.full((B, nleaves), np.nan)
         return {
-            "alive_coords": np.zeros((0, ndim)),
-            "alive_twl": np.zeros((0, 3), dtype=np.int64),
+            # None, not an empty array: a neutral block ran nothing, so the
+            # head must KEEP the coords/inds it sliced for those walkers
+            # rather than write anything back (the head skips a neutral
+            # block's merge anyway; these say so in the reply itself)
+            "block_coords": None,
+            "block_inds": None,
             "d_h": d_h,
             "h_h": h_h,
             "band_counts": np.zeros((ntemps, B, nb), dtype=int),
@@ -18739,10 +18757,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # neutral blocks keep the log_like they came in with
         log_like_final = np.array(new_state.log_like[0], copy=True)
         cap_rows, fallback_rows = [], 0
-        # every alive leaf is rewritten from the replies (each block owns
-        # its own births and deaths); a neutral block has none, and
-        # all-False is exactly what made it neutral
-        work.inds[:] = False
+        # Each block's WHOLE branch slice is rewritten from its reply (a
+        # block owns its walkers' coords and inds outright -- there is no
+        # cross-walker coupling in either array), so the head ends the
+        # propose with exactly what ``_propose_legacy`` would hold: the
+        # repacked alive leaves AND the sorter's rejected-birth fill in the
+        # dead slots (fix round 4; see the copy site in ``_gb_serve_finish``).
+        # A NEUTRAL block writes nothing: it ran nothing, so the coords the
+        # head sliced for it are already its state and its ``inds`` are
+        # all-False -- which is exactly what made it neutral.
         for rank in layout.compute_ranks:
             w0, w1 = layout.block_of(rank)
             rep = replies_f[rank]
@@ -18756,12 +18779,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 cap_rows.append(_stats)
             if neutral[rank]:
                 continue
-            twl = np.asarray(rep["alive_twl"], dtype=np.int64)
-            if twl.shape[0]:
-                # column 1 is a LOCAL walker id: this block starts at w0
-                _t, _w, _l = twl[:, 0], twl[:, 1], twl[:, 2]
-                work.coords[_t, w0 + _w, _l] = np.asarray(rep["alive_coords"])
-                work.inds[_t, w0 + _w, _l] = True
+            work.coords[:, w0:w1] = np.asarray(rep["block_coords"])
+            work.inds[:, w0:w1] = np.asarray(rep["block_inds"])
             if getattr(sub, "d_h", None) is not None:
                 sub.d_h[w0:w1] = np.asarray(rep["d_h"])
                 sub.h_h[w0:w1] = np.asarray(rep["h_h"])

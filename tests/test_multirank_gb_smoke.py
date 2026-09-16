@@ -60,36 +60,40 @@ control proves nothing, and a red control means "this fixture does not
 reproduce", never "the orchestrator diverges". ``GB_SMOKE_PARITY_CONTROL=0``
 skips it (one child fewer).
 
-MEASURED 2026-09-16, first run of this harness: the gate is RED, the control is
-GREEN
------------------------------------------------------------------------------
-Recorded here because the numbers are the finding, not the harness:
+WHAT THIS GATE CAUGHT, AND THE FIX (2026-09-16)
+-----------------------------------------------
+The first run of this harness was RED with a GREEN control, and the numbers are
+worth keeping because they are what named the defect:
 
 * CONTROL (legacy vs legacy, two fresh interpreters, injected, 11 alive
-  leaves): **bit-identical on all five arrays, ``coords`` included**. The
-  fixture reproduces itself perfectly once each arm is its own process -- which
-  is what this round set out to establish, and which retires the old
-  "self-promotion" branch (the gate now compares full ``coords`` outright).
-* GATE (legacy vs orchestrator, same harness): ``inds``, ``band_temps`` and
-  ``band_num_binaries`` bit-identical; ``log_like`` differs on 1 of 4 cold
-  walkers by 1.99e-13 (rel 2.3e-15); ``coords`` differs in 390 of 400 cold-chain
-  leaves -- 389 DEAD slots plus ONE alive leaf (cold walker 1, leaf 1) whose 9
-  columns are a different accepted birth. The hot chain is untouched.
-* The orchestrated arm is internally deterministic: two orchestrated arms in
-  separate processes agree bit for bit on all five arrays.
-* On the EMPTY model (no injection) through the same harness: ``log_like``,
-  ``inds``, ``band_temps``, ``band_num_binaries`` bit-identical, and ``coords``
-  differs in ALL 400 cold-chain (dead) leaves.
+  leaves): bit-identical on all five arrays, ``coords`` included. The fixture
+  reproduces itself perfectly once each arm is its own process -- which retired
+  the old "self-promotion" branch (the gate compares full ``coords`` outright).
+* GATE (legacy vs orchestrator): ``inds``, ``band_temps`` and
+  ``band_num_binaries`` bit-identical; ``coords`` differed in 390 of 400
+  cold-chain leaves (389 DEAD slots plus one alive leaf) and ``log_like`` on
+  1 of 4 cold walkers by 1.99e-13. On the EMPTY model: every physics array
+  bit-identical and ALL 400 cold-chain (dead) leaves different.
 
-Read together: the two bodies make the same decisions but do not consume the
-module-level ``np.random`` proposal stream identically, so the rejected-birth
-fill left behind in dead leaf slots differs wholesale even with nothing alive,
-and on a live model that difference occasionally lands a different accepted
-birth. Dead-leaf content is not part of the model (eryn ignores ``coords``
-where ``inds`` is False), but the alive-leaf difference is real. Whether the
-fix is to make ``_propose_orchestrated`` draw in the legacy order, or to
-redefine parity on a live model, is a controller ruling -- so the gate is left
-STRICT and red rather than quietly relaxed.
+The first reading -- that the two bodies consume the module-level ``np.random``
+stream differently -- was WRONG, and RNG-state probes at nine matched
+checkpoints in both bodies refuted it: the MT19937 position and key hash agree
+exactly at every one of them (entry, after ``setup()``, after the sorter build,
+after ``run_proposal``, after ``run_tempering``, after the write-back, at exit),
+and so does eryn's ``model.random``. The real defect was a MERGE gap:
+
+    a ``keep_all_inds`` ``BandSorter`` takes
+    ``xp.asarray(gb_branch.coords.reshape(-1, ndim))`` as its coords, which on
+    a CPU-resolved run is a VIEW of the branch array, so the rejected-birth
+    fill it writes into the dead slots lands in the state ``_propose_legacy``
+    returns. ``gb_finish`` exported only the ALIVE leaves, so the head's dead
+    slots kept their pre-propose values.
+
+Fixed by having ``gb_finish`` ship the block's whole branch
+(``block_coords``/``block_inds``) and the head write ``work.coords[:, w0:w1]``
+/ ``work.inds[:, w0:w1]`` per block (a neutral block ships ``None`` and keeps
+what the head sliced). All five arrays -- full ``coords`` included -- are now
+bit-identical on the empty model and with the live source.
 
 Memory: an 8 GB laptop is the budget. The parity arms cost the PARENT nothing
 now (it builds no fit there; each child peaks ~3 GB and exits before the next

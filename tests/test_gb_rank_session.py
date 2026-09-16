@@ -779,8 +779,10 @@ class NeutralBlockTest(unittest.TestCase):
             {"seq": 7, "call_index": 4},
             self.model,
         )
-        self.assertEqual(np.shape(rep3["alive_coords"]), (0, NDIM))
-        self.assertEqual(np.shape(rep3["alive_twl"]), (0, 3))
+        # a neutral block ran nothing, so it ships NO branch block: the head
+        # keeps the coords/inds it sliced for those walkers
+        self.assertIsNone(rep3["block_coords"])
+        self.assertIsNone(rep3["block_inds"])
         self.assertEqual(np.shape(rep3["d_h"]), (B, NLEAVES))
         self.assertEqual(np.shape(rep3["h_h"]), (B, NLEAVES))
         self.assertEqual(np.shape(rep3["band_counts"]), (NTEMPS, B, NUM_BANDS))

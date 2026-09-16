@@ -54,7 +54,7 @@ ORCHESTRATOR_REPLY_KEYS = {
         "band_swaps_accepted", "band_swaps_proposed", "drift", "log_like_cold",
     }),
     "gb_finish": frozenset({
-        "alive_coords", "alive_twl", "d_h", "h_h", "band_counts",
+        "block_coords", "block_inds", "d_h", "h_h", "band_counts",
         "log_like_final", "cap_stats", "band_dof", "fstat_ctr_fallback_rows",
         "timing",
     }),
@@ -178,8 +178,9 @@ def _stub_gf_serve(move, op, payload, clock, model):
             # with no sources they are the residual-window values, so the
             # head's walker-axis concatenation is still N rows.
             return _checked(op, {
-                "alive_coords": np.zeros((0, NDIM)),
-                "alive_twl": np.zeros((0, 3), dtype=np.int64),
+                # a neutral block ships no branch block at all
+                "block_coords": None,
+                "block_inds": None,
                 "d_h": np.full((B, NLEAVES), np.nan),
                 "h_h": np.full((B, NLEAVES), np.nan),
                 "band_counts": np.zeros((ntemps, B, nb), dtype=int),
@@ -191,10 +192,16 @@ def _stub_gf_serve(move, op, payload, clock, model):
                 "replace_census": None,
                 "timing": None,
             })
+        # the WHOLE block comes back: one alive source at (temp 0, LOCAL
+        # walker 0, leaf 0) and a rank-tagged fill everywhere else, which is
+        # what the rejected-birth fill in the dead slots looks like
+        block_coords = np.full((ntemps, B, NLEAVES, NDIM), -1.0 - rank)
+        block_coords[0, 0, 0] = float(rank)
+        block_inds = np.zeros((ntemps, B, NLEAVES), dtype=bool)
+        block_inds[0, 0, 0] = True
         return _checked(op, {
-            # one alive source at (temp 0, LOCAL walker 0, leaf 0)
-            "alive_coords": np.full((1, NDIM), float(rank)),
-            "alive_twl": np.array([[0, 0, 0]], dtype=np.int64),
+            "block_coords": block_coords,
+            "block_inds": block_inds,
             "d_h": np.full((B, NLEAVES), 10.0 + rank),
             "h_h": np.full((B, NLEAVES), 20.0 + rank),
             "band_counts": np.full((ntemps, B, nb), rank + 1, dtype=int),
@@ -413,14 +420,21 @@ class GBOrchestratorMergeTest(unittest.TestCase):
         self.assertEqual(accepted.shape, (NTEMPS, NWALKERS))
         self.assertFalse(accepted.any())
 
-    def test_alive_writes_land_at_w0_plus_local_walker(self):
+    def test_block_writes_land_at_w0_plus_local_walker(self):
         (new_state, _acc), moves = run_propose(self.state)
         work = moves[0]._work_branch(new_state)
         self.assertEqual(int(work.inds.sum()), 2)  # one per block
-        for rank, (w0, _w1) in BLOCKS.items():
+        for rank, (w0, w1) in BLOCKS.items():
             self.assertTrue(work.inds[0, w0, 0])
             np.testing.assert_allclose(
                 work.coords[0, w0, 0], np.full(NDIM, float(rank)))
+            # the WHOLE block is written, dead slots included -- a
+            # ``keep_all_inds`` sorter's rejected-birth fill lives there and
+            # ``_propose_legacy`` returns a state carrying it (fix round 4)
+            np.testing.assert_allclose(
+                work.coords[0, w0, 1], np.full(NDIM, -1.0 - rank))
+            np.testing.assert_allclose(
+                work.coords[1, w1 - 1, 0], np.full(NDIM, -1.0 - rank))
         sub = new_state.sub_states["gb"]
         np.testing.assert_allclose(sub.d_h[0:2], 10.0)
         np.testing.assert_allclose(sub.d_h[2:4], 11.0)
@@ -578,6 +592,7 @@ class GBOrchestratorMergeTest(unittest.TestCase):
         sub.branch.inds[:, 2:4] = False
         sub.sync_cold_row(self.state, "gb")
         before = np.array(self.state.log_like[0], copy=True)
+        before_coords = np.array(sub.branch.coords[:, 2:4], copy=True)
         (new_state, _acc), moves = run_propose(self.state, use_prior_removal=True)
         self.assertFalse(moves[0].payloads[0]["neutral"])
         self.assertTrue(moves[1].payloads[0]["neutral"])
@@ -592,6 +607,9 @@ class GBOrchestratorMergeTest(unittest.TestCase):
         np.testing.assert_allclose(new_state.log_like[0, 2:4], before[2:4])
         work = moves[0]._work_branch(new_state)
         self.assertEqual(int(work.inds[:, 2:4].sum()), 0)
+        # a neutral block ships no branch block, so its coords are exactly
+        # the ones the head sliced for it -- untouched, not zeroed
+        np.testing.assert_array_equal(work.coords[:, 2:4], before_coords)
         bi = new_state.sub_states["gb"].band_info
         np.testing.assert_array_equal(bi["band_num_binaries"][:, 2:4], 0)
         # ...but its cap rows DO ride back, so the caps still advance on the
