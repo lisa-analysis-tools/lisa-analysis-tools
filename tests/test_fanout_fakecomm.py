@@ -7,11 +7,22 @@ import numpy as np
 
 from lisatools.globalfit.communication.fakecomm import FakeWorld
 from lisatools.globalfit.communication.fanout import (
+    LIKELIHOOD_OP,
     ComputeService,
     RemoteWorkerError,
     WalkerFanout,
     concat_blocks,
 )
+
+
+class _Acs:
+    """Stands in for an AnalysisContainerArray: one likelihood per local walker."""
+
+    def __init__(self, values):
+        self.values = np.asarray(values, dtype=float)
+
+    def likelihood(self, complex=False):
+        return self.values
 from lisatools.globalfit.communication.ranks import RankRole, build_layout
 
 
@@ -175,6 +186,44 @@ class FanoutFakeCommTest(unittest.TestCase):
         self.assertEqual([c[1] for c in stubs["early"].calls], ["search"])
         self.assertEqual([c[1] for c in stubs["late"].calls], ["pe"])
         self.assertEqual([c[1] for c in stubs["bare"].calls], ["pe"])
+
+    def test_gather_likelihood_concatenates_blocks_in_walker_order(self):
+        # Head block (0, 2) scored from its own ACA; worker block (2, 4) answered by
+        # the LIKELIHOOD_OP builtin run.py installs on every ComputeService.
+        world = FakeWorld(3, nodes=[0, 0, 0])
+
+        def fn(rank, comm):
+            layout = build_layout(comm, 4, [0, 1], legacy=False)
+            fcomm = layout.make_fanout_comm(comm)
+            role = layout.role_of(rank)
+            if role == RankRole.SAVER:
+                return "saver-idle"
+            if role == RankRole.HEAD:
+                fo = WalkerFanout(fcomm, layout, rank, model=None)
+                try:
+                    return fo.gather_likelihood(_Acs([10.0, 11.0]))
+                finally:
+                    fo.stop()
+            builtins = {
+                LIKELIHOOD_OP: lambda payload, clock, model: np.asarray(
+                    model.likelihood(complex=False)
+                )
+            }
+            service = ComputeService(
+                fcomm, layout, rank, registry={}, model=_Acs([12.0, 13.0]), builtins=builtins
+            )
+            return service.serve()
+
+        out = world.run(fn)
+        np.testing.assert_array_equal(out[0], [10.0, 11.0, 12.0, 13.0])
+        self.assertEqual(out[1], 1)
+
+    def test_gather_likelihood_single_rank_is_a_direct_call(self):
+        layout = FakeWorld(1).run(lambda r, c: build_layout(c, 4, [0], legacy=False))[0]
+        fo = WalkerFanout(None, layout, 0, model=None)
+        np.testing.assert_array_equal(
+            fo.gather_likelihood(_Acs([1.0, 2.0, 3.0, 4.0])), [1.0, 2.0, 3.0, 4.0]
+        )
 
     def test_saver_never_sees_fanout_traffic(self):
         def saver(rank, comm):

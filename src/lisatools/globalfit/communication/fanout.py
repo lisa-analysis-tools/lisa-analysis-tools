@@ -22,8 +22,13 @@ import traceback
 
 import numpy as np
 
+from ...utils.utility import asnumpy
+
 STOP_OP = "stop"
 PING_OP = "ping"
+#: builtin every ComputeService installs: the rank's current per-walker
+#: likelihood over its block (see WalkerFanout.gather_likelihood).
+LIKELIHOOD_OP = "likelihood"
 
 
 class RemoteWorkerError(RuntimeError):
@@ -96,6 +101,25 @@ class WalkerFanout:
         self.clock["iteration"] = int(iteration)
 
     # -- commands --------------------------------------------------------
+    def gather_likelihood(self, acs):
+        """Current per-walker likelihood over ALL walkers (head-only, sampling phase).
+
+        The head scores its own block from ``acs`` (its B-row ACA); every worker
+        answers through the ``LIKELIHOOD_OP`` builtin its ComputeService installs.
+        Any head-side "all walkers" read of the residual during sampling must go
+        through here -- the head's ACA holds only its block. With one compute
+        rank this is a direct call.
+        """
+        return self.run(
+            LIKELIHOOD_OP,
+            move=None,
+            per_rank_payload=lambda rank, w0, w1: None,
+            local_body=lambda payload, model: np.asarray(
+                asnumpy(acs.likelihood(complex=False))
+            ),
+            merge=lambda results: concat_blocks(results, self.layout),
+        )
+
     def run(self, op, *, move=None, per_rank_payload, local_body, merge, shared=None):
         if not self.is_head:
             raise RuntimeError("WalkerFanout.run is head-only; compute ranks serve commands")

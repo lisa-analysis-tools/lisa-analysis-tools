@@ -82,6 +82,9 @@ class FunctionMove(Move, GlobalFitMove, ErynMove):
         self.acs = ctx.acs
         self.ntemps = ctx.ntemps
         self.nwalkers = ctx.nwalkers
+        # multi-rank: the head's ACA holds only its walker block, so the
+        # log_like re-sync must gather every rank's block (None single-process)
+        self.fanout = getattr(ctx, "fanout", None)
         if ctx.ntemps is not None and ctx.nwalkers is not None:
             self.accepted = np.zeros((ctx.ntemps, ctx.nwalkers))
         return None  # self IS the runtime move
@@ -108,10 +111,17 @@ class FunctionMove(Move, GlobalFitMove, ErynMove):
                     "to sync log_like from (run setup(ctx) first, or pass "
                     "sync_log_like=False)."
                 )
-            new_state.log_like[:] = asnumpy(acs.likelihood(complex=False))[None, :]
+            fanout = getattr(self, "fanout", None)
+            if fanout is not None and not fanout.single:
+                # head-only move under several compute ranks: ``fn`` ran on the
+                # head's block; every rank reports its block's current likelihood
+                new_state.log_like[:] = fanout.gather_likelihood(acs)[None, :]
+            else:
+                new_state.log_like[:] = asnumpy(acs.likelihood(complex=False))[None, :]
         return new_state, np.asarray(accepted)
 
     def __getstate__(self):
         state = super().__getstate__()
         state["acs"] = None
+        state["fanout"] = None
         return state

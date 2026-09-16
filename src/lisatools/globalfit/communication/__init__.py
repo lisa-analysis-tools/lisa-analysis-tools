@@ -12,6 +12,7 @@ head-directed commands, and the unchanged saver rank. See
 
 from .fakecomm import FakeAbort, FakeComm, FakeCommNull, FakeWorld
 from .fanout import (
+    LIKELIHOOD_OP,
     PING_OP,
     STOP_OP,
     ComputeService,
@@ -43,6 +44,7 @@ __all__ = [
     "FakeComm",
     "FakeCommNull",
     "FakeWorld",
+    "LIKELIHOOD_OP",
     "PING_OP",
     "STOP_OP",
     "ComputeService",

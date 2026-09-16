@@ -2677,7 +2677,7 @@ class GlobalFit:
             sorted(f"{stage}/{name}" for stage, name in registry),
         )
 
-        from .communication.fanout import ComputeService
+        from .communication.fanout import LIKELIHOOD_OP, ComputeService
 
         self.compute_service = ComputeService(
             self.fanout_comm,
@@ -2686,7 +2686,9 @@ class GlobalFit:
             registry=registry,
             model=model,
             builtins={
-                "likelihood": lambda payload, clock, model: np.asarray(
+                # answers WalkerFanout.gather_likelihood (head-side "all
+                # walkers" residual reads during sampling, e.g. FunctionMove)
+                LIKELIHOOD_OP: lambda payload, clock, model: np.asarray(
                     asnumpy(model.analysis_container_arr.likelihood(complex=False))
                 ),
             },
