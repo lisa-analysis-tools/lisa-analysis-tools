@@ -76,6 +76,32 @@ from .utils import BasicResidualacsLikelihood
 
 logger = getLogger(__name__)
 
+#: Truthy/falsy spellings for :func:`null_check_only`, matching
+#: ``stock.base.bool_or_str`` (imported nowhere here: ``stock`` builds ON
+#: this module, so reaching back into it would be a cycle).
+_NULL_CHECK_TRUE = ("1", "true", "yes", "on")
+
+
+def null_check_only() -> bool:
+    """``NULL_CHECK_ONLY=1``: measure the initial lnL, then stop.
+
+    The truth-injection NULL TEST's entire output is ONE line --
+    ``initial log likelihood (after recipe setup)`` -- so the per-source
+    decomposition of it (18 jobs, one (branch, id) pair each) has nothing to
+    sample. With this set, :meth:`GlobalFit.prepare_main` returns right after
+    that print and :meth:`GlobalFit.run_global_fit` skips ``run_mcmc``.
+
+    NOT a ``sys.exit``: the production layout is ``mpiexec -n 3`` (main +
+    saver + spare), and the other two ranks sit in ``comm.recv``. The early
+    return goes through the ORDINARY shutdown -- the spares' ``"stop"`` and
+    the saver's ``{"finish_run": True}`` -- so every rank exits rc 0 in
+    seconds instead of blocking until walltime.
+
+    A present-but-empty value counts as unset (``stock.base._env_lookup``'s
+    rule), so ``NULL_CHECK_ONLY= sbatch ...`` cannot silently skip a run.
+    """
+    return os.environ.get("NULL_CHECK_ONLY", "").strip().lower() in _NULL_CHECK_TRUE
+
 
 def _branch_cap_edges(branch_info):
     """Leaf-cap CELL edges for a banded branch (user design 2026-08-15).
@@ -2057,6 +2083,22 @@ class GlobalFit:
         state.log_like[:] = acs.likelihood(complex=False)
         logger.info(f"initial log likelihood (after recipe setup): {state.log_like[0]}")
 
+        # NULL_CHECK_ONLY: that line IS the whole measurement (per-source
+        # truth-injection null test). Stop HERE -- before the sampler,
+        # plot container and checkpoint self-test are built -- but tear
+        # down through the NORMAL path: release the spares with the same
+        # "stop" sends used below, and let run_global_fit hand the saver
+        # its {"finish_run": True}. See :func:`null_check_only`.
+        if null_check_only():
+            self._null_check_only = True
+            logger.info(
+                "[NULL_CHECK_ONLY] initial lnL measured; skipping the "
+                "sampler build and all sampling, and releasing the "
+                "helper ranks."
+            )
+            self._stop_spare_ranks()
+            return
+
         # [layer-chi2 diag; GB_LAYER_CHI2=1] Where does the post-subtraction
         # residual live in frequency? Edge layers -> out-of-window source
         # leakage (not subtracted); center -> subtraction bug; even -> global.
@@ -2092,15 +2134,8 @@ class GlobalFit:
         # backend.save_step(state, accepted, swaps_accepted=swaps_accepted)
         # exit()
 
-        # Stop the spare processes. (The old move->rank dispatch that
-        # handed spares to moves was removed with the CPU distribution-
-        # fitting workers it served — GPU GMM fitting / neural flows
-        # replaced them; parallel-resources plan P3. A future coarse
-        # multi-node worker pool would re-enter here.)
-        for rank in self.all_ranks:
-            if rank in self.used_ranks:
-                continue
-            self.comm.send("stop", dest=rank)
+        # Stop the spare processes.
+        self._stop_spare_ranks()
 
         from eryn.moves import StretchMove
 
@@ -2211,6 +2246,24 @@ class GlobalFit:
                 logger_=self.logger,
             )
 
+    def _stop_spare_ranks(self):
+        """Release every rank with no role by sending it its ``"stop"``.
+
+        A spare sits in ``comm.recv(source=main_rank)`` from startup (see
+        ``run_global_fit``'s ``else`` branch) and exits on the first message,
+        so this MUST run on every path off the main rank -- the normal
+        sampling one and :func:`null_check_only`'s early return alike, which
+        is why it is factored out here. (The old move->rank dispatch that
+        handed spares to moves was removed with the CPU distribution-fitting
+        workers it served — GPU GMM fitting / neural flows replaced them;
+        parallel-resources plan P3. A future coarse multi-node worker pool
+        would re-enter here.)
+        """
+        for rank in self.all_ranks:
+            if rank in self.used_ranks:
+                continue
+            self.comm.send("stop", dest=rank)
+
     def run_global_fit(self):
         """Execute the main global fit MCMC sampling run.
 
@@ -2233,14 +2286,25 @@ class GlobalFit:
         if self.rank == self.curr.settings_dict.rank_info.main_rank:
             self.prepare_main()
 
-            self.sampler.run_mcmc(self.state, self.curr.general_info.num_iterations, thin_by=1, progress=self.progress, store=True)
+            if getattr(self, "_null_check_only", False):
+                # NULL_CHECK_ONLY: prepare_main stopped after the initial-lnL
+                # print and has already released the spares. There is no
+                # sampler and no stored iteration, so there is nothing to
+                # sample and nothing to write a submission from -- fall
+                # straight through to the saver's finish_run below so all
+                # three ranks exit now.
+                logger.info(
+                    "[NULL_CHECK_ONLY] no sampling; finishing the run."
+                )
+            else:
+                self.sampler.run_mcmc(self.state, self.curr.general_info.num_iterations, thin_by=1, progress=self.progress, store=True)
 
-            if self.curr.general_info.submission_parent_folder is not None:
-                self.logger.debug(f"saving submission to {self.curr.general_info.submission_parent_folder}")
-                submission_writer = SubmissionWriter(backend=self.run_backend, curr=self.curr, ess=20_000)
-                submission_writer.write_submission(self.acs)
+                if self.curr.general_info.submission_parent_folder is not None:
+                    self.logger.debug(f"saving submission to {self.curr.general_info.submission_parent_folder}")
+                    submission_writer = SubmissionWriter(backend=self.run_backend, curr=self.curr, ess=20_000)
+                    submission_writer.write_submission(self.acs)
 
-            logger.info("Residuals saved.")
+                logger.info("Residuals saved.")
 
             if self.results_rank != self.main_rank:
                 # Dedicated saver rank (np >= 3): tell it the run is over.

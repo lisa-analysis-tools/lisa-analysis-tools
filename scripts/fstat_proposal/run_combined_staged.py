@@ -971,11 +971,21 @@ def main() -> int:
     except Exception:
         pass
     if _rank == _main:
-        print(
-            f"[combined] RUN COMPLETE: num_iterations="
-            f"{fit.general.num_iterations} reached; residuals saved.",
-            flush=True,
-        )
+        if _env_flag("NULL_CHECK_ONLY"):
+            # NULL_CHECK_ONLY stopped the run at the initial-lnL print
+            # (run.py's null_check_only), so claiming "num_iterations
+            # reached; residuals saved" would be flatly false.
+            print(
+                "[combined] NULL CHECK COMPLETE: initial lnL measured, no "
+                "iterations run (NULL_CHECK_ONLY=1).",
+                flush=True,
+            )
+        else:
+            print(
+                f"[combined] RUN COMPLETE: num_iterations="
+                f"{fit.general.num_iterations} reached; residuals saved.",
+                flush=True,
+            )
     else:
         print(
             f"[combined] rank {_rank} (non-sampling helper) exiting; "
