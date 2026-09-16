@@ -552,6 +552,91 @@ class ModuleSubState(eryn_State):
                 setattr(self, name, dc(getattr(other, name)))
         self._tempered_initialized = True
 
+    # ------------------------------------------------------------------
+    # Walker-block slicing (multi-rank fan-out). Every tempered array with
+    # a walker axis is sliced/merged by column. Ladders and the
+    # per-iteration delta counters have NO walker axis: a slice carries the
+    # ladder BY VALUE and never writes it back (the head owns ladders), and
+    # its counters start at zero so a fan-out body's counts come back as
+    # deltas that merge SUM-adds.
+    # ------------------------------------------------------------------
+
+    #: walker axis of every tempered array that has one (absent = no walker
+    #: axis). Subclasses with a different layout override the dict.
+    walker_axes: dict = {
+        "coords": 1,
+        "inds": 1,
+        "log_like": 1,
+        "log_prior": 1,
+        "d_h": 0,
+        "h_h": 0,
+    }
+
+    def _bare_like(self):
+        """A fresh, empty instance of this class (no tempered block yet)."""
+        return type(self)(None)
+
+    def slice_walkers(self, w0: int, w1: int):
+        """Copy walkers ``[w0, w1)`` of the tempered block into a fresh instance.
+
+        Returns a bare instance when this sub-state has no tempered block.
+        """
+        part = self._bare_like()
+        if not self.tempered_initialized:
+            return part
+        w0, w1 = int(w0), int(w1)
+        if not (0 <= w0 < w1 <= int(self.nwalkers)):
+            raise ValueError(f"walker block [{w0}, {w1}) is not inside [0, {self.nwalkers}).")
+        part.initialize_tempered(
+            self.ntemps,
+            w1 - w0,
+            self.nleaves_max,
+            self.ndim,
+            coords=self.coords[:, w0:w1],
+            inds=self.inds[:, w0:w1],
+        )
+        for name, axis in self.walker_axes.items():
+            if name in ("coords", "inds"):
+                continue
+            src = getattr(self, name, None)
+            if src is None:
+                continue
+            getattr(part, name)[...] = np.take(src, np.arange(w0, w1), axis=axis)
+        if self.betas_attr_name == "betas" and getattr(self, "betas", None) is not None:
+            part.betas = np.array(self.betas, copy=True)
+        return part
+
+    def merge_walkers(self, part, w0: int, w1: int, *, sum_counters: bool = True):
+        """Write ``part``'s walker columns back into ``[w0, w1)``.
+
+        Ladders are NOT written back; delta counters are SUM-added when
+        ``sum_counters`` (a slice starts from zero, so its counters are the
+        deltas of the command that produced it).
+        """
+        if not self.tempered_initialized or not getattr(part, "tempered_initialized", False):
+            return
+        w0, w1 = int(w0), int(w1)
+        if not (0 <= w0 < w1 <= int(self.nwalkers)):
+            raise ValueError(f"walker block [{w0}, {w1}) is not inside [0, {self.nwalkers}).")
+        if int(part.nwalkers) != w1 - w0:
+            raise ValueError(
+                f"slice has {part.nwalkers} walkers but the block [{w0}, {w1}) has {w1 - w0}."
+            )
+        for name, axis in self.walker_axes.items():
+            dst = getattr(self, name, None)
+            src = getattr(part, name, None)
+            if dst is None or src is None:
+                continue
+            index = [slice(None)] * dst.ndim
+            index[axis] = slice(w0, w1)
+            dst[tuple(index)] = src
+        if sum_counters:
+            for name in self.delta_counter_names:
+                dst = getattr(self, name, None)
+                src = getattr(part, name, None)
+                if dst is not None and src is not None:
+                    dst[...] += src
+
     #: Per-rung STATE arrays cloned by :meth:`reseed_cold_into_hottest`.
     #: ``d_h``/``h_h`` are cold-chain-only (no temperature axis) so the
     #: hottest-rung reseed never touches them; ``betas`` defines the ladder and
@@ -1336,6 +1421,13 @@ class PerLeafLadderState(ModuleSubState):
     legacy_dtype_names = ("betas_all",)
     # the ladder is per leaf (betas_all); no flat betas
     betas_attr_name = "betas_all"
+
+    # per-leaf log_like / log_prior are (nleaves_max, ntemps, nwalkers): walker axis LAST
+    walker_axes = {**ModuleSubState.walker_axes, "log_like": 2, "log_prior": 2}
+
+    def _bare_like(self):
+        betas_all = None if self.betas_all is None else np.array(self.betas_all, copy=True)
+        return type(self)(None, betas_all=betas_all)
 
     # per-leaf resolution: each leaf carries its own ladder, likelihood
     # rows, and counters
