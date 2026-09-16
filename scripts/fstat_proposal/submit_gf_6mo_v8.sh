@@ -2338,7 +2338,13 @@ export SOBBH_CHECK_LL_EVERY=30
 # laptop A/B on the real chunked SOBBH kernel measured acceptance 0.544 vs
 # stretch 0.156 at equal per-step cost. {BRANCH}_INNER_MOVE_KIND=stretch
 # is the per-branch escape back to the legacy stretch, exactly.
-export SOBBH_INNER_MOVE_KIND=eigen
+# GUARDED (2026-09-16) for the scoring-regression A/B: production
+# measures 61 ms/row vs the kernel's 2.78 ms/row job-373 reference.
+# One-window discriminator: `SOBBH_INNER_MOVE_KIND=stretch sbatch <this>`
+# -- leaf time collapsing toward ~15 s indicts the eigen inner-move path;
+# staying ~190 s indicts the scoring seam. Default stays eigen (it beat
+# stretch 0.544 vs 0.156 acceptance in the laptop A/B).
+export SOBBH_INNER_MOVE_KIND=${SOBBH_INNER_MOVE_KIND:-eigen}
 export MBH_INNER_MOVE_KIND=eigen
 export EMRI_INNER_MOVE_KIND=eigen
 # TABLE SCOPE (user ruling 2026-09-08). SOBBH: per-(temperature, walker)

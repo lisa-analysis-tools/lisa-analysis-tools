@@ -155,6 +155,49 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
     # likelihood seams
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # per-leaf scoring telemetry (2026-09-16). Production measured
+    # 190.5 s/leaf = 25 x ~7.35 s compute_like calls = 61 ms/row against
+    # the in-code job-373 reference of 2.78 ms/row (same Tobs / band
+    # half-width / shard count) with LOG-SILENT leaf windows -- a ~22x
+    # per-row regression nothing in the log could attribute. One
+    # [SOBBH_LL_TIMING] line per leaf window (flushed at the next
+    # setup_likelihood_here) splits the wall into host-stage vs kernel
+    # and counts calls/rows, so the call-count (extra scorings per
+    # repeat?) and the per-row rate are separately visible.
+    # ------------------------------------------------------------------
+
+    def _ll_stats_reset(self):
+        self._ll_stats = {"calls": 0, "rows": 0, "host_s": 0.0,
+                          "kernel_s": 0.0, "total_s": 0.0}
+
+    def _flush_ll_stats(self):
+        st = getattr(self, "_ll_stats", None)
+        if not st or st["calls"] == 0:
+            return
+        other = st["total_s"] - st["host_s"] - st["kernel_s"]
+        logger.info(
+            "[%s_LL_TIMING] leaf window: calls=%d rows=%d total=%.2f s "
+            "(host_stage=%.2f, kernel=%.2f, other=%.2f) -> %.0f ms/call, "
+            "%.2f ms/row",
+            getattr(self, "_dbg_prefix", "SOBBH"), st["calls"], st["rows"],
+            st["total_s"], st["host_s"], st["kernel_s"], other,
+            1e3 * st["total_s"] / st["calls"],
+            1e3 * st["total_s"] / max(st["rows"], 1),
+        )
+        self._ll_stats_reset()
+
+    def _ll_stats_add(self, rows, t0, t_host, t_kernel):
+        st = getattr(self, "_ll_stats", None)
+        if st is None:
+            self._ll_stats_reset()
+            st = self._ll_stats
+        st["calls"] += 1
+        st["rows"] += int(rows)
+        st["host_s"] += t_host
+        st["kernel_s"] += t_kernel
+        st["total_s"] += time.perf_counter() - t0
+
     def setup_likelihood_here(self, coords):
         """Capture the per-walker exposed-residual offset for this leaf.
 
@@ -164,6 +207,8 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
         configured) that the container scoring path folds into every value —
         the piece the chunked call (built with ``d_d = 0``) leaves out.
         """
+        # previous leaf's scoring window ends here -- flush its telemetry
+        self._flush_ll_stats()
         self._exposed_offset = np.asarray(asnumpy(self.acs.likelihood()), dtype=float)
         super().setup_likelihood_here(coords)
 
@@ -187,8 +232,10 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
                 "exposed-residual offset (propose() choreography violated)."
             )
 
+        _t0 = time.perf_counter()
         coords_np = np.atleast_2d(np.asarray(asnumpy(coords_in), dtype=np.float64))
         idx = np.asarray(asnumpy(data_index)).astype(np.int32).reshape(-1)
+        _t_host = time.perf_counter() - _t0
         n_rows = coords_np.shape[0]
 
         params = self.to_chunked_basis(coords_np)
@@ -203,12 +250,16 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
         self._last_d_h = np.full(n_rows, np.nan)
         self._last_h_h = np.full(n_rows, np.nan)
         if not np.any(valid):
+            self._ll_stats_add(n_rows, _t0, _t_host, 0.0)
             return out
 
+        _t_k = time.perf_counter()
         ll, d_h, h_h = self._kernel_ll(params[valid], idx[valid])
+        _t_kernel = time.perf_counter() - _t_k
         out[valid] = ll + self._exposed_offset[idx[valid]]
         self._last_d_h[valid] = d_h
         self._last_h_h[valid] = h_h
+        self._ll_stats_add(n_rows, _t0, _t_host, _t_kernel)
         return out
 
     def _kernel_ll(self, params, idx):
