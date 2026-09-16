@@ -1956,7 +1956,7 @@ def subtract_gb_neighbors_from_data(
     xp = gb_wdm_comp.xp
     params_phys = _tc_fdot.both_transforms(
         xp.asarray(sampling[mask]), xp=xp)
-    nwalkers = int(curr.general_info.nwalkers)
+    nwalkers = _local_nwalkers(acs)
     params_tiled = xp.tile(xp.asarray(params_phys), (nwalkers, 1))
     data_index = xp.repeat(
         xp.arange(nwalkers, dtype=xp.int32), n_sub).astype(xp.int32)
@@ -2053,6 +2053,27 @@ def _reference_sens_mat(acs):
     if len(flat) == 0:
         return None
     return getattr(flat[0], "sens_mat", None)
+
+
+def _local_nwalkers(acs) -> int:
+    """Walkers this rank's ACA holds (== the global count in a single-process run)."""
+    return int(acs.acs_total_entries)
+
+
+def _local_walker_block(curr, acs):
+    """(w0, w1) of the global walkers this rank's ACA rows correspond to."""
+    layout = getattr(curr, "rank_layout", None)
+    rank = getattr(curr, "rank", None)
+    n_local = _local_nwalkers(acs)
+    if layout is None or rank is None:
+        return 0, n_local
+    w0, w1 = layout.block_of(rank)
+    if w1 - w0 != n_local:
+        raise ValueError(
+            f"rank {rank}: layout block [{w0}, {w1}) has {w1 - w0} walkers but the ACA holds "
+            f"{n_local} rows."
+        )
+    return int(w0), int(w1)
 
 
 def get_shared_dcga(acs):
@@ -2158,7 +2179,7 @@ def build_noise_moves(
     pe_move : PSDMove
     """
     general_info = curr.general_info
-    nwalkers: int = general_info.nwalkers
+    nwalkers: int = _local_nwalkers(acs)
     if not sampled_branches:
         raise ValueError("sampled_branches must name at least one noise branch.")
     missing = [b for b in sampled_branches if b not in curr.source_info]
@@ -2252,6 +2273,8 @@ def build_noise_moves(
 
     search_move.accepted = np.zeros((ntemps, nwalkers))
     pe_move.accepted = np.zeros((ntemps, nwalkers))
+    search_move.fanout_branches = list(sampled_branches)
+    pe_move.fanout_branches = list(sampled_branches)
 
     return search_move, pe_move
 
@@ -2519,11 +2542,14 @@ def build_gb_moves(
     #* Skipped when a GB ``signal_gen`` is registered — the engine's
     #* setup_acs(rebuild_residuals=True) already subtracted the state's GB
     #* templates. No GB signal_gen exists today, so this stays active.
-    if getattr(gb_info, "signal_gen", None) is None and state.branches["gb"].inds[0].sum() > 0:
+    # Block-gated (Plan 2, Task 5): this rank's ACA holds only walkers
+    # [w0, w1) of the FULL ``state``, so every per-walker row below is
+    # sliced to that block before use.
+    w0, w1 = _local_walker_block(curr, acs)
+    inds_loc = state.branches["gb"].inds[0, w0:w1]
+    if getattr(gb_info, "signal_gen", None) is None and inds_loc.sum() > 0:
 
-        coords_out_gb = state.branches["gb"].coords[0,
-            state.branches["gb"].inds[0]
-        ]
+        coords_out_gb = state.branches["gb"].coords[0, w0:w1][inds_loc]
         coords_out_gb[:, 3] = coords_out_gb[:, 3] % (2 * np.pi)
         coords_out_gb[:, 5] = coords_out_gb[:, 5] % (1 * np.pi)
         coords_out_gb[:, 6] = coords_out_gb[:, 6] % (2 * np.pi)
@@ -2547,8 +2573,8 @@ def build_gb_moves(
         band_inds = np.searchsorted(band_edges, coords_in_in[:, 1], side="right") - 1
 
         walker_vals = np.tile(
-            np.arange(nwalkers), (nleaves_max_gb, 1)
-        ).transpose((1, 0))[state.branches["gb"].inds[0]]
+            np.arange(w1 - w0), (nleaves_max_gb, 1)
+        ).transpose((1, 0))[inds_loc]
 
         data_index_1 = walker_vals  # ((band_inds % 2) + 0) * nwalkers + walker_vals
 
@@ -3705,12 +3731,13 @@ def build_vgb_moves(
     # below.
 
     # ---- subtract the seeded VGB templates from the residuals ----
-    if (
-        getattr(vgb_info, "signal_gen", None) is None
-        and state.branches["vgb"].inds[0].sum() > 0
-    ):
-        inds0 = state.branches["vgb"].inds[0]  # (nwalkers, nleaves)
-        coords_out = state.branches["vgb"].coords[0, inds0]
+    # Block-gated (Plan 2, Task 5): this rank's ACA holds only walkers
+    # [w0, w1) of the FULL ``state``, so every per-walker row below is
+    # sliced to that block before use.
+    w0, w1 = _local_walker_block(curr, acs)
+    inds0 = state.branches["vgb"].inds[0, w0:w1]  # (w1 - w0, nleaves)
+    if getattr(vgb_info, "signal_gen", None) is None and inds0.sum() > 0:
+        coords_out = state.branches["vgb"].coords[0, w0:w1][inds0]
         for _name, _per in (("phi0", 2 * np.pi), ("psi", np.pi)):
             _i = input_basis.index(_name)
             coords_out[:, _i] = coords_out[:, _i] % _per
@@ -3722,12 +3749,12 @@ def build_vgb_moves(
                 "VGB prior limits against the catalogue values."
             )
 
-        leaf_inds = np.tile(np.arange(nleaves_max_vgb), (nwalkers, 1))[inds0]
+        leaf_inds = np.tile(np.arange(nleaves_max_vgb), (w1 - w0, 1))[inds0]
         coords_in_in = tc.both_transforms(coords_out, leaf_inds=leaf_inds)
 
         band_inds = np.searchsorted(band_edges, coords_in_in[:, 1], side="right") - 1
         walker_vals = np.tile(
-            np.arange(nwalkers), (nleaves_max_vgb, 1)
+            np.arange(w1 - w0), (nleaves_max_vgb, 1)
         ).transpose((1, 0))[inds0]
 
         _xp = acs.xp
@@ -4029,7 +4056,7 @@ class SingleSourcePEBuilder(SourceMoveBuilder):
     def build(self, engine_info, curr, acs, priors, state):
         info = curr.source_info[self.branch_name]
         gi = curr.general_info
-        nwalkers = gi.nwalkers
+        nwalkers = _local_nwalkers(acs)
         # this branch's OWN per-leaf ladder size (the engine runs cold-chain
         # only); an explicit betas ladder wins over the ntemps knob
         _info_betas = getattr(info, "betas", None)
@@ -4133,6 +4160,7 @@ class SingleSourcePEBuilder(SourceMoveBuilder):
             name=self.move_name,
             **_extra_kwargs,
         )
+        move.fanout_branches = [self.branch_name]
         if getattr(info, "info_matrix_gen", None) is not None:
             move.eigen_table_builder = info.info_matrix_gen
         # where the eigen tables persist to: the same store path the
