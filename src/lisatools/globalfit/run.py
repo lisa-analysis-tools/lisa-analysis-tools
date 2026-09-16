@@ -461,16 +461,19 @@ class GlobalFit:
 
     @classmethod
     def resolve_rank_roles(cls, comm: MPI.Comm, main_rank: int = 0):
-        """Compat wrapper around ``communication.ranks.resolve_roles``.
+        """Legacy-compat wrapper over ``communication.ranks.resolve_roles``.
 
-        The layout is: ``main_rank`` runs the sampler; at ``size >= 3`` the
-        highest remaining rank becomes the dedicated results/saver rank
-        (below that, saving is synchronous on main). In the current
-        (non-legacy) walker-block layout every other rank computes a walker
-        block, so ``spare_ranks`` is empty; the legacy layout
-        (``GF_LEGACY_RANK_LAYOUT=1``) still stops every non-head, non-saver
-        rank at startup and ``spare_ranks`` lists them, matching the old
-        behavior this method historically returned.
+        Kept for old callers of the ``(main_rank, results_rank, spare_ranks)``
+        shape: ``main_rank`` runs the sampler; at ``size >= 3`` the highest
+        remaining rank becomes the dedicated results/saver rank (below that,
+        saving is synchronous on main). ``resolve_roles`` never reads
+        ``GF_LEGACY_RANK_LAYOUT`` (only ``communication.ranks.build_layout``
+        does), so ``spare_ranks`` here is ALWAYS ``[]`` -- including under the
+        legacy layout, where every non-head, non-saver rank IS in fact a
+        stopped spare. A caller that needs the real spare set (or any other
+        legacy-layout distinction) must go through
+        ``communication.ranks.prepare_rank`` + ``layout.role_of(rank) ==
+        RankRole.SPARE`` instead of this method.
 
         Exposed as a classmethod so launchers (``scripts/run_global.py``)
         can decide which ranks need the heavy data build *before*
@@ -481,11 +484,10 @@ class GlobalFit:
             main_rank: Rank that drives the sampler. Default 0.
 
         Returns:
-            ``(main_rank, results_rank, spare_ranks)``.
+            ``(main_rank, results_rank, [])``.
         """
-        head, saver, compute = resolve_roles(comm.Get_size(), main_rank)
-        spares = [r for r in range(comm.Get_size()) if r not in compute and r != saver]
-        return head, saver, spares
+        head, saver, _compute = resolve_roles(comm.Get_size(), main_rank)
+        return head, saver, []
 
     def __init__(self, curr: GlobalFitSetup, comm: typing.Optional[MPI.Comm] = None):
         """Main class for managing the global fit MCMC sampling run.
@@ -2407,9 +2409,22 @@ class GlobalFit:
         allocation failures on that same device at ~97-99% -- the helpers'
         cache was the missing margin. Frees CACHED pool blocks (after a
         ``gc.collect()``; live arrays are untouched, so this is
-        behavior-neutral) on this rank's OWN devices only (``layout.
-        local_gpus``) -- not every visible device, so it stays correct when
-        several ranks share a node's GPU pool. A CPU run is a no-op.
+        behavior-neutral).
+
+        Iterates ``self.curr.general_info.gpus`` (the rank-local device list
+        AFTER ``communication.ranks.select_rank_device`` pinning), NOT
+        ``layout.local_gpus(rank)``: the layout's pool ids are the PER-NODE
+        pool's own numbering, which in ``"visible"`` pinning mode no longer
+        even exist as device indices (the rank's ``CUDA_VISIBLE_DEVICES`` was
+        narrowed to just its own devices, renumbered ``0..k-1``), and in the
+        legacy layout (``GF_LEGACY_RANK_LAYOUT=1``) every rank still builds on
+        the WHOLE ``gpus`` pool (no per-rank pinning runs at all) while
+        ``layout.local_gpus`` gives the saver/spare only one pool device --
+        freeing half the cache instead of all of it. ``general_info.gpus`` is
+        correct in every mode: ``[0..k-1]`` in ``"visible"`` mode, the pinned
+        pool ids in ``"setdevice"`` mode, and the untouched full pool in
+        single-process and legacy runs. A CPU run (``gpus`` empty/``None``)
+        is a no-op.
         """
         import gc
 
@@ -2418,7 +2433,7 @@ class GlobalFit:
             import cupy as cp
         except Exception:
             return
-        devices = self.layout.local_gpus(self.rank) or []
+        devices = list(self.curr.general_info.gpus or [])
         if not devices:
             return
         freed = 0
