@@ -225,9 +225,11 @@ explicitly — if it does, pin it to the same value for all three launches.
 
 **What to diff:**
 - `[FANOUT_DIGEST]` lines — a per-iteration state hash (`log_like` + coords
-  + inds) the head emits when `GF_FANOUT_DIGEST=1`. Only the three
-  `n_compute=2` layouts above are expected to print the identical hash at
-  every iteration. The line is emitted from the recipe's post-iteration hook
+  + inds) the head emits when `GF_FANOUT_DIGEST=1`. Across the three
+  `n_compute=2` layouts above the `coords` and `inds` hashes must be
+  identical at every iteration; the `log_like` hash is NOT expected to match
+  on GPU (see "Step 1 as actually run" below — few-ulp launch-to-launch
+  noise), compare it numerically instead. The line is emitted from the recipe's post-iteration hook
   whether or not a fan-out exists, so a single-rank (`-n 1`) baseline run
   prints it too, but single mode reseeds nothing (`run.py::
   _resolve_seed_base`/`_seed_rank_streams` return `None` when
@@ -266,6 +268,62 @@ A mismatch anywhere in this step means the transport or the merge logic
 broke bit-identity for some fan-out op — bisect by op (`WalkerFanoutMixin`
 addremove/PSD vs GB's three-command protocol) using the per-op
 `[FANOUT_DIGEST]` cadence rather than only the end-of-run state digest.
+
+### Step 1 as actually run and PASSED (2026-09-16, gb_no_fg)
+
+Two practical findings that the commands above do not show:
+
+1. **The stock synthetic injections are too faint to move the fit.** With
+   `DATA_MODE=synthetic` and no explicit injection table, the F-stat epoch
+   fit reports **no peaks**, births fall back to the prior, nothing is
+   accepted in five iterations and every `[FANOUT_DIGEST]` line repeats the
+   same three hashes — three layouts that all do nothing always agree, so
+   the comparison is vacuous. Use one loud in-band injection (the laptop
+   parity gate's) through a six-line driver launched exactly like
+   `run_global.py`; there is no env knob for the injection table:
+
+   ```python
+   # gate_gb.py -- run from the repo root
+   from lisatools.globalfit.stock import erebor
+
+   fit = erebor.get_stock("gb_no_fg")
+   # amplitude, f0 [Hz], fdot, fddot, phi0, iota, psi, lambda, beta (GBGPU order)
+   fit.general.gb_injection_params = [[1e-21, 7.5e-3, 1e-16, 0.0, 1.2, 0.9, 1.0, 4.0, -0.6]]
+   fit.run()
+   ```
+
+   Give every layout its OWN `FILE_STORE_DIR` (`./gate_a/`, `./gate_b/`,
+   `./gate_c/`): a run that finds an existing store RESUMES from it, which
+   silently breaks the same-initial-state premise. A live fixture shows
+   `20 peaks` on the epoch line and hashes that CHANGE every iteration.
+2. **`log_like` is not bit-identical on GPU, and cannot be; the decisions
+   are.** Measured over five moving iterations (2026-09-16, 8 walkers,
+   layouts (a)/(b)/(c) all `n_compute=2`): `coords` and `inds` hashes
+   identical at every iteration and in the final stores across all three
+   layouts; `log_like` differs by at most 1.3e-9 on values near 7e5
+   (relative 1.8e-15, i.e. a few ulps), and `substate/gb/d_h` differs the
+   same way. Walker 0 — the head's block, computed on GPU 0 in EVERY
+   layout — differs between (a) and (b), so this is launch-to-launch
+   reduction-order noise of the likelihood kernel on one device, not a
+   device-to-device difference and not transport. **Pass criterion,
+   restated:** `coords` and `inds` bit-identical across the layouts at every
+   iteration and in `gf_state_digest.py`; `log_like` (and `d_h`) within
+   1e-12 relative, compared numerically:
+
+   ```sh
+   python - <<'EOF'
+   import numpy as np
+   from lisatools.globalfit.hdfbackend import GFHDFBackend
+   ll = {r: np.asarray(GFHDFBackend(f"gate_{r}/gb_no_fg_test_2_testing.h5")
+                       .get_last_sample().log_like)[0] for r in "abc"}
+   for r in "bc":
+       d = ll[r] - ll["a"]
+       print(r, d, "max rel:", np.max(np.abs(d) / np.abs(ll["a"])))
+   EOF
+   ```
+
+   A difference above ~1e-9 relative, or any `coords`/`inds` mismatch, is
+   the real failure this gate exists to catch.
 
 ## Step 2 — shared-GPU parity run
 
