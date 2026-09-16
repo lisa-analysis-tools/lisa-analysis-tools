@@ -238,6 +238,15 @@ class GBSettings(Settings):
 
     A_lims: typing.List[float] = dataclasses.field(default_factory=list)
     f0_lims: typing.List[float] = dataclasses.field(default_factory=list)
+    # PER-RANK seed for the prior objects :meth:`GBSetup.init_sampling_info`
+    # constructs with their OWN ``np.random.Generator`` (the (f0, Mc) heatmap
+    # GMM and the 3-D galaxy sky/distance prior). Stamped at build time by
+    # ``StockGlobalFit.prepare_branch_settings`` from
+    # ``communication.ranks.rank_build_seed`` -- NOT a user knob and NOT an
+    # env knob: a bare run seed here would give every walker block the same
+    # prior draws. ``None`` (no ``general.random_seed``) keeps those objects
+    # on OS entropy, exactly as before this field existed.
+    build_seed: typing.Optional[int] = None
     # GB's own tempering ladder size (the engine runs cold-chain only)
     ntemps: int = dataclasses.field(default_factory=env_default("GB_NTEMPS", 24, int))
     # Ceiling on the DYNAMIC nleaves_max sizing (2x catalogue sources in
@@ -732,6 +741,25 @@ class GBSetup(Setup, GBSettings):
 
         self.init_setup()
 
+    def _build_sub_seeds(self, n: int):
+        """``n`` independent sub-seeds off :attr:`GBSettings.build_seed`.
+
+        Returns ``[None] * n`` when no build seed was stamped (no
+        ``general.random_seed``), which leaves every consumer on OS entropy
+        -- the pre-2026-09-16 behaviour. With a seed, the values are the
+        deterministic ``SeedSequence(build_seed).spawn(n)`` children, so the
+        objects seeded from them are reproducible AND mutually independent.
+        ``build_seed`` itself is already per rank (``rank_build_seed``), so
+        two walker blocks never share a prior stream.
+        """
+        seed = getattr(self, "build_seed", None)
+        if seed is None:
+            return [None] * int(n)
+        return [
+            int(child.generate_state(1, dtype=np.uint32)[0])
+            for child in np.random.SeedSequence(int(seed)).spawn(int(n))
+        ]
+
     def init_sampling_info(self):
         """Build the GB :class:`TransformContainer`, prior, periodicity, and waveform kwargs.
 
@@ -784,6 +812,13 @@ class GBSetup(Setup, GBSettings):
         if self.periodic is None:
             self.periodic = {"gb": {"phi0": 2*np.pi, "psi": np.pi, "alpha": 2 * np.pi}}
 
+        # Sub-seeds for the prior objects below that own a private
+        # ``np.random.Generator``. ``build_seed`` is already PER RANK
+        # (``rank_build_seed``); the spawn keeps the three streams
+        # independent of each other. ``None`` -> every ``default_rng``
+        # below falls back to OS entropy, exactly as before.
+        _sub_seeds = self._build_sub_seeds(3)
+
         if self.priors is None:
             if self.use_chirp_mass and self.use_astrophysical_f0_mc_prior:
                 # Joint tuple-key prior on (f0[mHz], Mc[Msol]) from the
@@ -800,6 +835,7 @@ class GBSetup(Setup, GBSettings):
                     f0_lims_mHz=tuple(np.asarray(self.f0_lims) * 1e3),
                     mc_lims=tuple(self.m_chirp_lims) if self.m_chirp_lims
                     else None,
+                    seed=_sub_seeds[0],
                 )
                 # Slot 0 is DISTANCE (kpc) in this branch (use_distance): the
                 # sky and distance share a 3-D JOINT prior over
@@ -817,7 +853,12 @@ class GBSetup(Setup, GBSettings):
                     )
 
                     sky_dist = build_gb_galaxy_sky_dist(
-                        dist_lims=self.dist_lims
+                        dist_lims=self.dist_lims,
+                        # two SEPARATE ``default_rng`` sites: the sky/dist
+                        # prior's own rejection sampler and the nested
+                        # GalaxyPrior3D it draws from
+                        rng=_sub_seeds[1],
+                        galaxy_rng=_sub_seeds[2],
                     )
                     self.logger.info(
                         "GB sky/distance prior: 3-D Milky Way "

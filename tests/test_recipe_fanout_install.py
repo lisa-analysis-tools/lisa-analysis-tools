@@ -20,12 +20,12 @@ class FanoutInstallTest(unittest.TestCase):
     def test_builders_call_install(self):
         # the builders are exercised end to end by the gated smokes; here we pin
         # the call sites so a refactor cannot silently drop them.
-        # 3 (pre-Plan-4) + 15 (Plan 4, Task 5) = 18:
+        # 3 (pre-Plan-4) + 14 (Plan 4, Task 5, after the ridge fix) = 17:
         #   - addremove (SingleSourcePEBuilder.build, one call site shared by
         #     MBH/EMRI/SOBBH): 1
         #   - noise (build_psd_moves: search_move, pe_move): 2
-        #   - GB/VGB (build_gb_moves: 13 GBSpecial* moves + the ridge move;
-        #     build_vgb_moves: the vgb move): 15
+        #   - GB (build_gb_moves: 13 GBSpecial* moves): 13
+        #   - VGB (build_vgb_moves: the vgb move): 1
         src = open(recipe_mod.__file__).read()
         # the gb_ridge_gibbs move is a plain eryn move (head-only): no install
         self.assertEqual(src.count("install_walker_fanout(curr)"), 17)

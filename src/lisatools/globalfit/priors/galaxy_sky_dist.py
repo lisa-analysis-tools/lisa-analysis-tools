@@ -91,14 +91,22 @@ class GalaxySkyDistPrior:
             than over all space.
         galaxy: an existing :class:`GalaxyPrior3D`, or ``None`` to build one.
         rng: seed / Generator for :meth:`rvs`.
+        galaxy_rng: seed / Generator for the :class:`GalaxyPrior3D` this
+            builds when ``galaxy`` is ``None``. Its ``rvs`` owns a SECOND,
+            independent generator, so seeding ``rng`` alone would leave the
+            underlying galaxy draws on OS entropy. ``None`` (default) is
+            exactly that pre-existing entropy behaviour. Ignored when an
+            already-built ``galaxy`` is passed in.
         **params: forwarded to :class:`GalaxyPrior3D` (mixture overrides).
     """
 
     #: Monte-Carlo draws used to estimate :attr:`norm` (see its docstring).
     _norm_samples = 400_000
 
-    def __init__(self, dist_lims=(0.0, 100.0), galaxy=None, rng=None, **params):
-        self.galaxy = galaxy if galaxy is not None else GalaxyPrior3D(**params)
+    def __init__(self, dist_lims=(0.0, 100.0), galaxy=None, rng=None,
+                 galaxy_rng=None, **params):
+        self.galaxy = (galaxy if galaxy is not None
+                       else GalaxyPrior3D(rng=galaxy_rng, **params))
         self.dist_lims = (float(dist_lims[0]), float(dist_lims[1]))
         if not self.dist_lims[1] > self.dist_lims[0] >= 0.0:
             raise ValueError(f"dist_lims must be 0 <= lo < hi; got {dist_lims}")
@@ -217,6 +225,10 @@ def build_gb_galaxy_sky_dist(dist_lims, **params):
 
     The GB tuple-key slot ``("dist", "alpha", "sin_delta")`` hands its three
     columns to member index 0/1/2, so the joint occupies ``(0, 1, 2)``.
+
+    ``**params`` reaches :class:`GalaxySkyDistPrior`, so ``rng=`` and
+    ``galaxy_rng=`` seed its two generators (the stock GB build passes the
+    rank's build sub-seeds; ``None`` keeps both on OS entropy).
     """
     from eryn.prior import ProbDistContainer
 

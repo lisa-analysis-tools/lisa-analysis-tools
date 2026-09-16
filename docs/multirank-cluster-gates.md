@@ -49,11 +49,11 @@ GF_LAYOUT_DRY_RUN=1 srun -N 2 --ntasks=3 --distribution=cyclic \
 ```
 
 `GF_LAYOUT_DRY_RUN=1` prints `layout.describe()` from every rank and exits
-before `fit.build()` allocates anything (Plan 5 Task 2 of this port — not
-yet wired into the drivers at every HEAD of this branch; if your checkout
-doesn't have it yet, land that task first). Expected shape of the printed
-table (schematic — `communication/ranks.py::WalkerBlockLayout.describe()`,
-illustrated here for the `np=3` layout above, not a captured run):
+before `fit.build()` allocates anything (`communication/ranks.py::
+layout_dry_run`, wired into the drivers by Plan 5 Task 2). Expected shape of
+the printed table (schematic — `communication/ranks.py::
+WalkerBlockLayout.describe()`, illustrated here for the `np=3` layout above,
+not a captured run):
 
 ```
 walker-block layout: size=3 n_compute=2 nwalkers=<W> block=<W/2> gpus_per_rank=AUTO->1 ranks_per_gpu=1
@@ -73,6 +73,20 @@ over-subscribed pool) raises inside `build_layout`/`prepare_rank` before any
 `describe()` call, so the dry run's job is mainly to *stop before `build()`*
 on the happy path — a bad layout fails exactly the same way with or without
 `GF_LAYOUT_DRY_RUN=1`.
+
+Also check on the first real (non-dry) launch:
+
+- **F-stat epoch completeness.** The head's GB `setup()` writes
+  `band_peaks_stacked.npz` / `fstat_centers.npz` / `DONE.json` into
+  `<fit_dir>/shared/epoch_NNNN/` and the ranks open those paths on the very
+  next message, so the epoch directory has to be visible and complete on
+  every node. The head `fsync`s them (`[FSTAT_EPOCH ...] head flushed epoch
+  N for the ranks: ...` on the head's log) and a rank that still sees an
+  incomplete directory raises `F-stat epoch N incomplete at <path>` instead
+  of silently falling back to the prior for births. If that fires on a
+  2-node launch, the fit directory is not on a shared filesystem (or its
+  metadata lag exceeds the message latency) — fix the storage, do not
+  suppress the check.
 
 ## Step 1 — three transport-parity layouts
 

@@ -9,6 +9,9 @@ branch, which must still reply with correctly shaped arrays so the
 command count stays symmetric across ranks.
 """
 
+import os
+import shutil
+import tempfile
 import unittest
 from unittest import mock
 
@@ -77,16 +80,38 @@ def make_move(cls=gbs.GBSpecialBase):
     return move
 
 
-def make_grid_move():
-    """An F-stat grid move whose install side effects are recorded, not run."""
+def make_grid_move(epoch_complete=True, root="/nowhere"):
+    """An F-stat grid move whose install side effects are recorded, not run.
+
+    ``_setup_from_directive`` probes the epoch directory before installing
+    anything: ``_epoch_complete`` (the stage-B npz or ``DONE.json``) and,
+    when the head asks for the center table, ``fstat_centers.npz``.
+    ``epoch_complete`` stubs the first; the second is a REAL
+    ``os.path.exists`` against ``root``, so a test that wants it present
+    points ``root`` at a tmpdir and writes the file.
+    """
     move = make_move(gbs.GBSpecialRJFStatGridMove)
     move.installs, move.ctr_installs = [], []
     move._install = lambda k, **kw: move.installs.append((k, kw))
     move._install_ctr_table = lambda k, model=None, branches=None: (
         move.ctr_installs.append((k, model)))
-    move._epoch_dir = lambda k: f"/nowhere/epoch_{int(k):04d}"
+    move._epoch_dir = lambda k: os.path.join(root, f"epoch_{int(k):04d}")
     move._epoch_fit_clock = lambda k: 0
+    move._epoch_complete = lambda d: bool(epoch_complete)
     return move
+
+
+def make_epoch_dir(tmpdir, k=3, ctr_npz=True):
+    """A complete-looking epoch dir under ``tmpdir``; returns its ROOT."""
+    from lisatools.sampling.fstat_gridfit import CENTER_TABLE_BASENAME
+
+    d = os.path.join(tmpdir, f"epoch_{int(k):04d}")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "DONE.json"), "w") as f:
+        f.write('{"clock": 0}')
+    if ctr_npz:
+        np.savez(os.path.join(d, CENTER_TABLE_BASENAME), f0_mHz=np.zeros(1))
+    return tmpdir
 
 
 def make_slice(nwalkers=B):
@@ -253,6 +278,78 @@ class TemperRngSeedTest(unittest.TestCase):
         self.assertIs(self.move._temper_rng, rng)
 
 
+class _FakeLayout:
+    """Just what ``install_walker_fanout``'s block check reads."""
+
+    def __init__(self, block, nwalkers=8, n_compute=2):
+        self._block = block
+        self.nwalkers = nwalkers
+        self.n_compute = n_compute
+
+    def block_of(self, rank):
+        return self._block
+
+
+class _FakeFanoutWithLayout(_FakeFanout):
+    def __init__(self, layout, single=False, is_head=False):
+        super().__init__(single, is_head)
+        self.layout = layout
+
+
+def make_vgb_move(kind):
+    move = make_move(gbs.VGBSpecialStretchMove)
+    move._inmodel_kind = lambda: kind
+    return move
+
+
+class VGBWalkerBlockCheckTest(unittest.TestCase):
+    """The VGB red-blue stretch needs an EVEN block >= 2 -- refuse at install.
+
+    Without this the only guard is the ``assert`` inside
+    ``VGBSpecialStretchMove.get_proposal``, which fires at the FIRST propose
+    (after the whole build) instead of at launch.
+    """
+
+    def _install(self, kind, block):
+        move = make_vgb_move(kind)
+        fanout = _FakeFanoutWithLayout(_FakeLayout(block))
+        move.install_walker_fanout(_Curr(fanout, 1))
+        return move
+
+    def test_an_odd_block_is_refused(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._install("stretch", (0, 3))
+        msg = str(ctx.exception)
+        self.assertIn("NWALKERS", msg)
+        self.assertIn("3 walker(s)", msg)
+
+    def test_a_one_walker_block_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "EVEN and >= 2"):
+            self._install("stretch", (2, 3))
+
+    def test_an_even_block_installs(self):
+        move = self._install("stretch", (0, 4))
+        self.assertTrue(move.fanout_active)
+
+    def test_the_observable_and_eigen_kinds_do_not_need_an_even_block(self):
+        for kind in ("observable", "eigen"):
+            move = self._install(kind, (0, 3))
+            self.assertTrue(move.fanout_active)
+
+    def test_a_gb_move_never_needs_an_even_block(self):
+        move = make_move()
+        move.install_walker_fanout(
+            _Curr(_FakeFanoutWithLayout(_FakeLayout((0, 3))), 1))
+        self.assertTrue(move.fanout_active)
+
+    def test_single_rank_skips_the_check_entirely(self):
+        move = make_vgb_move("stretch")
+        fanout = _FakeFanoutWithLayout(_FakeLayout((0, 3)), single=True,
+                                       is_head=True)
+        move.install_walker_fanout(_Curr(fanout, 0))
+        self.assertFalse(move.fanout_active)
+
+
 class InstallWalkerFanoutTest(unittest.TestCase):
     def test_single_rank_is_inactive_and_keeps_the_sidecar(self):
         move = make_move()
@@ -348,10 +445,55 @@ class SetupFromDirectiveTest(unittest.TestCase):
         self.assertEqual(self.move.ctr_installs, [])
 
     def test_the_ctr_table_installs_only_when_the_head_asks(self):
-        self.move._setup_from_directive({"epoch": 3, "ctr_table": True})
-        self.assertEqual(self.move.installs, [(3, {"sync_shutoff": False})])
+        tmp = tempfile.mkdtemp(prefix="gb_epoch_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        move = make_grid_move(root=make_epoch_dir(tmp, 3, ctr_npz=True))
+        move._setup_from_directive({"epoch": 3, "ctr_table": True})
+        self.assertEqual(move.installs, [(3, {"sync_shutoff": False})])
         # model=None -> the npz-only branch, never an F-stat sweep
-        self.assertEqual(self.move.ctr_installs, [(3, None)])
+        self.assertEqual(move.ctr_installs, [(3, None)])
+
+    # ---- completeness: a rank NEVER falls back silently (review C1) ----
+    def test_an_incomplete_epoch_raises_instead_of_installing(self):
+        move = make_grid_move(epoch_complete=False)
+        move.gf_rank = 1
+        with self.assertRaises(RuntimeError) as ctx:
+            move._setup_from_directive({"epoch": 3, "ctr_table": False})
+        msg = str(ctx.exception)
+        self.assertIn("incomplete", msg)
+        self.assertIn("rank 1", msg)
+        self.assertIn("epoch_0003", msg)
+        # nothing installed, nothing memoised: a fallback grid for this epoch
+        # would have been cached and used for the whole epoch
+        self.assertEqual(move.installs, [])
+        self.assertEqual(move.ctr_installs, [])
+
+    def test_an_incomplete_epoch_raises_even_from_the_registry(self):
+        # the process-global memo must not short-circuit the check either
+        move = make_grid_move(epoch_complete=False)
+        gbs._FSTAT_GRID_REGISTRY[move._epoch_dir(3)] = ("container", 3, 17)
+        with self.assertRaisesRegex(RuntimeError, "incomplete"):
+            move._setup_from_directive({"epoch": 3, "ctr_table": False})
+
+    def test_a_requested_ctr_table_with_no_npz_raises(self):
+        tmp = tempfile.mkdtemp(prefix="gb_epoch_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        move = make_grid_move(root=make_epoch_dir(tmp, 3, ctr_npz=False))
+        move.gf_rank = 2
+        with self.assertRaises(RuntimeError) as ctx:
+            move._setup_from_directive({"epoch": 3, "ctr_table": True})
+        msg = str(ctx.exception)
+        self.assertIn("incomplete", msg)
+        self.assertIn("fstat_centers.npz", msg)
+        self.assertEqual(move.installs, [])
+        self.assertEqual(move.ctr_installs, [])
+
+    def test_no_ctr_table_requested_does_not_need_the_npz(self):
+        tmp = tempfile.mkdtemp(prefix="gb_epoch_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        move = make_grid_move(root=make_epoch_dir(tmp, 3, ctr_npz=False))
+        move._setup_from_directive({"epoch": 3, "ctr_table": False})
+        self.assertEqual(move.installs, [(3, {"sync_shutoff": False})])
 
     def test_an_epoch_already_in_the_registry_is_adopted_not_installed(self):
         gbs._FSTAT_GRID_REGISTRY[self.move._epoch_dir(3)] = ("container", 3, 17)
@@ -394,6 +536,43 @@ class SetupFromDirectiveTest(unittest.TestCase):
         )
         self.move._gb_session = None
         self.assertIs(seen["shutoff"], shut)
+
+
+class FlushEpochArtifactsTest(unittest.TestCase):
+    """The head half of the completeness contract (review C1)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="gb_flush_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_every_present_artifact_is_fsynced(self):
+        move = make_grid_move(root=make_epoch_dir(self.tmp, 3, ctr_npz=True))
+        synced = []
+        with mock.patch.object(gbs.os, "fsync", synced.append):
+            move._flush_epoch_artifacts(3)
+        # DONE.json + fstat_centers.npz (no stage-B npz in this fixture)
+        self.assertEqual(len(synced), 2)
+
+    def test_a_missing_epoch_dir_is_not_fatal(self):
+        move = make_grid_move(root=os.path.join(self.tmp, "absent"))
+        move._flush_epoch_artifacts(3)  # nothing to flush, no raise
+
+    def test_no_epoch_and_no_epoch_dir_are_no_ops(self):
+        move = make_grid_move(root=self.tmp)
+        move._flush_epoch_artifacts(None)
+        base = make_move()  # no ``_epoch_dir`` on the base class
+        base._flush_epoch_artifacts(3)
+
+    def test_an_unreadable_artifact_warns_rather_than_raises(self):
+        move = make_grid_move(root=make_epoch_dir(self.tmp, 3, ctr_npz=True))
+
+        def _boom(fd):
+            raise OSError("no fsync here")
+
+        with mock.patch.object(gbs.os, "fsync", _boom):
+            with self.assertLogs(gbs.logger, level="WARNING") as log:
+                move._flush_epoch_artifacts(3)
+        self.assertTrue(any("fsync" in line for line in log.output))
 
 
 class NeutralBlockTest(unittest.TestCase):

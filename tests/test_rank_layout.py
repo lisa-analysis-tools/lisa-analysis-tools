@@ -8,6 +8,7 @@ from lisatools.globalfit.communication.ranks import (
     build_layout,
     derive_rank_seed,
     prepare_rank,
+    rank_build_seed,
     rank_tag,
     resolve_roles,
     select_rank_device,
@@ -159,6 +160,61 @@ class SeedTest(unittest.TestCase):
         self.assertNotEqual(seeds, [derive_rank_seed(103210, lay, r) for r in lay.compute_ranks])
 
 
+class _SeedFit:
+    """The three attributes ``rank_build_seed`` reads off a StockGlobalFit."""
+
+    def __init__(self, random_seed, layout=None, rank=None):
+        self.general = type("G", (), {"random_seed": random_seed})()
+        if layout is not None:
+            self.rank_layout = layout
+        if rank is not None:
+            self.rank = rank
+
+
+class RankBuildSeedTest(unittest.TestCase):
+    """Build-time seeds for prior/proposal objects: per rank, never shared."""
+
+    def _layout(self):
+        return FakeWorld(3).run(lambda r, c: build_layout(c, 4, [0, 1], legacy=False))[0]
+
+    def test_no_run_seed_stays_on_entropy(self):
+        self.assertIsNone(rank_build_seed(_SeedFit(None)))
+        self.assertIsNone(rank_build_seed(_SeedFit(None, self._layout(), 1)))
+
+    def test_no_layout_is_the_plain_run_seed(self):
+        # single process / fit.sample(): prepare_rank never ran
+        self.assertEqual(rank_build_seed(_SeedFit(103209)), 103209)
+
+    def test_each_compute_rank_gets_its_own_seed(self):
+        lay = self._layout()
+        seeds = [rank_build_seed(_SeedFit(103209, lay, r)) for r in lay.compute_ranks]
+        self.assertEqual(len(set(seeds)), len(lay.compute_ranks))
+        self.assertNotIn(103209, seeds)  # never the bare run seed
+
+    def test_the_same_rank_twice_is_the_same_seed(self):
+        lay = self._layout()
+        self.assertEqual(
+            rank_build_seed(_SeedFit(103209, lay, 1)), rank_build_seed(_SeedFit(103209, lay, 1))
+        )
+        self.assertNotEqual(
+            rank_build_seed(_SeedFit(103209, lay, 1)), rank_build_seed(_SeedFit(103210, lay, 1))
+        )
+
+    def test_a_non_compute_rank_falls_back_to_the_head(self):
+        lay = self._layout()  # rank 2 is the saver: no walker block
+        self.assertEqual(
+            rank_build_seed(_SeedFit(103209, lay, lay.saver_rank)),
+            rank_build_seed(_SeedFit(103209, lay, lay.head_rank)),
+        )
+
+    def test_a_layout_without_a_stamped_rank_reads_as_the_head(self):
+        lay = self._layout()
+        self.assertEqual(
+            rank_build_seed(_SeedFit(103209, lay)),
+            rank_build_seed(_SeedFit(103209, lay, lay.head_rank)),
+        )
+
+
 class SelectRankDeviceTest(unittest.TestCase):
     def _layout(self):
         return FakeWorld(3).run(lambda r, c: build_layout(c, 4, [0, 1], legacy=False))[0]
@@ -276,6 +332,17 @@ class PrepareRankTest(unittest.TestCase):
         self.assertEqual(out[1], ([0], "visible", "1", (2, 4), True, "r1/c1"))
         self.assertEqual(out[2][:3], ([0], "visible", "0"))
         self.assertEqual(out[2][5], "r2/saver")
+
+    def test_stamps_the_rank_for_build_time_helpers(self):
+        # GlobalFit.__init__ sets fit.rank too, but that is AFTER the build;
+        # rank_build_seed runs inside it
+        def fn(rank, comm):
+            fit = _Fit()
+            prepare_rank(fit, comm, environ={}, device_count_fn=lambda: 1)
+            return fit.rank
+
+        out = FakeWorld(3).run(fn)
+        self.assertEqual((out[0], out[1], out[2]), (0, 1, 2))
 
     def test_refuses_to_run_after_build_with_several_ranks(self):
         def fn(rank, comm):

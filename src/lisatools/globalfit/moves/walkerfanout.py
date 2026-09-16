@@ -147,16 +147,39 @@ class WalkerFanoutMixin:
         return self.fanout_propose(model, state)
 
     def fanout_propose(self, model, state):
+        """Head: slice the ensemble, run every block, merge the replies back.
+
+        ``local_body`` closes over ``propose``'s own ``model``, NOT the one
+        ``WalkerFanout.run`` hands it (``fanout.model``, bound once at setup
+        and never refreshed): the object eryn passes ``propose`` is the only
+        one guaranteed to be this iteration's. Same fix GB's ``_fanout_cmd``
+        carries; the workers keep their ``ComputeService`` model, which IS
+        their live one.
+        """
         fanout = self.fanout
         layout = fanout.layout
         branches = list(self.fanout_branches or [])
         extra = self.fanout_payload_extra()
 
+        # the head's ACA must be its own walker block, not the ensemble: the
+        # body scores this block's rows against it (spec, ACA-width rule)
+        acs = getattr(model, "analysis_container_arr", None)
+        entries = getattr(acs, "acs_total_entries", None)
+        if entries is not None:
+            w0, w1 = layout.block_of(fanout.rank)
+            if int(entries) != w1 - w0:
+                raise RuntimeError(
+                    f"{type(self).__name__}: the head's AnalysisContainerArray "
+                    f"carries {int(entries)} walker rows but its block is "
+                    f"[{w0}, {w1}) ({w1 - w0} walkers). The per-rank ACA must "
+                    "be built at the block width, not the ensemble width."
+                )
+
         def payload(rank, w0, w1):
             return {"state": slice_state(state, w0, w1, sub_states=branches), "extra": extra}
 
-        def body(p, model_local):
-            return self.gf_serve(PROPOSE_OP, p, fanout.clock, model_local)
+        def body(p, _model_local):
+            return self.gf_serve(PROPOSE_OP, p, fanout.clock, model)
 
         def merge(replies):
             new_state = GFState(state, copy=True)

@@ -779,12 +779,23 @@ class StockGlobalFit(GlobalFitSetup):
 
         Default fills ``Tobs``/``dt`` from the general setup when unset and
         returns a deepcopy (the fit-level block stays untouched/re-buildable).
+
+        It also stamps ``build_seed`` on any block that declares the field
+        (GB/VGB today): the PER-RANK seed for prior/proposal objects the
+        Setup constructs, from
+        :func:`~lisatools.globalfit.communication.ranks.rank_build_seed`.
+        ``None`` there means ``general.random_seed`` is unset, which keeps
+        those objects on OS entropy exactly as before.
         """
         settings = deepcopy(getattr(self, name))
         if settings.Tobs is None:
             settings.Tobs = general_setup.Tobs
         if settings.dt is None:
             settings.dt = general_setup.dt
+        if hasattr(settings, "build_seed") and settings.build_seed is None:
+            from ..communication.ranks import rank_build_seed
+
+            settings.build_seed = rank_build_seed(self)
         return settings
 
     def build_sources(self, force: bool = False) -> typing.Dict[str, Setup]:

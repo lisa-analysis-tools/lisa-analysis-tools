@@ -33,6 +33,7 @@ class _StubMove(WalkerFanoutMixin):
         self.eigen_store_path = "store.h5"
         self.applied = []
         self.merged = None
+        self.seen_models = []
 
     def fanout_temperature_controls(self):
         return [self.tc]
@@ -50,6 +51,7 @@ class _StubMove(WalkerFanoutMixin):
         self.merged = replies
 
     def propose_local(self, model, state):
+        self.seen_models.append(model)
         new = GFState(state, copy=True)
         new.branches["mbh"].coords[...] += 1.0
         nw = new.log_like.shape[1]
@@ -101,7 +103,10 @@ class MixinFakeWorldTest(unittest.TestCase):
             moves[rank] = move
             if role == RankRole.HEAD:
                 fo.enter_stage("pe", "pe")
-                fo.model = "head-model"
+                # DELIBERATELY STALE: run_global_fit binds fanout.model once
+                # at setup and never refreshes it, so the head body must use
+                # the model ``propose`` was called with, not this one
+                fo.model = "stale-fanout-model"
                 state = make_state(np.random.default_rng(1))
                 state.sub_states["mbh"].in_model_accepted[...] = self.SEED_COUNTER
                 ref = GFState(state, copy=True)
@@ -151,6 +156,10 @@ class MixinFakeWorldTest(unittest.TestCase):
             self.assertTrue(moves[rank].tc.gf_configured_adaptive)
         self.assertEqual(moves[0].eigen_store_path, "store.h5")  # head keeps the sidecar
         self.assertIsNone(moves[1].eigen_store_path)  # worker never writes it
+        # the head body ran against propose()'s model, NOT fanout.model
+        self.assertEqual(moves[0].seen_models, ["head-model"])
+        # the worker keeps its ComputeService model (its own live one)
+        self.assertEqual(moves[1].seen_models, ["worker-model"])
 
     def test_counters_accumulate_when_the_body_adds(self):
         out, _moves = self._run_two_ranks(assigns_counters=False)

@@ -264,6 +264,16 @@ Plan 3/4 fan-out mixins' module docstrings for the code-level detail.
   so the residual dump would be wrong over the full ensemble. An explicit
   `TODO(multi-rank)` marks the gap in the warning text itself; routing the
   submission writer through the fan-out is unscoped follow-up work.
+- **A neutral GB block's `log_like` is not rebuilt from the residual.** When
+  the head marks a walker block *neutral* (an alive-only move — one carrying
+  `use_prior_removal` or `rj_replace` — over a block with no alive source),
+  that rank runs nothing and replies with zeros, and the head SKIPS the merge
+  for it: those walkers keep the `log_like` they came in with rather than
+  having it re-derived. Same as the legacy behaviour for a zero-source
+  ensemble, and every other branch's move still rebuilds the same walkers'
+  likelihood, so nothing goes stale in a real recipe — but the zeros in a
+  neutral reply are "nothing happened", never state
+  (`GBSpecialBase._gb_neutral_finish_reply`).
 - **Per-rank accept-split log lines.** `[GB_ACCEPT rj-split ...]` (and the
   analogous replace-split line) is now printed once per compute rank, into
   that rank's own log file — a monitor/digest tool that only reads the

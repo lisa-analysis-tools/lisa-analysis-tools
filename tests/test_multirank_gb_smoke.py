@@ -5,32 +5,52 @@ two compute ranks driving the three-command orchestrator, and the seeded PARITY 
 orchestrator at ONE compute rank (``GB_PROPOSE_ORCHESTRATE=1``, a direct-call
 ``WalkerFanout``) against ``_propose_legacy`` -- today's body.
 
+THE TWO SCENARIOS USE DIFFERENT MODELS, ON PURPOSE
+--------------------------------------------------
+The two-rank scenario INJECTS an in-band GB source
+(``general.gb_injection_params``), so the RJ search really births leaves and
+the whole alive-source path -- birth, in-model repeats, write-back, the
+head's block merge -- runs under real code on BOTH walker blocks. The parity
+scenario does NOT inject: its fixture has to be REPRODUCIBLE, and a model
+with alive leaves is not (measured below).
+
 WHAT THE PARITY GATE CAN AND CANNOT COMPARE
 -------------------------------------------
-``log_like``, ``inds``, ``band_temps`` and ``band_num_binaries`` are compared
-bit for bit. ``coords`` is NOT reproducible across two runs of this fit -- not
-even two runs of the *legacy* body -- because three GB proposal/prior objects
-seed themselves from OS entropy rather than from ``general.random_seed``:
+``log_like``, ``inds``, ``band_temps``, ``band_num_binaries`` and the alive
+coords (``coords[inds]``) are compared bit for bit on the EMPTY-model fit.
 
-* ``F0McGMMSampling.__init__`` -> ``np.random.default_rng(seed)`` with
-  ``seed=None`` (``stock/erebor/gb.py`` builds it via ``from_heatmap()``),
-* the 3-D galaxy sky/distance prior (``priors/galaxy_prior_3d.py``,
-  ``priors/galaxy_sky_dist.py``) -> ``np.random.default_rng(None)``,
-* the F-stat birth proposal (``sampling/fstat_proposal.py``)
-  -> ``np.random.default_rng()``.
+Reproducibility of this fixture, measured with PAIRED NEGATIVE CONTROLS
+(legacy vs legacy, same seed, same process -- an invariance claim without one
+proves nothing):
 
-Together they fill 5 of the 9 GB columns, so the prior draw that seeds the
-starting state -- and every RJ birth candidate afterwards -- differs run to
-run. Measured 2026-09-16 on this fit: a PAIRED NEGATIVE CONTROL (legacy vs
-legacy, same seed, same process) diverges in ``coords`` exactly like legacy vs
-orchestrator -- 4000/7200 elements on the starting state, 5600/7200 after two
-iterations, i.e. the 5 of 9 columns those three objects fill -- while
-``log_like``, ``inds``, ``band_temps`` and ``band_num_binaries`` stay
-bit-identical in BOTH pairings. So this test compares those four plus the
-alive-leaf coords. ``GB_SMOKE_PARITY_CONTROL=1`` re-runs that control here and
-automatically promotes the check to the FULL ``coords`` array once the fixture
-reproduces it (i.e. once those three sites take the run seed) -- the gate is
-never weakened silently, the control decides.
+* 2026-09-16, before the build seeds: ``coords`` diverged in the control
+  exactly as it did legacy-vs-orchestrator (4000/7200 elements on the
+  starting state, 5600/7200 after two iterations) while the four arrays above
+  stayed bit-identical in BOTH pairings. Cause: the GB prior objects seeded
+  themselves from OS entropy -- ``F0McGMMSampling`` (built via
+  ``from_heatmap()`` in ``stock/erebor/gb.py``) and the 3-D galaxy
+  sky/distance prior (``priors/galaxy_prior_3d.py``,
+  ``priors/galaxy_sky_dist.py``), which between them fill 5 of the 9 GB
+  columns. They now take PER-RANK sub-seeds derived from ``random_seed``
+  (``communication/ranks.py::rank_build_seed`` -> ``GBSettings.build_seed``
+  -> ``GBSetup._build_sub_seeds``).
+* 2026-09-16, with the injection ON: the control diverges in ``log_like``
+  itself (all 4 walkers, O(100) nats) -- and so does legacy vs orchestrator,
+  by the same magnitude. The seeded priors do not help, because a NON-EMPTY
+  model reaches a second entropy family the empty one never touches: once the
+  F-stat fit finds peaks, the RJ birth container
+  (``fstat_gridfit.build_gb_birth_distribution`` ->
+  ``StackedFStatProposal4D`` / ``CombIntrinsicProposal`` /
+  ``MixtureProposal`` / ``UniformFloorMixture`` / ``FdotAxisBirth`` /
+  ``RatioTightenedBirth``) is assembled with ``seed=None`` at every
+  constructor, i.e. ``np.random.default_rng()``. Every birth candidate then
+  comes off an entropy stream. Until those take the run seed, an injected
+  fixture CANNOT support a bit-identity gate -- hence the split above.
+
+``GB_SMOKE_PARITY_CONTROL=1`` re-runs the control here and automatically
+promotes the check to the FULL ``coords`` array (dead-leaf fill included)
+once the fixture reproduces that too -- the gate is never weakened silently,
+the control decides.
 
 Memory: an 8 GB laptop is the budget. ``tearDown`` asserts the process stayed
 under 5 GB; the whole module measured 4.0-4.7 GB peak RSS (two scenarios,
@@ -106,6 +126,17 @@ class MultiRankGBSmokeTest(unittest.TestCase):
     #: happens BEFORE any move is constructed.
     SEED = 4242
 
+    #: ONE in-band GB injection, GBGPU basis
+    #: ``[A, f0, fdot, fddot, phi0, iota, psi, lam, beta]``
+    #: (``injections.GB_INJECTION_PARAMS``' column order). ``f0 = 7.5 mHz``
+    #: sits inside gb_no_fg's GB band [7.36, 7.78] mHz and ``A = 1e-21`` is
+    #: loud enough at the 3-day debug Tobs that the RJ search births leaves
+    #: within the two iterations. Used by the TWO-RANK scenario only -- the
+    #: alive-source path was otherwise untested by real code (whole-plan
+    #: review, I2); the parity scenario needs a reproducible fixture and an
+    #: alive model is not one (module docstring).
+    INJECTION = [[1e-21, 7.5e-3, 1e-16, 0.0, 1.2, 0.9, 1.0, 4.0, -0.6]]
+
     #: seeded through ``os.environ.setdefault`` (an explicit value in the
     #: caller's environment still wins, so the knobs stay tunable from a shell)
     SMOKE_ENV = {
@@ -156,7 +187,7 @@ class MultiRankGBSmokeTest(unittest.TestCase):
         os.environ.update(self._env0)
         self.assertLess(_rss_gb(), 5.0, "GB smoke exceeded the 5 GB laptop budget")
 
-    def _fit(self, subdir):
+    def _fit(self, subdir, inject):
         from lisatools.globalfit.stock import erebor
 
         fit = erebor.gb_no_fg(
@@ -166,9 +197,11 @@ class MultiRankGBSmokeTest(unittest.TestCase):
         )
         fit.general.num_iterations = self.ITERATIONS
         fit.general.random_seed = self.SEED
+        if inject:
+            fit.general.gb_injection_params = self.INJECTION
         return fit
 
-    def _run_world(self, size, env=None, subdir=None):
+    def _run_world(self, size, env=None, subdir=None, inject=False):
         """Run ``size`` ranks over the fake world; return ``{rank: probe dict}``."""
         from lisatools.globalfit.communication.fakecomm import FakeWorld
         from lisatools.globalfit.communication.ranks import prepare_rank
@@ -177,7 +210,7 @@ class MultiRankGBSmokeTest(unittest.TestCase):
         store = subdir if subdir is not None else f"n{size}"
 
         def fn(rank, comm):
-            fit = self._fit(store)
+            fit = self._fit(store, inject)
             layout = prepare_rank(fit, comm)
             fit.build()
             gf = GlobalFit(fit, comm)
@@ -220,7 +253,7 @@ class MultiRankGBSmokeTest(unittest.TestCase):
                     os.environ[key] = value
 
     def test_two_compute_ranks_run_the_gb_moves(self):
-        out = self._run_world(2)
+        out = self._run_world(2, inject=True)
         self.assertEqual((out[0]["role"], out[1]["role"]), ("head", "compute"))
         self.assertEqual((out[0]["acs_rows"], out[1]["acs_rows"]), (2, 2))
         # FLOOR, not the exact count: ping + the three commands of one GB
@@ -232,8 +265,24 @@ class MultiRankGBSmokeTest(unittest.TestCase):
         self.assertEqual(out[0]["log_like"].shape, (self.NWALKERS,))
         # (num_bands, ntemps) ladder: betas non-increasing with temperature
         self.assertTrue(np.all(np.diff(out[0]["band_temps"], axis=-1) <= 0))
+        # the injected source is found: the ALIVE-source path ran for real
+        # (an empty model exercises only the neutral/early-return branches)
+        inds = out[0]["inds"]
+        self.assertGreater(int(inds.sum()), 0, "no GB leaf survived the run")
+        # and BOTH walker blocks carry leaves on the cold chain -- the merge
+        # writes each rank's block back into the head's full state, so a
+        # block-shaped merge bug shows here and nowhere else
+        half = self.NWALKERS // 2
+        self.assertTrue(inds[0, :half].any(), "head block has no cold leaf")
+        self.assertTrue(inds[0, half:].any(), "worker block has no cold leaf")
 
     def test_orchestrator_at_one_rank_matches_the_legacy_body(self):
+        # NO injection here: with one the fixture stops reproducing (the birth
+        # container's entropy-seeded generators -- module docstring), and the
+        # measured legacy-vs-LEGACY control then diverges in ``log_like`` just
+        # as legacy-vs-orchestrator does, which would make this gate red for a
+        # fixture reason rather than a port one. Alive-source coverage lives in
+        # the two-rank scenario instead.
         legacy = self._run_world(1, env={"GB_PROPOSE_ORCHESTRATE": "0"}, subdir="legacy")[0]
         orch = self._run_world(1, env={"GB_PROPOSE_ORCHESTRATE": "1"}, subdir="orch")[0]
         for key in PARITY_KEYS:
@@ -255,9 +304,9 @@ class MultiRankGBSmokeTest(unittest.TestCase):
                         "non-reproducible here, so the orchestrator comparison above "
                         "proves nothing")
         if np.array_equal(ctl["coords"], legacy["coords"]):
-            # the fixture reproduces its dead-leaf fill now (the three
-            # entropy-seeded sites took the run seed): hold the orchestrator to
-            # the whole array, which is the gate the plan actually wants.
+            # the fixture reproduces its dead-leaf fill (every entropy-seeded
+            # site took the run seed): hold the orchestrator to the whole
+            # array, which is the gate the plan actually wants.
             np.testing.assert_array_equal(orch["coords"], legacy["coords"], err_msg="coords")
 
 

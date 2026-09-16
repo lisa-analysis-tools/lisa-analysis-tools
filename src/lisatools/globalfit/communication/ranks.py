@@ -347,6 +347,37 @@ def derive_rank_seed(base_seed, layout, rank) -> int:
     return int(child.generate_state(1, dtype=np.uint32)[0])
 
 
+def rank_build_seed(fit):
+    """Per-rank seed for objects built during ``fit.build()``; ``None`` for entropy.
+
+    ``run.py::_seed_rank_streams`` seeds the GLOBAL numpy/cupy streams per
+    rank, but it runs long after the build: priors and proposal objects
+    constructed inside ``fit.build()`` own private ``Generator``s that were
+    already drawn from OS entropy by then. Seeding those from the bare
+    ``general.random_seed`` would hand EVERY rank the identical stream, so
+    the walker blocks' prior draws and RJ birth candidates would correlate.
+    This is the build-time analogue of :func:`derive_rank_seed`.
+
+    * ``general.random_seed is None`` -> ``None`` (entropy, exactly today);
+    * a layout is resolved (``prepare_rank`` ran) -> the rank's sub-seed;
+    * no layout (single process, ``fit.sample()``) -> the plain run seed.
+
+    A rank with no walker block (the saver) has nothing to sample, so it
+    takes the head's sub-seed rather than an index error.
+    """
+    seed = getattr(getattr(fit, "general", None), "random_seed", None)
+    if seed is None:
+        return None
+    layout = getattr(fit, "rank_layout", None)
+    if layout is None:
+        return int(seed)
+    rank = getattr(fit, "rank", None)
+    rank = layout.head_rank if rank is None else int(rank)
+    if rank not in layout.compute_ranks:
+        rank = layout.head_rank
+    return derive_rank_seed(int(seed), layout, rank)
+
+
 # --------------------------------------------------------------------------
 # device pinning (must run BEFORE any CUDA initialisation on the rank)
 # --------------------------------------------------------------------------
@@ -480,9 +511,13 @@ def prepare_rank(
     Idempotent (returns the stored layout on a second call). Reads the
     pre-build settings ``fit.general.nwalkers`` / ``.gpus`` (the per-node
     pool) / ``.gpus_per_rank`` / ``.ranks_per_gpu``; writes the rank-local
-    ``fit.general.gpus``, ``fit.rank_layout`` and ``fit.rank_device_mode``.
-    ``gpus_per_rank`` is passed through unchanged (``None`` stays ``None``,
-    AUTO) — it is never coerced to 1.
+    ``fit.general.gpus``, ``fit.rank``, ``fit.rank_layout`` and
+    ``fit.rank_device_mode``. ``gpus_per_rank`` is passed through unchanged
+    (``None`` stays ``None``, AUTO) — it is never coerced to 1.
+
+    ``fit.rank`` is stamped here (``GlobalFit.__init__`` sets it too, but
+    that is AFTER the build) so build-time helpers — :func:`rank_build_seed`
+    — can tell which block this process owns.
     """
     layout = getattr(fit, "rank_layout", None)
     if layout is not None:
@@ -514,6 +549,7 @@ def prepare_rank(
     )
     if pool:
         general.gpus = gpus
+    fit.rank = int(comm.Get_rank())
     fit.rank_layout = layout
     fit.rank_device_mode = mode
     if logger is not None:

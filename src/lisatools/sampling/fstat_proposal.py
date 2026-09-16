@@ -658,7 +658,7 @@ def _pe_vonmises_rvs(kappa, rand, xp):
 
 
 def pe_extrinsic_rvs(phi0_c, iota_c, psi_c, ln_snr, eps: float = 0.05,
-                     geom: float = 2.0, rand=None):
+                     geom: float = 2.0, rand=None, seed: Optional[int] = None):
     """Draw ``(phi0, cos_iota, psi)`` from the PE-mode extrinsic proposal.
 
     Samples exactly the density :func:`pe_extrinsic_logpdf` evaluates:
@@ -666,9 +666,14 @@ def pe_extrinsic_rvs(phi0_c, iota_c, psi_c, ln_snr, eps: float = 0.05,
     (phi0, psi) centers jointly by ``(pi, pi/2)``, then each component is
     drawn from its in-branch eps-mixture (uniform floor with probability
     ``eps``, else the concentrated law). ``rand(m) -> (m,)`` uniforms on
-    the target module is the caller-owned RNG stream (defaults to a fresh
-    numpy generator). Outputs are wrapped/clipped into the sampling
-    domains ``[0, 2 pi) x [-1, 1] x [0, pi)``.
+    the target module is the caller-owned RNG stream; with none supplied
+    this falls back to ``np.random.default_rng(seed)``, so ``seed=None``
+    (the default) is OS entropy exactly as before and a direct caller that
+    needs reproducibility passes ``rand`` or ``seed``. The GB move always
+    supplies ``rand``, backed by the global cupy/numpy stream that
+    ``run.py``'s ``_seed_rank_streams`` already seeds PER RANK. Outputs are
+    wrapped/clipped into the sampling domains
+    ``[0, 2 pi) x [-1, 1] x [0, pi)``.
     """
     from ..utils.utility import get_array_module
 
@@ -678,7 +683,7 @@ def pe_extrinsic_rvs(phi0_c, iota_c, psi_c, ln_snr, eps: float = 0.05,
     ci_c = xp.cos(xp.asarray(iota_c, dtype=xp.float64) % np.pi)
     n = int(phi0_c.shape[0])
     if rand is None:
-        _rng = np.random.default_rng()
+        _rng = np.random.default_rng(seed)
 
         def rand(m):
             return xp.asarray(_rng.random(m))

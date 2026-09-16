@@ -17099,13 +17099,46 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         PE moves (``recipe.SingleSourcePEBuilder``). The ``hasattr`` guard
         below is kept anyway, harmless and one line, so a subclass that ever
         grows the attribute inherits the single-writer rule for free.
+
+        VGB UNDER ``VGB_INMODEL_PROPOSAL=stretch``: the red-blue split takes
+        its complement from the RANK's walker block, so that block must be
+        even and at least 2. Today the ``assert`` guarding it lives inside
+        the proposal and fires at the first propose, after the whole build;
+        refuse here instead, where the launch can still be fixed.
         """
         self.fanout = getattr(curr, "fanout", None)
         self.gf_rank = getattr(curr, "rank", None)
         if not self.fanout_active:
             return
+        if self._needs_even_walker_block():
+            layout = self.fanout.layout
+            w0, w1 = layout.block_of(self.gf_rank)
+            width = int(w1 - w0)
+            if width < 2 or width % 2:
+                raise ValueError(
+                    f"{self.name}: VGB_INMODEL_PROPOSAL=stretch draws its "
+                    f"red-blue complement from this rank's walker block, "
+                    f"which is [{w0}, {w1}) = {width} walker(s). It must be "
+                    f"EVEN and >= 2: NWALKERS ({layout.nwalkers}) has to be "
+                    f"an even multiple of the compute-rank count "
+                    f"({layout.n_compute}). Raise NWALKERS, lower the rank "
+                    "count, or pin VGB_INMODEL_PROPOSAL=observable|eigen."
+                )
         if not self.fanout.is_head and hasattr(self, "eigen_store_path"):
             self.eigen_store_path = None  # single-writer sidecar (head only)
+
+    def _needs_even_walker_block(self) -> bool:
+        """Does this move's in-model draw need an even walker block?
+
+        Only the VGB stretch kind does: ``GBSpecialBase`` proposals never
+        take a red-blue complement, and the VGB ``observable`` / ``eigen``
+        kinds take the composite / one-axis draw instead. ``_inmodel_kind``
+        is the single resolver for ``VGB_INMODEL_PROPOSAL`` (see
+        ``_vgb_inmodel_defaults``).
+        """
+        if not isinstance(self, VGBSpecialStretchMove):
+            return False
+        return self._inmodel_kind() == "stretch"
 
     # ---- session bookkeeping ------------------------------------------
     @staticmethod
@@ -17276,6 +17309,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         reads the valve to drop grid rows). The head owns the valve and
         ships it.
 
+        COMPLETENESS IS CHECKED, NOT ASSUMED (whole-plan review C1). The head
+        writes the epoch artifacts to a SHARED filesystem and the very next
+        MPI message has every rank open them, so a rank can race an
+        incomplete directory (NFS metadata lag, a partially-written npz).
+        Neither loader fails on that: ``_install`` falls back to the PRIOR
+        for births (``container is None``) and ``_install_ctr_table`` to the
+        per-unit hoist, and BOTH results are memoised per epoch
+        (``_FSTAT_GRID_REGISTRY`` / ``_FSTAT_CTR_TABLE_REGISTRY``) -- so that
+        rank would propose from a different distribution for the whole epoch,
+        silently. Raise instead; the head's ``_flush_epoch_artifacts`` is the
+        other half of the contract.
+
         No-op on the base class (only ``GBSpecialRJFStatGridMove`` has an
         ``_install``) and no-op when the head ships no epoch.
         """
@@ -17285,9 +17330,27 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         if k is None:
             return
         k = int(k)
+        epoch_dir = self._epoch_dir(k)
+        if not self._epoch_complete(epoch_dir):
+            raise RuntimeError(
+                f"rank {self.gf_rank}: F-stat epoch {k} incomplete at "
+                f"{epoch_dir} (DONE.json missing) -- the head's setup() must "
+                "finish and flush before the ranks install it"
+            )
+        if directive.get("ctr_table"):
+            from lisatools.sampling.fstat_gridfit import CENTER_TABLE_BASENAME
+
+            ctr_path = os.path.join(epoch_dir, CENTER_TABLE_BASENAME)
+            if not os.path.exists(ctr_path):
+                raise RuntimeError(
+                    f"rank {self.gf_rank}: F-stat epoch {k} incomplete at "
+                    f"{ctr_path} (the head asked for the center table but "
+                    "the npz is absent) -- the head's setup() must finish "
+                    "and flush before the ranks install it"
+                )
         # Same process-global memo ``setup()`` consults: another GB move
         # sharing this fit dir may already hold the epoch on this rank.
-        hit = _FSTAT_GRID_REGISTRY.get(self._epoch_dir(k))
+        hit = _FSTAT_GRID_REGISTRY.get(epoch_dir)
         if hit is not None:
             container, epoch, n_peaks = hit
             logger.info(
@@ -17303,6 +17366,63 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         if directive.get("ctr_table"):
             # model=None -> npz-only branch, never an F-stat sweep
             self._install_ctr_table(k, model=None)
+
+    #: epoch artifacts the head fsyncs before the ranks open them; the two
+    #: npz names are resolved lazily (fstat_gridfit owns the basenames)
+    _EPOCH_MANIFEST = "DONE.json"
+
+    def _flush_epoch_artifacts(self, k):
+        """HEAD: fsync epoch ``k``'s artifacts before any rank reads them.
+
+        The other half of :meth:`_setup_from_directive`'s completeness check.
+        ``setup()`` writes ``band_peaks_stacked.npz`` / ``fstat_centers.npz``
+        / ``DONE.json`` through buffered Python file objects; the next MPI
+        message has every OTHER process open the same paths over a shared
+        filesystem. ``os.sync()`` is not portable and would flush the whole
+        machine, so this re-opens each artifact that exists and ``fsync``s
+        its descriptor -- the narrow, portable "these bytes are on the
+        server" barrier.
+
+        No-op off the F-stat grid moves (no ``_epoch_dir``) and when the head
+        installed no epoch. Never fatal on its own: a missing artifact is the
+        RANK's loud failure, and an unreadable one is reported as a warning
+        here rather than taking down a run whose ``setup()`` succeeded.
+        """
+        if k is None or not hasattr(self, "_epoch_dir"):
+            return
+        from lisatools.sampling.fstat_gridfit import (
+            CENTER_TABLE_BASENAME,
+            GRID_BASENAME,
+        )
+
+        d = self._epoch_dir(int(k))
+        names = (
+            self._EPOCH_MANIFEST,
+            GRID_BASENAME.replace(".npz", "_peaks_stacked.npz"),
+            CENTER_TABLE_BASENAME,
+        )
+        flushed = []
+        for name in names:
+            path = os.path.join(d, name)
+            if not os.path.exists(path):
+                continue
+            try:
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                flushed.append(name)
+            except OSError as exc:
+                logger.warning(
+                    "%s: could not fsync the F-stat epoch %d artifact %s "
+                    "(%r); the ranks' completeness check is the backstop",
+                    self.name, int(k), path, exc,
+                )
+        logger.info(
+            "[FSTAT_EPOCH %s] head flushed epoch %d for the ranks: %s in %s",
+            self.name, int(k), (", ".join(flushed) or "no artifacts"), d,
+        )
 
     def _make_slice_state(self, payload):
         """This rank's walker-block ``GFState`` (built by the head).
@@ -17844,6 +17964,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         (computed by the caller when the head asked for it): the cap gate's
         statistic has a walker axis, so every block must supply its rows or
         the head's concatenation is short of N and the caps stall.
+
+        ``log_like`` IS NOT REBUILT FROM THE RESIDUAL for a neutral block.
+        ``log_like_final`` here is zeros and the head SKIPS the merge for a
+        neutral block (see ``_propose_orchestrated``'s NEUTRAL BLOCKS note),
+        so those walkers keep the value they carried in. Consequence, stated
+        rather than fixed: on a ``use_prior_removal`` / ``rj_replace`` move
+        whose block is PERMANENTLY empty, the block's stored ``log_like`` is
+        never re-derived by this move -- it is whatever the last move that
+        did run wrote. That matches the legacy behaviour (an alive-only move
+        on a zero-source block also recomputes nothing) and every other
+        branch's move still rebuilds the same walkers' likelihood, so no
+        value goes stale in a real recipe; documented so a future reader does
+        not mistake the zeros for state.
         """
         branch = self._work_branch(sess.new_part)
         ndim = int(branch.coords.shape[-1])
@@ -18262,6 +18395,24 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         N = int(nwalkers)
         num_bands = len(self.band_edges) - 1
 
+        if self.fanout_active:
+            # the head's ACA must carry exactly its own walker block: every
+            # flat (temp, walker, band) index below is computed against N
+            # while the fills run against these rows (spec, ACA-width rule)
+            _acs = model.analysis_container_arr
+            _w0, _w1 = layout.block_of(fanout.rank)
+            _entries = getattr(_acs, "acs_total_entries", None)
+            if _entries is not None and int(_entries) != _w1 - _w0:
+                raise RuntimeError(
+                    f"{self.name}: the head's AnalysisContainerArray carries "
+                    f"{int(_entries)} walker rows but its block is "
+                    f"[{_w0}, {_w1}) ({_w1 - _w0} walkers). The per-rank ACA "
+                    "must be built at the block width, not the ensemble width."
+                )
+            # ``setup()`` above may have written a NEW epoch; the ranks open
+            # those files from the shared filesystem on the very next message
+            self._flush_epoch_artifacts(getattr(self, "_fstat_epoch", None))
+
         new_state = GFState(state, copy=True)
         assert new_state.log_like is not None
 
@@ -18353,7 +18504,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # NEUTRAL BLOCKS paragraph of this method's docstring).
         #
         # NOT the same set as the legacy's whole-ensemble early return
-        # (``rj_replace or rj_removal_only``, line ~18078): that gate asks
+        # (``rj_replace or rj_removal_only``, see the empty-model early
+        # returns above): that gate asks
         # "can this move run at all" and deliberately EXCLUDES
         # ``use_prior_removal``, because the search BIRTH move carries it
         # and must still run on a zero-leaf start (the 2026-08-13 defect).
@@ -18750,7 +18902,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # ``_fanout_cmd`` restores it after every command precisely so this
         # stays true (a body binds ``_prop_timer`` to its rank session's
         # timer). Under fan-out the head's own stage spans therefore live on
-        # the session timer and land in the per-rank DEBUG line below, which
+        # the session timer and land in the per-rank line below, which
         # leaves ``untracked`` here carrying the worker wait and transport;
         # fanout.py's [FANOUT] line carries the load balance.
         logger.info(
@@ -18763,11 +18915,22 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             _stages = _snap.get("stages") or {}
             if not _stages:
                 continue
-            logger.debug(
-                "[GB_TIMING %s r%s] %s", self.name, rank,
-                " ".join(f"{k}={v:.3f}s" for k, v in
-                         sorted(_stages.items(), key=lambda kv: -kv[1])),
-            )
+            _text = " ".join(f"{k}={v:.3f}s" for k, v in
+                             sorted(_stages.items(), key=lambda kv: -kv[1]))
+            # The HEAD's own block is the only per-rank line the head's log
+            # file can carry, and under fan-out it is where the head's real
+            # stage breakdown went (the INFO line above degenerates to
+            # ``untracked``). Promote it so the [GB_TIMING] parsers keep a
+            # meaningful line at default verbosity. The workers' rows stay
+            # DEBUG: a worker prints no [GB_TIMING] line of its own (see the
+            # note in ``_gb_serve_finish``), so these are the only copies --
+            # promoting all of them would multiply the head's line by
+            # n_compute every propose for no new head-side signal.
+            if self.fanout_active and rank == fanout.rank:
+                logger.info("[GB_TIMING %s head r%s] %s",
+                            self.name, rank, _text)
+            else:
+                logger.debug("[GB_TIMING %s r%s] %s", self.name, rank, _text)
 
         return new_state, accepted
 
@@ -20396,8 +20559,13 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         self._fstat_ctr_table = table
         _FSTAT_CTR_TABLE_REGISTRY[key] = table
 
-    def _install(self, k: int, stacked=None, n_peaks=None, sync_shutoff=True):
+    def _install(self, k: int, stacked=None, n_peaks=None, *,
+                 sync_shutoff=True):
         """Install epoch ``k``'s birth grid (pure in-memory).
+
+        ``sync_shutoff`` is KEYWORD-ONLY: it silently reverses the band
+        shut-off semantics, so it must never be passed by position next to
+        ``stacked``/``n_peaks`` (Task 2 review minor).
 
         ``sync_shutoff=False`` skips the band-shutoff epoch sync: under the
         multi-rank fan-out the head owns the valve and ships its state to
