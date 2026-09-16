@@ -371,7 +371,20 @@ not treat any difference as a regression.
 
 ## Step 4 — load balance and payload-size measurement
 
-**`[FANOUT]` load-balance line.** Every non-single fan-out op logs one DEBUG
+**Measured 2026-09-16 (gb_no_fg, 8 walkers, layouts (b) and (c)):** `wait_s`
+0.000 on every op in both layouts, and the wall time between consecutive ops
+equals `max_rank_s` + ~10 ms — so the whole command/reply round trip,
+including the two-node TCP fabric and the enlarged `gb_finish` payload,
+costs ~10 ms against 9-15 s `gb_run_proposal` calls; `max_rank_s` tracks
+`head_s` to within 0.14 s (balanced blocks); `gb_run_tempering` 0.3-0.5 s,
+`gb_finish` 50-90 ms (the ceiling on the round-4 reply-size concern: no
+narrowing needed). A faster fabric than tcp buys nothing at this scale.
+Before 2026-09-16 the line went to `global_fit.log` (the `GlobalFit` logger,
+propagation off) at DEBUG; it is now INFO on the module logger, i.e. in
+`globalfit_run.log` next to `[FANOUT_DIGEST]`, where `summarize_fanout`
+looks for it.
+
+**`[FANOUT]` load-balance line.** Every non-single fan-out op logs one INFO
 line on the head (`communication/fanout.py::WalkerFanout.run`):
 
 ```

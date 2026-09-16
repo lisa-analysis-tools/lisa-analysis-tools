@@ -18,10 +18,18 @@ from __future__ import annotations
 
 import collections
 import hashlib
+import logging
 import time
 import traceback
 
 import numpy as np
+
+# Module logger: propagates to the ``lisatools`` file handler, i.e. the head's
+# ``globalfit_run.log`` -- the file the diagnostics (``summarize_fanout``) and
+# the WP7 runbook read. The ``GlobalFit`` logger handed in at construction
+# writes ``global_fit.log`` with propagation OFF, which is where the
+# ``[FANOUT]`` load-balance line hid until 2026-09-16 (cluster Step 4).
+_LOG = logging.getLogger(__name__)
 
 from ...utils.utility import asnumpy
 
@@ -234,16 +242,17 @@ class WalkerFanout:
                     )
             first = failures[0]
             raise RemoteWorkerError(first["rank"], op, move, first.get("error"))
-        if self.logger is not None:
-            worst = max(rep["wall_s"] for rep in replies.values())
-            self.logger.debug(
-                "[FANOUT] op=%s move=%s head_s=%.3f max_rank_s=%.3f wait_s=%.3f",
-                op,
-                move,
-                head_wall,
-                worst,
-                wait_s,
-            )
+        # INFO on the module logger (not DEBUG on ``self.logger``): one line per
+        # fan-out op, the load-balance signal the cluster gates diff.
+        worst = max(rep["wall_s"] for rep in replies.values())
+        _LOG.info(
+            "[FANOUT] op=%s move=%s head_s=%.3f max_rank_s=%.3f wait_s=%.3f",
+            op,
+            move,
+            head_wall,
+            worst,
+            wait_s,
+        )
         return merge({r: rep["result"] for r, rep in replies.items()})
 
     def ping(self):
