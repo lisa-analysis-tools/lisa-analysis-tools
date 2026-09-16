@@ -648,6 +648,20 @@ class FlushEpochArtifactsTest(unittest.TestCase):
             move._flush_epoch_artifacts(3)  # nothing to flush, no raise
         self.assertTrue(any("no artifacts" in line for line in log.output))
 
+    def test_a_flush_that_found_nothing_does_not_suppress_the_real_one(self):
+        # the memo is recorded AFTER a pass that actually synced something:
+        # a first call racing ahead of the setup() that writes the epoch must
+        # not permanently suppress that epoch's real flush on this move
+        root = os.path.join(self.tmp, "late")
+        move = make_grid_move(root=root)
+        synced = []
+        with mock.patch.object(gbs.os, "fsync", synced.append):
+            move._flush_epoch_artifacts(3)  # epoch dir not written yet
+            self.assertEqual(len(synced), 0)
+            make_epoch_dir(root, 3, ctr_npz=True)
+            move._flush_epoch_artifacts(3)  # now it is there
+        self.assertEqual(len(synced), 2)
+
     def test_no_epoch_and_no_epoch_dir_are_no_ops(self):
         move = make_grid_move(root=self.tmp)
         base = make_move()  # no ``_epoch_dir`` on the base class

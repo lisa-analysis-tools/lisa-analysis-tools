@@ -2998,7 +2998,10 @@ def build_gb_moves(
             logger.warning(
                 "GB_FSTAT_FIT_IN_MOVE=1 supersedes the supplied "
                 "rj_birth_distribution; drop a prebuilt grid into "
-                "%s/<move name>/epoch_0000/ to have it loaded instead.",
+                "%s/<move name>/epoch_0000/ -- WITH a DONE.json beside it, "
+                "since under the multi-rank fan-out every rank (the head "
+                "included) refuses an epoch whose manifest is missing -- to "
+                "have it loaded instead.",
                 _fit_dir,
             )
 

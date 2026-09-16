@@ -323,6 +323,16 @@ def _reseed_node(node, seed):
     ``run.py::_seed_rank_streams`` -- there is no per-object stream to set.
     An eryn ``ProbDistContainer`` is recursed into by its ``priors_in``
     mapping (insertion order, which is the container's construction order).
+
+    The skip is NOT unconditional: a node that owns a private ``_rng`` or
+    carries a wrapped child (``base`` / ``components`` / ``grid4``) but
+    defines no ``reseed`` raises :class:`TypeError` here, exactly as a bad
+    ROOT does in :func:`reseed_birth_tree`. Without that a new wrapper
+    inserted INSIDE the tree would leave its whole subtree on OS entropy with
+    no error anywhere -- the failure mode this helper exists to prevent.
+    None of the eryn analytic leaves or
+    :class:`~lisatools.sampling.prior.FullGaussianMixtureModel` define any of
+    those four attributes, so the legitimate skips are unaffected.
     """
     if node is None or seed is None:
         return
@@ -335,6 +345,16 @@ def _reseed_node(node, seed):
         kids = _child_seeds(np.random.SeedSequence(int(seed)), len(priors_in))
         for child, kid in zip(priors_in.values(), kids):
             _reseed_node(child, kid)
+        return
+    owned = [name for name in ("_rng", "base", "components", "grid4")
+             if getattr(node, name, None) is not None]
+    if owned:
+        raise TypeError(
+            f"{type(node).__name__} sits inside an RJ birth tree, owns "
+            f"{', '.join(owned)} and defines no reseed(seed): skipping it "
+            "would leave that subtree on OS entropy. Give the class a "
+            "reseed(seed) method (see reseed_birth_tree)."
+        )
 
 
 def reseed_birth_tree(obj, seed):

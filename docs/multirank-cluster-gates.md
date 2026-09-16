@@ -162,6 +162,15 @@ explicitly — if it does, pin it to the same value for all three launches.
   birth stream per epoch for `build_gb_birth_distribution(seed=...)`. A
   resume that re-installs the same epoch on the same rank therefore rebuilds
   the identical birth container, and two ranks never share a birth stream.
+  Those births are reproducible for the **first fit built in a process** —
+  which is every production rank, one `fit.build()` per process (round 2
+  measured run-1 legacy == run-2 legacy across processes exactly) — while a
+  *second* fit built in the same process drifts, because per-process caches
+  change how many draws the module-level `np.random` stream has served by
+  prior-draw time and the four columns eryn's `UniformDistribution` fills
+  (`phi0`, `cos_iota`, `psi`, `fdot_astro_ratio`) move with it; that is why
+  the laptop parity harness (`tests/test_multirank_gb_smoke.py`) runs one fit
+  per process, and not something a cluster rank ever hits.
   With `random_seed` unset nothing is seeded — every birth generator stays on
   OS entropy, exactly as before — and a bit-identity diff across layouts is
   then meaningless for any run whose model has alive GB leaves.

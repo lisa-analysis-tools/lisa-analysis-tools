@@ -17433,7 +17433,6 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         d = self._epoch_dir(int(k))
         if getattr(self, "_epoch_flushed", None) == (int(k), d):
             return
-        self._epoch_flushed = (int(k), d)
         names = (
             self._EPOCH_MANIFEST,
             GRID_BASENAME.replace(".npz", "_peaks_stacked.npz"),
@@ -17457,6 +17456,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     "(%r); the ranks' completeness check is the backstop",
                     self.name, int(k), path, exc,
                 )
+        if flushed:
+            # memo AFTER the pass, and only when something was really synced:
+            # recording it up front would let a first call that found NOTHING
+            # (a flush racing ahead of the ``setup()`` that writes the epoch)
+            # permanently suppress the real flush of that epoch on this move.
+            self._epoch_flushed = (int(k), d)
         logger.info(
             "[FSTAT_EPOCH %s] head flushed epoch %d for the ranks: %s in %s",
             self.name, int(k), (", ".join(flushed) or "no artifacts"), d,

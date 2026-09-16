@@ -34,6 +34,7 @@ from lisatools.sampling.fstat_proposal import (
     RatioTightenedBirth,
     StackedFStatProposal4D,
     UniformFloorMixture,
+    _reseed_node,
     make_gb_rj_birth_container,
     reseed_birth_tree,
 )
@@ -169,6 +170,35 @@ class ReseedTreeTest(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "_NewWrapper"):
             reseed_birth_tree(_NewWrapper(), None)  # even with no seed
 
+    def test_a_wrapper_INSIDE_the_tree_raises_too(self):
+        # the strict check must reach CHILDREN, not only the root: a wrapper
+        # inserted mid-tree that forgot ``reseed`` would otherwise leave its
+        # whole subtree on OS entropy with no error anywhere -- exactly what
+        # this helper exists to prevent.
+        class _InnerWrapper:  # carries a wrapped child, no reseed
+            def __init__(self, base):
+                self.base = base
+
+        class _InnerRngOwner:  # owns a private stream, no reseed
+            def __init__(self):
+                self._rng = np.random.default_rng(0)
+
+        with self.assertRaisesRegex(TypeError, "_InnerWrapper"):
+            _reseed_node(_InnerWrapper(_tree()), 3)
+        with self.assertRaisesRegex(TypeError, "_InnerRngOwner"):
+            _reseed_node(_InnerRngOwner(), 3)
+
+    def test_an_analytic_leaf_is_still_skipped(self):
+        # the legitimate skip the raise must not swallow: eryn's analytic
+        # dists own no private generator and wrap no child -- they draw from
+        # the module-level stream, so there is nothing to set on them
+        class _AnalyticLeaf:
+            def rvs(self, size):
+                return np.random.uniform(size=size)
+
+        _reseed_node(_AnalyticLeaf(), 3)  # no raise, nothing to do
+        _reseed_node(None, 3)  # and an absent child is still a no-op
+
 
 class ReseedFdotAxisTreeTest(unittest.TestCase):
     """The fdot-basis tree (default): FdotAxisBirth is the intrinsic block."""
@@ -253,10 +283,11 @@ class BuildBirthDistributionSeedTest(unittest.TestCase):
         self.assertFalse(np.array_equal(_draw(a, 32), _draw(self._build(8), 32)))
 
     def test_seed_none_leaves_the_streams_alone(self):
-        # no assertion of INEQUALITY (two entropy streams may collide in
-        # principle): what is pinned is that the build runs and that nothing
-        # was replaced by a seeded generator -- a seeded pair would be equal
-        # every time, which is exactly what must NOT happen here.
+        # the INEQUALITY below is the point of the test: a seeded pair would
+        # be equal EVERY time, which is exactly what must not happen under
+        # ``seed=None``. Two independent OS-entropy streams agreeing on 32x9
+        # float64 draws has vanishing probability, so it is a safe assertion
+        # rather than a flaky one.
         a, b = self._build(None), self._build(None)
         self.assertIsInstance(a, RatioTightenedBirth)
         self.assertEqual(len(_rngs(a)), len(_rngs(b)))
