@@ -4526,6 +4526,42 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 "(%r); falling back to walker 0.", self.name, exc)
             return 0
 
+    def _fstat_global_reference(self, model):
+        """``(w_global, owner_rank, local_index, lls)`` for the F-stat fit.
+
+        The GLOBAL max-likelihood walker, not this rank's local one. Under
+        the walker-block layout ``_fstat_reference_walker`` ranks only the
+        HEAD'S OWN block, so the epoch would be fitted against the best of B
+        walkers instead of the best of N -- and the index it returns is used
+        downstream as an ACA ROW index, which a global index >= B would
+        blow out. Every walker's likelihood comes back through the existing
+        ``WalkerFanout.gather_likelihood`` (the ``LIKELIHOOD_OP`` builtin;
+        ``acs.likelihood(complex=False)``, the same numbers the local argmax
+        sees), and the layout converts the winner into the owning rank plus
+        the row index ON that rank.
+
+        With ONE compute rank this is a direct call that returns
+        ``(w, head_rank, w, lls)`` -- the same walker
+        ``_fstat_reference_walker`` picks today, with the same local index.
+        """
+        fanout = getattr(self, "fanout", None)
+        if fanout is None:
+            w = self._fstat_reference_walker(model)
+            return int(w), 0, int(w), np.full(1, np.nan)
+        try:
+            lls = np.asarray(_to_numpy(fanout.gather_likelihood(
+                model.analysis_container_arr)), dtype=float)
+            w_global = int(np.argmax(lls))
+        except Exception as exc:
+            # Never silent: a broken ranking here quietly pins every F-stat
+            # reference to walker 0 for the whole run.
+            logger.warning(
+                "%s: could not rank walkers for the F-stat reference (%r); "
+                "falling back to walker 0.", self.name, exc)
+            return 0, fanout.layout.head_rank, 0, np.full(1, np.nan)
+        owner, local = fanout.layout.owner_of(w_global)
+        return w_global, int(owner), int(local), lls
+
     def run_proposal(self, model, state, band_sorter, band_temps, *,
                      scan_schedule=None):
         """One full pass of per-band proposals.

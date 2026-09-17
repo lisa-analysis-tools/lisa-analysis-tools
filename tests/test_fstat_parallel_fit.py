@@ -592,5 +592,38 @@ class WriteStackedNpzValidationTest(unittest.TestCase):
         self.assertIn("group 1 grid has 2 box(es)", str(ctx.exception))
 
 
+class OwnerOfTest(unittest.TestCase):
+    def _layout(self, nwalkers, n_compute):
+        from lisatools.globalfit.communication import ranks as R
+        from lisatools.globalfit.communication.fakecomm import FakeWorld
+
+        world = FakeWorld(n_compute + 1)
+        out = world.run(lambda r, comm: R.build_layout(
+            comm, nwalkers, list(range(n_compute))))
+        return out[0]
+
+    def test_maps_every_global_walker_to_its_rank_and_local_row(self):
+        layout = self._layout(8, 2)
+        block = layout.block
+        for w in range(8):
+            rank, local = layout.owner_of(w)
+            w0, w1 = layout.block_of(rank)
+            self.assertTrue(w0 <= w < w1)
+            self.assertEqual(local, w - w0)
+            self.assertTrue(0 <= local < block)
+
+    def test_single_compute_rank_is_the_identity(self):
+        layout = self._layout(6, 1)
+        for w in range(6):
+            self.assertEqual(layout.owner_of(w), (layout.head_rank, w))
+
+    def test_out_of_range_raises(self):
+        layout = self._layout(4, 2)
+        with self.assertRaises(ValueError):
+            layout.owner_of(4)
+        with self.assertRaises(ValueError):
+            layout.owner_of(-1)
+
+
 if __name__ == "__main__":
     unittest.main()
