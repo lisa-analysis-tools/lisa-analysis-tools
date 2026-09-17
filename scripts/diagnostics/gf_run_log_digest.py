@@ -190,7 +190,12 @@ if __name__ != "__main__":
     raise SystemExit(0)
 
 RUN = sys.argv[1] if len(sys.argv) > 1 else None
-LOG_PATHS = discover_run_logs(f"{RUN}/gf_prod_3mo_artifacts")
+# The run's artifacts directory is ``<file_store_dir>/<base_file_name>_artifacts/``
+# (``engine.py::artifacts_file_dir``); the walk is recursive, so pass the
+# store directory (``FILE_STORE_DIR``) and any ``*_artifacts`` subdirectory --
+# the 3-mo production ``gf_prod_3mo_artifacts`` or a stock run's
+# ``gb_no_fg_test_2_artifacts`` -- is found without naming it.
+LOG_PATHS = discover_run_logs(RUN) if RUN is not None else []
 
 TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d+) - (\S+) - (\w+) - (.*)$")
 
