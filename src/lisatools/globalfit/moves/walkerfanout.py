@@ -138,7 +138,16 @@ class WalkerFanoutMixin:
                 tc.gf_configured_adaptive = bool(getattr(tc, "adaptive", False))
             tc.adaptive = False  # ranks never adapt; the head adapts once per propose
         if not self.fanout.is_head and hasattr(self, "eigen_store_path"):
-            self.eigen_store_path = None  # single-writer sidecar (head only)
+            # Single-WRITER sidecar: the head owns the file. Compute ranks keep
+            # the path READ-ONLY (2026-09-17): a walker-independent table
+            # (``walker_max`` scope -- MBH, EMRI, and SOBBH since the same-day
+            # ruling) is valid for every rank, and without it every resume
+            # made rank 1 rebuild all its information matrices while the head
+            # adopted its sidecar (6mo continuation, job 541: mbh_pe head 190 s
+            # vs rank 1324 s; emri_pe 251 s vs 1670 s -- a 7x block imbalance).
+            # Per-(temp, walker) stashes are NOT adopted off-head: the head's
+            # stash covers the head's block, not this rank's walkers.
+            self.eigen_store_readonly = True
 
     # ---- propose -------------------------------------------------------------
     def propose(self, model, state):

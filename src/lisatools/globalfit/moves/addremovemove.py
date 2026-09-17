@@ -390,6 +390,16 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         if got is None:
             return False
         axes, sigmas, visits = got
+        if (getattr(self, "eigen_store_readonly", False)
+                and np.asarray(axes).ndim >= 4):
+            # a compute rank reading the head's sidecar: a per-(temp, walker)
+            # stash is the HEAD'S block, not this rank's walkers -- rebuild
+            eigen_refresh.logger.info(
+                "[eigen_refresh] %s leaf %d: persisted table is a per-walker "
+                "stash of another rank's block; rebuilding locally",
+                self.branch_name, leaf,
+            )
+            return False
         self._eigen_tables[leaf] = (axes, sigmas)
         self._eigen_visit_count[leaf] = int(visits)
         eigen_refresh.logger.info(
@@ -402,6 +412,8 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
 
     def _persist_eigen_table(self, leaf):
         """Write-through the table just built for ``leaf``."""
+        if getattr(self, "eigen_store_readonly", False):
+            return  # compute rank: the head is the sidecar's single writer
         path = self._eigen_sidecar_path()
         if path is None:
             return

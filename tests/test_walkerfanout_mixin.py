@@ -155,7 +155,11 @@ class MixinFakeWorldTest(unittest.TestCase):
             self.assertFalse(moves[rank].tc.adaptive)
             self.assertTrue(moves[rank].tc.gf_configured_adaptive)
         self.assertEqual(moves[0].eigen_store_path, "store.h5")  # head keeps the sidecar
-        self.assertIsNone(moves[1].eigen_store_path)  # worker never writes it
+        self.assertFalse(getattr(moves[0], "eigen_store_readonly", False))
+        # the worker keeps the PATH but read-only (2026-09-17): it adopts the
+        # head's walker-independent tables and never writes the file
+        self.assertEqual(moves[1].eigen_store_path, "store.h5")
+        self.assertTrue(moves[1].eigen_store_readonly)
         # the head body ran against propose()'s model, NOT fanout.model
         self.assertEqual(moves[0].seen_models, ["head-model"])
         # the worker keeps its ComputeService model (its own live one)

@@ -734,3 +734,50 @@ class PersistEnabledTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReadOnlyRankSidecarTest(unittest.TestCase):
+    """A compute rank reads the head's sidecar but never writes it (2026-09-17).
+
+    Under the multi-rank walker-block layout the head is the sidecar's single
+    writer. Before this, compute ranks dropped the path entirely and rebuilt
+    every information matrix on every resume while the head adopted its
+    tables (6mo continuation job 541: mbh_pe head 190 s vs rank 1324 s). A
+    walker-independent (``walker_max``) table is valid on every rank; a
+    per-(temp, walker) stash is the head's block and must not be adopted.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.store = os.path.join(self._tmp.name, "store.h5")
+        self.sidecar = eigen_table_persist.sidecar_path(self.store)
+
+    def _readonly_move(self, scope=None):
+        move = _stub_move([EigenAxisMove()], self.store, refresh=10, scope=scope)
+        move.eigen_store_readonly = True
+        move._eigen_tables = {}
+        move._eigen_visit_count = {}
+        return move
+
+    def test_walker_max_table_is_adopted_but_never_written_off_head(self):
+        eigen_table_persist.save_entry(
+            self.sidecar, "sobbh", 0, _walker_max_entry(visits=3, seed=5)
+        )
+        move = self._readonly_move()
+        self.assertTrue(move._adopt_persisted_eigen_table(0))
+        self.assertEqual(move._eigen_visit_count[0], 3)
+        # the rank must not write: remove the file and ask it to persist
+        os.remove(self.sidecar)
+        move._persist_eigen_table(0)
+        self.assertFalse(os.path.exists(self.sidecar))
+
+    def test_per_walker_stash_is_not_adopted_off_head(self):
+        eigen_table_persist.save_entry(
+            self.sidecar, "sobbh", 1, _per_walker_entry(visits=2, seed=6)
+        )
+        move = self._readonly_move(scope="per_walker")
+        with self.assertLogs(eigen_refresh.logger, level="INFO") as cm:
+            self.assertFalse(move._adopt_persisted_eigen_table(1))
+        self.assertTrue(any("another rank's block" in m for m in cm.output))
+        self.assertNotIn(1, move._eigen_tables)
