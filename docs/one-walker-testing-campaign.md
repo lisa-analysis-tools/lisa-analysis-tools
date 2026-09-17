@@ -19,7 +19,7 @@ export NWALKERS=1
 G=$HOME/onewalker_gates; mkdir -p "$G"
 
 # THE LAUNCH (every gate unless stated): 3 ranks round-robin over the 2 hosts
-GPUS=0 mpiexec -n 3 -ppn 1 python scripts/run_global.py --stock <name>
+FILE_STORE_DIR=$G/<gate>/ GPUS=0 mpiexec -n 3 -ppn 1 python scripts/run_global.py --stock <name>
 #   rank 0  head    node A  GPU 0   replica 0 (the head computes too)
 #   rank 1  compute node B  GPU 0   replica 1
 #   rank 2  saver   node A
@@ -36,6 +36,17 @@ The **single-node control layout** used by T2 keeps all three ranks on node A sh
 - An invariance claim needs its control (project rule). Each gate names its control; a gate without its control passing is not a pass.
 - Order matters: do not run a later gate until the earlier one's pass criterion is met. T0 + T1 take well under an hour.
 - The fit directory must be on the shared filesystem: the head writes the F-stat epoch (`<fit_dir>/shared/epoch_NNNN/`) and the replica on node B opens it on the next message. `F-stat epoch N incomplete at <path>` on node B means storage, not code — fix the storage, never suppress the check.
+- **A fresh `FILE_STORE_DIR` per run** (`FILE_STORE_DIR=$G/<gate>/`): a run that finds an existing store RESUMES from it — a store written with another walker count aborts with `walker-count mismatch for branch 'gb'`, and one with the same count silently breaks the same-initial-state premise.
+- **GB gates need a loud injection.** `--stock gb_no_fg` synthetic has no GB catalogue: the F-stat epoch reports `NO peaks`, births fall back to the prior, nothing is accepted, and every replica trivially agrees — the run exercises the transport and `gb_sync` only, never the ledger or the merge. There is no env knob for the injection table; launch the runbook's six-line driver instead of `run_global.py` for T1, T2 and T4 (a live fixture shows `20 peaks` on the epoch line and hashes that change every iteration):
+  ```python
+  # gate_gb.py -- run from the repo root, launched exactly like run_global.py
+  from lisatools.globalfit.stock import erebor
+  fit = erebor.get_stock("gb_no_fg")
+  # amplitude, f0 [Hz], fdot, fddot, phi0, iota, psi, lambda, beta (GBGPU order)
+  fit.general.gb_injection_params = [[1e-21, 7.5e-3, 1e-16, 0.0, 1.2, 0.9, 1.0, 4.0, -0.6]]
+  fit.run()
+  ```
+  Expected, benign warnings on every run: `No 'GB' catalogue found; GB SNR-cut injection skipped`, `sig-het nt_layer=64 does not divide Nt ... snapping`, and `multi-rank run: submission residual dump SKIPPED` (a known TODO, not a failure).
 - Pull `dev` again before T3: the MBH `Q` prior fix (linear-column log-uniform on [1, 10]) lands after T0-T2 were written; the all_sources gates need it.
 
 ## Pass/fail signals (what to grep)
@@ -81,11 +92,11 @@ Pass: the replica layout header identical on all three ranks; rank 1 on the othe
 ### T1 — first real one-walker run, GB only, across the two nodes (≈10-20 min)
 
 ```sh
-NUM_ITERATIONS=4 GPUS=0 timeout 3600 mpiexec -n 3 -ppn 1 \
-  python scripts/run_global.py --stock gb_no_fg 2>&1 | tee "$G/T1.log"
+FILE_STORE_DIR=$G/T1/ NUM_ITERATIONS=4 GPUS=0 timeout 3600 mpiexec -n 3 -ppn 1 \
+  python gate_gb.py 2>&1 | tee "$G/T1.log"
 python scripts/diagnostics/gf_run_log_digest.py <run_dir> | tee "$G/T1_digest.txt"
 ```
-Pass: completes; no WARNING-class `[GB_REPLICA]` line; `replicas_agree` counted on every iteration (a `False` is informational on GPU — the lnL guard is the criterion); `[FANOUT]` table shows `gb_run_proposal`, `gb_run_tempering`, `gb_finish`, `gb_sync` all served by rank 1 with `max_rank_s` comparable to the head's; the F-stat epoch opened on node B without the `incomplete` error.
+Pass: the epoch line reports peaks (not `NO peaks`) and the `[FANOUT_DIGEST]` hashes change between iterations (the run is moving); completes; no WARNING-class `[GB_REPLICA]` line; `replicas_agree` counted on every iteration (a `False` is informational on GPU — the lnL guard is the criterion); `[FANOUT]` table shows `gb_run_proposal`, `gb_run_tempering`, `gb_finish`, `gb_sync` all served by rank 1 with `max_rank_s` comparable to the head's; the F-stat epoch opened on node B without the `incomplete` error.
 What it exonerates: the cross-node transport for every GB op, the ledger's device indexing, `gb_sync`, the merge on real RJ births/deaths, the shared-filesystem epoch hand-off.
 **Control (regression):** the same command with `NWALKERS=8` (walker-block layout, head + 1 compute across the nodes) must reproduce the WP7 Step 1 layout (c) record (decisions bit-identical, `log_like` within 1e-12 relative) — this branch must not change the walker-block path.
 
@@ -93,9 +104,9 @@ What it exonerates: the cross-node transport for every GB op, the ledger's devic
 
 ```sh
 # (c) two nodes -- the primary layout, same seeds
-NUM_ITERATIONS=4 GPUS=0 timeout 3600 mpiexec -n 3 -ppn 1 python scripts/run_global.py --stock gb_no_fg 2>&1 | tee "$G/T2c.log"
+FILE_STORE_DIR=$G/T2c/ NUM_ITERATIONS=4 GPUS=0 timeout 3600 mpiexec -n 3 -ppn 1 python gate_gb.py 2>&1 | tee "$G/T2c.log"
 # (a) one node, both replicas on node A's single GPU
-NUM_ITERATIONS=4 GPUS=0 RANKS_PER_GPU=2 timeout 3600 mpiexec -n 3 -ppn 3 python scripts/run_global.py --stock gb_no_fg 2>&1 | tee "$G/T2a.log"
+FILE_STORE_DIR=$G/T2a/ NUM_ITERATIONS=4 GPUS=0 RANKS_PER_GPU=2 timeout 3600 mpiexec -n 3 -ppn 3 python gate_gb.py 2>&1 | tee "$G/T2a.log"
 ```
 Pass: `log_like` / `coords` / `inds` digests of (c) and (a) agree to the multi-walker gate's tolerance (decisions bit-identical, `log_like` within 1e-12 relative); no lnL-guard warning in either. The fabric and the node placement must not change the chain.
 **Controls:** (c) run twice with the same `random_seed` → identical digests (determinism, so a (c)/(a) mismatch would mean something); (c) with a different seed → digests differ (the digest is sensitive).
@@ -105,9 +116,9 @@ Pass: `log_like` / `coords` / `inds` digests of (c) and (a) agree to the multi-w
 Two nodes, `--stock all_sources` synthetic (first run with MBH/EMRI/SOBBH + PSD at one walker), `NUM_ITERATIONS=3`, same seeds:
 ```sh
 B="NUM_ITERATIONS=3 GPUS=0"
-env $B timeout 5400 mpiexec -n 3 -ppn 1 python scripts/run_global.py --stock all_sources 2>&1 | tee "$G/T3_base.log"
-env $B MBH_LIKELIHOOD_FANOUT=0 EMRI_LIKELIHOOD_FANOUT=0 SOBBH_LIKELIHOOD_FANOUT=0 timeout 5400 mpiexec -n 3 -ppn 1 python scripts/run_global.py --stock all_sources 2>&1 | tee "$G/T3_ar_off.log"
-env $B PSD_LIKELIHOOD_FANOUT=0 GALFOR_LIKELIHOOD_FANOUT=0 timeout 5400 mpiexec -n 3 -ppn 1 python scripts/run_global.py --stock all_sources 2>&1 | tee "$G/T3_psd_off.log"
+env $B FILE_STORE_DIR=$G/T3_base/ timeout 5400 mpiexec -n 3 -ppn 1 python scripts/run_global.py --stock all_sources 2>&1 | tee "$G/T3_base.log"
+env $B FILE_STORE_DIR=$G/T3_ar_off/ MBH_LIKELIHOOD_FANOUT=0 EMRI_LIKELIHOOD_FANOUT=0 SOBBH_LIKELIHOOD_FANOUT=0 timeout 5400 mpiexec -n 3 -ppn 1 python scripts/run_global.py --stock all_sources 2>&1 | tee "$G/T3_ar_off.log"
+env $B FILE_STORE_DIR=$G/T3_psd_off/ PSD_LIKELIHOOD_FANOUT=0 GALFOR_LIKELIHOOD_FANOUT=0 timeout 5400 mpiexec -n 3 -ppn 1 python scripts/run_global.py --stock all_sources 2>&1 | tee "$G/T3_psd_off.log"
 ```
 Pass: the three runs give identical `log_like`/`coords`/`inds` digests (where a row is scored must not change the chain) and identical `replicas_agree` counts (the replays run regardless of the knob). Runs 2 and 3 are slower — that is the point. Grep `inner proposal: eigen` for PSD and galfor, and a nonzero PSD in-model acceptance.
 What it exonerates: addremove row scatter + expose/setup/fold replays; PSD row scatter + begin/publish replays; the PSD eigen inner at one walker; the MBH `Q` prior fix (no `AssertionError: m1 should be the larger mass`).
@@ -117,9 +128,9 @@ What it exonerates: addremove row scatter + expose/setup/fold replays; PSD row s
 
 ```sh
 # single rank, no replicas, node A only
-NUM_ITERATIONS=100 GPUS=0 timeout 43200 mpiexec -n 1 python scripts/run_global.py --stock all_sources 2>&1 | tee "$G/T4_single.log"
+FILE_STORE_DIR=$G/T4_single/ NUM_ITERATIONS=100 GPUS=0 timeout 43200 mpiexec -n 1 python scripts/run_global.py --stock all_sources 2>&1 | tee "$G/T4_single.log"
 # two replicas across the nodes
-NUM_ITERATIONS=100 GPUS=0 timeout 43200 mpiexec -n 3 -ppn 1 python scripts/run_global.py --stock all_sources 2>&1 | tee "$G/T4_replicas.log"
+FILE_STORE_DIR=$G/T4_replicas/ NUM_ITERATIONS=100 GPUS=0 timeout 43200 mpiexec -n 3 -ppn 1 python scripts/run_global.py --stock all_sources 2>&1 | tee "$G/T4_replicas.log"
 ```
 NOT expected bit-identical (each rank draws its own GB RJ proposals). Compare through the `processing-gf-snapshots` flow: GB acceptance rates per move, cold-chain leaf counts vs truth, per-band `band_temps`, addremove acceptance and `acceptance_fraction` (finite, never nan), PSD acceptance under the eigen inner. Pass: distributions overlap; no systematic offset in leaf counts or ladders.
 **Control:** two single-rank runs with different `random_seed` — the replica-vs-single spread must be no larger than the seed-vs-seed spread.
