@@ -888,7 +888,9 @@ def prepare_sobbh_branch(sobbh, general_setup: GeneralSetup, gs):
 
 def prepare_mbh_branch(mbh, general_setup: GeneralSetup, gs):
     from eryn.moves import StretchMove
-    from eryn.prior import ProbDistContainer, log_uniform, uniform_dist
+    from eryn.prior import ProbDistContainer, uniform_dist
+
+    from ....sampling.prior import LogUniformLinear
 
     n = gs.n_injections["MBHB"]
     if mbh.initialize_kwargs is None:
@@ -947,7 +949,9 @@ def prepare_mbh_branch(mbh, general_setup: GeneralSetup, gs):
             "mbh": ProbDistContainer(
                 {
                     "logM": uniform_dist(*mbh.logM_prior),
-                    "Q": log_uniform(1.0, 10.0),
+                    # LINEAR-column log-uniform (Q = m1/m2 >= 1); eryn's
+                    # ``log_uniform`` is ln-space -- see LogUniformLinear.
+                    "Q": LogUniformLinear(1.0, 10.0),
                     "s1z": uniform_dist(-0.999999, 0.999999),
                     "s2z": uniform_dist(-0.999999, 0.999999),
                     "dist": uniform_dist(*mbh.dist_prior),

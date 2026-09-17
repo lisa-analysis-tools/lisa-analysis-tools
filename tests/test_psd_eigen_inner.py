@@ -202,7 +202,10 @@ class RealNoisePriorWidthsTest(unittest.TestCase):
         }
         w = prior_box_widths(ProbDistContainer(dct), 4)
         # LogUniform's minimum/maximum are the SAMPLER-space (ln) bounds,
-        # which is the basis the eigen table works in
+        # which is the basis the eigen table works in. NOTE: this dict is a
+        # generic string-keyed stand-in -- the stock MBH "Q" column is
+        # ``LogUniformLinear(1.0, 10.0)`` (physical bounds, width 9.0) since
+        # 2026-09-16; see tests/test_mbh_q_prior.py.
         np.testing.assert_allclose(
             w, [np.log(1e8) - np.log(1e5), np.log(10.0), 149.0, 7.9e6], rtol=1e-12
         )
