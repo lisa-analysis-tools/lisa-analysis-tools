@@ -946,12 +946,20 @@ class FitClockTest(unittest.TestCase):
 
 
 class CtrTableGBFreeTest(unittest.TestCase):
-    """The epoch center-table sweep must run INSIDE the GB-free window.
+    """The epoch center-table sweep must see the GB-FREE reference residual.
 
     2026-08-24 fix: the sweep used to run after the fit's GB-free context
     closed, so at any real refit the amplitude/SNR centers for exactly the
     loud already-recovered peaks would have been fitted against a residual
     with those peaks subtracted.
+
+    Under the walker-block layout (design spec 2026-09-16, decision 6) that
+    window no longer lives here at all: it is opened on the rank that OWNS
+    the global reference walker, around the snapshot ``gb_fstat_ref_row``
+    replicates, and the sweep scores through that row's cached scorer --
+    the same object the grids were fitted with. What this class pins is
+    therefore that the centre sweep goes through ``_fstat_holder_call``,
+    never through a locally re-derived walker.
     """
 
     class _Stub:
@@ -969,6 +977,9 @@ class CtrTableGBFreeTest(unittest.TestCase):
         fstat_fit_kwargs = {}
         _fstat_root_dir = None
         events = None  # set per test
+        _fstat_ref_holder = None
+        _fstat_ref_call = None
+        _fstat_ref_walker = None
 
         @property
         def _fstat_root(self):
@@ -981,27 +992,30 @@ class CtrTableGBFreeTest(unittest.TestCase):
             return 2.0
 
         def _fstat_reference_walker(self, model):
-            self.events.append("walker_ref")
+            self.events.append("LOCAL_ARGMAX")   # the route that must be dead
             return 0
 
-        def _fstat_call(self, model, walker_ref):
+        def _fstat_global_reference(self, model):
+            self.events.append("global_reference")
+            return 6, 3, 2, np.arange(8, dtype=float)
+
+        def _fstat_ref_row_fanout(self, model, branches, w, owner, local):
+            self.events.append("ref_row")
+            self._fstat_ref_holder = object()
+            self._fstat_ref_walker = int(w)
+
+        def _fstat_release_fanout(self, model):
+            self.events.append("release_fanout")
+
+        def _fstat_release_ref_row(self):
+            self.events.append("release_local")
+            self._fstat_ref_holder = None
+            self._fstat_ref_call = None
+
+        def _fstat_holder_call(self, model):
+            assert self._fstat_ref_holder is not None, "scored with no row"
             self.events.append("call_built")
             return lambda params: None
-
-        def _gb_free_residual(self, model, branches, walker_ref):
-            import contextlib
-
-            events = self.events
-
-            @contextlib.contextmanager
-            def _cm():
-                events.append("gbfree_enter")
-                try:
-                    yield
-                finally:
-                    events.append("gbfree_exit")
-
-            return _cm()
 
     def setUp(self):
         self.d = tempfile.mkdtemp()
@@ -1024,16 +1038,28 @@ class CtrTableGBFreeTest(unittest.TestCase):
         self._G.build_fstat_center_table = self._orig_build
         shutil.rmtree(self.d, ignore_errors=True)
 
-    def test_sweep_runs_inside_gb_free_window(self):
+    def test_sweep_scores_through_the_replicated_reference_row(self):
+        """With no live row (this stub never ran a fit) the sweep replicates
+        one itself -- global reference, ``gb_fstat_ref_row``, holder scorer --
+        and puts both halves back afterwards. The LOCAL argmax is dead."""
         self.s._install_ctr_table(0, model=object(), branches={"gb": object()})
-        # scorer built AND sweep executed strictly inside the window
         self.assertEqual(
             self.s.events,
-            ["walker_ref", "gbfree_enter", "call_built", "sweep",
-             "gbfree_exit"],
+            ["global_reference", "ref_row", "call_built", "sweep",
+             "release_fanout", "release_local"],
         )
 
+    def test_a_live_row_from_the_fit_is_reused_and_kept(self):
+        """After ``_run_fstat_fit`` the head still holds the row: the centre
+        sweep must reuse it (one residual snapshot for grids and centres) and
+        must NOT release it -- ``setup()``'s ``finally`` owns that one."""
+        self.s._fstat_ref_holder = object()
+        self.s._fstat_ref_walker = 6
+        self.s._install_ctr_table(0, model=object(), branches={"gb": object()})
+        self.assertEqual(self.s.events, ["call_built", "sweep"])
+        self.assertIsNotNone(self.s._fstat_ref_holder)
+
     def test_load_path_never_touches_the_residual(self):
-        """No model (checkpoint-load path) -> no window, call=None."""
+        """No model (checkpoint-load path) -> no row, no scorer, call=None."""
         self.s._install_ctr_table(1, model=None, branches=None)
         self.assertEqual(self.s.events, ["load"])

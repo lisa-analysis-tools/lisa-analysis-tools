@@ -22725,13 +22725,14 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         (:func:`lisatools.sampling.fstat_gridfit.enumerate_center_nodes` --
         every peak-box f0 node at its own F-stat argmax in (Mc, sky), plus
         the comb nodes at their scan-best sky), scored through the SAME
-        ``call_fstat`` the grids were fitted with, against the SAME reference
-        walker's residual snapshot. Persisted as ``fstat_centers.npz`` in the
-        epoch dir, so a restart that loads a complete epoch loads the centers
-        with it (in milliseconds, and WITHOUT building an F-stat scorer); an
-        epoch that predates the table (or an offline grid dropped into
-        ``epoch_0000``) rebuilds it here, against the residual as it stands
-        at that moment.
+        ``call_fstat`` object the grids were fitted with, against the SAME
+        replicated reference row (spec decision 6 -- literally the same
+        :meth:`_fstat_holder_call` scorer, not a rebuilt twin). Persisted as
+        ``fstat_centers.npz`` in the epoch dir, so a restart that loads a
+        complete epoch loads the centers with it (in milliseconds, and
+        WITHOUT building an F-stat scorer); an epoch that predates the table
+        (or an offline grid dropped into ``epoch_0000``) rebuilds it here,
+        replicating the reference row itself first.
 
         No-ops under ``GB_FSTAT_CTR_MODE=unit``. Leaves ``_fstat_ctr_table``
         ``None`` when the epoch has no drawable support at all — the move
@@ -22767,15 +22768,47 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             # this sweep used to run AFTER the fit's GB-free window closed,
             # so at any real refit the amplitude/SNR centers for exactly the
             # loud already-recovered peaks would have been fitted against
-            # noise). The scorer is built INSIDE the window too: under
-            # FSTAT_USE_SIGHET its heterodyne references snapshot the
-            # residual at build time. Costs one extra add/remove round trip
-            # when this follows a fit (the fit's own window already closed)
-            # -- two fill_template passes, negligible against the sweep.
-            walker_ref = self._fstat_reference_walker(model)
-            with self._gb_free_residual(model, branches, walker_ref):
-                call = self._fstat_call(model, walker_ref)
-                host = build_fstat_center_table(call, **_table_kwargs)
+            # noise). Under the walker-block layout that is now literal: the
+            # fit's REPLICATED reference row is still live on this rank
+            # (``setup()``'s ``finally`` is what finally drops it), so the
+            # centre sweep scores through the same holder at the same GLOBAL
+            # reference walker, and nothing here re-derives either. A LOCAL
+            # argmax would silently pick a different walker -- and its index
+            # is not even a valid ACA row off that walker's owner.
+            if self._fstat_ref_holder is None:
+                # A path that never ran a fit (a complete epoch being loaded,
+                # a cross-move reuse, or an offline grid dropped in without a
+                # centre table): replicate the row now, through exactly the
+                # same global reference + ``gb_fstat_ref_row`` the fit uses.
+                w_global, owner_rank, local_index, _lls = (
+                    self._fstat_global_reference(model))
+                self._fstat_ref_row_fanout(model, branches, w_global,
+                                           owner_rank, local_index)
+                _release_after = True
+            else:
+                _release_after = False
+            logger.info(
+                "[FSTAT_CTR %s] epoch %d centre sweep scores through the "
+                "replicated reference row (walker %s, %s)", self.name, k,
+                self._fstat_ref_walker,
+                "replicated here" if _release_after else "the fit's own")
+            try:
+                host = build_fstat_center_table(
+                    self._fstat_holder_call(model), **_table_kwargs)
+                if _release_after:
+                    # SUCCESS ONLY, exactly as ``_run_fstat_fit`` releases
+                    # its ranks: issuing a fan-out command while an exception
+                    # unwinds would only replace the real error with a
+                    # fan-out failure. Nothing else would ever drop these --
+                    # a rank cannot tell that this was the last command.
+                    self._fstat_release_fanout(model)
+            finally:
+                if _release_after:
+                    # This rank's own half goes either way: ``setup()``'s
+                    # ``finally`` covers the fit's row, but on this path the
+                    # row was taken HERE, and it is tens of MB plus a built
+                    # sig-het scorer.
+                    self._fstat_release_ref_row()
         else:
             host = build_fstat_center_table(None, **_table_kwargs)
         table = None

@@ -2024,5 +2024,209 @@ class ReleaseFanoutTest(unittest.TestCase):
             self.assertIsNotNone(move._fstat_ref_holder)
 
 
+class CentreTableReferenceTest(unittest.TestCase):
+    """The centre sweep must reuse the fit's replicated row, not re-derive one."""
+
+    def test_no_local_reference_walker_derivation_left(self):
+        """``_install_ctr_table`` lives on :class:`GBSpecialRJFStatGridMove`,
+        not on ``GBSpecialBase`` (the brief's attribution is the one Tasks
+        6-8 corrected for ``_fstat_call`` / ``_run_fstat_fit``)."""
+        import inspect
+
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        src = inspect.getsource(gbs.GBSpecialRJFStatGridMove._install_ctr_table)
+        self.assertNotIn(
+            "self._fstat_reference_walker(model)", src,
+            "the centre table must not re-derive a LOCAL reference walker; "
+            "it scores through the fit's replicated reference row")
+        self.assertIn("_fstat_ref_holder", src)
+        self.assertIn("_fstat_holder_call", src)
+
+    def test_the_holder_call_is_cached_so_grids_and_centres_share_it(self):
+        """Spec verification 1(d): SAME scorer object, not a rebuilt twin.
+
+        The fit and the centre sweep must score against one reference row
+        and one sig-het reference-block stash. ``_fstat_holder_call``
+        caching it is what makes that literal -- a rebuilt closure would
+        silently re-snapshot and re-bucket.
+        """
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialBase.__new__(gbs.GBSpecialBase)
+        move._fstat_ref_holder = object()
+        move._fstat_ref_call = None
+        sentinel = object()
+        calls = []
+
+        def fake_fstat_call(model, walker_ref, *, holder=None):
+            calls.append((walker_ref, holder))
+            return sentinel
+
+        move._fstat_call = fake_fstat_call
+        first = move._fstat_holder_call(None)
+        second = move._fstat_holder_call(None)
+        self.assertIs(first, sentinel)
+        self.assertIs(second, first, "the scorer must be built once per fit")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], 0, "the holder is scored at row 0")
+        self.assertIs(calls[0][1], move._fstat_ref_holder)
+
+        move._fstat_release_ref_row()
+        self.assertIsNone(move._fstat_ref_call)
+        self.assertIsNone(move._fstat_ref_holder)
+
+
+class CentreTableScoringTest(unittest.TestCase):
+    """The REAL ``_install_ctr_table``, driven on a ``__new__`` skeleton.
+
+    What is pinned is which residual the centre sweep sees: the fit's live
+    replicated row when there is one, and otherwise one replicated here
+    through the SAME global-reference + ``gb_fstat_ref_row`` path -- never a
+    local argmax against the live ACA (spec decision 6).
+    """
+
+    def setUp(self):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        self.gbs = gbs
+        self.tmp = tempfile.mkdtemp()
+        self.events = []
+        self.scorer = lambda params: params
+        self.move = self._move()
+
+    def tearDown(self):
+        # the table registry is process-global; a leftover entry would make
+        # the next test short-circuit before it reached the sweep
+        self.gbs._FSTAT_CTR_TABLE_REGISTRY.pop(self.tmp, None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _move(self, *, holder=True):
+        gbs = self.gbs
+        move = gbs.GBSpecialRJFStatGridMove.__new__(gbs.GBSpecialRJFStatGridMove)
+        move.name = "gb_test"
+        move._backend_name = "lisatools_cpu"
+        move.branch_name = "gb"
+        move.fstat_fit_kwargs = {"mc_lims": [0.02, 0.8]}
+        move._epoch_dir = lambda k: self.tmp
+        move._fstat_ref_holder = object() if holder else None
+        move._fstat_ref_call = None
+        move._fstat_ref_walker = 6 if holder else None
+        self.owner_rank = 3
+
+        events = self.events
+
+        def holder_call(model):
+            events.append("holder_call")
+            return self.scorer
+
+        def ref_row(model, branches, w, owner, local):
+            events.append(("ref_row", w, owner, local, branches))
+            move._fstat_ref_holder = object()
+
+        def release_fanout(model):
+            events.append("release_fanout")
+
+        def global_reference(model):
+            events.append("global_reference")
+            return 6, self.owner_rank, 2, np.arange(8, dtype=float)
+
+        def local_walker(model):                       # the banned route
+            events.append("LOCAL_ARGMAX")
+            return 0
+
+        @contextlib.contextmanager
+        def window(model, branches, walker_ref):
+            events.append("gb_free_window")
+            yield
+
+        move._fstat_holder_call = holder_call
+        move._fstat_ref_row_fanout = ref_row
+        move._fstat_release_fanout = release_fanout
+        move._fstat_global_reference = global_reference
+        move._fstat_reference_walker = local_walker
+        move._gb_free_residual = window
+        return move
+
+    @contextlib.contextmanager
+    def _patched_build(self, raises=None):
+        captured = {}
+
+        def fake_build(call_fstat, **kw):
+            self.events.append("sweep" if call_fstat is not None else "load")
+            captured["call_fstat"] = call_fstat
+            captured.update(kw)
+            if raises is not None:
+                raise raises
+            return None
+
+        with mock.patch.object(G, "build_fstat_center_table", fake_build):
+            yield captured
+
+    def test_a_live_holder_is_what_the_sweep_scores_through(self):
+        with self._patched_build() as captured:
+            self.move._install_ctr_table(4, model="model", branches={"gb": 1})
+        self.assertIs(captured["call_fstat"], self.scorer)
+        self.assertEqual(self.events, ["holder_call", "sweep"])
+        # nothing re-derived, nothing re-broadcast, no second GB-free window
+        self.assertNotIn("LOCAL_ARGMAX", self.events)
+        # ... and the head's row survives: setup()'s finally owns it
+        self.assertIsNotNone(self.move._fstat_ref_holder)
+        self.assertEqual(captured["cache_dir"], self.tmp)
+        self.assertEqual(captured["mc_lims"], [0.02, 0.8])
+
+    def test_without_a_holder_it_replicates_the_global_row_itself(self):
+        """The load-only path (an offline grid dropped in, or a centre table
+        missing from a complete epoch) must take the SAME global reference
+        and the SAME broadcast the fit does -- a local argmax there would
+        score the centres against another walker's residual, and its index
+        is not even a valid ACA row off its owner."""
+        move = self._move(holder=False)
+        with self._patched_build() as captured:
+            move._install_ctr_table(4, model="model", branches={"gb": 1})
+        self.assertIs(captured["call_fstat"], self.scorer)
+        self.assertEqual(
+            self.events,
+            ["global_reference", ("ref_row", 6, self.owner_rank, 2, {"gb": 1}),
+             "holder_call", "sweep", "release_fanout"])
+        # both halves put back: the workers' by the fan-out release, the
+        # head's here, because this path -- not setup()'s fit -- took it
+        self.assertIsNone(move._fstat_ref_holder)
+        self.assertIsNone(move._fstat_ref_call)
+
+    def test_a_failed_sweep_still_drops_the_row_it_took(self):
+        """... and issues NO fan-out command while the exception unwinds:
+        that would replace the real error with a fan-out failure (the same
+        reason ``_run_fstat_fit``'s release is not in a ``finally``)."""
+        move = self._move(holder=False)
+        boom = RuntimeError("sweep died")
+        with self._patched_build(raises=boom):
+            with self.assertRaises(RuntimeError) as ctx:
+                move._install_ctr_table(4, model="model", branches={"gb": 1})
+        self.assertIs(ctx.exception, boom)
+        self.assertIsNone(move._fstat_ref_holder)
+        self.assertNotIn("release_fanout", self.events)
+
+    def test_a_table_already_on_disk_takes_neither_a_row_nor_a_scorer(self):
+        """The checkpoint-load branch: no sweep, so no reference row and --
+        crucially under FSTAT_USE_SIGHET -- no scorer build."""
+        with open(os.path.join(self.tmp, G.CENTER_TABLE_BASENAME), "wb") as f:
+            f.write(b"")
+        with self._patched_build() as captured:
+            self.move._install_ctr_table(4, model="model", branches={"gb": 1})
+        self.assertIsNone(captured["call_fstat"])
+        self.assertEqual(self.events, ["load"])
+
+    def test_the_rank_side_load_never_replicates_a_row(self):
+        """``_setup_from_directive`` calls this with ``model=None``; a rank
+        that fanned out from there would deadlock -- the fan-out is head-only
+        and every other rank is parked in ``ComputeService.serve``."""
+        move = self._move(holder=False)
+        with self._patched_build() as captured:
+            move._install_ctr_table(4, model=None)
+        self.assertIsNone(captured["call_fstat"])
+        self.assertEqual(self.events, ["load"])
+
+
 if __name__ == "__main__":
     unittest.main()
