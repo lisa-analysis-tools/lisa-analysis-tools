@@ -231,10 +231,26 @@ def ckpt_save(ckpt: Optional[str], F_rows, done: int, n: int,
         if have > s:
             os.truncate(dat, s * 8)
         elif have < s:
-            raise ValueError(
-                f"F-stat checkpoint payload {dat!r} holds {max(have, 0)} "
-                f"rows but the append starts at {s}; refusing to write a "
-                f"payload with a hole.")
+            # The payload no longer holds the rows this append continues
+            # from. In practice that means ANOTHER process cleared or
+            # rewrote this checkpoint under us (2026-09-16: a second job
+            # fitting the same epoch in the same directory finished its comb
+            # scan and ran ``ckpt_clear`` while this one was mid-sweep; the
+            # 6mo relaunch died on this line 9 minutes in). The sweep's
+            # result lives in memory and does not need the checkpoint, so a
+            # hole must NOT be fatal: skip this write, leave the header where
+            # it was (``ckpt_load`` already restarts a sweep whose payload
+            # is shorter than its header), and keep computing. Writing a
+            # payload with a hole is still refused -- that would be a
+            # silently corrupt resume.
+            logger.warning(
+                "[ckpt] %s: payload holds %d rows but this append starts at %d "
+                "(cleared or rewritten by another process?) -- skipping this "
+                "checkpoint write; the sweep continues from memory and a "
+                "later resume restarts it", os.path.basename(dat),
+                max(have, 0), s,
+            )
+            return
         with open(dat, "ab") as f:
             rows.tofile(f)
     np.savez(tmp, done=done, n=n, fingerprint=fingerprint)
