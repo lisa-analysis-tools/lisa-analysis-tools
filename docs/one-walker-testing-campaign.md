@@ -102,6 +102,8 @@ What it exonerates: the cross-node transport for every GB op, the ledger's devic
 
 ### T2 — across nodes vs one node agree (≈30 min)
 
+**Record 2026-09-17 (gate driver, campaign sig-het pins):** T2c two nodes (07:07) vs T2a one node with both replicas on node A's GPU (07:14): `coords` and `inds` hashes IDENTICAL at it=0..3, `log_like` hashes identical at it=0 and 2 and differing in the last bits at it=1 and 3 (the GPU non-bit-identity the criterion allows); no lnL-guard warning in either → **T2 PASSED** (the two-layout match doubles as the same-seed determinism control; the different-seed sensitivity control is optional).
+
 ```sh
 # (c) two nodes -- the primary layout, same seeds
 FILE_STORE_DIR=$G/T2c/ NUM_ITERATIONS=4 GPUS=0 timeout 3600 mpiexec -n 3 -ppn 1 python scripts/diagnostics/gate_run.py --stock gb_no_fg 2>&1 | tee "$G/T2c.log"
