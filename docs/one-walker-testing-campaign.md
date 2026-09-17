@@ -147,6 +147,12 @@ NOT expected bit-identical (each rank draws its own GB RJ proposals). Compare th
 Two replicas (the primary layout) vs four replicas, one per node: `salloc --nodes=4 --gres=gpu:1 --ntasks-per-node=2`, then `GPUS=0 mpiexec -n 5 -ppn 1 python scripts/diagnostics/gate_run.py --stock all_sources` (ranks 0-3 replicas on nodes A-D, rank 4 saver on A). If four nodes are not grantable, two replicas per node's GPU: `--nodes=2`, `GPUS=0 RANKS_PER_GPU=2 mpiexec -n 5 -ppn 2` (ranks 0,1 on A; 2,3 on B; saver 4 on A; `--ntasks-per-node=3`; expect the OOM row of the triage table for all_sources). `NUM_ITERATIONS=5`, `PSD_NTEMPS` / MBH `ntemps` ≥ n_compute.
 Record per family from `[GB_TIMING]`, `[PSD_TIMING]`, the addremove leaf lines and the `[FANOUT]` table. Expectations: addremove per-leaf time ~ 1/min(n_compute, ntemps) of single-rank (the info-matrix batch scales best); PSD similar plus the eigen refresh (`{P}_EIGEN_REFRESH` default 10); GB proposals and open/close ~1/R, the swap-grid build and the tempering census NOT — not a regression. Cross-node cost shows up as `max_rank_s` minus the head's own time in the `[FANOUT]` table. Decide `ntemps` for the real run here.
 
+Note (parallel F-stat fit, 2026-09-16): the F-stat epoch grid fit itself was
+the serial 1x term this table's scaling didn't touch — it now splits stage B
+across compute ranks (including one-walker replicas, whose block is `(0, 1)`
+like any other) via `gb_fstat_ref_row`/`gb_fstat_stage_b`/`gb_fstat_release`;
+run `docs/multirank-cluster-gates.md`'s Step 5 in this same allocation.
+
 ### T6 — real-data shape through the campaign script (hours)
 
 ```sh
