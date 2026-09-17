@@ -22590,11 +22590,32 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         this epoch's artifacts are written (:meth:`_fstat_release_fanout`);
         the HEAD's own survives until the centre table has used it, and is
         released by ``setup()``'s ``finally``.
+
+        A "fit" decision that lands on an ALREADY COMPLETE stage-B npz
+        (``stage_b_complete``) skips all of it -- no row on the wire, no
+        scorer built, no runner, no release -- and goes straight to
+        ``run_fstat_grid_fit``'s cache short circuit, which is what this
+        path was always going to reach. The centre table then replicates
+        (and releases) its own row if it still needs one.
         """
-        from lisatools.sampling.fstat_gridfit import run_fstat_grid_fit
+        from lisatools.sampling.fstat_gridfit import (
+            run_fstat_grid_fit,
+            stage_b_complete,
+        )
 
         cache_dir = self._epoch_dir(k)
         os.makedirs(cache_dir, exist_ok=True)
+        # BEFORE the row goes on the wire. ``run_fstat_grid_fit`` short-
+        # circuits on a finished stage-B npz, and a "fit" decision can
+        # legitimately land on one (a DONE.json lost beside it, an offline
+        # grid dropped into the epoch dir) -- but the broadcast (~72 MB per
+        # rank at 6mo) and the sig-het scorer build beside it would already
+        # have been paid, for a row nothing then scores through, and a
+        # gb_fstat_release would be issued for it. The completeness test
+        # needs no reference row, so it runs first; it is
+        # ``fstat_gridfit``'s own predicate, not a second spelling of the
+        # cache path.
+        _already_fitted = stage_b_complete(cache_dir)
         w_global, owner_rank, local_index, lls = self._fstat_global_reference(
             model)
         _fanout = getattr(self, "fanout", None)
@@ -22646,11 +22667,27 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         # until the first real refit -- exactly the silent-cache-reuse case
         # the fingerprint exists to prevent.
         _gb_free = os.environ.get("GB_FSTAT_GB_FREE", "1") == "1"
-        self._fstat_ref_row_fanout(model, branches, w_global, owner_rank,
-                                   local_index)
-        # Built (and cached on ``_fstat_ref_call``) before anything can score
-        # -- see ORDERING above.
-        call_fstat = self._fstat_holder_call(model)
+        if _already_fitted:
+            # Nothing will be scored: ``run_fstat_grid_fit`` loads the npz and
+            # returns. ``call_fstat`` is a refusal rather than ``None`` so a
+            # file that vanished between the two tests says WHY instead of
+            # dying as a ``NoneType is not callable`` somewhere inside stage A.
+            def call_fstat(*_args, **_kw):
+                raise RuntimeError(
+                    f"{self.name}: epoch {k}'s stage-B grid was complete when "
+                    "the fit started, so no reference row was replicated and "
+                    "no F-stat scorer was built -- and then something asked "
+                    f"to score. {cache_dir} must have lost its "
+                    "*_peaks_stacked.npz mid-fit.")
+            logger.info(
+                "%s: F-stat epoch %d is already fitted; loading it without "
+                "replicating a reference row.", self.name, k)
+        else:
+            self._fstat_ref_row_fanout(model, branches, w_global, owner_rank,
+                                       local_index)
+            # Built (and cached on ``_fstat_ref_call``) before anything can
+            # score -- see ORDERING above.
+            call_fstat = self._fstat_holder_call(model)
         stacked, n_peaks = run_fstat_grid_fit(
             call_fstat,
             xp=self.xp,
@@ -22672,7 +22709,8 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             # legacy ``stageb`` to ``stageb_g{gi}_r0`` and round-trip the
             # golden-gated serial sweep through disk for nothing.
             sweep_runner=(self._fstat_stage_b_runner(model)
-                          if self.fanout_active else None),
+                          if (self.fanout_active and not _already_fitted)
+                          else None),
         )
         # NOTE: the HEAD's holder is NOT released here. The centre table
         # (``_install_ctr_table``) must score against the SAME reference and
@@ -22708,8 +22746,11 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         # stage A and the centre table are head-only. Not in a ``finally``:
         # a fit that died is taking the run down with it, and issuing a
         # fan-out command while THAT exception unwinds would only replace it
-        # with a fan-out failure.
-        self._fstat_release_fanout(model)
+        # with a fan-out failure. Skipped entirely when nothing was
+        # replicated: no rank holds anything to release, and the centre table
+        # will take (and release) its own row.
+        if not _already_fitted:
+            self._fstat_release_fanout(model)
         return stacked, n_peaks
 
     # Fields the propose-time lookup reads; the rest of the npz (node Mc /

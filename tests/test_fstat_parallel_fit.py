@@ -1874,6 +1874,56 @@ class RunFstatFitWiringTest(unittest.TestCase):
         self.assertIn(f"rank {self.owner_rank}", line)
         self.assertIn("n_compute=2", line)
 
+    def test_a_complete_stacked_npz_costs_no_broadcast(self):
+        """Task 8 concern 6.2. ``run_fstat_grid_fit`` short-circuits on a
+        finished stage-B npz -- but the ~72 MB per-rank row broadcast and the
+        sig-het scorer build had already been paid by then, for a row nothing
+        would score through, and a ``gb_fstat_release`` was then issued for
+        it. The completeness test needs no reference row, so it runs first.
+
+        Reachable whenever ``_fstat_fit_decision`` says "fit" over a complete
+        npz: a ``DONE.json`` lost beside one, or an offline grid dropped into
+        the epoch dir. The REAL ``run_fstat_grid_fit`` runs here, on a real
+        golden npz, so the ``call_fstat`` this path hands it is exercised.
+        """
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = self._move(n_compute=2)
+        move._fstat_holder_call = lambda model: self.fail(
+            "a complete epoch must not build an F-stat scorer")
+        shutil.copyfile(GOLDEN_SINGLE, G.stacked_grid_path(self.tmp))
+        # the golden was fitted in the Mc basis; stacked_from_cache refuses a
+        # cache whose basis disagrees with the flag
+        with stage_b_env(), self.assertLogs(gbs.logger, "INFO") as cap:
+            stacked, n_peaks = move._run_fstat_fit("model", 4,
+                                                   branches={"gb": 1})
+        self.assertEqual(self.seen["ref_row"], [],
+                         "no gb_fstat_ref_row may be issued")
+        self.assertEqual(self.seen["release"], [],
+                         "nothing was replicated, so nothing to release")
+        self.assertEqual(self.seen["runner"], 0)
+        self.assertIsNotNone(stacked)
+        with np.load(GOLDEN_SINGLE, allow_pickle=False) as d:
+            self.assertEqual(n_peaks, int(len(d["peak_f0_mHz"])))
+        # the manifest is still written -- that is what stops the next
+        # window deciding "fit" all over again
+        self.assertEqual(self._manifest()["n_peaks"], n_peaks)
+        self.assertEqual(self._manifest()["walker_ref"], 6)
+        self.assertIn("already fitted", "\n".join(cap.output))
+
+    def test_the_completeness_test_names_the_file_the_fit_loads(self):
+        """One implementation, so the move's pre-check can never disagree
+        with the orchestrator's own short circuit."""
+        self.assertFalse(G.stage_b_complete(self.tmp))
+        path = G.stacked_grid_path(self.tmp)
+        self.assertEqual(
+            path,
+            os.path.join(self.tmp, G.GRID_BASENAME).replace(
+                ".npz", "_peaks_stacked.npz"))
+        with open(path, "wb") as f:
+            f.write(b"")
+        self.assertTrue(G.stage_b_complete(self.tmp))
+
 
 class ReleaseBodyTest(unittest.TestCase):
     """``gb_fstat_release``: the seventh op, and what serving it does."""

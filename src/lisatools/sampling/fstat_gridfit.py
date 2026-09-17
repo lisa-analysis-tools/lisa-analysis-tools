@@ -60,6 +60,8 @@ __all__ = [
     "clear_stage_b_parts",
     "run_stacked_stage_b",
     "run_fstat_grid_fit",
+    "stacked_grid_path",
+    "stage_b_complete",
     "build_gb_birth_distribution",
     "sighet_fstat_ref_margin_hz",
     "build_sighet_call_fstat",
@@ -1543,6 +1545,34 @@ def run_stacked_stage_b(call_fstat: Callable, peaks, *, xp, Tobs: float,
 # orchestrator
 # --------------------------------------------------------------------------
 
+def stacked_grid_path(cache_dir: str) -> str:
+    """The stage-B output npz ``run_fstat_grid_fit`` writes and reloads.
+
+    Spelled exactly as every writer spells it -- ``os.path.join(cache_dir,
+    GRID_BASENAME)`` with the suffix swapped -- so a caller's pre-check can
+    never name a different file from the one the orchestrator tests.
+    """
+    return os.path.join(cache_dir, GRID_BASENAME).replace(
+        ".npz", "_peaks_stacked.npz")
+
+
+def stage_b_complete(cache_dir: str) -> bool:
+    """True when ``cache_dir`` already holds a finished stage-B grid.
+
+    The condition :func:`run_fstat_grid_fit` short-circuits on, exposed so a
+    caller can test it BEFORE paying for anything the short circuit would
+    throw away. Under the multi-rank fit that matters: the reference row is
+    ~72 MB per rank on the wire and the sig-het scorer built beside it is
+    ~GB on device, and a "fit" decision can legitimately land on a complete
+    npz (a ``DONE.json`` lost beside one, an offline grid dropped in).
+
+    Says nothing about a ZERO-PEAK epoch, for which no npz is ever written;
+    that is the manifest's job (``_epoch_complete`` /
+    ``_epoch_missing_for_ranks`` in the GB move).
+    """
+    return os.path.exists(stacked_grid_path(cache_dir))
+
+
 def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
                        band_edges_hz, f0_lims_hz, mc_lims, cache_dir: str,
                        fingerprint_extra: str = "", epoch=None,
@@ -1556,7 +1586,9 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
     ``sweep_runner`` is forwarded to :func:`run_stacked_stage_b`; ``None``
     is the serial per-group kernel stream. The stacked-cache short circuit
     below it is unchanged -- a complete epoch never re-enters the kernel,
-    parallel or not.
+    parallel or not, and ``call_fstat`` is never called on that path (see
+    :func:`stage_b_complete`, which a caller can test first to avoid
+    BUILDING one).
 
     Cache reuse IS the mid-fit resume, and it is always on:
 
@@ -1573,7 +1605,7 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
     os.makedirs(cache_dir, exist_ok=True)
     cache_path = os.path.join(cache_dir, GRID_BASENAME)
     comb_cache = cache_path.replace(".npz", "_comb.npz")
-    stacked_cache = cache_path.replace(".npz", "_peaks_stacked.npz")
+    stacked_cache = stacked_grid_path(cache_dir)
 
     if os.path.exists(stacked_cache):
         d = np.load(stacked_cache, allow_pickle=False)
