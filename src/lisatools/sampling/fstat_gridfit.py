@@ -52,6 +52,12 @@ __all__ = [
     "StageBGroupSpec",
     "run_stage_b_group",
     "write_stacked_npz",
+    "split_box_range",
+    "stage_b_part_path",
+    "save_stage_b_part",
+    "load_stage_b_part",
+    "assemble_stage_b_group",
+    "clear_stage_b_parts",
     "run_stacked_stage_b",
     "run_fstat_grid_fit",
     "build_gb_birth_distribution",
@@ -1054,7 +1060,42 @@ def write_stacked_npz(stacked_path, *, grids_g, mc_ax_g, f0_los, f0_dxs,
     SAME code -- the loader (``fstat_proposal.stacked_from_cache``)
     dispatches on ``"logp_grids" in keys``, so the two formats are not
     interchangeable and must never be produced by two separate writers.
+
+    The parallel fit feeds this function rank-ASSEMBLED concatenations
+    rather than whole-group sweeps, so a short or long partial (a dropped
+    rank, an off-by-one in :func:`split_box_range`, ...) would otherwise
+    write a cache whose box axis silently disagrees with ``f0_los[a:b]`` --
+    wrong templates proposed forever, with no error anywhere. Validate the
+    shapes before touching disk.
     """
+    if len(grids_g) != len(mc_ax_g):
+        raise ValueError(
+            f"write_stacked_npz: {len(grids_g)} grid(s) but {len(mc_ax_g)} "
+            f"Mc axis/axes -- exactly one Mc axis per group is required")
+    if group_sizes is not None:
+        if len(grids_g) != len(group_sizes):
+            raise ValueError(
+                f"write_stacked_npz: {len(grids_g)} grid(s) but "
+                f"{len(group_sizes)} group_sizes entries")
+        for gi, (grid, want) in enumerate(zip(grids_g, group_sizes)):
+            got = int(np.asarray(grid).shape[0])
+            want = int(want)
+            if got != want:
+                raise ValueError(
+                    f"write_stacked_npz: group {gi} grid has {got} box(es) "
+                    f"but group_sizes[{gi}] says {want} -- a short or long "
+                    f"partial would write a cache whose box axis silently "
+                    f"disagrees with f0_los[a:b]")
+    total_boxes = sum(int(np.asarray(g).shape[0]) for g in grids_g)
+    if total_boxes != len(f0_los):
+        raise ValueError(
+            f"write_stacked_npz: {total_boxes} box(es) across all groups "
+            f"but f0_los has {len(f0_los)} entries")
+    if total_boxes != len(f0_dxs):
+        raise ValueError(
+            f"write_stacked_npz: {total_boxes} box(es) across all groups "
+            f"but f0_dxs has {len(f0_dxs)} entries")
+
     os.makedirs(os.path.dirname(stacked_path), exist_ok=True)
     common = dict(
         f0_los=f0_los, f0_dxs=f0_dxs, alpha_ax=alpha_ax, sin_delta_ax=sd_ax,
@@ -1078,6 +1119,113 @@ def write_stacked_npz(stacked_path, *, grids_g, mc_ax_g, f0_los, f0_dxs,
         group_arrays[f"mc_ax_g{gi}"] = mc_ax_g[gi]
     np.savez(stacked_path, group_sizes=np.asarray(group_sizes, dtype=int),
              **common, **group_arrays)
+
+
+def split_box_range(a, b, n_parts):
+    """Split boxes ``[a, b)`` into ``n_parts`` CONTIGUOUS, near-equal ranges.
+
+    A pure function of ``(a, b, n_parts)`` -- that is load-bearing: a resume
+    must reproduce the same rank -> range map, or a rank would find another
+    rank's checkpoint under its own name (the fingerprint would reject it and
+    the group would silently restart, which is safe but wastes the sweep).
+
+    CONTIGUITY, not interleaving, is also load-bearing: the sig-het F-stat
+    keeps ONE reference block resident and rebuilds it on f0 boundary
+    crossings, so an f0-contiguous range divides the block builds
+    proportionally, while an interleaved one would rebuild every block on
+    every rank (measured 4,600 rebuilds ~ 350 s in the F-ordered-box
+    incident, see run_stacked_stage_b's f0-sort comment).
+
+    The first ``(b - a) % n_parts`` ranges get one extra box. With fewer
+    boxes than parts the tail ranges come back EMPTY (zero width), which
+    :func:`run_stage_b_group` short-circuits.
+    """
+    a, b, n = int(a), int(b), int(n_parts)
+    if n <= 0:
+        raise ValueError(f"n_parts must be positive, got {n_parts!r}")
+    total = max(b - a, 0)
+    base, rem = divmod(total, n)
+    out, start = [], a
+    for i in range(n):
+        width = base + (1 if i < rem else 0)
+        out.append((start, start + width))
+        start += width
+    return out
+
+
+def stage_b_part_path(parts_dir, gi, rank) -> str:
+    """``<parts>/stageb_g{gi}_r{rank}.npy`` -- one rank's slice of one group.
+
+    The ``stageb`` prefix is deliberate: the existing
+    ``ckpt_clear(_parts, "stageb")`` at the end of a successful stage B
+    already removes the per-rank PROGRESS files by prefix, and these
+    partials are cleared by :func:`clear_stage_b_parts` alongside them.
+    """
+    return os.path.join(parts_dir, f"stageb_g{int(gi)}_r{int(rank)}.npy")
+
+
+def save_stage_b_part(parts_dir, gi, rank, grid):
+    """Write one rank's finished slice as raw float64; return ``(path, n_rows, sha1)``.
+
+    ``np.save`` through an open file object, NOT a path: given a path it
+    appends ``.npy`` to whatever it is handed, which would turn the
+    write-then-rename temp name into ``....npy.tmp.npy``. The rename is what
+    makes the head's read of a partial atomic on a shared filesystem.
+    """
+    os.makedirs(parts_dir, exist_ok=True)
+    arr = np.ascontiguousarray(_to_host(grid), dtype=np.float64)
+    path = stage_b_part_path(parts_dir, gi, rank)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as fh:
+        np.save(fh, arr, allow_pickle=False)
+    os.replace(tmp, path)
+    return path, int(arr.shape[0]), hashlib.sha1(arr.tobytes()).hexdigest()[:16]
+
+
+def load_stage_b_part(parts_dir, gi, rank):
+    return np.load(stage_b_part_path(parts_dir, gi, rank), allow_pickle=False)
+
+
+def assemble_stage_b_group(parts_dir, gi, n_parts, node_shape, *, xp,
+                           sha1s=None):
+    """Concatenate one group's per-rank partials in RANK (== box) order.
+
+    Box is the slowest axis of ``node_shape``
+    (:func:`run_stacked_peak_sweep`), and :func:`split_box_range` hands rank
+    ``r`` a contiguous ascending range, so rank-ordered concatenation on
+    axis 0 reproduces the whole-group sweep exactly. ``sha1s`` (rank ->
+    digest, as the ranks reported them) is verified when given: a partial
+    that changed between the reply and the read is a filesystem fault, and
+    silently fitting on it would corrupt the epoch with no symptom.
+    """
+    parts = []
+    for r in range(int(n_parts)):
+        arr = np.ascontiguousarray(load_stage_b_part(parts_dir, gi, r))
+        if sha1s is not None and sha1s.get(r) is not None:
+            got = hashlib.sha1(arr.tobytes()).hexdigest()[:16]
+            if got != sha1s[r]:
+                raise RuntimeError(
+                    f"stage-B partial g{gi} r{r} changed under us: reported "
+                    f"sha1 {sha1s[r]}, read {got} "
+                    f"({stage_b_part_path(parts_dir, gi, r)})")
+        parts.append(arr)
+    grid = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
+    if tuple(grid.shape) != tuple(node_shape):
+        raise RuntimeError(
+            f"stage-B group {gi}: assembled {tuple(grid.shape)} from "
+            f"{n_parts} partials, expected {tuple(node_shape)}")
+    return xp.asarray(grid)
+
+
+def clear_stage_b_parts(parts_dir, gi, n_parts) -> None:
+    """Remove one group's partials (and any leftover temp files)."""
+    for r in range(int(n_parts)):
+        for path in (stage_b_part_path(parts_dir, gi, r),
+                     stage_b_part_path(parts_dir, gi, r) + ".tmp"):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def mc_ladder_levels(n_req):

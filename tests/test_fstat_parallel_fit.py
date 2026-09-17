@@ -326,10 +326,21 @@ class SweepRunnerInjectionTest(unittest.TestCase):
         self.assertEqual(right.fdot_axis, spec.fdot_axis)
 
     def test_split_sweeps_reassemble_bit_identically(self):
-        """Two half-range sweeps concatenated == the whole-group sweep."""
+        """Two half-range sweeps concatenated == the whole-group sweep.
+
+        Self-guarding: the runner falls back to the whole-group sweep for
+        any group with ``n_boxes < 2`` (``group_sizes`` is ``[3, 3, 5, 1]``
+        today, so the last group takes that fallback). If the fixture's
+        group structure ever became all-singleton, this test would keep
+        passing while no longer exercising a split at all -- so count the
+        groups that actually took the split path and require at least one.
+        """
+        split_count = [0]
+
         def runner(spec, call_fstat, *, xp):
             if spec.n_boxes < 2:
                 return G.run_stage_b_group(spec, call_fstat, xp=xp)
+            split_count[0] += 1
             mid = spec.a + spec.n_boxes // 2
             parts = [
                 G.run_stage_b_group(
@@ -342,6 +353,163 @@ class SweepRunnerInjectionTest(unittest.TestCase):
 
         got = run_golden(self.d, grouped=True, sweep_runner=runner)
         assert_npz_identical(self, got, GOLDEN_GROUPED)
+        self.assertGreaterEqual(
+            split_count[0], 1,
+            "no group took the split path -- this test would pass "
+            "vacuously if every group were a singleton")
+
+
+class SplitBoxRangeTest(unittest.TestCase):
+    def test_contiguous_covering_and_ordered(self):
+        for total, n in ((12, 3), (13, 3), (1, 1), (5, 5), (7, 4)):
+            parts = G.split_box_range(10, 10 + total, n)
+            self.assertEqual(len(parts), n)
+            self.assertEqual(parts[0][0], 10)
+            self.assertEqual(parts[-1][1], 10 + total)
+            for (a0, b0), (a1, _b1) in zip(parts, parts[1:]):
+                self.assertLessEqual(a0, b0)
+                self.assertEqual(b0, a1, "ranges must be contiguous")
+            self.assertEqual(sum(b - a for a, b in parts), total)
+
+    def test_sizes_differ_by_at_most_one(self):
+        parts = G.split_box_range(0, 13, 4)
+        widths = sorted(b - a for a, b in parts)
+        self.assertEqual(widths, [3, 3, 3, 4])
+        self.assertEqual(parts, [(0, 4), (4, 7), (7, 10), (10, 13)])
+
+    def test_more_ranks_than_boxes_gives_empty_tail_ranges(self):
+        parts = G.split_box_range(0, 2, 4)
+        self.assertEqual(parts, [(0, 1), (1, 2), (2, 2), (2, 2)])
+
+    def test_is_a_pure_function_of_its_arguments(self):
+        self.assertEqual(G.split_box_range(3, 29, 5), G.split_box_range(3, 29, 5))
+
+    def test_zero_parts_raises(self):
+        with self.assertRaises(ValueError):
+            G.split_box_range(0, 10, 0)
+
+
+class StageBPartIOTest(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def test_round_trip_with_checksum(self):
+        rng = np.random.default_rng(7)
+        grid = rng.normal(size=(3, 4, 2, 2, 2))
+        path, n_rows, sha = G.save_stage_b_part(self.d, 1, 2, grid)
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(n_rows, 3)
+        back = G.load_stage_b_part(self.d, 1, 2)
+        self.assertEqual(back.dtype, np.float64)
+        self.assertEqual(back.tobytes(), np.ascontiguousarray(grid).tobytes())
+        _p2, _n2, sha2 = G.save_stage_b_part(self.d, 1, 2, grid)
+        self.assertEqual(sha, sha2)
+
+    def test_assemble_concatenates_in_rank_order_and_checks_shape(self):
+        rng = np.random.default_rng(11)
+        whole = rng.normal(size=(5, 4, 2, 2, 2))
+        for r, (a, b) in enumerate(G.split_box_range(0, 5, 3)):
+            G.save_stage_b_part(self.d, 0, r, whole[a:b])
+        got = G.assemble_stage_b_group(self.d, 0, 3, whole.shape, xp=np)
+        self.assertEqual(np.asarray(got).tobytes(),
+                         np.ascontiguousarray(whole).tobytes())
+        with self.assertRaises(RuntimeError):
+            G.assemble_stage_b_group(self.d, 0, 3, (6, 4, 2, 2, 2), xp=np)
+
+    def test_assemble_rejects_a_corrupt_partial(self):
+        rng = np.random.default_rng(13)
+        whole = rng.normal(size=(4, 2, 2, 2, 2))
+        shas = {}
+        for r, (a, b) in enumerate(G.split_box_range(0, 4, 2)):
+            _p, _n, shas[r] = G.save_stage_b_part(self.d, 0, r, whole[a:b])
+        G.save_stage_b_part(self.d, 0, 1, whole[2:4] + 1.0)  # tamper
+        with self.assertRaises(RuntimeError):
+            G.assemble_stage_b_group(self.d, 0, 2, whole.shape, xp=np, sha1s=shas)
+
+    def test_clear_removes_only_this_group(self):
+        g = np.zeros((1, 2, 2, 2, 2))
+        G.save_stage_b_part(self.d, 0, 0, g)
+        G.save_stage_b_part(self.d, 1, 0, g)
+        G.clear_stage_b_parts(self.d, 0, 1)
+        self.assertFalse(os.path.exists(G.stage_b_part_path(self.d, 0, 0)))
+        self.assertTrue(os.path.exists(G.stage_b_part_path(self.d, 1, 0)))
+
+    def test_part_names_are_cleared_by_the_existing_stageb_prefix(self):
+        """ckpt_clear(parts, "stageb") must reach the per-rank checkpoints."""
+        self.assertTrue(
+            os.path.basename(G.stage_b_part_path(self.d, 0, 3)).startswith("stageb"))
+
+
+class WriteStackedNpzValidationTest(unittest.TestCase):
+    """(A) write_stacked_npz must validate shapes before touching disk.
+
+    The parallel fit feeds this function rank-ASSEMBLED concatenations, so
+    a short or long partial must raise loudly rather than write a cache
+    whose box axis silently disagrees with ``f0_los[a:b]``.
+    """
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def _common_kwargs(self, n_total):
+        peaks = np.zeros((n_total, 4))
+        peaks[:, 0] = np.linspace(8.0, 9.0, n_total)  # peak_f0_mHz
+        peaks[:, 1] = 1.0                             # peak_F
+        return dict(
+            f0_los=np.linspace(8.0, 9.0, n_total),
+            f0_dxs=np.full(n_total, 1e-6),
+            alpha_ax=np.linspace(0.0, 2 * np.pi, 2),
+            sd_ax=np.linspace(-1.0, 1.0, 2),
+            grid_basis="Mc", grid_c_t=0.0, peaks=peaks,
+            band_idx=np.zeros(n_total, dtype=int),
+            band_edges_mHz=np.array([7.0, 10.0]),
+            band_edges_hz=np.array([7.0e-3, 10.0e-3]),
+        )
+
+    def test_short_group_grid_raises_and_names_the_group(self):
+        """group_sizes says [2, 3] (5 boxes); group 1's grid has only 2."""
+        grids_g = [np.zeros((2, 2, 2, 2, 2)), np.zeros((2, 2, 2, 2, 2))]
+        mc_ax_g = [np.linspace(0.1, 1.0, 2), np.linspace(0.1, 1.0, 2)]
+        with self.assertRaises(ValueError) as ctx:
+            G.write_stacked_npz(
+                os.path.join(self.d, "out.npz"), grids_g=grids_g,
+                mc_ax_g=mc_ax_g, group_sizes=[2, 3],
+                **self._common_kwargs(5))
+        msg = str(ctx.exception)
+        self.assertIn("group 1", msg)
+        self.assertIn("2", msg)
+        self.assertIn("3", msg)
+        self.assertFalse(os.path.exists(os.path.join(self.d, "out.npz")),
+                          "a rejected write must not touch disk")
+
+    def test_total_box_count_mismatch_raises(self):
+        """Both groups match group_sizes, but f0_los is one box short."""
+        grids_g = [np.zeros((2, 2, 2, 2, 2)), np.zeros((3, 2, 2, 2, 2))]
+        mc_ax_g = [np.linspace(0.1, 1.0, 2), np.linspace(0.1, 1.0, 2)]
+        with self.assertRaises(ValueError) as ctx:
+            G.write_stacked_npz(
+                os.path.join(self.d, "out.npz"), grids_g=grids_g,
+                mc_ax_g=mc_ax_g, group_sizes=[2, 3],
+                **self._common_kwargs(4))  # f0_los/f0_dxs sized for 4, not 5
+        msg = str(ctx.exception)
+        self.assertIn("5", msg)
+        self.assertIn("4", msg)
+
+    def test_valid_shapes_write_cleanly(self):
+        """The happy path must still write -- validation is not overzealous."""
+        grids_g = [np.zeros((2, 2, 2, 2, 2)), np.zeros((3, 2, 2, 2, 2))]
+        mc_ax_g = [np.linspace(0.1, 1.0, 2), np.linspace(0.1, 1.0, 2)]
+        out = os.path.join(self.d, "out.npz")
+        G.write_stacked_npz(
+            out, grids_g=grids_g, mc_ax_g=mc_ax_g, group_sizes=[2, 3],
+            **self._common_kwargs(5))
+        self.assertTrue(os.path.exists(out))
 
 
 if __name__ == "__main__":
