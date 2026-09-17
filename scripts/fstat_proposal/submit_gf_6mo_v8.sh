@@ -502,7 +502,9 @@ cd /shared/home/mlkatz1/lisa-analysis-tools
 # stay intact for comparison and nothing can silently resume. BASE_FILE_NAME
 # stays gf_prod_3mo so every analysis tool (monitor generator, digests) works
 # unchanged -- they take the DIRECTORY as their argument.
-STORE_DIR=/shared/data/global_fit_output/gf_prod_6mo_v8/
+# env-overridable (2026-09-16) so a COPY of a live run's folder can be continued
+# under new code/layout without touching the original (STORE_DIR=<copy> ...).
+STORE_DIR=${STORE_DIR:-/shared/data/global_fit_output/gf_prod_6mo_v8/}
 
 # ---- GPU telemetry ---------------------------------------------------------
 # Background nvidia-smi sampler: one CSV row per GPU into the run store
@@ -699,16 +701,17 @@ echo "[V8-NOISE] coarse: Q=${COARSE_Q} mode=${COARSE_GPU_MODE} \
 use_ws=${COARSE_USE_WS} fiducial=${COARSE_FIDUCIAL}"
 
 # ---- sampler shape ---------------------------------------------------------
-export NWALKERS=${NWALKERS:-8}     # 8 walkers (user ruling 2026-09-16): divisible
-                                   # by N_COMPUTE=2 (NGPUS=2) AND 4 (NGPUS=4), so
-                                   # a run started on 2 GPUs CONTINUES on 4 GPUs
-                                   # from the same store (the walker block is a
-                                   # runtime property, not stored). Was 10 (the
-                                   # 2026-09-11 rebase off the validated 10w 3mo
-                                   # arm, jobs 465/473). GB rungs stay
-                                   # GB_NTEMPS=24 -- walkers and temps are
-                                   # independent axes. NEVER change NWALKERS on
-                                   # a resume: the store carries the walker axis.
+export NWALKERS=${NWALKERS:-10}    # 10-walker rebase (2026-09-11 ruling: build
+                                   # off the validated 10w 3mo arm, jobs
+                                   # 465/473); env-overridable since 2026-09-16.
+                                   # GB rungs stay GB_NTEMPS=24 -- walkers and
+                                   # temps are independent axes. NEVER change
+                                   # NWALKERS on a resume: the store carries the
+                                   # walker axis. Under the walker-block layout
+                                   # NWALKERS must divide by N_COMPUTE (10 -> 2
+                                   # or 5 compute ranks; 4 GPUs need 5 compute
+                                   # ranks with RANKS_PER_GPU=2, or 8/12 walkers
+                                   # from the start of a run).
                                    # Noise-block floor 2*ndim (galfor ndim 5
                                    # -> 10) still satisfied.
 if [ "${GF_LEGACY_RANK_LAYOUT}" = "0" ] && [ "${N_COMPUTE_EFF}" -gt 0 ] \
