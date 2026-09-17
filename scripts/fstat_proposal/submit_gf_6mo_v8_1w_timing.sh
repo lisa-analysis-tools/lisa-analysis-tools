@@ -400,7 +400,7 @@
 
 # ---- fill these in ---------------------------------------------------------
 #SBATCH --job-name=gf6mo_1w          # 1-WALKER TIMING BASELINE (2026-09-16)
-#SBATCH --partition=gpu-40-spot   # 1-GPU timing node (user ruling); the
+#SBATCH --partition=gpu-80-spot   # 1 GPU of an 80-node (user ruling 2026-09-16); the
                                   # NGPUS self-dispatch below overrides it
 #SBATCH --gres=gpu:1              # ONE GPU -- in-job GPUS derives to "0"
 #SBATCH --nodes=1                 # DEFAULT 1 node; NGPUS=4 -> 2 nodes (below)
