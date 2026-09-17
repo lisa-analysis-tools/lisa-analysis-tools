@@ -4215,6 +4215,49 @@ class SourceMoveBuilder:
         raise NotImplementedError
 
 
+def resume_ladder_wins(branch_name, info, sub, ntemps):
+    """Reconcile a per-leaf-ladder branch's rung count with a RESUMED state.
+
+    Returns ``(ntemps, betas)``: the rung count the move must be built at
+    and, when the store overrode the configuration, the store's own
+    representative ladder (leaf 0's ``betas_all`` row) to build it with;
+    ``betas`` is ``None`` whenever the configuration stands.
+
+    ``sub`` is the branch's sub-state as loaded (``None`` / not yet
+    tempered-initialized on a fresh start: the configuration stands). A
+    resumed sub-state carries its coords, per-leaf log_like and counters
+    at the rung count the store was written with, so that count is
+    authoritative: the configured ``{BRANCH}_NTEMPS`` / ``betas`` is
+    reported and ignored, and ``info.ntemps`` / ``info.betas`` are
+    rewritten so every later consumer (``run.py::_branch_ntemps``, the
+    midit checkpoint gate, the saver) reads the store's count too.
+    """
+    if sub is None or not getattr(sub, "tempered_initialized", False):
+        return int(ntemps), None
+    stored_nt = int(getattr(sub, "ntemps", 0) or 0)
+    if stored_nt <= 0 or stored_nt == int(ntemps):
+        return int(ntemps), None
+    stored_all = getattr(sub, "betas_all", None)
+    betas = None
+    if stored_all is not None and np.shape(stored_all)[-1] == stored_nt:
+        betas = np.asarray(stored_all, dtype=float).reshape(-1, stored_nt)[0].copy()
+    else:
+        betas = make_ladder(int(info.ndim), ntemps=stored_nt)
+    configured = int(ntemps)
+    info.ntemps = stored_nt
+    info.betas = betas
+    logger.warning(
+        "%s branch resumed at the STORED %d-rung ladder %s -- the configured "
+        "%d-rung ladder (%s_NTEMPS / an explicit betas) is IGNORED; the "
+        "move's TemperatureControl, coords_shape, betas and accepted array "
+        "follow the store. To actually run at %d rungs, re-rung the store "
+        "(a migration) or start a fresh backend.",
+        branch_name, stored_nt, np.array2string(betas, precision=4),
+        configured, str(branch_name).upper(), configured,
+    )
+    return stored_nt, betas
+
+
 class SingleSourcePEBuilder(SourceMoveBuilder):
     """Build a :class:`ResidualAddOneRemoveOneMove` PE move for one branch.
 
@@ -4314,6 +4357,21 @@ class SingleSourcePEBuilder(SourceMoveBuilder):
             if _info_betas is not None
             else int(getattr(info, "ntemps", None) or gi.ntemps)
         )
+        # RESUME: the STORED rung count wins (same rule as the banded
+        # branches, GBState.initialize_band_information step 3). A resumed
+        # sub-state carries its coords / per-leaf log_like / counters at the
+        # rung count the store was written with; sizing the move off the
+        # configured {BRANCH}_NTEMPS instead leaves a 12-rung
+        # TemperatureControl (and a 12-row coords_shape) against an 8-rung
+        # state -- or the reverse -- and the mismatch surfaces later as
+        # "cannot reshape array of size 88 into shape (12,newaxis)" in the
+        # per-walker eigen sweep (2026-09-17 relaunch) or as the mass
+        # eigen-table rebuilds of snapshot 7 (2026-09-16). Re-rungging a
+        # live store is a migration, never a mid-resume side effect.
+        ntemps, _stored_betas = resume_ladder_wins(
+            self.branch_name, info, state.sub_states.get(self.branch_name),
+            ntemps,
+        )
 
         # Ladder resolution honors the class contract ("any argument left
         # None falls back to the matching field on source_info"): an explicit
@@ -4321,7 +4379,9 @@ class SingleSourcePEBuilder(SourceMoveBuilder):
         # (e.g. EMRISetup's dense 1/1.2^k), then the make_ladder default.
         # Previously info.betas was skipped entirely, so the configured EMRI
         # ladder never reached the move's per-leaf temperature controls.
-        betas = self.betas
+        # On a rung-count resume mismatch the store's own ladder is the one
+        # the run was actually sampling at, so it wins over all of those.
+        betas = _stored_betas if _stored_betas is not None else self.betas
         if betas is None:
             betas = getattr(info, "betas", None)
             if betas is not None:

@@ -2521,7 +2521,14 @@ export EMRI_NTEMPS=2
 # 80/80 non-positive infomats, mbh/emri walls 3-5x, iteration ~80 min).
 # Set 8 ONLY at the deliberate fresh restart (with the VGB chirp
 # migration), never on a resumed 12-rung store.
-export SOBBH_NTEMPS=12
+# (2026-09-17) Overridable, and the STORED rung count now WINS on resume
+# for mbh/emri/sobbh (recipe.resume_ladder_wins, same rule as gb/vgb): a
+# store born at 8 rungs (d3c0d6ee era, 09-16 12:52 -> 21:55) resumed under
+# 12 built a 12-rung move against an 8-rung state and died in the SOBBH
+# per-walker eigen sweep ("cannot reshape array of size 88 into shape
+# (12,newaxis)"). The knob is reported-and-ignored on such a resume; a
+# fresh store honours it.
+export SOBBH_NTEMPS=${SOBBH_NTEMPS:-12}
 # ONE information matrix per leaf at the max-lnL cold walker (like MBH/EMRI)
 # instead of one per (temperature, walker) (user ruling 2026-09-16): the
 # per-walker stash is keyed by the walker axis, so every resume under a
@@ -2529,7 +2536,11 @@ export SOBBH_NTEMPS=12
 # matrices per leaf (~2.6 min/leaf/rank); walker_max tables are
 # layout-independent and persist across resumes. Watch the per-rung SOBBH
 # acceptance -- hot rungs now propose with the best walker's curvature.
-export SOBBH_EIGEN_SCOPE=walker_max
+# THE ONLY SOBBH_EIGEN_SCOPE EXPORT IN THIS FILE: a second
+# `export SOBBH_EIGEN_SCOPE=per_walker` further down (the 2026-09-08
+# TABLE SCOPE block) silently overrode this line until 2026-09-17, so the
+# ruling never took effect. Escape: SOBBH_EIGEN_SCOPE=per_walker in the env.
+export SOBBH_EIGEN_SCOPE=${SOBBH_EIGEN_SCOPE:-walker_max}
 export MBH_NUM_PROP_REPEATS=2
 export EMRI_NUM_PROP_REPEATS=2
 export SOBBH_NUM_PROP_REPEATS=20   # 25 -> 20 (user ruling 2026-09-16); applies at next relaunch
@@ -2578,16 +2589,13 @@ export SOBBH_CHECK_LL_EVERY=30
 export SOBBH_INNER_MOVE_KIND=${SOBBH_INNER_MOVE_KIND:-eigen}
 export MBH_INNER_MOVE_KIND=eigen
 export EMRI_INNER_MOVE_KIND=eigen
-# TABLE SCOPE (user ruling 2026-09-08). SOBBH: per-(temperature, walker)
-# -- every point its own matrix against its own walker's data, ONE batched
-# corner sweep (the red/blue seam slices the full table per split). Cost
-# at this shape (10 walkers, 2026-09-11): 12 rungs x 10 walkers = 120
-# points x ~245 rows ~ 29k batched likelihood rows ~ 1.4 min per LEAF
-# REFRESH at the measured 2.78 ms/row -- first visit + every
-# SOBBH_EIGEN_REFRESH-th (10), i.e. under a minute per iteration averaged
-# over 6 leaves, concentrated in refresh iterations. If that bites: SOBBH_EIGEN_SCOPE=walker_max drops a refresh
-# to ~245 rows (~0.7 s); SOBBH_EIGEN_REFRESH stretches the cadence.
-export SOBBH_EIGEN_SCOPE=per_walker
+# TABLE SCOPE. SOBBH is set ABOVE (SOBBH_EIGEN_SCOPE, walker_max per the
+# 2026-09-16 ruling; the 2026-09-08 per-walker ruling it superseded cost
+# 12 rungs x 10 walkers = 120 points x ~245 rows ~ 29k batched likelihood
+# rows ~ 1.4 min per LEAF REFRESH at 2.78 ms/row, and the per-walker stash
+# is discarded on every walker-block change). SOBBH_EIGEN_REFRESH stretches
+# the refresh cadence either way. Do NOT re-add an export here: a second
+# export silently overrode the ruling above until 2026-09-17.
 export SOBBH_EIGEN_REFRESH=10
 # MBH/EMRI: ONE table per leaf, built at the max-lnL COLD walker (their
 # likelihood rows are per-row dense, ~1.4 / ~1.0 s). A refresh is

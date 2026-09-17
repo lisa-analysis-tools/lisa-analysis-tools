@@ -47,6 +47,47 @@ exit 0
 """
 
 
+class SobbhKnobsSingleExportTest(unittest.TestCase):
+    """One effective export per SOBBH knob (2026-09-17).
+
+    ``SOBBH_EIGEN_SCOPE=walker_max`` (user ruling 2026-09-16) was exported
+    once and then silently overridden by a second, older
+    ``export SOBBH_EIGEN_SCOPE=per_walker`` further down the same file, so
+    the ruling never reached a run. ``SOBBH_NTEMPS`` must be overridable
+    from the environment (a store born at 8 rungs is resumed with
+    ``SOBBH_NTEMPS=8``; the stored count wins either way, but the knob
+    should not lie in run_settings.log).
+    """
+
+    def _exports(self, path, name):
+        with open(path) as fh:
+            return [
+                line.strip() for line in fh
+                if line.lstrip().startswith(f"export {name}=")
+            ]
+
+    def test_sobbh_eigen_scope_exported_once(self):
+        for path in SCRIPTS:
+            lines = self._exports(path, "SOBBH_EIGEN_SCOPE")
+            self.assertLessEqual(
+                len(lines), 1,
+                f"{path}: SOBBH_EIGEN_SCOPE exported {len(lines)} times: {lines}",
+            )
+
+    def test_campaign_sobbh_eigen_scope_is_walker_max(self):
+        # The ruling applies to the campaign script; the null-test script
+        # keeps its own (per-walker) setting and is only held to one export.
+        lines = self._exports(SCRIPTS[0], "SOBBH_EIGEN_SCOPE")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("walker_max", lines[0])
+        self.assertNotIn("per_walker", lines[0])
+
+    def test_sobbh_ntemps_is_env_overridable(self):
+        lines = self._exports(SCRIPTS[0], "SOBBH_NTEMPS")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertEqual(lines[0], "export SOBBH_NTEMPS=${SOBBH_NTEMPS:-12}")
+
+
 class SubmitScriptsSyntaxTest(unittest.TestCase):
     def test_bash_syntax(self):
         for path in SCRIPTS:
