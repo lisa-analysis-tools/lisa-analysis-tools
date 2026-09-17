@@ -29,7 +29,7 @@ Design authority: `docs/superpowers/specs/2026-09-16-one-walker-replicas-design.
 ## Gates
 
 ### T0 — preflight (minutes, no compute)
-1. Layout dry run (Step A): `GF_LAYOUT_DRY_RUN=1 GPUS=0,1 mpiexec -n 3 -ppn 3 python scripts/run_global.py --stock gb_no_fg`. Pass: the replica layout line, identical `digest()` on every rank.
+1. Layout dry run (Step A), one node: `GF_LAYOUT_DRY_RUN=1 GPUS=0,1 mpiexec -n 3 -ppn 3 python scripts/run_global.py --stock gb_no_fg`. Pass: the replica layout line, identical `digest()` on every rank. Then the same across two nodes (needs the 2-node allocation and the launcher bundle): `GF_LAYOUT_DRY_RUN=1 GPUS=0 mpiexec -n 3 -ppn 1 python scripts/run_global.py --stock gb_no_fg` — same header, rank 1 on the other node with `devices=[0]`, both compute ranks `walkers=[0,1)`. A rank printing `size=1` is the launcher singleton symptom, not a layout bug.
 2. **Control (trigger):** the same with `GF_ONE_WALKER_REPLICAS=0` must refuse with `ValueError: nwalkers=1 on 2 compute ranks needs one-walker replica mode, which GF_ONE_WALKER_REPLICAS=0 disables`; with `NWALKERS=2` it must print the ordinary walker-block layout (`block=1`, no `REPLICAS`).
 3. Submit-script check: `bash -n` on both campaign scripts, then `python -m unittest tests.test_submit_scripts_layout -v` in the cluster env (it runs the extracted in-job block under bash and the dispatch block against a stub `sbatch`). The `[SUBMIT] NWALKERS=1 on N_COMPUTE=...: one-walker replica mode` echo itself only appears in a job's stdout (T6). The scripts read `NWALKERS` from the submitting shell (`export NWALKERS=${NWALKERS:-10}`, carried by the dispatch's `--export=ALL`); a plain resubmit stays at 10.
 
