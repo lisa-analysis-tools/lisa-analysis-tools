@@ -13,9 +13,11 @@ the parallel split existed. They are the single-process regression gate:
 import contextlib
 import dataclasses
 import hashlib
+import json
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 import warnings
 from unittest import mock
@@ -147,19 +149,28 @@ def stage_b_env(**overrides):
                 os.environ[k] = v
 
 
-def run_golden(tmpdir, *, grouped, sweep_runner=None):
+def run_golden(tmpdir, *, grouped, sweep_runner=None, call_fstat=None):
     """Run the serial stage B into ``tmpdir``; return the stacked npz path.
 
     ``grouped=False`` pins ``FSTAT_N_MC`` so every box lands on one ladder
     level (one group, the legacy npz keys); ``grouped=True`` lets the auto
     criterion size each box, which the wide band grid splits into several.
+
+    ``call_fstat`` defaults to a fresh :func:`_fake_call_fstat` -- the
+    goldens' own scorer, and the only thing the serial path ever passes.
+    The parallel gate hands in the head's HOLDER-SCORED call instead,
+    because :meth:`GBSpecialBase._fstat_stage_b_runner`'s guard refuses any
+    scorer that is not the rank's cached ``_fstat_ref_call``; substituting a
+    twin here would make the gate pass through a hole that guard exists to
+    close.
     """
     cache_path = os.path.join(tmpdir, G.GRID_BASENAME)
     extra = {} if grouped else {"FSTAT_N_MC": "3"}
     kwargs = {} if sweep_runner is None else {"sweep_runner": sweep_runner}
     with stage_b_env(**extra):
         G.run_stacked_stage_b(
-            _fake_call_fstat(), make_peaks(), xp=np, Tobs=TOBS,
+            _fake_call_fstat() if call_fstat is None else call_fstat,
+            make_peaks(), xp=np, Tobs=TOBS,
             band_edges_hz=BAND_EDGES, mc_lims=[0.01, 1.0],
             cache_path=cache_path, fingerprint_extra="|epoch=0|gbfree=1",
             epoch=0, **kwargs)
@@ -2487,6 +2498,1067 @@ class CentreTableScoringTest(unittest.TestCase):
             move._install_ctr_table(4, model=None)
         self.assertIsNone(captured["call_fstat"])
         self.assertEqual(self.events, ["load"])
+
+
+# =========================================================================
+# THE ACCEPTANCE GATE (spec "Verification" 1(a)-(d)).
+#
+# A real WalkerFanout / ComputeService over a real FakeWorld drives the
+# PRODUCTION served bodies and the production head-side drivers on the tiny
+# analytic fixture. Nothing about the wire, the dispatcher, the guard, the
+# split, the assembly or the release is stubbed; what IS stubbed is only
+# what needs a GPU (the ACA bind, the sig-het scorer build, the BandSorter
+# window and the memory pool).
+# =========================================================================
+
+
+def _row_keyed_call_fstat(ref_row=None):
+    """The analytic fixture scorer, KEYED BY THE REFERENCE ROW it scores.
+
+    The production ``_fstat_call`` builds its scorer AGAINST the replicated
+    reference row, so a rank that scored its OWN live residual instead would
+    produce different numbers on every node. The analytic fixture ignores
+    its data entirely -- which would let exactly that bug reproduce a golden
+    byte for byte -- so the stand-in folds ONE number off the row into the
+    amplitude. That is what turns "every rank scored the owner's row" from a
+    wiring assertion into a BYTE-LEVEL one.
+
+    An all-zero (or absent) row is the EXACT identity: ``1.0 + 0.01 * 0.0``
+    is ``1.0`` and ``x * 1.0`` is exact for every finite float, which is
+    what lets the stage-B gate keep scoring the stored goldens' own
+    function through this wrapper.
+    """
+    base = _fake_call_fstat()
+    row = np.asarray([] if ref_row is None else ref_row).reshape(-1)
+    scale = 1.0 + 0.01 * float(row[0]) if row.size else 1.0
+
+    def call(params):
+        N, M = base(params)
+        return N * scale, M
+
+    return call
+
+
+def _kill_stage_b_once(rank_suffix="_r1", gi=None):
+    """Patch ``run_stage_b_group`` to kill ONE rank's sweep, exactly once.
+
+    Deterministic by NAME (``ckpt_name`` ends ``_r<index>``) rather than by
+    call count: the FakeWorld ranks are threads and a counter would pick a
+    different victim from run to run. Returns ``(patch, fired event)``.
+    """
+    from lisatools.sampling import fstat_gridfit as GG
+
+    real = GG.run_stage_b_group
+    fired = threading.Event()
+
+    def flaky(spec, call_fstat, *, xp):
+        if ((gi is None or int(spec.gi) == int(gi))
+                and str(spec.ckpt_name).endswith(rank_suffix)
+                and not fired.is_set()):
+            fired.set()
+            raise RuntimeError("simulated rank death mid-sweep")
+        return real(spec, call_fstat, xp=xp)
+
+    return mock.patch.object(GG, "run_stage_b_group", flaky), fired
+
+
+class _StubRefRow:
+    """Stands in for ``gbbands.FStatRefRowHolder`` where no row is shipped.
+
+    ``_fstat_holder_call`` tests a holder for ``None`` and hands it to
+    ``_fstat_call``; nothing else on the stage-B path reads one. The
+    all-zero row makes :func:`_row_keyed_call_fstat` the exact identity, so
+    the stage-B gate still scores the stored goldens' own function.
+    """
+
+    def __init__(self, n=4):
+        self.linear_data_arr = [np.zeros(int(n))]
+        self.linear_psd_arr = [np.zeros(int(n))]
+
+
+class _StageBRankStub:
+    """A stand-in move exposing exactly the F-stat stage-B rank surface.
+
+    Real ``GBSpecialBase`` needs a GPU, a built ``BandSorter`` and gigabytes
+    of buffers, which the laptop budget forbids -- but the code under test
+    (``_fstat_stage_b_payload`` / ``_fstat_stage_b_spec`` /
+    ``_gb_serve_fstat_stage_b`` / ``_fstat_stage_b_runner``, reached through
+    the real ``gf_serve`` and its ``_require_fstat_grid_move`` guard)
+    touches only the fan-out, the spec slicing, the scorer chokepoint and
+    ``run_stage_b_group``. Every method below is BORROWED from production,
+    so what runs is the dispatcher and the bodies the cluster runs; only
+    ``_bind_rank_acs``, ``_fstat_call`` and the memory pool are stubs.
+
+    THE GUARD IS NOT WEAKENED. ``gf_serve`` refuses ``gb_fstat_stage_b`` on a
+    move whose ``_fstat_call`` is ``None`` (``_FSTAT_OP_REQUIRES``); this
+    stub HAS one, and it is holder-scored exactly as the real one is --
+    it raises without a holder, and the scorer it returns depends on the
+    row, so the guard is satisfied honestly rather than defeated.
+    """
+
+    from lisatools.globalfit.moves.gbspecialstretch import GBSpecialBase as _B
+
+    # ``_fstat_stage_b_payload`` / ``_fstat_stage_b_spec`` /
+    # ``_gb_session_token`` are staticmethods, so reading them off the class
+    # yields plain functions -- re-wrap.
+    _fstat_stage_b_payload = staticmethod(_B._fstat_stage_b_payload)
+    _fstat_stage_b_spec = staticmethod(_B._fstat_stage_b_spec)
+    _gb_session_token = staticmethod(_B._gb_session_token)
+    _gb_serve_fstat_stage_b = _B._gb_serve_fstat_stage_b
+    _gb_serve_fstat_release = _B._gb_serve_fstat_release
+    _fstat_stage_b_runner = _B._fstat_stage_b_runner
+    _fstat_holder_call = _B._fstat_holder_call
+    _fstat_release_ref_row = _B._fstat_release_ref_row
+    _require_fstat_grid_move = _B._require_fstat_grid_move
+    _fanout_cmd = _B._fanout_cmd
+    _rank_tag = _B._rank_tag
+    gf_move_name = "gb_pe"
+    name = "gb_stub"
+
+    def __init__(self, fanout, *, rank=None):
+        self.fanout = fanout
+        self.gf_rank = rank
+        self.mempool = _CountingMempool()
+        self.ops_served = []
+        self.nwalkers = None
+        self.ntemps = None
+        self._prop_timer = None
+        self._fstat_ref_holder = _StubRefRow()
+        self._fstat_ref_call = None
+        self._fstat_ref_walker = 0
+
+    @property
+    def xp(self):
+        return np
+
+    def _bind_rank_acs(self, model):
+        return None
+
+    def _fstat_call(self, model, walker_ref, *, holder=None):
+        """The one stub the guard tests for -- holder-scored, like the real one."""
+        if holder is None:
+            raise AssertionError(
+                "a stage-B scorer must be built from the replicated row")
+        return _row_keyed_call_fstat(holder.linear_data_arr[0])
+
+    def gf_serve(self, op, payload, clock, model):
+        """Record the op, then run the PRODUCTION dispatcher unchanged."""
+        self.ops_served.append(op)
+        return self._B.gf_serve(self, op, payload, clock, model)
+
+
+class _RefRowRankStub:
+    """A stand-in move for ``gb_fstat_ref_row``: fake ACA, fake GB-free window.
+
+    Borrows the production ``_gb_serve_fstat_ref_row`` (and the real
+    ``gf_serve`` that dispatches to it, guard included), so the collective,
+    the header exchange and the holder construction under test are the real
+    ones. The GB-free window is faked as "+1.0 on this walker's residual
+    row", which makes two things checkable at once: the SHIPPED row carries
+    the window's effect, and the owner's LIVE residual is back to its
+    original value afterwards.
+    """
+
+    from lisatools.globalfit.moves.gbspecialstretch import GBSpecialBase as _B
+
+    _gb_serve_fstat_ref_row = _B._gb_serve_fstat_ref_row
+    _fstat_ref_row_payload = staticmethod(_B._fstat_ref_row_payload)
+    _fstat_ref_shard = staticmethod(_B._fstat_ref_shard)
+    _fstat_ref_branch_from_payload = _B._fstat_ref_branch_from_payload
+    _require_fstat_grid_move = _B._require_fstat_grid_move
+    gf_serve = _B.gf_serve
+    _fstat_ref_holder = None
+    _fstat_ref_call = None
+    _fstat_ref_walker = None
+    _fstat_ref_branches = None
+    branch_name = "gb"
+    name = "gb_stub"
+
+    def __init__(self, fanout, acs):
+        self.fanout = fanout
+        self._acs = acs
+
+    @property
+    def xp(self):
+        return np
+
+    def _bind_rank_acs(self, model):
+        return self._acs
+
+    @contextlib.contextmanager
+    def _gb_free_residual(self, model, branches, walker_ref):
+        # RESTORE BY ASSIGNMENT, not by ``-= 1.0``: ``(x + 1) - 1`` is not
+        # ``x`` when the two straddle a binade, and the point of the
+        # ``residual_restored`` assertion is that the body left the window,
+        # not that floating-point addition is associative.
+        rows = np.asarray(self._acs.linear_data_arr[0]).reshape(
+            self._acs.acs_total_entries, -1)
+        saved = np.array(rows[int(walker_ref)], copy=True)
+        rows[int(walker_ref)] += 1.0
+        self._gb_free_n_live = 7
+        self._gb_free_opened = True
+        try:
+            yield
+        finally:
+            rows[int(walker_ref)] = saved
+
+
+class RefRowReplicationTest(unittest.TestCase):
+    """Spec verification 1(a): every rank gets the OWNER's windowed row."""
+
+    def _run(self, n_compute, owner_rank_index, local_index):
+        from lisatools.globalfit.communication import ranks as R
+        from lisatools.globalfit.communication.fakecomm import FakeWorld
+        from lisatools.globalfit.communication.fanout import (
+            ComputeService,
+            WalkerFanout,
+        )
+        from tests.test_fstat_ref_row_holder import _FakeParent
+
+        world = FakeWorld(n_compute + 1, timeout=20.0)
+        B = 2
+
+        def body(rank, comm):
+            with warnings.catch_warnings():
+                # n_compute == 1 is a `-n 2` launch on a one-device pool:
+                # the size-2 saver fallback warns, and that is not this
+                # test's subject.
+                warnings.simplefilter("ignore", UserWarning)
+                layout = R.build_layout(comm, B * n_compute,
+                                        list(range(n_compute)))
+            # ``make_fanout_comm`` is a COLLECTIVE ``Split``: every rank of
+            # the world must enter it, the saver included, or the compute
+            # ranks block in it forever.
+            fcomm = layout.make_fanout_comm(comm)
+            if rank not in layout.compute_ranks:
+                return None
+            acs = _FakeParent(B, 6, 9)
+            # make every rank's buffers DIFFERENT so a missing broadcast
+            # cannot pass by coincidence
+            acs.linear_data_arr[0] += 100.0 * layout.fanout_rank(rank)
+            acs.linear_psd_arr[0] += 100.0 * layout.fanout_rank(rank)
+            before = np.array(acs.linear_data_arr[0], copy=True)
+            fanout = WalkerFanout(fcomm, layout, rank, model=None)
+            stub = _RefRowRankStub(fanout, acs)
+            owner_rank = layout.compute_ranks[owner_rank_index]
+            w_global = layout.block_of(owner_rank)[0] + local_index
+            if rank == layout.head_rank:
+                # ``gb_free`` is what the HEAD asked for, and this bare
+                # ``fanout.run`` ships no branch -- so ``False`` is the
+                # honest value and the owner's "asked for a window, got no
+                # branch" WARNING is not provoked.
+                try:
+                    fanout.run(
+                        "gb_fstat_ref_row", move="gb_pe",
+                        per_rank_payload=lambda r, w0, w1:
+                            stub._fstat_ref_row_payload(
+                                w_global, owner_rank, local_index, False),
+                        local_body=lambda p, _m: stub.gf_serve(
+                            "gb_fstat_ref_row", p, fanout.clock, None),
+                        merge=lambda r: r)
+                finally:
+                    # WITHOUT the finally a head-side failure leaves every
+                    # worker parked in ``serve()`` and the whole world dies
+                    # on the timeout instead of reporting the real error.
+                    fanout.stop()
+            else:
+                service = ComputeService(fcomm, layout, rank,
+                                         registry={"gb_pe": stub}, model=None)
+                service.serve()
+            after = np.asarray(acs.linear_data_arr[0])
+            return {
+                "data_row": np.asarray(
+                    stub._fstat_ref_holder.linear_data_arr[0]).copy(),
+                "psd_row": np.asarray(
+                    stub._fstat_ref_holder.linear_psd_arr[0]).copy(),
+                "walker_ref": stub._fstat_ref_walker,
+                "residual_restored": np.array_equal(before, after),
+                "expected": (
+                    np.asarray(before).reshape(B, -1)[local_index] + 1.0
+                    if rank == owner_rank else None),
+                "expected_psd": (
+                    np.asarray(acs.linear_psd_arr[0]).reshape(B, -1)[local_index]
+                    if rank == owner_rank else None),
+            }
+
+        return world.run(body)
+
+    def test_every_rank_holds_the_owners_windowed_row(self):
+        for n_compute, owner_idx, local in ((2, 1, 0), (2, 0, 1), (3, 2, 1)):
+            with self.subTest(n_compute=n_compute, owner=owner_idx):
+                out = {r: v for r, v in self._run(n_compute, owner_idx, local).items()
+                       if v is not None}
+                self.assertEqual(len(out), n_compute)
+                expected = next(v["expected"] for v in out.values()
+                                if v["expected"] is not None)
+                expected_psd = next(v["expected_psd"] for v in out.values()
+                                    if v["expected_psd"] is not None)
+                for rank, v in out.items():
+                    np.testing.assert_array_equal(
+                        v["data_row"], expected,
+                        f"rank {rank} did not receive the owner's row")
+                    np.testing.assert_array_equal(
+                        v["psd_row"], expected_psd,
+                        f"rank {rank} did not receive the owner's invC row")
+                    self.assertTrue(v["residual_restored"],
+                                    f"rank {rank}'s live residual was left mutated")
+                self.assertEqual(
+                    len({v["walker_ref"] for v in out.values()}), 1,
+                    "every rank must record the same GLOBAL reference walker")
+
+    def test_single_compute_rank_needs_no_collective(self):
+        out = {r: v for r, v in self._run(1, 0, 1).items() if v is not None}
+        self.assertEqual(len(out), 1)
+        v = next(iter(out.values()))
+        np.testing.assert_array_equal(v["data_row"], v["expected"])
+        self.assertTrue(v["residual_restored"])
+
+
+class ParallelStageBGateTest(unittest.TestCase):
+    """THE acceptance gate: 2 (and 3) ranks == 1 rank, byte for byte."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def _fanout_run(self, n_compute, tmpdir, *, grouped=True):
+        """Run the grouped stage B over ``n_compute`` FakeWorld ranks."""
+        from lisatools.globalfit.communication import ranks as R
+        from lisatools.globalfit.communication.fakecomm import FakeWorld
+        from lisatools.globalfit.communication.fanout import (
+            ComputeService,
+            WalkerFanout,
+        )
+
+        world = FakeWorld(n_compute + 1, timeout=300.0)
+
+        def body(rank, comm):
+            layout = R.build_layout(comm, 2 * n_compute, list(range(n_compute)))
+            # a COLLECTIVE ``Split``: every rank enters it, saver included
+            fcomm = layout.make_fanout_comm(comm)
+            if rank not in layout.compute_ranks:
+                return None
+            fanout = WalkerFanout(fcomm, layout, rank, model=None)
+            stub = _StageBRankStub(fanout, rank=rank)
+            if rank != layout.head_rank:
+                ComputeService(fcomm, layout, rank,
+                               registry={None: stub, "gb_pe": stub},
+                               model=None).serve()
+                return None
+            # The scorer the runner's guard compares against must BE the
+            # rank's cached holder-scored call: built here through the
+            # production chokepoint, exactly as ``_run_fstat_fit`` builds it
+            # before entering ``run_fstat_grid_fit``.
+            call_fstat = stub._fstat_holder_call(None)
+            try:
+                return run_golden(tmpdir, grouped=grouped,
+                                  call_fstat=call_fstat,
+                                  sweep_runner=stub._fstat_stage_b_runner(None))
+            finally:
+                fanout.stop()
+
+        return next(v for v in world.run(body).values() if v is not None)
+
+    def test_two_ranks_are_bit_identical_to_the_serial_fit(self):
+        got = self._fanout_run(2, self.d, grouped=True)
+        assert_npz_identical(self, got, GOLDEN_GROUPED)
+
+    def test_three_ranks_are_bit_identical_too(self):
+        got = self._fanout_run(3, self.d, grouped=True)
+        assert_npz_identical(self, got, GOLDEN_GROUPED)
+
+    def test_single_group_split_is_bit_identical(self):
+        got = self._fanout_run(2, self.d, grouped=False)
+        assert_npz_identical(self, got, GOLDEN_SINGLE)
+
+    def test_partials_are_deleted_after_assembly(self):
+        self._fanout_run(2, self.d, grouped=True)
+        parts = os.path.join(self.d, "fstat_grid_parts")
+        leftovers = [f for f in os.listdir(parts) if f.endswith(".npy")] \
+            if os.path.isdir(parts) else []
+        self.assertEqual(leftovers, [], f"stage-B partials left behind: {leftovers}")
+
+    def _flaky_group(self, gi, rank_suffix):
+        return _kill_stage_b_once(rank_suffix, gi=gi)
+
+    def test_resume_with_the_same_rank_count_reuses_the_checkpoints(self):
+        """A rank that dies mid-sweep resumes from its own progress file.
+
+        Group 0 finishes on BOTH ranks before rank 1 dies in group 1, so the
+        rerun has real completed work to reuse -- ``ckpt_clear`` only runs
+        at the end of a whole successful stage B, which is exactly what did
+        not happen here.
+        """
+        patch, fired = self._flaky_group(1, "_r1")
+        with patch:
+            with self.assertRaises(Exception):
+                self._fanout_run(2, self.d, grouped=True)
+        self.assertTrue(fired.is_set(), "the simulated death never fired")
+        # the progress files from the surviving sweeps must still be there
+        parts = os.path.join(self.d, "fstat_grid_parts")
+        progress = [f for f in os.listdir(parts) if f.endswith(".progress.npz")]
+        self.assertTrue(progress, "per-rank checkpoints must survive a death")
+        self.assertTrue(any("_r" in f for f in progress),
+                        f"checkpoints must be per rank, got {progress}")
+        with self.assertLogs(G.logger, level="INFO") as captured:
+            got = self._fanout_run(2, self.d, grouped=True)
+        self.assertTrue(
+            any("[ckpt] resuming" in m for m in captured.output),
+            "the same rank count must RESUME the per-rank checkpoints, not "
+            "silently redo them")
+        assert_npz_identical(self, got, GOLDEN_GROUPED)
+
+    def test_a_different_rank_count_restarts_the_stale_checkpoints(self):
+        """Spec verification 1(b), second half: a changed ``n_compute``.
+
+        The per-rank checkpoint FINGERPRINT hashes the SLICED inputs and
+        ``node_shape``, so a different split makes every surviving progress
+        file invalid -- and the fit must say so and recompute, never stitch
+        a 2-way slice's rows into a 3-way one.
+        """
+        patch, fired = self._flaky_group(1, "_r1")
+        with patch:
+            with self.assertRaises(Exception):
+                self._fanout_run(2, self.d, grouped=True)
+        self.assertTrue(fired.is_set())
+        with self.assertLogs(G.logger, level="INFO") as captured:
+            got = self._fanout_run(3, self.d, grouped=True)
+        self.assertTrue(
+            any("restarting this sweep" in m for m in captured.output),
+            "a 2-rank checkpoint must be refused by a 3-rank sweep")
+        assert_npz_identical(self, got, GOLDEN_GROUPED)
+
+    def test_a_different_rank_count_on_a_clean_tree_is_identical_too(self):
+        self._fanout_run(2, self.d, grouped=True)
+        os.remove(os.path.join(self.d, "fstat_grid_peaks_stacked.npz"))
+        got = self._fanout_run(3, self.d, grouped=True)
+        assert_npz_identical(self, got, GOLDEN_GROUPED)
+
+    def test_the_workers_go_through_the_real_dispatcher(self):
+        """Not a stub ``gf_serve``: the command is dispatched by the
+        production one, past ``_require_fstat_grid_move``, on every rank."""
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        self.assertIn("gb_fstat_stage_b", gbs._FSTAT_OP_REQUIRES)
+        stub = _StageBRankStub(None)
+        stub._fstat_call = None            # a GB move that cannot fit a grid
+        with self.assertRaises(ValueError) as ctx:
+            stub.gf_serve("gb_fstat_stage_b", {}, {}, None)
+        self.assertIn("_fstat_call", str(ctx.exception))
+
+
+# -------------------------------------------------------------------------
+# The WHOLE epoch fit over a FakeWorld: ``_run_fstat_fit`` end to end.
+#
+# The stage-B gate above pins the SPLIT. This arm pins the FIT: the global
+# reference, the replicated row (including a WORKER-owned reference walker
+# and the block-sliced branch that reaches its GB-free window), the real
+# ``run_fstat_grid_fit`` on top of the split, the manifest, and the release.
+# -------------------------------------------------------------------------
+
+#: 6 sub-bands spanning BOTH of the fixture's amplitude bumps (9.0 and
+#: 15.0 mHz), so the comb finds more than one peak box and
+#: ``split_box_range`` has something to split -- while a 0.02 mHz comb over
+#: 10 mHz keeps stage A (head-only, real) at milliseconds.
+EPOCH_BAND_EDGES = np.linspace(7.0e-3, 17.0e-3, 7)
+
+
+@contextlib.contextmanager
+def epoch_fit_env(**overrides):
+    """Pin every knob the WHOLE fit reads (stage A included).
+
+    Set by the test, OUTSIDE the ``FakeWorld``: ``os.environ`` is process
+    global and every rank is a thread of this process, so a rank that read
+    it while the head was still setting it would sweep a different grid.
+    """
+    env = {
+        "FSTAT_BATCH": "512",
+        "FSTAT_CKPT_SECS": "0",
+        "FSTAT_F0_SPACING_MHZ": "0.02",
+        "FSTAT_COMB_NSKY": "2",
+        "FSTAT_PEAK_MIN_F": "10",
+        "FSTAT_PEAKS_PER_BAND": "2",
+        "FSTAT_N_MC": "2",
+        "FSTAT_N_ALPHA": "2",
+        "FSTAT_N_SINDELTA": "2",
+        "FSTAT_PEAK_HALF_MHZ": "0.05",
+        "FSTAT_FDOT_AXIS": "0",
+        "FSTAT_MC_GROUPING": "1",
+        "FSTAT_PEAK_WEIGHTING": "fstat",
+        "FSTAT_GRID_MEM_MB": "",
+        "FSTAT_PEAKS_TO_FIT": "",
+        "FSTAT_MC_MIN": "",
+        "FSTAT_MC_ETA": "",
+        "FSTAT_N_F0": "",
+        "FSTAT_N_PER_AXIS": "",
+        "GB_FSTAT_GB_FREE": "1",
+        "GB_FSTAT_CTR_MODE": "epoch",
+    }
+    env.update({k: str(v) for k, v in overrides.items()})
+    old = {k: os.environ.get(k) for k in env}
+    try:
+        for k, v in env.items():
+            if v == "":
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _epoch_global_state(nwalkers, drow=6, prow=9, seed=17):
+    """``(residual rows, invC rows, lnL)`` for the WHOLE ensemble.
+
+    ``lls`` ascends, so the global argmax is the LAST walker -- under a real
+    fan-out that walker is owned by a WORKER, which is the case the design
+    exists for (the head ships the owner a block-sliced branch and the
+    ``Bcast`` root is not the head).
+    """
+    rng = np.random.default_rng(seed)
+    return (rng.normal(size=(int(nwalkers), int(drow))),
+            rng.normal(size=(int(nwalkers), int(prow))),
+            np.arange(int(nwalkers), dtype=float))
+
+
+def _epoch_branches(nwalkers, seed=5):
+    from eryn.state import Branch
+
+    rng = np.random.default_rng(seed)
+    coords = rng.normal(size=(2, int(nwalkers), 2, 9))
+    inds = rng.random((2, int(nwalkers), 2)) > 0.3
+    return {"gb": Branch(coords, inds=inds)}
+
+
+class _EpochAcs:
+    """Flat per-walker residual + inverse-PSD buffers; this rank's block."""
+
+    gpus = None
+    device = None
+    nchannels = 3
+    shape_sens = (3, 3)
+    psd_row_index = None
+
+    def __init__(self, rows_d, rows_p, lls, offset=0.0):
+        self.acs_total_entries = int(np.shape(rows_d)[0])
+        self.linear_data_arr = [np.ascontiguousarray(
+            np.asarray(rows_d, dtype=float).reshape(-1) + float(offset))]
+        self.linear_psd_arr = [np.ascontiguousarray(
+            np.asarray(rows_p, dtype=float).reshape(-1) + float(offset))]
+        self._lls = np.asarray(lls, dtype=float)
+
+    @property
+    def xp(self):
+        return np
+
+    def likelihood(self, complex=False):
+        return self._lls
+
+
+class _EpochModel:
+    def __init__(self, acs):
+        self.analysis_container_arr = acs
+
+
+class _EpochFitRankStub:
+    """A stand-in move exposing the WHOLE epoch-fit surface, head and rank.
+
+    Everything on the class body is BORROWED from production: the head's
+    ``_run_fstat_fit`` and ``_install_ctr_table``, the global-reference
+    gather, the reference-row driver and its served body, the stage-B runner
+    and its served body, the release driver and its served body,
+    ``gf_serve`` with its ``_require_fstat_grid_move`` guard, and
+    ``_fanout_cmd``. ``run_fstat_grid_fit`` underneath is the real one too,
+    comb scan and all.
+
+    The stubs are exactly the GPU-bound halves: ``_bind_rank_acs`` (a flat
+    numpy stand-in ACA), ``_gb_free_residual`` (a +1.0 window that restores
+    by assignment and RECORDS the branch column it was given), and
+    ``_fstat_call`` -- the analytic fixture scorer KEYED BY THE ROW it is
+    handed (:func:`_row_keyed_call_fstat`). That keying is what makes "every
+    rank scored the OWNER's replicated row" a byte-level assertion: a rank
+    that scored its own residual instead produces a different grid, and the
+    bit-identity gate fails.
+    """
+
+    from lisatools.globalfit.moves.gbspecialstretch import (
+        GBSpecialBase as _B,
+        GBSpecialRJFStatGridMove as _G,
+    )
+
+    _run_fstat_fit = _G._run_fstat_fit
+    _install_ctr_table = _G._install_ctr_table
+    _fstat_ctr_mode = staticmethod(_G._fstat_ctr_mode)
+    _fstat_ctr_smear = _G._fstat_ctr_smear
+    _CTR_TABLE_DEVICE_FIELDS = _G._CTR_TABLE_DEVICE_FIELDS
+    _fstat_global_reference = _B._fstat_global_reference
+    _fstat_ref_row_payload = staticmethod(_B._fstat_ref_row_payload)
+    _fstat_ref_shard = staticmethod(_B._fstat_ref_shard)
+    _fstat_ref_branch_slice = _B._fstat_ref_branch_slice
+    _fstat_ref_branch_from_payload = _B._fstat_ref_branch_from_payload
+    _gb_serve_fstat_ref_row = _B._gb_serve_fstat_ref_row
+    _fstat_ref_row_fanout = _B._fstat_ref_row_fanout
+    _warn_if_gb_free_missed = _B._warn_if_gb_free_missed
+    _fstat_holder_call = _B._fstat_holder_call
+    _fstat_stage_b_payload = staticmethod(_B._fstat_stage_b_payload)
+    _fstat_stage_b_spec = staticmethod(_B._fstat_stage_b_spec)
+    _gb_serve_fstat_stage_b = _B._gb_serve_fstat_stage_b
+    _fstat_stage_b_runner = _B._fstat_stage_b_runner
+    _gb_serve_fstat_release = _B._gb_serve_fstat_release
+    _fstat_release_ref_row = _B._fstat_release_ref_row
+    _fstat_release_fanout = _B._fstat_release_fanout
+    _require_fstat_grid_move = _B._require_fstat_grid_move
+    _fanout_cmd = _B._fanout_cmd
+    _gb_session_token = staticmethod(_B._gb_session_token)
+    _rank_tag = _B._rank_tag
+    fanout_active = _B.fanout_active
+    name = "gb_stub"
+    gf_move_name = "gb_pe"
+    branch_name = "gb"
+    num_proposals = 0
+
+    def __init__(self, fanout, acs, cache_root, *, rank=None):
+        self.fanout = fanout
+        self._acs = acs
+        self.cache_root = cache_root
+        self.gf_rank = rank
+        self.mempool = _CountingMempool()
+        self.ops_served = []
+        self.window_log = []
+        self.held_after_ref_row = None
+        self.nwalkers = None
+        self.ntemps = None
+        self._prop_timer = None
+        self._fstat_ctr_table = None
+        self._fstat_ref_holder = None
+        self._fstat_ref_call = None
+        self._fstat_ref_walker = None
+        self._fstat_ref_branches = None
+        self.band_edges = EPOCH_BAND_EDGES
+        self.df = 1.0 / TOBS
+        self.fstat_fit_kwargs = {"mc_lims": [0.01, 1.0]}
+
+    @property
+    def xp(self):
+        return np
+
+    def _epoch_dir(self, k):
+        return os.path.join(self.cache_root, f"epoch_{int(k):04d}")
+
+    def _fstat_clock(self):
+        return 0
+
+    def _bind_rank_acs(self, model):
+        return self._acs
+
+    def _fstat_reference_walker(self, model):
+        return int(np.argmax(np.asarray(self._acs.likelihood())))
+
+    def _fstat_call(self, model, walker_ref, *, holder=None):
+        if holder is None:
+            raise AssertionError(
+                "the epoch scorer must be built from the replicated row")
+        return _row_keyed_call_fstat(holder.linear_data_arr[0])
+
+    @contextlib.contextmanager
+    def _gb_free_residual(self, model, branches, walker_ref):
+        branch = None if not branches else branches.get(self.branch_name)
+        self.window_log.append({
+            "walker": int(walker_ref),
+            "coords": (None if branch is None else np.array(
+                np.asarray(branch.coords)[0, int(walker_ref)], copy=True)),
+        })
+        rows = np.asarray(self._acs.linear_data_arr[0]).reshape(
+            self._acs.acs_total_entries, -1)
+        saved = np.array(rows[int(walker_ref)], copy=True)
+        rows[int(walker_ref)] += 1.0
+        self._gb_free_n_live = 3
+        self._gb_free_opened = True
+        try:
+            yield
+        finally:
+            rows[int(walker_ref)] = saved
+
+    def gf_serve(self, op, payload, clock, model):
+        """Record the op, then run the PRODUCTION dispatcher unchanged."""
+        self.ops_served.append(op)
+        out = self._B.gf_serve(self, op, payload, clock, model)
+        if op == "gb_fstat_ref_row":
+            self.held_after_ref_row = self._fstat_ref_holder is not None
+        return out
+
+
+def run_epoch_fit_world(n_compute, nwalkers, cache_root, *, epoch=0,
+                        after_fit=None):
+    """One whole ``_run_fstat_fit`` over ``n_compute`` FakeWorld ranks.
+
+    Returns ``{world rank: dict}``. ``after_fit(move, model, branches)`` runs
+    on the HEAD after the fit and before the fan-out is stopped, so a follow
+    on head-side command (the centre table's fallback) still has its ranks.
+    """
+    from lisatools.globalfit.communication import ranks as R
+    from lisatools.globalfit.communication.fakecomm import FakeWorld
+    from lisatools.globalfit.communication.fanout import (
+        LIKELIHOOD_OP,
+        ComputeService,
+        WalkerFanout,
+    )
+
+    world = FakeWorld(n_compute + 1 if n_compute > 1 else 1, timeout=300.0)
+    rows_d, rows_p, lls = _epoch_global_state(nwalkers)
+    branches = _epoch_branches(nwalkers)
+
+    def body(rank, comm):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            layout = R.build_layout(comm, nwalkers, list(range(n_compute)))
+        fcomm = layout.make_fanout_comm(comm)
+        if rank not in layout.compute_ranks:
+            return None
+        w0, w1 = layout.block_of(rank)
+        ri = layout.fanout_rank(rank)
+        # REPLICA MODE: every rank holds the same single walker, so a rank
+        # that scored its OWN residual instead of the broadcast one would be
+        # invisible. Offsetting the replicas' buffers is what makes the
+        # bit-identity gate detect it (production replicas do hold equal
+        # residuals; this is the deliberate negative control).
+        acs = _EpochAcs(rows_d[w0:w1], rows_p[w0:w1], lls[w0:w1],
+                        offset=(100.0 * ri if layout.replica_mode else 0.0))
+        fanout = WalkerFanout(fcomm, layout, rank, model=None)
+        move = _EpochFitRankStub(fanout, acs, cache_root, rank=rank)
+        model = _EpochModel(acs)
+        facts = {
+            "replica_mode": bool(layout.replica_mode),
+            "n_replicas": int(layout.n_replicas),
+            "n_compute": int(layout.n_compute),
+            "block": layout.block_of(rank),
+        }
+        if rank != layout.head_rank:
+            ComputeService(
+                fcomm, layout, rank, registry={None: move, "gb_pe": move},
+                model=model,
+                builtins={LIKELIHOOD_OP: (
+                    lambda p, c, m, _a=acs: np.asarray(
+                        _a.likelihood(complex=False)))},
+            ).serve()
+            return dict(facts, role="worker", ops=list(move.ops_served),
+                        held_after_ref_row=move.held_after_ref_row,
+                        holder=move._fstat_ref_holder,
+                        call=move._fstat_ref_call,
+                        walker=move._fstat_ref_walker,
+                        window=list(move.window_log))
+        try:
+            _stacked, n_peaks = move._run_fstat_fit(model, epoch, branches)
+            held = move._fstat_ref_holder is not None
+            extra = (None if after_fit is None
+                     else after_fit(move, model, branches))
+        finally:
+            fanout.stop()
+        # setup()'s own ``finally``, which is what finally drops the head's
+        cache_dir = move._epoch_dir(epoch)
+        move._fstat_release_ref_row()
+        with open(os.path.join(cache_dir, "DONE.json")) as f:
+            manifest = json.load(f)
+        return dict(facts, role="head", n_peaks=int(n_peaks),
+                    path=G.stacked_grid_path(cache_dir), manifest=manifest,
+                    owner_of_argmax=layout.owner_of(int(np.argmax(lls))),
+                    head_rank=int(layout.head_rank),
+                    holder_after_fit=held,
+                    holder_after_release=move._fstat_ref_holder,
+                    ops=list(move.ops_served), extra=extra,
+                    window=list(move.window_log))
+
+    return world.run(body)
+
+
+class EpochFitGateTest(unittest.TestCase):
+    """The whole fit: N compute ranks == 1, byte for byte, plus the manifest."""
+
+    def setUp(self):
+        self.a = tempfile.mkdtemp()
+        self.b = tempfile.mkdtemp()
+
+    def tearDown(self):
+        for d in (self.a, self.b):
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_two_walker_blocks_match_the_one_rank_fit(self):
+        """Spec verification 1(a) + (c) at the level of the WHOLE fit.
+
+        The global argmax is the LAST walker, which a 2-rank layout puts on
+        the WORKER -- so this is the path where the head ships a block-sliced
+        branch to a rank that has none, the owner opens the GB-free window
+        there, and the ``Bcast`` root is not the head. The 1-rank arm reaches
+        the same walker through its own ACA with no wire at all.
+        """
+        with epoch_fit_env():
+            serial = run_epoch_fit_world(1, 4, self.a)
+            parallel = run_epoch_fit_world(2, 4, self.b)
+        s_head = next(v for v in serial.values() if v and v["role"] == "head")
+        p_head = next(v for v in parallel.values() if v and v["role"] == "head")
+        self.assertGreaterEqual(
+            s_head["n_peaks"], 2,
+            "the fixture must produce more than one peak box, or "
+            "split_box_range has nothing to split and the gate is vacuous")
+        assert_npz_identical(self, p_head["path"], s_head["path"])
+        self.assertEqual(s_head["manifest"]["walker_ref"], 3)
+        self.assertEqual(p_head["manifest"]["walker_ref"], 3)
+        self.assertEqual(s_head["manifest"]["n_compute"], 1)
+        self.assertEqual(p_head["manifest"]["n_compute"], 2)
+        # the reference walker's owner is a WORKER, and the window opened
+        # there on the shipped slice -- at the OWNER's LOCAL row
+        self.assertNotEqual(p_head["owner_of_argmax"][0], p_head["head_rank"])
+        worker = next(v for v in parallel.values()
+                      if v and v["role"] == "worker" and v["window"])
+        self.assertEqual(len(worker["window"]), 1)
+        self.assertEqual(worker["window"][0]["walker"],
+                         p_head["owner_of_argmax"][1])
+        # ... and it is the SAME branch column the serial fit's window saw
+        np.testing.assert_array_equal(worker["window"][0]["coords"],
+                                      s_head["window"][0]["coords"])
+        # the head opened no window of its own under the fan-out
+        self.assertEqual(p_head["window"], [])
+
+    def test_the_workers_are_released_and_the_head_keeps_its_row(self):
+        with epoch_fit_env():
+            out = run_epoch_fit_world(2, 4, self.b)
+        head = next(v for v in out.values() if v and v["role"] == "head")
+        workers = [v for v in out.values() if v and v["role"] == "worker"]
+        self.assertTrue(workers)
+        for w in workers:
+            self.assertEqual(w["ops"][0], "gb_fstat_ref_row")
+            self.assertEqual(w["ops"][-1], "gb_fstat_release")
+            self.assertTrue(w["held_after_ref_row"],
+                            "the worker never built a holder")
+            self.assertIsNone(w["holder"], "a worker kept its reference row")
+            self.assertIsNone(w["call"], "a worker kept its sig-het scorer")
+        # the head's own survives the fit (the centre table still needs it)
+        # and goes only at the setup()-level release
+        self.assertTrue(head["holder_after_fit"])
+        self.assertIsNone(head["holder_after_release"])
+
+    @staticmethod
+    def _walker_zero_reference():
+        """Pretend the global argmax moved to walker 0 across the restart."""
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        real_ref = gbs.GBSpecialBase._fstat_global_reference
+
+        def moved(self_, model):
+            _w, _o, _l, lls = real_ref(self_, model)
+            fan = getattr(self_, "fanout", None)
+            owner, local = (0, 0) if fan is None else fan.layout.owner_of(0)
+            return 0, int(owner), int(local), lls
+
+        return mock.patch.object(
+            _EpochFitRankStub, "_fstat_global_reference", moved)
+
+    def _die_mid_fit(self, cache_root):
+        """Leave a half-finished epoch behind: surviving per-rank checkpoints."""
+        patch, fired = _kill_stage_b_once("_r1")
+        with patch:
+            with self.assertRaises(Exception):
+                run_epoch_fit_world(2, 4, cache_root)
+        self.assertTrue(fired.is_set(), "the simulated death never fired")
+        parts = os.path.join(cache_root, "epoch_0000", "fstat_grid_parts")
+        progress = [f for f in os.listdir(parts)
+                    if f.endswith(".progress.npz")]
+        self.assertTrue(progress, "no per-rank checkpoint survived the death")
+        return progress
+
+    def test_the_same_reference_walker_resumes_its_checkpoints(self):
+        with epoch_fit_env():
+            self._die_mid_fit(self.a)
+            with self.assertLogs(G.logger, level="INFO") as captured:
+                out = run_epoch_fit_world(2, 4, self.a)
+        head = next(v for v in out.values() if v and v["role"] == "head")
+        self.assertEqual(head["manifest"]["walker_ref"], 3)
+        self.assertTrue(
+            any("[ckpt] resuming" in m for m in captured.output),
+            "an unchanged reference must RESUME the surviving checkpoints")
+        self.assertFalse(
+            any("restarting this sweep" in m for m in captured.output),
+            "an unchanged reference must not invalidate its own cache")
+
+    def test_a_different_reference_walker_restarts_the_sweep(self):
+        """Task 9 concern 5: ``walker_ref`` is part of the cache fingerprint.
+
+        A restart of the SAME epoch whose global argmax has MOVED must not
+        reuse the earlier walker's stage-B checkpoints -- those rows were
+        scored against a different residual, and stitching them into the new
+        walker's grid is silent. Under the walker-block layout the global
+        argmax is exactly the volatile quantity, which is why this is
+        enforced and not merely recorded in ``DONE.json``.
+        """
+        with epoch_fit_env():
+            self._die_mid_fit(self.b)
+            with self._walker_zero_reference():
+                with self.assertLogs(G.logger, level="INFO") as captured:
+                    out = run_epoch_fit_world(2, 4, self.b)
+        head = next(v for v in out.values() if v and v["role"] == "head")
+        self.assertEqual(head["manifest"]["walker_ref"], 0)
+        self.assertTrue(
+            any("restarting this sweep" in m for m in captured.output),
+            "a CHANGED reference walker must invalidate the epoch's "
+            "checkpoints -- otherwise the new walker's grid is stitched "
+            "out of the old walker's rows")
+        self.assertFalse(
+            any("[ckpt] resuming" in m for m in captured.output),
+            "nothing of the old walker's sweep may be reused")
+
+    def test_the_fingerprint_names_the_reference_walker(self):
+        import inspect
+
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        src = inspect.getsource(gbs.GBSpecialRJFStatGridMove._run_fstat_fit)
+        self.assertIn("wref={w_global}", src)
+
+
+class ReplicaModeEpochFitTest(unittest.TestCase):
+    """One-walker replica mode (dev's ``GF_ONE_WALKER_REPLICAS``).
+
+    ``nwalkers == 1`` on several compute ranks: every rank's block is
+    ``(0, 1)``, ``owner_of(0)`` is the HEAD at local row 0, and the replicas
+    split stage B between them. The replicas' residual buffers are
+    deliberately made to DIFFER here, so a rank that scored its own row
+    instead of the broadcast one breaks the bit-identity gate.
+    """
+
+    def setUp(self):
+        self.a = tempfile.mkdtemp()
+        self.b = tempfile.mkdtemp()
+
+    def tearDown(self):
+        for d in (self.a, self.b):
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_two_replicas_are_bit_identical_to_the_one_rank_fit(self):
+        with epoch_fit_env():
+            serial = run_epoch_fit_world(1, 1, self.a)
+            replicas = run_epoch_fit_world(2, 1, self.b)
+        s_head = next(v for v in serial.values() if v and v["role"] == "head")
+        r_head = next(v for v in replicas.values() if v and v["role"] == "head")
+
+        self.assertFalse(s_head["replica_mode"], "one rank is not replicated")
+        self.assertTrue(r_head["replica_mode"])
+        self.assertEqual(r_head["n_replicas"], 2)
+        for v in replicas.values():
+            if v:
+                self.assertEqual(v["block"], (0, 1))
+        # the owner of the single walker is the HEAD, at local row 0
+        self.assertEqual(r_head["owner_of_argmax"],
+                         (r_head["head_rank"], 0))
+
+        self.assertGreater(s_head["n_peaks"], 0)
+        assert_npz_identical(self, r_head["path"], s_head["path"])
+        self.assertEqual(r_head["manifest"]["walker_ref"], 0)
+        self.assertEqual(r_head["manifest"]["n_compute"], 2)
+        self.assertEqual(s_head["manifest"]["n_compute"], 1)
+
+        workers = [v for v in replicas.values() if v and v["role"] == "worker"]
+        self.assertEqual(len(workers), 1)
+        for w in workers:
+            self.assertTrue(w["held_after_ref_row"])
+            self.assertIsNone(w["holder"], "a replica kept its row")
+            self.assertIsNone(w["call"], "a replica kept its scorer")
+            self.assertEqual(w["window"], [],
+                             "only the OWNER opens the GB-free window")
+        self.assertTrue(r_head["holder_after_fit"])
+        self.assertIsNone(r_head["holder_after_release"])
+
+
+class CentreTableFallbackOverTheWireTest(unittest.TestCase):
+    """Task 9 concern 1, over a REAL fan-out.
+
+    ``_install_ctr_table``'s fallback -- a load/reuse decision meeting a
+    MISSING centre table -- replicates the reference row itself. Unit tests
+    pin the call and its arguments; this drives it over two FakeWorld ranks,
+    which is the shape that would HANG (a ``gb_fstat_ref_row`` from
+    ``setup()`` on a rank that is not parked in ``serve()``) if the wiring
+    were wrong.
+    """
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    def tearDown(self):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        gbs._FSTAT_CTR_TABLE_REGISTRY.pop(
+            os.path.join(self.d, "epoch_0000"), None)
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def test_the_fallback_scores_through_a_row_it_replicates_and_releases(self):
+        captured = {}
+        current = {}
+
+        def fake_build(call_fstat, **kw):
+            """Record WHAT the centre sweep was handed, and at which walker.
+
+            Object identity against ``_fstat_ref_call`` is the assertion
+            that matters (spec decision 6: literally the same scorer), and
+            it has to be taken HERE -- by the time ``_install_ctr_table``
+            returns, the fallback has already dropped both halves.
+            """
+            move = current["move"]
+            captured["is_ref_call"] = call_fstat is move._fstat_ref_call
+            captured["walker"] = move._fstat_ref_walker
+            captured["holder"] = move._fstat_ref_holder is not None
+            captured["cache_dir"] = kw.get("cache_dir")
+            return {name: np.zeros(2)
+                    for name in _EpochFitRankStub._CTR_TABLE_DEVICE_FIELDS}
+
+        def after_fit(move, model, branches):
+            """The SECOND fit call: npz complete, centre table still absent."""
+            current["move"] = move
+            move._fstat_release_ref_row()      # setup()'s own finally fired
+            move._run_fstat_fit(model, 0, branches)
+            holder_after_second_fit = move._fstat_ref_holder
+            before = len(move.ops_served)
+            with mock.patch.object(G, "build_fstat_center_table", fake_build):
+                move._install_ctr_table(0, model=model, branches=branches)
+            return {
+                "holder_after_second_fit": holder_after_second_fit,
+                "ctr_table": move._fstat_ctr_table is not None,
+                "holder_after": move._fstat_ref_holder,
+                "new_ops": move.ops_served[before:],
+                "captured": dict(captured),
+            }
+
+        with epoch_fit_env():
+            out = run_epoch_fit_world(2, 4, self.d, after_fit=after_fit)
+        head = next(v for v in out.values() if v and v["role"] == "head")
+        extra = head["extra"]
+        # the second fit found a complete npz: no row, no scorer, no release
+        self.assertIsNone(extra["holder_after_second_fit"],
+                          "a complete stage-B npz must cost no broadcast")
+        cap = extra["captured"]
+        self.assertTrue(cap, "the centres were never swept")
+        self.assertTrue(cap["holder"], "the fallback replicated no row")
+        self.assertTrue(cap["is_ref_call"],
+                        "the centres must be scored through THE holder call")
+        self.assertEqual(cap["walker"], 3,
+                         "the centres must score the fit's GLOBAL reference")
+        self.assertEqual(cap["cache_dir"], os.path.join(self.d, "epoch_0000"))
+        self.assertTrue(extra["ctr_table"])
+        # the row it took is put back on this rank ...
+        self.assertIsNone(extra["holder_after"])
+        # ... and the workers were told, over the wire, to drop theirs
+        self.assertEqual(extra["new_ops"],
+                         ["gb_fstat_ref_row", "gb_fstat_release"])
+        for v in out.values():
+            if v and v["role"] == "worker":
+                self.assertIsNone(v["holder"], "a worker kept the centre row")
+                self.assertIsNone(v["call"])
+                self.assertEqual(v["ops"][-2:],
+                                 ["gb_fstat_ref_row", "gb_fstat_release"])
 
 
 if __name__ == "__main__":

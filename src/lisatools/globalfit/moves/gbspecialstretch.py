@@ -22744,7 +22744,20 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             mc_lims=mc_lims,
             ratio_max=_gb_fdot_astro_ratio_max(self),
             cache_dir=cache_dir,
-            fingerprint_extra=f"|epoch={k}|gbfree={int(_gb_free)}",
+            # THE REFERENCE WALKER IS PART OF THE FINGERPRINT TOO, for the
+            # same reason ``gbfree`` is: it changes the RESIDUAL the sweep
+            # scores against and nothing else about the sweep's inputs.
+            # Under the walker-block layout the reference is the GLOBAL
+            # argmax, which moves more freely across a restart than the old
+            # head-local one did -- a job that died mid-fit and came back to
+            # a different best walker would otherwise resume the earlier
+            # walker's comb and per-rank stage-B checkpoints under an
+            # unchanged cache key, silently stitching two residuals' rows
+            # into one grid. With ``wref`` in the key those checkpoints are
+            # simply invalid and each sweep restarts cleanly.
+            # ``DONE.json``'s ``walker_ref`` stays the audit trail; this is
+            # the enforcement.
+            fingerprint_extra=f"|epoch={k}|gbfree={int(_gb_free)}|wref={w_global}",
             epoch=k,
             # ``fanout_active`` is exactly ``n_compute > 1`` (``single`` IS
             # ``n_compute == 1``), and the runner REFUSES to be built at one
