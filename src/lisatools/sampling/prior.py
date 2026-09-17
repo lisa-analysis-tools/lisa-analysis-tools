@@ -3,6 +3,7 @@
 import numpy as np
 from eryn.moves.multipletry import logsumexp
 from eryn.prior import ProbDistContainer
+from eryn.priors import UniformDistribution
 from scipy import stats
 
 from ..sensitivity import get_sensitivity
@@ -27,6 +28,101 @@ try:
 
 except (ModuleNotFoundError, ImportError) as e:
     pass
+
+
+class LogUniformLinear(UniformDistribution):
+    """Log-uniform prior that lives on the LINEAR column: ``p(x) = 1 / (x ln(max/min))``.
+
+    Why this exists (2026-09-16). Eryn's prior rewrite (eryn commit
+    ``20ff728``, 2026-07-05) redefined :class:`eryn.priors.analytical.LogUniform`
+    as a *sampling-space* distribution: it stores ``minimum = ln(min)`` /
+    ``maximum = ln(max)`` and its ``rvs`` / ``pdf`` / ``logpdf`` all work in
+    ``u = ln x``; the physical (linear) column is reached only through the
+    ``*_physical`` variants. :class:`~eryn.priors.probdist.ProbDistContainer`
+    calls the plain ``rvs`` / ``logpdf``, so a column spelled
+    ``log_uniform(a, b)`` is drawn and scored in ``ln`` units while every
+    consumer downstream still reads it as a linear value.
+
+    That silently broke the stock MBH mass-ratio column ``Q = m1/m2 >= 1``,
+    whose transform (:func:`lisatools.globalfit.stock.erebor.transforms.mT_Q`)
+    asserts ``m1 >= m2``: with ``log_uniform(1., 10.)`` the support became
+    ``[0, ln 10] = [0, 2.30]``, 43 % of prior draws (``Q < 1``) raised inside
+    the transform, and every ``Q`` in ``(2.30, 10]`` scored ``-inf``.
+
+    This class is the linear-column log-uniform those call sites always
+    meant: ``minimum`` / ``maximum`` / ``width`` report the PHYSICAL bounds
+    (so :func:`lisatools.globalfit.moves.eigen_refresh.prior_box_widths`
+    whitens the eigen tables with the real box width, 9.0 for ``Q``), ``rvs``
+    returns ``exp(U(ln min, ln max))`` in ``[min, max]``, and ``logpdf`` is
+    ``-ln x - ln(ln(max/min))`` inside the box, ``-inf`` outside.
+
+    Call sites:
+
+    * ``lisatools.globalfit.stock.erebor.mbh.MBHSetup.init_sampling_info``
+      (``"Q": LogUniformLinear(1.0, 10.0)``)
+    * ``lisatools.globalfit.stock.erebor.source_runtime.prepare_mbh_branch``
+      (same column)
+
+    Do NOT re-implement this by subclassing eryn's ``LogUniform``: its
+    ``minimum`` / ``maximum`` are the ln-space bounds, and the base
+    ``logpdf_physical`` calls ``self.logpdf`` (overriding ``logpdf`` there
+    would recurse through the forward transform).
+
+    Args:
+        minimum: Lower bound of the physical column; must be ``> 0``.
+        maximum: Upper bound of the physical column; must be ``> minimum``.
+        **kwargs: Forwarded to :class:`eryn.priors.analytical.UniformDistribution`
+            (``name``, ``use_cupy``, ``return_gpu``, ...).
+
+    Raises:
+        ValueError: If ``minimum <= 0`` or ``maximum <= minimum``.
+    """
+
+    def __init__(self, minimum: float, maximum: float, name: str | None = None, **kwargs):
+        minimum = float(minimum)
+        maximum = float(maximum)
+        kwargs["name"] = name  # keep the base's positional (minimum, maximum, name) order
+        if minimum <= 0:
+            raise ValueError(
+                f"LogUniformLinear minimum must be strictly positive (got {minimum})."
+            )
+        if maximum <= minimum:
+            raise ValueError(
+                f"LogUniformLinear maximum {maximum} must exceed minimum {minimum}."
+            )
+
+        # PHYSICAL bounds on purpose: ``minimum``/``maximum``/``width`` are the
+        # linear box. The uniform ``pdf_val``/``logpdf_val`` the base sets from
+        # them are unused here -- ``pdf``/``logpdf`` are overridden below.
+        super().__init__(minimum=minimum, maximum=maximum, **kwargs)
+
+        self._log_min = float(np.log(minimum))
+        self._log_max = float(np.log(maximum))
+        # ln of the normalization ln(max/min) = ln(ln max - ln min)
+        self._log_norm = float(np.log(self._log_max - self._log_min))
+
+    def _logpdf_raw(self, x):
+        """``logpdf`` without the host/device round trip (array module native)."""
+        x_arr = self.xp.asarray(x, dtype=self.xp.float64)
+        mask = (x_arr >= self.minimum) & (x_arr <= self.maximum)
+        # never take the log of a non-positive input: mask first, fill -inf
+        safe = self.xp.where(mask, x_arr, 1.0)
+        return self.xp.where(mask, -self.xp.log(safe) - self._log_norm, -self.xp.inf)
+
+    def rvs(self, size: int | tuple = (1,), **kwargs):
+        """Draw ``exp(U(ln min, ln max))`` -- values in ``[minimum, maximum]``."""
+        if isinstance(size, int):
+            size = (size,)
+        u = self.xp.random.uniform(self._log_min, self._log_max, size=size)
+        return self._to_device(self.xp.exp(u))
+
+    def logpdf(self, x, **kwargs):
+        """``-ln x - ln(ln(max/min))`` inside the box, ``-inf`` outside."""
+        return self._to_device(self._logpdf_raw(x))
+
+    def pdf(self, x, **kwargs):
+        """``exp(logpdf(x))`` -- ``1 / (x ln(max/min))`` inside the box, 0 outside."""
+        return self._to_device(self.xp.exp(self._logpdf_raw(x)))
 
 
 class EMRIKerrDomainPrior(ProbDistContainer):

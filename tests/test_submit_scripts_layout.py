@@ -35,6 +35,7 @@ SCRIPTS = [
 _DISPATCH_ENV_KEYS = (
     "SLURM_JOB_ID",
     "NGPUS",
+    "NODES",
     "GPUS_PER_RANK",
     "RANKS_PER_GPU",
     "GF_LEGACY_RANK_LAYOUT",
@@ -309,6 +310,41 @@ class SubmitScriptsDispatchTest(unittest.TestCase):
                 self.assertIn("--partition=gpu-80-spot", lines)
                 self.assertIn("--distribution=cyclic", lines)
                 self._assert_export_contains(lines, "GF_LEGACY_RANK_LAYOUT=0")
+
+    def test_nodes_knob_spreads_the_gpus_one_per_node(self):
+        # one-walker replica gates (user ruling 2026-09-16: test ACROSS nodes):
+        # NGPUS=2 NODES=2 -> 2 nodes x gpu:1, head + 1 compute + saver, cyclic
+        for script in SCRIPTS:
+            with self.subTest(script=script, nodes=2):
+                lines = self._run_dispatch(script, {"NGPUS": "2", "NODES": "2"})
+                self.assertIn("--nodes=2", lines)
+                self.assertIn("--gres=gpu:1", lines)
+                self.assertIn("--ntasks=3", lines)
+                self.assertIn("--distribution=cyclic", lines)
+                self._assert_export_contains(lines, "GF_LEGACY_RANK_LAYOUT=0")
+            with self.subTest(script=script, nodes=4):
+                lines = self._run_dispatch(script, {"NGPUS": "4", "NODES": "4"})
+                self.assertIn("--nodes=4", lines)
+                self.assertIn("--gres=gpu:1", lines)
+                self.assertIn("--ntasks=5", lines)
+                self.assertIn("--distribution=cyclic", lines)
+            with self.subTest(script=script, nodes="unset"):
+                # unset NODES = the NGPUS table, unchanged
+                lines = self._run_dispatch(script, {"NGPUS": "2"})
+                self.assertIn("--nodes=1", lines)
+                self.assertIn("--gres=gpu:2", lines)
+
+    def test_nodes_knob_must_divide_ngpus(self):
+        for script in SCRIPTS:
+            with self.subTest(script=script):
+                env = {k: v for k, v in os.environ.items() if k not in _DISPATCH_ENV_KEYS}
+                env["PATH"] = self.stub_dir + os.pathsep + env.get("PATH", "")
+                env.update({"NGPUS": "2", "NODES": "3"})
+                result = subprocess.run(
+                    ["bash", script], env=env, capture_output=True, text=True, timeout=60
+                )
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("must be >= 1 and divide NGPUS=2", result.stdout)
 
     def test_ngpus_2_explicit_walker_block(self):
         for script in SCRIPTS:

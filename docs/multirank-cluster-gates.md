@@ -477,11 +477,22 @@ export I_MPI_HYDRA_BOOTSTRAP=slurm I_MPI_FABRICS=shm:ofi FI_PROVIDER=tcp   # see
 export NWALKERS=1 DATA_MODE=synthetic NUM_ITERATIONS=4 MIDIT_CHECKPOINT=0 \
        MAKE_DIAGNOSTIC_PLOTS=0 GF_FANOUT_DIGEST=1 GF_LEGACY_RANK_LAYOUT=0
 
+# 1 node: head + 1 compute + saver on a 2-GPU node
 GF_LAYOUT_DRY_RUN=1 GPUS=0,1 mpiexec -n 3 -ppn 3 \
   python scripts/run_global.py --stock <name>
 # expect: "walker-block layout: ... nwalkers=1 block=1 ... REPLICAS" and every
 # compute rank printing "walkers=[0,1)"
+
+# 2 nodes (round-robin: head + saver on node A, the second replica on node B,
+# GPUS=0 pins each node's pool to one device so AUTO gpus_per_rank stays 1)
+GF_LAYOUT_DRY_RUN=1 GPUS=0 mpiexec -n 3 -ppn 1 \
+  python scripts/run_global.py --stock <name>
+# expect: the same header; rank 1 on the other node with devices=[0]; a rank
+# printing size=1 is the launcher singleton symptom (see "MPI launcher")
 ```
+(`tests/test_rank_layout.py::ReplicaModeTest` pins both placements — the
+3-rank round-robin and the NGPUS=4 five-rank cyclic one — on a fake world;
+the transport across nodes is only proven by Step B (c).)
 
 ### Step B — replica parity (three layouts, same seeds)
 

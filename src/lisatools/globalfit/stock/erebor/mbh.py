@@ -10,8 +10,9 @@ from typing import Any, Optional
 import numpy as np
 from eryn.moves import Move
 from eryn.moves.tempering import make_ladder
-from eryn.prior import ProbDistContainer, log_uniform, uniform_dist
+from eryn.prior import ProbDistContainer, uniform_dist
 
+from ....sampling.prior import LogUniformLinear
 from ...engine import Settings, Setup
 from ...hdfbackend import MBHHDFBackend
 from ...loginfo import init_logger
@@ -105,7 +106,10 @@ class MBHSetup(Setup):
         if self.priors is None:
             priors_mbh = {
                 "logM": uniform_dist(np.log(1e5), np.log(1e8)),
-                "Q": log_uniform(1., 10.),
+                # LINEAR-column log-uniform: the transform ``mT_Q`` reads Q as
+                # m1/m2 >= 1. eryn's ``log_uniform`` samples/scores in ln-space
+                # (support [0, 2.30] here) -- see LogUniformLinear's docstring.
+                "Q": LogUniformLinear(1.0, 10.0),
                 "s1z": uniform_dist(-0.99999999, +0.99999999),
                 "s2z": uniform_dist(-0.99999999, +0.99999999),
                 "dist": uniform_dist(1, 150.0), # uniform_dist(0.01, 1000.0),

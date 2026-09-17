@@ -448,6 +448,48 @@ class ReplicaModeTest(unittest.TestCase):
         for r in range(3):
             self.assertEqual(outs[r].digest(), lay.digest())
 
+    def test_one_walker_across_two_nodes_round_robin(self):
+        # campaign layout (c): `GPUS=0 mpiexec -n 3 -ppn 1` -- head + saver on
+        # node0, the second replica alone on node1 with that node's one-device
+        # pool (the runbook's GPUS=0 pin keeps AUTO gpus_per_rank at 1 there)
+        world = FakeWorld(3, nodes=[0, 1, 0])
+        outs = _layouts(world, 1, [0])
+        lay = outs[0]
+        self.assertTrue(lay.replica_mode)
+        self.assertEqual(lay.compute_ranks, (0, 1))
+        self.assertEqual(lay.saver_rank, 2)
+        self.assertEqual(lay.n_replicas, 2)
+        self.assertEqual([lay.block_of(r) for r in lay.compute_ranks], [(0, 1), (0, 1)])
+        self.assertEqual([lay.replica_index(r) for r in lay.compute_ranks], [0, 1])
+        self.assertEqual((lay.placements[0].node, lay.placements[1].node), ("node0", "node1"))
+        self.assertEqual(lay.placements[0].devices, (0,))
+        self.assertEqual(lay.placements[1].devices, (0,))
+        self.assertEqual(lay.placements[1].local_index, 0)  # first process on its node
+        self.assertEqual(lay.ranks_on_device("node0", 0), (0,))
+        self.assertEqual(lay.ranks_on_device("node1", 0), (1,))
+        self.assertIn("REPLICAS", lay.describe())
+        for r in range(3):
+            self.assertEqual(outs[r].describe(), lay.describe())
+            self.assertEqual(outs[r].digest(), lay.digest())
+
+    def test_one_walker_four_replicas_on_two_nodes(self):
+        # the NGPUS=4 dispatch: 2 nodes x 2 GPUs, cyclic placement, rank 4 = saver
+        world = FakeWorld(5, nodes=[0, 1, 0, 1, 0])
+        outs = _layouts(world, 1, [0, 1])
+        lay = outs[0]
+        self.assertTrue(lay.replica_mode)
+        self.assertEqual(lay.n_replicas, 4)
+        self.assertEqual(lay.compute_ranks, (0, 1, 2, 3))
+        self.assertEqual(lay.saver_rank, 4)
+        self.assertEqual([lay.block_of(r) for r in lay.compute_ranks], [(0, 1)] * 4)
+        self.assertEqual([lay.replica_index(r) for r in lay.compute_ranks], [0, 1, 2, 3])
+        self.assertEqual([lay.placements[r].devices for r in range(4)], [(0,), (0,), (1,), (1,)])
+        self.assertEqual([lay.placements[r].node for r in range(5)],
+                         ["node0", "node1", "node0", "node1", "node0"])
+        self.assertEqual(lay.block_of(4), (0, 0))
+        for r in range(5):
+            self.assertEqual(outs[r].digest(), lay.digest())
+
     def test_more_walkers_is_unchanged(self):
         lay = _layouts(FakeWorld(3), 4, [0, 1])[0]
         self.assertFalse(lay.replica_mode)

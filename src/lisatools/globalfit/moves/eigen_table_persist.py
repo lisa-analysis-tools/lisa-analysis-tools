@@ -65,7 +65,10 @@ SIDECAR_SUFFIX = "_eigen_tables.pkl"
 #: data identity) cannot tell such a table from a current one, so the bump
 #: is what makes a warm restart rebuild them instead of proposing with the
 #: old axes for a whole refresh cadence.
-FORMAT_VERSION = 2
+#: 3 (2026-09-16): the MBH ``Q`` prior became the linear-column log-uniform
+#: on [1, 10] (``LogUniformLinear``) — its prior-box width went 2.30 -> 9.0,
+#: so every MBH table built before it whitens the wrong box; same remedy.
+FORMAT_VERSION = 3
 
 # (path, reason) pairs already warned about, so a sampler that touches a
 # broken sidecar every leaf visit logs once, not thousands of times.
