@@ -1054,6 +1054,146 @@ class RefRowOpTest(unittest.TestCase):
                          np.complex128)
 
 
+class _FakeAcs:
+    """Minimal single-shard ACA stand-in (no devices, nothing to slice)."""
+
+    gpus = None
+
+    def __init__(self):
+        self.linear_data_arr = [object()]
+        self.linear_psd_arr = [object()]
+
+
+class RefRowStatusWordTest(unittest.TestCase):
+    """The owner's failure reaches every rank as an ERROR, never as a hang.
+
+    ``Important 1``'s whole mechanism, over a real ``FakeWorld``: the owner
+    catches its own failure, broadcasts a status-0 header, and every rank
+    raises off that header one collective in. A regression would show up
+    here as a ``TimeoutError`` from ``FakeWorld.run`` -- i.e. exactly the
+    permanent, silent cluster hang, made observable.
+    """
+
+    def _move(self, fr, comm, layout, owner_index, *, bind_raises=False,
+              window_raises=False):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialBase.__new__(gbs.GBSpecialBase)
+        move.name = "gb_test"
+        # ``xp`` and ``backend`` are read-only properties deriving from
+        # ``_backend_name`` (the deepcopy-safety rule: never stash an array
+        # module, or a backend object, on an instance).
+        move._backend_name = "lisatools_cpu"
+        move.branch_name = "gb"
+        acs = _FakeAcs()
+
+        def bind(model):
+            if bind_raises and fr == owner_index:
+                raise RuntimeError("device pin blew up")
+            return acs
+
+        @contextlib.contextmanager
+        def window(model, branches, walker_ref):
+            if window_raises and fr == owner_index:
+                raise RuntimeError("BandSorter build blew up")
+            move._gb_free_opened = True
+            move._gb_free_n_live = 2
+            yield
+
+        move._bind_rank_acs = bind
+        move._gb_free_residual = window
+        move.fanout = _StubFanout(layout, lls=None)
+        # The fan-out communicator's rank order IS ``compute_ranks`` order,
+        # so FakeWorld rank ``fr`` stands in for ``compute_ranks[fr]``.
+        move.fanout.rank = layout.compute_ranks[fr]
+        move.fanout.comm = comm
+        move.fanout.single = False
+        return move
+
+    def _run(self, **kw):
+        from lisatools.globalfit.communication.fakecomm import FakeWorld
+
+        layout = _build_fake_layout(8, 2)
+        owner_index = 1                      # the SECOND compute rank owns it
+        owner_rank = layout.compute_ranks[owner_index]
+        world = FakeWorld(2)
+
+        def body(fr, comm):
+            move = self._move(fr, comm, layout, owner_index, **kw)
+            payload = move._fstat_ref_row_payload(6, owner_rank, 2, True)
+            try:
+                move._gb_serve_fstat_ref_row(payload, {}, None)
+            except BaseException as exc:     # noqa: BLE001 - reported, not swallowed
+                return ("raised", str(exc), move._fstat_ref_holder)
+            return ("ok", None, move._fstat_ref_holder)
+
+        # The bodies catch their own exception and report it, so ``run``
+        # returns one row per rank instead of re-raising the lowest rank's --
+        # the point of the test is that EVERY rank got out.
+        return world.run(body), owner_rank
+
+    def _assert_every_rank_aborted(self, out, owner_rank, needle):
+        self.assertEqual(sorted(out), [0, 1])
+        for fr, (status, message, holder) in out.items():
+            self.assertEqual(status, "raised", f"rank {fr} did not raise")
+            self.assertIn(needle, message, f"rank {fr}: {message}")
+            self.assertIn(f"rank {owner_rank}", message)
+            self.assertIsNone(holder, f"rank {fr} kept a holder anyway")
+
+    def test_a_failed_snapshot_on_the_owner_aborts_every_rank(self):
+        out, owner_rank = self._run(window_raises=True)
+        self._assert_every_rank_aborted(
+            out, owner_rank, "gb_fstat_ref_row aborted")
+
+    def test_a_failed_bind_on_the_owner_aborts_every_rank(self):
+        """``_bind_rank_acs`` used to sit OUTSIDE the guard, so an owner that
+        failed there exited the body without broadcasting and parked every
+        other rank in ``Bcast(header)`` forever. It is a failure the ROOT can
+        signal, and now does."""
+        out, owner_rank = self._run(bind_raises=True)
+        self._assert_every_rank_aborted(
+            out, owner_rank, "gb_fstat_ref_row aborted")
+
+    def test_a_zero_length_snapshot_is_refused_on_every_rank(self):
+        from lisatools.globalfit.moves import gbbands
+
+        empty = (np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64))
+        with mock.patch.object(gbbands, "snapshot_ref_rows",
+                               lambda *a, **k: empty):
+            out, owner_rank = self._run()
+        self._assert_every_rank_aborted(out, owner_rank, "EMPTY")
+
+    def test_a_good_snapshot_reaches_every_rank(self):
+        """The success path of the same fixture: proves the aborts above are
+        the STATUS WORD firing, not the harness failing to work at all."""
+        from lisatools.globalfit.moves import gbbands
+
+        data = np.arange(4, dtype=np.float64) + 0.5
+        psd = np.arange(6, dtype=np.float64) + 1.5
+        with mock.patch.object(gbbands, "snapshot_ref_rows",
+                               lambda *a, **k: (data, psd)):
+            out, _owner_rank = self._run()
+        for fr, (status, message, holder) in out.items():
+            self.assertEqual(status, "ok", f"rank {fr}: {message}")
+            np.testing.assert_array_equal(holder.linear_data_arr[0], data)
+            np.testing.assert_array_equal(holder.linear_psd_arr[0], psd)
+
+    def test_the_owner_says_so_when_a_requested_window_had_no_branch(self):
+        """``gb_free`` is not decoration: it is what lets the OWNER's own log
+        distinguish "the head disabled the window" from "the branch never
+        reached me"."""
+        from lisatools.globalfit.moves import gbbands
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        data = np.zeros(4) + 1.0
+        with mock.patch.object(gbbands, "snapshot_ref_rows",
+                               lambda *a, **k: (data, data)), \
+                self.assertLogs(gbs.logger, level="WARNING") as captured:
+            self._run()
+        self.assertTrue(any("carries no GB branch" in line
+                            for line in captured.output), captured.output)
+
+
 class StageBPayloadTest(unittest.TestCase):
     """The shipped payload carries host arrays and reconstructs the spec."""
 

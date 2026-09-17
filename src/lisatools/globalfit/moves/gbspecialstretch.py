@@ -19002,7 +19002,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         ``gb_free_requested`` is what the head ASKED FOR, env flag included,
         so a rank that skipped the window can be told apart from a run with
-        ``GB_FSTAT_GB_FREE=0``.
+        ``GB_FSTAT_GB_FREE=0``. Read on the OWNER only, which warns in its
+        own log when the head asked for the window and no branch reached it
+        (the head's :meth:`_warn_if_gb_free_missed` says the same thing on
+        the other side of the wire, off its own local flag -- so the fact is
+        recorded on both the rank that failed to open the window and the
+        rank an operator reads first).
         """
         return {
             "walker_ref": int(w_global),
@@ -19108,15 +19113,25 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         visible only in that one worker's log. So the owner catches its own
         failure, logs the traceback, and broadcasts a header whose status
         word is 0; EVERY rank then raises the same error together, one
-        collective in, and the head sees an ordinary ``RemoteWorkerError``.
+        collective in.
 
-        What that does NOT cover, and cannot with a root broadcast: a
-        NON-owner failing before it reaches ``Bcast(header)`` -- only
-        ``_bind_rank_acs`` is up there -- still hangs the rest, because a
-        non-root rank has no way to signal through a header the root owns.
-        Closing that needs a different primitive (an allgather of status),
-        i.e. a fourth collective on every command; it is deliberately not
-        paid here, where the fallible work is all on the owner.
+        The head then sees ITS OWN ``RuntimeError``, not a
+        ``RemoteWorkerError``: the head's body raises the status error inside
+        ``WalkerFanout.run``'s ``try``, whose drain waits the isends,
+        ``recv``s each worker's failure reply and DISCARDS it before
+        re-raising the head's exception (``fanout.py`` :206-222). Grep the
+        head log for the message, not for the type.
+
+        EVERY piece of owner-side fallible work is inside the guard --
+        ``_bind_rank_acs``, the GB-free window, the shard resolve, the
+        snapshot, and the dtype normalization that sizes the header. What
+        that does NOT cover, and cannot with a ROOT broadcast, is a
+        NON-owner failing before it reaches ``Bcast(header)``: its
+        ``_bind_rank_acs``, and its two ``np.empty`` allocations between the
+        header and the data broadcasts. A non-root rank has no way to signal
+        through a header the root owns; closing that needs a different
+        primitive (an allgather of status), i.e. a fourth collective on
+        every command, deliberately not paid here.
 
         The header is ``(status, n_data, n_psd, data_is_complex,
         psd_is_complex)`` as int64. The two complex flags are not
@@ -19137,7 +19152,6 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """
         from .gbbands import FStatRefRowHolder, snapshot_ref_rows
 
-        acs = self._bind_rank_acs(model)
         payload = payload or {}
         w_global = int(payload["walker_ref"])
         owner_rank = int(payload["owner_rank"])
@@ -19150,22 +19164,46 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         collective = fanout is not None and not fanout.single
 
+        acs = None
         data_row = psd_row = None
         n_live = -1
         gb_free_opened = False
         owner_failed = False
-        if is_owner:
-            # ``_fstat_ref_branches`` is the head's own hand-off (no
-            # fan-out / one compute rank: nothing is pickled, so the live
-            # dict is passed through). Under a real fan-out the head ships
-            # the owner's BLOCK-SLICED cold branch in the payload instead --
-            # the owner may be a worker, which has no branch of its own
-            # during setup(). Both routes end with the window genuinely open.
-            branches = getattr(self, "_fstat_ref_branches", None)
-            if branches is None:
-                branches = self._fstat_ref_branch_from_payload(
-                    payload.get("gb_branch"))
-            try:
+        # (status, n_data, n_psd, data_is_complex, psd_is_complex). Allocated
+        # BEFORE the guard so a failure inside it still has a header to
+        # broadcast: an owner that exits this body without one parks every
+        # other rank in ``Bcast(header)`` with no timeout, forever.
+        header = np.zeros(5, dtype=np.int64)
+        try:
+            # THE BIND IS INSIDE THE GUARD. It pins the device, refreshes the
+            # domain and re-binds the parent engine, any of which can raise --
+            # and on the OWNER that is a failure the root CAN signal, unlike a
+            # non-owner's.
+            acs = self._bind_rank_acs(model)
+            if is_owner:
+                # ``_fstat_ref_branches`` is the head's own hand-off (no
+                # fan-out / one compute rank: nothing is pickled, so the live
+                # dict is passed through). Under a real fan-out the head ships
+                # the owner's BLOCK-SLICED cold branch in the payload instead
+                # -- the owner may be a worker, which has no branch of its own
+                # during setup(). Both routes end with the window genuinely
+                # open.
+                branches = getattr(self, "_fstat_ref_branches", None)
+                if branches is None:
+                    branches = self._fstat_ref_branch_from_payload(
+                        payload.get("gb_branch"))
+                if payload.get("gb_free") and branches is None:
+                    # What ``gb_free`` is FOR: the head asked for the window,
+                    # and this rank has nothing to open it with. The head's
+                    # own WARNING names the rank; this one puts the fact in
+                    # the owner's log, where the operator is already looking
+                    # if anything else went wrong here.
+                    logger.warning(
+                        "%s: gb_fstat_ref_row on rank %d was asked for a "
+                        "GB-FREE window for walker %d but carries no GB "
+                        "branch (none shipped, none head-local); the snapshot "
+                        "will be of that walker's OWN residual.",
+                        self.name, owner_rank, w_global)
                 with self._gb_free_residual(model, branches, local_index):
                     gb_free_opened = bool(getattr(self, "_gb_free_opened", False))
                     n_live = int(getattr(self, "_gb_free_n_live", -1))
@@ -19178,36 +19216,46 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         device = int(acs.gpus[0])
                     data_row, psd_row = snapshot_ref_rows(
                         acs, view, intra, intra, xp=self.xp, device=device)
-            except BaseException:
-                if not collective:
-                    raise          # nobody is waiting on us; propagate as-is
-                # Every other rank is about to block in Bcast(header) with no
-                # timeout, and ``ComputeService.handle`` would swallow this
-                # traceback into a reply the head never gets to read. Log it
-                # HERE (the only place it exists) and tell the others through
-                # the status word, so the whole command fails together.
-                logger.exception(
-                    "%s: gb_fstat_ref_row FAILED on the owner rank %d while "
-                    "snapshotting walker %d (local row %d); every compute "
-                    "rank will raise together.",
-                    self.name, owner_rank, w_global, local_index)
-                owner_failed = True
-                data_row = psd_row = None
+                if collective:
+                    # Normalize to the canonical width FIRST, so the flag the
+                    # receivers act on describes the buffer that is actually
+                    # sent. Never a cast ACROSS the real/complex boundary:
+                    # that is what would silently drop the imaginary part.
+                    # GUARDED TOO -- these are tens of MB, so they can raise
+                    # MemoryError, and doing so after the guard closed would
+                    # be the same permanent hang. The no-broadcast paths
+                    # (no fan-out, one compute rank) convert NOTHING, which
+                    # is what keeps the golden-gated serial fit byte-exact.
+                    data_row = np.ascontiguousarray(
+                        data_row, dtype=_bcast_dtype(data_row))
+                    psd_row = np.ascontiguousarray(
+                        psd_row, dtype=_bcast_dtype(psd_row))
+                    header[:] = (1, data_row.size, psd_row.size,
+                                 np.iscomplexobj(data_row),
+                                 np.iscomplexobj(psd_row))
+        except BaseException:
+            if not (collective and is_owner):
+                # Nobody is waiting on us -- either there is no collective at
+                # all, or we are a NON-owner, which cannot signal through a
+                # header the root owns (see the docstring's residual).
+                raise
+            # Every other rank is about to block in Bcast(header) with no
+            # timeout, and ``ComputeService.handle`` would swallow this
+            # traceback into a reply the head never gets to read. Log it
+            # HERE (the only place it exists) and tell the others through
+            # the status word, so the whole command fails together.
+            logger.exception(
+                "%s: gb_fstat_ref_row FAILED on the owner rank %d while "
+                "snapshotting walker %d (local row %d); every compute "
+                "rank will raise together.",
+                self.name, owner_rank, w_global, local_index)
+            owner_failed = True
+            data_row = psd_row = None
+            header[:] = 0
 
         if collective:
             comm = fanout.comm
             root = fanout.layout.fanout_rank(owner_rank)
-            # (status, n_data, n_psd, data_is_complex, psd_is_complex)
-            header = np.zeros(5, dtype=np.int64)
-            if is_owner and not owner_failed:
-                # Normalize to the canonical width FIRST, so the flag the
-                # receivers act on describes the buffer that is actually
-                # sent. Never a cast ACROSS the real/complex boundary: that
-                # is what would silently drop the imaginary part.
-                data_row = np.ascontiguousarray(data_row, dtype=_bcast_dtype(data_row))
-                psd_row = np.ascontiguousarray(psd_row, dtype=_bcast_dtype(psd_row))
-                header[:] = (1, data_row.size, psd_row.size,
-                             np.iscomplexobj(data_row), np.iscomplexobj(psd_row))
             comm.Bcast(header, root=root)
             # Checked on EVERY rank off the SAME header, so every rank takes
             # the same branch and the collective count stays symmetric: on
