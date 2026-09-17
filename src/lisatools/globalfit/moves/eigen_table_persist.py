@@ -59,7 +59,13 @@ SIDECAR_SUFFIX = "_eigen_tables.pkl"
 
 #: Payload format stamp — bump if the entry layout changes incompatibly
 #: (an unknown format is ignored like a corrupt file, never adopted).
-FORMAT_VERSION = 1
+#: 2 (2026-09-16): tables built before the ``prior_box_widths`` fix were
+#: whitened and capped with UNIT prior widths on every string-keyed branch
+#: (mbh / emri / sobbh); the adoption guards (ndim, ntemps, nwalkers, scope,
+#: data identity) cannot tell such a table from a current one, so the bump
+#: is what makes a warm restart rebuild them instead of proposing with the
+#: old axes for a whole refresh cadence.
+FORMAT_VERSION = 2
 
 # (path, reason) pairs already warned about, so a sampler that touches a
 # broken sidecar every leaf visit logs once, not thousands of times.

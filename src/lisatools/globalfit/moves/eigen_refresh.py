@@ -97,49 +97,73 @@ def prior_box_widths(prob_dist_container, ndim):
     of minus inf" on every repeat).
 
     A column the container DOES cover but whose distribution exposes no
-    bounds is reported once per call rather than defaulting silently —
-    that silence is what hid the defect above. Columns the container does
-    not cover at all (fixed / per-leaf-filled parameters) keep width 1.0
-    quietly, as before.
+    FINITE, positive box (eryn distributions default ``minimum`` /
+    ``maximum`` to -inf / +inf, and :func:`prior_box_scales` maps such a
+    width back to 1.0) is reported once per ``(ndim, columns)`` rather than
+    defaulting silently — that silence is what hid the defect above.
+    Columns the container does not cover at all (fixed / per-leaf-filled
+    parameters) keep width 1.0 quietly, as before. A reader failure keeps
+    the columns read up to that point (unit widths elsewhere) and warns.
     """
     lo = np.zeros(ndim)
     hi = np.ones(ndim)
+    covered = []
     unread = []
     try:
         for cols, dist in _prior_entries(prob_dist_container):
-            cols = [int(c) for c in cols.ravel() if 0 <= int(c) < ndim]
-            if not cols:
+            cols_all = [int(c) for c in cols.ravel()]
+            keep = np.array([0 <= c < ndim for c in cols_all], dtype=bool)
+            if not keep.any():
                 continue
+            cols_in = [c for c, k in zip(cols_all, keep) if k]
             _mn = getattr(dist, "minimum", getattr(dist, "min_val", None))
             _mx = getattr(dist, "maximum", getattr(dist, "max_val", None))
             if _mn is None or _mx is None:
-                unread.extend(cols)
+                unread.extend(cols_in)
                 continue
             try:
                 # a scalar bound on a multi-column (tuple-keyed) entry
                 # applies to each of its columns; a per-column array must
-                # match them one for one
-                mn = np.broadcast_to(np.asarray(_mn, dtype=float), (len(cols),))
-                mx = np.broadcast_to(np.asarray(_mx, dtype=float), (len(cols),))
+                # match the entry's columns one for one — masked TOGETHER
+                # with the columns, so an out-of-range column cannot shift
+                # the others' bounds
+                mn = np.broadcast_to(np.asarray(_mn, dtype=float), (len(cols_all),))[keep]
+                mx = np.broadcast_to(np.asarray(_mx, dtype=float), (len(cols_all),))[keep]
             except (TypeError, ValueError):
-                unread.extend(cols)
+                unread.extend(cols_in)
                 continue
-            lo[cols] = mn
-            hi[cols] = mx
+            lo[cols_in] = mn
+            hi[cols_in] = mx
+            covered.extend(cols_in)
     except Exception as exc:  # never break the sampler on an exotic prior
         logger.warning(
-            "[eigen_refresh] prior box unavailable (%r); falling back to "
-            "unit widths", exc,
+            "[eigen_refresh] prior box unavailable (%r); keeping the columns "
+            "read so far, unit widths elsewhere", exc,
         )
-        return prior_box_scales(np.zeros(ndim), np.ones(ndim))
+    width = hi - lo
+    unread.extend(c for c in covered if not np.isfinite(width[c]) or width[c] <= 0)
     if unread:
-        logger.warning(
-            "[eigen_refresh] prior columns %s expose no (minimum, maximum) "
-            "bounds; using unit width there — the eigen steps and the "
-            "prior-box cap on those columns are NOT in the parameter's own "
-            "units.", sorted(set(unread)),
-        )
+        _warn_unread(ndim, tuple(sorted(set(unread))))
     return prior_box_scales(lo, hi)
+
+
+# (ndim, columns) already reported by _warn_unread: addremove calls
+# prior_box_widths once per leaf per refresh, so an unbounded column would
+# otherwise log one identical line per leaf.
+_UNREAD_WARNED = set()
+
+
+def _warn_unread(ndim, cols):
+    key = (int(ndim), tuple(cols))
+    if key in _UNREAD_WARNED:
+        return
+    _UNREAD_WARNED.add(key)
+    logger.warning(
+        "[eigen_refresh] prior columns %s expose no finite positive "
+        "(minimum, maximum) box; using unit width there — the eigen steps "
+        "and the prior-box cap on those columns are NOT in the parameter's "
+        "own units.", list(cols),
+    )
 
 
 def _fallback_table(widths):

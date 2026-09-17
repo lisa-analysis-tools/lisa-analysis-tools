@@ -1,7 +1,7 @@
 # One-walker replica mode — cluster testing campaign
 
 Branch `one-walker-replicas` (worktree `LISAanalysistools-onewalker`, base `dev` `aec22834`).
-Laptop evidence already in hand: GB one-walker/two-replica smoke (4 `gb_sync` rounds, agreeing hashes), parity arm, 4-walker two-rank arm, 545-test sweep — all green; a one-walker noise-smoke arm (PSD eigen inner + row scatter + replays) is the last laptop item. Everything below runs on the cluster and is what actually proves the GPU path.
+Laptop evidence already in hand: GB one-walker/two-replica smoke (4 `gb_sync` rounds, agreeing hashes), parity arm, 4-walker two-rank arm, 545-test sweep, and the one-walker noise-smoke arm (PSD eigen inner + row scatter + replays; it exposed the `prior_box_widths` unit-width defect on string-keyed prior dicts, fixed the same day — psd in-model acceptance 48/120, was 0) — all green. Everything below runs on the cluster and is what actually proves the GPU path.
 
 Design authority: `docs/superpowers/specs/2026-09-16-one-walker-replicas-design.md`. Launcher facts and the per-step commands: `docs/multirank-cluster-gates.md` ("One-walker replica mode gate", from line 370). Logs digest: `python scripts/diagnostics/gf_run_log_digest.py <run_dir>` (prints the `[FANOUT]` load-balance table, the `[FANOUT_DIGEST] replicas` agreement count and the `[GB_REPLICA]` counters).
 
