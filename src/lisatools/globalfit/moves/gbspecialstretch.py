@@ -4588,7 +4588,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # single-process ``fit.sample()`` path), or a caller that is not
             # the head: ``WalkerFanout.run`` -- which ``gather_likelihood``
             # is built on -- is head-only and raises ``RuntimeError`` on a
-            # non-head caller (fanout.py:166), so both cases fall back to
+            # non-head caller (fanout.py:218), so both cases fall back to
             # the local ranking. There is no layout to consult in either
             # case, so ``owner_rank=0`` below is a fixed convention, not a
             # derived value -- a caller with no fan-out (or that is not the
@@ -4608,7 +4608,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # deriving it keeps this fallback correct off the ``main_rank=0``
             # path every in-tree run takes today. ``exc_info=True`` keeps a
             # remote worker's traceback (``RemoteWorkerError.remote_traceback``,
-            # fanout.py:51) from being swallowed behind the one-line ``%r``.
+            # fanout.py:53) from being swallowed behind the one-line ``%r``.
             logger.warning(
                 "%s: could not rank walkers for the F-stat reference (%r); "
                 "falling back to walker 0.", self.name, exc, exc_info=True)
@@ -19132,7 +19132,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         ``RemoteWorkerError``: the head's body raises the status error inside
         ``WalkerFanout.run``'s ``try``, whose ``except BaseException`` drain
         waits the isends, ``recv``s each worker's failure reply and DISCARDS
-        it before re-raising the head's exception (``fanout.py`` :260-274).
+        it before re-raising the head's exception (``fanout.py`` :260-275,
+        the bare ``raise`` being the last of those lines).
         Grep the head log for the message, not for the type.
 
         EVERY piece of owner-side fallible work is inside the guard --
@@ -19748,7 +19749,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         REFUSES ANYTHING BUT A REAL FAN-OUT, in code rather than in prose.
         At ``n_compute == 1`` this would otherwise run happily --
-        ``WalkerFanout.run``'s single branch (``fanout.py`` :224-225) calls
+        ``WalkerFanout.run``'s single branch (``fanout.py`` :223-225, the
+        ``if self.single:`` being the first of those lines) calls
         only ``local_body``, so the head would sweep the whole range, write
         ``stageb_g{gi}_r0.npy`` and read it straight back. The NUMBERS would
         be unchanged, but ``n_compute == 1`` is the spec's byte-identity
@@ -19765,7 +19767,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         )
 
         fanout = getattr(self, "fanout", None)
-        if fanout is None or fanout.single:
+        # ``getattr(..., True)``: a real ``WalkerFanout`` always sets
+        # ``single`` (fanout.py :145), but reading it bare would answer a
+        # fan-out-like object that does not with an ``AttributeError``
+        # instead of this message. Defaulting to "single" keeps the
+        # byte-identity gate CLOSED whenever the shape is unknown.
+        if fanout is None or getattr(fanout, "single", True):
             raise RuntimeError(
                 f"{self.name}: _fstat_stage_b_runner needs SEVERAL compute "
                 "ranks to split the group over. With no fan-out, or at one "
@@ -19848,15 +19855,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 grid = assemble_stage_b_group(
                     spec.parts_dir, spec.gi, n_parts, spec.node_shape, xp=xp,
                     sha1s=sha1s)
-            except FileNotFoundError as exc:
+            except OSError as exc:
                 # Every rank reported success, so the file exists -- on ITS
                 # node. The whole stage-B wall has already been paid by the
-                # time this shows up, and a bare FileNotFoundError says
-                # nothing about why.
+                # time this shows up, and the bare errno says nothing about
+                # why. ``OSError``, not just ``FileNotFoundError``: a flaky
+                # or node-local shared mount surfaces just as often as a
+                # stale NFS handle (ESTALE) or a PermissionError, and the
+                # diagnosis below is the right one for all of them.
                 raise RuntimeError(
                     f"{self.name}: stage-B group {spec.gi} partial "
-                    f"{getattr(exc, 'filename', None)} is missing on the head "
-                    "although every rank reported writing one. The epoch cache "
+                    f"{getattr(exc, 'filename', None)} could not be read on "
+                    f"the head ({exc.__class__.__name__}: {exc}) although "
+                    "every rank reported writing one. The epoch cache "
                     f"directory ({spec.parts_dir}) must be on a filesystem "
                     "SHARED by every compute rank; a node-local one lets each "
                     "rank write a partial the head can never read."
@@ -19866,9 +19877,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # died at a LARGER n_compute leaves its high-index partials --
             # hundreds of MB each -- in the epoch dir forever, and nothing
             # else matches them (the end-of-stage ``ckpt_clear`` sweeps only
-            # the ``.progress.*`` suffixes).
+            # the ``.progress.*`` suffixes). The trailing ``*`` also takes
+            # ``.npy.tmp`` orphans: ``save_stage_b_part`` writes through a
+            # temp file, so a rank that died mid-``np.save`` at an index
+            # above the current ``n_compute`` leaves a FULL-SIZE one that
+            # ``clear_stage_b_parts`` never looks at either. The literal
+            # ``_r`` after the group number is what stops ``g1`` matching
+            # ``g11``.
             for stale in glob.glob(os.path.join(
-                    spec.parts_dir, f"stageb_g{int(spec.gi)}_r*.npy")):
+                    spec.parts_dir, f"stageb_g{int(spec.gi)}_r*.npy*")):
                 try:
                     os.remove(stale)
                 except OSError:

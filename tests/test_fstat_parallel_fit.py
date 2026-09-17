@@ -940,10 +940,11 @@ class RefRowOpTest(unittest.TestCase):
         """``_fanout_cmd`` yields ``{rank: result}``, not ``{rank: {"result"}}``.
 
         ``WalkerFanout.run`` unwraps the reply envelope itself before
-        ``merge`` (``fanout.py`` :172 single / :262 multi), so indexing
-        ``r["result"]`` here would ``KeyError`` on the FIRST multi-rank
-        refit -- a crash no single-rank test can reach. This pins the shape
-        and the owner-reply pick together.
+        ``merge`` (``fanout.py`` :223-225 single / :308 multi; the envelope
+        is built by ``_reply``, :71), so indexing ``r["result"]`` here would
+        ``KeyError`` on the FIRST multi-rank refit -- a crash no single-rank
+        test can reach. This pins the shape and the owner-reply pick
+        together.
         """
         from lisatools.globalfit.moves import gbspecialstretch as gbs
 
@@ -1504,8 +1505,9 @@ class StageBRunnerTest(unittest.TestCase):
             replies = self._serve(
                 move, layout, spec, per_rank_payload,
                 lambda sub: whole[sub.a - spec.a:sub.b - spec.a])
-            # ``_fanout_cmd`` returns the BARE result dicts (fanout.py:172 /
-            # :262 unwrap the envelope), not ``{rank: {"result": ...}}``.
+            # ``_fanout_cmd`` returns the BARE result dicts (fanout.py:223-225
+            # single / :308 multi unwrap the envelope ``_reply`` built at
+            # :71), not ``{rank: {"result": ...}}``.
             return replies, None
 
         move._fanout_cmd = fake_cmd
@@ -1560,6 +1562,31 @@ class StageBRunnerTest(unittest.TestCase):
             runner(spec, None, xp=np)
         self.assertIn("box range", str(ctx.exception))
 
+    def test_a_reply_that_misreports_its_row_count_is_refused(self):
+        """A SHORT partial is caught downstream too, but only as an
+        aggregate shape error naming no rank -- after the whole stage-B wall
+        has been paid. The per-rank check fires while the rank is still in
+        hand, and nothing else in this suite would go red if it vanished."""
+        move, layout = self._move(n_compute=2)
+        spec = self._spec()
+        whole = np.zeros(spec.node_shape)
+
+        def fake_cmd(op, per_rank_payload, model):
+            replies = self._serve(
+                move, layout, spec, per_rank_payload,
+                lambda sub: whole[sub.a - spec.a:sub.b - spec.a])
+            first = layout.compute_ranks[0]
+            replies[first] = dict(replies[first], n_rows=0)
+            return replies, None
+
+        move._fanout_cmd = fake_cmd
+        runner = move._fstat_stage_b_runner("model")
+        with self.assertRaises(RuntimeError) as ctx:
+            runner(spec, None, xp=np)
+        msg = str(ctx.exception)
+        self.assertIn("box row(s)", msg)
+        self.assertIn("rank index 0", msg)
+
     def test_a_reply_without_a_rank_index_is_refused(self):
         move, layout = self._move(n_compute=2)
         spec = self._spec()
@@ -1600,6 +1627,76 @@ class StageBRunnerTest(unittest.TestCase):
         than trust a docstring.
         """
         move, _layout = self._move(n_compute=1)
+        with self.assertRaises(RuntimeError) as ctx:
+            move._fstat_stage_b_runner("model")
+        self.assertIn("sweep_runner", str(ctx.exception))
+
+    def test_orphan_partials_of_a_wider_fit_are_swept_tmp_files_too(self):
+        """``clear_stage_b_parts`` only unlinks ``r < n_parts``, so a fit that
+        died at a LARGER ``n_compute`` leaves hundreds of MB per orphan --
+        including a ``.npy.tmp`` from a rank that died mid-``np.save``, which
+        the plain ``*.npy`` pattern did not match. Another group's partials
+        must survive: ``g1`` must not sweep ``g11``."""
+        move, layout = self._move(n_compute=2)
+        spec = self._spec()
+        whole = np.zeros(spec.node_shape)
+        planted = ("stageb_g0_r7.npy", "stageb_g0_r9.npy.tmp")
+        kept = ("stageb_g01_r0.npy", "stageb_g1_r0.npy",
+                "stageb_g0.progress.npz")
+        for name in planted + kept:
+            with open(os.path.join(self.tmp, name), "wb") as f:
+                f.write(b"x")
+
+        def fake_cmd(op, per_rank_payload, model):
+            return self._serve(
+                move, layout, spec, per_rank_payload,
+                lambda sub: whole[sub.a - spec.a:sub.b - spec.a]), None
+
+        move._fanout_cmd = fake_cmd
+        runner = move._fstat_stage_b_runner("model")
+        with self.assertLogs("lisatools.globalfit.moves.gbspecialstretch",
+                             level="INFO"):
+            runner(spec, None, xp=np)
+        left = set(os.listdir(self.tmp))
+        self.assertEqual(left & set(planted), set())
+        self.assertEqual(left & set(kept), set(kept))
+
+    def test_an_unreadable_partial_names_the_shared_filesystem(self):
+        """Not only ``FileNotFoundError``: a flaky or node-local shared mount
+        surfaces just as often as ``ESTALE`` or a ``PermissionError``, and
+        those used to die bare inside ``np.load`` -- after the whole stage-B
+        wall -- saying nothing about why."""
+        move, layout = self._move(n_compute=2)
+        spec = self._spec()
+        whole = np.zeros(spec.node_shape)
+
+        def fake_cmd(op, per_rank_payload, model):
+            return self._serve(
+                move, layout, spec, per_rank_payload,
+                lambda sub: whole[sub.a - spec.a:sub.b - spec.a]), None
+
+        def boom(*a, **k):
+            raise PermissionError(13, "Permission denied", "stageb_g0_r1.npy")
+
+        move._fanout_cmd = fake_cmd
+        with mock.patch.object(G, "assemble_stage_b_group", boom):
+            runner = move._fstat_stage_b_runner("model")
+            with self.assertRaises(RuntimeError) as ctx:
+                runner(spec, None, xp=np)
+        msg = str(ctx.exception)
+        self.assertIn("SHARED by every compute rank", msg)
+        self.assertIn("PermissionError", msg)
+        self.assertIn("stageb_g0_r1.npy", msg)
+
+    def test_a_fanout_with_no_single_flag_is_refused_not_crashed(self):
+        """Reading ``fanout.single`` bare answers a fan-out-like object that
+        does not carry it with an ``AttributeError`` instead of the refusal.
+        Unknown shape -> keep the byte-identity gate CLOSED."""
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialRJFStatGridMove.__new__(gbs.GBSpecialRJFStatGridMove)
+        move.name = "gb_test"
+        move.fanout = object()          # no ``single``
         with self.assertRaises(RuntimeError) as ctx:
             move._fstat_stage_b_runner("model")
         self.assertIn("sweep_runner", str(ctx.exception))
