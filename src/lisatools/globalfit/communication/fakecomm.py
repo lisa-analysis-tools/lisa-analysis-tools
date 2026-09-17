@@ -144,7 +144,7 @@ class FakeComm:
         is what the F-stat reference row pair (tens of MB) uses. The fake
         moves the bytes through the existing slot exchange and writes them
         into each non-root rank's own array, so a caller that allocates its
-        own receive buffer -- the real usage -- is exercised faithfully.
+        own receive buffer -- the real usage -- takes the same shape here.
 
         The receive buffer must be C-CONTIGUOUS: ``reshape(-1)`` returns a
         view only then, and on a strided array it would copy, so the write
@@ -152,6 +152,18 @@ class FakeComm:
         error at all. Refused loudly instead. (Every array the F-stat op
         broadcasts is a fresh ``np.empty``, so this never fires in
         production -- it exists so a future caller cannot fail silently.)
+
+        What this does NOT model, on top of the module-level list:
+
+        - the ROOT's buffer is never validated. Real mpi4py raises
+          ``BufferError`` for a non-contiguous send buffer; here the root
+          goes through ``tobytes()``, which happily linearizes a strided
+          array. So a strided buffer is rejected by BOTH implementations but
+          for different reasons and on different ranks -- receiver-side here,
+          sender-side there.
+        - the ``[buf, count, datatype]`` list form is accepted, but only
+          ``buf`` is honoured: an explicit ``count`` or MPI datatype is
+          dropped, and the whole array is sent at its own numpy dtype.
         """
         arr = buf[0] if isinstance(buf, (list, tuple)) else buf
         arr = np.asarray(arr)

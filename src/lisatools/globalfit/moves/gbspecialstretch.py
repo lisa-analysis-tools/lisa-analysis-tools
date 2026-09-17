@@ -17708,6 +17708,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     _fstat_ref_walker = None
     _fstat_ref_branches = None
     _gb_free_n_live = -1
+    _gb_free_opened = False
 
     @property
     def fanout_active(self) -> bool:
@@ -18943,13 +18944,76 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
     @staticmethod
     def _fstat_ref_row_payload(w_global, owner_rank, local_index,
-                               branches_present):
-        """The command payload: the same dict for every rank (symmetric op)."""
+                               gb_free_requested):
+        """The command payload every rank shares.
+
+        Identical on every rank, which is what keeps the op symmetric: each
+        one derives ``root = layout.fanout_rank(owner_rank)`` from these
+        fields, and a rank-dependent ``owner_rank`` would have them
+        broadcasting against different roots and deadlock the run. (The owner
+        alone additionally gets a ``gb_branch`` slice bolted on -- see
+        :meth:`_fstat_ref_row_fanout` -- which no other rank reads.)
+
+        ``gb_free_requested`` is what the head ASKED FOR, env flag included,
+        so a rank that skipped the window can be told apart from a run with
+        ``GB_FSTAT_GB_FREE=0``.
+        """
         return {
             "walker_ref": int(w_global),
             "owner_rank": int(owner_rank),
             "local_index": int(local_index),
-            "gb_free": bool(branches_present),
+            "gb_free": bool(gb_free_requested),
+        }
+
+    def _fstat_ref_branch_slice(self, branches, w0, w1):
+        """The owner block's COLD GB branch, as plain host arrays for the wire.
+
+        The GB-free window is the reason the owner needs a branch at all, and
+        a rank has none during ``setup()`` -- no session is open, so no state
+        slice has been shipped. This is what the head sends instead.
+
+        WHAT ``BandSorter`` ACTUALLY NEEDS (read, not assumed): its non-copy
+        constructor touches ``gb_branch.shape``, ``gb_branch.inds`` and
+        ``gb_branch.coords`` and nothing else (``gbbands.py`` :5564-5578 and
+        :5627); it stores the object as ``gb_branch_orig``, which no other
+        code in the tree ever reads back. ``branch_supplemental`` is NOT
+        load-bearing here -- the per-source labels (``temp_inds`` /
+        ``walker_inds`` / ``leaf_inds``) are derived from the SHAPE, the band
+        assignment from ``coords`` through the move's own
+        ``parameter_transforms``, and ``N_vals`` from the sorter's
+        ``band_N_vals``. So a bare ``Branch(coords, inds=inds)`` is enough,
+        and that is the cheapest thing that can be.
+
+        SLICED TO THE BLOCK AND TO TEMP 0. ``_gb_free_residual`` selects with
+        ``dict(temp=0, walker=..., apply_inds=True)`` and never reads another
+        temperature, so the hot rungs are pure payload weight. Slicing the
+        walker axis to ``[w0, w1)`` is what makes ``walker=local_index``
+        address the branch column and the owner's ACA row identically --
+        ``adjust_sources_in_residual_buffer`` passes ``subset.walker_inds``
+        straight into ``fill_template`` as the ACA row index, so the branch's
+        walker axis MUST be the rank's block.
+
+        At 6 months with ``B = 5`` this is ~3.6 MB of coords + inds.
+        """
+        branch = (branches or {}).get(self.branch_name)
+        if branch is None:
+            return None
+        coords = np.asarray(_to_numpy(branch.coords))[0:1, int(w0):int(w1)]
+        inds = np.asarray(_to_numpy(branch.inds))[0:1, int(w0):int(w1)]
+        return {
+            "coords": np.ascontiguousarray(coords),
+            "inds": np.ascontiguousarray(inds.astype(bool)),
+        }
+
+    def _fstat_ref_branch_from_payload(self, blob):
+        """Rebuild the ``{branch_name: Branch}`` dict from a shipped slice."""
+        if not blob:
+            return None
+        return {
+            self.branch_name: Branch(
+                np.ascontiguousarray(np.asarray(blob["coords"])),
+                inds=np.ascontiguousarray(np.asarray(blob["inds"]).astype(bool)),
+            )
         }
 
     @staticmethod
@@ -18976,13 +19040,46 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     def _gb_serve_fstat_ref_row(self, payload, clock, model):
         """Replicate the reference walker's residual + inverse-PSD rows.
 
-        SYMMETRIC: every compute rank -- the head included -- enters this
-        body exactly once per command, so the ``Bcast`` inside it is legal
-        on the fan-out communicator (same precedent as
-        ``WalkerFanout.allgather_walker_vector``). Every path below reaches
-        the SAME three broadcasts in the same order: the only branch that
-        differs by rank (``is_owner``) fills the buffers on one side and
-        allocates them on the other, and neither side returns early.
+        SYMMETRIC: the fan-out comm IS ``ComputeService``'s comm, it contains
+        every compute rank and only compute ranks, and every one of them --
+        the head included -- enters this body exactly once per command, so
+        the ``Bcast`` inside it is legal. Every path below reaches the SAME
+        broadcasts in the same order: the only branch that differs by rank
+        (``is_owner``) fills the buffers on one side and allocates them on
+        the other, and neither side returns early.
+
+        THE STATUS SLOT IS NOT OPTIONAL. Unlike
+        ``WalkerFanout.allgather_walker_vector`` -- which is called from the
+        rank's own setup path (``run.py`` ``_global_likelihood``), outside
+        any try/except, so a raise there aborts the job -- this collective
+        runs inside a ``gf_serve`` body, and ``ComputeService.handle``
+        CATCHES whatever it raises, replies "failed" and returns that worker
+        to ``recv``. A worker that owns the reference walker and dies in the
+        fallible owner-only work above (the ``BandSorter`` build has failed
+        in production before -- see the ``rj_prop=None`` note in
+        :meth:`_gb_free_residual`) would therefore leave every other rank
+        parked in ``Bcast`` with no timeout, forever, with the traceback
+        visible only in that one worker's log. So the owner catches its own
+        failure, logs the traceback, and broadcasts a header whose status
+        word is 0; EVERY rank then raises the same error together, one
+        collective in, and the head sees an ordinary ``RemoteWorkerError``.
+
+        What that does NOT cover, and cannot with a root broadcast: a
+        NON-owner failing before it reaches ``Bcast(header)`` -- only
+        ``_bind_rank_acs`` is up there -- still hangs the rest, because a
+        non-root rank has no way to signal through a header the root owns.
+        Closing that needs a different primitive (an allgather of status),
+        i.e. a fourth collective on every command; it is deliberately not
+        paid here, where the fallible work is all on the owner.
+
+        The header is ``(status, n_data, n_psd, data_is_complex,
+        psd_is_complex)`` as int64. The two complex flags are not
+        decoration: ``AnalysisContainerArray.data_dtype`` is ``float`` only
+        in the WDM basis and ``complex`` in FD (and ``noise_dtype`` is
+        complex whenever the sensitivity matrix is), so a receiver that
+        assumed float64 would allocate the wrong buffer and an owner that
+        cast to float64 would discard the imaginary part of every residual
+        sample.
 
         The OWNER rank opens the GB-free window on its LOCAL row (today's
         ``_gb_free_residual`` semantics), snapshots the two rows to host and
@@ -18991,15 +19088,6 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         rank then wraps the pair in an :class:`FStatRefRowHolder` scored
         with ``data_index = noise_index = 0``.
 
-        The row sizes come from the owner first (a tiny pickled reply is not
-        available here -- this is a collective), so they are broadcast as a
-        4-element int64 header -- two element counts and two "is complex"
-        flags -- before the payload buffers. The flags are NOT decoration:
-        ``AnalysisContainerArray.data_dtype`` is ``float`` only in the WDM
-        basis and ``complex`` in FD (and ``noise_dtype`` is complex whenever
-        the sensitivity matrix is), so a receiver that assumed float64 would
-        allocate the wrong buffer and an owner that cast to float64 would
-        discard the imaginary part of every residual sample.
         """
         from .gbbands import FStatRefRowHolder, snapshot_ref_rows
 
@@ -19014,60 +19102,93 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         fanout = getattr(self, "fanout", None)
         is_owner = (fanout is None) or (int(fanout.rank) == owner_rank)
 
+        collective = fanout is not None and not fanout.single
+
         data_row = psd_row = None
         n_live = -1
+        gb_free_opened = False
+        owner_failed = False
         if is_owner:
+            # ``_fstat_ref_branches`` is the head's own hand-off (no
+            # fan-out / one compute rank: nothing is pickled, so the live
+            # dict is passed through). Under a real fan-out the head ships
+            # the owner's BLOCK-SLICED cold branch in the payload instead --
+            # the owner may be a worker, which has no branch of its own
+            # during setup(). Both routes end with the window genuinely open.
             branches = getattr(self, "_fstat_ref_branches", None)
-            if branches is None and payload.get("gb_free"):
-                # ``_fstat_ref_branches`` is head-local: the head sets it on
-                # its OWN move object before the command. A WORKER that owns
-                # the reference walker has no branch dict at ``setup()``
-                # time (no session is open yet, so no state slice has been
-                # shipped), so ``_gb_free_residual`` takes its early return
-                # and the snapshot is taken against the live residual --
-                # which still has this walker's own GBs subtracted. Loud,
-                # because the epoch cache's fingerprint says ``gbfree=1``
-                # either way and the two residuals are not the same fit.
-                logger.warning(
-                    "%s: F-stat reference walker %d is owned by rank %d, "
-                    "which holds no branch slice during setup() -- the "
-                    "GB-FREE window was NOT opened for this snapshot even "
-                    "though GB_FSTAT_GB_FREE is on. The epoch grid is "
-                    "fitted against that walker's own residual.",
-                    self.name, w_global, owner_rank)
-            with self._gb_free_residual(model, branches, local_index):
-                n_live = int(getattr(self, "_gb_free_n_live", -1))
-                view, intra = self._fstat_ref_shard(acs, local_index)
-                # ``snapshot_ref_rows`` slices ON the owning device; a shard
-                # view carries its own, a single-shard ACA does not, so the
-                # rank's main GPU is passed explicitly.
-                device = getattr(view, "device", None)
-                if device is None and getattr(acs, "gpus", None):
-                    device = int(acs.gpus[0])
-                data_row, psd_row = snapshot_ref_rows(
-                    acs, view, intra, intra, xp=self.xp, device=device)
+            if branches is None:
+                branches = self._fstat_ref_branch_from_payload(
+                    payload.get("gb_branch"))
+            try:
+                with self._gb_free_residual(model, branches, local_index):
+                    gb_free_opened = bool(getattr(self, "_gb_free_opened", False))
+                    n_live = int(getattr(self, "_gb_free_n_live", -1))
+                    view, intra = self._fstat_ref_shard(acs, local_index)
+                    # ``snapshot_ref_rows`` slices ON the owning device; a
+                    # shard view carries its own, a single-shard ACA does
+                    # not, so the rank's main GPU is passed explicitly.
+                    device = getattr(view, "device", None)
+                    if device is None and getattr(acs, "gpus", None):
+                        device = int(acs.gpus[0])
+                    data_row, psd_row = snapshot_ref_rows(
+                        acs, view, intra, intra, xp=self.xp, device=device)
+            except BaseException:
+                if not collective:
+                    raise          # nobody is waiting on us; propagate as-is
+                # Every other rank is about to block in Bcast(header) with no
+                # timeout, and ``ComputeService.handle`` would swallow this
+                # traceback into a reply the head never gets to read. Log it
+                # HERE (the only place it exists) and tell the others through
+                # the status word, so the whole command fails together.
+                logger.exception(
+                    "%s: gb_fstat_ref_row FAILED on the owner rank %d while "
+                    "snapshotting walker %d (local row %d); every compute "
+                    "rank will raise together.",
+                    self.name, owner_rank, w_global, local_index)
+                owner_failed = True
+                data_row = psd_row = None
 
-        if fanout is not None and not fanout.single:
+        if collective:
             comm = fanout.comm
             root = fanout.layout.fanout_rank(owner_rank)
-            header = np.zeros(4, dtype=np.int64)
-            if is_owner:
+            # (status, n_data, n_psd, data_is_complex, psd_is_complex)
+            header = np.zeros(5, dtype=np.int64)
+            if is_owner and not owner_failed:
                 # Normalize to the canonical width FIRST, so the flag the
                 # receivers act on describes the buffer that is actually
                 # sent. Never a cast ACROSS the real/complex boundary: that
                 # is what would silently drop the imaginary part.
                 data_row = np.ascontiguousarray(data_row, dtype=_bcast_dtype(data_row))
                 psd_row = np.ascontiguousarray(psd_row, dtype=_bcast_dtype(psd_row))
-                header[:] = (data_row.size, psd_row.size,
+                header[:] = (1, data_row.size, psd_row.size,
                              np.iscomplexobj(data_row), np.iscomplexobj(psd_row))
             comm.Bcast(header, root=root)
+            # Checked on EVERY rank off the SAME header, so every rank takes
+            # the same branch and the collective count stays symmetric: on
+            # failure all of them raise here, one collective in.
+            if int(header[0]) != 1:
+                raise RuntimeError(
+                    f"{self.name}: gb_fstat_ref_row aborted -- the owner "
+                    f"(rank {owner_rank}, walker {w_global}, local row "
+                    f"{local_index}) could not snapshot the reference row. "
+                    f"The traceback is in rank {owner_rank}'s log; this rank "
+                    "only saw the failure status word."
+                )
+            if int(header[1]) <= 0 or int(header[2]) <= 0:
+                raise RuntimeError(
+                    f"{self.name}: gb_fstat_ref_row broadcast an EMPTY "
+                    f"reference row (data {int(header[1])} elements, invC "
+                    f"{int(header[2])}) from rank {owner_rank}. Scoring the "
+                    "whole epoch against empty rows would be silent, so this "
+                    "refuses instead."
+                )
             if not is_owner:
                 data_row = np.empty(
-                    int(header[0]),
-                    dtype=np.complex128 if header[2] else np.float64)
-                psd_row = np.empty(
                     int(header[1]),
                     dtype=np.complex128 if header[3] else np.float64)
+                psd_row = np.empty(
+                    int(header[2]),
+                    dtype=np.complex128 if header[4] else np.float64)
             comm.Bcast(data_row, root=root)
             comm.Bcast(psd_row, root=root)
 
@@ -19095,6 +19216,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         return {
             "rank": int(getattr(fanout, "rank", 0)),
             "is_owner": bool(is_owner),
+            # Did the GB-free window ACTUALLY open? ``n_live`` cannot answer
+            # that -- 0 is what a disabled window, an empty walker and a
+            # branch-less rank all look like -- and the head's one INFO line
+            # is the only thing an operator reads.
+            "gb_free_opened": bool(gb_free_opened),
             "n_live": int(n_live),
             # ``data_row`` / ``psd_row`` are still the HOST arrays here --
             # ``xp.asarray`` above copied, it did not rebind -- so this is
@@ -19108,13 +19234,45 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                               local_index):
         """HEAD: issue ``gb_fstat_ref_row``; every rank ends holding a holder.
 
-        ``branches`` reaches the owner through ``_fstat_ref_branches`` rather
-        than the payload: it is the live branch dict the GB-free window needs
-        to build its ``BandSorter``, and it is not shippable. Cleared in the
-        ``finally`` so a later command can never reuse a stale one. Only the
-        HEAD's own copy of the op body can see it -- see the warning in
-        :meth:`_gb_serve_fstat_ref_row` for what a worker-owned reference
-        walker means.
+        HOW ``branches`` REACHES THE OWNER. The GB-free window needs a live
+        branch dict to build its ``BandSorter``, and a compute rank has none
+        during ``setup()``. Two routes, chosen by whether a real fan-out
+        exists:
+
+        * **No fan-out, or ONE compute rank** -- ``_fstat_ref_branches``
+          carries the head's own dict straight into the body. Nothing is
+          pickled and nothing is sliced, so this path (every production run
+          today, and the one the stage-B goldens gate) is byte-for-byte what
+          it was. Cleared in a ``finally`` so a later command can never reuse
+          a stale one.
+        * **Several compute ranks** -- the owner's payload carries its
+          BLOCK-SLICED, temp-0 cold branch (:meth:`_fstat_ref_branch_slice`),
+          because the owner is a worker roughly ``1 - 1/n_compute`` of the
+          time and would otherwise open no window at all: the epoch would be
+          fitted against a residual that still has the reference walker's own
+          GBs subtracted -- exactly the walker-dependence the GB-free
+          redesign exists to remove -- while the cache fingerprint still said
+          ``gbfree=1``, so a resume would silently reuse it.
+
+          The HEAD takes the same route when it is the owner under a real
+          fan-out, deliberately: its in-memory ``branches`` is the FULL
+          ensemble while its ACA is only its block, and ``walker=local_index``
+          against a full-ensemble branch picks the right column only when the
+          head's block starts at 0. It does under ``main_rank=0``, but
+          ``main_rank`` is a public ``StockGlobalFit`` knob and
+          ``resolve_roles`` orders ``compute_ranks`` by world rank, so a
+          non-zero one puts the head's block elsewhere and the old path would
+          have restored a DIFFERENT walker's GBs into the right ACA row. One
+          route for every owner removes the trap; it costs a numpy slice of
+          arrays the head already holds, not a round trip.
+
+        PAYLOAD SHAPE. Per-rank, but only in the one field no rank but the
+        owner reads: every non-owner gets the identical base dict, and the
+        owner gets that same dict plus ``gb_branch``. Everything the
+        COLLECTIVE depends on -- ``owner_rank``, and therefore the ``root``
+        every rank computes -- is identical on every rank, which is the
+        invariant that actually matters; broadcasting megabytes of branch to
+        ranks that would throw them away is not.
 
         With NO fan-out at all (``_propose_legacy``, ``fit.sample()``) this
         is a direct call to the body -- no communicator is touched and the
@@ -19125,26 +19283,61 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         Returns ``{rank: reply}``, the shape :meth:`_fanout_cmd` produces.
         """
-        self._fstat_ref_branches = branches
-        payload = self._fstat_ref_row_payload(
-            w_global, owner_rank, local_index, branches is not None)
         fanout = getattr(self, "fanout", None)
+        # The payload's ``gb_free`` is what the head ASKED FOR, so it has to
+        # account for the env flag too -- otherwise a rank that skipped the
+        # window because GB_FSTAT_GB_FREE=0 is indistinguishable from one that
+        # skipped it because it had no branch.
+        gb_free_requested = (branches is not None
+                             and os.environ.get("GB_FSTAT_GB_FREE", "1") == "1")
+        base_payload = self._fstat_ref_row_payload(
+            w_global, owner_rank, local_index, gb_free_requested)
+
         if fanout is None:
+            self._fstat_ref_branches = branches
             try:
-                result = self._gb_serve_fstat_ref_row(payload, {}, model)
+                result = self._gb_serve_fstat_ref_row(base_payload, {}, model)
             finally:
                 self._fstat_ref_branches = None
             logger.info(
                 "%s: F-stat reference row built in-process from walker %d "
-                "(no fan-out); %d cold GB signal(s) restored for the "
-                "snapshot; %.1f MB residual + %.1f MB invC",
-                self.name, int(w_global), int(result.get("n_live", -1)),
+                "(no fan-out); GB-free window %s, %d cold GB signal(s) "
+                "restored for the snapshot; %.1f MB residual + %.1f MB invC",
+                self.name, int(w_global),
+                "OPEN" if result.get("gb_free_opened") else "not opened",
+                int(result.get("n_live", -1)),
                 result.get("data_bytes", 0) / 1e6,
                 result.get("psd_bytes", 0) / 1e6)
+            self._warn_if_gb_free_missed(
+                gb_free_requested, bool(result.get("gb_free_opened")),
+                owner_rank, w_global)
             return {0: result}
+
+        owner_payload = base_payload
+        if fanout.single:
+            # ONE compute rank: no slicing and nothing on the wire -- the
+            # head's live dict goes through ``_fstat_ref_branches`` exactly
+            # as it always has, and every rank (there is one) gets the same
+            # payload object.
+            self._fstat_ref_branches = branches
+        else:
+            self._fstat_ref_branches = None
+            owner_payload = dict(base_payload)
+            if gb_free_requested:
+                ow0, ow1 = fanout.layout.block_of(owner_rank)
+                owner_payload["gb_branch"] = self._fstat_ref_branch_slice(
+                    branches, ow0, ow1)
+
+        def per_rank(rank, w0, w1):
+            # Only the OWNER's payload differs, and only in ``gb_branch``,
+            # which no other rank reads. Every field the COLLECTIVE depends
+            # on -- ``owner_rank``, hence the ``root`` each rank derives --
+            # is the same object on every rank.
+            return owner_payload if int(rank) == owner_rank else base_payload
+
         try:
             replies, _token = self._fanout_cmd(
-                "gb_fstat_ref_row", lambda rank, w0, w1: payload, model)
+                "gb_fstat_ref_row", per_rank, model)
         finally:
             self._fstat_ref_branches = None
         owner_reply = next(
@@ -19154,18 +19347,53 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # the per-rank cost; prefer the OWNER's, which measured them before
         # the broadcast.
         sized = owner_reply or next((r for r in replies.values() if r), {})
+        opened = bool((owner_reply or {}).get("gb_free_opened"))
         logger.info(
             "%s: F-stat reference row replicated to %d rank(s) from walker "
-            "%d (rank %d, local row %d); %d cold GB signal(s) restored for "
-            "the snapshot; %.1f MB residual + %.1f MB invC per rank",
+            "%d (rank %d, local row %d); GB-free window %s, %d cold GB "
+            "signal(s) restored for the snapshot; %.1f MB residual + %.1f MB "
+            "invC per rank",
             self.name, len(replies), int(w_global), int(owner_rank),
-            int(local_index), n_live,
+            int(local_index), "OPEN" if opened else "not opened", n_live,
             (sized.get("data_bytes") or 0) / 1e6,
             (sized.get("psd_bytes") or 0) / 1e6)
+        self._warn_if_gb_free_missed(gb_free_requested, opened,
+                                     owner_rank, w_global)
         return replies
 
+    def _warn_if_gb_free_missed(self, requested, opened, owner_rank, w_global):
+        """The safety net: say so when a requested GB-free window never opened.
+
+        The head's one INFO line is what an operator reads, and ``n_live == 0``
+        is ambiguous -- it is what ``GB_FSTAT_GB_FREE=0`` looks like, what a
+        walker holding no cold GBs looks like, and what a rank that was handed
+        no branch looks like. Meanwhile ``_run_fstat_fit`` stamps
+        ``gbfree=<env flag>`` into the epoch's cache fingerprint either way, so
+        a silent miss here is resumed as a GB-free grid forever.
+        """
+        if not requested or opened:
+            return
+        logger.warning(
+            "%s: the F-stat GB-FREE window did NOT open on rank %d for "
+            "reference walker %d, although the head requested it. This "
+            "epoch's grid is fitted against that walker's own residual while "
+            "its cache fingerprint claims gbfree=1 -- the branch the owner "
+            "was given did not reach the GB-free window.",
+            self.name, int(owner_rank), int(w_global))
+
     def _fstat_release_ref_row(self):
-        """Drop the replicated row holder (head + ranks) after the fit."""
+        """Drop the replicated row holder after the fit. HEAD-SIDE ONLY today.
+
+        TODO (Task 8/9 wiring): nothing calls this yet -- the caller is
+        ``setup()``, once the grid fit AND the centre table are both done
+        (they must score against the same reference row, the 2026-08-24
+        same-residual rule). Until that lands, the holder is released on no
+        rank at all, and a COMPUTE rank never releases it even afterwards:
+        a rank cannot know which ``gb_fstat_stage_b`` command was the last,
+        so it keeps its pair until the next ``gb_fstat_ref_row`` overwrites
+        it. That is tens of MB per worker surviving between fits, which is
+        the accepted trade; it is not a leak that grows.
+        """
         self._fstat_ref_holder = None
         self._fstat_ref_call = None
         self._fstat_ref_walker = None
@@ -21771,6 +21999,14 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             # owner's count in its one log line, and "no window was opened"
             # must read as 0 restored signals, never as the previous fit's
             # number (see _gb_serve_fstat_ref_row).
+            #
+            # ``_gb_free_opened`` is the load-bearing half. A count of 0 is
+            # AMBIGUOUS -- it is what GB_FSTAT_GB_FREE=0 looks like, what a
+            # walker with no cold GBs looks like, and what a rank that was
+            # handed no branch looks like -- so the head cannot tell "the
+            # window was disabled" from "the window silently never opened"
+            # out of the count alone. The flag can.
+            self._gb_free_opened = False
             self._gb_free_n_live = 0
             yield
             return
@@ -21796,6 +22032,7 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         )
         sel = dict(temp=0, walker=int(walker_ref), apply_inds=True)
         n_live = int(sorter.get_subset_bool(**sel).sum())
+        self._gb_free_opened = True
         self._gb_free_n_live = n_live
         logger.info(
             "%s: F-stat GB-FREE residual: restoring %d cold GB signal(s) "

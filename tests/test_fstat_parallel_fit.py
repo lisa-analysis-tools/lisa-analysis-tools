@@ -15,6 +15,8 @@ import os
 import shutil
 import tempfile
 import unittest
+import warnings
+from unittest import mock
 
 import numpy as np
 
@@ -602,8 +604,16 @@ def _build_fake_layout(nwalkers, n_compute):
     from lisatools.globalfit.communication.fakecomm import FakeWorld
 
     world = FakeWorld(n_compute + 1)
-    out = world.run(lambda r, comm: R.build_layout(
-        comm, nwalkers, list(range(n_compute))))
+    # ``gpu_pool`` is ``[0]`` -- ONE device -- while these fixtures ask for up
+    # to ``n_compute`` compute ranks, which ``build_layout`` warns about
+    # ("size-N launch on a per-node GPU pool [0] that supports only 1 compute
+    # rank"). That over-subscription is deliberate and irrelevant here (no
+    # device is ever touched), so swallow it rather than let every layout
+    # fixture smear the warning across the test log.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        out = world.run(lambda r, comm: R.build_layout(
+            comm, nwalkers, list(range(n_compute))))
     return out[0]
 
 
@@ -854,10 +864,12 @@ class RefRowOpTest(unittest.TestCase):
     def test_payload_is_identical_for_every_rank(self):
         """The op is SYMMETRIC: every rank must compute the same ``root``.
 
-        ``_fstat_ref_row_fanout`` ships one dict through
-        ``lambda rank, w0, w1: payload``, so the payload cannot depend on the
-        rank -- a per-rank ``owner_rank`` would have the ranks broadcasting
-        against different roots and deadlock the run.
+        The base payload is one dict shared by every rank, so none of the
+        fields ``root = layout.fanout_rank(payload["owner_rank"])`` depends
+        on can vary by rank -- that would have them broadcasting against
+        different roots and deadlock the run. (The owner alone gets a
+        ``gb_branch`` slice added on top; see
+        ``test_only_the_owner_payload_carries_the_branch_slice``.)
         """
         from lisatools.globalfit.moves import gbspecialstretch as gbs
 
@@ -868,6 +880,161 @@ class RefRowOpTest(unittest.TestCase):
         self.assertEqual(
             gbs.GBSpecialBase._fstat_ref_row_payload(6, 3, 2, None)["gb_free"],
             False)
+
+    def test_branch_slice_round_trips_what_bandsorter_needs(self):
+        """The shipped slice must satisfy ``BandSorter``'s actual contract.
+
+        ``BandSorter.__init__``'s non-copy path reads exactly
+        ``gb_branch.shape`` / ``.inds`` / ``.coords`` (gbbands.py :5564-5578,
+        :5627) and stores the object as ``gb_branch_orig``, which nothing
+        reads back -- so a bare ``Branch(coords, inds=inds)`` is enough. It
+        must ALSO not look like a BandSorter to the copy-constructor branch,
+        whose test is ``hasattr(gb_branch, "num_sources")``.
+
+        The slice is the owner's BLOCK and TEMP 0 only: ``walker_inds`` is
+        handed straight to ``fill_template`` as the ACA row index, so the
+        walker axis has to BE the rank's block for ``walker=local_index`` to
+        address the branch column and the ACA row identically.
+        """
+        from eryn.state import Branch
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialBase.__new__(gbs.GBSpecialBase)
+        move.branch_name = "gb"
+        ntemps, nw, nleaves, ndim = 3, 8, 4, 9
+        rng = np.random.default_rng(23)
+        coords = rng.normal(size=(ntemps, nw, nleaves, ndim))
+        inds = rng.random((ntemps, nw, nleaves)) > 0.5
+        blob = move._fstat_ref_branch_slice(
+            {"gb": Branch(coords, inds=inds)}, 4, 8)
+
+        self.assertEqual(blob["coords"].shape, (1, 4, nleaves, ndim))
+        self.assertEqual(blob["inds"].shape, (1, 4, nleaves))
+        np.testing.assert_array_equal(blob["coords"], coords[0:1, 4:8])
+        np.testing.assert_array_equal(blob["inds"], inds[0:1, 4:8])
+        self.assertTrue(blob["coords"].flags["C_CONTIGUOUS"])
+        self.assertEqual(blob["inds"].dtype, np.bool_)
+
+        back = move._fstat_ref_branch_from_payload(blob)
+        branch = back["gb"]
+        self.assertEqual(branch.shape, (1, 4, nleaves, ndim))
+        np.testing.assert_array_equal(branch.coords, coords[0:1, 4:8])
+        np.testing.assert_array_equal(branch.inds, inds[0:1, 4:8])
+        self.assertFalse(hasattr(branch, "num_sources"),
+                         "a Branch must not take BandSorter's copy path")
+        # temp 0 of the slice is temp 0 of the original, for the block's rows
+        np.testing.assert_array_equal(branch.coords[0, 2], coords[0, 6])
+
+    def test_branch_slice_is_none_without_a_branch(self):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialBase.__new__(gbs.GBSpecialBase)
+        move.branch_name = "gb"
+        self.assertIsNone(move._fstat_ref_branch_slice(None, 0, 4))
+        self.assertIsNone(move._fstat_ref_branch_slice({}, 0, 4))
+        self.assertIsNone(move._fstat_ref_branch_from_payload(None))
+
+    def test_fanout_reads_replies_as_the_bare_result_dicts(self):
+        """``_fanout_cmd`` yields ``{rank: result}``, not ``{rank: {"result"}}``.
+
+        ``WalkerFanout.run`` unwraps the reply envelope itself before
+        ``merge`` (``fanout.py`` :172 single / :262 multi), so indexing
+        ``r["result"]`` here would ``KeyError`` on the FIRST multi-rank
+        refit -- a crash no single-rank test can reach. This pins the shape
+        and the owner-reply pick together.
+        """
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialBase.__new__(gbs.GBSpecialBase)
+        move.name = "gb_test"
+        move.branch_name = "gb"
+        move.fanout = _StubFanout(_build_fake_layout(8, 2), lls=None)
+        move.fanout.single = False
+        seen = {}
+
+        def fake_cmd(op, per_rank_payload, model):
+            seen["op"] = op
+            seen["payloads"] = {r: per_rank_payload(r, 0, 4) for r in (0, 1)}
+            return ({
+                0: {"rank": 0, "is_owner": False, "gb_free_opened": False,
+                    "n_live": -1, "data_bytes": 40, "psd_bytes": 20},
+                1: {"rank": 1, "is_owner": True, "gb_free_opened": True,
+                    "n_live": 7, "data_bytes": 4_000_000,
+                    "psd_bytes": 2_000_000},
+            }, ("seq", 1))
+
+        move._fanout_cmd = fake_cmd
+        with self.assertLogs(gbs.logger, level="INFO") as captured:
+            replies = move._fstat_ref_row_fanout(None, None, 6, 1, 2)
+
+        self.assertEqual(seen["op"], "gb_fstat_ref_row")
+        self.assertEqual(set(replies), {0, 1})
+        line = "\n".join(captured.output)
+        # the OWNER's numbers, not rank 0's: n_live 7 and 4.0 MB
+        self.assertIn("7 cold GB signal(s)", line)
+        self.assertIn("4.0 MB residual", line)
+        self.assertIn("2.0 MB invC", line)
+        self.assertIn("GB-free window OPEN", line)
+        # branches=None -> nothing was requested -> no false alarm
+        self.assertFalse(any("did NOT open" in x for x in captured.output))
+
+    def test_a_requested_but_unopened_gb_free_window_warns_on_the_head(self):
+        """The safety net: the head must SAY SO when the owner reports the
+        window never opened. Its own INFO line is the only thing an operator
+        reads, and ``n_live == 0`` is indistinguishable from a correctly
+        disabled window."""
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialBase.__new__(gbs.GBSpecialBase)
+        move.name = "gb_test"
+        move.branch_name = "gb"
+        move.fanout = _StubFanout(_build_fake_layout(8, 2), lls=None)
+        move.fanout.single = False
+        move._fanout_cmd = lambda op, prp, model: ({
+            1: {"rank": 1, "is_owner": True, "gb_free_opened": False,
+                "n_live": 0, "data_bytes": 8, "psd_bytes": 8},
+        }, None)
+        move._fstat_ref_branch_slice = lambda branches, a, b: {"coords": 1}
+
+        with mock.patch.dict(os.environ, {"GB_FSTAT_GB_FREE": "1"}), \
+                self.assertLogs(gbs.logger, level="WARNING") as captured:
+            move._fstat_ref_row_fanout(None, {"gb": object()}, 6, 1, 2)
+        self.assertTrue(any("did NOT open" in x for x in captured.output))
+
+    def test_only_the_owner_payload_carries_the_branch_slice(self):
+        """Per-rank payload, but identical in every field the COLLECTIVE uses.
+
+        Every rank derives ``root`` from ``owner_rank``, so those fields must
+        match everywhere or the ranks broadcast against different roots and
+        hang. The branch slice is megabytes and only the owner reads it.
+        """
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialBase.__new__(gbs.GBSpecialBase)
+        move.name = "gb_test"
+        move.branch_name = "gb"
+        move.fanout = _StubFanout(_build_fake_layout(8, 2), lls=None)
+        move.fanout.single = False
+        move._fstat_ref_branch_slice = lambda branches, a, b: {"block": (a, b)}
+        grabbed = {}
+
+        def fake_cmd(op, per_rank_payload, model):
+            grabbed.update({r: per_rank_payload(r, 0, 4)
+                            for r in move.fanout.layout.compute_ranks})
+            return ({1: {"rank": 1, "is_owner": True, "gb_free_opened": True,
+                         "n_live": 3, "data_bytes": 8, "psd_bytes": 8}}, None)
+
+        move._fanout_cmd = fake_cmd
+        with mock.patch.dict(os.environ, {"GB_FSTAT_GB_FREE": "1"}):
+            move._fstat_ref_row_fanout(None, {"gb": object()}, 6, 1, 2)
+
+        owner = grabbed.pop(1)
+        self.assertIn("gb_branch", owner)
+        self.assertEqual(owner["gb_branch"], {"block": (4, 8)})  # owner's block
+        for rank, p in grabbed.items():
+            self.assertNotIn("gb_branch", p, f"rank {rank} got the slice")
+            for key in ("walker_ref", "owner_rank", "local_index", "gb_free"):
+                self.assertEqual(p[key], owner[key], f"rank {rank}: {key}")
 
     def test_wire_dtype_never_crosses_the_real_complex_boundary(self):
         """``_bcast_dtype`` normalizes WIDTH, never realness.
