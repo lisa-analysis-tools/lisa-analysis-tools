@@ -1546,12 +1546,17 @@ def run_stacked_stage_b(call_fstat: Callable, peaks, *, xp, Tobs: float,
 def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
                        band_edges_hz, f0_lims_hz, mc_lims, cache_dir: str,
                        fingerprint_extra: str = "", epoch=None,
-                       ratio_max=None):
+                       ratio_max=None, sweep_runner=None):
     """Full fit with resume: comb scan -> peak select -> stage B.
 
     ``epoch`` selects the peak-box weighting tilt only (see
     :func:`peak_weight_alpha_env`); it does not change what is computed or
     cached, so the npz caches stay interchangeable across epochs.
+
+    ``sweep_runner`` is forwarded to :func:`run_stacked_stage_b`; ``None``
+    is the serial per-group kernel stream. The stacked-cache short circuit
+    below it is unchanged -- a complete epoch never re-enters the kernel,
+    parallel or not.
 
     Cache reuse IS the mid-fit resume, and it is always on:
 
@@ -1597,6 +1602,11 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
         )
         return stacked, int(len(d["peak_f0_mHz"]))
 
+    # Stage A's wall, on its own line. It is HEAD-ONLY work under the
+    # multi-rank fit (design spec decision 3), and its epoch-1 cost is the
+    # trigger for deciding whether it gets split too -- so it has to be
+    # readable directly, not inferred by subtracting stage B from the fit.
+    _t_stage_a = time.time()
     if os.path.exists(comb_cache):
         d = np.load(comb_cache, allow_pickle=False)
         logger.info("[fit] reusing comb cache %s; re-selecting peaks",
@@ -1611,11 +1621,16 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
             f0_lims_hz=f0_lims_hz, mc_lims=mc_lims, cache_path=cache_path,
             fingerprint_extra=fingerprint_extra,
         )
+    logger.info("[stageA] comb + peak selection: %d peaks in %s "
+                "(head-only; see the parallel-fit design spec for when this "
+                "becomes worth splitting too)",
+                int(len(peaks)), _fmt_secs(time.time() - _t_stage_a))
 
     stacked = run_stacked_stage_b(
         call_fstat, peaks, xp=xp, Tobs=Tobs, band_edges_hz=band_edges_hz,
         mc_lims=mc_lims, ratio_max=ratio_max, cache_path=cache_path,
         fingerprint_extra=fingerprint_extra, epoch=epoch,
+        sweep_runner=sweep_runner,
     )
     return stacked, int(len(peaks))
 

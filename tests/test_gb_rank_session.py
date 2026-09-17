@@ -487,14 +487,16 @@ class DispatchTest(unittest.TestCase):
 
     def test_ops_constant(self):
         """The op names are a wire contract: the head issues exactly these and
-        a rank refuses anything else. The first three are the per-propose
-        session; the last two are the F-stat epoch fit, issued from the head's
-        ``setup()`` with no session open (parallel-fit spec 2026-09-16).
+        a rank refuses anything else. The first four are the per-propose
+        session; the last three are the F-stat epoch fit, issued from the
+        head's ``setup()`` with no session open (parallel-fit spec
+        2026-09-16) -- replicate the reference row, split stage B, then
+        release the row on every rank.
         """
         self.assertEqual(
             gbs.GB_OPS,
             ("gb_run_proposal", "gb_run_tempering", "gb_finish", "gb_sync",
-             "gb_fstat_ref_row", "gb_fstat_stage_b"),
+             "gb_fstat_ref_row", "gb_fstat_stage_b", "gb_fstat_release"),
         )
 
     def test_gb_moves_are_no_longer_fanout_unready(self):

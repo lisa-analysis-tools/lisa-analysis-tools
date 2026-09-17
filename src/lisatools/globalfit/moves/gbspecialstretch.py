@@ -1974,15 +1974,17 @@ def _buffer_fixed_capacity_active(sorter, kwargs) -> bool:
 #: back with ``gb_sync``, which is where the finish-time authoritative rebuild
 #: (``check_ll_inject``) actually happens. It is issued ONLY in replica mode
 #: and opens no session (``gb_finish`` has already torn it down).
-#: The LAST TWO are the F-stat epoch fit (parallel-fit spec 2026-09-16), not
+#: The LAST THREE are the F-stat epoch fit (parallel-fit spec 2026-09-16), not
 #: part of that session: they are issued from the head's ``setup()`` BEFORE
 #: any session exists -- harmless, because the session token is captured from
 #: the opening ``gb_run_proposal`` and ``call_index`` is counted per
 #: ``(move, op)``. ``gb_fstat_ref_row`` replicates the reference walker's
 #: residual + inverse-PSD rows to every rank; ``gb_fstat_stage_b`` splits the
-#: epoch grid sweep by contiguous box range.
+#: epoch grid sweep by contiguous box range; ``gb_fstat_release`` drops the
+#: replicated row -- and the sig-het scorer cached beside it, which is the
+#: expensive half -- on every rank once the fit's last group is assembled.
 GB_OPS = ("gb_run_proposal", "gb_run_tempering", "gb_finish", "gb_sync",
-          "gb_fstat_ref_row", "gb_fstat_stage_b")
+          "gb_fstat_ref_row", "gb_fstat_stage_b", "gb_fstat_release")
 
 #: F-stat op -> the ``GBSpecialRJFStatGridMove`` attribute its served body
 #: needs. ``gf_serve`` checks this before dispatching, so a command addressed
@@ -18212,6 +18214,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             return self._gb_serve_finish(payload, clock, model)
         if op == "gb_sync":
             return self._gb_serve_sync(payload, clock, model)
+        if op == "gb_fstat_release":
+            # Deliberately NOT behind ``_FSTAT_OP_REQUIRES``, unlike the other
+            # two F-stat ops: this body reads nothing that belongs to
+            # ``GBSpecialRJFStatGridMove`` -- it clears the ``_fstat_ref_*``
+            # attributes the BASE declares and frees the pool -- and a
+            # release that REFUSED would
+            # leave that rank holding the replicated row plus its ~GB sig-het
+            # scorer with nothing left in the protocol to drop them. A release
+            # must never be the thing that fails.
+            return self._gb_serve_fstat_release(payload, clock, model)
         if op in _FSTAT_OP_REQUIRES:
             self._require_fstat_grid_move(op)
             if op == "gb_fstat_ref_row":
@@ -19481,21 +19493,111 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             self.name, int(owner_rank), int(w_global))
 
     def _fstat_release_ref_row(self):
-        """Drop the replicated row holder after the fit. HEAD-SIDE ONLY today.
+        """Drop this rank's replicated row holder AND its cached scorer.
 
-        TODO (Task 8/9 wiring): nothing calls this yet -- the caller is
-        ``setup()``, once the grid fit AND the centre table are both done
-        (they must score against the same reference row, the 2026-08-24
-        same-residual rule). Until that lands, the holder is released on no
-        rank at all, and a COMPUTE rank never releases it even afterwards:
-        a rank cannot know which ``gb_fstat_stage_b`` command was the last,
-        so it keeps its pair until the next ``gb_fstat_ref_row`` overwrites
-        it. That is tens of MB per worker surviving between fits, which is
-        the accepted trade; it is not a leak that grows.
+        Two callers, on the two sides of the wire:
+
+        * the HEAD, from ``setup()``'s ``finally``, once the grid fit AND the
+          centre table are done -- they must score against the same reference
+          row (the 2026-08-24 same-residual rule), so the release cannot
+          happen between them;
+        * every COMPUTE rank, serving ``gb_fstat_release``, which the head
+          issues from :meth:`_run_fstat_fit` as soon as the last stage-B group
+          is assembled and the epoch's artifacts are written. A rank cannot
+          tell which ``gb_fstat_stage_b`` command was the last, so the head
+          -- which can -- says so explicitly.
+
+        ``_fstat_ref_call`` is the expensive half, not the rows: it holds the
+        BUILT sig-het scorer, whose bucketed reference blocks can be ~GB on
+        device, and nothing else invalidates it (``_gb_serve_fstat_ref_row``
+        only resets it when a NEW row arrives, which at
+        ``GB_FSTAT_REFIT_EVERY=50`` is ~50 iterations of GB proposals later).
         """
         self._fstat_ref_holder = None
         self._fstat_ref_call = None
         self._fstat_ref_walker = None
+
+    def _gb_serve_fstat_release(self, payload, clock, model):
+        """Drop this rank's replicated F-stat reference row; free the pool.
+
+        NON-SESSION (the head issues it from ``setup()``, like the other two
+        F-stat ops) and, unlike ``gb_fstat_ref_row``, NO COLLECTIVE and NO
+        PAYLOAD: nothing here can block on another rank, so a failure on one
+        surfaces as an ordinary remote failure instead of parking the rest.
+
+        UNCONDITIONAL, on every rank including the head's own local body --
+        which is why the head's driver (:meth:`_fstat_release_fanout`) saves
+        and restores its holder around the command rather than teaching this
+        body about roles: a memory-reclaim command with a rank-dependent
+        branch is one mis-set flag away from being the thing that keeps the
+        memory.
+
+        Returns ``{"rank", "released"}``; ``released`` says whether this rank
+        was actually holding anything, so the head's line reports a measured
+        count rather than the number of ranks it asked.
+        """
+        held = (self._fstat_ref_holder is not None
+                or self._fstat_ref_call is not None)
+        self._fstat_release_ref_row()
+        # ``getattr``: this must work on any GB move (see ``gf_serve``), and
+        # the pool is what actually hands the device memory back -- dropping
+        # the references alone only makes the blocks reusable by THIS process.
+        pool = getattr(self, "mempool", None)
+        if pool is not None:
+            pool.free_all_blocks()
+        fanout = getattr(self, "fanout", None)
+        logger.info(
+            "%s%s: F-stat reference row released (%s).", self._rank_tag(),
+            self.name, "was held" if held else "nothing was held")
+        return {"rank": None if fanout is None else int(fanout.rank),
+                "released": bool(held)}
+
+    def _fstat_release_fanout(self, model):
+        """HEAD: ``gb_fstat_release`` -- every WORKER drops its reference row.
+
+        Issued from :meth:`_run_fstat_fit` once the last stage-B group has
+        been assembled and the epoch's ``.npz`` + ``DONE.json`` are written.
+        Stage A and the centre table are head-only, so no worker's holder is
+        needed past that point, and waiting for the next fit would leave the
+        row plus its built sig-het scorer idle on every worker's device for
+        ``GB_FSTAT_REFIT_EVERY`` (50) iterations of GB proposals.
+
+        THE HEAD KEEPS ITS OWN. ``WalkerFanout.run`` always runs
+        ``local_body`` (``fanout.py`` :225 / :258), so the head serves this
+        command too -- and its holder is exactly what
+        :meth:`_install_ctr_table` still has to score against (spec decision
+        6). Rather than give the served body a role branch, the head saves the
+        three attributes and puts them back in a ``finally``. The body's
+        ``free_all_blocks`` cannot reclaim those arrays while ``saved`` holds
+        a reference to them, so the head's row survives the pool sweep as
+        well as the assignment.
+
+        No-op with no fan-out, and at ONE compute rank (there is no other rank
+        to release, and the byte-identity-gated single-rank path must not grow
+        a command it never had). Returns ``{rank: reply}``.
+        """
+        fanout = getattr(self, "fanout", None)
+        if fanout is None or fanout.single:
+            return {}
+        saved = (self._fstat_ref_holder, self._fstat_ref_call,
+                 self._fstat_ref_walker)
+        try:
+            replies, _token = self._fanout_cmd(
+                "gb_fstat_release", lambda rank, w0, w1: None, model)
+        finally:
+            (self._fstat_ref_holder, self._fstat_ref_call,
+             self._fstat_ref_walker) = saved
+        # The head's own reply says "released" too -- its body ran like every
+        # other rank's -- but its row is back by the time this line is
+        # written, so counting it would misreport what was actually freed.
+        head = fanout.layout.head_rank
+        workers = [r for rank, r in replies.items() if rank != head]
+        n_held = sum(1 for r in workers if (r or {}).get("released"))
+        logger.info(
+            "%s: F-stat reference row released on %d of %d worker rank(s); "
+            "the head keeps its own until the centre table is built.",
+            self.name, n_held, len(workers))
+        return replies
 
     def _fstat_holder_call(self, model):
         """The holder-scored ``call_fstat``, built ONCE per fit on this rank.
@@ -22452,19 +22554,75 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
                         "again; residual restored.", self.name, n_live)
 
     def _run_fstat_fit(self, model, k: int, branches=None):
+        """Fit epoch ``k``'s F-stat grid. HEAD-side; the ranks serve commands.
+
+        Three things differ from the single-process fit, all of them forced
+        by the walker-block layout (design spec 2026-09-16):
+
+        1. The reference walker is the GLOBAL argmax
+           (:meth:`_fstat_global_reference`), not this rank's local one.
+        2. The whole sweep scores through the REPLICATED reference row
+           (``gb_fstat_ref_row``), not the live residual -- so the GB-free
+           window is opened once, on the OWNING rank, around the snapshot,
+           and no rank's residual stays mutated for the hours the fit runs.
+           That is why no ``_gb_free_residual`` wrapper survives here: the
+           window now lives inside the op body, on the rank that owns the
+           walker, and the head's own residual is never touched.
+        3. Stage B is split per Mc group by contiguous box range over every
+           compute rank (``gb_fstat_stage_b``); stage A stays here.
+
+        ORDERING IS LOAD-BEARING, twice over. The row is replicated FIRST,
+        and the holder-scored ``call_fstat`` is then built HERE, before
+        ``run_fstat_grid_fit`` is entered -- not lazily inside it. That is
+        what makes stage A, every rank's stage B and the centre table score
+        ONE residual snapshot (spec decision 6), and it is what gives
+        :meth:`_fstat_stage_b_runner`'s "is this my cached scorer?" guard
+        something real to compare against: with ``_fstat_ref_call`` still
+        ``None`` on both sides that check would pass vacuously.
+
+        At ONE compute rank all three collapse: the reference is the same
+        walker, the holder is built from this process's own rows with no
+        MPI, and ``sweep_runner`` stays ``None`` -- the serial path, whose
+        grids are pinned byte-for-byte by
+        ``tests/test_fstat_parallel_fit.py``'s goldens.
+
+        The workers' holders go as soon as the last group is assembled and
+        this epoch's artifacts are written (:meth:`_fstat_release_fanout`);
+        the HEAD's own survives until the centre table has used it, and is
+        released by ``setup()``'s ``finally``.
+        """
         from lisatools.sampling.fstat_gridfit import run_fstat_grid_fit
 
         cache_dir = self._epoch_dir(k)
         os.makedirs(cache_dir, exist_ok=True)
-        walker_ref = self._fstat_reference_walker(model)
+        w_global, owner_rank, local_index, lls = self._fstat_global_reference(
+            model)
+        _fanout = getattr(self, "fanout", None)
+        n_compute = 1 if _fanout is None else int(_fanout.layout.n_compute)
         # Auditability: the epoch line carries the reference walker's total
-        # lnL (residual+PSD combination) alongside its index, so a run log
-        # shows WHICH state each epoch's grid was fitted against -- "same
-        # peaks after a refit" is only diagnosable with this visible.
+        # lnL (residual+PSD combination) alongside its GLOBAL index and the
+        # rank that owns it, so a run log shows WHICH state each epoch's grid
+        # was fitted against -- "same peaks after a refit" is only
+        # diagnosable with this visible.
         try:
-            _lls = _to_numpy(model.analysis_container_arr.likelihood())
-            _ll_ref, _ll_spread = (float(_lls[walker_ref]),
-                                   float(_lls.max() - _lls.min()))
+            if lls.size > w_global:
+                _ll_ref = float(lls[w_global])
+                _ll_spread = (float(lls.max() - lls.min()) if lls.size > 1
+                              else float("nan"))
+            elif _fanout is None:
+                # ``_fstat_global_reference`` reports an all-NaN length-1
+                # placeholder when there is no fan-out to gather through
+                # (``_propose_legacy``, ``fit.sample()``) -- but on THAT path
+                # this process's ACA holds every walker and the global index
+                # IS the row, so the epoch line keeps the lnL it has always
+                # carried. Not attempted under a fan-out: there the ACA is
+                # this rank's BLOCK, and ``lls[w_global]`` would silently be
+                # some other walker's number.
+                _lls = _to_numpy(model.analysis_container_arr.likelihood())
+                _ll_ref = float(_lls[w_global])
+                _ll_spread = float(_lls.max() - _lls.min())
+            else:
+                _ll_ref = _ll_spread = float("nan")
         except Exception:
             _ll_ref, _ll_spread = float("nan"), float("nan")
         band_edges = _to_numpy(self.band_edges)
@@ -22472,40 +22630,53 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         f0_lims = (float(band_edges[1]), float(band_edges[-2]))
         mc_lims = self.fstat_fit_kwargs.get("mc_lims") or [0.001, 1.0]
         t0 = time.perf_counter()
-        logger.info("%s: F-stat grid fit epoch %d starting (walker_ref=%d, "
-                    "lnL=%.3f, cold-walker lnL spread=%.3f, cache %s)",
-                    self.name, k, walker_ref, _ll_ref, _ll_spread, cache_dir)
-        # The sweep scores through ``self._fstat_call``, which reads the LIVE
-        # residual -- so the GB-free window has to wrap the call, not just
-        # the setup.
-        #
-        # THE FLAG IS PART OF THE FINGERPRINT. ``GB_FSTAT_GB_FREE`` changes the
-        # RESIDUAL the sweep runs against but nothing else about the sweep's
-        # inputs, so without this the two modes produce different grids under
-        # the SAME cache key: flip the flag, refit at the same epoch, and the
-        # checkpoint layer hands back the other mode's grid with no error and
-        # no warning. Inert at epoch 0 (nothing to restore when the reference
-        # walker holds no GBs) and therefore invisible until the first real
-        # refit -- exactly the silent-cache-reuse case the fingerprint exists
-        # to prevent.
+        logger.info(
+            "%s: F-stat grid fit epoch %d starting (walker_ref=%d GLOBAL on "
+            "rank %d row %d, lnL=%.3f, cold-walker lnL spread=%.3f, "
+            "n_compute=%d, cache %s)",
+            self.name, k, w_global, owner_rank, local_index, _ll_ref,
+            _ll_spread, n_compute, cache_dir)
+        # THE FLAG IS PART OF THE FINGERPRINT. ``GB_FSTAT_GB_FREE`` changes
+        # the RESIDUAL the sweep runs against but nothing else about the
+        # sweep's inputs, so without this the two modes produce different
+        # grids under the SAME cache key: flip the flag, refit at the same
+        # epoch, and the checkpoint layer hands back the other mode's grid
+        # with no error and no warning. Inert at epoch 0 (nothing to restore
+        # when the reference walker holds no GBs) and therefore invisible
+        # until the first real refit -- exactly the silent-cache-reuse case
+        # the fingerprint exists to prevent.
         _gb_free = os.environ.get("GB_FSTAT_GB_FREE", "1") == "1"
-        with self._gb_free_residual(model, branches, walker_ref):
-            stacked, n_peaks = run_fstat_grid_fit(
-                self._fstat_call(model, walker_ref),
-                xp=self.xp,
-                # 1.0/self.df, NOT basis_settings.Tobs: the latter is absent
-                # on FDSettings, and under FSTAT_FDOT_AXIS this value is no
-                # longer only a node-density input -- it sets the f_mid shear
-                # coefficient, so a wrong one costs acceptance on every birth.
-                Tobs=1.0 / float(self.df),
-                band_edges_hz=band_edges,
-                f0_lims_hz=f0_lims,
-                mc_lims=mc_lims,
-                ratio_max=_gb_fdot_astro_ratio_max(self),
-                cache_dir=cache_dir,
-                fingerprint_extra=f"|epoch={k}|gbfree={int(_gb_free)}",
-                epoch=k,
-            )
+        self._fstat_ref_row_fanout(model, branches, w_global, owner_rank,
+                                   local_index)
+        # Built (and cached on ``_fstat_ref_call``) before anything can score
+        # -- see ORDERING above.
+        call_fstat = self._fstat_holder_call(model)
+        stacked, n_peaks = run_fstat_grid_fit(
+            call_fstat,
+            xp=self.xp,
+            # 1.0/self.df, NOT basis_settings.Tobs: the latter is absent
+            # on FDSettings, and under FSTAT_FDOT_AXIS this value is no
+            # longer only a node-density input -- it sets the f_mid shear
+            # coefficient, so a wrong one costs acceptance on every birth.
+            Tobs=1.0 / float(self.df),
+            band_edges_hz=band_edges,
+            f0_lims_hz=f0_lims,
+            mc_lims=mc_lims,
+            ratio_max=_gb_fdot_astro_ratio_max(self),
+            cache_dir=cache_dir,
+            fingerprint_extra=f"|epoch={k}|gbfree={int(_gb_free)}",
+            epoch=k,
+            # ``fanout_active`` is exactly ``n_compute > 1`` (``single`` IS
+            # ``n_compute == 1``), and the runner REFUSES to be built at one
+            # rank: there it would rename the group checkpoint from the
+            # legacy ``stageb`` to ``stageb_g{gi}_r0`` and round-trip the
+            # golden-gated serial sweep through disk for nothing.
+            sweep_runner=(self._fstat_stage_b_runner(model)
+                          if self.fanout_active else None),
+        )
+        # NOTE: the HEAD's holder is NOT released here. The centre table
+        # (``_install_ctr_table``) must score against the SAME reference and
+        # the SAME row, so the caller of both (``setup()``) releases it.
         wall = time.perf_counter() - t0
         # Feed the propose timer: this runs outside every other top-level
         # span, so without it the refit lands in [GB_TIMING]'s untracked
@@ -22517,15 +22688,28 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
                     self.name, k, wall, n_peaks)
         try:
             with open(os.path.join(cache_dir, "DONE.json"), "w") as f:
-                json.dump(dict(epoch=k, walker_ref=int(walker_ref),
+                json.dump(dict(epoch=k, walker_ref=int(w_global),
                                n_peaks=int(n_peaks), wall_seconds=wall,
                                num_proposals=int(self.num_proposals),
+                               # how many compute ranks split stage B -- the
+                               # rank -> box-range map is a pure function of
+                               # (g_edges, n_compute), so a resume under a
+                               # DIFFERENT count restarts each group cleanly
+                               # rather than resuming another rank's slice
+                               n_compute=int(n_compute),
                                # the refit clock at fit time -- read back by
                                # _epoch_fit_clock so the cadence budget
                                # survives restarts (2026-08-24)
                                clock=int(self._fstat_clock())), f)
         except OSError as exc:  # manifest is bookkeeping, never fatal
             logger.warning("%s: could not write DONE.json (%r)", self.name, exc)
+        # LAST, and only on the success path: every worker's row (and the
+        # sig-het scorer cached beside it) is dead weight from here on --
+        # stage A and the centre table are head-only. Not in a ``finally``:
+        # a fit that died is taking the run down with it, and issuing a
+        # fan-out command while THAT exception unwinds would only replace it
+        # with a fan-out failure.
+        self._fstat_release_fanout(model)
         return stacked, n_peaks
 
     # Fields the propose-time lookup reads; the rest of the npz (node Mc /
@@ -22748,6 +22932,27 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         if action == "skip":
             return
 
+        try:
+            self._setup_epoch(model, branches, action, k)
+        finally:
+            # The replicated reference row is a per-FIT resource: the grids
+            # and the centre table must BOTH score against it (the
+            # 2026-08-24 same-residual rule), which is why it cannot be
+            # released between them -- and it is tens of MB plus a built
+            # sig-het scorer, so it must not survive them either. Every
+            # worker's copy is already gone (``_run_fstat_fit`` issues
+            # ``gb_fstat_release`` once the epoch's artifacts are written);
+            # this is the head's own, and the ``finally`` covers the paths
+            # that never took a row at all (load / cross-move reuse), where
+            # it is a no-op.
+            self._fstat_release_ref_row()
+
+    def _setup_epoch(self, model, branches, action, k):
+        """``setup()``'s body once the refit decision is made.
+
+        Split out only so the reference-row release can wrap every exit path
+        -- including the two early ``return``s -- in one ``finally``.
+        """
         # Cross-move reuse: another move sharing this fit dir may already
         # have built (or loaded) this exact epoch in THIS process. Take its
         # container verbatim -- no refit, no npz reload.
