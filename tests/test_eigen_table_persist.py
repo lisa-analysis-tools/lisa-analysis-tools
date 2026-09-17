@@ -263,6 +263,52 @@ class GuardTest(unittest.TestCase):
         )
         self.assertIsNotNone(got)
 
+    def test_walker_max_table_adopts_across_walker_count_and_ladder_changes(self):
+        # 2026-09-16: a walker_max table is ONE matrix for every point, so a
+        # different walker-block width (the multi-rank layout builds each rank
+        # at B < nwalkers; a 2 -> 4 GPU continuation changes B again) or a
+        # different ladder must NOT discard it -- that discard cost the 6mo
+        # continuation ~45 min of MBH/EMRI/SOBBH information-matrix rebuilds.
+        eigen_table_persist.save_entry(
+            self.path, "mbh", 3, _walker_max_entry(ndim=3, ntemps=12,
+                                                   nwalkers=10, visits=4)
+        )
+        for kw in (dict(nwalkers=5), dict(nwalkers=2), dict(ntemps=8),
+                   dict(ntemps=8, nwalkers=2)):
+            with self.subTest(**kw):
+                base = dict(scope="walker_max", ndim=3, ntemps=12, nwalkers=10)
+                base.update(kw)
+                got = eigen_table_persist.load_entry(
+                    self.path, "mbh", 3, **base
+                )
+                self.assertIsNotNone(got)
+                self.assertEqual(got[2], 4)
+
+    def test_walker_max_table_still_rejects_ndim_and_scope(self):
+        eigen_table_persist.save_entry(
+            self.path, "mbh", 4, _walker_max_entry(ndim=3, ntemps=12,
+                                                   nwalkers=10, visits=4)
+        )
+        with self.assertLogs(eigen_refresh.logger, level="WARNING"):
+            self.assertIsNone(eigen_table_persist.load_entry(
+                self.path, "mbh", 4, scope="walker_max", ndim=4, ntemps=12,
+                nwalkers=10))
+        with self.assertLogs(eigen_refresh.logger, level="WARNING"):
+            self.assertIsNone(eigen_table_persist.load_entry(
+                self.path, "mbh", 4, scope="per_walker", ndim=3, ntemps=12,
+                nwalkers=10))
+
+    def test_shared_fallback_under_per_walker_scope_adopts_across_walker_count(self):
+        entry = _per_walker_entry(visits=2)
+        entry["axes"] = np.eye(3)
+        entry["sigmas"] = np.full(3, 0.1)
+        eigen_table_persist.save_entry(self.path, "sobbh", 3, entry)
+        got = eigen_table_persist.load_entry(
+            self.path, "sobbh", 3, scope="per_walker", ndim=3,
+            ntemps=2, nwalkers=8,
+        )
+        self.assertIsNotNone(got)
+
     def test_data_identity_mismatch_rejects_but_a_missing_one_does_not(self):
         entry = _walker_max_entry(visits=1)
         entry["data_identity"] = 1.0 / (0.5 * 365.25 * 24 * 3600.0)

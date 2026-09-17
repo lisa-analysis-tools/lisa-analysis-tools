@@ -2488,6 +2488,14 @@ export EMRI_NTEMPS=2
 # restart). The persisted eigen sidecar's sobbh tables are
 # per-(temp,walker) shaped and will rebuild once on the shape change.
 export SOBBH_NTEMPS=8
+# ONE information matrix per leaf at the max-lnL cold walker (like MBH/EMRI)
+# instead of one per (temperature, walker) (user ruling 2026-09-16): the
+# per-walker stash is keyed by the walker axis, so every resume under a
+# different walker-block width (2 -> 4 GPUs) discarded it and rebuilt 60-120
+# matrices per leaf (~2.6 min/leaf/rank); walker_max tables are
+# layout-independent and persist across resumes. Watch the per-rung SOBBH
+# acceptance -- hot rungs now propose with the best walker's curvature.
+export SOBBH_EIGEN_SCOPE=walker_max
 export MBH_NUM_PROP_REPEATS=2
 export EMRI_NUM_PROP_REPEATS=2
 export SOBBH_NUM_PROP_REPEATS=20   # 25 -> 20 (user ruling 2026-09-16); applies at next relaunch

@@ -200,12 +200,23 @@ def _guards_ok(entry, key, *, scope, ndim, ntemps, nwalkers,
         )
     if int(entry.get("ndim", -1)) != int(ndim):
         return _bad("stored ndim %r != %d", entry.get("ndim"), int(ndim))
-    if int(entry.get("ntemps", -1)) != int(ntemps):
+    # The ladder / walker-count guards apply ONLY to a per-(temp, walker)
+    # stash (axes.ndim >= 4), whose rows are addressed by (temp, walker). A
+    # walker-independent table -- ``walker_max`` scope, or the shared
+    # fallback a ``per_walker`` branch persists -- is ONE matrix for every
+    # point, so neither the walker count nor the ladder size makes it wrong:
+    # the multi-rank walker-block layout builds every rank at its OWN block
+    # width (B < nwalkers) and a 2-GPU -> 4-GPU continuation changes B again;
+    # before 2026-09-16 that discarded all 18 MBH/EMRI/SOBBH tables and paid
+    # ~45 min of information-matrix rebuilds per resume (user ruling: keep
+    # them; MBH/EMRI always sit at the injection, SOBBH moved to walker_max).
+    _stash = axes.ndim >= 4
+    if _stash and int(entry.get("ntemps", -1)) != int(ntemps):
         return _bad(
             "stored ntemps %r != %d (temperature ladder changed)",
             entry.get("ntemps"), int(ntemps),
         )
-    if int(entry.get("nwalkers", -1)) != int(nwalkers):
+    if _stash and int(entry.get("nwalkers", -1)) != int(nwalkers):
         return _bad(
             "stored nwalkers %r != %d", entry.get("nwalkers"), int(nwalkers)
         )
