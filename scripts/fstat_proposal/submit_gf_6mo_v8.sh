@@ -2487,7 +2487,14 @@ export EMRI_NTEMPS=2
 # take effect at the next FRESH branch init (the deliberate VGB-chirp
 # restart). The persisted eigen sidecar's sobbh tables are
 # per-(temp,walker) shaped and will rebuild once on the shape change.
-export SOBBH_NTEMPS=8
+# REVERTED 8 -> 12 (2026-09-16 snapshot 7 decode): the resume-safety
+# claim was WRONG -- on resume the LIVE ladder followed the config (8
+# betas) while the store/sidecar stayed 12-shaped, triggering mass
+# eigen-table rebuilds every launch (231 s leaf windows, 772 rows/call,
+# 80/80 non-positive infomats, mbh/emri walls 3-5x, iteration ~80 min).
+# Set 8 ONLY at the deliberate fresh restart (with the VGB chirp
+# migration), never on a resumed 12-rung store.
+export SOBBH_NTEMPS=12
 # ONE information matrix per leaf at the max-lnL cold walker (like MBH/EMRI)
 # instead of one per (temperature, walker) (user ruling 2026-09-16): the
 # per-walker stash is keyed by the walker axis, so every resume under a
