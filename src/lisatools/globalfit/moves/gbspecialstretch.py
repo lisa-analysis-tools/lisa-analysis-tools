@@ -1983,6 +1983,17 @@ def _buffer_fixed_capacity_active(sorter, kwargs) -> bool:
 GB_OPS = ("gb_run_proposal", "gb_run_tempering", "gb_finish", "gb_sync",
           "gb_fstat_ref_row", "gb_fstat_stage_b")
 
+#: F-stat op -> the ``GBSpecialRJFStatGridMove`` attribute its served body
+#: needs. ``gf_serve`` checks this before dispatching, so a command addressed
+#: to a GB move that cannot run an F-stat fit fails with a named error on
+#: EVERY rank at once, instead of an ``AttributeError`` raised from inside a
+#: body -- which for ``gb_fstat_ref_row`` would strand the other ranks in its
+#: broadcast.
+_FSTAT_OP_REQUIRES = {
+    "gb_fstat_ref_row": "_gb_free_residual",
+    "gb_fstat_stage_b": "_fstat_call",
+}
+
 
 def _gb_host(obj):
     """Host-numpy view of a reply value (arrays, dicts and sequences).
@@ -7114,7 +7125,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self._log_dist_range_cache = val
         return val
 
-    def _fstat_NM(self, model, params_phys, walker_ref):
+    def _fstat_NM(self, model, params_phys, walker_ref, *, holder=None):
         """Per-binary F-stat ``(N, M)`` from the domain-appropriate comp.
 
         Domain is the ONLY thing that differs between FD and WDM: pick the
@@ -7132,6 +7143,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         single-shard holders pass straight through; on a sharded parent ACA
         the reference walker's rows run on its owning device and (N, M) come
         back on the caller's device.
+
+        ``holder`` overrides the residual source (the multi-rank fit's
+        replicated reference row, scored at row 0). The per-unit lane
+        adapter is bypassed under an override: it is armed for a walker's
+        ACA row, not for a shipped row pair.
         """
         xp = self.xp
         # Multi-device fan-out (2026-08-27, GPU-imbalance autopsy): when the
@@ -7155,7 +7171,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             tm.count("fstat_nm_calls", 1)
             tm.count("fstat_nm_rows", int(params_phys.shape[0]))
         _lanes = getattr(self, "_fstat_nm_lanes", None)
-        if _lanes is not None and _lanes[0] == int(walker_ref):
+        if holder is None and _lanes is not None and _lanes[0] == int(walker_ref):
             _t = _tmark_start(tm)
             try:
                 return _lanes[1](params_phys)
@@ -7163,11 +7179,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 _tmark_end(tm, "fstat_nm_lanes", _t)
         _t = _tmark_start(tm)
         try:
-            di = xp.full(params_phys.shape[0], int(walker_ref), dtype=xp.int32)
-            holder = model.analysis_container_arr
+            # A shipped row pair is a ONE-ROW holder, so it is scored at row
+            # 0: ``walker_ref`` is the GLOBAL walker index under the
+            # multi-rank fit and is not an ACA row on any rank but its owner.
+            _row = 0 if holder is not None else int(walker_ref)
+            di = xp.full(params_phys.shape[0], _row, dtype=xp.int32)
+            _holder = model.analysis_container_arr if holder is None else holder
             comp, method_name = self._fstat_comp_method()
             return _RoutedBandEngine.route_fstat_ll(
-                comp, method_name, holder, params_phys,
+                comp, method_name, _holder, params_phys,
                 data_index=di, noise_index=di, convert_to_ra_dec=False)
         finally:
             _tmark_end(tm, "fstat_nm_routed", _t)
@@ -18191,13 +18211,39 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             return self._gb_serve_finish(payload, clock, model)
         if op == "gb_sync":
             return self._gb_serve_sync(payload, clock, model)
-        if op == "gb_fstat_ref_row":
-            return self._gb_serve_fstat_ref_row(payload, clock, model)
-        if op == "gb_fstat_stage_b":
+        if op in _FSTAT_OP_REQUIRES:
+            self._require_fstat_grid_move(op)
+            if op == "gb_fstat_ref_row":
+                return self._gb_serve_fstat_ref_row(payload, clock, model)
             return self._gb_serve_fstat_stage_b(payload, clock, model)
         raise ValueError(
             f"move {self.name!r} serves only {GB_OPS}, got {op!r}"
         )
+
+    def _require_fstat_grid_move(self, op):
+        """Refuse an F-stat op on a GB move that cannot run one.
+
+        The two F-stat commands are served on the base -- next to every other
+        ``_gb_serve_*`` body ``gf_serve`` dispatches to -- but their bodies
+        reach into :class:`GBSpecialRJFStatGridMove`'s half of the fit
+        (``_gb_free_residual``, ``_fstat_call``). Only that class ever ISSUES
+        them, so a miss means the head addressed the command to the wrong
+        ``gf_move_name``; without this it surfaces as an ``AttributeError``
+        from inside a served body, and for ``gb_fstat_ref_row`` it would do
+        so on the owner AFTER the other ranks are already committed to the
+        collective.
+
+        Checked HERE rather than inside the bodies precisely because it is
+        SYMMETRIC: every rank serves the same move class, so either all of
+        them raise (before any collective) or none does.
+        """
+        needed = _FSTAT_OP_REQUIRES[op]
+        if getattr(self, needed, None) is None:
+            raise ValueError(
+                f"move {self.name!r} was sent {op!r}, but only the F-stat "
+                f"grid move (GBSpecialRJFStatGridMove) can serve it: this "
+                f"move has no {needed}."
+            )
 
     def _gb_new_timer(self, model):
         """``propose``'s per-propose stage timer, per rank."""
@@ -19397,6 +19443,228 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self._fstat_ref_holder = None
         self._fstat_ref_call = None
         self._fstat_ref_walker = None
+
+    def _fstat_holder_call(self, model):
+        """The holder-scored ``call_fstat``, built ONCE per fit on this rank.
+
+        Cached because the sig-het scorer is STATEFUL: its bucketed
+        reference blocks are built lazily on f0 crossings and stashed on the
+        comp, so rebuilding the closure per group would throw that cache
+        away between groups -- exactly the rebuild pathology the f0-sorted
+        box order exists to avoid.
+
+        Used by the head (stage A, and the centre table under the spec's
+        same-residual rule) and by every rank's ``gb_fstat_stage_b`` body,
+        so the whole epoch is scored against ONE residual snapshot.
+        """
+        if self._fstat_ref_holder is None:
+            # Without this, ``holder=None`` falls straight through to the
+            # LIVE ACA at ``walker_ref=0`` -- some other walker's residual,
+            # with no error anywhere and a grid that looks perfectly normal.
+            raise RuntimeError(
+                f"{self.name}: no replicated F-stat reference row on this "
+                "rank -- gb_fstat_ref_row must run before anything scores "
+                "through the holder. Scoring the live ACA at row 0 instead "
+                "would silently fit the epoch against the wrong walker.")
+        call = getattr(self, "_fstat_call", None)
+        if call is None:
+            raise RuntimeError(
+                f"{self.name}: only the F-stat grid move "
+                "(GBSpecialRJFStatGridMove) can build an F-stat scorer; this "
+                "move has no _fstat_call.")
+        if self._fstat_ref_call is None:
+            self._fstat_ref_call = call(
+                model, 0, holder=self._fstat_ref_holder)
+        return self._fstat_ref_call
+
+    @staticmethod
+    def _fstat_stage_b_payload(spec, rank_index, a, b):
+        """One rank's slice of one group, as host arrays (the wire pickles it).
+
+        The AXES are shipped whole (they define what a row means, and they
+        are kilobytes); only ``f0_los`` / ``f0_dxs`` / the leading axis of
+        ``node_shape`` are sliced. ``ckpt_name`` is per rank so two ranks
+        never share a progress file -- their fingerprints already differ,
+        because the fingerprint hashes the SLICED inputs plus ``node_shape``.
+        """
+        sub = spec.sub_range(a, b, ckpt_name=f"{spec.ckpt_name}_r{int(rank_index)}")
+        return {
+            "gi": int(sub.gi),
+            "n_groups": int(sub.n_groups),
+            "a": int(sub.a),
+            "b": int(sub.b),
+            "rank_index": int(rank_index),
+            "f0_los": np.ascontiguousarray(np.asarray(sub.f0_los, dtype=float)),
+            "f0_dxs": np.ascontiguousarray(np.asarray(sub.f0_dxs, dtype=float)),
+            "mc_ax": np.ascontiguousarray(np.asarray(sub.mc_ax, dtype=float)),
+            "alpha_ax": np.ascontiguousarray(np.asarray(sub.alpha_ax, dtype=float)),
+            "sd_ax": np.ascontiguousarray(np.asarray(sub.sd_ax, dtype=float)),
+            "node_shape": tuple(int(v) for v in sub.node_shape),
+            "ckpt_name": sub.ckpt_name,
+            "parts_dir": sub.parts_dir,
+            "fingerprint_extra": sub.fingerprint_extra,
+            "fdot_axis": bool(sub.fdot_axis),
+            "c_t": float(sub.c_t),
+        }
+
+    @staticmethod
+    def _fstat_stage_b_spec(payload):
+        """Rebuild the :class:`StageBGroupSpec` a payload describes."""
+        from lisatools.sampling.fstat_gridfit import StageBGroupSpec
+
+        return StageBGroupSpec(
+            gi=int(payload["gi"]), n_groups=int(payload["n_groups"]),
+            a=int(payload["a"]), b=int(payload["b"]),
+            f0_los=np.asarray(payload["f0_los"], dtype=float),
+            f0_dxs=np.asarray(payload["f0_dxs"], dtype=float),
+            mc_ax=np.asarray(payload["mc_ax"], dtype=float),
+            alpha_ax=np.asarray(payload["alpha_ax"], dtype=float),
+            sd_ax=np.asarray(payload["sd_ax"], dtype=float),
+            node_shape=tuple(int(v) for v in payload["node_shape"]),
+            ckpt_name=payload["ckpt_name"], parts_dir=payload["parts_dir"],
+            fingerprint_extra=payload["fingerprint_extra"],
+            fdot_axis=bool(payload["fdot_axis"]), c_t=float(payload["c_t"]))
+
+    def _gb_serve_fstat_stage_b(self, payload, clock, model):
+        """Sweep this rank's contiguous box range of one stage-B group.
+
+        Runs the SAME :func:`run_stage_b_group` the serial fit runs, on the
+        sliced inputs, scored through the replicated reference row -- so a
+        split can only differ from the serial sweep by ``FSTAT_BATCH``
+        grouping, which is row-independent. The finished slice goes to the
+        shared ``_parts`` directory as raw float64; the REPLY carries only
+        metadata, because a whole group grid is 163-653 MB at production
+        scale against mpi4py's ~2 GiB pickle cap.
+
+        NO COLLECTIVE runs in this body, deliberately (spec decisions 4/5):
+        each rank sweeps its own range and writes its own file, so a failure
+        on one rank surfaces as an ordinary ``RemoteWorkerError`` on the head
+        instead of parking every other rank in an untimed ``Bcast`` -- the
+        hazard ``gb_fstat_ref_row`` has to spend a status word on.
+        """
+        from lisatools.sampling.fstat_gridfit import (
+            run_stage_b_group,
+            save_stage_b_part,
+        )
+
+        self._bind_rank_acs(model)
+        if self._fstat_ref_holder is None:
+            raise RuntimeError(
+                f"{self.name}: gb_fstat_stage_b arrived before "
+                "gb_fstat_ref_row -- no replicated reference row on this rank")
+        spec = self._fstat_stage_b_spec(payload)
+        rank_index = int(payload["rank_index"])
+        t0 = time.perf_counter()
+        grid = run_stage_b_group(spec, self._fstat_holder_call(model), xp=self.xp)
+        _path, n_rows, sha = save_stage_b_part(
+            spec.parts_dir, spec.gi, rank_index, grid)
+        del grid
+        self.mempool.free_all_blocks()
+        wall = time.perf_counter() - t0
+        logger.info(
+            "%s: [FSTAT_STAGEB] g%d r%d boxes [%d, %d) (%d) in %.1fs",
+            self.name, spec.gi, rank_index, spec.a, spec.b, n_rows, wall)
+        return {"gi": int(spec.gi), "a": int(spec.a), "b": int(spec.b),
+                "rank_index": rank_index, "n_rows": int(n_rows),
+                "sha1": sha, "wall_s": float(wall),
+                "rank": int(getattr(getattr(self, "fanout", None), "rank", 0))}
+
+    def _fstat_stage_b_runner(self, model):
+        """HEAD: a ``sweep_runner`` that fans ONE group out over the ranks.
+
+        ``run_stacked_stage_b`` does everything else -- the host prep, the
+        f0 sort, the Mc grouping, the proposal build and the npz write --
+        so the parallel path can differ from the serial one only in HOW each
+        group's grid is produced. Ranges are contiguous and equal-count
+        (:func:`split_box_range`), a pure function of ``(g_edges,
+        n_compute)``, so a resume reproduces the same map; box is the
+        slowest axis, so concatenating the partials in rank order
+        reproduces the whole-group sweep exactly.
+
+        INSTALL IT ONLY UNDER A REAL FAN-OUT. At ``n_compute == 1`` (and with
+        no fan-out at all) the serial ``run_stage_b_group`` is the gated
+        path: the goldens pin the serial ``.npz`` byte for byte, and routing
+        that run through per-rank partials would change the checkpoint names
+        under an in-flight fit for no gain.
+        """
+        from lisatools.sampling.fstat_gridfit import (
+            assemble_stage_b_group,
+            clear_stage_b_parts,
+            split_box_range,
+        )
+
+        fanout = getattr(self, "fanout", None)
+        if fanout is None:
+            raise RuntimeError(
+                f"{self.name}: _fstat_stage_b_runner needs a fan-out to split "
+                "the group over; a single-process fit must pass no "
+                "sweep_runner at all (the serial run_stage_b_group).")
+        layout = fanout.layout
+        n_parts = int(layout.n_compute)
+
+        def runner(spec, call_fstat, *, xp):
+            if not spec.parts_dir:
+                raise RuntimeError(
+                    f"{self.name}: stage-B group {spec.gi} has no parts_dir -- "
+                    "the parallel sweep writes each rank's slice there and the "
+                    "head reads them back, so a shared epoch cache directory "
+                    "is required.")
+            ranges = split_box_range(spec.a, spec.b, n_parts)
+            by_rank = {r: ranges[layout.fanout_rank(r)]
+                       for r in layout.compute_ranks}
+            t0 = time.perf_counter()
+            replies, _token = self._fanout_cmd(
+                "gb_fstat_stage_b",
+                lambda rank, w0, w1: self._fstat_stage_b_payload(
+                    spec, layout.fanout_rank(rank), *by_rank[rank]),
+                model,
+            )
+            # ``_fanout_cmd`` hands back the BARE result dicts -- ``{rank:
+            # result}``, not ``{rank: {"result": ...}}``: ``WalkerFanout.run``
+            # unwraps the envelope itself before ``merge`` (fanout.py:172 and
+            # :262).
+            results = {}
+            for rank, res in replies.items():
+                res = res or {}
+                if "rank_index" not in res:
+                    raise RuntimeError(
+                        f"{self.name}: the gb_fstat_stage_b reply from rank "
+                        f"{rank} carries no 'rank_index', so group {spec.gi}'s "
+                        "partial cannot be placed in box order; assembling the "
+                        "rest would write a grid whose box axis silently "
+                        "disagrees with f0_los[a:b].")
+                results[int(res["rank_index"])] = res
+            for ri, res in results.items():
+                # ``assemble_stage_b_group`` checks only the TOTAL shape, so
+                # two partials that swapped places would concatenate silently
+                # into a grid mismatched to its own f0 nodes. The ranges are
+                # what put them in order; check them.
+                want = ranges[ri] if 0 <= ri < len(ranges) else None
+                if want is None or (int(res.get("a", -1)),
+                                    int(res.get("b", -1))) != want:
+                    raise RuntimeError(
+                        f"{self.name}: stage-B group {spec.gi} rank index {ri} "
+                        f"reported box range {(res.get('a'), res.get('b'))} but "
+                        f"was asked for {want} -- the partials would assemble "
+                        "out of box order.")
+            sha1s = {i: res.get("sha1") for i, res in results.items()}
+            grid = assemble_stage_b_group(
+                spec.parts_dir, spec.gi, n_parts, spec.node_shape, xp=xp,
+                sha1s=sha1s)
+            clear_stage_b_parts(spec.parts_dir, spec.gi, n_parts)
+            walls = [float(res.get("wall_s", 0.0))
+                     for res in results.values()] or [0.0]
+            logger.info(
+                "%s: [FSTAT_STAGEB] group %d/%d over %d rank(s): boxes %s | "
+                "wall min %.1fs max %.1fs (imbalance %.0f%%) | assembled "
+                "%.1fs total",
+                self.name, spec.gi + 1, spec.n_groups, n_parts,
+                [b - a for a, b in ranges], min(walls), max(walls),
+                100.0 * (max(walls) - min(walls)) / max(max(walls), 1e-9),
+                time.perf_counter() - t0)
+            return grid
+
+        return runner
 
     # ==================================================================
     # Multi-rank walker-block fan-out -- the HEAD side (Plan 4 / WP5).
@@ -21906,7 +22174,7 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
 
     # ---- the fit -----------------------------------------------------------
 
-    def _fstat_call(self, model, walker_ref):
+    def _fstat_call(self, model, walker_ref, *, holder=None):
         """The injectable kernel entry the library sweeps drive.
 
         Default: same routing as :meth:`_fstat_NM` -- the sig-het wrapper
@@ -21929,6 +22197,14 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         the on-GPU parity gate; ``=check`` adds a pinned shadow compare)
         fans candidate batches out over ALL run devices instead.
         Single-shard holders pass through unchanged.
+
+        ``holder`` overrides the ACA the scorer reads. The multi-rank fit
+        passes the replicated single-row :class:`FStatRefRowHolder`
+        (``gb_fstat_ref_row``), which is scored at ``data_index =
+        noise_index = 0`` -- the GLOBAL reference walker's index is NOT an
+        ACA row index on any rank but its owner, and the holder removes the
+        question entirely. Single-shard by construction
+        (``len(linear_data_arr) == 1``), so the router passes it through.
         """
         # Default ON (2026-08-12 user ruling): the sig-het shared-reference
         # F-stat is the production scorer; FSTAT_USE_SIGHET=0 restores the
@@ -21936,7 +22212,16 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         # warning below either way).
         if os.environ.get("FSTAT_USE_SIGHET", "1") == "1":
             sig_comp = self.gb_wdm_comp
-            holder = model.analysis_container_arr
+            # NOT rebound onto ``holder``: the two fallbacks below return the
+            # ``_fstat_NM`` lambda, which reads ``holder is None`` to decide
+            # between the walker's ACA row and a shipped one-row pair. Writing
+            # the ACA into ``holder`` here would make that lambda score row 0
+            # of the live ACA -- a different walker, silently.
+            if holder is None:
+                sig_holder, _di, _ni = (model.analysis_container_arr,
+                                        int(walker_ref), int(walker_ref))
+            else:
+                sig_holder, _di, _ni = holder, 0, 0
             if not hasattr(sig_comp, "setup_fstat_references"):
                 logger.warning(
                     "%s: FSTAT_USE_SIGHET=1 but the GB comp has no sig-het "
@@ -21950,13 +22235,14 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             else:
                 band_edges = _to_numpy(self.band_edges)
                 return _RoutedBandEngine.route_sighet_fstat(
-                    sig_comp, holder, xp=self.xp,
+                    sig_comp, sig_holder, xp=self.xp,
                     Tobs=float(self._basis_settings.Tobs),
                     f0_lims_hz=(float(band_edges[0]),
                                 float(band_edges[-1])),
-                    data_index=int(walker_ref),
-                    noise_index=int(walker_ref))
-        return lambda params: self._fstat_NM(model, params, walker_ref)
+                    data_index=_di,
+                    noise_index=_ni)
+        return lambda params: self._fstat_NM(
+            model, params, walker_ref, holder=holder)
 
     @contextmanager
     def _gb_free_residual(self, model, branches, walker_ref: int):

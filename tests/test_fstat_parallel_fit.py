@@ -1054,5 +1054,308 @@ class RefRowOpTest(unittest.TestCase):
                          np.complex128)
 
 
+class StageBPayloadTest(unittest.TestCase):
+    """The shipped payload carries host arrays and reconstructs the spec."""
+
+    def _spec(self):
+        return G.StageBGroupSpec(
+            gi=2, n_groups=3, a=10, b=18,
+            f0_los=np.linspace(6.0, 6.7, 8),
+            f0_dxs=np.full(8, 1e-3),
+            mc_ax=np.linspace(0.01, 1.0, 3),
+            alpha_ax=np.linspace(0.0, 2 * np.pi, 2),
+            sd_ax=np.linspace(-1.0, 1.0, 2),
+            node_shape=(8, 5, 3, 2, 2),
+            ckpt_name="stageb_g2", parts_dir="/tmp/parts",
+            fingerprint_extra="|epoch=3|gbfree=1",
+            fdot_axis=False, c_t=0.0)
+
+    def test_payload_round_trips_to_an_equivalent_sub_spec(self):
+        import pickle
+
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialBase.__new__(gbs.GBSpecialBase)
+        spec = self._spec()
+        payload = move._fstat_stage_b_payload(spec, 1, 13, 16)
+        payload = pickle.loads(pickle.dumps(payload))   # the wire does this
+        got = gbs.GBSpecialBase._fstat_stage_b_spec(payload)
+        self.assertEqual(got.gi, 2)
+        self.assertEqual((got.a, got.b), (13, 16))
+        self.assertEqual(got.node_shape, (3, 5, 3, 2, 2))
+        self.assertEqual(got.ckpt_name, "stageb_g2_r1")
+        np.testing.assert_array_equal(got.f0_los, spec.f0_los[3:6])
+        np.testing.assert_array_equal(got.f0_dxs, spec.f0_dxs[3:6])
+        np.testing.assert_array_equal(got.mc_ax, spec.mc_ax)
+        np.testing.assert_array_equal(got.alpha_ax, spec.alpha_ax)
+        np.testing.assert_array_equal(got.sd_ax, spec.sd_ax)
+        self.assertEqual(got.fingerprint_extra, spec.fingerprint_extra)
+        self.assertEqual(got.parts_dir, spec.parts_dir)
+
+    def test_payload_holds_no_device_arrays(self):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialBase.__new__(gbs.GBSpecialBase)
+        payload = move._fstat_stage_b_payload(self._spec(), 0, 10, 13)
+        for key, value in payload.items():
+            if isinstance(value, np.ndarray):
+                self.assertIs(type(value), np.ndarray, key)
+
+    def test_empty_range_is_a_legal_payload(self):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialBase.__new__(gbs.GBSpecialBase)
+        payload = move._fstat_stage_b_payload(self._spec(), 3, 18, 18)
+        got = gbs.GBSpecialBase._fstat_stage_b_spec(payload)
+        self.assertEqual(got.n_boxes, 0)
+        self.assertEqual(got.node_shape[0], 0)
+
+    def test_fstat_call_accepts_a_holder_override(self):
+        """The override is KEYWORD-ONLY with a ``None`` default.
+
+        ``_fstat_call`` lives on :class:`GBSpecialRJFStatGridMove`, not on
+        ``GBSpecialBase`` (the brief's ``GBSpecialBase._fstat_call`` is a
+        mis-attribution carried through Tasks 6-9); ``_fstat_NM`` genuinely
+        is on the base. Positional would be worse than useless here: every
+        existing call site passes ``(model, walker_ref)`` and a third
+        positional slot would silently accept a stray argument as the
+        holder.
+        """
+        import inspect
+
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        sig = inspect.signature(gbs.GBSpecialRJFStatGridMove._fstat_call)
+        self.assertIn("holder", sig.parameters)
+        self.assertEqual(sig.parameters["holder"].kind,
+                         inspect.Parameter.KEYWORD_ONLY)
+        self.assertIsNone(sig.parameters["holder"].default)
+        sig_nm = inspect.signature(gbs.GBSpecialBase._fstat_NM)
+        self.assertIn("holder", sig_nm.parameters)
+        self.assertEqual(sig_nm.parameters["holder"].kind,
+                         inspect.Parameter.KEYWORD_ONLY)
+
+
+class HolderCallTest(unittest.TestCase):
+    """``_fstat_holder_call``: built once per fit, against the shipped row."""
+
+    def _move(self):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialRJFStatGridMove.__new__(gbs.GBSpecialRJFStatGridMove)
+        move.name = "gb_test"
+        return move
+
+    def test_it_is_built_once_and_cached(self):
+        """The sig-het scorer is STATEFUL -- rebuilding the closure per group
+        would throw away the bucketed reference blocks the f0-sorted box
+        order exists to keep."""
+        move = self._move()
+        move._fstat_ref_holder = object()
+        calls = []
+
+        def fake_fstat_call(model, walker_ref, *, holder=None):
+            calls.append((model, walker_ref, holder))
+            return lambda params: params
+
+        move._fstat_call = fake_fstat_call
+        first = move._fstat_holder_call("model")
+        second = move._fstat_holder_call("model")
+        self.assertIs(first, second)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], 0)                 # the holder's row 0
+        self.assertIs(calls[0][2], move._fstat_ref_holder)
+
+    def test_no_holder_refuses_rather_than_scoring_row_zero(self):
+        """Without the guard ``holder=None`` falls back to the LIVE ACA at
+        ``walker_ref=0`` -- a different walker's residual, silently."""
+        move = self._move()
+        move._fstat_ref_holder = None
+        move._fstat_call = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not build a scorer without a holder"))
+        with self.assertRaises(RuntimeError) as ctx:
+            move._fstat_holder_call("model")
+        self.assertIn("gb_fstat_ref_row", str(ctx.exception))
+
+
+class _StopHere(Exception):
+    """Cut a runner short once the payloads have been inspected."""
+
+
+_KEEP = object()
+
+
+class StageBRunnerTest(unittest.TestCase):
+    """The head-side ``sweep_runner``: split, fan out, assemble, clear."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _spec(self, n_boxes=7, parts_dir=_KEEP):
+        return G.StageBGroupSpec(
+            gi=0, n_groups=1, a=0, b=n_boxes,
+            f0_los=np.linspace(6.0, 6.7, n_boxes),
+            f0_dxs=np.full(n_boxes, 1e-3),
+            mc_ax=np.linspace(0.01, 1.0, 2),
+            alpha_ax=np.linspace(0.0, 2 * np.pi, 2),
+            sd_ax=np.linspace(-1.0, 1.0, 2),
+            node_shape=(n_boxes, 3, 2, 2, 2),
+            ckpt_name="stageb_g0",
+            parts_dir=self.tmp if parts_dir is _KEEP else parts_dir,
+            fingerprint_extra="|epoch=0", fdot_axis=False, c_t=0.0)
+
+    def _move(self, n_compute=2):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialRJFStatGridMove.__new__(gbs.GBSpecialRJFStatGridMove)
+        move.name = "gb_test"
+        layout = _build_fake_layout(4 * n_compute, n_compute)
+        move.fanout = _StubFanout(layout, lls=None)
+        move.fanout.single = (n_compute == 1)
+        return move, layout
+
+    def _serve(self, move, layout, spec, per_rank_payload, grid_of):
+        """Every compute rank runs the op body's I/O half for real."""
+        replies = {}
+        for rank in layout.compute_ranks:
+            payload = per_rank_payload(rank, 0, 0)
+            sub = move._fstat_stage_b_spec(payload)
+            ri = int(payload["rank_index"])
+            _p, n_rows, sha = G.save_stage_b_part(
+                sub.parts_dir, sub.gi, ri, grid_of(sub))
+            replies[rank] = {"gi": int(sub.gi), "a": int(sub.a),
+                             "b": int(sub.b), "rank_index": ri,
+                             "n_rows": int(n_rows), "sha1": sha,
+                             "wall_s": 1.0 + ri}
+        return replies
+
+    def test_split_partials_assemble_into_the_whole_group_grid(self):
+        """The contract the bit-identity gate rests on: rank-ordered
+        concatenation of contiguous box ranges IS the whole-group sweep
+        (box is the slowest axis)."""
+        move, layout = self._move(n_compute=2)
+        spec = self._spec()
+        whole = np.arange(
+            int(np.prod(spec.node_shape)), dtype=float).reshape(spec.node_shape)
+        grabbed = {}
+
+        def fake_cmd(op, per_rank_payload, model):
+            self.assertEqual(op, "gb_fstat_stage_b")
+            grabbed["op"] = op
+            replies = self._serve(
+                move, layout, spec, per_rank_payload,
+                lambda sub: whole[sub.a - spec.a:sub.b - spec.a])
+            # ``_fanout_cmd`` returns the BARE result dicts (fanout.py:172 /
+            # :262 unwrap the envelope), not ``{rank: {"result": ...}}``.
+            return replies, None
+
+        move._fanout_cmd = fake_cmd
+        runner = move._fstat_stage_b_runner("model")
+        with self.assertLogs("lisatools.globalfit.moves.gbspecialstretch",
+                             level="INFO"):
+            grid = runner(spec, None, xp=np)
+        np.testing.assert_array_equal(grid, whole)
+        self.assertEqual(grabbed["op"], "gb_fstat_stage_b")
+        # the partials are cleared once the group is assembled
+        self.assertEqual(
+            [f for f in os.listdir(self.tmp) if f.endswith(".npy")], [])
+
+    def test_every_rank_gets_its_own_contiguous_range(self):
+        move, layout = self._move(n_compute=3)
+        spec = self._spec(n_boxes=7)
+        seen = {}
+
+        def fake_cmd(op, per_rank_payload, model):
+            for rank in layout.compute_ranks:
+                p = per_rank_payload(rank, 0, 0)
+                seen[int(p["rank_index"])] = (p["a"], p["b"])
+            raise _StopHere()
+
+        move._fanout_cmd = fake_cmd
+        runner = move._fstat_stage_b_runner("model")
+        with self.assertRaises(_StopHere):
+            runner(spec, None, xp=np)
+        self.assertEqual(seen, {0: (0, 3), 1: (3, 5), 2: (5, 7)})
+        self.assertEqual(
+            sorted(seen), list(range(layout.n_compute)))
+
+    def test_a_reply_that_misreports_its_range_is_refused(self):
+        """``assemble_stage_b_group`` checks only the TOTAL shape, so two
+        ranks whose partials swapped places would assemble silently into a
+        grid whose box axis disagrees with ``f0_los[a:b]``."""
+        move, layout = self._move(n_compute=2)
+        spec = self._spec()
+        whole = np.zeros(spec.node_shape)
+
+        def fake_cmd(op, per_rank_payload, model):
+            replies = self._serve(
+                move, layout, spec, per_rank_payload,
+                lambda sub: whole[sub.a - spec.a:sub.b - spec.a])
+            first = layout.compute_ranks[0]
+            replies[first] = dict(replies[first], a=99, b=101)
+            return replies, None
+
+        move._fanout_cmd = fake_cmd
+        runner = move._fstat_stage_b_runner("model")
+        with self.assertRaises(RuntimeError) as ctx:
+            runner(spec, None, xp=np)
+        self.assertIn("box range", str(ctx.exception))
+
+    def test_a_reply_without_a_rank_index_is_refused(self):
+        move, layout = self._move(n_compute=2)
+        spec = self._spec()
+        whole = np.zeros(spec.node_shape)
+
+        def fake_cmd(op, per_rank_payload, model):
+            replies = self._serve(
+                move, layout, spec, per_rank_payload,
+                lambda sub: whole[sub.a - spec.a:sub.b - spec.a])
+            replies[layout.compute_ranks[1]] = {}
+            return replies, None
+
+        move._fanout_cmd = fake_cmd
+        runner = move._fstat_stage_b_runner("model")
+        with self.assertRaises(RuntimeError) as ctx:
+            runner(spec, None, xp=np)
+        self.assertIn("rank_index", str(ctx.exception))
+
+    def test_a_group_with_no_shared_parts_dir_is_refused(self):
+        """Each rank writes its slice to the SHARED ``_parts`` dir; without
+        one there is nowhere for the head to read them back from."""
+        move, _layout = self._move(n_compute=2)
+        spec = self._spec(parts_dir=None)
+        move._fanout_cmd = lambda *a, **k: self.fail("must not fan out")
+        runner = move._fstat_stage_b_runner("model")
+        with self.assertRaises(RuntimeError) as ctx:
+            runner(spec, None, xp=np)
+        self.assertIn("parts_dir", str(ctx.exception))
+
+
+class FStatOpGuardTest(unittest.TestCase):
+    """A GB move that cannot run an F-stat fit must say so, not
+    ``AttributeError`` halfway through a served command."""
+
+    def test_stage_b_on_a_non_grid_move_names_the_class(self):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialBase.__new__(gbs.GBSpecialBase)
+        move.name = "gb_test"
+        with self.assertRaises(ValueError) as ctx:
+            move.gf_serve("gb_fstat_stage_b", {}, {}, None)
+        self.assertIn("GBSpecialRJFStatGridMove", str(ctx.exception))
+
+    def test_ref_row_on_a_non_grid_move_names_the_class(self):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialBase.__new__(gbs.GBSpecialBase)
+        move.name = "gb_test"
+        with self.assertRaises(ValueError) as ctx:
+            move.gf_serve("gb_fstat_ref_row", {}, {}, None)
+        self.assertIn("GBSpecialRJFStatGridMove", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
