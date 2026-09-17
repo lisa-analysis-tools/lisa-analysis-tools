@@ -62,6 +62,8 @@ The **single-node control layout** used by T2 keeps all three ranks on node A sh
 | `RemoteWorkerError` / `RuntimeError: GB replica merge` | a rank's command failed / a merge partition violation — FAIL, keep the traceback |
 | `F-stat epoch N incomplete` on rank 1 | shared-filesystem lag across nodes — storage problem |
 | job killed at the wall clock with ranks silent | hang inside a collective — FAIL, see triage |
+| `[GB_INFOMAT ...] FALL-THROUGH (sig-het comp: True; slot routing wired: False)` (WARNING) | pre-existing performance-route notice on this synthetic fixture: the RJ info matrices take the chunked path. Appears identically with `mpiexec -n 1` (T1 control, 2026-09-17). Not a replica signal |
+| `[GB_CELL_LL ...] per-repeat sampled-vs-actual diff ... exceeds its allowance (band 1)` (WARNING) | pre-existing accuracy-floor notice on the injected band; the single-rank control shows the same magnitudes (up to ~1e1 at temp 0). Not a replica signal — but a real dev item to look at separately |
 
 ## Gates
 
@@ -90,6 +92,8 @@ grep -c REPLICAS "$G/T0_two_walkers.log"                   # 0  (nwalkers=2 bloc
 Pass: the replica layout header identical on all three ranks; rank 1 on the other node with `devices=[0]`; `GF_ONE_WALKER_REPLICAS=0` refuses with `nwalkers=1 on 2 compute ranks needs one-walker replica mode`; `NWALKERS=2` prints the ordinary walker-block layout. Submit-script unit tests: 15 OK (the in-job `[SUBMIT] NWALKERS=1 on N_COMPUTE=2: one-walker replica mode` echo appears only in a job's stdout, T6).
 
 ### T1 — first real one-walker run, GB only, across the two nodes (≈10-20 min)
+
+**Record 2026-09-17:** two-node run with the gate driver completed 4 iterations in ~75 s; no lnL-guard warning; the `mpiexec -n 1` control reproduced the same `[GB_INFOMAT]`/`[GB_CELL_LL]` warnings at the same magnitudes → both pre-existing. Digest + 8-walker regression control still to record.
 
 ```sh
 FILE_STORE_DIR=$G/T1/ NUM_ITERATIONS=4 GPUS=0 timeout 3600 mpiexec -n 3 -ppn 1 \
