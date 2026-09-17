@@ -1507,7 +1507,8 @@ Add these methods to `GBSpecialBase`, immediately before `_run_fstat_fit` (`:206
 ```python
     # ---- the F-stat epoch fit's two fan-out commands -----------------------
 
-    def _fstat_ref_row_payload(self, w_global, owner_rank, local_index,
+    @staticmethod
+    def _fstat_ref_row_payload(w_global, owner_rank, local_index,
                                branches_present):
         """The command payload: the same dict for every rank (symmetric op)."""
         return {
@@ -1771,6 +1772,21 @@ class StageBPayloadTest(unittest.TestCase):
         got = gbs.GBSpecialBase._fstat_stage_b_spec(payload)
         self.assertEqual(got.n_boxes, 0)
         self.assertEqual(got.node_shape[0], 0)
+
+    def test_fstat_call_accepts_a_holder_override(self):
+        import inspect
+
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        sig = inspect.signature(gbs.GBSpecialBase._fstat_call)
+        self.assertIn("holder", sig.parameters)
+        self.assertEqual(sig.parameters["holder"].kind,
+                         inspect.Parameter.KEYWORD_ONLY)
+        self.assertIsNone(sig.parameters["holder"].default)
+        sig_nm = inspect.signature(gbs.GBSpecialBase._fstat_NM)
+        self.assertIn("holder", sig_nm.parameters)
+        self.assertEqual(sig_nm.parameters["holder"].kind,
+                         inspect.Parameter.KEYWORD_ONLY)
 ```
 
 - [ ] **Step 2: Run it to see it fail**
@@ -1782,7 +1798,67 @@ cat .wtenv/t7a.log
 ```
 Expected: FAIL — `AttributeError: ... has no attribute '_fstat_stage_b_payload'`.
 
-- [ ] **Step 3: Implement the payload, the spec reconstruction and the holder call**
+- [ ] **Step 3: Holder override on `_fstat_call` / `_fstat_NM`**
+
+`_fstat_holder_call` (next step) needs this, so it lands here rather than with the `_run_fstat_fit` wiring.
+
+`_fstat_call` (`:20476`) — change the signature to `def _fstat_call(self, model, walker_ref, *, holder=None):`, add this paragraph to the docstring, and route the holder:
+
+```
+        ``holder`` overrides the ACA the scorer reads. The multi-rank fit
+        passes the replicated single-row :class:`FStatRefRowHolder`
+        (``gb_fstat_ref_row``), which is scored at ``data_index =
+        noise_index = 0`` -- the GLOBAL reference walker's index is NOT an
+        ACA row index on any rank but its owner, and the holder removes the
+        question entirely. Single-shard by construction
+        (``len(linear_data_arr) == 1``), so the router passes it through.
+```
+
+In the sig-het branch, replace
+
+```python
+            sig_comp = self.gb_wdm_comp
+            holder = model.analysis_container_arr
+```
+with
+```python
+            sig_comp = self.gb_wdm_comp
+            if holder is None:
+                holder = model.analysis_container_arr
+                _di = _ni = int(walker_ref)
+            else:
+                _di = _ni = 0
+```
+and the `route_sighet_fstat(...)` call's `data_index=int(walker_ref), noise_index=int(walker_ref)` with `data_index=_di, noise_index=_ni`.
+
+Change the fallback return to `return lambda params: self._fstat_NM(model, params, walker_ref, holder=holder)`.
+
+`_fstat_NM` (`:6648`) — change the signature to `def _fstat_NM(self, model, params_phys, walker_ref, *, holder=None):`; add to the docstring:
+
+```
+        ``holder`` overrides the residual source (the multi-rank fit's
+        replicated reference row, scored at row 0). The per-unit lane
+        adapter is bypassed under an override: it is armed for a walker's
+        ACA row, not for a shipped row pair.
+```
+
+and in the body, change the lane fast-path guard and the routed call:
+
+```python
+        _lanes = getattr(self, "_fstat_nm_lanes", None)
+        if holder is None and _lanes is not None and _lanes[0] == int(walker_ref):
+```
+```python
+            _row = 0 if holder is not None else int(walker_ref)
+            di = xp.full(params_phys.shape[0], _row, dtype=xp.int32)
+            _holder = model.analysis_container_arr if holder is None else holder
+            comp, method_name = self._fstat_comp_method()
+            return _RoutedBandEngine.route_fstat_ll(
+                comp, method_name, _holder, params_phys,
+                data_index=di, noise_index=di, convert_to_ra_dec=False)
+```
+
+- [ ] **Step 4: Implement the payload, the spec reconstruction and the holder call**
 
 Add to `GBSpecialBase`, immediately after `_fstat_release_ref_row` from Task 6:
 
@@ -1889,7 +1965,7 @@ Add to `GBSpecialBase`, immediately after `_fstat_release_ref_row` from Task 6:
 
 `time` is already imported at the top of `gbspecialstretch.py`; `self.mempool` is the move's existing cupy pool handle (used in `_propose_orchestrated`) — if `mempool.free_all_blocks()` is not available on the CPU backend, guard it the way the surrounding code does (`self.mempool.free_all_blocks()` is already called unguarded at the top of `_propose_orchestrated`, so it is safe).
 
-- [ ] **Step 4: Implement the head-side runner**
+- [ ] **Step 5: Implement the head-side runner**
 
 Add immediately after `_gb_serve_fstat_stage_b`:
 
@@ -1949,7 +2025,7 @@ Add immediately after `_gb_serve_fstat_stage_b`:
         return runner
 ```
 
-- [ ] **Step 5: Run the tests**
+- [ ] **Step 6: Run the tests**
 
 ```sh
 .wtenv/wt_run.sh $PWD/src .wtenv/t7b.log \
@@ -1958,7 +2034,7 @@ cat .wtenv/t7b.log
 ```
 Expected: all PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```sh
 git add src/lisatools/globalfit/moves/gbspecialstretch.py tests/test_fstat_parallel_fit.py
@@ -2012,19 +2088,6 @@ class DoneManifestTest(unittest.TestCase):
                     "num_proposals", "clock", "epoch"):
             self.assertIn(key, src, f"DONE.json must record {key!r}")
 
-    def test_fstat_call_accepts_a_holder_override(self):
-        import inspect
-
-        from lisatools.globalfit.moves import gbspecialstretch as gbs
-
-        sig = inspect.signature(gbs.GBSpecialBase._fstat_call)
-        self.assertIn("holder", sig.parameters)
-        self.assertEqual(sig.parameters["holder"].kind,
-                         inspect.Parameter.KEYWORD_ONLY)
-        self.assertIsNone(sig.parameters["holder"].default)
-        sig_nm = inspect.signature(gbs.GBSpecialBase._fstat_NM)
-        self.assertIn("holder", sig_nm.parameters)
-
     def test_run_fstat_grid_fit_forwards_a_sweep_runner(self):
         import inspect
 
@@ -2040,7 +2103,7 @@ class DoneManifestTest(unittest.TestCase):
   python -m unittest tests.test_fstat_parallel_fit.DoneManifestTest -v
 cat .wtenv/t8a.log
 ```
-Expected: FAIL on all three.
+Expected: FAIL on both.
 
 - [ ] **Step 3: `sweep_runner` pass-through in `run_fstat_grid_fit`**
 
@@ -2064,66 +2127,7 @@ Docstring sentence:
     parallel or not.
 ```
 
-- [ ] **Step 4: Holder override on `_fstat_call` / `_fstat_NM`**
-
-`_fstat_call` (`:20476`) — change the signature to `def _fstat_call(self, model, walker_ref, *, holder=None):`, add this paragraph to the docstring, and route the holder:
-
-```
-        ``holder`` overrides the ACA the scorer reads. The multi-rank fit
-        passes the replicated single-row :class:`FStatRefRowHolder`
-        (``gb_fstat_ref_row``), which is scored at ``data_index =
-        noise_index = 0`` -- the GLOBAL reference walker's index is NOT an
-        ACA row index on any rank but its owner, and the holder removes the
-        question entirely. Single-shard by construction
-        (``len(linear_data_arr) == 1``), so the router passes it through.
-```
-
-In the sig-het branch, replace
-
-```python
-            sig_comp = self.gb_wdm_comp
-            holder = model.analysis_container_arr
-```
-with
-```python
-            sig_comp = self.gb_wdm_comp
-            if holder is None:
-                holder = model.analysis_container_arr
-                _di = _ni = int(walker_ref)
-            else:
-                _di = _ni = 0
-```
-and the `route_sighet_fstat(...)` call's `data_index=int(walker_ref), noise_index=int(walker_ref)` with `data_index=_di, noise_index=_ni`.
-
-Change the fallback return to `return lambda params: self._fstat_NM(model, params, walker_ref, holder=holder)`.
-
-`_fstat_NM` (`:6648`) — change the signature to `def _fstat_NM(self, model, params_phys, walker_ref, *, holder=None):`; add to the docstring:
-
-```
-        ``holder`` overrides the residual source (the multi-rank fit's
-        replicated reference row, scored at row 0). The per-unit lane
-        adapter is bypassed under an override: it is armed for a walker's
-        ACA row, not for a shipped row pair.
-```
-
-and in the body:
-
-```python
-        _lanes = getattr(self, "_fstat_nm_lanes", None)
-        if holder is None and _lanes is not None and _lanes[0] == int(walker_ref):
-```
-and
-```python
-            _row = 0 if holder is not None else int(walker_ref)
-            di = xp.full(params_phys.shape[0], _row, dtype=xp.int32)
-            _holder = model.analysis_container_arr if holder is None else holder
-            comp, method_name = self._fstat_comp_method()
-            return _RoutedBandEngine.route_fstat_ll(
-                comp, method_name, _holder, params_phys,
-                data_index=di, noise_index=di, convert_to_ra_dec=False)
-```
-
-- [ ] **Step 5: Rewrite `_run_fstat_fit`'s body**
+- [ ] **Step 4: Rewrite `_run_fstat_fit`'s body**
 
 Replace `_run_fstat_fit` (`:20601` through its `return stacked, n_peaks`) with:
 
@@ -2237,7 +2241,7 @@ Replace `_run_fstat_fit` (`:20601` through its `return stacked, n_peaks`) with:
         return stacked, n_peaks
     ```
 
-- [ ] **Step 6: Log stage A's wall separately (spec decision 3)**
+- [ ] **Step 5: Log stage A's wall separately (spec decision 3)**
 
 Stage A's epoch-1 wall time is the trigger for a later split, so it must be readable on its own rather than inferred by subtraction. In `src/lisatools/sampling/fstat_gridfit.py::run_fstat_grid_fit`, wrap the comb branch (`if os.path.exists(comb_cache): ... else: run_comb_scan(...)`, `:1292-1309`) with a timer and log it:
 
@@ -2255,7 +2259,7 @@ Stage A's epoch-1 wall time is the trigger for a later split, so it must be read
 
 `time` and `_fmt_secs` are already imported in that module.
 
-- [ ] **Step 7: Release the holder after the centre table**
+- [ ] **Step 6: Release the holder after the centre table**
 
 The caller of both `_run_fstat_fit` and `_install_ctr_table` is `setup()`. Find the `setup()` body that calls them (grep `_run_fstat_fit(` and `_install_ctr_table(` in `gbspecialstretch.py`) and wrap the pair so the holder is released once both are done:
 
@@ -2277,7 +2281,7 @@ Add the same release at the END of `_gb_serve_fstat_stage_b`'s LAST call? No —
         """
 ```
 
-- [ ] **Step 8: Run the tests**
+- [ ] **Step 7: Run the tests**
 
 ```sh
 .wtenv/wt_run.sh $PWD/src .wtenv/t8b.log \
@@ -2286,7 +2290,7 @@ cat .wtenv/t8b.log
 ```
 Expected: all PASS.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 8: Commit**
 
 ```sh
 git add src/lisatools/sampling/fstat_gridfit.py src/lisatools/globalfit/moves/gbspecialstretch.py tests/test_fstat_parallel_fit.py
