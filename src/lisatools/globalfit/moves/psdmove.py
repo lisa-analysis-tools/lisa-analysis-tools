@@ -2412,18 +2412,25 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         actually working with (what the stretch-complement check must key
         off — a 1-walker block cannot stretch even on a many-walker run).
         ``nwalkers_run`` is the RUN's total walker count (defaults to
-        ``nwalkers_block`` for single-process / non-fanout callers); the
-        ``inner_move_kind is None`` default resolves to ``"eigen"`` iff the
-        RUN has exactly one walker (one-walker replica mode), else
-        ``"stretch"`` — a many-walker run with a 1-walker-per-rank BLOCK
-        still defaults to stretch (the fancy walker-permuting swap pools
-        the complement across ranks). Logs the resolved kind ONCE per move.
+        ``nwalkers_block`` for single-process / non-fanout callers); it is
+        logged for context only. The ``inner_move_kind is None`` default
+        resolves off the BLOCK width (2026-09-17 ruling): ``"eigen"`` when
+        the block holds fewer than three walkers, else ``"stretch"``. The
+        stretch's complement is the LOCAL block under the walker-block layout
+        (cross-rank complement pooling is WP8, not built), so a 1-walker block
+        has no complement at all and a 2-walker block's complement is a single
+        point (the proposal degenerates to a line through it) -- both are what
+        a 4-GPU, 4-walker campaign run produces (one walker per rank), and
+        the one-walker replica mode (run nwalkers == 1) is the same case.
+        An explicit ``{P}_INNER_MOVE_KIND`` always wins (``stretch`` at a
+        1-walker block is still refused below). Logs the resolved kind ONCE
+        per move.
         """
         if nwalkers_run is None:
             nwalkers_run = nwalkers_block
         kind = self.inner_move_kind
         if kind is None:
-            kind = "eigen" if int(nwalkers_run) == 1 else "stretch"
+            kind = "eigen" if int(nwalkers_block) < 3 else "stretch"
         kind = str(kind).strip().lower()
         if kind not in ("eigen", "stretch"):
             prefix = self.fanout_knob_prefix()
@@ -2668,9 +2675,10 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         # the vanilla eryn stretch, from THIS block's module-ladder walker
         # count -- must run after the begin replay above (the tables score
         # merged rows that need the fixed-component covariances) and after
-        # nt_mod/nwalkers_mod are known. The default kind keys off the RUN's
-        # walker count (nwalkers_run), not the block width -- see
-        # _resolve_inner_kind.
+        # nt_mod/nwalkers_mod are known. The default kind keys off THIS
+        # BLOCK's walker count (a block of fewer than three walkers has no
+        # usable stretch complement); nwalkers_run is logged for context --
+        # see _resolve_inner_kind.
         nwalkers_run = (
             self.fanout.layout.nwalkers
             if getattr(self, "fanout", None) is not None

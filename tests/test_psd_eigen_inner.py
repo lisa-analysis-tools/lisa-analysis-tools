@@ -62,18 +62,25 @@ class InnerKindTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             _move(kind="bogus")[0]._resolve_inner_kind(1)
 
-    def test_default_keys_off_the_runs_walker_count_not_the_block(self):
-        """F3: a 1-walker BLOCK on a multi-walker RUN still defaults to
-        stretch (and then raises, since a 1-walker block cannot stretch);
-        only a 1-walker RUN defaults to eigen."""
+    def test_default_keys_off_the_block_width_not_the_run(self):
+        """2026-09-17 ruling: the stretch complement is the rank's LOCAL
+        block (cross-rank pooling is WP8), so a 1- or 2-walker BLOCK defaults
+        to eigen whatever the RUN's walker count -- a 4-GPU, 4-walker
+        campaign run (one walker per rank) must not hard-error at its first
+        PSD propose. An explicit ``stretch`` at a 1-walker block still
+        raises and names the knob, block and run counts."""
         m, _ = _move()
+        self.assertEqual(m._resolve_inner_kind(1, nwalkers_run=10), "eigen")
+        self.assertEqual(m._resolve_inner_kind(2, nwalkers_run=10), "eigen")
+        self.assertEqual(m._resolve_inner_kind(1, nwalkers_run=1), "eigen")
+        self.assertEqual(m._resolve_inner_kind(3, nwalkers_run=12), "stretch")
+        self.assertEqual(m._resolve_inner_kind(4), "stretch")
+        m2, _ = _move(kind="stretch")
         with self.assertRaisesRegex(ValueError, "INNER_MOVE_KIND") as ctx:
-            m._resolve_inner_kind(1, nwalkers_run=10)
+            m2._resolve_inner_kind(1, nwalkers_run=10)
         self.assertIn("block", str(ctx.exception).lower())
         self.assertIn("1", str(ctx.exception))
         self.assertIn("10", str(ctx.exception))
-        self.assertEqual(m._resolve_inner_kind(1, nwalkers_run=1), "eigen")
-        self.assertEqual(m._resolve_inner_kind(4), "stretch")
 
     def test_resolved_kind_logged_once_per_move(self):
         m, _ = _move()
