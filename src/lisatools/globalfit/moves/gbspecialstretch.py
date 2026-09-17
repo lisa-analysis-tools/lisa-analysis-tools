@@ -1981,8 +1981,10 @@ def _buffer_fixed_capacity_active(sorter, kwargs) -> bool:
 #: ``(move, op)``. ``gb_fstat_ref_row`` replicates the reference walker's
 #: residual + inverse-PSD rows to every rank; ``gb_fstat_stage_b`` splits the
 #: epoch grid sweep by contiguous box range; ``gb_fstat_release`` drops the
-#: replicated row -- and the sig-het scorer cached beside it, which is the
-#: expensive half -- on every rank once the fit's last group is assembled.
+#: replicated row, the sig-het scorer cached beside it AND the scorer's
+#: reference blocks on the GB comp -- the expensive half, and the half the
+#: closure alone does not own -- on every rank once the fit's last group is
+#: assembled, then frees the memory pool.
 GB_OPS = ("gb_run_proposal", "gb_run_tempering", "gb_finish", "gb_sync",
           "gb_fstat_ref_row", "gb_fstat_stage_b", "gb_fstat_release")
 
@@ -18002,8 +18004,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """The rank-side stand-in for ``setup()``: install epoch tables only.
 
         ``setup()`` on an F-stat grid move can RUN THE FIT -- an expensive
-        residual-dependent sweep against a walker chosen by a LOCAL
-        ``argmax``, which then writes ``fstat_grid_peaks_stacked.npz`` and
+        residual-dependent sweep against the GLOBAL argmax over every compute
+        rank's block (``_fstat_global_reference``, one ``gather_likelihood``
+        collective; it was a head-LOCAL argmax before the walker-block port,
+        which under a fan-out would have named a row the head does not even
+        own), which then writes ``fstat_grid_peaks_stacked.npz`` and
         ``DONE.json``. That is head-only work: the head runs ``setup()``
         first, so by the time a rank serves ``gb_run_proposal`` the epoch
         directory is complete and this is a pure in-memory load
@@ -18232,9 +18237,23 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             return self._gb_serve_fstat_release(payload, clock, model)
         if op in _FSTAT_OP_REQUIRES:
             self._require_fstat_grid_move(op)
-            if op == "gb_fstat_ref_row":
-                return self._gb_serve_fstat_ref_row(payload, clock, model)
-            return self._gb_serve_fstat_stage_b(payload, clock, model)
+            # NO SESSION TIMER FOR A NON-SESSION OP. These two bodies
+            # deliberately skip ``_enter_rank_block`` (the epoch fit is not a
+            # propose), and ``_exit_rank_block`` deliberately does not restore
+            # ``_prop_timer`` -- so on a WORKER whatever the last GB session
+            # left bound is still bound here, and a chunked-path
+            # (``FSTAT_USE_SIGHET=0``) stage-B sweep would add its
+            # ``fstat_nm_calls`` / ``fstat_nm_rows`` to a CLOSED session's
+            # timer, which never emits a ``[GB_TIMING]`` line again. Detached
+            # rather than rebound: there is no propose to attribute this to.
+            # The head reaches these bodies only through ``_fanout_cmd`` for
+            # its own share of a split sweep (stage A and the whole serial
+            # path are timed directly by ``_run_fstat_fit``'s
+            # ``fstat_grid_fit`` span, which is untouched).
+            with self._fstat_detached_timer():
+                if op == "gb_fstat_ref_row":
+                    return self._gb_serve_fstat_ref_row(payload, clock, model)
+                return self._gb_serve_fstat_stage_b(payload, clock, model)
         raise ValueError(
             f"move {self.name!r} serves only {GB_OPS}, got {op!r}"
         )
@@ -19363,6 +19382,17 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
           today, and the one the stage-B goldens gate) is byte-for-byte what
           it was. Cleared in a ``finally`` so a later command can never reuse
           a stale one.
+
+          BYTE-IDENTICAL IS NOT COST-IDENTICAL, and the difference is the
+          number an operator diffs against epoch 0: there is no disk round
+          trip and no collective, but the body still runs, so
+          ``snapshot_ref_rows`` hosts the two rows as genuine COPIES and
+          ``xp.asarray`` puts them back on the device -- ~72 MB resident for
+          the duration of the fit -- and the sweep then scores through that
+          single-slab holder pinned to ``acs.gpus[0]`` rather than through
+          the live (possibly multi-shard) ACA at row ``walker_ref``, which on
+          a multi-GPU single-rank box changes WHICH device runs it (spec
+          decision 8).
         * **Several compute ranks** -- the owner's payload carries its
           BLOCK-SLICED, temp-0 cold branch (:meth:`_fstat_ref_branch_slice`),
           because the owner is a worker roughly ``1 - 1/n_compute`` of the
@@ -19500,7 +19530,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             self.name, int(owner_rank), int(w_global))
 
     def _fstat_release_ref_row(self):
-        """Drop this rank's replicated row holder AND its cached scorer.
+        """Drop this rank's replicated row, its scorer, ITS BLOCKS, the pool.
 
         Two callers, on the two sides of the wire:
 
@@ -19514,18 +19544,111 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
           tell which ``gb_fstat_stage_b`` command was the last, so the head
           -- which can -- says so explicitly.
 
-        ``_fstat_ref_call`` is the expensive half, not the rows: it holds the
-        BUILT sig-het scorer, whose bucketed reference blocks can be ~GB on
-        device, and nothing else invalidates it (``_gb_serve_fstat_ref_row``
-        only resets it when a NEW row arrives, which at
-        ``GB_FSTAT_REFIT_EVERY=50`` is ~50 iterations of GB proposals later).
+        WHAT IS FREED, biggest first:
+
+        * the sig-het scorer's BUCKETED REFERENCE BLOCKS -- ~GB of device
+          arrays -- which live on the COMP (``gb_wdm_comp._fstat``), NOT on
+          the closure: :func:`build_sighet_call_fstat`'s ``_ensure_block``
+          calls ``comp.setup_fstat_references(...)``, which allocates them
+          onto the comp, and only then records a SECOND strong reference on
+          the closure. Dropping ``_fstat_ref_call`` alone therefore returns
+          one of two references and frees nothing at all; the clear goes
+          through :meth:`_fstat_clear_comp_references`.
+        * ``_fstat_ref_holder`` -- the replicated residual + inverse-PSD
+          rows (~72 MB at 6mo);
+        * ``_fstat_ref_call`` (the closure) and ``_fstat_ref_walker`` (the
+          index).
+
+        Then the memory pool, because dropping references only makes the
+        blocks reusable by THIS process -- the pool is what hands them back.
+
+        Nothing else invalidates any of it: ``_gb_serve_fstat_ref_row``
+        resets the holder and the closure only when a NEW row arrives, and
+        the comp's blocks only when the next ``setup_fstat_references`` runs
+        -- at ``GB_FSTAT_REFIT_EVERY=50``, ~50 iterations of GB proposals
+        later.
         """
         self._fstat_ref_holder = None
         self._fstat_ref_call = None
         self._fstat_ref_walker = None
+        self._fstat_clear_comp_references()
+        # THE POOL, LAST. Dropping the references above only makes the blocks
+        # reusable by this process; ``free_all_blocks`` is what returns them.
+        # It runs AFTER the clear for the obvious reason -- a live-referenced
+        # block cannot be reclaimed. ``getattr``: this must work on any GB
+        # move (see ``gf_serve``), including one built without a pool.
+        pool = getattr(self, "mempool", None)
+        if pool is not None:
+            pool.free_all_blocks()
+
+    @contextmanager
+    def _fstat_detached_timer(self):
+        """Run a served F-stat body with NO propose timer bound.
+
+        The F-stat ops are non-session commands issued from ``setup()``, so
+        there is no propose to attribute their spans and counters to. On a
+        worker the bound timer is a CLOSED session's (``_exit_rank_block``
+        deliberately does not restore it), and anything counted into it is
+        never printed anywhere -- it just makes a later timing dump read as
+        if a propose had done F-stat work. Restores the previous value, so
+        the head's own live timer survives its local body unchanged.
+        """
+        saved = getattr(self, "_prop_timer", None)
+        self._prop_timer = None
+        try:
+            yield
+        finally:
+            self._prop_timer = saved
+
+    def _fstat_clear_comp_references(self):
+        """Drop the sig-het F-stat reference blocks stashed on the GB comp.
+
+        THE EXPENSIVE HALF of an F-stat reference row, and the half a
+        ``_fstat_ref_call = None`` does not touch: ``setup_fstat_references``
+        writes the whole bucketed block (A0/A1/B0/B1/B0nc/B1nc/mask/refs,
+        every one an ``xp`` array) onto ``comp._fstat``, and the closure's
+        ``state["stash"]`` is only a second reference to that same dict.
+
+        Safe at any time. ``_ensure_block``'s identity guard treats
+        ``comp._fstat is None`` as "rebuild", so a scorer that outlives this
+        call (nothing in the F-stat path does -- the closure is dropped in
+        the same breath) degrades to one reference-block rebuild rather than
+        scoring against a stale block.
+
+        NEVER RAISES. A release is the one command in the protocol that must
+        not be the thing that fails (the same principle that exempts
+        ``gb_fstat_release`` from ``_FSTAT_OP_REQUIRES``), and this runs on
+        every rank including the head's own local body.
+
+        SCOPE: the move's own comp. Device-local comp REPLICAS built by
+        ``_RoutedBandEngine._comp_for`` for the multi-shard / multi-device
+        LANE path keep their own stash; those belong to the per-unit lane
+        adapter, not to the epoch fit, whose holder is single-shard by
+        construction and therefore always scores through this comp.
+        """
+        comp = getattr(self, "gb_wdm_comp", None)
+        if comp is None:
+            return
+        try:
+            _clear = getattr(comp, "clear_fstat_references", None)
+            if _clear is not None:
+                # GBSignalHetComputations.clear_fstat_references
+                _clear()
+            elif hasattr(comp, "_fstat"):
+                # A comp with the stash but no teardown (a future/foreign
+                # sig-het surface): drop it by hand rather than silently
+                # leaving ~GB resident.
+                comp._fstat = None
+            # else: a plain GBWDMComputations (GB_SIGHET_INMODEL=0) has no
+            # F-stat stash at all -- two failed lookups and nothing to do.
+        except Exception as exc:  # noqa: BLE001 -- a release cannot fail
+            logger.warning(
+                "%s: could not clear the sig-het F-stat reference blocks on "
+                "the GB comp (%r); they stay resident until the next "
+                "setup_fstat_references.", self.name, exc, exc_info=True)
 
     def _gb_serve_fstat_release(self, payload, clock, model):
-        """Drop this rank's replicated F-stat reference row; free the pool.
+        """Drop this rank's row, scorer and blocks; free the pool.
 
         NON-SESSION (the head issues it from ``setup()``, like the other two
         F-stat ops) and, unlike ``gb_fstat_ref_row``, NO COLLECTIVE and NO
@@ -19550,13 +19673,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         held = (self._fstat_ref_holder is not None
                 or self._fstat_ref_call is not None
                 or self._fstat_ref_walker is not None)
+        # Clears the comp's reference blocks and frees the pool too -- the
+        # pool sweep lives THERE so the head's own ``setup()``-level release
+        # (which never comes through this body) gets it as well.
         self._fstat_release_ref_row()
-        # ``getattr``: this must work on any GB move (see ``gf_serve``), and
-        # the pool is what actually hands the device memory back -- dropping
-        # the references alone only makes the blocks reusable by THIS process.
-        pool = getattr(self, "mempool", None)
-        if pool is not None:
-            pool.free_all_blocks()
         fanout = getattr(self, "fanout", None)
         logger.info(
             "%s%s: F-stat reference row released (%s).", self._rank_tag(),
@@ -19593,10 +19713,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         command too -- and its holder is exactly what
         :meth:`_install_ctr_table` still has to score against (spec decision
         6). Rather than give the served body a role branch, the head saves the
-        three attributes and puts them back in a ``finally``. The body's
-        ``free_all_blocks`` cannot reclaim those arrays while ``saved`` holds
-        a reference to them, so the head's row survives the pool sweep as
-        well as the assignment.
+        three attributes -- AND the comp's sig-het reference blocks, which
+        :meth:`_fstat_release_ref_row` now clears as well -- and puts them
+        back in a ``finally``. The body's ``free_all_blocks`` cannot reclaim
+        any of it while ``saved`` holds a reference, so the head's row and
+        its scorer's resident block survive the pool sweep as well as the
+        assignment; without the block, the centre sweep would score through
+        the same closure but pay a full reference-block REBUILD on its first
+        batch (``_ensure_block`` treats ``comp._fstat is None`` as "rebuild").
 
         No-op with no fan-out, and at ONE compute rank (there is no other rank
         to release, and the byte-identity-gated single-rank path must not grow
@@ -19607,12 +19731,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             return {}
         saved = (self._fstat_ref_holder, self._fstat_ref_call,
                  self._fstat_ref_walker)
+        # The comp's resident reference block goes with them (see above).
+        # ``getattr`` twice: a plain GBWDMComputations has no ``_fstat``, and
+        # a move may carry no comp at all.
+        _comp = getattr(self, "gb_wdm_comp", None)
+        _saved_blocks = getattr(_comp, "_fstat", None)
         try:
             replies, _token = self._fanout_cmd(
                 "gb_fstat_release", lambda rank, w0, w1: None, model)
         finally:
             (self._fstat_ref_holder, self._fstat_ref_call,
              self._fstat_ref_walker) = saved
+            if _saved_blocks is not None:
+                _comp._fstat = _saved_blocks
         # The head's own reply says "released" too -- its body ran like every
         # other rank's -- but its row is back by the time this line is
         # written, so counting it would misreport what was actually freed.
@@ -22605,6 +22736,58 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             logger.info("%s: F-stat GB-FREE residual: %d signal(s) removed "
                         "again; residual restored.", self.name, n_live)
 
+    def _fstat_epoch_line(self, model, k, w_global, owner_rank, local_index,
+                          lls, n_compute, cache_dir):
+        """The epoch's "fit starting" INFO line, with the reference lnL.
+
+        Auditability: the line carries the reference walker's total lnL
+        (residual+PSD combination) alongside its GLOBAL index and the rank
+        that owns it, so a run log shows WHICH state each epoch's grid was
+        fitted against -- "same peaks after a refit" is only diagnosable with
+        this visible. Split out of :meth:`_run_fstat_fit` when the global
+        gather moved into the fit-only branch: it is the only consumer of
+        ``lls``, and inlining it there hid the branch that actually matters.
+        """
+        try:
+            # BRANCH ON THE SOURCE OF ``lls``, NOT ON ITS SIZE.
+            # ``_fstat_global_reference`` reports an all-NaN LENGTH-1
+            # placeholder when there is no fan-out to gather through
+            # (``_propose_legacy``, ``fit.sample()``), so a ``lls.size >
+            # w_global`` test first is true exactly when ``w_global == 0``
+            # -- an entirely ordinary local argmax -- and the placeholder
+            # then wins, dropping both numbers from the line on the path
+            # most local runs take.
+            if getattr(self, "fanout", None) is None:
+                # No gather to do, and this process's ACA holds EVERY walker,
+                # so the global index IS the row and the epoch line keeps the
+                # lnL it has carried since 2026-08-24. Never attempted under
+                # a fan-out: there the ACA is this rank's BLOCK, and
+                # ``lls[w_global]`` would silently be another walker's number.
+                _lls = _to_numpy(model.analysis_container_arr.likelihood())
+                _ll_ref = float(_lls[w_global])
+                _ll_spread = float(_lls.max() - _lls.min())
+            elif lls.size > w_global:
+                _ll_ref = float(lls[w_global])
+                _ll_spread = (float(lls.max() - lls.min()) if lls.size > 1
+                              else float("nan"))
+            else:
+                # DEFENSIVE: a placeholder shorter than the global index. No
+                # head-side caller produces one today -- the gather's own
+                # fallback returns ``w_global = 0`` beside a length-1
+                # placeholder, which the ``elif`` above catches and already
+                # reports as nan/nan. Kept so a future gather that returns a
+                # short vector reports "unknown" instead of IndexError-ing
+                # out of an epoch log line.
+                _ll_ref = _ll_spread = float("nan")
+        except Exception:
+            _ll_ref, _ll_spread = float("nan"), float("nan")
+        logger.info(
+            "%s: F-stat grid fit epoch %d starting (walker_ref=%d GLOBAL on "
+            "rank %d row %d, lnL=%.3f, cold-walker lnL spread=%.3f, "
+            "n_compute=%d, cache %s)",
+            self.name, k, w_global, owner_rank, local_index, _ll_ref,
+            _ll_spread, n_compute, cache_dir)
+
     def _run_fstat_fit(self, model, k: int, branches=None):
         """Fit epoch ``k``'s F-stat grid. HEAD-side; the ranks serve commands.
 
@@ -22644,11 +22827,12 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         released by ``setup()``'s ``finally``.
 
         A "fit" decision that lands on an ALREADY COMPLETE stage-B npz
-        (``stage_b_complete``) skips all of it -- no row on the wire, no
-        scorer built, no runner, no release -- and goes straight to
-        ``run_fstat_grid_fit``'s cache short circuit, which is what this
-        path was always going to reach. The centre table then replicates
-        (and releases) its own row if it still needs one.
+        (``stage_b_complete``) skips all of it -- no global-reference gather,
+        no row on the wire, no scorer built, no runner, no release, i.e. NOT
+        ONE fan-out command -- and goes straight to ``run_fstat_grid_fit``'s
+        cache short circuit, which is what this path was always going to
+        reach. The centre table then replicates (and releases) its own row if
+        it still needs one, deriving its own global reference for it.
         """
         from lisatools.sampling.fstat_gridfit import (
             run_fstat_grid_fit,
@@ -22668,69 +22852,12 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         # ``fstat_gridfit``'s own predicate, not a second spelling of the
         # cache path.
         _already_fitted = stage_b_complete(cache_dir)
-        w_global, owner_rank, local_index, lls = self._fstat_global_reference(
-            model)
-        # PUBLISHED FOR THE CENTRE TABLE, keyed by the epoch. On the
-        # ``_already_fitted`` path no row is replicated, so
-        # ``_install_ctr_table``'s fallback fires afterwards and would
-        # otherwise gather a SECOND, independently derived global argmax --
-        # making decision 6's "the SAME global reference" true only for as
-        # long as nothing between the two calls touches the ACA. The epoch
-        # key is what stops a later epoch reusing this one. Cleared beside
-        # the row in ``setup()``'s ``finally``.
-        self._fstat_epoch_reference = (int(k), int(w_global), int(owner_rank),
-                                       int(local_index))
         _fanout = getattr(self, "fanout", None)
         n_compute = 1 if _fanout is None else int(_fanout.layout.n_compute)
-        # Auditability: the epoch line carries the reference walker's total
-        # lnL (residual+PSD combination) alongside its GLOBAL index and the
-        # rank that owns it, so a run log shows WHICH state each epoch's grid
-        # was fitted against -- "same peaks after a refit" is only
-        # diagnosable with this visible.
-        try:
-            # BRANCH ON THE SOURCE OF ``lls``, NOT ON ITS SIZE.
-            # ``_fstat_global_reference`` reports an all-NaN LENGTH-1
-            # placeholder when there is no fan-out to gather through
-            # (``_propose_legacy``, ``fit.sample()``), so a ``lls.size >
-            # w_global`` test first is true exactly when ``w_global == 0``
-            # -- an entirely ordinary local argmax -- and the placeholder
-            # then wins, dropping both numbers from the line on the path
-            # most local runs take.
-            if _fanout is None:
-                # No gather to do, and this process's ACA holds EVERY walker,
-                # so the global index IS the row and the epoch line keeps the
-                # lnL it has carried since 2026-08-24. Never attempted under
-                # a fan-out: there the ACA is this rank's BLOCK, and
-                # ``lls[w_global]`` would silently be another walker's number.
-                _lls = _to_numpy(model.analysis_container_arr.likelihood())
-                _ll_ref = float(_lls[w_global])
-                _ll_spread = float(_lls.max() - _lls.min())
-            elif lls.size > w_global:
-                _ll_ref = float(lls[w_global])
-                _ll_spread = (float(lls.max() - lls.min()) if lls.size > 1
-                              else float("nan"))
-            else:
-                # DEFENSIVE: a placeholder shorter than the global index. No
-                # head-side caller produces one today -- the gather's own
-                # fallback returns ``w_global = 0`` beside a length-1
-                # placeholder, which the ``elif`` above catches and already
-                # reports as nan/nan. Kept so a future gather that returns a
-                # short vector reports "unknown" instead of IndexError-ing
-                # out of an epoch log line.
-                _ll_ref = _ll_spread = float("nan")
-        except Exception:
-            _ll_ref, _ll_spread = float("nan"), float("nan")
         band_edges = _to_numpy(self.band_edges)
         # f0_lims convention (gb.py): the interior span, band_edges[1:-1].
         f0_lims = (float(band_edges[1]), float(band_edges[-2]))
         mc_lims = self.fstat_fit_kwargs.get("mc_lims") or [0.001, 1.0]
-        t0 = time.perf_counter()
-        logger.info(
-            "%s: F-stat grid fit epoch %d starting (walker_ref=%d GLOBAL on "
-            "rank %d row %d, lnL=%.3f, cold-walker lnL spread=%.3f, "
-            "n_compute=%d, cache %s)",
-            self.name, k, w_global, owner_rank, local_index, _ll_ref,
-            _ll_spread, n_compute, cache_dir)
         # THE FLAG IS PART OF THE FINGERPRINT. ``GB_FSTAT_GB_FREE`` changes
         # the RESIDUAL the sweep runs against but nothing else about the
         # sweep's inputs, so without this the two modes produce different
@@ -22741,7 +22868,30 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         # until the first real refit -- exactly the silent-cache-reuse case
         # the fingerprint exists to prevent.
         _gb_free = os.environ.get("GB_FSTAT_GB_FREE", "1") == "1"
+        t0 = time.perf_counter()
         if _already_fitted:
+            # NO GATHER EITHER. ``_fstat_global_reference`` is a fan-out
+            # collective, and on this path nothing consumes its answer: no row
+            # is replicated, the sweep short-circuits on the finished npz
+            # before it looks at a fingerprint, and ``_install_ctr_table``'s
+            # fallback -- the only other consumer -- gathers for itself when
+            # ``_fstat_epoch_reference`` is absent (and does not run at all
+            # when ``fstat_centers.npz`` already exists). So this path issues
+            # no F-stat command of any kind.
+            w_global = owner_rank = local_index = None
+            # THE MANIFEST'S ``walker_ref`` IS NOT THIS PROCESS'S TO INVENT on
+            # this path (final review M-3). Keep whatever the process that
+            # actually fitted the grid recorded, if its manifest is still
+            # there and readable; otherwise ``None``, because a walker
+            # gathered HERE would name the process that rewrote the manifest
+            # rather than the residual the grid was scored against -- in the
+            # one field whose whole job is to name that residual.
+            _manifest_walker = None
+            try:
+                with open(os.path.join(cache_dir, "DONE.json")) as _f:
+                    _manifest_walker = json.load(_f).get("walker_ref")
+            except (OSError, ValueError, TypeError):
+                _manifest_walker = None
             # Nothing will be scored: ``run_fstat_grid_fit`` loads the npz and
             # returns. ``call_fstat`` is a refusal rather than ``None`` so a
             # file that vanished between the two tests says WHY instead of
@@ -22753,10 +22903,33 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
                     "no F-stat scorer was built -- and then something asked "
                     f"to score. {cache_dir} must have lost its "
                     "*_peaks_stacked.npz mid-fit.")
+            # Unused by the short circuit; spelled out so a file that vanished
+            # between the two tests cannot resume some OTHER walker's
+            # checkpoints under this epoch's key.
+            fingerprint_extra = (
+                f"|epoch={k}|gbfree={int(_gb_free)}|wref=none")
             logger.info(
                 "%s: F-stat epoch %d is already fitted; loading it without "
-                "replicating a reference row.", self.name, k)
+                "replicating a reference row or gathering a global "
+                "reference (n_compute=%d, cache %s).",
+                self.name, k, n_compute, cache_dir)
         else:
+            w_global, owner_rank, local_index, lls = (
+                self._fstat_global_reference(model))
+            # PUBLISHED FOR THE CENTRE TABLE, keyed by the epoch: it must
+            # score through the SAME global reference this fit used (decision
+            # 6), and re-deriving it there would be a second, independently
+            # gathered argmax -- true only for as long as nothing between the
+            # two calls touches the ACA. The epoch key is what stops a later
+            # epoch reusing this one. Cleared beside the row in ``setup()``'s
+            # ``finally``.
+            self._fstat_epoch_reference = (int(k), int(w_global),
+                                           int(owner_rank), int(local_index))
+            _manifest_walker = int(w_global)
+            self._fstat_epoch_line(model, k, w_global, owner_rank,
+                                   local_index, lls, n_compute, cache_dir)
+            fingerprint_extra = (
+                f"|epoch={k}|gbfree={int(_gb_free)}|wref={w_global}")
             self._fstat_ref_row_fanout(model, branches, w_global, owner_rank,
                                        local_index)
             # Built (and cached on ``_fstat_ref_call``) before anything can
@@ -22782,13 +22955,25 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             # argmax, which moves more freely across a restart than the old
             # head-local one did -- a job that died mid-fit and came back to
             # a different best walker would otherwise resume the earlier
-            # walker's comb and per-rank stage-B checkpoints under an
-            # unchanged cache key, silently stitching two residuals' rows
-            # into one grid. With ``wref`` in the key those checkpoints are
-            # simply invalid and each sweep restarts cleanly.
+            # walker's IN-FLIGHT comb scan and per-rank stage-B checkpoints
+            # under an unchanged cache key, silently stitching two residuals'
+            # rows into one grid. With ``wref`` in the key those CHECKPOINTS
+            # are invalid and each sweep restarts cleanly.
+            #
+            # WHAT IT DOES NOT COVER -- the ruled known limitation (2026-09-17;
+            # docs/multirank-cluster-gates.md Step 5 item 1 carries the full
+            # text): ``fingerprint_extra`` salts ``ckpt_fingerprint``, i.e.
+            # the in-flight PROGRESS files only. A COMPLETED
+            # ``*_comb.npz`` is not a checkpoint -- ``run_fstat_grid_fit``
+            # reloads it on ``os.path.exists`` alone and re-selects peaks
+            # from it -- so a restart whose argmax moved still chooses its
+            # peak BOXES from the old walker's comb scan, and only the
+            # stage-B values inside those boxes are guaranteed to be scored
+            # at the new reference. A proposal-quality effect, not a
+            # correctness one (births are MH-corrected).
             # ``DONE.json``'s ``walker_ref`` stays the audit trail; this is
             # the enforcement.
-            fingerprint_extra=f"|epoch={k}|gbfree={int(_gb_free)}|wref={w_global}",
+            fingerprint_extra=fingerprint_extra,
             epoch=k,
             # ``fanout_active`` is exactly ``n_compute > 1`` (``single`` IS
             # ``n_compute == 1``), and the runner REFUSES to be built at one
@@ -22813,7 +22998,19 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
                     self.name, k, wall, n_peaks)
         try:
             with open(os.path.join(cache_dir, "DONE.json"), "w") as f:
-                json.dump(dict(epoch=k, walker_ref=int(w_global),
+                json.dump(dict(epoch=k,
+                               # THIS FIT's global reference -- or, on the
+                               # ``_already_fitted`` path, whatever the
+                               # process that really fitted the grid recorded
+                               # (``None`` when that manifest is gone, which
+                               # is the usual way onto that path). Never this
+                               # process's own argmax there: see the
+                               # ``_manifest_walker`` note above.
+                               # ``fitted_here`` says which of the two a
+                               # reader is looking at, and both keys always
+                               # exist so nothing has to special-case them.
+                               walker_ref=_manifest_walker,
+                               fitted_here=(not _already_fitted),
                                n_peaks=int(n_peaks), wall_seconds=wall,
                                num_proposals=int(self.num_proposals),
                                # how many compute ranks split stage B.
@@ -22965,16 +23162,20 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
                 # centre table): replicate the row now, through exactly the
                 # same global reference + ``gb_fstat_ref_row`` the fit uses.
                 #
-                # REUSE THE FIT'S OWN REFERENCE WHEN IT HAS ONE. On the
-                # ``_already_fitted`` path ``_run_fstat_fit`` gathered the
-                # global argmax (and stamped it into ``DONE.json``) but
-                # replicated no row, so this branch fires with the answer
-                # already in hand. Re-gathering would be a second collective
-                # AND a second, independently derived argmax -- decision 6's
-                # "the SAME global reference" would then hold only as long as
-                # nothing between the two calls touches the ACA, which
-                # nothing asserts. ``_fstat_epoch_reference`` is keyed by the
-                # epoch so a stale one can never be picked up.
+                # REUSE THE FIT'S OWN REFERENCE WHEN IT HAS ONE. When
+                # ``_run_fstat_fit`` ran a real fit for THIS epoch in this
+                # process it published the global argmax it used, so this
+                # branch fires with the answer already in hand. Re-gathering
+                # would be a second collective AND a second, independently
+                # derived argmax -- decision 6's "the SAME global reference"
+                # would then hold only as long as nothing between the two
+                # calls touches the ACA, which nothing asserts.
+                # ``_fstat_epoch_reference`` is keyed by the epoch so a stale
+                # one can never be picked up; it is absent on the paths that
+                # ran no fit (a load, a cross-move reuse, an
+                # ``_already_fitted`` short circuit -- which deliberately
+                # gathers nothing), and there this gathers once, here, for
+                # the row it is about to replicate.
                 _cached = getattr(self, "_fstat_epoch_reference", None)
                 if _cached is not None and int(_cached[0]) == int(k):
                     _k0, w_global, owner_rank, local_index = _cached
@@ -23190,7 +23391,8 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             # and the centre table must BOTH score against it (the
             # 2026-08-24 same-residual rule), which is why it cannot be
             # released between them -- and it is tens of MB plus a built
-            # sig-het scorer, so it must not survive them either. Every
+            # sig-het scorer plus that scorer's ~GB of reference blocks on
+            # the comp, so it must not survive them either. Every
             # worker's copy is already gone (``_run_fstat_fit`` issues
             # ``gb_fstat_release`` once the epoch's artifacts are written);
             # this is the head's own, and the ``finally`` covers the paths

@@ -1769,8 +1769,8 @@ class DoneManifestTest(unittest.TestCase):
         from lisatools.globalfit.moves import gbspecialstretch as gbs
 
         src = inspect.getsource(gbs.GBSpecialRJFStatGridMove._run_fstat_fit)
-        for key in ("walker_ref", "n_compute", "n_peaks", "wall_seconds",
-                    "num_proposals", "clock", "epoch"):
+        for key in ("walker_ref", "fitted_here", "n_compute", "n_peaks",
+                    "wall_seconds", "num_proposals", "clock", "epoch"):
             self.assertIn(key, src, f"DONE.json must record {key!r}")
 
     def test_run_fstat_grid_fit_forwards_a_sweep_runner(self):
@@ -1828,10 +1828,17 @@ class RunFstatFitWiringTest(unittest.TestCase):
         move.fanout.single = (n_compute == 1)
         self.owner_rank = layout.compute_ranks[-1]
         self.lls = np.arange(4 * n_compute, dtype=float)
-        move._fstat_global_reference = lambda model: (
-            w_global, self.owner_rank, 2, self.lls)
 
-        self.seen = {"ref_row": [], "release": [], "runner": 0, "window": 0}
+        self.seen = {"ref_row": [], "release": [], "runner": 0, "window": 0,
+                     "global_reference": 0}
+
+        def global_reference(model):
+            # COUNTED: it is a fan-out collective, and the ``_already_fitted``
+            # path must not pay one (final review M-2).
+            self.seen["global_reference"] += 1
+            return w_global, self.owner_rank, 2, self.lls
+
+        move._fstat_global_reference = global_reference
         self.scorer = lambda params: params
         self.runner = lambda spec, call, *, xp: None
 
@@ -1982,12 +1989,63 @@ class RunFstatFitWiringTest(unittest.TestCase):
             move._run_fstat_fit("model", 2)
         got = self._manifest()
         self.assertEqual(got["walker_ref"], 7)       # GLOBAL, not a local row
+        self.assertTrue(got["fitted_here"])          # this process fitted it
         self.assertEqual(got["n_compute"], 2)
         self.assertEqual(got["epoch"], 2)
         self.assertEqual(got["n_peaks"], 5)
         self.assertEqual(got["num_proposals"], 3)
         self.assertEqual(got["clock"], 11)
         self.assertGreaterEqual(got["wall_seconds"], 0.0)
+
+    def test_the_fit_publishes_the_epoch_reference_and_setup_clears_it(self):
+        """TASK 9 RE-REVIEW N-1 / final review M-11: the PRODUCER half.
+
+        ``_install_ctr_table``'s fallback reuses ``_fstat_epoch_reference``
+        instead of gathering a second, independently derived argmax. Every
+        consumer test sets the attribute BY HAND, and the over-the-wire arm
+        is green either way (the argmax is deterministic, so a re-gather
+        returns the same walker) -- so deleting the publication, or the
+        ``setup()``-level clear, cost nothing. These two assertions are the
+        detectors: the exact tuple the fit publishes, and ``None`` after the
+        release path that ``setup()``'s ``finally`` runs.
+        """
+        move = self._move(n_compute=2, w_global=7)
+        with self._patched_fit():
+            move._run_fstat_fit("model", 2)
+        self.assertEqual(move._fstat_epoch_reference,
+                         (2, 7, self.owner_rank, 2))
+
+    def test_setup_clears_the_row_and_the_epoch_reference_on_the_way_out(self):
+        """The other half of M-11: the REAL ``setup()``'s ``finally``.
+
+        ``_setup_epoch`` is stubbed to leave exactly what a fit leaves behind
+        (a holder, a scorer, an epoch reference); everything else here --
+        the ``try``/``finally`` and both statements inside it -- is
+        production. Deleting either line turns this red.
+        """
+        move = self._move(n_compute=2)
+        move._fstat_fit_decision = lambda: ("fit", 2)
+
+        def fake_epoch(model, branches, action, k):
+            move._fstat_epoch_reference = (int(k), 7, self.owner_rank, 2)
+            move._fstat_ref_holder = object()
+            move._fstat_ref_call = object()
+            move._fstat_ref_walker = 7
+
+        move._setup_epoch = fake_epoch
+        move.setup("model", {"gb": 1})
+        self.assertIsNone(move._fstat_ref_holder)
+        self.assertIsNone(move._fstat_ref_call)
+        self.assertIsNone(move._fstat_epoch_reference)
+
+    def test_a_skipped_setup_releases_nothing(self):
+        """``action == "skip"`` returns before the ``try``: a run between
+        refit windows must not touch a live centre-table row."""
+        move = self._move(n_compute=2)
+        move._fstat_fit_decision = lambda: ("skip", 0)
+        move._fstat_ref_holder = sentinel = object()
+        move.setup("model", {"gb": 1})
+        self.assertIs(move._fstat_ref_holder, sentinel)
 
     def test_the_ranks_are_released_only_after_the_manifest_is_written(self):
         """Spec decision 2 + the release ruling: a worker's holder (and the
@@ -2062,14 +2120,48 @@ class RunFstatFitWiringTest(unittest.TestCase):
         self.assertEqual(self.seen["release"], [],
                          "nothing was replicated, so nothing to release")
         self.assertEqual(self.seen["runner"], 0)
+        # ... AND NO GATHER (final review M-2): ``_fstat_global_reference`` is
+        # itself a fan-out collective, and on this path nothing consumes its
+        # answer -- the sweep short-circuits before any fingerprint, no row is
+        # replicated, and the centre table's fallback gathers for itself when
+        # it needs one. So this path issues no F-stat command at all.
+        self.assertEqual(self.seen["global_reference"], 0,
+                         "a complete epoch must cost no gather either")
+        self.assertIsNone(getattr(move, "_fstat_epoch_reference", None),
+                          "nothing was derived, so nothing may be published")
         self.assertIsNotNone(stacked)
         with np.load(GOLDEN_SINGLE, allow_pickle=False) as d:
             self.assertEqual(n_peaks, int(len(d["peak_f0_mHz"])))
         # the manifest is still written -- that is what stops the next
         # window deciding "fit" all over again
         self.assertEqual(self._manifest()["n_peaks"], n_peaks)
-        self.assertEqual(self._manifest()["walker_ref"], 6)
+        # ... but it does NOT claim a reference walker of its own (final
+        # review M-3): this process did not fit the grid beside it and never
+        # gathered an argmax, so any number here would name the process that
+        # rewrote the manifest, in the field whose whole job is to name the
+        # residual the grid was scored against. There is no earlier manifest
+        # to inherit one from here (that is how this path is reached at all),
+        # so the honest value is ``None``.
+        self.assertIsNone(self._manifest()["walker_ref"])
+        self.assertFalse(self._manifest()["fitted_here"])
         self.assertIn("already fitted", "\n".join(cap.output))
+
+    def test_a_complete_epoch_keeps_the_fitters_walker_in_the_manifest(self):
+        """The other half of M-3: when the ORIGINAL manifest is still there,
+        its ``walker_ref`` is the fit's audit trail and must survive a rewrite
+        by a process that only loaded the grid."""
+        move = self._move(n_compute=2)
+        move._fstat_holder_call = lambda model: self.fail(
+            "a complete epoch must not build an F-stat scorer")
+        shutil.copyfile(GOLDEN_SINGLE, G.stacked_grid_path(self.tmp))
+        with open(os.path.join(self.tmp, "DONE.json"), "w") as f:
+            json.dump({"epoch": 4, "walker_ref": 11, "fitted_here": True}, f)
+        with stage_b_env():
+            move._run_fstat_fit("model", 4, branches={"gb": 1})
+        got = self._manifest()
+        self.assertEqual(got["walker_ref"], 11, "the fitter's walker was lost")
+        self.assertFalse(got["fitted_here"])
+        self.assertEqual(self.seen["global_reference"], 0)
 
     def test_the_completeness_test_names_the_file_the_fit_loads(self):
         """One implementation, so the move's pre-check can never disagree
@@ -2085,16 +2177,55 @@ class RunFstatFitWiringTest(unittest.TestCase):
         self.assertTrue(G.stage_b_complete(self.tmp))
 
 
+class _StubSigHetComp:
+    """A GB comp with the sig-het F-stat stash and its teardown.
+
+    ``setup_fstat_references`` writes the whole bucketed reference block --
+    ~GB of device arrays -- onto ``comp._fstat``
+    (gbgpu/gbsignalhetcomputations.py), and the scorer closure only keeps a
+    SECOND reference to that same dict. This stands in for exactly that
+    surface: the attribute, and the ``clear_fstat_references`` teardown the
+    release is supposed to call.
+    """
+
+    def __init__(self):
+        self._fstat = {"A0": "~GB of device arrays"}
+        self.cleared = 0
+
+    def clear_fstat_references(self):
+        self.cleared += 1
+        self._fstat = None
+
+
+class _StubBlindComp:
+    """A comp carrying the stash but NO teardown method (the hasattr arm)."""
+
+    def __init__(self):
+        self._fstat = {"A0": "~GB of device arrays"}
+
+
+class _AngryComp:
+    """A comp whose teardown raises -- a release must survive it."""
+
+    _fstat = {"A0": "still here"}
+
+    def clear_fstat_references(self):
+        raise RuntimeError("device teardown failed")
+
+
 class ReleaseBodyTest(unittest.TestCase):
     """``gb_fstat_release``: the seventh op, and what serving it does."""
 
-    def _move(self, cls_name="GBSpecialRJFStatGridMove", *, held=True):
+    def _move(self, cls_name="GBSpecialRJFStatGridMove", *, held=True,
+              comp=None):
         from lisatools.globalfit.moves import gbspecialstretch as gbs
 
         cls = getattr(gbs, cls_name)
         move = cls.__new__(cls)
         move.name = "gb_test"
         move.mempool = _CountingMempool()
+        if comp is not None:
+            move.gb_wdm_comp = comp
         if held:
             move._fstat_ref_holder = object()
             move._fstat_ref_call = object()
@@ -2122,6 +2253,61 @@ class ReleaseBodyTest(unittest.TestCase):
         self.assertIsNone(move._fstat_ref_walker)
         self.assertEqual(move.mempool.frees, 1)
         self.assertTrue(reply["released"])
+
+    def test_serving_it_frees_the_sig_het_reference_blocks_on_the_comp(self):
+        """FINAL REVIEW I-1. The blocks are the ~GB half and they do NOT live
+        on the closure: ``_ensure_block`` calls
+        ``comp.setup_fstat_references(...)``, which allocates them onto
+        ``comp._fstat``, and only then stashes a second reference on the
+        closure. A release that sets ``_fstat_ref_call = None`` therefore
+        drops one of two references and frees NOTHING -- the blocks stay
+        resident on every worker's device until the next refit, ~50
+        iterations later, while three docstrings say they are gone."""
+        comp = _StubSigHetComp()
+        move = self._move(comp=comp)
+        reply = move.gf_serve("gb_fstat_release", None, {}, None)
+        self.assertIsNone(comp._fstat, "the comp kept the reference blocks")
+        self.assertEqual(comp.cleared, 1,
+                         "the release must go through the comp's own teardown")
+        self.assertTrue(reply["released"])
+        # and the pool sweep comes AFTER the clear -- a live-referenced block
+        # cannot be reclaimed
+        self.assertEqual(move.mempool.frees, 1)
+
+    def test_a_comp_with_no_teardown_still_loses_its_stash(self):
+        """The ``hasattr`` arm: a sig-het surface carrying ``_fstat`` but no
+        ``clear_fstat_references`` must not keep ~GB resident just because it
+        is missing one method."""
+        comp = _StubBlindComp()
+        move = self._move(comp=comp)
+        move.gf_serve("gb_fstat_release", None, {}, None)
+        self.assertIsNone(comp._fstat)
+
+    def test_a_comp_without_the_fstat_surface_is_untouched(self):
+        """A plain ``GBWDMComputations`` (GB_SIGHET_INMODEL=0) has no stash at
+        all: two failed lookups, no attribute invented on it."""
+        class _Plain:
+            pass
+
+        comp = _Plain()
+        move = self._move(comp=comp)
+        move.gf_serve("gb_fstat_release", None, {}, None)
+        self.assertFalse(hasattr(comp, "_fstat"))
+
+    def test_a_failing_comp_teardown_cannot_fail_the_release(self):
+        """A RELEASE MUST NEVER BE THE THING THAT FAILS -- the same principle
+        that exempts this op from ``_FSTAT_OP_REQUIRES``. The row still goes,
+        the pool is still swept, and the survivor is named in a WARNING."""
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = self._move(comp=_AngryComp())
+        with self.assertLogs(gbs.logger, "WARNING") as cap:
+            reply = move.gf_serve("gb_fstat_release", None, {}, None)
+        self.assertTrue(reply["released"])
+        self.assertIsNone(move._fstat_ref_holder)
+        self.assertEqual(move.mempool.frees, 1)
+        self.assertIn("sig-het F-stat reference blocks",
+                      "\n".join(cap.output))
 
     def test_holding_nothing_is_a_no_op_that_still_frees_the_pool(self):
         move = self._move(held=False)
@@ -2177,6 +2363,7 @@ class ReleaseFanoutTest(unittest.TestCase):
         move.name = "gb_test"
         move.gf_move_name = "gb_test"
         move.mempool = _CountingMempool() if mempool is None else mempool
+        move.gb_wdm_comp = _StubSigHetComp()
         move._fstat_ref_holder = object()
         move._fstat_ref_call = object()
         move._fstat_ref_walker = 6
@@ -2211,11 +2398,15 @@ class ReleaseFanoutTest(unittest.TestCase):
                     move.fanout.stop()
                 # the head's pool free is included: surviving its OWN
                 # free_all_blocks is exactly what the save/restore claims
-                return ("head", (move._fstat_ref_holder, move._fstat_ref_call),
+                return ("head",
+                        (move._fstat_ref_holder, move._fstat_ref_call,
+                         move.gb_wdm_comp._fstat),
                         (sorted(replies), move.mempool.frees))
             ComputeService(fcomm, layout, rank,
                            registry={"gb_test": move}, model=None).serve()
-            return ("worker", (move._fstat_ref_holder, move._fstat_ref_call),
+            return ("worker",
+                    (move._fstat_ref_holder, move._fstat_ref_call,
+                     move.gb_wdm_comp._fstat),
                     move.mempool.frees)
 
         return world.run(body)
@@ -2226,12 +2417,23 @@ class ReleaseFanoutTest(unittest.TestCase):
         self.assertEqual(roles, {"head", "worker", "saver"})
         for rank, (role, held, extra) in out.items():
             if role == "worker":
-                self.assertEqual(held, (None, None), f"rank {rank} kept a row")
+                # FINAL REVIEW I-1, over the wire: the third slot is the
+                # comp's reference-block stash, the ~GB half. Dropping the
+                # closure alone would leave it -- on EVERY worker, for the
+                # whole inter-refit window.
+                self.assertEqual(held, (None, None, None),
+                                 f"rank {rank} kept a row, a scorer or its "
+                                 "sig-het reference blocks")
                 self.assertEqual(extra, 1, "the worker never freed its pool")
             elif role == "head":
                 # the centre table still has to score against this row
                 self.assertIsNotNone(held[0], "the head dropped its own row")
                 self.assertIsNotNone(held[1], "the head dropped its scorer")
+                # ... and its scorer's RESIDENT BLOCK: without it the centre
+                # sweep keeps the same closure but pays a full rebuild on its
+                # first batch (``_ensure_block``'s identity guard)
+                self.assertIsNotNone(
+                    held[2], "the head dropped its reference blocks")
                 ranks_replied, head_frees = extra
                 self.assertEqual(len(ranks_replied), 2)  # one per compute rank
                 # the head served the command like every other rank -- pool
@@ -2731,6 +2933,8 @@ class _StageBRankStub:
     _fstat_stage_b_runner = _B._fstat_stage_b_runner
     _fstat_holder_call = _B._fstat_holder_call
     _fstat_release_ref_row = _B._fstat_release_ref_row
+    _fstat_clear_comp_references = _B._fstat_clear_comp_references
+    _fstat_detached_timer = _B._fstat_detached_timer
     _require_fstat_grid_move = _B._require_fstat_grid_move
     _fanout_cmd = _B._fanout_cmd
     _rank_tag = _B._rank_tag
@@ -2788,6 +2992,7 @@ class _RefRowRankStub:
     _fstat_ref_shard = staticmethod(_B._fstat_ref_shard)
     _fstat_ref_branch_from_payload = _B._fstat_ref_branch_from_payload
     _require_fstat_grid_move = _B._require_fstat_grid_move
+    _fstat_detached_timer = _B._fstat_detached_timer
     gf_serve = _B.gf_serve
     _fstat_ref_holder = None
     _fstat_ref_call = None
@@ -2937,7 +3142,16 @@ class RefRowReplicationTest(unittest.TestCase):
 
 
 class ParallelStageBGateTest(unittest.TestCase):
-    """THE acceptance gate: 2 (and 3) ranks == 1 rank, byte for byte."""
+    """THE acceptance gate: 2 (and 3) ranks == 1 rank, byte for byte.
+
+    A SPLIT gate, not a row gate: every rank pre-installs its own
+    :class:`_StubRefRow` of zeros, so this class never issues
+    ``gb_fstat_ref_row`` and the row-keyed scorer is the exact identity here
+    (which is what lets the arm score the stored goldens' own function). The
+    replication itself is gated by :class:`RefRowReplicationTest`, and "every
+    rank scored the OWNER's row" byte-for-byte by :class:`EpochFitGateTest` /
+    :class:`ReplicaModeEpochFitTest`.
+    """
 
     def setUp(self):
         self.d = tempfile.mkdtemp()
@@ -2995,6 +3209,16 @@ class ParallelStageBGateTest(unittest.TestCase):
         got = self._fanout_run(2, self.d, grouped=False)
         assert_npz_identical(self, got, GOLDEN_SINGLE)
 
+    def test_more_ranks_than_boxes_is_bit_identical_too(self):
+        """MORE RANKS THAN BOXES, over the wire. ``split_box_range`` hands the
+        surplus ranks an EMPTY range and ``run_stage_b_group`` short-circuits
+        on ``node_shape[0] == 0`` -- unit-tested, but until now never actually
+        crossed the fan-out, where an empty partial is still written, replied
+        for, verified against the head's map and concatenated. The cluster
+        hits this whenever a group has fewer boxes than compute ranks."""
+        got = self._fanout_run(5, self.d, grouped=True)
+        assert_npz_identical(self, got, GOLDEN_GROUPED)
+
     def test_partials_are_deleted_after_assembly(self):
         self._fanout_run(2, self.d, grouped=True)
         parts = os.path.join(self.d, "fstat_grid_parts")
@@ -3047,8 +3271,11 @@ class ParallelStageBGateTest(unittest.TestCase):
         self.assertTrue(fired.is_set())
         with self.assertLogs(G.logger, level="INFO") as captured:
             got = self._fanout_run(3, self.d, grouped=True)
+        # the FINGERPRINT line, not the bare "restarting this sweep" that
+        # ``ckpt_load`` also logs for a truncated or unreadable progress file
         self.assertTrue(
-            any("restarting this sweep" in m for m in captured.output),
+            any("inputs changed -> restarting this sweep" in m
+                for m in captured.output),
             "a 2-rank checkpoint must be refused by a 3-rank sweep")
         assert_npz_identical(self, got, GOLDEN_GROUPED)
 
@@ -3215,6 +3442,7 @@ class _EpochFitRankStub:
     )
 
     _run_fstat_fit = _G._run_fstat_fit
+    _fstat_epoch_line = _G._fstat_epoch_line
     _install_ctr_table = _G._install_ctr_table
     _fstat_ctr_mode = staticmethod(_G._fstat_ctr_mode)
     _fstat_ctr_smear = _G._fstat_ctr_smear
@@ -3234,6 +3462,8 @@ class _EpochFitRankStub:
     _fstat_stage_b_runner = _B._fstat_stage_b_runner
     _gb_serve_fstat_release = _B._gb_serve_fstat_release
     _fstat_release_ref_row = _B._fstat_release_ref_row
+    _fstat_clear_comp_references = _B._fstat_clear_comp_references
+    _fstat_detached_timer = _B._fstat_detached_timer
     _fstat_release_fanout = _B._fstat_release_fanout
     _require_fstat_grid_move = _B._require_fstat_grid_move
     _fanout_cmd = _B._fanout_cmd
@@ -3382,12 +3612,19 @@ def run_epoch_fit_world(n_compute, nwalkers, cache_root, *, epoch=0,
                      else after_fit(move, model, branches))
         finally:
             fanout.stop()
-        # setup()'s own ``finally``, which is what finally drops the head's
         cache_dir = move._epoch_dir(epoch)
+        # THE FIT'S OWN PUBLICATION, read before the release clears anything:
+        # ``_run_fstat_fit`` stashes the epoch's global reference so
+        # ``_install_ctr_table`` scores the same walker instead of gathering a
+        # second argmax that merely happens to agree (final review M-11).
+        epoch_reference = move._fstat_epoch_reference
+        # setup()'s own ``finally``, which is what finally drops the head's
+        # row and its scorer (the workers' went with gb_fstat_release)
         move._fstat_release_ref_row()
         with open(os.path.join(cache_dir, "DONE.json")) as f:
             manifest = json.load(f)
         return dict(facts, role="head", n_peaks=int(n_peaks),
+                    epoch_reference=epoch_reference,
                     path=G.stacked_grid_path(cache_dir), manifest=manifest,
                     owner_of_argmax=layout.owner_of(int(np.argmax(lls))),
                     head_rank=int(layout.head_rank),
@@ -3431,6 +3668,14 @@ class EpochFitGateTest(unittest.TestCase):
         assert_npz_identical(self, p_head["path"], s_head["path"])
         self.assertEqual(s_head["manifest"]["walker_ref"], 3)
         self.assertEqual(p_head["manifest"]["walker_ref"], 3)
+        # the PRODUCER of the centre table's reference (final review M-11):
+        # the exact tuple, over a real fan-out and against the owner the
+        # layout names -- not just "some walker that agrees"
+        for arm, name in ((s_head, "serial"), (p_head, "parallel")):
+            self.assertEqual(
+                arm["epoch_reference"],
+                (0, 3) + tuple(int(x) for x in arm["owner_of_argmax"]),
+                f"the {name} fit published no usable epoch reference")
         self.assertEqual(s_head["manifest"]["n_compute"], 1)
         self.assertEqual(p_head["manifest"]["n_compute"], 2)
         # the reference walker's owner is a WORKER, and the window opened
@@ -3525,14 +3770,27 @@ class EpochFitGateTest(unittest.TestCase):
                     out = run_epoch_fit_world(2, 4, self.b)
         head = next(v for v in out.values() if v and v["role"] == "head")
         self.assertEqual(head["manifest"]["walker_ref"], 0)
+        # the FINGERPRINT line specifically: ``ckpt_load`` logs the bare
+        # "restarting this sweep" for a truncated or unreadable file too
         self.assertTrue(
-            any("restarting this sweep" in m for m in captured.output),
+            any("inputs changed -> restarting this sweep" in m
+                for m in captured.output),
             "a CHANGED reference walker must invalidate the epoch's "
             "checkpoints -- otherwise the new walker's grid is stitched "
             "out of the old walker's rows")
         self.assertFalse(
             any("[ckpt] resuming" in m for m in captured.output),
             "nothing of the old walker's sweep may be reused")
+        # THE KNOWN LIMITATION, PINNED RATHER THAN IMPLIED AWAY (Task 10 I-1,
+        # ruled LEAVE AS IS 2026-09-17): ``|wref=`` salts the CHECKPOINTS.
+        # The COMPLETED comb npz is not one -- ``run_fstat_grid_fit`` reloads
+        # it on ``os.path.exists`` alone -- so the moved walker re-selects its
+        # peak BOXES from the old walker's comb scan. If this line ever stops
+        # firing here, stage A has started being fingerprinted too and the
+        # runbook's Step 5 item 1 limitation can be deleted.
+        self.assertTrue(
+            any("reusing comb cache" in m for m in captured.output),
+            "today's behaviour: the finished comb is reloaded unfingerprinted")
 
     def test_the_fingerprint_names_the_reference_walker(self):
         import inspect

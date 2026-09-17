@@ -1090,14 +1090,14 @@ def snapshot_ref_rows(holder, view, intra_data, intra_noise, *, xp,
     the multi-rank fit's owner rank ships exactly the rows THAT lane
     replicates.
 
-    TODO (not yet the only extraction):
-    :meth:`_RoutedBandEngine.make_fstat_nm_lanes` still inlines its own copy
-    of this slice against the same :class:`_ShardHolderView` type, and that
-    one is MIRROR-BLIND -- it reads ``linear_psd_arr[0]`` directly and would
-    take the wrong row for a shared-psd mirror view, which the
-    ``psd_row_index`` branch below exists to handle. Fold that site into
-    this helper; until then, "one set of layout assumptions" holds for the
-    sig-het lane and the multi-rank fit, not for the whole module.
+    THE ONLY EXTRACTION (2026-09-17). :meth:`_sighet_fstat_multidevice`, the
+    multi-rank fit's ``gb_fstat_ref_row`` body and
+    :meth:`_RoutedBandEngine.make_fstat_nm_lanes` all come through here, so
+    one set of layout assumptions covers the module: the mirror-aware psd row
+    (the ``psd_row_index`` branch below) and the copy guarantee. The lanes
+    site used to inline its own ``np.ascontiguousarray(asnumpy(...))`` slice
+    and had BOTH gaps -- it was mirror-blind, and on the CPU backend its
+    "snapshot" aliased the live residual.
     """
     n_slabs = int(view.acs_total_entries)
     dev = getattr(view, "device", None) if device is None else device
@@ -1115,9 +1115,21 @@ def snapshot_ref_rows(holder, view, intra_data, intra_noise, *, xp,
         (they receive a genuine ``Bcast`` copy), and any later residual
         write would silently re-score the epoch. On the CUDA backend
         ``asnumpy`` already copies; this makes the guarantee the docstring
-        states hold on both.
+        states hold on both -- WITHOUT paying a second ~72 MB
+        allocate-and-copy there, which is what an unconditional copy did.
+
+        The fresh-array test is deliberately conservative: a NEW object
+        (``arr is not row``) that OWNS its data (``base is None`` -- a view,
+        a slice and a ``frombuffer`` wrapper all carry a base) and is
+        C-contiguous cannot alias anything, and that is exactly what a D2H
+        ``asnumpy`` returns. Everything else is copied, the CPU backend's
+        identity return included.
         """
-        arr = np.asarray(asnumpy(row))
+        arr = asnumpy(row)
+        if (arr is not row and isinstance(arr, np.ndarray)
+                and arr.base is None and arr.flags["C_CONTIGUOUS"]):
+            return arr
+        arr = np.asarray(arr)
         return np.array(arr, dtype=arr.dtype, order="C", copy=True)
 
     with device_context(holder.xp, dev):
@@ -2598,14 +2610,17 @@ class _RoutedBandEngine:
         si = int(split_map[int(walker_ref)])
         intra = int(intra_map[int(walker_ref)])
         view = cls._shard_views(holder)[si]
-        n_slabs = int(view.acs_total_entries)
-        with device_context(holder.xp, view.device):
-            data_row_host = np.ascontiguousarray(asnumpy(
-                xp.asarray(view.linear_data_arr[0]).reshape(
-                    n_slabs, -1)[intra]))
-            psd_row_host = np.ascontiguousarray(asnumpy(
-                xp.asarray(view.linear_psd_arr[0]).reshape(
-                    n_slabs, -1)[intra]))
+        # ONE extraction for the whole module now (2026-09-17): this site used
+        # to inline its own ``np.ascontiguousarray(asnumpy(...))`` slice, which
+        # is MIRROR-BLIND (it reads ``linear_psd_arr[0]`` directly and takes
+        # the wrong row for a shared-psd mirror view) and, on the CPU backend,
+        # returns the LIVE view rather than a copy -- the production defect the
+        # multi-rank fit hit at ``d94e25fb``. Unreachable from here today (the
+        # lanes path needs ``_is_multi`` and several GPUs, i.e. cupy, where
+        # ``asnumpy`` copies), which is exactly why it had to stop being a
+        # second copy of these layout assumptions.
+        data_row_host, psd_row_host = snapshot_ref_rows(
+            holder, view, intra, intra, xp=xp, device=view.device)
 
         lanes = []
         for dev in [int(g) for g in holder.gpus]:

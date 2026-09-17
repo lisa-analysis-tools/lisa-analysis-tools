@@ -1180,6 +1180,14 @@ def save_stage_b_part(parts_dir, gi, rank, grid):
     appends ``.npy`` to whatever it is handed, which would turn the
     write-then-rename temp name into ``....npy.tmp.npy``. The rename is what
     makes the head's read of a partial atomic on a shared filesystem.
+
+    FLUSHED AND FSYNCED BEFORE THE RENAME. This is the branch's one
+    cross-NODE data path -- a worker writes here, replies, and the HEAD reads
+    the file from another node -- so the usual "the close is the barrier"
+    reasoning leans entirely on NFS close-to-open semantics. A bad read is
+    loud rather than silent (a short file raises out of ``np.load``, stale
+    content is caught by the sha1 ``assemble_stage_b_group`` re-checks), but
+    what it costs is a discarded stage-B wall, and the barrier is two lines.
     """
     os.makedirs(parts_dir, exist_ok=True)
     arr = np.ascontiguousarray(_to_host(grid), dtype=np.float64)
@@ -1187,6 +1195,8 @@ def save_stage_b_part(parts_dir, gi, rank, grid):
     tmp = path + ".tmp"
     with open(tmp, "wb") as fh:
         np.save(fh, arr, allow_pickle=False)
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
     return path, int(arr.shape[0]), hashlib.sha1(arr.tobytes()).hexdigest()[:16]
 
