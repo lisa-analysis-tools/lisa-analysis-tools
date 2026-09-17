@@ -508,6 +508,14 @@ cd /shared/home/mlkatz1/lisa-analysis-tools
 # ============================================================================
 export GF_LEGACY_RANK_LAYOUT=1
 export NWALKERS=1
+# PSD/galfor at 1 walker (2026-09-17): the stretch inner needs >= 2
+# walkers; dev now carries the eigen-axis MH inner for PSDMove, and
+# 5595d1e1 makes it the AUTOMATIC default below 3 walkers. Pinned
+# explicitly anyway for the run record. Acceptance greps for the first
+# log (one-walker campaign doc): "inner proposal: eigen" once for PSD
+# and once for galfor, and a NONZERO psd in-model acceptance.
+export PSD_INNER_MOVE_KIND=eigen
+export GALFOR_INNER_MOVE_KIND=eigen
 
 # FRESH RUN (2026-08-15, user ruling: "we want to totally restart. This is a
 # fresh run now."). A NEW store dir so the previous run's h5/logs/fstat cache
