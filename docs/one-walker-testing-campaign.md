@@ -18,6 +18,7 @@ cd /shared/home/mlkatz1/lisa-analysis-tools && git checkout dev && git pull --ff
 
 export I_MPI_HYDRA_BOOTSTRAP=slurm I_MPI_FABRICS=shm:ofi FI_PROVIDER=tcp   # hydra + tcp fabric, the launcher that works here
 export DATA_MODE=synthetic NUM_ITERATIONS=4 MIDIT_CHECKPOINT=0 MAKE_DIAGNOSTIC_PLOTS=0 GF_FANOUT_DIGEST=1 GF_LEGACY_RANK_LAYOUT=0
+export MIN_FREQ=4e-4   # production's band start; the stock 1e-4 lands on the singular WDM layer 1 (PSD bias 1.39x)
 export NWALKERS=1
 G=$HOME/onewalker_gates; mkdir -p "$G"
 
@@ -46,6 +47,7 @@ The **single-node control layout** used by T2 keeps all three ranks on node A sh
 - **GB gates need a loud injection** (the driver does it by default). `--stock gb_no_fg` synthetic has no GB catalogue: the F-stat epoch reports `NO peaks`, births fall back to the prior, nothing is accepted, and every replica trivially agrees — the run exercises the transport and `gb_sync` only, never the ledger or the merge. There is no env knob for the injection table; `gate_run.py` sets `fit.general.gb_injection_params` to the WP7 runbook's loud in-band binary (a live fixture shows `20 peaks` on the epoch line and hashes that change every iteration).
   Expected, benign warnings on every run: `No 'GB' catalogue found; GB SNR-cut injection skipped`, `sig-het nt_layer=64 does not divide Nt ... snapping`, and `multi-rank run: submission residual dump SKIPPED` (a known TODO, not a failure).
 - **Every gate runs the campaign's sig-het pins** through `scripts/diagnostics/gate_run.py`, which reads the `export SIGHET_*` / `GB_SIGHET_*` lines of `submit_gf_6mo_v8.sh` at launch (single source of truth; `tests/test_gate_run.py`). The stock defaults differ from `submit_gf_6mo_v8.sh`: `SIGHET_NT_LAYER` 64 (snapped to 60, a 36 h stride the sig-het v4 notes flagged as 2.2x too coarse) vs 120, `SIGHET_N_CP` AUTO vs 256, `GB_SIGHET_REFRESH_EVERY` 0 (reference never refreshed) vs 25, `GB_SIGHET_TRUST_PHASE_C` 0 vs 49, drift check off vs on. T1 (2026-09-17) ran the stock defaults on both sides of its control, so its verdict stands; every gate from here runs the pins, and anything that reads accuracy (T4+) needs them.
+- **Spot nodes get taken back** (`CANCELLED ... DUE TO NODE FAILURE`, all ranks SIGTERM): not a code signal; relaunch with fresh store dirs, or use the non-spot partition for a gate that must finish in one piece.
 - Pull `dev` again before T3: the MBH `Q` prior fix (linear-column log-uniform on [1, 10]) lands after T0-T2 were written; the all_sources gates need it.
 
 ## Pass/fail signals (what to grep)
