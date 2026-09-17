@@ -2514,7 +2514,10 @@ export EMRI_NTEMPS=2
 # 80/80 non-positive infomats, mbh/emri walls 3-5x, iteration ~80 min).
 # Set 8 ONLY at the deliberate fresh restart (with the VGB chirp
 # migration), never on a resumed 12-rung store.
-export SOBBH_NTEMPS=12
+# 12 -> 8 (user ruling 2026-09-17, "SOBBH_NTEMPS=8 in the scripts"): the
+# 1-walker store was born at 8 rungs; a resumed 12-rung store keeps its
+# 12 anyway (recipe.resume_ladder_wins, WARNING names this knob).
+export SOBBH_NTEMPS=${SOBBH_NTEMPS:-8}
 # ONE information matrix per leaf at the max-lnL cold walker (like MBH/EMRI)
 # instead of one per (temperature, walker) (user ruling 2026-09-16): the
 # per-walker stash is keyed by the walker axis, so every resume under a

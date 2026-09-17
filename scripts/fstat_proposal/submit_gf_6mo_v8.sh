@@ -2527,8 +2527,11 @@ export EMRI_NTEMPS=2
 # 12 built a 12-rung move against an 8-rung state and died in the SOBBH
 # per-walker eigen sweep ("cannot reshape array of size 88 into shape
 # (12,newaxis)"). The knob is reported-and-ignored on such a resume; a
-# fresh store honours it.
-export SOBBH_NTEMPS=${SOBBH_NTEMPS:-12}
+# fresh store honours it. BACK TO 8 (user ruling 2026-09-17 evening): the
+# gf_prod_6mo_v8_4gpu store IS an 8-rung store, and a resumed 12-rung
+# store (the _mr copy, the original run) keeps its 12 via the store-wins
+# rule with a WARNING, so 8 here is safe for every store.
+export SOBBH_NTEMPS=${SOBBH_NTEMPS:-8}
 # ONE information matrix per leaf at the max-lnL cold walker (like MBH/EMRI)
 # instead of one per (temperature, walker) (user ruling 2026-09-16): the
 # per-walker stash is keyed by the walker axis, so every resume under a

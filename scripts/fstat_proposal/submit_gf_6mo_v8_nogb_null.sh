@@ -2325,7 +2325,10 @@ export SOBHB_IDS=0,1,2,3,4,5       # all 6 -- expected mostly sub-threshold
 # comment blocks for the measured cost arithmetic).
 export MBH_NTEMPS=2
 export EMRI_NTEMPS=2
-export SOBBH_NTEMPS=12
+# 12 -> 8 (user ruling 2026-09-17, "SOBBH_NTEMPS=8 in the scripts"). Safe
+# on a resumed 12-rung null store: the STORED rung count wins on resume
+# (recipe.resume_ladder_wins) with a WARNING naming this knob.
+export SOBBH_NTEMPS=${SOBBH_NTEMPS:-8}
 export MBH_NUM_PROP_REPEATS=2
 export EMRI_NUM_PROP_REPEATS=2
 export SOBBH_NUM_PROP_REPEATS=25
