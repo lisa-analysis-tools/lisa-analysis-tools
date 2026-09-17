@@ -429,6 +429,33 @@ class StageBPartIOTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             G.assemble_stage_b_group(self.d, 0, 2, whole.shape, xp=np, sha1s=shas)
 
+    def test_assemble_with_zero_width_parts_matches_the_whole(self):
+        """More ranks than boxes (split_box_range's own empty-tail case)."""
+        rng = np.random.default_rng(17)
+        whole = rng.normal(size=(2, 3, 2, 2, 2))
+        for r, (a, b) in enumerate(G.split_box_range(0, 2, 4)):  # 2 boxes, 4 ranks
+            G.save_stage_b_part(self.d, 0, r, whole[a:b])
+        got = G.assemble_stage_b_group(self.d, 0, 4, whole.shape, xp=np)
+        self.assertEqual(np.asarray(got).tobytes(),
+                         np.ascontiguousarray(whole).tobytes())
+
+    def test_assemble_raises_on_a_rank_missing_from_sha1s(self):
+        """sha1s given but incomplete must raise, not silently go unverified.
+
+        A rank absent from the dict (a lost or malformed MPI reply) is
+        exactly the failure the sha1 check exists to catch -- skipping
+        verification for that one rank would defeat the whole point.
+        """
+        rng = np.random.default_rng(19)
+        whole = rng.normal(size=(4, 2, 2, 2, 2))
+        shas = {}
+        for r, (a, b) in enumerate(G.split_box_range(0, 4, 2)):
+            _p, _n, shas[r] = G.save_stage_b_part(self.d, 0, r, whole[a:b])
+        del shas[1]  # rank 1's reply was lost
+        with self.assertRaises(RuntimeError) as ctx:
+            G.assemble_stage_b_group(self.d, 0, 2, whole.shape, xp=np, sha1s=shas)
+        self.assertIn("rank(s) [1]", str(ctx.exception))
+
     def test_clear_removes_only_this_group(self):
         g = np.zeros((1, 2, 2, 2, 2))
         G.save_stage_b_part(self.d, 0, 0, g)
@@ -441,6 +468,31 @@ class StageBPartIOTest(unittest.TestCase):
         """ckpt_clear(parts, "stageb") must reach the per-rank checkpoints."""
         self.assertTrue(
             os.path.basename(G.stage_b_part_path(self.d, 0, 3)).startswith("stageb"))
+
+
+class _FakeDeviceArray:
+    """Duck-types just enough cupy to prove the validation never converts.
+
+    cupy raises on implicit numpy conversion; the module's own ``_to_host``
+    (``x.get() if hasattr(x, "get") else np.asarray(x)``) exists for
+    exactly that reason. A validation that reads shapes through
+    ``np.asarray`` therefore breaks every GPU production run at the cache
+    write, which a CPU-only suite cannot see -- hence this stand-in.
+    """
+
+    def __init__(self, arr):
+        self._arr = np.asarray(arr)
+        self.shape = self._arr.shape
+        self.dtype = self._arr.dtype
+        self.ndim = self._arr.ndim
+
+    def __array__(self, *args, **kwargs):
+        raise TypeError(
+            "Implicit conversion to a NumPy array is not allowed. "
+            "Please use .get() to construct a NumPy array explicitly.")
+
+    def get(self):
+        return self._arr
 
 
 class WriteStackedNpzValidationTest(unittest.TestCase):
@@ -482,9 +534,11 @@ class WriteStackedNpzValidationTest(unittest.TestCase):
                 mc_ax_g=mc_ax_g, group_sizes=[2, 3],
                 **self._common_kwargs(5))
         msg = str(ctx.exception)
-        self.assertIn("group 1", msg)
-        self.assertIn("2", msg)
-        self.assertIn("3", msg)
+        # Distinctive substrings, not bare digits: a lone "2" or "3" would
+        # match almost any message and not actually test that the TWO
+        # disagreeing numbers are both named.
+        self.assertIn("group 1 grid has 2 box(es)", msg)
+        self.assertIn("group_sizes[1] says 3", msg)
         self.assertFalse(os.path.exists(os.path.join(self.d, "out.npz")),
                           "a rejected write must not touch disk")
 
@@ -498,8 +552,8 @@ class WriteStackedNpzValidationTest(unittest.TestCase):
                 mc_ax_g=mc_ax_g, group_sizes=[2, 3],
                 **self._common_kwargs(4))  # f0_los/f0_dxs sized for 4, not 5
         msg = str(ctx.exception)
-        self.assertIn("5", msg)
-        self.assertIn("4", msg)
+        self.assertIn("5 box(es) across all groups", msg)
+        self.assertIn("f0_los has 4 entries", msg)
 
     def test_valid_shapes_write_cleanly(self):
         """The happy path must still write -- validation is not overzealous."""
@@ -510,6 +564,32 @@ class WriteStackedNpzValidationTest(unittest.TestCase):
             out, grids_g=grids_g, mc_ax_g=mc_ax_g, group_sizes=[2, 3],
             **self._common_kwargs(5))
         self.assertTrue(os.path.exists(out))
+
+    def test_device_array_shapes_validate_and_write_without_conversion(self):
+        """A cupy-like grid must validate and write via ``.get()``, never
+        ``np.asarray`` -- ``np.asarray(cupy_array)`` raises for real cupy."""
+        host = [np.zeros((2, 2, 2, 2, 2)), np.ones((3, 2, 2, 2, 2))]
+        grids_g = [_FakeDeviceArray(h) for h in host]
+        mc_ax_g = [np.linspace(0.1, 1.0, 2), np.linspace(0.1, 1.0, 2)]
+        out = os.path.join(self.d, "out.npz")
+        G.write_stacked_npz(
+            out, grids_g=grids_g, mc_ax_g=mc_ax_g, group_sizes=[2, 3],
+            **self._common_kwargs(5))
+        with np.load(out, allow_pickle=False) as d:
+            np.testing.assert_array_equal(d["logp_grids_g0"], host[0])
+            np.testing.assert_array_equal(d["logp_grids_g1"], host[1])
+
+    def test_device_array_short_grid_still_raises_without_conversion(self):
+        """The mismatch path must also avoid ``np.asarray`` on the grid."""
+        grids_g = [_FakeDeviceArray(np.zeros((2, 2, 2, 2, 2))),
+                   _FakeDeviceArray(np.zeros((2, 2, 2, 2, 2)))]  # short: want 3
+        mc_ax_g = [np.linspace(0.1, 1.0, 2), np.linspace(0.1, 1.0, 2)]
+        with self.assertRaises(ValueError) as ctx:
+            G.write_stacked_npz(
+                os.path.join(self.d, "out.npz"), grids_g=grids_g,
+                mc_ax_g=mc_ax_g, group_sizes=[2, 3],
+                **self._common_kwargs(5))
+        self.assertIn("group 1 grid has 2 box(es)", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -1078,7 +1078,14 @@ def write_stacked_npz(stacked_path, *, grids_g, mc_ax_g, f0_los, f0_dxs,
                 f"write_stacked_npz: {len(grids_g)} grid(s) but "
                 f"{len(group_sizes)} group_sizes entries")
         for gi, (grid, want) in enumerate(zip(grids_g, group_sizes)):
-            got = int(np.asarray(grid).shape[0])
+            # ``grid`` may be a device (cupy) array here -- read ``.shape``
+            # directly rather than routing through ``np.asarray``/``_to_host``,
+            # which would force a device->host copy of the WHOLE grid (up to
+            # ~650 MB) just to look at one integer, or (for cupy specifically)
+            # raise outright: cupy's ``__array__`` refuses implicit
+            # conversion, so ``np.asarray(cupy_array)`` is not even a slow
+            # path here, it is a crash on every GPU production run.
+            got = int(grid.shape[0])
             want = int(want)
             if got != want:
                 raise ValueError(
@@ -1086,7 +1093,7 @@ def write_stacked_npz(stacked_path, *, grids_g, mc_ax_g, f0_los, f0_dxs,
                     f"but group_sizes[{gi}] says {want} -- a short or long "
                     f"partial would write a cache whose box axis silently "
                     f"disagrees with f0_los[a:b]")
-    total_boxes = sum(int(np.asarray(g).shape[0]) for g in grids_g)
+    total_boxes = sum(int(g.shape[0]) for g in grids_g)
     if total_boxes != len(f0_los):
         raise ValueError(
             f"write_stacked_npz: {total_boxes} box(es) across all groups "
@@ -1197,11 +1204,24 @@ def assemble_stage_b_group(parts_dir, gi, n_parts, node_shape, *, xp,
     digest, as the ranks reported them) is verified when given: a partial
     that changed between the reply and the read is a filesystem fault, and
     silently fitting on it would corrupt the epoch with no symptom.
+
+    If ``sha1s`` is passed at all, EVERY rank ``0..n_parts-1`` must carry a
+    non-``None`` digest in it. A rank missing from the dict (a lost or
+    malformed MPI reply) is exactly the failure this check exists to catch
+    -- silently skipping verification for that one rank would defeat the
+    whole point, so it raises instead of falling back to "unverified".
     """
+    if sha1s is not None:
+        missing = [r for r in range(int(n_parts)) if sha1s.get(r) is None]
+        if missing:
+            raise RuntimeError(
+                f"stage-B group {gi}: sha1s given but missing/None for "
+                f"rank(s) {missing} of {n_parts} -- cannot verify those "
+                f"partials, refusing to silently skip verification")
     parts = []
     for r in range(int(n_parts)):
         arr = np.ascontiguousarray(load_stage_b_part(parts_dir, gi, r))
-        if sha1s is not None and sha1s.get(r) is not None:
+        if sha1s is not None:
             got = hashlib.sha1(arr.tobytes()).hexdigest()[:16]
             if got != sha1s[r]:
                 raise RuntimeError(
