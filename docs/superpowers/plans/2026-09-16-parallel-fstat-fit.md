@@ -2239,7 +2239,7 @@ Replace `_run_fstat_fit` (`:20601` through its `return stacked, n_peaks`) with:
         except OSError as exc:  # manifest is bookkeeping, never fatal
             logger.warning("%s: could not write DONE.json (%r)", self.name, exc)
         return stacked, n_peaks
-    ```
+```
 
 - [ ] **Step 5: Log stage A's wall separately (spec decision 3)**
 
