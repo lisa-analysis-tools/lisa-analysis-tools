@@ -19537,8 +19537,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         was actually holding anything, so the head's line reports a measured
         count rather than the number of ranks it asked.
         """
+        # ``_fstat_ref_walker`` too: it is part of what
+        # ``_fstat_release_ref_row`` clears, so a rank holding only the index
+        # (an aborted ``gb_fstat_ref_row``) would otherwise report
+        # ``released=False`` and under-count the head's line.
         held = (self._fstat_ref_holder is not None
-                or self._fstat_ref_call is not None)
+                or self._fstat_ref_call is not None
+                or self._fstat_ref_walker is not None)
         self._fstat_release_ref_row()
         # ``getattr``: this must work on any GB move (see ``gf_serve``), and
         # the pool is what actually hands the device memory back -- dropping
@@ -19562,6 +19567,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         needed past that point, and waiting for the next fit would leave the
         row plus its built sig-het scorer idle on every worker's device for
         ``GB_FSTAT_REFIT_EVERY`` (50) iterations of GB proposals.
+
+        WRITTEN, NOT YET FSYNCED. The barrier is the head's NEXT propose
+        (:meth:`_flush_epoch_artifacts`, from ``_propose_orchestrated``),
+        which is after ``setup()`` returns. That is safe because a rank
+        serving this command opens no epoch artifact at all; the ranks read
+        them at ``_setup_from_directive``, on the far side of the flush.
+
+        THE HEAD PAYS A POOL SWEEP IT DOES NOT WANT: its local body runs
+        ``free_all_blocks()`` just before the ~25 s centre sweep re-allocates.
+        Accepted deliberately, because the alternative is a role branch
+        inside a memory-reclaim command -- one mis-set flag away from being
+        the thing that keeps the memory. The head's ROW is unaffected (the
+        ``saved`` tuple holds those arrays alive across the sweep); what is
+        paid is the pool churn, against a section measured in seconds.
 
         THE HEAD KEEPS ITS OWN. ``WalkerFanout.run`` always runs
         ``local_body`` (``fanout.py`` :225 / :258), so the head serves this
@@ -22643,23 +22662,30 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         # was fitted against -- "same peaks after a refit" is only
         # diagnosable with this visible.
         try:
-            if lls.size > w_global:
-                _ll_ref = float(lls[w_global])
-                _ll_spread = (float(lls.max() - lls.min()) if lls.size > 1
-                              else float("nan"))
-            elif _fanout is None:
-                # ``_fstat_global_reference`` reports an all-NaN length-1
-                # placeholder when there is no fan-out to gather through
-                # (``_propose_legacy``, ``fit.sample()``) -- but on THAT path
-                # this process's ACA holds every walker and the global index
-                # IS the row, so the epoch line keeps the lnL it has always
-                # carried. Not attempted under a fan-out: there the ACA is
-                # this rank's BLOCK, and ``lls[w_global]`` would silently be
-                # some other walker's number.
+            # BRANCH ON THE SOURCE OF ``lls``, NOT ON ITS SIZE.
+            # ``_fstat_global_reference`` reports an all-NaN LENGTH-1
+            # placeholder when there is no fan-out to gather through
+            # (``_propose_legacy``, ``fit.sample()``), so a ``lls.size >
+            # w_global`` test first is true exactly when ``w_global == 0``
+            # -- an entirely ordinary local argmax -- and the placeholder
+            # then wins, dropping both numbers from the line on the path
+            # most local runs take.
+            if _fanout is None:
+                # No gather to do, and this process's ACA holds EVERY walker,
+                # so the global index IS the row and the epoch line keeps the
+                # lnL it has carried since 2026-08-24. Never attempted under
+                # a fan-out: there the ACA is this rank's BLOCK, and
+                # ``lls[w_global]`` would silently be another walker's number.
                 _lls = _to_numpy(model.analysis_container_arr.likelihood())
                 _ll_ref = float(_lls[w_global])
                 _ll_spread = float(_lls.max() - _lls.min())
+            elif lls.size > w_global:
+                _ll_ref = float(lls[w_global])
+                _ll_spread = (float(lls.max() - lls.min()) if lls.size > 1
+                              else float("nan"))
             else:
+                # the gather itself fell back (``_fstat_global_reference``'s
+                # except arm): there is no ranking to report
                 _ll_ref = _ll_spread = float("nan")
         except Exception:
             _ll_ref, _ll_spread = float("nan"), float("nan")
@@ -22746,11 +22772,14 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
                 json.dump(dict(epoch=k, walker_ref=int(w_global),
                                n_peaks=int(n_peaks), wall_seconds=wall,
                                num_proposals=int(self.num_proposals),
-                               # how many compute ranks split stage B -- the
-                               # rank -> box-range map is a pure function of
-                               # (g_edges, n_compute), so a resume under a
-                               # DIFFERENT count restarts each group cleanly
-                               # rather than resuming another rank's slice
+                               # how many compute ranks split stage B.
+                               # DIAGNOSTIC ONLY -- nothing reads it back.
+                               # A resume under a DIFFERENT count restarts
+                               # each group cleanly because the per-rank
+                               # checkpoint FINGERPRINT hashes the sliced
+                               # inputs and node_shape (fstat_gridfit
+                               # ckpt_fingerprint), so a different split is a
+                               # different key; not because of this field.
                                n_compute=int(n_compute),
                                # the refit clock at fit time -- read back by
                                # _epoch_fit_clock so the cadence budget
@@ -22767,7 +22796,26 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         # replicated: no rank holds anything to release, and the centre table
         # will take (and release) its own row.
         if not _already_fitted:
-            self._fstat_release_fanout(model)
+            try:
+                self._fstat_release_fanout(model)
+            except Exception as exc:  # noqa: BLE001 -- see below
+                # A RELEASE MUST NEVER BE THE THING THAT FAILS (the same
+                # principle that exempts this op from _FSTAT_OP_REQUIRES;
+                # the exemption protected the served body, not the driver).
+                # Unguarded, any failure here -- a worker's body raising, a
+                # sequence mismatch, a pool free, even a logging error --
+                # propagates out of a fit that has ALREADY written its npz
+                # and DONE.json, skipping _install, the _fstat_last_fit_hit
+                # belt and _install_ctr_table, and takes the run down. That
+                # is the cheapest command in the protocol discarding a
+                # 1 h 45 min section that succeeded. A worker that kept its
+                # row loses it at the next gb_fstat_ref_row anyway, which
+                # overwrites it.
+                logger.warning(
+                    "%s: gb_fstat_release failed after epoch %d was written "
+                    "(%r); the workers keep their reference row until the "
+                    "next gb_fstat_ref_row overwrites it.",
+                    self.name, k, exc, exc_info=True)
         return stacked, n_peaks
 
     # Fields the propose-time lookup reads; the rest of the npz (node Mc /

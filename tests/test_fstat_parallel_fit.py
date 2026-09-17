@@ -1834,6 +1834,12 @@ class RunFstatFitWiringTest(unittest.TestCase):
 
         def stage_b_runner(model):
             self.seen["runner"] += 1
+            # R2's ORDERING: in production ``_fstat_holder_call`` is what
+            # populates ``_fstat_ref_call``, and the stage-B runner's
+            # scorer-identity guard is vacuous until it has. Record whether
+            # the scorer was already cached when the runner was built.
+            self.seen["scorer_cached_at_runner_build"] = (
+                move._fstat_ref_call is not None)
             return self.runner
 
         @contextlib.contextmanager
@@ -1841,11 +1847,17 @@ class RunFstatFitWiringTest(unittest.TestCase):
             self.seen["window"] += 1
             yield
 
+        def holder_call(model):
+            # what the real one does, and the only thing that does it
+            move._fstat_ref_call = self.scorer
+            return self.scorer
+
         move._fstat_ref_row_fanout = ref_row
         move._fstat_release_fanout = release
         move._fstat_stage_b_runner = stage_b_runner
-        move._fstat_holder_call = lambda model: self.scorer
+        move._fstat_holder_call = holder_call
         move._gb_free_residual = window
+        move._fstat_ref_call = None
         return move
 
     @contextlib.contextmanager
@@ -1892,6 +1904,13 @@ class RunFstatFitWiringTest(unittest.TestCase):
         self.assertIs(captured["sweep_runner"], self.runner)
         self.assertEqual(self.seen["runner"], 1)
         self.assertEqual(self._manifest()["n_compute"], 3)
+        # R2's ORDERING, asserted rather than only documented: the runner is
+        # built AFTER the holder-scored scorer is cached, so its "is this my
+        # cached call_fstat?" guard compares two live objects instead of
+        # passing vacuously on ``None is not None``.
+        self.assertTrue(self.seen["scorer_cached_at_runner_build"],
+                        "the split runner was built before the scorer -- "
+                        "its identity guard would pass vacuously")
 
     def test_one_compute_rank_runs_the_serial_path_with_no_runner(self):
         """The byte-identity gate: at one compute rank ``sweep_runner`` must
@@ -1916,7 +1935,13 @@ class RunFstatFitWiringTest(unittest.TestCase):
         """``_fstat_global_reference`` has no gather to do there, so it
         reports an all-NaN placeholder ``lls`` -- but this process's ACA
         holds EVERY walker, so the line must not lose the lnL it has carried
-        since 2026-08-24."""
+        since 2026-08-24.
+
+        BOTH walkers, and walker 0 is the point: a ``lls.size > w_global``
+        test taken first is TRUE exactly at ``w_global == 0`` (the
+        placeholder has length 1), so the fallback silently never fired for
+        the one index an ordinary local argmax hits most often.
+        """
         from lisatools.globalfit.moves import gbspecialstretch as gbs
 
         class _Acs:
@@ -1927,15 +1952,18 @@ class RunFstatFitWiringTest(unittest.TestCase):
         class _Model:
             analysis_container_arr = _Acs()
 
-        move = self._move(n_compute=1, w_global=1)
-        move.fanout = None
-        move._fstat_global_reference = lambda model: (
-            1, 0, 1, np.full(1, np.nan))
-        with self._patched_fit(), self.assertLogs(gbs.logger, "INFO") as cap:
-            move._run_fstat_fit(_Model(), 0)
-        line = "\n".join(cap.output)
-        self.assertIn("lnL=-4.000", line)
-        self.assertIn("spread=6.000", line)
+        for w_global, want in ((0, "lnL=-10.000"), (1, "lnL=-4.000")):
+            with self.subTest(w_global=w_global):
+                move = self._move(n_compute=1, w_global=w_global)
+                move.fanout = None
+                move._fstat_global_reference = lambda model, w=w_global: (
+                    w, 0, w, np.full(1, np.nan))
+                with self._patched_fit(), \
+                        self.assertLogs(gbs.logger, "INFO") as cap:
+                    move._run_fstat_fit(_Model(), 0)
+                line = "\n".join(cap.output)
+                self.assertIn(want, line)
+                self.assertIn("spread=6.000", line)
 
     def test_the_manifest_names_the_global_walker_and_the_rank_count(self):
         move = self._move(n_compute=2, w_global=7)
@@ -1970,6 +1998,30 @@ class RunFstatFitWiringTest(unittest.TestCase):
         self.assertIn("walker_ref=6", line)
         self.assertIn(f"rank {self.owner_rank}", line)
         self.assertIn("n_compute=2", line)
+
+    def test_a_release_failure_cannot_destroy_a_finished_fit(self):
+        """C-1: ``gb_fstat_release`` is the cheapest command in the protocol
+        and it was allowed to discard a 1 h 45 min section that had already
+        succeeded -- the raise propagates out of ``_run_fstat_fit`` AFTER
+        DONE.json is durable, so ``setup()`` never reaches ``_install``, the
+        ``_fstat_last_fit_hit`` belt or ``_install_ctr_table``, and the run
+        dies. A release must never be the thing that fails."""
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = self._move(n_compute=2)
+
+        def boom(model):
+            self.seen["release"].append("raised")
+            raise RuntimeError("remote worker error during gb_fstat_release")
+
+        move._fstat_release_fanout = boom
+        with self._patched_fit(n_peaks=17) as _captured, \
+                self.assertLogs(gbs.logger, "WARNING") as cap:
+            stacked, n_peaks = move._run_fstat_fit("model", 0)
+        self.assertEqual((stacked, n_peaks), ("STACKED", 17))
+        self.assertEqual(self.seen["release"], ["raised"])
+        self.assertEqual(self._manifest()["n_peaks"], 17)
+        self.assertIn("gb_fstat_release failed", "\n".join(cap.output))
 
     def test_a_complete_stacked_npz_costs_no_broadcast(self):
         """Task 8 concern 6.2. ``run_fstat_grid_fit`` short-circuits on a
@@ -2093,13 +2145,13 @@ class ReleaseFanoutTest(unittest.TestCase):
     the same row the grids were fitted with (spec decision 6).
     """
 
-    def _move(self):
+    def _move(self, *, mempool=None):
         from lisatools.globalfit.moves import gbspecialstretch as gbs
 
         move = gbs.GBSpecialRJFStatGridMove.__new__(gbs.GBSpecialRJFStatGridMove)
         move.name = "gb_test"
         move.gf_move_name = "gb_test"
-        move.mempool = _CountingMempool()
+        move.mempool = _CountingMempool() if mempool is None else mempool
         move._fstat_ref_holder = object()
         move._fstat_ref_call = object()
         move._fstat_ref_walker = 6
@@ -2132,8 +2184,10 @@ class ReleaseFanoutTest(unittest.TestCase):
                     replies = move._fstat_release_fanout(None)
                 finally:
                     move.fanout.stop()
+                # the head's pool free is included: surviving its OWN
+                # free_all_blocks is exactly what the save/restore claims
                 return ("head", (move._fstat_ref_holder, move._fstat_ref_call),
-                        sorted(replies))
+                        (sorted(replies), move.mempool.frees))
             ComputeService(fcomm, layout, rank,
                            registry={"gb_test": move}, model=None).serve()
             return ("worker", (move._fstat_ref_holder, move._fstat_ref_call),
@@ -2153,7 +2207,67 @@ class ReleaseFanoutTest(unittest.TestCase):
                 # the centre table still has to score against this row
                 self.assertIsNotNone(held[0], "the head dropped its own row")
                 self.assertIsNotNone(held[1], "the head dropped its scorer")
-                self.assertEqual(len(extra), 2)   # one reply per compute rank
+                ranks_replied, head_frees = extra
+                self.assertEqual(len(ranks_replied), 2)  # one per compute rank
+                # the head served the command like every other rank -- pool
+                # sweep included -- and its row survived that too, because
+                # the ``saved`` tuple holds those arrays alive
+                self.assertEqual(head_frees, 1,
+                                 "the head skipped the uniform body")
+
+    def test_a_worker_that_cannot_release_does_not_abort_the_epoch(self):
+        """C-1, over the real wire: a worker whose served body raises turns
+        into an exception on the HEAD, out of ``_fstat_release_fanout``. That
+        is the failure ``_run_fstat_fit`` now swallows (see
+        ``RunFstatFitWiringTest::test_a_release_failure_cannot_destroy_a_
+        finished_fit``) -- and the head's own row must still be RESTORED by
+        the driver's ``finally``, or the centre table would have nothing to
+        score against even on the path that survives."""
+        from lisatools.globalfit.communication import ranks as R
+        from lisatools.globalfit.communication.fakecomm import FakeWorld
+        from lisatools.globalfit.communication.fanout import (
+            ComputeService,
+            WalkerFanout,
+        )
+
+        class _AngryMempool(_CountingMempool):
+            def free_all_blocks(self):
+                super().free_all_blocks()
+                raise RuntimeError("device pool is wedged")
+
+        world = FakeWorld(3, timeout=5.0)
+
+        def body(rank, comm):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                layout = R.build_layout(comm, 8, [0, 1])
+            fcomm = layout.make_fanout_comm(comm)
+            role = layout.role_of(rank)
+            if role == R.RankRole.SAVER:
+                return ("saver", None)
+            if role == R.RankRole.HEAD:
+                move = self._move()
+                move.fanout = WalkerFanout(fcomm, layout, rank, model=None)
+                try:
+                    move._fstat_release_fanout(None)
+                    raised = None
+                except Exception as exc:                      # noqa: BLE001
+                    raised = repr(exc)
+                finally:
+                    move.fanout.stop()
+                return ("head", (raised, move._fstat_ref_holder is not None,
+                                 move._fstat_ref_call is not None))
+            move = self._move(mempool=_AngryMempool())
+            ComputeService(fcomm, layout, rank,
+                           registry={"gb_test": move}, model=None).serve()
+            return ("worker", None)
+
+        out = world.run(body)
+        head = next(v for v in out.values() if v[0] == "head")
+        raised, kept_row, kept_scorer = head[1]
+        self.assertIsNotNone(raised, "a worker failure must reach the head")
+        self.assertTrue(kept_row, "the head lost its row on the failure path")
+        self.assertTrue(kept_scorer, "the head lost its scorer")
 
     def test_one_compute_rank_issues_nothing(self):
         """Nothing to release remotely, and the golden-gated single-rank path
