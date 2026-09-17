@@ -2950,7 +2950,12 @@ class GlobalFit:
             self.rank, len(stage_keys), [f"{s}/{n}" for s, n in stage_keys],
         )
 
-        from .communication.fanout import LIKELIHOOD_OP, ComputeService
+        from .communication.fanout import (
+            LIKELIHOOD_OP,
+            RESIDUAL_HASH_OP,
+            ComputeService,
+            residual_hash,
+        )
 
         self.compute_service = ComputeService(
             self.fanout_comm,
@@ -2963,6 +2968,11 @@ class GlobalFit:
                 # walkers" residual reads during sampling, e.g. FunctionMove)
                 LIKELIHOOD_OP: lambda payload, clock, model: np.asarray(
                     asnumpy(model.analysis_container_arr.likelihood(complex=False))
+                ),
+                # answers WalkerFanout.gather_residual_hashes (one-walker
+                # replica-mode agreement check on the [FANOUT_DIGEST] line)
+                RESIDUAL_HASH_OP: lambda payload, clock, model: residual_hash(
+                    model.analysis_container_arr
                 ),
             },
             logger=self.logger,

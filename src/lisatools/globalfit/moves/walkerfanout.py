@@ -31,9 +31,17 @@ Semantics that change only when several compute ranks exist (design spec,
 * ``move.temperature_control.swaps_accepted`` -- what eryn stores to HDF -- is
   the HEAD block's count, while the sub-state swap counters are pooled over
   ranks. Diagnostic only: nothing reads the control's copy back.
+
+One-walker replica mode (``layout.replica_mode``): ``propose`` runs
+``propose_local`` on the head with the full one-walker state; the moves'
+scoring seams scatter rows through ``RowFanout``; ranks serve ``serve_<op>``
+methods; none of the semantics above change because the body IS the
+single-process body.
 """
 
 from __future__ import annotations
+
+import os
 
 import numpy as np
 
@@ -90,6 +98,18 @@ class WalkerFanoutMixin:
     _fanout_body = False  # True while propose_local runs as a rank body
     gf_clock = None  # the command clock of the propose being served (rank side)
 
+    # ---- one-walker replica mode (row scatter) ---------------------------
+    row_fanout = None  # RowFanout when the layout is in replica mode
+    likelihood_fanout = True  # {PREFIX}_LIKELIHOOD_FANOUT: 0 = the head scores every row itself
+
+    def fanout_knob_prefix(self) -> str:
+        """Env prefix of this move's knobs (rule 0: the branch name, capitalized)."""
+        return str(getattr(self, "branch_name", "gf")).upper()
+
+    def rows_active(self) -> bool:
+        """True when scoring rows scatter over the replicas (replica mode, knob on)."""
+        return self.row_fanout is not None and bool(self.likelihood_fanout)
+
     # ---- subclass hooks --------------------------------------------------
     def fanout_temperature_controls(self):
         """Every ``TemperatureControl`` this move adapts (ranks never adapt them)."""
@@ -131,6 +151,17 @@ class WalkerFanoutMixin:
                 f"{type(self).__name__} overrides propose(); under several compute ranks the "
                 "body must live in propose_local() so every rank runs it (the mixin owns propose)"
             )
+        if getattr(self.fanout.layout, "replica_mode", False):
+            from ..communication.rowfanout import RowFanout
+
+            self.row_fanout = RowFanout(self.fanout, self)
+            env = os.environ.get(f"{self.fanout_knob_prefix()}_LIKELIHOOD_FANOUT")
+            if env is not None:
+                self.likelihood_fanout = env.strip() not in ("0", "false", "False", "")
+            if not self.fanout.is_head and hasattr(self, "eigen_store_path"):
+                self.eigen_store_path = None  # single-writer sidecar (head only)
+            # the head runs the single-process body: its ladders adapt inside it
+            return
         for tc in self.fanout_temperature_controls():
             if tc is None:
                 continue
@@ -143,6 +174,10 @@ class WalkerFanoutMixin:
     # ---- propose -------------------------------------------------------------
     def propose(self, model, state):
         if not self.fanout_active:
+            return self.propose_local(model, state)
+        if getattr(self.fanout.layout, "replica_mode", False):
+            # one-walker replica mode: the head runs the unchanged body; the
+            # body's scoring seams scatter rows over the replicas (RowFanout)
             return self.propose_local(model, state)
         return self.fanout_propose(model, state)
 
@@ -212,7 +247,11 @@ class WalkerFanoutMixin:
 
     def gf_serve(self, op, payload, clock, model):
         if op != PROPOSE_OP:
-            raise ValueError(f"{type(self).__name__} serves only {PROPOSE_OP!r}, got {op!r}")
+            handler = None if str(op).startswith("_") else getattr(self, f"serve_{op}", None)
+            if handler is None:
+                raise ValueError(f"{type(self).__name__} serves no fan-out command {op!r}")
+            self.gf_clock = dict(clock or {})
+            return handler(payload, clock, model)
         self.gf_clock = dict(clock or {})  # WP8 seeds its synced swap RNG from this
         self.fanout_apply_extra(payload.get("extra") or {})
         self._fanout_body = True

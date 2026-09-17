@@ -660,7 +660,19 @@ class Recipe:
             # iteration late (see setup_first_recipe_step).
             from .communication.fanout import fanout_digest_line
 
-            logger.info(fanout_digest_line(iteration, last_sample))
+            hashes = None
+            fanout = getattr(self, "fanout", None)
+            if (
+                fanout is not None
+                and getattr(fanout.layout, "replica_mode", False)
+                and getattr(fanout, "model", None) is not None
+            ):
+                try:
+                    hashes = fanout.gather_residual_hashes(fanout.model.analysis_container_arr)
+                except Exception as exc:  # noqa: BLE001 - a diagnostic hook must never break the run
+                    logger.warning("[FANOUT_DIGEST] residual hash gather failed: %r", exc)
+                    hashes = None
+            logger.info(fanout_digest_line(iteration, last_sample, residual_hashes=hashes))
         stop_here = self._current_recipe_step["adjust"].stopping_function(
             iteration, last_sample, sampler
         )
@@ -2312,6 +2324,11 @@ def build_noise_moves(
         # All-source coarse sidecar (plan-2): present only when the run
         # opted into COARSE_GPU_MODE; None leaves every route untouched.
         coarse_runtime=getattr(general_info, "coarse_wdm_runtime", None),
+        # Inner proposal knobs (Task 7): eigen-axis MH (one-walker default)
+        # or the vanilla eryn stretch, from the lead branch's settings block.
+        inner_move_kind=getattr(lead_info, "inner_move_kind", None),
+        eigen_refresh_every=int(getattr(lead_info, "eigen_refresh_every", 10) or 10),
+        eigen_eps_rel=float(getattr(lead_info, "eigen_eps_rel", 1e-4) or 1e-4),
     )
 
     tag = "+".join(sampled_branches)

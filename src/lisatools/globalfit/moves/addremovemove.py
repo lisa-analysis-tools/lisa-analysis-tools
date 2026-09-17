@@ -1282,24 +1282,131 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         return ll
 
     def compute_like(self, coords_in, data_index):
+        """Score rows; in one-walker replica mode the rows scatter over the replicas.
+
+        Every likelihood evaluation of this move funnels through here: the
+        entry ``prev_logl``, the in-model scoring, the fancy-swap re-scoring
+        (``log_like_for_fancy_swaping``) and the eigen-table builds. The
+        rank-local scorer is :meth:`compute_like_local` (DCGA or container
+        path) -- subclasses override THAT, never this. The gathered
+        ``d_h``/``h_h`` side outputs land on ``self._last_d_h/_last_h_h``
+        (the chunked SOBBH scorer's convention).
         """
-        Compute the likelihood for the given coordinates and data index.
+        if not self.rows_active():
+            return self.compute_like_local(coords_in, data_index)
+        coords_np = np.atleast_2d(np.asarray(asnumpy(coords_in), dtype=np.float64))
+        idx = np.atleast_1d(np.asarray(asnumpy(data_index))).astype(np.int32)
+        out = self.row_fanout.run(
+            "ll_rows", {"coords": coords_np, "data_index": idx}, local_body=self._score_rows_local
+        )
+        self._last_d_h = out["d_h"]
+        self._last_h_h = out["h_h"]
+        return out["ll"]
 
-        Defaults to each container's installed generator for this branch
-        (see :meth:`compute_acs_like`), so proposal scoring uses the same
-        template-assembly path as the residual bookkeeping.
-
-        Args:
-            coords_in: already-transformed (waveform-basis) coordinates of the sources for which we want to compute the likelihood. Shape is (n_sources, ndim).
-            data_index: index of the data for which we want to compute the likelihood. Shape is (n_sources,).
-
-        Returns:
-            ll: likelihood for the given coordinates and data index. Shape is (n_sources,).
-        """
+    def compute_like_local(self, coords_in, data_index):
+        """Rank-local scorer (the pre-replica ``compute_like`` body)."""
         if self._dcga is not None:
             return self._compute_like_dcga(coords_in, data_index)
         return self.compute_acs_like(
             coords_in, data_index, **self.waveform_like_kwargs
+        )
+
+    def _score_rows_local(self, rows):
+        """Serve one row chunk: ``{"ll", "d_h", "h_h"}`` in row order (empty-safe)."""
+        coords = np.asarray(rows["coords"], dtype=np.float64)
+        idx = np.asarray(rows["data_index"]).astype(np.int32)
+        n = int(coords.shape[0])
+        if n == 0:
+            return {"ll": np.zeros(0), "d_h": np.zeros(0), "h_h": np.zeros(0)}
+        self._last_d_h = None
+        self._last_h_h = None
+        ll = np.asarray(self.compute_like_local(coords, idx), dtype=float).reshape(n)
+
+        def _side(arr):
+            if arr is None:
+                return np.full(n, np.nan)
+            return np.asarray(arr, dtype=float).reshape(n)
+
+        return {"ll": ll, "d_h": _side(self._last_d_h), "h_h": _side(self._last_h_h)}
+
+    def serve_ll_rows(self, payload, clock, model):
+        return self._score_rows_local(payload["rows"])
+
+    def _check_like_local(self, coords_in, data_index):
+        """The check_ll cross-check: the container path with the MOVE's own generator."""
+        return self.compute_acs_like(
+            coords_in,
+            data_index=data_index,
+            signal_gen=self.waveform_gen,
+            **self.waveform_like_kwargs,
+        )
+
+    def compute_check_like(self, coords_in, data_index):
+        if not self.rows_active():
+            return np.asarray(self._check_like_local(coords_in, data_index))
+        coords_np = np.atleast_2d(np.asarray(asnumpy(coords_in), dtype=np.float64))
+        idx = np.atleast_1d(np.asarray(asnumpy(data_index))).astype(np.int32)
+        out = self.row_fanout.run(
+            "ll_rows_check", {"coords": coords_np, "data_index": idx},
+            local_body=self._check_rows_local,
+        )
+        return out["ll"]
+
+    def _check_rows_local(self, rows):
+        n = int(np.shape(rows["coords"])[0])
+        if n == 0:
+            return {"ll": np.zeros(0)}
+        ll = self._check_like_local(np.asarray(rows["coords"]), np.asarray(rows["data_index"]))
+        return {"ll": np.asarray(ll, dtype=float).reshape(n)}
+
+    def serve_ll_rows_check(self, payload, clock, model):
+        return self._check_rows_local(payload["rows"])
+
+    def _replay_cold_chain(self, kind, coords_in, leaf):
+        """Expose / setup / fold the leaf's cold-chain source on EVERY replica.
+
+        Gated on replica mode itself (``self.row_fanout is None``), NOT on
+        ``rows_active()`` / the ``{PREFIX}_LIKELIHOOD_FANOUT`` knob: that knob
+        only changes who SCORES rows (head-only vs fanned-out), it must not
+        stop the replays that keep every replica's residual state aligned —
+        otherwise, with the knob off, replicas would score against stale
+        residuals. Single process (no row_fanout): a direct local call,
+        identical to the pre-replica choreography.
+        """
+        payload = {
+            "kind": str(kind),
+            "coords": np.asarray(asnumpy(coords_in), dtype=np.float64),
+            "leaf": int(leaf),
+        }
+        if self.row_fanout is None:
+            self._apply_cold_chain_replay(payload)
+            return
+        self.row_fanout.replay("ar_replay", payload, local_body=self._apply_cold_chain_replay)
+
+    def _apply_cold_chain_replay(self, payload):
+        kind = payload["kind"]
+        self._current_leaf = int(payload["leaf"])
+        coords = np.asarray(payload["coords"], dtype=np.float64)
+        if kind == "expose":
+            self.remove_cold_chain_sources(coords)
+        elif kind == "setup":
+            self.setup_likelihood_here(coords)
+        elif kind == "fold":
+            self.add_back_in_cold_chain_sources(coords)
+        else:
+            raise ValueError(f"unknown cold-chain replay kind {kind!r}")
+
+    def serve_ar_replay(self, payload, clock, model):
+        self._apply_cold_chain_replay(payload)
+        return None
+
+    def _fancy_swap_fires(self, repeat):
+        """Walker-permuting swap cadence; never with one walker (identity permutation)."""
+        return (
+            self.permute_every > 0
+            and repeat == self.num_repeats - 1
+            and self._fancy_swap_clock % self.permute_every == 0
+            and int(self.nwalkers) > 1
         )
 
     #: Default for the per-leaf <d|h>/<h|h> record ({BRANCH}_RECORD_DH
@@ -1416,12 +1523,7 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         disables; ``{BRANCH}_CHECK_LL_EVERY=N`` thins the cost.
         """
         acs_like = (
-            self.compute_acs_like(
-                old_coords_in,
-                data_index=data_index_in,
-                signal_gen=self.waveform_gen,
-                **self.waveform_like_kwargs,
-            )
+            self.compute_check_like(old_coords_in, data_index_in)
             .reshape(prev_logl.shape)
             .real
         )
@@ -1787,7 +1889,7 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
             # updates folded back against it degraded the true residual.
             removal_coords = work.coords[0, :, leaf]
             removal_coords_in = self._to_phys(removal_coords)
-            self.remove_cold_chain_sources(removal_coords_in)
+            self._replay_cold_chain("expose", removal_coords_in, leaf)
 
             if _dbg_leaf:
                 # source-isolated residual = the "data" this source is fit
@@ -1799,7 +1901,7 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
                     logger.info("[%s_DEBUG] snapshot skipped: %r", self._dbg_prefix, exc)
                     _dbg_leaf = False
 
-            self.setup_likelihood_here(removal_coords_in)
+            self._replay_cold_chain("setup", removal_coords_in, leaf)
 
             # per-leaf eigen tables for EigenAxisMove inner moves (no-op for
             # stretch-only stacks); must run with the leaf exposed and
@@ -2019,11 +2121,7 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
                 # after a (re)start never fires (user ruling 2026-08-27):
                 # firings land on proposes N, 2N, 3N, ... <= 0 disables
                 # entirely ({BRANCH}_PERMUTE_EVERY env override).
-                fancy_swap = (
-                    self.permute_every > 0
-                    and repeat == self.num_repeats - 1
-                    and self._fancy_swap_clock % self.permute_every == 0
-                )
+                fancy_swap = self._fancy_swap_fires(repeat)
                 if fancy_swap:
                     logger.debug(
                         "%s leaf %d repeat %d: fancy (walker-permuting) "
@@ -2106,7 +2204,7 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
 
             # fold the (updated) cold-chain sources back INTO the fit:
             # subtract their templates from the residual (r = d -> d - h_new).
-            self.add_back_in_cold_chain_sources(add_coords_in)
+            self._replay_cold_chain("fold", add_coords_in, leaf)
 
             if self.swap_debug:
                 _acs_cold_post = asnumpy(self.acs.likelihood())

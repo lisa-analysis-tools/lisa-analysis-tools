@@ -735,7 +735,12 @@ export NWALKERS=${NWALKERS:-10}    # env-overridable (2026-09-16); 10-walker reb
                                    # walkers and temps are independent axes.
                                    # Noise-block floor 2*ndim (galfor ndim 5
                                    # -> 10) still satisfied.
-if [ "${GF_LEGACY_RANK_LAYOUT}" = "0" ] && [ "${N_COMPUTE_EFF}" -gt 0 ] \
+                                   # The dispatch's --export=ALL carries the
+                                   # shell's value, so `NWALKERS=1 ./submit_gf_6mo_v8_nogb_null.sh`
+                                   # reaches the one-walker branch below.
+if [ "${GF_LEGACY_RANK_LAYOUT}" = "0" ] && [ "${N_COMPUTE_EFF}" -gt 1 ] && [ "${NWALKERS}" -eq 1 ]; then
+  echo "[SUBMIT] NWALKERS=1 on N_COMPUTE=${N_COMPUTE_EFF}: one-walker replica mode (every compute rank holds the walker; GB/VGB by band range, addremove/PSD by likelihood rows)"
+elif [ "${GF_LEGACY_RANK_LAYOUT}" = "0" ] && [ "${N_COMPUTE_EFF}" -gt 0 ] \
      && [ $(( NWALKERS % N_COMPUTE_EFF )) -ne 0 ]; then
   echo "[SUBMIT] NWALKERS=${NWALKERS} is not a multiple of N_COMPUTE=${N_COMPUTE_EFF}; using NWALKERS=$(( (NWALKERS / N_COMPUTE_EFF + 1) * N_COMPUTE_EFF )) (user decision at the first 4-GPU launch)"
   export NWALKERS=$(( (NWALKERS / N_COMPUTE_EFF + 1) * N_COMPUTE_EFF ))

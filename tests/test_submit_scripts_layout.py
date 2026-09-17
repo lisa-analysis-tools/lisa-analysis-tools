@@ -105,6 +105,34 @@ class SubmitScriptsInJobBlockTest(unittest.TestCase):
                     text,
                 )
 
+    def test_one_walker_is_exempt_from_the_divisibility_fix(self):
+        for path in SCRIPTS:
+            with self.subTest(script=path):
+                text = self._text(path)
+                self.assertIn('[ "${NWALKERS}" -eq 1 ]', text)
+                self.assertIn("one-walker replica mode", text)
+                # the sampler-shape export must honour the submitting shell's
+                # NWALKERS (carried by --export=ALL), or the branch below it is
+                # unreachable: a hard `export NWALKERS=10` above the `-eq 1`
+                # test would silently run 10 walkers for `NWALKERS=1 ./submit`
+                self.assertIn("export NWALKERS=${NWALKERS:-10}", text)
+                self.assertNotIn("\nexport NWALKERS=10 ", text)
+                self.assertLess(
+                    text.index("export NWALKERS=${NWALKERS:-10}"),
+                    text.index('[ "${NWALKERS}" -eq 1 ]'),
+                )
+                # the rounding branch survives for NWALKERS > 1
+                self.assertIn(
+                    "(NWALKERS / N_COMPUTE_EFF + 1) * N_COMPUTE_EFF", text
+                )
+                # the exemption is tested BEFORE the rounding branch
+                self.assertLess(
+                    text.index('[ "${NWALKERS}" -eq 1 ]'),
+                    text.index(
+                        "(NWALKERS / N_COMPUTE_EFF + 1) * N_COMPUTE_EFF"
+                    ),
+                )
+
     def test_multinode_launch_line_is_hydra_round_robin(self):
         # WP7 Step 0 (2026-09-16): on this cluster `srun --mpi=pmix` bootstraps
         # Intel MPI but its OFI address exchange fails, and a bare `srun` gives
@@ -124,6 +152,79 @@ class SubmitScriptsInJobBlockTest(unittest.TestCase):
                     text,
                 )
                 self.assertNotIn('srun --ntasks="${SLURM_NTASKS', text)
+
+
+class SubmitScriptsNwalkersBlockTest(unittest.TestCase):
+    """Execute the in-job NWALKERS divisibility/exemption block with bash.
+
+    The text checks in ``SubmitScriptsInJobBlockTest`` confirm the exemption
+    line and message exist and come first; this class actually runs the
+    extracted `if ... fi` block under bash to confirm the one-walker branch
+    leaves NWALKERS untouched and the rounding branch still fires (and still
+    rounds correctly) for every other NWALKERS value.
+    """
+
+    _START_MARKER = (
+        'if [ "${GF_LEGACY_RANK_LAYOUT}" = "0" ] && '
+        '[ "${N_COMPUTE_EFF}" -gt 1 ] && [ "${NWALKERS}" -eq 1 ]; then'
+    )
+
+    def _text(self, path):
+        with open(path) as fh:
+            return fh.read()
+
+    def _extract_block(self, path):
+        text = self._text(path)
+        start = text.index(self._START_MARKER)
+        end = text.index("\nfi", start)
+        return text[start : end + len("\nfi")]
+
+    def _run_block(self, path, overrides):
+        block = self._extract_block(path)
+        env = {"PATH": os.environ.get("PATH", "")}
+        env.update(overrides)
+        result = subprocess.run(
+            ["bash", "-c", block + "\necho NW=${NWALKERS}"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"{path} {overrides}: exited {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        return result.stdout
+
+    def test_nwalkers_1_is_one_walker_replica_mode_and_unchanged(self):
+        for path in SCRIPTS:
+            with self.subTest(script=path):
+                stdout = self._run_block(
+                    path,
+                    {
+                        "GF_LEGACY_RANK_LAYOUT": "0",
+                        "N_COMPUTE_EFF": "4",
+                        "NWALKERS": "1",
+                    },
+                )
+                self.assertIn("one-walker replica mode", stdout)
+                self.assertIn("NW=1", stdout.splitlines())
+
+    def test_nwalkers_6_still_rounds_up_to_8(self):
+        for path in SCRIPTS:
+            with self.subTest(script=path):
+                stdout = self._run_block(
+                    path,
+                    {
+                        "GF_LEGACY_RANK_LAYOUT": "0",
+                        "N_COMPUTE_EFF": "4",
+                        "NWALKERS": "6",
+                    },
+                )
+                self.assertIn("is not a multiple of N_COMPUTE", stdout)
+                self.assertIn("NW=8", stdout.splitlines())
 
 
 class SubmitScriptsDispatchTest(unittest.TestCase):

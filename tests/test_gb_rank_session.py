@@ -487,7 +487,8 @@ class DispatchTest(unittest.TestCase):
 
     def test_ops_constant(self):
         self.assertEqual(
-            gbs.GB_OPS, ("gb_run_proposal", "gb_run_tempering", "gb_finish")
+            gbs.GB_OPS,
+            ("gb_run_proposal", "gb_run_tempering", "gb_finish", "gb_sync"),
         )
 
     def test_gb_moves_are_no_longer_fanout_unready(self):

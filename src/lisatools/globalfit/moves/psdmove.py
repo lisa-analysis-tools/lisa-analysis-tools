@@ -178,6 +178,9 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         run_threaded: bool = False,
         build_threads: int = 1,
         coarse_runtime=None,
+        inner_move_kind: str = None,
+        eigen_refresh_every: int = 10,
+        eigen_eps_rel: float = 1e-4,
         **kwargs,
     ):
 
@@ -206,6 +209,17 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         # fine callback, the containers' sens_mat, and the packed ACA buffer
         # never see coarse state.
         self.coarse_runtime = coarse_runtime
+        # inner proposal: eryn stretch (needs >= 2 walkers) or the eigen-axis MH
+        # move fed by per-rung likelihood-difference info matrices (one-walker
+        # default). Resolved per propose from the module ladder's walker count.
+        self.inner_move_kind = inner_move_kind
+        self.eigen_refresh_every = max(1, int(eigen_refresh_every or 10))
+        self.eigen_eps_rel = float(eigen_eps_rel or 1e-4)
+        self._inner_kind = None
+        self._inner_kind_logged = False
+        self._eigen_inner = None
+        self._eigen_visits = 0
+        self._eigen_inner_accepted_shape = None
         self._fixed_component_covariances_coarse = {}
         if dcga is not None:
             if acs is None:
@@ -1892,18 +1906,42 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         has_sgwb = "sgwb" in merged
         sgwb_coords = merged.get("sgwb")
 
+        logl[logp_keep] = self.compute_psd_rows(
+            walker_inds_keep,
+            psd_coords,
+            galfor_coords if has_galfor else None,
+            sgwb_coords if has_sgwb else None,
+        )
+        self.prev_logl = logl.copy()
+        return logl, None
+
+    def _score_rows(self, walker_inds_keep, psd_coords, galfor_coords, sgwb_coords):
+        """Rank-local tier dispatch: ``(n,)`` log-likelihoods for merged noise rows.
+
+        Row ``i`` scores the full noise model ``(psd, galfor, sgwb)[i]`` against
+        walker ``walker_inds_keep[i]``'s residual on THIS rank's ACA. Tier order
+        is unchanged from the pre-replica ``compute_log_like``: C++ kernel,
+        galfor sub-band coarse, coarse batch, PSD_BATCH, container fallback.
+        """
+        walker_inds_keep = np.asarray(walker_inds_keep).astype(int).reshape(-1)
+        n = int(walker_inds_keep.shape[0])
+        if n == 0:
+            return np.zeros(0, dtype=float)
+        has_galfor = galfor_coords is not None
+        has_sgwb = sgwb_coords is not None
+
         if self._kernel_fast_path_available(has_sgwb=has_sgwb):
-            # stft_tof fast path: C++ shared-memory kernel.
-            if has_galfor:
-                input_args = [psd_coords, galfor_coords]
-            else:
-                input_args = [psd_coords]
-
-            supps_keep = supps[logp_keep]
-            logl[logp_keep] = self.psd_log_like(input_args, supps=supps_keep, **self.psd_kwargs)
-
-            self.prev_logl = logl.copy()
-            return logl, None
+            input_args = [psd_coords, galfor_coords] if has_galfor else [psd_coords]
+            # A plain dict, not a BranchSupplemental: the old call site sliced
+            # the real supps (`supps[logp_keep]`), whose __getitem__ (a
+            # base-shape slicer, not a key lookup) returns exactly a
+            # ``{"walker_inds": <kept rows>}`` dict -- both consumers
+            # (psd_log_like's parent path and the DCGA path) only ever index
+            # it by that one string key.
+            supps_keep = {"walker_inds": walker_inds_keep}
+            return np.asarray(
+                self.psd_log_like(input_args, supps=supps_keep, **self.psd_kwargs), dtype=float
+            ).reshape(n)
 
         # The coarse-WDM routes come FIRST: they score against the coarse
         # sufficient statistic, which the PSD_BATCH route below knows nothing
@@ -1911,13 +1949,9 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         # order is the first line of defence.
         if self._galfor_subband_fast_path_available():
             stat = self.acs.flatten()[0].coarse_stats
-            tmp_logl = self._compute_galfor_subband_loglike(
-                stat, walker_inds_keep, galfor_coords
-            )
+            tmp_logl = self._compute_galfor_subband_loglike(stat, walker_inds_keep, galfor_coords)
             if tmp_logl is not None:
-                logl[logp_keep] = tmp_logl
-                self.prev_logl = logl.copy()
-                return logl, None
+                return np.asarray(tmp_logl, dtype=float).reshape(n)
 
         if self._coarse_batch_fast_path_available():
             from ...coarsewdm import coarse_wdm_log_likelihood_batch
@@ -1939,9 +1973,7 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
                     coarse_wdm_log_likelihood_batch(stat, covariances)
                 )
                 remaining = np.setdiff1d(remaining, batch)
-            logl[logp_keep] = tmp_logl
-            self.prev_logl = logl.copy()
-            return logl, None
+            return tmp_logl
 
         if self._batched_route_ready():
             # PSD_BATCH walker-batched route (tier 3): one batched covariance
@@ -1950,14 +1982,11 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
             # sens-mat snapshot/restore and no linear_psd_arr repack here
             # (the publish repack in propose() still runs and is what the
             # rest of the run reads).
-            logl[logp_keep] = self._compute_log_like_batched(
-                walker_inds_keep,
-                psd_coords,
-                galfor_coords if has_galfor else None,
-                sgwb_coords if has_sgwb else None,
-            )
-            self.prev_logl = logl.copy()
-            return logl, None
+            return np.asarray(
+                self._compute_log_like_batched(
+                    walker_inds_keep, psd_coords, galfor_coords, sgwb_coords
+                ), dtype=float,
+            ).reshape(n)
 
         # Cache and restore the per-walker sensitivity matrix so we don't
         # corrupt the state seen by other moves. After all proposals are
@@ -2002,16 +2031,102 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
                 walker_ll = asnumpy(np.asarray(self.acs.likelihood()))
                 tmp_logl[batch] = walker_ll[walker_inds_keep[batch].astype(int)]
                 remaining = np.setdiff1d(remaining, batch)
-            logl[logp_keep] = tmp_logl
         finally:
             for w, sens in original_sens.items():
                 self.acs[w].sens_mat = sens
             if not self._skip_linear_psd_repack:
                 self.acs.reset_linear_psd_arr()
 
-        self.prev_logl = logl.copy()
+        return tmp_logl
 
-        return logl, None
+    def compute_psd_rows(self, walker_inds_keep, psd_coords, galfor_coords, sgwb_coords):
+        """The scoring seam: scatters the rows over the replicas in one-walker replica mode."""
+        if not self.rows_active():
+            return self._score_rows(walker_inds_keep, psd_coords, galfor_coords, sgwb_coords)
+        rows = {"walker_inds": np.asarray(walker_inds_keep).astype(np.int32).reshape(-1)}
+        for key, arr in (("psd", psd_coords), ("galfor", galfor_coords), ("sgwb", sgwb_coords)):
+            if arr is not None:
+                rows[key] = np.asarray(arr, dtype=np.float64)
+        out = self.row_fanout.run("psd_rows", rows, local_body=self._serve_psd_rows_local)
+        return out["ll"]
+
+    def _serve_psd_rows_local(self, rows):
+        n = int(np.shape(rows["walker_inds"])[0])
+        if n == 0:
+            return {"ll": np.zeros(0)}
+        ll = self._score_rows(rows["walker_inds"], rows.get("psd"), rows.get("galfor"), rows.get("sgwb"))
+        return {"ll": np.asarray(ll, dtype=float).reshape(n)}
+
+    def serve_psd_rows(self, payload, clock, model):
+        return self._serve_psd_rows_local(payload["rows"])
+
+    # ---- replays: every replica mirrors the head's propose-begin prep and
+    # publish, gated on replica mode itself (``self.row_fanout is None``),
+    # NOT on ``rows_active()`` / the ``{PREFIX}_LIKELIHOOD_FANOUT`` knob —
+    # that knob only changes who SCORES rows; it must not stop the replays
+    # that keep every replica's fixed-noise state / sens_mat aligned. ----
+    def _replay_noise_begin(self):
+        payload = {
+            "kind": "begin",
+            "fixed_noise_coords": {
+                k: np.asarray(v, dtype=np.float64) for k, v in self._fixed_noise_coords.items()
+            },
+        }
+        if self.row_fanout is None:
+            self._apply_psd_replay(payload)
+            return
+        self.row_fanout.replay("psd_replay", payload, local_body=self._apply_psd_replay)
+
+    def _apply_noise_begin(self, payload):
+        self._fixed_noise_coords = {
+            k: np.asarray(v, dtype=np.float64) for k, v in payload["fixed_noise_coords"].items()
+        }
+        self._prepare_fixed_component_covariances()
+        if self.coarse_sidecar_active:
+            self.coarse_runtime.refresh_P(self.acs)
+            self._prepare_fixed_component_covariances_coarse()
+
+    def _replay_noise_publish(self, new_state):
+        """Publish the cold-row noise model of walker 0 onto every replica's container."""
+        bc = new_state.branches_coords
+
+        def _row(key):
+            return np.asarray(bc[key][0, 0, 0], dtype=np.float64) if key in bc else None
+
+        payload = {"kind": "publish", "psd": _row("psd"), "galfor": _row("galfor"), "sgwb": _row("sgwb")}
+        if self.row_fanout is None:
+            self._apply_psd_replay(payload)
+            return
+        self.row_fanout.replay("psd_replay", payload, local_body=self._apply_psd_replay)
+
+    def _apply_psd_replay(self, payload):
+        kind = payload["kind"]
+        if kind == "begin":
+            self._apply_noise_begin(payload)
+        elif kind == "publish":
+            # Same "sens_refresh" bucket the non-replica publish path times
+            # (see propose_local's _publish_one) so the profiler bucket is
+            # not silently zero in replica mode; _tspan no-ops when the
+            # propose-level timer is absent (e.g. a bare-replay unit test).
+            with _tspan(getattr(self, "_prop_timer", None), "sens_refresh"):
+                new_sens = self._build_sensitivity_for_walker(
+                    0, payload["psd"], payload["galfor"], payload["sgwb"]
+                )
+            self.acs[0].sens_mat = new_sens
+            self.acs.reset_linear_psd_arr()
+        else:
+            raise ValueError(f"unknown noise replay kind {kind!r}")
+
+    def serve_psd_replay(self, payload, clock, model):
+        self._apply_psd_replay(payload)
+        return None
+
+    def _fancy_swap_fires(self, move_i, nwalkers):
+        """Walker-permuting swap cadence; never with one walker (identity permutation)."""
+        return (int(move_i) % int(self.permute_every) == 0) and int(nwalkers) > 1
+
+    def fanout_knob_prefix(self):
+        return str((self.sampled_branches or ["psd"])[0]).upper()
 
     def compute_log_prior(self, branches_coords, *args, **kwargs):
         """Sum the per-branch log priors over THIS move's sampled branches.
@@ -2046,13 +2161,14 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         return logp
 
     def _propose_delayed_acceptance(self, model, state):
-        """One stretch repeat under two-stage (delayed) acceptance.
+        """One inner-proposal repeat under two-stage (delayed) acceptance.
 
-        Stage 1 reuses eryn's stretch accept VERBATIM as the surrogate
-        screen: the working state's log-likes are swapped to the coarse
-        values (so eryn's ``logP(x)`` is the tempered coarse posterior) and
-        ``model`` carries :meth:`compute_coarse_log_like` (so ``logP(y)`` is
-        too); the prior and the stretch factor therefore enter exactly once,
+        Stage 1 reuses the resolved inner proposal's (eigen or stretch, see
+        :meth:`_inner_propose`) own accept VERBATIM as the surrogate screen:
+        the working state's log-likes are swapped to the coarse values (so
+        eryn's ``logP(x)`` is the tempered coarse posterior) and ``model``
+        carries :meth:`compute_coarse_log_like` (so ``logP(y)`` is too); the
+        prior and the proposal's own factor therefore enter exactly once,
         in stage 1. Stage 2 corrects the stage-1 survivors with
 
             log alpha_2 = beta * [(Lf(y) - Lc(y)) - (Lf(x) - Lc(x))]
@@ -2092,14 +2208,10 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         _tc = self.temperature_control
         self.temperature_control = None
         try:
-            # WalkerFanoutMixin now sits between PSDMove and GlobalFitMove in
-            # the MRO and defines its own `propose` (the fan-out dispatcher);
-            # `super(PSDMove, self)` would land there instead of the vanilla
-            # RedBlueMove stretch proposal this stage-1 draw needs. Name that
-            # proposal outright (StretchMove.propose IS RedBlueMove.propose) --
-            # exactly what this hand-off reached before the mixin was inserted,
-            # and independent of where the mixin sits in the MRO.
-            new_state, accepted1 = StretchMove.propose(self, model, state)
+            # Stage-1 draw: the eigen-axis MH move or the vanilla eryn
+            # stretch, whichever this propose block resolved (see
+            # :meth:`_inner_propose` for the dispatch and MRO rationale).
+            new_state, accepted1 = self._inner_propose(model, state)
         finally:
             self.temperature_control = _tc
         acc = np.asarray(accepted1, dtype=bool)
@@ -2180,11 +2292,9 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         ):
             new_state, accepted = self._propose_delayed_acceptance(model, state)
         else:
-            # See the matching comment in _propose_delayed_acceptance: name the
-            # vanilla stretch proposal outright (StretchMove.propose IS
-            # RedBlueMove.propose) rather than walking the MRO past the fan-out
-            # mixin -- the same target this hand-off had pre-mixin.
-            new_state, accepted = StretchMove.propose(self, model, state)
+            # The eigen-axis MH move or the vanilla eryn stretch, whichever
+            # this propose block resolved (see :meth:`_inner_propose`).
+            new_state, accepted = self._inner_propose(model, state)
 
         # in-model bookkeeping: eryn returns (ntemps, nwalkers) acceptances and
         # every walker is proposed once per call, so the per-temperature deltas
@@ -2205,7 +2315,7 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         # residuals through compute_log_like) fires only every
         # ``permute_every`` repeats. Previously NO swap ran between fancy
         # events, so the ladder sat unexchanged for the other repeats.
-        do_fancy = (move_i % self.permute_every == 0)
+        do_fancy = self._fancy_swap_fires(move_i, int(np.shape(new_state.log_like)[1]))
         x = new_state.branches_coords
         logl = new_state.log_like
         logp = new_state.log_prior
@@ -2293,6 +2403,141 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
                     num_so_far += 1
 
         return state, accepted
+
+    # ---- inner proposal: stretch or eigen-axis MH ----------------------------
+    def _resolve_inner_kind(self, nwalkers_block, nwalkers_run=None) -> str:
+        """Resolve the inner proposal kind for one propose.
+
+        ``nwalkers_block`` is the per-rank BLOCK width this propose is
+        actually working with (what the stretch-complement check must key
+        off — a 1-walker block cannot stretch even on a many-walker run).
+        ``nwalkers_run`` is the RUN's total walker count (defaults to
+        ``nwalkers_block`` for single-process / non-fanout callers); the
+        ``inner_move_kind is None`` default resolves to ``"eigen"`` iff the
+        RUN has exactly one walker (one-walker replica mode), else
+        ``"stretch"`` — a many-walker run with a 1-walker-per-rank BLOCK
+        still defaults to stretch (the fancy walker-permuting swap pools
+        the complement across ranks). Logs the resolved kind ONCE per move.
+        """
+        if nwalkers_run is None:
+            nwalkers_run = nwalkers_block
+        kind = self.inner_move_kind
+        if kind is None:
+            kind = "eigen" if int(nwalkers_run) == 1 else "stretch"
+        kind = str(kind).strip().lower()
+        if kind not in ("eigen", "stretch"):
+            prefix = self.fanout_knob_prefix()
+            raise ValueError(
+                f"PSDMove {prefix}_INNER_MOVE_KIND {self.inner_move_kind!r}: "
+                "use 'eigen' or 'stretch'"
+            )
+        if kind == "stretch" and int(nwalkers_block) == 1:
+            prefix = self.fanout_knob_prefix()
+            raise ValueError(
+                "PSDMove: the stretch inner proposal needs at least two walkers in the "
+                f"block (there is no complement with one); block nwalkers={nwalkers_block}, "
+                f"run nwalkers={nwalkers_run}; set {prefix}_INNER_MOVE_KIND=eigen"
+            )
+        if not getattr(self, "_inner_kind_logged", False):
+            logger.info(
+                "[%s] resolved PSD inner proposal kind -> %r (block nwalkers=%d, "
+                "run nwalkers=%d)", self.fanout_knob_prefix(), kind,
+                int(nwalkers_block), int(nwalkers_run),
+            )
+            self._inner_kind_logged = True
+        return kind
+
+    def _eigen_inner_move(self):
+        if self._eigen_inner is None:
+            from eryn.moves import EigenAxisMove
+
+            self._eigen_inner = EigenAxisMove(mode="axis", periodic=self.periodic)
+        # follow the move's control (None during the delayed-acceptance stage 1)
+        # and periodic wrap on every call, not just at first construction.
+        self._eigen_inner.temperature_control = self.temperature_control
+        self._eigen_inner.periodic = self.periodic
+        return self._eigen_inner
+
+    def _refresh_eigen_tables(self, tmp_branches_coords):
+        """Per-branch, per-rung eigen tables from likelihood second differences at walker 0.
+
+        ``call_ll`` for branch ``b`` varies only ``b``'s parameters; the other
+        sampled branches sit at their own rung values (rows arrive as whole
+        ``ntemps``-point blocks, the batching invariant of
+        ``information_matrix_from_ll``) and the fixed branches at the cold row.
+        Scoring goes through :meth:`compute_psd_rows`, so it scatters too.
+        """
+        from .eigen_refresh import eigen_tables_from_ll_batch, prior_box_widths
+
+        names = list(tmp_branches_coords)
+        first = np.asarray(tmp_branches_coords[names[0]])
+        ntemps, nwalkers = int(first.shape[0]), int(first.shape[1])
+        inner = self._eigen_inner_move()
+        point = {
+            b: np.asarray(tmp_branches_coords[b], dtype=np.float64)[:, 0, 0, :] for b in names
+        }
+        fixed = {k: np.asarray(v, dtype=np.float64)[0] for k, v in self._fixed_noise_coords.items()}
+        for b in names:
+            ndim_b = int(point[b].shape[1])
+            widths = prior_box_widths(self.priors[b], ndim_b)
+
+            def call_ll(x, _b=b):
+                x = np.atleast_2d(np.asarray(x, dtype=np.float64))
+                rung = np.arange(x.shape[0]) % ntemps
+                rows = {}
+                for key in self.NOISE_BRANCHES:
+                    if key == _b:
+                        rows[key] = x
+                    elif key in point:
+                        rows[key] = point[key][rung]
+                    elif key in fixed:
+                        rows[key] = np.tile(fixed[key], (x.shape[0], 1))
+                return self.compute_psd_rows(
+                    np.zeros(x.shape[0], dtype=np.int32),
+                    rows.get("psd"), rows.get("galfor"), rows.get("sgwb"),
+                )
+
+            axes, sigmas = eigen_tables_from_ll_batch(
+                call_ll, point[b], widths, eps_rel=self.eigen_eps_rel
+            )
+            axes5 = np.broadcast_to(
+                axes[:, None, None], (ntemps, nwalkers, 1, ndim_b, ndim_b)
+            ).copy()
+            sig4 = np.broadcast_to(sigmas[:, None, None], (ntemps, nwalkers, 1, ndim_b)).copy()
+            inner.set_axes(b, axes5, sig4)
+
+    def _inner_propose(self, model, state):
+        """One in-model step: the eigen-axis MH move or the vanilla eryn stretch.
+
+        ``StretchMove.propose`` is named outright (it IS ``RedBlueMove.propose``)
+        rather than reached through the MRO past the fan-out mixin -- this is
+        the sole call site for both the stage-1 delayed-acceptance draw and
+        the ordinary ``run_move`` step, so both routes get the same dispatch.
+        """
+        if self._inner_kind == "eigen":
+            inner = self._eigen_inner_move()
+            ntemps, nwalkers = next(iter(state.branches_coords.values())).shape[:2]
+            # EigenAxisMove IS an MHMove: its propose() ends with
+            # ``self.accepted += accepted``, so the inner move's OWN
+            # (otherwise unused) accepted counter must be initialized before
+            # its first use -- eryn's ensemble normally does this once per
+            # move before running it; here nothing else does, since the
+            # inner move is never handed to an ensemble directly.
+            if getattr(self, "_eigen_inner_accepted_shape", None) != (ntemps, nwalkers):
+                inner.accepted = np.zeros((ntemps, nwalkers))
+                self._eigen_inner_accepted_shape = (ntemps, nwalkers)
+            out_state, out_acc = inner.propose(model, state)
+            # Mirror RedBlueMove.propose (Eryn red_blue.py:326-327): advance
+            # the OUTER move's own accepted/num_proposals too, not just the
+            # inner move's -- otherwise Move.acceptance_fraction sees
+            # num_proposals == 0 forever (zeros/0 -> RuntimeWarning + all-nan,
+            # poisoning the enclosing CombineMove's average at every
+            # checkpoint). `self.accepted` is sized to the module ladder
+            # shape by propose_local before any run_move call.
+            self.accepted += np.asarray(out_acc)
+            self.num_proposals += 1
+            return out_state, out_acc
+        return StretchMove.propose(self, model, state)
 
     # ---- multi-rank fan-out (WalkerFanoutMixin hooks) ------------------------
     # Multi-rank semantics this family changes (walkerfanout module docstring,
@@ -2391,16 +2636,13 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
             for key in model_branches
             if key not in noise_branches
         }
-        self._prepare_fixed_component_covariances()
-        if self.coarse_sidecar_active:
-            # Correctness-first lifecycle (plan-2 §4.3): every noise proposal
-            # block re-reads every walker's CURRENT residual — a source move
-            # may have run since the last block. Residual epochs are a
-            # recorded later optimization, deliberately not built yet.
-            # the ACA itself: refresh_P reads its gpu_map so each device
-            # group's statistics are built under the owning device's context
-            self.coarse_runtime.refresh_P(self.acs)
-            self._prepare_fixed_component_covariances_coarse()
+        # Correctness-first lifecycle (plan-2 §4.3): every noise proposal
+        # block re-reads every walker's CURRENT residual — a source move may
+        # have run since the last block. Residual epochs are a recorded later
+        # optimization, deliberately not built yet. One-walker replica mode:
+        # this begin-of-propose prep must run on every replica, not just the
+        # head, so it is a replay (see _replay_noise_begin / _apply_noise_begin).
+        self._replay_noise_begin()
 
         # The working ensembles are the SUB-STATES' tempered branches (this
         # move's module ladder); the main state carries only the engine's
@@ -2421,6 +2663,24 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         # move-local supplemental at the MODULE ladder shape (the main
         # state's supplemental is engine-shaped)
         nt_mod, nwalkers_mod = tmp_branches_coords[noise_branches[0]].shape[:2]
+
+        # inner proposal resolution: eigen-axis MH (one-walker default) or
+        # the vanilla eryn stretch, from THIS block's module-ladder walker
+        # count -- must run after the begin replay above (the tables score
+        # merged rows that need the fixed-component covariances) and after
+        # nt_mod/nwalkers_mod are known. The default kind keys off the RUN's
+        # walker count (nwalkers_run), not the block width -- see
+        # _resolve_inner_kind.
+        nwalkers_run = (
+            self.fanout.layout.nwalkers
+            if getattr(self, "fanout", None) is not None
+            else nwalkers_mod
+        )
+        self._inner_kind = self._resolve_inner_kind(nwalkers_mod, nwalkers_run=nwalkers_run)
+        if self._inner_kind == "eigen":
+            if self._eigen_visits % self.eigen_refresh_every == 0:
+                self._refresh_eigen_tables(tmp_branches_coords)
+            self._eigen_visits += 1
 
         # per-iteration acceptance deltas, accumulated across the repeat block
         # by run_move and written into each sampled branch's sub-state below.
@@ -2543,23 +2803,32 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
             self.acs[w].sens_mat = new_sens
             if self.debug and w == self.debug_plot_walker:
                 # accepted params of the plotted walker, for the
-                # instrument-only reference curve in the debug overlay
+                # instrument-only reference curve in the debug overlay.
+                # Non-replica path only: in replica mode the publish runs
+                # through _replay_noise_publish/_apply_psd_replay instead of
+                # _publish_one, so this capture never fires there.
                 self._debug_walker_params = (
                     w, psd_params, galfor_params, sgwb_params
                 )
 
-        self._run_rows_per_split(
-            _publish_one, np.arange(nwalkers), np.arange(nwalkers)
-        )
+        if self.row_fanout is not None:
+            # Gated on replica mode itself, not rows_active()/the knob: the
+            # publish must reach every replica's container regardless of
+            # {PREFIX}_LIKELIHOOD_FANOUT (see _replay_noise_publish).
+            self._replay_noise_publish(new_state)  # walker 0 on every replica, head included
+        else:
+            self._run_rows_per_split(
+                _publish_one, np.arange(nwalkers), np.arange(nwalkers)
+            )
 
-        # NOT gated by _skip_linear_psd_repack, deliberately. This is the one
-        # repack that PUBLISHES the accepted noise model to the rest of the
-        # run, and it fires once per propose (~16 ms) rather than once per
-        # scoring batch (~295x per iteration) -- so skipping it would buy
-        # ~0.15% while opening the buffer to staleness across moves. Keeping
-        # it means the only window where linear_psd_arr is stale is INSIDE
-        # compute_log_like's scoring loop, where no other move can observe it.
-        self.acs.reset_linear_psd_arr()
+            # NOT gated by _skip_linear_psd_repack, deliberately. This is the one
+            # repack that PUBLISHES the accepted noise model to the rest of the
+            # run, and it fires once per propose (~16 ms) rather than once per
+            # scoring batch (~295x per iteration) -- so skipping it would buy
+            # ~0.15% while opening the buffer to staleness across moves. Keeping
+            # it means the only window where linear_psd_arr is stale is INSIDE
+            # compute_log_like's scoring loop, where no other move can observe it.
+            self.acs.reset_linear_psd_arr()
         after_vals = self.acs.likelihood()
 
         if self.debug:

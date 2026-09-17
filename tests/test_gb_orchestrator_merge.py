@@ -57,6 +57,11 @@ ORCHESTRATOR_REPLY_KEYS = {
         "block_coords", "block_inds", "d_h", "h_h", "band_counts",
         "log_like_final", "cap_stats", "band_dof", "fstat_ctr_fallback_rows",
         "timing",
+        # one-walker replica mode: the band id per written-back slot (-1 where
+        # dead), the head's ownership key for the merge-by-source. ``None``
+        # outside replica mode -- but the KEY must always be there, because
+        # the head reads it unconditionally on the replica path.
+        "block_band_inds",
     }),
 }
 
@@ -184,6 +189,7 @@ def _stub_gf_serve(move, op, payload, clock, model):
                 # a neutral block ships no branch block at all
                 "block_coords": None,
                 "block_inds": None,
+                "block_band_inds": None,
                 "d_h": np.full((B, NLEAVES), np.nan),
                 "h_h": np.full((B, NLEAVES), np.nan),
                 "band_counts": np.zeros((ntemps, B, nb), dtype=int),
@@ -205,6 +211,8 @@ def _stub_gf_serve(move, op, payload, clock, model):
         return _checked(op, {
             "block_coords": block_coords,
             "block_inds": block_inds,
+            # multi-walker blocks: no band-ownership key (replica mode only)
+            "block_band_inds": None,
             "d_h": np.full((B, NLEAVES), 10.0 + rank),
             "h_h": np.full((B, NLEAVES), 20.0 + rank),
             "band_counts": np.full((ntemps, B, nb), rank + 1, dtype=int),

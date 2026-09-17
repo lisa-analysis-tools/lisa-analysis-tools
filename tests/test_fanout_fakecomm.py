@@ -8,10 +8,15 @@ import numpy as np
 from lisatools.globalfit.communication.fakecomm import FakeWorld
 from lisatools.globalfit.communication.fanout import (
     LIKELIHOOD_OP,
+    RESIDUAL_HASH_OP,
     ComputeService,
     RemoteWorkerError,
     WalkerFanout,
     concat_blocks,
+    fanout_digest_line,
+    residual_hash,
+    _array_bytes,
+    _sha1_16,
 )
 from lisatools.globalfit.communication.ranks import RankRole, build_layout
 
@@ -40,6 +45,12 @@ class _StubMove:
         if op == "unpicklable":
             return {"fn": lambda: None}  # pickle.dumps rejects this, like FakeComm.send
         return {"rank_sum": float(np.sum(payload["x"])), "model": model}
+
+
+class _DigestState:
+    log_like = np.zeros((1, 1))
+    branches_coords = {"mbh": np.zeros((1, 1, 1, 2))}
+    branches_inds = {"mbh": np.ones((1, 1, 1), dtype=bool)}
 
 
 def _run_world(size, nodes, nwalkers, head_fn, saver_fn=None, ranks_per_gpu=1):
@@ -440,6 +451,82 @@ class FanoutFakeCommTest(unittest.TestCase):
 
         out = FakeWorld(3).run(fn)
         self.assertEqual(out[0], "raised")
+
+
+class ReplicaGathersTest(unittest.TestCase):
+    def _replica_world(self, head_fn):
+        world = FakeWorld(3, nodes=[0, 0, 0])
+
+        def fn(rank, comm):
+            layout = build_layout(comm, 1, [0, 1], legacy=False)
+            fcomm = layout.make_fanout_comm(comm)
+            if layout.role_of(rank) == RankRole.SAVER:
+                return "saver"
+            fo = WalkerFanout(fcomm, layout, rank, model=None)
+            if layout.role_of(rank) == RankRole.HEAD:
+                fo.enter_stage("pe", "pe")
+                try:
+                    return head_fn(fo, layout)
+                finally:
+                    fo.stop()
+            service = ComputeService(
+                fcomm, layout, rank, registry={}, model=None,
+                builtins={RESIDUAL_HASH_OP: lambda p, c, m: f"h{rank}"},
+            )
+            return service.serve()
+
+        return world.run(fn)
+
+    def test_concat_blocks_returns_the_head_block_in_replica_mode(self):
+        out = self._replica_world(lambda fo, layout: concat_blocks({0: [1.5], 1: [9.9]}, layout))
+        np.testing.assert_array_equal(out[0], [1.5])
+
+    def test_allgather_walker_vector_returns_the_head_vector_everywhere(self):
+        world = FakeWorld(3, nodes=[0, 0, 0])
+
+        def fn(rank, comm):
+            layout = build_layout(comm, 1, [0, 1], legacy=False)
+            fcomm = layout.make_fanout_comm(comm)
+            if layout.role_of(rank) == RankRole.SAVER:
+                return "saver"
+            fo = WalkerFanout(fcomm, layout, rank, model=None)
+            return fo.allgather_walker_vector(np.array([10.0 + rank]))
+
+        out = world.run(fn)
+        np.testing.assert_array_equal(out[0], [10.0])
+        np.testing.assert_array_equal(out[1], [10.0])
+
+    def test_gather_residual_hashes_and_digest_line(self):
+        acs = _Acs([1.0])
+        out = self._replica_world(lambda fo, layout: fo.gather_residual_hashes(acs))
+        hashes = out[0]
+        self.assertEqual(set(hashes), {0, 1})
+        self.assertEqual(hashes[1], "h1")
+        self.assertEqual(hashes[0], residual_hash(acs))
+        line = fanout_digest_line(3, _DigestState(), residual_hashes={0: "aa", 1: "aa"})
+        self.assertIn("residual=r0:aa,r1:aa replicas_agree=True", line)
+        line = fanout_digest_line(3, _DigestState(), residual_hashes={0: "aa", 1: "bb"})
+        self.assertIn("replicas_agree=False", line)
+
+    def test_residual_hash_covers_data_and_psd_buffers(self):
+        """F2: residual_hash must catch a noise-model-only drift too."""
+        class _AcsWithBuffers:
+            def __init__(self, data, psd):
+                self.linear_data_arr = [data]
+                self.linear_psd_arr = [psd]
+
+        data = np.arange(4.0)
+        psd = np.ones(4)
+        acs = _AcsWithBuffers(data, psd)
+
+        expected = _sha1_16(_array_bytes(data) + _array_bytes(psd))
+        self.assertEqual(residual_hash(acs), expected)
+
+        acs_diff_data = _AcsWithBuffers(np.arange(4.0) + 1.0, psd)
+        self.assertNotEqual(residual_hash(acs), residual_hash(acs_diff_data))
+
+        acs_diff_psd = _AcsWithBuffers(data, psd * 2.0)
+        self.assertNotEqual(residual_hash(acs), residual_hash(acs_diff_psd))
 
 
 if __name__ == "__main__":

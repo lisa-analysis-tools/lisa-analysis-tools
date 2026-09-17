@@ -45,6 +45,7 @@ from gbgpu.gb_likelihood import (
     WDMBandLikelihoodEngine,
 )
 from .globalfitmove import GFCombineMove, GlobalFitMove
+from ..communication.fanout import residual_hash
 from ..communication.ranks import derive_rank_seed
 from ..communication.walkerslice import slice_state
 from ..priors.gbpriors import get_fdot_mojito
@@ -747,6 +748,40 @@ def _unit_residue_mask(band_inds, walker_inds, units, remainder):
         return band_inds % int(units) == int(rem)
     rem_dev = xp.asarray(rem.astype(np.int64))
     return band_inds % int(units) == rem_dev[walker_inds]
+
+
+def replica_band_ranges(num_bands, n_replicas, weights=None):
+    """Static contiguous band ranges, one per replica, covering ``[0, num_bands)``.
+
+    By count (``np.array_split`` sizes) unless ``weights`` (per band, >= 0) is
+    given, in which case the cut points balance the cumulative weight
+    (VGB: catalogue sources per band). Ranges are half-open; a tail range may
+    be empty when there are more replicas than bands.
+
+    Degenerate weights (all zero, or a non-finite total -- e.g. a VGB branch
+    whose catalogue is empty this propose) carry no information, and balancing
+    against them would put every cut at 0 and hand the whole grid to the last
+    replica. They fall back to the plain count split.
+    """
+    num_bands = int(num_bands)
+    n_replicas = max(1, int(n_replicas))
+    if weights is not None:
+        w = np.asarray(weights, dtype=float).reshape(-1)
+        if w.shape[0] != num_bands:
+            raise ValueError(f"weights has {w.shape[0]} entries for {num_bands} bands")
+        _total = float(w.sum())
+        if not np.isfinite(_total) or _total <= 0.0:
+            weights = None
+    if weights is None:
+        sizes = [len(c) for c in np.array_split(np.arange(num_bands), n_replicas)]
+        bounds = np.concatenate([[0], np.cumsum(sizes)]).astype(int)
+    else:
+        cum = np.concatenate([[0.0], np.cumsum(w)])
+        targets = cum[-1] * np.arange(1, n_replicas) / n_replicas
+        cuts = np.searchsorted(cum, targets, side="left")
+        bounds = np.concatenate([[0], np.clip(cuts, 0, num_bands), [num_bands]]).astype(int)
+        bounds = np.maximum.accumulate(bounds)
+    return [(int(bounds[i]), int(bounds[i + 1])) for i in range(n_replicas)]
 
 
 def _unit_class_label(remainder) -> str:
@@ -1920,15 +1955,24 @@ def _buffer_fixed_capacity_active(sorter, kwargs) -> bool:
     return True
 
 
-#: The three fan-out commands ONE GB propose issues, in the order the head
-#: issues them (multi-rank walker-block port, Plan 4 / design spec "WP5. GB
-#: move fan-out"). Every compute rank -- the head included -- runs all three
-#: on its own walker block against its own B-row ACA, so the command COUNT is
-#: symmetric across ranks even when a block has nothing to do (the head marks
-#: such a block ``payload["neutral"]``; a rank never returns early on its own).
+#: The fan-out commands ONE GB propose issues, in the order the head issues
+#: them (multi-rank walker-block port, Plan 4 / design spec "WP5. GB move
+#: fan-out"). Every compute rank -- the head included -- runs them on its own
+#: walker block against its own B-row ACA, so the command COUNT is symmetric
+#: across ranks even when a block has nothing to do (the head marks such a
+#: block ``payload["neutral"]``; a rank never returns early on its own).
 #: ``gb_run_proposal`` OPENS the per-propose :class:`GBRankSession` and
 #: ``gb_finish`` tears it down.
-GB_OPS = ("gb_run_proposal", "gb_run_tempering", "gb_finish")
+#:
+#: ``gb_sync`` is the ONE-WALKER REPLICA mode's fourth command (Plan 2): there
+#: every rank holds a replica of the same walker and owns a static band range,
+#: so each rank's finish-time branch is authoritative only for the sources in
+#: ITS bands and stale for every other rank's. The head merges by owned
+#: physical source (:func:`merge_owned_sources`) and then ships the MERGED branch
+#: back with ``gb_sync``, which is where the finish-time authoritative rebuild
+#: (``check_ll_inject``) actually happens. It is issued ONLY in replica mode
+#: and opens no session (``gb_finish`` has already torn it down).
+GB_OPS = ("gb_run_proposal", "gb_run_tempering", "gb_finish", "gb_sync")
 
 
 def _gb_host(obj):
@@ -1951,6 +1995,154 @@ def _gb_host(obj):
         vals = [_gb_host(v) for v in obj]
         return type(obj)(*vals) if hasattr(obj, "_fields") else type(obj)(vals)
     return np.asarray(_to_numpy(obj))
+
+
+def merge_owned_sources(work_coords, work_inds, replies, ranks, band_ranges,
+                        f0_col, d_h=None, h_h=None,
+                        preserve_leaf_identity=False):
+    """Replica-mode finish merge: each rank contributes the sources IT owns.
+
+    ONE walker, several replicas of it, each owning a static band range. Every
+    rank's ``gb_finish`` reply carries its WHOLE branch, but only the sources
+    in ITS bands are new -- the others are the head's pre-propose copies.
+
+    THE MERGE KEY IS THE SOURCE, NOT THE SLOT (fix round 1, Critical). GB's
+    ``_write_back_state`` renumbers leaves densely per (rung, walker) in
+    frequency order over the whole alive set, so a birth or death in a low band
+    on one rank shifts every higher leaf index in ITS copy of the other ranks'
+    sources -- a slot-keyed merge would collide or overwrite on any ordinary RJ
+    propose. Band ownership is the one key stable across replicas:
+
+    * select, per rung, each rank's alive slots whose ``block_band_inds`` falls
+      in that rank's ``(b0, b1)`` range (the bands are disjoint by
+      construction, so the union is conflict-free -- no mask, no assert);
+    * concatenate those rows over the ranks, sort by ``coords[:, f0_col]``
+      (``_write_back_state``'s own key) and lay them down densely at leaves
+      ``0..n-1`` with ``inds`` rebuilt from scratch. Dead-slot coords are left
+      exactly as the head had them.
+
+    ``d_h`` / ``h_h`` (optional, ``(nwalkers, nleaves_max)`` cold-only) follow
+    their sources through the same sort for rung 0; the freed slots go NaN,
+    the sub-state's own "nothing recorded" sentinel.
+
+    ``preserve_leaf_identity`` (VGB and any fixed-dimensional branch, where
+    leaf *i* IS a specific physical source and per-leaf transform fills are
+    attached to it): the dense re-sort would scramble those fills, and slots
+    there ARE stable across ranks because ``_write_back_state`` puts every
+    source back at its original leaf. So each rank's owned slots are written
+    back AT THEIR OWN INDICES instead, and ``inds`` is the union of the owned
+    alive slots.
+
+    A NEUTRAL block ships ``block_band_inds=None`` and contributes nothing.
+
+    Args:
+        work_coords, work_inds: the head's ``(ntemps, 1, nleaves_max, ndim)`` /
+            ``(ntemps, 1, nleaves_max)`` branch arrays, written in place.
+        replies: ``{rank: gb_finish reply}``.
+        ranks: the compute ranks to merge, in order.
+        band_ranges: ``{rank: (b0, b1)}`` half-open owned band range.
+        f0_col: the sampling-basis frequency column to sort on.
+    """
+    ntemps, _, nleaves_max, _ = np.shape(work_coords)
+    contributors = []
+    for r in ranks:
+        rep = replies[r]
+        bands = rep.get("block_band_inds") if hasattr(rep, "get") else rep["block_band_inds"]
+        if bands is None:
+            continue  # neutral block: nothing ran, nothing to contribute
+        bands = np.asarray(bands)
+        coords = np.asarray(rep["block_coords"])
+        inds = np.asarray(rep["block_inds"], dtype=bool)
+        if (coords.shape[:3] != (ntemps, 1, nleaves_max)
+                or inds.shape != (ntemps, 1, nleaves_max)
+                or bands.shape != (ntemps, 1, nleaves_max)):
+            raise RuntimeError(
+                f"GB replica merge: rank {r} shipped block_coords "
+                f"{coords.shape}, block_inds {inds.shape}, block_band_inds "
+                f"{bands.shape}; every one must be "
+                f"{(ntemps, 1, nleaves_max)} (+ ndim on the coords) -- one "
+                "walker, the head's own branch shape"
+            )
+        b0, b1 = (int(v) for v in band_ranges[r])
+        contributors.append((r, coords, inds, bands, b0, b1))
+
+    if not contributors:
+        return
+    # The ranges partition the whole band grid, so an ALIVE source whose
+    # frozen band label falls outside their union belongs to no rank and
+    # would be dropped silently by the per-range selection below (``-1`` is
+    # the sentinel a rank ships for a slot it could not label). That is a
+    # ledger/labelling bug, not a merge outcome -- fail loudly.
+    grid_lo = min(int(band_ranges[r][0]) for r in ranks)
+    grid_hi = max(int(band_ranges[r][1]) for r in ranks)
+    for t in range(ntemps):
+        for r, _c, _inds, _bands, _b0, _b1 in contributors:
+            _oob = _inds[t, 0] & (
+                (_bands[t, 0] < grid_lo) | (_bands[t, 0] >= grid_hi))
+            _k = int(_oob.sum())
+            if _k:
+                raise RuntimeError(
+                    f"GB replica merge: rank {r} holds {_k} alive source(s) "
+                    f"with a band label outside [{grid_lo}, {grid_hi}) at "
+                    f"rung {t}"
+                )
+    for t in range(ntemps):
+        # one selection per contributor, EMPTY ONES KEPT so the two lists stay
+        # index-aligned with ``contributors``
+        picks = [
+            np.nonzero(inds[t, 0] & (bands[t, 0] >= b0) & (bands[t, 0] < b1))[0]
+            for _r, _coords, inds, bands, b0, b1 in contributors
+        ]
+        n = int(sum(int(sel.size) for sel in picks))
+        if n > nleaves_max:
+            raise RuntimeError(
+                f"GB replica merge: rung {t} holds {n} owned sources but the "
+                f"branch has {nleaves_max} leaves. Each rank births only into "
+                "its OWN dead-slot partition (leaf % R == r, "
+                "``_owned_rows_mask``), so the owned sets are disjoint in "
+                "slots as well as in bands and must fit together -- the slot "
+                "partition was violated."
+            )
+        cold = t == 0 and d_h is not None
+        work_inds[t, 0, :] = False
+        if cold:
+            d_h[0][:] = np.nan
+            h_h[0][:] = np.nan
+        if preserve_leaf_identity:
+            # fixed-dimensional branch: leaves never move, so write each owned
+            # source back AT ITS OWN SLOT and union the alive masks
+            for (r, coords, _i, _b, _b0, _b1), sel in zip(contributors, picks):
+                if sel.size == 0:
+                    continue
+                work_coords[t, 0][sel] = coords[t, 0][sel]
+                work_inds[t, 0][sel] = True
+                if cold:
+                    d_h[0][sel] = np.asarray(replies[r]["d_h"])[0][sel]
+                    h_h[0][sel] = np.asarray(replies[r]["h_h"])[0][sel]
+            continue
+        if n == 0:
+            continue
+        merged = np.concatenate(
+            [coords[t, 0][sel]
+             for (_r, coords, _i, _b, _b0, _b1), sel in zip(contributors, picks)
+             if sel.size],
+            axis=0,
+        )
+        # the SAME key ``_write_back_state`` ranks live sources by
+        order = np.argsort(merged[:, int(f0_col)], kind="stable")
+        work_coords[t, 0, :n] = merged[order]
+        work_inds[t, 0, :n] = True
+        if cold:
+            d_h[0][:n] = np.concatenate(
+                [np.asarray(replies[r]["d_h"])[0][sel]
+                 for (r, *_rest), sel in zip(contributors, picks) if sel.size],
+                axis=0,
+            )[order]
+            h_h[0][:n] = np.concatenate(
+                [np.asarray(replies[r]["h_h"])[0][sel]
+                 for (r, *_rest), sel in zip(contributors, picks) if sel.size],
+                axis=0,
+            )[order]
 
 
 @dataclass
@@ -3245,6 +3437,123 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     def add_sources_to_residual(self, *args, **kwargs) -> None:
         self.adjust_sources_in_residual_buffer(-1, *args, **kwargs)
 
+    # ---- one-walker replica mode: per-unit residual reconciliation ----------
+    def _ledger_coords_in(self, band_sorter, sel):
+        """Physical coords for just the selected rows.
+
+        The ``coords_in`` property (gbbands.py ``BandSorter.coords_in``)
+        transforms the WHOLE sorter (``self.transform_fn.both_transforms(
+        self.coords, xp=self.xp, leaf_inds=self.leaf_inds)``) and only then
+        gets indexed by the caller -- doing that once per unit for a handful
+        of selected rows is a full-sorter ``both_transforms`` call wasted.
+        Call the same transform directly on ``band_sorter.coords[sel]`` (and
+        the matching ``leaf_inds`` slice, since the property forwards
+        ``leaf_inds=self.leaf_inds`` for per-leaf-fill containers) instead.
+        Falls back to the full ``coords_in`` property (then indexed) for a
+        sorter stand-in that doesn't expose ``coords``/``transform_fn``/
+        ``leaf_inds`` (e.g. the unit-test stub sorter). The guard is an
+        explicit ``hasattr`` rather than a bare ``except AttributeError``,
+        which would also swallow a genuine AttributeError raised INSIDE
+        ``both_transforms`` and silently take the slow path forever.
+
+        ``sel`` must already be on the sorter's device (see
+        ``_ledger_snapshot``): every gather here is into a device array.
+        """
+        if not hasattr(band_sorter, "transform_fn"):
+            return band_sorter.coords_in[sel]
+        return band_sorter.transform_fn.both_transforms(
+            band_sorter.coords[sel], xp=band_sorter.xp,
+            leaf_inds=band_sorter.leaf_inds[sel],
+        )
+
+    def _ledger_snapshot(self, band_sorter, sel):
+        """Host copy of the selected sorter rows (physical coords, alive flag, N).
+
+        The PAYLOAD is host numpy (it crosses the allgather), but every gather
+        into the sorter goes through ``band_sorter.xp.asarray(sel)``: on a real
+        run those arrays live on the GPU, and cupy raises on a host numpy
+        index. A raise on one rank between here and the allgather would
+        deadlock every other rank.
+        """
+        sel = np.asarray(asnumpy(sel)).reshape(-1).astype(int)
+        if sel.size == 0:
+            # nothing selected: no transform call, no gather
+            return {
+                "rows": sel,
+                "coords_in": np.zeros((0, 0), dtype=np.float64),
+                "alive": np.zeros(0, dtype=bool),
+                "N": np.zeros(0, dtype=int),
+            }
+        sel_dev = getattr(band_sorter, "xp", np).asarray(sel)
+        return {
+            "rows": sel,
+            "coords_in": np.asarray(
+                asnumpy(self._ledger_coords_in(band_sorter, sel_dev)), dtype=np.float64
+            ),
+            "alive": np.asarray(asnumpy(band_sorter.inds[sel_dev]), dtype=bool),
+            "N": np.asarray(asnumpy(band_sorter.N_vals[sel_dev])).astype(int),
+        }
+
+    def _ledger_delta(self, before, band_sorter):
+        """Rows of ``before`` whose alive flag or physical coords changed since the snapshot."""
+        rows = before["rows"]
+        if rows.size == 0:
+            # empty snapshot: every field is already the empty answer
+            return {
+                "rows": rows,
+                "old_coords_in": before["coords_in"],
+                "old_alive": before["alive"],
+                "new_coords_in": before["coords_in"],
+                "new_alive": before["alive"],
+                "N": before["N"],
+            }
+        rows_dev = getattr(band_sorter, "xp", np).asarray(rows)
+        now_c = np.asarray(
+            asnumpy(self._ledger_coords_in(band_sorter, rows_dev)), dtype=np.float64
+        )
+        now_a = np.asarray(asnumpy(band_sorter.inds[rows_dev]), dtype=bool)
+        changed = (now_a != before["alive"]) | (
+            (now_a | before["alive"]) & np.any(now_c != before["coords_in"], axis=1)
+        )
+        return {
+            "rows": rows[changed],
+            "old_coords_in": before["coords_in"][changed],
+            "old_alive": before["alive"][changed],
+            "new_coords_in": now_c[changed],
+            "new_alive": now_a[changed],
+            "N": before["N"][changed],
+        }
+
+    def _ledger_exchange(self, delta):
+        """Allgather this rank's delta on the fan-out comm; return the OTHER ranks' deltas."""
+        comm = self.fanout.comm
+        parts = comm.allgather(delta)
+        me = int(comm.Get_rank())
+        return [p for i, p in enumerate(parts) if i != me]
+
+    def _ledger_apply(self, model, deltas):
+        """Apply remote deltas to this replica's residual: add back the old alive
+        templates (factor +1), subtract the new alive ones (factor -1)."""
+        assert int(self.nwalkers) == 1, (
+            "the ledger carries no walker identity -- one-walker replica mode only"
+        )
+        acs = model.analysis_container_arr
+        xp = getattr(acs, "xp", np)
+        for d in deltas:
+            if int(np.shape(d["rows"])[0]) == 0:
+                continue
+            for factor, key, alive_key in ((+1, "old_coords_in", "old_alive"), (-1, "new_coords_in", "new_alive")):
+                alive = np.asarray(d[alive_key], dtype=bool)
+                if not alive.any():
+                    continue
+                params = xp.asarray(np.asarray(d[key])[alive])
+                N = xp.asarray(np.asarray(d["N"])[alive])
+                walkers = xp.zeros(params.shape[0], dtype=xp.int32)
+                self._likelihood_engine.fill_template(
+                    acs, params, walkers, N, factor=factor,
+                    waveform_kwargs=self.waveform_kwargs,
+                )
+
     # ================= GB-sampler verification (debug mode) =================
     # Each hook does ONE piece at the site where that operation happens in
     # run_proposal; all early-return unless ``self.debug`` is set (so the
@@ -4406,6 +4715,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # concurrent sub-band scheduling.
         _ortho_ll_on = os.environ.get("GB_ORTHO_LL_CHECK", "1") == "1"
 
+        # one-walker replica mode: this rank's owned-row mask (alive rows
+        # of its owned bands + dead rows of its owned bands in its slot
+        # partition; None outside replica mode). Computed once for the
+        # whole propose -- the owned band range and this replica's slot
+        # partition are static per propose, so it does not change per unit.
+        _owned = self._owned_rows_mask(band_sorter)
+
         for unit_i in range(units):
             remainder = _unit_pass_remainder(
                 _unit_starts, _unit_dirs, unit_i, units
@@ -4428,6 +4744,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     units, remainder,
                 )
                 _unit_kw = dict(extra_bool=_res_mask)
+
+            # one-walker replica mode: OPEN/CLOSE (below) touch only this
+            # rank's owned bands (+ its slot-partitioned dead rows), so the
+            # cold-chain residual passes never move sources outside its
+            # static band range.
+            if _owned is not None:   # compute _owned once before the unit loop: it does not change per unit
+                _unit_kw = dict(_unit_kw)
+                _unit_kw["extra_bool"] = (_owned if _unit_kw.get("extra_bool") is None
+                                          else (_unit_kw["extra_bool"] & _owned))
             _rem_lbl = _unit_class_label(remainder)
 
             if _ortho_ll_on:
@@ -4441,6 +4766,22 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     model.analysis_container_arr.likelihood()
                 ).copy()
                 _dbg_change_start = _to_numpy(ll_change_log[0].sum(axis=-1)).copy()
+
+            # one-walker replica mode: snapshot this unit's owned cold-chain
+            # rows before OPEN so the CLOSE-time delta (below) can tell
+            # which of them moved/were born/died during the unit -- that
+            # delta is what gets exchanged with the other replicas so every
+            # copy of the residual agrees after every unit.
+            if _owned is not None:
+                _unit_residue = (
+                    _res_mask if _res_mask is not None
+                    else (band_sorter.band_inds % units == remainder)
+                )
+                _ledger_xp = band_sorter.xp
+                _ledger_sel = _ledger_xp.where(
+                    _owned & (band_sorter.temp_inds == 0) & _unit_residue
+                )[0]
+                _ledger_before = self._ledger_snapshot(band_sorter, _ledger_sel)
 
             # Open this parity class in the parent residual.
             with _tspan(getattr(self, "_prop_timer", None), "unit_open_close"):
@@ -4462,6 +4803,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             extra_bool = (
                 (band_sorter.band_inds < self.num_bands - 1) & (band_sorter.band_inds > 0)
             ) if self.num_bands > 1 else None
+
+            # one-walker replica mode: restrict RJ/in-model proposals to
+            # this rank's owned bands (+ slot-partitioned dead rows) --
+            # None outside replica mode (see _owned_rows_mask).
+            if _owned is not None:
+                extra_bool = _owned if extra_bool is None else (extra_bool & _owned)
 
             # Per-walker residue test rides in with the other row gates
             # (the units/remainder kwargs below go None in that mode).
@@ -4724,6 +5071,40 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     np.array2string(_tracked, precision=3),
                     float(np.abs(_direct - _tracked).max()),
                 )
+
+            # one-walker replica mode: reconcile the replicas' residual
+            # copies for this unit -- diff the owned cold-chain rows
+            # against the pre-OPEN snapshot, allgather each rank's changed
+            # rows (every rank runs the same head-drawn schedule, so this
+            # fires exactly once per unit on every rank), and apply the
+            # other ranks' changes to this replica's own residual through
+            # the same fill_template engine call used above. Placed AFTER
+            # the GB_ORTHO_LL/GB_DEBUG per-unit monitors above (both compare
+            # this unit's own credited change against the realized residual
+            # change) so a remote rank's accepted moves folded in here never
+            # look like an orthogonality violation for THIS unit -- neither
+            # block mutates the residual, so moving the ledger past them
+            # changes nothing they read. The observed lnL delta the apply
+            # itself causes is credited into ``ll_change_log`` (temp 0,
+            # this walker, band slot 0 -- any owned band slot works, only
+            # the per-walker SUM over bands is read downstream) so it rides
+            # along with this rank's own credited change into both the
+            # NEXT unit's ortho/debug baseline and the propose-end
+            # ``new_part.log_like[0] += ll_change_log.sum(axis=-1)[0]``
+            # in ``_gb_serve_run_proposal`` -- otherwise this rank's belief
+            # about its own cold lnL would silently fall behind its residual
+            # the moment any other replica accepts a move.
+            if _owned is not None:
+                _ledger_change = self._ledger_delta(_ledger_before, band_sorter)
+                _ledger_others = self._ledger_exchange(_ledger_change)
+                _ledger_ll_pre = _to_numpy(
+                    model.analysis_container_arr.likelihood()
+                ).copy()
+                self._ledger_apply(model, _ledger_others)
+                _ledger_dll = _to_numpy(
+                    model.analysis_container_arr.likelihood()
+                ) - _ledger_ll_pre
+                ll_change_log[0, :, 0] += band_sorter.xp.asarray(_ledger_dll)
 
             with _tspan(getattr(self, "_prop_timer", None), "mempool_free"):
                 if self.backend.uses_cupy:
@@ -10652,6 +11033,81 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     #: nearest-in-frequency table) regardless of GB_INFOMAT_PER_BLOCK.
     infomat_per_block = False
 
+    #: one-walker replica mode: this rank's static band range (global band
+    #: indices, half-open) and its replica identity; None/0/1 otherwise
+    _owned_band_range = None
+    _replica_index = 0
+    _n_replicas = 1
+
+    def _replica_active(self) -> bool:
+        fanout = getattr(self, "fanout", None)
+        return (
+            fanout is not None
+            and not fanout.single
+            and bool(getattr(fanout.layout, "replica_mode", False))
+        )
+
+    def _apply_replica_payload(self, payload):
+        """Install (or clear) the replica identity a command payload carries."""
+        rng = payload.get("band_range")
+        self._owned_band_range = None if rng is None else (int(rng[0]), int(rng[1]))
+        rep = payload.get("replica")
+        if rep is None:
+            self._replica_index, self._n_replicas = 0, 1
+        else:
+            self._replica_index, self._n_replicas = int(rep[0]), max(1, int(rep[1]))
+
+    def _replica_band_weights(self, work):
+        """Per-band weights for the static split; None = split by band count (GB)."""
+        return None
+
+    def _owned_rows_mask(self, band_sorter):
+        """Rows this replica may propose on: alive rows of its owned bands plus
+        dead rows of its owned bands in its slot partition (``leaf % R == r``),
+        so two replicas never birth into the same dead slot. ``None`` = no
+        restriction (not in replica mode)."""
+        rng = self._owned_band_range
+        if rng is None:
+            return None
+        xp = band_sorter.xp
+        b = band_sorter.band_inds
+        owned = (b >= rng[0]) & (b < rng[1])
+        if self._n_replicas > 1:
+            mine = (band_sorter.leaf_inds % self._n_replicas) == self._replica_index
+            owned = owned & (band_sorter.inds | mine)
+        return xp.asarray(owned)
+
+    def _owned_band_row_mask(self, band_index_arr):
+        rng = self._owned_band_range
+        if rng is None:
+            return None
+        b = band_index_arr
+        return (b >= rng[0]) & (b < rng[1])
+
+    def _tempering_open_close_mask(self, band_sorter, units, remainder):
+        """``extra_bool`` for ``run_tempering``'s cold-chain OPEN/CLOSE pair.
+
+        The historical mask is the unit's BAND RESIDUE CLASS
+        (``band_inds % units == remainder``) over the whole sorter. In
+        ONE-WALKER REPLICA MODE that is wrong: the per-unit ledger reconciles
+        the shared RESIDUAL, never this rank's ``band_sorter``, which stays at
+        its session-build values for every band another rank owns. A
+        full-width OPEN with that stale sorter would restore a foreign
+        source's stale template -- and for a source that DIED on its owner
+        this propose, would add it back a second time. The swap grid already
+        drops unowned rows (``_unowned_row``), so nothing needs a foreign band
+        exposed; narrowing the open/close to the owned range is also where the
+        replica tempering saving comes from.
+
+        Outside replica mode ``_owned_band_row_mask`` is ``None`` and this
+        returns the plain residue expression, unchanged in dtype and device.
+        """
+        residue = band_sorter.band_inds % units == remainder
+        owned = self._owned_band_row_mask(band_sorter.band_inds)
+        if owned is None:
+            return residue
+        return residue & owned
+
     def _eigen_axes_from_info(self, info_y, coords, ndim):
         """Per-axis ``sigma_k * a_k`` table from the conditioned info matrix.
 
@@ -14649,7 +15105,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 self.remove_cold_chain_sources_from_residual(
                     model,
                     band_sorter,
-                    extra_bool=(band_sorter.band_inds % units == bool_remainder),
+                    extra_bool=self._tempering_open_close_mask(
+                        band_sorter, units, bool_remainder),
                 )
 
             (band_index, temp_index, walkers_permuted, special_index,
@@ -14708,7 +15165,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             _n_inert_rows_unit = 0
             _compact_rows = _temper_compact_rows_on()
             _skip_shut_bands = _temper_skip_shutoff_bands_on()
-            if (_compact_rows or _skip_shut_bands) and _n_rows_unit > 0:
+            # one-walker replica mode: this rank owns only a static band
+            # range, so unowned rows must drop out of the swap grid exactly
+            # as shut-off rows do (no counter restoration -- they belong to
+            # another rank, not to this run).
+            _owned_mode = self._owned_band_range is not None
+            if (_compact_rows or _skip_shut_bands or _owned_mode) and _n_rows_unit > 0:
                 _grid_sp = special_index.reshape(-1, self.ntemps)
                 _grid_bd = band_index.reshape(-1, self.ntemps)
                 _grid_wk = walkers_permuted.reshape(-1, self.ntemps)
@@ -14722,6 +15184,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     if (_shut_u is not None and bool(_shut_u.any())
                             and self._band_shutoff_enabled()):
                         _shut_row = cp.asarray(_shut_u)[_row_band]
+
+                # Unowned rows: the band is outside this replica's static
+                # range, so this rank never swaps it -- same "no counter
+                # restoration" treatment as shut-off rows.
+                # the SORTER's array module, not the module-level ``cp``
+                # alias (which is numpy in a CPU-only install)
+                _xp_row = getattr(band_sorter, "xp", self.xp)
+                _owned_rows_row = self._owned_band_row_mask(_row_band)
+                _unowned_row = (
+                    ~_xp_row.asarray(_owned_rows_row) if _owned_rows_row is not None
+                    else _xp_row.zeros(_n_rows_unit, dtype=bool)
+                )
 
                 # Inert rows: no source at ANY temperature. Same proof the
                 # _fill_slots skip already uses, applied to scheduling.
@@ -14747,9 +15221,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         _occ_f = cp.zeros_like(_grid_sp)
                     # A shut-off row is accounted for as shut-off, never
                     # as inert, so the two corrections cannot double-count.
-                    _inert_row = (_occ_f.sum(axis=1) == 0) & (~_shut_row)
+                    # Same for an unowned row (replica mode).
+                    _inert_row = (
+                        (_occ_f.sum(axis=1) == 0) & (~_shut_row) & (~_unowned_row)
+                    )
 
-                _drop_row = _inert_row | _shut_row
+                _drop_row = _inert_row | _shut_row | _unowned_row
                 if bool(_drop_row.any()):
                     _keep_row = ~_drop_row
                     _inert_bands_unit = _row_band[_inert_row]
@@ -15187,7 +15664,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 self.add_cold_chain_sources_to_residual(
                     model,
                     band_sorter,
-                    extra_bool=(band_sorter.band_inds % units == bool_remainder),
+                    extra_bool=self._tempering_open_close_mask(
+                        band_sorter, units, bool_remainder),
                 )
             # Once-per-unit label-consistency alarm: replaces the per-pair
             # device asserts inside exchange_cell_labels (now gated behind
@@ -17105,9 +17583,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     # ``propose`` is the head orchestrator. Everything below runs on EVERY
     # compute rank (the head included) over that rank's walker block
     # ``[w0, w1)`` against that rank's own B-row ACA: one per-propose
-    # :class:`GBRankSession` carried across the three :data:`GB_OPS`
-    # commands. The bodies are the SAME fragments ``propose`` runs, so the
-    # one-compute-rank path stays the single-process path.
+    # :class:`GBRankSession` carried across the three session
+    # :data:`GB_OPS` commands (``gb_sync``, the one-walker replica mode's
+    # fourth, runs after the teardown and holds no session). The bodies are
+    # the SAME fragments ``propose`` runs, so the one-compute-rank path
+    # stays the single-process path.
     #
     # A rank NEVER runs the head's once-per-propose work: no ``setup()`` /
     # ``_run_fstat_fit`` (no ``DONE.json``, no eigen sidecar), no
@@ -17246,6 +17726,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         "nwalkers", "ntemps", "time", "num_proposals", "_reseed_firing",
         "temper_vertical", "_cap_leaf_cap", "_band_leaf_cap",
         "_rj_band_shutoff", "_rank_rng_seed",
+        "_owned_band_range", "_replica_index", "_n_replicas",
     )
 
     def _enter_rank_block(self, payload, clock, model):
@@ -17297,6 +17778,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             "_band_leaf_cap": getattr(self, "_band_leaf_cap", None),
             "_rj_band_shutoff": getattr(self, "_rj_band_shutoff", None),
             "_rank_rng_seed": getattr(self, "_rank_rng_seed", None),
+            "_owned_band_range": getattr(self, "_owned_band_range", None),
+            "_replica_index": getattr(self, "_replica_index", 0),
+            "_n_replicas": getattr(self, "_n_replicas", 1),
             # the shared tempering-cadence census is a CLASS dict, not an
             # attribute: saved here too so a rank command can never leave
             # the head's census shifted (on the head the shipped value IS
@@ -17321,6 +17805,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self._cap_leaf_cap = tables.get("cap_leaf_cap")
         self._band_leaf_cap = tables.get("band_leaf_cap")
         self._rj_band_shutoff = tables.get("rj_band_shutoff")
+        self._apply_replica_payload(payload or {})
         new_seed = (payload or {}).get("rank_seed")
         # The seeded vertical-swap Generator must SURVIVE the three commands
         # of one propose: nulling it on every command restarted an identical
@@ -17547,7 +18032,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             self.name, int(k), (", ".join(flushed) or "no artifacts"), d,
         )
 
-    def _make_slice_state(self, payload):
+    def _make_slice_state(self, payload, key="state"):
         """This rank's walker-block ``GFState`` (built by the head).
 
         ``slice_state(state, w0, w1, sub_states=[branch])`` already produced
@@ -17561,11 +18046,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         The slice carries NO ``band_info`` (``GBState.slice_walkers`` leaves
         it unset) -- correct, because nothing on the rank path reads it.
+
+        ``key`` names the payload entry holding the slice: ``"state"`` for the
+        opening command, ``"merged_state"`` for ``gb_sync`` (the head's MERGED
+        one-walker branch). Same object shape, same validation.
         """
-        part = (payload or {}).get("state")
+        part = (payload or {}).get(key)
         if part is None:
             raise ValueError(
-                f"{self.name}: gb_run_proposal payload carries no state slice."
+                f"{self.name}: the rank payload carries no {key} slice."
             )
         sub = (getattr(part, "sub_states", None) or {}).get(self.branch_name)
         if sub is None or not getattr(sub, "tempered_initialized", False):
@@ -17585,6 +18074,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             return self._gb_serve_run_tempering(payload, clock, model)
         if op == "gb_finish":
             return self._gb_serve_finish(payload, clock, model)
+        if op == "gb_sync":
+            return self._gb_serve_sync(payload, clock, model)
         raise ValueError(
             f"move {self.name!r} serves only {GB_OPS}, got {op!r}"
         )
@@ -17826,8 +18317,33 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                                 f"vs walker drift {float(_chk[int(i)]):+.3e}")
                 except Exception:
                     pass
-                with tm.span("ll_inject_drift"):
-                    new_part.log_like[0] = self.check_ll_inject(model, band_sorter)
+                # the SAME predicate ``_gb_serve_finish`` uses: the identity
+                # the command PAYLOAD installed, not the fan-out layout
+                if self._owned_band_range is not None:
+                    # ONE-WALKER REPLICA MODE: this rank's ``band_sorter``
+                    # is authoritative only for its OWN owned bands -- the
+                    # other ranks' bands were never touched by this rank's
+                    # proposals/RJ this propose, so their rows in THIS
+                    # rank's sorter are whatever they were when the session
+                    # was built (stale relative to the reconciled residual).
+                    # ``check_ll_inject`` rebuilds/verifies against the
+                    # WHOLE sorter, so calling it here would subtract stale
+                    # foreign-band sources back out of the shared residual.
+                    # The residual itself is authoritative (every unit's
+                    # ledger reconciliation keeps every replica's copy in
+                    # sync); the only fix is to trust it and defer the real
+                    # cross-rank rebuild to the head's ``gb_sync`` at propose
+                    # end (Task 4).
+                    new_part.log_like[0] = asnumpy(
+                        model.analysis_container_arr.likelihood()
+                    )
+                    logger.info(
+                        f"{self._rank_tag()}{self.name}: [GB_REPLICA] "
+                        f"residual authoritative; rebuild deferred to "
+                        f"gb_sync (drift {drift:.3e}).")
+                else:
+                    with tm.span("ll_inject_drift"):
+                        new_part.log_like[0] = self.check_ll_inject(model, band_sorter)
 
             _pc, _ac = _to_numpy(prop_counts), _to_numpy(acc_counts)
             _at_cap = getattr(self, "_rj_at_cap_mask", None)
@@ -17925,8 +18441,24 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                                     for i in _off))
                 except Exception:
                     pass
-                with tm.span("ll_inject_drift"):
-                    new_part.log_like[0] = self.check_ll_inject(model, band_sorter)
+                if self._owned_band_range is not None:
+                    # Same reasoning (and the same payload-derived predicate)
+                    # as the twin branch in
+                    # ``_gb_serve_run_proposal``: this rank's ``band_sorter``
+                    # is stale for every band it doesn't own, so
+                    # ``check_ll_inject`` must not run here in replica mode
+                    # -- trust the (ledger-reconciled) residual and defer
+                    # the authoritative cross-rank rebuild to ``gb_sync``.
+                    new_part.log_like[0] = asnumpy(
+                        model.analysis_container_arr.likelihood()
+                    )
+                    logger.info(
+                        f"{self._rank_tag()}{self.name}: [GB_REPLICA] "
+                        f"residual authoritative; rebuild deferred to "
+                        f"gb_sync (drift {drift:.3e}).")
+                else:
+                    with tm.span("ll_inject_drift"):
+                        new_part.log_like[0] = self.check_ll_inject(model, band_sorter)
 
             with tm.span("mempool_free"):
                 self.mempool.free_all_blocks()
@@ -17977,7 +18509,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
             band_sorter = sess.band_sorter
             with tm.span("write_back"):
-                self._write_back_state(new_part, band_sorter)
+                _wb_inds_new, _wb_alive = self._write_back_state(
+                    new_part, band_sorter)
 
             work = self._work_branch(new_part)
             # THE WHOLE BLOCK'S BRANCH, not just its alive leaves (fix round
@@ -18004,6 +18537,35 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # push hard and this rides an MPI pickle.
             block_coords = np.array(_to_numpy(work.coords), copy=True)
             block_inds = np.array(_to_numpy(work.inds), copy=True)
+            # ONE-WALKER REPLICA MODE: the OWNERSHIP key for every written-back
+            # slot -- the band id of the source now sitting there, -1 where the
+            # slot is dead.
+            #
+            # WHY NOT A SLOT MASK (fix round 1, Critical). GB's
+            # ``_write_back_state`` renumbers leaves DENSELY per (rung, walker)
+            # in frequency order over the WHOLE alive set, so one birth or
+            # death in a low band shifts every higher leaf index -- including
+            # this rank's stale copies of the OTHER ranks' sources. A
+            # slot-keyed merge therefore collides (or silently overwrites) on a
+            # perfectly normal RJ propose. Band ownership is the only key that
+            # is stable across the replicas, so the head merges by PHYSICAL
+            # SOURCE: each rank contributes the sources whose band it owns, and
+            # the union is re-sorted into dense leaves head-side.
+            #
+            # DERIVED FROM THE SORTER, not recomputed from f0: band assignment
+            # is FROZEN per propose, and it is exactly the frozen assignment
+            # that decided which rows this rank was allowed to touch
+            # (``_owned_rows_mask``). Re-deriving the band from the final f0
+            # would disagree with ownership for any source whose in-model step
+            # carried it across a band edge -- such a source would be claimed
+            # by two ranks or by none. ``_write_back_state``'s return is the
+            # alive sources' NEW ``(temp, walker, leaf)`` positions in the same
+            # order as ``band_sorter.inds``, so this is an exact scatter.
+            block_band_inds = None
+            if self._owned_band_range is not None:
+                block_band_inds = np.full(work.inds.shape, -1, dtype=np.int64)
+                block_band_inds[_wb_inds_new] = np.asarray(
+                    _to_numpy(band_sorter.band_inds[_wb_alive])).astype(np.int64)
             sub = new_part.sub_states[self.branch_name]
             d_h = np.array(_to_numpy(sub.d_h), copy=True)
             h_h = np.array(_to_numpy(sub.h_h), copy=True)
@@ -18017,34 +18579,47 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             del band_sorter
             with tm.span("mempool_free"):
                 self.mempool.free_all_blocks()
-            with tm.span("sorter_rebuild"):
-                new_band_sorter = BandSorter(
-                    work,
-                    self.band_edges,
-                    self.band_N_vals,
-                    force_backend=self.force_backend,
-                    transform_fn=self.parameter_transforms,
-                    max_data_store_size=self.max_data_store_size,
-                    gb=self.gb,
-                    gb_wdm_comp=self.gb_wdm_comp,
-                    gb_fd_comp=self.gb_fd_comp,
-                    wdm_band_slab_layers=self.wdm_band_slab_layers,
-                    wdm_slab_guard_layers=self.wdm_slab_guard_layers,
-                    psd_shared_mirror=self.psd_shared_mirror,
-                    psd_mirror_parity_proposes=self.psd_mirror_parity_proposes,
-                    psd_mirror_parity_rows=self.psd_mirror_parity_rows,
-                    waveform_kwargs=self.waveform_kwargs,
-                )
+            # ONE-WALKER REPLICA MODE: the whole finish-time rebuild is SKIPPED.
+            # This rank's branch is authoritative only for the sources in its
+            # own bands; the rest are the head's pre-propose copies, so both
+            # products of that sorter would be wrong -- ``check_ll_inject``
+            # would subtract another replica's stale sources and drop the ones
+            # it accepted, and ``band_counts`` would report pre-propose counts
+            # outside this rank's range. Both move to ``gb_sync``, which the
+            # head issues over the MERGED branch; the reply says so with
+            # ``band_counts = None`` / ``log_like_final = None``.
+            band_info = None
+            log_like_final = None
+            if block_band_inds is None:
+                with tm.span("sorter_rebuild"):
+                    new_band_sorter = BandSorter(
+                        work,
+                        self.band_edges,
+                        self.band_N_vals,
+                        force_backend=self.force_backend,
+                        transform_fn=self.parameter_transforms,
+                        max_data_store_size=self.max_data_store_size,
+                        gb=self.gb,
+                        gb_wdm_comp=self.gb_wdm_comp,
+                        gb_fd_comp=self.gb_fd_comp,
+                        wdm_band_slab_layers=self.wdm_band_slab_layers,
+                        wdm_slab_guard_layers=self.wdm_slab_guard_layers,
+                        psd_shared_mirror=self.psd_shared_mirror,
+                        psd_mirror_parity_proposes=self.psd_mirror_parity_proposes,
+                        psd_mirror_parity_rows=self.psd_mirror_parity_rows,
+                        waveform_kwargs=self.waveform_kwargs,
+                    )
             self.temperature_control.swaps_accepted = np.zeros(ntemps - 1)
             self.temperature_control.swaps_proposed = np.zeros(ntemps - 1)
             with tm.span("mempool_free"):
                 self.mempool.free_all_blocks()
-            with tm.span("band_info"):
-                band_info = new_band_sorter.get_band_info()
-            with tm.span("mempool_free"):
-                self.mempool.free_all_blocks()
-            with tm.span("ll_inject_final"):
-                log_like_final = self.check_ll_inject(model, new_band_sorter)
+            if new_band_sorter is not None:
+                with tm.span("band_info"):
+                    band_info = new_band_sorter.get_band_info()
+                with tm.span("mempool_free"):
+                    self.mempool.free_all_blocks()
+                with tm.span("ll_inject_final"):
+                    log_like_final = self.check_ll_inject(model, new_band_sorter)
 
             # The residual-dependent half of the cap gate, on THIS block. The
             # head concatenates the walker axis and applies the gate once.
@@ -18067,9 +18642,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # (see the note at the copy site)
                 "block_coords": block_coords,
                 "block_inds": block_inds,
+                # replica mode only: ``(ntemps, B, nleaves_max)`` band id per
+                # written-back slot, -1 where dead -- the head's ownership key
+                # for the merge-by-source (``None`` otherwise, where the head
+                # writes the whole walker column back as it always has)
+                "block_band_inds": block_band_inds,
                 "d_h": d_h,
                 "h_h": h_h,
-                "band_counts": _gb_host(band_info["band_counts"]),
+                "band_counts": (None if band_info is None
+                                else _gb_host(band_info["band_counts"])),
                 "log_like_final": _gb_host(log_like_final),
                 "cap_stats": _gb_host(cap_stats),
                 "fstat_ctr_fallback_rows": int(
@@ -18132,9 +18713,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # None, not an empty array: a neutral block ran nothing, so the
             # head must KEEP the coords/inds it sliced for those walkers
             # rather than write anything back (the head skips a neutral
-            # block's merge anyway; these say so in the reply itself)
+            # block's merge anyway; these say so in the reply itself).
+            # ``block_band_inds`` says the same thing to the replica-mode
+            # merge-by-source, which contributes nothing for a ``None`` key.
             "block_coords": None,
             "block_inds": None,
+            "block_band_inds": None,
             "d_h": d_h,
             "h_h": h_h,
             "band_counts": np.zeros((ntemps, B, nb), dtype=int),
@@ -18151,6 +18735,84 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 getattr(self, "_replace_split_last", None)),
             "timing": None,
         }
+
+    def _gb_serve_sync(self, payload, clock, model):
+        """ONE-WALKER REPLICA MODE, 4th command: rebuild from the MERGED branch.
+
+        In replica mode every rank holds a copy of the same walker's residual
+        and owns a static band range, so no rank's own branch is the whole
+        truth at ``gb_finish``: it carries the sources of ITS bands plus the
+        head's pre-propose copies of every other rank's. ``gb_finish``
+        therefore SKIPS the authoritative rebuild and the head merges by owned
+        physical source (:func:`merge_owned_sources`); this command ships that
+        merged branch
+        back to EVERY rank so all the replicas end the propose on the same
+        residual, and reports the one-walker ``log_like`` / ``band_counts``
+        the head then stores.
+
+        NO SESSION. ``gb_finish`` has already torn the session down (and
+        released the sorter and the buffer cache), so this must not call
+        ``_gb_require_session``: everything it needs rides in the payload,
+        except the propose-start non-GB residual snapshot, which
+        ``check_ll_inject`` restores and which the teardown deliberately
+        leaves on the move (it is not in :data:`_RANK_BLOCK_SAVED` either).
+        That snapshot is checked, not assumed: rebuilding against a PREVIOUS
+        propose's non-GB residual would be a silent, whole-propose likelihood
+        error.
+
+        The ``BandSorter`` here mirrors ``_gb_serve_finish``'s finish-time
+        rebuild (same kwargs, no ``rj_prop``): its ``keep_all_inds`` default
+        is what makes an all-dead merged branch legal -- an alive-only sorter
+        cannot be built from zero sources -- and it changes nothing about what
+        is subtracted, because ``add_cold_chain_sources_to_residual`` forces
+        ``apply_inds=True`` (alive leaves only) and ``get_band_info`` counts
+        ``inds`` rows only.
+        """
+        saved = self._enter_rank_block(payload, clock, model)
+        sorter = None
+        try:
+            if getattr(self, "reset_non_gb_linear_data_arr", None) is None:
+                raise RuntimeError(
+                    f"{self.name} (rank {self.gf_rank}): gb_sync has no non-GB "
+                    "residual snapshot to rebuild against -- gb_run_proposal "
+                    "takes it once per propose and gb_finish must leave it in "
+                    "place. Rebuilding without it would silently score this "
+                    "walker against another propose's non-GB residual."
+                )
+            part = self._make_slice_state(payload, key="merged_state")
+            work = self._work_branch(part)
+            self.mempool.free_all_blocks()
+            sorter = BandSorter(
+                work,
+                self.band_edges,
+                self.band_N_vals,
+                force_backend=self.force_backend,
+                transform_fn=self.parameter_transforms,
+                max_data_store_size=self.max_data_store_size,
+                gb=self.gb,
+                gb_wdm_comp=self.gb_wdm_comp,
+                gb_fd_comp=self.gb_fd_comp,
+                wdm_band_slab_layers=self.wdm_band_slab_layers,
+                wdm_slab_guard_layers=self.wdm_slab_guard_layers,
+                psd_shared_mirror=self.psd_shared_mirror,
+                psd_mirror_parity_proposes=self.psd_mirror_parity_proposes,
+                psd_mirror_parity_rows=self.psd_mirror_parity_rows,
+                waveform_kwargs=self.waveform_kwargs,
+            )
+            band_counts = sorter.get_band_info()["band_counts"]
+            log_like_final = self.check_ll_inject(model, sorter)
+            return {
+                "log_like_final": _gb_host(log_like_final),
+                "band_counts": _gb_host(band_counts),
+                # the head compares these across the ranks: a disagreement
+                # means the replicas' residuals have drifted apart
+                "residual_hash": residual_hash(model.analysis_container_arr),
+            }
+        finally:
+            if sorter is not None:
+                del sorter
+            self.mempool.free_all_blocks()
+            self._exit_rank_block(saved)
 
     # ==================================================================
     # Multi-rank walker-block fan-out -- the HEAD side (Plan 4 / WP5).
@@ -18247,8 +18909,90 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """A host COPY of a head-owned table, for shipping read-only."""
         return None if arr is None else np.array(_to_numpy(arr), copy=True)
 
+    # ---- one-walker replica mode: the head's finish bookkeeping ---------
+    def _replica_merge_finish(self, work, sub, replies_f, layout, band_ranges):
+        """HEAD, replica mode: merge the ``gb_finish`` replies by owned source.
+
+        Split out of ``_propose_orchestrated`` so it can be unit-tested with
+        synthetic replies and a stub layout (the orchestrator itself cannot be
+        driven at one walker: the shared test harness builds a 4-walker state,
+        and ``build_layout`` only enters ``replica_mode`` at ``nwalkers == 1``).
+
+        ``band_ranges`` is the head's per-REPLICA list from
+        :func:`replica_band_ranges`; the rank -> range mapping goes through
+        ``layout.replica_index``. ``d_h``/``h_h`` ride along with the sources
+        (cold rung only). See :func:`merge_owned_sources` for the rules.
+        """
+        ranks = tuple(layout.compute_ranks)
+        ranges = {r: band_ranges[layout.replica_index(r)] for r in ranks}
+        f0_col = getattr(self, "_f0_col", None)
+        merge_owned_sources(
+            work.coords, work.inds, replies_f, ranks, ranges,
+            # the sampling-basis frequency column ``_write_back_state`` sorts
+            # on; its own expression is the literal 1 of the legacy layout
+            1 if f0_col is None else int(f0_col),
+            d_h=getattr(sub, "d_h", None),
+            h_h=getattr(sub, "h_h", None),
+            preserve_leaf_identity=bool(
+                getattr(self, "preserve_leaf_identity", False)),
+        )
+
+    def _replica_apply_sync(self, replies_s, layout, log_like_final, band_counts):
+        """HEAD, replica mode: take the ``gb_sync`` products and check the ranks agree.
+
+        The HEAD's own reply is the one the state takes -- every rank rebuilt
+        from the SAME merged branch, so they must agree.
+
+        THE GUARD IS THE PER-RANK ``log_like_final``, NOT THE HASH. Spec
+        decision 3: the replicas agree only to ~1e-12 (the GPU fills are
+        ``atomicAdd`` reductions, whose summation order is not reproducible
+        across ranks), so a bit-exact residual hash would differ on nearly
+        every propose and the alarm would be pure noise. The lnL comparison is
+        tolerance-based (``rtol=1e-10``, ``atol=1e-8``) and is the real
+        divergence detector; the hash is an exact-match BONUS, logged at INFO
+        when it differs.
+        Returns the hash map (for tests and the digest lines).
+        """
+        head_rep = replies_s[layout.head_rank]
+        ref = np.asarray(head_rep["log_like_final"])
+        log_like_final[:] = ref
+        band_counts[:] = np.asarray(head_rep["band_counts"])
+
+        bad = {}
+        for r, rep in replies_s.items():
+            ll = np.asarray(rep["log_like_final"])
+            if not np.allclose(ll, ref, rtol=1e-10, atol=1e-8):
+                bad[r] = ll
+        if bad:
+            logger.warning(
+                "[GB_REPLICA %s] log_like_final disagrees after sync "
+                "(head r%s: %s): %s",
+                self.name,
+                layout.head_rank,
+                np.array2string(ref, precision=6),
+                ", ".join(
+                    f"r{r}:{np.array2string(ll, precision=6)}"
+                    for r, ll in sorted(bad.items())
+                ),
+            )
+
+        hashes = {r: rep["residual_hash"] for r, rep in replies_s.items()}
+        if len(set(hashes.values())) != 1:
+            # INFO, not WARNING: bit-exact agreement is expected only on CPU;
+            # on GPU the ~1e-12 atomicAdd spread flips the hash routinely. The
+            # message text is the one ``gf_run_log_digest.py`` greps for.
+            logger.info(
+                "[GB_REPLICA %s] residual hashes disagree after sync: %s "
+                "(expected on GPU at the ~1e-12 atomicAdd level; the guard is "
+                "the per-rank log_like_final agreement above)",
+                self.name,
+                ", ".join(f"r{r}:{h}" for r, h in sorted(hashes.items())),
+            )
+        return hashes
+
     def _propose_orchestrated(self, model, state):
-        """Head orchestrator: three commands over the walker blocks.
+        """Head orchestrator: three commands over the walker blocks (four in
+        one-walker replica mode).
 
         The prologue is ``_propose_legacy``'s, verbatim and head-only: the
         tempering-cadence census tick, the propose timer, the device
@@ -18281,6 +19025,17 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         window values the legacy computes for an empty walker, so the cap
         gate's walker-axis concatenation is always N rows and the caps never
         freeze because some block had nothing to do.
+
+        ONE-WALKER REPLICA MODE (Plan 2). With N = 1 there are no walker
+        blocks to split: every rank replicates the same walker and owns a
+        static BAND range instead, so the finish merge is by owned physical
+        SOURCE rather than by walker column (``_replica_merge_finish`` ->
+        :func:`merge_owned_sources`; leaf SLOTS are not stable across the
+        ranks, because ``_write_back_state`` renumbers them densely in
+        frequency order), and a FOURTH command ``gb_sync`` ships the merged
+        branch back to every rank for the authoritative residual rebuild that
+        ``gb_finish`` skipped. See the merge loop and the ``gb_sync`` block
+        below.
         """
         # ---- prologue: ``_propose_legacy``'s, VERBATIM --------------------
         st_all = time.perf_counter()
@@ -18652,6 +19407,17 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 (self.use_prior_removal or self.rj_replace)
                 and not np.any(work.inds[:, _w0:_w1]))
 
+        # one-walker replica mode: every rank replicates the SAME walker but
+        # statically owns a band range, so the head computes ONE static
+        # split (by band count, or by the subclass's per-band weights) and
+        # ships each rank its own range plus its replica identity.
+        _replica = self._replica_active()
+        _band_ranges = None
+        if _replica:
+            _band_ranges = replica_band_ranges(
+                self.num_bands, layout.n_replicas, weights=self._replica_band_weights(work)
+            )
+
         def _common(rank, w0, w1):
             """Payload keys EVERY command needs (``_enter_rank_block``)."""
             return {
@@ -18675,6 +19441,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     None if layout.is_single()
                     else int(derive_rank_seed(_seed_base, layout, rank))
                     + 1000003 * int(self.num_proposals)
+                ),
+                # one-walker replica mode: this rank's static band-range
+                # ownership and its (index, count) identity; None otherwise.
+                "band_range": (
+                    None if _band_ranges is None
+                    else _band_ranges[layout.replica_index(rank)]
+                ),
+                "replica": (
+                    (layout.replica_index(rank), layout.n_replicas)
+                    if _replica else None
                 ),
             }
 
@@ -18859,6 +19635,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # A NEUTRAL block writes nothing: it ran nothing, so the coords the
         # head sliced for it are already its state and its ``inds`` are
         # all-False -- which is exactly what made it neutral.
+        #
+        # ONE-WALKER REPLICA MODE. Every rank replicates the SAME walker
+        # column, so there are no blocks to concatenate: each rank's reply is
+        # authoritative only for the sources in ITS bands, and the four column
+        # writes below would have each rank overwrite the others' work with its
+        # own stale copy. The branch merge is by owned PHYSICAL SOURCE
+        # (``_replica_merge_finish`` after the loop, ``d_h``/``h_h`` carried
+        # along with it), ``band_counts`` / ``log_like_final`` come from the
+        # ``gb_sync`` round below (the only place the merged branch exists),
+        # and ``cap_stats`` takes the HEAD's row alone -- every rank computed
+        # that statistic for the same single walker, so concatenating R of them
+        # would hand the cap gate R rows for N = 1.
         for rank in layout.compute_ranks:
             w0, w1 = layout.block_of(rank)
             rep = replies_f[rank]
@@ -18868,19 +19656,23 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # values, which is what the legacy computes for an empty
             # walker), so the walker-axis concatenation is always N rows.
             _stats = rep.get("cap_stats")
-            if _stats is not None:
+            if _stats is not None and not (_replica and rank != layout.head_rank):
                 cap_rows.append(_stats)
             if neutral[rank]:
                 continue
-            work.coords[:, w0:w1] = np.asarray(rep["block_coords"])
-            work.inds[:, w0:w1] = np.asarray(rep["block_inds"])
-            if getattr(sub, "d_h", None) is not None:
-                sub.d_h[w0:w1] = np.asarray(rep["d_h"])
-                sub.h_h[w0:w1] = np.asarray(rep["h_h"])
-            band_counts[:, w0:w1] = np.asarray(rep["band_counts"])
-            log_like_final[w0:w1] = np.asarray(rep["log_like_final"])
+            if not _replica:
+                work.coords[:, w0:w1] = np.asarray(rep["block_coords"])
+                work.inds[:, w0:w1] = np.asarray(rep["block_inds"])
+                if getattr(sub, "d_h", None) is not None:
+                    sub.d_h[w0:w1] = np.asarray(rep["d_h"])
+                    sub.h_h[w0:w1] = np.asarray(rep["h_h"])
+                band_counts[:, w0:w1] = np.asarray(rep["band_counts"])
+                log_like_final[w0:w1] = np.asarray(rep["log_like_final"])
             if rep.get("band_dof") is not None:
                 self._band_dof = rep["band_dof"]
+        if _replica:
+            self._replica_merge_finish(
+                work, sub, replies_f, layout, _band_ranges)
         self._fstat_ctr_fallback_rows = fallback_rows
         # NOTE: ``rj_split`` / ``replace_census`` now ride back in the
         # replies (each rank stashes its census before the report site
@@ -18891,6 +19683,32 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # (engine) state mirrors it (``_write_back_state`` does this per
         # block on a rank, over its own slice)
         self._sync_cold_row(new_state)
+
+        # ---- command 4: gb_sync (replica mode only) -----------------------
+        # The merged branch above exists ONLY here, and no replica's residual
+        # reflects it yet (each rank reconciled per unit against what the
+        # others told it, and ``gb_finish`` skipped the authoritative
+        # rebuild). Ship it back to every rank: each one rebuilds its residual
+        # from it and reports the one-walker ``log_like`` / ``band_counts``
+        # and a hash of the rebuilt residual. The HEAD's reply is the one the
+        # state takes -- every rank computes the same thing from the same
+        # branch, and the hashes are the cross-check that says so.
+        #
+        # SKIPPED when a block is neutral: a neutral ``gb_run_proposal``
+        # returns before taking the propose's non-GB residual snapshot, so
+        # there is nothing to rebuild against (and nothing ran).
+        if _replica and not any(neutral[r] for r in layout.compute_ranks):
+            def _payload_sync(rank, w0, w1):
+                payload = _common(rank, w0, w1)
+                payload.update({
+                    "merged_state": slice_state(
+                        new_state, w0, w1, sub_states=[branch]),
+                })
+                return payload
+
+            replies_s, _ = self._fanout_cmd("gb_sync", _payload_sync, model)
+            self._replica_apply_sync(
+                replies_s, layout, log_like_final, band_counts)
 
         # The cap gate's statistic is an N-walker max, so it needs a row per
         # walker: concatenate the blocks on the walker axis.
@@ -20032,6 +20850,37 @@ class VGBSpecialStretchMove(GBSpecialBase):
     def _obs_eigen_mode(self) -> str:
         """``VGB_INMODEL_OBSERVABLE_EIGEN``: off (default) | axis | full."""
         return _vgb_observable_eigen_mode()
+
+    def _cold_source_freqs_hz(self, work):
+        """f0 (Hz) of every alive cold-row leaf, from the per-leaf transform fill.
+
+        VGB's f0 is a per-leaf FILL (never a sampled column), so it cannot be
+        read off ``work`` coordinates the way GB's sampled f0 can -- this
+        mirrors :meth:`BandSorter._source_freqs_hz` (gbbands.py) against the
+        branch's own transform container instead. ``work.inds`` is
+        ``(ntemps, nwalkers, nleaves_max)``; one-walker replica mode makes
+        ``work.inds[0, 0]`` the cold, single-walker alive mask.
+        """
+        tf = self.transform_fn
+        alive = np.asarray(work.inds[0, 0])
+        leaves = np.nonzero(alive)[0]
+        fill_keys = list(tf.original_fill_dict[0].keys())
+        f0_fill_mhz = np.asarray(tf.fill_dict["fill_values"])[:, fill_keys.index("f0")]
+        return f0_fill_mhz[leaves] / 1e3
+
+    def _replica_band_weights(self, work):
+        """Per-band weight = count of alive cold-row VGB sources in that band.
+
+        VGB has one band per catalogue source region rather than GB's
+        count-driven bands, so a plain by-band-count split (the GB default,
+        ``GBSpecialBase._replica_band_weights`` returning ``None``) would
+        not balance the actual per-replica proposal load; weight each band
+        by how many live sources fall in it instead.
+        """
+        f0 = self._cold_source_freqs_hz(work)
+        b = np.searchsorted(np.asarray(self.band_edges), f0, side="right") - 1
+        b = np.clip(b, 0, self.num_bands - 1)
+        return np.bincount(b, minlength=self.num_bands).astype(float)
 
     def _proposal_cholesky(self, model, band_sorter, ids, slots=None,
                            buffer_obj=None):
