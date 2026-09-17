@@ -116,8 +116,7 @@ class WalkerBlockLayout:
         """
         w = int(w)
         if not (0 <= w < int(self.nwalkers)):
-            raise ValueError(
-                f"walker {w} is outside [0, {int(self.nwalkers)})")
+            raise ValueError(f"walker {w} is outside [0, {int(self.nwalkers)})")
         rank = self.compute_ranks[w // int(self.block)]
         w0, _w1 = self.block_of(rank)
         return int(rank), w - int(w0)

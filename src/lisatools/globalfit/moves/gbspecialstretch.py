@@ -4545,7 +4545,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         ``_fstat_reference_walker`` picks today, with the same local index.
         """
         fanout = getattr(self, "fanout", None)
-        if fanout is None:
+        if fanout is None or not fanout.is_head:
+            # No fan-out object at all (``_propose_legacy``, the
+            # single-process ``fit.sample()`` path), or a caller that is not
+            # the head: ``WalkerFanout.run`` -- which ``gather_likelihood``
+            # is built on -- is head-only and raises ``RuntimeError`` on a
+            # non-head caller (fanout.py:166), so both cases fall back to
+            # the local ranking. There is no layout to consult in either
+            # case, so ``owner_rank=0`` below is a fixed convention, not a
+            # derived value -- a caller with no fan-out (or that is not the
+            # head) has no per-rank ACA row of its own to report.
             w = self._fstat_reference_walker(model)
             return int(w), 0, int(w), np.full(1, np.nan)
         try:
@@ -4554,11 +4563,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             w_global = int(np.argmax(lls))
         except Exception as exc:
             # Never silent: a broken ranking here quietly pins every F-stat
-            # reference to walker 0 for the whole run.
+            # reference to walker 0 for the whole run. The owner of walker 0
+            # is ``layout.owner_of(0)`` -- whichever rank holds block 0 --
+            # NOT ``layout.head_rank``: those differ whenever ``main_rank``
+            # is non-zero (a public ``StockGlobalFit`` constructor knob), so
+            # deriving it keeps this fallback correct off the ``main_rank=0``
+            # path every in-tree run takes today. ``exc_info=True`` keeps a
+            # remote worker's traceback (``RemoteWorkerError.remote_traceback``,
+            # fanout.py:51) from being swallowed behind the one-line ``%r``.
             logger.warning(
                 "%s: could not rank walkers for the F-stat reference (%r); "
-                "falling back to walker 0.", self.name, exc)
-            return 0, fanout.layout.head_rank, 0, np.full(1, np.nan)
+                "falling back to walker 0.", self.name, exc, exc_info=True)
+            return (0, *fanout.layout.owner_of(0), np.full(1, np.nan))
         owner, local = fanout.layout.owner_of(w_global)
         return w_global, int(owner), int(local), lls
 

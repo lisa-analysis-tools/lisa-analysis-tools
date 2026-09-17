@@ -592,15 +592,24 @@ class WriteStackedNpzValidationTest(unittest.TestCase):
         self.assertIn("group 1 grid has 2 box(es)", str(ctx.exception))
 
 
+def _build_fake_layout(nwalkers, n_compute):
+    """One head + ``n_compute`` compute ranks (a saver fills out the world)
+    over ``FakeWorld`` -- the same in-process, no-MPI stand-in ``ranks.py``
+    and ``fanout.py`` are unit-tested against elsewhere. Module-scope so both
+    :class:`OwnerOfTest` and :class:`GlobalReferenceTest` share it.
+    """
+    from lisatools.globalfit.communication import ranks as R
+    from lisatools.globalfit.communication.fakecomm import FakeWorld
+
+    world = FakeWorld(n_compute + 1)
+    out = world.run(lambda r, comm: R.build_layout(
+        comm, nwalkers, list(range(n_compute))))
+    return out[0]
+
+
 class OwnerOfTest(unittest.TestCase):
     def _layout(self, nwalkers, n_compute):
-        from lisatools.globalfit.communication import ranks as R
-        from lisatools.globalfit.communication.fakecomm import FakeWorld
-
-        world = FakeWorld(n_compute + 1)
-        out = world.run(lambda r, comm: R.build_layout(
-            comm, nwalkers, list(range(n_compute))))
-        return out[0]
+        return _build_fake_layout(nwalkers, n_compute)
 
     def test_maps_every_global_walker_to_its_rank_and_local_row(self):
         layout = self._layout(8, 2)
@@ -623,6 +632,109 @@ class OwnerOfTest(unittest.TestCase):
             layout.owner_of(4)
         with self.assertRaises(ValueError):
             layout.owner_of(-1)
+
+
+class _StubFanout:
+    """Head-side fake -- just enough of ``WalkerFanout`` for
+    ``_fstat_global_reference``: a ``layout``, an ``is_head`` flag, and
+    ``gather_likelihood`` returning a fixed per-walker vector (or raising,
+    to exercise the never-silent fallback).
+    """
+
+    def __init__(self, layout, lls, is_head=True, raises=None):
+        self.layout = layout
+        self.is_head = is_head
+        self._lls = lls
+        self._raises = raises
+
+    def gather_likelihood(self, acs):
+        if self._raises is not None:
+            raise self._raises
+        return np.asarray(self._lls, dtype=float)
+
+
+class _DummyModel:
+    """Stand-in ``model``: ``_StubFanout.gather_likelihood`` ignores ``acs``
+    entirely, but ``_fstat_global_reference`` still reads the attribute off
+    ``model`` before handing it to the fan-out."""
+
+    analysis_container_arr = None
+
+
+class GlobalReferenceTest(unittest.TestCase):
+    """``GBSpecialBase._fstat_global_reference`` -- the helper this task
+    exists to deliver -- as a pure head-side function: a bare instance via
+    ``__new__`` (skips the heavy GPU/eryn ``__init__``) paired with
+    :class:`_StubFanout`, covering all four of its branches.
+    """
+
+    def _move(self):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialBase.__new__(gbs.GBSpecialBase)
+        move.name = "gb_test"
+        return move
+
+    def test_multi_rank_global_argmax_is_not_the_heads_local_one(self):
+        """The max sits in the SECOND block (not the head's own, [0, 4)):
+        the defect this task fixes -- an argmax over the head's local block
+        only -- would pick an index below 4 here and fail every assertion
+        below."""
+        layout = _build_fake_layout(8, 2)
+        lls = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 50.0, 8.0]  # global max at 6
+        move = self._move()
+        move.fanout = _StubFanout(layout, lls)
+        w_global, owner_rank, local_index, lls_out = move._fstat_global_reference(
+            _DummyModel())
+        self.assertEqual(w_global, 6)
+        self.assertEqual(owner_rank, layout.compute_ranks[1])
+        w0, _w1 = layout.block_of(owner_rank)
+        self.assertEqual(local_index, 6 - w0)
+        np.testing.assert_array_equal(lls_out, lls)
+
+    def test_single_compute_rank_matches_todays_local_pick(self):
+        """The hard spec constraint: with ONE compute rank this must return
+        exactly what ``_fstat_reference_walker`` picks today, same local
+        index -- the path every current production run takes."""
+        layout = _build_fake_layout(6, 1)
+        lls = [3.0, 1.0, 4.0, 1.0, 5.0, 9.0]  # max at 5
+        move = self._move()
+        move.fanout = _StubFanout(layout, lls)
+        w_global, owner_rank, local_index, lls_out = move._fstat_global_reference(
+            _DummyModel())
+        self.assertEqual((w_global, owner_rank, local_index), (5, layout.head_rank, 5))
+        np.testing.assert_array_equal(lls_out, lls)
+
+    def test_no_fanout_delegates_to_the_local_reference_walker(self):
+        """``_propose_legacy`` / single-process ``fit.sample()``: no
+        ``fanout`` attribute at all -- must fall back to
+        ``_fstat_reference_walker`` and report the all-NaN length-1 ``lls``
+        the brief specifies for the fallback path."""
+        move = self._move()
+        move._fstat_reference_walker = lambda model: 3  # instance-only stub
+        w_global, owner_rank, local_index, lls = move._fstat_global_reference(
+            _DummyModel())
+        self.assertEqual((w_global, owner_rank, local_index), (3, 0, 3))
+        self.assertEqual(lls.size, 1)
+        self.assertTrue(np.isnan(lls).all())
+
+    def test_ranking_exception_falls_back_to_walker_0_with_a_warning(self):
+        """A broken collective must not fail silently (logs a WARNING) and
+        must not raise -- and must name walker 0's actual owner
+        (``layout.owner_of(0)``), not just ``layout.head_rank``."""
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        layout = _build_fake_layout(8, 2)
+        move = self._move()
+        move.fanout = _StubFanout(layout, lls=None, raises=RuntimeError("boom"))
+        with self.assertLogs(gbs.logger, level="WARNING") as captured:
+            w_global, owner_rank, local_index, lls = move._fstat_global_reference(
+                _DummyModel())
+        self.assertEqual(w_global, 0)
+        self.assertEqual((owner_rank, local_index), layout.owner_of(0))
+        self.assertEqual(lls.size, 1)
+        self.assertTrue(np.isnan(lls).all())
+        self.assertTrue(any("could not rank walkers" in line for line in captured.output))
 
 
 if __name__ == "__main__":
