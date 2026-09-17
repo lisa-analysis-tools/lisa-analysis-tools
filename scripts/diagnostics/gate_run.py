@@ -99,6 +99,9 @@ def main(argv=None):
                         help="do not inject the loud in-band GB (gb_no_fg synthetic then has no GB sources)")
     parser.add_argument("--campaign", default=CAMPAIGN_SCRIPT,
                         help="submit script whose sig-het exports are mirrored")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="override general.random_seed (the seed has no env knob); "
+                             "the campaign's different-seed sensitivity control")
     parser.add_argument("--print-only", action="store_true", help="print the pins and exit")
     args = parser.parse_args(argv)
 
@@ -114,6 +117,9 @@ def main(argv=None):
     from lisatools.globalfit.stock import erebor  # noqa: E402
 
     fit = erebor.get_stock(args.stock)
+    if args.seed is not None:
+        fit.general.random_seed = int(args.seed)
+        print(f"[GATE] random_seed={args.seed}", flush=True)
     if not args.no_injection and getattr(fit, "gb", None) is not None:
         fit.general.gb_injection_params = LOUD_INJECTION
         print(f"[GATE] loud GB injection: {LOUD_INJECTION[0]}", flush=True)
