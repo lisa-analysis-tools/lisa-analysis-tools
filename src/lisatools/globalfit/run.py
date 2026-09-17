@@ -787,6 +787,28 @@ class GlobalFit:
             truths=truths_plot,
         )
 
+    @staticmethod
+    def _read_stored_branch_ntemps(backend, branch_names, logger_=None) -> dict:
+        """``{branch: ntemps}`` from the store's sub-backend attrs.
+
+        A cheap attrs read (no chain load) of the rung count each branch's
+        sub-state was WRITTEN with. Missing branches / groups / attrs are
+        simply absent from the result; any failure returns what was read so
+        far (this only feeds the mid-iteration checkpoint gate, which then
+        falls back to the configured count). Never raises.
+        """
+        out = {}
+        try:
+            with backend.open("r") as f:
+                grp = f[backend.name]["sub_backend"]
+                for name in branch_names:
+                    if name in grp and "ntemps" in grp[name].attrs:
+                        out[str(name)] = int(grp[name].attrs["ntemps"])
+        except Exception as exc:  # noqa: BLE001 -- never block a resume
+            if logger_ is not None:
+                logger_.debug("stored branch ntemps attrs unreadable (%r)", exc)
+        return out
+
     def _branch_ntemps(self, name: str) -> int:
         """The branch's OWN tempering-ladder size (the engine is cold-chain only).
 
@@ -844,12 +866,25 @@ class GlobalFit:
                     continue
                 betas_all = getattr(sub, "betas_all", None)
                 if betas_all is not None:
-                    nt_branch = int(self._branch_ntemps(name))
+                    # The rung count the resume will ACTUALLY build at: the
+                    # store's own (recipe.resume_ladder_wins: the stored
+                    # ladder wins over {BRANCH}_NTEMPS on a resume), else the
+                    # configuration. Comparing to the configuration alone
+                    # rejected every checkpoint of a store born at 8 rungs
+                    # once the script went back to 12 (2026-09-17: seven
+                    # spot requeues in a row each restarted the iteration
+                    # from the HDF store, zero progress in nine hours).
+                    _stored_nt = (getattr(self, "_stored_branch_ntemps", None)
+                                  or {}).get(name)
+                    nt_branch = int(
+                        _stored_nt if _stored_nt else self._branch_ntemps(name)
+                    )
                     if np.asarray(betas_all).shape[-1] != nt_branch:
                         return False, (
                             f"branch {name!r} ladder has "
-                            f"{np.asarray(betas_all).shape[-1]} rungs; config "
-                            f"builds {nt_branch}"
+                            f"{np.asarray(betas_all).shape[-1]} rungs; the "
+                            f"resume builds {nt_branch} "
+                            f"({'store' if _stored_nt else 'config'})"
                         )
                 band_info = getattr(sub, "band_info", None)
                 if band_info and "band_edges" in band_info:
@@ -934,6 +969,15 @@ class GlobalFit:
         # the iteration the store never got to save. Config-incompatible or
         # unreadable checkpoints are moved aside and the normal resume paths
         # below take over (fail safe, never crash).
+        # The gate compares per-branch ladders against what the resume will
+        # BUILD, which for a resumed store is the store's own rung count
+        # (recipe.resume_ladder_wins), not the configured knob.
+        self._stored_branch_ntemps = (
+            self._read_stored_branch_ntemps(
+                backend, self.engine_info.branch_names, logger_=self.logger
+            )
+            if backend is not None and _stored_it > 0 else {}
+        )
         _ckpt = midit_checkpoint.load_for_resume(
             backend_path,
             _stored_it,

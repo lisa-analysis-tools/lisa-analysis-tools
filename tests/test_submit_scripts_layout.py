@@ -82,10 +82,15 @@ class SobbhKnobsSingleExportTest(unittest.TestCase):
         self.assertIn("walker_max", lines[0])
         self.assertNotIn("per_walker", lines[0])
 
-    def test_sobbh_ntemps_is_env_overridable(self):
-        lines = self._exports(SCRIPTS[0], "SOBBH_NTEMPS")
-        self.assertEqual(len(lines), 1, lines)
-        self.assertEqual(lines[0], "export SOBBH_NTEMPS=${SOBBH_NTEMPS:-12}")
+    def test_sobbh_ntemps_is_env_overridable_and_defaults_to_8(self):
+        # User ruling 2026-09-17: 8 in the scripts (the 4-GPU store is an
+        # 8-rung store; resumed 12-rung stores keep 12 via the store-wins
+        # rule). Both campaign scripts.
+        for path in SCRIPTS:
+            lines = self._exports(path, "SOBBH_NTEMPS")
+            self.assertEqual(len(lines), 1, f"{path}: {lines}")
+            self.assertEqual(
+                lines[0], "export SOBBH_NTEMPS=${SOBBH_NTEMPS:-8}", path)
 
 
 class SubmitScriptsSyntaxTest(unittest.TestCase):
