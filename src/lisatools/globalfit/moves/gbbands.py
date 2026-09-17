@@ -923,7 +923,7 @@ class _ShardHolderView:
         return getattr(self._parent, name)
 
 
-class _FStatRefRowHolder:
+class FStatRefRowHolder:
     """One-slab wdm_holder replica feeding one device's sig-het F-stat lane.
 
     ``GBSignalHetComputations.setup_fstat_references`` consumes exactly
@@ -933,7 +933,9 @@ class _FStatRefRowHolder:
     lane needs only the ONE reference walker's residual + inverse-PSD rows,
     copied onto its device once at adapter build (host-routed, no P2P) and
     presented as a single-slab holder scored with ``data_index=0``.
-    Private to :meth:`_RoutedBandEngine._sighet_fstat_multidevice`;
+    Public because the multi-rank F-stat fit builds one on EVERY compute
+    rank from the reference walker's broadcast row pair (design spec
+    2026-09-16, decision 2) -- not only the in-process multi-device lanes.
     ``device`` / ``gpus`` / ``__len__`` mirror :class:`_ShardHolderView` so
     the router's replica plumbing (``_comp_for``) accepts it as a view.
     Lives only in the returned ``call_fstat`` closure -- it dies with the
@@ -965,6 +967,10 @@ class _FStatRefRowHolder:
         return getattr(self._parent, name)
 
 
+#: Back-compat alias: the class was private until the multi-rank F-stat fit.
+_FStatRefRowHolder = FStatRefRowHolder
+
+
 #: Depth guard for the ``_parent`` walk in :func:`_parity_target` (today's
 #: deepest chain is one hop: view -> buffer).
 _PARITY_CHAIN_MAX_DEPTH = 8
@@ -976,7 +982,7 @@ def _parity_target(holder):
     The gate (``GB_PSD_MIRROR_PARITY_PROPOSES``) lives on the
     :class:`SubBandBuffer` that binds the mirror, but the engine calls it is
     meant to shadow-score arrive at the router through VIEWS
-    (:class:`_ShardHolderView`, :class:`_FStatRefRowHolder`,
+    (:class:`_ShardHolderView`, :class:`FStatRefRowHolder`,
     :class:`_PsdParityHolder`) that carry no gate of their own -- so a bare
     ``getattr(holder, "_psd_mirror_parity_check", None)`` finds nothing and
     the check silently never runs. That was the measured coverage gap: on the
@@ -995,7 +1001,7 @@ def _parity_target(holder):
     ``self.psd_buffer[...]`` and ``_get_fill_buffer_ind_map(..., is_psd=True)``
     with GLOBAL slots, while a ``_ShardHolderView`` hands the engines
     INTRA-shard rows. A hop that re-indexes rows without publishing the map
-    (``_FStatRefRowHolder``, whose single row is a device-local COPY, or
+    (``FStatRefRowHolder``, whose single row is a device-local COPY, or
     ``_PsdParityHolder``) is refused rather than translated wrongly: the gate
     logs that it skipped instead of comparing the wrong slots.
     """
@@ -1069,6 +1075,53 @@ def _fire_psd_mirror_parity(holder, entry, params_phys, data_index,
     if getattr(p, "ndim", 2) == 1:
         p = p[None]
     buf._psd_mirror_parity_check(entry, p, di, ni, **check_kwargs)
+
+
+def snapshot_ref_rows(holder, view, intra_data, intra_noise, *, xp,
+                      device=None):
+    """Host COPIES of one walker's residual row and inverse-PSD row.
+
+    Slice the walker's rows ON the owning device and host only the rows --
+    ``asnumpy`` of the whole shard buffer would round-trip every walker.
+    ``view`` is the shard (or the holder itself for a single-shard ACA) and
+    ``intra_data`` / ``intra_noise`` are INTRA-shard row indices.
+
+    Factored out of :meth:`_RoutedBandEngine._sighet_fstat_multidevice` so
+    the multi-rank fit's owner rank ships exactly the rows the in-process
+    multi-device lanes replicate -- one extraction, one set of layout
+    assumptions.
+    """
+    n_slabs = int(view.acs_total_entries)
+    dev = getattr(view, "device", None) if device is None else device
+    with device_context(holder.xp, dev):
+        data_row_host = np.ascontiguousarray(asnumpy(
+            xp.asarray(view.linear_data_arr[0]).reshape(
+                n_slabs, -1)[int(intra_data)]))
+        _prow = getattr(view, "psd_row_index", None)
+        if _prow is not None:
+            # Shared-psd mirror: linear_psd_arr[0] is the parent's
+            # per-walker FULL-BAND plane; the slot's row is the map entry
+            # (only reachable for a full-band buffer in mirror mode -- the
+            # production F-stat holders are the parent ACA). One psd row =
+            # prod(shape_sens) x (Nf_active x Nt_active) = prod(shape_sens)
+            # x (data row size / nchannels).
+            _plane = xp.asarray(view.linear_psd_arr[0])
+            _row = int(np.asarray(asnumpy(_prow))[int(intra_noise)])
+            _per_row = (int(np.prod(holder.shape_sens))
+                        * (int(data_row_host.size) // int(holder.nchannels)))
+            _n_rows = int(_plane.size) // _per_row
+            if _n_rows * _per_row != int(_plane.size) or _row >= _n_rows:
+                raise RuntimeError(
+                    "sig-het F-stat: mirror plane / row map mismatch "
+                    f"(plane {int(_plane.size)} elements, per row {_per_row}, "
+                    f"row {_row})")
+            psd_row_host = np.ascontiguousarray(asnumpy(
+                _plane.reshape(_n_rows, -1)[_row]))
+        else:
+            psd_row_host = np.ascontiguousarray(asnumpy(
+                xp.asarray(view.linear_psd_arr[0]).reshape(
+                    n_slabs, -1)[int(intra_noise)]))
+    return data_row_host, psd_row_host
 
 
 class _RoutedBandEngine:
@@ -2346,43 +2399,14 @@ class _RoutedBandEngine:
         """
         from ...sampling.fstat_gridfit import build_sighet_call_fstat
 
-        n_slabs = int(view.acs_total_entries)
-        # Slice the walker's rows ON the owning device, host only the rows
-        # (asnumpy of the whole shard buffer would round-trip every walker).
-        with device_context(holder.xp, view.device):
-            data_row_host = np.ascontiguousarray(asnumpy(
-                xp.asarray(view.linear_data_arr[0]).reshape(
-                    n_slabs, -1)[int(intra_data)]))
-            _prow = getattr(view, "psd_row_index", None)
-            if _prow is not None:
-                # Shared-psd mirror: linear_psd_arr[0] is the parent's
-                # per-walker FULL-BAND plane; the slot's row is the map
-                # entry (only reachable for a full-band buffer in mirror
-                # mode -- the production F-stat holders are the parent ACA).
-                # One psd row = prod(shape_sens) x (Nf_active x Nt_active)
-                # = prod(shape_sens) x (data row size / nchannels).
-                _plane = xp.asarray(view.linear_psd_arr[0])
-                _row = int(np.asarray(asnumpy(_prow))[int(intra_noise)])
-                _per_row = (int(np.prod(holder.shape_sens))
-                            * (int(data_row_host.size) // int(holder.nchannels)))
-                _n_rows = int(_plane.size) // _per_row
-                if _n_rows * _per_row != int(_plane.size) or _row >= _n_rows:
-                    raise RuntimeError(
-                        "sig-het F-stat: mirror plane / row map mismatch "
-                        f"(plane {int(_plane.size)} elements, per row {_per_row}, "
-                        f"row {_row})")
-                psd_row_host = np.ascontiguousarray(asnumpy(
-                    _plane.reshape(_n_rows, -1)[_row]))
-            else:
-                psd_row_host = np.ascontiguousarray(asnumpy(
-                    xp.asarray(view.linear_psd_arr[0]).reshape(
-                        n_slabs, -1)[int(intra_noise)]))
+        data_row_host, psd_row_host = snapshot_ref_rows(
+            holder, view, intra_data, intra_noise, xp=xp)
 
         lanes = []
         lane_comps = []
         for dev in [int(g) for g in holder.gpus]:
             with device_context(holder.xp, dev):
-                ref_holder = _FStatRefRowHolder(
+                ref_holder = FStatRefRowHolder(
                     holder, dev,
                     xp.asarray(data_row_host), xp.asarray(psd_row_host))
             comp_d = cls._comp_for(comp, holder, ref_holder)
@@ -2560,7 +2584,7 @@ class _RoutedBandEngine:
         lanes = []
         for dev in [int(g) for g in holder.gpus]:
             with device_context(holder.xp, dev):
-                ref_holder = _FStatRefRowHolder(
+                ref_holder = FStatRefRowHolder(
                     holder, dev,
                     xp.asarray(data_row_host), xp.asarray(psd_row_host))
             lanes.append((dev, cls._comp_for(comp, holder, ref_holder),
