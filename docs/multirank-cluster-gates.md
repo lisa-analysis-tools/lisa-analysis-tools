@@ -432,8 +432,10 @@ one-walker replica mode's) plus three non-session F-stat ops the head issues
 from `setup()`, before any session exists: `gb_fstat_ref_row` (replicate the
 global reference walker's residual + inverse-PSD row to every rank),
 `gb_fstat_stage_b` (one command per Mc group, contiguous box ranges), and
-`gb_fstat_release` (drop the replicated row and its cached sig-het scorer on
-every worker once the epoch's artifacts are written).
+`gb_fstat_release` (drop the replicated row, the cached sig-het scorer AND
+the scorer's reference blocks on the GB comp — `gb_wdm_comp._fstat`, the ~GB
+half — on every worker once the epoch's artifacts are written, then free the
+memory pool).
 
 What to collect from the head's `globalfit_run.log`:
 
@@ -450,6 +452,17 @@ What to collect from the head's `globalfit_run.log`:
    argmax moved re-selects peaks from the OLD walker's comb scan. This is a
    proposal-quality risk, not a correctness one: stage B is still scored
    against the new reference row and is itself correctly invalidated.
+   **Budget ONE extra sweep on the first relaunch after this branch lands.**
+   Appending `|wref=<w>` changed the salt, so every checkpoint a pre-branch
+   process left IN FLIGHT is invalid once — even when the reference walker
+   has not moved. Per epoch: a **complete** `*_peaks_stacked.npz`
+   short-circuits before anything else and pays nothing; a **complete comb
+   with an in-flight stage B** keeps the comb (existence-only reload) and
+   re-sweeps stage B from zero, up to the full 1 h 45 min measured at 6mo;
+   an **in-flight comb** re-scans the comb too. It happens on the first
+   relaunch and never again. If that is unacceptable for the relaunch
+   window, land the branch at an iteration boundary where no epoch is
+   mid-fit.
 2. `F-stat reference row replicated to <n> rank(s) ... <X> MB residual +
    <Y> MB invC per rank` — at 6mo expect roughly 18 MB and 54 MB.
    A wildly different size means `Nf_active` is not what the design assumed;
@@ -471,19 +484,36 @@ What to collect from the head's `globalfit_run.log`:
    the per-rank partial-`.npy` I/O through the shared epoch directory.
 6. `F-stat reference row released on <n> of <n> worker rank(s); the head
    keeps its own until the centre table is built.` — issued right after the
-   epoch's `.npz` + `DONE.json` are written and flushed. A release failure
-   (`gb_fstat_release failed after epoch <k> was written`) is logged as a
-   WARNING and is never fatal — the epoch is already on disk, and a worker
-   that kept its row loses it at the next `gb_fstat_ref_row` regardless.
+   epoch's `.npz` + `DONE.json` are written and flushed. What each worker
+   actually gives back: the replicated row (~72 MB), the scorer closure, the
+   sig-het REFERENCE BLOCKS on its GB comp (`clear_fstat_references`; the
+   expensive half, and the one a dropped closure does not own), then
+   `free_all_blocks()`. **Watch a worker's `nvidia-smi` across the
+   ~50-iteration window after epoch 1 and record the step down** — the
+   block's "~GB" is an unmeasured estimate and that number belongs here. A
+   release failure (`gb_fstat_release failed after epoch <k> was written`)
+   is logged as a WARNING and is never fatal — the epoch is already on disk,
+   and a worker that kept its row loses it at the next `gb_fstat_ref_row`
+   regardless.
 
 At `n_compute == 1` (single rank, no fan-out) the serial path runs exactly
 as it did before the parallel-fit change, golden-gated to a byte-identical
-npz — none of the above fires; there is nothing to collect.
+npz — none of the above fires; there is nothing to collect. Byte-identical
+is not cost-identical, though: the reference-row body still runs in process,
+so expect **+72 MB resident** (the two rows are hosted as copies and put
+back on the device) and one host round trip per fit, and on a multi-GPU
+single-rank box the sweep now runs on `acs.gpus[0]` (the holder's device)
+rather than on the shard that owns `walker_ref`. No disk round trip and no
+collective, as designed.
 
 If a one-walker-replica run (`NWALKERS=1` on several compute ranks) hits
 this refit, the same three ops fire: every rank's block is `(0, 1)`, the
-reference walker's owner is the HEAD, and stage B splits over the replicas
-exactly like walker blocks — read the log the same way. Run this step's
+reference walker's owner is `compute_ranks[0]` — the HEAD under the default
+`main_rank=0`; with a non-zero `main_rank` `resolve_roles` orders the
+compute ranks by world rank, so `compute_ranks[0]` is a worker and the
+`Bcast` root is that worker (correct either way: every replica holds the
+same walker at local row 0) — and stage B splits over the replicas exactly
+like walker blocks — read the log the same way. Run this step's
 epoch-1 verification in the SAME allocation as the one-walker campaign's
 `docs/one-walker-testing-campaign.md` T5 scaling gate: both need a
 multi-node GPU allocation, and there is no reason to request two.
@@ -504,7 +534,11 @@ Failure modes to watch for:
   rank/range map mismatch; check that every rank sees the same
   `n_compute`.
 - A rank dying mid-sweep aborts the run as for any op; the per-rank
-  checkpoints (`<epoch>/fstat_grid_parts/stageb_g*_r*.progress.npz`) make
+  checkpoints (`<epoch>/fstat_grid_parts/stageb_g*_r*.progress.npz`, or
+  `stageb_r*.progress.npz` with a SINGLE Mc group — `FSTAT_MC_GROUPING=0`
+  or a band set narrow enough to make one group, where the legacy `stageb`
+  prefix is preserved deliberately; the production 6mo fit has six groups
+  and the head's `ckpt_clear(_parts, "stageb")` catches both by prefix) make
   the retry cheap AS LONG AS the relaunch uses the same `n_compute`. A
   changed rank count restarts each group cleanly — correct, but it pays the
   whole sweep again.
