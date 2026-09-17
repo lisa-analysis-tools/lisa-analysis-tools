@@ -100,7 +100,7 @@ Pass: the replica layout header identical on all three ranks; rank 1 on the othe
 
 ### T1 — first real one-walker run, GB only, across the two nodes (≈10-20 min)
 
-**Record 2026-09-17:** two-node run with the gate driver completed 4 iterations in ~75 s; no lnL-guard warning; the `mpiexec -n 1` control reproduced the same `[GB_INFOMAT]`/`[GB_CELL_LL]` warnings at the same magnitudes → both pre-existing. Digest + 8-walker regression control still to record.
+**Record 2026-09-17:** two-node run with the gate driver completed 4 iterations in ~75 s; no lnL-guard warning; the `mpiexec -n 1` control reproduced the same `[GB_INFOMAT]`/`[GB_CELL_LL]` warnings at the same magnitudes → both pre-existing. Digest (06:39 attempt): 20 peaks, leaves 0->33, all four GB ops served by rank 1 (rank 9.2 s vs head 8.6 s, wait 0), 0 lnL-guard warnings, 0 deferred rebuilds, residual hashes disagree on all 4 iterations (GPU, INFO) -> **T1 PASSED** (stock sig-het defaults on both sides). 8-walker regression control still to record.
 
 ```sh
 FILE_STORE_DIR=$G/T1/ NUM_ITERATIONS=4 GPUS=0 timeout 3600 mpiexec -n 3 -ppn 1 \
