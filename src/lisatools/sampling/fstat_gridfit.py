@@ -27,6 +27,7 @@ inherits the offline knob set unchanged.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 import os
@@ -48,6 +49,9 @@ __all__ = [
     "select_comb_peaks",
     "run_comb_scan",
     "run_stacked_peak_sweep",
+    "StageBGroupSpec",
+    "run_stage_b_group",
+    "write_stacked_npz",
     "run_stacked_stage_b",
     "run_fstat_grid_fit",
     "build_gb_birth_distribution",
@@ -960,6 +964,122 @@ def run_stacked_peak_sweep(call_fstat: Callable, f0_los, f0_dxs, mc_ax,
     return F_flat.reshape(node_shape)
 
 
+@dataclasses.dataclass(frozen=True)
+class StageBGroupSpec:
+    """Everything one stage-B Mc group's sweep needs, as host arrays.
+
+    The unit the parallel fit ships and slices. ``a``/``b`` are ABSOLUTE box
+    indices into the f0-sorted global box order, so a sub-range is addressed
+    in the same coordinates the assembled grid is concatenated in (box is
+    the SLOWEST axis of ``node_shape``, :func:`run_stacked_peak_sweep`).
+
+    Everything except ``f0_los``/``f0_dxs``/``node_shape[0]`` is group-wide
+    and is NEVER sliced: the Mc/alpha/sin-delta axes, the basis flag and the
+    shear coefficient define what a row MEANS, and a rank that sliced them
+    would score a different physical template while reporting the same box.
+    """
+
+    gi: int
+    n_groups: int
+    a: int
+    b: int
+    f0_los: np.ndarray
+    f0_dxs: np.ndarray
+    mc_ax: np.ndarray
+    alpha_ax: np.ndarray
+    sd_ax: np.ndarray
+    node_shape: tuple
+    ckpt_name: Optional[str]
+    parts_dir: Optional[str]
+    fingerprint_extra: str
+    fdot_axis: bool
+    c_t: float
+
+    @property
+    def n_boxes(self) -> int:
+        return int(self.b) - int(self.a)
+
+    def sub_range(self, a2, b2, *, ckpt_name=None) -> "StageBGroupSpec":
+        """This group restricted to ABSOLUTE boxes ``[a2, b2)``.
+
+        ``ckpt_name`` must differ per rank: the sweep's fingerprint hashes
+        the SLICED inputs plus ``node_shape``, so two ranks' checkpoints are
+        already mutually invalid -- but they must not collide on one path.
+        """
+        a2, b2 = int(a2), int(b2)
+        if not (self.a <= a2 <= b2 <= self.b):
+            raise ValueError(
+                f"sub_range({a2}, {b2}) is outside group {self.gi}'s "
+                f"box range [{self.a}, {self.b})")
+        i0, i1 = a2 - int(self.a), b2 - int(self.a)
+        return dataclasses.replace(
+            self,
+            a=a2,
+            b=b2,
+            f0_los=np.ascontiguousarray(self.f0_los[i0:i1]),
+            f0_dxs=np.ascontiguousarray(self.f0_dxs[i0:i1]),
+            node_shape=(i1 - i0,) + tuple(self.node_shape[1:]),
+            ckpt_name=(self.ckpt_name if ckpt_name is None else ckpt_name),
+        )
+
+
+def run_stage_b_group(spec: StageBGroupSpec, call_fstat: Callable, *, xp):
+    """Sweep ONE stage-B group (or one rank's box range of it).
+
+    The single entry point both the serial fit and every compute rank use,
+    so a split can never diverge from the serial code by construction. An
+    EMPTY range (more ranks than boxes) short-circuits: the sweep's
+    checkpoint layer is not defined at ``n_total == 0``, and there is
+    nothing to score.
+    """
+    if int(spec.node_shape[0]) == 0:
+        return xp.empty(tuple(spec.node_shape), dtype=xp.float64)
+    ckpt = (os.path.join(spec.parts_dir, spec.ckpt_name)
+            if (spec.parts_dir and spec.ckpt_name) else None)
+    return run_stacked_peak_sweep(
+        call_fstat, spec.f0_los, spec.f0_dxs, spec.mc_ax, spec.alpha_ax,
+        spec.sd_ax, spec.node_shape, xp=xp, ckpt=ckpt,
+        fingerprint_extra=spec.fingerprint_extra,
+        fdot_axis=spec.fdot_axis, c_t=spec.c_t)
+
+
+def write_stacked_npz(stacked_path, *, grids_g, mc_ax_g, f0_los, f0_dxs,
+                      alpha_ax, sd_ax, grid_basis, grid_c_t, peaks,
+                      band_idx, band_edges_mHz, band_edges_hz,
+                      group_sizes=None):
+    """Write the stage-B cache. ``group_sizes=None`` = the LEGACY 1-group keys.
+
+    Factored out of :func:`run_stacked_stage_b` so the parallel fit's head,
+    which assembles each group from per-rank partials, writes through the
+    SAME code -- the loader (``fstat_proposal.stacked_from_cache``)
+    dispatches on ``"logp_grids" in keys``, so the two formats are not
+    interchangeable and must never be produced by two separate writers.
+    """
+    os.makedirs(os.path.dirname(stacked_path), exist_ok=True)
+    common = dict(
+        f0_los=f0_los, f0_dxs=f0_dxs, alpha_ax=alpha_ax, sin_delta_ax=sd_ax,
+        # THE BASIS IS PART OF THE CACHE. Axis 2's VALUES differ between the
+        # two meanings, but a consumer that reads them as chirp masses when
+        # they are Hz/s gets no error at all -- just births at absurd
+        # parameters. Stamp it, and refuse a mismatch on load.
+        grid_basis=grid_basis, grid_c_t=float(grid_c_t),
+        peak_f0_mHz=peaks[:, 0], peak_F=peaks[:, 1], band_idx=band_idx,
+        band_f0_lo=band_edges_mHz[band_idx],
+        band_f0_hi=band_edges_mHz[band_idx + 1],
+        band_edges=np.asarray(band_edges_hz, dtype=float),
+    )
+    if group_sizes is None:
+        np.savez(stacked_path, logp_grids=_to_host(grids_g[0]),
+                 mc_ax=mc_ax_g[0], **common)
+        return
+    group_arrays = {}
+    for gi in range(len(grids_g)):
+        group_arrays[f"logp_grids_g{gi}"] = _to_host(grids_g[gi])
+        group_arrays[f"mc_ax_g{gi}"] = mc_ax_g[gi]
+    np.savez(stacked_path, group_sizes=np.asarray(group_sizes, dtype=int),
+             **common, **group_arrays)
+
+
 def mc_ladder_levels(n_req):
     """Doubling-ladder quantization of per-box Mc-node requirements.
 
@@ -986,7 +1106,8 @@ def mc_ladder_levels(n_req):
 def run_stacked_stage_b(call_fstat: Callable, peaks, *, xp, Tobs: float,
                         band_edges_hz, mc_lims, ratio_max=None,
                         cache_path: Optional[str] = None,
-                        fingerprint_extra: str = "", epoch=None):
+                        fingerprint_extra: str = "", epoch=None,
+                        sweep_runner=None):
     """Stage B: clamped boxes -> batched sweep(s) -> stacked grids.
 
     Assemble (host, cheap): every selected peak's 4-D box with its f0 range
@@ -1000,6 +1121,15 @@ def run_stacked_stage_b(call_fstat: Callable, peaks, *, xp, Tobs: float,
     :class:`GroupedStackedFStatProposal` (exact mixture equivalence) and
     the grouped npz format. ``FSTAT_MC_GROUPING=0`` restores the one
     max-f0-sized stack.
+
+    ``sweep_runner`` replaces the per-group kernel stream with
+    ``runner(spec, call_fstat, xp=xp) -> grid`` (``spec`` is a
+    :class:`StageBGroupSpec`). ``None`` is the serial path,
+    :func:`run_stage_b_group`, and is byte-identical to the historical
+    code. The multi-rank fit passes a runner that splits the group by
+    contiguous box range across the compute ranks and concatenates the
+    partials -- box is the SLOWEST axis, so concatenation on axis 0 in box
+    order reproduces the whole-group sweep exactly.
 
     Returns the live proposal (or ``None`` if no peaks).
     """
@@ -1165,13 +1295,16 @@ def run_stacked_stage_b(call_fstat: Callable, peaks, *, xp, Tobs: float,
         # single group keeps the historical "stageb" checkpoint name so
         # in-flight fits resume across this code change.
         _ck = "stageb" if n_groups == 1 else f"stageb_g{gi}"
-        grids_g.append(run_stacked_peak_sweep(
-            call_fstat, f0_los[a:b], f0_dxs[a:b], mc_ax, alpha_ax, sd_ax,
-            node_shape, xp=xp,
-            ckpt=os.path.join(_parts, _ck) if _parts else None,
+        spec = StageBGroupSpec(
+            gi=gi, n_groups=n_groups, a=a, b=b,
+            f0_los=f0_los[a:b], f0_dxs=f0_dxs[a:b], mc_ax=mc_ax,
+            alpha_ax=alpha_ax, sd_ax=sd_ax, node_shape=node_shape,
+            ckpt_name=_ck, parts_dir=_parts,
             fingerprint_extra=fingerprint_extra,
             fdot_axis=_fdot_axis, c_t=_c_t,
-        ))  # beta = 1: logp = F
+        )
+        runner = sweep_runner if sweep_runner is not None else run_stage_b_group
+        grids_g.append(runner(spec, call_fstat, xp=xp))  # beta = 1: logp = F
         mc_ax_g.append(mc_ax)
         n_mc_g.append(n_Mc)
 
@@ -1182,25 +1315,13 @@ def run_stacked_stage_b(call_fstat: Callable, peaks, *, xp, Tobs: float,
         )
         if cache_path:
             stacked_path = cache_path.replace(".npz", "_peaks_stacked.npz")
-            os.makedirs(os.path.dirname(stacked_path), exist_ok=True)
-            np.savez(
-                stacked_path,
-                logp_grids=_to_host(grids_g[0]), f0_los=f0_los,
-                f0_dxs=f0_dxs, mc_ax=mc_ax_g[0], alpha_ax=alpha_ax,
-                sin_delta_ax=sd_ax,
-                # THE BASIS IS PART OF THE CACHE. Axis 2's VALUES differ
-                # between the two meanings, but a consumer that reads them
-                # as chirp masses when they are Hz/s gets no error at all --
-                # just births at absurd parameters. Stamp it, and refuse a
-                # mismatch on load.
+            write_stacked_npz(
+                stacked_path, grids_g=grids_g, mc_ax_g=mc_ax_g,
+                f0_los=f0_los, f0_dxs=f0_dxs, alpha_ax=alpha_ax, sd_ax=sd_ax,
                 grid_basis=("fdot" if _fdot_axis else "Mc"),
-                grid_c_t=float(_c_t if _fdot_axis else 0.0),
-                peak_f0_mHz=peaks[:, 0], peak_F=peaks[:, 1],
-                band_idx=band_idx,
-                band_f0_lo=band_edges_mHz[band_idx],
-                band_f0_hi=band_edges_mHz[band_idx + 1],
-                band_edges=np.asarray(band_edges_hz, dtype=float),
-            )
+                grid_c_t=(_c_t if _fdot_axis else 0.0), peaks=peaks,
+                band_idx=band_idx, band_edges_mHz=band_edges_mHz,
+                band_edges_hz=band_edges_hz, group_sizes=None)
             logger.info("[cache] wrote %s", stacked_path)
             ckpt_clear(_parts, "stageb")
         return stacked
@@ -1225,25 +1346,14 @@ def run_stacked_stage_b(call_fstat: Callable, peaks, *, xp, Tobs: float,
 
     if cache_path:
         stacked_path = cache_path.replace(".npz", "_peaks_stacked.npz")
-        os.makedirs(os.path.dirname(stacked_path), exist_ok=True)
-        group_arrays = {}
-        for gi in range(n_groups):
-            group_arrays[f"logp_grids_g{gi}"] = _to_host(grids_g[gi])
-            group_arrays[f"mc_ax_g{gi}"] = mc_ax_g[gi]
-        np.savez(
-            stacked_path,
-            group_sizes=_sizes, f0_los=f0_los, f0_dxs=f0_dxs,
-            alpha_ax=alpha_ax, sin_delta_ax=sd_ax,
+        write_stacked_npz(
+            stacked_path, grids_g=grids_g, mc_ax_g=mc_ax_g,
+            f0_los=f0_los, f0_dxs=f0_dxs, alpha_ax=alpha_ax, sd_ax=sd_ax,
             grid_basis=("fdot" if _fdot_axis else "Mc"),
-            grid_c_t=float(_c_t if _fdot_axis else 0.0),
-            peak_f0_mHz=peaks[:, 0], peak_F=peaks[:, 1], band_idx=band_idx,
-            band_f0_lo=band_edges_mHz[band_idx],
-            band_f0_hi=band_edges_mHz[band_idx + 1],
-            band_edges=np.asarray(band_edges_hz, dtype=float),
-            **group_arrays,
-        )
-        logger.info("[cache] wrote %s (%d Mc groups)", stacked_path,
-                    n_groups)
+            grid_c_t=(_c_t if _fdot_axis else 0.0), peaks=peaks,
+            band_idx=band_idx, band_edges_mHz=band_edges_mHz,
+            band_edges_hz=band_edges_hz, group_sizes=_sizes)
+        logger.info("[cache] wrote %s (%d Mc groups)", stacked_path, n_groups)
         ckpt_clear(_parts, "stageb")
     return stacked
 

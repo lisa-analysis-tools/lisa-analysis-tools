@@ -272,5 +272,77 @@ class GoldenSerialStageBTest(unittest.TestCase):
                             f"mis-ordered along it would pass the gate")
 
 
+class SweepRunnerInjectionTest(unittest.TestCase):
+    """``sweep_runner`` sees one spec per group and may return any grid."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def test_default_runner_is_the_serial_path(self):
+        seen = []
+
+        def runner(spec, call_fstat, *, xp):
+            seen.append(spec)
+            return G.run_stage_b_group(spec, call_fstat, xp=xp)
+
+        got = run_golden(self.d, grouped=True, sweep_runner=runner)
+        assert_npz_identical(self, got, GOLDEN_GROUPED)
+        self.assertGreaterEqual(len(seen), 2, "one spec per Mc group")
+        for gi, spec in enumerate(seen):
+            self.assertEqual(spec.gi, gi)
+            self.assertEqual(spec.n_boxes, spec.b - spec.a)
+            self.assertEqual(spec.node_shape[0], spec.n_boxes)
+            self.assertEqual(len(spec.f0_los), spec.n_boxes)
+            self.assertEqual(len(spec.f0_dxs), spec.n_boxes)
+
+    def test_sub_range_slices_boxes_and_renames_the_checkpoint(self):
+        seen = []
+
+        def runner(spec, call_fstat, *, xp):
+            seen.append(spec)
+            return G.run_stage_b_group(spec, call_fstat, xp=xp)
+
+        run_golden(self.d, grouped=True, sweep_runner=runner)
+        spec = seen[0]
+        if spec.n_boxes < 2:
+            self.skipTest("first group has a single box")
+        mid = spec.a + spec.n_boxes // 2
+        left = spec.sub_range(spec.a, mid, ckpt_name="stageb_g0_r0")
+        right = spec.sub_range(mid, spec.b, ckpt_name="stageb_g0_r1")
+        self.assertEqual(left.n_boxes + right.n_boxes, spec.n_boxes)
+        self.assertEqual(left.node_shape, (left.n_boxes,) + tuple(spec.node_shape[1:]))
+        np.testing.assert_array_equal(
+            np.concatenate([left.f0_los, right.f0_los]), spec.f0_los)
+        np.testing.assert_array_equal(
+            np.concatenate([left.f0_dxs, right.f0_dxs]), spec.f0_dxs)
+        self.assertEqual(left.ckpt_name, "stageb_g0_r0")
+        # the axes and the basis are group-wide, never sliced
+        np.testing.assert_array_equal(left.mc_ax, spec.mc_ax)
+        np.testing.assert_array_equal(right.alpha_ax, spec.alpha_ax)
+        self.assertEqual(left.c_t, spec.c_t)
+        self.assertEqual(right.fdot_axis, spec.fdot_axis)
+
+    def test_split_sweeps_reassemble_bit_identically(self):
+        """Two half-range sweeps concatenated == the whole-group sweep."""
+        def runner(spec, call_fstat, *, xp):
+            if spec.n_boxes < 2:
+                return G.run_stage_b_group(spec, call_fstat, xp=xp)
+            mid = spec.a + spec.n_boxes // 2
+            parts = [
+                G.run_stage_b_group(
+                    spec.sub_range(lo, hi, ckpt_name=f"{spec.ckpt_name}_r{i}"),
+                    call_fstat, xp=xp)
+                for i, (lo, hi) in enumerate(
+                    ((spec.a, mid), (mid, spec.b)))
+            ]
+            return np.concatenate(parts, axis=0)
+
+        got = run_golden(self.d, grouped=True, sweep_runner=runner)
+        assert_npz_identical(self, got, GOLDEN_GROUPED)
+
+
 if __name__ == "__main__":
     unittest.main()
