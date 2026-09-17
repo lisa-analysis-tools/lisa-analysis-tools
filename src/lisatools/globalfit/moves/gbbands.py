@@ -1087,9 +1087,17 @@ def snapshot_ref_rows(holder, view, intra_data, intra_noise, *, xp,
     ``intra_data`` / ``intra_noise`` are INTRA-shard row indices.
 
     Factored out of :meth:`_RoutedBandEngine._sighet_fstat_multidevice` so
-    the multi-rank fit's owner rank ships exactly the rows the in-process
-    multi-device lanes replicate -- one extraction, one set of layout
-    assumptions.
+    the multi-rank fit's owner rank ships exactly the rows THAT lane
+    replicates.
+
+    TODO (not yet the only extraction):
+    :meth:`_RoutedBandEngine.make_fstat_nm_lanes` still inlines its own copy
+    of this slice against the same :class:`_ShardHolderView` type, and that
+    one is MIRROR-BLIND -- it reads ``linear_psd_arr[0]`` directly and would
+    take the wrong row for a shared-psd mirror view, which the
+    ``psd_row_index`` branch below exists to handle. Fold that site into
+    this helper; until then, "one set of layout assumptions" holds for the
+    sig-het lane and the multi-rank fit, not for the whole module.
     """
     n_slabs = int(view.acs_total_entries)
     dev = getattr(view, "device", None) if device is None else device

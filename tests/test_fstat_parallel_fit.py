@@ -737,5 +737,155 @@ class GlobalReferenceTest(unittest.TestCase):
         self.assertTrue(any("could not rank walkers" in line for line in captured.output))
 
 
+class FakeCommBcastTest(unittest.TestCase):
+    """``FakeComm.Bcast`` -- the uppercase, IN-PLACE buffer broadcast.
+
+    The F-stat reference row pair is tens of MB, which mpi4py moves through
+    the uppercase buffer form (no pickling) into a receive buffer the caller
+    allocated itself. The laptop gate runs the production op body over
+    :class:`FakeWorld`, so the fake needs that entry point with the same
+    in-place semantics -- a ``bcast``-shaped stand-in that RETURNED the
+    payload would let a body that forgot to use the return value pass here
+    and lose every row on the cluster.
+    """
+
+    def test_buffer_broadcast_fills_every_rank_in_place(self):
+        from lisatools.globalfit.communication.fakecomm import FakeWorld
+
+        world = FakeWorld(3)
+
+        def body(rank, comm):
+            buf = np.zeros(4, dtype=np.float64)
+            if rank == 1:
+                buf[:] = [1.5, 2.5, 3.5, 4.5]
+            comm.Bcast(buf, root=1)
+            return buf.copy()
+
+        out = world.run(body)
+        for rank in range(3):
+            np.testing.assert_array_equal(out[rank], [1.5, 2.5, 3.5, 4.5])
+
+    def test_dtype_and_shape_are_preserved(self):
+        from lisatools.globalfit.communication.fakecomm import FakeWorld
+
+        world = FakeWorld(2)
+
+        def body(rank, comm):
+            buf = np.zeros((2, 3), dtype=np.float64)
+            if rank == 0:
+                buf[:] = np.arange(6, dtype=np.float64).reshape(2, 3)
+            comm.Bcast(buf, root=0)
+            return buf.copy()
+
+        out = world.run(body)
+        np.testing.assert_array_equal(
+            out[1], np.arange(6, dtype=np.float64).reshape(2, 3))
+
+    def test_complex_rows_survive_the_broadcast(self):
+        """The residual row is COMPLEX in the FD basis.
+
+        ``AnalysisContainerArray.data_dtype`` is ``float`` only under
+        ``WDMSettings``; in FD it is ``complex``, and ``noise_dtype`` is
+        complex whenever the sensitivity matrix is. A transport (or a
+        sender-side cast) that assumed float64 would discard the imaginary
+        part of every sample, so the fake has to move complex buffers
+        faithfully.
+        """
+        from lisatools.globalfit.communication.fakecomm import FakeWorld
+
+        world = FakeWorld(3)
+        want = np.array([1 + 2j, -3 + 0.5j, 0 - 7j], dtype=np.complex128)
+
+        def body(rank, comm):
+            buf = np.zeros(3, dtype=np.complex128)
+            if rank == 2:
+                buf[:] = want
+            comm.Bcast(buf, root=2)
+            return buf.copy()
+
+        out = world.run(body)
+        for rank in range(3):
+            self.assertEqual(out[rank].dtype, np.complex128)
+            np.testing.assert_array_equal(out[rank], want)
+
+    def test_a_strided_receive_buffer_is_refused(self):
+        """A non-contiguous buffer must RAISE, not silently drop the payload.
+
+        ``arr.reshape(-1)`` is a VIEW only for a C-contiguous array; on a
+        strided one it COPIES, so the in-place write would land in a
+        temporary and the rank would keep its old values with no error at
+        all. Everything the production body broadcasts is a fresh
+        ``np.empty``, but a silent wrong answer is the wrong failure mode to
+        leave lying in a test harness.
+        """
+        from lisatools.globalfit.communication.fakecomm import FakeWorld
+
+        world = FakeWorld(2)
+
+        def body(rank, comm):
+            buf = np.zeros((2, 4), dtype=np.float64)[:, ::2]  # strided view
+            if rank == 0:
+                buf[:] = 1.0
+            comm.Bcast(buf, root=0)
+            return buf.copy()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            world.run(body)
+        self.assertIn("C-contiguous", str(ctx.exception))
+
+
+class RefRowOpTest(unittest.TestCase):
+    """``gb_fstat_ref_row`` replicates the owner's rows to every rank."""
+
+    def test_op_is_registered(self):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        self.assertIn("gb_fstat_ref_row", gbs.GB_OPS)
+        self.assertIn("gb_fstat_stage_b", gbs.GB_OPS)
+
+    def test_unknown_op_still_raises(self):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialBase.__new__(gbs.GBSpecialBase)
+        move.name = "gb_test"
+        with self.assertRaises(ValueError):
+            move.gf_serve("not_an_op", None, {}, None)
+
+    def test_payload_is_identical_for_every_rank(self):
+        """The op is SYMMETRIC: every rank must compute the same ``root``.
+
+        ``_fstat_ref_row_fanout`` ships one dict through
+        ``lambda rank, w0, w1: payload``, so the payload cannot depend on the
+        rank -- a per-rank ``owner_rank`` would have the ranks broadcasting
+        against different roots and deadlock the run.
+        """
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        p = gbs.GBSpecialBase._fstat_ref_row_payload(6, 3, 2, True)
+        self.assertEqual(
+            p, {"walker_ref": 6, "owner_rank": 3, "local_index": 2,
+                "gb_free": True})
+        self.assertEqual(
+            gbs.GBSpecialBase._fstat_ref_row_payload(6, 3, 2, None)["gb_free"],
+            False)
+
+    def test_wire_dtype_never_crosses_the_real_complex_boundary(self):
+        """``_bcast_dtype`` normalizes WIDTH, never realness.
+
+        The FD residual row is complex; casting it to float64 to broadcast
+        would silently drop the imaginary part of every sample.
+        """
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        self.assertEqual(gbs._bcast_dtype(np.zeros(2, dtype=np.float32)),
+                         np.float64)
+        self.assertEqual(gbs._bcast_dtype(np.zeros(2, dtype=np.float64)),
+                         np.float64)
+        self.assertEqual(gbs._bcast_dtype(np.zeros(2, dtype=np.complex64)),
+                         np.complex128)
+        self.assertEqual(gbs._bcast_dtype(np.zeros(2, dtype=np.complex128)),
+                         np.complex128)
+
+
 if __name__ == "__main__":
     unittest.main()
