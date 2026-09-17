@@ -2130,6 +2130,20 @@ class ReleaseBodyTest(unittest.TestCase):
         self.assertIsNone(move._fstat_ref_holder)
         self.assertEqual(move.mempool.frees, 1)
 
+    def test_a_rank_holding_only_the_walker_index_still_reports_released(self):
+        """Task 8 M-6's third disjunct, which nothing else distinguishes.
+
+        An ABORTED ``gb_fstat_ref_row`` can leave ``_fstat_ref_walker`` set
+        with no holder and no scorer (the owner's status word fires after
+        the index is recorded on some paths). A two-term ``held`` would call
+        that "nothing was held" and under-count the head's released line.
+        """
+        move = self._move(held=False)
+        move._fstat_ref_walker = 6
+        reply = move.gf_serve("gb_fstat_release", None, {}, None)
+        self.assertTrue(reply["released"])
+        self.assertIsNone(move._fstat_ref_walker)
+
     def test_it_serves_on_a_move_with_no_fstat_surface(self):
         """Deliberately NOT gated by ``_FSTAT_OP_REQUIRES`` (unlike the other
         two F-stat ops): the body touches nothing that belongs to the grid
@@ -2226,14 +2240,22 @@ class ReleaseFanoutTest(unittest.TestCase):
                 self.assertEqual(head_frees, 1,
                                  "the head skipped the uniform body")
 
-    def test_a_worker_that_cannot_release_does_not_abort_the_epoch(self):
-        """C-1, over the real wire: a worker whose served body raises turns
-        into an exception on the HEAD, out of ``_fstat_release_fanout``. That
-        is the failure ``_run_fstat_fit`` now swallows (see
-        ``RunFstatFitWiringTest::test_a_release_failure_cannot_destroy_a_
-        finished_fit``) -- and the head's own row must still be RESTORED by
-        the driver's ``finally``, or the centre table would have nothing to
-        score against even on the path that survives."""
+    def test_a_worker_failure_reaches_the_head_and_the_head_keeps_its_row(self):
+        """Over the real wire: a worker whose served body raises turns into
+        an exception on the HEAD, out of ``_fstat_release_fanout`` -- proving
+        the guarded call sites are guarding something that really happens --
+        and the head's own row is still RESTORED by the driver's ``finally``,
+        or the centre table would have nothing to score against even on the
+        path that survives.
+
+        NOT the C-1 regression detector, despite what this test used to be
+        called: it never enters ``_run_fstat_fit``, so it is green with or
+        without the swallow. The swallow itself is pinned at the two call
+        sites that do it --
+        ``RunFstatFitWiringTest::test_a_release_failure_cannot_destroy_a_finished_fit``
+        and
+        ``CentreTableScoringTest::test_a_release_failure_cannot_lose_the_centre_table``.
+        """
         from lisatools.globalfit.communication import ranks as R
         from lisatools.globalfit.communication.fakecomm import FakeWorld
         from lisatools.globalfit.communication.fanout import (
@@ -2365,6 +2387,9 @@ class CentreTableScoringTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.events = []
         self.scorer = lambda params: params
+        #: when True the stub gather answers walker 0, so a fallback that
+        #: RE-derives the reference instead of reusing the fit's is visible
+        self.moved_reference = False
         self.move = self._move()
 
     def tearDown(self):
@@ -2401,6 +2426,8 @@ class CentreTableScoringTest(unittest.TestCase):
 
         def global_reference(model):
             events.append("global_reference")
+            if self.moved_reference:
+                return 0, 0, 0, np.arange(8, dtype=float)
             return 6, self.owner_rank, 2, np.arange(8, dtype=float)
 
         def local_walker(model):                       # the banned route
@@ -2421,7 +2448,10 @@ class CentreTableScoringTest(unittest.TestCase):
         return move
 
     @contextlib.contextmanager
-    def _patched_build(self, raises=None):
+    def _patched_build(self, raises=None, host=None):
+        """``host=None`` returns nothing (the table install is not the
+        subject); pass a dict to let ``_install_ctr_table`` finish and
+        actually install one."""
         captured = {}
 
         def fake_build(call_fstat, **kw):
@@ -2430,10 +2460,17 @@ class CentreTableScoringTest(unittest.TestCase):
             captured.update(kw)
             if raises is not None:
                 raise raises
-            return None
+            return host
 
         with mock.patch.object(G, "build_fstat_center_table", fake_build):
             yield captured
+
+    @staticmethod
+    def _host_table():
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        return {name: np.zeros(2) for name in
+                gbs.GBSpecialRJFStatGridMove._CTR_TABLE_DEVICE_FIELDS}
 
     def test_a_live_holder_is_what_the_sweep_scores_through(self):
         with self._patched_build() as captured:
@@ -2498,6 +2535,91 @@ class CentreTableScoringTest(unittest.TestCase):
             move._install_ctr_table(4, model=None)
         self.assertIsNone(captured["call_fstat"])
         self.assertEqual(self.events, ["load"])
+
+    def test_a_release_failure_cannot_lose_the_centre_table(self):
+        """Task 9 C-1, the twin of ``_run_fstat_fit``'s guard.
+
+        By the time this release runs, the epoch's npz, ``DONE.json`` AND
+        ``fstat_centers.npz`` are on disk and the stage-B hours are paid.
+        Unguarded, a worker body raising inside the cheapest command in the
+        protocol propagates out of ``setup()`` and takes the run down --
+        while ALSO skipping the table install below, so the process that
+        just built the table falls back to the per-unit hoist.
+        """
+        move = self._move(holder=False)
+
+        def boom(model):
+            self.events.append("release_fanout")
+            raise RuntimeError("remote worker error during gb_fstat_release")
+
+        move._fstat_release_fanout = boom
+        with self._patched_build(host=self._host_table()) as captured:
+            with self.assertLogs(self.gbs.logger, level="WARNING") as caught:
+                move._install_ctr_table(4, model="model", branches={"gb": 1})
+        self.assertIs(captured["call_fstat"], self.scorer)
+        self.assertIn("release_fanout", self.events)
+        self.assertTrue(
+            any("gb_fstat_release after epoch 4's centre sweep failed" in m
+                for m in caught.output), caught.output)
+        # the table still installed, on this move AND in the registry
+        self.assertIsNotNone(move._fstat_ctr_table)
+        self.assertIn(self.tmp, self.gbs._FSTAT_CTR_TABLE_REGISTRY)
+        # ... and the head's own half still went
+        self.assertIsNone(move._fstat_ref_holder)
+
+    def test_the_fallback_reuses_the_fits_own_global_reference(self):
+        """Task 9 I-1: decision 6's "the SAME global reference", literally.
+
+        On the ``_already_fitted`` path ``_run_fstat_fit`` gathers the argmax
+        and stamps it into ``DONE.json`` without replicating a row, so this
+        fallback fires afterwards. Re-gathering would take a SECOND,
+        independently derived argmax -- equal to the manifest's only as long
+        as nothing between the two calls touches the ACA. Here the
+        likelihoods are deliberately perturbed between them.
+        """
+        move = self._move(holder=False)
+        move._fstat_epoch_reference = (4, 6, self.owner_rank, 2)
+        self.moved_reference = True     # a re-gather would pick walker 0
+        with self._patched_build():
+            move._install_ctr_table(4, model="model", branches={"gb": 1})
+        self.assertNotIn("global_reference", self.events,
+                         "the centre table re-gathered a second argmax")
+        self.assertEqual(
+            [e for e in self.events if isinstance(e, tuple)],
+            [("ref_row", 6, self.owner_rank, 2, {"gb": 1})])
+
+    def test_a_reference_stashed_for_another_epoch_is_not_reused(self):
+        move = self._move(holder=False)
+        move._fstat_epoch_reference = (3, 6, self.owner_rank, 2)   # epoch 3
+        with self._patched_build():
+            move._install_ctr_table(4, model="model", branches={"gb": 1})
+        self.assertIn("global_reference", self.events,
+                      "a stash from ANOTHER epoch must not be reused")
+
+    def test_a_sweep_with_no_branch_says_so(self):
+        """m-6: ``branches=None`` opens no GB-free window, and
+        ``_warn_if_gb_free_missed`` cannot see that (it reads the same flag),
+        so the centres would be fitted against a residual that still has the
+        reference walker's own GBs subtracted with nothing to say so."""
+        move = self._move(holder=False)
+        with self._patched_build():
+            with self.assertLogs(self.gbs.logger, level="WARNING") as caught:
+                move._install_ctr_table(4, model="model")
+        self.assertTrue(any("no GB branch" in m for m in caught.output),
+                        caught.output)
+
+    def test_the_fallback_refuses_to_run_on_a_non_head(self):
+        """m-4: the fallback fans out, and the fan-out is head-only. Without
+        this the failure is ``WalkerFanout.run is head-only`` two frames
+        down, which names the fan-out rather than the centre table."""
+        move = self._move(holder=False)
+        move.fanout = _StubFanout(_build_fake_layout(8, 2), lls=None)
+        move.fanout.is_head = False
+        with self._patched_build():
+            with self.assertRaises(RuntimeError) as ctx:
+                move._install_ctr_table(4, model="model", branches={"gb": 1})
+        self.assertIn("HEAD-ONLY", str(ctx.exception))
+        self.assertIn("centre sweep", str(ctx.exception))
 
 
 # =========================================================================
@@ -3544,8 +3666,12 @@ class CentreTableFallbackOverTheWireTest(unittest.TestCase):
         self.assertTrue(cap["holder"], "the fallback replicated no row")
         self.assertTrue(cap["is_ref_call"],
                         "the centres must be scored through THE holder call")
-        self.assertEqual(cap["walker"], 3,
+        # Task 9 I-1, over the wire: the row the centres were scored through
+        # carries the walker DONE.json names -- not a second, independently
+        # re-gathered argmax that happens to agree today.
+        self.assertEqual(cap["walker"], head["manifest"]["walker_ref"],
                          "the centres must score the fit's GLOBAL reference")
+        self.assertEqual(cap["walker"], 3)
         self.assertEqual(cap["cache_dir"], os.path.join(self.d, "epoch_0000"))
         self.assertTrue(extra["ctr_table"])
         # the row it took is put back on this rank ...

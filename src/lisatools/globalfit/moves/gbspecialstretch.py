@@ -17730,6 +17730,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     _fstat_ref_call = None
     _fstat_ref_walker = None
     _fstat_ref_branches = None
+    #: ``(epoch, w_global, owner_rank, local_index)`` of THIS epoch's fit,
+    #: published by ``_run_fstat_fit`` so ``_install_ctr_table``'s fallback
+    #: scores the centres against the reference the manifest names instead
+    #: of gathering a second, independently derived argmax. Class attribute
+    #: so the ``getattr`` on a move that never fitted cannot raise.
+    _fstat_epoch_reference = None
     _gb_free_n_live = -1
     _gb_free_opened = False
 
@@ -22322,11 +22328,16 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         THIS process resumes its own checkpoints -- so it is NOT the test a
         rank may apply to another process's directory; that one is
         :meth:`_epoch_missing_for_ranks`.
-        """
-        from lisatools.sampling.fstat_gridfit import GRID_BASENAME
 
-        return (os.path.exists(os.path.join(
-                    d, GRID_BASENAME.replace(".npz", "_peaks_stacked.npz")))
+        Spelled through ``fstat_gridfit``'s own :func:`stacked_grid_path`, the
+        single place that names this file -- the same one
+        ``run_fstat_grid_fit`` short-circuits on and ``stage_b_complete``
+        tests, so this predicate and that one can differ only in the trailing
+        ``or DONE.json``, which is the zero-peak case above.
+        """
+        from lisatools.sampling.fstat_gridfit import stacked_grid_path
+
+        return (os.path.exists(stacked_grid_path(d))
                 or os.path.exists(os.path.join(d, "DONE.json")))
 
     @staticmethod
@@ -22348,14 +22359,19 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
 
         The manifest is only read in that second case, so the common path is
         two ``os.path.exists`` calls.
+
+        The npz is named through ``fstat_gridfit``'s :func:`stacked_grid_path`
+        for the same reason :meth:`_epoch_complete` does: one spelling, so a
+        rank can never wait on a file the head does not write.
         """
-        from lisatools.sampling.fstat_gridfit import GRID_BASENAME
+        from lisatools.sampling.fstat_gridfit import stacked_grid_path
 
         manifest = os.path.join(d, "DONE.json")
         if not os.path.exists(manifest):
             return "DONE.json"
-        stacked = GRID_BASENAME.replace(".npz", "_peaks_stacked.npz")
-        if os.path.exists(os.path.join(d, stacked)):
+        stacked_path = stacked_grid_path(d)
+        stacked = os.path.basename(stacked_path)
+        if os.path.exists(stacked_path):
             return None
         try:
             with open(manifest) as f:
@@ -22654,6 +22670,16 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         _already_fitted = stage_b_complete(cache_dir)
         w_global, owner_rank, local_index, lls = self._fstat_global_reference(
             model)
+        # PUBLISHED FOR THE CENTRE TABLE, keyed by the epoch. On the
+        # ``_already_fitted`` path no row is replicated, so
+        # ``_install_ctr_table``'s fallback fires afterwards and would
+        # otherwise gather a SECOND, independently derived global argmax --
+        # making decision 6's "the SAME global reference" true only for as
+        # long as nothing between the two calls touches the ACA. The epoch
+        # key is what stops a later epoch reusing this one. Cleared beside
+        # the row in ``setup()``'s ``finally``.
+        self._fstat_epoch_reference = (int(k), int(w_global), int(owner_rank),
+                                       int(local_index))
         _fanout = getattr(self, "fanout", None)
         n_compute = 1 if _fanout is None else int(_fanout.layout.n_compute)
         # Auditability: the epoch line carries the reference walker's total
@@ -22684,8 +22710,13 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
                 _ll_spread = (float(lls.max() - lls.min()) if lls.size > 1
                               else float("nan"))
             else:
-                # the gather itself fell back (``_fstat_global_reference``'s
-                # except arm): there is no ranking to report
+                # DEFENSIVE: a placeholder shorter than the global index. No
+                # head-side caller produces one today -- the gather's own
+                # fallback returns ``w_global = 0`` beside a length-1
+                # placeholder, which the ``elif`` above catches and already
+                # reports as nan/nan. Kept so a future gather that returns a
+                # short vector reports "unknown" instead of IndexError-ing
+                # out of an epoch log line.
                 _ll_ref = _ll_spread = float("nan")
         except Exception:
             _ll_ref, _ll_spread = float("nan"), float("nan")
@@ -22851,7 +22882,12 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         complete epoch loads the centers with it (in milliseconds, and
         WITHOUT building an F-stat scorer); an epoch that predates the table
         (or an offline grid dropped into ``epoch_0000``) rebuilds it here,
-        replicating the reference row itself first.
+        replicating the reference row itself first -- AGAINST THE RESIDUAL AS
+        IT STANDS AT THAT MOMENT, which on a pure load path (no fit in this
+        process) is generally not the walker the loaded grids were fitted
+        against, i.e. not ``DONE.json``'s ``walker_ref``. When this process
+        DID run the fit, ``_fstat_epoch_reference`` makes the two literally
+        the same walker.
 
         No-ops under ``GB_FSTAT_CTR_MODE=unit``. Leaves ``_fstat_ctr_table``
         ``None`` when the epoch has no drawable support at all — the move
@@ -22895,12 +22931,56 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             # argmax would silently pick a different walker -- and its index
             # is not even a valid ACA row off that walker's owner.
             if self._fstat_ref_holder is None:
+                # HEAD ONLY. ``model is not None`` is the practical guard (the
+                # rank-side ``_setup_from_directive`` load passes ``None``),
+                # but the fan-out below is head-only and a non-head that got
+                # here would otherwise fail two frames down, inside
+                # ``WalkerFanout.run``, with a message about the fan-out
+                # rather than about the centre table.
+                _fan = getattr(self, "fanout", None)
+                if _fan is not None and not _fan.is_head:
+                    raise RuntimeError(
+                        f"{self.name}: _install_ctr_table's centre sweep is "
+                        "HEAD-ONLY -- it replicates the reference row with a "
+                        "gb_fstat_ref_row fan-out, and every other compute "
+                        "rank is parked in ComputeService.serve(). A rank "
+                        "loading an epoch must pass model=None "
+                        "(_setup_from_directive).")
+                if branches is None:
+                    # ``gb_free_requested`` is ``branches is not None``, so
+                    # with no branch the owner opens NO GB-free window and
+                    # ``_warn_if_gb_free_missed`` stays quiet -- the centres
+                    # would be scored against a residual that still has the
+                    # reference walker's own GBs subtracted, with nothing
+                    # anywhere to say so. No in-tree caller does this (all
+                    # four pass ``branches`` whenever they pass a model), but
+                    # the keyword default invites it.
+                    logger.warning(
+                        "%s: epoch %d's centre sweep was given no GB branch, "
+                        "so no GB-free window can open for it; the centres "
+                        "will be fitted against the reference walker's own "
+                        "residual while the grids were not.", self.name, k)
                 # A path that never ran a fit (a complete epoch being loaded,
                 # a cross-move reuse, or an offline grid dropped in without a
                 # centre table): replicate the row now, through exactly the
                 # same global reference + ``gb_fstat_ref_row`` the fit uses.
-                w_global, owner_rank, local_index, _lls = (
-                    self._fstat_global_reference(model))
+                #
+                # REUSE THE FIT'S OWN REFERENCE WHEN IT HAS ONE. On the
+                # ``_already_fitted`` path ``_run_fstat_fit`` gathered the
+                # global argmax (and stamped it into ``DONE.json``) but
+                # replicated no row, so this branch fires with the answer
+                # already in hand. Re-gathering would be a second collective
+                # AND a second, independently derived argmax -- decision 6's
+                # "the SAME global reference" would then hold only as long as
+                # nothing between the two calls touches the ACA, which
+                # nothing asserts. ``_fstat_epoch_reference`` is keyed by the
+                # epoch so a stale one can never be picked up.
+                _cached = getattr(self, "_fstat_epoch_reference", None)
+                if _cached is not None and int(_cached[0]) == int(k):
+                    _k0, w_global, owner_rank, local_index = _cached
+                else:
+                    w_global, owner_rank, local_index, _lls = (
+                        self._fstat_global_reference(model))
                 self._fstat_ref_row_fanout(model, branches, w_global,
                                            owner_rank, local_index)
                 _release_after = True
@@ -22920,7 +23000,26 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
                     # unwinds would only replace the real error with a
                     # fan-out failure. Nothing else would ever drop these --
                     # a rank cannot tell that this was the last command.
-                    self._fstat_release_fanout(model)
+                    try:
+                        self._fstat_release_fanout(model)
+                    except Exception as exc:  # noqa: BLE001
+                        # AND A RELEASE MUST NEVER BE THE THING THAT FAILS
+                        # (Task 8 C-1, the same guard 800 lines up on the
+                        # identical call). By now the epoch's npz, DONE.json
+                        # and fstat_centers.npz are ALL on disk and the
+                        # stage-B hours are paid; unguarded, a worker body
+                        # raising here would propagate out of setup() and
+                        # take the run down while ALSO skipping the
+                        # _FSTAT_CTR_TABLE_REGISTRY install below -- so the
+                        # process that just built the table would fall back
+                        # to the per-unit hoist. A worker that kept its row
+                        # loses it at the next gb_fstat_ref_row anyway.
+                        logger.warning(
+                            "%s: gb_fstat_release after epoch %d's centre "
+                            "sweep failed (%r); the workers keep their "
+                            "reference row until the next gb_fstat_ref_row "
+                            "overwrites it.", self.name, k, exc,
+                            exc_info=True)
             finally:
                 if _release_after:
                     # This rank's own half goes either way: ``setup()``'s
@@ -23098,6 +23197,12 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             # that never took a row at all (load / cross-move reuse), where
             # it is a no-op.
             self._fstat_release_ref_row()
+            # The epoch's global reference goes with it: it is published by
+            # ``_run_fstat_fit`` purely so ``_install_ctr_table`` can reuse
+            # THIS epoch's answer, and a stale one outliving the epoch is
+            # exactly what its epoch key exists to make harmless -- belt and
+            # braces, so a later reader never has to reason about it.
+            self._fstat_epoch_reference = None
 
     def _setup_epoch(self, model, branches, action, k):
         """``setup()``'s body once the refit decision is made.
