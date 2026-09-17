@@ -513,10 +513,12 @@ class HookPersistenceTest(unittest.TestCase):
         self.assertEqual(sigmas.shape, (move.ntemps, 2, 1, 3))
 
     def test_guard_mismatch_in_the_sidecar_triggers_a_rebuild(self):
-        # stored for a 5-temperature ladder; this run has 2
+        # stored for a 4-dimensional branch; this run has 3. (A ladder or
+        # walker-count change is NOT a mismatch for a walker_max table since
+        # 2026-09-16 -- see GuardTest -- so the staged defect is the ndim.)
         eigen_table_persist.save_entry(
             self.sidecar, "sobbh", 0,
-            _walker_max_entry(visits=2, ntemps=5, seed=25),
+            _walker_max_entry(visits=2, ndim=4, seed=25),
         )
         inner = EigenAxisMove()
         move = _stub_move([inner], self.store, refresh=10)
