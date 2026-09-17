@@ -228,6 +228,114 @@ def get_n_based_band_edges(
     return edges
 
 
+def sighet_engine_kwargs(info) -> dict:
+    """``for_band_engine`` kwargs for a branch's sig-het in-model engine.
+
+    ONE function for the GB and VGB branches so their engines can never
+    drift apart: every knob is read from the branch's settings block (the
+    ``sighet_*`` fields, which resolve the SHARED ``SIGHET_*`` env names).
+
+    The Tukey alpha is passed EXPLICITLY (pinned-alpha ruling 2026-08-19).
+    Left to ``None``, ``for_band_engine`` inherits the chunked delegate's
+    0.05 -- a per-chunk stitching fraction that the sig-het kernels apply
+    as a fraction of the WHOLE observation. At six months that tapers ~110
+    WDM layers per side against a 60-layer time crop and suppresses the
+    reference inside the active region (the engine only WARNS for an
+    inherited alpha). The VGB wiring did exactly that until 2026-09-17
+    (``VGBSettings`` had no ``sighet_tukey_alpha`` field), the likely
+    source of the ``[GB_CELL_LL]`` growth that had ``VGB_SIGHET_INMODEL``
+    pinned to 0 in the 6mo campaign.
+    """
+    v5 = int(info.sighet_v5)
+    kw = dict(
+        tukey_alpha=float(info.sighet_tukey_alpha),
+        nt_layer=int(info.sighet_nt_layer),
+        n_sparse_fd=int(info.sighet_n_sparse_fd),
+        max_r=float(info.sighet_max_r),
+        n_cp_build=int(info.sighet_n_cp),
+        v3_n_nodes=int(info.sighet_v3_nodes),
+        v4_knots=int(info.sighet_v4_knots),
+        v4_band=int(info.sighet_v4_band),
+    )
+    if v5:
+        kw["v5"] = v5
+    return kw
+
+
+def check_sighet_build_config(info, comp, *, branch: str) -> None:
+    """Refuse the silently-degrading sig-het configurations at build time.
+
+    Shared by the GB and VGB wiring (``branch`` names the offender).
+
+    * v5 is gated INSIDE the kernel selector on ``v4_knots``, and its
+      phase-aliased arena additionally needs a non-zero band (``band_len
+      == 0`` falls back to the flat carve, i.e. v5=2). Both degrade
+      SILENTLY to a slower path, so a run that asked for v5 would look
+      fine and quietly not be v5. Fail loudly instead.
+    * THE EDGE-EXCLUSION INVARIANT (user ruling 2026-08-19): any region
+      where taper error is created must be REMOVED by the WDM
+      ``[min_time, max_time]`` crop -- the crop serves the taper, never
+      the taper shrunk to fit the crop. Enforced here, at build time,
+      where both knobs are on the table: either raise
+      ``EDGE_CROP_WAVELETS`` or lower ``SIGHET_TUKEY_ALPHA``. (The engine
+      carries a last-resort clamp for non-erebor callers, but this
+      refusal is the real guard.)
+    """
+    v5 = int(info.sighet_v5)
+    if v5:
+        knots = int(info.sighet_v4_knots)
+        band = int(info.sighet_v4_band)
+        if knots <= 0:
+            raise ValueError(
+                f"[{branch}] SIGHET_V5={v5} requires SIGHET_V4_KNOTS > 0 "
+                f"(got {knots}): the v5 kernel is selected only when the v4 "
+                "fixed-knot resample is active, so v5 would be silently "
+                "ignored. Benchmarked config: SIGHET_V3_NODES=64 "
+                "SIGHET_V4_KNOTS=128 SIGHET_V4_BAND=16."
+            )
+        if v5 == 1 and band <= 0:
+            raise ValueError(
+                f"[{branch}] SIGHET_V5=1 requires SIGHET_V4_BAND > 0 (got "
+                f"{band}): with an empty band the kernel takes the flat "
+                "carve, which is the v5=2 control arm, not the phase-aliased "
+                "arena. Set SIGHET_V4_BAND=16, or ask for the control "
+                "explicitly with SIGHET_V5=2."
+            )
+
+    alpha = float(info.sighet_tukey_alpha)
+    wdm = getattr(comp, "wdm_settings", None)
+    Nt = int(getattr(wdm, "Nt", 0) or 0)
+    crop = int(getattr(wdm, "ind_min_t", 0) or 0)
+    if Nt:
+        taper = int(np.ceil(0.5 * alpha * Nt))
+        if taper + 8 > crop:
+            raise ValueError(
+                f"[{branch}] sig-het reference taper (SIGHET_TUKEY_ALPHA="
+                f"{alpha} -> {taper} WDM layers/side + 8 margin) is not "
+                f"excluded by the time crop (ind_min_t={crop}). "
+                "Error-created edges must be REMOVED by [min_time, "
+                f"max_time]: raise EDGE_CROP_WAVELETS to >= {taper + 8} or "
+                "lower SIGHET_TUKEY_ALPHA to <= "
+                f"{max(0.0, 2.0 * (crop - 8) / Nt):.4f}."
+            )
+
+
+def build_sighet_engine(info, comp, *, branch: str):
+    """Wrap the chunked-het ``comp`` in the sig-het in-model engine.
+
+    The single build path for both branches: the configuration checks,
+    then ``GBSignalHetComputations.for_band_engine`` with
+    :func:`sighet_engine_kwargs`. RJ / fills / swaps / information
+    matrices keep delegating to ``comp`` (pure type dispatch).
+    """
+    from gbgpu.gbsignalhetcomputations import GBSignalHetComputations
+
+    check_sighet_build_config(info, comp, branch=branch)
+    return GBSignalHetComputations.for_band_engine(
+        comp, **sighet_engine_kwargs(info)
+    )
+
+
 @dataclasses.dataclass
 class GBSettings(Settings):
     """Settings dataclass describing the GB branch in an Erebor-style recipe.

@@ -61,7 +61,7 @@ from ....recipe import (
 from ...base import env_default, env_resolve
 from ..common import tdi_generation_info
 from ..fit import EreborFit, EreborGeneralSettings
-from ..gb import GBSettings, GBSetup
+from ..gb import GBSettings, GBSetup, build_sighet_engine
 
 logger = logging.getLogger(__name__)
 
@@ -1023,71 +1023,13 @@ def setup_gb_moves(engine_info, curr, acs, priors, state) -> dict:
         # GBSignalHetComputations wrapping the chunked comp; RJ / fills /
         # swaps keep the chunked-het path (pure type dispatch).
         if getattr(gb_info, "sighet_inmodel", False):
-            from gbgpu.gbsignalhetcomputations import GBSignalHetComputations
-
-            # v5 is gated INSIDE the kernel selector on v4_knots, and its
-            # phase-aliased arena additionally needs a non-zero band
-            # (band_len == 0 falls back to the flat carve, i.e. v5=2). Both
-            # degrade SILENTLY to a slower path, so a run that asked for v5
-            # would look fine and quietly not be v5. Fail loudly instead.
-            _v5 = int(getattr(gb_info, "sighet_v5", 0))
-            if _v5:
-                _knots = int(getattr(gb_info, "sighet_v4_knots", 0))
-                _band = int(getattr(gb_info, "sighet_v4_band", 0))
-                if _knots <= 0:
-                    raise ValueError(
-                        f"SIGHET_V5={_v5} requires SIGHET_V4_KNOTS > 0 (got "
-                        f"{_knots}): the v5 kernel is selected only when the "
-                        "v4 fixed-knot resample is active, so v5 would be "
-                        "silently ignored. Benchmarked config: "
-                        "SIGHET_V3_NODES=64 SIGHET_V4_KNOTS=128 "
-                        "SIGHET_V4_BAND=16."
-                    )
-                if _v5 == 1 and _band <= 0:
-                    raise ValueError(
-                        f"SIGHET_V5=1 requires SIGHET_V4_BAND > 0 (got "
-                        f"{_band}): with an empty band the kernel takes the "
-                        "flat carve, which is the v5=2 control arm, not the "
-                        "phase-aliased arena. Set SIGHET_V4_BAND=16, or ask "
-                        "for the control explicitly with SIGHET_V5=2."
-                    )
-
-            # THE EDGE-EXCLUSION INVARIANT (user ruling 2026-08-19): any
-            # region where taper error is created must be REMOVED by the WDM
-            # [min_time, max_time] crop -- the crop serves the taper, never
-            # the taper shrunk to fit the crop. Enforced HERE, at build time,
-            # where both knobs are on the table: either raise
-            # EDGE_CROP_WAVELETS or lower SIGHET_TUKEY_ALPHA. (The engine
-            # also carries a last-resort clamp for non-erebor callers, but
-            # this refusal is the real guard.)
-            _alpha_sh = float(getattr(gb_info, "sighet_tukey_alpha", 0.01))
-            _wdm_dom = getattr(gb_info.gb_wdm_comp, "wdm_settings", None)
-            _Nt_dom = int(getattr(_wdm_dom, "Nt", 0) or 0)
-            _crop = int(getattr(_wdm_dom, "ind_min_t", 0) or 0)
-            if _Nt_dom:
-                _taper = int(np.ceil(0.5 * _alpha_sh * _Nt_dom))
-                if _taper + 8 > _crop:
-                    raise ValueError(
-                        f"sig-het reference taper (SIGHET_TUKEY_ALPHA="
-                        f"{_alpha_sh} -> {_taper} WDM layers/side + 8 margin)"
-                        f" is not excluded by the time crop (ind_min_t="
-                        f"{_crop}). Error-created edges must be REMOVED by "
-                        f"[min_time, max_time]: raise EDGE_CROP_WAVELETS to "
-                        f">= {_taper + 8} or lower SIGHET_TUKEY_ALPHA to <= "
-                        f"{max(0.0, 2.0 * (_crop - 8) / _Nt_dom):.4f}.")
-            gb_info.gb_wdm_comp = GBSignalHetComputations.for_band_engine(
-                gb_info.gb_wdm_comp,
-                tukey_alpha=float(getattr(gb_info, "sighet_tukey_alpha",
-                                          0.01)),
-                nt_layer=int(gb_info.sighet_nt_layer),
-                n_sparse_fd=int(gb_info.sighet_n_sparse_fd),
-                max_r=float(getattr(gb_info, "sighet_max_r", 0.0)),
-                n_cp_build=int(getattr(gb_info, "sighet_n_cp", -1)),
-                v3_n_nodes=int(getattr(gb_info, "sighet_v3_nodes", 0)),
-                v4_knots=int(getattr(gb_info, "sighet_v4_knots", 0)),
-                v4_band=int(getattr(gb_info, "sighet_v4_band", 0)),
-                **({"v5": int(getattr(gb_info, "sighet_v5", 0))}
-                   if int(getattr(gb_info, "sighet_v5", 0)) else {}),
+            # The v5 gating and the EDGE-EXCLUSION INVARIANT checks plus the
+            # for_band_engine call live in ONE shared builder with the VGB
+            # branch (erebor.gb.build_sighet_engine) so the two engines can
+            # never drift -- every knob, the Tukey alpha included, comes
+            # from the settings block.
+            gb_info.gb_wdm_comp = build_sighet_engine(
+                gb_info, gb_info.gb_wdm_comp, branch="gb"
             )
             # RESOLVED-CONFIG ECHO -- emitted HERE, not from GBGPU. The
             # equivalent gbgpu-side logger.info (GBGPU b412089) is INVISIBLE:
