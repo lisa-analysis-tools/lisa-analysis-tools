@@ -2249,9 +2249,20 @@ export GB_USE_GALAXY_PRIOR=1
 export PSD_NUM_PROP_REPEATS=10
 export GALFOR_NUM_PROP_REPEATS=10
 
-# ---- VGB: exact chunked-het in-model scorer (sig-het accuracy at the
-#      loudest-VGB SNRs is unverified -- [GB_CELL_LL] growth in smoke 1) ----
-export VGB_SIGHET_INMODEL=0
+# ---- VGB in-model scorer: sig-het ON (user ruling 2026-09-17), same engine
+#      and the SAME knobs as the GB branch by construction (VGBSettings reads
+#      the shared SIGHET_* / GB_SIGHET_* env names: windowed refs, N_CP,
+#      trust gate thresholds, n_sparse_fd). Was pinned to 0 ("accuracy at
+#      the loudest-VGB SNRs unverified -- [GB_CELL_LL] growth in smoke 1"),
+#      which routed the per-propose VGB information matrices through the
+#      CHUNKED engine at 30-45 ms/source: vgb_pe 130 s per call, the
+#      noise_vgb_search stage 131 s/iteration vs 24 s on the pre-basis-change
+#      legacy run. WATCH on the first snapshot: [GB_CELL_LL vgb_pe]
+#      |sampled-actual| must stay ~1e-7 (growth = the sig-het error at loud
+#      VGBs), [GB_TRUST] rejection fraction for vgb_pe (the trust gate is
+#      what protects the chain), the ll-drift rebuild count, VGB acceptance.
+#      VGB_SIGHET_INMODEL=0 restores the exact chunked scorer.
+export VGB_SIGHET_INMODEL=${VGB_SIGHET_INMODEL:-1}
 # VGB RELAUNCH BLOCK (2026-08-15, user rulings). The VGB likelihood was
 # OFF all run (betas=[1e-4] bug) and 36/55 leaves were frozen by the GB
 # SNR gate -- both fixed in code (76cd3237); pre-fix VGB samples are

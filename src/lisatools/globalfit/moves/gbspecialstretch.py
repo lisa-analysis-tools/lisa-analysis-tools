@@ -5768,6 +5768,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         if ms < self._INFOMAT_SLOW_MS:
             return
         self._infomat_warned = True
+        if not hasattr(comp, "chunked"):
+            # No sig-het comp exists on this branch by CONFIGURATION
+            # ({VGB,GB}_SIGHET_INMODEL=0): the chunked engine is the
+            # configured route, not a fall-through. Say so once at INFO
+            # so the per-source cost is on record without a false alarm.
+            logger.info(
+                "[GB_INFOMAT %s] information_matrix cost %.1f ms/source over "
+                "%d rows via the CHUNKED engine -- the configured route on "
+                "this branch (no sig-het in-model comp; "
+                "{VGB,GB}_SIGHET_INMODEL=0). The sig-het route is ~2.4 "
+                "ms/source.", self.name, ms, nrows)
+            return
         logger.warning(
             "[GB_INFOMAT %s] information_matrix cost %.1f ms/source over %d "
             "rows -- the sig-het route is ~2.4 ms/source and the chunked "
