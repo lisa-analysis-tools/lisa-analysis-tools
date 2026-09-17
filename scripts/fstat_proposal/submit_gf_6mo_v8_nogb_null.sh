@@ -481,8 +481,19 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
     4) _NGPU_PART=gpu-80-spot; _NODES=2; _GRES=gpu:2 ;;
     *) echo "[SUBMIT] NGPUS=${NGPUS} unsupported (2 or 4)."; exit 2 ;;
   esac
-  if [ "${NGPUS}" = "4" ]; then
-    GF_LEGACY_RANK_LAYOUT=0
+  # NODES=<n> spreads the NGPUS GPUs over n nodes (gres = NGPUS/n per node).
+  # One-walker replica gates (2026-09-16 ruling: test ACROSS nodes):
+  # NGPUS=2 NODES=2 -> 2 nodes x gpu:1, one replica per node;
+  # NGPUS=4 NODES=4 -> 4 nodes x gpu:1. Unset = the NGPUS table above.
+  NODES=${NODES:-}
+  if [ -n "${NODES}" ]; then
+    if [ "${NODES}" -lt 1 ] || [ $(( NGPUS % NODES )) -ne 0 ]; then
+      echo "[SUBMIT] NODES=${NODES} must be >= 1 and divide NGPUS=${NGPUS}."; exit 2
+    fi
+    _NODES=${NODES}; _GRES=gpu:$(( NGPUS / NODES ))
+  fi
+  if [ "${_NODES}" -gt 1 ]; then
+    GF_LEGACY_RANK_LAYOUT=0    # the legacy single-compute-rank layout cannot span nodes
   else
     # walker-block layout by default at NGPUS=2 too (user ruling 2026-09-16;
     # GF_LEGACY_RANK_LAYOUT=1 = the rollback knob for a 1-node job)
@@ -510,7 +521,7 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
   echo "[SUBMIT]   1 GPU, unchanged); under GF_LEGACY_RANK_LAYOUT=0 it ERRORS"
   echo "[SUBMIT]   at --ntasks>=3 (insufficient GPUs) -- pass '-n 2' as well."
   _DIST_FLAG=""
-  if [ "${_NODES}" = "2" ]; then
+  if [ "${_NODES}" -gt 1 ]; then
     _DIST_FLAG="--distribution=cyclic"
   fi
   exec sbatch --partition="${_NGPU_PART}" --gres="${_GRES}" --nodes="${_NODES}" \
