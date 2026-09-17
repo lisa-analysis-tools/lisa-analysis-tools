@@ -82,6 +82,28 @@ class SnapshotRefRowsTest(unittest.TestCase):
             self.assertTrue(d.flags["C_CONTIGUOUS"])
             self.assertTrue(p.flags["C_CONTIGUOUS"])
 
+    def test_the_rows_are_copies_not_views_of_the_live_buffer(self):
+        """A "snapshot" that aliases the live residual is not a snapshot.
+
+        On the CPU backend ``asnumpy`` is the identity and a row slice of a
+        C-contiguous reshape is already contiguous, so the old
+        ``np.ascontiguousarray`` returned THAT VERY VIEW. The GB-free window
+        closes immediately after this call by design, so its restore would
+        have undone the snapshot -- the owner's holder would then disagree
+        with every worker's (they receive a genuine ``Bcast`` copy) and the
+        epoch would be fitted against a residual nobody chose.
+        """
+        parent = _FakeParent(3, 8, 8)
+        parent.linear_data_arr[0].reshape(3, -1)[1] += 1.0
+        parent.linear_psd_arr[0].reshape(3, -1)[1] += 2.0
+        d, p = gbbands.snapshot_ref_rows(parent, parent, 1, 1, xp=np)
+        d_seen, p_seen = np.array(d, copy=True), np.array(p, copy=True)
+        # the window closing: the live rows go back to what they were
+        parent.linear_data_arr[0].reshape(3, -1)[1] -= 1.0
+        parent.linear_psd_arr[0].reshape(3, -1)[1] -= 2.0
+        np.testing.assert_array_equal(d, d_seen)
+        np.testing.assert_array_equal(p, p_seen)
+
     def test_the_snapshot_feeds_a_holder_that_scores_row_zero(self):
         parent = _FakeParent(3, 8, 8)
         d, p = gbbands.snapshot_ref_rows(parent, parent, 2, 2, xp=np)

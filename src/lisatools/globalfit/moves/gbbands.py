@@ -1101,10 +1101,29 @@ def snapshot_ref_rows(holder, view, intra_data, intra_noise, *, xp,
     """
     n_slabs = int(view.acs_total_entries)
     dev = getattr(view, "device", None) if device is None else device
+
+    def _host_copy(row):
+        """A host array that is a COPY, not a view of the live buffer.
+
+        ``np.ascontiguousarray`` alone is NOT enough on the CPU backend:
+        ``asnumpy`` of a numpy array is the identity, a row slice of a
+        C-contiguous 2-D reshape is already contiguous, and
+        ``ascontiguousarray`` then returns THAT VERY VIEW. The "snapshot"
+        would alias the live residual -- so the GB-free window's restore
+        (which runs immediately after this call, by design) would undo the
+        snapshot, the owner's holder would disagree with every worker's
+        (they receive a genuine ``Bcast`` copy), and any later residual
+        write would silently re-score the epoch. On the CUDA backend
+        ``asnumpy`` already copies; this makes the guarantee the docstring
+        states hold on both.
+        """
+        arr = np.asarray(asnumpy(row))
+        return np.array(arr, dtype=arr.dtype, order="C", copy=True)
+
     with device_context(holder.xp, dev):
-        data_row_host = np.ascontiguousarray(asnumpy(
+        data_row_host = _host_copy(
             xp.asarray(view.linear_data_arr[0]).reshape(
-                n_slabs, -1)[int(intra_data)]))
+                n_slabs, -1)[int(intra_data)])
         _prow = getattr(view, "psd_row_index", None)
         if _prow is not None:
             # Shared-psd mirror: linear_psd_arr[0] is the parent's
@@ -1123,12 +1142,11 @@ def snapshot_ref_rows(holder, view, intra_data, intra_noise, *, xp,
                     "sig-het F-stat: mirror plane / row map mismatch "
                     f"(plane {int(_plane.size)} elements, per row {_per_row}, "
                     f"row {_row})")
-            psd_row_host = np.ascontiguousarray(asnumpy(
-                _plane.reshape(_n_rows, -1)[_row]))
+            psd_row_host = _host_copy(_plane.reshape(_n_rows, -1)[_row])
         else:
-            psd_row_host = np.ascontiguousarray(asnumpy(
+            psd_row_host = _host_copy(
                 xp.asarray(view.linear_psd_arr[0]).reshape(
-                    n_slabs, -1)[int(intra_noise)]))
+                    n_slabs, -1)[int(intra_noise)])
     return data_row_host, psd_row_host
 
 
