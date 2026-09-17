@@ -16,16 +16,13 @@ cd /shared/home/mlkatz1/lisa-analysis-tools && git checkout dev && git pull --ff
 export I_MPI_HYDRA_BOOTSTRAP=slurm I_MPI_FABRICS=shm:ofi FI_PROVIDER=tcp   # hydra + tcp fabric, the launcher that works here
 export DATA_MODE=synthetic NUM_ITERATIONS=4 MIDIT_CHECKPOINT=0 MAKE_DIAGNOSTIC_PLOTS=0 GF_FANOUT_DIGEST=1 GF_LEGACY_RANK_LAYOUT=0
 export NWALKERS=1
-# the campaign script's sig-het accuracy pins (stock defaults are the coarse
-# nt_layer=64->60 / no reference refresh setup; see "Rules" below)
-export SIGHET_NT_LAYER=120 SIGHET_N_CP=256 SIGHET_TUKEY_ALPHA=0.01 SIGHET_INFOMAT=1
-export GB_SIGHET_INMODEL_WINDOWED=1 GB_INMODEL_SETUP_BATCH=0 GB_SIGHET_FOLD_MAX_BYTES=8589934592
-export GB_SIGHET_REFRESH_EVERY=25 GB_SIGHET_REFRESH_DPHASE=0 GB_SIGHET_REFRESH_MIN_BETA=0 GB_SIGHET_TRUST_PHASE_C=49
-export GB_SIGHET_ANCHOR_CHECK=0 GB_SIGHET_DRIFT_CHECK=1 GB_ORTHO_LL_CHECK=1
 G=$HOME/onewalker_gates; mkdir -p "$G"
 
-# THE LAUNCH (every gate unless stated): 3 ranks round-robin over the 2 hosts
-FILE_STORE_DIR=$G/<gate>/ GPUS=0 mpiexec -n 3 -ppn 1 python scripts/run_global.py --stock <name>
+# THE LAUNCH (every gate unless stated): 3 ranks round-robin over the 2 hosts,
+# through the gate driver -- it applies the campaign script's sig-het pins
+# (printed as a [GATE] line; a VAR=... prefix on the command still wins) and
+# injects one loud GB into the GB stocks (--no-injection to skip)
+FILE_STORE_DIR=$G/<gate>/ GPUS=0 mpiexec -n 3 -ppn 1 python scripts/diagnostics/gate_run.py --stock <name>
 #   rank 0  head    node A  GPU 0   replica 0 (the head computes too)
 #   rank 1  compute node B  GPU 0   replica 1
 #   rank 2  saver   node A
@@ -43,17 +40,9 @@ The **single-node control layout** used by T2 keeps all three ranks on node A sh
 - Order matters: do not run a later gate until the earlier one's pass criterion is met. T0 + T1 take well under an hour.
 - The fit directory must be on the shared filesystem: the head writes the F-stat epoch (`<fit_dir>/shared/epoch_NNNN/`) and the replica on node B opens it on the next message. `F-stat epoch N incomplete at <path>` on node B means storage, not code — fix the storage, never suppress the check.
 - **A fresh `FILE_STORE_DIR` per run** (`FILE_STORE_DIR=$G/<gate>/`): a run that finds an existing store RESUMES from it — a store written with another walker count aborts with `walker-count mismatch for branch 'gb'`, and one with the same count silently breaks the same-initial-state premise.
-- **GB gates need a loud injection.** `--stock gb_no_fg` synthetic has no GB catalogue: the F-stat epoch reports `NO peaks`, births fall back to the prior, nothing is accepted, and every replica trivially agrees — the run exercises the transport and `gb_sync` only, never the ledger or the merge. There is no env knob for the injection table; launch the runbook's six-line driver instead of `run_global.py` for T1, T2 and T4 (a live fixture shows `20 peaks` on the epoch line and hashes that change every iteration):
-  ```python
-  # gate_gb.py -- run from the repo root, launched exactly like run_global.py
-  from lisatools.globalfit.stock import erebor
-  fit = erebor.get_stock("gb_no_fg")
-  # amplitude, f0 [Hz], fdot, fddot, phi0, iota, psi, lambda, beta (GBGPU order)
-  fit.general.gb_injection_params = [[1e-21, 7.5e-3, 1e-16, 0.0, 1.2, 0.9, 1.0, 4.0, -0.6]]
-  fit.run()
-  ```
+- **GB gates need a loud injection** (the driver does it by default). `--stock gb_no_fg` synthetic has no GB catalogue: the F-stat epoch reports `NO peaks`, births fall back to the prior, nothing is accepted, and every replica trivially agrees — the run exercises the transport and `gb_sync` only, never the ledger or the merge. There is no env knob for the injection table; `gate_run.py` sets `fit.general.gb_injection_params` to the WP7 runbook's loud in-band binary (a live fixture shows `20 peaks` on the epoch line and hashes that change every iteration).
   Expected, benign warnings on every run: `No 'GB' catalogue found; GB SNR-cut injection skipped`, `sig-het nt_layer=64 does not divide Nt ... snapping`, and `multi-rank run: submission residual dump SKIPPED` (a known TODO, not a failure).
-- **Run the campaign's sig-het pins** (the export block above). The stock defaults differ from `submit_gf_6mo_v8.sh`: `SIGHET_NT_LAYER` 64 (snapped to 60, a 36 h stride the sig-het v4 notes flagged as 2.2x too coarse) vs 120, `SIGHET_N_CP` AUTO vs 256, `GB_SIGHET_REFRESH_EVERY` 0 (reference never refreshed) vs 25, `GB_SIGHET_TRUST_PHASE_C` 0 vs 49, drift check off vs on. T1 (2026-09-17) ran the stock defaults on both sides of its control, so its verdict stands; every gate from here runs the pins, and anything that reads accuracy (T4+) needs them.
+- **Every gate runs the campaign's sig-het pins** through `scripts/diagnostics/gate_run.py`, which reads the `export SIGHET_*` / `GB_SIGHET_*` lines of `submit_gf_6mo_v8.sh` at launch (single source of truth; `tests/test_gate_run.py`). The stock defaults differ from `submit_gf_6mo_v8.sh`: `SIGHET_NT_LAYER` 64 (snapped to 60, a 36 h stride the sig-het v4 notes flagged as 2.2x too coarse) vs 120, `SIGHET_N_CP` AUTO vs 256, `GB_SIGHET_REFRESH_EVERY` 0 (reference never refreshed) vs 25, `GB_SIGHET_TRUST_PHASE_C` 0 vs 49, drift check off vs on. T1 (2026-09-17) ran the stock defaults on both sides of its control, so its verdict stands; every gate from here runs the pins, and anything that reads accuracy (T4+) needs them.
 - Pull `dev` again before T3: the MBH `Q` prior fix (linear-column log-uniform on [1, 10]) lands after T0-T2 were written; the all_sources gates need it.
 
 ## Pass/fail signals (what to grep)
@@ -79,12 +68,12 @@ The **single-node control layout** used by T2 keeps all three ranks on node A sh
 ```sh
 # 1. two-node layout dry run
 NWALKERS=1 GF_LAYOUT_DRY_RUN=1 GPUS=0 timeout 300 mpiexec -n 3 -ppn 1 \
-  python scripts/run_global.py --stock gb_no_fg 2>&1 | tee "$G/T0_dryrun.log"
+  python scripts/diagnostics/gate_run.py --stock gb_no_fg 2>&1 | tee "$G/T0_dryrun.log"
 # 2. trigger controls
 NWALKERS=1 GF_ONE_WALKER_REPLICAS=0 GF_LAYOUT_DRY_RUN=1 GPUS=0 timeout 300 mpiexec -n 3 -ppn 1 \
-  python scripts/run_global.py --stock gb_no_fg 2>&1 | tee "$G/T0_knob_off.log"
+  python scripts/diagnostics/gate_run.py --stock gb_no_fg 2>&1 | tee "$G/T0_knob_off.log"
 NWALKERS=2 GF_LAYOUT_DRY_RUN=1 GPUS=0 timeout 300 mpiexec -n 3 -ppn 1 \
-  python scripts/run_global.py --stock gb_no_fg 2>&1 | tee "$G/T0_two_walkers.log"
+  python scripts/diagnostics/gate_run.py --stock gb_no_fg 2>&1 | tee "$G/T0_two_walkers.log"
 # 3. submit scripts
 bash -n scripts/fstat_proposal/submit_gf_6mo_v8.sh && bash -n scripts/fstat_proposal/submit_gf_6mo_v8_nogb_null.sh && echo SYNTAX_OK
 python -m unittest tests.test_submit_scripts_layout -v 2>&1 | tail -4
@@ -104,7 +93,7 @@ Pass: the replica layout header identical on all three ranks; rank 1 on the othe
 
 ```sh
 FILE_STORE_DIR=$G/T1/ NUM_ITERATIONS=4 GPUS=0 timeout 3600 mpiexec -n 3 -ppn 1 \
-  python gate_gb.py 2>&1 | tee "$G/T1.log"
+  python scripts/diagnostics/gate_run.py --stock gb_no_fg 2>&1 | tee "$G/T1.log"
 python scripts/diagnostics/gf_run_log_digest.py <run_dir> | tee "$G/T1_digest.txt"
 ```
 Pass: the epoch line reports peaks (not `NO peaks`) and the `[FANOUT_DIGEST]` hashes change between iterations (the run is moving); completes; no WARNING-class `[GB_REPLICA]` line; `replicas_agree` counted on every iteration (a `False` is informational on GPU — the lnL guard is the criterion); `[FANOUT]` table shows `gb_run_proposal`, `gb_run_tempering`, `gb_finish`, `gb_sync` all served by rank 1 with `max_rank_s` comparable to the head's; the F-stat epoch opened on node B without the `incomplete` error.
@@ -115,9 +104,9 @@ What it exonerates: the cross-node transport for every GB op, the ledger's devic
 
 ```sh
 # (c) two nodes -- the primary layout, same seeds
-FILE_STORE_DIR=$G/T2c/ NUM_ITERATIONS=4 GPUS=0 timeout 3600 mpiexec -n 3 -ppn 1 python gate_gb.py 2>&1 | tee "$G/T2c.log"
+FILE_STORE_DIR=$G/T2c/ NUM_ITERATIONS=4 GPUS=0 timeout 3600 mpiexec -n 3 -ppn 1 python scripts/diagnostics/gate_run.py --stock gb_no_fg 2>&1 | tee "$G/T2c.log"
 # (a) one node, both replicas on node A's single GPU
-FILE_STORE_DIR=$G/T2a/ NUM_ITERATIONS=4 GPUS=0 RANKS_PER_GPU=2 timeout 3600 mpiexec -n 3 -ppn 3 python gate_gb.py 2>&1 | tee "$G/T2a.log"
+FILE_STORE_DIR=$G/T2a/ NUM_ITERATIONS=4 GPUS=0 RANKS_PER_GPU=2 timeout 3600 mpiexec -n 3 -ppn 3 python scripts/diagnostics/gate_run.py --stock gb_no_fg 2>&1 | tee "$G/T2a.log"
 ```
 Pass: `log_like` / `coords` / `inds` digests of (c) and (a) agree to the multi-walker gate's tolerance (decisions bit-identical, `log_like` within 1e-12 relative); no lnL-guard warning in either. The fabric and the node placement must not change the chain.
 **Controls:** (c) run twice with the same `random_seed` → identical digests (determinism, so a (c)/(a) mismatch would mean something); (c) with a different seed → digests differ (the digest is sensitive).
@@ -127,9 +116,9 @@ Pass: `log_like` / `coords` / `inds` digests of (c) and (a) agree to the multi-w
 Two nodes, `--stock all_sources` synthetic (first run with MBH/EMRI/SOBBH + PSD at one walker), `NUM_ITERATIONS=3`, same seeds:
 ```sh
 B="NUM_ITERATIONS=3 GPUS=0"
-env $B FILE_STORE_DIR=$G/T3_base/ timeout 5400 mpiexec -n 3 -ppn 1 python scripts/run_global.py --stock all_sources 2>&1 | tee "$G/T3_base.log"
-env $B FILE_STORE_DIR=$G/T3_ar_off/ MBH_LIKELIHOOD_FANOUT=0 EMRI_LIKELIHOOD_FANOUT=0 SOBBH_LIKELIHOOD_FANOUT=0 timeout 5400 mpiexec -n 3 -ppn 1 python scripts/run_global.py --stock all_sources 2>&1 | tee "$G/T3_ar_off.log"
-env $B FILE_STORE_DIR=$G/T3_psd_off/ PSD_LIKELIHOOD_FANOUT=0 GALFOR_LIKELIHOOD_FANOUT=0 timeout 5400 mpiexec -n 3 -ppn 1 python scripts/run_global.py --stock all_sources 2>&1 | tee "$G/T3_psd_off.log"
+env $B FILE_STORE_DIR=$G/T3_base/ timeout 5400 mpiexec -n 3 -ppn 1 python scripts/diagnostics/gate_run.py --stock all_sources 2>&1 | tee "$G/T3_base.log"
+env $B FILE_STORE_DIR=$G/T3_ar_off/ MBH_LIKELIHOOD_FANOUT=0 EMRI_LIKELIHOOD_FANOUT=0 SOBBH_LIKELIHOOD_FANOUT=0 timeout 5400 mpiexec -n 3 -ppn 1 python scripts/diagnostics/gate_run.py --stock all_sources 2>&1 | tee "$G/T3_ar_off.log"
+env $B FILE_STORE_DIR=$G/T3_psd_off/ PSD_LIKELIHOOD_FANOUT=0 GALFOR_LIKELIHOOD_FANOUT=0 timeout 5400 mpiexec -n 3 -ppn 1 python scripts/diagnostics/gate_run.py --stock all_sources 2>&1 | tee "$G/T3_psd_off.log"
 ```
 Pass: the three runs give identical `log_like`/`coords`/`inds` digests (where a row is scored must not change the chain) and identical `replicas_agree` counts (the replays run regardless of the knob). Runs 2 and 3 are slower — that is the point. Grep `inner proposal: eigen` for PSD and galfor, and a nonzero PSD in-model acceptance.
 What it exonerates: addremove row scatter + expose/setup/fold replays; PSD row scatter + begin/publish replays; the PSD eigen inner at one walker; the MBH `Q` prior fix (no `AssertionError: m1 should be the larger mass`).
@@ -139,16 +128,16 @@ What it exonerates: addremove row scatter + expose/setup/fold replays; PSD row s
 
 ```sh
 # single rank, no replicas, node A only
-FILE_STORE_DIR=$G/T4_single/ NUM_ITERATIONS=100 GPUS=0 timeout 43200 mpiexec -n 1 python scripts/run_global.py --stock all_sources 2>&1 | tee "$G/T4_single.log"
+FILE_STORE_DIR=$G/T4_single/ NUM_ITERATIONS=100 GPUS=0 timeout 43200 mpiexec -n 1 python scripts/diagnostics/gate_run.py --stock all_sources 2>&1 | tee "$G/T4_single.log"
 # two replicas across the nodes
-FILE_STORE_DIR=$G/T4_replicas/ NUM_ITERATIONS=100 GPUS=0 timeout 43200 mpiexec -n 3 -ppn 1 python scripts/run_global.py --stock all_sources 2>&1 | tee "$G/T4_replicas.log"
+FILE_STORE_DIR=$G/T4_replicas/ NUM_ITERATIONS=100 GPUS=0 timeout 43200 mpiexec -n 3 -ppn 1 python scripts/diagnostics/gate_run.py --stock all_sources 2>&1 | tee "$G/T4_replicas.log"
 ```
 NOT expected bit-identical (each rank draws its own GB RJ proposals). Compare through the `processing-gf-snapshots` flow: GB acceptance rates per move, cold-chain leaf counts vs truth, per-band `band_temps`, addremove acceptance and `acceptance_fraction` (finite, never nan), PSD acceptance under the eigen inner. Pass: distributions overlap; no systematic offset in leaf counts or ladders.
 **Control:** two single-rank runs with different `random_seed` — the replica-vs-single spread must be no larger than the seed-vs-seed spread.
 
 ### T5 — scaling readout (≈1 h)
 
-Two replicas (the primary layout) vs four replicas, one per node: `salloc --nodes=4 --gres=gpu:1 --ntasks-per-node=2`, then `GPUS=0 mpiexec -n 5 -ppn 1 python scripts/run_global.py --stock all_sources` (ranks 0-3 replicas on nodes A-D, rank 4 saver on A). If four nodes are not grantable, two replicas per node's GPU: `--nodes=2`, `GPUS=0 RANKS_PER_GPU=2 mpiexec -n 5 -ppn 2` (ranks 0,1 on A; 2,3 on B; saver 4 on A; `--ntasks-per-node=3`; expect the OOM row of the triage table for all_sources). `NUM_ITERATIONS=5`, `PSD_NTEMPS` / MBH `ntemps` ≥ n_compute.
+Two replicas (the primary layout) vs four replicas, one per node: `salloc --nodes=4 --gres=gpu:1 --ntasks-per-node=2`, then `GPUS=0 mpiexec -n 5 -ppn 1 python scripts/diagnostics/gate_run.py --stock all_sources` (ranks 0-3 replicas on nodes A-D, rank 4 saver on A). If four nodes are not grantable, two replicas per node's GPU: `--nodes=2`, `GPUS=0 RANKS_PER_GPU=2 mpiexec -n 5 -ppn 2` (ranks 0,1 on A; 2,3 on B; saver 4 on A; `--ntasks-per-node=3`; expect the OOM row of the triage table for all_sources). `NUM_ITERATIONS=5`, `PSD_NTEMPS` / MBH `ntemps` ≥ n_compute.
 Record per family from `[GB_TIMING]`, `[PSD_TIMING]`, the addremove leaf lines and the `[FANOUT]` table. Expectations: addremove per-leaf time ~ 1/min(n_compute, ntemps) of single-rank (the info-matrix batch scales best); PSD similar plus the eigen refresh (`{P}_EIGEN_REFRESH` default 10); GB proposals and open/close ~1/R, the swap-grid build and the tempering census NOT — not a regression. Cross-node cost shows up as `max_rank_s` minus the head's own time in the `[FANOUT]` table. Decide `ntemps` for the real run here.
 
 ### T6 — real-data shape through the campaign script (hours)
