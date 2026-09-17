@@ -244,6 +244,33 @@ class RunValidateGateTest(unittest.TestCase):
         ok, why = self._validate(self._fake_state(nt_branch=6))
         self.assertFalse(ok)
         self.assertIn("ladder", why)
+        self.assertIn("config", why)
+
+    def test_ladder_matching_the_store_passes_despite_the_config(self):
+        """2026-09-17: a store born at 8 rungs, script back at 12.
+
+        The resume builds at the STORE's count (recipe.resume_ladder_wins),
+        so a checkpoint carrying the store's ladder is compatible even
+        though the configured knob disagrees. Rejecting it threw away the
+        iteration's progress on every spot requeue.
+        """
+        from lisatools.globalfit.run import GlobalFit
+
+        fake = self._fake_self()
+        fake._stored_branch_ntemps = {"mbh": 6}
+        ok, why = GlobalFit._midit_checkpoint_validate(
+            fake, self._fake_state(nt_branch=6))
+        self.assertTrue(ok, why)
+
+    def test_ladder_disagreeing_with_the_store_is_still_rejected(self):
+        from lisatools.globalfit.run import GlobalFit
+
+        fake = self._fake_self()
+        fake._stored_branch_ntemps = {"mbh": 4}
+        ok, why = GlobalFit._midit_checkpoint_validate(
+            fake, self._fake_state(nt_branch=6))
+        self.assertFalse(ok)
+        self.assertIn("store", why)
 
     def test_ndim_change_rejected(self):
         ok, why = self._validate(self._fake_state(ndim=9))
@@ -256,6 +283,38 @@ class RunValidateGateTest(unittest.TestCase):
         ok, why = self._validate(state)
         self.assertFalse(ok)
         self.assertIn("branch set", why)
+
+
+class StoredBranchNtempsReadTest(unittest.TestCase):
+    """The cheap attrs read that feeds the gate."""
+
+    def test_reads_sub_backend_ntemps_attrs(self):
+        import h5py
+
+        from lisatools.globalfit.run import GlobalFit
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "store.h5")
+            with h5py.File(path, "w") as f:
+                sb = f.create_group("mcmc").create_group("sub_backend")
+                sb.create_group("sobbh").attrs["ntemps"] = 8
+                sb.create_group("mbh").attrs["ntemps"] = 2
+                sb.create_group("gb")  # no attr
+            backend = types.SimpleNamespace(
+                name="mcmc", open=lambda mode="r": h5py.File(path, mode))
+            got = GlobalFit._read_stored_branch_ntemps(
+                backend, ["sobbh", "mbh", "gb", "emri"])
+        self.assertEqual(got, {"sobbh": 8, "mbh": 2})
+
+    def test_unreadable_store_yields_empty(self):
+        from lisatools.globalfit.run import GlobalFit
+
+        def _boom(mode="r"):
+            raise OSError("torn")
+
+        backend = types.SimpleNamespace(name="mcmc", open=_boom)
+        self.assertEqual(
+            GlobalFit._read_stored_branch_ntemps(backend, ["sobbh"]), {})
 
 
 if __name__ == "__main__":
