@@ -9,7 +9,10 @@ Design authority: `docs/superpowers/specs/2026-09-16-one-walker-replicas-design.
 Every gate runs on **2 nodes with 1 GPU each**, one replica per node:
 
 ```sh
-salloc --partition=gpu-80-spot --nodes=2 --gres=gpu:1 --ntasks-per-node=2 --time=02:00:00
+salloc --partition=gpu-80-spot --nodes=2 --gres=gpu:1 --ntasks-per-node=2 --cpus-per-task=2 --mem=0 --time=03:00:00
+#   --mem=0 (whole-node RAM, as the campaign script requests) is load-bearing: every rank runs the
+#   full build before the roles resolve, so node A holds TWO builds (head + saver) in host memory;
+#   all_sources under the partition's default per-job limit was OOM-killed there (2026-09-17)
 source /shared/home/mlkatz1/envs/gf_env/bin/activate
 cd /shared/home/mlkatz1/lisa-analysis-tools && git checkout dev && git pull --ff-only
 
@@ -163,6 +166,7 @@ NWALKERS=1 NGPUS=2 NODES=2 GF_LEGACY_RANK_LAYOUT=0 NUM_ITERATIONS=20 MIDIT_CHECK
 | `acceptance_fraction` nan / RuntimeWarning divide | outer counters not advanced (eigen inner) | PSD: `_inner_propose` bookkeeping; fixed in Plan 1, would be a regression |
 | replica layout not selected | `NWALKERS` not 1 on the compute ranks or `GF_ONE_WALKER_REPLICAS` falsy | the `[SUBMIT]` echo; the layout dry run |
 | all_sources OOMs with two ranks on one GPU (T2 (a), T5 fallback) | two full replicas + two ACAs per device | that is what the one-GPU-per-node layout avoids; keep (a) to GB-only |
+| `BAD TERMINATION ... KILLED BY SIGNAL: 9` on ranks 0 and 2 + SLURM `oom_kill event` | HOST memory: head + saver both build the full fit on node A under the partition's default RAM limit | allocate with `--mem=0 --cpus-per-task=2`; remove the killed attempt's store dir before re-running; the lite twin (`all_sources_lite`) is the fallback fixture |
 
 ## Evidence to bring back
 
