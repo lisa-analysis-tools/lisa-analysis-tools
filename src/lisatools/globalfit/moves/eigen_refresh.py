@@ -50,6 +50,29 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
+def _prior_entries(prob_dist_container):
+    """``[(column indices, distribution), ...]``, key-spelling agnostic.
+
+    Read the container's PARSED ``priors`` list — eryn's
+    :class:`~eryn.priors.probdist.ProbDistContainer` normalises every key
+    spelling it accepts (``int``, ``str``, and tuples of either) into
+    ``[column_index_array, dist]`` entries there, so this is the only view
+    that sees a string-keyed container's columns at all.
+
+    ``priors_in`` is the fallback for duck-typed containers that carry only
+    the raw mapping; it can resolve INTEGER keys only, because a string key
+    carries no column index outside the parser.
+    """
+    parsed = getattr(prob_dist_container, "priors", None)
+    if parsed is not None:
+        return [(np.atleast_1d(np.asarray(inds)), dist) for inds, dist in parsed]
+    return [
+        (np.atleast_1d(np.asarray(key)), dist)
+        for key, dist in prob_dist_container.priors_in.items()
+        if isinstance(key, (int, np.integer))
+    ]
+
+
 def prior_box_widths(prob_dist_container, ndim):
     """Per-column prior box widths from an eryn prior container.
 
@@ -59,27 +82,88 @@ def prior_box_widths(prob_dist_container, ndim):
     back to unit widths). Columns without a scalar distribution, and any
     reader failure, fall back to width 1.0 so the table build degrades
     instead of crashing.
+
+    **Read the columns through** :func:`_prior_entries`, never off
+    ``priors_in`` keys. Half the stock branches spell their prior dict with
+    LABELS rather than column indices — ``psd`` (``psd_prior_dict``:
+    ``r"$S_{\\rm oms}$"``), ``mbh`` (``"logM"``, ...), ``emri`` and ``sobbh``
+    (their ``input_basis`` names) — and an index-keyed reader silently
+    resolves NONE of those columns. Unit widths there are not a harmless
+    default: the psd levels live at ~1e-11 / ~1e-14 in boxes 1.9e-10 /
+    2.0e-13 wide, so width 1.0 overstates the box by 5e9x / 5e12x, which
+    puts every finite-difference corner AND every capped eigen step far
+    outside the prior (2026-09-16 one-walker defect: psd in-model
+    acceptance exactly 0, "All points entering likelihood have a log prior
+    of minus inf" on every repeat).
+
+    A column the container DOES cover but whose distribution exposes no
+    FINITE, positive box (eryn distributions default ``minimum`` /
+    ``maximum`` to -inf / +inf, and :func:`prior_box_scales` maps such a
+    width back to 1.0) is reported once per ``(ndim, columns)`` rather than
+    defaulting silently — that silence is what hid the defect above.
+    Columns the container does not cover at all (fixed / per-leaf-filled
+    parameters) keep width 1.0 quietly, as before. A reader failure keeps
+    the columns read up to that point (unit widths elsewhere) and warns.
     """
     lo = np.zeros(ndim)
     hi = np.ones(ndim)
+    covered = []
+    unread = []
     try:
-        pri = prob_dist_container.priors_in
-        for col, dist in pri.items():
-            idx = col if isinstance(col, (int, np.integer)) else None
-            if idx is None or not (0 <= int(idx) < ndim):
+        for cols, dist in _prior_entries(prob_dist_container):
+            cols_all = [int(c) for c in cols.ravel()]
+            keep = np.array([0 <= c < ndim for c in cols_all], dtype=bool)
+            if not keep.any():
                 continue
+            cols_in = [c for c, k in zip(cols_all, keep) if k]
             _mn = getattr(dist, "minimum", getattr(dist, "min_val", None))
             _mx = getattr(dist, "maximum", getattr(dist, "max_val", None))
             if _mn is None or _mx is None:
+                unread.extend(cols_in)
                 continue
-            lo[int(idx)] = float(_mn)
-            hi[int(idx)] = float(_mx)
+            try:
+                # a scalar bound on a multi-column (tuple-keyed) entry
+                # applies to each of its columns; a per-column array must
+                # match the entry's columns one for one — masked TOGETHER
+                # with the columns, so an out-of-range column cannot shift
+                # the others' bounds
+                mn = np.broadcast_to(np.asarray(_mn, dtype=float), (len(cols_all),))[keep]
+                mx = np.broadcast_to(np.asarray(_mx, dtype=float), (len(cols_all),))[keep]
+            except (TypeError, ValueError):
+                unread.extend(cols_in)
+                continue
+            lo[cols_in] = mn
+            hi[cols_in] = mx
+            covered.extend(cols_in)
     except Exception as exc:  # never break the sampler on an exotic prior
         logger.warning(
-            "[eigen_refresh] prior box unavailable (%r); falling back to "
-            "unit widths", exc,
+            "[eigen_refresh] prior box unavailable (%r); keeping the columns "
+            "read so far, unit widths elsewhere", exc,
         )
+    width = hi - lo
+    unread.extend(c for c in covered if not np.isfinite(width[c]) or width[c] <= 0)
+    if unread:
+        _warn_unread(ndim, tuple(sorted(set(unread))))
     return prior_box_scales(lo, hi)
+
+
+# (ndim, columns) already reported by _warn_unread: addremove calls
+# prior_box_widths once per leaf per refresh, so an unbounded column would
+# otherwise log one identical line per leaf.
+_UNREAD_WARNED = set()
+
+
+def _warn_unread(ndim, cols):
+    key = (int(ndim), tuple(cols))
+    if key in _UNREAD_WARNED:
+        return
+    _UNREAD_WARNED.add(key)
+    logger.warning(
+        "[eigen_refresh] prior columns %s expose no finite positive "
+        "(minimum, maximum) box; using unit width there — the eigen steps "
+        "and the prior-box cap on those columns are NOT in the parameter's "
+        "own units.", list(cols),
+    )
 
 
 def _fallback_table(widths):

@@ -1,6 +1,8 @@
 """Rank roles + walker-block layout resolved identically on every rank (FakeComm)."""
 
+import os
 import unittest
+from unittest import mock
 
 from lisatools.globalfit.communication.fakecomm import FakeWorld
 from lisatools.globalfit.communication.ranks import (
@@ -428,6 +430,58 @@ class LayoutDryRunTest(unittest.TestCase):
         self.assertTrue(layout_dry_run(lay, None, environ=armed, out=lines.append))
         self.assertTrue(any("head" in ln for ln in lines))
         self.assertFalse(layout_dry_run(lay, None, environ={}, out=lines.append))
+
+
+class ReplicaModeTest(unittest.TestCase):
+    def test_one_walker_on_two_compute_ranks_is_replica_mode(self):
+        world = FakeWorld(3, nodes=[0, 0, 0])
+        outs = _layouts(world, 1, [0, 1])
+        lay = outs[0]
+        self.assertTrue(lay.replica_mode)
+        self.assertEqual(lay.compute_ranks, (0, 1))
+        self.assertEqual(lay.n_replicas, 2)
+        self.assertEqual(lay.block, 1)
+        for r in lay.compute_ranks:
+            self.assertEqual(lay.block_of(r), (0, 1))
+        self.assertEqual([lay.replica_index(r) for r in lay.compute_ranks], [0, 1])
+        self.assertIn("REPLICAS", lay.describe())
+        for r in range(3):
+            self.assertEqual(outs[r].digest(), lay.digest())
+
+    def test_more_walkers_is_unchanged(self):
+        lay = _layouts(FakeWorld(3), 4, [0, 1])[0]
+        self.assertFalse(lay.replica_mode)
+        self.assertEqual(lay.n_replicas, 1)
+        self.assertEqual(lay.block_of(0), (0, 2))
+        self.assertEqual(lay.block_of(1), (2, 4))
+        self.assertEqual(lay.replica_index(1), 0)
+        self.assertNotIn("REPLICAS", lay.describe())
+
+    def test_one_walker_one_compute_rank_is_single(self):
+        lay = _layouts(FakeWorld(1), 1, [0])[0]
+        self.assertFalse(lay.replica_mode)
+        self.assertTrue(lay.is_single())
+        self.assertEqual(lay.block_of(0), (0, 1))
+
+    def test_escape_hatch_refuses_replica_mode(self):
+        with mock.patch.dict(os.environ, {"GF_ONE_WALKER_REPLICAS": "0"}):
+            with self.assertRaises(RuntimeError):  # FakeWorld re-raises rank failures
+                _layouts(FakeWorld(3), 1, [0, 1])
+
+    def test_truthy_string_still_selects_replica_mode(self):
+        """F7: parsed like the likelihood-fanout knob, not a bare '== "1"' check."""
+        with mock.patch.dict(os.environ, {"GF_ONE_WALKER_REPLICAS": "true"}):
+            lay = _layouts(FakeWorld(3, nodes=[0, 0, 0]), 1, [0, 1])[0]
+            self.assertTrue(lay.replica_mode)
+
+    def test_falsy_string_refuses_replica_mode(self):
+        with mock.patch.dict(os.environ, {"GF_ONE_WALKER_REPLICAS": "false"}):
+            with self.assertRaises(RuntimeError):  # FakeWorld re-raises rank failures
+                _layouts(FakeWorld(3), 1, [0, 1])
+
+    def test_non_divisible_still_raises(self):
+        with self.assertRaises(RuntimeError):
+            _layouts(FakeWorld(3), 3, [0, 1])
 
 
 if __name__ == "__main__":

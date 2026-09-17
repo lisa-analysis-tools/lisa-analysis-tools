@@ -1,6 +1,8 @@
 """WalkerFanoutMixin: direct call with one compute rank; slice/run/merge with several."""
 
+import os
 import unittest
+from unittest import mock
 
 import numpy as np
 from eryn.moves.tempering import TemperatureControl
@@ -317,6 +319,84 @@ class PooledLadderStepTest(unittest.TestCase):
         np.testing.assert_array_equal(
             pooled_ladder_step(one, np.array(one.betas), np.zeros(0), np.zeros(0)), one.betas
         )
+
+
+class _ReplicaStub(WalkerFanoutMixin):
+    gf_move_name = "stub"
+    fanout_branches = ["mbh"]
+    branch_name = "mbh"
+
+    def __init__(self):
+        self.calls = []
+        self.tc = TemperatureControl(2, 1, ntemps=3, permute=False)
+        self.tc.adaptive = True
+
+    def fanout_temperature_controls(self):
+        return [self.tc]
+
+    def propose_local(self, model, state):
+        self.calls.append((model, state))
+        return state, np.zeros((3, 1), dtype=bool)
+
+    def serve_echo(self, payload, clock, model):
+        return {"echo": payload, "stage": clock.get("stage")}
+
+
+class ReplicaModeMixinTest(unittest.TestCase):
+    def _world(self, head_fn, env=None):
+        world = FakeWorld(3, nodes=[0, 0, 0])
+        moves = {}
+
+        def fn(rank, comm):
+            layout = build_layout(comm, 1, [0, 1], legacy=False)
+            fcomm = layout.make_fanout_comm(comm)
+            if layout.role_of(rank) == RankRole.SAVER:
+                return "saver"
+            fo = WalkerFanout(fcomm, layout, rank, model=None)
+            move = _ReplicaStub()
+            with mock.patch.dict(os.environ, env or {}):
+                move.install_walker_fanout(_Curr(fo, rank))
+            moves[rank] = move
+            if layout.role_of(rank) == RankRole.HEAD:
+                fo.enter_stage("pe", "pe")
+                try:
+                    return head_fn(move, fo)
+                finally:
+                    fo.stop()
+            return ComputeService(fcomm, layout, rank, registry={("pe", "stub"): move}).serve()
+
+        return world.run(fn), moves
+
+    def test_head_runs_the_body_on_the_full_state_and_ranks_serve_nothing(self):
+        sentinel = object()
+
+        def head(move, fo):
+            new, acc = move.propose("head-model", sentinel)
+            return new is sentinel, acc.shape, move.calls[0][0]
+
+        out, moves = self._world(head)
+        self.assertEqual(out[0], (True, (3, 1), "head-model"))
+        self.assertEqual(out[1], 0)  # the worker served no propose
+        for r in (0, 1):
+            self.assertIsNotNone(moves[r].row_fanout)
+            self.assertTrue(moves[r].rows_active())
+            self.assertTrue(moves[r].tc.adaptive)  # single-process semantics: ladders adapt in the body
+
+    def test_knob_off_keeps_rows_local(self):
+        out, moves = self._world(lambda move, fo: move.rows_active(),
+                                 env={"MBH_LIKELIHOOD_FANOUT": "0"})
+        self.assertFalse(out[0])
+        self.assertFalse(moves[0].likelihood_fanout)
+
+    def test_gf_serve_dispatches_serve_methods(self):
+        move = _ReplicaStub()
+        out = move.gf_serve("echo", {"a": 1}, {"stage": "pe"}, None)
+        self.assertEqual(out, {"echo": {"a": 1}, "stage": "pe"})
+        self.assertEqual(move.gf_clock, {"stage": "pe"})
+        with self.assertRaises(ValueError):
+            move.gf_serve("nope", {}, {}, None)
+        with self.assertRaises(ValueError):
+            move.gf_serve("_private", {}, {}, None)
 
 
 if __name__ == "__main__":

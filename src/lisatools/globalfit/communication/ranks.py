@@ -29,6 +29,12 @@ import numpy as np
 
 LEGACY_ENV = "GF_LEGACY_RANK_LAYOUT"
 
+#: parsed like the likelihood-fanout knob: any value other than
+#: ``0``/``false``/``False``/empty enables replica mode (the default, when
+#: unset); ``0``/``false``/``False``/empty refuses a one-walker run on
+#: several compute ranks (today's error).
+ONE_WALKER_ENV = "GF_ONE_WALKER_REPLICAS"
+
 
 class RankRole(enum.Enum):
     HEAD = "head"
@@ -70,6 +76,9 @@ class WalkerBlockLayout:
     legacy: bool = False
     #: human-readable notes about non-default choices (e.g. the size-2 fallback)
     notes: tuple = ()
+    #: nwalkers == 1 on several compute ranks: every compute rank holds the
+    #: single walker (block (0, 1)); the replicas split the work inside moves
+    replica_mode: bool = False
 
     @property
     def n_compute(self) -> int:
@@ -81,6 +90,14 @@ class WalkerBlockLayout:
 
     def is_single(self) -> bool:
         return self.n_compute == 1
+
+    @property
+    def n_replicas(self) -> int:
+        return self.n_compute if self.replica_mode else 1
+
+    def replica_index(self, rank) -> int:
+        """Position among the replicas (head = 0); 0 outside replica mode."""
+        return self.fanout_rank(rank) if self.replica_mode else 0
 
     def role_of(self, rank) -> RankRole:
         return self.placements[int(rank)].role
@@ -122,6 +139,7 @@ class WalkerBlockLayout:
             f"nwalkers={self.nwalkers} block={self.block} "
             f"gpus_per_rank={gpk} ranks_per_gpu={self.ranks_per_gpu}"
             f"{' LEGACY' if self.legacy else ''}"
+            f"{' REPLICAS' if self.replica_mode else ''}"
         )
         lines = [head]
         for r in range(self.size):
@@ -248,12 +266,23 @@ def build_layout(
         warnings.warn(note, UserWarning, stacklevel=2)
     nwalkers = int(nwalkers)
     n_compute = len(compute)
-    if nwalkers % n_compute:
+    replica_mode = False
+    if nwalkers == 1 and n_compute > 1:
+        _one_walker_env = os.environ.get(ONE_WALKER_ENV, "1")
+        if _one_walker_env.strip() in ("0", "false", "False", ""):
+            raise ValueError(
+                f"nwalkers=1 on {n_compute} compute ranks needs one-walker replica mode, "
+                f"which {ONE_WALKER_ENV}=0 disables (unset it, or run one compute rank)."
+            )
+        replica_mode = True
+        block = 1
+    elif nwalkers % n_compute:
         raise ValueError(
             f"nwalkers={nwalkers} is not divisible by the compute-rank count {n_compute}: "
             "equal walker blocks are required (pick NWALKERS as a multiple of it)."
         )
-    block = nwalkers // n_compute
+    else:
+        block = nwalkers // n_compute
 
     if size == 1 or not hasattr(comm, "Split_type"):
         table = [(_proc_name(comm), 0)]
@@ -314,9 +343,8 @@ def build_layout(
             else:
                 devices, slot = (pool[i // m],), i % m
             bi = compute.index(r)
-            placements[r] = RankPlacement(
-                r, role, node, local_index, devices, slot, bi * block, (bi + 1) * block
-            )
+            w0, w1 = (0, 1) if replica_mode else (bi * block, (bi + 1) * block)
+            placements[r] = RankPlacement(r, role, node, local_index, devices, slot, w0, w1)
     if k_explicit is not None:
         resolved_k = k_explicit
     elif resolved_ks and len(set(resolved_ks)) == 1:
@@ -336,6 +364,7 @@ def build_layout(
         ranks_per_gpu=m,
         legacy=bool(legacy),
         notes=tuple(notes),
+        replica_mode=replica_mode,
     )
 
 

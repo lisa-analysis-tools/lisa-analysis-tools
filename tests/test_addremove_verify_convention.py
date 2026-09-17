@@ -44,6 +44,11 @@ def _stub(acs_like, like_kwargs=None, mode="warn"):
     s._verify_prev_logl = (
         ResidualAddOneRemoveOneMove._verify_prev_logl.__get__(s)
     )
+    s.row_fanout = None
+    s.likelihood_fanout = True
+    s.rows_active = ResidualAddOneRemoveOneMove.rows_active.__get__(s)
+    s._check_like_local = ResidualAddOneRemoveOneMove._check_like_local.__get__(s)
+    s.compute_check_like = ResidualAddOneRemoveOneMove.compute_check_like.__get__(s)
     return s
 
 

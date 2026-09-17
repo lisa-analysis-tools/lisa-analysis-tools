@@ -182,7 +182,10 @@ SRC_ROOT = os.path.join(REPO_ROOT, "src")
 #: the tmpdir and is dumped only when the arm fails)
 MARKER = "[gbsmoke-arm]"
 
-#: two compute ranks -> a 2-walker block each
+#: two compute ranks -> a 2-walker block each. ``NWALKERS = 1`` instead puts
+#: the layout in ONE-WALKER REPLICA mode (``build_layout``: every compute rank
+#: owns block (0, 1) and the GB move disperses the BANDS across the replicas),
+#: which is what ``test_one_walker_two_replicas`` exercises.
 NWALKERS = 4
 ITERATIONS = 2
 #: FakeWorld watchdog, and the per-arm subprocess timeout. Generous, but far
@@ -272,6 +275,36 @@ class _VertCounter(logging.Handler):
         self.accepted += int(match.group(4))
 
 
+class _LogCapture(logging.Handler):
+    """Every ``lisatools`` record's formatted message, for the test to grep.
+
+    The one-walker arm's whole cross-replica claim is a LOG line -- the head's
+    ``[GB_REPLICA <move>] residual hashes disagree after sync: ...`` warning
+    (``gbspecialstretch.GBSpecialBase._replica_apply_sync``) -- so the arm has
+    to read the records rather than the run's log FILE (no path guessing, and
+    it works whatever the run's verbosity knob does; same trick as
+    :class:`_VertCounter`). ``globalfit.loginfo.init_logger`` puts the
+    ``lisatools`` logger at DEBUG during ``fit.build()`` and leaves its managed
+    console handler at WARNING, so attaching this adds no output.
+
+    ``logging.Handler.handle`` takes the handler's lock around ``emit``, which
+    is what makes this safe with FakeWorld's one thread per rank.
+    """
+
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.lines = []
+
+    def emit(self, record):  # pragma: no cover - exercised only under RUN
+        try:
+            self.lines.append(record.getMessage())
+        except Exception:
+            pass
+
+    def text(self):
+        return "\n".join(self.lines)
+
+
 def _worktree_import_problem():
     """``None`` when ``lisatools`` came from THIS worktree, else the message.
 
@@ -326,13 +359,13 @@ def _reclaim():
     gc.collect()
 
 
-def _build_fit(store_dir, inject):
+def _build_fit(store_dir, inject, nwalkers=NWALKERS):
     """The ONE build recipe both the in-process and the child path use."""
     from lisatools.globalfit.stock import erebor
 
     fit = erebor.gb_no_fg(
         debug=True,  # 3-day Tobs, tiny chunked-het grids (sizes only)
-        nwalkers=NWALKERS, ntemps=2, data_mode="synthetic",
+        nwalkers=nwalkers, ntemps=2, data_mode="synthetic",
         file_store_dir=store_dir, make_diagnostic_plots=False,
     )
     fit.general.num_iterations = ITERATIONS
@@ -342,24 +375,32 @@ def _build_fit(store_dir, inject):
     return fit
 
 
-def _world_probe(size, store_dir, inject):
+def _world_probe(size, store_dir, inject, nwalkers=NWALKERS):
     """Run ``size`` ranks over the fake world; return ``{rank: probe dict}``.
 
     Module level on purpose: the unittest path and the ``--arm`` child path must
     run byte-identical code (same seed, same build, same iteration count), so
     there is exactly one copy of it.
+
+    ``nwalkers=1`` with ``size >= 2`` is ONE-WALKER REPLICA mode (the layout
+    gives every compute rank block ``(0, 1)``); the probe is otherwise the same.
     """
     from lisatools.globalfit.communication.fakecomm import FakeWorld
-    from lisatools.globalfit.communication.ranks import prepare_rank
+    from lisatools.globalfit.communication.ranks import RankRole, prepare_rank
     from lisatools.globalfit.run import GlobalFit
 
     def fn(rank, comm):
-        fit = _build_fit(store_dir, inject)
+        fit = _build_fit(store_dir, inject, nwalkers)
         layout = prepare_rank(fit, comm)
         fit.build()
         gf = GlobalFit(fit, comm)
         gf.run_global_fit()
-        out = {"role": layout.role_of(rank).value, "acs_rows": int(gf.acs.acs_total_entries)}
+        role = layout.role_of(rank)
+        if role is RankRole.SAVER:
+            # a dedicated saver (size >= 3) never builds an ACA: it opens the
+            # HDF backend and parks in the async save loop
+            return {"role": role.value}
+        out = {"role": role.value, "acs_rows": int(gf.acs.acs_total_entries)}
         if hasattr(gf, "compute_service"):
             out["served"] = gf.compute_service_served
             return out
@@ -373,6 +414,10 @@ def _world_probe(size, store_dir, inject):
         if final is None:  # pragma: no cover - eryn API fallback
             final = gf.sampler.get_last_sample()
         sub = final.sub_states["gb"]
+        # the state OBJECT as well as the array copies: FakeWorld ranks are
+        # threads, so nothing is pickled and the replica arm can assert on
+        # ``sub_states``/``branches`` directly (the brief's contract)
+        out["state"] = final
         out["log_like"] = np.array(final.log_like[0], copy=True)
         out["coords"] = np.array(final.branches["gb"].coords, copy=True)
         out["inds"] = np.array(final.branches["gb"].inds, copy=True)
@@ -481,22 +526,39 @@ class MultiRankGBSmokeTest(unittest.TestCase):
         self.assertLess(_rss_gb(), RSS_BUDGET_GB,
                         f"GB smoke exceeded the {RSS_BUDGET_GB} GB budget")
 
-    def _run_world(self, size, env=None, subdir=None, inject=False):
-        """In-process world (two-rank scenario). Returns ``{rank: probe dict}``."""
-        store = subdir if subdir is not None else f"n{size}"
+    def _run_world(self, size, env=None, subdir=None, inject=False, nwalkers=NWALKERS):
+        """In-process world. ``{rank: probe dict}`` plus two string keys.
+
+        ``out["log"]`` is every ``lisatools`` log message the world emitted and
+        ``out["state"]`` is the head's final eryn state object (``None`` if the
+        head produced none). Integer keys are the per-rank probes, exactly as
+        before -- the string keys are additive, so the 4-walker scenarios are
+        untouched.
+        """
+        store = subdir if subdir is not None else f"n{size}w{nwalkers}"
         # set OUTSIDE the rank threads: FakeWorld ranks are threads of one
         # process and share os.environ, so a per-rank write would race
         saved = {k: os.environ.get(k) for k in (env or {})}
         os.environ.update(env or {})
+        capture = _LogCapture()
+        logging.getLogger("lisatools").addHandler(capture)
+        started = time.time()
         try:
-            return _world_probe(size, os.path.join(self.tmpdir, store), inject)
+            out = _world_probe(size, os.path.join(self.tmpdir, store), inject, nwalkers)
         finally:
+            logging.getLogger("lisatools").removeHandler(capture)
             _reclaim()
             for key, value in saved.items():
                 if value is None:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+        print(f"{MARKER} world size={size} nwalkers={nwalkers} inject={inject}: "
+              f"wall={time.time() - started:.1f}s peak_rss={_rss_gb():.2f}GB "
+              f"(budget {RSS_BUDGET_GB} GB / {TIMEOUT_S:.0f} s)", flush=True)
+        out["log"] = capture.text()
+        out["state"] = out.get(0, {}).get("state")
+        return out
 
     def _run_arm_subprocess(self, subdir, orchestrate, inject):
         """One single-rank arm in a FRESH interpreter; returns the probe dict.
@@ -570,6 +632,89 @@ class MultiRankGBSmokeTest(unittest.TestCase):
         half = NWALKERS // 2
         self.assertTrue(inds[0, :half].any(), "head block has no cold leaf")
         self.assertTrue(inds[0, half:].any(), "worker block has no cold leaf")
+
+    def test_one_walker_two_replicas(self):
+        """1 walker on 2 compute ranks (replica mode): runs, replicas agree.
+
+        The first end-to-end exercise of the one-walker replica path: the
+        layout hands BOTH compute ranks block (0, 1), the GB move disperses
+        the bands between the two replicas, reconciles the per-unit residual
+        deltas, merges by physical source and rebuilds every replica's
+        residual from the merged branch in the fourth command (``gb_sync``).
+
+        The claims, in order of what a defect would break first:
+
+        * the world does not RAISE -- ``merge_owned_sources`` throws a
+          ``RuntimeError`` naming the cell/rank when two replicas claim one
+          source or a rank's block overflows ``nleaves_max``, and the
+          orchestrator would surface it here;
+        * ``gb_sync`` REALLY RAN, and its residual hashes AGREE. Both halves
+          are needed: the fourth command is SKIPPED whenever either block is
+          neutral, so "no disagreement was logged" alone is equally
+          consistent with "the command never fired". The spy below counts the
+          head's ``_replica_apply_sync`` calls and inspects the hash map it
+          returns; the log grep the brief asks for is kept beside it as the
+          check on the warning TEXT itself (a warning, not an exception, so
+          nothing else would surface it);
+        * the band ladder is finite (a NaN band temperature is how a
+          half-updated ``band_info`` shows up);
+        * the injected source SURVIVES -- without an alive leaf the run
+          exercises only the neutral/early-return branches and the merge
+          never runs at all.
+        """
+        if not RUN:
+            self.skipTest("set RUN_GF_GB_SMOKE=1")
+        from unittest import mock
+
+        from lisatools.globalfit.moves.gbspecialstretch import GBSpecialBase
+
+        # Spy, not a stub: the real method still runs and its return value
+        # (the ``{rank: residual_hash}`` map) is what is recorded. Only the
+        # HEAD thread ever calls it, and ``list.append`` is atomic anyway.
+        synced = []
+        _real_apply_sync = GBSpecialBase._replica_apply_sync
+
+        def _spy(move_self, replies_s, layout, log_like_final, band_counts):
+            hashes = _real_apply_sync(
+                move_self, replies_s, layout, log_like_final, band_counts)
+            synced.append((move_self.name, hashes))
+            return hashes
+
+        # size 2, nwalkers 1: resolve_roles aliases the saver onto the head
+        # below size 3, so both ranks compute -> n_compute=2 -> 2 replicas,
+        # and only TWO fits are built in this process (a third would not fit
+        # the 5 GB budget).
+        with mock.patch.object(GBSpecialBase, "_replica_apply_sync", _spy):
+            out = self._run_world(2, inject=True, nwalkers=1)
+        self.assertEqual((out[0]["role"], out[1]["role"]), ("head", "compute"))
+        for line in out["log"].splitlines():
+            if "[GB_REPLICA" in line:
+                print(f"{MARKER} {line}", flush=True)
+        print(f"{MARKER} gb_sync rounds={len(synced)} "
+              f"served_by_rank1={out[1].get('served')}", flush=True)
+        self.assertTrue(
+            synced,
+            "gb_sync never ran: every propose had a neutral block, so this arm "
+            "covers neither the fourth command nor the residual-hash agreement "
+            "(the other assertions below would pass vacuously)")
+        for name, hashes in synced:
+            # BOTH replicas answered (a one-entry map would compare a hash
+            # with itself and agree by construction)
+            self.assertEqual(
+                sorted(hashes), [0, 1],
+                f"{name}: gb_sync was answered by {sorted(hashes)}, not both "
+                "compute ranks")
+            self.assertEqual(
+                len(set(hashes.values())), 1,
+                f"{name}: replicas rebuilt DIFFERENT residuals from the merged "
+                f"branch: {hashes}")
+        self.assertNotIn("residual hashes disagree", out["log"])
+        state = out["state"]
+        self.assertIsNotNone(state, "the head returned no final state")
+        self.assertTrue(
+            np.all(np.isfinite(state.sub_states["gb"].band_info["band_temps"])))
+        # the injection survives
+        self.assertGreaterEqual(int(state.branches["gb"].inds[0].sum()), 1)
 
     def test_orchestrator_at_one_rank_matches_the_legacy_body(self):
         # WITH the injection: every arm is a fresh interpreter, so all three see

@@ -38,6 +38,8 @@ PING_OP = "ping"
 #: builtin every ComputeService installs: the rank's current per-walker
 #: likelihood over its block (see WalkerFanout.gather_likelihood).
 LIKELIHOOD_OP = "likelihood"
+#: builtin: sha1 of the rank's residual buffers (replica agreement check)
+RESIDUAL_HASH_OP = "residual_hash"
 
 
 class RemoteWorkerError(RuntimeError):
@@ -56,7 +58,13 @@ class RemoteWorkerError(RuntimeError):
 
 
 def concat_blocks(results, layout):
-    """Concatenate per-rank 1-D results in compute-rank (== walker) order."""
+    """Concatenate per-rank 1-D results in compute-rank (== walker) order.
+
+    Replica mode (one walker on every compute rank): the head's block IS the
+    whole vector; the replicas hold copies.
+    """
+    if getattr(layout, "replica_mode", False):
+        return np.asarray(results[layout.head_rank])
     return np.concatenate([np.asarray(results[r]) for r in layout.compute_ranks])
 
 
@@ -73,7 +81,24 @@ def _array_bytes(arr) -> bytes:
     return np.ascontiguousarray(asnumpy(arr)).tobytes()
 
 
-def fanout_digest_line(iteration, state) -> str:
+def residual_hash(acs) -> str:
+    """16-hex sha1 of the ACA's residual AND noise-model buffers.
+
+    Hashes ``linear_data_arr`` (the residual) *and* ``linear_psd_arr`` (the
+    noise covariance) when present, so a PSD-only drift between replicas is
+    caught too, not just a residual drift; falls back to the likelihood
+    vector when neither buffer is available.
+    """
+    arrs = (
+        list(getattr(acs, "linear_data_arr", []) or [])
+        + list(getattr(acs, "linear_psd_arr", []) or [])
+    )
+    if not arrs:
+        arrs = [acs.likelihood(complex=False)]
+    return _sha1_16(b"".join(_array_bytes(a) for a in arrs))
+
+
+def fanout_digest_line(iteration, state, residual_hashes=None) -> str:
     """``[FANOUT_DIGEST] it=<n> log_like=<sha1> coords=<sha1> inds=<sha1>``.
 
     Cluster-gate tool (``docs/multirank-cluster-gates.md`` Step 1): the head
@@ -84,16 +109,26 @@ def fanout_digest_line(iteration, state) -> str:
     branch's array in branch-name-sorted order (branches differ in shape, so
     concatenating raw bytes -- not ``np.concatenate`` -- is what makes a
     single hash possible across all of them), independent of dict order.
+
+    ``residual_hashes`` (one-walker replica mode): ``{world_rank: hash}`` from
+    :meth:`WalkerFanout.gather_residual_hashes`; when given, the line gains
+    `` residual=r<rank>:<hash>,... replicas_agree=<bool>`` so replica drift is
+    visible on the same line as the merged-state digest.
     """
     log_like_hash = _sha1_16(_array_bytes(state.log_like))
     coords = state.branches_coords
     coords_hash = _sha1_16(b"".join(_array_bytes(coords[name]) for name in sorted(coords)))
     inds = state.branches_inds
     inds_hash = _sha1_16(b"".join(_array_bytes(inds[name]) for name in sorted(inds)))
-    return (
+    line = (
         f"[FANOUT_DIGEST] it={int(iteration)} log_like={log_like_hash} "
         f"coords={coords_hash} inds={inds_hash}"
     )
+    if residual_hashes:
+        items = ",".join(f"r{int(r)}:{h}" for r, h in sorted(residual_hashes.items()))
+        agree = len(set(residual_hashes.values())) == 1
+        line += f" residual={items} replicas_agree={agree}"
+    return line
 
 
 class WalkerFanout:
@@ -159,6 +194,23 @@ class WalkerFanout:
                 asnumpy(acs.likelihood(complex=False))
             ),
             merge=lambda results: concat_blocks(results, self.layout),
+        )
+
+    def gather_residual_hashes(self, acs):
+        """``{world_rank: residual_hash}`` over the compute ranks (head-only, sampling phase).
+
+        One-walker replica mode watch: every rank hashes its OWN residual
+        buffers (``acs`` for the head, the ``RESIDUAL_HASH_OP`` builtin for
+        each worker) so drift between replicas shows up as disagreeing
+        hashes -- unlike :meth:`gather_likelihood` / :func:`concat_blocks`,
+        this is per-rank, never merged down to the head's single block.
+        """
+        return self.run(
+            RESIDUAL_HASH_OP,
+            move=None,
+            per_rank_payload=lambda rank, w0, w1: None,
+            local_body=lambda payload, model: residual_hash(acs),
+            merge=lambda results: {int(r): str(h) for r, h in results.items()},
         )
 
     def run(self, op, *, move=None, per_rank_payload, local_body, merge, shared=None):
@@ -286,11 +338,18 @@ class WalkerFanout:
 
     # -- setup-phase collective ------------------------------------------
     def allgather_walker_vector(self, local_1d):
-        """Concatenate every compute rank's 1-D block vector in walker order (collective)."""
+        """Concatenate every compute rank's 1-D block vector in walker order (collective).
+
+        Replica mode: every rank holds a copy of the same single walker, so
+        the head's vector (not a concatenation of the replicas) is the
+        answer, returned identically on every rank.
+        """
         local = np.asarray(local_1d)
         if self.single:
             return local
         parts = self.comm.allgather(local)  # fan-out comm ranks == compute-rank order
+        if getattr(self.layout, "replica_mode", False):
+            return np.asarray(parts[self.layout.fanout_rank(self.head)])
         return np.concatenate([np.asarray(p) for p in parts])
 
 

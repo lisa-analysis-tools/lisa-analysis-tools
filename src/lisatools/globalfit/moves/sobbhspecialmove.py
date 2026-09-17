@@ -14,7 +14,7 @@ psd branch], where ``d_d = <r|r>`` of the EXPOSED residual. The chunked call
 returns only the source piece ``d_h - 1/2 h_h`` (comp built with ``d_d=0``),
 so :meth:`setup_likelihood_here` captures the per-walker offset
 ``acs.likelihood()`` (= ``-1/2 d_d`` + noise term) on the freshly exposed
-residual once per leaf and :meth:`compute_like` adds it back. This reproduces
+residual once per leaf and :meth:`compute_like_local` adds it back. This reproduces
 the slow path's numbers on every scoring site (prev_logl, proposal batches,
 fancy tempering swap) and keeps the base ``_verify_entry_vs_acs`` expose
 invariant meaningful, up to chunked-heterodyne truncation error.
@@ -66,7 +66,7 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
         **kwargs: Keyword arguments of :class:`ResidualAddOneRemoveOneMove`.
             ``dcga`` must be ``None`` — the chunked kernel scores against
             the ACA buffers directly (multi-GPU walker shards are handled
-            by per-split routing inside :meth:`compute_like`, not by the
+            by per-split routing inside :meth:`compute_like_local`, not by the
             DCGA replica machinery).
     """
 
@@ -85,7 +85,7 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
                 "SOBBHChunkedLikeMove has no DCGA (replica) path: the "
                 "chunked kernel reads the ACA buffers directly, and "
                 "multi-GPU walker shards are served by per-split routing "
-                "inside compute_like. Build it without dcga= (the "
+                "inside compute_like_local. Build it without dcga= (the "
                 "SOBBHChunkedMoveBuilder skips the DCGA branch)."
             )
         if chunked_comp is None:
@@ -106,7 +106,7 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
 
         # the *_wdm kernels are single-shard by contract (they consume
         # linear_data_arr[0]); multi-shard (multi-GPU walker-shard) ACAs
-        # are served by per-split routing in compute_like and in the
+        # are served by per-split routing in compute_like_local and in the
         # cold-chain fill (gbbands _ShardHolderView + partition, each split
         # under its own device context).
         #
@@ -158,7 +158,7 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
         """Waveform-basis rows -> chunked-comp rows (explicit, tested shim).
 
         Input columns (stock SOBBH waveform basis, what the move's scoring
-        sites hand ``compute_like`` after the branch transform):
+        sites hand ``compute_like_local`` after the branch transform):
         ``(m1, m2, s1, s2, dist[Gpc], inc, f_low, lam, beta, psi, phi0)``.
         Output columns (``SOBBHTDIonTheFly``/chunked order):
         ``(m1, m2, s1, s2, dist[pc], f_low, phi_c, inc, psi, lam, beta)``.
@@ -175,7 +175,7 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
 
     # ------------------------------------------------------------------
     # per-leaf scoring telemetry (2026-09-16). Production measured
-    # 190.5 s/leaf = 25 x ~7.35 s compute_like calls = 61 ms/row against
+    # 190.5 s/leaf = 25 x ~7.35 s compute_like_local calls = 61 ms/row against
     # the in-code job-373 reference of 2.78 ms/row (same Tobs / band
     # half-width / shard count) with LOG-SILENT leaf windows -- a ~22x
     # per-row regression nothing in the log could attribute. One
@@ -273,8 +273,12 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
         self._exposed_offset = np.asarray(asnumpy(self.acs.likelihood()), dtype=float)
         super().setup_likelihood_here(coords)
 
-    def compute_like(self, coords_in, data_index):
-        """One vectorized chunked-heterodyne call for the whole batch.
+    def compute_like_local(self, coords_in, data_index):
+        """Rank-local chunked-heterodyne scorer for one batch.
+
+        The base ``compute_like`` (:class:`ResidualAddOneRemoveOneMove`)
+        scatters rows to this method — the row-fanout scatter seam, not
+        an override point.
 
         Args:
             coords_in: ``(N, 11)`` already-transformed waveform-basis rows
@@ -289,7 +293,7 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
             raise NotImplementedError("SOBBHChunkedLikeMove has no DCGA path.")
         if self._exposed_offset is None:
             raise RuntimeError(
-                "compute_like called before setup_likelihood_here armed the "
+                "compute_like_local called before setup_likelihood_here armed the "
                 "exposed-residual offset (propose() choreography violated)."
             )
 
@@ -601,12 +605,7 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
         base's ``{BRANCH}_CHECK_LL`` / ``_EVERY`` knobs.
         """
         acs_like = (
-            self.compute_acs_like(
-                old_coords_in,
-                data_index=data_index_in,
-                signal_gen=self.waveform_gen,
-                **self.waveform_like_kwargs,
-            )
+            self.compute_check_like(old_coords_in, data_index_in)
             .reshape(prev_logl.shape)
             .real
         )

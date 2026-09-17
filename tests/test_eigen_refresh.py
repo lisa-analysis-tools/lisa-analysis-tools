@@ -48,6 +48,62 @@ class PriorBoxWidthsTest(unittest.TestCase):
         w = prior_box_widths(Boom(), 4)
         np.testing.assert_allclose(w, np.ones(4))
 
+    # -- the parsed-priors reader (string / tuple keyed containers) ----------
+
+    class _Parsed:
+        """A container that carries only eryn's parsed ``priors`` list."""
+
+        def __init__(self, entries):
+            self.priors = entries
+
+    class _Dist:
+        def __init__(self, mn, mx):
+            self.minimum = mn
+            self.maximum = mx
+
+    def test_tuple_keyed_scalar_bounds_broadcast_to_every_column(self):
+        pri = self._Parsed([[np.array([0, 2]), self._Dist(0.0, 4.0)]])
+        np.testing.assert_allclose(prior_box_widths(pri, 3), [4.0, 1.0, 4.0])
+
+    def test_tuple_keyed_array_bounds_stay_aligned_past_an_out_of_range_column(self):
+        # column 5 is outside ndim=3: its bound must be dropped WITH it, not
+        # slide onto column 1
+        pri = self._Parsed([[
+            np.array([1, 5]),
+            self._Dist(np.array([0.0, 10.0]), np.array([2.0, 20.0])),
+        ]])
+        np.testing.assert_allclose(prior_box_widths(pri, 3), [1.0, 2.0, 1.0])
+
+    def test_unbounded_column_warns_once_and_keeps_unit_width(self):
+        eigen_refresh._UNREAD_WARNED.clear()
+        pri = self._Parsed([
+            [np.array([0]), self._Dist(-np.inf, np.inf)],   # eryn's default box
+            [np.array([1]), self._Dist(0.0, 3.0)],
+        ])
+        with self.assertLogs(eigen_refresh.logger, level="WARNING") as cm:
+            w = prior_box_widths(pri, 2)
+        np.testing.assert_allclose(w, [1.0, 3.0])
+        self.assertTrue(any("[0]" in m and "no finite" in m for m in cm.output), cm.output)
+        with self.assertNoLogs(eigen_refresh.logger, level="WARNING"):
+            prior_box_widths(pri, 2)  # deduplicated on (ndim, columns)
+
+    def test_a_reader_failure_keeps_the_columns_read_so_far(self):
+        class Raising:
+            maximum = 1.0
+
+            @property
+            def minimum(self):
+                raise RuntimeError("exotic")
+
+        pri = self._Parsed([
+            [np.array([0]), self._Dist(0.0, 5.0)],
+            [np.array([1]), Raising()],
+        ])
+        with self.assertLogs(eigen_refresh.logger, level="WARNING") as cm:
+            w = prior_box_widths(pri, 2)
+        np.testing.assert_allclose(w, [5.0, 1.0])
+        self.assertTrue(any("prior box unavailable" in m for m in cm.output), cm.output)
+
 
 def _gaussian_call_ll(cov):
     inv = np.linalg.inv(cov)

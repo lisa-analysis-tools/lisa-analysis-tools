@@ -131,6 +131,18 @@ class PSDSettings(Settings):
     log_sampling: bool = dataclasses.field(
         default_factory=env_default("PSD_LOG_SAMPLING", False, bool)
     )
+    # Inner proposal of the PSDMove sampling this block: `eigen` (per-rung
+    # info-matrix axes; the one-walker default) or `stretch` (needs >= 2
+    # walkers). See PSDMove._resolve_inner_kind.
+    inner_move_kind: typing.Optional[str] = dataclasses.field(
+        default_factory=env_default("PSD_INNER_MOVE_KIND", None, str)
+    )
+    eigen_refresh_every: int = dataclasses.field(
+        default_factory=env_default("PSD_EIGEN_REFRESH", 10, int)
+    )
+    eigen_eps_rel: float = dataclasses.field(
+        default_factory=env_default("PSD_EIGEN_EPS_REL", 1e-4, float)
+    )
 
 class PSDSetup(Setup):
     """:class:`Setup` for the instrumental PSD branch in the Erebor recipe.
@@ -369,6 +381,18 @@ class GalForSettings(Settings):
     # where linear proposals crawl. Knob: ``GALFOR_LOG_SAMPLING``.
     log_sampling: bool = dataclasses.field(
         default_factory=env_default("GALFOR_LOG_SAMPLING", False, bool)
+    )
+    # Inner proposal of the PSDMove sampling this block: `eigen` (per-rung
+    # info-matrix axes; the one-walker default) or `stretch` (needs >= 2
+    # walkers). See PSDMove._resolve_inner_kind.
+    inner_move_kind: typing.Optional[str] = dataclasses.field(
+        default_factory=env_default("GALFOR_INNER_MOVE_KIND", None, str)
+    )
+    eigen_refresh_every: int = dataclasses.field(
+        default_factory=env_default("GALFOR_EIGEN_REFRESH", 10, int)
+    )
+    eigen_eps_rel: float = dataclasses.field(
+        default_factory=env_default("GALFOR_EIGEN_EPS_REL", 1e-4, float)
     )
 
 

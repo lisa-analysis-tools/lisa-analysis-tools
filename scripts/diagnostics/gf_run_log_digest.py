@@ -86,6 +86,103 @@ def summarize_fanout(lines):
     }
 
 
+#: ``communication/fanout.py``'s ``fanout_digest_line()`` replica suffix
+#: (one-walker replica mode only): "... residual=r0:11,r1:22 replicas_agree=False".
+#: ``re.search`` (not ``match``) so this also finds the suffix inside a full
+#: log line ("<date> <time>,<ms> - <module> - <LEVEL> - <msg>"). A
+#: multi-walker-mode ``[FANOUT_DIGEST]`` line carries no ``residual=`` suffix
+#: at all and simply fails to match, which is what "ignored" means below.
+DIGEST_REPLICA_RE = re.compile(
+    r"\[FANOUT_DIGEST\] it=(?P<it>\d+) .*?residual=(?P<res>\S+) "
+    r"replicas_agree=(?P<agree>True|False)"
+)
+
+
+def summarize_replica_digest(lines):
+    """Per-iteration replica agreement from ``[FANOUT_DIGEST] ... residual=...
+    replicas_agree=...`` lines (one-walker replica mode).
+
+    Returns ``{"iterations": n, "agree": n_true, "disagree": [it, ...]}``,
+    empty if no line carries the ``residual=``/``replicas_agree=`` suffix
+    (e.g. every line comes from multi-walker mode).
+    """
+    iterations = 0
+    agree = 0
+    disagree = []
+    for line in lines:
+        m = DIGEST_REPLICA_RE.search(line)
+        if not m:
+            continue
+        iterations += 1
+        if m.group("agree") == "True":
+            agree += 1
+        else:
+            disagree.append(int(m.group("it")))
+    if iterations == 0:
+        return {}
+    return {"iterations": iterations, "agree": agree, "disagree": disagree}
+
+
+#: ``gbspecialstretch.py``'s one-walker replica-mode ``[GB_REPLICA]`` lines --
+#: two ``logger.info`` shapes (no move name inside the brackets; drift always
+#: present), one ``logger.warning`` shape for the hash bonus check (move name
+#: inside the brackets, no drift, now demoted to informational text but kept
+#: here under its historical key), and one ``logger.warning`` shape for the
+#: REAL divergence guard -- ``_replica_apply_sync``'s per-rank
+#: ``log_like_final`` tolerance check (move name inside the brackets, no
+#: drift): grep ``GB_REPLICA`` in that file for the exact emitters.
+GB_REPLICA_RE = re.compile(
+    r"\[GB_REPLICA(?: [^\]]*)?\] "
+    r"(?P<msg>residual hashes disagree after sync|"
+    r"log_like_final disagrees after sync|"
+    r"residual authoritative; rebuild deferred to gb_sync)"
+    r"(?:.*?drift (?P<drift>[0-9.eE+-]+))?"
+)
+
+
+def summarize_gb_replica(lines):
+    """Counts/worst-case over ``[GB_REPLICA]`` info/warning lines.
+
+    Returns ``{"disagree_warnings": n, "loglike_disagree_warnings": n,
+    "deferred_rebuilds": n, "max_drift": float|None}``, empty if no
+    ``[GB_REPLICA]`` line is present.
+
+    ``disagree_warnings`` counts the residual-hash line (an INFO-level bonus
+    check -- expected to fire routinely on GPU, see
+    ``_replica_apply_sync``). ``loglike_disagree_warnings`` counts the real
+    divergence guard: the per-rank ``log_like_final`` tolerance check, which
+    is the one that should stay at zero.
+    """
+    disagree_warnings = 0
+    loglike_disagree_warnings = 0
+    deferred_rebuilds = 0
+    max_drift = None
+    for line in lines:
+        m = GB_REPLICA_RE.search(line)
+        if not m:
+            continue
+        msg = m.group("msg")
+        if msg == "residual hashes disagree after sync":
+            disagree_warnings += 1
+        elif msg == "log_like_final disagrees after sync":
+            loglike_disagree_warnings += 1
+        else:
+            deferred_rebuilds += 1
+            drift = m.group("drift")
+            if drift is not None:
+                drift = float(drift)
+                if max_drift is None or drift > max_drift:
+                    max_drift = drift
+    if not disagree_warnings and not loglike_disagree_warnings and not deferred_rebuilds:
+        return {}
+    return {
+        "disagree_warnings": disagree_warnings,
+        "loglike_disagree_warnings": loglike_disagree_warnings,
+        "deferred_rebuilds": deferred_rebuilds,
+        "max_drift": max_drift,
+    }
+
+
 if __name__ != "__main__":
     # Standalone report script, not a library; guard the rest of the file
     # (which reads sys.argv / real log files unconditionally) so tests can
@@ -251,3 +348,24 @@ if fanout_summary:
     for (op, move), stats in sorted(fanout_summary.items()):
         print(f"{op:<12}{move:<22}{stats['count']:>6}{stats['mean_head_s']:>13.3f}"
               f"{stats['max_rank_s']:>12.3f}{stats['mean_wait_s']:>13.3f}")
+
+# ---- [FANOUT_DIGEST] replica agreement + [GB_REPLICA] summaries (Plan 3 ----
+# Task 3, one-walker replica mode) -------------------------------------------
+replica_digest_summary = summarize_replica_digest(msg for _, _, _, msg in ev)
+if replica_digest_summary:
+    print(
+        f"\n[FANOUT_DIGEST] replicas: {replica_digest_summary['iterations']} "
+        f"iterations, {replica_digest_summary['agree']} agree, "
+        f"disagree at it={replica_digest_summary['disagree']}"
+    )
+
+gb_replica_summary = summarize_gb_replica(msg for _, _, _, msg in ev)
+if gb_replica_summary:
+    print(
+        f"[GB_REPLICA]: {gb_replica_summary['disagree_warnings']} hash "
+        f"disagree warnings (bonus check, INFO), "
+        f"{gb_replica_summary['loglike_disagree_warnings']} log_like_final "
+        f"disagree warnings (THE GUARD), "
+        f"{gb_replica_summary['deferred_rebuilds']} deferred rebuilds, "
+        f"max drift {gb_replica_summary['max_drift']}"
+    )

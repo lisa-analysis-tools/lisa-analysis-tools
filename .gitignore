@@ -164,3 +164,5 @@ cython_debug/
 
 # not push _version.py file since this is handled by setuptool_scm
 /src/lisatools/_version.py
+# global-fit smoke-test output (tests/test_multirank_noise_smoke.py writes here)
+gf_output_noise/

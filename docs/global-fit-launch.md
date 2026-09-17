@@ -76,6 +76,11 @@ error, not a rounding fallback, when driven directly through `build_layout`
 | `GF_LEGACY_RANK_LAYOUT` | `0` everywhere (the layout level and, since the 2026-09-16 ruling after the WP7 transport gates passed, the campaign submit scripts at every `NGPUS`) | `1` restores today's pre-port roles: one compute rank owns the whole per-node pool, every other non-saver rank is a stopped SPARE. Rollback knob (design spec Risks). |
 | `GF_LAYOUT_DRY_RUN` | unset | Preflight: every rank prints `layout.describe()` and the process exits **before** `fit.build()` allocates anything; a genuinely bad layout still raises inside `build_layout`/`prepare_rank` (Plan 5 Task 2 of this port — see `docs/multirank-cluster-gates.md`'s Step 0 for the exact invocation). |
 | `GF_FANOUT_DIGEST` | unset | Emits a per-iteration `[FANOUT_DIGEST]` state-hash line (`log_like` + coords + inds), the cluster-gate tool for diffing two layouts for bit-identical transport (Plan 5 Task 4 of this port — see `docs/multirank-cluster-gates.md`'s Step 1). Emitted from the recipe's post-iteration hook regardless of the rank count, so a single-rank (`-n 1`) baseline prints it too, but only the three `n_compute=2` layouts are expected bit-identical to each other: single mode reseeds nothing (`run.py::_resolve_seed_base`/`_seed_rank_streams` return `None` when `layout.is_single()`), so the `-n 1` line is for observability and an `it=0` cross-check only, never a per-iteration diff. |
+| `GF_ONE_WALKER_REPLICAS` | `1` | `0`/`false`/empty refuses a one-walker run on several compute ranks (today's divisibility error); any other value enables replica mode when `NWALKERS=1`. |
+| `{BRANCH}_LIKELIHOOD_FANOUT` (`MBH_`, `EMRI_`, `SOBBH_`, `PSD_`, `GALFOR_`, `SGWB_`) | `1` | replica mode only: `0` = the head scores every likelihood row itself for that family (replicas still replay the residual/noise mutations and still serve GB). |
+| `{P}_INNER_MOVE_KIND` (`PSD_`, `GALFOR_`, `SGWB_`) | `eigen` when the RUN has one walker, `stretch` otherwise | the PSDMove inner proposal; `stretch` with one walker is a hard error. |
+| `{P}_EIGEN_REFRESH` | `10` | proposes between per-rung eigen table refreshes (eigen kind). |
+| `{P}_EIGEN_EPS_REL` | `1e-4` | finite-difference step for the eigen tables, fraction of the prior box. |
 
 ## Every rank builds
 
@@ -202,6 +207,8 @@ sbatch  ./submit_gf_6mo_v8.sh      # legacy flow: static header defaults
   `[SUBMIT]` line rather than failing — `build_layout` itself would raise.
   The former default `NWALKERS=10` was not divisible by `N_COMPUTE=4` at `NGPUS=4`,
   so a first 4-GPU launch rounds to 12 unless `NWALKERS` is set explicitly.
+  `NWALKERS=1` is exempt from the divisibility rounding: it launches
+  one-walker replica mode (every compute rank holds the walker).
 - Launch line: `mpiexec -n "${SLURM_NTASKS:-3}" -ppn 1 ...` with
   `I_MPI_HYDRA_BOOTSTRAP=slurm I_MPI_FABRICS=shm:ofi FI_PROVIDER=tcp` exported
   when `SLURM_NNODES > 1` (Intel MPI's hydra launcher placing ranks

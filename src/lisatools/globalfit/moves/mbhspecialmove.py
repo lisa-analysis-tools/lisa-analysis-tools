@@ -739,8 +739,15 @@ class MBHSpecialMove(
 
         cp.get_default_memory_pool().free_all_blocks()
 
-    def compute_like(self, new_points_in, data_index):
-        """Evaluate the heterodyned likelihood for proposed parameter rows."""
+    def compute_like_local(self, new_points_in, data_index):
+        """Rank-local heterodyned-likelihood scorer for proposed parameter rows.
+
+        This is the override point (see :meth:`ResidualAddOneRemoveOneMove.compute_like_local`);
+        the base ``compute_like`` scatter seam (inherited from
+        :class:`ResidualAddOneRemoveOneMove`) calls this per replica in
+        one-walker replica mode. Do not override ``compute_like`` itself --
+        that would shadow the scatter seam and silently skip the fanout.
+        """
         assert data_index is not None
         logl = self.like_fn.get_ll(
             new_points_in,

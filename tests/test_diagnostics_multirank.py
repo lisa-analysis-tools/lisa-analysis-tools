@@ -555,5 +555,58 @@ class GfStateDigestTest(unittest.TestCase):
             self.assertFalse(any(name.startswith("substate/") for name in digest))
 
 
+class SummarizeReplicaTest(unittest.TestCase):
+    """``summarize_replica_digest`` / ``summarize_gb_replica`` (Plan 3 Task 3,
+    one-walker replica mode). ``[GB_REPLICA]`` sample lines are the real
+    ``gbspecialstretch.py`` emitter texts: two ``logger.info`` lines
+    (``"<rank_tag><name>: [GB_REPLICA] residual authoritative; rebuild
+    deferred to gb_sync (drift <x>)."``, one with a non-empty ``[r1] `` rank
+    tag), one ``logger.info`` line for the hash bonus check -- demoted from
+    WARNING (``"[GB_REPLICA <name>] residual hashes disagree after sync:
+    <r>:<hash>, ..."``), and one ``logger.warning`` line for the real
+    divergence guard in ``_replica_apply_sync`` (``"[GB_REPLICA <name>]
+    log_like_final disagrees after sync (head r<rank>: <array>):
+    r<rank>:<array>, ..."``).
+    """
+
+    def setUp(self):
+        self.mod = _load_diagnostics_module("gf_run_log_digest.py", "gf_run_log_digest_replica")
+
+    def test_digest_agreement_counts_and_lists_disagreements(self):
+        lines = [
+            "[FANOUT_DIGEST] it=1 log_like=aa coords=bb inds=cc "
+            "residual=r0:11,r1:11 replicas_agree=True\n",
+            "[FANOUT_DIGEST] it=2 log_like=aa coords=bb inds=cc "
+            "residual=r0:11,r1:22 replicas_agree=False\n",
+            "[FANOUT_DIGEST] it=3 log_like=aa coords=bb inds=cc\n",
+            # multi-walker line: no residual/replicas_agree suffix, ignored
+        ]
+        out = self.mod.summarize_replica_digest(lines)
+        self.assertEqual(out, {"iterations": 2, "agree": 1, "disagree": [2]})
+        self.assertEqual(self.mod.summarize_replica_digest(["nothing here\n"]), {})
+
+    def test_gb_replica_lines(self):
+        lines = [
+            "2026-09-16 10:00:00,000 - lisatools.globalfit.moves.gb - INFO - "
+            "gb_pe: [GB_REPLICA] residual authoritative; rebuild deferred to "
+            "gb_sync (drift 2.500e-04).\n",
+            "2026-09-16 10:00:05,000 - lisatools.globalfit.moves.gb - INFO - "
+            "[r1] gb_pe: [GB_REPLICA] residual authoritative; rebuild "
+            "deferred to gb_sync (drift 1.000e-03).\n",
+            "2026-09-16 10:00:10,000 - lisatools.globalfit.moves.gb - "
+            "INFO - [GB_REPLICA gb_pe] residual hashes disagree after "
+            "sync: r0:a, r1:b\n",
+            "2026-09-16 10:00:15,000 - lisatools.globalfit.moves.gb - "
+            "WARNING - [GB_REPLICA gb_pe] log_like_final disagrees after "
+            "sync (head r0: [-123.456789]): r1:[-123.456700]\n",
+        ]
+        out = self.mod.summarize_gb_replica(lines)
+        self.assertEqual(out["disagree_warnings"], 1)
+        self.assertEqual(out["loglike_disagree_warnings"], 1)
+        self.assertEqual(out["deferred_rebuilds"], 2)
+        self.assertAlmostEqual(out["max_drift"], 1.0e-3)
+        self.assertEqual(self.mod.summarize_gb_replica(["plain\n"]), {})
+
+
 if __name__ == "__main__":
     unittest.main()

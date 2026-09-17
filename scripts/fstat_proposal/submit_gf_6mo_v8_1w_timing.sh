@@ -1,90 +1,5 @@
 #!/bin/bash
 # ============================================================================
-# 6MO_V8_NOGB_NULL -- THE TRUTH-INJECTION NULL TEST
-# (user ruling 2026-09-14 evening, replacing the nogb test config: "In the
-# nogb test run: remove the psd fitting, use best fit values for psd and
-# galfor from the 3mo run. NO INJECTED NOISE. Just psd modelling for the
-# likelihood. Turn all the start factors for SOBHB, MBHB, EMRI to zero. Only
-# include sobhb, mbhb, emris in the fit. I want to see our injection
-# log-likelihood WITHOUT the noise term -- how close to zero it is when we
-# inject the truth (deviation from truth ~0).")
-#
-# ---- WHAT THIS MEASURES ---------------------------------------------------
-# The data is SOURCE STREAMS ONLY -- no instrument-noise realization, no
-# galaxy, no VGBs. Every branch starts EXACTLY at its injected truth
-# (*_START_FACTOR=0). The likelihood is the source-only convention
-# -1/2 <d-h|d-h> (no -sum log|det C| noise term), weighted by a FIXED
-# sensitivity built from the 3mo run's best-fit psd + galfor.
-#
-# At that null point the residual d-h should CANCEL, so lnL -> 0:
-#   * sources SYNTHESIZED from the catalogue null EXACTLY by construction
-#     (same converters, epochs and orbits on the data side and the branch
-#     side) -- they are this run's built-in negative CONTROL: any nonzero
-#     contribution from them is a bug in the fit, not physics;
-#   * sources loaded from REAL mojito bricks leave whatever the
-#     mojito <-> our-template waveform mismatch is. THAT is the number the
-#     user is asking for.
-# Watch the loader's "[HYBRID] ..." lines for the per-source provenance
-# (brick vs synthesized) -- with the 2026-09-14 cluster state that is
-# EMRI 0,7 + SOBHB 3,4,5 synthesized and the rest real, but the log is
-# authoritative, not this comment.
-#
-# ---- THE NUMBER TO READ ---------------------------------------------------
-#   run.py's  "initial log likelihood (after recipe setup)"  line.
-# It is per-walker and every walker starts at the SAME point (start factor
-# 0), so the values are identical -- one number. |lnL| ~ 0 is the pass.
-# Read it BEFORE the sampler moves anything; later iterations wander off the
-# null by design. NUM_ITERATIONS is tiny (10) because that first line IS the
-# deliverable; the run does not need to converge anything.
-#
-# ---- THE WHOLE DELTA vs submit_gf_6mo_v8_nogb.sh --------------------------
-#   * REMOVE_BRANCHES=gb,galfor,vgb,psd -- psd became removable for this
-#     test. No psd branch => no noise_search / noise_vgb_search stages, no
-#     psd_pe / galfor_pe / vgb_pe move anywhere, and run.py setup_acs takes
-#     its FIXED-sensitivity path:
-#       sens = general.sensitivity_backend(f"walker_{w}",
-#                                          **general.fixed_psd_kwargs)
-#     Stage ladder collapses to  source_search -> full_pe  over
-#     sobbh+mbh+emri only.
-#   * PSD_FIXED_PARAMS / GALFOR_FIXED_PARAMS -- the 3mo run's best fit,
-#     extracted by the NULLTEST NOISE preflight below (best_logl_noise on
-#     the 3mo store) and exported into the run. PHYSICAL (linear) basis:
-#     the fixed path applies NO transform. See the preflight's own notes.
-#   * SOURCE_TYPES=SOBHB,MBHB,EMRI + ADD_INSTRUMENT_NOISE=0 -- "NO INJECTED
-#     NOISE". No NOISE stream, no synthetic draw, no foreground.
-#   * LIKELIHOOD_SOURCE_ONLY=1 -- "WITHOUT the noise term". Valid precisely
-#     because the PSD is fixed (the term is then an additive constant);
-#     run.py force-disables it if a psd branch is ever present.
-#   * MBH/EMRI/SOBBH_START_FACTOR=0 -- exact truth, every walker. The
-#     convention is MULTIPLICATIVE x*(1+f*randn), so 0 is exact (no floor,
-#     no division). Viable only because the inner moves are EigenAxisMove
-#     (information-matrix tables, not ensemble spread) -- the
-#     *_INNER_MOVE_KIND=eigen defaults pinned below. A stretch inner move
-#     would degenerate on a zero-spread ensemble.
-#   * UNEQUAL_ARM=0 -- the unequal-arm model installs ON the psd branch's
-#     instrument component, which no longer exists (all_sources
-#     _wire_unequal_arm raises "requires the psd branch"), so the
-#     fixed-sensitivity path runs the plain analytic equal-arm model.
-#     ACCEPTED APPROXIMATION, and it is benign here: at the null point the
-#     residual is ~0, so lnL ~ 0 regardless of the PSD weighting -- the
-#     noise model only scales small DEVIATIONS from truth. Using the 3mo
-#     best-fit amplitudes in the equal-arm model is the right trade for
-#     this test.
-#   * NUM_ITERATIONS=10, no GB machinery, no warm start.
-#   * Preflights: the V8 NOISE preflight (delay table + noise identity) and
-#     the LADDER preflight are SKIPPED -- no noise model is armed and there
-#     is no gb branch. The SOURCES preflight stays (the catalogue is the
-#     hard requirement for the synthesized fill). The NULLTEST NOISE
-#     preflight is new and is a hard gate.
-#   * Names: job gf6mo_null, store gf_prod_6mo_v8_nogb_null.
-# run_combined_staged.py ENFORCES this contract: removing psd while gb or
-# galfor is present, or with injected noise, or with UNEQUAL_ARM=1, or with
-# a STAGE_NOISE_* flag, is a loud refusal at composition time (seconds) --
-# not a null that quietly fails to reach zero after hours of allocation.
-# Every GB_* export below is retained verbatim for diff-parity with the
-# parent script; without a gb branch they are read by nothing.
-# ============================================================================
-# ============================================================================
 # PRODUCTION global fit -- 6mo_v8: 6-month Tobs, EXACT COPY of 3mo_v8 with
 # exactly three families of changes (user spec 2026-09-02):
 #
@@ -115,26 +30,48 @@
 #      09-08..11 correctness/perf stack that arm carries: PSD shared
 #      MIRROR, column-atomic staging + GB_TEMPER_CELL_ORDER=band (the
 #      vertical-swap fix set b3f5acbd -- REQUIRED with GB_TEMPER_VERTICAL=1
-#      below), windowed sig-het stash + one-block SETUP_BATCH, refresh
-#      threshold 0.1 rad, adaptive gb_search noise rider, fused accept
-#      kernel, PE draw-one. Tobs-scaled here: GB_N_SUBBANDS 16384/GPU and
+#      below), windowed sig-het stash + one-block SETUP_BATCH,
+#      adaptive gb_search noise rider, PE draw-one (the 09-11 refresh
+#      threshold and fused accept kernel were both REVERTED on that arm
+#      and are reverted here too -- see items 6). Tobs-scaled here:
+#      GB_N_SUBBANDS 16384/GPU and
 #      GB_RJ_INMODEL_CHUNK 32768 (byte-parity with the 3mo twin's
 #      32768/65536 at half the per-slot/-cell cost -- 6mo slots are ~2x
 #      3mo bytes).
 #
+#   5. (2026-09-14, user ruling) GB OBSERVABLE + EIGENBASIS: this run is
+#      the 6mo GB eigenbasis test -- GB_INMODEL_OBSERVABLE_EIGEN=full
+#      combines the observable-basis step with the whitened information-
+#      matrix eigen table (see the block by GB_INMODEL_OBSERVABLE_SHEAR),
+#      and the warm-start refit proposal (change 1) rides along, rebuilt
+#      from the MOST RECENT 3mo run (the 10-walker science arm).
+#
+#   6. (2026-09-14, user ruling) THE 6MO TESTING CAMPAIGN, ON THE
+#      COMBINED DATA: "This is going to be our 6mo testing campaign until
+#      full running." SOURCE_TYPES=COMBINED,... -- mojito's pre-summed L1
+#      stream is the data (see the COMBINED block by the id lists) -- and
+#      every post-rebase improvement from the 3mo 10-walker science arm
+#      is ported: per-stage RJ flip fractions (search 0.5 / PE 0.1),
+#      GB_TEMPER_SKIP_SHUTOFF_BANDS=1, BACKUP_ITER=10, repeats 100/50,
+#      GALFOR_ALPHA_MAX=20, and the 09-11 reverts (accept kernel 0,
+#      trace 0, ortho premise check 0, anchor audit retired, sig-het
+#      refresh threshold back to 0).
+#
 # V8-PARITY NOTES (deliberate divergences from the old 6mo_v1 draft --
 # the exact-copy rule wins for every non-Tobs knob): GB_USE_GALAXY_PRIOR
-# stays 1 (6mo_v1 had it 0, an 08-24 test-only ruling) and
-# VGB_CHIRP_MASS_BASIS stays 0 (6mo_v1 armed the chirp-basis debut; v8
-# production never did). Flip either ONLY with a fresh store.
+# stays 1 (6mo_v1 had it 0, an 08-24 test-only ruling). Flip it ONLY
+# with a fresh store.
 #
-# Staged recipe (the 6mo_v8 parent's): source_search -> noise_search ->
-# noise_vgb_search -> gb_search -> full_pe.
-# THIS NULL-TEST FILE COLLAPSES THAT TO  source_search -> full_pe  (no gb,
-# no noise branches at all -- see the NULL-TEST header at the top).
+# *** VGB_CHIRP_MASS_BASIS IS NOW 1 (user ruling 2026-09-16) -- the
+# v8-parity exact-copy pin at 0 is SUPERSEDED. See the VGB RELAUNCH
+# BLOCK below for the ruling, the validation numbers, and the LOUD
+# resume caveat (vgb chain ndim 5 -> 6: fresh store or migration, never
+# mid-store). ***
+#
+# Staged recipe: source_search -> noise_search -> noise_vgb_search ->
+# gb_search -> full_pe
 # via scripts/fstat_proposal/run_combined_staged.py  (LAT dev >= the
-# psd-removable + null-test commit; run the wiring tests
-# tests/test_nogb_null_composition.py and
+# staged-sources + warm-phase-max commit; run the wiring tests
 # tests/test_staged_sources_wiring.py before first launch)
 #
 # RESUME: re-submitting this script resumes automatically -- the h5 backend
@@ -149,11 +86,19 @@
 # ##     exposure of source_search + sources-in-gb_search.                 ##
 # ##   * W4 warm-start A/B: rj_warm_search acceptance healthy on a short   ##
 # ##     3-mo rewind before arming here.                                   ##
-# ##   * GB_WARM_START_COMPONENTS below must point at the REFEREED npz     ##
-# ##     fit from the FULL FINAL 3mo_v8 store (never the make_snapshots    ##
-# ##     tars -- their chain slabs are keep-window extracts):              ##
-# ##       warmstart_fit_from_store.py --last-k 10 -> warmstart_match_    ##
-# ##       referee.py -> warmstart_referee_apply.py                        ##
+# ##   * GB_WARM_START_COMPONENTS: the REFEREED npz from the FULL FINAL    ##
+# ##     store of the MOST RECENT 3mo run -- the 10-WALKER science arm     ##
+# ##     gf_prod_3mo_v8_10walkers (2026-09-14 ruling; never the            ##
+# ##     make_snapshots tars). AUTO-BUILT at recipe build when missing     ##
+# ##     (fit -> referee -> apply from GB_WARM_START_SOURCE_STORE, run     ##
+# ##     IN-PROCESS via imports; watch the [WARMSTART-BUILD] lines) --     ##
+# ##     the 09-14 first launch died on the old hard preflight refusal,    ##
+# ##     hence the automation. The npz lives INSIDE ${STORE_DIR}           ##
+# ##     (warmstart/ subdir) so it travels with the run.                   ##
+# ##   * GB OBSERVABLE+EIGEN (2026-09-14): first 6mo exposure of           ##
+# ##     GB_INMODEL_OBSERVABLE_EIGEN=full -- read the 3mo probe            ##
+# ##     (submit_gf_3mo_v8_10w_eigenaxis_probe.sh) first; empty knob =     ##
+# ##     bit-identical fallback. Tests: tests.test_gb_observable_eigen.    ##
 # ##   * EIGEN INNER MOVES (2026-09-08): first cluster exposure of the     ##
 # ##     EigenAxisMove defaults pinned below (sobbh per-walker tables,     ##
 # ##     mbh/emri max-lnL-walker tables). Requires Eryn dev >= the        ##
@@ -163,9 +108,37 @@
 # ##   * git pull BOTH repos + ./install.sh (native headers) + the tests:  ##
 # ##       python -m unittest tests.test_staged_sources_wiring \          ##
 # ##           tests.test_eigen_refresh tests.test_inner_move_kind \      ##
-# ##           tests.test_vgb_eigen_inmodel                                ##
+# ##           tests.test_vgb_eigen_inmodel tests.test_vgb_ridge_gibbs \  ##
+# ##           tests.test_vgb_observable_basis tests.test_ridge_fiber      ##
 # ## Store gf_prod_6mo_v8/ is NEW -- nothing to migrate; the RELAUNCH      ##
 # ## block below is 3mo_v8 history only.                                   ##
+# ##                                                                        ##
+# ## ⚠ 2026-09-16 VGB=GB PARITY: VGB_CHIRP_MASS_BASIS 0 -> 1 (vgb ndim     ##
+# ## 5 -> 6) + the new vgb_ridge_gibbs move. If gf_prod_6mo_v8/ has        ##
+# ## ALREADY been launched on the 5-dim basis, this is NOT a plain resume: ##
+# ## run.py refuses it at backend construction naming                       ##
+# ## VGB_CHIRP_MASS_BASIS. TWO ways forward:                                ##
+# ##                                                                        ##
+# ##  (a) KEEP THE RUN, REBORN VGBs (user ruling 2026-09-16, PREFERRED --  ##
+# ##      "keep the hdf backend except for the VGBs (and just start them   ##
+# ##      at injection again)"):                                            ##
+# ##        python scripts/fstat_proposal/migrate_vgb_chirp_basis.py \     ##
+# ##            <store.h5> <catalogue_dir>                                  ##
+# ##      DEFAULT mode = --restart-at-injection. Everything except the vgb ##
+# ##      branch survives byte-for-byte -- GB chains + band state, noise,  ##
+# ##      galfor, mbh/emri/sobbh, log_like, the ITERATION COUNTER -- so    ##
+# ##      the GB search keeps every iteration of progress. The vgb branch  ##
+# ##      is discarded and reseeded at catalogue truth in the 6 columns.   ##
+# ##      It also quarantines the stale 5-column sidecars (the midit       ##
+# ##      checkpoint and the running backup copy, either of which would    ##
+# ##      otherwise silently undo the migration) into                       ##
+# ##      pre_chirp_migration/ next to the store.                           ##
+# ##                                                                        ##
+# ##  (b) FRESH STORE -- also fine, but pays back the whole GB search.     ##
+# ##      The eigen sidecar and the warm-start npz SURVIVE either way      ##
+# ##      (they are gb/sobbh/mbh/emri artifacts, not vgb), and the vgb     ##
+# ##      chain restarts at exact truth in both routes under               ##
+# ##      VGB_START_FACTOR=0.                                               ##
 # ############################################################################
 # ############################################################################
 # ## ⚠ RELAUNCH REQUIRED (2026-08-29): CAP GRID 1 -> 2 + STAGGER.          ##
@@ -426,52 +399,58 @@
 # ############################################################################
 
 # ---- fill these in ---------------------------------------------------------
-#SBATCH --job-name=gf6mo_null        # job name
-#SBATCH --partition=gpu-80-spot   # DEFAULT partition (2-GPU flow); the
+#SBATCH --job-name=gf6mo_1w          # 1-WALKER TIMING BASELINE (2026-09-16)
+#SBATCH --partition=gpu-80-spot   # 1 GPU of an 80-node (user ruling 2026-09-16); the
                                   # NGPUS self-dispatch below overrides it
-#SBATCH --gres=gpu:2              # DEFAULT 2 GPUs (GPUS below are LOCAL indices)
+#SBATCH --gres=gpu:1              # ONE GPU -- in-job GPUS derives to "0"
 #SBATCH --nodes=1                 # DEFAULT 1 node; NGPUS=4 -> 2 nodes (below)
 #SBATCH --ntasks=3                # DEFAULT/fallback only (legacy layout: main
                                   # + stopped spare + SAVER rank, mpiexec -n 3);
                                   # the NGPUS self-dispatch below computes the
                                   # real rank count from GPUS_PER_RANK/
                                   # RANKS_PER_GPU/GF_LEGACY_RANK_LAYOUT and
-                                  # passes --ntasks explicitly on `exec sbatch`.
-                                  # A manual `sbatch --gres=gpu:1 <script>`
-                                  # still works under legacy=1 (unchanged
-                                  # -n 3 on 1 GPU); under legacy=0 it ERRORS
-                                  # (insufficient GPUs for --ntasks>=3) --
-                                  # pass `-n 2` as well in that case.
+                                  # passes --ntasks explicitly on `exec sbatch`
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=0                   # whole-node memory
 #SBATCH --time=24:00:00
-#SBATCH --output=/shared/data/global_fit_output/gf6mo_null_%j.log     # combined stdout+stderr (captures [MAXLOGL]/[BENCH])
+#SBATCH --output=/shared/data/global_fit_output/gf6mo_v8_%j.log     # combined stdout+stderr (captures [MAXLOGL]/[BENCH])
 # ----------------------------------------------------------------------------
 
 set -euo pipefail
 
-# ---- GPU-count self-dispatch + rank-layout knobs (2026-09-16, same as the
-# ---- main 6mo script: rank count now derives from the GPU count) ---------
+# ---- GPU-count self-dispatch + rank-layout knobs (2026-09-16: rank count
+# ---- now derives from the GPU count) ---------------------------------
 # NGPUS=2 -> gpu-80-spot, 1 node x 2 GPUs (default, unchanged partition);
 # NGPUS=4 -> gpu-80-spot, 2 NODES x 2 GPUs each -- the cluster's real 4-GPU
 # allocation shape (there is no single 4-GPU node; see the design spec's
-# "Context" section). #SBATCH lines are static, so run this script
-# DIRECTLY to pick the count:
-#     NGPUS=4 ./submit_gf_6mo_v8_nogb_null.sh   # gpu-80-spot, 2 nodes x gpu:2
-#     NGPUS=2 ./submit_gf_6mo_v8_nogb_null.sh   # gpu-80-spot, 1 node  x gpu:2
-#     sbatch  ./submit_gf_6mo_v8_nogb_null.sh   # header defaults (2 GPUs)
-# In-job GPUS derives from SLURM_GPUS_ON_NODE, so manual sbatch overrides
-# also work. (The null test's readout prints minutes after setup either
-# way -- 4 GPUs only shortens the sampling that follows it.)
+# "Context" section). #SBATCH lines are static comments, so neither the
+# partition/node/task count can follow an env var through a plain
+# `sbatch <script>`. Instead, run this script DIRECTLY to pick the GPU
+# count and it submits itself with the matching flags:
+#
+#     NGPUS=4 ./submit_gf_6mo_v8.sh      # gpu-80-spot, 2 nodes x gpu:2
+#     NGPUS=2 ./submit_gf_6mo_v8.sh      # gpu-80-spot, 1 node  x gpu:2 (default)
+#     sbatch  ./submit_gf_6mo_v8.sh      # legacy flow: header defaults above
+#                                        # (2 GPUs, gpu-80-spot, --ntasks=3)
 #
 # GPUS_PER_RANK (empty = AUTO) / RANKS_PER_GPU (default 1) size the compute
 # rank count: N_COMPUTE = NGPUS * RANKS_PER_GPU / GPUS_PER_RANK.
 #
-# CAMPAIGN SAFETY: GF_LEGACY_RANK_LAYOUT stays the default (=1) at NGPUS=2
-# so every line below is byte-identical in effect to today's campaign
-# launch (--ntasks=3, mpiexec -n 3) until the WP7 cluster gates pass.
-# NGPUS=4 forces GF_LEGACY_RANK_LAYOUT=0 (legacy cannot span nodes).
-if [ -z "${SLURM_JOB_ID:-}" ]; then
+# LAYOUT DEFAULT (user ruling 2026-09-16): the walker-block layout
+# (GF_LEGACY_RANK_LAYOUT=0) is the default at EVERY NGPUS. At NGPUS=2 that is
+# head + 1 compute rank + saver (--ntasks=3, one GPU each, NWALKERS/2 walkers
+# per rank); the WP7 transport gates (Steps 0-2, 4) passed on the cluster and
+# the 6mo campaign run itself is the statistical read (Step 3 was skipped by
+# ruling). GF_LEGACY_RANK_LAYOUT=1 still selects today's single-compute-rank
+# layout for a 1-node job (rollback knob). NGPUS=4 cannot use the legacy
+# layout (it cannot span nodes), so it forces GF_LEGACY_RANK_LAYOUT=0
+# regardless of any pre-set value.
+#
+# Inside the job, the GPU list further below derives from what slurm
+# ACTUALLY granted (SLURM_GPUS_ON_NODE), so a manual
+# `sbatch --partition=gpu-80-spot --gres=gpu:2 --nodes=2 <script>` also
+# works.
+if false && [ -z "${SLURM_JOB_ID:-}" ]; then  # DISPATCH DISABLED: sbatch this file directly
   NGPUS=${NGPUS:-2}
   GPUS_PER_RANK=${GPUS_PER_RANK:-}
   RANKS_PER_GPU=${RANKS_PER_GPU:-1}
@@ -484,8 +463,6 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
   if [ "${NGPUS}" = "4" ]; then
     GF_LEGACY_RANK_LAYOUT=0
   else
-    # walker-block layout by default at NGPUS=2 too (user ruling 2026-09-16;
-    # GF_LEGACY_RANK_LAYOUT=1 = the rollback knob for a 1-node job)
     GF_LEGACY_RANK_LAYOUT=${GF_LEGACY_RANK_LAYOUT:-0}
   fi
   export GF_LEGACY_RANK_LAYOUT
@@ -505,10 +482,6 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
     echo "[SUBMIT]   compute ranks + 1 saver."
   fi
   echo "[SUBMIT] NGPUS=${NGPUS} -> sbatch --partition=${_NGPU_PART} --gres=${_GRES} --nodes=${_NODES} --ntasks=${NTASKS} (N_COMPUTE=${N_COMPUTE} compute ranks + 1 saver)"
-  echo "[SUBMIT] NOTE: a manual 'sbatch --gres=gpu:1 ${0}' still works under"
-  echo "[SUBMIT]   GF_LEGACY_RANK_LAYOUT=1 (today's default: mpiexec -n 3 on"
-  echo "[SUBMIT]   1 GPU, unchanged); under GF_LEGACY_RANK_LAYOUT=0 it ERRORS"
-  echo "[SUBMIT]   at --ntasks>=3 (insufficient GPUs) -- pass '-n 2' as well."
   _DIST_FLAG=""
   if [ "${_NODES}" = "2" ]; then
     _DIST_FLAG="--distribution=cyclic"
@@ -524,12 +497,26 @@ fi
 source /shared/home/mlkatz1/envs/gf_env/bin/activate
 cd /shared/home/mlkatz1/lisa-analysis-tools
 
+# ============================================================================
+# 1-WALKER TIMING BASELINE (user ruling 2026-09-16). EXACT same setup as the
+# base 6mo_v8 run except: 1 walker, 1 GPU (gpu-40-spot), fancy swaps off
+# (meaningless at 1 walker), fresh store. GF_LEGACY_RANK_LAYOUT is PINNED to
+# 1 so the multirank session's 1-GPU/-n1 special-casing can never reroute
+# this run onto a different code path -- the point is to time TODAY'S
+# production mechanics, scaled to one walker. GB_N_SUBBANDS etc. deliberately
+# unchanged; if the 40 GB card OOMs, halve GB_N_SUBBANDS and note it.
+# ============================================================================
+export GF_LEGACY_RANK_LAYOUT=1
+export NWALKERS=1
+
 # FRESH RUN (2026-08-15, user ruling: "we want to totally restart. This is a
 # fresh run now."). A NEW store dir so the previous run's h5/logs/fstat cache
 # stay intact for comparison and nothing can silently resume. BASE_FILE_NAME
 # stays gf_prod_3mo so every analysis tool (monitor generator, digests) works
 # unchanged -- they take the DIRECTORY as their argument.
-STORE_DIR=/shared/data/global_fit_output/gf_prod_6mo_v8_nogb_null/
+# env-overridable (2026-09-16) so a COPY of a live run's folder can be continued
+# under new code/layout without touching the original (STORE_DIR=<copy> ...).
+STORE_DIR=${STORE_DIR:-/shared/data/global_fit_output/gf_prod_6mo_v8_1w_timing/}
 
 # ---- GPU telemetry ---------------------------------------------------------
 # Background nvidia-smi sampler: one CSV row per GPU into the run store
@@ -574,7 +561,7 @@ GPU_PROC_PID=$!
 # rather than an EXIT trap it survives a spot preemption (SIGKILL runs no
 # traps). Also note slurm stdout only FLUSHES at job end, so the mirror is
 # the only way to see these lines while the job is still running.
-SLURM_LOG=/shared/data/global_fit_output/gf6mo_null_${SLURM_JOB_ID:-manual}.log
+SLURM_LOG=/shared/data/global_fit_output/gf6mo_v8_${SLURM_JOB_ID:-manual}.log
 LOG_MIRROR_PID=""
 if [ -n "${SLURM_JOB_ID:-}" ]; then
   ( while true; do
@@ -624,10 +611,13 @@ export PROGRESS=0
 export MOJITO_DATA_PATH=/shared/data/mojito_cache
 export USE_GPU=1
 export GPU_BACKEND=cuda13x
-# GPU list follows what slurm actually granted (self-dispatch above).
+# GPU list follows what slurm actually granted (self-dispatch block above);
+# NGPUS is the pre-submit intent, SLURM_GPUS_ON_NODE the in-job truth.
+# NOTE GB_N_SUBBANDS below is PER GPU, so total sub-band residency scales
+# with the count automatically; nvidia-smi telemetry samples every device.
 _NGPUS_EFF=${SLURM_GPUS_ON_NODE:-${NGPUS:-2}}
-# printf join, NOT `seq -s,` (BSD seq trails a separator the GPUS parser
-# would choke on).
+# printf join, NOT `seq -s,` (BSD seq leaves a trailing separator, which
+# the driver's GPUS parser would choke on -- caught in the local smoke).
 GPUS=$(printf ",%d" $(seq 0 $((_NGPUS_EFF - 1)))); GPUS=${GPUS:1}
 export GPUS
 echo "[GPUS] ${_NGPUS_EFF} GPUs -> GPUS=${GPUS} (partition ${SLURM_JOB_PARTITION:-n/a})"
@@ -684,18 +674,7 @@ export FILE_STORE_DIR=${STORE_DIR}
 export BASE_FILE_NAME=gf_prod_6mo
 
 # ---- v8 noise model (the whole v8-vs-v7 diff) -------------------------------
-# NULL TEST: UNEQUAL_ARM=0, not the v8 production 1. The unequal-arm model is
-# installed ON the psd BRANCH's instrument component (all_sources
-# _wire_unequal_arm: "unequal_arm=1 requires the psd branch"), and this run
-# removes that branch -- run_combined_staged.py refuses the combination
-# outright. The fixed-sensitivity path therefore runs the plain analytic
-# EQUAL-ARM instrument model, carrying the 3mo best-fit amplitudes.
-# Benign for THIS test: at the null point the residual is ~0, so lnL ~ 0
-# whatever the PSD weighting -- the noise model only scales small deviations
-# from truth. UNEQUAL_ARM_STRIDE / WDM_PSD_METHOD / the modulation table
-# below are retained for diff-parity and are read by nothing without a psd
-# or galfor branch.
-export UNEQUAL_ARM=0
+export UNEQUAL_ARM=1
 export UNEQUAL_ARM_STRIDE=200
 export WDM_PSD_METHOD=layer_calibrated
 export GALFOR_MODULATION_PATH="$PWD/scripts/noise/modulation_unequal.dat"
@@ -725,31 +704,34 @@ export COARSE_Q=8
 export COARSE_GPU_MODE=delayed_acceptance
 export COARSE_USE_WS=1
 export COARSE_FIDUCIAL=injection
+# Galfor slope-index cap (2026-09-04 diagnostic, KEPT on the 3mo science
+# arm; ported): alpha railed at the stock 5.0 cap (~60% of samples at the
+# edge). Widened [1e-3, 20] so the slope can explore; revert = drop the
+# line. The prior is rebuilt from code each run.
+export GALFOR_ALPHA_MAX=20.0
 echo "[V8-NOISE] coarse: Q=${COARSE_Q} mode=${COARSE_GPU_MODE} \
 use_ws=${COARSE_USE_WS} fiducial=${COARSE_FIDUCIAL}"
 
 # ---- sampler shape ---------------------------------------------------------
-export NWALKERS=${NWALKERS:-10}    # env-overridable (2026-09-16); 10-walker rebase (2026-09-11 ruling: build
+export NWALKERS=${NWALKERS:-10}    # 10-walker rebase (2026-09-11 ruling: build
                                    # off the validated 10w 3mo arm, jobs
-                                   # 465/473); GB rungs stay GB_NTEMPS=24 --
-                                   # walkers and temps are independent axes.
+                                   # 465/473); env-overridable since 2026-09-16.
+                                   # GB rungs stay GB_NTEMPS=24 -- walkers and
+                                   # temps are independent axes. NEVER change
+                                   # NWALKERS on a resume: the store carries the
+                                   # walker axis. Under the walker-block layout
+                                   # NWALKERS must divide by N_COMPUTE (10 -> 2
+                                   # or 5 compute ranks; 4 GPUs need 5 compute
+                                   # ranks with RANKS_PER_GPU=2, or 8/12 walkers
+                                   # from the start of a run).
                                    # Noise-block floor 2*ndim (galfor ndim 5
                                    # -> 10) still satisfied.
-                                   # The dispatch's --export=ALL carries the
-                                   # shell's value, so `NWALKERS=1 ./submit_gf_6mo_v8_nogb_null.sh`
-                                   # reaches the one-walker branch below.
-if [ "${GF_LEGACY_RANK_LAYOUT}" = "0" ] && [ "${N_COMPUTE_EFF}" -gt 1 ] && [ "${NWALKERS}" -eq 1 ]; then
-  echo "[SUBMIT] NWALKERS=1 on N_COMPUTE=${N_COMPUTE_EFF}: one-walker replica mode (every compute rank holds the walker; GB/VGB by band range, addremove/PSD by likelihood rows)"
-elif [ "${GF_LEGACY_RANK_LAYOUT}" = "0" ] && [ "${N_COMPUTE_EFF}" -gt 0 ] \
+if [ "${GF_LEGACY_RANK_LAYOUT}" = "0" ] && [ "${N_COMPUTE_EFF}" -gt 0 ] \
      && [ $(( NWALKERS % N_COMPUTE_EFF )) -ne 0 ]; then
   echo "[SUBMIT] NWALKERS=${NWALKERS} is not a multiple of N_COMPUTE=${N_COMPUTE_EFF}; using NWALKERS=$(( (NWALKERS / N_COMPUTE_EFF + 1) * N_COMPUTE_EFF )) (user decision at the first 4-GPU launch)"
   export NWALKERS=$(( (NWALKERS / N_COMPUTE_EFF + 1) * N_COMPUTE_EFF ))
 fi
-# NULL TEST: 10, not the production 2000. The deliverable is the FIRST
-# "initial log likelihood (after recipe setup)" line, printed before the
-# sampler moves anything; the handful of iterations after it only prove the
-# run is alive. Nothing here needs to converge.
-export NUM_ITERATIONS=10           # total engine iterations (resume-safe; NITER was a dead name)
+export NUM_ITERATIONS=2000         # total engine iterations (resume-safe; NITER was a dead name)
 
 # ---- band + domain ---------------------------------------------------------
 # EXPLICIT Tobs (2026-08-13): sbatch propagates the submitting shell's env,
@@ -808,11 +790,23 @@ export GB_NLEAVES_MAX=15000        # 6 mo: deeper confusion resolved; 3-mo ran 1
 # 2.4s host round-trips. ~4.2 GB buffer; post-fix profile at 4096 was
 # flat 42-45/31 GB on 96 GB cards. If the unit-open lines stay flat,
 # full residency (50000 -> 44,352 slots, ~11.3 GB) is the next step.
-export GB_N_SUBBANDS=16384  # PER GPU; WITH THE MIRROR a slot carries data only
-                            # (~0.5 MB @6mo vs ~0.25 @3mo) -- 16384 x 0.5 MB
-                            # ~ 8.4 GB/GPU = byte-parity with the 3mo twin's
-                            # 32768 x 0.25. (Pre-mirror this line was 4096 at
-                            # ~2 MB/slot incl. XYZ invC.)   # total = x n_gpus
+# ---- OOM 2026-09-16 (dev0, 3.68 GB En fold at 88.9 GB allocated, run
+# died overnight in setup_in_model/bin_fold_real): 16384 violated the
+# sig-het stash law documented at the SIGHET_NT_LAYER block below -- the
+# stash goes as CELLS x N_sparse_t and the knobs MULTIPLY. The mirror
+# halved SLAB bytes (the rationale for 16384) but not the fold stash:
+# 6mo N_sparse_t 118 x 16384 = 1.93e6, right at the 2.2e6 product that
+# OOM'd v4@270 (and 4x the calibrated 6-mo-safe 118 x 4096 = 4.8e5).
+# Residency fills toward capacity as rj/tempering matures, so early
+# telemetry (35-45 GB) looks fine and the wall arrives after the first
+# long uninterrupted stretch. 8192 -> product 0.97e6, under the 23-mo
+# 1.1e6 OK precedent; back off to 4096 (the calibrated-safe value) if
+# dev0 max memory trends past ~70 GB in gpu_util_*.csv again.
+export GB_N_SUBBANDS=8192   # PER GPU; total = x n_gpus. Slab ~0.5 MB/slot
+                            # @6mo (mirror) ~ 4.2 GB/GPU; the binding
+                            # constraint is the SIG-HET STASH product above,
+                            # not slab bytes. (History: pre-mirror 4096 at
+                            # ~2 MB/slot; 16384 mirror-era OOM'd 09-16.)
 # PSD SHARED MIRROR (386f25ce, validated jobs 469/470: 3mo dev0 68->44 GB,
 # 1yr 85->61 GB with capacity DOUBLED; parity 11k+ IDENTICAL). Parity gate
 # disarmed: vgb_pe rebuilds its buffer every unit so the gate never retires
@@ -834,6 +828,14 @@ export GB_PSD_MIRROR_PARITY_PROPOSES=0
 # In-model repeats are unaffected either way -- they cover ALL alive
 # sources; the flip gate is rj-only by construction.
 # export GB_RJ_FLIP_FRACTION=0.2   # <- re-export ONLY to force ALL stages
+# PER-STAGE flip knobs (2026-09-11 user ruling, values corrected 09-14 --
+# ported from the 3mo 10-walker arm): rj_fstat_search never received the
+# flip default (recipe wiring miss, fixed 09-14), so the search ran at 1.0
+# in jobs 474/479; the intended "half the birth attempts" against what
+# actually ran is 0.5 (0.1 would be a 10x cut of the search feed). PE
+# moves DID carry 0.2 before, so 0.1 there is the intended halving.
+export GB_SEARCH_RJ_FLIP_FRACTION=0.5
+export GB_PE_RJ_FLIP_FRACTION=0.1
 # In-model info-matrix jump scale: 0.005 default measured 95% cold
 # acceptance; 0.2 -> 0.61; 0.4 -> 0.60 (job 196). Job 197 flipped the
 # story: with the EXACT per-block SIGHET info matrices live, cold
@@ -955,7 +957,12 @@ export GB_RJ_SNR_TRUNC_DIST=1      # birth distance draw truncated at the
 # faster and give more permuted + vertical swap rounds per hour.
 # NOTE these env pins beat the PE mode default as well — both phases
 # run 250/25.
-export GB_INMODEL_REPEATS_NEWBORN=250
+# 100 (2026-09-11 user ruling, was 250 -- ported from the 3mo 10-walker
+# arm): with the vertical ladder working, hot-rung newborns descend over
+# the following iterations and are polished as survivors at every rung
+# they visit; the newborn class had become 83% of the 1yr repeat-rows
+# (3,347 rows @250) and ~50% at 3mo.
+export GB_INMODEL_REPEATS_NEWBORN=100
 # SURVIVOR 25 -> 100 (user ruling 2026-08-29, aligned with v7), restoring the
 # value the high-f probe ran (200/100). In-model f0 drift is the ONLY mechanism
 # that moves a source across a sub-band edge -- there is no merge operator, RJ
@@ -967,7 +974,11 @@ export GB_INMODEL_REPEATS_NEWBORN=250
 # ⚠ The per-class split applies on the DIRECT-batch path only; the grouped
 # scheduler takes ONE budget for the whole pool from _SURVIVOR, so with
 # GB_RJ_GROUPED_INMODEL=1 this raises the effective budget for newborns too.
-export GB_INMODEL_REPEATS_SURVIVOR=100
+# 50 (2026-09-11 user ruling, was 100 -- ported from the 3mo 10-walker
+# arm): vertical sweeps run once per repeat, so this also halves the
+# vertical mixing per block -- judge by progress per wall-clock hour with
+# the [GB_CELL_LL] / sig-het cold audit as guards.
+export GB_INMODEL_REPEATS_SURVIVOR=50
 
 # VERTICAL TEMPERING ON (2026-08-26 user ruling: "this is crucial").
 # Per-repeat vertical band-temperature swaps inside the in-model loop
@@ -997,6 +1008,14 @@ export GB_TEMPER_EVERY_PROPOSES=1
 # vertical sweep starved/biased (the leaf-shedding root cause pair); job
 # 473 on order=band + the whole-cell L_with ratio is the validated config.
 export GB_TEMPER_CELL_ORDER=band
+# RUNNING-BACKUP CADENCE (2026-09-14, ported from the 3mo 10-walker arm):
+# job 479 spent 60-80 s of every 5.4 min PE iteration in [SAVE] save_step
+# -- the sampler's blocking handoff waiting for the saver rank to finish
+# copying + fsyncing the 14 GB store into *_running_backup_copy.h5 after
+# EVERY save. Every 10th save instead; the 600 s mid-iteration checkpoint
+# still bounds a torn-store loss to that interval. The 6mo store will be
+# larger still, so this matters MORE here.
+export BACKUP_ITER=10
 export GB_TEMPER_PRELOAD_CELLS=4800
 # One occupancy census per unit (assert-guarded exact) + drop inert rows.
 export GB_TEMPER_CENSUS_HOIST=1
@@ -1116,7 +1135,12 @@ export GB_SIGHET_REFRESH_EVERY=25
 # ruling below was written against the 0.1 DEFAULT's rung gating -- this
 # knob is a drift threshold, not a rung filter, so hot rungs still
 # refresh once they drift.
-export GB_SIGHET_REFRESH_DPHASE=0.1
+# REVERTED to 0 (2026-09-11 evening, ported from the 3mo 10-walker arm):
+# 0.1 rad refreshed 81% of sources instead of 89% at 3mo and 94% instead
+# of 97% at 1yr -- no measurable wall-clock saving -- while the 1yr cold
+# audit max rose 15 -> 22 in the same relaunch (cause not isolated).
+# Accuracy is primary: refresh every check.
+export GB_SIGHET_REFRESH_DPHASE=0
 # ALL RUNGS REFRESH (user ruling 2026-08-18). The default 0.1 keeps a stale
 # reference on everything hotter, justified in the code as "the ll error is
 # beta-suppressed". That reasoning covers the WITHIN-rung accept test, where
@@ -1174,7 +1198,11 @@ export GB_SIGHET_TRUST_PHASE_C=49
 # climbs with rung count, stop and investigate before spending days on it.
 # Cost: one extra exact batched call per in-model block (measured 0.053 s
 # against inmodel_repeats ~4-5 s).
-export GB_SIGHET_ANCHOR_CHECK=1
+# SIG-HET ANCHOR AUDIT RETIRED (2026-09-04 gate PASSED on the 3mo arm:
+# all-rung delta-vs-delta p50 0.054, cold max 5.48, well inside tolerance
+# over the whole run; ~18 s/iter while armed). Re-arm (=1) if a sig-het
+# accuracy question reopens. Ported from the 3mo 10-walker arm.
+export GB_SIGHET_ANCHOR_CHECK=0
 export GB_SIGHET_DRIFT_CHECK=1
 # TIER SCAN RETIRED FOR THE CLEAN RESTART (2026-08-19). It has NO iteration
 # cap (the "first-few-iterations" note above it was wrong): it ran 13 extra
@@ -1613,7 +1641,13 @@ export GB_PE_RJ_REPLACE=0
 # bookkeeping reconcile, already on). This measures what the band decomposition
 # RESTS on: normalized |<h_i|h_j>| between concurrently-open adjacent-band cold
 # sources. 8 pairs per unit at unit close, diagnostic only, never mutates state.
-export GB_ORTHO_CHECK=1
+# DISARMED (2026-09-04, ported from the 3mo 10-walker arm): this premise
+# check DIES on the 2-GPU path (get_swap_ll shards index a numpy
+# data_index with a cupy keep_idx -> guarded TypeError skip, ~166/snapshot
+# of pure log spam, never runs). The companion GB_ORTHO_LL_CHECK
+# (credited-vs-direct) still runs and stays on. Re-arm =1 only after the
+# gb_likelihood.py:907 cupy/numpy fix lands.
+export GB_ORTHO_CHECK=0
 # STAGGER ON (2026-08-29) -- the half-cell shift is the whole point of
 # this configuration; see the GB_CAP_DIVISOR block above for the measured
 # cell-membership numbers. It is meaningless without divisor > 1 (the move
@@ -1756,7 +1790,15 @@ export GB_LEAF_CAP_REQUIRE_IMPROVEMENT=1
 # content" -- with this change the GB side moved too, so a v8-vs-v7 cap or
 # leaf-count difference is NOT purely a noise effect. Set back to 5 if you
 # want the noise comparison fully isolated.
-export GB_LEAF_CAP_MIN_ITERS=4
+# 4 -> 3 (user ruling 2026-09-16): the v4/v5 3-mo campaigns ran 3; 4 was
+# the noise-merge-era compromise kept for v7 isolation, which no longer
+# applies. At 6-mo wall (~33 min/it) each increment cost ~2.2 h at 4 —
+# measured in production: caps raised on exactly the 4th consecutive
+# at-cap iteration (rows 13->16/17). Plateau/occupancy gates, staggered
+# cap grid, at-cap RJ skip, D/2 and GB_CAP_LL_CHECK all still stand.
+# 2 was considered and deferred: a 2-it stagnation window is weak at 10
+# walkers — revisit with the next snapshot's cap trajectory if 3 lags.
+export GB_LEAF_CAP_MIN_ITERS=3
 export GB_CAP_LL_CHECK=1
 # Grouped RJ scheduling: accumulate inds=True picks across RJ rounds
 # (1 proposal per cell per round), then ONE full-width in-model block.
@@ -1871,7 +1913,13 @@ export GB_CELL_LABEL_DEFERRED=1
 # >>> production arming was the 3mo relaunch after job 473; est. -30..-40
 # >>> s/it. VERIFY on this run: in-model acceptance rates + [GB_CELL_LL]
 # >>> + sig-het audit unchanged vs the python chain. =0 reverts.
-export GB_INMODEL_ACCEPT_KERNEL=1
+# BACK TO 0 (2026-09-11 user ruling, ported from the 3mo 10-walker arm):
+# it fuses only the inmodel_gate + inmodel_accept launches, ~18 s/it at
+# 250/100 repeats and ~9 s at 100/50 -- not worth a first production
+# exposure. Turn on only after tests/test_gb_inmodel_accept_kernel.py has
+# been run on a cluster GPU node. (With GB_INMODEL_TRACE armed it stood
+# down anyway -- job 474 logged "standing down".)
+export GB_INMODEL_ACCEPT_KERNEL=0
 # ---- THE v8 EXPERIMENT: OBSERVABLE-BASIS IN-MODEL PROPOSAL ----------
 # Pinned EXPLICITLY even though it is now the code default, so this run
 # does not silently change meaning if the default is ever revisited, and
@@ -1919,6 +1967,32 @@ export GB_INMODEL_OBSERVABLE_MC_STEP=0.05
 # determinant 1 for ANY coefficient (verified for 0, T/2, 0.41T, T, -3T),
 # so a wrong value here costs acceptance and never correctness.
 export GB_INMODEL_OBSERVABLE_SHEAR=0.5
+# ---- COMBINED WITH THE EIGENBASIS (user ruling 2026-09-14: "GB in model
+# should always be observed basis. We should combine that with the
+# eigenbasis.") ------------------------------------------------------------
+# The step STAYS in observable z with the same log-Jacobian factors, but
+# instead of independent per-coordinate steps it draws along the eigen
+# table of each source's own information matrix congruenced into z (exact
+# chain rule through the transform -- no extra waveform calls) and
+# whitened by the analytic step scales above. "full" = the JOINT
+# correlated draw over all axes per repeat, the whitened shear-free modern
+# version of the legacy full-covariance infomat draw (the old proposal was
+# never diagonal -- user preference 2026-09-14); "axis" = one uniformly
+# picked eigen-axis per repeat is the one-knob alternative; empty/0
+# reverts to the independent per-coordinate draw BIT-IDENTICALLY, RNG
+# stream included. Rows without a table yet (fresh births before their
+# first infomat visit) silently take the diagonal draw -- by design.
+# GB_INMODEL_OBSERVABLE_EIGEN_SMAX (default 10.0) caps the whitened
+# sigmas. Watch the [GB_TIMING] span "infomat_obs_eigen" (the per-block
+# Gamma_z stash) and the obs_basis cold acceptance vs the 3mo arm's ~0.2.
+# THIS RUN IS THE TEST (user ruling 2026-09-14: "Let's just go to the
+# full 6mo run test") -- the 3mo probe script
+# (submit_gf_3mo_v8_10w_eigenaxis_probe.sh) remains available as an
+# ISOLATION arm if the combined draw needs to be separated from the 6mo
+# changes. Launch with GB_INMODEL_OBSERVABLE_EIGEN= (explicitly empty)
+# to fall back to the diagonal draw bit-identically if it reads badly.
+export GB_INMODEL_OBSERVABLE_EIGEN=${GB_INMODEL_OBSERVABLE_EIGEN-full}
+echo "[GB-OBS-EIGEN] GB_INMODEL_OBSERVABLE_EIGEN='${GB_INMODEL_OBSERVABLE_EIGEN}' (empty = diagonal draw)"
 # ---- AND THE F-STAT GRID IN THE SAME BASIS -------------------------
 # fdot becomes a FIRST-CLASS grid axis instead of the r = 0 manifold the
 # grid searches today. Measured in v7: 39.6% of low-f and 10.5% of high-f
@@ -1976,7 +2050,11 @@ export GB_RJ_AMP_MAXIMIZE=0
 # see (a device-routing fault in factors) is exactly what this catches.
 # 979/979 matched in the r2 probes; any MISMATCH line here is a stop
 # signal. =0 disarms.
-export GB_INMODEL_TRACE=1
+# 0 (2026-09-11, was 1 -- ported from the 3mo 10-walker arm): the
+# per-repeat MH trace is a DEBUG knob (DEBUG lines per repeat, host
+# syncs) and, while armed, the fused accept kernel stands down. Re-arm
+# only for a diagnostic run.
+export GB_INMODEL_TRACE=0
 # DIFF DISCIPLINE: v7 exported GB_CAP_DIAG=1 and it costs time. Leaving it
 # on in v7 and off in v8 would make v8 look faster for reasons unrelated
 # to the proposal, so it is pinned ON here -- and the cap census is wanted
@@ -2069,6 +2147,15 @@ export GB_RJ_BAND_SHUTOFF_SCOPE=search
 # should re-open the question on its own. 100 = 2x the refit cadence
 # below, so it only bites if refitting stalls or is turned off.
 export GB_RJ_BAND_SHUTOFF_RESET_ITERS=100
+# USER RULING 2026-08-28: a shut-off band is frozen "for RJ and fancy
+# swaps until it resets". The RJ half is enforced in run_proposal; the
+# swap half is this knob (default OFF in code) and it had never been
+# exported -- shut-off bands kept being built, scored and swapped in the
+# horizontal tempering. ON since 2026-09-11 on the 3mo arm; ported here.
+# Safe because shutoff revives on every F-stat epoch (REFIT_EVERY=50) and
+# after RESET_ITERS. 6MO TODO (memory note): MEASURE the saving -- read
+# temper_cells_filled + run_tempering span vs the unskipped baseline.
+export GB_TEMPER_SKIP_SHUTOFF_BANDS=1
 # 100 -> 50 (2026-08-18): the refit re-derives the peaks against the LIVE
 # residual and the UPDATED foreground/PSD, which is the whole point of
 # refitting -- and the foreground converges well inside 20 iterations, so a
@@ -2166,42 +2253,109 @@ export VGB_SIGHET_INMODEL=0
 # SNR gate -- both fixed in code (76cd3237); pre-fix VGB samples are
 # prior-only. Migration 1 in the header checklist is REQUIRED for the
 # VGB_NTEMPS=8 ladder below.
-# PARAMETERIZATION: the ESTABLISHED 5-dim DISTANCE basis
-# [dist, phi0, cos_iota, psi, fdot_astro_ratio] -- what this store has
-# been sampling all along. (User ruling 2026-08-15, superseding the
-# earlier chirp-basis arming: "revert to the old VGB parameterization
-# ... the old regular parameterization we had before" for these runs.)
-# Keeping it means NO chirp migration and NO ndim 5->6 change on a live
-# store -- one less thing moving while we validate the likelihood fix.
-# The 6-dim chirp basis (Mc sampled, un-collapses fdot_astro_ratio)
-# stays built and tested for the 6-month run: set 1 there and run
-# migrate_vgb_chirp_basis.py first.
-# NOTE: fdot_astro_ratio stays a COLLAPSED dimension in this basis
-# (truth exactly 0 x multiplicative init = zero spread, and the
-# affine-invariant stretch cannot create spread it never had). That is
-# the known, accepted cost of staying on the old parameterization.
+# PARAMETERIZATION: the 6-dim CHIRP basis
+# [dist, phi0, cos_iota, psi, Mc, fdot_astro_ratio] -- Mc SAMPLED, only
+# f0 / alpha / sin_delta left as per-leaf fills.
+#
+# USER RULING 2026-09-16, superseding BOTH the 08-15 "revert to the old
+# VGB parameterization" ruling and this script's v8-parity exact-copy
+# pin at 0: "The VGBs should now (with stretch removed) have the exact
+# same mechanics as the GBs except f0 and sky fixed" -- Mc AND
+# fdot_astro_ratio both sampled -- and "really mirror the GBs as much as
+# possible ... VGBs get the ridge-gibbs fiber move too".
+#
+# WHAT THIS FIXES: on the old 5-dim basis fdot_astro_ratio was a
+# COLLAPSED dimension (truth exactly 0 x multiplicative init = zero
+# spread, and the affine-invariant stretch cannot create spread it never
+# had). The chirp basis un-collapses it: the nonzero catalogue Mc gives
+# the multiplicative init real spread, and the zero-truth ratio column
+# gets the documented ADDITIVE init exception
+# (VGB_RATIO_INIT_WIDTH x GB_FDOT_ASTRO_RATIO_MAX, still scaled by
+# VGB_START_FACTOR -- so START_FACTOR=0 below still starts at exact
+# truth).
+#
+# STANDALONE VALIDATION (HM Cnc smoke, 2026-09-16):
+#   * installed VGBObservableBasis log_jacobian EXACT vs analytic;
+#   * observable + eigen=full with fdot-weight 0 freezes Mc BY
+#     CONSTRUCTION (the fiber is exactly flat to the info matrix);
+#   * obs + eigen fw=0 + RIDGE-GIBBS was the BEST arm, cold acceptance
+#     0.593 -- the ridge move is what unfreezes Mc, so the two knobs
+#     ship together;
+#   * McRatioDistFiber works VERBATIM on the VGB layout: it resolves
+#     dist / Mc / fdot_astro_ratio by NAME and never reads f0.
+# The vgb_ridge_gibbs move registers AUTOMATICALLY off this flag --
+# recipe.build_vgb_moves gates on the basis carrying those three column
+# names, and run_combined_staged.py requests it in gb_search + full_pe
+# exactly where gb_ridge_gibbs rides. GB_RIDGE_GIBBS=0 kills both.
+#
+# *** LOUD CAVEAT -- NOT RESUME-COMPATIBLE. ***
+# This takes the vgb chain from ndim 5 to ndim 6. An existing store
+# CANNOT be resumed across the flip: run.py refuses it at backend
+# construction (before any chain load) with a message naming
+# VGB_CHIRP_MASS_BASIS. So this requires EITHER a FRESH store, OR a
+# vgb-branch migration with
+#   python scripts/fstat_proposal/migrate_vgb_chirp_basis.py \
+#       <store.h5> <catalogue_dir>
+# run BEFORE the first launch. NEVER flip this mid-store.
+# STAGED, NOT YET LIVE (2026-09-16 sequencing): the ruling + machinery
+# above are in the tree and gated by this knob, but the flip to 1 happens
+# at the DELIBERATE VGB restart together with
+# migrate_vgb_chirp_basis.py (restart-at-injection) -- NOT at the next
+# ordinary relaunch, which must keep resuming the current 5-column store
+# untouched. Flip this to 1 only alongside the migration step.
 export VGB_CHIRP_MASS_BASIS=0
 # 8-rung ladder (user ruling 2026-08-15). Resume derives the rung count
 # from the STORED band_temps shape, so the migration above MUST be run
 # with the matching "8" argument (it recreates every rung-dimensioned
 # vgb dataset: temps ladder, counters zeroed, 7 swap pairs).
 export VGB_NTEMPS=8
-# VGB IN-MODEL PROPOSAL -- DELIBERATE DIVERGENCE FROM THE NEW CODE DEFAULT
-# (which is =eigen since 2026-09-05: per-block EXACT per-(temp,walker,leaf)
-# information matrices + a generic one-axis eigen draw, stretch fallback on
-# any factor failure). Pinned =stretch FOR THIS RUN because:
-#   (a) VGB_SIGHET_INMODEL=0 above (loud-VGB sig-het accuracy unverified)
-#       forces the matrices through the CHUNKED engine at ~29-46 ms per
-#       source INSTANCE, and VGB has 55 leaves x 8 rungs x 10 walkers
-#       ~ 4.4k instances ~ 2-3.5 min of factor builds EVERY vgb propose;
-#       with the sig-het route validated that drops ~12-19x (~11-17 s).
-#   (b) the vgb reduced-basis factor path has ZERO cluster exposure (it
-#       degrades to stretch with one warning, but the build attempts are
-#       then pure cost).
-# ARMING GATE: validate VGB_SIGHET_INMODEL=1 at the loudest-VGB SNRs (or
-# accept the chunked cost on a probe first), then delete this pin or set
-# =eigen. =stretch is bit-identical to the pre-eigen pure-stretch config.
-export VGB_INMODEL_PROPOSAL=stretch
+# VGB IN-MODEL PROPOSAL = OBSERVABLE + EIGEN=FULL. SUPERSEDES the 09-15
+# morning "=eigen" arming (user ruling, same day, later: "we should be
+# sampling the VGBs just like the GBs now (in terms of the basis/proposal
+# type not RJ, still fixed model. f0 should be filled. sky location should
+# be filled. Everything else is just like the GB setup. We should be
+# sampling still in the observed basis for VGBs (just without f0, sky
+# coords)"). Both are the CODE defaults now; pinned here anyway because a
+# proposal swap is exactly the change a runbook must state.
+#
+# WHAT IT IS: the SAME composite step the GB branch runs, with the reduced
+# map swapped in -- a symmetric draw in z = [lnA, fdot, phi0, cos_iota,
+# psi] (f0 / alpha / sin_delta / Mc pinned per leaf; no f_mid because a
+# pinned f0 has no shear, no Mc fiber because (dist, r) -> (A, fdot) is
+# 2->2), whitened by the per-block information-matrix eigenbasis in z
+# (=full: one joint correlated step per repeat, all coordinates moving).
+# factors are the map's log-Jacobian difference.
+#
+# WHY IT SUPERSEDES =eigen -- the r-column verdict. The =eigen draw was in
+# the SAMPLING basis, where the ONLY physical quantity fdot_astro_ratio
+# drives is fdot = fdot_gr(f0, Mc)(1+r); with Mc a per-leaf FILL, Mc
+# occupies the physical fdot output slot through the container key_map, so
+# fdot sits OUTSIDE test_inds and r's only scored target is the fddot slot
+# -- which McDistFdotAstroQuad emits as exactly f0*0.0. Measured on the
+# real stock container: J[:, :, r] == 0 EXACTLY, info_y rank-deficient,
+# and the r eigen step set by the prior box (U[-5, 5]) instead of by
+# curvature. That is a blind jump in the one coordinate a known-f0 /
+# known-sky branch exists to measure, and every VGB run before this one
+# had it (commit 2bb484e2 recorded the suspicion; it is now confirmed and
+# fixed -- _infomat_phys_inds asks the engine for the live fdot slot).
+#
+# REQUIRED by the exact-truth flow above: VGB_START_FACTOR=0 gives a
+# zero-spread ensemble that a stretch draw could never move; the
+# observable step comes from the map + step scales, not the spread.
+# COST (accepted, unchanged): VGB_SIGHET_INMODEL=0 above routes the
+# matrices through the CHUNKED engine at ~29-46 ms/instance x (55 leaves
+# x 8 rungs x 10 walkers ~ 4.4k instances) ~ 2-3.5 min of factor builds
+# per vgb propose; validating VGB_SIGHET_INMODEL=1 at the loudest-VGB
+# SNRs drops that ~12-19x (~11-17 s) and remains the standing
+# optimization.
+# FIRST CLUSTER EXPOSURE of the vgb observable path -- watch the first
+# vgb_pe [GF_TIMING] wall, any "observable-basis proposal unavailable"
+# or "falling back to the stretch proposal" warnings, and the vgb fdot
+# spread actually opening up. Escapes: VGB_INMODEL_PROPOSAL=eigen (the
+# sampling-basis one-axis draw, now with a live r column) and =stretch
+# (the bit-identical legacy).
+export VGB_INMODEL_PROPOSAL=observable
+export VGB_INMODEL_OBSERVABLE_EIGEN=full
 # GB rung count. 24 is already the code default (stock/erebor/gb.py
 # env_default("GB_NTEMPS", 24)) -- pinned here anyway because the rung count
 # is the one knob whose failure mode is completely silent: resume derives it
@@ -2225,29 +2379,67 @@ export GB_ROUTER_THREADED=1
 # GB_RJ_PHASE_MAXIMIZE=1 exported above; run_swaps/leaf_cap_update stay
 # off (cycle invariants -- fstat_search owns tempering + cap counters).
 #
-# BUILD THE NPZ from the FULL FINAL 3mo_v8 store (NEVER the
+# BUILD THE NPZ from the MOST RECENT 3mo run (user ruling 2026-09-14:
+# the refit proposal rides the eigenbasis test and is based on the most
+# recent 3-month data run) -- that is the 10-WALKER SCIENCE arm this whole
+# file is rebased on (gf_prod_3mo_v8_10walkers, the GB_SCIENCE_465
+# relaunch of 2026-09-11, jobs 465->479 lineage), NOT the old 24-walker
+# gf_prod_3mo_v8 store. Use the FULL FINAL store h5 (NEVER the
 # make_snapshots tars -- their chain slabs are keep-window extracts and
 # the fitter would warn + fit on ~3 iterations):
-#   python scripts/gb/warmstart_fit_from_store.py \
-#       --store <...>/gf_prod_3mo_v8/gf_prod_3mo_testing.h5 \
-#       --last-k 10 --tobs 7776000 --out v8_last10.npz
-#   python scripts/gb/warmstart_match_referee.py \
-#       --npz v8_last10.npz --store <same h5>
-#   python scripts/gb/warmstart_referee_apply.py --fit v8_last10.npz \
-#       --referee v8_last10_referee.npz --out gf_prod_3mo_v8_refereed.npz
+#   python -m lisatools.globalfit.warmstart.fit_from_store \
+#       --store <...>/gf_prod_3mo_v8_10walkers/gf_prod_3mo_testing.h5 \
+#       --last-k 10 --tobs 7776000 --out v8_10w_last10.npz
+#   python -m lisatools.globalfit.warmstart.match_referee \
+#       --npz v8_10w_last10.npz --store <same h5>
+#   python -m lisatools.globalfit.warmstart.referee_apply --fit v8_10w_last10.npz \
+#       --referee v8_10w_last10_referee.npz \
+#       --out gf_prod_3mo_v8_10w_refereed.npz
 # (the machinery was audited end-to-end on the v7 final store,
 # 2026-09-02: p-accounting exact, 93-95% of p>0.9 comps on real
 # sources, logpdf finite at every leaf under the production floor box.)
-# Explicitly-empty GB_WARM_START_COMPONENTS= runs WITHOUT the warm move
+# The preflight below REFUSES to start while the npz is missing, so the
+# refit proposal cannot silently drop out of the run; explicitly-empty
+# GB_WARM_START_COMPONENTS= is the only way to run WITHOUT the warm move
 # (stage lists bit-identical to 3mo_v8's).
-# NOGB: explicitly EMPTY -- no gb branch, no warm-start move; an empty
-# value also skips the npz-existence FATAL below (its guard is -n).
-export GB_WARM_START_COMPONENTS=
+# The npz LIVES INSIDE THE RUN STORE (user ruling 2026-09-14: "The
+# warmstart store should be within the 6mo folder") -- so snapshot zips
+# of ${STORE_DIR} capture it, a resume finds it, and a fresh store
+# (rm -rf) rebuilds its own. The fit/referee intermediates land next to
+# it automatically (same directory as the target).
+export GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS-${STORE_DIR}warmstart/gf_prod_3mo_v8_10w_refereed.npz}
+# AUTO-BUILD (2026-09-14, after the first launch died on the missing npz;
+# user: "Check if it is done, if not run it. I would like it to be
+# automatic."). When the npz is missing, recipe build now runs the
+# fit -> referee -> apply pipeline ITSELF from this store, IN-PROCESS
+# (the three scripts are imported and their main() called -- no
+# subprocess; one MPI rank builds under a lock, the others wait; watch
+# the [WARMSTART-BUILD] lines). SOURCE_TOBS is the SOURCE store's Tobs
+# (3 months), not this run's -- the proposal container rescales to the
+# run Tobs at load.
+export GB_WARM_START_SOURCE_STORE=${GB_WARM_START_SOURCE_STORE-/shared/data/global_fit_output/gf_prod_3mo_v8_10walkers/gf_prod_3mo_testing.h5}
+export GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-7776000}
+export GB_WARM_START_LAST_K=${GB_WARM_START_LAST_K:-10}
 if [ -n "${GB_WARM_START_COMPONENTS}" ] && [ ! -f "${GB_WARM_START_COMPONENTS}" ]; then
-  echo "[WARMSTART] FATAL: GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS} does not exist."
-  echo "[WARMSTART] Build it with the fit -> referee -> apply recipe in the comment above,"
-  echo "[WARMSTART] or launch with GB_WARM_START_COMPONENTS= (explicitly empty) to run without it."
-  exit 2
+  if [ -f "${GB_WARM_START_SOURCE_STORE}" ]; then
+    echo "[WARMSTART] ${GB_WARM_START_COMPONENTS} missing -- it will be BUILT"
+    echo "[WARMSTART] automatically at recipe build (fit -> referee -> apply) from"
+    echo "[WARMSTART]   ${GB_WARM_START_SOURCE_STORE}"
+    echo "[WARMSTART] (last_k=${GB_WARM_START_LAST_K}, source tobs=${GB_WARM_START_SOURCE_TOBS})."
+  else
+    echo "[WARMSTART] FATAL: GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS} does not exist"
+    echo "[WARMSTART] and the auto-build source store is also missing:"
+    echo "[WARMSTART]   GB_WARM_START_SOURCE_STORE=${GB_WARM_START_SOURCE_STORE}"
+    echo "[WARMSTART] Point GB_WARM_START_SOURCE_STORE at the previous run's FULL FINAL h5,"
+    echo "[WARMSTART] or build the npz by hand:"
+    echo "[WARMSTART]   python -m lisatools.globalfit.warmstart.fit_from_store --store <store.h5> \\"
+    echo "[WARMSTART]       --last-k 10 --tobs 7776000 --out <dir>/gf_prod_3mo_v8_10w_fit.npz"
+    echo "[WARMSTART]   python -m lisatools.globalfit.warmstart.match_referee --npz <...fit.npz> --store <store.h5>"
+    echo "[WARMSTART]   python -m lisatools.globalfit.warmstart.referee_apply --fit <...fit.npz> \\"
+    echo "[WARMSTART]       --referee <...fit_referee.npz> --out ${GB_WARM_START_COMPONENTS}"
+    echo "[WARMSTART] or launch with GB_WARM_START_COMPONENTS= (explicitly empty) to run without it."
+    exit 2
+  fi
 fi
 # Uniform-floor weight over the 9-col prior box (keeps death factors
 # finite at every leaf) and the p floor: recipe defaults, pinned for the
@@ -2267,73 +2459,86 @@ export GB_WARM_START_CIRC_IMAGES=${GB_WARM_START_CIRC_IMAGES:-3}
 # stage (joint max-lnL over the source PE moves) runs FIRST so the loud
 # sources converge + subtract before the noise stages fit the PSD; the
 # PE moves then ride gb_search + full_pe (sobbh -> mbh -> emri banking
-# order). SOURCE_TYPES gains the armed classes' mojito streams
-# automatically. Ids = the 2026-08-24 census (user "yes in general",
+# order). Ids = the 2026-08-24 census (user "yes in general",
 # 2026-09-02): MBHB only the 4 systems with t_merge <= 6 mo; EMRI/SOBHB
 # full census pending the S4 readout.
-# ---- NULL-TEST DELTA (the whole point of this file) ------------------------
-# Only sobhb + mbhb + emri are SAMPLED and only their streams are INJECTED.
-# gb, galfor, vgb and psd all leave the fit; removing psd is what switches
-# run.py setup_acs onto the fixed-sensitivity path (see the header).
-# run_combined_staged.py enforces the rest of the contract (gb+galfor must go
-# with psd; no injected noise; no UNEQUAL_ARM; no STAGE_NOISE_* flag).
-export DATA_MODE=mojito
-export REMOVE_BRANCHES=gb,galfor,vgb,psd
-# MIRRORED from the main 6mo script (user ruling 2026-09-15 "mirror any
-# updates into the nogb_null test as well"): with exact-truth starts the
-# joint source search has nothing to converge -- skip straight to
-# full_pe. The null READOUT (initial lnL) prints before any stage either
-# way; this only removes burn-in sweeps after it. GB_SEARCH_SOURCE_EVERY
-# does not apply here (no gb_search stage; full_pe is uncadenced).
-export STAGE_SKIP_SOURCE_SEARCH=1
-# "NO INJECTED NOISE": no NOISE stream, no VGB stream, no galaxy. Source
-# streams only. (The driver's DEFAULT list would already drop NOISE with the
-# psd branch, but state it -- a submit script names its own injection.)
-export SOURCE_TYPES=SOBHB,MBHB,EMRI
-# ... and no synthetic instrument-noise draw either. all_sources defaults
-# this to True (auto-resolving to the real NOISE brick), which is exactly
-# the quiet way to ruin the null, so it is pinned off and the driver
-# refuses the composition if it is ever on.
-export ADD_INSTRUMENT_NOISE=0
-# "WITHOUT the noise term": report lnL = -1/2 <r|r> and drop the constant
-# -sum log|det C|. Legitimate only with a FIXED PSD, which is the case
-# here; run.py force-disables it (with a warning) if a psd branch exists.
-export LIKELIHOOD_SOURCE_ONLY=1
-# HYBRID fill: any MBHB/EMRI/SOBHB brick still in transfer is synthesized
-# in-process from its CATALOGUE parameters -- same converters as the branch
-# preps, mojito epochs, the run's REAL orbits -- so those sources null
-# against the branch template EXACTLY. They are this run's negative CONTROL
-# (see the header); the real bricks are what measures the mismatch. Watch
-# the loader's "[HYBRID] ..." lines for the per-source provenance.
-export SYNTHESIZE_MISSING_BRICKS=1
 export MBHB_IDS=2,5,16,18          # t_c 173.3 / 104.7 / 111.4 / 92.0 d
 export EMRI_IDS=0,1,2,3,4,5,6,7    # all 8 -- S4 census may trim
 export SOBHB_IDS=0,1,2,3,4,5       # all 6 -- expected mostly sub-threshold
+# ---- THE COMBINED DATA SET (user ruling 2026-09-14: the 6mo testing
+# campaign runs on the "combined" data) --------------------------------
+# COMBINED = mojito's PRE-SUMMED L1 stream (${MOJITO_DATA_PATH}/data/
+# COMBINED/L1/): it establishes the data AND the orbits, and it already
+# contains EVERYTHING -- instrument noise, the full GB galaxy (resolved +
+# confusion), VGBs, and ALL sources of every class. The per-class entries
+# after it contribute CATALOGUES ONLY (VGB seeding, nleaves sizing,
+# F-stat overlays, source-branch priors/starts); their L1 bricks are NOT
+# read, so per-id brick presence stops mattering. The loader REFUSES
+# COMBINED+NOISE and COMBINED+GALFOR (double-count guards) -- do not add
+# them. The NOISE brick must still EXIST on disk: UNEQUAL_ARM=1 reads its
+# /ltts delay table and the psd start estimates read its noise_estimates,
+# both resolved by PATH (NOISE_FILE / data/INSTRUMENT/L1/NOISE_*),
+# independent of this list.
+# ⚠ MODELING CONSEQUENCE vs the per-brick default (NOISE,GB,VGB,+armed):
+# the data now also contains the NON-ARMED sources (the other MBHBs
+# beyond ids 2,5,16,18, any catalogue rows outside the id lists). Nothing
+# samples them, so they sit in the residual as unmodeled content -- the
+# realistic full-data-challenge configuration, accepted by the 09-14
+# ruling. Explicitly-set SOURCE_TYPES always wins over this line.
+export SOURCE_TYPES=${SOURCE_TYPES-COMBINED,GB,VGB,MBHB,EMRI,SOBHB}
+echo "[DATA] SOURCE_TYPES=${SOURCE_TYPES} (COMBINED = pre-summed stream; classes after it are catalogue-only)"
 # Ladders / repeats / swap cadence / start scatter: the probe's latest
 # rulings (submit_gf_6mo_sources_probe.sh, 2026-08-26..28 -- see its
 # comment blocks for the measured cost arithmetic).
 export MBH_NTEMPS=2
 export EMRI_NTEMPS=2
+# 12 -> 8 (user ruling 2026-09-16, with repeats 25 -> 20: sobbh cost
+# trim now that the single-call fix landed). NOTE: SOBHB's ladder lives
+# in the stored PerLeafLadderState (betas_all per leaf), so on a RESUME
+# the stored 12-rung ladder wins and this value is inert -- 8 rungs
+# take effect at the next FRESH branch init (the deliberate VGB-chirp
+# restart). The persisted eigen sidecar's sobbh tables are
+# per-(temp,walker) shaped and will rebuild once on the shape change.
+# REVERTED 8 -> 12 (2026-09-16 snapshot 7 decode): the resume-safety
+# claim was WRONG -- on resume the LIVE ladder followed the config (8
+# betas) while the store/sidecar stayed 12-shaped, triggering mass
+# eigen-table rebuilds every launch (231 s leaf windows, 772 rows/call,
+# 80/80 non-positive infomats, mbh/emri walls 3-5x, iteration ~80 min).
+# Set 8 ONLY at the deliberate fresh restart (with the VGB chirp
+# migration), never on a resumed 12-rung store.
 export SOBBH_NTEMPS=12
+# ONE information matrix per leaf at the max-lnL cold walker (like MBH/EMRI)
+# instead of one per (temperature, walker) (user ruling 2026-09-16): the
+# per-walker stash is keyed by the walker axis, so every resume under a
+# different walker-block width (2 -> 4 GPUs) discarded it and rebuilt 60-120
+# matrices per leaf (~2.6 min/leaf/rank); walker_max tables are
+# layout-independent and persist across resumes. Watch the per-rung SOBBH
+# acceptance -- hot rungs now propose with the best walker's curvature.
+export SOBBH_EIGEN_SCOPE=walker_max
 export MBH_NUM_PROP_REPEATS=2
 export EMRI_NUM_PROP_REPEATS=2
-export SOBBH_NUM_PROP_REPEATS=25
-export MBH_PERMUTE_EVERY=10
-export EMRI_PERMUTE_EVERY=10
-export SOBBH_PERMUTE_EVERY=10
-# START FACTORS ZERO -- the heart of the null test ("Turn all the start
-# factors for SOBHB, MBHB, EMRI to zero"). run.py reads these directly
-# (MBH_START_FACTOR at run.py:856, EMRI at :883, SOBBH at :955) and applies
-# the sprint-wide MULTIPLICATIVE convention  x * (1 + factor * randn), so 0
-# reproduces the injection BITWISE for every walker and every rung. Nothing
-# floors or clips the value and nothing divides by it.
-# Zero spread is only viable because the inner moves are EigenAxisMove
-# (per-source information-matrix tables -- see the eigen block below), which
-# needs no ensemble spread; a StretchMove inner would be unable to generate
-# any and the branch would freeze.
-export MBH_START_FACTOR=0
-export EMRI_START_FACTOR=0
-export SOBBH_START_FACTOR=0
+export SOBBH_NUM_PROP_REPEATS=20   # 25 -> 20 (user ruling 2026-09-16); applies at next relaunch
+export MBH_PERMUTE_EVERY=0    # 1-walker: fancy swaps meaningless
+export EMRI_PERMUTE_EVERY=0   # 1-walker: fancy swaps meaningless
+export SOBBH_PERMUTE_EVERY=0  # 1-walker: fancy swaps meaningless
+# EXACT-TRUTH STARTS + NO SOURCE_SEARCH STAGE (user ruling 2026-09-14
+# late): "start all the emri, mbh, vgb, sobhb at the true points exactly
+# ... they switched to the eigen proposal, we do not [need] a spread like
+# with the stretch proposal." *_START_FACTOR=0 is exact truth (the
+# run.py seeders are x*(1+f*randn), no floor; VGB's additive ratio
+# jitter also scales by its factor, so 0 = exact truth-null there too).
+# With nothing to converge, the source_search stage is SKIPPED: sources
+# are subtracted at truth from setup_acs onward, sit frozen through the
+# noise stages, and their eigen PE proposals run only in gb_search +
+# full_pe (where they already ride).
+# VGB pairs with VGB_INMODEL_PROPOSAL=eigen (block below, 09-15 ruling):
+# the eigen draw samples fine from identical starts, so VGB is NOT
+# frozen at truth -- it PE-samples around it from the first propose.
+export STAGE_SKIP_SOURCE_SEARCH=1
+export MBH_START_FACTOR=0.0
+export EMRI_START_FACTOR=0.0
+export SOBBH_START_FACTOR=0.0
+export VGB_START_FACTOR=0.0
 # SOBBH chunked scoring width: converged value (S3 ruling; the 11-h-layer
 # stress result -- cheap insurance on this 1-h-layer production grid too).
 export SOBBH_M_BAND_HALF_WIDTH=3
@@ -2349,7 +2554,13 @@ export SOBBH_CHECK_LL_EVERY=30
 # laptop A/B on the real chunked SOBBH kernel measured acceptance 0.544 vs
 # stretch 0.156 at equal per-step cost. {BRANCH}_INNER_MOVE_KIND=stretch
 # is the per-branch escape back to the legacy stretch, exactly.
-export SOBBH_INNER_MOVE_KIND=eigen
+# GUARDED (2026-09-16) for the scoring-regression A/B: production
+# measures 61 ms/row vs the kernel's 2.78 ms/row job-373 reference.
+# One-window discriminator: `SOBBH_INNER_MOVE_KIND=stretch sbatch <this>`
+# -- leaf time collapsing toward ~15 s indicts the eigen inner-move path;
+# staying ~190 s indicts the scoring seam. Default stays eigen (it beat
+# stretch 0.544 vs 0.156 acceptance in the laptop A/B).
+export SOBBH_INNER_MOVE_KIND=${SOBBH_INNER_MOVE_KIND:-eigen}
 export MBH_INNER_MOVE_KIND=eigen
 export EMRI_INNER_MOVE_KIND=eigen
 # TABLE SCOPE (user ruling 2026-09-08). SOBBH: per-(temperature, walker)
@@ -2427,19 +2638,50 @@ if [ -e "${STORE_DIR}/${BASE_FILE_NAME}_testing.h5" ]; then
   echo "        or move this one aside first."
 else
   echo "[FRESH] no store at ${STORE_DIR} -- starting a NEW run from scratch."
-  echo "[FRESH] stages run from the top (source_search -> full_pe); there"
-  echo "        is no gb branch and no noise branch, so no F-stat grid and"
-  echo "        no PSD fit -- the sensitivity is FIXED from the 3mo run."
+  echo "[FRESH] stages run from the top (source_search -> noise_search ->"
+  echo "        noise_vgb_search ->"
+  echo "        gb_search -> full_pe); the F-stat grid + epoch center table"
+  echo "        are fitted fresh against this run's own residual."
 fi
 
 # ============================================================================
-# The 6mo_v8 parent carries an OPTIONAL LAUNCH SHORTCUT here (graft a
-# finished noise_search from an earlier store via graft_noise_state.py) and
-# a LATER REFITS note for the F-stat epoch cache. NEITHER APPLIES to the
-# null test: there is no noise stage to graft (the sensitivity is fixed from
-# the 3mo store by the NULLTEST preflight below) and no F-stat grid to
-# refit (no gb branch). Both blocks removed rather than left to mislead.
+# OPTIONAL LAUNCH SHORTCUT: graft v3's finished noise_search (2026-08-18)
 # ============================================================================
+# v4 changes NOTHING on the noise side -- the whole config diff against v3 is
+# GB / sig-het / F-stat knobs -- so refitting the PSD and galactic foreground
+# from scratch just reproduces a result v3 already has, at ~1.5 h.
+#
+# But noise_vgb_search MUST re-run: the VGB ladder moved to eryn's
+# make_ladder, and a resumed store's stored ladder WINS over the configured
+# one. (Measured on the temper probes: arms prepped from an older base kept
+# the old 1/1.2**i ladder, while freshly-built arms got make_ladder.)
+#
+# So: let v4 author its own store -- every grid, shape and ladder correct by
+# construction -- and move only the fitted numbers in.
+#
+#   1. sbatch this script against the fresh STORE_DIR. Let it reach
+#      noise_search and SAVE ONE iteration, then scancel. That iteration is
+#      throwaway; it exists so the datasets are allocated with >= 1 row.
+#   2. python scripts/fstat_proposal/graft_noise_state.py \
+#          <v3_store>/gf_prod_3mo_testing.h5 \
+#          ${STORE_DIR}/${BASE_FILE_NAME}_testing.h5          # dry run
+#      ... then the same command with --apply.
+#   3. sbatch this script again. It resumes from the grafted row, sees
+#      noise_search complete, and starts noise_vgb_search on the NEW ladder.
+#
+# The graft tool finds v3's handover row itself (VGB is frozen for the whole
+# of noise_search and starts moving on the first noise_vgb iteration), gates
+# on both stores having zero GB leaves, and refuses to touch sub_backend/vgb
+# -- which is where the ladder lives, and the entire point of the exercise.
+# Do NOT rewind a COPY of the v3 store instead: that carries v3's grids and
+# rung counts into v4 and needs a migration per array, which is how the three
+# earlier band-grid migrations failed.
+
+# LATER REFITS: GB_FSTAT_REFIT_EVERY=100 proposal-hits (~8 h at the new
+# iteration cadence, ~3.5% overhead at a 17.7-min fit). To force an extra
+# refit mid-run, stop the job and archive the epoch dir, then resubmit:
+#   mv ${STORE_DIR}/gb_fstat_fit/shared/epoch_* /tmp/  &&  sbatch ...
+# (_latest_epoch() then returns None and the fit-in-move rebuilds.)
 
 # DEDICATED SAVER RANK (armed 2026-08-15, user directive -- the [SAVE]
 # math flipped: the ~60 s sync write was 2% of a 55-min iteration but
@@ -2451,199 +2693,166 @@ fi
 # device allocations; if the extra ranks hold GPU memory, drop back to
 # the plain single-process line below until the rank-gated build lands.
 # ============================================================================
-# LADDER PREFLIGHT: SKIPPED. There is no gb branch in this composition (and
-# never will be in this store), so there are no band_temps rungs to check.
+# LADDER PREFLIGHT. Only fires on a RESUME (a fresh submission has no store
+# yet and skips it). Resume derives the GB rung count from the stored
+# band_temps shape, NOT from GB_NTEMPS above -- refuse to start rather than
+# run a silently-wrong ladder for days.
 # ============================================================================
-# V8 NOISE PREFLIGHT: SKIPPED. No noise model is armed -- no psd branch, no
-# galfor branch, UNEQUAL_ARM=0, and no NOISE stream -- so there is no delay
-# table to validate and no noise-model identity to match on resume. The
-# NULLTEST NOISE preflight below replaces it and is a HARD gate.
-# ============================================================================
-
-# ============================================================================
-# NULLTEST NOISE PREFLIGHT (the new hard gate for this run).
-#
-# The fixed sensitivity has to come from somewhere: this extracts the 3mo
-# run's BEST-FIT psd + galfor and exports them as PSD_FIXED_PARAMS /
-# GALFOR_FIXED_PARAMS, which run_combined_staged.py turns into
-# general.fixed_psd_kwargs -- the one thing run.py setup_acs's
-# no-psd-branch path reads.
-#
-# SOURCE OF TRUTH: lisatools.globalfit.warmstart.opt_snr.best_logl_noise,
-# the same helper the warm-start gate uses. It takes the last VALID stored
-# row (log_like written AND the gb coord slab nonzero) and, within it, the
-# cold walker with the highest log_like, returning that walker's psd and
-# galfor rows.
-#
-# BASIS -- the whole reason this is a preflight and not a hardcoded number.
-# best_logl_noise returns the RAW SAMPLED CHAIN COORDINATES with NO
-# transform applied, and the fixed-sensitivity path in run.py applies NO
-# transform either. The two ends therefore agree exactly, and both are the
-# PHYSICAL (linear) basis -- psd = [Soms_d, Sa_a] as square-root values,
-# galfor = (amp, fk, alpha, f_1, f_2) -- PROVIDED the source run sampled
-# them linearly, i.e. PSD_LOG_SAMPLING=0 and GALFOR_LOG_SAMPLING=0 (the
-# stock defaults, and what the 3mo v8 run used: with log sampling off the
-# stock psd/galfor transforms are None). If a future source store was
-# sampled with either log knob ON, these values would be LOG values and
-# this wiring would silently under-weight the noise -- the check below
-# refuses on an implausible magnitude rather than trusting the comment.
-#
-# NOTE best_logl_noise reads global_fit/chain/gb to find a valid row, so the
-# SOURCE store must have a gb branch (the 3mo production store does). That
-# is a property of the 3mo store being read, not of this run.
-# ============================================================================
-NULLTEST_NOISE_STORE=${NULLTEST_NOISE_STORE:-/shared/data/global_fit_output/gf_prod_3mo_v8_10walkers/gf_prod_3mo_testing.h5}
-if [ ! -f "${NULLTEST_NOISE_STORE}" ]; then
-  echo "[NULLTEST] REFUSING TO START: no 3mo store at"
-  echo "[NULLTEST]   ${NULLTEST_NOISE_STORE}"
-  echo "[NULLTEST] This run has NO psd branch, so its likelihood weighting"
-  echo "[NULLTEST] comes entirely from that store's best-fit psd+galfor."
-  echo "[NULLTEST] Point NULLTEST_NOISE_STORE at the 3mo run's h5."
-  exit 2
-fi
-# The human-readable report goes to STDERR (so it lands in the log); only
-# the two NAME=VALUE lines go to STDOUT, which is what we capture.
-NULLTEST_NOISE_EXPORTS="$(python - "${NULLTEST_NOISE_STORE}" <<'PYEOF'
-import sys
-
-store = sys.argv[1]
-try:
-    from lisatools.globalfit.warmstart.opt_snr import best_logl_noise
-except Exception as exc:  # import-time failure must not look like "no data"
-    print(f"[NULLTEST] REFUSING: cannot import best_logl_noise: {exc}",
-          file=sys.stderr)
+if [ -e "${STORE_DIR}/${BASE_FILE_NAME}_testing.h5" ]; then
+  python - "${STORE_DIR}/${BASE_FILE_NAME}_testing.h5" "${GB_NTEMPS}" <<'PYEOF' || exit 2
+import sys, h5py
+store, want = sys.argv[1], int(sys.argv[2])
+with h5py.File(store, "r") as f:
+    bt = f["global_fit"]["sub_backend"]["gb"].get("band_temps")
+    if bt is None:
+        print("[LADDER] no gb band_temps; nothing to check.")
+        raise SystemExit(0)
+    have = int(bt.shape[-1])
+print(f"[LADDER] stored gb rungs = {have}, GB_NTEMPS = {want}")
+if have != want:
+    print(f"[LADDER] REFUSING TO START: the store would run {have} rungs, not "
+          f"{want}. Resume takes the STORED count. Re-rung it first:\n"
+          f"  python scripts/fstat_proposal/reset_recipe_stage.py {store} "
+          f"gb_search --rewind-to-empty gb --apply\n"
+          f"  python scripts/fstat_proposal/rerunge_gb_ladder.py {store} gb "
+          f"{want} --apply")
     raise SystemExit(2)
-try:
-    noise = best_logl_noise(store)
-except Exception as exc:
-    print(f"[NULLTEST] REFUSING: best_logl_noise({store!r}) failed: "
-          f"{type(exc).__name__}: {exc}", file=sys.stderr)
-    raise SystemExit(2)
-
-psd = [float(x) for x in noise["psd_params"]]
-gal = [float(x) for x in noise["galfor_params"]]
-say = lambda m: print(m, file=sys.stderr)
-say(f"[NULLTEST] source store   : {store}")
-say(f"[NULLTEST] best-logL row  : iteration={noise['iteration']} "
-    f"walker={noise['walker']} log_like={noise['log_like']:.6g}")
-say(f"[NULLTEST] psd_params     : {psd}   (as stored; must be physical "
-    f"linear [Soms_d, Sa_a] -- checked below)")
-say(f"[NULLTEST] galfor_params  : {gal}   (as stored; must be physical "
-    f"linear (amp, fk, alpha, f_1, f_2))")
-
-if len(psd) != 2:
-    say(f"[NULLTEST] REFUSING: expected 2 psd params, got {len(psd)}: {psd}")
-    raise SystemExit(2)
-# BASIS SANITY. Physical Soms_d / Sa_a are tiny positive numbers (stock
-# 15e-12 / 3e-15); a log-sampled store would hand back values of order
-# -25 (ln) or -11 (log10). Refuse rather than silently mis-weight.
-for name, val, lo, hi in (("Soms_d", psd[0], 1e-13, 1e-10),
-                          ("Sa_a", psd[1], 1e-16, 1e-13)):
-    if not (lo < val < hi):
-        say(f"[NULLTEST] REFUSING: {name}={val!r} is outside the physical "
-            f"window ({lo}, {hi}). A LOG-sampled source store (the run's "
-            f"PSD_LOG_SAMPLING / GALFOR_LOG_SAMPLING were on) returns log "
-            f"values here, and the fixed-sensitivity path applies no "
-            f"transform -- the weighting would be silently wrong.")
-        raise SystemExit(2)
-if len(gal) != 5:
-    say(f"[NULLTEST] REFUSING: expected 5 galfor params, got {len(gal)}: {gal}")
-    raise SystemExit(2)
-
-print("PSD_FIXED_PARAMS=" + ",".join(repr(x) for x in psd))
-print("GALFOR_FIXED_PARAMS=" + ",".join(repr(x) for x in gal))
-say("[NULLTEST] preflight OK -- exporting the fixed noise parameters.")
+print("[LADDER] OK.")
 PYEOF
-)" || exit 2
-while IFS= read -r _line; do
-  [ -n "${_line}" ] || continue
-  export "${_line}"
-done <<< "${NULLTEST_NOISE_EXPORTS}"
-echo "[NULLTEST] PSD_FIXED_PARAMS=${PSD_FIXED_PARAMS}"
-echo "[NULLTEST] GALFOR_FIXED_PARAMS=${GALFOR_FIXED_PARAMS}"
-if [ -z "${PSD_FIXED_PARAMS:-}" ] || [ -z "${GALFOR_FIXED_PARAMS:-}" ]; then
-  echo "[NULLTEST] REFUSING TO START: the fixed noise parameters did not"
-  echo "[NULLTEST] make it into the environment."
-  exit 2
 fi
 
 # ============================================================================
-# SOURCES PREFLIGHT (6mo_v8). Hard-check the mojito bricks for every armed
-# source class before taking a slurm allocation (user ruling 2026-09-02:
-# "script hard-checks brick presence at launch"). Layout mirrors the NOISE
-# preflight above: ${MOJITO_DATA_PATH}/data/<CLASS>/L1/. The loader's own
-# loud raise at build remains the authoritative per-ID gate; this catches
-# the whole-class-missing case in seconds.
+# V8 NOISE PREFLIGHT. Fail here, not 20 minutes into a slurm allocation:
+#   * the modulation table must exist;
+#   * the NOISE brick must exist and carry /ltts;
+#   * an existing store must have been sampled under THIS noise identity
+#     (the run.py resume guard is authoritative; this is the cheap copy).
 # ============================================================================
-# DATA_MODE is pinned mojito for the null test, so this always runs. Its
-# [HYBRID] lines are also the manifest the header points at: which sources
-# are REAL bricks (measuring the mojito<->template mismatch) and which are
-# SYNTHESIZED from the catalogue (the exact-null control).
-python - "${MOJITO_DATA_PATH}" "${MBHB_IDS:-}" "${EMRI_IDS:-}" "${SOBHB_IDS:-}" "${SYNTHESIZE_MISSING_BRICKS:-0}" <<'PYEOF' || exit 2
+python - "${GALFOR_MODULATION_PATH}" "${MOJITO_DATA_PATH}" "${NOISE_FILE:-}"   "${STORE_DIR}/${BASE_FILE_NAME}_testing.h5" "${WDM_PSD_METHOD}" <<'PYEOF' || exit 2
 import glob, os, sys
-mojito, mbhb, emri, sobhb, hybrid = sys.argv[1:6]
-hybrid = hybrid.strip() == "1"
+import h5py
+mod, mojito, noise_file, store, method = sys.argv[1:6]
+if not os.path.isfile(mod):
+    print(f"[V8-NOISE] REFUSING: modulation table {mod!r} not found.")
+    raise SystemExit(2)
+if not noise_file:
+    hits = sorted(glob.glob(os.path.join(mojito, "data", "INSTRUMENT", "L1", "NOISE_*")))
+    if not hits:
+        print(f"[V8-NOISE] REFUSING: no NOISE_* brick under {mojito!r} and NOISE_FILE unset.")
+        raise SystemExit(2)
+    noise_file = hits[0]
+with h5py.File(noise_file, "r") as f:
+    if "ltts" not in f:
+        print(f"[V8-NOISE] REFUSING: {noise_file!r} has no /ltts group.")
+        raise SystemExit(2)
+    n = f["ltts"]["ltt_12"].shape[0]
+print(f"[V8-NOISE] delay table OK: {noise_file} (/ltts, {n} samples/link)")
+if os.path.exists(store):
+    with h5py.File(store, "r") as f:
+        grp = f.get("global_fit", {})
+        ident = grp.get("noise_model_identity") if hasattr(grp, "get") else None
+        if ident is None:
+            print(f"[V8-NOISE] REFUSING: {store!r} predates noise-model identity "
+                  "records -- it cannot have been sampled under the v8 noise "
+                  "model. Use a fresh STORE_DIR.")
+            raise SystemExit(2)
+        a = dict(ident.attrs)
+        # The coarse mode/Q are PART of the noise identity: they change the
+        # PSD/galfor transition kernel on identical array shapes, so a resume
+        # across them is refused by run.py. Check them here too, or the
+        # mismatch only surfaces minutes into the allocation.
+        want_mode = os.environ.get("COARSE_GPU_MODE", "delayed_acceptance")
+        want_q = int(os.environ.get("COARSE_Q", "8"))
+        mismatches = {}
+        if not bool(a.get("unequal_arm")):
+            mismatches["unequal_arm"] = (a.get("unequal_arm"), True)
+        if str(a.get("wdm_psd_method", "")) != method:
+            mismatches["wdm_psd_method"] = (a.get("wdm_psd_method"), method)
+        if str(a.get("coarse_mode", "")) != want_mode:
+            mismatches["coarse_mode"] = (a.get("coarse_mode"), want_mode)
+        if int(a.get("coarse_Q", 1)) != want_q:
+            mismatches["coarse_Q"] = (a.get("coarse_Q"), want_q)
+        if mismatches:
+            print(f"[V8-NOISE] REFUSING: stored noise identity does not match this "
+                  f"config (stored, wanted): {mismatches}. Full stored identity: {a}. "
+                  "Use a fresh STORE_DIR.")
+            raise SystemExit(2)
+        print(f"[V8-NOISE] resume identity OK: {a}")
+PYEOF
+
+# ============================================================================
+# SOURCES PREFLIGHT (6mo_v8). Hard-check the data before taking a slurm
+# allocation (user ruling 2026-09-02: "script hard-checks brick presence
+# at launch"). COMBINED-aware (2026-09-14): when SOURCE_TYPES carries
+# COMBINED, the per-class L1 bricks are never read -- the checks become
+# (a) the COMBINED file resolves exactly the way the loader's
+# find_combined_file will resolve it (single .h5 / COMBINED_ prefix /
+# MOJITO_COMBINED_FILE override), and (b) NOISE/GALFOR are not also
+# listed (the loader refuses the double-count at build; fail it here in
+# seconds instead). Without COMBINED, the old per-class brick check.
+# ============================================================================
+python - "${MOJITO_DATA_PATH}" "${MBHB_IDS:-}" "${EMRI_IDS:-}" "${SOBHB_IDS:-}" "${SOURCE_TYPES:-}" <<'PYEOF' || exit 2
+import glob, os, sys
+mojito, mbhb, emri, sobhb, src_types = sys.argv[1:6]
+types = [s.strip().upper() for s in src_types.split(",") if s.strip()]
 armed = {"MBHB": mbhb, "EMRI": emri, "SOBHB": sobhb}
-cat_files = {
-    "MBHB": "mbhb_cat_mojito_lite_processed_MT_rounding_fixed.hdf5",
-    "EMRI": "emri_cat_mojito_lite_processed_MT.hdf5",
-    "SOBHB": "sobhb_cat_mojito_lite_processed_MT.hdf5",
-}
 bad = False
-for cls, ids in armed.items():
-    if not ids.strip():
-        print(f"[SOURCES] {cls}: not armed (empty id list).")
-        continue
-    d = os.path.join(mojito, "data", cls, "L1")
-    id_list = [i.strip() for i in ids.split(",") if i.strip()]
-    have = [i for i in id_list
-            if glob.glob(os.path.join(d, f"{cls}_*source{i}_*"))]
-    miss = [i for i in id_list if i not in have]
-    if hybrid:
-        # the fill builds missing sources from CATALOGUE parameters, so
-        # the catalogue file is the hard requirement, not the bricks
-        cat = os.path.join(mojito, "catalogues", cat_files[cls])
-        if not os.path.exists(cat):
-            print(f"[SOURCES] REFUSING: {cls} armed but its catalogue "
-                  f"{cat!r} is missing -- the hybrid fill has no truths.")
+if "COMBINED" in types:
+    for clash in ("NOISE", "GALFOR"):
+        if clash in types:
+            print(f"[SOURCES] REFUSING: SOURCE_TYPES lists COMBINED and "
+                  f"{clash} -- the combined stream already contains it "
+                  "(the loader refuses this at build).")
             bad = True
-            continue
-        print(f"[SOURCES] {cls}: bricks for ids {have or '[]'}; "
-              f"[HYBRID] will synthesize ids {miss or '[]'} from the "
-              f"catalogue.")
-    else:
-        if not have:
-            print(f"[SOURCES] REFUSING: {cls} armed (ids {ids}) but no "
-                  f"bricks under {d!r}.")
-            bad = True
-        elif miss:
-            print(f"[SOURCES] REFUSING: {cls} ids {miss} have no brick "
-                  f"under {d!r} (set SYNTHESIZE_MISSING_BRICKS=1 for the "
-                  f"hybrid fill).")
+    folder = os.path.join(mojito, "data", "COMBINED", "L1")
+    override = os.environ.get("MOJITO_COMBINED_FILE", "").strip()
+    if override:
+        p = override if os.path.isabs(override) else os.path.join(folder, override)
+        if not os.path.exists(p):
+            print(f"[SOURCES] REFUSING: MOJITO_COMBINED_FILE={override!r} "
+                  f"does not exist (looked at {p}).")
             bad = True
         else:
-            print(f"[SOURCES] {cls}: all {len(have)} bricks present.")
+            print(f"[SOURCES] COMBINED file (override): {p}")
+    elif not os.path.isdir(folder):
+        print(f"[SOURCES] REFUSING: no combined-data folder at {folder!r}.")
+        bad = True
+    else:
+        cands = sorted(f for f in os.listdir(folder)
+                       if f.endswith(".h5") and not f.startswith("."))
+        named = [f for f in cands if f.upper().startswith("COMBINED_")]
+        if not cands:
+            print(f"[SOURCES] REFUSING: no .h5 file in {folder!r}.")
+            bad = True
+        elif len(cands) > 1 and len(named) != 1:
+            print(f"[SOURCES] REFUSING: {len(cands)} .h5 files in "
+                  f"{folder!r} ({cands}); set MOJITO_COMBINED_FILE.")
+            bad = True
+        else:
+            pick = named[0] if len(cands) > 1 else cands[0]
+            print(f"[SOURCES] COMBINED file: {os.path.join(folder, pick)}")
+    for cls, ids in armed.items():
+        state = f"ids {ids}" if ids.strip() else "not armed"
+        print(f"[SOURCES] {cls}: catalogue-only under COMBINED ({state}).")
+else:
+    for cls, ids in armed.items():
+        if not ids.strip():
+            print(f"[SOURCES] {cls}: not armed (empty id list).")
+            continue
+        d = os.path.join(mojito, "data", cls, "L1")
+        hits = sorted(glob.glob(os.path.join(d, "*")))
+        if not hits:
+            print(f"[SOURCES] REFUSING: {cls} armed (ids {ids}) but no bricks "
+                  f"under {d!r}.")
+            bad = True
+        else:
+            print(f"[SOURCES] {cls}: {len(hits)} brick file(s) under {d}; "
+                  f"ids {ids} (per-id resolution is the loader's).")
 if bad:
     raise SystemExit(2)
 print("[SOURCES] preflight OK.")
 PYEOF
 
-# ============================================================================
-# THE NUMBER TO READ, once more (this is the whole deliverable):
-#
-#   grep "initial log likelihood" on the log below.
-#
-# run.py prints "initial log likelihood (after recipe setup)" ONCE, before
-# the sampler moves anything, with the per-walker values. Every walker
-# starts at the identical truth point (*_START_FACTOR=0), so they are all
-# the same number. |lnL| ~ 0 = the null holds.
-#
-# Also worth grepping on the same log:
-#   [combined] stage ...              -> must be exactly source_search, full_pe
-#   [combined] FIXED sensitivity ...  -> the psd/galfor actually in use
-#   [NULLTEST] ...                    -> where those came from
-#   [HYBRID] ...                      -> real brick vs synthesized per source
-# ============================================================================
 if [ "${SLURM_NNODES:-1}" -gt 1 ]; then
   # Multi-node launch = Intel MPI's OWN launcher (hydra) bootstrapped from the
   # SLURM allocation, NOT `srun --mpi=...` (WP7 Step 0, 2026-09-16): on this

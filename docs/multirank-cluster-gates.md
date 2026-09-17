@@ -436,6 +436,120 @@ Once Steps 0-4 are green:
    green (Plan 4 ledger ruling: `"_propose_legacy is deleted only after the
    WP7 cluster gates"`; dispatch at `gbspecialstretch.py:17888-17911`).
 
+## One-walker replica mode gate
+
+The ordered cluster campaign for this mode (gates T0-T6 with pass criteria, paired controls, triage and the evidence to collect) is `docs/one-walker-testing-campaign.md`; the steps below are the per-step commands it references.
+
+`nwalkers=1` spread over several compute ranks, where every rank holds a full
+replica of the residual instead of a disjoint walker block: GB/VGB dispersal
+is by static per-rank band range with a per-unit cold-chain delta ledger and
+a `gb_sync` fan-out command that rebuilds every replica's residual from the
+head-merged branch; addremove/PSD dispersal is by head-controlled likelihood
+row scatter. Knobs: `GF_ONE_WALKER_REPLICAS`, `{BRANCH}_LIKELIHOOD_FANOUT`,
+`{P}_INNER_MOVE_KIND`, `{P}_EIGEN_REFRESH`, `{P}_EIGEN_EPS_REL`. Laptop gate
+passed: `RUN_GF_GB_SMOKE=1 python -m unittest tests.test_multirank_gb_smoke`
+— the one-walker/two-replica arm ran 4 `gb_sync` rounds with agreeing
+residual hashes across replicas. Four caveats to carry into the cluster
+gate: (a) the residual hash covers `linear_data_arr` + `linear_psd_arr`,
+which can be zero-length under the `psd_storage="none"` invC storage mode;
+(b) `run_tempering`'s cold-chain open/close is narrowed to the replica's own
+band range (`_tempering_open_close_mask`), so a replica opens roughly
+`1/n_replicas` of the grid per unit — but the tempering *swap* work it still
+schedules is its own rows only, so the 1-walker arm is not expected to beat
+the multi-walker arm on wall time; (c) `run_tempering` has no in-stage
+residual-divergence detector in replica mode — the cross-replica guard is the
+`gb_sync` per-rank `log_like_final` agreement (`rtol=1e-10`, `atol=1e-8`),
+and the residual hash is an exact-match bonus that agrees on CPU but is
+expected to differ on GPU at the ~1e-12 `atomicAdd` level (logged at INFO,
+not WARNING); (d) `cap_stats` (the leaf-cap gate heuristic) is computed on
+the head before the `gb_sync` rebuild, from its own residual and its partly
+stale `d_h`/`h_h`; heuristic only.
+
+The steps below mirror Step 1's three-layout parity setup (same MPI-launcher
+exports, same common env bundle) with `NWALKERS=1` in place of `NWALKERS=8`,
+since a one-walker run has no walker block left to divide.
+
+### Step A — layout dry run
+
+```sh
+export I_MPI_HYDRA_BOOTSTRAP=slurm I_MPI_FABRICS=shm:ofi FI_PROVIDER=tcp   # see "MPI launcher"
+
+export NWALKERS=1 DATA_MODE=synthetic NUM_ITERATIONS=4 MIDIT_CHECKPOINT=0 \
+       MAKE_DIAGNOSTIC_PLOTS=0 GF_FANOUT_DIGEST=1 GF_LEGACY_RANK_LAYOUT=0
+
+GF_LAYOUT_DRY_RUN=1 GPUS=0,1 mpiexec -n 3 -ppn 3 \
+  python scripts/run_global.py --stock <name>
+# expect: "walker-block layout: ... nwalkers=1 block=1 ... REPLICAS" and every
+# compute rank printing "walkers=[0,1)"
+```
+
+### Step B — replica parity (three layouts, same seeds)
+
+Common env bundle (design spec Verification item 5, same as Step 1's, with
+`NWALKERS=1`):
+
+```sh
+export DATA_MODE=synthetic
+export NWALKERS=1
+export NUM_ITERATIONS=<N>          # pick a small N for the first pass
+export MIDIT_CHECKPOINT=0
+export MAKE_DIAGNOSTIC_PLOTS=0
+export GF_FANOUT_DIGEST=1
+export GF_LEGACY_RANK_LAYOUT=0
+```
+
+```sh
+# (a) 2 compute ranks sharing 1 GPU -- cheapest, run this first
+GPUS=0 RANKS_PER_GPU=2 mpiexec -n 3 -ppn 3 \
+  python scripts/run_global.py --stock <name>
+
+# (b) 2 compute ranks on 2 GPUs of 1 node
+GPUS=0,1 mpiexec -n 3 -ppn 3 \
+  python scripts/run_global.py --stock <name>
+
+# (c) 2 compute ranks across 2 nodes (round-robin: head + saver on A, compute on B)
+GPUS=0 mpiexec -n 3 -ppn 1 \
+  python scripts/run_global.py --stock <name>
+```
+
+What to diff:
+- every `[FANOUT_DIGEST]` line ends with `replicas_agree=True`;
+- NO `"[GB_REPLICA ...] log_like_final disagrees after sync"` warning — that
+  is the divergence guard. `"[GB_REPLICA ...] residual hashes disagree after
+  sync"` is an INFO line and is EXPECTED on GPU (~1e-12 `atomicAdd` spread);
+  `"[GB_REPLICA] residual authoritative"` info lines are expected too (drift
+  logged, not repaired);
+- `log_like` / `coords` / `inds` digests agree across (a), (b), (c) to the
+  same tolerance the multi-walker gate (Step 1) uses.
+
+### Step C — statistical check vs one compute rank
+
+```sh
+# single rank, no replicas
+GPUS=0 mpiexec -n 1 \
+  python scripts/run_global.py --stock <name>
+```
+
+vs layout (b) above. NOT expected bit-identical (rank RNG streams differ for
+GB dead-slot draws); compare acceptance rates, cold-chain leaf counts, and
+per-band tempering through the `processing-gf-snapshots` flow, as Step 3
+does for the multi-walker port.
+
+### Step D — timing readout
+
+- Per scoring call the parallelism is `min(n_compute, ntemps)`: set
+  `PSD_NTEMPS` / MBH `ntemps` `>= n_compute`.
+- Measure the PSD eigen refresh cost (`{P}_EIGEN_REFRESH` default `10`) from
+  `[PSD_TIMING]`.
+- GB: `run_tempering`'s cold-chain open/close is narrowed to the owned band
+  range, but the swap-grid build, the census and the chunk loop are not, so
+  do not expect a ~n_replicas wall-time win from tempering alone.
+
+**Parser note.** The `[FANOUT_DIGEST]` line is append-only;
+`scripts/diagnostics/gf_run_log_digest.py` summarizes `replicas_agree` and
+`[GB_REPLICA]` via `summarize_replica_digest` and `summarize_gb_replica`
+(Task 3).
+
 ## Closing note
 
 `LISAanalysistools/multinode_gpu_handoff.md` — untracked, in the **main**

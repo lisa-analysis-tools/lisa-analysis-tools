@@ -44,7 +44,7 @@ package.
 | `cutils/` | All C++/CUDA sources + nanobind bindings + public headers (see §5). |
 | `sources/` | Per-source waveform generators: `bbh/`, `emri/`, `gb/`, `sobbh/`, plus `waveformbase.py`, `defaultresponse.py`, `utils.py`. |
 | `sampling/` | Eryn-based MCMC pieces: `prior.py`, `likelihood.py`, `gmm.py`, `stopping.py`, `fstat_proposal.py` (`FStatProposal4D` grid+inverse-CDF proposal over GB intrinsics + RJ-birth container helpers), `f0_mchirp_prior.py` (`F0McGMMSampling` astrophysical joint (f0, Mc) GB prior from the population heatmap GMM, box-truncated + renormalized), `moves/`. |
-| `globalfit/` | The global-fit pipeline (engine, run, recipe, per-branch modules, `moves/`, `priors/`, `stock/`). See §3–4. `globalfit/communication/` (`ranks.py`, `fanout.py`, `fakecomm.py`, `walkerslice.py`) is the multi-rank walker-block layer — rank roles, layout, device pinning, and the head↔compute fan-out; see [`docs/global-fit-launch.md`](global-fit-launch.md) (roles/knobs) and [`docs/multirank-cluster-gates.md`](multirank-cluster-gates.md) (cluster validation runbook). |
+| `globalfit/` | The global-fit pipeline (engine, run, recipe, per-branch modules, `moves/`, `priors/`, `stock/`). See §3–4. `globalfit/communication/` (`ranks.py`, `fanout.py`, `fakecomm.py`, `walkerslice.py`, `rowfanout.py`) is the multi-rank walker-block layer — rank roles, layout, device pinning, and the head↔compute fan-out; `rowfanout.py` (`RowFanout`) is the one-walker-replica row-scatter primitive (`run(op, rows, *, local_body)` splits row batches across compute ranks and concatenates in row order, `replay(op, payload, *, local_body)` broadcasts to every rank) used by the addremove/PSD scoring seams; see [`docs/global-fit-launch.md`](global-fit-launch.md) (roles/knobs) and [`docs/multirank-cluster-gates.md`](multirank-cluster-gates.md) (cluster validation runbook). |
 | `utils/` | `parallelbase.py` (`LISAToolsParallelModule`), `constants.py`, `utility.py` (`get_array_module`, `AET`, `asnumpy`), `typing.py`. |
 | `orbit_files/` | Packaged orbit data. |
 
@@ -269,6 +269,12 @@ templated kernels.
   sub-state's setup methods + name lists define its datasets; no Spec layer.
   Cold-row agreement is checked at every stage entry (`GF_SUBSTATE_CHECK=0`
   disables). Pre-rework files cannot be resumed (clean break).
+- **`gbspecialstretch.py`** — GB/VGB special moves. One-walker replica mode
+  (`layout.replica_mode`): static per-rank band ranges (`replica_band_ranges`,
+  `_owned_rows_mask`), a per-unit cold-chain delta ledger (`_ledger_*`), a
+  merge by physical source on the head (`merge_owned_sources`) and a 4th
+  fan-out command `gb_sync` that rebuilds every replica's residual from the
+  merged branch.
 - **Backend implementation hierarchy**: GPU C++ leads → CPU C++ mirrors via
   `#ifdef` → JAX diverges internally but must match C++ inner products
   (reldiff ≲ 1e-12). Narrowband WDM validation via `mm5`/`mm2`.
