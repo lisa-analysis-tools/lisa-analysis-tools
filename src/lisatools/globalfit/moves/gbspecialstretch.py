@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import os
@@ -19117,21 +19118,25 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         The head then sees ITS OWN ``RuntimeError``, not a
         ``RemoteWorkerError``: the head's body raises the status error inside
-        ``WalkerFanout.run``'s ``try``, whose drain waits the isends,
-        ``recv``s each worker's failure reply and DISCARDS it before
-        re-raising the head's exception (``fanout.py`` :206-222). Grep the
-        head log for the message, not for the type.
+        ``WalkerFanout.run``'s ``try``, whose ``except BaseException`` drain
+        waits the isends, ``recv``s each worker's failure reply and DISCARDS
+        it before re-raising the head's exception (``fanout.py`` :260-274).
+        Grep the head log for the message, not for the type.
 
         EVERY piece of owner-side fallible work is inside the guard --
         ``_bind_rank_acs``, the GB-free window, the shard resolve, the
-        snapshot, and the dtype normalization that sizes the header. What
-        that does NOT cover, and cannot with a ROOT broadcast, is a
-        NON-owner failing before it reaches ``Bcast(header)``: its
-        ``_bind_rank_acs``, and its two ``np.empty`` allocations between the
-        header and the data broadcasts. A non-root rank has no way to signal
-        through a header the root owns; closing that needs a different
-        primitive (an allgather of status), i.e. a fourth collective on
-        every command, deliberately not paid here.
+        snapshot, and the dtype normalization that sizes the header. Two
+        things remain uncovered, neither reachable by a ROOT broadcast:
+
+        * a NON-owner failing BEFORE ``Bcast(header)`` -- its own
+          ``_bind_rank_acs``;
+        * a NON-owner failing BETWEEN the header and data broadcasts -- its
+          two ``np.empty`` receive allocations.
+
+        A non-root rank has no way to signal through a header the root owns;
+        closing either needs a different primitive (an allgather of status),
+        i.e. a fourth collective on every command, deliberately not paid
+        here.
 
         The header is ``(status, n_data, n_psd, data_is_complex,
         psd_is_complex)`` as int64. The two complex flags are not
@@ -19503,7 +19508,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         Used by the head (stage A, and the centre table under the spec's
         same-residual rule) and by every rank's ``gb_fstat_stage_b`` body,
-        so the whole epoch is scored against ONE residual snapshot.
+        so the whole epoch is scored against ONE residual snapshot. THE
+        SINGLE CHOKEPOINT, and therefore the single place the "is there a
+        reference row?" guard lives -- every caller passes through here, so
+        duplicating it in the served body would only give one condition two
+        different messages.
         """
         if self._fstat_ref_holder is None:
             # Without this, ``holder=None`` falls straight through to the
@@ -19512,8 +19521,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             raise RuntimeError(
                 f"{self.name}: no replicated F-stat reference row on this "
                 "rank -- gb_fstat_ref_row must run before anything scores "
-                "through the holder. Scoring the live ACA at row 0 instead "
-                "would silently fit the epoch against the wrong walker.")
+                "through the holder (on a compute rank that means "
+                "gb_fstat_stage_b arrived first). Scoring the live ACA at "
+                "row 0 instead would silently fit the epoch against the "
+                "wrong walker.")
         call = getattr(self, "_fstat_call", None)
         if call is None:
             raise RuntimeError(
@@ -19589,6 +19600,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         on one rank surfaces as an ordinary ``RemoteWorkerError`` on the head
         instead of parking every other rank in an untimed ``Bcast`` -- the
         hazard ``gb_fstat_ref_row`` has to spend a status word on.
+
+        The missing-reference-row guard is :meth:`_fstat_holder_call`'s, not
+        a second copy here: the scorer below is built through it, so the
+        condition is checked once, before any sweep, with one message.
         """
         from lisatools.sampling.fstat_gridfit import (
             run_stage_b_group,
@@ -19596,10 +19611,6 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         )
 
         self._bind_rank_acs(model)
-        if self._fstat_ref_holder is None:
-            raise RuntimeError(
-                f"{self.name}: gb_fstat_stage_b arrived before "
-                "gb_fstat_ref_row -- no replicated reference row on this rank")
         spec = self._fstat_stage_b_spec(payload)
         rank_index = int(payload["rank_index"])
         t0 = time.perf_counter()
@@ -19612,10 +19623,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         logger.info(
             "%s: [FSTAT_STAGEB] g%d r%d boxes [%d, %d) (%d) in %.1fs",
             self.name, spec.gi, rank_index, spec.a, spec.b, n_rows, wall)
+        # ``rank`` is the WORLD rank, for per-rank attribution in a log; it is
+        # ``None`` rather than 0 without a fan-out, because labelling a
+        # fan-out-less serve "rank 0" is a claim, not a default.
+        _fan = getattr(self, "fanout", None)
         return {"gi": int(spec.gi), "a": int(spec.a), "b": int(spec.b),
                 "rank_index": rank_index, "n_rows": int(n_rows),
                 "sha1": sha, "wall_s": float(wall),
-                "rank": int(getattr(getattr(self, "fanout", None), "rank", 0))}
+                "rank": None if _fan is None else int(_fan.rank)}
 
     def _fstat_stage_b_runner(self, model):
         """HEAD: a ``sweep_runner`` that fans ONE group out over the ranks.
@@ -19629,11 +19644,17 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         slowest axis, so concatenating the partials in rank order
         reproduces the whole-group sweep exactly.
 
-        INSTALL IT ONLY UNDER A REAL FAN-OUT. At ``n_compute == 1`` (and with
-        no fan-out at all) the serial ``run_stage_b_group`` is the gated
-        path: the goldens pin the serial ``.npz`` byte for byte, and routing
-        that run through per-rank partials would change the checkpoint names
-        under an in-flight fit for no gain.
+        REFUSES ANYTHING BUT A REAL FAN-OUT, in code rather than in prose.
+        At ``n_compute == 1`` this would otherwise run happily --
+        ``WalkerFanout.run``'s single branch (``fanout.py`` :224-225) calls
+        only ``local_body``, so the head would sweep the whole range, write
+        ``stageb_g{gi}_r0.npy`` and read it straight back. The NUMBERS would
+        be unchanged, but ``n_compute == 1`` is the spec's byte-identity
+        gate: the checkpoint name would change from the legacy ``stageb`` to
+        ``stageb_r0`` (invalidating an in-flight fit's resume) and the gated
+        serial path would round-trip through disk for nothing. So the caller
+        must pass NO ``sweep_runner`` there, and this refuses instead of
+        trusting a docstring Task 8 may not read.
         """
         from lisatools.sampling.fstat_gridfit import (
             assemble_stage_b_group,
@@ -19642,15 +19663,31 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         )
 
         fanout = getattr(self, "fanout", None)
-        if fanout is None:
+        if fanout is None or fanout.single:
             raise RuntimeError(
-                f"{self.name}: _fstat_stage_b_runner needs a fan-out to split "
-                "the group over; a single-process fit must pass no "
-                "sweep_runner at all (the serial run_stage_b_group).")
+                f"{self.name}: _fstat_stage_b_runner needs SEVERAL compute "
+                "ranks to split the group over. With no fan-out, or at one "
+                "compute rank, stage B is the serial run_stage_b_group and "
+                "run_stacked_stage_b must be called with no sweep_runner at "
+                "all -- that path is the byte-identity gate.")
         layout = fanout.layout
         n_parts = int(layout.n_compute)
 
         def runner(spec, call_fstat, *, xp):
+            # Stage A, stage B and the centre table must score against the
+            # SAME residual snapshot (spec decision 6). The ranks build their
+            # own scorer from the replicated row, so this argument is unused
+            # here -- which is exactly why it has to be checked: a wiring that
+            # handed ``run_stacked_stage_b`` a live-ACA scorer would fit
+            # stage A against one residual and stage B against another, with
+            # nothing anywhere to say so.
+            if call_fstat is not self._fstat_ref_call:
+                raise RuntimeError(
+                    f"{self.name}: stage B was handed a scorer that is not "
+                    "this rank's cached holder-scored call_fstat "
+                    "(_fstat_holder_call). Stage A and stage B would then "
+                    "score against different residuals; pass "
+                    "self._fstat_holder_call(model) to run_stacked_stage_b.")
             if not spec.parts_dir:
                 raise RuntimeError(
                     f"{self.name}: stage-B group {spec.gi} has no parts_dir -- "
@@ -19669,8 +19706,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             )
             # ``_fanout_cmd`` hands back the BARE result dicts -- ``{rank:
             # result}``, not ``{rank: {"result": ...}}``: ``WalkerFanout.run``
-            # unwraps the envelope itself before ``merge`` (fanout.py:172 and
-            # :262).
+            # unwraps the envelope itself, ``merge({r: rep["result"] for r,
+            # rep in replies.items()})`` (``fanout.py`` :308; the envelope is
+            # built by ``_reply``, :71).
             results = {}
             for rank, res in replies.items():
                 res = res or {}
@@ -19695,11 +19733,44 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         f"reported box range {(res.get('a'), res.get('b'))} but "
                         f"was asked for {want} -- the partials would assemble "
                         "out of box order.")
+                # A short partial IS caught downstream, but only as an
+                # aggregate shape error that names no rank. Check it here,
+                # where the rank is still in hand.
+                if int(res.get("n_rows", -1)) != want[1] - want[0]:
+                    raise RuntimeError(
+                        f"{self.name}: stage-B group {spec.gi} rank index {ri} "
+                        f"wrote {res.get('n_rows')} box row(s) for the range "
+                        f"{want} ({want[1] - want[0]} expected).")
             sha1s = {i: res.get("sha1") for i, res in results.items()}
-            grid = assemble_stage_b_group(
-                spec.parts_dir, spec.gi, n_parts, spec.node_shape, xp=xp,
-                sha1s=sha1s)
+            try:
+                grid = assemble_stage_b_group(
+                    spec.parts_dir, spec.gi, n_parts, spec.node_shape, xp=xp,
+                    sha1s=sha1s)
+            except FileNotFoundError as exc:
+                # Every rank reported success, so the file exists -- on ITS
+                # node. The whole stage-B wall has already been paid by the
+                # time this shows up, and a bare FileNotFoundError says
+                # nothing about why.
+                raise RuntimeError(
+                    f"{self.name}: stage-B group {spec.gi} partial "
+                    f"{getattr(exc, 'filename', None)} is missing on the head "
+                    "although every rank reported writing one. The epoch cache "
+                    f"directory ({spec.parts_dir}) must be on a filesystem "
+                    "SHARED by every compute rank; a node-local one lets each "
+                    "rank write a partial the head can never read."
+                ) from exc
             clear_stage_b_parts(spec.parts_dir, spec.gi, n_parts)
+            # ``clear_stage_b_parts`` only unlinks ``r < n_parts``. A fit that
+            # died at a LARGER n_compute leaves its high-index partials --
+            # hundreds of MB each -- in the epoch dir forever, and nothing
+            # else matches them (the end-of-stage ``ckpt_clear`` sweeps only
+            # the ``.progress.*`` suffixes).
+            for stale in glob.glob(os.path.join(
+                    spec.parts_dir, f"stageb_g{int(spec.gi)}_r*.npy")):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
             walls = [float(res.get("wall_s", 0.0))
                      for res in results.values()] or [0.0]
             logger.info(

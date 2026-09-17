@@ -1210,7 +1210,14 @@ def assemble_stage_b_group(parts_dir, gi, n_parts, node_shape, *, xp,
     malformed MPI reply) is exactly the failure this check exists to catch
     -- silently skipping verification for that one rank would defeat the
     whole point, so it raises instead of falling back to "unverified".
+
+    Each partial is read STRAIGHT INTO its slice of one preallocated output
+    array. A ``parts`` list plus ``np.concatenate`` would hold the whole
+    group twice on the host at the moment of the concat -- ~1.3 GB transient
+    for the 653 MB production group 1, on top of the device copy -- for no
+    gain: the destination is contiguous and the order is known up front.
     """
+    node_shape = tuple(int(v) for v in node_shape)
     if sha1s is not None:
         missing = [r for r in range(int(n_parts)) if sha1s.get(r) is None]
         if missing:
@@ -1218,7 +1225,8 @@ def assemble_stage_b_group(parts_dir, gi, n_parts, node_shape, *, xp,
                 f"stage-B group {gi}: sha1s given but missing/None for "
                 f"rank(s) {missing} of {n_parts} -- cannot verify those "
                 f"partials, refusing to silently skip verification")
-    parts = []
+    out = np.empty(node_shape, dtype=np.float64)
+    off = 0
     for r in range(int(n_parts)):
         arr = np.ascontiguousarray(load_stage_b_part(parts_dir, gi, r))
         if sha1s is not None:
@@ -1228,13 +1236,18 @@ def assemble_stage_b_group(parts_dir, gi, n_parts, node_shape, *, xp,
                     f"stage-B partial g{gi} r{r} changed under us: reported "
                     f"sha1 {sha1s[r]}, read {got} "
                     f"({stage_b_part_path(parts_dir, gi, r)})")
-        parts.append(arr)
-    grid = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
-    if tuple(grid.shape) != tuple(node_shape):
+        if tuple(arr.shape[1:]) != node_shape[1:] or (
+                off + int(arr.shape[0]) > node_shape[0]):
+            raise RuntimeError(
+                f"stage-B group {gi}: partial r{r} is {tuple(arr.shape)} at "
+                f"box offset {off}, which does not fit {node_shape}")
+        out[off:off + int(arr.shape[0])] = arr
+        off += int(arr.shape[0])
+    if off != node_shape[0]:
         raise RuntimeError(
-            f"stage-B group {gi}: assembled {tuple(grid.shape)} from "
-            f"{n_parts} partials, expected {tuple(node_shape)}")
-    return xp.asarray(grid)
+            f"stage-B group {gi}: assembled {off} box(es) from {n_parts} "
+            f"partials, expected {node_shape[0]} ({node_shape})")
+    return xp.asarray(out)
 
 
 def clear_stage_b_parts(parts_dir, gi, n_parts) -> None:

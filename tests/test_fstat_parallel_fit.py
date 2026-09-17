@@ -11,6 +11,8 @@ the parallel split existed. They are the single-process regression gate:
 """
 
 import contextlib
+import dataclasses
+import hashlib
 import os
 import shutil
 import tempfile
@@ -1116,7 +1118,10 @@ class RefRowStatusWordTest(unittest.TestCase):
         layout = _build_fake_layout(8, 2)
         owner_index = 1                      # the SECOND compute rank owns it
         owner_rank = layout.compute_ranks[owner_index]
-        world = FakeWorld(2)
+        # A status-word regression is a HANG, and the default 60 s timeout
+        # would make every such regression cost a minute per test. Five
+        # seconds is ~500x the healthy run.
+        world = FakeWorld(2, timeout=5.0)
 
         def body(fr, comm):
             move = self._move(fr, comm, layout, owner_index, **kw)
@@ -1233,13 +1238,22 @@ class StageBPayloadTest(unittest.TestCase):
         self.assertEqual(got.parts_dir, spec.parts_dir)
 
     def test_payload_holds_no_device_arrays(self):
+        """Every array-shaped field must be host numpy.
+
+        NOT ``isinstance(value, np.ndarray)`` as the filter: a
+        ``cupy.ndarray`` is not an instance of ``np.ndarray``, so filtering
+        on it would SKIP exactly the type this test exists to catch. Check
+        everything that is not a plain scalar instead.
+        """
         from lisatools.globalfit.moves import gbspecialstretch as gbs
 
         move = gbs.GBSpecialBase.__new__(gbs.GBSpecialBase)
         payload = move._fstat_stage_b_payload(self._spec(), 0, 10, 13)
         for key, value in payload.items():
-            if isinstance(value, np.ndarray):
-                self.assertIs(type(value), np.ndarray, key)
+            if isinstance(value, (int, float, bool, str, tuple, type(None))):
+                continue
+            self.assertEqual(type(value).__module__.split(".")[0], "numpy",
+                             f"{key} is a {type(value)!r}")
 
     def test_empty_range_is_a_legal_payload(self):
         from lisatools.globalfit.moves import gbspecialstretch as gbs
@@ -1325,6 +1339,105 @@ class _StopHere(Exception):
 _KEEP = object()
 
 
+class ServedStageBBodyTest(unittest.TestCase):
+    """``_gb_serve_fstat_stage_b`` itself -- the PRODUCER's contract.
+
+    The head-side runner's checks are tested against hand-built replies; this
+    drives the real body, with a real ``run_stage_b_group`` sweep over a tiny
+    spec, and pins the reply dict the runner indexes by name. A typo in
+    ``"rank_index"`` or ``"sha1"``, or a regression that drops the
+    missing-reference-row guard (scoring the live ACA at row 0 -- the silent
+    wrong-walker failure), would otherwise first appear on the cluster.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _move(self, *, holder=_KEEP, scorer=_KEEP):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialRJFStatGridMove.__new__(gbs.GBSpecialRJFStatGridMove)
+        move.name = "gb_test"
+        move._backend_name = "lisatools_cpu"
+        move.mempool = gbs._NoOpMempool()
+        move._bind_rank_acs = lambda model: None
+        if holder is not _KEEP:
+            move._fstat_ref_holder = holder
+        if scorer is not _KEEP:
+            move._fstat_holder_call = lambda model: scorer
+        return move
+
+    def _payload(self, move, rank_index=1, a=0, b=2):
+        spec = G.StageBGroupSpec(
+            gi=3, n_groups=4, a=0, b=2,
+            f0_los=np.array([8.5, 8.6]), f0_dxs=np.full(2, 5e-4),
+            mc_ax=np.linspace(0.1, 0.9, 2),
+            alpha_ax=np.linspace(0.0, 2 * np.pi, 2),
+            sd_ax=np.linspace(-1.0, 1.0, 2),
+            node_shape=(2, 3, 2, 2, 2), ckpt_name="stageb_g3",
+            parts_dir=self.tmp, fingerprint_extra="|epoch=0",
+            fdot_axis=False, c_t=0.0)
+        return move._fstat_stage_b_payload(spec, rank_index, a, b)
+
+    def test_the_reply_describes_the_partial_it_wrote(self):
+        move = self._move(holder=object(), scorer=_fake_call_fstat())
+        payload = self._payload(move, rank_index=1, a=1, b=2)
+        with stage_b_env():
+            reply = move._gb_serve_fstat_stage_b(payload, {}, None)
+
+        self.assertEqual(
+            set(reply),
+            {"gi", "a", "b", "rank_index", "n_rows", "sha1", "wall_s", "rank"})
+        self.assertEqual((reply["gi"], reply["a"], reply["b"]), (3, 1, 2))
+        self.assertEqual(reply["rank_index"], 1)
+        self.assertEqual(reply["n_rows"], 1)
+        self.assertIsNone(reply["rank"])          # no fan-out: not "rank 0"
+        self.assertGreaterEqual(reply["wall_s"], 0.0)
+
+        # the reply's sha1 must describe the file the head will read back
+        arr = G.load_stage_b_part(self.tmp, 3, 1)
+        self.assertEqual(arr.shape, (1, 3, 2, 2, 2))
+        self.assertEqual(arr.dtype, np.float64)
+        self.assertEqual(
+            hashlib.sha1(np.ascontiguousarray(arr).tobytes()).hexdigest()[:16],
+            reply["sha1"])
+
+    def test_the_grid_it_writes_is_the_serial_sweep_of_that_range(self):
+        move = self._move(holder=object(), scorer=_fake_call_fstat())
+        payload = self._payload(move, rank_index=0, a=0, b=2)
+        with stage_b_env():
+            move._gb_serve_fstat_stage_b(payload, {}, None)
+            spec = move._fstat_stage_b_spec(payload)
+            want = G.run_stage_b_group(
+                dataclasses.replace(spec, ckpt_name=None, parts_dir=None),
+                _fake_call_fstat(), xp=np)
+        np.testing.assert_array_equal(G.load_stage_b_part(self.tmp, 3, 0), want)
+
+    def test_without_a_reference_row_it_refuses(self):
+        """No holder means ``holder=None`` reaches ``_fstat_call``, which
+        scores the LIVE ACA at row 0 -- a different walker, silently."""
+        move = self._move(holder=None)          # and NO stubbed scorer
+        payload = self._payload(move)
+        with self.assertRaises(RuntimeError) as ctx:
+            move._gb_serve_fstat_stage_b(payload, {}, None)
+        self.assertIn("gb_fstat_ref_row", str(ctx.exception))
+        self.assertFalse(os.listdir(self.tmp))  # nothing was written
+
+    def test_an_empty_range_writes_an_empty_partial(self):
+        """More ranks than boxes: the tail ranks still have to produce the
+        file the head assembles from."""
+        move = self._move(holder=object(), scorer=_fake_call_fstat())
+        payload = self._payload(move, rank_index=2, a=2, b=2)
+        with stage_b_env():
+            reply = move._gb_serve_fstat_stage_b(payload, {}, None)
+        self.assertEqual(reply["n_rows"], 0)
+        self.assertEqual(G.load_stage_b_part(self.tmp, 3, 2).shape,
+                         (0, 3, 2, 2, 2))
+
+
 class StageBRunnerTest(unittest.TestCase):
     """The head-side ``sweep_runner``: split, fan out, assemble, clear."""
 
@@ -1354,6 +1467,9 @@ class StageBRunnerTest(unittest.TestCase):
         move.name = "gb_test"
         layout = _build_fake_layout(4 * n_compute, n_compute)
         move.fanout = _StubFanout(layout, lls=None)
+        # LIVE, not decoration: the runner refuses ``single`` outright, so
+        # that the byte-identity-gated serial path cannot be routed through
+        # per-rank partials by a wiring mistake.
         move.fanout.single = (n_compute == 1)
         return move, layout
 
@@ -1472,6 +1588,42 @@ class StageBRunnerTest(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             runner(spec, None, xp=np)
         self.assertIn("parts_dir", str(ctx.exception))
+
+    def test_one_compute_rank_refuses_to_build_a_runner_at_all(self):
+        """``n_compute == 1`` is the spec's byte-identity gate.
+
+        ``WalkerFanout.run``'s single branch calls only ``local_body``, so the
+        runner would "work" -- and silently rename the group's checkpoint from
+        the legacy ``stageb`` to ``stageb_r0`` (killing an in-flight fit's
+        resume) while round-tripping the gated serial sweep through disk. The
+        caller must pass no ``sweep_runner`` there, and this refuses rather
+        than trust a docstring.
+        """
+        move, _layout = self._move(n_compute=1)
+        with self.assertRaises(RuntimeError) as ctx:
+            move._fstat_stage_b_runner("model")
+        self.assertIn("sweep_runner", str(ctx.exception))
+
+    def test_no_fanout_refuses_to_build_a_runner_at_all(self):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialRJFStatGridMove.__new__(gbs.GBSpecialRJFStatGridMove)
+        move.name = "gb_test"
+        with self.assertRaises(RuntimeError) as ctx:
+            move._fstat_stage_b_runner("model")
+        self.assertIn("sweep_runner", str(ctx.exception))
+
+    def test_a_scorer_that_is_not_the_cached_holder_call_is_refused(self):
+        """Stage A, stage B and the centre table must score against ONE
+        residual snapshot (spec decision 6). The ranks build their own scorer,
+        so nothing else ties the head's to theirs."""
+        move, _layout = self._move(n_compute=2)
+        move._fstat_ref_call = object()          # the head built its scorer
+        move._fanout_cmd = lambda *a, **k: self.fail("must not fan out")
+        runner = move._fstat_stage_b_runner("model")
+        with self.assertRaises(RuntimeError) as ctx:
+            runner(self._spec(), lambda p: p, xp=np)   # a DIFFERENT scorer
+        self.assertIn("_fstat_holder_call", str(ctx.exception))
 
 
 class FStatOpGuardTest(unittest.TestCase):
