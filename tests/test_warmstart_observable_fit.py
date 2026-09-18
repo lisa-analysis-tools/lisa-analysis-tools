@@ -185,5 +185,147 @@ class WhiteningScaleTest(unittest.TestCase):
             "metric -- f0 alone cannot tell them apart")
 
 
+class ClusterGMMTest(unittest.TestCase):
+    def _two_mode_cluster(self, n=400, seed=11):
+        """One cluster whose fdot marginal is genuinely bimodal."""
+        rng = np.random.default_rng(seed)
+        z = np.zeros((n, 9))
+        z[:, 0] = rng.normal(1.0, 0.05, n)
+        z[:, 1] = rng.normal(3.0, 1e-6, n)
+        half = n // 2
+        z[:half, 2] = rng.normal(1.0e-16, 2e-18, half)
+        z[half:, 2] = rng.normal(9.0e-16, 2e-18, n - half)
+        for c, sc in ((3, 0.05), (4, 0.05), (5, 0.05), (6, 0.05), (7, 0.05)):
+            z[:, c] = rng.normal(0.3, sc, n)
+        z[:, 8] = rng.normal(0.45, 0.01, n)
+        return z
+
+    def test_bimodal_cluster_gets_more_than_one_component(self):
+        comps = ffs.fit_cluster_gmms([self._two_mode_cluster()],
+                                     n_samples=2048, max_comp=6, seed=5)
+        weights = comps[0]
+        self.assertGreaterEqual(len(weights[0]), 2,
+                                "BIC should prefer >1 component for a "
+                                "genuinely bimodal cluster")
+
+    def test_component_count_is_set_by_the_min_members_cap(self):
+        """MEASURED 2026-09-18: the existing fitter's BIC is monotone in K.
+
+        ``vec_fit_gmm_min_bic`` scores BIC on the model's OWN synthetic
+        draws (``gmm.bic(gmm.rvs(n))``), which is an entropy estimate: more
+        components always fit tighter, so BIC falls monotonically and the
+        "risen twice past the running minimum" retirement never fires. On a
+        clean unimodal 9-D Gaussian, measured BIC ran 30556 (K=1) down to
+        22255 (K=7), with AND without resampling.
+
+        So the sweep returns ``max_comp_effective`` every time, and
+        ``min_members`` -- the spec's guard against BIC believing resampled
+        evidence -- is the ACTUAL selector. This test pins that, because it
+        is what anyone tuning ``--gmm-max-comp`` needs to know.
+
+        The underlying EM also runs with ``random_state=None``, so the
+        selected K is not reproducible run to run; the assertions below are
+        the guarantees that DO hold.
+        """
+        rng = np.random.default_rng(2)
+        z = np.zeros((400, 9))
+        for c in range(9):
+            z[:, c] = rng.normal(1.0, 0.05, 400)
+        # cap = min(6, 400 // 25 = 16) = 6
+        k6 = len(ffs.fit_cluster_gmms([z], n_samples=2048, max_comp=6,
+                                      seed=5)[0][0])
+        self.assertLessEqual(k6, 6)
+        self.assertGreater(k6, 1,
+                           "BIC-on-own-draws does not select 1 even for a "
+                           "clean unimodal cloud -- the cap is the selector")
+        # min_members binds when it is the tighter of the two: 400 // 200
+        k_guard = len(ffs.fit_cluster_gmms([z], n_samples=2048, max_comp=12,
+                                           min_members=200, seed=5)[0][0])
+        self.assertLessEqual(k_guard, 2)
+
+    def test_small_cluster_is_capped_at_one_component(self):
+        """min_members guards against BIC believing resampled evidence."""
+        z = self._two_mode_cluster(n=20)
+        comps = ffs.fit_cluster_gmms([z], n_samples=2048, max_comp=6,
+                                     min_members=25, seed=5)
+        self.assertEqual(len(comps[0][0]), 1)
+
+    def test_weights_sum_to_one_per_cluster(self):
+        comps = ffs.fit_cluster_gmms(
+            [self._two_mode_cluster(), self._two_mode_cluster(seed=99)],
+            n_samples=1024, max_comp=4, seed=5)
+        for w in comps[0]:
+            self.assertAlmostEqual(float(np.sum(w)), 1.0, places=6)
+
+    def test_output_is_the_seven_ragged_lists(self):
+        comps = ffs.fit_cluster_gmms([self._two_mode_cluster()],
+                                     n_samples=1024, max_comp=4, seed=5)
+        self.assertEqual(len(comps), 7)
+        weights, means, covs, invcovs, dets, mins, maxs = comps
+        k = len(weights[0])
+        self.assertEqual(np.shape(means[0]), (k, 9))
+        self.assertEqual(np.shape(covs[0]), (k, 9, 9))
+
+    def test_components_are_in_PHYSICAL_not_unit_cube_coordinates(self):
+        """The fitter returns means on [-1, 1]; we must store physical ones.
+
+        ``GMMFit`` maps each group onto the unit cube before fitting, so
+        ``vec_fit_gmm_min_bic``'s means/covs are cube coordinates and its
+        mins/maxs are the affine map back. ``WarmStartComponents`` draws
+        ``mean + L z`` directly, so the packed arrays have to be unscaled
+        here or every draw lands in the wrong place entirely.
+        """
+        z = self._two_mode_cluster()
+        comps = ffs.fit_cluster_gmms([z], n_samples=2048, max_comp=4, seed=5)
+        weights, means, covs, invcovs, dets, mins, maxs = comps
+        w = np.asarray(weights[0])
+        mu = np.asarray(means[0])
+        # the mixture mean of each column must sit inside the data range
+        mix_mean = w @ mu
+        for c in range(9):
+            self.assertGreaterEqual(mix_mean[c], z[:, c].min() - 1e-9)
+            self.assertLessEqual(mix_mean[c], z[:, c].max() + 1e-9)
+        # f_mid is ~3.0 physically and would be ~0 on the unit cube
+        self.assertAlmostEqual(mix_mean[1], float(z[:, 1].mean()), places=4)
+
+        # The decisive scale check: the mixture's own per-column variance
+        # must reproduce the members'. On the unit cube every column's
+        # variance is O(0.1); physically they run from ~1e-32 (fdot) to
+        # ~1e-3 (lnA), so a cube-coordinate slip fails this by decades.
+        cv = np.asarray(covs[0])
+        for c in range(9):
+            mix_var = float(w @ (cv[:, c, c] + (mu[:, c] - mix_mean[c]) ** 2))
+            self.assertAlmostEqual(
+                np.log10(mix_var), np.log10(float(z[:, c].var())), places=1,
+                msg=f"column {c} variance is off by orders of magnitude")
+
+    def test_stored_dets_match_the_stored_covariances(self):
+        """invcovs/dets ride along for the deferred FullGaussianMixtureModel
+        swap, so they must stay consistent with the unscaled covariances.
+
+        Checked via slogdet: the physical covariance spans ~18 orders of
+        magnitude between the lnA and fdot columns, so a plain
+        ``C @ invC == I`` comparison is meaningless in floating point even
+        though the identity holds exactly in exact arithmetic.
+        """
+        z = self._two_mode_cluster()
+        comps = ffs.fit_cluster_gmms([z], n_samples=2048, max_comp=4, seed=5)
+        covs, dets = np.asarray(comps[2][0]), np.asarray(comps[4][0])
+        for k in range(covs.shape[0]):
+            sign, logabsdet = np.linalg.slogdet(covs[k])
+            self.assertEqual(int(sign), 1)
+            self.assertAlmostEqual(logabsdet, float(np.log(dets[k])),
+                                   places=6)
+
+    def test_bounds_are_the_physical_member_range(self):
+        z = self._two_mode_cluster()
+        comps = ffs.fit_cluster_gmms([z], n_samples=2048, max_comp=4, seed=5)
+        mins, maxs = np.asarray(comps[5][0]), np.asarray(comps[6][0])
+        self.assertEqual(mins.shape, (9,))
+        for c in range(9):
+            self.assertGreaterEqual(mins[c], z[:, c].min() - 1e-9)
+            self.assertLessEqual(maxs[c], z[:, c].max() + 1e-9)
+
+
 if __name__ == "__main__":
     unittest.main()

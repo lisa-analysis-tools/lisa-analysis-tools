@@ -537,6 +537,137 @@ def fit_component(rows: np.ndarray, stats: dict):
 
 
 # --------------------------------------------------------------------------
+# stage 3 (observable): cluster -> GAUSSIAN MIXTURE
+# --------------------------------------------------------------------------
+def _unscale_gmm_components(comps):
+    """Fitted unit-cube components -> PHYSICAL coordinates, in place of a copy.
+
+    ``GMMFit`` linearly maps each group's samples into ``[-1, 1]^d`` using
+    that group's per-feature ``(min, max)`` BEFORE fitting, so the lists
+    ``vec_fit_gmm_min_bic`` returns carry CUBE means and covariances, with
+    ``mins``/``maxs`` as the affine map back::
+
+        x_phys = (z_cube + 1) / 2 * (max - min) + min
+
+    :class:`~.proposal.WarmStartComponents` draws ``mean + L z`` and scores
+    a Mahalanobis distance directly against the stored arrays, so it needs
+    PHYSICAL ones; left as cube coordinates every draw would land at a
+    completely wrong point (and f_mid ~3 mHz would read as ~0).
+
+    ``mins``/``maxs`` are already physical -- they are the member bounding
+    box -- and stay untouched, so they keep working as the box the density
+    side culls on.
+
+    NOTE for the deferred ``FullGaussianMixtureModel`` swap (spec 4.5):
+    that class applies the affine ITSELF, so it must NOT be handed these
+    unscaled arrays. ``meta["gmm"]["components_basis"] = "physical"``
+    records which convention a file is in.
+    """
+    weights, means, covs, invcovs, dets, mins, maxs = comps
+    out_means, out_covs, out_invcovs, out_dets = [], [], [], []
+    for mu, cv, icv, dt, lo, hi in zip(means, covs, invcovs, dets,
+                                       mins, maxs):
+        lo = np.asarray(_host_array(lo), dtype=float)
+        hi = np.asarray(_host_array(hi), dtype=float)
+        s = (hi - lo) / 2.0                      # per-feature half-width
+        mu = np.asarray(_host_array(mu), dtype=float)
+        cv = np.asarray(_host_array(cv), dtype=float)
+        out_means.append((mu + 1.0) / 2.0 * (hi - lo) + lo)
+        # cov_phys = S cov_cube S with S = diag(s); invcov and det follow.
+        out_covs.append(cv * np.outer(s, s)[None, :, :])
+        icv = np.asarray(_host_array(icv), dtype=float)
+        out_invcovs.append(icv / np.outer(s, s)[None, :, :])
+        out_dets.append(np.asarray(_host_array(dt), dtype=float)
+                        * float(np.prod(s)) ** 2)
+    return [[np.asarray(_host_array(w), dtype=float) for w in weights],
+            out_means, out_covs, out_invcovs, out_dets,
+            [np.asarray(_host_array(v), dtype=float) for v in mins],
+            [np.asarray(_host_array(v), dtype=float) for v in maxs]]
+
+
+def _host_array(a):
+    """cupy-or-numpy -> numpy (the fitter may run on device)."""
+    return a.get() if hasattr(a, "get") else np.asarray(a)
+
+
+def fit_cluster_gmms(cluster_rows, *, n_samples: int = 4096,
+                     max_comp: int = 12, min_members: int = 25,
+                     seed: int = 7, gpu=None, verbose: bool = False):
+    """Per-cluster Gaussian mixtures, min-BIC, on the EXISTING GPU fitter.
+
+    Mirrors :func:`lisatools.sampling.fstat_proposal.fit_gmm_to_stacked`:
+    ``vec_fit_gmm_min_bic`` wants a RECTANGULAR
+    ``(n_groups, n_samples, n_features)`` block, so each cluster's members
+    are resampled to a fixed ``n_samples`` (with replacement when the
+    cluster is smaller).
+
+    ``min_members`` is the honesty guard. Resampling cannot manufacture
+    structure the members do not contain, but it CAN let BIC believe it has
+    more evidence than it does, so a cluster's component cap is
+    ``min(max_comp, max(1, n_members // min_members))``.
+
+    **The cap is the selector, not BIC** (measured 2026-09-18). The shared
+    fitter scores BIC on the model's OWN synthetic draws
+    (``gmm.bic(gmm.rvs(n))``), which is an entropy estimate rather than a
+    fit-to-data criterion: more components always sit tighter, so BIC falls
+    essentially monotonically in K and the "risen twice past the running
+    minimum" retirement rule almost never fires. On a clean unimodal 9-D
+    Gaussian it ran 30556 (K=1) down to 22255 (K=7), with AND without
+    resampling. The sweep therefore returns the cap (give or take the noise
+    in its own random draws), which makes ``min_members`` the knob that
+    actually controls component count. Left as-is deliberately: the
+    criterion belongs to ``gmm.py`` and is shared with the F-stat side,
+    which is out of scope here (spec section 8).
+
+    Reproducibility note: the underlying EM initialises with
+    ``random_state=None``, so refitting the same store does not reproduce
+    the same K or the same components bit for bit.
+
+    Returns the seven ragged lists ``[weights, means, covs, invcovs, dets,
+    mins, maxs]``, one entry per cluster, in PHYSICAL coordinates (see
+    :func:`_unscale_gmm_components`), ready for
+    :func:`lisatools.sampling.fstat_proposal.pack_gmm_components`.
+    """
+    from lisatools.sampling.gmm import vec_fit_gmm_min_bic
+
+    rng = np.random.default_rng(seed)
+    caps = [min(int(max_comp), max(1, len(r) // int(min_members)))
+            for r in cluster_rows]
+    ndim = int(np.asarray(cluster_rows[0]).shape[1])
+    block = np.empty((len(cluster_rows), int(n_samples), ndim), dtype=float)
+    for i, rows in enumerate(cluster_rows):
+        rows = np.asarray(rows, dtype=float)
+        idx = rng.integers(0, len(rows), size=int(n_samples))
+        block[i] = rows[idx]
+        # DEGENERATE-COLUMN GUARD: GMMFit divides by (max - min) per
+        # feature, so a column that is constant across the cluster's
+        # members produces inf/nan for the whole group. Jitter such a
+        # column by a relative epsilon -- far below any posterior width,
+        # and it only ever affects columns that carry no information.
+        span = block[i].max(0) - block[i].min(0)
+        flat = span <= 0.0
+        if flat.any():
+            ref = np.maximum(np.abs(block[i].mean(0)), 1.0)
+            block[i][:, flat] += rng.normal(
+                0.0, 1e-12 * ref[flat], size=(int(n_samples), int(flat.sum())))
+
+    out = [[] for _ in range(7)]
+    # Groups sharing a cap are fitted together; the fitter sweeps a single
+    # (min_comp, max_comp) range per call, so one call per distinct cap.
+    for cap in sorted(set(caps)):
+        sel = [i for i, c in enumerate(caps) if c == cap]
+        comps = _unscale_gmm_components(vec_fit_gmm_min_bic(
+            block[sel], min_comp=1, max_comp=int(cap), gpu=gpu,
+            verbose=verbose, return_components=True,
+        ))
+        for j, i in enumerate(sel):
+            for k in range(7):
+                out[k].append((i, comps[k][j]))
+    # restore cluster order
+    return [[v for _, v in sorted(lst, key=lambda t: t[0])] for lst in out]
+
+
+# --------------------------------------------------------------------------
 # stage 3.5: wide-blend re-split (ruling 2026-09-08)
 # --------------------------------------------------------------------------
 # Measured on the v8 deep fits: in dense islands the stage-2 MAD-whitened
