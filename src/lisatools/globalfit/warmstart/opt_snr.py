@@ -142,31 +142,72 @@ def component_opt_snr(means: np.ndarray, store: str, noise: dict,
     return bt.opt_snr(phys, sa, se, gbw, df, tobs, nw, batch=batch)
 
 
+def _gate_observable(arrs, snr, keep):
+    """Gate a MIXTURE set: drop components, renormalise, drop empty clusters.
+
+    The SNR is per COMPONENT (each mixture component's mean is a template),
+    but ``p``/``mult``/``n_members``/``island_id`` are per CLUSTER, so one
+    mask cannot serve both. A cluster survives if any of its components
+    does; the survivors' weights are renormalised so the cluster still sums
+    to one.
+    """
+    ncomp = np.asarray(arrs["gmm_ncomp"], dtype=int)
+    splits = np.cumsum(ncomp)[:-1]
+    keep_by = np.split(keep, splits)
+    w_by = np.split(np.asarray(arrs["gmm_weights"], dtype=float), splits)
+    cl_keep = np.array([bool(k.any()) for k in keep_by])
+    out = {
+        "gmm_ncomp": np.array([int(k.sum()) for k, c in zip(keep_by, cl_keep)
+                               if c], dtype=int),
+        "gmm_weights": np.concatenate(
+            [w[k] / w[k].sum() for w, k, c in zip(w_by, keep_by, cl_keep)
+             if c]) if cl_keep.any() else np.zeros(0),
+    }
+    for k in ("gmm_means", "gmm_covs", "gmm_invcovs", "gmm_dets"):
+        out[k] = np.asarray(arrs[k])[keep]
+    for k in ("gmm_mins", "gmm_maxs"):
+        out[k] = np.asarray(arrs[k])[cl_keep]
+    for k, v in arrs.items():
+        if k.startswith("gmm_") or k == "f0_window_edges":
+            continue
+        out[k] = (v[cl_keep] if getattr(v, "ndim", 0) >= 1
+                  and len(v) == len(cl_keep) else v)
+    out["f0_window_edges"] = arrs["f0_window_edges"]
+    out["opt_snr"] = snr[keep]
+    return out
+
+
 def gate(fit_npz: str, out: str, limit: float, snr: np.ndarray,
          noise: dict) -> str:
     """Write the gated npz: opt_snr column + comps below ``limit`` dropped."""
     with np.load(fit_npz, allow_pickle=False) as d:
         arrs = {k: np.array(d[k]) for k in d.files if k != "meta"}
         meta = json.loads(str(d["meta"]))
-    n = len(arrs["means"])
+    observable = str(meta.get("basis", "sampling")) == "observable"
+    n = len(arrs["gmm_means"] if observable else arrs["means"])
     snr = np.asarray(snr, float)
     if snr.shape != (n,):
         raise ValueError(f"snr has shape {snr.shape}, fit has {n} comps")
     keep = snr >= float(limit)
-    per_comp = {k for k, v in arrs.items()
-                if v.ndim >= 1 and len(v) == n and k != "f0_window_edges"}
-    out_arrs = {k: (v[keep] if k in per_comp else v)
-                for k, v in arrs.items()}
-    out_arrs["opt_snr"] = snr[keep]
+    if observable:
+        out_arrs = _gate_observable(arrs, snr, keep)
+    else:
+        per_comp = {k for k, v in arrs.items()
+                    if v.ndim >= 1 and len(v) == n and k != "f0_window_edges"}
+        out_arrs = {k: (v[keep] if k in per_comp else v)
+                    for k, v in arrs.items()}
+        out_arrs["opt_snr"] = snr[keep]
     meta.update(
         opt_snr_limit=float(limit),
         opt_snr_dropped=int((~keep).sum()),
         opt_snr_noise=noise,
     )
     np.savez_compressed(out, **out_arrs, meta=json.dumps(meta))
+    dropped_p = ("" if observable else
+                 f"; dropped-p sum {arrs['p'][~keep].sum():.1f} of "
+                 f"{arrs['p'].sum():.1f}")
     print(f"gated: {n} -> {int(keep.sum())} comps at opt SNR >= {limit:g} "
-          f"(dropped {int((~keep).sum())}; dropped-p sum "
-          f"{arrs['p'][~keep].sum():.1f} of {arrs['p'].sum():.1f}) | "
+          f"(dropped {int((~keep).sum())}{dropped_p}) | "
           f"noise: it {noise['iteration']} walker {noise['walker']} "
           f"logL {noise['log_like']:.1f} | wrote {out}")
     return out
@@ -188,8 +229,12 @@ def main(argv=None):
           f"logL {noise['log_like']:.1f} psd={noise['psd_params']} "
           f"galfor={np.round(noise['galfor_params'], 4)}")
     with np.load(args.fit, allow_pickle=False) as d:
-        means = np.array(d["means"])
         fit_meta = json.loads(str(d["meta"]))
+        # WAVEFORM BOUNDARY: opt_snr builds real templates, so it needs
+        # astro columns whatever basis the fit ran in.
+        from . import basis as wb
+
+        means, _obs_map = wb.component_means_sampling(d, fit_meta)
     snr = component_opt_snr(boxed_means(means, fit_meta), args.store,
                             noise, batch=args.batch)
     gate(args.fit, args.out, args.limit, snr, noise)
