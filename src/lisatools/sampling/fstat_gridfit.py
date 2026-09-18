@@ -47,6 +47,13 @@ __all__ = [
     "ckpt_secs",
     "chunked_fstat_sweep",
     "select_comb_peaks",
+    "CombLevelSpec",
+    "run_comb_level",
+    "comb_part_path",
+    "save_comb_part",
+    "load_comb_part",
+    "assemble_comb_level",
+    "clear_comb_parts",
     "run_comb_scan",
     "run_stacked_peak_sweep",
     "StageBGroupSpec",
@@ -60,6 +67,7 @@ __all__ = [
     "clear_stage_b_parts",
     "run_stacked_stage_b",
     "run_fstat_grid_fit",
+    "comb_cache_usable",
     "stacked_grid_path",
     "stage_b_complete",
     "build_gb_birth_distribution",
@@ -735,9 +743,207 @@ class _CombRows:
         return self.shape, self._rows(uniq)[np.ravel(inv), cols]
 
 
+@dataclasses.dataclass(frozen=True)
+class CombLevelSpec:
+    """Everything ONE comb sky level's sweep needs, as host arrays.
+
+    Stage A's unit of parallel work, and the exact counterpart of
+    :class:`StageBGroupSpec`. ``a``/``b`` are node indices into the LEVEL's
+    own f0-ordered node list (the level assignment is a deterministic closed
+    form of f0 alone -- see ``nsky_per_node`` in :func:`run_comb_scan` --
+    so every rank derives the identical list with no communication, and a
+    sub-range is addressed in the same coordinates the head concatenates the
+    partials in).
+
+    The SKY GRID IS NEVER SLICED. ``alpha`` / ``sin_delta`` / ``lv`` /
+    ``mc_fix`` define what a ROW MEANS (:class:`_CombRows` lays rows out
+    node-major, sky fast), so a rank that sliced them would score a
+    different physical template while reporting the same node -- the same
+    invariant that keeps ``StageBGroupSpec``'s Mc/alpha/sin-delta axes
+    whole.
+    """
+
+    li: int
+    n_levels: int
+    lv: int
+    a: int
+    b: int
+    f0_nodes: np.ndarray
+    alpha: np.ndarray
+    sin_delta: np.ndarray
+    mc_fix: float
+    label: str
+    ckpt_name: Optional[str]
+    parts_dir: Optional[str]
+    fingerprint_extra: str
+
+    @property
+    def n_nodes(self) -> int:
+        return int(self.b) - int(self.a)
+
+    def sub_range(self, a2, b2, *, ckpt_name=None,
+                  label=None) -> "CombLevelSpec":
+        """This level restricted to ABSOLUTE nodes ``[a2, b2)``.
+
+        ``ckpt_name`` must differ per rank: the sweep's fingerprint hashes
+        the SLICED rows (:meth:`_CombRows._ckpt_flat_sample`) plus the
+        label, so two ranks' checkpoints are already mutually invalid -- but
+        they must not collide on one path.
+        """
+        a2, b2 = int(a2), int(b2)
+        if not (self.a <= a2 <= b2 <= self.b):
+            raise ValueError(
+                f"sub_range({a2}, {b2}) is outside level {self.li}'s "
+                f"node range [{self.a}, {self.b})")
+        i0, i1 = a2 - int(self.a), b2 - int(self.a)
+        return dataclasses.replace(
+            self,
+            a=a2,
+            b=b2,
+            f0_nodes=np.ascontiguousarray(self.f0_nodes[i0:i1]),
+            ckpt_name=(self.ckpt_name if ckpt_name is None else ckpt_name),
+            label=(self.label if label is None else label),
+        )
+
+
+def run_comb_level(spec: CombLevelSpec, call_fstat: Callable, *, xp):
+    """Sweep ONE comb sky level (or one rank's node range of it).
+
+    The single entry point both the serial scan and every compute rank use,
+    so a split can never diverge from the serial code by construction --
+    stage A's counterpart of :func:`run_stage_b_group`, and for the same
+    reason.
+
+    Returns the per-node reduction as THREE host arrays, ``(F_max,
+    best_alpha, best_sin_delta)``: the sky axis is maximized away here
+    rather than shipped, so a rank replies with 3 x n_nodes float64 instead
+    of the ``n_nodes x nsky`` block it scored (at the 6-mo level 6 that is
+    362,020 x 3 values instead of 185 million).
+
+    An EMPTY range (more ranks than nodes) short-circuits: the sweep's
+    checkpoint layer is not defined at ``n_total == 0``, and there is
+    nothing to score.
+    """
+    nn = spec.n_nodes
+    if nn == 0:
+        z = np.empty(0, dtype=np.float64)
+        return z, z.copy(), z.copy()
+    params = _CombRows(spec.f0_nodes, spec.alpha, spec.sin_delta, spec.mc_fix)
+    ckpt = (os.path.join(spec.parts_dir, spec.ckpt_name)
+            if (spec.parts_dir and spec.ckpt_name) else None)
+    Fd = chunked_fstat_sweep(
+        call_fstat, params, xp=xp, label=spec.label, ckpt=ckpt,
+        fingerprint_extra=spec.fingerprint_extra,
+    ).reshape(nn, int(spec.lv))
+    kb = _to_host(Fd.argmax(axis=1)).astype(int)
+    return _to_host(Fd.max(axis=1)), spec.alpha[kb], spec.sin_delta[kb]
+
+
+def comb_part_path(parts_dir, li, rank) -> str:
+    """``<parts>/comb_l{li}_r{rank}.npy`` -- one rank's slice of one level.
+
+    A separate prefix from the per-level PROGRESS files (``comb_nsky{lv}*``)
+    on purpose: :func:`run_comb_scan`'s end-of-scan
+    ``ckpt_clear(parts_dir, "comb_")`` sweeps only the ``.progress.*``
+    suffixes, so these finished partials are cleared by
+    :func:`clear_comb_parts` per level instead -- as soon as the head has
+    assembled them, rather than at the end of the whole scan.
+    """
+    return os.path.join(parts_dir, f"comb_l{int(li)}_r{int(rank)}.npy")
+
+
+def save_comb_part(parts_dir, li, rank, F_max, best_alpha, best_sin_delta):
+    """Write one rank's finished reduction as a ``(3, n)`` float64 block.
+
+    ONE file for the three arrays, so the head's read is one open and one
+    sha1 -- they are produced together, consumed together, and a partial
+    that lost one of the three would be a grid whose sky answers belong to
+    other nodes.
+
+    Written through an open file object and fsynced before the rename, for
+    the reasons :func:`save_stage_b_part` spells out: this is a cross-NODE
+    data path (a worker writes, replies, and the HEAD reads from another
+    node), so the barrier is what NFS close-to-open semantics need.
+    """
+    os.makedirs(parts_dir, exist_ok=True)
+    arr = np.ascontiguousarray(
+        np.stack([np.asarray(_to_host(F_max), dtype=np.float64),
+                  np.asarray(_to_host(best_alpha), dtype=np.float64),
+                  np.asarray(_to_host(best_sin_delta), dtype=np.float64)]))
+    path = comb_part_path(parts_dir, li, rank)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as fh:
+        np.save(fh, arr, allow_pickle=False)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    return path, int(arr.shape[1]), hashlib.sha1(arr.tobytes()).hexdigest()[:16]
+
+
+def load_comb_part(parts_dir, li, rank):
+    return np.load(comb_part_path(parts_dir, li, rank), allow_pickle=False)
+
+
+def assemble_comb_level(parts_dir, li, n_parts, n_nodes, *, sha1s=None):
+    """Concatenate one level's per-rank partials in RANK (== node) order.
+
+    :func:`split_box_range` hands rank ``r`` a contiguous ascending node
+    range, so rank-ordered concatenation reproduces the whole-level sweep
+    exactly. ``sha1s`` (rank -> digest, as the ranks reported them) is
+    verified when given, for the reason
+    :func:`assemble_stage_b_group`'s is: a partial that changed between the
+    reply and the read is a filesystem fault, and silently fitting on it
+    would corrupt the epoch with no symptom.
+
+    Returns ``(F_max, best_alpha, best_sin_delta)``, each ``(n_nodes,)``.
+    """
+    n_nodes = int(n_nodes)
+    if sha1s is not None:
+        missing = [r for r in range(int(n_parts)) if sha1s.get(r) is None]
+        if missing:
+            raise RuntimeError(
+                f"comb level {li}: sha1s given but missing/None for rank(s) "
+                f"{missing} of {n_parts} -- cannot verify those partials, "
+                f"refusing to silently skip verification")
+    out = np.empty((3, n_nodes), dtype=np.float64)
+    off = 0
+    for r in range(int(n_parts)):
+        arr = np.ascontiguousarray(load_comb_part(parts_dir, li, r))
+        if sha1s is not None:
+            got = hashlib.sha1(arr.tobytes()).hexdigest()[:16]
+            if got != sha1s[r]:
+                raise RuntimeError(
+                    f"comb partial l{li} r{r} changed under us: reported "
+                    f"sha1 {sha1s[r]}, read {got} "
+                    f"({comb_part_path(parts_dir, li, r)})")
+        if arr.ndim != 2 or arr.shape[0] != 3 or (
+                off + int(arr.shape[1]) > n_nodes):
+            raise RuntimeError(
+                f"comb level {li}: partial r{r} is {tuple(arr.shape)} at node "
+                f"offset {off}, which does not fit (3, {n_nodes})")
+        out[:, off:off + int(arr.shape[1])] = arr
+        off += int(arr.shape[1])
+    if off != n_nodes:
+        raise RuntimeError(
+            f"comb level {li}: assembled {off} node(s) from {n_parts} "
+            f"partials, expected {n_nodes}")
+    return out[0], out[1], out[2]
+
+
+def clear_comb_parts(parts_dir, li, n_parts) -> None:
+    """Remove one level's partials (and any leftover temp files)."""
+    for r in range(int(n_parts)):
+        for path in (comb_part_path(parts_dir, li, r),
+                     comb_part_path(parts_dir, li, r) + ".tmp"):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
                   f0_lims_hz, mc_lims, cache_path: Optional[str] = None,
-                  fingerprint_extra: str = ""):
+                  fingerprint_extra: str = "", comb_runner=None):
     """Dense-in-f0 F-stat comb scan across the sub-band.
 
     With months of data the F-stat f0 peaks are ~1/Tobs wide -- far too
@@ -747,6 +953,16 @@ def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
     right scan is therefore dense in f0 (spacing ~ 1/(2*Tobs)) x a small
     spread of sky points, maximized over sky per f0 node -- assembled into
     ONE parameter set per sky level and swept in a single chunked stream.
+
+    ``comb_runner`` replaces each level's kernel stream with
+    ``runner(spec, call_fstat, xp=xp) -> (F_max, best_alpha,
+    best_sin_delta)`` (``spec`` is a :class:`CombLevelSpec`). ``None`` is
+    the serial path, :func:`run_comb_level`, and is byte-identical to the
+    historical code. The multi-rank fit passes a runner that splits the
+    level by contiguous NODE range across the compute ranks and
+    concatenates the partials -- nodes are INDEPENDENT (the per-node
+    reduction reads only that node's own sky block), so rank-ordered
+    concatenation reproduces the whole-level sweep exactly.
 
     Returns ``(f0_nodes_mHz, F_max, peaks, extras)``.
     """
@@ -818,17 +1034,18 @@ def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
         # The block is generated per batch (:class:`_CombRows`), not held:
         # the dense array is 1.6 GB at 3-mo / ~81 GB at 23-mo density for
         # nothing but to be read 4096 rows at a time.
-        params = _CombRows(nodes, al, sd, mc_fix)
-        Fd = chunked_fstat_sweep(
-            call_fstat, params, xp=xp, label=f":comb.nsky{int(lv)}",
-            ckpt=(os.path.join(parts_dir, f"comb_nsky{int(lv)}")
-                  if parts_dir else None),
+        spec = CombLevelSpec(
+            li=_li, n_levels=len(levels), lv=int(lv), a=0, b=nn,
+            f0_nodes=nodes, alpha=al, sin_delta=sd, mc_fix=mc_fix,
+            label=f":comb.nsky{int(lv)}",
+            ckpt_name=f"comb_nsky{int(lv)}", parts_dir=parts_dir,
             fingerprint_extra=fingerprint_extra,
-        ).reshape(nn, int(lv))
-        _kb = _to_host(Fd.argmax(axis=1)).astype(int)
-        F_max_host[idx] = _to_host(Fd.max(axis=1))
-        best_al_host[idx] = al[_kb]
-        best_sd_host[idx] = sd[_kb]
+        )
+        runner = comb_runner if comb_runner is not None else run_comb_level
+        F_lv, al_lv, sd_lv = runner(spec, call_fstat, xp=xp)
+        F_max_host[idx] = F_lv
+        best_al_host[idx] = al_lv
+        best_sd_host[idx] = sd_lv
         total_evals += int(lv) * nn
     logger.info("[comb] total %d F-stat evals across %d sky level(s)",
                 total_evals, len(levels))
@@ -847,7 +1064,14 @@ def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
                  band_edges=np.asarray(band_edges_hz, dtype=float),
                  F_all=F_max_host[None, :], sky_alpha=_al_top,
                  sky_sin_delta=_sd_top, best_alpha=best_al_host,
-                 best_sin_delta=best_sd_host, nsky_per_node=nsky_per_node)
+                 best_sin_delta=best_sd_host, nsky_per_node=nsky_per_node,
+                 # WHAT RESIDUAL THIS SCAN WAS SCORED AGAINST. The same
+                 # string that salts the in-flight progress files -- epoch,
+                 # GB_FSTAT_GB_FREE, and (the reason it is here) the
+                 # reference walker. A FINISHED comb is not a checkpoint, so
+                 # nothing used to test it: it was reloaded on file
+                 # existence alone. See :func:`comb_cache_usable`.
+                 fingerprint_extra=fingerprint_extra)
         logger.info("[cache] wrote %s", comb_cache)
         # The comb npz is now the durable artifact; drop the per-level
         # progress files so a later knob change can't resurrect stale rows.
@@ -1555,6 +1779,57 @@ def run_stacked_stage_b(call_fstat: Callable, peaks, *, xp, Tobs: float,
 # orchestrator
 # --------------------------------------------------------------------------
 
+def comb_cache_usable(comb_cache: str, fingerprint_extra: str) -> bool:
+    """Is this FINISHED comb scan the one THIS fit would have run?
+
+    ``fingerprint_extra`` salts :func:`ckpt_fingerprint`, i.e. the in-flight
+    PROGRESS files only. A completed ``*_comb.npz`` is not a checkpoint, so
+    until this existed it was reloaded on ``os.path.exists`` alone -- and a
+    refit whose reference walker moved re-selected its peak BOXES from the
+    previous walker's scan while stage B then scored inside those boxes at
+    the NEW reference. Two residuals stitched into one fit, with nothing
+    anywhere to say so.
+
+    That is not hypothetical: 6mo epoch 1 hit exactly it (the global argmax
+    moved from walker 0 to walker 2 across a restart). It was ruled a known
+    limitation on 2026-09-17 because the effect is proposal quality, not
+    correctness -- births are MH-corrected -- and because rescanning cost
+    the full 47-minute serial comb. Stage A is split now, so the rescan is
+    ~12 minutes and the limitation is not worth keeping.
+
+    A cache with NO stamp is a legacy one, written before this landed. It is
+    REUSED, with a warning: refusing it would throw away a finished comb on
+    the first restart of every fit currently in flight, which is the exact
+    cost this is meant to avoid -- and it is no worse than the behavior that
+    wrote it. An UNREADABLE one is refused (there is nothing to reuse).
+    """
+    try:
+        with np.load(comb_cache, allow_pickle=False) as d:
+            stamp = (str(d["fingerprint_extra"])
+                     if "fingerprint_extra" in d else None)
+    except (OSError, ValueError) as exc:
+        logger.warning("[fit] comb cache %s could not be read (%s: %s); "
+                       "re-running the comb scan.", comb_cache,
+                       exc.__class__.__name__, exc)
+        return False
+    if stamp is None:
+        logger.warning(
+            "[fit] comb cache %s carries no reference-walker stamp (written "
+            "before the salt landed), so it cannot be checked against this "
+            "fit's %r -- reusing it. If this fit's reference walker moved, "
+            "its peak boxes come from the PREVIOUS walker's scan; delete the "
+            "file to force a clean rescan.", comb_cache, fingerprint_extra)
+        return True
+    if stamp != fingerprint_extra:
+        logger.info(
+            "[fit] comb cache %s was scored against a different reference "
+            "(%r, this fit is %r) -- re-running the comb scan rather than "
+            "selecting peaks from another walker's residual.",
+            comb_cache, stamp, fingerprint_extra)
+        return False
+    return True
+
+
 def stacked_grid_path(cache_dir: str) -> str:
     """The stage-B output npz ``run_fstat_grid_fit`` writes and reloads.
 
@@ -1586,15 +1861,16 @@ def stage_b_complete(cache_dir: str) -> bool:
 def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
                        band_edges_hz, f0_lims_hz, mc_lims, cache_dir: str,
                        fingerprint_extra: str = "", epoch=None,
-                       ratio_max=None, sweep_runner=None):
+                       ratio_max=None, sweep_runner=None, comb_runner=None):
     """Full fit with resume: comb scan -> peak select -> stage B.
 
     ``epoch`` selects the peak-box weighting tilt only (see
     :func:`peak_weight_alpha_env`); it does not change what is computed or
     cached, so the npz caches stay interchangeable across epochs.
 
-    ``sweep_runner`` is forwarded to :func:`run_stacked_stage_b`; ``None``
-    is the serial per-group kernel stream. The stacked-cache short circuit
+    ``comb_runner`` is forwarded to :func:`run_comb_scan` and
+    ``sweep_runner`` to :func:`run_stacked_stage_b`; ``None`` is the serial
+    per-level / per-group kernel stream. The stacked-cache short circuit
     below it is unchanged -- a complete epoch never re-enters the kernel,
     parallel or not, and ``call_fstat`` is never called on that path (see
     :func:`stage_b_complete`, which a caller can test first to avoid
@@ -1604,8 +1880,9 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
 
     * ``<cache_dir>/fstat_grid_peaks_stacked.npz`` present -> load and return
       (the fit is done; nothing recomputed).
-    * ``<cache_dir>/fstat_grid_comb.npz`` present -> reload the comb, re-select
-      peaks (cheap, deterministic), run only stage B.
+    * ``<cache_dir>/fstat_grid_comb.npz`` present AND scored against this
+      fit's reference (:func:`comb_cache_usable`) -> reload the comb,
+      re-select peaks (cheap, deterministic), run only stage B.
     * otherwise -> run both stages.
 
     Returns ``(stacked_or_None, n_peaks)``.
@@ -1644,12 +1921,14 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
         )
         return stacked, int(len(d["peak_f0_mHz"]))
 
-    # Stage A's wall, on its own line. It is HEAD-ONLY work under the
-    # multi-rank fit (design spec decision 3), and its epoch-1 cost is the
-    # trigger for deciding whether it gets split too -- so it has to be
-    # readable directly, not inferred by subtracting stage B from the fit.
+    # Stage A's wall, on its own line -- it used to be the head-only half of
+    # the fit and the only serial one left, so it has to stay readable
+    # directly rather than inferred by subtracting stage B from the fit.
+    # Measured at 6mo epoch 1 before the split: 2804 s on ONE GPU against
+    # stage B's 3068 s on four, i.e. 48% of the epoch.
     _t_stage_a = time.time()
-    if os.path.exists(comb_cache):
+    if os.path.exists(comb_cache) and comb_cache_usable(
+            comb_cache, fingerprint_extra):
         d = np.load(comb_cache, allow_pickle=False)
         logger.info("[fit] reusing comb cache %s; re-selecting peaks",
                     comb_cache)
@@ -1661,12 +1940,12 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
         _f0, _F, peaks, _x = run_comb_scan(
             call_fstat, xp=xp, Tobs=Tobs, band_edges_hz=band_edges_hz,
             f0_lims_hz=f0_lims_hz, mc_lims=mc_lims, cache_path=cache_path,
-            fingerprint_extra=fingerprint_extra,
+            fingerprint_extra=fingerprint_extra, comb_runner=comb_runner,
         )
-    logger.info("[stageA] comb + peak selection: %d peaks in %s "
-                "(head-only; see the parallel-fit design spec for when this "
-                "becomes worth splitting too)",
-                int(len(peaks)), _fmt_secs(time.time() - _t_stage_a))
+    logger.info("[stageA] comb + peak selection: %d peaks in %s (%s)",
+                int(len(peaks)), _fmt_secs(time.time() - _t_stage_a),
+                "split by node range over the compute ranks"
+                if comb_runner is not None else "serial, this process")
 
     stacked = run_stacked_stage_b(
         call_fstat, peaks, xp=xp, Tobs=Tobs, band_edges_hz=band_edges_hz,
