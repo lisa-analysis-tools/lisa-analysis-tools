@@ -122,10 +122,11 @@ Key env knobs
                          =0 removes it (stage lists bit-identical to the
                          pre-replace runs). full_pe is NOT touched.
     STAGE_SKIP_NOISE=1   start at stage 2 (noise already converged)
-    GB_SEARCH_SOURCE_EVERY   mbh/emri gb_search cadence (default 10):
+    GB_SEARCH_SOURCE_EVERY   sobbh/mbh/emri gb_search cadence (default 5):
                          they propose on every Nth gb_search iteration,
-                         staying subtracted in between; sobbh + full_pe
-                         uncadenced (2026-09-15 ruling)
+                         staying subtracted in between; full_pe is NEVER
+                         cadenced (2026-09-18 ruling; 09-15 was mbh/emri
+                         only, every 10)
     STAGE_SKIP_SOURCE_SEARCH=1  no source_search stage: armed sources
                          start (and stay subtracted) at their seeded
                          coords; source proposals only in gb_search +
@@ -772,20 +773,35 @@ def build_fit():
     # mbh/emri dense rows cost minutes per pass at near-zero GPU, so in
     # gb_search they propose on every Nth stage iteration (stage-local —
     # full_pe runs them every iteration). Between cadence hits they stay
-    # SUBTRACTED at their current coords exactly as before. sobbh's cheap
-    # chunked-het rows ride every iteration.
-    _gb_search_src_every = int(os.environ.get("GB_SEARCH_SOURCE_EVERY", "10"))
+    # SUBTRACTED at their current coords exactly as before.
+    #
+    # SOBBH JOINED THE CADENCE (user ruling 2026-09-18), superseding the
+    # 09-15 "sobbh's cheap chunked-het rows ride every iteration". They are
+    # not cheap: the 4-GPU run measured sobbh_pe at 250 s per propose over
+    # 47 calls (min 246, max 337) against mbh 147 s and emri 164 s on ~1 in
+    # 4 iterations, i.e. sobbh alone was 43% of a 9.2-min iteration and the
+    # single largest cost in gb_search. Its chunked-het scorer bills a FLAT
+    # 1.73 s per CALL whatever the batch shape (see
+    # sobbhspecialmove._LL_SPAN_KEYS' header), so the only lever on it is
+    # how many calls run: num_repeats (20 -> 10 the same day) and this
+    # cadence. full_pe is untouched — all three run every iteration there.
+    _gb_search_src_every = int(os.environ.get("GB_SEARCH_SOURCE_EVERY", "5"))
     if _gb_search_src_every < 1:
         raise ValueError(
             f"GB_SEARCH_SOURCE_EVERY={_gb_search_src_every} must be >= 1.")
 
+    #: Branches the gb_search cadence applies to. All three armed source
+    #: branches as of the 2026-09-18 ruling; kept as a named set so the
+    #: 09-15 behaviour (mbh/emri only) is one edit away.
+    _GB_SEARCH_CADENCED = ("sobbh", "mbh", "emri")
+
     def source_pe(gb_search_cadence=False):
         # Fresh Move descriptors per stage (never share one instance):
         # the armed source PE moves, sobbh -> mbh -> emri (banking order).
-        # ``gb_search_cadence`` puts mbh/emri on the 1-in-N schedule.
+        # ``gb_search_cadence`` puts them on the 1-in-N schedule.
         def _every(br):
             return (_gb_search_src_every
-                    if gb_search_cadence and br in ("mbh", "emri") else 1)
+                    if gb_search_cadence and br in _GB_SEARCH_CADENCED else 1)
         return [Move(f"{br}_pe", branch=br, every=_every(br))
                 for br, _env, _cls in _SOURCE_BRANCH_ENVS
                 if br in armed_sources]
