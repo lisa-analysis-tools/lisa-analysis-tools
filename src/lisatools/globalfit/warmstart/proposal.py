@@ -78,6 +78,20 @@ COLUMN_NAMES = [
 ]
 CIRCULAR_COLS = {3: 2.0 * np.pi, 5: np.pi, 6: 2.0 * np.pi}
 
+
+class _BasisContainer:
+    """Stand-in transform container carrying just ``input_basis``.
+
+    ``GBObservableFiberBasis`` pins nothing per leaf for GB, so this is all
+    it reads. The npz's own ``map_params["input_basis"]`` supplies it, which
+    lets :meth:`WarmStartComponents.from_npz` build the map eagerly instead
+    of leaving the object unusable until someone remembers to call
+    :meth:`~WarmStartComponents.attach_transform`.
+    """
+
+    def __init__(self, input_basis):
+        self.input_basis = list(input_basis)
+
 #: default logpdf candidate window, in units of df = 1/Tobs (mHz)
 DEFAULT_F0_WINDOW_DF = 10.0
 #: per-component sigma guard added to the candidate window half-width; the
@@ -138,7 +152,31 @@ class WarmStartComponents:
                  bounded_cols: typing.Optional[dict] = None,
                  mult=None, n_members=None, island_id=None,
                  f0_window_edges=None, meta: typing.Optional[dict] = None,
-                 use_cupy: bool = False, seed: typing.Optional[int] = None):
+                 use_cupy: bool = False, seed: typing.Optional[int] = None,
+                 basis: str = "sampling", map_params=None, gmm_ncomp=None):
+        if basis not in ("sampling", "observable"):
+            raise ValueError(
+                f"basis must be 'sampling' or 'observable', got {basis!r}")
+        #: which coordinates ``means``/``covs`` live in. ``"observable"``
+        #: means rvs converts back with ``from_internal`` and logpdf carries
+        #: the map's log Jacobian.
+        self.basis = str(basis)
+        self._map_params = dict(map_params) if map_params else None
+        #: per-CLUSTER mixture component counts; partitions the flat
+        #: component arrays (``None`` for a legacy one-Gaussian file).
+        self.gmm_ncomp = (None if gmm_ncomp is None
+                          else np.asarray(gmm_ncomp, dtype=np.int64))
+        self.obs_map = None
+        if self.basis == "observable":
+            if not self._map_params:
+                raise ValueError(
+                    "basis='observable' needs map_params to rebuild the "
+                    "GBObservableFiberBasis.")
+            from . import basis as _wb
+
+            self.obs_map = _wb.build_map_from_params(
+                _BasisContainer(self._map_params["input_basis"]),
+                self._map_params)
         means = np.array(means, dtype=np.float64, copy=True)
         covs = np.array(covs, dtype=np.float64, copy=True)
         p = np.asarray(p, dtype=np.float64).ravel()
@@ -240,6 +278,15 @@ class WarmStartComponents:
         if self.tobs <= 0:
             raise ValueError(f"new_tobs must be positive; got {new_tobs}.")
         self.df_mhz = 1e3 / self.tobs  # stored f0 is mHz
+        # UNITS: column 1 is f0 [mHz] in the sampling basis but f_mid [Hz]
+        # in the observable one, so the candidate window's df must be taken
+        # in the units of the basis the components were FITTED in. Reusing
+        # the mHz width against Hz means would make every window 1000x too
+        # wide -- harmless to correctness (the window is a search structure
+        # bounded by the 10-sigma guard) but it would gather the whole band
+        # as candidates at every logpdf call.
+        self.df_col1 = (1.0 / self.tobs if self.basis == "observable"
+                        else self.df_mhz)
         if window_df is None:
             window_df = float(os.environ.get(
                 "GB_WARM_START_F0_WINDOW_DF", str(DEFAULT_F0_WINDOW_DF)))
@@ -249,7 +296,7 @@ class WarmStartComponents:
         # >= GUARD sigma away in f0, making the windowed logpdf equal to the
         # full-mixture logpdf to machine precision (module docstring bound).
         self.window_halfwidth_mhz = (
-            self.window_df * self.df_mhz
+            self.window_df * self.df_col1
             + F0_WINDOW_GUARD_NSIGMA * sigma_f0
         )
         win_lo = means[:, 1] - self.window_halfwidth_mhz
@@ -423,25 +470,45 @@ class WarmStartComponents:
         ``floor_eps``, ``window_df``, ``p_floor``, ``seed``...).
         """
         with np.load(path, allow_pickle=False) as d:
-            required = ("means", "covs", "p", "mult", "n_members",
-                        "island_id", "f0_window_edges", "meta")
+            meta = json.loads(str(d["meta"])) if "meta" in d else {}
+            # A file with no ``basis`` key is the pre-2026-09-18 layout:
+            # sampling basis, ONE Gaussian per cluster. That is what the
+            # shipped gf_prod_3mo_v8_10w_refereed.npz is, and it must keep
+            # loading and drawing exactly as before.
+            basis = str(meta.get("basis", "sampling"))
+            per_cluster = ("p", "mult", "n_members", "island_id",
+                           "f0_window_edges", "meta")
+            if basis == "observable":
+                required = ("gmm_ncomp", "gmm_weights", "gmm_means",
+                            "gmm_covs", "gmm_invcovs", "gmm_dets",
+                            "gmm_mins", "gmm_maxs") + per_cluster
+            else:
+                required = ("means", "covs") + per_cluster
             missing = [k for k in required if k not in d]
             if missing:
                 raise ValueError(
                     f"warm-start npz {path} is missing keys {missing} "
                     f"(has {sorted(d.keys())}); expected the "
-                    f"warmstart.fit_from_store writer schema."
+                    f"warmstart.fit_from_store writer schema "
+                    f"(basis={basis!r})."
                 )
-            meta = json.loads(str(d["meta"]))
             # basis lockstep checks against the writer
+            want_cols = COLUMN_NAMES
+            want_units = "mHz"
+            if basis == "observable":
+                from . import basis as _wb
+
+                want_cols = _wb.OBSERVABLE_COLUMN_NAMES
+                want_units = "Hz"
             cols = list(meta.get("column_names", []))
-            if cols and cols != COLUMN_NAMES:
+            if cols and cols != want_cols:
                 raise ValueError(
-                    f"npz column_names {cols} != expected {COLUMN_NAMES}."
+                    f"npz column_names {cols} != expected {want_cols}."
                 )
-            if str(meta.get("f0_units", "mHz")) != "mHz":
+            if str(meta.get("f0_units", want_units)) != want_units:
                 raise ValueError(
-                    f"npz f0_units {meta.get('f0_units')!r} != 'mHz'."
+                    f"npz f0_units {meta.get('f0_units')!r} != "
+                    f"{want_units!r} (basis {basis!r})."
                 )
             circ = {int(k): float(v)
                     for k, v in dict(meta.get("circular_cols", {})).items()}
@@ -463,12 +530,41 @@ class WarmStartComponents:
                     int(c): (float(v[0]), float(v[1]))
                     for c, v in bc_meta.items()
                 } or None
+            extra = {}
+            if basis == "observable":
+                from lisatools.sampling.fstat_proposal import (
+                    unpack_gmm_components)
+
+                comps = unpack_gmm_components(d)
+                ncomp = np.asarray(d["gmm_ncomp"], dtype=np.int64)
+                means = np.concatenate([np.asarray(m) for m in comps[1]],
+                                       axis=0)
+                covs = np.concatenate([np.asarray(c) for c in comps[2]],
+                                      axis=0)
+                w_within = np.concatenate([np.asarray(w) for w in comps[0]])
+                # FLAT component weight = the cluster's inclusion
+                # probability x the component's share of that cluster, so
+                # the mixture still weights ~ p across clusters (v1 policy)
+                # while distributing each cluster's mass over its modes.
+                # Clamped strictly positive: a collapsed mixture component
+                # can carry a zero weight, which the schema forbids.
+                p_flat = (np.repeat(np.asarray(d["p"], dtype=float), ncomp)
+                          * np.maximum(w_within, 1e-12))
+                # per-CLUSTER diagnostics are broadcast to per-COMPONENT so
+                # every consumer indexing alongside means stays aligned.
+                rep = {k: np.repeat(np.asarray(d[k]), ncomp, axis=0)
+                       for k in ("mult", "n_members", "island_id")}
+                extra = dict(basis="observable", gmm_ncomp=ncomp,
+                             map_params=meta.get("map_params"))
+            else:
+                means, covs, p_flat = d["means"], d["covs"], d["p"]
+                rep = {k: d[k] for k in ("mult", "n_members", "island_id")}
             obj = cls(
-                d["means"], d["covs"], d["p"], new_tobs=float(new_tobs),
-                mult=d["mult"], n_members=d["n_members"],
-                island_id=d["island_id"],
+                means, covs, p_flat, new_tobs=float(new_tobs),
+                mult=rep["mult"], n_members=rep["n_members"],
+                island_id=rep["island_id"],
                 f0_window_edges=d["f0_window_edges"], meta=meta,
-                use_cupy=use_cupy, **kwargs,
+                use_cupy=use_cupy, **extra, **kwargs,
             )
         logger.info(
             "WarmStartComponents: %d components from %s (fit tobs=%.6g s, "
@@ -479,6 +575,24 @@ class WarmStartComponents:
             obj.floor_eps,
         )
         return obj
+
+    # ------------------------------------------------------------------
+    def attach_transform(self, transform_container):
+        """Rebind the observable map against a REAL transform container.
+
+        :meth:`from_npz` already builds the map from the stored
+        ``map_params`` (which carry their own ``input_basis``), so this is
+        not required for the object to work. What it adds is the check that
+        the RUN's sampling basis matches the one the components were fitted
+        against -- a mismatch raises here rather than mis-indexing every
+        column silently. No-op on a sampling-basis set.
+        """
+        if self.basis != "observable":
+            return
+        from . import basis as _wb
+
+        self.obs_map = _wb.build_map_from_params(
+            transform_container, self._map_params)
 
     # ------------------------------------------------------------------
     def rvs(self, size=1):
