@@ -48,6 +48,30 @@ exit 0
 """
 
 
+class WarmStartPathSeparatorTest(unittest.TestCase):
+    """The warm-start npz must land INSIDE the run store (2026-09-18).
+
+    The default was written ``${STORE_DIR}warmstart/...`` with no
+    separator, which relies on ``STORE_DIR`` ending in a slash. The
+    built-in default does; a command-line override
+    (``STORE_DIR=/.../gf_prod_6mo_v8_4gpu ./submit...``) does not, so the
+    npz went to a SIBLING directory ``gf_prod_6mo_v8_4gpuwarmstart/`` --
+    outside the snapshot zips, and not rebuilt when the store is reset.
+    """
+
+    def test_store_dir_and_warmstart_are_separated(self):
+        for path in SCRIPTS:
+            with open(path) as fh:
+                src = fh.read()
+            for m in re.finditer(r"\$\{STORE_DIR\}(?!/)(\S{0,24})", src):
+                self.assertNotIn(
+                    "warmstart", m.group(1),
+                    f"{os.path.basename(path)}: "
+                    f"${{STORE_DIR}}{m.group(1)} has no path separator, so "
+                    f"an override without a trailing slash puts the warm "
+                    f"start outside the store")
+
+
 class SobbhKnobsSingleExportTest(unittest.TestCase):
     """One effective export per SOBBH knob (2026-09-17).
 

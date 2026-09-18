@@ -2461,7 +2461,15 @@ export GB_ROUTER_THREADED=1
 # of ${STORE_DIR} capture it, a resume finds it, and a fresh store
 # (rm -rf) rebuilds its own. The fit/referee intermediates land next to
 # it automatically (same directory as the target).
-export GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS-${STORE_DIR}warmstart/gf_prod_3mo_v8_10w_refereed.npz}
+# The separator is EXPLICIT (2026-09-18). The slash used to be missing, and
+# that only lands inside the store when STORE_DIR carries a trailing slash --
+# the built-in default does, but every override on the command line does not,
+# so `STORE_DIR=/.../gf_prod_6mo_v8_4gpu ./submit...` silently put the npz in a
+# SIBLING directory gf_prod_6mo_v8_4gpuwarmstart/, outside the snapshot zips
+# and invisible to a fresh-store rebuild. Every other use of STORE_DIR in this
+# script already writes ${STORE_DIR}/..., so the doubled slash the default
+# produces is the same one they produce, and harmless.
+export GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS-${STORE_DIR}/warmstart/gf_prod_3mo_v8_10w_refereed.npz}
 # AUTO-BUILD (2026-09-14, after the first launch died on the missing npz;
 # user: "Check if it is done, if not run it. I would like it to be
 # automatic."). When the npz is missing, recipe build now runs the
