@@ -984,12 +984,22 @@ class WDMComputationsBase(LISAToolsParallelModule):
             "stage": _t_stage, "geom": _t_geom, "wrap": _t_wrap,
             "launch": _perf() - _t_mark, "total": _perf() - _t_entry,
             "num_bin": int(num_bin),
-            # groups are keyed by (m-band, data_index), and each group's
-            # kernel iteration sweeps all n_chunks -- so kernel work scales
-            # with the GROUP count, not the row count. Recorded because it
-            # is the one batch-shape number that can make a SMALLER batch
-            # cost MORE, and job 508's 54-row calls cost 4x job 373's
-            # 288-row calls.
+            # Groups are keyed by (m-band, data_index). RECORDED ONLY AS A
+            # DIAGNOSTIC for this path: ``wdm_het_get_ll_impl`` explicitly
+            # ``(void)``s binary_perm / group_starts / group_ends /
+            # group_m_lo / group_m_hi / n_groups -- the get_ll kernel takes
+            # its narrow band from ``m_band_half_width`` per binary per
+            # chunk instead, and its grid is ONE BLOCK PER BINARY
+            # (``gd_x = num_bin``). Measured on the 6-mo production run
+            # 2026-09-18 over 174 leaf windows: the call wall is flat at
+            # 1.71-1.73 s across groups/call 1.0-2.8 AND rows/call 6.7-24.2,
+            # i.e. it scales with NEITHER. An earlier note here claimed
+            # "kernel work scales with the GROUP count"; that is wrong for
+            # get_ll and it sent the 22x-per-row hunt down the wrong path.
+            # The wall is one block's serial sweep over all n_chunks, so
+            # rows are ~free until the device runs out of blocks.
+            # The OTHER kernel paths (fill_global / swap_ll / fstat) do
+            # consume these arrays.
             "n_groups": int(groups["n_groups"]),
         }
 
