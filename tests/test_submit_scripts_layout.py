@@ -18,6 +18,7 @@ since the legacy layout cannot span nodes.
 """
 
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -168,16 +169,21 @@ class SubmitScriptsInJobBlockTest(unittest.TestCase):
                 text = self._text(path)
                 self.assertIn('[ "${NWALKERS}" -eq 1 ]', text)
                 self.assertIn("one-walker replica mode", text)
-                # the sampler-shape export must honour the submitting shell's
+                # The sampler-shape export must honour the submitting shell's
                 # NWALKERS (carried by --export=ALL), or the branch below it is
-                # unreachable: a hard `export NWALKERS=10` above the `-eq 1`
-                # test would silently run 10 walkers for `NWALKERS=1 ./submit`
-                self.assertIn("export NWALKERS=${NWALKERS:-10}", text)
-                self.assertNotIn("\nexport NWALKERS=10 ", text)
+                # unreachable: a hard `export NWALKERS=<n>` above the `-eq 1`
+                # test would silently run n walkers for `NWALKERS=1 ./submit`.
+                # The DEFAULT VALUE is deliberately not pinned here -- it is a
+                # campaign choice that moves (10 at the 2026-09-11 rebase, 4
+                # for the walker-block store on 2026-09-18); what this test
+                # protects is the overridable FORM and its position.
+                m = re.search(r"^export NWALKERS=\$\{NWALKERS:-\d+\}",
+                              text, re.M)
+                self.assertIsNotNone(
+                    m, "NWALKERS must be exported as ${NWALKERS:-<default>}")
+                self.assertNotRegex(text, r"\nexport NWALKERS=\d+\s")
                 self.assertLess(
-                    text.index("export NWALKERS=${NWALKERS:-10}"),
-                    text.index('[ "${NWALKERS}" -eq 1 ]'),
-                )
+                    m.start(), text.index('[ "${NWALKERS}" -eq 1 ]'))
                 # the rounding branch survives for NWALKERS > 1
                 self.assertIn(
                     "(NWALKERS / N_COMPUTE_EFF + 1) * N_COMPUTE_EFF", text

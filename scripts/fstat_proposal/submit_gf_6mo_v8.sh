@@ -712,9 +712,22 @@ echo "[V8-NOISE] coarse: Q=${COARSE_Q} mode=${COARSE_GPU_MODE} \
 use_ws=${COARSE_USE_WS} fiducial=${COARSE_FIDUCIAL}"
 
 # ---- sampler shape ---------------------------------------------------------
-export NWALKERS=${NWALKERS:-10}    # 10-walker rebase (2026-09-11 ruling: build
-                                   # off the validated 10w 3mo arm, jobs
-                                   # 465/473); env-overridable since 2026-09-16.
+# 10 -> 4 (user ruling 2026-09-18, for the fresh walker-block store). One
+# walker per compute rank at NGPUS=4. Chosen for SEARCH SPEED: at fixed GPU
+# count the per-rank walker block is what grows, and ~364 s of a ~390 s
+# gb_search iteration scales with rows (the three GB RJ moves ~260 s,
+# mbh/emri amortized ~62, vgb ~30, noise ~11). Only SOBBH does not -- its
+# scorer bills a flat 1.73 s per CALL whatever the batch shape. Doubling to
+# 8 walkers therefore roughly doubles the iteration while buying nothing in
+# search throughput: births come from the F-stat grid and the warm-start
+# components, both independent of walker count, so births per HOUR is a wash
+# and iterations per hour is what drives the cap ramp and the tempering
+# cadence.
+# NOTE the walker count LOCKS for the life of the store (the resume refuses
+# any change -- state.py's walker-count mismatch), and it carries into
+# full_pe, where 4 is a thin posterior ensemble. Deliberate: this store's job
+# is the search.
+export NWALKERS=${NWALKERS:-4}
                                    # GB rungs stay GB_NTEMPS=24 -- walkers and
                                    # temps are independent axes. NEVER change
                                    # NWALKERS on a resume: the store carries the
@@ -1802,25 +1815,24 @@ export GB_LEAF_CAP_REQUIRE_IMPROVEMENT=1
 # cap grid, at-cap RJ skip, D/2 and GB_CAP_LL_CHECK all still stand.
 # 2 was considered and deferred: a 2-it stagnation window is weak at 10
 # walkers — revisit with the next snapshot's cap trajectory if 3 lags.
-# 3 -> 8 (user observation + ruling 2026-09-18: "we are advancing the CAP
-# too quickly with less walkers", then "keep as basic knob").
-# WHY THE WALKER COUNT MATTERS. The default gate is MAX over cold walkers:
-# a band's cap holds while the BEST walker keeps improving it by D/2, and
-# increments once none has for this many CONSECUTIVE iterations. With W
-# walkers the max gets W independent chances per iteration to find that
-# improvement and reset the clock, so the same iteration count is much
-# weaker evidence of a plateau at small W -- the cap ratchets FASTER the
-# fewer walkers run, which is backwards. Every previous value (5, 4, 3)
-# was tuned at 10 or 24 walkers; this run has 4.
-# MEASURED on the 4-walker run, iterations 35 -> 68: summed cap 1232 ->
-# 2373 (+34.6 slots/it) against cold leaves 420 -> 1066 (+19.6/it) =
-# 1307 cap slots of unused headroom, 202 bands already at cap >= 4 and a
-# max of 7 while the median band still held ONE source.
-# 8 keeps the same ~30 walker-iterations of stagnation that 3 bought at
-# 10 walkers (3 x 10 / 4 = 7.5 -> 8). RAISE THIS when NWALKERS drops and
-# LOWER IT toward 3 when returning to 10+ walkers -- the knob is not
-# walker-aware, so it is the operator's job.
-export GB_LEAF_CAP_MIN_ITERS=8
+# STAYS AT 3 (user ruling 2026-09-18, after considering 8 and 5).
+# RECORDED COUNTER-EVIDENCE, so the next person does not re-derive it: the
+# gate is MAX over cold walkers -- a band's cap holds while the BEST walker
+# keeps improving it by D/2, and increments once none has for this many
+# CONSECUTIVE iterations. With W walkers the max gets W independent chances
+# per iteration to reset that clock, so the same iteration count is weaker
+# evidence of a plateau at small W and the cap ratchets FASTER the fewer
+# walkers run. Every previous value (5, 4, 3) was tuned at 10 or 24 walkers;
+# this store runs 4. Measured on the 4-walker run, iterations 35 -> 68:
+# summed cap 1232 -> 2373 (+34.6 slots/it) against cold leaves 420 -> 1066
+# (+19.6/it), i.e. 1307 cap slots of unused headroom, 202 bands at cap >= 4
+# with a max of 7 while the median band still held ONE source -- and the
+# flagship 20.38 mHz source carried THREE fragment leaves per walker.
+# Matching the ~30 walker-iterations that 3 bought at 10 walkers would mean
+# 8 here. The knob is NOT walker-aware, so raising it is the operator's
+# call; the fresh store's fixed warm start is the other half of that
+# fragmentation story and is being addressed separately.
+export GB_LEAF_CAP_MIN_ITERS=3
 export GB_CAP_LL_CHECK=1
 # Grouped RJ scheduling: accumulate inds=True picks across RJ rounds
 # (1 proposal per cell per round), then ONE full-width in-model block.
