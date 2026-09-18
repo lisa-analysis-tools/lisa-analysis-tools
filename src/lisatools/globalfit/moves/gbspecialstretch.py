@@ -1974,19 +1974,22 @@ def _buffer_fixed_capacity_active(sorter, kwargs) -> bool:
 #: back with ``gb_sync``, which is where the finish-time authoritative rebuild
 #: (``check_ll_inject``) actually happens. It is issued ONLY in replica mode
 #: and opens no session (``gb_finish`` has already torn it down).
-#: The LAST THREE are the F-stat epoch fit (parallel-fit spec 2026-09-16), not
+#: The LAST FOUR are the F-stat epoch fit (parallel-fit spec 2026-09-16), not
 #: part of that session: they are issued from the head's ``setup()`` BEFORE
 #: any session exists -- harmless, because the session token is captured from
 #: the opening ``gb_run_proposal`` and ``call_index`` is counted per
-#: ``(move, op)``. ``gb_fstat_ref_row`` replicates the reference walker's
-#: residual + inverse-PSD rows to every rank; ``gb_fstat_stage_b`` splits the
-#: epoch grid sweep by contiguous box range; ``gb_fstat_release`` drops the
-#: replicated row, the sig-het scorer cached beside it AND the scorer's
-#: reference blocks on the GB comp -- the expensive half, and the half the
-#: closure alone does not own -- on every rank once the fit's last group is
-#: assembled, then frees the memory pool.
+#: ``(move, op)``. They are listed in the order the fit issues them.
+#: ``gb_fstat_ref_row`` replicates the reference walker's residual +
+#: inverse-PSD rows to every rank; ``gb_fstat_comb`` splits stage A's comb
+#: scan by contiguous NODE range, one command per sky level;
+#: ``gb_fstat_stage_b`` splits the epoch grid sweep by contiguous box range;
+#: ``gb_fstat_release`` drops the replicated row, the sig-het scorer cached
+#: beside it AND the scorer's reference blocks on the GB comp -- the
+#: expensive half, and the half the closure alone does not own -- on every
+#: rank once the fit's last group is assembled, then frees the memory pool.
 GB_OPS = ("gb_run_proposal", "gb_run_tempering", "gb_finish", "gb_sync",
-          "gb_fstat_ref_row", "gb_fstat_stage_b", "gb_fstat_release")
+          "gb_fstat_ref_row", "gb_fstat_comb", "gb_fstat_stage_b",
+          "gb_fstat_release")
 
 #: F-stat op -> the ``GBSpecialRJFStatGridMove`` attribute its served body
 #: needs. ``gf_serve`` checks this before dispatching, so a command addressed
@@ -1996,6 +1999,7 @@ GB_OPS = ("gb_run_proposal", "gb_run_tempering", "gb_finish", "gb_sync",
 #: broadcast.
 _FSTAT_OP_REQUIRES = {
     "gb_fstat_ref_row": "_gb_free_residual",
+    "gb_fstat_comb": "_fstat_call",
     "gb_fstat_stage_b": "_fstat_call",
 }
 
@@ -18237,7 +18241,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             return self._gb_serve_fstat_release(payload, clock, model)
         if op in _FSTAT_OP_REQUIRES:
             self._require_fstat_grid_move(op)
-            # NO SESSION TIMER FOR A NON-SESSION OP. These two bodies
+            # NO SESSION TIMER FOR A NON-SESSION OP. These bodies
             # deliberately skip ``_enter_rank_block`` (the epoch fit is not a
             # propose), and ``_exit_rank_block`` deliberately does not restore
             # ``_prop_timer`` -- so on a WORKER whatever the last GB session
@@ -18253,6 +18257,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             with self._fstat_detached_timer():
                 if op == "gb_fstat_ref_row":
                     return self._gb_serve_fstat_ref_row(payload, clock, model)
+                if op == "gb_fstat_comb":
+                    return self._gb_serve_fstat_comb(payload, clock, model)
                 return self._gb_serve_fstat_stage_b(payload, clock, model)
         raise ValueError(
             f"move {self.name!r} serves only {GB_OPS}, got {op!r}"
@@ -18261,7 +18267,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     def _require_fstat_grid_move(self, op):
         """Refuse an F-stat op on a GB move that cannot run one.
 
-        The two F-stat commands are served on the base -- next to every other
+        The F-stat commands are served on the base -- next to every other
         ``_gb_serve_*`` body ``gf_serve`` dispatches to -- but their bodies
         reach into :class:`GBSpecialRJFStatGridMove`'s half of the fit
         (``_gb_free_residual``, ``_fstat_call``). Only that class ever ISSUES
@@ -19794,6 +19800,281 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             self._fstat_ref_call = call(
                 model, 0, holder=self._fstat_ref_holder)
         return self._fstat_ref_call
+
+    @staticmethod
+    def _fstat_comb_payload(spec, rank_index, a, b):
+        """One rank's node range of one comb sky LEVEL, as host arrays.
+
+        The SKY GRID is shipped whole (it defines what a row means, and at
+        the largest production level it is 512 pairs = 8 kB); only
+        ``f0_nodes`` and the ``[a, b)`` bounds are sliced. ``ckpt_name`` is
+        per rank so two ranks never share a progress file -- their
+        fingerprints already differ, because the fingerprint hashes the
+        SLICED rows plus the label.
+        """
+        sub = spec.sub_range(
+            a, b, ckpt_name=f"{spec.ckpt_name}_r{int(rank_index)}")
+        return {
+            "li": int(sub.li),
+            "n_levels": int(sub.n_levels),
+            "lv": int(sub.lv),
+            "a": int(sub.a),
+            "b": int(sub.b),
+            "rank_index": int(rank_index),
+            "f0_nodes": np.ascontiguousarray(
+                np.asarray(sub.f0_nodes, dtype=float)),
+            "alpha": np.ascontiguousarray(np.asarray(sub.alpha, dtype=float)),
+            "sin_delta": np.ascontiguousarray(
+                np.asarray(sub.sin_delta, dtype=float)),
+            "mc_fix": float(sub.mc_fix),
+            "label": sub.label,
+            "ckpt_name": sub.ckpt_name,
+            "parts_dir": sub.parts_dir,
+            "fingerprint_extra": sub.fingerprint_extra,
+        }
+
+    @staticmethod
+    def _fstat_comb_spec(payload):
+        """Rebuild the :class:`CombLevelSpec` a payload describes."""
+        from lisatools.sampling.fstat_gridfit import CombLevelSpec
+
+        return CombLevelSpec(
+            li=int(payload["li"]), n_levels=int(payload["n_levels"]),
+            lv=int(payload["lv"]), a=int(payload["a"]), b=int(payload["b"]),
+            f0_nodes=np.asarray(payload["f0_nodes"], dtype=float),
+            alpha=np.asarray(payload["alpha"], dtype=float),
+            sin_delta=np.asarray(payload["sin_delta"], dtype=float),
+            mc_fix=float(payload["mc_fix"]), label=payload["label"],
+            ckpt_name=payload["ckpt_name"], parts_dir=payload["parts_dir"],
+            fingerprint_extra=payload["fingerprint_extra"])
+
+    def _gb_serve_fstat_comb(self, payload, clock, model):
+        """Sweep this rank's contiguous node range of one comb sky level.
+
+        Runs the SAME :func:`run_comb_level` the serial scan runs, on the
+        sliced inputs, scored through the replicated reference row -- so a
+        split can only differ from the serial sweep by ``FSTAT_BATCH``
+        grouping, which is row-independent.
+
+        The per-node reduction (max over the sky block, and its argmax)
+        happens HERE, before anything goes to disk: the level-6 block at 6mo
+        is 185 million F values and the reduction of it is 3 x 362,020. The
+        finished triple goes to the shared ``_parts`` directory as raw
+        float64 anyway, for the same reason stage B's partials do -- it is
+        the head that concatenates, and the reply carries only metadata.
+
+        NO COLLECTIVE runs in this body, deliberately (spec decisions 4/5),
+        exactly as in :meth:`_gb_serve_fstat_stage_b`: each rank sweeps its
+        own range and writes its own file, so a failure on one rank surfaces
+        as an ordinary ``RemoteWorkerError`` on the head instead of parking
+        every other rank in an untimed collective.
+
+        The missing-reference-row guard is :meth:`_fstat_holder_call`'s: the
+        scorer below is built through it, so the condition is checked once,
+        before any sweep, with one message.
+        """
+        from lisatools.sampling.fstat_gridfit import (
+            run_comb_level,
+            save_comb_part,
+        )
+
+        self._bind_rank_acs(model)
+        spec = self._fstat_comb_spec(payload)
+        rank_index = int(payload["rank_index"])
+        t0 = time.perf_counter()
+        F_max, best_al, best_sd = run_comb_level(
+            spec, self._fstat_holder_call(model), xp=self.xp)
+        _path, n_nodes, sha = save_comb_part(
+            spec.parts_dir, spec.li, rank_index, F_max, best_al, best_sd)
+        del F_max, best_al, best_sd
+        self.mempool.free_all_blocks()
+        wall = time.perf_counter() - t0
+        logger.info(
+            "%s: [FSTAT_COMB] l%d r%d nodes [%d, %d) (%d) in %.1fs",
+            self.name, spec.li, rank_index, spec.a, spec.b, n_nodes, wall)
+        # ``rank`` is the WORLD rank, for per-rank attribution in a log; it is
+        # ``None`` rather than 0 without a fan-out, because labelling a
+        # fan-out-less serve "rank 0" is a claim, not a default.
+        _fan = getattr(self, "fanout", None)
+        return {"li": int(spec.li), "a": int(spec.a), "b": int(spec.b),
+                "rank_index": rank_index, "n_nodes": int(n_nodes),
+                "sha1": sha, "wall_s": float(wall),
+                "rank": None if _fan is None else int(_fan.rank)}
+
+    def _fstat_comb_runner(self, model):
+        """HEAD: a ``comb_runner`` that fans ONE sky level out over the ranks.
+
+        ``run_comb_scan`` does everything else -- the node grid, the
+        adaptive ``nsky_per_node`` ladder, the peak selection and the npz
+        write -- so the parallel path can differ from the serial one only in
+        HOW each level's per-node reduction is produced.
+
+        NO COMMUNICATION DECIDES THE WORK. ``nsky_per_node`` is a closed
+        form of f0 alone, so every rank would derive the identical level
+        assignment; the head does not ship it, it ships the level's node
+        slice. Ranges are contiguous and equal-count
+        (:func:`split_box_range`), a pure function of ``(a, b, n_compute)``,
+        so a resume reproduces the same rank -> range map and each rank
+        finds its OWN progress file.
+
+        CONTIGUITY, not interleaving, for the reason stage B needs it: comb
+        nodes are f0-ORDERED and the sig-het scorer keeps ONE reference
+        block resident, rebuilding it on f0 crossings. An f0-contiguous
+        range divides the block builds proportionally; an interleaved one
+        would rebuild every block on every rank (measured 4,600 rebuilds ~
+        350 s in the F-ordered-box incident).
+
+        REFUSES ANYTHING BUT A REAL FAN-OUT, in code rather than in prose,
+        for the same reason :meth:`_fstat_stage_b_runner` does. At
+        ``n_compute == 1`` this would otherwise run happily --
+        ``WalkerFanout.run``'s single branch calls only ``local_body`` -- and
+        the NUMBERS would be unchanged, but ``n_compute == 1`` is the spec's
+        byte-identity gate: the checkpoint name would change from the legacy
+        ``comb_nsky{lv}`` to ``comb_nsky{lv}_r0`` (invalidating an in-flight
+        comb's resume, which at 6mo is up to 47 minutes of scan) and the
+        gated serial path would round-trip through disk for nothing.
+        """
+        from lisatools.sampling.fstat_gridfit import (
+            assemble_comb_level,
+            clear_comb_parts,
+            split_box_range,
+        )
+
+        fanout = getattr(self, "fanout", None)
+        # ``getattr(..., True)``: a real ``WalkerFanout`` always sets
+        # ``single``, but reading it bare would answer a fan-out-like object
+        # that does not with an ``AttributeError`` instead of this message.
+        # Defaulting to "single" keeps the byte-identity gate CLOSED whenever
+        # the shape is unknown.
+        if fanout is None or getattr(fanout, "single", True):
+            raise RuntimeError(
+                f"{self.name}: _fstat_comb_runner needs SEVERAL compute "
+                "ranks to split the sky level over. With no fan-out, or at "
+                "one compute rank, stage A is the serial run_comb_level and "
+                "run_comb_scan must be called with no comb_runner at all -- "
+                "that path is the byte-identity gate.")
+        layout = fanout.layout
+        n_parts = int(layout.n_compute)
+
+        def runner(spec, call_fstat, *, xp):
+            # Stage A, stage B and the centre table must score against the
+            # SAME residual snapshot (spec decision 6). The ranks build their
+            # own scorer from the replicated row, so this argument is unused
+            # here -- which is exactly why it has to be checked: a wiring that
+            # handed ``run_comb_scan`` a live-ACA scorer would fit stage A
+            # against one residual and stage B against another, with nothing
+            # anywhere to say so.
+            if call_fstat is not self._fstat_ref_call:
+                raise RuntimeError(
+                    f"{self.name}: stage A was handed a scorer that is not "
+                    "this rank's cached holder-scored call_fstat "
+                    "(_fstat_holder_call). Stage A and stage B would then "
+                    "score against different residuals; pass "
+                    "self._fstat_holder_call(model) to run_fstat_grid_fit.")
+            if not spec.parts_dir:
+                raise RuntimeError(
+                    f"{self.name}: comb level {spec.li} has no parts_dir -- "
+                    "the parallel sweep writes each rank's slice there and "
+                    "the head reads them back, so a shared epoch cache "
+                    "directory is required.")
+            ranges = split_box_range(spec.a, spec.b, n_parts)
+            by_rank = {r: ranges[layout.fanout_rank(r)]
+                       for r in layout.compute_ranks}
+            t0 = time.perf_counter()
+            replies, _token = self._fanout_cmd(
+                "gb_fstat_comb",
+                lambda rank, w0, w1: self._fstat_comb_payload(
+                    spec, layout.fanout_rank(rank), *by_rank[rank]),
+                model,
+            )
+            # ``_fanout_cmd`` hands back the BARE result dicts -- ``{rank:
+            # result}``, not ``{rank: {"result": ...}}``: ``WalkerFanout.run``
+            # unwraps the envelope itself.
+            results = {}
+            for rank, res in replies.items():
+                res = res or {}
+                if "rank_index" not in res:
+                    raise RuntimeError(
+                        f"{self.name}: the gb_fstat_comb reply from rank "
+                        f"{rank} carries no 'rank_index', so level "
+                        f"{spec.li}'s partial cannot be placed in node "
+                        "order; assembling the rest would return an F_max "
+                        "whose nodes silently disagree with f0_nodes[a:b].")
+                results[int(res["rank_index"])] = res
+            for ri, res in results.items():
+                # ``assemble_comb_level`` checks only the TOTAL width, so two
+                # partials that swapped places would concatenate silently
+                # into a reduction mismatched to its own f0 nodes -- every
+                # peak then selected at the wrong frequency. The ranges are
+                # what put them in order; check them.
+                want = ranges[ri] if 0 <= ri < len(ranges) else None
+                if want is None or (int(res.get("a", -1)),
+                                    int(res.get("b", -1))) != want:
+                    raise RuntimeError(
+                        f"{self.name}: comb level {spec.li} rank index {ri} "
+                        f"reported node range {(res.get('a'), res.get('b'))} "
+                        f"but was asked for {want} -- the partials would "
+                        "assemble out of node order.")
+                # A short partial IS caught downstream, but only as an
+                # aggregate width error that names no rank. Check it here,
+                # where the rank is still in hand.
+                if int(res.get("n_nodes", -1)) != want[1] - want[0]:
+                    raise RuntimeError(
+                        f"{self.name}: comb level {spec.li} rank index {ri} "
+                        f"wrote {res.get('n_nodes')} node(s) for the range "
+                        f"{want} ({want[1] - want[0]} expected).")
+            sha1s = {i: res.get("sha1") for i, res in results.items()}
+            try:
+                out = assemble_comb_level(
+                    spec.parts_dir, spec.li, n_parts, spec.n_nodes,
+                    sha1s=sha1s)
+            except OSError as exc:
+                # Every rank reported success, so the file exists -- on ITS
+                # node. The whole level's wall has already been paid by the
+                # time this shows up, and the bare errno says nothing about
+                # why. ``OSError``, not just ``FileNotFoundError``: a flaky
+                # or node-local shared mount surfaces just as often as a
+                # stale NFS handle (ESTALE) or a PermissionError, and the
+                # diagnosis below is the right one for all of them.
+                raise RuntimeError(
+                    f"{self.name}: comb level {spec.li} partial "
+                    f"{getattr(exc, 'filename', None)} could not be read on "
+                    f"the head ({exc.__class__.__name__}: {exc}) although "
+                    "every rank reported writing one. The epoch cache "
+                    f"directory ({spec.parts_dir}) must be on a filesystem "
+                    "SHARED by every compute rank; a node-local one lets "
+                    "each rank write a partial the head can never read."
+                ) from exc
+            clear_comb_parts(spec.parts_dir, spec.li, n_parts)
+            # ``clear_comb_parts`` only unlinks ``r < n_parts``. A fit that
+            # died at a LARGER n_compute leaves its high-index partials in
+            # the epoch dir forever, and nothing else matches them (the
+            # end-of-scan ``ckpt_clear(_parts, "comb_")`` sweeps only the
+            # ``.progress.*`` suffixes). The trailing ``*`` also takes
+            # ``.npy.tmp`` orphans: ``save_comb_part`` writes through a temp
+            # file, so a rank that died mid-``np.save`` at an index above the
+            # current ``n_compute`` leaves one ``clear_comb_parts`` never
+            # looks at either. The literal ``_r`` after the level number is
+            # what stops ``l1`` matching ``l11``.
+            for stale in glob.glob(os.path.join(
+                    spec.parts_dir, f"comb_l{int(spec.li)}_r*.npy*")):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+            walls = [float(res.get("wall_s", 0.0))
+                     for res in results.values()] or [0.0]
+            logger.info(
+                "%s: [FSTAT_COMB] level %d/%d over %d rank(s): nodes %s | "
+                "wall min %.1fs max %.1fs (imbalance %.0f%%) | assembled "
+                "%.1fs total",
+                self.name, spec.li + 1, spec.n_levels, n_parts,
+                [b - a for a, b in ranges], min(walls), max(walls),
+                100.0 * (max(walls) - min(walls)) / max(max(walls), 1e-9),
+                time.perf_counter() - t0)
+            return out
+
+        return runner
 
     @staticmethod
     def _fstat_stage_b_payload(spec, rank_index, a, b):
@@ -22803,8 +23084,11 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
            That is why no ``_gb_free_residual`` wrapper survives here: the
            window now lives inside the op body, on the rank that owns the
            walker, and the head's own residual is never touched.
-        3. Stage B is split per Mc group by contiguous box range over every
-           compute rank (``gb_fstat_stage_b``); stage A stays here.
+        3. BOTH sweeps are split over every compute rank: stage A per sky
+           level by contiguous node range (``gb_fstat_comb``), stage B per
+           Mc group by contiguous box range (``gb_fstat_stage_b``). Nothing
+           of the fit runs head-only any more except the host prep, the peak
+           selection and the npz writes, which are seconds.
 
         ORDERING IS LOAD-BEARING, twice over. The row is replicated FIRST,
         and the holder-scored ``call_fstat`` is then built HERE, before
@@ -22983,6 +23267,17 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             sweep_runner=(self._fstat_stage_b_runner(model)
                           if (self.fanout_active and not _already_fitted)
                           else None),
+            # Same gate, same reason, for stage A's comb: ``fanout_active``
+            # is exactly ``n_compute > 1``, and the runner REFUSES to be
+            # built at one rank, where it would rename the per-level
+            # checkpoint from the legacy ``comb_nsky{lv}`` to
+            # ``comb_nsky{lv}_r0`` -- throwing away an in-flight comb's
+            # resume -- and round-trip the serial sweep through disk for
+            # nothing. Measured at 6mo epoch 1: stage A was 2804 s on ONE
+            # GPU with three idle, 48% of the 5883 s epoch.
+            comb_runner=(self._fstat_comb_runner(model)
+                         if (self.fanout_active and not _already_fitted)
+                         else None),
         )
         # NOTE: the HEAD's holder is NOT released here. The centre table
         # (``_install_ctr_table``) must score against the SAME reference and

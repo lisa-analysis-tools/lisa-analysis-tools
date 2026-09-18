@@ -2239,8 +2239,8 @@ class ReleaseBodyTest(unittest.TestCase):
             gbs.GB_OPS[:4],
             ("gb_run_proposal", "gb_run_tempering", "gb_finish", "gb_sync"))
         self.assertEqual(gbs.GB_OPS[4:],
-                         ("gb_fstat_ref_row", "gb_fstat_stage_b",
-                          "gb_fstat_release"))
+                         ("gb_fstat_ref_row", "gb_fstat_comb",
+                          "gb_fstat_stage_b", "gb_fstat_release"))
 
     def test_serving_it_drops_the_row_and_the_cached_scorer(self):
         """BOTH, not just the row: Task 7 caches the built sig-het scorer on
@@ -2927,10 +2927,14 @@ class _StageBRankStub:
     # yields plain functions -- re-wrap.
     _fstat_stage_b_payload = staticmethod(_B._fstat_stage_b_payload)
     _fstat_stage_b_spec = staticmethod(_B._fstat_stage_b_spec)
+    _fstat_comb_payload = staticmethod(_B._fstat_comb_payload)
+    _fstat_comb_spec = staticmethod(_B._fstat_comb_spec)
     _gb_session_token = staticmethod(_B._gb_session_token)
     _gb_serve_fstat_stage_b = _B._gb_serve_fstat_stage_b
+    _gb_serve_fstat_comb = _B._gb_serve_fstat_comb
     _gb_serve_fstat_release = _B._gb_serve_fstat_release
     _fstat_stage_b_runner = _B._fstat_stage_b_runner
+    _fstat_comb_runner = _B._fstat_comb_runner
     _fstat_holder_call = _B._fstat_holder_call
     _fstat_release_ref_row = _B._fstat_release_ref_row
     _fstat_clear_comp_references = _B._fstat_clear_comp_references
@@ -3460,6 +3464,10 @@ class _EpochFitRankStub:
     _fstat_stage_b_spec = staticmethod(_B._fstat_stage_b_spec)
     _gb_serve_fstat_stage_b = _B._gb_serve_fstat_stage_b
     _fstat_stage_b_runner = _B._fstat_stage_b_runner
+    _fstat_comb_payload = staticmethod(_B._fstat_comb_payload)
+    _fstat_comb_spec = staticmethod(_B._fstat_comb_spec)
+    _gb_serve_fstat_comb = _B._gb_serve_fstat_comb
+    _fstat_comb_runner = _B._fstat_comb_runner
     _gb_serve_fstat_release = _B._gb_serve_fstat_release
     _fstat_release_ref_row = _B._fstat_release_ref_row
     _fstat_clear_comp_references = _B._fstat_clear_comp_references
@@ -3943,6 +3951,825 @@ class CentreTableFallbackOverTheWireTest(unittest.TestCase):
                 self.assertIsNone(v["call"])
                 self.assertEqual(v["ops"][-2:],
                                  ["gb_fstat_ref_row", "gb_fstat_release"])
+
+
+# =========================================================================
+# STAGE A -- the comb scan, split by contiguous NODE range per sky level.
+#
+# The arms above pin the stage-B BOX split; these pin the stage-A NODE
+# split. Same shape end to end, deliberately: one spec, one level runner
+# both the serial fit and every rank call, per-rank partials on the shared
+# parts dir, and a head that concatenates in rank order -- so a split can
+# never diverge from the serial code by construction, exactly as stage B's
+# cannot.
+# =========================================================================
+
+#: The comb fixture's sub-bands. ``f0_lims`` is the INTERIOR span
+#: (``band_edges[1:-1]``), the gb.py convention ``_run_fstat_fit`` follows.
+COMB_BAND_EDGES = np.linspace(7.0e-3, 17.0e-3, 7)
+COMB_F0_LIMS = (float(COMB_BAND_EDGES[1]), float(COMB_BAND_EDGES[-2]))
+
+
+@contextlib.contextmanager
+def comb_env(**overrides):
+    """Pin every knob stage A reads, sized for SEVERAL sky levels.
+
+    ``FSTAT_COMB_NSKY`` is deliberately UNSET. The fixed-nsky back-compat
+    path is ONE level, and one level would exercise the per-level fan-out
+    (one command per level, design decision 1) exactly once -- so the gate
+    runs the ADAPTIVE ladder, with ``SKY_VC`` / ``MIN`` / ``MAX`` sized to
+    put three levels over the fixture's interior span at ~2k evals.
+    """
+    env = {
+        "FSTAT_BATCH": "64",
+        "FSTAT_CKPT_SECS": "0",
+        "FSTAT_F0_SPACING_MHZ": "0.05",
+        "FSTAT_COMB_NSKY": "",
+        "FSTAT_COMB_SKY_VC": "3.5e-5",
+        "FSTAT_COMB_NSKY_MIN": "2",
+        "FSTAT_COMB_NSKY_MAX": "32",
+        "FSTAT_COMB_MC": "0.5",
+        "FSTAT_PEAK_MIN_F": "10",
+        "FSTAT_PEAKS_PER_BAND": "2",
+    }
+    env.update(overrides)
+    old = {k: os.environ.get(k) for k in env}
+    try:
+        for k, v in env.items():
+            if v == "":
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = str(v)
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def run_comb(tmpdir, *, call_fstat=None, comb_runner=None,
+             fingerprint_extra="|epoch=0|gbfree=1|wref=0"):
+    """Run the fixture comb scan into ``tmpdir``; return the ``*_comb.npz``.
+
+    ``comb_runner=None`` is the serial path -- the byte-identity reference
+    every parallel arm below is compared against.
+    """
+    cache_path = os.path.join(tmpdir, G.GRID_BASENAME)
+    kw = {} if comb_runner is None else {"comb_runner": comb_runner}
+    G.run_comb_scan(
+        call_fstat if call_fstat is not None else _fake_call_fstat(),
+        xp=np, Tobs=TOBS, band_edges_hz=COMB_BAND_EDGES,
+        f0_lims_hz=COMB_F0_LIMS, mc_lims=[0.01, 1.0],
+        cache_path=cache_path, fingerprint_extra=fingerprint_extra, **kw)
+    return cache_path.replace(".npz", "_comb.npz")
+
+
+def _comb_spec(n_nodes=7, *, lv=4, parts_dir=None, li=0, n_levels=1, a=0):
+    """A :class:`CombLevelSpec` over ``n_nodes`` synthetic f0 nodes."""
+    al, sd = G._sky_grid(lv)
+    return G.CombLevelSpec(
+        li=li, n_levels=n_levels, lv=lv, a=a, b=a + n_nodes,
+        f0_nodes=np.linspace(9.0, 9.6, n_nodes),
+        alpha=al, sin_delta=sd, mc_fix=0.5,
+        label=f":comb.nsky{lv}", ckpt_name=f"comb_nsky{lv}",
+        parts_dir=parts_dir, fingerprint_extra="|epoch=0")
+
+
+def _kill_comb_once(rank_suffix="_r1", li=None):
+    """Patch ``run_comb_level`` to kill ONE rank's sweep, exactly once.
+
+    Deterministic by NAME (``ckpt_name`` ends ``_r<index>``) rather than by
+    call count, for the same reason :func:`_kill_stage_b_once` is: the
+    FakeWorld ranks are threads and a counter would pick a different victim
+    from run to run. Returns ``(patch, fired event)``.
+    """
+    from lisatools.sampling import fstat_gridfit as GG
+
+    real = GG.run_comb_level
+    fired = threading.Event()
+
+    def flaky(spec, call_fstat, *, xp):
+        if ((li is None or int(spec.li) == int(li))
+                and str(spec.ckpt_name).endswith(rank_suffix)
+                and not fired.is_set()):
+            fired.set()
+            raise RuntimeError("simulated rank death mid-comb")
+        return real(spec, call_fstat, xp=xp)
+
+    return mock.patch.object(GG, "run_comb_level", flaky), fired
+
+
+class CombLevelSpecTest(unittest.TestCase):
+    """``CombLevelSpec.sub_range``: slice the NODES, never the sky grid."""
+
+    def test_sub_range_slices_nodes_and_renames_the_checkpoint(self):
+        spec = _comb_spec(8, lv=4)
+        sub = spec.sub_range(2, 5, ckpt_name="comb_nsky4_r1")
+        self.assertEqual((sub.a, sub.b), (2, 5))
+        self.assertEqual(sub.n_nodes, 3)
+        np.testing.assert_array_equal(sub.f0_nodes, spec.f0_nodes[2:5])
+        self.assertEqual(sub.ckpt_name, "comb_nsky4_r1")
+
+    def test_sub_range_keeps_the_sky_grid_whole(self):
+        """The sky axis defines what a ROW MEANS. A rank that sliced it would
+        score a different template while reporting the same node."""
+        spec = _comb_spec(8, lv=4)
+        sub = spec.sub_range(2, 5)
+        np.testing.assert_array_equal(sub.alpha, spec.alpha)
+        np.testing.assert_array_equal(sub.sin_delta, spec.sin_delta)
+        self.assertEqual(sub.lv, spec.lv)
+        self.assertEqual(sub.mc_fix, spec.mc_fix)
+
+    def test_sub_range_outside_the_level_raises(self):
+        spec = _comb_spec(8, lv=4)
+        with self.assertRaises(ValueError):
+            spec.sub_range(2, 99)
+
+    def test_a_non_zero_based_level_slices_in_absolute_indices(self):
+        spec = _comb_spec(6, lv=4, a=10)
+        sub = spec.sub_range(12, 14)
+        np.testing.assert_array_equal(sub.f0_nodes, spec.f0_nodes[2:4])
+
+
+class CombSplitCoverageTest(unittest.TestCase):
+    """Acceptance 4: contiguous, ordered, every node exactly once."""
+
+    def test_ranges_cover_every_node_exactly_once_at_every_shape(self):
+        for n_nodes in (0, 1, 3, 4, 7, 12, 13, 97):
+            for n_parts in (1, 2, 3, 4, 5):
+                with self.subTest(n_nodes=n_nodes, n_parts=n_parts):
+                    ranges = G.split_box_range(0, n_nodes, n_parts)
+                    self.assertEqual(len(ranges), n_parts)
+                    self.assertEqual(ranges[0][0], 0)
+                    self.assertEqual(ranges[-1][1], n_nodes)
+                    covered = []
+                    for (a, b), (a2, _b2) in zip(ranges, ranges[1:]):
+                        self.assertLessEqual(a, b)
+                        self.assertEqual(b, a2, "ranges must be CONTIGUOUS")
+                        covered.extend(range(a, b))
+                    covered.extend(range(*ranges[-1]))
+                    self.assertEqual(covered, list(range(n_nodes)))
+
+    def test_a_level_offset_by_its_start_index_still_covers_it(self):
+        ranges = G.split_box_range(40, 53, 4)
+        self.assertEqual(ranges[0][0], 40)
+        self.assertEqual(ranges[-1][1], 53)
+        self.assertEqual(sum(b - a for a, b in ranges), 13)
+
+
+class CombPartIOTest(unittest.TestCase):
+    """The three partial arrays: write, verify, concatenate in rank order."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_round_trip_with_checksum(self):
+        F = np.arange(5, dtype=float)
+        al = np.arange(5, dtype=float) + 0.5
+        sd = np.linspace(-1.0, 1.0, 5)
+        path, n, sha = G.save_comb_part(self.tmp, 0, 1, F, al, sd)
+        self.assertEqual(path, G.comb_part_path(self.tmp, 0, 1))
+        self.assertEqual(n, 5)
+        self.assertEqual(len(sha), 16)
+        got = G.load_comb_part(self.tmp, 0, 1)
+        np.testing.assert_array_equal(got[0], F)
+        np.testing.assert_array_equal(got[1], al)
+        np.testing.assert_array_equal(got[2], sd)
+
+    def test_assemble_concatenates_in_rank_order(self):
+        whole = np.arange(30, dtype=float).reshape(3, 10)
+        sha1s = {}
+        for r, (a, b) in enumerate(G.split_box_range(0, 10, 3)):
+            _p, _n, sha1s[r] = G.save_comb_part(
+                self.tmp, 2, r, *whole[:, a:b])
+        F, al, sd = G.assemble_comb_level(self.tmp, 2, 3, 10, sha1s=sha1s)
+        np.testing.assert_array_equal(np.stack([F, al, sd]), whole)
+
+    def test_assemble_with_zero_width_parts_matches_the_whole(self):
+        """More ranks than nodes: the tail partials are empty, not missing."""
+        whole = np.arange(6, dtype=float).reshape(3, 2)
+        for r, (a, b) in enumerate(G.split_box_range(0, 2, 5)):
+            G.save_comb_part(self.tmp, 0, r, *whole[:, a:b])
+        F, al, sd = G.assemble_comb_level(self.tmp, 0, 5, 2)
+        np.testing.assert_array_equal(np.stack([F, al, sd]), whole)
+
+    def test_assemble_rejects_a_corrupt_partial(self):
+        F = np.arange(4, dtype=float)
+        _p, _n, sha = G.save_comb_part(self.tmp, 0, 0, F, F, F)
+        with self.assertRaises(RuntimeError) as cm:
+            G.assemble_comb_level(self.tmp, 0, 1, 4,
+                                  sha1s={0: sha[::-1]})
+        self.assertIn("changed under us", str(cm.exception))
+
+    def test_assemble_raises_on_a_short_total(self):
+        F = np.arange(4, dtype=float)
+        G.save_comb_part(self.tmp, 0, 0, F, F, F)
+        with self.assertRaises(RuntimeError):
+            G.assemble_comb_level(self.tmp, 0, 1, 9)
+
+    def test_assemble_raises_on_a_rank_missing_from_sha1s(self):
+        F = np.arange(4, dtype=float)
+        _p, _n, sha = G.save_comb_part(self.tmp, 0, 0, F, F, F)
+        G.save_comb_part(self.tmp, 0, 1, F[:0], F[:0], F[:0])
+        with self.assertRaises(RuntimeError):
+            G.assemble_comb_level(self.tmp, 0, 2, 4, sha1s={0: sha})
+
+    def test_clear_removes_only_this_level(self):
+        F = np.arange(3, dtype=float)
+        G.save_comb_part(self.tmp, 0, 0, F, F, F)
+        G.save_comb_part(self.tmp, 1, 0, F, F, F)
+        G.clear_comb_parts(self.tmp, 0, 1)
+        self.assertFalse(os.path.exists(G.comb_part_path(self.tmp, 0, 0)))
+        self.assertTrue(os.path.exists(G.comb_part_path(self.tmp, 1, 0)))
+
+
+class CombLevelSerialTest(unittest.TestCase):
+    """``run_comb_level`` IS the serial per-level reduction, split or not."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _brute(self, spec, call):
+        """The reduction spelled out: score every (node, sky) row, then max."""
+        rows = G._CombRows(spec.f0_nodes, spec.alpha, spec.sin_delta,
+                           spec.mc_fix)
+        from lisatools.sampling.fstat_proposal import compute_fstat
+
+        N, M = call(rows[0:rows.shape[0]])
+        Fd = compute_fstat(np.asarray(N), np.asarray(M)).reshape(
+            spec.n_nodes, spec.lv)
+        kb = Fd.argmax(axis=1)
+        return Fd.max(axis=1), spec.alpha[kb], spec.sin_delta[kb]
+
+    def test_it_reproduces_the_per_node_max_and_argmax(self):
+        with comb_env():
+            spec = _comb_spec(9, lv=4)
+            call = _fake_call_fstat()
+            got = G.run_comb_level(spec, call, xp=np)
+            want = self._brute(spec, call)
+        for g, w in zip(got, want):
+            np.testing.assert_array_equal(g, w)
+
+    def test_one_part_split_is_the_whole_level(self):
+        """Acceptance 1 at the level of the reduction: splitting into ONE
+        contiguous range and assembling it back is the serial sweep."""
+        with comb_env():
+            spec = _comb_spec(9, lv=4, parts_dir=self.tmp)
+            call = _fake_call_fstat()
+            whole = G.run_comb_level(spec, call, xp=np)
+            (a, b), = G.split_box_range(spec.a, spec.b, 1)
+            sub = spec.sub_range(a, b, ckpt_name="comb_nsky4_r0")
+            G.save_comb_part(self.tmp, spec.li, 0,
+                             *G.run_comb_level(sub, call, xp=np))
+            got = G.assemble_comb_level(self.tmp, spec.li, 1, spec.n_nodes)
+        for g, w in zip(got, whole):
+            np.testing.assert_array_equal(g, w)
+
+    def test_a_four_part_split_is_the_whole_level(self):
+        with comb_env():
+            spec = _comb_spec(9, lv=4, parts_dir=self.tmp)
+            call = _fake_call_fstat()
+            whole = G.run_comb_level(spec, call, xp=np)
+            for r, (a, b) in enumerate(G.split_box_range(spec.a, spec.b, 4)):
+                sub = spec.sub_range(a, b, ckpt_name=f"comb_nsky4_r{r}")
+                G.save_comb_part(self.tmp, spec.li, r,
+                                 *G.run_comb_level(sub, call, xp=np))
+            got = G.assemble_comb_level(self.tmp, spec.li, 4, spec.n_nodes)
+        for g, w in zip(got, whole):
+            np.testing.assert_array_equal(g, w)
+
+    def test_an_empty_range_returns_empty_arrays(self):
+        spec = _comb_spec(4, lv=4).sub_range(2, 2)
+        F, al, sd = G.run_comb_level(spec, None, xp=np)
+        for arr in (F, al, sd):
+            self.assertEqual(arr.shape, (0,))
+
+    def test_per_rank_checkpoints_do_not_collide(self):
+        with comb_env(FSTAT_CKPT_SECS="0"):
+            spec = _comb_spec(9, lv=4, parts_dir=self.tmp)
+            call = _fake_call_fstat()
+            for r, (a, b) in enumerate(G.split_box_range(spec.a, spec.b, 3)):
+                G.run_comb_level(
+                    spec.sub_range(a, b, ckpt_name=f"comb_nsky4_r{r}"),
+                    call, xp=np)
+        progress = sorted(f for f in os.listdir(self.tmp)
+                          if f.endswith(".progress.npz"))
+        self.assertEqual(progress, ["comb_nsky4_r0.progress.npz",
+                                    "comb_nsky4_r1.progress.npz",
+                                    "comb_nsky4_r2.progress.npz"])
+
+
+class CombOpRegistrationTest(unittest.TestCase):
+    """``gb_fstat_comb`` is a wire op with the same requirement as stage B."""
+
+    def test_op_is_registered_between_the_row_and_stage_b(self):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        self.assertEqual(
+            gbs.GB_OPS[4:],
+            ("gb_fstat_ref_row", "gb_fstat_comb", "gb_fstat_stage_b",
+             "gb_fstat_release"))
+
+    def test_it_needs_the_same_attribute_stage_b_does(self):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        self.assertEqual(gbs._FSTAT_OP_REQUIRES["gb_fstat_comb"],
+                         "_fstat_call")
+
+    def test_it_is_refused_on_a_move_that_cannot_run_a_fit(self):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialBase.__new__(gbs.GBSpecialBase)
+        move.name = "gb_test"
+        move._fstat_call = None
+        with self.assertRaises(ValueError) as cm:
+            move.gf_serve("gb_fstat_comb", None, {}, None)
+        self.assertIn("_fstat_call", str(cm.exception))
+
+
+class CombPayloadTest(unittest.TestCase):
+    """The payload is host arrays and round-trips to an equivalent sub-spec."""
+
+    def test_payload_round_trips_to_an_equivalent_sub_spec(self):
+        from lisatools.globalfit.moves.gbspecialstretch import GBSpecialBase
+
+        spec = _comb_spec(8, lv=4, parts_dir="/tmp/parts", li=2, n_levels=3)
+        payload = GBSpecialBase._fstat_comb_payload(spec, 1, 2, 5)
+        sub = GBSpecialBase._fstat_comb_spec(payload)
+        self.assertEqual((sub.a, sub.b), (2, 5))
+        self.assertEqual(sub.li, 2)
+        self.assertEqual(sub.n_levels, 3)
+        self.assertEqual(sub.lv, 4)
+        self.assertEqual(sub.ckpt_name, "comb_nsky4_r1")
+        np.testing.assert_array_equal(sub.f0_nodes, spec.f0_nodes[2:5])
+        np.testing.assert_array_equal(sub.alpha, spec.alpha)
+        np.testing.assert_array_equal(sub.sin_delta, spec.sin_delta)
+        self.assertEqual(sub.parts_dir, "/tmp/parts")
+        self.assertEqual(sub.fingerprint_extra, "|epoch=0")
+
+    def test_payload_holds_no_device_arrays(self):
+        from lisatools.globalfit.moves.gbspecialstretch import GBSpecialBase
+
+        spec = _comb_spec(8, lv=4)
+        payload = GBSpecialBase._fstat_comb_payload(spec, 0, 0, 8)
+        for key in ("f0_nodes", "alpha", "sin_delta"):
+            self.assertIsInstance(payload[key], np.ndarray)
+
+    def test_empty_range_is_a_legal_payload(self):
+        from lisatools.globalfit.moves.gbspecialstretch import GBSpecialBase
+
+        spec = _comb_spec(2, lv=4)
+        payload = GBSpecialBase._fstat_comb_payload(spec, 4, 2, 2)
+        sub = GBSpecialBase._fstat_comb_spec(payload)
+        self.assertEqual(sub.n_nodes, 0)
+
+
+class ServedCombBodyTest(unittest.TestCase):
+    """``_gb_serve_fstat_comb``: sweep the range, write the partial, reply."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _move(self, *, holder=_KEEP):
+        layout = _build_fake_layout(4, 2)
+        fan = _StubFanout(layout, lls=None)
+        fan.single = False
+        fan.rank = int(layout.compute_ranks[0])
+        move = _StageBRankStub(fan, rank=fan.rank)
+        if holder is not _KEEP:
+            move._fstat_ref_holder = holder
+        return move
+
+    def _payload(self, rank_index=1, a=0, b=4):
+        from lisatools.globalfit.moves.gbspecialstretch import GBSpecialBase
+
+        spec = _comb_spec(9, lv=4, parts_dir=self.tmp)
+        return GBSpecialBase._fstat_comb_payload(spec, rank_index, a, b), spec
+
+    def test_the_reply_describes_the_partial_it_wrote(self):
+        move = self._move()
+        payload, _spec = self._payload(rank_index=1, a=2, b=6)
+        with comb_env():
+            with self.assertLogs(
+                    "lisatools.globalfit.moves.gbspecialstretch",
+                    level="INFO") as cap:
+                res = move.gf_serve("gb_fstat_comb", payload, {}, None)
+        self.assertEqual(res["li"], 0)
+        self.assertEqual((res["a"], res["b"]), (2, 6))
+        self.assertEqual(res["rank_index"], 1)
+        self.assertEqual(res["n_nodes"], 4)
+        self.assertEqual(len(res["sha1"]), 16)
+        self.assertTrue(any("[FSTAT_COMB] l0 r1 nodes [2, 6) (4)" in m
+                            for m in cap.output), cap.output)
+        self.assertTrue(os.path.exists(G.comb_part_path(self.tmp, 0, 1)))
+
+    def test_the_partial_is_the_serial_sweep_of_that_range(self):
+        move = self._move()
+        payload, spec = self._payload(rank_index=1, a=2, b=6)
+        with comb_env():
+            move.gf_serve("gb_fstat_comb", payload, {}, None)
+            want = G.run_comb_level(
+                spec.sub_range(2, 6), _fake_call_fstat(), xp=np)
+        got = G.load_comb_part(self.tmp, 0, 1)
+        for g, w in zip(got, want):
+            np.testing.assert_array_equal(g, w)
+
+    def test_without_a_reference_row_it_refuses(self):
+        move = self._move(holder=None)
+        payload, _spec = self._payload()
+        with self.assertRaises(RuntimeError) as cm:
+            move.gf_serve("gb_fstat_comb", payload, {}, None)
+        self.assertIn("reference row", str(cm.exception))
+
+    def test_an_empty_range_writes_an_empty_partial(self):
+        move = self._move()
+        payload, _spec = self._payload(rank_index=3, a=5, b=5)
+        with comb_env():
+            res = move.gf_serve("gb_fstat_comb", payload, {}, None)
+        self.assertEqual(res["n_nodes"], 0)
+        self.assertEqual(G.load_comb_part(self.tmp, 0, 3).shape, (3, 0))
+
+
+class CombRunnerTest(unittest.TestCase):
+    """HEAD side: split one level, check every reply, assemble in rank order."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _move(self, n_compute=2):
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            GBSpecialRJFStatGridMove,
+        )
+
+        move = GBSpecialRJFStatGridMove.__new__(GBSpecialRJFStatGridMove)
+        move.name = "gb_test"
+        move.fanout = _StubFanout(
+            _build_fake_layout(4 * n_compute, n_compute), lls=None)
+        move.fanout.single = (n_compute == 1)
+        move._fstat_ref_call = None
+        return move, move.fanout.layout
+
+    def _serve(self, move, layout, per_rank_payload, vals_of):
+        """Every compute rank runs the op body's I/O half for real."""
+        replies = {}
+        for rank in layout.compute_ranks:
+            payload = per_rank_payload(rank, 0, 0)
+            sub = move._fstat_comb_spec(payload)
+            ri = int(payload["rank_index"])
+            _p, n_nodes, sha = G.save_comb_part(
+                sub.parts_dir, sub.li, ri, *vals_of(sub))
+            replies[rank] = {"li": int(sub.li), "a": int(sub.a),
+                             "b": int(sub.b), "rank_index": ri,
+                             "n_nodes": int(n_nodes), "sha1": sha,
+                             "wall_s": 1.0 + ri}
+        return replies
+
+    def _whole(self, spec):
+        n = spec.n_nodes
+        return np.arange(3 * n, dtype=float).reshape(3, n)
+
+    def _run(self, move, layout, spec, *, mangle=None):
+        whole = self._whole(spec)
+
+        def fake_cmd(op, per_rank_payload, model):
+            self.assertEqual(op, "gb_fstat_comb")
+            replies = self._serve(
+                move, layout, per_rank_payload,
+                lambda sub: whole[:, sub.a - spec.a:sub.b - spec.a])
+            if mangle is not None:
+                mangle(replies)
+            return replies, None
+
+        move._fanout_cmd = fake_cmd
+        runner = move._fstat_comb_runner("model")
+        return runner, whole
+
+    def test_split_partials_assemble_into_the_whole_level(self):
+        move, layout = self._move(n_compute=2)
+        spec = _comb_spec(7, lv=4, parts_dir=self.tmp)
+        runner, whole = self._run(move, layout, spec)
+        with self.assertLogs("lisatools.globalfit.moves.gbspecialstretch",
+                             level="INFO") as cap:
+            got = runner(spec, None, xp=np)
+        np.testing.assert_array_equal(np.stack(got), whole)
+        self.assertTrue(
+            any("[FSTAT_COMB] level 1/1 over 2 rank(s)" in m
+                for m in cap.output), cap.output)
+
+    def test_every_rank_gets_its_own_contiguous_range(self):
+        move, layout = self._move(n_compute=3)
+        spec = _comb_spec(7, lv=4, parts_dir=self.tmp)
+        seen = {}
+
+        def fake_cmd(op, per_rank_payload, model):
+            for rank in layout.compute_ranks:
+                p = per_rank_payload(rank, 0, 0)
+                seen[int(p["rank_index"])] = (int(p["a"]), int(p["b"]))
+            raise _StopHere
+
+        move._fanout_cmd = fake_cmd
+        runner = move._fstat_comb_runner("model")
+        with self.assertRaises(_StopHere):
+            runner(spec, None, xp=np)
+        self.assertEqual([seen[i] for i in sorted(seen)],
+                         G.split_box_range(0, 7, 3))
+
+    def test_a_reply_that_misreports_its_range_is_refused(self):
+        move, layout = self._move(n_compute=2)
+        spec = _comb_spec(7, lv=4, parts_dir=self.tmp)
+
+        def mangle(replies):
+            k = sorted(replies)[0]
+            replies[k]["b"] = 99
+
+        runner, _w = self._run(move, layout, spec, mangle=mangle)
+        with self.assertRaises(RuntimeError) as cm:
+            runner(spec, None, xp=np)
+        self.assertIn("node range", str(cm.exception))
+
+    def test_a_reply_that_misreports_its_node_count_is_refused(self):
+        move, layout = self._move(n_compute=2)
+        spec = _comb_spec(7, lv=4, parts_dir=self.tmp)
+
+        def mangle(replies):
+            k = sorted(replies)[0]
+            replies[k]["n_nodes"] = 99
+
+        runner, _w = self._run(move, layout, spec, mangle=mangle)
+        with self.assertRaises(RuntimeError):
+            runner(spec, None, xp=np)
+
+    def test_a_reply_without_a_rank_index_is_refused(self):
+        move, layout = self._move(n_compute=2)
+        spec = _comb_spec(7, lv=4, parts_dir=self.tmp)
+
+        def mangle(replies):
+            replies[sorted(replies)[0]].pop("rank_index")
+
+        runner, _w = self._run(move, layout, spec, mangle=mangle)
+        with self.assertRaises(RuntimeError) as cm:
+            runner(spec, None, xp=np)
+        self.assertIn("rank_index", str(cm.exception))
+
+    def test_a_level_with_no_shared_parts_dir_is_refused(self):
+        move, _layout = self._move(n_compute=2)
+        spec = _comb_spec(7, lv=4, parts_dir=None)
+        move._fanout_cmd = lambda *a, **k: ({}, None)
+        runner = move._fstat_comb_runner("model")
+        with self.assertRaises(RuntimeError) as cm:
+            runner(spec, None, xp=np)
+        self.assertIn("parts_dir", str(cm.exception))
+
+    def test_one_compute_rank_refuses_to_build_a_runner_at_all(self):
+        move, _layout = self._move(n_compute=1)
+        with self.assertRaises(RuntimeError) as cm:
+            move._fstat_comb_runner("model")
+        self.assertIn("comb_runner", str(cm.exception))
+
+    def test_no_fanout_refuses_to_build_a_runner_at_all(self):
+        move, _layout = self._move(n_compute=2)
+        move.fanout = None
+        with self.assertRaises(RuntimeError):
+            move._fstat_comb_runner("model")
+
+    def test_a_fanout_with_no_single_flag_is_refused_not_crashed(self):
+        move, _layout = self._move(n_compute=2)
+        del move.fanout.single
+        with self.assertRaises(RuntimeError):
+            move._fstat_comb_runner("model")
+
+    def test_a_scorer_that_is_not_the_cached_holder_call_is_refused(self):
+        move, layout = self._move(n_compute=2)
+        move._fstat_ref_call = object()
+        spec = _comb_spec(7, lv=4, parts_dir=self.tmp)
+        move._fanout_cmd = lambda *a, **k: ({}, None)
+        runner = move._fstat_comb_runner("model")
+        with self.assertRaises(RuntimeError) as cm:
+            runner(spec, lambda rows: None, xp=np)
+        self.assertIn("_fstat_holder_call", str(cm.exception))
+
+    def test_partials_are_swept_after_assembly_tmp_files_too(self):
+        move, layout = self._move(n_compute=2)
+        spec = _comb_spec(7, lv=4, parts_dir=self.tmp)
+        # an orphan from a WIDER fit, plus a half-written temp file
+        F = np.zeros(3)
+        G.save_comb_part(self.tmp, 0, 9, F, F, F)
+        open(G.comb_part_path(self.tmp, 0, 7) + ".tmp", "wb").close()
+        runner, _w = self._run(move, layout, spec)
+        with self.assertLogs("lisatools.globalfit.moves.gbspecialstretch",
+                             level="INFO"):
+            runner(spec, None, xp=np)
+        left = [f for f in os.listdir(self.tmp) if f.startswith("comb_l")]
+        self.assertEqual(left, [], f"comb partials left behind: {left}")
+
+
+class ParallelCombGateTest(unittest.TestCase):
+    """THE stage-A acceptance gate: N ranks == the serial comb, byte for byte.
+
+    A SPLIT gate, not a row gate, exactly as :class:`ParallelStageBGateTest`
+    is: every rank pre-installs its own all-zero :class:`_StubRefRow`, so
+    this class issues no ``gb_fstat_ref_row`` and the row-keyed scorer is
+    the exact identity -- which is what lets the parallel arm be compared to
+    a serial run of the same analytic fixture.
+    """
+
+    def setUp(self):
+        self.a = tempfile.mkdtemp()
+        self.b = tempfile.mkdtemp()
+
+    def tearDown(self):
+        for d in (self.a, self.b):
+            shutil.rmtree(d, ignore_errors=True)
+
+    def _fanout_run(self, n_compute, tmpdir):
+        """Run the fixture comb over ``n_compute`` FakeWorld ranks."""
+        from lisatools.globalfit.communication import ranks as R
+        from lisatools.globalfit.communication.fakecomm import FakeWorld
+        from lisatools.globalfit.communication.fanout import (
+            ComputeService,
+            WalkerFanout,
+        )
+
+        world = FakeWorld(n_compute + 1, timeout=300.0)
+
+        def body(rank, comm):
+            layout = R.build_layout(comm, 2 * n_compute,
+                                    list(range(n_compute)))
+            fcomm = layout.make_fanout_comm(comm)
+            if rank not in layout.compute_ranks:
+                return None
+            fanout = WalkerFanout(fcomm, layout, rank, model=None)
+            stub = _StageBRankStub(fanout, rank=rank)
+            if rank != layout.head_rank:
+                ComputeService(fcomm, layout, rank,
+                               registry={None: stub, "gb_pe": stub},
+                               model=None).serve()
+                return None
+            call_fstat = stub._fstat_holder_call(None)
+            try:
+                return run_comb(tmpdir, call_fstat=call_fstat,
+                                comb_runner=stub._fstat_comb_runner(None))
+            finally:
+                fanout.stop()
+
+        return next(v for v in world.run(body).values() if v is not None)
+
+    def test_the_fixture_exercises_several_sky_levels(self):
+        """Otherwise the per-level fan-out is gated exactly once and the
+        'one command per level' half of the design is untested."""
+        with comb_env():
+            path = run_comb(self.a)
+        d = np.load(path, allow_pickle=False)
+        levels = np.unique(np.asarray(d["nsky_per_node"]))
+        self.assertGreaterEqual(len(levels), 2, f"only levels {levels}")
+        self.assertGreater(len(d["peaks"]), 0, "the comb found no peaks")
+
+    def test_two_ranks_are_bit_identical_to_the_serial_comb(self):
+        with comb_env():
+            want = run_comb(self.a)
+            got = self._fanout_run(2, self.b)
+        assert_npz_identical(self, got, want)
+
+    def test_four_ranks_are_bit_identical_to_the_serial_comb(self):
+        """Acceptance 2 -- the gate that matters."""
+        with comb_env():
+            want = run_comb(self.a)
+            got = self._fanout_run(4, self.b)
+        assert_npz_identical(self, got, want)
+
+    def test_more_ranks_than_nodes_is_bit_identical_too(self):
+        with comb_env(FSTAT_F0_SPACING_MHZ="2.0"):
+            want = run_comb(self.a)
+            got = self._fanout_run(5, self.b)
+        assert_npz_identical(self, got, want)
+
+    def test_partials_are_deleted_after_assembly(self):
+        with comb_env():
+            self._fanout_run(2, self.b)
+        parts = os.path.join(self.b, "fstat_grid_parts")
+        left = ([f for f in os.listdir(parts) if f.startswith("comb_l")]
+                if os.path.isdir(parts) else [])
+        self.assertEqual(left, [], f"comb partials left behind: {left}")
+
+    def test_resume_after_a_rank_dies_mid_level_is_unchanged(self):
+        """Acceptance 3: kill a rank mid-level, re-run, same assembled comb."""
+        with comb_env():
+            want = run_comb(self.a)
+            patch, fired = _kill_comb_once("_r1")
+            with patch:
+                with self.assertRaises(Exception):
+                    self._fanout_run(2, self.b)
+            self.assertTrue(fired.is_set(), "the simulated death never fired")
+            parts = os.path.join(self.b, "fstat_grid_parts")
+            progress = [f for f in os.listdir(parts)
+                        if f.endswith(".progress.npz")]
+            self.assertTrue(progress,
+                            "per-rank comb checkpoints must survive a death")
+            self.assertTrue(any("_r" in f for f in progress),
+                            f"checkpoints must be per rank, got {progress}")
+            with self.assertLogs(G.logger, level="INFO") as cap:
+                got = self._fanout_run(2, self.b)
+            self.assertTrue(
+                any("[ckpt] resuming" in m for m in cap.output),
+                "the same rank count must RESUME the per-rank checkpoints")
+        assert_npz_identical(self, got, want)
+
+    def test_a_different_rank_count_restarts_the_stale_checkpoints(self):
+        with comb_env():
+            want = run_comb(self.a)
+            patch, fired = _kill_comb_once("_r1")
+            with patch:
+                with self.assertRaises(Exception):
+                    self._fanout_run(2, self.b)
+            self.assertTrue(fired.is_set())
+            got = self._fanout_run(3, self.b)
+        assert_npz_identical(self, got, want)
+
+
+class CombCacheFingerprintTest(unittest.TestCase):
+    """The COMPLETED comb npz is salted by the reference walker too.
+
+    The parked 2026-09-17 limitation: ``fingerprint_extra`` salts the
+    in-flight progress files only, so a refit whose global argmax moved
+    reloaded the PREVIOUS walker's finished comb on file existence alone and
+    re-selected its peak boxes from it.
+    """
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def _fit(self, wref, **kw):
+        return G.run_fstat_grid_fit(
+            _fake_call_fstat(**kw), xp=np, Tobs=TOBS,
+            band_edges_hz=COMB_BAND_EDGES, f0_lims_hz=COMB_F0_LIMS,
+            mc_lims=[0.01, 1.0], cache_dir=self.d,
+            fingerprint_extra=f"|epoch=0|gbfree=1|wref={wref}", epoch=0)
+
+    def test_the_comb_npz_records_the_fingerprint_it_was_scored_with(self):
+        with comb_env():
+            path = run_comb(self.d, fingerprint_extra="|epoch=0|wref=7")
+        d = np.load(path, allow_pickle=False)
+        self.assertIn("fingerprint_extra", d)
+        self.assertEqual(str(d["fingerprint_extra"]), "|epoch=0|wref=7")
+
+    def test_the_same_reference_walker_reuses_the_comb(self):
+        with comb_env(), stage_b_env(FSTAT_N_MC="2",
+                                     FSTAT_PEAK_HALF_MHZ="0.05"):
+            self._fit(3)
+            os.remove(G.stacked_grid_path(self.d))
+            with self.assertLogs(G.logger, level="INFO") as cap:
+                self._fit(3)
+        self.assertTrue(any("reusing comb cache" in m for m in cap.output),
+                        cap.output)
+
+    def test_a_moved_reference_walker_rescans_instead_of_stitching(self):
+        with comb_env(), stage_b_env(FSTAT_N_MC="2",
+                                     FSTAT_PEAK_HALF_MHZ="0.05"):
+            self._fit(3)
+            os.remove(G.stacked_grid_path(self.d))
+            with self.assertLogs(G.logger, level="INFO") as cap:
+                self._fit(5)
+        self.assertFalse(any("reusing comb cache" in m for m in cap.output),
+                         "a moved argmax must not reuse the old walker's comb")
+        self.assertTrue(
+            any("scored against a different reference" in m
+                for m in cap.output), cap.output)
+        d = np.load(os.path.join(self.d, G.GRID_BASENAME).replace(
+            ".npz", "_comb.npz"), allow_pickle=False)
+        self.assertEqual(str(d["fingerprint_extra"]),
+                         "|epoch=0|gbfree=1|wref=5")
+
+    def test_a_legacy_comb_with_no_stamp_is_reused_with_a_warning(self):
+        """In-flight fits predate the stamp; refusing theirs would throw away
+        a finished 47-minute scan on the first restart after this lands."""
+        with comb_env():
+            path = run_comb(self.d)
+        d = dict(np.load(path, allow_pickle=False))
+        d.pop("fingerprint_extra")
+        np.savez(path, **d)
+        with comb_env(), stage_b_env(FSTAT_N_MC="2",
+                                     FSTAT_PEAK_HALF_MHZ="0.05"):
+            with self.assertLogs(G.logger, level="WARNING") as cap:
+                self._fit(5)
+        self.assertTrue(any("carries no reference-walker stamp" in m
+                            for m in cap.output), cap.output)
 
 
 if __name__ == "__main__":
