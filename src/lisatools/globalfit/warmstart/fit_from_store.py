@@ -88,6 +88,18 @@ FEAT_NAMES = ["f0", "Mc", "ln_dist", "alpha", "sin_delta"]
 #: mins/maxs already carry, so it is not listed here.
 OBSERVABLE_BOUNDED_COLS = {COS_IOTA_COL: (-1.0, 1.0)}
 
+#: Cluster feature space in the OBSERVABLE basis. `lnA` succeeds `ln_dist`
+#: (it IS the measured amplitude, already logged by the map) and `fdot`
+#: is new -- it is the separator the sampling metric lacks, because two
+#: fragments of one source share an f0 and differ in fdot. `Mc` LEAVES the
+#: metric: it is the fiber, a flat direction, and clustering on a flat
+#: direction is what generates the split artifacts the referee then merges.
+OBSERVABLE_FEAT_NAMES = ["f_mid", "fdot", "lnA", "alpha", "sin_delta"]
+
+#: Relative floor for the observable `fdot` whitening scale (see
+#: :func:`cluster_scale_floor`).
+FDOT_SCALE_FLOOR_FRAC = 1e-3
+
 
 class _DefaultGBBasisContainer:
     """Stand-in transform container for :func:`build_map`.
@@ -316,17 +328,47 @@ def segment_f0(f0_mhz: np.ndarray, df_mhz: float, n_samples: int):
 # --------------------------------------------------------------------------
 # stage 2: within-island split (swappable: split(island_rows) -> labels)
 # --------------------------------------------------------------------------
-def make_cluster_features(x_all: np.ndarray) -> np.ndarray:
-    """(n, 9) sampled rows -> (n, 5) cluster features, alpha rotated so the
-    2pi wrap sits in the emptiest region of the island's alpha histogram."""
+def make_cluster_features(x_all: np.ndarray,
+                          basis: str = "sampling") -> np.ndarray:
+    """rows -> (n, 5) cluster features, alpha rotated so the 2pi wrap sits
+    in the emptiest region of the island's alpha histogram.
+
+    ``basis="sampling"``   -> (f0,    Mc,   ln dist, alpha, sin_delta)
+    ``basis="observable"`` -> (f_mid, fdot, lnA,     alpha, sin_delta)
+    Alpha is column 6 in BOTH bases, so the rotation below is shared.
+    """
     alpha = x_all[:, 6]
     hist = np.bincount((alpha / (2 * np.pi) * 36).astype(int) % 36,
                        minlength=36)
     shift = (int(hist.argmin()) + 0.5) * (2 * np.pi / 36)
     alpha_rot = (alpha - shift) % (2 * np.pi)
+    if basis == "observable":
+        return np.column_stack([x_all[:, 1], x_all[:, 2], x_all[:, 0],
+                                alpha_rot, x_all[:, 7]])
     return np.column_stack([x_all[:, 1], x_all[:, 2],
                             np.log(np.maximum(x_all[:, 0], 1e-30)),
                             alpha_rot, x_all[:, 7]])
+
+
+def cluster_scale_floor(feats: np.ndarray, df_seg: float,
+                        basis: str = "sampling") -> np.ndarray:
+    """Per-feature whitening scale floors ("a zero MAD must not shatter").
+
+    The sampling vector is the historical one. The observable vector CANNOT
+    reuse it: entry 1 is ``Mc`` (order 0.5) in the sampling metric but
+    ``fdot`` in the observable one, and ``fdot`` runs ~1e-17 at 1 mHz to
+    ~1e-12 at 30 mHz. A fixed 1e-4 floor there sits up to 1e13x ABOVE the
+    data, whitening every chirp difference to zero -- it would silently
+    delete the separator this basis change exists to add, and no fixed
+    absolute number works across five decades either. The floor is
+    therefore taken RELATIVE to the island's own chirp scale.
+    """
+    if basis == "observable":
+        fdot_scale = float(np.median(np.abs(feats[:, 1])))
+        return np.array([0.05 * df_seg,
+                         max(FDOT_SCALE_FLOOR_FRAC * fdot_scale, 1e-30),
+                         1e-3, 1e-3, 1e-3])
+    return np.array([0.05 * df_seg, 1e-4, 1e-3, 1e-3, 1e-3])
 
 
 def _satellite_merge(labels, zw, stats):
@@ -373,18 +415,20 @@ def _satellite_merge(labels, zw, stats):
 
 
 def split_single_linkage(island_rows: np.ndarray, rng: np.random.Generator,
-                         df_mhz: float, stats: dict) -> np.ndarray:
+                         df_seg: float, stats: dict) -> np.ndarray:
     """Default swappable splitter: split(island_rows) -> labels (-1 = junk).
 
-    island_rows: (n, 9) sampled-basis rows of ONE island.
+    island_rows: (n, 9) rows of ONE island, in ``stats["basis"]``.
+    ``df_seg`` is 1/Tobs in the units of column 1 of THAT basis.
     """
-    feats = make_cluster_features(island_rows)
+    basis = stats.get("basis", "sampling")
+    feats = make_cluster_features(island_rows, basis=basis)
     n = len(feats)
     sub = feats[rng.choice(n, min(n, SUB), replace=False)]
     med = np.median(sub, axis=0)
     mad = 1.4826 * np.median(np.abs(sub - med), axis=0)
     # column-aware scale floors (a zero MAD must not shatter the island)
-    scale_floor = np.array([0.05 * df_mhz, 1e-4, 1e-3, 1e-3, 1e-3])
+    scale_floor = cluster_scale_floor(feats, df_seg, basis)
     scale = np.maximum(mad, scale_floor)
     zw_sub = (sub - med) / scale
     if len(zw_sub) > 1:
@@ -508,15 +552,15 @@ def fit_component(rows: np.ndarray, stats: dict):
 # counted; the apply-stage blend flag catches it downstream). A genuine
 # same-source double-stack also splits (two near-coincident components)
 # -- the deliberate "split upstream" side of the open mult-policy ruling.
-def _ward_split(rows, sid, rng, df_mhz):
+def _ward_split(rows, sid, rng, df_seg, basis="sampling"):
     """One ward 2-split in the cluster's own whitened frame.
 
     Returns [(rows, sid), (rows, sid)] or None when the split is
     degenerate (a tiny piece) or makes no mult progress."""
-    feats = make_cluster_features(rows)
+    feats = make_cluster_features(rows, basis=basis)
     med = np.median(feats, axis=0)
     mad = 1.4826 * np.median(np.abs(feats - med), axis=0)
-    scale_floor = np.array([0.05 * df_mhz, 1e-4, 1e-3, 1e-3, 1e-3])
+    scale_floor = cluster_scale_floor(feats, df_seg, basis)
     zw = (feats - med) / np.maximum(mad, scale_floor)
     n = len(zw)
     if n > SUB:
@@ -536,7 +580,7 @@ def _ward_split(rows, sid, rng, df_mhz):
     return parts
 
 
-def resplit_blends(rows, sid, n_samples, mult_max, rng, df_mhz, stats,
+def resplit_blends(rows, sid, n_samples, mult_max, rng, df_seg, stats,
                    max_depth=4):
     """Recursively re-split clusters with p > 0.5 and mult > mult_max."""
     out, queue = [], [(rows, sid, 0)]
@@ -548,7 +592,8 @@ def resplit_blends(rows, sid, n_samples, mult_max, rng, df_mhz, stats,
         if depth >= max_depth or p <= 0.5 or mult <= mult_max:
             out.append((r, s))
             continue
-        parts = _ward_split(r, s, rng, df_mhz)
+        parts = _ward_split(r, s, rng, df_seg,
+                            stats.get("basis", "sampling"))
         if parts is None:
             stats["blend_unsplit"] += 1
             out.append((r, s))
