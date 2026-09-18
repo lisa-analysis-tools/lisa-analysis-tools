@@ -2312,13 +2312,22 @@ export VGB_SIGHET_INMODEL=${VGB_SIGHET_INMODEL:-1}
 #   python scripts/fstat_proposal/migrate_vgb_chirp_basis.py \
 #       <store.h5> <catalogue_dir>
 # run BEFORE the first launch. NEVER flip this mid-store.
-# STAGED, NOT YET LIVE (2026-09-16 sequencing): the ruling + machinery
-# above are in the tree and gated by this knob, but the flip to 1 happens
-# at the DELIBERATE VGB restart together with
-# migrate_vgb_chirp_basis.py (restart-at-injection) -- NOT at the next
-# ordinary relaunch, which must keep resuming the current 5-column store
-# untouched. Flip this to 1 only alongside the migration step.
-export VGB_CHIRP_MASS_BASIS=0
+# LIVE (user ruling 2026-09-18). Staged off since 2026-09-16; flipped on
+# after the 4-GPU run measured VGB in-model acceptance at 0.001-0.004 per
+# rung under the 5-column basis, with NO vgb_ridge_gibbs registered (the
+# ridge gate reads the column names, and the 5-column basis does not carry
+# them). The HM Cnc standalone exonerated the map three ways and ranked
+# the arms: 6-col observable+eigen with the RIDGE 0.534 acceptance
+# (tau 66.6, the best arm) against 0.1596 without it. This run has been
+# getting neither half.
+#
+# *** BEFORE THE NEXT LAUNCH ON AN EXISTING STORE, MIGRATE IT. ***
+#   python scripts/fstat_proposal/migrate_vgb_chirp_basis.py \
+#       ${STORE_DIR}/gf_prod_6mo_testing.h5 <catalogue_dir>
+# Without that the launch REFUSES to resume (run.py's ndim guard fires at
+# backend construction, before any chain load, naming this knob) -- a
+# clean stop, not a corrupt run. Set 0 to roll back to the 5-column store.
+export VGB_CHIRP_MASS_BASIS=${VGB_CHIRP_MASS_BASIS:-1}
 # 8-rung ladder (user ruling 2026-08-15). Resume derives the rung count
 # from the STORED band_temps shape, so the migration above MUST be run
 # with the matching "8" argument (it recreates every rung-dimensioned
