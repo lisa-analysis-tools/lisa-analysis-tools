@@ -93,7 +93,7 @@ X0 = np.array([[9.69, 20.380376, 0.4678, 6.17, -0.9, 1.40,
 def _flagship_component(tmp, **kw):
     m = wb.build_map(_Container(), Tobs=7.776e6)
     z0 = np.asarray(m.to_internal(X0))[0]
-    cov = np.diag(np.maximum(np.abs(z0) * 1e-3, 1e-12) ** 2)
+    cov = np.diag(np.maximum(np.abs(z0) * 1e-5, 1e-30) ** 2)
     path, _ = _obs_npz(tmp, z0, cov, **kw)
     c = WarmStartComponents.from_npz(path, new_tobs=1.5552e7)
     c.attach_transform(_Container())
@@ -130,6 +130,87 @@ class ObservableFormatTest(unittest.TestCase):
             np.savez(bad, **d)
             with self.assertRaises(ValueError):
                 WarmStartComponents.from_npz(bad, new_tobs=1.5552e7)
+
+
+class ObservableDrawTest(unittest.TestCase):
+    def test_rvs_returns_sampling_columns_near_the_mapped_mean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            c, _, _, _ = _flagship_component(tmp)
+            x = c.rvs(512)
+            self.assertEqual(x.shape, (512, 9))
+            # f0 (sampling col 1) lands on the source, not scattered
+            self.assertLess(abs(np.median(x[:, 1]) - 20.380376), 1e-4)
+
+    def test_logpdf_carries_the_log_jacobian_with_the_right_sign(self):
+        """A density transforms with the determinant of the INVERSE map.
+
+        ``log_jacobian`` is ``ln|dy/dz|`` at a sampling point y, and
+        ``q_y(y) = q_z(z(y)) * |dz/dy|``, so the correction SUBTRACTS.
+        Getting it backwards leaves rvs and logpdf inconsistent by
+        ``2 * log_jacobian``, which varies across a component and so biases
+        the RJ birth/death factors instead of cancelling.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            c, m, z0, cov = _flagship_component(tmp)
+            lp = c.logpdf(X0)
+            z = np.asarray(m.to_internal(X0))
+            d = (z - z0).ravel()
+            gauss = (-0.5 * float(d @ np.linalg.inv(cov) @ d)
+                     - 0.5 * np.log(np.linalg.det(2 * np.pi * cov)))
+            jac = float(np.asarray(m.log_jacobian(X0))[0])
+            self.assertAlmostEqual(float(lp[0]), gauss - jac, places=6)
+            # and the wrong sign is far away, so this is a real test
+            self.assertGreater(abs(2 * jac), 10.0)
+
+    def test_sampling_density_integrates_to_one(self):
+        """Spec test 2, by importance sampling with an INDEPENDENT proposal.
+
+        Draw z from a deliberately broadened Gaussian h, map to y, and
+        estimate ``int q_y dy = E_h[q_y(y(z)) |dy/dz| / h(z)]``. The
+        estimator is 1 only if the Jacobian correction is applied with the
+        right sign and magnitude.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            c, m, z0, cov = _flagship_component(tmp)
+            rng = np.random.default_rng(11)
+            sd = np.sqrt(np.diag(cov)) * 1.3
+            z = z0 + sd * rng.standard_normal((50000, 9))
+            y = np.asarray(m.from_internal(z))
+            log_h = (-0.5 * np.sum(((z - z0) / sd) ** 2, axis=1)
+                     - np.sum(np.log(sd)) - 4.5 * np.log(2 * np.pi))
+            log_w = (c.logpdf(y) + np.asarray(m.log_jacobian(y)) - log_h)
+            integral = float(np.mean(np.exp(log_w)))
+            # Monte Carlo, so a tolerance rather than an equality -- but a
+            # flipped Jacobian sign lands this near e^64, not near 1.02.
+            self.assertAlmostEqual(integral, 1.0, delta=0.02)
+
+    def test_draws_are_self_consistent_between_rvs_and_logpdf(self):
+        """logpdf must be finite at every point rvs produces."""
+        with tempfile.TemporaryDirectory() as tmp:
+            c, _, _, _ = _flagship_component(tmp)
+            x = c.rvs(64)
+            self.assertTrue(np.all(np.isfinite(c.logpdf(x))))
+
+    def test_draws_follow_the_fitted_law_in_the_observable_basis(self):
+        """rvs maps back correctly: the draws, mapped FORWARD again, must
+        be chi-square(9) in Mahalanobis distance about the fitted mean.
+
+        This checks the draw path end to end -- Cholesky draw, circular
+        wrap, ``from_internal`` -- independently of logpdf, which the
+        normalisation test above covers.
+        """
+        from scipy.stats import chi2
+
+        with tempfile.TemporaryDirectory() as tmp:
+            c, m, z0, cov = _flagship_component(tmp)
+            x = c.rvs(20000)
+            z = np.asarray(m.to_internal(x))
+            d = z - z0
+            maha = np.einsum("ni,ij,nj->n", d, np.linalg.inv(cov), d)
+            self.assertAlmostEqual(float(np.mean(maha)), 9.0, delta=0.4)
+            for q in (0.25, 0.5, 0.75):
+                frac = float(np.mean(maha < chi2.ppf(q, 9)))
+                self.assertAlmostEqual(frac, q, delta=0.02)
 
 
 if __name__ == "__main__":

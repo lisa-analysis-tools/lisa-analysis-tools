@@ -53,6 +53,25 @@ Metropolis-Hastings factors require. Key design points:
   are proposed at their STORED widths -- conservative, wider = safer for MH;
   NO Fisher ``T``-rescale. Only the f0 candidate windows are re-derived
   against the NEW run's ``df = 1/new_tobs``.
+* **Two component formats** (2026-09-18). ``meta["basis"]`` selects:
+
+  - ``"sampling"`` (or NO ``basis`` key at all -- the shipped
+    ``gf_prod_3mo_v8_10w_refereed.npz``): ``means``/``covs`` are one
+    Gaussian per cluster in the 9 columns above. Unchanged in every respect.
+  - ``"observable"``: the packed ``gmm_*`` arrays hold a Gaussian MIXTURE
+    per cluster in the OBSERVABLE columns
+    ``(lnA, f_mid [Hz], fdot, phi0, cos_iota, psi, alpha, sin_delta, Mc)``.
+    ``rvs`` draws there and returns ``from_internal(z)`` -- sampling
+    columns, as every caller expects -- and ``logpdf`` scores
+    ``mixture_logpdf(to_internal(x)) - log_jacobian(x)``.
+
+  **The Jacobian SUBTRACTS.** ``log_jacobian`` is ``ln|dy/dz|`` and a
+  density transforms with the determinant of the inverse map,
+  ``q_y = q_z |dz/dy|``. The sign lives in
+  :func:`.basis.log_density_to_sampling` so there is one place to get it
+  right; flipped, ``rvs`` and ``logpdf`` disagree by ``2 log_jacobian``,
+  which varies across a component and therefore biases the RJ birth/death
+  factors rather than cancelling as a constant would.
 
 Pickle/deepcopy safe (sprint rule): master tables are numpy; the cupy
 device cache is dropped on ``__getstate__``.
@@ -644,6 +663,13 @@ class WarmStartComponents:
                         draws[:, c] = np.clip(draws[:, c], blo, bhi)
             for c, period in CIRCULAR_COLS.items():
                 draws[:, c] %= period
+            if self.basis == "observable":
+                # back to the SAMPLING columns every caller expects. The
+                # circular columns pass through the map untouched (indices
+                # 3/5/6 are identical in both bases), so wrapping them
+                # above is equivalent to wrapping them after.
+                draws = np.asarray(self.obs_map.from_internal(draws),
+                                   dtype=np.float64)
             out[~is_floor] = draws
 
         out = out.reshape(size + (self.ndim,))
@@ -656,6 +682,39 @@ class WarmStartComponents:
         Computed over the f0-windowed candidate set (search structure; equal
         to the full mixture to machine precision -- module docstring bound).
         Dispatches on the INPUT's array module; never returns NaN.
+        """
+        from ...utils.utility import get_array_module
+
+        xp = get_array_module(x)
+        x = xp.atleast_2d(xp.asarray(x, dtype=xp.float64))
+
+        if self.basis == "observable":
+            if self.obs_map is None:
+                raise RuntimeError(
+                    "observable components have no map; call "
+                    "attach_transform() with the run's GB transform.")
+            from . import basis as _wb
+
+            z = self.obs_map.to_internal(x)
+            # ln q_y(y) = ln q_z(z(y)) - ln|dy/dz|  -- see
+            # basis.log_density_to_sampling for why it subtracts.
+            lp_mix = _wb.log_density_to_sampling(
+                self._mixture_logpdf(z), x, self.obs_map)
+            lp_mix = xp.asarray(lp_mix)
+        else:
+            lp_mix = self._mixture_logpdf(x)
+
+        if self.floor_eps <= 0:
+            return lp_mix
+        return self._add_uniform_floor(lp_mix, x, xp)
+
+    # ------------------------------------------------------------------
+    def _mixture_logpdf(self, x):
+        """Windowed Gaussian-mixture log density in the FITTED basis.
+
+        ``x`` is in whatever coordinates ``means``/``covs`` live in: the
+        sampling columns for a legacy set, the observable ones for a
+        mixture set. The caller owns the change of variables.
         """
         from ...utils.utility import get_array_module
 
@@ -710,12 +769,18 @@ class WarmStartComponents:
         for c, (blo, bhi) in self.bounded_cols.items():
             lp_mix = xp.where((x[:, c] >= blo) & (x[:, c] <= bhi),
                               lp_mix, -xp.inf)
+        return lp_mix
 
-        if self.floor_eps <= 0:
-            return lp_mix
+    # ------------------------------------------------------------------
+    def _add_uniform_floor(self, lp_mix, x, xp):
+        """``(1 - eps) * mixture + eps * Uniform(box)``.
 
-        # (1 - eps) * mixture + eps * Uniform(box); the box test wraps the
-        # circular columns first (leaves arrive wrapped, but be safe).
+        ``x`` and ``floor_box`` are both in the SAMPLING basis, which is
+        where the mixture density has been transported to by the time this
+        runs -- so the floor means the same thing in both formats.
+        """
+        # the box test wraps the circular columns first (leaves arrive
+        # wrapped, but be safe).
         xb = x.copy()
         for c, period in CIRCULAR_COLS.items():
             xb[:, c] = xb[:, c] % period
