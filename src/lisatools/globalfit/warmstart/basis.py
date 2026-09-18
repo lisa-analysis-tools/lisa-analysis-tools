@@ -143,7 +143,29 @@ def log_density_to_sampling(log_q_z, x_sampling, obs_map, leaf_inds=None):
     Getting it backwards leaves ``rvs`` and ``logpdf`` inconsistent by
     ``2 * log_jacobian``, which varies across a component and so biases the
     RJ birth/death factors rather than cancelling as a constant would.
+
+    DISPATCHES ON THE INPUTS (2026-09-18). This used to force both terms
+    through ``np.asarray``, which raises ``TypeError: Implicit conversion
+    to a NumPy array is not allowed`` the moment either side is a cupy
+    array -- and on the production path both are: ``BandSorter`` scores
+    ``rj_prop.logpdf`` on device-resident band coordinates, and
+    ``log_jacobian`` is itself ``xp``-generic, so it hands back cupy. The
+    laptop tests never saw it because there is no cupy there.
     """
-    return (np.asarray(log_q_z, dtype=float)
-            - np.asarray(obs_map.log_jacobian(x_sampling, leaf_inds),
-                         dtype=float))
+    from ...utils.utility import get_array_module
+
+    # cupy wins if EITHER side is on device: a host->device promotion is
+    # free, the reverse is the exception above. get_array_module RAISES on
+    # a list/scalar, which is a legitimate input here -- those are host.
+    xp = np
+    for a in (log_q_z, x_sampling):
+        try:
+            mod = get_array_module(a)
+        except ValueError:
+            continue
+        if mod is not np:
+            xp = mod
+            break
+    return (xp.asarray(log_q_z, dtype=xp.float64)
+            - xp.asarray(obs_map.log_jacobian(x_sampling, leaf_inds),
+                         dtype=xp.float64))
