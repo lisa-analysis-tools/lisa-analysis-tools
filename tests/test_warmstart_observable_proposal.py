@@ -213,5 +213,123 @@ class ObservableDrawTest(unittest.TestCase):
                 self.assertAlmostEqual(frac, q, delta=0.02)
 
 
+class MergeScopeTest(unittest.TestCase):
+    def test_merge_candidate_pairs_never_cross_within_a_cluster(self):
+        from lisatools.globalfit.warmstart.referee_apply import (
+            merge_candidate_pairs)
+        # three clusters: 2, 1 and 3 components -> flat indices
+        ncomp = np.array([2, 1, 3])
+        pairs = merge_candidate_pairs(ncomp, island_id=np.array([0, 0, 0]))
+        # (0,1) and (3,4),(3,5),(4,5) are WITHIN clusters and must be absent
+        for bad in [(0, 1), (3, 4), (3, 5), (4, 5)]:
+            self.assertNotIn(bad, pairs)
+        # across-cluster pairs in the same island survive
+        self.assertIn((0, 2), pairs)
+        self.assertIn((2, 3), pairs)
+
+    def test_single_component_clusters_behave_as_before(self):
+        from lisatools.globalfit.warmstart.referee_apply import (
+            merge_candidate_pairs)
+        ncomp = np.array([1, 1, 1])
+        pairs = merge_candidate_pairs(ncomp, island_id=np.array([0, 0, 1]))
+        self.assertIn((0, 1), pairs)      # same island
+        self.assertNotIn((0, 2), pairs)   # different island
+
+    def test_filtering_an_existing_pair_list_is_the_same_rule(self):
+        """Production filters the referee's OWN pairs -- O(pairs), not the
+        O(n^2) enumeration, which at 5573 components is 15M iterations."""
+        from lisatools.globalfit.warmstart.referee_apply import (
+            merge_candidate_pairs)
+        ncomp = np.array([2, 1, 3])
+        isl = np.array([0, 0, 0])
+        proposed = [(0, 1), (0, 2), (3, 4), (2, 3), (1, 5)]
+        kept = merge_candidate_pairs(ncomp, isl, pairs=proposed)
+        self.assertEqual(kept, [(0, 2), (2, 3), (1, 5)])
+
+
+class RefereeApplyObservableTest(unittest.TestCase):
+    """Mixture siblings must survive the auto-merge that legacy pairs get."""
+
+    def _fit_and_referee(self, tmp, ncomp, cross):
+        from lisatools.sampling.fstat_proposal import pack_gmm_components
+
+        n = int(np.sum(ncomp))
+        m = wb.build_map(_Container(), Tobs=7.776e6)
+        z0 = np.asarray(m.to_internal(X0))[0]
+        means = np.repeat(z0[None], n, axis=0)
+        means[:, 1] += np.arange(n) * 1e-9        # distinct f_mid
+        cov = np.diag(np.maximum(np.abs(z0) * 1e-5, 1e-30) ** 2)
+        splits = np.cumsum(ncomp)[:-1]
+        comps = [
+            [np.full(k, 1.0 / k) for k in ncomp],
+            np.split(means, splits, axis=0),
+            np.split(np.repeat(cov[None], n, axis=0), splits, axis=0),
+            np.split(np.repeat(np.linalg.inv(cov)[None], n, axis=0), splits,
+                     axis=0),
+            np.split(np.full(n, np.linalg.det(cov)), splits),
+            [z0 - 10.0 for _ in ncomp], [z0 + 10.0 for _ in ncomp],
+        ]
+        fit = os.path.join(tmp, "fit.npz")
+        np.savez(fit, p=np.full(len(ncomp), 0.9),
+                 mult=np.ones(len(ncomp)),
+                 n_members=np.full(len(ncomp), 90),
+                 island_id=np.zeros(len(ncomp), dtype=int),
+                 f0_window_edges=np.array([[2.0e-2, 2.1e-2]]),
+                 meta=json.dumps({
+                     "tobs": 7.776e6, "basis": "observable", "f0_units": "Hz",
+                     "column_names": wb.OBSERVABLE_COLUMN_NAMES,
+                     "map_params": wb.map_params_from_map(m)}),
+                 **pack_gmm_components(comps))
+        ref = os.path.join(tmp, "ref.npz")
+        pairs = np.array([[i, j] for i in range(n) for j in range(i + 1, n)])
+        np.savez(ref, pairs=pairs,
+                 cross_match=np.full(len(pairs), cross),
+                 med_ratio=np.full(n, 0.9), med_match=np.full(n, 0.9))
+        return fit, ref
+
+    def test_mixture_siblings_are_not_merged_back_together(self):
+        from lisatools.globalfit.warmstart.referee_apply import apply
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # ONE cluster of 3 components, all cross-matching at 0.99
+            fit, ref = self._fit_and_referee(tmp, np.array([3]), 0.99)
+            out = os.path.join(tmp, "refereed.npz")
+            apply(fit, ref, out)
+            with np.load(out, allow_pickle=False) as d:
+                self.assertEqual(int(np.sum(d["gmm_ncomp"])), 3)
+                self.assertEqual(len(d["gmm_means"]), 3)
+
+    def test_across_cluster_pairs_still_merge(self):
+        """Three split artifacts become ONE cluster -- but they stay three
+        mixture components of it rather than being moment-matched into one
+        Gaussian, which would put the merged mass between the lobes."""
+        from lisatools.globalfit.warmstart.referee_apply import apply
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # THREE single-component clusters, all cross-matching at 0.99
+            fit, ref = self._fit_and_referee(tmp, np.array([1, 1, 1]), 0.99)
+            out = os.path.join(tmp, "refereed.npz")
+            apply(fit, ref, out)
+            with np.load(out, allow_pickle=False) as d:
+                self.assertEqual(len(d["p"]), 1)             # one cluster
+                np.testing.assert_array_equal(d["gmm_ncomp"], [3])
+                self.assertEqual(len(d["gmm_means"]), 3)
+                self.assertAlmostEqual(float(d["gmm_weights"].sum()), 1.0)
+                self.assertAlmostEqual(float(d["p"][0]), 1.0)  # min(1, 2.7)
+
+    def test_a_merged_observable_set_still_loads_as_a_proposal(self):
+        from lisatools.globalfit.warmstart.referee_apply import apply
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fit, ref = self._fit_and_referee(tmp, np.array([2, 2]), 0.99)
+            out = os.path.join(tmp, "refereed.npz")
+            apply(fit, ref, out)
+            c = WarmStartComponents.from_npz(out, new_tobs=1.5552e7)
+            c.attach_transform(_Container())
+            x = c.rvs(64)
+            self.assertEqual(x.shape, (64, 9))
+            self.assertTrue(np.all(np.isfinite(c.logpdf(x))))
+
+
 if __name__ == "__main__":
     unittest.main()

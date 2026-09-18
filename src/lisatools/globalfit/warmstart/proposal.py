@@ -97,20 +97,6 @@ COLUMN_NAMES = [
 ]
 CIRCULAR_COLS = {3: 2.0 * np.pi, 5: np.pi, 6: 2.0 * np.pi}
 
-
-class _BasisContainer:
-    """Stand-in transform container carrying just ``input_basis``.
-
-    ``GBObservableFiberBasis`` pins nothing per leaf for GB, so this is all
-    it reads. The npz's own ``map_params["input_basis"]`` supplies it, which
-    lets :meth:`WarmStartComponents.from_npz` build the map eagerly instead
-    of leaving the object unusable until someone remembers to call
-    :meth:`~WarmStartComponents.attach_transform`.
-    """
-
-    def __init__(self, input_basis):
-        self.input_basis = list(input_basis)
-
 #: default logpdf candidate window, in units of df = 1/Tobs (mHz)
 DEFAULT_F0_WINDOW_DF = 10.0
 #: per-component sigma guard added to the candidate window half-width; the
@@ -193,9 +179,10 @@ class WarmStartComponents:
                     "GBObservableFiberBasis.")
             from . import basis as _wb
 
-            self.obs_map = _wb.build_map_from_params(
-                _BasisContainer(self._map_params["input_basis"]),
-                self._map_params)
+            # eager: the stored params carry their own input_basis, so the
+            # object is usable straight from from_npz rather than waiting
+            # for someone to remember attach_transform().
+            self.obs_map = _wb.build_map_from_stored_params(self._map_params)
         means = np.array(means, dtype=np.float64, copy=True)
         covs = np.array(covs, dtype=np.float64, copy=True)
         p = np.asarray(p, dtype=np.float64).ravel()

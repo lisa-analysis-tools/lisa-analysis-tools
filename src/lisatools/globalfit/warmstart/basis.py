@@ -84,6 +84,50 @@ def build_map_from_params(transform_container, params: dict):
     )
 
 
+class BasisContainer:
+    """Stand-in transform container carrying just ``input_basis``.
+
+    ``GBObservableFiberBasis`` pins nothing per leaf for GB, so this is the
+    only attribute it reads. Stored ``map_params`` carry their own
+    ``input_basis``, which makes :func:`build_map_from_stored_params`
+    possible without a live run object.
+    """
+
+    def __init__(self, input_basis):
+        self.input_basis = list(input_basis)
+
+
+def build_map_from_stored_params(params: dict):
+    """Rebuild the map from stored ``map_params`` alone.
+
+    The params carry the sampling basis they were written against, so no
+    run object is needed. Pass a REAL container to
+    :func:`build_map_from_params` instead when one is available -- that
+    additionally checks the run's basis against the file's.
+    """
+    return build_map_from_params(BasisContainer(params["input_basis"]),
+                                 params)
+
+
+def component_means_sampling(d, meta: dict, transform_container=None):
+    """Component means in the SAMPLING basis, whichever format ``d`` is.
+
+    ``d`` is an open npz mapping. Returns ``(means_sampling, obs_map)``;
+    ``obs_map`` is ``None`` for a legacy set. This is the seam the referee
+    and the SNR gate use: both build real waveforms, which need astro
+    columns whatever basis the fit ran in.
+    """
+    import numpy as _np
+
+    if str(meta.get("basis", "sampling")) != "observable":
+        return _np.asarray(d["means"], dtype=float), None
+    params = meta["map_params"]
+    m = (build_map_from_stored_params(params) if transform_container is None
+         else build_map_from_params(transform_container, params))
+    z = _np.asarray(d["gmm_means"], dtype=float)
+    return _np.asarray(m.from_internal(z), dtype=float), m
+
+
 def log_density_to_sampling(log_q_z, x_sampling, obs_map, leaf_inds=None):
     """Transport an observable-basis log density to the sampling basis.
 
