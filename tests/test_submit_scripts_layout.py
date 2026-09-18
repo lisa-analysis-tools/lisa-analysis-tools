@@ -399,6 +399,14 @@ class SubmitScriptsInJobBlockTest(unittest.TestCase):
                     "FI_PROVIDER=tcp",
                     text,
                 )
+                # ... and the knob that makes `-ppn 1` bind at all (2026-09-18):
+                # with the SLURM bootstrap hydra otherwise honours the
+                # scheduler's per-node task counts, so 5 tasks over 2 nodes
+                # land 3/2 (block) instead of A,B,A,B,A (cyclic) and
+                # build_layout refuses -- 3 compute ranks on a 2-GPU node.
+                self.assertIn(
+                    "export I_MPI_JOB_RESPECT_PROCESS_PLACEMENT=0", text,
+                )
                 self.assertNotIn('srun --ntasks="${SLURM_NTASKS', text)
 
 
