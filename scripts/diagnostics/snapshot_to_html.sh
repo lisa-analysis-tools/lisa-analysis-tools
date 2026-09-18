@@ -23,16 +23,18 @@
 #    an older-format store survives beside the live one, plus there may be an
 #    ~800-byte stub. The live one is picked by size and its iteration attr,
 #    and the choice is printed.
-#  * One python process at a time on the laptop (8 GB): both heavy steps sit
-#    behind the `pgrep -x` interlock. NEVER `pgrep -f` with an interpreter
-#    path -- it self-matches this script's own waiting shell and deadlocks.
+#  * Concurrent interpreters have hard-crashed the 8 GB laptop. INTERLOCK=1
+#    serialises the two heavy steps against any other python; it is OFF by
+#    default for interactive use and should be set by UNATTENDED callers.
 #
 # Env overrides: ITERATION (row to build truth at), FLO/FHI (band, Hz),
 # CATALOGUE (the GB catalogue hdf5, or the directory holding it -- the
 # mojito brick cache lives somewhere different on every machine, so this is
 # the knob to set when build_truth cannot find it; MOJITO_CAT and
 # MOJITO_CACHE_DIR are honoured too and need no passthrough),
-# PY (interpreter), SKIP_TRUTH=1 (reuse whatever truth npz is present).
+# PY (interpreter), SKIP_TRUTH=1 (reuse whatever truth npz is present),
+# INTERLOCK=1 (wait for any other python to exit before each heavy step;
+# default off -- see the note above).
 set -euo pipefail
 
 TAR=${1:?usage: snapshot_to_html.sh <snapshot.tar.gz> [OUT.html] [WORKDIR]}
@@ -44,9 +46,20 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1
 
-interlock() {  # one interpreter machine-wide; -x ONLY, never -f
+# INTERLOCK=1 serialises against any other python on the machine. DEFAULT
+# OFF, because a person running this from a terminal already knows what
+# else is running and should not be made to wait on their own editor's
+# language server. It exists for UNATTENDED callers -- an agent or a batch
+# script that cannot see the rest of the machine -- where two concurrent
+# interpreters on an 8 GB laptop have hard-crashed the box.
+#
+# -x ONLY, never -f: `pgrep -f <interpreter path>` matches this script's
+# own waiting shell (the path appears in its command line) and deadlocks
+# forever. That has happened twice in production.
+interlock() {
+  [ "${INTERLOCK:-0}" = "1" ] || return 0
   while pgrep -x python >/dev/null || pgrep -x python3.12 >/dev/null; do
-    echo "[snap2html] another python is running, waiting..." >&2
+    echo "[snap2html] INTERLOCK=1 and another python is running, waiting..." >&2
     sleep 20
   done
 }
