@@ -1148,6 +1148,30 @@ export GB_TEMPER_COMPACT_ROWS=1
 # while a round improves by > tol, stop at the first flat one.
 export GB_SEARCH_NOISE_CHECKS=1
 export GB_SEARCH_NOISE_ITERS_PER_STEP=0
+# PLATEAU TOLERANCE 5 -> 20 lnL (user ruling 2026-09-18). MAXLOGL_TOL is what
+# counts as "this round improved"; JointMaxLogLSearch keeps taking rounds while
+# a round beats it and stops at the first flat one.
+#
+# Measured on the 6-month 4-GPU run: the rider took ~11.5 rounds per gb_search
+# iteration and ran INTO its 10-round ceiling (GB_SEARCH_NOISE_ITERS_PER_STEP=0
+# resolves to MAXLOGL_ITERS_PER_STEP, default 10), costing 101.4 s of a 320 s
+# steady-state iteration -- 32%, the single largest line item. The [MAXLOGL]
+# trace says where that goes: ROUND 1 carries the real re-tracking (IMPROVED
+# jumps of hundreds of lnL), rounds 2+ add ~5 lnL each -- exactly AT the old
+# tol, so the plateau rule could never fire and the loop ground to the cap
+# chasing the tol-level wobble of an ensemble already near the mode.
+#
+# 20 keeps round 1 whenever the GB residual genuinely moved and cuts the
+# wobble. Against a cold logL of ~1.04e8 gaining ~2e4 per iteration, a 20 lnL
+# floor is far below anything that matters.
+#
+# SCOPE, deliberately noted: MAXLOGL_TOL is GLOBAL to JointMaxLogLSearch, so it
+# also loosens the standalone noise_search / noise_vgb_search stages, which
+# will now declare plateau sooner. Those stages only need the noise roughly
+# converged before the next stage samples it in PE mode (see the tol default's
+# own comment), so this is judged acceptable -- but if the searches come out
+# under-converged, the rider needs its own tol knob rather than reverting this.
+export MAXLOGL_TOL=20
 # PE-only exclusive RJ draw (b9aae51f).
 export GB_PE_RJ_DRAW_ONE=1
 export GB_PE_RJ_FSTAT_FRACTION=0.8
