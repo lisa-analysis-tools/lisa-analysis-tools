@@ -739,7 +739,8 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
         split_fn=split_single_linkage, seed: int = 7,
         max_iter: int | None = None, resplit_mult: float = 2.0,
         ratio_max: float = 5.0, basis: str = "sampling",
-        transform_container=None):
+        transform_container=None, gmm_samples: int = 4096,
+        gmm_max_comp: int = 12, gmm_min_members: int = 25):
     """Fit a finished run's cold-chain leaf table into birth components.
 
     ``basis`` selects the coordinates the WHOLE fit runs in:
@@ -756,6 +757,9 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
 
     ``transform_container`` supplies the sampling basis the map indexes
     against; ``None`` uses this module's own :data:`COLUMN_NAMES`.
+
+    ``gmm_*`` configure the observable path's per-cluster mixture (see
+    :func:`fit_cluster_gmms`); they are ignored on the sampling path.
     """
     if basis not in ("observable", "sampling"):
         raise ValueError(
@@ -805,6 +809,11 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
     in_island = np.zeros(len(X), dtype=bool)
 
     means, covs, ps, mults, ns, isl_id = [], [], [], [], [], []
+    # observable path: the member block of each cluster, fitted as a
+    # MIXTURE in one batched call after the loop (the fitter is
+    # GPU-batched across groups, so per-cluster calls would waste it).
+    comp_rows: list = []
+    sort_f: list = []
     t0 = time.perf_counter()
     t_split_total = 0.0
     for isl, (b0, b1) in enumerate(islands):
@@ -833,9 +842,14 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
                     stats["dropped_fragment_rows"] += nr
                     continue
                 ids = np.unique(sr)
-                mean, cov = fit_component(xr, stats)
-                means.append(mean)
-                covs.append(cov)
+                if basis == "observable":
+                    comp_rows.append(xr)
+                    sort_f.append(float(np.mean(xr[:, 1])))
+                else:
+                    mean, cov = fit_component(xr, stats)
+                    means.append(mean)
+                    covs.append(cov)
+                    sort_f.append(float(mean[1]))
                 ps.append(len(ids) / n_samples)
                 mults.append(nr / len(ids))
                 ns.append(nr)
@@ -844,8 +858,6 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
     walls["components"] = time.perf_counter() - t0 - t_split_total
     stats["orphan_rows"] = int((~in_island).sum())
 
-    means = np.array(means)
-    covs = np.array(covs)
     ps = np.array(ps)
     mults = np.array(mults)
     ns = np.array(ns, dtype=np.int64)
@@ -853,10 +865,27 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
     f0_window_edges = np.array(
         [[f_lo + b0 * df_seg, f_lo + b1 * df_seg] for b0, b1 in islands])
 
-    order = np.argsort(means[:, 1])
-    means, covs, ps, mults, ns, isl_id = (
-        means[order], covs[order], ps[order], mults[order], ns[order],
-        isl_id[order])
+    # components are stored in ascending column-1 order in BOTH bases
+    # (f0 [mHz] / f_mid [Hz]); the clusters are ordered BEFORE the mixture
+    # fit so gmm_ncomp partitions the flat arrays in the same order.
+    order = np.argsort(np.array(sort_f))
+    ps, mults, ns, isl_id = ps[order], mults[order], ns[order], isl_id[order]
+    if basis == "observable":
+        comp_rows = [comp_rows[i] for i in order]
+        t0g = time.perf_counter()
+        gmm_comps = fit_cluster_gmms(
+            comp_rows, n_samples=int(gmm_samples),
+            max_comp=int(gmm_max_comp), min_members=int(gmm_min_members),
+            seed=seed)
+        walls["gmm"] = time.perf_counter() - t0g
+        n_per = [len(w) for w in gmm_comps[0]]
+        print(f"stage 3: {len(comp_rows)} clusters -> {int(sum(n_per))} "
+              f"mixture components (K per cluster: min {min(n_per)}, "
+              f"median {int(np.median(n_per))}, max {max(n_per)}) "
+              f"[{walls['gmm']:.1f} s]")
+    else:
+        means = np.array(means)[order]
+        covs = np.array(covs)[order]
 
     try:
         # provenance: the LAT repo this module runs from (editable src
@@ -886,17 +915,42 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
         **info, **{k: v for k, v in stats.items() if k != "df_mhz"},
         walls={k: round(v, 3) for k, v in walls.items()},
     )
+    per_cluster = dict(p=ps, mult=mults, n_members=ns, island_id=isl_id,
+                       f0_window_edges=f0_window_edges)
+    if basis == "observable":
+        from lisatools.sampling.fstat_proposal import pack_gmm_components
+
+        from . import basis as wb
+
+        packed = pack_gmm_components(gmm_comps)
+        meta["basis"] = "observable"
+        meta["column_names"] = wb.OBSERVABLE_COLUMN_NAMES
+        meta["f0_units"] = "Hz"          # column 1 is f_mid [Hz] now
+        meta["bounded_cols"] = {str(k): list(v) for k, v in
+                                OBSERVABLE_BOUNDED_COLS.items()}
+        meta["map_params"] = wb.map_params_from_map(obs_map)
+        meta["feat_names"] = OBSERVABLE_FEAT_NAMES
+        meta["gmm"] = dict(
+            n_samples=int(gmm_samples), max_comp=int(gmm_max_comp),
+            min_members=int(gmm_min_members),
+            n_components=int(sum(len(w) for w in gmm_comps[0])),
+            # the packed means/covs are UNSCALED to physical coordinates
+            # (see _unscale_gmm_components); FullGaussianMixtureModel
+            # applies the mins/maxs affine itself and must not be fed these.
+            components_basis="physical",
+        )
+        payload = dict(per_cluster, **packed)
+    else:
+        payload = dict(per_cluster, means=means, covs=covs)
     t0 = time.perf_counter()
-    np.savez_compressed(
-        out, means=means, covs=covs, p=ps, mult=mults, n_members=ns,
-        island_id=isl_id, f0_window_edges=f0_window_edges,
-        meta=json.dumps(meta))
+    np.savez_compressed(out, meta=json.dumps(meta), **payload)
     walls["write"] = time.perf_counter() - t0
 
     total_rows = len(X)
+    n_clusters = len(ps)
     print(f"stage 2: split {walls['split']:.1f} s | stage 3: components "
           f"{walls['components']:.1f} s | write {walls['write']:.2f} s")
-    print(f"components: {len(means)} | junk rows "
+    print(f"components: {n_clusters} | junk rows "
           f"{stats['junk_rows']:,} ({stats['junk_rows']/total_rows:.2%}) | "
           f"orphan rows (outside islands) {stats['orphan_rows']:,} "
           f"({stats['orphan_rows']/total_rows:.2%}) | dropped fragments "
@@ -935,6 +989,16 @@ def main(argv=None):
     ap.add_argument("--ratio-max", type=float, default=5.0,
                     help="fdot_astro_ratio prior half-width (the col-8 "
                          "truncation box; GBSettings.fdot_astro_ratio_max)")
+    ap.add_argument("--gmm-samples", type=int, default=4096,
+                    help="observable basis: members resampled per cluster "
+                         "to rectangularise the batched GMM fit")
+    ap.add_argument("--gmm-max-comp", type=int, default=12,
+                    help="observable basis: max mixture components per "
+                         "cluster")
+    ap.add_argument("--gmm-min-members", type=int, default=25,
+                    help="observable basis: members required per allowed "
+                         "mixture component (the ACTUAL selector -- see "
+                         "fit_cluster_gmms)")
     ap.add_argument("--basis", default="observable",
                     choices=("observable", "sampling"),
                     help="coordinates the WHOLE fit runs in (default "
@@ -945,7 +1009,9 @@ def main(argv=None):
     args = ap.parse_args(argv)
     run(args.store, args.last_k, args.tobs, args.out, seed=args.seed,
         max_iter=args.max_iter, resplit_mult=args.resplit_mult,
-        ratio_max=args.ratio_max, basis=args.basis)
+        ratio_max=args.ratio_max, basis=args.basis,
+        gmm_samples=args.gmm_samples, gmm_max_comp=args.gmm_max_comp,
+        gmm_min_members=args.gmm_min_members)
 
 
 if __name__ == "__main__":

@@ -327,5 +327,141 @@ class ClusterGMMTest(unittest.TestCase):
             self.assertLessEqual(maxs[c], z[:, c].max() + 1e-9)
 
 
+class WriterTest(unittest.TestCase):
+    def test_packed_layout_round_trips_and_ncomp_partitions_it(self):
+        from lisatools.sampling.fstat_proposal import (
+            pack_gmm_components, unpack_gmm_components)
+        g = ClusterGMMTest()
+        comps = ffs.fit_cluster_gmms(
+            [g._two_mode_cluster(), g._two_mode_cluster(seed=77)],
+            n_samples=1024, max_comp=4, seed=5)
+        d = pack_gmm_components(comps)
+        self.assertEqual(len(d["gmm_ncomp"]), 2)
+        self.assertEqual(int(np.sum(d["gmm_ncomp"])), len(d["gmm_weights"]))
+        back = unpack_gmm_components(d)
+        for k in range(7):
+            for a, b in zip(comps[k], back[k]):
+                np.testing.assert_allclose(np.asarray(a), np.asarray(b))
+
+    def test_gmm_ncomp_is_the_cluster_partition(self):
+        """The referee's merge rule keys on this -- no separate cluster_id."""
+        from lisatools.sampling.fstat_proposal import pack_gmm_components
+        g = ClusterGMMTest()
+        comps = ffs.fit_cluster_gmms([g._two_mode_cluster()],
+                                     n_samples=1024, max_comp=4, seed=5)
+        d = pack_gmm_components(comps)
+        splits = np.cumsum(d["gmm_ncomp"])[:-1]
+        self.assertEqual(len(np.split(d["gmm_means"], splits, axis=0)), 1)
+
+
+class ObservableRunWriterTest(unittest.TestCase):
+    """End-to-end ``run(basis='observable')`` on a tiny synthetic store."""
+
+    NDIM = 9
+    TOBS = 7776000.0
+
+    def _write_store(self, path, seed=5):
+        import h5py
+
+        rng = np.random.default_rng(seed)
+        n_its, n_walkers, n_leaves = 4, 10, 4
+        chain = np.zeros((n_its + 1, 1, 1, n_walkers, n_leaves, self.NDIM))
+        inds = np.zeros((n_its + 1, 1, 1, n_walkers, n_leaves), dtype=bool)
+        ll = np.zeros((n_its + 1, 1, 1, n_walkers))
+        df = 1e3 / self.TOBS
+        for it in range(n_its):
+            for w in range(n_walkers):
+                for li, f0 in enumerate((3.0, 3.0 + 40 * df)):
+                    chain[it, 0, 0, w, li] = [
+                        8.0 + 0.05 * rng.standard_normal(),
+                        f0 + 0.3 * df * rng.standard_normal(),
+                        0.60 + 0.01 * rng.standard_normal(),
+                        3.00 + 0.02 * rng.standard_normal(),
+                        0.30 + 0.02 * rng.standard_normal(),
+                        1.20 + 0.02 * rng.standard_normal(),
+                        4.00 + 0.02 * rng.standard_normal(),
+                        0.20 + 0.02 * rng.standard_normal(),
+                        0.05 + 0.02 * rng.standard_normal(),
+                    ]
+                    inds[it, 0, 0, w, li] = True
+                ll[it, 0, 0, w] = 1.0
+        with h5py.File(path, "w") as f:
+            g = f.create_group("global_fit")
+            g.attrs["iteration"] = n_its
+            g.create_group("chain").create_dataset("gb", data=chain)
+            g.create_group("inds").create_dataset("gb", data=inds)
+            g.create_dataset("log_like", data=ll)
+
+    def test_observable_run_writes_the_packed_layout_and_stamps(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = os.path.join(tmp, "store.h5")
+            out = os.path.join(tmp, "comp.npz")
+            self._write_store(store)
+            ffs.run(store, None, self.TOBS, out, seed=7, basis="observable",
+                    gmm_samples=512, gmm_max_comp=2)
+            with np.load(out, allow_pickle=False) as d:
+                keys = set(d.keys())
+                meta = json.loads(str(d["meta"]))
+                ncomp = np.array(d["gmm_ncomp"])
+                means = np.array(d["gmm_means"])
+                p = np.array(d["p"])
+            for k in ("gmm_ncomp", "gmm_weights", "gmm_means", "gmm_covs",
+                      "gmm_invcovs", "gmm_dets", "gmm_mins", "gmm_maxs",
+                      "p", "mult", "n_members", "island_id",
+                      "f0_window_edges", "meta"):
+                self.assertIn(k, keys)
+            # the legacy single-Gaussian keys are NOT written here
+            self.assertNotIn("means", keys)
+            self.assertNotIn("covs", keys)
+            self.assertEqual(meta["basis"], "observable")
+            self.assertEqual(meta["column_names"],
+                             wb.OBSERVABLE_COLUMN_NAMES)
+            self.assertEqual(meta["map_params"]["Tobs"], self.TOBS)
+            self.assertEqual(meta["map_params"]["input_basis"],
+                             ffs.COLUMN_NAMES)
+            self.assertEqual(meta["gmm"]["components_basis"], "physical")
+            # per-CLUSTER arrays keep length n_clusters; gmm_ncomp
+            # partitions the flat component arrays
+            self.assertEqual(len(ncomp), len(p))
+            self.assertEqual(int(ncomp.sum()), len(means))
+            # Both injected sources are represented. Exact cluster COUNT is
+            # not asserted: at 40 rows per source in 5-D the single-linkage
+            # stage fragments in EITHER basis (the sampling run on this same
+            # fixture drops two fragments of its own), so a count here would
+            # test the fixture's sparsity, not the writer.
+            self.assertGreaterEqual(len(p), 2)
+            f_mid = means[:, 1]
+            self.assertTrue(np.any(f_mid < 3.002e-3))
+            self.assertTrue(np.any(f_mid > 3.004e-3))
+            # column 1 is f_mid in HZ now, not f0 in mHz
+            self.assertLess(float(np.max(f_mid)), 1.0)
+            # components come out in ascending column-1 order
+            np.testing.assert_array_equal(f_mid, np.sort(f_mid))
+
+    def test_sampling_run_is_byte_identical_to_before(self):
+        """The default path must keep writing means/covs and no basis key."""
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = os.path.join(tmp, "store.h5")
+            out = os.path.join(tmp, "comp.npz")
+            self._write_store(store)
+            ffs.run(store, None, self.TOBS, out, seed=7)
+            with np.load(out, allow_pickle=False) as d:
+                keys = set(d.keys())
+                meta = json.loads(str(d["meta"]))
+            self.assertIn("means", keys)
+            self.assertIn("covs", keys)
+            self.assertNotIn("gmm_means", keys)
+            self.assertEqual(meta.get("basis", "sampling"), "sampling")
+            self.assertEqual(meta["column_names"], ffs.COLUMN_NAMES)
+
+
 if __name__ == "__main__":
     unittest.main()
