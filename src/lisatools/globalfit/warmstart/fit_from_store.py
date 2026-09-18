@@ -65,6 +65,93 @@ RATIO_COL = 8
 # cluster-feature space: (f0 [mHz], Mc, ln dist, alpha, sin_delta)
 FEAT_NAMES = ["f0", "Mc", "ln_dist", "alpha", "sin_delta"]
 
+# --------------------------------------------------------------------------
+# OBSERVABLE basis (2026-09-18). The fit runs in the coordinates the DATA
+# constrains rather than the ones the sampler uses:
+#
+#   0 lnA, 1 f_mid [Hz], 2 fdot [Hz/s], 3 phi0, 4 cos_iota, 5 psi,
+#   6 alpha, 7 sin_delta, 8 Mc [Msol] (the fiber)
+#
+# Indices 3..7 are IDENTICAL in both bases, so CIRCULAR_COLS and
+# COS_IOTA_COL above are reused unchanged; only 0/1/2/8 change meaning.
+#
+# UNITS TRAP: the map returns f_mid and fdot in HZ, not mHz -- the sampling
+# basis stores f0 in mHz. Every frequency-scaled quantity downstream (the
+# segmentation bin width, the whitening scale floor, the proposal's f0
+# candidate window) must therefore be taken in the units of the basis being
+# worked in. ``basis_df`` is the single place that choice is made.
+#: Bounded columns in the OBSERVABLE basis. cos_iota keeps its physical
+#: [-1, 1]; the sampling basis's +/- ratio_max rail is GONE because `fdot`
+#: is a raw unbounded coordinate there -- that rail is what produced ratio
+#: sigmas with a p90 of 30 across the shipped component set. `Mc` (the
+#: fiber, col 8) is bounded below by 0, which the GMM's own per-group
+#: mins/maxs already carry, so it is not listed here.
+OBSERVABLE_BOUNDED_COLS = {COS_IOTA_COL: (-1.0, 1.0)}
+
+
+class _DefaultGBBasisContainer:
+    """Stand-in transform container for :func:`build_map`.
+
+    ``GBObservableFiberBasis`` pins nothing per leaf for GB, so it reads
+    exactly one attribute off the container: ``input_basis``. This module
+    already declares that basis as :data:`COLUMN_NAMES` (verified against
+    ``stock/erebor/gb.py``), so the CLI does not need to import and build a
+    real stock container -- which would also break this module's
+    "waveform-free, numpy/scipy/h5py only" contract.
+
+    An explicit container always wins and is checked against
+    :data:`COLUMN_NAMES`, so a genuinely different sampling basis fails
+    loudly instead of mis-indexing every column.
+    """
+
+    input_basis = COLUMN_NAMES
+
+
+def basis_df(tobs: float, basis: str) -> float:
+    """Frequency bin width ``1/Tobs`` in the units column 1 is stored in.
+
+    ``"sampling"`` -> mHz (the stored ``f0``); ``"observable"`` -> Hz (the
+    map's ``f_mid``). Passing the mHz width against Hz data would make the
+    segmentation bins 1000x too wide and collapse the whole band into a
+    few islands.
+    """
+    if basis == "observable":
+        return 1.0 / float(tobs)
+    return 1.0 / float(tobs) * 1e3
+
+
+def to_observable(x_all: np.ndarray, obs_map) -> np.ndarray:
+    """``(n, 9)`` sampling rows -> ``(n, 9)`` observable rows.
+
+    THE intake seam: after this call no stage of the pipeline sees sampling
+    columns until the referee, the SNR gate or the proposal converts back.
+    """
+    return np.asarray(obs_map.to_internal(np.asarray(x_all, dtype=float)),
+                      dtype=float)
+
+
+def build_observable_map(tobs: float, transform_container=None,
+                         shear: float = 0.5, fiber_coord: str = "Mc"):
+    """The intake map, built at the SOURCE run's ``1/df`` (cross-Tobs v1).
+
+    Lazily imported so the sampling-basis path keeps this module free of
+    any lisatools dependency.
+    """
+    from . import basis as wb
+
+    if transform_container is None:
+        transform_container = _DefaultGBBasisContainer()
+    else:
+        got = list(getattr(transform_container, "input_basis", []) or [])
+        if got != COLUMN_NAMES:
+            raise ValueError(
+                f"transform_container input_basis {got} != this fitter's "
+                f"{COLUMN_NAMES}; the leaf-table column meanings would not "
+                "match the map's.")
+    return wb.build_map(transform_container, Tobs=float(tobs),
+                        shear=float(shear), fiber_coord=str(fiber_coord))
+
+
 # Stage-1 valley split (2026-08-24 fix): at final leaf density (~900
 # leaves/walker) the confusion band is CONTINUOUSLY occupied above the
 # global count floor, so floor-only segmentation returned ONE island for
@@ -475,9 +562,33 @@ def resplit_blends(rows, sid, n_samples, mult_max, rng, df_mhz, stats,
 def run(store: str, last_k: int | None, tobs: float, out: str,
         split_fn=split_single_linkage, seed: int = 7,
         max_iter: int | None = None, resplit_mult: float = 2.0,
-        ratio_max: float = 5.0):
+        ratio_max: float = 5.0, basis: str = "sampling",
+        transform_container=None):
+    """Fit a finished run's cold-chain leaf table into birth components.
+
+    ``basis`` selects the coordinates the WHOLE fit runs in:
+
+    * ``"sampling"`` (default here) -- the historical astro basis, one
+      Gaussian per cluster, ``means``/``covs`` in the npz. Kept as the
+      library default so every existing caller and stored file is
+      bit-identical.
+    * ``"observable"`` -- the leaf table is mapped through
+      ``GBObservableFiberBasis.to_internal`` at intake and every stage
+      after works there; clusters are fitted as Gaussian MIXTURES and
+      written in the packed ``gmm_*`` layout. This is the CLI default
+      (``--basis``), so a rerun of the pipeline produces an observable set.
+
+    ``transform_container`` supplies the sampling basis the map indexes
+    against; ``None`` uses this module's own :data:`COLUMN_NAMES`.
+    """
+    if basis not in ("observable", "sampling"):
+        raise ValueError(
+            f"basis must be 'observable' or 'sampling', got {basis!r}")
     rng = np.random.default_rng(seed)
     df_mhz = 1.0 / tobs * 1e3          # 1/Tobs in mHz (stored f0 is mHz)
+    # the SAME 1/Tobs, in the units column 1 carries in the working basis
+    # (mHz for sampling f0, Hz for observable f_mid) -- see basis_df.
+    df_seg = basis_df(tobs, basis)
     walls = {}
 
     t0 = time.perf_counter()
@@ -490,14 +601,25 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
           f"{info['leaves_per_walker']:.1f} leaves/walker) "
           f"[{walls['load']:.1f} s, RSS {rss_gb():.2f} GB]")
 
+    # --- INTAKE SEAM: after this the pipeline is in ONE basis ------------
+    obs_map = None
+    if basis == "observable":
+        obs_map = build_observable_map(tobs, transform_container)
+        X = to_observable(X, obs_map)
+        print(f"intake: mapped {len(X):,} rows to the OBSERVABLE basis "
+              f"(Tobs {tobs:.6g} s, shear {obs_map.shear}, fiber "
+              f"{obs_map.fiber_coord}); col 1 is f_mid [Hz], col 2 fdot.")
+
     t0 = time.perf_counter()
-    bin_idx, islands, f_lo, floor = segment_f0(X[:, 1], df_mhz, n_samples)
+    bin_idx, islands, f_lo, floor = segment_f0(X[:, 1], df_seg, n_samples)
     walls["segment"] = time.perf_counter() - t0
     print(f"stage 1: {len(islands)} islands (floor {floor}/bin, "
-          f"df {df_mhz:.6g} mHz) [{walls['segment']:.2f} s]")
+          f"df {df_seg:.6g} {'Hz' if basis == 'observable' else 'mHz'}) "
+          f"[{walls['segment']:.2f} s]")
 
     stats = dict(satellite_merges=0, cov_floor_triggers=0,
                  cov_floor_diag=0, cov_floor_eig=0, df_mhz=df_mhz,
+                 df_seg=df_seg, basis=basis,
                  junk_rows=0, orphan_rows=0, dropped_fragments=0,
                  dropped_fragment_rows=0, blend_resplits=0,
                  blend_unsplit=0, trunc_mle_fits=0,
@@ -514,7 +636,7 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
         in_island |= m
         x_all, sid = X[m], sample_id[m]
         ts = time.perf_counter()
-        labels = split_fn(x_all, rng, df_mhz, stats)
+        labels = split_fn(x_all, rng, df_seg, stats)
         t_split_total += time.perf_counter() - ts
         stats["junk_rows"] += int((labels == -1).sum())
         for k in range(labels.max() + 1 if labels.size else 0):
@@ -527,7 +649,7 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
             pieces = [(x_all[mk], sid[mk])]
             if resplit_mult > 0:
                 pieces = resplit_blends(x_all[mk], sid[mk], n_samples,
-                                        resplit_mult, rng, df_mhz, stats)
+                                        resplit_mult, rng, df_seg, stats)
             for xr, sr in pieces:
                 nr = len(xr)
                 if nr < max(3, MIN_FRAC * n_samples):
@@ -553,7 +675,7 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
     ns = np.array(ns, dtype=np.int64)
     isl_id = np.array(isl_id, dtype=np.int64)
     f0_window_edges = np.array(
-        [[f_lo + b0 * df_mhz, f_lo + b1 * df_mhz] for b0, b1 in islands])
+        [[f_lo + b0 * df_seg, f_lo + b1 * df_seg] for b0, b1 in islands])
 
     order = np.argsort(means[:, 1])
     means, covs, ps, mults, ns, isl_id = (
@@ -637,10 +759,17 @@ def main(argv=None):
     ap.add_argument("--ratio-max", type=float, default=5.0,
                     help="fdot_astro_ratio prior half-width (the col-8 "
                          "truncation box; GBSettings.fdot_astro_ratio_max)")
+    ap.add_argument("--basis", default="observable",
+                    choices=("observable", "sampling"),
+                    help="coordinates the WHOLE fit runs in (default "
+                         "observable: lnA/f_mid/fdot/.../Mc, per-cluster "
+                         "Gaussian MIXTURE in the packed gmm_* layout). "
+                         "'sampling' reproduces the pre-2026-09-18 astro-"
+                         "basis fit with one Gaussian per cluster.")
     args = ap.parse_args(argv)
     run(args.store, args.last_k, args.tobs, args.out, seed=args.seed,
         max_iter=args.max_iter, resplit_mult=args.resplit_mult,
-        ratio_max=args.ratio_max)
+        ratio_max=args.ratio_max, basis=args.basis)
 
 
 if __name__ == "__main__":
