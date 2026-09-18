@@ -181,6 +181,14 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         inner_move_kind: str = None,
         eigen_refresh_every: int = 10,
         eigen_eps_rel: float = 1e-4,
+        # tiled per-walker ensemble search -- SEARCH stages only, see
+        # _ensemble_search_active / run_move_ensemble_search
+        ensemble_search: bool = False,
+        ensemble_repeats: int = 10,
+        ensemble_spread_lo: float = 1.0,
+        ensemble_spread_hi: float = 10.0,
+        ensemble_scale0: float = 1e-3,
+        ensemble_scale_tries: int = 4,
         **kwargs,
     ):
 
@@ -219,6 +227,13 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         self._inner_kind_logged = False
         self._eigen_inner = None
         self._eigen_visits = 0
+        self.ensemble_search = bool(ensemble_search)
+        self.ensemble_repeats = max(2, int(ensemble_repeats or 10))
+        self.ensemble_spread_lo = float(ensemble_spread_lo)
+        self.ensemble_spread_hi = float(ensemble_spread_hi)
+        self.ensemble_scale0 = float(ensemble_scale0)
+        self.ensemble_scale_tries = max(1, int(ensemble_scale_tries or 1))
+        self._ensemble_inner = None
         self._eigen_inner_accepted_shape = None
         self._fixed_component_covariances_coarse = {}
         if dcga is not None:
@@ -2404,6 +2419,295 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
 
         return state, accepted
 
+    # ---- per-walker tiled ensemble search (SEARCH stages only) ---------------
+    #
+    # TODO(noise-ensemble-search): this currently rides inside the existing
+    # noise search proposal, gated on gf_stage_kind. If it earns its keep,
+    # split it into its own stock move name so it can be selected per stage
+    # and A/B'd without a knob.
+    def _ensemble_search_active(self) -> bool:
+        """Is the tiled per-walker ensemble search armed for THIS propose?
+
+        Two conditions, both required: the branch knob
+        ``{PREFIX}_ENSEMBLE_SEARCH`` is on, AND this propose is running
+        inside a SEARCH stage.
+
+        The stage test is ``gf_stage_kind`` -- the per-propose stamp
+        ``GFCombineMove`` sets from the running ``Stage.kind``, the same
+        discriminator :meth:`_resolve_mode_like_fns` already uses to pick
+        the coarse sidecar mode. It must NOT be ``max_logl_mode`` and must
+        NOT be the GB ``"search" in self.name`` idiom: ``JointMaxLogLSearch``
+        wraps the ``*_pe`` moves, not the ``*_search`` ones, so the live
+        object is literally named ``"psd pe move"`` and carries
+        ``max_logl_mode=False`` -- both of those tests would silently never
+        fire. Keying off the stage is also what puts the move back in
+        regular mode for free: the SAME move object is reused by the
+        ``noise_vgb_pe`` / ``full_pe`` stages, where ``gf_stage_kind`` is
+        ``"pe"``, and takes the ordinary path there.
+        """
+        if not bool(getattr(self, "ensemble_search", False)):
+            return False
+        return getattr(self, "gf_stage_kind", None) in ("search", "rj")
+
+    def _ensemble_fold(self, arr4, R):
+        """``(nt, B, 1, ndim)`` cold state -> ``(B*nt, R, 1, ndim)`` inner ensemble.
+
+        The row order IS Eryn's folded-sampler order: row ``b * nt + t``
+        holds walker ``b``'s rung ``t``, which is what
+        ``Move.sampler_id_rows`` (``np.repeat(np.arange(nsamplers),
+        ntemps_per_sampler)``) and ``TemperatureControl``'s
+        ``act * ntemps + i`` row arithmetic both assume. Every reshape in
+        this block relies on it, so it is asserted in the tests rather than
+        re-derived at each site.
+        """
+        nt, B = arr4.shape[:2]
+        tail = arr4.shape[2:]
+        rows = np.transpose(arr4, (1, 0) + tuple(range(2, arr4.ndim)))
+        rows = rows.reshape((B * nt, 1) + tail)
+        return np.repeat(rows, int(R), axis=1)
+
+    def _ensemble_spread_scale(self, model, state, inner_supps, R, widths, names):
+        """Closed loop on the MEASURED logL spread (user ruling 2026-09-18).
+
+        Perturb, score, and rescale until each walker's own inner ensemble
+        spans ``[ensemble_spread_lo, ensemble_spread_hi]`` log-likelihood.
+        The loop is per-walker and vectorised: one batched likelihood call
+        covers every walker's whole ``nt x R`` block, and the rescale
+        ``scale *= sqrt(target / spread)`` is applied per walker.
+
+        Copy 0 of every ``(walker, rung)`` is left UNPERTURBED so the
+        incumbent always survives the block -- the search can then only
+        improve on what it was handed, and there is always at least one
+        finite point to measure a spread against when a wide draw puts the
+        rest outside the prior.
+        """
+        nt, B = state.branches_coords[names[0]].shape[:2]
+        base = {k: self._ensemble_fold(np.asarray(state.branches_coords[k]), R)
+                for k in names}
+        rng = model.random
+        step = {k: rng.normal(size=base[k].shape) for k in names}
+        for k in names:
+            step[k][:, 0] = 0.0                      # keep the incumbent
+
+        lo = float(self.ensemble_spread_lo)
+        hi = float(self.ensemble_spread_hi)
+        target = 0.5 * (lo + hi)
+        scale = np.full(B, float(self.ensemble_scale0), dtype=float)
+        coords = logp = logl = None
+
+        for _ in range(max(1, int(self.ensemble_scale_tries))):
+            rows = np.repeat(scale, nt)[:, None, None, None]
+            coords = {k: base[k] + rows * widths[k] * step[k] for k in names}
+            logp = self.compute_log_prior(coords)
+            logl = np.asarray(
+                model.compute_log_like_fn(coords, logp=logp, supps=inner_supps)[0]
+            )
+            blk = np.where(np.isfinite(logl), logl, np.nan).reshape(B, nt * R)
+            with np.errstate(invalid="ignore"):
+                spread = np.nanmax(blk, axis=1) - np.nanmin(blk, axis=1)
+            # a walker with <2 finite points has no measurable spread: treat
+            # it as far too wide and shrink hard rather than divide by nan.
+            n_ok = np.isfinite(blk).sum(axis=1)
+            spread = np.where(n_ok >= 2, spread, np.inf)
+            if np.all((spread >= lo) & (spread <= hi)):
+                break
+            with np.errstate(divide="ignore", invalid="ignore"):
+                adj = np.sqrt(target / spread)
+            adj = np.where(np.isfinite(adj) & (adj > 0.0), adj, 0.25)
+            scale = np.clip(scale * np.clip(adj, 0.1, 10.0), 1e-8, 1e2)
+
+        return coords, logp, logl, scale
+
+    def run_move_ensemble_search(self, model, state):
+        """One block of the tiled per-walker ensemble search.
+
+        For each walker of this rank's block, independently and with no
+        cross-walker interaction: tile its parameters into ``R`` repeats
+        (default 10), spread them by a measured 1-10 logL, run the eryn
+        stretch on that inner ensemble with full ensemble-permutation
+        tempering and per-walker ladder adaptation, then hand back the best
+        point that walker's ``(ntemps x R)`` set reached.
+
+        **Why this exists.** ``StretchMove`` needs a complement, which a
+        one-walker block does not have (:meth:`_resolve_inner_kind` refuses
+        it outright), so a 4-GPU/4-walker run falls back to the eigen-axis
+        proposal -- and that path was returning a non-positive information
+        matrix on 34 of 55 galfor builds. Tiling manufactures a complement
+        INSIDE each walker and takes the information matrix off the search
+        critical path entirely.
+
+        **Almost nothing here is new.** The geometry is Eryn's folded
+        sampler axis: outer walker -> ``nsamplers``, rung -> ``ntemps``, the
+        ``R`` repeats -> ``nwalkers``. Red/blue splits and stretch
+        complements are drawn per row of axis 0 and never mix rows, so an
+        unmodified ``StretchMove`` on a folded ``(B*nt, R, 1, ndim)`` array
+        IS "R copies per rung, each walker its own independent ensemble".
+        ``TemperatureControl(permute=True, nsamplers=B)`` gives the
+        full-permutation swaps within each walker's own ladder, and its
+        ``temper_comps`` adapts each walker's betas from that walker's own
+        swap acceptance. :meth:`compute_log_like` and
+        :meth:`compute_log_prior` are already shape-agnostic, and
+        :meth:`compute_psd_rows` already takes repeating walker indices, so
+        the scoring seam is untouched.
+
+        SEARCH ONLY -- the argmax at the end is a deterministic hill-climb,
+        admissible under the standing search-waiver policy and gated to
+        search stages by :meth:`_ensemble_search_active`.
+        """
+        from eryn.moves.tempering import TemperatureControl
+
+        from .eigen_refresh import prior_box_widths
+
+        names = [k for k in self.NOISE_BRANCHES if k in state.branches_coords]
+        nt, B = state.branches_coords[names[0]].shape[:2]
+        R = max(2, int(self.ensemble_repeats))
+        ndim_total = sum(int(state.branches_coords[k].shape[-1]) for k in names)
+
+        if R < 2 * ndim_total and not getattr(self, "_ens_width_logged", False):
+            logger.warning(
+                "[%s] ensemble search: %d repeats is below eryn's red/blue floor "
+                "of 2*ndim_total=%d for branches %s -- the stretch complement is "
+                "thin. Raise {PREFIX}_ENSEMBLE_REPEATS.",
+                self.fanout_knob_prefix(), R, 2 * ndim_total, names,
+            )
+            self._ens_width_logged = True
+
+        # data_index: every one of a walker's R*nt rows must score against
+        # THAT walker's own ACA residual. Row b*nt + t -> walker b. Getting
+        # this wrong scores walkers against each other's residuals (the PSD
+        # fancy-swap walker_inds defect, in a new place).
+        w_rows = np.repeat(np.arange(B, dtype=np.int64), nt)
+        inner_supps = BranchSupplemental(
+            {"walker_inds": np.tile(w_rows[:, None], (1, R))},
+            base_shape=(B * nt, R),
+            copy=True,
+        )
+
+        widths = {
+            k: np.asarray(
+                prior_box_widths(self.priors[k], int(state.branches_coords[k].shape[-1])),
+                dtype=float,
+            )
+            for k in names
+        }
+
+        coords, logp, logl, scale = self._ensemble_spread_scale(
+            model, state, inner_supps, R, widths, names
+        )
+
+        # The inner ladder is PRIVATE: a fresh control, never published and
+        # never handed to the fan-out, so it adapts during the run even
+        # under several compute ranks (install_walker_fanout pins only the
+        # move's own control non-adaptive). Seeded from the outer ladder.
+        betas0 = np.asarray(self.temperature_control.betas, dtype=float)[:nt]
+        inner_tc = TemperatureControl(
+            ndim_total, R,
+            betas=betas0, ntemps=nt, nsamplers=B,
+            permute=True,                       # full ensemble permutation
+            skip_swap_supp_names=["walker_inds"],
+        )
+        inner = self._ensemble_inner_move()
+        inner.temperature_control = inner_tc
+        inner.accepted = np.zeros((B * nt, R))
+
+        inner_state = GFState(coords, copy=True, supplemental=inner_supps)
+        inner_state.log_prior = logp
+        inner_state.log_like = logl
+
+        inner_model = Model(
+            model.log_like_fn,
+            model.compute_log_like_fn,
+            self.compute_log_prior,
+            inner_tc,
+            model.map_fn,
+            model.random,
+        )
+
+        acc_sum = np.zeros((B * nt, R))
+        for _ in range(max(1, int(self.num_repeats))):
+            inner_state, acc = inner.propose(inner_model, inner_state)
+            acc_sum += np.asarray(acc, dtype=float)
+        n_rounds = max(1, int(self.num_repeats))
+
+        return self._ensemble_take_best(state, inner_state, acc_sum, n_rounds, names,
+                                        nt, B, R, scale)
+
+    def _ensemble_inner_move(self):
+        if getattr(self, "_ensemble_inner", None) is None:
+            # live_dangerously: the red/blue floor is about the OUTER
+            # ensemble's dimensionality; here the complement is manufactured
+            # and its width is the knob (warned about above).
+            self._ensemble_inner = StretchMove(
+                live_dangerously=True, periodic=self.periodic
+            )
+        self._ensemble_inner.periodic = self.periodic
+        return self._ensemble_inner
+
+    def _ensemble_take_best(self, state, inner_state, acc_sum, n_rounds, names,
+                            nt, B, R, scale):
+        """Fold the inner ensemble back onto the module ladder.
+
+        The COLD row of each walker takes that walker's global argmax over
+        its whole ``(nt x R)`` set -- the user's "take the max logL of each
+        walker and temperature set of 10 and make that the parameters and
+        logL to pass on", and the cold row is what the residual and the
+        enclosing plateau criterion actually read. Each HOT rung takes the
+        argmax over its OWN R copies instead of the global best, so the
+        ladder keeps its spread rather than collapsing onto one point.
+        """
+        ll = np.asarray(inner_state.log_like, dtype=float).reshape(B, nt, R)
+        lp = np.asarray(inner_state.log_prior, dtype=float).reshape(B, nt, R)
+
+        bw = np.arange(B)[:, None]
+        bt = np.arange(nt)[None, :]
+        best_r = np.argmax(np.where(np.isfinite(ll), ll, -np.inf), axis=2)   # (B, nt)
+        flat = np.where(np.isfinite(ll), ll, -np.inf).reshape(B, nt * R)
+        best_t, best_r0 = np.divmod(np.argmax(flat, axis=1), R)              # (B,)
+        ba = np.arange(B)
+
+        for k in names:
+            ndim_k = int(state.branches_coords[k].shape[-1])
+            c = np.asarray(inner_state.branches_coords[k]).reshape(B, nt, R, 1, ndim_k)
+            out = c[bw, bt, best_r]                       # (B, nt, 1, ndim)
+            out[:, 0] = c[ba, best_t, best_r0]            # cold row: global best
+            state.branches_coords[k][:] = np.transpose(out, (1, 0, 2, 3))
+
+        ll_out = ll[bw, bt, best_r]
+        lp_out = lp[bw, bt, best_r]
+        ll_out[:, 0] = ll[ba, best_t, best_r0]
+        lp_out[:, 0] = lp[ba, best_t, best_r0]
+        state.log_like = np.ascontiguousarray(ll_out.T)
+        state.log_prior = np.ascontiguousarray(lp_out.T)
+
+        # bookkeeping on the OUTER move, so acceptance_fraction stays finite
+        # and the sub-state counters are not silently zero (the same reason
+        # _inner_propose mirrors RedBlueMove's own bookkeeping by hand).
+        acc = (acc_sum.reshape(B, nt, R).sum(axis=2) / (n_rounds * R)).T
+        self.accepted += acc
+        self.num_proposals += 1
+        self._tally_in_model_proposed += n_rounds * R * B
+        self._tally_in_model_accepted += (
+            acc_sum.reshape(B, nt, R).sum(axis=(0, 2)).astype(int)
+        )
+        sa = getattr(self._ensemble_inner.temperature_control, "swaps_accepted", None)
+        sp = getattr(self._ensemble_inner.temperature_control, "swaps_proposed", None)
+        if sa is not None and sp is not None:
+            self._tally_swaps_accepted += (
+                np.asarray(sa).reshape(B, -1).sum(axis=0).astype(int)
+            )
+            self._tally_swaps_proposed += (
+                np.asarray(sp).reshape(B, -1).sum(axis=0).astype(int)
+            )
+        if not getattr(self, "_ens_logged", False):
+            logger.info(
+                "[%s] ensemble search: %d repeats x %d rungs x %d walkers, "
+                "perturbation scale %s prior-box fractions",
+                self.fanout_knob_prefix(), R, nt, B,
+                np.array2string(scale, precision=3),
+            )
+            self._ens_logged = True
+        return state, acc
+
     # ---- inner proposal: stretch or eigen-axis MH ----------------------------
     def _resolve_inner_kind(self, nwalkers_block, nwalkers_run=None) -> str:
         """Resolve the inner proposal kind for one propose.
@@ -2776,11 +3080,23 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
             if getattr(self, "fanout", None) is not None
             else nwalkers_mod
         )
-        self._inner_kind = self._resolve_inner_kind(nwalkers_mod, nwalkers_run=nwalkers_run)
-        if self._inner_kind == "eigen":
-            if self._eigen_visits % self.eigen_refresh_every == 0:
-                self._refresh_eigen_tables(tmp_branches_coords)
-            self._eigen_visits += 1
+        if self._ensemble_search_active():
+            # The tiled ensemble supplies its own complement, so neither the
+            # block-width resolution nor the information matrix applies:
+            # _resolve_inner_kind would either pick `eigen` (and pay for the
+            # table this move exists to avoid) or REFUSE an explicit
+            # `stretch` at a one-walker block -- and that refusal is about
+            # the OUTER block, which is exactly the condition being worked
+            # around here.
+            self._inner_kind = "ensemble"
+        else:
+            self._inner_kind = self._resolve_inner_kind(
+                nwalkers_mod, nwalkers_run=nwalkers_run
+            )
+            if self._inner_kind == "eigen":
+                if self._eigen_visits % self.eigen_refresh_every == 0:
+                    self._refresh_eigen_tables(tmp_branches_coords)
+                self._eigen_visits += 1
 
         # per-iteration acceptance deltas, accumulated across the repeat block
         # by run_move and written into each sampled branch's sub-state below.
@@ -2840,6 +3156,14 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         with _tspan(_tm, "sample"):
             if self.max_logl_mode:
                 tmp_state, accepted = self.run_move_max_likelihood(tmp_model, tmp_state)
+
+            elif self._ensemble_search_active():
+                # Tiled per-walker ensemble, SEARCH stages only. One block
+                # per propose: the enclosing MaxLogLCombineMove plateau is
+                # what "run until the maximum likelihood converges" means
+                # here, so this stays chunked exactly like run_move_for_loop
+                # rather than owning a second convergence loop.
+                tmp_state, accepted = self.run_move_ensemble_search(tmp_model, tmp_state)
 
             else:
                 tmp_state, accepted = self.run_move_for_loop(tmp_model, tmp_state, self.num_repeats)

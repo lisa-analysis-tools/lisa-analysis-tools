@@ -2329,6 +2329,15 @@ def build_noise_moves(
         inner_move_kind=getattr(lead_info, "inner_move_kind", None),
         eigen_refresh_every=int(getattr(lead_info, "eigen_refresh_every", 10) or 10),
         eigen_eps_rel=float(getattr(lead_info, "eigen_eps_rel", 1e-4) or 1e-4),
+        # tiled per-walker ensemble search; only fires inside a search stage
+        # (PSDMove._ensemble_search_active), so the same pair of move objects
+        # is still the ordinary proposal everywhere else.
+        ensemble_search=bool(getattr(lead_info, "ensemble_search", False)),
+        ensemble_repeats=int(getattr(lead_info, "ensemble_repeats", 10) or 10),
+        ensemble_spread_lo=float(getattr(lead_info, "ensemble_spread_lo", 1.0) or 1.0),
+        ensemble_spread_hi=float(getattr(lead_info, "ensemble_spread_hi", 10.0) or 10.0),
+        ensemble_scale0=float(getattr(lead_info, "ensemble_scale0", 1e-3) or 1e-3),
+        ensemble_scale_tries=int(getattr(lead_info, "ensemble_scale_tries", 4) or 4),
     )
 
     tag = "+".join(sampled_branches)
