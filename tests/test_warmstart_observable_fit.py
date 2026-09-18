@@ -208,40 +208,48 @@ class ClusterGMMTest(unittest.TestCase):
                                 "BIC should prefer >1 component for a "
                                 "genuinely bimodal cluster")
 
-    def test_component_count_is_set_by_the_min_members_cap(self):
-        """MEASURED 2026-09-18: the existing fitter's BIC is monotone in K.
+    def test_BIC_selects_and_min_members_only_bounds(self):
+        """BIC is the selector; ``min_members`` is a ceiling on it.
 
-        ``vec_fit_gmm_min_bic`` scores BIC on the model's OWN synthetic
-        draws (``gmm.bic(gmm.rvs(n))``), which is an entropy estimate: more
-        components always fit tighter, so BIC falls monotonically and the
-        "risen twice past the running minimum" retirement never fires. On a
-        clean unimodal 9-D Gaussian, measured BIC ran 30556 (K=1) down to
-        22255 (K=7), with AND without resampling.
-
-        So the sweep returns ``max_comp_effective`` every time, and
-        ``min_members`` -- the spec's guard against BIC believing resampled
-        evidence -- is the ACTUAL selector. This test pins that, because it
-        is what anyone tuning ``--gmm-max-comp`` needs to know.
-
-        The underlying EM also runs with ``random_state=None``, so the
-        selected K is not reproducible run to run; the assertions below are
-        the guarantees that DO hold.
+        Before the 2026-09-18 ``gmm.py`` fix this was the other way round:
+        the sweep scored BIC on the model's OWN draws, which falls
+        monotonically in K, so every group ran to its cap and
+        ``min_members`` was the only thing setting component counts. The
+        criterion now reads the fitted data, so a clean unimodal cloud
+        comes back with ONE component even when the cap allows six.
         """
         rng = np.random.default_rng(2)
         z = np.zeros((400, 9))
         for c in range(9):
             z[:, c] = rng.normal(1.0, 0.05, 400)
-        # cap = min(6, 400 // 25 = 16) = 6
+        # cap = min(6, 400 // 25 = 16) = 6, and BIC should not use it
         k6 = len(ffs.fit_cluster_gmms([z], n_samples=2048, max_comp=6,
                                       seed=5)[0][0])
-        self.assertLessEqual(k6, 6)
-        self.assertGreater(k6, 1,
-                           "BIC-on-own-draws does not select 1 even for a "
-                           "clean unimodal cloud -- the cap is the selector")
-        # min_members binds when it is the tighter of the two: 400 // 200
+        self.assertLess(k6, 6,
+                        "the sweep returned its cap -- BIC is not selecting")
+        # min_members still binds when it is the tighter of the two:
+        # 400 // 200 = 2
         k_guard = len(ffs.fit_cluster_gmms([z], n_samples=2048, max_comp=12,
                                            min_members=200, seed=5)[0][0])
         self.assertLessEqual(k_guard, 2)
+
+    def test_same_seed_reproduces_the_same_components(self):
+        """The production component set must be reproducible from the store.
+
+        ``seed`` drives the per-cluster resampling draw AND the EM
+        initialisation (``random_state``). Without the second the same
+        store refitted twice gave a different K and different components,
+        so a warm start could not be regenerated after the fact.
+        """
+        z = self._two_mode_cluster()
+        a = ffs.fit_cluster_gmms([z], n_samples=1024, max_comp=4, seed=5)
+        b = ffs.fit_cluster_gmms([z], n_samples=1024, max_comp=4, seed=5)
+        self.assertEqual(len(a[0][0]), len(b[0][0]))
+        np.testing.assert_allclose(np.asarray(a[0][0]), np.asarray(b[0][0]),
+                                   rtol=1e-10, atol=1e-12)
+        np.testing.assert_allclose(np.asarray(a[1][0]), np.asarray(b[1][0]),
+                                   rtol=1e-10, atol=1e-12)
+
 
     def test_small_cluster_is_capped_at_one_component(self):
         """min_members guards against BIC believing resampled evidence."""
@@ -461,6 +469,25 @@ class ObservableRunWriterTest(unittest.TestCase):
             self.assertNotIn("gmm_means", keys)
             self.assertEqual(meta.get("basis", "sampling"), "sampling")
             self.assertEqual(meta["column_names"], ffs.COLUMN_NAMES)
+
+
+
+
+class GmmDeviceResolutionTest(unittest.TestCase):
+    """``--gmm-gpu``: the mixture fit takes a device like the F-stat one."""
+
+    def test_explicit_cpu_and_index_forms(self):
+        self.assertIsNone(ffs.resolve_gmm_gpu("cpu"))
+        self.assertIsNone(ffs.resolve_gmm_gpu("none"))
+        self.assertIsNone(ffs.resolve_gmm_gpu("-1"))
+        self.assertIsNone(ffs.resolve_gmm_gpu(None))
+        self.assertEqual(ffs.resolve_gmm_gpu("0"), 0)
+        self.assertEqual(ffs.resolve_gmm_gpu("3"), 3)
+
+    def test_auto_never_raises_without_a_device(self):
+        """A login node must still be able to rebuild the warm start."""
+        got = ffs.resolve_gmm_gpu("auto")
+        self.assertTrue(got is None or isinstance(got, int))
 
 
 if __name__ == "__main__":

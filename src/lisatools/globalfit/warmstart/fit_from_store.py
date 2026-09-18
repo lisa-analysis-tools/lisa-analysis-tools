@@ -590,6 +590,35 @@ def _host_array(a):
     return a.get() if hasattr(a, "get") else np.asarray(a)
 
 
+def resolve_gmm_gpu(spec):
+    """``--gmm-gpu`` string -> device index or ``None`` (CPU).
+
+    ``"auto"`` is the default because this fitter is run by hand on the
+    cluster: on a GPU node it should use the device the way the F-stat fit
+    does, and on a login node it must still run. Anything that fails to
+    report a device falls back to the host path with a printed reason
+    rather than raising -- a warm start that fits slowly is recoverable, a
+    warm start that does not fit at all blocks a launch.
+    """
+    if spec is None:
+        return None
+    s = str(spec).strip().lower()
+    if s in ("cpu", "none", "-1"):
+        return None
+    if s != "auto":
+        return int(s)
+    try:
+        import cupy as cp
+
+        if int(cp.cuda.runtime.getDeviceCount()) > 0:
+            return 0
+        print("[warmstart] --gmm-gpu auto: cupy sees no device; using CPU")
+    except Exception as exc:  # no cupy, no driver, no visible device
+        print(f"[warmstart] --gmm-gpu auto: GPU unavailable ({exc}); "
+              f"using CPU")
+    return None
+
+
 def fit_cluster_gmms(cluster_rows, *, n_samples: int = 4096,
                      max_comp: int = 12, min_members: int = 25,
                      seed: int = 7, gpu=None, verbose: bool = False):
@@ -606,22 +635,22 @@ def fit_cluster_gmms(cluster_rows, *, n_samples: int = 4096,
     more evidence than it does, so a cluster's component cap is
     ``min(max_comp, max(1, n_members // min_members))``.
 
-    **The cap is the selector, not BIC** (measured 2026-09-18). The shared
-    fitter scores BIC on the model's OWN synthetic draws
-    (``gmm.bic(gmm.rvs(n))``), which is an entropy estimate rather than a
-    fit-to-data criterion: more components always sit tighter, so BIC falls
-    essentially monotonically in K and the "risen twice past the running
-    minimum" retirement rule almost never fires. On a clean unimodal 9-D
-    Gaussian it ran 30556 (K=1) down to 22255 (K=7), with AND without
-    resampling. The sweep therefore returns the cap (give or take the noise
-    in its own random draws), which makes ``min_members`` the knob that
-    actually controls component count. Left as-is deliberately: the
-    criterion belongs to ``gmm.py`` and is shared with the F-stat side,
-    which is out of scope here (spec section 8).
+    BIC is the selector and ``min_members`` only bounds it. That ordering
+    is true as of the 2026-09-18 fix to ``gmm.py``: the sweep used to score
+    BIC on the model's OWN synthetic draws (``gmm.bic(gmm.rvs(n))``), an
+    entropy estimate that falls monotonically in K, so the "risen twice
+    past the running minimum" retirement rule never fired and every group
+    returned ``max_comp``. The criterion is now evaluated on the fitted
+    data (``tests/test_gmm_min_bic_selection.py`` pins it).
 
-    Reproducibility note: the underlying EM initialises with
-    ``random_state=None``, so refitting the same store does not reproduce
-    the same K or the same components bit for bit.
+    ``seed`` feeds both the resampling draw and the EM initialisation
+    (``random_state``), so refitting the same store on the same device
+    reproduces the same K and the same components.
+
+    ``gpu`` is a CUDA device index handed straight to the shared fitter
+    (``None`` -> CPU), exactly as ``fstat_proposal.fit_gmm_to_stacked``
+    does. Device and host EM take different code paths inside ``gmm.py``,
+    so results are reproducible per device, not across devices.
 
     Returns the seven ragged lists ``[weights, means, covs, invcovs, dets,
     mins, maxs]``, one entry per cluster, in PHYSICAL coordinates (see
@@ -659,10 +688,23 @@ def fit_cluster_gmms(cluster_rows, *, n_samples: int = 4096,
         comps = _unscale_gmm_components(vec_fit_gmm_min_bic(
             block[sel], min_comp=1, max_comp=int(cap), gpu=gpu,
             verbose=verbose, return_components=True,
+            random_state=int(seed),
         ))
         for j, i in enumerate(sel):
             for k in range(7):
                 out[k].append((i, comps[k][j]))
+    if gpu is not None:
+        # The components are host arrays by now (_unscale_gmm_components
+        # calls _host_array). Hand the device memory back: this fitter runs
+        # in-process on a rank that is about to allocate its ACA and its GB
+        # band preload, and cupy's pool would otherwise hold the block
+        # (n_clusters x n_samples x ndim doubles plus EM workspace).
+        try:
+            import cupy as cp
+
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
     # restore cluster order
     return [[v for _, v in sorted(lst, key=lambda t: t[0])] for lst in out]
 
@@ -740,7 +782,8 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
         max_iter: int | None = None, resplit_mult: float = 2.0,
         ratio_max: float = 5.0, basis: str = "sampling",
         transform_container=None, gmm_samples: int = 4096,
-        gmm_max_comp: int = 12, gmm_min_members: int = 25):
+        gmm_max_comp: int = 12, gmm_min_members: int = 25,
+        gmm_gpu: int | None = None):
     """Fit a finished run's cold-chain leaf table into birth components.
 
     ``basis`` selects the coordinates the WHOLE fit runs in:
@@ -876,13 +919,14 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
         gmm_comps = fit_cluster_gmms(
             comp_rows, n_samples=int(gmm_samples),
             max_comp=int(gmm_max_comp), min_members=int(gmm_min_members),
-            seed=seed)
+            seed=seed, gpu=gmm_gpu)
         walls["gmm"] = time.perf_counter() - t0g
         n_per = [len(w) for w in gmm_comps[0]]
+        where = "CPU" if gmm_gpu is None else f"GPU {int(gmm_gpu)}"
         print(f"stage 3: {len(comp_rows)} clusters -> {int(sum(n_per))} "
               f"mixture components (K per cluster: min {min(n_per)}, "
               f"median {int(np.median(n_per))}, max {max(n_per)}) "
-              f"[{walls['gmm']:.1f} s]")
+              f"[{walls['gmm']:.1f} s on {where}]")
     else:
         means = np.array(means)[order]
         covs = np.array(covs)[order]
@@ -999,6 +1043,12 @@ def main(argv=None):
                     help="observable basis: members required per allowed "
                          "mixture component (the ACTUAL selector -- see "
                          "fit_cluster_gmms)")
+    ap.add_argument("--gmm-gpu", default="auto",
+                    help="observable basis: CUDA device index for the "
+                         "mixture fit, 'cpu' to force the host path, or "
+                         "'auto' (default) to take device 0 when cupy sees "
+                         "one. Same device semantics as the F-stat fit "
+                         "(fstat_proposal.fit_gmm_to_stacked).")
     ap.add_argument("--basis", default="observable",
                     choices=("observable", "sampling"),
                     help="coordinates the WHOLE fit runs in (default "
@@ -1011,7 +1061,8 @@ def main(argv=None):
         max_iter=args.max_iter, resplit_mult=args.resplit_mult,
         ratio_max=args.ratio_max, basis=args.basis,
         gmm_samples=args.gmm_samples, gmm_max_comp=args.gmm_max_comp,
-        gmm_min_members=args.gmm_min_members)
+        gmm_min_members=args.gmm_min_members,
+        gmm_gpu=resolve_gmm_gpu(args.gmm_gpu))
 
 
 if __name__ == "__main__":
