@@ -82,6 +82,15 @@ error, not a rounding fallback, when driven directly through `build_layout`
 | `{P}_EIGEN_REFRESH` | `10` | proposes between per-rung eigen table refreshes (eigen kind). |
 | `{P}_EIGEN_EPS_REL` | `1e-4` | finite-difference step for the eigen tables, fraction of the prior box. |
 
+- **`FSTAT_SIGHET_MULTIDEV=1` is inert under the walker-block layout.** It
+  fans the F-stat scorer out over a rank's OWN devices, and the current
+  pipeline gives each rank exactly one GPU — so it silently does nothing.
+  The rank split is what replaces that parallelism: stage B is divided
+  across compute ranks by contiguous box range (design spec
+  `docs/superpowers/specs/2026-09-16-parallel-fstat-fit-design.md`). Leave
+  the variable set; it costs nothing and re-engages if anyone ever runs
+  `GPUS_PER_RANK > 1`.
+
 ## Every rank builds
 
 `prepare_rank(fit, comm)` runs **before** `fit.build()` in both drivers

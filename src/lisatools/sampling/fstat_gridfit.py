@@ -27,6 +27,7 @@ inherits the offline knob set unchanged.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 import os
@@ -46,10 +47,29 @@ __all__ = [
     "ckpt_secs",
     "chunked_fstat_sweep",
     "select_comb_peaks",
+    "CombLevelSpec",
+    "run_comb_level",
+    "comb_part_path",
+    "save_comb_part",
+    "load_comb_part",
+    "assemble_comb_level",
+    "clear_comb_parts",
     "run_comb_scan",
     "run_stacked_peak_sweep",
+    "StageBGroupSpec",
+    "run_stage_b_group",
+    "write_stacked_npz",
+    "split_box_range",
+    "stage_b_part_path",
+    "save_stage_b_part",
+    "load_stage_b_part",
+    "assemble_stage_b_group",
+    "clear_stage_b_parts",
     "run_stacked_stage_b",
     "run_fstat_grid_fit",
+    "comb_cache_usable",
+    "stacked_grid_path",
+    "stage_b_complete",
     "build_gb_birth_distribution",
     "sighet_fstat_ref_margin_hz",
     "build_sighet_call_fstat",
@@ -723,9 +743,207 @@ class _CombRows:
         return self.shape, self._rows(uniq)[np.ravel(inv), cols]
 
 
+@dataclasses.dataclass(frozen=True)
+class CombLevelSpec:
+    """Everything ONE comb sky level's sweep needs, as host arrays.
+
+    Stage A's unit of parallel work, and the exact counterpart of
+    :class:`StageBGroupSpec`. ``a``/``b`` are node indices into the LEVEL's
+    own f0-ordered node list (the level assignment is a deterministic closed
+    form of f0 alone -- see ``nsky_per_node`` in :func:`run_comb_scan` --
+    so every rank derives the identical list with no communication, and a
+    sub-range is addressed in the same coordinates the head concatenates the
+    partials in).
+
+    The SKY GRID IS NEVER SLICED. ``alpha`` / ``sin_delta`` / ``lv`` /
+    ``mc_fix`` define what a ROW MEANS (:class:`_CombRows` lays rows out
+    node-major, sky fast), so a rank that sliced them would score a
+    different physical template while reporting the same node -- the same
+    invariant that keeps ``StageBGroupSpec``'s Mc/alpha/sin-delta axes
+    whole.
+    """
+
+    li: int
+    n_levels: int
+    lv: int
+    a: int
+    b: int
+    f0_nodes: np.ndarray
+    alpha: np.ndarray
+    sin_delta: np.ndarray
+    mc_fix: float
+    label: str
+    ckpt_name: Optional[str]
+    parts_dir: Optional[str]
+    fingerprint_extra: str
+
+    @property
+    def n_nodes(self) -> int:
+        return int(self.b) - int(self.a)
+
+    def sub_range(self, a2, b2, *, ckpt_name=None,
+                  label=None) -> "CombLevelSpec":
+        """This level restricted to ABSOLUTE nodes ``[a2, b2)``.
+
+        ``ckpt_name`` must differ per rank: the sweep's fingerprint hashes
+        the SLICED rows (:meth:`_CombRows._ckpt_flat_sample`) plus the
+        label, so two ranks' checkpoints are already mutually invalid -- but
+        they must not collide on one path.
+        """
+        a2, b2 = int(a2), int(b2)
+        if not (self.a <= a2 <= b2 <= self.b):
+            raise ValueError(
+                f"sub_range({a2}, {b2}) is outside level {self.li}'s "
+                f"node range [{self.a}, {self.b})")
+        i0, i1 = a2 - int(self.a), b2 - int(self.a)
+        return dataclasses.replace(
+            self,
+            a=a2,
+            b=b2,
+            f0_nodes=np.ascontiguousarray(self.f0_nodes[i0:i1]),
+            ckpt_name=(self.ckpt_name if ckpt_name is None else ckpt_name),
+            label=(self.label if label is None else label),
+        )
+
+
+def run_comb_level(spec: CombLevelSpec, call_fstat: Callable, *, xp):
+    """Sweep ONE comb sky level (or one rank's node range of it).
+
+    The single entry point both the serial scan and every compute rank use,
+    so a split can never diverge from the serial code by construction --
+    stage A's counterpart of :func:`run_stage_b_group`, and for the same
+    reason.
+
+    Returns the per-node reduction as THREE host arrays, ``(F_max,
+    best_alpha, best_sin_delta)``: the sky axis is maximized away here
+    rather than shipped, so a rank replies with 3 x n_nodes float64 instead
+    of the ``n_nodes x nsky`` block it scored (at the 6-mo level 6 that is
+    362,020 x 3 values instead of 185 million).
+
+    An EMPTY range (more ranks than nodes) short-circuits: the sweep's
+    checkpoint layer is not defined at ``n_total == 0``, and there is
+    nothing to score.
+    """
+    nn = spec.n_nodes
+    if nn == 0:
+        z = np.empty(0, dtype=np.float64)
+        return z, z.copy(), z.copy()
+    params = _CombRows(spec.f0_nodes, spec.alpha, spec.sin_delta, spec.mc_fix)
+    ckpt = (os.path.join(spec.parts_dir, spec.ckpt_name)
+            if (spec.parts_dir and spec.ckpt_name) else None)
+    Fd = chunked_fstat_sweep(
+        call_fstat, params, xp=xp, label=spec.label, ckpt=ckpt,
+        fingerprint_extra=spec.fingerprint_extra,
+    ).reshape(nn, int(spec.lv))
+    kb = _to_host(Fd.argmax(axis=1)).astype(int)
+    return _to_host(Fd.max(axis=1)), spec.alpha[kb], spec.sin_delta[kb]
+
+
+def comb_part_path(parts_dir, li, rank) -> str:
+    """``<parts>/comb_l{li}_r{rank}.npy`` -- one rank's slice of one level.
+
+    A separate prefix from the per-level PROGRESS files (``comb_nsky{lv}*``)
+    on purpose: :func:`run_comb_scan`'s end-of-scan
+    ``ckpt_clear(parts_dir, "comb_")`` sweeps only the ``.progress.*``
+    suffixes, so these finished partials are cleared by
+    :func:`clear_comb_parts` per level instead -- as soon as the head has
+    assembled them, rather than at the end of the whole scan.
+    """
+    return os.path.join(parts_dir, f"comb_l{int(li)}_r{int(rank)}.npy")
+
+
+def save_comb_part(parts_dir, li, rank, F_max, best_alpha, best_sin_delta):
+    """Write one rank's finished reduction as a ``(3, n)`` float64 block.
+
+    ONE file for the three arrays, so the head's read is one open and one
+    sha1 -- they are produced together, consumed together, and a partial
+    that lost one of the three would be a grid whose sky answers belong to
+    other nodes.
+
+    Written through an open file object and fsynced before the rename, for
+    the reasons :func:`save_stage_b_part` spells out: this is a cross-NODE
+    data path (a worker writes, replies, and the HEAD reads from another
+    node), so the barrier is what NFS close-to-open semantics need.
+    """
+    os.makedirs(parts_dir, exist_ok=True)
+    arr = np.ascontiguousarray(
+        np.stack([np.asarray(_to_host(F_max), dtype=np.float64),
+                  np.asarray(_to_host(best_alpha), dtype=np.float64),
+                  np.asarray(_to_host(best_sin_delta), dtype=np.float64)]))
+    path = comb_part_path(parts_dir, li, rank)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as fh:
+        np.save(fh, arr, allow_pickle=False)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    return path, int(arr.shape[1]), hashlib.sha1(arr.tobytes()).hexdigest()[:16]
+
+
+def load_comb_part(parts_dir, li, rank):
+    return np.load(comb_part_path(parts_dir, li, rank), allow_pickle=False)
+
+
+def assemble_comb_level(parts_dir, li, n_parts, n_nodes, *, sha1s=None):
+    """Concatenate one level's per-rank partials in RANK (== node) order.
+
+    :func:`split_box_range` hands rank ``r`` a contiguous ascending node
+    range, so rank-ordered concatenation reproduces the whole-level sweep
+    exactly. ``sha1s`` (rank -> digest, as the ranks reported them) is
+    verified when given, for the reason
+    :func:`assemble_stage_b_group`'s is: a partial that changed between the
+    reply and the read is a filesystem fault, and silently fitting on it
+    would corrupt the epoch with no symptom.
+
+    Returns ``(F_max, best_alpha, best_sin_delta)``, each ``(n_nodes,)``.
+    """
+    n_nodes = int(n_nodes)
+    if sha1s is not None:
+        missing = [r for r in range(int(n_parts)) if sha1s.get(r) is None]
+        if missing:
+            raise RuntimeError(
+                f"comb level {li}: sha1s given but missing/None for rank(s) "
+                f"{missing} of {n_parts} -- cannot verify those partials, "
+                f"refusing to silently skip verification")
+    out = np.empty((3, n_nodes), dtype=np.float64)
+    off = 0
+    for r in range(int(n_parts)):
+        arr = np.ascontiguousarray(load_comb_part(parts_dir, li, r))
+        if sha1s is not None:
+            got = hashlib.sha1(arr.tobytes()).hexdigest()[:16]
+            if got != sha1s[r]:
+                raise RuntimeError(
+                    f"comb partial l{li} r{r} changed under us: reported "
+                    f"sha1 {sha1s[r]}, read {got} "
+                    f"({comb_part_path(parts_dir, li, r)})")
+        if arr.ndim != 2 or arr.shape[0] != 3 or (
+                off + int(arr.shape[1]) > n_nodes):
+            raise RuntimeError(
+                f"comb level {li}: partial r{r} is {tuple(arr.shape)} at node "
+                f"offset {off}, which does not fit (3, {n_nodes})")
+        out[:, off:off + int(arr.shape[1])] = arr
+        off += int(arr.shape[1])
+    if off != n_nodes:
+        raise RuntimeError(
+            f"comb level {li}: assembled {off} node(s) from {n_parts} "
+            f"partials, expected {n_nodes}")
+    return out[0], out[1], out[2]
+
+
+def clear_comb_parts(parts_dir, li, n_parts) -> None:
+    """Remove one level's partials (and any leftover temp files)."""
+    for r in range(int(n_parts)):
+        for path in (comb_part_path(parts_dir, li, r),
+                     comb_part_path(parts_dir, li, r) + ".tmp"):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
                   f0_lims_hz, mc_lims, cache_path: Optional[str] = None,
-                  fingerprint_extra: str = ""):
+                  fingerprint_extra: str = "", comb_runner=None):
     """Dense-in-f0 F-stat comb scan across the sub-band.
 
     With months of data the F-stat f0 peaks are ~1/Tobs wide -- far too
@@ -735,6 +953,16 @@ def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
     right scan is therefore dense in f0 (spacing ~ 1/(2*Tobs)) x a small
     spread of sky points, maximized over sky per f0 node -- assembled into
     ONE parameter set per sky level and swept in a single chunked stream.
+
+    ``comb_runner`` replaces each level's kernel stream with
+    ``runner(spec, call_fstat, xp=xp) -> (F_max, best_alpha,
+    best_sin_delta)`` (``spec`` is a :class:`CombLevelSpec`). ``None`` is
+    the serial path, :func:`run_comb_level`, and is byte-identical to the
+    historical code. The multi-rank fit passes a runner that splits the
+    level by contiguous NODE range across the compute ranks and
+    concatenates the partials -- nodes are INDEPENDENT (the per-node
+    reduction reads only that node's own sky block), so rank-ordered
+    concatenation reproduces the whole-level sweep exactly.
 
     Returns ``(f0_nodes_mHz, F_max, peaks, extras)``.
     """
@@ -806,17 +1034,18 @@ def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
         # The block is generated per batch (:class:`_CombRows`), not held:
         # the dense array is 1.6 GB at 3-mo / ~81 GB at 23-mo density for
         # nothing but to be read 4096 rows at a time.
-        params = _CombRows(nodes, al, sd, mc_fix)
-        Fd = chunked_fstat_sweep(
-            call_fstat, params, xp=xp, label=f":comb.nsky{int(lv)}",
-            ckpt=(os.path.join(parts_dir, f"comb_nsky{int(lv)}")
-                  if parts_dir else None),
+        spec = CombLevelSpec(
+            li=_li, n_levels=len(levels), lv=int(lv), a=0, b=nn,
+            f0_nodes=nodes, alpha=al, sin_delta=sd, mc_fix=mc_fix,
+            label=f":comb.nsky{int(lv)}",
+            ckpt_name=f"comb_nsky{int(lv)}", parts_dir=parts_dir,
             fingerprint_extra=fingerprint_extra,
-        ).reshape(nn, int(lv))
-        _kb = _to_host(Fd.argmax(axis=1)).astype(int)
-        F_max_host[idx] = _to_host(Fd.max(axis=1))
-        best_al_host[idx] = al[_kb]
-        best_sd_host[idx] = sd[_kb]
+        )
+        runner = comb_runner if comb_runner is not None else run_comb_level
+        F_lv, al_lv, sd_lv = runner(spec, call_fstat, xp=xp)
+        F_max_host[idx] = F_lv
+        best_al_host[idx] = al_lv
+        best_sd_host[idx] = sd_lv
         total_evals += int(lv) * nn
     logger.info("[comb] total %d F-stat evals across %d sky level(s)",
                 total_evals, len(levels))
@@ -835,7 +1064,14 @@ def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
                  band_edges=np.asarray(band_edges_hz, dtype=float),
                  F_all=F_max_host[None, :], sky_alpha=_al_top,
                  sky_sin_delta=_sd_top, best_alpha=best_al_host,
-                 best_sin_delta=best_sd_host, nsky_per_node=nsky_per_node)
+                 best_sin_delta=best_sd_host, nsky_per_node=nsky_per_node,
+                 # WHAT RESIDUAL THIS SCAN WAS SCORED AGAINST. The same
+                 # string that salts the in-flight progress files -- epoch,
+                 # GB_FSTAT_GB_FREE, and (the reason it is here) the
+                 # reference walker. A FINISHED comb is not a checkpoint, so
+                 # nothing used to test it: it was reloaded on file
+                 # existence alone. See :func:`comb_cache_usable`.
+                 fingerprint_extra=fingerprint_extra)
         logger.info("[cache] wrote %s", comb_cache)
         # The comb npz is now the durable artifact; drop the per-level
         # progress files so a later knob change can't resurrect stale rows.
@@ -960,6 +1196,307 @@ def run_stacked_peak_sweep(call_fstat: Callable, f0_los, f0_dxs, mc_ax,
     return F_flat.reshape(node_shape)
 
 
+@dataclasses.dataclass(frozen=True)
+class StageBGroupSpec:
+    """Everything one stage-B Mc group's sweep needs, as host arrays.
+
+    The unit the parallel fit ships and slices. ``a``/``b`` are ABSOLUTE box
+    indices into the f0-sorted global box order, so a sub-range is addressed
+    in the same coordinates the assembled grid is concatenated in (box is
+    the SLOWEST axis of ``node_shape``, :func:`run_stacked_peak_sweep`).
+
+    Everything except ``f0_los``/``f0_dxs``/``node_shape[0]`` is group-wide
+    and is NEVER sliced: the Mc/alpha/sin-delta axes, the basis flag and the
+    shear coefficient define what a row MEANS, and a rank that sliced them
+    would score a different physical template while reporting the same box.
+    """
+
+    gi: int
+    n_groups: int
+    a: int
+    b: int
+    f0_los: np.ndarray
+    f0_dxs: np.ndarray
+    mc_ax: np.ndarray
+    alpha_ax: np.ndarray
+    sd_ax: np.ndarray
+    node_shape: tuple
+    ckpt_name: Optional[str]
+    parts_dir: Optional[str]
+    fingerprint_extra: str
+    fdot_axis: bool
+    c_t: float
+
+    @property
+    def n_boxes(self) -> int:
+        return int(self.b) - int(self.a)
+
+    def sub_range(self, a2, b2, *, ckpt_name=None) -> "StageBGroupSpec":
+        """This group restricted to ABSOLUTE boxes ``[a2, b2)``.
+
+        ``ckpt_name`` must differ per rank: the sweep's fingerprint hashes
+        the SLICED inputs plus ``node_shape``, so two ranks' checkpoints are
+        already mutually invalid -- but they must not collide on one path.
+        """
+        a2, b2 = int(a2), int(b2)
+        if not (self.a <= a2 <= b2 <= self.b):
+            raise ValueError(
+                f"sub_range({a2}, {b2}) is outside group {self.gi}'s "
+                f"box range [{self.a}, {self.b})")
+        i0, i1 = a2 - int(self.a), b2 - int(self.a)
+        return dataclasses.replace(
+            self,
+            a=a2,
+            b=b2,
+            f0_los=np.ascontiguousarray(self.f0_los[i0:i1]),
+            f0_dxs=np.ascontiguousarray(self.f0_dxs[i0:i1]),
+            node_shape=(i1 - i0,) + tuple(self.node_shape[1:]),
+            ckpt_name=(self.ckpt_name if ckpt_name is None else ckpt_name),
+        )
+
+
+def run_stage_b_group(spec: StageBGroupSpec, call_fstat: Callable, *, xp):
+    """Sweep ONE stage-B group (or one rank's box range of it).
+
+    The single entry point both the serial fit and every compute rank use,
+    so a split can never diverge from the serial code by construction. An
+    EMPTY range (more ranks than boxes) short-circuits: the sweep's
+    checkpoint layer is not defined at ``n_total == 0``, and there is
+    nothing to score.
+    """
+    if int(spec.node_shape[0]) == 0:
+        return xp.empty(tuple(spec.node_shape), dtype=xp.float64)
+    ckpt = (os.path.join(spec.parts_dir, spec.ckpt_name)
+            if (spec.parts_dir and spec.ckpt_name) else None)
+    return run_stacked_peak_sweep(
+        call_fstat, spec.f0_los, spec.f0_dxs, spec.mc_ax, spec.alpha_ax,
+        spec.sd_ax, spec.node_shape, xp=xp, ckpt=ckpt,
+        fingerprint_extra=spec.fingerprint_extra,
+        fdot_axis=spec.fdot_axis, c_t=spec.c_t)
+
+
+def write_stacked_npz(stacked_path, *, grids_g, mc_ax_g, f0_los, f0_dxs,
+                      alpha_ax, sd_ax, grid_basis, grid_c_t, peaks,
+                      band_idx, band_edges_mHz, band_edges_hz,
+                      group_sizes=None):
+    """Write the stage-B cache. ``group_sizes=None`` = the LEGACY 1-group keys.
+
+    Factored out of :func:`run_stacked_stage_b` so the parallel fit's head,
+    which assembles each group from per-rank partials, writes through the
+    SAME code -- the loader (``fstat_proposal.stacked_from_cache``)
+    dispatches on ``"logp_grids" in keys``, so the two formats are not
+    interchangeable and must never be produced by two separate writers.
+
+    The parallel fit feeds this function rank-ASSEMBLED concatenations
+    rather than whole-group sweeps, so a short or long partial (a dropped
+    rank, an off-by-one in :func:`split_box_range`, ...) would otherwise
+    write a cache whose box axis silently disagrees with ``f0_los[a:b]`` --
+    wrong templates proposed forever, with no error anywhere. Validate the
+    shapes before touching disk.
+    """
+    if len(grids_g) != len(mc_ax_g):
+        raise ValueError(
+            f"write_stacked_npz: {len(grids_g)} grid(s) but {len(mc_ax_g)} "
+            f"Mc axis/axes -- exactly one Mc axis per group is required")
+    if group_sizes is not None:
+        if len(grids_g) != len(group_sizes):
+            raise ValueError(
+                f"write_stacked_npz: {len(grids_g)} grid(s) but "
+                f"{len(group_sizes)} group_sizes entries")
+        for gi, (grid, want) in enumerate(zip(grids_g, group_sizes)):
+            # ``grid`` may be a device (cupy) array here -- read ``.shape``
+            # directly rather than routing through ``np.asarray``/``_to_host``,
+            # which would force a device->host copy of the WHOLE grid (up to
+            # ~650 MB) just to look at one integer, or (for cupy specifically)
+            # raise outright: cupy's ``__array__`` refuses implicit
+            # conversion, so ``np.asarray(cupy_array)`` is not even a slow
+            # path here, it is a crash on every GPU production run.
+            got = int(grid.shape[0])
+            want = int(want)
+            if got != want:
+                raise ValueError(
+                    f"write_stacked_npz: group {gi} grid has {got} box(es) "
+                    f"but group_sizes[{gi}] says {want} -- a short or long "
+                    f"partial would write a cache whose box axis silently "
+                    f"disagrees with f0_los[a:b]")
+    total_boxes = sum(int(g.shape[0]) for g in grids_g)
+    if total_boxes != len(f0_los):
+        raise ValueError(
+            f"write_stacked_npz: {total_boxes} box(es) across all groups "
+            f"but f0_los has {len(f0_los)} entries")
+    if total_boxes != len(f0_dxs):
+        raise ValueError(
+            f"write_stacked_npz: {total_boxes} box(es) across all groups "
+            f"but f0_dxs has {len(f0_dxs)} entries")
+
+    os.makedirs(os.path.dirname(stacked_path), exist_ok=True)
+    common = dict(
+        f0_los=f0_los, f0_dxs=f0_dxs, alpha_ax=alpha_ax, sin_delta_ax=sd_ax,
+        # THE BASIS IS PART OF THE CACHE. Axis 2's VALUES differ between the
+        # two meanings, but a consumer that reads them as chirp masses when
+        # they are Hz/s gets no error at all -- just births at absurd
+        # parameters. Stamp it, and refuse a mismatch on load.
+        grid_basis=grid_basis, grid_c_t=float(grid_c_t),
+        peak_f0_mHz=peaks[:, 0], peak_F=peaks[:, 1], band_idx=band_idx,
+        band_f0_lo=band_edges_mHz[band_idx],
+        band_f0_hi=band_edges_mHz[band_idx + 1],
+        band_edges=np.asarray(band_edges_hz, dtype=float),
+    )
+    if group_sizes is None:
+        np.savez(stacked_path, logp_grids=_to_host(grids_g[0]),
+                 mc_ax=mc_ax_g[0], **common)
+        return
+    group_arrays = {}
+    for gi in range(len(grids_g)):
+        group_arrays[f"logp_grids_g{gi}"] = _to_host(grids_g[gi])
+        group_arrays[f"mc_ax_g{gi}"] = mc_ax_g[gi]
+    np.savez(stacked_path, group_sizes=np.asarray(group_sizes, dtype=int),
+             **common, **group_arrays)
+
+
+def split_box_range(a, b, n_parts):
+    """Split boxes ``[a, b)`` into ``n_parts`` CONTIGUOUS, near-equal ranges.
+
+    A pure function of ``(a, b, n_parts)`` -- that is load-bearing: a resume
+    must reproduce the same rank -> range map, or a rank would find another
+    rank's checkpoint under its own name (the fingerprint would reject it and
+    the group would silently restart, which is safe but wastes the sweep).
+
+    CONTIGUITY, not interleaving, is also load-bearing: the sig-het F-stat
+    keeps ONE reference block resident and rebuilds it on f0 boundary
+    crossings, so an f0-contiguous range divides the block builds
+    proportionally, while an interleaved one would rebuild every block on
+    every rank (measured 4,600 rebuilds ~ 350 s in the F-ordered-box
+    incident, see run_stacked_stage_b's f0-sort comment).
+
+    The first ``(b - a) % n_parts`` ranges get one extra box. With fewer
+    boxes than parts the tail ranges come back EMPTY (zero width), which
+    :func:`run_stage_b_group` short-circuits.
+    """
+    a, b, n = int(a), int(b), int(n_parts)
+    if n <= 0:
+        raise ValueError(f"n_parts must be positive, got {n_parts!r}")
+    total = max(b - a, 0)
+    base, rem = divmod(total, n)
+    out, start = [], a
+    for i in range(n):
+        width = base + (1 if i < rem else 0)
+        out.append((start, start + width))
+        start += width
+    return out
+
+
+def stage_b_part_path(parts_dir, gi, rank) -> str:
+    """``<parts>/stageb_g{gi}_r{rank}.npy`` -- one rank's slice of one group.
+
+    The ``stageb`` prefix is deliberate: the existing
+    ``ckpt_clear(_parts, "stageb")`` at the end of a successful stage B
+    already removes the per-rank PROGRESS files by prefix, and these
+    partials are cleared by :func:`clear_stage_b_parts` alongside them.
+    """
+    return os.path.join(parts_dir, f"stageb_g{int(gi)}_r{int(rank)}.npy")
+
+
+def save_stage_b_part(parts_dir, gi, rank, grid):
+    """Write one rank's finished slice as raw float64; return ``(path, n_rows, sha1)``.
+
+    ``np.save`` through an open file object, NOT a path: given a path it
+    appends ``.npy`` to whatever it is handed, which would turn the
+    write-then-rename temp name into ``....npy.tmp.npy``. The rename is what
+    makes the head's read of a partial atomic on a shared filesystem.
+
+    FLUSHED AND FSYNCED BEFORE THE RENAME. This is the branch's one
+    cross-NODE data path -- a worker writes here, replies, and the HEAD reads
+    the file from another node -- so the usual "the close is the barrier"
+    reasoning leans entirely on NFS close-to-open semantics. A bad read is
+    loud rather than silent (a short file raises out of ``np.load``, stale
+    content is caught by the sha1 ``assemble_stage_b_group`` re-checks), but
+    what it costs is a discarded stage-B wall, and the barrier is two lines.
+    """
+    os.makedirs(parts_dir, exist_ok=True)
+    arr = np.ascontiguousarray(_to_host(grid), dtype=np.float64)
+    path = stage_b_part_path(parts_dir, gi, rank)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as fh:
+        np.save(fh, arr, allow_pickle=False)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    return path, int(arr.shape[0]), hashlib.sha1(arr.tobytes()).hexdigest()[:16]
+
+
+def load_stage_b_part(parts_dir, gi, rank):
+    return np.load(stage_b_part_path(parts_dir, gi, rank), allow_pickle=False)
+
+
+def assemble_stage_b_group(parts_dir, gi, n_parts, node_shape, *, xp,
+                           sha1s=None):
+    """Concatenate one group's per-rank partials in RANK (== box) order.
+
+    Box is the slowest axis of ``node_shape``
+    (:func:`run_stacked_peak_sweep`), and :func:`split_box_range` hands rank
+    ``r`` a contiguous ascending range, so rank-ordered concatenation on
+    axis 0 reproduces the whole-group sweep exactly. ``sha1s`` (rank ->
+    digest, as the ranks reported them) is verified when given: a partial
+    that changed between the reply and the read is a filesystem fault, and
+    silently fitting on it would corrupt the epoch with no symptom.
+
+    If ``sha1s`` is passed at all, EVERY rank ``0..n_parts-1`` must carry a
+    non-``None`` digest in it. A rank missing from the dict (a lost or
+    malformed MPI reply) is exactly the failure this check exists to catch
+    -- silently skipping verification for that one rank would defeat the
+    whole point, so it raises instead of falling back to "unverified".
+
+    Each partial is read STRAIGHT INTO its slice of one preallocated output
+    array. A ``parts`` list plus ``np.concatenate`` would hold the whole
+    group twice on the host at the moment of the concat -- ~1.3 GB transient
+    for the 653 MB production group 1, on top of the device copy -- for no
+    gain: the destination is contiguous and the order is known up front.
+    """
+    node_shape = tuple(int(v) for v in node_shape)
+    if sha1s is not None:
+        missing = [r for r in range(int(n_parts)) if sha1s.get(r) is None]
+        if missing:
+            raise RuntimeError(
+                f"stage-B group {gi}: sha1s given but missing/None for "
+                f"rank(s) {missing} of {n_parts} -- cannot verify those "
+                f"partials, refusing to silently skip verification")
+    out = np.empty(node_shape, dtype=np.float64)
+    off = 0
+    for r in range(int(n_parts)):
+        arr = np.ascontiguousarray(load_stage_b_part(parts_dir, gi, r))
+        if sha1s is not None:
+            got = hashlib.sha1(arr.tobytes()).hexdigest()[:16]
+            if got != sha1s[r]:
+                raise RuntimeError(
+                    f"stage-B partial g{gi} r{r} changed under us: reported "
+                    f"sha1 {sha1s[r]}, read {got} "
+                    f"({stage_b_part_path(parts_dir, gi, r)})")
+        if tuple(arr.shape[1:]) != node_shape[1:] or (
+                off + int(arr.shape[0]) > node_shape[0]):
+            raise RuntimeError(
+                f"stage-B group {gi}: partial r{r} is {tuple(arr.shape)} at "
+                f"box offset {off}, which does not fit {node_shape}")
+        out[off:off + int(arr.shape[0])] = arr
+        off += int(arr.shape[0])
+    if off != node_shape[0]:
+        raise RuntimeError(
+            f"stage-B group {gi}: assembled {off} box(es) from {n_parts} "
+            f"partials, expected {node_shape[0]} ({node_shape})")
+    return xp.asarray(out)
+
+
+def clear_stage_b_parts(parts_dir, gi, n_parts) -> None:
+    """Remove one group's partials (and any leftover temp files)."""
+    for r in range(int(n_parts)):
+        for path in (stage_b_part_path(parts_dir, gi, r),
+                     stage_b_part_path(parts_dir, gi, r) + ".tmp"):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 def mc_ladder_levels(n_req):
     """Doubling-ladder quantization of per-box Mc-node requirements.
 
@@ -986,7 +1523,8 @@ def mc_ladder_levels(n_req):
 def run_stacked_stage_b(call_fstat: Callable, peaks, *, xp, Tobs: float,
                         band_edges_hz, mc_lims, ratio_max=None,
                         cache_path: Optional[str] = None,
-                        fingerprint_extra: str = "", epoch=None):
+                        fingerprint_extra: str = "", epoch=None,
+                        sweep_runner=None):
     """Stage B: clamped boxes -> batched sweep(s) -> stacked grids.
 
     Assemble (host, cheap): every selected peak's 4-D box with its f0 range
@@ -1000,6 +1538,15 @@ def run_stacked_stage_b(call_fstat: Callable, peaks, *, xp, Tobs: float,
     :class:`GroupedStackedFStatProposal` (exact mixture equivalence) and
     the grouped npz format. ``FSTAT_MC_GROUPING=0`` restores the one
     max-f0-sized stack.
+
+    ``sweep_runner`` replaces the per-group kernel stream with
+    ``runner(spec, call_fstat, xp=xp) -> grid`` (``spec`` is a
+    :class:`StageBGroupSpec`). ``None`` is the serial path,
+    :func:`run_stage_b_group`, and is byte-identical to the historical
+    code. The multi-rank fit passes a runner that splits the group by
+    contiguous box range across the compute ranks and concatenates the
+    partials -- box is the SLOWEST axis, so concatenation on axis 0 in box
+    order reproduces the whole-group sweep exactly.
 
     Returns the live proposal (or ``None`` if no peaks).
     """
@@ -1165,13 +1712,16 @@ def run_stacked_stage_b(call_fstat: Callable, peaks, *, xp, Tobs: float,
         # single group keeps the historical "stageb" checkpoint name so
         # in-flight fits resume across this code change.
         _ck = "stageb" if n_groups == 1 else f"stageb_g{gi}"
-        grids_g.append(run_stacked_peak_sweep(
-            call_fstat, f0_los[a:b], f0_dxs[a:b], mc_ax, alpha_ax, sd_ax,
-            node_shape, xp=xp,
-            ckpt=os.path.join(_parts, _ck) if _parts else None,
+        spec = StageBGroupSpec(
+            gi=gi, n_groups=n_groups, a=a, b=b,
+            f0_los=f0_los[a:b], f0_dxs=f0_dxs[a:b], mc_ax=mc_ax,
+            alpha_ax=alpha_ax, sd_ax=sd_ax, node_shape=node_shape,
+            ckpt_name=_ck, parts_dir=_parts,
             fingerprint_extra=fingerprint_extra,
             fdot_axis=_fdot_axis, c_t=_c_t,
-        ))  # beta = 1: logp = F
+        )
+        runner = sweep_runner if sweep_runner is not None else run_stage_b_group
+        grids_g.append(runner(spec, call_fstat, xp=xp))  # beta = 1: logp = F
         mc_ax_g.append(mc_ax)
         n_mc_g.append(n_Mc)
 
@@ -1182,25 +1732,13 @@ def run_stacked_stage_b(call_fstat: Callable, peaks, *, xp, Tobs: float,
         )
         if cache_path:
             stacked_path = cache_path.replace(".npz", "_peaks_stacked.npz")
-            os.makedirs(os.path.dirname(stacked_path), exist_ok=True)
-            np.savez(
-                stacked_path,
-                logp_grids=_to_host(grids_g[0]), f0_los=f0_los,
-                f0_dxs=f0_dxs, mc_ax=mc_ax_g[0], alpha_ax=alpha_ax,
-                sin_delta_ax=sd_ax,
-                # THE BASIS IS PART OF THE CACHE. Axis 2's VALUES differ
-                # between the two meanings, but a consumer that reads them
-                # as chirp masses when they are Hz/s gets no error at all --
-                # just births at absurd parameters. Stamp it, and refuse a
-                # mismatch on load.
+            write_stacked_npz(
+                stacked_path, grids_g=grids_g, mc_ax_g=mc_ax_g,
+                f0_los=f0_los, f0_dxs=f0_dxs, alpha_ax=alpha_ax, sd_ax=sd_ax,
                 grid_basis=("fdot" if _fdot_axis else "Mc"),
-                grid_c_t=float(_c_t if _fdot_axis else 0.0),
-                peak_f0_mHz=peaks[:, 0], peak_F=peaks[:, 1],
-                band_idx=band_idx,
-                band_f0_lo=band_edges_mHz[band_idx],
-                band_f0_hi=band_edges_mHz[band_idx + 1],
-                band_edges=np.asarray(band_edges_hz, dtype=float),
-            )
+                grid_c_t=(_c_t if _fdot_axis else 0.0), peaks=peaks,
+                band_idx=band_idx, band_edges_mHz=band_edges_mHz,
+                band_edges_hz=band_edges_hz, group_sizes=None)
             logger.info("[cache] wrote %s", stacked_path)
             ckpt_clear(_parts, "stageb")
         return stacked
@@ -1225,25 +1763,14 @@ def run_stacked_stage_b(call_fstat: Callable, peaks, *, xp, Tobs: float,
 
     if cache_path:
         stacked_path = cache_path.replace(".npz", "_peaks_stacked.npz")
-        os.makedirs(os.path.dirname(stacked_path), exist_ok=True)
-        group_arrays = {}
-        for gi in range(n_groups):
-            group_arrays[f"logp_grids_g{gi}"] = _to_host(grids_g[gi])
-            group_arrays[f"mc_ax_g{gi}"] = mc_ax_g[gi]
-        np.savez(
-            stacked_path,
-            group_sizes=_sizes, f0_los=f0_los, f0_dxs=f0_dxs,
-            alpha_ax=alpha_ax, sin_delta_ax=sd_ax,
+        write_stacked_npz(
+            stacked_path, grids_g=grids_g, mc_ax_g=mc_ax_g,
+            f0_los=f0_los, f0_dxs=f0_dxs, alpha_ax=alpha_ax, sd_ax=sd_ax,
             grid_basis=("fdot" if _fdot_axis else "Mc"),
-            grid_c_t=float(_c_t if _fdot_axis else 0.0),
-            peak_f0_mHz=peaks[:, 0], peak_F=peaks[:, 1], band_idx=band_idx,
-            band_f0_lo=band_edges_mHz[band_idx],
-            band_f0_hi=band_edges_mHz[band_idx + 1],
-            band_edges=np.asarray(band_edges_hz, dtype=float),
-            **group_arrays,
-        )
-        logger.info("[cache] wrote %s (%d Mc groups)", stacked_path,
-                    n_groups)
+            grid_c_t=(_c_t if _fdot_axis else 0.0), peaks=peaks,
+            band_idx=band_idx, band_edges_mHz=band_edges_mHz,
+            band_edges_hz=band_edges_hz, group_sizes=_sizes)
+        logger.info("[cache] wrote %s (%d Mc groups)", stacked_path, n_groups)
         ckpt_clear(_parts, "stageb")
     return stacked
 
@@ -1252,22 +1779,110 @@ def run_stacked_stage_b(call_fstat: Callable, peaks, *, xp, Tobs: float,
 # orchestrator
 # --------------------------------------------------------------------------
 
+def comb_cache_usable(comb_cache: str, fingerprint_extra: str) -> bool:
+    """Is this FINISHED comb scan the one THIS fit would have run?
+
+    ``fingerprint_extra`` salts :func:`ckpt_fingerprint`, i.e. the in-flight
+    PROGRESS files only. A completed ``*_comb.npz`` is not a checkpoint, so
+    until this existed it was reloaded on ``os.path.exists`` alone -- and a
+    refit whose reference walker moved re-selected its peak BOXES from the
+    previous walker's scan while stage B then scored inside those boxes at
+    the NEW reference. Two residuals stitched into one fit, with nothing
+    anywhere to say so.
+
+    That is not hypothetical: 6mo epoch 1 hit exactly it (the global argmax
+    moved from walker 0 to walker 2 across a restart). It was ruled a known
+    limitation on 2026-09-17 because the effect is proposal quality, not
+    correctness -- births are MH-corrected -- and because rescanning cost
+    the full 47-minute serial comb. Stage A is split now, so the rescan is
+    ~12 minutes and the limitation is not worth keeping.
+
+    A cache with NO stamp is a legacy one, written before this landed. It is
+    REUSED, with a warning: refusing it would throw away a finished comb on
+    the first restart of every fit currently in flight, which is the exact
+    cost this is meant to avoid -- and it is no worse than the behavior that
+    wrote it. An UNREADABLE one is refused (there is nothing to reuse).
+    """
+    try:
+        with np.load(comb_cache, allow_pickle=False) as d:
+            stamp = (str(d["fingerprint_extra"])
+                     if "fingerprint_extra" in d else None)
+    except (OSError, ValueError) as exc:
+        logger.warning("[fit] comb cache %s could not be read (%s: %s); "
+                       "re-running the comb scan.", comb_cache,
+                       exc.__class__.__name__, exc)
+        return False
+    if stamp is None:
+        logger.warning(
+            "[fit] comb cache %s carries no reference-walker stamp (written "
+            "before the salt landed), so it cannot be checked against this "
+            "fit's %r -- reusing it. If this fit's reference walker moved, "
+            "its peak boxes come from the PREVIOUS walker's scan; delete the "
+            "file to force a clean rescan.", comb_cache, fingerprint_extra)
+        return True
+    if stamp != fingerprint_extra:
+        logger.info(
+            "[fit] comb cache %s was scored against a different reference "
+            "(%r, this fit is %r) -- re-running the comb scan rather than "
+            "selecting peaks from another walker's residual.",
+            comb_cache, stamp, fingerprint_extra)
+        return False
+    return True
+
+
+def stacked_grid_path(cache_dir: str) -> str:
+    """The stage-B output npz ``run_fstat_grid_fit`` writes and reloads.
+
+    Spelled exactly as every writer spells it -- ``os.path.join(cache_dir,
+    GRID_BASENAME)`` with the suffix swapped -- so a caller's pre-check can
+    never name a different file from the one the orchestrator tests.
+    """
+    return os.path.join(cache_dir, GRID_BASENAME).replace(
+        ".npz", "_peaks_stacked.npz")
+
+
+def stage_b_complete(cache_dir: str) -> bool:
+    """True when ``cache_dir`` already holds a finished stage-B grid.
+
+    The condition :func:`run_fstat_grid_fit` short-circuits on, exposed so a
+    caller can test it BEFORE paying for anything the short circuit would
+    throw away. Under the multi-rank fit that matters: the reference row is
+    ~72 MB per rank on the wire and the sig-het scorer built beside it is
+    ~GB on device, and a "fit" decision can legitimately land on a complete
+    npz (a ``DONE.json`` lost beside one, an offline grid dropped in).
+
+    Says nothing about a ZERO-PEAK epoch, for which no npz is ever written;
+    that is the manifest's job (``_epoch_complete`` /
+    ``_epoch_missing_for_ranks`` in the GB move).
+    """
+    return os.path.exists(stacked_grid_path(cache_dir))
+
+
 def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
                        band_edges_hz, f0_lims_hz, mc_lims, cache_dir: str,
                        fingerprint_extra: str = "", epoch=None,
-                       ratio_max=None):
+                       ratio_max=None, sweep_runner=None, comb_runner=None):
     """Full fit with resume: comb scan -> peak select -> stage B.
 
     ``epoch`` selects the peak-box weighting tilt only (see
     :func:`peak_weight_alpha_env`); it does not change what is computed or
     cached, so the npz caches stay interchangeable across epochs.
 
+    ``comb_runner`` is forwarded to :func:`run_comb_scan` and
+    ``sweep_runner`` to :func:`run_stacked_stage_b`; ``None`` is the serial
+    per-level / per-group kernel stream. The stacked-cache short circuit
+    below it is unchanged -- a complete epoch never re-enters the kernel,
+    parallel or not, and ``call_fstat`` is never called on that path (see
+    :func:`stage_b_complete`, which a caller can test first to avoid
+    BUILDING one).
+
     Cache reuse IS the mid-fit resume, and it is always on:
 
     * ``<cache_dir>/fstat_grid_peaks_stacked.npz`` present -> load and return
       (the fit is done; nothing recomputed).
-    * ``<cache_dir>/fstat_grid_comb.npz`` present -> reload the comb, re-select
-      peaks (cheap, deterministic), run only stage B.
+    * ``<cache_dir>/fstat_grid_comb.npz`` present AND scored against this
+      fit's reference (:func:`comb_cache_usable`) -> reload the comb,
+      re-select peaks (cheap, deterministic), run only stage B.
     * otherwise -> run both stages.
 
     Returns ``(stacked_or_None, n_peaks)``.
@@ -1277,7 +1892,7 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
     os.makedirs(cache_dir, exist_ok=True)
     cache_path = os.path.join(cache_dir, GRID_BASENAME)
     comb_cache = cache_path.replace(".npz", "_comb.npz")
-    stacked_cache = cache_path.replace(".npz", "_peaks_stacked.npz")
+    stacked_cache = stacked_grid_path(cache_dir)
 
     if os.path.exists(stacked_cache):
         d = np.load(stacked_cache, allow_pickle=False)
@@ -1306,7 +1921,14 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
         )
         return stacked, int(len(d["peak_f0_mHz"]))
 
-    if os.path.exists(comb_cache):
+    # Stage A's wall, on its own line -- it used to be the head-only half of
+    # the fit and the only serial one left, so it has to stay readable
+    # directly rather than inferred by subtracting stage B from the fit.
+    # Measured at 6mo epoch 1 before the split: 2804 s on ONE GPU against
+    # stage B's 3068 s on four, i.e. 48% of the epoch.
+    _t_stage_a = time.time()
+    if os.path.exists(comb_cache) and comb_cache_usable(
+            comb_cache, fingerprint_extra):
         d = np.load(comb_cache, allow_pickle=False)
         logger.info("[fit] reusing comb cache %s; re-selecting peaks",
                     comb_cache)
@@ -1318,13 +1940,18 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
         _f0, _F, peaks, _x = run_comb_scan(
             call_fstat, xp=xp, Tobs=Tobs, band_edges_hz=band_edges_hz,
             f0_lims_hz=f0_lims_hz, mc_lims=mc_lims, cache_path=cache_path,
-            fingerprint_extra=fingerprint_extra,
+            fingerprint_extra=fingerprint_extra, comb_runner=comb_runner,
         )
+    logger.info("[stageA] comb + peak selection: %d peaks in %s (%s)",
+                int(len(peaks)), _fmt_secs(time.time() - _t_stage_a),
+                "split by node range over the compute ranks"
+                if comb_runner is not None else "serial, this process")
 
     stacked = run_stacked_stage_b(
         call_fstat, peaks, xp=xp, Tobs=Tobs, band_edges_hz=band_edges_hz,
         mc_lims=mc_lims, ratio_max=ratio_max, cache_path=cache_path,
         fingerprint_extra=fingerprint_extra, epoch=epoch,
+        sweep_runner=sweep_runner,
     )
     return stacked, int(len(peaks))
 

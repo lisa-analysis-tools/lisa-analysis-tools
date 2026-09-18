@@ -1088,8 +1088,20 @@ class GaussianMixtureModel:
         self.max_iter = max_iter
         self.n_init = n_init
         self.init_params = init_params
+        # ``None`` -> the array module itself (numpy/cupy ``random``), the
+        # historical unseeded behaviour. An INT is normalised to that
+        # module's ``RandomState``, which carries every method this class
+        # calls (choice / multinomial / rand / uniform / randn /
+        # standard_normal / multivariate_normal) while making a refit of the
+        # same data reproducible -- ``init_params="random_from_data"`` draws
+        # fresh starting points on every call, so an unseeded refit of one
+        # store gave different component counts AND different components
+        # (2026-09-18). Anything else is passed through untouched, so a
+        # caller supplying its own generator still works.
         if random_state is None:
             random_state = self.xp.random
+        elif isinstance(random_state, (int, np.integer)):
+            random_state = self.xp.random.RandomState(int(random_state))
 
         self.random_state = random_state
         self.warm_start = warm_start
@@ -1929,7 +1941,8 @@ class GMMFit:
         else:
             return np
 
-    def __init__(self, samples_in=None, n_components=30, gpu=None):
+    def __init__(self, samples_in=None, n_components=30, gpu=None,
+                 random_state=None):
 
         self.gpu = gpu
         if gpu is not None:
@@ -1954,7 +1967,12 @@ class GMMFit:
             weights_init=None,
             means_init=None,
             precisions_init=None,
-            random_state=None,
+            # Seedable (2026-09-18). ``None`` keeps the historical unseeded
+            # behaviour; a value makes a refit of the same data reproducible,
+            # which it was not -- ``init_params="random_from_data"`` draws
+            # fresh starting points every call, so the same store refitted
+            # twice gave different component counts AND different components.
+            random_state=random_state,
             warm_start=False,
             verbose=0,
             verbose_interval=10,
@@ -2144,6 +2162,7 @@ def vec_fit_gmm_min_bic(
     gpu=None,
     verbose=False,
     return_components=False,
+    random_state=None,
 ):
     """Fit per-group GMMs by sweeping component count and selecting min BIC.
 
@@ -2156,8 +2175,16 @@ def vec_fit_gmm_min_bic(
         samples: Array of shape ``(n_groups, n_samples, n_features)``.
         min_comp: Smallest number of components to try.
         max_comp: Largest number of components to try.
-        n_samp_bic_test: Number of synthetic samples drawn from each fit to
-            evaluate the BIC.
+        n_samp_bic_test: UNUSED since 2026-09-18, kept so existing callers
+            keep working. The BIC is now evaluated on the FITTED DATA. It
+            used to be evaluated on ``n_samp_bic_test`` synthetic draws from
+            each fit, which is an entropy estimate rather than a
+            goodness-of-fit: it decreases monotonically with the component
+            count, so nothing was ever selected and every group returned
+            ``max_comp``.
+        random_state: Seed for the underlying EM. ``None`` (default) keeps
+            the historical unseeded behaviour; a value makes a refit of the
+            same samples reproducible.
         gpu: GPU device index to use; ``None`` selects CPU.
         verbose: If ``True``, print convergence progress.
         return_components: If ``True``, return the raw lists
@@ -2199,9 +2226,21 @@ def vec_fit_gmm_min_bic(
 
         inds_here = xp.arange(n_groups)[~converged]
         samples_here = samples[inds_here]
-        gmm = GMMFit(samples_here, n_components=comp_i, gpu=gpu)
-        samp = gmm.rvs(n_samp_bic_test)
-        bic = gmm.bic(samp)
+        gmm = GMMFit(samples_here, n_components=comp_i, gpu=gpu,
+                     random_state=random_state)
+        # SCORE THE CRITERION ON THE DATA (2026-09-18 fix). This previously
+        # read
+        #     samp = gmm.rvs(n_samp_bic_test); bic = gmm.bic(samp)
+        # i.e. it scored the model against its OWN synthetic draws. That is
+        # an entropy estimate, not a goodness-of-fit: it falls monotonically
+        # as components are added, so the criterion had no minimum, the
+        # "risen twice past the running minimum" retirement below could never
+        # fire, and EVERY group ran to ``max_comp`` and returned the cap.
+        # Measured on a clean unimodal 9-D Gaussian: 30556 at K=1 decreasing
+        # to 22255 at K=7, with and without resampling. ``GMMFit.bic`` takes
+        # PHYSICAL coordinates and maps them to the unit cube itself, so the
+        # fitted input is exactly what it wants.
+        bic = gmm.bic(samples_here)
 
         above_min_bic = bic > min_bic[inds_here]
         below_min_bic = bic < min_bic[inds_here]

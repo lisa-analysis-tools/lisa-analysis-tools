@@ -2465,6 +2465,59 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         self._eigen_inner.periodic = self.periodic
         return self._eigen_inner
 
+    def _eigen_scope(self):
+        """``{PREFIX}_EIGEN_SCOPE``: ``cold_per_walker`` (default) or ``per_temp``.
+
+        ``cold_per_walker`` (2026-09-18 user ruling) builds the information
+        matrix ONLY on the COLD row, one table per walker, and shares each
+        walker's table up its own ladder. Two reasons:
+
+        * **Correctness.** The hot rungs sit far from the mode, where the
+          log-likelihood genuinely has negative-curvature directions -- the
+          3-month run logged ``8/12 matrices had a non-positive eigenvalue
+          (worst lambda/lambda_max = -inf) -> projected onto the PSD cone``,
+          12 being galfor's ntemps. Expanding only at the cold row removes
+          that class of table entirely.
+        * **Cost.** Builds drop from ``ntemps`` to ``nwalkers`` points --
+          12 -> 1 for galfor/psd at one walker per rank.
+
+        It also fixes a smaller latent issue: the legacy path expanded at
+        every rung but scored all of them against walker 0's residual.
+
+        ``per_temp`` restores the pre-2026-09-18 behaviour exactly (every
+        rung at walker 0, shared across walkers, no sigma tempering) for
+        A/B work. Mirrors ``AddRemove._eigen_scope``'s knob spelling.
+        """
+        val = getattr(self, "eigen_table_scope", None)
+        if val is None:
+            val = os.environ.get(f"{self._debug_prefix}_EIGEN_SCOPE", None)
+        if val is None:
+            return "cold_per_walker"
+        val = str(val).strip().lower()
+        if val not in ("cold_per_walker", "per_temp"):
+            logger.warning(
+                "[%s] unknown EIGEN_SCOPE %r (use 'cold_per_walker' or "
+                "'per_temp'); using 'cold_per_walker'",
+                self._debug_prefix, val,
+            )
+            return "cold_per_walker"
+        return val
+
+    def _eigen_temper_sigmas(self) -> bool:
+        """``{PREFIX}_EIGEN_TEMPER_SIGMAS`` (default ON under cold_per_walker).
+
+        Widens the shared cold sigma by ``1/sqrt(beta)`` per rung. Only
+        meaningful when a cold table is reused up the ladder; see
+        :func:`~lisatools.globalfit.moves.eigen_refresh.temper_sigmas` for
+        why omitting it freezes the hot chains. ``0`` hands every rung the
+        bare cold sigma, which is what ``AddRemove``'s ``walker_max`` scope
+        still does (tracked separately).
+        """
+        raw = os.environ.get(f"{self._debug_prefix}_EIGEN_TEMPER_SIGMAS")
+        if raw is None:
+            return True
+        return str(raw).strip().lower() not in ("0", "false", "no", "")
+
     def _refresh_eigen_tables(self, tmp_branches_coords):
         """Per-branch, per-rung eigen tables from likelihood second differences at walker 0.
 
@@ -2474,15 +2527,32 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         ``information_matrix_from_ll``) and the fixed branches at the cold row.
         Scoring goes through :meth:`compute_psd_rows`, so it scatters too.
         """
-        from .eigen_refresh import eigen_tables_from_ll_batch, prior_box_widths
+        from .eigen_refresh import (
+            eigen_tables_from_ll_batch,
+            prior_box_widths,
+            temper_sigmas,
+        )
 
         names = list(tmp_branches_coords)
         first = np.asarray(tmp_branches_coords[names[0]])
         ntemps, nwalkers = int(first.shape[0]), int(first.shape[1])
         inner = self._eigen_inner_move()
+        cold_only = self._eigen_scope() == "cold_per_walker"
+        # EXPANSION POINTS. cold_per_walker: the COLD row, one point per
+        # walker -> nwalkers builds. per_temp (legacy): every rung at walker
+        # 0 -> ntemps builds, shared across walkers.
+        sl = (0, slice(None)) if cold_only else (slice(None), 0)
         point = {
-            b: np.asarray(tmp_branches_coords[b], dtype=np.float64)[:, 0, 0, :] for b in names
+            b: np.asarray(tmp_branches_coords[b], dtype=np.float64)[sl][:, 0, :]
+            for b in names
         }
+        n_pts = int(point[names[0]].shape[0])
+        # Which walker's data each expansion point belongs to. Under
+        # cold_per_walker each point is that walker's own cold state, so it
+        # must be scored against THAT walker's residual/PSD; the legacy path
+        # scored every rung against walker 0, which is what it expanded at.
+        pt_walker = (np.arange(n_pts, dtype=np.int32) if cold_only
+                     else np.zeros(n_pts, dtype=np.int32))
         fixed = {k: np.asarray(v, dtype=np.float64)[0] for k, v in self._fixed_noise_coords.items()}
         for b in names:
             ndim_b = int(point[b].shape[1])
@@ -2490,27 +2560,49 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
 
             def call_ll(x, _b=b):
                 x = np.atleast_2d(np.asarray(x, dtype=np.float64))
-                rung = np.arange(x.shape[0]) % ntemps
+                # information_matrix_from_ll batches whole n_pts-point
+                # blocks in row order, so per-point metadata tiles by
+                # rows // n_pts (the same invariant the addremove builder
+                # relies on).
+                idx = np.arange(x.shape[0]) % n_pts
                 rows = {}
                 for key in self.NOISE_BRANCHES:
                     if key == _b:
                         rows[key] = x
                     elif key in point:
-                        rows[key] = point[key][rung]
+                        rows[key] = point[key][idx]
                     elif key in fixed:
                         rows[key] = np.tile(fixed[key], (x.shape[0], 1))
                 return self.compute_psd_rows(
-                    np.zeros(x.shape[0], dtype=np.int32),
+                    pt_walker[idx],
                     rows.get("psd"), rows.get("galfor"), rows.get("sgwb"),
                 )
 
             axes, sigmas = eigen_tables_from_ll_batch(
                 call_ll, point[b], widths, eps_rel=self.eigen_eps_rel
             )
-            axes5 = np.broadcast_to(
-                axes[:, None, None], (ntemps, nwalkers, 1, ndim_b, ndim_b)
-            ).copy()
-            sig4 = np.broadcast_to(sigmas[:, None, None], (ntemps, nwalkers, 1, ndim_b)).copy()
+            if cold_only:
+                # one table per walker, shared up the ladder; the sigmas are
+                # widened per rung because EigenAxisMove applies no beta
+                # scaling of its own (see eigen_refresh.temper_sigmas).
+                axes5 = np.broadcast_to(
+                    axes[None, :, None], (ntemps, nwalkers, 1, ndim_b, ndim_b)
+                ).copy()
+                sig4 = np.broadcast_to(
+                    sigmas[None, :, None], (ntemps, nwalkers, 1, ndim_b)
+                )
+                if self._eigen_temper_sigmas():
+                    sig4 = temper_sigmas(
+                        sig4, np.asarray(self.temperature_control.betas)
+                    )
+                sig4 = np.ascontiguousarray(sig4)
+            else:
+                axes5 = np.broadcast_to(
+                    axes[:, None, None], (ntemps, nwalkers, 1, ndim_b, ndim_b)
+                ).copy()
+                sig4 = np.broadcast_to(
+                    sigmas[:, None, None], (ntemps, nwalkers, 1, ndim_b)
+                ).copy()
             inner.set_axes(b, axes5, sig4)
 
     def _inner_propose(self, model, state):

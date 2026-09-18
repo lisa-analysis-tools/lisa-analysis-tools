@@ -106,6 +106,21 @@ class WalkerBlockLayout:
         p = self.placements[int(rank)]
         return p.w0, p.w1
 
+    def owner_of(self, w) -> tuple:
+        """Global walker ``w`` -> ``(owning compute rank, local row index)``.
+
+        The inverse of :meth:`block_of`. Needed wherever a head-side GLOBAL
+        walker index has to become an ACA ROW index: rows are per-rank, so a
+        global index is out of range on every rank but its owner (the
+        multi-rank F-stat fit's reference walker is exactly that case).
+        """
+        w = int(w)
+        if not (0 <= w < int(self.nwalkers)):
+            raise ValueError(f"walker {w} is outside [0, {int(self.nwalkers)})")
+        rank = self.compute_ranks[w // int(self.block)]
+        w0, _w1 = self.block_of(rank)
+        return int(rank), w - int(w0)
+
     def local_gpus(self, rank):
         devices = self.placements[int(rank)].devices
         return list(devices) if devices else None

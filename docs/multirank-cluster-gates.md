@@ -419,6 +419,177 @@ the per-iteration `[FANOUT]` `wait_s`/`head_s` budget, that is the
 justification to build `main_branches=`; if it is negligible at production
 `Tobs`/branch counts, leave it as documented, deferred overhead.
 
+## Step 5. Parallel F-stat epoch fit (WP7 addendum, 2026-09-16)
+
+The first epoch that REFITS under the walker-block layout
+(`GB_FSTAT_REFIT_EVERY=50`, so epoch 1 of the 6mo continuation) is the
+cluster half of the parallel F-stat gate. Measured baseline: epoch 0 took
+1 h 45 min, all of it stage B, on one of two GPUs.
+
+**BOTH sweeps are split now (2026-09-18).** Epoch 1 of
+`gf_prod_6mo_v8_4gpu` measured 5883 s total: stage A's comb 2804 s
+(46.7 min) on ONE GPU with three idle, and stage B 3068 s (51.1 min) over
+four ranks at 3.34x. Stage A was 48% of the epoch and the ceiling on the
+whole fit, so it is now split by contiguous NODE range per sky level — the
+comb is 222.9M evals at 6mo, 83% of them in the single nsky=512 level, and
+nodes are independent (the per-node reduction reads only that node's own
+sky block). Expect stage A ~12-14 min at four ranks and the epoch ~65 min,
+with stage B the ceiling again.
+
+`GB_OPS` now has all eight ops: the four per-propose session commands
+(`gb_run_proposal`, `gb_run_tempering`, `gb_finish`, `gb_sync` — the last is
+one-walker replica mode's) plus four non-session F-stat ops the head issues
+from `setup()`, before any session exists, listed in the order the fit
+issues them: `gb_fstat_ref_row` (replicate the global reference walker's
+residual + inverse-PSD row to every rank), `gb_fstat_comb` (stage A: one
+command per sky LEVEL, contiguous node ranges), `gb_fstat_stage_b` (stage B:
+one command per Mc group, contiguous box ranges), and `gb_fstat_release`
+(drop the replicated row, the cached sig-het scorer AND the scorer's
+reference blocks on the GB comp — `gb_wdm_comp._fstat`, the ~GB half — on
+every worker once the epoch's artifacts are written, then free the memory
+pool).
+
+What to collect from the head's `globalfit_run.log`:
+
+1. `F-stat grid fit epoch 1 starting (walker_ref=<w> GLOBAL on rank <r> row
+   <l>, ..., n_compute=<n>, ...)` — the reference is the GLOBAL argmax and
+   names its owner. Cross-check `walker_ref` against `DONE.json`, which now
+   also records `n_compute`; both feed the epoch's cache fingerprint as
+   `|wref=<walker_ref>`, so a restart whose global argmax moved restarts the
+   stage-B sweep and any in-flight comb scan cleanly instead of stitching
+   two residuals' rows into one grid. **The COMPLETED comb cache is covered
+   too now (2026-09-18).** It used to be reloaded on file existence alone —
+   `fingerprint_extra` salts `ckpt_fingerprint`, i.e. the in-flight progress
+   files, and a finished `*_comb.npz` is not one — so a refit whose argmax
+   moved re-selected its peak BOXES from the old walker's scan while stage B
+   scored inside them at the new reference. That was ruled an acceptable
+   limitation on 2026-09-17 (proposal quality, not correctness: births are
+   MH-corrected) because a rescan cost the full 47-minute serial comb; with
+   stage A split it costs ~12 min, so `run_comb_scan` now stamps
+   `fingerprint_extra` into the npz and a mismatch rescans, logging
+   `comb cache ... was scored against a different reference`. Epoch 1 hit
+   exactly this case (the argmax moved from walker 0 to walker 2).
+   **Budget ONE extra sweep on the first relaunch after this branch lands.**
+   Appending `|wref=<w>` changed the salt, so every checkpoint a pre-branch
+   process left IN FLIGHT is invalid once — even when the reference walker
+   has not moved. Per epoch: a **complete** `*_peaks_stacked.npz`
+   short-circuits before anything else and pays nothing; a **complete comb
+   with an in-flight stage B** keeps the comb (a pre-branch comb carries no
+   stamp, so it is reused with a `carries no reference-walker stamp`
+   WARNING rather than rescanned — deliberately, so this relaunch does not
+   also pay for stage A) and re-sweeps stage B from zero, up to the full
+   1 h 45 min measured at 6mo; an **in-flight comb** re-scans the comb too,
+   now split over the ranks. It happens on the first relaunch and never
+   again. If that is unacceptable for the relaunch window, land the branch
+   at an iteration boundary where no epoch is mid-fit.
+2. `F-stat reference row replicated to <n> rank(s) ... <X> MB residual +
+   <Y> MB invC per rank` — at 6mo expect roughly 18 MB and 54 MB.
+   A wildly different size means `Nf_active` is not what the design assumed;
+   record the real number. A status word in the broadcast header makes an
+   OWNER-side snapshot failure surface as a named `RuntimeError` instead of
+   a hang; a NON-owner rank failing before that header broadcast still
+   hangs the run — a documented residual, not a bug to chase here.
+3. One `[FSTAT_COMB] level l/L over <n> rank(s): nodes [...] | wall min ...
+   max ... (imbalance ...%) | assembled ...s total` line per SKY LEVEL,
+   plus one `[FSTAT_COMB] l<li> r<r> nodes [a, b) (n) in <N>s` per rank per
+   level. At 6mo expect six levels (nsky 16..512) with the nsky=512 level
+   carrying 83% of the work; the node counts printed should sum to that
+   level's node count and the ranges are contiguous. Per-node cost is
+   uniform within a level, so an imbalance here is the sig-het
+   reference-block build over the range's f0 span — the same residue stage B
+   has, and the same remedy (weight by f0 span rather than node count).
+   `[stageA] comb + peak selection: <k> peaks in <T> (split by node range
+   over the compute ranks)` is the whole-stage line; `(serial, this
+   process)` there means the fan-out was not installed.
+4. One `[FSTAT_STAGEB] group g/G over <n> rank(s): boxes [...] | wall min
+   ... max ... (imbalance ...%)` line per Mc group. Per-box cost is uniform
+   within a group, so the residue is the sig-het reference-block build,
+   which scales with f0 span. An imbalance above ~20% is the signal to
+   weight the split by f0 span instead of box count (spec, Risks).
+5. `[FANOUT] op=gb_fstat_comb ...` per level and
+   `[FANOUT] op=gb_fstat_stage_b ... head_s=... max_rank_s=... wait_s=...`
+   per group — the transport view of the same balance.
+6. `F-stat grid fit epoch 1 done in <W>s` — compare `W` against epoch 0's
+   `wall_seconds` in `epoch_0000/DONE.json` and against epoch 1's own 5883 s
+   pre-split measurement. Expect roughly `1/n_compute` of BOTH the stage-A
+   and stage-B shares, plus the unchanged centre table, the row-broadcast
+   overhead (~72 MB total per rank, residual + invC) and the per-rank
+   partial-`.npy` I/O through the shared epoch directory. At four ranks on
+   the 6mo fit that is ~65 min against 98 min measured, with stage B back as
+   the dominant half (~78%).
+7. `F-stat reference row released on <n> of <n> worker rank(s); the head
+   keeps its own until the centre table is built.` — issued right after the
+   epoch's `.npz` + `DONE.json` are written and flushed. What each worker
+   actually gives back: the replicated row (~72 MB), the scorer closure, the
+   sig-het REFERENCE BLOCKS on its GB comp (`clear_fstat_references`; the
+   expensive half, and the one a dropped closure does not own), then
+   `free_all_blocks()`. **Watch a worker's `nvidia-smi` across the
+   ~50-iteration window after epoch 1 and record the step down** — the
+   block's "~GB" is an unmeasured estimate and that number belongs here. A
+   release failure (`gb_fstat_release failed after epoch <k> was written`)
+   is logged as a WARNING and is never fatal — the epoch is already on disk,
+   and a worker that kept its row loses it at the next `gb_fstat_ref_row`
+   regardless.
+
+At `n_compute == 1` (single rank, no fan-out) BOTH sweeps run the serial
+path exactly as they did before the parallel-fit change, golden-gated to a
+byte-identical npz — `_fstat_comb_runner` and `_fstat_stage_b_runner` both
+refuse to be built there, which is what keeps that gate closed rather than a
+docstring. None of the above fires; there is nothing to collect. Byte-identical
+is not cost-identical, though: the reference-row body still runs in process,
+so expect **+72 MB resident** (the two rows are hosted as copies and put
+back on the device) and one host round trip per fit, and on a multi-GPU
+single-rank box the sweep now runs on `acs.gpus[0]` (the holder's device)
+rather than on the shard that owns `walker_ref`. No disk round trip and no
+collective, as designed.
+
+If a one-walker-replica run (`NWALKERS=1` on several compute ranks) hits
+this refit, the same four ops fire: every rank's block is `(0, 1)`, the
+reference walker's owner is `compute_ranks[0]` — the HEAD under the default
+`main_rank=0`; with a non-zero `main_rank` `resolve_roles` orders the
+compute ranks by world rank, so `compute_ranks[0]` is a worker and the
+`Bcast` root is that worker (correct either way: every replica holds the
+same walker at local row 0) — and both sweeps split over the replicas
+exactly like walker blocks — read the log the same way. Run this step's
+epoch-1 verification in the SAME allocation as the one-walker campaign's
+`docs/one-walker-testing-campaign.md` T5 scaling gate: both need a
+multi-node GPU allocation, and there is no reason to request two.
+
+Correctness, if a serial refit of the same state is affordable: run one with
+`GF_LEGACY_RANK_LAYOUT=1` into a scratch fit root and diff the two
+`fstat_grid_peaks_stacked.npz` files key by key (the `assert_npz_identical`
+helper in `tests/test_fstat_parallel_fit.py` is the reference comparison).
+They must be byte-identical.
+
+Failure modes to watch for:
+
+- `gb_fstat_comb`/`gb_fstat_stage_b` `arrived before gb_fstat_ref_row` — a
+  rank missed the replication command; the run aborts through
+  `RemoteWorkerError`.
+- `comb partial lN rM changed under us` / `stage-B partial gN rM changed
+  under us` — shared-filesystem fault between the rank's reply and the
+  head's read.
+- `comb level N: assembled k node(s) from n partials, expected m` /
+  `stage-B group N: assembled (...) from k partials, expected (...)` — a
+  rank/range map mismatch; check that every rank sees the same
+  `n_compute`.
+- `comb level N partial <path> could not be read on the head ... although
+  every rank reported writing one` (and its stage-B twin) — the epoch cache
+  directory is NOT on a filesystem shared by every compute rank.
+- A rank dying mid-sweep aborts the run as for any op; the per-rank
+  checkpoints make the retry cheap AS LONG AS the relaunch uses the same
+  `n_compute`. Stage A's are
+  `<epoch>/fstat_grid_parts/comb_nsky*_r*.progress.npz` (the serial path
+  keeps the legacy `comb_nsky{lv}` name, and the head's
+  `ckpt_clear(_parts, "comb_")` catches both by prefix); stage B's are
+  `stageb_g*_r*.progress.npz`, or `stageb_r*.progress.npz` with a SINGLE Mc
+  group (`FSTAT_MC_GROUPING=0` or a band set narrow enough to make one
+  group, where the legacy `stageb` prefix is preserved deliberately; the
+  production 6mo fit has six groups). A changed rank count restarts each
+  level/group cleanly — correct, but it pays the whole sweep again.
+- `gb_fstat_release failed after epoch <k> was written` — logged, not
+  fatal; see item 7 above.
+
 ## Decisions this runbook closes
 
 Once Steps 0-4 are green:

@@ -274,7 +274,13 @@ templated kernels.
   `_owned_rows_mask`), a per-unit cold-chain delta ledger (`_ledger_*`), a
   merge by physical source on the head (`merge_owned_sources`) and a 4th
   fan-out command `gb_sync` that rebuilds every replica's residual from the
-  merged branch.
+  merged branch. `GB_OPS` carries three more — `gb_fstat_ref_row`,
+  `gb_fstat_stage_b`, `gb_fstat_release` — the NON-session F-stat epoch fit
+  (the head issues them from `setup()`, before any session exists): replicate
+  the global reference walker's residual + inverse-PSD row to every rank,
+  split each Mc group's stage-B sweep by contiguous box range, then drop the
+  row, the scorer and its comp-side reference blocks everywhere. Runbook:
+  `docs/multirank-cluster-gates.md` Step 5.
 - **Backend implementation hierarchy**: GPU C++ leads → CPU C++ mirrors via
   `#ifdef` → JAX diverges internally but must match C++ inner products
   (reldiff ≲ 1e-12). Narrowband WDM validation via `mm5`/`mm2`.

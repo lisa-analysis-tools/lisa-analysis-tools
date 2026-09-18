@@ -2,9 +2,9 @@
 
 ``FakeWorld(size)`` runs one Python thread per rank; ``FakeComm`` implements
 ``Get_rank / Get_size / Get_processor_name / send / isend / recv / iprobe /
-bcast / allgather / barrier / Split / Split_type / Abort / Free`` with
-pickle-copy transport, so the SAME fan-out code runs on a laptop with no
-MPI installed, in one python process. A test harness, not a performance
+bcast / Bcast / allgather / barrier / Split / Split_type / Abort / Free``
+with pickle-copy transport, so the SAME fan-out code runs on a laptop with
+no MPI installed, in one python process. A test harness, not a performance
 tool.
 
 What the fake does NOT model:
@@ -27,6 +27,8 @@ import queue
 import threading
 import time
 import traceback
+
+import numpy as np
 
 #: mirrors of the mpi4py constants the layout code needs (only identity matters)
 COMM_TYPE_SHARED = 1
@@ -134,6 +136,53 @@ class FakeComm:
     def bcast(self, obj, root=0):
         out = self._exchange(_pcopy(obj) if self._rank == int(root) else None)
         return _pcopy(out[int(root)])
+
+    def Bcast(self, buf, root=0):
+        """Buffer broadcast (uppercase MPI form): fills ``buf`` IN PLACE.
+
+        mpi4py's ``Bcast`` moves contiguous buffers without pickling, which
+        is what the F-stat reference row pair (tens of MB) uses. The fake
+        moves the bytes through the existing slot exchange and writes them
+        into each non-root rank's own array, so a caller that allocates its
+        own receive buffer -- the real usage -- takes the same shape here.
+
+        The receive buffer must be C-CONTIGUOUS: ``reshape(-1)`` returns a
+        view only then, and on a strided array it would copy, so the write
+        would land in a temporary and the broadcast would vanish with no
+        error at all. Refused loudly instead. (Every array the F-stat op
+        broadcasts is a fresh ``np.empty``, so this never fires in
+        production -- it exists so a future caller cannot fail silently.)
+
+        What this does NOT model, on top of the module-level list:
+
+        - the ROOT's buffer is never validated. Real mpi4py raises
+          ``BufferError`` for a non-contiguous send buffer; here the root
+          goes through ``tobytes()``, which happily linearizes a strided
+          array. So a strided buffer is rejected by BOTH implementations but
+          for different reasons and on different ranks -- receiver-side here,
+          sender-side there.
+        - the ``[buf, count, datatype]`` list form is accepted, but only
+          ``buf`` is honoured: an explicit ``count`` or MPI datatype is
+          dropped, and the whole array is sent at its own numpy dtype.
+        """
+        arr = buf[0] if isinstance(buf, (list, tuple)) else buf
+        arr = np.asarray(arr)
+        payload = self._exchange(
+            arr.tobytes() if self._rank == int(root) else None)[int(root)]
+        if self._rank != int(root):
+            if not arr.flags["C_CONTIGUOUS"]:
+                raise ValueError(
+                    "Bcast needs a C-contiguous receive buffer; got shape "
+                    f"{arr.shape} strides {arr.strides}, whose reshape(-1) "
+                    "is a COPY -- the broadcast would be silently lost")
+            flat = arr.reshape(-1)
+            got = np.frombuffer(payload, dtype=flat.dtype)
+            if got.size != flat.size:
+                raise ValueError(
+                    f"Bcast buffer size mismatch: root sent {got.size} "
+                    f"elements, this rank's buffer holds {flat.size}")
+            flat[:] = got
+        return None
 
     def allgather(self, obj):
         return [_pcopy(v) for v in self._exchange(_pcopy(obj))]

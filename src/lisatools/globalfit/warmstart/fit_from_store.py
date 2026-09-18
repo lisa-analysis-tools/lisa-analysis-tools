@@ -65,6 +65,105 @@ RATIO_COL = 8
 # cluster-feature space: (f0 [mHz], Mc, ln dist, alpha, sin_delta)
 FEAT_NAMES = ["f0", "Mc", "ln_dist", "alpha", "sin_delta"]
 
+# --------------------------------------------------------------------------
+# OBSERVABLE basis (2026-09-18). The fit runs in the coordinates the DATA
+# constrains rather than the ones the sampler uses:
+#
+#   0 lnA, 1 f_mid [Hz], 2 fdot [Hz/s], 3 phi0, 4 cos_iota, 5 psi,
+#   6 alpha, 7 sin_delta, 8 Mc [Msol] (the fiber)
+#
+# Indices 3..7 are IDENTICAL in both bases, so CIRCULAR_COLS and
+# COS_IOTA_COL above are reused unchanged; only 0/1/2/8 change meaning.
+#
+# UNITS TRAP: the map returns f_mid and fdot in HZ, not mHz -- the sampling
+# basis stores f0 in mHz. Every frequency-scaled quantity downstream (the
+# segmentation bin width, the whitening scale floor, the proposal's f0
+# candidate window) must therefore be taken in the units of the basis being
+# worked in. ``basis_df`` is the single place that choice is made.
+#: Bounded columns in the OBSERVABLE basis. cos_iota keeps its physical
+#: [-1, 1]; the sampling basis's +/- ratio_max rail is GONE because `fdot`
+#: is a raw unbounded coordinate there -- that rail is what produced ratio
+#: sigmas with a p90 of 30 across the shipped component set. `Mc` (the
+#: fiber, col 8) is bounded below by 0, which the GMM's own per-group
+#: mins/maxs already carry, so it is not listed here.
+OBSERVABLE_BOUNDED_COLS = {COS_IOTA_COL: (-1.0, 1.0)}
+
+#: Cluster feature space in the OBSERVABLE basis. `lnA` succeeds `ln_dist`
+#: (it IS the measured amplitude, already logged by the map) and `fdot`
+#: is new -- it is the separator the sampling metric lacks, because two
+#: fragments of one source share an f0 and differ in fdot. `Mc` LEAVES the
+#: metric: it is the fiber, a flat direction, and clustering on a flat
+#: direction is what generates the split artifacts the referee then merges.
+OBSERVABLE_FEAT_NAMES = ["f_mid", "fdot", "lnA", "alpha", "sin_delta"]
+
+#: Relative floor for the observable `fdot` whitening scale (see
+#: :func:`cluster_scale_floor`).
+FDOT_SCALE_FLOOR_FRAC = 1e-3
+
+
+class _DefaultGBBasisContainer:
+    """Stand-in transform container for :func:`build_map`.
+
+    ``GBObservableFiberBasis`` pins nothing per leaf for GB, so it reads
+    exactly one attribute off the container: ``input_basis``. This module
+    already declares that basis as :data:`COLUMN_NAMES` (verified against
+    ``stock/erebor/gb.py``), so the CLI does not need to import and build a
+    real stock container -- which would also break this module's
+    "waveform-free, numpy/scipy/h5py only" contract.
+
+    An explicit container always wins and is checked against
+    :data:`COLUMN_NAMES`, so a genuinely different sampling basis fails
+    loudly instead of mis-indexing every column.
+    """
+
+    input_basis = COLUMN_NAMES
+
+
+def basis_df(tobs: float, basis: str) -> float:
+    """Frequency bin width ``1/Tobs`` in the units column 1 is stored in.
+
+    ``"sampling"`` -> mHz (the stored ``f0``); ``"observable"`` -> Hz (the
+    map's ``f_mid``). Passing the mHz width against Hz data would make the
+    segmentation bins 1000x too wide and collapse the whole band into a
+    few islands.
+    """
+    if basis == "observable":
+        return 1.0 / float(tobs)
+    return 1.0 / float(tobs) * 1e3
+
+
+def to_observable(x_all: np.ndarray, obs_map) -> np.ndarray:
+    """``(n, 9)`` sampling rows -> ``(n, 9)`` observable rows.
+
+    THE intake seam: after this call no stage of the pipeline sees sampling
+    columns until the referee, the SNR gate or the proposal converts back.
+    """
+    return np.asarray(obs_map.to_internal(np.asarray(x_all, dtype=float)),
+                      dtype=float)
+
+
+def build_observable_map(tobs: float, transform_container=None,
+                         shear: float = 0.5, fiber_coord: str = "Mc"):
+    """The intake map, built at the SOURCE run's ``1/df`` (cross-Tobs v1).
+
+    Lazily imported so the sampling-basis path keeps this module free of
+    any lisatools dependency.
+    """
+    from . import basis as wb
+
+    if transform_container is None:
+        transform_container = _DefaultGBBasisContainer()
+    else:
+        got = list(getattr(transform_container, "input_basis", []) or [])
+        if got != COLUMN_NAMES:
+            raise ValueError(
+                f"transform_container input_basis {got} != this fitter's "
+                f"{COLUMN_NAMES}; the leaf-table column meanings would not "
+                "match the map's.")
+    return wb.build_map(transform_container, Tobs=float(tobs),
+                        shear=float(shear), fiber_coord=str(fiber_coord))
+
+
 # Stage-1 valley split (2026-08-24 fix): at final leaf density (~900
 # leaves/walker) the confusion band is CONTINUOUSLY occupied above the
 # global count floor, so floor-only segmentation returned ONE island for
@@ -229,17 +328,47 @@ def segment_f0(f0_mhz: np.ndarray, df_mhz: float, n_samples: int):
 # --------------------------------------------------------------------------
 # stage 2: within-island split (swappable: split(island_rows) -> labels)
 # --------------------------------------------------------------------------
-def make_cluster_features(x_all: np.ndarray) -> np.ndarray:
-    """(n, 9) sampled rows -> (n, 5) cluster features, alpha rotated so the
-    2pi wrap sits in the emptiest region of the island's alpha histogram."""
+def make_cluster_features(x_all: np.ndarray,
+                          basis: str = "sampling") -> np.ndarray:
+    """rows -> (n, 5) cluster features, alpha rotated so the 2pi wrap sits
+    in the emptiest region of the island's alpha histogram.
+
+    ``basis="sampling"``   -> (f0,    Mc,   ln dist, alpha, sin_delta)
+    ``basis="observable"`` -> (f_mid, fdot, lnA,     alpha, sin_delta)
+    Alpha is column 6 in BOTH bases, so the rotation below is shared.
+    """
     alpha = x_all[:, 6]
     hist = np.bincount((alpha / (2 * np.pi) * 36).astype(int) % 36,
                        minlength=36)
     shift = (int(hist.argmin()) + 0.5) * (2 * np.pi / 36)
     alpha_rot = (alpha - shift) % (2 * np.pi)
+    if basis == "observable":
+        return np.column_stack([x_all[:, 1], x_all[:, 2], x_all[:, 0],
+                                alpha_rot, x_all[:, 7]])
     return np.column_stack([x_all[:, 1], x_all[:, 2],
                             np.log(np.maximum(x_all[:, 0], 1e-30)),
                             alpha_rot, x_all[:, 7]])
+
+
+def cluster_scale_floor(feats: np.ndarray, df_seg: float,
+                        basis: str = "sampling") -> np.ndarray:
+    """Per-feature whitening scale floors ("a zero MAD must not shatter").
+
+    The sampling vector is the historical one. The observable vector CANNOT
+    reuse it: entry 1 is ``Mc`` (order 0.5) in the sampling metric but
+    ``fdot`` in the observable one, and ``fdot`` runs ~1e-17 at 1 mHz to
+    ~1e-12 at 30 mHz. A fixed 1e-4 floor there sits up to 1e13x ABOVE the
+    data, whitening every chirp difference to zero -- it would silently
+    delete the separator this basis change exists to add, and no fixed
+    absolute number works across five decades either. The floor is
+    therefore taken RELATIVE to the island's own chirp scale.
+    """
+    if basis == "observable":
+        fdot_scale = float(np.median(np.abs(feats[:, 1])))
+        return np.array([0.05 * df_seg,
+                         max(FDOT_SCALE_FLOOR_FRAC * fdot_scale, 1e-30),
+                         1e-3, 1e-3, 1e-3])
+    return np.array([0.05 * df_seg, 1e-4, 1e-3, 1e-3, 1e-3])
 
 
 def _satellite_merge(labels, zw, stats):
@@ -286,18 +415,20 @@ def _satellite_merge(labels, zw, stats):
 
 
 def split_single_linkage(island_rows: np.ndarray, rng: np.random.Generator,
-                         df_mhz: float, stats: dict) -> np.ndarray:
+                         df_seg: float, stats: dict) -> np.ndarray:
     """Default swappable splitter: split(island_rows) -> labels (-1 = junk).
 
-    island_rows: (n, 9) sampled-basis rows of ONE island.
+    island_rows: (n, 9) rows of ONE island, in ``stats["basis"]``.
+    ``df_seg`` is 1/Tobs in the units of column 1 of THAT basis.
     """
-    feats = make_cluster_features(island_rows)
+    basis = stats.get("basis", "sampling")
+    feats = make_cluster_features(island_rows, basis=basis)
     n = len(feats)
     sub = feats[rng.choice(n, min(n, SUB), replace=False)]
     med = np.median(sub, axis=0)
     mad = 1.4826 * np.median(np.abs(sub - med), axis=0)
     # column-aware scale floors (a zero MAD must not shatter the island)
-    scale_floor = np.array([0.05 * df_mhz, 1e-4, 1e-3, 1e-3, 1e-3])
+    scale_floor = cluster_scale_floor(feats, df_seg, basis)
     scale = np.maximum(mad, scale_floor)
     zw_sub = (sub - med) / scale
     if len(zw_sub) > 1:
@@ -406,6 +537,179 @@ def fit_component(rows: np.ndarray, stats: dict):
 
 
 # --------------------------------------------------------------------------
+# stage 3 (observable): cluster -> GAUSSIAN MIXTURE
+# --------------------------------------------------------------------------
+def _unscale_gmm_components(comps):
+    """Fitted unit-cube components -> PHYSICAL coordinates, in place of a copy.
+
+    ``GMMFit`` linearly maps each group's samples into ``[-1, 1]^d`` using
+    that group's per-feature ``(min, max)`` BEFORE fitting, so the lists
+    ``vec_fit_gmm_min_bic`` returns carry CUBE means and covariances, with
+    ``mins``/``maxs`` as the affine map back::
+
+        x_phys = (z_cube + 1) / 2 * (max - min) + min
+
+    :class:`~.proposal.WarmStartComponents` draws ``mean + L z`` and scores
+    a Mahalanobis distance directly against the stored arrays, so it needs
+    PHYSICAL ones; left as cube coordinates every draw would land at a
+    completely wrong point (and f_mid ~3 mHz would read as ~0).
+
+    ``mins``/``maxs`` are already physical -- they are the member bounding
+    box -- and stay untouched, so they keep working as the box the density
+    side culls on.
+
+    NOTE for the deferred ``FullGaussianMixtureModel`` swap (spec 4.5):
+    that class applies the affine ITSELF, so it must NOT be handed these
+    unscaled arrays. ``meta["gmm"]["components_basis"] = "physical"``
+    records which convention a file is in.
+    """
+    weights, means, covs, invcovs, dets, mins, maxs = comps
+    out_means, out_covs, out_invcovs, out_dets = [], [], [], []
+    for mu, cv, icv, dt, lo, hi in zip(means, covs, invcovs, dets,
+                                       mins, maxs):
+        lo = np.asarray(_host_array(lo), dtype=float)
+        hi = np.asarray(_host_array(hi), dtype=float)
+        s = (hi - lo) / 2.0                      # per-feature half-width
+        mu = np.asarray(_host_array(mu), dtype=float)
+        cv = np.asarray(_host_array(cv), dtype=float)
+        out_means.append((mu + 1.0) / 2.0 * (hi - lo) + lo)
+        # cov_phys = S cov_cube S with S = diag(s); invcov and det follow.
+        out_covs.append(cv * np.outer(s, s)[None, :, :])
+        icv = np.asarray(_host_array(icv), dtype=float)
+        out_invcovs.append(icv / np.outer(s, s)[None, :, :])
+        out_dets.append(np.asarray(_host_array(dt), dtype=float)
+                        * float(np.prod(s)) ** 2)
+    return [[np.asarray(_host_array(w), dtype=float) for w in weights],
+            out_means, out_covs, out_invcovs, out_dets,
+            [np.asarray(_host_array(v), dtype=float) for v in mins],
+            [np.asarray(_host_array(v), dtype=float) for v in maxs]]
+
+
+def _host_array(a):
+    """cupy-or-numpy -> numpy (the fitter may run on device)."""
+    return a.get() if hasattr(a, "get") else np.asarray(a)
+
+
+def resolve_gmm_gpu(spec):
+    """``--gmm-gpu`` string -> device index or ``None`` (CPU).
+
+    ``"auto"`` is the default because this fitter is run by hand on the
+    cluster: on a GPU node it should use the device the way the F-stat fit
+    does, and on a login node it must still run. Anything that fails to
+    report a device falls back to the host path with a printed reason
+    rather than raising -- a warm start that fits slowly is recoverable, a
+    warm start that does not fit at all blocks a launch.
+    """
+    if spec is None:
+        return None
+    s = str(spec).strip().lower()
+    if s in ("cpu", "none", "-1"):
+        return None
+    if s != "auto":
+        return int(s)
+    try:
+        import cupy as cp
+
+        if int(cp.cuda.runtime.getDeviceCount()) > 0:
+            return 0
+        print("[warmstart] --gmm-gpu auto: cupy sees no device; using CPU")
+    except Exception as exc:  # no cupy, no driver, no visible device
+        print(f"[warmstart] --gmm-gpu auto: GPU unavailable ({exc}); "
+              f"using CPU")
+    return None
+
+
+def fit_cluster_gmms(cluster_rows, *, n_samples: int = 4096,
+                     max_comp: int = 12, min_members: int = 25,
+                     seed: int = 7, gpu=None, verbose: bool = False):
+    """Per-cluster Gaussian mixtures, min-BIC, on the EXISTING GPU fitter.
+
+    Mirrors :func:`lisatools.sampling.fstat_proposal.fit_gmm_to_stacked`:
+    ``vec_fit_gmm_min_bic`` wants a RECTANGULAR
+    ``(n_groups, n_samples, n_features)`` block, so each cluster's members
+    are resampled to a fixed ``n_samples`` (with replacement when the
+    cluster is smaller).
+
+    ``min_members`` is the honesty guard. Resampling cannot manufacture
+    structure the members do not contain, but it CAN let BIC believe it has
+    more evidence than it does, so a cluster's component cap is
+    ``min(max_comp, max(1, n_members // min_members))``.
+
+    BIC is the selector and ``min_members`` only bounds it. That ordering
+    is true as of the 2026-09-18 fix to ``gmm.py``: the sweep used to score
+    BIC on the model's OWN synthetic draws (``gmm.bic(gmm.rvs(n))``), an
+    entropy estimate that falls monotonically in K, so the "risen twice
+    past the running minimum" retirement rule never fired and every group
+    returned ``max_comp``. The criterion is now evaluated on the fitted
+    data (``tests/test_gmm_min_bic_selection.py`` pins it).
+
+    ``seed`` feeds both the resampling draw and the EM initialisation
+    (``random_state``), so refitting the same store on the same device
+    reproduces the same K and the same components.
+
+    ``gpu`` is a CUDA device index handed straight to the shared fitter
+    (``None`` -> CPU), exactly as ``fstat_proposal.fit_gmm_to_stacked``
+    does. Device and host EM take different code paths inside ``gmm.py``,
+    so results are reproducible per device, not across devices.
+
+    Returns the seven ragged lists ``[weights, means, covs, invcovs, dets,
+    mins, maxs]``, one entry per cluster, in PHYSICAL coordinates (see
+    :func:`_unscale_gmm_components`), ready for
+    :func:`lisatools.sampling.fstat_proposal.pack_gmm_components`.
+    """
+    from lisatools.sampling.gmm import vec_fit_gmm_min_bic
+
+    rng = np.random.default_rng(seed)
+    caps = [min(int(max_comp), max(1, len(r) // int(min_members)))
+            for r in cluster_rows]
+    ndim = int(np.asarray(cluster_rows[0]).shape[1])
+    block = np.empty((len(cluster_rows), int(n_samples), ndim), dtype=float)
+    for i, rows in enumerate(cluster_rows):
+        rows = np.asarray(rows, dtype=float)
+        idx = rng.integers(0, len(rows), size=int(n_samples))
+        block[i] = rows[idx]
+        # DEGENERATE-COLUMN GUARD: GMMFit divides by (max - min) per
+        # feature, so a column that is constant across the cluster's
+        # members produces inf/nan for the whole group. Jitter such a
+        # column by a relative epsilon -- far below any posterior width,
+        # and it only ever affects columns that carry no information.
+        span = block[i].max(0) - block[i].min(0)
+        flat = span <= 0.0
+        if flat.any():
+            ref = np.maximum(np.abs(block[i].mean(0)), 1.0)
+            block[i][:, flat] += rng.normal(
+                0.0, 1e-12 * ref[flat], size=(int(n_samples), int(flat.sum())))
+
+    out = [[] for _ in range(7)]
+    # Groups sharing a cap are fitted together; the fitter sweeps a single
+    # (min_comp, max_comp) range per call, so one call per distinct cap.
+    for cap in sorted(set(caps)):
+        sel = [i for i, c in enumerate(caps) if c == cap]
+        comps = _unscale_gmm_components(vec_fit_gmm_min_bic(
+            block[sel], min_comp=1, max_comp=int(cap), gpu=gpu,
+            verbose=verbose, return_components=True,
+            random_state=int(seed),
+        ))
+        for j, i in enumerate(sel):
+            for k in range(7):
+                out[k].append((i, comps[k][j]))
+    if gpu is not None:
+        # The components are host arrays by now (_unscale_gmm_components
+        # calls _host_array). Hand the device memory back: this fitter runs
+        # in-process on a rank that is about to allocate its ACA and its GB
+        # band preload, and cupy's pool would otherwise hold the block
+        # (n_clusters x n_samples x ndim doubles plus EM workspace).
+        try:
+            import cupy as cp
+
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+    # restore cluster order
+    return [[v for _, v in sorted(lst, key=lambda t: t[0])] for lst in out]
+
+
+# --------------------------------------------------------------------------
 # stage 3.5: wide-blend re-split (ruling 2026-09-08)
 # --------------------------------------------------------------------------
 # Measured on the v8 deep fits: in dense islands the stage-2 MAD-whitened
@@ -421,15 +725,15 @@ def fit_component(rows: np.ndarray, stats: dict):
 # counted; the apply-stage blend flag catches it downstream). A genuine
 # same-source double-stack also splits (two near-coincident components)
 # -- the deliberate "split upstream" side of the open mult-policy ruling.
-def _ward_split(rows, sid, rng, df_mhz):
+def _ward_split(rows, sid, rng, df_seg, basis="sampling"):
     """One ward 2-split in the cluster's own whitened frame.
 
     Returns [(rows, sid), (rows, sid)] or None when the split is
     degenerate (a tiny piece) or makes no mult progress."""
-    feats = make_cluster_features(rows)
+    feats = make_cluster_features(rows, basis=basis)
     med = np.median(feats, axis=0)
     mad = 1.4826 * np.median(np.abs(feats - med), axis=0)
-    scale_floor = np.array([0.05 * df_mhz, 1e-4, 1e-3, 1e-3, 1e-3])
+    scale_floor = cluster_scale_floor(feats, df_seg, basis)
     zw = (feats - med) / np.maximum(mad, scale_floor)
     n = len(zw)
     if n > SUB:
@@ -449,7 +753,7 @@ def _ward_split(rows, sid, rng, df_mhz):
     return parts
 
 
-def resplit_blends(rows, sid, n_samples, mult_max, rng, df_mhz, stats,
+def resplit_blends(rows, sid, n_samples, mult_max, rng, df_seg, stats,
                    max_depth=4):
     """Recursively re-split clusters with p > 0.5 and mult > mult_max."""
     out, queue = [], [(rows, sid, 0)]
@@ -461,7 +765,8 @@ def resplit_blends(rows, sid, n_samples, mult_max, rng, df_mhz, stats,
         if depth >= max_depth or p <= 0.5 or mult <= mult_max:
             out.append((r, s))
             continue
-        parts = _ward_split(r, s, rng, df_mhz)
+        parts = _ward_split(r, s, rng, df_seg,
+                            stats.get("basis", "sampling"))
         if parts is None:
             stats["blend_unsplit"] += 1
             out.append((r, s))
@@ -475,9 +780,38 @@ def resplit_blends(rows, sid, n_samples, mult_max, rng, df_mhz, stats,
 def run(store: str, last_k: int | None, tobs: float, out: str,
         split_fn=split_single_linkage, seed: int = 7,
         max_iter: int | None = None, resplit_mult: float = 2.0,
-        ratio_max: float = 5.0):
+        ratio_max: float = 5.0, basis: str = "sampling",
+        transform_container=None, gmm_samples: int = 4096,
+        gmm_max_comp: int = 12, gmm_min_members: int = 25,
+        gmm_gpu: int | None = None):
+    """Fit a finished run's cold-chain leaf table into birth components.
+
+    ``basis`` selects the coordinates the WHOLE fit runs in:
+
+    * ``"sampling"`` (default here) -- the historical astro basis, one
+      Gaussian per cluster, ``means``/``covs`` in the npz. Kept as the
+      library default so every existing caller and stored file is
+      bit-identical.
+    * ``"observable"`` -- the leaf table is mapped through
+      ``GBObservableFiberBasis.to_internal`` at intake and every stage
+      after works there; clusters are fitted as Gaussian MIXTURES and
+      written in the packed ``gmm_*`` layout. This is the CLI default
+      (``--basis``), so a rerun of the pipeline produces an observable set.
+
+    ``transform_container`` supplies the sampling basis the map indexes
+    against; ``None`` uses this module's own :data:`COLUMN_NAMES`.
+
+    ``gmm_*`` configure the observable path's per-cluster mixture (see
+    :func:`fit_cluster_gmms`); they are ignored on the sampling path.
+    """
+    if basis not in ("observable", "sampling"):
+        raise ValueError(
+            f"basis must be 'observable' or 'sampling', got {basis!r}")
     rng = np.random.default_rng(seed)
     df_mhz = 1.0 / tobs * 1e3          # 1/Tobs in mHz (stored f0 is mHz)
+    # the SAME 1/Tobs, in the units column 1 carries in the working basis
+    # (mHz for sampling f0, Hz for observable f_mid) -- see basis_df.
+    df_seg = basis_df(tobs, basis)
     walls = {}
 
     t0 = time.perf_counter()
@@ -490,14 +824,25 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
           f"{info['leaves_per_walker']:.1f} leaves/walker) "
           f"[{walls['load']:.1f} s, RSS {rss_gb():.2f} GB]")
 
+    # --- INTAKE SEAM: after this the pipeline is in ONE basis ------------
+    obs_map = None
+    if basis == "observable":
+        obs_map = build_observable_map(tobs, transform_container)
+        X = to_observable(X, obs_map)
+        print(f"intake: mapped {len(X):,} rows to the OBSERVABLE basis "
+              f"(Tobs {tobs:.6g} s, shear {obs_map.shear}, fiber "
+              f"{obs_map.fiber_coord}); col 1 is f_mid [Hz], col 2 fdot.")
+
     t0 = time.perf_counter()
-    bin_idx, islands, f_lo, floor = segment_f0(X[:, 1], df_mhz, n_samples)
+    bin_idx, islands, f_lo, floor = segment_f0(X[:, 1], df_seg, n_samples)
     walls["segment"] = time.perf_counter() - t0
     print(f"stage 1: {len(islands)} islands (floor {floor}/bin, "
-          f"df {df_mhz:.6g} mHz) [{walls['segment']:.2f} s]")
+          f"df {df_seg:.6g} {'Hz' if basis == 'observable' else 'mHz'}) "
+          f"[{walls['segment']:.2f} s]")
 
     stats = dict(satellite_merges=0, cov_floor_triggers=0,
                  cov_floor_diag=0, cov_floor_eig=0, df_mhz=df_mhz,
+                 df_seg=df_seg, basis=basis,
                  junk_rows=0, orphan_rows=0, dropped_fragments=0,
                  dropped_fragment_rows=0, blend_resplits=0,
                  blend_unsplit=0, trunc_mle_fits=0,
@@ -507,6 +852,11 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
     in_island = np.zeros(len(X), dtype=bool)
 
     means, covs, ps, mults, ns, isl_id = [], [], [], [], [], []
+    # observable path: the member block of each cluster, fitted as a
+    # MIXTURE in one batched call after the loop (the fitter is
+    # GPU-batched across groups, so per-cluster calls would waste it).
+    comp_rows: list = []
+    sort_f: list = []
     t0 = time.perf_counter()
     t_split_total = 0.0
     for isl, (b0, b1) in enumerate(islands):
@@ -514,7 +864,7 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
         in_island |= m
         x_all, sid = X[m], sample_id[m]
         ts = time.perf_counter()
-        labels = split_fn(x_all, rng, df_mhz, stats)
+        labels = split_fn(x_all, rng, df_seg, stats)
         t_split_total += time.perf_counter() - ts
         stats["junk_rows"] += int((labels == -1).sum())
         for k in range(labels.max() + 1 if labels.size else 0):
@@ -527,7 +877,7 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
             pieces = [(x_all[mk], sid[mk])]
             if resplit_mult > 0:
                 pieces = resplit_blends(x_all[mk], sid[mk], n_samples,
-                                        resplit_mult, rng, df_mhz, stats)
+                                        resplit_mult, rng, df_seg, stats)
             for xr, sr in pieces:
                 nr = len(xr)
                 if nr < max(3, MIN_FRAC * n_samples):
@@ -535,9 +885,14 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
                     stats["dropped_fragment_rows"] += nr
                     continue
                 ids = np.unique(sr)
-                mean, cov = fit_component(xr, stats)
-                means.append(mean)
-                covs.append(cov)
+                if basis == "observable":
+                    comp_rows.append(xr)
+                    sort_f.append(float(np.mean(xr[:, 1])))
+                else:
+                    mean, cov = fit_component(xr, stats)
+                    means.append(mean)
+                    covs.append(cov)
+                    sort_f.append(float(mean[1]))
                 ps.append(len(ids) / n_samples)
                 mults.append(nr / len(ids))
                 ns.append(nr)
@@ -546,19 +901,35 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
     walls["components"] = time.perf_counter() - t0 - t_split_total
     stats["orphan_rows"] = int((~in_island).sum())
 
-    means = np.array(means)
-    covs = np.array(covs)
     ps = np.array(ps)
     mults = np.array(mults)
     ns = np.array(ns, dtype=np.int64)
     isl_id = np.array(isl_id, dtype=np.int64)
     f0_window_edges = np.array(
-        [[f_lo + b0 * df_mhz, f_lo + b1 * df_mhz] for b0, b1 in islands])
+        [[f_lo + b0 * df_seg, f_lo + b1 * df_seg] for b0, b1 in islands])
 
-    order = np.argsort(means[:, 1])
-    means, covs, ps, mults, ns, isl_id = (
-        means[order], covs[order], ps[order], mults[order], ns[order],
-        isl_id[order])
+    # components are stored in ascending column-1 order in BOTH bases
+    # (f0 [mHz] / f_mid [Hz]); the clusters are ordered BEFORE the mixture
+    # fit so gmm_ncomp partitions the flat arrays in the same order.
+    order = np.argsort(np.array(sort_f))
+    ps, mults, ns, isl_id = ps[order], mults[order], ns[order], isl_id[order]
+    if basis == "observable":
+        comp_rows = [comp_rows[i] for i in order]
+        t0g = time.perf_counter()
+        gmm_comps = fit_cluster_gmms(
+            comp_rows, n_samples=int(gmm_samples),
+            max_comp=int(gmm_max_comp), min_members=int(gmm_min_members),
+            seed=seed, gpu=gmm_gpu)
+        walls["gmm"] = time.perf_counter() - t0g
+        n_per = [len(w) for w in gmm_comps[0]]
+        where = "CPU" if gmm_gpu is None else f"GPU {int(gmm_gpu)}"
+        print(f"stage 3: {len(comp_rows)} clusters -> {int(sum(n_per))} "
+              f"mixture components (K per cluster: min {min(n_per)}, "
+              f"median {int(np.median(n_per))}, max {max(n_per)}) "
+              f"[{walls['gmm']:.1f} s on {where}]")
+    else:
+        means = np.array(means)[order]
+        covs = np.array(covs)[order]
 
     try:
         # provenance: the LAT repo this module runs from (editable src
@@ -588,17 +959,42 @@ def run(store: str, last_k: int | None, tobs: float, out: str,
         **info, **{k: v for k, v in stats.items() if k != "df_mhz"},
         walls={k: round(v, 3) for k, v in walls.items()},
     )
+    per_cluster = dict(p=ps, mult=mults, n_members=ns, island_id=isl_id,
+                       f0_window_edges=f0_window_edges)
+    if basis == "observable":
+        from lisatools.sampling.fstat_proposal import pack_gmm_components
+
+        from . import basis as wb
+
+        packed = pack_gmm_components(gmm_comps)
+        meta["basis"] = "observable"
+        meta["column_names"] = wb.OBSERVABLE_COLUMN_NAMES
+        meta["f0_units"] = "Hz"          # column 1 is f_mid [Hz] now
+        meta["bounded_cols"] = {str(k): list(v) for k, v in
+                                OBSERVABLE_BOUNDED_COLS.items()}
+        meta["map_params"] = wb.map_params_from_map(obs_map)
+        meta["feat_names"] = OBSERVABLE_FEAT_NAMES
+        meta["gmm"] = dict(
+            n_samples=int(gmm_samples), max_comp=int(gmm_max_comp),
+            min_members=int(gmm_min_members),
+            n_components=int(sum(len(w) for w in gmm_comps[0])),
+            # the packed means/covs are UNSCALED to physical coordinates
+            # (see _unscale_gmm_components); FullGaussianMixtureModel
+            # applies the mins/maxs affine itself and must not be fed these.
+            components_basis="physical",
+        )
+        payload = dict(per_cluster, **packed)
+    else:
+        payload = dict(per_cluster, means=means, covs=covs)
     t0 = time.perf_counter()
-    np.savez_compressed(
-        out, means=means, covs=covs, p=ps, mult=mults, n_members=ns,
-        island_id=isl_id, f0_window_edges=f0_window_edges,
-        meta=json.dumps(meta))
+    np.savez_compressed(out, meta=json.dumps(meta), **payload)
     walls["write"] = time.perf_counter() - t0
 
     total_rows = len(X)
+    n_clusters = len(ps)
     print(f"stage 2: split {walls['split']:.1f} s | stage 3: components "
           f"{walls['components']:.1f} s | write {walls['write']:.2f} s")
-    print(f"components: {len(means)} | junk rows "
+    print(f"components: {n_clusters} | junk rows "
           f"{stats['junk_rows']:,} ({stats['junk_rows']/total_rows:.2%}) | "
           f"orphan rows (outside islands) {stats['orphan_rows']:,} "
           f"({stats['orphan_rows']/total_rows:.2%}) | dropped fragments "
@@ -637,10 +1033,36 @@ def main(argv=None):
     ap.add_argument("--ratio-max", type=float, default=5.0,
                     help="fdot_astro_ratio prior half-width (the col-8 "
                          "truncation box; GBSettings.fdot_astro_ratio_max)")
+    ap.add_argument("--gmm-samples", type=int, default=4096,
+                    help="observable basis: members resampled per cluster "
+                         "to rectangularise the batched GMM fit")
+    ap.add_argument("--gmm-max-comp", type=int, default=12,
+                    help="observable basis: max mixture components per "
+                         "cluster")
+    ap.add_argument("--gmm-min-members", type=int, default=25,
+                    help="observable basis: members required per allowed "
+                         "mixture component (the ACTUAL selector -- see "
+                         "fit_cluster_gmms)")
+    ap.add_argument("--gmm-gpu", default="auto",
+                    help="observable basis: CUDA device index for the "
+                         "mixture fit, 'cpu' to force the host path, or "
+                         "'auto' (default) to take device 0 when cupy sees "
+                         "one. Same device semantics as the F-stat fit "
+                         "(fstat_proposal.fit_gmm_to_stacked).")
+    ap.add_argument("--basis", default="observable",
+                    choices=("observable", "sampling"),
+                    help="coordinates the WHOLE fit runs in (default "
+                         "observable: lnA/f_mid/fdot/.../Mc, per-cluster "
+                         "Gaussian MIXTURE in the packed gmm_* layout). "
+                         "'sampling' reproduces the pre-2026-09-18 astro-"
+                         "basis fit with one Gaussian per cluster.")
     args = ap.parse_args(argv)
     run(args.store, args.last_k, args.tobs, args.out, seed=args.seed,
         max_iter=args.max_iter, resplit_mult=args.resplit_mult,
-        ratio_max=args.ratio_max)
+        ratio_max=args.ratio_max, basis=args.basis,
+        gmm_samples=args.gmm_samples, gmm_max_comp=args.gmm_max_comp,
+        gmm_min_members=args.gmm_min_members,
+        gmm_gpu=resolve_gmm_gpu(args.gmm_gpu))
 
 
 if __name__ == "__main__":

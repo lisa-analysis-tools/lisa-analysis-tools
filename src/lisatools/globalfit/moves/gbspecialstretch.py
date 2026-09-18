@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import os
@@ -30,6 +31,7 @@ from ...analysiscontainer import (
     AnalysisContainerArray,
     BandView,
     band_gpu_assignment,
+    shard_lookup_maps,
 )
 # DataResidualArray is deprecated; AnalysisContainer now accepts DomainBase children
 # directly (FDSignal / WDMSignal / TDSignal / STFTSignal).
@@ -1972,7 +1974,34 @@ def _buffer_fixed_capacity_active(sorter, kwargs) -> bool:
 #: back with ``gb_sync``, which is where the finish-time authoritative rebuild
 #: (``check_ll_inject``) actually happens. It is issued ONLY in replica mode
 #: and opens no session (``gb_finish`` has already torn it down).
-GB_OPS = ("gb_run_proposal", "gb_run_tempering", "gb_finish", "gb_sync")
+#: The LAST FOUR are the F-stat epoch fit (parallel-fit spec 2026-09-16), not
+#: part of that session: they are issued from the head's ``setup()`` BEFORE
+#: any session exists -- harmless, because the session token is captured from
+#: the opening ``gb_run_proposal`` and ``call_index`` is counted per
+#: ``(move, op)``. They are listed in the order the fit issues them.
+#: ``gb_fstat_ref_row`` replicates the reference walker's residual +
+#: inverse-PSD rows to every rank; ``gb_fstat_comb`` splits stage A's comb
+#: scan by contiguous NODE range, one command per sky level;
+#: ``gb_fstat_stage_b`` splits the epoch grid sweep by contiguous box range;
+#: ``gb_fstat_release`` drops the replicated row, the sig-het scorer cached
+#: beside it AND the scorer's reference blocks on the GB comp -- the
+#: expensive half, and the half the closure alone does not own -- on every
+#: rank once the fit's last group is assembled, then frees the memory pool.
+GB_OPS = ("gb_run_proposal", "gb_run_tempering", "gb_finish", "gb_sync",
+          "gb_fstat_ref_row", "gb_fstat_comb", "gb_fstat_stage_b",
+          "gb_fstat_release")
+
+#: F-stat op -> the ``GBSpecialRJFStatGridMove`` attribute its served body
+#: needs. ``gf_serve`` checks this before dispatching, so a command addressed
+#: to a GB move that cannot run an F-stat fit fails with a named error on
+#: EVERY rank at once, instead of an ``AttributeError`` raised from inside a
+#: body -- which for ``gb_fstat_ref_row`` would strand the other ranks in its
+#: broadcast.
+_FSTAT_OP_REQUIRES = {
+    "gb_fstat_ref_row": "_gb_free_residual",
+    "gb_fstat_comb": "_fstat_call",
+    "gb_fstat_stage_b": "_fstat_call",
+}
 
 
 def _gb_host(obj):
@@ -2143,6 +2172,21 @@ def merge_owned_sources(work_coords, work_inds, replies, ranks, band_ranges,
                  for (r, *_rest), sel in zip(contributors, picks) if sel.size],
                 axis=0,
             )[order]
+def _bcast_dtype(arr):
+    """The canonical wire dtype for one host row: complex128 or float64.
+
+    ``AnalysisContainerArray`` allocates at python ``float`` / ``complex``
+    width already (``data_dtype`` is ``float`` in the WDM basis and
+    ``complex`` in FD; ``noise_dtype`` is complex whenever the sensitivity
+    matrix is), so this is the identity in every run today. It exists so the
+    F-stat reference-row broadcast NORMALIZES rather than assumes: the
+    receiving ranks allocate from a single is-complex flag, and a float32 or
+    complex64 row would otherwise make the owner's buffer and theirs
+    disagree in size. It never crosses the real/complex boundary -- casting
+    a complex residual down to float64 would discard the imaginary part of
+    every sample, silently.
+    """
+    return np.complex128 if np.iscomplexobj(arr) else np.float64
 
 
 @dataclass
@@ -4526,6 +4570,58 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 "(%r); falling back to walker 0.", self.name, exc)
             return 0
 
+    def _fstat_global_reference(self, model):
+        """``(w_global, owner_rank, local_index, lls)`` for the F-stat fit.
+
+        The GLOBAL max-likelihood walker, not this rank's local one. Under
+        the walker-block layout ``_fstat_reference_walker`` ranks only the
+        HEAD'S OWN block, so the epoch would be fitted against the best of B
+        walkers instead of the best of N -- and the index it returns is used
+        downstream as an ACA ROW index, which a global index >= B would
+        blow out. Every walker's likelihood comes back through the existing
+        ``WalkerFanout.gather_likelihood`` (the ``LIKELIHOOD_OP`` builtin;
+        ``acs.likelihood(complex=False)``, the same numbers the local argmax
+        sees), and the layout converts the winner into the owning rank plus
+        the row index ON that rank.
+
+        With ONE compute rank this is a direct call that returns
+        ``(w, head_rank, w, lls)`` -- the same walker
+        ``_fstat_reference_walker`` picks today, with the same local index.
+        """
+        fanout = getattr(self, "fanout", None)
+        if fanout is None or not fanout.is_head:
+            # No fan-out object at all (``_propose_legacy``, the
+            # single-process ``fit.sample()`` path), or a caller that is not
+            # the head: ``WalkerFanout.run`` -- which ``gather_likelihood``
+            # is built on -- is head-only and raises ``RuntimeError`` on a
+            # non-head caller (fanout.py:218), so both cases fall back to
+            # the local ranking. There is no layout to consult in either
+            # case, so ``owner_rank=0`` below is a fixed convention, not a
+            # derived value -- a caller with no fan-out (or that is not the
+            # head) has no per-rank ACA row of its own to report.
+            w = self._fstat_reference_walker(model)
+            return int(w), 0, int(w), np.full(1, np.nan)
+        try:
+            lls = np.asarray(_to_numpy(fanout.gather_likelihood(
+                model.analysis_container_arr)), dtype=float)
+            w_global = int(np.argmax(lls))
+        except Exception as exc:
+            # Never silent: a broken ranking here quietly pins every F-stat
+            # reference to walker 0 for the whole run. The owner of walker 0
+            # is ``layout.owner_of(0)`` -- whichever rank holds block 0 --
+            # NOT ``layout.head_rank``: those differ whenever ``main_rank``
+            # is non-zero (a public ``StockGlobalFit`` constructor knob), so
+            # deriving it keeps this fallback correct off the ``main_rank=0``
+            # path every in-tree run takes today. ``exc_info=True`` keeps a
+            # remote worker's traceback (``RemoteWorkerError.remote_traceback``,
+            # fanout.py:53) from being swallowed behind the one-line ``%r``.
+            logger.warning(
+                "%s: could not rank walkers for the F-stat reference (%r); "
+                "falling back to walker 0.", self.name, exc, exc_info=True)
+            return (0, *fanout.layout.owner_of(0), np.full(1, np.nan))
+        owner, local = fanout.layout.owner_of(w_global)
+        return w_global, int(owner), int(local), lls
+
     def run_proposal(self, model, state, band_sorter, band_temps, *,
                      scan_schedule=None):
         """One full pass of per-band proposals.
@@ -5373,6 +5469,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     # "every N proposes" counts ALL GBSpecial* propose() calls of the
     # branch across every move instance in the process.
     _branch_propose_counts: dict = {}
+    # Distinct global-fit ITERATIONS this branch has been proposed in, and
+    # the last iteration stamp seen per branch. Separate from the propose
+    # census above ON PURPOSE: that one is a per-propose tick the tempering
+    # cadence reads, and changing its meaning would silently retune
+    # _temper_cadence_fire. Only the F-stat refit clock reads these.
+    _branch_iteration_counts: dict = {}
+    _branch_iteration_seen: dict = {}
     _branch_last_temper: dict = {}
 
     # Per-rank RNG seed for the move's OWN Generator streams (multi-rank
@@ -5768,6 +5871,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         if ms < self._INFOMAT_SLOW_MS:
             return
         self._infomat_warned = True
+        if not hasattr(comp, "chunked"):
+            # No sig-het comp exists on this branch by CONFIGURATION
+            # ({VGB,GB}_SIGHET_INMODEL=0): the chunked engine is the
+            # configured route, not a fall-through. Say so once at INFO
+            # so the per-source cost is on record without a false alarm.
+            logger.info(
+                "[GB_INFOMAT %s] information_matrix cost %.1f ms/source over "
+                "%d rows via the CHUNKED engine -- the configured route on "
+                "this branch (no sig-het in-model comp; "
+                "{VGB,GB}_SIGHET_INMODEL=0). The sig-het route is ~2.4 "
+                "ms/source.", self.name, ms, nrows)
+            return
         logger.warning(
             "[GB_INFOMAT %s] information_matrix cost %.1f ms/source over %d "
             "rows -- the sig-het route is ~2.4 ms/source and the chunked "
@@ -7026,7 +7141,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self._log_dist_range_cache = val
         return val
 
-    def _fstat_NM(self, model, params_phys, walker_ref):
+    def _fstat_NM(self, model, params_phys, walker_ref, *, holder=None):
         """Per-binary F-stat ``(N, M)`` from the domain-appropriate comp.
 
         Domain is the ONLY thing that differs between FD and WDM: pick the
@@ -7044,6 +7159,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         single-shard holders pass straight through; on a sharded parent ACA
         the reference walker's rows run on its owning device and (N, M) come
         back on the caller's device.
+
+        ``holder`` overrides the residual source (the multi-rank fit's
+        replicated reference row, scored at row 0). The per-unit lane
+        adapter is bypassed under an override: it is armed for a walker's
+        ACA row, not for a shipped row pair.
         """
         xp = self.xp
         # Multi-device fan-out (2026-08-27, GPU-imbalance autopsy): when the
@@ -7067,7 +7187,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             tm.count("fstat_nm_calls", 1)
             tm.count("fstat_nm_rows", int(params_phys.shape[0]))
         _lanes = getattr(self, "_fstat_nm_lanes", None)
-        if _lanes is not None and _lanes[0] == int(walker_ref):
+        if holder is None and _lanes is not None and _lanes[0] == int(walker_ref):
             _t = _tmark_start(tm)
             try:
                 return _lanes[1](params_phys)
@@ -7075,11 +7195,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 _tmark_end(tm, "fstat_nm_lanes", _t)
         _t = _tmark_start(tm)
         try:
-            di = xp.full(params_phys.shape[0], int(walker_ref), dtype=xp.int32)
-            holder = model.analysis_container_arr
+            # A shipped row pair is a ONE-ROW holder, so it is scored at row
+            # 0: ``walker_ref`` is the GLOBAL walker index under the
+            # multi-rank fit and is not an ACA row on any rank but its owner.
+            _row = 0 if holder is not None else int(walker_ref)
+            di = xp.full(params_phys.shape[0], _row, dtype=xp.int32)
+            _holder = model.analysis_container_arr if holder is None else holder
             comp, method_name = self._fstat_comp_method()
             return _RoutedBandEngine.route_fstat_ll(
-                comp, method_name, holder, params_phys,
+                comp, method_name, _holder, params_phys,
                 data_index=di, noise_index=di, convert_to_ra_dec=False)
         finally:
             _tmark_end(tm, "fstat_nm_routed", _t)
@@ -17606,6 +17730,28 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     #: the live :class:`GBRankSession`; ``None`` outside a fanned-out propose
     _gb_session = None
 
+    #: The multi-rank F-stat fit's replicated reference row (parallel-fit spec
+    #: 2026-09-16, decision 2): ``gb_fstat_ref_row`` sets these on EVERY
+    #: compute rank, and the head releases its own at the end of the fit
+    #: (:meth:`_fstat_release_ref_row`). Class-level defaults so a fresh move
+    #: -- or a ``__new__`` skeleton in the tests -- never ``AttributeError``s.
+    #: ``_fstat_ref_branches`` is the head-local hand-off into its own copy of
+    #: the op body (a branch dict is not shippable); ``_gb_free_n_live`` is
+    #: what the GB-free window last restored, published so the head's log line
+    #: reports a measured count instead of a guess.
+    _fstat_ref_holder = None
+    _fstat_ref_call = None
+    _fstat_ref_walker = None
+    _fstat_ref_branches = None
+    #: ``(epoch, w_global, owner_rank, local_index)`` of THIS epoch's fit,
+    #: published by ``_run_fstat_fit`` so ``_install_ctr_table``'s fallback
+    #: scores the centres against the reference the manifest names instead
+    #: of gathering a second, independently derived argmax. Class attribute
+    #: so the ``getattr`` on a move that never fitted cannot raise.
+    _fstat_epoch_reference = None
+    _gb_free_n_live = -1
+    _gb_free_opened = False
+
     @property
     def fanout_active(self) -> bool:
         """Is this propose shared by several compute ranks?"""
@@ -17729,11 +17875,28 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         "_owned_band_range", "_replica_index", "_n_replicas",
     )
 
+    def _bind_rank_acs(self, model):
+        """Pin this rank's device and bind the ACA that arrived with the model.
+
+        Run-time source of truth is the ACA that arrives with the model (one
+        B-row ACA per rank): refresh the domain quantities and re-bind the
+        parent engine if this ACA differs from the bound one. Shared by the
+        per-propose session commands (:meth:`_enter_rank_block`) and the
+        F-stat epoch-fit commands, which carry no session and so cannot go
+        through the block prologue.
+        """
+        acs = model.analysis_container_arr
+        pin_main_device(self.xp, acs.gpus)
+        self._configure_domain(acs)
+        self._bind_parent_acs(acs)
+        return acs
+
     def _enter_rank_block(self, payload, clock, model):
         """Bind this rank's ACA and clock for one command; return the saved state.
 
         Mirrors ``propose``'s prologue for a walker BLOCK: the same three
-        device-binding calls, then ``self.nwalkers = B`` / ``self.ntemps``
+        device-binding calls (:meth:`_bind_rank_acs`), then
+        ``self.nwalkers = B`` / ``self.ntemps``
         (which ``propose`` sets from ``work_in.coords.shape``) and the
         head-shipped clock values, read-only cap/shut-off tables and rank
         RNG seed. ``self._temper_rng`` is dropped -- so the vertical-swap
@@ -17758,13 +17921,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         a ``finally``; on the head that restores N, and on a pure compute
         rank the restore is harmless (nothing runs between commands).
         """
-        acs = model.analysis_container_arr
-        pin_main_device(self.xp, acs.gpus)
-        # Run-time source of truth is the ACA that arrives with the model
-        # (one B-row ACA per rank): refresh the domain quantities and
-        # re-bind the parent engine if this ACA differs from the bound one.
-        self._configure_domain(acs)
-        self._bind_parent_acs(acs)
+        self._bind_rank_acs(model)
 
         branch = self.branch_name
         saved = {
@@ -17796,9 +17953,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self._reseed_firing = bool(cv.get("reseed_firing", False))
         self.temper_vertical = bool(cv.get("temper_vertical", saved["temper_vertical"]))
         if cv.get("branch_propose_count") is not None:
-            # read by _fstat_clock and _temper_cadence_fire; the head ticks
-            # it ONCE per propose and ships the value
+            # read by _temper_cadence_fire; the head ticks it ONCE per
+            # propose and ships the value
             type(self)._branch_propose_counts[branch] = int(cv["branch_propose_count"])
+        if cv.get("gf_iteration") is not None:
+            # the F-stat refit clock's tick source (see _fstat_clock). Ranks
+            # are never stamped by a combine, so without this their clock
+            # would stand still and they would disagree with the head about
+            # which epoch is current.
+            self.gf_iteration = int(cv["gf_iteration"])
 
         tables = (payload or {}).get("tables") or {}
         # READ-ONLY on a rank: the head arms, advances and persists them.
@@ -17858,8 +18021,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """The rank-side stand-in for ``setup()``: install epoch tables only.
 
         ``setup()`` on an F-stat grid move can RUN THE FIT -- an expensive
-        residual-dependent sweep against a walker chosen by a LOCAL
-        ``argmax``, which then writes ``fstat_grid_peaks_stacked.npz`` and
+        residual-dependent sweep against the GLOBAL argmax over every compute
+        rank's block (``_fstat_global_reference``, one ``gather_likelihood``
+        collective; it was a head-LOCAL argmax before the walker-block port,
+        which under a fan-out would have named a row the head does not even
+        own), which then writes ``fstat_grid_peaks_stacked.npz`` and
         ``DONE.json``. That is head-only work: the head runs ``setup()``
         first, so by the time a rank serves ``gb_run_proposal`` the epoch
         directory is complete and this is a pure in-memory load
@@ -18076,9 +18242,65 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             return self._gb_serve_finish(payload, clock, model)
         if op == "gb_sync":
             return self._gb_serve_sync(payload, clock, model)
+        if op == "gb_fstat_release":
+            # Deliberately NOT behind ``_FSTAT_OP_REQUIRES``, unlike the other
+            # two F-stat ops: this body reads nothing that belongs to
+            # ``GBSpecialRJFStatGridMove`` -- it clears the ``_fstat_ref_*``
+            # attributes the BASE declares and frees the pool -- and a
+            # release that REFUSED would
+            # leave that rank holding the replicated row plus its ~GB sig-het
+            # scorer with nothing left in the protocol to drop them. A release
+            # must never be the thing that fails.
+            return self._gb_serve_fstat_release(payload, clock, model)
+        if op in _FSTAT_OP_REQUIRES:
+            self._require_fstat_grid_move(op)
+            # NO SESSION TIMER FOR A NON-SESSION OP. These bodies
+            # deliberately skip ``_enter_rank_block`` (the epoch fit is not a
+            # propose), and ``_exit_rank_block`` deliberately does not restore
+            # ``_prop_timer`` -- so on a WORKER whatever the last GB session
+            # left bound is still bound here, and a chunked-path
+            # (``FSTAT_USE_SIGHET=0``) stage-B sweep would add its
+            # ``fstat_nm_calls`` / ``fstat_nm_rows`` to a CLOSED session's
+            # timer, which never emits a ``[GB_TIMING]`` line again. Detached
+            # rather than rebound: there is no propose to attribute this to.
+            # The head reaches these bodies only through ``_fanout_cmd`` for
+            # its own share of a split sweep (stage A and the whole serial
+            # path are timed directly by ``_run_fstat_fit``'s
+            # ``fstat_grid_fit`` span, which is untouched).
+            with self._fstat_detached_timer():
+                if op == "gb_fstat_ref_row":
+                    return self._gb_serve_fstat_ref_row(payload, clock, model)
+                if op == "gb_fstat_comb":
+                    return self._gb_serve_fstat_comb(payload, clock, model)
+                return self._gb_serve_fstat_stage_b(payload, clock, model)
         raise ValueError(
             f"move {self.name!r} serves only {GB_OPS}, got {op!r}"
         )
+
+    def _require_fstat_grid_move(self, op):
+        """Refuse an F-stat op on a GB move that cannot run one.
+
+        The F-stat commands are served on the base -- next to every other
+        ``_gb_serve_*`` body ``gf_serve`` dispatches to -- but their bodies
+        reach into :class:`GBSpecialRJFStatGridMove`'s half of the fit
+        (``_gb_free_residual``, ``_fstat_call``). Only that class ever ISSUES
+        them, so a miss means the head addressed the command to the wrong
+        ``gf_move_name``; without this it surfaces as an ``AttributeError``
+        from inside a served body, and for ``gb_fstat_ref_row`` it would do
+        so on the owner AFTER the other ranks are already committed to the
+        collective.
+
+        Checked HERE rather than inside the bodies precisely because it is
+        SYMMETRIC: every rank serves the same move class, so either all of
+        them raise (before any collective) or none does.
+        """
+        needed = _FSTAT_OP_REQUIRES[op]
+        if getattr(self, needed, None) is None:
+            raise ValueError(
+                f"move {self.name!r} was sent {op!r}, but only the F-stat "
+                f"grid move (GBSpecialRJFStatGridMove) can serve it: this "
+                f"move has no {needed}."
+            )
 
     def _gb_new_timer(self, model):
         """``propose``'s per-propose stage timer, per rank."""
@@ -18813,6 +19035,1324 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 del sorter
             self.mempool.free_all_blocks()
             self._exit_rank_block(saved)
+    # ---- the F-stat epoch fit's two fan-out commands -----------------------
+    #
+    # These two are NOT part of the per-propose session above: the head issues
+    # them from ``setup()``, where no session (and no state slice) exists on
+    # any rank. They are served here, on the base, next to the other
+    # ``_gb_serve_*`` bodies ``gf_serve`` dispatches to; the head-side work
+    # they support (``_gb_free_residual``, ``_fstat_call``) belongs to
+    # :class:`GBSpecialRJFStatGridMove`, which is the only class that ever
+    # issues them.
+
+    @staticmethod
+    def _fstat_ref_row_payload(w_global, owner_rank, local_index,
+                               gb_free_requested):
+        """The command payload every rank shares.
+
+        Identical on every rank, which is what keeps the op symmetric: each
+        one derives ``root = layout.fanout_rank(owner_rank)`` from these
+        fields, and a rank-dependent ``owner_rank`` would have them
+        broadcasting against different roots and deadlock the run. (The owner
+        alone additionally gets a ``gb_branch`` slice bolted on -- see
+        :meth:`_fstat_ref_row_fanout` -- which no other rank reads.)
+
+        ``gb_free_requested`` is what the head ASKED FOR, env flag included,
+        so a rank that skipped the window can be told apart from a run with
+        ``GB_FSTAT_GB_FREE=0``. Read on the OWNER only, which warns in its
+        own log when the head asked for the window and no branch reached it
+        (the head's :meth:`_warn_if_gb_free_missed` says the same thing on
+        the other side of the wire, off its own local flag -- so the fact is
+        recorded on both the rank that failed to open the window and the
+        rank an operator reads first).
+        """
+        return {
+            "walker_ref": int(w_global),
+            "owner_rank": int(owner_rank),
+            "local_index": int(local_index),
+            "gb_free": bool(gb_free_requested),
+        }
+
+    def _fstat_ref_branch_slice(self, branches, w0, w1):
+        """The owner block's COLD GB branch, as plain host arrays for the wire.
+
+        The GB-free window is the reason the owner needs a branch at all, and
+        a rank has none during ``setup()`` -- no session is open, so no state
+        slice has been shipped. This is what the head sends instead.
+
+        WHAT ``BandSorter`` ACTUALLY NEEDS (read, not assumed): its non-copy
+        constructor touches ``gb_branch.shape``, ``gb_branch.inds`` and
+        ``gb_branch.coords`` and nothing else (``gbbands.py`` :5564-5578 and
+        :5627); it stores the object as ``gb_branch_orig``, which no other
+        code in the tree ever reads back. ``branch_supplemental`` is NOT
+        load-bearing here -- the per-source labels (``temp_inds`` /
+        ``walker_inds`` / ``leaf_inds``) are derived from the SHAPE, the band
+        assignment from ``coords`` through the move's own
+        ``parameter_transforms``, and ``N_vals`` from the sorter's
+        ``band_N_vals``. So a bare ``Branch(coords, inds=inds)`` is enough,
+        and that is the cheapest thing that can be.
+
+        SLICED TO THE BLOCK AND TO TEMP 0. ``_gb_free_residual`` selects with
+        ``dict(temp=0, walker=..., apply_inds=True)`` and never reads another
+        temperature, so the hot rungs are pure payload weight. Slicing the
+        walker axis to ``[w0, w1)`` is what makes ``walker=local_index``
+        address the branch column and the owner's ACA row identically --
+        ``adjust_sources_in_residual_buffer`` passes ``subset.walker_inds``
+        straight into ``fill_template`` as the ACA row index, so the branch's
+        walker axis MUST be the rank's block.
+
+        At 6 months with ``B = 5`` this is ~3.6 MB of coords + inds.
+        """
+        branch = (branches or {}).get(self.branch_name)
+        if branch is None:
+            return None
+        coords = np.asarray(_to_numpy(branch.coords))[0:1, int(w0):int(w1)]
+        inds = np.asarray(_to_numpy(branch.inds))[0:1, int(w0):int(w1)]
+        return {
+            "coords": np.ascontiguousarray(coords),
+            "inds": np.ascontiguousarray(inds.astype(bool)),
+        }
+
+    def _fstat_ref_branch_from_payload(self, blob):
+        """Rebuild the ``{branch_name: Branch}`` dict from a shipped slice."""
+        if not blob:
+            return None
+        return {
+            self.branch_name: Branch(
+                np.ascontiguousarray(np.asarray(blob["coords"])),
+                inds=np.ascontiguousarray(np.asarray(blob["inds"]).astype(bool)),
+            )
+        }
+
+    @staticmethod
+    def _fstat_ref_shard(acs, row):
+        """``(view, intra_row)``: the shard OWNING one ACA row, and its index.
+
+        Under the one-rank-per-GPU layout a rank's ACA is single-shard and
+        this is the identity ``(acs, row)``. It is NOT single-shard at
+        ``n_compute == 1`` on a multi-GPU box -- today's production config --
+        where ``linear_data_arr`` holds one buffer PER DEVICE: there
+        ``linear_data_arr[0]`` is only the first device's rows and
+        ``acs_total_entries`` is the total, so a global row index would
+        reshape the first shard into the wrong row count and slice a walker
+        that does not live there. Same resolution
+        :meth:`_RoutedBandEngine.route_fstat_ll` makes for every routed
+        F-stat call, through the same cached lookup tables.
+        """
+        if len(acs.linear_data_arr) <= 1:
+            return acs, int(row)
+        split_map, intra_map = shard_lookup_maps(acs)
+        view = _RoutedBandEngine._shard_views(acs)[int(split_map[int(row)])]
+        return view, int(intra_map[int(row)])
+
+    def _gb_serve_fstat_ref_row(self, payload, clock, model):
+        """Replicate the reference walker's residual + inverse-PSD rows.
+
+        SYMMETRIC: the fan-out comm IS ``ComputeService``'s comm, it contains
+        every compute rank and only compute ranks, and every one of them --
+        the head included -- enters this body exactly once per command, so
+        the ``Bcast`` inside it is legal. Every path below reaches the SAME
+        broadcasts in the same order: the only branch that differs by rank
+        (``is_owner``) fills the buffers on one side and allocates them on
+        the other, and neither side returns early.
+
+        THE STATUS SLOT IS NOT OPTIONAL. Unlike
+        ``WalkerFanout.allgather_walker_vector`` -- which is called from the
+        rank's own setup path (``run.py`` ``_global_likelihood``), outside
+        any try/except, so a raise there aborts the job -- this collective
+        runs inside a ``gf_serve`` body, and ``ComputeService.handle``
+        CATCHES whatever it raises, replies "failed" and returns that worker
+        to ``recv``. A worker that owns the reference walker and dies in the
+        fallible owner-only work above (the ``BandSorter`` build has failed
+        in production before -- see the ``rj_prop=None`` note in
+        :meth:`_gb_free_residual`) would therefore leave every other rank
+        parked in ``Bcast`` with no timeout, forever, with the traceback
+        visible only in that one worker's log. So the owner catches its own
+        failure, logs the traceback, and broadcasts a header whose status
+        word is 0; EVERY rank then raises the same error together, one
+        collective in.
+
+        The head then sees ITS OWN ``RuntimeError``, not a
+        ``RemoteWorkerError``: the head's body raises the status error inside
+        ``WalkerFanout.run``'s ``try``, whose ``except BaseException`` drain
+        waits the isends, ``recv``s each worker's failure reply and DISCARDS
+        it before re-raising the head's exception (``fanout.py`` :260-275,
+        the bare ``raise`` being the last of those lines).
+        Grep the head log for the message, not for the type.
+
+        EVERY piece of owner-side fallible work is inside the guard --
+        ``_bind_rank_acs``, the GB-free window, the shard resolve, the
+        snapshot, and the dtype normalization that sizes the header. Two
+        things remain uncovered, neither reachable by a ROOT broadcast:
+
+        * a NON-owner failing BEFORE ``Bcast(header)`` -- its own
+          ``_bind_rank_acs``;
+        * a NON-owner failing BETWEEN the header and data broadcasts -- its
+          two ``np.empty`` receive allocations.
+
+        A non-root rank has no way to signal through a header the root owns;
+        closing either needs a different primitive (an allgather of status),
+        i.e. a fourth collective on every command, deliberately not paid
+        here.
+
+        The header is ``(status, n_data, n_psd, data_is_complex,
+        psd_is_complex)`` as int64. The two complex flags are not
+        decoration: ``AnalysisContainerArray.data_dtype`` is ``float`` only
+        in the WDM basis and ``complex`` in FD (and ``noise_dtype`` is
+        complex whenever the sensitivity matrix is), so a receiver that
+        assumed float64 would allocate the wrong buffer and an owner that
+        cast to float64 would discard the imaginary part of every residual
+        sample.
+
+        The OWNER rank opens the GB-free window on its LOCAL row (today's
+        ``_gb_free_residual`` semantics), snapshots the two rows to host and
+        then RESTORES its residual -- so unlike the serial fit, no rank's
+        live residual stays mutated for the duration of the sweep. Every
+        rank then wraps the pair in an :class:`FStatRefRowHolder` scored
+        with ``data_index = noise_index = 0``.
+
+        """
+        from .gbbands import FStatRefRowHolder, snapshot_ref_rows
+
+        payload = payload or {}
+        w_global = int(payload["walker_ref"])
+        owner_rank = int(payload["owner_rank"])
+        local_index = int(payload["local_index"])
+        # ``getattr``, not ``self.fanout``: ``_propose_legacy`` and the
+        # single-process ``fit.sample()`` path build moves that never see a
+        # fan-out at all, and this body is the one they take.
+        fanout = getattr(self, "fanout", None)
+        is_owner = (fanout is None) or (int(fanout.rank) == owner_rank)
+
+        collective = fanout is not None and not fanout.single
+
+        acs = None
+        data_row = psd_row = None
+        n_live = -1
+        gb_free_opened = False
+        owner_failed = False
+        # (status, n_data, n_psd, data_is_complex, psd_is_complex). Allocated
+        # BEFORE the guard so a failure inside it still has a header to
+        # broadcast: an owner that exits this body without one parks every
+        # other rank in ``Bcast(header)`` with no timeout, forever.
+        header = np.zeros(5, dtype=np.int64)
+        try:
+            # THE BIND IS INSIDE THE GUARD. It pins the device, refreshes the
+            # domain and re-binds the parent engine, any of which can raise --
+            # and on the OWNER that is a failure the root CAN signal, unlike a
+            # non-owner's.
+            acs = self._bind_rank_acs(model)
+            if is_owner:
+                # ``_fstat_ref_branches`` is the head's own hand-off (no
+                # fan-out / one compute rank: nothing is pickled, so the live
+                # dict is passed through). Under a real fan-out the head ships
+                # the owner's BLOCK-SLICED cold branch in the payload instead
+                # -- the owner may be a worker, which has no branch of its own
+                # during setup(). Both routes end with the window genuinely
+                # open.
+                branches = getattr(self, "_fstat_ref_branches", None)
+                if branches is None:
+                    branches = self._fstat_ref_branch_from_payload(
+                        payload.get("gb_branch"))
+                if payload.get("gb_free") and branches is None:
+                    # What ``gb_free`` is FOR: the head asked for the window,
+                    # and this rank has nothing to open it with. The head's
+                    # own WARNING names the rank; this one puts the fact in
+                    # the owner's log, where the operator is already looking
+                    # if anything else went wrong here.
+                    logger.warning(
+                        "%s: gb_fstat_ref_row on rank %d was asked for a "
+                        "GB-FREE window for walker %d but carries no GB "
+                        "branch (none shipped, none head-local); the snapshot "
+                        "will be of that walker's OWN residual.",
+                        self.name, owner_rank, w_global)
+                with self._gb_free_residual(model, branches, local_index):
+                    gb_free_opened = bool(getattr(self, "_gb_free_opened", False))
+                    n_live = int(getattr(self, "_gb_free_n_live", -1))
+                    view, intra = self._fstat_ref_shard(acs, local_index)
+                    # ``snapshot_ref_rows`` slices ON the owning device; a
+                    # shard view carries its own, a single-shard ACA does
+                    # not, so the rank's main GPU is passed explicitly.
+                    device = getattr(view, "device", None)
+                    if device is None and getattr(acs, "gpus", None):
+                        device = int(acs.gpus[0])
+                    data_row, psd_row = snapshot_ref_rows(
+                        acs, view, intra, intra, xp=self.xp, device=device)
+                if collective:
+                    # Normalize to the canonical width FIRST, so the flag the
+                    # receivers act on describes the buffer that is actually
+                    # sent. Never a cast ACROSS the real/complex boundary:
+                    # that is what would silently drop the imaginary part.
+                    # GUARDED TOO -- these are tens of MB, so they can raise
+                    # MemoryError, and doing so after the guard closed would
+                    # be the same permanent hang. The no-broadcast paths
+                    # (no fan-out, one compute rank) convert NOTHING, which
+                    # is what keeps the golden-gated serial fit byte-exact.
+                    data_row = np.ascontiguousarray(
+                        data_row, dtype=_bcast_dtype(data_row))
+                    psd_row = np.ascontiguousarray(
+                        psd_row, dtype=_bcast_dtype(psd_row))
+                    header[:] = (1, data_row.size, psd_row.size,
+                                 np.iscomplexobj(data_row),
+                                 np.iscomplexobj(psd_row))
+        except BaseException:
+            if not (collective and is_owner):
+                # Nobody is waiting on us -- either there is no collective at
+                # all, or we are a NON-owner, which cannot signal through a
+                # header the root owns (see the docstring's residual).
+                raise
+            # Every other rank is about to block in Bcast(header) with no
+            # timeout, and ``ComputeService.handle`` would swallow this
+            # traceback into a reply the head never gets to read. Log it
+            # HERE (the only place it exists) and tell the others through
+            # the status word, so the whole command fails together.
+            logger.exception(
+                "%s: gb_fstat_ref_row FAILED on the owner rank %d while "
+                "snapshotting walker %d (local row %d); every compute "
+                "rank will raise together.",
+                self.name, owner_rank, w_global, local_index)
+            owner_failed = True
+            data_row = psd_row = None
+            header[:] = 0
+
+        if collective:
+            comm = fanout.comm
+            root = fanout.layout.fanout_rank(owner_rank)
+            comm.Bcast(header, root=root)
+            # Checked on EVERY rank off the SAME header, so every rank takes
+            # the same branch and the collective count stays symmetric: on
+            # failure all of them raise here, one collective in.
+            if int(header[0]) != 1:
+                raise RuntimeError(
+                    f"{self.name}: gb_fstat_ref_row aborted -- the owner "
+                    f"(rank {owner_rank}, walker {w_global}, local row "
+                    f"{local_index}) could not snapshot the reference row. "
+                    f"The traceback is in rank {owner_rank}'s log; this rank "
+                    "only saw the failure status word."
+                )
+            if int(header[1]) <= 0 or int(header[2]) <= 0:
+                raise RuntimeError(
+                    f"{self.name}: gb_fstat_ref_row broadcast an EMPTY "
+                    f"reference row (data {int(header[1])} elements, invC "
+                    f"{int(header[2])}) from rank {owner_rank}. Scoring the "
+                    "whole epoch against empty rows would be silent, so this "
+                    "refuses instead."
+                )
+            if not is_owner:
+                data_row = np.empty(
+                    int(header[1]),
+                    dtype=np.complex128 if header[3] else np.float64)
+                psd_row = np.empty(
+                    int(header[2]),
+                    dtype=np.complex128 if header[4] else np.float64)
+            comm.Bcast(data_row, root=root)
+            comm.Bcast(psd_row, root=root)
+
+        if data_row is None or psd_row is None:
+            # Unreachable by construction: a rank that is not the owner only
+            # skips the broadcast when the fan-out reports ONE compute rank,
+            # and that rank IS the owner. Refuse rather than hand ``None`` to
+            # ``xp.asarray`` -- and safe to raise, because the only shape
+            # that reaches it has nobody else waiting in a collective.
+            raise RuntimeError(
+                f"{self.name}: gb_fstat_ref_row has no reference row on rank "
+                f"{getattr(fanout, 'rank', None)}: owner_rank={owner_rank} is "
+                "not this rank and no broadcast ran. The head's owner_rank "
+                "must name a rank of the fan-out communicator."
+            )
+
+        self._fstat_ref_walker = w_global
+        self._fstat_ref_call = None       # rebuilt lazily against the holder
+        self._fstat_ref_holder = FStatRefRowHolder(
+            acs,
+            (acs.gpus[0] if getattr(acs, "gpus", None) else None),
+            self.xp.asarray(data_row),
+            self.xp.asarray(psd_row),
+        )
+        return {
+            "rank": int(getattr(fanout, "rank", 0)),
+            "is_owner": bool(is_owner),
+            # Did the GB-free window ACTUALLY open? ``n_live`` cannot answer
+            # that -- 0 is what a disabled window, an empty walker and a
+            # branch-less rank all look like -- and the head's one INFO line
+            # is the only thing an operator reads.
+            "gb_free_opened": bool(gb_free_opened),
+            "n_live": int(n_live),
+            # ``data_row`` / ``psd_row`` are still the HOST arrays here --
+            # ``xp.asarray`` above copied, it did not rebind -- so this is
+            # numpy on the GPU path too (``np.asarray`` of a cupy array
+            # raises).
+            "data_bytes": int(np.asarray(data_row).nbytes),
+            "psd_bytes": int(np.asarray(psd_row).nbytes),
+        }
+
+    def _fstat_ref_row_fanout(self, model, branches, w_global, owner_rank,
+                              local_index):
+        """HEAD: issue ``gb_fstat_ref_row``; every rank ends holding a holder.
+
+        HOW ``branches`` REACHES THE OWNER. The GB-free window needs a live
+        branch dict to build its ``BandSorter``, and a compute rank has none
+        during ``setup()``. Two routes, chosen by whether a real fan-out
+        exists:
+
+        * **No fan-out, or ONE compute rank** -- ``_fstat_ref_branches``
+          carries the head's own dict straight into the body. Nothing is
+          pickled and nothing is sliced, so this path (every production run
+          today, and the one the stage-B goldens gate) is byte-for-byte what
+          it was. Cleared in a ``finally`` so a later command can never reuse
+          a stale one.
+
+          BYTE-IDENTICAL IS NOT COST-IDENTICAL, and the difference is the
+          number an operator diffs against epoch 0: there is no disk round
+          trip and no collective, but the body still runs, so
+          ``snapshot_ref_rows`` hosts the two rows as genuine COPIES and
+          ``xp.asarray`` puts them back on the device -- ~72 MB resident for
+          the duration of the fit -- and the sweep then scores through that
+          single-slab holder pinned to ``acs.gpus[0]`` rather than through
+          the live (possibly multi-shard) ACA at row ``walker_ref``, which on
+          a multi-GPU single-rank box changes WHICH device runs it (spec
+          decision 8).
+        * **Several compute ranks** -- the owner's payload carries its
+          BLOCK-SLICED, temp-0 cold branch (:meth:`_fstat_ref_branch_slice`),
+          because the owner is a worker roughly ``1 - 1/n_compute`` of the
+          time and would otherwise open no window at all: the epoch would be
+          fitted against a residual that still has the reference walker's own
+          GBs subtracted -- exactly the walker-dependence the GB-free
+          redesign exists to remove -- while the cache fingerprint still said
+          ``gbfree=1``, so a resume would silently reuse it.
+
+          The HEAD takes the same route when it is the owner under a real
+          fan-out, deliberately: its in-memory ``branches`` is the FULL
+          ensemble while its ACA is only its block, and ``walker=local_index``
+          against a full-ensemble branch picks the right column only when the
+          head's block starts at 0. It does under ``main_rank=0``, but
+          ``main_rank`` is a public ``StockGlobalFit`` knob and
+          ``resolve_roles`` orders ``compute_ranks`` by world rank, so a
+          non-zero one puts the head's block elsewhere and the old path would
+          have restored a DIFFERENT walker's GBs into the right ACA row. One
+          route for every owner removes the trap; it costs a numpy slice of
+          arrays the head already holds, not a round trip.
+
+        PAYLOAD SHAPE. Per-rank, but only in the one field no rank but the
+        owner reads: every non-owner gets the identical base dict, and the
+        owner gets that same dict plus ``gb_branch``. Everything the
+        COLLECTIVE depends on -- ``owner_rank``, and therefore the ``root``
+        every rank computes -- is identical on every rank, which is the
+        invariant that actually matters; broadcasting megabytes of branch to
+        ranks that would throw them away is not.
+
+        With NO fan-out at all (``_propose_legacy``, ``fit.sample()``) this
+        is a direct call to the body -- no communicator is touched and the
+        holder is built from this process's own rows. A non-head rank is NOT
+        given a fallback: the fit is head-only work, so ``_fanout_cmd``
+        raising ``WalkerFanout.run is head-only`` is the right answer -- a
+        local snapshot there would silently be of the wrong walker.
+
+        Returns ``{rank: reply}``, the shape :meth:`_fanout_cmd` produces.
+        """
+        fanout = getattr(self, "fanout", None)
+        # The payload's ``gb_free`` is what the head ASKED FOR, so it has to
+        # account for the env flag too -- otherwise a rank that skipped the
+        # window because GB_FSTAT_GB_FREE=0 is indistinguishable from one that
+        # skipped it because it had no branch.
+        gb_free_requested = (branches is not None
+                             and os.environ.get("GB_FSTAT_GB_FREE", "1") == "1")
+        base_payload = self._fstat_ref_row_payload(
+            w_global, owner_rank, local_index, gb_free_requested)
+
+        if fanout is None:
+            self._fstat_ref_branches = branches
+            try:
+                result = self._gb_serve_fstat_ref_row(base_payload, {}, model)
+            finally:
+                self._fstat_ref_branches = None
+            logger.info(
+                "%s: F-stat reference row built in-process from walker %d "
+                "(no fan-out); GB-free window %s, %d cold GB signal(s) "
+                "restored for the snapshot; %.1f MB residual + %.1f MB invC",
+                self.name, int(w_global),
+                "OPEN" if result.get("gb_free_opened") else "not opened",
+                int(result.get("n_live", -1)),
+                result.get("data_bytes", 0) / 1e6,
+                result.get("psd_bytes", 0) / 1e6)
+            self._warn_if_gb_free_missed(
+                gb_free_requested, bool(result.get("gb_free_opened")),
+                owner_rank, w_global)
+            return {0: result}
+
+        owner_payload = base_payload
+        if fanout.single:
+            # ONE compute rank: no slicing and nothing on the wire -- the
+            # head's live dict goes through ``_fstat_ref_branches`` exactly
+            # as it always has, and every rank (there is one) gets the same
+            # payload object.
+            self._fstat_ref_branches = branches
+        else:
+            self._fstat_ref_branches = None
+            owner_payload = dict(base_payload)
+            if gb_free_requested:
+                ow0, ow1 = fanout.layout.block_of(owner_rank)
+                owner_payload["gb_branch"] = self._fstat_ref_branch_slice(
+                    branches, ow0, ow1)
+
+        def per_rank(rank, w0, w1):
+            # Only the OWNER's payload differs, and only in ``gb_branch``,
+            # which no other rank reads. Every field the COLLECTIVE depends
+            # on -- ``owner_rank``, hence the ``root`` each rank derives --
+            # is the same object on every rank.
+            return owner_payload if int(rank) == owner_rank else base_payload
+
+        try:
+            replies, _token = self._fanout_cmd(
+                "gb_fstat_ref_row", per_rank, model)
+        finally:
+            self._fstat_ref_branches = None
+        owner_reply = next(
+            (r for r in replies.values() if r and r.get("is_owner")), None)
+        n_live = -1 if owner_reply is None else int(owner_reply.get("n_live", -1))
+        # Every rank ends up holding the SAME pair, so any reply's sizes are
+        # the per-rank cost; prefer the OWNER's, which measured them before
+        # the broadcast.
+        sized = owner_reply or next((r for r in replies.values() if r), {})
+        opened = bool((owner_reply or {}).get("gb_free_opened"))
+        logger.info(
+            "%s: F-stat reference row replicated to %d rank(s) from walker "
+            "%d (rank %d, local row %d); GB-free window %s, %d cold GB "
+            "signal(s) restored for the snapshot; %.1f MB residual + %.1f MB "
+            "invC per rank",
+            self.name, len(replies), int(w_global), int(owner_rank),
+            int(local_index), "OPEN" if opened else "not opened", n_live,
+            (sized.get("data_bytes") or 0) / 1e6,
+            (sized.get("psd_bytes") or 0) / 1e6)
+        self._warn_if_gb_free_missed(gb_free_requested, opened,
+                                     owner_rank, w_global)
+        return replies
+
+    def _warn_if_gb_free_missed(self, requested, opened, owner_rank, w_global):
+        """The safety net: say so when a requested GB-free window never opened.
+
+        The head's one INFO line is what an operator reads, and ``n_live == 0``
+        is ambiguous -- it is what ``GB_FSTAT_GB_FREE=0`` looks like, what a
+        walker holding no cold GBs looks like, and what a rank that was handed
+        no branch looks like. Meanwhile ``_run_fstat_fit`` stamps
+        ``gbfree=<env flag>`` into the epoch's cache fingerprint either way, so
+        a silent miss here is resumed as a GB-free grid forever.
+        """
+        if not requested or opened:
+            return
+        logger.warning(
+            "%s: the F-stat GB-FREE window did NOT open on rank %d for "
+            "reference walker %d, although the head requested it. This "
+            "epoch's grid is fitted against that walker's own residual while "
+            "its cache fingerprint claims gbfree=1 -- the branch the owner "
+            "was given did not reach the GB-free window.",
+            self.name, int(owner_rank), int(w_global))
+
+    def _fstat_release_ref_row(self):
+        """Drop this rank's replicated row, its scorer, ITS BLOCKS, the pool.
+
+        Two callers, on the two sides of the wire:
+
+        * the HEAD, from ``setup()``'s ``finally``, once the grid fit AND the
+          centre table are done -- they must score against the same reference
+          row (the 2026-08-24 same-residual rule), so the release cannot
+          happen between them;
+        * every COMPUTE rank, serving ``gb_fstat_release``, which the head
+          issues from :meth:`_run_fstat_fit` as soon as the last stage-B group
+          is assembled and the epoch's artifacts are written. A rank cannot
+          tell which ``gb_fstat_stage_b`` command was the last, so the head
+          -- which can -- says so explicitly.
+
+        WHAT IS FREED, biggest first:
+
+        * the sig-het scorer's BUCKETED REFERENCE BLOCKS -- ~GB of device
+          arrays -- which live on the COMP (``gb_wdm_comp._fstat``), NOT on
+          the closure: :func:`build_sighet_call_fstat`'s ``_ensure_block``
+          calls ``comp.setup_fstat_references(...)``, which allocates them
+          onto the comp, and only then records a SECOND strong reference on
+          the closure. Dropping ``_fstat_ref_call`` alone therefore returns
+          one of two references and frees nothing at all; the clear goes
+          through :meth:`_fstat_clear_comp_references`.
+        * ``_fstat_ref_holder`` -- the replicated residual + inverse-PSD
+          rows (~72 MB at 6mo);
+        * ``_fstat_ref_call`` (the closure) and ``_fstat_ref_walker`` (the
+          index).
+
+        Then the memory pool, because dropping references only makes the
+        blocks reusable by THIS process -- the pool is what hands them back.
+
+        Nothing else invalidates any of it: ``_gb_serve_fstat_ref_row``
+        resets the holder and the closure only when a NEW row arrives, and
+        the comp's blocks only when the next ``setup_fstat_references`` runs
+        -- at ``GB_FSTAT_REFIT_EVERY=50``, ~50 iterations of GB proposals
+        later.
+        """
+        self._fstat_ref_holder = None
+        self._fstat_ref_call = None
+        self._fstat_ref_walker = None
+        self._fstat_clear_comp_references()
+        # THE POOL, LAST. Dropping the references above only makes the blocks
+        # reusable by this process; ``free_all_blocks`` is what returns them.
+        # It runs AFTER the clear for the obvious reason -- a live-referenced
+        # block cannot be reclaimed. ``getattr``: this must work on any GB
+        # move (see ``gf_serve``), including one built without a pool.
+        pool = getattr(self, "mempool", None)
+        if pool is not None:
+            pool.free_all_blocks()
+
+    @contextmanager
+    def _fstat_detached_timer(self):
+        """Run a served F-stat body with NO propose timer bound.
+
+        The F-stat ops are non-session commands issued from ``setup()``, so
+        there is no propose to attribute their spans and counters to. On a
+        worker the bound timer is a CLOSED session's (``_exit_rank_block``
+        deliberately does not restore it), and anything counted into it is
+        never printed anywhere -- it just makes a later timing dump read as
+        if a propose had done F-stat work. Restores the previous value, so
+        the head's own live timer survives its local body unchanged.
+        """
+        saved = getattr(self, "_prop_timer", None)
+        self._prop_timer = None
+        try:
+            yield
+        finally:
+            self._prop_timer = saved
+
+    def _fstat_clear_comp_references(self):
+        """Drop the sig-het F-stat reference blocks stashed on the GB comp.
+
+        THE EXPENSIVE HALF of an F-stat reference row, and the half a
+        ``_fstat_ref_call = None`` does not touch: ``setup_fstat_references``
+        writes the whole bucketed block (A0/A1/B0/B1/B0nc/B1nc/mask/refs,
+        every one an ``xp`` array) onto ``comp._fstat``, and the closure's
+        ``state["stash"]`` is only a second reference to that same dict.
+
+        Safe at any time. ``_ensure_block``'s identity guard treats
+        ``comp._fstat is None`` as "rebuild", so a scorer that outlives this
+        call (nothing in the F-stat path does -- the closure is dropped in
+        the same breath) degrades to one reference-block rebuild rather than
+        scoring against a stale block.
+
+        NEVER RAISES. A release is the one command in the protocol that must
+        not be the thing that fails (the same principle that exempts
+        ``gb_fstat_release`` from ``_FSTAT_OP_REQUIRES``), and this runs on
+        every rank including the head's own local body.
+
+        SCOPE: the move's own comp. Device-local comp REPLICAS built by
+        ``_RoutedBandEngine._comp_for`` for the multi-shard / multi-device
+        LANE path keep their own stash; those belong to the per-unit lane
+        adapter, not to the epoch fit, whose holder is single-shard by
+        construction and therefore always scores through this comp.
+        """
+        comp = getattr(self, "gb_wdm_comp", None)
+        if comp is None:
+            return
+        try:
+            _clear = getattr(comp, "clear_fstat_references", None)
+            if _clear is not None:
+                # GBSignalHetComputations.clear_fstat_references
+                _clear()
+            elif hasattr(comp, "_fstat"):
+                # A comp with the stash but no teardown (a future/foreign
+                # sig-het surface): drop it by hand rather than silently
+                # leaving ~GB resident.
+                comp._fstat = None
+            # else: a plain GBWDMComputations (GB_SIGHET_INMODEL=0) has no
+            # F-stat stash at all -- two failed lookups and nothing to do.
+        except Exception as exc:  # noqa: BLE001 -- a release cannot fail
+            logger.warning(
+                "%s: could not clear the sig-het F-stat reference blocks on "
+                "the GB comp (%r); they stay resident until the next "
+                "setup_fstat_references.", self.name, exc, exc_info=True)
+
+    def _gb_serve_fstat_release(self, payload, clock, model):
+        """Drop this rank's row, scorer and blocks; free the pool.
+
+        NON-SESSION (the head issues it from ``setup()``, like the other two
+        F-stat ops) and, unlike ``gb_fstat_ref_row``, NO COLLECTIVE and NO
+        PAYLOAD: nothing here can block on another rank, so a failure on one
+        surfaces as an ordinary remote failure instead of parking the rest.
+
+        UNCONDITIONAL, on every rank including the head's own local body --
+        which is why the head's driver (:meth:`_fstat_release_fanout`) saves
+        and restores its holder around the command rather than teaching this
+        body about roles: a memory-reclaim command with a rank-dependent
+        branch is one mis-set flag away from being the thing that keeps the
+        memory.
+
+        Returns ``{"rank", "released"}``; ``released`` says whether this rank
+        was actually holding anything, so the head's line reports a measured
+        count rather than the number of ranks it asked.
+        """
+        # ``_fstat_ref_walker`` too: it is part of what
+        # ``_fstat_release_ref_row`` clears, so a rank holding only the index
+        # (an aborted ``gb_fstat_ref_row``) would otherwise report
+        # ``released=False`` and under-count the head's line.
+        held = (self._fstat_ref_holder is not None
+                or self._fstat_ref_call is not None
+                or self._fstat_ref_walker is not None)
+        # Clears the comp's reference blocks and frees the pool too -- the
+        # pool sweep lives THERE so the head's own ``setup()``-level release
+        # (which never comes through this body) gets it as well.
+        self._fstat_release_ref_row()
+        fanout = getattr(self, "fanout", None)
+        logger.info(
+            "%s%s: F-stat reference row released (%s).", self._rank_tag(),
+            self.name, "was held" if held else "nothing was held")
+        return {"rank": None if fanout is None else int(fanout.rank),
+                "released": bool(held)}
+
+    def _fstat_release_fanout(self, model):
+        """HEAD: ``gb_fstat_release`` -- every WORKER drops its reference row.
+
+        Issued from :meth:`_run_fstat_fit` once the last stage-B group has
+        been assembled and the epoch's ``.npz`` + ``DONE.json`` are written.
+        Stage A and the centre table are head-only, so no worker's holder is
+        needed past that point, and waiting for the next fit would leave the
+        row plus its built sig-het scorer idle on every worker's device for
+        ``GB_FSTAT_REFIT_EVERY`` (50) iterations of GB proposals.
+
+        WRITTEN, NOT YET FSYNCED. The barrier is the head's NEXT propose
+        (:meth:`_flush_epoch_artifacts`, from ``_propose_orchestrated``),
+        which is after ``setup()`` returns. That is safe because a rank
+        serving this command opens no epoch artifact at all; the ranks read
+        them at ``_setup_from_directive``, on the far side of the flush.
+
+        THE HEAD PAYS A POOL SWEEP IT DOES NOT WANT: its local body runs
+        ``free_all_blocks()`` just before the ~25 s centre sweep re-allocates.
+        Accepted deliberately, because the alternative is a role branch
+        inside a memory-reclaim command -- one mis-set flag away from being
+        the thing that keeps the memory. The head's ROW is unaffected (the
+        ``saved`` tuple holds those arrays alive across the sweep); what is
+        paid is the pool churn, against a section measured in seconds.
+
+        THE HEAD KEEPS ITS OWN. ``WalkerFanout.run`` always runs
+        ``local_body`` (``fanout.py`` :225 / :258), so the head serves this
+        command too -- and its holder is exactly what
+        :meth:`_install_ctr_table` still has to score against (spec decision
+        6). Rather than give the served body a role branch, the head saves the
+        three attributes -- AND the comp's sig-het reference blocks, which
+        :meth:`_fstat_release_ref_row` now clears as well -- and puts them
+        back in a ``finally``. The body's ``free_all_blocks`` cannot reclaim
+        any of it while ``saved`` holds a reference, so the head's row and
+        its scorer's resident block survive the pool sweep as well as the
+        assignment; without the block, the centre sweep would score through
+        the same closure but pay a full reference-block REBUILD on its first
+        batch (``_ensure_block`` treats ``comp._fstat is None`` as "rebuild").
+
+        No-op with no fan-out, and at ONE compute rank (there is no other rank
+        to release, and the byte-identity-gated single-rank path must not grow
+        a command it never had). Returns ``{rank: reply}``.
+        """
+        fanout = getattr(self, "fanout", None)
+        if fanout is None or fanout.single:
+            return {}
+        saved = (self._fstat_ref_holder, self._fstat_ref_call,
+                 self._fstat_ref_walker)
+        # The comp's resident reference block goes with them (see above).
+        # ``getattr`` twice: a plain GBWDMComputations has no ``_fstat``, and
+        # a move may carry no comp at all.
+        _comp = getattr(self, "gb_wdm_comp", None)
+        _saved_blocks = getattr(_comp, "_fstat", None)
+        try:
+            replies, _token = self._fanout_cmd(
+                "gb_fstat_release", lambda rank, w0, w1: None, model)
+        finally:
+            (self._fstat_ref_holder, self._fstat_ref_call,
+             self._fstat_ref_walker) = saved
+            if _saved_blocks is not None:
+                _comp._fstat = _saved_blocks
+        # The head's own reply says "released" too -- its body ran like every
+        # other rank's -- but its row is back by the time this line is
+        # written, so counting it would misreport what was actually freed.
+        head = fanout.layout.head_rank
+        workers = [r for rank, r in replies.items() if rank != head]
+        n_held = sum(1 for r in workers if (r or {}).get("released"))
+        logger.info(
+            "%s: F-stat reference row released on %d of %d worker rank(s); "
+            "the head keeps its own until the centre table is built.",
+            self.name, n_held, len(workers))
+        return replies
+
+    def _fstat_holder_call(self, model):
+        """The holder-scored ``call_fstat``, built ONCE per fit on this rank.
+
+        Cached because the sig-het scorer is STATEFUL: its bucketed
+        reference blocks are built lazily on f0 crossings and stashed on the
+        comp, so rebuilding the closure per group would throw that cache
+        away between groups -- exactly the rebuild pathology the f0-sorted
+        box order exists to avoid.
+
+        Used by the head (stage A, and the centre table under the spec's
+        same-residual rule) and by every rank's ``gb_fstat_stage_b`` body,
+        so the whole epoch is scored against ONE residual snapshot. THE
+        SINGLE CHOKEPOINT, and therefore the single place the "is there a
+        reference row?" guard lives -- every caller passes through here, so
+        duplicating it in the served body would only give one condition two
+        different messages.
+        """
+        if self._fstat_ref_holder is None:
+            # Without this, ``holder=None`` falls straight through to the
+            # LIVE ACA at ``walker_ref=0`` -- some other walker's residual,
+            # with no error anywhere and a grid that looks perfectly normal.
+            raise RuntimeError(
+                f"{self.name}: no replicated F-stat reference row on this "
+                "rank -- gb_fstat_ref_row must run before anything scores "
+                "through the holder (on a compute rank that means "
+                "gb_fstat_stage_b arrived first). Scoring the live ACA at "
+                "row 0 instead would silently fit the epoch against the "
+                "wrong walker.")
+        call = getattr(self, "_fstat_call", None)
+        if call is None:
+            raise RuntimeError(
+                f"{self.name}: only the F-stat grid move "
+                "(GBSpecialRJFStatGridMove) can build an F-stat scorer; this "
+                "move has no _fstat_call.")
+        if self._fstat_ref_call is None:
+            self._fstat_ref_call = call(
+                model, 0, holder=self._fstat_ref_holder)
+        return self._fstat_ref_call
+
+    @staticmethod
+    def _fstat_comb_payload(spec, rank_index, a, b):
+        """One rank's node range of one comb sky LEVEL, as host arrays.
+
+        The SKY GRID is shipped whole (it defines what a row means, and at
+        the largest production level it is 512 pairs = 8 kB); only
+        ``f0_nodes`` and the ``[a, b)`` bounds are sliced. ``ckpt_name`` is
+        per rank so two ranks never share a progress file -- their
+        fingerprints already differ, because the fingerprint hashes the
+        SLICED rows plus the label.
+        """
+        sub = spec.sub_range(
+            a, b, ckpt_name=f"{spec.ckpt_name}_r{int(rank_index)}")
+        return {
+            "li": int(sub.li),
+            "n_levels": int(sub.n_levels),
+            "lv": int(sub.lv),
+            "a": int(sub.a),
+            "b": int(sub.b),
+            "rank_index": int(rank_index),
+            "f0_nodes": np.ascontiguousarray(
+                np.asarray(sub.f0_nodes, dtype=float)),
+            "alpha": np.ascontiguousarray(np.asarray(sub.alpha, dtype=float)),
+            "sin_delta": np.ascontiguousarray(
+                np.asarray(sub.sin_delta, dtype=float)),
+            "mc_fix": float(sub.mc_fix),
+            "label": sub.label,
+            "ckpt_name": sub.ckpt_name,
+            "parts_dir": sub.parts_dir,
+            "fingerprint_extra": sub.fingerprint_extra,
+        }
+
+    @staticmethod
+    def _fstat_comb_spec(payload):
+        """Rebuild the :class:`CombLevelSpec` a payload describes."""
+        from lisatools.sampling.fstat_gridfit import CombLevelSpec
+
+        return CombLevelSpec(
+            li=int(payload["li"]), n_levels=int(payload["n_levels"]),
+            lv=int(payload["lv"]), a=int(payload["a"]), b=int(payload["b"]),
+            f0_nodes=np.asarray(payload["f0_nodes"], dtype=float),
+            alpha=np.asarray(payload["alpha"], dtype=float),
+            sin_delta=np.asarray(payload["sin_delta"], dtype=float),
+            mc_fix=float(payload["mc_fix"]), label=payload["label"],
+            ckpt_name=payload["ckpt_name"], parts_dir=payload["parts_dir"],
+            fingerprint_extra=payload["fingerprint_extra"])
+
+    def _gb_serve_fstat_comb(self, payload, clock, model):
+        """Sweep this rank's contiguous node range of one comb sky level.
+
+        Runs the SAME :func:`run_comb_level` the serial scan runs, on the
+        sliced inputs, scored through the replicated reference row -- so a
+        split can only differ from the serial sweep by ``FSTAT_BATCH``
+        grouping, which is row-independent.
+
+        The per-node reduction (max over the sky block, and its argmax)
+        happens HERE, before anything goes to disk: the level-6 block at 6mo
+        is 185 million F values and the reduction of it is 3 x 362,020. The
+        finished triple goes to the shared ``_parts`` directory as raw
+        float64 anyway, for the same reason stage B's partials do -- it is
+        the head that concatenates, and the reply carries only metadata.
+
+        NO COLLECTIVE runs in this body, deliberately (spec decisions 4/5),
+        exactly as in :meth:`_gb_serve_fstat_stage_b`: each rank sweeps its
+        own range and writes its own file, so a failure on one rank surfaces
+        as an ordinary ``RemoteWorkerError`` on the head instead of parking
+        every other rank in an untimed collective.
+
+        The missing-reference-row guard is :meth:`_fstat_holder_call`'s: the
+        scorer below is built through it, so the condition is checked once,
+        before any sweep, with one message.
+        """
+        from lisatools.sampling.fstat_gridfit import (
+            run_comb_level,
+            save_comb_part,
+        )
+
+        self._bind_rank_acs(model)
+        spec = self._fstat_comb_spec(payload)
+        rank_index = int(payload["rank_index"])
+        t0 = time.perf_counter()
+        F_max, best_al, best_sd = run_comb_level(
+            spec, self._fstat_holder_call(model), xp=self.xp)
+        _path, n_nodes, sha = save_comb_part(
+            spec.parts_dir, spec.li, rank_index, F_max, best_al, best_sd)
+        del F_max, best_al, best_sd
+        self.mempool.free_all_blocks()
+        wall = time.perf_counter() - t0
+        logger.info(
+            "%s: [FSTAT_COMB] l%d r%d nodes [%d, %d) (%d) in %.1fs",
+            self.name, spec.li, rank_index, spec.a, spec.b, n_nodes, wall)
+        # ``rank`` is the WORLD rank, for per-rank attribution in a log; it is
+        # ``None`` rather than 0 without a fan-out, because labelling a
+        # fan-out-less serve "rank 0" is a claim, not a default.
+        _fan = getattr(self, "fanout", None)
+        return {"li": int(spec.li), "a": int(spec.a), "b": int(spec.b),
+                "rank_index": rank_index, "n_nodes": int(n_nodes),
+                "sha1": sha, "wall_s": float(wall),
+                "rank": None if _fan is None else int(_fan.rank)}
+
+    def _fstat_comb_runner(self, model):
+        """HEAD: a ``comb_runner`` that fans ONE sky level out over the ranks.
+
+        ``run_comb_scan`` does everything else -- the node grid, the
+        adaptive ``nsky_per_node`` ladder, the peak selection and the npz
+        write -- so the parallel path can differ from the serial one only in
+        HOW each level's per-node reduction is produced.
+
+        NO COMMUNICATION DECIDES THE WORK. ``nsky_per_node`` is a closed
+        form of f0 alone, so every rank would derive the identical level
+        assignment; the head does not ship it, it ships the level's node
+        slice. Ranges are contiguous and equal-count
+        (:func:`split_box_range`), a pure function of ``(a, b, n_compute)``,
+        so a resume reproduces the same rank -> range map and each rank
+        finds its OWN progress file.
+
+        CONTIGUITY, not interleaving, for the reason stage B needs it: comb
+        nodes are f0-ORDERED and the sig-het scorer keeps ONE reference
+        block resident, rebuilding it on f0 crossings. An f0-contiguous
+        range divides the block builds proportionally; an interleaved one
+        would rebuild every block on every rank (measured 4,600 rebuilds ~
+        350 s in the F-ordered-box incident).
+
+        REFUSES ANYTHING BUT A REAL FAN-OUT, in code rather than in prose,
+        for the same reason :meth:`_fstat_stage_b_runner` does. At
+        ``n_compute == 1`` this would otherwise run happily --
+        ``WalkerFanout.run``'s single branch calls only ``local_body`` -- and
+        the NUMBERS would be unchanged, but ``n_compute == 1`` is the spec's
+        byte-identity gate: the checkpoint name would change from the legacy
+        ``comb_nsky{lv}`` to ``comb_nsky{lv}_r0`` (invalidating an in-flight
+        comb's resume, which at 6mo is up to 47 minutes of scan) and the
+        gated serial path would round-trip through disk for nothing.
+        """
+        from lisatools.sampling.fstat_gridfit import (
+            assemble_comb_level,
+            clear_comb_parts,
+            split_box_range,
+        )
+
+        fanout = getattr(self, "fanout", None)
+        # ``getattr(..., True)``: a real ``WalkerFanout`` always sets
+        # ``single``, but reading it bare would answer a fan-out-like object
+        # that does not with an ``AttributeError`` instead of this message.
+        # Defaulting to "single" keeps the byte-identity gate CLOSED whenever
+        # the shape is unknown.
+        if fanout is None or getattr(fanout, "single", True):
+            raise RuntimeError(
+                f"{self.name}: _fstat_comb_runner needs SEVERAL compute "
+                "ranks to split the sky level over. With no fan-out, or at "
+                "one compute rank, stage A is the serial run_comb_level and "
+                "run_comb_scan must be called with no comb_runner at all -- "
+                "that path is the byte-identity gate.")
+        layout = fanout.layout
+        n_parts = int(layout.n_compute)
+
+        def runner(spec, call_fstat, *, xp):
+            # Stage A, stage B and the centre table must score against the
+            # SAME residual snapshot (spec decision 6). The ranks build their
+            # own scorer from the replicated row, so this argument is unused
+            # here -- which is exactly why it has to be checked: a wiring that
+            # handed ``run_comb_scan`` a live-ACA scorer would fit stage A
+            # against one residual and stage B against another, with nothing
+            # anywhere to say so.
+            if call_fstat is not self._fstat_ref_call:
+                raise RuntimeError(
+                    f"{self.name}: stage A was handed a scorer that is not "
+                    "this rank's cached holder-scored call_fstat "
+                    "(_fstat_holder_call). Stage A and stage B would then "
+                    "score against different residuals; pass "
+                    "self._fstat_holder_call(model) to run_fstat_grid_fit.")
+            if not spec.parts_dir:
+                raise RuntimeError(
+                    f"{self.name}: comb level {spec.li} has no parts_dir -- "
+                    "the parallel sweep writes each rank's slice there and "
+                    "the head reads them back, so a shared epoch cache "
+                    "directory is required.")
+            ranges = split_box_range(spec.a, spec.b, n_parts)
+            by_rank = {r: ranges[layout.fanout_rank(r)]
+                       for r in layout.compute_ranks}
+            t0 = time.perf_counter()
+            replies, _token = self._fanout_cmd(
+                "gb_fstat_comb",
+                lambda rank, w0, w1: self._fstat_comb_payload(
+                    spec, layout.fanout_rank(rank), *by_rank[rank]),
+                model,
+            )
+            # ``_fanout_cmd`` hands back the BARE result dicts -- ``{rank:
+            # result}``, not ``{rank: {"result": ...}}``: ``WalkerFanout.run``
+            # unwraps the envelope itself.
+            results = {}
+            for rank, res in replies.items():
+                res = res or {}
+                if "rank_index" not in res:
+                    raise RuntimeError(
+                        f"{self.name}: the gb_fstat_comb reply from rank "
+                        f"{rank} carries no 'rank_index', so level "
+                        f"{spec.li}'s partial cannot be placed in node "
+                        "order; assembling the rest would return an F_max "
+                        "whose nodes silently disagree with f0_nodes[a:b].")
+                results[int(res["rank_index"])] = res
+            for ri, res in results.items():
+                # ``assemble_comb_level`` checks only the TOTAL width, so two
+                # partials that swapped places would concatenate silently
+                # into a reduction mismatched to its own f0 nodes -- every
+                # peak then selected at the wrong frequency. The ranges are
+                # what put them in order; check them.
+                want = ranges[ri] if 0 <= ri < len(ranges) else None
+                if want is None or (int(res.get("a", -1)),
+                                    int(res.get("b", -1))) != want:
+                    raise RuntimeError(
+                        f"{self.name}: comb level {spec.li} rank index {ri} "
+                        f"reported node range {(res.get('a'), res.get('b'))} "
+                        f"but was asked for {want} -- the partials would "
+                        "assemble out of node order.")
+                # A short partial IS caught downstream, but only as an
+                # aggregate width error that names no rank. Check it here,
+                # where the rank is still in hand.
+                if int(res.get("n_nodes", -1)) != want[1] - want[0]:
+                    raise RuntimeError(
+                        f"{self.name}: comb level {spec.li} rank index {ri} "
+                        f"wrote {res.get('n_nodes')} node(s) for the range "
+                        f"{want} ({want[1] - want[0]} expected).")
+            sha1s = {i: res.get("sha1") for i, res in results.items()}
+            try:
+                out = assemble_comb_level(
+                    spec.parts_dir, spec.li, n_parts, spec.n_nodes,
+                    sha1s=sha1s)
+            except OSError as exc:
+                # Every rank reported success, so the file exists -- on ITS
+                # node. The whole level's wall has already been paid by the
+                # time this shows up, and the bare errno says nothing about
+                # why. ``OSError``, not just ``FileNotFoundError``: a flaky
+                # or node-local shared mount surfaces just as often as a
+                # stale NFS handle (ESTALE) or a PermissionError, and the
+                # diagnosis below is the right one for all of them.
+                raise RuntimeError(
+                    f"{self.name}: comb level {spec.li} partial "
+                    f"{getattr(exc, 'filename', None)} could not be read on "
+                    f"the head ({exc.__class__.__name__}: {exc}) although "
+                    "every rank reported writing one. The epoch cache "
+                    f"directory ({spec.parts_dir}) must be on a filesystem "
+                    "SHARED by every compute rank; a node-local one lets "
+                    "each rank write a partial the head can never read."
+                ) from exc
+            clear_comb_parts(spec.parts_dir, spec.li, n_parts)
+            # ``clear_comb_parts`` only unlinks ``r < n_parts``. A fit that
+            # died at a LARGER n_compute leaves its high-index partials in
+            # the epoch dir forever, and nothing else matches them (the
+            # end-of-scan ``ckpt_clear(_parts, "comb_")`` sweeps only the
+            # ``.progress.*`` suffixes). The trailing ``*`` also takes
+            # ``.npy.tmp`` orphans: ``save_comb_part`` writes through a temp
+            # file, so a rank that died mid-``np.save`` at an index above the
+            # current ``n_compute`` leaves one ``clear_comb_parts`` never
+            # looks at either. The literal ``_r`` after the level number is
+            # what stops ``l1`` matching ``l11``.
+            for stale in glob.glob(os.path.join(
+                    spec.parts_dir, f"comb_l{int(spec.li)}_r*.npy*")):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+            walls = [float(res.get("wall_s", 0.0))
+                     for res in results.values()] or [0.0]
+            logger.info(
+                "%s: [FSTAT_COMB] level %d/%d over %d rank(s): nodes %s | "
+                "wall min %.1fs max %.1fs (imbalance %.0f%%) | assembled "
+                "%.1fs total",
+                self.name, spec.li + 1, spec.n_levels, n_parts,
+                [b - a for a, b in ranges], min(walls), max(walls),
+                100.0 * (max(walls) - min(walls)) / max(max(walls), 1e-9),
+                time.perf_counter() - t0)
+            return out
+
+        return runner
+
+    @staticmethod
+    def _fstat_stage_b_payload(spec, rank_index, a, b):
+        """One rank's slice of one group, as host arrays (the wire pickles it).
+
+        The AXES are shipped whole (they define what a row means, and they
+        are kilobytes); only ``f0_los`` / ``f0_dxs`` / the leading axis of
+        ``node_shape`` are sliced. ``ckpt_name`` is per rank so two ranks
+        never share a progress file -- their fingerprints already differ,
+        because the fingerprint hashes the SLICED inputs plus ``node_shape``.
+        """
+        sub = spec.sub_range(a, b, ckpt_name=f"{spec.ckpt_name}_r{int(rank_index)}")
+        return {
+            "gi": int(sub.gi),
+            "n_groups": int(sub.n_groups),
+            "a": int(sub.a),
+            "b": int(sub.b),
+            "rank_index": int(rank_index),
+            "f0_los": np.ascontiguousarray(np.asarray(sub.f0_los, dtype=float)),
+            "f0_dxs": np.ascontiguousarray(np.asarray(sub.f0_dxs, dtype=float)),
+            "mc_ax": np.ascontiguousarray(np.asarray(sub.mc_ax, dtype=float)),
+            "alpha_ax": np.ascontiguousarray(np.asarray(sub.alpha_ax, dtype=float)),
+            "sd_ax": np.ascontiguousarray(np.asarray(sub.sd_ax, dtype=float)),
+            "node_shape": tuple(int(v) for v in sub.node_shape),
+            "ckpt_name": sub.ckpt_name,
+            "parts_dir": sub.parts_dir,
+            "fingerprint_extra": sub.fingerprint_extra,
+            "fdot_axis": bool(sub.fdot_axis),
+            "c_t": float(sub.c_t),
+        }
+
+    @staticmethod
+    def _fstat_stage_b_spec(payload):
+        """Rebuild the :class:`StageBGroupSpec` a payload describes."""
+        from lisatools.sampling.fstat_gridfit import StageBGroupSpec
+
+        return StageBGroupSpec(
+            gi=int(payload["gi"]), n_groups=int(payload["n_groups"]),
+            a=int(payload["a"]), b=int(payload["b"]),
+            f0_los=np.asarray(payload["f0_los"], dtype=float),
+            f0_dxs=np.asarray(payload["f0_dxs"], dtype=float),
+            mc_ax=np.asarray(payload["mc_ax"], dtype=float),
+            alpha_ax=np.asarray(payload["alpha_ax"], dtype=float),
+            sd_ax=np.asarray(payload["sd_ax"], dtype=float),
+            node_shape=tuple(int(v) for v in payload["node_shape"]),
+            ckpt_name=payload["ckpt_name"], parts_dir=payload["parts_dir"],
+            fingerprint_extra=payload["fingerprint_extra"],
+            fdot_axis=bool(payload["fdot_axis"]), c_t=float(payload["c_t"]))
+
+    def _gb_serve_fstat_stage_b(self, payload, clock, model):
+        """Sweep this rank's contiguous box range of one stage-B group.
+
+        Runs the SAME :func:`run_stage_b_group` the serial fit runs, on the
+        sliced inputs, scored through the replicated reference row -- so a
+        split can only differ from the serial sweep by ``FSTAT_BATCH``
+        grouping, which is row-independent. The finished slice goes to the
+        shared ``_parts`` directory as raw float64; the REPLY carries only
+        metadata, because a whole group grid is 163-653 MB at production
+        scale against mpi4py's ~2 GiB pickle cap.
+
+        NO COLLECTIVE runs in this body, deliberately (spec decisions 4/5):
+        each rank sweeps its own range and writes its own file, so a failure
+        on one rank surfaces as an ordinary ``RemoteWorkerError`` on the head
+        instead of parking every other rank in an untimed ``Bcast`` -- the
+        hazard ``gb_fstat_ref_row`` has to spend a status word on.
+
+        The missing-reference-row guard is :meth:`_fstat_holder_call`'s, not
+        a second copy here: the scorer below is built through it, so the
+        condition is checked once, before any sweep, with one message.
+        """
+        from lisatools.sampling.fstat_gridfit import (
+            run_stage_b_group,
+            save_stage_b_part,
+        )
+
+        self._bind_rank_acs(model)
+        spec = self._fstat_stage_b_spec(payload)
+        rank_index = int(payload["rank_index"])
+        t0 = time.perf_counter()
+        grid = run_stage_b_group(spec, self._fstat_holder_call(model), xp=self.xp)
+        _path, n_rows, sha = save_stage_b_part(
+            spec.parts_dir, spec.gi, rank_index, grid)
+        del grid
+        self.mempool.free_all_blocks()
+        wall = time.perf_counter() - t0
+        logger.info(
+            "%s: [FSTAT_STAGEB] g%d r%d boxes [%d, %d) (%d) in %.1fs",
+            self.name, spec.gi, rank_index, spec.a, spec.b, n_rows, wall)
+        # ``rank`` is the WORLD rank, for per-rank attribution in a log; it is
+        # ``None`` rather than 0 without a fan-out, because labelling a
+        # fan-out-less serve "rank 0" is a claim, not a default.
+        _fan = getattr(self, "fanout", None)
+        return {"gi": int(spec.gi), "a": int(spec.a), "b": int(spec.b),
+                "rank_index": rank_index, "n_rows": int(n_rows),
+                "sha1": sha, "wall_s": float(wall),
+                "rank": None if _fan is None else int(_fan.rank)}
+
+    def _fstat_stage_b_runner(self, model):
+        """HEAD: a ``sweep_runner`` that fans ONE group out over the ranks.
+
+        ``run_stacked_stage_b`` does everything else -- the host prep, the
+        f0 sort, the Mc grouping, the proposal build and the npz write --
+        so the parallel path can differ from the serial one only in HOW each
+        group's grid is produced. Ranges are contiguous and equal-count
+        (:func:`split_box_range`), a pure function of ``(g_edges,
+        n_compute)``, so a resume reproduces the same map; box is the
+        slowest axis, so concatenating the partials in rank order
+        reproduces the whole-group sweep exactly.
+
+        REFUSES ANYTHING BUT A REAL FAN-OUT, in code rather than in prose.
+        At ``n_compute == 1`` this would otherwise run happily --
+        ``WalkerFanout.run``'s single branch (``fanout.py`` :223-225, the
+        ``if self.single:`` being the first of those lines) calls
+        only ``local_body``, so the head would sweep the whole range, write
+        ``stageb_g{gi}_r0.npy`` and read it straight back. The NUMBERS would
+        be unchanged, but ``n_compute == 1`` is the spec's byte-identity
+        gate: the checkpoint name would change from the legacy ``stageb`` to
+        ``stageb_r0`` (invalidating an in-flight fit's resume) and the gated
+        serial path would round-trip through disk for nothing. So the caller
+        must pass NO ``sweep_runner`` there, and this refuses instead of
+        trusting a docstring Task 8 may not read.
+        """
+        from lisatools.sampling.fstat_gridfit import (
+            assemble_stage_b_group,
+            clear_stage_b_parts,
+            split_box_range,
+        )
+
+        fanout = getattr(self, "fanout", None)
+        # ``getattr(..., True)``: a real ``WalkerFanout`` always sets
+        # ``single`` (fanout.py :145), but reading it bare would answer a
+        # fan-out-like object that does not with an ``AttributeError``
+        # instead of this message. Defaulting to "single" keeps the
+        # byte-identity gate CLOSED whenever the shape is unknown.
+        if fanout is None or getattr(fanout, "single", True):
+            raise RuntimeError(
+                f"{self.name}: _fstat_stage_b_runner needs SEVERAL compute "
+                "ranks to split the group over. With no fan-out, or at one "
+                "compute rank, stage B is the serial run_stage_b_group and "
+                "run_stacked_stage_b must be called with no sweep_runner at "
+                "all -- that path is the byte-identity gate.")
+        layout = fanout.layout
+        n_parts = int(layout.n_compute)
+
+        def runner(spec, call_fstat, *, xp):
+            # Stage A, stage B and the centre table must score against the
+            # SAME residual snapshot (spec decision 6). The ranks build their
+            # own scorer from the replicated row, so this argument is unused
+            # here -- which is exactly why it has to be checked: a wiring that
+            # handed ``run_stacked_stage_b`` a live-ACA scorer would fit
+            # stage A against one residual and stage B against another, with
+            # nothing anywhere to say so.
+            if call_fstat is not self._fstat_ref_call:
+                raise RuntimeError(
+                    f"{self.name}: stage B was handed a scorer that is not "
+                    "this rank's cached holder-scored call_fstat "
+                    "(_fstat_holder_call). Stage A and stage B would then "
+                    "score against different residuals; pass "
+                    "self._fstat_holder_call(model) to run_stacked_stage_b.")
+            if not spec.parts_dir:
+                raise RuntimeError(
+                    f"{self.name}: stage-B group {spec.gi} has no parts_dir -- "
+                    "the parallel sweep writes each rank's slice there and the "
+                    "head reads them back, so a shared epoch cache directory "
+                    "is required.")
+            ranges = split_box_range(spec.a, spec.b, n_parts)
+            by_rank = {r: ranges[layout.fanout_rank(r)]
+                       for r in layout.compute_ranks}
+            t0 = time.perf_counter()
+            replies, _token = self._fanout_cmd(
+                "gb_fstat_stage_b",
+                lambda rank, w0, w1: self._fstat_stage_b_payload(
+                    spec, layout.fanout_rank(rank), *by_rank[rank]),
+                model,
+            )
+            # ``_fanout_cmd`` hands back the BARE result dicts -- ``{rank:
+            # result}``, not ``{rank: {"result": ...}}``: ``WalkerFanout.run``
+            # unwraps the envelope itself, ``merge({r: rep["result"] for r,
+            # rep in replies.items()})`` (``fanout.py`` :308; the envelope is
+            # built by ``_reply``, :71).
+            results = {}
+            for rank, res in replies.items():
+                res = res or {}
+                if "rank_index" not in res:
+                    raise RuntimeError(
+                        f"{self.name}: the gb_fstat_stage_b reply from rank "
+                        f"{rank} carries no 'rank_index', so group {spec.gi}'s "
+                        "partial cannot be placed in box order; assembling the "
+                        "rest would write a grid whose box axis silently "
+                        "disagrees with f0_los[a:b].")
+                results[int(res["rank_index"])] = res
+            for ri, res in results.items():
+                # ``assemble_stage_b_group`` checks only the TOTAL shape, so
+                # two partials that swapped places would concatenate silently
+                # into a grid mismatched to its own f0 nodes. The ranges are
+                # what put them in order; check them.
+                want = ranges[ri] if 0 <= ri < len(ranges) else None
+                if want is None or (int(res.get("a", -1)),
+                                    int(res.get("b", -1))) != want:
+                    raise RuntimeError(
+                        f"{self.name}: stage-B group {spec.gi} rank index {ri} "
+                        f"reported box range {(res.get('a'), res.get('b'))} but "
+                        f"was asked for {want} -- the partials would assemble "
+                        "out of box order.")
+                # A short partial IS caught downstream, but only as an
+                # aggregate shape error that names no rank. Check it here,
+                # where the rank is still in hand.
+                if int(res.get("n_rows", -1)) != want[1] - want[0]:
+                    raise RuntimeError(
+                        f"{self.name}: stage-B group {spec.gi} rank index {ri} "
+                        f"wrote {res.get('n_rows')} box row(s) for the range "
+                        f"{want} ({want[1] - want[0]} expected).")
+            sha1s = {i: res.get("sha1") for i, res in results.items()}
+            try:
+                grid = assemble_stage_b_group(
+                    spec.parts_dir, spec.gi, n_parts, spec.node_shape, xp=xp,
+                    sha1s=sha1s)
+            except OSError as exc:
+                # Every rank reported success, so the file exists -- on ITS
+                # node. The whole stage-B wall has already been paid by the
+                # time this shows up, and the bare errno says nothing about
+                # why. ``OSError``, not just ``FileNotFoundError``: a flaky
+                # or node-local shared mount surfaces just as often as a
+                # stale NFS handle (ESTALE) or a PermissionError, and the
+                # diagnosis below is the right one for all of them.
+                raise RuntimeError(
+                    f"{self.name}: stage-B group {spec.gi} partial "
+                    f"{getattr(exc, 'filename', None)} could not be read on "
+                    f"the head ({exc.__class__.__name__}: {exc}) although "
+                    "every rank reported writing one. The epoch cache "
+                    f"directory ({spec.parts_dir}) must be on a filesystem "
+                    "SHARED by every compute rank; a node-local one lets each "
+                    "rank write a partial the head can never read."
+                ) from exc
+            clear_stage_b_parts(spec.parts_dir, spec.gi, n_parts)
+            # ``clear_stage_b_parts`` only unlinks ``r < n_parts``. A fit that
+            # died at a LARGER n_compute leaves its high-index partials --
+            # hundreds of MB each -- in the epoch dir forever, and nothing
+            # else matches them (the end-of-stage ``ckpt_clear`` sweeps only
+            # the ``.progress.*`` suffixes). The trailing ``*`` also takes
+            # ``.npy.tmp`` orphans: ``save_stage_b_part`` writes through a
+            # temp file, so a rank that died mid-``np.save`` at an index
+            # above the current ``n_compute`` leaves a FULL-SIZE one that
+            # ``clear_stage_b_parts`` never looks at either. The literal
+            # ``_r`` after the group number is what stops ``g1`` matching
+            # ``g11``.
+            for stale in glob.glob(os.path.join(
+                    spec.parts_dir, f"stageb_g{int(spec.gi)}_r*.npy*")):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+            walls = [float(res.get("wall_s", 0.0))
+                     for res in results.values()] or [0.0]
+            logger.info(
+                "%s: [FSTAT_STAGEB] group %d/%d over %d rank(s): boxes %s | "
+                "wall min %.1fs max %.1fs (imbalance %.0f%%) | assembled "
+                "%.1fs total",
+                self.name, spec.gi + 1, spec.n_groups, n_parts,
+                [b - a for a, b in ranges], min(walls), max(walls),
+                100.0 * (max(walls) - min(walls)) / max(max(walls), 1e-9),
+                time.perf_counter() - t0)
+            return grid
+
+        return runner
 
     # ==================================================================
     # Multi-rank walker-block fan-out -- the HEAD side (Plan 4 / WP5).
@@ -19369,6 +20909,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             "temper_vertical": bool(getattr(self, "temper_vertical", False)),
             "branch_propose_count": int(
                 type(self)._branch_propose_counts.get(branch, 0)),
+            # The stage combine stamps gf_iteration on the HEAD's move only;
+            # ranks never see a combine, so the F-stat refit clock would stop
+            # advancing on them without this. Shipped as the raw stamp so a
+            # rank's own _fstat_clock does the same change-detection the head
+            # does, rather than trusting a pre-counted total.
+            "gf_iteration": (None if getattr(self, "gf_iteration", None) is None
+                             else int(self.gf_iteration)),
         }
         # READ-ONLY copies: the head arms, advances and persists these, and
         # a rank must never see them move under it mid-propose.
@@ -21143,23 +22690,52 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
     _fstat_clock_written: dict = {}
 
     def _fstat_clock(self) -> int:
-        """The refit clock: total branch proposes, restart-persistent.
+        """The refit clock: **global-fit ITERATIONS**, restart-persistent.
 
-        Reads the shared census every GBSpecial move of this branch ticks
-        (:attr:`GBSpecialBase._branch_propose_counts` — the same clock the
-        tempering cadence uses), and makes it survive restarts by (a)
-        seeding the census from ``<fstat_root>/clock.json`` on this
-        process's first read and (b) journaling the census back to that
-        file every :attr:`_FSTAT_CLOCK_WRITE_EVERY` ticks. Proposes made
-        between the last journal write and a crash are lost — the budget
-        stretches by at most the journal granularity, never resets.
+        ``GB_FSTAT_REFIT_EVERY`` counts iterations, so ``=50`` means "refit
+        every 50 iterations" in every stage (user ruling 2026-09-18).
 
-        Only the sampling rank proposes, so the journal has a single
-        writer; both grid moves journaling the same monotone value is
-        benign either way.
+        It used to count the shared per-branch PROPOSE census
+        (:attr:`GBSpecialBase._branch_propose_counts`), which is a
+        stage-dependent multiple of the iteration count and so gave the knob
+        a different meaning in each stage. Measured on the two production
+        runs: the 3-month run fires exactly **2.00** GB-branch proposes per
+        ``gb_search`` iteration (``rj_fstat_search`` + ``rj_prior_removal``)
+        and the 6-month run **3.00** (warm start adds ``rj_warm_search``), so
+        the same ``=50`` refit every 25 and every 17 iterations respectively
+        -- and roughly every 150 in randomized ``full_pe``, where the GB
+        branch is proposed about a sixth as often. No fixed divisor can
+        reconcile those, which is why this counts iterations directly.
+
+        The iteration number is stamped down the move tree by the stage
+        combine (``GFCombineMove.propose`` -> ``_prepare_child``), the only
+        object eryn proposes exactly once per iteration. The census is left
+        strictly alone: ``_temper_cadence_fire`` still reads it and its
+        meaning must not change underneath it.
+
+        Restart persistence is unchanged in shape: seed from
+        ``<fstat_root>/clock.json`` on this process's first read, journal
+        back every :attr:`_FSTAT_CLOCK_WRITE_EVERY` ticks, and the last-fit
+        tick rides in the epoch's ``DONE.json``. Iterations between the last
+        journal write and a crash are lost, so the budget stretches by at
+        most the journal granularity and never resets.
+
+        Only the sampling rank proposes, so the journal has a single writer;
+        both grid moves journaling the same monotone value is benign.
+
+        A move that never receives a stamp (an exotic harness, a direct unit
+        -test call) falls back to counting its own visits, which is the old
+        behaviour for that move alone and keeps the clock monotone.
         """
         branch = getattr(self, "branch_name", "gb")
-        counts = GBSpecialBase._branch_propose_counts
+        counts = GBSpecialBase._branch_iteration_counts
+        seen = GBSpecialBase._branch_iteration_seen
+        it = getattr(self, "gf_iteration", None)
+        if it is None:
+            counts[branch] = int(counts.get(branch, 0)) + 1
+        elif seen.get(branch) != it:
+            seen[branch] = it
+            counts[branch] = int(counts.get(branch, 0)) + 1
         root = self._fstat_root
         path = os.path.join(root, self._FSTAT_CLOCK_BASENAME)
         if root not in GBSpecialRJFStatGridMove._fstat_clock_seeded:
@@ -21213,11 +22789,16 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         THIS process resumes its own checkpoints -- so it is NOT the test a
         rank may apply to another process's directory; that one is
         :meth:`_epoch_missing_for_ranks`.
-        """
-        from lisatools.sampling.fstat_gridfit import GRID_BASENAME
 
-        return (os.path.exists(os.path.join(
-                    d, GRID_BASENAME.replace(".npz", "_peaks_stacked.npz")))
+        Spelled through ``fstat_gridfit``'s own :func:`stacked_grid_path`, the
+        single place that names this file -- the same one
+        ``run_fstat_grid_fit`` short-circuits on and ``stage_b_complete``
+        tests, so this predicate and that one can differ only in the trailing
+        ``or DONE.json``, which is the zero-peak case above.
+        """
+        from lisatools.sampling.fstat_gridfit import stacked_grid_path
+
+        return (os.path.exists(stacked_grid_path(d))
                 or os.path.exists(os.path.join(d, "DONE.json")))
 
     @staticmethod
@@ -21239,14 +22820,19 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
 
         The manifest is only read in that second case, so the common path is
         two ``os.path.exists`` calls.
+
+        The npz is named through ``fstat_gridfit``'s :func:`stacked_grid_path`
+        for the same reason :meth:`_epoch_complete` does: one spelling, so a
+        rank can never wait on a file the head does not write.
         """
-        from lisatools.sampling.fstat_gridfit import GRID_BASENAME
+        from lisatools.sampling.fstat_gridfit import stacked_grid_path
 
         manifest = os.path.join(d, "DONE.json")
         if not os.path.exists(manifest):
             return "DONE.json"
-        stacked = GRID_BASENAME.replace(".npz", "_peaks_stacked.npz")
-        if os.path.exists(os.path.join(d, stacked)):
+        stacked_path = stacked_grid_path(d)
+        stacked = os.path.basename(stacked_path)
+        if os.path.exists(stacked_path):
             return None
         try:
             with open(manifest) as f:
@@ -21322,7 +22908,7 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
 
     # ---- the fit -----------------------------------------------------------
 
-    def _fstat_call(self, model, walker_ref):
+    def _fstat_call(self, model, walker_ref, *, holder=None):
         """The injectable kernel entry the library sweeps drive.
 
         Default: same routing as :meth:`_fstat_NM` -- the sig-het wrapper
@@ -21345,6 +22931,14 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         the on-GPU parity gate; ``=check`` adds a pinned shadow compare)
         fans candidate batches out over ALL run devices instead.
         Single-shard holders pass through unchanged.
+
+        ``holder`` overrides the ACA the scorer reads. The multi-rank fit
+        passes the replicated single-row :class:`FStatRefRowHolder`
+        (``gb_fstat_ref_row``), which is scored at ``data_index =
+        noise_index = 0`` -- the GLOBAL reference walker's index is NOT an
+        ACA row index on any rank but its owner, and the holder removes the
+        question entirely. Single-shard by construction
+        (``len(linear_data_arr) == 1``), so the router passes it through.
         """
         # Default ON (2026-08-12 user ruling): the sig-het shared-reference
         # F-stat is the production scorer; FSTAT_USE_SIGHET=0 restores the
@@ -21352,7 +22946,16 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         # warning below either way).
         if os.environ.get("FSTAT_USE_SIGHET", "1") == "1":
             sig_comp = self.gb_wdm_comp
-            holder = model.analysis_container_arr
+            # NOT rebound onto ``holder``: the two fallbacks below return the
+            # ``_fstat_NM`` lambda, which reads ``holder is None`` to decide
+            # between the walker's ACA row and a shipped one-row pair. Writing
+            # the ACA into ``holder`` here would make that lambda score row 0
+            # of the live ACA -- a different walker, silently.
+            if holder is None:
+                sig_holder, _di, _ni = (model.analysis_container_arr,
+                                        int(walker_ref), int(walker_ref))
+            else:
+                sig_holder, _di, _ni = holder, 0, 0
             if not hasattr(sig_comp, "setup_fstat_references"):
                 logger.warning(
                     "%s: FSTAT_USE_SIGHET=1 but the GB comp has no sig-het "
@@ -21366,13 +22969,14 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             else:
                 band_edges = _to_numpy(self.band_edges)
                 return _RoutedBandEngine.route_sighet_fstat(
-                    sig_comp, holder, xp=self.xp,
+                    sig_comp, sig_holder, xp=self.xp,
                     Tobs=float(self._basis_settings.Tobs),
                     f0_lims_hz=(float(band_edges[0]),
                                 float(band_edges[-1])),
-                    data_index=int(walker_ref),
-                    noise_index=int(walker_ref))
-        return lambda params: self._fstat_NM(model, params, walker_ref)
+                    data_index=_di,
+                    noise_index=_ni)
+        return lambda params: self._fstat_NM(
+            model, params, walker_ref, holder=holder)
 
     @contextmanager
     def _gb_free_residual(self, model, branches, walker_ref: int):
@@ -21411,6 +23015,19 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         """
         if (os.environ.get("GB_FSTAT_GB_FREE", "1") != "1"
                 or branches is None or self.branch_name not in branches):
+            # Published on BOTH paths: the multi-rank fit's head reports the
+            # owner's count in its one log line, and "no window was opened"
+            # must read as 0 restored signals, never as the previous fit's
+            # number (see _gb_serve_fstat_ref_row).
+            #
+            # ``_gb_free_opened`` is the load-bearing half. A count of 0 is
+            # AMBIGUOUS -- it is what GB_FSTAT_GB_FREE=0 looks like, what a
+            # walker with no cold GBs looks like, and what a rank that was
+            # handed no branch looks like -- so the head cannot tell "the
+            # window was disabled" from "the window silently never opened"
+            # out of the count alone. The flag can.
+            self._gb_free_opened = False
+            self._gb_free_n_live = 0
             yield
             return
         sorter = BandSorter(
@@ -21435,6 +23052,8 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         )
         sel = dict(temp=0, walker=int(walker_ref), apply_inds=True)
         n_live = int(sorter.get_subset_bool(**sel).sum())
+        self._gb_free_opened = True
+        self._gb_free_n_live = n_live
         logger.info(
             "%s: F-stat GB-FREE residual: restoring %d cold GB signal(s) "
             "from walker %d for the sweep (GB_FSTAT_GB_FREE=0 disables).",
@@ -21447,61 +23066,274 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             logger.info("%s: F-stat GB-FREE residual: %d signal(s) removed "
                         "again; residual restored.", self.name, n_live)
 
+    def _fstat_epoch_line(self, model, k, w_global, owner_rank, local_index,
+                          lls, n_compute, cache_dir):
+        """The epoch's "fit starting" INFO line, with the reference lnL.
+
+        Auditability: the line carries the reference walker's total lnL
+        (residual+PSD combination) alongside its GLOBAL index and the rank
+        that owns it, so a run log shows WHICH state each epoch's grid was
+        fitted against -- "same peaks after a refit" is only diagnosable with
+        this visible. Split out of :meth:`_run_fstat_fit` when the global
+        gather moved into the fit-only branch: it is the only consumer of
+        ``lls``, and inlining it there hid the branch that actually matters.
+        """
+        try:
+            # BRANCH ON THE SOURCE OF ``lls``, NOT ON ITS SIZE.
+            # ``_fstat_global_reference`` reports an all-NaN LENGTH-1
+            # placeholder when there is no fan-out to gather through
+            # (``_propose_legacy``, ``fit.sample()``), so a ``lls.size >
+            # w_global`` test first is true exactly when ``w_global == 0``
+            # -- an entirely ordinary local argmax -- and the placeholder
+            # then wins, dropping both numbers from the line on the path
+            # most local runs take.
+            if getattr(self, "fanout", None) is None:
+                # No gather to do, and this process's ACA holds EVERY walker,
+                # so the global index IS the row and the epoch line keeps the
+                # lnL it has carried since 2026-08-24. Never attempted under
+                # a fan-out: there the ACA is this rank's BLOCK, and
+                # ``lls[w_global]`` would silently be another walker's number.
+                _lls = _to_numpy(model.analysis_container_arr.likelihood())
+                _ll_ref = float(_lls[w_global])
+                _ll_spread = float(_lls.max() - _lls.min())
+            elif lls.size > w_global:
+                _ll_ref = float(lls[w_global])
+                _ll_spread = (float(lls.max() - lls.min()) if lls.size > 1
+                              else float("nan"))
+            else:
+                # DEFENSIVE: a placeholder shorter than the global index. No
+                # head-side caller produces one today -- the gather's own
+                # fallback returns ``w_global = 0`` beside a length-1
+                # placeholder, which the ``elif`` above catches and already
+                # reports as nan/nan. Kept so a future gather that returns a
+                # short vector reports "unknown" instead of IndexError-ing
+                # out of an epoch log line.
+                _ll_ref = _ll_spread = float("nan")
+        except Exception:
+            _ll_ref, _ll_spread = float("nan"), float("nan")
+        logger.info(
+            "%s: F-stat grid fit epoch %d starting (walker_ref=%d GLOBAL on "
+            "rank %d row %d, lnL=%.3f, cold-walker lnL spread=%.3f, "
+            "n_compute=%d, cache %s)",
+            self.name, k, w_global, owner_rank, local_index, _ll_ref,
+            _ll_spread, n_compute, cache_dir)
+
     def _run_fstat_fit(self, model, k: int, branches=None):
-        from lisatools.sampling.fstat_gridfit import run_fstat_grid_fit
+        """Fit epoch ``k``'s F-stat grid. HEAD-side; the ranks serve commands.
+
+        Three things differ from the single-process fit, all of them forced
+        by the walker-block layout (design spec 2026-09-16):
+
+        1. The reference walker is the GLOBAL argmax
+           (:meth:`_fstat_global_reference`), not this rank's local one.
+        2. The whole sweep scores through the REPLICATED reference row
+           (``gb_fstat_ref_row``), not the live residual -- so the GB-free
+           window is opened once, on the OWNING rank, around the snapshot,
+           and no rank's residual stays mutated for the hours the fit runs.
+           That is why no ``_gb_free_residual`` wrapper survives here: the
+           window now lives inside the op body, on the rank that owns the
+           walker, and the head's own residual is never touched.
+        3. BOTH sweeps are split over every compute rank: stage A per sky
+           level by contiguous node range (``gb_fstat_comb``), stage B per
+           Mc group by contiguous box range (``gb_fstat_stage_b``). Nothing
+           of the fit runs head-only any more except the host prep, the peak
+           selection and the npz writes, which are seconds.
+
+        ORDERING IS LOAD-BEARING, twice over. The row is replicated FIRST,
+        and the holder-scored ``call_fstat`` is then built HERE, before
+        ``run_fstat_grid_fit`` is entered -- not lazily inside it. That is
+        what makes stage A, every rank's stage B and the centre table score
+        ONE residual snapshot (spec decision 6), and it is what gives
+        :meth:`_fstat_stage_b_runner`'s "is this my cached scorer?" guard
+        something real to compare against: with ``_fstat_ref_call`` still
+        ``None`` on both sides that check would pass vacuously.
+
+        At ONE compute rank all three collapse: the reference is the same
+        walker, the holder is built from this process's own rows with no
+        MPI, and ``sweep_runner`` stays ``None`` -- the serial path, whose
+        grids are pinned byte-for-byte by
+        ``tests/test_fstat_parallel_fit.py``'s goldens.
+
+        The workers' holders go as soon as the last group is assembled and
+        this epoch's artifacts are written (:meth:`_fstat_release_fanout`);
+        the HEAD's own survives until the centre table has used it, and is
+        released by ``setup()``'s ``finally``.
+
+        A "fit" decision that lands on an ALREADY COMPLETE stage-B npz
+        (``stage_b_complete``) skips all of it -- no global-reference gather,
+        no row on the wire, no scorer built, no runner, no release, i.e. NOT
+        ONE fan-out command -- and goes straight to ``run_fstat_grid_fit``'s
+        cache short circuit, which is what this path was always going to
+        reach. The centre table then replicates (and releases) its own row if
+        it still needs one, deriving its own global reference for it.
+        """
+        from lisatools.sampling.fstat_gridfit import (
+            run_fstat_grid_fit,
+            stage_b_complete,
+        )
 
         cache_dir = self._epoch_dir(k)
         os.makedirs(cache_dir, exist_ok=True)
-        walker_ref = self._fstat_reference_walker(model)
-        # Auditability: the epoch line carries the reference walker's total
-        # lnL (residual+PSD combination) alongside its index, so a run log
-        # shows WHICH state each epoch's grid was fitted against -- "same
-        # peaks after a refit" is only diagnosable with this visible.
-        try:
-            _lls = _to_numpy(model.analysis_container_arr.likelihood())
-            _ll_ref, _ll_spread = (float(_lls[walker_ref]),
-                                   float(_lls.max() - _lls.min()))
-        except Exception:
-            _ll_ref, _ll_spread = float("nan"), float("nan")
+        # BEFORE the row goes on the wire. ``run_fstat_grid_fit`` short-
+        # circuits on a finished stage-B npz, and a "fit" decision can
+        # legitimately land on one (a DONE.json lost beside it, an offline
+        # grid dropped into the epoch dir) -- but the broadcast (~72 MB per
+        # rank at 6mo) and the sig-het scorer build beside it would already
+        # have been paid, for a row nothing then scores through, and a
+        # gb_fstat_release would be issued for it. The completeness test
+        # needs no reference row, so it runs first; it is
+        # ``fstat_gridfit``'s own predicate, not a second spelling of the
+        # cache path.
+        _already_fitted = stage_b_complete(cache_dir)
+        _fanout = getattr(self, "fanout", None)
+        n_compute = 1 if _fanout is None else int(_fanout.layout.n_compute)
         band_edges = _to_numpy(self.band_edges)
         # f0_lims convention (gb.py): the interior span, band_edges[1:-1].
         f0_lims = (float(band_edges[1]), float(band_edges[-2]))
         mc_lims = self.fstat_fit_kwargs.get("mc_lims") or [0.001, 1.0]
-        t0 = time.perf_counter()
-        logger.info("%s: F-stat grid fit epoch %d starting (walker_ref=%d, "
-                    "lnL=%.3f, cold-walker lnL spread=%.3f, cache %s)",
-                    self.name, k, walker_ref, _ll_ref, _ll_spread, cache_dir)
-        # The sweep scores through ``self._fstat_call``, which reads the LIVE
-        # residual -- so the GB-free window has to wrap the call, not just
-        # the setup.
-        #
-        # THE FLAG IS PART OF THE FINGERPRINT. ``GB_FSTAT_GB_FREE`` changes the
-        # RESIDUAL the sweep runs against but nothing else about the sweep's
-        # inputs, so without this the two modes produce different grids under
-        # the SAME cache key: flip the flag, refit at the same epoch, and the
-        # checkpoint layer hands back the other mode's grid with no error and
-        # no warning. Inert at epoch 0 (nothing to restore when the reference
-        # walker holds no GBs) and therefore invisible until the first real
-        # refit -- exactly the silent-cache-reuse case the fingerprint exists
-        # to prevent.
+        # THE FLAG IS PART OF THE FINGERPRINT. ``GB_FSTAT_GB_FREE`` changes
+        # the RESIDUAL the sweep runs against but nothing else about the
+        # sweep's inputs, so without this the two modes produce different
+        # grids under the SAME cache key: flip the flag, refit at the same
+        # epoch, and the checkpoint layer hands back the other mode's grid
+        # with no error and no warning. Inert at epoch 0 (nothing to restore
+        # when the reference walker holds no GBs) and therefore invisible
+        # until the first real refit -- exactly the silent-cache-reuse case
+        # the fingerprint exists to prevent.
         _gb_free = os.environ.get("GB_FSTAT_GB_FREE", "1") == "1"
-        with self._gb_free_residual(model, branches, walker_ref):
-            stacked, n_peaks = run_fstat_grid_fit(
-                self._fstat_call(model, walker_ref),
-                xp=self.xp,
-                # 1.0/self.df, NOT basis_settings.Tobs: the latter is absent
-                # on FDSettings, and under FSTAT_FDOT_AXIS this value is no
-                # longer only a node-density input -- it sets the f_mid shear
-                # coefficient, so a wrong one costs acceptance on every birth.
-                Tobs=1.0 / float(self.df),
-                band_edges_hz=band_edges,
-                f0_lims_hz=f0_lims,
-                mc_lims=mc_lims,
-                ratio_max=_gb_fdot_astro_ratio_max(self),
-                cache_dir=cache_dir,
-                fingerprint_extra=f"|epoch={k}|gbfree={int(_gb_free)}",
-                epoch=k,
-            )
+        t0 = time.perf_counter()
+        if _already_fitted:
+            # NO GATHER EITHER. ``_fstat_global_reference`` is a fan-out
+            # collective, and on this path nothing consumes its answer: no row
+            # is replicated, the sweep short-circuits on the finished npz
+            # before it looks at a fingerprint, and ``_install_ctr_table``'s
+            # fallback -- the only other consumer -- gathers for itself when
+            # ``_fstat_epoch_reference`` is absent (and does not run at all
+            # when ``fstat_centers.npz`` already exists). So this path issues
+            # no F-stat command of any kind.
+            w_global = owner_rank = local_index = None
+            # THE MANIFEST'S ``walker_ref`` IS NOT THIS PROCESS'S TO INVENT on
+            # this path (final review M-3). Keep whatever the process that
+            # actually fitted the grid recorded, if its manifest is still
+            # there and readable; otherwise ``None``, because a walker
+            # gathered HERE would name the process that rewrote the manifest
+            # rather than the residual the grid was scored against -- in the
+            # one field whose whole job is to name that residual.
+            _manifest_walker = None
+            try:
+                with open(os.path.join(cache_dir, "DONE.json")) as _f:
+                    _manifest_walker = json.load(_f).get("walker_ref")
+            except (OSError, ValueError, TypeError):
+                _manifest_walker = None
+            # Nothing will be scored: ``run_fstat_grid_fit`` loads the npz and
+            # returns. ``call_fstat`` is a refusal rather than ``None`` so a
+            # file that vanished between the two tests says WHY instead of
+            # dying as a ``NoneType is not callable`` somewhere inside stage A.
+            def call_fstat(*_args, **_kw):
+                raise RuntimeError(
+                    f"{self.name}: epoch {k}'s stage-B grid was complete when "
+                    "the fit started, so no reference row was replicated and "
+                    "no F-stat scorer was built -- and then something asked "
+                    f"to score. {cache_dir} must have lost its "
+                    "*_peaks_stacked.npz mid-fit.")
+            # Unused by the short circuit; spelled out so a file that vanished
+            # between the two tests cannot resume some OTHER walker's
+            # checkpoints under this epoch's key.
+            fingerprint_extra = (
+                f"|epoch={k}|gbfree={int(_gb_free)}|wref=none")
+            logger.info(
+                "%s: F-stat epoch %d is already fitted; loading it without "
+                "replicating a reference row or gathering a global "
+                "reference (n_compute=%d, cache %s).",
+                self.name, k, n_compute, cache_dir)
+        else:
+            w_global, owner_rank, local_index, lls = (
+                self._fstat_global_reference(model))
+            # PUBLISHED FOR THE CENTRE TABLE, keyed by the epoch: it must
+            # score through the SAME global reference this fit used (decision
+            # 6), and re-deriving it there would be a second, independently
+            # gathered argmax -- true only for as long as nothing between the
+            # two calls touches the ACA. The epoch key is what stops a later
+            # epoch reusing this one. Cleared beside the row in ``setup()``'s
+            # ``finally``.
+            self._fstat_epoch_reference = (int(k), int(w_global),
+                                           int(owner_rank), int(local_index))
+            _manifest_walker = int(w_global)
+            self._fstat_epoch_line(model, k, w_global, owner_rank,
+                                   local_index, lls, n_compute, cache_dir)
+            fingerprint_extra = (
+                f"|epoch={k}|gbfree={int(_gb_free)}|wref={w_global}")
+            self._fstat_ref_row_fanout(model, branches, w_global, owner_rank,
+                                       local_index)
+            # Built (and cached on ``_fstat_ref_call``) before anything can
+            # score -- see ORDERING above.
+            call_fstat = self._fstat_holder_call(model)
+        stacked, n_peaks = run_fstat_grid_fit(
+            call_fstat,
+            xp=self.xp,
+            # 1.0/self.df, NOT basis_settings.Tobs: the latter is absent
+            # on FDSettings, and under FSTAT_FDOT_AXIS this value is no
+            # longer only a node-density input -- it sets the f_mid shear
+            # coefficient, so a wrong one costs acceptance on every birth.
+            Tobs=1.0 / float(self.df),
+            band_edges_hz=band_edges,
+            f0_lims_hz=f0_lims,
+            mc_lims=mc_lims,
+            ratio_max=_gb_fdot_astro_ratio_max(self),
+            cache_dir=cache_dir,
+            # THE REFERENCE WALKER IS PART OF THE FINGERPRINT TOO, for the
+            # same reason ``gbfree`` is: it changes the RESIDUAL the sweep
+            # scores against and nothing else about the sweep's inputs.
+            # Under the walker-block layout the reference is the GLOBAL
+            # argmax, which moves more freely across a restart than the old
+            # head-local one did -- a job that died mid-fit and came back to
+            # a different best walker would otherwise resume the earlier
+            # walker's IN-FLIGHT comb scan and per-rank stage-B checkpoints
+            # under an unchanged cache key, silently stitching two residuals'
+            # rows into one grid. With ``wref`` in the key those CHECKPOINTS
+            # are invalid and each sweep restarts cleanly.
+            #
+            # IT NOW COVERS THE FINISHED COMB TOO. ``fingerprint_extra``
+            # salts ``ckpt_fingerprint``, i.e. the in-flight PROGRESS files
+            # -- and a COMPLETED ``*_comb.npz`` is not a checkpoint, so it
+            # used to be reloaded on ``os.path.exists`` alone: a restart
+            # whose argmax moved chose its peak BOXES from the old walker's
+            # comb scan while stage B scored inside them at the new
+            # reference (the ruled 2026-09-17 limitation; 6mo epoch 1 hit it
+            # when the argmax moved from walker 0 to walker 2).
+            # ``run_comb_scan`` now STAMPS this string into the npz and
+            # ``comb_cache_usable`` refuses a mismatch, so a moved argmax
+            # rescans cleanly instead of stitching two residuals' rows into
+            # one fit. Affordable because stage A is split now (~12 min at
+            # 6mo, against the 47 it cost serially, which is why the
+            # limitation was ruled acceptable at the time).
+            # ``DONE.json``'s ``walker_ref`` stays the audit trail; this is
+            # the enforcement.
+            fingerprint_extra=fingerprint_extra,
+            epoch=k,
+            # ``fanout_active`` is exactly ``n_compute > 1`` (``single`` IS
+            # ``n_compute == 1``), and the runner REFUSES to be built at one
+            # rank: there it would rename the group checkpoint from the
+            # legacy ``stageb`` to ``stageb_g{gi}_r0`` and round-trip the
+            # golden-gated serial sweep through disk for nothing.
+            sweep_runner=(self._fstat_stage_b_runner(model)
+                          if (self.fanout_active and not _already_fitted)
+                          else None),
+            # Same gate, same reason, for stage A's comb: ``fanout_active``
+            # is exactly ``n_compute > 1``, and the runner REFUSES to be
+            # built at one rank, where it would rename the per-level
+            # checkpoint from the legacy ``comb_nsky{lv}`` to
+            # ``comb_nsky{lv}_r0`` -- throwing away an in-flight comb's
+            # resume -- and round-trip the serial sweep through disk for
+            # nothing. Measured at 6mo epoch 1: stage A was 2804 s on ONE
+            # GPU with three idle, 48% of the 5883 s epoch.
+            comb_runner=(self._fstat_comb_runner(model)
+                         if (self.fanout_active and not _already_fitted)
+                         else None),
+        )
+        # NOTE: the HEAD's holder is NOT released here. The centre table
+        # (``_install_ctr_table``) must score against the SAME reference and
+        # the SAME row, so the caller of both (``setup()``) releases it.
         wall = time.perf_counter() - t0
         # Feed the propose timer: this runs outside every other top-level
         # span, so without it the refit lands in [GB_TIMING]'s untracked
@@ -21513,15 +23345,65 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
                     self.name, k, wall, n_peaks)
         try:
             with open(os.path.join(cache_dir, "DONE.json"), "w") as f:
-                json.dump(dict(epoch=k, walker_ref=int(walker_ref),
+                json.dump(dict(epoch=k,
+                               # THIS FIT's global reference -- or, on the
+                               # ``_already_fitted`` path, whatever the
+                               # process that really fitted the grid recorded
+                               # (``None`` when that manifest is gone, which
+                               # is the usual way onto that path). Never this
+                               # process's own argmax there: see the
+                               # ``_manifest_walker`` note above.
+                               # ``fitted_here`` says which of the two a
+                               # reader is looking at, and both keys always
+                               # exist so nothing has to special-case them.
+                               walker_ref=_manifest_walker,
+                               fitted_here=(not _already_fitted),
                                n_peaks=int(n_peaks), wall_seconds=wall,
                                num_proposals=int(self.num_proposals),
+                               # how many compute ranks split stage B.
+                               # DIAGNOSTIC ONLY -- nothing reads it back.
+                               # A resume under a DIFFERENT count restarts
+                               # each group cleanly because the per-rank
+                               # checkpoint FINGERPRINT hashes the sliced
+                               # inputs and node_shape (fstat_gridfit
+                               # ckpt_fingerprint), so a different split is a
+                               # different key; not because of this field.
+                               n_compute=int(n_compute),
                                # the refit clock at fit time -- read back by
                                # _epoch_fit_clock so the cadence budget
                                # survives restarts (2026-08-24)
                                clock=int(self._fstat_clock())), f)
         except OSError as exc:  # manifest is bookkeeping, never fatal
             logger.warning("%s: could not write DONE.json (%r)", self.name, exc)
+        # LAST, and only on the success path: every worker's row (and the
+        # sig-het scorer cached beside it) is dead weight from here on --
+        # stage A and the centre table are head-only. Not in a ``finally``:
+        # a fit that died is taking the run down with it, and issuing a
+        # fan-out command while THAT exception unwinds would only replace it
+        # with a fan-out failure. Skipped entirely when nothing was
+        # replicated: no rank holds anything to release, and the centre table
+        # will take (and release) its own row.
+        if not _already_fitted:
+            try:
+                self._fstat_release_fanout(model)
+            except Exception as exc:  # noqa: BLE001 -- see below
+                # A RELEASE MUST NEVER BE THE THING THAT FAILS (the same
+                # principle that exempts this op from _FSTAT_OP_REQUIRES;
+                # the exemption protected the served body, not the driver).
+                # Unguarded, any failure here -- a worker's body raising, a
+                # sequence mismatch, a pool free, even a logging error --
+                # propagates out of a fit that has ALREADY written its npz
+                # and DONE.json, skipping _install, the _fstat_last_fit_hit
+                # belt and _install_ctr_table, and takes the run down. That
+                # is the cheapest command in the protocol discarding a
+                # 1 h 45 min section that succeeded. A worker that kept its
+                # row loses it at the next gb_fstat_ref_row anyway, which
+                # overwrites it.
+                logger.warning(
+                    "%s: gb_fstat_release failed after epoch %d was written "
+                    "(%r); the workers keep their reference row until the "
+                    "next gb_fstat_ref_row overwrites it.",
+                    self.name, k, exc, exc_info=True)
         return stacked, n_peaks
 
     # Fields the propose-time lookup reads; the rest of the npz (node Mc /
@@ -21537,13 +23419,19 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         (:func:`lisatools.sampling.fstat_gridfit.enumerate_center_nodes` --
         every peak-box f0 node at its own F-stat argmax in (Mc, sky), plus
         the comb nodes at their scan-best sky), scored through the SAME
-        ``call_fstat`` the grids were fitted with, against the SAME reference
-        walker's residual snapshot. Persisted as ``fstat_centers.npz`` in the
-        epoch dir, so a restart that loads a complete epoch loads the centers
-        with it (in milliseconds, and WITHOUT building an F-stat scorer); an
-        epoch that predates the table (or an offline grid dropped into
-        ``epoch_0000``) rebuilds it here, against the residual as it stands
-        at that moment.
+        ``call_fstat`` object the grids were fitted with, against the SAME
+        replicated reference row (spec decision 6 -- literally the same
+        :meth:`_fstat_holder_call` scorer, not a rebuilt twin). Persisted as
+        ``fstat_centers.npz`` in the epoch dir, so a restart that loads a
+        complete epoch loads the centers with it (in milliseconds, and
+        WITHOUT building an F-stat scorer); an epoch that predates the table
+        (or an offline grid dropped into ``epoch_0000``) rebuilds it here,
+        replicating the reference row itself first -- AGAINST THE RESIDUAL AS
+        IT STANDS AT THAT MOMENT, which on a pure load path (no fit in this
+        process) is generally not the walker the loaded grids were fitted
+        against, i.e. not ``DONE.json``'s ``walker_ref``. When this process
+        DID run the fit, ``_fstat_epoch_reference`` makes the two literally
+        the same walker.
 
         No-ops under ``GB_FSTAT_CTR_MODE=unit``. Leaves ``_fstat_ctr_table``
         ``None`` when the epoch has no drawable support at all — the move
@@ -21579,15 +23467,114 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             # this sweep used to run AFTER the fit's GB-free window closed,
             # so at any real refit the amplitude/SNR centers for exactly the
             # loud already-recovered peaks would have been fitted against
-            # noise). The scorer is built INSIDE the window too: under
-            # FSTAT_USE_SIGHET its heterodyne references snapshot the
-            # residual at build time. Costs one extra add/remove round trip
-            # when this follows a fit (the fit's own window already closed)
-            # -- two fill_template passes, negligible against the sweep.
-            walker_ref = self._fstat_reference_walker(model)
-            with self._gb_free_residual(model, branches, walker_ref):
-                call = self._fstat_call(model, walker_ref)
-                host = build_fstat_center_table(call, **_table_kwargs)
+            # noise). Under the walker-block layout that is now literal: the
+            # fit's REPLICATED reference row is still live on this rank
+            # (``setup()``'s ``finally`` is what finally drops it), so the
+            # centre sweep scores through the same holder at the same GLOBAL
+            # reference walker, and nothing here re-derives either. A LOCAL
+            # argmax would silently pick a different walker -- and its index
+            # is not even a valid ACA row off that walker's owner.
+            if self._fstat_ref_holder is None:
+                # HEAD ONLY. ``model is not None`` is the practical guard (the
+                # rank-side ``_setup_from_directive`` load passes ``None``),
+                # but the fan-out below is head-only and a non-head that got
+                # here would otherwise fail two frames down, inside
+                # ``WalkerFanout.run``, with a message about the fan-out
+                # rather than about the centre table.
+                _fan = getattr(self, "fanout", None)
+                if _fan is not None and not _fan.is_head:
+                    raise RuntimeError(
+                        f"{self.name}: _install_ctr_table's centre sweep is "
+                        "HEAD-ONLY -- it replicates the reference row with a "
+                        "gb_fstat_ref_row fan-out, and every other compute "
+                        "rank is parked in ComputeService.serve(). A rank "
+                        "loading an epoch must pass model=None "
+                        "(_setup_from_directive).")
+                if branches is None:
+                    # ``gb_free_requested`` is ``branches is not None``, so
+                    # with no branch the owner opens NO GB-free window and
+                    # ``_warn_if_gb_free_missed`` stays quiet -- the centres
+                    # would be scored against a residual that still has the
+                    # reference walker's own GBs subtracted, with nothing
+                    # anywhere to say so. No in-tree caller does this (all
+                    # four pass ``branches`` whenever they pass a model), but
+                    # the keyword default invites it.
+                    logger.warning(
+                        "%s: epoch %d's centre sweep was given no GB branch, "
+                        "so no GB-free window can open for it; the centres "
+                        "will be fitted against the reference walker's own "
+                        "residual while the grids were not.", self.name, k)
+                # A path that never ran a fit (a complete epoch being loaded,
+                # a cross-move reuse, or an offline grid dropped in without a
+                # centre table): replicate the row now, through exactly the
+                # same global reference + ``gb_fstat_ref_row`` the fit uses.
+                #
+                # REUSE THE FIT'S OWN REFERENCE WHEN IT HAS ONE. When
+                # ``_run_fstat_fit`` ran a real fit for THIS epoch in this
+                # process it published the global argmax it used, so this
+                # branch fires with the answer already in hand. Re-gathering
+                # would be a second collective AND a second, independently
+                # derived argmax -- decision 6's "the SAME global reference"
+                # would then hold only as long as nothing between the two
+                # calls touches the ACA, which nothing asserts.
+                # ``_fstat_epoch_reference`` is keyed by the epoch so a stale
+                # one can never be picked up; it is absent on the paths that
+                # ran no fit (a load, a cross-move reuse, an
+                # ``_already_fitted`` short circuit -- which deliberately
+                # gathers nothing), and there this gathers once, here, for
+                # the row it is about to replicate.
+                _cached = getattr(self, "_fstat_epoch_reference", None)
+                if _cached is not None and int(_cached[0]) == int(k):
+                    _k0, w_global, owner_rank, local_index = _cached
+                else:
+                    w_global, owner_rank, local_index, _lls = (
+                        self._fstat_global_reference(model))
+                self._fstat_ref_row_fanout(model, branches, w_global,
+                                           owner_rank, local_index)
+                _release_after = True
+            else:
+                _release_after = False
+            logger.info(
+                "[FSTAT_CTR %s] epoch %d centre sweep scores through the "
+                "replicated reference row (walker %s, %s)", self.name, k,
+                self._fstat_ref_walker,
+                "replicated here" if _release_after else "the fit's own")
+            try:
+                host = build_fstat_center_table(
+                    self._fstat_holder_call(model), **_table_kwargs)
+                if _release_after:
+                    # SUCCESS ONLY, exactly as ``_run_fstat_fit`` releases
+                    # its ranks: issuing a fan-out command while an exception
+                    # unwinds would only replace the real error with a
+                    # fan-out failure. Nothing else would ever drop these --
+                    # a rank cannot tell that this was the last command.
+                    try:
+                        self._fstat_release_fanout(model)
+                    except Exception as exc:  # noqa: BLE001
+                        # AND A RELEASE MUST NEVER BE THE THING THAT FAILS
+                        # (Task 8 C-1, the same guard 800 lines up on the
+                        # identical call). By now the epoch's npz, DONE.json
+                        # and fstat_centers.npz are ALL on disk and the
+                        # stage-B hours are paid; unguarded, a worker body
+                        # raising here would propagate out of setup() and
+                        # take the run down while ALSO skipping the
+                        # _FSTAT_CTR_TABLE_REGISTRY install below -- so the
+                        # process that just built the table would fall back
+                        # to the per-unit hoist. A worker that kept its row
+                        # loses it at the next gb_fstat_ref_row anyway.
+                        logger.warning(
+                            "%s: gb_fstat_release after epoch %d's centre "
+                            "sweep failed (%r); the workers keep their "
+                            "reference row until the next gb_fstat_ref_row "
+                            "overwrites it.", self.name, k, exc,
+                            exc_info=True)
+            finally:
+                if _release_after:
+                    # This rank's own half goes either way: ``setup()``'s
+                    # ``finally`` covers the fit's row, but on this path the
+                    # row was taken HERE, and it is tens of MB plus a built
+                    # sig-het scorer.
+                    self._fstat_release_ref_row()
         else:
             host = build_fstat_center_table(None, **_table_kwargs)
         table = None
@@ -21744,6 +23731,34 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         if action == "skip":
             return
 
+        try:
+            self._setup_epoch(model, branches, action, k)
+        finally:
+            # The replicated reference row is a per-FIT resource: the grids
+            # and the centre table must BOTH score against it (the
+            # 2026-08-24 same-residual rule), which is why it cannot be
+            # released between them -- and it is tens of MB plus a built
+            # sig-het scorer plus that scorer's ~GB of reference blocks on
+            # the comp, so it must not survive them either. Every
+            # worker's copy is already gone (``_run_fstat_fit`` issues
+            # ``gb_fstat_release`` once the epoch's artifacts are written);
+            # this is the head's own, and the ``finally`` covers the paths
+            # that never took a row at all (load / cross-move reuse), where
+            # it is a no-op.
+            self._fstat_release_ref_row()
+            # The epoch's global reference goes with it: it is published by
+            # ``_run_fstat_fit`` purely so ``_install_ctr_table`` can reuse
+            # THIS epoch's answer, and a stale one outliving the epoch is
+            # exactly what its epoch key exists to make harmless -- belt and
+            # braces, so a later reader never has to reason about it.
+            self._fstat_epoch_reference = None
+
+    def _setup_epoch(self, model, branches, action, k):
+        """``setup()``'s body once the refit decision is made.
+
+        Split out only so the reference-row release can wrap every exit path
+        -- including the two early ``return``s -- in one ``finally``.
+        """
         # Cross-move reuse: another move sharing this fit dir may already
         # have built (or loaded) this exact epoch in THIS process. Take its
         # container verbatim -- no refit, no npz reload.

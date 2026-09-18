@@ -613,6 +613,19 @@ class VGBSettings(GBSettings):
     sighet_v5: int = dataclasses.field(
         default_factory=env_default("SIGHET_V5", 1, int)
     )
+    # Sig-het REFERENCE-BUILD Tukey alpha, pinned EXPLICITLY -- the same
+    # field, env name and default as the GB block (pinned-alpha ruling
+    # 2026-08-19). MISSING here until 2026-09-17: the VGB wiring then
+    # passed no alpha and ``for_band_engine`` inherited the chunked
+    # delegate's 0.05 per-chunk stitching fraction as a WHOLE-observation
+    # fraction -- at 6mo ~110 tapered layers per side against a 60-layer
+    # crop, the reference suppressed inside the active region (the engine
+    # only warns). The likely source of the [GB_CELL_LL] growth that had
+    # VGB_SIGHET_INMODEL pinned to 0. Both branches now build through
+    # ``erebor.gb.build_sighet_engine``, which takes every knob from here.
+    sighet_tukey_alpha: float = dataclasses.field(
+        default_factory=env_default("SIGHET_TUKEY_ALPHA", 0.01, float)
+    )
     # (nleaves, len(fixed basis)) per-leaf fixed values in SAMPLING units
     # (f0 in mHz), ordered like the active fixed basis (vgb_fixed_basis);
     # feeds the per-leaf fill list.

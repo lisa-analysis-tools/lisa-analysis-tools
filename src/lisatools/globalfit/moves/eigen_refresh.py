@@ -45,6 +45,7 @@ __all__ = [
     "eigen_table_from_ll",
     "eigen_tables_from_ll_batch",
     "eigen_table_from_waveform",
+    "temper_sigmas",
 ]
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,38 @@ def _prior_entries(prob_dist_container):
         for key, dist in prob_dist_container.priors_in.items()
         if isinstance(key, (int, np.integer))
     ]
+
+
+def temper_sigmas(sigmas_cold, betas):
+    """Widen a COLD-chain 1-sigma table for each rung of a ladder.
+
+    ``sigmas_cold`` is any array whose LEADING axis is broadcastable
+    against ``betas`` -- typically ``(1, nwalkers, nleaves, ndim)`` from a
+    cold-row table about to be shared up the ladder. Returns
+    ``sigmas_cold / sqrt(beta)`` with ``betas`` on axis 0.
+
+    **Why this is required whenever a cold table is reused at a hot rung.**
+    The target at inverse temperature ``beta`` is proportional to
+    ``exp(beta * L)``, so its covariance is ``(beta * F)^-1`` and its width
+    is ``1 / sqrt(beta)`` times the cold width. ``EigenAxisMove`` applies
+    NO temperature scaling of its own -- ``draw_axis_step`` is
+    ``jump_factor * sigma * z`` and ``beta`` appears nowhere in
+    ``eryn/moves/eigenaxis.py`` -- so a cold sigma handed to a hot rung
+    proposes steps ``sqrt(T)`` too small. On a 12-rung ladder reaching
+    ``beta ~ 1e-4`` that is 100x too small at the hot end, which shows up
+    as near-1.0 in-model acceptance with a stationary chain: the step is
+    tiny, so ``delta_lnL`` is tiny, so ``exp(beta * delta_lnL)`` accepts
+    almost everything and nothing travels.
+
+    ``beta <= 0`` (a fully flattened rung) has no finite width; those rungs
+    keep the cold sigma rather than producing ``inf``, and the axis cap in
+    :func:`_tables_from_info_batch` already bounds every sigma by the prior
+    box, so a widened table can never step outside the prior.
+    """
+    sig = np.asarray(sigmas_cold, dtype=float)
+    b = np.asarray(betas, dtype=float).reshape((-1,) + (1,) * (sig.ndim - 1))
+    scale = np.where(b > 0.0, 1.0 / np.sqrt(np.where(b > 0.0, b, 1.0)), 1.0)
+    return sig * scale
 
 
 def prior_box_widths(prob_dist_container, ndim):

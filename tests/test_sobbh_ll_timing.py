@@ -214,8 +214,18 @@ class KernelSubSpanFlushTest(unittest.TestCase):
         self.assertIn("launch=", joined)
         self.assertIn("geom=", joined)
         self.assertIn("slowest=launch", joined)
+        # groups/call stays: the fill_global / swap_ll / fstat kernels DO
+        # consume the layer groups, so it remains a useful diagnostic.
         self.assertIn("groups/call=7.0", joined)
-        self.assertIn("ms/group", joined)
+        # ...but get_ll's cost is reported PER CALL, not per group. Measured
+        # 2026-09-18 over 174 production leaf windows: the call wall is flat
+        # at 1.71-1.73 s across groups/call 1.0-2.8 AND rows/call 6.7-24.2,
+        # because the kernel grid is one block per binary. Dividing that
+        # constant by the group count invented a "ms/group" cost that does
+        # not exist and sent a performance hunt down the wrong path.
+        self.assertIn("ms/call", joined)
+        self.assertIn("rows/call", joined)
+        self.assertNotIn("ms/group", joined)
 
     def test_flush_resets_the_sub_spans(self):
         inst = _kernel_move()

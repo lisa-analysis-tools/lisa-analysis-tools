@@ -1710,6 +1710,72 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         a, p = tally.get(int(leaf), (0.0, 0.0))
         tally[int(leaf)] = (a + acc, p + prop)
 
+    def _record_leaf_telemetry(self, new_state, leaf, proposed, accepted,
+                               prev_logl, prev_logp):
+        """Fill this leaf visit's acceptance counters and lnL on the sub-state.
+
+        ``PerLeafLadderState`` has declared ``in_model_proposed`` /
+        ``in_model_accepted``, the per-rung-pair swap counters and the
+        per-leaf ``log_like`` / ``log_prior`` from the start, but NOTHING
+        ever wrote them for the addremove branches, so every MBH / EMRI /
+        SOBBH store on disk records zeros: the three branches have no
+        acceptance telemetry at all (found 2026-09-17 in the 4-GPU store --
+        53 iterations, every counter exactly zero, while the same fields are
+        populated for gb / vgb / psd / galfor). PSD fills its equivalents
+        from ``_tally_*``; this is the addremove side of the same contract.
+
+        Semantics, chosen to match what the storage layer already assumes:
+
+        * ``in_model_proposed[leaf, rung]`` counts ONE proposal per walker
+          per repeat. Every walker is proposed for exactly once per repeat
+          (the red/blue split masks partition the ensemble), and an
+          out-of-prior draw still counts as a proposal, so the denominator
+          is ``num_repeats * nwalkers`` and the ratio is the true MH
+          acceptance rate of the inner move.
+        * ``swaps_*[leaf, pair]`` is the per-repeat sum over the visit --
+          Eryn re-zeroes its control's counters on every
+          ``temperature_swaps`` call, which is why ``_fanout_note_swaps``
+          accumulates them.
+        * ``log_like`` / ``log_prior`` are the POST-swap per-leaf values for
+          this leaf, one row per (rung, walker).
+
+        Counters are DELTAS. A rank's slice starts at zero and
+        :meth:`ModuleSubState.merge_walkers` SUM-adds them across walker
+        blocks, so the head ends the propose with ensemble-wide totals, and
+        ``reset_delta_counters`` zeroes them after each save. ``log_like``
+        and ``log_prior`` carry a walker axis and are merged by column, so a
+        rank writes only its own block's rows.
+        """
+        sub = (getattr(new_state, "sub_states", None) or {}).get(self.branch_name)
+        if sub is None or not getattr(sub, "tempered_initialized", False):
+            return
+        leaf = int(leaf)
+        nt = min(int(self.ntemps), int(sub.ntemps))
+
+        for name, src in (("in_model_proposed", proposed),
+                          ("in_model_accepted", accepted)):
+            dst = getattr(sub, name, None)
+            if dst is not None:
+                dst[leaf, :nt] += np.asarray(src, dtype=dst.dtype)[:nt]
+
+        tally = (getattr(self, "_fanout_swap_tally", None) or {}).get(leaf)
+        if tally is not None:
+            for name, src in (("swaps_accepted", tally[0]),
+                              ("swaps_proposed", tally[1])):
+                dst = getattr(sub, name, None)
+                src = np.asarray(src, dtype=float).ravel()
+                if dst is None or not src.size:
+                    continue
+                n = min(src.size, dst.shape[-1])
+                dst[leaf, :n] += src[:n].astype(dst.dtype)
+
+        for name, src in (("log_like", prev_logl), ("log_prior", prev_logp)):
+            dst = getattr(sub, name, None)
+            if dst is None:
+                continue
+            src = np.asarray(src, dtype=float)
+            dst[leaf, :nt, :] = src[:nt, : dst.shape[-1]]
+
     def fanout_temperature_controls(self):
         return list(self.temperature_controls)
 
@@ -1975,6 +2041,10 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
 
             # fix this need to compute prev_logl for all walkers
             _free_pool()
+            # per-rung acceptance tally for THIS leaf visit, written to the
+            # sub-state at the end of the visit (_record_leaf_telemetry).
+            _leaf_proposed = np.zeros(self.ntemps, dtype=np.int64)
+            _leaf_accepted = np.zeros(self.ntemps, dtype=np.int64)
             for repeat in tqdm(
                 range(self.num_repeats), desc=f"{self.branch_name} update, leaf {leaf}",
                 disable=not getattr(self, "progress", False),
@@ -2114,6 +2184,12 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
                 self.accepted += accepted
                 # print(self.accepted[0])
                 self.num_proposals += 1
+                # Every walker is proposed for exactly once per repeat (the
+                # split masks partition the ensemble), so the denominator is
+                # nwalkers per rung; out-of-prior draws count as proposals.
+                _leaf_accepted += np.asarray(
+                    accepted[: self.ntemps], dtype=bool).sum(axis=1)
+                _leaf_proposed += int(self.nwalkers)
 
                 # TODO: include PSD likelihood in swaps?
                 # temperature swaps
@@ -2271,6 +2347,12 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
             new_state.sub_states[self.branch_name].betas_all[leaf][
                 : self.ntemps
             ] = temperature_control_here.betas
+
+            # acceptance / swap counters + per-leaf lnL for this visit
+            self._record_leaf_telemetry(
+                new_state, leaf, _leaf_proposed, _leaf_accepted,
+                prev_logl, prev_logp,
+            )
             # print(leaf)
 
             # ll_tmp2 = -1/2 * 4 * self.df * xp.sum(data_residuals[:2].conj() * data_residuals[:2] / psd[:2], axis=(0, 2)).get()

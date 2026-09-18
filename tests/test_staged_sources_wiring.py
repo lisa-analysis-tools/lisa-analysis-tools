@@ -126,17 +126,33 @@ class StagedSourcesWiringTest(unittest.TestCase):
                              f"{stage}: {names}")
         self.assertIn("rj_fstat_search", stages["gb_search"])
         self.assertIn("rj_fstat_pe", stages["full_pe"])
+        # User ruling 2026-09-18: ALL THREE armed source branches ride the
+        # gb_search cadence, default every 5. sobbh joined because the
+        # 4-GPU run measured it at 250 s/propose -- 43% of an iteration and
+        # the largest single cost in the stage -- against the 09-15
+        # assumption that its chunked-het rows were cheap. full_pe is never
+        # cadenced.
         self.assertEqual(_everies(fit, "gb_search"),
-                         {"sobbh_pe": 1, "mbh_pe": 10, "emri_pe": 10})
+                         {"sobbh_pe": 5, "mbh_pe": 5, "emri_pe": 5})
         self.assertEqual(_everies(fit, "full_pe"),
                          {"sobbh_pe": 1, "mbh_pe": 1, "emri_pe": 1})
 
     def test_gb_search_source_every_env_override(self):
         os.environ.update(ALL_IDS)
-        os.environ["GB_SEARCH_SOURCE_EVERY"] = "5"
+        os.environ["GB_SEARCH_SOURCE_EVERY"] = "7"
         fit = _build_fit()
         self.assertEqual(_everies(fit, "gb_search"),
-                         {"sobbh_pe": 1, "mbh_pe": 5, "emri_pe": 5})
+                         {"sobbh_pe": 7, "mbh_pe": 7, "emri_pe": 7})
+        # the override never leaks into full_pe
+        self.assertEqual(_everies(fit, "full_pe"),
+                         {"sobbh_pe": 1, "mbh_pe": 1, "emri_pe": 1})
+
+    def test_gb_search_source_every_one_is_uncadenced(self):
+        os.environ.update(ALL_IDS)
+        os.environ["GB_SEARCH_SOURCE_EVERY"] = "1"
+        fit = _build_fit()
+        self.assertEqual(_everies(fit, "gb_search"),
+                         {"sobbh_pe": 1, "mbh_pe": 1, "emri_pe": 1})
 
     def test_skip_source_search_keeps_moves_in_gb_stages(self):
         # User ruling 2026-09-14 late: with exact-truth starts
@@ -151,14 +167,14 @@ class StagedSourcesWiringTest(unittest.TestCase):
         self.assertEqual(list(stages),
                          ["noise_search", "noise_vgb_search",
                           "gb_search", "full_pe"])
-        # user ruling 2026-09-15 (superseding the brief PE-only form):
-        # mbh/emri ride gb_search at a 1-in-10 cadence; all three in
-        # full_pe uncadenced.
+        # user ruling 2026-09-18 (superseding 09-15's mbh/emri-only
+        # 1-in-10): all three ride gb_search at a 1-in-5 cadence; all three
+        # in full_pe uncadenced.
         for mv in ("sobbh_pe", "mbh_pe", "emri_pe"):
             self.assertIn(mv, stages["gb_search"])
             self.assertIn(mv, stages["full_pe"])
         self.assertEqual(_everies(fit, "gb_search"),
-                         {"sobbh_pe": 1, "mbh_pe": 10, "emri_pe": 10})
+                         {"sobbh_pe": 5, "mbh_pe": 5, "emri_pe": 5})
 
     def test_skip_source_search_without_sources_is_refused(self):
         # the flag has no stage to skip when nothing is armed -- refuse

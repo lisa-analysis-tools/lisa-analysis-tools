@@ -601,6 +601,18 @@ class GFCombineMove(CombineMove, GlobalFitMove):
         # on the engine ladder through plain eryn moves, which legitimately
         # rebuild the State -- only arm the guards when a real module
         # sub-state is present.
+        # ---- the run's ITERATION counter ---------------------------------
+        # eryn calls the stage combine's propose exactly once per global-fit
+        # iteration, so this is the one place in the move tree that can count
+        # iterations. Everything below it is proposed a stage-dependent NUMBER
+        # of times per iteration (gb_search fires 3 GB-branch moves, full_pe
+        # ~1/6 of the time), which is why a per-propose counter cannot stand
+        # in for one -- see GBSpecialRJFStatGridMove._fstat_clock.
+        # Only the STAGE combine mints the value; nested combines inherit it
+        # through _prepare_child, the same way gf_stage_kind propagates.
+        if getattr(self, "gf_is_stage_combine", False):
+            self.gf_iteration = int(getattr(self, "gf_iteration", -1)) + 1
+
         _subs = getattr(state, "sub_states", None) or {}
         had_sub_states = any(sub is not None for sub in _subs.values())
         if had_sub_states:
@@ -663,6 +675,12 @@ class GFCombineMove(CombineMove, GlobalFitMove):
         if kind is not None:
             try:
                 move.gf_stage_kind = kind
+            except AttributeError:  # exotic move objects: never fatal
+                pass
+        it = getattr(self, "gf_iteration", None)
+        if it is not None:
+            try:
+                move.gf_iteration = it
             except AttributeError:  # exotic move objects: never fatal
                 pass
         runtime = self._gf_sidecar_runtime_lookup()

@@ -183,6 +183,41 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
     # setup_likelihood_here) splits the wall into host-stage vs kernel
     # and counts calls/rows, so the call-count (extra scorings per
     # repeat?) and the per-row rate are separately visible.
+    #
+    # RESOLVED 2026-09-18, from 174 leaf windows of the 4-GPU production run
+    # (gf_prod_6mo_v8_4gpu, 1 walker/rank x 8 rungs). THERE IS NO PER-ROW
+    # REGRESSION: the call wall is a FLAT 1.71-1.73 s and does not move with
+    # either batch dimension --
+    #
+    #     rows/call   6.7 .. 24.2   ->  s/call 1.708 .. 1.831
+    #     groups/call 1.0 .. 2.8    ->  s/call 1.708 .. 1.725
+    #
+    # so the "2.78 ms/row" reference was simply a 288-row call paying the
+    # same flat wall, and job 508's 54-row calls "costing 4x" was the same
+    # constant divided by fewer rows. The CAUSE is the kernel launch
+    # geometry, not the group count: ``wdm_het_get_ll_impl`` sets
+    # ``gd_x = num_bin`` -- ONE BLOCK PER ROW, no grid-stride over chunks --
+    # and explicitly ``(void)``s binary_perm / group_starts / group_ends /
+    # group_m_lo / group_m_hi / n_groups (the narrow band the kernel
+    # actually honours comes from ``m_band_half_width`` per binary per
+    # chunk). One block's serial sweep over all n_chunks therefore SETS the
+    # wall, and every additional row occupies an idle SM for free until the
+    # device runs out of blocks -- on an H100 that is ~132, against the 8
+    # rows a 1-walker block supplies.
+    #
+    # Consequences, in order of leverage:
+    #   1. rows/call is the lever and it is a LAYOUT knob. One walker per
+    #      rank is the worst case for SOBBH: it uses ~6% of the device and
+    #      pays full price. More walkers per rank cost SOBBH nothing.
+    #   2. calls/leaf = num_repeats + 2, so {BRANCH}_NUM_PROP_REPEATS scales
+    #      the branch's cost linearly (20 -> 10 on 2026-09-18).
+    #   3. Saturating the device for a small batch needs a (row x chunk)
+    #      grid with a cross-block reduction of the partial <d|h>/<h|h>,
+    #      i.e. a kernel change in lat_chunked_het_kernels.hh that the GB
+    #      branch shares. Not attempted here.
+    # The ``n_groups`` figure is kept in the line because the other kernel
+    # paths (fill_global / swap_ll / fstat) DO consume the groups -- but for
+    # get_ll it is a diagnostic only, never a cost driver.
     # ------------------------------------------------------------------
 
     #: ``_kernel_ll`` sub-spans accumulated per leaf window, in the order
@@ -238,13 +273,17 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
             "[%s_LL_TIMING] leaf window internals: shard_calls=%d "
             "groups/call=%.1f dispatch=%.2f stage=%.2f geom=%.2f wrap=%.2f "
             "launch=%.2f sync=%.2f pull=%.2f s (named=%.2f of kernel=%.2f) "
-            "-> slowest=%s (%.0f%% of named), %.1f ms/group",
+            "-> slowest=%s (%.0f%% of named), %.0f ms/call at %.1f rows/call "
+            "(kernel grid = ONE BLOCK PER ROW: the wall is one row's serial "
+            "chunk sweep, so rows up to the device's block capacity are "
+            "~free -- raise rows/call, not groups)",
             prefix, st["shard_calls"], st["groups"] / shard_calls,
             spans["dispatch"], spans["stage"], spans["geom"], spans["wrap"],
             spans["launch"], spans["sync"], spans["pull"],
             named, st["kernel_s"],
             slowest, 100.0 * spans[slowest] / named if named > 0 else 0.0,
-            1e3 * (spans["launch"] + spans["sync"]) / max(st["groups"], 1),
+            1e3 * (spans["launch"] + spans["sync"]) / shard_calls,
+            st["rows"] / shard_calls,
         )
         self._ll_stats_reset()
 

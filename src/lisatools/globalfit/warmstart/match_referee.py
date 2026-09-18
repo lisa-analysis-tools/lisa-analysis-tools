@@ -239,18 +239,49 @@ def main(argv=None):
 
     z = np.load(args.npz, allow_pickle=True)
     meta = json.loads(str(z["meta"]))
-    means, covs, p, mult = z["means"], z["covs"], z["p"], z["mult"]
-    n_members, island_id = z["n_members"], z["island_id"]
-    edges = z["f0_window_edges"]
+    basis = str(meta.get("basis", "sampling"))
     tobs = args.tobs or float(meta["tobs"])
-    df_mhz = float(meta["df_mhz"])
+    edges = z["f0_window_edges"]
+    obs_map = None
+    if basis == "observable":
+        from . import basis as wb
+
+        # The fit's geometry -- member assignment, whitening, f0 offsets,
+        # island windows -- all lives in the OBSERVABLE basis, so the leaf
+        # rows are mapped INTO it below. Only the waveform calls convert
+        # back, and they read the sampling rows directly.
+        obs_map = wb.build_map_from_stored_params(meta["map_params"])
+        ncomp_per = np.asarray(z["gmm_ncomp"], dtype=int)
+        means, covs = np.asarray(z["gmm_means"]), np.asarray(z["gmm_covs"])
+        # per-CLUSTER -> per-COMPONENT so every check below is unchanged
+        p, mult, n_members, island_id = (
+            np.repeat(np.asarray(z[k]), ncomp_per, axis=0)
+            for k in ("p", "mult", "n_members", "island_id"))
+        means_sampling = np.asarray(obs_map.from_internal(means), dtype=float)
+        df_seg = 1.0 / tobs                     # col 1 is f_mid [Hz]
+        f_units = "Hz"
+    else:
+        means, covs, p, mult = z["means"], z["covs"], z["p"], z["mult"]
+        n_members, island_id = z["n_members"], z["island_id"]
+        means_sampling = np.asarray(means, dtype=float)
+        df_seg = float(meta["df_mhz"])
+        f_units = "mHz"
     ncomp = len(means)
-    print(f"npz: {ncomp} comps | Tobs {tobs:.0f} s | df {df_mhz:.6g} mHz")
+    print(f"npz: {ncomp} comps ({basis} basis) | Tobs {tobs:.0f} s | "
+          f"df {df_seg:.6g} {f_units}")
 
     # ---- member re-extraction ------------------------------------
     t0 = time.perf_counter()
     X, _sid = load_leaf_rows(args.store, int(meta["last_k"]))
-    assign, _ad = assign_members(X, means, covs, island_id, edges)
+    # X stays SAMPLING (the waveform generator needs it); G is the same
+    # rows in the fit's basis, so X[i] and G[i] are the same leaf.
+    if obs_map is not None:
+        from .fit_from_store import to_observable
+
+        G = to_observable(X, obs_map)
+    else:
+        G = X
+    assign, _ad = assign_members(G, means, covs, island_id, edges)
     counts = np.bincount(assign[assign >= 0], minlength=ncomp)
     frac = counts / np.maximum(n_members, 1)
     print(f"leaf rows {len(X):,} | assigned {np.sum(assign >= 0):,} "
@@ -264,8 +295,8 @@ def main(argv=None):
     tail = rng.choice(tail_all, min(args.tail_n, len(tail_all)),
                       replace=False)
     # flagship island: highest-p comp within 6 bins of --flagship-f0
-    near = np.flatnonzero(np.abs(means[:, 1] - args.flagship_f0)
-                          < 6 * df_mhz)
+    near = np.flatnonzero(np.abs(means_sampling[:, 1] - args.flagship_f0)
+                          < 6 * (1e3 / tobs))
     flag = int(near[np.argmax(p[near])]) if len(near) else -1
     flag_isl = island_id[flag] if flag >= 0 else -1
     referee = np.unique(np.concatenate(
@@ -273,7 +304,8 @@ def main(argv=None):
     referee = referee[counts[referee] >= 2]
     print(f"referee: {len(core)} core (p>{args.p_core}) + {len(tail)} tail "
           f"+ flagship island {flag_isl} (comp {flag}, "
-          f"f0 {means[flag, 1]:.5f} mHz, p {p[flag]:.2f})" if flag >= 0 else
+          f"f0 {means_sampling[flag, 1]:.5f} mHz, p {p[flag]:.2f})"
+          if flag >= 0 else
           f"referee: {len(core)} core + {len(tail)} tail (no flagship found)")
 
     # ---- same-island neighbor pairs ------------------------------
@@ -285,7 +317,7 @@ def main(argv=None):
         for a_i in range(len(sel)):
             for b_i in range(a_i + 1, len(sel)):
                 i, j = sel[a_i], sel[b_i]
-                if abs(means[i, 1] - means[j, 1]) <= args.pair_bins * df_mhz:
+                if abs(means[i, 1] - means[j, 1]) <= args.pair_bins * df_seg:
                     pairs.append((i, j))
     pairs = np.array(pairs, dtype=np.int64).reshape(-1, 2)
     print(f"pairs: {len(pairs)} same-island neighbors within "
@@ -317,9 +349,9 @@ def main(argv=None):
     for k in referee:
         ridx = np.flatnonzero(assign == k)
         # anchor: member closest to the component mean (whitened)
-        diff = X[ridx] - means[k]
+        diff = G[ridx] - means[k]
         for col, period in CIRC.items():
-            diff[:, col] = circ_diff(X[ridx][:, col], means[k][col], period)
+            diff[:, col] = circ_diff(G[ridx][:, col], means[k][col], period)
         d = np.sqrt(np.sum((diff / sig[k]) ** 2, axis=1))
         anchor = ridx[d.argmin()]
         others = ridx[ridx != anchor]
@@ -333,14 +365,14 @@ def main(argv=None):
         # ratio ~1 -> the group's incoherence is fully explained by its
         # f0 spread (self-consistent posterior width / smooth blend);
         # ratio << 1 -> members also disagree in other params (junk).
-        off_bins = (X[take, 1] - X[anchor, 1]) / df_mhz
+        off_bins = (G[take, 1] - G[anchor, 1]) / df_seg
         pred = np.maximum(np.abs(np.sinc(off_bins)), 1e-3)
         med_match[k] = np.median(ms)
         min_match[k] = ms.min()
         med_ratio[k] = np.median(np.minimum(ms / pred, 1.2))
         n_sampled[k] = len(ms)
         if k == flag:
-            off = (X[take, 1] - means[k, 1]) / df_mhz  # 1/Tobs units
+            off = (G[take, 1] - means[k, 1]) / df_seg  # 1/Tobs units
             # far-vs-near cross-check: match the two extreme-offset members
             lo_i, hi_i = int(off.argmin()), int(off.argmax())
             cross = mm.match(wf[1 + lo_i], kmin[1 + lo_i],
@@ -354,7 +386,7 @@ def main(argv=None):
     t0 = time.perf_counter()
     cross_match = np.zeros(len(pairs))
     for n_i, (i, j) in enumerate(pairs):
-        wf, kmin = mm.waves(means[[i, j]])
+        wf, kmin = mm.waves(means_sampling[[i, j]])
         cross_match[n_i] = mm.match(wf[0], kmin[0], wf[1], kmin[1])
     print(f"merge test: {len(pairs)} pairs [{time.perf_counter() - t0:.1f} s]")
 
@@ -389,8 +421,9 @@ def main(argv=None):
     print("   comp   f0[mHz]     p    mult  n_mem  sig_f0/df  med     min"
           "    ratio")
     for k in worst:
-        print(f"   {k:5d} {means[k, 1]:10.5f} {p[k]:5.2f} {mult[k]:6.2f} "
-              f"{n_members[k]:6d} {sig[k, 1] / df_mhz:8.2f} "
+        print(f"   {k:5d} {means_sampling[k, 1]:10.5f} {p[k]:5.2f} "
+              f"{mult[k]:6.2f} "
+              f"{n_members[k]:6d} {sig[k, 1] / df_seg:8.2f} "
               f"{med_match[k]:7.4f} {min_match[k]:7.4f} {med_ratio[k]:7.3f}")
 
     print("\n=== MERGE TEST (centroid cross-matches) ===")
@@ -400,17 +433,20 @@ def main(argv=None):
           f"<0.5 (distinct): {np.sum(cross_match <= 0.5)}")
     for i, j in hi_m:
         c = cross_match[np.all(pairs == [i, j], axis=1)][0]
-        print(f"   MERGE {i}+{j}: f0 {means[i, 1]:.5f}/{means[j, 1]:.5f} "
+        print(f"   MERGE {i}+{j}: f0 {means_sampling[i, 1]:.5f}/"
+              f"{means_sampling[j, 1]:.5f} "
               f"p {p[i]:.2f}/{p[j]:.2f} mult {mult[i]:.1f}/{mult[j]:.1f} "
               f"cross {c:.4f} coher {med_match[i]:.3f}/{med_match[j]:.3f}")
     for i, j in mid:
         c = cross_match[np.all(pairs == [i, j], axis=1)][0]
-        print(f"   mid   {i}+{j}: f0 {means[i, 1]:.5f}/{means[j, 1]:.5f} "
+        print(f"   mid   {i}+{j}: f0 {means_sampling[i, 1]:.5f}/"
+              f"{means_sampling[j, 1]:.5f} "
               f"p {p[i]:.2f}/{p[j]:.2f} cross {c:.4f}")
 
     if flag >= 0:
-        print(f"\n=== FLAGSHIP comp {flag} (f0 {means[flag, 1]:.5f} mHz, "
-              f"p {p[flag]:.2f}, sig_f0 {sig[flag, 1] / df_mhz:.2f}/Tobs) ===")
+        print(f"\n=== FLAGSHIP comp {flag} "
+              f"(f0 {means_sampling[flag, 1]:.5f} mHz, "
+              f"p {p[flag]:.2f}, sig_f0 {sig[flag, 1] / df_seg:.2f}/Tobs) ===")
         if flag_detail is not None:
             fd = flag_detail
             o, m = fd["offsets"], fd["matches"]
@@ -433,7 +469,8 @@ def main(argv=None):
             i, j = pairs[n_i]
             o = j if i == flag else i
             print(f"  pair w/ comp {o} (p {p[o]:.2f}, "
-                  f"df0 {(means[o, 1] - means[flag, 1]) / df_mhz:+.2f}/Tobs)"
+                  f"df0 {(means[o, 1] - means[flag, 1]) / df_seg:+.2f}"
+                  f"/Tobs)"
                   f": cross-match {cross_match[n_i]:.4f}")
 
     out = args.out or os.path.splitext(args.npz)[0] + "_referee.npz"

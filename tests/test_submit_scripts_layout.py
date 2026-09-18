@@ -18,6 +18,7 @@ since the legacy layout cannot span nodes.
 """
 
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -27,7 +28,13 @@ ROOT = os.path.dirname(HERE)
 SCRIPTS = [
     os.path.join(ROOT, "scripts", "fstat_proposal", "submit_gf_6mo_v8.sh"),
     os.path.join(ROOT, "scripts", "fstat_proposal", "submit_gf_6mo_v8_nogb_null.sh"),
+    # the 3-month twin of the 6mo campaign script: same layout machinery,
+    # Tobs-derived settings reverted, source branches and warm start off
+    os.path.join(ROOT, "scripts", "fstat_proposal", "submit_gf_3mo_v8_4gpu.sh"),
 ]
+
+THREE_MO = SCRIPTS[2]
+SIX_MO = SCRIPTS[0]
 
 # Env knobs the dispatch block reads; stripped from the inherited environment
 # before each scenario applies its own overrides, so a stray value in the
@@ -45,6 +52,253 @@ _STUB_SBATCH = """#!/usr/bin/env bash
 for a in "$@"; do printf '%s\\n' "$a"; done
 exit 0
 """
+
+
+def _exports(path):
+    """``{KNOB: value}`` as bash resolves the script's export lines in order.
+
+    Resolving them rather than regexing the file is the point: the values
+    are ``${K:-default}`` forms and several are overridden further down, so
+    a grep answers what the file SAYS and this answers what the run GETS.
+    """
+    src = open(path).read()
+    lines = [l for l in src.split("\n") if re.match(r"^export [A-Z0-9_]+=", l)]
+    env = dict(os.environ)
+    for k in list(env):
+        if k.isupper():
+            env.pop(k, None)
+    out = subprocess.run(["bash", "-c", "\n".join(lines) + "\nenv | sort\n"],
+                         capture_output=True, text=True, env=env).stdout
+    return dict(l.split("=", 1) for l in out.split("\n") if "=" in l)
+
+
+class ThreeMonthTwinTest(unittest.TestCase):
+    """``submit_gf_3mo_v8_4gpu.sh`` is the 6mo script at 3 months.
+
+    Written 2026-09-18 to the spec "use all the updates and base it on the
+    6mo run, but make sure the high level 3mo things are there (Tobs, no
+    emris/sobhbs/mbhbs)" plus "(no warmstart)".
+
+    The failure this guards is a silent one. The two files are 97% the
+    same text, so the obvious way to carry a 6mo fix across is to copy the
+    block -- and the blocks that must NOT be copied are exactly the ones
+    that look like ordinary knobs (``TOBS_TARGET``, ``GB_N_SUBBANDS``). A
+    3-month run that quietly analysed 6 months of data, or armed the
+    source branches, would produce plausible output and waste the
+    campaign.
+    """
+
+    def setUp(self):
+        self.three = _exports(THREE_MO)
+        self.six = _exports(SIX_MO)
+
+    def test_tobs_and_its_derived_settings_are_the_3mo_values(self):
+        self.assertEqual(self.three["TOBS_TARGET"], "7776000")
+        self.assertEqual(self.three["GB_NLEAVES_MAX"], "10000")
+        self.assertEqual(self.three["GB_N_SUBBANDS"], "32768")
+        self.assertEqual(self.three["GB_RJ_INMODEL_CHUNK"], "65536")
+        self.assertEqual(self.three["COARSE_Q"], "1")
+        self.assertEqual(self.three["COARSE_GPU_MODE"], "off")
+        self.assertEqual(self.three["BASE_FILE_NAME"], "gf_prod_3mo")
+        # 6mo-only; the 3mo arm takes the defaults
+        self.assertNotIn("SIGHET_NT_LAYER", self.three)
+        self.assertNotIn("EDGE_CROP_WAVELETS", self.three)
+
+    def test_source_id_vars_are_UNSET_not_set_empty(self):
+        """Set-empty looks equivalent and breaks the import (2026-09-18).
+
+        Two readers disagree about what "empty" means:
+
+        * ``source_runtime.default_source_ids`` seeds the SETTINGS and
+          tests ``os.environ.get(f"{cls}_IDS") is not None`` -- so a
+          set-but-empty var REPLACES the class default
+          ``{"MBHB": [], "EMRI": [1], "SOBHB": []}`` with three empty
+          lists;
+        * ``run_combined_staged._source_ids_from_env`` ARMS the branches
+          and reads ``os.environ.get(env, "")`` -- unset and set-empty are
+          identical to it.
+
+        With all three set-empty, importing
+        ``lisatools.globalfit.stock.erebor`` FAILS outright: the module
+        builds its stock registry eagerly, and ``FullYearCombinedGlobalFit``
+        -- a variant this run never uses -- raises "mojito_source_ids must
+        inject at least 1 source total". The run died before it built
+        anything.
+        """
+        for knob in ("MBHB_IDS", "EMRI_IDS", "SOBHB_IDS"):
+            self.assertNotIn(
+                knob, self.three,
+                f"{knob} must be UNSET, not set-empty: a set-empty value "
+                f"overrides the settings default and makes `import erebor` "
+                f"raise from an unrelated variant's constructor")
+
+    def test_unset_ids_still_leave_every_source_branch_unarmed(self):
+        """The other half: unset must not accidentally ARM anything."""
+        import sys
+        sys.path.insert(0, os.path.join(ROOT, "scripts", "fstat_proposal"))
+        from run_combined_staged import _source_ids_from_env
+
+        from lisatools.globalfit.stock.erebor.source_runtime import (
+            default_source_ids,
+        )
+
+        saved = {k: os.environ.pop(k, None)
+                 for k in ("MBHB_IDS", "EMRI_IDS", "SOBHB_IDS")}
+        try:
+            self.assertEqual(_source_ids_from_env(), {},
+                             "no source branch may be armed")
+            # ... while the SETTINGS default still injects something, which
+            # is what keeps the eager registry constructible.
+            self.assertGreaterEqual(
+                sum(len(v) for v in default_source_ids().values()), 1,
+                "the settings default must stay non-empty or `import "
+                "erebor` raises again")
+        finally:
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_the_data_carries_no_source_streams(self):
+        self.assertEqual(self.three["SOURCE_TYPES"], "NOISE,GB,VGB")
+
+    def test_the_source_search_skip_is_not_set(self):
+        """It is an ERROR, not a no-op, with no armed sources.
+
+        ``run_combined_staged`` raises "STAGE_SKIP_SOURCE_SEARCH=1 but no
+        source branches are armed -- there is no source_search stage to
+        skip." The 6mo script sets it; carrying it across would kill this
+        run at startup, which is how it was found.
+        """
+        self.assertNotIn("STAGE_SKIP_SOURCE_SEARCH", self.three)
+
+    def test_no_warm_start(self):
+        self.assertEqual(
+            self.three.get("GB_WARM_START_COMPONENTS", ""), "",
+            "a 3-month run is the SOURCE of warm-start components, not a "
+            "consumer; empty is the documented off switch")
+
+    def test_every_other_knob_matches_the_6mo_script(self):
+        """The whole point of the merge: only the listed knobs differ."""
+        allowed = {
+            "TOBS_TARGET", "GB_NLEAVES_MAX", "GB_N_SUBBANDS",
+            "GB_RJ_INMODEL_CHUNK", "SIGHET_NT_LAYER", "EDGE_CROP_WAVELETS",
+            "COARSE_Q", "COARSE_GPU_MODE", "BASE_FILE_NAME",
+            "SOURCE_TYPES", "MBHB_IDS", "EMRI_IDS", "SOBHB_IDS",
+            "GB_WARM_START_COMPONENTS", "GB_WARM_START_SOURCE_STORE",
+            "STAGE_SKIP_SOURCE_SEARCH",
+            # sig-het memory sizing, split 2026-09-18. The 6-month run OOM'd
+            # in gb_search inside bin_fold_real (the fold chunker sizes each
+            # chunk to FILL the byte cap, so an 8 GiB cap builds an ~8 GiB
+            # transient) and took the revert its own comment block prescribes
+            # for the full_pe handoff. The 3-month run's slots are ~0.25 MB
+            # against the 6mo ~0.5 MB and it has been healthy through
+            # iteration 210, so it keeps the aggressive sizing. All four are
+            # transient knobs -- no stored number depends on them -- and both
+            # scripts make them env-overridable, so the split is a default,
+            # not a fork.
+            "GB_INMODEL_SETUP_BATCH", "GB_SIGHET_FOLD_MAX_BYTES",
+            "GB_INFOMAT_MEMPOOL_FREE", "GB_INMODEL_BATCH_MEMPOOL_FREE",
+        }
+        keys = (set(self.three) | set(self.six)) - {"_", "SHLVL", "PWD"}
+        diff = {k for k in keys
+                if self.three.get(k, "<unset>") != self.six.get(k, "<unset>")}
+        unexpected = diff - allowed
+        self.assertEqual(
+            unexpected, set(),
+            f"these knobs drifted apart and are not on the 3mo reversion "
+            f"list: {sorted(unexpected)}")
+
+    def test_the_multirank_and_correctness_updates_came_across(self):
+        """The reason to derive from the 6mo file rather than the old 3mo one."""
+        for knob, value in (("VGB_CHIRP_MASS_BASIS", "1"),
+                            ("VGB_SIGHET_INMODEL", "1"),
+                            ("VGB_INMODEL_PROPOSAL", "observable"),
+                            ("GB_INMODEL_OBSERVABLE_EIGEN", "full"),
+                            ("GB_LEAF_CAP_MIN_ITERS", "3"),
+                            ("NWALKERS", "4"),
+                            ("SIGHET_TUKEY_ALPHA", "0.01"),
+                            ("SOBBH_EIGEN_SCOPE", "walker_max")):
+            self.assertEqual(self.three.get(knob), value, knob)
+
+
+class WarmStartPathSeparatorTest(unittest.TestCase):
+    """The warm-start npz must land INSIDE the run store (2026-09-18).
+
+    The default was written ``${STORE_DIR}warmstart/...`` with no
+    separator, which relies on ``STORE_DIR`` ending in a slash. The
+    built-in default does; a command-line override
+    (``STORE_DIR=/.../gf_prod_6mo_v8_4gpu ./submit...``) does not, so the
+    npz went to a SIBLING directory ``gf_prod_6mo_v8_4gpuwarmstart/`` --
+    outside the snapshot zips, and not rebuilt when the store is reset.
+    """
+
+    def test_store_dir_and_warmstart_are_separated(self):
+        for path in SCRIPTS:
+            with open(path) as fh:
+                src = fh.read()
+            for m in re.finditer(r"\$\{STORE_DIR\}(?!/)(\S{0,24})", src):
+                self.assertNotIn(
+                    "warmstart", m.group(1),
+                    f"{os.path.basename(path)}: "
+                    f"${{STORE_DIR}}{m.group(1)} has no path separator, so "
+                    f"an override without a trailing slash puts the warm "
+                    f"start outside the store")
+
+
+class SobbhKnobsSingleExportTest(unittest.TestCase):
+    """One effective export per SOBBH knob (2026-09-17).
+
+    ``SOBBH_EIGEN_SCOPE=walker_max`` (user ruling 2026-09-16) was exported
+    once and then silently overridden by a second, older
+    ``export SOBBH_EIGEN_SCOPE=per_walker`` further down the same file, so
+    the ruling never reached a run. ``SOBBH_NTEMPS`` must be overridable
+    from the environment (a store born at 8 rungs is resumed with
+    ``SOBBH_NTEMPS=8``; the stored count wins either way, but the knob
+    should not lie in run_settings.log).
+    """
+
+    def _exports(self, path, name):
+        with open(path) as fh:
+            return [
+                line.strip() for line in fh
+                if line.lstrip().startswith(f"export {name}=")
+            ]
+
+    def test_sobbh_eigen_scope_exported_once(self):
+        for path in SCRIPTS:
+            lines = self._exports(path, "SOBBH_EIGEN_SCOPE")
+            self.assertLessEqual(
+                len(lines), 1,
+                f"{path}: SOBBH_EIGEN_SCOPE exported {len(lines)} times: {lines}",
+            )
+
+    def test_campaign_sobbh_eigen_scope_is_walker_max(self):
+        # The ruling applies to the campaign script; the null-test script
+        # keeps its own (per-walker) setting and is only held to one export.
+        lines = self._exports(SCRIPTS[0], "SOBBH_EIGEN_SCOPE")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("walker_max", lines[0])
+        self.assertNotIn("per_walker", lines[0])
+
+    def test_sobbh_repeats_is_env_overridable_and_defaults_to_10(self):
+        # User ruling 2026-09-18. Repeats are the ONLY knob that moves the
+        # SOBBH cost: [SOBBH_LL_TIMING] measured a flat 1.73 s per scoring
+        # call regardless of rows, and calls come from repeats, not walkers
+        # or rungs. 20 -> 10 halves the dominant per-iteration cost.
+        lines = self._exports(SCRIPTS[0], "SOBBH_NUM_PROP_REPEATS")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertEqual(
+            lines[0], "export SOBBH_NUM_PROP_REPEATS=${SOBBH_NUM_PROP_REPEATS:-10}")
+
+    def test_sobbh_ntemps_is_env_overridable_and_defaults_to_8(self):
+        # User ruling 2026-09-17: 8 in the scripts (the 4-GPU store is an
+        # 8-rung store; resumed 12-rung stores keep 12 via the store-wins
+        # rule). Both campaign scripts.
+        for path in SCRIPTS:
+            lines = self._exports(path, "SOBBH_NTEMPS")
+            self.assertEqual(len(lines), 1, f"{path}: {lines}")
+            self.assertEqual(
+                lines[0], "export SOBBH_NTEMPS=${SOBBH_NTEMPS:-8}", path)
 
 
 class SubmitScriptsSyntaxTest(unittest.TestCase):
@@ -112,16 +366,21 @@ class SubmitScriptsInJobBlockTest(unittest.TestCase):
                 text = self._text(path)
                 self.assertIn('[ "${NWALKERS}" -eq 1 ]', text)
                 self.assertIn("one-walker replica mode", text)
-                # the sampler-shape export must honour the submitting shell's
+                # The sampler-shape export must honour the submitting shell's
                 # NWALKERS (carried by --export=ALL), or the branch below it is
-                # unreachable: a hard `export NWALKERS=10` above the `-eq 1`
-                # test would silently run 10 walkers for `NWALKERS=1 ./submit`
-                self.assertIn("export NWALKERS=${NWALKERS:-10}", text)
-                self.assertNotIn("\nexport NWALKERS=10 ", text)
+                # unreachable: a hard `export NWALKERS=<n>` above the `-eq 1`
+                # test would silently run n walkers for `NWALKERS=1 ./submit`.
+                # The DEFAULT VALUE is deliberately not pinned here -- it is a
+                # campaign choice that moves (10 at the 2026-09-11 rebase, 4
+                # for the walker-block store on 2026-09-18); what this test
+                # protects is the overridable FORM and its position.
+                m = re.search(r"^export NWALKERS=\$\{NWALKERS:-\d+\}",
+                              text, re.M)
+                self.assertIsNotNone(
+                    m, "NWALKERS must be exported as ${NWALKERS:-<default>}")
+                self.assertNotRegex(text, r"\nexport NWALKERS=\d+\s")
                 self.assertLess(
-                    text.index("export NWALKERS=${NWALKERS:-10}"),
-                    text.index('[ "${NWALKERS}" -eq 1 ]'),
-                )
+                    m.start(), text.index('[ "${NWALKERS}" -eq 1 ]'))
                 # the rounding branch survives for NWALKERS > 1
                 self.assertIn(
                     "(NWALKERS / N_COMPUTE_EFF + 1) * N_COMPUTE_EFF", text
@@ -307,9 +566,21 @@ class SubmitScriptsDispatchTest(unittest.TestCase):
                 self.assertIn("--ntasks=5", lines)
                 self.assertIn("--nodes=2", lines)
                 self.assertIn("--gres=gpu:2", lines)
-                self.assertIn("--partition=gpu-80-spot", lines)
+                # NGPUS=4 is 2 nodes, so a spot preemption of EITHER node
+                # kills the whole MPI world -- twice the exposure of the
+                # 1-node flow. It goes to ON-DEMAND (user 2026-09-18);
+                # NGPUS=2 above stays on spot deliberately.
+                self.assertIn("--partition=gpu-80-ondemand", lines)
+                self.assertNotIn("--partition=gpu-80-spot", lines)
                 self.assertIn("--distribution=cyclic", lines)
                 self._assert_export_contains(lines, "GF_LEGACY_RANK_LAYOUT=0")
+
+    def test_the_4gpu_partition_is_overridable_without_editing(self):
+        for script in SCRIPTS:
+            with self.subTest(script=script):
+                lines = self._run_dispatch(
+                    script, {"NGPUS": "4", "PARTITION": "gpu-80-spot"})
+                self.assertIn("--partition=gpu-80-spot", lines)
 
     def test_nodes_knob_spreads_the_gpus_one_per_node(self):
         # one-walker replica gates (user ruling 2026-09-16: test ACROSS nodes):

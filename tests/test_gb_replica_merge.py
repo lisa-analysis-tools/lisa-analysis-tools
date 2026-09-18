@@ -381,10 +381,14 @@ class SyncCommandTest(unittest.TestCase):
             self.addCleanup(p.stop)
 
     def test_gb_ops_carries_the_fourth_command(self):
+        # the session's four commands, in order; the F-stat epoch fit's three
+        # (gb_fstat_ref_row / gb_fstat_stage_b / gb_fstat_release,
+        # parallel-fit branch) follow
         self.assertEqual(
-            gbs.GB_OPS,
+            gbs.GB_OPS[:4],
             ("gb_run_proposal", "gb_run_tempering", "gb_finish", "gb_sync"),
         )
+        self.assertIn("gb_sync", gbs.GB_OPS)
 
     def test_sync_rebuilds_from_the_merged_branch_with_no_open_session(self):
         move = _sync_move()

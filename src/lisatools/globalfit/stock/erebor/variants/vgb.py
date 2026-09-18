@@ -50,6 +50,7 @@ from ....moves import Move, MoveBuildContext
 from ....recipe import Recipe, Stage, build_vgb_moves
 from ...base import env_default
 from ..fit import EreborFit, EreborGeneralSettings
+from ..gb import build_sighet_engine
 from ..vgb import VGBSettings, VGBSetup, prepare_vgb_branch
 
 logger = logging.getLogger(__name__)
@@ -268,23 +269,23 @@ def setup_vgb_moves(engine_info, curr, acs, priors, state) -> dict:
         # chunked build above is skipped once gb_wdm_comp is non-None, so a
         # second pass must not wrap the wrapper.
         if not isinstance(vgb_info.gb_wdm_comp, GBSignalHetComputations):
-            vgb_info.gb_wdm_comp = GBSignalHetComputations.for_band_engine(
-                vgb_info.gb_wdm_comp,
-                nt_layer=int(vgb_info.sighet_nt_layer),
-                n_sparse_fd=int(vgb_info.sighet_n_sparse_fd),
-                max_r=float(getattr(vgb_info, "sighet_max_r", 0.0)),
-                n_cp_build=int(getattr(vgb_info, "sighet_n_cp", -1)),
-                v3_n_nodes=int(getattr(vgb_info, "sighet_v3_nodes", 0)),
-                v4_knots=int(getattr(vgb_info, "sighet_v4_knots", 0)),
-                v4_band=int(getattr(vgb_info, "sighet_v4_band", 0)),
-                **({"v5": int(getattr(vgb_info, "sighet_v5", 0))}
-                   if int(getattr(vgb_info, "sighet_v5", 0)) else {}),
+            # SAME builder as the GB branch (erebor.gb.build_sighet_engine):
+            # the v5 gating + edge-exclusion checks and every for_band_engine
+            # knob, the Tukey alpha included. Until 2026-09-17 this call
+            # passed no tukey_alpha and the engine inherited the chunked
+            # delegate's 0.05 as a whole-observation taper (~110 layers a
+            # side at 6mo against a 60-layer crop, engine WARNING only) --
+            # the likely source of the [GB_CELL_LL] growth that had
+            # VGB_SIGHET_INMODEL pinned to 0 in the 6mo campaign.
+            vgb_info.gb_wdm_comp = build_sighet_engine(
+                vgb_info, vgb_info.gb_wdm_comp, branch="vgb"
             )
             logger.info(
-                "VGB in-model likelihood: SIGNAL-HET (nt_layer=%d, "
-                "n_sparse_fd=%d, max_r=%s, n_cp=%d, v3_nodes=%d, "
-                "v4_knots=%d, v4_band=%d, v5=%d; chunked-het delegate for "
-                "fills / swaps).",
+                "VGB in-model likelihood: SIGNAL-HET (tukey_alpha=%s, "
+                "nt_layer=%d, n_sparse_fd=%d, max_r=%s, n_cp=%d, "
+                "v3_nodes=%d, v4_knots=%d, v4_band=%d, v5=%d; chunked-het "
+                "delegate for fills / swaps).",
+                float(vgb_info.sighet_tukey_alpha),
                 int(vgb_info.sighet_nt_layer),
                 int(vgb_info.sighet_n_sparse_fd),
                 float(getattr(vgb_info, "sighet_max_r", 0.0)),
@@ -292,6 +293,7 @@ def setup_vgb_moves(engine_info, curr, acs, priors, state) -> dict:
                 int(vgb_info.gb_wdm_comp._g.get("v3_n_nodes", 0)),
                 int(vgb_info.gb_wdm_comp._g.get("v4_knots", 0)),
                 int(vgb_info.gb_wdm_comp._g.get("v4_band", 0)),
+                int(vgb_info.sighet_v5),
             )
 
     if isinstance(general_info.domain_settings, FDSettings):

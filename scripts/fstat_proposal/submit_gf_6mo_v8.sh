@@ -457,7 +457,12 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
   _k=${GPUS_PER_RANK:-1}
   case "${NGPUS}" in
     2) _NGPU_PART=gpu-80-spot; _NODES=1; _GRES=gpu:2 ;;
-    4) _NGPU_PART=gpu-80-spot; _NODES=2; _GRES=gpu:2 ;;
+    # NGPUS=4 -> ON-DEMAND (user ruling 2026-09-18). The 4-GPU shape is
+    # 2 nodes x 2 GPUs, and on spot a preemption of EITHER node kills the
+    # whole MPI world -- twice the exposure of the 1-node flow for the
+    # same work. NGPUS=2 stays on spot: it is a single node and the
+    # midit-checkpoint path recovers it cheaply.
+    4) _NGPU_PART=${PARTITION:-gpu-80-ondemand}; _NODES=2; _GRES=gpu:2 ;;
     *) echo "[SUBMIT] NGPUS=${NGPUS} unsupported (2 or 4)."; exit 2 ;;
   esac
   # NODES=<n> spreads the NGPUS GPUs over n nodes (gres = NGPUS/n per node).
@@ -707,14 +712,53 @@ export COARSE_FIDUCIAL=injection
 # arm; ported): alpha railed at the stock 5.0 cap (~60% of samples at the
 # edge). Widened [1e-3, 20] so the slope can explore; revert = drop the
 # line. The prior is rebuilt from code each run.
+# GALFOR SAMPLING BASIS (user ruling 2026-09-18). amp, fk, f_1, f_2 move to
+# log10 over the SAME physical support (galfor_prior_dict + the 10**x
+# transform container); alpha is O(1) and stays linear. The foreground model
+# still receives linear parameters.
+#
+# WHY. galfor's linear prior box spans ~42 decades -- amp (1e-47, 1e-41)
+# against alpha (1e-3, 20) -- and the eigen proposal's step is scaled to that
+# box: the softest whitened eigenvalue puts a ~1-prior-width step on amp,
+# i.e. ~190x the parameter's own value, which takes amp negative and the
+# prior rejects every draw. That is the measured "galfor does not move".
+#
+# The two cheaper fixes were tried and REFUTED, in this order:
+#   * per-parameter whitening of the info matrix -- ALREADY implemented in
+#     eigen_refresh._tables_from_info_batch (diag(w) I diag(w)); rescaling
+#     cannot make a likelihood quadratic in a parameter it is wildly
+#     non-linear in;
+#   * building the eigen tables on the COLD ROW only (512105bd) -- shipped,
+#     confirmed live in the 6mo run by its "1 sources x 5 dims" infomat
+#     signature, and galfor STILL came back non-positive on 23 of 28 builds,
+#     ~29% of them catastrophic (worst lambda/lambda_max -9.7e78).
+#
+# NEEDS A FRESH STORE: this changes what the stored numbers MEAN, not their
+# shape. A resume across the flip is refused by noise_model_identity as of
+# 0044b7cc (galfor_log_sampling is stamped and compared) -- pull at least
+# that commit before running this, or the refusal is not there to catch you.
+export GALFOR_LOG_SAMPLING=${GALFOR_LOG_SAMPLING:-1}
 export GALFOR_ALPHA_MAX=20.0
 echo "[V8-NOISE] coarse: Q=${COARSE_Q} mode=${COARSE_GPU_MODE} \
 use_ws=${COARSE_USE_WS} fiducial=${COARSE_FIDUCIAL}"
 
 # ---- sampler shape ---------------------------------------------------------
-export NWALKERS=${NWALKERS:-10}    # 10-walker rebase (2026-09-11 ruling: build
-                                   # off the validated 10w 3mo arm, jobs
-                                   # 465/473); env-overridable since 2026-09-16.
+# 10 -> 4 (user ruling 2026-09-18, for the fresh walker-block store). One
+# walker per compute rank at NGPUS=4. Chosen for SEARCH SPEED: at fixed GPU
+# count the per-rank walker block is what grows, and ~364 s of a ~390 s
+# gb_search iteration scales with rows (the three GB RJ moves ~260 s,
+# mbh/emri amortized ~62, vgb ~30, noise ~11). Only SOBBH does not -- its
+# scorer bills a flat 1.73 s per CALL whatever the batch shape. Doubling to
+# 8 walkers therefore roughly doubles the iteration while buying nothing in
+# search throughput: births come from the F-stat grid and the warm-start
+# components, both independent of walker count, so births per HOUR is a wash
+# and iterations per hour is what drives the cap ramp and the tempering
+# cadence.
+# NOTE the walker count LOCKS for the life of the store (the resume refuses
+# any change -- state.py's walker-count mismatch), and it carries into
+# full_pe, where 4 is a thin posterior ensemble. Deliberate: this store's job
+# is the search.
+export NWALKERS=${NWALKERS:-4}
                                    # GB rungs stay GB_NTEMPS=24 -- walkers and
                                    # temps are independent axes. NEVER change
                                    # NWALKERS on a resume: the store carries the
@@ -1028,6 +1072,30 @@ export GB_TEMPER_COMPACT_ROWS=1
 # while a round improves by > tol, stop at the first flat one.
 export GB_SEARCH_NOISE_CHECKS=1
 export GB_SEARCH_NOISE_ITERS_PER_STEP=0
+# PLATEAU TOLERANCE 5 -> 20 lnL (user ruling 2026-09-18). MAXLOGL_TOL is what
+# counts as "this round improved"; JointMaxLogLSearch keeps taking rounds while
+# a round beats it and stops at the first flat one.
+#
+# Measured on the 6-month 4-GPU run: the rider took ~11.5 rounds per gb_search
+# iteration and ran INTO its 10-round ceiling (GB_SEARCH_NOISE_ITERS_PER_STEP=0
+# resolves to MAXLOGL_ITERS_PER_STEP, default 10), costing 101.4 s of a 320 s
+# steady-state iteration -- 32%, the single largest line item. The [MAXLOGL]
+# trace says where that goes: ROUND 1 carries the real re-tracking (IMPROVED
+# jumps of hundreds of lnL), rounds 2+ add ~5 lnL each -- exactly AT the old
+# tol, so the plateau rule could never fire and the loop ground to the cap
+# chasing the tol-level wobble of an ensemble already near the mode.
+#
+# 20 keeps round 1 whenever the GB residual genuinely moved and cuts the
+# wobble. Against a cold logL of ~1.04e8 gaining ~2e4 per iteration, a 20 lnL
+# floor is far below anything that matters.
+#
+# SCOPE, deliberately noted: MAXLOGL_TOL is GLOBAL to JointMaxLogLSearch, so it
+# also loosens the standalone noise_search / noise_vgb_search stages, which
+# will now declare plateau sooner. Those stages only need the noise roughly
+# converged before the next stage samples it in PE mode (see the tol default's
+# own comment), so this is judged acceptable -- but if the searches come out
+# under-converged, the rider needs its own tol knob rather than reverting this.
+export MAXLOGL_TOL=20
 # PE-only exclusive RJ draw (b9aae51f).
 export GB_PE_RJ_DRAW_ONE=1
 export GB_PE_RJ_FSTAT_FRACTION=0.8
@@ -1433,11 +1501,44 @@ export VGB_BAND_LAYERS=8
 # code: one-block staging is what raised vertical-pair co-residency, and
 # the fixed whole-cell swap ratio is what makes that correct.
 export GB_SIGHET_INMODEL_WINDOWED=1
-export GB_INMODEL_SETUP_BATCH=0
-export GB_SIGHET_FOLD_MAX_BYTES=8589934592
+# ######################################################################### #
+# ## OOM 2026-09-18 -- THE REVERT ABOVE, APPLIED EARLY.                  ## #
+# ##                                                                     ## #
+# ## The run died in gb_search (NOT full_pe) at ~4288 leaves:            ## #
+# ##   setup_in_model -> gbsignalhetcomputations.py:1074 bin_fold_real   ## #
+# ##   -> signal_het.py:119  En = c0[...,:,None,:,:]*iC*c0[...,None,:,:] ## #
+# ##   OutOfMemoryError: 2,782,742,528 bytes (89,586,791,936 allocated)  ## #
+# ##                                                                     ## #
+# ## gbsignalhetcomputations.py:1047 sizes each fold chunk to FILL the   ## #
+# ## byte cap, so an 8 GiB cap builds an ~8 GiB transient by design:     ## #
+# ##   per_src = 2*nch*nch*W*Nt_active*16 (Ec+En) + nch*W*Nt_active*16   ## #
+# ##   chunk   = _SIGHET_FOLD_MAX_BYTES // per_src                       ## #
+# ## The CODE default is 1 GiB (1<<30); 8 GiB was this file's override,  ## #
+# ## and one-block staging (SETUP_BATCH=0) sat on top of it. That is     ## #
+# ## ~8 GiB of transient against a card already 89.6 GB resident.        ## #
+# ##                                                                     ## #
+# ## The block above says to revert AT THE FULL_PE HANDOFF. The 6-month  ## #
+# ## run reaches the danger zone EARLIER than that -- in gb_search, as   ## #
+# ## the leaf count climbs -- so the revert is now the default here.     ## #
+# ## This file's own header (lines ~15-17) already calls the calibrated  ## #
+# ## 6-month sizing GB_N_SUBBANDS=4096/GPU and SETUP_BATCH=2048; the     ## #
+# ## live values had drifted to 8192 and 0.                              ## #
+# ##                                                                     ## #
+# ## All four are TRANSIENT/scheduling knobs: no stored number changes,  ## #
+# ## so a mid-store resume is safe. Cost is more chunks per unit (launch ## #
+# ## overhead), not accuracy. Every one is env-overridable, so the old   ## #
+# ## aggressive sizing is one export away if telemetry shows margin.     ## #
+# ##                                                                     ## #
+# ## STILL TIGHT? Next lever is GB_N_SUBBANDS 8192 -> 4096 (halves the   ## #
+# ## slab AND the active-slot count; the header's calibrated value).     ## #
+# ## NEVER reach for SIGHET_NT_LAYER: not a mid-store knob, and it       ## #
+# ## MULTIPLIES with GB_N_SUBBANDS in the sig-het byte product.          ## #
+# ######################################################################### #
+export GB_INMODEL_SETUP_BATCH=${GB_INMODEL_SETUP_BATCH:-2048}
+export GB_SIGHET_FOLD_MAX_BYTES=${GB_SIGHET_FOLD_MAX_BYTES:-1073741824}
 export GB_RJ_INMODEL_CHUNK=32768  # byte-parity with the 3mo twin's 65536 (6mo cells ~2x bytes); floored to ntemps multiples by the column-atomic staging
-export GB_INFOMAT_MEMPOOL_FREE=0
-export GB_INMODEL_BATCH_MEMPOOL_FREE=0
+export GB_INFOMAT_MEMPOOL_FREE=${GB_INFOMAT_MEMPOOL_FREE:-1}
+export GB_INMODEL_BATCH_MEMPOOL_FREE=${GB_INMODEL_BATCH_MEMPOOL_FREE:-1}
 # ######################################################################### #
 # ## SEAM-STRADDLING CAP CELLS (divisor 2 + stagger, 2026-08-29).        ## #
 # ## ⚠ DO NOT "FIX" THE CAP GRID BACK INTO ALIGNMENT WITH THE SUB-BANDS. ## #
@@ -1802,6 +1903,23 @@ export GB_LEAF_CAP_REQUIRE_IMPROVEMENT=1
 # cap grid, at-cap RJ skip, D/2 and GB_CAP_LL_CHECK all still stand.
 # 2 was considered and deferred: a 2-it stagnation window is weak at 10
 # walkers — revisit with the next snapshot's cap trajectory if 3 lags.
+# STAYS AT 3 (user ruling 2026-09-18, after considering 8 and 5).
+# RECORDED COUNTER-EVIDENCE, so the next person does not re-derive it: the
+# gate is MAX over cold walkers -- a band's cap holds while the BEST walker
+# keeps improving it by D/2, and increments once none has for this many
+# CONSECUTIVE iterations. With W walkers the max gets W independent chances
+# per iteration to reset that clock, so the same iteration count is weaker
+# evidence of a plateau at small W and the cap ratchets FASTER the fewer
+# walkers run. Every previous value (5, 4, 3) was tuned at 10 or 24 walkers;
+# this store runs 4. Measured on the 4-walker run, iterations 35 -> 68:
+# summed cap 1232 -> 2373 (+34.6 slots/it) against cold leaves 420 -> 1066
+# (+19.6/it), i.e. 1307 cap slots of unused headroom, 202 bands at cap >= 4
+# with a max of 7 while the median band still held ONE source -- and the
+# flagship 20.38 mHz source carried THREE fragment leaves per walker.
+# Matching the ~30 walker-iterations that 3 bought at 10 walkers would mean
+# 8 here. The knob is NOT walker-aware, so raising it is the operator's
+# call; the fresh store's fixed warm start is the other half of that
+# fragmentation story and is being addressed separately.
 export GB_LEAF_CAP_MIN_ITERS=3
 export GB_CAP_LL_CHECK=1
 # Grouped RJ scheduling: accumulate inds=True picks across RJ rounds
@@ -2249,9 +2367,20 @@ export GB_USE_GALAXY_PRIOR=1
 export PSD_NUM_PROP_REPEATS=10
 export GALFOR_NUM_PROP_REPEATS=10
 
-# ---- VGB: exact chunked-het in-model scorer (sig-het accuracy at the
-#      loudest-VGB SNRs is unverified -- [GB_CELL_LL] growth in smoke 1) ----
-export VGB_SIGHET_INMODEL=0
+# ---- VGB in-model scorer: sig-het ON (user ruling 2026-09-17), same engine
+#      and the SAME knobs as the GB branch by construction (VGBSettings reads
+#      the shared SIGHET_* / GB_SIGHET_* env names: windowed refs, N_CP,
+#      trust gate thresholds, n_sparse_fd). Was pinned to 0 ("accuracy at
+#      the loudest-VGB SNRs unverified -- [GB_CELL_LL] growth in smoke 1"),
+#      which routed the per-propose VGB information matrices through the
+#      CHUNKED engine at 30-45 ms/source: vgb_pe 130 s per call, the
+#      noise_vgb_search stage 131 s/iteration vs 24 s on the pre-basis-change
+#      legacy run. WATCH on the first snapshot: [GB_CELL_LL vgb_pe]
+#      |sampled-actual| must stay ~1e-7 (growth = the sig-het error at loud
+#      VGBs), [GB_TRUST] rejection fraction for vgb_pe (the trust gate is
+#      what protects the chain), the ll-drift rebuild count, VGB acceptance.
+#      VGB_SIGHET_INMODEL=0 restores the exact chunked scorer.
+export VGB_SIGHET_INMODEL=${VGB_SIGHET_INMODEL:-1}
 # VGB RELAUNCH BLOCK (2026-08-15, user rulings). The VGB likelihood was
 # OFF all run (betas=[1e-4] bug) and 36/55 leaves were frozen by the GB
 # SNR gate -- both fixed in code (76cd3237); pre-fix VGB samples are
@@ -2301,13 +2430,22 @@ export VGB_SIGHET_INMODEL=0
 #   python scripts/fstat_proposal/migrate_vgb_chirp_basis.py \
 #       <store.h5> <catalogue_dir>
 # run BEFORE the first launch. NEVER flip this mid-store.
-# STAGED, NOT YET LIVE (2026-09-16 sequencing): the ruling + machinery
-# above are in the tree and gated by this knob, but the flip to 1 happens
-# at the DELIBERATE VGB restart together with
-# migrate_vgb_chirp_basis.py (restart-at-injection) -- NOT at the next
-# ordinary relaunch, which must keep resuming the current 5-column store
-# untouched. Flip this to 1 only alongside the migration step.
-export VGB_CHIRP_MASS_BASIS=0
+# LIVE (user ruling 2026-09-18). Staged off since 2026-09-16; flipped on
+# after the 4-GPU run measured VGB in-model acceptance at 0.001-0.004 per
+# rung under the 5-column basis, with NO vgb_ridge_gibbs registered (the
+# ridge gate reads the column names, and the 5-column basis does not carry
+# them). The HM Cnc standalone exonerated the map three ways and ranked
+# the arms: 6-col observable+eigen with the RIDGE 0.534 acceptance
+# (tau 66.6, the best arm) against 0.1596 without it. This run has been
+# getting neither half.
+#
+# *** BEFORE THE NEXT LAUNCH ON AN EXISTING STORE, MIGRATE IT. ***
+#   python scripts/fstat_proposal/migrate_vgb_chirp_basis.py \
+#       ${STORE_DIR}/gf_prod_6mo_testing.h5 <catalogue_dir>
+# Without that the launch REFUSES to resume (run.py's ndim guard fires at
+# backend construction, before any chain load, naming this knob) -- a
+# clean stop, not a corrupt run. Set 0 to roll back to the 5-column store.
+export VGB_CHIRP_MASS_BASIS=${VGB_CHIRP_MASS_BASIS:-1}
 # 8-rung ladder (user ruling 2026-08-15). Resume derives the rung count
 # from the STORED band_temps shape, so the migration above MUST be run
 # with the matching "8" argument (it recreates every rung-dimensioned
@@ -2411,7 +2549,15 @@ export GB_ROUTER_THREADED=1
 # of ${STORE_DIR} capture it, a resume finds it, and a fresh store
 # (rm -rf) rebuilds its own. The fit/referee intermediates land next to
 # it automatically (same directory as the target).
-export GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS-${STORE_DIR}warmstart/gf_prod_3mo_v8_10w_refereed.npz}
+# The separator is EXPLICIT (2026-09-18). The slash used to be missing, and
+# that only lands inside the store when STORE_DIR carries a trailing slash --
+# the built-in default does, but every override on the command line does not,
+# so `STORE_DIR=/.../gf_prod_6mo_v8_4gpu ./submit...` silently put the npz in a
+# SIBLING directory gf_prod_6mo_v8_4gpuwarmstart/, outside the snapshot zips
+# and invisible to a fresh-store rebuild. Every other use of STORE_DIR in this
+# script already writes ${STORE_DIR}/..., so the doubled slash the default
+# produces is the same one they produce, and harmless.
+export GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS-${STORE_DIR}/warmstart/gf_prod_3mo_v8_10w_refereed.npz}
 # AUTO-BUILD (2026-09-14, after the first launch died on the missing npz;
 # user: "Check if it is done, if not run it. I would like it to be
 # automatic."). When the npz is missing, recipe build now runs the
@@ -2510,7 +2656,17 @@ export EMRI_NTEMPS=2
 # 80/80 non-positive infomats, mbh/emri walls 3-5x, iteration ~80 min).
 # Set 8 ONLY at the deliberate fresh restart (with the VGB chirp
 # migration), never on a resumed 12-rung store.
-export SOBBH_NTEMPS=12
+# (2026-09-17) Overridable, and the STORED rung count now WINS on resume
+# for mbh/emri/sobbh (recipe.resume_ladder_wins, same rule as gb/vgb): a
+# store born at 8 rungs (d3c0d6ee era, 09-16 12:52 -> 21:55) resumed under
+# 12 built a 12-rung move against an 8-rung state and died in the SOBBH
+# per-walker eigen sweep ("cannot reshape array of size 88 into shape
+# (12,newaxis)"). The knob is reported-and-ignored on such a resume; a
+# fresh store honours it. BACK TO 8 (user ruling 2026-09-17 evening): the
+# gf_prod_6mo_v8_4gpu store IS an 8-rung store, and a resumed 12-rung
+# store (the _mr copy, the original run) keeps its 12 via the store-wins
+# rule with a WARNING, so 8 here is safe for every store.
+export SOBBH_NTEMPS=${SOBBH_NTEMPS:-8}
 # ONE information matrix per leaf at the max-lnL cold walker (like MBH/EMRI)
 # instead of one per (temperature, walker) (user ruling 2026-09-16): the
 # per-walker stash is keyed by the walker axis, so every resume under a
@@ -2518,10 +2674,27 @@ export SOBBH_NTEMPS=12
 # matrices per leaf (~2.6 min/leaf/rank); walker_max tables are
 # layout-independent and persist across resumes. Watch the per-rung SOBBH
 # acceptance -- hot rungs now propose with the best walker's curvature.
-export SOBBH_EIGEN_SCOPE=walker_max
+# THE ONLY SOBBH_EIGEN_SCOPE EXPORT IN THIS FILE: a second
+# `export SOBBH_EIGEN_SCOPE=per_walker` further down (the 2026-09-08
+# TABLE SCOPE block) silently overrode this line until 2026-09-17, so the
+# ruling never took effect. Escape: SOBBH_EIGEN_SCOPE=per_walker in the env.
+export SOBBH_EIGEN_SCOPE=${SOBBH_EIGEN_SCOPE:-walker_max}
 export MBH_NUM_PROP_REPEATS=2
 export EMRI_NUM_PROP_REPEATS=2
-export SOBBH_NUM_PROP_REPEATS=20   # 25 -> 20 (user ruling 2026-09-16); applies at next relaunch
+# 25 -> 20 (user ruling 2026-09-16) -> 10 (user ruling 2026-09-18).
+# THE lever on the dominant per-iteration cost. [SOBBH_LL_TIMING] on the
+# 4-GPU run measured the chunked-het scorer at a FLAT 1.73 s per CALL,
+# independent of how many rows the call carries (windows of 138 and 404
+# rows both cost 1.72 s/call; 100% of it in the kernel-launch span at
+# ~605 ms per WDM layer group, ~2.8 groups/call). Calls come from repeats,
+# NOT from walkers or rungs, so the walker-block width does not touch this
+# cost and repeats are the only knob that moves it: 22 calls/leaf (20
+# repeats + 2) x 6 leaves x 1.73 s = 228 s, plus 12 residual fills at
+# 1.70 s = 248 s, i.e. 43% of a 9.2-min iteration. At 10 repeats that is
+# ~130 s and the iteration drops to ~7.2 min. The underlying defect is the
+# 605 ms group launch: the in-code reference for this configuration is
+# 2.78 ms/row (sobbhspecialmove.py, job-373 note), ~58x away.
+export SOBBH_NUM_PROP_REPEATS=${SOBBH_NUM_PROP_REPEATS:-10}
 export MBH_PERMUTE_EVERY=10
 export EMRI_PERMUTE_EVERY=10
 export SOBBH_PERMUTE_EVERY=10
@@ -2567,16 +2740,13 @@ export SOBBH_CHECK_LL_EVERY=30
 export SOBBH_INNER_MOVE_KIND=${SOBBH_INNER_MOVE_KIND:-eigen}
 export MBH_INNER_MOVE_KIND=eigen
 export EMRI_INNER_MOVE_KIND=eigen
-# TABLE SCOPE (user ruling 2026-09-08). SOBBH: per-(temperature, walker)
-# -- every point its own matrix against its own walker's data, ONE batched
-# corner sweep (the red/blue seam slices the full table per split). Cost
-# at this shape (10 walkers, 2026-09-11): 12 rungs x 10 walkers = 120
-# points x ~245 rows ~ 29k batched likelihood rows ~ 1.4 min per LEAF
-# REFRESH at the measured 2.78 ms/row -- first visit + every
-# SOBBH_EIGEN_REFRESH-th (10), i.e. under a minute per iteration averaged
-# over 6 leaves, concentrated in refresh iterations. If that bites: SOBBH_EIGEN_SCOPE=walker_max drops a refresh
-# to ~245 rows (~0.7 s); SOBBH_EIGEN_REFRESH stretches the cadence.
-export SOBBH_EIGEN_SCOPE=per_walker
+# TABLE SCOPE. SOBBH is set ABOVE (SOBBH_EIGEN_SCOPE, walker_max per the
+# 2026-09-16 ruling; the 2026-09-08 per-walker ruling it superseded cost
+# 12 rungs x 10 walkers = 120 points x ~245 rows ~ 29k batched likelihood
+# rows ~ 1.4 min per LEAF REFRESH at 2.78 ms/row, and the per-walker stash
+# is discarded on every walker-block change). SOBBH_EIGEN_REFRESH stretches
+# the refresh cadence either way. Do NOT re-add an export here: a second
+# export silently overrode the ruling above until 2026-09-17.
 export SOBBH_EIGEN_REFRESH=10
 # MBH/EMRI: ONE table per leaf, built at the max-lnL COLD walker (their
 # likelihood rows are per-row dense, ~1.4 / ~1.0 s). A refresh is
