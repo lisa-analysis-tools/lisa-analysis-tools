@@ -94,6 +94,16 @@ OUT = sys.argv[2] if len(sys.argv) > 2 else "gf_monitor.html"
 # ---- mission-control plot style -------------------------------------------
 BG, PANEL, LINE, FG, DIM = "#0A0E14", "#10161F", "#223041", "#B8C6D4", "#67788A"
 CYAN, AMBER, GREEN, RED, VIOLET = "#4FD8EB", "#F5A623", "#58C48A", "#E5484D", "#9B7BFF"
+# text.usetex is pinned OFF rather than left to inherit. Nothing on this
+# page needs a real LaTeX installation -- the ~19 math labels
+# (r"$\Delta f_0$", r"$\ln(A_{\rm rec}/A_{\rm cat})$", "m/s$^2$", ...) are
+# all plain mathtext, which matplotlib renders internally. Left unset the
+# value comes from whatever matplotlibrc the machine happens to carry, so a
+# host with usetex on would shell out to LaTeX for every one of the 30
+# figures: far slower, and a hard failure on any box without a TeX
+# distribution -- which is most cluster nodes and every fresh container.
+# Set GF_MONITOR_USETEX=1 to opt back in (real LaTeX must be installed).
+_USETEX = os.environ.get("GF_MONITOR_USETEX", "0") not in ("0", "", "false", "no")
 plt.rcParams.update({
     "figure.facecolor": PANEL, "axes.facecolor": PANEL, "savefig.facecolor": PANEL,
     "axes.edgecolor": LINE, "axes.labelcolor": FG, "text.color": FG,
@@ -101,6 +111,7 @@ plt.rcParams.update({
     "axes.grid": True, "grid.linewidth": 0.6, "grid.alpha": 0.5,
     "font.size": 10, "font.family": "monospace", "axes.titlesize": 11,
     "legend.frameon": False, "figure.dpi": 110,
+    "text.usetex": _USETEX,
 })
 
 IMGS, MISSING = {}, []

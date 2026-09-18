@@ -33,6 +33,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# Same pin as gf_monitor_gen.py: never shell out to a real LaTeX install.
+# This script set no rcParams at all, so text.usetex came from whatever
+# matplotlibrc the machine carried -- fine here, a hard failure on any box
+# without a TeX distribution. The math labels are plain mathtext, which
+# matplotlib renders internally. GF_MONITOR_USETEX=1 opts back in.
+plt.rcParams["text.usetex"] = (
+    os.environ.get("GF_MONITOR_USETEX", "0") not in ("0", "", "false", "no"))
+
 RUN_META = [
     ("v4", "#58C48A"),
     ("v5", "#FF7BAC"),
