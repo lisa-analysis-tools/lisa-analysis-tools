@@ -2546,7 +2546,20 @@ export SOBBH_NTEMPS=${SOBBH_NTEMPS:-8}
 export SOBBH_EIGEN_SCOPE=${SOBBH_EIGEN_SCOPE:-walker_max}
 export MBH_NUM_PROP_REPEATS=2
 export EMRI_NUM_PROP_REPEATS=2
-export SOBBH_NUM_PROP_REPEATS=20   # 25 -> 20 (user ruling 2026-09-16); applies at next relaunch
+# 25 -> 20 (user ruling 2026-09-16) -> 10 (user ruling 2026-09-18).
+# THE lever on the dominant per-iteration cost. [SOBBH_LL_TIMING] on the
+# 4-GPU run measured the chunked-het scorer at a FLAT 1.73 s per CALL,
+# independent of how many rows the call carries (windows of 138 and 404
+# rows both cost 1.72 s/call; 100% of it in the kernel-launch span at
+# ~605 ms per WDM layer group, ~2.8 groups/call). Calls come from repeats,
+# NOT from walkers or rungs, so the walker-block width does not touch this
+# cost and repeats are the only knob that moves it: 22 calls/leaf (20
+# repeats + 2) x 6 leaves x 1.73 s = 228 s, plus 12 residual fills at
+# 1.70 s = 248 s, i.e. 43% of a 9.2-min iteration. At 10 repeats that is
+# ~130 s and the iteration drops to ~7.2 min. The underlying defect is the
+# 605 ms group launch: the in-code reference for this configuration is
+# 2.78 ms/row (sobbhspecialmove.py, job-373 note), ~58x away.
+export SOBBH_NUM_PROP_REPEATS=${SOBBH_NUM_PROP_REPEATS:-10}
 export MBH_PERMUTE_EVERY=10
 export EMRI_PERMUTE_EVERY=10
 export SOBBH_PERMUTE_EVERY=10

@@ -82,6 +82,16 @@ class SobbhKnobsSingleExportTest(unittest.TestCase):
         self.assertIn("walker_max", lines[0])
         self.assertNotIn("per_walker", lines[0])
 
+    def test_sobbh_repeats_is_env_overridable_and_defaults_to_10(self):
+        # User ruling 2026-09-18. Repeats are the ONLY knob that moves the
+        # SOBBH cost: [SOBBH_LL_TIMING] measured a flat 1.73 s per scoring
+        # call regardless of rows, and calls come from repeats, not walkers
+        # or rungs. 20 -> 10 halves the dominant per-iteration cost.
+        lines = self._exports(SCRIPTS[0], "SOBBH_NUM_PROP_REPEATS")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertEqual(
+            lines[0], "export SOBBH_NUM_PROP_REPEATS=${SOBBH_NUM_PROP_REPEATS:-10}")
+
     def test_sobbh_ntemps_is_env_overridable_and_defaults_to_8(self):
         # User ruling 2026-09-17: 8 in the scripts (the 4-GPU store is an
         # 8-rung store; resumed 12-rung stores keep 12 via the store-wins
