@@ -1803,6 +1803,24 @@ export GB_LEAF_CAP_REQUIRE_IMPROVEMENT=1
 # 2 was considered and deferred: a 2-it stagnation window is weak at 10
 # walkers — revisit with the next snapshot's cap trajectory if 3 lags.
 export GB_LEAF_CAP_MIN_ITERS=3
+# WALKER-COUNT SCALING of the patience above (user observation 2026-09-18,
+# "we are advancing the CAP too quickly with less walkers" -- correct).
+# The default gate is MAX over cold walkers: the cap holds while the BEST
+# walker keeps improving a band by D/2 and increments once none has for
+# GB_LEAF_CAP_MIN_ITERS consecutive iterations. With W walkers the max
+# gets W chances per iteration, so the same iteration count is much weaker
+# evidence of a plateau at small W -- the cap ratchets FASTER the fewer
+# walkers run, which is backwards. Only the iteration count was ever
+# tuned (at 10 and 24 walkers), never the walker count.
+# MEASURED on the 4-walker run, iterations 35->68: summed cap 1232 -> 2373
+# while the cold chain held 420 -> 1066 leaves = 1307 cap slots of unused
+# headroom, 202 bands already at cap >= 4 and a max of 7 while the median
+# band still held ONE source.
+# This pins the reference walker count the 3 above was tuned at, so the
+# patience carries the same 30 walker-iterations of evidence at any
+# NWALKERS: 3 iterations at 10 walkers, 8 at 4, 30 at 1. ONE-SIDED -- runs
+# at or above 10 walkers are bit-identical. 0 disables the scaling.
+export GB_LEAF_CAP_MIN_ITERS_REF_WALKERS=10
 export GB_CAP_LL_CHECK=1
 # Grouped RJ scheduling: accumulate inds=True picks across RJ rounds
 # (1 proposal per cell per round), then ONE full-width in-model block.

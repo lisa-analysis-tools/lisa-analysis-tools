@@ -16917,6 +16917,60 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             self.num_bands, self.cap_divisor
         ).max(axis=1)
 
+    def _leaf_cap_patience(self, n_cold_walkers: int) -> int:
+        """Cap-gate patience in iterations, held walker-count INVARIANT.
+
+        The default gate is MAX-over-cold-walkers: the cap holds while the
+        BEST walker keeps improving a band by D/2, and increments once no
+        walker has for ``leaf_cap_min_iters`` consecutive iterations. With
+        W walkers the max gets W independent chances to improve each
+        iteration, so the SAME iteration count is far weaker evidence of a
+        plateau at small W -- the cap ratchets faster the fewer walkers
+        run, which is backwards (fewer walkers search less, so the cap
+        should be MORE patient, not less).
+
+        Measured on the 4-walker run (2026-09-18, iterations 35-68): the
+        summed cap went 1232 -> 2373 while the cold chain held 420 -> 1066
+        leaves, i.e. 1307 cap slots of unused headroom, 202 bands already
+        at cap >= 4 and a max of 7 while the median band still held one
+        source. The knob's own comment anticipated exactly this -- "a 2-it
+        stagnation window is weak at 10 walkers" -- but only the iteration
+        count was ever tuned, at 10 and 24 walkers, never the walker count.
+
+        The invariant that should be constant is WALKER-ITERATIONS of
+        stagnation, so the configured value is scaled by
+        ``ref_walkers / W`` and rounded up. ONE-SIDED by construction: the
+        result is never below ``leaf_cap_min_iters``, so runs at or above
+        the reference count are bit-identical to before and only
+        small-walker runs become more patient.
+
+        OPT-IN, default OFF (``GB_LEAF_CAP_MIN_ITERS_REF_WALKERS`` unset
+        or 0). This gate drives RJ births in production, so it does not
+        change behaviour silently: the campaign script sets the reference
+        count explicitly alongside its other cap knobs, and the gate's own
+        unit tests (which drive it at 1-2 walkers to exercise the
+        engagement latch and occupancy rules) keep testing mechanics with
+        no policy layer on top. Set it to the walker count the current
+        ``leaf_cap_min_iters`` was tuned at -- 10 for the v8 campaign.
+        """
+        base = int(self.leaf_cap_min_iters)
+        ref = int(os.environ.get("GB_LEAF_CAP_MIN_ITERS_REF_WALKERS", "0"))
+        w = int(n_cold_walkers)
+        if ref <= 0 or w <= 0 or w >= ref:
+            return base
+        scaled = int(np.ceil(base * ref / float(w)))
+        out = max(base, scaled)
+        if out != base and not getattr(self, "_cap_patience_logged", False):
+            self._cap_patience_logged = True
+            logger.info(
+                "[GB_CAP_PATIENCE %s] leaf-cap patience %d -> %d iterations: "
+                "the gate is MAX over %d cold walker(s), so %d iterations "
+                "carries %d walker-iterations of stagnation against the %d "
+                "the configured value buys at the %d-walker reference. "
+                "GB_LEAF_CAP_MIN_ITERS_REF_WALKERS=0 disables the scaling.",
+                self.name, base, out, w, base, base * w, base * ref, ref)
+        return out
+
     def _track_band_best_ll(self, bi, band_lls) -> None:
         """Keep ``band_best_ll`` tracking when the caps run on a CELL grid.
 
@@ -17440,6 +17494,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 bi["band_cold_ll"][:] = lls
         cur_max = lls.max(axis=0)
         _occ_max = None
+        # Patience scaled to the COLD WALKER COUNT (``lls`` is the merged
+        # full-N array on the head, so this is the run's walker count, not
+        # a rank's block width). See :meth:`_leaf_cap_patience`.
+        _patience = self._leaf_cap_patience(lls.shape[0])
 
         if self.leaf_cap_ll_improve:
             # Coarse likelihood-based gate: a band's cap holds while the
@@ -17495,7 +17553,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 best[:] = np.maximum(best, cur_max)
                 iters[improved] = 0
                 iters[~improved] += 1
-                converged = iters >= self.leaf_cap_min_iters
+                converged = iters >= _patience
                 self._cap_ll_improved_once = None
                 _skip_guard = True
             else:
@@ -17548,7 +17606,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # (clock holds) instead of ratcheting its cap on a
                 # schedule.
                 iters[~improved & _seen & _occ_any] += 1
-                converged = iters >= self.leaf_cap_min_iters
+                converged = iters >= _patience
                 # OCCUPANCY-AT-CAP increment condition (user-approved
                 # 2026-08-26): a cap only rises when its allowance is
                 # actually USED -- some cold walker holds >= cap leaves in
@@ -17564,12 +17622,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # Iteration-only mode (see ctor): a fixed schedule -- every band
             # increments after ``leaf_cap_min_iters`` iterations at its
             # current cap, regardless of lnL plateau or occupancy.
+            # DELIBERATELY UNSCALED: this mode asks for a wall-clock
+            # ratchet with no evidence test, so there is no per-walker
+            # evidence to hold invariant (see _leaf_cap_patience).
             converged = iters >= self.leaf_cap_min_iters
         else:
             best[:] = np.maximum(best, cur_max)
             iters += 1
             tol = self.leaf_cap_ll_nsigma * np.sqrt(np.maximum(dof, 0) / 2.0)
-            converged = (iters >= self.leaf_cap_min_iters) & (
+            # Scaled like the default gate: this test is MIN-over-walkers,
+            # so every extra walker is one more chance to sit outside the
+            # tolerance and hold the cap -- the same walker-count bias in
+            # the same direction (see _leaf_cap_patience).
+            converged = (iters >= _patience) & (
                 (best - lls.min(axis=0)) <= tol
             )
             if self.leaf_cap_require_occupancy:
