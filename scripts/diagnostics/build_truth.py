@@ -87,9 +87,53 @@ TOBS_3MO = 7776000.0   # the original 3-month set; also the fallback Tobs
 DT = 2.5
 NW_3MO = 128      # FD points per waveform at 3 months (the monitor's own NW_)
 
-MOJITO_CAT = os.path.expanduser(
+# The GB catalogue this truth set is built against. The default is the
+# mojito brick cache as it lands on a laptop; a cluster, a container or a
+# second checkout will all put it somewhere else, so the path is
+# overridable by --catalogue or MOJITO_CAT and the default is a SEARCH
+# rather than a single guess.
+MOJITO_CAT_DEFAULT = os.path.expanduser(
     "~/.mojito_cache/brickmarket/mojito_light_v1_0_0/catalogues/"
     "wdwd_cat_mojito_lite_processed.hdf5")
+MOJITO_CAT_NAME = "wdwd_cat_mojito_lite_processed.hdf5"
+
+
+def resolve_catalogue(explicit=None):
+    """Locate the GB catalogue, most specific source first.
+
+    ``--catalogue`` beats ``MOJITO_CAT`` beats ``MOJITO_CACHE_DIR`` beats
+    the packaged default. Raises with every path it tried rather than
+    failing later inside h5py with a bare "unable to open file", which is
+    what made this hard to diagnose the first time.
+    """
+    tried = []
+    for cand in (
+        explicit,
+        os.environ.get("MOJITO_CAT"),
+        (os.path.join(os.environ["MOJITO_CACHE_DIR"], "brickmarket",
+                      "mojito_light_v1_0_0", "catalogues", MOJITO_CAT_NAME)
+         if os.environ.get("MOJITO_CACHE_DIR") else None),
+        MOJITO_CAT_DEFAULT,
+    ):
+        if not cand:
+            continue
+        cand = os.path.expanduser(cand)
+        # a directory is accepted and the catalogue looked up inside it
+        if os.path.isdir(cand):
+            cand = os.path.join(cand, MOJITO_CAT_NAME)
+        tried.append(cand)
+        if os.path.isfile(cand):
+            return cand
+    raise SystemExit(
+        "could not find the GB catalogue "
+        f"({MOJITO_CAT_NAME}).\nTried, in order:\n  "
+        + "\n  ".join(tried)
+        + "\n\nSet one of:\n"
+        "  --catalogue /path/to/wdwd_cat_mojito_lite_processed.hdf5\n"
+        "  MOJITO_CAT=/path/to/wdwd_cat_mojito_lite_processed.hdf5\n"
+        "  MOJITO_CACHE_DIR=/path/to/.mojito_cache\n"
+        "(--catalogue and MOJITO_CAT also accept the containing directory.)"
+    )
 
 
 def store_tobs(store, fallback=TOBS_3MO):
@@ -180,7 +224,7 @@ def sens_grids(psd_p, gal_p, df):
     return sa, se
 
 
-def catalogue_phys(t_ref, flo=FLO, fhi=FHI):
+def catalogue_phys(t_ref, flo=FLO, fhi=FHI, catalogue=None):
     """(N,9) GBGPU physical rows for every catalogue GB in [flo, fhi].
 
     Column conventions copied from the run's own catalogue path
@@ -190,7 +234,9 @@ def catalogue_phys(t_ref, flo=FLO, fhi=FHI):
     ``gb_catalogue_to_sampling_basis`` exposes directly through the run's
     transform container."""
     from lisatools.globalfit.recipe import gb_catalogue_to_sampling_basis
-    with h5py.File(MOJITO_CAT, "r") as f:
+    cat = resolve_catalogue(catalogue)
+    print(f"catalogue: {cat}")
+    with h5py.File(cat, "r") as f:
         b = f["Binaries"]
         f0 = np.asarray(b["GW22FrequencySSBFrame"][:], float)
         sel = (f0 >= flo) & (f0 <= fhi)
@@ -259,6 +305,10 @@ def main(argv=None):
     ap.add_argument("--fhi", type=float, default=FHI,
                     help=f"band ceiling [Hz]; default {FHI:.10g} = the GB "
                          "band_edges[-1] of the erebor stores")
+    ap.add_argument("--catalogue", default=None,
+                    help="GB catalogue hdf5, or the directory holding it. "
+                         "Overrides MOJITO_CAT and MOJITO_CACHE_DIR; "
+                         f"default {MOJITO_CAT_DEFAULT}")
     ap.add_argument("--batch", type=int, default=20000,
                     help="waveform rows per run_wave call (default 20000); "
                          "lower it if the build runs out of memory")
@@ -285,7 +335,7 @@ def main(argv=None):
     orb = lisa_models.DefaultOrbits(force_backend="cpu", frame="icrs")
     gbw = GBGPU(force_backend="cpu", orbits=orb, t0=float(GB_MOJITO_T_REF))
 
-    phys = catalogue_phys(GB_MOJITO_T_REF, flo, fhi)
+    phys = catalogue_phys(GB_MOJITO_T_REF, flo, fhi, args.catalogue)
     print(f"catalogue rows in [{flo:.10g}, {fhi:.10g}] Hz: {len(phys)}")
 
     # ---- kappa prefilter -------------------------------------------------

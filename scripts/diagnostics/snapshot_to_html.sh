@@ -28,6 +28,10 @@
 #    path -- it self-matches this script's own waiting shell and deadlocks.
 #
 # Env overrides: ITERATION (row to build truth at), FLO/FHI (band, Hz),
+# CATALOGUE (the GB catalogue hdf5, or the directory holding it -- the
+# mojito brick cache lives somewhere different on every machine, so this is
+# the knob to set when build_truth cannot find it; MOJITO_CAT and
+# MOJITO_CACHE_DIR are honoured too and need no passthrough),
 # PY (interpreter), SKIP_TRUTH=1 (reuse whatever truth npz is present).
 set -euo pipefail
 
@@ -95,7 +99,8 @@ else
       --iteration "$IT" \
       --out       "$TRUTH" \
       --kappa-out "$RUN/kappa_grid.npz" \
-      ${FLO:+--flo "$FLO"} ${FHI:+--fhi "$FHI"}
+      ${FLO:+--flo "$FLO"} ${FHI:+--fhi "$FHI"} \
+      ${CATALOGUE:+--catalogue "$CATALOGUE"}
 fi
 
 # Rendered FROM the scratch dir: the generator rewrites gf_arm_<tag>.npz in
