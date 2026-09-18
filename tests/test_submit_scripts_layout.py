@@ -28,7 +28,13 @@ ROOT = os.path.dirname(HERE)
 SCRIPTS = [
     os.path.join(ROOT, "scripts", "fstat_proposal", "submit_gf_6mo_v8.sh"),
     os.path.join(ROOT, "scripts", "fstat_proposal", "submit_gf_6mo_v8_nogb_null.sh"),
+    # the 3-month twin of the 6mo campaign script: same layout machinery,
+    # Tobs-derived settings reverted, source branches and warm start off
+    os.path.join(ROOT, "scripts", "fstat_proposal", "submit_gf_3mo_v8_4gpu.sh"),
 ]
+
+THREE_MO = SCRIPTS[2]
+SIX_MO = SCRIPTS[0]
 
 # Env knobs the dispatch block reads; stripped from the inherited environment
 # before each scenario applies its own overrides, so a stray value in the
@@ -46,6 +52,112 @@ _STUB_SBATCH = """#!/usr/bin/env bash
 for a in "$@"; do printf '%s\\n' "$a"; done
 exit 0
 """
+
+
+def _exports(path):
+    """``{KNOB: value}`` as bash resolves the script's export lines in order.
+
+    Resolving them rather than regexing the file is the point: the values
+    are ``${K:-default}`` forms and several are overridden further down, so
+    a grep answers what the file SAYS and this answers what the run GETS.
+    """
+    src = open(path).read()
+    lines = [l for l in src.split("\n") if re.match(r"^export [A-Z0-9_]+=", l)]
+    env = dict(os.environ)
+    for k in list(env):
+        if k.isupper():
+            env.pop(k, None)
+    out = subprocess.run(["bash", "-c", "\n".join(lines) + "\nenv | sort\n"],
+                         capture_output=True, text=True, env=env).stdout
+    return dict(l.split("=", 1) for l in out.split("\n") if "=" in l)
+
+
+class ThreeMonthTwinTest(unittest.TestCase):
+    """``submit_gf_3mo_v8_4gpu.sh`` is the 6mo script at 3 months.
+
+    Written 2026-09-18 to the spec "use all the updates and base it on the
+    6mo run, but make sure the high level 3mo things are there (Tobs, no
+    emris/sobhbs/mbhbs)" plus "(no warmstart)".
+
+    The failure this guards is a silent one. The two files are 97% the
+    same text, so the obvious way to carry a 6mo fix across is to copy the
+    block -- and the blocks that must NOT be copied are exactly the ones
+    that look like ordinary knobs (``TOBS_TARGET``, ``GB_N_SUBBANDS``). A
+    3-month run that quietly analysed 6 months of data, or armed the
+    source branches, would produce plausible output and waste the
+    campaign.
+    """
+
+    def setUp(self):
+        self.three = _exports(THREE_MO)
+        self.six = _exports(SIX_MO)
+
+    def test_tobs_and_its_derived_settings_are_the_3mo_values(self):
+        self.assertEqual(self.three["TOBS_TARGET"], "7776000")
+        self.assertEqual(self.three["GB_NLEAVES_MAX"], "10000")
+        self.assertEqual(self.three["GB_N_SUBBANDS"], "32768")
+        self.assertEqual(self.three["GB_RJ_INMODEL_CHUNK"], "65536")
+        self.assertEqual(self.three["COARSE_Q"], "1")
+        self.assertEqual(self.three["COARSE_GPU_MODE"], "off")
+        self.assertEqual(self.three["BASE_FILE_NAME"], "gf_prod_3mo")
+        # 6mo-only; the 3mo arm takes the defaults
+        self.assertNotIn("SIGHET_NT_LAYER", self.three)
+        self.assertNotIn("EDGE_CROP_WAVELETS", self.three)
+
+    def test_no_source_branches(self):
+        for knob in ("MBHB_IDS", "EMRI_IDS", "SOBHB_IDS"):
+            self.assertEqual(
+                self.three.get(knob, ""), "",
+                f"{knob} must be EMPTY: _source_ids_from_env arms a branch "
+                f"on any non-empty list, and an armed branch is sampled")
+        self.assertEqual(self.three["SOURCE_TYPES"], "NOISE,GB,VGB")
+
+    def test_the_source_search_skip_is_not_set(self):
+        """It is an ERROR, not a no-op, with no armed sources.
+
+        ``run_combined_staged`` raises "STAGE_SKIP_SOURCE_SEARCH=1 but no
+        source branches are armed -- there is no source_search stage to
+        skip." The 6mo script sets it; carrying it across would kill this
+        run at startup, which is how it was found.
+        """
+        self.assertNotIn("STAGE_SKIP_SOURCE_SEARCH", self.three)
+
+    def test_no_warm_start(self):
+        self.assertEqual(
+            self.three.get("GB_WARM_START_COMPONENTS", ""), "",
+            "a 3-month run is the SOURCE of warm-start components, not a "
+            "consumer; empty is the documented off switch")
+
+    def test_every_other_knob_matches_the_6mo_script(self):
+        """The whole point of the merge: only the listed knobs differ."""
+        allowed = {
+            "TOBS_TARGET", "GB_NLEAVES_MAX", "GB_N_SUBBANDS",
+            "GB_RJ_INMODEL_CHUNK", "SIGHET_NT_LAYER", "EDGE_CROP_WAVELETS",
+            "COARSE_Q", "COARSE_GPU_MODE", "BASE_FILE_NAME",
+            "SOURCE_TYPES", "MBHB_IDS", "EMRI_IDS", "SOBHB_IDS",
+            "GB_WARM_START_COMPONENTS", "GB_WARM_START_SOURCE_STORE",
+            "STAGE_SKIP_SOURCE_SEARCH",
+        }
+        keys = (set(self.three) | set(self.six)) - {"_", "SHLVL", "PWD"}
+        diff = {k for k in keys
+                if self.three.get(k, "<unset>") != self.six.get(k, "<unset>")}
+        unexpected = diff - allowed
+        self.assertEqual(
+            unexpected, set(),
+            f"these knobs drifted apart and are not on the 3mo reversion "
+            f"list: {sorted(unexpected)}")
+
+    def test_the_multirank_and_correctness_updates_came_across(self):
+        """The reason to derive from the 6mo file rather than the old 3mo one."""
+        for knob, value in (("VGB_CHIRP_MASS_BASIS", "1"),
+                            ("VGB_SIGHET_INMODEL", "1"),
+                            ("VGB_INMODEL_PROPOSAL", "observable"),
+                            ("GB_INMODEL_OBSERVABLE_EIGEN", "full"),
+                            ("GB_LEAF_CAP_MIN_ITERS", "3"),
+                            ("NWALKERS", "4"),
+                            ("SIGHET_TUKEY_ALPHA", "0.01"),
+                            ("SOBBH_EIGEN_SCOPE", "walker_max")):
+            self.assertEqual(self.three.get(knob), value, knob)
 
 
 class WarmStartPathSeparatorTest(unittest.TestCase):
