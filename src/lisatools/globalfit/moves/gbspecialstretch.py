@@ -5469,6 +5469,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     # "every N proposes" counts ALL GBSpecial* propose() calls of the
     # branch across every move instance in the process.
     _branch_propose_counts: dict = {}
+    # Distinct global-fit ITERATIONS this branch has been proposed in, and
+    # the last iteration stamp seen per branch. Separate from the propose
+    # census above ON PURPOSE: that one is a per-propose tick the tempering
+    # cadence reads, and changing its meaning would silently retune
+    # _temper_cadence_fire. Only the F-stat refit clock reads these.
+    _branch_iteration_counts: dict = {}
+    _branch_iteration_seen: dict = {}
     _branch_last_temper: dict = {}
 
     # Per-rank RNG seed for the move's OWN Generator streams (multi-rank
@@ -17946,9 +17953,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self._reseed_firing = bool(cv.get("reseed_firing", False))
         self.temper_vertical = bool(cv.get("temper_vertical", saved["temper_vertical"]))
         if cv.get("branch_propose_count") is not None:
-            # read by _fstat_clock and _temper_cadence_fire; the head ticks
-            # it ONCE per propose and ships the value
+            # read by _temper_cadence_fire; the head ticks it ONCE per
+            # propose and ships the value
             type(self)._branch_propose_counts[branch] = int(cv["branch_propose_count"])
+        if cv.get("gf_iteration") is not None:
+            # the F-stat refit clock's tick source (see _fstat_clock). Ranks
+            # are never stamped by a combine, so without this their clock
+            # would stand still and they would disagree with the head about
+            # which epoch is current.
+            self.gf_iteration = int(cv["gf_iteration"])
 
         tables = (payload or {}).get("tables") or {}
         # READ-ONLY on a rank: the head arms, advances and persists them.
@@ -20896,6 +20909,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             "temper_vertical": bool(getattr(self, "temper_vertical", False)),
             "branch_propose_count": int(
                 type(self)._branch_propose_counts.get(branch, 0)),
+            # The stage combine stamps gf_iteration on the HEAD's move only;
+            # ranks never see a combine, so the F-stat refit clock would stop
+            # advancing on them without this. Shipped as the raw stamp so a
+            # rank's own _fstat_clock does the same change-detection the head
+            # does, rather than trusting a pre-counted total.
+            "gf_iteration": (None if getattr(self, "gf_iteration", None) is None
+                             else int(self.gf_iteration)),
         }
         # READ-ONLY copies: the head arms, advances and persists these, and
         # a rank must never see them move under it mid-propose.
@@ -22670,23 +22690,52 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
     _fstat_clock_written: dict = {}
 
     def _fstat_clock(self) -> int:
-        """The refit clock: total branch proposes, restart-persistent.
+        """The refit clock: **global-fit ITERATIONS**, restart-persistent.
 
-        Reads the shared census every GBSpecial move of this branch ticks
-        (:attr:`GBSpecialBase._branch_propose_counts` — the same clock the
-        tempering cadence uses), and makes it survive restarts by (a)
-        seeding the census from ``<fstat_root>/clock.json`` on this
-        process's first read and (b) journaling the census back to that
-        file every :attr:`_FSTAT_CLOCK_WRITE_EVERY` ticks. Proposes made
-        between the last journal write and a crash are lost — the budget
-        stretches by at most the journal granularity, never resets.
+        ``GB_FSTAT_REFIT_EVERY`` counts iterations, so ``=50`` means "refit
+        every 50 iterations" in every stage (user ruling 2026-09-18).
 
-        Only the sampling rank proposes, so the journal has a single
-        writer; both grid moves journaling the same monotone value is
-        benign either way.
+        It used to count the shared per-branch PROPOSE census
+        (:attr:`GBSpecialBase._branch_propose_counts`), which is a
+        stage-dependent multiple of the iteration count and so gave the knob
+        a different meaning in each stage. Measured on the two production
+        runs: the 3-month run fires exactly **2.00** GB-branch proposes per
+        ``gb_search`` iteration (``rj_fstat_search`` + ``rj_prior_removal``)
+        and the 6-month run **3.00** (warm start adds ``rj_warm_search``), so
+        the same ``=50`` refit every 25 and every 17 iterations respectively
+        -- and roughly every 150 in randomized ``full_pe``, where the GB
+        branch is proposed about a sixth as often. No fixed divisor can
+        reconcile those, which is why this counts iterations directly.
+
+        The iteration number is stamped down the move tree by the stage
+        combine (``GFCombineMove.propose`` -> ``_prepare_child``), the only
+        object eryn proposes exactly once per iteration. The census is left
+        strictly alone: ``_temper_cadence_fire`` still reads it and its
+        meaning must not change underneath it.
+
+        Restart persistence is unchanged in shape: seed from
+        ``<fstat_root>/clock.json`` on this process's first read, journal
+        back every :attr:`_FSTAT_CLOCK_WRITE_EVERY` ticks, and the last-fit
+        tick rides in the epoch's ``DONE.json``. Iterations between the last
+        journal write and a crash are lost, so the budget stretches by at
+        most the journal granularity and never resets.
+
+        Only the sampling rank proposes, so the journal has a single writer;
+        both grid moves journaling the same monotone value is benign.
+
+        A move that never receives a stamp (an exotic harness, a direct unit
+        -test call) falls back to counting its own visits, which is the old
+        behaviour for that move alone and keeps the clock monotone.
         """
         branch = getattr(self, "branch_name", "gb")
-        counts = GBSpecialBase._branch_propose_counts
+        counts = GBSpecialBase._branch_iteration_counts
+        seen = GBSpecialBase._branch_iteration_seen
+        it = getattr(self, "gf_iteration", None)
+        if it is None:
+            counts[branch] = int(counts.get(branch, 0)) + 1
+        elif seen.get(branch) != it:
+            seen[branch] = it
+            counts[branch] = int(counts.get(branch, 0)) + 1
         root = self._fstat_root
         path = os.path.join(root, self._FSTAT_CLOCK_BASENAME)
         if root not in GBSpecialRJFStatGridMove._fstat_clock_seeded:

@@ -1129,6 +1129,12 @@ class Stage:
         # would be whichever stage materialised last. GFCombineMove re-stamps
         # its children immediately before each propose instead.
         combined.gf_stage_kind = self.kind
+        # This combine IS the stage's per-iteration entry point: eryn calls
+        # its propose exactly once per global-fit iteration. It therefore
+        # owns the iteration counter that gets stamped down the move tree
+        # (see GFCombineMove.propose); nested combines inherit the stamp
+        # rather than minting their own, exactly as gf_stage_kind does.
+        combined.gf_is_stage_combine = True
         if not hasattr(combined, "accepted") or combined.accepted is None:
             combined.accepted = np.zeros((ctx.ntemps, ctx.nwalkers))
         return _STEP_CLASSES[self.kind](moves=[combined], **self.step_kwargs)
