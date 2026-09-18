@@ -2298,6 +2298,23 @@ class GlobalFit:
                 **noise_identity,
                 "coarse_fiducial_digest": _coarse_runtime.fiducial_digest,
             }
+        # SAMPLING BASIS of the noise branches (2026-09-18). psd.log_sampling
+        # and galfor.log_sampling change what the STORED NUMBERS MEAN without
+        # changing a single array shape: galfor amp 2.5e-44 read back under
+        # log sampling is 10**2.5e-44 ~ 1. A resume across that flip is the
+        # exact "same shapes, different likelihood" case this identity exists
+        # to refuse, and it was the one noise knob it did not record.
+        _src = getattr(self.curr, "source_info", None) or {}
+        if noise_identity:
+            _basis = {}
+            for _b in ("psd", "galfor"):
+                _info = _src.get(_b) if hasattr(_src, "get") else None
+                if _info is not None:
+                    _basis[f"{_b}_log_sampling"] = bool(
+                        getattr(_info, "log_sampling", False)
+                    )
+            if _basis:
+                noise_identity = {**noise_identity, **_basis}
         if noise_identity:
             if int(backend.iteration) == 0:
                 backend.write_noise_model_identity(noise_identity)
@@ -2328,8 +2345,22 @@ class GlobalFit:
                     mismatched = {}
                     for key, value in noise_identity.items():
                         stored_value = stored.get(key)
+                        # A key this store PREDATES is not a mismatch: the
+                        # identity grows over time and every key added later
+                        # would otherwise refuse every existing store at once
+                        # (adding psd/galfor_log_sampling on 2026-09-18 would
+                        # have killed both live runs on their next resume).
+                        # The asymmetry is the point -- absent-and-default is
+                        # fine, absent-and-NON-default is exactly the silent
+                        # reinterpretation we are guarding, so that still
+                        # raises below.
+                        if key not in stored:
+                            if value in (False, "", 0):
+                                continue
+                            mismatched[key] = ("<not recorded>", value)
+                            continue
                         if isinstance(value, float):
-                            same = stored_value is not None and np.isclose(
+                            same = np.isclose(
                                 float(stored_value), value, rtol=0.0, atol=1e-6
                             )
                         else:
