@@ -1610,8 +1610,18 @@ export VGB_BAND_LAYERS=8
 # code: one-block staging is what raised vertical-pair co-residency, and
 # the fixed whole-cell swap ratio is what makes that correct.
 export GB_SIGHET_INMODEL_WINDOWED=1
-export GB_INMODEL_SETUP_BATCH=0
-export GB_SIGHET_FOLD_MAX_BYTES=8589934592
+# NOT reverted here, unlike the 6mo twin. The 6-month run OOM'd in
+# gb_search on 2026-09-18 with exactly these two values (the fold chunker
+# sizes each chunk to FILL the cap, so 8 GiB builds an ~8 GiB transient);
+# this run's slots are ~0.25 MB against the 6mo ~0.5 MB, and it has been
+# healthy through iteration 210, so the aggressive sizing stays. If this
+# one ever OOMs in bin_fold_real, apply the 6mo revert:
+#   GB_SIGHET_FOLD_MAX_BYTES=1073741824  (the code default)
+#   GB_INMODEL_SETUP_BATCH=2048
+#   GB_INFOMAT_MEMPOOL_FREE=1  GB_INMODEL_BATCH_MEMPOOL_FREE=1
+# All four are transient knobs -- no stored number changes, resume-safe.
+export GB_INMODEL_SETUP_BATCH=${GB_INMODEL_SETUP_BATCH:-0}
+export GB_SIGHET_FOLD_MAX_BYTES=${GB_SIGHET_FOLD_MAX_BYTES:-8589934592}
 export GB_RJ_INMODEL_CHUNK=65536  # 3mo cells are ~half the bytes of 6mo; floored to ntemps multiples by the column-atomic staging
 export GB_INFOMAT_MEMPOOL_FREE=0
 export GB_INMODEL_BATCH_MEMPOOL_FREE=0

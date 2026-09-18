@@ -1501,11 +1501,44 @@ export VGB_BAND_LAYERS=8
 # code: one-block staging is what raised vertical-pair co-residency, and
 # the fixed whole-cell swap ratio is what makes that correct.
 export GB_SIGHET_INMODEL_WINDOWED=1
-export GB_INMODEL_SETUP_BATCH=0
-export GB_SIGHET_FOLD_MAX_BYTES=8589934592
+# ######################################################################### #
+# ## OOM 2026-09-18 -- THE REVERT ABOVE, APPLIED EARLY.                  ## #
+# ##                                                                     ## #
+# ## The run died in gb_search (NOT full_pe) at ~4288 leaves:            ## #
+# ##   setup_in_model -> gbsignalhetcomputations.py:1074 bin_fold_real   ## #
+# ##   -> signal_het.py:119  En = c0[...,:,None,:,:]*iC*c0[...,None,:,:] ## #
+# ##   OutOfMemoryError: 2,782,742,528 bytes (89,586,791,936 allocated)  ## #
+# ##                                                                     ## #
+# ## gbsignalhetcomputations.py:1047 sizes each fold chunk to FILL the   ## #
+# ## byte cap, so an 8 GiB cap builds an ~8 GiB transient by design:     ## #
+# ##   per_src = 2*nch*nch*W*Nt_active*16 (Ec+En) + nch*W*Nt_active*16   ## #
+# ##   chunk   = _SIGHET_FOLD_MAX_BYTES // per_src                       ## #
+# ## The CODE default is 1 GiB (1<<30); 8 GiB was this file's override,  ## #
+# ## and one-block staging (SETUP_BATCH=0) sat on top of it. That is     ## #
+# ## ~8 GiB of transient against a card already 89.6 GB resident.        ## #
+# ##                                                                     ## #
+# ## The block above says to revert AT THE FULL_PE HANDOFF. The 6-month  ## #
+# ## run reaches the danger zone EARLIER than that -- in gb_search, as   ## #
+# ## the leaf count climbs -- so the revert is now the default here.     ## #
+# ## This file's own header (lines ~15-17) already calls the calibrated  ## #
+# ## 6-month sizing GB_N_SUBBANDS=4096/GPU and SETUP_BATCH=2048; the     ## #
+# ## live values had drifted to 8192 and 0.                              ## #
+# ##                                                                     ## #
+# ## All four are TRANSIENT/scheduling knobs: no stored number changes,  ## #
+# ## so a mid-store resume is safe. Cost is more chunks per unit (launch ## #
+# ## overhead), not accuracy. Every one is env-overridable, so the old   ## #
+# ## aggressive sizing is one export away if telemetry shows margin.     ## #
+# ##                                                                     ## #
+# ## STILL TIGHT? Next lever is GB_N_SUBBANDS 8192 -> 4096 (halves the   ## #
+# ## slab AND the active-slot count; the header's calibrated value).     ## #
+# ## NEVER reach for SIGHET_NT_LAYER: not a mid-store knob, and it       ## #
+# ## MULTIPLIES with GB_N_SUBBANDS in the sig-het byte product.          ## #
+# ######################################################################### #
+export GB_INMODEL_SETUP_BATCH=${GB_INMODEL_SETUP_BATCH:-2048}
+export GB_SIGHET_FOLD_MAX_BYTES=${GB_SIGHET_FOLD_MAX_BYTES:-1073741824}
 export GB_RJ_INMODEL_CHUNK=32768  # byte-parity with the 3mo twin's 65536 (6mo cells ~2x bytes); floored to ntemps multiples by the column-atomic staging
-export GB_INFOMAT_MEMPOOL_FREE=0
-export GB_INMODEL_BATCH_MEMPOOL_FREE=0
+export GB_INFOMAT_MEMPOOL_FREE=${GB_INFOMAT_MEMPOOL_FREE:-1}
+export GB_INMODEL_BATCH_MEMPOOL_FREE=${GB_INMODEL_BATCH_MEMPOOL_FREE:-1}
 # ######################################################################### #
 # ## SEAM-STRADDLING CAP CELLS (divisor 2 + stagger, 2026-08-29).        ## #
 # ## ⚠ DO NOT "FIX" THE CAP GRID BACK INTO ALIGNMENT WITH THE SUB-BANDS. ## #

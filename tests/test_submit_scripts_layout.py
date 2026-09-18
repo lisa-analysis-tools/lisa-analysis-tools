@@ -186,6 +186,18 @@ class ThreeMonthTwinTest(unittest.TestCase):
             "SOURCE_TYPES", "MBHB_IDS", "EMRI_IDS", "SOBHB_IDS",
             "GB_WARM_START_COMPONENTS", "GB_WARM_START_SOURCE_STORE",
             "STAGE_SKIP_SOURCE_SEARCH",
+            # sig-het memory sizing, split 2026-09-18. The 6-month run OOM'd
+            # in gb_search inside bin_fold_real (the fold chunker sizes each
+            # chunk to FILL the byte cap, so an 8 GiB cap builds an ~8 GiB
+            # transient) and took the revert its own comment block prescribes
+            # for the full_pe handoff. The 3-month run's slots are ~0.25 MB
+            # against the 6mo ~0.5 MB and it has been healthy through
+            # iteration 210, so it keeps the aggressive sizing. All four are
+            # transient knobs -- no stored number depends on them -- and both
+            # scripts make them env-overridable, so the split is a default,
+            # not a fork.
+            "GB_INMODEL_SETUP_BATCH", "GB_SIGHET_FOLD_MAX_BYTES",
+            "GB_INFOMAT_MEMPOOL_FREE", "GB_INMODEL_BATCH_MEMPOOL_FREE",
         }
         keys = (set(self.three) | set(self.six)) - {"_", "SHLVL", "PWD"}
         diff = {k for k in keys
