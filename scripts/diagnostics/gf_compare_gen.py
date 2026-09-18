@@ -37,14 +37,15 @@ RUN_META = [
     ("v4", "#58C48A"),
     ("v5", "#FF7BAC"),
     ("v6", "#9B7BFF"),
-    ("1yr", "#F2E14C"),   # optional 4th run; different Tobs -- shown for
+    ("v7", "#4CC9F0"),    # optional (--v7); 3-month, matched-iteration
+    ("1yr", "#F2E14C"),   # optional; different Tobs -- shown for
                           # contrast, excluded from matched-iteration deltas
 ]
 BG, PANEL, LINE, FG, DIM = "#0A0E14", "#10161F", "#223041", "#B8C6D4", "#67788A"
 TRUTHRED = "#FF2E3E"
 TG = 4.925490947641267e-6
 
-# flagship: the highest-frequency catalogue source in the 3-21 mHz set
+# flagship: the highest-frequency catalogue source in the analysed GB band
 FLAG_F0, FLAG_TOL, FLAG_FDOT = 20.380377e-3, 5.144e-6, 1.0245e-13
 PSD_NAMES = ["Soms_d  [m]", "Sa_a  [m/s$^2$]"]
 PSD_INJ = [1.496182e-11, 2.982412e-15]
@@ -249,31 +250,93 @@ def load_vgb_cat():
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
+    # v4 accepts "none"/"-"/"skip": the v4 reference h5 no longer exists on
+    # disk, and the page is perfectly readable without it -- the delta panel
+    # simply rebaselines onto the earliest run that IS present.
     ap.add_argument("v4"); ap.add_argument("v5"); ap.add_argument("v6")
     ap.add_argument("out")
+    ap.add_argument("--v7", default=None,
+                    help="optional 3-month v7 run dir/h5 -- matched-iteration")
     ap.add_argument("--yr1", default=None,
-                    help="optional 1-yr run dir/h5 -- adds a 4th panel/line")
+                    help="optional 1-yr run dir/h5 -- adds a contrast line")
     ap.add_argument("--truth", default="gb_truth_3to21.npz")
     a = ap.parse_args(argv)
 
     runs = {}
-    srcs = [a.v4, a.v5, a.v6] + ([a.yr1] if a.yr1 else [])
-    for (tag, col), src in zip(RUN_META, srcs):
+    colors = dict(RUN_META)
+    _absent = ("none", "-", "skip", "")
+    pairs = [(k, v) for k, v in
+             [("v4", a.v4), ("v5", a.v5), ("v6", a.v6)]
+             if v and str(v).strip().lower() not in _absent]
+    if a.v7:
+        pairs.append(("v7", a.v7))
+    if a.yr1:
+        pairs.append(("1yr", a.yr1))
+    for tag, src in pairs:
         p = live_h5(src)
         print(f"[{tag}] {p}")
         runs[tag] = load_run(p)
-        runs[tag]["col"] = col
+        runs[tag]["col"] = colors[tag]
         runs[tag]["src"] = os.path.basename(p)
 
     truth_det = truth_sub = []
     TR = None
+    truthnote = "No truth npz found &mdash; crosses are absent from every panel."
     if os.path.exists(a.truth):
         z = np.load(a.truth)
         t_f0, t_amp, det = z["f0"] * 1e3, np.log10(z["amp"]), z["det"] > 0
+        # Stamps (2026-08-23): the band and Tobs come from the FILE, never
+        # from its name -- the rendered page once carried the 1-yr set under
+        # 3-month panels, and the resulting 3 mHz cross floor + wrong-Tobs
+        # det styling read as "truth amplitudes are wrong" on the zoom stack.
+        tband = (np.asarray(z["band"], float).reshape(-1) * 1e3
+                 if "band" in z.files else np.array([3.0, 21.94]))
+        ttobs = float(z["tobs"]) if "tobs" in z.files else 7.776e6
+        # The full-band truth set carries the whole in-band catalogue (~4M
+        # rows); inlining it wholesale would put >100 MB of crosses in the
+        # page. Every DETECTABLE truth is kept. The faint layer keeps the
+        # sub-threshold catalogue above a cut anchored 0.5 dex below the
+        # faintest recovered sample of any run, decimated per log-f window
+        # (uniform drawn fraction in f0 -- a single global cap would draw a
+        # band-wide brightness edge, the artifact the monitor's explorer
+        # decimation just dropped).
+        rec_lo = min(float(runs[t]["pts"][:, 1].min()) for t in runs)
+        sub_cut = rec_lo - 0.5
+        sub_i = np.nonzero((~det) & (t_amp >= sub_cut))[0]
+        n_above = int(sub_i.size)
+        SUB_CAP = 25000
+        if sub_i.size > SUB_CAP:
+            rng = np.random.default_rng(0)
+            wed = np.geomspace(t_f0[sub_i].min() * (1 - 1e-12),
+                               t_f0[sub_i].max() * (1 + 1e-12), 65)
+            wid = np.clip(np.searchsorted(wed, t_f0[sub_i], "right") - 1,
+                          0, 63)
+            frac = SUB_CAP / sub_i.size
+            parts = []
+            for wi in range(64):
+                kw = sub_i[wid == wi]
+                if not kw.size:
+                    continue
+                q = max(int(round(kw.size * frac)), 1)
+                parts.append(kw if kw.size <= q else
+                             rng.choice(kw, size=q, replace=False))
+            sub_i = np.concatenate(parts)
         truth_det = np.column_stack([t_f0[det], t_amp[det]]).round(5).tolist()
-        truth_sub = np.column_stack([t_f0[~det], t_amp[~det]]).round(5).tolist()
-        TR = dict(f0=t_f0, logA=t_amp, det=det,
+        truth_sub = np.column_stack(
+            [t_f0[sub_i], t_amp[sub_i]]).round(5).tolist()
+        TR = dict(f0=t_f0, logA=t_amp, det=det, sub_i=sub_i,
                   phys=z["phys"] if "phys" in z.files else None)
+        truthnote = (
+            f"Truth crosses cover {tband[0]:.4g}&ndash;{tband[1]:.4g} mHz. "
+            f"Bold = detectable (optimal SNR&gt;7) at Tobs = "
+            f"{ttobs / 86400.0:.0f} d: {int(det.sum())} sources &mdash; runs "
+            f"at a different Tobs have a different detectable set. Faint = "
+            f"sub-threshold catalogue above log10 A = {sub_cut:.2f} (0.5 dex "
+            f"below the faintest recovered sample; {len(truth_sub):,} of "
+            f"{n_above:,} such sources drawn, decimated per log-f window so "
+            f"the drawn density is uniform in frequency &mdash; the faint "
+            f"layer's lower edge is that amplitude cut, not the catalogue's "
+            f"end).")
 
     # ---- overplot figures ------------------------------------------------
     figs = {}
@@ -289,13 +352,18 @@ def main(argv=None):
 
     fig, ax = plt.subplots(figsize=(10.5, 3.0), facecolor=PANEL)
     styled_ax(ax)
-    n4 = runs["v4"]["ll_max"]
-    for tag in ("v5", "v6"):
+    # BASELINE = the earliest run present, not a hard-coded "v4": with the
+    # v4 reference gone the panel would otherwise KeyError. Everything else
+    # about the panel is unchanged.
+    _base = next(k for k in ("v4", "v5", "v6", "v7") if k in runs)
+    n4 = runs[_base]["ll_max"]
+    for tag in (t for t in ("v4", "v5", "v6", "v7")
+                if t in runs and t != _base):
         r = runs[tag]
         n = min(len(n4), len(r["ll_max"]))
         ax.plot(np.arange(n), r["ll_max"][:n] - n4[:n], color=r["col"],
-                lw=1.8, label=f"{tag} − v4")
-    ax.axhline(0, color=runs["v4"]["col"], lw=1.2, ls="--", label="v4")
+                lw=1.8, label=f"{tag} \u2212 {_base}")
+    ax.axhline(0, color=runs[_base]["col"], lw=1.2, ls="--", label=_base)
     ax.set_xlabel("iteration (matched)"); ax.set_ylabel("Δ cold logL max")
     ax.legend(facecolor=PANEL, edgecolor=LINE, labelcolor=FG, fontsize=8)
     figs["dll"] = b64fig(fig)
@@ -369,7 +437,7 @@ def main(argv=None):
     for ax, t in zip(axs, tags):
         r = runs[t]
         if TR is not None:
-            ax.scatter(TR["f0"][~TR["det"]], TR["logA"][~TR["det"]], s=2,
+            ax.scatter(TR["f0"][TR["sub_i"]], TR["logA"][TR["sub_i"]], s=2,
                        marker="x", lw=0.35, color=TRUTHRED, alpha=0.10)
             ax.scatter(TR["f0"][TR["det"]], TR["logA"][TR["det"]], s=9,
                        marker="x", lw=0.7, color=TRUTHRED, alpha=0.85)
@@ -537,6 +605,7 @@ def main(argv=None):
     figs["b_galh"] = block("galh", "galfor posteriors at latest iteration")
     figs["b_vgb"] = block("vgb", "VGB per-leaf distance medians", "vgb")
     figs["hirows"] = hirows
+    figs["truthnote"] = truthnote
     figs["tobsnote"] = "; ".join(
         f"{t} Tobs = {runs[t]['tobs'] / 86400:.0f} d" for t in tags)
 
@@ -607,10 +676,10 @@ button.armed {{ outline:2px solid var(--truthred); }}
 everywhere: <span class="chip" style="background:#58C48A"></span>v4
 <span class="chip" style="background:#FF7BAC"></span>v5
 <span class="chip" style="background:#9B7BFF"></span>v6
+<span class="chip" style="background:#4CC9F0"></span>v7
 <span class="chip" style="background:#F2E14C"></span>1yr (different Tobs
 -- shown for contrast, not matched-iteration comparison); red is reserved
-for catalogue truths. Truth crosses are the 3-month detectability set;
-the 1-yr run's own detectable set is larger.</p>
+for catalogue truths. {truthnote}</p>
 <table><tr><th>run</th><th>store</th><th>iterations</th>
 <th>leaves/walker</th><th>cold logL max</th><th>leaves &gt; 10 mHz</th>
 <th>fdot &lt; 0 above 10 mHz</th></tr>{rows}</table>
@@ -626,8 +695,13 @@ the 1-yr run's own detectable set is larger.</p>
 <h2>Synced zoom — amplitude vs frequency, one panel per run</h2>
 <p class="note">Drag to pan, scroll to zoom, on ANY panel — the view is
 shared, so all three windows show exactly the same axes at all times.
-Red crosses: detectable catalogue truths (SNR&gt;7); faint crosses: below
-threshold. Cloud: last-iteration cold-chain leaves, all walkers.</p>
+Red crosses: detectable catalogue truths (SNR&gt;7); faint crosses:
+sub-threshold catalogue (decimated &mdash; see the note at the top; their
+lower edge is a drawn amplitude cut, not the catalogue's end). Cloud:
+last-iteration cold-chain leaves, all walkers. Below ~5 mHz several
+catalogue sources share every frequency bin, so a recovered leaf can
+legitimately sit ABOVE every individual cross there &mdash; it is fitting
+the blend.</p>
 <div class="bar">
   <button id="reset">reset view</button>
   <button id="truthbtn">toggle catalogue truths</button>
@@ -653,8 +727,9 @@ run's absolute lnL is not comparable to the 3-month runs ({tobsnote}); its
 <p class="note">Static counterpart of the synced zoom stack, for printing
 and scanning: identical x/y limits on all panels, log frequency axis. Red
 crosses are catalogue truths (bold = detectable at SNR&nbsp;&gt;&nbsp;7,
-faint = below threshold, 3-month set); the coloured cloud is that run's
-last-iteration cold-chain leaves pooled over all walkers.</p>
+faint = sub-threshold catalogue, decimated as in the note at the top); the
+coloured cloud is that run's last-iteration cold-chain leaves pooled over
+all walkers.</p>
 {b_pop}
 
 <h2>Sky distribution — one panel per run</h2>

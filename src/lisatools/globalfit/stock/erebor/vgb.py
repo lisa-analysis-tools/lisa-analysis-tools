@@ -27,9 +27,12 @@ import dataclasses
 import logging
 import os
 import typing
+import warnings
 
 import numpy as np
 from eryn.moves.tempering import make_ladder
+
+from lisatools.utils.constants import YRSID_SI
 
 from ...engine import GeneralSetup, Settings
 from ...recipe import MOJITO_REFERENCE_TIME, gb_catalogue_to_sampling_basis
@@ -104,6 +107,340 @@ def _vgb_ndim_default() -> int:
         if env_resolve("VGB_CHIRP_MASS_BASIS", False, bool)
         else len(VGB_SAMPLED_BASIS_DIST)
     )
+
+
+def vgb_preset_band_edges(
+    f0_hz,
+    Tobs: float,
+    layer_df: float,
+    *,
+    start_freq: float,
+    end_freq: float,
+    width_cap_layers: float = 8.0,
+    support_margin: float = 1.0,
+    unit_stride: int = 2,
+    oversample: int = 4,
+    amp: float = 1e-30,
+    amps=None,
+    sep_factor: typing.Optional[float] = None,
+    validate: bool = True,
+    return_meta: bool = False,
+):
+    """PRESET VGB band edges: windows centered on the known sources.
+
+    The VGB branch is fixed-dimensional (no RJ, f0 fixed per leaf), so its
+    band grid is PURE SCHEDULING -- it only has to respect the same-unit
+    support-separation rule (:func:`...moves.gbbands.
+    check_band_support_separation`), not cover the spectrum uniformly.
+    This builder exploits that: it packs the known sources into as few
+    OCCUPIED bands ("windows") as possible and places all windows in ONE
+    band-unit, so one unit pass carries every proposal and the other
+    passes are empty (near-free: ``get_subset`` returns ``None``).
+
+    Construction (deterministic; sorted-input greedy, no RNG):
+
+    1. Per-source FD half-supports ``s_i = get_N(A_i, f_i)/Tobs`` via the
+       installed :func:`gbgpu.utils.utility.get_N` (``amps=None`` uses the
+       conservative ``amp`` envelope -- the production band-sizing
+       convention).
+    2. Greedy left-to-right packing: consecutive sources join one window
+       while the window's content span (source supports x
+       ``support_margin`` included) stays within ``width_cap_layers``
+       WDM layers. Sources whose supports OVERLAP always share a window
+       (they could never be scheduled concurrently anyway; a cluster
+       serializes within its band, which the per-leaf VGB move handles).
+       The cap exists because the sub-band buffer's slab extent
+       (``SubBandBuffer.band_slab_Nf``) is a SINGLE scalar sized by the
+       WIDEST band in the grid -- one wide band inflates every slot's
+       slab, so windows AND fillers are both width-capped.
+    3. Window edges center the content and never go below the band's own
+       ``2 * get_N(f_hi_band)/Tobs`` fixed-point floor (the get_n width
+       rule) -- that floor is exactly what makes stride 2 pass the
+       support-separation guard.
+    4. Windows whose gap cannot hold one filler band of the required
+       separation width are merged (iterated to a fixed point).
+    5. Gaps are chopped into equal-width filler bands, each width in
+       ``[separation requirement, width cap]``, with the filler COUNT
+       chosen ODD so every window lands at an ODD band index: under
+       ``band_index % 2`` unit scheduling, unit 1 holds all windows and
+       unit 0 only ever holds empty fillers. One guard filler leads and
+       trails the grid (the machinery never proposes in the first/last
+       band).
+    6. The final grid is validated with the installed
+       :func:`check_band_support_separation` at ``unit_stride``
+       (enforce=True) plus preset-specific asserts (windows odd, sources
+       interior).
+
+    Args:
+        f0_hz: Source frequencies (Hz), any order.
+        Tobs: Observation time (s).
+        layer_df: WDM layer width (Hz) -- used only for the width cap and
+            reporting (edges are free-floating; scheduling is independent
+            of the pixelization).
+        start_freq / end_freq: Hard grid bounds (Hz); the outermost edges
+            are clamped inside them and the sources must fit with a guard
+            band on each side.
+        width_cap_layers: Maximum band width in WDM layers (windows and
+            fillers). Drives the shared slab extent; overridden only by a
+            must-merge cluster wider than the cap (warned).
+        support_margin: Multiplier on each source's own half-support when
+            deciding window membership/extent.
+        unit_stride: Stride the grid is validated at (2 = the preset
+            design; larger strides only add clearance).
+        oversample / amp: The production ``get_N`` call convention.
+        amps: Optional per-source amplitudes for the source-support sizing
+            (``None`` -> ``amp`` envelope for every source).
+        sep_factor: Same-unit separation factor; ``None`` resolves from
+            ``GB_ORTHO_SEP_FACTOR`` (default 1.0), matching the validator.
+        validate: Run the installed separation check (enforce=True).
+        return_meta: Also return a dict with ``window_band_inds``,
+            ``window_sources`` (list of source-index arrays per window)
+            and ``max_band_span_layers``.
+
+    Returns:
+        np.ndarray: ascending band edges (Hz) -- or ``(edges, meta)`` when
+        ``return_meta``.
+    """
+    from gbgpu.utils.utility import get_N
+
+    from ...moves.gbbands import check_band_support_separation
+
+    f0 = np.sort(np.asarray(f0_hz, dtype=float).ravel())
+    n = f0.size
+    if n == 0:
+        raise ValueError("vgb_preset_band_edges needs at least one source.")
+    order = np.argsort(np.asarray(f0_hz, dtype=float).ravel())
+    if amps is not None:
+        amps = np.asarray(amps, dtype=float).ravel()[order]
+    if sep_factor is None:
+        sep_factor = float(os.environ.get("GB_ORTHO_SEP_FACTOR", "1.0"))
+    sep_factor = float(sep_factor)
+    Tobs = float(Tobs)
+    df = 1.0 / Tobs
+    ldf = float(layer_df)
+    w_cap = float(width_cap_layers) * ldf
+    m = float(support_margin)
+
+    def _s_edge(f: float) -> float:
+        """Edge half-support (validator convention: the ``amp`` envelope)."""
+        return float(get_N(amp, f, Tobs, oversample=oversample).item()) * df
+
+    def _s_src(i: int) -> float:
+        a_i = amp if amps is None else float(amps[i])
+        return float(get_N(a_i, f0[i], Tobs, oversample=oversample).item()) * df
+
+    def _w_floor(f_lo: float) -> float:
+        """Least fixed point of ``w = 2*get_N(f_lo + w)/Tobs`` (get_n rule)."""
+        w = 2.0 * _s_edge(f_lo)
+        for _ in range(32):
+            w_next = 2.0 * _s_edge(f_lo + w)
+            if w_next <= w:
+                return w
+            w = w_next
+        raise RuntimeError(
+            f"band-width fixed point did not converge at f={f_lo:.6e} Hz."
+        )
+
+    s_src = np.asarray([_s_src(i) for i in range(n)])
+
+    # ---- 2. windows in three phases ----
+    # (a) MUST-merge clusters: sources whose (margined) supports overlap
+    #     can never be scheduled concurrently, so they share a window.
+    clusters = []  # [lo_content, hi_content, [source indices]]
+    i = 0
+    while i < n:
+        lo = f0[i] - m * s_src[i]
+        hi = f0[i] + m * s_src[i]
+        members = [i]
+        j = i
+        while j + 1 < n and (f0[j + 1] - m * s_src[j + 1]) <= hi:
+            j += 1
+            members.append(j)
+            hi = max(hi, f0[j] + m * s_src[j])
+        clusters.append([lo, hi, members])
+        i = j + 1
+
+    # (b) SPLITTABLE boundaries: a gap can separate two windows only if a
+    #     filler band of the required separation width fits AFTER both
+    #     windows are floor-widened (each window may extend beyond its
+    #     content by up to half its own 2*get_N floor). Adjacent clusters
+    #     across a non-splittable gap are FORCED into one window --
+    #     packing them to the cap boundary and merging later is exactly
+    #     the cascade that busts the width cap.
+    tol = 1e-9
+
+    def _splittable(left, right) -> bool:
+        # Floor-widening eats into the gap only by the EXCESS of the
+        # 2*get_N floor over each window's own content span (a window
+        # whose content already exceeds the floor is not widened).
+        span_l = left[1] - left[0]
+        span_r = right[1] - right[0]
+        ext_l = 0.5 * max(0.0, 2.0 * _s_edge(left[1]) - span_l)
+        ext_r = 0.5 * max(0.0, 2.0 * _s_edge(right[0]) - span_r)
+        gap_edges = (right[0] - left[1]) - ext_l - ext_r
+        need = sep_factor * (_s_edge(left[1]) + _s_edge(right[0]))
+        return gap_edges >= need * (1.0 + tol)
+
+    groups = [clusters[0]]
+    for cl in clusters[1:]:
+        if _splittable(groups[-1], cl):
+            groups.append(list(cl))
+        else:
+            groups[-1] = [
+                groups[-1][0], max(groups[-1][1], cl[1]),
+                groups[-1][2] + cl[2],
+            ]
+
+    # (c) EFFICIENCY packing: greedily merge adjacent groups while the
+    #     combined content span stays within the width cap. Fewer
+    #     occupied windows = fewer (temp, walker, band) cells; the
+    #     sources inside a window serialize (one pick round per source),
+    #     which the per-leaf VGB move handles cheaply.
+    windows = [groups[0]]
+    for grp in groups[1:]:
+        if (grp[1] - windows[-1][0]) <= w_cap:
+            windows[-1] = [
+                windows[-1][0], max(windows[-1][1], grp[1]),
+                windows[-1][2] + grp[2],
+            ]
+        else:
+            windows.append(list(grp))
+
+    # ---- 3+4. window edges (floor-widened, centered) + gap-feasibility
+    # merging, iterated to a fixed point ----
+    def _window_edges(win):
+        lo_c, hi_c, _ = win
+        span = hi_c - lo_c
+        mid = 0.5 * (lo_c + hi_c)
+        w = max(span, 2.0 * _s_edge(mid))
+        for _ in range(32):
+            w_next = max(span, 2.0 * _s_edge(mid + 0.5 * w))
+            if w_next <= w:
+                break
+            w = w_next
+        return mid - 0.5 * w, mid + 0.5 * w
+
+    tol = 1e-9
+    for _ in range(len(windows) + 1):
+        edges_w = [_window_edges(win) for win in windows]
+        merged = False
+        for k in range(len(windows) - 1):
+            gap = edges_w[k + 1][0] - edges_w[k][1]
+            need = sep_factor * (
+                _s_edge(edges_w[k][1]) + _s_edge(edges_w[k + 1][0])
+            )
+            if gap < need * (1.0 + 10 * tol):
+                lo_c = min(windows[k][0], windows[k + 1][0])
+                hi_c = max(windows[k][1], windows[k + 1][1])
+                members = windows[k][2] + windows[k + 1][2]
+                windows[k : k + 2] = [[lo_c, hi_c, members]]
+                merged = True
+                break
+        if not merged:
+            break
+    else:
+        raise RuntimeError("window merging did not converge.")
+
+    if any((hi - lo) > w_cap * (1.0 + tol) for lo, hi in edges_w):
+        warnings.warn(
+            "a must-merge VGB cluster exceeds the preset width cap "
+            f"({width_cap_layers:g} layers); the shared buffer slab extent "
+            "(band_slab_Nf) follows the widest band.",
+            stacklevel=2,
+        )
+
+    # ---- 5. assemble: guard filler, windows, odd filler counts ----
+    first_lo = edges_w[0][0]
+    lead_w = min(_w_floor(max(first_lo - w_cap, start_freq)), w_cap)
+    edge0 = max(float(start_freq), first_lo - max(lead_w, ldf))
+    if not (edge0 < first_lo):
+        raise ValueError(
+            f"VGB preset grid needs a guard band below {first_lo:.6e} Hz "
+            f"but start_freq={start_freq:.6e} Hz leaves no room; widen the "
+            "general band (prepare_vgb_branch guards should cover this)."
+        )
+    edges = [edge0]
+    window_band_inds = []
+    for k, (lo_w, hi_w) in enumerate(edges_w):
+        # Fillers between the previous edge (edge0, or the previous
+        # window's high edge) and this window's low edge. Band b spans
+        # [edges[b], edges[b+1]), so the window's band index is the list
+        # position its LOW edge is appended at; an ODD filler count
+        # between windows keeps every window at an odd index.
+        gap = lo_w - edges[-1]
+        if k == 0:
+            # the single leading guard band [edge0, lo_w)
+            assert gap > 0.0
+        else:
+            need = sep_factor * (_s_edge(edges[-1]) + _s_edge(lo_w))
+            k_max = max(1, int(np.floor(gap / max(need, tol * ldf))))
+            k_min = max(1, int(np.ceil(gap / w_cap - tol)))
+            n_fill = min(k_min, k_max)
+            # ODD filler count -> window index parity stays odd. Prefer
+            # one more (narrower) filler; only exceed the separation
+            # bound never, the width cap only when unavoidable.
+            if n_fill % 2 == 0:
+                n_fill = n_fill + 1 if n_fill + 1 <= k_max else n_fill - 1
+            if n_fill < 1 or gap / n_fill < need * (1.0 - tol):
+                raise RuntimeError(
+                    f"cannot place an odd filler count in the "
+                    f"[{edges[-1]:.6e}, {lo_w:.6e}] Hz gap (need "
+                    f"{need:.3e} Hz per filler); windows should have been "
+                    "merged."
+                )
+            base = edges[-1]
+            for kk in range(1, n_fill):
+                edges.append(base + gap * kk / n_fill)
+        window_band_inds.append(len(edges))  # position lo_w lands at
+        edges.append(lo_w)
+        edges.append(hi_w)
+    # trailing guard filler
+    last_hi = edges[-1]
+    trail_w = min(_w_floor(last_hi), w_cap)
+    edgeN = min(float(end_freq), last_hi + max(trail_w, ldf))
+    if not (edgeN > last_hi):
+        raise ValueError(
+            f"VGB preset grid needs a guard band above {last_hi:.6e} Hz "
+            f"but end_freq={end_freq:.6e} Hz leaves no room; widen the "
+            "general band."
+        )
+    edges.append(edgeN)
+    edges = np.asarray(edges, dtype=float)
+    window_band_inds = np.asarray(window_band_inds, dtype=int)
+
+    # ---- 6. validation ----
+    assert np.all(np.diff(edges) > 0.0), "preset edges must be ascending"
+    assert np.all(window_band_inds % 2 == 1), (
+        "preset windows must sit at ODD band indices (all in one "
+        "stride-2 unit)"
+    )
+    band_of = np.searchsorted(edges, f0, side="right") - 1
+    assert np.all((band_of >= 1) & (band_of <= len(edges) - 3)), (
+        "every VGB must live in an interior band"
+    )
+    assert set(band_of.tolist()) <= set(window_band_inds.tolist()), (
+        "every VGB must live inside a window band"
+    )
+    if validate:
+        check_band_support_separation(
+            edges, Tobs, int(unit_stride),
+            sep_factor=sep_factor, oversample=oversample, amp=amp,
+            context="vgb_preset_band_edges", enforce=True,
+        )
+
+    if return_meta:
+        lo_l = np.floor(edges[:-1] / ldf + 1e-6).astype(int)
+        hi_l = np.ceil(edges[1:] / ldf - 1e-6).astype(int)
+        meta = {
+            "window_band_inds": window_band_inds,
+            "window_sources": [
+                order[np.asarray(win[2], dtype=int)] for win in windows
+            ],
+            "max_band_span_layers": int(np.max(np.maximum(1, hi_l - lo_l))),
+            "num_windows": len(windows),
+        }
+        return edges, meta
+    return edges
 
 
 @dataclasses.dataclass
@@ -294,9 +631,27 @@ class VGBSettings(GBSettings):
     # (GB_BAND_EDGES_MODE=get_n) does NOT silently move the VGB band grid
     # (which has no RJ surface and whose stored per-band arrays would
     # otherwise also need migrating on resume). Set VGB_BAND_EDGES_MODE
-    # explicitly to opt VGB in.
+    # explicitly to opt VGB in. Besides the GB modes ("uniform"/"get_n"),
+    # VGB accepts "preset": a source-anchored grid from
+    # :func:`vgb_preset_band_edges` -- windows centered on the known
+    # catalogue sources (clusters share a window), don't-care filler
+    # bands between them, every window in ONE stride-2 unit. Fresh VGB
+    # storage required (the band-grid resume guard refuses a changed
+    # grid by design).
     band_edges_mode: str = dataclasses.field(
         default_factory=env_default("VGB_BAND_EDGES_MODE", "uniform", str)
+    )
+    # "preset" mode knobs. Width cap (WDM layers) for windows AND fillers:
+    # the sub-band buffer slab extent (band_slab_Nf) is ONE scalar sized by
+    # the widest band in the grid, so an uncapped band inflates every
+    # slot's slab memory and per-cell likelihood cost.
+    preset_width_cap_layers: float = dataclasses.field(
+        default_factory=env_default("VGB_PRESET_WIDTH_CAP_LAYERS", 8.0, float)
+    )
+    # Multiplier on each source's own FD half-support (get_N(A,f)/Tobs)
+    # when deciding window membership and extent.
+    preset_support_margin: float = dataclasses.field(
+        default_factory=env_default("VGB_PRESET_SUPPORT_MARGIN", 1.0, float)
     )
     band_target_count: int = dataclasses.field(
         default_factory=env_default("VGB_BAND_TARGET_COUNT", 0, int)
@@ -324,6 +679,13 @@ class VGBSetup(GBSetup):
         # VGB fdot prior is catalogue-derived in prepare_vgb_branch, so an
         # explicitly-set range survives.
         _fdot_lims_in = list(self.fdot_lims) if self.fdot_lims else None
+        if str(getattr(self, "band_edges_mode", "uniform")).lower() == "preset":
+            # VGB-only mode: GBSetup.init_band_structure would raise on an
+            # unknown mode, so the whole construction is handled here.
+            self._init_preset_band_structure()
+            if _fdot_lims_in is not None:
+                self.fdot_lims = _fdot_lims_in
+            return
         super().init_band_structure()
         if _fdot_lims_in is not None:
             self.fdot_lims = _fdot_lims_in
@@ -350,6 +712,117 @@ class VGBSetup(GBSetup):
                 "VGB band separations coarsened to %d WDM layers/band "
                 "(VGB_BAND_LAYERS): %d sub-bands.", L, self.num_sub_bands,
             )
+
+    def _init_preset_band_structure(self):
+        """Band structure for ``band_edges_mode='preset'``.
+
+        Source-anchored grid from :func:`vgb_preset_band_edges`: windows
+        centered on the fixed catalogue f0s (overlapping/nearby sources
+        share a window up to ``preset_width_cap_layers``), don't-care
+        filler bands between them, every window at an ODD band index so
+        stride-2 unit scheduling puts ALL proposal work in one unit pass.
+        Requires ``fixed_params`` (run :func:`prepare_vgb_branch` first)
+        and a WDM domain. RESUME NOTE: a preset grid differs from the
+        stored uniform grid, so resuming an existing store fails loudly in
+        ``initialize_band_information`` (band-grid mismatch) -- preset runs
+        need FRESH VGB storage (or a band-edge migration).
+        """
+        from gbgpu.utils.utility import get_N
+
+        from lisatools.domains import WDMSettings
+
+        from ...priors.gbpriors import get_fdot_mojito
+
+        if self.fixed_params is None:
+            raise ValueError(
+                "VGB_BAND_EDGES_MODE=preset needs the per-leaf fixed_params "
+                "(f0 table); run prepare_vgb_branch before building the "
+                "setup."
+            )
+        if not isinstance(self.domain_settings, WDMSettings):
+            raise NotImplementedError(
+                "VGB_BAND_EDGES_MODE=preset is implemented for the WDM "
+                "domain only (the width cap is expressed in WDM layers); "
+                "use 'uniform' on FD runs."
+            )
+        if self.oversample is None:
+            self.oversample = 2 if self.Tobs < YRSID_SI / 2.0 else 4
+        assert self.oversample >= 1
+
+        wdm = self.domain_settings
+        layer_df = float(wdm.layer_df)
+        # Clamp to the WDM active band exactly like GBSetup (edges outside
+        # [ind_min_f, ind_max_f] silently zero-fill).
+        wdm_min = float(wdm.ind_min_f * layer_df)
+        wdm_max = float(wdm.ind_max_f * layer_df)
+        start_freq = max(float(self.start_freq), wdm_min)
+        end_freq = min(float(self.end_freq), wdm_max)
+        if start_freq >= end_freq:
+            raise ValueError(
+                "WDM active band [{:.4e}, {:.4e}] does not overlap the VGB "
+                "frequency range.".format(wdm_min, wdm_max)
+            )
+
+        fixed = np.asarray(self.fixed_params, dtype=float)
+        f0_hz = fixed[:, vgb_fixed_basis(self).index("f0")] * 1e-3
+
+        L = int(getattr(self, "band_layers", 1) or 1)
+        if L > 1:
+            self.logger.info(
+                "VGB_BAND_LAYERS=%d is ignored in preset band-edge mode "
+                "(the preset builder sizes bands itself).", L,
+            )
+
+        # The preset design targets stride 2 (fillers between windows).
+        # The inherited GBSettings.band_unit_stride default reads the
+        # SHARED GB_BAND_UNIT_STRIDE env, so a GB-side stride experiment
+        # (e.g. 9) would silently drag VGB along; pin 2 here unless the
+        # user explicitly set the per-branch knob.
+        if os.environ.get("VGB_BAND_UNIT_STRIDE") is None:
+            if int(getattr(self, "band_unit_stride", 2)) != 2:
+                self.logger.info(
+                    "VGB preset band mode: band_unit_stride %s -> 2 (the "
+                    "preset design; set VGB_BAND_UNIT_STRIDE to override).",
+                    self.band_unit_stride,
+                )
+            self.band_unit_stride = 2
+
+        self.band_edges, _preset_meta = vgb_preset_band_edges(
+            f0_hz,
+            float(self.Tobs),
+            layer_df,
+            start_freq=start_freq,
+            end_freq=end_freq,
+            width_cap_layers=float(getattr(self, "preset_width_cap_layers", 8.0)),
+            support_margin=float(getattr(self, "preset_support_margin", 1.0)),
+            unit_stride=int(getattr(self, "band_unit_stride", 2)),
+            oversample=int(self.oversample),
+            validate=True,
+            return_meta=True,
+        )
+        self.band_N_vals = np.asarray(
+            [
+                get_N(1e-30, edge, self.Tobs, oversample=self.oversample).item()
+                for edge in self.band_edges[:-1]
+            ]
+        )
+        self.f0_lims = [self.band_edges[1].min(), self.band_edges[-2].max()]
+        self.fdot_lims = [
+            get_fdot_mojito(self.f0_lims[1], sign="-"),
+            get_fdot_mojito(self.f0_lims[1], sign="+"),
+        ]
+        self.num_sub_bands = len(self.band_edges) - 1
+        self.logger.info(
+            "[VGB_BAND_EDGES preset] %d sub-bands over [%.6e, %.6e] Hz: "
+            "%d source windows (odd band indices, all in one stride-2 "
+            "unit), %d filler bands; widest band spans %d WDM layers "
+            "(width cap %g).",
+            self.num_sub_bands, self.band_edges[0], self.band_edges[-1],
+            int(_preset_meta["num_windows"]),
+            self.num_sub_bands - int(_preset_meta["num_windows"]),
+            int(_preset_meta["max_band_span_layers"]),
+            float(getattr(self, "preset_width_cap_layers", 8.0)),
+        )
 
     def init_sampling_info(self):
         if self.fixed_params is None:

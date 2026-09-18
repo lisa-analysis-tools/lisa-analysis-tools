@@ -17,7 +17,11 @@
 #        INCLUDE_FSTAT=1  keep the fstat epoch caches (default: only
 #              DONE.json; the payload npzs are 100s of MB-GBs);
 #        KEEP  iterations of the big chains kept in the reduced store
-#              (default 5); N_JOB_LOGS  newest *.log files from the repo
+#              (default 5); COLD_KEEP  deeper window for the COLD chains
+#              only (default 12; ~1.4 MB/iteration vs ~22 MB/iteration
+#              for the all-rung family) so warmstart_fit_from_store.py
+#              gets a real --last-k 10 window from routine snapshots;
+#        N_JOB_LOGS  newest *.log files from the repo
 #              root to include (default 8);
 #        LOG_CAP_MB  when the run log exceeds this (default 200), ship a
 #              GREP-FILTERED full-history file + the raw tail instead of
@@ -29,6 +33,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."   # repo root (script lives in scripts/fstat_proposal)
 echo "make_snapshots @ $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 KEEP=${KEEP:-5}
+COLD_KEEP=${COLD_KEEP:-12}
 PYTHON=${PYTHON:-python}
 N_JOB_LOGS=${N_JOB_LOGS:-8}
 
@@ -52,7 +57,7 @@ for d in "${DIRS[@]}"; do
   fi
   echo "== $d  live store: $h5"
 
-  if ! "$PYTHON" scripts/diagnostics/gf_store_extract.py "$h5" --keep "$KEEP"; then
+  if ! "$PYTHON" scripts/diagnostics/gf_store_extract.py "$h5" --keep "$KEEP" --cold-keep "$COLD_KEEP"; then
     echo "== $d: extract FAILED, skipping archive"
     continue
   fi

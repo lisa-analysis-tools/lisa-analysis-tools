@@ -64,6 +64,12 @@ LISTED_CAP = 64 * 1024 * 1024
 # headline tracker) lives in them -- the 1-yr extract silently lost it
 # when inds/gb crossed SIZE_CAP (2026-08-22).
 FULL_ALWAYS = ("inds/gb", "inds/vgb")
+# COLD chains get their own (deeper) keep window: the warm-start fitter
+# (scripts/gb/warmstart_fit_from_store.py) needs --last-k ~10 of COLD
+# coords, and at ~1.4 MB/iteration gzip'd they are ~18x cheaper than the
+# all-rung sub_backend/gb/chain (~22 MB/iteration) that dominates the
+# LAST_K_ONLY family (measured on the 3mo_v8 it-182 extract, 2026-09-05).
+COLD_DEEP = ("chain/gb", "chain/vgb")
 
 
 def _wanted_rows(ds, keep, it):
@@ -74,7 +80,8 @@ def _wanted_rows(ds, keep, it):
     return lo, hi
 
 
-def extract(src_path, dst_path, keep, fallback_path=None):
+def extract(src_path, dst_path, keep, fallback_path=None, cold_keep=None):
+    cold_keep = keep if cold_keep is None else max(int(cold_keep), keep)
     src = h5py.File(src_path, "r")
     # A LIVE store is being written while we read: gzip'd chunks caught
     # mid-write fail with "filter returned failure during read"
@@ -107,7 +114,8 @@ def extract(src_path, dst_path, keep, fallback_path=None):
     except Exception:
         pass
     print(f"[extract] {src_path} -> {dst_path}  (iteration attr: {it}, "
-          f"keep last {keep} rows of the big iteration-axis datasets"
+          f"keep last {keep} rows of the big iteration-axis datasets, "
+          f"last {cold_keep} of the cold chains"
           + (f"; torn-read fallback: {fallback_path}" if fb else "") + ")")
     dst = h5py.File(dst_path, "w")
     stats = {"full": 0, "partial": 0, "bytes_in": 0}
@@ -149,7 +157,9 @@ def extract(src_path, dst_path, keep, fallback_path=None):
             d = dst.create_dataset(name, shape=obj.shape, dtype=obj.dtype,
                                    chunks=chunks, compression="gzip",
                                    compression_opts=4, fillvalue=0)
-            lo, hi = _wanted_rows(obj, keep, it)
+            this_keep = (cold_keep if any(name.endswith(s)
+                                          for s in COLD_DEEP) else keep)
+            lo, hi = _wanted_rows(obj, this_keep, it)
             for r in range(lo, hi):
                 val = _read(name, r)
                 if val is not None:
@@ -187,9 +197,14 @@ def main():
     ap.add_argument("out", nargs="?", default=None)
     ap.add_argument("--keep", type=int, default=3,
                     help="iterations of the big chains to keep (default 3)")
+    ap.add_argument("--cold-keep", type=int, default=None,
+                    help="deeper window for the COLD chains "
+                         "(chain/gb, chain/vgb) so the warm-start fitter "
+                         "gets a real --last-k window; default: same as "
+                         "--keep, never less")
     a = ap.parse_args()
     out = a.out or a.store.replace(".h5", "_extract.h5")
-    extract(a.store, out, a.keep)
+    extract(a.store, out, a.keep, cold_keep=a.cold_keep)
     return 0
 
 

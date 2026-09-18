@@ -2,10 +2,29 @@
 
 The status page (``gf_monitor_gen.py``) quotes every completeness / purity /
 per-source recovery number against ONE frozen set: the catalogue galactic
-binaries detectable (optimal SNR > 7) over 3-21.94 mHz under the v3 run's own
-fitted noise at iteration 78. The original build script lived in a session
-scratchpad and was lost -- which is why this one is IN the repo. Committed
-2026-08-19; validated by reproducing the original count (812 detectable).
+binaries detectable (optimal SNR > 7) over the analysed GB band under the
+run's own fitted noise at a chosen iteration. The original build script lived
+in a session scratchpad and was lost -- which is why this one is IN the repo.
+Committed 2026-08-19; validated by reproducing the original count (812
+detectable over the then-hardcoded 3-21.94 mHz).
+
+THE BAND IS THE RUN'S BAND (2026-08-23). It used to be hardcoded at
+3-21.94 mHz, which quietly threw away the bottom 82% of the GB band: the
+run's own ``sub_backend/gb/band_edges`` starts at 5.5555556e-4 Hz
+(0.5556 mHz), not at 3 mHz, so every page built on the old denominator was
+reporting completeness against a sixth of the frequency range the sampler
+actually works in. ``--flo``/``--fhi`` now set the band, defaulting to the
+full GB band, and the band actually used is stamped into BOTH output npz
+files so the monitor can quote it rather than assume it.
+
+A WARNING ABOUT THE LOW-FREQUENCY END. ``det`` is and remains an SNR
+statement: optimal SNR > 7 against a sensitivity that already includes the
+fitted galactic foreground, so the confusion background is accounted for in
+the DENOMINATOR of the SNR. It is not a resolvability statement. Below
+~3 mHz the catalogue puts many sources in every frequency bin, and a source
+can clear SNR 7 while being hopelessly blended with its neighbours. Read the
+sub-3 mHz part of this set as "carries enough signal power to matter", not
+as "is individually recoverable".
 
 DETECTABILITY IS PER-TOBS. The observation time sets the FD bin width, the
 waveform duration and hence the optimal SNR itself, so a truth set is only
@@ -40,9 +59,13 @@ waveform set to the plausibly-detectable tail; the same curve is written to
 Usage::
 
     OMP_NUM_THREADS=1 python scripts/diagnostics/build_truth.py \
-        STORE.h5 [--iteration 78] [--out gb_truth_3to21.npz] [--tobs SEC]
+        STORE.h5 [--iteration 78] [--out gb_truth_3to21.npz] [--tobs SEC] \
+        [--flo 5.5555556e-4] [--fhi 2.1944444e-2]
 
-Runs on CPU in a few minutes. Keep the thread pins: laptop policy.
+Runs on CPU. Over the full band the catalogue contributes ~240k in-band rows
+instead of the ~4.7k above 3 mHz; the kappa prefilter still cuts most of
+them, but expect tens of thousands of waveforms and tens of minutes rather
+than a few. Keep the thread pins: laptop policy.
 """
 
 from __future__ import annotations
@@ -54,7 +77,10 @@ import sys
 import numpy as np
 import h5py
 
-FLO, FHI = 3e-3, 21.94e-3
+# The GB band the runs actually analyse: ``sub_backend/gb/band_edges[0]`` and
+# ``[-1]`` of every erebor store in this campaign (155 edges, 0.5556 mHz to
+# 21.9444 mHz). Read off the v4 3-month and v5 1-year stores, not assumed.
+FLO, FHI = 5.5555555556e-4, 2.1944444444e-2
 SNR_DET = 7.0
 TOBS_3MO = 7776000.0   # the original 3-month set; also the fallback Tobs
 DT = 2.5
@@ -127,8 +153,8 @@ def sens_grids(psd_p, gal_p, df):
     return sa, se
 
 
-def catalogue_phys(t_ref):
-    """(N,9) GBGPU physical rows for every catalogue GB in [FLO, FHI].
+def catalogue_phys(t_ref, flo=FLO, fhi=FHI):
+    """(N,9) GBGPU physical rows for every catalogue GB in [flo, fhi].
 
     Column conventions copied from the run's own catalogue path
     (``gb_catalogue_to_sampling_basis`` handles the epoch shift and ICRS
@@ -140,7 +166,7 @@ def catalogue_phys(t_ref):
     with h5py.File(MOJITO_CAT, "r") as f:
         b = f["Binaries"]
         f0 = np.asarray(b["GW22FrequencySSBFrame"][:], float)
-        sel = (f0 >= FLO) & (f0 <= FHI)
+        sel = (f0 >= flo) & (f0 <= fhi)
         entry = {k: np.asarray(b[k][sel]) for k in (
             "Amplitude", "GW22FrequencySSBFrame",
             "GW22FrequencyDerivativeSourceFrame", "InclinationAngle",
@@ -157,7 +183,7 @@ def catalogue_phys(t_ref):
     return phys
 
 
-def opt_snr(phys, sa, se, gbw, df, tobs, nw):
+def opt_snr(phys, sa, se, gbw, df, tobs, nw, batch=20000):
     """Optimal SNR of each row: 4 df sum(|A|^2/SA + |E|^2/SE), sqrt.
 
     ``tobs`` is the run's observation time -- it enters BOTH the waveform
@@ -166,7 +192,11 @@ def opt_snr(phys, sa, se, gbw, df, tobs, nw):
     sampled on that same ``df`` grid.
     """
     out = np.zeros(len(phys))
-    B = 20000
+    # One batch holds ``batch x nw`` complex A and E. That was harmless at
+    # 4.7k rows and nw=128; over the full band the kept set is tens of
+    # thousands and a 1-year build carries nw=512, so the knob is exposed --
+    # drop it on a memory-constrained host rather than editing this file.
+    B = int(batch)
     for lo in range(0, len(phys), B):
         p = phys[lo:lo + B]
         gbw.run_wave(*[np.ascontiguousarray(p[:, k]) for k in range(9)],
@@ -196,13 +226,27 @@ def main(argv=None):
     ap.add_argument("--nw", type=int, default=None,
                     help="FD points per waveform; default: 128 scaled by "
                          "Tobs/3 months, rounded up to a power of two")
+    ap.add_argument("--flo", type=float, default=FLO,
+                    help=f"band floor [Hz]; default {FLO:.10g} = the GB "
+                         "band_edges[0] of the erebor stores")
+    ap.add_argument("--fhi", type=float, default=FHI,
+                    help=f"band ceiling [Hz]; default {FHI:.10g} = the GB "
+                         "band_edges[-1] of the erebor stores")
+    ap.add_argument("--batch", type=int, default=20000,
+                    help="waveform rows per run_wave call (default 20000); "
+                         "lower it if the build runs out of memory")
     a = ap.parse_args(argv)
 
+    flo, fhi = float(a.flo), float(a.fhi)
+    if not (0 < flo < fhi):
+        ap.error(f"need 0 < --flo < --fhi (got {flo}, {fhi})")
     tobs = float(a.tobs) if a.tobs else store_tobs(a.store)
     nw = int(a.nw) if a.nw else nw_for(tobs)
     df = 1.0 / tobs
     print(f"Tobs = {tobs:.1f} s ({tobs / 86400.0:.1f} d), df = {df:.4g} Hz, "
           f"N per waveform = {nw}")
+    print(f"band = [{flo:.10g}, {fhi:.10g}] Hz "
+          f"({flo * 1e3:.4g}-{fhi * 1e3:.4g} mHz)")
     psd_p, gal_p = fitted_noise(a.store, a.iteration)
     print(f"noise @ it {a.iteration}: psd={psd_p} galfor={gal_p}")
     sa, se = sens_grids(psd_p, gal_p, df)
@@ -214,13 +258,20 @@ def main(argv=None):
     orb = lisa_models.DefaultOrbits(force_backend="cpu", frame="icrs")
     gbw = GBGPU(force_backend="cpu", orbits=orb, t0=float(GB_MOJITO_T_REF))
 
-    phys = catalogue_phys(GB_MOJITO_T_REF)
-    print(f"catalogue rows in [{FLO}, {FHI}] Hz: {len(phys)}")
+    phys = catalogue_phys(GB_MOJITO_T_REF, flo, fhi)
+    print(f"catalogue rows in [{flo:.10g}, {fhi:.10g}] Hz: {len(phys)}")
 
     # ---- kappa prefilter -------------------------------------------------
     # Best-case-orientation unit-SNR curve on a coarse grid: face-on,
     # psi=phi0=0, one sky draw per node maximised over 8 sky positions.
-    fgrid = np.geomspace(FLO, FHI, 48)
+    # Node count scales with the LOG SPAN so the grid keeps the density the
+    # 48-node 3-21.94 mHz grid had (48 nodes / 0.864 decades). A wider band on
+    # a fixed node count would interpolate the kappa curve across the galactic
+    # knee, and the prefilter reads that curve as a ceiling -- a sagging
+    # interpolant there silently drops real sources before any waveform runs.
+    _NK_REF, _SPAN_REF = 48, np.log10(21.94e-3 / 3e-3)
+    _nk = max(int(round(_NK_REF * np.log10(fhi / flo) / _SPAN_REF)), _NK_REF)
+    fgrid = np.geomspace(flo, fhi, _nk)
     kap = np.zeros(fgrid.size)
     A0 = 1e-22
     for isky in range(8):
@@ -235,11 +286,13 @@ def main(argv=None):
     keep = phys[:, 0] * np.interp(phys[:, 1], fgrid, kap) > 0.5 * SNR_DET
     print(f"kappa prefilter keeps {keep.sum()} / {len(phys)}")
     # keys are the monitor's contract: kappa_grid.npz carries fgrid/fit. The
-    # curve is a unit-SNR ceiling under THIS Tobs, so stamp it too.
-    np.savez(a.kappa_out, fgrid=fgrid, fit=kap, tobs=np.array(tobs))
+    # curve is a unit-SNR ceiling under THIS Tobs over THIS band, so stamp
+    # both -- the monitor draws the curve only over the band it was built on.
+    np.savez(a.kappa_out, fgrid=fgrid, fit=kap, tobs=np.array(tobs),
+             band=np.array([flo, fhi]))
 
     snr = np.zeros(len(phys))
-    snr[keep] = opt_snr(phys[keep], sa, se, gbw, df, tobs, nw)
+    snr[keep] = opt_snr(phys[keep], sa, se, gbw, df, tobs, nw, a.batch)
     det = snr > SNR_DET
     print(f"DETECTABLE (SNR > {SNR_DET}): {det.sum()}")
 
@@ -247,7 +300,7 @@ def main(argv=None):
         a.out, f0=phys[:, 1], amp=phys[:, 0], snr=snr, det=det, phys=phys,
         store=np.array(a.store), iteration=np.array(a.iteration),
         psd_params=psd_p, galfor_params=gal_p,
-        band=np.array([FLO, FHI]), tobs=np.array(tobs), nw=np.array(nw))
+        band=np.array([flo, fhi]), tobs=np.array(tobs), nw=np.array(nw))
     print(f"wrote {a.out}")
     return 0
 
