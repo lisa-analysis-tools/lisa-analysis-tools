@@ -25,9 +25,9 @@
 #                                               the bytes, so ~4x the count
 #                                               holds the byte budget)
 #   GB_RJ_INMODEL_CHUNK     32768 -> 65536     (same byte-parity argument)
-#   SIGHET_NT_LAYER           120 -> unset     (the 36-h stride parity value
-#                                               at 6mo; the 3mo arm took the
-#                                               default and this restores it)
+#   SIGHET_NT_LAYER           120 -> unset     (see the note below -- the
+#                                               DEFAULT 64 is the 3mo value of
+#                                               the SAME 36-h prescription)
 #   EDGE_CROP_WAVELETS         60 -> unset     (REQUIRED at 6 mo because the
 #                                               sig-het taper ceil(0.5 x 0.01
 #                                               x 4320) = 22, +8 = 30 exceeds
@@ -51,6 +51,36 @@
 #                                               without it)
 #   BASE_FILE_NAME    gf_prod_6mo -> gf_prod_3mo, STORE_DIR/job name/log to
 #                                               match.
+#
+# --- WHY SIGHET_NT_LAYER IS LEFT AT THE DEFAULT (asked 2026-09-18) ---
+# The knob is a sparse-time NODE COUNT, not an accuracy dial you read
+# directly: gbgpu._resolve_nt_layer snaps it to the nearest divisor of Nt
+# and the engine uses stride = Nt // nt_layer. A WDM layer here is
+# Nf*dt = 1440*2.5 = 3600 s EXACTLY, so stride reads off in hours:
+#
+#     3mo (Nt=2160)  default 64 -> snaps to  60 -> stride 36 -> 36 h
+#     6mo (Nt=4320)  default 64 -> snaps to  60 -> stride 72 -> 72 h
+#     6mo (Nt=4320)  explicit 120            120 -> stride 36 -> 36 h
+#
+# So the 6mo file sets 120 precisely BECAUSE its default would be twice as
+# coarse, and 120 at 6 months is the same 36-h sparse density the 3mo
+# default already gives. Leaving it unset here is not accepting a lower
+# accuracy -- it IS the 6mo prescription, at 3 months. (The constant-
+# density rule is the accuracy studies' finding; SIGHET_NT_LAYER=-1 is an
+# AUTO mode that targets 35 h and reproduces 60 / 120 / 240 at 3mo / 6mo /
+# 1yr. It is not used because AUTO is device-CLAMPED -- it silently
+# coarsens if the fstat shared budget does not fit -- while an explicit
+# value fails loudly instead, which is what a production accuracy
+# prescription should do.)
+#
+# Going FINER is a memory decision, not a free one: the sig-het stash is
+# LINEAR in N_sparse_t (~0.28 GB per node, measured). 3mo at 120 (18 h)
+# costs ~34 GB and is affordable; 3mo at 270 (8 h) costs ~77 GB and OOM'd a
+# v4 launch on a 99.9 GB device (2026-08-18). At 6 months the shipped 120
+# ALREADY costs ~34 GB, so the 18-h step there (240) would be ~68 GB and
+# will not fit alongside the band preload. Measured accuracy at 36 h is
+# eps_delta ~ 0.07-0.13 x T, and the sampler only ever sees a DELTA scored
+# against the same reference, so the constant part cancels exactly.
 #
 # --- OFF IN THIS VARIANT ---
 #   MBHB_IDS / EMRI_IDS / SOBHB_IDS are EMPTY, so _source_ids_from_env()
