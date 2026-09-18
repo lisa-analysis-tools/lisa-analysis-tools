@@ -67,6 +67,7 @@ __all__ = [
     "clear_stage_b_parts",
     "run_stacked_stage_b",
     "run_fstat_grid_fit",
+    "comb_cache_usable",
     "stacked_grid_path",
     "stage_b_complete",
     "build_gb_birth_distribution",
@@ -1063,7 +1064,14 @@ def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
                  band_edges=np.asarray(band_edges_hz, dtype=float),
                  F_all=F_max_host[None, :], sky_alpha=_al_top,
                  sky_sin_delta=_sd_top, best_alpha=best_al_host,
-                 best_sin_delta=best_sd_host, nsky_per_node=nsky_per_node)
+                 best_sin_delta=best_sd_host, nsky_per_node=nsky_per_node,
+                 # WHAT RESIDUAL THIS SCAN WAS SCORED AGAINST. The same
+                 # string that salts the in-flight progress files -- epoch,
+                 # GB_FSTAT_GB_FREE, and (the reason it is here) the
+                 # reference walker. A FINISHED comb is not a checkpoint, so
+                 # nothing used to test it: it was reloaded on file
+                 # existence alone. See :func:`comb_cache_usable`.
+                 fingerprint_extra=fingerprint_extra)
         logger.info("[cache] wrote %s", comb_cache)
         # The comb npz is now the durable artifact; drop the per-level
         # progress files so a later knob change can't resurrect stale rows.
@@ -1771,6 +1779,57 @@ def run_stacked_stage_b(call_fstat: Callable, peaks, *, xp, Tobs: float,
 # orchestrator
 # --------------------------------------------------------------------------
 
+def comb_cache_usable(comb_cache: str, fingerprint_extra: str) -> bool:
+    """Is this FINISHED comb scan the one THIS fit would have run?
+
+    ``fingerprint_extra`` salts :func:`ckpt_fingerprint`, i.e. the in-flight
+    PROGRESS files only. A completed ``*_comb.npz`` is not a checkpoint, so
+    until this existed it was reloaded on ``os.path.exists`` alone -- and a
+    refit whose reference walker moved re-selected its peak BOXES from the
+    previous walker's scan while stage B then scored inside those boxes at
+    the NEW reference. Two residuals stitched into one fit, with nothing
+    anywhere to say so.
+
+    That is not hypothetical: 6mo epoch 1 hit exactly it (the global argmax
+    moved from walker 0 to walker 2 across a restart). It was ruled a known
+    limitation on 2026-09-17 because the effect is proposal quality, not
+    correctness -- births are MH-corrected -- and because rescanning cost
+    the full 47-minute serial comb. Stage A is split now, so the rescan is
+    ~12 minutes and the limitation is not worth keeping.
+
+    A cache with NO stamp is a legacy one, written before this landed. It is
+    REUSED, with a warning: refusing it would throw away a finished comb on
+    the first restart of every fit currently in flight, which is the exact
+    cost this is meant to avoid -- and it is no worse than the behavior that
+    wrote it. An UNREADABLE one is refused (there is nothing to reuse).
+    """
+    try:
+        with np.load(comb_cache, allow_pickle=False) as d:
+            stamp = (str(d["fingerprint_extra"])
+                     if "fingerprint_extra" in d else None)
+    except (OSError, ValueError) as exc:
+        logger.warning("[fit] comb cache %s could not be read (%s: %s); "
+                       "re-running the comb scan.", comb_cache,
+                       exc.__class__.__name__, exc)
+        return False
+    if stamp is None:
+        logger.warning(
+            "[fit] comb cache %s carries no reference-walker stamp (written "
+            "before the salt landed), so it cannot be checked against this "
+            "fit's %r -- reusing it. If this fit's reference walker moved, "
+            "its peak boxes come from the PREVIOUS walker's scan; delete the "
+            "file to force a clean rescan.", comb_cache, fingerprint_extra)
+        return True
+    if stamp != fingerprint_extra:
+        logger.info(
+            "[fit] comb cache %s was scored against a different reference "
+            "(%r, this fit is %r) -- re-running the comb scan rather than "
+            "selecting peaks from another walker's residual.",
+            comb_cache, stamp, fingerprint_extra)
+        return False
+    return True
+
+
 def stacked_grid_path(cache_dir: str) -> str:
     """The stage-B output npz ``run_fstat_grid_fit`` writes and reloads.
 
@@ -1821,8 +1880,9 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
 
     * ``<cache_dir>/fstat_grid_peaks_stacked.npz`` present -> load and return
       (the fit is done; nothing recomputed).
-    * ``<cache_dir>/fstat_grid_comb.npz`` present -> reload the comb, re-select
-      peaks (cheap, deterministic), run only stage B.
+    * ``<cache_dir>/fstat_grid_comb.npz`` present AND scored against this
+      fit's reference (:func:`comb_cache_usable`) -> reload the comb,
+      re-select peaks (cheap, deterministic), run only stage B.
     * otherwise -> run both stages.
 
     Returns ``(stacked_or_None, n_peaks)``.
@@ -1867,7 +1927,8 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
     # Measured at 6mo epoch 1 before the split: 2804 s on ONE GPU against
     # stage B's 3068 s on four, i.e. 48% of the epoch.
     _t_stage_a = time.time()
-    if os.path.exists(comb_cache):
+    if os.path.exists(comb_cache) and comb_cache_usable(
+            comb_cache, fingerprint_extra):
         d = np.load(comb_cache, allow_pickle=False)
         logger.info("[fit] reusing comb cache %s; re-selecting peaks",
                     comb_cache)

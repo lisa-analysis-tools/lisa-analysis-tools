@@ -23244,17 +23244,20 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             # rows into one grid. With ``wref`` in the key those CHECKPOINTS
             # are invalid and each sweep restarts cleanly.
             #
-            # WHAT IT DOES NOT COVER -- the ruled known limitation (2026-09-17;
-            # docs/multirank-cluster-gates.md Step 5 item 1 carries the full
-            # text): ``fingerprint_extra`` salts ``ckpt_fingerprint``, i.e.
-            # the in-flight PROGRESS files only. A COMPLETED
-            # ``*_comb.npz`` is not a checkpoint -- ``run_fstat_grid_fit``
-            # reloads it on ``os.path.exists`` alone and re-selects peaks
-            # from it -- so a restart whose argmax moved still chooses its
-            # peak BOXES from the old walker's comb scan, and only the
-            # stage-B values inside those boxes are guaranteed to be scored
-            # at the new reference. A proposal-quality effect, not a
-            # correctness one (births are MH-corrected).
+            # IT NOW COVERS THE FINISHED COMB TOO. ``fingerprint_extra``
+            # salts ``ckpt_fingerprint``, i.e. the in-flight PROGRESS files
+            # -- and a COMPLETED ``*_comb.npz`` is not a checkpoint, so it
+            # used to be reloaded on ``os.path.exists`` alone: a restart
+            # whose argmax moved chose its peak BOXES from the old walker's
+            # comb scan while stage B scored inside them at the new
+            # reference (the ruled 2026-09-17 limitation; 6mo epoch 1 hit it
+            # when the argmax moved from walker 0 to walker 2).
+            # ``run_comb_scan`` now STAMPS this string into the npz and
+            # ``comb_cache_usable`` refuses a mismatch, so a moved argmax
+            # rescans cleanly instead of stitching two residuals' rows into
+            # one fit. Affordable because stage A is split now (~12 min at
+            # 6mo, against the 47 it cost serially, which is why the
+            # limitation was ruled acceptable at the time).
             # ``DONE.json``'s ``walker_ref`` stays the audit trail; this is
             # the enforcement.
             fingerprint_extra=fingerprint_extra,

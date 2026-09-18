@@ -3789,16 +3789,20 @@ class EpochFitGateTest(unittest.TestCase):
         self.assertFalse(
             any("[ckpt] resuming" in m for m in captured.output),
             "nothing of the old walker's sweep may be reused")
-        # THE KNOWN LIMITATION, PINNED RATHER THAN IMPLIED AWAY (Task 10 I-1,
-        # ruled LEAVE AS IS 2026-09-17): ``|wref=`` salts the CHECKPOINTS.
-        # The COMPLETED comb npz is not one -- ``run_fstat_grid_fit`` reloads
-        # it on ``os.path.exists`` alone -- so the moved walker re-selects its
-        # peak BOXES from the old walker's comb scan. If this line ever stops
-        # firing here, stage A has started being fingerprinted too and the
-        # runbook's Step 5 item 1 limitation can be deleted.
-        self.assertTrue(
+        # THE FORMER KNOWN LIMITATION (Task 10 I-1, ruled LEAVE AS IS
+        # 2026-09-17, FIXED once stage A was split): ``|wref=`` salts the
+        # CHECKPOINTS, and a COMPLETED comb npz is not one -- so the moved
+        # walker used to re-select its peak BOXES from the old walker's comb
+        # scan while stage B scored inside them at the new reference. The
+        # scan is stamped with ``fingerprint_extra`` now, so it rescans.
+        self.assertFalse(
             any("reusing comb cache" in m for m in captured.output),
-            "today's behaviour: the finished comb is reloaded unfingerprinted")
+            "a moved reference walker must not re-select peaks from the "
+            "previous walker's finished comb scan")
+        self.assertTrue(
+            any("scored against a different reference" in m
+                for m in captured.output),
+            "the refusal must say WHY the comb was rescanned")
 
     def test_the_fingerprint_names_the_reference_walker(self):
         import inspect
