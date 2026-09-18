@@ -48,6 +48,7 @@ Runs on CPU in a few minutes. Keep the thread pins: laptop policy.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -99,16 +100,42 @@ def nw_for(tobs):
     return int(min(2 ** int(np.ceil(np.log2(n))), 2048))
 
 
+def galfor_log_sampling_of(store) -> bool:
+    """``noise_model_identity["galfor_log_sampling"]`` for this STORE.
+
+    Read it off the store, never off the environment: the env var describes
+    the current process, while the stored numbers were written in whatever
+    basis that run used. A store predating the key is linear.
+    """
+    from lisatools.globalfit.stock.erebor.noise import read_noise_model_identity
+
+    return bool(read_noise_model_identity(store).get("galfor_log_sampling", False))
+
+
 def fitted_noise(store, it):
-    """Cold-chain median psd + galfor params at ``it`` (the monitor's own
-    ``np.median(psd_cold[-1], axis=0)`` evaluated at a chosen row)."""
+    """Cold-chain median psd + galfor params at ``it``, in PHYSICAL units.
+
+    The galfor row is de-log10'd when the store says so -- see
+    :func:`~lisatools.globalfit.stock.erebor.noise.galfor_params_to_physical`.
+    Handing the raw log10 row to the foreground model gives a negative
+    ``amp``/``f_1`` and NaN sensitivity, which showed up here not as a crash
+    but as an ALL-ZERO ``snr`` and an all-False ``det`` -- a silently empty
+    truth set that still passes a "psd/galfor are nonzero" sanity check.
+
+    The median is taken in the SAMPLING basis and converted afterwards,
+    matching what the sampler and the monitor page both do; for the log
+    columns that is a geometric median-of-logs, which is the meaningful
+    centre for a quantity spanning decades.
+    """
+    from lisatools.globalfit.stock.erebor.noise import galfor_params_to_physical
+
     with h5py.File(store, "r") as f:
         g = f["global_fit"]
         psd = np.median(np.asarray(g["chain"]["psd"][it, 0, 0, :, 0, :]),
                         axis=0)
         gal = np.median(np.asarray(g["chain"]["galfor"][it, 0, 0, :, 0, :]),
                         axis=0)
-    return psd, gal
+    return psd, galfor_params_to_physical(gal, galfor_log_sampling_of(store))
 
 
 def sens_grids(psd_p, gal_p, df):

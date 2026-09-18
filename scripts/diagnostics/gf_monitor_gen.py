@@ -570,9 +570,29 @@ fig_b64(fig, "ll")
 # foreground coming down as sources leave the residual. Two panels, both
 # answerable at a glance.
 psd_cold = psd_c[:, 0, :, 0, :]                     # (it, 24, 2)
-gal_cold = gal_c[:, 0, :, 0, :]                     # (it, 24, 5)
+gal_cold = gal_c[:, 0, :, 0, :]                     # (it, 24, 5)  SAMPLING basis
 SOMS_INJ, SA_INJ = 1.496182e-11, 2.982412e-15
-GAL_NAMES = ["log10 amp", "p1", "log10 fknee", "p2", "slope"]
+
+# Under GALFOR_LOG_SAMPLING the four log columns are stored as log10 while
+# alpha stays linear. The trace/histogram panels want the SAMPLING basis
+# (that is what the chain actually explores, and what its prior is uniform
+# in); every sensitivity evaluation wants the PHYSICAL one. Keeping both and
+# labelling them correctly is the whole fix -- feeding the raw log10 row to
+# the foreground model makes amp and f_1 negative, so (f/f_1)**alpha is NaN
+# and the entire data/template/residual block raises. That surfaced as a
+# fatal KeyError: 'nbins' far downstream, with no page written at all.
+from lisatools.globalfit.stock.erebor.noise import (
+    GALFOR_BASIS, GALFOR_LOG_PARAMS, galfor_params_to_physical,
+    read_noise_model_identity,
+)
+
+# The store's OWN basis flag -- never an env var, which describes the current
+# process rather than the run that wrote these numbers.
+GALFOR_LOG = bool(
+    read_noise_model_identity(h5path).get("galfor_log_sampling", False))
+gal_cold_phys = galfor_params_to_physical(gal_cold, GALFOR_LOG)
+GAL_NAMES = [("log10 " + n) if (GALFOR_LOG and n in GALFOR_LOG_PARAMS) else n
+             for n in GALFOR_BASIS]
 
 _nsh = min(3, SUB_NIT)
 fig, ax = plt.subplots(1, 2, figsize=(11, 3.0))
@@ -619,7 +639,7 @@ try:
     fig, ax = plt.subplots(figsize=(11, 4.0))
     for k in range(SUB_NIT):
         pk_ = np.median(psd_cold[k], axis=0)
-        gk = np.median(gal_cold[k], axis=0)
+        gk = np.median(gal_cold_phys[k], axis=0)
         ax.plot(fr, sens_curves(pk_[0], pk_[1], gk),
                 color=ramp(k / max(SUB_NIT - 1, 1)), lw=1.1,
                 label=(f"iteration {k}" if k in (0, SUB_NIT - 1) else None))
@@ -688,7 +708,7 @@ try:
                                stochastic_function=HTGF)
 
     pm = np.median(psd_cold[-1], axis=0)
-    gm = np.median(gal_cold[-1], axis=0)
+    gm = np.median(gal_cold_phys[-1], axis=0)
     fig, ax = plt.subplots(figsize=(11, 4.2))
     ax.plot(fr, sens_lisasens(*pm), color=CYAN, lw=1.6, label="instrument PSD")
     ax.plot(fr, sens_lisasens(pm[0], pm[1], gm), color=AMBER, lw=1.6,
@@ -708,7 +728,7 @@ try:
             label="instrument PSD (latest)")
     for k in range(SUB_NIT):
         pk_ = np.median(psd_cold[k], axis=0)
-        gk = np.median(gal_cold[k], axis=0)
+        gk = np.median(gal_cold_phys[k], axis=0)
         ax.plot(fr, sens_lisasens(pk_[0], pk_[1], gk),
                 color=ramp2(k / max(SUB_NIT - 1, 1)), lw=1.1,
                 label=f"iter {k}" if k in (0, SUB_NIT - 1) else None)
@@ -1673,7 +1693,7 @@ try:
     from lisatools.stochastic import (
         HyperbolicTangentGalacticForeground as _HTGF)
     _pm = np.median(psd_cold[-1], axis=0)
-    _gm = np.median(gal_cold[-1], axis=0)
+    _gm = np.median(gal_cold_phys[-1], axis=0)
     _lmod = lisa_models.LISAModel(_pm[0] ** 2, _pm[1] ** 2,
                                   lisa_models.DefaultOrbits(), "sampled")
     _fpos = np.maximum(_fr, FDS.df)
@@ -2023,7 +2043,7 @@ if TRU is not None:
             make_gb_transform_container)
 
         _psd_p = np.median(psd_cold[-1], axis=0)
-        _gal_p = np.median(gal_cold[-1], axis=0)
+        _gal_p = np.median(gal_cold_phys[-1], axis=0)
         _lm = lisa_models.LISAModel(_psd_p[0] ** 2, _psd_p[1] ** 2,
                                     lisa_models.DefaultOrbits(), "sampled")
         _nk = dict(model=_lm, stochastic_params=tuple(_gal_p),
@@ -3543,22 +3563,36 @@ if SCI and not SHOW_MATCH_STATS:
         "the same distribution for the injections. Sub-bin spacing in the "
         "model relative to the injections indicates template sharing.")
 
-if DTR:
+# A PARTIAL DTR means the data/template/residual analysis raised partway
+# through -- it is truthy but missing the keys the captions read. Rendering
+# "nan of 0 bins" would be worse than saying nothing, so report it as a
+# MISSING section instead. (Before 2026-09-18 this path hard-indexed
+# _d['nbins'] and killed the whole page with a KeyError, which is how the
+# galfor log-sampling bug above surfaced.)
+if DTR and "nbins" not in DTR:
+    MISSING.append(
+        "data/template/residual captions skipped: the DTR analysis did not "
+        "complete (no 'nbins'), so its summary numbers do not exist. The "
+        "panels above are whatever it managed to produce. Most likely cause "
+        "is a NaN sensitivity curve -- check the galfor sampling basis.")
+if DTR and "nbins" in DTR:
     _d = DTR
     cap_f1 = (
         f"Power spectral density of the TDI X channel &mdash; not a strain "
         f"amplitude, and not an ASD. The gap between the instrument curve and "
         f"their sum is the galactic confusion, at most a factor "
         f"{_d.get('conf_ratio', float('nan')):.2f} in power, near "
-        f"{_d.get('conf_f', float('nan')) * 1e3:.1f} mHz. {_d['n_gb']} "
-        f"galactic-binary and {_d['n_vgb']} verification-binary templates are "
-        f"subtracted here.")
+        f"{_d.get('conf_f', float('nan')) * 1e3:.1f} mHz. "
+        f"{_d.get('n_gb', '?')} "
+        f"galactic-binary and {_d.get('n_vgb', '?')} verification-binary "
+        f"templates are subtracted here.")
     cap_f1b = (
         f"Lower panel: residual power over the fitted noise-plus-foreground "
         f"model, coloured by the Anderson&ndash;Darling Gaussianity p-value of "
         f"the whitened residual &mdash; dark bins are where the model is still "
         f"incomplete. The residual stays above the instrument-only curve in "
-        f"{_d['nbins'] - _d['undersub']} of {_d['nbins']} bins; "
+        f"{_d.get('nbins', 0) - _d.get('undersub', 0)} of "
+        f"{_d.get('nbins', 0)} bins; "
         f"{_d['undersub']} dip below it, spanning "
         f"{_d.get('undersub_lo', float('nan')) * 1e3:.1f}&ndash;"
         f"{_d.get('undersub_hi', float('nan')) * 1e3:.1f} mHz, and the "
@@ -3576,7 +3610,7 @@ else:
 # ---- captions for the restored data/template/residual panels --------------
 # Condensed from the pre-redesign page: same numbers, read off the same
 # arrays, without the method narrative that now lives in the appendix.
-if DTR:
+if DTR and "nbins" in DTR:
     _d = DTR
     dtr_fd_cap = (
         f"Rows are the TDI channels the run analyses; columns are data, "

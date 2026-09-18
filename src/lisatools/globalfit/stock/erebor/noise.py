@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import os
 import typing
@@ -309,6 +310,75 @@ def galfor_prior_dict(log_sampling: bool = False, *, alpha_max=None) -> dict:
             lo, hi = np.log10(lo), np.log10(hi)
         priors[i] = uniform_dist(lo, hi)
     return priors
+
+
+def read_noise_model_identity(h5_path) -> dict:
+    """``noise_model_identity`` out of a global-fit store, as a plain dict.
+
+    The record is written as a GROUP, ``global_fit/noise_model_identity``,
+    carrying one ATTRIBUTE per key -- not as a JSON string attribute. Readers
+    that assume the latter find nothing, fall back to their defaults and
+    silently reinterpret the store (a linear-basis read of a log-sampled
+    galfor chain, say). A JSON-attribute fallback is kept for any store that
+    ever wrote it that way; an unreadable or absent record returns ``{}``,
+    which callers must treat as "the defaults", never as "all False".
+    """
+    import h5py
+
+    out = {}
+    try:
+        with h5py.File(h5_path, "r") as f:
+            grp = f.get("global_fit/noise_model_identity")
+            if grp is not None and hasattr(grp, "attrs"):
+                for k, v in grp.attrs.items():
+                    out[k] = v.item() if hasattr(v, "item") else v
+            if not out:
+                raw = f.attrs.get("noise_model_identity")
+                if raw is None and "global_fit" in f:
+                    raw = f["global_fit"].attrs.get("noise_model_identity")
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", "replace")
+                if isinstance(raw, str):
+                    out = dict(json.loads(raw))
+                elif isinstance(raw, dict):
+                    out = dict(raw)
+    except (OSError, ValueError, TypeError, KeyError):
+        return {}
+    return out
+
+
+def galfor_params_to_physical(params, log_sampling: bool):
+    """Stored galfor coordinates -> the LINEAR five the foreground model wants.
+
+    Under ``log_sampling`` the four :data:`GALFOR_LOG_PARAMS` columns are
+    stored as ``log10`` while ``alpha`` stays linear, so a consumer that
+    hands the stored vector straight to
+    :class:`~lisatools.stochastic.HyperbolicTangentGalacticForeground`
+    passes a NEGATIVE ``amp`` and ``f_1`` and gets NaN out of
+    ``(f / f_1) ** alpha`` -- with no exception at the call site.
+
+    That is not hypothetical: it silently produced an all-zero SNR / all-False
+    truth set in ``build_truth.py`` and a fatal ``KeyError: 'nbins'`` in
+    ``gf_monitor_gen.py`` on the first stores written with
+    ``GALFOR_LOG_SAMPLING=1`` (2026-09-18). Every reader of a stored galfor
+    row must route through here, keyed off the store's own
+    ``noise_model_identity["galfor_log_sampling"]`` -- never off an env var,
+    which reflects the CURRENT process, not the basis the store was written in.
+
+    Accepts any shape whose LAST axis is the 5-column basis; returns a float
+    array of the same shape. ``log_sampling=False`` is an identity copy.
+    """
+    out = np.array(params, dtype=float, copy=True)
+    if out.shape[-1] != len(GALFOR_BASIS):
+        raise ValueError(
+            f"galfor parameters must have {len(GALFOR_BASIS)} columns "
+            f"{GALFOR_BASIS} on the last axis; got shape {out.shape}"
+        )
+    if not log_sampling:
+        return out
+    idx = [GALFOR_BASIS.index(n) for n in GALFOR_LOG_PARAMS]
+    out[..., idx] = 10.0 ** out[..., idx]
+    return out
 
 
 def check_galfor_log_sampling(galfor) -> bool:
