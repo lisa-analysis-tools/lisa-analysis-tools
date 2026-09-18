@@ -41,4 +41,17 @@ for iteration, (model, state) in enumerate(fit.sample(iterations=3, store=False,
     ll_new = aca[0].template_likelihood(wdm_sig)
     snr_new = aca[0].template_snr(wdm_sig)
     print("ll new:", ll_new, "snr_new:", snr_new)
+ # new parameters
+    # recommend looking at the analysis containers. You can move this under the hood.
+    A1 = 1.001e-23
+    f01 = 2.000001e-3
+    phi01 = phi0 + 0.001
+
+    X1 = A1 * np.sin(2 * np.pi * f01 * t_arr + phi01)
+    Y1, Z1 = X1.copy(), X1.copy()
+
+    wdm_sig = TDSignal(np.asarray([X1, Y1, Z1]), td_set).transform(aca[0].data_res_arr.settings)
+    ll_new = aca[0].template_likelihood(wdm_sig)
+    snr_new = aca[0].template_snr(wdm_sig)
+    print("ll new:", ll_new, "snr_new:", snr_new)
 
