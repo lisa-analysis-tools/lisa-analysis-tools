@@ -335,7 +335,7 @@ def main(argv=None):
     orb = lisa_models.DefaultOrbits(force_backend="cpu", frame="icrs")
     gbw = GBGPU(force_backend="cpu", orbits=orb, t0=float(GB_MOJITO_T_REF))
 
-    phys = catalogue_phys(GB_MOJITO_T_REF, flo, fhi, args.catalogue)
+    phys = catalogue_phys(GB_MOJITO_T_REF, flo, fhi, a.catalogue)
     print(f"catalogue rows in [{flo:.10g}, {fhi:.10g}] Hz: {len(phys)}")
 
     # ---- kappa prefilter -------------------------------------------------
