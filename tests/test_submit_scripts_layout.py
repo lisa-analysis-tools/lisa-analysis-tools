@@ -104,12 +104,61 @@ class ThreeMonthTwinTest(unittest.TestCase):
         self.assertNotIn("SIGHET_NT_LAYER", self.three)
         self.assertNotIn("EDGE_CROP_WAVELETS", self.three)
 
-    def test_no_source_branches(self):
+    def test_source_id_vars_are_UNSET_not_set_empty(self):
+        """Set-empty looks equivalent and breaks the import (2026-09-18).
+
+        Two readers disagree about what "empty" means:
+
+        * ``source_runtime.default_source_ids`` seeds the SETTINGS and
+          tests ``os.environ.get(f"{cls}_IDS") is not None`` -- so a
+          set-but-empty var REPLACES the class default
+          ``{"MBHB": [], "EMRI": [1], "SOBHB": []}`` with three empty
+          lists;
+        * ``run_combined_staged._source_ids_from_env`` ARMS the branches
+          and reads ``os.environ.get(env, "")`` -- unset and set-empty are
+          identical to it.
+
+        With all three set-empty, importing
+        ``lisatools.globalfit.stock.erebor`` FAILS outright: the module
+        builds its stock registry eagerly, and ``FullYearCombinedGlobalFit``
+        -- a variant this run never uses -- raises "mojito_source_ids must
+        inject at least 1 source total". The run died before it built
+        anything.
+        """
         for knob in ("MBHB_IDS", "EMRI_IDS", "SOBHB_IDS"):
-            self.assertEqual(
-                self.three.get(knob, ""), "",
-                f"{knob} must be EMPTY: _source_ids_from_env arms a branch "
-                f"on any non-empty list, and an armed branch is sampled")
+            self.assertNotIn(
+                knob, self.three,
+                f"{knob} must be UNSET, not set-empty: a set-empty value "
+                f"overrides the settings default and makes `import erebor` "
+                f"raise from an unrelated variant's constructor")
+
+    def test_unset_ids_still_leave_every_source_branch_unarmed(self):
+        """The other half: unset must not accidentally ARM anything."""
+        import sys
+        sys.path.insert(0, os.path.join(ROOT, "scripts", "fstat_proposal"))
+        from run_combined_staged import _source_ids_from_env
+
+        from lisatools.globalfit.stock.erebor.source_runtime import (
+            default_source_ids,
+        )
+
+        saved = {k: os.environ.pop(k, None)
+                 for k in ("MBHB_IDS", "EMRI_IDS", "SOBHB_IDS")}
+        try:
+            self.assertEqual(_source_ids_from_env(), {},
+                             "no source branch may be armed")
+            # ... while the SETTINGS default still injects something, which
+            # is what keeps the eager registry constructible.
+            self.assertGreaterEqual(
+                sum(len(v) for v in default_source_ids().values()), 1,
+                "the settings default must stay non-empty or `import "
+                "erebor` raises again")
+        finally:
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_the_data_carries_no_source_streams(self):
         self.assertEqual(self.three["SOURCE_TYPES"], "NOISE,GB,VGB")
 
     def test_the_source_search_skip_is_not_set(self):

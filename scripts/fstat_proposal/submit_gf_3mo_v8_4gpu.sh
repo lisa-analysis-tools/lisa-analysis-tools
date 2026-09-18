@@ -83,7 +83,7 @@
 # against the same reference, so the constant part cancels exactly.
 #
 # --- OFF IN THIS VARIANT ---
-#   MBHB_IDS / EMRI_IDS / SOBHB_IDS are EMPTY, so _source_ids_from_env()
+#   MBHB_IDS / EMRI_IDS / SOBHB_IDS are UNSET, so _source_ids_from_env()
 #   arms nothing and run_combined_staged removes the mbh, emri and sobbh
 #   branches. SOURCE_TYPES follows at NOISE,GB,VGB -- the data carries the
 #   noise realization, the GB galaxy and the VGBs and nothing else, which
@@ -2640,9 +2640,32 @@ export GB_WARM_START_CIRC_IMAGES=${GB_WARM_START_CIRC_IMAGES:-3}
 # order). Ids = the 2026-08-24 census (user "yes in general",
 # 2026-09-02): MBHB only the 4 systems with t_merge <= 6 mo; EMRI/SOBHB
 # full census pending the S4 readout.
-export MBHB_IDS=                   # EMPTY -> mbh branch removed (3mo variant)
-export EMRI_IDS=                   # EMPTY -> emri branch removed (3mo variant)
-export SOBHB_IDS=                  # EMPTY -> sobbh branch removed (3mo variant)
+# THE THREE ID VARS ARE LEFT *UNSET*, NOT SET-EMPTY (2026-09-18).
+# Setting them empty looks equivalent and is not. Two different readers:
+#
+#   source_runtime.default_source_ids() seeds the SETTINGS and tests
+#       `if os.environ.get(f"{cls}_IDS") is not None`
+#   -- so a SET-BUT-EMPTY var overrides the class default
+#      {"MBHB": [], "EMRI": [1], "SOBHB": []} with three empty lists;
+#
+#   run_combined_staged._source_ids_from_env() ARMS the branches and reads
+#       os.environ.get(env, "")
+#   -- so unset and set-empty are the same to it: nothing armed, and
+#      mbh/emri/sobbh are removed. Which is what we want.
+#
+# With all three set-empty, `import lisatools.globalfit.stock.erebor`
+# FAILS: erebor/__init__.py builds the whole stock registry eagerly at
+# module scope, and one of those constructors
+# (FullYearCombinedGlobalFit -- a variant this run never uses) raises
+# "mojito_source_ids must inject at least 1 source total across MBHB /
+# EMRI / SOBHB". Leaving them unset keeps EMRI's default [1], which
+# satisfies that unrelated constructor. Nothing is injected from it: the
+# DATA content is SOURCE_TYPES=NOISE,GB,VGB, which carries no EMRI
+# stream at all, and the emri branch is removed either way.
+#
+# export MBHB_IDS=...   <- deliberately absent
+# export EMRI_IDS=...   <- deliberately absent
+# export SOBHB_IDS=...  <- deliberately absent
 # ---- THE COMBINED DATA SET (user ruling 2026-09-14: the 6mo testing
 # campaign runs on the "combined" data) --------------------------------
 # COMBINED = mojito's PRE-SUMMED L1 stream (${MOJITO_DATA_PATH}/data/
