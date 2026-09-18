@@ -554,9 +554,21 @@ class SubmitScriptsDispatchTest(unittest.TestCase):
                 self.assertIn("--ntasks=5", lines)
                 self.assertIn("--nodes=2", lines)
                 self.assertIn("--gres=gpu:2", lines)
-                self.assertIn("--partition=gpu-80-spot", lines)
+                # NGPUS=4 is 2 nodes, so a spot preemption of EITHER node
+                # kills the whole MPI world -- twice the exposure of the
+                # 1-node flow. It goes to ON-DEMAND (user 2026-09-18);
+                # NGPUS=2 above stays on spot deliberately.
+                self.assertIn("--partition=gpu-80-ondemand", lines)
+                self.assertNotIn("--partition=gpu-80-spot", lines)
                 self.assertIn("--distribution=cyclic", lines)
                 self._assert_export_contains(lines, "GF_LEGACY_RANK_LAYOUT=0")
+
+    def test_the_4gpu_partition_is_overridable_without_editing(self):
+        for script in SCRIPTS:
+            with self.subTest(script=script):
+                lines = self._run_dispatch(
+                    script, {"NGPUS": "4", "PARTITION": "gpu-80-spot"})
+                self.assertIn("--partition=gpu-80-spot", lines)
 
     def test_nodes_knob_spreads_the_gpus_one_per_node(self):
         # one-walker replica gates (user ruling 2026-09-16: test ACROSS nodes):

@@ -564,7 +564,12 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
   _k=${GPUS_PER_RANK:-1}
   case "${NGPUS}" in
     2) _NGPU_PART=gpu-80-spot; _NODES=1; _GRES=gpu:2 ;;
-    4) _NGPU_PART=gpu-80-spot; _NODES=2; _GRES=gpu:2 ;;
+    # NGPUS=4 -> ON-DEMAND (user ruling 2026-09-18). The 4-GPU shape is
+    # 2 nodes x 2 GPUs, and on spot a preemption of EITHER node kills the
+    # whole MPI world -- twice the exposure of the 1-node flow for the
+    # same work. NGPUS=2 stays on spot: it is a single node and the
+    # midit-checkpoint path recovers it cheaply.
+    4) _NGPU_PART=${PARTITION:-gpu-80-ondemand}; _NODES=2; _GRES=gpu:2 ;;
     *) echo "[SUBMIT] NGPUS=${NGPUS} unsupported (2 or 4)."; exit 2 ;;
   esac
   # NODES=<n> spreads the NGPUS GPUs over n nodes (gres = NGPUS/n per node).
@@ -814,6 +819,32 @@ export COARSE_FIDUCIAL=injection
 # arm; ported): alpha railed at the stock 5.0 cap (~60% of samples at the
 # edge). Widened [1e-3, 20] so the slope can explore; revert = drop the
 # line. The prior is rebuilt from code each run.
+# GALFOR SAMPLING BASIS (user ruling 2026-09-18). amp, fk, f_1, f_2 move to
+# log10 over the SAME physical support (galfor_prior_dict + the 10**x
+# transform container); alpha is O(1) and stays linear. The foreground model
+# still receives linear parameters.
+#
+# WHY. galfor's linear prior box spans ~42 decades -- amp (1e-47, 1e-41)
+# against alpha (1e-3, 20) -- and the eigen proposal's step is scaled to that
+# box: the softest whitened eigenvalue puts a ~1-prior-width step on amp,
+# i.e. ~190x the parameter's own value, which takes amp negative and the
+# prior rejects every draw. That is the measured "galfor does not move".
+#
+# The two cheaper fixes were tried and REFUTED, in this order:
+#   * per-parameter whitening of the info matrix -- ALREADY implemented in
+#     eigen_refresh._tables_from_info_batch (diag(w) I diag(w)); rescaling
+#     cannot make a likelihood quadratic in a parameter it is wildly
+#     non-linear in;
+#   * building the eigen tables on the COLD ROW only (512105bd) -- shipped,
+#     confirmed live in the 6mo run by its "1 sources x 5 dims" infomat
+#     signature, and galfor STILL came back non-positive on 23 of 28 builds,
+#     ~29% of them catastrophic (worst lambda/lambda_max -9.7e78).
+#
+# NEEDS A FRESH STORE: this changes what the stored numbers MEAN, not their
+# shape. A resume across the flip is refused by noise_model_identity as of
+# 0044b7cc (galfor_log_sampling is stamped and compared) -- pull at least
+# that commit before running this, or the refusal is not there to catch you.
+export GALFOR_LOG_SAMPLING=${GALFOR_LOG_SAMPLING:-1}
 export GALFOR_ALPHA_MAX=20.0
 echo "[V8-NOISE] coarse: Q=${COARSE_Q} mode=${COARSE_GPU_MODE} \
 use_ws=${COARSE_USE_WS} fiducial=${COARSE_FIDUCIAL}"

@@ -457,7 +457,12 @@ if false && [ -z "${SLURM_JOB_ID:-}" ]; then  # DISPATCH DISABLED: sbatch this f
   _k=${GPUS_PER_RANK:-1}
   case "${NGPUS}" in
     2) _NGPU_PART=gpu-80-spot; _NODES=1; _GRES=gpu:2 ;;
-    4) _NGPU_PART=gpu-80-spot; _NODES=2; _GRES=gpu:2 ;;
+    # NGPUS=4 -> ON-DEMAND (user ruling 2026-09-18). The 4-GPU shape is
+    # 2 nodes x 2 GPUs, and on spot a preemption of EITHER node kills the
+    # whole MPI world -- twice the exposure of the 1-node flow for the
+    # same work. NGPUS=2 stays on spot: it is a single node and the
+    # midit-checkpoint path recovers it cheaply.
+    4) _NGPU_PART=${PARTITION:-gpu-80-ondemand}; _NODES=2; _GRES=gpu:2 ;;
     *) echo "[SUBMIT] NGPUS=${NGPUS} unsupported (2 or 4)."; exit 2 ;;
   esac
   if [ "${NGPUS}" = "4" ]; then
