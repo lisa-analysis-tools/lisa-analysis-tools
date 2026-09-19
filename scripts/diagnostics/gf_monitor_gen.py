@@ -95,11 +95,13 @@ OUT = sys.argv[2] if len(sys.argv) > 2 else "gf_monitor.html"
 BG, PANEL, LINE, FG, DIM = "#0A0E14", "#10161F", "#223041", "#B8C6D4", "#67788A"
 CYAN, AMBER, GREEN, RED, VIOLET = "#4FD8EB", "#F5A623", "#58C48A", "#E5484D", "#9B7BFF"
 #: The UNDETECTABLE injection population (F4 right panel). Deliberately
-#: darker than DIM -- DIM already marks detectable-but-unrecovered sources
-#: in the neutral branch of that same panel, and the sub-threshold cloud
-#: outnumbers the detectable set ~3700:1, so it has to read as background
-#: texture or it buries everything drawn on top of it.
-GREY_UNDET = "#39424E"
+#: distinct from DIM, which already marks detectable-but-unrecovered
+#: sources in the neutral branch of that same panel. First tried two shades
+#: darker (#39424E at alpha 0.5); on a real 6-month page that disappeared
+#: into the background entirely, which is the opposite failure -- the layer
+#: is there to be SEEN as a population. This reads as texture under the
+#: detectable markers without competing with them.
+GREY_UNDET = "#55627A"
 # text.usetex is pinned OFF rather than left to inherit. Nothing on this
 # page needs a real LaTeX installation -- the ~19 math labels
 # (r"$\Delta f_0$", r"$\ln(A_{\rm rec}/A_{\rm cat})$", "m/s$^2$", ...) are
@@ -2227,7 +2229,12 @@ if TRU is not None:
     # plotted fraction next to it, never the sample size on its own.
     _und = _inband & ~_det_all
     N_UND = int(_und.sum())
-    _und_cap = int(os.environ.get("GF_MONITOR_UNDET_MAX", "40000") or 0)
+    # 120k, not the 40k first tried: the panel inherits its y-limits from
+    # the left one, so ~89% of a uniform sample lands below the view and is
+    # clipped. 40k left only ~4.4k markers in frame, too sparse to read as a
+    # population; 120k leaves ~13k, which does. Rasterized, so the cost is
+    # a bounded bitmap rather than 120k vector glyphs.
+    _und_cap = int(os.environ.get("GF_MONITOR_UNDET_MAX", "120000") or 0)
     _ui = np.where(_und)[0]
     if _und_cap > 0 and _ui.size > _und_cap:
         _ui = np.random.default_rng(12345).choice(_ui, _und_cap, replace=False)
@@ -2504,8 +2511,8 @@ if TRU is not None:
         if U_F0.size:
             _ulab = f"undetectable injections ({N_UND:,}"
             _ulab += ")" if U_FRAC >= 0.999 else f"; {U_FRAC:.1%} plotted)"
-            b_.scatter(U_F0, U_AMP, s=6, marker="x", color=GREY_UNDET,
-                       lw=0.5, alpha=0.5, rasterized=True, zorder=1,
+            b_.scatter(U_F0, U_AMP, s=7, marker="x", color=GREY_UNDET,
+                       lw=0.6, alpha=0.75, rasterized=True, zorder=1,
                        label=_ulab)
         if SHOW_MATCH_STATS:
             b_.scatter(T_F0[~FOUND], T_AMP[~FOUND], s=17, marker="x", color=RED,
