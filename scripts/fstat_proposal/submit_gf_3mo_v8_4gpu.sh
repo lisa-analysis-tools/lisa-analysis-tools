@@ -2221,7 +2221,23 @@ export GB_INMODEL_OBSERVABLE_SHEAR=0.5
 # ISOLATION arm if the combined draw needs to be separated from the 6mo
 # changes. Launch with GB_INMODEL_OBSERVABLE_EIGEN= (explicitly empty)
 # to fall back to the diagonal draw bit-identically if it reads badly.
-export GB_INMODEL_OBSERVABLE_EIGEN=${GB_INMODEL_OBSERVABLE_EIGEN-full}
+# DEFAULT CHANGED full -> axis (user ruling 2026-09-19). "full" is a JOINT
+# draw over every eigen axis per repeat, so ONE ill-conditioned direction
+# contaminates EVERY proposal: an observed-information eigenvalue projected
+# onto the PSD cone leaves lambda ~ 0, its whitened sigma (~1/sqrt(lambda))
+# rails at GB_INMODEL_OBSERVABLE_EIGEN_SMAX = 10, and the step overshoots
+# along an axis the matrix could not measure. Measured cost in full_pe:
+#     GB obs_basis cold 0.0139 (full)  vs  0.0864 (10-walker arm, no eigen)
+#     mean |df_mid| proposed 0.218 bins vs 0.026 accepted -- 8.5x too wide
+#     (the 10-walker arm: proposed 0.038, accepted 0.021, ratio 1.8)
+# "axis" draws ONE whitened eigen-axis per repeat, so a bad direction costs
+# only the 1-in-ndim repeats that pick it instead of all of them. That is
+# exactly the mode EigenAxisMove(mode="axis") uses for mbh / emri / sobbh,
+# and those three are healthy (accepted fraction 0.57 / 0.16 / 0.26).
+# Escapes, both bit-identical to what they name:
+#   GB_INMODEL_OBSERVABLE_EIGEN=      -> the diagonal observable draw
+#   GB_INMODEL_OBSERVABLE_EIGEN=full  -> the 2026-09-14 joint draw
+export GB_INMODEL_OBSERVABLE_EIGEN=${GB_INMODEL_OBSERVABLE_EIGEN-axis}
 echo "[GB-OBS-EIGEN] GB_INMODEL_OBSERVABLE_EIGEN='${GB_INMODEL_OBSERVABLE_EIGEN}' (empty = diagonal draw)"
 # ---- AND THE F-STAT GRID IN THE SAME BASIS -------------------------
 # fdot becomes a FIRST-CLASS grid axis instead of the r = 0 manifold the
@@ -2623,7 +2639,13 @@ export VGB_INMODEL_PROPOSAL=${VGB_INMODEL_PROPOSAL:-observable}
 # NOTE stretch (the 10-walker arm's setting) is NOT reachable at 4 walkers
 # on 4 ranks: its red/blue pairing is within the local walker block, which
 # needs B >= 2 and even. That is why this run moved VGB to observable.
-export VGB_INMODEL_OBSERVABLE_EIGEN=${VGB_INMODEL_OBSERVABLE_EIGEN-full}
+# DEFAULT CHANGED full -> axis (user ruling 2026-09-19), same reasoning as
+# the GB knob above and more urgent: VGB measured cold 0/47 = 0.0000 under
+# "full" -- frozen, not slow. VGB fixes f0 and sky, so its information
+# matrix keeps only the degenerate directions and a larger share of its
+# eigenspectrum is ill-conditioned, which is why the joint draw tips from
+# bad to zero here. Escape: VGB_INMODEL_OBSERVABLE_EIGEN= (diagonal draw).
+export VGB_INMODEL_OBSERVABLE_EIGEN=${VGB_INMODEL_OBSERVABLE_EIGEN-axis}
 echo "[VGB-OBS-EIGEN] VGB_INMODEL_OBSERVABLE_EIGEN='${VGB_INMODEL_OBSERVABLE_EIGEN}' (empty = diagonal draw)"
 # GB rung count. 24 is already the code default (stock/erebor/gb.py
 # env_default("GB_NTEMPS", 24)) -- pinned here anyway because the rung count
