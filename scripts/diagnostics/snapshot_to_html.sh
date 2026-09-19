@@ -31,7 +31,12 @@
 # CATALOGUE (the GB catalogue hdf5, or the directory holding it -- the
 # mojito brick cache lives somewhere different on every machine, so this is
 # the knob to set when build_truth cannot find it; MOJITO_CAT and
-# MOJITO_CACHE_DIR are honoured too and need no passthrough),
+# MOJITO_CACHE_DIR are honoured too and need no passthrough -- gf_monitor_gen
+# reads the same env chain and derives its L1-brick base dir from it, so on
+# a machine whose cache is not at the laptop default ~/.mojito_cache/... the
+# monitor's residual-spectrum and data/template/residual panels ONLY render
+# when one of these is set; without them, the DTR block silently degrades to
+# three MISSING entries and the page loses those panels),
 # PY (interpreter), SKIP_TRUTH=1 (reuse whatever truth npz is present),
 # INTERLOCK=1 (wait for any other python to exit before each heavy step;
 # default off -- see the note above).

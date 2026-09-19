@@ -256,7 +256,7 @@ else:
 sub = g["sub_backend"]
 psd_c = sub["psd/chain"][:NIT]                      # (it, 12, 24, 1, 2)
 gal_c = sub["galfor/chain"][:NIT]                   # (it, 12, 24, 1, 5)
-vgb_c = sub["vgb/chain"][:NIT, 0]                   # (it, 24, 55, 5)
+vgb_c = sub["vgb/chain"][:NIT, 0, ..., :5]          # (it, W, 55, 5); store may hold >5 params (e.g. 6-param VGB); the monitor plots the first 5
 vgb_hh = sub["vgb/h_h"][:NIT]                       # (it, 24, 55)
 # TRAILING INCOMPLETE SUB-BACKEND ROWS (2026-08-15). The main backend and a
 # sub-backend are not flushed atomically: a snapshot can hold a row where
@@ -604,6 +604,16 @@ GALFOR_LOG = bool(
 gal_cold_phys = galfor_params_to_physical(gal_cold, GALFOR_LOG)
 GAL_NAMES = [("log10 " + n) if (GALFOR_LOG and n in GALFOR_LOG_PARAMS) else n
              for n in GALFOR_BASIS]
+
+# The lisatools/eryn import chain above (via erebor.noise -> eryn.utils.plot)
+# calls plt.style.use(["science"]), which flips text.usetex=True on any host
+# that has scienceplots installed. Every Text object created after this point
+# captures rcParams["text.usetex"] at __init__, so we MUST pin it back to
+# _USETEX BEFORE the next plt.subplots() call -- the later rcParams.update
+# block only takes effect at figure creation time for new Text, not for
+# already-existing ones. Fixing it here keeps the page tex-free even when the
+# host has no LaTeX (i.e., every cluster node and every fresh container).
+plt.rcParams["text.usetex"] = _USETEX
 
 _nsh = min(3, SUB_NIT)
 fig, ax = plt.subplots(1, 2, figsize=(11, 3.0))
@@ -1360,8 +1370,41 @@ VGB_NAMES = ["dist [kpc]", "phi0", "cos_iota", "psi", "fdot_astro_ratio"]
 VGB_F0 = None
 VGB_IDS = None
 
-MOJITO_CAT_DIR = os.path.expanduser(
-    "~/.mojito_cache/brickmarket/mojito_light_v1_0_0")
+# The monitor rebuilds the data / template / residual stack on the fly and
+# reads the VGB, GB and WDWD catalogues on the way; both need a "brick base
+# dir" that contains ``data/{GB,VGB,COMBINED,...}/L1/*.h5`` and
+# ``catalogues/wdwd_cat_mojito_lite_processed.hdf5``. That directory lives
+# somewhere different on every machine, so it must be discoverable via env
+# rather than hard-coded. The env chain matches build_truth.py's
+# ``_resolve_catalogue()`` (--catalogue > MOJITO_CAT > MOJITO_CACHE_DIR >
+# default) so a caller who has already exported MOJITO_CAT for build_truth.py
+# does not have to set a second knob. Without the fix, cluster runs (bricks
+# under /shared/data/mojito_cache) fell back to the legacy laptop default and
+# silently dropped the residual-spectrum and data/template/residual panels.
+def _resolve_mojito_cat_dir():
+    v = os.environ.get("MOJITO_CAT")
+    if v:
+        v = os.path.expanduser(v)
+        # A file argument (typically .../catalogues/wdwd_cat_*.hdf5) implies
+        # the brick base dir is two levels up.
+        if os.path.isfile(v):
+            return os.path.dirname(os.path.dirname(v))
+        if os.path.isdir(v):
+            return v
+    v = os.environ.get("MOJITO_CACHE_DIR")
+    if v:
+        v = os.path.expanduser(v)
+        # build_truth.py's convention nests the bricks under
+        # brickmarket/mojito_light_v1_0_0/; a cluster layout may store them
+        # flat under the cache root. Prefer the nested layout when present,
+        # else fall through to the flat cache.
+        nested = os.path.join(v, "brickmarket", "mojito_light_v1_0_0")
+        return nested if os.path.isdir(nested) else v
+    return os.path.expanduser(
+        "~/.mojito_cache/brickmarket/mojito_light_v1_0_0")
+
+
+MOJITO_CAT_DIR = _resolve_mojito_cat_dir()
 
 
 def cat_to_sampled9(entry):
