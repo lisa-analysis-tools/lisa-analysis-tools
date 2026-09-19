@@ -2647,7 +2647,27 @@ if TRU is not None:
 VGB_SAMP_ROWS = _vgb_pool_rows(POOL_ITS_SAMPLES)
 VGB_SAMP_ITS = int(VGB_SAMP_ROWS.size)
 vgb_last = vgb_c[VGB_SAMP_ROWS].reshape(-1, 55, 5)       # (S, 55, 5)
-snr = np.sqrt(np.clip(np.nanmean(vgb_hh[-1], axis=0), 0, None))  # (55,)
+# ``vgb_hh`` gets trimmed to SUB_NIT rows above, and SUB_NIT can land at 0
+# on a very young store or one whose mid-flush left the whole VGB column
+# unwritten. ``vgb_hh[-1]`` then raises IndexError and the whole page dies.
+# Same for the all-NaN case: nanmean on all-NaN returns NaN with a warning,
+# but we don't want a NaN cascade downstream. Fall back to a zero-SNR
+# vector so ``VGB_DET`` is empty and the panel renders with no bars.
+_nv = int(vgb_hh.shape[-1]) if vgb_hh.ndim >= 1 else 55
+try:
+    if vgb_hh.shape[0] == 0:
+        raise ValueError("no VGB h_h rows retained (SUB_NIT trimmed to 0)")
+    with np.errstate(invalid="ignore"):
+        snr = np.sqrt(np.clip(np.nanmean(vgb_hh[-1], axis=0), 0, None))
+    if snr.ndim != 1 or snr.shape[0] != _nv:
+        raise ValueError(f"unexpected SNR shape {snr.shape}")
+    snr = np.where(np.isfinite(snr), snr, 0.0)
+except Exception as _e:
+    snr = np.zeros(_nv)
+    MISSING.append(f"VGB SNR>7 panel: could not compute per-VGB SNRs "
+                   f"({type(_e).__name__}: {_e}); the detectable-subset "
+                   f"strip shows as empty (VGB branch not populated yet, "
+                   f"or vgb_hh malformed in this snapshot).")
 order = np.argsort(snr)[::-1]
 VGB_DET = np.nonzero(snr > 7.0)[0]
 VGB_DET = VGB_DET[np.argsort(snr[VGB_DET])[::-1]]
