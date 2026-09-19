@@ -175,6 +175,45 @@ def warm_pe_move_overrides() -> dict:
     )
 
 
+def pe_phase_maximize_on(gb_mode_search: bool, pe_strict: bool) -> bool:
+    """Whether ``rj_fstat_pe`` may phase-maximize. Default: NEVER.
+
+    User ruling 2026-09-19. ``rj_fstat_pe`` used to read
+
+        phase_maximize = _rj_phase_max if (gb_mode_search and not pe_strict)
+
+    which made it the ONE move in the PE stack that could maximize -- every
+    other one (``rj_warm_pe``, ``rj_prior_pe``, ``rj_replace_pe``, ``vgb_pe``)
+    is hardcoded False. The intent was the ``GB_MODE=search`` campaign, which
+    runs the search THROUGH the pe-named stage, but the effect was that
+    setting ``GB_MODE=search`` silently re-armed phase maximization inside
+    ``full_pe`` -- a config change in one place rearming machinery in another
+    with no line saying so, which is exactly the anti-pattern
+    :func:`~lisatools.globalfit.moves.gbspecialstretch._rj_amp_maximize_on`
+    was written to avoid.
+
+    ``GB_PE_MOVES_STRICT=1`` was the only documented way to close it, and it
+    is NOT a safe door to shut on its own: the same flag also nulls the PE
+    leaf caps (``leaf_cap_start=None``, ``leaf_cap_update=False``) and swaps
+    the RJ flip fraction and IMR defaults. Reaching for it to disarm phase-max
+    would quietly reconfigure the cap machinery of a production PE stage.
+
+    So the knob is now its OWN: ``GB_PE_PHASE_MAXIMIZE``, default off. A
+    search campaign that genuinely wants the old behaviour asks for it by
+    name, and the search-stage moves (``rj_fstat_search``, ``rj_warm_search``,
+    ``rj_prior_removal``) are untouched -- they keep following
+    ``GB_RJ_PHASE_MAXIMIZE`` under the standing search waiver.
+
+    ``pe_extrinsic_draw`` deliberately keeps its own mode-following gate: it
+    selects between two EXACTLY BALANCED proposals (pinned-and-uniform-washed
+    vs maximizer-centered-and-charged), so it is not a maximization and is not
+    what this policy is about.
+    """
+    if os.environ.get("GB_PE_PHASE_MAXIMIZE", "0") != "1":
+        return False
+    return bool(gb_mode_search) and not bool(pe_strict)
+
+
 def _stage_kind_of(step):
     """The stage kind (``"search"``/``"rj"``/``"pe"``) stamped on a materialized step.
 
@@ -3536,8 +3575,13 @@ def build_gb_moves(
         **_fit_kwargs,
         name="rj_fstat_pe",
         use_prior_removal=False,  # gb_info["pe_info"]["use_prior_removal"],
+        # NEVER in full_pe unless GB_PE_PHASE_MAXIMIZE=1 asks for it by name
+        # -- see pe_phase_maximize_on() for why this no longer just follows
+        # GB_MODE, and why GB_PE_MOVES_STRICT was never the right off switch.
         phase_maximize=(
-            _rj_phase_max if (_gb_mode_search and not _pe_strict) else False
+            _rj_phase_max
+            if pe_phase_maximize_on(_gb_mode_search, _pe_strict)
+            else False
         ),
         pe_extrinsic_draw=(
             _pe_extr_draw and not (_gb_mode_search and not _pe_strict)
