@@ -619,6 +619,60 @@ NOISE_BIAS = [float(np.median(psd_cold[-_nsh:, :, j]) / inj - 1.0)
               for j, inj in enumerate((SOMS_INJ, SA_INJ))]
 fig.suptitle(f"instrument-noise posteriors, last {_nsh} stored iterations "
              f"x {nwalk} cold walkers", fontsize=10, color=FG)
+plt.rcParams.update({
+    "figure.facecolor": PANEL, "axes.facecolor": PANEL, "savefig.facecolor": PANEL,
+    "axes.edgecolor": LINE, "axes.labelcolor": FG, "text.color": FG,
+    "xtick.color": DIM, "ytick.color": DIM, "grid.color": LINE,
+    "axes.grid": True, "grid.linewidth": 0.6, "grid.alpha": 0.5,
+    "font.size": 10, "font.family": "monospace", "axes.titlesize": 11,
+    "legend.frameon": False, "figure.dpi": 110,
+    "text.usetex": _USETEX,
+})
+plt.rcParams.update({
+    "figure.facecolor": PANEL, "axes.facecolor": PANEL, "savefig.facecolor": PANEL,
+    "axes.edgecolor": LINE, "axes.labelcolor": FG, "text.color": FG,
+    "xtick.color": DIM, "ytick.color": DIM, "grid.color": LINE,
+    "axes.grid": True, "grid.linewidth": 0.6, "grid.alpha": 0.5,
+    "font.size": 10, "font.family": "monospace", "axes.titlesize": 11,
+    "legend.frameon": False, "figure.dpi": 110,
+    "text.usetex": _USETEX,
+})
+plt.rcParams.update({
+    "figure.facecolor": PANEL, "axes.facecolor": PANEL, "savefig.facecolor": PANEL,
+    "axes.edgecolor": LINE, "axes.labelcolor": FG, "text.color": FG,
+    "xtick.color": DIM, "ytick.color": DIM, "grid.color": LINE,
+    "axes.grid": True, "grid.linewidth": 0.6, "grid.alpha": 0.5,
+    "font.size": 10, "font.family": "monospace", "axes.titlesize": 11,
+    "legend.frameon": False, "figure.dpi": 110,
+    "text.usetex": _USETEX,
+})
+plt.rcParams.update({
+    "figure.facecolor": PANEL, "axes.facecolor": PANEL, "savefig.facecolor": PANEL,
+    "axes.edgecolor": LINE, "axes.labelcolor": FG, "text.color": FG,
+    "xtick.color": DIM, "ytick.color": DIM, "grid.color": LINE,
+    "axes.grid": True, "grid.linewidth": 0.6, "grid.alpha": 0.5,
+    "font.size": 10, "font.family": "monospace", "axes.titlesize": 11,
+    "legend.frameon": False, "figure.dpi": 110,
+    "text.usetex": _USETEX,
+})
+plt.rcParams.update({
+    "figure.facecolor": PANEL, "axes.facecolor": PANEL, "savefig.facecolor": PANEL,
+    "axes.edgecolor": LINE, "axes.labelcolor": FG, "text.color": FG,
+    "xtick.color": DIM, "ytick.color": DIM, "grid.color": LINE,
+    "axes.grid": True, "grid.linewidth": 0.6, "grid.alpha": 0.5,
+    "font.size": 10, "font.family": "monospace", "axes.titlesize": 11,
+    "legend.frameon": False, "figure.dpi": 110,
+    "text.usetex": _USETEX,
+})
+plt.rcParams.update({
+    "figure.facecolor": PANEL, "axes.facecolor": PANEL, "savefig.facecolor": PANEL,
+    "axes.edgecolor": LINE, "axes.labelcolor": FG, "text.color": FG,
+    "xtick.color": DIM, "ytick.color": DIM, "grid.color": LINE,
+    "axes.grid": True, "grid.linewidth": 0.6, "grid.alpha": 0.5,
+    "font.size": 10, "font.family": "monospace", "axes.titlesize": 11,
+    "legend.frameon": False, "figure.dpi": 110,
+    "text.usetex": _USETEX,
+})
 fig.tight_layout(rect=[0, 0, 1, 0.93])
 fig_b64(fig, "f11_psd")
 
@@ -1608,6 +1662,15 @@ try:
         f"frequency domain - cold walker {WBEST} (max lnL), stored iteration "
         f"{NIT - 1} - dotted red = the run's GB band edges", fontsize=10,
         color=FG)
+    plt.rcParams.update({
+    "figure.facecolor": PANEL, "axes.facecolor": PANEL, "savefig.facecolor": PANEL,
+    "axes.edgecolor": LINE, "axes.labelcolor": FG, "text.color": FG,
+    "xtick.color": DIM, "ytick.color": DIM, "grid.color": LINE,
+    "axes.grid": True, "grid.linewidth": 0.6, "grid.alpha": 0.5,
+    "font.size": 10, "font.family": "monospace", "axes.titlesize": 11,
+    "legend.frameon": False, "figure.dpi": 110,
+    "text.usetex": _USETEX,
+})
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     fig_b64(fig, "dtr_fd")
 
@@ -1667,6 +1730,15 @@ try:
         f"({_wdm.Nf_active} layers x {_wdm.layer_df * 1e3:.4f} mHz, "
         f"{int(_wdm.layer_dt)} s pixels) - shared linear scale per channel row",
         fontsize=10, color=FG)
+    plt.rcParams.update({
+    "figure.facecolor": PANEL, "axes.facecolor": PANEL, "savefig.facecolor": PANEL,
+    "axes.edgecolor": LINE, "axes.labelcolor": FG, "text.color": FG,
+    "xtick.color": DIM, "ytick.color": DIM, "grid.color": LINE,
+    "axes.grid": True, "grid.linewidth": 0.6, "grid.alpha": 0.5,
+    "font.size": 10, "font.family": "monospace", "axes.titlesize": 11,
+    "legend.frameon": False, "figure.dpi": 110,
+    "text.usetex": _USETEX,
+})
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     # 9 dense speckle images are the single most expensive PNG on the page;
     # 88 dpi still oversamples the pooled (layer x pooled-time) grid.
@@ -2557,6 +2629,15 @@ if VGB_F0 is not None:
     for _i, _k in enumerate(VGB_DET):
         ax[1].text(snr[_k] * 1.06, _y[_i], f" {VGB_F0[_k]:.2f} mHz",
                    fontsize=7, color=DIM, va="center")
+plt.rcParams.update({
+    "figure.facecolor": PANEL, "axes.facecolor": PANEL, "savefig.facecolor": PANEL,
+    "axes.edgecolor": LINE, "axes.labelcolor": FG, "text.color": FG,
+    "xtick.color": DIM, "ytick.color": DIM, "grid.color": LINE,
+    "axes.grid": True, "grid.linewidth": 0.6, "grid.alpha": 0.5,
+    "font.size": 10, "font.family": "monospace", "axes.titlesize": 11,
+    "legend.frameon": False, "figure.dpi": 110,
+    "text.usetex": _USETEX,
+})
 fig.tight_layout()
 fig_b64(fig, "f9_vgb")
 
