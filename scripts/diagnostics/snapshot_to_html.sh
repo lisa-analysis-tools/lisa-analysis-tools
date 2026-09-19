@@ -39,7 +39,16 @@
 # three MISSING entries and the page loses those panels),
 # PY (interpreter), SKIP_TRUTH=1 (reuse whatever truth npz is present),
 # INTERLOCK=1 (wait for any other python to exit before each heavy step;
-# default off -- see the note above).
+# default off -- see the note above),
+# GF_MONITOR_MATCH_STATS=1 (ON here by default -- unlocks the banner match
+# KPIs, the completeness/purity/overlap comparison plots, the SNR-bucket
+# completeness panel, and the Parameter Recovery section; set =0 for the
+# leaner "no page-level match statistic" build the 2026-08-19 user ruling
+# describes),
+# GF_MONITOR_ARM_CACHE_DIR=<dir> (persistent arm-cache directory, default
+# ~/.cache/gf_monitor_arms/; every snapshot render seeds its scratch dir
+# from here and syncs its own arm cache back, so cross-run comparison
+# panels stay populated across invocations).
 set -euo pipefail
 
 TAR=${1:?usage: snapshot_to_html.sh <snapshot.tar.gz> [OUT.html] [WORKDIR]}
@@ -50,6 +59,31 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1
+
+# Match-criterion content ON by default. The user ruling 2026-08-19 gated
+# these panels off the page's own 2-bin proxy match, but this pipeline
+# renders the phase-maximised overlap and Wilson-interval SNR-bucket
+# completeness statistics that the artifact treats as headline. Without this
+# knob the page loses: the matched-sources/completeness/purity banner KPIs,
+# F2 (completeness+purity vs GB-search iteration), F3 (overlap CDF and
+# survival), F6 (completeness vs SNR bucket), F7 params (recovered - injected),
+# F7 scatter (recovered vs injected), the Parameter Recovery section and the
+# hi-f census panel. Callers who want the leaner build set
+# GF_MONITOR_MATCH_STATS=0 explicitly.
+export GF_MONITOR_MATCH_STATS=${GF_MONITOR_MATCH_STATS:-1}
+
+# Arm-cache persistence. gf_monitor_gen.py saves the current run's arm as
+# gf_arm_<tag>.npz in its CWD and draws the multi-run comparison panels (F2,
+# F3, F6, F10, the arm-comparison table) by loading every gf_arm_*.npz it
+# finds beside it. Historically WORK is a fresh mktemp, so previous runs'
+# arms were never picked up and every comparison collapsed to a single-arm
+# line. Keep them under GF_MONITOR_ARM_CACHE_DIR (default
+# $HOME/.cache/gf_monitor_arms/) instead: seed WORK from the cache before
+# rendering, sync back whatever the monitor wrote. Set GF_MONITOR_ARM_CACHE_DIR
+# to a shared path (e.g. the run directory itself) if arms should follow the
+# run rather than the host.
+ARM_CACHE_DIR=${GF_MONITOR_ARM_CACHE_DIR:-"$HOME/.cache/gf_monitor_arms"}
+mkdir -p "$ARM_CACHE_DIR"
 
 # INTERLOCK=1 serialises against any other python on the machine. DEFAULT
 # OFF, because a person running this from a terminal already knows what
@@ -125,10 +159,34 @@ fi
 # whatever directory it is run from.
 OUT=${OUT:-$WORK/$(basename "$RUN").html}
 mkdir -p "$(dirname "$OUT")"
+
+# Seed the scratch dir with every arm cache we already know about, so the
+# comparison panels can plot multiple arms. Missing directory / empty glob
+# is fine -- shopt -s nullglob keeps the loop silent, and the panels still
+# render with just the current run's own arm.
+shopt -s nullglob
+_seeded=0
+for _ac in "$ARM_CACHE_DIR"/gf_arm_*.npz; do
+  cp "$_ac" "$WORK"/ && _seeded=$((_seeded + 1))
+done
+shopt -u nullglob
+echo "[snap2html] arm caches seeded from $ARM_CACHE_DIR: $_seeded"
+
 interlock
 ( cd "$WORK" && "$PY" "$HERE/gf_monitor_gen.py" "$RUN" "$OUT" )
+
+# Sync any arm cache the monitor produced back to the persistent dir. The
+# monitor only writes the current run's own arm, but we cp every matching
+# file so a caller who dropped an extra cache into WORK by hand keeps it.
+shopt -s nullglob
+_synced=0
+for _ac in "$WORK"/gf_arm_*.npz; do
+  cp "$_ac" "$ARM_CACHE_DIR"/ && _synced=$((_synced + 1))
+done
+shopt -u nullglob
 
 echo
 echo "[snap2html] PAGE: $OUT"
 echo "[snap2html] run dir kept at: $RUN"
 echo "[snap2html] arm caches written in: $WORK"
+echo "[snap2html] arm caches synced back to $ARM_CACHE_DIR: $_synced"

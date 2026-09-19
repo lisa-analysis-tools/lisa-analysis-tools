@@ -2533,9 +2533,17 @@ if TRU is not None:
         ax0.stairs(_hrec, _eds, color=GREEN, fill=True, alpha=0.9,
                    label=f"recovered ({int(FOUND.sum())})")
     else:
-        _hmod, _ = np.histogram(_rf, bins=_eds)
+        # F5 sits OUTSIDE the ``if RPHYS is not None`` block that defines
+        # ``_rf = RPHYS[:, 1]`` for the F4 scatter, so when the RPHYS build
+        # try-block raises (unreachable orbits, missing waveform backend,
+        # zero recovered sources with an "empty slice" warning cascade,
+        # etc.) this branch used to hit ``NameError: name '_rf' is not
+        # defined``. Rebuild from REC9 -- always populated before F5 --
+        # instead of chaining off the F4 side-effect.
+        _rf_hz = REC9[:, 1] * 1e-3
+        _hmod, _ = np.histogram(_rf_hz, bins=_eds)
         ax0.stairs(_hmod, _eds, color=GREEN, fill=True, alpha=0.9,
-                   label=f"model sources ({int(_rf.size)})")
+                   label=f"model sources ({int(_rf_hz.size)})")
     ax0.set_yscale("log"); ax0.set_ylim(0.5, None)
     ax0.set_ylabel("sources per bin"); ax0.legend(fontsize=8)
     if ax1 is not None:
