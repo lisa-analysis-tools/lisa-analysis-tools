@@ -17633,6 +17633,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # runaway: in production, cells whose source converged
                 # early would reach nleaves_max long before the run ends).
                 # Armed cells only (cap >= 1; -1 = disarmed sentinel).
+                #
+                # MAX over walkers is DELIBERATE here and must stay (user
+                # ruling 2026-09-19, asked and answered). It reads as the
+                # same "one walker speaks for all" shape as the lnL test
+                # below, but it is not: this is a DEMAND signal, not a
+                # readiness one. Walkers are expected to disagree about how
+                # many sources a cell holds once the fit approaches the true
+                # count, and most of all in crowded cells -- that is the
+                # posterior, not a pathology. A single walker pressed
+                # against its allowance is exactly the evidence that the
+                # cell needs more room, whether or not the others agree, so
+                # taking the max is the correct reduction. Do not "fix" this
+                # to min/all; the readiness question is the lnL gate's job
+                # and is handled by GB_LEAF_CAP_ALL_WALKERS below.
                 converged &= (cap >= 1) & (_occ_max >= cap)
                 # ALL-WALKERS CONVERGENCE (user ruling 2026-09-19,
                 # GB_LEAF_CAP_ALL_WALKERS=1, default OFF). The test above

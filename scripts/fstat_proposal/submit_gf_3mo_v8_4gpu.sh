@@ -1894,7 +1894,22 @@ export GB_CAP_STAGGER=1
 #   bands. 2 remains right: it is an ADDITIVE allowance on destination
 #   occupancy, and the transient double-occupancy it must exceed did not
 #   change when the cell halved.
-export GB_CAP_CELL_MAX=20
+# RAISED 20 -> 50 (user ruling 2026-09-19): "we cannot be up against that
+# edge". This is a BELT against a runaway ratchet, not a design target, and
+# 20 was only ever inherited from the probe's nleaves_max. Truth-set source
+# density per cap cell, scaling SNR by sqrt(Tobs) off the 3-month set,
+# detection at SNR 7:
+#     Tobs    p99   p99.9   max   cells >=20   cells >=50
+#     3 mo      6       8     8        0            0
+#     6 mo     11      12    14        0            0
+#     1 yr     17      20    21        4            0
+#     2 yr     28      34    35       92            0
+# So 20 already BINDS at 1 year (four cells exceed it) and badly at 2, while
+# 50 is clear of the densest cell at every Tobs through 2 years. It costs
+# nothing to raise: the knob gates the increment condition and sizes no
+# allocation, and on the live 6mo run the highest cap reached is 17 with
+# nothing at the ceiling, so this changes no cell's behaviour today.
+export GB_CAP_CELL_MAX=50
 #
 # ── SUPERSEDED 2026-08-30. The block above reasons about the divisor-2
 # geometry (two mid-band cap boundaries per band, "when the cell halved").
