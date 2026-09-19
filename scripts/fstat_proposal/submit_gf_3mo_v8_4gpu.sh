@@ -2604,8 +2604,27 @@ export VGB_NTEMPS=8
 # spread actually opening up. Escapes: VGB_INMODEL_PROPOSAL=eigen (the
 # sampling-basis one-axis draw, now with a live r column) and =stretch
 # (the bit-identical legacy).
-export VGB_INMODEL_PROPOSAL=observable
-export VGB_INMODEL_OBSERVABLE_EIGEN=full
+export VGB_INMODEL_PROPOSAL=${VGB_INMODEL_PROPOSAL:-observable}
+# OVERRIDABLE (2026-09-19). Measured, 4 walkers, full_pe:
+#   VGB  obs_basis  cold 0/47 (0.0000)  all 0/376 (0.0000)   <- EIGEN=full
+#   (the 10-walker arm ran VGB_INMODEL_PROPOSAL=stretch and got
+#    cold 182/470 = 0.387, all 1512/3760 = 0.402)
+# The VGB in-model move is frozen: 47 cold proposals a propose, zero
+# accepted. Same failure as the GB twin (GB_INMODEL_OBSERVABLE_EIGEN=full
+# -> obs_basis cold 0.0139 against the 10-walker arm's 0.0864) and worse,
+# because VGB fixes f0 and sky, so the information matrix keeps only the
+# degenerate directions and a larger fraction of its eigenspectrum is
+# ill-conditioned. A "full" draw is JOINT over every axis, so one railed
+# direction (PSD-projected eigenvalue -> whitened sigma at
+# *_OBSERVABLE_EIGEN_SMAX, default 10) contaminates EVERY proposal --
+# unlike "axis", which spends only 1-in-ndim repeats on a bad direction
+# and is what the healthy mbh/emri/sobbh EigenAxisMove(mode="axis") uses.
+# Empty = the diagonal observable draw, bit-identical fallback.
+# NOTE stretch (the 10-walker arm's setting) is NOT reachable at 4 walkers
+# on 4 ranks: its red/blue pairing is within the local walker block, which
+# needs B >= 2 and even. That is why this run moved VGB to observable.
+export VGB_INMODEL_OBSERVABLE_EIGEN=${VGB_INMODEL_OBSERVABLE_EIGEN-full}
+echo "[VGB-OBS-EIGEN] VGB_INMODEL_OBSERVABLE_EIGEN='${VGB_INMODEL_OBSERVABLE_EIGEN}' (empty = diagonal draw)"
 # GB rung count. 24 is already the code default (stock/erebor/gb.py
 # env_default("GB_NTEMPS", 24)) -- pinned here anyway because the rung count
 # is the one knob whose failure mode is completely silent: resume derives it
