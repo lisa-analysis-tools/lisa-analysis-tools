@@ -458,6 +458,30 @@ class _StoreWindowCases:
                          msg="a runaway chirp must be counted for every row")
         self.assertGreater(len(counter._cells_outside), 0)
 
+    # ---------------- Fisher kernel on a real computation group ----------------
+
+    def test_information_matrix_kernel_matches_reference(self):
+        bound = 1e-13 if self.BACKEND == "cpu" else 1e-10
+        sorter, _specials = self.live_cells()
+        ids = sorter.xp.arange(sorter.num_sources)[sorter.inds]
+        physical = self.case["transform"].both_transforms(sorter.coords[ids], xp=sorter.xp)
+        walkers = sorter.walker_inds[ids].astype(sorter.xp.int32)
+        test_inds = [0, 1, 2, 4, 5, 6, 7, 8]
+        comp, aca = self.case["comp"], self.case["aca"]
+
+        from gbgpu.testing import stft_information_matrix_reference
+
+        kernel = host(comp.information_matrix(physical, aca, inds=test_inds, noise_index=walkers))
+        reference = host(stft_information_matrix_reference(
+            comp, physical, aca, inds=test_inds, noise_index=walkers))
+
+        diagonal = np.abs(np.diagonal(reference, axis1=1, axis2=2))
+        self.assertTrue(np.all(diagonal > 0), msg="every sampled direction must carry information")
+        norm = np.sqrt(diagonal[:, :, None] * diagonal[:, None, :])
+        worst = float(np.max(np.abs(kernel - reference) / norm))
+        self.assertLess(worst, bound, msg=f"kernel Fisher left the reference by {worst:.3e}")
+        np.testing.assert_array_equal(kernel, np.swapaxes(kernel, 1, 2))
+
 
 @unittest.skipUnless(_have_gbgpu_stft(), "requires gbgpu.gbcomps.STFTGBComputations")
 class StoreWindowDebugFlowTest(unittest.TestCase):

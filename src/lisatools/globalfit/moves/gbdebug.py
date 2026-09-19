@@ -202,6 +202,8 @@ class GBDebugSettings:
     plot_walker: int = 0
     plot_band: Optional[int] = None
     seq_pick: SeqPickStrategy = "first"
+    rj_trace: bool = False
+    prop_timing_sync: bool = False
     verify_buffer: bool = False
     mem_probe: bool = False
     mem_probe_file: Optional[str] = None

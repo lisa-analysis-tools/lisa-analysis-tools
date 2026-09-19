@@ -1813,6 +1813,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                 tdi_type=parent_group.tdi_type,
                 window_alpha=parent_group.window_alpha,
                 use_midpoint=parent_group.use_midpoint,
+                linear_envelope=parent_group.linear_envelope,
             )
         return ac_list, aca_kwargs
 

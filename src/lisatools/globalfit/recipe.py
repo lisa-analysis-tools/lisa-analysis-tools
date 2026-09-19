@@ -34,6 +34,7 @@ from lisatools.response.tdiconfig import TDIConfig
 from bbhx.utils.transform import SSB_to_LISA
 from gbgpu.gbgpu import GBGPU
 from gbgpu.gbcomps import STFTGBComputations
+from gbgpu.gb_likelihood import make_band_likelihood_engine
 from eryn.moves.tempering import TemperatureControl, make_ladder
 from eryn.prior import ProbDistContainer
 
@@ -1483,12 +1484,6 @@ def build_gb_moves(
                 N=N_vals,
                 **gb_info.waveform_kwargs,
             )
-            max_diff_templates = _xp.abs(template_in[0] - acs.linear_data_arr[0]).max()
-            del template_in
-            logger.debug(
-                f"Global GB template generated with max template in/out diff = "
-                f"{max_diff_templates:5e}"
-            )
         elif isinstance(domain_settings, WDMSettings):
             if gb_info.gb_wdm_comp is None:
                 raise ValueError(
@@ -1514,18 +1509,43 @@ def build_gb_moves(
             )
             
             xp = gb_info.gb_stft_comp.xp
-            factors_arr = xp.asarray(factors).astype(xp.float64)
-            
-            gb_info.gb_stft_comp.fill_global_stft(
-                coords_in_in,
-                acs.gather_linear_data_arr(),
-                data_index=xp.asarray(data_index).astype(xp.int32),
-                factors=factors_arr,
+
+            make_band_likelihood_engine(
+                domain_settings,
+                gb_stft_comp=gb_info.gb_stft_comp,
+                nchannels=acs.nchannels,
+                tdi_channel_setup=gb_info.waveform_kwargs["tdi_channel_setup"],
+            ).fill_template(
+                acs,
+                xp.asarray(coords_in_in),
+                xp.asarray(data_index).astype(xp.int32),
+                None,
+                factor=-1,
+                waveform_kwargs=gb_info.waveform_kwargs,
             )
         else:
             raise NotImplementedError(
                 f"Domain settings {type(domain_settings).__name__} are not "
                 f"supported for GB initialization."
+            )
+
+        max_diff_templates = 0.0
+        for shard, (before, after) in enumerate(zip(template_in, acs.linear_data_arr)):
+            # Both operands live on this shard's device; subtracting them anywhere else is
+            # a cross-device op.
+            with acs.device_context(None if gpus is None else int(gpus[shard])):
+                max_diff_templates = max(
+                    max_diff_templates, float(_xp.abs(before - after).max())
+                )
+        del template_in
+        logger.debug(
+            f"Global GB template generated with max template in/out diff = "
+            f"{max_diff_templates:5e}"
+        )
+        if max_diff_templates == 0.0:
+            raise RuntimeError(
+                "The initial GB subtraction left the residual unchanged on every shard. "
+                "The template was written somewhere other than acs.linear_data_arr."
             )
 
     _post_sub = acs[0].data_res_arr.data_res_arr

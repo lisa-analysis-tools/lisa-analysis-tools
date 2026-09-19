@@ -461,52 +461,65 @@ class STFTFresnel : public STFTSettings {
   CUDA_DEVICE
   double get_zeta(double f, double f0, double fdot0);
   CUDA_DEVICE
-  double get_v(double tau, double f, double f0, double fdot0);
-  CUDA_DEVICE
   void get_fresnel_integrals(double* C, double* S,
                              double x);  // Fresnel integrals C(x) and S(x)
-                                         // returned in ints[0] and ints[1]
+  // Auxiliary Fresnel functions for |x| > 1.6, the form the integrals are built from:
+  //   C + iS = sign(x) [ (1+i)/2 - (g + i f)(|x|) e^{i pi x^2 / 2} ].
+  // get_phase_kernel_core consumes them directly so the large phase never forms. df_out/dg_out
+  // are their derivatives in |x|, for the demodulated first moment; nullptr skips them.
   CUDA_DEVICE
-  void get_fresnel_integrals_with_expi(
-      double* C, double* S, double* cos_arg, double* sin_arg,
-      double x);  // as get_fresnel_integrals, also exposing the internal
-                  // cos/sin(0.5*pi*x^2) (= dC/dx, dS/dx; even in x)
+  void get_fresnel_aux(double* f_out, double* g_out, double abs_x,
+                       double* df_out = nullptr, double* dg_out = nullptr);
+  // The single-interval phase-kernel product and, when moment_out is not null, its first moment
+  // about t_ref (the linear-envelope correction). The moment shares the value's Fresnel
+  // evaluations, endpoint sincos and polar, so it costs no extra transcendentals.
   CUDA_DEVICE
-  cmplx get_fresnel_kernel_interval(double f, double t0, double f0,
-                                    double fdot0, double t_start, double t_end);
+  void get_phase_kernel_core(double f_eff, double t_ref, double f0, double fdot0,
+                             double t_start, double t_end, double t_ft_origin,
+                             cmplx* kernel_out, cmplx* moment_out);
   CUDA_DEVICE
   cmplx get_phase_kernel_product(double f_eff, double t_ref, double f0,
                                  double fdot0, double t_start, double t_end,
                                  double t_ft_origin);
   CUDA_DEVICE
-  void get_phase_kernel_product_with_moment(
-      double f_eff, double t_ref, double f0, double fdot0, double t_start,
-      double t_end, double t_ft_origin, cmplx* kernel_out,
-      cmplx* moment_out);  // fused: kernel (bit-identical to
-                           // get_phase_kernel_product) + its first moment
-                           // about t_ref (the linear-envelope correction)
-  CUDA_DEVICE
   cmplx get_windowed_fourier_value(double amp, double phase0, double f0,
                                    double fdot0, double t0, double f,
                                    double slope = 0.0);
   CUDA_DEVICE
-  cmplx get_fresnel_kernel(double f, double t0, double f0, double fdot0);
-  CUDA_DEVICE
   cmplx get_fourier_value(double amp, double phase0, double f0, double fdot0,
                           double t0, double f, double window_factor,
                           double slope = 0.0);
+  // Without the envelope moment, get_fourier_value == get_fourier_prefactor * get_fourier_kernel. 
+  // The kernel holds all Fresnel work and does not depend on amp or phase0, 
+  // so templates on one track can share it.
+  CUDA_DEVICE
+  cmplx get_fourier_prefactor(double amp, double phase0, double fdot0,
+                              double window_factor);
+  CUDA_DEVICE
+  cmplx get_fourier_kernel(double f0, double fdot0, double t0, double f);
+  CUDA_DEVICE
+  cmplx get_windowed_fourier_kernel(double f0, double fdot0, double t0,
+                                    double f);
+  // Shared body of the two windowed entry points: the seven Tukey terms and, when moment_out
+  // is not null, their first moments.
+  CUDA_DEVICE
+  void get_windowed_fourier_core(double f0, double fdot0, double t0, double f,
+                                 cmplx* kernel_out, cmplx* moment_out);
 
   void compute_fourier_values_wrap(cmplx* output, double* amps, double* phase0s,
                                    double* f0s, double* fdot0s, double* t0s,
                                    double* freqs, double window_factor,
                                    int num_binaries, int num_freqs);
-};
 
-CUDA_KERNEL
-void compute_fourier_values_kernel(cmplx* output, STFTFresnel* fresnel,
-                                   double* amps, double* phase0s, double* f0s,
-                                   double* fdot0s, double* t0s, double* freqs,
-                                   int num_binaries, int num_freqs);
+  // Diagnostic entry point: the single-interval phase-kernel product and its first moment, the pair
+  // the demodulated evaluator is built on. Exposed so both can be checked against the integrals they
+  // represent (kernel = sqrt(2|fdot0|) int e^{i psi} dtau, moment = the same with a tau weight).
+  void compute_phase_kernel_moments_wrap(cmplx* kernel_out, cmplx* moment_out,
+                                         double* f_effs, double* t_refs,
+                                         double* f0s, double* fdot0s,
+                                         double* t_starts, double* t_ends,
+                                         double* t_origins, int num);
+};
 
 /** @brief First-pass kernel: partial (d|h) and (h|h) sums per CUDA block.
  *

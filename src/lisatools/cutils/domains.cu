@@ -48,6 +48,22 @@
  * supporting birth/death and swap proposals in a Reversible-Jump MCMC sampler
  * (e.g. Eryn) without redundant noise-matrix lookups.
  *
+ * Fresnel evaluator (STFTFresnel)
+ * -------------------------------
+ * The second half of the file evaluates the STFT pixel value of a locally linear
+ * chirp analytically. Three nested layers, each with one shared body that also
+ * returns a first moment when the caller asks for one:
+ *
+ *   get_fresnel_aux            – the auxiliary functions f, g (and df, dg)
+ *   get_phase_kernel_core      – one integration interval, demodulated
+ *   get_windowed_fourier_core  – the seven Tukey terms of one STFT window
+ *
+ * The public entry points sit on top: get_fourier_value, and its factorised
+ * pair get_fourier_prefactor * get_fourier_kernel. Only the prefactor depends
+ * on amplitude and phase, so the information-matrix kernel in
+ * lat_stft_kernels.hh evaluates the kernel once and shares it across templates
+ * that agree on (f0, fdot0, window start).
+ *
  * @see domains.hpp for class declarations and detailed parameter documentation.
  */
 
@@ -163,7 +179,7 @@ int STFTDomain::get_freq_index(double f) {
 CUDA_DEVICE
 int STFTDomain::get_data_index(int t_idx, int f_idx, int channel,
                                int data_index) {
-  if (data_index > num_data) {
+  if (data_index >= num_data) {
 #ifdef __CUDACC__
 #else
     throw std::invalid_argument(
@@ -194,7 +210,7 @@ cmplx STFTDomain::get_data_value(int t_idx, int f_idx, int channel,
 CUDA_DEVICE
 int STFTDomain::get_noise_index(int t_idx, int f_idx, int channel,
                                 int noise_index) {
-  if (noise_index > num_noise) {
+  if (noise_index >= num_noise) {
 #ifdef __CUDACC__
 #else
     throw std::invalid_argument(
@@ -225,7 +241,7 @@ cmplx STFTDomain::get_invC_value(int t_idx, int f_idx, int channel,
 CUDA_DEVICE
 int STFTDomain::get_noise_index_cross(int t_idx, int f_idx, int ch_i, int ch_j,
                                       int noise_index) {
-  if (noise_index > num_noise) {
+  if (noise_index >= num_noise) {
 #ifdef __CUDACC__
 #else
     throw std::invalid_argument(
@@ -537,8 +553,7 @@ void STFTDomain::compute_likelihood_terms_wrap(
   // Number of blocks along the (t,f) dimension; each block reduces
   // NUM_THREADS pixels and contributes one partial-sum entry.
   int num_blocks_x =
-      std::ceil((num_times_template * num_freqs_template + NUM_THREADS - 1) /
-                NUM_THREADS);
+      (num_times_template * num_freqs_template + NUM_THREADS - 1) / NUM_THREADS;
   int num_blocks_y = num_binaries;  // one row of blocks per binary
   dim3 grid_dim(num_blocks_x, num_blocks_y);
 
@@ -557,15 +572,8 @@ void STFTDomain::compute_likelihood_terms_wrap(
                          num_binaries * num_blocks_x * sizeof(cmplx)));
   }
 
-  // Copy the host STFTDomain struct (including its device data/invC pointers)
-  // to the device so the kernel can call member functions through the pointer.
-  //   STFTDomain* domain_ptr;
-  //   gpuErrchk(cudaMalloc(&domain_ptr, sizeof(STFTDomain)));
-  //   gpuErrchk(
-  //       cudaMemcpy(domain_ptr, this, sizeof(STFTDomain),
-  //       cudaMemcpyHostToDevice));
-
-  // Pass 1: compute per-block partial sums of (d|h) and (h|h).
+  // Pass 1: compute per-block partial sums of (d|h) and (h|h). `*this` is passed by value: the
+  // struct is copied into kernel-arg space and its data/invC fields are already device pointers.
   compute_likelihood_contributions_kernel<<<grid_dim, NUM_THREADS>>>(
       d_h_contrib, h_h_contrib, *this, template_vals, start_times_all,
       start_freqs_all, num_binaries, data_index_all, noise_index_all,
@@ -584,7 +592,6 @@ void STFTDomain::compute_likelihood_terms_wrap(
     gpuErrchk(cudaFree(h_h_contrib));
     cudaDeviceSynchronize();
   }
-  //   gpuErrchk(cudaFree(domain_ptr));
 
 #else
   // CPU path: the kernel function is a plain C++ function.  Results are
@@ -629,14 +636,6 @@ double STFTFresnel::get_zeta(double f, double f0, double fdot0) {
   return zeta;
 }
 
-CUDA_DEVICE
-double STFTFresnel::get_v(double tau, double f, double f0, double fdot0) {
-  double zeta = get_zeta(f, f0, fdot0);
-  double v = std::sqrt(2.0 * std::abs(fdot0)) *
-             (tau + zeta);  // todo: check for negative fdot0
-  return v;
-}
-
 /**
  * Evaluate the Fresnel integrals C(x) and S(x).
  *
@@ -662,27 +661,7 @@ double STFTFresnel::get_v(double tau, double f, double f0, double fdot0) {
  */
 CUDA_DEVICE
 void STFTFresnel::get_fresnel_integrals(double* C, double* S, double x) {
-  double cos_arg_unused, sin_arg_unused;
-  get_fresnel_integrals_with_expi(C, S, &cos_arg_unused, &sin_arg_unused, x);
-}
-
-// Body of get_fresnel_integrals, additionally exposing the internal
-// cos/sin(0.5*pi*x^2) evaluated once at the top (the auxiliary-branch sincos).
-// These are exactly the Fresnel derivatives dC/dx and dS/dx, so the fused
-// moment evaluator reuses them instead of re-calling sincos. They are even in
-// x (the argument is 0.5*pi*x^2), so the x < 0 odd-symmetry flip applied to
-// C and S below does NOT apply to them.
-CUDA_DEVICE
-void STFTFresnel::get_fresnel_integrals_with_expi(double* C, double* S,
-                                                  double* cos_arg,
-                                                  double* sin_arg, double x) {
   double abs_x = std::abs(x);
-  double pi_x = M_PI * abs_x;
-  double half_pi_x2 = 0.5 * pi_x * abs_x;  // arg = 0.5 * pi * ax^2
-  double c_halfpix2 = std::cos(half_pi_x2);
-  double s_halfpix2 = std::sin(half_pi_x2);
-  *cos_arg = c_halfpix2;
-  *sin_arg = s_halfpix2;
   double S_val, C_val;
 
   if (abs_x <= 1.6) {
@@ -709,6 +688,42 @@ void STFTFresnel::get_fresnel_integrals_with_expi(double* C, double* S,
       }
     }
   } else {
+    // ? Only the auxiliary branches need cos/sin(0.5*pi*ax^2); the series above does not,
+    // ? so the sincos sits here rather than at the top of the function.
+    double half_pi_x2 = 0.5 * (M_PI * abs_x) * abs_x;  // arg = 0.5 * pi * ax^2
+    double c_halfpix2 = std::cos(half_pi_x2);
+    double s_halfpix2 = std::sin(half_pi_x2);
+    double f_x, g_x;
+    get_fresnel_aux(&f_x, &g_x, abs_x);
+    S_val = 0.5 - f_x * c_halfpix2 - g_x * s_halfpix2;
+    C_val = 0.5 + f_x * s_halfpix2 - g_x * c_halfpix2;
+  }
+
+  // Complex conjugate when fdot < 0
+  if (x < 0) { 
+    *C = -C_val;  // Fresnel C integral
+    *S = -S_val;  // Fresnel S integral
+  } else {
+    *C = C_val;  // Fresnel C integral
+    *S = S_val;  // Fresnel S integral
+  }
+}
+
+// Auxiliary Fresnel functions f and g for |x| > 1.6, the form branches 2 and 3 are built from:
+//   C + iS = sign(x) [ (1+i)/2 - (g + i f)(|x|) e^{i pi x^2 / 2} ].
+// Held apart from get_fresnel_integrals so get_phase_kernel_core can use f and g directly,
+// without ever forming e^{i pi x^2 / 2}.
+//
+// df_out and dg_out are the derivatives in |x|, needed only by the envelope moment; pass nullptr
+// for either to skip them. Differentiating C = 0.5 + f sin(theta) - g cos(theta) at
+// theta = pi x^2 / 2 and matching the independent sin and cos parts gives the exact identities
+//   f' = -pi x g,   g' = pi x f - 1.
+CUDA_DEVICE
+void STFTFresnel::get_fresnel_aux(double* f_out, double* g_out, double abs_x,
+                                  double* df_out, double* dg_out) {
+  double pi_x = M_PI * abs_x;
+  bool with_derivatives = (df_out != nullptr);
+  {
     double f_x, g_x;
     if (abs_x < 8.0) {
       // Branch 2: auxiliary form with minimax rational fits in u = 1/ax^2
@@ -743,6 +758,10 @@ void STFTFresnel::get_fresnel_integrals_with_expi(double* C, double* S,
       qg = qg * u + 1.0000000000000000e+00;
       f_x = (1.0 / pi_x) * (pf / qf);
       g_x = (1.0 / (M_PI * M_PI * abs_x * abs_x * abs_x)) * (pg / qg);
+      if (with_derivatives) {
+        *df_out = -pi_x * g_x;
+        *dg_out = pi_x * f_x - 1.0;
+      }
     } else {
       // Branch 3: 5-term asymptotic series, w = 1/(pi*ax^2).
       //   f = (1/(pi*ax)) sum_{m=0}^{4} (-1)^m (4m-1)!! w^{2m}   ((-1)!!=1)
@@ -759,50 +778,22 @@ void STFTFresnel::get_fresnel_integrals_with_expi(double* C, double* S,
                            w2 * (945.0 + w2 * (-135135.0 + w2 * 34459425.0))));
       f_x = (1.0 / pi_x) * f_sum;
       g_x = (1.0 / pi_x) * g_sum;
+      if (with_derivatives) {
+        // ! Here g' by the identity above is a catastrophic cancellation once pi x f -> 1: the true
+        // ! value falls as -3 w^2 (5e-20 at x = 5e4) while the subtraction rounds at 1e-16. This
+        // ! branch's series is differentiated instead, term by term, using dw/dx = -2w/x:
+        // !   f = F(w)/(pi x)  ->  f' = -[F + 2 w F'] / (pi x^2), and likewise for g.
+        double df_sum =
+            w * (-6.0 + w2 * (420.0 + w2 * (-62370.0 + w2 * 16216200.0)));
+        double dg_sum = 1.0 + w2 * (-45.0 + w2 * (4725.0 + w2 * (-945945.0 +
+                                                                 w2 * 310134825.0)));
+        *df_out = -w * (f_sum + 2.0 * w * df_sum);
+        *dg_out = -w * (g_sum + 2.0 * w * dg_sum);
+      }
     }
-    S_val = 0.5 - f_x * c_halfpix2 - g_x * s_halfpix2;
-    C_val = 0.5 + f_x * s_halfpix2 - g_x * c_halfpix2;
+    *f_out = f_x;
+    *g_out = g_x;
   }
-
-  if (x < 0) {
-    *C = -C_val;  // Fresnel C integral
-    *S = -S_val;  // Fresnel S integral
-  } else {
-    *C = C_val;  // Fresnel C integral
-    *S = S_val;  // Fresnel S integral
-  }
-}
-
-CUDA_DEVICE
-cmplx STFTFresnel::get_fresnel_kernel_interval(double f, double t0, double f0,
-                                               double fdot0, double t_start,
-                                               double t_end) {
-  double tau_start = t_start - t0;
-  double tau_end = t_end - t0;
-  double v_start = get_v(tau_start, f, f0, fdot0);
-
-  double v_end = get_v(tau_end, f, f0, fdot0);
-
-  double C_start, S_start, C_end, S_end;
-  get_fresnel_integrals(&C_start, &S_start, v_start);
-  get_fresnel_integrals(&C_end, &S_end, v_end);
-
-  double delta_C = C_end - C_start;
-  double delta_S = S_end - S_start;
-  cmplx kernel =
-      (fdot0 >= 0.0) ? cmplx(delta_C, delta_S) : cmplx(delta_C, -delta_S);
-
-  return kernel;
-}
-
-CUDA_DEVICE
-cmplx STFTFresnel::get_fresnel_kernel(double f, double t0, double f0,
-                                      double fdot0) {
-  double t1 = t0 + dt;  // End of the current STFT window. we are assuming that
-                        // everything is correctly aligned with the stft grid
-
-  cmplx kernel = get_fresnel_kernel_interval(f, t0, f0, fdot0, t0, t1);
-  return kernel;
 }
 
 CUDA_DEVICE
@@ -810,79 +801,126 @@ cmplx STFTFresnel::get_phase_kernel_product(double f_eff, double t_ref,
                                             double f0, double fdot0,
                                             double t_start, double t_end,
                                             double t_ft_origin) {
-  cmplx kernel =
-      get_fresnel_kernel_interval(f_eff, t_ref, f0, fdot0, t_start, t_end);
-  double zeta = get_zeta(f_eff, f0, fdot0);
-  // First term: the usual stationary-phase factor for a chirp referenced at
-  // t_ref.  Second term: re-references the Fourier transform back to the
-  // window start (t_ft_origin) when the chirp is anchored elsewhere
-  // (t_ref = midpoint).  It is exactly 0 when t_ref == t_ft_origin, so the
-  // initial-time path is bit-for-bit unchanged.
-  double phase = -M_PI * fdot0 * zeta * zeta -
-                 2.0 * M_PI * f_eff * (t_ref - t_ft_origin);
-  return gcmplx::polar(1.0, phase) * kernel;
+  // The stationary factor exp(-i pi fdot0 zeta^2) and the Fresnel phase pi v^2 / 2 both carry
+  // pi (f0 - f_eff)^2 / fdot0 -- 1e12 rad at fdot0 = 1e-19, and 3e15 rad for the taper's
+  // f -/+ f_taper terms -- and cancel analytically. Formed apart, their last bits alone cost up to
+  // 1e-4 of the value and 1e4 of its f0 derivative. Each endpoint therefore carries the combined
+  // phase psi = pi fdot0 tau^2 + 2 pi (f0 - f_eff) tau, which never exceeds a few thousand radians:
+  //   C + i s S = sign(v) [ (1 + i s) / 2 - (g + i s f)(|v|) e^{i s pi v^2 / 2} ],  s = sign(fdot0)
+  //   e^{i s pi v^2 / 2} e^{-i pi fdot0 zeta^2} = e^{i psi},   since fdot0 zeta = f0 - f_eff.
+  // The fdot0 < 0 conjugation, the signed zeta and the magnitude under the root follow the
+  // convention in _dev/gbs_derivatives/fresnel_playground_negative_fdot.ipynb.
+  cmplx kernel;
+  get_phase_kernel_core(f_eff, t_ref, f0, fdot0, t_start, t_end, t_ft_origin,
+                        &kernel, nullptr);
+  return kernel;
 }
 
-// Fused evaluator: the phase-kernel product AND its first moment about t_ref
-// in one pass. *kernel_out reproduces get_phase_kernel_product BIT-FOR-BIT
-// (same evaluation sequence); the moment costs no additional Fresnel
-// evaluations, endpoint sincos, or polar on top of it (they are shared),
-// versus ~5-6 redundant sincos per call when the two were evaluated apart.
-//
-// Moment derivation (guide A2): with F(f) the phase-kernel product, the
-// linear-envelope first moment integral is  int tau e^{i phi} dtau = (i/2pi) dF/df;
-// anchored at t_ref it reduces to
-//   M = polar(1, phase) * [ -zeta*kernel + (i/2pi) dkernel/df ].
-// `phase` is IDENTICAL to the zeroth moment's, so the t_ref/t_ft_origin
-// anchoring (incl. use_midpoint) matches exactly; the (t_ref - t_ft_origin)
-// Fourier-origin shift cancels analytically into the -zeta*kernel stationary
-// term (validated: helper-form == (i/2pi)dF/df - (t_ref-t0)F to ~4e-10).
-// dC/dv = cos(pi v^2/2), dS/dv = sin(pi v^2/2) are the exact Fresnel
-// derivatives -- here reused from get_fresnel_integrals_with_expi's endpoint
-// evaluations (they differ from the previous direct cos/sin(0.5*M_PI*v*v)
-// calls only by ulp-level argument association, 0.5*(M_PI*|v|)*|v| vs
-// ((0.5*M_PI)*v)*v); dv/df = -sqrt(2|fdot0|)/fdot0 at both endpoints.
+// Shared body of the phase-kernel product and its first moment about t_ref. The moment is
+//   moment = sqrt(2 |fdot0|) int tau e^{i psi} dtau = (1 / 2 pi i) d(kernel) / d(delta_f),
+// so it is the same endpoint decomposition differentiated in delta_f = f0 - f_eff, using
+// dv/d(delta_f) = sign(v) sqrt(2|fdot0|) / fdot0 and d(psi)/d(delta_f) = 2 pi tau. Differentiating
+// in this form is what keeps the moment conditioned: the textbook expression -zeta * kernel +
+// (i / 2 pi) d(kernel)/df subtracts two terms of size |zeta * kernel|, and zeta reaches 1e17 s.
 CUDA_DEVICE
-void STFTFresnel::get_phase_kernel_product_with_moment(
-    double f_eff, double t_ref, double f0, double fdot0, double t_start,
-    double t_end, double t_ft_origin, cmplx* kernel_out, cmplx* moment_out) {
-  double tau_start = t_start - t_ref;
-  double tau_end = t_end - t_ref;
-  double v_start = get_v(tau_start, f_eff, f0, fdot0);
-  double v_end = get_v(tau_end, f_eff, f0, fdot0);
-
-  double C_start, S_start, C_end, S_end;
-  double cos_start, sin_start, cos_end, sin_end;
-  get_fresnel_integrals_with_expi(&C_start, &S_start, &cos_start, &sin_start,
-                                  v_start);
-  get_fresnel_integrals_with_expi(&C_end, &S_end, &cos_end, &sin_end, v_end);
-  double delta_C = C_end - C_start;
-  double delta_S = S_end - S_start;
-  cmplx kernel =
-      (fdot0 >= 0.0) ? cmplx(delta_C, delta_S) : cmplx(delta_C, -delta_S);
-
-  double dv_df = -std::sqrt(2.0 * std::abs(fdot0)) / fdot0;
-  double dC_df = dv_df * (cos_end - cos_start);
-  double dS_df = dv_df * (sin_end - sin_start);
-  cmplx dkernel_df =
-      (fdot0 >= 0.0) ? cmplx(dC_df, dS_df) : cmplx(dC_df, -dS_df);
-
+void STFTFresnel::get_phase_kernel_core(double f_eff, double t_ref, double f0,
+                                        double fdot0, double t_start,
+                                        double t_end, double t_ft_origin,
+                                        cmplx* kernel_out, cmplx* moment_out) {
   double zeta = get_zeta(f_eff, f0, fdot0);
-  double phase = -M_PI * fdot0 * zeta * zeta -
-                 2.0 * M_PI * f_eff * (t_ref - t_ft_origin);
-  cmplx rot = gcmplx::polar(1.0, phase);
-  cmplx moment_kernel =
-      -zeta * kernel + cmplx(0.0, 1.0 / (2.0 * M_PI)) * dkernel_df;
-  *kernel_out = rot * kernel;
-  *moment_out = rot * moment_kernel;
+  double root = std::sqrt(2.0 * std::abs(fdot0));
+  double sign_fdot = (fdot0 >= 0.0) ? 1.0 : -1.0;
+  double delta_f = f0 - f_eff;  // = fdot0 * zeta, without the round trip through zeta
+  bool with_moment = (moment_out != nullptr);
+
+  cmplx oscillating(0.0, 0.0);
+  cmplx oscillating_moment(0.0, 0.0);
+  cmplx series_part(0.0, 0.0);
+  double constant_weight = 0.0;
+  bool needs_stationary = false;
+  double psi_end = 0.0, psi_start = 0.0;
+
+  for (int endpoint = 0; endpoint < 2; endpoint += 1) {
+    double tau = (endpoint == 0) ? (t_end - t_ref) : (t_start - t_ref);
+    double weight = (endpoint == 0) ? 1.0 : -1.0;
+    double v = root * (tau + zeta);
+    double abs_v = std::abs(v);
+    double sign_v = (v >= 0.0) ? 1.0 : -1.0;
+    double psi = M_PI * fdot0 * tau * tau + 2.0 * M_PI * delta_f * tau;
+    if (endpoint == 0) psi_end = psi; else psi_start = psi;
+    if (abs_v > 1.6) {
+      double f_x, g_x, df_x = 0.0, dg_x = 0.0;
+      if (with_moment)
+        get_fresnel_aux(&f_x, &g_x, abs_v, &df_x, &dg_x);
+      else
+        get_fresnel_aux(&f_x, &g_x, abs_v);
+      cmplx rotation = gcmplx::polar(1.0, psi);
+      cmplx aux(g_x, sign_fdot * f_x);
+      oscillating = oscillating - (weight * sign_v) * rotation * aux;
+      if (with_moment) {
+        // (1 / 2 pi i) d/d(delta_f) of this endpoint's term.
+        cmplx aux_slope(dg_x, sign_fdot * df_x);
+        oscillating_moment =
+            oscillating_moment +
+            weight * rotation *
+                (cmplx(0.0, root / (2.0 * M_PI * fdot0)) * aux_slope -
+                 (sign_v * tau) * aux);
+      }
+      constant_weight += weight * sign_v;
+    } else {
+      // * The endpoint lies within 1.6 / sqrt(2 |fdot0|) of the stationary point, so |zeta| is
+      // * bounded by |tau| plus that width and the stationary factor below is safe to form.
+      double C_v, S_v;
+      get_fresnel_integrals(&C_v, &S_v, v);
+      series_part = series_part + weight * cmplx(C_v, sign_fdot * S_v);
+      needs_stationary = true;
+    }
+  }
+
+  cmplx bounded(0.0, 0.0);
+  bool bounded_zeta = (needs_stationary || constant_weight != 0.0);
+  if (bounded_zeta) {
+    // ! A surviving constant means v changed sign inside the interval, so -zeta lies in it and
+    // ! |zeta| <= the interval length. Where |zeta| is large the two constants cancel exactly and
+    // ! this branch is skipped, which is what keeps the large phase out of the evaluation.
+    cmplx stationary = gcmplx::polar(1.0, -M_PI * fdot0 * zeta * zeta);
+    cmplx flat = series_part + constant_weight * cmplx(0.5, 0.5 * sign_fdot);
+    bounded = stationary * flat;
+  }
+  // Re-references the Fourier transform to the window start when the chirp is anchored elsewhere
+  // (t_ref = midpoint); exactly 1 when t_ref == t_ft_origin.
+  cmplx origin =
+      gcmplx::polar(1.0, -2.0 * M_PI * f_eff * (t_ref - t_ft_origin));
+  cmplx kernel = oscillating + bounded;
+  *kernel_out = origin * kernel;
+  if (!with_moment) return;
+
+  cmplx moment;
+  if (bounded_zeta) {
+    // Near the stationary point the endpoint derivatives are a difference of two cosines that are
+    // both 1 to within the rounding, so that form loses the whole answer. Here |zeta| is bounded, so
+    // integrate (tau + zeta) e^{i psi} in closed form instead:
+    //   int (tau + zeta) e^{i psi} dtau = [e^{i psi}] / (2 pi i fdot0),
+    //   moment = root [e^{i psi}] / (2 pi i fdot0) - zeta * kernel.
+    // The endpoint difference is taken as e^{i psi_start} (e^{i dpsi} - 1) = e^{i psi_start} *
+    // 2i sin(dpsi/2) e^{i dpsi/2}, which keeps its accuracy when dpsi is small.
+    double half = 0.5 * (psi_end - psi_start);
+    cmplx difference = (2.0 * std::sin(half)) *
+                       (gcmplx::polar(1.0, psi_start + half) * cmplx(0.0, 1.0));
+    moment = cmplx(0.0, -root / (2.0 * M_PI * fdot0)) * difference - zeta * kernel;
+  } else {
+    moment = oscillating_moment;
+  }
+  *moment_out = origin * moment;
 }
 
+// Seven-term Tukey decomposition of the windowed Fourier value, without the amplitude and
+// phase prefactor. moment_out may be null; when it is not, every term also returns its first
+// moment about t_ref, and the two are combined with the same weights and taper rotations.
 CUDA_DEVICE
-cmplx STFTFresnel::get_windowed_fourier_value(double amp, double phase0,
-                                              double f0, double fdot0,
-                                              double t0, double f,
-                                              double slope) {
-  // account the effect of a tukey window on the fourier value.
+void STFTFresnel::get_windowed_fourier_core(double f0, double fdot0, double t0,
+                                            double f, cmplx* kernel_out,
+                                            cmplx* moment_out) {
   double t_end = t0 + dt;
   double t_roll_on = t0 + taper_duration;
   double t_roll_off = t_end - taper_duration;
@@ -890,62 +928,22 @@ cmplx STFTFresnel::get_windowed_fourier_value(double amp, double phase0,
   // Chirp reference: bin start (default) or bin midpoint (more accurate).  The
   // Fourier-transform origin is always the window start t0, so each sub-term
   // automatically picks up the correct per-effective-frequency compensating
-  // phase inside get_phase_kernel_product and the output stays in the standard
+  // phase inside get_phase_kernel_core and the output stays in the standard
   // STFT convention.  Integration bounds remain the physical window times.
   double t_ref = use_midpoint ? (t0 + 0.5 * dt) : t0;
+  bool with_moment = (moment_out != nullptr);
 
-  double amplitude = amp / std::sqrt(2.0 * std::abs(fdot0));
-  cmplx overall_factor = gcmplx::polar(amplitude, phase0);
+  // The seven terms, in order: the rectangular window, then the left ramp's DC and its two
+  // taper sidebands, then the same three for the right ramp.
+  const double f_shift[7] = {0.0, 0.0, -f_taper, +f_taper, 0.0, -f_taper, +f_taper};
+  const double t_lo[7] = {t0, t0, t0, t0, t_roll_off, t_roll_off, t_roll_off};
+  const double t_hi[7] = {t_end, t_roll_on, t_roll_on, t_roll_on,
+                          t_end, t_end,     t_end};
 
-  // Linear-envelope correction: each sub-interval term also gets its own
-  // first moment (same 7-term Tukey decomposition, same weights and taper
-  // rotations), added as slope * M below. The fused evaluator returns each
-  // term's {value, moment} in one pass -- the values are bit-identical to
-  // get_phase_kernel_product's, so gating only on (linear_envelope, slope)
-  // keeps the value path invariant. slope == 0.0 (astro-fallback columns)
-  // skips the moment work entirely: the correction would be exactly zero.
-  bool with_moment = linear_envelope && (slope != 0.0);
-
-  cmplx rectangular, left_dc, left_plus_shift, left_minus_shift;
-  cmplx right_dc, right_plus_shift, right_minus_shift;
-  cmplx m_rectangular(0.0, 0.0), m_left_dc(0.0, 0.0);
-  cmplx m_left_plus_shift(0.0, 0.0), m_left_minus_shift(0.0, 0.0);
-  cmplx m_right_dc(0.0, 0.0), m_right_plus_shift(0.0, 0.0);
-  cmplx m_right_minus_shift(0.0, 0.0);
-  if (with_moment) {
-    get_phase_kernel_product_with_moment(f, t_ref, f0, fdot0, t0, t_end, t0,
-                                         &rectangular, &m_rectangular);
-    get_phase_kernel_product_with_moment(f, t_ref, f0, fdot0, t0, t_roll_on,
-                                         t0, &left_dc, &m_left_dc);
-    get_phase_kernel_product_with_moment(f - f_taper, t_ref, f0, fdot0, t0,
-                                         t_roll_on, t0, &left_plus_shift,
-                                         &m_left_plus_shift);
-    get_phase_kernel_product_with_moment(f + f_taper, t_ref, f0, fdot0, t0,
-                                         t_roll_on, t0, &left_minus_shift,
-                                         &m_left_minus_shift);
-    get_phase_kernel_product_with_moment(f, t_ref, f0, fdot0, t_roll_off,
-                                         t_end, t0, &right_dc, &m_right_dc);
-    get_phase_kernel_product_with_moment(f - f_taper, t_ref, f0, fdot0,
-                                         t_roll_off, t_end, t0,
-                                         &right_plus_shift,
-                                         &m_right_plus_shift);
-    get_phase_kernel_product_with_moment(f + f_taper, t_ref, f0, fdot0,
-                                         t_roll_off, t_end, t0,
-                                         &right_minus_shift,
-                                         &m_right_minus_shift);
-  } else {
-    rectangular = get_phase_kernel_product(f, t_ref, f0, fdot0, t0, t_end, t0);
-    left_dc = get_phase_kernel_product(f, t_ref, f0, fdot0, t0, t_roll_on, t0);
-    left_plus_shift = get_phase_kernel_product(f - f_taper, t_ref, f0, fdot0,
-                                               t0, t_roll_on, t0);
-    left_minus_shift = get_phase_kernel_product(f + f_taper, t_ref, f0, fdot0,
-                                                t0, t_roll_on, t0);
-    right_dc =
-        get_phase_kernel_product(f, t_ref, f0, fdot0, t_roll_off, t_end, t0);
-    right_plus_shift = get_phase_kernel_product(f - f_taper, t_ref, f0, fdot0,
-                                                t_roll_off, t_end, t0);
-    right_minus_shift = get_phase_kernel_product(f + f_taper, t_ref, f0, fdot0,
-                                                 t_roll_off, t_end, t0);
+  cmplx term[7], moment[7];
+  for (int i = 0; i < 7; i += 1) {
+    get_phase_kernel_core(f + f_shift[i], t_ref, f0, fdot0, t_lo[i], t_hi[i], t0,
+                          &term[i], with_moment ? &moment[i] : nullptr);
   }
 
   // The right-ramp half-cosine is referenced to the segment END,
@@ -959,20 +957,51 @@ cmplx STFTFresnel::get_windowed_fourier_value(double amp, double phase0,
   cmplx right_rot_p = gcmplx::polar(1.0, -taper_rot);  // multiplies (f - f_taper)
   cmplx right_rot_m = gcmplx::polar(1.0, +taper_rot);  // multiplies (f + f_taper)
 
-  cmplx out = overall_factor * (rectangular - 0.5 * (left_dc + right_dc) -
-                                0.25 * (left_plus_shift + left_minus_shift +
-                                        right_rot_p * right_plus_shift +
-                                        right_rot_m * right_minus_shift));
+  *kernel_out = term[0] - 0.5 * (term[1] + term[4]) -
+                0.25 * (term[2] + term[3] + right_rot_p * term[5] +
+                        right_rot_m * term[6]);
+  if (!with_moment) return;
+  *moment_out = moment[0] - 0.5 * (moment[1] + moment[4]) -
+                0.25 * (moment[2] + moment[3] + right_rot_p * moment[5] +
+                        right_rot_m * moment[6]);
+}
 
-  if (with_moment) {
-    cmplx moment =
-        overall_factor * (m_rectangular - 0.5 * (m_left_dc + m_right_dc) -
-                          0.25 * (m_left_plus_shift + m_left_minus_shift +
-                                  right_rot_p * m_right_plus_shift +
-                                  right_rot_m * m_right_minus_shift));
-    out = out + slope * moment;
-  }
-  return out;
+CUDA_DEVICE
+cmplx STFTFresnel::get_windowed_fourier_kernel(double f0, double fdot0,
+                                               double t0, double f) {
+  cmplx kernel;
+  get_windowed_fourier_core(f0, fdot0, t0, f, &kernel, nullptr);
+  return kernel;
+}
+
+CUDA_DEVICE
+cmplx STFTFresnel::get_windowed_fourier_value(double amp, double phase0,
+                                              double f0, double fdot0,
+                                              double t0, double f,
+                                              double slope) {
+  // account the effect of a tukey window on the fourier value.
+  // window_factor is ignored whenever the Tukey evaluator runs (see get_fourier_value), so the
+  // 1.0 passed here never reaches the returned prefactor.
+  cmplx overall_factor = get_fourier_prefactor(amp, phase0, fdot0, 1.0);
+
+  // Linear-envelope correction: each sub-interval term also gets its own
+  // first moment (same 7-term Tukey decomposition, same weights and taper
+  // rotations), added as slope * M below. The core returns each term's
+  // {value, moment} in one pass -- the values are bit-identical to the
+  // moment-free path's, so gating only on (linear_envelope, slope) keeps the
+  // value path invariant. slope == 0.0 (astro-fallback columns) skips the
+  // moment work entirely: the correction would be exactly zero.
+  bool with_moment = linear_envelope && (slope != 0.0);
+
+  // * Without the moment the value is the prefactor times the shared kernel.
+  if (!with_moment)
+    return overall_factor * get_windowed_fourier_kernel(f0, fdot0, t0, f);
+
+  cmplx kernel, moment_kernel;
+  get_windowed_fourier_core(f0, fdot0, t0, f, &kernel, &moment_kernel);
+  cmplx out = overall_factor * kernel;
+  cmplx moment = overall_factor * moment_kernel;
+  return out + slope * moment;
 }
 
 CUDA_DEVICE
@@ -986,14 +1015,7 @@ cmplx STFTFresnel::get_fourier_value(double amp, double phase0, double f0,
   if (window_alpha > 0.0)
     return get_windowed_fourier_value(amp, phase0, f0, fdot0, t0, f, slope);
 
-  double t1 = t0 + dt;
-
-  // Chirp reference: bin start (default) or bin midpoint (more accurate).  The
-  // Fourier-transform origin stays at the window start t0; the compensating
-  // phase added in get_phase_kernel_product keeps the standard STFT convention.
-  double t_ref = use_midpoint ? (t0 + 0.5 * dt) : t0;
-
-  double amplitude = window_factor * amp / std::sqrt(2.0 * std::abs(fdot0));
+  cmplx pref = get_fourier_prefactor(amp, phase0, fdot0, window_factor);
 
   // Linear-envelope correction: out += slope * (i/2pi) dF/df, anchored at
   // t_ref, computed by the fused evaluator (value bit-identical to the plain
@@ -1001,20 +1023,82 @@ cmplx STFTFresnel::get_fourier_value(double amp, double phase0, double f0,
   // slope == 0.0 (astro-fallback columns, batch API) -> byte-identical
   // const-envelope value.
   if (linear_envelope && slope != 0.0) {
+    // Chirp reference: bin start (default) or bin midpoint (more accurate). The
+    // Fourier-transform origin stays at the window start t0; the compensating
+    // phase added in get_phase_kernel_core keeps the standard STFT convention.
+    double t_ref = use_midpoint ? (t0 + 0.5 * dt) : t0;
     cmplx phase_kernel, moment_kernel;
-    get_phase_kernel_product_with_moment(f, t_ref, f0, fdot0, t0, t1, t0,
-                                         &phase_kernel, &moment_kernel);
-    cmplx pref = gcmplx::polar(amplitude, phase0);
+    get_phase_kernel_core(f, t_ref, f0, fdot0, t0, t0 + dt, t0, &phase_kernel,
+                          &moment_kernel);
     return pref * phase_kernel + slope * pref * moment_kernel;
   }
 
-  cmplx phase_kernel = get_phase_kernel_product(f, t_ref, f0, fdot0, t0, t1, t0);
-  return gcmplx::polar(amplitude, phase0) * phase_kernel;
+  return pref * get_fourier_kernel(f0, fdot0, t0, f);
+}
+
+// * The single home of the amplitude and phase prefactor: both get_fourier_value and
+// * get_windowed_fourier_value take theirs from here, so the value and the
+// * prefactor-times-kernel split the information-matrix kernel uses cannot drift apart.
+CUDA_DEVICE
+cmplx STFTFresnel::get_fourier_prefactor(double amp, double phase0,
+                                         double fdot0, double window_factor) {
+  if (window_alpha > 0.0)
+    return gcmplx::polar(amp / std::sqrt(2.0 * std::abs(fdot0)), phase0);
+  return gcmplx::polar(window_factor * amp / std::sqrt(2.0 * std::abs(fdot0)),
+                       phase0);
+}
+
+CUDA_DEVICE
+cmplx STFTFresnel::get_fourier_kernel(double f0, double fdot0, double t0,
+                                      double f) {
+  if (window_alpha > 0.0) return get_windowed_fourier_kernel(f0, fdot0, t0, f);
+  double t_ref = use_midpoint ? (t0 + 0.5 * dt) : t0;
+  return get_phase_kernel_product(f, t_ref, f0, fdot0, t0, t0 + dt, t0);
 }
 
 // ============================================================
 // Batched Fresnel Fourier-value kernel (map, not reduce)
 // ============================================================
+
+CUDA_KERNEL
+void compute_phase_kernel_moments_kernel(cmplx* kernel_out, cmplx* moment_out,
+                                         STFTFresnel fresnel, double* f_effs,
+                                         double* t_refs, double* f0s,
+                                         double* fdot0s, double* t_starts,
+                                         double* t_ends, double* t_origins,
+                                         int num) {
+#ifdef __CUDACC__
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= num) return;
+#else
+  for (int i = 0; i < num; i++) {
+#endif
+
+  fresnel.get_phase_kernel_core(f_effs[i], t_refs[i], f0s[i], fdot0s[i],
+                                t_starts[i], t_ends[i], t_origins[i],
+                                &kernel_out[i], &moment_out[i]);
+
+#ifndef __CUDACC__
+  }
+#endif
+}
+
+void STFTFresnel::compute_phase_kernel_moments_wrap(
+    cmplx* kernel_out, cmplx* moment_out, double* f_effs, double* t_refs,
+    double* f0s, double* fdot0s, double* t_starts, double* t_ends,
+    double* t_origins, int num) {
+#ifdef __CUDACC__
+  int num_blocks = (num + NUM_THREADS - 1) / NUM_THREADS;
+  compute_phase_kernel_moments_kernel<<<num_blocks, NUM_THREADS>>>(
+      kernel_out, moment_out, *this, f_effs, t_refs, f0s, fdot0s, t_starts,
+      t_ends, t_origins, num);
+  gpuErrchk(cudaGetLastError());
+#else
+  compute_phase_kernel_moments_kernel(kernel_out, moment_out, *this, f_effs,
+                                      t_refs, f0s, fdot0s, t_starts, t_ends,
+                                      t_origins, num);
+#endif
+}
 
 /**
  * @brief Compute Fresnel-based Fourier values for a batch of binaries.
@@ -1083,18 +1167,11 @@ void STFTFresnel::compute_fourier_values_wrap(cmplx* output, double* amps,
   int total = num_binaries * num_freqs;
   int num_blocks = (total + NUM_THREADS - 1) / NUM_THREADS;
 
-  //   STFTFresnel* dev_ptr;
-  //   gpuErrchk(cudaMalloc(&dev_ptr, sizeof(STFTFresnel)));
-  //   gpuErrchk(
-  //       cudaMemcpy(dev_ptr, this, sizeof(STFTFresnel),
-  //       cudaMemcpyHostToDevice));
-
   compute_fourier_values_kernel<<<num_blocks, NUM_THREADS>>>(
       output, *this, amps, phase0s, f0s, fdot0s, t0s, freqs, window_factor,
       num_binaries, num_freqs);
 
   gpuErrchk(cudaGetLastError());
-  // gpuErrchk(cudaFree(dev_ptr));
 #else
       compute_fourier_values_kernel(output, *this, amps, phase0s, f0s, fdot0s,
                                     t0s, freqs, window_factor, num_binaries,

@@ -165,6 +165,11 @@ static CUDA_DEVICE cmplx stft_block_reduce_cmplx(cmplx* sdata)
 // ---------------------------------------------------------------------------
 constexpr double STFT_FREQ_FDOT_DT_MAX = 3600.0;         ///< half-width cap [s]
 constexpr double STFT_DT_STENCIL_DEMOD = 2000.0;         ///< demodulated half-width [s]
+// Sign-preserving floor on the chirp rate. The Fresnel column carries 1/sqrt(2|fdot0|) and
+// zeta = (f0 - f)/fdot0, both singular at fdot0 = 0, which a stencil reaches whenever the fdot step
+// exceeds the chirp itself (the production step 1e-19 does so below ~1 mHz). At this floor the phase
+// it costs over a segment is pi |dfdot| tau^2 ~ 6e-13 rad, far below every other error here.
+constexpr double STFT_FDOT_FLOOR = 1.0e-22;              ///< [Hz/s]
 
 // Spacecraft acceleration for the analytic Doppler rate. DT_ORB spans 4x the 500 s
 // linear interpolation grid to prevent node aliasing.
@@ -204,6 +209,9 @@ CUDA_DEVICE inline void stft_freq_fdot_astro_fallback(
 {
     double f_astro = src.get_f(t, params, bin_i);
     double fdot_astro = src.get_fdot(t, params, bin_i);
+    // guard for small fdots that explode divisions
+    if (std::fabs(fdot_astro) < STFT_FDOT_FLOOR)
+        fdot_astro = std::signbit(fdot_astro) ? -STFT_FDOT_FLOOR : STFT_FDOT_FLOOR;
     for (int ch = 0; ch < 3; ch += 1)
     {
         f0_out[ch] = f_astro;
@@ -324,9 +332,9 @@ CUDA_DEVICE void stft_freq_fdot_from_tdi_phase(
         // Sign-preserving zero guard (protects float64 range across side-bins)
         // We only want to guard for exact cancellation of fdot that happen 
         // twice a year for binaries that are dominated by doppler modulation.
-        if (std::fabs(fdot0_out[ch]) < 1.0e-22)
+        if (std::fabs(fdot0_out[ch]) < STFT_FDOT_FLOOR)
         {
-            fdot0_out[ch] = std::signbit(fdot0_out[ch]) ? -1.0e-22 : 1.0e-22;
+            fdot0_out[ch] = std::signbit(fdot0_out[ch]) ? -STFT_FDOT_FLOOR : STFT_FDOT_FLOOR;
         }
     }
     if (isnan(f0_out[ch_ref]) || isnan(fdot0_out[ch_ref]))
@@ -507,6 +515,40 @@ struct FresnelColumn
         return s.fresnel->get_fourier_value(
             s.amp[j], s.phase[j], s.f0[j], s.fdot0[j],
             s.t_seg, freq_here, s.window_factor, s.a[j]);
+    }
+
+    // Optional split of value() used by the information-matrix kernel:
+    // value == prefactor * kernel, and kernel carries all per-pixel Fresnel work.
+    // * A channel with an active envelope moment does not factorise; its kernel is then
+    // * the full value and its prefactor is one, so the product still equals value().
+    CUDA_DEVICE static bool factorises(const State& s, int j)
+    {
+        return !(s.fresnel->linear_envelope && s.a[j] != 0.0);
+    }
+
+    CUDA_DEVICE static cmplx prefactor(const State& s, int j)
+    {
+        if (!factorises(s, j))
+            return cmplx(1.0, 0.0);
+        return s.fresnel->get_fourier_prefactor(s.amp[j], s.phase[j], s.fdot0[j],
+                                                s.window_factor);
+    }
+
+    CUDA_DEVICE static cmplx kernel(const State& s, int j, int freq_j_here,
+                                    double freq_here)
+    {
+        if (!factorises(s, j))
+            return value(s, j, freq_j_here, freq_here);
+        return s.fresnel->get_fourier_kernel(s.f0[j], s.fdot0[j], s.t_seg, freq_here);
+    }
+
+    // True when two (column, channel) pairs have the same kernel at every pixel: every input
+    // the kernel reads compares equal, so sharing it cannot change a finite value.
+    CUDA_DEVICE static bool same_kernel(const State& s_a, int j_a, const State& s_b, int j_b)
+    {
+        return factorises(s_a, j_a) && factorises(s_b, j_b)
+            && s_a.f0[j_a] == s_b.f0[j_b] && s_a.fdot0[j_a] == s_b.fdot0[j_b]
+            && s_a.t_seg == s_b.t_seg;
     }
 };
 
@@ -1533,6 +1575,408 @@ inline void stft_swap_ll_grad_impl(
         param_eps_add, param_eps_remove,
         num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
         start_freq_inds);
+#endif
+}
+
+// ===========================================================================
+// information_matrix : per-source Fisher matrix
+//   Gamma_ij = 4 df Re sum_{t,f,c,d} conj(dh_i,c) invC_cd dh_j,d
+// where dh_i is the four-point central difference (two-point with easy_central_difference) of the
+// fill_global template over parameter inds[i]. Each perturbed template keeps its own
+// +-n_side_bins support; the pixel sum runs over the union of the supports.
+// Templates on one (f0, fdot0) track share one Fresnel kernel per pixel (ColumnT::same_kernel)
+// and differ only in their prefactor. On the astro track that holds for every parameter except
+// the frequency ones, so a pixel needs 1 + 4 + 4 kernel sums instead of 32 templates x 3 channels.
+// eps <= 0 freezes a parameter (zero row and column). The output is exactly symmetric.
+// Layout: info_out[(bin * num_derivs + i) * num_derivs + j].
+// ===========================================================================
+#ifndef STFT_FISHER_NDERIV_MAX
+#define STFT_FISHER_NDERIV_MAX 9 // currently only verified for UCBs, current max cap for memory allocation
+#endif
+constexpr int STFT_FISHER_NSTENCIL_MAX  = 4;
+constexpr int STFT_FISHER_NTEMPLATE_MAX = STFT_FISHER_NDERIV_MAX * STFT_FISHER_NSTENCIL_MAX;
+constexpr int STFT_FISHER_NSLOT_MAX     = STFT_FISHER_NTEMPLATE_MAX * 3;  // one kernel per template and channel
+
+#ifdef __CUDACC__
+// Real, vector-valued twin of stft_block_reduce_cmplx: sums sdata[tid * width + w] over threads for
+// every w, leaving the sums in sdata[0 .. width - 1]. Requires blockDim.x a power of two.
+static CUDA_DEVICE void stft_block_reduce_vec(double* sdata, int width)
+{
+    int tid = threadIdx.x;
+    CUDA_SYNC_THREADS;
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            for (int w = 0; w < width; w += 1)
+                sdata[tid * width + w] = sdata[tid * width + w] + sdata[(tid + s) * width + w];
+        }
+        CUDA_SYNC_THREADS;
+    }
+}
+#endif
+
+// Per-source Fisher evaluation (the parameters are already loaded into the shared `params`).
+// `inds` and `eps` are per-derivative copies held by the caller. Writes the scaled matrix into
+// info_row_out[i * num_derivs + j] from thread 0 only.
+template <class SourceT, class ColumnT = FresnelColumn<SourceT>>
+CUDA_DEVICE void stft_eval_block_information(
+    SourceT& src, STFTFresnel* fresnel, STFTDomain* stft,
+    double* params, int nparams,
+    int* link_space_craft_rec, int* link_space_craft_em, int bin_i,
+    int noise_index, int start_j,
+    int* inds, double* eps, int num_derivs,
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    bool easy_central_difference,
+    double* reduce_tmp, int tid, double* info_row_out)
+{
+    const int num_stencil = easy_central_difference ? 2 : 4;
+
+    // These arrays are sized at compile time but still too large for registers; if the kernel is
+    // slow, their placement in local memory is the first thing to measure.
+    typename ColumnT::State cols[STFT_FISHER_NTEMPLATE_MAX];
+    cmplx pref[STFT_FISHER_NTEMPLATE_MAX][3];
+    int slot_of[STFT_FISHER_NTEMPLATE_MAX][3];
+    int slot_template[STFT_FISHER_NSLOT_MAX];
+    int slot_channel[STFT_FISHER_NSLOT_MAX];
+    int slot_lo[STFT_FISHER_NSLOT_MAX];
+    int slot_hi[STFT_FISHER_NSLOT_MAX];
+    cmplx slot_val[STFT_FISHER_NSLOT_MAX];
+    cmplx dh[STFT_FISHER_NDERIV_MAX][3];
+    cmplx invc_dh[STFT_FISHER_NDERIV_MAX][3];   // (invC dh_j)_c
+    cmplx invc[3][3];
+    double acc[STFT_FISHER_NDERIV_MAX][STFT_FISHER_NDERIV_MAX];
+    double params_local[N_PARAMS_MAX];
+    bool active[STFT_FISHER_NDERIV_MAX];
+
+    double t0 = stft->t0;
+    double dt = stft->dt;
+    double df = stft->df;
+    double f_min = stft->f_min;
+    int num_times = stft->num_times;
+    int num_freqs = stft->num_freqs;
+    bool cross_channel = (stft->tdi_type == TDI_XYZ);
+    int num_contract_channels = cross_channel ? 3 : stft->num_channels;
+    double t_anchor_shift = fresnel->use_midpoint ? 0.5 * dt : 0.0;
+
+    for (int i = 0; i < num_derivs; i += 1)
+    {
+        active[i] = (eps[i] > 0.0);
+        for (int j = 0; j < num_derivs; j += 1)
+            acc[i][j] = 0.0;
+    }
+
+    for (int time_i = THREAD_START_X; time_i < num_times; time_i += BLOCK_INCR_X)
+    {
+        double t_seg = t0 + time_i * dt;
+
+        // One column per (derivative, stencil point). Stencil point order: +eps, -eps, +2eps, -2eps.
+        // The shifts repeat the reference's p[ind] += eps, -= eps, += 2*eps, -= 2*eps exactly.
+        int carrier_lo = 0, carrier_hi = -1;
+        bool any_active = false;
+        // * Lowest and highest carrier among one derivative's stencil templates; their union of
+        // * supports is what all four of them are evaluated on (see the pixel loop).
+        int deriv_lo[STFT_FISHER_NDERIV_MAX];
+        int deriv_hi[STFT_FISHER_NDERIV_MAX];
+        for (int d = 0; d < num_derivs; d += 1)
+        {
+            if (!active[d])
+                continue;
+            double shift[STFT_FISHER_NSTENCIL_MAX] = {eps[d], -eps[d], 2.0 * eps[d], -(2.0 * eps[d])};
+            for (int p = 0; p < num_stencil; p += 1)
+            {
+                int tpl = d * STFT_FISHER_NSTENCIL_MAX + p;
+                for (int k = 0; k < nparams; k += 1)
+                    params_local[k] = params[k];
+                params_local[inds[d]] = params[inds[d]] + shift[p];
+
+                Vec k_vec(0.0, 0.0, 0.0), u_vec(0.0, 0.0, 0.0), v_vec(0.0, 0.0, 0.0);
+                src.get_sky_vectors(&k_vec, &u_vec, &v_vec, params_local);
+                ColumnT::setup(cols[tpl], src, fresnel, stft, params_local, k_vec, u_vec, v_vec,
+                               link_space_craft_rec, link_space_craft_em, bin_i,
+                               t_seg, t_anchor_shift, window_factor, freq_from_tdi_phase);
+                for (int c = 0; c < 3; c += 1)
+                    pref[tpl][c] = ColumnT::prefactor(cols[tpl], c);
+
+                int carrier = cols[tpl].carrier_j;
+                if (p == 0 || carrier < deriv_lo[d]) deriv_lo[d] = carrier;
+                if (p == 0 || carrier > deriv_hi[d]) deriv_hi[d] = carrier;
+                if (!any_active || carrier < carrier_lo) carrier_lo = carrier;
+                if (!any_active || carrier > carrier_hi) carrier_hi = carrier;
+                any_active = true;
+            }
+        }
+        if (!any_active)
+            continue;
+
+        // Group (template, channel) pairs into kernel slots; a slot is evaluated only on the union
+        // of its members' supports.
+        int num_slots = 0;
+        for (int d = 0; d < num_derivs; d += 1)
+        {
+            if (!active[d])
+                continue;
+            for (int p = 0; p < num_stencil; p += 1)
+            {
+                int tpl = d * STFT_FISHER_NSTENCIL_MAX + p;
+                // ! The bounds are the derivative's COMMON support, not this template's own carrier.
+                int support_lo = deriv_lo[d] - n_side_bins;
+                int support_hi = deriv_hi[d] + n_side_bins;
+                for (int c = 0; c < 3; c += 1)
+                {
+                    int found = -1;
+                    for (int s = 0; s < num_slots; s += 1)
+                    {
+                        if (ColumnT::same_kernel(cols[slot_template[s]], slot_channel[s], cols[tpl], c))
+                        {
+                            found = s;
+                            break;
+                        }
+                    }
+                    if (found < 0)
+                    {
+                        found = num_slots;
+                        slot_template[found] = tpl;
+                        slot_channel[found] = c;
+                        slot_lo[found] = support_lo;
+                        slot_hi[found] = support_hi;
+                        num_slots += 1;
+                    }
+                    else
+                    {
+                        if (support_lo < slot_lo[found]) slot_lo[found] = support_lo;
+                        if (support_hi > slot_hi[found]) slot_hi[found] = support_hi;
+                    }
+                    slot_of[tpl][c] = found;
+                }
+            }
+        }
+
+        int freq_j_first = carrier_lo - n_side_bins;
+        int freq_j_last  = carrier_hi + n_side_bins;
+        if (freq_j_first < start_j) freq_j_first = start_j;
+        if (freq_j_last > start_j + num_freqs - 1) freq_j_last = start_j + num_freqs - 1;
+
+        for (int freq_j_here = freq_j_first; freq_j_here <= freq_j_last; freq_j_here += 1)
+        {
+            int freq_j_local = freq_j_here - start_j;
+            double freq_here = f_min + freq_j_here * df;
+
+            for (int s = 0; s < num_slots; s += 1)
+            {
+                if ((freq_j_here >= slot_lo[s]) && (freq_j_here <= slot_hi[s]))
+                    slot_val[s] = ColumnT::kernel(cols[slot_template[s]], slot_channel[s],
+                                                  freq_j_here, freq_here);
+            }
+
+            // Template values as fill_global writes them, combined in the reference's operation order.
+            //
+            // COMMON SUPPORT. The four templates of one derivative are all evaluated on the union of
+            // their carriers' stencils, [min carrier - n_side_bins, max carrier + n_side_bins], not
+            // each on its own carrier's. The union is the SAME set for the four, so the cut cancels in
+            // the difference. It equals each template's own support whenever the four carriers agree,
+            // which is every pixel of every source except a carrier crossing.
+            //
+            // With each template on its own support instead, a step that moves one carrier across a
+            // half bin shifts that template's cut by one bin. The difference then keeps one whole edge
+            // pixel that the other three do not have, divided by eps: measured x1e3 to 2e4 in
+            // Gamma_f0f0 at n_side_bins = 10, for the ~1.2e-4 of sources where a stencil carrier
+            // crosses. The union adds at most the one extra edge bin to all four, which is leakage of
+            // order 1e-3 of a segment and cancels to the same order as the templates themselves.
+            for (int d = 0; d < num_derivs; d += 1)
+            {
+                if (!active[d])
+                    continue;
+                for (int c = 0; c < 3; c += 1)
+                {
+                    cmplx vals[STFT_FISHER_NSTENCIL_MAX];
+                    for (int p = 0; p < num_stencil; p += 1)
+                    {
+                        int tpl = d * STFT_FISHER_NSTENCIL_MAX + p;
+                        if ((freq_j_here >= deriv_lo[d] - n_side_bins)
+                            && (freq_j_here <= deriv_hi[d] + n_side_bins))
+                            vals[p] = 0.5 * (pref[tpl][c] * slot_val[slot_of[tpl][c]]);
+                        else
+                            vals[p] = cmplx(0.0, 0.0);
+                    }
+                    if (easy_central_difference)
+                        dh[d][c] = (vals[0] - vals[1]) / (2.0 * eps[d]);
+                    else
+                        dh[d][c] = (-vals[2] + vals[3] + 8.0 * (vals[0] - vals[1])) / (12.0 * eps[d]);
+                }
+            }
+
+            if (cross_channel)
+            {
+                for (int c = 0; c < 3; c += 1)
+                    for (int e = 0; e < 3; e += 1)
+                        invc[c][e] = stft->get_invC_cross_value(time_i, freq_j_local, c, e, noise_index);
+                for (int d = 0; d < num_derivs; d += 1)
+                {
+                    if (!active[d])
+                        continue;
+                    for (int c = 0; c < 3; c += 1)
+                        invc_dh[d][c] = invc[c][0] * dh[d][0] + invc[c][1] * dh[d][1] + invc[c][2] * dh[d][2];
+                }
+            }
+            else
+            {
+                for (int c = 0; c < num_contract_channels; c += 1)
+                    invc[c][c] = stft->get_invC_value(time_i, freq_j_local, c, noise_index);
+                for (int d = 0; d < num_derivs; d += 1)
+                {
+                    if (!active[d])
+                        continue;
+                    for (int c = 0; c < num_contract_channels; c += 1)
+                        invc_dh[d][c] = invc[c][c] * dh[d][c];
+                }
+            }
+
+            // Re(conj(x) y) = x.re y.re + x.im y.im, accumulated on the upper triangle only.
+            for (int i = 0; i < num_derivs; i += 1)
+            {
+                if (!active[i])
+                    continue;
+                for (int j = i; j < num_derivs; j += 1)
+                {
+                    if (!active[j])
+                        continue;
+                    double sum = 0.0;
+                    for (int c = 0; c < num_contract_channels; c += 1)
+                        sum += dh[i][c].real() * invc_dh[j][c].real() + dh[i][c].imag() * invc_dh[j][c].imag();
+                    acc[i][j] += sum;
+                }
+            }
+        }
+    }
+    CUDA_SYNC_THREADS;
+
+    double scale = 4.0 * stft->diff_comp;
+    for (int i = 0; i < num_derivs; i += 1)
+    {
+        int width = num_derivs - i;
+#ifdef __CUDACC__
+        // * Reduce one row of the upper triangle at a time through the shared staging array.
+        for (int w = 0; w < width; w += 1)
+            reduce_tmp[tid * width + w] = acc[i][i + w];
+        stft_block_reduce_vec(reduce_tmp, width);
+        if (tid == 0)
+        {
+            for (int w = 0; w < width; w += 1)
+            {
+                double val = scale * reduce_tmp[w];
+                info_row_out[i * num_derivs + i + w] = val;
+                info_row_out[(i + w) * num_derivs + i] = val;
+            }
+        }
+        CUDA_SYNC_THREADS;
+#else
+        (void) reduce_tmp;
+        (void) tid;
+        for (int w = 0; w < width; w += 1)
+        {
+            double val = scale * acc[i][i + w];
+            info_row_out[i * num_derivs + i + w] = val;
+            info_row_out[(i + w) * num_derivs + i] = val;
+        }
+#endif
+    }
+}
+
+template <class SourceT, class ColumnT = FresnelColumn<SourceT>>
+CUDA_KERNEL
+void stft_information_matrix_kernel(
+    double* info_out,
+    Orbits* orbits, TDIConfig* tdi_config,
+    STFTFresnel* fresnel, STFTDomain* stft,
+    double* params_all, int* noise_index_all,
+    int* inds, double* param_eps,
+    int num_bin, int nparams, int num_derivs, double T, double t_ref,
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    bool easy_central_difference,
+    int* start_freq_inds)
+{
+    CUDA_SHARED double reduce_tmp[NUM_THREADS_HERE * STFT_FISHER_NDERIV_MAX];
+    CUDA_SHARED double params[N_PARAMS_MAX];
+
+    SourceT src(orbits, tdi_config, T, t_ref);
+
+    CUDA_SHARED int link_space_craft_rec[NLINKS];
+    CUDA_SHARED int link_space_craft_em[NLINKS];
+    src.fill_link_arrays(link_space_craft_rec, link_space_craft_em);
+    CUDA_SYNC_THREADS;
+
+#ifdef __CUDACC__
+    int tid = threadIdx.x;
+#else
+    int tid = 0;
+#endif
+
+    // * The derivative index and step tables are read once per launch, not per pixel.
+    int inds_local[STFT_FISHER_NDERIV_MAX];
+    double eps_local[STFT_FISHER_NDERIV_MAX];
+    for (int d = 0; d < num_derivs; d += 1)
+    {
+        inds_local[d] = inds[d];
+        eps_local[d] = param_eps[inds[d]];
+    }
+
+    for (int bin_i = BLOCK_START_X; bin_i < num_bin; bin_i += GRID_INCR_X)
+    {
+        int noise_index = noise_index_all[bin_i];
+        // The window start belongs to the invC row this source is contracted against.
+        int start_j = (start_freq_inds == nullptr) ? 0 : start_freq_inds[noise_index];
+        for (int i = THREAD_START_X; i < nparams; i += BLOCK_INCR_X)
+            params[i] = params_all[bin_i * nparams + i];
+        CUDA_SYNC_THREADS;
+
+        stft_eval_block_information<SourceT, ColumnT>(
+            src, fresnel, stft, params, nparams,
+            link_space_craft_rec, link_space_craft_em, bin_i,
+            noise_index, start_j,
+            inds_local, eps_local, num_derivs,
+            n_side_bins, window_factor, freq_from_tdi_phase, easy_central_difference,
+            reduce_tmp, tid, &info_out[(size_t) bin_i * num_derivs * num_derivs]);
+        CUDA_SYNC_THREADS;
+    }
+}
+
+template <class SourceT, class ColumnT = FresnelColumn<SourceT>>
+inline void stft_information_matrix_impl(
+    double* info_out,
+    Orbits* orbits, TDIConfig* tdi_config,
+    STFTFresnel* fresnel, STFTDomain* stft,
+    double* params_all, int* noise_index_all,
+    int* inds, double* param_eps,
+    int num_bin, int nparams, int num_derivs, double T, double t_ref,
+    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    bool easy_central_difference,
+    int* start_freq_inds = nullptr)
+{
+    if (num_derivs < 1 || num_derivs > STFT_FISHER_NDERIV_MAX)
+        throw std::invalid_argument("stft_information_matrix: num_derivs must lie in [1, STFT_FISHER_NDERIV_MAX].");
+    if (nparams > N_PARAMS_MAX)
+        throw std::invalid_argument("stft_information_matrix: nparams exceeds N_PARAMS_MAX.");
+    // ! inds is device memory on the GPU path, so its range is checked by the Python caller.
+    if (num_bin == 0)
+        return;
+
+#ifdef __CUDACC__
+    const STFTDeviceStructs& dev = stft_device_structs(orbits, tdi_config, fresnel, stft);
+
+    dim3 grid((unsigned) num_bin, 1u, 1u);
+    stft_information_matrix_kernel<SourceT, ColumnT><<<grid, NUM_THREADS_HERE>>>(
+        info_out, dev.orbits, dev.tdi_config, dev.fresnel, dev.stft,
+        params_all, noise_index_all, inds, param_eps,
+        num_bin, nparams, num_derivs, T, t_ref, n_side_bins, window_factor,
+        freq_from_tdi_phase, easy_central_difference, start_freq_inds);
+    gpuErrchk(cudaGetLastError());
+#else
+    stft_information_matrix_kernel<SourceT, ColumnT>(
+        info_out, orbits, tdi_config, fresnel, stft,
+        params_all, noise_index_all, inds, param_eps,
+        num_bin, nparams, num_derivs, T, t_ref, n_side_bins, window_factor,
+        freq_from_tdi_phase, easy_central_difference, start_freq_inds);
 #endif
 }
 

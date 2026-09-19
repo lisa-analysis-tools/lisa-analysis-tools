@@ -134,8 +134,6 @@ from .gbbands import (
 from .gbmemprobe import make_probe
 from ...utils.devicereplicas import release_gb_comp_groups
 
-GB_RJ_TRACE = True # bool(int(os.environ.get("GB_RJ_TRACE", "0")))
-GB_PROP_TIMING_SYNC = True # bool(int(os.environ.get("GB_PROP_TIMING_SYNC", "0")))
 
 
 class _ProposeTimer:
@@ -149,7 +147,7 @@ class _ProposeTimer:
     On a CuPy backend the numbers are HOST wall time per stage. Because
     kernel launches are asynchronous, device work is attributed to the
     stage that *forces* the sync (the next ``asnumpy`` / ``.item()`` /
-    explicit synchronize). Set ``GB_PROP_TIMING_SYNC=1`` to synchronize the
+    explicit synchronize). Set ``GBDebugSettings.prop_timing_sync`` to synchronize the
     device at every span boundary instead — slightly slower overall, but
     each stage then carries exactly its own kernel time. Either view is
     diagnostic: if host time dominates in stages with tiny kernels
@@ -1314,7 +1312,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         t_i, w_i, b_i = picked["temp_inds"], picked["walker_inds"], picked["band_inds"]
         prop_counts[0][t_i, w_i, b_i] += 1
 
-        if GB_RJ_TRACE:
+        if getattr(self.debug_settings, "rj_trace", False):
             # Trace every cold-chain DEATH proposal (accepted or not) plus
             # every accepted cold-chain move. The death delta is
             # -<r|h> - 0.5<h|h>: for a well-fit bright source it must sit
@@ -1415,10 +1413,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         else:
             _info_comp = self.gb_wdm_comp
 
-        info_phys = _RoutedBandEngine.route_information_matrix(
-            _info_comp, model.analysis_container_arr, params_phys,
-            inds=_test_inds, noise_index=walker_inds,
-        )
+        _timer = getattr(self, "_prop_timer", None)
+        if _timer is not None:
+            _timer.count("fisher_sources", int(n_src))
+
+        with _tspan(_timer, "fisher_matrix"):
+            info_phys = _RoutedBandEngine.route_information_matrix(
+                _info_comp, model.analysis_container_arr, params_phys,
+                inds=_test_inds, noise_index=walker_inds,
+            )
 
         # Conditioning scales for the sampling basis (fdot spans ~1e-13 in
         # sampled units; without the rescale the Fisher inversion is
@@ -1430,33 +1433,37 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         # Numerical diagonal Jacobian d(phys[test_inds[i]]) / d(y_i) through
         # the transform container -- generic in the container's transforms.
-        J = xp.zeros((n_src, ndim))
-        for i in range(ndim):
-            h = 1e-6 * xp.maximum(xp.abs(coords[:, i]), 1e-3)
-            up = coords.copy()
-            dn = coords.copy()
-            up[:, i] += h
-            dn[:, i] -= h
-            dphys = (
-                self.transform_fn.both_transforms(up, xp=self.xp)[:, _test_inds[i]]
-                - self.transform_fn.both_transforms(dn, xp=self.xp)[:, _test_inds[i]]
-            )
-            J[:, i] = dphys / (2.0 * h) * s[i]
+        with _tspan(_timer, "fisher_jacobian"):
+            J = xp.zeros((n_src, ndim))
+            for i in range(ndim):
+                h = 1e-6 * xp.maximum(xp.abs(coords[:, i]), 1e-3)
+                up = coords.copy()
+                dn = coords.copy()
+                up[:, i] += h
+                dn[:, i] -= h
+                dphys = (
+                    self.transform_fn.both_transforms(up, xp=self.xp)[:, _test_inds[i]]
+                    - self.transform_fn.both_transforms(dn, xp=self.xp)[:, _test_inds[i]]
+                )
+                J[:, i] = dphys / (2.0 * h) * s[i]
 
-        info_y = info_phys * J[:, :, None] * J[:, None, :]
+            info_y = info_phys * J[:, :, None] * J[:, None, :]
 
-        self.mempool.free_all_blocks()
+        with _tspan(_timer, "fisher_mempool"):
+            self.mempool.free_all_blocks()
         # Robust inverse-Fisher factor: near-zero-SNR (prior-drawn) sources
         # give (numerically) singular Fishers. Eigendecompose and clamp the
         # spectrum to a relative floor; B = V diag(lambda^-1/2) satisfies
         # B B^T = inv(info) and is all the Gaussian proposal needs (the
         # proposal shape only -- M-H corrects).
-        evals, evecs = xp.linalg.eigh(info_y)
-        floor = 1e-10 * xp.maximum(
-            xp.abs(evals).max(axis=-1, keepdims=True), 1e-300
-        )
-        evals = xp.maximum(xp.abs(evals), floor)
-        return evecs / xp.sqrt(evals)[:, None, :]
+        with _tspan(_timer, "fisher_eigh"):
+            evals, evecs = xp.linalg.eigh(info_y)
+            floor = 1e-10 * xp.maximum(
+                xp.abs(evals).max(axis=-1, keepdims=True), 1e-300
+            )
+            evals = xp.maximum(xp.abs(evals), floor)
+            chol = evecs / xp.sqrt(evals)[:, None, :]
+        return chol
 
     def in_model_proposal(self, coords, chol, band_sorter, source_ids, model):
         """Default in-model proposal: group-stretch / info-matrix mix.
@@ -2353,11 +2360,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         st_all = time.perf_counter()
 
         # Per-propose stage timing (GPU-efficiency diagnosis): one INFO line
-        # per propose with the sorted stage breakdown. GB_PROP_TIMING_SYNC=1
+        # per propose with the sorted stage breakdown. debug_settings.prop_timing_sync
         # synchronizes the device at every span boundary so device work is
         # attributed to the launching stage (see _ProposeTimer docstring).
         _tm_sync = None
-        if self.backend.uses_cupy and GB_PROP_TIMING_SYNC:
+        if self.backend.uses_cupy and getattr(self.debug_settings, "prop_timing_sync", False):
             _tm_sync = self.xp.cuda.runtime.deviceSynchronize
         self._mem_probe = make_probe(
             self.xp,

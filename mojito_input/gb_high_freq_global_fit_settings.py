@@ -281,10 +281,12 @@ def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMe
 
     # * plot_dir=None puts the debug plots in <artifacts_file_dir>/gb_debug/.
     debug_settings = GBDebugSettings(
-        enabled=True,
+        enabled=False,
         plot_walker=0,
         plot_band=None,
         seq_pick="first",
+        rj_trace=False,
+        prop_timing_sync=False,
     )
     leaf_cap_settings = None
     # leaf_cap_settings = GBLeafCapSettings(
@@ -336,6 +338,8 @@ def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMe
         stretch_probability=stretch_probability,
         start_freq_ind=start_freq_ind,
         num_repeat_proposals=50,
+        num_band_preload=512,
+        num_bands_preload_temp=128,
         t0=general_set.data_t0,
         # tdi_setup="XYZ", degenerate with waveform_kwargs, skipped if provided
         # use_tdi2=True,
@@ -379,7 +383,7 @@ def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMe
 def get_general_erebor_settings() -> GeneralSetup:
 
     global_fit_codename = "erebor"
-    global_fit_version = "TEST_highf_gb_stft_multi_gpu"
+    global_fit_version = "highf_gb_stft_2_gpu_run2"
     global_fit_contact = "ereborl2d@googlegroups.com"
     global_fit_code_link = "https://github.com/Erebor-L2D"
     global_fit_input_data_link = "/workspace/ggfitlisa/ldc/mojito_light/"
@@ -399,9 +403,9 @@ def get_general_erebor_settings() -> GeneralSetup:
     head_dir = "/workspace/rrondeel/dev_gb_stft/_results/"
     data_input_path = "/workspace/ggfitlisa/ldc/mojito_light/"
     base_file_name = global_fit_version #"test_mbh_18_with_covariance"
-    file_store_dir = head_dir + "gb_testing/"
+    file_store_dir = head_dir + "gb_test_runs/"
 
-    gpus = [0] if gpu_available else None
+    gpus = [0, 1] if gpu_available else None
     if gpu_available:
         cp.cuda.runtime.setDevice(gpus[0])
         # Restrict JAX to only see the target GPU — must be set before JAX backend init
