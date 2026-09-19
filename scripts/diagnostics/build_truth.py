@@ -8,23 +8,26 @@ in a session scratchpad and was lost -- which is why this one is IN the repo.
 Committed 2026-08-19; validated by reproducing the original count (812
 detectable over the then-hardcoded 3-21.94 mHz).
 
-THE BAND IS THE RUN'S BAND (2026-08-23). It used to be hardcoded at
-3-21.94 mHz, which quietly threw away the bottom 82% of the GB band: the
-run's own ``sub_backend/gb/band_edges`` starts at 5.5555556e-4 Hz
-(0.5556 mHz), not at 3 mHz, so every page built on the old denominator was
-reporting completeness against a sixth of the frequency range the sampler
-actually works in. ``--flo``/``--fhi`` now set the band, defaulting to the
-full GB band, and the band actually used is stamped into BOTH output npz
-files so the monitor can quote it rather than assume it.
+THE BAND IS SETTABLE, AND THE DEFAULT IS A JUDGEMENT CALL. It used to be
+hardcoded at 3-21.94 mHz, which threw away most of the GB band: the run's
+own ``sub_backend/gb/band_edges`` starts at 0.5556 mHz. ``--flo``/``--fhi``
+now set the band and the value used is stamped into BOTH output npz files,
+so the monitor quotes it rather than assuming.
 
-A WARNING ABOUT THE LOW-FREQUENCY END. ``det`` is and remains an SNR
-statement: optimal SNR > 7 against a sensitivity that already includes the
-fitted galactic foreground, so the confusion background is accounted for in
-the DENOMINATOR of the SNR. It is not a resolvability statement. Below
-~3 mHz the catalogue puts many sources in every frequency bin, and a source
-can clear SNR 7 while being hopelessly blended with its neighbours. Read the
-sub-3 mHz part of this set as "carries enough signal power to matter", not
-as "is individually recoverable".
+The DEFAULT floor is **0.8 mHz** (2026-09-18), above the sampler's own
+0.5556 mHz. That is deliberate: see the resolvability warning below. Pass
+``--flo 5.5555555556e-4`` for the full analysed band.
+
+A WARNING ABOUT THE LOW-FREQUENCY END -- the reason for the 0.8 mHz floor.
+``det`` is and remains an SNR statement: optimal SNR > 7 against a
+sensitivity that already includes the fitted galactic foreground, so the
+confusion background is accounted for in the DENOMINATOR of the SNR. It is
+NOT a resolvability statement. Below ~0.8 mHz the catalogue puts many sources
+in every frequency bin, and a source can clear SNR 7 while being hopelessly
+blended with its neighbours; charging the run for those in the completeness
+denominator measures the catalogue, not the sampler. Even between 0.8 and
+3 mHz, read this set as "carries enough signal power to matter" rather than
+"is individually recoverable".
 
 DETECTABILITY IS PER-TOBS. The observation time sets the FD bin width, the
 waveform duration and hence the optimal SNR itself, so a truth set is only
@@ -60,12 +63,21 @@ Usage::
 
     OMP_NUM_THREADS=1 python scripts/diagnostics/build_truth.py \
         STORE.h5 [--iteration 78] [--out gb_truth_3to21.npz] [--tobs SEC] \
-        [--flo 5.5555556e-4] [--fhi 2.1944444e-2]
+        [--flo 0.8e-3] [--fhi 2.1944444e-2]
 
-Runs on CPU. Over the full band the catalogue contributes ~240k in-band rows
-instead of the ~4.7k above 3 mHz; the kappa prefilter still cuts most of
-them, but expect tens of thousands of waveforms and tens of minutes rather
-than a few. Keep the thread pins: laptop policy.
+Runs on CPU. THE WAVEFORM COUNT IS SET BY THE PREFILTER, NOT THE BAND --
+measured on the 3-month store at iteration 208:
+
+    floor       in-band rows   waveforms run   detectable
+    0.5556 mHz     3 959 524           9 086         1048
+    0.8    mHz     1 008 443           9 011         1048
+    1      mHz       396 653           8 885         1042
+
+Widening the band multiplies the catalogue rows by 10 and the waveforms by
+2%, because `amp * kappa(f)` bounds the SNR and everything below the cut is
+discarded before any waveform runs. The prefilter is a vectorised interp
+over the catalogue array, so the extra rows cost seconds. Budget tens of
+minutes for the ~9k waveforms. Keep the thread pins: laptop policy.
 """
 
 from __future__ import annotations
@@ -78,10 +90,18 @@ import sys
 import numpy as np
 import h5py
 
-# The GB band the runs actually analyse: ``sub_backend/gb/band_edges[0]`` and
-# ``[-1]`` of every erebor store in this campaign (155 edges, 0.5556 mHz to
-# 21.9444 mHz). Read off the v4 3-month and v5 1-year stores, not assumed.
-FLO, FHI = 5.5555555556e-4, 2.1944444444e-2
+# The band the truth set is built over. The ceiling is the runs' own
+# ``sub_backend/gb/band_edges[-1]`` (21.9444 mHz); the FLOOR is a DELIBERATE
+# 0.8 mHz, set above the sampler's band_edges[0] of 0.5556 mHz.
+#
+# Why not the full analysed band: ``det`` is an SNR statement, not a
+# resolvability one. Below ~0.8 mHz the catalogue puts many sources in every
+# frequency bin, so a binary clears SNR 7 while being inseparable from its
+# neighbours. Counting those in the DENOMINATOR charges the run for sources
+# nothing could individually recover, which depresses completeness by an
+# amount that says nothing about the sampler. 0.8 mHz is the floor; use
+# ``--flo 5.5555555556e-4`` to reinstate the full analysed band.
+FLO, FHI = 0.8e-3, 2.1944444444e-2
 SNR_DET = 7.0
 TOBS_3MO = 7776000.0   # the original 3-month set; also the fallback Tobs
 DT = 2.5

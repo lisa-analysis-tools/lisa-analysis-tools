@@ -107,7 +107,7 @@ Positional: tarball, output HTML, optional work dir. Env knobs:
 | `INTERLOCK=1` | serialise against other pythons. **Default OFF for humans; an unattended caller should always set it.** |
 | `ITERATION=` | row to build truth at (default `iteration - 2`) |
 | `CATALOGUE=` | GB catalogue hdf5 **or its directory**; also `MOJITO_CAT`, `MOJITO_CACHE_DIR` |
-| `FLO=` / `FHI=` | band in Hz |
+| `FLO=` / `FHI=` | band in Hz; default floor **0.8 mHz**, ceiling 21.944 mHz |
 | `SKIP_TRUTH=1` | reuse an existing truth npz — **see the trap in §4** |
 | `PY=` | interpreter |
 
@@ -197,9 +197,20 @@ Every one of these produced a wrong analysis or a crash at least once.
 - **A stale truth npz loads fine and is silently wrong.** The `tobs` guard
   catches a 3-month set on a 6-month run, but a set built at a different
   iteration or with a narrower `--flo/--fhi` passes every check and just
-  yields fewer crosses. The band default widened from 3 mHz to 0.5556 mHz
-  on 2026-09-18, so any older npz shows only sources above 3 mHz.
-  **`SKIP_TRUTH=1` is a trap in exactly this situation.**
+  yields fewer crosses. **The band default moved twice on 2026-09-18**:
+  3 mHz -> 0.5556 mHz (the sampler's own `band_edges[0]`), then -> **0.8 mHz**
+  as a deliberate resolvability floor. Any npz built before those changes
+  disagrees with a fresh one. **`SKIP_TRUTH=1` is a trap in exactly this
+  situation.**
+
+  The waveform cost does NOT scale with the band. The kappa prefilter
+  (`build_truth.py:352-375`) bounds each source's SNR by
+  `amp * kappa(f)` with `kappa` a best-case unit-SNR curve, and keeps only
+  `> 0.5 * SNR_DET`. Measured on the 3-month store: 0.5556 mHz gives
+  3 959 524 in-band rows but only **9 086 waveforms**; 1 mHz gives 396 653
+  rows and **8 885 waveforms**. The prefilter itself is a vectorised
+  interp over the catalogue array, so widening the band costs seconds, not
+  waveforms.
 - **`galfor_log_sampling`.** Under it the four log columns are stored as
   `log10` and `alpha` stays linear. Handing the raw row to the foreground
   model makes `amp` and `f_1` negative, so `(f/f_1)**alpha` is NaN — and
