@@ -2117,7 +2117,17 @@ export GB_INMODEL_PROPOSAL=observable
 export GB_INMODEL_OBSERVABLE_FIBER_WEIGHT=0.0
 # Overall step multiplier for this path. Deliberately its own knob and NOT
 # the legacy jump_factor, which was tuned against the eigen-floored draw.
-export GB_INMODEL_OBSERVABLE_JUMP=1.0
+# RAISED 1.0 -> 2.0 (2026-09-19). Under GB_INMODEL_OBSERVABLE_EIGEN=axis
+# the GB in-model step came out TOO SMALL: measured on the 6mo run,
+# obs_basis acceptance cold 0.71 / all-rung 0.78, with
+#   mean |df_mid| proposed 0.0184 bins vs 0.0032 accepted
+# against the well-tuned 10-walker diagonal arm's proposed 0.038 /
+# accepted 0.021 at acceptance 0.219. A one-axis-per-repeat draw is
+# effectively 1-D, where the optimal acceptance is 0.44 (not 0.234), so
+# 0.71 says the step wants roughly doubling -- which is this knob, and
+# deliberately NOT GB_JUMP_FACTOR (that one was tuned against the
+# eigen-floored draw; see the block above).
+export GB_INMODEL_OBSERVABLE_JUMP=2.0
 # Mc step as a FRACTION of the m_chirp prior box (only reachable when the
 # fiber weight above is non-zero).
 export GB_INMODEL_OBSERVABLE_MC_STEP=0.05
@@ -2574,6 +2584,11 @@ export VGB_INMODEL_PROPOSAL=${VGB_INMODEL_PROPOSAL:-observable}
 # eigenspectrum is ill-conditioned, which is why the joint draw tips from
 # bad to zero here. Escape: VGB_INMODEL_OBSERVABLE_EIGEN= (diagonal draw).
 export VGB_INMODEL_OBSERVABLE_EIGEN=${VGB_INMODEL_OBSERVABLE_EIGEN-axis}
+# VGB's own step scale, split from GB's 2026-09-19. One shared knob used to
+# scale BOTH branches; in the same propose GB was over-accepting at 0.71
+# while VGB sat healthy at 0.26-0.43, so GB's correction is the last thing
+# VGB wants. 1.0 = unchanged (it is also the code default).
+export VGB_INMODEL_OBSERVABLE_JUMP=${VGB_INMODEL_OBSERVABLE_JUMP:-1.0}
 echo "[VGB-OBS-EIGEN] VGB_INMODEL_OBSERVABLE_EIGEN='${VGB_INMODEL_OBSERVABLE_EIGEN}' (empty = diagonal draw)"
 # GB rung count. 24 is already the code default (stock/erebor/gb.py
 # env_default("GB_NTEMPS", 24)) -- pinned here anyway because the rung count

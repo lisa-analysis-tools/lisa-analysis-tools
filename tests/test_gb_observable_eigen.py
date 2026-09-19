@@ -13,6 +13,7 @@ Knob: GB_INMODEL_OBSERVABLE_EIGEN = 0 (default, bit-identical) | 1/axis
 (one eigen-axis per repeat) | full (joint correlated step).
 """
 
+import functools
 import os
 import types
 import unittest
@@ -60,6 +61,11 @@ def _stub(**over):
         _observable_map_class=GBSpecialStretchMove._observable_map_class,
         _observable_required_cols=(
             GBSpecialStretchMove._observable_required_cols),
+        # Step-scale knob NAME (split GB/VGB 2026-09-19). Bound to the real
+        # class method rather than the literal so the stub cannot drift
+        # from it; the method ignores self, hence the None.
+        _obs_jump_knob=functools.partial(
+            GBSpecialStretchMove._obs_jump_knob, None),
         _eigen_axis_min_dim=NDIM,
         _eigen_axis_widths_cache=None,
         _observable_map_cache=None,

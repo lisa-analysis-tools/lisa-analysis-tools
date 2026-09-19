@@ -11500,9 +11500,27 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             r, m.Tobs,
             extrinsic_scales=ex,
             mc_step=mc_step,
-            jump=_observable_knob("GB_INMODEL_OBSERVABLE_JUMP", 1.0),
+            jump=_observable_knob(self._obs_jump_knob(), 1.0),
             internal_basis=m.INTERNAL_BASIS,
         )
+
+    def _obs_jump_knob(self) -> str:
+        """Env name for this branch's observable-step multiplier.
+
+        Split GB/VGB 2026-09-19. This method is on the SHARED base, so a
+        single ``GB_INMODEL_OBSERVABLE_JUMP`` used to scale the VGB step
+        too -- the silent-coupling anti-pattern this file already refuses
+        elsewhere (see ``_rj_amp_maximize_on``). It bit immediately: under
+        ``*_INMODEL_OBSERVABLE_EIGEN=axis`` the two branches landed on
+        OPPOSITE sides of the optimum in the same run -- GB over-accepting
+        at 0.71 (steps too small) while VGB sat at a healthy 0.26-0.43 --
+        so the correction GB needs is the last thing VGB wants.
+
+        Defaults are identical (1.0), so an unset VGB knob reproduces the
+        old shared behaviour exactly; only an explicit GB-side change now
+        stops at the GB branch.
+        """
+        return "GB_INMODEL_OBSERVABLE_JUMP"
 
     def _observable_stash_gamma_z(self, info_y, coords, s, ids, n_src,
                                   leaf_inds=None):
@@ -22515,6 +22533,20 @@ class VGBSpecialStretchMove(GBSpecialBase):
     def _obs_eigen_mode(self) -> str:
         """``VGB_INMODEL_OBSERVABLE_EIGEN``: off (default) | axis | full."""
         return _vgb_observable_eigen_mode()
+
+    def _obs_jump_knob(self) -> str:
+        """``VGB_INMODEL_OBSERVABLE_JUMP``: the VGB half of the step scale.
+
+        Same split, and the same reason, as :meth:`_obs_eigen_mode` above:
+        the two branches are tuned against different information matrices
+        -- VGB pins f0, sky and Mc, so its observable basis is 5 columns
+        against GB's 8 -- and they do not want the same step. Measured on
+        the 2026-09-19 6-month run under ``axis``, in the SAME propose:
+        GB over-accepting at 0.71 (steps too small) while VGB sat at a
+        healthy 0.26-0.43. Default 1.0 matches GB's, so an unset knob is
+        exactly the pre-split shared behaviour.
+        """
+        return "VGB_INMODEL_OBSERVABLE_JUMP"
 
     def _cold_source_freqs_hz(self, work):
         """f0 (Hz) of every alive cold-row leaf, from the per-leaf transform fill.
