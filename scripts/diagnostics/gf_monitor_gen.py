@@ -3453,14 +3453,29 @@ if csvs:
 # ---- 9. swaps (last ACTIVE iteration per branch: a stored iteration can
 # record zero proposals for one branch at a stage handoff) ----
 fig, ax = plt.subplots(1, 2, figsize=(11, 3.0))
+_empty_branches = []
 for arrs, name, a in [((psd_sw_a, psd_sw_p), "psd", 0), ((gal_sw_a, gal_sw_p), "galfor", 1)]:
     sa, sp = arrs
+    # Empty swap-count arrays happen on a very young / mid-flush snapshot
+    # where SUB_NIT has trimmed the whole stream away. The prior fallback
+    # ``sp.shape[0] - 1`` then landed at -1 and sa[-1] raised IndexError.
+    # Skip the branch with an empty panel + a MISSING reason instead.
+    if sp.shape[0] == 0:
+        ax[a].set_title(f"{name} swap acceptance (no rows in this snapshot)")
+        ax[a].set_xlabel("rung"); ax[a].set_ylim(0, 1)
+        _empty_branches.append(name)
+        continue
     nz = np.where(sp.sum(axis=1) > 0)[0]
     k_it = int(nz.max()) if nz.size else sp.shape[0] - 1
     rate = sa[k_it] / np.maximum(sp[k_it], 1)
     ax[a].bar(np.arange(len(rate)), rate, color=CYAN if a == 0 else AMBER, alpha=0.85)
     ax[a].set_title(f"{name} swap acceptance per rung (iter {k_it})")
     ax[a].set_xlabel("rung"); ax[a].set_ylim(0, 1)
+if _empty_branches:
+    MISSING.append(
+        f"swap-acceptance panel: {'/'.join(_empty_branches)} sub-backend "
+        f"has no rows in this snapshot (young run or mid-flush trim to "
+        f"SUB_NIT=0); those panels render empty.")
 fig_b64(fig, "swaps")
 
 # ---- 10. grouped-RJ stats + device-memory telemetry (new-code lines) -------
