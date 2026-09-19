@@ -39,6 +39,26 @@
 # 2*convergence_iter`), so the re-opened stage cannot trip a stop check for
 # its first 41 iterations -- it gets a real run at growing the catalogue.
 #
+# 3mo_4gpu CASE (2026-09-19): the same story for the 4-WALKER 3-month run
+# (`3mo` above is the 10-walker one; do not confuse them). gb_search ended
+# at stored row 181 on `782 --> 777` with the leaf caps still ratcheting.
+# IT=182 keeps every search row.
+#
+#   !! THIS ONE IS EXPENSIVE. The 6mo had barely entered full_pe when it
+#   !! was caught; the 3mo has been in full_pe for ~19 h and ~880 rows. The
+#   !! rewind discards all of it. What that buys back: full_pe added only
+#   !! 58 leaves in those 19 h (782 -> 840) and has been FLAT at ~840 for
+#   !! the last five hours, while the 10-walker twin reached 1117 at the
+#   !! same iteration count. Trading a frozen PE chain for a re-opened
+#   !! search is the point -- but it is a trade, so the script prints the
+#   !! discard count before it writes anything.
+#
+# Unlike 6mo this case DOES move F-stat epochs aside (see the case block).
+#
+#   bash scripts/fstat_proposal/rewind_to_465.sh 3mo_4gpu --apply
+#   STORE_DIR=/shared/data/global_fit_output/gf_prod_3mo_v8_4gpu \
+#     sbatch scripts/fstat_proposal/submit_gf_3mo_v8_4gpu.sh
+#
 # What this does (3mo; the 1yr numbers in brackets):
 #   1. reset_recipe_stage.py STORE gb_search --iteration 151 [29] --apply
 #      -- re-opens gb_search (3mo completed it at it 175 and moved to full_pe)
@@ -63,14 +83,14 @@
 #      using at it 150. (1yr has only epoch_0000; nothing to move.)
 # Nothing is deleted: everything goes to STORE_DIR/rewind_<stamp>/.
 set -euo pipefail
-# Usage: rewind_to_465.sh 3mo|1yr|6mo [--apply] [--iteration N]
+# Usage: rewind_to_465.sh 3mo|1yr|6mo|3mo_4gpu [--apply] [--iteration N]
 #   --iteration N overrides the default rewind point (3mo 151, 1yr 29,
-#   6mo 160).
+#   6mo 160, 3mo_4gpu 182).
 #   For the 1yr run, N=5 is "rewind the whole GB search": gb_search began
 #   at row ~4-5 there (rows 0-3 hold 0 GB leaves, row 6 already 246), so
 #   the converged noise stages are kept and the search restarts from its
 #   first iteration on the fixed code.
-RUN="${1:?usage: rewind_to_465.sh 3mo|1yr|6mo [--apply] [--iteration N]}"
+RUN="${1:?usage: rewind_to_465.sh 3mo|1yr|6mo|3mo_4gpu [--apply] [--iteration N]}"
 shift
 APPLY=""; IT_OVERRIDE=""
 while [ $# -gt 0 ]; do
@@ -93,8 +113,40 @@ case "$RUN" in
   # and free. Pass --iteration with a deeper target ONLY with the epoch
   # question re-examined by hand.
   6mo) DIR=/shared/data/global_fit_output/gf_prod_6mo_v8_4gpu;      BASE=gf_prod_6mo_testing; IT=160; EPOCHS="";                      JOBNAME=gf6mo_v8 ;;
+  # 3mo_4gpu: the 4-WALKER run (gf_prod_3mo_v8_4gpu), not the 10-walker
+  # `3mo` case above. Same premature-plateau story as 6mo, but this one sat
+  # in full_pe for ~19 h afterwards, so the rewind is EXPENSIVE -- see the
+  # WARNING the script prints below. Boundary confirmed two independent
+  # ways: the log (last gb_search row saved at 19:27:59, digest it=181,
+  # then `Previous nleaves: 782 --> new nleaves: 777` and stage=full_pe),
+  # and the store (band_leaf_cap sum ratchets 2233->2239 through row 181
+  # and is frozen from 182 on -- the cap only ratchets during search).
+  # IT=182 keeps rows 0..181 = every gb_search row.
+  3mo_4gpu) DIR=/shared/data/global_fit_output/gf_prod_3mo_v8_4gpu; BASE=gf_prod_3mo_testing; IT=182; EPOCHS="";                      JOBNAME=gf3mo_v8_4gpu
+            # Unlike 6mo (where full_pe barely ran), ~20 F-stat epochs here
+            # were fitted DURING full_pe, against a residual with 58 more
+            # sources subtracted than the rewound state has. The move loads
+            # the LATEST epoch dir blindly, so keeping them would hand the
+            # re-opened search a grid that is blind in exactly the places
+            # those 58 sources sit. Select them by DONE.json mtime against
+            # the boundary wall-clock -- unambiguous, and independent of the
+            # DONE.json `clock` field (which counts engine iterations, not
+            # stored rows: it reads 1205 at stored row 1060).
+            EPOCH_NEWER_THAN="2026-09-18 19:27:59" ;;
   *) echo "unknown run $RUN"; exit 2 ;;
 esac
+
+# Epochs fitted after the rewind point, selected by mtime when the case asks
+# for it. Nothing is deleted; the loop below moves them to $ASIDE.
+if [ -n "${EPOCH_NEWER_THAN:-}" ]; then
+  # dirname|basename rather than GNU `find -printf`, so this also runs on a
+  # BSD find (e.g. checking the logic against a snapshot on the laptop).
+  EPOCHS=$(find "$DIR/gb_fstat_fit/shared" -mindepth 2 -maxdepth 2 -name DONE.json \
+             -newermt "$EPOCH_NEWER_THAN" 2>/dev/null \
+             | xargs -n1 dirname 2>/dev/null | xargs -n1 basename 2>/dev/null \
+             | sort | tr '\n' ' ' || true)
+  echo "   epochs fitted after $EPOCH_NEWER_THAN: ${EPOCHS:-<none>}"
+fi
 [ -n "$IT_OVERRIDE" ] && IT="$IT_OVERRIDE"
 if [ "$RUN" = "1yr" ] && [ "$IT" -lt 29 ]; then
   # A deeper 1yr rewind also invalidates any F-stat epoch fitted after it
@@ -108,6 +160,22 @@ ASIDE="$DIR/rewind_$STAMP"
 LAT="${LAT_ROOT:-$HOME/lisa-analysis-tools}"
 
 echo "== rewind $RUN: $STORE -> iteration $IT (resume from row $((IT-1))) apply=${APPLY:-no}"
+# How much is being thrown away. reset_recipe_stage.py prints the row count
+# too, but for 3mo_4gpu that number is ~880 rows / ~19 h of full_pe, which
+# is a decision the operator should make with eyes open rather than read
+# past in a dry run.
+if [ -r "$STORE" ]; then
+  NOW_IT=$(python - "$STORE" <<'EOF' 2>/dev/null || echo ""
+import sys, h5py
+with h5py.File(sys.argv[1], "r") as f:
+    print(int(f["global_fit"].attrs["iteration"]))
+EOF
+)
+  if [ -n "$NOW_IT" ] && [ "$NOW_IT" -gt "$IT" ]; then
+    echo "   !! store is at iteration $NOW_IT; this DISCARDS $((NOW_IT - IT)) rows."
+    echo "   !! Everything at or before row $((IT-1)) is kept, including the whole GB search."
+  fi
+fi
 # ONE-WRITER-PER-STORE GUARD. ``lsof`` on the head node cannot see a
 # compute node's open handle, so it passed while a job was still writing
 # the store (2026-09-10: the rewind ran under a live job, the store was
