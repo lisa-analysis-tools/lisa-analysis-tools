@@ -94,6 +94,12 @@ OUT = sys.argv[2] if len(sys.argv) > 2 else "gf_monitor.html"
 # ---- mission-control plot style -------------------------------------------
 BG, PANEL, LINE, FG, DIM = "#0A0E14", "#10161F", "#223041", "#B8C6D4", "#67788A"
 CYAN, AMBER, GREEN, RED, VIOLET = "#4FD8EB", "#F5A623", "#58C48A", "#E5484D", "#9B7BFF"
+#: The UNDETECTABLE injection population (F4 right panel). Deliberately
+#: darker than DIM -- DIM already marks detectable-but-unrecovered sources
+#: in the neutral branch of that same panel, and the sub-threshold cloud
+#: outnumbers the detectable set ~3700:1, so it has to read as background
+#: texture or it buries everything drawn on top of it.
+GREY_UNDET = "#39424E"
 # text.usetex is pinned OFF rather than left to inherit. Nothing on this
 # page needs a real LaTeX installation -- the ~19 math labels
 # (r"$\Delta f_0$", r"$\ln(A_{\rm rec}/A_{\rm cat})$", "m/s$^2$", ...) are
@@ -2195,12 +2201,41 @@ def _leaf_f0(it_, w):
 
 
 if TRU is not None:
-    _sel = (TRU["det"] & (TRU["f0"] >= FLO) & (TRU["f0"] <= FHI))
-    T_F0 = TRU["f0"][_sel]
+    # Pull f0/det ONCE: TRU is an NpzFile, so every TRU[key] decompresses the
+    # whole array again, and f0 alone is ~4M float64 on the 0.8 mHz truth set.
+    _f0_all = np.asarray(TRU["f0"], dtype=float)
+    _det_all = np.asarray(TRU["det"], dtype=bool)
+    _inband = (_f0_all >= FLO) & (_f0_all <= FHI)
+    _sel = _det_all & _inband
+    T_F0 = _f0_all[_sel]
     T_SNR = TRU["snr"][_sel]
     T_AMP = TRU["amp"][_sel]
     T_PHYS = TRU["phys"][_sel]
     NDET = int(_sel.sum())
+
+    # ---- the SUB-THRESHOLD population (F4 right panel, grey) --------------
+    # Everything in band that does NOT clear the detection threshold. It is
+    # the confusion foreground the fit is working against, and seeing where
+    # it sits relative to the recovered catalogue is the point of drawing it.
+    #
+    # It is also enormous: 3,958,460 undetectable against 1,064 detectable on
+    # the 3-month 0.8 mHz truth set, a ratio of ~3720:1. Four million markers
+    # would render slowly, blow up the embedded PNG, and hide the very
+    # sources the panel exists to show, so a uniform random SAMPLE is drawn
+    # instead. Uniform, so the density structure survives; seeded, so the
+    # page is reproducible; and the legend reports the TRUE count with the
+    # plotted fraction next to it, never the sample size on its own.
+    _und = _inband & ~_det_all
+    N_UND = int(_und.sum())
+    _und_cap = int(os.environ.get("GF_MONITOR_UNDET_MAX", "40000") or 0)
+    _ui = np.where(_und)[0]
+    if _und_cap > 0 and _ui.size > _und_cap:
+        _ui = np.random.default_rng(12345).choice(_ui, _und_cap, replace=False)
+        _ui.sort()
+    U_F0 = _f0_all[_ui]
+    U_AMP = np.asarray(TRU["amp"])[_ui] if _ui.size else np.empty(0)
+    U_FRAC = (_ui.size / N_UND) if N_UND else 0.0
+    del _f0_all, _det_all, _inband, _und, _ui
     # Chance rate: the fraction of the band covered by the +-2-bin acceptance
     # windows of the truth set. Any purity number is only meaningful against
     # it, and it is the first thing a reviewer asks for.
@@ -2463,21 +2498,32 @@ if TRU is not None:
         _cb = fig.colorbar(_sc, ax=a_, pad=0.015); _cb.set_label("SNR", fontsize=8)
         _cb.ax.tick_params(labelsize=7)
         b_ = ax[1]
+        # The sub-threshold cloud goes down FIRST and rasterized: it is
+        # background texture for everything above it, and at tens of
+        # thousands of points a vector layer would dominate the PNG.
+        if U_F0.size:
+            _ulab = f"undetectable injections ({N_UND:,}"
+            _ulab += ")" if U_FRAC >= 0.999 else f"; {U_FRAC:.1%} plotted)"
+            b_.scatter(U_F0, U_AMP, s=6, marker="x", color=GREY_UNDET,
+                       lw=0.5, alpha=0.5, rasterized=True, zorder=1,
+                       label=_ulab)
         if SHOW_MATCH_STATS:
             b_.scatter(T_F0[~FOUND], T_AMP[~FOUND], s=17, marker="x", color=RED,
-                       lw=0.8, alpha=0.7,
+                       lw=0.8, alpha=0.7, zorder=3,
                        label=f"detectable, not recovered ({int((~FOUND).sum())})")
             b_.scatter(_rf[~MATCHED], _ra_[~MATCHED], s=22, facecolors="none",
-                       edgecolors=VIOLET, lw=0.8, alpha=0.85,
+                       edgecolors=VIOLET, lw=0.8, alpha=0.85, zorder=4,
                        label=f"recovered, no match ({int((~MATCHED).sum())})")
             b_.scatter(_rf[MATCHED], _ra_[MATCHED], s=12, color=GREEN, lw=0,
-                       alpha=0.95, label=f"recovered and matched ({int(MATCHED.sum())})")
+                       alpha=0.95, zorder=5,
+                       label=f"recovered and matched ({int(MATCHED.sum())})")
         else:
             # Neutral overlay -- injections and model in one plane, the eye
             # does the comparison; no proxy-match classification.
             b_.scatter(T_F0, T_AMP, s=17, marker="x", color=DIM, lw=0.8,
-                       alpha=0.6, label=f"detectable injections ({NDET})")
-            b_.scatter(_rf, _ra_, s=12, color=GREEN, lw=0, alpha=0.9,
+                       alpha=0.6, zorder=3,
+                       label=f"detectable injections ({NDET})")
+            b_.scatter(_rf, _ra_, s=12, color=GREEN, lw=0, alpha=0.9, zorder=5,
                        label=f"model sources ({_rf.size})")
         if _athr is not None:
             b_.plot(_fgr, _athr, color=FG, lw=1.5)
