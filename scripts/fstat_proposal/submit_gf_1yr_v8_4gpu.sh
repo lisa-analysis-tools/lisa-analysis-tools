@@ -1899,6 +1899,22 @@ export GB_CAP_CELL_MAX=20
 # source per straddling cell, and tempering handles the mid-band pairs.
 export GB_CAP_INMODEL_HEADROOM=0
 export GB_SEARCH_CAP_QUIESCENT=1
+# RJRecipeStep plateau window. The code default is 5, and at FOUR walkers
+# that is too tight: the rule is a running-maximum ratchet
+# (recipe.py::RJRecipeStep, max over all prior stage iterations vs max over
+# the last `convergence_iter`), so ONE noisy dip ends the search stage.
+# Both 4-walker production runs died on a dip smaller than their own
+# walker-to-walker spread while gb_search was still gaining leaves:
+#   3 mo (2026-09-19): ...771->778, 772->782, 778->782 x4, 782->777 STOP
+#   6 mo (2026-09-19): ...1674->1683, 1679->1683 x3, 1683->1681 STOP
+#                      -- a 2-leaf dip against a walker spread of 51
+#                      ([1638 1689 1656 1657]), after +110 leaves over the
+#                      preceding 30 checks with no cap veto firing.
+# At 10 walkers the max-over-walkers statistic was quiet enough for 5 to
+# work; at 4 it is not. 20 gives the ratchet a window several times the
+# per-check growth (~0.5-3.7 leaves) without disarming the test -- a truly
+# converged stage still trips it, just 15 iterations later.
+export GB_PLATEAU_ITERS=20
 # ---- THE TWO v4-POSTMORTEM FIXES (code defaults since 8d926f27; pinned
 #      so the store's provenance is unambiguous) ----
 # Birth fix (1274a66c): births draw fdot_astro_ratio | (f0, Mc) from the

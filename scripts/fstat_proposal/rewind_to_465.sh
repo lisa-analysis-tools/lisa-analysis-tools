@@ -1,17 +1,43 @@
 #!/bin/bash
-# Rewind a v8 10-walker store to the last iteration BEFORE the 2026-09-09
-# relaunches (3mo: job 465 -> iteration 151, 1yr: job 466 -> iteration 29)
-# and clear every sidecar that would otherwise undo the rewind. Run on the
-# cluster with the job CANCELLED (scancel) and the store closed.
+# Rewind a v8 store to a chosen iteration and clear every sidecar that would
+# otherwise undo the rewind. Run on the cluster with the job CANCELLED
+# (scancel) and the store closed.
 #
 #   bash scripts/fstat_proposal/rewind_to_465.sh 3mo          # dry run (reports only)
 #   bash scripts/fstat_proposal/rewind_to_465.sh 3mo --apply  # do it
 #   bash scripts/fstat_proposal/rewind_to_465.sh 1yr --apply  # optional 1yr twin
+#   bash scripts/fstat_proposal/rewind_to_465.sh 6mo --apply  # 2026-09-19, see below
 #
-# Then resubmit with the job-465 SCIENCE configuration:
+# ORIGINAL PURPOSE (3mo/1yr): rewind the 10-walker stores to the last
+# iteration BEFORE the 2026-09-09 relaunches (3mo: job 465 -> iteration 151,
+# 1yr: job 466 -> iteration 29). Then resubmit with the job-465 SCIENCE
+# configuration:
 #   sbatch --export=ALL,GB_SCIENCE_465=1 scripts/fstat_proposal/submit_gf_3mo_v8_10walkers.sh
 # (the submit scripts carry an opt-in block that reverts every 467/469/471
 # knob when GB_SCIENCE_465=1; see the block just above their mpiexec line).
+#
+# 6mo CASE (2026-09-19, user ruling): the 4-GPU 6-month run's gb_search
+# stage ended PREMATURELY on the RJRecipeStep plateau ratchet -- the check
+# log reads `Previous nleaves: 1683 --> new nleaves: 1681`, a two-leaf dip
+# against a walker-to-walker spread of 51 ([1638 1689 1656 1657]), after
+# +110 leaves over the preceding 30 checks. Row 159 was the last gb_search
+# row (the boundary midit checkpoint names it: "stored iteration 159
+# (boundary: stage=gb_search ...)"), and the store advanced to
+# iteration=160 = full_pe.
+#
+# So IT=160 here means: KEEP EVERY SEARCH ROW (0..159, all 1650-odd leaves,
+# the fitted noise, the band/cap grids, the whole ratchet) and discard ONLY
+# the full_pe rows written after the bad stage advance. This is NOT the
+# `--rewind-to-empty gb` flow and must never be confused with it -- nothing
+# the search found is thrown away.
+#
+# Resubmit with GB_PLATEAU_ITERS=20 (now pinned in submit_gf_6mo_v8.sh, so
+# a plain resubmit carries it):
+#   STORE_DIR=/shared/data/global_fit_output/gf_prod_6mo_v8_4gpu \
+#     sbatch scripts/fstat_proposal/submit_gf_6mo_v8.sh
+# The plateau guard is stage-scoped (`current_iter - _stage_start_iter >
+# 2*convergence_iter`), so the re-opened stage cannot trip a stop check for
+# its first 41 iterations -- it gets a real run at growing the catalogue.
 #
 # What this does (3mo; the 1yr numbers in brackets):
 #   1. reset_recipe_stage.py STORE gb_search --iteration 151 [29] --apply
@@ -37,13 +63,14 @@
 #      using at it 150. (1yr has only epoch_0000; nothing to move.)
 # Nothing is deleted: everything goes to STORE_DIR/rewind_<stamp>/.
 set -euo pipefail
-# Usage: rewind_to_465.sh 3mo|1yr [--apply] [--iteration N]
-#   --iteration N overrides the default rewind point (3mo 151, 1yr 29).
+# Usage: rewind_to_465.sh 3mo|1yr|6mo [--apply] [--iteration N]
+#   --iteration N overrides the default rewind point (3mo 151, 1yr 29,
+#   6mo 160).
 #   For the 1yr run, N=5 is "rewind the whole GB search": gb_search began
 #   at row ~4-5 there (rows 0-3 hold 0 GB leaves, row 6 already 246), so
 #   the converged noise stages are kept and the search restarts from its
 #   first iteration on the fixed code.
-RUN="${1:?usage: rewind_to_465.sh 3mo|1yr [--apply] [--iteration N]}"
+RUN="${1:?usage: rewind_to_465.sh 3mo|1yr|6mo [--apply] [--iteration N]}"
 shift
 APPLY=""; IT_OVERRIDE=""
 while [ $# -gt 0 ]; do
@@ -56,6 +83,16 @@ done
 case "$RUN" in
   3mo) DIR=/shared/data/global_fit_output/gf_prod_3mo_v8_10walkers; BASE=gf_prod_3mo_testing; IT=151; EPOCHS="epoch_0004 epoch_0005"; JOBNAME=gf3mo_v8 ;;
   1yr) DIR=/shared/data/global_fit_output/gf_prod_1yr_v8_10walkers; BASE=gf_prod_1yr_testing; IT=29;  EPOCHS="";                      JOBNAME=gf1yr_v8 ;;
+  # 6mo: EPOCHS is deliberately EMPTY. The 3mo case drops epochs because its
+  # rewind discarded search progress the grids were fitted against; this one
+  # keeps every search row, so every epoch under gb_fstat_fit/shared is still
+  # fitted against a residual the store still holds. Any epoch fitted during
+  # the short full_pe excursion is, if anything, fitted against a MORE
+  # subtracted residual, and the F-stat cache is a proposal object (blind
+  # latest-epoch reuse, valid MH either way) -- so keeping it is both safe
+  # and free. Pass --iteration with a deeper target ONLY with the epoch
+  # question re-examined by hand.
+  6mo) DIR=/shared/data/global_fit_output/gf_prod_6mo_v8_4gpu;      BASE=gf_prod_6mo_testing; IT=160; EPOCHS="";                      JOBNAME=gf6mo_v8 ;;
   *) echo "unknown run $RUN"; exit 2 ;;
 esac
 [ -n "$IT_OVERRIDE" ] && IT="$IT_OVERRIDE"

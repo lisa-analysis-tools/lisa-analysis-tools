@@ -1848,6 +1848,27 @@ export GB_CAP_CELL_MAX=20
 # source per straddling cell, and tempering handles the mid-band pairs.
 export GB_CAP_INMODEL_HEADROOM=0
 export GB_SEARCH_CAP_QUIESCENT=1
+# RJRecipeStep plateau window (user ruling 2026-09-19). The code default is
+# 5, and at FOUR walkers that is too tight. The rule is a running-maximum
+# ratchet (recipe.py::RJRecipeStep._stop_fn): max of the cold leaf count
+# over the stage so far, against its max over the last `convergence_iter`
+# iterations -- so ONE noisy dip ends the search stage. Both 4-walker
+# production runs died that way while gb_search was still gaining leaves:
+#
+#   3 mo: ...771->778, 772->782, 778->782 x4, 782->777 STOP
+#   6 mo: ...1674->1683, 1679->1683 x3,      1683->1681 STOP  <-- THIS RUN
+#
+# The 6 mo stopped on a TWO-leaf dip while its own walker-to-walker spread
+# was 51 ([1638 1689 1656 1657]), after +110 leaves over the preceding 30
+# checks, with GB_SEARCH_CAP_QUIESCENT armed but firing zero times (caps
+# were quiescent, so nothing held the stage open).
+#
+# 20 gives the ratchet a window several times the observed per-check growth
+# (0.5-3.7 leaves) without disarming the test: a genuinely converged stage
+# still trips it, just later. Note the stage-scoped guard means the first
+# check cannot fire until 2*20 = 41 iterations into the stage, which is
+# exactly what a post-rewind resume wants.
+export GB_PLATEAU_ITERS=20
 # ---- THE TWO v4-POSTMORTEM FIXES (code defaults since 8d926f27; pinned
 #      so the store's provenance is unambiguous) ----
 # Birth fix (1274a66c): births draw fdot_astro_ratio | (f0, Mc) from the
