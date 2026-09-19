@@ -3031,6 +3031,30 @@ try:
     del _f0_all
     la_band = np.log10(np.maximum(cf["Amplitude"][:][cat_gidx], 1e-30))
     gb_truth_meta["in_band"] = int(cat_gidx.size)
+
+    # DETECTABILITY per catalogue row (user ask 2026-09-19): the overlay used
+    # to draw every catalogue source in one red, which made a cross under a
+    # recovered dot indistinguishable from a cross the run could never have
+    # found. Detectable stays red; everything below threshold goes grey.
+    #
+    # Matched on f0 against DET_F0 -- the same detectable-f0 list the leaf
+    # count and occupancy overlays already use, carrying its own Tobs guard
+    # (an npz built for a different observation time never reaches here).
+    # Both arrays are the SAME catalogue column, so the only discrepancy is
+    # float round-trip through the npz and the *1e3 to mHz; a relative
+    # tolerance well below the catalogue's own f0 spacing settles it without
+    # ever matching a neighbouring source.
+    det_band = np.ones(f0_band.size, dtype=bool)
+    if DET_F0 is not None and DET_F0.size:
+        _dref = np.sort(np.asarray(DET_F0, dtype=float))
+        _fq = f0_band * 1e-3                       # back to Hz for the match
+        _j = np.clip(np.searchsorted(_dref, _fq), 0, _dref.size - 1)
+        _jm = np.clip(_j - 1, 0, _dref.size - 1)
+        _near = np.minimum(np.abs(_dref[_j] - _fq), np.abs(_dref[_jm] - _fq))
+        det_band = _near <= (1e-9 * np.maximum(_fq, 1e-30))
+        gb_truth_meta["n_det"] = int(det_band.sum())
+        gb_truth_meta["n_undet"] = int((~det_band).sum())
+        del _dref, _fq, _j, _jm, _near
     if expl["gb"]:
         _rec_lo = float(min(p[1] for p in expl["gb"]))
         cut = _rec_lo - 0.5      # 0.5 dex below the faintest recovered source
@@ -3095,6 +3119,21 @@ try:
                     if _b > _a:
                         _pro[_srt[_a:_b]] = True
 
+            # ...and PROTECT EVERY DETECTABLE SOURCE too (2026-09-19). Rule 1
+            # above only spares a catalogue row that a MODEL source already
+            # sits on, so a detectable source the run has NOT found could be
+            # decimated away -- and with red now meaning "detectable", a
+            # missing red cross would read as "nothing to find here" when the
+            # truth is "here is one it missed", which is the single most
+            # important thing this panel can show. They are 1,064 rows out of
+            # ~4M on the 3-month set, so protecting all of them is free.
+            # Gated on "n_det", NOT on det_band itself: with no DET_F0 the
+            # mask defaults to ALL-TRUE (everything drawn red, the old
+            # behaviour), and OR-ing that in would protect every row and
+            # silently disable decimation entirely.
+            if "n_det" in gb_truth_meta:
+                _pro |= det_band[keep]
+
             # rule 2 -- floor first, then spread what is left proportionally.
             # The floor is raised to the protected count where a window holds
             # more protected rows than the floor, so the per-window quota can
@@ -3137,15 +3176,26 @@ try:
             gb_truth_meta["drawn_frac"] = float(_frac)
         else:
             sel = keep
-        gb_truth_pts = [[float(f"{f0_band[i]:.7g}"), round(float(la_band[i]), 4)]
-                        for i in sel]
+        # Third column: 1 = detectable (red), 0 = sub-threshold (grey). An
+        # int costs 2 bytes a row in the JSON, against the ~23 the pair
+        # already costs, and saves the canvas a second lookup structure.
+        gb_truth_pts = [[float(f"{f0_band[i]:.7g}"), round(float(la_band[i]), 4),
+                         int(det_band[i])] for i in sel]
         gb_truth_meta["shown"] = len(gb_truth_pts)
+        gb_truth_meta["shown_det"] = int(sum(p[2] for p in gb_truth_pts))
         _tm = gb_truth_meta
+        _detbit = (
+            f"{_tm.get('shown_det', _tm['shown']):,} of them RED (detectable, "
+            f"SNR > 7), the rest GREY (sub-threshold -- drawn so a patch with "
+            f"no red mark reads as 'nothing findable here' rather than as a "
+            f"gap in the overlay). "
+            if "shown_det" in _tm else "")
         expl["truth_cap"] = (
-            f"Catalogue truths (red): {_tm['shown']:,} points shown of "
+            f"Catalogue truths: {_tm['shown']:,} points shown of "
             f"{_tm['above_cut']:,} passing the cut log10 A >= {_tm['cut']:.2f} "
             f"(0.5 dex below the faintest recovered source, {_tm['rec_lo']:.2f}); "
             f"{_tm['in_band']:,} catalogue sources lie in the GB band in total. "
+            + _detbit
             + (f"Decimation is per frequency window ({_tm['nwin']} log-spaced "
                f"windows). Any window holding at most {_tm['win_full']:,} "
                f"sources is drawn IN FULL -- which is every window above a few "
@@ -4010,10 +4060,15 @@ html = f"""<title>LISA Global Fit {RUN_LABEL}</title>
      against the green recovery circles. Legibility of the overlay wins --
      the haze worry is handled by the per-cross alpha instead. */
   --truthred:#FF2E3E;
+  /* Sub-threshold catalogue sources on the zoom canvas. Light enough to
+     read as a population against --bg, dark enough that the red
+     detectable crosses stay the thing the eye lands on. */
+  --truthgrey:#5A6878;
 }}
 :root[data-theme="light"] {{
   --bg:#EEF1F5; --panel:#FFFFFF; --line:#D4DBE3; --fg:#25313D; --dim:#5D6B7A;
   --truthred:#E00016;
+  --truthgrey:#9AA7B4;
 }}
 * {{ box-sizing:border-box; }}
 body {{ background:var(--bg); color:var(--fg); font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; margin:0; }}
@@ -4163,7 +4218,9 @@ the residual by construction.</div>
 <canvas id="expl"></canvas>
 <div class="caption" id="expl_cap"></div>
 <div class="caption">Zoomable version of the amplitude-frequency plane: green =
-model sources, red crosses = the injected catalogue. Drag to pan and use the
+model sources, <strong>red crosses = injected catalogue sources this run can
+detect</strong> (SNR &gt; 7 against its own sampled sensitivity), grey crosses
+= the sub-threshold catalogue below that bar. Drag to pan and use the
 wheel to zoom, or set the view numerically with the centre and width/height
 controls above &mdash; those hold the window size fixed and slide it across
 the band, which is the steadier way to walk through frequency.
@@ -4560,17 +4617,29 @@ function viewCtl(px, cv, api) {{
       // --truthred, NOT --dim (2026-08-19). The colour was defined for
       // exactly these marks and never wired up, so the crosses rendered
       // grey and the caption's "Catalogue truths (red)" was a lie.
-      g.strokeStyle = C("--truthred"); g.globalAlpha = 0.9;
+      // TWO passes, not one (2026-09-19): p[2] is 1 for a catalogue source
+      // the run could actually detect and 0 for a sub-threshold one, and a
+      // canvas path carries a single strokeStyle. Sub-threshold goes down
+      // FIRST so the detectable crosses sit on top of it. Still batched --
+      // two stroke() calls a frame instead of one, against the thousands
+      // the per-point version cost before 2026-08-19. A point with no flag
+      // (a page built before this column existed) counts as detectable, so
+      // an old EXPL_JSON still renders all-red rather than all-grey.
       g.lineWidth = 1.5; g.lineCap = "round";
       const r = 3.4;
-      g.beginPath();
-      for (const p of TRUTH) {{
-        const x = sx(p[0]), y = sy(p[1]);
-        if (x < ml || x > w - mr || y < mt || y > h - mb) continue;
-        g.moveTo(x - r, y - r); g.lineTo(x + r, y + r);
-        g.moveTo(x - r, y + r); g.lineTo(x + r, y - r);
+      for (const pass of [0, 1]) {{
+        g.strokeStyle = C(pass ? "--truthred" : "--truthgrey");
+        g.globalAlpha = pass ? 0.9 : 0.55;
+        g.beginPath();
+        for (const p of TRUTH) {{
+          if ((p.length > 2 ? p[2] : 1) !== pass) continue;
+          const x = sx(p[0]), y = sy(p[1]);
+          if (x < ml || x > w - mr || y < mt || y > h - mb) continue;
+          g.moveTo(x - r, y - r); g.lineTo(x + r, y + r);
+          g.moveTo(x - r, y + r); g.lineTo(x + r, y - r);
+        }}
+        g.stroke();
       }}
-      g.stroke();
     }}
     // ONE PATH, ONE FILL (2026-08-19). This used to open a path and issue a
     // separate fill() per point -- 5k+ draw calls per frame. Batching every
