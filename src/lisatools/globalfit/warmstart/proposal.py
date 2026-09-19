@@ -97,6 +97,15 @@ COLUMN_NAMES = [
 ]
 CIRCULAR_COLS = {3: 2.0 * np.pi, 5: np.pi, 6: 2.0 * np.pi}
 
+# Byte budget for one chunk of the windowed-mixture logpdf, which scores
+# (coord, candidate) PAIRS and whose chol_inv gather is (n_pair, ndim, ndim).
+# Default 1 GiB, the same value and spelling as the sig-het fold cap
+# (GB_SIGHET_FOLD_MAX_BYTES). Raise it only with measured headroom: the pair
+# count is n x D x images, and a 6-month run hit 19.7M pairs = 12.8 GB in a
+# single unchunked allocation. See _mixture_logpdf.
+_LOGPDF_MAX_BYTES = int(
+    os.environ.get("GB_WARM_START_LOGPDF_MAX_BYTES", 1 << 30))
+
 #: default logpdf candidate window, in units of df = 1/Tobs (mHz)
 DEFAULT_F0_WINDOW_DF = 10.0
 #: per-component sigma guard added to the candidate window half-width; the
@@ -727,21 +736,49 @@ class WarmStartComponents:
 
         lp = xp.full((n, D), -np.inf, dtype=xp.float64)
         rows, cols = xp.where(valid)
-        if rows.shape[0]:
-            k_img = kk[rows, cols]                # candidate (image) index
-            k_sel = t["cand_parent"][k_img]       # parent component
-            diff = x[rows] - t["means"][k_sel]
-            # minimal-image displacement on the circular columns ...
-            for c, period in CIRCULAR_COLS.items():
-                d = diff[:, c]
-                diff[:, c] = d - period * xp.round(d / period)
-            # ... plus this candidate's period-image shift (zero when
-            # circ_images == 0 -- float-exact no-op).
-            diff = diff + t["cand_shift"][k_img]
-            y = xp.einsum("nij,nj->ni", t["chol_inv"][k_sel], diff)
-            maha = xp.sum(y * y, axis=1)
-            lp[rows, cols] = (t["log_w"][k_sel] + t["log_norm"][k_sel]
-                              - t["log_trunc_z"][k_sel] - 0.5 * maha)
+        n_pair = int(rows.shape[0])
+        if n_pair:
+            # CHUNKED OVER (coord, candidate) PAIRS (2026-09-19). Every pair
+            # is independent -- each writes one cell of ``lp`` and reads only
+            # its own component -- so slicing the pair list is a float-exact
+            # transformation, not an approximation.
+            #
+            # It has to be chunked because ``t["chol_inv"][k_sel]`` is a fancy
+            # -index TAKE that materialises (n_pair, ndim, ndim) float64 in
+            # one allocation. The pair count is n x D, not n: every coord
+            # contributes one pair per overlapping window, and
+            # GB_WARM_START_CIRC_IMAGES multiplies the candidate set by the
+            # wrapped-normal image count on top of that. A 6-month production
+            # run reached ~19.7 MILLION pairs and asked cupy for a single
+            # 12.8 GB block on a card already holding 90.7 GB:
+            #
+            #   rj_warm_pe -> BandSorter.__init__ -> rj_prop.logpdf
+            #     -> _mixture_logpdf -> einsum("nij,nj->ni", chol_inv[k_sel])
+            #   OutOfMemoryError: allocating 12,768,211,456 bytes
+            #
+            # Budget knob mirrors the sig-het fold cap's spelling and its
+            # 1 GiB default. Bytes per pair: the chol_inv take (ndim^2) plus
+            # diff/y/maha (~3 x ndim), all float64.
+            per_pair = 8 * (self.ndim * self.ndim + 3 * self.ndim)
+            step = max(1, int(_LOGPDF_MAX_BYTES // max(per_pair, 1)))
+            for s in range(0, n_pair, step):
+                e = min(s + step, n_pair)
+                r_c, c_c = rows[s:e], cols[s:e]
+                k_img = kk[r_c, c_c]              # candidate (image) index
+                k_sel = t["cand_parent"][k_img]   # parent component
+                diff = x[r_c] - t["means"][k_sel]
+                # minimal-image displacement on the circular columns ...
+                for c, period in CIRCULAR_COLS.items():
+                    d = diff[:, c]
+                    diff[:, c] = d - period * xp.round(d / period)
+                # ... plus this candidate's period-image shift (zero when
+                # circ_images == 0 -- float-exact no-op).
+                diff = diff + t["cand_shift"][k_img]
+                y = xp.einsum("nij,nj->ni", t["chol_inv"][k_sel], diff)
+                maha = xp.sum(y * y, axis=1)
+                lp[r_c, c_c] = (t["log_w"][k_sel] + t["log_norm"][k_sel]
+                                - t["log_trunc_z"][k_sel] - 0.5 * maha)
+                del k_img, k_sel, diff, y, maha
 
         m = xp.max(lp, axis=1)
         m_safe = xp.where(xp.isfinite(m), m, 0.0)
