@@ -17356,6 +17356,70 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             "is_cells": is_cells,
         }
 
+    def _cap_all_walkers_converged(self, lls, occ_w, thresh, tol):
+        """Per-cell mask: has EVERY engaged cold walker plateaued here?
+
+        The aggregate gate in :meth:`_update_band_leaf_caps` runs one
+        patience clock per cell on ``lls.max(axis=0)``. This runs the
+        SAME criterion once per walker on that walker's own series, and
+        reports the cells where no engaged walker is still improving.
+
+        Per walker ``w`` and cell ``c``, mirroring the aggregate exactly:
+
+        * engagement: ``|lls[w, c] - prev[w, c]| > tol`` latches ``seen``
+          (first update: engaged where the walker holds a source);
+        * improvement: ``lls[w, c] > best[w, c] + thresh`` resets the clock
+          and raises ``best``;
+        * patience accrues only while engaged AND occupied for that
+          walker, so a walker whose source died stops the clock rather
+          than ratcheting it.
+
+        A cell is returned True when at least one walker has engaged and
+        NO engaged walker is still inside its patience window. Walkers
+        that never engaged are ignored -- they have no plateau to post,
+        and demanding one would freeze the cell permanently.
+
+        All state is per-instance and in-memory (see the call site); the
+        arrays reshape themselves if the walker or cell count changes,
+        which is what a resume or a walker rescale looks like from here.
+        """
+        lls = np.asarray(lls)
+        occ_w = np.asarray(occ_w)
+        shape = lls.shape
+        best = getattr(self, "_cap_best_w", None)
+        if best is None or best.shape != shape:
+            best = np.full(shape, -np.inf)
+            self._cap_iters_w = np.zeros(shape, dtype=int)
+            self._cap_seen_w = np.zeros(shape, dtype=bool)
+            self._cap_prev_w = None
+        self._cap_best_w = best
+        iters_w, seen_w = self._cap_iters_w, self._cap_seen_w
+
+        prev = getattr(self, "_cap_prev_w", None)
+        occ_any_w = occ_w > 0
+        if prev is None or prev.shape != shape:
+            changed = occ_any_w.copy()
+        else:
+            both = np.isfinite(prev) & np.isfinite(lls)
+            # -inf minus -inf is nan and numpy warns eagerly even though
+            # ``both`` masks it out; an empty cell is exactly that case
+            # every iteration, so silence it rather than spam the run log.
+            with np.errstate(invalid="ignore"):
+                changed = np.where(
+                    both, np.abs(lls - prev) > tol,
+                    np.isfinite(lls) != np.isfinite(prev),
+                )
+        self._cap_prev_w = np.array(lls, copy=True)
+        seen_w |= changed
+
+        improved_w = lls > (best + thresh)
+        np.maximum(best, lls, out=best)
+        iters_w[improved_w] = 0
+        iters_w[~improved_w & seen_w & occ_any_w] += 1
+
+        blocking = (seen_w & (iters_w < self.leaf_cap_min_iters)).any(axis=0)
+        return seen_w.any(axis=0) & ~blocking
+
     def _update_band_leaf_caps(self, model, new_state, band_counts, *,
                                precomputed=None) -> None:
         """Advance the progressive leaf caps (once per iteration).
@@ -17536,9 +17600,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # post-restart update).
             if not _skip_guard:
                 _tol = float(os.environ.get("GB_LEAF_CAP_ENGAGE_TOL", "0.1"))
-                _occ_max = _to_numpy(
+                _occ_w = _to_numpy(
                     self._cold_occupancy(band_counts, new_state)
-                ).max(axis=0)
+                )
+                _occ_max = _occ_w.max(axis=0)
                 _occ_any = _occ_max > 0
                 _prev = getattr(self, "_cap_ll_prev_stat", None)
                 if _prev is None or _prev.shape != cur_max.shape:
@@ -17569,6 +17634,39 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # early would reach nleaves_max long before the run ends).
                 # Armed cells only (cap >= 1; -1 = disarmed sentinel).
                 converged &= (cap >= 1) & (_occ_max >= cap)
+                # ALL-WALKERS CONVERGENCE (user ruling 2026-09-19,
+                # GB_LEAF_CAP_ALL_WALKERS=1, default OFF). The test above
+                # runs on ``cur_max = lls.max(axis=0)`` -- ONE series that
+                # tracks whichever walker is on top. Because it compares a
+                # running best over TIME it is level-invariant, so a
+                # constant offset between walkers does not blind it; what
+                # it cannot see is a LAGGARD still climbing while the
+                # leader sits flat. The cap it then opens applies to every
+                # walker, including the ones that were not done. This is
+                # the standing TODO(leaf-cap-min-ll) above, in the form
+                # the user specified: require each walker to satisfy the
+                # convergence criterion in its OWN series before the cell
+                # is allowed to ramp.
+                #
+                # Composed with ``&=`` so it can only ever TIGHTEN the
+                # gate -- a bug here delays a cap, never opens one early.
+                #
+                # Only ENGAGED walkers can block: a walker that has never
+                # had a source in this cell has no plateau to post, and
+                # requiring one would freeze the cell forever (its
+                # per-walker clock would sit at 0 and never reach
+                # min_iters). ``sw.any()`` keeps the cell ramping once at
+                # least one walker has engaged, exactly as the aggregate
+                # latch does.
+                #
+                # State is IN-MEMORY ONLY, matching _cap_ll_improved_once
+                # and the engage baseline: a restart re-earns every
+                # walker's plateau, which holds caps LONGER -- the
+                # conservative direction. Nothing is added to the store,
+                # so this changes no on-disk layout and no resume.
+                if os.environ.get("GB_LEAF_CAP_ALL_WALKERS", "0") == "1":
+                    converged &= self._cap_all_walkers_converged(
+                        lls, _occ_w, thresh, _tol)
         elif self.leaf_cap_iter_only:
             best[:] = np.maximum(best, cur_max)
             iters += 1
@@ -17610,6 +17708,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             cap[converged] += 1
             iters[converged] = 0
             best[converged] = -np.inf
+            # The per-walker clocks follow the aggregate one: the next
+            # allowance must be re-earned by every engaged walker.
+            _iw = getattr(self, "_cap_iters_w", None)
+            if _iw is not None and _iw.shape[-1] == converged.shape[0]:
+                _iw[:, converged] = 0
+                self._cap_best_w[:, converged] = -np.inf
             logger.info(
                 f"{self.name}: leaf cap incremented for {len(inc)} {_unit} "
                 f"{_compact_index_ranges(inc)} -> caps "
