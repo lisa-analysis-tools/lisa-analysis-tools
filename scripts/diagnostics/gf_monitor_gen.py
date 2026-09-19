@@ -2672,9 +2672,21 @@ order = np.argsort(snr)[::-1]
 VGB_DET = np.nonzero(snr > 7.0)[0]
 VGB_DET = VGB_DET[np.argsort(snr[VGB_DET])[::-1]]
 VGB_N_DET = int(VGB_DET.size)
-med = np.median(vgb_last[:, :, 0], axis=0)
-lo = np.percentile(vgb_last[:, :, 0], 16, axis=0)
-hi = np.percentile(vgb_last[:, :, 0], 84, axis=0)
+# ``vgb_last`` can be shape (0, 55, 5) on the same young / mid-flush
+# snapshots the vgb_hh guard above already handles. np.median on an empty
+# slice merely warns and returns NaN, but np.percentile crashes inside
+# ``_quantile`` (arr[-1, ...] on a size-0 axis). Fall back to NaN arrays so
+# the panel still lays out with empty errorbars.
+if vgb_last.shape[0] == 0:
+    _shp = vgb_last.shape[1]
+    med = np.full(_shp, np.nan)
+    lo = np.full(_shp, np.nan)
+    hi = np.full(_shp, np.nan)
+else:
+    with np.errstate(invalid="ignore"):
+        med = np.median(vgb_last[:, :, 0], axis=0)
+        lo = np.percentile(vgb_last[:, :, 0], 16, axis=0)
+        hi = np.percentile(vgb_last[:, :, 0], 84, axis=0)
 
 _lab = [(VGB_IDS[k] if VGB_IDS else f"leaf {k}") for k in VGB_DET]
 _y = np.arange(VGB_N_DET)[::-1]
