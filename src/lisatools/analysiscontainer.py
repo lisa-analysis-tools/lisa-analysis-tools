@@ -1772,7 +1772,7 @@ class AnalysisContainerArray:
                 if not isinstance(g, (int, np.integer)):
                     raise TypeError(f"gpus entries must be int, got {type(g)}")
             if len(gpus) > 1:
-                logger.warning(
+                logger.info(
                     "Multiple GPUs detected. Data and sensitivity information "
                     "will be split across the GPUs as evenly as possible."
                 )
@@ -1943,12 +1943,13 @@ class AnalysisContainerArray:
             start_index = intra_split_index * (self.nchannels * self.data_length)
             end_index = (intra_split_index + 1) * (self.nchannels * self.data_length)
 
-            flat_data_res_here = ac.data_res_arr.flatten()
-
-            if hasattr(flat_data_res_here, "get") and not _on_device(
-                flat_data_res_here, gpu if self.gpus is not None else None
+            # ! Same guard and same order as reset_linear_psd_arr below.
+            data_res_src = ac.data_res_arr.data_res_arr.arr
+            if hasattr(data_res_src, "get") and not _on_device(
+                data_res_src, gpu if self.gpus is not None else None
             ):
-                flat_data_res_here = flat_data_res_here.get()
+                data_res_src = data_res_src.get()
+            flat_data_res_here = data_res_src.flatten()
             self.linear_data_arr[split][start_index:end_index] = self.xp.asarray(
                 flat_data_res_here
             )

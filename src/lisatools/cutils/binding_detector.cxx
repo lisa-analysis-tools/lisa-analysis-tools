@@ -463,22 +463,22 @@ void detector_part(nb::module_ &m) {
     .def_ro("N_quad",   &GalacticGridSetup::N_quad)
     .def_prop_ro("lam_ecl", [](GalacticGridSetup &s) {
         return vec_to_numpy(s.lam_ecl);
-    })
+    }, nb::rv_policy::automatic)
     .def_prop_ro("beta_ecl", [](GalacticGridSetup &s) {
         return vec_to_numpy(s.beta_ecl);
-    })
+    }, nb::rv_policy::automatic)
     .def_prop_ro("cos_beta_ecl", [](GalacticGridSetup &s) {
         return vec_to_numpy(s.cos_beta_ecl);
-    })
+    }, nb::rv_policy::automatic)
     .def_prop_ro("quad_weights", [](GalacticGridSetup &s) {
         return vec_to_numpy(s.quad_weights);
-    })
+    }, nb::rv_policy::automatic)
     .def_prop_ro("R_vals_quad", [](GalacticGridSetup &s) {
         return vec_to_numpy(s.R_vals_quad);
-    })
+    }, nb::rv_policy::automatic)
     .def_prop_ro("z_vals_quad", [](GalacticGridSetup &s) {
         return vec_to_numpy(s.z_vals_quad);
-    });
+    }, nb::rv_policy::automatic);
 
     // ---- GalacticGridWrap ----
 #if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
@@ -644,6 +644,17 @@ void domains_part(nb::module_ &m) {
          nb::arg("t0"), nb::arg("f_min"), nb::arg("f_max"),
          nb::arg("dt"), nb::arg("df"), nb::arg("window_alpha") = 0.0,
          nb::arg("use_midpoint") = false, nb::arg("linear_envelope") = false)
+    .def("compute_phase_kernel_moments", &STFTFresnelWrap::compute_phase_kernel_moments,
+         nb::arg("kernel_out"), nb::arg("moment_out"), nb::arg("f_effs"),
+         nb::arg("t_refs"), nb::arg("f0s"), nb::arg("fdot0s"),
+         nb::arg("t_starts"), nb::arg("t_ends"), nb::arg("t_origins"), nb::arg("num"),
+         nb::call_guard<nb::gil_scoped_release>(),
+         "Diagnostic: the single-interval phase-kernel product and its first moment about t_ref.\n\n"
+         "With psi(tau) = pi fdot0 tau^2 + 2 pi (f0 - f_eff) tau and tau measured from t_ref,\n"
+         "  kernel = e^{-2 pi i f_eff (t_ref - t_origin)} sqrt(2 |fdot0|) int e^{i psi} dtau,\n"
+         "  moment = the same integral with an extra tau in the integrand.\n"
+         "Both are the quantities the windowed evaluator sums over its seven Tukey terms, so they\n"
+         "can be compared directly with the integrals rather than with another implementation.")
     .def("compute_fourier_values", &STFTFresnelWrap::compute_fourier_values,
          nb::arg("output"), nb::arg("amps"), nb::arg("phase0s"),
          nb::arg("f0s"), nb::arg("fdot0s"), nb::arg("t0s"),

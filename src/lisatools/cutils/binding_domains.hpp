@@ -189,6 +189,35 @@ public:
             out_ptr, amp_ptr, ph_ptr, f0_ptr, fd_ptr, t0_ptr,
             freq_ptr, window_factor, num_binaries, num_freqs);
     }
+
+    // Diagnostic: the single-interval phase-kernel product and its first moment about t_ref, so both
+    // can be compared with the integrals they represent.
+    void compute_phase_kernel_moments(
+        array_type<std::complex<double>> kernel_out,
+        array_type<std::complex<double>> moment_out,
+        array_type<double> f_effs,
+        array_type<double> t_refs,
+        array_type<double> f0s,
+        array_type<double> fdot0s,
+        array_type<double> t_starts,
+        array_type<double> t_ends,
+        array_type<double> t_origins,
+        int num)
+    {
+        fresnel->compute_phase_kernel_moments_wrap(
+            reinterpret_cast<cmplx*>(
+                return_pointer_and_check_length(kernel_out, "kernel_out", num, 1)),
+            reinterpret_cast<cmplx*>(
+                return_pointer_and_check_length(moment_out, "moment_out", num, 1)),
+            return_pointer_and_check_length(f_effs, "f_effs", num, 1),
+            return_pointer_and_check_length(t_refs, "t_refs", num, 1),
+            return_pointer_and_check_length(f0s, "f0s", num, 1),
+            return_pointer_and_check_length(fdot0s, "fdot0s", num, 1),
+            return_pointer_and_check_length(t_starts, "t_starts", num, 1),
+            return_pointer_and_check_length(t_ends, "t_ends", num, 1),
+            return_pointer_and_check_length(t_origins, "t_origins", num, 1),
+            num);
+    }
 };
 
 #endif // __BINDING_DOMAINS_HPP__
