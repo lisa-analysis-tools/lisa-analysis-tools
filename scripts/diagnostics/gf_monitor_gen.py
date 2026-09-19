@@ -256,8 +256,26 @@ else:
 sub = g["sub_backend"]
 psd_c = sub["psd/chain"][:NIT]                      # (it, 12, 24, 1, 2)
 gal_c = sub["galfor/chain"][:NIT]                   # (it, 12, 24, 1, 5)
-vgb_c = sub["vgb/chain"][:NIT, 0, ..., :5]          # (it, W, 55, 5); store may hold >5 params (e.g. 6-param VGB); the monitor plots the first 5
-vgb_hh = sub["vgb/h_h"][:NIT]                       # (it, 24, 55)
+# Two VGB sampling bases are live in production (stock/erebor/vgb.py):
+#   * legacy 5-param DIST basis: [dist, phi0, cos_iota, psi, fdot_astro_ratio]
+#     with per-leaf FIXED Mc from the catalogue
+#   * 6-param CHIRP basis (VGB_CHIRP_MASS_BASIS=1, used by 6-month runs):
+#     [dist, phi0, cos_iota, psi, Mc, fdot_astro_ratio]  -- Mc sampled
+# The panel that reassembles the 9-col GB basis (F1 residual, DTR panels)
+# below MUST know which basis this store used or it will read a chirp mass
+# out of the fdot_astro_ratio slot and vice versa, collapsing every VGB
+# template's amplitude to ~zero (silent -- no crash, the residual just
+# reads as if VGB isn't being subtracted). Store's last chain dim tells
+# them apart. Keep the FULL sampled row; downstream reads by column index.
+_vgb_chain_ndim = int(sub["vgb/chain"].shape[-1])
+VGB_SAMPLED_DIST = _vgb_chain_ndim == 5
+VGB_SAMPLED_CHIRP = _vgb_chain_ndim == 6
+if not (VGB_SAMPLED_DIST or VGB_SAMPLED_CHIRP):
+    raise RuntimeError(
+        f"unrecognised VGB chain last-dim {_vgb_chain_ndim} "
+        f"(expected 5 for DIST basis or 6 for CHIRP basis)")
+vgb_c = sub["vgb/chain"][:NIT, 0]                   # (it, W, 55, 5 or 6)
+vgb_hh = sub["vgb/h_h"][:NIT]                       # (it, W, 55)
 # TRAILING INCOMPLETE SUB-BACKEND ROWS (2026-08-15). The main backend and a
 # sub-backend are not flushed atomically: a snapshot can hold a row where
 # log_like / inds / chain are written but sub_backend/vgb/* is still all
@@ -1364,7 +1382,13 @@ else:
         "comb/peaks caches only when it finishes).")
 
 # ---- 7. VGB ----
-VGB_NAMES = ["dist [kpc]", "phi0", "cos_iota", "psi", "fdot_astro_ratio"]
+# Matches the sampled columns in the same order the store writes them, so
+# vgb_last[..., j] always corresponds to VGB_NAMES[j].
+VGB_NAMES = (
+    ["dist [kpc]", "phi0", "cos_iota", "psi", "Mc [Msol]", "fdot_astro_ratio"]
+    if VGB_SAMPLED_CHIRP else
+    ["dist [kpc]", "phi0", "cos_iota", "psi", "fdot_astro_ratio"]
+)
 # Per-leaf FIXED frequencies + names from the mojito catalogue (leaf i =
 # catalogue row i, fixed-leaf branch).
 VGB_F0 = None
@@ -1442,7 +1466,7 @@ def cat_to_sampled9(entry):
                             rows[:, 5], rows[:, 6], rows[:, 7], ratio]), rel
 
 
-VGB_TRUTH = None        # (55, 5) in the VGB sampled basis
+VGB_TRUTH = None        # (55, ndim) in the VGB sampled basis (5 or 6 cols)
 VGB_TRUTH_REL = None
 try:
     from lisatools.globalfit.stock.erebor.vgb import load_vgb_catalogue_file
@@ -1451,11 +1475,16 @@ try:
     VGB_F0 = np.asarray(_v["GW22FrequencySSBFrame"]) * 1e3   # mHz
     VGB_IDS = [i.decode() if isinstance(i, bytes) else str(i)
                for i in _v["ID"]]
-    # VGB sampled basis = ["dist", "phi0", "cos_iota", "psi",
-    # "fdot_astro_ratio"] (VGB_SAMPLED_BASIS_DIST) = columns 0, 3, 4, 5, 8
-    # of the 9-column GB basis.
+    # Legacy VGB sampled basis (5 params) = ["dist", "phi0", "cos_iota",
+    # "psi", "fdot_astro_ratio"] = 9-col GB indices [0, 3, 4, 5, 8].
+    # Chirp basis (6 params, 6-month runs) = ["dist", "phi0", "cos_iota",
+    # "psi", "Mc", "fdot_astro_ratio"] = 9-col GB indices
+    # [0, 3, 4, 5, 2, 8] -- Mc slot goes IN THE MIDDLE, matching the store
+    # column order in ``vgb_c[..., 4]``.
     _r9, VGB_TRUTH_REL = cat_to_sampled9(_v)
-    VGB_TRUTH = _r9[:, [0, 3, 4, 5, 8]]
+    _truth_cols = ([0, 3, 4, 5, 2, 8] if VGB_SAMPLED_CHIRP
+                   else [0, 3, 4, 5, 8])
+    VGB_TRUTH = _r9[:, _truth_cols]
 except Exception as e:
     MISSING.append(f"VGB catalogue f0 axis unavailable locally: {e!r}")
 
@@ -1609,13 +1638,25 @@ try:
     # --- templates from the max-lnL cold walker's last stored coordinates ---
     WBEST = int(np.argmax(ll[-1]))
     _gb9 = gb_chain_cold[WBEST][gb_alive_last[WBEST]]        # (n_gb, 9)
-    _v5 = vgb_c[-1, WBEST]                                   # (55, 5)
-    # VGB sampled 5 columns + the 4 catalogue-FIXED ones (f0, Mc, alpha,
-    # sin_delta) reassembled into the same 9-column basis the gb branch uses,
-    # so ONE transform container serves both branches.
-    _vgb9 = np.column_stack([_v5[:, 0], _r9[:, 1], _r9[:, 2], _v5[:, 1],
-                             _v5[:, 2], _v5[:, 3], _r9[:, 6], _r9[:, 7],
-                             _v5[:, 4]])
+    _v5 = vgb_c[-1, WBEST]                                   # (55, 5) or (55, 6)
+    # Reassemble to the 9-column GB basis
+    # [dist, f0, Mc, phi0, cos_iota, psi, alpha, sin_delta, fdot_astro_ratio].
+    # LEGACY (5-param DIST basis): Mc is catalogue-fixed (_r9[:, 2]),
+    #   fdot_astro_ratio is sampled at _v5[:, 4].
+    # CHIRP (6-param): Mc is SAMPLED at _v5[:, 4], and fdot_astro_ratio
+    #   moves to _v5[:, 5]. Getting this wrong silently zeroes the VGB
+    #   template amplitude (Mc value ~0.3 winds up in the ratio slot and
+    #   the amplitude transform d(A)/d(Mc,dist,...) collapses) -- the
+    #   sampler subtracts as normal, but the monitor's rebuild does not,
+    #   and the DTR residual reads as if HM Cnc etc. were never fit.
+    if VGB_SAMPLED_CHIRP:
+        _vgb9 = np.column_stack([_v5[:, 0], _r9[:, 1], _v5[:, 4],
+                                 _v5[:, 1], _v5[:, 2], _v5[:, 3],
+                                 _r9[:, 6], _r9[:, 7], _v5[:, 5]])
+    else:
+        _vgb9 = np.column_stack([_v5[:, 0], _r9[:, 1], _r9[:, 2],
+                                 _v5[:, 1], _v5[:, 2], _v5[:, 3],
+                                 _r9[:, 6], _r9[:, 7], _v5[:, 4]])
     _tf = make_gb_transform_container(use_chirp_mass=True, use_fdot_astro=True,
                                       use_distance=True, mc_lims=(0.001, 1.0))
     _comp = GBFDComputations(
@@ -1660,13 +1701,33 @@ try:
     _YLO = 1e-19
 
     def _maxdec(x, y, npts=2200):
-        """Block-MAX decimation: a 1.55M-bin spectrum has to lose 99.9% of
-        its points to fit a PNG, and taking every Nth bin would drop exactly
-        the narrow GB lines this panel exists to show."""
-        st = max(1, len(x) // npts)
-        m = (len(x) // st) * st
-        return (x[:m].reshape(-1, st)[:, 0],
-                np.abs(y[:m]).reshape(-1, st).max(axis=1))
+        """Log-frequency RMS binning: a 1.55M-bin spectrum has to lose 99.9%
+        of its points to fit a PNG. Earlier this was a linear block-MAX of
+        |y|; that preserved narrow GB lines but the sub-band region reads
+        as visible waviness because Tukey-window sidelobes from strong
+        sub-mHz TDI content sinc-leak across every bin below FLO and the
+        MAX picks up their peaks. Log-frequency RMS (sqrt of the mean of
+        |y|^2 per log-f bin) collapses the sinc envelope to its RMS while
+        narrow GB lines still show as bumps above the residual floor
+        (in-band, thousands of noise bins per log-f pixel drop the RMS
+        floor well below the GB peak). Matches what the F1 residual-
+        spectrum panel already does (see the ``_bmean`` block below).
+        """
+        x = np.asarray(x, float)
+        y = np.abs(np.asarray(y))
+        pos = x > 0
+        if not pos.any():
+            return x[:0], y[:0]
+        xL, yL = x[pos], y[pos]
+        ed = np.logspace(np.log10(xL[0]), np.log10(xL[-1]), npts + 1)
+        bi = np.clip(np.searchsorted(ed, xL, side="right") - 1, 0, npts - 1)
+        cnt = np.bincount(bi, minlength=npts).astype(float)
+        s2 = np.bincount(bi, weights=yL ** 2, minlength=npts)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            rms = np.sqrt(s2 / np.maximum(cnt, 1))
+        fc = np.sqrt(ed[:-1] * ed[1:])
+        ok = cnt > 0
+        return fc[ok], rms[ok]
 
     _cols = [
         ("data (mojito " + " + ".join(_types) + ")",
@@ -1855,6 +1916,31 @@ try:
     _Pd, _Pt = _bmean(_PSD(_dA[_sel])), _bmean(_PSD(_tA[_sel]))
     _Pr = _bmean(_PSD(_rA[_sel]))
     _Ni = _bmean(_Sinst[_sel]); _Ng = _bmean(_Sgal[_sel]); _Ns = _bmean(_Ssum[_sel])
+
+    # Welch-in-frequency-domain smoothing on the log-f binned periodogram.
+    # A single-windowed periodogram bin has Chi^2(2) statistics
+    # (sigma/mu = 1 per FD bin), and the log-f block-MEAN above beats that
+    # to sigma/mu = 1/sqrt(N) where N is the number of FD bins per log-f
+    # pixel. At the low-f end where N is small, ~5-10% variance is still
+    # visible on log-y over five decades of PSD range and reads as
+    # waviness. Convolving with a Hann kernel of half-width H log-f bins
+    # is equivalent to Welch's method with a Hann synthesis window across
+    # neighbouring subbands: it multiplies the effective DOF by
+    # (2H+1)*<w^2>/<w>^2, so H=2 (5-tap Hann) roughly triples the DOF and
+    # drops sigma/mu by ~sqrt(3). Total power is preserved because the
+    # kernel is normalised, and the model curves (_Ni/_Ng/_Ns) are already
+    # smooth so the same kernel on them is a no-op up to floating point.
+    # NaN-safe: bins the block-mean flagged as empty stay NaN.
+    def _smooth_logf(y, half=2):
+        w = np.hanning(2 * half + 1)
+        w = w / w.sum()
+        m = np.isfinite(y).astype(float)
+        yz = np.where(np.isfinite(y), y, 0.0)
+        yc = np.convolve(yz, w, mode="same")
+        mc = np.convolve(m, w, mode="same")
+        return np.where(mc > 1e-9, yc / np.maximum(mc, 1e-30), np.nan)
+    _Pd = _smooth_logf(_Pd); _Pt = _smooth_logf(_Pt); _Pr = _smooth_logf(_Pr)
+    _Ni = _smooth_logf(_Ni); _Ng = _smooth_logf(_Ng); _Ns = _smooth_logf(_Ns)
 
     # whitened residual: real and imaginary parts are each N(0,1) when the
     # noise model is right, so the ratio below sits at 1 and the
@@ -2646,7 +2732,7 @@ if TRU is not None:
 # pooled marginals and the zoomable posterior cloud) draws the same rows.
 VGB_SAMP_ROWS = _vgb_pool_rows(POOL_ITS_SAMPLES)
 VGB_SAMP_ITS = int(VGB_SAMP_ROWS.size)
-vgb_last = vgb_c[VGB_SAMP_ROWS].reshape(-1, 55, 5)       # (S, 55, 5)
+vgb_last = vgb_c[VGB_SAMP_ROWS].reshape(-1, 55, _vgb_chain_ndim)  # (S, 55, 5 or 6)
 # ``vgb_hh`` gets trimmed to SUB_NIT rows above, and SUB_NIT can land at 0
 # on a very young store or one whose mid-flush left the whole VGB column
 # unwritten. ``vgb_hh[-1]`` then raises IndexError and the whole page dies.
@@ -2818,9 +2904,14 @@ fig_b64(fig, "vgb_traces")
 # the posterior's peak). fdot_astro_ratio is the exception -- every truth is
 # identically 0 (GR-chirp binaries), so a single dotted line is the honest
 # overlay there.
-fig, ax = plt.subplots(1, 4, figsize=(13, 2.8))
-for j in range(1, 5):
-    a = ax[j-1]
+# Non-distance marginals: cols 1..(ndim-1), so 4 panels on the legacy
+# 5-param basis and 5 on the chirp 6-param basis.
+_marg_cols = list(range(1, _vgb_chain_ndim))
+fig, ax = plt.subplots(1, len(_marg_cols), figsize=(13, 2.8))
+if len(_marg_cols) == 1:
+    ax = [ax]
+for _panel_i, j in enumerate(_marg_cols):
+    a = ax[_panel_i]
     n_, edges_, _ = a.hist(vgb_last[:, :, j].ravel(), bins=30, color=VIOLET,
                            alpha=0.85)
     if VGB_TRUTH is not None:
@@ -3102,7 +3193,7 @@ VGB_POST_JSON = json.dumps({
 VGB_CORNER_ROWS = _vgb_pool_rows(POOL_ITS_POSTERIOR)
 CORNER_ITS = int(VGB_CORNER_ROWS.size)
 CORNER_DPI, CORNER_IN = 68, 7.0        # size-budget tuned (see below)
-vgb_corner = vgb_c[VGB_CORNER_ROWS].reshape(-1, 55, 5)   # (S, 55, 5)
+vgb_corner = vgb_c[VGB_CORNER_ROWS].reshape(-1, 55, _vgb_chain_ndim)  # (S, 55, 5 or 6)
 VGB_CORNER = {"src": [], "nsamp": int(vgb_corner.shape[0]),
               "nits": int(CORNER_ITS), "nwalk": int(nwalk)}
 CORNER_BYTES = []
