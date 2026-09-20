@@ -4859,37 +4859,18 @@ function viewCtl(px, cv, api) {{
     // legible over crowded amber patches, but the grey undetectable rows
     // still show up under the cloud where the model has no sources.
     if (showT) {{
-      // Drawn as CROSSES, not 1.4px dots (user request 2026-08-16): the
-      // dots were the same visual weight as a rendering artefact, so the
-      // injected population read as background noise rather than as the
-      // thing the recovered cloud is being judged against. An open glyph
-      // also stays legible UNDER the filled recovery circles, which a
-      // solid marker of this size would not.
-      // --truthred, NOT --dim (2026-08-19). The colour was defined for
-      // exactly these marks and never wired up, so the crosses rendered
-      // grey and the caption's "Catalogue truths (red)" was a lie.
-      // TWO passes, not one (2026-09-19): p[2] is 1 for a catalogue source
-      // the run could actually detect and 0 for a sub-threshold one, and a
-      // canvas path carries a single strokeStyle. Sub-threshold goes down
-      // FIRST so the detectable crosses sit on top of it. Still batched --
-      // two stroke() calls a frame instead of one, against the thousands
-      // the per-point version cost before 2026-08-19. A point with no flag
-      // (a page built before this column existed) counts as detectable, so
-      // an old EXPL_JSON still renders all-red rather than all-grey.
+      // Layer 1: grey X's for undetectable catalogue rows.
+      g.strokeStyle = C("--dim"); g.globalAlpha = 0.55;
       g.lineWidth = 1.5; g.lineCap = "round";
       const r = 3.4;
-      for (const pass of [0, 1]) {{
-        g.strokeStyle = C(pass ? "--truthred" : "--truthgrey");
-        g.globalAlpha = pass ? 0.9 : 0.55;
-        g.beginPath();
-        for (const p of TRUTH) {{
-          if ((p.length > 2 ? p[2] : 1) !== pass) continue;
-          const x = sx(p[0]), y = sy(p[1]);
-          if (x < ml || x > w - mr || y < mt || y > h - mb) continue;
-          g.moveTo(x - r, y - r); g.lineTo(x + r, y + r);
-          g.moveTo(x - r, y + r); g.lineTo(x + r, y - r);
-        }}
+      g.beginPath();
+      for (const p of T_GREY) {{
+        const x = sx(p[0]), y = sy(p[1]);
+        if (x < ml || x > w - mr || y < mt || y > h - mb) continue;
+        g.moveTo(x - r, y - r); g.lineTo(x + r, y + r);
+        g.moveTo(x - r, y + r); g.lineTo(x + r, y - r);
       }}
+      g.stroke();
     }}
     // ONE PATH, ONE FILL (2026-08-19). This used to open a path and issue a
     // separate fill() per point -- 5k+ draw calls per frame. Batching every
