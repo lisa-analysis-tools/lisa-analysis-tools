@@ -1009,7 +1009,7 @@ if shutoff_bands:
 # In-pane zoom for GB leaf count: last 50 iterations (user request 2026-09-20).
 _gb_zoom = gb_counts[-_n_zoom:]
 if _n_zoom >= 3:
-    axins_gb = inset_axes(ax[0], width="35%", height="30%", loc="upper right",
+    axins_gb = inset_axes(ax[0], width="35%", height="30%", loc="center",
                           borderpad=1.2)
     for w in range(nwalk):
         axins_gb.plot(_it_zoom, _gb_zoom[:, w], color=GREEN, alpha=0.35, lw=0.7)
