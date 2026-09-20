@@ -587,18 +587,16 @@ _m0 = re.search(r"\[gb\].*?\n\s+t0:\s*([\d.]+)", SETTINGS_TXT, re.S)
 T_REF_SCI = float(_m0.group(1)) if _m0 else 97729089.327664
 
 # ============================ PLOTS =========================================
-# ---- 1. likelihood + GB leaf count (user request 2026-09-20: 3-panel row) --
-# The third panel (GB leaf count) is populated below after gb_counts is computed.
-fig_ll, ax_ll = plt.subplots(1, 3, figsize=(15.5, 3.4))
+# ---- 1. likelihood ----
+fig, ax = plt.subplots(1, 2, figsize=(11, 3.4))
 for w in range(nwalk):
-    ax_ll[0].plot(it, ll[:, w], color=CYAN, alpha=0.25, lw=0.8)
-ax_ll[0].plot(it, ll.max(axis=1), color=AMBER, lw=1.8, label="max")
-ax_ll[0].plot(it, np.median(ll, axis=1), color=FG, lw=1.2, ls="--", label="median")
-ax_ll[0].set_xlabel("iteration"); ax_ll[0].set_ylabel("cold-chain lnL")
-ax_ll[0].legend(fontsize=8)
-ax_ll[0].set_title("total log-likelihood (24 walkers)")
-ax_ll[1].plot(it, ll.max(axis=1) - ll.min(axis=1), color=VIOLET, lw=1.5)
-ax_ll[1].set_xlabel("iteration"); ax_ll[1].set_title("walker lnL spread (max - min)")
+    ax[0].plot(it, ll[:, w], color=CYAN, alpha=0.25, lw=0.8)
+ax[0].plot(it, ll.max(axis=1), color=AMBER, lw=1.8, label="max")
+ax[0].plot(it, np.median(ll, axis=1), color=FG, lw=1.2, ls="--", label="median")
+ax[0].set_xlabel("iteration"); ax[0].set_ylabel("cold-chain lnL"); ax[0].legend()
+ax[0].set_title("total log-likelihood (24 walkers)")
+ax[1].plot(it, ll.max(axis=1) - ll.min(axis=1), color=VIOLET, lw=1.5)
+ax[1].set_xlabel("iteration"); ax[1].set_title("walker lnL spread (max - min)")
 
 # In-pane zoom showing last 50 iterations (user request 2026-09-20).
 _n_zoom = min(50, NIT)
@@ -607,7 +605,7 @@ _ll_zoom = ll[-_n_zoom:]
 if _n_zoom >= 3:
     from mpl_toolkits.axes_grid1.inset_locator import inset_axes
     # Left panel zoom: last 50 iterations of all traces
-    axins0 = inset_axes(ax_ll[0], width="35%", height="30%", loc="lower right",
+    axins0 = inset_axes(ax[0], width="35%", height="30%", loc="lower right",
                         borderpad=1.2)
     for w in range(nwalk):
         axins0.plot(_it_zoom, _ll_zoom[:, w], color=CYAN, alpha=0.3, lw=0.7)
@@ -616,8 +614,8 @@ if _n_zoom >= 3:
     axins0.tick_params(labelsize=7)
     axins0.set_title(f"last {_n_zoom} iter", fontsize=7.5, pad=2)
     axins0.grid(True, alpha=0.25, lw=0.5)
-    # Middle panel zoom: last 50 iterations of spread
-    axins1 = inset_axes(ax_ll[1], width="35%", height="30%", loc="upper right",
+    # Right panel zoom: last 50 iterations of spread
+    axins1 = inset_axes(ax[1], width="35%", height="30%", loc="upper right",
                         borderpad=1.2)
     axins1.plot(_it_zoom, _ll_zoom.max(axis=1) - _ll_zoom.min(axis=1),
                 color=VIOLET, lw=1.3)
@@ -625,7 +623,7 @@ if _n_zoom >= 3:
     axins1.set_title(f"last {_n_zoom} iter", fontsize=7.5, pad=2)
     axins1.grid(True, alpha=0.25, lw=0.5)
 
-# Third panel (GB leaf count) populated below after gb_counts is available
+fig_b64(fig, "ll")
 
 # ---- F11: the noise model, in two panels ----------------------------------
 # The page used to carry six: two instrument traces, two instrument
@@ -873,31 +871,6 @@ except Exception as e:
 # where it is given a denominator) ----------------------------------------
 gb_counts = gb_inds.sum(axis=-1)                    # (it, 24)
 
-# Add GB leaf count to the third panel of the likelihood figure (user request
-# 2026-09-20: 3-panel row with lnL, spread, leaf count).
-for w in range(nwalk):
-    ax_ll[2].plot(it, gb_counts[:, w], color=GREEN, alpha=0.35, lw=0.9)
-ax_ll[2].plot(it, gb_counts.max(axis=1), color=GREEN, lw=1.8, label="max")
-ax_ll[2].set_xlabel("iteration"); ax_ll[2].set_ylabel("GB leaf count")
-ax_ll[2].set_title("GB leaf count (cold walkers)")
-ax_ll[2].set_ylim(bottom=-0.5)
-ax_ll[2].legend(fontsize=8, loc="lower right")
-
-# Third panel zoom: last 50 iterations of GB leaf count
-_gb_zoom = gb_counts[-_n_zoom:]
-if _n_zoom >= 3:
-    axins2 = inset_axes(ax_ll[2], width="35%", height="30%", loc="upper right",
-                        borderpad=1.2)
-    for w in range(nwalk):
-        axins2.plot(_it_zoom, _gb_zoom[:, w], color=GREEN, alpha=0.35, lw=0.7)
-    axins2.plot(_it_zoom, _gb_zoom.max(axis=1), color=GREEN, lw=1.4)
-    axins2.tick_params(labelsize=7)
-    axins2.set_title(f"last {_n_zoom} iter", fontsize=7.5, pad=2)
-    axins2.grid(True, alpha=0.25, lw=0.5)
-
-# Emit the 3-panel likelihood + GB figure
-fig_b64(fig_ll, "ll")
-
 # ---- detectable-truth set for the overlays (from the census npz) ----------
 # `census.py` computes optimal SNR for every catalogue GB over the analysed
 # band against the run's OWN sampled sensitivity; the detectable (SNR>7) subset
@@ -1032,6 +1005,19 @@ for b in shutoff_bands:
 if shutoff_bands:
     ax[1].set_title(
         f"leaf cap per {_lab} ({len(shutoff_bands)} bands birth-OFF, red)")
+
+# In-pane zoom for GB leaf count: last 50 iterations (user request 2026-09-20).
+_gb_zoom = gb_counts[-_n_zoom:]
+if _n_zoom >= 3:
+    axins_gb = inset_axes(ax[0], width="35%", height="30%", loc="upper right",
+                          borderpad=1.2)
+    for w in range(nwalk):
+        axins_gb.plot(_it_zoom, _gb_zoom[:, w], color=GREEN, alpha=0.35, lw=0.7)
+    axins_gb.plot(_it_zoom, _gb_zoom.max(axis=1), color=GREEN, lw=1.4)
+    axins_gb.tick_params(labelsize=7)
+    axins_gb.set_title(f"last {_n_zoom} iter", fontsize=7.5, pad=2)
+    axins_gb.grid(True, alpha=0.25, lw=0.5)
+
 fig_b64(fig, "gb_leaves")
 
 # ---- 5a. CAP-CELL OCCUPANCY ----------------------------------------------
