@@ -597,6 +597,32 @@ ax[0].set_xlabel("iteration"); ax[0].set_ylabel("cold-chain lnL"); ax[0].legend(
 ax[0].set_title("total log-likelihood (24 walkers)")
 ax[1].plot(it, ll.max(axis=1) - ll.min(axis=1), color=VIOLET, lw=1.5)
 ax[1].set_xlabel("iteration"); ax[1].set_title("walker lnL spread (max - min)")
+
+# In-pane zoom showing last 50 iterations (user request 2026-09-20).
+_n_zoom = min(50, NIT)
+_it_zoom = it[-_n_zoom:]
+_ll_zoom = ll[-_n_zoom:]
+if _n_zoom >= 3:
+    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+    # Left panel zoom: last 50 iterations of all traces
+    axins0 = inset_axes(ax[0], width="35%", height="30%", loc="lower right",
+                        borderpad=1.2)
+    for w in range(nwalk):
+        axins0.plot(_it_zoom, _ll_zoom[:, w], color=CYAN, alpha=0.3, lw=0.7)
+    axins0.plot(_it_zoom, _ll_zoom.max(axis=1), color=AMBER, lw=1.4)
+    axins0.plot(_it_zoom, np.median(_ll_zoom, axis=1), color=FG, lw=0.9, ls="--")
+    axins0.tick_params(labelsize=7)
+    axins0.set_title(f"last {_n_zoom} iter", fontsize=7.5, pad=2)
+    axins0.grid(True, alpha=0.25, lw=0.5)
+    # Right panel zoom: last 50 iterations of spread
+    axins1 = inset_axes(ax[1], width="35%", height="30%", loc="upper right",
+                        borderpad=1.2)
+    axins1.plot(_it_zoom, _ll_zoom.max(axis=1) - _ll_zoom.min(axis=1),
+                color=VIOLET, lw=1.3)
+    axins1.tick_params(labelsize=7)
+    axins1.set_title(f"last {_n_zoom} iter", fontsize=7.5, pad=2)
+    axins1.grid(True, alpha=0.25, lw=0.5)
+
 fig_b64(fig, "ll")
 
 # ---- F11: the noise model, in two panels ----------------------------------
