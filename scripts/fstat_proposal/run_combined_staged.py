@@ -946,7 +946,7 @@ def build_fit():
             # noise, then sobbh -> mbh -> emri, then gb).
             # rj_warm_pe (when armed) runs IMMEDIATELY BEFORE rj_fstat_pe
             # -- the PE mirror of the search-stage order.
-            moves=noise_pe + source_pe() + warm_pe() + [
+            moves=noise_pe + source_pe(gb_search_cadence=True) + warm_pe() + [
                 Move("rj_fstat_pe", branch="gb"),
                 Move("rj_prior_pe", branch="gb"),
             ] + ([Move("gb_ridge_gibbs", branch="gb")]
