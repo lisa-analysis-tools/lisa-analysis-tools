@@ -3394,10 +3394,11 @@ try:
     if (RPHYS is not None and RPHYS.shape[0] > 0
             and isinstance(MATCHED_MM, np.ndarray)
             and MATCHED_MM.size == RPHYS.shape[0]):
-        _rf_hz = np.asarray(RPHYS[:, 1], float)      # already in mHz
+        _rf_hz = np.asarray(RPHYS[:, 1], float)      # Hz from GBGPU
+        _rf_mhz = _rf_hz * 1e3                       # convert to mHz for plot
         _ra_lg = np.log10(np.maximum(np.asarray(RPHYS[:, 0], float), 1e-40))
         expl["sources"] = [
-            [round(float(_rf_hz[i]), 7),
+            [round(float(_rf_mhz[i]), 7),
              round(float(_ra_lg[i]), 4),
              1 if bool(MATCHED_MM[i]) else 0]
             for i in range(RPHYS.shape[0])]
