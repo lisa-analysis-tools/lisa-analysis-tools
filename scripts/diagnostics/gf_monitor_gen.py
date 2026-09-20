@@ -1886,7 +1886,8 @@ try:
     from lisatools.sensitivity import get_sensitivity, X2TDISens
     from lisatools import detector as lisa_models
     from lisatools.stochastic import (
-        HyperbolicTangentGalacticForeground as _HTGF)
+        HyperbolicTangentGalacticForeground as _HTGF,
+        FittedHyperbolicTangentGalacticForeground as _FHT)
     _pm = np.median(psd_cold[-1], axis=0)
     _gm = np.median(gal_cold_phys[-1], axis=0)
     _lmod = lisa_models.LISAModel(_pm[0] ** 2, _pm[1] ** 2,
@@ -1899,6 +1900,18 @@ try:
                                        stochastic_params=tuple(_gm),
                                        stochastic_function=_HTGF), float)
     _Sgal = np.maximum(_Ssum - _Sinst, 1e-60)
+
+    # Injected instrument + FittedHyperbolicTangent foreground for comparison.
+    _lm_inj = lisa_models.LISAModel(SOMS_INJ ** 2, SA_INJ ** 2,
+                                    lisa_models.DefaultOrbits(), "injected")
+    _Sinst_inj = np.asarray(get_sensitivity(_fpos, sens_fn=X2TDISens,
+                                            model=_lm_inj, stochastic_params=()),
+                            float)
+    _Ssum_inj = np.asarray(get_sensitivity(_fpos, sens_fn=X2TDISens,
+                                           model=_lm_inj,
+                                           stochastic_params=(SCI_TOBS,),
+                                           stochastic_function=_FHT), float)
+    _Sgal_inj = np.maximum(_Ssum_inj - _Sinst_inj, 1e-60)
 
     # log-f binning. A PSD is an AVERAGE of periodogram bins, so the reduction
     # is a mean per log-frequency bin -- not the block-MAX a line spectrum
@@ -1924,6 +1937,9 @@ try:
     _Pd, _Pt = _bmean(_PSD(_dA[_sel])), _bmean(_PSD(_tA[_sel]))
     _Pr = _bmean(_PSD(_rA[_sel]))
     _Ni = _bmean(_Sinst[_sel]); _Ng = _bmean(_Sgal[_sel]); _Ns = _bmean(_Ssum[_sel])
+    _Ni_inj = _bmean(_Sinst_inj[_sel])
+    _Ng_inj = _bmean(_Sgal_inj[_sel])
+    _Ns_inj = _bmean(_Ssum_inj[_sel])
 
     # Welch-in-frequency-domain smoothing on the log-f binned periodogram.
     # A single-windowed periodogram bin has Chi^2(2) statistics
@@ -1949,6 +1965,8 @@ try:
         return np.where(mc > 1e-9, yc / np.maximum(mc, 1e-30), np.nan)
     _Pd = _smooth_logf(_Pd); _Pt = _smooth_logf(_Pt); _Pr = _smooth_logf(_Pr)
     _Ni = _smooth_logf(_Ni); _Ng = _smooth_logf(_Ng); _Ns = _smooth_logf(_Ns)
+    _Ni_inj = _smooth_logf(_Ni_inj); _Ng_inj = _smooth_logf(_Ng_inj)
+    _Ns_inj = _smooth_logf(_Ns_inj)
 
     # whitened residual: real and imaginary parts are each N(0,1) when the
     # noise model is right, so the ratio below sits at 1 and the
@@ -1998,14 +2016,20 @@ try:
     ax[0].plot(_fcb, _Pd, color=CYAN, lw=1.6, label="injected data")
     ax[0].plot(_fcb, _Pt, color=GREEN, lw=1.2, label="template sum (GB + VGB)")
     ax[0].plot(_fcb, _Pr, color=VIOLET, lw=1.4, label="residual")
-    ax[0].plot(_fcb, _Ni, color=FG, lw=1.2, ls=":", label="instrument noise")
+    ax[0].plot(_fcb, _Ni, color=FG, lw=1.2, ls=":", label="instrument noise (sampled)")
     ax[0].plot(_fcb, _Ng, color=AMBER, lw=1.2, ls=":",
-               label="galactic foreground")
-    ax[0].plot(_fcb, _Ns, color=FG, lw=1.3, ls="--", label="their sum")
+               label="galactic foreground (sampled)")
+    ax[0].plot(_fcb, _Ns, color=FG, lw=1.3, ls="--", label="their sum (sampled)")
+    ax[0].plot(_fcb, _Ni_inj, color=RED, lw=1.0, ls=":", alpha=0.7,
+               label="instrument noise (injected)")
+    ax[0].plot(_fcb, _Ng_inj, color=RED, lw=1.0, ls="-.", alpha=0.7,
+               label="FittedHyperbolicTangent foreground")
+    ax[0].plot(_fcb, _Ns_inj, color=RED, lw=1.2, ls="--", alpha=0.7,
+               label="their sum (injected)")
     ax[0].set_xscale("log"); ax[0].set_yscale("log")
     ax[0].set_ylabel("PSD, TDI X channel  [1/Hz]")
     ax[0].set_ylim(1e-45, 2e-37)
-    ax[0].legend(fontsize=8, loc="upper left", ncols=2)
+    ax[0].legend(fontsize=7.5, loc="upper left", ncols=2)
     _sc = ax[1].scatter(_fcb, _rat, c=_adp, cmap="magma", s=11, vmin=-8,
                         vmax=0, lw=0)
     ax[1].axhline(1.0, color=FG, ls="--", lw=1.0)
