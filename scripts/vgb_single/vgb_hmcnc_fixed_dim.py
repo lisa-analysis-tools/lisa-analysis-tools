@@ -722,7 +722,7 @@ def make_ridge_move(like: HMCncLikelihood, priors):
 def run_arm(arm: str, like: HMCncLikelihood, src: Source, *, nwalkers=32,
             nsteps=3000, burn=500, seed=42, mapobj=None, info_x=None,
             table=None, obs_mode="full", fiber_weight=OBS_FIBER_WEIGHT,
-            add_ridge=False, verbose=True):
+            add_ridge=False, verbose=True, ntemps=1):
     """Run one arm; return a result dict."""
     x0 = src.astro_truth()
     ndim = len(like.basis)
@@ -737,7 +737,7 @@ def run_arm(arm: str, like: HMCncLikelihood, src: Source, *, nwalkers=32,
         sig0 = np.sqrt(np.abs(np.diag(np.linalg.pinv(info_x))))
     sig0 = np.where(np.isfinite(sig0) & (sig0 > 0), sig0, 1e-3 * np.abs(x0) + 1e-6)
     start = x0[None, None, None, :] + 0.1 * sig0 * rng.standard_normal(
-        (1, nwalkers, 1, ndim))
+        (ntemps, nwalkers, 1, ndim))
     start = np.clip(start, lo + 1e-9, hi - 1e-9)
 
     obs_move = None
@@ -761,7 +761,7 @@ def run_arm(arm: str, like: HMCncLikelihood, src: Source, *, nwalkers=32,
 
     sampler = EnsembleSampler(
         nwalkers, {BRANCH: ndim}, like, priors,
-        tempering_kwargs=dict(ntemps=1), branch_names=[BRANCH],
+        tempering_kwargs=dict(ntemps=ntemps), branch_names=[BRANCH],
         nleaves_max={BRANCH: 1}, nleaves_min={BRANCH: 1},
         moves=moves, periodic=periodic, vectorize=True,
     )
@@ -774,8 +774,24 @@ def run_arm(arm: str, like: HMCncLikelihood, src: Source, *, nwalkers=32,
     sampler.run_mcmc(state, nsteps, burn=burn, progress=False, thin_by=1)
     wall = time.time() - t0
 
-    chain = sampler.get_chain()[BRANCH][:, 0, :, 0, :]     # (nsteps, nwalkers, ndim)
+    chain = sampler.get_chain()[BRANCH][:, 0, :, 0, :]     # (nsteps, nwalkers, ndim)  cold rung
     acc = float(np.mean(sampler.acceptance_fraction))
+    # Per-rung acceptance + PT swap acceptance (only meaningful if ntemps > 1)
+    try:
+        acc_per_temp = np.mean(sampler.acceptance_fraction, axis=-1).tolist()
+    except Exception:
+        acc_per_temp = None
+    swap_rate = None
+    try:
+        if hasattr(sampler, "swap_acceptance_fraction"):
+            swap_rate = np.asarray(sampler.swap_acceptance_fraction).tolist()
+        elif hasattr(sampler, "temperature_control") and hasattr(
+                sampler.temperature_control, "swaps_accepted"):
+            sa = np.asarray(sampler.temperature_control.swaps_accepted, float)
+            sp = np.asarray(sampler.temperature_control.swaps_proposed, float)
+            swap_rate = np.where(sp > 0, sa / np.maximum(sp, 1), np.nan).tolist()
+    except Exception:
+        swap_rate = None
     tau = integrated_act(chain)
     flat = chain.reshape(-1, ndim)
     mean, std = flat.mean(axis=0), flat.std(axis=0)
@@ -795,7 +811,10 @@ def run_arm(arm: str, like: HMCncLikelihood, src: Source, *, nwalkers=32,
                mode=(obs_mode if arm == "observable" else None),
                fiber_weight=(fiber_weight if arm == "observable" else None),
                ridge=bool(add_ridge),
-               acceptance=acc, wall_s=wall, nsteps=nsteps, nwalkers=nwalkers,
+               acceptance=acc, ntemps=ntemps,
+               acceptance_per_temp=acc_per_temp,
+               swap_acceptance=swap_rate,
+               wall_s=wall, nsteps=nsteps, nwalkers=nwalkers,
                burn=burn, tau=tau.tolist(), mean=mean.tolist(),
                std=std.tolist(), pull=pull.tolist(), truth=x0.tolist(),
                basis=list(like.basis),
@@ -971,6 +990,10 @@ def main(argv=None):
     ap.add_argument("--N", type=int, default=1024, help="GB sparse band points")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--json-out", default=None)
+    ap.add_argument("--ntemps", type=int, default=1,
+                    help="number of parallel-tempering rungs; default 1 = "
+                         "single-temperature. Production VGB uses 8 rungs per "
+                         "band, so pass --ntemps 8 to mirror it.")
     ap.add_argument("--report", action="store_true",
                     help="print the compliance report and exit")
     args = ap.parse_args(argv)
@@ -1059,7 +1082,8 @@ def main(argv=None):
             else [args.arm])
 
     common = dict(nwalkers=args.nwalkers, nsteps=nsteps, burn=burn,
-                  seed=args.seed, mapobj=mapobj, info_x=info_x, table=table)
+                  seed=args.seed, mapobj=mapobj, info_x=info_x, table=table,
+                  ntemps=args.ntemps)
     results = []
     for arm in arms:
         if arm == "observable":

@@ -125,6 +125,14 @@ IMGS, MISSING = {}, []
 # recovery split/census. GF_MONITOR_MATCH_STATS=1 restores those panels.
 SHOW_MATCH_STATS = os.environ.get("GF_MONITOR_MATCH_STATS", "0") == "1"
 
+# Threshold for "matched" once the phase-maximised, noise-weighted overlap MM
+# is computed for each 2-df pair (see below). Default 0.8; override via
+# GF_MONITOR_MATCH_MM. Only affects F4's three-way split and the zoomable-plot
+# marker classes -- the F2/F3/F6 panels intentionally still key off the 2-df
+# proxy so per-iteration progress does not require re-running waveforms per
+# stored row.
+MATCH_MM_THRESH = float(os.environ.get("GF_MONITOR_MATCH_MM", "0.8"))
+
 def fig_b64(fig, key, dpi=None):
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=dpi)
@@ -2098,6 +2106,17 @@ BAND_TXT = f"{_mhz(FLO)}&ndash;{_mhz(FHI)} mHz"       # HTML captions
 TOL_BINS = 2.0
 NBAND = (FHI - FLO) / SCI_DF       # FD bins in the band
 
+# Set the overlap-match caption fragments UP FRONT so they exist even when
+# the recovery-section machinery below never runs (TRU missing, Tobs
+# mismatch, or the RPHYS try-block failed). The values are overwritten in
+# the RPHYS block below once MM is actually computed.
+MATCH_CRIT_HTML = (
+    f"&ldquo;Matched&rdquo; here = phase-maximised overlap "
+    f"&ge; {MATCH_MM_THRESH:.2f} on top of a "
+    f"{TOL_BINS:.0f}-df-bin f<sub>0</sub> pair "
+    f"(threshold <code>GF_MONITOR_MATCH_MM</code>).")
+MATCH_CRIT_TXT = f"matched = phase-max overlap >= {MATCH_MM_THRESH:.2f}"
+
 # The truth set is tied to A Tobs (SNRs, and the FD bin the match tolerance is
 # quoted in) -- not to THE 3-month one: ``build_truth.py`` now stamps the
 # observation time it was built at into the npz. Compare against that stamp,
@@ -2333,6 +2352,35 @@ if TRU is not None:
                        f"{type(e).__name__}: {e}")
         RPHYS, REC_SNR, MM = None, None, np.zeros(0)
 
+    # ---- overlap-refined match: the criterion the science panels use ----
+    # Above, MI/TI/MATCHED/FOUND come from the 2-df-bin proxy match: a pair
+    # is anything within TOL_BINS FD bins of f0. That is what the F2 progress
+    # panel and completeness/purity KPIs use, because they run every stored
+    # row and can't afford a waveform per pair. Here we tighten "matched" to
+    # a real phase-maximised overlap threshold (MATCH_MM_THRESH, default
+    # 0.8) for the panels that only need it at the last row -- F4 and the
+    # zoomable plot. Everything upstream keeps the 2-df definition.
+    if MM is not None and MM.size:
+        _kept = np.asarray(MM, float) >= MATCH_MM_THRESH
+        _MI_ov, _TI_ov = MI[_kept], TI[_kept]
+        MATCHED_MM = np.zeros(REC9.shape[0], bool); MATCHED_MM[_MI_ov] = True
+        FOUND_MM   = np.zeros(NDET, bool);           FOUND_MM[_TI_ov]  = True
+        MATCH_CRIT_HTML = (
+            f"&ldquo;Matched&rdquo; here = phase-maximised, noise-weighted "
+            f"overlap &ge; {MATCH_MM_THRESH:.2f} on top of a "
+            f"{TOL_BINS:.0f}-df-bin f<sub>0</sub> pair "
+            f"(threshold <code>GF_MONITOR_MATCH_MM</code>).")
+        MATCH_CRIT_TXT = f"matched = phase-max overlap >= {MATCH_MM_THRESH:.2f}"
+    else:
+        MATCHED_MM = MATCHED
+        FOUND_MM   = FOUND
+        MATCH_CRIT_HTML = (
+            f"&ldquo;Matched&rdquo; here = within {TOL_BINS:.0f} "
+            f"f<sub>0</sub> bins ONLY &mdash; the phase-maximised overlap "
+            f"machinery was unavailable in this snapshot, so this panel "
+            f"falls back to the 2-df proxy.")
+        MATCH_CRIT_TXT = f"matched = within {TOL_BINS:.0f} df bins (2-df proxy)"
+
     # ---- cross-arm cache -------------------------------------------------
     # The v2/v3 comparison must be made on GB-SEARCH iterations, not absolute
     # ones (v2's first GB leaf lands at iteration 5, v3's at 16), so each arm
@@ -2464,14 +2512,15 @@ if TRU is not None:
         _cb.ax.tick_params(labelsize=7)
         b_ = ax[1]
         if SHOW_MATCH_STATS:
-            b_.scatter(T_F0[~FOUND], T_AMP[~FOUND], s=17, marker="x", color=RED,
-                       lw=0.8, alpha=0.7,
-                       label=f"detectable, not recovered ({int((~FOUND).sum())})")
-            b_.scatter(_rf[~MATCHED], _ra_[~MATCHED], s=22, facecolors="none",
-                       edgecolors=VIOLET, lw=0.8, alpha=0.85,
-                       label=f"recovered, no match ({int((~MATCHED).sum())})")
-            b_.scatter(_rf[MATCHED], _ra_[MATCHED], s=12, color=GREEN, lw=0,
-                       alpha=0.95, label=f"recovered and matched ({int(MATCHED.sum())})")
+            b_.scatter(T_F0[~FOUND_MM], T_AMP[~FOUND_MM], s=17, marker="x",
+                       color=RED, lw=0.8, alpha=0.7,
+                       label=f"detectable, not recovered ({int((~FOUND_MM).sum())})")
+            b_.scatter(_rf[~MATCHED_MM], _ra_[~MATCHED_MM], s=22,
+                       facecolors="none", edgecolors=VIOLET, lw=0.8, alpha=0.85,
+                       label=f"recovered, no match ({int((~MATCHED_MM).sum())})")
+            b_.scatter(_rf[MATCHED_MM], _ra_[MATCHED_MM], s=12, color=GREEN,
+                       lw=0, alpha=0.95,
+                       label=f"recovered and matched ({int(MATCHED_MM.sum())})")
         else:
             # Neutral overlay -- injections and model in one plane, the eye
             # does the comparison; no proxy-match classification.
@@ -3020,6 +3069,7 @@ WDWD_PATH = os.path.join(MOJITO_CAT_DIR, "catalogues",
                          "wdwd_cat_mojito_lite_processed.hdf5")
 TRUTH_CAP = 30000
 gb_truth_pts, gb_truth_meta = [], {}
+gb_truth_pts_grey, gb_truth_pts_red = [], []
 cf = f0_band = cat_gidx = None
 try:
     _wd = h5py.File(WDWD_PATH, "r")
@@ -3027,7 +3077,9 @@ try:
     _f0_all = cf["GW22FrequencySSBFrame"][:]
     cat_gidx = np.nonzero(
         (_f0_all >= band_edges[0]) & (_f0_all <= band_edges[-1]))[0]
-    f0_band = _f0_all[cat_gidx] * 1e3            # mHz, in-band catalogue
+    f0_band_hz = _f0_all[cat_gidx].astype(float, copy=True)   # Hz copy for
+                                                              # bit-exact lookups
+    f0_band = f0_band_hz * 1e3                    # mHz, in-band catalogue
     del _f0_all
     la_band = np.log10(np.maximum(cf["Amplitude"][:][cat_gidx], 1e-30))
     gb_truth_meta["in_band"] = int(cat_gidx.size)
@@ -3182,7 +3234,70 @@ try:
         gb_truth_pts = [[float(f"{f0_band[i]:.7g}"), round(float(la_band[i]), 4),
                          int(det_band[i])] for i in sel]
         gb_truth_meta["shown"] = len(gb_truth_pts)
-        gb_truth_meta["shown_det"] = int(sum(p[2] for p in gb_truth_pts))
+
+        # SPLIT the truth crosses into (grey: undetectable) and (red:
+        # detectable but not recovered) so the zoomable canvas can render
+        # the four required classes. Rows that are detectable AND recovered
+        # are dropped here -- the green filled-circle source marker sits at
+        # the recovered coordinate on top, which is what the reader is
+        # trying to see.
+        #
+        # Classification is by f0 lookup with a small absolute tolerance
+        # (1e-12 Hz, ~3 orders below the FD bin). `np.isin` would be
+        # unreliable: TRU["f0"] goes through the mHz sampling basis in
+        # build_truth (rows[:, 1] * 1e-3), so it does NOT bit-exactly match
+        # the raw wdwd `GW22FrequencySSBFrame` in f0_band_hz.
+        gb_truth_pts_grey = gb_truth_pts   # fallback: no TRU -> all grey
+        gb_truth_pts_red = []
+        if TRU is not None:
+            def _within_tol_lookup(vals_hz):
+                if vals_hz.size == 0:
+                    return lambda q: np.zeros_like(q, dtype=bool)
+                _s = np.sort(np.asarray(vals_hz, float))
+                _n = _s.size
+
+                def _fn(q):
+                    q = np.asarray(q, float)
+                    i = np.searchsorted(_s, q)
+                    il = np.clip(i - 1, 0, _n - 1)
+                    ir = np.clip(i, 0, _n - 1)
+                    dl = np.abs(_s[il] - q); dr = np.abs(_s[ir] - q)
+                    return np.minimum(dl, dr) < 1e-12
+                return _fn
+
+            _det_full_hz = np.asarray(
+                TRU["f0"][ np.asarray(TRU["det"], bool)
+                          & (np.asarray(TRU["f0"], float) >= band_edges[0])
+                          & (np.asarray(TRU["f0"], float) <= band_edges[-1]) ],
+                float)
+            _rec_full_hz = (np.asarray(T_F0, float)[FOUND_MM]
+                            if (isinstance(FOUND_MM, np.ndarray)
+                                and FOUND_MM.size)
+                            else np.zeros(0))
+
+            _sel_hz = f0_band_hz[sel]
+            _is_det = _within_tol_lookup(_det_full_hz)(_sel_hz)
+            _is_rec = _within_tol_lookup(_rec_full_hz)(_sel_hz)
+            # grey = undetectable within the decimated `sel`
+            _grey_mask = ~_is_det
+            gb_truth_pts_grey = [
+                [float(f"{f0_band[sel[i]]:.7g}"),
+                 round(float(la_band[sel[i]]), 4)]
+                for i in np.where(_grey_mask)[0]]
+            # red = detectable, not recovered -- pulled from the FULL
+            # detectable set in-band, no decimation. There are only ~10^3 of
+            # these even on a 1-year run, so this is cheap and complete.
+            _found_arr = (np.asarray(FOUND_MM, bool)
+                          if (isinstance(FOUND_MM, np.ndarray) and FOUND_MM.size)
+                          else np.zeros(NDET, bool))
+            _mis_f = np.asarray(T_F0, float)[~_found_arr]
+            _mis_a = np.log10(np.maximum(
+                np.asarray(T_AMP, float)[~_found_arr], 1e-40))
+            gb_truth_pts_red = [
+                [float(f"{f * 1e3:.7g}"), round(float(a), 4)]
+                for f, a in zip(_mis_f, _mis_a)]
+            gb_truth_meta["shown_grey"] = len(gb_truth_pts_grey)
+            gb_truth_meta["shown_red"] = len(gb_truth_pts_red)
         _tm = gb_truth_meta
         _detbit = (
             f"{_tm.get('shown_det', _tm['shown']):,} of them RED (detectable, "
@@ -3213,7 +3328,33 @@ except Exception as e:
     MISSING.append(f"GB injection catalogue truth overlay unavailable: {e!r}")
 
 expl["truth"] = gb_truth_pts
+# When TRU is available the classification split populated these two; when
+# it was not, the grey list falls back to the full unclassified truth so
+# the canvas still shows something recognisable.
+expl["truth_grey"] = gb_truth_pts_grey or gb_truth_pts
+expl["truth_red"]  = gb_truth_pts_red
 expl["truth_meta"] = gb_truth_meta
+
+# Recovered-source markers for the zoomable canvas: one per source at the
+# last stored iteration, classified matched/unmatched under the current
+# match criterion (MATCHED_MM). Coords are (f0 mHz, log10 amplitude) so
+# they land on the same axes as expl["gb"].
+expl["sources"] = []
+try:
+    if (RPHYS is not None and RPHYS.shape[0] > 0
+            and isinstance(MATCHED_MM, np.ndarray)
+            and MATCHED_MM.size == RPHYS.shape[0]):
+        _rf_hz = np.asarray(RPHYS[:, 1], float)      # already in mHz
+        _ra_lg = np.log10(np.maximum(np.asarray(RPHYS[:, 0], float), 1e-40))
+        expl["sources"] = [
+            [round(float(_rf_hz[i]), 7),
+             round(float(_ra_lg[i]), 4),
+             1 if bool(MATCHED_MM[i]) else 0]
+            for i in range(RPHYS.shape[0])]
+except NameError:
+    pass
+expl["match_note"] = MATCH_CRIT_TXT
+
 EXPL_JSON = json.dumps(expl)
 
 # zoomable dist-f0 posterior cloud: every sample (last iters x walkers x leaf)
@@ -3845,7 +3986,7 @@ if SCI:
         f"Left: every model source in the amplitude-frequency plane, coloured "
         f"by optimal SNR. Right: the same plane split three ways. Recovery "
         f"tracks amplitude, and the misses concentrate along the faint edge "
-        f"rather than anywhere structural.")
+        f"rather than anywhere structural. {MATCH_CRIT_HTML}")
     cap_f5 = (
         f"Where the sources are and where they are being found. The lower "
         f"panel is the per-bin recovery fraction with 68% Wilson intervals. "
@@ -3878,12 +4019,15 @@ else:
 if SCI and not SHOW_MATCH_STATS:
     # Match-criterion content is gated off this page (user ruling
     # 2026-08-19): truths stay in every overlay, but nothing is classified
-    # or counted by the page's own 2-bin proxy match.
+    # or counted by the page's own 2-bin proxy match. Match-criterion note
+    # still emitted so the reader knows what would be applied were the gate
+    # opened.
     cap_f4 = (
         "Left: every model source in the amplitude-frequency plane, "
         "coloured by optimal SNR, over the detectable injections (grey). "
         "Right: injections and model overlaid in the same plane. The "
-        "comparison is visual; no match criterion is applied on this page.")
+        "comparison is visual; no match criterion is applied on this page. "
+        f"(Would be: {MATCH_CRIT_TXT}.)")
     cap_f5 = (
         "Source density per frequency bin: the full catalogue, its "
         "detectable subset, and the model population. The gap between the "
@@ -4048,6 +4192,88 @@ else:
         "own 2-bin frequency proxy is not quoted as a number. The catalogue "
         "truths appear in the visual overlays only. The run has not "
         "converged.")
+
+# ---- "How Many Are Detectable At All" table (live, this Tobs) --------------
+# The block below builds the two columns of the #detect table at this run's
+# actual observation time -- until 2026-09-20 the table was HARDCODED to the
+# 3-month values (1,001 / 1,103 at SNR>7), so a 1-year page silently claimed
+# the 3-month numbers as if they were current.
+#   Column 1 (fitted noise): free -- TRU already carries per-source SNR under
+#     the run's own fitted PSD + foreground at this Tobs. Just count.
+#   Column 2 (injected + FittedHyperbolicTangent): re-run the catalogue
+#     optimal-SNR calculation against a fixed reference noise -- the injected
+#     instrument (SOMS_INJ, SA_INJ) plus the lisatools
+#     FittedHyperbolicTangentGalacticForeground, both functions of Tobs alone.
+#     Reuses build_truth.py's opt_snr helper for consistency.
+DETECT_CUTS = (5, 7, 10, 15)
+_col1 = _col2 = None
+_col2_err = None
+if TRU is not None:
+    try:
+        _snr_fit = np.asarray(TRU["snr"], float)
+        _col1 = {c: int((_snr_fit > c).sum()) for c in DETECT_CUTS}
+    except Exception as _e:
+        MISSING.append(f"#detect column 1 (fitted noise) unavailable: "
+                       f"{type(_e).__name__}: {_e}")
+
+    # Column 2 -- compute lazily. Skipped when GBGPU can't import or when
+    # any prerequisite is missing; the caption below reflects the state.
+    try:
+        import sys as _sys
+        _bt_dir = os.path.dirname(os.path.abspath(__file__))
+        if _bt_dir not in _sys.path:
+            _sys.path.insert(0, _bt_dir)
+        from build_truth import opt_snr as _opt_snr_bt   # local sibling
+
+        from gbgpu.gbgpu import GBGPU as _GBGPU2
+        from lisatools import detector as _lm2
+        from lisatools.sensitivity import (
+            get_sensitivity as _gs2, A2TDISens as _A2T, E2TDISens as _E2T)
+        from lisatools.stochastic import (
+            FittedHyperbolicTangentGalacticForeground as _FHT)
+        from lisatools.globalfit.stock.erebor.variants.gb_no_fg import (
+            GB_MOJITO_T_REF as _T_REF_BT)
+
+        _lm_inj = _lm2.LISAModel(SOMS_INJ ** 2, SA_INJ ** 2,
+                                 _lm2.DefaultOrbits(force_backend="cpu",
+                                                    frame="icrs"),
+                                 "injected")
+        _nk_inj = dict(model=_lm_inj, stochastic_params=(SCI_TOBS,),
+                       stochastic_function=_FHT)
+        _ng2 = int(2.35e-2 / SCI_DF) + 2
+        _fg2 = np.maximum(np.arange(_ng2) * SCI_DF, SCI_DF)
+        _sa2 = np.asarray(_gs2(_fg2, sens_fn=_A2T, **_nk_inj), float)
+        _se2 = np.asarray(_gs2(_fg2, sens_fn=_E2T, **_nk_inj), float)
+        _nw2 = int(TRU["nw"]) if "nw" in getattr(TRU, "files", []) else 128
+        _phys2 = np.asarray(TRU["phys"], float)
+        _orb2 = globals().get("_L1_ORB_CPU")
+        if _orb2 is None:
+            _orb2 = _lm2.DefaultOrbits(force_backend="cpu", frame="icrs")
+        _gbw2 = _GBGPU2(force_backend="cpu", orbits=_orb2,
+                        t0=float(_T_REF_BT))
+        _snr_inj = _opt_snr_bt(_phys2, _sa2, _se2, _gbw2, SCI_DF,
+                               SCI_TOBS, _nw2, batch=20000)
+        _col2 = {c: int((_snr_inj > c).sum()) for c in DETECT_CUTS}
+    except Exception as _e:
+        _col2_err = f"{type(_e).__name__}: {_e}"
+        MISSING.append(f"#detect column 2 (injected + FittedHT) unavailable: "
+                       f"{_col2_err}")
+
+def _detect_tbl_row(cut):
+    _bold = (cut == 7)
+    _tc = "font-weight:bold" if _bold else ""
+    _v1 = (f"{_col1[cut]:,}" if _col1 is not None else "&mdash;")
+    _v2 = (f"{_col2[cut]:,}" if _col2 is not None else "&mdash;")
+    _lb = f"<strong>{cut}</strong>" if _bold else f"{cut}"
+    _cs = "padding:3px 18px 3px 0"
+    return (f'<tr><td style="{_cs}">{_lb}</td>'
+            f'<td style="text-align:right;{_cs};{_tc}">{_v1}</td>'
+            f'<td style="text-align:right;{_tc}">{_v2}</td></tr>')
+
+TBL_DETECT_ROWS = "\n".join(_detect_tbl_row(c) for c in DETECT_CUTS)
+_col2_note = ("" if _col2 is not None else
+              f"<br><em>Column 2 not computed in this snapshot "
+              f"({'no TRU npz' if TRU is None else _col2_err}).</em>")
 
 html = f"""<title>LISA Global Fit {RUN_LABEL}</title>
 <style>
@@ -4217,19 +4443,27 @@ the residual by construction.</div>
 </div>
 <canvas id="expl"></canvas>
 <div class="caption" id="expl_cap"></div>
-<div class="caption">Zoomable version of the amplitude-frequency plane: green =
-model sources, <strong>red crosses = injected catalogue sources this run can
-detect</strong> (SNR &gt; 7 against its own sampled sensitivity), grey crosses
-= the sub-threshold catalogue below that bar. Drag to pan and use the
-wheel to zoom, or set the view numerically with the centre and width/height
-controls above &mdash; those hold the window size fixed and slide it across
-the band, which is the steadier way to walk through frequency.
-<strong>Green is pooled over the last {EXPL_ITS} stored iterations</strong>
+<div class="caption">Zoomable version of the amplitude-frequency plane, with
+four classification layers on top of the posterior cloud:
+<span style="color:var(--amber)">amber</span> = pooled posterior samples of
+the current model,
+<span style="color:var(--dim)">grey X</span> = undetectable catalogue rows,
+<span style="color:var(--truthred)">red X</span> = detectable but not
+recovered under the current match criterion,
+<span style="color:var(--green)">closed green circle</span> = recovered and
+matched,
+<span style="color:var(--violet)">open violet circle</span> = recovered with
+no matching injection. Drag to pan and use the wheel to zoom, or set the
+view numerically with the centre and width/height controls above &mdash;
+those hold the window size fixed and slide it across the band, which is the
+steadier way to walk through frequency.
+<strong>Amber is pooled over the last {EXPL_ITS} stored iterations</strong>
 &times; {nwalk} cold walkers ({EXPL_RAW:,} alive-leaf rows{EXPL_DEC_NOTE}),
 with each iteration&rsquo;s own alive mask applied, so a single source draws a
 cloud whose width is the sampler&rsquo;s spread rather than one snapshot of
-where the walkers happened to sit. Red is unchanged: one cross per catalogue
-source, decimated per frequency window.</div>
+where the walkers happened to sit. The catalogue overlay is decimated per
+frequency window on the undetectable rows; every detectable-not-recovered
+row is drawn in full. {MATCH_CRIT_HTML}</div>
 </div>
 
 <div class="panel">
@@ -4357,29 +4591,29 @@ the truth, so a truth line outside the posterior stays visible.</div>
 
 <section id="detect"><h2>How Many Are Detectable At All</h2>
 <div class="panel">
-<div class="caption" style="margin:0 0 10px 0">Optimal SNR of the whole injected
-catalogue at this observation time, under two noise models: the run&rsquo;s own fitted
-instrument and foreground, and the injected instrument noise with the legacy fitted
-foreground. Whole catalogue, so these are larger than the {BAND_TXT} denominator
-above.</div>
+<div class="caption" style="margin:0 0 10px 0">Optimal SNR of the injected
+catalogue over {BAND_TXT} at this run&rsquo;s observation time
+({SCI_TOBS / 86400.0:.4g} d), under two noise models:
+<em>col 1</em> = the run&rsquo;s own fitted instrument + foreground at the
+truth-build iteration; <em>col 2</em> = the injected instrument
+(S<sub>oms</sub>, S<sub>a</sub>) plus the lisatools
+<code>FittedHyperbolicTangentGalacticForeground</code> at this T<sub>obs</sub>.
+Both columns re-compute at every snapshot render &mdash; they do not carry
+over from previous pages.{_col2_note}</div>
 <table style="border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums">
 <tr style="border-bottom:1px solid var(--line)">
   <th style="text-align:left;padding:4px 18px 4px 0">SNR &gt;</th>
-  <th style="text-align:right;padding:4px 18px 4px 0">fitted noise</th>
-  <th style="text-align:right;padding:4px 0">injected + legacy foreground</th></tr>
-<tr><td style="padding:3px 18px 3px 0">5</td><td style="text-align:right;padding:3px 18px 3px 0">1,661</td><td style="text-align:right">1,749</td></tr>
-<tr><td style="padding:3px 18px 3px 0"><strong>7</strong></td><td style="text-align:right;padding:3px 18px 3px 0"><strong>1,001</strong></td><td style="text-align:right"><strong>1,103</strong></td></tr>
-<tr><td style="padding:3px 18px 3px 0">10</td><td style="text-align:right;padding:3px 18px 3px 0">560</td><td style="text-align:right">647</td></tr>
-<tr><td style="padding:3px 18px 3px 0">15</td><td style="text-align:right;padding:3px 18px 3px 0">259</td><td style="text-align:right">297</td></tr>
+  <th style="text-align:right;padding:4px 18px 4px 0">fitted noise (col 1)</th>
+  <th style="text-align:right;padding:4px 0">injected + FittedHT (col 2)</th></tr>
+{TBL_DETECT_ROWS}
 </table>
 <div class="caption" style="margin-top:12px">Detectability dies below about 1 mHz,
-where the foreground swamps everything: eight detectable sources across the whole
-0.1&ndash;1 mHz decade, out of roughly 13 million catalogue entries there. The two
-models disagree by 10% overall and, more usefully, in opposite directions either side
-of the galactic peak &mdash; treat the second column as a reference point, not truth.
+where the foreground swamps everything. The two models disagree by ~10% and, more
+usefully, in opposite directions either side of the galactic peak &mdash; treat
+column 2 as a reference point, not truth.
 <br><br>
 Detectability is also a moving target: the same calculation gives
-<strong>{SCI.get("ndet", 812)}</strong> over {BAND_TXT} at this run&rsquo;s
+<strong>{SCI.get("ndet", 0)}</strong> over {BAND_TXT} at this run&rsquo;s
 late-iteration noise, and it moved as the foreground estimate dropped and sources
 left the residual. That is exactly why the denominator on this page is frozen at
 one iteration and stated.</div>
@@ -4553,18 +4787,26 @@ function viewCtl(px, cv, api) {{
   // points: [x, y(=1/d), tag]
   const pts = hasGB ? DATA.gb : DATA.vgb;
   const xlab = hasGB ? "f0 [mHz]" : (DATA.vgb_axis || "VGB leaf index");
-  const TRUTH = DATA.truth || [];
-  // DEFAULT ON (2026-08-16). The catalogue overlay is the point of this
-  // panel -- the recovered cloud alone cannot show completeness or the
-  // faint tail -- and defaulting it to hidden meant it went unnoticed.
-  let showT = TRUTH.length > 0;
+  // FOUR-CLASS OVERLAY (2026-09-20). truth_grey = undetectable catalogue,
+  // truth_red = detectable catalogue that isn't recovered under the current
+  // match criterion, sources = recovered sources (last iter) with a
+  // matched/unmatched flag. Legacy DATA.truth is retained for the VGB
+  // fallback path and any external consumers of this JSON blob.
+  const T_GREY = DATA.truth_grey || DATA.truth || [];
+  const T_RED  = DATA.truth_red  || [];
+  const SRC    = DATA.sources    || [];
+  const N_OVERLAY = T_GREY.length + T_RED.length + SRC.length;
+  const MATCH_NOTE = DATA.match_note || "";
+  // DEFAULT ON. The classification overlay IS the point of this panel --
+  // catalogue completeness cannot be read off the recovered cloud alone.
+  let showT = N_OVERLAY > 0;
   const baseCap = (hasGB
-    ? `GB samples: ${{DATA.gb.length}} alive-source rows pooled over the last ${{DATA.gb_its}} stored iterations x all cold walkers${{DATA.gb_stride > 1 ? ` (1-in-${{DATA.gb_stride}} of ${{DATA.gb_raw}} for page weight)` : ""}}; y = log10 amplitude from (dist, f0, Mc).`
+    ? `GB samples: ${{DATA.gb.length}} alive-source rows pooled over the last ${{DATA.gb_its}} stored iterations x all cold walkers${{DATA.gb_stride > 1 ? ` (1-in-${{DATA.gb_stride}} of ${{DATA.gb_raw}} for page weight)` : ""}}; y = log10 amplitude from (dist, f0, Mc). Posterior cloud = amber; catalogue: grey X undetectable, red X detectable-not-recovered; recovered source markers: closed green circle (matched) or open violet circle (not matched). ${{MATCH_NOTE}}`
     : `No GB sources alive yet - showing the 55 VGBs (${{DATA.vgb_its}} stored iterations x 24 walker samples each) as 1/dist vs leaf index. GB samples take over automatically once births land.`);
   const setCap = () => {{
-    cap.textContent = baseCap + (TRUTH.length
-      ? (showT ? " " + (DATA.truth_cap || "") : ` ${{TRUTH.length}} catalogue truth points available - press "show catalogue truths".`)
-      : " No catalogue truth overlay in this snapshot.");
+    cap.textContent = baseCap + (N_OVERLAY
+      ? (showT ? " " + (DATA.truth_cap || "") : ` ${{N_OVERLAY.toLocaleString()}} classification points available - press "show catalogue & recovered".`)
+      : " No catalogue/recovered overlay in this snapshot.");
   }};
   let X0, X1, Y0, Y1;
   const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
@@ -4606,7 +4848,16 @@ function viewCtl(px, cv, api) {{
     g.fillText(xlab, w / 2 - 40, h - 2);
     g.save(); g.translate(10, h / 2); g.rotate(-Math.PI / 2);
     g.fillText(hasGB ? "log10 A" : "1 / dist [1/kpc]", -30, 0); g.restore();
-    // truths UNDER the recovered cloud so the recoveries stay readable
+    // LAYERING (2026-09-20). Draw order, bottom to top:
+    //   1. grey X's for undetectable catalogue rows        (--dim)
+    //   2. amber posterior cloud                          (--amber)
+    //   3. red X's for detectable-not-recovered           (--truthred)
+    //   4. green filled / violet open circles for recovered sources
+    // Steps 1, 3, 4 are gated by `showT`. Step 2 always draws (that's the
+    // "posterior of the current model" and reads even without an overlay).
+    // The cloud sits between the two truth layers so the red misses stay
+    // legible over crowded amber patches, but the grey undetectable rows
+    // still show up under the cloud where the model has no sources.
     if (showT) {{
       // Drawn as CROSSES, not 1.4px dots (user request 2026-08-16): the
       // dots were the same visual weight as a rendering artefact, so the
@@ -4638,7 +4889,6 @@ function viewCtl(px, cv, api) {{
           g.moveTo(x - r, y - r); g.lineTo(x + r, y + r);
           g.moveTo(x - r, y + r); g.lineTo(x + r, y - r);
         }}
-        g.stroke();
       }}
     }}
     // ONE PATH, ONE FILL (2026-08-19). This used to open a path and issue a
@@ -4646,7 +4896,10 @@ function viewCtl(px, cv, api) {{
     // dot into a single path costs one fill. The moveTo before each arc is
     // required: without it consecutive arcs are joined by a straight line.
     g.globalAlpha = 0.55;
-    g.fillStyle = hasGB ? C("--green") : C("--violet");
+    // AMBER for the GB posterior cloud (2026-09-20): green now belongs to
+    // the "recovered + matched" source markers layered on top. VGB fallback
+    // keeps violet.
+    g.fillStyle = hasGB ? C("--amber") : C("--violet");
     g.beginPath();
     for (const p of pts) {{
       const x = sx(p[0]), y = sy(p[1]);
@@ -4655,6 +4908,45 @@ function viewCtl(px, cv, api) {{
     }}
     g.fill();
     g.globalAlpha = 1;
+    if (showT) {{
+      // red X: detectable but not recovered under the current criterion.
+      g.strokeStyle = C("--truthred"); g.globalAlpha = 0.95;
+      g.lineWidth = 1.6; g.lineCap = "round";
+      const rr = 3.6;
+      g.beginPath();
+      for (const p of T_RED) {{
+        const x = sx(p[0]), y = sy(p[1]);
+        if (x < ml || x > w - mr || y < mt || y > h - mb) continue;
+        g.moveTo(x - rr, y - rr); g.lineTo(x + rr, y + rr);
+        g.moveTo(x - rr, y + rr); g.lineTo(x + rr, y - rr);
+      }}
+      g.stroke();
+      // recovered-source markers: filled green (matched) then open violet
+      // (unmatched). Two passes so fill / stroke styles need not toggle
+      // inside the loop.
+      const rs = 3.2;
+      g.globalAlpha = 0.95;
+      g.fillStyle = C("--green");
+      g.beginPath();
+      for (const p of SRC) {{
+        if (p[2] !== 1) continue;
+        const x = sx(p[0]), y = sy(p[1]);
+        if (x < ml || x > w - mr || y < mt || y > h - mb) continue;
+        g.moveTo(x + rs, y); g.arc(x, y, rs, 0, 6.29);
+      }}
+      g.fill();
+      g.strokeStyle = C("--violet");
+      g.lineWidth = 1.4;
+      g.beginPath();
+      for (const p of SRC) {{
+        if (p[2] !== 0) continue;
+        const x = sx(p[0]), y = sy(p[1]);
+        if (x < ml || x > w - mr || y < mt || y > h - mb) continue;
+        g.moveTo(x + rs, y); g.arc(x, y, rs, 0, 6.29);
+      }}
+      g.stroke();
+      g.globalAlpha = 1;
+    }}
     syncCtl();
   }}
   // COALESCE REDRAWS TO ANIMATION FRAMES (2026-08-19). pointermove fires at
@@ -4703,14 +4995,14 @@ function viewCtl(px, cv, api) {{
   document.getElementById("btn_all").onclick = () => {{ full(); draw(); }};
   document.getElementById("btn_reset").onclick = () => {{ full(); draw(); }};
   const bt = document.getElementById("btn_truth");
-  if (!TRUTH.length) bt.disabled = true;
+  if (!N_OVERLAY) bt.disabled = true;
   // reflect the ON default in the control the moment the page loads
   bt.classList.toggle("armed", showT); bt.classList.toggle("truth", showT);
-  bt.textContent = showT ? "hide catalogue truths" : "show catalogue truths";
+  bt.textContent = showT ? "hide catalogue & recovered" : "show catalogue & recovered";
   bt.onclick = () => {{
     showT = !showT;
     bt.classList.toggle("armed", showT); bt.classList.toggle("truth", showT);
-    bt.textContent = showT ? "hide catalogue truths" : "show catalogue truths";
+    bt.textContent = showT ? "hide catalogue & recovered" : "show catalogue & recovered";
     setCap(); draw();
   }};
   setCap();
