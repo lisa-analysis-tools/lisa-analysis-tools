@@ -594,7 +594,7 @@ for w in range(nwalk):
 ax[0].plot(it, ll.max(axis=1), color=AMBER, lw=1.8, label="max")
 ax[0].plot(it, np.median(ll, axis=1), color=FG, lw=1.2, ls="--", label="median")
 ax[0].set_xlabel("iteration"); ax[0].set_ylabel("cold-chain lnL"); ax[0].legend()
-ax[0].set_title("total log-likelihood (24 walkers)")
+ax[0].set_title(f"total log-likelihood ({nwalk} walkers)")
 ax[1].plot(it, ll.max(axis=1) - ll.min(axis=1), color=VIOLET, lw=1.5)
 ax[1].set_xlabel("iteration"); ax[1].set_title("walker lnL spread (max - min)")
 
@@ -793,9 +793,9 @@ fig_b64(fig, "psd_trace")
 fig, ax = plt.subplots(1, 2, figsize=(11, 2.9))
 for j, (name, inj) in enumerate([("Soms_d", SOMS_INJ), ("Sa_a", SA_INJ)]):
     v = psd_cold[-min(3, SUB_NIT):, :, j].ravel()
-    ax[j].hist(v, bins=24, color=CYAN, alpha=0.85)
+    ax[j].hist(v, bins=min(30, nwalk), color=CYAN, alpha=0.85)
     ax[j].axvline(inj, color=RED, lw=1.4, ls=":")
-    ax[j].set_title(f"{name} posterior (last {min(3,NIT)} iters x 24 walkers)")
+    ax[j].set_title(f"{name} posterior (last {min(3,NIT)} iters x {nwalk} walkers)")
 fig_b64(fig, "psd_hist")
 
 fig, ax = plt.subplots(1, 5, figsize=(14, 2.7))
@@ -3120,6 +3120,7 @@ for _p in range(_Spool.shape[0]):
                                 float(snr[leaf])])
 expl["vgb_its"] = int(VGB_SAMP_ITS)
 expl["vgb_axis"] = "f0 [mHz] (catalogue)" if VGB_F0 is not None else "VGB leaf index"
+expl["nwalk"] = int(nwalk)
 
 # ---- GB catalogue truth cloud for the explorer (Task 3) -------------------
 # The key science overlay: recovered (f0, log10 A) cloud vs the injected
@@ -4866,7 +4867,7 @@ function viewCtl(px, cv, api) {{
   let showT = N_OVERLAY > 0;
   const baseCap = (hasGB
     ? `GB samples: ${{DATA.gb.length}} alive-source rows pooled over the last ${{DATA.gb_its}} stored iterations x all cold walkers${{DATA.gb_stride > 1 ? ` (1-in-${{DATA.gb_stride}} of ${{DATA.gb_raw}} for page weight)` : ""}}; y = log10 amplitude from (dist, f0, Mc). Posterior cloud = amber; catalogue: grey X undetectable, red X detectable-not-recovered; recovered source markers: closed green circle (matched) or open violet circle (not matched). ${{MATCH_NOTE}}`
-    : `No GB sources alive yet - showing the 55 VGBs (${{DATA.vgb_its}} stored iterations x 24 walker samples each) as 1/dist vs leaf index. GB samples take over automatically once births land.`);
+    : `No GB sources alive yet - showing the 55 VGBs (${{DATA.vgb_its}} stored iterations x ${{DATA.nwalk}} walker samples each) as 1/dist vs leaf index. GB samples take over automatically once births land.`);
   const setCap = () => {{
     cap.textContent = baseCap + (N_OVERLAY
       ? (showT ? " " + (DATA.truth_cap || "") : ` ${{N_OVERLAY.toLocaleString()}} classification points available - press "show catalogue & recovered".`)
@@ -5053,7 +5054,7 @@ function viewCtl(px, cv, api) {{
   setCap();
   document.getElementById("btn_top3").onclick = () => {{
     const srt = [...pts].sort((a, b) => b[0] - a[0]);
-    const top = srt.slice(0, Math.min(3 * 24, srt.length));
+    const top = srt.slice(0, Math.min(3 * DATA.nwalk, srt.length));
     const tx = top.map(p => p[0]), ty = top.map(p => p[1]);
     [X0, X1] = pad(Math.min(...tx), Math.max(...tx) || 1);
     [Y0, Y1] = hasGB ? pad(Math.min(...ty), Math.max(...ty)) : pad(0, Math.max(...ty) || 1);
