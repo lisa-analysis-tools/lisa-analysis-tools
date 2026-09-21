@@ -861,6 +861,11 @@ export GB_N_SUBBANDS=8192   # PER GPU; total = x n_gpus. Slab ~0.5 MB/slot
 # (+25 s/unit at 1yr); the gate already banked its evidence on 469/470.
 export GB_PSD_SHARED_MIRROR=1
 export GB_PSD_MIRROR_PARITY_PROPOSES=0
+
+### SOME OTHER GB options
+export GB_OPT_SNR_LIMIT_SEARCH=5.0
+export GB_SEARCH_SOURCE_EVERY=10
+
 # RJ pick thinning. UNSET as of 2026-08-28 -- the value now lives in code
 # (_SEARCH_RJ_FLIP_DEFAULT / _PE_RJ_FLIP_DEFAULT in recipe.py, both 0.2),
 # so behavior is UNCHANGED from the 0.2 this line used to export.
