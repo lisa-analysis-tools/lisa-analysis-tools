@@ -777,6 +777,27 @@ try:
     ax.set_ylabel("PSD, TDI X channel  [1/Hz]")
     ax.legend(fontsize=8, loc="upper left")
     fig_b64(fig, "f11_fg")
+
+    # Last-50-iterations zoom of the same plot (user request 2026-09-21).
+    _last_n = min(50, SUB_NIT)
+    if _last_n >= 3:
+        fig, ax = plt.subplots(figsize=(11, 4.0))
+        for k in range(SUB_NIT - _last_n, SUB_NIT):
+            pk_ = np.median(psd_cold[k], axis=0)
+            gk = np.median(gal_cold_phys[k], axis=0)
+            # Normalize color index to the last-50 window
+            _color_idx = (k - (SUB_NIT - _last_n)) / max(_last_n - 1, 1)
+            ax.plot(fr, sens_curves(pk_[0], pk_[1], gk),
+                    color=ramp(_color_idx), lw=1.1,
+                    label=(f"iteration {k}" if k in (SUB_NIT - _last_n, SUB_NIT - 1) else None))
+        ax.plot(fr, sens_curves(*pm), color=FG, lw=1.4, ls=":",
+                label="instrument only (latest)")
+        ax.set_xscale("log"); ax.set_yscale("log")
+        ax.set_xlabel("Frequency [Hz]")
+        ax.set_ylabel("PSD, TDI X channel  [1/Hz]")
+        ax.legend(fontsize=8, loc="upper left")
+        ax.set_title(f"PSD + foreground per stored iteration (last {_last_n} iterations)")
+        fig_b64(fig, "f11_fg_zoom")
 except Exception as e:
     MISSING.append(f"foreground curve render failed: {e!r}")
 
