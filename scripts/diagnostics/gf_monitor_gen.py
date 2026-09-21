@@ -836,15 +836,23 @@ try:
 
     pm = np.median(psd_cold[-1], axis=0)
     gm = np.median(gal_cold_phys[-1], axis=0)
+
+    # Compute injected + FittedHT foreground for comparison
+    from lisatools.stochastic import (
+        FittedHyperbolicTangentGalacticForeground as _FHT_sens)
+    _gal_fht = _FHT_sens.specific_Sh_function(fr, SCI_TOBS)
+
     fig, ax = plt.subplots(figsize=(11, 4.2))
-    ax.plot(fr, sens_lisasens(*pm), color=CYAN, lw=1.6, label="instrument PSD")
+    ax.plot(fr, sens_lisasens(*pm), color=CYAN, lw=1.6, label="instrument PSD (sampled)")
     ax.plot(fr, sens_lisasens(pm[0], pm[1], gm), color=AMBER, lw=1.6,
-            label="PSD + galactic foreground")
+            label="PSD + galactic foreground (sampled)")
     ax.plot(fr, sens_lisasens(SOMS_INJ, SA_INJ), color=RED, ls=":", lw=1.3,
             label="injected instrument")
+    ax.plot(fr, sens_lisasens(SOMS_INJ, SA_INJ) + _gal_fht, color=RED, ls="-.",
+            lw=1.3, alpha=0.8, label="injected + FittedHT foreground")
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xlabel("f [Hz]"); ax.set_ylabel("Sn(f) [LISASens]")
-    ax.legend(); ax.set_title(
+    ax.legend(fontsize=9); ax.set_title(
         "sensitivity, cold-chain walker-median, latest stored iteration")
     fig_b64(fig, "psd_curves")
 
