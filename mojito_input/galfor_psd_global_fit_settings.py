@@ -1,16 +1,15 @@
 from __future__ import annotations
 
+import h5py
 import numpy as np
-import os
 import shutil
 import logging
+import os
 
 try:
     import cupy as cp
 
-    gpu_available = bool(cp.cuda.is_available())
-    if not gpu_available:
-        import numpy as cp
+    gpu_available = True
 except (ModuleNotFoundError, ImportError) as e:
     import numpy as cp
 
@@ -20,32 +19,43 @@ from typing import TYPE_CHECKING
 
 from lisatools.detector import L1Orbits
 from lisatools.domains import FDSettings, STFTSettings, DomainSettingsBase
+from lisatools.domaincomputation import DomainComputationGroupArray
 from lisatools.utils.constants import *
-from lisatools.utils.constants import YRSID_SI
-from lisatools.sensitivity import XYZSensitivityBackend
 from lisatools.globalfit.run import CurrentInfoGlobalFit
 from lisatools.globalfit.stock.erebor import (
-    GalForSetup, GalForSettings, PSDSetup, PSDSettings, GBSetup, GBSettings,
-    get_fdot_mojito,
+    GalForSetup, GalForSettings, PSDSetup, PSDSettings,
+    MBHSetup, MBHSettings, GBSetup, GBSettings
 )
-
-from eryn.prior import ProbDistContainer, uniform_dist, log_uniform
-from eryn.utils import TransformContainer
-from eryn.moves import TemperatureControl
+from eryn.prior import ProbDistContainer
 
 from lisatools.globalfit.engine import GlobalFitSettings, GeneralSetup, GeneralSettings, RankInfo
-from lisatools.globalfit.moves import MultiGPUPSDMove
+from lisatools.globalfit.recipe import subtract_initial_signal
+from lisatools.utils.constants import YRSID_SI
+from lisatools.sensitivity import XYZSensitivityBackend
+
+from eryn.prior import uniform_dist
+from eryn.utils import TransformContainer
+from eryn.prior import ProbDistContainer, uniform_dist, log_uniform
+
 from lisatools.globalfit.preprocessing import L1ProcessingStep
 from lisatools.globalfit.recipe import (
     SearchRecipeStep,
     PERecipeStep,
+    RJRecipeStep,
+    build_psd_moves,
     build_gb_moves,
+    build_mbh_moves_phenom,
+    scatter_around_injection,
+    mbh_catalogue_to_sampling_basis,
     setup_state_for_injection,
 )
+from lisatools.globalfit.moves import GFCombineMove
 from lisatools.globalfit.postprocessing import (
     StochasticMetadata,
-    SourceMetadata,
+    SourceMetadata
 )
+from lisatools.globalfit.priors.gbpriors import get_fdot_mojito
+from lisatools.globalfit.moves import GlobalFitMove
 
 from gbgpu.gbcomps import STFTGBComputations
 from lisatools.globalfit.moves.gbdebug import GBDebugSettings
@@ -54,19 +64,20 @@ if TYPE_CHECKING:
     from lisatools.globalfit.recipe import Recipe
     from lisatools.analysiscontainer import AnalysisContainerArray
     from lisatools.datacontainer import DataResidualArray
+    from lisatools.globalfit.engine import EngineInfo
 
 
-# The run's combined log handler is attached to the "lisatools" logger, not to
-# the root, so a bare getLogger(__name__) here would reach no handler at all.
-logger = logging.getLogger("lisatools.settings." + __name__)
 
-MOJITO_REFERENCE_TIME = 97729089.327664
-MOJITO_AVERAGE_ARMLENGTH = 2493162305.42235
+logger = logging.getLogger(__name__)
 
+def f_ms_to_s(x):
+    return x * 1e-3
 
 def ten_to_the_x(x):
     return 10.0 ** x
 
+MOJITO_REFERENCE_TIME = 97729089.327664
+MOJITO_AVERAGE_ARMLENGTH = 2493162305.42235
 
 #####################
 
@@ -76,29 +87,23 @@ def ten_to_the_x(x):
 
 
 def setup_recipe(
-    recipe: Recipe,
-    engine_info,
-    curr: CurrentInfoGlobalFit,
-    acs: AnalysisContainerArray,
-    priors: dict[str, ProbDistContainer],
+    recipe: Recipe, 
+    engine_info, 
+    curr: CurrentInfoGlobalFit, 
+    acs: AnalysisContainerArray, 
+    priors: dict[str, ProbDistContainer], 
     state
 ):
     general_info = curr.general_info
-    assert general_info.nwalkers and general_info.ntemps, "nwalkers and ntemps must be set in general_info"
     nwalkers: int = general_info.nwalkers
     ntemps: int = general_info.ntemps
+    cp.cuda.runtime.setDevice(curr.general_info.gpus[0])
+    psd_info = curr.source_info["psd"]
 
-    if gpu_available:
-        gpus = general_info.gpus
-        assert gpus is not None and len(gpus) > 0, "No GPUs specified in general_info.gpus"
-        getattr(cp, "cuda").runtime.setDevice(gpus[0])
-
-    #* =============================== INJECT SOURCES =================================
-    # Sampling basis: ``[logA, f0 [mHz], fdot, phi0, cos_iota, psi, alpha, sin_delta]``
-    # The GBs are seeded at their catalogue values and never proposed, so the
-    # branch acts purely as a fixed subtraction of the resolved galaxy.
-    spread_gb = 0.0
-
+    # #* =============================== INJECT SOURCES =================================
+    # Sampling basis: ``[logA, f0 [mHz], fdot, phi0, cos_iota, psi, lam, sin_beta]``
+    spread_gb = 0.0 #np.array([1e-12, 1e-12, 1e-20, 1e-10, 1e-10, 1e-10, 1e-10, 1e-10])
+    
     data_input_path = str(general_info.input_data_link)
     iteratively_resolved_population_path = os.path.join(
         data_input_path + "/catalogues", "iteratively_resolved_gbs_075yrs_snr7.npy"
@@ -122,62 +127,51 @@ def setup_recipe(
         f"{len(subset_inds)} in-band GB sources do not fit in nleaves_max={nleaves_max_gb}; "
         "raise GBSettings.nleaves_max or narrow the band."
     )
-
+    
     setup_state_for_injection(curr, state, "GB", "gb", spread=spread_gb, subset_inds=subset_inds, priors=priors)
 
-    #* =========================== SUBTRACT THE RESOLVED GBs ==========================
-    # ! Must come before the PSD moves. Assigning ``acs.domain_group_kwargs``
-    # ! (which this call does, with tdi_type / window_alpha / use_midpoint /
-    # ! linear_envelope) drops the cached per-split computation groups, while
-    # ! MultiGPUPSDMove binds the sensitivity backend of split 0 once, at
-    # ! construction. Building the PSD moves first leaves them holding a
-    # ! backend from a discarded split.
-    # Empty move-name lists keep the GB templates out of the residual without
-    # paying for RJ move construction; add names here to sample the GBs too.
+    
+    #* ================================= BUILD MOVES ==================================
     _, _ = build_gb_moves(
         engine_info, curr, acs, priors, state,
         search_move_names=[],
         pe_move_names=[],
     )
 
-    #* ================================= BUILD MOVES ==================================
     psd_info = curr.source_info["psd"]
     galfor_info = curr.source_info["galfor"]
 
-    # The PSD and foreground parameters share one branch-pair in the move, so
-    # the tempering ladder is sized on their combined dimension.
-    effective_ndim = engine_info.ndims["psd"] + engine_info.ndims["galfor"]
-    temperature_control = TemperatureControl(
-        effective_ndim, nwalkers, ntemps=ntemps, Tmax=1.0e6, permute=False
-    )
+    # # The PSD and foreground parameters share one branch-pair in the move, so
+    # # the tempering ladder is sized on their combined dimension.
+    # effective_ndim = engine_info.ndims["psd"] + engine_info.ndims["galfor"]
+    # temperature_control = TemperatureControl(
+    #     effective_ndim, nwalkers, ntemps=ntemps, Tmax=1.0e6, permute=False
+    # )
 
-    psd_move_kwargs = dict(
+    # psd_move_kwargs = dict(
+    #     num_repeats=psd_info.num_prop_repeats,
+    #     permute_every=50,
+    #     live_dangerously=True,
+    #     psd_transform_fn=psd_info.transform,
+    #     galfor_transform_fn=galfor_info.transform,
+    #     temperature_control=temperature_control,
+    #     use_gpu=gpu_available,
+    # )
+    
+    psd_search_move, psd_pe_move = build_psd_moves(
+        engine_info, curr, acs, priors, 
         num_repeats=psd_info.num_prop_repeats,
-        permute_every=200,
-        live_dangerously=True,
-        psd_transform_fn=psd_info.transform,
-        galfor_transform_fn=galfor_info.transform,
-        temperature_control=temperature_control,
-        use_gpu=gpu_available,
-        run_async=True,
-        run_threaded=False,
+        permute_every=50
     )
+    
+    
 
-    psd_search_move = MultiGPUPSDMove(
-        acs, priors, max_logl_mode=True, name="psd search move", **psd_move_kwargs
-    )
-    psd_pe_move = MultiGPUPSDMove(
-        acs, priors, max_logl_mode=False, name="psd pe move", **psd_move_kwargs
-    )
-
-    psd_search_move.accepted = np.zeros((ntemps, nwalkers))
-    psd_pe_move.accepted = np.zeros((ntemps, nwalkers))
-
-    #* ================================= SETUP SEARCH =================================
+    #* ================================= SETUP SEARCH ================================= 
     recipe.add_recipe_component(SearchRecipeStep(moves=[psd_search_move]), name="psd+galfor search")
 
-    #* ========================== SETUP PARAMETER ESTIMATION ==========================
+    #* ========================== SETUP PARAMETER ESTIMATION ========================== 
     recipe.add_recipe_component(PERecipeStep(moves=[psd_pe_move]), name="psd+galfor pe")
+    
 
 
 #######################
@@ -199,19 +193,20 @@ def get_psd_erebor_settings(general_set: GeneralSetup) -> tuple[PSDSetup, Stocha
 
     frequency_ranges = [(general_set.start_freq, general_set.end_freq)]
     prior_model = "uniform"
-    model_config = dict(use_splines=False, num_params=2)
+    model_config = dict(use_splines=False, num_params=2)  # for now just two parameters, but can be extended to include splines or other features in the future
 
     if prior_model == "uniform":
         logger.info("Using uniform prior for PSD parameters.")
         prior_fn = uniform_dist
+
     elif prior_model == "log_uniform":
         logger.info("Using log-uniform prior for PSD parameters.")
         prior_fn = log_uniform
     else:
         raise ValueError(f"Unsupported prior model: {prior_model}")
-
+    
     prior_model_config = {
-        r"$S_{\rm oms}$": LOG10_OMS_ASD_RANGE,
+        r"$S_{\rm oms}$": LOG10_OMS_ASD_RANGE,  
         r"$S_{\rm tm}$": LOG10_TM_ASD_RANGE,
     }
 
@@ -220,7 +215,6 @@ def get_psd_erebor_settings(general_set: GeneralSetup) -> tuple[PSDSetup, Stocha
         r"$S_{\rm tm}$",
     ]
 
-    # The two noise levels are sampled in log10 and mapped back for the kernel.
     psd_transform = TransformContainer(
         input_basis=psd_input_basis,
         output_basis=psd_input_basis,
@@ -238,6 +232,7 @@ def get_psd_erebor_settings(general_set: GeneralSetup) -> tuple[PSDSetup, Stocha
     priors = {"psd": ProbDistContainer(priors_psd)}
 
     injection = np.array([np.log10(15e-12), np.log10(3e-15)])  # for diagnostic plots
+    #injection = np.array([15e-12, 3e-15])
 
     psd_settings = PSDSettings(
         Tobs=general_set.Tobs,
@@ -266,20 +261,18 @@ def get_galfor_erebor_settings(general_set: GeneralSetup) -> tuple[GalForSetup, 
 
     frequency_ranges = [(general_set.start_freq, general_set.end_freq)]
     prior_model = "uniform"
-    model_config = dict(
-        num_params=5,
-        galactic_grid_kwargs=general_set.sensitivity_init_kwargs.get("galactic_grid_kwargs", {}),
-    )
+    model_config = dict(num_params=5, galactic_grid_kwargs=general_set.sensitivity_init_kwargs.get("galactic_grid_kwargs", {}))  # for now just two parameters, but can be extended to include splines or other features in the future
 
     if prior_model == "uniform":
-        logger.info("Using uniform prior for galactic foreground parameters.")
+        logger.info("Using uniform prior for PSD parameters.")
         prior_fn = uniform_dist
+
     elif prior_model == "log_uniform":
-        logger.info("Using log-uniform prior for galactic foreground parameters.")
+        logger.info("Using log-uniform prior for PSD parameters.")
         prior_fn = log_uniform
     else:
         raise ValueError(f"Unsupported prior model: {prior_model}")
-
+    
     galfor_input_basis = [
         r'$\log_{10} A_{\rm gal}$',
         r'$\alpha_{\rm gal}$',
@@ -295,6 +288,7 @@ def get_galfor_erebor_settings(general_set: GeneralSetup) -> tuple[GalForSetup, 
         r'$\log_{10} f_{\rm knee}$': LOG10_FKNEE_RANGE,
         r'$\log_{10} f_2$': LOG10_FREQ2_RANGE,
     }
+
 
     galfor_transform = TransformContainer(
         input_basis=galfor_input_basis,
@@ -336,6 +330,7 @@ def get_galfor_erebor_settings(general_set: GeneralSetup) -> tuple[GalForSetup, 
 
     return GalForSetup(galfor_settings), galfor_metadata
 
+  
 
 def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMetadata]:
 
@@ -435,7 +430,6 @@ def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMe
         dt=general_set.dt,
         initialize_kwargs=initialize_kwargs,
         # Transform, Priors, and Periodic handled later
-        # ! Must hold every in-band resolved source: 3747 sit in 1e-4 - 2.9e-2 Hz.
         nleaves_max=4000,
         nleaves_min=0,
         ndim=8,
@@ -499,43 +493,40 @@ def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMe
 def get_general_erebor_settings() -> GeneralSetup:
 
     global_fit_codename = "erebor"
-    global_fit_version = "galfor_psd_multigpu_stft_run2"
+    global_fit_version = "galfor_psd_singlegpu_stft_run1"
     global_fit_contact = "ereborl2d@googlegroups.com"
-    global_fit_code_link = "https://github.com/Erebor-L2D"
+    global_fit_code_link = "https://github.com/Erebor-L2D/LISAanalysistools/releases/tag/cdl1-run_0"
     global_fit_input_data_link = "/workspace/ggfitlisa/ldc/mojito_light/"
     global_fit_input_reference = "mojito light"
     global_fit_noise_model = "parametric"
-    global_fit_noise_model_code_link = "https://github.com/Erebor-L2D"
-    comment = "Multi-GPU PSD + galactic foreground on data with the resolved GBs subtracted through the STFT comp group."
+    global_fit_noise_model_code_link = "https://github.com/Erebor-L2D" #todo populate repositories
+    comment = "galfor + noise without resolved 9 months 1 gpu"
 
-    submission_folder = None
+    submission_folder = None #"/work/asantini/globalfit/l3c_exchange/mojito_light_results/"
 
     num_iterations = 500
 
     Tobs = 9.0 * YRSID_SI / 12.0
     dt = 5.0
-    # Band covers the whole galactic foreground: the knee and both slopes are
-    # only constrained below ~5 mHz, so the high-frequency-only band is of no
-    # use to the 5-parameter foreground model.
+    
     start_freq, end_freq = [1e-4, 2.9e-2]
 
     head_dir = "/workspace/rrondeel/dev_gb_stft/_results/"
     data_input_path = global_fit_input_data_link
     base_file_name = global_fit_version
     file_store_dir = head_dir + "galfor_test_runs/"
+    
+    gpus = [0]
+    cp.cuda.runtime.setDevice(gpus[0])
+    # Restrict JAX to only see the target GPU — must be set before JAX backend init
+    import jax
 
-    gpus = list(range(cp.cuda.runtime.getDeviceCount())) if gpu_available else None
-    if gpu_available:
-        cp.cuda.runtime.setDevice(gpus[0])
-        # Restrict JAX to only see the target GPUs — must be set before JAX backend init
-        import jax
-
-        jax.config.update("jax_cuda_visible_devices", ",".join(str(gpu) for gpu in gpus))
+    jax.config.update("jax_cuda_visible_devices", ",".join(str(gpu) for gpu in gpus))
 
     backend = "cuda12x" if gpus is not None else "cpu"
     nwalkers = 24
     ntemps = 16
-
+    
     #* =============================== DOMAIN SETTINGS =================================
     domain_cls = STFTSettings
 
@@ -551,21 +542,19 @@ def get_general_erebor_settings() -> GeneralSetup:
 
     # * =============================== DATA PROCESSOR =================================
     window_type = "tukey"
-    # Sets window_alpha = taper / (nperseg * dt) = 1 / (start_freq * stft_dt),
-    # which in turn fixes the STFT band layout.
     window_taper_duration = 1 / start_freq
     normalize_window = True
 
     processor_init_kwargs = dict(
         L1_folder=data_input_path,
-        source_types=["gb", "noise"],  #'vgb', 'gb', "mbhb",
-        source_ids=dict(),
+        source_types=["gb", "noise"],  #'vgb', 'gb', 'mbhb'
+        source_ids=dict(), # mbhb=source_ids
         verbose=True,
         do_plots=True,
         orbits_class=L1Orbits,
         orbits_kwargs=dict(
-            force_backend=backend,
-            frame="icrs",
+            force_backend=backend, 
+            frame="icrs", 
             armlength=MOJITO_AVERAGE_ARMLENGTH
         ),
     )
@@ -591,8 +580,8 @@ def get_general_erebor_settings() -> GeneralSetup:
     }
 
     trim_kwargs = {
-        "duration": 200 * 3600,  # seconds — duration to trim from each end
-        "is_percent": False,  # If True, 'duration' is interpreted as a percentage of the total signal length
+        "duration": 0.02,  # seconds — duration to trim from each end
+        "is_percent": True,  # If True, 'duration' is interpreted as a percentage of the total signal length
         "trimming_type": "from_each_end",  # "from_each_end" or "from_start"
     }
 
@@ -605,21 +594,21 @@ def get_general_erebor_settings() -> GeneralSetup:
     )
 
     # ---- Fixed galactic grid parameters (NOT inferred) ----
-    # The grid supplies the sky-averaged geometry factor R_avg that the
-    # foreground spectrum is scaled by. On an STFT grid it is evaluated at
-    # every segment centre time, so the annual modulation is carried.
-    # ``t0`` is filled in by the engine from data_t0.
+    # alpha0, beta0: LISA orbit orientation angles [rad].
+    # These should match the orbit file used; 0.0 is the default for
+    # equal-armlength/Keplerian orbits.  For numerical orbits, read them
+    # from the orbit file or set to the appropriate value.
     galactic_grid_kwargs = dict(
         R_d=2.18,     # disk radial scale length [kpc]
         z_d=0.48,     # disk vertical scale height [kpc]
-        N_lambda=90,  # sky grid longitude points
-        N_beta=60,    # sky grid latitude points
+        N_lambda=90, # sky grid longitude points
+        N_beta=60,   # sky grid latitude points
     )
 
     sensitivity_init_kwargs = dict(
-        tdi_generation=2,
-        mask_percentage=0.02,
-        galactic_grid_kwargs=galactic_grid_kwargs,
+        tdi_generation=2, 
+        mask_percentage=0.02, 
+        galactic_grid_kwargs=galactic_grid_kwargs, 
         average_transfer_functions=True
     )
 
@@ -629,7 +618,7 @@ def get_general_erebor_settings() -> GeneralSetup:
         file_store_dir=file_store_dir,
         base_file_name=base_file_name,
         domain_settings=domain_settings,
-        random_seed=5701424,
+        random_seed=1434768955,
         backup_iter=5,
         nwalkers=nwalkers,
         ntemps=ntemps,
@@ -657,10 +646,7 @@ def get_general_erebor_settings() -> GeneralSetup:
     )
 
     general_setup = GeneralSetup(general_settings)
-
-    # ! start_freq / end_freq / stft_dt are read-only properties reading the
-    # ! resolved domain settings; assigning them (as older settings files do)
-    # ! raises. The PSD and foreground setups read the properties instead.
+    
     return general_setup
 
 
@@ -671,9 +657,9 @@ def get_global_fit_settings(copy_settings_file=False):
     if copy_settings_file:
         shutil.copy(
             __file__,
-            general_setup.file_store_dir
-            + general_setup.base_file_name
-            + "_"
+            general_setup.file_store_dir 
+            + general_setup.base_file_name 
+            + "_" 
             + __file__.split("/")[-1],
         )
 
@@ -684,7 +670,10 @@ def get_global_fit_settings(copy_settings_file=False):
     head_rank = 1
     main_rank = 0
 
-    rank_info = RankInfo(head_rank=head_rank, main_rank=main_rank)
+    rank_info = RankInfo(
+        head_rank=head_rank,
+        main_rank=main_rank,
+    )
 
     ##################################
     ###  PSD + GalFor Settings  ######
@@ -693,9 +682,11 @@ def get_global_fit_settings(copy_settings_file=False):
     psd_setup, psd_metadata = get_psd_erebor_settings(general_setup)
 
     galfor_setup, galfor_metadata = get_galfor_erebor_settings(general_setup)
-
+    
     ##################################
-    ###  GB Settings  ################
+    ##################################
+    ###  GB Settings  ###############
+    ##################################
     ##################################
 
     gb_setup, gb_metadata = get_gb_erebor_settings(general_setup)
@@ -714,7 +705,7 @@ def get_global_fit_settings(copy_settings_file=False):
         rank_info=rank_info,
         setup_function=setup_recipe,
         source_metadata={
-            "gb": gb_metadata,
+            #"gb": gb_metadata,
             "psd": psd_metadata,
             "galfor": galfor_metadata,
         }
@@ -727,4 +718,3 @@ def get_global_fit_settings(copy_settings_file=False):
 
 if __name__ == "__main__":
     settings = get_global_fit_settings()
-    breakpoint()
