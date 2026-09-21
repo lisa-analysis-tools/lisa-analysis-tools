@@ -3236,7 +3236,7 @@ def build_gb_moves(
         is_rj_prop=True,
         run_swaps=False,
         name="rj_fstat_mcmc_search",
-        phase_maximize=True,
+        phase_maximize=_rj_phase_max,
         gpus=[],
         # Leaf-cap counters advance once per iteration: the prior RJ move is
         # the designated updater; the other RJ moves only enforce the gate.
@@ -3263,7 +3263,7 @@ def build_gb_moves(
             run_swaps=False,
             name="rj_refit_search",
             fp=_refit_fp,
-            phase_maximize=True,  # gb_info["pe_info"]["rj_phase_maximize"],
+            phase_maximize=_rj_phase_max,  # gb_info["pe_info"]["rj_phase_maximize"],
             gpus=[],
             **{**gb_move_kwargs, "leaf_cap_update": False,
                "rj_flip_fraction_default": _search_rj_flip_default()}
@@ -3355,6 +3355,7 @@ def build_gb_moves(
         gb_in_model_move.install_walker_fanout(curr)
 
     gb_prior_removal_move = None
+    print("CHECK FOR CHANGE MICHAEL MADE!")
     if _gb_mode_search and getattr(gb_info, "search_prior_removal", False):
         gb_prior_removal_move = GBSpecialRJPriorMove(
             *gb_move_args,

@@ -2227,7 +2227,7 @@ export GB_RJ_FSTAT_DIST_BIRTH=0
 # unmaximized r1 arm needed ~10 iterations; low-f stayed neutral and all
 # 979 live detailed-balance traces still matched (phase max touches
 # scoring only, never the observable-basis factors).
-export GB_RJ_PHASE_MAXIMIZE=1     # birth lands on target at iteration 0
+export GB_RJ_PHASE_MAXIMIZE=0     # birth lands on target at iteration 0
 # Amp max DEFAULTS TO FOLLOW phase_maximize -- it would silently arm with
 # the line above. User ruling: phase max only, no amp max for now.
 export GB_RJ_AMP_MAXIMIZE=0
