@@ -3360,7 +3360,7 @@ def build_gb_moves(
             *gb_move_args,
             rj_proposal_distribution=gpu_priors,  # THE prior container
             name="rj_prior_removal",
-            rj_removal_only=True,
+            rj_removal_only=False,  # True,
             # Follows GB_RJ_PHASE_MAXIMIZE, same as rj_fstat_search (user
             # ruling 2026-09-02: "phase maximization on for the prior
             # removal just like fstat"). What it arms here is the move's
