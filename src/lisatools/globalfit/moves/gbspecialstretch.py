@@ -4543,10 +4543,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             logger.warning("[GB_DEBUG %s] band plot skipped: %r", self.name, e)
 
     def _fstat_reference_walker(self, model):
-        """Max-likelihood walker used as the F-stat distance-birth reference.
+        """Reference walker for the F-stat distance-birth center.
+
+        Max-likelihood, or MIN-likelihood under
+        :attr:`fstat_search_residual` (user ruling 2026-09-21) -- the same
+        selector the epoch fit uses, :meth:`_fstat_fit_ref_from`.
 
         Mirrors the serial-search move: the F-stat centers are computed
-        against the residual of the best-fitting walker. Computed once per
+        against the residual of the reference walker. Computed once per
         ``run_proposal`` (the residual drifts within a proposal, but the
         reference only sets the proposal CENTER, not the accept test).
 
@@ -4561,7 +4565,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         ~130s/iter dominated by in-model repeats). Measure before adopting.
         """
         try:
-            return int(np.argmax(_to_numpy(model.analysis_container_arr.likelihood())))
+            return self._fstat_fit_ref_from(
+                _to_numpy(model.analysis_container_arr.likelihood()))
         except Exception as exc:
             # Never silent: a broken ranking here quietly pins every F-stat
             # reference to walker 0 for the whole run.
@@ -4570,10 +4575,77 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 "(%r); falling back to walker 0.", self.name, exc)
             return 0
 
+    @property
+    def fstat_search_residual(self) -> bool:
+        """SEARCH-mode F-stat refit: fit the LIVE residual, MIN-lnL walker.
+
+        ``True`` (search): sweep the residual as it stands, i.e. **with the
+        GBs subtracted** -- the peaks are what is left to find.
+        ``False`` (PE, the pre-existing method): **add the GBs back in**
+        first so the data looks un-subtracted, and rank by max lnL. See
+        :meth:`_gb_free_residual` for the two modes side by side.
+
+        Set per move instance by
+        :func:`lisatools.globalfit.recipe.build_gb_moves`; a property with a
+        ``False`` default so every non-grid move and every direct unit-test
+        construction keeps the old semantics without touching its ctor.
+
+        See :meth:`GBSpecialRJFStatGridMove._fstat_root` for why the two
+        modes must not share an epoch root.
+        """
+        return bool(getattr(self, "_fstat_search_residual", False))
+
+    @fstat_search_residual.setter
+    def fstat_search_residual(self, value) -> None:
+        self._fstat_search_residual = bool(value)
+
+    def _fstat_gb_free_on(self) -> bool:
+        """Should the F-stat sweep run against a GB-FREE residual?
+
+        ``GB_FSTAT_GB_FREE`` (default on) AND not
+        :attr:`fstat_search_residual`. The mode flag WINS over the env var:
+        "search fits the live residual" is the definition of the mode, so a
+        stray ``GB_FSTAT_GB_FREE=1`` in a submit script must not silently
+        turn the GB restore back on for the search moves.
+
+        Single source of truth for all three readers -- the window itself
+        (:meth:`_gb_free_residual`), the fan-out payload's ``gb_free``
+        request, and the epoch FINGERPRINT -- which must agree or a cache
+        key stops describing the residual that was actually swept.
+        """
+        if self.fstat_search_residual:
+            return False
+        return os.environ.get("GB_FSTAT_GB_FREE", "1") == "1"
+
+    def _fstat_fit_ref_from(self, lls):
+        """Index of the walker whose residual an F-stat EPOCH is fitted to.
+
+        ``argmax`` (PE, the original) or ``argmin`` under
+        :attr:`fstat_search_residual` (user ruling 2026-09-21).
+
+        **Why the min in search.** The search fit no longer opens the
+        GB-free window, so it sweeps a walker's residual exactly as it
+        stands. The MIN-lnL cold walker is the one with the most signal
+        still IN its residual, so its peaks are the ones the search has yet
+        to find -- fitting the max-lnL walker there would hand the grid the
+        emptiest residual in the ensemble and shrink the peak list fastest
+        for the walker that needs it least. With the GB-free window open
+        (PE) the argument does not apply: every walker's GBs are restored
+        before the sweep, so the residuals agree and the max is kept.
+
+        Only the FIT path routes through here. The F-stat distance-birth
+        proposal CENTER (``_fstat_walker_ref``, set once per propose) keeps
+        :meth:`_fstat_reference_walker` and its argmax unchanged.
+        """
+        return int(np.argmin(lls) if self.fstat_search_residual
+                   else np.argmax(lls))
+
     def _fstat_global_reference(self, model):
         """``(w_global, owner_rank, local_index, lls)`` for the F-stat fit.
 
-        The GLOBAL max-likelihood walker, not this rank's local one. Under
+        The GLOBAL max-likelihood walker, not this rank's local one (or the
+        global MIN-likelihood one under :attr:`fstat_search_residual` -- see
+        :meth:`_fstat_fit_ref_from`). Under
         the walker-block layout ``_fstat_reference_walker`` ranks only the
         HEAD'S OWN block, so the epoch would be fitted against the best of B
         walkers instead of the best of N -- and the index it returns is used
@@ -4599,12 +4671,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # case, so ``owner_rank=0`` below is a fixed convention, not a
             # derived value -- a caller with no fan-out (or that is not the
             # head) has no per-rank ACA row of its own to report.
+            # DELEGATE, do not re-derive: ``_fstat_reference_walker`` is the
+            # local-ranking entry point (subclasses and tests override it)
+            # and it now carries the same min/max mode switch this method
+            # applies to the gathered vector below.
             w = self._fstat_reference_walker(model)
             return int(w), 0, int(w), np.full(1, np.nan)
         try:
             lls = np.asarray(_to_numpy(fanout.gather_likelihood(
                 model.analysis_container_arr)), dtype=float)
-            w_global = int(np.argmax(lls))
+            w_global = self._fstat_fit_ref_from(lls)
         except Exception as exc:
             # Never silent: a broken ranking here quietly pins every F-stat
             # reference to walker 0 for the whole run. The owner of walker 0
@@ -19592,7 +19668,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # window because GB_FSTAT_GB_FREE=0 is indistinguishable from one that
         # skipped it because it had no branch.
         gb_free_requested = (branches is not None
-                             and os.environ.get("GB_FSTAT_GB_FREE", "1") == "1")
+                             and self._fstat_gb_free_on())
         base_payload = self._fstat_ref_row_payload(
             w_global, owner_rank, local_index, gb_free_requested)
 
@@ -22822,9 +22898,39 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
 
         ``GB_FSTAT_FIT_PER_MOVE=1`` restores per-move grids for the case
         where two moves genuinely need different ones.
+
+        SEARCH AND PE DO NOT SHARE A ROOT (2026-09-21). Under
+        :attr:`fstat_search_residual` the epochs are fitted to a DIFFERENT
+        residual (live, not GB-free) against a DIFFERENT reference walker
+        (min lnL, not max), so a PE move landing on a search epoch -- which
+        the shared root guarantees, since ``full_pe`` follows ``gb_search``
+        in the same store and ``_latest_epoch`` simply takes the highest
+        number it finds -- would silently inherit grids built under
+        semantics it does not want. The epoch FINGERPRINT catches a reused
+        *sweep checkpoint*, but ``_epoch_complete`` + ``_latest_epoch`` load
+        a finished epoch without ever consulting it, so the fingerprint
+        alone does not close this. Separate roots do, and they also give the
+        search its own epoch numbering (so an in-flight PE epoch is never
+        renumbered underneath it).
+
+        TODO (collapse the split? -- user note 2026-09-21): the exposure
+        this guards is the COLD START only. It is the handoff itself that is
+        dangerous: ``full_pe`` opens holding whatever the search last
+        fitted, and with one root that grid is live for PE until PE's own
+        cadence fires. Once PE has taken its FIRST refit under
+        ``GB_FSTAT_REFIT_EVERY`` (30 iterations, so shortly after the
+        handoff) it is back on a grid it fitted itself, GB-free and max-lnL,
+        and from then on the two modes never read each other's epochs
+        anyway. So the split is only really buying that opening window. If
+        the PE TODO in ``recipe.py`` resolves to "PE also fits the live
+        residual", this collapses back to one root outright; if PE keeps the
+        GB-free grid, decide whether a forced refit at the stage handoff is
+        a cheaper guarantee than carrying two roots forever.
         """
         if os.environ.get("GB_FSTAT_FIT_PER_MOVE", "0") == "1":
             return os.path.join(self.fstat_fit_dir, self.name)
+        if self.fstat_search_residual:
+            return os.path.join(self.fstat_fit_dir, "shared_search")
         return os.path.join(self.fstat_fit_dir, "shared")
 
     def _epoch_dir(self, k: int) -> str:
@@ -23132,11 +23238,33 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
     def _gb_free_residual(self, model, branches, walker_ref: int):
         """Put the reference walker's cold GB signals BACK into the residual.
 
-        ``GB_FSTAT_GB_FREE=1`` (default ON). For the duration of the block the
+        ``GB_FSTAT_GB_FREE=1`` (default ON) **and PE only**. For the duration
+        of the block the
         F-stat sweep sees a residual with everything else subtracted -- MBH,
         VGB, the fitted noise and foreground -- but **no GBs**, so the peaks
         it finds are the full galactic population rather than whatever this
         one walker has not yet found.
+
+        THE TWO MODES, STATED PLAINLY (user ruling 2026-09-21):
+
+        * **PE** (this window OPEN, the pre-existing method): the reference
+          walker's GB signals are added BACK, so the sweep sees a residual
+          in which all the GBs are still in the data. Peaks = the full
+          galactic population.
+        * **SEARCH** (:attr:`fstat_search_residual`, window SKIPPED): the
+          sweep sees the live residual with the GBs SUBTRACTED -- the model
+          templates are already out of it. Peaks = only what the search has
+          LEFT to find.
+
+        The search consequence is the point of the change: the peak list
+        SHRINKS as sources are found, instead of being pinned at the
+        full-galaxy count forever, so each refit gets cheaper and the
+        stage-B stacked tables (the 2026-09-21 OOM site,
+        ``StackedFStatProposal4D``) shrink with it. The walker-independence
+        argument below is what is being traded away; it is bought back by
+        taking the MIN-lnL walker as the reference
+        (:meth:`_fstat_fit_ref_from`), i.e. the residual that still holds
+        the most unfound signal in the ensemble.
 
         **Why.** The fit is scored against ONE reference walker (the
         max-likelihood one, :meth:`_fstat_reference_walker`), and its GBs are
@@ -23163,7 +23291,7 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         "restoring them to the residual" in
         :meth:`adjust_sources_in_residual_buffer`).
         """
-        if (os.environ.get("GB_FSTAT_GB_FREE", "1") != "1"
+        if (not self._fstat_gb_free_on()
                 or branches is None or self.branch_name not in branches):
             # Published on BOTH paths: the multi-rank fit's head reports the
             # owner's count in its one log line, and "no window was opened"
@@ -23350,7 +23478,7 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         # when the reference walker holds no GBs) and therefore invisible
         # until the first real refit -- exactly the silent-cache-reuse case
         # the fingerprint exists to prevent.
-        _gb_free = os.environ.get("GB_FSTAT_GB_FREE", "1") == "1"
+        _gb_free = self._fstat_gb_free_on()
         t0 = time.perf_counter()
         if _already_fitted:
             # NO GATHER EITHER. ``_fstat_global_reference`` is a fan-out

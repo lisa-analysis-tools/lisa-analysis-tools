@@ -3452,6 +3452,13 @@ class _EpochFitRankStub:
     _fstat_ctr_smear = _G._fstat_ctr_smear
     _CTR_TABLE_DEVICE_FIELDS = _G._CTR_TABLE_DEVICE_FIELDS
     _fstat_global_reference = _B._fstat_global_reference
+    # Search/PE residual mode (2026-09-21). Borrowed like the rest so the
+    # stub's _run_fstat_fit / _fstat_ref_row_fanout reach the SAME gate
+    # production does; the property descriptor carries its own False
+    # default, so the stub stays in PE mode unless a test sets it.
+    fstat_search_residual = _B.fstat_search_residual
+    _fstat_gb_free_on = _B._fstat_gb_free_on
+    _fstat_fit_ref_from = _B._fstat_fit_ref_from
     _fstat_ref_row_payload = staticmethod(_B._fstat_ref_row_payload)
     _fstat_ref_shard = staticmethod(_B._fstat_ref_shard)
     _fstat_ref_branch_slice = _B._fstat_ref_branch_slice

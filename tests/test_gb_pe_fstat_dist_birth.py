@@ -102,9 +102,13 @@ class StampResolverTest(unittest.TestCase):
 
         return _fstat_dist_birth_stamp
 
-    def test_default_is_on(self):
+    def test_default_is_off(self):
+        # FLIPPED True -> False (user ruling 2026-09-21): production has
+        # been exporting GB_RJ_FSTAT_DIST_BIRTH=0 throughout, so the code
+        # default now matches the runs and the F-stat distance birth is
+        # opted into by name.
         with _EnvPatch(GB_RJ_FSTAT_DIST_BIRTH=None):
-            self.assertIs(self._fn()(), True)
+            self.assertIs(self._fn()(), False)
 
     def test_env_zero_restores_the_prior_width_path(self):
         # BLAST-RADIUS ESCAPE HATCH: =0 must give back exactly the

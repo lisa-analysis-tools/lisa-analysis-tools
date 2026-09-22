@@ -267,7 +267,14 @@ class GBNoFgGBSettings(GBSettings):
         default_factory=env_default("GB_FSTAT_FIT_IN_MOVE", True, bool)
     )
     fstat_refit_every: int = dataclasses.field(
-        default_factory=env_default("GB_FSTAT_REFIT_EVERY", 0, int)
+        # Refit the F-stat birth grid every 40 global-fit ITERATIONS (user
+        # ruling 2026-09-21; the clock counts iterations in every stage
+        # since the 2026-09-18 fix, so this number means the same thing in
+        # gb_search and full_pe). Matches the production value exported by
+        # submit_gf_6mo_v8.sh, so the library default and the runs agree.
+        # 0 = fit once and never refit, the old default -- which left the
+        # birth grid pinned to the initial residual for the whole run.
+        default_factory=env_default("GB_FSTAT_REFIT_EVERY", 40, int)
     )
     fstat_fit_dir: str = dataclasses.field(
         default_factory=env_default("GB_FSTAT_FIT_DIR", "", str)

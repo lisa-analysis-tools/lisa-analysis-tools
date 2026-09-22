@@ -2509,7 +2509,7 @@ class GBWaveformDict(typing.TypedDict):
     window_alpha: float
 
 
-def _fstat_dist_birth_stamp(default: bool = True) -> bool:
+def _fstat_dist_birth_stamp(default: bool = False) -> bool:
     """Resolve ``GBSpecialBase.rj_fstat_dist_birth`` for an install site.
 
     The move's own constructor defaults this to ``bool(rj_amp_maximize)``
@@ -2528,6 +2528,14 @@ def _fstat_dist_birth_stamp(default: bool = True) -> bool:
     ``GB_RJ_FSTAT_DIST_BIRTH`` always wins (the project-wide env-knob
     convention); ``=0`` restores the prior-width path bit-identically by
     switching the RJ step's whole F-stat branch off.
+
+    DEFAULT FLIPPED True -> False (user ruling 2026-09-21): production has
+    been exporting ``GB_RJ_FSTAT_DIST_BIRTH=0`` all along, so the ``True``
+    default described a path no run was taking while every run paid the
+    cost of reading past it. The default now MATCHES production, and a run
+    that wants the F-stat distance birth opts in by name. The 2026-08-28
+    mirroring ruling above is untouched -- it says search and PE resolve
+    the SAME way, which they still do; only the value they agree on moved.
     """
     env = os.environ.get("GB_RJ_FSTAT_DIST_BIRTH")
     return bool(int(env)) if env is not None else bool(default)
@@ -3222,6 +3230,25 @@ def build_gb_moves(
            "rj_flip_fraction_default": _search_rj_flip_default(),
            **_imr_search}
     )
+    # SEARCH F-stat refits sweep the LIVE residual of the MIN-lnL cold
+    # walker -- the GBs stay SUBTRACTED, so the peaks are what the search
+    # has left to find. PE keeps the pre-existing method: add the GBs back
+    # in so the data looks un-subtracted, ranked by max lnL (user ruling
+    # 2026-09-21). Set as an attribute rather than a ctor kwarg because
+    # ``_RJBirth`` is ``GBSpecialRJPriorMove`` when GB_FSTAT_FIT_IN_MOVE=0,
+    # which has no such parameter and would raise on it; the flag is a
+    # no-op on that class, which never fits a grid.
+    #
+    # TODO (PE, undecided 2026-09-21): PE deliberately KEEPS the GB-free
+    # grid -- an assembled model's births must stay able to reach a source
+    # any one walker has already subtracted, which is exactly what the
+    # GB-free residual preserves and what fitting the live residual would
+    # take away. Revisit once the search-side change has a snapshot behind
+    # it: if the shrinking peak list turns out to cost PE nothing (compare
+    # completeness/purity either side of the full_pe handoff), the two
+    # stages could share one live-residual grid again and the ``shared`` /
+    # ``shared_search`` root split could collapse back to one.
+    gb_search_prune_move.fstat_search_residual = True
     gb_search_prune_move.accepted = np.zeros((ntemps, nwalkers_local))
     gb_search_prune_move.install_walker_fanout(curr)
     
@@ -3327,6 +3354,12 @@ def build_gb_moves(
         # center, then priced through the unchanged RJ densities:
         # maximize-then-pretend). A PE replace install must NOT set this.
         gb_replace_move.replace_search_stage = True
+        # Search-stage companion of rj_fstat_search: it must land on the
+        # SAME epoch root, so it carries the same live-residual mode. With
+        # the flag left False it would fit a second, GB-free epoch under
+        # ``shared`` and the "no second fit" sharing described above would
+        # quietly stop holding.
+        gb_replace_move.fstat_search_residual = True
         gb_replace_move.accepted = np.zeros((ntemps, nwalkers_local))
         gb_replace_move.install_walker_fanout(curr)
     # Pure IN-MODEL move (2026-08-04): no RJ step at all -- ``is_rj_prop=False``
@@ -3593,6 +3626,9 @@ def build_gb_moves(
         **{**gb_move_kwargs, "rj_flip_fraction_default": _rj_flip_default,
            **_imr_defaults, **_pe_cap_off}
     )
+    # PE stays on the GB-FREE grid (``fstat_search_residual`` left False):
+    # see the TODO beside rj_fstat_search. Spelled out here because the
+    # default is silent and this is the move the decision is about.
     gb_pe_prior_move.accepted = np.zeros((ntemps, nwalkers_local))
     gb_pe_prior_move.install_walker_fanout(curr)
 
