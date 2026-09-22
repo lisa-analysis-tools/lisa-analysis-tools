@@ -64,8 +64,18 @@ class MojitoNoiseGeneralSettings(NoiseGeneralSettings):
 
     # mojito L1 is sampled at dt = 2.5 s (the noise-variant default is 5.0).
     dt: float = 2.5
-    nf: typing.Optional[int] = 1440
-    nt: typing.Optional[int] = 2160
+    # ``nf``/``nt`` OVERRIDE ``tobs_target``: ``EreborFit.wdm_grid`` returns
+    # ``nf * nt * dt`` whenever BOTH are set and only falls back to
+    # ``derive_wdm_grid(tobs_target, ...)`` when one is None. So a run that
+    # exports TOBS_TARGET alone keeps the 90-d grid below and silently
+    # analyses 90 days -- found 2026-09-21 while building the 6-month noise
+    # twin. Env-wired for the same reason MIN_FREQ/MAX_FREQ above are: a
+    # noise-only run must be able to match a production GB run's grid
+    # exactly. 6 months = NT 4320 (1440 * 4320 * 2.5 = 1.5552e7 s).
+    nf: typing.Optional[int] = dataclasses.field(
+        default_factory=env_default("NF", 1440, int))
+    nt: typing.Optional[int] = dataclasses.field(
+        default_factory=env_default("NT", 2160, int))
 
     # Full analysis band, not the smoke-friendly 0.3-8 mHz of the synthetic fits.
     # Env-backed (2026-09-04) so a run can pin the SAME band a production GB run
