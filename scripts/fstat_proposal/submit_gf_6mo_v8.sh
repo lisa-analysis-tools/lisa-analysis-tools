@@ -1076,7 +1076,7 @@ export GB_TEMPER_COMPACT_ROWS=1
 # Adaptive gb_search noise rider (379ae2e1): keep taking MaxLogL rounds
 # while a round improves by > tol, stop at the first flat one.
 export GB_SEARCH_NOISE_CHECKS=1
-export GB_SEARCH_NOISE_ITERS_PER_STEP=0
+export GB_SEARCH_NOISE_ITERS_PER_STEP=100
 # PLATEAU TOLERANCE 5 -> 20 lnL (user ruling 2026-09-18). MAXLOGL_TOL is what
 # counts as "this round improved"; JointMaxLogLSearch keeps taking rounds while
 # a round beats it and stops at the first flat one.
@@ -1103,7 +1103,7 @@ export GB_SEARCH_NOISE_ITERS_PER_STEP=0
 export MAXLOGL_TOL=20
 # PE-only exclusive RJ draw (b9aae51f).
 export GB_PE_RJ_DRAW_ONE=1
-export GB_PE_RJ_FSTAT_FRACTION=0.8
+export GB_PE_RJ_FSTAT_FRACTION=0.5
 # Per-block EXACT info matrices through the sig-het fast route
 # (~2.4 ms/src vs ~29-46 chunked). The data_index misindex is FIXED and
 # multi-GPU slots now route by the BUFFER's slot shards. First
