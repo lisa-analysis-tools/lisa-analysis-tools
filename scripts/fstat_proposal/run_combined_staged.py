@@ -924,9 +924,9 @@ def build_fit():
             # and the GB RJ cycle (sobbh -> mbh -> emri banking order).
             # mbh/emri ride at the 1-in-N gb_search cadence (block above);
             # sobbh every iteration.
-            moves=noise_vgb_gb + source_pe(gb_search_cadence=True) + warm() + [
+            moves=noise_vgb_gb + source_pe(gb_search_cadence=True) + warm() + noise_only + [
                 Move("rj_fstat_search", branch="gb"),
-            ] + replace() + [
+            ] + noise_only + replace() + [
                 Move("rj_prior_removal", branch="gb"),
             ] + ([Move("gb_ridge_gibbs", branch="gb")]
                  if os.environ.get("GB_RIDGE_GIBBS", "1") == "1" else [])
