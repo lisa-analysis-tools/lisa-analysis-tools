@@ -198,6 +198,14 @@ if rg is not None:
         recipe[k] = (int(rg[k].attrs.get("order num", 0)), bool(rg[k].attrs.get("status", False)))
 nwalk = ll.shape[1]
 
+# Observation time from domain settings (needed by multiple plot sections)
+SCI_TOBS = 7776000.0  # 3-month default
+try:
+    _a = dict(f["global_fit/domain_settings/args"].attrs)
+    SCI_TOBS = float(_a["0"]) * float(_a["1"]) * float(_a["2"])
+except Exception:
+    pass
+
 # RUN IDENTITY (2026-08-15): one generator now serves several runs (3-mo
 # production, 23-mo scaling). Derive the label from the store rather than
 # hard-coding it, so a 23-mo page can never be mislabelled as the 3-mo one.
@@ -2169,12 +2177,7 @@ for _tp in (os.path.join(RUN_DIR, "gb_truth_3to21.npz"), "gb_truth_3to21.npz"):
             TRU = None
         break
 
-SCI_TOBS = 7776000.0
-try:
-    _a = dict(f["global_fit/domain_settings/args"].attrs)
-    SCI_TOBS = float(_a["0"]) * float(_a["1"]) * float(_a["2"])
-except Exception:
-    pass
+# SCI_TOBS already defined near line 200 after file open
 SCI_DF = 1.0 / SCI_TOBS
 
 # THE BAND COMES FROM THE TRUTH SET (2026-08-23). It used to be hardcoded at
