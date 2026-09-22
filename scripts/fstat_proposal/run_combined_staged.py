@@ -741,8 +741,16 @@ def build_fit():
     # Stage 1: noise alone. Stage 2 and the GB search: noise + VGBs, with the
     # max-logl criterion spanning ALL of them -- one object per stage, so the
     # convergence is joint rather than each move plateauing separately.
+
+    # TODO: CLEAN
     noise_only = [JointMaxLogLSearch(
         "noise_joint_search", list(_noise_names), branch="psd")]
+    noise_only_1 = [JointMaxLogLSearch(
+        "noise_joint_search_1", list(_noise_names), branch="psd")]
+    noise_only_2 = [JointMaxLogLSearch(
+        "noise_joint_search_2", list(_noise_names), branch="psd")]
+    noise_only_3 = [JointMaxLogLSearch(
+        "noise_joint_search_3", list(_noise_names), branch="psd")]
     noise_vgb = [JointMaxLogLSearch(
         "noise_vgb_joint_search",
         _noise_names + (["vgb_pe"] if _has_vgb else []),
@@ -924,9 +932,9 @@ def build_fit():
             # and the GB RJ cycle (sobbh -> mbh -> emri banking order).
             # mbh/emri ride at the 1-in-N gb_search cadence (block above);
             # sobbh every iteration.
-            moves=noise_vgb_gb + source_pe(gb_search_cadence=True) + warm() + noise_only + [
+            moves=noise_vgb_gb + source_pe(gb_search_cadence=True) + warm() + noise_only_1 + [
                 Move("rj_fstat_search", branch="gb"),
-            ] + noise_only + replace() + [
+            ] + noise_only_2 + replace() + [
                 Move("rj_prior_removal", branch="gb"),
             ] + ([Move("gb_ridge_gibbs", branch="gb")]
                  if os.environ.get("GB_RIDGE_GIBBS", "1") == "1" else [])
