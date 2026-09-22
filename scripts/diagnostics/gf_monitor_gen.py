@@ -817,6 +817,20 @@ for j, (name, inj) in enumerate([("Soms_d", SOMS_INJ), ("Sa_a", SA_INJ)]):
         ax[j].plot(np.arange(SUB_NIT), psd_cold[:, w, j], color=CYAN, alpha=0.3, lw=0.8)
     ax[j].axhline(inj, color=RED, lw=1.4, ls=":", label="injected")
     ax[j].set_title(f"psd: {name}"); ax[j].set_xlabel("iteration"); ax[j].legend()
+
+    # Inset: last 50 iterations
+    _last_n = min(50, SUB_NIT)
+    if _last_n >= 3:
+        from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+        ax_in = inset_axes(ax[j], width="40%", height="35%", loc="center")
+        for w in range(nwalk):
+            ax_in.plot(np.arange(SUB_NIT - _last_n, SUB_NIT),
+                      psd_cold[SUB_NIT - _last_n:, w, j],
+                      color=CYAN, alpha=0.3, lw=0.8)
+        ax_in.axhline(inj, color=RED, lw=1.2, ls=":")
+        ax_in.set_title(f"last {_last_n} iter", fontsize=7)
+        ax_in.tick_params(labelsize=6)
+        ax_in.grid(True, alpha=0.3)
 fig_b64(fig, "psd_trace")
 
 fig, ax = plt.subplots(1, 2, figsize=(11, 2.9))
@@ -901,6 +915,25 @@ try:
     ax.legend(); ax.set_title(
         "PSD + foreground per stored iteration (light -> dark = later)")
     fig_b64(fig, "psd_evolution")
+
+    # Last 50 iterations zoom
+    _last_n = min(50, SUB_NIT)
+    if _last_n >= 3:
+        fig, ax = plt.subplots(figsize=(11, 4.2))
+        ax.plot(fr, sens_lisasens(*pm), color=CYAN, lw=1.4,
+                label="instrument PSD (latest)")
+        for k in range(SUB_NIT - _last_n, SUB_NIT):
+            pk_ = np.median(psd_cold[k], axis=0)
+            gk = np.median(gal_cold_phys[k], axis=0)
+            _color_idx = (k - (SUB_NIT - _last_n)) / max(_last_n - 1, 1)
+            ax.plot(fr, sens_lisasens(pk_[0], pk_[1], gk),
+                    color=ramp2(_color_idx), lw=1.1,
+                    label=(f"iter {k}" if k in (SUB_NIT - _last_n, SUB_NIT - 1) else None))
+        ax.set_xscale("log"); ax.set_yscale("log")
+        ax.set_xlabel("f [Hz]"); ax.set_ylabel("Sn(f) [LISASens]")
+        ax.legend(); ax.set_title(
+            f"PSD + foreground, last {_last_n} stored iterations (light -> dark = later)")
+        fig_b64(fig, "psd_evolution_zoom")
 except Exception as e:
     MISSING.append(f"LISASens curve render failed: {e!r}")
 
@@ -4648,6 +4681,8 @@ curve. This is the only panel carrying the injected curve.</div></div>
 <div class="panel">{img("psd_evolution", "sensitivity evolution")}
 <div class="caption">The decline watch on the same axes, one curve per stored iteration,
 light to dark with time.</div></div>
+<div class="panel">{img("psd_evolution_zoom", "sensitivity evolution (last 50 iterations)")}
+<div class="caption">Same as above, zoomed to the last 50 stored iterations.</div></div>
 <div class="panel">{img("psd_trace")}
 <div class="caption">Instrument-parameter traces per cold walker; dotted red is the
 injected value.</div></div>
