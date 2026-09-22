@@ -2353,8 +2353,28 @@ export GB_TEMPER_SKIP_SHUTOFF_BANDS=1
 # The peak weighting also flattens to w ~ sqrt(SNR) from epoch 1 onward
 # (FSTAT_PEAK_WEIGHT_ALPHA_LATE, default 0.25), so this cadence is also
 # when that takes effect.
-export GB_FSTAT_REFIT_EVERY=50     # production cadence (5 was verify-only)
+# 50 -> 30 (2026-09-21, user ruling), alongside the SEARCH live-residual
+# refit. The clock counts global-fit ITERATIONS in every stage (2026-09-18
+# fix), so this is literally "refit every 30 iterations". The search refit
+# no longer restores the walker's GBs before sweeping, so its peak list
+# now SHRINKS as sources are found -- each refit should get cheaper, which
+# is what pays for the faster cadence. WATCH on the first snapshot:
+#   grep '\[peaks\]' globalfit_run.log
+# Epochs 0/8/9 were 13513 / 19413 / 19586 peaks, all GB-free. Under the
+# change the count should start falling, and stage-B wall time with it
+# (epoch 8 was 4054 s).
+export GB_FSTAT_REFIT_EVERY=40     # production cadence (5 was verify-only)
 export FSTAT_PEAKS_PER_BAND=200    # per-sub-band peak cap (code default; explicit)
+# STAGE-B STACK CHUNKING -- fixes the 2026-09-21 epoch-9 OOM.
+# StackedFStatProposal4D.__init__ corner-averages the ENTIRE K-box 4-D grid
+# in ONE allocation; unset, k_chunk = K and nothing is chunked. Epoch 9
+# (19586 peaks, the largest of the run) asked for 1,708,159,488 bytes on a
+# 91.5 GB resident baseline and died. This feeds mem_budget_mb -> k_chunk:
+# SAME grid, SAME result, pure chunking, one-time cost, then cached to
+# <epoch>/..._peaks_stacked.npz so resumes skip it. 512 rather than the
+# 1yr run's proven 1500 because this baseline is tighter. Lower it further
+# if it still OOMs; also consider the MEMPOOL_FREE=1 levers.
+export FSTAT_GRID_MEM_MB=512
 # BIRTH-DRAW ALLOCATION (2026-08-16). Peak boxes are weighted w ~ F**alpha,
 # and the F-statistic goes like SNR^2 -- so the historical alpha=1 hands an
 # SNR-10 source 9x FEWER birth attempts than an SNR-30 one, exactly
