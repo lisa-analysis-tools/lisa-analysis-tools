@@ -4,15 +4,18 @@ Companion to ``run_noise_6mo_1gpu.py`` / the laptop coarse runner.
 
     python scripts/noise/psd_ml_point.py <store_dir>
 
-TRUTH below is what the NOISE brick itself reports at build ("noise
-parameters read from ... Soms_d=..., Sa_a=..." in the run log) -- NOT the
-stock PSD_INJECTION fallback. Override via PSD_TRUTH="soms,saa" if a
-different brick is used.
+TRUTH is resolved by ``psd_truth_levels``: PSD_TRUTH="soms,saa" if set, else
+the brick's own tabulated estimates refitted with the UNEQUAL-arm model at its
+/ltts, else mojito-light's round injection (1.5e-11, 3e-15). Do NOT paste a
+literal back in here -- the old 1.496182e-11 / 2.982412e-15 was the EQUAL-arm
+fit, 0.26% / 0.59% low, and it made an accurate fit look biased (2026-09-23).
 """
 import os, sys, glob, h5py, numpy as np
 
-TRUTH = np.array([float(x) for x in os.environ.get(
-    "PSD_TRUTH", "1.496182e-11,2.982412e-15").split(",")])   # read from the NOISE brick
+from lisatools.globalfit.stock.erebor.noise import psd_truth_levels
+
+TRUTH = np.array(psd_truth_levels(
+    mojito_data_path=os.environ.get("MOJITO_DATA_PATH")))
 store = sys.argv[1] if len(sys.argv) > 1 else None
 path = sorted(glob.glob(f"{store}/*_testing.h5"))[0]
 

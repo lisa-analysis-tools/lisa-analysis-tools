@@ -56,7 +56,14 @@ TG = 4.925490947641267e-6
 # flagship: the highest-frequency catalogue source in the analysed GB band
 FLAG_F0, FLAG_TOL, FLAG_FDOT = 20.380377e-3, 5.144e-6, 1.0245e-13
 PSD_NAMES = ["Soms_d  [m]", "Sa_a  [m/s$^2$]"]
-PSD_INJ = [1.496182e-11, 2.982412e-15]
+# Resolved, never a literal -- see the note in gf_monitor_gen.py. The old
+# 1.496182e-11 / 2.982412e-15 pair is the EQUAL-arm fit and sits 0.26% / 0.59%
+# below mojito-light's actual injection (1.5e-11 / 3e-15).
+from lisatools.globalfit.stock.erebor.noise import psd_truth_levels  # noqa: E402
+
+PSD_INJ = list(psd_truth_levels(
+    mojito_data_path=os.environ.get("MOJITO_DATA_PATH")
+))
 GAL_NAMES = ["log10 amp", "p1", "log10 fknee", "p2", "slope"]
 MOJITO_CAT_DIR = os.path.expanduser(
     "~/.mojito_cache/brickmarket/mojito_light_v1_0_0")

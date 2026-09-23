@@ -701,7 +701,14 @@ fig_b64(fig, "ll")
 # answerable at a glance.
 psd_cold = psd_c[:, 0, :, 0, :]                     # (it, 24, 2)
 gal_cold = gal_c[:, 0, :, 0, :]                     # (it, 24, 5)
-SOMS_INJ, SA_INJ = 1.496182e-11, 2.982412e-15
+# Resolved, never a literal -- see the same note in gf_monitor_gen.py. The old
+# 1.496182e-11 / 2.982412e-15 pair is the EQUAL-arm fit and sits 0.26% / 0.59%
+# below mojito-light's actual injection (1.5e-11 / 3e-15).
+from lisatools.globalfit.stock.erebor.noise import psd_truth_levels
+
+SOMS_INJ, SA_INJ = psd_truth_levels(
+    mojito_data_path=os.environ.get("MOJITO_DATA_PATH")
+)
 GAL_NAMES = ["log10 amp", "p1", "log10 fknee", "p2", "slope"]
 
 _nsh = min(3, SUB_NIT)

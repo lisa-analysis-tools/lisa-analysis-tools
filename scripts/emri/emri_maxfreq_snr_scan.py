@@ -57,7 +57,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WF_DIR = os.path.join(HERE, "..", "..", "gf_output", "emri_long_waveforms")
 PLOT_DIR = os.path.join(WF_DIR, "plots")
 
-# run-matched constants (full_year_combined defaults / run_settings.log)
+# run-matched constants (full_year_combined defaults / run_settings.log).
+# NOTE (2026-09-23): these reproduce the ORIGINAL run, whose levels came from
+# the EQUAL-arm fit of the brick's tabulated estimates -- 0.26% / 0.59% below
+# mojito-light's actual injection. `fit_scalar_params` now uses the brick's
+# /ltts, so a NEW full_year_combined run resolves 1.500004e-11 / 3.000107e-15.
+# Kept as-is deliberately so this scan still matches the run it was written
+# for; use `erebor.noise.psd_truth_levels()` for anything new.
 NOISE_SOMS_D = 1.496182116469066e-11
 NOISE_SA_A = 2.9824117392856982e-15
 LAYER_DF = 1.25e-5  # WDM layer spacing of the run (general_setup.log)

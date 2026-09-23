@@ -642,7 +642,18 @@ fig_b64(fig, "ll")
 # answerable at a glance.
 psd_cold = psd_c[:, 0, :, 0, :]                     # (it, 24, 2)
 gal_cold = gal_c[:, 0, :, 0, :]                     # (it, 24, 5)  SAMPLING basis
-SOMS_INJ, SA_INJ = 1.496182e-11, 2.982412e-15
+# Resolved, never a literal. The pair used to be pasted in as
+# 1.496182e-11 / 2.982412e-15, which is the EQUAL-arm fit of the brick's
+# tabulated estimates and sits 0.26% / 0.59% BELOW what mojito-light actually
+# injects (1.5e-11 / 3e-15). Drawing that as "truth" made a 6-month
+# noise-only fit accurate to -0.02% / -0.22% read as biased by +0.23% /
+# +0.37% (2026-09-23). psd_truth_levels honors PSD_TRUTH, else refits the
+# brick with the unequal-arm model, else falls back to the round injection.
+from lisatools.globalfit.stock.erebor.noise import psd_truth_levels
+
+SOMS_INJ, SA_INJ = psd_truth_levels(
+    mojito_data_path=os.environ.get("MOJITO_DATA_PATH")
+)
 
 # Under GALFOR_LOG_SAMPLING the four log columns are stored as log10 while
 # alpha stays linear. The trace/histogram panels want the SAMPLING basis
@@ -2209,6 +2220,33 @@ for _tp in (os.path.join(RUN_DIR, "gb_truth_3to21.npz"), "gb_truth_3to21.npz"):
         except Exception:
             TRU = None
         break
+
+# WHICH EPHEMERIS IS THE TRUTH SET ON? (2026-09-23.) This page used to run in
+# a silently MIXED state: the recovery block below builds waveforms on the
+# mojito L1 orbits whenever it can reach them, while the detectable
+# denominator, the injected-SNR axis of the recovery curve and column 1 of
+# the #detect table all come straight out of this npz -- which build_truth.py
+# built on the ANALYTIC ephemeris until today. Measured at 7.44-7.60 mHz on
+# the 6mo store, that is not a rounding difference: optimal SNRs moved
+# 7.96 -> 8.69 and 32.81 -> 42.67, and template overlaps 0.052 -> 0.580.
+# build_truth now stamps ``orbits``; an unstamped file predates the stamp and
+# is therefore analytic.
+TRU_ORBITS = "unstamped (pre-2026-09-23 => analytic)"
+if TRU is not None:
+    try:
+        TRU_ORBITS = str(TRU["orbits"]) if "orbits" in TRU.files else TRU_ORBITS
+    except Exception:
+        pass
+    if not TRU_ORBITS.startswith("mojito"):
+        MISSING.append(
+            "the truth set was built on the ANALYTIC ephemeris "
+            f"({TRU_ORBITS}) while this page's overlap/SNR block uses the "
+            "injected mojito L1 orbits. Everything keyed to the truth set -- "
+            "the detectable denominator, completeness/purity, the injected-SNR "
+            "axis and column 1 of the detectability table -- carries that "
+            "ephemeris and is NOT comparable to column 2 or to the overlaps. "
+            "Rebuild with scripts/diagnostics/build_truth.py (it now defaults "
+            "to the injected orbits).")
 
 # SCI_TOBS already defined near line 200 after file open
 SCI_DF = 1.0 / SCI_TOBS

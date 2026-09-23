@@ -5937,6 +5937,17 @@ def _interp1d_along_axis(
     return y_lo * (1.0 - w) + y_hi * w
 
 
+#: Sentinel distinguishing "not resolved yet" from a resolved ``None``
+#: in :meth:`MojitoNoiseEstimates._resolve_fit_ltts`'s cache.
+_MISSING = object()
+
+#: Decimation for the run-averaged ``/ltts`` read in
+#: :meth:`MojitoNoiseEstimates.fit_scalar_params`. The delays vary smoothly on
+#: month timescales, so a few hundred changes the mean in the 12th digit while
+#: reading a fraction of the six 25M-sample columns.
+_FIT_LTTS_STRIDE = 500
+
+
 class MojitoNoiseEstimates(NoiseComponent):
     """Tabulated instrument-noise covariance read from a mojito NOISE L1 brick.
 
@@ -6103,18 +6114,85 @@ class MojitoNoiseEstimates(NoiseComponent):
         ratio = np.moveaxis(ratio, (0, 1, 2, 3), (3, 2, 0, 1))
         return xp.asarray(folded[..., None] * ratio)
 
+    def _resolve_fit_ltts(self, ltts, tdi_generation: int):
+        """Six link delays for :meth:`fit_scalar_params`, or ``None``.
+
+        An explicit ``ltts`` always wins. Otherwise the brick's own ``/ltts``
+        group is read (run-averaged, strided), which is the same table
+        :func:`~lisatools.globalfit.stock.erebor.noise.wire_unequal_arm_psd`
+        feeds the fit itself. ``None`` means "no delays available" and selects
+        the equal-arm fallback: a non-TDI-2 generation (the closed forms are
+        generated for gen 2 only), a non-XYZ table, or a file without the
+        group.
+        """
+        if ltts is not None:
+            arr = np.asarray(ltts, dtype=float)
+            if arr.shape != (6,):
+                raise ValueError(
+                    f"ltts must have shape (6,) in UNEQUAL_ARM_LINKS order "
+                    f"{UNEQUAL_ARM_LINKS}; got {arr.shape}."
+                )
+            return arr
+        if tdi_generation != 2 or self.which != "xyz":
+            return None
+        cached = getattr(self, "_fit_ltts_cache", _MISSING)
+        if cached is not _MISSING:
+            return cached
+        found = None
+        try:
+            import h5py
+
+            with h5py.File(self.path, "r") as fh:
+                has = "ltts" in fh
+            if has:
+                found = UnequalArmInstrumentNoise.ltts_from_l1_file(
+                    self.path, mode="averaged", stride=_FIT_LTTS_STRIDE
+                )
+        except (OSError, KeyError, ImportError):
+            found = None
+        self._fit_ltts_cache = found
+        return found
+
     def fit_scalar_params(
         self,
         band: Tuple[float, float] = (1e-4, 2.5e-2),
         tdi_generation: int = 2,
+        ltts=None,
     ) -> Tuple[float, float]:
         """Estimate scalar ``(Soms_d, Sa_a)`` from the tabulated estimates.
 
         The TDI instrument PSD is linear in ``(Soms_d**2, Sa_a**2)``, so a
-        weighted linear least-squares of the analytic X-channel model against
-        the time-averaged tabulated diagonals over ``band`` recovers the
+        weighted linear least-squares of the analytic model against the
+        time-averaged tabulated diagonals over ``band`` recovers the
         parameters exactly (1/S weighting so each decade counts equally).
         Only meaningful for ``which="xyz"``.
+
+        THE ARM MODEL MATTERS AT THE 0.5% LEVEL. The real constellation's six
+        link delays differ by ~0.4%, which splits the three XYZ auto-spectra
+        and shifts the transfer functions. Fitting an equal-arm ``X2TDISens``
+        (one armlength, one X response reused on all three diagonals) to a
+        real brick lands the levels **low** -- measured 2026-09-23 on
+        mojito-light, whose injection is exactly ``(1.5e-11, 3e-15)``:
+
+        ============================  ============  ============
+        arm model                     Soms_d        Sa_a
+        ============================  ============  ============
+        equal-arm                     1.496182e-11  2.982412e-15
+        unequal-arm (brick ``/ltts``) 1.500004e-11  3.000107e-15
+        ============================  ============  ============
+
+        i.e. 0.26% / 0.59% low in amplitude, 0.5% / 1.2% in power. That matters
+        because this pair is what every noise-only accuracy statement is scored
+        against, and (through ``psd_from_noise_file``) what the fixed-PSD
+        variants hold their noise at. So the delays are used whenever they can
+        be resolved; see :meth:`_resolve_fit_ltts`.
+
+        Args:
+            band: Frequency range of the tabulated grid to fit over.
+            tdi_generation: 1 or 2. Generation 1 always takes the equal-arm
+                path -- the unequal-arm closed forms are TDI-2 only.
+            ltts: Optional ``(6,)`` link delays in :data:`UNEQUAL_ARM_LINKS`
+                order, overriding the brick's own table.
 
         Returns:
             ``(Soms_d, Sa_a)`` in linear (square-root) units, the convention
@@ -6130,17 +6208,35 @@ class MojitoNoiseEstimates(NoiseComponent):
         if not mask.any():
             raise ValueError(f"band {band} has no overlap with the tabulated grid.")
         fb = est_f[mask]
-        Xsens = _XYZ_ELEMENT_SENS[tdi_generation][0]
-        orbits = lisa_models.DefaultOrbits()
-        # LISAModel carries the SQUARED levels; unit-basis responses give the
-        # linear-model columns.
-        resp_oms = Xsens.get_Sn(fb, model=lisa_models.LISAModel(1.0, 0.0, orbits, "oms_basis"))
-        resp_acc = Xsens.get_Sn(fb, model=lisa_models.LISAModel(0.0, 1.0, orbits, "acc_basis"))
+
+        delays = self._resolve_fit_ltts(ltts, tdi_generation)
+        if delays is None:
+            Xsens = _XYZ_ELEMENT_SENS[tdi_generation][0]
+            orbits = lisa_models.DefaultOrbits()
+            # LISAModel carries the SQUARED levels; unit-basis responses give
+            # the linear-model columns. Equal arms -> one response for all
+            # three diagonals.
+            resp_oms = Xsens.get_Sn(
+                fb, model=lisa_models.LISAModel(1.0, 0.0, orbits, "oms_basis")
+            )
+            resp_acc = Xsens.get_Sn(
+                fb, model=lisa_models.LISAModel(0.0, 1.0, orbits, "acc_basis")
+            )
+            cols = [(resp_oms, resp_acc)] * self.nchannels
+        else:
+            b_oms, b_acc = unequal_arm_tdi2_unit_covariances(fb, delays)
+            # each channel gets its OWN response: with unequal arms
+            # XX != YY != ZZ.
+            cols = [
+                (np.real(np.asarray(b_oms)[i, i]), np.real(np.asarray(b_acc)[i, i]))
+                for i in range(self.nchannels)
+            ]
+
         rows, rhs = [], []
         for i in range(self.nchannels):
             target = avg[mask, i, i]
             w = 1.0 / target
-            rows.append(np.stack([resp_oms * w, resp_acc * w], axis=1))
+            rows.append(np.stack([cols[i][0] * w, cols[i][1] * w], axis=1))
             rhs.append(target * w)
         coef, *_ = np.linalg.lstsq(np.vstack(rows), np.concatenate(rhs), rcond=None)
         if coef[0] < 0 or coef[1] < 0:
@@ -6156,13 +6252,16 @@ def estimate_noise_params_from_file(
     *,
     band: Tuple[float, float] = (1e-4, 2.5e-2),
     tdi_generation: int = 2,
+    ltts=None,
 ) -> Tuple[float, float]:
     """``(Soms_d, Sa_a)`` fit to a mojito NOISE brick's tabulated estimates.
 
-    Thin wrapper over :meth:`MojitoNoiseEstimates.fit_scalar_params`.
+    Thin wrapper over :meth:`MojitoNoiseEstimates.fit_scalar_params`, which
+    uses the brick's own ``/ltts`` (unequal arms) whenever they are there --
+    see that method for why the arm model is worth 0.26% / 0.59%.
     """
     return MojitoNoiseEstimates(path).fit_scalar_params(
-        band=band, tdi_generation=tdi_generation
+        band=band, tdi_generation=tdi_generation, ltts=ltts
     )
 
 

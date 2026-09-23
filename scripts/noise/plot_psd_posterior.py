@@ -3,8 +3,11 @@
     python scripts/noise/plot_psd_posterior.py <store_dir> <out.png> [burnin]
 
 Colors are the data-viz reference palette (categorical slots 1-2 + the
-blue sequential ramp). TRUTH is the NOISE brick's own value; override via
-PSD_TRUTH="soms,saa".
+blue sequential ramp). TRUTH comes from ``psd_truth_levels``: PSD_TRUTH if
+set, else the brick's tabulated estimates refitted with the UNEQUAL-arm model,
+else mojito-light's round injection. Do NOT paste a literal back in -- the old
+1.496182e-11 / 2.982412e-15 was the EQUAL-arm fit, 0.26% / 0.59% low, and the
+truth marker landed off the posterior (2026-09-23).
 """
 import os, sys, h5py, numpy as np
 import matplotlib
@@ -16,9 +19,11 @@ STORE = sys.argv[1]
 OUT = sys.argv[2]
 BURN = int(sys.argv[3]) if len(sys.argv) > 3 else 50
 
-# truth: read from the NOISE brick by the run itself
-TRUTH = np.array([float(x) for x in os.environ.get(
-    "PSD_TRUTH", "1.496182e-11,2.982412e-15").split(",")])
+# truth: resolved, never a literal (see the module docstring)
+from lisatools.globalfit.stock.erebor.noise import psd_truth_levels
+
+TRUTH = np.array(psd_truth_levels(
+    mojito_data_path=os.environ.get("MOJITO_DATA_PATH")))
 SCALE = np.array([1e-12, 1e-15])          # -> pm , fm/s^2 : readable axis numbers
 LAB = [r"$S_{\rm oms,d}$  [$10^{-12}$ m]", r"$S_{\rm a,a}$  [$10^{-15}$ m s$^{-2}$]"]
 

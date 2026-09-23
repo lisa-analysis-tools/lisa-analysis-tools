@@ -755,6 +755,67 @@ def noise_params_from_file(
     return [soms_d, sa_a]
 
 
+#: The instrument levels the mojito-light v1.0.0 bricks are built with. Used
+#: only when no brick is reachable -- a measured fit against the brick's own
+#: tabulated estimates is preferred, and recovers these to 3e-6 / 4e-5.
+MOJITO_LIGHT_PSD_INJECTION = (1.5e-11, 3.0e-15)
+
+
+def psd_truth_levels(
+    noise_file: typing.Optional[str] = None,
+    mojito_data_path: typing.Optional[str] = None,
+    default: typing.Tuple[float, float] = MOJITO_LIGHT_PSD_INJECTION,
+) -> typing.Tuple[float, float]:
+    """``(Soms_d, Sa_a)`` to draw as the truth line on a noise plot.
+
+    The one place the diagnostic pages should get this pair. Resolution order:
+
+    1. ``PSD_TRUTH="<soms_d>,<sa_a>"`` in the environment — an explicit
+       override for a run against a non-stock brick;
+    2. the NOISE brick's own tabulated estimates via
+       :func:`noise_params_from_file`, i.e. the unequal-arm fit at the brick's
+       ``/ltts``;
+    3. ``default``.
+
+    WHY THIS EXISTS. The pair used to be copy-pasted as a literal into every
+    generator (``1.496182e-11, 2.982412e-15``). That literal came from the
+    EQUAL-arm fit, which lands 0.26% / 0.59% low (see
+    :meth:`~lisatools.sensitivity.MojitoNoiseEstimates.fit_scalar_params`), so
+    every page drew its truth line in the wrong place and a 6-month noise-only
+    fit that is accurate to -0.02% / -0.22% read as biased by +0.23% / +0.37%.
+    Five copies of a number nobody re-derived is how that survived; resolve it
+    here instead.
+
+    Args:
+        noise_file: Explicit path to a mojito NOISE L1 brick.
+        mojito_data_path: Brick-market root to auto-discover the NOISE file
+            under, when ``noise_file`` is not given.
+        default: Returned when neither the environment nor a brick provides
+            the levels — snapshot pages routinely run where the 5.9 GB brick
+            is not present.
+
+    Returns:
+        ``(Soms_d, Sa_a)`` in linear (square-root) units.
+    """
+    env = os.environ.get("PSD_TRUTH")
+    if env:
+        parts = [p for p in env.replace(",", " ").split() if p]
+        if len(parts) != 2:
+            raise ValueError(
+                f'PSD_TRUTH must be "<Soms_d>,<Sa_a>"; got {env!r}.'
+            )
+        return (float(parts[0]), float(parts[1]))
+
+    path = noise_file
+    if path is None and mojito_data_path is not None:
+        path = resolve_noise_file(mojito_data_path, None)
+    if path is not None:
+        params = noise_params_from_file(path)
+        if params is not None:
+            return (float(params[0]), float(params[1]))
+    return (float(default[0]), float(default[1]))
+
+
 def prepare_psd_branch(psd, psd_injection=None):
     """Fill the 2-param instrument PSD prior, transform, and (optional) injection.
 

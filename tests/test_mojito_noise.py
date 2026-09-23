@@ -51,6 +51,35 @@ def _analytic_table(n_days=8, n_freq=800, drift=0.0):
     return times, freqs, cov
 
 
+class PsdTruthLevelsTest(unittest.TestCase):
+    """The truth pair the monitor/compare pages overlay."""
+
+    def test_env_override_wins(self):
+        from lisatools.globalfit.stock.erebor.noise import psd_truth_levels
+
+        old = os.environ.get("PSD_TRUTH")
+        os.environ["PSD_TRUTH"] = "1.1e-11,2.2e-15"
+        try:
+            self.assertEqual(psd_truth_levels(), (1.1e-11, 2.2e-15))
+        finally:
+            os.environ.pop("PSD_TRUTH", None)
+            if old is not None:
+                os.environ["PSD_TRUTH"] = old
+
+    def test_falls_back_to_the_round_injection_when_no_brick(self):
+        from lisatools.globalfit.stock.erebor.noise import psd_truth_levels
+
+        old = os.environ.pop("PSD_TRUTH", None)
+        try:
+            self.assertEqual(
+                psd_truth_levels(mojito_data_path="/nonexistent_mojito_dir/"),
+                (1.5e-11, 3.0e-15),
+            )
+        finally:
+            if old is not None:
+                os.environ["PSD_TRUTH"] = old
+
+
 class ComponentTest(unittest.TestCase):
     def _comp(self, drift=0.0, **kwargs):
         comp = MojitoNoiseEstimates("/nonexistent/noise_brick.h5", **kwargs)
@@ -112,6 +141,36 @@ class ComponentTest(unittest.TestCase):
         soms, sa = comp.fit_scalar_params()
         self.assertLess(abs(soms / SOMS_TRUE - 1), 1e-6)
         self.assertLess(abs(sa / SA_TRUE - 1), 1e-6)
+
+    def test_fit_scalar_params_unequal_arm_table(self):
+        """An UNEQUAL-arm table must be fitted with the unequal-arm model.
+
+        The equal-arm ``X2TDISens`` used for a table built from six distinct
+        link delays lands the levels low (~0.26% in Soms_d, ~0.59% in Sa_a on
+        the mojito-light delays), because it assumes one armlength and reuses
+        a single X-channel response for all three diagonals.
+        """
+        from lisatools.sensitivity import unequal_arm_tdi2_unit_covariances
+
+        # mojito-light run-mean directed delays, UNEQUAL_ARM_LINKS order
+        ltts = np.array(
+            [8.33035514, 8.31804494, 8.28917420,
+             8.28999371, 8.31821040, 8.32935825]
+        )
+        freqs = np.logspace(-5, 0, 800)
+        b_oms, b_acc = unequal_arm_tdi2_unit_covariances(freqs, ltts)
+        full = np.real(
+            SOMS_TRUE**2 * np.asarray(b_oms) + SA_TRUE**2 * np.asarray(b_acc)
+        )  # (3, 3, Nf)
+        cov = np.broadcast_to(
+            np.moveaxis(full, (0, 1, 2), (1, 2, 0)), (4, freqs.size, 3, 3)
+        ).copy()
+
+        comp = MojitoNoiseEstimates("/nonexistent/noise_brick.h5")
+        comp._tab = (np.arange(4) * 86400.0, freqs, cov)
+        soms, sa = comp.fit_scalar_params(ltts=ltts)
+        self.assertLess(abs(soms / SOMS_TRUE - 1), 1e-3)
+        self.assertLess(abs(sa / SA_TRUE - 1), 1e-3)
 
     def test_pickle_drops_cache(self):
         comp = self._comp()
@@ -202,6 +261,28 @@ class RealBrickTest(unittest.TestCase):
         # the mojito-light sim runs near-scird levels
         self.assertLess(abs(soms / 15e-12 - 1), 0.05)
         self.assertLess(abs(sa / 3e-15 - 1), 0.05)
+
+    def test_fit_recovers_the_round_injection_levels(self):
+        """mojito-light injects exactly 1.5e-11 / 3e-15 -- recover them.
+
+        This is the reference every noise-only accuracy statement is scored
+        against, so a 0.26% / 0.59% offset here reads as a fit bias that does
+        not exist. Recovering the round numbers requires fitting the brick's
+        tabulated estimates with the UNEQUAL-arm model at its own ``/ltts``,
+        which is what the runs themselves use.
+        """
+        from lisatools.sensitivity import estimate_noise_params_from_file
+
+        soms, sa = estimate_noise_params_from_file(_find_brick())
+        self.assertLess(abs(soms / 1.5e-11 - 1), 5e-4, f"Soms_d = {soms:.6e}")
+        self.assertLess(abs(sa / 3.0e-15 - 1), 1e-3, f"Sa_a = {sa:.6e}")
+
+    def test_psd_truth_levels_reads_the_brick(self):
+        from lisatools.globalfit.stock.erebor.noise import psd_truth_levels
+
+        soms, sa = psd_truth_levels(noise_file=_find_brick())
+        self.assertLess(abs(soms / 1.5e-11 - 1), 5e-4)
+        self.assertLess(abs(sa / 3.0e-15 - 1), 1e-3)
 
     def test_matrix_from_file(self):
         wdm = WDMSettings(
