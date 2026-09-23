@@ -1,7 +1,8 @@
 """
 Preprocessing module for loading and handling Mojito L1 files.
 
-Credits for most of the signal processing functions to Ollie Burke and Martina Muratore for the repository: https://github.com/OllieBurke/mojito-noise-sprint/blob/main/Mojito_Sprint/
+Credits for most of the signal processing functions to Ollie Burke and Martina Muratore for the repository: https://github.com/OllieBurke/mojito-noise-sprint/blob/main/Mojito_Sprint
+and to Federico Pozzoli for the integration of the filters response.
 """
 
 import dataclasses
@@ -14,6 +15,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 from mojito import MojitoL1File
 from MojitoProcessor import SignalProcessor as MPSignalProcessor
+from scipy import signal
+try:
+    from scipy.signal import freqz_sos                  # SciPy >= 1.15
+except ImportError:
+    from scipy.signal import sosfreqz as freqz_sos
+
 from tqdm import tqdm
 
 from ..domains import DomainBase
@@ -44,6 +51,24 @@ if not logger.handlers:
 
 ALLOWED_SOURCES = ["NOISE", "GB", "VGB", "MBHB", "EMRI", "SOBHB"]
 
+def _butter(n, wn, **kw):
+            return signal.butter(n, wn, **kw)
+
+def _bessel(n, wn, **kw):
+    return signal.bessel(n, wn, **kw)
+
+def _cheby1(n, wn, **kw):
+    return signal.cheby1(n, 1.0, wn, **kw)
+
+def _cheby2(n, wn, **kw):
+    return signal.cheby2(n, 40.0, wn, **kw)
+
+filter_funcs = {
+    "butterworth": _butter,
+    "bessel": _bessel,
+    "chebyshev1": _cheby1,
+    "chebyshev2": _cheby2,
+}
 
 def find_file(folder: str, source_type: str, source_id: int) -> str:
     """
@@ -115,9 +140,9 @@ class L1DataLoader:
         self,
         L1_folder: str,
         source_types: list,
-        source_ids: dict = None,
-        orbits_class: Orbits = L1Orbits,
-        orbits_kwargs: dict = None,
+        source_ids: Optional[dict] = None,
+        orbits_class: Orbits | L1Orbits = L1Orbits,
+        orbits_kwargs: Optional[dict] = None,
         verbose: bool = True,
         store_individual_timeseries: bool = False,  # whether to store individual timeseries for each source type and ID
     ):
@@ -842,12 +867,12 @@ class BaseProcessingStep(SignalProcessor):
 
     def process(
         self,
-        highpass_kwargs: dict = None,
-        lowpass_kwargs: dict = None,
-        bandpass_kwargs: dict = None,
-        downsample_kwargs: dict = None,
-        trim_kwargs: dict = None,
-        Tobs: float = None,
+        highpass_kwargs: Optional[dict] = None,
+        lowpass_kwargs: Optional[dict] = None,
+        bandpass_kwargs: Optional[dict] = None,
+        downsample_kwargs: Optional[dict] = None,
+        trim_kwargs: Optional[dict] = None,
+        Tobs: Optional[float] = None,
         **kwargs,
     ) -> tuple:
         """
