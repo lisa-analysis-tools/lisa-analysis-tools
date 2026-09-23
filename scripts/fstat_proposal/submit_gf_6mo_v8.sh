@@ -2298,6 +2298,10 @@ export GB_FSTAT_CTR_BATCH
 : "${GB_FSTAT_NM_LANE_WEIGHTS:=}"
 export GB_FSTAT_NM_LANE_WEIGHTS
 export GB_TEMPER_ON_REMOVAL=1      # band swaps run inside rj_prior_removal
+# rj_prior_removal proposes prior BIRTHS as well as deaths in this run
+# (what the 2026-09-21 hand edit did from stored iteration 300 on). The
+# code default is 1 = the original deaths-only pruning move.
+export GB_SEARCH_PRIOR_REMOVAL_ONLY=0
 # High-f barren-band birth shutoff (search scope): bands above FMIN with
 # AFTER consecutive zero-birth-accept proposes stop proposing births
 # (deaths + in-model continue; [GB_BAND_SHUTOFF] log line per band).

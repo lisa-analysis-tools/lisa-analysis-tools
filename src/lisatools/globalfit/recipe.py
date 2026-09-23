@@ -3080,10 +3080,22 @@ def build_gb_moves(
 
     # Phase-maximised RJ births for the prior moves (two-quadrature
     # analytic maximisation in the band engines; the accepted phi0 is
-    # rotated to the maximum). GB_RJ_PHASE_MAXIMIZE=1 turns it on --
-    # gb_no_foreground defaults it ON under GB_MODE=search (the
-    # "annealing" configuration) and OFF otherwise.
-    _rj_phase_max = bool(int(os.environ.get("GB_RJ_PHASE_MAXIMIZE", "0")))
+    # rotated to the maximum). GB_RJ_PHASE_MAXIMIZE=1 turns it on; the
+    # default is OFF and no stock variant overrides it any more. LOGGED
+    # (user request 2026-09-22): the 6mo submit script mentions the knob
+    # only in a comment, so the value in force was invisible in the logs.
+    _rj_phase_max_env = os.environ.get("GB_RJ_PHASE_MAXIMIZE")
+    _rj_phase_max = bool(int(_rj_phase_max_env or "0"))
+    logger.info(
+        "GB RJ phase maximization = %s (GB_RJ_PHASE_MAXIMIZE %s) -> "
+        "rj_fstat_search / rj_prior_removal / search rj_replace births "
+        "%s.",
+        "ON" if _rj_phase_max else "OFF",
+        "unset, default" if _rj_phase_max_env is None
+        else f"= {_rj_phase_max_env!r}",
+        "scored at the two-quadrature maximum, phi0 rotated on accept"
+        if _rj_phase_max else "scored at the proposed phase",
+    )
 
     # Custom RJ-birth distribution hook (``GBSettings.rj_birth_distribution``):
     # an eryn duck-typed distribution over the full 8-column GB sampling
@@ -3388,20 +3400,35 @@ def build_gb_moves(
         gb_in_model_move.install_walker_fanout(curr)
 
     gb_prior_removal_move = None
-    print("CHECK FOR CHANGE MICHAEL MADE!")
     if _gb_mode_search and getattr(gb_info, "search_prior_removal", False):
+        # rj_removal_only: True = the original pruning move (births
+        # force-rejected, deaths judged against the prior); False = the
+        # prior container proposes BOTH births and deaths. The hand edit
+        # of 2026-09-21 (6mo jobs 596+, stored iteration 300 on) ran
+        # False; promoted to ``GBSettings.search_prior_removal_only`` /
+        # GB_SEARCH_PRIOR_REMOVAL_ONLY on 2026-09-22 -- default True
+        # (user ruling), the 6mo submit script exports 0.
+        _prior_removal_only = bool(
+            getattr(gb_info, "search_prior_removal_only", True))
+        logger.info(
+            "rj_prior_removal: rj_removal_only = %s (%s) "
+            "[GB_SEARCH_PRIOR_REMOVAL_ONLY]",
+            _prior_removal_only,
+            "deaths only" if _prior_removal_only
+            else "prior births AND deaths",
+        )
         gb_prior_removal_move = GBSpecialRJPriorMove(
             *gb_move_args,
             rj_proposal_distribution=gpu_priors,  # THE prior container
             name="rj_prior_removal",
-            rj_removal_only=False,  # True,
+            rj_removal_only=_prior_removal_only,
             # Follows GB_RJ_PHASE_MAXIMIZE, same as rj_fstat_search (user
             # ruling 2026-09-02: "phase maximization on for the prior
-            # removal just like fstat"). What it arms here is the move's
-            # IN-MODEL repeat scoring (two-quadrature, rotation-on-accept);
-            # the RJ side is unaffected in practice -- this move proposes
-            # deaths only (births 0 throughout in the r2 probes) and deaths
-            # always keep the true phase. The old hard False also leaned on
+            # removal just like fstat"). It arms the move's IN-MODEL repeat
+            # scoring (two-quadrature, rotation-on-accept) and, when births
+            # are enabled (removal_only False), the prior births exactly as
+            # in rj_fstat_search; deaths always keep the true phase, so the
+            # removal-only mode is unaffected. The old hard False also leaned on
             # amp-pin/dist-birth ctor defaults following it; both are now
             # independent knobs (GB_RJ_AMP_MAXIMIZE decoupled 0e4e45d7,
             # GB_RJ_FSTAT_DIST_BIRTH env-pinned), so nothing else moves.

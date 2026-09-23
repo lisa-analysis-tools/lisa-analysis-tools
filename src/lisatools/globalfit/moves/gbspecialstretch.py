@@ -17207,6 +17207,74 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         np.add.at(out[w], nb[w][m2], 1)
         return out
 
+    def _log_cap_increments(self, new_state, band_counts, inc, cap, iters,
+                            best, cur_max, occ_w, max_cells=24, max_src=8):
+        """Log, for every cell whose cap is about to rise, what drove it.
+
+        One ``[GB_CAP_INC <move>]`` line per cell: the cell index and its
+        edges (mHz), the cap before -> after, the per-cold-walker occupancy
+        the gate USED (``gate_occ``, None outside the improvement gate),
+        an independent RECOUNT of the same census from the state as it
+        stands, the patience counter, the running best / current max cell
+        lnL, and the cold sources inside the cell per walker as
+        ``f0[mHz]/col0`` (col 0 is the first sampling column: distance in
+        the 9-column basis). ``gate_occ != recount`` on a line is the
+        smoking gun for the census question; the source lists say which
+        binaries are asking for room.
+
+        Diagnostic only -- reads the state, mutates nothing. Volume is
+        bounded (``max_cells`` cells per call, ``max_src`` sources per
+        walker); increments run 2-6 cells per iteration in production.
+        """
+        branch = self._work_branch(new_state)
+        coords = _to_numpy(branch.coords[0])
+        inds = _to_numpy(branch.inds[0]).astype(bool)
+        be = _to_numpy(self.band_edges)
+        f0_hz = coords[..., 1] / 1e3
+        band = np.clip(np.searchsorted(be, f0_hz, side="right") - 1,
+                       0, self.num_bands - 1)
+        if self._cap_is_band_grid:
+            cell, edges = band, be
+        else:
+            cell, _nb, _has_nb = self._np_cap_members(f0_hz, band, be)
+            edges = _to_numpy(self.cap_edges)
+        nw = coords.shape[0]
+        occ_w = None if occ_w is None else np.asarray(occ_w)
+        logger.info(
+            f"[GB_CAP_INC {self.name}] {len(inc)} cell(s) incrementing; "
+            f"branch coords {tuple(branch.coords.shape)}, cold census over "
+            f"{nw} walker(s), grid={'band' if self._cap_is_band_grid else 'cap cells'}"
+        )
+        for k in inc[:max_cells]:
+            k = int(k)
+            lo = float(edges[k]) * 1e3
+            hi = float(edges[k + 1]) * 1e3 if k + 1 < len(edges) else float("nan")
+            recount = [int(((cell[w] == k) & inds[w]).sum()) for w in range(nw)]
+            gate = None if occ_w is None else [int(v) for v in occ_w[:, k]]
+            parts = []
+            for w in range(nw):
+                m = (cell[w] == k) & inds[w]
+                if not m.any():
+                    continue
+                rows = coords[w][m]
+                order = np.argsort(rows[:, 1])[:max_src]
+                parts.append(
+                    f"w{w}: "
+                    + " ".join(f"{rows[i, 1]:.5f}/{rows[i, 0]:.3g}" for i in order)
+                    + (" ..." if int(m.sum()) > max_src else "")
+                )
+            logger.info(
+                f"[GB_CAP_INC {self.name}] cell {k} [{lo:.4f},{hi:.4f}) mHz "
+                f"cap {int(cap[k])}->{int(cap[k]) + 1} gate_occ={gate} "
+                f"recount={recount} iters={int(iters[k])} "
+                f"best={float(best[k]):.2f} cur_max={float(cur_max[k]):.2f} | "
+                + (" | ".join(parts) if parts else "NO cold sources in cell")
+            )
+        if len(inc) > max_cells:
+            logger.info(
+                f"[GB_CAP_INC {self.name}] ... {len(inc) - max_cells} more "
+                "cell(s) not detailed (max_cells)")
+
     def _rj_birth_perrow(self) -> bool:
         """Per-row F-stat centers for this move's fstat births/deaths?
 
@@ -17609,6 +17677,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 bi["band_cold_ll"][:] = lls
         cur_max = lls.max(axis=0)
         _occ_max = None
+        _occ_w = None   # per-cold-walker census the gate used (diag below)
 
         if self.leaf_cap_ll_improve:
             # Coarse likelihood-based gate: a band's cap holds while the
@@ -17813,6 +17882,21 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         _unit = "cap cells" if not self._cap_is_band_grid else "bands"
         if np.any(converged):
             inc = np.where(converged)[0]
+            # Per-cell increment diagnostic (user request 2026-09-22): the
+            # store cannot say which sources drive a cap rise, and on the
+            # 6mo snapshot-19 store the occupancy-at-cap condition could
+            # not be reproduced for 52 of 54 increments under any census.
+            # Runs BEFORE the counters are mutated so it reports the state
+            # the gate actually judged. GB_CAP_INC_DIAG=0 silences it.
+            if os.environ.get("GB_CAP_INC_DIAG", "1") == "1":
+                try:
+                    self._log_cap_increments(
+                        new_state, band_counts, inc, cap, iters, best,
+                        cur_max, _occ_w)
+                except Exception as exc:  # diag must never break the gate
+                    logger.warning(
+                        f"{self.name}: [GB_CAP_INC] diagnostic failed: "
+                        f"{exc!r}")
             cap[converged] += 1
             iters[converged] = 0
             best[converged] = -np.inf

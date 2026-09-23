@@ -677,12 +677,22 @@ class GBSettings(Settings):
     pe_rj_replace: bool = dataclasses.field(
         default_factory=env_default("GB_PE_RJ_REPLACE", True, bool)
     )
-    # search_prior_removal: build + install the removal-only pruning move
-    # ``rj_prior_removal`` (GBSpecialRJPriorMove with the PRIOR container +
-    # rj_removal_only=True: births force-rejected, deaths untouched). Env:
+    # search_prior_removal: build + install the prior-container RJ move
+    # ``rj_prior_removal`` (GBSpecialRJPriorMove with the PRIOR container;
+    # what it proposes is ``search_prior_removal_only`` below). Env:
     # GB_SEARCH_PRIOR_REMOVAL.
     search_prior_removal: bool = dataclasses.field(
         default_factory=env_default("GB_SEARCH_PRIOR_REMOVAL", False, bool)
+    )
+    # search_prior_removal_only: what ``rj_prior_removal`` proposes. True
+    # (default, user ruling 2026-09-22): the original pruning move --
+    # births force-rejected, only deaths are judged against the prior.
+    # False: the prior container proposes BOTH births and deaths -- the
+    # configuration the 6mo production run has used since stored iteration
+    # 300 (2026-09-21, first as a hand edit in recipe.py); the 6mo submit
+    # script exports 0 for that reason. Env: GB_SEARCH_PRIOR_REMOVAL_ONLY.
+    search_prior_removal_only: bool = dataclasses.field(
+        default_factory=env_default("GB_SEARCH_PRIOR_REMOVAL_ONLY", True, bool)
     )
     # leaf_cap_iter_only: per-band progressive leaf caps advance on a FIXED
     # schedule -- the only gate is ``iters >= GB_LEAF_CAP_MIN_ITERS`` (the
