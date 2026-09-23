@@ -244,6 +244,78 @@ def sens_grids(psd_p, gal_p, df):
     return sa, se
 
 
+def find_l1_brick(path=None):
+    """Any mojito L1 file -- they all carry the same orbits/ltt tables."""
+    import glob
+    if path:
+        return path
+    for root in (os.environ.get("MOJITO_DATA_PATH"),
+                 os.path.expanduser("~/.mojito_cache")):
+        if not root or not os.path.isdir(root):
+            continue
+        hits = sorted(glob.glob(os.path.join(root, "**", "*_L1_*.h5"),
+                                recursive=True))
+        if hits:
+            return hits[0]
+    return None
+
+
+def l1_orbits(stride=200, path=None, frame="icrs"):
+    """The INJECTED (mojito L1) orbits, with the light-travel-time table strided.
+
+    THIS IS NOT A REFINEMENT, IT IS THE DIFFERENCE BETWEEN RIGHT AND WRONG.
+    Measured at 7.44-7.60 mHz on the 6mo store (2026-09-23), swapping the
+    analytic ``DefaultOrbits`` ephemeris for these:
+
+        template-vs-injection overlap   0.052 -> 0.580,  0.368 -> 0.982,
+                                        0.262 -> 0.962
+        optimal SNR                     7.96 -> 8.69,   32.81 -> 42.67
+
+    The analytic ephemeris differs from the mojito orbits by the full
+    annual-Doppler phase at the run epoch, so anything above a few mHz --
+    SNRs, overlaps, the detectable denominator -- is simply a different
+    number. Phase-MAXIMISED overlaps do not rescue it.
+
+    Why striding is exact: the C++ side interpolates ltt linearly in
+    ``(t - ltt_t0) / ltt_dt`` (``Detector.cu`` ``get_window`` ->
+    ``interpolate``) and light travel times vary on ORBITAL timescales -- an
+    8.3 s travel time changing by ~1% over a year. Sampling them every
+    ``stride * 2.5`` s instead of every 2.5 s leaves a linear-interpolation
+    error of ~1e-15 s, and turns a 1.2 GB table (plus its C++ copy) into
+    1.5 MB. That is what lets this run on a laptop.
+
+    Returns ``(orbits, path)``, or ``(None, reason)`` when no brick is found.
+    """
+    from lisatools import detector as lisa_models
+    fp = find_l1_brick(path)
+    if fp is None:
+        return None, ("no mojito L1 brick under MOJITO_DATA_PATH or "
+                      "~/.mojito_cache")
+
+    class _StridedL1(lisa_models.L1Orbits):
+        def _setup(self):
+            with self.open() as f:
+                self.ltt = np.ascontiguousarray(f.ltts.ltts[::stride])
+                try:
+                    self.ltt_t = f.ltts.time_sampling.t(slice(0, None, stride))
+                except TypeError:
+                    self.ltt_t = f.ltts.time_sampling.t()[::stride]
+                self.x_base = f.orbits.positions[:]
+                self.v_base = f.orbits.velocities[:]
+                self.sc_t_base = f.orbits.time_sampling.t()
+                self.size_base = self.sc_t_base.shape[0]
+                self.dt_base = float(f.orbits.time_sampling.dt)
+                self.ltt_dt = float(f.ltts.time_sampling.dt) * stride
+                self.sc_dt = f.orbits.time_sampling.dt
+                self.ltt_t0 = float(self.ltt_t[0])
+                self.sc_t0 = float(self.sc_t_base[0])
+
+    orb = _StridedL1(fp, force_backend="cpu", frame=frame,
+                     linear_interp_dt=500.0)
+    orb._ensure_configured()
+    return orb, fp
+
+
 def catalogue_phys(t_ref, flo=FLO, fhi=FHI, catalogue=None):
     """(N,9) GBGPU physical rows for every catalogue GB in [flo, fhi].
 
@@ -329,6 +401,10 @@ def main(argv=None):
                     help="GB catalogue hdf5, or the directory holding it. "
                          "Overrides MOJITO_CAT and MOJITO_CACHE_DIR; "
                          f"default {MOJITO_CAT_DEFAULT}")
+    ap.add_argument("--analytic-orbits", action="store_true",
+                    help="build on DefaultOrbits instead of the injected "
+                         "mojito L1 orbits. Reproduces truth sets made before "
+                         "2026-09-23; wrong above a few mHz (see l1_orbits).")
     ap.add_argument("--batch", type=int, default=20000,
                     help="waveform rows per run_wave call (default 20000); "
                          "lower it if the build runs out of memory")
@@ -352,7 +428,24 @@ def main(argv=None):
     from lisatools import detector as lisa_models
     from lisatools.globalfit.stock.erebor.variants.gb_no_fg import (
         GB_MOJITO_T_REF)
-    orb = lisa_models.DefaultOrbits(force_backend="cpu", frame="icrs")
+    # THE INJECTED ORBITS BY DEFAULT (2026-09-23). This file used to build
+    # every truth set on the analytic ephemeris, which put the monitor in a
+    # mixed state: the page's own overlap/SNR block uses the mojito orbits
+    # when it can reach them, while the detectable DENOMINATOR, the SNR axis
+    # of the recovery curve and column 1 of the #detect table came from here.
+    # The two disagree by tens of percent above a few mHz (see l1_orbits).
+    orb, orb_src = (None, "--analytic-orbits requested")
+    if not a.analytic_orbits:
+        orb, orb_src = l1_orbits()
+    orbits_tag = "mojito_l1"
+    if orb is None:
+        orbits_tag = "analytic"
+        print(f"WARNING: building on the ANALYTIC ephemeris ({orb_src}). "
+              "SNRs and the detectable set above a few mHz will not match "
+              "the monitor's own overlap block.")
+        orb = lisa_models.DefaultOrbits(force_backend="cpu", frame="icrs")
+    else:
+        print(f"orbits: mojito L1 {orb_src}")
     gbw = GBGPU(force_backend="cpu", orbits=orb, t0=float(GB_MOJITO_T_REF))
 
     phys = catalogue_phys(GB_MOJITO_T_REF, flo, fhi, a.catalogue)
@@ -397,8 +490,10 @@ def main(argv=None):
         a.out, f0=phys[:, 1], amp=phys[:, 0], snr=snr, det=det, phys=phys,
         store=np.array(a.store), iteration=np.array(a.iteration),
         psd_params=psd_p, galfor_params=gal_p,
-        band=np.array([flo, fhi]), tobs=np.array(tobs), nw=np.array(nw))
-    print(f"wrote {a.out}")
+        band=np.array([flo, fhi]), tobs=np.array(tobs), nw=np.array(nw),
+        # STAMPED so the monitor can refuse to mix ephemerides silently.
+        orbits=np.array(orbits_tag))
+    print(f"wrote {a.out}  (orbits: {orbits_tag})")
     return 0
 
 
