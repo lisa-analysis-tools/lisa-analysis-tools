@@ -93,6 +93,8 @@ __all__ = [
     "FSTAT_KNOB_DEFAULTS",
     "fstat_knob",
     "fstat_peak_min_F",
+    "fstat_peak_min_F_stages",
+    "fstat_band_min_F",
     "fstat_n_f0",
     "fstat_n_mc",
     "fdot_axis_on",
@@ -175,6 +177,72 @@ def fstat_peak_min_F() -> float:
     if f:
         return float(f)
     return 0.5 * float(FSTAT_KNOB_DEFAULTS["FSTAT_PEAK_MIN_SNR"]) ** 2
+
+
+def fstat_peak_min_F_stages() -> tuple:
+    """``(coarse_F, fine_F)`` peak-selection floors, in F units.
+
+    The F-stat half of the per-(walker, band) search-stage schedule (user
+    request 2026-09-23). COARSE defaults to whatever :func:`fstat_peak_min_F`
+    already resolves to, so a run that sets neither stage knob behaves
+    exactly as it does today; FINE defaults to
+    ``FSTAT_PEAK_MIN_SNR_FINE`` (6.25, the landed 2026-09-23 knee value).
+
+    ⚠ THE CATALOG IS SHARED ACROSS WALKERS and always will be: the comb is
+    swept ONCE against ONE reference walker's residual, so there is no
+    walker axis for a peak list to have. A band's catalog floor is
+    therefore the LOOSER of the floors any walker holds there, and the
+    per-walker half of the schedule is carried by the opt-SNR boundary
+    (``GB_OPT_SNR_LIMIT_SEARCH_{COARSE,FINE}``), which IS per row.
+
+    That direction is deliberate under the standing recall-over-precision
+    ruling: a peak a walker is not ready for costs some proposal mass and
+    dies in that walker's own SNR gate, while a peak missing from the
+    catalog is invisible to every walker.
+    """
+    coarse_env = os.environ.get("FSTAT_PEAK_MIN_SNR_COARSE", "").strip()
+    coarse = (0.5 * float(coarse_env) ** 2 if coarse_env
+              else fstat_peak_min_F())
+    fine_env = os.environ.get("FSTAT_PEAK_MIN_SNR_FINE", "").strip()
+    fine = 0.5 * float(fine_env if fine_env else 6.25) ** 2
+    if fine > coarse:
+        raise ValueError(
+            f"FSTAT_PEAK_MIN_SNR_FINE resolves to F={fine:.3f} which is "
+            f"ABOVE the coarse floor F={coarse:.3f}. The stage schedule "
+            f"promotes COARSE -> FINE one way, on the premise that FINE "
+            f"admits strictly MORE peaks; inverted, promoting a band would "
+            f"shrink its catalog and the search would lose candidates it "
+            f"had already earned the right to see."
+        )
+    return (coarse, fine)
+
+
+def fstat_band_min_F(band_stage, num_bands: int):
+    """Per-band peak floor from a ``(nwalkers, nbands)`` stage table.
+
+    Returns a ``(num_bands,)`` array of F floors: a band gets the FINE
+    floor once ANY walker has promoted there (``stage.max(axis=0)``), for
+    the reason spelled out in :func:`fstat_peak_min_F_stages` -- one shared
+    catalog, so it must cover the loosest floor in force anywhere.
+
+    ``band_stage`` of ``None`` (feature off) returns ``None``, and every
+    caller then keeps the scalar floor it has always used.
+    """
+    if band_stage is None:
+        return None
+    coarse, fine = fstat_peak_min_F_stages()
+    stage = np.asarray(band_stage)
+    if stage.ndim == 2:
+        stage = stage.max(axis=0)
+    stage = stage.astype(int).reshape(-1)
+    if stage.shape[0] != int(num_bands):
+        raise ValueError(
+            f"band stage table covers {stage.shape[0]} bands but the peak "
+            f"grid has {int(num_bands)}. Per-peak ``band_idx`` labels index "
+            f"the band grid, so a mismatched stage table would loosen the "
+            f"floor in the wrong bands."
+        )
+    return np.where(stage >= 1, fine, coarse)
 
 
 def fstat_n_f0(box_width_mHz: float, Tobs_s: float) -> int:

@@ -91,6 +91,35 @@ CELL_AXIS = {
     "cap_cell_cold_ll": 2,
 }
 
+#: PER-WALKER cap family (``GB_LEAF_CAP_PER_WALKER``, 2026-09-22):
+#: on-disk name -> the shared per-cell array it is seeded from. These live
+#: on the SAME cell grid as their twins, so a cap-grid migration has to
+#: rebuild them too or the resume guard meets a cap table that does not
+#: cover the grid. Each is re-seeded from the freshly-migrated shared
+#: array, which is exactly the rule ``ensure_cap_cell_fields`` uses when
+#: the flag is first switched on: every walker inherits the shared cap.
+#:
+#: MIGRATED ONLY WHEN ALREADY PRESENT -- a store that never ran per-walker
+#: caps must not acquire them (and their datasets) from a grid migration.
+#:
+#: ``band_best_ll_w`` is deliberately absent: it is per BAND, so the cap
+#: grid moving underneath it changes nothing.
+CAP_CELL_PER_WALKER_SPEC = {
+    "cap_cell_leaf_cap_w": "cap_cell_leaf_cap",
+    "cap_cell_iters_w": "cap_cell_iters",
+    "cap_cell_best_ll_w": "cap_cell_best_ll",
+}
+
+
+def seed_per_walker_cells(cell_arr, nw):
+    """``(step, nc)`` -> ``(step, nw, nc)``, every walker inheriting the row.
+
+    A real copy, not a broadcast view: the walkers must be able to diverge
+    from the very next increment, and a view would move them together.
+    """
+    cell_arr = np.asarray(cell_arr)
+    return np.repeat(cell_arr[:, None, :], int(nw), axis=1)
+
 
 def split_to_cells(band_arr, axis, k):
     """Broadcast a per-band array to its ``k`` children along ``axis``.
@@ -199,6 +228,26 @@ def migrate(path, branch="gb", cap_divisor=8, stagger=False, dry_run=False,
                 dtype=new.dtype,
             )
             print(f"  wrote {name} {new.shape} {new.dtype}")
+
+        # PER-WALKER cap family: present only when the run used
+        # GB_LEAF_CAP_PER_WALKER. Re-seeded from the shared arrays just
+        # written above, so every walker inherits the migrated cap and its
+        # patience clock and divergence restarts from the next increment.
+        for name, src in CAP_CELL_PER_WALKER_SPEC.items():
+            if name not in grp:
+                continue
+            if nw is None:
+                print(f"  SKIPPED {name}: no band_cold_ll to size the "
+                      "walker axis from")
+                continue
+            new = seed_per_walker_cells(np.asarray(grp[src][:]), nw)
+            del grp[name]
+            grp.create_dataset(
+                name, data=new, maxshape=(None,) + new.shape[1:],
+                dtype=new.dtype,
+            )
+            print(f"  wrote {name} {new.shape} {new.dtype} "
+                  f"(re-seeded from {src})")
 
         grp.attrs["num_cap_cells"] = nc
         print(f"  attr num_cap_cells = {nc}")

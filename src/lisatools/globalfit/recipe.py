@@ -652,6 +652,7 @@ class Recipe:
             raise ValueError("Recipe is already finished.")
 
         self._current_recipe_step["adjust"].setup_run(iteration, last_sample, sampler)
+        self._announce_recipe_step()
         if self.fanout is not None:
             # Seed the fan-out clock BEFORE the first propose -- otherwise it
             # sits at its constructed 0 through the whole first iteration.
@@ -723,6 +724,7 @@ class Recipe:
             if self._current_iter >= len(self.recipe):
                 return True
             self._current_recipe_step["adjust"].setup_run(iteration, last_sample, sampler)
+            self._announce_recipe_step()
             if self.fanout is not None:
                 self.fanout.enter_stage(
                     self._current_recipe_step["name"],
@@ -730,6 +732,33 @@ class Recipe:
                 )
 
         return False
+
+    def _announce_recipe_step(self) -> None:
+        """Tell this step's moves which step they are now running under.
+
+        THE IDENTITY IS THE STEP INDEX (``_current_iter``), deliberately
+        NOT the backend iteration. A step's index is stable for as long as
+        that step is active, including across a mid-step restart -- the
+        cursor is rebuilt from the per-step ``status`` flags, which the
+        backend persists. The iteration number is not: on a resume it is
+        wherever the run got to, so anything keyed on it would read as a
+        NEW step and release state the step had legitimately earned.
+
+        That distinction is the whole reason this lives on ``Recipe``
+        rather than in ``RecipeStep.setup_run``. A step does not know its
+        own index; the recipe does. It also means a Stage subclass that
+        overrides ``setup_run`` without calling ``super()`` cannot silently
+        break the announcement.
+
+        Today's one consumer is the per-(walker, band) RJ shutoff valve,
+        which must HOLD for the whole of a step and release only when the
+        next one begins (user requirement 2026-09-24).
+        """
+        step = self._current_recipe_step
+        if step is None:
+            return
+        begin_search_recipe_step(
+            step["adjust"].moves, int(self._current_iter))
 
 
 class RecipeStep:
@@ -884,6 +913,100 @@ def _cap_headroom_deficit_total(moves) -> int:
         total += int(getattr(m, "_cap_headroom_deficit", 0) or 0)
         total += _cap_headroom_deficit_total(getattr(m, "moves", None))
     return total
+
+
+def band_shutoff_w_pending_total(moves) -> int:
+    """Occupied (walker, band) pairs not yet shut off, over a move tree.
+
+    The stage-convergence counter for the per-(walker, band) RJ shutoff
+    valve (``GB_SEARCH_BAND_SHUTOFF_PER_WALKER``), in the same shape as
+    :func:`_cap_ramp_pending_total`: ``0`` means fully converged.
+    ``GFCombineMove`` nests and weighted ``(move, weight)`` entries are
+    unwrapped, as there.
+
+    THE SANCTIONED CRITERION, in the user's own words (ruling 2026-09-24):
+
+        **"every occupied (walker, band) pair has shut off"**
+
+    OCCUPIED is load-bearing, and the word is why this ruling was asked for
+    explicitly. An EMPTY (walker, band) can never shut -- the valve requires
+    a non-zero source count, because a band that has found nothing has not
+    plateaued, it has not started -- so the looser phrasing "all bands and
+    walkers are shut off", which is what the original request said and what
+    will be in people's heads, would be unreachable in any run with an empty
+    band, i.e. every run. The difference is invisible until someone wonders
+    why a stage never ends, which is exactly why it is written out here.
+
+    Empty pairs remain the nleaves-plateau gate's business, which is why a
+    stage composes this WITH that gate rather than replacing it.
+
+    A move that does not publish the counter, or has not computed it yet,
+    contributes 0: the feature is off there, so it has no opinion and must
+    not hold a stage open. ⚠ THE COROLLARY: with the valve off everywhere
+    this returns 0, i.e. "converged", on the very first check. A stage that
+    uses it as its ONLY criterion must therefore also confirm the feature
+    is armed -- pair it with the nleaves-plateau gate (which is what the
+    existing stopping_function already is) rather than replacing that gate
+    outright.
+    """
+    total = 0
+    for m in list(moves or []):
+        if isinstance(m, (tuple, list)) and m:
+            m = m[0]
+        pending = getattr(m, "_shutoff_w_pending", None)
+        if pending is not None:
+            total += int(pending)
+        total += band_shutoff_w_pending_total(getattr(m, "moves", None))
+    return total
+
+
+def band_shutoff_w_armed(moves) -> bool:
+    """Is the per-(walker, band) RJ valve live on ANY move in the tree?
+
+    The companion to :func:`band_shutoff_w_pending_total`, and the guard
+    that makes it safe to use as a stage criterion: the pending count is 0
+    both when everything has converged and when nothing is armed, and only
+    this can tell those apart.
+    """
+    for m in list(moves or []):
+        if isinstance(m, (tuple, list)) and m:
+            m = m[0]
+        if getattr(m, "_shutoff_w_pending", None) is not None:
+            return True
+        if band_shutoff_w_armed(getattr(m, "moves", None)):
+            return True
+    return False
+
+
+def begin_search_recipe_step(moves, serial) -> None:
+    """Tell every move in the tree that a new recipe step has begun.
+
+    Walks a move tree the same way :func:`_arm_cap_headroom_grant` does
+    (``GFCombineMove`` nests; weighted ``(move, weight)`` entries are
+    unwrapped), calling ``begin_recipe_step(serial)`` on anything that
+    publishes one. Moves without the method are skipped, so this is inert
+    for every non-GB branch and for any GB build predating the feature.
+
+    Today the one consumer is the per-(walker, band) RJ shutoff valve,
+    which is SCOPED TO A STEP: a (walker, band) that has stopped paying in
+    lnL under this step's moves, caps and floors has said nothing about
+    the next step's, so the valve is released here rather than allowed to
+    persist.
+
+    ``serial`` identifies the STEP, and :meth:`Recipe._announce_recipe_step`
+    passes the step INDEX rather than an iteration number precisely so it
+    stays the same across a mid-step restart. Only a CHANGE releases, so
+    re-announcing an already-active step does not wipe a valve that step
+    earned -- which is what makes "hold for the whole step, release at the
+    next one" true across a resume and not only within one process.
+    """
+    for m in list(moves or []):
+        if isinstance(m, (tuple, list)) and m:
+            m = m[0]
+        fn = getattr(m, "begin_recipe_step", None)
+        if callable(fn):
+            fn(serial)
+        begin_search_recipe_step(getattr(m, "moves", None), serial)
 
 
 def _arm_cap_headroom_grant(moves) -> None:
@@ -2886,6 +3009,23 @@ def build_gb_moves(
     _resolved_ntemps = state.sub_states["gb"].initialize_band_information(
         nwalkers, ntemps, band_edges, band_temps, cap_edges=_cap_edges,
         branch_name="gb",
+        # Per-walker caps must be allocated HERE, at state init, not
+        # lazily at first gate access: the module backend derives its
+        # dataset set from storage_arrays() when it resets, so an array
+        # that first appeared mid-run would have no dataset to be
+        # written into.
+        leaf_cap_per_walker=bool(
+            getattr(gb_info, "leaf_cap_per_walker", False)
+        ),
+        # Same rule for the per-(walker, band) search-stage record and the
+        # per-walker RJ valve: allocated at state init or the backend has
+        # no dataset for them.
+        search_stage_per_walker=bool(
+            getattr(gb_info, "search_stage_per_walker", False)
+        ),
+        search_shutoff_per_walker=bool(
+            getattr(gb_info, "search_shutoff_per_walker", False)
+        ),
     )
     # RUNG RECONCILIATION (2026-08-15, mirrors build_vgb_moves): a resumed
     # store's ladder WINS over the configured one (initialize_band_information
@@ -3032,6 +3172,36 @@ def build_gb_moves(
         # iters >= leaf_cap_min_iters (lnL-plateau + occupancy skipped).
         leaf_cap_iter_only=bool(getattr(gb_info, "leaf_cap_iter_only", False)),
         leaf_cap_update=True,
+        # Per-walker leaf caps (GBSettings.leaf_cap_per_walker /
+        # GB_LEAF_CAP_PER_WALKER, 2026-09-22): the cap family gains a
+        # walker axis so every walker earns and is gated on its own
+        # allowance. False -> the shared cap, bit-identically.
+        leaf_cap_per_walker=bool(
+            getattr(gb_info, "leaf_cap_per_walker", False)
+        ),
+        # PER-(WALKER, BAND) SEARCH SCHEDULE (2026-09-23). The opt-SNR
+        # floor becomes a function of a (walker, band) stage; the valve
+        # below freezes a pair whose source count has converged within the
+        # current recipe step. ``search_mode`` is passed EXPLICITLY rather
+        # than inferred inside the move from GB_MODE or from the move's
+        # name: the recipe is what knows which mode it is building, and a
+        # knob that silently follows another is how a config change in one
+        # place rearms machinery in another with no line saying so.
+        search_stage_per_walker=bool(
+            getattr(gb_info, "search_stage_per_walker", False)
+        ),
+        search_stage_min_iters=getattr(
+            gb_info, "search_stage_min_iters", None),
+        opt_snr_limit_search_coarse=getattr(
+            gb_info, "opt_snr_limit_search_coarse", None),
+        opt_snr_limit_search_fine=getattr(
+            gb_info, "opt_snr_limit_search_fine", None),
+        search_shutoff_per_walker=bool(
+            getattr(gb_info, "search_shutoff_per_walker", False)
+        ),
+        search_shutoff_conv_iter=getattr(
+            gb_info, "search_shutoff_conv_iter", None),
+        search_mode=(getattr(gb_info, "mode", "pe") == "search"),
         # Leaf-cap CELL grid (GBSettings.cap_divisor / GB_CAP_DIVISOR):
         # caps are enforced per 1/K-of-a-sub-band cell, not per sub-band.
         # 1 -> the pre-2026-08-15 per-band behaviour, bit-identically.

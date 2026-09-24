@@ -213,8 +213,24 @@ def _cap_grid_is_staggered(band_info: dict) -> bool:
     return not np.allclose(be, ce, rtol=0.0, atol=1e-12)
 
 
+#: the per-WALKER cap family (``GB_LEAF_CAP_PER_WALKER``, user request
+#: 2026-09-22). Each name is the ``_w`` twin of the shared 1-D array it
+#: replaces as the GATE's state; the 1-D originals stay written as
+#: max-over-walkers mirrors so the monitor and every diagnostic script keep
+#: working. Deliberately SEPARATE NAMES rather than a reshaped array: a
+#: store written with the feature on must still be readable by a build with
+#: it off (and vice versa), which a changed rank on an existing key would
+#: break. See :func:`ensure_cap_cell_fields`.
+CAP_CELL_PER_WALKER_FIELDS = (
+    ("cap_cell_leaf_cap_w", "cap_cell_leaf_cap"),
+    ("cap_cell_iters_w", "cap_cell_iters"),
+    ("cap_cell_best_ll_w", "cap_cell_best_ll"),
+)
+
+
 def ensure_cap_cell_fields(band_info: dict, num_cells: int,
-                           staggered: bool = False) -> None:
+                           staggered: bool = False,
+                           per_walker: bool = False) -> None:
     """Backfill the per-CAP-CELL progressive leaf-cap arrays on ``band_info``.
 
     The cap-cell twins of the ``band_*`` cap arrays (see
@@ -246,8 +262,29 @@ def ensure_cap_cell_fields(band_info: dict, num_cells: int,
     ``divisor == 1 and not stagger``). Keying this on the count instead
     skipped the allocation and the move raised ``KeyError`` on
     ``cap_cell_leaf_cap`` at construction.
+
+    ``per_walker`` (``GB_LEAF_CAP_PER_WALKER``, 2026-09-22) additionally
+    allocates the ``(nwalkers, num_cells)`` twins in
+    :data:`CAP_CELL_PER_WALKER_FIELDS` -- the arrays the gate then reads
+    and writes, with the 1-D originals demoted to max-over-walkers
+    mirrors. Like ``staggered`` it DISABLES the divisor-1 short circuit:
+    the shared arrays can stand in for the cell arrays when cells are
+    bands, but ``band_leaf_cap`` has no walker axis to stand in for, so
+    the cell family must exist at every divisor.
+
+    ENABLING ON AN EXISTING STORE needs no migration. When the shared
+    arrays are already present (any store written before this flag) each
+    walker is SEEDED from them by broadcast, so every walker inherits the
+    stored cap and its patience clock and divergence starts from the next
+    increment. A fresh state seeds from the fresh sentinels instead, which
+    is the same code path.
+
+    OFF is the flag-off guarantee this whole design rests on: not one
+    array is allocated and not one key is added, so a store written by a
+    build carrying this change is byte-identical to one written without
+    it. ``tests/test_gb_cap_per_walker.py`` asserts exactly that.
     """
-    if (not staggered
+    if (not staggered and not per_walker
             and int(num_cells) == int(band_info.get("num_bands", num_cells))):
         return
     band_info.setdefault("cap_cell_leaf_cap", np.full(num_cells, -1, dtype=int))
@@ -258,6 +295,25 @@ def ensure_cap_cell_fields(band_info: dict, num_cells: int,
         band_info.setdefault(
             "cap_cell_cold_ll", np.full((_nw, num_cells), -np.inf)
         )
+    if per_walker:
+        if not _nw:
+            raise ValueError(
+                "GB_LEAF_CAP_PER_WALKER needs band_info['nwalkers'] to size "
+                "the per-walker cap arrays, but it is absent or zero. A "
+                "band_info that reached here without a walker count is a "
+                "half-built state -- refusing rather than silently falling "
+                "back to the shared cap, which would look identical in the "
+                "log and gate every walker on one allowance."
+            )
+        for _name, _shared in CAP_CELL_PER_WALKER_FIELDS:
+            if _name in band_info and band_info[_name] is not None:
+                continue
+            # SEED by broadcast from the shared array, which at this point
+            # is either the freshly-allocated sentinel fill or the value
+            # restored from a store written before the flag existed.
+            band_info[_name] = np.repeat(
+                np.asarray(band_info[_shared])[None, :], _nw, axis=0
+            )
 
 
 #: the per-band RJ shutoff valve's persisted state. ALL-OR-NOTHING: the
@@ -360,7 +416,226 @@ def ensure_band_shutoff_fields(band_info: dict, num_bands: int) -> str:
     return "restored"
 
 
-def ensure_leaf_cap_fields(band_info: dict, num_bands: int) -> None:
+#: the per-(walker, band) SEARCH STAGE record
+#: (``GB_SEARCH_STAGE_PER_WALKER``, user request 2026-09-23). ALL-OR-NOTHING
+#: for exactly the reason :data:`BAND_SHUTOFF_FIELDS` is: the stage, the
+#: occupancy it was measured against and the streak that earned it are one
+#: consistent record, and half of it restored onto the other half's grid
+#: would promote arbitrary (walker, band) pairs to the relaxed floor.
+SEARCH_STAGE_FIELDS = (
+    "band_stage_w",
+    "band_stage_occ_last_w",
+    "band_stage_streak_w",
+)
+
+#: stage indices. One-way: COARSE -> FINE, never back (see
+#: ``GBSpecialBase._update_search_stages`` for why demotion is unsafe).
+SEARCH_STAGE_COARSE = 0
+SEARCH_STAGE_FINE = 1
+
+
+def _zero_search_stage(band_info: dict, num_bands: int, nwalkers: int) -> None:
+    """Install a fresh (COARSE everywhere) search-stage record."""
+    band_info["band_stage_w"] = np.zeros(
+        (nwalkers, num_bands), dtype=np.int8)
+    # -1, not 0: the streak only counts an iteration whose occupancy is
+    # UNCHANGED, and -1 is unreachable for a count, so the first update
+    # always starts a fresh streak rather than crediting a spurious match
+    # against a zero-filled array. Same sentinel, same reason, as
+    # ``band_occ_last`` in _zero_band_shutoff.
+    band_info["band_stage_occ_last_w"] = np.full(
+        (nwalkers, num_bands), -1, dtype=np.int64)
+    band_info["band_stage_streak_w"] = np.zeros(
+        (nwalkers, num_bands), dtype=np.int64)
+    # 1-D MIRROR, min over walkers: the monitor and the diagnostic scripts
+    # get one number per band, and a band only reads FINE once EVERY walker
+    # agrees. Like the cap family's 1-D mirrors this is a summary view and
+    # never the latch's state.
+    band_info["band_stage"] = np.zeros(num_bands, dtype=np.int8)
+
+
+def ensure_search_stage_fields(band_info: dict, num_bands: int,
+                               per_walker: bool = False) -> str:
+    """Backfill/validate the per-(walker, band) search-stage record.
+
+    The search's opt-SNR floor (and, when a later change picks it up, its
+    F-stat peak floor) is a function of a ``(walker, band)`` STAGE rather
+    than one number for the whole run: stage ``0`` = COARSE (the starting
+    floors, hunting bright sources), stage ``1`` = FINE (relaxed floors,
+    digging the faint tail). A band promotes once that walker's cold-chain
+    SOURCE COUNT there has stopped changing -- see
+    ``GBSpecialBase._update_search_stages``.
+
+    Rides the SAME channel as the ``band_leaf_cap`` and shutoff families and
+    needs no schema change: ``GBState.storage_arrays`` persists every
+    ndarray in ``band_info`` and ``GBState.from_stored`` restores every
+    ``band_*`` key, so naming is the whole wiring. Deliberately kept OUT of
+    ``band_info_keys`` (so band-info dicts from older stores still pass the
+    setter's required-key check) and out of ``legacy_dtype_names`` (these
+    are integer counters and a stage index; coercing them to the backend
+    float dtype, which is what that list is for, would be wrong -- the same
+    reasoning the shutoff family follows).
+
+    ``per_walker`` FALSE is a hard no-op: not one array is allocated and not
+    one key is added, so a store written by a build carrying this change is
+    byte-identical to one written without it.
+
+    Returns a short origin token for the status line -- ``"off"``,
+    ``"fresh"``, ``"restored"`` or ``"reset(...)"`` -- because a persisted
+    latch that silently failed to restore is the same invisible failure the
+    shutoff valve's own clock had.
+
+    Degrades, never raises:
+
+    * ABSENT (any store written before this existed) -> fresh COARSE.
+    * PARTIAL (a half-written record) -> discarded whole, fresh COARSE.
+    * SHAPE MISMATCH (the band grid or the walker count changed between
+      runs) -> discarded, fresh COARSE, warning naming both shapes.
+
+    Every degradation lands on COARSE, which is the TIGHTER floor: a
+    record we cannot trust must never hand a walker the relaxed prior it
+    did not earn.
+    """
+    if not per_walker:
+        return "off"
+    _nw = int(band_info.get("nwalkers", 0) or 0)
+    if not _nw:
+        raise ValueError(
+            "GB_SEARCH_STAGE_PER_WALKER needs band_info['nwalkers'] to size "
+            "the per-walker stage arrays, but it is absent or zero. A "
+            "band_info that reached here without a walker count is a "
+            "half-built state -- refusing rather than silently falling back "
+            "to one shared stage, which would look identical in the log and "
+            "move every walker's floor together."
+        )
+    present = [f for f in SEARCH_STAGE_FIELDS if band_info.get(f) is not None]
+    if not present:
+        _zero_search_stage(band_info, num_bands, _nw)
+        return "fresh"
+    if len(present) != len(SEARCH_STAGE_FIELDS):
+        missing = [f for f in SEARCH_STAGE_FIELDS if f not in present]
+        logger.warning(
+            "search-stage state is incomplete (missing %s); discarding the "
+            "partial record and restarting every (walker, band) at the "
+            "COARSE floor.", missing)
+        _zero_search_stage(band_info, num_bands, _nw)
+        return "reset(partial)"
+    _want = (_nw, int(num_bands))
+    for name in SEARCH_STAGE_FIELDS:
+        got = tuple(np.shape(band_info[name]))
+        if got != _want:
+            logger.warning(
+                "stored search-stage state %r has shape %s but this run's "
+                "grid is %s; the band grid or the walker count changed "
+                "between runs, so the stage latch is being restarted at the "
+                "COARSE floor rather than restored onto a grid it was not "
+                "measured on.", name, got, _want)
+            _zero_search_stage(band_info, num_bands, _nw)
+            return f"reset(shape {got}!={_want})"
+    # Restored: pin the dtypes. An HDF5 round trip is faithful for these
+    # (they are not in legacy_dtype_names) but a hand-built or migrated
+    # band_info need not be, and the streak arithmetic is integer.
+    band_info["band_stage_w"] = np.asarray(
+        band_info["band_stage_w"], dtype=np.int8)
+    band_info["band_stage_occ_last_w"] = np.asarray(
+        band_info["band_stage_occ_last_w"], dtype=np.int64)
+    band_info["band_stage_streak_w"] = np.asarray(
+        band_info["band_stage_streak_w"], dtype=np.int64)
+    band_info["band_stage"] = np.asarray(
+        band_info["band_stage_w"], dtype=np.int8).min(axis=0)
+    return "restored"
+
+
+#: the per-(walker, band) RJ shutoff valve
+#: (``GB_SEARCH_BAND_SHUTOFF_PER_WALKER``, user request 2026-09-24). This is
+#: ADDITIONAL to, and completely independent of, the per-band valve in
+#: :data:`BAND_SHUTOFF_FIELDS` -- that one stays exactly as it is and the two
+#: compose with OR (a row is frozen if either valve says so).
+SEARCH_SHUTOFF_FIELDS = (
+    "band_rj_shutoff_w",
+    "band_shutoff_w_step",
+)
+
+#: sentinel for "no recipe step recorded yet" in ``band_shutoff_w_step``
+SEARCH_SHUTOFF_STEP_UNSET = -1
+
+
+def _zero_search_shutoff(band_info: dict, num_bands: int, nwalkers: int,
+                         step: int = SEARCH_SHUTOFF_STEP_UNSET) -> None:
+    """Install a fresh (all-open) per-(walker, band) RJ shutoff record."""
+    band_info["band_rj_shutoff_w"] = np.zeros(
+        (nwalkers, num_bands), dtype=bool)
+    band_info["band_shutoff_w_step"] = np.full(1, int(step), dtype=np.int64)
+
+
+def ensure_search_shutoff_fields(band_info: dict, num_bands: int,
+                                 per_walker: bool = False) -> str:
+    """Backfill/validate the per-(walker, band) RJ shutoff valve.
+
+    A SEARCH-only valve, additional to the existing per-band one: once a
+    (walker, band)'s cold-chain source count has stopped growing WITHIN THE
+    CURRENT RECIPE STEP, that band takes no further RJ on that walker until
+    the next recipe step begins. See
+    ``GBSpecialBase._update_search_band_shutoff`` for the criterion, which
+    is the per-(walker, band) form of ``RJRecipeStep.stopping_function``'s
+    nleaves-max window test.
+
+    ``band_shutoff_w_step`` records WHICH recipe step the valve was earned
+    in. The move stamps the step serial it is running under; a mismatch on
+    resume means the run advanced a step while it was down, and the whole
+    valve is released -- the alternative, honouring a valve earned in a
+    step that is over, would silently freeze bands the new step was meant
+    to reopen.
+
+    ``per_walker`` FALSE is a hard no-op. Same all-or-nothing degradation
+    rules as :func:`ensure_band_shutoff_fields`, and every degradation
+    lands on ALL-OPEN, which is the permissive direction: a valve we
+    cannot trust must never freeze a band the search still needs.
+    """
+    if not per_walker:
+        return "off"
+    _nw = int(band_info.get("nwalkers", 0) or 0)
+    if not _nw:
+        raise ValueError(
+            "GB_SEARCH_BAND_SHUTOFF_PER_WALKER needs band_info['nwalkers'] "
+            "to size the per-walker shutoff valve, but it is absent or "
+            "zero. A band_info that reached here without a walker count is "
+            "a half-built state -- refusing rather than silently falling "
+            "back to the per-band valve, which would look identical in the "
+            "log and freeze every walker together."
+        )
+    present = [f for f in SEARCH_SHUTOFF_FIELDS
+               if band_info.get(f) is not None]
+    if not present:
+        _zero_search_shutoff(band_info, num_bands, _nw)
+        return "fresh"
+    if len(present) != len(SEARCH_SHUTOFF_FIELDS):
+        missing = [f for f in SEARCH_SHUTOFF_FIELDS if f not in present]
+        logger.warning(
+            "per-walker RJ shutoff state is incomplete (missing %s); "
+            "discarding the partial record and reopening every "
+            "(walker, band).", missing)
+        _zero_search_shutoff(band_info, num_bands, _nw)
+        return "reset(partial)"
+    _want = (_nw, int(num_bands))
+    got = tuple(np.shape(band_info["band_rj_shutoff_w"]))
+    if got != _want:
+        logger.warning(
+            "stored per-walker RJ shutoff state has shape %s but this "
+            "run's grid is %s; the band grid or the walker count changed "
+            "between runs, so the valve is being reopened rather than "
+            "restored onto a grid it was not measured on.", got, _want)
+        _zero_search_shutoff(band_info, num_bands, _nw)
+        return "reset(shape)"
+    band_info["band_rj_shutoff_w"] = np.asarray(
+        band_info["band_rj_shutoff_w"], dtype=bool)
+    band_info["band_shutoff_w_step"] = np.asarray(
+        band_info["band_shutoff_w_step"], dtype=np.int64).reshape(-1)[:1]
+    return "restored"
+
+
+def ensure_leaf_cap_fields(band_info: dict, num_bands: int,
+                           per_walker: bool = False) -> None:
     """Backfill the per-band progressive leaf-cap arrays on ``band_info``.
 
     Three ``(num_bands,)`` arrays drive the search-mode leaf cap
@@ -391,6 +666,16 @@ def ensure_leaf_cap_fields(band_info: dict, num_bands: int) -> None:
         band_info.setdefault(
             "band_cold_ll", np.full((_nw, num_bands), -np.inf)
         )
+        if per_walker:
+            # ``band_best_ll_w``: the per-WALKER running max, the twin of
+            # ``band_best_ll``. Pure monitor series (no reset -- band caps
+            # are a mirror on cell grids and never gate), and the only way
+            # a snapshot can show whether the per-walker caps actually
+            # diverged: ``band_best_ll`` is a max over walkers and so is
+            # blind to exactly the spread this feature exists to expose.
+            band_info.setdefault(
+                "band_best_ll_w", np.full((_nw, num_bands), -np.inf)
+            )
 
 
 class ModuleSubState(eryn_State):
@@ -923,7 +1208,8 @@ class GBState(ModuleSubState):
 
     def initialize_band_information(
         self, nwalkers, ntemps, band_edges, band_temps, cap_edges=None,
-        branch_name=None, leaf_caps=True,
+        branch_name=None, leaf_caps=True, leaf_cap_per_walker=False,
+        search_stage_per_walker=False, search_shutoff_per_walker=False,
     ):
         """Allocate the band-info dict with zeroed counters.
 
@@ -949,6 +1235,34 @@ class GBState(ModuleSubState):
                 migration. The band-level ``band_leaf_cap`` family stays (the
                 monitor reads it; it is sentinel/-1 and never consulted
                 without RJ).
+            leaf_cap_per_walker: ``True`` (``GBSettings.leaf_cap_per_walker``
+                / ``GB_LEAF_CAP_PER_WALKER``) additionally allocates the
+                ``(nwalkers, num_cells)`` cap family -- see
+                :func:`ensure_cap_cell_fields`. Allocated HERE, at state
+                init, rather than lazily at first gate access: the module
+                backend derives its dataset set from ``storage_arrays()``
+                when it resets, so an array that first appears mid-run
+                would have no dataset to be written into. Default ``False``
+                keeps a fresh store byte-identical to one written before
+                this flag existed.
+            search_stage_per_walker: ``True``
+                (``GBSettings.search_stage_per_walker`` /
+                ``GB_SEARCH_STAGE_PER_WALKER``) additionally allocates the
+                ``(nwalkers, num_bands)`` search-stage record -- see
+                :func:`ensure_search_stage_fields`. Allocated HERE for the
+                same reason the per-walker cap family is: the module
+                backend derives its dataset set from ``storage_arrays()``
+                at reset, so an array that first appears mid-run would have
+                no dataset to be written into. Default ``False`` keeps a
+                fresh store byte-identical to one written before this flag
+                existed.
+            search_shutoff_per_walker: ``True``
+                (``GBSettings.search_shutoff_per_walker`` /
+                ``GB_SEARCH_BAND_SHUTOFF_PER_WALKER``) additionally
+                allocates the per-(walker, band) RJ shutoff valve -- see
+                :func:`ensure_search_shutoff_fields`. Independent of
+                ``search_stage_per_walker``: the two features share a
+                census and an update point but are separately switchable.
 
         Returns:
             int: the rung count that is ACTUALLY in effect after this call.
@@ -1002,12 +1316,24 @@ class GBState(ModuleSubState):
                 (band_info["ntemps"], band_info["nwalkers"], band_info["num_bands"]),
                 dtype=int,
             )
-            ensure_leaf_cap_fields(band_info, band_info["num_bands"])
+            ensure_leaf_cap_fields(
+                band_info, band_info["num_bands"],
+                per_walker=bool(leaf_caps and leaf_cap_per_walker))
             ensure_band_shutoff_fields(band_info, band_info["num_bands"])
             if leaf_caps:
                 ensure_cap_cell_fields(
                     band_info, band_info["num_cap_cells"],
-                    staggered=_cap_grid_is_staggered(band_info))
+                    staggered=_cap_grid_is_staggered(band_info),
+                    per_walker=bool(leaf_cap_per_walker))
+            # Gated on ``leaf_caps`` as well: the stage latch exists to move
+            # the SEARCH's RJ-birth floors, and a branch with no RJ surface
+            # (VGB) has nothing for it to gate.
+            ensure_search_stage_fields(
+                band_info, band_info["num_bands"],
+                per_walker=bool(leaf_caps and search_stage_per_walker))
+            ensure_search_shutoff_fields(
+                band_info, band_info["num_bands"],
+                per_walker=bool(leaf_caps and search_shutoff_per_walker))
             band_info["initialized"] = True
             self.band_info = band_info
             return int(band_info["ntemps"])
@@ -1036,6 +1362,15 @@ class GBState(ModuleSubState):
                 "band_cold_ll": 2,
                 "cap_cell_leaf_cap": 1, "cap_cell_iters": 1,
                 "cap_cell_best_ll": 1, "cap_cell_cold_ll": 2,
+                # the per-walker cap family (GB_LEAF_CAP_PER_WALKER)
+                "cap_cell_leaf_cap_w": 2, "cap_cell_iters_w": 2,
+                "cap_cell_best_ll_w": 2, "band_best_ll_w": 2,
+                # the per-(walker, band) search-stage record
+                # (GB_SEARCH_STAGE_PER_WALKER) + its min-over-walkers mirror
+                "band_stage_w": 2, "band_stage_occ_last_w": 2,
+                "band_stage_streak_w": 2, "band_stage": 1,
+                # the per-(walker, band) RJ shutoff valve
+                "band_rj_shutoff_w": 2, "band_shutoff_w_step": 1,
             }
             for _key, _nd in _bare_ndim.items():
                 _arr = bi.get(_key)
@@ -1049,14 +1384,39 @@ class GBState(ModuleSubState):
             bi["num_cap_cells"] = len(bi["cap_edges"]) - 1
             bi.setdefault("ntemps", int(bi["band_temps"].shape[-1]))
             bi.setdefault("nwalkers", int(bi["band_num_binaries"].shape[-2]))
-            ensure_leaf_cap_fields(bi, bi["num_bands"])
+            # RESUME. ``per_walker`` here is the ENABLE path as well as the
+            # restore path: a store written without the flag has no ``_w``
+            # arrays, so turning the flag on seeds every walker by broadcast
+            # from the stored shared cap (see ensure_cap_cell_fields). A
+            # store that HAS them keeps them -- setdefault never overwrites.
+            ensure_leaf_cap_fields(
+                bi, bi["num_bands"],
+                per_walker=bool(leaf_caps and leaf_cap_per_walker))
             ensure_cap_cell_fields(bi, bi["num_cap_cells"],
-                                   staggered=_cap_grid_is_staggered(bi))
+                                   staggered=_cap_grid_is_staggered(bi),
+                                   per_walker=bool(leaf_cap_per_walker))
             # RESUME path for the shutoff valve: a stored record whose grid
             # no longer matches is DISCARDED here rather than restored onto
             # a grid it was never measured on (see the function's docstring
             # for the full degradation table).
             ensure_band_shutoff_fields(bi, bi["num_bands"])
+            # RESUME path for the stage latch. Unlike the cap family this is
+            # NOT an enable-by-broadcast seam: there is no shared 1-D stage
+            # to widen, so turning the flag on over an existing store starts
+            # every (walker, band) at COARSE. That is the correct direction
+            # -- a store that never measured the latch cannot hand a walker
+            # the relaxed floor it did not earn.
+            _stage_origin = ensure_search_stage_fields(
+                bi, bi["num_bands"],
+                per_walker=bool(leaf_caps and search_stage_per_walker))
+            if _stage_origin not in ("off", "fresh"):
+                logger.info("[GB_STAGE] search-stage record %s", _stage_origin)
+            _shutoff_w_origin = ensure_search_shutoff_fields(
+                bi, bi["num_bands"],
+                per_walker=bool(leaf_caps and search_shutoff_per_walker))
+            if _shutoff_w_origin not in ("off", "fresh"):
+                logger.info("[GB_STAGE] per-walker RJ shutoff valve %s",
+                            _shutoff_w_origin)
             _label = f"branch {branch_name!r}" if branch_name else "banded branch"
             _stored_nt = int(bi["ntemps"])
             _stored_nw = int(bi["nwalkers"])
@@ -1078,6 +1438,29 @@ class GBState(ModuleSubState):
                 "band_swaps_proposed": (_stored_nb, max(_stored_nt - 1, 0)),
                 "band_swaps_accepted": (_stored_nb, max(_stored_nt - 1, 0)),
                 "band_num_binaries": (_stored_nt, _stored_nw, _stored_nb),
+                # the per-walker cap family (GB_LEAF_CAP_PER_WALKER). A
+                # stored ``_w`` array whose walker axis disagrees with the
+                # ladder would gate walker w against some other walker's
+                # allowance -- silently, since every index stays in range.
+                "cap_cell_leaf_cap_w": (
+                    _stored_nw, int(bi.get("num_cap_cells", 0))),
+                "cap_cell_iters_w": (
+                    _stored_nw, int(bi.get("num_cap_cells", 0))),
+                "cap_cell_best_ll_w": (
+                    _stored_nw, int(bi.get("num_cap_cells", 0))),
+                "band_best_ll_w": (_stored_nw, _stored_nb),
+                # the per-(walker, band) search-stage record. When the flag
+                # is ON ``ensure_search_stage_fields`` has already reset any
+                # mismatch to COARSE, so these never fire; they are here for
+                # the flag-OFF case, where the arrays are inert but a store
+                # carrying arrays that disagree with its own ladder is
+                # corruption by this check's own definition and must say so
+                # rather than be persisted onward. Same rule, same place, as
+                # the per-walker cap family above.
+                "band_stage_w": (_stored_nw, _stored_nb),
+                "band_stage_occ_last_w": (_stored_nw, _stored_nb),
+                "band_stage_streak_w": (_stored_nw, _stored_nb),
+                "band_rj_shutoff_w": (_stored_nw, _stored_nb),
             }
             for _key, _want in _expected_shapes.items():
                 _arr = bi.get(_key)
@@ -1163,6 +1546,15 @@ class GBState(ModuleSubState):
                 for _cap_key in (
                     "cap_edges", "num_cap_cells", "cap_cell_leaf_cap",
                     "cap_cell_iters", "cap_cell_best_ll", "cap_cell_cold_ll",
+                    "cap_cell_leaf_cap_w", "cap_cell_iters_w",
+                    "cap_cell_best_ll_w",
+                    # the search-stage record follows the cap family: it
+                    # gates RJ-birth floors and a cap-free branch has no RJ
+                    # surface for it to gate, so a stored record here is
+                    # stranded state, not something to keep persisting.
+                    "band_stage_w", "band_stage_occ_last_w",
+                    "band_stage_streak_w", "band_stage",
+                    "band_rj_shutoff_w", "band_shutoff_w_step",
                 ):
                     bi.pop(_cap_key, None)
                 return _stored_nt
@@ -1284,6 +1676,12 @@ class GBState(ModuleSubState):
         "cap_cell_iters",
         "cap_cell_best_ll",
         "cap_cell_cold_ll",
+        # the per-walker cap family rides the same channel as its 1-D
+        # twins, so it keeps the same backend float dtype convention
+        "cap_cell_leaf_cap_w",
+        "cap_cell_iters_w",
+        "cap_cell_best_ll_w",
+        "band_best_ll_w",
     )
 
     #: band_info entries that are STATIC (written once at backend reset),

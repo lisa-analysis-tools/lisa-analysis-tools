@@ -468,6 +468,12 @@ class _CapStub:
 
     _cap_flat_index = GBSpecialBase._cap_flat_index
     _cap_new_entry_veto = GBSpecialBase._cap_new_entry_veto
+    # the veto gathers its per-row cap through this since the per-walker
+    # caps landed (2026-09-22); on a 1-D cap it is ``cap[cells]``.
+    # Re-wrapped in staticmethod: accessing it off the class unwraps the
+    # descriptor, so a bare assignment would rebind it as a bound method
+    # and shift every argument by one.
+    _cap_for_rows = staticmethod(GBSpecialBase._cap_for_rows)
 
 
 class CapInModelHeadroomTest(unittest.TestCase):

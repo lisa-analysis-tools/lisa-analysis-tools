@@ -1141,6 +1141,17 @@ class GlobalFit:
                 self.curr.source_info["gb"].band_edges,
                 band_temps,
                 cap_edges=_branch_cap_edges(self.curr.source_info["gb"]),
+                leaf_cap_per_walker=bool(getattr(
+                    self.curr.source_info["gb"], "leaf_cap_per_walker", False
+                )),
+                search_stage_per_walker=bool(getattr(
+                    self.curr.source_info["gb"],
+                    "search_stage_per_walker", False,
+                )),
+                search_shutoff_per_walker=bool(getattr(
+                    self.curr.source_info["gb"],
+                    "search_shutoff_per_walker", False,
+                )),
             )
 
         if state is None:
@@ -1427,6 +1438,21 @@ class GlobalFit:
                     cap_edges=_branch_cap_edges(
                         self.curr.source_info[_banded]
                     ),
+                    # VGB has no such setting (and no RJ surface, so no
+                    # caps at all) -- getattr keeps it False there.
+                    leaf_cap_per_walker=bool(getattr(
+                        self.curr.source_info[_banded],
+                        "leaf_cap_per_walker", False,
+                    )),
+                    # Same getattr rule: VGB has neither setting.
+                    search_stage_per_walker=bool(getattr(
+                        self.curr.source_info[_banded],
+                        "search_stage_per_walker", False,
+                    )),
+                    search_shutoff_per_walker=bool(getattr(
+                        self.curr.source_info[_banded],
+                        "search_shutoff_per_walker", False,
+                    )),
                 )
 
             state.log_like = np.zeros((self.ntemps, self.nwalkers))

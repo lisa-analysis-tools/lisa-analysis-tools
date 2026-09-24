@@ -181,6 +181,30 @@ class PlanTest(unittest.TestCase):
                      "band_edges"):
             self.assertIsNone(axes[f"sub_backend/gb/{name}"], name)
 
+    def test_per_walker_cap_tables_carry_a_walker_axis(self):
+        """GB_LEAF_CAP_PER_WALKER (2026-09-22) gives the cap family one.
+
+        The rest of the cap family is walker-free, which is exactly why a
+        walker rescale can carry the whole GB search state forward. The
+        ``_w`` twins are the exception and must be TILED like any other
+        walker-axis table -- silently leaving them at the old width would
+        gate the new walkers against a table that does not cover them.
+        """
+        with h5py.File(self.src, "a") as f:
+            gb = f["global_fit/sub_backend/gb"]
+            for name in ("cap_cell_leaf_cap_w", "cap_cell_iters_w",
+                         "cap_cell_best_ll_w"):
+                _fill(gb.create_dataset(
+                    name, (NSTEPS, NW, GB_NB), dtype="f8"), 50)
+            _fill(gb.create_dataset(
+                "band_best_ll_w", (NSTEPS, NW, GB_NB), dtype="f8"), 51)
+        entries, refusals, _, _ = self._plan()
+        self.assertEqual(refusals, [])
+        axes = {e.path: e.axis for e in entries}
+        for name in ("cap_cell_leaf_cap_w", "cap_cell_iters_w",
+                     "cap_cell_best_ll_w", "band_best_ll_w"):
+            self.assertEqual(axes[f"sub_backend/gb/{name}"], 1, name)
+
     def test_an_unclassified_dataset_is_a_refusal_not_a_guess(self):
         with h5py.File(self.src, "a") as f:
             f["global_fit/sub_backend/gb"].create_dataset(

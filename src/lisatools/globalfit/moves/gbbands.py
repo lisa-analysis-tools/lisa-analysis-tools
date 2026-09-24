@@ -4871,12 +4871,28 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         # Rejection sampling on SNR: only applied to *add* proposals (the
         # remove side's opt_snr is meaningless when amp_add is tiny).
         reject = self.xp.zeros(kept.shape[0], dtype=bool)
-        _bad_swap = result.opt_snr_add[kept] < self.opt_snr_rej_samp_limit
+        # PER-(WALKER, BAND) FLOOR. This surface takes ``data_index`` (a
+        # global slot id) and carries no walker/band labels of its own, so
+        # a table is reduced to its MINIMUM here rather than gathered.
+        #
+        # That is the permissive direction and it is deliberate: the
+        # authoritative per-row enforcement lives in the move
+        # (``_run_rj_step`` / ``_run_replace_step`` / the in-model gate),
+        # all three of which DO have the row's walker and band and all
+        # three of which run on every proposal this clamp could see. A
+        # min here can therefore only let a row through to a gate that
+        # will judge it correctly; gathering walker 0's floor for
+        # everyone -- the alternative a naive scalar cast would give --
+        # would silently reject rows no gate ever asked about.
+        _lim_sw = self.opt_snr_rej_samp_limit
+        if np.ndim(_lim_sw) != 0:
+            _lim_sw = float(np.min(np.asarray(_lim_sw)))
+        _bad_swap = result.opt_snr_add[kept] < _lim_sw
         if getattr(self, "snr_rej_detected", False) and (
                 getattr(result, "d_h_add", None) is not None):
             _det_add = self.xp.asarray(result.d_h_add)[kept].real / self.xp.maximum(
                 result.opt_snr_add[kept], 1e-300)
-            _bad_swap = _bad_swap | (_det_add < self.opt_snr_rej_samp_limit)
+            _bad_swap = _bad_swap | (_det_add < _lim_sw)
         reject[kept] = _bad_swap & (params_add_phys[kept, 0] > 1e-30)
         ll_diff[reject] = -1e300
 
@@ -5512,7 +5528,7 @@ class BandSorter(LISAToolsParallelModule):
         keep_all_inds=True,
         wdm_band_slab_layers: Optional[int] = None,
         wdm_slab_guard_layers: int = 1,
-        opt_snr_rej_samp_limit: float = 5.0,
+        opt_snr_rej_samp_limit=5.0,
         snr_rej_detected: bool = False,
         psd_shared_mirror: bool = False,
         psd_mirror_parity_proposes: int = 0,
@@ -5525,7 +5541,18 @@ class BandSorter(LISAToolsParallelModule):
         # forwarded into every SubBandBuffer this sorter builds; the copy
         # constructor path below overwrites it with the source sorter's
         # value (attribute copy loop), keeping one source of truth.
-        self.opt_snr_rej_samp_limit = float(opt_snr_rej_samp_limit)
+        #
+        # SCALAR OR ``(nwalkers, num_bands)`` TABLE. Under
+        # GB_SEARCH_STAGE_PER_WALKER the move ships a per-(walker, band)
+        # floor (``GBSpecialBase._live_snr_lim``) and every consumer gathers
+        # its own rows through ``_snr_lim_for_rows``. NOT cast to float --
+        # that cast is exactly what would turn a table into a TypeError
+        # here, two layers away from the knob that set it.
+        self.opt_snr_rej_samp_limit = (
+            float(opt_snr_rej_samp_limit)
+            if np.ndim(opt_snr_rej_samp_limit) == 0
+            else np.asarray(opt_snr_rej_samp_limit, dtype=float)
+        )
         self.snr_rej_detected = bool(snr_rej_detected)
         # Shared-psd mirror knobs (GB_PSD_SHARED_MIRROR /
         # GB_PSD_MIRROR_PARITY_PROPOSES / GB_PSD_MIRROR_PARITY_ROWS): plain

@@ -161,9 +161,25 @@ def _sub_signatures(a):
     sig["betas"] = (None, (nt,))
 
     if nb is not None:
+        # The cap-cell grid is a refinement of the band grid by
+        # GB_CAP_DIVISOR; a store written before the cap grid existed has
+        # no ``num_cap_cells`` attribute and the two coincide.
+        nc = int(a["num_cap_cells"]) if "num_cap_cells" in a else nb
         sig["band_cold_ll"] = (1, (nw, nb))
         sig["cap_cell_cold_ll"] = (1, (nw, nb))
         sig["band_num_binaries"] = (2, (nt, nw, nb))
+        # PER-WALKER leaf caps (GB_LEAF_CAP_PER_WALKER, 2026-09-22). The
+        # rest of the cap family is walker-free -- which is exactly why a
+        # walker rescale can carry the whole GB search state forward --
+        # and these four are the exception: they are tiled like any other
+        # walker-axis table, so walker w of the copy inherits the caps and
+        # the patience clocks of walker ``w % nwalkers``. Both the band-
+        # and cap-grid widths are accepted, because the store may or may
+        # not carry ``num_cap_cells`` and the two agree at divisor 1.
+        for name in ("cap_cell_leaf_cap_w", "cap_cell_iters_w",
+                     "cap_cell_best_ll_w"):
+            sig[name] = ((1, (nw, nc)), (1, (nw, nb)))
+        sig["band_best_ll_w"] = (1, (nw, nb))
         # per-band and per-(band, temp) state: the leaf caps, the shutoff
         # ladder and the swap census. All walker-free, which is exactly why
         # a walker rescale can carry the whole GB search state forward.

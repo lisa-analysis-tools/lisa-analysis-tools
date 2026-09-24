@@ -598,7 +598,8 @@ def chunked_fstat_sweep(call_fstat: Callable, params, *, xp, label: str = "",
     return F
 
 
-def select_comb_peaks(f0_nodes, F_max, band_edges_hz, spacing, xp):
+def select_comb_peaks(f0_nodes, F_max, band_edges_hz, spacing, xp,
+                      min_F=None):
     """Vectorized per-sub-band peak selection from the comb's ``F_max(f0)``.
 
     Two-tier candidate set -> absolute SNR floor + interior-band mask ->
@@ -609,6 +610,17 @@ def select_comb_peaks(f0_nodes, F_max, band_edges_hz, spacing, xp):
     * **Tier 2** (local-max rescue): ALSO keep any strict 3-point local
       maximum, gated only by the shared SNR floor -- so a quiet real source
       inside a loud neighbor's Doppler window still gets its own grid.
+
+    ``min_F`` overrides the global ``FSTAT_PEAK_MIN_SNR`` floor. It may be
+    a scalar (one floor everywhere, the historical behaviour) or a
+    ``(num_sub_bands,)`` array giving each sub-band its OWN floor -- the
+    F-stat half of the per-(walker, band) search-stage schedule, built by
+    ``fstat_proposal.fstat_band_min_F``. ``None`` (the default) keeps
+    ``fstat_peak_min_F()`` exactly as before.
+
+    Note the per-band floor's blast radius is bounded by
+    ``FSTAT_PEAKS_PER_BAND``: in a band already at that cap, which keeps
+    the TOP peaks by F, loosening the floor changes nothing at all.
 
     Returns a host ``(N, 4)`` array of ``(f0_mHz, F, node_idx, band_idx)``
     sorted by F descending; only interior sub-bands are kept.
@@ -628,9 +640,26 @@ def select_comb_peaks(f0_nodes, F_max, band_edges_hz, spacing, xp):
     local3 = xp.zeros(F_max.shape, dtype=bool)
     local3[1:-1] = (F_max[1:-1] > F_max[:-2]) & (F_max[1:-1] > F_max[2:])
 
-    min_F = fstat_peak_min_F()
+    if min_F is None:
+        min_F = fstat_peak_min_F()
+    # PER-BAND floor: gather each node's own band's threshold. The scalar
+    # branch is the historical expression, bit-identically.
+    if np.ndim(min_F) == 0:
+        min_F_row = min_F
+        _min_F_lo = _min_F_hi = float(min_F)
+    else:
+        _mf = np.asarray(min_F, dtype=float).reshape(-1)
+        if _mf.shape[0] != num_sub_bands:
+            raise ValueError(
+                f"select_comb_peaks got a per-band min_F covering "
+                f"{_mf.shape[0]} bands but the grid has {num_sub_bands}. "
+                f"A mismatched vector would threshold the wrong bands "
+                f"while every index stayed in range."
+            )
+        min_F_row = xp.asarray(_mf)[band_of_node]
+        _min_F_lo, _min_F_hi = float(_mf.min()), float(_mf.max())
     interior = (band_of_node >= 1) & (band_of_node <= num_sub_bands - 2)
-    cand = (tier1 | local3) & (F_max >= min_F) & interior
+    cand = (tier1 | local3) & (F_max >= min_F_row) & interior
 
     idx = xp.where(cand)[0]
     if int(idx.shape[0]) == 0:
@@ -657,9 +686,17 @@ def select_comb_peaks(f0_nodes, F_max, band_edges_hz, spacing, xp):
     peaks = peaks[np.argsort(peaks[:, 1])[::-1]]
 
     counts = np.bincount(b_h.astype(int), minlength=num_sub_bands)
-    logger.info("[peaks] %d peaks (F >= %.1f ~ SNR %.1f, cap %d/band); "
-                "per-interior-band counts: %s", len(peaks), min_F,
-                np.sqrt(2 * min_F), cap, dict(enumerate(counts.tolist())))
+    if _min_F_lo == _min_F_hi:
+        logger.info("[peaks] %d peaks (F >= %.1f ~ SNR %.1f, cap %d/band); "
+                    "per-interior-band counts: %s", len(peaks), _min_F_lo,
+                    np.sqrt(2 * _min_F_lo), cap,
+                    dict(enumerate(counts.tolist())))
+    else:
+        logger.info("[peaks] %d peaks (PER-BAND floor F %.1f-%.1f ~ SNR "
+                    "%.2f-%.2f, cap %d/band); per-interior-band counts: %s",
+                    len(peaks), _min_F_lo, _min_F_hi,
+                    np.sqrt(2 * _min_F_lo), np.sqrt(2 * _min_F_hi), cap,
+                    dict(enumerate(counts.tolist())))
     zero_bands = [k for k in range(1, num_sub_bands - 1) if counts[k] == 0]
     if zero_bands:
         logger.warning("[peaks] interior sub-band(s) %s have ZERO peaks -- "
@@ -943,7 +980,8 @@ def clear_comb_parts(parts_dir, li, n_parts) -> None:
 
 def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
                   f0_lims_hz, mc_lims, cache_path: Optional[str] = None,
-                  fingerprint_extra: str = "", comb_runner=None):
+                  fingerprint_extra: str = "", comb_runner=None,
+                  band_min_F=None):
     """Dense-in-f0 F-stat comb scan across the sub-band.
 
     With months of data the F-stat f0 peaks are ~1/Tobs wide -- far too
@@ -1051,7 +1089,7 @@ def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
                 total_evals, len(levels))
 
     peaks = select_comb_peaks(f0_nodes, xp.asarray(F_max_host), band_edges_hz,
-                              spacing, xp)
+                              spacing, xp, min_F=band_min_F)
     for f0p, Fp, _, bi in peaks[:10]:
         logger.info("[comb]   %.5f  %10.2f  band %d", f0p, Fp, int(bi))
 
@@ -1998,7 +2036,8 @@ def stage_b_complete(cache_dir: str) -> bool:
 def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
                        band_edges_hz, f0_lims_hz, mc_lims, cache_dir: str,
                        fingerprint_extra: str = "", epoch=None,
-                       ratio_max=None, sweep_runner=None, comb_runner=None):
+                       ratio_max=None, sweep_runner=None, comb_runner=None,
+                       band_min_F=None):
     """Full fit with resume: comb scan -> peak select -> stage B.
 
     ``epoch`` selects the peak-box weighting tilt only (see
@@ -2072,13 +2111,19 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
                     comb_cache)
         f0_nodes = np.asarray(d["f0_nodes_mHz"], dtype=float)
         spacing = float(f0_nodes[1] - f0_nodes[0]) if len(f0_nodes) > 1 else 1.0
+        # RE-SELECT from the cached comb at the CURRENT floor. This is
+        # the cheap half by design: the comb stores F_max for every
+        # node, so a floor that moved between epochs costs a
+        # re-selection and a stage-B refit, never a re-sweep.
         peaks = select_comb_peaks(f0_nodes, xp.asarray(d["F_max"]),
-                                  band_edges_hz, spacing, xp)
+                                  band_edges_hz, spacing, xp,
+                                  min_F=band_min_F)
     else:
         _f0, _F, peaks, _x = run_comb_scan(
             call_fstat, xp=xp, Tobs=Tobs, band_edges_hz=band_edges_hz,
             f0_lims_hz=f0_lims_hz, mc_lims=mc_lims, cache_path=cache_path,
             fingerprint_extra=fingerprint_extra, comb_runner=comb_runner,
+            band_min_F=band_min_F,
         )
     logger.info("[stageA] comb + peak selection: %d peaks in %s (%s)",
                 int(len(peaks)), _fmt_secs(time.time() - _t_stage_a),

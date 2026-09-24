@@ -99,9 +99,13 @@ from ...utils.utility import get_array_module, get_groups_from_band_structure, s
 from ..state import (
     GFState,
     BAND_SHUTOFF_EPOCH_UNSET,
+    CAP_CELL_PER_WALKER_FIELDS,
+    SEARCH_STAGE_COARSE,
+    SEARCH_STAGE_FINE,
     ensure_band_shutoff_fields,
     ensure_cap_cell_fields,
     ensure_leaf_cap_fields,
+    ensure_search_stage_fields,
     make_cap_edge_extensions,
     make_cap_edges,
 )
@@ -904,7 +908,8 @@ def _format_unit_scan_schedule(starts, directions, units, name=""):
     )
 
 
-def tempering_swap_cap_ok(occ_a, occ_b, from_band_a, from_band_b, cap):
+def tempering_swap_cap_ok(occ_a, occ_b, from_band_a, from_band_b, cap,
+                          cap_b=None):
     """Would a band-swap leave every affected cap cell within cap?
 
     THE HOLE THIS CLOSES (user diagnosis 2026-08-30). Tempering exchanges a
@@ -934,12 +939,25 @@ def tempering_swap_cap_ok(occ_a, occ_b, from_band_a, from_band_b, cap):
     * ``from_band_a`` / ``from_band_b`` -- how many of those come from the
       band being swapped. Everything else in the cell stays put, which is
       the whole point: the NEIGHBOUR band's contribution does not move.
-    * ``cap`` -- the per-cell cap (caps are per cell, not per rung, so one
-      array serves both sides).
+    * ``cap`` -- side A's per-cell cap. Caps are per cell and not per
+      rung, so with a SHARED cap one array serves both sides and
+      ``cap_b`` is left ``None``.
+    * ``cap_b`` -- side B's per-cell cap, when the two sides can differ.
+      That is the PER-WALKER case (``GB_LEAF_CAP_PER_WALKER``,
+      2026-09-22): caps are still temperature-uniform, but they are now
+      indexed by walker, and the permuted swap path pairs two DIFFERENT
+      walker indices. The vertical sweep shares a walker, so there
+      ``cap_b is cap`` and this function's behaviour is unchanged --
+      which is the reason the bulk of dimension transport into the cold
+      chain (the T0-T1 vertical swaps) is untouched by per-walker caps.
+      ``None`` (default) means "same on both sides" and keeps every
+      pre-2026-09-22 call site and test working verbatim.
 
     Post-swap each side keeps its non-swapped remainder and receives the
     partner's band contribution. Both sides are checked because search
-    caps bind at EVERY temperature.
+    caps bind at EVERY temperature -- and each side is checked against
+    ITS OWN cap, because after the swap the sources live under the
+    receiving side's allowance, not the sending side's.
 
     THIS IS A SEARCH-ONLY CONSTRAINT, NOT A CORRECTNESS FIX (user
     correction 2026-08-30). The RJ ``curr_logp = -inf`` cap gate is a
@@ -959,11 +977,16 @@ def tempering_swap_cap_ok(occ_a, occ_b, from_band_a, from_band_b, cap):
     Returns a per-pair bool: True = the swap is admissible.
     """
     xp = get_array_module(occ_a)
+    if cap_b is None:
+        cap_b = cap
     post_a = occ_a - from_band_a + from_band_b
     post_b = occ_b - from_band_b + from_band_a
-    free = cap < 0                       # disarmed sentinel -> no limit
-    ok_a = free | (post_a <= cap)
-    ok_b = free | (post_b <= cap)
+    # The disarmed sentinel is evaluated PER SIDE: with per-walker caps one
+    # walker can be disarmed (-1, unconstrained) while its swap partner is
+    # capped, and a shared ``free`` mask would export one side's freedom to
+    # the other.
+    ok_a = (cap < 0) | (post_a <= cap)
+    ok_b = (cap_b < 0) | (post_b <= cap_b)
     return xp.all(ok_a & ok_b, axis=-1)
 
 
@@ -1274,6 +1297,52 @@ _OBS_RHO_FALLBACK = 10.0
 #: Extrinsic step as a fraction of the prior box, used only when no
 #: information matrix is available (``chol is None``).
 _OBS_PRIOR_STEP_FRAC = 0.1
+
+
+def fstat_band_min_F_for(move):
+    """Per-band F-stat peak floor for ``move``'s next fit, or ``None``.
+
+    ``None`` -- the flag-off answer -- leaves the fit on the global
+    ``FSTAT_PEAK_MIN_SNR`` it has always used.
+
+    MODULE-LEVEL, and taking the move rather than being a method on it,
+    deliberately: ``_run_fstat_fit`` is invoked on duck-typed rank stubs in
+    the multi-rank tests and (more importantly) on whatever a future
+    fan-out stands up in a rank process. A bound method would make every
+    such object grow one or crash the fit path; a getattr degrades to "the
+    feature is off here", which is the correct answer for anything that
+    never armed it.
+
+    ⚠ THE FLOOR IS PART OF WHAT A CACHED EPOCH MEANS -- see
+    :func:`fstat_stage_fingerprint_for`.
+    """
+    from lisatools.sampling.fstat_proposal import fstat_band_min_F
+
+    stage = getattr(move, "_stage_table", None)
+    if stage is None:
+        return None
+    return fstat_band_min_F(stage, int(getattr(move, "num_bands", 0)))
+
+
+def fstat_stage_fingerprint_for(move) -> str:
+    """Epoch-fingerprint term for ``move``'s per-band F-stat peak floor.
+
+    EMPTY STRING with the feature off, so every existing cache key is
+    byte-identical and no resume is invalidated by this change.
+
+    Armed, the fingerprint carries a hash of the per-band floor vector. It
+    HAS to: ``run_fstat_grid_fit`` short-circuits a COMPLETE epoch straight
+    off disk without re-selecting peaks, so a stage promotion between
+    refits would otherwise keep handing back the catalog selected at the
+    OLD floor -- silently, and for the rest of the run. A changed floor is
+    a new epoch; the comb npz is keyed separately and is reused, so the
+    cost is a re-selection plus stage B, never a re-sweep.
+    """
+    mf = fstat_band_min_F_for(move)
+    if mf is None:
+        return ""
+    h = hashlib.sha1(np.asarray(mf, dtype=float).tobytes()).hexdigest()[:12]
+    return f"|stagefloor={h}"
 
 
 def _rj_amp_maximize_on() -> bool:
@@ -2559,6 +2628,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         leaf_cap_require_occupancy=True,
         leaf_cap_iter_only=False,
         leaf_cap_update=True,
+        leaf_cap_per_walker=False,
+        search_stage_per_walker=False,
+        search_stage_min_iters=None,
+        opt_snr_limit_search_coarse=None,
+        opt_snr_limit_search_fine=None,
+        search_shutoff_per_walker=False,
+        search_shutoff_conv_iter=None,
+        search_mode=False,
         cap_divisor=None,
         cap_stagger=None,
         cap_overlap_frac=None,
@@ -2704,7 +2781,166 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # fixed-schedule annealing knob for search runs.
         self.leaf_cap_iter_only = bool(leaf_cap_iter_only)
         self.leaf_cap_update = bool(leaf_cap_update)
+        # PER-WALKER CAPS (user request 2026-09-22, GB_LEAF_CAP_PER_WALKER,
+        # default OFF). The cap family gains a walker axis: every walker
+        # earns its own per-cell allowance from its OWN lnL plateau and its
+        # OWN occupancy, and every enforcement gate scores a row against
+        # ``cap[its walker, its cell]``.
+        #
+        # WHY. The gate collapses the walker axis the moment it runs
+        # (``cur_max = lls.max(axis=0)``), so the LEADING walker's evidence
+        # ramps the allowance for everyone -- including laggards that never
+        # filled the cap they already had. On the 6-month production run
+        # that shows up as a 400-1000 leaf spread across four cold walkers
+        # and (snapshot 19) a set of increments whose occupancy-at-cap
+        # condition holds for almost none of them under any reduction.
+        #
+        # This does NOT reverse the 2026-09-19 ruling that MAX is the right
+        # reduction for the occupancy demand signal. That ruling was about a
+        # SHARED allowance, where one walker pressed against its cap is
+        # evidence the cell needs room for all. With per-walker allowances
+        # the same principle is relocated, not abandoned: each walker's own
+        # demand drives its own cap.
+        self.leaf_cap_per_walker = bool(leaf_cap_per_walker)
         self._band_leaf_cap = None
+        self._cap_pw_warned_all_walkers = False
+
+        # ------------------------------------------------------------------
+        # PER-(WALKER, BAND) SEARCH STAGE (user request 2026-09-23,
+        # GB_SEARCH_STAGE_PER_WALKER, default OFF).
+        # ------------------------------------------------------------------
+        # The search runs ONE opt-SNR floor for every walker and every band
+        # for the whole run, and that is the wrong shape. A band where a
+        # walker has already assembled its sources wants a LOWER floor (dig
+        # into the faint tail); a band still finding bright sources wants the
+        # HIGH floor (do not poison the model with noise births). Those two
+        # states coexist at the same iteration, in different bands, and in
+        # the SAME band on different walkers.
+        #
+        # So the floor becomes a function of a (walker, band) STAGE: 0 =
+        # COARSE (``opt_snr_limit_search_coarse``), 1 = FINE
+        # (``opt_snr_limit_search_fine``). A band promotes once that
+        # walker's cold-chain SOURCE COUNT there has stopped changing --
+        # see :meth:`_update_search_stages`.
+        #
+        # OFF is a hard no-op: ``_snr_lim_table`` stays ``None``, the floor
+        # stays the scalar float it has always been, and not one array is
+        # allocated or persisted.
+        self.search_stage_per_walker = bool(search_stage_per_walker)
+        self.search_stage_min_iters = int(
+            search_stage_min_iters
+            if search_stage_min_iters is not None
+            else os.environ.get("GB_SEARCH_STAGE_MIN_ITERS", "20")
+        )
+        # COARSE defaults to whatever this move's floor already resolved to,
+        # so arming the feature with no other knob set reproduces today's
+        # behaviour until the first promotion. FINE defaults to the PE floor
+        # (5.0), which is the relaxed end of the same standing pair.
+        _coarse_env = os.environ.get("GB_OPT_SNR_LIMIT_SEARCH_COARSE")
+        self.opt_snr_limit_search_coarse = float(
+            opt_snr_limit_search_coarse
+            if opt_snr_limit_search_coarse is not None
+            else (_coarse_env if _coarse_env is not None
+                  else self.opt_snr_rej_samp_limit)
+        )
+        self.opt_snr_limit_search_fine = float(
+            opt_snr_limit_search_fine
+            if opt_snr_limit_search_fine is not None
+            else os.environ.get("GB_OPT_SNR_LIMIT_SEARCH_FINE", "5.0")
+        )
+        #: the live ``(nwalkers, num_bands)`` floor table, or ``None`` while
+        #: the feature is off. Rebuilt from the stage record once per
+        #: proposal and shipped to the sorter/buffer in place of the scalar.
+        self._snr_lim_table = None
+        self._stage_warned_accept_kernel = False
+        self._stage_armed_logged = False
+        if self.search_stage_per_walker:
+            if self.opt_snr_limit_search_fine > self.opt_snr_limit_search_coarse:
+                # Refuse rather than run it backwards. The latch is ONE-WAY
+                # on the premise that FINE is a strictly LARGER prior
+                # support; inverted, a promotion would TIGHTEN the floor
+                # under an assembled model and start rejecting sources that
+                # model already holds -- and the in-model gate enforces on
+                # every update, not only on birth, so those sources would be
+                # frozen out rather than merely un-birthable.
+                raise ValueError(
+                    f"{name}: GB_SEARCH_STAGE_PER_WALKER needs the FINE "
+                    f"opt-SNR floor to be <= the COARSE one, but got "
+                    f"fine={self.opt_snr_limit_search_fine} > "
+                    f"coarse={self.opt_snr_limit_search_coarse}. The stage "
+                    f"latch is one-way because FINE is assumed to be the "
+                    f"LARGER prior support; inverted, promoting a band "
+                    f"would tighten its floor under an already-assembled "
+                    f"model and the in-model SNR gate would freeze out "
+                    f"sources the model already holds."
+                )
+            if self.search_stage_min_iters < 1:
+                raise ValueError(
+                    f"{name}: GB_SEARCH_STAGE_MIN_ITERS must be >= 1, got "
+                    f"{self.search_stage_min_iters}. A patience of 0 would "
+                    f"promote every occupied band on its first update, "
+                    f"before any equilibrium could have been observed."
+                )
+
+        # ------------------------------------------------------------------
+        # PER-(WALKER, BAND) RJ SHUTOFF (user request 2026-09-24,
+        # GB_SEARCH_BAND_SHUTOFF_PER_WALKER, default OFF). SEARCH ONLY.
+        # ------------------------------------------------------------------
+        # ADDITIONAL to the existing per-band valve (``_rj_band_shutoff``),
+        # which is untouched: the two compose with OR, so a row is frozen if
+        # EITHER says so.
+        #
+        # The criterion is the per-(walker, band) form of the one the recipe
+        # already uses to end an RJ stage
+        # (``RJRecipeStep.stopping_function``): the cold-chain source count
+        # has stopped GROWING over a ``search_shutoff_conv_iter`` window
+        # WITHIN THE CURRENT RECIPE STEP. Where the recipe asks that of the
+        # whole branch to advance the stage, this asks it of one
+        # (walker, band) to stop spending proposals there.
+        #
+        # SCOPED TO THE STEP, and released when the next one begins: the
+        # next step changes the moves, the caps and the floors, so a band
+        # that had nothing left to find under the old configuration may have
+        # plenty under the new one. A valve that outlived its step would
+        # silently freeze exactly the bands the new step was meant to
+        # reopen.
+        self.search_mode = bool(search_mode)
+        self.search_shutoff_per_walker = bool(search_shutoff_per_walker)
+        self.search_shutoff_conv_iter = int(
+            search_shutoff_conv_iter
+            if search_shutoff_conv_iter is not None
+            else os.environ.get("GB_SEARCH_BAND_SHUTOFF_CONV_ITER", "5")
+        )
+        if self.search_shutoff_per_walker and self.search_shutoff_conv_iter < 1:
+            raise ValueError(
+                f"{name}: GB_SEARCH_BAND_SHUTOFF_CONV_ITER must be >= 1, "
+                f"got {self.search_shutoff_conv_iter}. A zero-length "
+                f"patience window would freeze every occupied band on "
+                f"its first update, before any lnL plateau could have "
+                f"been observed."
+            )
+        #: live reference into ``band_info['band_rj_shutoff_w']``, or None.
+        self._rj_band_shutoff_w = None
+        #: IN-MEMORY within-step lnL plateau state. Deliberately not
+        #: persisted: a restart re-earns the window, which leaves bands
+        #: OPEN longer -- the permissive direction, and the one that cannot
+        #: lose sources.
+        self._shutoff_best = None
+        self._shutoff_streak = None
+        self._stage_band_lls = None
+        self._stage_band_lls_stamp = None
+        self._shutoff_w_warned_lls = False
+        #: the recipe-step serial this move is running under. ``None`` until
+        #: a recipe step announces itself through :meth:`begin_recipe_step`.
+        self._recipe_step_serial = None
+        self._shutoff_w_warned_mode = False
+        #: stage-convergence counter (occupied (walker, band) pairs not yet
+        #: shut). ``None`` = never computed, which is how
+        #: ``band_shutoff_w_pending_total`` tells "feature off / no update
+        #: yet" apart from a genuine 0. See _publish_shutoff_w_pending.
+        self._shutoff_w_pending = None
+        self._shutoff_w_shut = 0
+        self._shutoff_w_total = 0
 
         # Sig-het reference policy (ALL in-model proposals): the heterodyne
         # reference is built ONCE per repeat block, against the source-free
@@ -5291,6 +5527,23 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 extra_bool = (
                     _shut_ok if extra_bool is None
                     else (extra_bool & _shut_ok)
+                )
+
+            # PER-(WALKER, BAND) VALVE, composed with OR against the
+            # per-band one above (a row is frozen if EITHER says so). Same
+            # FULL FREEZE semantics -- alive rows leave the subset too, so
+            # the pair takes no births AND no deaths -- and the same
+            # release rule, except that this valve's release is the start of
+            # the next RECIPE STEP rather than a revival counter.
+            _shut_w = getattr(self, "_rj_band_shutoff_w", None)
+            if _shut_w is not None and bool(_shut_w.any()):
+                xp_s3 = get_array_module(band_sorter.band_inds)
+                _shut_w_dev = xp_s3.asarray(_shut_w)
+                _shut_w_ok = ~_shut_w_dev[
+                    band_sorter.walker_inds, band_sorter.band_inds]
+                extra_bool = (
+                    _shut_w_ok if extra_bool is None
+                    else (extra_bool & _shut_w_ok)
                 )
 
             # EARLY RJ FLIP (user design 2026-08-14): apply the flip
@@ -9557,7 +9810,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # per-row -log Phi(alpha) normalization) replaces the
                 # untruncated one on BOTH the birth and the death side of
                 # the RJ factors: detailed balance stays exact.
-                _snr_lim = float(buffer_obj.opt_snr_rej_samp_limit)
+                _snr_lim = self._snr_trunc_floor(
+                    buffer_obj.opt_snr_rej_samp_limit)
                 _snr_trunc = (
                     os.environ.get("GB_RJ_SNR_TRUNC_DIST", "1") == "1"
                     and _snr_lim > 0.0
@@ -9789,7 +10043,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # (default OFF). For amp-maximized rows d_h == h_h == snr^2,
             # so det == opt there and the extra test is a no-op anyway.
             opt_snr = xp.sqrt(xp.maximum(h_h, 0.0))
-            _lim = buffer_obj.opt_snr_rej_samp_limit
+            # PER-(WALKER, BAND) floor when the stage schedule is live: the
+            # row's own walker and its FILED band. Filed, not f0-resolved,
+            # is right here because a birth whose drawn f0 leaves its cell
+            # window is already -inf'd by ``out_of_band`` above, so for
+            # every row that survives to this gate the filed band IS the
+            # destination band. Scalar floor -> this is the historical
+            # expression, bit-identically.
+            _lim = self._snr_lim_for_rows(
+                buffer_obj.opt_snr_rej_samp_limit,
+                band_sorter.walker_inds[ids], band_sorter.band_inds[ids])
             _bad_snr = opt_snr < _lim
             if getattr(buffer_obj, "snr_rej_detected", False):
                 det_snr = d_h / xp.maximum(opt_snr, 1e-300)
@@ -9812,7 +10075,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         float(delta_ll[kb].max()),
                         float(xp.median(delta_ll[kb])),
                         float(opt_snr[kb].max()),
-                        float(buffer_obj.opt_snr_rej_samp_limit),
+                        # per-row floor -> report the range the rows
+                        # actually saw, not a scalar that does not exist
+                        float(xp.min(_lim)) if np.ndim(_lim) else float(_lim),
                     )
 
             self._debug_verify_rj_step(
@@ -10033,7 +10298,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 _flat_acc = self._cap_flat_index(
                     t_i[accept], w_i[accept], _cells_acc
                 )
-                _cap_acc = _cap_arr[_cells_acc]
+                # PER-WALKER: the budget's saturation transitions must read
+                # the SAME allowance the pick pool gated on -- the accepted
+                # row's own walker's -- or the scheduler's finish budget
+                # drifts out of step with what the pool will hand out.
+                _cap_acc = self._cap_for_rows(
+                    _cap_arr, w_i[accept], _cells_acc)
                 _alive_acc = alive[accept]
                 if True:  # noqa: SIM108 - keeps the block's indentation
                     # OWN-CELL budget transitions at every divisor
@@ -10432,7 +10702,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # (GB_RJ_SNR_TRUNC_DIST): the truncation boundary and its
             # -log Phi(alpha) normalization enter BOTH density sides, so
             # detailed balance stays exact.
-            _snr_lim = float(buffer_obj.opt_snr_rej_samp_limit)
+            _snr_lim = self._snr_trunc_floor(
+                buffer_obj.opt_snr_rej_samp_limit)
             _snr_trunc = (
                 os.environ.get("GB_RJ_SNR_TRUNC_DIST", "1") == "1"
                 and _snr_lim > 0.0
@@ -10684,7 +10955,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         _n_snr_gated = 0
         if not _force_accept:
             opt_snr_new = xp.sqrt(xp.maximum(h_h_new, 0.0))
-            _lim = buffer_obj.opt_snr_rej_samp_limit
+            # Per-(walker, band) floor: the replaced source's own row. A
+            # replacement is band-scoped (the NEW draw is clamped to the
+            # same cell), so ``b_i`` is both the source's band and the
+            # replacement's. Scalar floor -> historical expression.
+            _lim = self._snr_lim_for_rows(
+                buffer_obj.opt_snr_rej_samp_limit, w_i, b_i)
             _bad_new = opt_snr_new < _lim
             if getattr(buffer_obj, "snr_rej_detected", False):
                 det_snr_new = ((delta_new + 0.5 * h_h_new)
@@ -13690,6 +13966,32 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """
         if not _inmodel_accept_kernel_on():
             return None
+        # PER-WALKER CAPS: the fused gate takes ``dg_cap`` as a FLAT
+        # per-cell array and tests ``counts >= cap[cell]`` inside the
+        # kernel. A per-walker cap is (nwalkers, ncells) and would reach
+        # the raw-pointer ABI flattened, so the kernel would read cell c
+        # of walker 0 for every walker -- in range, never raising, and
+        # wrong. Stand down to the python chain (which is always correct)
+        # rather than teach the kernel a second layout for a path that is
+        # default-OFF.
+        if self._cap_per_walker:
+            self._imk_warn_once(
+                "GB_LEAF_CAP_PER_WALKER=1 gives the cap a walker axis that "
+                "the fused gate's flat per-cell ABI cannot express; standing "
+                "down to the python in-model chain.")
+            return None
+        # SAME STAND-DOWN, same reason, for the per-(walker, band) opt-SNR
+        # floor: ``acc["apply"]`` takes it as a single float in the
+        # raw-pointer ABI and would clamp every walker at walker 0's
+        # boundary -- in range, never raising, and wrong.
+        _lim_tab = getattr(self, "_snr_lim_table", None)
+        if _lim_tab is not None and np.ndim(_lim_tab) == 2:
+            self._imk_warn_once(
+                "GB_SEARCH_STAGE_PER_WALKER=1 gives the opt-SNR floor a "
+                "(walker, band) axis that the fused accept kernel's scalar "
+                "float ABI cannot express; standing down to the python "
+                "in-model chain.")
+            return None
         # Trace knobs win over the accept knob, and are checked FIRST: a
         # traced run must be exact, whatever else is armed.
         if _inmodel_trace_knobs_active():
@@ -14714,7 +15016,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 if getattr(buffer_obj, "d_h_out", None) is not None and keep_any:
                     _hh_im = cp.asarray(buffer_obj.h_h_out).real
                     _opt_im = cp.sqrt(cp.maximum(_hh_im, 0.0))
-                    _lim_im = buffer_obj.opt_snr_rej_samp_limit
+                    # Per-(walker, band) floor on the KEPT subset's own rows
+                    # (``keep_idx`` indexes the repeat's n_sub rows, which
+                    # is what t_s/w_s/b_s are indexed by). Scalar floor ->
+                    # bit-identical to the historical expression.
+                    _lim_im = self._snr_lim_for_rows(
+                        buffer_obj.opt_snr_rej_samp_limit,
+                        w_s[keep_idx], b_s[keep_idx])
                     _viol_im = _opt_im < _lim_im
                     if getattr(buffer_obj, "snr_rej_detected", False):
                         _dh_im = cp.asarray(buffer_obj.d_h_out).real
@@ -16680,9 +16988,46 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             f = self._band_flat_index(t, w, b)
             return xp.stack([lo[f], hi[f]], axis=-1)
 
-        return tempering_swap_cap_ok(
+        # PER-WALKER: each side is scored against the cap of the walker
+        # that will HOLD the sources after the swap. ``cells`` is
+        # (npair, ncells_affected), so the walker index needs a trailing
+        # axis to gather against it. With a shared (1-D) cap both sides
+        # gather the same values and ``cap_b`` is redundant but harmless.
+        def _cap_side(w):
+            return self._cap_for_rows(
+                cap, w[:, None] if np.ndim(cap) == 2 else None, cells)
+
+        ok = tempering_swap_cap_ok(
             _occ(t_a, w_a), _occ(t_b, w_b),
-            _fromband(t_a, w_a), _fromband(t_b, w_b), cap[cells])
+            _fromband(t_a, w_a), _fromband(t_b, w_b),
+            _cap_side(w_a), _cap_side(w_b))
+        # The stage gate and the per-walker valve ride here, composed with
+        # ``&`` so either can only ever REFUSE a swap the cap gate already
+        # allowed. One place, so both _swap_cap_ok call sites (the vertical
+        # sweep and the permuted path) inherit them without either being
+        # touched, and both are already wrapped in the caller's try/except.
+        ok = ok & self._swap_stage_ok(w_a, w_b, b)
+        ok = ok & self._swap_shutoff_ok(w_a, w_b, b)
+        return ok
+
+    def _swap_shutoff_ok(self, w_a, w_b, bands):
+        """Per-pair bool: is neither side of this band swap frozen?
+
+        A shut-off (walker, band) is frozen whole -- "no RJ of any kind, at
+        any temperature, and no tempering swaps", the per-band valve's own
+        rule (2026-08-28), applied to its per-walker twin. Transporting a
+        band INTO a frozen pair would hand it sources it has decided it is
+        done with, and OUT of one would undo the freeze by the back door.
+
+        Vacuously True with the valve off.
+        """
+        shut = getattr(self, "_rj_band_shutoff_w", None)
+        if shut is None:
+            return True
+        xp = get_array_module(bands)
+        b = xp.asarray(bands).astype(xp.int64)
+        s = xp.asarray(shut)
+        return ~(s[xp.asarray(w_a), b] | s[xp.asarray(w_b), b])
 
     def _cap_cell_members(self, band_inds, freqs_hz, resolve_band=False):
         """``(primary, neighbour, has_neighbour)`` cap-cell membership.
@@ -16746,12 +17091,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         cell). With ``nb_cells is None`` (overlap off, or rows known to be
         single-membership) this is exactly the historical single-cell
         expression, bit-identically.
+
+        PER-WALKER: the cap is gathered through :meth:`_cap_for_rows`, so
+        a row is scored against ITS OWN walker's allowance. The occupancy
+        side already was per walker -- ``_cap_flat_index`` is keyed on
+        ``(temp, walker, cell)`` -- so this closes the asymmetry rather
+        than adding one.
         """
         flat = self._cap_flat_index(temp_inds, walker_inds, cells)
-        at = counts[flat] >= cap[cells]
+        at = counts[flat] >= self._cap_for_rows(cap, walker_inds, cells)
         if nb_cells is not None:
             flat_nb = self._cap_flat_index(temp_inds, walker_inds, nb_cells)
-            at = at | (has_nb & (counts[flat_nb] >= cap[nb_cells]))
+            at = at | (has_nb & (
+                counts[flat_nb]
+                >= self._cap_for_rows(cap, walker_inds, nb_cells)))
         return at
 
     def _cap_drift_gate_setup(self, band_sorter):
@@ -16921,9 +17274,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 _memb & (_cell != c_p) & (~c_hn | (_cell != c_nb))
             )
             _flat = self._cap_flat_index(temp_inds, walker_inds, _cell)
+            # PER-WALKER: the destination's allowance is the MOVING ROW'S
+            # OWN walker's, gathered through _cap_for_rows. Both the
+            # disarmed test and the headroom test read the same gathered
+            # value, so a walker whose cap is disarmed stays unconstrained
+            # even while its neighbours are capped.
+            _cap_row = self._cap_for_rows(cap, walker_inds, _cell)
             veto = veto | (
-                _foreign & (cap[_cell] >= 0)
-                & (counts[_flat] >= cap[_cell] + _h)
+                _foreign & (_cap_row >= 0)
+                & (counts[_flat] >= _cap_row + _h)
             )
         return veto
 
@@ -17120,16 +17479,35 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         cell has room, so it joins the all-full test. The last band has no
         upper neighbour (its top half-cell folds into its own final cell).
         """
-        if self._cap_is_band_grid:
-            return counts >= cap
+        xp = get_array_module(counts)
         k = self.cap_divisor
         nb = self.num_bands
-        full = counts.reshape(-1, nb, k) >= cap.reshape(1, nb, k)
+        # PER-WALKER: ``counts``' flat leading axis is ``temp * nwalkers``
+        # (see _cap_flat_index), while a per-walker cap carries only the
+        # walker axis -- the cap is walker-indexed and temperature-UNIFORM.
+        # Tile it over the rungs once, here, so every reshape below keeps
+        # its historical shape and the broadcast against ``counts`` lines
+        # the two axes up correctly. Getting this wrong is invisible: a
+        # (nwalkers, ncells) array broadcasts against (ntemps*nwalkers, ...)
+        # without error whenever ntemps happens to equal nwalkers.
+        if np.ndim(cap) == 2:
+            _nw = int(cap.shape[0])
+            _nt = max(int(counts.shape[0]) // max(_nw * nb * k, 1), 1)
+            cap = xp.broadcast_to(
+                cap.reshape(1, _nw, nb * k), (_nt, _nw, nb * k)
+            ).reshape(_nt * _nw, nb * k)
+            if self._cap_is_band_grid:
+                return counts >= cap.reshape(-1)
+            full = counts.reshape(-1, nb, k) >= cap.reshape(-1, nb, k)
+        else:
+            if self._cap_is_band_grid:
+                return counts >= cap
+            full = counts.reshape(-1, nb, k) >= cap.reshape(1, nb, k)
         sat = full.all(axis=2)
         if self.cap_stagger and nb > 1:
-            xp = get_array_module(counts)
             full_flat = (counts.reshape(-1, nb * k)
-                         >= cap.reshape(1, nb * k))
+                         >= (cap.reshape(-1, nb * k) if np.ndim(cap) == 2
+                             else cap.reshape(1, nb * k)))
             # boundary cell (b+1)*K for bands b = 0 .. nb-2
             sat = xp.concatenate(
                 [sat[:, :-1] & full_flat[:, k::k], sat[:, -1:]], axis=1
@@ -17196,12 +17574,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         At ``cap_divisor == 1`` this is the same expression the
         pre-2026-08-15 code used, so the per-band mask is unchanged there.
         """
-        own = counts[flat] >= cap[cap_inds]
+        _w = band_sorter.walker_inds
+        own = counts[flat] >= self._cap_for_rows(cap, _w, cap_inds)
         if nb_inds is not None:
             flat_nb = self._cap_flat_index(
-                band_sorter.temp_inds, band_sorter.walker_inds, nb_inds
+                band_sorter.temp_inds, _w, nb_inds
             )
-            own = own | (has_nb & (counts[flat_nb] >= cap[nb_inds]))
+            own = own | (has_nb & (
+                counts[flat_nb] >= self._cap_for_rows(cap, _w, nb_inds)))
         return own
 
     def _cap_cells_of_band(self, band_index: int):
@@ -17218,7 +17598,33 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         hold", which is what the cap plot and the band-shutoff rule both
         ask. (SUM would report the band-total allowance, which is not what
         any existing consumer means by ``band_leaf_cap``.)
+
+        PER-WALKER (2026-09-22): the ``_w`` family is the gate's state and
+        the three 1-D cap-cell arrays become MAX-OVER-WALKERS SUMMARIES,
+        refreshed here before the band mirror is taken from them. Every
+        existing reader then keeps its meaning -- "the largest allowance
+        any walker holds in this cell / band" -- which is what the cap plot
+        and the band-shutoff rule ("could this band hold a second source
+        anywhere") both actually ask. The band mirror runs at EVERY
+        divisor in this mode, including the band grid, where
+        ``band_leaf_cap`` stops being the gate array and becomes a mirror
+        like the rest.
         """
+        if self._cap_per_walker:
+            cap_w = bi.get("cap_cell_leaf_cap_w")
+            if cap_w is None:
+                return
+            for _w_name, _shared in CAP_CELL_PER_WALKER_FIELDS:
+                _src, _dst = bi.get(_w_name), bi.get(_shared)
+                if _src is None or _dst is None:
+                    continue
+                _dst[:] = np.asarray(_src).max(axis=0)
+            band_cap = bi.get("band_leaf_cap")
+            if band_cap is not None:
+                band_cap[:] = np.asarray(
+                    bi["cap_cell_leaf_cap"]
+                ).reshape(self.num_bands, self.cap_divisor).max(axis=1)
+            return
         if self._cap_is_band_grid:
             return
         cell_cap = bi.get("cap_cell_leaf_cap")
@@ -17242,10 +17648,21 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         reset: band caps are a mirror on cell grids and never gate, so
         there is no increment to re-converge after.
         """
-        if self._cap_is_band_grid:
+        lls = np.asarray(band_lls)
+        # PER-WALKER mirror (2026-09-22). ``band_best_ll`` is a max over
+        # walkers and so is blind to exactly the spread the per-walker caps
+        # produce; ``band_best_ll_w`` is the per-walker running max, the
+        # only per-band series a snapshot can read the divergence from.
+        # Maintained at EVERY divisor (unlike the shared mirror below,
+        # which the band-grid gate owns) because on the band grid the
+        # per-walker gate reads the cap-cell arrays, not these.
+        best_w = bi.get("band_best_ll_w")
+        if best_w is not None and lls.ndim == 2 and best_w.shape == lls.shape:
+            np.maximum(
+                best_w, np.where(np.isnan(lls), -np.inf, lls), out=best_w)
+        if self._cap_is_band_grid and not self._cap_per_walker:
             return
         best = bi.get("band_best_ll")
-        lls = np.asarray(band_lls)
         if best is None or lls.ndim != 2 or best.shape != (lls.shape[1],):
             return
         # NaN statistics (degenerate residual windows) must never poison
@@ -17253,13 +17670,931 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         cur = np.max(np.where(np.isnan(lls), -np.inf, lls), axis=0)
         np.maximum(best, cur, out=best)
 
+    @property
+    def _cap_per_walker(self) -> bool:
+        """Do the caps carry a WALKER axis? (``GB_LEAF_CAP_PER_WALKER``)
+
+        The single switch every per-walker branch tests. Gated on
+        ``_leaf_cap_enabled`` as well as the flag so a cap-free branch
+        (VGB) can never allocate the family, and so PE -- where caps are
+        disarmed -- is untouched.
+        """
+        return bool(getattr(self, "leaf_cap_per_walker", False)) and bool(
+            getattr(self, "_leaf_cap_enabled", False)
+        )
+
+    # ------------------------------------------------------------------
+    # PER-(WALKER, BAND) SEARCH STAGE
+    # ------------------------------------------------------------------
+
+    @property
+    def _stage_per_walker(self) -> bool:
+        """Does the opt-SNR floor carry a (walker, band) axis?
+
+        The single switch every stage branch tests. Gated on
+        ``is_rj_prop`` as well as the flag: the stage exists to move RJ
+        BIRTH floors, and a move with no RJ surface has nothing for it to
+        gate (the in-model floor still follows the table when the move is
+        an RJ move; a pure in-model move keeps the scalar).
+        """
+        return bool(getattr(self, "search_stage_per_walker", False)) and bool(
+            getattr(self, "is_rj_prop", False)
+        )
+
+    @staticmethod
+    def _stage_arrays(bi):
+        """The ``(stage, occ_last, streak)`` triple, or ``None`` if absent.
+
+        ``None`` means the feature was never armed on this state, which is
+        the flag-off path and must stay allocation-free.
+        """
+        if bi is None or bi.get("band_stage_w") is None:
+            return None
+        return (bi["band_stage_w"], bi["band_stage_occ_last_w"],
+                bi["band_stage_streak_w"])
+
+    @staticmethod
+    def _snr_lim_for_rows(lim, walker_inds, bands):
+        """Per-row opt-SNR floor: ``lim`` (scalar) or ``lim[walker, band]``.
+
+        THE SINGLE PLACE the two floor layouts are distinguished. Keyed on
+        ``np.ndim(lim)`` rather than on the move's flag, for exactly the
+        reason :meth:`_cap_for_rows` is: the floor reaches some gates
+        through the buffer, which took its copy earlier in the propose, and
+        a value that carried its layout in one place and its indexing rule
+        in another is how a gate ends up scoring a row against another
+        walker's prior while every index stays in range and nothing raises.
+
+        Scalar is the historical expression, bit-identically.
+
+        The array module is taken from the ROWS, not from the table: the
+        table is host numpy (it lives in ``band_info``) while the rows are
+        very often CuPy, and resolving on the table would return a host
+        array into a device expression.
+        """
+        if np.ndim(lim) == 0:
+            return lim
+        xp = get_array_module(bands)
+        return xp.asarray(lim)[xp.asarray(walker_inds), xp.asarray(bands)]
+
+    def _stage_snr_limits(self):
+        """``(coarse, fine)`` opt-SNR floors, indexed by stage value."""
+        return (float(self.opt_snr_limit_search_coarse),
+                float(self.opt_snr_limit_search_fine))
+
+    def _build_snr_lim_table(self, new_state):
+        """The live ``(nwalkers, num_bands)`` opt-SNR floor, or ``None``.
+
+        ``None`` is the flag-off answer and every consumer then keeps the
+        scalar it has always used. Rebuilt once per proposal from the
+        persisted stage record so a resume, a mid-run promotion and a
+        multi-rank ship all read the same table.
+        """
+        if not self._stage_per_walker:
+            return None
+        bi = new_state.sub_states[self.branch_name].band_info
+        arrays = self._stage_arrays(bi)
+        if arrays is None:
+            return None
+        stage = np.asarray(arrays[0])
+        coarse, fine = self._stage_snr_limits()
+        # Indexing a 2-element table by the stage value rather than
+        # ``np.where(stage == 1, ...)``: a third stage is then a data
+        # change, and an out-of-range stage raises here instead of being
+        # silently folded into COARSE.
+        lut = np.array([coarse, fine], dtype=float)
+        if stage.size and (stage.min() < 0 or stage.max() >= lut.shape[0]):
+            raise ValueError(
+                f"{self.name}: band_stage_w carries stage values outside "
+                f"[0, {lut.shape[0] - 1}] (min {int(stage.min())}, max "
+                f"{int(stage.max())}). The stage record does not describe "
+                f"this build's floor table, so every row would be scored "
+                f"against the wrong prior boundary."
+            )
+        return lut[stage.astype(int)]
+
+    def _snr_lim_table_for_block(self, table, w0, w1):
+        """The read-only floor table one rank's walker block should receive.
+
+        Same rule, same reason, as :meth:`_cap_table_for_block`: a rank runs
+        with ``self.nwalkers = B`` and every floor lookup goes through
+        ``lim[BLOCK-LOCAL walker, band]``, so an unsliced table would score
+        block-local walker 0 against global walker 0's prior.
+        """
+        if table is None or np.ndim(table) < 2:
+            return table
+        return table[w0:w1]
+
+    def _stage_for_rows(self, stage, walker_inds, bands):
+        """Per-row stage index, for the swap gate and the diagnostics."""
+        xp = get_array_module(stage)
+        return stage[xp.asarray(walker_inds), xp.asarray(bands)]
+
+    def _swap_stage_ok(self, w_a, w_b, bands):
+        """Per-pair bool: do both sides of this band swap share a floor?
+
+        A cross-walker band swap moves the band's sources from one walker's
+        prior into the other's. When the two walkers sit at different
+        stages their opt-SNR floors differ, and a source that is legal in
+        the FINE walker is below the COARSE walker's prior boundary -- the
+        swap would deposit a state outside the prior it lands in, which the
+        in-model gate then force-rejects on every subsequent update rather
+        than merely refusing to birth it.
+
+        The gate is on the STAGE, not on the sources' SNRs. Testing the
+        actual SNRs would need a per-source inner product per swap pair,
+        which this sweep cannot afford; equal stages mean equal floors and
+        therefore no possible violation, so stage equality is a SUFFICIENT
+        condition that costs one comparison. It is conservative -- it also
+        refuses swaps where no source is anywhere near either boundary --
+        and that is the right direction for a gate that can only ever
+        remove swaps from a sweep that does not need detailed balance.
+
+        Vacuously True with the feature off, and for the vertical sweep
+        (which shares a walker, so both sides gather the same row).
+        """
+        if not self._stage_per_walker:
+            return True
+        stage = getattr(self, "_stage_table", None)
+        if stage is None:
+            return True
+        xp = get_array_module(bands)
+        b = xp.asarray(bands).astype(xp.int64)
+        s = xp.asarray(stage)
+        return s[xp.asarray(w_a), b] == s[xp.asarray(w_b), b]
+
+    def _update_search_stages(self, new_state, band_counts) -> None:
+        """Advance the per-(walker, band) search stage (once per iteration).
+
+        Runs immediately after :meth:`_update_band_leaf_caps`, from the same
+        designated move (``leaf_cap_update``) and for the same reason: a
+        second updater would double-advance the streak.
+
+        THE SIGNAL is the cold-chain SOURCE COUNT per (walker, band) --
+        ``band_counts[0]``, the census the cap gate already computes, so
+        this adds no residual work and no kernel call. A band promotes to
+        the FINE floor once that count has been UNCHANGED for
+        ``search_stage_min_iters`` consecutive iterations.
+
+        This is deliberately NOT the cap gate's ``converged`` mask. That
+        mask means "the lnL has plateaued AND this walker is pressed
+        against its allowance", i.e. *the band wants more room* -- close to
+        the opposite of settled. The count-plateau signal already has a
+        proven implementation in this file: the band-shutoff valve's
+        ``band_occ_streak`` / ``band_occ_last`` pair. This is that
+        mechanism with a walker axis.
+
+        Three deliberate choices:
+
+        * **An EMPTY band can never promote.** Its count is trivially
+          unchanged forever, so without the ``occ > 0`` term every empty
+          band would promote itself on a fixed clock -- precisely the
+          ghost-increment failure the cap gate's engagement latch exists to
+          stop (measured: 920 of 1232 cells incrementing in lockstep at
+          iteration 10 on the 3-month run). A band that has found nothing
+          has reached no equilibrium.
+        * **The streak resets to 0, not 1.** A band that just gained a
+          source posts ``min_iters`` FULL quiet iterations, not one fewer.
+        * **Promotion is ONE-WAY.** FINE is a strictly larger prior
+          support; demoting would tighten the floor under an assembled
+          model, and the SNR gate enforces on in-model updates as well as
+          births, so the sources below the restored floor would be frozen
+          out rather than merely un-birthable.
+        """
+        if not self._stage_per_walker:
+            return
+        bi = new_state.sub_states[self.branch_name].band_info
+        arrays = self._stage_arrays(bi)
+        if arrays is None:
+            return
+        stage, occ_last, streak = arrays
+        occ = _to_numpy(band_counts[0]).astype(np.int64)
+        if occ.shape != stage.shape:
+            # Same class of failure the cap gate's row-alignment guard
+            # catches, and the same reason it must raise rather than
+            # broadcast: a census that does not line up row-for-row with
+            # the stage table would promote walker w on another walker's
+            # count, in range and without a word.
+            raise RuntimeError(
+                f"{self.name}: the search-stage latch received a "
+                f"{occ.shape} cold census but the stage table is "
+                f"{stage.shape}. With GB_SEARCH_STAGE_PER_WALKER the two "
+                f"are matched row by row, so this would promote a walker's "
+                f"band on another walker's source count. If the rank layout "
+                f"now has several compute ranks sharing one walker block, "
+                f"the census merge must reduce over ONE rank per block "
+                f"rather than concatenate every compute rank's reply."
+            )
+        same = (occ == occ_last) & (occ_last >= 0)
+        streak[:] = np.where(same, streak + 1, 0)
+        occ_last[:] = occ
+        promote = (
+            (stage == SEARCH_STAGE_COARSE)
+            & (streak >= self.search_stage_min_iters)
+            & (occ > 0)
+        )
+        if np.any(promote):
+            stage[promote] = SEARCH_STAGE_FINE
+            self._log_stage_promotions(promote, occ, streak)
+        # The 1-D mirror: min over walkers, so a band reads FINE only once
+        # EVERY walker agrees (see ensure_search_stage_fields).
+        if bi.get("band_stage") is not None:
+            bi["band_stage"][:] = stage.min(axis=0)
+        self._log_stage_spread(stage)
+
+    def _log_stage_promotions(self, promote, occ, streak) -> None:
+        """Per-(walker, band) promotion breakdown, at decision time."""
+        ws, bs = np.where(promote)
+        coarse, fine = self._stage_snr_limits()
+        logger.info(
+            "[GB_STAGE %s] %d (walker, band) pairs promoted COARSE->FINE "
+            "(opt_snr %.2f -> %.2f); walkers %s.",
+            self.name, int(ws.size), coarse, fine,
+            _compact_index_ranges(np.unique(ws)),
+        )
+        if os.environ.get("GB_SEARCH_STAGE_DIAG", "0") != "1":
+            return
+        _max = int(os.environ.get("GB_SEARCH_STAGE_DIAG_MAX", "20"))
+        be = _to_numpy(self.band_edges)
+        for w, b in list(zip(ws.tolist(), bs.tolist()))[:_max]:
+            logger.info(
+                "[GB_STAGE %s]   w%d band %d [%.4f,%.4f] mHz: occ=%d "
+                "streak=%d -> FINE", self.name, w, b,
+                be[b] * 1e3, be[b + 1] * 1e3,
+                int(occ[w, b]), int(streak[w, b]),
+            )
+
+    # ---- per-(walker, band) RJ shutoff (SEARCH only) -------------------
+
+    @property
+    def _search_shutoff_per_walker(self) -> bool:
+        """Is the per-(walker, band) RJ valve live?
+
+        Three conditions, and the SEARCH one is explicit rather than
+        inferred from the move's name or from ``GB_MODE``: the recipe knows
+        which mode it is building and says so through ``search_mode=``. A
+        knob that silently follows another is how a config change in one
+        place rearms machinery in another with no line saying so -- the
+        anti-pattern ``pe_phase_maximize_on`` was written to end.
+        """
+        return (
+            bool(getattr(self, "search_shutoff_per_walker", False))
+            and bool(getattr(self, "search_mode", False))
+            and bool(getattr(self, "is_rj_prop", False))
+        )
+
+    def begin_recipe_step(self, serial) -> None:
+        """Announce a new recipe step: release the per-walker RJ valve.
+
+        Called from the recipe's ``setup_run`` through
+        :func:`~lisatools.globalfit.recipe.begin_search_recipe_step`, which
+        walks the move tree the same way ``_arm_cap_headroom_grant`` does.
+
+        Releasing here rather than letting the valve decay is the whole
+        point of scoping it to a step: the next step changes the moves, the
+        caps and the floors, so "this band had nothing left to find" is a
+        statement about the configuration that has just been replaced.
+
+        Safe to call on a move with the feature off (it only records the
+        serial), and safe to call repeatedly with the SAME serial -- only a
+        CHANGE releases, so a recipe that re-runs ``setup_run`` for an
+        already-active step does not wipe a valve that step earned.
+        """
+        prev = self._recipe_step_serial
+        self._recipe_step_serial = None if serial is None else int(serial)
+        if prev is not None and prev == self._recipe_step_serial:
+            return
+        self._release_search_band_shutoff("recipe step %s -> %s"
+                                          % (prev, self._recipe_step_serial))
+
+    def _release_search_band_shutoff(self, why: str) -> None:
+        """Reopen every (walker, band) and restart the within-step window.
+
+        CLEARS THE WINDOW, not only the boolean. A step that inherited the
+        previous step's running-best lnL would find nothing able to beat it
+        -- the model is already fitted, so the best is already high -- and
+        would re-freeze on its first patience window, which looks exactly
+        like "converged" and is not. Pinned by a two-consecutive-steps test
+        in ``tests/test_gb_search_stage_schedule``.
+        """
+        self._shutoff_best = None
+        self._shutoff_streak = None
+        self._shutoff_w_pending = None
+        shut = self._rj_band_shutoff_w
+        if shut is None:
+            return
+        n_was = int(shut.sum())
+        shut[:] = False
+        if n_was:
+            logger.info(
+                "[GB_STAGE %s] per-walker RJ valve RELEASED (%s): %d "
+                "(walker, band) pairs reopened.", self.name, why, n_was)
+
+    def _update_search_band_shutoff(self, model, new_state,
+                                    band_counts) -> None:
+        """Freeze a (walker, band) whose cold-chain lnL has converged.
+
+        USER RULING 2026-09-24, superseding the source-count criterion this
+        started as: the quantity that has to converge is the **lnL of the
+        (band, walker)**, not its leaf count. A count can sit still for
+        many iterations while the sampler is still materially improving the
+        fit of the sources it already has -- refining a blend, splitting a
+        confused pair -- and freezing RJ there would end the search in a
+        band that was still paying.
+
+        THE CRITERION is the cap gate's own lnL-plateau test, per
+        (walker, band) and scoped to the current recipe step: the band's
+        cold-chain residual lnL must fail to beat its running best within
+        the step by more than ``_shutoff_ll_tol`` for
+        ``search_shutoff_conv_iter`` CONSECUTIVE iterations. Any
+        qualifying improvement zeroes the counter.
+
+        The tolerance defaults to ``leaf_cap_ndim / 2`` -- D/2 = 4.0 for
+        GBs, the lnL a genuinely new D-parameter source has to buy. That is
+        deliberately the SAME threshold the leaf cap uses, so the two
+        features cannot disagree about what counts as an improvement worth
+        waiting for. ``GB_SEARCH_BAND_SHUTOFF_LL_TOL`` overrides it.
+
+        OCCUPANCY GUARD (``GB_SEARCH_BAND_SHUTOFF_REQUIRE_OCC``, default
+        on): an EMPTY band's residual lnL does not improve either, so
+        without this every empty band would freeze itself after one
+        patience window -- and an empty band is exactly where an
+        undiscovered source lives. This is the ghost-increment failure the
+        cap gate's engagement latch exists to stop, in its valve form.
+
+        THE LNL comes from the cap gate's stash, computed once per
+        iteration for both features (see ``_update_band_leaf_caps``). If
+        that gate did not run this iteration the statistic is recomputed
+        here rather than replayed stale; if it cannot be obtained at all
+        the valve does nothing, which is the permissive direction.
+
+        The running best and the streak are IN-MEMORY and per-step. A
+        restart re-earns the whole window, which leaves bands open longer
+        -- the direction that cannot lose a source.
+        """
+        if not self._search_shutoff_per_walker:
+            return
+        shut = self._rj_band_shutoff_w
+        if shut is None:
+            return
+        lls = self._shutoff_band_lls(model, new_state)
+        if lls is None:
+            return
+        occ = _to_numpy(band_counts[0]).astype(np.int64)
+        if occ.shape != shut.shape or lls.shape != shut.shape:
+            raise RuntimeError(
+                f"{self.name}: the per-walker RJ valve received a "
+                f"{occ.shape} cold census and a {lls.shape} lnL statistic "
+                f"but the valve is {shut.shape}. With "
+                f"GB_SEARCH_BAND_SHUTOFF_PER_WALKER all three are matched "
+                f"row by row, so this would freeze a walker's band on "
+                f"another walker's evidence."
+            )
+        if self._shutoff_best is None or self._shutoff_best.shape != shut.shape:
+            self._shutoff_best = np.full(shut.shape, -np.inf)
+            self._shutoff_streak = np.zeros(shut.shape, dtype=np.int64)
+        tol = self._shutoff_ll_tol()
+        cur = np.where(np.isnan(lls), -np.inf, lls)
+        improved = cur > (self._shutoff_best + tol)
+        np.maximum(self._shutoff_best, cur, out=self._shutoff_best)
+        self._shutoff_streak[improved] = 0
+        self._shutoff_streak[~improved] += 1
+        converged = (
+            (self._shutoff_streak >= self.search_shutoff_conv_iter) & ~shut
+        )
+        if self._shutoff_require_occ():
+            converged &= occ > 0
+        shut[converged] = True
+        self._publish_shutoff_w_pending(shut, occ)
+        if not np.any(converged):
+            self._log_shutoff_w_spread(shut)
+            return
+        ws, bs = np.where(converged)
+        logger.info(
+            "[GB_STAGE %s] per-walker RJ shutoff: %d (walker, band) pairs "
+            "converged in lnL within this recipe step (no improvement > "
+            "%.2f for %d consecutive iterations) -- births AND deaths "
+            "frozen there until the next step; %d of %d pairs now shut.",
+            self.name, int(ws.size), tol, self.search_shutoff_conv_iter,
+            int(shut.sum()), int(shut.size),
+        )
+        if os.environ.get("GB_SEARCH_STAGE_DIAG", "0") == "1":
+            _max = int(os.environ.get("GB_SEARCH_STAGE_DIAG_MAX", "20"))
+            be = _to_numpy(self.band_edges)
+            for w, b in list(zip(ws.tolist(), bs.tolist()))[:_max]:
+                logger.info(
+                    "[GB_STAGE %s]   w%d band %d [%.4f,%.4f] mHz: "
+                    "best=%.3f cur=%.3f occ=%d streak=%d -> SHUT",
+                    self.name, w, b, be[b] * 1e3, be[b + 1] * 1e3,
+                    float(self._shutoff_best[w, b]), float(cur[w, b]),
+                    int(occ[w, b]), int(self._shutoff_streak[w, b]),
+                )
+
+    def _shutoff_ll_tol(self) -> float:
+        """lnL improvement a band must post to keep its valve open.
+
+        Defaults to the leaf cap's own D/2 hold threshold so the two
+        features share one definition of "an improvement worth waiting
+        for". Env: ``GB_SEARCH_BAND_SHUTOFF_LL_TOL``.
+        """
+        env = os.environ.get("GB_SEARCH_BAND_SHUTOFF_LL_TOL", "").strip()
+        if env:
+            return float(env)
+        return 0.5 * float(getattr(self, "leaf_cap_ndim", 8.0) or 8.0)
+
+    @staticmethod
+    def _shutoff_require_occ() -> bool:
+        """Must a band hold a source before its valve can close?"""
+        return os.environ.get(
+            "GB_SEARCH_BAND_SHUTOFF_REQUIRE_OCC", "1") == "1"
+
+    def _shutoff_band_lls(self, model, new_state):
+        """This iteration's ``(nwalkers, nbands)`` cold-chain per-band lnL.
+
+        Prefers the cap gate's stash (computed once per iteration and
+        stamped with the propose counter, so a stale one is detectable);
+        recomputes when the cap gate did not run this iteration; returns
+        ``None`` -- valve inert, the permissive direction -- when neither
+        is available.
+
+        Never reads ``band_info['band_cold_ll']`` as a fallback: on a
+        sub-layer cap grid that array is the CELL statistic the gate wrote
+        over it, and on an iteration where the gate did not run it is last
+        iteration's values. Either would look exactly like a converged
+        band.
+        """
+        stamp = getattr(self, "_stage_band_lls_stamp", None)
+        stash = getattr(self, "_stage_band_lls", None)
+        if stash is not None and stamp == int(getattr(self, "num_proposals", 0)):
+            return np.asarray(stash, dtype=float)
+        try:
+            stats = self._cap_stats_local(model, new_state)
+            return np.asarray(stats["band_lls"], dtype=float)
+        except Exception as exc:  # never break a propose on the valve
+            if not self._shutoff_w_warned_lls:
+                self._shutoff_w_warned_lls = True
+                logger.warning(
+                    "[GB_STAGE %s] the per-walker RJ valve could not obtain "
+                    "this iteration's per-band cold lnL (%r); the valve is "
+                    "inert until it can. Nothing is frozen on a statistic "
+                    "that was not measured.", self.name, exc)
+            return None
+
+
+    def _publish_shutoff_w_pending(self, shut, occ) -> None:
+        """Publish the stage-convergence counter a recipe Stage reads.
+
+        ``_shutoff_w_pending`` is the count of (walker, band) pairs that are
+        OCCUPIED on the cold chain and have NOT yet converged. A recipe
+        stage that wants "every band and walker is shut off" waits for this
+        to reach 0, exactly as the cap-quiescence veto waits for
+        ``_cap_ramp_pending``. Read it through
+        :func:`~lisatools.globalfit.recipe.band_shutoff_w_pending_total`,
+        which sums it over a nested move tree.
+
+        OCCUPIED, not "all", is the load-bearing word. An EMPTY pair can
+        never shut -- ``_update_search_band_shutoff`` requires ``new_max >
+        0``, because a band that has found nothing has not plateaued, it
+        has not started -- so a plain "all pairs shut" criterion would be
+        unreachable in any run with an empty band, which is every run. The
+        empty pairs stay the nleaves-plateau gate's business.
+
+        Published on EVERY update, including the ones where nothing
+        converged and the ones before the window has filled, so a stage
+        reading it can never mistake "not computed yet" for 0. It starts at
+        the occupied-pair count and falls to 0.
+        """
+        self._shutoff_w_pending = int(((occ > 0) & ~shut).sum())
+        self._shutoff_w_shut = int(shut.sum())
+        self._shutoff_w_total = int(shut.size)
+
+    def _log_shutoff_w_spread(self, shut) -> None:
+        """Every-iteration summary; says so while the valve is still inert."""
+        n = int(shut.sum())
+        if n == 0:
+            logger.info(
+                "[GB_STAGE %s] per-walker RJ valve is currently inert: no "
+                "(walker, band) has converged within this recipe step "
+                "(window %d).", self.name, self.search_shutoff_conv_iter)
+            return
+        logger.info(
+            "[GB_STAGE %s] per-walker RJ valve: %d of %d (walker, band) "
+            "pairs shut; per-walker shut counts %s.",
+            self.name, n, int(shut.size), shut.sum(axis=1).tolist())
+
+    def _arm_search_stage(self, state) -> None:
+        """Bind the live stage / valve references and derive the floor table.
+
+        Runs once per propose, next to the cap arming and for the same
+        reasons: the arrays live in ``state.band_info`` (so the store
+        persists them and a resume restores them), the move holds live
+        references that the latch mutates in place, and the derived floor
+        table is rebuilt from them so a resume, a mid-run promotion and a
+        multi-rank ship can never disagree about what the floor is.
+
+        Everything here is ``None`` with both features off, which is what
+        keeps the scalar-floor path bit-identical.
+        """
+        self._stage_table = None
+        self._snr_lim_table = None
+        self._rj_band_shutoff_w = None
+        bi = None
+        try:
+            bi = state.sub_states[self.branch_name].band_info
+        except (AttributeError, KeyError):
+            return
+        if self._stage_per_walker:
+            arrays = self._stage_arrays(bi)
+            if arrays is not None:
+                self._stage_table = arrays[0]
+                self._snr_lim_table = self._build_snr_lim_table(state)
+        if self._search_shutoff_per_walker:
+            shut = bi.get("band_rj_shutoff_w")
+            if shut is None:
+                # REQUESTED BUT UNALLOCATED. This is the one way the valve
+                # can be fully configured and still do nothing, and since
+                # the valve is load-bearing for the search schedule it must
+                # not pass quietly: the state was built without
+                # ``search_shutoff_per_walker=True``, which happens when the
+                # knob reached the move but not
+                # ``initialize_band_information`` (a hand-built state, or a
+                # settings object the recipe read for one and not the
+                # other).
+                raise RuntimeError(
+                    f"{self.name}: GB_SEARCH_BAND_SHUTOFF_PER_WALKER is on "
+                    f"for this move, but the state carries no "
+                    f"'band_rj_shutoff_w' array, so the valve would be a "
+                    f"silent no-op. The state must be built with "
+                    f"initialize_band_information(..., "
+                    f"search_shutoff_per_walker=True) -- the same setting "
+                    f"that reached the move has to reach the state."
+                )
+            self._rj_band_shutoff_w = shut
+            # STEP STAMP. The move stamps the serial it is running under; a
+            # stored valve earned in a DIFFERENT step is released rather
+            # than honoured, because the step it was measured under is over
+            # (see begin_recipe_step).
+            stamp = bi.get("band_shutoff_w_step")
+            serial = self._recipe_step_serial
+            if serial is None:
+                # NOBODY ANNOUNCED A STEP. The valve still works, but it
+                # never RELEASES -- and a valve that only ever closes will
+                # freeze the whole search. Warn once rather than let that
+                # be discovered from a run that stopped finding sources.
+                if not self._shutoff_w_warned_mode:
+                    self._shutoff_w_warned_mode = True
+                    logger.warning(
+                        "[GB_STAGE %s] the per-walker RJ valve is live but "
+                        "no recipe step has announced itself, so nothing "
+                        "will ever RELEASE it and every pair it shuts stays "
+                        "shut for the rest of the run. A recipe step's "
+                        "setup_run must call "
+                        "recipe.begin_search_recipe_step(moves, serial); "
+                        "a bare sample() loop should call "
+                        "move.begin_recipe_step(n) itself.", self.name)
+            elif stamp is not None and int(stamp[0]) != int(serial):
+                self._release_search_band_shutoff(
+                    f"stored step {int(stamp[0])} != current {int(serial)}")
+                stamp[0] = int(serial)
+        self._log_stage_arm()
+
+    def _log_stage_arm(self) -> None:
+        """Arming line. Fires in BOTH modes, so a flag that did not take is
+        impossible to miss -- the same rule the cap's arming log follows."""
+        if self._stage_armed_logged:
+            return
+        self._stage_armed_logged = True
+        if self._stage_per_walker and self._snr_lim_table is not None:
+            coarse, fine = self._stage_snr_limits()
+            logger.info(
+                "[GB_STAGE %s] opt-SNR floors are PER (WALKER, BAND): "
+                "%d walkers x %d bands, COARSE %.2f -> FINE %.2f after %d "
+                "unchanged-count iterations.", self.name,
+                *np.shape(self._snr_lim_table), coarse, fine,
+                self.search_stage_min_iters)
+        else:
+            logger.info(
+                "[GB_STAGE %s] opt-SNR floor is SHARED (scalar %.2f); "
+                "GB_SEARCH_STAGE_PER_WALKER is off.",
+                self.name, float(self.opt_snr_rej_samp_limit))
+        if self._search_shutoff_per_walker and self._rj_band_shutoff_w is not None:
+            logger.info(
+                "[GB_STAGE %s] per-walker RJ shutoff valve is LIVE "
+                "(%d walkers x %d bands, window %d, released at every "
+                "recipe step).", self.name,
+                *np.shape(self._rj_band_shutoff_w),
+                self.search_shutoff_conv_iter)
+        elif getattr(self, "search_shutoff_per_walker", False):
+            logger.info(
+                "[GB_STAGE %s] per-walker RJ shutoff valve requested but "
+                "NOT live (search_mode=%s, is_rj_prop=%s). It is a "
+                "SEARCH-only, RJ-only valve.", self.name,
+                bool(getattr(self, "search_mode", False)),
+                bool(getattr(self, "is_rj_prop", False)))
+
+    @staticmethod
+    def _snr_trunc_floor(lim) -> float:
+        """The SCALAR boundary the SNR-truncated distance draw is built on.
+
+        ``GB_RJ_SNR_TRUNC_DIST`` truncates the birth/replace distance draw
+        at the SNR floor and charges the truncated density -- including its
+        per-row ``-log Phi(alpha)`` normalization -- on BOTH sides of the RJ
+        factor, so detailed balance stays exact only while the boundary the
+        density is normalized against is the boundary the draw actually
+        used.
+
+        With a per-(walker, band) floor the obvious move is to truncate each
+        row at its own value. This deliberately does NOT: it takes the
+        MINIMUM floor in force anywhere and truncates every row there.
+
+        Why the minimum and not the row's own: the truncation is an
+        EFFICIENCY device, not a correctness one (the hard clamp downstream
+        is what actually enforces the boundary). Truncating at the minimum
+        is strictly WIDER than any row needs, so no row is ever drawn
+        outside a region its own density covers -- a coarse-floor row can
+        still draw below its own floor and be clamped, exactly as it was
+        before the truncation existed. Truncating each row at its own floor
+        would also be correct, but it makes the normalization per-row in a
+        second place and buys only the proposals a coarse row would have
+        wasted; the min keeps one scalar flowing through
+        ``_snr_trunc_alpha`` and cannot desynchronize the two density
+        sides.
+        """
+        if np.ndim(lim) == 0:
+            return float(lim)
+        return float(np.min(_to_numpy(lim)))
+
+    def _live_snr_lim(self):
+        """The opt-SNR floor to hand the sorter/buffer this propose.
+
+        The ``(nwalkers, nbands)`` table when the stage schedule is live,
+        otherwise the scalar the move has always passed. ONE accessor, so
+        the two construction sites cannot drift apart.
+        """
+        table = getattr(self, "_snr_lim_table", None)
+        if table is None:
+            return self.opt_snr_rej_samp_limit
+        return table
+
+    def _log_stage_spread(self, stage) -> None:
+        """Every-iteration summary; says so when the latch is still inert."""
+        n_fine = int((stage == SEARCH_STAGE_FINE).sum())
+        if n_fine == 0:
+            logger.info(
+                "[GB_STAGE %s] search stages are currently inert: every "
+                "(walker, band) is COARSE (patience %d unchanged-count "
+                "iterations).", self.name, self.search_stage_min_iters)
+            return
+        per_w = (stage == SEARCH_STAGE_FINE).sum(axis=1)
+        logger.info(
+            "[GB_STAGE %s] stage spread: %d of %d (walker, band) pairs are "
+            "FINE; per-walker FINE band counts %s.",
+            self.name, n_fine, int(stage.size), per_w.tolist(),
+        )
+
+    def _cap_table_for_block(self, cap, w0, w1):
+        """The read-only cap table one rank's walker block should receive.
+
+        SHARED cap (1-D, per cell): every rank gets the whole thing -- a
+        cap indexed by cell alone means the same for every walker.
+
+        PER-WALKER cap (2-D): the rank gets rows ``[w0, w1)`` and nothing
+        else. A rank runs with ``self.nwalkers = B`` and every cap lookup
+        goes through ``cap[BLOCK-LOCAL walker, cell]``, so an unsliced
+        table would gate block-local walker 0 against GLOBAL walker 0's
+        allowance on every rank. Nothing raises when that happens -- the
+        indices stay in range on every rank -- so the failure would be a
+        silently wrong gate, not a crash. The slice is the same rule
+        ``_sched_block`` applies to the per-walker scan schedule.
+
+        Read-only, like every other shipped table: the head arms, advances
+        and persists the caps, and a rank must never see them move under
+        it mid-propose.
+        """
+        if cap is None:
+            return None
+        if np.ndim(cap) == 1:
+            return self._ro_table(cap)
+        return self._ro_table(cap[int(w0):int(w1)])
+
+    def _check_rank_stage_table(self, name, table, block_width) -> None:
+        """The RECEIVING end of :meth:`_snr_lim_table_for_block`.
+
+        Exactly :meth:`_check_rank_cap_table`'s job for the stage family,
+        and it exists for exactly the same reason: a rank takes the table
+        out of its payload and runs, so a head that shipped the full N-row
+        table would have every rank score BLOCK-LOCAL walker 0 against
+        GLOBAL walker 0's floor -- every index in range, nothing raised,
+        nothing logged. This is the one failure mode the multi-rank layout
+        can produce invisibly, so it gets a check rather than a comment.
+        """
+        if table is None or np.ndim(table) < 2:
+            return
+        _b = int(block_width)
+        if int(np.shape(table)[0]) != _b:
+            raise RuntimeError(
+                f"{self.name}: this rank was shipped a per-walker "
+                f"{name} with {int(np.shape(table)[0])} walker rows but "
+                f"its walker block is {_b} wide. A rank indexes it with "
+                f"BLOCK-LOCAL walker indices, so it would score its "
+                f"walkers against another block's floors. The head must "
+                f"slice with _snr_lim_table_for_block(table, w0, w1) "
+                f"before shipping it."
+            )
+        if not getattr(self, "_stage_rank_logged", False):
+            self._stage_rank_logged = True
+            logger.info(
+                "[GB_STAGE %s] rank stage tables: %d walkers x %d bands.",
+                self.name, *np.shape(table))
+
+    def _check_rank_cap_table(self, cap, block_width) -> None:
+        """The RECEIVING end of :meth:`_cap_table_for_block`.
+
+        Every other ``[GB_CAP_PW]`` line is head-side. A rank simply takes
+        ``tables["cap_leaf_cap"]`` out of its payload and runs, so if the
+        head shipped the full N-row table (or the wrong block) the rank
+        gates BLOCK-LOCAL walker 0 against GLOBAL walker 0's allowance --
+        every index in range, nothing raised, nothing logged. On a
+        multi-rank run that is the one place the slice can be wrong
+        invisibly, which is exactly why it gets a check rather than a
+        comment.
+
+        Refuses on a row-count mismatch and logs once per process what
+        this rank actually received, so a 4-GPU launch can be confirmed
+        from the rank logs instead of inferred.
+
+        A SHARED (1-D) cap is correct at any block width -- a cap indexed
+        by cell alone means the same thing for every walker.
+        """
+        if cap is None or np.ndim(cap) == 1:
+            return
+        _b = int(block_width)
+        if int(np.shape(cap)[0]) != _b:
+            raise RuntimeError(
+                f"{self.name}: this rank was shipped a per-walker cap "
+                f"table with {int(np.shape(cap)[0])} walker rows but its "
+                f"walker block is {_b} wide. A rank indexes the cap with "
+                f"BLOCK-LOCAL walker indices, so it would gate its "
+                f"walkers against another block's allowances. The head "
+                f"must slice the table with _cap_table_for_block(cap, "
+                f"w0, w1) before shipping it."
+            )
+        if not getattr(self, "_cap_pw_rank_logged", False):
+            self._cap_pw_rank_logged = True
+            logger.info(
+                "[GB_CAP_PW %s] rank cap table: PER WALKER, %d walkers x "
+                "%d cap cells for this block (caps %d-%d).",
+                self.name, _b, int(np.shape(cap)[1]),
+                int(np.min(cap)), int(np.max(cap)),
+            )
+
+    def _log_per_walker_arm(self, cap_arr) -> None:
+        """``[GB_CAP_PW]`` one line, ONCE per process, when the caps bind.
+
+        States plainly which cap layout this process is running, how wide
+        the table is, and what the caps looked like when it adopted them
+        -- all-sentinel (fresh), uniform (a broadcast seed from a store
+        written before the flag, or a fresh arm) or already spread (a
+        genuine resume of per-walker state). A run whose per-walker caps
+        silently failed to allocate is the failure this makes impossible
+        to miss: the line simply says ``SHARED``.
+        """
+        if getattr(self, "_cap_pw_armed_logged", False):
+            return
+        self._cap_pw_armed_logged = True
+        cap_arr = np.asarray(cap_arr)
+        if not self._cap_per_walker:
+            logger.info(
+                "[GB_CAP_PW %s] leaf caps are SHARED across walkers "
+                "(GB_LEAF_CAP_PER_WALKER off); table %s.",
+                self.name, tuple(cap_arr.shape),
+            )
+            return
+        if bool(np.all(cap_arr < 0)):
+            _origin = "fresh (all disarmed)"
+        elif int(cap_arr.shape[0]) > 1 and bool(
+                np.any(cap_arr.max(axis=0) != cap_arr.min(axis=0))):
+            _origin = "resumed (walkers already differ)"
+        else:
+            _origin = "uniform (fresh arm, or seeded by broadcast from a "
+            _origin += "store written without the flag)"
+        logger.info(
+            "[GB_CAP_PW %s] leaf caps are PER WALKER: %d walkers x %d cap "
+            "cells, caps %d-%d, %s.",
+            self.name, int(cap_arr.shape[0]), int(cap_arr.shape[1]),
+            int(cap_arr.min()), int(cap_arr.max()), _origin,
+        )
+
+    def _log_per_walker_increments(self, converged, cap, cap_pre, iters_pre,
+                                   best_pre, cur, occ) -> None:
+        """``[GB_CAP_PW]``: who incremented, and on what evidence.
+
+        WHY THIS IS NOT OPTIONAL. The shared-cap gate has twice produced
+        increments that could not be explained after the fact from the
+        store -- most recently snapshot 19, where the occupancy-at-cap
+        condition held for 2 of 54 observed increments under every census
+        and grid tried, because the store records the state at SAVE time
+        and the decision was taken against an occupancy that had moved on.
+        The only fix is to log the decision's own inputs at the moment it
+        is taken, from the arrays the gate actually read.
+
+        The INFO line is the per-walker breakdown (cheap, one line per
+        iteration that increments). ``GB_CAP_PW_DIAG=1`` adds one DEBUG-
+        level-detail line per increment carrying the full tuple --
+        walker, cell, the cell's frequency edges, occupancy, cap before,
+        patience, running best and current statistic -- capped at
+        ``GB_CAP_PW_DIAG_MAX`` rows (default 20) so a lockstep iteration
+        cannot flood the run log.
+        """
+        w_idx, c_idx = np.where(converged)
+        per_w = np.bincount(w_idx, minlength=cap.shape[0])
+        logger.info(
+            "[GB_CAP_PW %s] leaf cap incremented for %d (walker, cell) "
+            "pairs across %d cell(s); per walker %s -> new caps %d-%d "
+            "(ensemble cap min/max %d/%d).",
+            self.name, int(w_idx.size), int(np.unique(c_idx).size),
+            ", ".join(f"w{w}:{int(n)}" for w, n in enumerate(per_w)),
+            int(cap[w_idx, c_idx].min()), int(cap[w_idx, c_idx].max()),
+            int(cap.min()), int(cap.max()),
+        )
+        if os.environ.get("GB_CAP_PW_DIAG", "0") != "1":
+            return
+        _max = int(os.environ.get("GB_CAP_PW_DIAG_MAX", "20") or 20)
+        _edges = np.asarray(getattr(self, "cap_edges", []), dtype=float)
+        for _i in range(min(_max, int(w_idx.size))):
+            w, c = int(w_idx[_i]), int(c_idx[_i])
+            _lo = float(_edges[c]) if _edges.size > c else float("nan")
+            _hi = float(_edges[c + 1]) if _edges.size > c + 1 else float("nan")
+            logger.info(
+                "[GB_CAP_PW %s]   w%d cell %d [%.6f, %.6f] mHz: occ=%s "
+                "cap %s -> %d, iters=%s, best=%.4f, cur=%.4f",
+                self.name, w, c, _lo * 1e3, _hi * 1e3,
+                (int(np.asarray(occ)[w, c]) if occ is not None else "n/a"),
+                (int(cap_pre[w, c]) if cap_pre is not None else "n/a"),
+                int(cap[w, c]),
+                (int(iters_pre[w, c]) if iters_pre is not None else "n/a"),
+                (float(best_pre[w, c]) if best_pre is not None
+                 else float("nan")),
+                float(np.asarray(cur)[w, c]),
+            )
+        if int(w_idx.size) > _max:
+            logger.info(
+                "[GB_CAP_PW %s]   ... %d further increments suppressed "
+                "(GB_CAP_PW_DIAG_MAX=%d).",
+                self.name, int(w_idx.size) - _max, _max,
+            )
+
+    def _log_per_walker_cap_spread(self, cap) -> None:
+        """``[GB_CAP_PW]`` divergence summary -- is this mode doing anything?
+
+        If every walker ramps in lockstep the per-walker caps are inert and
+        the run should say so in one line rather than leave it to be
+        discovered by a snapshot analysis. Reports the number of cells
+        where the walkers disagree and the largest disagreement.
+        """
+        cap = np.asarray(cap)
+        if cap.ndim != 2 or cap.shape[0] < 2:
+            return
+        span = cap.max(axis=0) - cap.min(axis=0)
+        n_div = int((span > 0).sum())
+        if n_div == 0:
+            logger.info(
+                "[GB_CAP_PW %s] cap spread: every walker holds the SAME cap "
+                "in all %d cells (per-walker caps are currently inert).",
+                self.name, int(cap.shape[1]),
+            )
+            return
+        _worst = int(np.argmax(span))
+        logger.info(
+            "[GB_CAP_PW %s] cap spread: %d/%d cells differ between walkers, "
+            "max spread %d (cell %d: %s).",
+            self.name, n_div, int(cap.shape[1]), int(span.max()), _worst,
+            np.asarray(cap[:, _worst]).astype(int).tolist(),
+        )
+
     def _cap_state_arrays(self, bi):
         """``(cap, iters, best)`` for whichever grid drives the caps.
 
         At ``cap_divisor == 1`` these ARE the band arrays -- no cap-cell
         arrays are allocated at all, so a store written before the cap grid
         existed resumes untouched and the whole gate is bit-identical.
+
+        PER-WALKER (2026-09-22) returns the ``(nwalkers, ncells)`` ``_w``
+        family instead, at EVERY divisor. The divisor-1 short circuit below
+        cannot serve it: the band arrays it hands back have no walker axis
+        to stand in for. The 1-D arrays are still maintained, as
+        max-over-walkers mirrors (:meth:`_mirror_band_leaf_cap`), so the
+        monitor and the diagnostic scripts keep reading what they always
+        have.
         """
+        if self._cap_per_walker:
+            ensure_cap_cell_fields(bi, self.num_cap_cells,
+                                   staggered=self.cap_stagger,
+                                   per_walker=True)
+            return (
+                bi["cap_cell_leaf_cap_w"], bi["cap_cell_iters_w"],
+                bi["cap_cell_best_ll_w"],
+            )
         if self._cap_is_band_grid:
             return (
                 bi["band_leaf_cap"], bi["band_cap_iters"], bi["band_best_ll"],
@@ -17270,6 +18605,25 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             bi["cap_cell_leaf_cap"], bi["cap_cell_iters"],
             bi["cap_cell_best_ll"],
         )
+
+    @staticmethod
+    def _cap_for_rows(cap, walker_inds, cells):
+        """Per-row cap value: ``cap[cells]`` or ``cap[walker_inds, cells]``.
+
+        THE SINGLE PLACE the two cap layouts are distinguished. Keyed on
+        ``cap.ndim`` rather than on the move's flag, deliberately: the cap
+        reaches some gates as a device-side snapshot taken earlier in the
+        propose (``_cap_drift_gate_setup``, ``_replace_cap_state``,
+        ``_live_cap_state``), and a snapshot that carried its layout in one
+        place and its indexing rule in another is exactly how a gate ends
+        up scoring against the wrong walker's allowance while every index
+        stays in range and nothing raises.
+
+        1-D is the historical expression, bit-identically.
+        """
+        if np.ndim(cap) == 1:
+            return cap[cells]
+        return cap[walker_inds, cells]
 
     def _cap_cells_resolvable(self, acs) -> bool:
         """Can the RESIDUAL resolve one cap cell from the next?
@@ -17865,6 +19219,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         if ("band_cold_ll" in bi
                 and bi["band_cold_ll"].shape == band_lls.shape):
             bi["band_cold_ll"][:] = band_lls
+        # STASH for the per-(walker, band) RJ shutoff valve, which runs
+        # immediately after this gate and needs the SAME per-band cold lnL.
+        # Handing it over here rather than letting it re-derive the
+        # statistic keeps one residual pass per iteration and guarantees
+        # the two features can never disagree about what this iteration's
+        # lnL was. Stamped so a stale stash (this gate skipped) is
+        # detectable rather than silently replayed.
+        self._stage_band_lls = np.array(band_lls, copy=True)
+        self._stage_band_lls_stamp = int(getattr(self, "num_proposals", 0))
         # Cell grids: the gate below never touches the band-level running
         # best, so track it here (no-op on the band grid, where the gate
         # owns it). User ask 2026-09-02.
@@ -17881,7 +19244,49 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # (overwriting the residual-window series written above,
                 # which is empty/degenerate on sub-layer band grids).
                 bi["band_cold_ll"][:] = lls
-        cur_max = lls.max(axis=0)
+        # THE WALKER-AXIS COLLAPSE, and the one place it is skipped.
+        # Shared caps reduce the (nwalkers, ncells) statistic to one series
+        # per cell; per-walker caps keep it, and every term below is
+        # elementwise either way, so the whole gate is shape-polymorphic
+        # from here on. ``_pw`` is read once so the two layouts cannot
+        # disagree mid-gate.
+        _pw = self._cap_per_walker
+        if _pw and np.shape(lls)[0] != np.shape(cap)[0]:
+            # ROW ALIGNMENT IS NOW LOAD-BEARING. The shared cap reduced
+            # this statistic with ``max(axis=0)``, which is indifferent to
+            # how many rows arrive and in what order -- a duplicated or
+            # missing walker changed nothing. Per-walker caps index
+            # ``cap[w, c]`` against ``lls[w, c]`` POSITIONALLY, so a row
+            # count that disagrees with the cap table means the gate would
+            # score walker w on some other walker's series, in range and
+            # without raising.
+            #
+            # The realistic source is the multi-rank merge, which
+            # concatenates each compute rank's block on the walker axis.
+            # That is exactly N rows only while ``layout.block_of``
+            # PARTITIONS the walker axis. A layout where several ranks
+            # share a walker block (GPUs > walkers) would deliver N x R
+            # rows, and this is where that has to stop.
+            #
+            # SCOPE, honestly: this checks the row COUNT, not the row
+            # ORDER. A merge that returned N rows permuted would still
+            # mis-gate silently. The count is what the shared-block layout
+            # actually breaks; ordering is guaranteed upstream by the
+            # merge iterating ``layout.compute_ranks`` over contiguous
+            # ascending blocks, and there is no cheap invariant to assert
+            # here that would add to it.
+            raise RuntimeError(
+                f"{self.name}: the cap gate received "
+                f"{np.shape(lls)[0]} walker rows of the cell statistic but "
+                f"the per-walker cap table has {np.shape(cap)[0]} walkers. "
+                "With GB_LEAF_CAP_PER_WALKER the two are matched row by "
+                "row, so this would gate a walker against another "
+                "walker's evidence. If the rank layout now has several "
+                "compute ranks sharing one walker block, the cap-stats "
+                "merge must reduce over ONE rank per block rather than "
+                "concatenate every compute rank's reply."
+            )
+        cur_max = lls if _pw else lls.max(axis=0)
         _occ_max = None
         _occ_w = None   # per-cold-walker census the gate used (diag below)
 
@@ -17972,7 +19377,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 _occ_w = _to_numpy(
                     self._cold_occupancy(band_counts, new_state)
                 )
-                _occ_max = _occ_w.max(axis=0)
+                # PER-WALKER: no reduction. ``_occ_max`` keeps its name
+                # (it is the occupancy the gate scores against) but is the
+                # full (nwalkers, ncells) array, so engagement and the
+                # occupancy-at-cap term below both run per walker.
+                _occ_max = _occ_w if _pw else _occ_w.max(axis=0)
                 _occ_any = _occ_max > 0
                 _prev = getattr(self, "_cap_ll_prev_stat", None)
                 if _prev is None or _prev.shape != cur_max.shape:
@@ -18048,8 +19457,35 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # conservative direction. Nothing is added to the store,
                 # so this changes no on-disk layout and no resume.
                 if os.environ.get("GB_LEAF_CAP_ALL_WALKERS", "0") == "1":
-                    converged &= self._cap_all_walkers_converged(
-                        lls, _occ_w, thresh, _tol)
+                    if _pw:
+                        # SUBSUMED (2026-09-22). This flag's whole job was
+                        # to make a SHARED cap wait for every walker's own
+                        # plateau. Per-walker caps do not share, so there
+                        # is nothing left for it to tighten -- and its
+                        # reduction (``.any(axis=0)`` over walkers) would
+                        # silently broadcast one walker's readiness across
+                        # the walker axis it no longer collapses. Honored
+                        # as a no-op, loudly and once, so an existing
+                        # runbook that still exports it does not quietly
+                        # change meaning.
+                        # getattr, not attribute access: the move is
+                        # deepcopied and rebuilt across resumes, and a
+                        # once-only log latch must never be the thing that
+                        # raises inside the cap gate.
+                        if not getattr(
+                                self, "_cap_pw_warned_all_walkers", False):
+                            self._cap_pw_warned_all_walkers = True
+                            logger.warning(
+                                "[GB_CAP_PW %s] GB_LEAF_CAP_ALL_WALKERS=1 is "
+                                "IGNORED while GB_LEAF_CAP_PER_WALKER=1: the "
+                                "per-walker caps already run one plateau "
+                                "clock per walker, which is what that flag "
+                                "approximated on a shared cap. Remove it "
+                                "from the launch environment.", self.name,
+                            )
+                    else:
+                        converged &= self._cap_all_walkers_converged(
+                            lls, _occ_w, thresh, _tol)
         elif self.leaf_cap_iter_only:
             best[:] = np.maximum(best, cur_max)
             iters += 1
@@ -18061,12 +19497,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             best[:] = np.maximum(best, cur_max)
             iters += 1
             tol = self.leaf_cap_ll_nsigma * np.sqrt(np.maximum(dof, 0) / 2.0)
+            # PER-WALKER: the spread test is per walker against its own
+            # running best, and the occupancy test against its own cap --
+            # the same two reductions dropped from the default gate above.
             converged = (iters >= self.leaf_cap_min_iters) & (
-                (best - lls.min(axis=0)) <= tol
+                (best - (lls if _pw else lls.min(axis=0))) <= tol
             )
             if self.leaf_cap_require_occupancy:
-                cold_counts = self._cold_occupancy(band_counts, new_state)
-                converged &= cold_counts.max(axis=0) >= cap
+                cold_counts = _to_numpy(
+                    self._cold_occupancy(band_counts, new_state))
+                converged &= (
+                    cold_counts if _pw else cold_counts.max(axis=0)
+                ) >= cap
         # THE PER-CELL CEILING IS THE FULL BRANCH ``nleaves_max``, NOT
         # ``nleaves_max / K`` (user intent 2026-08-15: caps SMALLER locally,
         # but the band-level TOTAL allowance never TIGHTER than today). A
@@ -18087,37 +19529,62 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         _unit = "cap cells" if not self._cap_is_band_grid else "bands"
         if np.any(converged):
-            inc = np.where(converged)[0]
-            # Per-cell increment diagnostic (user request 2026-09-22): the
-            # store cannot say which sources drive a cap rise, and on the
-            # 6mo snapshot-19 store the occupancy-at-cap condition could
-            # not be reproduced for 52 of 54 increments under any census.
-            # Runs BEFORE the counters are mutated so it reports the state
-            # the gate actually judged. GB_CAP_INC_DIAG=0 silences it.
-            if os.environ.get("GB_CAP_INC_DIAG", "1") == "1":
-                try:
-                    self._log_cap_increments(
-                        new_state, band_counts, inc, cap, iters, best,
-                        cur_max, _occ_w)
-                except Exception as exc:  # diag must never break the gate
-                    logger.warning(
-                        f"{self.name}: [GB_CAP_INC] diagnostic failed: "
-                        f"{exc!r}")
+            _cap_pre = np.array(cap, copy=True) if _pw else None
+            _iters_pre = np.array(iters, copy=True) if _pw else None
+            _best_pre = np.array(best, copy=True) if _pw else None
+            if not _pw:
+                inc = np.where(converged)[0]
+                # Per-cell increment diagnostic (user request 2026-09-22):
+                # the store cannot say which sources drive a cap rise, and
+                # on the 6mo snapshot-19 store the occupancy-at-cap
+                # condition could not be reproduced for 52 of 54 increments
+                # under any census. Runs BEFORE the counters are mutated so
+                # it reports the state the gate actually judged.
+                # GB_CAP_INC_DIAG=0 silences it.
+                #
+                # SHARED-CAP ONLY, and that guard is load-bearing rather
+                # than tidy: this diagnostic takes ``inc`` as a CELL index
+                # vector, but under per-walker caps ``converged`` is
+                # (nwalkers, ncells) and ``np.where(converged)[0]`` is the
+                # WALKER axis -- in range, never raising, and reporting
+                # walker indices as cells. The per-walker path has its own
+                # (walker, cell) diagnostic below, which is strictly more
+                # informative anyway.
+                if os.environ.get("GB_CAP_INC_DIAG", "1") == "1":
+                    try:
+                        self._log_cap_increments(
+                            new_state, band_counts, inc, cap, iters, best,
+                            cur_max, _occ_w)
+                    except Exception as exc:  # diag must never break the gate
+                        logger.warning(
+                            f"{self.name}: [GB_CAP_INC] diagnostic failed: "
+                            f"{exc!r}")
             cap[converged] += 1
             iters[converged] = 0
             best[converged] = -np.inf
-            # The per-walker clocks follow the aggregate one: the next
-            # allowance must be re-earned by every engaged walker.
-            _iw = getattr(self, "_cap_iters_w", None)
-            if _iw is not None and _iw.shape[-1] == converged.shape[0]:
-                _iw[:, converged] = 0
-                self._cap_best_w[:, converged] = -np.inf
-            logger.info(
-                f"{self.name}: leaf cap incremented for {len(inc)} {_unit} "
-                f"{_compact_index_ranges(inc)} -> caps "
-                f"{int(cap[inc].min())}-{int(cap[inc].max())}."
-            )
+            if _pw:
+                # (walker, cell) pairs, not cells: the increment is a
+                # per-walker event now and a cell-only count would hide
+                # exactly the divergence this mode exists to produce.
+                self._log_per_walker_increments(
+                    converged, cap, _cap_pre, _iters_pre, _best_pre,
+                    cur_max, _occ_max)
+            else:
+                inc = np.where(converged)[0]
+                # The per-walker clocks follow the aggregate one: the next
+                # allowance must be re-earned by every engaged walker.
+                _iw = getattr(self, "_cap_iters_w", None)
+                if _iw is not None and _iw.shape[-1] == converged.shape[0]:
+                    _iw[:, converged] = 0
+                    self._cap_best_w[:, converged] = -np.inf
+                logger.info(
+                    f"{self.name}: leaf cap incremented for {len(inc)} "
+                    f"{_unit} {_compact_index_ranges(inc)} -> caps "
+                    f"{int(cap[inc].min())}-{int(cap[inc].max())}."
+                )
         self._mirror_band_leaf_cap(bi)
+        if _pw:
+            self._log_per_walker_cap_spread(cap)
         # Publish the RAMP-PENDING count for the search-stage convergence
         # veto (recipe.RJRecipeStep.stopping_function reads it off the
         # move): cells actively counting toward a REAL increment -- armed,
@@ -18138,6 +19605,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             and _seen_pub is not None
             and _seen_pub.shape == np.shape(cap)
         ):
+            # PER-WALKER: every term is already (nwalkers, ncells), so this
+            # counts (walker, cell) pairs still mid-ramp. That is the right
+            # generalization for the stage veto, which only asks "is
+            # anything still ramping"; a cell-only count would hide a
+            # single laggard walker still climbing.
             self._cap_ramp_pending = int(np.sum(
                 (cap >= 1) & _seen_pub & (_occ_max >= cap)
                 & (cap < _ceiling)
@@ -18155,13 +19627,22 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         if _seen is not None and _seen.shape == iters.shape:
             _frozen = int((~_seen).sum())
             _running = int(_seen.sum())
-            _tail = (f"; {_frozen} never-engaged (clock frozen), "
+            # Per-walker the counts are over (walker, cell) pairs, not
+            # cells -- say so, or the number reads as a cell count that is
+            # nwalkers times too large.
+            _u = "(walker, cell) pairs" if _pw else "cells"
+            _tail = (f"; {_frozen} never-engaged {_u} (clock frozen), "
                      f"{_running} accruing patience")
         else:
             _tail = ""
+        # ``cap.size`` not ``len(cap)``: per-walker the first axis is the
+        # walker count, so len() would report "over 4 cap cells" for a
+        # 1232-cell grid.
+        _n_units = (f"{cap.shape[0]} walkers x {cap.shape[1]}" if _pw
+                    else f"{cap.size}")
         logger.info(
             f"{self.name}: leaf caps min/max = {int(cap.min())}/{int(cap.max())}"
-            f" over {len(cap)} {_unit}{_tail}."
+            f" over {_n_units} {_unit}{_tail}."
         )
 
         # CAP-HEADROOM stop gate (user 2026-09-06): before gb_search may
@@ -18182,7 +19663,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             if _occ_hr is None or np.shape(_occ_hr) != np.shape(cap):
                 _occ_hr = _to_numpy(
                     self._cold_occupancy(band_counts, new_state)
-                ).max(axis=0)
+                )
+                # PER-WALKER: keep the walker axis, so a walker short of
+                # headroom in its OWN cell is the one granted the extra
+                # slot. Reducing here would broadcast the ensemble-max
+                # occupancy against every walker's cap and grant on another
+                # walker's crowding -- which is the exact reduction this
+                # whole mode removes.
+                if not _pw:
+                    _occ_hr = _occ_hr.max(axis=0)
             if getattr(self, "_grant_cap_headroom", False):
                 _short = _cap_headroom_short_mask(
                     cap, _occ_hr, _ceiling, _headroom)
@@ -18374,6 +19863,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         "nwalkers", "ntemps", "time", "num_proposals", "_reseed_firing",
         "temper_vertical", "_cap_leaf_cap", "_band_leaf_cap",
         "_rj_band_shutoff", "_rank_rng_seed",
+        # the per-(walker, band) search-stage floor table and the
+        # per-walker RJ valve: both are head-owned, rank-read-only,
+        # and both are SLICED to the block, so a command that left
+        # them installed would leak one block's rows into the next.
+        "_snr_lim_table", "_stage_table", "_rj_band_shutoff_w",
         "_owned_band_range", "_replica_index", "_n_replicas",
     )
 
@@ -18436,6 +19930,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             "_cap_leaf_cap": getattr(self, "_cap_leaf_cap", None),
             "_band_leaf_cap": getattr(self, "_band_leaf_cap", None),
             "_rj_band_shutoff": getattr(self, "_rj_band_shutoff", None),
+            "_snr_lim_table": getattr(self, "_snr_lim_table", None),
+            "_stage_table": getattr(self, "_stage_table", None),
+            "_rj_band_shutoff_w": getattr(
+                self, "_rj_band_shutoff_w", None),
             "_rank_rng_seed": getattr(self, "_rank_rng_seed", None),
             "_owned_band_range": getattr(self, "_owned_band_range", None),
             "_replica_index": getattr(self, "_replica_index", 0),
@@ -18468,8 +19966,25 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         tables = (payload or {}).get("tables") or {}
         # READ-ONLY on a rank: the head arms, advances and persists them.
         self._cap_leaf_cap = tables.get("cap_leaf_cap")
+        # ...and, when the caps carry a walker axis, this rank's table must
+        # be ITS block's rows. Checked here rather than trusted: a wrong
+        # slice keeps every index in range and would gate block-local
+        # walker 0 against global walker 0.
+        self._check_rank_cap_table(self._cap_leaf_cap, self.nwalkers)
         self._band_leaf_cap = tables.get("band_leaf_cap")
         self._rj_band_shutoff = tables.get("rj_band_shutoff")
+        # The per-(walker, band) tables arrive already sliced to this
+        # block (``_common`` below), for the same reason the cap does:
+        # a rank runs with ``self.nwalkers = B`` and every lookup
+        # indexes with a BLOCK-LOCAL walker, so an unsliced table
+        # would score block-local walker 0 against global walker 0.
+        self._snr_lim_table = tables.get("snr_lim_table")
+        self._stage_table = tables.get("stage_table")
+        self._rj_band_shutoff_w = tables.get("rj_band_shutoff_w")
+        for _nm, _tb in (("snr_lim_table", self._snr_lim_table),
+                         ("stage_table", self._stage_table),
+                         ("rj_band_shutoff_w", self._rj_band_shutoff_w)):
+            self._check_rank_stage_table(_nm, _tb, self.nwalkers)
         self._apply_replica_payload(payload or {})
         new_seed = (payload or {}).get("rank_seed")
         # The seeded vertical-swap Generator must SURVIVE the three commands
@@ -18935,7 +20450,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     waveform_kwargs=self.waveform_kwargs,
                     rj_prop=rj_prop,
                     keep_all_inds=sess.keep_all_inds,
-                    opt_snr_rej_samp_limit=self.opt_snr_rej_samp_limit,
+                    opt_snr_rej_samp_limit=self._live_snr_lim(),
                     snr_rej_detected=self.snr_rej_detected,
                 )
             sess.band_sorter = band_sorter
@@ -21263,13 +22778,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     f"state initialization; changing it on an existing "
                     f"store requires a fresh store."
                 )
-            ensure_leaf_cap_fields(bi, self.num_bands)
+            _pw_arm = self._cap_per_walker
+            ensure_leaf_cap_fields(bi, self.num_bands, per_walker=_pw_arm)
             ensure_cap_cell_fields(bi, self.num_cap_cells,
-                               staggered=self.cap_stagger)
+                               staggered=self.cap_stagger,
+                               per_walker=_pw_arm)
             cap_arr = self._cap_state_arrays(bi)[0]
             if np.all(cap_arr < 0):
                 cap_arr[:] = int(self.leaf_cap_start)
-                if not self._cap_is_band_grid:
+                # PER-WALKER: ``band_leaf_cap`` is a mirror at EVERY
+                # divisor now (the gate reads the ``_w`` family), so it has
+                # to be armed here too -- including on the band grid, where
+                # the shared code leaves it to the gate array that no
+                # longer exists.
+                if _pw_arm or not self._cap_is_band_grid:
                     bi["band_leaf_cap"][:] = int(self.leaf_cap_start)
                 # Overlap echo: geometry in FD bins (w = s/(1-p), core =
                 # s - 2x; s = the median cap-cell stride -- uniform grids
@@ -21287,11 +22809,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     )
                 logger.info(
                     f"{self.name}: armed leaf cap at "
-                    f"{int(self.leaf_cap_start)} for {len(cap_arr)} "
-                    + ("cap cells " if not self._cap_is_band_grid else "bands ")
+                    f"{int(self.leaf_cap_start)} for "
+                    f"{cap_arr.shape[-1]} "
+                    + ("cap cells " if (not self._cap_is_band_grid or _pw_arm)
+                       else "bands ")
                     + f"(divisor {self.cap_divisor} over "
                     f"{self.num_bands} sub-bands"
                     + (", STAGGERED grid" if self.cap_stagger else "")
+                    + (f", PER-WALKER x{cap_arr.shape[0]} walkers"
+                       if _pw_arm else "")
                     + _ov_txt
                     + ")."
                 )
@@ -21301,8 +22827,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # decision reads ``_cap_leaf_cap``.
             self._band_leaf_cap = bi["band_leaf_cap"]
             self._mirror_band_leaf_cap(bi)
+            self._log_per_walker_arm(cap_arr)
         elif self._leaf_cap_enabled and (
-            not self._cap_is_band_grid
+            self._cap_per_walker
+            or not self._cap_is_band_grid
             or float(getattr(self, "cap_overlap_frac", 0.0) or 0.0) > 0.0
         ):
             # READ-ONLY cap reference for non-RJ moves: they never arm or
@@ -21312,11 +22840,26 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # arming, no mirroring, no counter updates here. At divisor 1
             # (+overlap) the band arrays ARE the cell arrays.
             bi = state.sub_states[self.branch_name].band_info
-            if self._cap_is_band_grid:
+            if self._cap_per_walker:
+                # Non-RJ moves read the SAME per-walker array the RJ move
+                # arms; falling back to the 1-D mirror here would let an
+                # in-model drift gate admit an entry against the ensemble
+                # MAXIMUM allowance instead of the mover's own.
+                if bi.get("cap_cell_leaf_cap_w") is not None:
+                    self._cap_leaf_cap = bi["cap_cell_leaf_cap_w"]
+            elif self._cap_is_band_grid:
                 if bi.get("band_leaf_cap") is not None:
                     self._cap_leaf_cap = bi["band_leaf_cap"]
             elif bi.get("cap_cell_leaf_cap") is not None:
                 self._cap_leaf_cap = bi["cap_cell_leaf_cap"]
+
+        # Arm the per-(walker, band) search stage. Like the cap above this
+        # is a LIVE reference into ``state.band_info`` -- the latch mutates
+        # it in place and the store persists it -- plus the derived floor
+        # table every enforcement site gathers from. Both are ``None`` with
+        # the feature off, which is exactly what keeps the scalar path
+        # bit-identical.
+        self._arm_search_stage(state)
 
         # Run any move-specific setup.
         self.setup(model, state.branches)
@@ -21421,12 +22964,27 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         }
         # READ-ONLY copies: the head arms, advances and persists these, and
         # a rank must never see them move under it mid-propose.
+        #
+        # ``band_leaf_cap`` and ``rj_band_shutoff`` stay PER BAND and so are
+        # shared by every rank verbatim. ``cap_leaf_cap`` is per band too --
+        # UNTIL the per-walker mode gives it a walker axis, and then it must
+        # be SLICED to the rank's block: a rank runs with
+        # ``self.nwalkers = B`` and every cap lookup indexes with a
+        # BLOCK-LOCAL walker index, so shipping the full N-row table would
+        # score block-local walker 0 against global walker 0's allowance on
+        # every rank. Silent -- the indices stay in range on every rank --
+        # which is why the slice lives with the payload and not in the gate.
+        # Same rule, same place, as ``_sched_block`` for the per-walker scan
+        # schedule.
+        _cap_table_full = self._cap_leaf_cap
+        _cap_is_pw = np.ndim(_cap_table_full) == 2
         tables = {
-            "cap_leaf_cap": self._ro_table(self._cap_leaf_cap),
             "band_leaf_cap": self._ro_table(self._band_leaf_cap),
             "rj_band_shutoff": self._ro_table(
                 getattr(self, "_rj_band_shutoff", None)),
         }
+        if not _cap_is_pw:
+            tables["cap_leaf_cap"] = self._ro_table(_cap_table_full)
         _seed_base = int(fanout.clock.get("seed_base") or 0)
         # The head owns the "does this block run at all" decision: a rank
         # can never return early on its own without desynchronizing the
@@ -21485,12 +23043,32 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         def _common(rank, w0, w1):
             """Payload keys EVERY command needs (``_enter_rank_block``)."""
+            # The shared tables plus THIS block's cap slice (per-walker
+            # mode only; shared caps stay in ``tables`` untouched).
+            _tab = tables if not _cap_is_pw else {
+                **tables,
+                "cap_leaf_cap": self._cap_table_for_block(
+                    _cap_table_full, w0, w1),
+            }
+            # The per-(walker, band) stage family: SLICED to this block for
+            # the same reason the cap is (see the comment above). Absent
+            # keys simply mean the feature is off on this move, and the
+            # rank's ``tables.get`` then installs None -- the scalar path.
+            for _k, _t in (("snr_lim_table", self._snr_lim_table),
+                           ("stage_table", getattr(self, "_stage_table", None)),
+                           ("rj_band_shutoff_w",
+                            getattr(self, "_rj_band_shutoff_w", None))):
+                if _t is not None:
+                    if _tab is tables:
+                        _tab = dict(tables)
+                    _tab[_k] = self._ro_table(
+                        self._snr_lim_table_for_block(_t, w0, w1))
             return {
                 "ntemps": int(ntemps),
                 "nwalkers": int(w1 - w0),
                 "keep_all_inds": keep_all_inds,
                 "clock_vals": clock_vals,
-                "tables": tables,
+                "tables": _tab,
                 # distinct per rank AND per propose: a constant seed would
                 # restart every rank's _temper_rng on the same stream every
                 # iteration.
@@ -21903,6 +23481,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             self._update_band_leaf_caps(
                 model, new_state, band_counts, precomputed=cap_stats)
 
+        # The per-(walker, band) search stage rides the SAME ownership rule
+        # as the caps (``leaf_cap_update`` = the one designated updater per
+        # iteration): a second updater would double-advance the streak and
+        # promote every occupied band in half the intended patience.
+        if self.leaf_cap_update:
+            self._update_search_stages(new_state, band_counts)
+            self._update_search_band_shutoff(model, new_state, band_counts)
+
         accepted = np.zeros((engine_ntemps, N), dtype=bool)
 
         num_active_sources = work.inds.sum(axis=-1)[0]
@@ -22187,13 +23773,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     f"state initialization; changing it on an existing "
                     f"store requires a fresh store."
                 )
-            ensure_leaf_cap_fields(bi, self.num_bands)
+            _pw_arm = self._cap_per_walker
+            ensure_leaf_cap_fields(bi, self.num_bands, per_walker=_pw_arm)
             ensure_cap_cell_fields(bi, self.num_cap_cells,
-                               staggered=self.cap_stagger)
+                               staggered=self.cap_stagger,
+                               per_walker=_pw_arm)
             cap_arr = self._cap_state_arrays(bi)[0]
             if np.all(cap_arr < 0):
                 cap_arr[:] = int(self.leaf_cap_start)
-                if not self._cap_is_band_grid:
+                # PER-WALKER: ``band_leaf_cap`` is a mirror at EVERY
+                # divisor now (the gate reads the ``_w`` family), so it has
+                # to be armed here too -- including on the band grid, where
+                # the shared code leaves it to the gate array that no
+                # longer exists.
+                if _pw_arm or not self._cap_is_band_grid:
                     bi["band_leaf_cap"][:] = int(self.leaf_cap_start)
                 # Overlap echo: geometry in FD bins (w = s/(1-p), core =
                 # s - 2x; s = the median cap-cell stride -- uniform grids
@@ -22211,11 +23804,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     )
                 logger.info(
                     f"{self.name}: armed leaf cap at "
-                    f"{int(self.leaf_cap_start)} for {len(cap_arr)} "
-                    + ("cap cells " if not self._cap_is_band_grid else "bands ")
+                    f"{int(self.leaf_cap_start)} for "
+                    f"{cap_arr.shape[-1]} "
+                    + ("cap cells " if (not self._cap_is_band_grid or _pw_arm)
+                       else "bands ")
                     + f"(divisor {self.cap_divisor} over "
                     f"{self.num_bands} sub-bands"
                     + (", STAGGERED grid" if self.cap_stagger else "")
+                    + (f", PER-WALKER x{cap_arr.shape[0]} walkers"
+                       if _pw_arm else "")
                     + _ov_txt
                     + ")."
                 )
@@ -22225,8 +23822,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # decision reads ``_cap_leaf_cap``.
             self._band_leaf_cap = bi["band_leaf_cap"]
             self._mirror_band_leaf_cap(bi)
+            self._log_per_walker_arm(cap_arr)
         elif self._leaf_cap_enabled and (
-            not self._cap_is_band_grid
+            self._cap_per_walker
+            or not self._cap_is_band_grid
             or float(getattr(self, "cap_overlap_frac", 0.0) or 0.0) > 0.0
         ):
             # READ-ONLY cap reference for non-RJ moves: they never arm or
@@ -22236,11 +23835,26 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # arming, no mirroring, no counter updates here. At divisor 1
             # (+overlap) the band arrays ARE the cell arrays.
             bi = state.sub_states[self.branch_name].band_info
-            if self._cap_is_band_grid:
+            if self._cap_per_walker:
+                # Non-RJ moves read the SAME per-walker array the RJ move
+                # arms; falling back to the 1-D mirror here would let an
+                # in-model drift gate admit an entry against the ensemble
+                # MAXIMUM allowance instead of the mover's own.
+                if bi.get("cap_cell_leaf_cap_w") is not None:
+                    self._cap_leaf_cap = bi["cap_cell_leaf_cap_w"]
+            elif self._cap_is_band_grid:
                 if bi.get("band_leaf_cap") is not None:
                     self._cap_leaf_cap = bi["band_leaf_cap"]
             elif bi.get("cap_cell_leaf_cap") is not None:
                 self._cap_leaf_cap = bi["cap_cell_leaf_cap"]
+
+        # Arm the per-(walker, band) search stage. Like the cap above this
+        # is a LIVE reference into ``state.band_info`` -- the latch mutates
+        # it in place and the store persists it -- plus the derived floor
+        # table every enforcement site gathers from. Both are ``None`` with
+        # the feature off, which is exactly what keeps the scalar path
+        # bit-identical.
+        self._arm_search_stage(state)
 
         # Run any move-specific setup.
         self.setup(model, state.branches)
@@ -22310,7 +23924,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 waveform_kwargs=self.waveform_kwargs,
                 rj_prop=rj_prop,
                 keep_all_inds=keep_all_inds,
-                opt_snr_rej_samp_limit=self.opt_snr_rej_samp_limit,
+                opt_snr_rej_samp_limit=self._live_snr_lim(),
                 snr_rej_detected=self.snr_rej_detected,
             )
 
@@ -22673,6 +24287,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # the counters; every cap-enabled RJ move enforces the gate.
         if self._band_leaf_cap is not None and self.leaf_cap_update:
             self._update_band_leaf_caps(model, new_state, band_info["band_counts"])
+
+        # Same ownership rule as the caps above -- see the twin call site in
+        # the orchestrated propose.
+        if self.leaf_cap_update:
+            self._update_search_stages(new_state, band_info["band_counts"])
+            self._update_search_band_shutoff(
+                model, new_state, band_info["band_counts"])
 
         # if self.is_rj_prop:
         #     pass  # print(self.name, "2nd count check:", new_state.branches[self.branch_name].inds.sum(axis=-1).mean(axis=-1), "\nll:", new_state.log_like[0] - orig_store, new_state.log_like[0])
@@ -23900,7 +25521,8 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             # between the two tests cannot resume some OTHER walker's
             # checkpoints under this epoch's key.
             fingerprint_extra = (
-                f"|epoch={k}|gbfree={int(_gb_free)}|wref=none")
+                f"|epoch={k}|gbfree={int(_gb_free)}|wref=none"
+                f"{fstat_stage_fingerprint_for(self)}")
             logger.info(
                 "%s: F-stat epoch %d is already fitted; loading it without "
                 "replicating a reference row or gathering a global "
@@ -23922,7 +25544,8 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             self._fstat_epoch_line(model, k, w_global, owner_rank,
                                    local_index, lls, n_compute, cache_dir)
             fingerprint_extra = (
-                f"|epoch={k}|gbfree={int(_gb_free)}|wref={w_global}")
+                f"|epoch={k}|gbfree={int(_gb_free)}|wref={w_global}"
+                f"{fstat_stage_fingerprint_for(self)}")
             self._fstat_ref_row_fanout(model, branches, w_global, owner_rank,
                                        local_index)
             # Built (and cached on ``_fstat_ref_call``) before anything can
@@ -23940,6 +25563,13 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             f0_lims_hz=f0_lims,
             mc_lims=mc_lims,
             ratio_max=_gb_fdot_astro_ratio_max(self),
+            # PER-BAND peak floor from the live stage table (None with the
+            # feature off -> the global FSTAT_PEAK_MIN_SNR, unchanged).
+            # There is ONE catalog for every walker, so a band takes the
+            # LOOSER floor once any walker has promoted there; the
+            # per-walker half of the schedule is the opt-SNR boundary,
+            # which IS per row. See fstat_band_min_F.
+            band_min_F=fstat_band_min_F_for(self),
             cache_dir=cache_dir,
             # THE REFERENCE WALKER IS PART OF THE FINGERPRINT TOO, for the
             # same reason ``gbfree`` is: it changes the RESIDUAL the sweep

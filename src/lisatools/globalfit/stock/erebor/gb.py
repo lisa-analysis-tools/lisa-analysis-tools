@@ -701,6 +701,103 @@ class GBSettings(Settings):
     leaf_cap_iter_only: bool = dataclasses.field(
         default_factory=env_default("GB_LEAF_CAP_ITER_ONLY", False, bool)
     )
+    # leaf_cap_per_walker: give EVERY WALKER its own per-cap-cell leaf cap
+    # (user request 2026-09-22). The cap family
+    # (``cap_cell_leaf_cap``/``_iters``/``_best_ll``) gains a walker axis:
+    # each walker earns its allowance from its OWN lnL plateau and its OWN
+    # occupancy-at-cap, and every enforcement gate -- RJ birth, in-model
+    # drift, the replacement move, the pick pool, the tempering swap gate --
+    # scores a row against ``cap[its walker, its cell]``.
+    #
+    # WHY. The gate collapses the walker axis the moment it runs
+    # (``cur_max = lls.max(axis=0)``), so the LEADING walker's evidence
+    # ramps the allowance for everyone, including laggards that never
+    # filled the cap they already had. On the 6-month production run that
+    # is a 400-1000 leaf spread across four cold walkers.
+    #
+    # DEFAULT FALSE, and off is a HARD guarantee, not a convention: no
+    # per-walker array is allocated, no new HDF5 dataset is written and no
+    # new branch is taken, so the live 6-month run can be relaunched from a
+    # build carrying this change and behave exactly as before
+    # (``tests/test_gb_cap_per_walker.py`` asserts it). Turning it ON over
+    # an existing store needs no migration -- every walker is seeded by
+    # broadcast from the stored shared cap.
+    #
+    # Subsumes GB_LEAF_CAP_ALL_WALKERS, which is ignored (with a warning)
+    # while this is on. Diagnostics: ``[GB_CAP_PW]`` log lines, plus
+    # ``GB_CAP_PW_DIAG=1`` for the per-increment decision tuple.
+    # Env: GB_LEAF_CAP_PER_WALKER.
+    leaf_cap_per_walker: bool = dataclasses.field(
+        default_factory=env_default("GB_LEAF_CAP_PER_WALKER", False, bool)
+    )
+    # ------------------------------------------------------------------
+    # PER-(WALKER, BAND) SEARCH SCHEDULE (user request 2026-09-23)
+    # ------------------------------------------------------------------
+    # search_stage_per_walker: the SEARCH's opt-SNR floor stops being one
+    # number for the whole run and becomes a function of a (walker, band)
+    # STAGE. Stage 0 = COARSE (``opt_snr_limit_search_coarse``, hunting
+    # bright sources), stage 1 = FINE (``opt_snr_limit_search_fine``,
+    # digging the faint tail). A band promotes once THAT WALKER's
+    # cold-chain source count there has been unchanged for
+    # ``search_stage_min_iters`` consecutive iterations.
+    #
+    # WHY. A band where a walker has already assembled its sources wants a
+    # LOWER floor; a band still finding bright ones wants the HIGH floor,
+    # or the model fills with noise births. Those two states coexist at the
+    # same iteration, in different bands, and in the SAME band on different
+    # walkers -- which one global number cannot express.
+    #
+    # The F-stat peak floor follows per BAND but not per walker: there is
+    # ONE catalog, swept against ONE reference walker's residual, so a band
+    # takes the LOOSER floor once any walker has promoted
+    # (FSTAT_PEAK_MIN_SNR_COARSE / _FINE). The per-walker half of the
+    # schedule is carried entirely by the opt-SNR boundary, which IS per
+    # row. Phase maximization is NOT part of this (deferred 2026-09-24).
+    #
+    # DEFAULT FALSE, and off is a HARD guarantee: no array allocated, no
+    # dataset written, the floor stays the scalar float it has always been.
+    # Env: GB_SEARCH_STAGE_PER_WALKER.
+    search_stage_per_walker: bool = dataclasses.field(
+        default_factory=env_default("GB_SEARCH_STAGE_PER_WALKER", False, bool)
+    )
+    # Consecutive unchanged-source-count iterations a (walker, band) must
+    # post before it promotes. Env: GB_SEARCH_STAGE_MIN_ITERS.
+    search_stage_min_iters: int = dataclasses.field(
+        default_factory=env_default("GB_SEARCH_STAGE_MIN_ITERS", 20, int)
+    )
+    # The two opt-SNR floors. COARSE defaults to None = "whatever the
+    # move's floor already resolved to", so arming the schedule with no
+    # other knob reproduces today's behaviour until the first promotion.
+    # Env: GB_OPT_SNR_LIMIT_SEARCH_COARSE / GB_OPT_SNR_LIMIT_SEARCH_FINE.
+    opt_snr_limit_search_coarse: typing.Optional[float] = dataclasses.field(
+        default_factory=env_default(
+            "GB_OPT_SNR_LIMIT_SEARCH_COARSE", None, float)
+    )
+    opt_snr_limit_search_fine: float = dataclasses.field(
+        default_factory=env_default("GB_OPT_SNR_LIMIT_SEARCH_FINE", 5.0, float)
+    )
+    # search_shutoff_per_walker: a SEARCH-only per-(walker, band) RJ valve,
+    # ADDITIONAL to the existing per-band one (which is untouched; the two
+    # compose with OR). Once a (walker, band)'s cold-chain source count has
+    # stopped GROWING within the CURRENT RECIPE STEP -- the per-pair form
+    # of the nleaves-max window test ``RJRecipeStep.stopping_function``
+    # uses to end the step -- that pair takes no further RJ (births OR
+    # deaths, and no tempering swaps) until the next recipe step begins.
+    #
+    # Scoped to the step and RELEASED when the next one starts: the next
+    # step changes the moves, the caps and the floors, so "nothing left to
+    # find here" is a statement about a configuration that has just been
+    # replaced. Env: GB_SEARCH_BAND_SHUTOFF_PER_WALKER.
+    search_shutoff_per_walker: bool = dataclasses.field(
+        default_factory=env_default(
+            "GB_SEARCH_BAND_SHUTOFF_PER_WALKER", False, bool)
+    )
+    # Window length for that test, i.e. ``RJRecipeStep.convergence_iter``'s
+    # per-pair twin. Env: GB_SEARCH_BAND_SHUTOFF_CONV_ITER.
+    search_shutoff_conv_iter: int = dataclasses.field(
+        default_factory=env_default(
+            "GB_SEARCH_BAND_SHUTOFF_CONV_ITER", 5, int)
+    )
     # cap_divisor: the LEAF-CAP CELL grid (user design 2026-08-15). Each
     # sub-band is split into this many equal pieces and the per-cell leaf
     # caps are enforced on THOSE, not on the sub-band. Sub-band widths are
