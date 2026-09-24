@@ -1,0 +1,48 @@
+"""Real-MPI layout preflight: ``build_layout`` across N processes, then stop.
+
+Gate G1 of ``docs/gpu-routing-test-campaign.md`` -- the cheapest test that
+exercises the layout OUTSIDE ``FakeWorld``: real mpi4py, real processes, a
+real ``allgather``. It catches anything that only works because FakeWorld's
+``Split``/``allgather`` are in-process, and it costs about ten seconds.
+
+    export GF_GPU_ROUTING=1                   # the routing is OPT-IN
+    export GF_LAYOUT_DRY_RUN=1 GPUS=""        # CPU: no GPU-pool capacity check
+    export LAT_SRC=<worktree>/src
+    # IN A WORKTREE, the .wtenv shim is REQUIRED: the editable install's
+    # meta-path finder hard-maps every ``lisatools.*`` module to the MAIN
+    # checkout and beats sys.path, so without these two the script silently
+    # imports the installed package and tests the wrong code.
+    export PYTHONPATH=<worktree>/.wtenv LAT_WORKTREE_SRC=$LAT_SRC
+    NWALKERS=2 mpiexec --oversubscribe -n 5 python gf_layout_preflight_mpi.py
+
+Prints the resolved factorization, asserts every rank agrees on
+``layout.digest()``, and dumps the per-rank table. ``GPUS=0,1`` instead
+exercises the per-node GPU-pool capacity check (which will refuse more
+compute ranks than the pool can host -- that refusal is the check working).
+
+``GF_GPU_ROUTING`` is honoured exactly as the engine honours it, because
+preflighting a rule the run will not apply is worse than not preflighting at
+all. Unset, a shape needing the unified factorization REFUSES here just as it
+would at launch, and the printed line says ``gpu_routing=OFF(legacy)``.
+
+Nothing here builds a fit or touches a store.
+"""
+import os, sys
+from mpi4py import MPI
+sys.path.insert(0, os.environ["LAT_SRC"])
+from lisatools.globalfit.communication.ranks import build_layout, layout_dry_run
+
+comm = MPI.COMM_WORLD
+nw = int(os.environ.get("NWALKERS", "4"))
+pool = [int(x) for x in os.environ.get("GPUS", "0,1").split(",") if x != ""]
+rpb = os.environ.get("RANKS_PER_BLOCK") or None
+lay = build_layout(comm, nw, pool, legacy=False,
+                   ranks_per_block=None if rpb is None else int(rpb))
+if comm.Get_rank() == 0:
+    print(f"### nwalkers={nw} n_compute={lay.n_compute} "
+          f"n_blocks={lay.n_blocks} R={lay.ranks_per_block} block={lay.block} "
+          f"gpu_routing={'on' if lay.gpu_routing else 'OFF(legacy)'}")
+digests = comm.allgather(lay.digest())
+if comm.Get_rank() == 0:
+    print("### all ranks agree on the layout:", len(set(digests)) == 1)
+layout_dry_run(lay, comm)

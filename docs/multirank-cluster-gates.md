@@ -732,6 +732,98 @@ does for the multi-walker port.
 `[GB_REPLICA]` via `summarize_replica_digest` and `summarize_gb_replica`
 (Task 3).
 
+## Step 7 — GPUs > walkers (the unified layout, 2026-09-23)
+
+`build_layout` no longer requires `nwalkers % n_compute == 0`. Every shape
+resolves as `n_compute = n_blocks x R` with
+`n_blocks = gcd(nwalkers, n_compute)` and `R = n_compute / n_blocks` ranks
+sharing each walker block. `R = 1` is the walker-block layout these gates
+already cover; `nwalkers = 1` is the replica layout of Step 6; everything
+else is new and is what this step gates.
+
+> **★ All of this is OPT-IN behind `GF_GPU_ROUTING=1`.** With the knob unset
+> the library applies the pre-2026-09-23 rule exactly — `nwalkers` must
+> divide the compute-rank count, with the `nwalkers == 1` replica carve-out —
+> so merging this work changed nothing for Steps 0–6 or for any existing
+> runbook. The two rules agree on every shape the legacy one accepted
+> (`tests/test_gpu_routing_optin.py`), so the knob only ADDS shapes. The
+> submit script below sets it to `1` for you; `GF_GPU_ROUTING=0` on that
+> script is the rollback, and a shape that needs the knob without it raises
+> at `build_layout` naming the knob.
+
+`RANKS_PER_BLOCK=<n>` pins R explicitly (it must divide the compute-rank
+count, and `n_compute / n` must divide `nwalkers`), and needs the knob above.
+The rule is importable —
+`from lisatools.globalfit.communication import factorize_layout` — so a
+planner or a submit script never needs to re-derive it. It answers for the
+unified rule regardless of the knob, so a planner can price a shape this
+deployment has not opted into yet; `build_layout` is what enforces the knob.
+
+Launch with **`scripts/fstat_proposal/submit_gf_6mo_v8_gpurouting.sh`**, a
+mirror of `submit_gf_6mo_v8.sh` carrying only the layout dispatch (it accepts
+`NGPUS` 8/16/32, exports `RANKS_PER_BLOCK`, picks `--distribution=block:block`
+when `R > 1`, and reports the resolved layout instead of rounding `NWALKERS`).
+The production script is untouched; `tests/test_submit_gpurouting_layout.py`
+fails if the two drift outside those blocks.
+
+### 7.0 Dry runs — seconds, no allocation
+
+```bash
+GF_LAYOUT_DRY_RUN=1 NWALKERS=4  NGPUS=16 ./submit_gf_6mo_v8_gpurouting.sh
+GF_LAYOUT_DRY_RUN=1 NWALKERS=24 NGPUS=8  ./submit_gf_6mo_v8_gpurouting.sh
+GF_LAYOUT_DRY_RUN=1 NWALKERS=24 NGPUS=32 ./submit_gf_6mo_v8_gpurouting.sh
+```
+
+Expect `n_blocks=4 block=1 ranks_per_block=AUTO->4`, `n_blocks=8 block=3
+ranks_per_block=AUTO->1`, `n_blocks=8 block=3 ranks_per_block=AUTO->4`, and
+every rank printing the SAME `describe()`/`digest()`. A `gcd=1` shape warns
+that one block is replicated everywhere with no walker parallelism.
+
+### 7.1 Factorization parity — the gate that matters most
+
+Run the THREE factorizations of 4 compute ranks on the same store and seeds,
+and diff `GF_FANOUT_DIGEST` line for line:
+
+```bash
+NWALKERS=4 RANKS_PER_BLOCK=1 GF_FANOUT_DIGEST=1   # (4 blocks, R=1) — today
+NWALKERS=2 RANKS_PER_BLOCK=2 GF_FANOUT_DIGEST=1   # (2 blocks, R=2)
+NWALKERS=1 RANKS_PER_BLOCK=4 GF_FANOUT_DIGEST=1   # (1 block,  R=4) — Step 6
+```
+
+They sample different walker counts, so the CHAINS differ; what must agree is
+that each is self-consistent and that `[GB_REPLICA] log_like_final` never
+warns. The point of the gate is that the factorization is a ROUTING choice,
+not a physics one.
+
+### 7.2 What to watch in the log
+
+* `[FANOUT] <move>: block path with N rank(s) per block; leads [...] propose,
+  [...] stay passive` — psd/galfor keep the block path under replicas and only
+  block leads propose. Its absence at `R > 1` means the family went flat,
+  which for psd/galfor is wrong.
+* `[GB_REPLICA] log_like_final disagrees after sync` — the real divergence
+  detector for band dispersal (tolerance-based; the residual hash is INFO,
+  because the GPU fills are `atomicAdd` reductions and differ at ~1e-12).
+* `Alive sources per temp after run_proposal` — must NOT scale with R. It
+  used to be inflated by exactly R in one-walker replica mode.
+
+### 7.3 ORDERING CONSTRAINT — do not run T5 first
+
+`docs/one-walker-testing-campaign.md` gate **T5** (the one-walker R=2 vs R=4
+scaling readout) is the only measurement of the replica axis, and it has never
+been run. **It must run AFTER the source-weighted band split**, not before.
+
+Until 2026-09-23 `GBSpecialBase._replica_band_weights` returned `None`, so
+`replica_band_ranges` split the 1232 bands by COUNT. The galaxy is not uniform
+in frequency — most detectable sources sit below ~5 mHz — so an equal-count
+4-way split hands one rank the large majority of the work, and dispersal
+measures ~50 % efficient (about 2x at R = 4) instead of ~100 % (about 4x).
+
+A T5 run on the old split would therefore measure the bad number and could
+wrongly condemn the whole replica axis. **If a T5 arm was already taken, discard
+its scaling figures.** VGB always overrode the weights correctly; GB now shares
+the same implementation.
+
 ## Closing note
 
 `LISAanalysistools/multinode_gpu_handoff.md` — untracked, in the **main**

@@ -144,6 +144,39 @@ NOT expected bit-identical (each rank draws its own GB RJ proposals). Compare th
 
 ### T5 — scaling readout (≈1 h)
 
+> **⚠ PREREQUISITE (2026-09-23): run this only AFTER the source-weighted GB
+> band split.** T5 is the only measurement of the replica axis and it has
+> never been run — so whatever it produces will be taken as *the* number.
+>
+> Until 2026-09-23 `GBSpecialBase._replica_band_weights` returned `None`, so
+> `replica_band_ranges` split the 1232 bands by **count**. The galaxy is not
+> uniform in frequency (most detectable sources sit below ~5 mHz), so an
+> equal-count 4-way split hands one rank the large majority of the work:
+> dispersal then measures **~50 % efficient (≈2× at R = 4) instead of ~100 %
+> (≈4×)**. A T5 run on the old split would measure the bad number and could
+> wrongly condemn the replica axis outright.
+>
+> **If a T5 arm was already taken, discard its scaling figures.** VGB always
+> overrode the weights correctly; GB now shares the same implementation, so
+> check `_replica_band_weights` is not returning `None` before starting.
+>
+> **AND export `GF_GPU_ROUTING=1`.** The weighted split is gated on that
+> opt-in (the unified routing is off by default so it could be carried on
+> `dev` while its cluster gates were outstanding). With the knob unset the
+> weighting code is present but the legacy equal-count split is what runs —
+> i.e. exactly the bad measurement this prerequisite exists to prevent, and
+> it would look like a real result rather than a misconfiguration. Confirm
+> from the run's own layout line, which must read `gpu_routing=on`.
+>
+> The `GB proposals and open/close ~1/R, the swap-grid build and the
+> tempering census NOT` expectation below is the `f_fixed` ceiling. The
+> 1-year `[GB_TIMING]` line bounds the clearly R-invariant spans at ~4 %
+> (`sorter_build` 2.8 % + `unit_open_close` 1.1 %), i.e. a ceiling near 25×,
+> but that is a LOWER bound on `f_fixed`: the tempering census and swap-grid
+> build were not separately instrumented. `temper_swap_grid` now is — read it
+> here and the ceiling stops being an estimate.
+
+
 Two replicas (the primary layout) vs four replicas, one per node: `salloc --nodes=4 --gres=gpu:1 --ntasks-per-node=2`, then `GPUS=0 mpiexec -n 5 -ppn 1 python scripts/diagnostics/gate_run.py --stock all_sources` (ranks 0-3 replicas on nodes A-D, rank 4 saver on A). If four nodes are not grantable, two replicas per node's GPU: `--nodes=2`, `GPUS=0 RANKS_PER_GPU=2 mpiexec -n 5 -ppn 2` (ranks 0,1 on A; 2,3 on B; saver 4 on A; `--ntasks-per-node=3`; expect the OOM row of the triage table for all_sources). `NUM_ITERATIONS=5`, `PSD_NTEMPS` / MBH `ntemps` ≥ n_compute.
 Record per family from `[GB_TIMING]`, `[PSD_TIMING]`, the addremove leaf lines and the `[FANOUT]` table. Expectations: addremove per-leaf time ~ 1/min(n_compute, ntemps) of single-rank (the info-matrix batch scales best); PSD similar plus the eigen refresh (`{P}_EIGEN_REFRESH` default 10); GB proposals and open/close ~1/R, the swap-grid build and the tempering census NOT — not a regression. Cross-node cost shows up as `max_rank_s` minus the head's own time in the `[FANOUT]` table. Decide `ntemps` for the real run here.
 
