@@ -69,8 +69,51 @@
 #   # 4 GPUs per job instead of the header's 2
 #   NGPUS=4 bash scripts/fstat_proposal/launch_null_per_source.sh
 #
+#   # THE SAME TEST AT ONE YEAR (2026-09-19)
+#   NULL_TOBS=1yr bash scripts/fstat_proposal/launch_null_per_source.sh
+#
 # Then, once they have run:
 #   bash scripts/fstat_proposal/collect_null_per_source.sh
+#
+# ---- OBSERVATION TIME ------------------------------------------------------
+# NULL_TOBS selects the window: 6mo (default, unchanged) or 1yr. The canonical
+# script is 6-month throughout, so 1yr is applied the same way everything else
+# here is -- asserted seds on the generated COPY, never an edit to the
+# canonical. Four lines move, and they are the only Tobs-dependent settings in
+# it (verified by grepping the script for 15552000 and for every knob whose
+# value is derived from the window):
+#
+#     TOBS_TARGET       15552000 -> 31104000   (180 d -> 360 d)
+#     SIGHET_NT_LAYER        120 -> 240        (sparse-time layers ~ Nt)
+#     BASE_FILE_NAME  gf_prod_6mo -> gf_prod_1yr
+#     MBHB id list      2 5 16 18 -> the set merging inside 360 d
+#
+# NOT changed, deliberately:
+#   * EDGE_CROP_WAVELETS stays 60. The sig-het reference taper is a FRACTION
+#     of Tobs (SIGHET_TUKEY_ALPHA=0.01), so it grows with Nt: ceil(0.5*0.01*
+#     8640) = 44 layers, +8 margin = 52, against a crop of 60. It passes with
+#     8 layers to spare. (At 2 yr it would need 95 and 60 would FAIL the
+#     build-time check in stock/erebor/gb.py::check_sighet_build_config.)
+#   * GB_N_SUBBANDS -- gb is in REMOVE_BRANCHES, so the knob is inert here.
+#   * The #SBATCH header. NULL_CHECK_ONLY stops in seconds; 1 yr doubles Nt,
+#     which roughly doubles the residual arrays, so pass NGPUS=4 if a 1yr job
+#     comes back OOM. Nothing about the readout needs more wall time.
+#
+# ---- WHICH IDS AT ONE YEAR -------------------------------------------------
+# The three *_IDS_LIST values below are the FILE-BACKED sources -- the ones
+# with a real mojito L1 brick -- and that census was taken from the 6-month
+# combined null's own [SOURCES] preflight scan. IT DOES NOT CARRY OVER: a
+# longer window admits MBHBs that merge after 180 d, and whether each has a
+# brick is a property of the cache, not of the window. So the 1yr MBH default
+# below is the full merging-inside-360d set from submit_gf_1yr_v8_4gpu.sh,
+# and the first run's [SOURCES] scan is what tells you which of them are
+# synthesized. Trim with the env overrides once you have that scan:
+#
+#   NULL_TOBS=1yr MBH_IDS_LIST="0 2 3 5 16 18" bash ...launch_null_per_source.sh
+#
+# A synthesized source's null is ZERO BY DEFINITION (same waveform on both
+# ends), so leaving one in costs an allocation and measures nothing -- it does
+# not corrupt the other numbers.
 # ============================================================================
 set -euo pipefail
 
@@ -80,9 +123,37 @@ set -euo pipefail
 # (slurm_stdout_509.log). Those are the only ones whose null MEASURES
 # anything: a brick-backed source leaves the mojito<->our-template waveform
 # mismatch in the residual.
-MBH_IDS_LIST="2 5 16 18"
-EMRI_IDS_LIST="1 2 3 4 5 6"
-SOBBH_IDS_LIST="0 1 2"
+#
+# All three are env-overridable so a census taken from a run's own [SOURCES]
+# scan can be fed straight back in without editing this file.
+NULL_TOBS="${NULL_TOBS:-6mo}"
+case "${NULL_TOBS}" in
+  6mo)
+    _TOBS_SECONDS=15552000
+    _NT_LAYER=120
+    _BASE_NAME=gf_prod_6mo
+    _DEFAULT_MBH="2 5 16 18"
+    _DEFAULT_PREFIX="gf_prod_6mo_v8_null_"
+    ;;
+  1yr)
+    _TOBS_SECONDS=31104000
+    _NT_LAYER=240
+    _BASE_NAME=gf_prod_1yr
+    # The full set merging inside 360 d (submit_gf_1yr_v8_4gpu.sh). The
+    # file-backed subset is NOT known until the first [SOURCES] scan -- see
+    # the header. Override MBH_IDS_LIST once it is.
+    _DEFAULT_MBH="0 2 3 4 5 7 9 10 12 15 16 18"
+    _DEFAULT_PREFIX="gf_prod_1yr_v8_null_"
+    ;;
+  *)
+    echo "[LAUNCH] FATAL: NULL_TOBS='${NULL_TOBS}' unsupported (6mo or 1yr)." >&2
+    exit 2
+    ;;
+esac
+
+MBH_IDS_LIST="${MBH_IDS_LIST:-${_DEFAULT_MBH}}"
+EMRI_IDS_LIST="${EMRI_IDS_LIST:-1 2 3 4 5 6}"
+SOBBH_IDS_LIST="${SOBBH_IDS_LIST:-0 1 2}"
 
 # ---- DELIBERATELY SKIPPED (re-enable by swapping these lines in) -----------
 # These 5 ids have NO L1 brick. SYNTHESIZE_MISSING_BRICKS=1 rebuilds them
