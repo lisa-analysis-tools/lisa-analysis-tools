@@ -15049,6 +15049,28 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """
         if not getattr(self, "inmodel_group", False):
             return None
+        if not _converge_stage_allows(self):
+            # SEARCH ONLY. Two separate reasons, and the second is the one
+            # that bites here:
+            #  * stopping the passes on a plateau is OPTIONAL STOPPING on
+            #    the chain's own lnL, the same licence the row rule needs;
+            #  * the per-source effort is NON-UNIFORM by construction -- a
+            #    source whose sub-band shuts off early gets fewer sweeps
+            #    than one in a band that keeps earning passes. The user
+            #    ruled that acceptable IN SEARCH (2026-09-24, "this is okay
+            #    in search"), which is exactly the scope of
+            #    feedback_search_no_detailed_balance. In PE it is not: the
+            #    sweep count would depend on the state in a way the
+            #    posterior never sanctioned.
+            if not getattr(self, "_group_pe_warned", False):
+                self._group_pe_warned = True
+                logger.warning(
+                    "[GB_IMGROUP %s] %s_INMODEL_GROUP is set but this is a "
+                    "PE-stage move -- ignoring it. The group rule stops on a "
+                    "plateau and spends non-uniform effort per source; both "
+                    "are search-only licences.",
+                    self.name, str(self.branch_name).upper())
+            return None
         if getattr(self, "is_rj_prop", False):
             if not getattr(self, "_group_rj_warned", False):
                 self._group_rj_warned = True

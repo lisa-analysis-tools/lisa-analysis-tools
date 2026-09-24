@@ -1515,3 +1515,36 @@ class VerticalLadderAdaptTest(unittest.TestCase):
         p = np.ones((self.NB, self.NT - 1), dtype=np.int64)
         mv._vertical_ladder_bank(self._census(p, p))
         self.assertEqual(mv._vert_ladder_prop.shape, (self.NB, self.NT - 1))
+
+
+class GroupPEGuardTest(unittest.TestCase):
+    """The group rule is SEARCH-ONLY.
+
+    Non-uniform per-source effort is sanctioned in search (user ruling
+    2026-09-24: "this is okay in search") and forbidden in PE, where the
+    number of sweeps a source receives would depend on the state in a way
+    the posterior never sanctioned -- on top of the optional-stopping
+    problem the plateau exit already carries.
+    """
+
+    def _mv(self, name):
+        mv = _make_move(25)
+        mv.name = name
+        mv.is_rj_prop = False
+        mv.inmodel_group = True
+        mv.inmodel_group_iters = 3
+        mv.inmodel_group_dll = 4.0
+        mv.inmodel_group_max_passes = 20
+        mv.inmodel_group_scale = "flat"
+        return mv
+
+    def test_a_pe_stage_move_is_refused_with_a_warning(self):
+        mv = self._mv("in_model_pe")
+        with self.assertLogs(
+                "lisatools.globalfit.moves.gbspecialstretch", "WARNING") as cm:
+            self.assertIsNone(mv._group_state_or_none())
+        self.assertTrue(any("search-only" in m for m in cm.output))
+        self.assertTrue(mv._group_pe_warned)
+
+    def test_a_search_stage_move_still_gets_its_state(self):
+        self.assertIsNotNone(self._mv("in_model")._group_state_or_none())
