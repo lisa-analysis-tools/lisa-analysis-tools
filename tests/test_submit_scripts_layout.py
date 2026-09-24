@@ -31,10 +31,14 @@ SCRIPTS = [
     # the 3-month twin of the 6mo campaign script: same layout machinery,
     # Tobs-derived settings reverted, source branches and warm start off
     os.path.join(ROOT, "scripts", "fstat_proposal", "submit_gf_3mo_v8_4gpu.sh"),
+    # the v9 campaign script: same dispatch machinery as 6mo_v8, three
+    # deliberate deltas (see SixMonthV9DeltaTest)
+    os.path.join(ROOT, "scripts", "fstat_proposal", "submit_gf_6mo_v9_4gpu.sh"),
 ]
 
 THREE_MO = SCRIPTS[2]
 SIX_MO = SCRIPTS[0]
+SIX_MO_V9 = SCRIPTS[3]
 
 # Env knobs the dispatch block reads; stripped from the inherited environment
 # before each scenario applies its own overrides, so a stray value in the
@@ -70,6 +74,147 @@ def _exports(path):
     out = subprocess.run(["bash", "-c", "\n".join(lines) + "\nenv | sort\n"],
                          capture_output=True, text=True, env=env).stdout
     return dict(l.split("=", 1) for l in out.split("\n") if "=" in l)
+
+
+class SixMonthV9DeltaTest(unittest.TestCase):
+    """``submit_gf_6mo_v9_4gpu.sh`` is ``submit_gf_6mo_v8.sh`` plus exactly
+    three families of change (user spec 2026-09-24).
+
+    Same silent-failure shape as the 3-month twin below: the two files are
+    ~99% the same text, and every block that MUST differ looks like an
+    ordinary knob. A v9 that quietly kept v8's coarse surrogate, or ran with
+    the convergence mode off, would produce entirely plausible output and
+    waste the campaign -- so each delta is pinned here, and so is the
+    v8 side of it, because a test that only checks v9 would still pass if
+    someone "fixed" v8 to match.
+    """
+
+    def setUp(self):
+        self.v8 = _exports(SIX_MO)
+        self.v9 = _exports(SIX_MO_V9)
+
+    # -- V9-2: noise likelihood back to exact-fine ----------------------
+    def test_the_noise_model_is_normal_not_coarse(self):
+        self.assertEqual(self.v8["COARSE_GPU_MODE"], "delayed_acceptance")
+        self.assertEqual(self.v9["COARSE_GPU_MODE"], "off")
+
+    def test_the_other_coarse_knobs_still_match_v8(self):
+        """They select nothing at mode=off, but the stamped noise identity
+        and the preflight's "wanted" values are read from the same env --
+        dropping them would let those two disagree."""
+        for k in ("COARSE_Q", "COARSE_USE_WS", "COARSE_FIDUCIAL"):
+            self.assertEqual(self.v9[k], self.v8[k], k)
+
+    # -- V9-1: per-source in-model convergence --------------------------
+    def test_the_convergence_mode_is_armed(self):
+        self.assertNotIn("GB_INMODEL_CONVERGE", self.v8)
+        self.assertIn(self.v9["GB_INMODEL_CONVERGE"], ("on", "observe"))
+
+    def test_the_convergence_defaults_are_the_ruled_values(self):
+        self.assertEqual(self.v9["GB_INMODEL_CONVERGE_ITERS"], "100")
+        self.assertEqual(self.v9["GB_INMODEL_CONVERGE_DLL"], "4.0")
+        self.assertEqual(self.v9["GB_INMODEL_CONVERGE_CLASSES"], "newborn")
+
+    def test_the_ladder_gate_is_on(self):
+        """1.0 would make every rung vote, and the hot rungs never retire."""
+        self.assertLess(
+            float(self.v9["GB_INMODEL_CONVERGE_GATE_FRAC"]), 1.0)
+
+    def test_the_refill_is_armed_and_can_actually_fire(self):
+        """stop_frac 1.0 silently disables the refill: every column would
+        finish together, nothing would carry, and the loop degenerates into
+        the fixed chunk loop. Arming REFILL without lowering it is the
+        no-op combination this pins against."""
+        self.assertEqual(self.v9["GB_INMODEL_CONVERGE_REFILL"], "1")
+        self.assertLess(
+            float(self.v9["GB_INMODEL_CONVERGE_STOP_FRAC"]), 1.0)
+
+    # -- V9-5 / V9-6: flip fraction + the in-GROUP convergence ----------
+    def test_the_search_flip_fraction_is_one(self):
+        self.assertEqual(self.v8["GB_SEARCH_RJ_FLIP_FRACTION"], "0.5")
+        self.assertEqual(self.v9["GB_SEARCH_RJ_FLIP_FRACTION"], "1.0")
+        # PE is untouched
+        self.assertEqual(self.v9["GB_PE_RJ_FLIP_FRACTION"],
+                         self.v8["GB_PE_RJ_FLIP_FRACTION"])
+
+    def test_the_in_group_convergence_is_armed_and_distinct(self):
+        """V9-6 is a DIFFERENT scope from V9-1 -- (walker, band) on a
+        pass clock inside one proposal, vs row on a repeat clock. Pinned
+        together so nobody "tidies" one family into the other."""
+        self.assertEqual(self.v9["GB_INMODEL_GROUP"], "1")
+        self.assertEqual(self.v9["GB_INMODEL_GROUP_SCALE"], "flat")
+        self.assertEqual(self.v9["GB_INMODEL_GROUP_DLL"], "4.0")
+        # the group window is in PASSES and must stay far smaller than the
+        # row window, which is in repeats -- swapping them would make the
+        # group rule unfireable (and the row rule fire on noise)
+        self.assertLess(int(self.v9["GB_INMODEL_GROUP_ITERS"]),
+                        int(self.v9["GB_INMODEL_CONVERGE_ITERS"]))
+
+    def test_the_group_has_a_hard_pass_ceiling(self):
+        """Unbounded by construction: one pass is a full sweep of every
+        source, so the ceiling is the only bound."""
+        self.assertGreater(int(self.v9["GB_INMODEL_GROUP_MAX_PASSES"]), 0)
+
+    # -- V9-4: cap cells off --------------------------------------------
+    def test_the_leaf_cap_is_off_and_its_companions_with_it(self):
+        """User ruling 2026-09-24: "no caps. Keep all those options
+        available but turn them off."
+
+        The cap is armed ONLY by a non-empty GB_LEAF_CAP_START, so empty is
+        the off switch and every other knob stays present but inert. The
+        companions are pinned separately because bash resolves exports in
+        order -- an early `=0` followed by a later `=1` silently re-arms
+        them, which is exactly the bug this test caught during authoring.
+        """
+        self.assertEqual(self.v9["GB_LEAF_CAP_START"], "")
+        self.assertEqual(self.v9["GB_CAP_DRIFT_GATE"], "0")
+        self.assertEqual(self.v9["GB_CAP_DRIFT_GATE_EDGE_LEAK"], "0")
+        # the two stage-convergence vetoes the cap needed
+        self.assertEqual(self.v9["GB_SEARCH_CAP_QUIESCENT"], "0")
+        self.assertEqual(self.v9.get("GB_SEARCH_CAP_HEADROOM", "0"), "0")
+
+    def test_the_cap_knobs_are_still_present_not_deleted(self):
+        """"Keep all those options available" -- re-arming must be a
+        one-line change, not an archaeology exercise."""
+        src = open(SIX_MO_V9).read()
+        for knob in ("GB_CAP_DIVISOR", "GB_LEAF_CAP_MIN_ITERS",
+                     "GB_LEAF_CAP_REQUIRE_IMPROVEMENT"):
+            self.assertIn(f"export {knob}=", src, knob)
+
+    # -- V9-3: naming / a fresh store -----------------------------------
+    def test_the_store_is_not_v8s(self):
+        """The coarse mode is part of noise_model_identity, so a v8 store
+        cannot be resumed under V9-2 -- run.py refuses it. The default
+        STORE_DIR must therefore be a new path, not v8's."""
+        src = open(SIX_MO_V9).read()
+        self.assertIn("gf_prod_6mo_v9_4gpu/", src)
+        self.assertNotIn(
+            "STORE_DIR:-/shared/data/global_fit_output/gf_prod_6mo_v8/", src)
+
+    def test_it_does_not_write_over_v8s_log(self):
+        src = open(SIX_MO_V9).read()
+        self.assertIn("--job-name=gf6mo_v9_4gpu", src)
+        self.assertNotIn("gf6mo_v8_%j.log", src)
+
+    def test_everything_else_is_still_v8(self):
+        """The whole point of a copy-with-deltas: any OTHER knob that
+        drifted is either an unrecorded change or a bad merge."""
+        allowed = {
+            "COARSE_GPU_MODE",                      # V9-2
+            "STORE_DIR", "FILE_STORE_DIR",          # V9-3
+            "GB_LEAF_CAP_START", "GB_CAP_DRIFT_GATE",
+            "GB_CAP_DRIFT_GATE_EDGE_LEAK", "GB_SEARCH_CAP_QUIESCENT",
+            "GB_SEARCH_RJ_FLIP_FRACTION",           # V9-5
+        }
+        drift = {
+            k: (self.v8.get(k), self.v9.get(k))
+            for k in set(self.v8) | set(self.v9)
+            if self.v8.get(k) != self.v9.get(k)
+            and not k.startswith("GB_INMODEL_CONVERGE")
+            and not k.startswith("GB_INMODEL_GROUP")
+            and k not in allowed
+        }
+        self.assertEqual(drift, {}, f"undeclared v8 -> v9 drift: {drift}")
 
 
 class ThreeMonthTwinTest(unittest.TestCase):
