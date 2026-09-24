@@ -553,6 +553,54 @@ def _safe(node, key, default=None, label=None):
             f"(likely copied mid-save) -- {type(e).__name__}")
         return default
 
+
+def _opt(node, key):
+    """A dataset that MAY SIMPLY NOT EXIST, read quietly.
+
+    ``_safe`` is for datasets every store is supposed to carry: an absent one
+    is a fault and earns a MISSING line. The per-walker cap / search-stage /
+    RJ-valve families are the opposite case -- they are allocated only when
+    their (default-off) feature flag is set, so every store written before
+    2026-09-24 and every run with the flags off legitimately lacks them. Those
+    must cost NO MISSING line and NO placeholder: the panels they feed are
+    simply not emitted. Returns ``None`` for absent, unreadable or empty.
+    """
+    try:
+        ds = node.get(key)
+    except Exception:
+        return None
+    if ds is None:
+        return None
+    try:
+        arr = ds[:NIT] if NIT else ds[()]
+    except Exception:
+        # Torn chunk in a snapshot copied mid-save. A per-walker diagnostic
+        # panel is not worth a MISSING line of its own; drop it silently,
+        # exactly as if the feature had been off.
+        return None
+    arr = np.asarray(arr)
+    return arr if arr.size else None
+
+
+def _per_cell(arr, how="max"):
+    """Legacy per-(iteration, cell) view of a cap array of EITHER layout.
+
+    PER-WALKER CAPS (2026-09-22, ``GB_LEAF_CAP_PER_WALKER``). The gate's state
+    became ``cap_cell_leaf_cap_w`` ``(nwalkers, ncells)``; the 1-D arrays this
+    page has always read are kept live as MAX-OVER-WALKERS mirrors
+    (``gbspecialstretch._mirror_band_leaf_cap``), so in practice the stored
+    ``cap_cell_leaf_cap`` is still ``(nit, ncells)`` and every panel below is
+    unchanged. This normalizer exists so that a store which ever DOES carry a
+    walker axis in the mirror slot -- a hand-built one, a future layout, or a
+    mirror that a cap-free branch left unrefreshed -- renders the envelope
+    instead of raising inside ``imshow``. ``how="max"`` matches the mirror's
+    own reduction, so the collapsed array is the same number the run wrote.
+    """
+    a = np.asarray(arr)
+    while a.ndim > 2:
+        a = a.max(axis=1) if how == "max" else a.min(axis=1)
+    return a
+
 # THE CAP PANEL MUST PLOT THE ENFORCED ARRAY (2026-08-16). This used to
 # read ``gb/band_leaf_cap`` -- the LEGACY MIRROR that
 # ``_mirror_band_leaf_cap`` keeps equal to the MAX over each band's cap
@@ -578,6 +626,13 @@ CAP_UNIT = "cap cell"
 if caps is None or not getattr(caps, "size", 0):
     caps = _safe(sub, "gb/band_leaf_cap", None, "per-band leaf caps")
     CAP_UNIT, CAP_K = "band", 1
+if caps is not None and getattr(caps, "size", 0):
+    caps = _per_cell(caps)
+# The per-walker cap table itself (``GB_LEAF_CAP_PER_WALKER``, default off).
+# ``None`` on every store written before 2026-09-22 and on every run with the
+# flag off -- the spread panel is then simply not emitted. Stored layout is
+# ``(nit, nwalkers, ncells)``.
+CAPS_W = _opt(sub, "gb/cap_cell_leaf_cap_w")
 
 
 logpaths = discover_run_logs(RUN_DIR)
@@ -1197,6 +1252,12 @@ fig_b64(fig, "gb_leaves")
 # small even when the packing is working -- the sources are all in the
 # galaxy, not spread over 0.56-21.9 mHz).
 cap_cells = _safe(sub, "gb/cap_cell_leaf_cap", None, "per-cell leaf caps")
+if cap_cells is not None and getattr(cap_cells, "size", 0):
+    # Same both-layouts normalisation as ``caps`` above: this panel indexes
+    # ``cap_cells[row]`` as a 1-D per-cell vector and broadcasts it against
+    # ``(nwalkers, ncell)`` occupancy, which a walker axis would silently
+    # misalign rather than raise on.
+    cap_cells = _per_cell(cap_cells)
 cap_edges_arr = None
 try:
     cap_edges_arr = sub["gb/cap_edges"][:]
@@ -1346,6 +1407,302 @@ if cap_cells is not None and cap_cells.size and cap_edges_arr is not None:
         f"({100*_occ_last/ncell:.0f}%): <strong>{_exact1:.0f}</strong> cells "
         f"hold exactly one source and <strong>{_atcap_last:.0f}</strong> sit "
         f"at or over their cap.")
+
+# ---- 5b. PER-(WALKER, BAND) SEARCH STATE ----------------------------------
+# Three families landed on 2026-09-22/24, all indexed by (walker, band or
+# cell) and all PERSISTED in band_info, which is what makes them plottable
+# over the course of a stage and across stages rather than only inside one
+# propose:
+#
+#   * cap_cell_leaf_cap_w  (GB_LEAF_CAP_PER_WALKER)  -- each walker earns,
+#     holds and is enforced against its OWN per-cell allowance. The 1-D
+#     arrays the panels above read are max-over-walker mirrors, so they show
+#     the ENVELOPE; the spread is only in the _w array, and whether the
+#     spread ever opens at all is the whole question the feature poses.
+#     Design: docs/superpowers/specs/2026-09-22-gb-cap-per-walker-design.md
+#   * band_rj_shutoff_w    (GB_SEARCH_BAND_SHUTOFF_PER_WALKER)  -- a
+#     (walker, band) pair whose cold-chain lnL converged WITHIN the current
+#     recipe step takes no further RJ until the next step releases it.
+#     "every OCCUPIED pair has shut off" is the stage-convergence criterion
+#     (recipe.band_shutoff_w_pending_total == 0), so the pending count going
+#     to zero is a stage ending, and the reset at the step boundary is the
+#     next one starting.
+#   * band_stage_w         (GB_SEARCH_STAGE_PER_WALKER)  -- stage 0 COARSE /
+#     stage 1 FINE per (walker, band); a one-way latch on the opt-SNR and
+#     F-stat floors.
+#     Design: docs/superpowers/specs/2026-09-24-gb-search-stage-schedule-design.md
+#
+# EVERY ONE OF THEM IS OPTIONAL. All three flags default to False and none of
+# the arrays exists in a store written before the feature landed, which is
+# most stores on disk. ``_opt`` returns None quietly in that case and each
+# panel below is skipped whole -- no figure, no ``img()`` placeholder (the
+# HTML fragment collapses to ""), no MISSING line. A store without these keys
+# must render EXACTLY as it did before this section existed.
+CAP_PW_TXT = SHUTOFF_W_TXT = STAGE_W_TXT = ""
+CAP_PW_PANEL = SHUTOFF_W_PANEL = STAGE_W_PANEL = ""
+
+# The cold-chain per-(walker, band) source census, ``band_counts[0]``, is the
+# occupancy the valve and the stage latch are both judged against -- an EMPTY
+# pair can never shut off and can never promote, so "all pairs shut" would be
+# unreachable without it. Stored as (nit, ntemps, nwalkers, nbands); the
+# temp-0 hyperslab is 1/ntemps of the bytes a full read would pull, which
+# matters on a 1-yr store. Read ONLY when one of the new families is present,
+# so an old store pays nothing for this section at all.
+_occ_wb = None
+if (CAPS_W is not None or _opt(sub, "gb/band_rj_shutoff_w") is not None
+        or _opt(sub, "gb/band_stage_w") is not None):
+    try:
+        _occ_wb = np.asarray(sub["gb/band_num_binaries"][:NIT, 0])  # (it,w,b)
+    except Exception:
+        _occ_wb = None
+
+# ---- 5b-1. per-walker leaf caps: did the allowances actually diverge? -----
+if CAPS_W is not None and CAPS_W.ndim == 3:
+    _cw = np.asarray(CAPS_W, dtype=float)            # (it, nw, ncell)
+    _cn, _cnw, _cnc = _cw.shape
+    # The cap is a SENTINEL (-1) until the GB search stage arms it, and a
+    # disarmed row would read as a perfectly agreed cap of -1. Only rows where
+    # some walker holds a real (>= 1) cap carry a spread worth quoting.
+    _armed = np.any(_cw >= 1, axis=(1, 2))           # (it,)
+    _spread = _cw.max(axis=1) - _cw.min(axis=1)      # (it, ncell)
+    _ndiff = (_spread > 0).sum(axis=1)               # cells where walkers differ
+    _mxsp = _spread.max(axis=1)
+    _cit = np.arange(_cn)
+
+    fig, ax = plt.subplots(1, 3, figsize=(15.0, 3.6),
+                           gridspec_kw=dict(wspace=0.42))
+
+    # (a) is the feature doing anything? This is the plotted form of the
+    # run log's once-per-iteration "[GB_CAP_PW] cap spread" line: a flat zero
+    # means every walker ramped in lockstep and the per-walker caps bought
+    # nothing, which is a real result and the first thing to check.
+    ax[0].plot(_cit, _ndiff, color=VIOLET, lw=2, label="cells where walkers differ")
+    ax[0].set_xlabel("iteration")
+    ax[0].set_ylabel(f"cap cells (of {_cnc})")
+    axr = ax[0].twinx()
+    axr.plot(_cit, _mxsp, color=AMBER, lw=1.4, ls="--")
+    axr.set_ylabel("max spread [leaves]", color=AMBER, fontsize=9)
+    axr.tick_params(axis="y", colors=AMBER, labelsize=8); axr.grid(False)
+    ax[0].legend(loc="upper left", fontsize=8)
+    ax[0].set_title("per-walker cap divergence"
+                    + ("" if _ndiff[-1] else " (INERT: all walkers agree)"))
+
+    # (b) each walker's own total allowance over the run. The mirror panel
+    # above can only ever show the leading walker; this is the ensemble.
+    _tot_w = _cw.clip(min=0).sum(axis=2)             # (it, nw)
+    for _w in range(_cnw):
+        ax[1].plot(_cit, _tot_w[:, _w], color=CYAN, alpha=0.45, lw=0.9)
+    ax[1].plot(_cit, _tot_w.max(axis=1), color=AMBER, lw=1.8, label="max walker")
+    ax[1].plot(_cit, _tot_w.min(axis=1), color=GREEN, lw=1.4, label="min walker")
+    ax[1].set_xlabel("iteration"); ax[1].set_ylabel("total allowance [leaves]")
+    ax[1].legend(fontsize=8, loc="upper left")
+    ax[1].set_title(f"allowance per cold walker ({_cnw} walkers)")
+
+    # (c) WHERE the disagreement sits. Blocked to the band grid for the same
+    # reason panel 5a(c) is: 1,232 hairlines is a moire, not a distribution.
+    _last = int(np.max(np.nonzero(_armed)[0])) if _armed.any() else _cn - 1
+    _K = max(int(round(_cnc / max(len(band_edges) - 1, 1))), 1)
+    _nblk = _cnc // _K
+    if _nblk >= 1:
+        _sp_blk = _spread[_last][:_nblk * _K].reshape(_nblk, _K).max(axis=1)
+        _fblk = (0.5 * (cap_edges_static[:-1] + cap_edges_static[1:])
+                 )[:_nblk * _K].reshape(_nblk, _K).mean(axis=1) * 1e3
+        ax[2].fill_between(_fblk, 0, _sp_blk, color=VIOLET, alpha=0.9, lw=0,
+                           step="mid")
+        ax[2].set_xlabel("f0 [mHz]")
+        ax[2].set_ylabel("max cap spread in band")
+        ax[2].set_title(f"where the walkers disagree @ iter {_last}")
+    fig_b64(fig, "gb_cap_per_walker")
+
+    _ndiff_last = int(_ndiff[_last]) if _cn else 0
+    CAP_PW_TXT = (
+        f"<code>GB_LEAF_CAP_PER_WALKER</code> is ON in this run: each of the "
+        f"{_cnw} cold walkers carries its own allowance in each of the "
+        f"{_cnc} cap cells. At iteration {_last}, "
+        f"<strong>{_ndiff_last}</strong> cell(s) hold different caps for "
+        f"different walkers, the largest disagreement being "
+        f"<strong>{_mxsp[_last]:.0f}</strong> leaves."
+        if _ndiff_last else
+        f"<code>GB_LEAF_CAP_PER_WALKER</code> is ON in this run, but at "
+        f"iteration {_last} every one of the {_cnw} cold walkers still holds "
+        f"the SAME cap in all {_cnc} cells &mdash; the per-walker caps are "
+        f"running and, so far, buying nothing.")
+    CAP_PW_PANEL = f"""<div class="panel">{img("gb_cap_per_walker", "per-walker leaf caps")}
+<div class="caption">{CAP_PW_TXT} The cap panels above read the legacy 1-D arrays, which
+the run keeps as <em>max-over-walker</em> mirrors &mdash; they show the envelope, never the
+spread, so this panel is the only place the feature can be judged. Left is whether the
+allowances diverged at all and by how much; middle is each walker's own total allowance,
+which is what the enforcement actually gates against; right localises the disagreement in
+frequency.</div></div>"""
+    del _cw, _spread
+
+# ---- 5b-2. the per-(walker, band) RJ shutoff valve ------------------------
+_shut_w = _opt(sub, "gb/band_rj_shutoff_w")
+if _shut_w is not None and _shut_w.ndim == 3 and _occ_wb is not None:
+    _sw = np.asarray(_shut_w, dtype=bool)                  # (it, nw, nb)
+    _n = min(_sw.shape[0], _occ_wb.shape[0])
+    _sw, _ow = _sw[:_n], np.asarray(_occ_wb[:_n])
+    if _sw.shape[1:] != _ow.shape[1:]:
+        # A (walker, band) grid that does not match the census cannot be
+        # scored against occupancy, and OCCUPIED is the load-bearing half of
+        # the criterion. Say so rather than plotting a wrong denominator.
+        MISSING.append(
+            f"per-walker RJ shutoff panel skipped: the valve is "
+            f"{_sw.shape[1:]} but the cold-chain band census is "
+            f"{_ow.shape[1:]}; without a matching occupancy grid the "
+            "'fraction of OCCUPIED pairs shut' denominator would be wrong.")
+    else:
+        _occ = _ow > 0                                     # (it, nw, nb)
+        _nocc = _occ.sum(axis=(1, 2)).astype(float)        # occupied pairs
+        _nshut = (_sw & _occ).sum(axis=(1, 2)).astype(float)
+        _npend = _nocc - _nshut                            # the convergence stat
+        _frac = np.divide(_nshut, _nocc, out=np.zeros_like(_nshut),
+                          where=_nocc > 0)
+        _sit = np.arange(_n)
+        # Recipe-step boundaries: the valve is RELEASED at each new step, so
+        # the step stamp is what turns a sawtooth into a readable series.
+        _step = _opt(sub, "gb/band_shutoff_w_step")
+        _steps = None
+        _bnds = []
+        if _step is not None:
+            _steps = np.asarray(_step).reshape(_step.shape[0], -1)[:_n, 0]
+            _bnds = [int(i) for i in range(1, _n) if _steps[i] != _steps[i - 1]]
+
+        fig, ax = plt.subplots(1, 3, figsize=(15.0, 3.6),
+                               gridspec_kw=dict(wspace=0.42))
+
+        # (a) THE stage-convergence readout. 100% = every occupied pair has
+        # shut off = the stage's own stopping criterion is met.
+        ax[0].plot(_sit, 100.0 * _frac, color=AMBER, lw=2)
+        ax[0].axhline(100.0, color=GREEN, ls=":", lw=1.2)
+        ax[0].text(_sit[-1] if _n else 0, 100.0, " stage converged ",
+                   color=GREEN, fontsize=8, va="top", ha="right")
+        for _b in _bnds:
+            ax[0].axvline(_b, color=VIOLET, lw=1.0, alpha=0.7, ls="--")
+        ax[0].set_ylim(-2, 104)
+        ax[0].set_xlabel("iteration")
+        ax[0].set_ylabel("% of occupied (walker, band) pairs")
+        ax[0].set_title("RJ valve: shut fraction"
+                        + (f" ({len(_bnds)} step boundaries)" if _bnds else ""))
+
+        # (b) the counts behind the fraction. PENDING is the number the
+        # recipe's own band_shutoff_w_pending_total returns, and a stage ends
+        # when it touches zero.
+        ax[1].plot(_sit, _nocc, color=CYAN, lw=1.6, label="occupied pairs")
+        ax[1].plot(_sit, _nshut, color=AMBER, lw=2, label="shut off")
+        ax[1].plot(_sit, _npend, color=RED, lw=1.6, label="pending (= 0 ends the stage)")
+        for _b in _bnds:
+            ax[1].axvline(_b, color=VIOLET, lw=1.0, alpha=0.7, ls="--")
+        ax[1].set_xlabel("iteration"); ax[1].set_ylabel("(walker, band) pairs")
+        ax[1].legend(fontsize=8, loc="upper left")
+        ax[1].set_title("occupied / shut / pending")
+
+        # (c) WHICH bands are holding the stage open, at the last row: per
+        # band, how many walkers are occupied there and still unfrozen.
+        _nb = _sw.shape[2]
+        _pend_b = (_occ[-1] & ~_sw[-1]).sum(axis=0)        # (nb,) walkers
+        _shut_b = (_occ[-1] & _sw[-1]).sum(axis=0)
+        _fc = 0.5 * (band_edges[:-1] + band_edges[1:])[:_nb] * 1e3
+        ax[2].fill_between(_fc, 0, _shut_b, color=AMBER, alpha=0.85, lw=0,
+                           step="mid", label="shut")
+        ax[2].fill_between(_fc, _shut_b, _shut_b + _pend_b, color=RED,
+                           alpha=0.85, lw=0, step="mid", label="pending")
+        ax[2].set_xlabel("f0 [mHz]"); ax[2].set_ylabel("occupied walkers in band")
+        ax[2].legend(fontsize=8, loc="upper right")
+        ax[2].set_title(f"where the stage is still open @ iter {_n - 1}")
+        fig_b64(fig, "gb_shutoff_w")
+
+        _step_txt = ""
+        if _steps is not None:
+            _step_txt = (f" The valve is stamped with recipe step "
+                         f"<strong>{int(_steps[-1])}</strong>"
+                         + (f" and has been released at {len(_bnds)} step "
+                            f"boundary(ies) in this store." if _bnds
+                            else ", which has not changed within this store."))
+        SHUTOFF_W_TXT = (
+            f"<code>GB_SEARCH_BAND_SHUTOFF_PER_WALKER</code> is ON. At "
+            f"iteration {_n - 1}, <strong>{_nshut[-1]:.0f} of "
+            f"{_nocc[-1]:.0f}</strong> occupied (walker, band) pairs have shut "
+            f"off ({100 * _frac[-1]:.0f}%), leaving "
+            f"<strong>{_npend[-1]:.0f}</strong> pending." + _step_txt)
+        SHUTOFF_W_PANEL = f"""<div class="panel">{img("gb_shutoff_w", "per-walker RJ shutoff valve")}
+<div class="caption">{SHUTOFF_W_TXT} A pair freezes when its own cold-chain lnL stops
+improving <em>within the current recipe step</em>, and the valve is released wholesale when
+the next step begins &mdash; the dashed violet lines. This is additional to the per-band
+valve marked in red on the cap panel, and the two compose with OR. The denominator is
+OCCUPIED pairs on purpose: an empty band can never shut off, so counting it would put
+&ldquo;all pairs shut&rdquo; permanently out of reach. Middle is the literal stage-stopping
+criterion &mdash; when the red pending line reaches zero the stage has converged; right says
+which bands are holding it open.</div></div>"""
+        del _sw, _occ
+
+# ---- 5b-3. the per-(walker, band) search STAGE (coarse -> fine) -----------
+_stage_w = _opt(sub, "gb/band_stage_w")
+if _stage_w is not None and _stage_w.ndim == 3:
+    _st = np.asarray(_stage_w, dtype=float)                # (it, nw, nb)
+    _n = _st.shape[0]
+    _stit = np.arange(_n)
+    _fine = _st >= 1
+    if _occ_wb is not None and _occ_wb.shape[1:] == _st.shape[1:]:
+        _m = min(_n, _occ_wb.shape[0])
+        _occ_s = np.asarray(_occ_wb[:_m]) > 0
+        _st, _fine, _n, _stit = _st[:_m], _fine[:_m], _m, _stit[:_m]
+        _den = _occ_s.sum(axis=(1, 2)).astype(float)
+        _num = (_fine & _occ_s).sum(axis=(1, 2)).astype(float)
+        _den_lab = "occupied (walker, band) pairs"
+    else:
+        # No census to pair with -- fall back to ALL pairs and label it, so
+        # the number is never silently a different denominator than 5b-2's.
+        _den = np.full(_n, float(_st.shape[1] * _st.shape[2]))
+        _num = _fine.sum(axis=(1, 2)).astype(float)
+        _den_lab = "all (walker, band) pairs"
+    _fr = np.divide(_num, _den, out=np.zeros_like(_num), where=_den > 0)
+
+    fig, ax = plt.subplots(1, 2, figsize=(11.0, 3.4))
+    ax[0].plot(_stit, 100.0 * _fr, color=GREEN, lw=2)
+    ax[0].set_ylim(-2, 104)
+    ax[0].set_xlabel("iteration"); ax[0].set_ylabel(f"% of {_den_lab}")
+    ax[0].set_title("promoted to FINE (stage 1)"
+                    + ("" if _num[-1] else " -- none yet"))
+    # Per band, the fraction of walkers at FINE. The stage is a ONE-WAY latch,
+    # so this image can only ever fill in, and where it fills first is where
+    # the search settled first.
+    _im = ax[1].imshow(_fine.mean(axis=1).T, aspect="auto", origin="lower",
+                       cmap="viridis", vmin=0, vmax=1,
+                       extent=[0, _n, 0, _st.shape[2]])
+    ax[1].set_xlabel("iteration"); ax[1].set_ylabel("band")
+    ax[1].set_title("fraction of walkers at FINE, per band")
+    fig.colorbar(_im, ax=ax[1], shrink=0.85)
+    fig_b64(fig, "gb_search_stage")
+
+    STAGE_W_TXT = (
+        f"<code>GB_SEARCH_STAGE_PER_WALKER</code> is ON. At iteration "
+        f"{_n - 1}, <strong>{_num[-1]:.0f} of {_den[-1]:.0f}</strong> "
+        f"{_den_lab} ({100 * _fr[-1]:.0f}%) have promoted from the COARSE "
+        f"floor to the FINE one.")
+    STAGE_W_PANEL = f"""<div class="panel">{img("gb_search_stage", "per-walker search stage")}
+<div class="caption">{STAGE_W_TXT} Stage 0 (COARSE) runs the run's starting opt-SNR and
+F-stat floors &mdash; hunt bright sources, do not poison the model with noise births. A
+(walker, band) pair promotes to stage 1 (FINE, relaxed floors, dig the faint tail) once its
+own cold-chain source count has sat unchanged for the configured number of iterations, and
+an empty band never promotes. The latch is <em>one-way</em>, so the right-hand image can
+only fill in: where it fills first is where the search settled first.</div></div>"""
+    del _st, _fine
+
+if _occ_wb is not None:
+    del _occ_wb
+
+# One injection point, and it is CONCATENATED onto the previous panel's line
+# in the HTML rather than given lines of its own: with all three features off
+# (every store written before 2026-09-24) this is the empty string, and the
+# page that comes out is then BYTE-IDENTICAL to one built before this section
+# existed -- which is the property that matters most here, since almost every
+# store on disk predates the features. Verified with ``cmp`` against
+# ``git show HEAD:...`` on gf_prod_3mo_v7.
+PER_WALKER_PANELS = "\n".join(
+    p for p in (CAP_PW_PANEL, SHUTOFF_W_PANEL, STAGE_W_PANEL) if p)
+if PER_WALKER_PANELS:
+    PER_WALKER_PANELS = "\n" + PER_WALKER_PANELS
 
 # ---- 5a2. HIGH-FREQUENCY RECOVERY CENSUS ----------------------------------
 # Injection-vs-recovery above 5 mHz, the direct test of whether source
@@ -4827,7 +5184,7 @@ stacking. Middle is the race that matters &mdash; occupied cells must stay ahead
 at their cap, or the model is queuing against the ceiling rather than filling. Right
 explains why the occupied fraction looks small: the cells tile the whole band uniformly
 while the sources are concentrated in the galaxy, so most cells are empty because there is
-nothing in them yet.</div></div>
+nothing in them yet.</div></div>{PER_WALKER_PANELS}
 <div class="panel">{img("gb_cap_divisor", "cap-divisor study")}
 <div class="caption">What the cap grid can represent, independent of how far this run has
 got: summing the detectable sources a cell cannot admit gives the ceiling the sampler can
