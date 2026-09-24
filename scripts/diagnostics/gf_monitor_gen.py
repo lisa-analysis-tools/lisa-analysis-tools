@@ -189,6 +189,42 @@ if REWOUND:
         f"rendering the live {int(_it_attr)} rows only (the rest is the "
         "discarded pre-rewind trajectory awaiting truncation).")
     NIT = int(_it_attr)
+
+# TORN LAST ROW (2026-09-24). A save step writes the row's datasets one at a
+# time and takes ~23 s on this store; the GB branch alone is 4 walkers x
+# 15000 leaves x 9 columns. Read the file mid-save and the log_like row -- and
+# so ``filled`` and often the ``iteration`` attr -- can already be there while
+# ``inds/gb`` is still zeros. EVERY GB panel then renders an empty model: 0
+# model sources, 0% completeness, no templates on the residual spectrum, and
+# the leaf-count trace dropping off a cliff on its final point. Seen on the
+# 2026-09-24 render at iteration attr 811, where row 810 was empty and 809
+# held 3100 leaves. Step back to the last row that actually carries GB
+# content and say so, rather than publishing a page that reads as if the
+# search had lost every source.
+_gb_inds_ds = g.get("inds/gb")
+if NIT > 0 and _gb_inds_ds is not None:
+    _alive_last = int(np.count_nonzero(_gb_inds_ds[NIT - 1, 0, 0]))
+    if _alive_last == 0:
+        _back = 0
+        for _j in range(NIT - 2, max(NIT - 40, -1), -1):
+            if np.count_nonzero(_gb_inds_ds[_j, 0, 0]):
+                _back = NIT - 1 - _j
+                break
+        if _back:
+            MISSING.append(
+                f"stored row {NIT - 1} carries NO GB leaves while row "
+                f"{NIT - 1 - _back} carries "
+                f"{int(np.count_nonzero(_gb_inds_ds[NIT - 1 - _back, 0, 0]))}"
+                f" -- a torn save, not a lost model. Rendering through row "
+                f"{NIT - 1 - _back} ({_back} row(s) dropped); re-run once the "
+                "save completes to pick them up.")
+            NIT -= _back
+        else:
+            MISSING.append(
+                f"stored row {NIT - 1} carries no GB leaves and neither does "
+                "any of the 40 rows before it. Every GB panel below will read "
+                "as an empty model -- treat that as a store problem, not a "
+                "search result, until the leaf-count trace is checked.")
 it = np.arange(NIT)
 ll = ll_all[:NIT]                                   # (it, 24)
 recipe = {}
