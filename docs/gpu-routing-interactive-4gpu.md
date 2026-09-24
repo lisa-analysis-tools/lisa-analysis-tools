@@ -27,14 +27,29 @@ salloc --nodes=2 --gres=gpu:2 --ntasks-per-node=3 --time=02:00:00 \
 `--ntasks-per-node=3` so a 5-task launch fits (4 compute + 1 saver) with room
 for the round-robin below.
 
-> **EXPORT THIS BLOCK FIRST, IN THE SHELL YOU WILL RUN FROM.** `salloc` gives
-> you a NEW shell, and these do not survive it — nor a second terminal, nor a
-> reconnected session. Nothing below works without them, and the way it fails
-> is not obvious: without the fabric pins Intel MPI dies inside
-> `MPI_Init_thread` with `OFI get address vector map failed` and UCX
-> complaining about `different host id`, which looks like a broken install
-> rather than a missing export. If you are ever unsure whether you exported
-> them, just paste the block again — it is idempotent.
+> ## ★ After EVERY `salloc`, run this one line first
+>
+> ```bash
+> source scripts/diagnostics/gate_env.sh     # prints [gate_env] ok: ...
+> ```
+>
+> `salloc` gives you a NEW shell and none of these exports survive it — nor a
+> second terminal, nor a reconnected session. **This bit three times on
+> 2026-09-23/24**, twice after re-allocating onto different nodes, because the
+> failure does not point at a missing export:
+>
+> ```
+> UCX ERROR no active messages transport ... different host id ...
+> Abort: MPIDI_OFI_mpi_init_hook: OFI get address vector map failed
+> ```
+>
+> which reads as a broken MPI install. **The tell is the HOSTNAMES:** if the
+> nodes named in the error differ from the ones in your last working run, you
+> re-allocated and the exports are gone. Sourcing is idempotent — if unsure,
+> just do it again.
+>
+> The block below is what that file sets, kept here so the reasoning is
+> visible; you do not need to paste it.
 
 ```bash
 # --- EDIT THESE TWO, then paste the rest verbatim -------------------------
