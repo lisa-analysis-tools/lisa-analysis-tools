@@ -755,7 +755,25 @@ export UNEQUAL_ARM_STRIDE=200
 export WDM_PSD_METHOD=layer_calibrated
 export GALFOR_MODULATION_PATH="$PWD/scripts/noise/modulation_unequal.dat"
 export GALFOR_MODULATION_T0=data
-echo "[V8-NOISE] UNEQUAL_ARM=${UNEQUAL_ARM} stride=${UNEQUAL_ARM_STRIDE} wdm_psd_method=${WDM_PSD_METHOD}"
+# PIN THE RESUMABLE NOISE IDENTITY OF THIS STORE (2026-09-23). 36e2319e made
+# the NOISE-brick scalar fit use the brick's own link delays, which moves the
+# fitted (Soms_d, Sa_a) by 0.26% / 0.59%:
+#     equal arms (this store)  1.496182116469e-11  2.982411739286e-15
+#     unequal arms (new code)  1.500004011496e-11  3.000107254658e-15
+# Those numbers ARE general.psd_injection, and the coarse delayed-acceptance
+# fiducial digest is a SHA-256 over their raw float64 bytes, so the new fit
+# changes the digest and the resume guard refuses the store:
+#     "stored noise-model identity differs from the configured one:
+#      {'coarse_fiducial_digest': ('856ddb07f6b46e39', 'b5047f761a4400d5')}"
+# =0 restores the equal-arm fit BIT-IDENTICALLY (verified against 36e2319e^
+# on the mojito-light brick), so gf_prod_6mo_v8_4gpu resumes unchanged.
+# DELETE THIS LINE for a fresh store -- the arm model is the better answer,
+# it just is not the answer this chain was started with.
+# NOT the noise model: UNEQUAL_ARM=1 above still selects
+# UnequalArmInstrumentNoise for the likelihood. This is only the REFERENCE
+# fit that produces general.psd_injection.
+export MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM=0
+echo "[V8-NOISE] UNEQUAL_ARM=${UNEQUAL_ARM} stride=${UNEQUAL_ARM_STRIDE} wdm_psd_method=${WDM_PSD_METHOD} psd_reference_fit_unequal_arm=${MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM}"
 echo "[V8-NOISE] modulation=${GALFOR_MODULATION_PATH} t0=${GALFOR_MODULATION_T0}"
 
 # ---- coarse noise likelihood (pinned, not inherited) ------------------------
@@ -1182,7 +1200,7 @@ export GB_TEMPER_COMPACT_ROWS=1
 # Adaptive gb_search noise rider (379ae2e1): keep taking MaxLogL rounds
 # while a round improves by > tol, stop at the first flat one.
 export GB_SEARCH_NOISE_CHECKS=1
-export GB_SEARCH_NOISE_ITERS_PER_STEP=0
+export GB_SEARCH_NOISE_ITERS_PER_STEP=100
 # PLATEAU TOLERANCE 5 -> 20 lnL (user ruling 2026-09-18). MAXLOGL_TOL is what
 # counts as "this round improved"; JointMaxLogLSearch keeps taking rounds while
 # a round beats it and stops at the first flat one.
@@ -1209,7 +1227,7 @@ export GB_SEARCH_NOISE_ITERS_PER_STEP=0
 export MAXLOGL_TOL=20
 # PE-only exclusive RJ draw (b9aae51f).
 export GB_PE_RJ_DRAW_ONE=1
-export GB_PE_RJ_FSTAT_FRACTION=0.8
+export GB_PE_RJ_FSTAT_FRACTION=0.5
 # Per-block EXACT info matrices through the sig-het fast route
 # (~2.4 ms/src vs ~29-46 chunked). The data_index misindex is FIXED and
 # multi-GPU slots now route by the BUFFER's slot shards. First
@@ -2309,6 +2327,85 @@ echo "[GB-OBS-EIGEN] GB_INMODEL_OBSERVABLE_EIGEN='${GB_INMODEL_OBSERVABLE_EIGEN}
 # need its epoch caches cleared.
 export FSTAT_FDOT_AXIS=1
 export FSTAT_FDOT_RATIO_MAX=5.0
+
+# PEAK-SELECTION FLOOR 8.0 -> 6.25 (user ruling 2026-09-23: "err on the side
+# of grabbing things not missing them. Even if there is excess stuff that is
+# fine.")
+#
+# NOTE ON THE RUN IN FLIGHT: this knob was never exported before, so the
+# current 6mo run has been selecting at the stock 8.0. That is what the
+# measurement below is against.
+#
+# WHY THE STOCK 8.0 IS TOO STRICT *ON THIS RUN*. The 8.0 default is a
+# false-alarm argument (fstat_proposal.py): under the null 2F ~ chi2_4, so
+# F = 32 gives ~4e-5 expected false peaks on a full-band production comb.
+# That null assumes the ASSUMED PSD equals the true one. Here it does not --
+# galfor absorbs the galaxy the search has not resolved, so the assumed floor
+# is k = 1.85-2.00x the truth over 3-4 mHz. The realized null is then
+# 2F ~ chi2_4 / k: the whole distribution SHRINKS, the cut becomes orders of
+# magnitude stricter than designed, and the cost is paid entirely in missed
+# sources. Measured 2026-09-23 (galfor_6mo_figs/): 8.0 is an effective
+# TRUE-SNR threshold of 11.3 at 3.5 mHz, hiding 693 findable binaries, 506 of
+# them in 3-5 mHz.
+#
+# WHY 6.25 AND NOT LOWER. Expected false peaks against this run's own k(f),
+# with the comb size back-calibrated from the ruling's own 4e-5 number:
+#
+#     cut 8.00 -> 6e-5 false,     0 of 693 recovered   (the run in flight)
+#     cut 7.00 -> 0.06 false,   319 recovered
+#     cut 6.50 -> 1.2  false,   478 recovered
+#     cut 6.25 -> 5.3  false,   551 recovered          <-- HERE
+#     cut 6.00 -> 21.7 false,   628 recovered
+#     cut 5.66 -> 134  false,   692 recovered
+#
+# 6.25 buys 73 more sources than 6.50 for ~4 more expected false peaks. The
+# marginal rate collapses just below it -- 6.50->6.40 is 36 sources per false
+# peak, 6.25->6.20 is 7, 6.10->6.00 is 3.7 -- so 6.25 sits at the last point
+# where the exchange is still clearly favourable. 6.0 and below is the regime
+# the 2026-08-17 SNR-8 ruling was written to escape (a peak list that was
+# ~98% noise put 2-7 leaves on one source).
+#
+# THIS IS A COMPENSATION, NOT A FIX, AND IT IS RUN-SPECIFIC. It trades a
+# known-inflated floor for a looser cut; do NOT port it to a run whose noise
+# model is well calibrated, where it would simply loosen the false-alarm rate
+# for nothing. The principled replacement is a per-band self-calibrated
+# threshold (8/sqrt(k_hat), k_hat measured from the F-stat grid's own median)
+# which recovers ALL 693 at the 4e-5 design rate -- see
+# galfor_6mo_figs/FSTAT_SELFCAL_PROPOSAL.md. Revert to 8.0 when that lands,
+# or when GB has subtracted enough that galfor is no longer inflated.
+#
+# CAVEAT the table cannot show: the chi2_4 null only holds where the residual
+# is Gaussian. At 1-3 mHz the confusion forest is not, so the real false rate
+# there is worse than tabulated at ANY global cut. Watch the per-band peak
+# counts and the birth multiplicity per source in the 1-3 mHz bands.
+#
+# ############################################################################
+# ## ⚠⚠ THIS KNOB IS A NO-OP ON A RESUME UNLESS YOU CLEAR THE STAGE-B CACHE ##
+# ##                                                                        ##
+# ## fstat_gridfit's stage-B load path is "load and return, nothing         ##
+# ## recomputed": the peak LIST was selected at whatever threshold was in   ##
+# ## force when it was FITTED, and nothing on that path re-reads the knob.  ##
+# ## So a resume keeps proposing from the old SNR-8 list while this script  ##
+# ## and the run log both say 6.25.                                         ##
+# ##                                                                        ##
+# ## THE CHEAP MIGRATION -- delete ONLY the stacked file, KEEP the comb:    ##
+# ##                                                                        ##
+# ##     rm <fit_dir>/fstat_grid_peaks_stacked.npz                          ##
+# ##     # keep  <fit_dir>/fstat_grid_comb.npz                              ##
+# ##                                                                        ##
+# ## The comb stores F_max for EVERY node, so peaks re-select at the new    ##
+# ## threshold (cheap, deterministic) and only stage B reruns. Deleting the ##
+# ## whole epoch directory also works but pays for the comb again -- and    ##
+# ## the comb is the expensive half (monitor_6mo.html was still reporting   ##
+# ## "the grid fit is still running" at the Sep-18 snapshot).               ##
+# ##                                                                        ##
+# ## As of 2026-09-23 the stage-B cache STAMPS peak_min_F and the loader    ##
+# ## REFUSES a mismatch (fstat_gridfit._check_cached_peak_threshold). But   ##
+# ## caches written BEFORE that stamp -- including this run's -- carry no   ##
+# ## stamp and only WARN. Watch for "carries no peak_min_F stamp" in the    ##
+# ## log on the first resume; that line means you must clear it by hand.    ##
+# ############################################################################
+export FSTAT_PEAK_MIN_SNR=6.25
 # F-STAT CENTERING OFF (probe verdict 2026-09-02, 4-arm A/B, readout
 # artifact 2f5d673c): centered births are a stacking engine in BOTH test
 # bands (A_ctr multiplicity 4.33/walker on a 1-source band, 23% neg-fdot
@@ -2404,6 +2501,10 @@ export GB_FSTAT_CTR_BATCH
 : "${GB_FSTAT_NM_LANE_WEIGHTS:=}"
 export GB_FSTAT_NM_LANE_WEIGHTS
 export GB_TEMPER_ON_REMOVAL=1      # band swaps run inside rj_prior_removal
+# rj_prior_removal proposes prior BIRTHS as well as deaths in this run
+# (what the 2026-09-21 hand edit did from stored iteration 300 on). The
+# code default is 1 = the original deaths-only pruning move.
+export GB_SEARCH_PRIOR_REMOVAL_ONLY=0
 # High-f barren-band birth shutoff (search scope): bands above FMIN with
 # AFTER consecutive zero-birth-accept proposes stop proposing births
 # (deaths + in-model continue; [GB_BAND_SHUTOFF] log line per band).
