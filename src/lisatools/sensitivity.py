@@ -6125,15 +6125,22 @@ class MojitoNoiseEstimates(NoiseComponent):
         generated for gen 2 only), a non-XYZ table, or a file without the
         group.
 
-        ``MOJITO_PSD_FIT_UNEQUAL_ARM=0`` forces the equal-arm fallback even
-        when delays are available or were passed explicitly. THIS EXISTS TO
-        LET AN IN-FLIGHT RUN RESUME. The fitted levels are the run's
-        ``psd_injection``, and the coarse delayed-acceptance fiducial digest
-        is a SHA-256 over their raw float64 bytes, so moving them by the
-        0.26% / 0.59% the arm model is worth changes the digest and
-        ``_open_run_backend`` refuses the resume ("stored noise-model
-        identity differs from the configured one"). Measured on the
-        mojito-light NOISE brick 2026-09-23:
+        ``MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM=0`` forces the equal-arm
+        fallback even when delays are available or were passed explicitly.
+
+        NOTE WHAT THIS KNOB IS NOT. It does not touch the run's noise MODEL.
+        ``UNEQUAL_ARM=1`` selects :class:`UnequalArmInstrumentNoise` as the
+        component the likelihood whitens with, and that is unaffected here.
+        This knob governs only the REFERENCE fit -- the least-squares
+        extraction of a single ``(Soms_d, Sa_a)`` pair from the brick's
+        tabulated estimates, which becomes ``general.psd_injection``.
+
+        THIS EXISTS TO LET AN IN-FLIGHT RUN RESUME. The coarse
+        delayed-acceptance fiducial digest is a SHA-256 over those levels'
+        raw float64 bytes, so moving them by the 0.26% / 0.59% the arm model
+        is worth changes the digest and ``_open_run_backend`` refuses the
+        resume ("stored noise-model identity differs from the configured
+        one"). Measured on the mojito-light NOISE brick 2026-09-23:
 
             unequal arms (default)  1.500004011496e-11  3.000107254658e-15
             equal arms   (=0)       1.496182116469e-11  2.982411739286e-15
@@ -6142,7 +6149,23 @@ class MojitoNoiseEstimates(NoiseComponent):
         knob to 0 for that store; leave it alone for anything new, where the
         arm model is simply the better answer.
         """
-        if os.environ.get("MOJITO_PSD_FIT_UNEQUAL_ARM", "1") == "0":
+        _ref_fit = os.environ.get("MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM")
+        if _ref_fit is None:
+            # Legacy spelling, shipped 2026-09-23 in 1ec78bda and renamed the
+            # same day. Honoured rather than ignored: an unrecognised env var
+            # is SILENT, so a hard rename would quietly hand a runbook the
+            # unequal-arm levels and fail its resume all over again -- the
+            # exact failure this knob was added to fix.
+            _ref_fit = os.environ.get("MOJITO_PSD_FIT_UNEQUAL_ARM")
+            if _ref_fit is not None:
+                warnings.warn(
+                    "MOJITO_PSD_FIT_UNEQUAL_ARM is deprecated; use "
+                    "MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM (same values). The "
+                    "old name is still honoured.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+        if _ref_fit == "0":
             return None
         if ltts is not None:
             arr = np.asarray(ltts, dtype=float)

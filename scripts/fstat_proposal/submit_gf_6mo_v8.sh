@@ -697,8 +697,11 @@ export GALFOR_MODULATION_T0=data
 # on the mojito-light brick), so gf_prod_6mo_v8_4gpu resumes unchanged.
 # DELETE THIS LINE for a fresh store -- the arm model is the better answer,
 # it just is not the answer this chain was started with.
-export MOJITO_PSD_FIT_UNEQUAL_ARM=0
-echo "[V8-NOISE] UNEQUAL_ARM=${UNEQUAL_ARM} stride=${UNEQUAL_ARM_STRIDE} wdm_psd_method=${WDM_PSD_METHOD} psd_fit_unequal_arm=${MOJITO_PSD_FIT_UNEQUAL_ARM}"
+# NOT the noise model: UNEQUAL_ARM=1 above still selects
+# UnequalArmInstrumentNoise for the likelihood. This is only the REFERENCE
+# fit that produces general.psd_injection.
+export MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM=0
+echo "[V8-NOISE] UNEQUAL_ARM=${UNEQUAL_ARM} stride=${UNEQUAL_ARM_STRIDE} wdm_psd_method=${WDM_PSD_METHOD} psd_reference_fit_unequal_arm=${MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM}"
 echo "[V8-NOISE] modulation=${GALFOR_MODULATION_PATH} t0=${GALFOR_MODULATION_T0}"
 
 # ---- coarse noise likelihood (pinned, not inherited) ------------------------
