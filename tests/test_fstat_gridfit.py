@@ -455,6 +455,12 @@ class FitDecisionTest(unittest.TestCase):
         _fstat_last_fit_hit = -1
         name = "stub"
         branch_name = "gb"
+        # The per-iteration stamp GFCombineMove.propose mints and
+        # _prepare_child hands down the tree (2026-09-18). Absent/None is the
+        # documented fallback -- _fstat_clock then counts its own visits --
+        # so the tests that care about the iteration cadence set it
+        # explicitly through _tick().
+        gf_iteration = None
         # the band grid the run is configured with (the staleness check
         # compares epoch caches against it)
         band_edges = np.linspace(1e-3, 2e-3, 6)
@@ -485,18 +491,50 @@ class FitDecisionTest(unittest.TestCase):
             GBSpecialRJFStatGridMove,
         )
 
+        # 2026-09-18: the clock moved OFF the per-branch propose census onto
+        # the per-branch ITERATION count, so both of the new dicts have to be
+        # cleared here -- leaving them dirty leaks a clock value into the next
+        # test. The census is still popped because it is the same kind of
+        # class-level shared state and _temper_cadence_fire reads it; it is
+        # simply no longer what the refit clock counts.
         GBSpecialBase._branch_propose_counts.pop("gb", None)
+        GBSpecialBase._branch_iteration_counts.pop("gb", None)
+        GBSpecialBase._branch_iteration_seen.pop("gb", None)
         GBSpecialRJFStatGridMove._fstat_clock_seeded.clear()
         GBSpecialRJFStatGridMove._fstat_clock_written.clear()
 
     @staticmethod
-    def _tick(n):
-        """Advance the shared branch census, as any GBSpecial propose does."""
+    def _tick(n, *readers):
+        """Run ``n`` more global-fit ITERATIONS of this branch's grid moves.
+
+        2026-09-18 (user ruling): ``GB_FSTAT_REFIT_EVERY`` counts iterations,
+        not proposes, so this helper no longer advances
+        ``GBSpecialBase._branch_propose_counts`` -- it advances the pair the
+        clock actually reads. ``_fstat_clock`` ticks on a CHANGE of the
+        ``gf_iteration`` stamp, i.e. it does exactly
+
+            seen[branch] = <new stamp>;  counts[branch] += 1
+
+        once per fresh stamp, which is what the loop below replicates. Poking
+        the dicts rather than calling ``_fstat_clock`` n times keeps the
+        journal writes attributable to the explicit reads each test makes --
+        ``test_journal_throttle`` pins where those writes land.
+
+        Every ``reader`` is handed the CURRENT stamp, because a move proposed
+        inside iteration k is stamped k and its own clock read must NOT tick
+        again: several reads per iteration are normal (``_fstat_fit_decision``
+        at setup, the DONE.json write, the post-fit mark), and double-counting
+        them would put the knob back on a per-propose footing.
+        """
         from lisatools.globalfit.moves.gbspecialstretch import GBSpecialBase
 
-        GBSpecialBase._branch_propose_counts["gb"] = (
-            GBSpecialBase._branch_propose_counts.get("gb", 0) + n
-        )
+        seen = GBSpecialBase._branch_iteration_seen
+        counts = GBSpecialBase._branch_iteration_counts
+        for _ in range(int(n)):
+            seen["gb"] = int(seen.get("gb", -1)) + 1
+            counts["gb"] = int(counts.get("gb", 0)) + 1
+        for reader in readers:
+            reader.gf_iteration = seen.get("gb")
 
     def setUp(self):
         self.d = tempfile.mkdtemp()
@@ -518,23 +556,81 @@ class FitDecisionTest(unittest.TestCase):
         self.assertEqual(self.s._fstat_fit_decision(), ("skip", 0))
 
     def test_cadence_refit(self):
-        """Cadence runs on the SHARED branch census, not num_proposals.
+        """Cadence runs on the SHARED branch ITERATION count.
 
-        2026-08-24 redesign: the per-instance counter starved in
-        production (full_pe random_choice, short gb_search stages,
-        per-launch resets) so the grid never refit. The clock is now the
-        class-level per-branch propose census, which every GBSpecial move
-        of the branch ticks.
+        2026-08-24 redesign: the per-instance ``num_proposals`` counter
+        starved in production (full_pe random_choice, short gb_search stages,
+        per-launch resets) so the grid never refit, and the clock became the
+        class-level per-branch PROPOSE census.
+
+        2026-09-18 (user ruling): the census is a stage-dependent multiple of
+        the iteration count -- 2 GB-branch proposes per gb_search iteration on
+        the 3-month run, 3 on the 6-month one, ~1/6 in randomized full_pe --
+        so ``GB_FSTAT_REFIT_EVERY=N`` meant a different cadence in every
+        stage. The clock now counts iterations, via the ``gf_iteration`` stamp
+        the stage combine mints once per iteration, and this test pins that:
+        ``=10`` must mean ten iterations, whatever the propose census does.
         """
         self.s.rj_proposal_distribution = {"gb": object()}
         self.s._fstat_epoch = 0
         self.s.fstat_refit_every = 10
         self.s._fstat_last_fit_hit = 0
         self.s.num_proposals = 0        # the instance counter is IGNORED now
-        self._tick(9)
+        self._tick(9, self.s)
         self.assertEqual(self.s._fstat_fit_decision(), ("skip", 0))
-        self._tick(1)
+        self._tick(1, self.s)
         self.assertEqual(self.s._fstat_fit_decision(), ("fit", 1))
+
+    def test_cadence_ignores_the_propose_census(self):
+        """The census must not move the clock (2026-09-18 units change).
+
+        The negative control for ``test_cadence_refit``: pile up ten times the
+        cadence in ``_branch_propose_counts`` -- what the pre-2026-09-18 clock
+        counted, and what every GBSpecial propose still ticks for the
+        tempering cadence -- and the decision must stay "skip". Without this
+        a clock that silently drifted back onto the census would still pass
+        the cadence test above, since both counters advance together in a
+        real run.
+        """
+        from lisatools.globalfit.moves.gbspecialstretch import GBSpecialBase
+
+        self.s.rj_proposal_distribution = {"gb": object()}
+        self.s._fstat_epoch = 0
+        self.s.fstat_refit_every = 10
+        self.s._fstat_last_fit_hit = 0
+        GBSpecialBase._branch_propose_counts["gb"] = 100
+        self._tick(9, self.s)
+        self.assertEqual(self.s._fstat_fit_decision(), ("skip", 0))
+
+    def test_clock_ticks_once_per_iteration_not_per_read(self):
+        """Repeated reads inside ONE iteration must not advance the clock.
+
+        The whole point of the 2026-09-18 change is that the tick is driven by
+        a CHANGE of ``gf_iteration``, so the number of times a move is
+        proposed (or the number of times it reads the clock within a propose)
+        cannot inflate the budget. Reads the clock through the real method,
+        not through ``_tick``.
+        """
+        self.s.gf_iteration = 7
+        self.assertEqual(self.s._fstat_clock(), 1)
+        self.assertEqual(self.s._fstat_clock(), 1)   # same iteration: no tick
+        self.s.gf_iteration = 8
+        self.assertEqual(self.s._fstat_clock(), 2)   # next iteration: one tick
+
+    def test_clock_counts_iterations_not_stamp_gaps(self):
+        """A skipped iteration advances the clock by ONE, not by the gap.
+
+        Documented behaviour of ``_branch_iteration_counts``: "distinct
+        global-fit ITERATIONS this branch has been proposed in". A move that
+        full_pe's ``random_choice`` passes over for five iterations comes back
+        with a stamp five higher and still ticks once, so the clock is a
+        proposed-in-iteration count rather than a wall-clock iteration count.
+        Pinned so the distinction is a decision on record, not an accident.
+        """
+        self.s.gf_iteration = 0
+        self.assertEqual(self.s._fstat_clock(), 1)
+        self.s.gf_iteration = 6          # five iterations went to other moves
+        self.assertEqual(self.s._fstat_clock(), 2)
 
     def test_load_complete_epoch(self):
         d0 = os.path.join(self.d, "epoch_0000")
@@ -852,6 +948,11 @@ class FitClockTest(unittest.TestCase):
     pooled across move instances, the budget surviving a process restart
     (the clock journal + the DONE.json last-fit mark), and pre-clock
     epochs being treated as out of budget.
+
+    The clock's UNIT changed on 2026-09-18 (proposes -> iterations, user
+    ruling) but none of those three properties did, so these tests kept
+    their numbers and only their tick source moved -- see
+    ``FitDecisionTest._tick``.
     """
 
     _Stub = FitDecisionTest._Stub
@@ -887,17 +988,26 @@ class FitClockTest(unittest.TestCase):
         other.fstat_refit_every = 10
         other._fstat_last_fit_hit = 0
         other.num_proposals = 0
-        # ticks contributed by ANY moves of the branch (e.g. the search
-        # instance + prior moves), none by `other` itself:
-        self._tick(10)
+        # ten iterations run, all of them ticked by the OTHER grid move of the
+        # branch (the search instance; `self.s` stands in for it):
+        self._tick(10, self.s)
+        # `other` is proposed inside that same tenth iteration, so it carries
+        # the same stamp -- it contributes NOTHING to the clock and still sees
+        # the pooled value. 2026-09-18: pooling now lives in
+        # _branch_iteration_counts rather than the propose census, but the
+        # property being pinned is unchanged.
+        other.gf_iteration = self.s.gf_iteration
         self.assertEqual(other._fstat_fit_decision(), ("fit", 1))
 
     def test_budget_survives_restart(self):
         """The production failure: short launches must still accumulate.
 
-        Process 1 samples 55 proposes past a fit made at clock 5 and dies.
-        Process 2 (fresh counters) must refit IMMEDIATELY on the carried
-        budget rather than starting a new 50-propose wait.
+        Process 1 samples 55 iterations past a fit made at clock 5 and dies.
+        Process 2 (fresh counters, and a ``gf_iteration`` stamp restarting
+        from 0) must refit IMMEDIATELY on the carried budget rather than
+        starting a new 50-iteration wait. Units are iterations as of
+        2026-09-18; the restart mechanism -- clock.json plus the DONE.json
+        last-fit mark -- is unchanged by that.
         """
         self._make_epoch(0, clock=5)
         self.s.rj_proposal_distribution = {"gb": object()}
@@ -905,8 +1015,8 @@ class FitClockTest(unittest.TestCase):
         self.s.fstat_refit_every = 50
         self.s._fstat_last_fit_hit = self.s._epoch_fit_clock(0)
         self.assertEqual(self.s._fstat_last_fit_hit, 5)
-        # process 1: 55 proposes, journal written en route
-        self._tick(55)
+        # process 1: 55 iterations, journal written on this read
+        self._tick(55, self.s)
         self.assertEqual(self.s._fstat_clock(), 55)
         # process death: in-memory counters gone
         self._reset_clock_state()
@@ -916,7 +1026,10 @@ class FitClockTest(unittest.TestCase):
         s2._fstat_epoch = 0
         s2.fstat_refit_every = 50
         s2._fstat_last_fit_hit = s2._epoch_fit_clock(0)
-        # zero proposes in THIS process; elapsed = 55 - 5 >= 50 -> refit
+        # a relaunched sampler stamps iteration 0 again: the in-process count
+        # restarts at 1 and the journal seed (55) has to win over it.
+        s2.gf_iteration = 0
+        # zero carried iterations in THIS process; elapsed = 55 - 5 >= 50
         self.assertEqual(s2._fstat_fit_decision(), ("fit", 1))
 
     def test_epoch_fit_clock_manifest(self):
@@ -930,16 +1043,18 @@ class FitClockTest(unittest.TestCase):
         self.assertEqual(self.s._epoch_fit_clock(3), 0)  # missing entirely
 
     def test_journal_throttle(self):
+        # Ticks are iterations as of 2026-09-18; the journal cadence is
+        # counted in the same units and is otherwise untouched.
         path = os.path.join(self.d, self.s._FSTAT_CLOCK_BASENAME)
-        self._tick(3)
+        self._tick(3, self.s)
         self.assertEqual(self.s._fstat_clock(), 3)   # first read journals
         with open(path) as f:
             self.assertEqual(json.load(f)["clock"], 3)
-        self._tick(6)
+        self._tick(6, self.s)
         self.assertEqual(self.s._fstat_clock(), 9)   # < WRITE_EVERY: no write
         with open(path) as f:
             self.assertEqual(json.load(f)["clock"], 3)
-        self._tick(4)
+        self._tick(4, self.s)
         self.assertEqual(self.s._fstat_clock(), 13)  # >= WRITE_EVERY: rewrite
         with open(path) as f:
             self.assertEqual(json.load(f)["clock"], 13)

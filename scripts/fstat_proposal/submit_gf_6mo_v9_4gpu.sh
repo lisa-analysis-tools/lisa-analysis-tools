@@ -2699,8 +2699,9 @@ export GB_RJ_BAND_SHUTOFF_FMIN_MHZ=10.0
 # brings a new proposal grid AND an updated noise/foreground profile, so
 # a band that was unreachable may now be reachable) and, failing that,
 # after GB_RJ_BAND_SHUTOFF_RESET_ITERS iterations. With
-# GB_FSTAT_REFIT_EVERY=50 below, a band silenced at iteration 5 is open
-# again by ~50 and then has to re-earn its shutoff over a fresh 5-window,
+# GB_FSTAT_REFIT_EVERY=40 below (was 50 when this note was written), a
+# band silenced at iteration 5 is open again by ~40 and then has to
+# re-earn its shutoff over a fresh 5-window,
 # so those 9 bands get repeated chances instead of one. The cost of the
 # short clock is now a DELAY on a genuinely barren-looking band, not a
 # permanent loss. Revivals log as [GB_BAND_REVIVE <move>].
@@ -3344,8 +3345,14 @@ fi
 # rung counts into v4 and needs a migration per array, which is how the three
 # earlier band-grid migrations failed.
 
-# LATER REFITS: GB_FSTAT_REFIT_EVERY=100 proposal-hits (~8 h at the new
-# iteration cadence, ~3.5% overhead at a 17.7-min fit). To force an extra
+# LATER REFITS: GB_FSTAT_REFIT_EVERY=40 ITERATIONS (~3.5% overhead at a
+# 17.7-min fit). ⚠ THE UNITS CHANGED 2026-09-18 and this note predated it:
+# the clock counts distinct global-fit ITERATIONS THIS BRANCH WAS PROPOSED
+# IN, not proposal hits. In a SEQUENTIAL stage (gb_search) the GB move
+# fires every iteration, so 40 really is 40. In a random_choice stage one
+# wrapped move is drawn per step, so the clock ticks at that move's own
+# rate and 40 means ~40/(draw probability) iterations -- read the cadence
+# per stage, not globally. To force an extra
 # refit mid-run, stop the job and archive the epoch dir, then resubmit:
 #   mv ${STORE_DIR}/gb_fstat_fit/shared/epoch_* /tmp/  &&  sbatch ...
 # (_latest_epoch() then returns None and the fit-in-move rebuilds.)
