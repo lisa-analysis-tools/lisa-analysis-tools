@@ -121,3 +121,121 @@ class VGBWeightsTest(unittest.TestCase):
         m._cold_source_freqs_hz = lambda work: np.array([0.5, 1.5, 1.6, 2.5, 2.6, 2.7])
         w = m._replica_band_weights(SimpleNamespace())
         np.testing.assert_array_equal(w, [1, 2, 3])
+
+
+class GBBandWeightsTest(unittest.TestCase):
+    """GB's own source-weighted band split.
+
+    Until 2026-09-23 ``GBSpecialBase._replica_band_weights`` returned
+    ``None``, so ``replica_band_ranges`` split the band grid by COUNT. The
+    galaxy is not uniform in frequency, so an equal-count split hands the
+    low-frequency replica most of the work; VGB already overrode this
+    correctly and GB now shares the same implementation.
+    """
+
+    @staticmethod
+    def _move(nwalkers=1):
+        m = GBSpecialBase.__new__(GBSpecialBase)
+        m.band_edges = np.array([0.0, 1.0, 2.0, 3.0])
+        m.num_bands = 3
+        m._f0_col = 1  # sampling-basis f0 column (mHz)
+        return m
+
+    @staticmethod
+    def _work(f0_mhz_per_walker, ntemps=2):
+        """``work`` with f0 at sampling column 1, alive rows only where given."""
+        from types import SimpleNamespace
+        nw = len(f0_mhz_per_walker)
+        nleaves = max(len(f) for f in f0_mhz_per_walker)
+        coords = np.zeros((ntemps, nw, nleaves, 4))
+        inds = np.zeros((ntemps, nw, nleaves), dtype=bool)
+        for w, f0 in enumerate(f0_mhz_per_walker):
+            coords[:, w, : len(f0), 1] = np.asarray(f0, dtype=float)
+            inds[:, w, : len(f0)] = True
+        return SimpleNamespace(coords=coords, inds=inds)
+
+    def test_base_no_longer_returns_none(self):
+        # The regression guard: a stub here silently halves dispersal.
+        m = self._move()
+        w = m._replica_band_weights(self._work([[500.0, 1500.0]]))
+        self.assertIsNotNone(w)
+
+    def test_counts_alive_cold_sources_per_band(self):
+        # mHz -> Hz: 500 mHz lands in band 0 of edges [0, 1, 2, 3] Hz.
+        m = self._move()
+        w = m._replica_band_weights(
+            self._work([[500.0, 1500.0, 1600.0, 2500.0, 2600.0, 2700.0]]))
+        np.testing.assert_array_equal(w, [1, 2, 3])
+
+    def test_sums_over_every_walker_of_the_block(self):
+        # A block wider than one walker must weight the whole block, not
+        # walker 0 alone -- otherwise B>1 splits balance the wrong load.
+        m = self._move()
+        w = m._replica_band_weights(self._work([[500.0], [1500.0, 2500.0]]))
+        np.testing.assert_array_equal(w, [1, 1, 1])
+
+    def test_ignores_dead_rows_and_hot_rungs(self):
+        from types import SimpleNamespace
+        m = self._move()
+        coords = np.zeros((2, 1, 3, 4))
+        coords[0, 0, :, 1] = [500.0, 1500.0, 2500.0]   # cold rung
+        coords[1, 0, :, 1] = [2500.0, 2500.0, 2500.0]  # hot rung, must not count
+        inds = np.zeros((2, 1, 3), dtype=bool)
+        inds[0, 0, :2] = True   # only the first two cold rows are alive
+        inds[1, 0, :] = True
+        w = m._replica_band_weights(SimpleNamespace(coords=coords, inds=inds))
+        np.testing.assert_array_equal(w, [1, 1, 0])
+
+    def test_empty_weights_degrade_to_the_count_split(self):
+        m = self._move()
+        w = m._replica_band_weights(self._work([[]], ntemps=1))
+        self.assertEqual(
+            replica_band_ranges(3, 2, weights=w), replica_band_ranges(3, 2))
+
+    def test_weighted_split_beats_the_count_split_on_a_skewed_galaxy(self):
+        # The real shape: most sources in the low-frequency bands, spread
+        # over many of them. The count split gives replica 0 nine times
+        # replica 1's load; the weighted split nearly equalizes it.
+        #
+        # (A skew concentrated in ONE band is deliberately not the fixture:
+        # a band is atomic, so no contiguous split can balance it and the
+        # weighting correctly makes no difference.)
+        m = GBSpecialBase.__new__(GBSpecialBase)
+        m.band_edges = np.arange(31, dtype=float)
+        m.num_bands = 30
+        m._f0_col = 1
+        f0_mhz = np.concatenate([
+            np.repeat(np.arange(0, 10) + 0.5, 9) * 1e3,    # 90 over bands 0-9
+            np.repeat(np.arange(20, 30) + 0.5, 1) * 1e3,   # 10 over bands 20-29
+        ])
+        w = m._replica_band_weights(self._work([f0_mhz]))
+        self.assertEqual(int(w.sum()), 100)
+
+        def load(ranges):
+            return [float(w[a:b].sum()) for a, b in ranges]
+
+        by_count = load(replica_band_ranges(30, 2))
+        by_weight = load(replica_band_ranges(30, 2, weights=w))
+        self.assertEqual(by_count, [90.0, 10.0])          # 9:1 today
+        self.assertLessEqual(max(by_weight) - min(by_weight), 10.0)
+        # every replica keeps a contiguous, covering range
+        r = replica_band_ranges(30, 2, weights=w)
+        self.assertEqual(r[0][0], 0)
+        self.assertEqual(r[-1][1], 30)
+        self.assertEqual(r[0][1], r[1][0])
+
+    def test_weighted_split_scales_to_many_replicas(self):
+        m = GBSpecialBase.__new__(GBSpecialBase)
+        m.band_edges = np.arange(31, dtype=float)
+        m.num_bands = 30
+        m._f0_col = 1
+        f0_mhz = np.repeat(np.arange(0, 10) + 0.5, 8) * 1e3  # 80, bands 0-9
+        w = m._replica_band_weights(self._work([f0_mhz]))
+        for n in (2, 4, 8):
+            loads = [float(w[a:b].sum())
+                     for a, b in replica_band_ranges(30, n, weights=w)]
+            self.assertAlmostEqual(sum(loads), 80.0)
+            # never worse than the count split it replaces
+            count_loads = [float(w[a:b].sum())
+                           for a, b in replica_band_ranges(30, n)]
+            self.assertLessEqual(max(loads), max(count_loads))

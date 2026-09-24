@@ -68,6 +68,16 @@ class EreborGeneralSettings(GeneralSettings):
         default_factory=env_default("GPUS_PER_RANK", None, int)
     )
     ranks_per_gpu: int = dataclasses.field(default_factory=env_default("RANKS_PER_GPU", 1, int))
+    #: R -- compute ranks sharing ONE walker block, the axis that makes
+    #: ``n_gpus > nwalkers`` legal (2026-09-23). ``None`` = AUTO:
+    #: ``n_blocks = gcd(nwalkers, n_compute)``, i.e. maximize walker blocks
+    #: and only then replicate, because a block is the cheap axis (GB is
+    #: sublinear in block width) while a replica costs a whole ACA. An int
+    #: pins it and must divide the compute-rank count. ``1`` forces today's
+    #: walker-block layout and then ``nwalkers`` must divide ``n_compute``.
+    ranks_per_block: typing.Optional[int] = dataclasses.field(
+        default_factory=env_default("RANKS_PER_BLOCK", None, int)
+    )
     # RETIRED as a tempering knob: the engine runs cold-chain only (each
     # branch tempers internally; see the per-branch <BRANCH>_NTEMPS knobs).
     # A set NTEMPS env var raises. erebor.blank overrides this field to keep

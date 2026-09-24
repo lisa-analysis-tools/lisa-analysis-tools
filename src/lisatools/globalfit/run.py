@@ -722,6 +722,26 @@ class GlobalFit:
             r for r in self.all_ranks if layout.role_of(r) == RankRole.SPARE
         ]
         self.fanout_comm = layout.make_fanout_comm(self.comm) if not layout.is_single() else None
+        # THE symmetric site for the two sub-splits (2026-09-23). Every rank
+        # reaches this line exactly once, which is what a collective needs;
+        # ``WalkerFanout`` is NOT such a site (the head builds one while the
+        # workers build a ``ComputeService`` instead), so the comms are built
+        # here and passed in. ``group_comm`` carries work shared only by a
+        # walker block's R replicas -- GB's per-unit delta ledger -- and
+        # ``reps_comm`` carries anything per-WALKER rather than per-rank.
+        # Both are ``None`` for a single compute rank, where neither exists
+        # and the direct-call path must stay untouched.
+        # Guarded on COMPUTE-RANK MEMBERSHIP, not on ``fanout_comm is not
+        # None``: the saver's ``make_fanout_comm`` returns a NULL comm object
+        # (not ``None``), and splitting a null comm raises. It is not a
+        # member of the fan-out comm, so it takes neither sub-split.
+        self.group_comm = None
+        self.reps_comm = None
+        if (self.fanout_comm is not None
+                and int(self.rank) in tuple(layout.compute_ranks)
+                and hasattr(layout, "make_group_comm")):
+            self.group_comm = layout.make_group_comm(self.fanout_comm)
+            self.reps_comm = layout.make_reps_comm(self.fanout_comm)
         if isinstance(self.comm, MPI.Comm) and self.comm.Get_size() > 1:
             install_mpi_abort_on_error(self.comm)
 
@@ -2133,7 +2153,9 @@ class GlobalFit:
         from .communication.fanout import WalkerFanout
 
         fanout = WalkerFanout(
-            self.fanout_comm, self.layout, self.rank, model=model, logger=self.logger
+            self.fanout_comm, self.layout, self.rank, model=model, logger=self.logger,
+            group_comm=getattr(self, "group_comm", None),
+            reps_comm=getattr(self, "reps_comm", None),
         )
         # The resolved base (``_resolve_seed_base``), NOT the raw config field:
         # every rank got it in the state bcast, so the clock a body reads and

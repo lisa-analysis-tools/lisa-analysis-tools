@@ -1360,6 +1360,137 @@ def write_stacked_npz(stacked_path, *, grids_g, mc_ax_g, f0_los, f0_dxs,
              **common, **group_arrays)
 
 
+def union_stacked_npz(slot_paths, out_path):
+    """Union several walkers' stage-B grids into ONE birth cache.
+
+    Each input is a complete stage-B npz fitted against a DIFFERENT walker's
+    residual. The union keeps every slot's groups as separate MIXTURE
+    COMPONENTS -- it does not merge or re-bin anything -- and writes through
+    the same key layout :func:`write_stacked_npz` produces, so
+    ``fstat_proposal.stacked_from_cache`` loads it unchanged.
+
+    WHY COMPONENTS AND NOT ONE STACK. Under ``FSTAT_FDOT_AXIS`` a group's
+    axis-2 bounds are the INTERSECTION of its boxes' feasible fdot ranges, a
+    function of the group's f0 extent -- so two boxes from different walkers
+    with the same ``n_Mc`` have DIFFERENT fdot axes and cannot share a
+    ``StackedFStatProposal4D``. Keeping each slot's groups intact sidesteps
+    that, and it also keeps ``_overlap_depth`` per component instead of
+    multiplying the f0-overlap gather width by W.
+
+    NO DEDUPLICATION, deliberately. Two walkers' boxes on the same comb node
+    carry different grids (both the residual and the inverse-PSD row differ
+    per walker), so any dedup would be lossy rather than a de-duplication --
+    and overlapping boxes are priced EXACTLY by
+    ``StackedFStatProposal4D.logpdf``, which sums over every box whose f0
+    interval contains the point. The standing "never use f0 proximity as a
+    duplicate test" rule is satisfied vacuously: nothing here tests identity.
+
+    Refuses on any disagreement in the arrays that must be shared (the sky
+    axes, the grid basis, the band edges) rather than silently preferring
+    one slot's -- a basis mismatch produces births at absurd parameters with
+    no error anywhere.
+    """
+    slot_paths = [str(p) for p in slot_paths]
+    if not slot_paths:
+        raise ValueError("union_stacked_npz: no slot paths given")
+    files = [np.load(p, allow_pickle=False) for p in slot_paths]
+    try:
+        first = files[0]
+        if "group_sizes" not in first.files:
+            raise ValueError(
+                "union_stacked_npz: %s is a LEGACY single-group cache; the "
+                "union needs the grouped format (group_sizes)" % slot_paths[0])
+
+        # -- arrays every slot must agree on --------------------------------
+        for key in ("alpha_ax", "sin_delta_ax", "band_edges"):
+            ref = np.asarray(first[key])
+            for p, f in zip(slot_paths[1:], files[1:]):
+                got = np.asarray(f[key])
+                if got.shape != ref.shape or not np.array_equal(got, ref):
+                    raise ValueError(
+                        f"union_stacked_npz: {key} differs between "
+                        f"{slot_paths[0]} and {p}; the slots were not swept "
+                        "on the same grid")
+        basis = first["grid_basis"]
+        c_t = float(first["grid_c_t"])
+        for p, f in zip(slot_paths[1:], files[1:]):
+            if str(f["grid_basis"]) != str(basis) or float(f["grid_c_t"]) != c_t:
+                raise ValueError(
+                    f"union_stacked_npz: grid basis/c_t differs between "
+                    f"{slot_paths[0]} and {p} -- axis 2 would mean two "
+                    "different things in one cache")
+
+        # -- concatenate the per-box (global) arrays ------------------------
+        per_box = ("f0_los", "f0_dxs", "peak_f0_mHz", "peak_F", "band_idx",
+                   "band_f0_lo", "band_f0_hi")
+        out = {k: np.concatenate([np.asarray(f[k]) for f in files])
+               for k in per_box}
+        out["alpha_ax"] = np.asarray(first["alpha_ax"])
+        out["sin_delta_ax"] = np.asarray(first["sin_delta_ax"])
+        out["band_edges"] = np.asarray(first["band_edges"])
+        out["grid_basis"] = basis
+        out["grid_c_t"] = c_t
+        #: which slot each box came from -- the provenance the cell census
+        #: and any per-walker diagnostic needs, and cheap to carry
+        out["box_slot"] = np.concatenate([
+            np.full(int(np.sum(np.asarray(f["group_sizes"]))), i, dtype=np.int32)
+            for i, f in enumerate(files)])
+
+        # -- groups, renumbered across the slots ----------------------------
+        sizes, gi_out = [], 0
+        for f in files:
+            gs = [int(x) for x in np.asarray(f["group_sizes"])]
+            for gi in range(len(gs)):
+                out[f"logp_grids_g{gi_out}"] = f[f"logp_grids_g{gi}"]
+                out[f"mc_ax_g{gi_out}"] = f[f"mc_ax_g{gi}"]
+                gi_out += 1
+            sizes.extend(gs)
+        out["group_sizes"] = np.asarray(sizes, dtype=int)
+
+        total = int(sum(sizes))
+        if total != len(out["f0_los"]):
+            raise ValueError(
+                f"union_stacked_npz: {total} box(es) across {len(sizes)} "
+                f"group(s) but f0_los has {len(out['f0_los'])} entries")
+
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        np.savez(out_path, **out)
+        return total, len(sizes)
+    finally:
+        for f in files:
+            f.close()
+
+
+def union_cell_keys(band_idx, peak_f0_mHz):
+    """Exact ``(band, node)`` keys for the union's peaks -- NOT f0 proximity.
+
+    ``FSTAT_PEAK_WEIGHT_CELLS`` equalizes weight per f0 cell by COUNTING
+    boxes in it. Across a union that inverts: a cell holding W copies of one
+    contested peak reads as "W peaks" and gets DOWN-weighted -- penalising
+    exactly the peaks the union exists to keep. The census must count
+    UNIQUE peaks instead.
+
+    The key is exact, not approximate. The comb node grid is
+    ``arange(f0_lo, f0_hi + 0.5*spacing, spacing)``, a deterministic function
+    of ``Tobs`` and the band edges and therefore IDENTICAL across walkers --
+    so the same node yields the same float64 bits in every slot, and
+    ``(band_idx, peak_f0_mHz)`` compares equal by value. That is why this is
+    not the forbidden "f0 proximity" test: nothing here has a tolerance.
+
+    Returns an integer label per box, equal iff the boxes sit on the same
+    comb node of the same band.
+    """
+    band_idx = np.asarray(band_idx)
+    f0 = np.asarray(peak_f0_mHz)
+    if band_idx.shape != f0.shape:
+        raise ValueError(
+            f"union_cell_keys: band_idx has {band_idx.shape} entries but "
+            f"peak_f0_mHz has {f0.shape}")
+    pairs = np.stack([band_idx.astype(np.int64), f0.view(np.int64)], axis=1)
+    _uniq, labels = np.unique(pairs, axis=0, return_inverse=True)
+    return labels.astype(np.int64)
+
+
 def split_box_range(a, b, n_parts):
     """Split boxes ``[a, b)`` into ``n_parts`` CONTIGUOUS, near-equal ranges.
 

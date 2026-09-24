@@ -1308,8 +1308,15 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
             return self.compute_like_local(coords_in, data_index)
         coords_np = np.atleast_2d(np.asarray(asnumpy(coords_in), dtype=np.float64))
         idx = np.atleast_1d(np.asarray(asnumpy(data_index))).astype(np.int32)
+        # ``walkers=idx``: under the flat control plane the body runs at the
+        # FULL ensemble width, so a row's ``data_index`` IS its global walker
+        # -- which is exactly the key the router needs to send it to a rank
+        # that holds that walker, and to rewrite it to that rank's local ACA
+        # row. At one walker block the router ignores it and the split is the
+        # original contiguous one.
         out = self.row_fanout.run(
-            "ll_rows", {"coords": coords_np, "data_index": idx}, local_body=self._score_rows_local
+            "ll_rows", {"coords": coords_np, "data_index": idx},
+            local_body=self._score_rows_local, walkers=idx,
         )
         self._last_d_h = out["d_h"]
         self._last_h_h = out["h_h"]
@@ -1360,7 +1367,7 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         idx = np.atleast_1d(np.asarray(asnumpy(data_index))).astype(np.int32)
         out = self.row_fanout.run(
             "ll_rows_check", {"coords": coords_np, "data_index": idx},
-            local_body=self._check_rows_local,
+            local_body=self._check_rows_local, walkers=idx,
         )
         return out["ll"]
 
@@ -1947,7 +1954,9 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
                 self.check_ll_mode != "0"
                 and self._dbg_step % self.check_ll_every == 0
             ):
-                _cold_ref = asnumpy(self.acs.likelihood())
+                # ensemble-wide: this is compared against prev_logl, which
+                # is at the body's state width (see ensemble_likelihood)
+                _cold_ref = asnumpy(self.ensemble_likelihood(self.acs))
             if self.swap_debug:
                 logger.info(
                     "[STAGE] %s leaf %d PRE-EXPOSE  ACS cold lnL min/med/max "
@@ -2295,7 +2304,7 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
             self._replay_cold_chain("fold", add_coords_in, leaf)
 
             if self.swap_debug:
-                _acs_cold_post = asnumpy(self.acs.likelihood())
+                _acs_cold_post = asnumpy(self.ensemble_likelihood(self.acs))
                 _believed = np.asarray(prev_logl[0], dtype=float)
                 _delta = _believed - _acs_cold_post
                 logger.info(
@@ -2380,8 +2389,14 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         # new_state.log_like[(temp_inds_update, walker_inds_update)] = logl.flatten()
         # new_state.log_prior[(temp_inds_update, walker_inds_update)] = logp.flatten()
         # print("before computing current likelihood. elapsed: ", time.time() - tic)
+        # ENSEMBLE-WIDE, not block-local (2026-09-23). ``new_state`` below is
+        # written at the width of the state this body was handed, and under
+        # the flat control plane that is the WHOLE ensemble while this rank's
+        # ACA holds only its own block -- so a bare ``self.acs.likelihood()``
+        # would be B rows for an N-row assignment. At one block per rank this
+        # returns exactly the local read it replaces.
         current_ll = (
-            self.acs.likelihood()
+            self.ensemble_likelihood(self.acs)
         )  #  - xp.sum(xp.log(xp.asarray(psd[:2])), axis=(0, 2))).get()
         # print("after computing current likelihood. elapsed: ", time.time() - tic)
         if np.any(current_ll < 0.0):

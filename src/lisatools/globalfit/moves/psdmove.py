@@ -128,6 +128,8 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         3x3 channel structure, no frequency-layer mask, full-likelihood
         containers); anything else silently keeps the per-walker path.
     """
+    fanout_flat_body = False  # see the mixin: PSD reads walker count/devices off the LOCAL ACA
+
 
     # canonical noise-model branch order (psd is mandatory in the model;
     # galfor/sgwb optional)
@@ -2058,6 +2060,28 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         """The scoring seam: scatters the rows over the replicas in one-walker replica mode."""
         if not self.rows_active():
             return self._score_rows(walker_inds_keep, psd_coords, galfor_coords, sgwb_coords)
+        # NOT WALKER-ROUTED, AND IT DOES NOT NEED TO BE (2026-09-23).
+        # ``fanout_flat_body = False`` keeps this family on the BLOCK path,
+        # so ``propose_local`` only ever runs against the rank's own block
+        # and every row here already belongs to a walker this rank holds.
+        # The unrouted contiguous split is therefore correct by
+        # construction, at any number of blocks.
+        #
+        # The reason PSD is not flat: it derives its walker count and device
+        # map from the LOCAL ACA (``len(self.acs.flatten())``,
+        # ``self.acs.gpu_map[...]``), which are WRONG -- not merely slow --
+        # under a full-ensemble body. Making it flat would buy a scatter
+        # over R ranks of a move that is ~1% of the iteration, so the
+        # de-ACA pass that would enable it is not worth its risk today.
+        #
+        # This assert is the guard that keeps the above true: if someone
+        # flips ``fanout_flat_body``, the rows stop being block-local and
+        # this fires instead of scoring against the wrong residual.
+        assert not self.fanout_flat_body, (
+            f"{self.fanout_knob_prefix()}: the PSD scoring seam assumes a "
+            "block-local body (fanout_flat_body=False); a flat body needs "
+            "the rows walker-routed first"
+        )
         rows = {"walker_inds": np.asarray(walker_inds_keep).astype(np.int32).reshape(-1)}
         for key, arr in (("psd", psd_coords), ("galfor", galfor_coords), ("sgwb", sgwb_coords)):
             if arr is not None:

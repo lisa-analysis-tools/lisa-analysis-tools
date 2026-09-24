@@ -18,6 +18,14 @@ from lisatools.globalfit.communication.ranks import (
 
 
 def _layouts(world, nwalkers, pool, **kwargs):
+    # gpu_routing defaults ON here and OFF in build_layout: the unified rule
+    # is what this module is ABOUT, while the shipped default is opt-in (see
+    # GpuRoutingOptInTest, which pins the gate itself). Pinning it here also
+    # keeps these tests independent of a GF_GPU_ROUTING left in the shell.
+    # It cannot mask a regression on the legacy shapes, because ON and OFF
+    # agree on every shape the legacy rule accepts -- which is itself an
+    # assertion below.
+    kwargs.setdefault("gpu_routing", True)
     return world.run(lambda r, c: build_layout(c, nwalkers, pool, legacy=False, **kwargs))
 
 
@@ -75,8 +83,10 @@ class BuildLayoutTest(unittest.TestCase):
 
     def test_errors(self):
         world = FakeWorld(3)
-        with self.assertRaises(RuntimeError):
-            _layouts(world, 7, [0, 1])  # 7 % 2 != 0
+        # NOTE (2026-09-23): ``nwalkers % n_compute != 0`` is NO LONGER an
+        # error -- the unified factorization resolves every pair (7 walkers
+        # on 2 ranks = one block of 7, replicated). It warns instead; see
+        # ReplicaModeTest.test_non_divisible_now_resolves_instead_of_raising.
         with self.assertRaises(RuntimeError):
             _layouts(world, 4, [0])  # two compute ranks on one GPU without ranks_per_gpu
         with self.assertRaises(RuntimeError):
@@ -521,10 +531,195 @@ class ReplicaModeTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):  # FakeWorld re-raises rank failures
                 _layouts(FakeWorld(3), 1, [0, 1])
 
-    def test_non_divisible_still_raises(self):
+    def test_non_divisible_now_resolves_instead_of_raising(self):
+        """BEHAVIOUR CHANGE 2026-09-23 (unified factorization).
+
+        ``nwalkers % n_compute`` used to be a hard error. Under
+        ``n_compute = n_blocks x R`` with ``n_blocks = gcd(...)`` every pair
+        resolves: 3 walkers on 2 ranks is one block of 3, replicated twice.
+        It is legal but rarely what was meant, so it must WARN.
+        """
+        lay = _layouts(FakeWorld(3), 3, [0, 1])[0]
+        self.assertEqual((lay.n_blocks, lay.ranks_per_block, lay.block), (1, 2, 3))
+        self.assertTrue(any("one block" in n or "gcd" in n for n in lay.notes))
+
+
+class UnifiedFactorizationTest(unittest.TestCase):
+    """``n_compute = n_blocks x R`` for ANY (nwalkers, n_compute) pair.
+
+    Blocks are the cheap axis (GB is sublinear in block width, and the GB
+    buffer saturates above ~2.5 walkers); replicas cost a full ACA and
+    inverse-PSD per rank. AUTO therefore MAXIMIZES blocks:
+    ``n_blocks = gcd(nwalkers, n_compute)``, ``R = n_compute // n_blocks``.
+    """
+
+    def _lay(self, size, nwalkers, pool=(0, 1), nodes=None, **kw):
+        return _layouts(FakeWorld(size, nodes=nodes), nwalkers, list(pool), **kw)[0]
+
+    def test_auto_factorization_table(self):
+        # (size, nwalkers, pool) -> (n_blocks, R, block)
+        cases = [
+            ((3, 4, [0, 1]), (2, 1, 2)),        # 2 compute ranks, 4 walkers: today
+            ((5, 8, [0, 1]), (4, 1, 2)),        # 4 compute ranks, 8 walkers: today
+            ((3, 1, [0, 1]), (1, 2, 1)),        # one-walker replica mode: today
+            ((5, 1, [0, 1]), (1, 4, 1)),        # one walker, 4 replicas: today
+            ((5, 2, [0, 1]), (2, 2, 1)),        # NEW: GPUs > walkers, 2 blocks x 2
+            ((5, 4, [0, 1]), (4, 1, 1)),        # 4 walkers on 4 ranks: today
+        ]
+        for (size, nw, pool), expect in cases:
+            with self.subTest(size=size, nwalkers=nw):
+                lay = self._lay(size, nw, pool, nodes=[0, 1, 0, 1, 0][:size])
+                self.assertEqual(
+                    (lay.n_blocks, lay.ranks_per_block, lay.block), expect)
+                self.assertEqual(lay.n_blocks * lay.ranks_per_block, lay.n_compute)
+                self.assertEqual(lay.n_blocks * lay.block, lay.nwalkers)
+
+    def test_gpus_greater_than_walkers_pairs_blocks_and_replicas(self):
+        # 4 compute ranks, 2 walkers -> 2 blocks of 1 walker, 2 replicas each.
+        lay = self._lay(5, 2, [0, 1], nodes=[0, 1, 0, 1, 0])
+        self.assertEqual(lay.compute_ranks, (0, 1, 2, 3))
+        self.assertEqual([lay.block_of(r) for r in lay.compute_ranks],
+                         [(0, 1), (0, 1), (1, 2), (1, 2)])
+        self.assertEqual([lay.block_index(r) for r in lay.compute_ranks], [0, 0, 1, 1])
+        self.assertEqual([lay.replica_index(r) for r in lay.compute_ranks], [0, 1, 0, 1])
+        self.assertEqual(lay.ranks_in_block(0), (0, 1))
+        self.assertEqual(lay.ranks_in_block(1), (2, 3))
+        self.assertEqual(lay.block_leads, (0, 2))
+        self.assertTrue(lay.is_block_lead(0) and lay.is_block_lead(2))
+        self.assertFalse(lay.is_block_lead(1) or lay.is_block_lead(3))
+        self.assertTrue(lay.replica_mode)
+        self.assertEqual(lay.n_replicas, 2)
+
+    def test_owner_of_returns_the_block_lead_and_owners_of_the_group(self):
+        lay = self._lay(5, 2, [0, 1], nodes=[0, 1, 0, 1, 0])
+        self.assertEqual(lay.owner_of(0), (0, 0))   # walker 0 -> block 0's lead
+        self.assertEqual(lay.owner_of(1), (2, 0))   # walker 1 -> block 1's lead
+        self.assertEqual(lay.owners_of(1), ((2, 3), 0))
+        with self.assertRaises(ValueError):
+            lay.owner_of(2)
+
+    # ---- endpoint identity: both of today's regimes must be reproduced ----
+    def test_endpoint_r_equals_one_matches_todays_block_layout(self):
+        lay = self._lay(5, 8, [0, 1], nodes=[0, 1, 0, 1, 0])
+        self.assertEqual(lay.ranks_per_block, 1)
+        self.assertFalse(lay.replica_mode)
+        self.assertEqual(lay.n_replicas, 1)
+        for i, r in enumerate(lay.compute_ranks):
+            self.assertEqual(lay.block_of(r), (i * 2, (i + 1) * 2))
+            self.assertEqual(lay.replica_index(r), 0)
+            self.assertEqual(lay.block_index(r), i)
+            self.assertEqual(lay.owner_of(i * 2), (r, 0))
+            self.assertTrue(lay.is_block_lead(r))
+
+    def test_endpoint_one_walker_matches_todays_replica_mode(self):
+        lay = self._lay(5, 1, [0, 1], nodes=[0, 1, 0, 1, 0])
+        self.assertEqual((lay.n_blocks, lay.ranks_per_block), (1, 4))
+        self.assertTrue(lay.replica_mode)
+        self.assertEqual(lay.n_replicas, 4)
+        for i, r in enumerate(lay.compute_ranks):
+            self.assertEqual(lay.block_of(r), (0, 1))
+            self.assertEqual(lay.replica_index(r), i)   # == fanout_rank, as before
+            self.assertEqual(lay.block_index(r), 0)
+        self.assertIn("REPLICAS", lay.describe())
+
+    def test_single_compute_rank_is_untouched(self):
+        # the lite / laptop path: one process owns every walker, no replicas
+        lay = _layouts(FakeWorld(1), 10, [])[0]
+        self.assertTrue(lay.is_single())
+        self.assertEqual((lay.n_blocks, lay.ranks_per_block, lay.block), (1, 1, 10))
+        self.assertFalse(lay.replica_mode)
+        self.assertEqual(lay.block_of(0), (0, 10))
+
+    # ---- explicit R ----
+    def test_explicit_ranks_per_block_overrides_auto(self):
+        lay = self._lay(5, 4, [0, 1], nodes=[0, 1, 0, 1, 0], ranks_per_block=4)
+        self.assertEqual((lay.n_blocks, lay.ranks_per_block, lay.block), (1, 4, 4))
+        self.assertFalse(lay.ranks_per_block_auto)
+
+    def test_explicit_r_must_divide_the_compute_rank_count(self):
         with self.assertRaises(RuntimeError):
-            _layouts(FakeWorld(3), 3, [0, 1])
+            self._lay(5, 4, [0, 1], nodes=[0, 1, 0, 1, 0], ranks_per_block=3)
+
+    def test_explicit_r_must_leave_divisible_blocks(self):
+        # 4 compute ranks, R=2 -> 2 blocks, but 3 walkers do not split in 2
+        with self.assertRaises(RuntimeError):
+            self._lay(5, 3, [0, 1], nodes=[0, 1, 0, 1, 0], ranks_per_block=2)
+
+    def test_escape_hatch_refuses_any_replication(self):
+        with mock.patch.dict(os.environ, {"GF_ONE_WALKER_REPLICAS": "0"}):
+            with self.assertRaises(RuntimeError):
+                self._lay(5, 2, [0, 1], nodes=[0, 1, 0, 1, 0])
+
+    def test_describe_and_digest_agree_on_every_rank(self):
+        world = FakeWorld(5, nodes=[0, 1, 0, 1, 0])
+        outs = _layouts(world, 2, [0, 1])
+        for r in range(5):
+            self.assertEqual(outs[r].describe(), outs[0].describe())
+            self.assertEqual(outs[r].digest(), outs[0].digest())
+        self.assertIn("n_blocks=2", outs[0].describe())
+        self.assertIn("ranks_per_block=", outs[0].describe())
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FactorizeLayoutPublicApiTest(unittest.TestCase):
+    """``factorize_layout`` is the ONE rule; nothing should mirror it.
+
+    ``scripts/walker_scaleup/scale_up.py`` (branch ``walker-scaleup-24``)
+    re-implements ``build_layout``'s arithmetic in its own ``n_compute`` /
+    ``block_width`` helpers, with a docstring saying it "mirrors" them. A
+    mirror keeps answering the old question after the rule changes -- which
+    it now has -- so the planner would report layouts the engine will not
+    build. Exporting the rule makes re-anchoring it an import.
+    """
+
+    def test_it_is_importable_from_the_package(self):
+        from lisatools.globalfit.communication import factorize_layout as f
+        self.assertEqual(f(4, 4), (4, 1, 1))
+
+    def test_the_documented_table(self):
+        from lisatools.globalfit.communication import factorize_layout as f
+        self.assertEqual(f(4, 4), (4, 1, 1))     # today's production run
+        self.assertEqual(f(4, 16), (4, 4, 1))    # GPUs > walkers
+        self.assertEqual(f(24, 8), (8, 1, 3))    # PE blocks
+        self.assertEqual(f(24, 32), (8, 4, 3))   # both axes
+        self.assertEqual(f(1, 4), (1, 4, 1))     # one-walker replicas
+        self.assertEqual(f(10, 4), (2, 2, 5))
+        self.assertEqual(f(32, 16), (16, 1, 2))
+
+    def test_the_invariants_hold_across_a_sweep(self):
+        from lisatools.globalfit.communication import factorize_layout as f
+        for nw in range(1, 33):
+            for nc in range(1, 33):
+                nb, r, blk = f(nw, nc)
+                self.assertEqual(nb * r, nc, f"({nw}, {nc})")
+                self.assertEqual(nb * blk, nw, f"({nw}, {nc})")
+
+    def test_it_agrees_with_build_layout(self):
+        # the rule and the layout that uses it must never disagree
+        for nw, size in ((4, 3), (8, 5), (1, 5), (2, 5)):
+            lay = _layouts(FakeWorld(size, nodes=[0, 1, 0, 1, 0][:size]),
+                           nw, [0, 1])[0]
+            from lisatools.globalfit.communication import factorize_layout as f
+            self.assertEqual(
+                f(nw, lay.n_compute),
+                (lay.n_blocks, lay.ranks_per_block, lay.block),
+                msg=f"nwalkers={nw} size={size}")
+
+    def test_it_is_pure(self):
+        # no env read, no warning, no communicator -- a planner must be able
+        # to call it without side effects
+        import warnings
+        from lisatools.globalfit.communication import factorize_layout as f
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            self.assertEqual(f(3, 2), (1, 2, 3))   # the coprime case that WARNS in build_layout
+
+    def test_it_raises_the_same_refusals(self):
+        from lisatools.globalfit.communication import factorize_layout as f
+        with self.assertRaises(ValueError):
+            f(4, 16, ranks_per_block=3)    # does not divide n_compute
+        with self.assertRaises(ValueError):
+            f(3, 16, ranks_per_block=8)    # 2 blocks do not divide 3 walkers

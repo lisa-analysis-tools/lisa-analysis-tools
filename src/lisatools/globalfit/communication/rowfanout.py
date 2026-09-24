@@ -1,15 +1,24 @@
-"""Scatter independent rows over every compute rank; gather in row order.
+"""Scatter independent scoring rows over compute ranks; gather in row order.
 
-One-walker replica mode (``WalkerBlockLayout.replica_mode``): every compute
-rank holds the SAME walker's residual, so any scoring row (a parameter vector
-plus the walker it scores against) can be evaluated on any rank.
-:meth:`RowFanout.run` splits a row batch into contiguous chunks in
-compute-rank order (``np.array_split`` sizes), ships each chunk through
-:meth:`WalkerFanout.run` (the head evaluates its own chunk locally) and
-concatenates the replies back in row order. :meth:`RowFanout.replay`
-broadcasts a state-mutating step (expose a source, publish a noise model) so
-every replica applies it, head included. With one compute rank both are
-direct local calls -- no comm, no pickling.
+Two routing modes, picked by whether the caller names each row's walker.
+
+**Unrouted** (``walkers=None``) -- every compute rank can serve every row,
+which is true exactly when they all hold the same walkers (one-walker
+replica mode). Rows split into contiguous chunks in compute-rank order via
+:func:`numpy.array_split` sizes. This is the original behaviour and is kept
+byte-for-byte.
+
+**Walker-routed** (``walkers=`` global indices) -- a row scoring walker *w*
+may only be served by a rank whose block CONTAINS *w*; any other rank's
+``AnalysisContainerArray`` simply has no such row. Rows are grouped by
+walker, each walker's rows split contiguously over that walker's group, and
+every shipped row's ``data_index`` rewritten from the GLOBAL walker index to
+the BLOCK-LOCAL row index the serving rank will use. Replies are scattered
+back to their original positions, so the caller always sees row order.
+
+:meth:`RowFanout.replay` broadcasts a state-mutating step (expose a source,
+publish a noise model) so every replica applies it, head included. With one
+compute rank both are direct local calls -- no comm, no pickling.
 
 Rank side: ``ComputeService`` routes op ``x`` to ``move.gf_serve("x", ...)``;
 the payload is ``{"rows": {...}}`` for ``run`` and the raw payload for
@@ -40,8 +49,42 @@ class RowFanout:
         sizes = [len(c) for c in np.array_split(np.arange(int(n)), int(n_chunks))]
         return np.concatenate([[0], np.cumsum(sizes)]).astype(int)
 
-    def run(self, op, rows, *, local_body):
-        """``{name: (N, ...)}`` -> ``{name: (N, ...)}``, rows evaluated over all compute ranks."""
+    def _plan(self, n, walkers):
+        """``{rank: (row positions, local data_index per position)}``.
+
+        Walker-routed: for each walker, its rows are split contiguously over
+        the ranks of ITS block, so a rank only ever receives rows it can
+        actually score, and the row's ACA index is translated on the way.
+        """
+        layout = self.fanout.layout
+        walkers = np.asarray(walkers).reshape(-1).astype(int)
+        if walkers.shape[0] != int(n):
+            raise ValueError(
+                f"RowFanout.run: walkers has {walkers.shape[0]} entries for {n} rows")
+        plan = {}
+        for w in np.unique(walkers):
+            pos = np.nonzero(walkers == int(w))[0]
+            ranks, local = layout.owners_of(int(w))
+            bounds = self._bounds(pos.size, len(ranks))
+            for i, r in enumerate(ranks):
+                s, e = int(bounds[i]), int(bounds[i + 1])
+                if e <= s:
+                    continue
+                prev_pos, prev_loc = plan.get(r, (None, None))
+                take = pos[s:e]
+                loc = np.full(take.size, int(local), dtype=int)
+                plan[r] = ((take, loc) if prev_pos is None else
+                           (np.concatenate([prev_pos, take]),
+                            np.concatenate([prev_loc, loc])))
+        return plan
+
+    def run(self, op, rows, *, local_body, walkers=None):
+        """``{name: (N, ...)}`` -> ``{name: (N, ...)}``, rows evaluated over compute ranks.
+
+        ``walkers``: optional GLOBAL walker index per row. Given, the split
+        is walker-routed (see the module docstring); omitted, it is the
+        original contiguous split over every compute rank.
+        """
         rows = {k: np.asarray(v) for k, v in rows.items()}
         if not rows:
             raise ValueError("RowFanout.run: no row arrays given")
@@ -51,6 +94,15 @@ class RowFanout:
         n = next(iter(lengths.values()))
         if not self.active:
             return local_body(rows)
+        layout = self.fanout.layout
+        # Routing is only NEEDED when blocks differ; at one block every rank
+        # holds every walker and the cheaper contiguous split is equivalent.
+        if walkers is None or int(getattr(layout, "n_blocks", 1)) <= 1:
+            return self._run_contiguous(op, rows, n, local_body)
+        return self._run_routed(op, rows, n, local_body, walkers)
+
+    # -- the original path, unchanged ------------------------------------
+    def _run_contiguous(self, op, rows, n, local_body):
         layout = self.fanout.layout
         bounds = self._bounds(n, layout.n_compute)
 
@@ -70,6 +122,42 @@ class RowFanout:
                 )
                 for k in keys
             }
+
+        return self.fanout.run(
+            op, move=self.move_name, per_rank_payload=chunk, local_body=body, merge=merge
+        )
+
+    # -- walker-routed ----------------------------------------------------
+    def _run_routed(self, op, rows, n, local_body, walkers):
+        layout = self.fanout.layout
+        plan = self._plan(n, walkers)
+
+        def chunk(rank, _w0, _w1):
+            pos, loc = plan.get(rank, (np.zeros(0, int), np.zeros(0, int)))
+            out = {k: v[pos] for k, v in rows.items()}
+            if "data_index" in out:
+                # GLOBAL walker -> BLOCK-LOCAL ACA row. Shipping the global
+                # index would read past the end of a narrower block's ACA.
+                out["data_index"] = loc.astype(
+                    np.asarray(rows["data_index"]).dtype, copy=False)
+            return {"rows": out}
+
+        def body(payload, _model):
+            return local_body(payload["rows"])
+
+        def merge(results):
+            head = results[layout.head_rank]
+            out = {}
+            for k in list(head.keys()):
+                sample = np.asarray(head[k])
+                shape = (n,) + tuple(sample.shape[1:])
+                buf = np.empty(shape, dtype=sample.dtype)
+                for r in layout.compute_ranks:
+                    pos, _loc = plan.get(r, (np.zeros(0, int), None))
+                    if pos.size:
+                        buf[pos] = np.asarray(results[r][k])
+                out[k] = buf
+            return out
 
         return self.fanout.run(
             op, move=self.move_name, per_rank_payload=chunk, local_body=body, merge=merge

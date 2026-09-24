@@ -9,10 +9,15 @@ from lisatools.globalfit.communication.fakecomm import FakeWorld
 from lisatools.globalfit.moves.gbspecialstretch import GBSpecialBase
 
 
-def _sorter(coords_in, alive, N):
+def _sorter(coords_in, alive, N, walker=None):
+    """A stand-in BandSorter. ``walker_inds`` is block-local (0..B-1); it
+    defaults to all-zero, which is a one-walker block."""
+    n = len(np.asarray(alive))
     return SimpleNamespace(
         coords_in=np.asarray(coords_in, dtype=float), inds=np.asarray(alive, dtype=bool),
         N_vals=np.asarray(N, dtype=int), xp=np,
+        walker_inds=(np.zeros(n, dtype=int) if walker is None
+                     else np.asarray(walker, dtype=int)),
     )
 
 
@@ -23,8 +28,11 @@ def _move(comm=None):
     m.nwalkers = 1  # one-walker replica mode: the ledger carries no walker identity
     m.waveform_kwargs = {}
     m._likelihood_engine = SimpleNamespace(
+        # walkers recorded as element 3 (appended 2026-09-23 for the ledger's
+        # walker column); elements 0-2 keep their meaning for older tests.
         fill_template=lambda acs, params, walkers, N, factor, **kw: m.fills.append(
-            (int(factor), np.asarray(params).copy(), np.asarray(N).copy())
+            (int(factor), np.asarray(params).copy(), np.asarray(N).copy(),
+             np.asarray(walkers).copy())
         )
     )
     return m
@@ -83,6 +91,76 @@ class LedgerLocalTest(unittest.TestCase):
         np.testing.assert_array_equal(m.fills[1][2], [8, 16])  # -1 call: both rows new-alive
 
 
+class LedgerWalkerColumnTest(unittest.TestCase):
+    """The ledger carries a per-row WALKER label (2026-09-23).
+
+    It used to hard-code ``walkers = zeros(n)`` in the apply, which was
+    correct only because a replicated block was exactly one walker wide.
+    Under ``n_compute = n_blocks x R`` a block can be several walkers AND
+    replicated, and zeros would fold every remote delta into walker 0.
+    """
+
+    @staticmethod
+    def _fills_walkers(m):
+        return [np.asarray(f[3]).tolist() for f in m.fills]
+
+    def test_apply_routes_each_row_to_its_own_walker(self):
+        m = _move()
+        m.nwalkers = 3
+        d = {"rows": np.array([0, 1, 2]),
+             "old_coords_in": np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
+             "old_alive": np.array([True, True, True]),
+             "new_coords_in": np.array([[1.5, 2.0], [3.5, 4.0], [5.5, 6.0]]),
+             "new_alive": np.array([True, True, True]),
+             "N": np.array([8, 8, 8]),
+             "walker": np.array([0, 2, 1])}
+        m._ledger_apply(SimpleNamespace(analysis_container_arr="acs"), [d])
+        self.assertEqual(self._fills_walkers(m), [[0, 2, 1], [0, 2, 1]])
+
+    def test_walker_labels_are_masked_with_each_sides_alive_flags(self):
+        m = _move()
+        m.nwalkers = 3
+        d = {"rows": np.array([0, 1, 2]),
+             "old_coords_in": np.zeros((3, 2)),
+             "old_alive": np.array([False, True, True]),
+             "new_coords_in": np.zeros((3, 2)),
+             "new_alive": np.array([True, False, True]),
+             "N": np.array([8, 8, 8]),
+             "walker": np.array([0, 1, 2])}
+        m._ledger_apply(SimpleNamespace(analysis_container_arr="acs"), [d])
+        self.assertEqual(self._fills_walkers(m), [[1, 2], [0, 2]])
+
+    def test_a_wide_block_no_longer_raises(self):
+        # Before the walker column this refused with NotImplementedError.
+        m = _move()
+        m.nwalkers = 4
+        d = {"rows": np.array([0]), "old_coords_in": np.array([[1.0, 2.0]]),
+             "old_alive": np.array([True]), "new_coords_in": np.array([[1.0, 2.0]]),
+             "new_alive": np.array([False]), "N": np.array([8]),
+             "walker": np.array([3])}
+        m._ledger_apply(SimpleNamespace(analysis_container_arr="acs"), [d])
+        self.assertEqual(self._fills_walkers(m), [[3]])
+
+    def test_mismatched_walker_length_is_refused(self):
+        m = _move()
+        m.nwalkers = 2
+        d = {"rows": np.array([0, 1]), "old_coords_in": np.zeros((2, 2)),
+             "old_alive": np.array([True, True]), "new_coords_in": np.zeros((2, 2)),
+             "new_alive": np.array([True, True]), "N": np.array([8, 8]),
+             "walker": np.array([0])}
+        with self.assertRaises(ValueError):
+            m._ledger_apply(SimpleNamespace(analysis_container_arr="acs"), [d])
+
+    def test_a_payload_without_the_column_still_applies_at_one_walker(self):
+        # Backward compatibility: an old-format delta is a one-walker block.
+        m = _move()
+        d = {"rows": np.array([0]), "old_coords_in": np.array([[1.0, 2.0]]),
+             "old_alive": np.array([True]), "new_coords_in": np.array([[1.0, 2.0]]),
+             "new_alive": np.array([False]), "N": np.array([8])}
+        m._ledger_apply(SimpleNamespace(analysis_container_arr="acs"), [d])
+        self.assertEqual(self._fills_walkers(m), [[0]])
+
+
 class _FakeDev:
     """A minimal cupy stand-in: refuses to be indexed by a HOST numpy array.
 
@@ -122,11 +200,16 @@ class _FakeXP:
         return a if isinstance(a, _FakeDev) else _FakeDev(a)
 
 
-def _dev_sorter(coords_in, alive, N):
+def _dev_sorter(coords_in, alive, N, walker=None):
+    n = len(np.asarray(alive))
     return SimpleNamespace(
         coords_in=_FakeDev(np.asarray(coords_in, dtype=float)),
         inds=_FakeDev(np.asarray(alive, dtype=bool)),
         N_vals=_FakeDev(np.asarray(N, dtype=int)),
+        # device-resident like the rest of the sorter: the snapshot must
+        # pull it through ``asnumpy`` rather than indexing it on the host
+        walker_inds=_FakeDev(np.zeros(n, dtype=int) if walker is None
+                             else np.asarray(walker, dtype=int)),
         xp=_FakeXP,
     )
 
@@ -169,7 +252,8 @@ class LedgerEmptySelectionTest(unittest.TestCase):
         d = m._ledger_delta(snap, None)
         self.assertEqual(
             set(d),
-            {"rows", "old_coords_in", "old_alive", "new_coords_in", "new_alive", "N"},
+            {"rows", "old_coords_in", "old_alive", "new_coords_in", "new_alive",
+             "N", "walker"},
         )
         self.assertEqual(int(d["rows"].size), 0)
         m._ledger_apply(SimpleNamespace(analysis_container_arr="acs"), [d])

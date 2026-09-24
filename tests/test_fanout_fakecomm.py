@@ -58,8 +58,14 @@ def _run_world(size, nodes, nwalkers, head_fn, saver_fn=None, ranks_per_gpu=1):
     stubs = {}
 
     def fn(rank, comm):
+        # gpu_routing pinned ON: some callers below ask for shapes only the
+        # unified rule resolves. It is opt-in at the launcher
+        # (ranks.GPU_ROUTING_ENV) and agrees with the legacy rule on every
+        # shape the legacy rule accepts, so pinning it changes nothing for
+        # the walker-block and one-walker cases this helper also serves.
         layout = build_layout(
-            comm, nwalkers, [0, 1], legacy=False, ranks_per_gpu=ranks_per_gpu
+            comm, nwalkers, [0, 1], legacy=False, ranks_per_gpu=ranks_per_gpu,
+            gpu_routing=True,
         )
         fcomm = layout.make_fanout_comm(comm)
         role = layout.role_of(rank)
@@ -480,6 +486,75 @@ class ReplicaGathersTest(unittest.TestCase):
     def test_concat_blocks_returns_the_head_block_in_replica_mode(self):
         out = self._replica_world(lambda fo, layout: concat_blocks({0: [1.5], 1: [9.9]}, layout))
         np.testing.assert_array_equal(out[0], [1.5])
+
+    def test_concat_blocks_reduces_over_block_leads_when_both_axes_exist(self):
+        """2 blocks x 2 replicas: one representative per block, in walker order.
+
+        The old code had exactly two branches -- concatenate EVERY compute
+        rank, or (replica mode) take the head alone. With both axes live,
+        the first counts each walker R times and the second drops every
+        block but the head's; only a reduction over block LEADS is right.
+        """
+        world = FakeWorld(5, nodes=[0, 1, 0, 1, 0])
+
+        def fn(rank, comm):
+            layout = build_layout(comm, 2, [0, 1], legacy=False,
+                                  gpu_routing=True)  # 2 blocks x R=2
+            return concat_blocks({0: [1.0], 1: [1.0], 2: [2.0], 3: [2.0]}, layout)
+
+        out = world.run(fn)
+        np.testing.assert_array_equal(out[0], [1.0, 2.0])
+
+    def test_allgather_walker_vector_concatenates_blocks_not_replicas(self):
+        world = FakeWorld(5, nodes=[0, 1, 0, 1, 0])
+
+        def fn(rank, comm):
+            layout = build_layout(comm, 2, [0, 1], legacy=False,
+                                  gpu_routing=True)  # 2 blocks x R=2
+            fcomm = layout.make_fanout_comm(comm)
+            if layout.role_of(rank) == RankRole.SAVER:
+                return "saver"
+            fo = WalkerFanout(fcomm, layout, rank, model=None)
+            w0, _w1 = layout.block_of(rank)
+            # every replica of a block holds the SAME walker rows
+            return fo.allgather_walker_vector(np.array([100.0 + w0]))
+
+        out = world.run(fn)
+        for r in range(4):
+            np.testing.assert_array_equal(out[r], [100.0, 101.0])
+
+    def test_group_and_reps_communicators(self):
+        world = FakeWorld(5, nodes=[0, 1, 0, 1, 0])
+
+        def fn(rank, comm):
+            layout = build_layout(comm, 2, [0, 1], legacy=False,
+                                  gpu_routing=True)  # 2 blocks x R=2
+            fcomm = layout.make_fanout_comm(comm)
+            if layout.role_of(rank) == RankRole.SAVER:
+                # The saver is NOT in the fan-out comm, and both splits are
+                # taken ON the fan-out comm -- so it must not call them. The
+                # "every rank calls it the same number of times" rule is
+                # scoped to the fan-out comm's members, i.e. compute ranks.
+                return "saver"
+            gcomm = layout.make_group_comm(fcomm)
+            rcomm = layout.make_reps_comm(fcomm)
+            return (
+                int(gcomm.Get_size()), int(gcomm.Get_rank()),
+                (int(rcomm.Get_size()), int(rcomm.Get_rank()))
+                if layout.is_block_lead(rank) else None,
+            )
+
+        out = world.run(fn)
+        # each group holds R == 2 ranks, lead first
+        self.assertEqual(out[0][:2], (2, 0))
+        self.assertEqual(out[1][:2], (2, 1))
+        self.assertEqual(out[2][:2], (2, 0))
+        self.assertEqual(out[3][:2], (2, 1))
+        # the representatives comm holds one rank per block, in block order
+        self.assertEqual(out[0][2], (2, 0))
+        self.assertEqual(out[2][2], (2, 1))
+        self.assertIsNone(out[1][2])
+        self.assertIsNone(out[3][2])
 
     def test_allgather_walker_vector_returns_the_head_vector_everywhere(self):
         world = FakeWorld(3, nodes=[0, 0, 0])

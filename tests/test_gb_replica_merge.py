@@ -426,3 +426,97 @@ class SyncCommandTest(unittest.TestCase):
     def test_unknown_op_still_raises(self):
         with self.assertRaises(ValueError):
             _sync_move().gf_serve("nope", {}, {"seq": 1, "call_index": 1}, _FakeModel())
+
+
+class MergeWalkerAxisTest(unittest.TestCase):
+    """The merge spans the whole walker BLOCK, not walker 0 (2026-09-23).
+
+    Under ``n_compute = n_blocks x R`` a replicated block can be several
+    walkers wide, so every ``[t, 0]`` in the merge became ``[t, w]``. At a
+    one-walker block the loop runs once and the result is unchanged, which
+    the rest of this module already pins.
+    """
+
+    NW = 2
+
+    def _reply_w(self, coords, inds, bands):
+        return {
+            "block_coords": np.asarray(coords, float),
+            "block_inds": np.asarray(inds, bool),
+            "block_band_inds": np.asarray(bands, np.int64),
+            "d_h": np.zeros((self.NW, NL)),
+            "h_h": np.zeros((self.NW, NL)),
+        }
+
+    def _blank_w(self, fill=-99.0):
+        return (np.full((NT, self.NW, NL, ND), fill),
+                np.zeros((NT, self.NW, NL), bool))
+
+    def test_each_walker_is_merged_independently(self):
+        # rank 0 owns bands [0,2), rank 1 owns [2,4). Each walker carries a
+        # DIFFERENT source per rank, so a merge that only ever looked at
+        # walker 0 would leave walker 1 empty.
+        co0 = np.full((NT, self.NW, NL, ND), -99.0)
+        in0 = np.zeros((NT, self.NW, NL), bool)
+        bd0 = np.full((NT, self.NW, NL), -1, np.int64)
+        co1 = co0.copy(); in1 = in0.copy(); bd1 = bd0.copy()
+        for t in range(NT):
+            for w in range(self.NW):
+                # rank 0's owned source, f0 = 10 + w
+                co0[t, w, 0, F0] = 10.0 + w; in0[t, w, 0] = True; bd0[t, w, 0] = 1
+                # rank 1's owned source, f0 = 20 + w
+                co1[t, w, 3, F0] = 20.0 + w; in1[t, w, 3] = True; bd1[t, w, 3] = 2
+
+        wc, wi = self._blank_w()
+        merge_owned_sources(
+            wc, wi,
+            {0: self._reply_w(co0, in0, bd0), 1: self._reply_w(co1, in1, bd1)},
+            [0, 1], {0: (0, 2), 1: (2, 4)}, F0,
+        )
+        for t in range(NT):
+            for w in range(self.NW):
+                self.assertEqual(int(wi[t, w].sum()), 2,
+                                 msg=f"rung {t}, walker {w}")
+                np.testing.assert_allclose(
+                    wc[t, w, :2, F0], [10.0 + w, 20.0 + w],
+                    err_msg=f"rung {t}, walker {w} sorted by f0")
+
+    def test_shape_gate_names_the_block_width(self):
+        wc, wi = self._blank_w()
+        # a reply shaped for ONE walker against a two-walker block
+        bad = _reply(np.zeros((NT, 1, NL, ND)), np.zeros((NT, 1, NL), bool),
+                     np.full((NT, 1, NL), -1, np.int64))
+        with self.assertRaisesRegex(RuntimeError, "walker block"):
+            merge_owned_sources(wc, wi, {0: bad}, [0], {0: (0, 4)}, F0)
+
+    def test_overflow_message_names_the_walker(self):
+        co = np.full((NT, self.NW, NL, ND), -99.0)
+        ind = np.zeros((NT, self.NW, NL), bool)
+        bd = np.full((NT, self.NW, NL), -1, np.int64)
+        ind[:, :, :] = True; bd[:, :, :] = 1
+        co[:, :, :, F0] = np.arange(NL)
+        # one rank owning every slot of a 6-leaf branch is fine; two ranks
+        # each owning all 6 overflow it
+        with self.assertRaisesRegex(RuntimeError, "walker"):
+            merge_owned_sources(
+                *self._blank_w(),
+                {0: self._reply_w(co, ind, bd), 1: self._reply_w(co, ind, bd)},
+                [0, 1], {0: (0, 2), 1: (0, 2)}, F0,
+            )
+
+    def test_preserve_leaf_identity_spans_walkers(self):
+        co = np.full((NT, self.NW, NL, ND), -99.0)
+        ind = np.zeros((NT, self.NW, NL), bool)
+        bd = np.full((NT, self.NW, NL), -1, np.int64)
+        for t in range(NT):
+            for w in range(self.NW):
+                co[t, w, 4, F0] = 30.0 + w; ind[t, w, 4] = True; bd[t, w, 4] = 1
+        wc, wi = self._blank_w()
+        merge_owned_sources(wc, wi, {0: self._reply_w(co, ind, bd)}, [0],
+                            {0: (0, 4)}, F0, preserve_leaf_identity=True)
+        for t in range(NT):
+            for w in range(self.NW):
+                # written back AT ITS OWN SLOT, not densely repacked
+                self.assertTrue(wi[t, w, 4])
+                self.assertEqual(int(wi[t, w].sum()), 1)
+                self.assertAlmostEqual(wc[t, w, 4, F0], 30.0 + w)

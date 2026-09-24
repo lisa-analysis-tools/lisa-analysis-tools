@@ -58,14 +58,20 @@ class RemoteWorkerError(RuntimeError):
 
 
 def concat_blocks(results, layout):
-    """Concatenate per-rank 1-D results in compute-rank (== walker) order.
+    """Concatenate per-BLOCK 1-D results in walker order.
 
-    Replica mode (one walker on every compute rank): the head's block IS the
-    whole vector; the replicas hold copies.
+    ONE representative per walker block (``replica_index == 0``), because
+    the R ranks of a block hold the same walkers: concatenating all of them
+    would repeat every walker R times, and taking the head alone would drop
+    every block but its own. Both of the pre-2026-09-23 branches are special
+    cases of this -- at ``R == 1`` the leads ARE the compute ranks, and at
+    ``n_blocks == 1`` the only lead is the head.
     """
-    if getattr(layout, "replica_mode", False):
-        return np.asarray(results[layout.head_rank])
-    return np.concatenate([np.asarray(results[r]) for r in layout.compute_ranks])
+    leads = getattr(layout, "block_leads", None)
+    if leads is None:  # pragma: no cover - stub layouts in older tests
+        leads = (layout.head_rank,) if getattr(layout, "replica_mode", False) \
+            else layout.compute_ranks
+    return np.concatenate([np.atleast_1d(np.asarray(results[r])) for r in leads])
 
 
 def _reply(seq, rank, ok, result, wall_s, error=None):
@@ -134,7 +140,8 @@ def fanout_digest_line(iteration, state, residual_hashes=None) -> str:
 class WalkerFanout:
     """Head-side fan-out (usable on every compute rank for the collectives)."""
 
-    def __init__(self, comm, layout, rank, *, model=None, logger=None):
+    def __init__(self, comm, layout, rank, *, model=None, logger=None,
+                 group_comm=None, reps_comm=None):
         self.comm = comm
         self.layout = layout
         self.rank = int(rank)
@@ -143,6 +150,21 @@ class WalkerFanout:
         self.head = layout.head_rank
         self.is_head = self.rank == self.head
         self.single = layout.is_single()
+        #: the R ranks sharing this rank's walker block (``None`` when single
+        #: or when the caller did not build one). Work shared only by a
+        #: block's replicas -- GB's per-unit delta ledger above all -- goes
+        #: here, NOT on ``self.comm``: on the fan-out comm it would be
+        #: O(n_compute) instead of O(R) AND would put blocks with nothing to
+        #: say to each other into unit lockstep.
+        #:
+        #: PASSED IN, never built here. ``WalkerFanout`` is constructed on
+        #: the head while workers construct ``ComputeService`` instead, so
+        #: this is NOT a symmetric call site and a ``Split`` taken here
+        #: deadlocks the head. ``run.py`` builds both beside
+        #: ``make_fanout_comm``, which every compute rank does reach.
+        self.group_comm = group_comm
+        #: one representative per block (replica 0); a null comm off-lead.
+        self.reps_comm = reps_comm
         if not self.single and comm is not None:
             # `comm` must be the compute-only fan-out comm (layout.make_fanout_comm),
             # never the world comm; `None` is a test-only placeholder that skips this
@@ -338,19 +360,32 @@ class WalkerFanout:
 
     # -- setup-phase collective ------------------------------------------
     def allgather_walker_vector(self, local_1d):
-        """Concatenate every compute rank's 1-D block vector in walker order (collective).
+        """Concatenate the BLOCKS' 1-D vectors in walker order (collective).
 
-        Replica mode: every rank holds a copy of the same single walker, so
-        the head's vector (not a concatenation of the replicas) is the
-        answer, returned identically on every rank.
+        Stays a single allgather on the fan-out comm -- every compute rank
+        must reach it, so a split over the representatives communicator
+        would need the non-leads to sit out a collective they are already
+        inside. Instead every rank allgathers and then keeps one part per
+        block, which is cheap (the parts are one float per walker) and keeps
+        the result identical on every rank by construction.
+
+        At ``R == 1`` the kept parts are every part, in compute-rank order --
+        byte-for-byte the pre-2026-09-23 concatenation. At ``n_blocks == 1``
+        exactly one part survives, the head's, which is what replica mode
+        has always returned.
         """
         local = np.asarray(local_1d)
         if self.single:
             return local
         parts = self.comm.allgather(local)  # fan-out comm ranks == compute-rank order
-        if getattr(self.layout, "replica_mode", False):
-            return np.asarray(parts[self.layout.fanout_rank(self.head)])
-        return np.concatenate([np.asarray(p) for p in parts])
+        layout = self.layout
+        leads = getattr(layout, "block_leads", None)
+        if leads is None:  # pragma: no cover - stub layouts in older tests
+            if getattr(layout, "replica_mode", False):
+                return np.asarray(parts[layout.fanout_rank(self.head)])
+            return np.concatenate([np.asarray(p) for p in parts])
+        return np.concatenate(
+            [np.atleast_1d(np.asarray(parts[layout.fanout_rank(r)])) for r in leads])
 
 
 class ComputeService:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import glob
 import hashlib
 import json
@@ -750,6 +751,72 @@ def _unit_residue_mask(band_inds, walker_inds, units, remainder):
         return band_inds % int(units) == int(rem)
     rem_dev = xp.asarray(rem.astype(np.int64))
     return band_inds % int(units) == rem_dev[walker_inds]
+
+
+#: One F-stat fit against one walker's residual, and the ranks doing it.
+FStatFitSlot = collections.namedtuple(
+    "FStatFitSlot",
+    "slot walker owner_rank local_index group_ranks needs_bcast",
+)
+
+
+def fstat_fit_plan(layout, refs):
+    """Map reference walkers onto compute ranks: ``(FStatFitSlot, ...)``.
+
+    THE ONE SPELLING of the W-way split, so the rank -> slot map and the
+    box -> rank map cannot drift apart. It reuses
+    :func:`lisatools.sampling.fstat_gridfit.split_box_range` -- the same pure
+    function stage A and stage B already split with -- rather than deriving
+    a second contiguous partition that merely happens to agree today.
+
+    The decomposition is two nested axes: OUTER = the walker (W independent
+    fits, one per reference residual), INNER = the existing contiguous range
+    split over that walker's ranks. Everything downstream reads this object:
+    the reference row's ``owner_rank`` and ``root``, ``n_parts`` and the
+    group-local rank index in the comb and stage-B runners, the per-slot
+    cache directory, and the release order.
+
+    ``needs_bcast`` is per SLOT but must be decided per COMMAND -- see
+    :func:`fstat_plan_is_collective`.
+
+    ``layout`` may be ``None`` (single process): one slot per reference, all
+    on the head, nothing broadcast.
+    """
+    from ..communication.ranks import WalkerBlockLayout  # noqa: F401  (typing only)
+    from ...sampling.fstat_gridfit import split_box_range
+
+    refs = [int(w) for w in refs]
+    if layout is None:
+        return tuple(
+            FStatFitSlot(i, w, 0, w, (0,), False) for i, w in enumerate(refs)
+        )
+    ranks = tuple(layout.compute_ranks)
+    bounds = split_box_range(0, len(ranks), max(1, len(refs)))
+    slots = []
+    for i, w in enumerate(refs):
+        a, b = (int(x) for x in bounds[i]) if i < len(bounds) else (0, 0)
+        group = ranks[a:b] or (layout.head_rank,)
+        owner, local = layout.owner_of(w)
+        slots.append(FStatFitSlot(i, w, int(owner), int(local), tuple(group),
+                                  len(group) > 1))
+    return tuple(slots)
+
+
+def fstat_plan_is_collective(plan) -> bool:
+    """Whether the epoch's commands must be communicator-wide.
+
+    ``comm.Bcast`` is COMMUNICATOR-WIDE: every rank of the fan-out comm must
+    call it. So a command in which some slots are singletons (return at once)
+    and others are not (block in ``Bcast``) DEADLOCKS.
+
+    The rule is therefore per COMMAND, not per rank: if ANY slot's group has
+    more than one rank, every slot uses the collective form. Only the
+    all-singleton case takes the non-collective path. Callers must ship this
+    one boolean in the payload rather than letting each rank re-derive it
+    from its own layout copy -- the existing ``gb_fstat_ref_row`` payload
+    already enforces exactly that discipline for ``owner_rank``.
+    """
+    return any(s.needs_bcast for s in plan)
 
 
 def replica_band_ranges(num_bands, n_replicas, weights=None):
@@ -2072,7 +2139,12 @@ def merge_owned_sources(work_coords, work_inds, replies, ranks, band_ranges,
         band_ranges: ``{rank: (b0, b1)}`` half-open owned band range.
         f0_col: the sampling-basis frequency column to sort on.
     """
-    ntemps, _, nleaves_max, _ = np.shape(work_coords)
+    # ``nw`` IS THE BLOCK WIDTH (2026-09-23), not the literal 1. Under
+    # ``n_compute = n_blocks x R`` a replicated block can hold several
+    # walkers, so every ``[t, 0]`` below became ``[t, w]`` over the block.
+    # At a one-walker block the loop runs once and the behaviour is the
+    # pre-existing one exactly.
+    ntemps, nw, nleaves_max, _ = np.shape(work_coords)
     contributors = []
     for r in ranks:
         rep = replies[r]
@@ -2082,15 +2154,15 @@ def merge_owned_sources(work_coords, work_inds, replies, ranks, band_ranges,
         bands = np.asarray(bands)
         coords = np.asarray(rep["block_coords"])
         inds = np.asarray(rep["block_inds"], dtype=bool)
-        if (coords.shape[:3] != (ntemps, 1, nleaves_max)
-                or inds.shape != (ntemps, 1, nleaves_max)
-                or bands.shape != (ntemps, 1, nleaves_max)):
+        if (coords.shape[:3] != (ntemps, nw, nleaves_max)
+                or inds.shape != (ntemps, nw, nleaves_max)
+                or bands.shape != (ntemps, nw, nleaves_max)):
             raise RuntimeError(
                 f"GB replica merge: rank {r} shipped block_coords "
                 f"{coords.shape}, block_inds {inds.shape}, block_band_inds "
                 f"{bands.shape}; every one must be "
-                f"{(ntemps, 1, nleaves_max)} (+ ndim on the coords) -- one "
-                "walker, the head's own branch shape"
+                f"{(ntemps, nw, nleaves_max)} (+ ndim on the coords) -- the "
+                "head's own branch shape for this walker block"
             )
         b0, b1 = (int(v) for v in band_ranges[r])
         contributors.append((r, coords, inds, bands, b0, b1))
@@ -2105,70 +2177,73 @@ def merge_owned_sources(work_coords, work_inds, replies, ranks, band_ranges,
     grid_lo = min(int(band_ranges[r][0]) for r in ranks)
     grid_hi = max(int(band_ranges[r][1]) for r in ranks)
     for t in range(ntemps):
-        for r, _c, _inds, _bands, _b0, _b1 in contributors:
-            _oob = _inds[t, 0] & (
-                (_bands[t, 0] < grid_lo) | (_bands[t, 0] >= grid_hi))
-            _k = int(_oob.sum())
-            if _k:
-                raise RuntimeError(
-                    f"GB replica merge: rank {r} holds {_k} alive source(s) "
-                    f"with a band label outside [{grid_lo}, {grid_hi}) at "
-                    f"rung {t}"
-                )
-    for t in range(ntemps):
+        for w in range(nw):
+            for r, _c, _inds, _bands, _b0, _b1 in contributors:
+                _oob = _inds[t, w] & (
+                    (_bands[t, w] < grid_lo) | (_bands[t, w] >= grid_hi))
+                _k = int(_oob.sum())
+                if _k:
+                    raise RuntimeError(
+                        f"GB replica merge: rank {r} holds {_k} alive "
+                        f"source(s) with a band label outside "
+                        f"[{grid_lo}, {grid_hi}) at rung {t}, walker {w}"
+                    )
+    # ONE loop over (rung, walker) rather than a nested pair, so the body
+    # below keeps its original indentation and the diff stays reviewable.
+    for t, w in ((_t, _w) for _t in range(ntemps) for _w in range(nw)):
         # one selection per contributor, EMPTY ONES KEPT so the two lists stay
         # index-aligned with ``contributors``
         picks = [
-            np.nonzero(inds[t, 0] & (bands[t, 0] >= b0) & (bands[t, 0] < b1))[0]
+            np.nonzero(inds[t, w] & (bands[t, w] >= b0) & (bands[t, w] < b1))[0]
             for _r, _coords, inds, bands, b0, b1 in contributors
         ]
         n = int(sum(int(sel.size) for sel in picks))
         if n > nleaves_max:
             raise RuntimeError(
-                f"GB replica merge: rung {t} holds {n} owned sources but the "
-                f"branch has {nleaves_max} leaves. Each rank births only into "
-                "its OWN dead-slot partition (leaf % R == r, "
+                f"GB replica merge: rung {t}, walker {w} holds {n} owned "
+                f"sources but the branch has {nleaves_max} leaves. Each rank "
+                "births only into its OWN dead-slot partition (leaf % R == r, "
                 "``_owned_rows_mask``), so the owned sets are disjoint in "
                 "slots as well as in bands and must fit together -- the slot "
                 "partition was violated."
             )
         cold = t == 0 and d_h is not None
-        work_inds[t, 0, :] = False
+        work_inds[t, w, :] = False
         if cold:
-            d_h[0][:] = np.nan
-            h_h[0][:] = np.nan
+            d_h[w][:] = np.nan
+            h_h[w][:] = np.nan
         if preserve_leaf_identity:
             # fixed-dimensional branch: leaves never move, so write each owned
             # source back AT ITS OWN SLOT and union the alive masks
             for (r, coords, _i, _b, _b0, _b1), sel in zip(contributors, picks):
                 if sel.size == 0:
                     continue
-                work_coords[t, 0][sel] = coords[t, 0][sel]
-                work_inds[t, 0][sel] = True
+                work_coords[t, w][sel] = coords[t, w][sel]
+                work_inds[t, w][sel] = True
                 if cold:
-                    d_h[0][sel] = np.asarray(replies[r]["d_h"])[0][sel]
-                    h_h[0][sel] = np.asarray(replies[r]["h_h"])[0][sel]
+                    d_h[w][sel] = np.asarray(replies[r]["d_h"])[w][sel]
+                    h_h[w][sel] = np.asarray(replies[r]["h_h"])[w][sel]
             continue
         if n == 0:
             continue
         merged = np.concatenate(
-            [coords[t, 0][sel]
+            [coords[t, w][sel]
              for (_r, coords, _i, _b, _b0, _b1), sel in zip(contributors, picks)
              if sel.size],
             axis=0,
         )
         # the SAME key ``_write_back_state`` ranks live sources by
         order = np.argsort(merged[:, int(f0_col)], kind="stable")
-        work_coords[t, 0, :n] = merged[order]
-        work_inds[t, 0, :n] = True
+        work_coords[t, w, :n] = merged[order]
+        work_inds[t, w, :n] = True
         if cold:
-            d_h[0][:n] = np.concatenate(
-                [np.asarray(replies[r]["d_h"])[0][sel]
+            d_h[w][:n] = np.concatenate(
+                [np.asarray(replies[r]["d_h"])[w][sel]
                  for (r, *_rest), sel in zip(contributors, picks) if sel.size],
                 axis=0,
             )[order]
-            h_h[0][:n] = np.concatenate(
-                [np.asarray(replies[r]["h_h"])[0][sel]
+            h_h[w][:n] = np.concatenate(
+                [np.asarray(replies[r]["h_h"])[w][sel]
                  for (r, *_rest), sel in zip(contributors, picks) if sel.size],
                 axis=0,
             )[order]
@@ -3527,6 +3602,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 "coords_in": np.zeros((0, 0), dtype=np.float64),
                 "alive": np.zeros(0, dtype=bool),
                 "N": np.zeros(0, dtype=int),
+                "walker": np.zeros(0, dtype=int),
             }
         sel_dev = getattr(band_sorter, "xp", np).asarray(sel)
         return {
@@ -3536,6 +3612,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             ),
             "alive": np.asarray(asnumpy(band_sorter.inds[sel_dev]), dtype=bool),
             "N": np.asarray(asnumpy(band_sorter.N_vals[sel_dev])).astype(int),
+            # THE WALKER COLUMN (2026-09-23). ``band_sorter.walker_inds`` is
+            # BLOCK-LOCAL (0..B-1) and ``fill_template``'s ``walkers``
+            # argument indexes ACA ROWS, which are also block-local -- so
+            # they correspond directly with no translation. Before this the
+            # apply hard-coded zeros, which was right only because a block
+            # was one walker wide; at any wider block it would have folded
+            # every remote delta into walker 0.
+            "walker": np.asarray(
+                asnumpy(band_sorter.walker_inds[sel_dev])).astype(int),
         }
 
     def _ledger_delta(self, before, band_sorter):
@@ -3550,6 +3635,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 "new_coords_in": before["coords_in"],
                 "new_alive": before["alive"],
                 "N": before["N"],
+                "walker": before.get("walker", np.zeros(0, dtype=int)),
             }
         rows_dev = getattr(band_sorter, "xp", np).asarray(rows)
         now_c = np.asarray(
@@ -3559,6 +3645,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         changed = (now_a != before["alive"]) | (
             (now_a | before["alive"]) & np.any(now_c != before["coords_in"], axis=1)
         )
+        _walker = before.get("walker")
         return {
             "rows": rows[changed],
             "old_coords_in": before["coords_in"][changed],
@@ -3566,11 +3653,38 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             "new_coords_in": now_c[changed],
             "new_alive": now_a[changed],
             "N": before["N"][changed],
+            # The sorter's walker labels are frozen for the propose along
+            # with its band labels, so the snapshot's column is still valid
+            # at close -- it is carried through ``changed``, never re-read.
+            "walker": (np.zeros(int(np.count_nonzero(changed)), dtype=int)
+                       if _walker is None else np.asarray(_walker)[changed]),
         }
 
     def _ledger_exchange(self, delta):
-        """Allgather this rank's delta on the fan-out comm; return the OTHER ranks' deltas."""
-        comm = self.fanout.comm
+        """Allgather this rank's delta on its GROUP comm; return the others' deltas.
+
+        THE GROUP COMM, NOT THE FAN-OUT COMM (2026-09-23). Only the replicas
+        of one walker block share a residual, so only they have anything to
+        reconcile. Running this on the fan-out comm would be O(n_compute)
+        instead of O(R) *and* would force every block into the same unit at
+        the same moment -- lockstep between blocks that are working on
+        different walkers entirely.
+
+        At ``R == 1`` there is no one to exchange with, so it returns an
+        empty list without touching a communicator at all; that is the
+        walker-block layout's behaviour and it must stay free.
+        """
+        fanout = self.fanout
+        # The GROUP comm when the run built one, else the fan-out comm --
+        # which is what a single-block run's group would BE, so the fallback
+        # is the same communicator rather than a different policy.
+        comm = getattr(fanout, "group_comm", None)
+        if comm is None:
+            comm = fanout.comm
+        if comm is None or int(comm.Get_size()) <= 1:
+            # A group of one has nobody to reconcile with. Derived from the
+            # comm rather than the layout so it holds for any caller.
+            return []
         parts = comm.allgather(delta)
         me = int(comm.Get_rank())
         return [p for i, p in enumerate(parts) if i != me]
@@ -3578,21 +3692,35 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     def _ledger_apply(self, model, deltas):
         """Apply remote deltas to this replica's residual: add back the old alive
         templates (factor +1), subtract the new alive ones (factor -1)."""
-        assert int(self.nwalkers) == 1, (
-            "the ledger carries no walker identity -- one-walker replica mode only"
-        )
         acs = model.analysis_container_arr
         xp = getattr(acs, "xp", np)
         for d in deltas:
             if int(np.shape(d["rows"])[0]) == 0:
                 continue
+            # Block-local walker per row. Absent only for a payload built
+            # before the column existed, where a one-walker block makes
+            # zeros the correct answer.
+            w_col = d.get("walker")
+            if w_col is None:
+                w_col = np.zeros(int(np.shape(d["rows"])[0]), dtype=int)
+            w_col = np.asarray(w_col, dtype=int)
+            if w_col.shape[0] != int(np.shape(d["rows"])[0]):
+                # ``getattr``, not ``self.name``: this guard must survive a
+                # skeleton move (the unit tests build one via ``__new__``),
+                # and a message that itself raises hides the real error.
+                raise ValueError(
+                    f"{getattr(self, 'name', type(self).__name__)}: ledger "
+                    f"delta has {w_col.shape[0]} walker labels for "
+                    f"{int(np.shape(d['rows'])[0])} rows"
+                )
             for factor, key, alive_key in ((+1, "old_coords_in", "old_alive"), (-1, "new_coords_in", "new_alive")):
                 alive = np.asarray(d[alive_key], dtype=bool)
                 if not alive.any():
                     continue
                 params = xp.asarray(np.asarray(d[key])[alive])
                 N = xp.asarray(np.asarray(d["N"])[alive])
-                walkers = xp.zeros(params.shape[0], dtype=xp.int32)
+                # Was ``xp.zeros(...)``: correct only at a one-walker block.
+                walkers = xp.asarray(w_col[alive].astype(np.int32))
                 self._likelihood_engine.fill_template(
                     acs, params, walkers, N, factor=factor,
                     waveform_kwargs=self.waveform_kwargs,
@@ -4639,6 +4767,35 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """
         return int(np.argmin(lls) if self.fstat_search_residual
                    else np.argmax(lls))
+
+    def _fstat_fit_refs_from(self, lls, n):
+        """The ``n`` walkers an F-stat epoch is fitted to, best first.
+
+        The plural of :meth:`_fstat_fit_ref_from`: the ``n`` lowest-lnL cold
+        walkers under :attr:`fstat_search_residual`, the ``n`` highest under
+        PE. ``n = 1`` is the single-reference fit and MUST reproduce the
+        scalar selector exactly, tie-breaks included -- that identity is the
+        hinge the whole W=1 bit-identity gate hangs on, which is why the
+        sort is ``kind="stable"``: numpy's stable sort takes the lowest index
+        among equal values, the same tie-break ``argmin``/``argmax`` use.
+
+        **Why fit several at all.** The single reference is a PROXY for "the
+        residual with the most left to find", and the proxy is lossy: at v3
+        iteration 82 only 6 of 121 occupied bands had every cold walker
+        agreeing on its leaf count. A peak walker B still needs disappears
+        from the shared grid the moment walker A finds it. Fitting W walkers
+        and unioning their peaks removes the proxy -- a peak survives iff at
+        least one walker still has it.
+        """
+        lls = np.asarray(lls, dtype=float).reshape(-1)
+        n = max(1, min(int(n), int(lls.size)))
+        order = np.argsort(lls, kind="stable")
+        if not self.fstat_search_residual:
+            # descending by value, but still lowest-index-first among ties:
+            # reverse a stable ascending sort of the NEGATED values rather
+            # than reversing ``order``, which would flip the tie-break.
+            order = np.argsort(-lls, kind="stable")
+        return [int(w) for w in order[:n]]
 
     def _fstat_global_reference(self, model):
         """``(w_global, owner_rank, local_index, lls)`` for the F-stat fit.
@@ -11257,9 +11414,47 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         else:
             self._replica_index, self._n_replicas = int(rep[0]), max(1, int(rep[1]))
 
+    def _cold_source_freqs_hz(self, work):
+        """f0 (Hz) of every alive COLD-row source, over every walker of the block.
+
+        Sampling-basis f0 is in mHz at column :attr:`_f0_col` (the literal 1
+        of the legacy layout when the transform container does not name it),
+        mirroring ``BandSorter._source_freqs_hz``. VGB overrides this: its f0
+        is a per-leaf transform FILL, never a sampled column.
+
+        ``work.inds`` is ``(ntemps, nwalkers, nleaves_max)`` and rung 0 is the
+        cold chain. EVERY walker of the block is summed, not walker 0 alone --
+        at a block width above one the split must balance the whole block's
+        load, and at one walker the two are the same thing.
+        """
+        col = self._f0_col if getattr(self, "_f0_col", None) is not None else 1
+        coords = _to_numpy(work.coords[0])  # (nwalkers, nleaves_max, ndim)
+        alive = np.asarray(_to_numpy(work.inds[0]), dtype=bool)
+        if not alive.any():
+            return np.zeros(0, dtype=float)
+        return np.asarray(coords[alive][:, int(col)], dtype=float) / 1e3
+
     def _replica_band_weights(self, work):
-        """Per-band weights for the static split; None = split by band count (GB)."""
-        return None
+        """Per-band weight = count of alive cold-row sources in that band.
+
+        The band grid is uniform in frequency but the GALAXY IS NOT -- the
+        bulk of the detectable population sits below ~5 mHz -- so the plain
+        by-band-count split (``replica_band_ranges``'s ``weights=None``
+        branch) hands the low-frequency replica most of the proposal load.
+        Weighting by live source count equalizes it; on a skewed grid that
+        is the difference between ~50 % and ~100 % dispersal efficiency.
+
+        Degenerate weights (no alive source anywhere) are all-zero and
+        ``replica_band_ranges`` falls back to the count split, which is the
+        right answer when there is no load to balance.
+
+        Shared with VGB, which supplies its own
+        :meth:`_cold_source_freqs_hz` because its f0 is a per-leaf fill.
+        """
+        f0 = self._cold_source_freqs_hz(work)
+        b = np.searchsorted(np.asarray(self.band_edges), f0, side="right") - 1
+        b = np.clip(b, 0, self.num_bands - 1).astype(int)
+        return np.bincount(b, minlength=self.num_bands).astype(float)
 
     def _owned_rows_mask(self, band_sorter):
         """Rows this replica may propose on: alive rows of its owned bands plus
@@ -15327,9 +15522,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         band_sorter, units, bool_remainder),
                 )
 
-            (band_index, temp_index, walkers_permuted, special_index,
-             num_bands_unit) = self._tempering_swap_grid(
-                 band_sorter, start, units=units)
+            # SPAN ADDED 2026-09-23 for the band-dispersal ceiling. This
+            # build is WHOLE-GRID: it draws a walker permutation for every
+            # interior band of the unit at every rung, and the owned-band
+            # filter is applied afterwards (``_unowned_row`` below). So its
+            # cost does NOT divide by the replica count R, and it is one of
+            # the two terms that set ``f_fixed`` -- the R-invariant fraction
+            # of a GB propose, hence the 1/f_fixed ceiling on what band
+            # dispersal can ever buy. ``sorter_build`` is the other and is
+            # already instrumented; the empty-pair census beside it is a
+            # counter dict, not compute, so it needs no span.
+            with _tspan(getattr(self, "_prop_timer", None), "temper_swap_grid"):
+                (band_index, temp_index, walkers_permuted, special_index,
+                 num_bands_unit) = self._tempering_swap_grid(
+                     band_sorter, start, units=units)
 
             # ---- DEFERRED CELL RELABELS (orchestration audit 2026-08-27,
             # candidate 2; GB_CELL_LABEL_DEFERRED, default OFF) ----
@@ -21257,8 +21463,24 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         _replica = self._replica_active()
         _band_ranges = None
         if _replica:
+            # SOURCE-WEIGHTED only under the opt-in routing knob. The weights
+            # are the difference between ~50% and ~100% dispersal efficiency
+            # (the galaxy is not uniform in frequency, so an equal-BAND-COUNT
+            # split hands the low-f rank most of the load) -- but they also
+            # change WHICH rank owns which band, and therefore which stream
+            # proposes it. That is the only behaviour on this branch that
+            # differs at a shape the legacy layout already accepted, namely
+            # one-walker replica mode. Gating it here is what makes a
+            # one-walker run bit-identical to ``dev`` with the knob unset.
+            # TODO(gpu-routing): drop the conditional and always weight, when
+            # GF_GPU_ROUTING's default flips (see ranks.GPU_ROUTING_ENV).
+            _weights = (
+                self._replica_band_weights(work)
+                if bool(getattr(layout, "gpu_routing", False))
+                else None
+            )
             _band_ranges = replica_band_ranges(
-                self.num_bands, layout.n_replicas, weights=self._replica_band_weights(work)
+                self.num_bands, layout.n_replicas, weights=_weights
             )
 
         def _common(rank, w0, w1):
@@ -21323,20 +21545,42 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         cold_acc = np.zeros((2, N, num_bands), dtype=np.int64)
         alive_per_temp = np.zeros(ntemps, dtype=np.int64)
         drift_max, at_cap_total = 0.0, 0
+        # ``block_of`` IS NO LONGER A PARTITION (2026-09-23). At R > 1 the R
+        # replicas of a block return the SAME ``[w0, w1)``, so which of these
+        # reductions is correct depends on what the quantity means:
+        #
+        #   * BAND-DISJOINT per-rank counters (the propose/accept counts, the
+        #     per-walker cold rows) must ACCUMULATE -- each replica reports
+        #     only its own owned bands, so the sum over a group is the union.
+        #     ``=`` would keep whichever rank came last and silently drop the
+        #     rest of the band grid.
+        #   * PER-WALKER quantities (the cold log-likelihood, the alive
+        #     census) must come from ONE representative per block; summing
+        #     them over replicas multiplies by R.
         for rank in layout.compute_ranks:
             w0, w1 = layout.block_of(rank)
             rep = replies_p[rank]
+            _is_lead = layout.is_block_lead(rank) if hasattr(
+                layout, "is_block_lead") else True
             # a neutral block replies with ZERO counters, so the sums and
             # the per-walker cold rows below are correct for it as they are
             prop_counts_sum += np.asarray(rep["prop_counts"], dtype=np.int64)
             acc_counts_sum += np.asarray(rep["acc_counts"], dtype=np.int64)
             _cold = np.asarray(rep["cold_counts"], dtype=np.int64)
-            cold_prop[:, w0:w1] = _cold[0]
-            cold_acc[:, w0:w1] = _cold[1]
-            alive_per_temp += np.asarray(rep["alive_per_temp"], dtype=np.int64)
+            # ``+=``, not ``=``: band-disjoint across a block's replicas.
+            # Identical to ``=`` at R == 1, where the array starts zeroed and
+            # each slice is written exactly once.
+            cold_prop[:, w0:w1] += _cold[0]
+            cold_acc[:, w0:w1] += _cold[1]
+            if _is_lead:
+                # Each replica's sorter still carries the head's stale copies
+                # of its group-mates' bands, so every replica reports the
+                # WHOLE block's alive count -- summing them inflated this log
+                # line by exactly R in one-walker replica mode.
+                alive_per_temp += np.asarray(rep["alive_per_temp"], dtype=np.int64)
             drift_max = max(drift_max, float(rep["drift"] or 0.0))
             at_cap_total += int(rep["rj_at_cap"] or 0)
-            if neutral[rank]:
+            if neutral[rank] or not _is_lead:
                 continue  # zeros are "nothing happened", not this block's ll
             new_state.log_like[0, w0:w1] = np.asarray(rep["log_like_cold"])
         logger.info(
@@ -21415,12 +21659,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             for rank in layout.compute_ranks:
                 w0, w1 = layout.block_of(rank)
                 rep = replies_t[rank]
+                # Band-disjoint across a block's replicas -> SUM is the union
+                # (the swap counters have a band axis, not a walker axis).
                 band_swaps_accepted += np.asarray(
                     rep["band_swaps_accepted"], dtype=np.int64)
                 band_swaps_proposed += np.asarray(
                     rep["band_swaps_proposed"], dtype=np.int64)
                 _t_drift = max(_t_drift, float(rep["drift"] or 0.0))
-                if neutral[rank]:
+                # ...but the cold lnL is PER WALKER, so take one
+                # representative per block rather than letting the last
+                # replica win (see the reduction note in the propose merge).
+                _is_lead = layout.is_block_lead(rank) if hasattr(
+                    layout, "is_block_lead") else True
+                if neutral[rank] or not _is_lead:
                     continue
                 new_state.log_like[0, w0:w1] = np.asarray(rep["log_like_cold"])
             # TODO(Task 3 fix round): ``census`` is None in every reply today
@@ -22715,29 +22966,23 @@ class VGBSpecialStretchMove(GBSpecialBase):
         read off ``work`` coordinates the way GB's sampled f0 can -- this
         mirrors :meth:`BandSorter._source_freqs_hz` (gbbands.py) against the
         branch's own transform container instead. ``work.inds`` is
-        ``(ntemps, nwalkers, nleaves_max)``; one-walker replica mode makes
-        ``work.inds[0, 0]`` the cold, single-walker alive mask.
+        ``(ntemps, nwalkers, nleaves_max)``; rung 0 is the cold chain and the
+        leaf axis is unioned over EVERY walker of the block, matching the
+        base's :meth:`GBSpecialBase._cold_source_freqs_hz`. With
+        ``preserve_leaf_identity`` every walker carries the same catalogue,
+        so the union is the per-walker set and the resulting weights are the
+        same split either way -- the union is what stays correct if that
+        ever stops holding.
+
+        :meth:`GBSpecialBase._replica_band_weights` does the binning; only
+        the frequency SOURCE differs between GB and VGB.
         """
         tf = self.transform_fn
-        alive = np.asarray(work.inds[0, 0])
-        leaves = np.nonzero(alive)[0]
+        alive = np.asarray(_to_numpy(work.inds[0]), dtype=bool)
+        leaves = np.nonzero(alive.any(axis=0))[0]
         fill_keys = list(tf.original_fill_dict[0].keys())
         f0_fill_mhz = np.asarray(tf.fill_dict["fill_values"])[:, fill_keys.index("f0")]
         return f0_fill_mhz[leaves] / 1e3
-
-    def _replica_band_weights(self, work):
-        """Per-band weight = count of alive cold-row VGB sources in that band.
-
-        VGB has one band per catalogue source region rather than GB's
-        count-driven bands, so a plain by-band-count split (the GB default,
-        ``GBSpecialBase._replica_band_weights`` returning ``None``) would
-        not balance the actual per-replica proposal load; weight each band
-        by how many live sources fall in it instead.
-        """
-        f0 = self._cold_source_freqs_hz(work)
-        b = np.searchsorted(np.asarray(self.band_edges), f0, side="right") - 1
-        b = np.clip(b, 0, self.num_bands - 1)
-        return np.bincount(b, minlength=self.num_bands).astype(float)
 
     def _proposal_cholesky(self, model, band_sorter, ids, slots=None,
                            buffer_obj=None):
@@ -23019,6 +23264,59 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
 
     def _epoch_dir(self, k: int) -> str:
         return os.path.join(self._fstat_root, f"epoch_{k:04d}")
+
+    @property
+    def fstat_fit_walkers(self) -> int:
+        """How many walkers' residuals one F-stat epoch is fitted to.
+
+        ``GB_FSTAT_FIT_WALKERS``, **default 1 in BOTH modes** (user ruling
+        2026-09-23): the epoch keeps being fitted to the single reference
+        walker -- the MIN-lnL cold chain in search, the max in PE -- exactly
+        as it is today. The multi-walker union is entirely opt-in, and at
+        the default this whole path is dormant and bit-identical.
+
+        ``1`` -- the reference walker only, today's behaviour.
+        ``n > 1`` -- the ``n`` best references by :meth:`_fstat_fit_refs_from`,
+        swept independently and unioned.
+        Unset / ``0`` / unparseable -- the default.
+
+        WHY IT IS NOT ON BY DEFAULT. There is NO work shared between
+        walkers: the F-stat kernel's ``M_upper`` term uses each walker's own
+        inverse-PSD row, so W walkers costs exactly W times the evaluations.
+        Fitting W is wall-clock-free only when ``n_compute >= W * R*``, with
+        ``R*`` the ranks-per-fit the cadence already tolerates (4 at 6
+        months) -- i.e. **W=4 wants 16 GPUs**. At the current 4 GPUs it
+        would take the epoch from ~1100 s to ~3534 s, which is a visible
+        slowdown bought for a 6-12% gain in distinct support. Turn it on
+        when the GPUs are there, not before.
+        """
+        raw = os.environ.get("GB_FSTAT_FIT_WALKERS")
+        if raw is not None and str(raw).strip() not in ("", "0"):
+            try:
+                return max(1, int(raw))
+            except ValueError:
+                logger.warning(
+                    "%s: GB_FSTAT_FIT_WALKERS=%r is not an integer; fitting "
+                    "the single reference walker.", self.name, raw)
+        return 1
+
+    def _fstat_slot_dir(self, k: int, walker: int, n_slots: int) -> str:
+        """Cache directory for ONE walker's sweep within epoch ``k``.
+
+        At ``n_slots == 1`` this is the epoch directory itself, unchanged --
+        no ``w##`` level appears and every existing cache key, checkpoint
+        name and manifest path is byte-identical. That is the filesystem
+        half of the W=1 bit-identity gate.
+
+        Named by the GLOBAL WALKER INDEX, not the slot position: a
+        mid-epoch restart whose lnL ordering shuffles among the SAME walkers
+        then hits all W caches instead of none -- and a mid-epoch restart is
+        exactly when the ordering shuffles.
+        """
+        base = self._epoch_dir(k)
+        if int(n_slots) <= 1:
+            return base
+        return os.path.join(base, f"w{int(walker):02d}")
 
     # ---- the refit clock (2026-08-24) --------------------------------------
     # One journal file per fit root; seeded/written registries are

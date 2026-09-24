@@ -401,3 +401,116 @@ class ReplicaModeMixinTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FlatBodyOptOutTest(unittest.TestCase):
+    """``fanout_flat_body`` keeps a family on the BLOCK path under replicas.
+
+    Once ``replica_mode`` became ``R > 1``, ``propose`` routed EVERY family
+    to the full-ensemble body. That is right for addremove, whose every
+    evaluation funnels through one scoring seam, and wrong for PSD/galfor,
+    which read their walker count and device map off the LOCAL ACA. Those
+    families opt out and keep the block path at any R -- with only the block
+    LEAD proposing, because the group-mates hold the same walkers and R
+    bodies would draw R different proposals for one block.
+    """
+
+    def test_the_mixin_defaults_to_flat_capable(self):
+        self.assertTrue(WalkerFanoutMixin.fanout_flat_body)
+
+    def test_psd_opts_out(self):
+        from lisatools.globalfit.moves.psdmove import PSDMove
+        self.assertFalse(PSDMove.fanout_flat_body)
+
+    def test_addremove_stays_flat_capable(self):
+        from lisatools.globalfit.moves.addremovemove import (
+            ResidualAddOneRemoveOneMove,
+        )
+        self.assertTrue(ResidualAddOneRemoveOneMove.fanout_flat_body)
+
+    def test_a_flat_family_runs_the_full_body_under_replicas(self):
+        move = _ReplicaStub()
+        move.fanout = mock.Mock()
+        move.fanout.single = False
+        move.fanout.layout = mock.Mock(replica_mode=True, n_blocks=4)
+        move.fanout_propose = mock.Mock(
+            side_effect=AssertionError("must not take the block path"))
+        state = object()
+        move.propose("model", state)
+        self.assertEqual(len(move.calls), 1)          # propose_local ran
+        self.assertIs(move.calls[0][1], state)        # with the FULL state
+
+    def test_a_non_flat_family_takes_the_block_path_with_SEVERAL_blocks(self):
+        move = _ReplicaStub()
+        move.fanout_flat_body = False
+        move.fanout = mock.Mock()
+        move.fanout.single = False
+        move.fanout.layout = mock.Mock(replica_mode=True, n_blocks=2)
+        move.fanout_propose = mock.Mock(return_value=("merged", "acc"))
+        out = move.propose("model", "state")
+        self.assertEqual(out, ("merged", "acc"))
+        self.assertEqual(move.calls, [])              # the body did NOT run here
+        move.fanout_propose.assert_called_once()
+
+    def test_a_non_flat_family_STILL_goes_flat_at_one_block(self):
+        """REGRESSION (2026-09-23): one-walker replica mode must stay flat.
+
+        ``fanout_flat_body`` is about a state WIDER than the rank's ACA. At
+        ``n_blocks == 1`` the block IS the ensemble, so there is no gap and
+        even an ACA-sizing body is correct -- and that case is exactly
+        one-walker replica mode, which has always used the flat path.
+        Forcing it onto the block path put ``propose_local`` inside a
+        ``propose`` command, whose ``_replay_noise_begin`` then issued a
+        second fan-out command from within the first: a NESTED fan-out,
+        surfacing as ``fan-out sequence mismatch``. Caught by the
+        multi-rank noise smoke, not by a mock.
+        """
+        move = _ReplicaStub()
+        move.fanout_flat_body = False
+        move.fanout = mock.Mock()
+        move.fanout.single = False
+        move.fanout.layout = mock.Mock(replica_mode=True, n_blocks=1)
+        move.fanout_propose = mock.Mock(
+            side_effect=AssertionError("one block must NOT take the block path"))
+        state = object()
+        move.propose("model", state)
+        self.assertEqual(len(move.calls), 1)
+        self.assertIs(move.calls[0][1], state)
+
+    def test_flat_body_ok_truth_table(self):
+        move = _ReplicaStub()
+        for flat, nb, expect in ((True, 1, True), (True, 4, True),
+                                 (False, 1, True), (False, 4, False)):
+            with self.subTest(fanout_flat_body=flat, n_blocks=nb):
+                move.fanout_flat_body = flat
+                self.assertEqual(
+                    move._flat_body_ok(mock.Mock(n_blocks=nb)), expect)
+
+    def test_a_passive_reply_is_shaped_like_a_real_one_and_changes_nothing(self):
+        move = _ReplicaStub()
+
+        class _Part:
+            branches_coords = {"mbh": np.zeros((3, 2, 1, 4))}
+            sub_states = {"mbh": object(), "other": object()}
+
+        part = _Part()
+        rep = move._passive_propose_reply({"state": part})
+        self.assertEqual(set(rep), {"state", "accepted", "extra"})
+        self.assertIs(rep["state"], part)             # the slice, unchanged
+        self.assertEqual(rep["accepted"].shape, (3, 2))
+        self.assertFalse(rep["accepted"].any())       # nothing accepted
+        self.assertEqual(rep["extra"], {})
+        # sub-states outside fanout_branches are nulled, as gf_serve does
+        self.assertIsNone(part.sub_states["other"])
+        self.assertIsNotNone(part.sub_states["mbh"])
+
+    def test_the_passive_reply_survives_an_empty_branch_set(self):
+        move = _ReplicaStub()
+
+        class _Part:
+            branches_coords = {}
+            sub_states = {}
+
+        rep = move._passive_propose_reply({"state": _Part()})
+        self.assertEqual(rep["accepted"].shape, (1, 1))
+        self.assertFalse(rep["accepted"].any())

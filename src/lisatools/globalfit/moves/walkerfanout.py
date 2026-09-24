@@ -41,12 +41,15 @@ single-process body.
 
 from __future__ import annotations
 
+import logging
 import os
 
 import numpy as np
 
 from ..communication.walkerslice import merge_state, slice_state
 from ..state import GFState
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["PROPOSE_OP", "WalkerFanoutMixin", "pooled_ladder_step"]
 
@@ -110,6 +113,33 @@ class WalkerFanoutMixin:
         """True when scoring rows scatter over the replicas (replica mode, knob on)."""
         return self.row_fanout is not None and bool(self.likelihood_fanout)
 
+    def ensemble_likelihood(self, acs):
+        """Per-walker lnL over the WHOLE ensemble, not just this rank's block.
+
+        WHICH READ IS CORRECT DEPENDS ON WHICH BODY IS RUNNING:
+
+        * BLOCK mode (``R == 1``) -- every rank runs its OWN block's
+          ``propose_local`` against its own ACA and writes into a sliced
+          state, so the plain local read is already the right width. Routing
+          it would be wrong (and a collective from a rank that is not the
+          head would hang).
+        * FLAT mode (``R > 1``, i.e. ``row_fanout`` installed) -- the head
+          runs the FULL-N body while its ACA holds only its own block, so a
+          local read returns B rows for an N-row state. It must be gathered.
+
+        Gated on ``row_fanout is not None`` (the layout), never on the
+        ``{PREFIX}_LIKELIHOOD_FANOUT`` knob: that knob chooses who SCORES
+        rows, and turning it off must not silently narrow an ensemble-wide
+        read back to one block.
+
+        ``gather_likelihood`` is a head-driven fan-out command, so the
+        workers answer it from their ``ComputeService`` loop and its merge
+        reduces over one representative per block.
+        """
+        if self.row_fanout is None or not self.fanout_active:
+            return acs.likelihood()
+        return self.fanout.gather_likelihood(acs)
+
     # ---- subclass hooks --------------------------------------------------
     def fanout_temperature_controls(self):
         """Every ``TemperatureControl`` this move adapts (ranks never adapt them)."""
@@ -130,6 +160,29 @@ class WalkerFanoutMixin:
     def fanout_reply_extra(self, part):
         """Rank -> head: swap tallies and anything the body left rank-local."""
         return {}
+
+    def _passive_propose_reply(self, payload):
+        """A no-op propose reply from a rank whose block another rank proposes.
+
+        Shaped exactly like ``gf_serve``'s real reply so the head's merge
+        needs no special case, but carrying the slice UNCHANGED and zero
+        accepted counts. Nothing of it reaches the state: the merge takes
+        one representative per block and this rank is not it. It exists so
+        the fan-out's reply set stays uniform -- every compute rank answers
+        every command -- rather than the head having to address a subset,
+        which ``WalkerFanout.run`` has no way to do.
+        """
+        part = payload["state"]
+        coords = getattr(part, "branches_coords", None) or {}
+        if coords:
+            shape = np.shape(next(iter(coords.values())))
+            accepted = np.zeros(shape[:2], dtype=bool)
+        else:
+            accepted = np.zeros((1, 1), dtype=bool)
+        for name in list(getattr(part, "sub_states", None) or {}):
+            if name not in set(self.fanout_branches or []):
+                part.sub_states[name] = None
+        return {"state": part, "accepted": accepted, "extra": {}}
 
     def fanout_merge_extra(self, replies, new_state):
         """Head: pooled ladder adaptation etc. ``replies`` = {rank: extra}."""
@@ -180,14 +233,54 @@ class WalkerFanoutMixin:
             # stash covers the head's block, not this rank's walkers.
             self.eigen_store_readonly = True
 
+    #: Can this family's body run at the FULL ensemble width on a rank whose
+    #: ACA holds only its block? True for addremove, whose every evaluation
+    #: funnels through one scoring seam. FALSE for PSD/galfor, which derive
+    #: their walker count and device map from the LOCAL ACA
+    #: (``len(self.acs.flatten())``, ``self.acs.gpu_map[...]``) -- those are
+    #: WRONG under a full-N body, not merely slow, so that family keeps the
+    #: block path until those reads come from the state instead.
+    fanout_flat_body = True
+
+    def _flat_body_ok(self, layout) -> bool:
+        """May THIS layout run the full-ensemble body on this rank?
+
+        ``fanout_flat_body`` is about whether the body can cope with a state
+        WIDER than the rank's own ACA. At ``n_blocks == 1`` there is no such
+        gap -- the single block IS the whole ensemble, so the local ACA holds
+        every walker and even a body that sizes itself from
+        ``len(self.acs.flatten())`` is correct.
+
+        That case is not hypothetical: it is one-walker replica mode, which
+        has ALWAYS run psd/galfor through the flat path. Refusing it here
+        pushed that family onto the block path, where ``propose_local`` ran
+        inside a ``propose`` command and its ``_replay_noise_begin`` issued a
+        second fan-out command from within the first -- a nested fan-out,
+        which surfaces as ``fan-out sequence mismatch``. Caught by
+        ``tests/test_multirank_noise_smoke.py::test_one_walker_two_replicas``.
+
+        So the opt-out only bites where it must: several blocks, where the
+        head's ACA really is narrower than the state.
+        """
+        if self.fanout_flat_body:
+            return True
+        return int(getattr(layout, "n_blocks", 1)) <= 1
+
     # ---- propose -------------------------------------------------------------
     def propose(self, model, state):
         if not self.fanout_active:
             return self.propose_local(model, state)
-        if getattr(self.fanout.layout, "replica_mode", False):
-            # one-walker replica mode: the head runs the unchanged body; the
-            # body's scoring seams scatter rows over the replicas (RowFanout)
+        layout = self.fanout.layout
+        if getattr(layout, "replica_mode", False) and self._flat_body_ok(layout):
+            # FLAT: the head runs the unchanged full-ensemble body; the body's
+            # scoring seams scatter rows over the replicas (RowFanout). At one
+            # walker block this is the original one-walker replica path.
             return self.propose_local(model, state)
+        # BLOCK: every walker block runs its own body. With replicas present
+        # only the block LEAD runs it (see ``fanout_propose``) -- the
+        # group-mates hold the same walkers, so letting them all propose
+        # would draw R different proposals for one block and the merge would
+        # keep whichever replied last.
         return self.fanout_propose(model, state)
 
     def fanout_propose(self, model, state):
@@ -219,10 +312,36 @@ class WalkerFanoutMixin:
                     "be built at the block width, not the ensemble width."
                 )
 
+        # With replicas, only ONE rank per block proposes; the rest are
+        # passive. They hold the same walkers, so R bodies would draw R
+        # different proposals for one block (the per-rank seeds differ) and
+        # the merge below would silently keep whichever replied last.
+        def _is_lead(rank):
+            if not hasattr(layout, "is_block_lead"):
+                return True
+            return bool(layout.is_block_lead(rank))
+
+        _passive = [r for r in layout.compute_ranks if not _is_lead(r)]
+        if _passive:
+            logger.info(
+                "[FANOUT] %s: block path with %d rank(s) per block; "
+                "leads %s propose, %s stay passive (this family's body is "
+                "not flat-capable)",
+                getattr(self, "gf_move_name", type(self).__name__),
+                int(getattr(layout, "ranks_per_block", 1)),
+                list(layout.block_leads), _passive,
+            )
+
         def payload(rank, w0, w1):
-            return {"state": slice_state(state, w0, w1, sub_states=branches), "extra": extra}
+            return {"state": slice_state(state, w0, w1, sub_states=branches),
+                    "extra": extra, "passive": not _is_lead(rank)}
 
         def body(p, _model_local):
+            if p.get("passive"):
+                # Return the slice UNCHANGED plus a zero accepted count: the
+                # merge writes the lead's result over this block anyway, and
+                # a neutral reply keeps the reply shape uniform.
+                return self._passive_propose_reply(p)
             return self.gf_serve(PROPOSE_OP, p, fanout.clock, model)
 
         def merge(replies):
@@ -236,13 +355,21 @@ class WalkerFanoutMixin:
                         arr = getattr(sub, cname, None)
                         if arr is not None:
                             arr[...] = 0
-            for rank in layout.compute_ranks:
+            # ONE REPRESENTATIVE PER BLOCK. ``block_of`` is no longer a
+            # partition: at R > 1 the group-mates return the same walker
+            # slice, so merging every compute rank would write each block R
+            # times (and concatenate accepted R times, giving an array R x
+            # too wide). At R == 1 the leads ARE the compute ranks and this
+            # is the original loop.
+            _reps = (list(layout.block_leads) if hasattr(layout, "block_leads")
+                     else list(layout.compute_ranks))
+            for rank in _reps:
                 w0, w1 = layout.block_of(rank)
                 merge_state(new_state, replies[rank]["state"], w0, w1)
             accepted = np.concatenate(
-                [np.asarray(replies[r]["accepted"]) for r in layout.compute_ranks], axis=1
+                [np.asarray(replies[r]["accepted"]) for r in _reps], axis=1
             )
-            self.fanout_merge_extra({r: replies[r]["extra"] for r in layout.compute_ranks},
+            self.fanout_merge_extra({r: replies[r]["extra"] for r in _reps},
                                     new_state)
             return new_state, accepted
 

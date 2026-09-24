@@ -10,6 +10,10 @@ mapping between ranks and GPUs is general in both directions:
 ``GF_LEGACY_RANK_LAYOUT=1`` restores today's roles (one compute rank owning
 the whole pool, other non-saver ranks are stopped SPARE ranks).
 
+``GF_GPU_ROUTING=1`` enables the unified GPU-count routing (see
+:data:`GPU_ROUTING_ENV`). It is OPT-IN, so merging it changes nothing until
+a run asks for it.
+
 ``mpi4py`` is imported lazily and only for real communicators.
 """
 
@@ -18,6 +22,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import hashlib
+import math
 import os
 import sys
 import threading
@@ -34,6 +39,42 @@ LEGACY_ENV = "GF_LEGACY_RANK_LAYOUT"
 #: unset); ``0``/``false``/``False``/empty refuses a one-walker run on
 #: several compute ranks (today's error).
 ONE_WALKER_ENV = "GF_ONE_WALKER_REPLICAS"
+
+#: ★ The unified GPU-count routing (``n_compute = n_blocks * R`` at ANY
+#: walker count: GPUs > walkers, GPUs == walkers, GPUs < walkers) is
+#: **OPT-IN**, off unless this is set to ``1``/``true``/``yes``/``on``.
+#:
+#: TODO(gpu-routing): flip this default to ON once the cluster gates G3-G6
+#: of ``docs/gpu-routing-test-campaign.md`` have passed at the production
+#: shapes, then delete the knob and the ``gpu_routing`` plumbing entirely
+#: (``_factorize``/``factorize_layout``/``build_layout`` keyword, the
+#: ``WalkerBlockLayout.gpu_routing`` field, and the ``layout.gpu_routing``
+#: check in ``GBSpecialBase._replica_band_weights``'s call site). The
+#: unified rule is a strict superset of the legacy one, so the flip is a
+#: deletion, not a rewrite.
+#:
+#: OFF reproduces the pre-2026-09-23 rule EXACTLY, and that is the whole
+#: point of the knob: ``nwalkers`` must divide the compute-rank count
+#: (``R == 1``, the walker-block layout) with the single ``nwalkers == 1``
+#: carve-out that is one-walker replica mode. Any other shape raises the
+#: error it always raised, now naming this knob as the way forward.
+#:
+#: It also pins the one behaviour that differs at a shape the legacy rule
+#: DOES accept: in one-walker replica mode the GB band split stays the
+#: legacy equal-BAND-COUNT one instead of the source-weighted one, so a
+#: one-walker run on this branch is bit-identical to ``dev``.
+GPU_ROUTING_ENV = "GF_GPU_ROUTING"
+
+
+def gpu_routing_enabled(env=None) -> bool:
+    """Is the unified GPU-count routing switched on? (default: NO)
+
+    Deliberately the OPPOSITE polarity to :data:`ONE_WALKER_ENV`, which is
+    an opt-OUT of a shipped feature. This is an opt-IN to a new one, so an
+    unset variable, an empty one and a typo all mean "legacy".
+    """
+    raw = (os.environ if env is None else env).get(GPU_ROUTING_ENV, "")
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
 class RankRole(enum.Enum):
@@ -56,6 +97,10 @@ class RankPlacement:
     device_slot: int
     w0: int
     w1: int
+    #: which walker BLOCK this rank computes (``compute.index(r) // R``)
+    block_index: int = 0
+    #: this rank's position among the R ranks sharing that block (lead = 0)
+    replica_index: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -76,13 +121,36 @@ class WalkerBlockLayout:
     legacy: bool = False
     #: human-readable notes about non-default choices (e.g. the size-2 fallback)
     notes: tuple = ()
-    #: nwalkers == 1 on several compute ranks: every compute rank holds the
-    #: single walker (block (0, 1)); the replicas split the work inside moves
-    replica_mode: bool = False
+    #: walker blocks; ``n_compute == n_blocks * ranks_per_block`` always
+    n_blocks: int = 1
+    #: R: compute ranks sharing one walker block. 1 = today's walker-block
+    #: layout; ``n_compute`` at ``nwalkers == 1`` = today's replica mode.
+    ranks_per_block: int = 1
+    #: True when ``ranks_per_block`` was requested as AUTO (``None`` input)
+    ranks_per_block_auto: bool = True
+    #: resolved value of :data:`GPU_ROUTING_ENV`, carried on the layout so a
+    #: move can consult it without re-reading the environment (and so it
+    #: lands in :meth:`describe`, hence the digest -- a rank that set the
+    #: knob differently from its peers then fails the agreement check
+    #: instead of silently routing differently).
+    #: TODO(gpu-routing): delete with the knob; see :data:`GPU_ROUTING_ENV`.
+    gpu_routing: bool = False
 
     @property
     def n_compute(self) -> int:
         return len(self.compute_ranks)
+
+    @property
+    def replica_mode(self) -> bool:
+        """Several ranks share a walker block, so their work must be dispersed.
+
+        DERIVED, not a field (2026-09-23). It used to mean the single
+        carve-out ``nwalkers == 1``; under the unified factorization it is
+        simply ``R > 1``, which reproduces that case exactly (one block,
+        ``R == n_compute``) and also covers GPUs > walkers at any walker
+        count.
+        """
+        return int(self.ranks_per_block) > 1
 
     @property
     def worker_ranks(self) -> tuple:
@@ -93,11 +161,41 @@ class WalkerBlockLayout:
 
     @property
     def n_replicas(self) -> int:
-        return self.n_compute if self.replica_mode else 1
+        """R. At ``R == 1`` this is 1 and at one walker it is ``n_compute``,
+        reproducing both of the pre-2026-09-23 values."""
+        return int(self.ranks_per_block)
 
     def replica_index(self, rank) -> int:
-        """Position among the replicas (head = 0); 0 outside replica mode."""
-        return self.fanout_rank(rank) if self.replica_mode else 0
+        """Position among the ranks sharing this rank's block (lead = 0).
+
+        GROUP-RELATIVE. At ``n_blocks == 1`` it equals ``fanout_rank``, which
+        is what one-walker replica mode has always used; at ``R == 1`` it is
+        0 for every rank, as the walker-block layout has always used.
+        """
+        return int(self.placements[int(rank)].replica_index)
+
+    def block_index(self, rank) -> int:
+        """Which walker block this rank computes (``fanout_rank // R``)."""
+        return int(self.placements[int(rank)].block_index)
+
+    def ranks_in_block(self, b) -> tuple:
+        """The R compute ranks sharing walker block ``b``, lead first."""
+        b, R = int(b), int(self.ranks_per_block)
+        if not (0 <= b < int(self.n_blocks)):
+            raise ValueError(f"block {b} is outside [0, {int(self.n_blocks)})")
+        return tuple(self.compute_ranks[b * R:(b + 1) * R])
+
+    def block_lead(self, b) -> int:
+        """Replica 0 of block ``b`` -- its representative in head-side merges."""
+        return int(self.ranks_in_block(b)[0])
+
+    @property
+    def block_leads(self) -> tuple:
+        """One representative rank per block, in block order (head first)."""
+        return tuple(self.block_lead(b) for b in range(int(self.n_blocks)))
+
+    def is_block_lead(self, rank) -> bool:
+        return int(self.replica_index(rank)) == 0
 
     def role_of(self, rank) -> RankRole:
         return self.placements[int(rank)].role
@@ -107,19 +205,35 @@ class WalkerBlockLayout:
         return p.w0, p.w1
 
     def owner_of(self, w) -> tuple:
-        """Global walker ``w`` -> ``(owning compute rank, local row index)``.
+        """Global walker ``w`` -> ``(owning block's LEAD rank, local row index)``.
 
         The inverse of :meth:`block_of`. Needed wherever a head-side GLOBAL
         walker index has to become an ACA ROW index: rows are per-rank, so a
-        global index is out of range on every rank but its owner (the
+        global index is out of range on every rank but its owners (the
         multi-rank F-stat fit's reference walker is exactly that case).
+
+        At ``R > 1`` a walker has R owners, all holding the same rows, so
+        this returns the block's LEAD as the deterministic representative --
+        which is what a collective root must be. Use :meth:`owners_of` when
+        the whole group is wanted. At ``R == 1`` the lead IS the sole owner,
+        so this is unchanged from the walker-block layout.
         """
         w = int(w)
         if not (0 <= w < int(self.nwalkers)):
             raise ValueError(f"walker {w} is outside [0, {int(self.nwalkers)})")
-        rank = self.compute_ranks[w // int(self.block)]
+        rank = self.block_lead(w // int(self.block))
         w0, _w1 = self.block_of(rank)
         return int(rank), w - int(w0)
+
+    def owners_of(self, w) -> tuple:
+        """Global walker ``w`` -> ``(every rank holding it, local row index)``."""
+        w = int(w)
+        if not (0 <= w < int(self.nwalkers)):
+            raise ValueError(f"walker {w} is outside [0, {int(self.nwalkers)})")
+        b = w // int(self.block)
+        ranks = self.ranks_in_block(b)
+        w0, _w1 = self.block_of(ranks[0])
+        return ranks, w - int(w0)
 
     def local_gpus(self, rank):
         devices = self.placements[int(rank)].devices
@@ -144,15 +258,55 @@ class WalkerBlockLayout:
         color = 0 if rank in self.compute_ranks else _undefined(comm)
         return comm.Split(color, key=rank)
 
+    def make_group_comm(self, comm):
+        """Split the FAN-OUT comm by walker block: size R, lead = group rank 0.
+
+        The communicator for work shared by the replicas of one block --
+        notably GB's per-unit delta-ledger allgather, which must be O(R) and
+        must NOT put blocks with nothing to say to each other into unit
+        lockstep. Non-compute ranks get the null comm.
+
+        COLLECTIVE ON THE FAN-OUT COMM. Every rank OF THAT COMM -- i.e.
+        every compute rank -- must call this the same number of times,
+        including at ``R == 1`` where the group is a single rank. The saver
+        is not a member and must not call it at all; callers skip it
+        entirely when ``is_single()``.
+        """
+        rank = int(comm.Get_rank())
+        if rank not in self.compute_ranks:
+            return comm.Split(_undefined(comm), key=rank)
+        return comm.Split(self.block_index(rank), key=self.replica_index(rank))
+
+    def make_reps_comm(self, comm):
+        """Split the FAN-OUT comm to one REPRESENTATIVE per block (replica 0).
+
+        The communicator for anything that is per-walker rather than
+        per-rank: the head-side likelihood gather, the state concatenation,
+        the residual-hash digest. Reducing over every compute rank would
+        count each walker R times; reducing over the leads counts it once.
+        Non-lead and non-compute ranks get the null comm.
+
+        COLLECTIVE, with the same rule as :meth:`make_group_comm`.
+        """
+        rank = int(comm.Get_rank())
+        lead = rank in self.compute_ranks and self.is_block_lead(rank)
+        color = 0 if lead else _undefined(comm)
+        key = self.block_index(rank) if lead else rank
+        return comm.Split(color, key=key)
+
     def describe(self) -> str:
         if self.gpus_per_rank_auto:
             gpk = "AUTO" if self.gpus_per_rank is None else f"AUTO->{self.gpus_per_rank}"
         else:
             gpk = str(self.gpus_per_rank)
+        rpb = ("AUTO->%d" % self.ranks_per_block) if self.ranks_per_block_auto \
+            else str(self.ranks_per_block)
         head = (
             f"walker-block layout: size={self.size} n_compute={self.n_compute} "
-            f"nwalkers={self.nwalkers} block={self.block} "
-            f"gpus_per_rank={gpk} ranks_per_gpu={self.ranks_per_gpu}"
+            f"nwalkers={self.nwalkers} n_blocks={self.n_blocks} block={self.block} "
+            f"ranks_per_block={rpb} "
+            f"gpus_per_rank={gpk} ranks_per_gpu={self.ranks_per_gpu} "
+            f"gpu_routing={'on' if self.gpu_routing else 'OFF(legacy)'}"
             f"{' LEGACY' if self.legacy else ''}"
             f"{' REPLICAS' if self.replica_mode else ''}"
         )
@@ -161,7 +315,8 @@ class WalkerBlockLayout:
             p = self.placements[r]
             lines.append(
                 f"  r{r:<3d} {p.role.value:<7s} node={p.node} local={p.local_index} "
-                f"devices={list(p.devices)} slot={p.device_slot} walkers=[{p.w0},{p.w1})"
+                f"devices={list(p.devices)} slot={p.device_slot} walkers=[{p.w0},{p.w1}) "
+                f"block={p.block_index} replica={p.replica_index}"
             )
         for note in self.notes:
             lines.append(f"  note: {note}")
@@ -224,6 +379,152 @@ def resolve_roles(size, main_rank=0):
     return head, saver, compute
 
 
+def factorize_layout(nwalkers, n_compute, ranks_per_block=None, *, gpu_routing=True):
+    """``(n_blocks, ranks_per_block, block)`` for a run shape -- THE public rule.
+
+    The single source of truth for "how does this many walkers spread over
+    this many compute ranks", exported so nothing has to MIRROR the
+    arithmetic. Mirrored copies are the failure mode this exists to prevent:
+    a planner or submit script that re-derives the rule keeps answering the
+    old question after the rule changes, and reports a layout the engine
+    will not build.
+
+    Pure and side-effect free -- no communicator, no environment, no
+    warnings -- so a planner, a dry run or a test can call it as cheaply as
+    the launcher does. :func:`build_layout` uses it and adds the placement,
+    the device pinning and the advisory warnings on top.
+
+    Raises ``ValueError`` on a shape the engine would refuse, with the same
+    message the launcher would print.
+
+    >>> factorize_layout(4, 4)      # today's production run
+    (4, 1, 1)
+    >>> factorize_layout(4, 16)     # GPUs > walkers
+    (4, 4, 1)
+    >>> factorize_layout(24, 8)     # PE, blocks wider than one walker
+    (8, 1, 3)
+    >>> factorize_layout(1, 4)      # one-walker replica mode
+    (1, 4, 1)
+
+    ``gpu_routing`` is the resolved :data:`GPU_ROUTING_ENV` switch. It
+    defaults to TRUE here, unlike at the launcher: this function answers
+    "what IS the rule", so a planner or a dry run can price a shape the
+    current deployment has not opted into yet. :func:`build_layout` defaults
+    it from the environment instead, which is what decides whether a run
+    actually starts.
+    """
+    return _factorize(nwalkers, n_compute, ranks_per_block, [], gpu_routing=gpu_routing)
+
+
+def _legacy_factorize(nwalkers, n_compute, ranks_per_block):
+    """The pre-2026-09-23 rule, verbatim, for ``GF_GPU_ROUTING`` unset.
+
+    Two shapes and no others: ``nwalkers % n_compute == 0`` (walker blocks,
+    ``R = 1``) and ``nwalkers == 1`` (replica mode, ``R = n_compute``).
+    Everything else raised, and still raises -- with the message extended to
+    name the knob that lifts the restriction.
+
+    TODO(gpu-routing): delete this function when the default flips; see
+    :data:`GPU_ROUTING_ENV`.
+    """
+    _how = (
+        f"Set {GPU_ROUTING_ENV}=1 to enable the unified GPU-count routing, "
+        f"which spreads {nwalkers} walker(s) over {n_compute} compute ranks "
+        f"as {math.gcd(nwalkers, n_compute)} block(s) of "
+        f"{nwalkers // math.gcd(nwalkers, n_compute)} with "
+        f"{n_compute // math.gcd(nwalkers, n_compute)} rank(s) each."
+    )
+    if ranks_per_block is not None and int(ranks_per_block) != 1:
+        raise ValueError(
+            f"RANKS_PER_BLOCK={ranks_per_block} needs the unified GPU-count "
+            f"routing, which is off. {_how}"
+        )
+    if nwalkers == 1:
+        return 1, int(n_compute), 1  # the one-walker replica carve-out
+    if n_compute and nwalkers % n_compute:
+        raise ValueError(
+            f"nwalkers={nwalkers} is not divisible by the {n_compute} compute "
+            f"ranks, so the walker-block layout cannot split it evenly. "
+            f"{_how} Otherwise pick nwalkers as a multiple of {n_compute}, or "
+            f"run fewer ranks."
+        )
+    return int(n_compute), 1, int(nwalkers // n_compute)
+
+
+def _factorize(nwalkers, n_compute, ranks_per_block, notes, *, gpu_routing=True):
+    """``n_compute = n_blocks * R``; returns ``(n_blocks, R, block)``.
+
+    ONE factorization covers every (nwalkers, n_compute) pair, so there is
+    no divisibility error any more and no ``nwalkers == 1`` carve-out.
+
+    AUTO (``ranks_per_block is None``) MAXIMIZES BLOCKS:
+    ``n_blocks = gcd(nwalkers, n_compute)``. Blocks are the cheap axis -- GB
+    is sublinear in block width (~``B^0.65``), SOBBH is flat in rows, and the
+    GB sub-band buffer saturates above a block width of ~2.5 -- while each
+    replica costs a full ACA, inverse-PSD plane and whole-grid ``BandSorter``.
+    So a GPU is worth more as another walker than as another replica, and
+    AUTO spends it that way unless told otherwise.
+
+    Both of today's regimes fall out unchanged: ``nwalkers % n_compute == 0``
+    gives ``gcd == n_compute`` -> ``R = 1``, the walker-block layout; one
+    walker gives ``gcd == 1`` -> ``R = n_compute``, the replica layout.
+
+    ``gpu_routing=False`` (the deployed default; see :data:`GPU_ROUTING_ENV`)
+    hands off to :func:`_legacy_factorize`, which accepts ONLY those two
+    regimes. Because AUTO reproduces both of them exactly, the gate never
+    changes the answer on a shape the legacy rule accepted -- it only
+    restores the error on the shapes it refused.
+
+    PURE, and the ``gpu_routing`` switch keeps it that way: the value is a
+    PARAMETER, never an ``os.environ`` read, so a planner may poll the rule
+    either way without the environment deciding for it.
+    """
+    nwalkers, n_compute = int(nwalkers), int(n_compute)
+    if not gpu_routing:
+        return _legacy_factorize(nwalkers, n_compute, ranks_per_block)
+    if ranks_per_block is None:
+        n_blocks = math.gcd(nwalkers, n_compute)
+        R = n_compute // n_blocks
+        if n_blocks == 1 and nwalkers > 1 and n_compute > 1:
+            # Legal, but it replicates the WHOLE ensemble on every rank and
+            # buys no walker parallelism at all -- almost always a typo in
+            # NWALKERS or the rank count rather than an intent.
+            # RECORDED, NOT WARNED. ``_factorize`` is the pure rule behind
+            # the public :func:`factorize_layout`, which a planner or dry run
+            # may call in a loop; emitting a ``UserWarning`` from here would
+            # make the rule un-poll-able and put the advice in the caller's
+            # stack instead of the launcher's. ``build_layout`` warns for
+            # every note this adds -- that is the thing actually launching.
+            notes.append(
+                f"nwalkers={nwalkers} and {n_compute} compute ranks share no "
+                f"common factor (gcd=1), so AUTO resolved to ONE block of "
+                f"{nwalkers} walkers replicated on all {n_compute} ranks. That "
+                f"gives no walker parallelism; pick nwalkers as a multiple of a "
+                f"divisor of {n_compute}, or set RANKS_PER_BLOCK explicitly."
+            )
+    else:
+        R = int(ranks_per_block)
+        if R < 1:
+            raise ValueError("ranks_per_block must be >= 1")
+        if n_compute % R:
+            divisors = [d for d in range(1, n_compute + 1) if n_compute % d == 0]
+            raise ValueError(
+                f"RANKS_PER_BLOCK={R} does not divide the compute-rank count "
+                f"{n_compute}; legal values are {divisors}."
+            )
+        n_blocks = n_compute // R
+    if nwalkers % n_blocks:
+        _auto = math.gcd(nwalkers, n_compute)
+        raise ValueError(
+            f"nwalkers={nwalkers} does not divide into {n_blocks} equal walker "
+            f"block(s) (RANKS_PER_BLOCK={ranks_per_block} over {n_compute} "
+            f"compute ranks). Pick nwalkers as a multiple of {n_blocks}, or "
+            f"leave RANKS_PER_BLOCK unset -- AUTO would use "
+            f"{_auto} block(s) of {nwalkers // _auto}."
+        )
+    return int(n_blocks), int(R), int(nwalkers // n_blocks)
+
+
 def build_layout(
     comm,
     nwalkers,
@@ -231,8 +532,10 @@ def build_layout(
     *,
     gpus_per_rank=None,
     ranks_per_gpu=1,
+    ranks_per_block=None,
     main_rank=0,
     legacy=None,
+    gpu_routing=None,
 ):
     """Resolve the identical layout on every rank (one collective ``allgather``).
 
@@ -246,9 +549,16 @@ def build_layout(
     per-node pool (``k = len(pool)``, today's in-process ``-n 1`` multi-GPU
     run); several compute ranks on a node instead get one device each
     (``k = 1``). An explicit int pins ``k`` on every node.
+
+    ``gpu_routing=None`` (the default) resolves :data:`GPU_ROUTING_ENV`,
+    which is OFF unless set -- so an existing runbook keeps the exact layout
+    it had. Pass ``True``/``False`` to pin it (tests, dry runs).
     """
     if legacy is None:
         legacy = os.environ.get(LEGACY_ENV, "0") == "1"
+    if gpu_routing is None:
+        gpu_routing = gpu_routing_enabled()
+    gpu_routing = bool(gpu_routing)
     size = int(comm.Get_size())
     rank = int(comm.Get_rank())
     head, saver, compute = resolve_roles(size, main_rank)
@@ -281,23 +591,24 @@ def build_layout(
         warnings.warn(note, UserWarning, stacklevel=2)
     nwalkers = int(nwalkers)
     n_compute = len(compute)
-    replica_mode = False
-    if nwalkers == 1 and n_compute > 1:
+    _n_notes = len(notes)
+    n_blocks, R, block = _factorize(
+        nwalkers, n_compute, ranks_per_block, notes, gpu_routing=gpu_routing
+    )
+    # The rule RECORDS its advice; the launcher is what surfaces it (see the
+    # comment in ``_factorize``). Anything it appended is worth a warning
+    # here, where the stack points at the code actually starting a run.
+    for _note in notes[_n_notes:]:
+        warnings.warn(_note, UserWarning, stacklevel=2)
+    if R > 1:
         _one_walker_env = os.environ.get(ONE_WALKER_ENV, "1")
         if _one_walker_env.strip() in ("0", "false", "False", ""):
             raise ValueError(
-                f"nwalkers=1 on {n_compute} compute ranks needs one-walker replica mode, "
-                f"which {ONE_WALKER_ENV}=0 disables (unset it, or run one compute rank)."
+                f"nwalkers={nwalkers} on {n_compute} compute ranks resolves to "
+                f"{n_blocks} walker block(s) shared by {R} ranks each, which "
+                f"{ONE_WALKER_ENV}=0 disables. Unset it, set RANKS_PER_BLOCK=1 "
+                f"(needs nwalkers divisible by {n_compute}), or run fewer ranks."
             )
-        replica_mode = True
-        block = 1
-    elif nwalkers % n_compute:
-        raise ValueError(
-            f"nwalkers={nwalkers} is not divisible by the compute-rank count {n_compute}: "
-            "equal walker blocks are required (pick NWALKERS as a multiple of it)."
-        )
-    else:
-        block = nwalkers // n_compute
 
     if size == 1 or not hasattr(comm, "Split_type"):
         table = [(_proc_name(comm), 0)]
@@ -357,9 +668,16 @@ def build_layout(
                 devices, slot = tuple(pool[i * k : (i + 1) * k]), 0
             else:
                 devices, slot = (pool[i // m],), i % m
-            bi = compute.index(r)
-            w0, w1 = (0, 1) if replica_mode else (bi * block, (bi + 1) * block)
-            placements[r] = RankPlacement(r, role, node, local_index, devices, slot, w0, w1)
+            # ONE general expression (2026-09-23). It reproduces both former
+            # branches exactly: at R == 1 ``bi`` is the compute-rank index and
+            # the blocks tile the ensemble; at n_blocks == 1 every rank gets
+            # ``(0, block)``, which is ``(0, 1)`` at one walker.
+            bi, ri = divmod(compute.index(r), R)
+            w0, w1 = bi * block, (bi + 1) * block
+            placements[r] = RankPlacement(
+                r, role, node, local_index, devices, slot, w0, w1,
+                block_index=bi, replica_index=ri,
+            )
     if k_explicit is not None:
         resolved_k = k_explicit
     elif resolved_ks and len(set(resolved_ks)) == 1:
@@ -379,7 +697,10 @@ def build_layout(
         ranks_per_gpu=m,
         legacy=bool(legacy),
         notes=tuple(notes),
-        replica_mode=replica_mode,
+        n_blocks=n_blocks,
+        ranks_per_block=R,
+        ranks_per_block_auto=ranks_per_block is None,
+        gpu_routing=gpu_routing,
     )
 
 
@@ -590,6 +911,7 @@ def prepare_rank(
         pool,
         gpus_per_rank=getattr(general, "gpus_per_rank", None),
         ranks_per_gpu=int(getattr(general, "ranks_per_gpu", 1) or 1),
+        ranks_per_block=getattr(general, "ranks_per_block", None),
         main_rank=int(getattr(fit, "main_rank", 0) or 0),
     )
     # capture BEFORE select_rank_device narrows/restores it in place
