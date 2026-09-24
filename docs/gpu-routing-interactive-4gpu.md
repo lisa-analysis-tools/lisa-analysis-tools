@@ -20,28 +20,61 @@ salloc --nodes=2 --gres=gpu:2 --ntasks-per-node=3 --time=02:00:00 \
 `--ntasks-per-node=3` so a 5-task launch fits (4 compute + 1 saver) with room
 for the round-robin below.
 
+> **EXPORT THIS BLOCK FIRST, IN THE SHELL YOU WILL RUN FROM.** `salloc` gives
+> you a NEW shell, and these do not survive it — nor a second terminal, nor a
+> reconnected session. Nothing below works without them, and the way it fails
+> is not obvious: without the fabric pins Intel MPI dies inside
+> `MPI_Init_thread` with `OFI get address vector map failed` and UCX
+> complaining about `different host id`, which looks like a broken install
+> rather than a missing export. If you are ever unsure whether you exported
+> them, just paste the block again — it is idempotent.
+
 ```bash
 # --- EDIT THESE TWO, then paste the rest verbatim -------------------------
-export LAT=$HOME/LISAanalysistools          # the gpu-count-routing checkout
+export LAT=$HOME/lisa-analysis-tools        # your LAT checkout on the cluster
 export G=$SCRATCH/gpurouting_gates          # somewhere with room for stores
 # --------------------------------------------------------------------------
 
 cd "$LAT"
-git rev-parse --abbrev-ref HEAD             # expect: gpu-count-routing
+git rev-parse --abbrev-ref HEAD             # expect: dev (merged 2026-09-23)
+git log --oneline -1                        # should include the routing work
 mkdir -p "$G"
 
-# Intel MPI launcher pins (WP7 runbook). `srun --mpi=pmix` bootstraps but its
-# OFI business-card exchange fails, and bare srun gives SIZE-1 WORLDS -- a run
-# that looks fine and is actually N independent single-rank runs.
+# Intel MPI launcher pins. THESE THREE ARE THE PROVEN SET -- they are what
+# the production submit scripts' multi-node branch exports verbatim, and the
+# launcher table in docs/multirank-cluster-gates.md records how each
+# alternative fails: bare `srun` (no PMI) gives SIZE-1 WORLDS, `--mpi=pmi2`
+# finds no libpmi2, `--mpi=pmix` bootstraps but Intel MPI's OFI
+# business-card exchange then aborts.
+#
+# WITHOUT THE LAST TWO you get this, and it is NOT a broken install:
+#   UCX ERROR no active messages transport to <no debug data>:
+#     self/memory ... sysv/memory - different host id ... cma/memory
+#   Abort: MPIDI_OFI_mpi_init_hook: OFI get address vector map failed
+# i.e. the only transports on offer are SHARED-MEMORY ones (self/sysv/posix/
+# cma), correctly refused between two hosts -- UCX finds no cross-node
+# transport on this cluster, so the fabric must be pinned to libfabric's tcp
+# provider. TCP is a CORRECTNESS choice here; whether a faster provider
+# (`fi_info -l`) is worth it is a separate measurement.
 export I_MPI_HYDRA_BOOTSTRAP=slurm
 export I_MPI_FABRICS=shm:ofi
 export FI_PROVIDER=tcp
 
-# ★ THE TRAP THAT COST A LAUNCH (2026-09-18). `-ppn 1` does NOT bind under the
-# SLURM bootstrap: hydra honours the scheduler's per-node TASK COUNTS over it.
-# At 5 tasks on 2 nodes SLURM's block split is 3/2, so node A would get compute
-# ranks 0,1,2 and `build_layout` refuses ("3 compute ranks but the per-node GPU
-# pool [0, 1] supports at most 2"). This forces round-robin A,B,A,B,A.
+# ★ THE TRAP THAT COST A LAUNCH (2026-09-18, the first 4-GPU one-walker
+# launch). SIZE-DEPENDENT, which is why Step 0 never saw it: under the SLURM
+# bootstrap hydra honours the scheduler's PER-NODE TASK COUNTS over `-ppn`.
+# At 3 tasks over 2 nodes block and cyclic happen to AGREE, so `-ppn 1` looks
+# like it binds. At 5 tasks (4 compute + saver) SLURM's block split is 3/2,
+# node A receives compute ranks 0,1,2 and `build_layout` refuses ("node ...-1:
+# 3 compute ranks but the per-node GPU pool [0, 1] supports at most 2"). This
+# restores the round robin A,B,A,B,A: node A takes compute 0, compute 2 and
+# the saver; node B takes compute 1 and 3.
+#
+# ⚠ NOT IN dev's SUBMIT SCRIPTS. It is exported by the campaign scripts on the
+# UNMERGED `one-walker-replicas` branch (with a test keeping it there), so a
+# 5-rank shape launched from dev's scripts will hit the 3/2 refusal. Every
+# gate in THIS runbook is a bare mpiexec, so exporting it here is what covers
+# them; see the note under G4 for the submit-script path.
 export I_MPI_JOB_RESPECT_PROCESS_PLACEMENT=0
 
 # GPUS is the PER-NODE pool, not the total.
