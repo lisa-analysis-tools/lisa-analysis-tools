@@ -208,18 +208,30 @@ COMMON="NUM_ITERATIONS=4 GF_FANOUT_DIGEST=1"
 # (a) 4 blocks x R=1 -- today's walker-block layout
 env $COMMON FILE_STORE_DIR=$G/g4_a/ NWALKERS=4 RANKS_PER_BLOCK=1 \
   mpiexec -n 5 -ppn 1 python -u scripts/diagnostics/gate_run.py --stock gb_no_fg \
-  2>&1 | tee $G/g4_a.log | tail -5
+  2>&1 | tee $G/g4_a.log
 
 # (b) 2 blocks x R=2 -- THE NEW AXIS (previously impossible)
 env $COMMON FILE_STORE_DIR=$G/g4_b/ NWALKERS=2 RANKS_PER_BLOCK=2 \
   mpiexec -n 5 -ppn 1 python -u scripts/diagnostics/gate_run.py --stock gb_no_fg \
-  2>&1 | tee $G/g4_b.log | tail -5
+  2>&1 | tee $G/g4_b.log
 
 # (c) 1 block x R=4 -- one-walker replicas (the pre-existing mode)
 env $COMMON FILE_STORE_DIR=$G/g4_c/ NWALKERS=1 RANKS_PER_BLOCK=4 \
   mpiexec -n 5 -ppn 1 python -u scripts/diagnostics/gate_run.py --stock gb_no_fg \
-  2>&1 | tee $G/g4_c.log | tail -5
+  2>&1 | tee $G/g4_c.log
 ```
+
+> **These STREAM to the terminal as well as to the log.** They used to end
+> in `| tail -5`, which prints nothing at all until the process exits — so a
+> perfectly healthy arm looks HUNG for its whole runtime, and a genuinely
+> hung one looks identical. (Cost a scare on 2026-09-24.) If the output is
+> too noisy, background it and watch the log instead: `tail -f $G/g4_a.log`.
+>
+> **To tell a slow arm from a hung one:** if `ls -l $G/<arm>.log` is growing,
+> it is working. If it is static AND `nvidia-smi` shows the GPUs idle, that
+> is the recorded hang risk — a failure inside the per-unit allgather has no
+> containment, so give every arm a wall-clock limit and do not wait on it
+> indefinitely.
 
 **A FRESH `FILE_STORE_DIR` PER ARM IS MANDATORY.** A reused store RESUMES, and
 a walker-count mismatch aborts with "walker-count mismatch" — which looks like
@@ -293,17 +305,17 @@ S="NWALKERS=1 NUM_ITERATIONS=5 GB_PROP_TIMING_SYNC=all"
 # R=1 -- baseline, ONE compute rank + saver, one GPU
 env $S FILE_STORE_DIR=$G/g5_r1/ GPUS=0 \
   mpiexec -n 2 -ppn 1 python -u scripts/diagnostics/gate_run.py --stock gb_no_fg \
-  2>&1 | tee $G/g5_r1.log | tail -3
+  2>&1 | tee $G/g5_r1.log
 
 # R=2 -- two compute ranks + saver
 env $S FILE_STORE_DIR=$G/g5_r2/ GPUS=0,1 \
   mpiexec -n 3 -ppn 1 python -u scripts/diagnostics/gate_run.py --stock gb_no_fg \
-  2>&1 | tee $G/g5_r2.log | tail -3
+  2>&1 | tee $G/g5_r2.log
 
 # R=4 -- four compute ranks + saver, both nodes
 env $S FILE_STORE_DIR=$G/g5_r4/ GPUS=0,1 \
   mpiexec -n 5 -ppn 1 python -u scripts/diagnostics/gate_run.py --stock gb_no_fg \
-  2>&1 | tee $G/g5_r4.log | tail -3
+  2>&1 | tee $G/g5_r4.log
 ```
 
 ### The numbers to bring back
