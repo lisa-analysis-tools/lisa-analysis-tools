@@ -3530,6 +3530,44 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # Stays None on the FD path; the FD engine path doesn't touch it.
         self.gb_wdm_comp = gb_wdm_comp
         self.stop_here = True
+        # PERMUTED ("fancy") BAND-TEMPERATURE SWAPS -- the whole of
+        # ``run_tempering``. ``{BRANCH}_RUN_FANCY_TEMPERING=0`` forces it off for
+        # every move of the branch at once (user ruling 2026-09-24: "make
+        # sure the run_tempering is entirely turned off because we have no
+        # fancy swaps").
+        #
+        # ⚠ THIS IS THE ONLY RELIABLE OFF SWITCH. ``temper_every_proposes``
+        # (GB_TEMPER_EVERY_PROPOSES) only THROTTLES -- see
+        # ``_temper_cadence_fire``, where ``n <= 1`` returns True
+        # unconditionally, so 0 means "fire always", the exact opposite of
+        # off. And per-move ``run_swaps=`` is set from several different
+        # expressions in the recipe (``_temper_all_moves or not
+        # _temper_on_removal``, hard False on some moves), so there is no
+        # single recipe-level value to flip either.
+        #
+        # ⚠ It does NOT touch the per-repeat VERTICAL rung swaps
+        # (GB_TEMPER_VERTICAL). Those live inside the in-model loop, are
+        # ADDITIVE to the permuted swaps rather than part of them, and are
+        # the transport the convergence work depends on -- turning the
+        # fancy swaps off must not silently take them with it.
+        #
+        # Default: unset -> the caller's value -> today's behaviour exactly.
+        _rt = os.environ.get(f"{str(branch_name).upper()}_RUN_FANCY_TEMPERING")
+        if _rt is not None and _rt.strip().lower() in ("0", "false"):
+            if run_swaps and not getattr(
+                    type(self), "_fancy_tempering_off_logged", False):
+                type(self)._fancy_tempering_off_logged = True
+                logger.info(
+                    "[GB_TEMPER] %s_RUN_FANCY_TEMPERING=0: permuted band-temperature "
+                    "swaps (run_tempering) are OFF for every %s move. The "
+                    "per-repeat VERTICAL rung swaps are unaffected "
+                    "(%s_TEMPER_VERTICAL=%s).",
+                    str(branch_name).upper(), branch_name,
+                    str(branch_name).upper(),
+                    os.environ.get(
+                        f"{str(branch_name).upper()}_TEMPER_VERTICAL", "0"),
+                )
+            run_swaps = False
         self.run_swaps = run_swaps
         # Tempering cadence (user design 2026-08-14): a swap-enabled move
         # runs the band-swap stage only when at least this many TOTAL
@@ -14127,7 +14165,89 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # exactly once, at the block-end log).
             "prop_by_rung_dev": None,
             "acc_by_rung_dev": None,
+            # PER-(BAND, RUNG-PAIR) counts, the shape _adapt_band_temps
+            # consumes: (num_bands, ntemps - 1), summed over WALKERS (user
+            # ruling 2026-09-24 -- "the tuning should be across walkers per
+            # band"; the band ladder has no walker axis). These exist so the
+            # ladder can be adapted from the VERTICAL swaps when the
+            # permuted ones are off -- see _vertical_ladder_counts.
+            "prop_by_bandrung_dev": None,
+            "acc_by_bandrung_dev": None,
         }
+
+    def _vertical_ladder_bank(self, census) -> None:
+        """Bank one block's per-(band, rung) vertical swap counts.
+
+        Accumulated across the whole PROPOSE (reset in
+        :meth:`_vertical_ladder_reset`) because ``_adapt_band_temps`` runs
+        once per propose and a single block's counts are far too sparse to
+        steer a ladder with.
+        """
+        for key, attr in (("prop_by_bandrung_dev", "_vert_ladder_prop"),
+                          ("acc_by_bandrung_dev", "_vert_ladder_acc")):
+            blk = census.get(key)
+            if blk is None:
+                continue
+            cur = getattr(self, attr, None)
+            setattr(self, attr, blk.copy() if cur is None else cur + blk)
+
+    def _vertical_ladder_reset(self) -> None:
+        """Clear the per-propose vertical ladder counts."""
+        self._vert_ladder_prop = None
+        self._vert_ladder_acc = None
+
+    def _vertical_adapt_ladder(self, band_temps) -> bool:
+        """Adapt the band temperature ladder from the VERTICAL swaps.
+
+        USER REQUEST 2026-09-24, and it closes a hole that
+        ``{BRANCH}_RUN_FANCY_TEMPERING=0`` would otherwise open:
+        ``_adapt_band_temps`` is called from exactly ONE place --
+        ``run_tempering`` -- so turning the permuted swaps off does not
+        merely stop those swaps, it FREEZES THE LADDER for the whole run.
+        Nothing would have logged that; the ladder would simply stop
+        moving. This routes the same adaptation off the vertical rung
+        swaps instead, which are still running.
+
+        The statistic is the vertical sweep's own per-``(band, rung-pair)``
+        accepted/proposed census, summed over WALKERS ("the tuning should
+        be across walkers per band") -- which is both the right pooling
+        (the band ladder has no walker axis) and the same
+        ``(num_bands, ntemps - 1)`` shape ``run_tempering`` hands over, so
+        ``_adapt_band_temps`` is reused verbatim rather than reimplemented.
+
+        A vertical pair and a permuted pair are the same MH question --
+        "should these two adjacent rungs of this band exchange?" -- so
+        their acceptance ratios drive the ladder the same way. What differs
+        is only WHICH pairs get asked, and the vertical sweep asks far more
+        of them per propose.
+
+        Returns True when the ladder was adapted (so the caller can log it).
+        """
+        prop = getattr(self, "_vert_ladder_prop", None)
+        acc = getattr(self, "_vert_ladder_acc", None)
+        if prop is None or acc is None:
+            return False
+        if self.temperature_control is None or self.ntemps <= 1:
+            return False
+        n_prop = int(prop.sum())
+        if n_prop <= 0:
+            # Nothing was proposed anywhere -- adapting on an all-zero
+            # ratio column would drag every rung toward each other for a
+            # reason that is an absence of data, not a measurement.
+            logger.info(
+                "[GB_TEMPER %s] vertical ladder adaptation SKIPPED: no "
+                "vertical swap was proposed this propose.", self.name)
+            return False
+        self._adapt_band_temps(band_temps, acc, prop)
+        _r = float(acc.sum()) / max(n_prop, 1)
+        logger.info(
+            "[GB_TEMPER %s] ladder adapted from VERTICAL swaps "
+            "(fancy tempering off): %d proposed / %d accepted (%.1f%%) "
+            "over %d band(s) x %d rung pair(s), pooled across walkers.",
+            self.name, n_prop, int(acc.sum()), 100.0 * _r,
+            int(prop.shape[0]), int(prop.shape[1]),
+        )
+        return True
 
     @staticmethod
     def _vertical_census_flush(census) -> None:
@@ -14344,6 +14464,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 census["prop_by_rung_dev"] = _pr.astype(xp.int64)
             else:
                 census["prop_by_rung_dev"] += _pr
+            # ... and the same census resolved PER BAND, which is what the
+            # ladder adaptation needs. Flattened (band, rung) bincount, one
+            # extra kernel, still no sync.
+            _nr = len(census["prop_by_rung"])
+            _pbr = xp.bincount(
+                b_i[cold].astype(xp.int64) * _nr + t_i[cold].astype(xp.int64),
+                minlength=int(self.num_bands) * _nr,
+            )[: int(self.num_bands) * _nr].reshape(int(self.num_bands), _nr)
+            if census.get("prop_by_bandrung_dev") is None:
+                census["prop_by_bandrung_dev"] = _pbr.astype(xp.int64)
+            else:
+                census["prop_by_bandrung_dev"] += _pbr
         # Swap RNG lives on its own stream: the in-model repeat loop's draw
         # count/order must not change, or the bit-exact accept-chain
         # reference test breaks for a reason unrelated to correctness.
@@ -14416,6 +14548,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 census["acc_by_rung_dev"] = _ar.astype(xp.int64)
             else:
                 census["acc_by_rung_dev"] += _ar
+            _nr = len(census["acc_by_rung"])
+            _abr = xp.bincount(
+                b_hc.astype(xp.int64) * _nr + t_c.astype(xp.int64),
+                minlength=int(self.num_bands) * _nr,
+            )[: int(self.num_bands) * _nr].reshape(int(self.num_bands), _nr)
+            if census.get("acc_by_bandrung_dev") is None:
+                census["acc_by_bandrung_dev"] = _abr.astype(xp.int64)
+            else:
+                census["acc_by_bandrung_dev"] += _abr
 
         # --- sorter: every source of both cells trades its temperature ---
         # BATCHED relabel (orchestration audit 2026-08-27): the per-pair
@@ -16499,6 +16640,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     scheduler.relabel_slots(slots, _spec_final)
             _cn = _vert_census
             self._vertical_census_flush(_cn)
+            # Bank this block's per-(band, rung) counts for the ladder
+            # adaptation. Per PROPOSE, not per block: _adapt_band_temps is
+            # a once-per-propose operation and a single block's counts are
+            # far too sparse to steer a ladder with.
+            self._vertical_ladder_bank(_cn)
             _avail = _cn["paired"] / max(_cn["rows"], 1)
             _rate = _cn["accepted"] / max(_cn["proposed"], 1)
             # PAIR AVAILABILITY is the headline: a vertical swap needs both
@@ -20394,6 +20540,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 f"{num_active_leaves}")
             st_prop = time.perf_counter()
             self._replace_accept_forensics = []
+            # Per-propose vertical-swap ladder census (see
+            # _vertical_adapt_ladder).
+            self._vertical_ladder_reset()
             _reseed_firing = getattr(self, "_reseed_firing", False)
             _passes = self._cold_reseed_replace_passes() if _reseed_firing else 1
             _saved_temper_vertical = getattr(self, "temper_vertical", False)
@@ -23793,6 +23942,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # involved (two rj_replace drifts at 1.5-1.9e3 -- 3 orders above
         # every other move -- prompted this).
         self._replace_accept_forensics = []
+        # Per-propose vertical-swap ladder census (see _vertical_adapt_ladder).
+        self._vertical_ladder_reset()
         # reseed+replace combined proposal (v9): on the firing iteration go
         # around the alive-source group GB_COLD_RESEED_REPLACE_PASSES times
         # (default 3), and force vertical swaps ON for the in-model phase of
@@ -24084,6 +24235,26 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # (num_bands, ntemps) summed over walkers. The two families are
         # recorded separately (one propose produces both kinds).
         sub = new_state.sub_states[self.branch_name]
+        # LADDER ADAPTATION WHEN THE PERMUTED SWAPS ARE OFF. Must land
+        # BEFORE the write-back on the next line, which is what persists
+        # band_temps into the state.
+        #
+        # AUTO by default, and deliberately so: _adapt_band_temps is called
+        # from run_tempering and nowhere else, so
+        # {BRANCH}_RUN_FANCY_TEMPERING=0 silently FREEZES the ladder for the
+        # whole run. Making the operator remember a second knob to avoid
+        # that is how a run quietly samples a fixed ladder for 2000
+        # iterations. "off"/"on" force it either way.
+        _vadapt = os.environ.get(
+            f"{str(self.branch_name).upper()}_VERTICAL_ADAPT_LADDER", "auto"
+        ).strip().lower()
+        if _vadapt == "auto":
+            _vadapt_on = (not self.run_swaps) and bool(
+                getattr(self, "temper_vertical", False))
+        else:
+            _vadapt_on = _vadapt in ("1", "true", "on")
+        if _vadapt_on:
+            self._vertical_adapt_ladder(band_temps)
         sub.band_info["band_temps"][:] = _to_numpy(band_temps)
         sub.band_info["band_num_binaries"][:] = band_info["band_counts"]
         sub.accumulate_proposals(

@@ -1262,3 +1262,256 @@ class GroupWiringTest(unittest.TestCase):
         self.assertIsNot(a, b)
         self.assertEqual(a.passes, 0)
         self.assertEqual(b.passes, 0)
+
+
+class GroupLoopTerminationTest(unittest.TestCase):
+    """``_run_group_passes`` must ALWAYS terminate.
+
+    This is a stopping-gate audit, not a feature test: the group loop is
+    unbounded by construction (it repeats a full sweep until the data says
+    stop), so every exit has to be reachable and the ceiling has to be
+    enforced even when the data never cooperates.
+    """
+
+    NW, NB = 2, 3
+
+    def _move(self, cold_delta, max_passes=6, window=2, occ=1):
+        """A move whose run_proposal always reports ``cold_delta``."""
+        mv = _make_move(25)
+        mv.name = "in_model"
+        mv.is_rj_prop = False
+        mv.nwalkers, mv.num_bands, mv.ntemps = self.NW, self.NB, 2
+        mv.branch_name = "gb"
+        calls = []
+
+        def fake_run_proposal(model, state, sorter, temps):
+            calls.append(1)
+            log = np.zeros((2, self.NW, self.NB))
+            log[0] = cold_delta
+            return log, None, None
+
+        mv.run_proposal = fake_run_proposal
+        mv._group_cold_occupancy = lambda sorter: np.full(
+            (self.NW, self.NB), occ)
+        st = _InModelGroupState(window=window, thresh=4.0,
+                                max_passes=max_passes)
+        sorter = SimpleNamespace(has_run_rj=np.zeros(4, dtype=bool))
+        state = SimpleNamespace(log_like=np.zeros((1, self.NW)))
+        first = np.zeros((2, self.NW, self.NB))
+        first[0] = cold_delta
+        return mv, st, sorter, state, first, calls
+
+    def test_it_stops_when_every_sub_band_converges(self):
+        mv, st, sorter, state, first, calls = self._move(
+            np.zeros((self.NW, self.NB)), max_passes=50, window=2)
+        mv._run_group_passes(st, None, state, sorter, None, first)
+        self.assertTrue(st.all_shut(np))
+        self.assertLess(st.passes, 50, "should stop on convergence, not the cap")
+
+    def test_the_ceiling_stops_a_group_that_never_converges(self):
+        """Every sub-band climbing forever: only the ceiling can end this."""
+        mv, st, sorter, state, first, calls = self._move(
+            np.full((self.NW, self.NB), 1e3), max_passes=6, window=2)
+        with self.assertLogs(
+                "lisatools.globalfit.moves.gbspecialstretch", "WARNING") as cm:
+            mv._run_group_passes(st, None, state, sorter, None, first)
+        self.assertEqual(st.passes, 6)
+        self.assertFalse(st.all_shut(np))
+        self.assertTrue(any("CEILING" in m for m in cm.output),
+                        "hitting the cap must WARN, not pass silently")
+
+    def test_an_empty_pool_terminates_immediately(self):
+        """No occupied pair anywhere: every pair shuts on pass 1 rather than
+        holding the group open forever."""
+        mv, st, sorter, state, first, calls = self._move(
+            np.zeros((self.NW, self.NB)), max_passes=50, window=5, occ=0)
+        mv._run_group_passes(st, None, state, sorter, None, first)
+        self.assertTrue(st.all_shut(np))
+        self.assertEqual(st.passes, 1)
+
+    def test_has_run_rj_is_reset_every_pass(self):
+        """Without this the second pass picks NOTHING and the group looks
+        instantly converged -- has_run_rj is allocated once per SORTER."""
+        mv, st, sorter, state, first, calls = self._move(
+            np.full((self.NW, self.NB), 1e3), max_passes=3, window=2)
+        sorter.has_run_rj[:] = True
+        mv._run_group_passes(st, None, state, sorter, None, first)
+        self.assertFalse(bool(sorter.has_run_rj.any()),
+                         "has_run_rj must be cleared for the next pass")
+        self.assertEqual(len(calls), 2, "ceiling 3 => 2 further passes run")
+
+    def test_each_pass_banks_its_cold_delta_into_log_like(self):
+        """Every pass but the last banks its own delta; the last is banked by
+        the caller. Dropping one silently loses lnL from the chain."""
+        mv, st, sorter, state, first, calls = self._move(
+            np.full((self.NW, self.NB), 1e3), max_passes=4, window=2)
+        mv._run_group_passes(st, None, state, sorter, None, first)
+        # passes 1..3 bank; pass 4's delta is returned for the caller
+        self.assertAlmostEqual(
+            float(state.log_like[0].sum()),
+            3 * self.NW * self.NB * 1e3, places=3)
+
+
+class RunTemperingOffTest(unittest.TestCase):
+    """``{BRANCH}_RUN_FANCY_TEMPERING=0`` kills the permuted swaps outright."""
+
+    def _mk(self, env, run_swaps=True, branch="gb"):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        # the ctor line under test, exercised in isolation: the real ctor
+        # needs a full fit to build.
+        with mock.patch.dict(os.environ, env, clear=False):
+            for k in ("GB_RUN_FANCY_TEMPERING", "VGB_RUN_FANCY_TEMPERING"):
+                if k not in env:
+                    os.environ.pop(k, None)
+            _rt = os.environ.get(f"{branch.upper()}_RUN_FANCY_TEMPERING")
+            if _rt is not None and _rt.strip().lower() in ("0", "false"):
+                return False
+            return run_swaps
+
+    def test_unset_leaves_the_callers_value(self):
+        self.assertTrue(self._mk({}, run_swaps=True))
+        self.assertFalse(self._mk({}, run_swaps=False))
+
+    def test_zero_forces_off(self):
+        self.assertFalse(self._mk({"GB_RUN_FANCY_TEMPERING": "0"}, run_swaps=True))
+
+    def test_one_leaves_it_alone(self):
+        self.assertTrue(self._mk({"GB_RUN_FANCY_TEMPERING": "1"}, run_swaps=True))
+
+    def test_it_is_branch_scoped(self):
+        """A vgb knob must not silence gb's swaps."""
+        self.assertTrue(
+            self._mk({"VGB_RUN_FANCY_TEMPERING": "0"}, run_swaps=True, branch="gb"))
+
+    def test_the_cadence_knob_cannot_do_this(self):
+        """Regression guard for the trap this knob exists to avoid:
+        GB_TEMPER_EVERY_PROPOSES=0 means 'fire ALWAYS', not 'never'."""
+        mv = _make_move(25)
+        mv.temper_every_proposes = 0
+        from lisatools.globalfit.moves.gbspecialstretch import GBSpecialBase
+        self.assertTrue(
+            GBSpecialBase._temper_cadence_fire(mv),
+            "n <= 1 must still mean 'always fire' -- if this ever becomes "
+            "False, GB_TEMPER_EVERY_PROPOSES=0 has silently become an off "
+            "switch and the docs here are wrong",
+        )
+
+
+class VerticalLadderAdaptTest(unittest.TestCase):
+    """Adapting the band temperature ladder from the VERTICAL swaps.
+
+    The hole this closes: ``_adapt_band_temps`` is called from exactly one
+    place, ``run_tempering``. So GB_RUN_FANCY_TEMPERING=0 does not merely
+    stop the permuted swaps -- it FREEZES THE LADDER for the whole run,
+    silently. These pin that the vertical census can drive it instead.
+    """
+
+    NB, NT = 3, 4
+
+    def _mv(self):
+        mv = _make_move(25)
+        mv.name = "in_model"
+        mv.num_bands, mv.ntemps = self.NB, self.NT
+        mv.branch_name = "gb"
+        mv._vertical_ladder_reset()
+        return mv
+
+    def _census(self, prop, acc):
+        return {"prop_by_bandrung_dev": prop, "acc_by_bandrung_dev": acc}
+
+    def test_bank_accumulates_across_blocks(self):
+        """Per PROPOSE, not per block -- one block's counts are far too
+        sparse to steer a ladder with."""
+        mv = self._mv()
+        p = np.ones((self.NB, self.NT - 1), dtype=np.int64)
+        a = np.full((self.NB, self.NT - 1), 2, dtype=np.int64)
+        for _ in range(3):
+            mv._vertical_ladder_bank(self._census(p, a))
+        np.testing.assert_array_equal(mv._vert_ladder_prop, 3 * p)
+        np.testing.assert_array_equal(mv._vert_ladder_acc, 3 * a)
+
+    def test_bank_is_a_copy_not_an_alias(self):
+        """The census array is reused by the next block; banking must not
+        alias it or later blocks would mutate the banked totals."""
+        mv = self._mv()
+        p = np.ones((self.NB, self.NT - 1), dtype=np.int64)
+        mv._vertical_ladder_bank(self._census(p, p))
+        p += 99
+        np.testing.assert_array_equal(
+            mv._vert_ladder_prop, np.ones((self.NB, self.NT - 1)))
+
+    def test_reset_clears_between_proposes(self):
+        mv = self._mv()
+        p = np.ones((self.NB, self.NT - 1), dtype=np.int64)
+        mv._vertical_ladder_bank(self._census(p, p))
+        mv._vertical_ladder_reset()
+        self.assertIsNone(mv._vert_ladder_prop)
+        self.assertIsNone(mv._vert_ladder_acc)
+
+    def test_it_adapts_and_reports(self):
+        mv = self._mv()
+        # Set the BACKING field, not the property: eryn's
+        # Move.temperature_control setter also rebinds compute_log_posterior
+        # and re-derives ntemps/nsamplers from the object, none of which this
+        # test needs and all of which a fake would have to impersonate.
+        # _adapt_band_temps only reads .adaptation_lag / .adaptation_time.
+        mv._temperature_control = SimpleNamespace(
+            adaptation_lag=100.0, adaptation_time=10.0)
+        mv.time = 5
+        p = np.full((self.NB, self.NT - 1), 10, dtype=np.int64)
+        a = np.full((self.NB, self.NT - 1), 5, dtype=np.int64)
+        mv._vertical_ladder_bank(self._census(p, a))
+        bt = np.tile(np.array([1.0, 0.5, 0.25, 0.1]), (self.NB, 1))
+        before = bt.copy()
+        with self.assertLogs(
+                "lisatools.globalfit.moves.gbspecialstretch", "INFO") as cm:
+            ok = mv._vertical_adapt_ladder(bt)
+        self.assertTrue(ok)
+        self.assertTrue(any("VERTICAL swaps" in m for m in cm.output))
+        # cold and hot rungs are pinned; the interior must be free to move
+        np.testing.assert_allclose(bt[:, 0], before[:, 0])
+        np.testing.assert_allclose(bt[:, -1], before[:, -1])
+
+    def test_no_proposals_skips_rather_than_collapsing_the_ladder(self):
+        """An all-zero ratio column is an ABSENCE of data, not a
+        measurement -- adapting on it would drag every rung together."""
+        mv = self._mv()
+        # Set the BACKING field, not the property: eryn's
+        # Move.temperature_control setter also rebinds compute_log_posterior
+        # and re-derives ntemps/nsamplers from the object, none of which this
+        # test needs and all of which a fake would have to impersonate.
+        # _adapt_band_temps only reads .adaptation_lag / .adaptation_time.
+        mv._temperature_control = SimpleNamespace(
+            adaptation_lag=100.0, adaptation_time=10.0)
+        mv.time = 5
+        z = np.zeros((self.NB, self.NT - 1), dtype=np.int64)
+        mv._vertical_ladder_bank(self._census(z, z))
+        bt = np.tile(np.array([1.0, 0.5, 0.25, 0.1]), (self.NB, 1))
+        before = bt.copy()
+        with self.assertLogs(
+                "lisatools.globalfit.moves.gbspecialstretch", "INFO") as cm:
+            ok = mv._vertical_adapt_ladder(bt)
+        self.assertFalse(ok)
+        self.assertTrue(any("SKIPPED" in m for m in cm.output))
+        np.testing.assert_array_equal(bt, before)
+
+    def test_nothing_banked_is_a_no_op(self):
+        mv = self._mv()
+        # Set the BACKING field, not the property: eryn's
+        # Move.temperature_control setter also rebinds compute_log_posterior
+        # and re-derives ntemps/nsamplers from the object, none of which this
+        # test needs and all of which a fake would have to impersonate.
+        # _adapt_band_temps only reads .adaptation_lag / .adaptation_time.
+        mv._temperature_control = SimpleNamespace(
+            adaptation_lag=100.0, adaptation_time=10.0)
+        self.assertFalse(mv._vertical_adapt_ladder(
+            np.tile(np.array([1.0, 0.5, 0.25, 0.1]), (self.NB, 1))))
+
+    def test_the_counts_are_pooled_across_walkers_per_band(self):
+        """User ruling: "the tuning should be across walkers per band".
+        The banked shape carries NO walker axis -- it is (band, rung pair),
+        which is exactly what _adapt_band_temps consumes."""
+        mv = self._mv()
+        p = np.ones((self.NB, self.NT - 1), dtype=np.int64)
+        mv._vertical_ladder_bank(self._census(p, p))
+        self.assertEqual(mv._vert_ladder_prop.shape, (self.NB, self.NT - 1))
