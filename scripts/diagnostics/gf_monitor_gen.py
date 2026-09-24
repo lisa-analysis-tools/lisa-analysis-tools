@@ -1729,6 +1729,47 @@ try:
         raise FileNotFoundError("run_settings.log not found beside the store")
     _mt = re.search(r"window_taper_duration:\s*([\d.eE+-]+)", _settings_txt)
     WIN_ALPHA = (float(_mt.group(1)) / (N_TD * W_DT)) if _mt else 0.0
+
+    # DISPLAY TAPER: fill the edge crop, do not inherit the run's data taper.
+    #
+    # The run's taper is deliberately tiny (14400 s of 1.5552e7 = alpha
+    # 1.85e-3) and that is CORRECT for the likelihood, which works in the WDM
+    # domain and throws the tapered edges away wholesale via
+    # EDGE_CROP_WAVELETS. There is no global FFT there and so no global
+    # leakage. This panel is a different representation: one FFT over the
+    # whole span, where a 2-wavelet taper leaks catastrophically. Root-caused
+    # 2026-08-18: the smooth lobes below ~1.4 mHz are the taper's own
+    # transfer function convolved with the enormous sub-mHz TDI content
+    # (highpass is off), with measured null spacing 0.1366 mHz = 1/7320 s
+    # against 1/7200 s for the taper ramp. They are a picture of the window,
+    # not of the data, and they drove the residual/model ratio in the lower
+    # panel to 10-40x below 0.8 mHz.
+    #
+    # The cure obeys the standing EDGE-EXCLUSION INVARIANT (2026-08-19): any
+    # region where taper error is created must be one the crop removes. So
+    # the display taper is set to the crop duration itself -- it lives
+    # entirely inside [t_start, min_time] and [max_time, t_end], which the
+    # likelihood already ignores, leaving the analysed span untouched while
+    # lengthening the ramp ~15x and collapsing the leakage.
+    _t_span = N_TD * W_DT
+    try:
+        _crop_lo = float(_k["min_time"])
+        _crop_hi = _t_span - float(_k["max_time"])
+        _taper_sec = max(min(_crop_lo, _crop_hi), 0.0)
+    except Exception:
+        _taper_sec = 0.0
+    WIN_ALPHA_DISP = (2.0 * _taper_sec / _t_span) if _taper_sec > 0 else WIN_ALPHA
+    if WIN_ALPHA_DISP <= WIN_ALPHA:
+        WIN_ALPHA_DISP = WIN_ALPHA
+        MISSING.append(
+            "residual-spectrum display taper fell back to the run's own "
+            f"alpha ({WIN_ALPHA:.4g}): no usable edge crop in the stored "
+            "domain settings. Expect window-leakage lobes below ~1.4 mHz; "
+            "they are the window, not the data.")
+    WIN_TAPER_NOTE = (
+        f"display taper {_taper_sec:.0f} s per side (alpha "
+        f"{WIN_ALPHA_DISP:.4g}), sized to the edge crop the likelihood "
+        f"already discards; the run's own data taper is alpha {WIN_ALPHA:.4g}")
     _mt0 = re.search(r"\[gb\].*?\n\s+t0:\s*([\d.]+)", _settings_txt, re.S)
     T_REF = float(_mt0.group(1)) if _mt0 else float(MOJITO_REFERENCE_TIME)
 
@@ -1798,7 +1839,10 @@ try:
             del _chunk
             if _t0_data is None:
                 _t0_data = float(_fh.tdis.time_sampling.t0)
-    _win, _ = windowfun("tukey", N_TD, alpha=WIN_ALPHA)
+    # WIN_ALPHA_DISP, not WIN_ALPHA -- see the note where it is derived. The
+    # same window is applied to the data, the templates and the residual, so
+    # every trace on this panel stays directly comparable.
+    _win, _ = windowfun("tukey", N_TD, alpha=WIN_ALPHA_DISP)
     _fd_data = TDSignal(_td, TDSettings(t0=_t0_data, dt=W_DT, N=N_TD,
                                         force_backend="cpu")
                         ).fft(settings=None, window=_win)
@@ -1837,7 +1881,12 @@ try:
         T_REF, t_start=T_REF, N_sparse=2048, orbits=_orb,
         tdi_config=TDIConfig("2nd generation", force_backend="cpu"),
         tdi_type="XYZ", nchannels=3, force_backend="cpu",
-        tukey_alpha=WIN_ALPHA, edge_frac=0.0)
+        # MUST match the window applied to the data above: the residual is
+        # formed as data_fd - templates, so a different taper here would
+        # subtract a differently-windowed signal and manufacture a residual
+        # component out of the mismatch -- worse than the leakage this is
+        # fixing. One alpha, both sides.
+        tukey_alpha=WIN_ALPHA_DISP, edge_frac=0.0)
     _fr = np.asarray(FDS.f_arr)
     _shift = np.exp(2j * np.pi * _fr * (_t0_data - T_REF))[None, :]
     _tmpl = {}
@@ -4279,7 +4328,15 @@ if DTR and "nbins" in DTR:
         f"{_d.get('conf_f', float('nan')) * 1e3:.1f} mHz. "
         f"{_d.get('n_gb', '?')} "
         f"galactic-binary and {_d.get('n_vgb', '?')} verification-binary "
-        f"templates are subtracted here.")
+        f"templates are subtracted here. "
+        f"Data, templates and residual share one window: "
+        f"{globals().get('WIN_TAPER_NOTE', 'the run&rsquo;s own data taper')}. "
+        f"Until 2026-09-24 this panel inherited the run&rsquo;s 2-wavelet "
+        f"taper, which is right for the likelihood &mdash; it works in the "
+        f"WDM domain and discards the tapered edges &mdash; but leaks badly "
+        f"through a single whole-span FFT, putting scalloped lobes below "
+        f"~1.4 mHz that were the window, not the data (146&times; "
+        f"peak-to-trough, now 1.7&times;; in-band unchanged to 0.001%).")
     cap_f1b = (
         f"Lower panel: residual power over the fitted noise-plus-foreground "
         f"model, coloured by the Anderson&ndash;Darling Gaussianity p-value of "
