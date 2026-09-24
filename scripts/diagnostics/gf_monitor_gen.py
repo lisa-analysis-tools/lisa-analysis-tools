@@ -782,19 +782,43 @@ try:
     ramp = mcolors.LinearSegmentedColormap.from_list(
         "amber", ["#FBE3B5", "#F5A623", "#8C5A00"])
     pm = np.median(psd_cold[-1], axis=0)
+
+    # EVERY WALKER, NEVER THE PARAMETER-WISE MEDIAN (user ruling 2026-09-24).
+    # The foreground posterior is bimodal in alpha: walkers sit near 1.6 or
+    # near 7 on one degeneracy ridge, and both ends produce curves that agree
+    # to 4%. Taking the median COLUMN BY COLUMN across four walkers does not
+    # give either -- with a 2/2 split it builds a hybrid parameter vector
+    # (alpha ~ 4.8) whose hyperbolic tangent is not the average of two
+    # hyperbolic tangents. Measured on the 6mo store over the last 50
+    # iterations: the walkers spanned 1.04x at 3 mHz while the median curve
+    # spanned 1.81x, and the upper branch it drew sat 1.76x above anything
+    # any walker held. That branch was an artifact of this line, not the
+    # foreground moving. Plot the walkers; let the reader see the spread.
+    def _walker_noise(k):
+        """``[(psd_params, galfor_params), ...]`` for every cold walker at k."""
+        return [(psd_cold[k, w], gal_cold_phys[k, w]) for w in range(nwalk)]
+
+    # Full-run panels draw nwalk curves per iteration, so decimate the
+    # iteration axis to keep the figure legible and the PNG small.
+    _step = max(1, SUB_NIT // 250)
+    _its = list(range(0, SUB_NIT, _step))
+    if _its[-1] != SUB_NIT - 1:
+        _its.append(SUB_NIT - 1)
+
     fig, ax = plt.subplots(figsize=(11, 4.0))
-    for k in range(SUB_NIT):
-        pk_ = np.median(psd_cold[k], axis=0)
-        gk = np.median(gal_cold_phys[k], axis=0)
-        ax.plot(fr, sens_curves(pk_[0], pk_[1], gk),
-                color=ramp(k / max(SUB_NIT - 1, 1)), lw=1.1,
-                label=(f"iteration {k}" if k in (0, SUB_NIT - 1) else None))
+    for k in _its:
+        for _w, (pk_, gk) in enumerate(_walker_noise(k)):
+            ax.plot(fr, sens_curves(pk_[0], pk_[1], gk),
+                    color=ramp(k / max(SUB_NIT - 1, 1)), lw=0.8, alpha=0.55,
+                    label=(f"iteration {k}"
+                           if (_w == 0 and k in (0, SUB_NIT - 1)) else None))
     ax.plot(fr, sens_curves(*pm), color=FG, lw=1.4, ls=":",
             label="instrument only (latest)")
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xlabel("Frequency [Hz]")
     ax.set_ylabel("PSD, TDI X channel  [1/Hz]")
     ax.legend(fontsize=8, loc="upper left")
+    ax.set_title(f"PSD + foreground, all {nwalk} cold walkers per stored iteration")
     fig_b64(fig, "f11_fg")
 
     # Last-50-iterations zoom of the same plot (user request 2026-09-21).
@@ -802,20 +826,22 @@ try:
     if _last_n >= 3:
         fig, ax = plt.subplots(figsize=(11, 4.0))
         for k in range(SUB_NIT - _last_n, SUB_NIT):
-            pk_ = np.median(psd_cold[k], axis=0)
-            gk = np.median(gal_cold_phys[k], axis=0)
             # Normalize color index to the last-50 window
             _color_idx = (k - (SUB_NIT - _last_n)) / max(_last_n - 1, 1)
-            ax.plot(fr, sens_curves(pk_[0], pk_[1], gk),
-                    color=ramp(_color_idx), lw=1.1,
-                    label=(f"iteration {k}" if k in (SUB_NIT - _last_n, SUB_NIT - 1) else None))
+            for _w, (pk_, gk) in enumerate(_walker_noise(k)):
+                ax.plot(fr, sens_curves(pk_[0], pk_[1], gk),
+                        color=ramp(_color_idx), lw=0.8, alpha=0.6,
+                        label=(f"iteration {k}"
+                               if (_w == 0 and k in (SUB_NIT - _last_n,
+                                                     SUB_NIT - 1)) else None))
         ax.plot(fr, sens_curves(*pm), color=FG, lw=1.4, ls=":",
                 label="instrument only (latest)")
         ax.set_xscale("log"); ax.set_yscale("log")
         ax.set_xlabel("Frequency [Hz]")
         ax.set_ylabel("PSD, TDI X channel  [1/Hz]")
         ax.legend(fontsize=8, loc="upper left")
-        ax.set_title(f"PSD + foreground per stored iteration (last {_last_n} iterations)")
+        ax.set_title(f"PSD + foreground, all {nwalk} cold walkers "
+                     f"(last {_last_n} iterations)")
         fig_b64(fig, "f11_fg_zoom")
 except Exception as e:
     MISSING.append(f"foreground curve render failed: {e!r}")
@@ -889,17 +915,26 @@ try:
                                stochastic_function=HTGF)
 
     pm = np.median(psd_cold[-1], axis=0)
-    gm = np.median(gal_cold_phys[-1], axis=0)
+    # gm: the parameter-wise walker median. NO LONGER DRAWN (2026-09-24) --
+    # kept only because the _detect table and the SNR machinery still take
+    # a single representative noise model. See the f11_fg note.
+    gm = np.median(gal_cold_phys[-1], axis=0)  # noqa: F841
 
     # Compute injected + FittedHT foreground for comparison
     from lisatools.stochastic import (
         FittedHyperbolicTangentGalacticForeground as _FHT_sens)
     _gal_fht = _FHT_sens.specific_Sh_function(fr, SCI_TOBS)
 
+    # One curve per cold walker, not the parameter-wise median -- see the
+    # note at the f11_fg panel for why that median draws a foreground no
+    # walker holds when the alpha posterior is split.
     fig, ax = plt.subplots(figsize=(11, 4.2))
     ax.plot(fr, sens_lisasens(*pm), color=CYAN, lw=1.6, label="instrument PSD (sampled)")
-    ax.plot(fr, sens_lisasens(pm[0], pm[1], gm), color=AMBER, lw=1.6,
-            label="PSD + galactic foreground (sampled)")
+    for w in range(nwalk):
+        ax.plot(fr, sens_lisasens(psd_cold[-1, w, 0], psd_cold[-1, w, 1],
+                                  gal_cold_phys[-1, w]),
+                color=AMBER, lw=1.4, alpha=0.75,
+                label="PSD + galactic foreground (per walker)" if w == 0 else None)
     ax.plot(fr, sens_lisasens(SOMS_INJ, SA_INJ), color=RED, ls=":", lw=1.3,
             label="injected instrument")
     ax.plot(fr, sens_lisasens(SOMS_INJ, SA_INJ) + _gal_fht, color=RED, ls="-.",
@@ -907,24 +942,30 @@ try:
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xlabel("f [Hz]"); ax.set_ylabel("Sn(f) [LISASens]")
     ax.legend(fontsize=9); ax.set_title(
-        "sensitivity, cold-chain walker-median, latest stored iteration")
+        f"sensitivity, all {nwalk} cold walkers, latest stored iteration")
     fig_b64(fig, "psd_curves")
 
     ramp2 = mcolors.LinearSegmentedColormap.from_list(
         "amber", ["#FBE3B5", "#F5A623", "#8C5A00"])
+    _step2 = max(1, SUB_NIT // 250)
+    _its2 = list(range(0, SUB_NIT, _step2))
+    if _its2[-1] != SUB_NIT - 1:
+        _its2.append(SUB_NIT - 1)
     fig, ax = plt.subplots(figsize=(11, 4.2))
     ax.plot(fr, sens_lisasens(*pm), color=CYAN, lw=1.4,
             label="instrument PSD (latest)")
-    for k in range(SUB_NIT):
-        pk_ = np.median(psd_cold[k], axis=0)
-        gk = np.median(gal_cold_phys[k], axis=0)
-        ax.plot(fr, sens_lisasens(pk_[0], pk_[1], gk),
-                color=ramp2(k / max(SUB_NIT - 1, 1)), lw=1.1,
-                label=f"iter {k}" if k in (0, SUB_NIT - 1) else None)
+    for k in _its2:
+        for w in range(nwalk):
+            ax.plot(fr, sens_lisasens(psd_cold[k, w, 0], psd_cold[k, w, 1],
+                                      gal_cold_phys[k, w]),
+                    color=ramp2(k / max(SUB_NIT - 1, 1)), lw=0.8, alpha=0.55,
+                    label=(f"iter {k}"
+                           if (w == 0 and k in (0, SUB_NIT - 1)) else None))
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xlabel("f [Hz]"); ax.set_ylabel("Sn(f) [LISASens]")
     ax.legend(); ax.set_title(
-        "PSD + foreground per stored iteration (light -> dark = later)")
+        f"PSD + foreground, all {nwalk} cold walkers per stored iteration "
+        "(light -> dark = later)")
     fig_b64(fig, "psd_evolution")
 
     # Last 50 iterations zoom
@@ -934,16 +975,19 @@ try:
         ax.plot(fr, sens_lisasens(*pm), color=CYAN, lw=1.4,
                 label="instrument PSD (latest)")
         for k in range(SUB_NIT - _last_n, SUB_NIT):
-            pk_ = np.median(psd_cold[k], axis=0)
-            gk = np.median(gal_cold_phys[k], axis=0)
             _color_idx = (k - (SUB_NIT - _last_n)) / max(_last_n - 1, 1)
-            ax.plot(fr, sens_lisasens(pk_[0], pk_[1], gk),
-                    color=ramp2(_color_idx), lw=1.1,
-                    label=(f"iter {k}" if k in (SUB_NIT - _last_n, SUB_NIT - 1) else None))
+            for w in range(nwalk):
+                ax.plot(fr, sens_lisasens(psd_cold[k, w, 0], psd_cold[k, w, 1],
+                                          gal_cold_phys[k, w]),
+                        color=ramp2(_color_idx), lw=0.8, alpha=0.6,
+                        label=(f"iter {k}"
+                               if (w == 0 and k in (SUB_NIT - _last_n,
+                                                    SUB_NIT - 1)) else None))
         ax.set_xscale("log"); ax.set_yscale("log")
         ax.set_xlabel("f [Hz]"); ax.set_ylabel("Sn(f) [LISASens]")
         ax.legend(); ax.set_title(
-            f"PSD + foreground, last {_last_n} stored iterations (light -> dark = later)")
+            f"PSD + foreground, all {nwalk} cold walkers, last {_last_n} "
+            "stored iterations (light -> dark = later)")
         fig_b64(fig, "psd_evolution_zoom")
 except Exception as e:
     MISSING.append(f"LISASens curve render failed: {e!r}")
@@ -2008,8 +2052,15 @@ try:
     from lisatools.stochastic import (
         HyperbolicTangentGalacticForeground as _HTGF,
         FittedHyperbolicTangentGalacticForeground as _FHT)
-    _pm = np.median(psd_cold[-1], axis=0)
-    _gm = np.median(gal_cold_phys[-1], axis=0)
+    # WBEST's OWN noise, not the walker median (2026-09-24). The data,
+    # templates and residual on this panel are all built from cold walker
+    # WBEST, so the noise curve drawn over them has to be the one THAT
+    # walker's likelihood used. The parameter-wise median is a different
+    # model -- with the alpha posterior split it is not even a model any
+    # walker holds -- so overlaying it invited exactly the "residual sits
+    # above the curve" reading that is really a mismatched pairing.
+    _pm = psd_cold[-1, WBEST]
+    _gm = gal_cold_phys[-1, WBEST]
     _lmod = lisa_models.LISAModel(_pm[0] ** 2, _pm[1] ** 2,
                                   lisa_models.DefaultOrbits(), "sampled")
     _fpos = np.maximum(_fr, FDS.df)

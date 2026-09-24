@@ -753,13 +753,21 @@ try:
     ramp = mcolors.LinearSegmentedColormap.from_list(
         "amber", ["#FBE3B5", "#F5A623", "#8C5A00"])
     pm = np.median(psd_cold[-1], axis=0)
+    # ALL WALKERS, never the parameter-wise median (2026-09-24): with the
+    # foreground posterior split in alpha, a column-by-column median across
+    # walkers builds a hybrid parameter vector whose curve no walker holds.
+    # Measured on the 6mo store: walkers spanned 1.04x at 3 mHz, the median
+    # curve spanned 1.81x. See gf_monitor_gen.py for the full note.
+    _step = max(1, SUB_NIT // 250)
+    _its = sorted(set(list(range(0, SUB_NIT, _step)) + [SUB_NIT - 1]))
     fig, ax = plt.subplots(figsize=(11, 4.0))
-    for k in range(SUB_NIT):
-        pk_ = np.median(psd_cold[k], axis=0)
-        gk = np.median(gal_cold[k], axis=0)
-        ax.plot(fr, sens_curves(pk_[0], pk_[1], gk),
-                color=ramp(k / max(SUB_NIT - 1, 1)), lw=1.1,
-                label=(f"iteration {k}" if k in (0, SUB_NIT - 1) else None))
+    for k in _its:
+        for w in range(nwalk):
+            ax.plot(fr, sens_curves(psd_cold[k, w, 0], psd_cold[k, w, 1],
+                                    gal_cold[k, w]),
+                    color=ramp(k / max(SUB_NIT - 1, 1)), lw=0.8, alpha=0.55,
+                    label=(f"iteration {k}"
+                           if (w == 0 and k in (0, SUB_NIT - 1)) else None))
     ax.plot(fr, sens_curves(*pm), color=FG, lw=1.4, ls=":",
             label="instrument only (latest)")
     ax.set_xscale("log"); ax.set_yscale("log")
@@ -833,14 +841,17 @@ try:
     gm = np.median(gal_cold[-1], axis=0)
     fig, ax = plt.subplots(figsize=(11, 4.2))
     ax.plot(fr, sens_lisasens(*pm), color=CYAN, lw=1.6, label="instrument PSD")
-    ax.plot(fr, sens_lisasens(pm[0], pm[1], gm), color=AMBER, lw=1.6,
-            label="PSD + galactic foreground")
+    for w in range(nwalk):
+        ax.plot(fr, sens_lisasens(psd_cold[-1, w, 0], psd_cold[-1, w, 1],
+                                  gal_cold[-1, w]),
+                color=AMBER, lw=1.4, alpha=0.75,
+                label="PSD + galactic foreground (per walker)" if w == 0 else None)
     ax.plot(fr, sens_lisasens(SOMS_INJ, SA_INJ), color=RED, ls=":", lw=1.3,
             label="injected instrument")
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xlabel("f [Hz]"); ax.set_ylabel("Sn(f) [LISASens]")
     ax.legend(); ax.set_title(
-        "sensitivity, cold-chain walker-median, latest stored iteration")
+        f"sensitivity, all {nwalk} cold walkers, latest stored iteration")
     fig_b64(fig, "psd_curves")
 
     ramp2 = mcolors.LinearSegmentedColormap.from_list(
@@ -848,12 +859,13 @@ try:
     fig, ax = plt.subplots(figsize=(11, 4.2))
     ax.plot(fr, sens_lisasens(*pm), color=CYAN, lw=1.4,
             label="instrument PSD (latest)")
-    for k in range(SUB_NIT):
-        pk_ = np.median(psd_cold[k], axis=0)
-        gk = np.median(gal_cold[k], axis=0)
-        ax.plot(fr, sens_lisasens(pk_[0], pk_[1], gk),
-                color=ramp2(k / max(SUB_NIT - 1, 1)), lw=1.1,
-                label=f"iter {k}" if k in (0, SUB_NIT - 1) else None)
+    for k in _its:
+        for w in range(nwalk):
+            ax.plot(fr, sens_lisasens(psd_cold[k, w, 0], psd_cold[k, w, 1],
+                                      gal_cold[k, w]),
+                    color=ramp2(k / max(SUB_NIT - 1, 1)), lw=0.8, alpha=0.55,
+                    label=(f"iter {k}"
+                           if (w == 0 and k in (0, SUB_NIT - 1)) else None))
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xlabel("f [Hz]"); ax.set_ylabel("Sn(f) [LISASens]")
     ax.legend(); ax.set_title(
