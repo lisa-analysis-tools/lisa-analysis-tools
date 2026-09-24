@@ -98,8 +98,17 @@ class EigenTablesTest(unittest.TestCase):
         axes, sigmas = m._eigen_inner._tables["psd"]
         self.assertEqual(axes.shape, (NT, 1, 1, 2, 2))
         self.assertEqual(sigmas.shape, (NT, 1, 1, 2))
+        # Since the 2026-09-18 cold-scope ruling the table is built ONCE on
+        # the cold row and shared up the ladder, with the sigmas widened by
+        # 1/sqrt(beta) per rung -- EigenAxisMove applies no beta scaling of
+        # its own, so a cold sigma handed to a hot rung would step sqrt(T)
+        # too small. The COLD rung still recovers the quadratic exactly.
+        betas = np.asarray(m.temperature_control.betas, dtype=float)
         for t in range(NT):
-            np.testing.assert_allclose(np.sort(sigmas[t, 0, 0]), [0.5, 1.0], rtol=1e-3)
+            widen = 1.0 / np.sqrt(betas[t]) if betas[t] > 0 else 1.0
+            np.testing.assert_allclose(
+                np.sort(sigmas[t, 0, 0]), np.array([0.5, 1.0]) * widen, rtol=1e-3
+            )
             A = np.abs(axes[t, 0, 0])  # columns are +-e_i in some order
             np.testing.assert_allclose(A @ A.T, np.eye(2), atol=1e-3)
             np.testing.assert_allclose(np.sort(A.ravel()), [0.0, 0.0, 1.0, 1.0], atol=1e-3)

@@ -144,6 +144,29 @@ class PSDSettings(Settings):
     eigen_eps_rel: float = dataclasses.field(
         default_factory=env_default("PSD_EIGEN_EPS_REL", 1e-4, float)
     )
+    # --- tiled per-walker ensemble search (SEARCH stages only) ---------------
+    # See the matching block on GalForSettings for the rationale. 10 repeats
+    # clears eryn's red/blue floor of 2*ndim for the psd branch's 4 columns
+    # with room to spare.
+    ensemble_search: bool = dataclasses.field(
+        default_factory=env_default("PSD_ENSEMBLE_SEARCH", False, bool)
+    )
+    ensemble_repeats: int = dataclasses.field(
+        default_factory=env_default("PSD_ENSEMBLE_REPEATS", 10, int)
+    )
+    ensemble_spread_lo: float = dataclasses.field(
+        default_factory=env_default("PSD_ENSEMBLE_SPREAD_LO", 1.0, float)
+    )
+    ensemble_spread_hi: float = dataclasses.field(
+        default_factory=env_default("PSD_ENSEMBLE_SPREAD_HI", 10.0, float)
+    )
+    ensemble_scale0: float = dataclasses.field(
+        default_factory=env_default("PSD_ENSEMBLE_SCALE0", 1e-3, float)
+    )
+    ensemble_scale_tries: int = dataclasses.field(
+        default_factory=env_default("PSD_ENSEMBLE_SCALE_TRIES", 4, int)
+    )
+
 
 class PSDSetup(Setup):
     """:class:`Setup` for the instrumental PSD branch in the Erebor recipe.
@@ -463,6 +486,38 @@ class GalForSettings(Settings):
     )
     eigen_eps_rel: float = dataclasses.field(
         default_factory=env_default("GALFOR_EIGEN_EPS_REL", 1e-4, float)
+    )
+    # --- tiled per-walker ensemble search (SEARCH stages only) ---------------
+    # A one-walker block has no stretch complement, so the inner proposal
+    # falls back to `eigen` -- and that path returned a non-positive
+    # information matrix on 34 of 55 galfor builds on the live 3-month run.
+    # With this on, each walker gets its own inner ensemble of
+    # `ensemble_repeats` tiled copies, which manufactures a complement and
+    # takes the information matrix off the SEARCH critical path entirely.
+    # Only fires inside a search stage (PSDMove._ensemble_search_active);
+    # PE is untouched. 10 repeats is eryn's red/blue floor of 2*ndim for
+    # galfor's 5 columns.
+    ensemble_search: bool = dataclasses.field(
+        default_factory=env_default("GALFOR_ENSEMBLE_SEARCH", False, bool)
+    )
+    ensemble_repeats: int = dataclasses.field(
+        default_factory=env_default("GALFOR_ENSEMBLE_REPEATS", 10, int)
+    )
+    # Closed loop on the MEASURED logL spread: perturb, score, rescale until
+    # each walker's inner ensemble spans [lo, hi] logL. `scale0` is the
+    # opening guess as a fraction of the prior box width -- safe at O(1) now
+    # that GALFOR_LOG_SAMPLING makes the columns O(1) wide.
+    ensemble_spread_lo: float = dataclasses.field(
+        default_factory=env_default("GALFOR_ENSEMBLE_SPREAD_LO", 1.0, float)
+    )
+    ensemble_spread_hi: float = dataclasses.field(
+        default_factory=env_default("GALFOR_ENSEMBLE_SPREAD_HI", 10.0, float)
+    )
+    ensemble_scale0: float = dataclasses.field(
+        default_factory=env_default("GALFOR_ENSEMBLE_SCALE0", 1e-3, float)
+    )
+    ensemble_scale_tries: int = dataclasses.field(
+        default_factory=env_default("GALFOR_ENSEMBLE_SCALE_TRIES", 4, int)
     )
 
 
