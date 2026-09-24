@@ -7,13 +7,18 @@ real ``allgather``. It catches anything that only works because FakeWorld's
 
     export GF_GPU_ROUTING=1                   # the routing is OPT-IN
     export GF_LAYOUT_DRY_RUN=1 GPUS=""        # CPU: no GPU-pool capacity check
+    NWALKERS=2 mpiexec --oversubscribe -n 5 python gf_layout_preflight_mpi.py
+
+``LAT_SRC`` is OPTIONAL and normally unset: on a plain checkout the installed
+``lisatools`` is the one under test, and pinning a path would be a way to
+preflight code the run will not use.
+
     export LAT_SRC=<worktree>/src
     # IN A WORKTREE, the .wtenv shim is REQUIRED: the editable install's
     # meta-path finder hard-maps every ``lisatools.*`` module to the MAIN
     # checkout and beats sys.path, so without these two the script silently
     # imports the installed package and tests the wrong code.
     export PYTHONPATH=<worktree>/.wtenv LAT_WORKTREE_SRC=$LAT_SRC
-    NWALKERS=2 mpiexec --oversubscribe -n 5 python gf_layout_preflight_mpi.py
 
 Prints the resolved factorization, asserts every rank agrees on
 ``layout.digest()``, and dumps the per-rank table. ``GPUS=0,1`` instead
@@ -29,7 +34,8 @@ Nothing here builds a fit or touches a store.
 """
 import os, sys
 from mpi4py import MPI
-sys.path.insert(0, os.environ["LAT_SRC"])
+if os.environ.get("LAT_SRC"):
+    sys.path.insert(0, os.environ["LAT_SRC"])
 from lisatools.globalfit.communication.ranks import build_layout, layout_dry_run
 
 comm = MPI.COMM_WORLD

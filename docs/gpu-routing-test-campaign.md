@@ -27,13 +27,14 @@ an allocation and tells you nothing about the layout.
 | **G0** | Unit suites | laptop, CPU, 1 core | **~1 min** | yes |
 | **G1** | Real-MPI layout preflight | laptop, CPU, 5 procs | **~10 s** | yes |
 | **G2** | FakeWorld smokes at both axes | laptop, CPU | **~3 min** | yes |
-| **G3** | Cluster dry runs at 4/8/16/32 | login node, no alloc | **~1 min** | yes |
+| **G3a** | Factorization + real-MPI agreement | login node, **no alloc** | **~1 min** | yes |
+| **G3b** | Placement dry runs at 4/8/16/32 | brief alloc (seconds each) | **~5 min** | yes |
 | **G4** | Three-factorization parity | 1 node × 2 GPUs, interactive | **~30 min** | yes |
 | **G5** | **T5 scaling readout** (R = 1/2/4) | 2 nodes × 2 GPUs | **~1 h** | **the decision gate** |
 | **G6** | Short production shape | target allocation | **2-4 h** | before a long run |
 
 Total to a go/no-go on the replica axis: **~2 GPU-hours**, essentially all of
-it in G5. G0-G3 are free.
+it in G5. G0-G3a are free; G3b costs seconds of an allocation.
 
 ---
 
@@ -124,7 +125,42 @@ of scope for this work. **Attribute before chasing:** the cheap check is
 > is on the machine. On a larger box this caution does not apply.
 > Never run `tests/test_gbspecial_flow.py` here at all (8-26 GB balloon).
 
-## G3 — cluster dry runs (login node, no allocation, ~1 min)
+## G3a — factorization and agreement (login node, genuinely free, ~1 min)
+
+Two questions, neither needing a GPU. First, **what shape does a given
+(NWALKERS, NGPUS) resolve to** — the pure rule, no MPI at all:
+
+```bash
+GF_GPU_ROUTING=1 python -c "
+from lisatools.globalfit.communication import factorize_layout as f
+for nw in (4, 24):
+    for ng in (4, 8, 16, 32):
+        nb, R, b = f(nw, ng)
+        print(f'NWALKERS={nw:2d} NGPUS={ng:2d} -> {nb:2d} block(s) x {b} walker(s), R={R}')
+"
+```
+
+Second, **do independent processes agree** — real mpi4py, real `allgather`,
+on CPU (`GPUS=""` skips the per-node pool capacity check):
+
+```bash
+export GF_GPU_ROUTING=1 GF_LAYOUT_DRY_RUN=1 GPUS=""
+for NW in 4 2 1 6; do
+  NWALKERS=$NW mpiexec -n 5 python scripts/diagnostics/gf_layout_preflight_mpi.py \
+    2>&1 | grep '^###'
+done
+```
+
+**Pass:** every line reads `gpu_routing=on` and `all ranks agree ... True`.
+Run the same loop with `GF_GPU_ROUTING` unset and NWALKERS 2 and 6 must
+REFUSE, naming the knob — that is the opt-in working.
+
+## G3b — placement dry runs (brief allocation, ~5 min)
+
+The submit script **self-dispatches with `exec sbatch`**, so these SUBMIT —
+they do not run on the login node. Each job exits within seconds (the dry
+run stops before `fit.build()` allocates), but it is an allocation, not
+free:
 
 ```bash
 GF_LAYOUT_DRY_RUN=1 NWALKERS=4  NGPUS=16 ./submit_gf_6mo_v8_gpurouting.sh
@@ -132,10 +168,11 @@ GF_LAYOUT_DRY_RUN=1 NWALKERS=24 NGPUS=8  ./submit_gf_6mo_v8_gpurouting.sh
 GF_LAYOUT_DRY_RUN=1 NWALKERS=24 NGPUS=32 ./submit_gf_6mo_v8_gpurouting.sh
 ```
 
-Free, and it catches every placement error before an allocation is spent —
-including the recorded `I_MPI_JOB_RESPECT_PROCESS_PLACEMENT=0` trap, where
-SLURM's block split puts more compute ranks on a node than its GPU pool
-holds. **Pass:** the expected `n_blocks`/`R`, and each block's R ranks on ONE
+This is the step that catches PLACEMENT, which G3a cannot: which node gets
+which rank, and whether that node's GPU pool can host them — including the
+recorded `I_MPI_JOB_RESPECT_PROCESS_PLACEMENT=0` trap, where SLURM's block
+split puts more compute ranks on a node than its pool holds. **Pass:** the
+expected `n_blocks`/`R` in the job's log, and each block's R ranks on ONE
 node (that is what `--distribution=block:block` is for).
 
 ## G4 — three-factorization parity (1 node × 2 GPUs, ~30 min)
