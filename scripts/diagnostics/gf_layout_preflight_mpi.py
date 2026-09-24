@@ -69,14 +69,37 @@ except Exception as exc:
               f"RANKS_PER_BLOCK={rpb or 'AUTO'}: {type(exc).__name__}: {exc}",
               flush=True)
         traceback.print_exc()
+    # NO Barrier HERE. build_layout raises the same ValueError on every rank
+    # (the rule is pure and every rank has identical inputs), but if that ever
+    # became one-sided, a Barrier in the error path would turn a clear failure
+    # into a HANG -- strictly worse than interleaved output.
     sys.stdout.flush()
-    comm.Barrier()
+    sys.stderr.flush()
     sys.exit(1)
 if _rank == 0:
     print(f"### nwalkers={nw} n_compute={lay.n_compute} "
           f"n_blocks={lay.n_blocks} R={lay.ranks_per_block} block={lay.block} "
           f"gpu_routing={'on' if lay.gpu_routing else 'OFF(legacy)'}", flush=True)
 digests = comm.allgather(lay.digest())
-if comm.Get_rank() == 0:
-    print("### all ranks agree on the layout:", len(set(digests)) == 1)
-layout_dry_run(lay, comm)
+if _rank == 0:
+    print("### all ranks agree on the layout:", len(set(digests)) == 1, flush=True)
+
+
+def _say(*a):
+    """FLUSHING printer for layout_dry_run.
+
+    Every print in this script flushes, and that is not fussiness. Python
+    block-buffers stdout when it is a PIPE rather than a tty, so
+    ``mpiexec ... | grep`` buffers a few hundred bytes and holds them -- and
+    if the job then dies (an MPI abort SIGKILLs the siblings), the buffer
+    goes with it. The command prints NOTHING, which reads as "no output, so
+    nothing happened" when it actually means "it died before flushing".
+    Exactly how this script appeared to do nothing on the cluster on
+    2026-09-23. ``python -u`` fixes it from the caller's side; this fixes it
+    from the script's, so no runbook has to remember.
+    """
+    print(*a, flush=True)
+
+
+layout_dry_run(lay, comm, out=_say)
+sys.stdout.flush()
