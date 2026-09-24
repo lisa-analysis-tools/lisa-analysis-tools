@@ -155,6 +155,42 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         source, so the ceiling is the only bound."""
         self.assertGreater(int(self.v9["GB_INMODEL_GROUP_MAX_PASSES"]), 0)
 
+    # -- V9-7: permuted ("fancy") swaps off, vertical KEPT ---------------
+    def test_fancy_tempering_is_off_but_vertical_survives(self):
+        """⚠ Killing run_tempering must NOT take the vertical rung swaps
+        with it. They are additive to the permuted swaps, not part of
+        them, and they are the transport the in-model convergence depends
+        on -- AND, since _adapt_band_temps is only ever called from
+        run_tempering, they are now the only thing keeping the temperature
+        ladder from freezing for the whole run."""
+        self.assertEqual(self.v9["GB_RUN_FANCY_TEMPERING"], "0")
+        self.assertEqual(self.v9["GB_TEMPER_VERTICAL"], "1")
+
+    # -- V9-8: the standalone in-model move is actually BUILT -------------
+    def test_the_pure_in_model_move_is_armed(self):
+        """Without this the group-convergence knobs are exported, ignored,
+        and nothing ever logs [GB_IMGROUP] -- the move is not built and not
+        scheduled. This pair is what makes V9-6 reachable at all."""
+        self.assertEqual(self.v9["GB_SEARCH_IN_MODEL"], "1")
+        self.assertEqual(self.v9["GB_NUM_REPEAT_PROPOSALS"], "25")
+        self.assertNotIn("GB_SEARCH_IN_MODEL", self.v8)
+
+    # -- V9-9: the stage-convergence valve --------------------------------
+    def test_the_stage_shutoff_valve_is_on_and_the_band_schedule_is_not(self):
+        """SNR limits move per recipe STAGE in v9, never per band, so the
+        per-band stage schedule must stay out of the way. Independent
+        flags; pinned together because arming both would have the two
+        fighting over the same thresholds."""
+        self.assertEqual(self.v9["GB_SEARCH_BAND_SHUTOFF_PER_WALKER"], "1")
+        self.assertEqual(self.v9["GB_SEARCH_STAGE_PER_WALKER"], "0")
+
+    # -- V9-10: refit cadence ---------------------------------------------
+    def test_the_pe_refit_cadence_is_separate_and_longer(self):
+        """full_pe is a random_choice stage; a search-tuned cadence there
+        refits far more often in wall-clock terms than the number says."""
+        self.assertEqual(self.v9["GB_FSTAT_REFIT_EVERY_PE"], "250")
+        self.assertEqual(self.v9["GB_FSTAT_REFIT_EVERY"], "40")
+
     # -- V9-4: cap cells off --------------------------------------------
     def test_the_leaf_cap_is_off_and_its_companions_with_it(self):
         """User ruling 2026-09-24: "no caps. Keep all those options
@@ -205,6 +241,13 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             "GB_LEAF_CAP_START", "GB_CAP_DRIFT_GATE",
             "GB_CAP_DRIFT_GATE_EDGE_LEAK", "GB_SEARCH_CAP_QUIESCENT",
             "GB_SEARCH_RJ_FLIP_FRACTION",           # V9-5
+            "GB_RUN_FANCY_TEMPERING",               # V9-7
+            "GB_SEARCH_IN_MODEL",                   # V9-8
+            "GB_NUM_REPEAT_PROPOSALS",              # V9-8
+            "GB_SEARCH_BAND_SHUTOFF_PER_WALKER",    # V9-9
+            "GB_SEARCH_BAND_SHUTOFF_CONV_ITER",     # V9-9
+            "GB_SEARCH_STAGE_PER_WALKER",           # V9-9
+            "GB_FSTAT_REFIT_EVERY_PE",              # V9-10
         }
         drift = {
             k: (self.v8.get(k), self.v9.get(k))
