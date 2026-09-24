@@ -1215,6 +1215,15 @@ export GB_INMODEL_CONVERGE_CLASSES=newborn
 # moves only -- armed on an RJ move it logs a warning and does nothing,
 # because on an RJ pass a flat sub-band logL means the BIRTHS stopped
 # paying, which is the stage valve's decision, not this one's.
+# ⚠ THE GROUP RULE IS DEAD WITHOUT THIS PAIR. The move it lives on is the
+# PURE in-model move, which is built only when search_in_model is set and
+# is otherwise absent from the stage entirely -- so with GB_SEARCH_IN_MODEL
+# unset the knobs below are exported, ignored, and nothing logs [GB_IMGROUP]
+# at all. That is exactly the silent no-op the preflight exists to catch.
+export GB_SEARCH_IN_MODEL=1
+# Repeats per source per PASS of that move (the group rule then decides how
+# many passes). 25 per the user's structure.
+export GB_NUM_REPEAT_PROPOSALS=25
 export GB_INMODEL_GROUP=1
 # W in PASSES (not repeats): one pass is already GB_NUM_REPEAT_PROPOSALS
 # repeats per source, so the per-pass gain is a far coarser quantity than
@@ -1311,6 +1320,28 @@ refill=${GB_INMODEL_CONVERGE_REFILL} classes=${GB_INMODEL_CONVERGE_CLASSES}"
 # once-per-iteration permuted swaps. Known approximation: a mid-block
 # vertical swap exchanges occupancy without updating the drift-gate
 # census (self-corrects next block). =0 reverts.
+# ===========================================================================
+# V9-7: PERMUTED ("FANCY") BAND-TEMPERATURE SWAPS OFF (user ruling
+# 2026-09-24: "make sure the run_tempering is entirely turned off because
+# we have no fancy swaps").
+# ===========================================================================
+# ⚠ THIS IS THE ONLY RELIABLE OFF SWITCH, and the obvious candidates are
+# both traps:
+#   * GB_TEMPER_EVERY_PROPOSES only THROTTLES. In _temper_cadence_fire,
+#     `n <= 1` returns True unconditionally, so 0 means "fire on EVERY
+#     eligible propose" -- the exact opposite of off.
+#   * per-move run_swaps= is set from several different expressions in the
+#     recipe (`_temper_all_moves or not _temper_on_removal`, hard False on
+#     some moves), so there is no single recipe value to flip.
+# GB_RUN_FANCY_TEMPERING=0 forces run_swaps False for every GB move at once, at
+# the one choke point in the constructor, and logs once that it did.
+export GB_RUN_FANCY_TEMPERING=0
+# ⚠ AND NOTE WHAT THIS DOES **NOT** TOUCH: the per-repeat VERTICAL rung
+# swaps below. They live inside the in-model loop, are ADDITIVE to the
+# permuted swaps rather than part of them, and are the transport the
+# in-model convergence work depends on -- killing the fancy swaps must not
+# silently take them too. They stay ON.
+# ===========================================================================
 export GB_TEMPER_VERTICAL=1
 
 # PERMUTED-SWAP CADENCE 3 -> 1 (user ruling 2026-08-26): fire the
@@ -2161,6 +2192,22 @@ export GB_LEAF_CAP_START=
 # silently overridden by the later one. Search V9-4 to find them all.
 # ===========================================================================
 export GB_SEARCH_CAP_QUIESCENT=0   # V9-4: cap off -> nothing to hold for
+
+# ===========================================================================
+# V9-9: PER-(WALKER, BAND) RJ SHUTOFF VALVE -- the STAGE convergence signal.
+# ===========================================================================
+# A (walker, band) pair freezes when its sub-band cold-chain logL converges
+# within the current recipe step, and the valve RELEASES when the next step
+# begins. A search stage ends when EVERY OCCUPIED pair has shut off (user's
+# words) -- empty pairs can never shut off by construction, so "all pairs"
+# is unreachable and the occupied-only reading is the operative one.
+export GB_SEARCH_BAND_SHUTOFF_PER_WALKER=1
+export GB_SEARCH_BAND_SHUTOFF_CONV_ITER=5
+# ⚠ OFF, deliberately: this is the PER-BAND stage schedule (SNR limits and
+# phase maximization moving independently per band). In v9 those move
+# together across RECIPE stages instead, so the per-band schedule must stay
+# out of the way. The two are independent flags.
+export GB_SEARCH_STAGE_PER_WALKER=0
 # RJRecipeStep plateau window (user ruling 2026-09-19). The code default is
 # 5, and at FOUR walkers that is too tight. The rule is a running-maximum
 # ratchet (recipe.py::RJRecipeStep._stop_fn): max of the cold leaf count
@@ -2740,7 +2787,17 @@ export GB_TEMPER_SKIP_SHUTOFF_BANDS=1
 # Epochs 0/8/9 were 13513 / 19413 / 19586 peaks, all GB-free. Under the
 # change the count should start falling, and stage-B wall time with it
 # (epoch 8 was 4054 s).
-export GB_FSTAT_REFIT_EVERY=40     # production cadence (5 was verify-only)
+export GB_FSTAT_REFIT_EVERY=40     # SEARCH stages: 40 ELAPSED iterations
+# PE-STAGE CADENCE (user ruling 2026-09-24): 250 elapsed iterations.
+# Separate from the search value because full_pe is a RANDOM_CHOICE stage --
+# the GB move is drawn roughly one iteration in N, so a search-tuned cadence
+# there refits far more often in wall-clock terms than the number suggests.
+# ⚠ THE CLOCK'S UNITS CHANGED WITH THIS: it counts ELAPSED iterations now,
+# not "iterations this branch was proposed in". In a sequential stage
+# (gb_search) the two coincide exactly, so 40 above is unchanged in meaning;
+# in full_pe the old clock ticked ~1/N as fast and the knob silently meant N
+# times more iterations than it said.
+export GB_FSTAT_REFIT_EVERY_PE=250
 export FSTAT_PEAKS_PER_BAND=200    # per-sub-band peak cap (code default; explicit)
 # STAGE-B STACK CHUNKING -- fixes the 2026-09-21 epoch-9 OOM.
 # StackedFStatProposal4D.__init__ corner-averages the ENTIRE K-box 4-D grid

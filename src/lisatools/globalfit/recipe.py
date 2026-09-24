@@ -3304,6 +3304,15 @@ def build_gb_moves(
     _fit_in_move = bool(getattr(gb_info, "fstat_fit_in_move", False))
     _RJBirth = GBSpecialRJFStatGridMove if _fit_in_move else GBSpecialRJPriorMove
     _fit_kwargs = {}
+    # PE-STAGE REFIT CADENCE (user ruling 2026-09-24): 250 ELAPSED
+    # iterations in PE, against the search stages' own value. Separate
+    # because full_pe is a random_choice stage -- the GB move is drawn
+    # roughly one iteration in N, so a search-tuned cadence there would
+    # refit far more often in wall-clock terms than the number suggests
+    # (and, before the clock was changed to count elapsed iterations,
+    # far LESS often than it said). Unset -> the shared value -> today's
+    # behaviour.
+    _refit_pe = int(os.environ.get("GB_FSTAT_REFIT_EVERY_PE", "250"))
     if _fit_in_move:
         _fit_dir = getattr(gb_info, "fstat_fit_dir", "") or os.path.join(
             os.path.dirname(str(general_info.main_file_path)), "gb_fstat_fit")
@@ -3812,7 +3821,7 @@ def build_gb_moves(
         *gb_move_args,
         rj_proposal_distribution=(None if _fit_in_move else _rj_birth_prop),
         **({"is_rj_prop": True} if _fit_in_move else {}),
-        **_fit_kwargs,
+        **{**_fit_kwargs, "fstat_refit_every": _refit_pe},
         name="rj_fstat_pe",
         use_prior_removal=False,  # gb_info["pe_info"]["use_prior_removal"],
         # NEVER in full_pe unless GB_PE_PHASE_MAXIMIZE=1 asks for it by name
@@ -3962,7 +3971,7 @@ def build_gb_moves(
             *gb_move_args,
             rj_proposal_distribution=(None if _fit_in_move else _rj_birth_prop),
             **({"is_rj_prop": True} if _fit_in_move else {}),
-            **_fit_kwargs,
+            **{**_fit_kwargs, "fstat_refit_every": _refit_pe},
             name="rj_replace_pe",
             rj_replace=True,
             # NEVER phase-maximize the RJ birth machinery here (the

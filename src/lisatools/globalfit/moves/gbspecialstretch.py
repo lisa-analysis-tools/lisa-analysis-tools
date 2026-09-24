@@ -25008,8 +25008,27 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         if it is None:
             counts[branch] = int(counts.get(branch, 0)) + 1
         elif seen.get(branch) != it:
+            # ELAPSED iterations, not iterations-this-branch-was-proposed-in
+            # (user ruling 2026-09-24, for PE). Advance by the GAP since the
+            # last stamp this branch saw, so the clock measures wall-clock
+            # sampler progress rather than this move's own firing rate.
+            #
+            # WHY IT MATTERS, and why it is a PE-only change in practice:
+            # in a SEQUENTIAL stage (gb_search) the GB move fires every
+            # iteration, so the gap is always 1 and this is bit-identical
+            # to the += 1 it replaces. In a RANDOM_CHOICE stage (full_pe)
+            # one wrapped move is drawn per step, so the move ran ~1/N of
+            # iterations and the old clock ticked ~1/N as fast -- making
+            # GB_FSTAT_REFIT_EVERY mean N times more iterations there than
+            # the number said. The knob now means the same thing in both.
+            #
+            # First stamp for a branch advances by 1, not by ``it``: the
+            # clock is a cadence counter, not an absolute iteration index,
+            # and it is seeded from the journal across restarts.
+            _prev = seen.get(branch)
+            _gap = 1 if _prev is None else max(int(it) - int(_prev), 1)
             seen[branch] = it
-            counts[branch] = int(counts.get(branch, 0)) + 1
+            counts[branch] = int(counts.get(branch, 0)) + _gap
         root = self._fstat_root
         path = os.path.join(root, self._FSTAT_CLOCK_BASENAME)
         if root not in GBSpecialRJFStatGridMove._fstat_clock_seeded:

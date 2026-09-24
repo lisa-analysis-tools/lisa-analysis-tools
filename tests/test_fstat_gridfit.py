@@ -617,20 +617,46 @@ class FitDecisionTest(unittest.TestCase):
         self.s.gf_iteration = 8
         self.assertEqual(self.s._fstat_clock(), 2)   # next iteration: one tick
 
-    def test_clock_counts_iterations_not_stamp_gaps(self):
-        """A skipped iteration advances the clock by ONE, not by the gap.
+    def test_clock_counts_ELAPSED_iterations_not_proposed_in_ones(self):
+        """A skipped iteration advances the clock by the GAP.
 
-        Documented behaviour of ``_branch_iteration_counts``: "distinct
-        global-fit ITERATIONS this branch has been proposed in". A move that
-        full_pe's ``random_choice`` passes over for five iterations comes back
-        with a stamp five higher and still ticks once, so the clock is a
-        proposed-in-iteration count rather than a wall-clock iteration count.
-        Pinned so the distinction is a decision on record, not an accident.
+        USER RULING 2026-09-24 (for PE), REVERSING what this test pinned
+        when it was written hours earlier. The clock was "distinct
+        global-fit iterations this branch has been PROPOSED IN"; it is now
+        ELAPSED iterations.
+
+        WHY THE REVERSAL. In a sequential stage (gb_search) the GB move
+        fires every iteration, so the gap is always 1 and the two
+        definitions coincide -- the change is bit-identical there. In a
+        random_choice stage (full_pe) one wrapped move is drawn per step,
+        so the move ran ~1/N of iterations and the old clock ticked ~1/N as
+        fast: GB_FSTAT_REFIT_EVERY meant N times MORE elapsed iterations
+        than the number said, in the one stage the knob's own docstring
+        cited as its motivation. Elapsed makes the knob mean the same thing
+        in every stage.
+
+        A move that full_pe passes over for five iterations comes back with
+        a stamp five higher and now advances the clock by five.
         """
         self.s.gf_iteration = 0
         self.assertEqual(self.s._fstat_clock(), 1)
         self.s.gf_iteration = 6          # five iterations went to other moves
-        self.assertEqual(self.s._fstat_clock(), 2)
+        self.assertEqual(self.s._fstat_clock(), 7)
+
+    def test_a_sequential_stage_is_unchanged_by_the_elapsed_clock(self):
+        """The reversal above must be a NO-OP where the move fires every
+        iteration -- i.e. in gb_search, which is the stage v9 relies on."""
+        for k, it in enumerate(range(0, 6)):
+            self.s.gf_iteration = it
+            self.assertEqual(self.s._fstat_clock(), k + 1)
+
+    def test_repeated_reads_in_one_iteration_still_tick_once(self):
+        """Elapsed counting must not turn a second read within the same
+        iteration into a second tick."""
+        self.s.gf_iteration = 3
+        first = self.s._fstat_clock()
+        self.assertEqual(self.s._fstat_clock(), first)
+        self.assertEqual(self.s._fstat_clock(), first)
 
     def test_load_complete_epoch(self):
         d0 = os.path.join(self.d, "epoch_0000")
