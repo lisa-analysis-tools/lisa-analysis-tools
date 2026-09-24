@@ -683,7 +683,22 @@ export UNEQUAL_ARM_STRIDE=200
 export WDM_PSD_METHOD=layer_calibrated
 export GALFOR_MODULATION_PATH="$PWD/scripts/noise/modulation_unequal.dat"
 export GALFOR_MODULATION_T0=data
-echo "[V8-NOISE] UNEQUAL_ARM=${UNEQUAL_ARM} stride=${UNEQUAL_ARM_STRIDE} wdm_psd_method=${WDM_PSD_METHOD}"
+# PIN THE RESUMABLE NOISE IDENTITY OF THIS STORE (2026-09-23). 36e2319e made
+# the NOISE-brick scalar fit use the brick's own link delays, which moves the
+# fitted (Soms_d, Sa_a) by 0.26% / 0.59%:
+#     equal arms (this store)  1.496182116469e-11  2.982411739286e-15
+#     unequal arms (new code)  1.500004011496e-11  3.000107254658e-15
+# Those numbers ARE general.psd_injection, and the coarse delayed-acceptance
+# fiducial digest is a SHA-256 over their raw float64 bytes, so the new fit
+# changes the digest and the resume guard refuses the store:
+#     "stored noise-model identity differs from the configured one:
+#      {'coarse_fiducial_digest': ('856ddb07f6b46e39', 'b5047f761a4400d5')}"
+# =0 restores the equal-arm fit BIT-IDENTICALLY (verified against 36e2319e^
+# on the mojito-light brick), so gf_prod_6mo_v8_4gpu resumes unchanged.
+# DELETE THIS LINE for a fresh store -- the arm model is the better answer,
+# it just is not the answer this chain was started with.
+export MOJITO_PSD_FIT_UNEQUAL_ARM=0
+echo "[V8-NOISE] UNEQUAL_ARM=${UNEQUAL_ARM} stride=${UNEQUAL_ARM_STRIDE} wdm_psd_method=${WDM_PSD_METHOD} psd_fit_unequal_arm=${MOJITO_PSD_FIT_UNEQUAL_ARM}"
 echo "[V8-NOISE] modulation=${GALFOR_MODULATION_PATH} t0=${GALFOR_MODULATION_T0}"
 
 # ---- coarse noise likelihood (pinned, not inherited) ------------------------

@@ -6124,7 +6124,26 @@ class MojitoNoiseEstimates(NoiseComponent):
         the equal-arm fallback: a non-TDI-2 generation (the closed forms are
         generated for gen 2 only), a non-XYZ table, or a file without the
         group.
+
+        ``MOJITO_PSD_FIT_UNEQUAL_ARM=0`` forces the equal-arm fallback even
+        when delays are available or were passed explicitly. THIS EXISTS TO
+        LET AN IN-FLIGHT RUN RESUME. The fitted levels are the run's
+        ``psd_injection``, and the coarse delayed-acceptance fiducial digest
+        is a SHA-256 over their raw float64 bytes, so moving them by the
+        0.26% / 0.59% the arm model is worth changes the digest and
+        ``_open_run_backend`` refuses the resume ("stored noise-model
+        identity differs from the configured one"). Measured on the
+        mojito-light NOISE brick 2026-09-23:
+
+            unequal arms (default)  1.500004011496e-11  3.000107254658e-15
+            equal arms   (=0)       1.496182116469e-11  2.982411739286e-15
+
+        A store written before 2026-09-23 carries the second pair. Set the
+        knob to 0 for that store; leave it alone for anything new, where the
+        arm model is simply the better answer.
         """
+        if os.environ.get("MOJITO_PSD_FIT_UNEQUAL_ARM", "1") == "0":
+            return None
         if ltts is not None:
             arr = np.asarray(ltts, dtype=float)
             if arr.shape != (6,):
