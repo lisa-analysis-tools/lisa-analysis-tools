@@ -2475,6 +2475,65 @@ export GB_USE_GALAXY_PRIOR=1
 export PSD_NUM_PROP_REPEATS=10
 export GALFOR_NUM_PROP_REPEATS=10
 
+# ---- NOISE SEARCH: tiled per-walker ensemble (stretch) instead of the
+#      eigen-axis fallback (user ruling 2026-09-23) ------------------------
+# WHY. NWALKERS=4 over N_COMPUTE ranks leaves a 1-2 walker BLOCK per rank,
+# and a block under 3 walkers has no stretch complement, so
+# PSDMove._resolve_inner_kind falls back to the eigen-axis proposal. That
+# path is the one that failed on the live 3-month run: 47 non-positive
+# information matrices (worst lambda/lambda_max = -2.0e300), and three of
+# four walkers drove galfor to identically zero and absorbed the galactic
+# confusion into Sa_a with no proposal able to carry them back out.
+# With this on, each walker gets its own inner ensemble of
+# *_ENSEMBLE_REPEATS tiled copies -- a complement manufactured INSIDE the
+# walker -- and the information matrix leaves the search critical path
+# entirely. The geometry is eryn's folded sampler axis (outer walker ->
+# nsamplers, rung -> ntemps, repeats -> nwalkers), so the inner move is an
+# unmodified eryn StretchMove with full ensemble-permutation tempering.
+#
+# SEARCH ONLY, and the gate is the STAGE (gf_stage_kind), so full_pe and
+# noise_vgb_pe take the ordinary proposal with the same move objects --
+# the deterministic argmax fold-back never touches a PE stage.
+#
+# COST -- read this before the first snapshot. The gate is
+# gf_stage_kind in ("search","rj"), and gb_search is kind="rj" with the
+# noise joint criterion riding inside it (noise_vgb_gb), so this also arms
+# during the GB search, where the noise block already ran ~93 s/iteration
+# (15%) at 3mo. Under WDM the C++ one-launch tier is unavailable, so
+# scoring lands on the [PSD_BATCH] tier: ~10x the likelihood CALLS per
+# round at unchanged batch WIDTH, hence unchanged peak memory. It pays for
+# itself only if rounds-to-plateau falls by the same factor.
+# WATCH on the first snapshot, in this order:
+#   1. [MAXLOGL] rounds-to-plateau for noise_joint_search -- must FALL.
+#   2. the noise block seconds/iteration inside gb_search (the 10x risk).
+#   3. galfor amp/fk traces: do the walkers stay off zero (the disease).
+#   4. "[PSD] ensemble search: N repeats x ..." fires once per move; its
+#      absence means the gate never armed.
+# KILL SWITCH: PSD_ENSEMBLE_SEARCH=0 GALFOR_ENSEMBLE_SEARCH=0 ./thisscript
+# restores the eigen path exactly (the knob off is a hard no-op).
+#
+# REPEATS. 10 is eryn's red/blue floor of 2*ndim for galfor's 5 columns and
+# clears psd's 4 with room to spare; the move WARNS if a branch list makes
+# the floor bigger than the repeat count. These are SPLIT moves here
+# (all_sources noise_move_spec: psd and galfor each get their own move and
+# their own ladder), so each branch's knob governs its own move.
+export PSD_ENSEMBLE_SEARCH=${PSD_ENSEMBLE_SEARCH:-1}
+export GALFOR_ENSEMBLE_SEARCH=${GALFOR_ENSEMBLE_SEARCH:-1}
+export PSD_ENSEMBLE_REPEATS=${PSD_ENSEMBLE_REPEATS:-10}
+export GALFOR_ENSEMBLE_REPEATS=${GALFOR_ENSEMBLE_REPEATS:-10}
+# The perturbation that seeds the inner ensemble closes the loop on the
+# MEASURED logL spread (perturb -> score -> rescale by sqrt(target/spread),
+# per walker) until each walker's ensemble spans [LO, HI] logL. SCALE0 is
+# only the opening guess, as a fraction of the prior box width -- safe at
+# 1e-3 now that GALFOR_LOG_SAMPLING=1 makes the galfor columns O(1) wide.
+# Copy 0 is left UNPERTURBED, so the incumbent always survives and the
+# block can only improve on what it was handed.
+export PSD_ENSEMBLE_SPREAD_LO=${PSD_ENSEMBLE_SPREAD_LO:-1.0}
+export PSD_ENSEMBLE_SPREAD_HI=${PSD_ENSEMBLE_SPREAD_HI:-10.0}
+export GALFOR_ENSEMBLE_SPREAD_LO=${GALFOR_ENSEMBLE_SPREAD_LO:-1.0}
+export GALFOR_ENSEMBLE_SPREAD_HI=${GALFOR_ENSEMBLE_SPREAD_HI:-10.0}
+echo "[V8-NOISE] ensemble search: psd=${PSD_ENSEMBLE_SEARCH} galfor=${GALFOR_ENSEMBLE_SEARCH} repeats=${GALFOR_ENSEMBLE_REPEATS} (search/rj stages only)"
+
 # ---- VGB in-model scorer: sig-het ON (user ruling 2026-09-17), same engine
 #      and the SAME knobs as the GB branch by construction (VGBSettings reads
 #      the shared SIGHET_* / GB_SIGHET_* env names: windowed refs, N_CP,
