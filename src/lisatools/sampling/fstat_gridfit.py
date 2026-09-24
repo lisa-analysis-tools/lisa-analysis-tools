@@ -1337,6 +1337,12 @@ def write_stacked_npz(stacked_path, *, grids_g, mc_ax_g, f0_los, f0_dxs,
         # they are Hz/s gets no error at all -- just births at absurd
         # parameters. Stamp it, and refuse a mismatch on load.
         grid_basis=grid_basis, grid_c_t=float(grid_c_t),
+        # THE PEAK THRESHOLD IS PART OF THE CACHE, for the same reason the
+        # basis is: the stage-B load path short-circuits selection entirely,
+        # so a cache fitted at one FSTAT_PEAK_MIN_SNR and loaded under
+        # another keeps the old peak list with no error at all. Stamped
+        # here, checked in _check_cached_peak_threshold on load.
+        peak_min_F=float(_peak_min_F_now()),
         peak_f0_mHz=peaks[:, 0], peak_F=peaks[:, 1], band_idx=band_idx,
         band_f0_lo=band_edges_mHz[band_idx],
         band_f0_hi=band_edges_mHz[band_idx + 1],
@@ -1897,6 +1903,7 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
     if os.path.exists(stacked_cache):
         d = np.load(stacked_cache, allow_pickle=False)
         logger.info("[fit] stage B already complete: %s", stacked_cache)
+        _check_cached_peak_threshold(d, stacked_cache, comb_cache)
         mem_mb = os.environ.get("FSTAT_GRID_MEM_MB", "").strip()
         # Weight exactly as the other two paths do. This used to pass RAW
         # peak_F, i.e. alpha=1 with no cell equalisation -- and because the
@@ -1959,6 +1966,58 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
 # --------------------------------------------------------------------------
 # birth container
 # --------------------------------------------------------------------------
+
+def _peak_min_F_now() -> float:
+    """The peak-selection floor in force right now, in F units."""
+    from lisatools.sampling.fstat_proposal import fstat_peak_min_F
+
+    return float(fstat_peak_min_F())
+
+
+def _check_cached_peak_threshold(d, stacked_cache: str, comb_cache: str) -> None:
+    """Refuse a stage-B cache selected at a DIFFERENT peak threshold.
+
+    The stage-B cache short-circuits everything: "load and return, nothing
+    recomputed". Its peak LIST was selected at whatever
+    ``FSTAT_PEAK_MIN_SNR`` was in force when it was fitted, and nothing else
+    on this path consults the knob -- so lowering the threshold on a resume
+    is a SILENT NO-OP, and the run keeps proposing from the old, stricter
+    list while its log and its submit script both claim the new value. Same
+    class of trap as the ``grid_basis`` and ``band_edges`` stamps above, and
+    the same treatment: stamp it, refuse a mismatch.
+
+    The migration is cheap and is named in the error. The COMB cache stores
+    ``F_max`` for every node, so deleting only ``*_peaks_stacked.npz`` while
+    KEEPING ``*_comb.npz`` re-selects peaks at the new threshold (cheap,
+    deterministic) and reruns stage B alone -- no full refit.
+
+    A cache with no stamp is legacy: warn rather than refuse, since every
+    cache written before this stamp existed would otherwise become unusable.
+    """
+    from lisatools.sampling.fstat_proposal import fstat_peak_min_F
+
+    want = float(fstat_peak_min_F())
+    if "peak_min_F" not in d:
+        logger.warning(
+            "[fit] stage-B cache %s carries no peak_min_F stamp (written "
+            "before the stamp existed); CANNOT verify it against the run's "
+            "F >= %.3f (SNR %.2f). If you have changed FSTAT_PEAK_MIN_SNR, "
+            "delete %s (KEEP the _comb.npz) to re-select peaks.",
+            stacked_cache, want, np.sqrt(2.0 * want), stacked_cache)
+        return
+    have = float(d["peak_min_F"])
+    if abs(have - want) > 1e-9 * max(1.0, abs(want)):
+        raise ValueError(
+            f"F-stat stage-B cache {stacked_cache!r} selected its peaks at "
+            f"F >= {have:.4f} (SNR {np.sqrt(2.0 * have):.3f}), but this run "
+            f"asks for F >= {want:.4f} (SNR {np.sqrt(2.0 * want):.3f}). "
+            f"Loading it would silently keep the OLD peak list. Delete "
+            f"{stacked_cache!r} and KEEP {comb_cache!r}: the comb stores "
+            f"F_max for every node, so peaks re-select at the new threshold "
+            f"and only stage B reruns (no full refit). Deleting the whole "
+            f"epoch directory also works but pays for the comb again."
+        )
+
 
 def check_cached_band_grid(cache_dir: str, expected_band_edges) -> None:
     """Refuse a cached F-stat grid fitted against a DIFFERENT band grid.

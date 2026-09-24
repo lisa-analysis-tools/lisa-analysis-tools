@@ -2221,6 +2221,85 @@ echo "[GB-OBS-EIGEN] GB_INMODEL_OBSERVABLE_EIGEN='${GB_INMODEL_OBSERVABLE_EIGEN}
 # need its epoch caches cleared.
 export FSTAT_FDOT_AXIS=1
 export FSTAT_FDOT_RATIO_MAX=5.0
+
+# PEAK-SELECTION FLOOR 8.0 -> 6.25 (user ruling 2026-09-23: "err on the side
+# of grabbing things not missing them. Even if there is excess stuff that is
+# fine.")
+#
+# NOTE ON THE RUN IN FLIGHT: this knob was never exported before, so the
+# current 6mo run has been selecting at the stock 8.0. That is what the
+# measurement below is against.
+#
+# WHY THE STOCK 8.0 IS TOO STRICT *ON THIS RUN*. The 8.0 default is a
+# false-alarm argument (fstat_proposal.py): under the null 2F ~ chi2_4, so
+# F = 32 gives ~4e-5 expected false peaks on a full-band production comb.
+# That null assumes the ASSUMED PSD equals the true one. Here it does not --
+# galfor absorbs the galaxy the search has not resolved, so the assumed floor
+# is k = 1.85-2.00x the truth over 3-4 mHz. The realized null is then
+# 2F ~ chi2_4 / k: the whole distribution SHRINKS, the cut becomes orders of
+# magnitude stricter than designed, and the cost is paid entirely in missed
+# sources. Measured 2026-09-23 (galfor_6mo_figs/): 8.0 is an effective
+# TRUE-SNR threshold of 11.3 at 3.5 mHz, hiding 693 findable binaries, 506 of
+# them in 3-5 mHz.
+#
+# WHY 6.25 AND NOT LOWER. Expected false peaks against this run's own k(f),
+# with the comb size back-calibrated from the ruling's own 4e-5 number:
+#
+#     cut 8.00 -> 6e-5 false,     0 of 693 recovered   (the run in flight)
+#     cut 7.00 -> 0.06 false,   319 recovered
+#     cut 6.50 -> 1.2  false,   478 recovered
+#     cut 6.25 -> 5.3  false,   551 recovered          <-- HERE
+#     cut 6.00 -> 21.7 false,   628 recovered
+#     cut 5.66 -> 134  false,   692 recovered
+#
+# 6.25 buys 73 more sources than 6.50 for ~4 more expected false peaks. The
+# marginal rate collapses just below it -- 6.50->6.40 is 36 sources per false
+# peak, 6.25->6.20 is 7, 6.10->6.00 is 3.7 -- so 6.25 sits at the last point
+# where the exchange is still clearly favourable. 6.0 and below is the regime
+# the 2026-08-17 SNR-8 ruling was written to escape (a peak list that was
+# ~98% noise put 2-7 leaves on one source).
+#
+# THIS IS A COMPENSATION, NOT A FIX, AND IT IS RUN-SPECIFIC. It trades a
+# known-inflated floor for a looser cut; do NOT port it to a run whose noise
+# model is well calibrated, where it would simply loosen the false-alarm rate
+# for nothing. The principled replacement is a per-band self-calibrated
+# threshold (8/sqrt(k_hat), k_hat measured from the F-stat grid's own median)
+# which recovers ALL 693 at the 4e-5 design rate -- see
+# galfor_6mo_figs/FSTAT_SELFCAL_PROPOSAL.md. Revert to 8.0 when that lands,
+# or when GB has subtracted enough that galfor is no longer inflated.
+#
+# CAVEAT the table cannot show: the chi2_4 null only holds where the residual
+# is Gaussian. At 1-3 mHz the confusion forest is not, so the real false rate
+# there is worse than tabulated at ANY global cut. Watch the per-band peak
+# counts and the birth multiplicity per source in the 1-3 mHz bands.
+#
+# ############################################################################
+# ## ⚠⚠ THIS KNOB IS A NO-OP ON A RESUME UNLESS YOU CLEAR THE STAGE-B CACHE ##
+# ##                                                                        ##
+# ## fstat_gridfit's stage-B load path is "load and return, nothing         ##
+# ## recomputed": the peak LIST was selected at whatever threshold was in   ##
+# ## force when it was FITTED, and nothing on that path re-reads the knob.  ##
+# ## So a resume keeps proposing from the old SNR-8 list while this script  ##
+# ## and the run log both say 6.25.                                         ##
+# ##                                                                        ##
+# ## THE CHEAP MIGRATION -- delete ONLY the stacked file, KEEP the comb:    ##
+# ##                                                                        ##
+# ##     rm <fit_dir>/fstat_grid_peaks_stacked.npz                          ##
+# ##     # keep  <fit_dir>/fstat_grid_comb.npz                              ##
+# ##                                                                        ##
+# ## The comb stores F_max for EVERY node, so peaks re-select at the new    ##
+# ## threshold (cheap, deterministic) and only stage B reruns. Deleting the ##
+# ## whole epoch directory also works but pays for the comb again -- and    ##
+# ## the comb is the expensive half (monitor_6mo.html was still reporting   ##
+# ## "the grid fit is still running" at the Sep-18 snapshot).               ##
+# ##                                                                        ##
+# ## As of 2026-09-23 the stage-B cache STAMPS peak_min_F and the loader    ##
+# ## REFUSES a mismatch (fstat_gridfit._check_cached_peak_threshold). But   ##
+# ## caches written BEFORE that stamp -- including this run's -- carry no   ##
+# ## stamp and only WARN. Watch for "carries no peak_min_F stamp" in the    ##
+# ## log on the first resume; that line means you must clear it by hand.    ##
+# ############################################################################
+export FSTAT_PEAK_MIN_SNR=6.25
 # F-STAT CENTERING OFF (probe verdict 2026-09-02, 4-arm A/B, readout
 # artifact 2f5d673c): centered births are a stacking engine in BOTH test
 # bands (A_ctr multiplicity 4.33/walker on a 1-source band, 23% neg-fdot
