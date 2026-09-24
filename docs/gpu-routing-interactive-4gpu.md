@@ -10,10 +10,27 @@ whole deployment — it is pure Python, with no native file touched and nothing
 to recompile. It is OPT-IN (`GF_GPU_ROUTING=1`, exported in §0), so a checkout
 carrying it behaves exactly as before until a run asks for it.
 
-**Progress (2026-09-24, 2 nodes × 2 GPUs):** §0 sanity ✔ · G3 at `NWALKERS=4`
-(`n_blocks=4 R=1`) ✔ · G3 at `NWALKERS=2` (`n_blocks=2 R=2 REPLICAS`) ✔ — the
-first time GPUs > walkers has resolved on hardware. Round-robin placement
-confirmed (A,B,A,B,A), each node's two compute ranks on distinct devices.
+## ✅ G3 PASSED — 2026-09-24, 2 nodes × 2 GPUs (4 compute ranks + saver)
+
+| NWALKERS | `GF_GPU_ROUTING=1` | knob unset |
+|---|---|---|
+| 4 | `n_blocks=4 R=1 block=1` ✔ | resolves (legacy shape) |
+| 2 | `n_blocks=2 R=2 block=1` `REPLICAS` ✔ | **refused**, names the knob ✔ |
+| 1 | `n_blocks=1 R=4 block=1` `REPLICAS` ✔ | resolves (replica carve-out) |
+| 6 | `n_blocks=2 R=2 block=3` ✔ | **refused**, names the knob ✔ |
+
+Every shape: all five ranks agreed on `digest()`. **The first time GPUs >
+walkers has resolved on hardware** — `NWALKERS=2` and `6` on 4 compute ranks
+were both hard `ValueError`s before this work.
+
+This is the opt-in contract end to end: new shapes resolve when asked for,
+refuse when not, and the two shapes the legacy rule accepted behave the same
+either way. Placement confirmed round-robin A,B,A,B,A with each node's two
+compute ranks on distinct devices, and at `R=2` block 0 was ranks (0,1) —
+i.e. straddling both nodes, as predicted.
+
+**Next: G4** (three-factorization parity, ~30 min), then G5 (the decision
+gate, ~1 h).
 
 ---
 
