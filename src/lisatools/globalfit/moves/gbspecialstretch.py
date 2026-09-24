@@ -2805,143 +2805,6 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self._band_leaf_cap = None
         self._cap_pw_warned_all_walkers = False
 
-        # ------------------------------------------------------------------
-        # PER-(WALKER, BAND) SEARCH STAGE (user request 2026-09-23,
-        # GB_SEARCH_STAGE_PER_WALKER, default OFF).
-        # ------------------------------------------------------------------
-        # The search runs ONE opt-SNR floor for every walker and every band
-        # for the whole run, and that is the wrong shape. A band where a
-        # walker has already assembled its sources wants a LOWER floor (dig
-        # into the faint tail); a band still finding bright sources wants the
-        # HIGH floor (do not poison the model with noise births). Those two
-        # states coexist at the same iteration, in different bands, and in
-        # the SAME band on different walkers.
-        #
-        # So the floor becomes a function of a (walker, band) STAGE: 0 =
-        # COARSE (``opt_snr_limit_search_coarse``), 1 = FINE
-        # (``opt_snr_limit_search_fine``). A band promotes once that
-        # walker's cold-chain SOURCE COUNT there has stopped changing --
-        # see :meth:`_update_search_stages`.
-        #
-        # OFF is a hard no-op: ``_snr_lim_table`` stays ``None``, the floor
-        # stays the scalar float it has always been, and not one array is
-        # allocated or persisted.
-        self.search_stage_per_walker = bool(search_stage_per_walker)
-        self.search_stage_min_iters = int(
-            search_stage_min_iters
-            if search_stage_min_iters is not None
-            else os.environ.get("GB_SEARCH_STAGE_MIN_ITERS", "20")
-        )
-        # COARSE defaults to whatever this move's floor already resolved to,
-        # so arming the feature with no other knob set reproduces today's
-        # behaviour until the first promotion. FINE defaults to the PE floor
-        # (5.0), which is the relaxed end of the same standing pair.
-        _coarse_env = os.environ.get("GB_OPT_SNR_LIMIT_SEARCH_COARSE")
-        self.opt_snr_limit_search_coarse = float(
-            opt_snr_limit_search_coarse
-            if opt_snr_limit_search_coarse is not None
-            else (_coarse_env if _coarse_env is not None
-                  else self.opt_snr_rej_samp_limit)
-        )
-        self.opt_snr_limit_search_fine = float(
-            opt_snr_limit_search_fine
-            if opt_snr_limit_search_fine is not None
-            else os.environ.get("GB_OPT_SNR_LIMIT_SEARCH_FINE", "5.0")
-        )
-        #: the live ``(nwalkers, num_bands)`` floor table, or ``None`` while
-        #: the feature is off. Rebuilt from the stage record once per
-        #: proposal and shipped to the sorter/buffer in place of the scalar.
-        self._snr_lim_table = None
-        self._stage_warned_accept_kernel = False
-        self._stage_armed_logged = False
-        if self.search_stage_per_walker:
-            if self.opt_snr_limit_search_fine > self.opt_snr_limit_search_coarse:
-                # Refuse rather than run it backwards. The latch is ONE-WAY
-                # on the premise that FINE is a strictly LARGER prior
-                # support; inverted, a promotion would TIGHTEN the floor
-                # under an assembled model and start rejecting sources that
-                # model already holds -- and the in-model gate enforces on
-                # every update, not only on birth, so those sources would be
-                # frozen out rather than merely un-birthable.
-                raise ValueError(
-                    f"{name}: GB_SEARCH_STAGE_PER_WALKER needs the FINE "
-                    f"opt-SNR floor to be <= the COARSE one, but got "
-                    f"fine={self.opt_snr_limit_search_fine} > "
-                    f"coarse={self.opt_snr_limit_search_coarse}. The stage "
-                    f"latch is one-way because FINE is assumed to be the "
-                    f"LARGER prior support; inverted, promoting a band "
-                    f"would tighten its floor under an already-assembled "
-                    f"model and the in-model SNR gate would freeze out "
-                    f"sources the model already holds."
-                )
-            if self.search_stage_min_iters < 1:
-                raise ValueError(
-                    f"{name}: GB_SEARCH_STAGE_MIN_ITERS must be >= 1, got "
-                    f"{self.search_stage_min_iters}. A patience of 0 would "
-                    f"promote every occupied band on its first update, "
-                    f"before any equilibrium could have been observed."
-                )
-
-        # ------------------------------------------------------------------
-        # PER-(WALKER, BAND) RJ SHUTOFF (user request 2026-09-24,
-        # GB_SEARCH_BAND_SHUTOFF_PER_WALKER, default OFF). SEARCH ONLY.
-        # ------------------------------------------------------------------
-        # ADDITIONAL to the existing per-band valve (``_rj_band_shutoff``),
-        # which is untouched: the two compose with OR, so a row is frozen if
-        # EITHER says so.
-        #
-        # The criterion is the per-(walker, band) form of the one the recipe
-        # already uses to end an RJ stage
-        # (``RJRecipeStep.stopping_function``): the cold-chain source count
-        # has stopped GROWING over a ``search_shutoff_conv_iter`` window
-        # WITHIN THE CURRENT RECIPE STEP. Where the recipe asks that of the
-        # whole branch to advance the stage, this asks it of one
-        # (walker, band) to stop spending proposals there.
-        #
-        # SCOPED TO THE STEP, and released when the next one begins: the
-        # next step changes the moves, the caps and the floors, so a band
-        # that had nothing left to find under the old configuration may have
-        # plenty under the new one. A valve that outlived its step would
-        # silently freeze exactly the bands the new step was meant to
-        # reopen.
-        self.search_mode = bool(search_mode)
-        self.search_shutoff_per_walker = bool(search_shutoff_per_walker)
-        self.search_shutoff_conv_iter = int(
-            search_shutoff_conv_iter
-            if search_shutoff_conv_iter is not None
-            else os.environ.get("GB_SEARCH_BAND_SHUTOFF_CONV_ITER", "5")
-        )
-        if self.search_shutoff_per_walker and self.search_shutoff_conv_iter < 1:
-            raise ValueError(
-                f"{name}: GB_SEARCH_BAND_SHUTOFF_CONV_ITER must be >= 1, "
-                f"got {self.search_shutoff_conv_iter}. A zero-length "
-                f"patience window would freeze every occupied band on "
-                f"its first update, before any lnL plateau could have "
-                f"been observed."
-            )
-        #: live reference into ``band_info['band_rj_shutoff_w']``, or None.
-        self._rj_band_shutoff_w = None
-        #: IN-MEMORY within-step lnL plateau state. Deliberately not
-        #: persisted: a restart re-earns the window, which leaves bands
-        #: OPEN longer -- the permissive direction, and the one that cannot
-        #: lose sources.
-        self._shutoff_best = None
-        self._shutoff_streak = None
-        self._stage_band_lls = None
-        self._stage_band_lls_stamp = None
-        self._shutoff_w_warned_lls = False
-        #: the recipe-step serial this move is running under. ``None`` until
-        #: a recipe step announces itself through :meth:`begin_recipe_step`.
-        self._recipe_step_serial = None
-        self._shutoff_w_warned_mode = False
-        #: stage-convergence counter (occupied (walker, band) pairs not yet
-        #: shut). ``None`` = never computed, which is how
-        #: ``band_shutoff_w_pending_total`` tells "feature off / no update
-        #: yet" apart from a genuine 0. See _publish_shutoff_w_pending.
-        self._shutoff_w_pending = None
-        self._shutoff_w_shut = 0
-        self._shutoff_w_total = 0
-
         # Sig-het reference policy (ALL in-model proposals): the heterodyne
         # reference is built ONCE per repeat block, against the source-free
         # residual, and held FIXED for the whole block --
@@ -3156,7 +3019,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         if opt_snr_rej_samp_limit is None:
             opt_snr_rej_samp_limit = float(
                 os.environ.get("GB_OPT_SNR_LIMIT", "5.0"))
-        self.opt_snr_rej_samp_limit = float(opt_snr_rej_samp_limit)
+        # THE RESOLVED FLOOR, kept in a LOCAL as well as on self. The
+        # per-(walker, band) stage block below needs this value for its
+        # COARSE default, and reading it back off ``self`` made the two
+        # blocks silently order-dependent: an earlier arrangement had the
+        # stage block ABOVE this line and every default construction raised
+        # AttributeError before the first proposal (caught in review, 09-24,
+        # after it reached dev). A local cannot be read before it is bound,
+        # so the dependency is now a NameError at worst and visible at best.
+        _resolved_snr_floor = float(opt_snr_rej_samp_limit)
+        self.opt_snr_rej_samp_limit = _resolved_snr_floor
         if snr_rej_detected is None:
             snr_rej_detected = (
                 os.environ.get("GB_SNR_REJ_DETECTED", "0") == "1")
@@ -3168,6 +3040,149 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             name, self.opt_snr_rej_samp_limit,
             "ON" if self.snr_rej_detected else "OFF",
         )
+
+        # ------------------------------------------------------------------
+        # PER-(WALKER, BAND) SEARCH STAGE (user request 2026-09-23,
+        # GB_SEARCH_STAGE_PER_WALKER, default OFF).
+        # ------------------------------------------------------------------
+        # The search runs ONE opt-SNR floor for every walker and every band
+        # for the whole run, and that is the wrong shape. A band where a
+        # walker has already assembled its sources wants a LOWER floor (dig
+        # into the faint tail); a band still finding bright sources wants the
+        # HIGH floor (do not poison the model with noise births). Those two
+        # states coexist at the same iteration, in different bands, and in
+        # the SAME band on different walkers.
+        #
+        # So the floor becomes a function of a (walker, band) STAGE: 0 =
+        # COARSE (``opt_snr_limit_search_coarse``), 1 = FINE
+        # (``opt_snr_limit_search_fine``). A band promotes once that
+        # walker's cold-chain SOURCE COUNT there has stopped changing --
+        # see :meth:`_update_search_stages`.
+        #
+        # OFF is a hard no-op: ``_snr_lim_table`` stays ``None``, the floor
+        # stays the scalar float it has always been, and not one array is
+        # allocated or persisted.
+        self.search_stage_per_walker = bool(search_stage_per_walker)
+        self.search_stage_min_iters = int(
+            search_stage_min_iters
+            if search_stage_min_iters is not None
+            else os.environ.get("GB_SEARCH_STAGE_MIN_ITERS", "20")
+        )
+        # COARSE defaults to whatever this move's floor already resolved to,
+        # so arming the feature with no other knob set reproduces today's
+        # behaviour until the first promotion. FINE defaults to the PE floor
+        # (5.0), which is the relaxed end of the same standing pair.
+        _coarse_env = os.environ.get("GB_OPT_SNR_LIMIT_SEARCH_COARSE")
+        # ``_resolved_snr_floor`` (the LOCAL bound just above), never
+        # ``self.opt_snr_rej_samp_limit``: this default is "whatever this
+        # move's floor already resolved to", which is only true while this
+        # block runs AFTER that resolution. Reading it off ``self`` is what
+        # made that a silent ordering contract, and it was wrong -- see the
+        # comment at the assignment.
+        self.opt_snr_limit_search_coarse = float(
+            opt_snr_limit_search_coarse
+            if opt_snr_limit_search_coarse is not None
+            else (_coarse_env if _coarse_env is not None
+                  else _resolved_snr_floor)
+        )
+        self.opt_snr_limit_search_fine = float(
+            opt_snr_limit_search_fine
+            if opt_snr_limit_search_fine is not None
+            else os.environ.get("GB_OPT_SNR_LIMIT_SEARCH_FINE", "5.0")
+        )
+        #: the live ``(nwalkers, num_bands)`` floor table, or ``None`` while
+        #: the feature is off. Rebuilt from the stage record once per
+        #: proposal and shipped to the sorter/buffer in place of the scalar.
+        self._snr_lim_table = None
+        self._stage_warned_accept_kernel = False
+        self._stage_armed_logged = False
+        if self.search_stage_per_walker:
+            if self.opt_snr_limit_search_fine > self.opt_snr_limit_search_coarse:
+                # Refuse rather than run it backwards. The latch is ONE-WAY
+                # on the premise that FINE is a strictly LARGER prior
+                # support; inverted, a promotion would TIGHTEN the floor
+                # under an assembled model and start rejecting sources that
+                # model already holds -- and the in-model gate enforces on
+                # every update, not only on birth, so those sources would be
+                # frozen out rather than merely un-birthable.
+                raise ValueError(
+                    f"{name}: GB_SEARCH_STAGE_PER_WALKER needs the FINE "
+                    f"opt-SNR floor to be <= the COARSE one, but got "
+                    f"fine={self.opt_snr_limit_search_fine} > "
+                    f"coarse={self.opt_snr_limit_search_coarse}. The stage "
+                    f"latch is one-way because FINE is assumed to be the "
+                    f"LARGER prior support; inverted, promoting a band "
+                    f"would tighten its floor under an already-assembled "
+                    f"model and the in-model SNR gate would freeze out "
+                    f"sources the model already holds."
+                )
+            if self.search_stage_min_iters < 1:
+                raise ValueError(
+                    f"{name}: GB_SEARCH_STAGE_MIN_ITERS must be >= 1, got "
+                    f"{self.search_stage_min_iters}. A patience of 0 would "
+                    f"promote every occupied band on its first update, "
+                    f"before any equilibrium could have been observed."
+                )
+
+        # ------------------------------------------------------------------
+        # PER-(WALKER, BAND) RJ SHUTOFF (user request 2026-09-24,
+        # GB_SEARCH_BAND_SHUTOFF_PER_WALKER, default OFF). SEARCH ONLY.
+        # ------------------------------------------------------------------
+        # ADDITIONAL to the existing per-band valve (``_rj_band_shutoff``),
+        # which is untouched: the two compose with OR, so a row is frozen if
+        # EITHER says so.
+        #
+        # The criterion is the per-(walker, band) form of the one the recipe
+        # already uses to end an RJ stage
+        # (``RJRecipeStep.stopping_function``): the cold-chain source count
+        # has stopped GROWING over a ``search_shutoff_conv_iter`` window
+        # WITHIN THE CURRENT RECIPE STEP. Where the recipe asks that of the
+        # whole branch to advance the stage, this asks it of one
+        # (walker, band) to stop spending proposals there.
+        #
+        # SCOPED TO THE STEP, and released when the next one begins: the
+        # next step changes the moves, the caps and the floors, so a band
+        # that had nothing left to find under the old configuration may have
+        # plenty under the new one. A valve that outlived its step would
+        # silently freeze exactly the bands the new step was meant to
+        # reopen.
+        self.search_mode = bool(search_mode)
+        self.search_shutoff_per_walker = bool(search_shutoff_per_walker)
+        self.search_shutoff_conv_iter = int(
+            search_shutoff_conv_iter
+            if search_shutoff_conv_iter is not None
+            else os.environ.get("GB_SEARCH_BAND_SHUTOFF_CONV_ITER", "5")
+        )
+        if self.search_shutoff_per_walker and self.search_shutoff_conv_iter < 1:
+            raise ValueError(
+                f"{name}: GB_SEARCH_BAND_SHUTOFF_CONV_ITER must be >= 1, "
+                f"got {self.search_shutoff_conv_iter}. A zero-length "
+                f"patience window would freeze every occupied band on "
+                f"its first update, before any lnL plateau could have "
+                f"been observed."
+            )
+        #: live reference into ``band_info['band_rj_shutoff_w']``, or None.
+        self._rj_band_shutoff_w = None
+        #: IN-MEMORY within-step lnL plateau state. Deliberately not
+        #: persisted: a restart re-earns the window, which leaves bands
+        #: OPEN longer -- the permissive direction, and the one that cannot
+        #: lose sources.
+        self._shutoff_best = None
+        self._shutoff_streak = None
+        self._stage_band_lls = None
+        self._stage_band_lls_stamp = None
+        self._shutoff_w_warned_lls = False
+        #: the recipe-step serial this move is running under. ``None`` until
+        #: a recipe step announces itself through :meth:`begin_recipe_step`.
+        self._recipe_step_serial = None
+        self._shutoff_w_warned_mode = False
+        #: stage-convergence counter (occupied (walker, band) pairs not yet
+        #: shut). ``None`` = never computed, which is how
+        #: ``band_shutoff_w_pending_total`` tells "feature off / no update
+        #: yet" apart from a genuine 0. See _publish_shutoff_w_pending.
+        self._shutoff_w_pending = None
+        self._shutoff_w_shut = 0
+        self._shutoff_w_total = 0
 
         # ------------------------------------------------------------------
         # LEAF-CAP CELL GRID (user design 2026-08-15)

@@ -229,6 +229,87 @@ class FeatureIndependenceTest(unittest.TestCase):
                          set())
 
 
+class RealConstructionTest(unittest.TestCase):
+    """Build an ACTUAL GBSpecialStretchMove on the DEFAULT path.
+
+    ⚠ THIS IS THE TEST THE REST OF THIS FILE COULD NOT BE. Every other case
+    here drives the stage/valve logic through a light fake that bypasses
+    ``__init__`` entirely, which is what makes them fast -- and is exactly
+    why 491 green tests missed an ordering bug in ``__init__`` that raised
+    ``AttributeError`` on the default construction path and reached dev
+    (2026-09-24: the coarse/fine block read ``self.opt_snr_rej_samp_limit``
+    ~315 lines before it was assigned; kwarg None + env unset is the
+    SHIPPED configuration, so every real GB run would have crashed before
+    its first proposal).
+
+    So this one pays for a real fixture. It asserts nothing clever: only
+    that the constructor RUNS with no stage env and no stage kwargs, and
+    that the COARSE floor ends up equal to the floor the move actually
+    resolved -- which is the contract the buggy line was trying to express.
+    """
+
+    STAGE_ENVS = (
+        "GB_SEARCH_STAGE_PER_WALKER", "GB_SEARCH_STAGE_MIN_ITERS",
+        "GB_OPT_SNR_LIMIT_SEARCH_COARSE", "GB_OPT_SNR_LIMIT_SEARCH_FINE",
+        "GB_SEARCH_BAND_SHUTOFF_PER_WALKER",
+        "GB_SEARCH_BAND_SHUTOFF_CONV_ITER",
+    )
+
+    def setUp(self):
+        self._saved = {k: os.environ.pop(k, None) for k in self.STAGE_ENVS}
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+    def _build_move(self, **extra):
+        from tests.test_gbspecial_flow import build_fixture
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            GBSpecialStretchMove,
+        )
+
+        fx = build_fixture(seed=1234)
+        kwargs = dict(fx["move_kwargs"])
+        kwargs.update(extra)
+        return GBSpecialStretchMove(
+            *fx["move_args"], is_rj_prop=False,
+            name="stage_ctor_check", stretch_probability=0.5, **kwargs)
+
+    def test_default_construction_does_not_raise(self):
+        move = self._build_move()
+        # the default path: both features off, floor still a plain scalar
+        self.assertFalse(move.search_stage_per_walker)
+        self.assertFalse(move.search_shutoff_per_walker)
+        self.assertEqual(np.ndim(move.opt_snr_rej_samp_limit), 0)
+
+    def test_coarse_defaults_to_the_resolved_floor(self):
+        move = self._build_move()
+        self.assertEqual(
+            float(move.opt_snr_limit_search_coarse),
+            float(move.opt_snr_rej_samp_limit),
+            "COARSE must default to the floor this move actually resolved",
+        )
+
+    def test_an_explicit_coarse_env_wins(self):
+        os.environ["GB_OPT_SNR_LIMIT_SEARCH_COARSE"] = "9.5"
+        move = self._build_move()
+        self.assertEqual(float(move.opt_snr_limit_search_coarse), 9.5)
+
+    def test_an_explicit_kwarg_beats_the_env(self):
+        os.environ["GB_OPT_SNR_LIMIT_SEARCH_COARSE"] = "9.5"
+        move = self._build_move(opt_snr_limit_search_coarse=7.25)
+        self.assertEqual(float(move.opt_snr_limit_search_coarse), 7.25)
+
+    def test_an_inverted_pair_refuses_at_construction(self):
+        with self.assertRaises(ValueError):
+            self._build_move(
+                search_stage_per_walker=True,
+                opt_snr_limit_search_coarse=5.0,
+                opt_snr_limit_search_fine=9.0,
+            )
+
+
 class StageRestoreTest(unittest.TestCase):
     """All-or-nothing, and every degradation lands on the SAFE side."""
 
