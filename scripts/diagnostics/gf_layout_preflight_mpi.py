@@ -30,24 +30,52 @@ preflighting a rule the run will not apply is worse than not preflighting at
 all. Unset, a shape needing the unified factorization REFUSES here just as it
 would at launch, and the printed line says ``gpu_routing=OFF(legacy)``.
 
+EVERY OUTCOME PRINTS A ``###`` LINE ON STDOUT, INCLUDING FAILURE. Runbooks
+pipe this through ``grep '^###'``, and a filter that only matches success
+makes a crash, a refused shape and a silent pass look identical -- an empty
+result then reads as "nothing happened" when it actually means "it broke".
+So the layout build is wrapped: on any exception rank 0 prints
+``### FAILED ...`` and the process exits non-zero.
+
 Nothing here builds a fit or touches a store.
 """
-import os, sys
+import os, sys, traceback
 from mpi4py import MPI
 if os.environ.get("LAT_SRC"):
     sys.path.insert(0, os.environ["LAT_SRC"])
 from lisatools.globalfit.communication.ranks import build_layout, layout_dry_run
 
 comm = MPI.COMM_WORLD
+_rank, _size = comm.Get_rank(), comm.Get_size()
 nw = int(os.environ.get("NWALKERS", "4"))
 pool = [int(x) for x in os.environ.get("GPUS", "0,1").split(",") if x != ""]
 rpb = os.environ.get("RANKS_PER_BLOCK") or None
-lay = build_layout(comm, nw, pool, legacy=False,
-                   ranks_per_block=None if rpb is None else int(rpb))
-if comm.Get_rank() == 0:
+# A SIZE-1 WORLD IS THE COMMONEST CLUSTER FAILURE and it is not an error
+# here -- build_layout resolves it happily as a single-process run -- so it
+# has to be SAID. It means the launcher started N independent jobs rather
+# than one N-rank world (Intel MPI without I_MPI_HYDRA_BOOTSTRAP=slurm is
+# the usual cause), and every agreement result below would be vacuous.
+if _size == 1:
+    print(f"### WARNING: MPI world size is 1 -- the launcher did NOT make one "
+          f"multi-rank world. Nothing below tests agreement. Check the MPI "
+          f"bootstrap pins.", flush=True)
+try:
+    lay = build_layout(comm, nw, pool, legacy=False,
+                       ranks_per_block=None if rpb is None else int(rpb))
+except Exception as exc:
+    if _rank == 0:
+        print(f"### FAILED nwalkers={nw} size={_size} "
+              f"GF_GPU_ROUTING={os.environ.get('GF_GPU_ROUTING', '<unset>')} "
+              f"RANKS_PER_BLOCK={rpb or 'AUTO'}: {type(exc).__name__}: {exc}",
+              flush=True)
+        traceback.print_exc()
+    sys.stdout.flush()
+    comm.Barrier()
+    sys.exit(1)
+if _rank == 0:
     print(f"### nwalkers={nw} n_compute={lay.n_compute} "
           f"n_blocks={lay.n_blocks} R={lay.ranks_per_block} block={lay.block} "
-          f"gpu_routing={'on' if lay.gpu_routing else 'OFF(legacy)'}")
+          f"gpu_routing={'on' if lay.gpu_routing else 'OFF(legacy)'}", flush=True)
 digests = comm.allgather(lay.digest())
 if comm.Get_rank() == 0:
     print("### all ranks agree on the layout:", len(set(digests)) == 1)

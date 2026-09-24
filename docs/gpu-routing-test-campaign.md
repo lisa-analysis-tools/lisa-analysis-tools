@@ -146,14 +146,35 @@ on CPU (`GPUS=""` skips the per-node pool capacity check):
 ```bash
 export GF_GPU_ROUTING=1 GF_LAYOUT_DRY_RUN=1 GPUS=""
 for NW in 4 2 1 6; do
+  echo "--- NWALKERS=$NW ---"
   NWALKERS=$NW mpiexec -n 5 python scripts/diagnostics/gf_layout_preflight_mpi.py \
-    2>&1 | grep '^###'
+    > /tmp/pf_$NW.log 2>&1
+  rc=$?
+  grep '^###' /tmp/pf_$NW.log || {
+    echo "  NO ### LINE AT ALL (rc=$rc) -- last 6 lines:"; tail -6 /tmp/pf_$NW.log; }
 done
 ```
 
-**Pass:** every line reads `gpu_routing=on` and `all ranks agree ... True`.
-Run the same loop with `GF_GPU_ROUTING` unset and NWALKERS 2 and 6 must
-REFUSE, naming the knob — that is the opt-in working.
+> **Do NOT collapse this to `... 2>&1 | grep '^###'`.** That merges stderr
+> into the pipe and then filters it away, so a traceback, a `command not
+> found`, an unactivated environment and a clean pass ALL print nothing. An
+> empty result reads as "fine" when it means "it broke". The script now
+> prints a `### FAILED ...` line on any exception and a `### WARNING: MPI
+> world size is 1` line when the launcher made singleton worlds, so an empty
+> result means the script never ran at all — which is what the `tail`
+> fallback above is for.
+
+**Pass:** every line reads `gpu_routing=on` and `all ranks agree ... True`,
+and no `### WARNING` about world size. Run the same loop with
+`GF_GPU_ROUTING` unset: 4 and 1 must resolve identically, 2 and 6 must print
+`### FAILED ... Set GF_GPU_ROUTING=1` — that is the opt-in working.
+
+**On a COMPUTE node (inside `salloc`) rather than the login node**, a bare
+`mpiexec` is usually the problem: Intel MPI needs its bootstrap pins, and
+without them it makes size-1 worlds or dies before Python starts. Export the
+env block from `docs/gpu-routing-interactive-4gpu.md` §0 first
+(`I_MPI_HYDRA_BOOTSTRAP=slurm`, `I_MPI_FABRICS=shm:ofi`, `FI_PROVIDER=tcp`,
+`I_MPI_JOB_RESPECT_PROCESS_PLACEMENT=0`) and add `-ppn 1`.
 
 ## G3b — placement dry runs (brief allocation, ~5 min)
 
