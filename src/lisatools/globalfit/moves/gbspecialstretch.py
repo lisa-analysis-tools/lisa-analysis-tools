@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections
 import glob
+import itertools
 import hashlib
 import json
 import os
@@ -1682,6 +1683,142 @@ def _resolve_inmodel_repeats(branch_name, class_name, kwarg_value, default):
     return value
 
 
+def _resolve_converge_knob(branch_name, knob, kwarg_value, default, cast):
+    """Resolve one ``{BRANCH}_INMODEL_CONVERGE[_<KNOB>]`` setting.
+
+    Same precedence as every other move knob (:func:`_resolve_rj_flip_fraction`,
+    :func:`_resolve_inmodel_repeats`): explicit kwarg > environment >
+    ``default``. ``knob`` is the suffix ("" for the master switch),
+    ``cast`` the value constructor -- :func:`_converge_cast_mode`,
+    ``int``, ``float`` or :func:`_converge_cast_classes`.
+
+    One generic resolver rather than six near-identical ones: these knobs
+    are a single feature's surface and their only difference is the cast.
+    """
+    value = kwarg_value
+    if value is None:
+        env = f"{str(branch_name).upper()}_INMODEL_CONVERGE"
+        if knob:
+            env = f"{env}_{str(knob).upper()}"
+        value = os.environ.get(env, None)
+    if value is None:
+        value = default
+    return cast(value)
+
+
+def _converge_cast_mode(value):
+    """``off`` / ``observe`` / ``on`` -- the master switch is TRI-state.
+
+    ``observe`` runs the whole rule under the UNCHANGED fixed budget and
+    nothing else: no freezing, no early exit, no change to a single
+    proposal. It only reports the repeat distribution the rule WOULD have
+    produced. That is the paired negative control this feature needs
+    before its defaults can be argued from anything but synthetic traces
+    (``feedback_paired_negative_controls``), and it answers the one
+    question that decides whether the mode is worth arming at all: if
+    every row would retire at exactly the patience window, the rule is a
+    constant budget of ``window`` and ``GB_INMODEL_REPEATS_NEWBORN`` says
+    the same thing for free.
+
+    ``0``/``false`` and ``1``/``true`` are accepted for ``off``/``on`` so
+    the knob reads like every other switch in this file.
+    """
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    v = str(value).strip().lower()
+    alias = {"0": "off", "false": "off", "1": "on", "true": "on"}
+    v = alias.get(v, v)
+    if v not in ("off", "observe", "on"):
+        raise ValueError(
+            "inmodel_converge must be off/observe/on (0/1 accepted), "
+            f"got {value!r}."
+        )
+    return v
+
+
+def _converge_stage_allows(move) -> bool:
+    """Is this move a SEARCH-stage move, i.e. may it stop on a plateau?
+
+    A convergence-plateau stopping rule is OPTIONAL STOPPING on the
+    chain's own likelihood trajectory: the law of the chain at that
+    stopping time is not the target. Search is allowed to do that
+    (``feedback_search_no_detailed_balance``); PE is not
+    (``feedback_no_pe_maximization``), and the PE stages
+    (``rj_fstat_pe`` / ``rj_prior_pe`` / ``rj_replace_pe``) are
+    ``is_rj_prop`` moves on the same direct-batch path, so
+    ``is_rj_prop`` alone is NOT a sufficient gate.
+
+    The test is deliberately a DENY-list on the pe-named stage rather than
+    the allow-list ``"search" in name`` that ``GB_REPLACE_FSTAT_MAX=auto``
+    uses (``_replace_fstat_max``). An allow-list would silently disable
+    the mode on the configurations that run a GB_MODE=search campaign
+    THROUGH moves that are not search-named (the search cycle's own
+    ``rj_prior_removal`` is one, and recipe.py documents whole campaigns
+    doing it) -- a knob that quietly does nothing is worse here than one
+    that arms a move the user did not picture, because the user exports it
+    per RUN and the log line below names every move that armed.
+    """
+    name = str(getattr(move, "name", "") or "").lower()
+    if name.endswith("_pe") or "_pe_" in name:
+        return False
+    return True
+
+
+def _converge_cast_classes(value):
+    """``"newborn,mature"`` -> ``frozenset``, validated against the two
+    provenance classes :func:`_split_by_newborn` can emit."""
+    if isinstance(value, str):
+        names = [v.strip().lower() for v in value.split(",") if v.strip()]
+    else:
+        names = [str(v).strip().lower() for v in value]
+    bad = sorted(set(names) - {"newborn", "mature"})
+    if bad or not names:
+        raise ValueError(
+            "inmodel_converge_classes must be a non-empty subset of "
+            f"{{newborn, mature}}, got {value!r}."
+        )
+    return frozenset(names)
+
+
+def _converge_cast_refill(value):
+    """0/1/true/false -> bool for the column-refill switch."""
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v not in ("0", "1", "true", "false"):
+            raise ValueError(
+                f"inmodel_converge_refill must be 0/1, got {value!r}."
+            )
+        return v in ("1", "true")
+    return bool(value)
+
+
+def _converge_cast_scale(value):
+    """``flat`` | ``per_source`` for the group threshold's normalization."""
+    v = str(value).strip().lower()
+    if v not in ("flat", "per_source"):
+        raise ValueError(
+            f"inmodel_group_scale must be flat/per_source, got {value!r}.")
+    return v
+
+
+def _converge_cast_window(value):
+    value = int(value)
+    if value < 1:
+        raise ValueError(
+            f"inmodel_converge_iters must be >= 1, got {value}."
+        )
+    return value
+
+
+def _converge_cast_swap_frac(value):
+    value = float(value)
+    if not (0.0 < value <= 1.0):
+        raise ValueError(
+            f"inmodel_converge_swap_frac must be in (0, 1], got {value}."
+        )
+    return value
+
+
 def _resolve_temper_vertical(branch_name, kwarg_value, default=False):
     """Resolve ``temper_vertical`` for a move (kwarg > env > ``default``).
 
@@ -2065,6 +2202,584 @@ def _column_atomic_newborn(pool, xp, num_bands):
     out = dict(pool)
     out["newborn"] = col_nb[inv]
     return out
+
+
+def _converge_column_spans(pool, num_bands):
+    """``[(col_id, start, stop), ...]`` for a COLUMN-ORDERED pool.
+
+    One entry per ``(walker, band)`` column, in pool order, each naming the
+    contiguous row range it occupies. The pool must have been through
+    :func:`_order_pool_by_column`; a column that is not contiguous is a
+    staging bug, not something to paper over, so it raises.
+    """
+    key = np.asarray(_to_numpy(_pool_column_key(pool, num_bands)))
+    n = int(key.shape[0])
+    if n == 0:
+        return []
+    starts = np.flatnonzero(np.r_[True, key[1:] != key[:-1]])
+    bounds = np.r_[starts, n]
+    spans = [
+        (int(key[bounds[i]]), int(bounds[i]), int(bounds[i + 1]))
+        for i in range(len(starts))
+    ]
+    if len({c for c, _, _ in spans}) != len(spans):
+        raise RuntimeError(
+            "convergence-driven in-model polish: the pool is not "
+            "column-ordered -- a (walker, band) column appears in more "
+            "than one contiguous run."
+        )
+    return spans
+
+
+def _converge_refill(active, queue, width):
+    """Top ``active`` up from ``queue`` without ever splitting a column.
+
+    ``active`` / ``queue`` are lists of ``(col_id, start, stop)`` spans (see
+    :func:`_converge_column_spans`). Columns move from the front of the
+    queue into ``active`` while the total row count stays within ``width``;
+    a single column wider than ``width`` is taken whole (the rule
+    :func:`_column_chunks` already uses) but only into an EMPTY active set,
+    so it never evicts carried-over work. Returns new lists; the inputs are
+    not mutated.
+    """
+    active = list(active)
+    queue = list(queue)
+    rows = sum(stop - start for _, start, stop in active)
+    while queue:
+        _, start, stop = queue[0]
+        w = stop - start
+        if rows + w <= width or not active:
+            active.append(queue.pop(0))
+            rows += w
+        else:
+            break
+    return active, queue
+
+
+def _converge_take(pool, spans, xp):
+    """The sub-pool holding exactly the rows of ``spans``, in span order."""
+    if not spans:
+        return None
+    idx = np.concatenate(
+        [np.arange(s, e, dtype=np.int64) for _, s, e in spans]
+    )
+    idx = xp.asarray(idx)
+    return {k: v[idx] for k, v in pool.items()}
+
+
+def _converge_gate_mask(t_i, n_gate, xp):
+    """Which rows the ladder gate is allowed to wait on.
+
+    ``True`` for rows currently on rung ``t < n_gate`` -- the COLD half by
+    default. Evaluated on the live ``t_i``, because a vertical swap moves
+    rows between rungs: the gate is a property of the rung, not of the row.
+
+    ``n_gate=None`` (the whole ladder) and the degenerate case where the
+    block happens to hold no gated row both fall back to "every row
+    gates", so the gate can only ever shorten a block that has a cold rung
+    to shorten it on -- never end one early because the pool's columns
+    happen to be hot-only.
+    """
+    if n_gate is None:
+        return xp.ones(t_i.shape, dtype=bool)
+    mask = t_i < int(n_gate)
+    if not bool(mask.any()):
+        return xp.ones(t_i.shape, dtype=bool)
+    return mask
+
+
+#: Repeats between host polls of the convergence latch. Detection is exact
+#: per repeat (device-side); only ACTING on it -- rebuilding the row sets,
+#: ending the block -- costs a sync, so it is amortized. Deliberately a
+#: constant and not a knob: it trades at most this many wasted repeats per
+#: converged row against one host sync, and there is no regime where a user
+#: should be tuning it.
+_CONVERGE_POLL_EVERY = 5
+
+
+class _InModelGroupState:
+    """Per-``(walker, band)`` convergence for ONE in-model proposal GROUP.
+
+    USER SPEC 2026-09-24: *"I want to run it until each (band, walker)'s
+    cold-chain logL has converged. I want the logL of the whole sub-band
+    tracked for each (band, walker). When that logL converges, shutoff that
+    band, walker ... this shutoff is within one proposal, whereas the other
+    shutoff being worked on is per recipe stage."*
+
+    THREE CONVERGENCE SCOPES EXIST AND THEY ARE EASY TO CONFUSE:
+
+    ======  =========================  ====================  ==================
+    unit    statistic                  clock                 lifetime
+    ======  =========================  ====================  ==================
+    row     accepted ``delta_ll``      one in-model REPEAT   one repeat block,
+            (:class:`_InModelConvergeState`)                 newborns only
+    (w, b)  sub-band COLD-CHAIN logL   one in-model PASS     one in-model
+            (THIS class)                                     proposal GROUP
+    (w, b)  sub-band COLD-CHAIN logL   one sampler ITER      one recipe stage
+            (``band_shutoff_w_*``, peer session)
+    ======  =========================  ====================  ==================
+
+    ⚠ The third scope moved from a converged LEAF COUNT to a converged logL
+    (user, 2026-09-24), so scopes 2 and 3 now differ ONLY in clock and
+    lifetime -- same unit, same statistic. That makes them very easy to
+    mistake for each other in a log or a traceback, which is why everything
+    here carries an explicit ``group`` infix (``GB_INMODEL_GROUP_*``,
+    ``_group_shutoff_wb``, ``[GB_IMGROUP]``) against the stage-scoped
+    ``_w`` family. If the two rules are ever unified, this class is the one
+    with the finer clock and the shorter lifetime.
+
+    **The statistic is free.** Do NOT measure the sub-band likelihood: that
+    is ``_cap_stats_local``'s full residual reduction, and it would be paid
+    once per pass. ``run_proposal`` already returns ``ll_change_log`` with
+    shape ``(ntemps, nwalkers, num_bands)`` -- the total ACCEPTED
+    ``delta_ll`` per cell for that pass. Row 0 is the COLD rung, so
+    ``ll_change_log[0]`` IS the per-``(walker, band)`` cold-chain logL change
+    of the pass, already computed, and summing it across passes is that
+    sub-band's cold logL trajectory up to an additive constant.
+
+    It is also reference-invariant for the same reason the per-row gain is:
+    an absolute sub-band likelihood carries the sig-het offset (1-17 lnL
+    cold) and is re-anchored mid-block, which would inject a step far above
+    the threshold into the very quantity being tested. A sum of accepted
+    deltas carries none of it.
+
+    The rule is the ring-buffer form, per ``(walker, band)``::
+
+        G     = running sum over passes of ll_change_log[0, w, b]
+        best  = max(best, G)
+        shut when  passes >= W  and  best - best_at(passes - W) <= thresh
+
+    ⚠ THE THRESHOLD IS PER SUB-BAND, NOT PER SOURCE, so time-to-converge
+    scales with occupancy: a band holding 50 sources each gaining 0.1 posts
+    5.0 and keeps running, while a band holding 2 cannot clear 4.0 even
+    while both climb. ``scale="per_source"`` divides the band's gain by its
+    live cold source count before the test, making the threshold a per-source
+    rate instead. Default ``"flat"`` (the literal reading of the spec); both
+    numbers are logged every pass so the choice can be made from data.
+    """
+
+    def __init__(self, window, thresh, max_passes, scale="flat"):
+        self.window = int(window)
+        self.thresh = float(thresh)
+        self.max_passes = int(max_passes)
+        self.scale = str(scale)
+        self.passes = 0
+        self._best = None      # (nwalkers, num_bands) running max of G
+        self._ring = None      # (window, nwalkers, num_bands)
+        self._gain = None      # (nwalkers, num_bands) cumulative cold gain
+        self.shut = None       # (nwalkers, num_bands) bool
+        self.shut_at = None    # (nwalkers, num_bands) pass index it shut
+        self.occupied = None   # (nwalkers, num_bands) bool, last census
+        self.occ_count = None  # (nwalkers, num_bands) live cold counts
+
+    def _alloc(self, xp, shape):
+        self._best = xp.full(shape, -xp.inf)
+        self._ring = xp.full((self.window,) + tuple(shape), -xp.inf)
+        self._gain = xp.zeros(shape)
+        self.shut = xp.zeros(shape, dtype=bool)
+        self.shut_at = xp.zeros(shape, dtype=xp.int64)
+
+    def update(self, xp, cold_delta, occ_count):
+        """Fold one pass in. Returns the number of NEWLY shut pairs.
+
+        ``cold_delta`` is ``ll_change_log[0]`` for the pass (nwalkers,
+        num_bands). ``occ_count`` is the live COLD SOURCE COUNT per pair --
+        a count, not a mask, because ``scale="per_source"`` divides by it
+        (an early version took the mask and silently divided by 1.0, which
+        made the two scales identical; ``test_per_source_scaling_removes_
+        that_asymmetry`` pins it).
+
+        An UNOCCUPIED pair is shut immediately and permanently -- it has
+        nothing to converge, and leaving it open would hold the group open
+        forever (the same trap the peer's stage-scoped valve documents for
+        empty pairs, resolved here in the opposite direction because this
+        group must terminate inside one propose).
+        """
+        if self._best is None:
+            self._alloc(xp, tuple(cold_delta.shape))
+        occupied = occ_count > 0
+        self.occupied = occupied
+        self.occ_count = occ_count
+        self._gain = self._gain + cold_delta
+        if self.scale == "per_source":
+            n = xp.maximum(occ_count.astype(self._gain.dtype), 1.0)
+            stat = self._gain / n
+        else:
+            stat = self._gain
+        self._best = xp.maximum(self._best, stat)
+        slot = self.passes % self.window
+        old = self._ring[slot].copy()
+        self._ring[slot] = self._best
+        was = self.shut
+        flat = (self.passes >= self.window) & (
+            (self._best - old) <= self.thresh)
+        self.shut = self.shut | flat | (~occupied)
+        self.shut_at = xp.where(self.shut & ~was, self.passes + 1,
+                                self.shut_at)
+        self.passes += 1
+        return int(xp.count_nonzero(self.shut & ~was))
+
+    def all_shut(self, xp):
+        return bool(xp.all(self.shut)) if self.shut is not None else False
+
+    def census(self, xp):
+        """``(n_shut, n_open, n_occupied_open)`` -- host ints for the log."""
+        if self.shut is None:
+            return 0, 0, 0
+        n_shut = int(xp.count_nonzero(self.shut))
+        n_open = int(self.shut.size) - n_shut
+        n_occ_open = int(xp.count_nonzero(~self.shut & self.occupied))
+        return n_shut, n_open, n_occ_open
+
+
+class _InModelConvergeState:
+    """Per-ROW convergence bookkeeping, retired a COLUMN at a time.
+
+    USER SPEC 2026-09-24 (two rulings, both load-bearing):
+
+    * "convergence is determined for each individual temperature set per
+      (band, walker)" -- the test runs on EVERY ROW (one ``(temp, walker,
+      band)`` cell), on that row's own cell likelihood;
+    * "they move on and off from the search together ... you can turn them
+      off after they converged but cannot be removed from the active
+      computing area until all temperatures have converged" -- a converged
+      row is FROZEN (it stops proposing) but stays resident, and the whole
+      ``(walker, band)`` column leaves the block only once every one of its
+      rows is done. That is what keeps the vertical rung swaps legal: a
+      swap needs both partners co-resident.
+
+    The rule per row::
+
+        G_row = running sum of ACCEPTED delta_ll     # lnL gained so far
+        best  = max(best, G_row)                     # monotone
+        converged when  seen >= window  and
+                        best - best_at(seen - window) <= thresh
+
+    ``best_at(seen - window)`` comes from a ``(window, n_rows)`` ring
+    buffer. Read ``(thresh, window)`` as a RATE: a row is retired once its
+    best improves by less than ``thresh / window`` lnL per repeat --
+    D/2 = 4.0 over 50 repeats is 0.08 lnL/repeat.
+
+    **Why the GAIN and not the cell likelihood itself.** ``G_row`` equals
+    ``L_with(i) - L_with(0)`` exactly: every accepted move changes the
+    cell's whole-model likelihood by precisely its ``delta_ll`` and a
+    rejected one changes nothing. So the two differ by a per-row constant
+    and the rule above is identical either way -- except where the
+    constant MOVES, and it moves twice:
+
+    * ``ll_ref`` is a SIG-HET value. Its absolute offset from exact is
+      1-17 lnL on cold rungs (see the ``[GB_SIGHET ... AUDIT]`` line this
+      method emits, and ``sighet_inmodel_accuracy_law``), i.e. well ABOVE
+      a 4.0 threshold. That offset cancels in a delta and only in a delta
+      -- ``_anchor_err`` exists to report exactly this.
+    * production re-anchors that reference MID-BLOCK
+      (``GB_SIGHET_REFRESH_EVERY=25``, ``..._DPHASE=0`` -> every source,
+      every rung) and re-bases ``ll_ref`` against the new expansion point.
+      An absolute statistic takes a discontinuity there every 25 repeats
+      -- at the same cadence as the patience window.
+
+    ``G_row`` is immune to both: it accumulates only MH deltas, each taken
+    against whatever reference was live when the move was made. It is also
+    free -- ``delta_ll`` and ``accept`` already exist at the accept site,
+    where ``ll_change_log`` accumulates the same product per CELL. This
+    keeps a per-ROW copy instead, because a vertical swap exchanges the
+    per-cell ledgers while rows keep their own coordinates.
+
+    Why NOT the cap gate's literal form (``improved = L > best + thresh``
+    with a patience counter): that gate's clock is one whole sampler
+    iteration, so a steadily improving cell posts > D/2 per tick. A tick
+    HERE is one unthinned MH step, which turns the same code into a
+    per-step test that retires a row mid-climb (measured: a trace gaining
+    30 lnL over 60 repeats was retired at repeat 26 with 17.3 lnL still to
+    come -- see ``tests/test_inmodel_converge.py``).
+
+    State is keyed by SOURCE ID (the row's index in the band sorter), which
+    a vertical swap does not touch -- the swap exchanges temperature
+    LABELS, so a ``(temp, walker, band)`` key would follow the wrong row.
+    It PERSISTS across generations, ring buffer included, or a carried-over
+    row would have to re-earn the ``seen >= window`` warm-up before it
+    could ever be retired.
+    """
+
+    def __init__(self, window, thresh, max_repeats, stop_frac=1.0,
+                 observe=False, n_gate=None, refill=False):
+        self.window = int(window)
+        self.thresh = float(thresh)
+        self.max_repeats = int(max_repeats)
+        self.stop_frac = float(stop_frac)
+        self.observe = bool(observe)
+        # LADDER GATE (user ruling 2026-09-24: "make sure the upper half of
+        # temperatures do not hold us up, so once the lower have converged
+        # we can move on"). Only rungs ``t < n_gate`` are tested, frozen and
+        # allowed to gate the block's exit; hotter rungs keep sampling for
+        # the whole block and are released unfrozen when it ends.
+        #
+        # WHY the hot rungs cannot be held to this test: a hot chain accepts
+        # freely, so its gain RANDOM-WALKS rather than climbing, and the
+        # running max of a random walk keeps creeping (record statistics) --
+        # over a 50-repeat window that creep is easily > D/2. The hot rungs
+        # would therefore be the last to "converge" while being the rungs
+        # whose convergence means least, and the cold sources that ARE done
+        # would wait on them.
+        #
+        # WHY they are not frozen either: they are the transport that feeds
+        # good states down the ladder to the cold rungs still working. And
+        # it is nearly free -- the gate is what ends the block early, so the
+        # hot rungs were never going to run long once it fires.
+        self.n_gate = None if n_gate is None else max(1, int(n_gate))
+        self.refill = bool(refill)
+        self.generations = 0     # filled in by the driver, for the report
+        self.released = set()    # ungated rows the block ended under
+        self._gated = {}         # row id -> was it gated at block end
+        self._best = {}          # row id -> running max of G_row
+        self._ring = {}          # row id -> (window,) best-at-repeat ring
+        self._seen = {}          # row id -> repeats the row was PRESENT for
+        self._at = {}            # row id -> repeat at which it froze
+        self._gain = {}          # row id -> running sum of accepted deltas
+        self.converged = set()   # rows retired by the rule
+        self.capped = set()      # rows retired by the max_repeats ceiling
+
+    # -- block plumbing -------------------------------------------------
+    def gather(self, rows):
+        """Host arrays for ``rows`` (source ids), in that order."""
+        n = len(rows)
+        best = np.empty(n, dtype=np.float64)
+        ring = np.empty((self.window, n), dtype=np.float64)
+        seen = np.empty(n, dtype=np.int64)
+        gain = np.empty(n, dtype=np.float64)
+        done = np.empty(n, dtype=bool)
+        at = np.zeros(n, dtype=np.int64)
+        for i, r in enumerate(rows):
+            best[i] = self._best.get(r, -np.inf)
+            hist = self._ring.get(r)
+            ring[:, i] = -np.inf if hist is None else hist
+            seen[i] = self._seen.get(r, 0)
+            gain[i] = self._gain.get(r, 0.0)
+            done[i] = r in self.converged
+            at[i] = self._at.get(r, 0)
+        return best, ring, seen, gain, done, at
+
+    def absorb(self, rows, best, ring, seen, gain, done, at=None,
+               gated=None):
+        """Fold a finished block's arrays back into the persistent state.
+
+        ``gated`` is the ladder-gate mask as it stood when the block ended
+        (rung membership moves under the vertical swaps, so it is a
+        block-end fact, not a property of the row). Ungated rows are
+        recorded as RELEASED rather than converged or capped: the block
+        stopped because the cold half was done, and nothing was concluded
+        about them.
+        """
+        best = np.asarray(_to_numpy(best), dtype=np.float64)
+        ring = np.asarray(_to_numpy(ring), dtype=np.float64)
+        seen = np.asarray(_to_numpy(seen), dtype=np.int64)
+        gain = np.asarray(_to_numpy(gain), dtype=np.float64)
+        done = np.asarray(_to_numpy(done), dtype=bool)
+        at = (np.zeros(len(rows), dtype=np.int64) if at is None
+              else np.asarray(_to_numpy(at), dtype=np.int64))
+        gated = (np.ones(len(rows), dtype=bool) if gated is None
+                 else np.asarray(_to_numpy(gated), dtype=bool))
+        for i, r in enumerate(rows):
+            self._best[r] = float(best[i])
+            self._ring[r] = ring[:, i].copy()
+            self._seen[r] = int(seen[i])
+            self._gain[r] = float(gain[i])
+            self._gated[r] = bool(gated[i])
+            if at[i]:
+                self._at[r] = int(at[i])
+            if done[i] and gated[i]:
+                self.converged.add(r)
+            elif not gated[i]:
+                self.released.add(r)
+            elif self._seen[r] >= self.max_repeats:
+                self.capped.add(r)
+                self._at.setdefault(r, self._seen[r])
+
+    def row_retired(self, row):
+        """Is this ROW frozen (converged by the rule, or at the ceiling)?
+
+        ``released`` does NOT count: an ungated hot rung the block ended
+        under was never judged, and must not be reported as if it had
+        converged.
+        """
+        return row in self.converged or row in self.capped
+
+    def column_retired(self, rows):
+        """Can this COLUMN leave? When every GATED rung of it is done.
+
+        "All temperatures travel together" still holds -- the column leaves
+        whole, and nothing is removed from the buffer while the block runs.
+        What the ladder gate changes is only WHICH rungs get a vote: the
+        cold half decides, the hot half comes along.
+        """
+        gated = [r for r in rows if self._gated.get(r, True)]
+        if not gated:          # a column with no cold rung in this pool
+            gated = list(rows)
+        return all(self.row_retired(r) for r in gated)
+
+    def clock(self, row):
+        """Repeats this row was PRESENT for -- what the ring and the
+        ceiling are measured in. Advances for frozen rows too."""
+        return int(self._seen.get(row, 0))
+
+    def repeats(self, row):
+        """Repeats this row NEEDED: where it froze, or the clock if it is
+        still running. This is the number the report and any cost
+        comparison against the fixed budget want."""
+        if self.row_retired(row) and row in self._at:
+            return int(self._at[row])
+        return self.clock(row)
+
+    def gain(self, row):
+        return float(self._gain.get(row, 0.0))
+
+    def report(self, name, cls_name, col_of_row, rows, budget,
+               observe=False):
+        """One ``[GB_IMCONV]`` line for a finished in-model phase.
+
+        ``col_of_row`` maps each row id to its ``(walker, band)`` column id,
+        so the line can say how many COLUMNS fully retired (the unit the
+        user's "all temperatures travel together" rule is about) alongside
+        the per-row repeat distribution.
+        """
+        if not rows:
+            return
+        reps = np.array([self.repeats(r) for r in rows], dtype=np.int64)
+        gains = np.array([self.gain(r) for r in rows], dtype=np.float64)
+        conv = np.array([r in self.converged for r in rows])
+        capd = np.array([r in self.capped for r in rows])
+        rel = np.array([r in self.released for r in rows])
+        gated = np.array([self._gated.get(r, True) for r in rows])
+        cols = {}
+        for r in rows:
+            cols.setdefault(col_of_row[r], []).append(r)
+        col_done = sum(1 for rs in cols.values() if self.column_retired(rs))
+        budget = int(budget)
+        floor = self.window + 1          # the earliest the rule can fire
+
+        def _pc(a, q):
+            return float(np.percentile(a, q)) if a.size else float("nan")
+
+        # ---- LINE 1: what happened, and what it cost -------------------
+        # ``work`` is against the FIXED budget this mode replaces: below
+        # 1.0 the phase did less in-model work than the budget would have.
+        # Repeats only -- a refill's extra block setups are reported
+        # separately because they are priced in setups, not repeats.
+        logger.info(
+            "[GB_IMCONV %s] %s%s: %d row(s) in %d column(s) over %d "
+            "generation(s) -- converged %d (%.1f%%), at the %d-repeat "
+            "ceiling %d (%.1f%%), released unjudged (hot rungs) %d "
+            "(%.1f%%); columns fully retired %d/%d; work = %.2fx a fixed "
+            "%d-repeat budget, plus %d extra block setup(s) from the "
+            "refill (window %d, dll %.2f = %.3f lnL/repeat, floor %d).",
+            name, cls_name, " OBSERVE-ONLY" if observe else "",
+            len(rows), len(cols), max(self.generations, 1),
+            int(conv.sum()), 100.0 * conv.mean(),
+            self.max_repeats, int(capd.sum()), 100.0 * capd.mean(),
+            int(rel.sum()), 100.0 * rel.mean(),
+            col_done, len(cols),
+            float(reps.sum()) / max(len(rows) * max(budget, 1), 1),
+            budget, max(self.generations - 1, 0),
+            self.window, self.thresh,
+            self.thresh / max(self.window, 1), floor,
+        )
+
+        # ---- LINE 2: THE CALIBRATION LINE ------------------------------
+        # The one readout that says whether the rule MEANS anything. Two
+        # degenerate outcomes look identical in the repeat percentiles
+        # alone and are told apart only by the GAIN:
+        #   * everything piling up at the floor (W+1) with ~zero gain = the
+        #     rule never fired on evidence, it just ran the window out. That
+        #     is a constant budget of W, and GB_INMODEL_REPEATS_NEWBORN=W
+        #     buys it for free. A newborn born at an F-stat peak under phase
+        #     maximization is ALREADY at its ML point, which is exactly how
+        #     this arises -- the same shape as the leaf cap's
+        #     ghost-increment defect (_update_band_leaf_caps).
+        #   * a broad repeat spread with gains of order D/2 and up = rows
+        #     genuinely climbing at their own rates, which is the point.
+        # ``at floor`` is the headline: if it is ~100%, stop and recalibrate
+        # the threshold against a measured delta_ll distribution rather than
+        # the cap gate's per-ITERATION D/2.
+        _at_floor = int(np.count_nonzero(reps <= floor))
+        logger.info(
+            "[GB_IMCONV %s] %s calibration: repeats p10/p50/p90/max = "
+            "%.0f/%.0f/%.0f/%d, AT FLOOR (<=%d) %d (%.1f%%); lnL gained "
+            "per row p10/p50/p90 = %.2f/%.2f/%.2f (max %.1f), rows gaining "
+            "< dll(%.2f) = %d (%.1f%%); hist %s.",
+            name, cls_name,
+            _pc(reps, 10), _pc(reps, 50), _pc(reps, 90), int(reps.max()),
+            floor, _at_floor, 100.0 * _at_floor / len(rows),
+            _pc(gains, 10), _pc(gains, 50), _pc(gains, 90),
+            float(gains.max()),
+            self.thresh, int(np.count_nonzero(gains < self.thresh)),
+            100.0 * np.count_nonzero(gains < self.thresh) / len(rows),
+            self._hist(reps, budget),
+        )
+
+        # ---- LINE 3: cold (gated) vs hot (released) --------------------
+        # The ladder gate means these two populations are judged by
+        # different rules, so a pooled number hides which one is paying.
+        if gated.any() and (~gated).any():
+            logger.info(
+                "[GB_IMCONV %s] %s by rung: GATED %d row(s) repeats p50 "
+                "%.0f, lnL p50 %.2f, converged %.1f%% | RELEASED %d row(s) "
+                "repeats p50 %.0f, lnL p50 %.2f (never judged).",
+                name, cls_name,
+                int(gated.sum()), _pc(reps[gated], 50),
+                _pc(gains[gated], 50),
+                100.0 * conv[gated].mean(),
+                int((~gated).sum()), _pc(reps[~gated], 50),
+                _pc(gains[~gated], 50),
+            )
+
+    @staticmethod
+    def _hist(reps, budget):
+        """Compact repeat histogram -- a pile-up is obvious at a glance."""
+        edges = [0, 25, 50, 75, 100, 150, 200, 300, 400]
+        edges = sorted({e for e in edges if e <= max(int(reps.max()), 1)}
+                       | {max(int(reps.max()), 1)})
+        out, lo = [], 0
+        for hi in edges[1:] if len(edges) > 1 else edges:
+            n = int(np.count_nonzero((reps > lo) & (reps <= hi)))
+            if n:
+                out.append(f"{lo + 1}-{hi}:{n}")
+            lo = hi
+        return " ".join(out) or "-"
+
+    # -- the rule -------------------------------------------------------
+    @staticmethod
+    def step(xp, gain, best, ring, seen, rows_ar, window, thresh, done,
+             at=None):
+        """ONE repeat's update, vectorized over the block's rows.
+
+        ``gain`` is the running per-row sum of accepted ``delta_ll``.
+        ``ring`` and ``seen`` are updated IN PLACE; ``best`` and ``done``
+        are returned. ``done`` LATCHES -- a frozen row stops proposing, so
+        its gain no longer moves, and un-latching on a vertical swap would
+        be wrong anyway (the swap is a pure relabel: the row keeps its own
+        coordinates and its own likelihood).
+
+        Frozen rows are still stepped here. Their ``gain`` cannot move (no
+        proposal is made for them), so the update is a no-op that keeps
+        every per-row array the same length as the block -- cheaper and far
+        less error-prone than compacting the state arrays mid-block.
+        """
+        best = xp.maximum(best, gain)
+        slot = seen % int(window)
+        old = ring[slot, rows_ar]
+        ring[slot, rows_ar] = best
+        fresh = (
+            (seen >= int(window)) & ((best - old) <= float(thresh)) & ~done
+        )
+        done = done | fresh
+        if at is not None:
+            # The repeat a row froze at, for the report's "repeats needed"
+            # column -- ``seen`` keeps advancing for frozen rows (the ring
+            # is a sliding window over the block, not over the row's own
+            # activity), so it cannot answer that question itself.
+            at = xp.where(fresh, seen + 1, at)
+        seen += 1
+        return (best, done) if at is None else (best, done, at)
 
 
 def _buffer_fixed_capacity_active(sorter, kwargs) -> bool:
@@ -2914,6 +3629,44 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # Stays None on the FD path; the FD engine path doesn't touch it.
         self.gb_wdm_comp = gb_wdm_comp
         self.stop_here = True
+        # PERMUTED ("fancy") BAND-TEMPERATURE SWAPS -- the whole of
+        # ``run_tempering``. ``{BRANCH}_RUN_FANCY_TEMPERING=0`` forces it off for
+        # every move of the branch at once (user ruling 2026-09-24: "make
+        # sure the run_tempering is entirely turned off because we have no
+        # fancy swaps").
+        #
+        # ⚠ THIS IS THE ONLY RELIABLE OFF SWITCH. ``temper_every_proposes``
+        # (GB_TEMPER_EVERY_PROPOSES) only THROTTLES -- see
+        # ``_temper_cadence_fire``, where ``n <= 1`` returns True
+        # unconditionally, so 0 means "fire always", the exact opposite of
+        # off. And per-move ``run_swaps=`` is set from several different
+        # expressions in the recipe (``_temper_all_moves or not
+        # _temper_on_removal``, hard False on some moves), so there is no
+        # single recipe-level value to flip either.
+        #
+        # ⚠ It does NOT touch the per-repeat VERTICAL rung swaps
+        # (GB_TEMPER_VERTICAL). Those live inside the in-model loop, are
+        # ADDITIVE to the permuted swaps rather than part of them, and are
+        # the transport the convergence work depends on -- turning the
+        # fancy swaps off must not silently take them with it.
+        #
+        # Default: unset -> the caller's value -> today's behaviour exactly.
+        _rt = os.environ.get(f"{str(branch_name).upper()}_RUN_FANCY_TEMPERING")
+        if _rt is not None and _rt.strip().lower() in ("0", "false"):
+            if run_swaps and not getattr(
+                    type(self), "_fancy_tempering_off_logged", False):
+                type(self)._fancy_tempering_off_logged = True
+                logger.info(
+                    "[GB_TEMPER] %s_RUN_FANCY_TEMPERING=0: permuted band-temperature "
+                    "swaps (run_tempering) are OFF for every %s move. The "
+                    "per-repeat VERTICAL rung swaps are unaffected "
+                    "(%s_TEMPER_VERTICAL=%s).",
+                    str(branch_name).upper(), branch_name,
+                    str(branch_name).upper(),
+                    os.environ.get(
+                        f"{str(branch_name).upper()}_TEMPER_VERTICAL", "0"),
+                )
+            run_swaps = False
         self.run_swaps = run_swaps
         # Tempering cadence (user design 2026-08-14): a swap-enabled move
         # runs the band-swap stage only when at least this many TOTAL
@@ -3529,6 +4282,169 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             kwargs.get(
                 "inmodel_repeats_survivor_default", _surv_mode_default
             ),
+        )
+        # CONVERGENCE-DRIVEN in-model polish (user design 2026-09-24,
+        # GB_INMODEL_CONVERGE, default OFF = a hard no-op). Instead of
+        # spending the fixed per-class budget on every source, the
+        # newborn phase of the grouped RJ direct-batch path runs each
+        # (walker, band) COLUMN until its cell likelihood stops improving
+        # by D/2 over ``inmodel_converge_iters`` in-model repeats, retires
+        # it, and refills the freed slots from the pending pool. See
+        # ``_InModelConvergeState`` for the rule (and for why the cap
+        # gate's literal form does NOT port to a per-repeat clock) and
+        # ``_run_in_model_converge`` for the driver.
+        self.inmodel_converge = _resolve_converge_knob(
+            branch_name, "", kwargs.get("inmodel_converge", None),
+            kwargs.get("inmodel_converge_default", "off"),
+            _converge_cast_mode,
+        )
+        # W = 100 (user ruling 2026-09-24, raised from the 50 of the
+        # ruling earlier the same day). Read (thresh, W) as a RATE: a row
+        # is retired once its best improves by less than thresh/W lnL per
+        # repeat -- 0.04 at the defaults, which tracks climbs out to
+        # ~300 repeats (at W=50 the rule gave up on those at 76).
+        #
+        # ⚠ AT W=100 THIS MODE IS A SPEND, NOT A SAVING. The FLOOR -- what
+        # a row that converged instantly still pays -- is W + 1 = 101,
+        # already above the stock newborn budget of 100, so every row
+        # costs at least what it costs today and the slow tail costs up to
+        # the ceiling (4x). That is the deliberate trade: sources finish
+        # climbing instead of being cut off at a fixed 100. The
+        # [GB_IMCONV] work ratio reports the price per phase; W=50 (floor
+        # 51) is the setting that makes it a saving instead.
+        self.inmodel_converge_iters = _resolve_converge_knob(
+            branch_name, "iters", kwargs.get("inmodel_converge_iters", None),
+            kwargs.get("inmodel_converge_iters_default", 100),
+            _converge_cast_window,
+        )
+        # D/2 -- the same threshold, and the same reasoning, as the leaf
+        # cap's lnL-improvement gate (_update_band_leaf_caps): the log
+        # likelihood a genuinely new D-parameter source has to buy.
+        self.inmodel_converge_dll = _resolve_converge_knob(
+            branch_name, "dll", kwargs.get("inmodel_converge_dll", None),
+            kwargs.get("inmodel_converge_dll_default",
+                       0.5 * float(self.leaf_cap_ndim)),
+            float,
+        )
+        # Ceiling on the repeats ONE ROW may accumulate; 0 = 4x the class
+        # budget, resolved per class at the call site (400 at the stock
+        # newborn 100). This ceiling -- NOT the class budget -- is what
+        # bounds a block: "run in-model until each converges ... more than
+        # 100 steps, and the steps are unique to each walking source"
+        # (user, 2026-09-24). The class budget survives only as the scale
+        # the ceiling is derived from, and as the budget the fixed-budget
+        # path keeps using when this mode is off.
+        self.inmodel_converge_max = _resolve_converge_knob(
+            branch_name, "max", kwargs.get("inmodel_converge_max", None),
+            kwargs.get("inmodel_converge_max_default", 0), int,
+        )
+        # SWAP TRIGGER / tail control: end the block once this fraction of
+        # its (walker, band) COLUMNS has fully retired -- every gated rung
+        # of them frozen. With the refill on this is what "a full band is
+        # done, swap it out" means in practice; with it off it just trims
+        # the tail, which matters because a repeat is ~99% host-side launch
+        # overhead (v7: ~70 ms/step, 0.41 ms of it kernel), so a long tail
+        # of a handful of live rows still pays most of a full repeat.
+        #
+        # DEFAULT 0.5, NOT 1.0. At 1.0 the block runs until EVERY column is
+        # done, so they all retire together, nothing carries, and the
+        # refill loop degenerates into exactly the fixed chunk loop it
+        # replaced -- i.e. 1.0 silently disables the refill. Set it to 1.0
+        # deliberately when you want the freeze WITHOUT the swap-out (and
+        # then ``..._REFILL=0`` says so more honestly).
+        self.inmodel_converge_stop_frac = _resolve_converge_knob(
+            branch_name, "stop_frac",
+            kwargs.get("inmodel_converge_stop_frac", None),
+            kwargs.get("inmodel_converge_stop_frac_default", 0.5),
+            _converge_cast_swap_frac,
+        )
+        # LADDER GATE: the coldest fraction of the ladder is what the block
+        # waits on (user ruling 2026-09-24 -- "make sure the upper half of
+        # temperatures do not hold us up, so once the lower have converged
+        # we can move on"). 1.0 restores "every rung must converge".
+        # See _converge_gate_mask / _InModelConvergeState for why a hot
+        # rung cannot meaningfully pass this test and why it is still left
+        # sampling rather than frozen.
+        self.inmodel_converge_gate_frac = _resolve_converge_knob(
+            branch_name, "gate_frac",
+            kwargs.get("inmodel_converge_gate_frac", None),
+            kwargs.get("inmodel_converge_gate_frac_default", 0.5),
+            _converge_cast_swap_frac,
+        )
+        # COLUMN REFILL (user ruling 2026-09-24): when a whole band is
+        # done, swap it out for a new one instead of waiting on the
+        # others. ON with the mode. ⚠ each generation re-pays one block
+        # setup (~73 in-model repeats measured); 0 keeps every column in
+        # place for the life of its block, which is strictly cheaper in
+        # setups and strictly worse in slot occupancy. A/B it on the
+        # [GB_IMCONV] line's generation count and work ratio.
+        self.inmodel_converge_refill = _resolve_converge_knob(
+            branch_name, "refill",
+            kwargs.get("inmodel_converge_refill", None),
+            kwargs.get("inmodel_converge_refill_default", True),
+            _converge_cast_refill,
+        )
+        # Which pick-time provenance classes the driver runs. The ask was
+        # newborns ("when an rj is birthed"); mature survivors keep their
+        # fixed budget unless asked for explicitly.
+        self.inmodel_converge_classes = _resolve_converge_knob(
+            branch_name, "classes",
+            kwargs.get("inmodel_converge_classes", None),
+            kwargs.get("inmodel_converge_classes_default", "newborn"),
+            _converge_cast_classes,
+        )
+        # ---- IN-MODEL GROUP CONVERGENCE (user design 2026-09-24) ----------
+        # A PURE in-model move ({BRANCH}_INMODEL_GROUP=1, is_rj_prop=False
+        # only) repeats its whole pass until every (walker, band) sub-band's
+        # COLD-CHAIN logL has converged, shutting each sub-band off as it
+        # does. Scoped to ONE proposal -- see _InModelGroupState for the
+        # three-scope table and for why the statistic is a sum of accepted
+        # deltas rather than a measured sub-band likelihood.
+        self.inmodel_group = _resolve_converge_knob(
+            branch_name, "group", kwargs.get("inmodel_group", None),
+            kwargs.get("inmodel_group_default", False), _converge_cast_refill,
+        )
+        # W in PASSES of the whole move (not repeats). Small by construction:
+        # one pass is already num_repeat_proposals repeats per source, so the
+        # per-pass gain is a much coarser quantity than the per-repeat one
+        # and does not need the 100-repeat window the row rule does.
+        self.inmodel_group_iters = _resolve_converge_knob(
+            branch_name, "group_iters",
+            kwargs.get("inmodel_group_iters", None),
+            kwargs.get("inmodel_group_iters_default", 3),
+            _converge_cast_window,
+        )
+        self.inmodel_group_dll = _resolve_converge_knob(
+            branch_name, "group_dll", kwargs.get("inmodel_group_dll", None),
+            kwargs.get("inmodel_group_dll_default",
+                       0.5 * float(self.leaf_cap_ndim)),
+            float,
+        )
+        # ⚠ Hard bound on the passes. This group is unbounded by
+        # construction, so this is a COST knob, not a safety net: one pass
+        # is a full sweep of every source at num_repeat_proposals repeats.
+        self.inmodel_group_max_passes = _resolve_converge_knob(
+            branch_name, "group_max_passes",
+            kwargs.get("inmodel_group_max_passes", None),
+            kwargs.get("inmodel_group_max_passes_default", 20), int,
+        )
+        # USER RULING 2026-09-24: FLAT. "When a source is birthed, it is
+        # per-source. During the special in-model only proposals it is
+        # per-sub-band. I want flat D/2. This will focus more resources on
+        # the sub-bands with more sources."
+        #
+        # So the occupancy scaling is INTENDED, not a defect: a dense band
+        # posts a larger per-pass gain, clears the flat threshold for
+        # longer, and therefore gets more passes -- which is where the
+        # sources are. "per_source" (divide by the band's live cold count
+        # first) is kept as the alternative and is what the row-level rule
+        # effectively does at birth; both numbers are logged every pass so
+        # the ruling can be revisited against data rather than argument.
+        self.inmodel_group_scale = _resolve_converge_knob(
+            branch_name, "group_scale",
+            kwargs.get("inmodel_group_scale", None),
+            kwargs.get("inmodel_group_scale_default", "flat"),
+            _converge_cast_scale,
         )
         # Per-repeat VERTICAL band-temperature swaps inside the in-model
         # loop (default OFF = today's behavior). Additive to -- never a
@@ -6970,6 +7886,17 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # (and thus overwrite) its sources. Drop the top temperature from
             # eligibility -- replace runs on temps < hottest only.
             eligible = eligible & (band_sorter.temp_inds != (self.ntemps - 1))
+        # IN-MODEL GROUP SHUTOFF (user design 2026-09-24): a (walker, band)
+        # sub-band whose cold-chain logL converged earlier in THIS proposal
+        # group stops being sampled for the rest of it. Scoped to one
+        # proposal and cleared at group entry -- distinct from the per-band
+        # ``band_rj_shutoff`` and from the peer session's stage-scoped
+        # per-walker valve. All three compose by OR, and this is the single
+        # point where this one is applied.
+        _grp = getattr(self, "_group_shutoff_wb", None)
+        if _grp is not None:
+            eligible = eligible & ~_grp[
+                band_sorter.walker_inds, band_sorter.band_inds]
         # Unit-scoped eligibility, consumed by _run_rj_step's cap-transition
         # budget adjustment (counting a freed/re-capped cell's UNPICKED
         # staged birth rows requires knowing which main-sorter rows belong
@@ -7242,8 +8169,17 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # and was sliced blind, so a column's rungs landed in
                 # different chunks and the sweep found partners only by
                 # coincidence (job 465: none at T0-T1).
+                # The convergence mode needs the SAME column-atomic staging
+                # for its own reason -- it retires and refills whole
+                # (walker, band) columns, and a column split across chunks
+                # could not be retired as a unit -- so it forces the
+                # ordering even where ``temper_vertical`` is off.
+                _cv_any = (
+                    getattr(self, "inmodel_converge", "off") != "off"
+                    and _converge_stage_allows(self)
+                )
                 _vert_stage = (
-                    bool(getattr(self, "temper_vertical", False))
+                    (bool(getattr(self, "temper_vertical", False)) or _cv_any)
                     and self.ntemps > 1
                 )
                 if _vert_stage:
@@ -7271,7 +8207,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # classes (the host-side dedup above is class-blind).
                 for _cls_name, _cls in _split_by_newborn(merged, xp):
                     _cls_census[_cls_name] = int(len(_cls["specials"]))
-                    for chunk in _chunk_iter(_cls):
+                    # CONVERGENCE-DRIVEN budget for this class, or None to
+                    # keep the fixed one. When it is None the loop below is
+                    # the historical fixed-budget loop, unchanged.
+                    _cv = self._converge_state_for(_cls_name)
+                    _cv_reps = (
+                        _cls_reps[_cls_name] if _cv is None
+                        else max(_cv.max_repeats, _cls_reps[_cls_name])
+                    )
+
+                    def _polish(chunk, _cv=_cv, _cv_reps=_cv_reps,
+                                _cls_name=_cls_name):
+                        """One in-model block over ``chunk``."""
+                        nonlocal buffer_obj
                         buffer_obj = _rebind(chunk["specials"])
                         # RJ-time slot indices are stale after the rebind.
                         chunk["slot_index"] = buffer_obj.get_index(
@@ -7281,10 +8229,33 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                                 model, band_sorter, buffer_obj, band_temps,
                                 chunk, ll_change_log, prop_counts,
                                 acc_counts,
-                                num_repeats=_cls_reps[_cls_name],
+                                num_repeats=(
+                                    _cv_reps if _cv is not None and
+                                    not _cv.observe
+                                    else _cls_reps[_cls_name]
+                                ),
                                 cell_ll_state=cell_ll_state,
+                                converge=_cv,
                             )
-                        n_chunks += 1
+
+                    if _cv is not None and _cv.refill and not _cv.observe:
+                        n_chunks += self._converge_refill_loop(
+                            _cls, _cv, _polish, _im_w, band_sorter, xp)
+                    else:
+                        for chunk in _chunk_iter(_cls):
+                            _polish(chunk)
+                            n_chunks += 1
+                    if _cv is not None:
+                        _cv.report(
+                            self.name, _cls_name,
+                            {int(i): int(w) * int(self.num_bands) + int(b)
+                             for i, w, b in zip(
+                                 _to_numpy(_cls["ids"]).tolist(),
+                                 _to_numpy(_cls["walker_inds"]).tolist(),
+                                 _to_numpy(_cls["band_inds"]).tolist())},
+                            [int(i) for i in _to_numpy(_cls["ids"]).tolist()],
+                            _cls_reps[_cls_name], observe=_cv.observe,
+                        )
             logger.info(
                 f"{self.name}: direct batches — {n_batches} rj batch(es), "
                 f"{n_surv} survivors polished in {n_chunks} in-model "
@@ -13485,7 +14456,89 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # exactly once, at the block-end log).
             "prop_by_rung_dev": None,
             "acc_by_rung_dev": None,
+            # PER-(BAND, RUNG-PAIR) counts, the shape _adapt_band_temps
+            # consumes: (num_bands, ntemps - 1), summed over WALKERS (user
+            # ruling 2026-09-24 -- "the tuning should be across walkers per
+            # band"; the band ladder has no walker axis). These exist so the
+            # ladder can be adapted from the VERTICAL swaps when the
+            # permuted ones are off -- see _vertical_ladder_counts.
+            "prop_by_bandrung_dev": None,
+            "acc_by_bandrung_dev": None,
         }
+
+    def _vertical_ladder_bank(self, census) -> None:
+        """Bank one block's per-(band, rung) vertical swap counts.
+
+        Accumulated across the whole PROPOSE (reset in
+        :meth:`_vertical_ladder_reset`) because ``_adapt_band_temps`` runs
+        once per propose and a single block's counts are far too sparse to
+        steer a ladder with.
+        """
+        for key, attr in (("prop_by_bandrung_dev", "_vert_ladder_prop"),
+                          ("acc_by_bandrung_dev", "_vert_ladder_acc")):
+            blk = census.get(key)
+            if blk is None:
+                continue
+            cur = getattr(self, attr, None)
+            setattr(self, attr, blk.copy() if cur is None else cur + blk)
+
+    def _vertical_ladder_reset(self) -> None:
+        """Clear the per-propose vertical ladder counts."""
+        self._vert_ladder_prop = None
+        self._vert_ladder_acc = None
+
+    def _vertical_adapt_ladder(self, band_temps) -> bool:
+        """Adapt the band temperature ladder from the VERTICAL swaps.
+
+        USER REQUEST 2026-09-24, and it closes a hole that
+        ``{BRANCH}_RUN_FANCY_TEMPERING=0`` would otherwise open:
+        ``_adapt_band_temps`` is called from exactly ONE place --
+        ``run_tempering`` -- so turning the permuted swaps off does not
+        merely stop those swaps, it FREEZES THE LADDER for the whole run.
+        Nothing would have logged that; the ladder would simply stop
+        moving. This routes the same adaptation off the vertical rung
+        swaps instead, which are still running.
+
+        The statistic is the vertical sweep's own per-``(band, rung-pair)``
+        accepted/proposed census, summed over WALKERS ("the tuning should
+        be across walkers per band") -- which is both the right pooling
+        (the band ladder has no walker axis) and the same
+        ``(num_bands, ntemps - 1)`` shape ``run_tempering`` hands over, so
+        ``_adapt_band_temps`` is reused verbatim rather than reimplemented.
+
+        A vertical pair and a permuted pair are the same MH question --
+        "should these two adjacent rungs of this band exchange?" -- so
+        their acceptance ratios drive the ladder the same way. What differs
+        is only WHICH pairs get asked, and the vertical sweep asks far more
+        of them per propose.
+
+        Returns True when the ladder was adapted (so the caller can log it).
+        """
+        prop = getattr(self, "_vert_ladder_prop", None)
+        acc = getattr(self, "_vert_ladder_acc", None)
+        if prop is None or acc is None:
+            return False
+        if self.temperature_control is None or self.ntemps <= 1:
+            return False
+        n_prop = int(prop.sum())
+        if n_prop <= 0:
+            # Nothing was proposed anywhere -- adapting on an all-zero
+            # ratio column would drag every rung toward each other for a
+            # reason that is an absence of data, not a measurement.
+            logger.info(
+                "[GB_TEMPER %s] vertical ladder adaptation SKIPPED: no "
+                "vertical swap was proposed this propose.", self.name)
+            return False
+        self._adapt_band_temps(band_temps, acc, prop)
+        _r = float(acc.sum()) / max(n_prop, 1)
+        logger.info(
+            "[GB_TEMPER %s] ladder adapted from VERTICAL swaps "
+            "(fancy tempering off): %d proposed / %d accepted (%.1f%%) "
+            "over %d band(s) x %d rung pair(s), pooled across walkers.",
+            self.name, n_prop, int(acc.sum()), 100.0 * _r,
+            int(prop.shape[0]), int(prop.shape[1]),
+        )
+        return True
 
     @staticmethod
     def _vertical_census_flush(census) -> None:
@@ -13702,6 +14755,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 census["prop_by_rung_dev"] = _pr.astype(xp.int64)
             else:
                 census["prop_by_rung_dev"] += _pr
+            # ... and the same census resolved PER BAND, which is what the
+            # ladder adaptation needs. Flattened (band, rung) bincount, one
+            # extra kernel, still no sync.
+            _nr = len(census["prop_by_rung"])
+            _pbr = xp.bincount(
+                b_i[cold].astype(xp.int64) * _nr + t_i[cold].astype(xp.int64),
+                minlength=int(self.num_bands) * _nr,
+            )[: int(self.num_bands) * _nr].reshape(int(self.num_bands), _nr)
+            if census.get("prop_by_bandrung_dev") is None:
+                census["prop_by_bandrung_dev"] = _pbr.astype(xp.int64)
+            else:
+                census["prop_by_bandrung_dev"] += _pbr
         # Swap RNG lives on its own stream: the in-model repeat loop's draw
         # count/order must not change, or the bit-exact accept-chain
         # reference test breaks for a reason unrelated to correctness.
@@ -13774,6 +14839,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 census["acc_by_rung_dev"] = _ar.astype(xp.int64)
             else:
                 census["acc_by_rung_dev"] += _ar
+            _nr = len(census["acc_by_rung"])
+            _abr = xp.bincount(
+                b_hc.astype(xp.int64) * _nr + t_c.astype(xp.int64),
+                minlength=int(self.num_bands) * _nr,
+            )[: int(self.num_bands) * _nr].reshape(int(self.num_bands), _nr)
+            if census.get("acc_by_bandrung_dev") is None:
+                census["acc_by_bandrung_dev"] = _abr.astype(xp.int64)
+            else:
+                census["acc_by_bandrung_dev"] += _abr
 
         # --- sorter: every source of both cells trades its temperature ---
         # BATCHED relabel (orchestration audit 2026-08-27): the per-pair
@@ -14281,10 +15355,356 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         )
         return buf["delta"], buf["lnp"], buf["acc"].view(bool)
 
+    def _group_state_or_none(self):
+        """A fresh :class:`_InModelGroupState`, or ``None`` when off.
+
+        PURE in-model moves only (``is_rj_prop=False``). An RJ move's pass
+        births and kills sources, so "the sub-band stopped improving" would
+        be a statement about the RJ, not about the polish, and shutting the
+        sub-band off would stop the search in it -- which is the
+        stage-scoped valve's job, on a much coarser clock, not this one's.
+        """
+        if not getattr(self, "inmodel_group", False):
+            return None
+        if not _converge_stage_allows(self):
+            # SEARCH ONLY. Two separate reasons, and the second is the one
+            # that bites here:
+            #  * stopping the passes on a plateau is OPTIONAL STOPPING on
+            #    the chain's own lnL, the same licence the row rule needs;
+            #  * the per-source effort is NON-UNIFORM by construction -- a
+            #    source whose sub-band shuts off early gets fewer sweeps
+            #    than one in a band that keeps earning passes. The user
+            #    ruled that acceptable IN SEARCH (2026-09-24, "this is okay
+            #    in search"), which is exactly the scope of
+            #    feedback_search_no_detailed_balance. In PE it is not: the
+            #    sweep count would depend on the state in a way the
+            #    posterior never sanctioned.
+            if not getattr(self, "_group_pe_warned", False):
+                self._group_pe_warned = True
+                logger.warning(
+                    "[GB_IMGROUP %s] %s_INMODEL_GROUP is set but this is a "
+                    "PE-stage move -- ignoring it. The group rule stops on a "
+                    "plateau and spends non-uniform effort per source; both "
+                    "are search-only licences.",
+                    self.name, str(self.branch_name).upper())
+            return None
+        if getattr(self, "is_rj_prop", False):
+            if not getattr(self, "_group_rj_warned", False):
+                self._group_rj_warned = True
+                logger.warning(
+                    "[GB_IMGROUP %s] %s_INMODEL_GROUP is set but this is an "
+                    "RJ move -- ignoring it. The group rule is for the pure "
+                    "in-model move only; on an RJ pass a flat sub-band logL "
+                    "means the BIRTHS stopped paying, which is the "
+                    "stage-scoped valve's decision to make, not this one's.",
+                    self.name, str(self.branch_name).upper())
+            return None
+        if not getattr(self, "_group_armed_logged", False):
+            self._group_armed_logged = True
+            logger.info(
+                "[GB_IMGROUP %s] armed: window %d pass(es), dll %.2f "
+                "(scale=%s), max %d passes, %d repeats/source/pass.",
+                self.name, self.inmodel_group_iters, self.inmodel_group_dll,
+                self.inmodel_group_scale, self.inmodel_group_max_passes,
+                int(self.num_repeat_proposals),
+            )
+        return _InModelGroupState(
+            window=self.inmodel_group_iters,
+            thresh=self.inmodel_group_dll,
+            max_passes=self.inmodel_group_max_passes,
+            scale=self.inmodel_group_scale,
+        )
+
+    def _group_cold_occupancy(self, band_sorter):
+        """``(nwalkers, num_bands)`` count of live COLD sources per pair."""
+        xp = self.xp
+        cold = (band_sorter.temp_inds == 0) & band_sorter.inds
+        idx = (band_sorter.walker_inds[cold].astype(xp.int64)
+               * int(self.num_bands)
+               + band_sorter.band_inds[cold].astype(xp.int64))
+        counts = xp.bincount(
+            idx, minlength=int(self.nwalkers) * int(self.num_bands))
+        return counts.reshape(int(self.nwalkers), int(self.num_bands))
+
+    def _run_group_passes(self, st, model, new_state, band_sorter,
+                          band_temps, ll_change_log):
+        """Repeat the pass until every ``(walker, band)`` sub-band is shut.
+
+        ``ll_change_log`` is the FIRST pass's, already run by the caller.
+        Returns the final pass's ``(ll_change_log, prop_counts,
+        acc_counts)`` so the caller's existing post-loop bookkeeping banks
+        the last delta exactly as it does on the single-pass path.
+        """
+        xp = self.xp
+        prop_counts = acc_counts = None
+        while True:
+            occ = self._group_cold_occupancy(band_sorter)
+            n_new = st.update(xp, ll_change_log[0], occ)
+            n_shut, n_open, n_occ_open = st.census(xp)
+            _tot = float(_to_numpy(ll_change_log[0].sum()))
+            logger.info(
+                "[GB_IMGROUP %s] pass %d: cold dlnL %+.3f over %d occupied "
+                "sub-band(s); shut %d (+%d this pass) / open %d (%d "
+                "occupied); mean gain/occupied band %+.3f, per source "
+                "%+.4f.",
+                self.name, st.passes, _tot,
+                int(_to_numpy(xp.count_nonzero(occ > 0))),
+                n_shut, n_new, n_open, n_occ_open,
+                _tot / max(int(_to_numpy(xp.count_nonzero(occ > 0))), 1),
+                _tot / max(float(_to_numpy(occ.sum())), 1.0),
+            )
+            if st.all_shut(xp):
+                logger.info(
+                    "[GB_IMGROUP %s] group CONVERGED after %d pass(es): "
+                    "every (walker, band) sub-band shut off.",
+                    self.name, st.passes)
+                break
+            if st.passes >= st.max_passes:
+                logger.warning(
+                    "[GB_IMGROUP %s] group hit the %d-pass CEILING with %d "
+                    "sub-band(s) still open (%d of them occupied) -- the "
+                    "group is a cost knob, not a safety net; raise "
+                    "%s_INMODEL_GROUP_MAX_PASSES or loosen "
+                    "%s_INMODEL_GROUP_DLL if this is routine.",
+                    self.name, st.max_passes, n_open, n_occ_open,
+                    str(self.branch_name).upper(),
+                    str(self.branch_name).upper())
+                break
+            # Bank this pass's cold delta before the next one, exactly as
+            # the reseed multi-pass path does.
+            new_state.log_like[0] += _to_numpy(ll_change_log.sum(axis=-1)[0])
+            # Publish the shutoff for the next pass's eligibility filter.
+            self._group_shutoff_wb = st.shut
+            # ⚠ ``has_run_rj`` marks every source consumed "for the
+            # remainder of this proposal" and is allocated ONCE per sorter
+            # (BandSorter.__init__), not per pass. Without this reset the
+            # second pass would pick NOTHING and the group would look
+            # instantly converged.
+            band_sorter.has_run_rj[:] = False
+            ll_change_log, prop_counts, acc_counts = self.run_proposal(
+                model, new_state, band_sorter, band_temps
+            )
+        self._group_report(st, xp)
+        if prop_counts is None:
+            # converged on the first pass: the caller's arrays are still
+            # the live ones.
+            return ll_change_log, None, None
+        return ll_change_log, prop_counts, acc_counts
+
+    def _group_report(self, st, xp):
+        """One closing ``[GB_IMGROUP]`` summary for the whole group."""
+        if st.shut is None:
+            return
+        at = _to_numpy(st.shut_at).ravel()
+        occ = _to_numpy(st.occupied).ravel() if st.occupied is not None else None
+        fired = at[at > 0]
+        if occ is not None:
+            occ_at = _to_numpy(st.shut_at)[_to_numpy(st.occupied)]
+            occ_at = occ_at[occ_at > 0]
+        else:
+            occ_at = fired
+        def _p(a, q):
+            return float(np.percentile(a, q)) if a.size else float("nan")
+        logger.info(
+            "[GB_IMGROUP %s] group done: %d pass(es) x %d repeats/source; "
+            "shut-off pass p10/p50/p90/max = %.0f/%.0f/%.0f/%.0f over all "
+            "pairs, %.0f/%.0f/%.0f/%.0f over OCCUPIED pairs; %d pair(s) "
+            "never shut. Compare against a fixed 5-pass block: %.2fx the "
+            "passes.",
+            self.name, st.passes, int(self.num_repeat_proposals),
+            _p(fired, 10), _p(fired, 50), _p(fired, 90),
+            float(fired.max()) if fired.size else float("nan"),
+            _p(occ_at, 10), _p(occ_at, 50), _p(occ_at, 90),
+            float(occ_at.max()) if occ_at.size else float("nan"),
+            int((at == 0).sum()), st.passes / 5.0,
+        )
+
+    def _converge_refill_loop(self, pool, state, polish, width, band_sorter,
+                              xp):
+        """Retire finished COLUMNS and refill their slots from ``pool``.
+
+        USER RULING 2026-09-24: *"when a full band is done, we should swap
+        it out for a new band, not wait for the other bands to converge."*
+
+        The unit is the whole ``(walker, band)`` column, so every rung of a
+        retiring band leaves together and every rung of an arriving one
+        arrives together -- the vertical swaps keep their partners on both
+        sides of the exchange. A generation ends when its block does (its
+        gated rungs reached ``stop_frac``); retired columns drop out,
+        unretired ones CARRY with their full state (gain, running best,
+        ring buffer, clock), and new columns come off the queue to fill the
+        freed width.
+
+        ``polish(chunk)`` runs one in-model block; it is the caller's
+        closure over the rebind so this loop stays testable without a
+        buffer. Returns the number of blocks run.
+
+        ⚠ COST. Each generation re-pays one block setup, measured at ~73
+        in-model repeats (cholesky + sig-het reference + buffer refill; see
+        the spec). This loop is therefore a throughput/occupancy trade, not
+        a free win, and the ``[GB_IMCONV]`` line reports the generation
+        count so the price stays visible. The optimization that would cut
+        it is ``_cached_get_buffer(fill_slots=...)`` -- refill only the
+        slots that actually changed -- but that argument gates the
+        residual/PSD copy WITHOUT gating the source re-injection, so a
+        carried slot would have its sources injected twice. Not attempted.
+        ``{BRANCH}_INMODEL_CONVERGE_REFILL=0`` turns the whole loop off and
+        keeps every column in its block for that block's life.
+        """
+        spans = _converge_column_spans(pool, self.num_bands)
+        queue, active = list(spans), []
+        n_blocks = 0
+        # Every generation either retires a column naturally or caps one
+        # below, so len(spans) + 1 is the true bound; the slack is only
+        # there so the guard reports a bug rather than masking one.
+        guard_max = len(spans) + 4
+        for guard in itertools.count(1):
+            if guard > guard_max:
+                # Cannot happen while a generation either retires a column
+                # or drains the queue; assert it rather than spin.
+                logger.warning(
+                    "[GB_IMCONV %s] refill loop hit its guard after %d "
+                    "generation(s) with %d column(s) still active -- "
+                    "finishing them in one block.",
+                    self.name, state.generations, len(active))
+                active = active + queue
+                if active:
+                    polish(_converge_take(pool, active, xp))
+                    n_blocks += 1
+                break
+            active, queue = _converge_refill(active, queue, width)
+            if not active:
+                break
+            # Cell labels move under the vertical swaps, so the pool's
+            # cached ``specials`` / ``temp_inds`` go stale the moment one is
+            # accepted. Re-read them from the sorter before every
+            # generation: the rebind AND ``get_index`` both resolve through
+            # those labels, and a stale one binds a row to another cell's
+            # slab with no error anywhere.
+            pool["specials"] = band_sorter.special_band_inds[pool["ids"]]
+            pool["temp_inds"] = band_sorter.temp_inds[pool["ids"]]
+            polish(_converge_take(pool, active, xp))
+            n_blocks += 1
+            state.generations += 1
+            rows_of = {
+                c: [int(i) for i in _to_numpy(pool["ids"][s:e]).tolist()]
+                for c, s, e in active
+            }
+            keep = [sp for sp in active
+                    if not state.column_retired(rows_of[sp[0]])]
+            if len(keep) == len(active):
+                # NO COLUMN RETIRED. Carrying the identical active set into
+                # another generation would re-pay the setup for exactly the
+                # same work and, with the width already full, would block
+                # the queue forever -- so force these columns off the
+                # working set at the ceiling instead. A block can land here
+                # legitimately: it exits on ``stop_frac`` or on the repeat
+                # ceiling, and with ``stop_frac < 1`` the frozen rows can be
+                # spread across columns so that no single column completes.
+                #
+                # This is what makes the loop terminate in at most one
+                # generation per column plus one: every generation either
+                # retires a column naturally or caps one here.
+                for sp in active:
+                    for r in rows_of[sp[0]]:
+                        if state._gated.get(r, True):
+                            state.capped.add(r)
+                            state._at.setdefault(r, state.clock(r))
+                if queue:
+                    logger.info(
+                        "[GB_IMCONV %s] generation %d retired no column "
+                        "(%d still short of the rule) -- capping them so "
+                        "the %d queued column(s) get the slots.",
+                        self.name, state.generations, len(active),
+                        len(queue),
+                    )
+                keep = []
+            active = keep
+        return n_blocks
+
+    def _converge_state_for(self, cls_name):
+        """A FRESH convergence state for one provenance class, or ``None``.
+
+        ``None`` means "keep the fixed budget", which is every case unless
+        ``{BRANCH}_INMODEL_CONVERGE`` was set. The state is deliberately
+        constructed here and referenced only by the caller's local, so it
+        dies with the in-model phase: nothing is stashed on ``self``.
+        That matters for three separate reasons --
+
+        * GB has no mid-iteration checkpoint hooks (the finest resume point
+          is the enclosing ``GFCombineMove`` boundary), so anything that
+          survived a propose would come back stale after a restart;
+        * band units partition the bands, so a column from unit *k* is not
+          even a candidate in unit *k+1* -- carried state would be dead
+          weight keyed by rows that cannot reappear;
+        * move objects must survive ``deepcopy`` / ``pickle`` (the
+          sprint-wide rule in CLAUDE.md), and a per-row dict of device-fed
+          floats is exactly the kind of runtime state that must not be
+          live at that moment.
+        """
+        mode = getattr(self, "inmodel_converge", "off")
+        if mode == "off":
+            return None
+        if cls_name not in getattr(
+                self, "inmodel_converge_classes", frozenset()):
+            return None
+        if not _converge_stage_allows(self):
+            # Optional stopping on the chain's own likelihood trajectory is
+            # a search tool; in PE it is a maximization the posterior never
+            # asked for. Warn ONCE per move so an operator who exported the
+            # knob run-wide can see which stages took it and which did not.
+            if not getattr(self, "_converge_pe_warned", False):
+                self._converge_pe_warned = True
+                logger.warning(
+                    "[GB_IMCONV %s] %s_INMODEL_CONVERGE is set but this is "
+                    "a PE-stage move -- keeping the fixed in-model budget. "
+                    "A convergence-plateau stop is optional stopping on the "
+                    "chain's own lnL trajectory, which is a search-only "
+                    "licence.", self.name, str(self.branch_name).upper(),
+                )
+            return None
+        _budget = int(
+            self.inmodel_repeats_newborn if cls_name == "newborn"
+            else self.inmodel_repeats_survivor
+        )
+        _ceiling = int(self.inmodel_converge_max) or 4 * _budget
+        _ceiling = max(_ceiling, self.inmodel_converge_iters + 1)
+        if not getattr(self, "_converge_armed_logged", False):
+            self._converge_armed_logged = True
+            logger.info(
+                "[GB_IMCONV %s] armed (%s): window %d, dll %.2f "
+                "(= %.3f lnL/repeat), ceiling %d, stop_frac %.2f, "
+                "gate = coldest %d/%d rung(s), refill %s, classes %s.",
+                self.name, mode, self.inmodel_converge_iters,
+                self.inmodel_converge_dll,
+                self.inmodel_converge_dll
+                / max(self.inmodel_converge_iters, 1),
+                _ceiling, self.inmodel_converge_stop_frac,
+                max(1, int(np.ceil(int(self.ntemps)
+                                   * float(self.inmodel_converge_gate_frac)))),
+                int(self.ntemps),
+                "on" if self.inmodel_converge_refill else "off",
+                ",".join(sorted(self.inmodel_converge_classes)),
+            )
+        # The gate line: how many of the COLDEST rungs get a vote on when
+        # the block may stop. ceil, so a fraction can never round to zero
+        # rungs and silently disarm the whole test.
+        _n_gate = max(1, int(np.ceil(
+            int(self.ntemps) * float(self.inmodel_converge_gate_frac))))
+        return _InModelConvergeState(
+            window=self.inmodel_converge_iters,
+            thresh=self.inmodel_converge_dll,
+            max_repeats=_ceiling,
+            stop_frac=self.inmodel_converge_stop_frac,
+            observe=(mode == "observe"),
+            n_gate=_n_gate,
+            refill=bool(self.inmodel_converge_refill),
+        )
+
     def _run_in_model_repeats(self, model, band_sorter, buffer_obj, band_temps,
                               picked, ll_change_log, prop_counts, acc_counts,
                               num_repeats=None, cell_ll_state=None,
-                              scheduler=None):
+                              scheduler=None, converge=None):
         """``num_repeats`` in-model rounds on the picked live sources.
 
         The picked source is first taken OUT of its cell residual, so every
@@ -14321,8 +15741,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # temperature LAST, so a column is one contiguous run of rows, and
         # never cut a sub-block inside a column. Row order is otherwise
         # immaterial to the block (every per-row array is gathered by row).
+        # COLUMN-ATOMIC STAGING is also what the convergence mode needs, and
+        # for its own reason: a column split across two sub-blocks would run
+        # two independent freeze/exit decisions over halves of the same
+        # ladder, so rungs that must travel together would stop at different
+        # repeats. ``temper_vertical`` is OFF in some configurations that
+        # would still arm the mode, hence the explicit ``or``.
         _vert_stage = (
-            bool(getattr(self, "temper_vertical", False)) and self.ntemps > 1
+            (bool(getattr(self, "temper_vertical", False))
+             or converge is not None)
+            and self.ntemps > 1
         )
         if _vert_stage and int(picked["ids"].shape[0]) > 1:
             picked = _order_pool_by_column(picked, xp, self.num_bands)
@@ -14371,7 +15799,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     model, band_sorter, buffer_obj, band_temps, _sub,
                     ll_change_log, prop_counts, acc_counts,
                     num_repeats=num_repeats, cell_ll_state=cell_ll_state,
-                    scheduler=scheduler,
+                    scheduler=scheduler, converge=converge,
                 )
             return
         n_rep = (
@@ -14647,9 +16075,24 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # invalidates every ``_t_s`` / ``beta_s`` / ``cold_s`` below. The
         # build is therefore a closure the sweep can re-run; left stale, the
         # next repeat would score at the wrong temperature SILENTLY.
+        # FREEZE mask (convergence mode only; None = every row proposes,
+        # which is the historical behavior byte for byte). A row that has
+        # converged is dropped from the per-half row sets here, so it costs
+        # nothing at all for the rest of the block -- no proposal, no prior,
+        # no ``get_add_ll``, no accept. This IS the user's "you can turn
+        # them off after they converged": the row stays resident (its
+        # column keeps every rung co-located for the vertical swaps, and
+        # the sweep still pairs it) but stops being sampled.
+        _cv_active = None
+
         def _build_half_pre():
             out = []
             for _sub in halves:
+                if _cv_active is not None:
+                    _sub = (xp.where(_cv_active)[0] if _sub is None
+                            else _sub[_cv_active[_sub]])
+                    if int(_sub.size) == 0:
+                        continue
                 _sl = slice(None) if _sub is None else _sub
                 _t_s = t_i[_sl]
                 _cold_s = _t_s == 0
@@ -14777,12 +16220,65 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             _cell_window = band_sorter.begin_cell_label_window(
                 band_sorter.get_special_band_index(t_i, w_i, b_i))
 
-        for move_i in range(n_rep):
+        # ---- CONVERGENCE-DRIVEN polish state (None = mode off) ----------
+        # Per-ROW: running gain, running best of that gain, the
+        # best-W-repeats-ago ring, the repeat clock, and the frozen latch.
+        # Seeded from the state object, which is keyed by SORTER ROW ID --
+        # stable under the vertical swap's relabel, and the key a later
+        # block of the same phase re-gathers by.
+        _cv_rows = _cv_best = _cv_ring = _cv_seen = None
+        _cv_gain = _cv_done = _cv_idx = _cv_at = None
+        _cv_colidx = _cv_ncols = None
+        _cv_observe = False
+        _cv_n_frozen = 0
+        if converge is not None:
+            _cv_observe = bool(getattr(converge, "observe", False))
+            _cv_rows = [int(v) for v in np.asarray(_to_numpy(ids)).ravel()]
+            _b0, _r0, _s0, _g0, _d0, _a0 = converge.gather(_cv_rows)
+            _cv_best = xp.asarray(_b0)
+            _cv_ring = xp.asarray(_r0)
+            _cv_seen = xp.asarray(_s0)
+            _cv_gain = xp.asarray(_g0)
+            _cv_done = xp.asarray(_d0)
+            _cv_at = xp.asarray(_a0)
+            _cv_idx = xp.arange(len(_cv_rows))
+            # Host-side (walker, band) column index for the exit test.
+            # Built ONCE: ``w_i`` / ``b_i`` are invariant for the block (a
+            # vertical swap moves only ``t_i``), so the column partition is
+            # fixed even though rung membership is not.
+            _cv_ck = np.asarray(_to_numpy(
+                _pool_column_key({"walker_inds": w_i, "band_inds": b_i},
+                                 self.num_bands)))
+            _cv_uni, _cv_colidx = np.unique(_cv_ck, return_inverse=True)
+            _cv_ncols = int(_cv_uni.shape[0])
+            if not _cv_observe and bool(_cv_done.any()):
+                # Rows already frozen by an earlier block of this phase
+                # never propose again -- gated rows only, so a hot rung
+                # that converged in an earlier block still transports here.
+                _cv_active = ~(
+                    _cv_done & _converge_gate_mask(t_i, converge.n_gate, xp)
+                )
+                _half_pre = _build_half_pre()
+                if _acc is not None:
+                    self._imk_rebuild_halves(_acc, _half_pre)
+
+        # Repeats actually EXECUTED. Equal to ``n_rep`` unless the
+        # convergence mode ends the block early; every log line below
+        # reports this rather than the budget.
+        _n_done = 0
+        for move_i in range(n_rep if _half_pre else 0):
           for _h_i, (sub, sl, n_sub, ids_s, slots_s, N_s, l_s, t_s, w_s, b_s,
                beta_s, n4_s, lo_s, hi_s, cold_s, n_cold_s) in enumerate(_half_pre):
-            if sub is not None:
+            if self.sequential_parity_repeats:
                 # Complement <- current state (including the other half's
                 # accepted moves) for this half's proposal.
+                #
+                # Gated on the KNOB, not on ``sub is not None`` (equivalent
+                # until 2026-09-24): the convergence mode's freeze makes
+                # ``sub`` an index array on the single-sweep path too, and
+                # syncing the sorter mid-block there would change what the
+                # group-stretch friend table reads -- a silent change to the
+                # proposal, not to the bookkeeping.
                 band_sorter.coords[ids] = curr
 
             with _tspan(tm, "inmodel_proposal"):
@@ -15207,6 +16703,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                             accept, _hh_full, self._sorter_hh[ids_s]
                         )
 
+            # Per-ROW lnL gain, the convergence rule's statistic: the SAME
+            # ``where(accept, delta_ll, 0)`` product ``ll_change_log``
+            # accumulates per CELL, kept per ROW because a vertical swap
+            # exchanges the per-cell ledgers while rows keep their own
+            # coordinates. One masked add per half per repeat, and nothing
+            # is read back to the host until the poll.
+            if _cv_gain is not None:
+                _cv_gain[sl] = _cv_gain[sl] + cp.where(accept, delta_ll, 0.0)
+
             # Guard at the CALL SITE (perf, 2026-08): the callee also checks
             # ``self.debug``, but its arguments — three ``asnumpy`` device
             # pulls — were evaluated unconditionally on EVERY in-model
@@ -15229,9 +16734,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             if (
                 sighet_active
                 # once per REPEAT: only after the last parity half-sweep
-                # (halves == [None] on the full-batch path, so this is
-                # always true there).
-                and sub is halves[-1]
+                # (there is one half on the full-batch path, so this is
+                # always true there). Compared by POSITION, not by
+                # ``sub is halves[-1]`` (equivalent until 2026-09-24): the
+                # convergence mode's freeze rebuilds ``_half_pre`` with
+                # masked index arrays, so the identity test would silently
+                # never fire and the reference would stop being refreshed.
+                and _h_i == len(_half_pre) - 1
                 and self.sighet_refresh_every > 0
                 and (move_i + 1) % self.sighet_refresh_every == 0
                 and move_i + 1 < n_rep
@@ -15306,6 +16815,85 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                   if _acc is not None:
                       self._imk_rebuild_halves(_acc, _half_pre)
 
+          # ---- CONVERGENCE rule + freeze/exit poll, once per repeat ----
+          # AFTER the vertical sweep -- and here that ORDER IS LOAD-BEARING,
+          # unlike the statistic itself (the sweep is a pure relabel and
+          # leaves every row's accumulated gain alone). The LADDER GATE
+          # below reads ``t_i``, which the sweep rewrites, so the gate has
+          # to be evaluated on the post-swap rung assignment: whichever
+          # rows are sitting in the cold half RIGHT NOW are the ones whose
+          # convergence the block waits on.
+          _n_done = move_i + 1
+          if _cv_gain is not None:
+              _cv_best, _cv_done, _cv_at = _InModelConvergeState.step(
+                  xp, _cv_gain, _cv_best, _cv_ring, _cv_seen, _cv_idx,
+                  converge.window, converge.thresh, _cv_done, _cv_at,
+              )
+              # The ONE host sync this mode adds, amortized over
+              # ``_CONVERGE_POLL_EVERY`` repeats. Detection is exact per
+              # repeat (the latch above is device-side); only ACTING on it
+              # -- rebuilding the row sets, deciding to stop -- is polled.
+              if (not _cv_observe
+                      and ((move_i + 1) % _CONVERGE_POLL_EVERY == 0
+                           or move_i + 1 == n_rep)):
+                  _cv_gated = _converge_gate_mask(
+                      t_i, converge.n_gate, xp)
+                  _frozen = _to_numpy(
+                      (_cv_done | (_cv_seen >= converge.max_repeats))
+                      & _cv_gated
+                  )
+                  _gated_h = _to_numpy(_cv_gated)
+                  _n_fr = int(np.count_nonzero(_frozen))
+                  # STOP on finished COLUMNS, not on a count of finished
+                  # rows (user's unit: "when a full BAND is done"). Two
+                  # reasons it has to be columns:
+                  #   * the refill swaps whole columns, so a row-count
+                  #     threshold can be met with the frozen rows spread
+                  #     thinly and NO band actually complete -- the
+                  #     refill's progress rule would then cap columns that
+                  #     only needed more time;
+                  #   * a column is what occupies buffer slots, so it is
+                  #     what freeing capacity is measured in.
+                  # A column counts as finished when every GATED rung of it
+                  # is frozen; one holding no gated rung at all (no cold
+                  # rung survived RJ there) has nothing to wait on.
+                  _g_cnt = np.bincount(
+                      _cv_colidx, weights=_gated_h.astype(np.float64),
+                      minlength=_cv_ncols)
+                  _f_cnt = np.bincount(
+                      _cv_colidx, weights=_frozen.astype(np.float64),
+                      minlength=_cv_ncols)
+                  _cols_done = int(np.count_nonzero(_f_cnt >= _g_cnt))
+                  if _cols_done >= converge.stop_frac * _cv_ncols:
+                      # Enough bands are done -- the hot rungs come along
+                      # rather than holding the block open, and the refill
+                      # loop hands their slots to the queue.
+                      _cv_n_frozen = _n_fr
+                      break
+                  if _n_fr != _cv_n_frozen:
+                      # Newly converged COLD rows stop proposing. Hot rows
+                      # keep sampling: they are the transport that feeds the
+                      # cold rungs still working.
+                      _cv_n_frozen = _n_fr
+                      _cv_active = xp.asarray(~_frozen)
+                      _half_pre = _build_half_pre()
+                      if _acc is not None:
+                          self._imk_rebuild_halves(_acc, _half_pre)
+                      if not _half_pre:
+                          break
+
+        # Fold the convergence state back into the phase-scoped object
+        # (block-local otherwise: nothing here outlives ``_run_band_unit``).
+        if _cv_gain is not None:
+            converge.absorb(
+                _cv_rows, _cv_best, _cv_ring, _cv_seen, _cv_gain, _cv_done,
+                _cv_at,
+                # The gate as it stood when the block ended: rung
+                # membership moves under the swaps, so this is a block-end
+                # fact. Ungated rows are recorded RELEASED, not converged.
+                _converge_gate_mask(t_i, converge.n_gate, xp),
+            )
+
         # Fold the fused kernel's device-side censuses back into the python
         # accumulators BEFORE the flush reads them, so the block-end logging
         # is byte-identical whichever path ran.
@@ -15356,7 +16944,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         f"[GB_CAPGATE {self.name}] vetoed {_n_dg} "
                         f"cross-cell in-model proposal(s) into at-cap "
                         f"cells this repeat block ({len(ids)} sources x "
-                        f"{n_rep} repeats)."
+                        f"{_n_done} repeats)."
                     )
 
         # ---- BLOCK BOUNDARY BARRIER (user ruling 2026-08-18) ----
@@ -15397,6 +16985,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     scheduler.relabel_slots(slots, _spec_final)
             _cn = _vert_census
             self._vertical_census_flush(_cn)
+            # Bank this block's per-(band, rung) counts for the ladder
+            # adaptation. Per PROPOSE, not per block: _adapt_band_temps is
+            # a once-per-propose operation and a single block's counts are
+            # far too sparse to steer a ladder with.
+            self._vertical_ladder_bank(_cn)
             _avail = _cn["paired"] / max(_cn["rows"], 1)
             _rate = _cn["accepted"] / max(_cn["proposed"], 1)
             # PAIR AVAILABILITY is the headline: a vertical swap needs both
@@ -15415,7 +17008,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 f"({_cn['paired']}/{_cn['rows']} rows had a partner over "
                 f"{_cn['sweeps']} sweeps) | proposed {_cn['proposed']} "
                 f"accepted {_cn['accepted']} ({100.0 * _rate:.1f}%) over "
-                f"{n_rep} repeats x {len(ids)} sources | "
+                f"{_n_done} repeats x {len(ids)} sources | "
                 f"cap-vetoed {int(_cn.get('cap_vetoed', 0))}"
                 f"{'' if _swap_cens is not None else ' (gate off)'} | "
                 f"per rung pair -- {_rungs or 'none'}"
@@ -15433,7 +17026,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 f"{self.name}: [GB_TRUST] {int(_tn[2])}/{_trust_seen} "
                 f"({100.0 * int(_tn[2]) / _trust_seen:.1f}%) in-model "
                 f"candidates rejected by the sig-het trust gate over "
-                f"{n_rep} repeats x {len(ids)} sources "
+                f"{_n_done} repeats x {len(ids)} sources "
                 f"(dlnA {int(_tn[0])}, dphase {int(_tn[1])}; "
                 f"dphase gate=[{float(trust_dphase.min()):.3g}.."
                 f"{float(trust_dphase.max()):.3g}] rad, "
@@ -15455,7 +17048,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             )
             logger.info(
                 f"{self.name}: sig-het end-of-block drift ({len(ids)} sources, "
-                f"{n_rep} repeats): phase max="
+                f"{_n_done} repeats): phase max="
                 f"{float(drift.max()):.3e} median={float(cp.median(drift)):.3e} rad, "
                 f"{n_over} over dphase={self.sighet_refresh_dphase}; "
                 f"|dlnA| max={float(damp.max()):.3e}.{_gate}"
@@ -20499,6 +22092,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 f"{num_active_leaves}")
             st_prop = time.perf_counter()
             self._replace_accept_forensics = []
+            # Per-propose vertical-swap ladder census (see
+            # _vertical_adapt_ladder).
+            self._vertical_ladder_reset()
             _reseed_firing = getattr(self, "_reseed_firing", False)
             _passes = self._cold_reseed_replace_passes() if _reseed_firing else 1
             _saved_temper_vertical = getattr(self, "temper_vertical", False)
@@ -23997,6 +25593,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # involved (two rj_replace drifts at 1.5-1.9e3 -- 3 orders above
         # every other move -- prompted this).
         self._replace_accept_forensics = []
+        # Per-propose vertical-swap ladder census (see _vertical_adapt_ladder).
+        self._vertical_ladder_reset()
         # reseed+replace combined proposal (v9): on the firing iteration go
         # around the alive-source group GB_COLD_RESEED_REPLACE_PASSES times
         # (default 3), and force vertical swaps ON for the in-model phase of
@@ -24010,19 +25608,35 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         _saved_temper_vertical = getattr(self, "temper_vertical", False)
         if _reseed_firing:
             self.temper_vertical = True
+        # IN-MODEL GROUP CONVERGENCE (user design 2026-09-24): a pure
+        # in-model move repeats its whole pass until every (walker, band)
+        # sub-band's cold-chain logL has converged. Rides the SAME
+        # multi-pass shape the reseed path established above -- each pass's
+        # cold delta is banked into log_like before the next one, and the
+        # final pass's is banked by the update after this block -- so the
+        # two differ only in how the pass count is decided.
+        _grp_state = self._group_state_or_none()
         try:
             with tm.span("run_proposal"):
                 ll_change_log, prop_counts, acc_counts = self.run_proposal(
                     model, new_state, band_sorter, band_temps
                 )
-                for _p in range(1, _passes):
-                    new_state.log_like[0] += _to_numpy(
-                        ll_change_log.sum(axis=-1)[0])
-                    ll_change_log, prop_counts, acc_counts = self.run_proposal(
-                        model, new_state, band_sorter, band_temps
+                if _grp_state is not None:
+                    _passes = self._run_group_passes(
+                        _grp_state, model, new_state, band_sorter,
+                        band_temps, ll_change_log,
                     )
+                    ll_change_log, prop_counts, acc_counts = _passes
+                else:
+                    for _p in range(1, _passes):
+                        new_state.log_like[0] += _to_numpy(
+                            ll_change_log.sum(axis=-1)[0])
+                        ll_change_log, prop_counts, acc_counts = self.run_proposal(
+                            model, new_state, band_sorter, band_temps
+                        )
         finally:
             self.temper_vertical = _saved_temper_vertical
+            self._group_shutoff_wb = None
         et_prop = time.perf_counter()
         # Diagnostic: per-temperature alive source counts after run_proposal
         _alive_per_temp_post_prop = [
@@ -24272,6 +25886,26 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # (num_bands, ntemps) summed over walkers. The two families are
         # recorded separately (one propose produces both kinds).
         sub = new_state.sub_states[self.branch_name]
+        # LADDER ADAPTATION WHEN THE PERMUTED SWAPS ARE OFF. Must land
+        # BEFORE the write-back on the next line, which is what persists
+        # band_temps into the state.
+        #
+        # AUTO by default, and deliberately so: _adapt_band_temps is called
+        # from run_tempering and nowhere else, so
+        # {BRANCH}_RUN_FANCY_TEMPERING=0 silently FREEZES the ladder for the
+        # whole run. Making the operator remember a second knob to avoid
+        # that is how a run quietly samples a fixed ladder for 2000
+        # iterations. "off"/"on" force it either way.
+        _vadapt = os.environ.get(
+            f"{str(self.branch_name).upper()}_VERTICAL_ADAPT_LADDER", "auto"
+        ).strip().lower()
+        if _vadapt == "auto":
+            _vadapt_on = (not self.run_swaps) and bool(
+                getattr(self, "temper_vertical", False))
+        else:
+            _vadapt_on = _vadapt in ("1", "true", "on")
+        if _vadapt_on:
+            self._vertical_adapt_ladder(band_temps)
         sub.band_info["band_temps"][:] = _to_numpy(band_temps)
         sub.band_info["band_num_binaries"][:] = band_info["band_counts"]
         sub.accumulate_proposals(
