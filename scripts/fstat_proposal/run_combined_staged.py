@@ -614,10 +614,26 @@ def build_fit():
         print(f"[combined] FIXED sensitivity (physical basis): "
               f"psd_params={_kw.get('psd_params')} "
               f"galfor_params={_kw.get('galfor_params')}", flush=True)
-        if "psd" in fit.branches:
+        # Which of the two actually reaches the likelihood depends on which
+        # BRANCHES are sampled, and the two answers differ -- say both out
+        # loud rather than leaving a pin to look live when it is not.
+        if "psd" in fit.branches and _psd_fixed:
             print("[combined] WARNING: PSD_FIXED_PARAMS set while the psd "
                   "branch is SAMPLED -- setup_acs takes the sampled "
-                  "coordinates and ignores fixed_psd_kwargs.", flush=True)
+                  "coordinates and IGNORES psd_params.", flush=True)
+        if _gal_fixed:
+            if "galfor" in fit.branches:
+                print("[combined] WARNING: GALFOR_FIXED_PARAMS set while the "
+                      "galfor branch is SAMPLED -- setup_acs takes the "
+                      "sampled coordinates and IGNORES galfor_params. Add "
+                      "galfor to REMOVE_BRANCHES to pin it.", flush=True)
+            else:
+                print("[combined] galfor branch REMOVED and galfor_params "
+                      "PINNED -- the foreground is held at the value above "
+                      "while psd stays sampled (run.py setup_acs). This is "
+                      "the loop-breaker configuration: galfor can no longer "
+                      "absorb unresolved GB and raise the search's own noise "
+                      "floor in the band those sources live in.", flush=True)
 
     if gb_only:
         # Branch-set sanity: gb only, or the composition is not what the

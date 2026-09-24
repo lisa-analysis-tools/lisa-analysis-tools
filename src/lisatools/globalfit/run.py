@@ -1599,10 +1599,16 @@ class GlobalFit:
                 psd_params, galfor_params, sgwb_params = _initial_fiducial_params()
             else:
                 psd_params = np.asarray(general_info.psd_injection, dtype=float)
+                # Same fallback as the sampled path: with the branch removed
+                # but a foreground PINNED, the coarse surrogate's fiducial
+                # should be that pinned shape, not a galaxy-free one. Delayed
+                # acceptance stays exact either way, so a mismatch here costs
+                # stage-1 screening efficiency rather than correctness.
+                _gal_fixed = (general_info.fixed_psd_kwargs or {}).get("galfor_params")
                 galfor_params = (
                     np.asarray(general_info.galfor_injection, dtype=float)
                     if "galfor" in branches
-                    else None
+                    else (None if _gal_fixed is None else np.asarray(_gal_fixed, dtype=float))
                 )
                 sgwb_params = (
                     np.asarray(general_info.sgwb_injection, dtype=float)
@@ -1875,7 +1881,29 @@ class GlobalFit:
                         else galfor_params
                     )
                 else:
-                    galfor_params = None
+                    # No galfor BRANCH, but a fixed foreground may still have
+                    # been supplied (GALFOR_FIXED_PARAMS ->
+                    # general.fixed_psd_kwargs). Falling through to None here
+                    # means "no galaxy", not "no galfor branch": at 1-3 mHz the
+                    # confusion is ~3x the instrument noise, so the floor
+                    # collapses and the GB search births into it.
+                    #
+                    # This is what lets the foreground be PINNED while psd and
+                    # gb stay sampled. Freezing galfor at a measured shape for
+                    # a gb_search stage breaks the self-shielding loop it
+                    # otherwise sits in: galfor absorbs the unresolved galaxy,
+                    # which raises the search's own noise floor in exactly the
+                    # band those sources live in, which stops them being
+                    # found, which keeps galfor high. (Measured on the 6mo run
+                    # 2026-09-23: 2x too high at 3.5 mHz, SNR x0.71, ~745
+                    # findable binaries hidden.)
+                    #
+                    # Unset -> None -> byte-identical to the previous
+                    # behaviour. Physical basis, no transform, same contract
+                    # as the fixed-sensitivity path below.
+                    galfor_params = (general_info.fixed_psd_kwargs or {}).get(
+                        "galfor_params"
+                    )
                 # only forward sgwb_params when the branch exists so the legacy
                 # XYZSensitivityBackend signature keeps working for runs without
                 # an sgwb branch
