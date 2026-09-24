@@ -49,18 +49,58 @@ _EXTRA = ("GB_ORTHO_LL_CHECK", "GB_INMODEL_SETUP_BATCH")
 
 _EXPORT = re.compile(r"""^export\s+([A-Z][A-Z0-9_]*)=("[^"]*"|'[^']*'|[^\s#]*)""")
 
+#: A whole-value shell parameter expansion: ``${NAME:-default}``, ``${NAME}``
+#: or ``$NAME``. These lines are NOT literal values, and copying them through
+#: sets a variable to the string "${NAME:-default}" -- which the consumer then
+#: tries to parse. Seen for real on 2026-09-24: the campaign script's
+#: ``export GB_SIGHET_FOLD_MAX_BYTES=${GB_SIGHET_FOLD_MAX_BYTES:-1073741824}``
+#: reached GBGPU's module-level ``int(os.environ.get(...))`` and killed the
+#: import before the fit existed -- an unreadable failure a long way from its
+#: cause.
+_PARAM = re.compile(
+    r"^\$\{([A-Z][A-Z0-9_]*)(?::-([^}]*))?\}$"   # ${NAME} / ${NAME:-default}
+    r"|^\$([A-Z][A-Z0-9_]*)$"                     # $NAME
+)
+
+
+def _resolve(value, environ):
+    """Resolve a whole-value parameter expansion; ``None`` if it cannot be.
+
+    ``${NAME:-default}`` means exactly what :func:`apply_pins` already does --
+    the shell's value wins, else the default -- so resolving it here keeps the
+    two consistent rather than inventing a second rule.
+
+    ``None`` means "do not pin this": a value still carrying a ``$`` is a
+    shell construct this parser does not model (a command substitution, an
+    arithmetic expansion, a concatenation), and pinning it LITERALLY is worse
+    than leaving it unset, because the stock default is at least a number.
+    """
+    if "$" not in value:
+        return value
+    m = _PARAM.match(value)
+    if m is None:
+        return None
+    name = m.group(1) or m.group(3)
+    got = environ.get(name)
+    return got if got is not None else m.group(2)
+
 #: amplitude, f0 [Hz], fdot, fddot, phi0, iota, psi, lambda, beta (GBGPU order)
 LOUD_INJECTION = [[1e-21, 7.5e-3, 1e-16, 0.0, 1.2, 0.9, 1.0, 4.0, -0.6]]
 
 
-def campaign_sighet_pins(path=CAMPAIGN_SCRIPT):
+def campaign_sighet_pins(path=CAMPAIGN_SCRIPT, environ=None):
     """``{NAME: value}`` for every sig-het ``export`` line of the campaign script.
 
     Only top-level ``export NAME=value`` lines count (the script's in-job
     block); a later export of the same name wins, like it does in the shell.
     Quotes are stripped; a trailing ``# comment`` is not part of the value.
+
+    A whole-value ``${NAME:-default}`` is RESOLVED (see :func:`_resolve`), and
+    anything else containing ``$`` is DROPPED rather than pinned literally --
+    the stock default beats a string the consumer cannot parse.
     """
-    pins = {}
+    environ = os.environ if environ is None else environ
+    pins, unresolved = {}, {}
     with open(path) as fh:
         for line in fh:
             m = _EXPORT.match(line)
@@ -71,7 +111,16 @@ def campaign_sighet_pins(path=CAMPAIGN_SCRIPT):
                 continue
             if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
                 value = value[1:-1]
-            pins[name] = value
+            resolved = _resolve(value, environ)
+            if resolved is None:
+                unresolved[name] = value
+                pins.pop(name, None)   # a later shell-y export un-pins an earlier one
+                continue
+            pins[name] = resolved
+    if unresolved:
+        print(f"[gate_run] NOT pinning {len(unresolved)} knob(s) whose campaign "
+              f"value is a shell expression this parser does not model "
+              f"(the stock default applies): {_fmt(unresolved)}", flush=True)
     return pins
 
 

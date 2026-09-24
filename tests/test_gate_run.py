@@ -28,7 +28,14 @@ class CampaignPinsTest(unittest.TestCase):
         self.assertEqual(self.pins["SIGHET_INFOMAT"], "1")
         self.assertEqual(self.pins["GB_SIGHET_INMODEL_WINDOWED"], "1")
         self.assertEqual(self.pins["GB_ORTHO_LL_CHECK"], "1")
-        self.assertEqual(self.pins["GB_INMODEL_SETUP_BATCH"], "0")
+        # 2048, not the 0 this asserted until 2026-09-24. The campaign script
+        # reads `export GB_INMODEL_SETUP_BATCH=${GB_INMODEL_SETUP_BATCH:-2048}`
+        # -- the batched in-model setup that, with the 1 GiB fold cap, is what
+        # fixed the 6-month sig-het OOM. This assertion could not have caught
+        # the drift while it was written, because the parser was handing back
+        # the LITERAL string "${GB_INMODEL_SETUP_BATCH:-2048}": the test was
+        # already red on dev, just for a different reason than it looked.
+        self.assertEqual(self.pins["GB_INMODEL_SETUP_BATCH"], "2048")
 
     def test_diagnostic_sweeps_are_not_mirrored(self):
         for name in self.pins:
@@ -43,6 +50,48 @@ class CampaignPinsTest(unittest.TestCase):
             self.assertNotIn("#", value, name)
             self.assertNotIn('"', value, name)
             self.assertNotIn(" ", value, name)
+
+    def test_no_pin_is_an_unexpanded_shell_expression(self):
+        """★ A pin carrying a literal ``$`` is a LANDMINE, not a value.
+
+        The campaign script writes
+        ``export GB_SIGHET_FOLD_MAX_BYTES=${GB_SIGHET_FOLD_MAX_BYTES:-1073741824}``.
+        Copied through verbatim, that string reached GBGPU's module-level
+        ``int(os.environ.get("GB_SIGHET_FOLD_MAX_BYTES", 1 << 30))`` and
+        killed the import -- on the cluster, mid-gate, with a traceback a
+        long way from its cause (2026-09-24). Every pin must be something
+        its consumer can actually parse.
+        """
+        for name, value in self.pins.items():
+            self.assertNotIn("$", value, f"{name}={value!r} is unexpanded")
+
+    def test_a_parameter_expansion_resolves_to_its_default(self):
+        pins = gate_run.campaign_sighet_pins(environ={})
+        self.assertEqual(pins["GB_SIGHET_FOLD_MAX_BYTES"], "1073741824")
+        self.assertEqual(int(pins["GB_SIGHET_FOLD_MAX_BYTES"]), 1 << 30)
+
+    def test_a_parameter_expansion_prefers_the_shell(self):
+        # ``${NAME:-default}`` means what apply_pins already means: the shell
+        # wins. Resolving it here must not invent a second rule.
+        pins = gate_run.campaign_sighet_pins(
+            environ={"GB_SIGHET_FOLD_MAX_BYTES": "4096"})
+        self.assertEqual(pins["GB_SIGHET_FOLD_MAX_BYTES"], "4096")
+
+    def test_an_unmodelled_shell_expression_is_dropped_not_pinned(self):
+        import tempfile, textwrap
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
+            fh.write(textwrap.dedent("""\
+                export SIGHET_N_CP=256
+                export SIGHET_NT_LAYER=$(compute_it)
+                export GB_SIGHET_REFRESH_EVERY=${A}${B}
+            """))
+            path = fh.name
+        pins = gate_run.campaign_sighet_pins(path, environ={})
+        # the plain one survives; the two shell-y ones are left to the stock
+        # default, which at least parses
+        self.assertEqual(pins.get("SIGHET_N_CP"), "256")
+        self.assertNotIn("SIGHET_NT_LAYER", pins)
+        self.assertNotIn("GB_SIGHET_REFRESH_EVERY", pins)
 
     def test_shell_value_wins_over_the_pin(self):
         env = {"SIGHET_NT_LAYER": "216"}
