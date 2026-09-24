@@ -5,8 +5,15 @@ Copy-paste commands for gates **G3, G4 and G5** of
 ~1.5 h of wall clock, of which G5 is the only part that answers the science
 question.
 
-Everything below assumes the branch `gpu-count-routing` is checked out on the
-cluster. It is not pushed yet — that is a prerequisite, not a step here.
+The routing merged to `dev` on 2026-09-23, so `git pull` on the cluster is the
+whole deployment — it is pure Python, with no native file touched and nothing
+to recompile. It is OPT-IN (`GF_GPU_ROUTING=1`, exported in §0), so a checkout
+carrying it behaves exactly as before until a run asks for it.
+
+**Progress (2026-09-24, 2 nodes × 2 GPUs):** §0 sanity ✔ · G3 at `NWALKERS=4`
+(`n_blocks=4 R=1`) ✔ · G3 at `NWALKERS=2` (`n_blocks=2 R=2 REPLICAS`) ✔ — the
+first time GPUs > walkers has resolved on hardware. Round-robin placement
+confirmed (A,B,A,B,A), each node's two compute ranks on distinct devices.
 
 ---
 
@@ -105,6 +112,14 @@ print(c.Get_rank(), c.Get_size(), socket.gethostname())"
 If `Get_size()` is 1 on every line, the launcher is making singleton worlds —
 stop and fix that before reading anything else as a layout result.
 
+> **`python -u` in every command below is load-bearing, not style.** These all
+> pipe into `tee`/`grep`, and Python block-buffers stdout when it is a pipe
+> rather than a tty. If the job then dies — an MPI abort `SIGKILL`s the
+> siblings — the buffer dies with it and the command prints NOTHING, which
+> reads as "no output, nothing happened" instead of "it died before
+> flushing". Cost two rounds of confusion on 2026-09-23.
+
+
 ---
 
 ## G3 — layout dry runs (~2 min, no GPU work)
@@ -116,16 +131,16 @@ cd "$LAT"
 for NW in 4 2 1 6 24; do
   echo "=== NWALKERS=$NW ==="
   GF_LAYOUT_DRY_RUN=1 NWALKERS=$NW \
-    mpiexec -n 5 -ppn 1 python scripts/run_global.py --stock gb_no_fg \
+    mpiexec -n 5 -ppn 1 python -u scripts/run_global.py --stock gb_no_fg \
     2>&1 | grep -E "walker-block layout|note:" | head -2
 done
 
 # explicit R, and a deliberately illegal one
 GF_LAYOUT_DRY_RUN=1 NWALKERS=4 RANKS_PER_BLOCK=4 \
-  mpiexec -n 5 -ppn 1 python scripts/run_global.py --stock gb_no_fg \
+  mpiexec -n 5 -ppn 1 python -u scripts/run_global.py --stock gb_no_fg \
   2>&1 | grep "walker-block layout" | head -1
 GF_LAYOUT_DRY_RUN=1 NWALKERS=4 RANKS_PER_BLOCK=3 \
-  mpiexec -n 5 -ppn 1 python scripts/run_global.py --stock gb_no_fg \
+  mpiexec -n 5 -ppn 1 python -u scripts/run_global.py --stock gb_no_fg \
   2>&1 | grep -oE "RANKS_PER_BLOCK=3 does not divide.*" | head -1
 ```
 
@@ -160,23 +175,34 @@ COMMON="NUM_ITERATIONS=4 GF_FANOUT_DIGEST=1"
 
 # (a) 4 blocks x R=1 -- today's walker-block layout
 env $COMMON FILE_STORE_DIR=$G/g4_a/ NWALKERS=4 RANKS_PER_BLOCK=1 \
-  mpiexec -n 5 -ppn 1 python scripts/diagnostics/gate_run.py --stock gb_no_fg \
+  mpiexec -n 5 -ppn 1 python -u scripts/diagnostics/gate_run.py --stock gb_no_fg \
   2>&1 | tee $G/g4_a.log | tail -5
 
 # (b) 2 blocks x R=2 -- THE NEW AXIS (previously impossible)
 env $COMMON FILE_STORE_DIR=$G/g4_b/ NWALKERS=2 RANKS_PER_BLOCK=2 \
-  mpiexec -n 5 -ppn 1 python scripts/diagnostics/gate_run.py --stock gb_no_fg \
+  mpiexec -n 5 -ppn 1 python -u scripts/diagnostics/gate_run.py --stock gb_no_fg \
   2>&1 | tee $G/g4_b.log | tail -5
 
 # (c) 1 block x R=4 -- one-walker replicas (the pre-existing mode)
 env $COMMON FILE_STORE_DIR=$G/g4_c/ NWALKERS=1 RANKS_PER_BLOCK=4 \
-  mpiexec -n 5 -ppn 1 python scripts/diagnostics/gate_run.py --stock gb_no_fg \
+  mpiexec -n 5 -ppn 1 python -u scripts/diagnostics/gate_run.py --stock gb_no_fg \
   2>&1 | tee $G/g4_c.log | tail -5
 ```
 
 **A FRESH `FILE_STORE_DIR` PER ARM IS MANDATORY.** A reused store RESUMES, and
 a walker-count mismatch aborts with "walker-count mismatch" — which looks like
 a layout failure and is not.
+
+> **Expect every block to STRADDLE BOTH NODES in arms (b) and (c), and do not
+> read the `[FANOUT]` times here as production numbers.** Blocks are
+> contiguous in compute-rank order, so at R=2 block 0 is ranks (0,1) — and
+> `-ppn 1` places those round-robin, i.e. on different hosts. The intra-block
+> ledger allgather therefore crosses the TCP fabric. Confirmed on hardware
+> 2026-09-24. It does not affect what G4 measures, which is whether the
+> factorization changes the ANSWER, not how fast it gets there. Production
+> co-locates a block instead: the submit script switches to
+> `--distribution=block:block` whenever `RANKS_PER_BLOCK > 1`, for exactly
+> this reason.
 
 Read out:
 
@@ -234,17 +260,17 @@ S="NWALKERS=1 NUM_ITERATIONS=5 GB_PROP_TIMING_SYNC=all"
 
 # R=1 -- baseline, ONE compute rank + saver, one GPU
 env $S FILE_STORE_DIR=$G/g5_r1/ GPUS=0 \
-  mpiexec -n 2 -ppn 1 python scripts/diagnostics/gate_run.py --stock gb_no_fg \
+  mpiexec -n 2 -ppn 1 python -u scripts/diagnostics/gate_run.py --stock gb_no_fg \
   2>&1 | tee $G/g5_r1.log | tail -3
 
 # R=2 -- two compute ranks + saver
 env $S FILE_STORE_DIR=$G/g5_r2/ GPUS=0,1 \
-  mpiexec -n 3 -ppn 1 python scripts/diagnostics/gate_run.py --stock gb_no_fg \
+  mpiexec -n 3 -ppn 1 python -u scripts/diagnostics/gate_run.py --stock gb_no_fg \
   2>&1 | tee $G/g5_r2.log | tail -3
 
 # R=4 -- four compute ranks + saver, both nodes
 env $S FILE_STORE_DIR=$G/g5_r4/ GPUS=0,1 \
-  mpiexec -n 5 -ppn 1 python scripts/diagnostics/gate_run.py --stock gb_no_fg \
+  mpiexec -n 5 -ppn 1 python -u scripts/diagnostics/gate_run.py --stock gb_no_fg \
   2>&1 | tee $G/g5_r4.log | tail -3
 ```
 
