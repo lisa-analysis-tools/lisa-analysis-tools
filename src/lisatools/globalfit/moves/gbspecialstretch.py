@@ -1873,17 +1873,21 @@ def _resolve_temper_vertical(branch_name, kwarg_value, default=False):
     return bool(value)
 
 
-def _resolve_temper_cell_order(branch_name, kwarg_value, default="count"):
+def _resolve_temper_cell_order(branch_name, kwarg_value, default="band"):
     """Resolve ``temper_cell_order`` for a move (kwarg > env > ``default``).
 
     ``{BRANCH}_TEMPER_CELL_ORDER`` selects how :class:`BandScheduler` orders
-    cells into buffer slots: ``"count"`` (today, best packing) or ``"band"``
-    (sub-band columns contiguous). See the ``BandScheduler`` docstring for
-    the measured effect on vertical-swap partner availability.
+    cells into buffer slots: ``"band"`` (sub-band columns contiguous, the
+    DEFAULT) or ``"count"`` (historical best-packing).
 
-    Deliberately SEPARATE from ``temper_vertical`` so the ordering change
-    can be A/B'd on its own: it alters scheduling for every GB proposal,
-    vertical swaps or not, and its packing cost must be attributable.
+    ⚠ HARD RULE (user ruling 2026-09-25): "all temperatures in (band,
+    walker) move together as a block at all times ... into the current
+    computation buffers." Only ``"band"`` can honour that -- under
+    ``"count"`` a column's cells are scattered through ``cell_specials``
+    and no contiguous staging slice keeps them together, so
+    ``BandScheduler.column_atomic`` switches itself off. The default was
+    ``"count"`` until 2026-09-25, which made the invariant an opt-in env
+    var; it is now the default and ``"count"`` warns.
     """
     value = kwarg_value
     if value is None:
@@ -1897,6 +1901,16 @@ def _resolve_temper_cell_order(branch_name, kwarg_value, default="count"):
         raise ValueError(
             f"temper_cell_order must be one of "
             f"{BandScheduler.CELL_ORDERS}, got {value!r}."
+        )
+    if value != "band":
+        logger.warning(
+            "[GB_COLUMN] %s_TEMPER_CELL_ORDER=%r BREAKS the column rule: "
+            "under 'count' a (walker, band) column's cells are scattered "
+            "through cell_specials, so BandScheduler cannot stage or retire "
+            "them as a unit and partial columns WILL reach the computation "
+            "buffers. Use 'band' unless you are deliberately reproducing "
+            "pre-2026-09-25 scheduling.",
+            str(branch_name).upper(), value,
         )
     return value
 
