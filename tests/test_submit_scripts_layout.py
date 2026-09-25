@@ -403,6 +403,78 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         self.assertEqual(drift, {}, f"undeclared v8 -> v9 drift: {drift}")
 
 
+class V9RankLayoutTest(unittest.TestCase):
+    """What (NGPUS, NWALKERS) actually resolve to, run against the SCRIPT's
+    own arithmetic rather than a reimplementation of it.
+
+    Written 2026-09-24 while the user was testing the NWALKERS/NGPU shape.
+    The hazard is not a crash: a NWALKERS that does not divide N_COMPUTE is
+    ROUNDED UP rather than refused, and the store then LOCKS to the rounded
+    value for its whole life (a resume refuses any change). So testing at one
+    value and launching at another silently produces a different run.
+    """
+
+    #: The two formulas this pins, quoted from the script so a drift in
+    #: either place fails here rather than at launch.
+    N_COMPUTE_SRC = ("N_COMPUTE_EFF=$(( ${SLURM_NNODES:-1} * _NGPUS_EFF "
+                     "* RANKS_PER_GPU / _k ))")
+    ROUND_SRC = "export NWALKERS=$(( (NWALKERS / N_COMPUTE_EFF + 1) * N_COMPUTE_EFF ))"
+
+    def setUp(self):
+        self.src = open(SIX_MO_V9).read()
+
+    def test_the_formulas_are_still_the_ones_modelled_here(self):
+        """If either line changes, the expectations below are stale and must
+        be re-derived -- fail loudly instead of asserting against fiction."""
+        self.assertIn(self.N_COMPUTE_SRC, self.src)
+        self.assertIn(self.ROUND_SRC, self.src)
+
+    @staticmethod
+    def _resolve(ngpus, nwalkers, ranks_per_gpu=1, gpus_per_rank=1):
+        nodes, gpus_per_node = (2, 2) if ngpus == 4 else (1, 2)
+        n_compute = nodes * gpus_per_node * ranks_per_gpu // gpus_per_rank
+        if n_compute > 1 and nwalkers == 1:
+            return n_compute, 1, "replica"
+        if n_compute > 0 and nwalkers % n_compute:
+            nwalkers = (nwalkers // n_compute + 1) * n_compute
+            return n_compute, nwalkers, "rounded"
+        return n_compute, nwalkers, "exact"
+
+    def test_the_intended_4gpu_shape_needs_no_rounding(self):
+        """NGPUS=4, NWALKERS=4 -> N_COMPUTE 4, one walker per rank, exact."""
+        n_compute, nw, how = self._resolve(4, int(self.v9_nwalkers()))
+        self.assertEqual((n_compute, nw, how), (4, 4, "exact"))
+
+    def v9_nwalkers(self):
+        return _exports(SIX_MO_V9)["NWALKERS"]
+
+    def test_the_script_ships_the_shape_that_divides(self):
+        self.assertEqual(int(self.v9_nwalkers()), 4)
+
+    def test_non_multiples_are_ROUNDED_not_refused(self):
+        """⚠ The quiet one. Only a [SUBMIT] line marks it, and the store then
+        locks to the rounded number."""
+        for asked, got in ((2, 4), (3, 4), (5, 8), (6, 8), (10, 12)):
+            n_compute, nw, how = self._resolve(4, asked)
+            self.assertEqual((nw, how), (got, "rounded"),
+                             f"NGPUS=4 NWALKERS={asked}")
+
+    def test_one_walker_is_replica_mode_not_a_rounding(self):
+        self.assertEqual(self._resolve(4, 1)[2], "replica")
+        self.assertEqual(self._resolve(2, 1)[2], "replica")
+
+    def test_ranks_per_gpu_2_gives_EIGHT_compute_ranks_not_five(self):
+        """The script's old comment claimed 'NGPUS=4 needs 5 compute ranks
+        with RANKS_PER_GPU=2'. It does not -- that gives 8, and 5 is not
+        reachable from 4 GPUs at all. Pinned so the corrected comment cannot
+        quietly revert."""
+        self.assertEqual(self._resolve(4, 8, ranks_per_gpu=2)[0], 8)
+        # The script still QUOTES the old claim in order to correct it, so
+        # test for the correction rather than the absence of the string.
+        self.assertIn("that is wrong", self.src)
+        self.assertIn("RANKS_PER_GPU=2 gives N_COMPUTE=8, not 5", self.src)
+
+
 class ThreeMonthTwinTest(unittest.TestCase):
     """``submit_gf_3mo_v8_4gpu.sh`` is the 6mo script at 3 months.
 

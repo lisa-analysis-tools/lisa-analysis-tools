@@ -835,10 +835,24 @@ export NWALKERS=${NWALKERS:-4}
                                    # temps are independent axes. NEVER change
                                    # NWALKERS on a resume: the store carries the
                                    # walker axis. Under the walker-block layout
-                                   # NWALKERS must divide by N_COMPUTE (10 -> 2
-                                   # or 5 compute ranks; 4 GPUs need 5 compute
-                                   # ranks with RANKS_PER_GPU=2, or 8/12 walkers
-                                   # from the start of a run).
+                                   # NWALKERS must divide by N_COMPUTE, and
+                                   # N_COMPUTE = NNODES * GPUS_PER_NODE *
+                                   # RANKS_PER_GPU / GPUS_PER_RANK. At the
+                                   # intended NGPUS=4 shape that is
+                                   # 2 * 2 * 1 / 1 = 4, so NWALKERS=4 divides
+                                   # cleanly at 1 walker/rank and NOTHING is
+                                   # rounded. (The older note here claimed
+                                   # "4 GPUs need 5 compute ranks with
+                                   # RANKS_PER_GPU=2" -- that is wrong and was
+                                   # left over from the NWALKERS=10 plan:
+                                   # RANKS_PER_GPU=2 gives N_COMPUTE=8, not 5,
+                                   # and 5 is not reachable from 4 GPUs at all.)
+                                   # ⚠ A NON-MULTIPLE IS ROUNDED UP, not
+                                   # refused, and the store then LOCKS to the
+                                   # rounded value: at NGPUS=4, 2 and 3 both
+                                   # become 4, 5 and 6 become 8, 10 becomes 12.
+                                   # So test at the value you intend to launch
+                                   # -- a resume refuses any change.
                                    # Noise-block floor 2*ndim (galfor ndim 5
                                    # -> 10) still satisfied.
                                    # The dispatch's --export=ALL carries the
