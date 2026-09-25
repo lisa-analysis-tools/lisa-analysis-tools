@@ -8063,6 +8063,28 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
             pending = []
             _pooled_host = set()
+            # FROZEN CELLS, as a device array for the pick gate.
+            #
+            # ⚠ WHY THIS EXISTS. ``_pooled_host`` alone dedups the POOL, and
+            # it does so AFTER ``_run_rj_step`` has already proposed and
+            # accepted. That is not the serial-within-band rule: nothing
+            # stopped ``_pick_sources`` from picking a DIFFERENT dead slot
+            # in a cell that had just birthed (``has_run_rj`` retires each
+            # SOURCE, not each cell), so a second birth in the same cell was
+            # proposed, accepted, written into the state -- and then dropped
+            # by the pool dedup, so it was never polished. It sat at its
+            # birth coordinates for the rest of the run.
+            #
+            # Measured on the job-621 checkpoint: 33 of 96 (rung, walker)
+            # cells carried >1 leaf on the SINGLE injected source at
+            # 19.66822 mHz, summing to 1.5-3.4x its true amplitude, with the
+            # extra leaves at 0.76-0.99x each -- the unpolished signature.
+            #
+            # The staged-scheduler path (``blocked_specials=pending_specials``
+            # at the other call site) always had this. The DIRECT-BATCH path
+            # -- GB_RJ_DIRECT_BATCH=1, the production default -- did not, so
+            # the freeze was silently absent wherever it actually mattered.
+            _pooled_dev = None
             all_cells = scheduler.cell_specials
             n_slots = int(scheduler.n_slots)
             n_cells_total = int(scheduler.n_cells)
@@ -8104,6 +8126,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     with _tspan(tm, "pick"):
                         picked = self._pick_sources(
                             band_sorter, buffer_obj, bview, eligible,
+                            blocked_specials=_pooled_dev,
                         )
                     if picked is None:
                         break
@@ -8155,6 +8178,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         )
                         if _keep.any():
                             _pooled_host.update(_sp_h[_keep].tolist())
+                            # Refresh the pick gate. Rebuilt only when the
+                            # set actually grows, so a round that pools
+                            # nothing costs no transfer; the array is small
+                            # (one entry per frozen cell) next to the
+                            # per-round buffer work.
+                            _pooled_dev = xp.asarray(
+                                sorted(_pooled_host),
+                                dtype=band_sorter.special_band_inds.dtype)
                             _km = xp.asarray(_keep)
                             pending.append(
                                 {k: v[_km] for k, v in held.items()})
@@ -22307,6 +22338,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 "drift": drift,
                 "rj_at_cap": None if _at_cap is None else int(_to_numpy(_at_cap).sum()),
                 "timing": tm.snapshot(),
+                # VERTICAL-SWAP LADDER CENSUS, (num_bands, ntemps - 1).
+                # This block banked it per repeat in _vertical_ladder_bank;
+                # it has to travel because the HEAD owns the ladder. A rank
+                # must never adapt its own: the band ladder has no walker
+                # axis, so four ranks adapting from one walker each would
+                # diverge silently -- the same rule the permuted path
+                # already states at its _adapt_band_temps call.
+                # None when the vertical sweep did not run (temper_vertical
+                # off, or nothing proposed); the head treats that as zeros.
+                "vert_ladder_prop": _gb_host(
+                    getattr(self, "_vert_ladder_prop", None)),
+                "vert_ladder_acc": _gb_host(
+                    getattr(self, "_vert_ladder_acc", None)),
             }
         finally:
             self._exit_rank_block(saved)
@@ -25033,6 +25077,34 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             alive_per_temp.tolist(), drift_max, at_cap_total,
         )
 
+        # ---- VERTICAL-SWAP LADDER CENSUS, POOLED OVER THE BLOCKS ---------
+        # Each rank banked its own (num_bands, ntemps - 1) counts per repeat
+        # inside its in-model loop (``_vertical_ladder_bank``) and shipped
+        # them in the propose reply. They are summed HERE and nowhere else.
+        #
+        # ⚠ WHY THE HEAD AND NOT THE RANK. ``band_temps`` has a band axis
+        # and NO walker axis -- one ladder per band, shared by every walker.
+        # Four ranks each adapting from their own single walker would write
+        # four different ladders for the same band and the merge would
+        # silently keep one. That is the rule the permuted path already
+        # states at its own ``_adapt_band_temps`` call, and it is what the
+        # user asked for: "adapt the temperature rungs based on the swaps
+        # accepted across the 4 walkers" (2026-09-25).
+        #
+        # A block that ran no vertical sweep replies None -> treat as zeros.
+        _vert_acc = np.zeros((num_bands, ntemps - 1), dtype=np.int64)
+        _vert_prop = np.zeros((num_bands, ntemps - 1), dtype=np.int64)
+        for rank in layout.compute_ranks:
+            rep = replies_p[rank]
+            _vp, _va = rep.get("vert_ladder_prop"), rep.get("vert_ladder_acc")
+            if _vp is None or _va is None:
+                continue
+            # Band-disjoint across a block's replicas, walker-summed across
+            # blocks: SUM is right in both layouts, exactly as it is for the
+            # permuted band_swaps_* counters below.
+            _vert_prop += np.asarray(_vp, dtype=np.int64)
+            _vert_acc += np.asarray(_va, dtype=np.int64)
+
         # TEMPERING
         self.temperature_control.swaps_accepted = np.zeros(ntemps - 1)
         self.temperature_control.swaps_proposed = np.zeros(ntemps - 1)
@@ -25139,11 +25211,40 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 cp.asarray(band_swaps_proposed),
             )
             band_temps_host = np.array(_to_numpy(_band_temps), copy=True)
+            _ladder_adapted = True
             logger.info(
                 "Runtime of %s tempering is %s seconds (max block drift "
                 "%.3e).", self.name,
                 round(time.perf_counter() - st_temp, 3), _t_drift,
             )
+        else:
+            _ladder_adapted = False
+
+        # ---- LADDER ADAPTATION FROM THE VERTICAL SWAPS -------------------
+        # THE HOLE THIS CLOSES. ``_adapt_band_temps`` is reachable from
+        # exactly one place, the permuted-swap block above, so
+        # GB_RUN_FANCY_TEMPERING=0 does not merely stop those swaps -- it
+        # FREEZES THE LADDER for the whole run, silently. Measured on the
+        # job-621 checkpoint: all 1232 bands still carried one identical
+        # 1.2-geometric ladder after a full in-model block, and every
+        # band_swaps_* counter was zero.
+        #
+        # ``_vertical_adapt_ladder`` already existed for this and was wired
+        # into ``_propose_legacy`` only -- the same fan-out gap the in-model
+        # GROUP rule had. Here it runs on the POOLED counts, so the ladder
+        # is steered by the swaps accepted across all four walkers.
+        #
+        # Only when the permuted path did NOT already adapt this propose:
+        # both routes call the same ``_adapt_band_temps`` on the same array,
+        # and adapting twice in one propose would take two ladder steps for
+        # one measurement.
+        if not _ladder_adapted and int(_vert_prop.sum()) > 0:
+            self._vert_ladder_prop = _vert_prop
+            self._vert_ladder_acc = _vert_acc
+            _bt = cp.asarray(band_temps_host)
+            if self._vertical_adapt_ladder(_bt):
+                band_temps_host = np.array(_to_numpy(_bt), copy=True)
+            self._vertical_ladder_reset()
 
         # ---- command 3: gb_finish (write back, rebuild, close) ------------
         want_cap_stats = bool(

@@ -1633,3 +1633,127 @@ class GroupPEGuardTest(unittest.TestCase):
 
     def test_a_search_stage_move_still_gets_its_state(self):
         self.assertIsNotNone(self._mv("in_model")._group_state_or_none())
+
+
+class SerialWithinBandFreezeTest(unittest.TestCase):
+    """REGRESSION: the DIRECT-BATCH RJ path lost the cell freeze.
+
+    ``_pick_sources`` takes ``blocked_specials`` precisely so that "a cell
+    already holding a pending alive source is frozen until the accumulated
+    in-model flush runs, so the pool can never collect two same-cell
+    sources (serial-within-band rule)". The staged-scheduler call site
+    passed it. The DIRECT-BATCH call site -- GB_RJ_DIRECT_BATCH=1, the
+    production default -- did not.
+
+    What that cost: ``_pooled_host`` dedups the POOL, and only AFTER
+    ``_run_rj_step`` has proposed and accepted. ``has_run_rj`` retires each
+    SOURCE, not each cell, so a later round could pick a different dead
+    slot in a cell that had just birthed, accept a second birth into the
+    state, and then have it dropped by the pool dedup -- never polished,
+    left at its birth coordinates for the rest of the run.
+
+    Measured on the job-621 checkpoint: 33 of 96 (rung, walker) cells held
+    more than one leaf on the SINGLE injected source at 19.66822 mHz,
+    summing to 1.5-3.4x its true amplitude, the extras at 0.76-0.99x each.
+    """
+
+    def _direct_batch_src(self):
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._run_rj_and_inmodel) \
+            if hasattr(g.GBSpecialBase, "_run_rj_and_inmodel") else None
+        if src is None:
+            # the loop lives in the big propose helper; fall back to module
+            src = inspect.getsource(g)
+        return src
+
+    def test_only_the_NON_POOLING_path_may_omit_blocked_specials(self):
+        """Exactly one call site is allowed to skip the freeze.
+
+        The two POOLING paths -- direct-batch and the staged scheduler --
+        accumulate survivors and polish them later, so a second same-cell
+        birth in between is the bug. The third call site is the
+        ``GB_RJ_GROUPED_INMODEL=0`` per-round interleave, which polishes
+        each pick immediately: there is no pool to protect, so it needs no
+        freeze. Pinning the COUNT rather than deleting the check keeps a
+        newly added pooling call site from silently joining the exception.
+        """
+        import inspect
+        import re
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g)
+        without = []
+        for m in re.finditer(r"self\._pick_sources\(", src):
+            tail, depth, arg = src[m.end():m.end() + 400], 1, []
+            for ch in tail:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                arg.append(ch)
+            if "blocked_specials" not in "".join(arg):
+                without.append("".join(arg).strip()[:70])
+        self.assertEqual(
+            len(without), 1,
+            f"expected exactly one non-pooling call site, found {without}")
+        # ...and it must be the plain interleave one, not a pooling path
+        self.assertNotIn("bview", without[0])
+
+    def test_the_direct_batch_loop_refreshes_the_frozen_set(self):
+        """Passing the gate is not enough -- it has to be REBUILT as cells
+        pool, or only the cells frozen before round 1 are ever honoured."""
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g)
+        self.assertIn("_pooled_dev = xp.asarray(", src)
+        self.assertIn("blocked_specials=_pooled_dev", src)
+
+
+class VerticalLadderFanoutTest(unittest.TestCase):
+    """REGRESSION: the ladder froze on the fan-out path.
+
+    ``_adapt_band_temps`` is reachable from ONE place, the permuted-swap
+    block, so GB_RUN_FANCY_TEMPERING=0 does not merely stop those swaps --
+    it freezes the ladder for the whole run, silently.
+    ``_vertical_adapt_ladder`` exists for exactly that and was wired into
+    ``_propose_legacy`` only.
+
+    Measured on the job-621 checkpoint: all 1232 bands still carried ONE
+    identical 1.2-geometric ladder, and every band_swaps_* counter was 0.
+    """
+
+    def test_the_rank_ships_its_vertical_census(self):
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        body = inspect.getsource(g.GBSpecialBase._gb_serve_run_proposal)
+        for key in ("vert_ladder_prop", "vert_ladder_acc"):
+            self.assertIn(key, body,
+                          f"the rank reply does not carry {key}")
+
+    def test_the_head_pools_across_blocks_and_adapts(self):
+        """⚠ Pooling must happen on the HEAD: band_temps has a band axis and
+        no walker axis, so four ranks adapting from one walker each would
+        write four ladders for the same band and the merge keeps one."""
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        body = inspect.getsource(g.GBSpecialBase._propose_orchestrated)
+        self.assertIn("_vert_prop += np.asarray", body)
+        self.assertIn("_vert_acc += np.asarray", body)
+        self.assertIn("_vertical_adapt_ladder", body)
+
+    def test_the_head_never_adapts_twice_in_one_propose(self):
+        """Both routes call the same _adapt_band_temps on the same array;
+        adapting twice would take two ladder steps for one measurement."""
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        body = inspect.getsource(g.GBSpecialBase._propose_orchestrated)
+        self.assertIn("_ladder_adapted", body)
+        self.assertIn("if not _ladder_adapted", body)
