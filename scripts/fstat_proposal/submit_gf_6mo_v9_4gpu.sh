@@ -3356,8 +3356,24 @@ export GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS-${STORE_DIR}/warmstar
 # from its maxlogL cold walker (the V9-12 block further down). Overriding one
 # without the other is what this variable exists to prevent.
 #
-# THE SEED IS THE 3mo 10-WALKER **NOISE-FIX** RUN (user, 2026-09-24), not the
-# plain 10-walker arm the rest of this file is rebased on. Override at launch:
+# THE SEED IS THE 3mo 10-WALKER RUN. This default was FIRST written as a
+# `_noisefix` sibling of that directory (user, 2026-09-24, prefixed "I
+# think") and the first v9 launch -- job 616, 2026-09-24 19:52 -- died on
+# it before reaching python: no such directory exists under
+# /shared/data/global_fit_output. The script's own candidate scan proved it
+# in the same log, listing eight gf_prod_3mo* runs and no _noisefix among
+# them. User ruling on those forensics, 2026-09-25: "yea it is just
+# gf_prod_3mo_v8_10walkers".
+#
+# ⚠ scripts/diagnostics/gf_monitor_gen_lean.py calls THIS directory the
+# PRE-noise-fix arm, and that is still true. What makes it acceptable as
+# the v9 seed is that galfor no longer comes from the store at all --
+# GALFOR_START_PARAMS below is the offline 3mo estimate (user ruling
+# 2026-09-24, "just for now") -- so the store supplies only
+# PSD_START_PARAMS and the GB warm-start mixture, and that mixture is the
+# very one v8's own 6mo run was launched on.
+#
+# Override at launch:
 #     GF_SEED_STORE=/shared/data/global_fit_output/<dir>/<store>.h5 \
 #         NGPUS=4 ./scripts/fstat_proposal/submit_gf_6mo_v9_4gpu.sh
 #
@@ -3367,7 +3383,7 @@ export GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS-${STORE_DIR}/warmstar
 # another store would be the exact "warm start and noise pin from different
 # folders" split the ruling forbids. A store that cannot be resolved means
 # no pin, which means the noise stages run -- loudly, see below.
-export GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/global_fit_output/gf_prod_3mo_v8_10walkers_noisefix/gf_prod_3mo_testing.h5}
+export GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/global_fit_output/gf_prod_3mo_v8_10walkers/gf_prod_3mo_testing.h5}
 if [ ! -f "${GF_SEED_STORE}" ]; then
   _seed_dir="${GF_SEED_STORE}"
   [ -f "${_seed_dir}" ] || [ -d "${_seed_dir}" ] || _seed_dir=$(dirname "${GF_SEED_STORE}")
@@ -3389,6 +3405,21 @@ if [ ! -f "${GF_SEED_STORE}" ]; then
       2>/dev/null | sort | sed 's/^/[V9-SEED]   /'
     echo "[V9-SEED] Re-launch with GF_SEED_STORE=<one of those>/<store>.h5 to"
     echo "[V9-SEED] pin the noise; otherwise the noise stages will fit it."
+    # JOIN THE TWO GATES (2026-09-25, job-616 forensics). On its own a
+    # missing seed is SOFT -- no pin, the noise stages run. But the warm
+    # start is fitted from this same store, so when the refereed npz is
+    # also absent the [WARMSTART] gate below hard-exits on the very same
+    # path. Job 616 read the soft wording above, concluded the launch had
+    # survived, and then died 10 lines later with no traceback and no
+    # stated connection between the two. Say it here.
+    if [ -n "${GB_WARM_START_COMPONENTS}" ] && [ ! -f "${GB_WARM_START_COMPONENTS}" ]; then
+      echo "[V9-SEED] ⚠ AND THIS WILL BE FATAL BELOW. The warm-start mixture is"
+      echo "[V9-SEED]   fitted from this same store, and the refereed npz"
+      echo "[V9-SEED]     ${GB_WARM_START_COMPONENTS}"
+      echo "[V9-SEED]   does not exist either, so the [WARMSTART] gate is about"
+      echo "[V9-SEED]   to refuse the launch (exit 2). Fixing GF_SEED_STORE"
+      echo "[V9-SEED]   fixes BOTH gates; there is one problem here, not two."
+    fi
   fi
   unset _seed_dir _n_h5
 fi
@@ -3413,6 +3444,10 @@ if [ -n "${GB_WARM_START_COMPONENTS}" ] && [ ! -f "${GB_WARM_START_COMPONENTS}" 
     echo "[WARMSTART] FATAL: GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS} does not exist"
     echo "[WARMSTART] and the auto-build source store is also missing:"
     echo "[WARMSTART]   GB_WARM_START_SOURCE_STORE=${GB_WARM_START_SOURCE_STORE}"
+    echo "[WARMSTART] ^ that path came from GF_SEED_STORE -- read the [V9-SEED] lines"
+    echo "[WARMSTART]   above FIRST: if the seed store did not resolve, this is the"
+    echo "[WARMSTART]   same single failure and re-launching with a seed that exists"
+    echo "[WARMSTART]   clears both gates at once."
     echo "[WARMSTART] Point GB_WARM_START_SOURCE_STORE at the previous run's FULL FINAL h5,"
     echo "[WARMSTART] or build the npz by hand:"
     echo "[WARMSTART]   python -m lisatools.globalfit.warmstart.fit_from_store --store <store.h5> \\"

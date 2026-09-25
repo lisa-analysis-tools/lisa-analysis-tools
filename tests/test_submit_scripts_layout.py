@@ -276,21 +276,53 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         self.assertIn("GB_WARM_START_SOURCE_STORE-${GF_SEED_STORE}", src)
         self.assertIn("lisatools.globalfit.warmstart.noise_pin", src)
 
-    def test_the_seed_is_the_NOISE_FIX_run(self):
-        """User, 2026-09-24: the seed is the 3mo 10-walker NOISE-FIX run,
-        not the plain 10-walker arm the rest of this file is rebased on."""
-        self.assertIn("gf_prod_3mo_v8_10walkers_noisefix",
-                      self.v9["GF_SEED_STORE"])
+    def test_the_seed_is_the_3mo_10_WALKER_run_that_actually_EXISTS(self):
+        """REGRESSION, job 616 (2026-09-24 19:52). The default used to name
+        a `_noisefix` sibling that does not exist on the cluster, and the
+        first v9 launch died on it before reaching python -- the script's
+        own candidate scan listed eight gf_prod_3mo* runs with no _noisefix
+        among them. User ruling on the forensics, 2026-09-25: "yea it is
+        just gf_prod_3mo_v8_10walkers".
+
+        A path this test cannot verify (no filesystem here) is exactly the
+        kind that has to be pinned by NAME once it has been confirmed by a
+        launch, so a plausible-looking edit cannot silently reintroduce it.
+        """
+        self.assertEqual(
+            self.v9["GF_SEED_STORE"],
+            "/shared/data/global_fit_output/gf_prod_3mo_v8_10walkers/"
+            "gf_prod_3mo_testing.h5",
+        )
+        self.assertNotIn("noisefix", self.v9["GF_SEED_STORE"])
 
     def test_the_seed_never_falls_back_to_a_DIFFERENT_run(self):
         """The resolver may pick the single .h5 inside a given directory,
         but it must never substitute another run: a seed is a provenance
         statement, and quietly swapping it is the exact "warm start and
-        noise pin from different folders" split the ruling forbids."""
+        noise pin from different folders" split the ruling forbids.
+
+        Note this is about the RESOLVER, not the default. Changing which
+        store the default names is a user ruling; substituting one at run
+        time, after the operator named a different one, is the defect.
+        """
         src = open(SIX_MO_V9).read()
         self.assertIn("does NOT fall back to a", src)
-        self.assertNotIn("GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/"
-                         "global_fit_output/gf_prod_3mo_v8_10walkers/", src)
+        # The only substitution allowed is directory -> the ONE .h5 in it.
+        self.assertIn('_n_h5=$(find "${_seed_dir}" -maxdepth 1 -name \'*.h5\'',
+                      src)
+        self.assertIn('if [ "${_n_h5}" = "1" ]; then', src)
+
+    def test_a_missing_seed_says_it_will_ALSO_kill_the_warm_start_gate(self):
+        """Job 616's log was hard to read because one cause tripped two
+        gates that never referenced each other: the [V9-SEED] miss printed
+        a SOFT message ("otherwise the noise stages will fit it"), then the
+        [WARMSTART] gate hard-exited 10 lines later on the same inherited
+        path with no traceback. The seed gate must forward-declare the
+        fatality, and the fatal gate must name where its path came from."""
+        src = open(SIX_MO_V9).read()
+        self.assertIn("AND THIS WILL BE FATAL BELOW", src)
+        self.assertIn("there is one problem here, not two", src)
+        self.assertIn("that path came from GF_SEED_STORE", src)
 
     def test_mid_iteration_checkpoints_are_pinned_on(self):
         """User ask 2026-09-24: "checkpoints between all the GB moves for
