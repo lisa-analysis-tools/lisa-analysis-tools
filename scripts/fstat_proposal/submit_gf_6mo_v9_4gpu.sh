@@ -2964,6 +2964,77 @@ export FSTAT_PEAKS_PER_BAND=200    # per-sub-band peak cap (code default; explic
 # 1yr run's proven 1500 because this baseline is tighter. Lower it further
 # if it still OOMs; also consider the MEMPOOL_FREE=1 levers.
 export FSTAT_GRID_MEM_MB=512
+# ---------------------------------------------------------------------------
+# STAGE-B SKY GRID: f0-ADAPTIVE (2026-09-24, new this run)
+# ---------------------------------------------------------------------------
+# WHAT WAS WRONG. Stage A (the comb) has always sized its sky grid from the
+# Doppler ridge, n ~ (f0 Tobs v/c)^2, adaptive over 16..512 nodes -- the log
+# line is "[comb] ... sky ADAPTIVE [16..512] over 6 level(s)". Stage B, which
+# REFINES stage A's peaks, was pinned at a fixed 8 x 8 = 64 full-sky nodes at
+# every frequency. So above ~6 mHz the refinement was 4-8x COARSER on the sky
+# than the scan that produced its own input, and stage B is the component the
+# birth proposal actually draws from.
+#
+# Worse, of those 64 nodes only 44 were distinct directions:
+# linspace(0, 2*pi, 8) repeats the same longitude at both ends, and every
+# longitude collapses to one point at sin_delta = +-1. 31% of the sweep
+# re-derived values it already had, and the poles were over-weighted by the
+# collapse. Stage B now builds alpha half-open and picks the best rectangular
+# factorization of its node budget (measured: near-square, 9x7 / 13x10 /
+# 18x14 / 26x20), so 95th-percentile miss-to-nearest-node goes 0.399 ->
+# 0.368 rad at the same 64 nodes, and 0.187 rad at 252.
+#
+# WHY IT MATTERS HERE. The 7.444 and 7.599 mHz misses sit exactly in the
+# 5-11 mHz range where this run's peak boxes are dense and the old grid was
+# 2-4x too coarse. Those groups are the ones that gain most below.
+#
+# NO NODE CAP (user ruling 2026-09-24): FSTAT_STAGEB_NSKY_MAX stays 0. The
+# limit is a per-group BYTE budget instead, which is the right control
+# because what breaks is memory and memory goes as
+# n_boxes * n_f0 * n_Mc * n_sky -- not as n_sky. Uncapped-with-no-budget on
+# the snapshot-19 peak list asks for 45.8 GB of grid with a single 27 GB
+# group at 15-20 mHz (438 boxes but n_Mc = 96), and this run already died
+# once on a 1.7 GB allocation against a 91.5 GB resident baseline, which is
+# what FSTAT_GRID_MEM_MB above exists to work around.
+#
+# THE BUDGET SELF-ADJUSTS, which is why it beats a node cap: a group's grid
+# shrinks as its peak count falls, so as the search subtracts the high-f
+# sources the freed bytes are spent on sky resolution there automatically,
+# with no knob change. Epoch 0 is the expensive one.
+#
+# 2.0 GB holds the largest group at 1.82 GB -- within the 1.71 GB this run
+# has already survived -- for 1.80x today's stage-B node count. Projected
+# per-group sky at epoch 0 (from the snapshot-19 group census):
+#     0.57- 5.14 mHz  11630 boxes  nMc  3   sky  64 ->  63   1.39 GB
+#     5.14- 6.11 mHz   2447 boxes  nMc  3   sky  64 -> 130   0.60 GB
+#     6.11- 7.27 mHz   1547 boxes  nMc  6   sky  64 -> 130   0.76 GB
+#     7.28- 7.57 mHz    393 boxes  nMc  6   sky  64 -> 252   0.38 GB
+#     7.57- 9.24 mHz   1754 boxes  nMc 12   sky  64 -> 130   1.73 GB
+#     9.32-10.29 mHz    435 boxes  nMc 24   sky  64 -> 252   1.66 GB
+#    10.29-11.25 mHz    432 boxes  nMc 24   sky  64 -> 252   1.65 GB
+#    11.25-13.17 mHz    514 boxes  nMc 43   sky  64 -> 130   1.82 GB
+#    15.36-20.38 mHz    438 boxes  nMc 96   sky  64 ->  63   1.67 GB
+# Above 13 mHz the sky stays put because n_Mc = 96 eats the budget there.
+# Those sources are few and loud; they are the ones the shrinking peak list
+# will free up first.
+#
+# ⚠ THIS FORCES A REFIT. The stage-B cache stores the grid, so an epoch
+# fitted at 8x8 cannot be reused under a different sky. Start from a clean
+# gb_fstat_fit/ or the loader reuses the old 64-node grids silently.
+#
+# WATCH on the first snapshot -- one line per group, and the step-downs:
+#   grep '\[stageB\] group' globalfit_run.log
+#   grep 'stepping the sky down' globalfit_run.log
+#   grep 'VARIES BY GROUP' globalfit_run.log
+# ESCAPES, in order of bluntness:
+#   FSTAT_STAGEB_GROUP_MAX_GB=1.7  hold every group at today's largest
+#   FSTAT_STAGEB_NSKY_MAX=128      hard node cap on top of the budget
+#   FSTAT_STAGEB_SKY_ADAPT=0       back to the fixed 8x8 exactly
+#   FSTAT_N_ALPHA / FSTAT_N_SINDELTA   setting EITHER also pins the sky
+export FSTAT_STAGEB_SKY_ADAPT=1
+export FSTAT_STAGEB_NSKY_MIN=64      # never coarser than the old fixed 8x8
+export FSTAT_STAGEB_NSKY_MAX=0       # 0 = no node cap (user ruling)
+export FSTAT_STAGEB_GROUP_MAX_GB=2.0
 # BIRTH-DRAW ALLOCATION (2026-08-16). Peak boxes are weighted w ~ F**alpha,
 # and the F-statistic goes like SNR^2 -- so the historical alpha=1 hands an
 # SNR-10 source 9x FEWER birth attempts than an SNR-30 one, exactly

@@ -53,13 +53,17 @@ def _fake_call_fstat(counter=None, raise_after=None):
     lands on real structure, unlike the narrow-comb-scan bumps this
     fixture originally inherited from tests/test_fstat_gridfit.py.
 
-    The alpha term uses ``cos(alpha / 2)``, not ``cos(alpha)``: stage B's
-    ``alpha_ax = linspace(0, 2*pi, n_alpha)`` always samples a FULL period,
-    so any function with period ``2*pi`` (or an integer fraction of it)
-    gives the SAME value at the first and last alpha node -- exactly the
-    degenerate-axis trap this fixture exists to catch. Halving the
-    argument (period ``4*pi``) makes the two endpoints of a one-period
-    grid genuinely different.
+    The alpha term uses ``cos(alpha / 2)``, not ``cos(alpha)``: the PINNED
+    sky path -- which these goldens take, via ``FSTAT_N_ALPHA`` in
+    :func:`stage_b_env` -- still builds ``alpha_ax = linspace(0, 2*pi,
+    n_alpha)``, which samples a FULL period, so any function with period
+    ``2*pi`` (or an integer fraction of it) gives the SAME value at the
+    first and last alpha node -- exactly the degenerate-axis trap this
+    fixture exists to catch. Halving the argument (period ``4*pi``) makes
+    the two endpoints of a one-period grid genuinely different. The
+    f0-ADAPTIVE path no longer has that duplicate (``stage_b_sky_axes``
+    builds alpha half-open, 2026-09-24), but the goldens are pinned and this
+    fixture must keep working for both.
     """
     state = {"rows": 0}
 

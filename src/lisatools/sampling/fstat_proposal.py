@@ -133,10 +133,25 @@ FSTAT_KNOB_DEFAULTS = {
                                    #   enough that the cap should not bind)
     "FSTAT_PEAK_HALF_MHZ": 2.5e-3, # peak-box f0 half width [mHz]
     "FSTAT_MC_MIN": 0.01,          # Mc grid-box floor
-    "FSTAT_N_MC": 3,               # anisotropic node counts: Mc / sky are
-    "FSTAT_N_ALPHA": 8,            #   per-band unmeasurable, so coarse
+    "FSTAT_N_MC": 3,               # Mc floor; the AUTO path scales it with
+                                   #   the box's fdot span (fstat_n_mc)
+    # STAGE-B SKY. These two are now a FLOOR-and-override pair, not the
+    # grid: setting EITHER pins the sky to a fixed n_alpha x n_sd and turns
+    # the f0-adaptive sky off for the whole fit (a line is logged saying
+    # so). Left unset, stage B sizes its sky per box from
+    # ``fstat_gridfit.sky_nodes_required`` -- the same law stage A uses --
+    # and factorizes it with ``stage_b_sky_axes``. The old fixed 8x8 was up
+    # to 8x COARSER than the stage-A scan that produced its own input, and
+    # spent 64 evaluations on only 44 distinct sky directions.
+    "FSTAT_N_ALPHA": 8,
     "FSTAT_N_SINDELTA": 8,
-    "FSTAT_COMB_NSKY": 6,          # comb sky points
+    # INERT, and kept only so this table still documents the name. The comb
+    # reads FSTAT_COMB_NSKY straight from os.environ (run_comb_scan), NOT
+    # through fstat_knob, so this value has never been used -- and it is 2.7
+    # to 85x below what the adaptive path actually picks. Routing it through
+    # fstat_knob "for consistency" would silently drop the comb to 6 sky
+    # points at every frequency. Set the ENV var to pin it; leave this be.
+    "FSTAT_COMB_NSKY": 6,
     "FSTAT_FLOOR_EPS": 0.1,        # uniform-floor mixture weight
     "FSTAT_COMB_WEIGHT": 0.3,      # comb component weight. 2026-07 study
                                    #   (band75): unboxed-source coverage
@@ -387,6 +402,12 @@ def fstat_n_axis(name: str) -> int:
     (For the Mc axis prefer :func:`fstat_n_mc`, which is AUTO by default;
     this fixed-default path remains for alpha / sin_delta and legacy
     callers.)
+
+    For the SKY axes in stage B this is now an OVERRIDE, not the grid: if
+    any of the three env vars above is set, ``run_stacked_stage_b`` takes it
+    as an instruction to pin the sky and skips the f0-adaptive sizing
+    entirely. Reading the return value does not by itself mean the adaptive
+    path is off -- the caller checks the environment for that.
     """
     raw = os.environ.get(name, "").strip()
     if raw:
@@ -1321,6 +1342,21 @@ class StackedFStatProposal4D:
         self._f0_hi = self._f0_lo + (node_shape[0] - 1) * self._f0_dx
         axes3 = [np.asarray(_host(a), dtype=float) for a in
                  (mc_ax, alpha_ax, sin_delta_ax)]
+        # Only a[0], a[-1] and a[1]-a[0] are ever read from an axis, so an
+        # axis of the WRONG LENGTH raises nothing here and instead rescales
+        # every draw on that axis for the life of the proposal -- births at
+        # sky angles and chirp masses the grid was never scored at, with no
+        # error anywhere. Since the sky axes became per-group (f0-adaptive
+        # sky, 2026-09-24) a loader that reaches for the wrong group's key
+        # produces exactly that, so check the lengths against the grid.
+        _want3 = tuple(node_shape[1:])
+        _got3 = tuple(len(a) for a in axes3)
+        if _got3 != _want3:
+            raise ValueError(
+                f"StackedFStatProposal4D: grid has (n_Mc, n_alpha, n_sd) = "
+                f"{_want3} but the axes given are {_got3} "
+                f"(Mc/alpha/sin_delta) -- the axes must describe the grid "
+                f"they were swept on")
         self._lo3 = np.array([a[0] for a in axes3])
         self._hi3 = np.array([a[-1] for a in axes3])
         self._dx3 = np.array([a[1] - a[0] for a in axes3])
@@ -1853,11 +1889,25 @@ def stacked_from_cache(d, weights=None, seed: Optional[int] = None,
             sub_w = w[a:b]
             if not np.any(sub_w > 0):
                 sub_w = None  # zero-mass group: equal inside, never drawn
+        # PER-GROUP sky axes (f0-adaptive sky, 2026-09-24). The flat
+        # ``alpha_ax`` / ``sin_delta_ax`` keys describe group 0 only in a
+        # cache written since then, so preferring them would hand groups
+        # 1..n an axis of the wrong LENGTH -- StackedFStatProposal4D reads
+        # only ``a[0]``, ``a[-1]`` and ``a[1]-a[0]`` from an axis, so a
+        # wrong-length alpha axis raises nothing and silently rescales
+        # every sky draw in that group. Legacy caches have no suffixed key
+        # and fall back to the flat one, which is correct for them because
+        # their sky grid really was shared.
+        _keys = d.files if hasattr(d, "files") else d
         comps.append(StackedFStatProposal4D.from_cache(
             dict(logp_grids=d[f"logp_grids_g{gi}"],
                  f0_los=f0_los[a:b], f0_dxs=f0_dxs[a:b],
-                 mc_ax=d[f"mc_ax_g{gi}"], alpha_ax=d["alpha_ax"],
-                 sin_delta_ax=d["sin_delta_ax"]),
+                 mc_ax=d[f"mc_ax_g{gi}"],
+                 alpha_ax=(d[f"alpha_ax_g{gi}"]
+                           if f"alpha_ax_g{gi}" in _keys else d["alpha_ax"]),
+                 sin_delta_ax=(d[f"sin_delta_ax_g{gi}"]
+                               if f"sin_delta_ax_g{gi}" in _keys
+                               else d["sin_delta_ax"])),
             weights=sub_w, seed=seed, mem_budget_mb=mem_budget_mb,
             use_cupy=use_cupy, device=device))
     return GroupedStackedFStatProposal(comps, box_weights=w, seed=seed)

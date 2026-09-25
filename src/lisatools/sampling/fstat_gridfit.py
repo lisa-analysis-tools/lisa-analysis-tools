@@ -712,6 +712,108 @@ def _sky_grid(n):
             -1.0 + 2.0 * (ks + 0.5) / n)
 
 
+def sky_nodes_required(f0_mHz, Tobs, *, vc=None, nmin=1, nmax=0):
+    """Sky nodes a template at ``f0`` needs, snapped to a power of two.
+
+    THE ONE PLACE the sky density law lives. Stage A (:func:`run_comb_scan`)
+    and stage B (:func:`run_stacked_stage_b`) both call it, so the scan and
+    the refinement can no longer disagree about how finely the sky has to be
+    resolved -- which they did until 2026-09-24, stage A adaptive 16..512 and
+    stage B pinned at a fixed 8x8=64, i.e. the REFINEMENT was up to 8x
+    coarser than the scan that found the peak.
+
+    THE LAW. A source is localized on the sky by its Doppler ridge: the
+    orbital motion sweeps the carrier by ``+- f0 * v/c``, which over ``Tobs``
+    is ``f0 * (v/c) * Tobs`` resolvable frequency bins, and the sky is
+    two-dimensional, so the number of distinguishable directions goes as the
+    SQUARE of that. Hence ``n ~ (f0 * Tobs * v/c)^2`` -- 10 cells at 2 mHz,
+    39 at 4 mHz, 155 at 8 mHz, ~1000 at 20 mHz. Snapping up to a power of
+    two keeps the level set small so the sweep runs as a few rectangular
+    batches rather than one design per node.
+
+    Args:
+        f0_mHz: carrier frequency/frequencies [mHz]. Scalar or array.
+        Tobs: observation time [s].
+        vc: orbital speed in units of c (``FSTAT_SKY_VC``, default 1e-4).
+        nmin: floor. Stage A uses 16; stage B uses 64 so the adaptive
+            grid is never COARSER than the historical fixed 8x8.
+        nmax: cap, or ``0``/``None`` for uncapped.
+
+    Returns:
+        ``int`` array (or scalar) of node counts, same shape as ``f0_mHz``.
+    """
+    if vc is None:
+        vc = float(os.environ.get("FSTAT_SKY_VC",
+                                  os.environ.get("FSTAT_COMB_SKY_VC", "1e-4")))
+    f = np.asarray(f0_mHz, dtype=float)
+    req = np.ceil((f * 1e-3 * float(Tobs) * float(vc)) ** 2)
+    lvl = (2.0 ** np.ceil(np.log2(np.clip(req, 1.0, None))))
+    lvl = np.maximum(lvl, float(nmin))
+    if nmax:
+        lvl = np.minimum(lvl, float(nmax))
+    out = lvl.astype(int)
+    return out if out.ndim else int(out)
+
+
+#: Longitude nodes per latitude node in the stage-B rectangular sky grid.
+#:
+#: Measured, not assumed. Sweeping every factorization of a node budget over
+#: 40k uniform sky directions and scoring the 95th-percentile angle to the
+#: nearest node, the optimum sits at 8x8, 12x11, 17x15, 26x20 and 38x27 for
+#: budgets 64/128/256/512/1024 -- i.e. very nearly SQUARE, drifting to ~1.4
+#: as the budget grows. ``n_sd = round(sqrt(N/1.25))`` reproduces every one
+#: of those to within 4% of the optimal p95, so the closed form is used
+#: rather than a table.
+#:
+#: The intuition that longitude should be ~pi times denser than latitude (to
+#: make cells isotropic at the equator) is WRONG here, and the measurement is
+#: what caught it: equal steps in sin(delta) become ever LARGER steps in the
+#: angle delta towards the poles, so latitude, not longitude, sets the
+#: worst-covered cell. Aspect ratios of 2.5 and up measurably lose.
+STAGEB_SKY_ASPECT = 1.25
+
+
+def stage_b_sky_axes(n_target):
+    """``n_target`` sky nodes as rectangular ``(alpha_ax, sd_ax)`` axes.
+
+    Stage B's grid is a 4-D TENSOR (:class:`StackedFStatProposal4D`), so the
+    sky has to stay a separable ``alpha x sin_delta`` product -- a
+    golden-ratio spread like stage A's would need a different proposal class
+    and a different cache format. This picks the best rectangular
+    factorization instead, and fixes the two ways the historical
+    ``linspace(0, 2pi, 8) x linspace(-1, 1, 8)`` wasted its own nodes:
+
+    * ``linspace(0, 2*pi, n)`` includes BOTH endpoints, and alpha = 0 and
+      alpha = 2*pi are the same longitude -- one duplicated column, i.e.
+      ``n_sd`` wasted evaluations. Fixed with ``endpoint=False``.
+    * every alpha at ``sin_delta = +-1`` is the same direction (the pole), so
+      each pole row collapses to ONE point. 8x8 therefore scored 64 nodes at
+      only 44 distinct sky directions -- 31% of the sweep spent re-deriving
+      values it already had, and the poles over-weighted in the proposal by
+      the collapse.
+
+    The poles are KEPT (``sin_delta`` spans the closed interval): dropping
+    them for cell centers measures worse, because a rectangular grid's
+    worst-covered point is otherwise the polar cap, whose radius goes only as
+    ``sqrt(2/n_sd)``. With the endpoint fix an 8x8 carries 50 distinct
+    directions and a 95th-percentile miss of 0.368 rad, against 44 and 0.399
+    for the historical grid.
+
+    Returns:
+        ``(alpha_ax, sd_ax)``, both float64 and uniformly spaced -- the
+        latter is required by :class:`StackedFStatProposal4D`, which stores
+        one ``dx`` per axis.
+    """
+    n = max(int(n_target), 9)
+    n_sd = max(4, int(round(np.sqrt(n / STAGEB_SKY_ASPECT))))
+    n_alpha = max(4, int(round(n / n_sd)))
+    # alpha: half-open, so 0 and 2*pi are not the same node twice.
+    alpha_ax = 2.0 * np.pi * np.arange(n_alpha, dtype=float) / n_alpha
+    # sin_delta: closed, so both poles carry an explicit node.
+    sd_ax = np.linspace(-1.0, 1.0, n_sd)
+    return alpha_ax, sd_ax
+
+
 class _CombRows:
     """One comb sky level's ``(n_nodes * n_sky, 9)`` rows, never materialized.
 
@@ -1014,20 +1116,16 @@ def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
     n_nodes = len(f0_nodes)
 
     # Per-node sky count. FIXED if FSTAT_COMB_NSKY is set (back-compat);
-    # otherwise ADAPTIVE: the comb resolves a source through its Doppler
-    # ridge, so the sky grid scales as ~(f0*Tobs*v/c)^2, floored, capped,
-    # and snapped up to powers of two so the sweep runs as a few rectangular
-    # batches instead of one giant fixed-n_sky design.
-    vc = float(os.environ.get("FSTAT_COMB_SKY_VC", "1e-4"))
+    # otherwise ADAPTIVE via :func:`sky_nodes_required`, the law stage B now
+    # shares (see that docstring for why it goes as (f0*Tobs*v/c)^2).
     nsky_min = int(os.environ.get("FSTAT_COMB_NSKY_MIN", "16"))
     nsky_max = int(os.environ.get("FSTAT_COMB_NSKY_MAX", "512"))
     _fixed = os.environ.get("FSTAT_COMB_NSKY", "").strip()
     if _fixed:
         nsky_per_node = np.full(n_nodes, int(_fixed), dtype=int)
     else:
-        req = np.ceil((f0_nodes * 1e-3 * Tobs * vc) ** 2)
-        lvl = (2 ** np.ceil(np.log2(np.clip(req, 1.0, None)))).astype(int)
-        nsky_per_node = np.clip(lvl, nsky_min, nsky_max).astype(int)
+        nsky_per_node = sky_nodes_required(
+            f0_nodes, Tobs, nmin=nsky_min, nmax=nsky_max)
 
     levels = np.unique(nsky_per_node)
     logger.info("[comb] %d f0 nodes; sky %s [%d..%d] over %d level(s); "
@@ -1316,8 +1414,16 @@ def run_stage_b_group(spec: StageBGroupSpec, call_fstat: Callable, *, xp):
 def write_stacked_npz(stacked_path, *, grids_g, mc_ax_g, f0_los, f0_dxs,
                       alpha_ax, sd_ax, grid_basis, grid_c_t, peaks,
                       band_idx, band_edges_mHz, band_edges_hz,
-                      group_sizes=None):
+                      group_sizes=None, alpha_ax_g=None, sd_ax_g=None):
     """Write the stage-B cache. ``group_sizes=None`` = the LEGACY 1-group keys.
+
+    ``alpha_ax_g`` / ``sd_ax_g`` are the PER-GROUP sky axes (2026-09-24,
+    f0-adaptive sky). When given they are written as ``alpha_ax_g{gi}`` /
+    ``sin_delta_ax_g{gi}`` beside the flat ``alpha_ax`` / ``sin_delta_ax``,
+    which stay for readers that predate the change -- those flat keys then
+    describe GROUP 0 only, so a reader that needs the real axis of group
+    ``gi`` must prefer the suffixed key when it exists. The loader
+    (``fstat_proposal.stacked_from_cache``) does exactly that.
 
     Factored out of :func:`run_stacked_stage_b` so the parallel fit's head,
     which assembles each group from per-rank partials, writes through the
@@ -1390,10 +1496,43 @@ def write_stacked_npz(stacked_path, *, grids_g, mc_ax_g, f0_los, f0_dxs,
         np.savez(stacked_path, logp_grids=_to_host(grids_g[0]),
                  mc_ax=mc_ax_g[0], **common)
         return
+    if alpha_ax_g is not None and len(alpha_ax_g) != len(grids_g):
+        raise ValueError(
+            f"write_stacked_npz: {len(grids_g)} grid(s) but "
+            f"{len(alpha_ax_g)} alpha axis/axes -- one sky axis per group "
+            f"is required once the sky is f0-adaptive, or the cache would "
+            f"describe a different sky grid than the one that was swept")
+    # Per-group sky keys are written ONLY when the groups actually differ.
+    # When every group shares one sky grid -- any pinned-sky fit, and every
+    # configuration that predates the adaptive sky -- the flat alpha_ax /
+    # sin_delta_ax already say everything, and emitting redundant suffixed
+    # copies would change the key set of a cache whose content is unchanged,
+    # invalidating the stage-B golden files and every reader that checks the
+    # layout. So: identical sky across groups => byte-identical key set.
+    _sky_per_group = False
+    if alpha_ax_g is not None:
+        for gi in range(len(grids_g)):
+            _al = np.asarray(alpha_ax_g[gi], dtype=float)
+            _sd = np.asarray(sd_ax_g[gi], dtype=float)
+            _want = tuple(int(n) for n in grids_g[gi].shape[3:5])
+            if (len(_al), len(_sd)) != _want:
+                raise ValueError(
+                    f"write_stacked_npz: group {gi} grid has sky shape "
+                    f"{_want} but the axes given are {len(_al)}x{len(_sd)} "
+                    f"-- births would be placed at sky angles the grid was "
+                    f"never scored at")
+            if not (np.array_equal(_al, np.asarray(alpha_ax, dtype=float))
+                    and np.array_equal(_sd, np.asarray(sd_ax, dtype=float))):
+                _sky_per_group = True
     group_arrays = {}
     for gi in range(len(grids_g)):
         group_arrays[f"logp_grids_g{gi}"] = _to_host(grids_g[gi])
         group_arrays[f"mc_ax_g{gi}"] = mc_ax_g[gi]
+        if _sky_per_group:
+            group_arrays[f"alpha_ax_g{gi}"] = np.asarray(alpha_ax_g[gi],
+                                                        dtype=float)
+            group_arrays[f"sin_delta_ax_g{gi}"] = np.asarray(sd_ax_g[gi],
+                                                            dtype=float)
     np.savez(stacked_path, group_sizes=np.asarray(group_sizes, dtype=int),
              **common, **group_arrays)
 
@@ -1440,7 +1579,22 @@ def union_stacked_npz(slot_paths, out_path):
                 "union needs the grouped format (group_sizes)" % slot_paths[0])
 
         # -- arrays every slot must agree on --------------------------------
-        for key in ("alpha_ax", "sin_delta_ax", "band_edges"):
+        # SKY AXES. With one shared sky grid per cache they had to agree
+        # across slots, because the format could only hold one. Since the sky
+        # became f0-adaptive (2026-09-24) each GROUP carries its own axes and
+        # the union keeps every slot's groups as separate, self-describing
+        # mixture components -- so there is nothing left to reconcile across
+        # slots, and requiring agreement would be wrong twice over: slots
+        # legitimately have DIFFERENT group counts (each walker selects its
+        # own peaks, so the Mc ladder lands differently), and two slots whose
+        # group 3 covers different frequencies SHOULD carry different sky
+        # grids. The historical cross-slot check is kept exactly as it was
+        # for the uniform-sky case, which is what every pinned-sky and
+        # pre-adaptive cache is.
+        _per_group_sky = ["alpha_ax_g0" in f.files for f in files]
+        _shared = ("band_edges",) if any(_per_group_sky) else (
+            "alpha_ax", "sin_delta_ax", "band_edges")
+        for key in _shared:
             ref = np.asarray(first[key])
             for p, f in zip(slot_paths[1:], files[1:]):
                 got = np.asarray(f[key])
@@ -1481,6 +1635,19 @@ def union_stacked_npz(slot_paths, out_path):
             for gi in range(len(gs)):
                 out[f"logp_grids_g{gi_out}"] = f[f"logp_grids_g{gi}"]
                 out[f"mc_ax_g{gi_out}"] = f[f"mc_ax_g{gi}"]
+                # Per-group sky axes through the renumbering. If ANY slot
+                # carries them, EVERY output group gets them -- a uniform-sky
+                # slot contributing its flat axes explicitly. Leaving those
+                # groups unsuffixed would send the loader to the OUTPUT's flat
+                # key, which is slot 0's, and silently rescale their sky.
+                if any(_per_group_sky):
+                    out[f"alpha_ax_g{gi_out}"] = (
+                        f[f"alpha_ax_g{gi}"] if f"alpha_ax_g{gi}" in f.files
+                        else f["alpha_ax"])
+                    out[f"sin_delta_ax_g{gi_out}"] = (
+                        f[f"sin_delta_ax_g{gi}"]
+                        if f"sin_delta_ax_g{gi}" in f.files
+                        else f["sin_delta_ax"])
                 gi_out += 1
             sizes.extend(gs)
         out["group_sizes"] = np.asarray(sizes, dtype=int)
@@ -1830,12 +1997,103 @@ def run_stacked_stage_b(call_fstat: Callable, peaks, *, xp, Tobs: float,
         levels = mc_ladder_levels(n_req)
     else:
         levels = np.full(K, int(n_req.max()))
-    g_edges = np.concatenate(
-        [[0], np.flatnonzero(np.diff(levels)) + 1, [K]]).astype(int)
+
+    # ---- ADAPTIVE SKY (2026-09-24) ------------------------------------
+    # Until now the sky axes were ONE fixed 8x8 shared by every box, while
+    # stage A already scaled its own sky grid as f0^2 -- so above ~6 mHz the
+    # refinement was coarser than the scan that produced its input. The sky
+    # requirement is now evaluated per box from the same law
+    # (:func:`sky_nodes_required`) and enters the GROUPING key beside the Mc
+    # ladder. Both requirements are monotone in f0 and the boxes are
+    # f0-sorted, so the joint key still yields CONTIGUOUS groups -- the
+    # property every downstream slice (g_edges, box weights, the parallel
+    # fit's box ranges) depends on.
+    #
+    # The floor defaults to 64, the historical node count, so the change can
+    # only ADD sky resolution, never remove it. FSTAT_STAGEB_NSKY_MAX=0 is
+    # uncapped; the real protection is the per-group byte budget below, not
+    # a node cap, because what actually breaks is memory and memory depends
+    # on n_boxes * n_f0 * n_Mc * n_sky, not on n_sky alone.
+    _sky_adapt = os.environ.get("FSTAT_STAGEB_SKY_ADAPT", "1") == "1"
+    _sky_pinned = bool(os.environ.get("FSTAT_N_ALPHA", "").strip()
+                       or os.environ.get("FSTAT_N_SINDELTA", "").strip()
+                       or os.environ.get("FSTAT_N_PER_AXIS", "").strip())
+    if _sky_adapt and not _sky_pinned:
+        _nsky_min = int(os.environ.get("FSTAT_STAGEB_NSKY_MIN", "64"))
+        _nsky_max = int(os.environ.get("FSTAT_STAGEB_NSKY_MAX", "0"))
+        sky_lv = sky_nodes_required(peaks[:, 0], float(Tobs),
+                                    nmin=_nsky_min, nmax=_nsky_max)
+        sky_lv = np.maximum.accumulate(sky_lv)  # monotone => contiguous groups
+    else:
+        sky_lv = np.full(K, int(n_alpha) * int(n_sd), dtype=int)
+        if _sky_pinned:
+            logger.info(
+                "[stageB] sky grid PINNED to %dx%d by FSTAT_N_ALPHA/"
+                "FSTAT_N_SINDELTA; the f0-adaptive sky is off for this fit.",
+                n_alpha, n_sd)
+
+    _key = np.stack([np.asarray(levels, dtype=np.int64),
+                     np.asarray(sky_lv, dtype=np.int64)], axis=1)
+    _chg = np.flatnonzero(np.any(np.diff(_key, axis=0) != 0, axis=1)) + 1
+    g_edges = np.concatenate([[0], _chg, [K]]).astype(int)
     n_groups = len(g_edges) - 1
 
-    alpha_ax = np.linspace(0.0, 2 * np.pi, n_alpha)
-    sd_ax = np.linspace(-1.0, 1.0, n_sd)
+    # Per-group sky axes, after a MEMORY step-down. The grid is materialized
+    # dense and float64 -- xp.empty(node_shape) in run_stage_b_group -- and
+    # StackedFStatProposal4D then holds the node grid, the cell weights AND
+    # the flat CDF, so the resident cost at DRAW time is ~3x the grid and
+    # FSTAT_GRID_MEM_MB does not bound it (it chunks construction; every
+    # chunk is retained). A group whose grid exceeds the budget therefore
+    # takes its sky down one power of two at a time, loudly. Without this,
+    # uncapped adaptive sky asks for a single 27 GB allocation on the
+    # 15-20 mHz group, where n_Mc is already 96.
+    _grp_max_gb = float(os.environ.get("FSTAT_STAGEB_GROUP_MAX_GB", "8.0"))
+    alpha_ax_g, sd_ax_g = [], []
+    for gi in range(n_groups):
+        a, b = int(g_edges[gi]), int(g_edges[gi + 1])
+        if _sky_adapt and not _sky_pinned:
+            want = int(sky_lv[a])
+            n_Mc_g = int(n_req[a:b].max())
+            while True:
+                _a_ax, _s_ax = stage_b_sky_axes(want)
+                gb = ((b - a) * n_f0 * n_Mc_g * len(_a_ax) * len(_s_ax)
+                      * 8 / 1e9)
+                # The step-down stops at 64 even if FSTAT_STAGEB_NSKY_MIN is
+                # higher: 64 is the historical node count, so it is the one
+                # size this pipeline is known to fit. Going below it to
+                # satisfy a byte budget would make the grid COARSER than it
+                # has ever been, which is never the trade we want; if 64
+                # still does not fit, the budget is set wrong and the run
+                # should fail loudly on the allocation rather than quietly
+                # propose worse births.
+                if _grp_max_gb <= 0 or gb <= _grp_max_gb or want <= 64:
+                    break
+                logger.warning(
+                    "[stageB] group %d (%.2f-%.2f mHz, %d boxes, n_Mc %d) "
+                    "wants %d sky nodes = %.3g GB > "
+                    "FSTAT_STAGEB_GROUP_MAX_GB %.3g GB; stepping the sky "
+                    "down to %d.",
+                    gi, float(f0_los[a]), float(f0_los[b - 1]), b - a,
+                    n_Mc_g, want, gb, _grp_max_gb, want // 2)
+                want //= 2
+            alpha_ax_g.append(_a_ax)
+            sd_ax_g.append(_s_ax)
+        else:
+            alpha_ax_g.append(np.linspace(0.0, 2 * np.pi, n_alpha))
+            sd_ax_g.append(np.linspace(-1.0, 1.0, n_sd))
+    # The flat alpha_ax/sd_ax fields (spec fields, npz keys, the legacy
+    # single-group proposal) can only carry ONE sky grid, so from here they
+    # mean GROUP 0. Say so when the groups actually differ: several scripts
+    # under scripts/fstat_proposal/ read the flat npz keys and would plot or
+    # re-wrap a high-f0 group on the low-f0 group's axes.
+    alpha_ax, sd_ax = alpha_ax_g[0], sd_ax_g[0]
+    if not all(len(a_) == len(alpha_ax) and len(s_) == len(sd_ax)
+               for a_, s_ in zip(alpha_ax_g, sd_ax_g)):
+        logger.warning(
+            "[stageB] the sky grid now VARIES BY GROUP (%s nodes); the flat "
+            "alpha_ax/sin_delta_ax fields describe GROUP 0 only. Readers "
+            "must prefer alpha_ax_g{gi}/sin_delta_ax_g{gi}.",
+            [len(a_) * len(s_) for a_, s_ in zip(alpha_ax_g, sd_ax_g)])
     _parts = cache_path.replace(".npz", "_parts") if cache_path else None
     mem_mb = os.environ.get("FSTAT_GRID_MEM_MB", "").strip()
     mem_budget = float(mem_mb) if mem_mb else None
@@ -1875,22 +2133,25 @@ def run_stacked_stage_b(call_fstat: Callable, peaks, *, xp, Tobs: float,
             mc_ax = np.linspace(_lo, _hi, n_Mc)
         else:
             mc_ax = np.linspace(mc_range[0], mc_range[1], n_Mc)
-        node_shape = (b - a, n_f0, n_Mc, n_alpha, n_sd)
+        _al, _sd = alpha_ax_g[gi], sd_ax_g[gi]
+        _na, _nsd = len(_al), len(_sd)
+        node_shape = (b - a, n_f0, n_Mc, _na, _nsd)
         logger.info(
             "[stageB] group %d/%d: %d peak boxes x %dx%dx%dx%d nodes "
-            "(f0 %.4f-%.4f mHz); axis2 = %s %s; f0 boxes clamped to their "
-            "sub-bands.", gi + 1, n_groups, b - a, n_f0, n_Mc, n_alpha,
-            n_sd, float(f0_los[a]), float(f0_los[b - 1]),
+            "(f0 %.4f-%.4f mHz); axis2 = %s %s; sky %d nodes = %.2f GB; "
+            "f0 boxes clamped to their sub-bands.", gi + 1, n_groups, b - a,
+            n_f0, n_Mc, _na, _nsd, float(f0_los[a]), float(f0_los[b - 1]),
             "fdot[Hz/s]" if _fdot_axis else "Mc",
             (f"[{mc_ax[0]:.4e}, {mc_ax[-1]:.4e}]" if _fdot_axis
-             else str(mc_range)))
+             else str(mc_range)),
+            _na * _nsd, float(np.prod(node_shape)) * 8 / 1e9)
         # single group keeps the historical "stageb" checkpoint name so
         # in-flight fits resume across this code change.
         _ck = "stageb" if n_groups == 1 else f"stageb_g{gi}"
         spec = StageBGroupSpec(
             gi=gi, n_groups=n_groups, a=a, b=b,
             f0_los=f0_los[a:b], f0_dxs=f0_dxs[a:b], mc_ax=mc_ax,
-            alpha_ax=alpha_ax, sd_ax=sd_ax, node_shape=node_shape,
+            alpha_ax=_al, sd_ax=_sd, node_shape=node_shape,
             ckpt_name=_ck, parts_dir=_parts,
             fingerprint_extra=fingerprint_extra,
             fdot_axis=_fdot_axis, c_t=_c_t,
@@ -1927,20 +2188,26 @@ def run_stacked_stage_b(call_fstat: Callable, peaks, *, xp, Tobs: float,
             if not np.any(sub_w > 0):
                 sub_w = None  # zero-mass group: equal inside, never drawn
         comps.append(StackedFStatProposal4D(
-            grids_g[gi], f0_los[a:b], f0_dxs[a:b], mc_ax_g[gi], alpha_ax,
-            sd_ax, weights=sub_w, mem_budget_mb=mem_budget))
+            grids_g[gi], f0_los[a:b], f0_dxs[a:b], mc_ax_g[gi],
+            alpha_ax_g[gi], sd_ax_g[gi], weights=sub_w,
+            mem_budget_mb=mem_budget))
     stacked = GroupedStackedFStatProposal(comps, box_weights=box_w)
     _sizes = np.diff(g_edges).astype(int)
+    _tot_gb = sum(float(np.prod(g.shape)) for g in grids_g) * 8 / 1e9
     logger.info(
-        "[stageB] banded Mc stacks: %d groups, sizes %s, n_Mc %s "
-        "(a single max-f0 stack would carry %d Mc nodes on every box).",
-        n_groups, _sizes.tolist(), n_mc_g, int(n_req.max()))
+        "[stageB] banded Mc stacks: %d groups, sizes %s, n_Mc %s, sky %s "
+        "(a single max-f0 stack would carry %d Mc nodes on every box); "
+        "grids total %.1f GB, resident cost at draw time is ~3x that.",
+        n_groups, _sizes.tolist(), n_mc_g,
+        [len(a_) * len(s_) for a_, s_ in zip(alpha_ax_g, sd_ax_g)],
+        int(n_req.max()), _tot_gb)
 
     if cache_path:
         stacked_path = cache_path.replace(".npz", "_peaks_stacked.npz")
         write_stacked_npz(
             stacked_path, grids_g=grids_g, mc_ax_g=mc_ax_g,
             f0_los=f0_los, f0_dxs=f0_dxs, alpha_ax=alpha_ax, sd_ax=sd_ax,
+            alpha_ax_g=alpha_ax_g, sd_ax_g=sd_ax_g,
             grid_basis=("fdot" if _fdot_axis else "Mc"),
             grid_c_t=(_c_t if _fdot_axis else 0.0), peaks=peaks,
             band_idx=band_idx, band_edges_mHz=band_edges_mHz,
