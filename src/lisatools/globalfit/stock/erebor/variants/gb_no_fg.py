@@ -1238,9 +1238,16 @@ def setup_gb_moves(engine_info, curr, acs, priors, state) -> dict:
             # Pure in-model refinement BEFORE the removal move: freshly-born
             # sources get a full repeat block to climb the likelihood before
             # rj_prior_removal judges them for death.
+            # Prefix test, not equality (2026-09-24): the v9 three-stage
+            # search lists THREE in-model slots per stage -- "in_model",
+            # "in_model_fstat", "in_model_replace" -- and an equality check
+            # would miss a recipe that carries only the latter two, then
+            # insert a fourth. It would also try to resolve an ``after=``
+            # anchor that appears in all three stages, which is ambiguous.
             if (
                 getattr(gb_info, "search_in_model", False)
-                and "in_model" not in recipe.move_names()
+                and not any(n.startswith("in_model")
+                            for n in recipe.move_names())
             ):
                 recipe.add_move("in_model", after=_anchor, branch="gb")
                 _anchor = "in_model"

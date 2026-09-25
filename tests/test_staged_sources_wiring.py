@@ -40,7 +40,12 @@ STAGE_ENVS = ("GB_ONLY", "STAGE_SKIP_NOISE", "STAGE_SKIP_SOURCE_SEARCH",
               # stage move lists, so every exact stage-list assertion below
               # needs it CLEARED rather than inherited from the ambient env
               # (VGBChirpRidgeWiringTest covers the =1 composition).
-              "VGB_CHIRP_MASS_BASIS")
+              "VGB_CHIRP_MASS_BASIS",
+              # 2026-09-24: shapes the stage LIST itself, so an ambient
+              # value would silently change every exact-list assertion here.
+              "STAGE_V9_SEARCH", "GB_SEARCH_3_WARM_EVERY",
+              "PSD_START_PARAMS", "GALFOR_START_PARAMS",
+              "STAGE_FORCE_NOISE_SEARCH")
 
 
 def _build_fit():
@@ -51,10 +56,53 @@ def _build_fit():
     return mod.build_fit()
 
 
+#: The GB search stage names under the v9 three-stage restructure
+#: (2026-09-24). ``STAGE_V9_SEARCH=0`` collapses them back to one
+#: ``gb_search``; ``LegacySingleSearchStageTest`` below covers that path, and
+#: everything else here runs against the DEFAULT composition, which is v9.
+V9_SEARCH_STAGES = ("gb_search_1", "gb_search_2", "gb_search_3")
+
+
 def _everies(fit, stage_name):
     st = next(s for s in fit.recipe.stages if s.name == stage_name)
     return {m.name: getattr(m, "every", 1) for m in st.moves
             if m.name in ("sobbh_pe", "mbh_pe", "emri_pe")}
+
+
+class LegacySingleSearchStageTest(unittest.TestCase):
+    """``STAGE_V9_SEARCH=0`` restores the pre-2026-09-24 composition.
+
+    The escape hatch has to keep working: it is what a bisect against the
+    restructure would use, and what a run that only wants the v9 knobs
+    (in-model convergence, caps off, fancy tempering off) WITHOUT the
+    three-stage cycle would set.
+    """
+
+    def setUp(self):
+        self._env = os.environ.copy()
+        for k in SRC_ENVS + STAGE_ENVS:
+            os.environ.pop(k, None)
+        os.environ["STAGE_V9_SEARCH"] = "0"
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._env)
+
+    def test_one_gb_search_stage_of_kind_rj(self):
+        fit = _build_fit()
+        self.assertEqual([st.name for st in fit.recipe.stages],
+                         ["noise_search", "noise_vgb_search", "gb_search",
+                          "full_pe"])
+        st = next(s for s in fit.recipe.stages if s.name == "gb_search")
+        self.assertEqual(st.kind, "rj")
+        self.assertNotIn("profile", st.step_kwargs)
+
+    def test_the_source_cadence_still_applies(self):
+        os.environ.update(ALL_IDS)
+        os.environ["STAGE_SKIP_SOURCE_SEARCH"] = "1"
+        fit = _build_fit()
+        self.assertEqual(_everies(fit, "gb_search"),
+                         {"sobbh_pe": 5, "mbh_pe": 5, "emri_pe": 5})
 
 
 class StagedSourcesWiringTest(unittest.TestCase):
@@ -76,7 +124,8 @@ class StagedSourcesWiringTest(unittest.TestCase):
         fit = _build_fit()
         self.assertEqual(
             [st.name for st in fit.recipe.stages],
-            ["noise_search", "noise_vgb_search", "gb_search", "full_pe"])
+            ["noise_search", "noise_vgb_search", *V9_SEARCH_STAGES,
+             "full_pe"])
         for b in ("mbh", "emri", "sobbh"):
             self.assertNotIn(b, fit.branches)
         for names in self._stages(fit).values():
@@ -105,7 +154,7 @@ class StagedSourcesWiringTest(unittest.TestCase):
         self.assertEqual(
             [st.name for st in fit.recipe.stages],
             ["source_search", "noise_search", "noise_vgb_search",
-             "gb_search", "full_pe"])
+             *V9_SEARCH_STAGES, "full_pe"])
         st0 = fit.recipe.stages[0]
         self.assertEqual(st0.kind, "search")
         self.assertEqual([m.name for m in st0.moves],
@@ -118,13 +167,14 @@ class StagedSourcesWiringTest(unittest.TestCase):
         # per pass at near-zero GPU); sobbh's cheap chunked-het rows run
         # every iteration, and full_pe runs everything uncadenced.
         stages = self._stages(fit)
-        for stage in ("gb_search", "full_pe"):
+        for stage in (*V9_SEARCH_STAGES, "full_pe"):
             names = stages[stage]
             sub = [n for n in names
                    if n in ("sobbh_pe", "mbh_pe", "emri_pe")]
             self.assertEqual(sub, ["sobbh_pe", "mbh_pe", "emri_pe"],
                              f"{stage}: {names}")
-        self.assertIn("rj_fstat_search", stages["gb_search"])
+        for stage in V9_SEARCH_STAGES:
+            self.assertIn("rj_fstat_search", stages[stage])
         self.assertIn("rj_fstat_pe", stages["full_pe"])
         # User ruling 2026-09-18: ALL THREE armed source branches ride the
         # gb_search cadence, default every 5. sobbh joined because the
@@ -132,8 +182,10 @@ class StagedSourcesWiringTest(unittest.TestCase):
         # the largest single cost in the stage -- against the 09-15
         # assumption that its chunked-het rows were cheap. full_pe is never
         # cadenced.
-        self.assertEqual(_everies(fit, "gb_search"),
-                         {"sobbh_pe": 5, "mbh_pe": 5, "emri_pe": 5})
+        for stage in V9_SEARCH_STAGES:
+            self.assertEqual(_everies(fit, stage),
+                             {"sobbh_pe": 5, "mbh_pe": 5, "emri_pe": 5},
+                             stage)
         self.assertEqual(_everies(fit, "full_pe"),
                          {"sobbh_pe": 1, "mbh_pe": 1, "emri_pe": 1})
 
@@ -141,8 +193,10 @@ class StagedSourcesWiringTest(unittest.TestCase):
         os.environ.update(ALL_IDS)
         os.environ["GB_SEARCH_SOURCE_EVERY"] = "7"
         fit = _build_fit()
-        self.assertEqual(_everies(fit, "gb_search"),
-                         {"sobbh_pe": 7, "mbh_pe": 7, "emri_pe": 7})
+        for stage in V9_SEARCH_STAGES:
+            self.assertEqual(_everies(fit, stage),
+                             {"sobbh_pe": 7, "mbh_pe": 7, "emri_pe": 7},
+                             stage)
         # the override never leaks into full_pe
         self.assertEqual(_everies(fit, "full_pe"),
                          {"sobbh_pe": 1, "mbh_pe": 1, "emri_pe": 1})
@@ -151,8 +205,10 @@ class StagedSourcesWiringTest(unittest.TestCase):
         os.environ.update(ALL_IDS)
         os.environ["GB_SEARCH_SOURCE_EVERY"] = "1"
         fit = _build_fit()
-        self.assertEqual(_everies(fit, "gb_search"),
-                         {"sobbh_pe": 1, "mbh_pe": 1, "emri_pe": 1})
+        for stage in V9_SEARCH_STAGES:
+            self.assertEqual(_everies(fit, stage),
+                             {"sobbh_pe": 1, "mbh_pe": 1, "emri_pe": 1},
+                             stage)
 
     def test_skip_source_search_keeps_moves_in_gb_stages(self):
         # User ruling 2026-09-14 late: with exact-truth starts
@@ -166,15 +222,18 @@ class StagedSourcesWiringTest(unittest.TestCase):
         stages = self._stages(fit)
         self.assertEqual(list(stages),
                          ["noise_search", "noise_vgb_search",
-                          "gb_search", "full_pe"])
+                          *V9_SEARCH_STAGES, "full_pe"])
         # user ruling 2026-09-18 (superseding 09-15's mbh/emri-only
-        # 1-in-10): all three ride gb_search at a 1-in-5 cadence; all three
-        # in full_pe uncadenced.
+        # 1-in-10): all three ride the GB search stages at a 1-in-5
+        # cadence; all three in full_pe uncadenced.
         for mv in ("sobbh_pe", "mbh_pe", "emri_pe"):
-            self.assertIn(mv, stages["gb_search"])
+            for stage in V9_SEARCH_STAGES:
+                self.assertIn(mv, stages[stage], stage)
             self.assertIn(mv, stages["full_pe"])
-        self.assertEqual(_everies(fit, "gb_search"),
-                         {"sobbh_pe": 5, "mbh_pe": 5, "emri_pe": 5})
+        for stage in V9_SEARCH_STAGES:
+            self.assertEqual(_everies(fit, stage),
+                             {"sobbh_pe": 5, "mbh_pe": 5, "emri_pe": 5},
+                             stage)
 
     def test_skip_source_search_without_sources_is_refused(self):
         # the flag has no stage to skip when nothing is armed -- refuse
@@ -346,13 +405,13 @@ class VGBChirpRidgeWiringTest(unittest.TestCase):
         os.environ["VGB_CHIRP_MASS_BASIS"] = "1"
         stages = self._stages(_build_fit())
         # exactly where gb_ridge_gibbs rides
-        for stage_name in ("gb_search", "full_pe"):
+        for stage_name in (*V9_SEARCH_STAGES, "full_pe"):
             self.assertIn("vgb_ridge_gibbs", stages[stage_name],
                           f"{stage_name}: {stages[stage_name]}")
             self.assertIn("gb_ridge_gibbs", stages[stage_name])
         # ... and nowhere else (search stages carry the joint criterion only)
         for name, names in stages.items():
-            if name in ("gb_search", "full_pe"):
+            if name in (*V9_SEARCH_STAGES, "full_pe"):
                 continue
             self.assertNotIn("vgb_ridge_gibbs", names, f"{name}: {names}")
 

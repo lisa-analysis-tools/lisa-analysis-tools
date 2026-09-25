@@ -757,8 +757,16 @@ class Recipe:
         step = self._current_recipe_step
         if step is None:
             return
-        begin_search_recipe_step(
-            step["adjust"].moves, int(self._current_iter))
+        adjust = step["adjust"]
+        serial = int(self._current_iter)
+        # Second consumer (2026-09-24, v9): a step that carries a per-stage
+        # PROFILE applies it here rather than in ``setup_run`` -- it needs the
+        # step serial, and only the recipe knows it (same argument as the
+        # docstring's). Steps without the hook are unaffected.
+        _note = getattr(adjust, "note_recipe_step", None)
+        if callable(_note):
+            _note(serial)
+        begin_search_recipe_step(adjust.moves, serial)
 
 
 class RecipeStep:
@@ -1009,6 +1017,56 @@ def begin_search_recipe_step(moves, serial) -> None:
         begin_search_recipe_step(getattr(m, "moves", None), serial)
 
 
+def iter_move_tree(moves):
+    """Yield every move in a (possibly nested) move tree, once, in order.
+
+    ``GFCombineMove`` nests its children under ``moves``; a weighted entry is
+    a ``(move, weight)`` tuple. Same unwrapping as
+    :func:`_cap_ramp_pending_total` and friends, factored out because the v9
+    stage profile needs to WRITE to the tree rather than sum over it.
+    """
+    for m in list(moves or []):
+        if isinstance(m, (tuple, list)) and m:
+            m = m[0]
+        if m is None:
+            continue
+        yield m
+        yield from iter_move_tree(getattr(m, "moves", None))
+
+
+def gb_moves_in_tree(moves):
+    """Every GB-branch GBSpecial move in the tree (VGB and non-GB excluded).
+
+    The test is ``branch_name == "gb"`` plus the presence of the SNR-boundary
+    attribute, i.e. "a GB band move", which is what the per-stage profile is
+    allowed to write to. ⚠ The VGB moves carry the SAME attribute name with
+    their own value (``VGB_OPT_SNR_LIMIT``, default 0.0 = off); writing the GB
+    floor onto them would silently arm an SNR gate the VGB branch has never
+    had, on 55 KNOWN sources that must not be gated at all.
+    """
+    for m in iter_move_tree(moves):
+        if (getattr(m, "branch_name", None) == "gb"
+                and hasattr(m, "opt_snr_rej_samp_limit")):
+            yield m
+
+
+def force_fstat_refit(moves, serial, reason: str = "") -> int:
+    """Arm a forced fresh-epoch F-stat refit on every grid move in the tree.
+
+    Returns how many moves were armed (0 when the tree carries no F-stat
+    grid move, e.g. a GB-less recipe). See
+    :meth:`~lisatools.globalfit.moves.gbspecialstretch.GBSpecialRJFStatGridMove.arm_fstat_refit`
+    for why a refit, and not an environment change, is the mechanism.
+    """
+    n = 0
+    for m in iter_move_tree(moves):
+        fn = getattr(m, "arm_fstat_refit", None)
+        if callable(fn):
+            fn(serial, reason)
+            n += 1
+    return n
+
+
 def _arm_cap_headroom_grant(moves) -> None:
     """Set the one-shot ``_grant_cap_headroom`` flag on every move in the tree
     that publishes a headroom deficit, so the next cap update grants +1 slot to
@@ -1176,7 +1234,232 @@ class RJRecipeStep(BaseRecipeStep):
             # move.ntemps = sampler.ntemps
 
 
-_STEP_CLASSES = {"search": SearchRecipeStep, "pe": PERecipeStep, "rj": RJRecipeStep}
+class SearchStageProfileStep(RJRecipeStep):
+    """An RJ step that also owns a per-stage GB SEARCH PROFILE (v9).
+
+    The v9 restructure (user spec 2026-09-24) replaces the single
+    ``gb_search`` stage with three, differing ONLY in four knobs:
+
+    ======================  =========  =========  =========  ===========
+    stage                   noise      phase max  opt SNR    F-stat peak
+    ======================  =========  =========  =========  ===========
+    ``gb_search_1``         fixed      **on**     **8**      **8**
+    ``gb_search_2``         fixed      off        5          6.25
+    ``gb_search_3``         sampled    off        5          6.25
+    ======================  =========  =========  =========  ===========
+
+    Noise fixed-vs-sampled is a MOVE-LIST difference (an unsampled branch
+    does not move), so it is handled by the driver. The other three are
+    per-move attributes, and they are applied HERE, at stage entry, rather
+    than by building three named copies of every GB move: ``build_gb_moves``
+    builds each stock move once and ``Move("rj_fstat_search")`` resolves the
+    SAME object in all three stages. Three copies would triple the
+    F-stat-carrying RJ instances -- each of which owns an epoch cache
+    lifecycle -- for no sampling benefit whatsoever.
+
+    WHAT IS WRITTEN, AND TO WHAT:
+
+    * ``opt_snr_rej_samp_limit`` -> **every GB-branch band move** in the
+      stage, including the pure in-model ones. It is the GB SNR PRIOR
+      BOUNDARY, not a per-move heuristic: a birth move and an in-model move
+      disagreeing about where the prior ends would let a source be walked
+      into a region the move that birthed it treats as zero-prior.
+    * ``phase_maximize`` -> the **RJ moves only** (``is_rj_prop``). The pure
+      in-model move is constructed ``phase_maximize=False`` deliberately
+      ("in-model scoring is at the actual phase") and that is not a stage
+      choice to make; phase maximization is a BIRTH heuristic.
+    * ``peak_min_snr`` -> the process-wide F-stat peak floor
+      (:func:`lisatools.sampling.fstat_proposal.set_peak_min_F_override`)
+      plus, on a CHANGE, a forced fresh-epoch refit
+      (:func:`force_fstat_refit`). ⚠ The floor is consumed when the grid is
+      FITTED and stamped into the stage-B cache, whose loader refuses a
+      mismatch -- so moving it without a refit either silently reuses the
+      old peak list or hard-refuses. See ``arm_fstat_refit``.
+
+    Every mutation prints one ``[V9-STAGE]`` line naming stage, knob, old and
+    new value. This machinery is otherwise invisible, and a profile that
+    silently failed to apply would look exactly like a normal run.
+
+    STOPPING. The stage ends when the nleaves plateau AND the
+    per-(walker, band) RJ shutoff valve both say so -- see
+    :meth:`stopping_function`.
+
+    Args:
+        profile: ``{"phase_maximize": bool|None, "opt_snr": float|None,
+            "peak_min_snr": float|None}``. ``None`` for a key means "leave
+            it alone", which is how a stage opts out of owning a knob.
+        stage_name: label for the log lines.
+    """
+
+    def __init__(self, *args, profile: typing.Optional[dict] = None,
+                 stage_name: str = "", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.profile = dict(profile or {})
+        _unknown = sorted(set(self.profile) - {
+            "phase_maximize", "opt_snr", "peak_min_snr"})
+        if _unknown:
+            raise ValueError(
+                f"SearchStageProfileStep({stage_name!r}): unknown profile "
+                f"keys {_unknown}. A misspelled key would be silently "
+                f"ignored, which is exactly the failure this refuses."
+            )
+        self.stage_name = stage_name
+        #: Step serial the profile was last applied for (idempotence across a
+        #: mid-step resume, which re-announces the ACTIVE step).
+        self._profile_serial = None
+        #: Whether this step has ever been announced. Read by the
+        #: ``stopping_function`` guard below.
+        self._profile_applied = False
+
+    # ---- profile application ----------------------------------------------
+
+    def note_recipe_step(self, serial) -> None:
+        """Apply the profile for recipe step ``serial`` (idempotent per step).
+
+        Called by :meth:`Recipe._announce_recipe_step` immediately after
+        ``setup_run`` and before the step's first propose. It lives here
+        rather than in ``setup_run`` for the same reason the valve's release
+        does: a step does not know its own index and the forced refit needs
+        one that is stable across a mid-step restart.
+        """
+        if serial is not None and serial == self._profile_serial:
+            return
+        self._profile_serial = serial
+        self._profile_applied = True
+        self._apply_profile(serial)
+
+    def _apply_profile(self, serial) -> None:
+        tag = self.stage_name or "gb_search"
+        prof = self.profile
+        gb_moves = list(gb_moves_in_tree(self.moves))
+        if not gb_moves:
+            logger.warning(
+                "[V9-STAGE %s] no GB band moves in this stage's move tree -- "
+                "the stage profile %s applies to NOTHING. Either the gb "
+                "branch was removed or the stage was mis-composed.", tag, prof)
+        logger.info(
+            "[V9-STAGE %s] entering (recipe step %s): profile %s over %d GB "
+            "move(s) %s", tag, serial,
+            {k: v for k, v in prof.items() if v is not None},
+            len(gb_moves), [getattr(m, "name", "?") for m in gb_moves])
+
+        snr = prof.get("opt_snr")
+        if snr is not None:
+            for m in gb_moves:
+                old = float(getattr(m, "opt_snr_rej_samp_limit", float("nan")))
+                if old != float(snr):
+                    logger.info(
+                        "[V9-STAGE %s] %s.opt_snr_rej_samp_limit %.3f -> "
+                        "%.3f", tag, m.name, old, float(snr))
+                m.opt_snr_rej_samp_limit = float(snr)
+                # The per-(walker, band) stage table, when the COARSE/FINE
+                # schedule is armed, SHADOWS the scalar (``_live_snr_lim``
+                # returns the table). Say so rather than leaving a log line
+                # claiming a value the buffer never sees.
+                if getattr(m, "_snr_lim_table", None) is not None:
+                    logger.warning(
+                        "[V9-STAGE %s] %s carries a per-(walker, band) "
+                        "opt-SNR table (GB_SEARCH_STAGE_PER_WALKER=1), which "
+                        "SHADOWS the scalar just set. v9 expects that flag "
+                        "OFF -- SNR floors move per recipe STAGE, not per "
+                        "band.", tag, m.name)
+
+        pm = prof.get("phase_maximize")
+        if pm is not None:
+            for m in gb_moves:
+                if not getattr(m, "is_rj_prop", False):
+                    continue
+                old = bool(getattr(m, "phase_maximize", False))
+                if old != bool(pm):
+                    logger.info("[V9-STAGE %s] %s.phase_maximize %s -> %s",
+                                tag, m.name, old, bool(pm))
+                m.phase_maximize = bool(pm)
+
+        peak = prof.get("peak_min_snr")
+        if peak is not None:
+            from lisatools.sampling.fstat_proposal import (
+                peak_min_F_override, set_peak_min_F_override)
+
+            want_F = 0.5 * float(peak) ** 2
+            have_F = peak_min_F_override()
+            set_peak_min_F_override(float(peak))
+            changed = have_F is None or abs(have_F - want_F) > 1e-9 * max(
+                1.0, abs(want_F))
+            logger.info(
+                "[V9-STAGE %s] F-stat peak floor -> SNR %.3f (F %.3f); "
+                "previous in-code override %s", tag, float(peak), want_F,
+                "unset (the run's FSTAT_PEAK_MIN_SNR was in force)"
+                if have_F is None else f"F {have_F:.3f}")
+            if changed:
+                n = force_fstat_refit(
+                    self.moves, serial,
+                    f"{tag}: peak floor -> SNR {float(peak):.3f}")
+                logger.info(
+                    "[V9-STAGE %s] armed a forced fresh-epoch F-stat refit on "
+                    "%d grid move(s). The stage-B cache stamps the floor its "
+                    "peaks were selected at and its loader refuses a "
+                    "mismatch, so a new epoch -- not a deleted file -- is how "
+                    "the new floor takes effect.", tag, n)
+                if n == 0:
+                    logger.warning(
+                        "[V9-STAGE %s] the peak floor MOVED but no F-stat "
+                        "grid move was found to refit. The new floor will "
+                        "only bind if something else fits a grid.", tag)
+
+    # ---- stopping ----------------------------------------------------------
+
+    def stopping_function(self, i, sample, sampler) -> bool:
+        """Nleaves plateau AND the per-(walker, band) RJ valve (gate 6).
+
+        COMPOSED, never replaced. The criterion the user sanctioned is
+        **"every OCCUPIED (walker, band) pair has shut off"**, and the two
+        halves cover disjoint failure modes:
+
+        * ``band_shutoff_w_pending_total`` counts OCCUPIED pairs still paying
+          in lnL. An EMPTY pair can never shut off (a band that has found
+          nothing has not plateaued, it has not started), so this can never
+          speak for the empty bands -- which the nleaves plateau does.
+        * ⚠ ``band_shutoff_w_armed`` is MANDATORY. ``pending_total`` returns
+          0 both when everything converged and when the feature is off, and
+          the second reading would end every stage at its first check.
+        """
+        stop = super().stopping_function(i, sample, sampler)
+        moves = getattr(sampler, "moves", None)
+        if band_shutoff_w_armed(moves):
+            pending = band_shutoff_w_pending_total(moves)
+            if stop and pending:
+                logger.info(
+                    "[V9-STAGE %s] nleaves plateau reached but %d occupied "
+                    "(walker, band) pair(s) have NOT shut off -- holding the "
+                    "stage open.", self.stage_name or "gb_search", pending)
+                stop = False
+            elif stop:
+                logger.info(
+                    "[V9-STAGE %s] STAGE COMPLETE: nleaves plateau AND every "
+                    "occupied (walker, band) pair has shut off.",
+                    self.stage_name or "gb_search")
+            elif i % 10 == 0:
+                logger.info(
+                    "[V9-STAGE %s] running: %d occupied (walker, band) "
+                    "pair(s) still active.",
+                    self.stage_name or "gb_search", pending)
+        elif stop:
+            logger.info(
+                "[V9-STAGE %s] STAGE COMPLETE on the nleaves plateau alone "
+                "(the per-(walker, band) RJ valve is NOT armed -- export "
+                "GB_SEARCH_BAND_SHUTOFF_PER_WALKER=1 to add it).",
+                self.stage_name or "gb_search")
+        return stop
+
+
+_STEP_CLASSES = {
+    "search": SearchRecipeStep,
+    "pe": PERecipeStep,
+    "rj": RJRecipeStep,
+    # v9: an ``rj`` step that additionally owns a per-stage GB search profile
+    # and composes the per-(walker, band) shutoff valve into its stopping rule.
+    "gb_search": SearchStageProfileStep,
+}
 
 
 class Stage:
@@ -1191,7 +1474,12 @@ class Stage:
       completion internally; the stage is done on its first check);
     * ``"pe"`` -> :class:`PERecipeStep` (runs indefinitely);
     * ``"rj"`` -> :class:`RJRecipeStep` (stops when the monitored branch's
-      cold-chain leaf count plateaus; knobs via ``step_kwargs``).
+      cold-chain leaf count plateaus; knobs via ``step_kwargs``);
+    * ``"gb_search"`` -> :class:`SearchStageProfileStep` (v9): an ``"rj"``
+      step that also applies a per-stage GB search profile at stage entry
+      and composes the per-(walker, band) RJ shutoff valve into its stopping
+      rule. ``step_kwargs`` takes ``profile=`` and ``stage_name=`` on top of
+      the RJ plateau knobs.
 
     Args:
         name: Unique stage name (e.g. ``"gb_pe"``, ``"main"``).
@@ -1208,7 +1496,25 @@ class Stage:
             carry its own ``Move.debug`` (same value semantics).
     """
 
-    _KINDS = ("search", "pe", "rj")
+    _KINDS = ("search", "pe", "rj", "gb_search")
+
+    #: Kinds that are a SPECIALIZATION of another kind, mapped to the kind
+    #: they BEHAVE as. ``Stage.kind`` picks the step class and is what the
+    #: recipe prints; this is what gets stamped onto the runtime combine as
+    #: ``gf_stage_kind``, which is what the rest of the package switches on.
+    #:
+    #: ⚠ WHY THIS EXISTS. ``gf_stage_kind`` is tested by literal tuples in
+    #: several places -- ``psdmove._coarse_mode`` resolves "auto" to
+    #: search_approx only for ``("search", "rj")``, and the delayed-acceptance
+    #: PE path keys on ``== "pe"``. Adding a fourth kind therefore did not
+    #: extend those tests, it fell THROUGH them: v9's search stages would have
+    #: silently resolved the coarse noise likelihood to delayed_acceptance,
+    #: i.e. the PE behaviour, in the stages where the wall time is. Mapping
+    #: here fixes every such site at once and keeps new kinds from having to
+    #: find them all. (v9 runs COARSE_GPU_MODE=off, so that particular
+    #: resolution was inert -- which is exactly why it would not have been
+    #: noticed.)
+    _RUNTIME_KIND = {"gb_search": "rj"}
 
     def __init__(
         self,
@@ -1227,6 +1533,11 @@ class Stage:
         self.step_kwargs = dict(step_kwargs or {})
         self.combine_kwargs = dict(combine_kwargs or {})
         self.debug = debug
+
+    @property
+    def runtime_kind(self) -> str:
+        """The kind this stage BEHAVES as (see :data:`_RUNTIME_KIND`)."""
+        return self._RUNTIME_KIND.get(self.kind, self.kind)
 
     def move_names(self) -> typing.List[str]:
         return [m.name for m in self.moves]
@@ -1290,7 +1601,10 @@ class Stage:
         # instance serves noise_search and full_pe, and a static stamp on it
         # would be whichever stage materialised last. GFCombineMove re-stamps
         # its children immediately before each propose instead.
-        combined.gf_stage_kind = self.kind
+        #
+        # The RUNTIME kind, not ``self.kind``: a specialized kind behaves as
+        # the kind it specializes everywhere downstream (see _RUNTIME_KIND).
+        combined.gf_stage_kind = self.runtime_kind
         # This combine IS the stage's per-iteration entry point: eryn calls
         # its propose exactly once per global-fit iteration. It therefore
         # owns the iteration counter that gets stamped down the move tree
@@ -3570,22 +3884,58 @@ def build_gb_moves(
     # ``rj_prior_removal`` judges them for death (a source still sitting at its
     # birth coordinates looks far more deletable than the same source after it
     # has walked onto its peak).
-    gb_in_model_move = None
+    #: The in-model SLOT names the v9 three-stage search cycle installs, in
+    #: cycle order. Each is named for the RJ move it POLISHES: the
+    #: warm-start births, the F-stat births, and the replacement swaps
+    #: (user spec 2026-09-24, amended the same day to end the cycle on
+    #: ``rj_prior_removal`` -- so every birth and every swap gets a full
+    #: in-model refinement pass BEFORE the removal judge sees it, and a
+    #: source is never judged at coordinates it has not been given a chance
+    #: to walk away from).
+    #:
+    #: THREE INSTANCES, not one listed three times, because a stage's move
+    #: names must be unique (``Recipe._check_unique``) and because
+    #: ``Stage.setup`` stamps ``gf_move_name`` onto the runtime object -- one
+    #: shared object in three slots would report all three passes under
+    #: whichever name was stamped last, and pool their ``accepted`` counters,
+    #: which is exactly the per-slot accounting the cycle exists to expose.
+    #: They are cheap: no birth distribution, no F-stat grid, no cap counters;
+    #: ``gb_move_args`` are shared references and ``band_temps`` lives in the
+    #: STATE, so the three cannot drift apart.
+    #:
+    #: The first keeps the historical bare name so single-stage recipes, the
+    #: ``gb_no_fg`` auto-insertion and every existing runbook still resolve.
+    GB_IN_MODEL_SLOTS = ("in_model", "in_model_fstat", "in_model_replace")
+
+    gb_in_model_moves = []
     if _gb_mode_search and getattr(gb_info, "search_in_model", False):
-        gb_in_model_move = GBSpecialStretchMove(
-            *gb_move_args,
-            rj_proposal_distribution=None,
-            is_rj_prop=False,          # THE switch: in-model repeats only
-            name="in_model",
-            phase_maximize=False,      # in-model scoring is at the actual phase
-            run_swaps=False,
-            gpus=[],
-            # Cap counters advance exactly once per iteration on ``rj_prior``;
-            # this move must not touch them (it changes no dimensions).
-            **{**gb_move_kwargs, "leaf_cap_update": False},
+        for _slot in GB_IN_MODEL_SLOTS:
+            _mv = GBSpecialStretchMove(
+                *gb_move_args,
+                rj_proposal_distribution=None,
+                is_rj_prop=False,      # THE switch: in-model repeats only
+                name=_slot,
+                phase_maximize=False,  # in-model scoring is at the actual phase
+                run_swaps=False,
+                gpus=[],
+                # Cap counters advance exactly once per iteration on
+                # ``rj_prior``; this move must not touch them (it changes no
+                # dimensions).
+                **{**gb_move_kwargs, "leaf_cap_update": False},
+            )
+            _mv.accepted = np.zeros((ntemps, nwalkers_local))
+            _mv.install_walker_fanout(curr)
+            gb_in_model_moves.append(_mv)
+        logger.info(
+            "build_gb_moves: %d pure in-model slots registered %s. Each runs "
+            "%d repeats per source per PASS, and -- when "
+            "GB_INMODEL_GROUP=1 -- an ADAPTIVE number of passes, ending when "
+            "every occupied (walker, band) sub-band's cold-chain logL has "
+            "plateaued or the pass ceiling hits.",
+            len(gb_in_model_moves), list(GB_IN_MODEL_SLOTS),
+            int(gb_info.num_repeat_proposals),
         )
-        gb_in_model_move.accepted = np.zeros((ntemps, nwalkers_local))
-        gb_in_model_move.install_walker_fanout(curr)
+    gb_in_model_move = gb_in_model_moves[0] if gb_in_model_moves else None
 
     gb_prior_removal_move = None
     if _gb_mode_search and getattr(gb_info, "search_prior_removal", False):
@@ -3744,6 +4094,25 @@ def build_gb_moves(
             _warm_path, _warm_container.n_components,
             os.environ.get("GB_WARM_START_FLOOR_EPS", "0.05"),
         )
+        # TWO-PASS rj_replace (user ruling 2026-09-24: "one internal
+        # iteration with the refit/warmstart and one internal iteration of
+        # the fstat ... inside one def propose()"). The SAME container object
+        # is shared by reference -- one WarmStartComponents in the process,
+        # holding one device-resident mixture -- so the replace pass and
+        # rj_warm_search's births can never draw from different laws.
+        # GB_REPLACE_WARM_PASS=0 leaves replace single-pass.
+        if gb_replace_move is not None and os.environ.get(
+                "GB_REPLACE_WARM_PASS", "1").strip() not in ("0", "false",
+                                                             "False", "off"):
+            gb_replace_move.replace_warm_distribution = {
+                "gb": _warm_container}
+            logger.info(
+                "build_gb_moves: rj_replace is TWO-PASS -- pass 1 draws "
+                "replacement candidates from the warm-start mixture, pass 2 "
+                "from the F-stat grid, both inside one propose(). Watch "
+                "[GB_REPLACE] for the per-pass lnL drift and [GB_ACCEPT "
+                "replace-split] for the per-pass acceptance."
+            )
 
     #* ============================================= PARAMETER ESTIMATION MOVES =============================================
     # PE births draw the EXTRINSICS (distance/amplitude, phi0, cos-iota,
@@ -4064,8 +4433,7 @@ def build_gb_moves(
     gb_pe_moves += [gb_pe_prior_birth_move, gb_pe_fstat_mcmc_move]
     if gb_replace_move is not None:
         gb_pe_moves.append(gb_replace_move)
-    if gb_in_model_move is not None:
-        gb_pe_moves.append(gb_in_model_move)
+    gb_pe_moves += gb_in_model_moves
     if gb_prior_removal_move is not None:
         gb_pe_moves.append(gb_prior_removal_move)
     if _refit_available:

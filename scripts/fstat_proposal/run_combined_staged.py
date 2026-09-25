@@ -354,6 +354,43 @@ def _source_ids_from_env() -> dict:
     return armed
 
 
+#: THE v9 SEARCH STAGE TABLE -- ``(stage name, profile, samples noise)``.
+#:
+#: User spec 2026-09-24. One ``gb_search`` stage becomes three that differ in
+#: exactly four things, and this tuple is the single place all four are
+#: stated, so the GB-only composition and the full one cannot drift:
+#:
+#:   * ``phase_maximize`` -- the RJ BIRTH phase-maximization heuristic.
+#:     On in stage 1 (hunting: take the credit), off afterwards.
+#:   * ``opt_snr`` -- the GB SNR prior boundary. 8 in stage 1 ("SNR 5 = noise,
+#:     keep 8" -- a boundary of 5 measurably ballooned the hot ladder with
+#:     noise births), 5 once the loud population is assembled and the faint
+#:     tail must become reachable.
+#:   * ``peak_min_snr`` -- the F-stat peak-selection floor. Moves with the
+#:     opt-SNR boundary; 6.25 is the landed 2026-09-23 knee value.
+#:   * samples noise -- whether the psd/galfor moves are in the stage at all.
+#:
+#: ⚠ ``peak_min_snr`` is consumed when the F-stat grid is FITTED and stamped
+#: into the stage-B cache, whose loader refuses a mismatch. The stage entry
+#: therefore sets an in-code override AND forces a fresh-epoch refit; see
+#: ``recipe.SearchStageProfileStep``. Nothing on disk is deleted.
+V9_SEARCH_STAGE_PROFILES = (
+    ("gb_search_1",
+     dict(phase_maximize=True, opt_snr=8.0, peak_min_snr=8.0), False),
+    ("gb_search_2",
+     dict(phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25), False),
+    ("gb_search_3",
+     dict(phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25), True),
+)
+
+
+def _v9_search_enabled() -> bool:
+    """Is the v9 three-stage GB search on? ``STAGE_V9_SEARCH=0`` restores the
+    single legacy ``gb_search`` stage, bit-identically."""
+    return os.environ.get("STAGE_V9_SEARCH", "1").strip() not in (
+        "0", "false", "False", "off")
+
+
 def build_fit():
     from lisatools.globalfit.recipe import Move, Recipe, Stage
     from lisatools.globalfit.stock import erebor
@@ -656,6 +693,54 @@ def build_fit():
             # Fresh Move descriptor per stage (never share one instance).
             return ([Move("gb_ridge_gibbs", branch="gb")]
                     if os.environ.get("GB_RIDGE_GIBBS", "1") == "1" else [])
+
+        def gb_only_in_model(slot):
+            return ([Move(slot, branch="gb")]
+                    if _env_flag("GB_SEARCH_IN_MODEL") else [])
+
+        if _v9_search_enabled():
+            # Same three-stage v9 cycle as the full composition below, minus
+            # every psd/galfor/vgb move. Keeping the two in step matters: the
+            # GB-only variant is what the probe scripts and the search-test
+            # runbook drive, so a divergence here would mean the probes stop
+            # testing the production cycle.
+            _pe_stage = Stage(
+                name="full_pe", kind="pe",
+                moves=warm_pe() + [
+                    Move("rj_fstat_pe", branch="gb"),
+                    Move("rj_prior_pe", branch="gb"),
+                ] + ridge(),
+                combine_kwargs=_pe_combine_kwargs(),
+            )
+            _warm3 = int(os.environ.get("GB_SEARCH_3_WARM_EVERY", "5"))
+            if _warm3 < 1:
+                raise ValueError(
+                    f"GB_SEARCH_3_WARM_EVERY={_warm3} must be >= 1.")
+            _gb_only_stages = []
+            for _name, _prof, _sampled in V9_SEARCH_STAGE_PROFILES:
+                _every = _warm3 if _sampled else 1
+                _warm = ([Move("rj_warm_search", branch="gb", every=_every)]
+                         if warm() else [])
+                _gb_only_stages.append(Stage(
+                    name=_name, kind="gb_search",
+                    moves=(_warm + gb_only_in_model("in_model")
+                           + [Move("rj_fstat_search", branch="gb")]
+                           + gb_only_in_model("in_model_fstat")
+                           + replace()
+                           + gb_only_in_model("in_model_replace")
+                           + [Move("rj_prior_removal", branch="gb")]
+                           + ridge()),
+                    step_kwargs=dict(
+                        plateau_branch="gb",
+                        convergence_iter=int(
+                            os.environ.get("GB_PLATEAU_ITERS", "5")),
+                        stage_name=_name, profile=dict(_prof),
+                    ),
+                    combine_kwargs=dict(share_temperature_control=False),
+                ))
+            fit.recipe = Recipe(_gb_only_stages + [_pe_stage])
+            return fit
+
         fit.recipe = Recipe([
             Stage(
                 name="gb_search", kind="rj",
@@ -871,7 +956,42 @@ def build_fit():
                 branch=_src_branch)],
             combine_kwargs=dict(share_temperature_control=False),
         ))
-    if _has_psd and not _env_flag("STAGE_SKIP_NOISE"):
+    # CONDITIONAL NOISE STAGES (v9, user spec 2026-09-24): "noise_search /
+    # noise_vgb_search run ONLY when there is no psd/foreground estimate from
+    # a previous run." The estimate IS the start pin -- {PSD,GALFOR}_START_
+    # PARAMS, which the submit script fills from the previous run's maxlogL
+    # point, the same folder the warm start comes from. With every sampled
+    # noise branch pinned there is nothing for a convergence-gated noise
+    # burn-in to find; without one they run exactly as before.
+    #
+    # ⚠ The gate requires a pin for EVERY sampled noise branch. A half-pinned
+    # start (psd seeded, galfor prior-drawn) with the noise stages skipped
+    # would enter gb_search_1 -- which does not sample noise at all -- with a
+    # random foreground, and stay there for two whole stages.
+    _noise_pinned = bool(os.environ.get("PSD_START_PARAMS", "").strip()) and (
+        not _has_galfor
+        or bool(os.environ.get("GALFOR_START_PARAMS", "").strip()))
+    _force_noise = _env_flag("STAGE_FORCE_NOISE_SEARCH")
+    if _v9_search_enabled() and _noise_pinned and not _force_noise:
+        print(
+            "[combined] v9: SKIPPING noise_search / noise_vgb_search -- the "
+            "noise model is PINNED at a previous run's estimate "
+            "(PSD_START_PARAMS"
+            + (" + GALFOR_START_PARAMS" if _has_galfor else "")
+            + "). Stages gb_search_1/2 hold it there; gb_search_3 releases "
+              "it. Export STAGE_FORCE_NOISE_SEARCH=1 to run them anyway.",
+            flush=True,
+        )
+    elif _has_psd and not _env_flag("STAGE_SKIP_NOISE"):
+        if _v9_search_enabled() and not _noise_pinned:
+            print(
+                "[combined] v9: noise_search / noise_vgb_search KEPT -- no "
+                "previous-run noise estimate was supplied "
+                "(PSD_START_PARAMS / GALFOR_START_PARAMS unset), so the psd "
+                "and foreground start from a PRIOR DRAW and must be fitted "
+                "before the fixed-noise search stages freeze them.",
+                flush=True,
+            )
         stages.append(Stage(
             name="noise_search", kind="search", moves=noise_only,
             combine_kwargs=dict(share_temperature_control=False),
@@ -919,6 +1039,135 @@ def build_fit():
             moves=noise_pe + source_pe() + vgb + vgb_ridge(),
             combine_kwargs=_pe_combine_kwargs(),
         ))
+        fit.recipe = Recipe(stages)
+        return fit
+
+    # ======================================================================
+    # v9: THREE GB SEARCH STAGES (user spec 2026-09-24)
+    # ======================================================================
+    # Design: docs/superpowers/specs/2026-09-24-v9-search-stage-restructure-
+    # design.md. One ``gb_search`` stage becomes three, differing in exactly
+    # four things:
+    #
+    #   stage           noise     phase max   opt SNR   F-stat peak
+    #   gb_search_1     FIXED     on          8         8
+    #   gb_search_2     FIXED     off         5         6.25
+    #   gb_search_3     sampled   off         5         6.25
+    #
+    # and each runs the same per-iteration move cycle:
+    #
+    #   1  rj_warm_search      (stage 3: every GB_SEARCH_3_WARM_EVERY iters)
+    #   2  in_model            (adaptive passes -- see below)
+    #   3  rj_fstat_search
+    #   4  in_model_fstat
+    #   5  rj_replace          (two internal passes: warm, then F-stat)
+    #   6  in_model_replace
+    #   7  rj_prior_removal    (removal only) -- THE CYCLE ENDS HERE
+    #
+    # The cycle ENDS on the removal judge (user amendment 2026-09-24), so
+    # every birth and every swap has had a full in-model refinement pass
+    # before it is judged for death. A source still sitting at its birth or
+    # swap coordinates looks far more deletable than the same source after it
+    # has walked onto its peak, and the three in-model slots are each named
+    # for the RJ move they polish.
+    #
+    # THE IN-MODEL SLOTS ARE NOT FIXED-LENGTH. Each is ONE ``propose()`` that
+    # internally repeats its whole pass -- GB_NUM_REPEAT_PROPOSALS repeats per
+    # source per pass, a FIXED number -- until every occupied (walker, band)
+    # sub-band's cold-chain logL has plateaued, or GB_INMODEL_GROUP_MAX_PASSES
+    # hits. Fixed repeats, adaptive passes (user confirmation 2026-09-24);
+    # per-source totals are consequently not uniform across the proposal,
+    # which is accepted in search.
+    #
+    # "FIXED noise" is the ABSENCE of the psd/galfor moves, not a pin: an
+    # unsampled branch does not move, and setup_acs rebuilds each walker's
+    # sensitivity from the state coords every pass. The VALUE it is fixed at
+    # is PSD_START_PARAMS / GALFOR_START_PARAMS (run.py's noise start pin),
+    # which the submit script fills from the SAME previous-run folder the warm
+    # start comes from, at that run's maxlogL point.
+    #
+    # STAGE_V9_SEARCH=0 restores the single legacy ``gb_search`` stage.
+    _v9_stages = _v9_search_enabled()
+
+    def in_model(slot):
+        """One pure in-model slot, when the move exists to resolve.
+
+        ``build_gb_moves`` registers the three slots only under
+        GB_MODE=search + GB_SEARCH_IN_MODEL=1, and a listed-but-unbuilt move
+        fails recipe materialization -- so the descriptor has to be
+        knob-conditional exactly like warm()/replace(). Fresh Move descriptor
+        per call (never share one instance across stages).
+        """
+        return ([Move(slot, branch="gb")]
+                if _env_flag("GB_SEARCH_IN_MODEL") else [])
+
+    def _search_stage(name, *, sample_noise, phase_maximize, opt_snr,
+                      peak_min_snr, warm_every=1):
+        # SAMPLED noise: the legacy gb_search composition verbatim -- the
+        # leading joint psd+galfor+vgb search plus the two extra re-tracking
+        # rounds that bracket the F-stat birth move, so the grid is always
+        # fitted against a current noise level. FIXED noise: the vgb branch
+        # keeps sampling (it is 55 KNOWN sources, nothing to do with the
+        # noise model) and the psd/galfor moves are simply absent.
+        _noise = (noise_vgb_gb if sample_noise
+                  else ([Move("vgb_pe", branch="vgb")] if _has_vgb else []))
+        _noise_pre = noise_only_1 if sample_noise else []
+        _noise_post = noise_only_2 if sample_noise else []
+        _warm = ([Move("rj_warm_search", branch="gb", every=warm_every)]
+                 if warm() else [])
+        return Stage(
+            name=name, kind="gb_search",
+            moves=(
+                _noise
+                + source_pe(gb_search_cadence=True)
+                + _warm + in_model("in_model") + _noise_pre
+                + [Move("rj_fstat_search", branch="gb")]
+                + _noise_post
+                + in_model("in_model_fstat")
+                + replace()
+                + in_model("in_model_replace")
+                + [Move("rj_prior_removal", branch="gb")]
+                + ([Move("gb_ridge_gibbs", branch="gb")]
+                   if os.environ.get("GB_RIDGE_GIBBS", "1") == "1" else [])
+                + vgb_ridge()
+            ),
+            step_kwargs=dict(
+                plateau_branch="gb",
+                convergence_iter=int(os.environ.get("GB_PLATEAU_ITERS", "5")),
+                stage_name=name,
+                profile=dict(phase_maximize=phase_maximize, opt_snr=opt_snr,
+                             peak_min_snr=peak_min_snr),
+            ),
+            combine_kwargs=dict(share_temperature_control=False),
+        )
+
+    if _v9_stages:
+        # Warm start every Nth iteration in stage 3 only (user ruling
+        # 2026-09-24). By then the previous run's posterior has been mined;
+        # what remains is expensive per hit and rarely productive, so it
+        # rides a cadence instead of the every-iteration schedule stages 1-2
+        # give it.
+        _warm3 = int(os.environ.get("GB_SEARCH_3_WARM_EVERY", "5"))
+        if _warm3 < 1:
+            raise ValueError(
+                f"GB_SEARCH_3_WARM_EVERY={_warm3} must be >= 1.")
+        stages += [
+            _search_stage(_name, sample_noise=_sampled,
+                          warm_every=(_warm3 if _sampled else 1), **_prof)
+            for _name, _prof, _sampled in V9_SEARCH_STAGE_PROFILES
+        ] + [
+            Stage(
+                name="full_pe", kind="pe",
+                # Unchanged from the legacy composition below.
+                moves=noise_pe + source_pe() + warm_pe() + [
+                    Move("rj_fstat_pe", branch="gb"),
+                    Move("rj_prior_pe", branch="gb"),
+                ] + ([Move("gb_ridge_gibbs", branch="gb")]
+                     if os.environ.get("GB_RIDGE_GIBBS", "1") == "1" else [])
+                + vgb + vgb_ridge(),
+                combine_kwargs=_pe_combine_kwargs(),
+            ),
+        ]
         fit.recipe = Recipe(stages)
         return fit
 

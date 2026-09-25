@@ -1683,24 +1683,49 @@ def _resolve_inmodel_repeats(branch_name, class_name, kwarg_value, default):
     return value
 
 
-def _resolve_converge_knob(branch_name, knob, kwarg_value, default, cast):
-    """Resolve one ``{BRANCH}_INMODEL_CONVERGE[_<KNOB>]`` setting.
+def _resolve_converge_knob(branch_name, knob, kwarg_value, default, cast,
+                           family: str = "INMODEL_CONVERGE"):
+    """Resolve one ``{BRANCH}_{FAMILY}[_<KNOB>]`` setting.
 
     Same precedence as every other move knob (:func:`_resolve_rj_flip_fraction`,
     :func:`_resolve_inmodel_repeats`): explicit kwarg > environment >
-    ``default``. ``knob`` is the suffix ("" for the master switch),
+    ``default``. ``knob`` is the suffix ("" for a family's master switch),
     ``cast`` the value constructor -- :func:`_converge_cast_mode`,
     ``int``, ``float`` or :func:`_converge_cast_classes`.
 
-    One generic resolver rather than six near-identical ones: these knobs
-    are a single feature's surface and their only difference is the cast.
+    One generic resolver rather than a dozen near-identical ones: these
+    knobs are two features' surface and their only difference is the cast.
+
+    TWO FAMILIES, and they are deliberately siblings rather than nested:
+
+    * ``INMODEL_CONVERGE`` -- the per-ROW newborn rule (scope 1);
+    * ``INMODEL_GROUP``    -- the per-(walker, band) in-GROUP rule (scope 2).
+
+    ⚠ ``family`` exists because the group knobs were briefly resolved under
+    the convergence family, i.e. as ``GB_INMODEL_CONVERGE_GROUP_*``, while
+    every docstring, every ``[GB_IMGROUP]`` log line and the v9 submit
+    script said ``GB_INMODEL_GROUP_*``. An unrecognized env var is SILENTLY
+    IGNORED, so that mismatch did not fail anything -- it just left the
+    whole group rule off in a run whose script, log header and drift guard
+    all claimed it was on. The documented spelling is now the real one, and
+    the old one is still honoured (with a warning) so no draft runbook
+    written against it silently does nothing either.
     """
     value = kwarg_value
     if value is None:
-        env = f"{str(branch_name).upper()}_INMODEL_CONVERGE"
-        if knob:
-            env = f"{env}_{str(knob).upper()}"
+        base = f"{str(branch_name).upper()}_{family}"
+        env = f"{base}_{str(knob).upper()}" if knob else base
         value = os.environ.get(env, None)
+        if value is None and family == "INMODEL_GROUP":
+            legacy_base = f"{str(branch_name).upper()}_INMODEL_CONVERGE_GROUP"
+            legacy = (f"{legacy_base}_{str(knob).upper()}" if knob
+                      else legacy_base)
+            value = os.environ.get(legacy, None)
+            if value is not None:
+                logger.warning(
+                    "%s is the OLD spelling of %s and is honoured here, but "
+                    "it is not the documented name -- export %s instead.",
+                    legacy, env, env)
     if value is None:
         value = default
     return cast(value)
@@ -3428,6 +3453,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 "rj_removal_only and rj_replace are mutually exclusive "
                 "(build one move instance per mode)."
             )
+        # Second candidate source for the multi-pass replace (user ruling
+        # 2026-09-24): the WARM-START mixture, shared by reference from
+        # ``rj_warm_search`` so there is exactly one container in the process.
+        # ``None`` -> single-pass replace, exactly as before. See
+        # :meth:`_replace_passes`.
+        self.replace_warm_distribution = None
+        self._replace_pass_source = None
         self.has_setup_group = False
 
         # GB-sampler verification instrumentation. When ``debug`` is on, the
@@ -4401,32 +4433,34 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # three-scope table and for why the statistic is a sum of accepted
         # deltas rather than a measured sub-band likelihood.
         self.inmodel_group = _resolve_converge_knob(
-            branch_name, "group", kwargs.get("inmodel_group", None),
+            branch_name, "", kwargs.get("inmodel_group", None),
             kwargs.get("inmodel_group_default", False), _converge_cast_refill,
+            family="INMODEL_GROUP",
         )
         # W in PASSES of the whole move (not repeats). Small by construction:
         # one pass is already num_repeat_proposals repeats per source, so the
         # per-pass gain is a much coarser quantity than the per-repeat one
         # and does not need the 100-repeat window the row rule does.
         self.inmodel_group_iters = _resolve_converge_knob(
-            branch_name, "group_iters",
+            branch_name, "iters",
             kwargs.get("inmodel_group_iters", None),
             kwargs.get("inmodel_group_iters_default", 3),
-            _converge_cast_window,
+            _converge_cast_window, family="INMODEL_GROUP",
         )
         self.inmodel_group_dll = _resolve_converge_knob(
-            branch_name, "group_dll", kwargs.get("inmodel_group_dll", None),
+            branch_name, "dll", kwargs.get("inmodel_group_dll", None),
             kwargs.get("inmodel_group_dll_default",
                        0.5 * float(self.leaf_cap_ndim)),
-            float,
+            float, family="INMODEL_GROUP",
         )
         # ⚠ Hard bound on the passes. This group is unbounded by
         # construction, so this is a COST knob, not a safety net: one pass
         # is a full sweep of every source at num_repeat_proposals repeats.
         self.inmodel_group_max_passes = _resolve_converge_knob(
-            branch_name, "group_max_passes",
+            branch_name, "max_passes",
             kwargs.get("inmodel_group_max_passes", None),
             kwargs.get("inmodel_group_max_passes_default", 20), int,
+            family="INMODEL_GROUP",
         )
         # USER RULING 2026-09-24: FLAT. "When a source is birthed, it is
         # per-source. During the special in-model only proposals it is
@@ -4441,10 +4475,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # effectively does at birth; both numbers are logged every pass so
         # the ruling can be revisited against data rather than argument.
         self.inmodel_group_scale = _resolve_converge_knob(
-            branch_name, "group_scale",
+            branch_name, "scale",
             kwargs.get("inmodel_group_scale", None),
             kwargs.get("inmodel_group_scale_default", "flat"),
-            _converge_cast_scale,
+            _converge_cast_scale, family="INMODEL_GROUP",
         )
         # Per-repeat VERTICAL band-temperature swaps inside the in-model
         # loop (default OFF = today's behavior). Additive to -- never a
@@ -22035,6 +22069,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 None if not self.is_rj_prop
                 else self.rj_proposal_distribution[self.branch_name]
             )
+            rj_prop = self._replace_pass_container(rj_prop)
             # NOTE: the periodic wrap of the full branch is HEAD work (it has
             # no walker coupling but must happen once, before the slice).
             with tm.span("sorter_build"):
@@ -24009,12 +24044,151 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             :class:`GFState`: GFState of sampler after proposal is complete.
 
         """
+        passes = self._replace_passes()
+        if len(passes) > 1:
+            return self._propose_replace_passes(model, state, passes)
+        return self._propose_dispatch(model, state)
+
+    def _propose_dispatch(self, model, state):
+        """The single-pass propose: orchestrated when fanned out, else local."""
         if self.fanout_active or (
             self.fanout is not None
             and os.environ.get("GB_PROPOSE_ORCHESTRATE", "0") == "1"
         ):
             return self._propose_orchestrated(model, state)
         return self._propose_legacy(model, state)
+
+    # ---- rj_replace: multiple candidate SOURCES per propose ----------------
+
+    def _replace_passes(self) -> tuple:
+        """Ordered candidate sources this REPLACE move sweeps per ``propose``.
+
+        USER RULING 2026-09-24, reinstating ``rj_replace`` into all three v9
+        search stages: *"have the replace move do one internal iteration with
+        the refit/warmstart and one internal iteration of the fstat before
+        moving on (inside one def propose())"*.
+
+        A "pass" is one complete internal replace sweep -- the same machinery
+        that runs today -- with the candidate container swapped. Two passes
+        means every alive source is offered a warm-start replacement AND an
+        F-stat replacement in the same iteration, each priced against its own
+        container on both sides of the MH ratio (the sorter's death-side
+        ``factors`` are computed from whichever container the pass installs,
+        so the pair never mixes).
+
+        ``()`` or a single entry -> the ordinary one-pass propose,
+        bit-identically. The default is two passes only when a warm container
+        has actually been installed on this move; ``GB_REPLACE_PASSES``
+        (comma list of ``warm`` / ``fstat``) overrides, and
+        ``GB_REPLACE_PASSES=fstat`` restores the pre-2026-09-24 behaviour.
+        """
+        if not getattr(self, "rj_replace", False):
+            return ()
+        raw = os.environ.get("GB_REPLACE_PASSES", "").strip()
+        if raw:
+            names = tuple(v.strip().lower() for v in raw.split(",") if v.strip())
+            bad = sorted(set(names) - {"warm", "fstat"})
+            if bad or not names:
+                raise ValueError(
+                    f"GB_REPLACE_PASSES must be a non-empty comma list of "
+                    f"warm/fstat, got {raw!r}."
+                )
+        elif getattr(self, "replace_warm_distribution", None) is not None:
+            names = ("warm", "fstat")
+        else:
+            names = ("fstat",)
+        # A warm pass with no warm container installed is a silent no-op, and
+        # this knob is exported per run -- say so and drop the pass rather
+        # than running the F-stat container twice under two labels.
+        if ("warm" in names
+                and getattr(self, "replace_warm_distribution", None) is None):
+            if not getattr(self, "_warm_pass_warned", False):
+                self._warm_pass_warned = True
+                logger.warning(
+                    "[GB_REPLACE %s] a 'warm' pass was requested but no "
+                    "warm-start container is installed on this move "
+                    "(GB_WARM_START_COMPONENTS unset, or the recipe did not "
+                    "share it). Dropping the warm pass.", self.name)
+            names = tuple(n for n in names if n != "warm")
+        return names
+
+    def _replace_pass_container(self, rj_prop):
+        """Swap in the current pass's candidate container at sorter build.
+
+        Returns ``rj_prop`` unchanged outside a multi-pass replace, which is
+        every move and every run that has not asked for one.
+
+        The override is applied HERE rather than by reassigning
+        ``self.rj_proposal_distribution`` around the pass deliberately: that
+        attribute is what the F-stat grid machinery's refit decision reads and
+        writes (``_fstat_fit_decision`` / ``_install``), so borrowing it for a
+        pass could make a refit land on the borrowed value, or make the pass
+        loop's restore discard a grid that was just fitted.
+        """
+        src = getattr(self, "_replace_pass_source", None)
+        if src is None or src == "fstat":
+            return rj_prop
+        cont = getattr(self, "replace_warm_distribution", None)
+        if cont is None:
+            return rj_prop
+        return cont[self.branch_name] if isinstance(cont, dict) else cont
+
+    def _propose_replace_passes(self, model, state, passes):
+        """Run one complete replace sweep per entry in ``passes``.
+
+        Logging is deliberately heavy. ``rj_replace`` was RETIRED once for a
+        propose-level lnL drift of 1.5-1.9e3 -- three orders above every other
+        move -- root-caused to a phase-max credit that was not attainable at
+        any actual phi0, and it is being reinstated on the hypothesis that the
+        old GPU/scoring setup was the cause. So each pass prints its own
+        acceptance census and its own measured lnL drift, and the two are
+        attributable to a single container rather than pooled.
+        """
+        accepted = None
+        for i, src in enumerate(passes):
+            self._replace_pass_source = src
+            logger.info(
+                "[GB_REPLACE %s] pass %d/%d: candidate source = %s "
+                "container.", self.name, i + 1, len(passes), src.upper())
+            _ll0 = self._replace_pass_ll(state)
+            try:
+                state, acc = self._propose_dispatch(model, state)
+            finally:
+                self._replace_pass_source = None
+            _ll1 = self._replace_pass_ll(state)
+            if _ll0 is not None and _ll1 is not None:
+                _d = float(np.max(np.abs(_ll1 - _ll0)))
+                logger.info(
+                    "[GB_REPLACE %s] pass %d/%d (%s) done: max |dlnL| over "
+                    "the cold chain = %.4g. ⚠ The retirement signature was a "
+                    "propose-level drift of 1.5-1.9e3; anything at that scale "
+                    "here means the move is misbehaving the way it used to.",
+                    self.name, i + 1, len(passes), src, _d)
+                if _d > 1.0e3:
+                    logger.warning(
+                        "[GB_REPLACE %s] pass %s lnL moved by %.4g in ONE "
+                        "pass -- this is the recorded rj_replace failure "
+                        "signature. Check [GB_ACCEPT replace-split] above and "
+                        "consider GB_REPLACE_PHASE_MAX=0 / "
+                        "GB_SEARCH_RJ_REPLACE=0.", self.name, src, _d)
+            accepted = acc if accepted is None else (accepted | acc)
+        return state, accepted
+
+    @staticmethod
+    def _replace_pass_ll(state):
+        """Cold-chain log-like of ``state`` as a host array, or ``None``.
+
+        Diagnostic only -- it must never be able to break a propose, so every
+        shape/attribute assumption is guarded rather than asserted.
+        """
+        try:
+            ll = getattr(state, "log_like", None)
+            if ll is None:
+                return None
+            arr = np.asarray(_to_numpy(ll), dtype=float)
+            return arr[0].copy() if arr.ndim >= 2 else arr.copy()
+        except Exception:  # noqa: BLE001 -- a diagnostic, never a failure mode
+            return None
 
     def _fanout_cmd(self, op, per_rank_payload, model):
         """Run ONE fan-out command; return ``({rank: reply}, token)``.
@@ -25497,6 +25671,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             waveform_kwargs_now.pop("N")
 
         rj_prop = None if not self.is_rj_prop else self.rj_proposal_distribution[self.branch_name]
+        rj_prop = self._replace_pass_container(rj_prop)
 
         # make sure all periodic parameters have been put into their range
         work.coords[:] = self.periodic.wrap(
@@ -26423,6 +26598,20 @@ _FSTAT_GRID_REGISTRY: dict = {}
 #: the sweep, the rest take the identical table.
 _FSTAT_CTR_TABLE_REGISTRY: dict = {}
 
+#: Process-local map ``(fstat_root, stage serial) -> epoch number`` for the
+#: FORCED refits the v9 per-stage profile arms (see
+#: :meth:`GBSpecialRJFStatGridMove.arm_fstat_refit`).
+#:
+#: ⚠ WHY IT IS SHARED RATHER THAN PER-MOVE. Several moves share one fit dir
+#: (``rj_fstat_search`` and ``rj_replace`` at minimum, plus ``rj_warm_search``
+#: when armed). Each resolves "the new epoch" as ``latest + 1``, and the first
+#: one to fit CREATES that directory -- so a per-move answer would give move A
+#: epoch k+1, move B epoch k+2, and the stage would pay for TWO full comb
+#: scans (~2800 s each at 6mo) instead of one. Agreeing here means move B
+#: lands on the same key and takes the
+#: :data:`_FSTAT_GRID_REGISTRY` cross-move reuse path instead.
+_FORCED_FSTAT_EPOCH: dict = {}
+
 
 class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
     """RJ birth move that FITS its own F-stat grid inside ``setup()``.
@@ -26479,6 +26668,66 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         # Epoch F-stat center table (GB_FSTAT_CTR_MODE=epoch); installed
         # alongside the birth grids, see _install_ctr_table.
         self._fstat_ctr_table = None
+        # FORCED refit (v9 per-stage profile). ``_force_refit_serial`` is the
+        # recipe-step serial a refit has been REQUESTED for;
+        # ``_force_refit_done`` the last one actually consumed. They differ
+        # for exactly one ``setup()`` call per stage, which is what "on the
+        # first F-stat call in the new stage" means.
+        self._force_refit_serial = None
+        self._force_refit_done = None
+        self._force_refit_reason = ""
+
+    # ---- forced refit (per-stage profile) ----------------------------------
+
+    def arm_fstat_refit(self, serial, reason: str = "") -> None:
+        """Request a fresh-epoch F-stat fit at this move's next ``setup()``.
+
+        Called by the recipe's per-stage profile when the stage changes
+        something the FITTED grid depends on -- today only the peak-selection
+        floor (``FSTAT_PEAK_MIN_SNR``), which is read while the grid is fitted
+        and then stamped into the stage-B cache.
+
+        Why a refit rather than an env change: the stage-B cache is "load and
+        return, nothing recomputed", and its loader REFUSES a ``peak_min_F``
+        mismatch. A new epoch directory sidesteps both -- the new floor
+        selects its peaks, the new stamp matches, and stage 1's epoch stays on
+        disk, valid and unread. No file is deleted.
+
+        Idempotent per ``serial``: re-arming the same step (a resume
+        re-announces the active step) does not buy a second refit.
+        """
+        if serial is None:
+            return
+        self._force_refit_serial = serial
+        self._force_refit_reason = str(reason or "")
+
+    def _consume_forced_refit(self):
+        """``(epoch, reason)`` when a forced refit is due now, else ``None``.
+
+        Consumes the request, so the second ``setup()`` of the same stage
+        takes the ordinary cadence path.
+        """
+        serial = getattr(self, "_force_refit_serial", None)
+        if serial is None or serial == getattr(self, "_force_refit_done", None):
+            return None
+        self._force_refit_done = serial
+        key = (self._fstat_root, serial)
+        k = _FORCED_FSTAT_EPOCH.get(key)
+        if k is None:
+            k_latest = self._latest_epoch()
+            k = 0 if k_latest is None else int(k_latest) + 1
+            _FORCED_FSTAT_EPOCH[key] = k
+            logger.info(
+                "[V9-STAGE %s] FORCED F-stat refit: opening epoch %d in %s "
+                "(%s). The previous epoch is kept on disk; nothing is "
+                "deleted.", self.name, k, self._fstat_root,
+                self._force_refit_reason or "stage profile change")
+        else:
+            logger.info(
+                "[V9-STAGE %s] FORCED F-stat refit: joining epoch %d already "
+                "opened for this recipe step by a move sharing %s -- no "
+                "second comb scan.", self.name, k, self._fstat_root)
+        return k
 
     # ---- epoch bookkeeping -------------------------------------------------
 
@@ -27686,6 +27935,13 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
 
     def setup(self, model, branches):
         action, k = self._fstat_fit_decision()
+        # A forced refit OVERRIDES every branch of the decision above,
+        # including "skip": the whole point is that the cadence has not
+        # elapsed but the grid is stale for a reason the cadence cannot see
+        # (the stage moved the peak floor). Consumed exactly once per stage.
+        _forced = self._consume_forced_refit()
+        if _forced is not None:
+            action, k = "fit", _forced
         if action == "skip":
             return
 

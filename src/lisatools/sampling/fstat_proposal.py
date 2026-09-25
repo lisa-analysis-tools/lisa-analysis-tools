@@ -93,6 +93,8 @@ __all__ = [
     "FSTAT_KNOB_DEFAULTS",
     "fstat_knob",
     "fstat_peak_min_F",
+    "set_peak_min_F_override",
+    "peak_min_F_override",
     "fstat_peak_min_F_stages",
     "fstat_band_min_F",
     "fstat_n_f0",
@@ -163,13 +165,61 @@ def fstat_knob(name: str, cast=float):
     return cast(FSTAT_KNOB_DEFAULTS[name])
 
 
+#: Live, in-code override of the peak-selection floor, in F units.
+#:
+#: The v9 three-stage GB search runs stage 1 at peak SNR 8 and stages 2-3 at
+#: 6.25, and it CANNOT do that with an environment variable: the floor is
+#: read when the grid is FITTED, the stage-B cache stamps the value it
+#: selected at, and the loader refuses a mismatch (see
+#: ``fstat_gridfit._check_cached_peak_threshold``) -- so changing the env at a
+#: stage boundary either silently reuses the old peak list or hard-refuses.
+#:
+#: USER RESOLUTION (2026-09-24), in place of deleting cache files: make the
+#: threshold an updateable value in code and force an F-stat refit on the
+#: first call inside the new stage. A refit opens a FRESH epoch directory, so
+#: the new floor is what selects its peaks and what its own stamp records --
+#: the old epoch stays on disk, valid, and unread.
+#:
+#: ``None`` (the default) means "no override": every resolution below behaves
+#: exactly as it did before this existed.
+_PEAK_MIN_F_OVERRIDE: Optional[float] = None
+
+
+def set_peak_min_F_override(value) -> Optional[float]:
+    """Install (or clear, with ``None``) the live peak-floor override.
+
+    ``value`` is an SNR, not an F -- the same unit the knob and every log
+    line use -- and is stored as ``F = SNR^2 / 2``. Returns the PREVIOUS
+    override in F units so a caller can tell whether it actually changed
+    anything and restore it if it must.
+    """
+    global _PEAK_MIN_F_OVERRIDE
+    prev = _PEAK_MIN_F_OVERRIDE
+    _PEAK_MIN_F_OVERRIDE = (None if value is None
+                            else 0.5 * float(value) ** 2)
+    return prev
+
+
+def peak_min_F_override() -> Optional[float]:
+    """The live override in F units, or ``None`` when unset."""
+    return _PEAK_MIN_F_OVERRIDE
+
+
 def fstat_peak_min_F() -> float:
     """Peak-selection floor in F units (``F = SNR^2 / 2``).
 
-    Precedence: explicit ``FSTAT_PEAK_MIN_SNR`` > explicit
+    Precedence: the in-code override (:func:`set_peak_min_F_override`, the
+    v9 per-stage profile) > explicit ``FSTAT_PEAK_MIN_SNR`` > explicit
     ``FSTAT_PEAK_MIN_F`` > the default SNR
     (``FSTAT_KNOB_DEFAULTS['FSTAT_PEAK_MIN_SNR']`` = 8, i.e. F = 32).
+
+    The override wins over the environment deliberately: the env value is
+    the RUN's floor, set once in the submit script, while the override is
+    the STAGE's floor and the stage is the narrower, later statement. A run
+    that sets no override is bit-identical to before.
     """
+    if _PEAK_MIN_F_OVERRIDE is not None:
+        return float(_PEAK_MIN_F_OVERRIDE)
     snr = os.environ.get("FSTAT_PEAK_MIN_SNR", "").strip()
     if snr:
         return 0.5 * float(snr) ** 2
