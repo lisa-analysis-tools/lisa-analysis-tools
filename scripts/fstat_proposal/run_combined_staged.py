@@ -385,6 +385,16 @@ _PE_PEAK_MIN_SNR = 6.25
 V9_SEARCH_STAGE_PROFILES = (
     ("gb_search_1",
      dict(phase_maximize=True, opt_snr=8.0, peak_min_snr=8.0), False),
+    # ⚠ STAGE 2 DOES NOT PHASE-MAXIMIZE, and the reason is the row itself.
+    # It is the stage that DROPS the floors -- opt SNR 8 -> 5, F-stat peak
+    # 8 -> 6.25 -- so it is already reaching for weaker, more marginal
+    # sources. Maximizing the phase on top of that would add a second
+    # optimistic bias to exactly the population least able to afford one:
+    # a maximized delta is an upper bound on what the source can pay, and
+    # near the floor that is the difference between a real detection and
+    # a noise peak (user ruling 2026-09-25, correcting the same day's
+    # "1 and 2" to stage 1 only). Only stage 1 -- the high-floor, high-
+    # confidence pass -- maximizes.
     ("gb_search_2",
      dict(phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25), False),
     ("gb_search_3",

@@ -279,10 +279,31 @@ class ProfileDeclarationTest(unittest.TestCase):
         got = {s.name: s.step_kwargs["profile"] for s in fit.recipe.stages[:3]}
         self.assertEqual(got["gb_search_1"], dict(
             phase_maximize=True, opt_snr=8.0, peak_min_snr=8.0))
+        # ⚠ ONLY stage 1 phase-maximizes. Stage 2 is the floor-dropping
+        # stage (opt SNR 8->5, peak 8->6.25); a maximized delta is an upper
+        # bound on what a source can pay, so stacking it on the weakest
+        # population is the one place it is least affordable (user ruling
+        # 2026-09-25, correcting the same day's "1 and 2").
         self.assertEqual(got["gb_search_2"], dict(
             phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25))
         self.assertEqual(got["gb_search_3"], dict(
             phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25))
+
+    def test_phase_max_is_STAGE_1_ONLY_and_tracks_the_high_floor(self):
+        """The rule in one place, stated as a relationship rather than as
+        three literals: the stage that maximizes is exactly the stage that
+        keeps the HIGH floors. Phase maximization and a lowered detection
+        floor are both optimistic, and the ruling is that they never
+        compound."""
+        fit = _build()
+        prof = {s.name: s.step_kwargs["profile"] for s in fit.recipe.stages[:3]}
+        maximizing = {n for n, p in prof.items() if p["phase_maximize"]}
+        self.assertEqual(maximizing, {"gb_search_1"})
+        for name, p in prof.items():
+            high_floor = p["opt_snr"] == 8.0 and p["peak_min_snr"] == 8.0
+            self.assertEqual(
+                p["phase_maximize"], high_floor,
+                f"{name}: maximization must track the high floor")
 
     def test_stage_name_is_declared_for_the_log_lines(self):
         fit = _build()
@@ -310,13 +331,19 @@ class ReviewFixesTest(unittest.TestCase):
     def tearDown(self):
         set_peak_min_F_override(None)
 
-    # -- the profile must not re-arm rj_replace's phase max ---------------
-    def test_the_profile_LEAVES_rj_replace_phase_max_alone(self):
-        """⚠ rj_replace is built ``phase_maximize=False`` because that
-        acceptance WAS the root-caused lnL drift that retired it. The stage-1
-        profile setting it True would re-arm the one thing the move is on
-        probation for. Its own scoring switch (GB_REPLACE_PHASE_MAX) has
-        rotation-on-accept behind it -- a different mechanism."""
+    # -- EVERY GB move follows the profile, rj_replace included -----------
+    def test_the_profile_reaches_rj_replace_too(self):
+        """User ruling 2026-09-25: "all the GB proposals in the gb search 1
+        and 2 should be phase maximized" -- every GB move, not just the RJ
+        ones, and with no rj_replace exception.
+
+        ⚠ This REVERSES the earlier exclusion, knowingly. rj_replace's
+        recorded failure was maximized credit WITHOUT the rotation
+        write-back; ``inmodel_get_add_ll`` now subtracts the maximizing
+        rotation from phi0 and re-wraps before the accept test, so the
+        scored rows are the kept rows. The [GB_REPLACE] |dlnL| > 1e3 alarm
+        is the guard.
+        """
         rep = _FakeGBMove("rj_replace", pm=False)
         rep.rj_replace = True
         other = _FakeGBMove("rj_fstat_search", pm=False)
@@ -324,8 +351,25 @@ class ReviewFixesTest(unittest.TestCase):
             moves=[_FakeCombine([rep, other])],
             profile=dict(phase_maximize=True), stage_name="gb_search_1")
         st.note_recipe_step(1)
-        self.assertFalse(rep.phase_maximize, "rj_replace was re-armed")
+        self.assertTrue(rep.phase_maximize)
         self.assertTrue(other.phase_maximize)
+
+    def test_stage_3_turns_every_GB_move_back_OFF(self):
+        """gb_search_3 is NOT phase maximized (user, 2026-09-25). Since the
+        flags are now written on EVERY GB move, stage 3's profile has to
+        clear them all -- a stage that only ever set True would leave
+        stage 2's arming in place and there would be no way back."""
+        rep = _FakeGBMove("rj_replace", pm=True)
+        rep.rj_replace = True
+        inm = _FakeGBMove("in_model", pm=True)
+        inm.is_rj_prop = False
+        rj = _FakeGBMove("rj_fstat_search", pm=True)
+        st = SearchStageProfileStep(
+            moves=[_FakeCombine([rep, inm, rj])],
+            profile=dict(phase_maximize=False), stage_name="gb_search_3")
+        st.note_recipe_step(3)
+        for m in (rep, inm, rj):
+            self.assertFalse(m.phase_maximize, m.name)
 
     def test_rj_prior_removal_DOES_follow_the_profile(self):
         """It is not an exception: user ruling 2026-09-02, "phase
@@ -506,16 +550,21 @@ class ProfileApplicationTest(unittest.TestCase):
         self.assertEqual(rj.opt_snr_rej_samp_limit, 5.0)
         self.assertEqual(inm.opt_snr_rej_samp_limit, 5.0)
 
-    def test_phase_max_reaches_RJ_moves_ONLY(self):
-        """The pure in-model move is constructed phase_maximize=False on
-        purpose -- in-model scoring is at the ACTUAL phase, and phase
-        maximization is a BIRTH heuristic, not a stage choice."""
+    def test_phase_max_reaches_THE_PURE_IN_MODEL_MOVES_TOO(self):
+        """User ruling 2026-09-25: "ALL the GB proposals in the gb search 1
+        and 2 should be phase maximized" -- which includes the three pure
+        in-model slots, not only the RJ ones.
+
+        The CONSTRUCTOR default stays False, so a legacy single-stage
+        recipe (STAGE_V9_SEARCH=0), which installs no profile at all, keeps
+        the old "in-model scores at the actual phase" behaviour
+        bit-identically. Only a stage that explicitly asks flips them."""
         rj = _FakeGBMove("rj_fstat_search", pm=False)
         inm = _FakeGBMove("in_model", is_rj_prop=False, pm=False)
         st = self._step(dict(phase_maximize=True), [rj, inm])
         st.note_recipe_step(1)
         self.assertTrue(rj.phase_maximize)
-        self.assertFalse(inm.phase_maximize)
+        self.assertTrue(inm.phase_maximize)
 
     def test_vgb_moves_are_NEVER_touched(self):
         """⚠ VGB carries the same attribute name with its own value
