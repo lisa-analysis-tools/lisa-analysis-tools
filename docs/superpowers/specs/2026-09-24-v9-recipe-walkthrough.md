@@ -30,11 +30,27 @@ Driver: `scripts/fstat_proposal/run_combined_staged.py`
    1. `GB_WARM_START_SOURCE_STORE` derives from it. If the refereed
       warm-start npz is absent it is built in-process at recipe build
       (fit → referee → apply).
-   2. The seed defaults to the 3mo 10-walker **noise-fix** run. If the
-      exact `.h5` is absent but the directory holds exactly one, the script
-      resolves it and says so; if the directory is absent it lists the
-      candidate `gf_prod_3mo*` directories. ⚠ It never substitutes a
+   2. The seed defaults to
+      `/shared/data/global_fit_output/gf_prod_3mo_v8_10walkers/gf_prod_3mo_testing.h5`
+      — the same 3-month store `submit_gf_6mo_v8.sh:2788` uses, so all six
+      `GB_WARM_START_*` knobs resolve identically across the two launchers.
+      If the exact `.h5` is absent but the directory holds exactly one, the
+      script resolves it and says so; if the directory is absent it lists
+      the candidate `gf_prod_3mo*` directories. ⚠ It never substitutes a
       *different* run — a seed is a provenance statement.
+      * ⚠ **This killed the first launch (job 616, 2026-09-24 19:52).** The
+        default then named a `_noisefix` sibling that does not exist. The
+        job died at `exit 2` in the **shell preflight**, before python — so
+        there is no traceback, and the log's last 11 lines ARE the error.
+        A missing seed is SOFT on its own (no pin, the noise stages run),
+        but the warm start is fitted from the same store, so when the
+        refereed npz is also absent the `[WARMSTART]` gate below hard-exits
+        on the same path. Both gates now say so; see §1.2.5.
+      * ⚠ `gf_monitor_gen_lean.py:10` calls this directory the **PRE**-
+        noise-fix arm, and that is still true. It is acceptable as the v9
+        seed only because galfor no longer comes from the store at all
+        (`GALFOR_START_PARAMS` is the offline 3mo estimate), so the store
+        supplies just `PSD_START_PARAMS` and the GB warm-start mixture.
    3. The **noise pin** is extracted from the same store:
       `python -m lisatools.globalfit.warmstart.noise_pin --store $GF_SEED_STORE --export`
       reads the **best-logL cold walker of the last valid row**, converts it

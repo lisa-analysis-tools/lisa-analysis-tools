@@ -166,6 +166,57 @@ def _fmt(vals) -> str:
     return ",".join(f"{float(v):.10g}" for v in vals)
 
 
+#: Ratio band, pin / scirdv1 nominal, outside which the psd pin is called
+#: out. NOT a guess -- measured against the converged 6mo v8 4-GPU run
+#: (`gf_prod_6mo_v8_4gpu`, cold chain, last 50 stored rows to iteration
+#: 746):
+#:
+#:     Soms_d  1.49989e-11   p16/p84 [1.49931e-11, 1.50052e-11]   0.99993x
+#:     Sa_a    3.04401e-15   p16/p84 [3.02744e-15, 3.05933e-15]   1.01467x
+#:
+#: which reproduces that run's own monitor page ("medians sit -0.0% and
+#: +1.5% from injection") and so CONFIRMS the injection is scirdv1,
+#: 1.5e-11 / 3.0e-15 in sqrt units. The recovered posterior is startlingly
+#: tight -- ±0.004% on Soms_d -- so a band of a few tens of percent is
+#: already extremely generous for a pin; it is set here at ±33% only
+#: because the pin is a single maxlogL sample from a possibly
+#: unconverged source run, not a posterior median.
+#:
+#: ⚠ A sangria-injection run would sit at ~0.53x Soms_d and trip this. That
+#: is a warning, never an error, and the message says as much -- the v9
+#: launcher is mojito-only.
+_PSD_PLAUSIBLE = (0.75, 1.33)
+
+
+def psd_plausibility(psd) -> list:
+    """``[(name, value, nominal, ratio, ok), ...]`` against scirdv1.
+
+    ⚠ WHY THIS EXISTS ON TOP OF ``_check``. ``_check`` tests the PRIOR
+    support, which is the right test for "will every walker be at
+    ``-inf`` on iteration 0" and the WRONG test for "is this the
+    instrument". ``PSD_PRIOR_RANGE`` spans a factor of 33 in ``Soms_d``
+    and 200 in ``Sa_a``: a pin ten times the real noise level sails
+    through it, and a global fit seeded at a tenfold noise floor does
+    not crash -- it quietly finds nothing, which is far more expensive
+    than crashing. So report the ratio every time and flag the outliers.
+
+    The branch samples ``(Soms_d, Sa_a)`` in SQRT units while
+    ``lisatools.detector`` models carry the squared PSD levels, hence
+    the ``sqrt`` here: scirdv1 ``2.25e-22 -> 1.5e-11``, ``9e-30 -> 3e-15``.
+    """
+    from math import sqrt
+
+    from ...detector import scirdv1
+
+    nominal = (sqrt(float(scirdv1.Soms_d)), sqrt(float(scirdv1.Sa_a)))
+    lo, hi = _PSD_PLAUSIBLE
+    out = []
+    for name, val, nom in zip(("Soms_d", "Sa_a"), psd, nominal):
+        ratio = float(val) / nom if nom else float("inf")
+        out.append((name, float(val), nom, ratio, lo <= ratio <= hi))
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="python -m lisatools.globalfit.warmstart.noise_pin",
@@ -197,6 +248,18 @@ def main(argv=None) -> int:
           f"galfor={pin['galfor_basis']}; emitted values are PHYSICAL/linear "
           f"and run.py converts them into THIS run's sampling basis.",
           file=sys.stderr)
+    rows = psd_plausibility(pin["psd"])
+    for name, val, nom, ratio, ok in rows:
+        print(f"# [NOISE-PIN] {'' if ok else '⚠ '}{name} = {val:.6e} = "
+              f"{ratio:.3f}x scirdv1 nominal ({nom:.6e})", file=sys.stderr)
+    if not all(ok for *_, ok in rows):
+        lo, hi = _PSD_PLAUSIBLE
+        print(f"# [NOISE-PIN] ⚠ outside the plausible band [{lo}, {hi}]x. "
+              f"This is NOT fatal -- it is inside the prior, so the run will "
+              f"start -- but a pin far from the instrument level seeds the "
+              f"search at the wrong noise floor and it will quietly find "
+              f"less. Check the store before committing an allocation.",
+              file=sys.stderr)
     print(f"{pre}PSD_START_PARAMS={_fmt(pin['psd'])}")
     print(f"{pre}GALFOR_START_PARAMS={_fmt(pin['galfor'])}")
     return 0

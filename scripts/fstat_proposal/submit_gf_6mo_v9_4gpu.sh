@@ -3567,16 +3567,58 @@ export GALFOR_START_PARAMS=${GALFOR_START_PARAMS:-1.436180605904e-44,2.533915614
 _psd_was=${PSD_START_PARAMS+set}; _psd_save=${PSD_START_PARAMS-}
 _gal_was=${GALFOR_START_PARAMS+set}; _gal_save=${GALFOR_START_PARAMS-}
 if [ -f "${GF_SEED_STORE}" ] && { [ -z "${_psd_was}" ] || [ -z "${_gal_was}" ]; }; then
-  if _pin=$(python -m lisatools.globalfit.warmstart.noise_pin \
-              --store "${GF_SEED_STORE}" --export); then
-    eval "${_pin}"
+  # ⚠ NEVER `eval` this output. JOB 617 (2026-09-25) died right here with
+  #     slurm_script: eval: line 3572: syntax error near unexpected token `('
+  # The CLI itself is clean -- it writes its three diagnostics to STDERR and
+  # only the two `export NAME=<digits>` lines to stdout, verified against a
+  # real store both bare and under this script's full 191-export environment.
+  # Something ELSE in the cluster process wrote to stdout: a banner from a
+  # GPU/backend import is the obvious candidate, and it never appears on a
+  # laptop with no CUDA, which is why local testing could not have caught it.
+  # `eval` of another process's stdout is the defect regardless of who the
+  # polluter turns out to be -- ANY stray line is executed as shell. So parse
+  # the two values out with an anchored pattern that admits only number
+  # characters, and drop everything else on the floor.
+  _pin_rc=0
+  _pin=$(python -m lisatools.globalfit.warmstart.noise_pin \
+           --store "${GF_SEED_STORE}" --export) || _pin_rc=$?
+  _psd_pin=$(printf '%s\n' "${_pin}" \
+    | sed -n 's/^export PSD_START_PARAMS=\([-+0-9.eE,]*\)$/\1/p' | tail -1)
+  _gal_pin=$(printf '%s\n' "${_pin}" \
+    | sed -n 's/^export GALFOR_START_PARAMS=\([-+0-9.eE,]*\)$/\1/p' | tail -1)
+  # Name the polluter in the log so the next run identifies it instead of
+  # leaving this comment guessing.
+  _pin_junk=$(printf '%s\n' "${_pin}" \
+    | grep -vcE '^export (PSD|GALFOR)_START_PARAMS=|^[[:space:]]*$' || true)
+  if [ "${_pin_junk:-0}" != "0" ]; then
+    echo "[V9-SEED] note: the pin CLI wrote ${_pin_junk} unexpected stdout"
+    echo "[V9-SEED] line(s). They are IGNORED (this is what broke job 617"
+    echo "[V9-SEED] when the output was eval'd). First few:"
+    printf '%s\n' "${_pin}" \
+      | grep -vE '^export (PSD|GALFOR)_START_PARAMS=|^[[:space:]]*$' \
+      | head -3 | sed 's/^/[V9-SEED]   | /'
+  fi
+  # A VARIABLE IS SATISFIED EITHER WAY, INDEPENDENTLY (user ruling 2026-09-25:
+  # "the galfor pin should come from our estimate. The PSD estimate can come
+  # from the 3mo run"). In the shipped configuration GALFOR_START_PARAMS is
+  # already hand-set to the offline foreground estimate, so the store only has
+  # to deliver the PSD line -- demanding BOTH would throw away a perfectly good
+  # instrument-noise pin over a galfor value this run was never going to use.
+  if [ "${_pin_rc}" = "0" ] \
+     && { [ -n "${_psd_was}" ] || [ -n "${_psd_pin}" ]; } \
+     && { [ -n "${_gal_was}" ] || [ -n "${_gal_pin}" ]; }; then
     if [ -n "${_psd_was}" ]; then
-      export PSD_START_PARAMS="${_psd_save}"
       echo "[V9-SEED] PSD_START_PARAMS was set by hand -- keeping it, not the store's."
+    else
+      export PSD_START_PARAMS="${_psd_pin}"
+      echo "[V9-SEED] PSD_START_PARAMS <- the seed store's maxlogL cold walker."
     fi
     if [ -n "${_gal_was}" ]; then
-      export GALFOR_START_PARAMS="${_gal_save}"
-      echo "[V9-SEED] GALFOR_START_PARAMS was set by hand -- keeping it, not the store's."
+      echo "[V9-SEED] GALFOR_START_PARAMS was set by hand (the offline foreground"
+      echo "[V9-SEED] estimate) -- keeping it, not the store's."
+    else
+      export GALFOR_START_PARAMS="${_gal_pin}"
+      echo "[V9-SEED] GALFOR_START_PARAMS <- the seed store's maxlogL cold walker."
     fi
   else
     echo "[V9-SEED] ############################################################"
@@ -3601,7 +3643,7 @@ if [ -f "${GF_SEED_STORE}" ] && { [ -z "${_psd_was}" ] || [ -z "${_gal_was}" ]; 
       exit 2
     fi
   fi
-  unset _pin
+  unset _pin _pin_rc _psd_pin _gal_pin _pin_junk
 elif [ -n "${_psd_was}" ] && [ -n "${_gal_was}" ]; then
   echo "[V9-SEED] both start pins were supplied explicitly -- the seed store is not read."
 elif [ ! -f "${GF_SEED_STORE}" ]; then

@@ -312,6 +312,52 @@ class SixMonthV9DeltaTest(unittest.TestCase):
                       src)
         self.assertIn('if [ "${_n_h5}" = "1" ]; then', src)
 
+    def test_the_noise_pin_output_is_PARSED_never_evald(self):
+        """REGRESSION, job 617 (2026-09-25):
+
+            slurm_script: eval: line 3572: syntax error near unexpected
+            token `('
+
+        The CLI is clean -- three diagnostics to STDERR, two
+        ``export NAME=<digits>`` lines to stdout, verified against a real
+        store both bare and under this script's full export environment.
+        Something else in the cluster process wrote to stdout (a backend
+        banner is the likely culprit; it cannot appear on a laptop with no
+        CUDA, which is why local testing could not have caught it).
+
+        ``eval`` of another process's stdout is the defect whoever the
+        polluter is: ANY stray line becomes shell. The values must be
+        parsed out with an anchored, number-only pattern instead.
+        """
+        src = open(SIX_MO_V9).read()
+        self.assertNotIn('eval "${_pin}"', src)
+        self.assertIn("NEVER `eval` this output", src)
+        for var in ("PSD", "GALFOR"):
+            self.assertIn(
+                rf"sed -n 's/^export {var}_START_PARAMS="
+                rf"\([-+0-9.eE,]*\)$/\1/p'", src)
+
+    def test_the_pin_satisfies_each_variable_INDEPENDENTLY(self):
+        """User ruling 2026-09-25: "the galfor pin should come from our
+        estimate. The PSD estimate can come from the 3mo run." Since
+        GALFOR_START_PARAMS ships hand-set, requiring BOTH lines to parse
+        would discard a good instrument-noise pin over a galfor value this
+        run was never going to use."""
+        src = open(SIX_MO_V9).read()
+        self.assertIn(
+            '{ [ -n "${_psd_was}" ] || [ -n "${_psd_pin}" ]; }', src)
+        self.assertIn(
+            '{ [ -n "${_gal_was}" ] || [ -n "${_gal_pin}" ]; }', src)
+        # ...and galfor still ships hand-set, so the store never supplies it.
+        self.assertTrue(self.v9["GALFOR_START_PARAMS"])
+
+    def test_unexpected_pin_stdout_is_reported_not_silently_dropped(self):
+        """Dropping the junk fixes the crash but loses the evidence. The
+        next run has to NAME the polluter, or this comment stays a guess."""
+        src = open(SIX_MO_V9).read()
+        self.assertIn("unexpected stdout", src)
+        self.assertIn("_pin_junk", src)
+
     def test_a_missing_seed_says_it_will_ALSO_kill_the_warm_start_gate(self):
         """Job 616's log was hard to read because one cause tripped two
         gates that never referenced each other: the [V9-SEED] miss printed

@@ -901,6 +901,71 @@ class NoisePinEndToEndTest(unittest.TestCase):
                 noise_pin_from_store(path)
 
 
+class PsdPinPlausibilityTest(unittest.TestCase):
+    """User ask 2026-09-25: "make sure the values are reasonably close to
+    the correct values."
+
+    ``_check`` already tests the PRIOR support, which answers a DIFFERENT
+    question -- "will every walker be at -inf on iteration 0". It cannot
+    answer this one: ``PSD_PRIOR_RANGE`` spans a factor of 33 in Soms_d
+    and 200 in Sa_a, so a pin ten times the instrument level passes it,
+    and a search seeded at a tenfold noise floor does not crash, it
+    quietly finds less.
+    """
+
+    def test_the_real_3mo_pin_is_within_a_few_percent_of_nominal(self):
+        from lisatools.globalfit.warmstart.noise_pin import psd_plausibility
+
+        rows = psd_plausibility([1.526295014e-11, 2.857748554e-15])
+        ratios = {n: r for n, _, _, r, _ in rows}
+        self.assertAlmostEqual(ratios["Soms_d"], 1.018, places=2)
+        self.assertAlmostEqual(ratios["Sa_a"], 0.953, places=2)
+        self.assertTrue(all(ok for *_, ok in rows))
+
+    def test_sqrt_units_not_squared(self):
+        """The branch samples (Soms_d, Sa_a) in SQRT units; the detector
+        models carry the SQUARED PSD levels. Comparing the two directly
+        would call every correct pin ~1e11x off."""
+        from math import sqrt
+
+        from lisatools.detector import scirdv1
+        from lisatools.globalfit.warmstart.noise_pin import psd_plausibility
+
+        noms = {n: nom for n, _, nom, _, _ in
+                psd_plausibility([1.0e-11, 3.0e-15])}
+        self.assertAlmostEqual(noms["Soms_d"], sqrt(float(scirdv1.Soms_d)))
+        self.assertAlmostEqual(noms["Sa_a"], sqrt(float(scirdv1.Sa_a)))
+        self.assertAlmostEqual(noms["Soms_d"], 1.5e-11)
+
+    def test_the_band_is_calibrated_on_the_CONVERGED_v8_posterior(self):
+        """The band is measured, not guessed. These are the 6mo v8 4-GPU
+        cold-chain medians over the last 50 stored rows to iteration 746,
+        which reproduce that run's monitor page ("medians sit -0.0% and
+        +1.5% from injection") and so confirm the injection is scirdv1."""
+        from lisatools.globalfit.warmstart.noise_pin import psd_plausibility
+
+        rows = psd_plausibility([1.49989144e-11, 3.04400590e-15])
+        ratios = {n: r for n, _, _, r, _ in rows}
+        self.assertAlmostEqual(ratios["Soms_d"], 0.99993, places=4)
+        self.assertAlmostEqual(ratios["Sa_a"], 1.01467, places=4)
+        self.assertTrue(all(ok for *_, ok in rows))
+
+    def test_a_PRIOR_LEGAL_but_absurd_pin_is_flagged(self):
+        """The paired control, and the whole point: this point is INSIDE
+        PSD_PRIOR_RANGE -- ``_check`` passes it without a word."""
+        from lisatools.globalfit.stock.erebor.noise import PSD_PRIOR_RANGE
+        from lisatools.globalfit.warmstart.noise_pin import (_check, _windows,
+                                                             psd_plausibility)
+
+        absurd = [1.9e-10, 1.9e-13]
+        for v, (lo, hi) in zip(absurd, PSD_PRIOR_RANGE):
+            self.assertTrue(lo <= v <= hi, "control must be inside the prior")
+        _check(np.asarray(absurd), _windows("psd"), "PSD_START_PARAMS")
+
+        rows = psd_plausibility(absurd)
+        self.assertFalse(any(ok for *_, ok in rows))
+
+
 class GalforKneePriorTest(unittest.TestCase):
     """The galfor knee prior is 0.8 mHz .. 10 mHz (user ruling 2026-09-24).
 
