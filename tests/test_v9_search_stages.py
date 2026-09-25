@@ -300,6 +300,148 @@ class ProfileDeclarationTest(unittest.TestCase):
         self.assertEqual(gb_only, table)
 
 
+class ReviewFixesTest(unittest.TestCase):
+    """Regressions for the CONFIRMED findings of the 2026-09-24 code review.
+
+    Every one of these was silent: the run would have produced plausible
+    output with the feature quietly wrong.
+    """
+
+    def tearDown(self):
+        set_peak_min_F_override(None)
+
+    # -- the profile must not re-arm rj_replace's phase max ---------------
+    def test_the_profile_LEAVES_rj_replace_phase_max_alone(self):
+        """⚠ rj_replace is built ``phase_maximize=False`` because that
+        acceptance WAS the root-caused lnL drift that retired it. The stage-1
+        profile setting it True would re-arm the one thing the move is on
+        probation for. Its own scoring switch (GB_REPLACE_PHASE_MAX) has
+        rotation-on-accept behind it -- a different mechanism."""
+        rep = _FakeGBMove("rj_replace", pm=False)
+        rep.rj_replace = True
+        other = _FakeGBMove("rj_fstat_search", pm=False)
+        st = SearchStageProfileStep(
+            moves=[_FakeCombine([rep, other])],
+            profile=dict(phase_maximize=True), stage_name="gb_search_1")
+        st.note_recipe_step(1)
+        self.assertFalse(rep.phase_maximize, "rj_replace was re-armed")
+        self.assertTrue(other.phase_maximize)
+
+    def test_rj_prior_removal_DOES_follow_the_profile(self):
+        """It is not an exception: user ruling 2026-09-02, "phase
+        maximization on for the prior removal just like fstat"."""
+        rm = _FakeGBMove("rj_prior_removal", pm=False)
+        st = SearchStageProfileStep(
+            moves=[_FakeCombine([rm])],
+            profile=dict(phase_maximize=True), stage_name="gb_search_1")
+        st.note_recipe_step(1)
+        self.assertTrue(rm.phase_maximize)
+
+    # -- the pending count is per VALVE, not per move ---------------------
+    def test_pending_counts_each_shared_valve_ONCE(self):
+        """⚠ Four armed RJ moves all publish against the SAME shared
+        band_info table. Summing naively reported 4x the pending pairs. The
+        `== 0` gate survived that (4x0 is 0), which is why it went unnoticed
+        -- the operator-facing number and the monitor trace did not."""
+        table = np.zeros((2, 3), dtype=bool)
+        moves = []
+        for n in ("rj_warm_search", "rj_fstat_search", "rj_replace",
+                  "rj_prior_removal"):
+            m = _FakeGBMove(n)
+            m._rj_band_shutoff_w = table       # one shared valve
+            m._shutoff_w_pending = 7
+            moves.append(m)
+        self.assertEqual(
+            band_shutoff_w_pending_total([_FakeCombine(moves)]), 7)
+
+    def test_genuinely_independent_valves_still_add(self):
+        a, b = _FakeGBMove("a"), _FakeGBMove("b")
+        a._rj_band_shutoff_w = np.zeros((2, 3), dtype=bool)
+        b._rj_band_shutoff_w = np.zeros((2, 3), dtype=bool)
+        a._shutoff_w_pending, b._shutoff_w_pending = 7, 3
+        self.assertEqual(
+            band_shutoff_w_pending_total([_FakeCombine([a, b])]), 10)
+
+    def test_zero_pending_still_reads_as_converged(self):
+        table = np.zeros((2, 3), dtype=bool)
+        moves = []
+        for n in ("a", "b", "c"):
+            m = _FakeGBMove(n)
+            m._rj_band_shutoff_w = table
+            m._shutoff_w_pending = 0
+            moves.append(m)
+        self.assertEqual(
+            band_shutoff_w_pending_total([_FakeCombine(moves)]), 0)
+        self.assertTrue(band_shutoff_w_armed([_FakeCombine(moves)]))
+
+    # -- full_pe declares its own peak floor ------------------------------
+    def test_full_pe_DECLARES_its_peak_floor(self):
+        """⚠ The search stages install a PROCESS-GLOBAL override of the
+        F-stat peak floor and nothing cleared it, so full_pe silently
+        inherited gb_search_3's 6.25 while the script exported 8.0. 6.25 is
+        what the design wants here -- but inheriting it by accident is not
+        choosing it, and the next person to retune a search stage would have
+        moved this one too."""
+        import run_combined_staged as R
+
+        fit = _build()
+        pe = fit.recipe.stages[-1]
+        self.assertEqual(pe.name, "full_pe")
+        self.assertEqual(pe.step_kwargs["peak_min_snr"], R._PE_PEAK_MIN_SNR)
+        self.assertEqual(pe.step_kwargs["stage_name"], "full_pe")
+
+    def test_the_pe_step_applies_and_logs_the_floor(self):
+        from lisatools.globalfit.recipe import PERecipeStep
+
+        set_peak_min_F_override(6.25)             # as if stage 3 had run
+        st = PERecipeStep(moves=[_FakeCombine([])], peak_min_snr=6.25,
+                          stage_name="full_pe")
+        st.note_recipe_step(9)
+        self.assertAlmostEqual(peak_min_F_override(), 0.5 * 6.25 ** 2)
+
+    def test_a_None_pe_floor_CLEARS_a_search_stage_override(self):
+        from lisatools.globalfit.recipe import PERecipeStep
+
+        set_peak_min_F_override(6.25)
+        PERecipeStep(moves=[_FakeCombine([])], peak_min_snr=None,
+                     stage_name="full_pe").note_recipe_step(9)
+        self.assertIsNone(peak_min_F_override())
+
+    # -- the pass identity must cross the wire ----------------------------
+    def test_the_replace_pass_is_shipped_to_the_compute_ranks(self):
+        """⚠ THE WORST ONE. ``_replace_pass_source`` is set by the pass loop
+        in the HEAD process, but every compute rank holds its OWN move
+        instance. Without the payload key, ranks 1..N-1 drew from the F-stat
+        container on BOTH passes: the warm pass was a no-op on 3 of 4 walker
+        blocks while the log said it ran, and the first block was sampled
+        under a different proposal from the rest. Pinned at the source level
+        because exercising it needs a real MPI fan-out."""
+        import inspect
+
+        from lisatools.globalfit.moves import gbspecialstretch as g
+
+        src = inspect.getsource(g)
+        self.assertIn('"replace_pass_source": getattr(', src,
+                      "the pass source is not put INTO the rank payload")
+        self.assertIn('self._replace_pass_source = (payload or {}).get(\n'
+                      '                "replace_pass_source", None)', src,
+                      "the rank body does not READ the pass source back")
+
+    def test_the_stage_name_is_restamped_per_propose(self):
+        """⚠ Stage.setup stamps gf_stage_name ONCE at materialization, but
+        every stage is materialized up front and the GB moves are SHARED --
+        so the static stamp was whichever stage was built last, and every
+        stage-labelled line during gb_search_1 read 'gb_search_3'."""
+        import inspect
+
+        from lisatools.globalfit.moves.globalfitmove import GFCombineMove
+
+        src = inspect.getsource(GFCombineMove._gf_precondition)
+        self.assertIn("gf_stage_name", src,
+                      "the per-propose preamble does not re-stamp the "
+                      "stage NAME, only the kind")
+
+
 class RuntimeStageKindTest(unittest.TestCase):
     """⚠ A NEW STAGE KIND MUST NOT FALL THROUGH THE LITERAL KIND TESTS.
 

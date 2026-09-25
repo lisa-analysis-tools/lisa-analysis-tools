@@ -882,7 +882,46 @@ class SearchRecipeStep(BaseRecipeStep):
 
 
 class PERecipeStep(BaseRecipeStep):
-    """Recipe step that runs indefinitely (ongoing parameter estimation)."""
+    """Recipe step that runs indefinitely (ongoing parameter estimation).
+
+    ``peak_min_snr`` (optional) DECLARES the F-stat peak-selection floor this
+    stage runs at. ⚠ It exists because the v9 search stages install a
+    PROCESS-GLOBAL in-code override of that floor
+    (:class:`SearchStageProfileStep`) and nothing was clearing it: ``full_pe``
+    silently inherited ``gb_search_3``'s 6.25 while the submit script
+    exported 8.0 and the log's last word on the subject was a stale
+    ``[V9-STAGE gb_search_3]`` line. 6.25 happens to be the value the design
+    wants here -- an assembled model's faint tail must stay reachable -- but
+    inheriting it by accident is not the same as choosing it, and the next
+    person to change a search stage's floor would have moved this one too.
+    Declared, applied and logged; ``None`` clears the override so the run's
+    own ``FSTAT_PEAK_MIN_SNR`` governs again.
+    """
+
+    def __init__(self, *args, peak_min_snr=None, stage_name: str = "",
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+        self.peak_min_snr = peak_min_snr
+        self.stage_name = stage_name
+        self._profile_serial = None
+
+    def note_recipe_step(self, serial) -> None:
+        """Apply this stage's declared peak floor (idempotent per step)."""
+        if serial is not None and serial == self._profile_serial:
+            return
+        self._profile_serial = serial
+        from lisatools.sampling.fstat_proposal import (
+            fstat_peak_min_F, set_peak_min_F_override)
+
+        set_peak_min_F_override(self.peak_min_snr)
+        _F = float(fstat_peak_min_F())
+        logger.info(
+            "[V9-STAGE %s] entering (recipe step %s): F-stat peak floor is "
+            "F >= %.3f (SNR %.3f), %s.",
+            self.stage_name or "pe", serial, _F, float(np.sqrt(2.0 * _F)),
+            "declared by this stage" if self.peak_min_snr is not None
+            else "from the run's FSTAT_PEAK_MIN_SNR (any search-stage "
+                 "override has been cleared)")
 
     def stopping_function(self, *args, **kwargs):
         """Never stop on its own — relies on outer stopping logic."""
@@ -956,15 +995,32 @@ def band_shutoff_w_pending_total(moves) -> int:
     is armed -- pair it with the nleaves-plateau gate (which is what the
     existing stopping_function already is) rather than replacing that gate
     outright.
+
+    ⚠ COUNTED ONCE PER VALVE, NOT ONCE PER MOVE. Every armed RJ move in the
+    cycle publishes its own ``_shutoff_w_pending``, but they are all reading
+    the SAME shared ``band_info["band_rj_shutoff_w"]`` table -- so a naive sum
+    over a 4-RJ-move stage reports 4x the real number of pending pairs. The
+    ``== 0`` gate survives that (4x0 is still 0), which is exactly why it went
+    unnoticed; the human-facing count and the monitor's "pending" trace do
+    not. Moves are deduplicated by the identity of the table they publish
+    against, falling back to the move's own identity when it exposes none.
     """
+    return _band_shutoff_w_pending(moves, set())
+
+
+def _band_shutoff_w_pending(moves, seen) -> int:
     total = 0
     for m in list(moves or []):
         if isinstance(m, (tuple, list)) and m:
             m = m[0]
         pending = getattr(m, "_shutoff_w_pending", None)
         if pending is not None:
-            total += int(pending)
-        total += band_shutoff_w_pending_total(getattr(m, "moves", None))
+            table = getattr(m, "_rj_band_shutoff_w", None)
+            key = id(table) if table is not None else id(m)
+            if key not in seen:
+                seen.add(key)
+                total += int(pending)
+        total += _band_shutoff_w_pending(getattr(m, "moves", None), seen)
     return total
 
 
@@ -1368,6 +1424,28 @@ class SearchStageProfileStep(RJRecipeStep):
         if pm is not None:
             for m in gb_moves:
                 if not getattr(m, "is_rj_prop", False):
+                    continue
+                # ⚠ NEVER rj_replace. It is constructed ``phase_maximize=
+                # False`` with the reason in its own comment: the phase-max
+                # acceptance WAS the root-caused rj_replace lnL-drift flaw
+                # (the maximized value is not attainable at any actual phi0),
+                # and the move is only back in the cycle at all on the
+                # hypothesis that the rest was the old GPU setup. A stage
+                # profile must not re-arm the one thing that retired it.
+                # Its own scoring-side switch is ``_replace_phase_max``
+                # (GB_REPLACE_PHASE_MAX), which has rotation-on-accept behind
+                # it -- a different mechanism with a different safety story.
+                if getattr(m, "rj_replace", False):
+                    if not getattr(self, "_replace_pm_noted", False):
+                        self._replace_pm_noted = True
+                        logger.info(
+                            "[V9-STAGE %s] %s.phase_maximize LEFT AT %s: the "
+                            "replace move opted out by construction (its "
+                            "phase-max acceptance was the root cause of the "
+                            "drift that retired it). GB_REPLACE_PHASE_MAX is "
+                            "its own, separate switch.",
+                            tag, m.name, bool(getattr(m, "phase_maximize",
+                                                      False)))
                     continue
                 old = bool(getattr(m, "phase_maximize", False))
                 if old != bool(pm):

@@ -374,6 +374,14 @@ def _source_ids_from_env() -> dict:
 #: into the stage-B cache, whose loader refuses a mismatch. The stage entry
 #: therefore sets an in-code override AND forces a fresh-epoch refit; see
 #: ``recipe.SearchStageProfileStep``. Nothing on disk is deleted.
+#: ``full_pe``'s F-stat peak floor, declared for the same reason the search
+#: stages declare theirs: the override the search stages install is
+#: process-global, so an undeclared full_pe would inherit gb_search_3's value
+#: silently. 6.25 is what the design wants here (an assembled model's faint
+#: tail must stay reachable) -- this makes choosing it explicit. ``None``
+#: would clear the override and hand the stage back to FSTAT_PEAK_MIN_SNR.
+_PE_PEAK_MIN_SNR = 6.25
+
 V9_SEARCH_STAGE_PROFILES = (
     ("gb_search_1",
      dict(phase_maximize=True, opt_snr=8.0, peak_min_snr=8.0), False),
@@ -710,6 +718,8 @@ def build_fit():
                     Move("rj_fstat_pe", branch="gb"),
                     Move("rj_prior_pe", branch="gb"),
                 ] + ridge(),
+                step_kwargs=dict(peak_min_snr=_PE_PEAK_MIN_SNR,
+                                 stage_name="full_pe"),
                 combine_kwargs=_pe_combine_kwargs(),
             )
             _warm3 = int(os.environ.get("GB_SEARCH_3_WARM_EVERY", "5"))
@@ -1158,13 +1168,20 @@ def build_fit():
         ] + [
             Stage(
                 name="full_pe", kind="pe",
-                # Unchanged from the legacy composition below.
+                # Move list unchanged from the legacy composition below. The
+                # peak floor is DECLARED rather than inherited: the search
+                # stages install a process-global override of it, and
+                # full_pe wants the loose 6.25 (an assembled model's faint
+                # tail must stay reachable) -- but getting it by accident
+                # from gb_search_3 is not the same as choosing it.
                 moves=noise_pe + source_pe() + warm_pe() + [
                     Move("rj_fstat_pe", branch="gb"),
                     Move("rj_prior_pe", branch="gb"),
                 ] + ([Move("gb_ridge_gibbs", branch="gb")]
                      if os.environ.get("GB_RIDGE_GIBBS", "1") == "1" else [])
                 + vgb + vgb_ridge(),
+                step_kwargs=dict(peak_min_snr=_PE_PEAK_MIN_SNR,
+                                 stage_name="full_pe"),
                 combine_kwargs=_pe_combine_kwargs(),
             ),
         ]

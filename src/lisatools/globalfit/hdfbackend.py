@@ -945,11 +945,41 @@ class GFHDFBackend(eryn_HDFBackend):
                 f[self.name].attrs["has_recipe"] = True
 
     def completed_recipe_step(self, step_name):
-        """Mark ``step_name`` as completed in the on-disk recipe metadata."""
+        """Mark ``step_name`` as completed in the on-disk recipe metadata.
+
+        Also stamps ``completed_iteration``: the stored iteration the step
+        ended at. The status flag alone says WHETHER a stage finished, never
+        WHERE -- and with the v9 three-stage GB search (``gb_search_1/2/3``)
+        every per-iteration trace in the monitor now spans several stages
+        whose caps, SNR floors, phase-max setting and F-stat peak floor all
+        differ. Without the boundary those traces are unreadable: a leaf
+        count that jumps is either a discovery or a stage lowering its
+        floors, and nothing on the page could tell them apart.
+
+        Written best-effort. A stamp is a diagnostic, and failing a run
+        because one could not be written would be absurd; a missing stamp
+        just means the monitor draws no boundary (every store written before
+        this existed is in that state).
+        """
+        # ⚠ READ THE ITERATION FIRST. ``self.iteration`` OPENS THE FILE in
+        # "r", and doing that from inside the ``with self.open("a")`` below
+        # is a same-file reopen with incompatible flags. On this stack it
+        # succeeds; on an older HDF5 it behaves like a lock, and eryn's
+        # backend retry loop spins 100 x 1 s before raising -- which the
+        # ``except`` would then swallow, costing ~100 s and 100 stderr lines
+        # per stage boundary and producing no stamp at all.
+        try:
+            _it = int(self.iteration)
+        except Exception as exc:  # noqa: BLE001 -- the stamp is diagnostic
+            logger.debug("recipe step %s: iteration unreadable (%r)",
+                         step_name, exc)
+            _it = None
         with self.open("a") as f:
             recipe_group = f[self.name]["recipe"]
             recipe_step_group = recipe_group[step_name]
             recipe_step_group.attrs["status"] = True
+            if _it is not None:
+                recipe_step_group.attrs["completed_iteration"] = _it
 
 
 class ModuleSubBackend(eryn_HDFBackend):

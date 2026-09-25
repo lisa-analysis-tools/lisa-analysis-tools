@@ -677,6 +677,21 @@ class GFCombineMove(CombineMove, GlobalFitMove):
                 move.gf_stage_kind = kind
             except AttributeError:  # exotic move objects: never fatal
                 pass
+        # ... and the stage NAME, for the same reason and with the same
+        # lifetime. ``Stage.setup`` stamps it once at materialization, but
+        # every stage is materialized up front and the GB moves are SHARED
+        # objects -- so the static stamp is whichever stage was built last.
+        # Under the v9 three-stage search that means every `[GB_STAGE
+        # rj_fstat_search]` / `[MAXLOGL]` line emitted during gb_search_1
+        # read "gb_search_3", which is precisely the attribution the
+        # restructure needs its diagnostics to get right. Re-stamped per
+        # propose, exactly as gf_stage_kind is.
+        name = getattr(self, "gf_stage_name", None)
+        if name is not None:
+            try:
+                move.gf_stage_name = name
+            except AttributeError:  # exotic move objects: never fatal
+                pass
         it = getattr(self, "gf_iteration", None)
         if it is not None:
             try:

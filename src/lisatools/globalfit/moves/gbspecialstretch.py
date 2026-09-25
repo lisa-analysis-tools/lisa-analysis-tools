@@ -22065,6 +22065,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             ntemps = int(self.ntemps)
             band_temps = self.xp.asarray((payload or {})["band_temps"])
             self.mempool.free_all_blocks()
+            # WHICH PASS of a multi-pass replace this command is (see
+            # _replace_passes). ⚠ It has to come over the WIRE: the pass loop
+            # runs in the HEAD process and sets its own
+            # ``_replace_pass_source``, but each compute rank holds its OWN
+            # move instance, whose attribute would stay None -- so every rank
+            # but the head would have drawn from the F-stat container on BOTH
+            # passes. That is silent, and it makes the warm pass a no-op on
+            # every walker block except the head's while the log says it ran.
+            self._replace_pass_source = (payload or {}).get(
+                "replace_pass_source", None)
             rj_prop = (
                 None if not self.is_rj_prop
                 else self.rj_proposal_distribution[self.branch_name]
@@ -24894,6 +24904,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 "band_temps": band_temps_host,
                 "scan_schedule": _sched_block(w0, w1),
                 "engine_ntemps": int(engine_ntemps),
+                # Multi-pass replace: which candidate container THIS command
+                # draws from. None for every other move and for a
+                # single-pass replace, so the payload is unchanged there.
+                "replace_pass_source": getattr(
+                    self, "_replace_pass_source", None),
             })
             return payload
 
@@ -26711,6 +26726,29 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         if serial is None or serial == getattr(self, "_force_refit_done", None):
             return None
         self._force_refit_done = serial
+        # ⚠ RESUME. The arming decision is made against a PROCESS-GLOBAL
+        # override that is None in a fresh process, so on every restart the
+        # stage looks like it has just changed the peak floor and would open
+        # yet another epoch -- a full comb scan (~2800 s at 6mo) per resume,
+        # forever, plus an unbounded pile of epoch dirs. The authority on
+        # whether a refit is actually needed is the DISK: if the latest
+        # complete epoch was already fitted at the floor now in force, load
+        # it. Only a genuine change refits.
+        from lisatools.sampling.fstat_proposal import fstat_peak_min_F
+
+        _k_latest = self._latest_epoch()
+        if _k_latest is not None:
+            _have = self._epoch_peak_min_F(self._epoch_dir(_k_latest))
+            _want = float(fstat_peak_min_F())
+            if (_have is not None
+                    and abs(_have - _want) <= 1e-9 * max(1.0, abs(_want))):
+                logger.info(
+                    "[V9-STAGE %s] forced refit requested, but epoch %d was "
+                    "already fitted at F >= %.4f (SNR %.3f) -- the floor in "
+                    "force. Loading it instead of paying for another comb "
+                    "scan.", self.name, _k_latest, _have,
+                    float(np.sqrt(2.0 * _want)))
+                return None
         key = (self._fstat_root, serial)
         k = _FORCED_FSTAT_EPOCH.get(key)
         if k is None:
@@ -27025,6 +27063,28 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         ks = sorted(int(n.split("_")[1]) for n in os.listdir(root)
                     if n.startswith("epoch_") and n[6:].isdigit())
         return ks[-1] if ks else None
+
+    @staticmethod
+    def _epoch_peak_min_F(d: str):
+        """The peak floor epoch dir ``d`` was FITTED at, or ``None``.
+
+        ``None`` means "cannot tell" -- no stage-B cache yet (a mid-fit or
+        zero-peak epoch), or a cache written before the stamp existed. Every
+        caller must treat that as "assume it differs", never as a match.
+        """
+        from lisatools.sampling.fstat_gridfit import stacked_grid_path
+
+        try:
+            path = stacked_grid_path(d)
+            if not os.path.exists(path):
+                return None
+            with np.load(path, allow_pickle=False) as z:
+                if "peak_min_F" not in z:
+                    return None
+                return float(z["peak_min_F"])
+        except Exception as exc:  # noqa: BLE001 -- a probe, never a failure
+            logger.debug("epoch %s: peak_min_F unreadable (%r)", d, exc)
+            return None
 
     def _epoch_band_grid_stale(self, d: str) -> bool:
         """True when epoch dir ``d`` holds grids fitted on DIFFERENT band edges.
