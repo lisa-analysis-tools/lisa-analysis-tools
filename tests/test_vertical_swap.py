@@ -1057,3 +1057,95 @@ class SchedulerRelabelTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ColumnAtomicStagingTest(unittest.TestCase):
+    """``advance()`` must stage and retire a (walker, band) COLUMN whole.
+
+    User ruling 2026-09-25: "advance() retires per cell: this has to change
+    it must work on a band,walker as a unit. This is a must."
+
+    WHY IT IS NOT COSMETIC. A vertical swap pairs adjacent rungs of one
+    column and needs both cells RESIDENT SIMULTANEOUSLY. ``cell_order=
+    "band"`` exists to put a column's cells in adjacent slots, but
+    per-cell retirement then lets a column half-retire -- some rungs swap
+    out while the rest stay -- which destroys the very adjacency the
+    ordering was introduced to create.
+    """
+
+    NT, NW, NB = 4, 2, 5
+
+    def _sched(self, n_subbands, order="band"):
+        from lisatools.globalfit.moves.gbbands import (
+            BandScheduler, _SPECIAL_INDEX_BASE as B)
+        sp = []
+        for b in range(self.NB):
+            for w in range(self.NW):
+                for t in range(self.NT):
+                    # UNEVEN source counts per cell: the failure mode is a
+                    # short cell finishing first and retiring alone.
+                    sp += [(t * self.NW + w) * B + b] * (1 + (b + w) % 3)
+        return BandScheduler(np.asarray(sp), n_subbands=n_subbands, xp=np,
+                             cell_order=order, nwalkers=self.NW), B
+
+    def _resident_columns(self, sc, B):
+        a = sc.slot_specials[sc.slot_active]
+        cols = (a // B % self.NW) * B + (a % B)
+        uni, cnt = np.unique(cols, return_counts=True)
+        return dict(zip(uni.tolist(), cnt.tolist()))
+
+    def test_every_resident_column_stays_whole(self):
+        sc, B = self._sched(12)
+        self.assertTrue(sc.column_atomic)
+        self.assertEqual(sc.n_slots, 12, "slots must be whole columns")
+        for rnd in range(60):
+            if not sc.any_active():
+                break
+            sc.record_picks(sc.active_slot_specials)
+            sc.advance()
+            partial = {c: n for c, n in self._resident_columns(sc, B).items()
+                       if n != self.NT}
+            self.assertEqual(partial, {},
+                             f"round {rnd}: half-retired column(s) {partial}")
+
+    def test_nothing_is_stranded(self):
+        """Column staging must still consume every source exactly once --
+        the correctness check on any reordering."""
+        sc, _ = self._sched(12)
+        while sc.any_active():
+            sc.record_picks(sc.active_slot_specials)
+            sc.advance()
+        self.assertEqual(int(sc.cell_run.sum()), int(sc.cell_counts.sum()))
+
+    def test_a_frozen_cell_pins_its_WHOLE_column(self):
+        """The pool freezes cells; under column staging the freeze has to
+        hold the whole column resident or its partners leave without it."""
+        sc, B = self._sched(12)
+        frozen = sc.active_slot_specials[:1]
+        before = self._resident_columns(sc, B)
+        fcol = int((frozen[0] // B % self.NW) * B + (frozen[0] % B))
+        for _ in range(10):
+            sc.record_picks(sc.active_slot_specials)
+            sc.advance(frozen_specials=frozen)
+        after = self._resident_columns(sc, B)
+        self.assertIn(fcol, after, "the frozen cell's column was evicted")
+        self.assertEqual(after[fcol], self.NT,
+                         "the frozen column is only partly resident")
+        self.assertIn(fcol, before)
+
+    def test_count_ordering_keeps_the_old_per_cell_behaviour(self):
+        """Columns are not contiguous under 'count', so the mode must be
+        off -- and the legacy path must still drain."""
+        sc, _ = self._sched(12, order="count")
+        self.assertFalse(sc.column_atomic)
+        while sc.any_active():
+            sc.record_picks(sc.active_slot_specials)
+            sc.advance()
+        self.assertEqual(int(sc.cell_run.sum()), int(sc.cell_counts.sum()))
+
+    def test_a_buffer_narrower_than_one_column_falls_back(self):
+        """Such a buffer cannot host a vertical pair at all; staging
+        nothing would deadlock, so it reverts to per-cell packing."""
+        sc, _ = self._sched(3)          # one column is NT=4 cells
+        self.assertFalse(sc.column_atomic)
+        self.assertEqual(sc.n_slots, 3)

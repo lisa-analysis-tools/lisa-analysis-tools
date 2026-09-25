@@ -581,7 +581,51 @@ class BandScheduler:
         self._lookup_order = xp.argsort(self.cell_specials)
         self._specials_sorted = self.cell_specials[self._lookup_order]
 
-        n_slots = min(int(n_subbands), self.n_cells)
+        # ---- COLUMN-ATOMIC STAGING (user ruling 2026-09-25: advance()
+        # "must work on a band,walker as a unit") ------------------------
+        #
+        # A COLUMN is the ntemps cells sharing one (walker, band). Retiring
+        # cells INDEPENDENTLY lets a column half-retire: some rungs swap
+        # out while the rest stay, which destroys exactly the vertical-swap
+        # adjacency the "band" ordering exists to create -- a partner pair
+        # (t, w, b) / (t-1, w, b) must be resident SIMULTANEOUSLY.
+        #
+        # Under "band" ordering the cells of a column are CONTIGUOUS in
+        # ``cell_specials`` (the lexsort's primary key is band, then
+        # walker, then temp), which is what makes whole-column staging a
+        # slice rather than a gather. Under "count" ordering they are
+        # scattered, so the mode is only available there.
+        self.column_atomic = (cell_order == "band")
+        if self.column_atomic:
+            _b = self.cell_specials % _SPECIAL_INDEX_BASE
+            _w = (self.cell_specials // _SPECIAL_INDEX_BASE) % int(nwalkers)
+            self._cell_col = _w * _SPECIAL_INDEX_BASE + _b
+            _is_new = xp.concatenate([
+                xp.ones(1, dtype=bool),
+                self._cell_col[1:] != self._cell_col[:-1],
+            ])
+            self._col_of_cell = xp.cumsum(_is_new) - 1
+            self._col_start = xp.arange(self.n_cells)[_is_new]
+            self._col_end = xp.concatenate([
+                self._col_start[1:],
+                xp.asarray([self.n_cells], dtype=self._col_start.dtype),
+            ])
+            self.n_cols = int(self._col_start.shape[0])
+            # Initial staging is column-aligned too: take WHOLE columns
+            # while they fit. A buffer narrower than one column cannot host
+            # a vertical pair at all, so in that case fall back to the
+            # per-cell packing rather than stage nothing.
+            _sizes = self._col_end - self._col_start
+            _cum = xp.cumsum(_sizes)
+            _fit = int((_cum <= int(n_subbands)).sum())
+            if _fit >= 1:
+                n_slots = int(_cum[_fit - 1])
+                self._next_col = _fit
+            else:
+                self.column_atomic = False
+                n_slots = min(int(n_subbands), self.n_cells)
+        if not self.column_atomic:
+            n_slots = min(int(n_subbands), self.n_cells)
         self.slot_cell = xp.arange(n_slots)
         self.slot_active = xp.ones(n_slots, dtype=bool)
         self._next_cell = n_slots
@@ -641,23 +685,62 @@ class BandScheduler:
         caller stage new cells into the OTHER finished slots so the pool
         keeps accumulating toward a full-width in-model block.
         """
+        xp = self.xp
         finished = self.slot_active & (
             self.cell_run[self.slot_cell] >= self.cell_counts[self.slot_cell]
         )
         if frozen_specials is not None and len(frozen_specials):
-            finished &= ~self.xp.isin(self.slot_specials, frozen_specials)
+            finished &= ~xp.isin(self.slot_specials, frozen_specials)
+
+        if self.column_atomic:
+            # A COLUMN retires only when EVERY active slot of it is
+            # finished and none of its cells is frozen. Anything less
+            # half-retires the column and breaks the vertical-swap pairing
+            # the band ordering exists to provide.
+            _slot_col = self._col_of_cell[self.slot_cell]
+            _act = self.slot_active
+            # per-column: any active slot, and any active-but-unfinished
+            _n_act = xp.bincount(_slot_col[_act], minlength=self.n_cols)
+            _n_done = xp.bincount(_slot_col[_act & finished],
+                                  minlength=self.n_cols)
+            _col_ready = (_n_act > 0) & (_n_act == _n_done)
+            finished = _act & _col_ready[_slot_col]
+
         n_finished = int(finished.sum())
         if n_finished == 0:
-            return self.xp.zeros(0, dtype=int), self.xp.zeros(0, dtype=int)
+            return xp.zeros(0, dtype=int), xp.zeros(0, dtype=int)
 
-        n_pending = self.n_cells - self._next_cell
-        n_replace = min(n_finished, n_pending)
-        finished_slots = self.xp.arange(self.n_slots)[finished]
+        finished_slots = xp.arange(self.n_slots)[finished]
+
+        if self.column_atomic:
+            # Stage WHOLE columns into the freed slots -- never a partial
+            # one, for the same reason. Columns are contiguous in
+            # cell_specials, so this is a slice.
+            _room, _take = n_finished, 0
+            while self._next_col + _take < self.n_cols:
+                _c = self._next_col + _take
+                _sz = int(self._col_end[_c] - self._col_start[_c])
+                if _sz > _room:
+                    break
+                _room -= _sz
+                _take += 1
+            if _take:
+                _lo = int(self._col_start[self._next_col])
+                _hi = int(self._col_end[self._next_col + _take - 1])
+                new_cells = xp.arange(_lo, _hi)
+                self._next_col += _take
+                self._next_cell = _hi
+            else:
+                new_cells = xp.zeros(0, dtype=self.slot_cell.dtype)
+            n_replace = int(new_cells.shape[0])
+        else:
+            n_pending = self.n_cells - self._next_cell
+            n_replace = min(n_finished, n_pending)
+            new_cells = self._next_cell + xp.arange(n_replace)
+            self._next_cell += n_replace
 
         inds_fill = finished_slots[:n_replace]
-        new_cells = self._next_cell + self.xp.arange(n_replace)
         self.slot_cell[inds_fill] = new_cells
-        self._next_cell += n_replace
 
         # slots beyond the replacements retire
         self.slot_active[finished_slots[n_replace:]] = False
