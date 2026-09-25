@@ -8206,7 +8206,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         # Removal-only / replace steps never revive a dead
                         # row, so their pools are 100% mature here by
                         # construction.
-                        held["newborn"] = (~alive_at_pick)[alive_now]
+                        # Swapped rows count as NEWBORN: same reasoning as
+                        # the flag itself -- a replace installs new
+                        # parameters, so the row needs a converged climb,
+                        # not the mature budget. A REJECTED replace leaves
+                        # the source where it was, so it stays mature.
+                        _nb = ~alive_at_pick
+                        _ra = getattr(self, "_last_replace_accept", None)
+                        if _ra is not None:
+                            _nb = _nb | _ra
+                        held["newborn"] = _nb[alive_now]
                         _sp_h = np.asarray(_to_numpy(held["specials"]))
                         _keep = np.fromiter(
                             (s not in _pooled_host for s in _sp_h.tolist()),
@@ -8428,7 +8437,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     alive_now = self._survivor_pool_mask(alive_now, picked)
                     if bool(alive_now.any()):
                         held = {k: v[alive_now] for k, v in picked.items()}
-                        held["newborn"] = (~alive_at_pick)[alive_now]
+                        # Swapped rows count as NEWBORN: same reasoning as
+                        # the flag itself -- a replace installs new
+                        # parameters, so the row needs a converged climb,
+                        # not the mature budget. A REJECTED replace leaves
+                        # the source where it was, so it stays mature.
+                        _nb = ~alive_at_pick
+                        _ra = getattr(self, "_last_replace_accept", None)
+                        if _ra is not None:
+                            _nb = _nb | _ra
+                        held["newborn"] = _nb[alive_now]
                         pending.append(held)
                         pending_specials = self.xp.concatenate(
                             [pending_specials, held["specials"]]
@@ -11704,6 +11722,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         forbidden with ``-inf``.
         """
         xp = self.xp
+        # PROVENANCE FOR THE IN-MODEL POLISH. A replace writes brand-new
+        # parameters onto a row that was ALIVE at pick, so the plain
+        # "dead at pick -> newborn" test calls it MATURE and it gets the
+        # fixed survivor budget instead of the convergence rule -- even
+        # though a swapped source is exactly as unpolished as a birth.
+        # User ruling 2026-09-25: "replace should get convergence polish".
+        # Aligned with ``picked``, not with ``sel``, so the pooling sites
+        # can use it directly; None = this move is not a replace or nothing
+        # was accepted.
+        self._last_replace_accept = None
         alive = band_sorter.inds[picked["ids"]]
         if not bool(alive.any()):
             return
@@ -12117,6 +12145,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # identity can be asserted deterministically. NEVER for real
             # sampling.
             accept = ~bad_mask & (prev_logp > -1e229)
+
+        # ``accept`` is a mask over ``sel`` (the alive subset); lift it to
+        # ``picked`` so the pool can mark swapped rows as newborn.
+        _acc_picked = xp.zeros(len(picked["ids"]), dtype=bool)
+        _acc_picked[sel[accept]] = True
+        self._last_replace_accept = _acc_picked
 
         try:
             # replace acceptance census (printed at propose end);

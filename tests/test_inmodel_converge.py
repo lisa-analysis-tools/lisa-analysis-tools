@@ -1839,7 +1839,13 @@ class StagedFlushConvergesTest(unittest.TestCase):
         row would take the mature budget -- which is how this path came to
         run a flat 50 repeats for newborns too."""
         src = self._staged_src()
-        self.assertIn('held["newborn"] = (~alive_at_pick)[alive_now]', src)
+        # ``alive_at_pick`` is captured before the RJ step and feeds the
+        # flag; an accepted REPLACE is OR-ed in on top (see
+        # ReplaceGetsConvergencePolishTest).
+        self.assertIn("alive_at_pick = band_sorter.inds[picked[\"ids\"]].copy()",
+                      src)
+        self.assertIn("_nb = ~alive_at_pick", src)
+        self.assertIn('held["newborn"] = _nb[alive_now]', src)
 
     def test_PE_needs_no_branch(self):
         """PE gets the same schedule WITHOUT convergence for free: the
@@ -1851,3 +1857,48 @@ class StagedFlushConvergesTest(unittest.TestCase):
         import lisatools.globalfit.moves.gbspecialstretch as g
         body = inspect.getsource(g.GBSpecialBase._converge_state_for)
         self.assertIn("_converge_stage_allows", body)
+
+
+class ReplaceGetsConvergencePolishTest(unittest.TestCase):
+    """An accepted REPLACE must be polished like a birth.
+
+    User ruling 2026-09-25: "replace should get convergence polish."
+
+    The provenance flag was "dead at pick -> newborn". A replace writes
+    brand-new parameters onto a row that was ALIVE at pick, so every
+    swapped source was classified MATURE and took the fixed survivor
+    budget instead of the convergence rule -- despite being exactly as
+    unpolished as a birth. (``rj_prior_removal`` survivors stay mature,
+    correctly: nothing about them changed.)
+    """
+
+    def test_the_replace_step_stashes_a_picked_aligned_accept_mask(self):
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        body = inspect.getsource(g.GBSpecialBase._run_replace_step)
+        self.assertIn("self._last_replace_accept = None", body,
+                      "stale mask from a previous round would leak")
+        self.assertIn("_acc_picked[sel[accept]] = True", body)
+        self.assertIn("self._last_replace_accept = _acc_picked", body)
+
+    def test_BOTH_pooling_sites_fold_it_into_newborn(self):
+        """Direct-batch and staged both build the pool; a fix on one only
+        would make the polish depend on GB_RJ_DIRECT_BATCH."""
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g)
+        self.assertEqual(src.count('held["newborn"] = _nb[alive_now]'), 2)
+        self.assertEqual(src.count("_nb = _nb | _ra"), 2)
+
+    def test_a_rejected_replace_stays_mature(self):
+        """The mask is the ACCEPT mask, not the picked set -- a rejected
+        swap leaves the source at its old parameters, which are already
+        polished."""
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        body = inspect.getsource(g.GBSpecialBase._run_replace_step)
+        self.assertIn("_acc_picked[sel[accept]] = True", body)
+        self.assertNotIn("_acc_picked[:] = True", body)
