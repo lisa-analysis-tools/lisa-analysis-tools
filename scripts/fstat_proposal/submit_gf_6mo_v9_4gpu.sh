@@ -1281,11 +1281,30 @@ export GB_INMODEL_GROUP_ITERS=3
 export GB_INMODEL_GROUP_DLL=4.0
 export GB_INMODEL_GROUP_SCALE=flat
 # ⚠ COST KNOB, NOT A SAFETY NET. This group is unbounded by construction:
-# one pass is a full sweep of every source at 25 repeats each, so 20 passes
-# is up to 500 repeats/source for the slowest sub-band. Watch the
+# one pass is a full sweep of every source at 25 repeats each, so 50 passes
+# is up to 1250 repeats/source for the slowest sub-band. Watch the
 # [GB_IMGROUP] "group done" line's pass distribution and tighten if the p90
 # is at the ceiling.
-export GB_INMODEL_GROUP_MAX_PASSES=20
+#
+# 20 -> 50 (user, 2026-09-25: "this may need to be higher"). Two reasons:
+#
+#  * SCALE=flat above makes crowded bands structurally slower to shut --
+#    that is the INTENT -- so the ceiling truncates exactly the bands the
+#    design is trying to favour. At 20 passes a band gets 500
+#    repeats/source, and the row-level rule measured on job 620 needs a
+#    MEDIAN of 260 and a p90 of 400 repeats for a SINGLE newborn to
+#    converge. 20 was ~1.25x the p90 for one source, for a bar the whole
+#    band has to clear in aggregate.
+#  * raising it is nearly free. A shut sub-band leaves the eligible set
+#    (``_group_shutoff_wb`` is the next pass's filter), so late passes only
+#    touch what is still open -- with ~61 columns, one stubborn band costs
+#    ~1/61 of a pass. The expensive case is MANY bands still open, and that
+#    trips the ceiling WARNING, which names the remedy.
+#
+# ⚠ 50 is reasoned, not measured: the group rule was inert on the fan-out
+# path until 2026-09-25, so no run has ever produced a [GB_IMGROUP] pass
+# distribution. The first one settles this number.
+export GB_INMODEL_GROUP_MAX_PASSES=50
 echo "[V9-IMGROUP] group=${GB_INMODEL_GROUP} iters=${GB_INMODEL_GROUP_ITERS} \
 dll=${GB_INMODEL_GROUP_DLL} scale=${GB_INMODEL_GROUP_SCALE} \
 max_passes=${GB_INMODEL_GROUP_MAX_PASSES}"

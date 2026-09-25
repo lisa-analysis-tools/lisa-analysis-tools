@@ -1304,7 +1304,7 @@ class GroupLoopTerminationTest(unittest.TestCase):
     def test_it_stops_when_every_sub_band_converges(self):
         mv, st, sorter, state, first, calls = self._move(
             np.zeros((self.NW, self.NB)), max_passes=50, window=2)
-        mv._run_group_passes(st, None, state, sorter, None, first)
+        mv._run_group_passes(st, None, state, sorter, None, first, None, None)
         self.assertTrue(st.all_shut(np))
         self.assertLess(st.passes, 50, "should stop on convergence, not the cap")
 
@@ -1314,7 +1314,7 @@ class GroupLoopTerminationTest(unittest.TestCase):
             np.full((self.NW, self.NB), 1e3), max_passes=6, window=2)
         with self.assertLogs(
                 "lisatools.globalfit.moves.gbspecialstretch", "WARNING") as cm:
-            mv._run_group_passes(st, None, state, sorter, None, first)
+            mv._run_group_passes(st, None, state, sorter, None, first, None, None)
         self.assertEqual(st.passes, 6)
         self.assertFalse(st.all_shut(np))
         self.assertTrue(any("CEILING" in m for m in cm.output),
@@ -1325,7 +1325,7 @@ class GroupLoopTerminationTest(unittest.TestCase):
         holding the group open forever."""
         mv, st, sorter, state, first, calls = self._move(
             np.zeros((self.NW, self.NB)), max_passes=50, window=5, occ=0)
-        mv._run_group_passes(st, None, state, sorter, None, first)
+        mv._run_group_passes(st, None, state, sorter, None, first, None, None)
         self.assertTrue(st.all_shut(np))
         self.assertEqual(st.passes, 1)
 
@@ -1335,7 +1335,7 @@ class GroupLoopTerminationTest(unittest.TestCase):
         mv, st, sorter, state, first, calls = self._move(
             np.full((self.NW, self.NB), 1e3), max_passes=3, window=2)
         sorter.has_run_rj[:] = True
-        mv._run_group_passes(st, None, state, sorter, None, first)
+        mv._run_group_passes(st, None, state, sorter, None, first, None, None)
         self.assertFalse(bool(sorter.has_run_rj.any()),
                          "has_run_rj must be cleared for the next pass")
         self.assertEqual(len(calls), 2, "ceiling 3 => 2 further passes run")
@@ -1345,11 +1345,96 @@ class GroupLoopTerminationTest(unittest.TestCase):
         the caller. Dropping one silently loses lnL from the chain."""
         mv, st, sorter, state, first, calls = self._move(
             np.full((self.NW, self.NB), 1e3), max_passes=4, window=2)
-        mv._run_group_passes(st, None, state, sorter, None, first)
+        mv._run_group_passes(st, None, state, sorter, None, first, None, None)
         # passes 1..3 bank; pass 4's delta is returned for the caller
         self.assertAlmostEqual(
             float(state.log_like[0].sum()),
             3 * self.NW * self.NB * 1e3, places=3)
+
+    def test_an_IMMEDIATE_convergence_returns_the_CALLERS_counts(self):
+        """⚠ The no-extra-pass case used to return ``(ll, None, None)``.
+
+        Both callers unpack straight into their own ``prop_counts`` /
+        ``acc_counts`` and both then index ``prop_counts[0]`` (the
+        per-propose census, and on the fan-out path the reply the head
+        sums across blocks). So a group that shut every sub-band on the
+        caller's FIRST pass -- the cheapest, most ordinary outcome -- was a
+        TypeError waiting on a path nobody had run, because the group rule
+        itself had never executed in production.
+        """
+        mv, st, sorter, state, first, calls = self._move(
+            np.zeros((self.NW, self.NB)), max_passes=50, window=2)
+        # Force the "everything shut on the caller's own pass" branch. The
+        # state machine needs two updates to reach it on its own, so
+        # stubbing is what isolates the RETURN contract from the shut-off
+        # arithmetic, which its own tests already cover.
+        st.all_shut = lambda xp: True
+        pc = np.ones((2, 2, self.NB), dtype=int)
+        ac = np.full((2, 2, self.NB), 7, dtype=int)
+        ll, out_pc, out_ac = mv._run_group_passes(
+            st, None, state, sorter, None, first, pc, ac)
+        self.assertEqual(len(calls), 0, "no further pass should have run")
+        self.assertIsNotNone(out_pc, "returned None: the old TypeError trap")
+        self.assertIsNotNone(out_ac, "returned None: the old TypeError trap")
+        np.testing.assert_array_equal(out_pc, pc)
+        np.testing.assert_array_equal(out_ac, ac)
+        np.testing.assert_array_equal(ll, first)
+        # the shape both callers then index -- prop_counts[0]
+        self.assertEqual(out_pc[0].shape, pc[0].shape)
+
+
+class GroupRuleReachesTheFanoutPathTest(unittest.TestCase):
+    """REGRESSION, job 620: ``GB_INMODEL_GROUP`` was inert in production.
+
+    ``_group_state_or_none`` had exactly ONE caller, inside
+    ``_propose_legacy``. A 4-rank run dispatches to ``_propose_orchestrated``
+    and the GB work is served on the ranks by ``_gb_serve_run_proposal``,
+    so the group rule never executed: zero ``[GB_IMGROUP]`` lines in 63
+    minutes with ``in_model`` having run for 97 s.
+
+    Everything else about the knob was healthy -- it resolved to True, the
+    preflight passed, the launcher printed ``[V9-IMGROUP] group=1`` -- which
+    is exactly why a source-level check is worth having. A behavioural test
+    of the served body needs MPI and GPUs; this pins the one fact that
+    failed.
+    """
+
+    def _src(self):
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        return g
+
+    def test_BOTH_propose_paths_build_the_group_state(self):
+        import inspect
+
+        g = self._src()
+        cls = g.GBSpecialBase
+        for name in ("_propose_legacy", "_gb_serve_run_proposal"):
+            body = inspect.getsource(getattr(cls, name))
+            self.assertIn(
+                "_group_state_or_none()", body,
+                f"{name} does not build the in-model group state -- "
+                f"GB_INMODEL_GROUP is inert on that path")
+            self.assertIn(
+                "_run_group_passes", body,
+                f"{name} builds the group state but never runs its passes")
+
+    def test_both_paths_clear_the_shutoff_in_a_finally(self):
+        """``_group_shutoff_wb`` is the NEXT pass's eligibility filter. Left
+        set, it would silently suppress sub-bands in a later propose -- and
+        the group is scoped to ONE propose by design."""
+        import inspect
+
+        g = self._src()
+        cls = g.GBSpecialBase
+        for name in ("_propose_legacy", "_gb_serve_run_proposal"):
+            body = inspect.getsource(getattr(cls, name))
+            self.assertIn("self._group_shutoff_wb = None", body, name)
+            fin = body.index("finally:")
+            self.assertGreater(
+                body.index("self._group_shutoff_wb = None", fin), fin,
+                f"{name}: the reset must be in the finally, not the happy path")
 
 
 class RunTemperingOffTest(unittest.TestCase):

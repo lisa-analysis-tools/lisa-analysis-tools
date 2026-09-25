@@ -15461,16 +15461,32 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         return counts.reshape(int(self.nwalkers), int(self.num_bands))
 
     def _run_group_passes(self, st, model, new_state, band_sorter,
-                          band_temps, ll_change_log):
+                          band_temps, ll_change_log, prop_counts, acc_counts,
+                          *, scan_schedule=None):
         """Repeat the pass until every ``(walker, band)`` sub-band is shut.
 
-        ``ll_change_log`` is the FIRST pass's, already run by the caller.
-        Returns the final pass's ``(ll_change_log, prop_counts,
-        acc_counts)`` so the caller's existing post-loop bookkeeping banks
-        the last delta exactly as it does on the single-pass path.
+        ``ll_change_log`` / ``prop_counts`` / ``acc_counts`` are the FIRST
+        pass's, already run by the caller. Returns the LAST pass's, so the
+        caller's existing post-loop bookkeeping banks the final delta
+        exactly as it does on the single-pass path.
+
+        ⚠ THE CALLER'S COUNTS ARE THE SEED, and that is load-bearing. This
+        used to initialise them to ``None`` and return ``(ll, None, None)``
+        when the group converged on the very first pass -- the "nothing
+        further ran" case. Both call sites unpack straight into their own
+        ``prop_counts`` / ``acc_counts``, and both then index
+        ``prop_counts[0]``, so an immediate convergence was a TypeError
+        waiting on the one path nobody had run. Seeding with the caller's
+        arrays makes the no-extra-pass case return exactly what came in.
+
+        ``scan_schedule`` is forwarded to every subsequent pass and must be
+        the one the caller used for the first. It is drawn ONCE on the head
+        for the whole ensemble and shipped to the ranks, so a later pass
+        that dropped it would have each rank draw its own and diverge from
+        both the first pass and the other blocks. ``None`` is correct for
+        the single-process caller, which never supplies one.
         """
         xp = self.xp
-        prop_counts = acc_counts = None
         while True:
             occ = self._group_cold_occupancy(band_sorter)
             n_new = st.update(xp, ll_change_log[0], occ)
@@ -15516,13 +15532,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # instantly converged.
             band_sorter.has_run_rj[:] = False
             ll_change_log, prop_counts, acc_counts = self.run_proposal(
-                model, new_state, band_sorter, band_temps
+                model, new_state, band_sorter, band_temps,
+                **({} if scan_schedule is None
+                   else {"scan_schedule": scan_schedule}),
             )
         self._group_report(st, xp)
-        if prop_counts is None:
-            # converged on the first pass: the caller's arrays are still
-            # the live ones.
-            return ll_change_log, None, None
         return ll_change_log, prop_counts, acc_counts
 
     def _group_report(self, st, xp):
@@ -22145,21 +22159,57 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             _saved_temper_vertical = getattr(self, "temper_vertical", False)
             if _reseed_firing:
                 self.temper_vertical = True
+            # IN-MODEL GROUP CONVERGENCE ON THE FAN-OUT PATH. ⚠ This body is
+            # why GB_INMODEL_GROUP appeared to do nothing in production:
+            # ``_group_state_or_none`` had exactly ONE caller, in
+            # ``_propose_legacy``, and a 4-rank run takes
+            # ``_propose_orchestrated`` instead. Every knob resolved, the
+            # preflight passed, the script printed "[V9-IMGROUP] group=1",
+            # every docstring said it was on -- and the code that consumes
+            # it never executed. Diagnosed from job 620: ZERO [GB_IMGROUP]
+            # lines in 63 minutes with in_model having run for 97 s.
+            #
+            # IT BELONGS ON THE RANK, not on the head. The rule shuts off
+            # (walker, band) pairs, each walker lives entirely inside one
+            # block, so the decision is rank-LOCAL and needs no aggregation
+            # and no protocol change -- the loop just makes this one command
+            # take longer. (The head never sees ``ll_change_log`` at all,
+            # which is what makes the head-side alternative expensive.)
+            #
+            # The shape is the legacy block's, verbatim: the group loop
+            # REPLACES the reseed multi-pass loop, each pass banks its cold
+            # delta before the next, and the final pass's is banked by the
+            # update below. ``_group_shutoff_wb`` is cleared in the finally
+            # -- it is the next pass's eligibility filter and must never
+            # survive into another propose.
+            _grp_state = self._group_state_or_none()
             try:
                 with tm.span("run_proposal"):
                     ll_change_log, prop_counts, acc_counts = self.run_proposal(
                         model, new_part, band_sorter, band_temps,
                         scan_schedule=(payload or {}).get("scan_schedule"),
                     )
-                    for _p in range(1, _passes):
-                        new_part.log_like[0] += _to_numpy(
-                            ll_change_log.sum(axis=-1)[0])
-                        ll_change_log, prop_counts, acc_counts = self.run_proposal(
-                            model, new_part, band_sorter, band_temps,
-                            scan_schedule=(payload or {}).get("scan_schedule"),
+                    if _grp_state is not None:
+                        ll_change_log, prop_counts, acc_counts = (
+                            self._run_group_passes(
+                                _grp_state, model, new_part, band_sorter,
+                                band_temps, ll_change_log, prop_counts,
+                                acc_counts,
+                                scan_schedule=(
+                                    payload or {}).get("scan_schedule"),
+                            )
                         )
+                    else:
+                        for _p in range(1, _passes):
+                            new_part.log_like[0] += _to_numpy(
+                                ll_change_log.sum(axis=-1)[0])
+                            ll_change_log, prop_counts, acc_counts = self.run_proposal(
+                                model, new_part, band_sorter, band_temps,
+                                scan_schedule=(payload or {}).get("scan_schedule"),
+                            )
             finally:
                 self.temper_vertical = _saved_temper_vertical
+                self._group_shutoff_wb = None
             et_prop = time.perf_counter()
             _alive_per_temp_post_prop = [
                 int(band_sorter.inds[band_sorter.temp_inds == _t].sum())
@@ -25830,7 +25880,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 if _grp_state is not None:
                     _passes = self._run_group_passes(
                         _grp_state, model, new_state, band_sorter,
-                        band_temps, ll_change_log,
+                        band_temps, ll_change_log, prop_counts, acc_counts,
                     )
                     ll_change_log, prop_counts, acc_counts = _passes
                 else:
