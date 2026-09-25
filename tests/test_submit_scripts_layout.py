@@ -200,7 +200,11 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         and nothing ever logs [GB_IMGROUP] -- the move is not built and not
         scheduled. This pair is what makes V9-6 reachable at all."""
         self.assertEqual(self.v9["GB_SEARCH_IN_MODEL"], "1")
-        self.assertEqual(self.v9["GB_NUM_REPEAT_PROPOSALS"], "25")
+        # 25 -> 100 (user ruling 2026-09-25, off job 628). The group rule
+        # decides the PASS count; this is repeats per source per pass, so
+        # the trade is a coarser stopping granularity for fewer, fatter
+        # passes -- see the knob's comment in the launcher.
+        self.assertEqual(self.v9["GB_NUM_REPEAT_PROPOSALS"], "100")
         self.assertNotIn("GB_SEARCH_IN_MODEL", self.v8)
 
     # -- V9-9: the stage-convergence valve --------------------------------

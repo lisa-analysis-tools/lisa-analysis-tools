@@ -1331,8 +1331,26 @@ export GB_INMODEL_CONVERGE_CLASSES=newborn,mature
 # at all. That is exactly the silent no-op the preflight exists to catch.
 export GB_SEARCH_IN_MODEL=1
 # Repeats per source per PASS of that move (the group rule then decides how
-# many passes). 25 per the user's structure.
-export GB_NUM_REPEAT_PROPOSALS=25
+# many passes). 25 -> 100 (user ruling 2026-09-25, off job 628's first two
+# complete gb_search_1 cycles).
+#
+# WHAT THIS DOES NOT CHANGE: the total work is NOT 4x. The group rule stops
+# a sub-band when its cold dlnL over a 3-PASS window falls under
+# GB_INMODEL_GROUP_DLL, so a 4x fatter pass posts a ~4x larger per-pass gain
+# and clears the bar in correspondingly fewer passes. 628 reached pass 17 of
+# a 1000 ceiling at 25; expect single digits at 100 for a broadly similar
+# repeat count.
+#
+# ⚠ WHAT IT DOES CHANGE, and the reason to watch it: the convergence test
+# gets COARSER. The stopping decision is only ever taken at a pass boundary,
+# so the granularity goes from 25 repeats to 100 -- a sub-band that would
+# have converged at repeat 30 now runs to 100. That overshoot is the cost,
+# and it is paid on the sub-bands that converge FASTEST (the sparse ones).
+# The gain is on the slow, dense sub-bands, which stop being re-polled every
+# 25 repeats. Watch [GB_IMGROUP] "pass N: cold dlnL" -- if pass 1 now lands
+# under ~4x its old value the trade is working; if the pass count does not
+# drop roughly 4x, this is simply 4x the in-model wall.
+export GB_NUM_REPEAT_PROPOSALS=100
 export GB_INMODEL_GROUP=1
 # W in PASSES (not repeats): one pass is already GB_NUM_REPEAT_PROPOSALS
 # repeats per source, so the per-pass gain is a far coarser quantity than
