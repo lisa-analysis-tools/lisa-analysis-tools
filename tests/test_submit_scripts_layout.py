@@ -292,6 +292,18 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         self.assertNotIn("GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/"
                          "global_fit_output/gf_prod_3mo_v8_10walkers/", src)
 
+    def test_mid_iteration_checkpoints_are_pinned_on(self):
+        """User ask 2026-09-24: "checkpoints between all the GB moves for
+        resume". The HOOKS are unconditional (GFCombineMove writes after
+        every sub-move); what this pins is that the feature is ARMED and
+        that its throttle -- the thing that actually decides how much a spot
+        preemption costs -- is on the run record rather than a silent
+        default."""
+        self.assertEqual(self.v9["MIDIT_CHECKPOINT"], "1")
+        self.assertIn("MIDIT_CHECKPOINT_MIN_INTERVAL", self.v9)
+        self.assertGreaterEqual(
+            int(self.v9["MIDIT_CHECKPOINT_MIN_INTERVAL"]), 0)
+
     def test_the_noise_pin_is_read_at_MAXLOGL(self):
         """noise_pin reads best_logl_noise, i.e. the best-logL cold walker
         of the last valid row -- not a posterior mean."""
@@ -321,6 +333,8 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             "FSTAT_PEAK_MIN_SNR",
             # V9-12, the shared seed store + noise pin
             "GF_SEED_STORE", "GB_WARM_START_SOURCE_STORE",
+            # mid-iteration checkpoints, pinned explicitly for v9
+            "MIDIT_CHECKPOINT", "MIDIT_CHECKPOINT_MIN_INTERVAL",
         }
         drift = {
             k: (self.v8.get(k), self.v9.get(k))

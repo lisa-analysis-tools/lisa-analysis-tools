@@ -3459,6 +3459,34 @@ export STAGE_V9_SEARCH=1
 # Stages 1-2 run it every iteration.
 export GB_SEARCH_3_WARM_EVERY=5
 
+# ---- MID-ITERATION CHECKPOINTS (user ask 2026-09-24: "make sure there are
+# checkpoints between all the GB moves for resume") ------------------------
+# The HOOKS already sit at EVERY sub-move boundary: GFCombineMove writes one
+# after each move it proposes, on both its sequential and weighted-cycle
+# paths, and the v9 search stages take the sequential one. So across a
+# search iteration there is a coherent resume point after each of
+#   rj_warm_search / in_model / rj_fstat_search / in_model_fstat /
+#   rj_replace / in_model_replace / rj_prior_removal
+# plus one BETWEEN the two internal passes of rj_replace (that move is a
+# single sub-move running two complete sweeps, so the combine's own boundary
+# would have left the second pass unprotected).
+#
+# ⚠ WHICH hooks actually WRITE is the throttle's decision, not the hook's.
+# MIDIT_CHECKPOINT_MIN_INTERVAL is the minimum seconds between writes, so at
+# the 600 s default a ~2500-4000 s v9 iteration checkpoints at roughly every
+# other boundary, and the exposure on a preemption is bounded by the LONGEST
+# gap between two writes -- which for v9 is a whole in-model slot, since one
+# of those can run up to GB_INMODEL_GROUP_MAX_PASSES x
+# GB_NUM_REPEAT_PROPOSALS per source. Lower this if the [MIDIT_CKPT] write
+# cost (it logs MB and seconds) turns out to be small against that exposure;
+# 0 writes at every boundary. Both pinned explicitly here rather than left
+# to the code defaults, because on a SPOT partition this is the knob that
+# decides how much a preemption costs.
+export MIDIT_CHECKPOINT=1
+export MIDIT_CHECKPOINT_MIN_INTERVAL=${MIDIT_CHECKPOINT_MIN_INTERVAL:-600}
+echo "[V9-CKPT] mid-iteration checkpoints ON, min interval ${MIDIT_CHECKPOINT_MIN_INTERVAL}s"
+echo "[V9-CKPT] watch: [MIDIT_CKPT] wrote ... at stored iteration N (boundary '...')"
+
 # ============================================================================
 # CHANGE 3 OF 3 vs 3mo_v8 -- MBHB + EMRI + SOBHB (campaign S6). Non-empty
 # id lists arm the branches in run_combined_staged.py: a source_search

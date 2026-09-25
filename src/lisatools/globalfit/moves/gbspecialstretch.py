@@ -24165,6 +24165,22 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 state, acc = self._propose_dispatch(model, state)
             finally:
                 self._replace_pass_source = None
+            # RESUME BOUNDARY. ``GFCombineMove`` writes a mid-iteration
+            # checkpoint after every sub-move, but a two-pass replace is ONE
+            # sub-move running two complete internal sweeps -- so without
+            # this the second pass is unprotected and a preemption inside it
+            # loses the first as well. ``state`` is a fully coherent return
+            # from ``_propose_dispatch`` here, which is exactly what makes
+            # this a legal point to write one. Throttled and head-only like
+            # every other boundary, so it costs nothing when it does not
+            # fire.
+            from .. import midit_checkpoint
+
+            midit_checkpoint.maybe_write(
+                state,
+                tag=(f"stage={getattr(self, 'gf_stage_name', '?')} "
+                     f"{self.name} pass {i + 1}/{len(passes)} ({src})"),
+            )
             _ll1 = self._replace_pass_ll(state)
             if _ll0 is not None and _ll1 is not None:
                 _d = float(np.max(np.abs(_ll1 - _ll0)))
