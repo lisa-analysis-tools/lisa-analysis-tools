@@ -3,7 +3,31 @@
 **Written 2026-09-24 as a pre-compaction handoff.** Everything needed to
 resume without the conversation.
 
+> **SUPERSEDED 2026-09-24 (later the same day).** Everything in
+> "REMAINING WORK" below is now BUILT. Read
+> [`2026-09-24-v9-recipe-walkthrough.md`](2026-09-24-v9-recipe-walkthrough.md)
+> for how the finished recipe runs and what to watch in the log. This file
+> is kept for the traps section and the decision history.
+>
+> What changed since it was written:
+> * the three-stage restructure, gate 6, the per-stage profile, the F-stat
+>   peak override + forced fresh-epoch refit, `rj_replace` two-pass, the
+>   noise start pin and the conditional noise stages all landed;
+> * the cycle now ENDS on `rj_prior_removal` (user amendment): the third
+>   in-model slot moved to between `rj_replace` and the removal judge and
+>   was renamed `in_model_replace`;
+> * `gb-inmodel-converge` merged to `dev` with zero conflicts;
+> * commit `e7e4c37c` was split so the HTML-monitor work is its own commit
+>   (the mistake in the section below is FIXED; the tree was verified
+>   byte-identical across the rewrite);
+> * ⚠ **a real defect was found and fixed**: the in-GROUP knobs resolved as
+>   `GB_INMODEL_CONVERGE_GROUP*` while the script and every docstring said
+>   `GB_INMODEL_GROUP*`, so V9-6 was entirely dead. The preflight now
+>   RESOLVES knobs instead of probing symbols, which is the only check that
+>   catches a name mismatch.
+
 ## Where the code is
+
 
 | | |
 |---|---|
