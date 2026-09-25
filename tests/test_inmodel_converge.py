@@ -1902,3 +1902,58 @@ class ReplaceGetsConvergencePolishTest(unittest.TestCase):
         body = inspect.getsource(g.GBSpecialBase._run_replace_step)
         self.assertIn("_acc_picked[sel[accept]] = True", body)
         self.assertNotIn("_acc_picked[:] = True", body)
+
+
+class PerWalkerValveStatisticTest(unittest.TestCase):
+    """REGRESSION: the per-walker RJ valve got a ONE-BLOCK lnL with caps off.
+
+        RuntimeError: rj_fstat_search: the per-walker RJ valve received a
+        (4, 1232) cold census and a (1, 1232) lnL statistic
+
+    ``cap_stats`` is the only place a (nwalkers, nbands) cold lnL is
+    assembled on the head -- every block ships its rows and they are
+    concatenated on the walker axis. Requesting it was gated on
+    ``_band_leaf_cap is not None``, so with LEAF CAPS OFF the ranks were
+    never asked, nothing stamped the valve's stash, and
+    ``_shutoff_band_lls`` fell through to ``_cap_stats_local`` on the HEAD
+    -- a rank-local routine that returns ONE block.
+
+    Only reachable once rj_fstat_search (the single designated
+    ``leaf_cap_update`` move) completes a propose, which is why several
+    runs that died earlier in the cycle never saw it.
+    """
+
+    def _orch(self):
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        return inspect.getsource(g.GBSpecialBase._propose_orchestrated)
+
+    def test_the_valve_alone_is_enough_to_request_cap_stats(self):
+        body = self._orch()
+        self.assertIn("or self._search_shutoff_per_walker)", body)
+        self.assertNotIn(
+            "want_cap_stats = bool(\n            self._band_leaf_cap is not None "
+            "and self.leaf_cap_update)", body,
+            "the request is still gated on caps existing")
+
+    def test_caps_off_still_stashes_the_N_walker_statistic(self):
+        """The cap gate is the usual writer of the stash; with caps off it
+        does not run, so the assembled array must be stamped here."""
+        body = self._orch()
+        self.assertIn("elif cap_stats is not None and self.leaf_cap_update:",
+                      body)
+        self.assertIn('self._stage_band_lls = np.array(cap_stats["band_lls"]',
+                      body)
+
+    def test_the_cap_GATE_stays_off_when_caps_are_off(self):
+        """⚠ The fix must hand over a number, not switch the cap gate on --
+        this run has GB_LEAF_CAP_START empty on purpose."""
+        body = self._orch()
+        self.assertIn(
+            "if self._band_leaf_cap is not None and self.leaf_cap_update:",
+            body, "the cap gate's own condition must be unchanged")
+        i_gate = body.index(
+            "if self._band_leaf_cap is not None and self.leaf_cap_update:")
+        i_elif = body.index("elif cap_stats is not None")
+        self.assertLess(i_gate, i_elif, "the stash must be the ELSE branch")

@@ -25413,8 +25413,31 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             self._vertical_ladder_reset()
 
         # ---- command 3: gb_finish (write back, rebuild, close) ------------
+        # ⚠ THE PER-WALKER VALVE NEEDS THIS TOO, EVEN WITH CAPS OFF.
+        # ``cap_stats`` is the only place a (nwalkers, nbands) cold lnL is
+        # assembled on the head -- every block ships its rows and they are
+        # concatenated on the walker axis below. The per-(walker, band) RJ
+        # shutoff valve consumes exactly that array.
+        #
+        # Gating the request on ``_band_leaf_cap is not None`` meant that
+        # with LEAF CAPS OFF -- this run, GB_LEAF_CAP_START empty -- the
+        # ranks were never asked, nothing was stashed, and
+        # ``_shutoff_band_lls`` fell through to ``_cap_stats_local`` ON THE
+        # HEAD. That routine is rank-LOCAL (its docstring: "compute the
+        # block and hand the head the pieces"), so on the head it returns
+        # ONE block: a (1, nbands) statistic against a (nwalkers, nbands)
+        # valve, which is the shape check that killed the run:
+        #
+        #   RuntimeError: rj_fstat_search: the per-walker RJ valve received
+        #   a (4, 1232) cold census and a (1, 1232) lnL statistic
+        #
+        # Only reachable once rj_fstat_search -- the single designated
+        # ``leaf_cap_update`` move -- completes a propose, which is why it
+        # survived several runs that died earlier in the cycle.
         want_cap_stats = bool(
-            self._band_leaf_cap is not None and self.leaf_cap_update)
+            self.leaf_cap_update
+            and (self._band_leaf_cap is not None
+                 or self._search_shutoff_per_walker))
 
         def _payload_finish(rank, w0, w1):
             payload = _common(rank, w0, w1)
@@ -25613,6 +25636,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # on every propose -- there is no neutral-block skip any more.
             self._update_band_leaf_caps(
                 model, new_state, band_counts, precomputed=cap_stats)
+        elif cap_stats is not None and self.leaf_cap_update:
+            # CAPS OFF: the gate above is the usual writer of the valve's
+            # stash, so with no caps nothing stamps it and the valve would
+            # re-derive the statistic head-locally and get one block. Stash
+            # the assembled N-walker array here instead. The cap gate
+            # itself stays OFF -- this only hands over a number that was
+            # already computed and shipped.
+            self._stage_band_lls = np.array(cap_stats["band_lls"], copy=True)
+            self._stage_band_lls_stamp = int(
+                getattr(self, "num_proposals", 0))
 
         # The per-(walker, band) search stage rides the SAME ownership rule
         # as the caps (``leaf_cap_update`` = the one designated updater per
