@@ -1275,27 +1275,35 @@ export GB_INMODEL_CONVERGE_STOP_FRAC=0.5
 # 2040 CARRIED rows. Price it from the [GB_IMCONV] generation count, not from
 # a single 73-repeat figure.
 export GB_INMODEL_CONVERGE_REFILL=1
-# NEWBORN ONLY -- and mature survivors are NOT unpolished as a result.
+# BOTH CLASSES. User ruling 2026-09-25, final form: "What I want is RJ
+# moves to have their sources run to convergence (in the search) whether
+# they are birthed or survived."
 #
-# User ruling 2026-09-25: "Sources that make it through the RJ proposals
-# without getting removed should also run to convergence just like the
-# births", clarified the same day: "I mean the purely in model only moves
-# with group convergence."
+# A pooled row is MATURE when it was alive at pick and survived the RJ
+# step -- it was judged for death and KEPT. Under "newborn" those rows took
+# the flat GB_INMODEL_REPEATS_SURVIVOR budget (50) while newborns
+# converged, so a source that had just proved it was worth keeping got the
+# LEAST polish in the pool. Both classes now run the window (250) /
+# ceiling (20000) rule and stop on their own evidence.
 #
-# So a survivor's convergence is the GROUP rule, not this one. The cycle
-# puts a pure in-model slot immediately after every RJ move --
-# rj_warm_search -> in_model, rj_fstat_search -> in_model_fstat,
-# rj_replace -> in_model_replace -- and each runs to sub-band convergence
-# ([GB_IMGROUP], per (walker, band)) over EVERY live source, survivors
-# included. That is where they get mixed up and converged.
+# ⚠ TWO SCOPES, BOTH WANTED -- this is the distinction I got wrong twice.
+#   * THIS knob is the per-ROW rule inside an RJ move's own pool. It is
+#     what the ruling above is about.
+#   * The pure in-model slots (in_model / in_model_fstat /
+#     in_model_replace) that follow each RJ move converge per SUB-BAND via
+#     the GROUP rule ([GB_IMGROUP]). That is the "let the in model moves
+#     mix them up" half, it is a different scope, and it is untouched --
+#     _run_in_model_repeats is not passed a converge state on that path.
+#   Arming "mature" here therefore does NOT change the in_model* budgets.
 #
-# ⚠ This knob is the per-ROW rule inside an RJ move's own pool, a
-# different scope. Adding "mature" here was briefly committed (e6552f4e)
-# on a misreading and is reverted: it would have run every survivor to a
-# 20000-repeat ceiling inside the RJ move as well, duplicating work the
-# following in-model slot does anyway, and mature rows are the bulk of the
-# pool once the search has found most of the catalogue.
-export GB_INMODEL_CONVERGE_CLASSES=newborn
+# ⚠ COST -- the largest single increase in this batch. Newborns are a
+# minority of the pool; mature rows are the bulk once the search has found
+# most of the catalogue. Bounded by the same two mechanisms as newborns:
+# the stop is evidence-based, and GB_INMODEL_CONVERGE_STOP_FRAC=0.5 ends a
+# block once half the gated rows are done. Watch [GB_IMCONV ... mature]:
+# a high "at floor" fraction means mature rows plateau immediately and the
+# convergence is buying them nothing.
+export GB_INMODEL_CONVERGE_CLASSES=newborn,mature
 
 # ===========================================================================
 # V9-6: IN-GROUP CONVERGENCE FOR THE PURELY IN-MODEL PROPOSALS

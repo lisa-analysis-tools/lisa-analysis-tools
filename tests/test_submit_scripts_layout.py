@@ -118,10 +118,13 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         # 100 -> 250 (user, 2026-09-25, "just to be safe" for births).
         self.assertEqual(self.v9["GB_INMODEL_CONVERGE_ITERS"], "250")
         self.assertEqual(self.v9["GB_INMODEL_CONVERGE_DLL"], "4.0")
-        # NEWBORN only. A survivor's convergence is the GROUP rule in the
-        # pure in-model slot that follows every RJ move, not this per-row
-        # rule inside the RJ pool (user clarification 2026-09-25).
-        self.assertEqual(self.v9["GB_INMODEL_CONVERGE_CLASSES"], "newborn")
+        # BOTH. "RJ moves [should] have their sources run to convergence
+        # (in the search) whether they are birthed or survived" (user,
+        # 2026-09-25). This is the per-ROW rule in the RJ pool; the pure
+        # in-model slots converge per SUB-BAND via the GROUP rule and are
+        # a separate scope, untouched by this knob.
+        self.assertEqual(
+            self.v9["GB_INMODEL_CONVERGE_CLASSES"], "newborn,mature")
 
     def test_the_row_ceiling_leaves_room_ABOVE_the_patience_floor(self):
         """⚠ The floor is W+1: a row cannot retire before the window is
