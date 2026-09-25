@@ -3256,6 +3256,13 @@ if [ "${SLURM_NNODES:-1}" -gt 1 ]; then
   # mpiexec branch below so an odd/manual allocation still launches the
   # head+compute+saver shape instead of dying on an unset var under `set -u`.
   export I_MPI_HYDRA_BOOTSTRAP=slurm I_MPI_FABRICS=shm:ofi FI_PROVIDER=tcp
+  # ⚠ Makes `-ppn 1` actually bind. Without it hydra honours SLURM's
+  # PER-NODE TASK COUNTS over -ppn, and at 5 tasks over 2 nodes the 3/2
+  # block split puts three compute ranks on a 2-GPU node -- build_layout
+  # then refuses outright. At 3 tasks the placements coincide, which is why
+  # this went unnoticed until a 5-task launch. See the v9 script for the
+  # full account; pinned across every -ppn launcher by MpiPlacementTest.
+  export I_MPI_JOB_RESPECT_PROCESS_PLACEMENT=0
   mpiexec -n "${SLURM_NTASKS:-3}" -ppn 1 python scripts/fstat_proposal/run_combined_staged.py
 else
   mpiexec -n "${SLURM_NTASKS:-3}" python scripts/fstat_proposal/run_combined_staged.py

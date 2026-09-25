@@ -391,6 +391,9 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             "MIDIT_CHECKPOINT", "MIDIT_CHECKPOINT_MIN_INTERVAL",
             # the offline 3mo galfor start point
             "GALFOR_START_PARAMS",
+            # f0-adaptive stage-B sky grid (the F-stat fix, 2026-09-24)
+            "FSTAT_STAGEB_SKY_ADAPT", "FSTAT_STAGEB_NSKY_MIN",
+            "FSTAT_STAGEB_NSKY_MAX", "FSTAT_STAGEB_GROUP_MAX_GB",
         }
         drift = {
             k: (self.v8.get(k), self.v9.get(k))
@@ -401,6 +404,45 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             and k not in allowed
         }
         self.assertEqual(drift, {}, f"undeclared v8 -> v9 drift: {drift}")
+
+
+class MpiPlacementTest(unittest.TestCase):
+    """⚠ EVERY script that launches `-ppn 1` must also export
+    I_MPI_JOB_RESPECT_PROCESS_PLACEMENT=0, or the placement silently reverts
+    to SLURM's per-node block split.
+
+    This is a LAUNCH BLOCKER, not a tuning knob. At 5 tasks over 2 nodes --
+    the v9 4-GPU shape, 4 compute + 1 saver -- SLURM's 3/2 split puts three
+    compute ranks on a 2-GPU node and build_layout refuses outright. At 3
+    tasks the two placements coincide, which is exactly why it went unnoticed
+    until a 5-task launch, and why it is pinned here rather than left to the
+    next person to rediscover.
+
+    Found 2026-09-24: the fix lived on an UNMERGED branch, so neither v9 nor
+    v8-on-dev carried it.
+    """
+
+    def test_every_ppn_launcher_sets_placement_respect_off(self):
+        import glob
+
+        checked = 0
+        for path in glob.glob(os.path.join(
+                ROOT, "scripts", "fstat_proposal", "submit_gf_*.sh")):
+            src = open(path).read()
+            if "-ppn 1" not in src:
+                continue
+            checked += 1
+            self.assertIn(
+                "export I_MPI_JOB_RESPECT_PROCESS_PLACEMENT=0", src,
+                f"{os.path.basename(path)} launches `-ppn 1` without the "
+                f"placement export; a 5-task 2-node run would be refused by "
+                f"build_layout")
+        self.assertGreater(checked, 0, "no -ppn launcher found to check")
+
+    def test_the_v9_launcher_is_one_of_them(self):
+        src = open(SIX_MO_V9).read()
+        self.assertIn("-ppn 1", src)
+        self.assertIn("export I_MPI_JOB_RESPECT_PROCESS_PLACEMENT=0", src)
 
 
 class V9RankLayoutTest(unittest.TestCase):
