@@ -1149,3 +1149,93 @@ class ColumnAtomicStagingTest(unittest.TestCase):
         sc, _ = self._sched(3)          # one column is NT=4 cells
         self.assertFalse(sc.column_atomic)
         self.assertEqual(sc.n_slots, 3)
+
+    def test_no_cells_at_all_falls_back_instead_of_raising(self):
+        """``n_cells == 0`` makes the boolean mask shorter than
+        ``_is_new``; the per-cell path already stages zero slots."""
+        from lisatools.globalfit.moves.gbbands import BandScheduler
+
+        sc = BandScheduler(np.zeros(0, dtype=int), n_subbands=8, xp=np,
+                           cell_order="band", nwalkers=self.NW)
+        self.assertFalse(sc.column_atomic)
+        self.assertEqual(sc.n_slots, 0)
+
+
+def _cupy_like_bincount(x, weights=None, minlength=0):
+    """``numpy.bincount`` with CuPy's zero-size behaviour.
+
+    CuPy evaluates ``int(cupy.max(x)) + 1`` before it consults
+    ``minlength``, so an empty input raises there while NumPy returns the
+    all-zero histogram of length ``minlength``.
+    """
+    if np.asarray(x).shape[0] == 0:
+        raise ValueError("zero-size array to reduction operation "
+                         "CUPY_CUB_MAX which has no identity")
+    return _REAL_BINCOUNT(x, weights=weights, minlength=minlength)
+
+
+_REAL_BINCOUNT = np.bincount
+
+
+class ColumnCensusEmptyBincountTest(ColumnAtomicStagingTest):
+    """The column census must survive a zero-size selection (job 625).
+
+    The column-atomic census takes two ``bincount``s over boolean
+    selections of the slot table, and BOTH go empty in ordinary
+    operation. On GPU that is fatal::
+
+        ValueError: zero-size array to reduction operation
+                    CUPY_CUB_MAX which has no identity
+
+    WHY A PLAIN NUMPY TEST CANNOT BE THE CONTROL: ``numpy.bincount([])``
+    returns zeros quite happily, so the suite above passes with OR
+    without the guard -- it has no teeth against this bug, which is
+    exactly how the defect reached production. This class re-runs every
+    staging assertion of its parent with ``numpy.bincount`` patched to
+    CuPy's semantics, and ``test_the_control_is_armed`` proves the patch
+    really does reproduce the production error.
+
+    Zeros are the right answer for an empty selection: ``_col_ready`` is
+    then all-False and ``advance()`` takes its ``n_finished == 0`` early
+    return.
+    """
+
+    def setUp(self):
+        p = mock.patch("numpy.bincount", _cupy_like_bincount)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_the_control_is_armed(self):
+        """Without this, every other test here is vacuous."""
+        with self.assertRaises(ValueError) as cm:
+            np.bincount(np.zeros(0, dtype=int), minlength=4)
+        self.assertIn("CUPY_CUB_MAX", str(cm.exception))
+        # ...and a NON-empty bincount is still the real thing.
+        np.testing.assert_array_equal(
+            np.bincount(np.asarray([0, 2, 2]), minlength=4), [1, 0, 2, 0])
+
+    def test_nothing_finished_yet(self):
+        """Call site two: ``_act & finished`` is empty on any pass where
+        no slot finished -- the normal state early in a round."""
+        sc, _ = self._sched(12)
+        self.assertTrue(sc.column_atomic)
+        fill, spec = sc.advance()          # no record_picks first
+        self.assertEqual(int(fill.shape[0]), 0)
+        self.assertEqual(int(spec.shape[0]), 0)
+        self.assertTrue(sc.any_active(), "nothing should have retired")
+
+    def test_drained_scheduler(self):
+        """Call site one, the shape job 625 actually hit: every column
+        retired with nothing left to stage, so ``_act`` itself is empty."""
+        sc, _ = self._sched(12)
+        for _ in range(500):
+            if not sc.any_active():
+                break
+            sc.record_picks(sc.active_slot_specials)
+            sc.advance()
+        self.assertFalse(sc.any_active())
+        fill, spec = sc.advance()          # the call that raised
+        self.assertEqual(int(fill.shape[0]), 0)
+        self.assertEqual(int(spec.shape[0]), 0)
+        self.assertEqual(int(sc.cell_run.sum()), int(sc.cell_counts.sum()),
+                         "the guard must not cost us any staged work")
