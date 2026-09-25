@@ -4084,24 +4084,29 @@ if [ "${SLURM_NNODES:-1}" -gt 1 ]; then
   # mpiexec branch below so an odd/manual allocation still launches the
   # head+compute+saver shape instead of dying on an unset var under `set -u`.
   export I_MPI_HYDRA_BOOTSTRAP=slurm I_MPI_FABRICS=shm:ofi FI_PROVIDER=tcp
-  # ⚠⚠ THIS EXPORT IS WHAT MAKES `-ppn 1` ABOVE ACTUALLY BIND, and without it
-  # THE v9 SHAPE DOES NOT LAUNCH. With the SLURM bootstrap, hydra otherwise
-  # honours the scheduler's PER-NODE TASK COUNTS over -ppn. At 3 tasks over 2
-  # nodes the two placements happen to agree, which is why the earlier gate
-  # never caught it. At FIVE tasks over two nodes -- exactly this script at
-  # NGPUS=4, 4 compute + 1 saver -- SLURM's block split is 3/2, so node A
-  # gets compute ranks 0,1,2 and build_layout REFUSES with "3 compute ranks
-  # but the per-node GPU pool [0, 1] supports at most 2".
+  # Makes `-ppn 1` above actually bind: with the SLURM bootstrap, hydra
+  # otherwise honours the scheduler's PER-NODE TASK COUNTS over -ppn. With
+  # placement respect OFF the round robin is A,B,A,B,A -- two compute ranks
+  # per 2-GPU node, which is what the walker-block layout wants.
   #
-  # With placement respect OFF the round robin is A,B,A,B,A: node A takes
-  # compute 0, compute 2 and the saver; node B takes compute 1 and 3 -- two
-  # compute ranks per 2-GPU node, which is what the walker-block layout
-  # wants. Verified by GF_LAYOUT_DRY_RUN on a live allocation before the
-  # first successful 4-GPU relaunch (2026-09-18).
+  # ⚠ NOT REQUIRED ON THIS SCRIPT'S NORMAL PATH, and I first recorded it as a
+  # launch blocker in error (corrected 2026-09-24 by the rank-layout session,
+  # with hardware corroboration). The self-dispatch block above passes
+  # --distribution=cyclic whenever _NODES > 1, and cyclic already lands 5
+  # tasks over 2 nodes as A:{0,2,4} B:{1,3} -- node A takes compute 0,
+  # compute 2 and the SAVER, i.e. two compute ranks against a 2-GPU pool.
+  # Pin or no pin, the placement is identical. The discriminator: v8's own
+  # 1yr 4-GPU script never carried the pin and has launched fine.
   #
-  # It reached the v8 scripts on the one-walker-replicas branch, which sat
-  # UNMERGED until 2026-09-24 -- so this script, copied from v8 before that
-  # merge, was missing it entirely.
+  # WHERE IT IS GENUINELY REQUIRED: any path that SKIPS the dispatch block
+  # and therefore gets no --distribution=cyclic -- a manual
+  # `sbatch --nodes=2 --ntasks=5 <script>` (the script's own comments flag
+  # that case), and the INTERACTIVE allocation, where --ntasks-per-node=3
+  # forces three tasks onto node A and -ppn 1 has to override it. That is
+  # the 2026-09-18 failure the one-walker-replicas note describes.
+  #
+  # Kept as free insurance: identical placement under cyclic, correct
+  # placement without it.
   export I_MPI_JOB_RESPECT_PROCESS_PLACEMENT=0
   mpiexec -n "${SLURM_NTASKS:-3}" -ppn 1 python scripts/fstat_proposal/run_combined_staged.py
 else
