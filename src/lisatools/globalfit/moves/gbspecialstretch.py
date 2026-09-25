@@ -14629,9 +14629,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         A VERTICAL swap partner pair: same walker, same sub-band, adjacent
         temperatures. Same walker is what makes the swap free -- every
         buffer fill index map addresses the parent ACA by WALKER, never by
-        temperature (``gbbands.py:3756/3765/3808/3818``), so the two cells
-        read a bit-identical data slab and the post-swap likelihoods are
-        the pre-swap ones exchanged.
+        temperature (``_get_fill_buffer_ind_map``, ``gbbands.py:5429/5438/
+        5481/5491``, where column 1 of ``unique_band_combos`` is the walker;
+        the window origin ``buffer_start_index`` depends only on the band),
+        so the two cells read a bit-identical data slab and the post-swap
+        likelihoods are the pre-swap ones exchanged.
+
+        ⚠ ONLY PICKED ROWS PAIR HERE. ``t_i/w_i/b_i`` are the block's picked
+        rows, so a rung that holds an UNPICKED source, or none at all, can
+        never be a partner -- even though it has a perfectly well-defined
+        total cell likelihood and the accept path
+        (``exchange_cell_labels_batch``) is already cell-based. Lifting that
+        is designed in
+        ``docs/superpowers/specs/2026-09-25-vertical-swap-all-rungs-design.md``;
+        read the two landmines there before touching this.
 
         Serial-within-band guarantees at most one picked row per cell, so a
         given (t, w, b) appears at most once and each row joins at most one
