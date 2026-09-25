@@ -1161,6 +1161,130 @@ class ColumnAtomicStagingTest(unittest.TestCase):
         self.assertEqual(sc.n_slots, 0)
 
 
+class AllRungPairsTest(unittest.TestCase):
+    """Vertical pairs over EVERY rung, not just the picked rows.
+
+    User ruling 2026-09-25: "swapping across all rungs at each 25 repeat
+    batch regardless of how many sources are in each sub-band and
+    regardless if a source/band is picked or not". ``_vertical_pairs``
+    keys on the block's picked rows, so an unpicked or empty rung can
+    never be a partner; ``_vert_all_rung_pairs`` enumerates the ladder.
+
+    Design + audit: docs/superpowers/specs/
+    2026-09-25-vertical-swap-all-rungs-design.md
+    """
+
+    NT = 8
+
+    def _tables(self, occ_rows, carrier_rows):
+        occ = np.asarray(occ_rows, dtype=bool)
+        car = np.asarray(carrier_rows, dtype=np.int64)
+        return car, occ
+
+    def _pairs(self, occ_rows, carrier_rows, parity):
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            _vert_all_rung_pairs)
+        car, occ = self._tables(occ_rows, carrier_rows)
+        ci, tc, th = _vert_all_rung_pairs(car, occ, parity, self.NT, np)
+        return list(zip(ci.tolist(), tc.tolist(), th.tolist()))
+
+    def test_occupied_against_EMPTY_is_kept(self):
+        """The whole point: a lone source can now swap with the empty
+        rung above it, which is the eviction route that does not exist
+        today."""
+        occ = [[True] + [False] * 7]
+        car = [[0] + [-1] * 7]
+        self.assertIn((0, 0, 1), self._pairs(occ, car, 0))
+
+    def test_empty_against_empty_is_DROPPED(self):
+        occ = [[True] + [False] * 7]
+        car = [[0] + [-1] * 7]
+        got = self._pairs(occ, car, 0)
+        self.assertEqual(got, [(0, 0, 1)],
+                         "only the occupied-vs-empty pair may survive")
+
+    def test_why_dropping_empty_pairs_is_load_bearing(self):
+        """THE CONTROL for hazard 2. Two empty rungs have identical L, so
+        paccept is exactly 0.0 -- and the sweep's accept test is
+        ``paccept >= log(u)`` with log(u) <= 0, i.e. ALWAYS TRUE. Left in,
+        every such pair is counted proposed AND accepted into the arrays
+        _adapt_band_temps consumes, so a sparse column at ntemps=24 would
+        contribute ~20 always-accept pairs against 1-3 real ones and
+        collapse the band's ladder."""
+        L_empty_a = L_empty_b = -1234.5
+        b_cold, b_hot = 1.0, 0.5
+        paccept = (b_cold - b_hot) * (L_empty_a - L_empty_b)
+        self.assertEqual(paccept, 0.0)
+        rng = np.random.default_rng(0)
+        u = rng.random(4096)
+        self.assertTrue(np.all(paccept >= np.log(u)),
+                        "an empty-vs-empty pair is unconditionally accepted")
+
+    def test_pairs_are_disjoint(self):
+        """``exchange_cell_labels_batch`` requires each cell in at most
+        one pair; a duplicate silently half-applies the relabel because
+        GB_INDEX_ASSERTS is off in production."""
+        rng = np.random.default_rng(3)
+        occ = rng.random((5, self.NT)) < 0.5
+        car = np.full((5, self.NT), -1, dtype=np.int64)
+        for parity in (0, 1):
+            seen = set()
+            for ci, tc, th in self._pairs(occ, car, parity):
+                for t in (tc, th):
+                    self.assertNotIn((ci, t), seen, "rung in two pairs")
+                    seen.add((ci, t))
+
+    def test_two_parities_cover_every_adjacent_rung(self):
+        occ = [[True] * self.NT]
+        car = [[-1] * self.NT]
+        got = set(self._pairs(occ, car, 0)) | set(self._pairs(occ, car, 1))
+        self.assertEqual(
+            got, {(0, t, t + 1) for t in range(self.NT - 1)})
+
+    def test_a_fully_empty_column_yields_nothing(self):
+        occ = [[False] * self.NT]
+        car = [[-1] * self.NT]
+        self.assertEqual(self._pairs(occ, car, 0), [])
+        self.assertEqual(self._pairs(occ, car, 1), [])
+
+    def test_L_uses_live_values_for_carriers_and_cache_otherwise(self):
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            _vert_all_rung_L)
+        car = np.array([[0, -1, 1, -1]], dtype=np.int64)
+        cached = np.array([[np.nan, -10.0, np.nan, -20.0]])
+        base = np.array([100.0, 200.0])
+        ll_ref = np.array([1.0, 2.0])
+        ci = np.array([0, 0, 0, 0])
+        t = np.array([0, 1, 2, 3])
+        got = _vert_all_rung_L(car, cached, base, ll_ref, ci, t, np)
+        np.testing.assert_allclose(got, [101.0, -10.0, 202.0, -20.0])
+
+    def test_L_never_reads_the_cache_where_a_carrier_exists(self):
+        """Cache entries under a carrier are deliberately NaN in the test
+        above; if the selection were inverted the result would be NaN."""
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            _vert_all_rung_L)
+        car = np.array([[0]], dtype=np.int64)
+        got = _vert_all_rung_L(car, np.array([[np.nan]]), np.array([5.0]),
+                               np.array([0.5]), np.array([0]),
+                               np.array([0]), np)
+        self.assertFalse(np.isnan(got).any())
+        np.testing.assert_allclose(got, [5.5])
+
+    def test_the_eviction_sign_is_right(self):
+        """Occupied cold rung vs empty hot rung reduces to
+        paccept = -(b_cold - b_hot) * ll_ref, so a HARMFUL leaf is pushed
+        hot and a good one stays cold."""
+        b_cold, b_hot = 1.0, 0.4
+        base = -500.0
+        for ll_ref, expect_evict in ((-3.0, True), (+3.0, False)):
+            L_cold = base + ll_ref
+            L_hot = base                      # empty rung: same bare slab
+            paccept = (b_cold - b_hot) * (L_hot - L_cold)
+            self.assertEqual(paccept > 0, expect_evict,
+                             f"ll_ref={ll_ref} evicted={paccept > 0}")
+
+
 def _cupy_like_bincount(x, weights=None, minlength=0):
     """``numpy.bincount`` with CuPy's zero-size behaviour.
 

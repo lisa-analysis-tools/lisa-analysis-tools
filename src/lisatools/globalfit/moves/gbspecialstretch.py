@@ -2243,6 +2243,68 @@ def _column_atomic_newborn(pool, xp, num_bands):
     return out
 
 
+def _vert_all_rung_pairs(carrier, occupied, parity, ntemps, xp):
+    """Cell-level vertical swap pairs over EVERY rung of a column.
+
+    User ruling 2026-09-25: "swapping across all rungs ... regardless of
+    how many sources are in each sub-band and regardless if a source/band
+    is picked or not". :meth:`GBSpecialBase._vertical_pairs` can only pair
+    PICKED rows; this enumerates the ladder itself, so a rung holding an
+    unpicked source -- or none at all -- is a partner like any other.
+
+    ``carrier`` / ``occupied`` are ``(n_cols, ntemps)``: the block row
+    index carrying each rung (``-1`` = no picked row) and whether the rung
+    holds any alive source. Returns ``(col_idx, t_cold, t_hot)``.
+
+    ⚠ EMPTY<->EMPTY PAIRS ARE DROPPED, and that is not an optimization.
+    Two empty rungs of one column have identical whole-cell likelihoods,
+    so ``paccept == 0.0``, and the sweep's ``acc = paccept >= log(u)`` with
+    ``log u <= 0`` makes such a pair UNCONDITIONALLY ACCEPTED. Those
+    accepts feed ``prop_by_bandrung_dev`` / ``acc_by_bandrung_dev`` and
+    hence ``_adapt_band_temps``, so at ntemps=24 a sparsely occupied
+    column would contribute ~20 always-accept pairs against 1-3 real ones
+    and drive the band's measured acceptance to ~1 -- collapsing its
+    ladder. Same failure already documented for GB_TEMPER_COMPACT_ROWS.
+    Dropping them is exact: there is nothing to relabel, so
+    ``exchange_cell_labels_batch`` would match zero rows either way.
+
+    Disjointness (the contract ``exchange_cell_labels_batch`` requires):
+    one parity of ``t_cold`` yields pairs (p, p+1), (p+2, p+3), ... so a
+    rung is in at most one pair, and columns are distinct by construction.
+    """
+    n_pair = max((int(ntemps) - 1 - int(parity) + 1) // 2, 0)
+    n_cols = int(carrier.shape[0])
+    if n_pair <= 0 or n_cols == 0:
+        z = xp.zeros(0, dtype=xp.int64)
+        return z, z, z
+    t_cold = xp.arange(int(parity), int(ntemps) - 1, 2, dtype=xp.int64)
+    ci = xp.repeat(xp.arange(n_cols, dtype=xp.int64), t_cold.shape[0])
+    tc = xp.tile(t_cold, n_cols)
+    th = tc + 1
+    keep = occupied[ci, tc] | occupied[ci, th]
+    return ci[keep], tc[keep], th[keep]
+
+
+def _vert_all_rung_L(carrier, cached, cell_ll_base, ll_ref, ci, t, xp):
+    """Whole-cell likelihood of rung ``t`` of column ``ci``.
+
+    A rung carrying a picked row is scored LIVE (``cell_ll_base + ll_ref``
+    -- the same quantity the picked-row sweep uses, which moves as the
+    repeats proceed); any other rung is scored from the block-constant
+    ``cached`` total. ``cached`` is authoritative only where
+    ``carrier < 0``; the two are kept in step by permuting BOTH on an
+    accepted swap.
+    """
+    c = carrier[ci, t]
+    live = c >= 0
+    out = xp.asarray(cached[ci, t]).astype(xp.float64).copy()
+    if bool(live.any()):
+        cl = c[live]
+        out[live] = (xp.asarray(cell_ll_base)[cl].astype(xp.float64)
+                     + xp.asarray(ll_ref)[cl].astype(xp.float64))
+    return out
+
+
 def _converge_column_spans(pool, num_bands):
     """``[(col_id, start, stop), ...]`` for a COLUMN-ORDERED pool.
 
