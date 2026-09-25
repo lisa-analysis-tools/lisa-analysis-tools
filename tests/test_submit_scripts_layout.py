@@ -99,10 +99,14 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         self.assertEqual(self.v9["COARSE_GPU_MODE"], "off")
 
     def test_the_other_coarse_knobs_still_match_v8(self):
-        """They select nothing at mode=off, but the stamped noise identity
-        and the preflight's "wanted" values are read from the same env --
-        dropping them would let those two disagree."""
-        for k in ("COARSE_Q", "COARSE_USE_WS", "COARSE_FIDUCIAL"):
+        """``COARSE_Q`` deliberately does NOT match v8 any more -- see
+        :meth:`test_v9_runs_the_EXACT_FINE_noise_likelihood` and job 618.
+        This test used to include it, on the same false premise the script
+        comment carried ("they select nothing at mode=off"), which is how
+        an illegal pair shipped. The two that really are inert stay pinned:
+        dropping them would let the stamped noise identity and the
+        preflight's "wanted" values disagree."""
+        for k in ("COARSE_USE_WS", "COARSE_FIDUCIAL"):
             self.assertEqual(self.v9[k], self.v8[k], k)
 
     # -- V9-1: per-source in-model convergence --------------------------
@@ -312,6 +316,45 @@ class SixMonthV9DeltaTest(unittest.TestCase):
                       src)
         self.assertIn('if [ "${_n_h5}" = "1" ]; then', src)
 
+    def test_the_shipped_COARSE_pair_PASSES_the_real_validator(self):
+        """REGRESSION, job 618 (2026-09-25): all 5 ranks aborted at build
+        with ``coarse_Q > 1 in an all-source run requires an explicit
+        COARSE_GPU_MODE``.
+
+        The script shipped COARSE_Q=8 with COARSE_GPU_MODE=off on the
+        written-down belief that "with mode=off they select nothing". They
+        do not: ``run.py`` reads ``coarse_Q`` on its own and builds the
+        coarse basis for any Q > 1 without consulting the mode.
+
+        Asserting the two VALUES would only re-state the fix. This runs the
+        actual function that rejected the job, so the pair is checked by
+        the rule itself and a future edit to either knob is caught here
+        rather than on the cluster.
+        """
+        from lisatools.globalfit.stock.erebor.noise import (
+            validate_coarse_settings)
+
+        class _GS:
+            pass
+
+        gs = _GS()
+        gs.coarse_Q = int(self.v9["COARSE_Q"])
+        gs.coarse_gpu_mode = self.v9["COARSE_GPU_MODE"]
+        gs.coarse_fiducial = self.v9["COARSE_FIDUCIAL"]
+        gs.gpus = [0, 1]
+        validate_coarse_settings(gs, all_source=True)   # must not raise
+
+    def test_v9_runs_the_EXACT_FINE_noise_likelihood(self):
+        """V9-2 ruling, restated 2026-09-25: "We want the general psd
+        computations for galfor and psd. Not the coarse version." Q=1 IS
+        that configuration -- there is nothing to coarsen."""
+        self.assertEqual(self.v9["COARSE_Q"], "1")
+        self.assertEqual(self.v9["COARSE_GPU_MODE"], "off")
+        # ...and v8, which this file is rebased on, ran the OTHER legal
+        # pair. Pinned so the delta stays deliberate and visible.
+        self.assertEqual(self.v8["COARSE_Q"], "8")
+        self.assertEqual(self.v8["COARSE_GPU_MODE"], "delayed_acceptance")
+
     def test_the_noise_pin_output_is_PARSED_never_evald(self):
         """REGRESSION, job 617 (2026-09-25):
 
@@ -446,7 +489,10 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         """The whole point of a copy-with-deltas: any OTHER knob that
         drifted is either an unrecorded change or a bad merge."""
         allowed = {
-            "COARSE_GPU_MODE",                      # V9-2
+            # V9-2. COARSE_Q joined this list on 2026-09-25: it is not an
+            # extra change but the OTHER HALF of the same one -- mode=off
+            # with Q=8 is the illegal pair that aborted job 618.
+            "COARSE_GPU_MODE", "COARSE_Q",
             "STORE_DIR", "FILE_STORE_DIR",          # V9-3
             "GB_LEAF_CAP_START", "GB_CAP_DRIFT_GATE",
             "GB_CAP_DRIFT_GATE_EDGE_LEAK", "GB_SEARCH_CAP_QUIESCENT",

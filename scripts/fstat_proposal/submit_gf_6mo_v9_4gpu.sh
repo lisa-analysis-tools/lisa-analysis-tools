@@ -771,12 +771,32 @@ echo "[V8-NOISE] modulation=${GALFOR_MODULATION_PATH} t0=${GALFOR_MODULATION_T0}
 # resumed under this line -- the [V8-NOISE] preflight below and run.py both
 # refuse the mismatch by design. STORE_DIR is a fresh v9 path for this reason.
 #
-# COARSE_Q / COARSE_USE_WS / COARSE_FIDUCIAL are left exported so the stamped
-# identity and the preflight's "wanted" values are read from the same env and
-# cannot disagree with each other; with mode=off they select nothing.
-# To go back to the v8 configuration: COARSE_GPU_MODE=delayed_acceptance
-# (and a store that was created under it).
-export COARSE_Q=8
+# ⚠ COARSE_Q MUST BE 1 HERE, AND "8 + mode=off" WAS NOT A NO-OP.
+# JOB 618 (2026-09-25) aborted all 5 ranks at build:
+#
+#   ValueError: coarse_Q > 1 in an all-source run requires an explicit
+#   COARSE_GPU_MODE ('search_approx' for optimization stages,
+#   'delayed_acceptance' for production PE): the coarse statistic changes
+#   the PSD/GALFOR transition kernel, so it is never an implicit speed knob
+#   here.   [stock/erebor/noise.py::validate_coarse_settings]
+#
+# This comment used to claim COARSE_Q could stay at 8 "so the stamped
+# identity and the preflight's wanted values are read from the same env",
+# because "with mode=off they select nothing". THAT WAS WRONG, and the
+# validator exists to catch precisely it: run.py:1607 reads coarse_Q on its
+# own -- `Q = int(getattr(general_info, "coarse_Q", 1) or 1)` -- and builds
+# the coarse basis for ANY Q > 1 without consulting the mode at all. So the
+# pair (Q=8, mode=off) is not "exact fine with a documentary 8"; it is two
+# subsystems disagreeing, which is why it is refused rather than resolved.
+#
+# Q=1 IS the exact-fine configuration V9-2 asked for -- there is nothing to
+# coarsen -- and it is what "the general psd computations for galfor and
+# psd, not the coarse version" (user, 2026-09-25) means in this file.
+# ⚠ all_sources.py defaults COARSE_Q to 8, so this export must be explicit.
+# To go back to the v8 configuration: COARSE_Q=8 AND
+# COARSE_GPU_MODE=delayed_acceptance together (and a store created under
+# that pair -- the mode is part of noise_model_identity).
+export COARSE_Q=1
 export COARSE_GPU_MODE=off
 export COARSE_USE_WS=1
 export COARSE_FIDUCIAL=injection
