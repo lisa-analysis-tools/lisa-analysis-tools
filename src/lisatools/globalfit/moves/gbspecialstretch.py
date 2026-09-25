@@ -2709,6 +2709,42 @@ class _InModelConvergeState:
             self.thresh / max(self.window, 1), floor,
         )
 
+        # ---- THE CEILING TRIPWIRE --------------------------------------
+        # At GB_INMODEL_CONVERGE_MAX=20000 the ceiling is no longer a cost
+        # bound, it is a tripwire (user ruling 2026-09-25). The measured
+        # need is p50 260 / p90 400 repeats at W=100, so a row reaching
+        # 20000 has run ~50x the p90 without its accumulated accepted
+        # delta_ll ever going 250 repeats without a new best. That is not
+        # "needs a bigger budget" -- it is a row whose gain never flattens,
+        # which means either the THRESHOLD is too tight for this data or
+        # the row is not converging at all (a hot rung that slipped the
+        # ladder gate, or a source oscillating between modes).
+        # Warned per (move, class) block, not per row, so a pathological
+        # block says so once and loudly.
+        _n_cap = int(capd.sum())
+        if _n_cap:
+            _B = str(getattr(self, "branch_name", "gb")).upper()
+            logger.warning(
+                "\n"
+                "########################################################\n"
+                "##  [GB_IMCONV %s] %s: %d ROW(S) HIT THE %d-REPEAT     \n"
+                "##  CEILING (%.1f%% of the block).                      \n"
+                "##                                                      \n"
+                "##  The CEILING ended these rows, not the evidence. At  \n"
+                "##  this size that is a tripwire, not a budget: the     \n"
+                "##  measured need is p50 260 / p90 400 repeats, so these\n"
+                "##  rows ran ~50x the p90 without ever going %d repeats \n"
+                "##  without a new best accumulated delta_ll.            \n"
+                "##                                                      \n"
+                "##  DO NOT just raise it again. Look at %s_INMODEL_     \n"
+                "##  CONVERGE_DLL (threshold too tight -> nothing ever   \n"
+                "##  counts as flat) and at whether these rows are on    \n"
+                "##  gated rungs at all -- a hot rung random-walks and    \n"
+                "##  its running max creeps forever by construction.     \n"
+                "########################################################",
+                name, cls_name, _n_cap, self.max_repeats,
+                100.0 * capd.mean(), self.window, _B)
+
         # ---- LINE 2: THE CALIBRATION LINE ------------------------------
         # The one readout that says whether the rule MEANS anything. Two
         # degenerate outcomes look identical in the repeat percentiles

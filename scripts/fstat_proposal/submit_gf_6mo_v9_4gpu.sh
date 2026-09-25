@@ -1222,7 +1222,16 @@ export GB_INMODEL_CONVERGE_DLL=4.0
 # 2026-09-25: "make the ceiling much larger than 1000 honestly if it is
 # still adding logL").
 #
-# ⚠ WHY 5000 IS NOT A COST BLOWUP. The ceiling is a BACKSTOP, not the
+# 5000 -> 20000 (user, 2026-09-25). At this size the ceiling stops being
+# a budget and becomes a TRIPWIRE: the measured need is p50 260 / p90 400
+# repeats, so a row reaching 20000 has run ~50x the p90 without its
+# accumulated accepted delta_ll ever going W=250 repeats without a new
+# best. A new loud [GB_IMCONV] warning fires whenever ANY row hits it --
+# and says not to raise it again, because at that point the suspect is the
+# THRESHOLD (DLL) or a row that is not converging at all (a hot rung that
+# slipped the ladder gate, a source oscillating between modes).
+#
+# ⚠ WHY THIS IS NOT A COST BLOWUP. The ceiling is a BACKSTOP, not the
 # primary control. Two other things stop a block first:
 #   * the convergence rule itself -- 94% of gated rows retired on evidence
 #     at W=100, not on the cap;
@@ -1232,7 +1241,7 @@ export GB_INMODEL_CONVERGE_DLL=4.0
 # and raising it buys exactly the rows that are still paying. If the
 # [GB_IMCONV] ceiling fraction climbs anyway, the thing to move is the
 # THRESHOLD (GB_INMODEL_CONVERGE_DLL), not this.
-export GB_INMODEL_CONVERGE_MAX=5000
+export GB_INMODEL_CONVERGE_MAX=20000
 # LADDER GATE: only the COLDEST half of the 24 rungs is tested, frozen, and
 # allowed to hold a block open; hotter rungs keep sampling (they are the
 # transport that feeds the cold rungs) and are reported "released".
