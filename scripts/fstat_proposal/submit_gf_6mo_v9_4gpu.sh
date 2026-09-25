@@ -1209,20 +1209,30 @@ export GB_INMODEL_CONVERGE_ITERS=250
 # gate, but see the warning above -- same threshold, different clock.
 export GB_INMODEL_CONVERGE_DLL=4.0
 # Per-row ceiling. 0 would mean 4x the class budget = 400, which is now
-# WRONG: with W=250 the floor alone is 251, so a 400 ceiling leaves a row
-# only 149 repeats in which to plateau. At W=100 just 3-4% hit the ceiling;
-# at W=250 against a 400 cap most of the distribution would, and the
-# ceiling -- not the evidence -- would be deciding when a birth stops.
-# 1000 keeps the original 4x-the-window ratio.
+# WRONG twice over: with W=250 the floor alone is 251, and 400 caps rows
+# that are still climbing hard.
 #
-# ⚠ COST. This is the worst case per newborn row, and it is 2.5x the old
-# one. What makes it affordable is the serial-within-band freeze restored
-# on the direct-batch path: a cell now pools ONE source per propose, so the
-# newborn population being polished is much smaller than the run that
-# measured 0.76-0.99x duplicate leaves. Watch the [GB_IMCONV] "at floor"
-# and ceiling fractions on the first iteration; if the ceiling fraction is
-# large the threshold (DLL), not the ceiling, is the thing to move.
-export GB_INMODEL_CONVERGE_MAX=1000
+# THE EVIDENCE FOR GOING BIG (job 620 calibration, per rank):
+#   lnL gained per row p10/p50/p90 = -12.80 / 21.57 / 222.53, max 1323.1
+#   and on another rank max 4988.0
+#   at the 400-repeat ceiling: 3.4-4.2% of rows
+# The p90 of 222 and those maxima are rows still buying hundreds to
+# thousands of lnL when the cap cut them off. Capping a row that is still
+# adding logL is the one thing this knob should never do (user ruling
+# 2026-09-25: "make the ceiling much larger than 1000 honestly if it is
+# still adding logL").
+#
+# ⚠ WHY 5000 IS NOT A COST BLOWUP. The ceiling is a BACKSTOP, not the
+# primary control. Two other things stop a block first:
+#   * the convergence rule itself -- 94% of gated rows retired on evidence
+#     at W=100, not on the cap;
+#   * GB_INMODEL_CONVERGE_STOP_FRAC=0.5 ends the whole block once half the
+#     GATED rows have converged, and un-retired rows are released with it.
+# So the ceiling only binds inside a block that is already running long,
+# and raising it buys exactly the rows that are still paying. If the
+# [GB_IMCONV] ceiling fraction climbs anyway, the thing to move is the
+# THRESHOLD (GB_INMODEL_CONVERGE_DLL), not this.
+export GB_INMODEL_CONVERGE_MAX=5000
 # LADDER GATE: only the COLDEST half of the 24 rungs is tested, frozen, and
 # allowed to hold a block open; hotter rungs keep sampling (they are the
 # transport that feeds the cold rungs) and are reported "released".
