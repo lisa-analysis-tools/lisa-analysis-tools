@@ -206,6 +206,85 @@ class FullCompositionTest(unittest.TestCase):
         self.assertIn("noise_joint_search_1", by["gb_search_3"])
         self.assertIn("noise_joint_search_2", by["gb_search_3"])
 
+    def test_the_other_sources_run_LAST_in_every_search_stage(self):
+        """User ruling 2026-09-25: "change the order of the moves so the
+        'other sources' become the last moves of the gb search sequences."
+
+        WHY IT IS WORTH PINNING. Measured on job 620 iteration 1, the source
+        block was sobbh 144 s + mbh 262 s + emri 1266 s = ~28 min BEFORE a
+        single GB move ran. Last means (a) the sources are updated against
+        the freshly-improved GB model, (b) a spot preemption throws away the
+        source block rather than the GB cycle plus its comb scan.
+        """
+        fit = self._full(PSD_START_PARAMS="1.5e-11,3e-15",
+                         GALFOR_START_PARAMS="1e-44,1e-3,1.5,5e-4,5e-4")
+        for st in fit.recipe.stages[:3]:
+            names = _names(st)
+            srcs = [n for n in names if n in
+                    ("sobbh_pe", "mbh_pe", "emri_pe")]
+            self.assertTrue(srcs, f"{st.name}: no source moves to order")
+            self.assertEqual(
+                names[-len(srcs):], srcs,
+                f"{st.name}: the source moves are not the final entries")
+            # ...and strictly after every GB cycle slot.
+            last_gb = max(i for i, n in enumerate(names)
+                          if n.startswith(("rj_", "in_model")))
+            self.assertLess(last_gb, names.index(srcs[0]), st.name)
+
+    def test_stage_3_converges_the_noise_after_EVERY_rj_proposal(self):
+        """User ruling 2026-09-25: "For GB search 3 we also need to add
+        noise_search (psd and foreground) after each rj proposal to
+        convergence ... as we try to remove the last bit of sources."
+
+        ⚠ ``noise_joint_search_1`` sits before ``rj_fstat_search`` rather
+        than immediately after ``rj_warm_search``: it doubles as the
+        fresh-noise pass the F-stat grid FIT reads, and that placement is
+        load-bearing. It still separates the two RJ proposals, so every RJ
+        slot is followed by a convergence before the next one.
+        """
+        fit = self._full(PSD_START_PARAMS="1.5e-11,3e-15",
+                         GALFOR_START_PARAMS="1e-44,1e-3,1.5,5e-4,5e-4")
+        names = _names(
+            next(s for s in fit.recipe.stages if s.name == "gb_search_3"))
+        rj = [i for i, n in enumerate(names) if n.startswith("rj_")]
+        noise = [i for i, n in enumerate(names)
+                 if n.startswith("noise_joint_search")]
+        self.assertEqual(len(rj), 4, names)
+        self.assertEqual(len(noise), 4, names)
+        # Every RJ proposal has a noise convergence before the NEXT one
+        # (or before the end of the cycle, for the last).
+        for k, i in enumerate(rj):
+            nxt = rj[k + 1] if k + 1 < len(rj) else len(names)
+            self.assertTrue(
+                any(i < j < nxt for j in noise),
+                f"no noise convergence between {names[i]} and "
+                f"{names[nxt] if nxt < len(names) else 'the end'}")
+
+    def test_the_interleaved_noise_slots_are_DISTINCT_objects(self):
+        """JointMaxLogLSearch carries its own plateau state. Two slots
+        sharing one instance would pool their convergence and the second
+        would inherit the first's already-flat verdict -- it would look
+        like it ran and do nothing."""
+        fit = self._full(PSD_START_PARAMS="1.5e-11,3e-15",
+                         GALFOR_START_PARAMS="1e-44,1e-3,1.5,5e-4,5e-4")
+        st = next(s for s in fit.recipe.stages if s.name == "gb_search_3")
+        noise = [m for m in st.moves
+                 if m.name.startswith("noise_joint_search")]
+        self.assertEqual(len(noise), 4)
+        self.assertEqual(len({id(m) for m in noise}), 4)
+        self.assertEqual(len({m.name for m in noise}), 4)
+
+    def test_stages_1_and_2_get_NO_interleaved_noise(self):
+        """They do not sample the noise, so every interleaved list is empty
+        there -- the new slots must not leak into them."""
+        fit = self._full(PSD_START_PARAMS="1.5e-11,3e-15",
+                         GALFOR_START_PARAMS="1e-44,1e-3,1.5,5e-4,5e-4")
+        by = {s.name: _names(s) for s in fit.recipe.stages}
+        for s in ("gb_search_1", "gb_search_2"):
+            self.assertEqual(
+                [n for n in by[s] if n.startswith("noise_joint_search")],
+                [], s)
+
     def test_vgb_keeps_sampling_in_the_fixed_noise_stages(self):
         """The VGBs are 55 KNOWN sources and have nothing to do with the
         noise model -- freezing them alongside it would leave their power in

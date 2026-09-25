@@ -870,8 +870,18 @@ def build_fit():
         "noise_joint_search_1", list(_noise_names), branch="psd")]
     noise_only_2 = [JointMaxLogLSearch(
         "noise_joint_search_2", list(_noise_names), branch="psd")]
+    # _3 / _4 ride AFTER rj_replace and AFTER rj_prior_removal in
+    # gb_search_3 (user ruling 2026-09-25: "add noise_search (psd and
+    # foreground) after each rj proposal to convergence ... as we try to
+    # remove the last bit of sources"). _3 was defined and never used until
+    # then. One object per SLOT, never a shared instance: JointMaxLogLSearch
+    # carries its own plateau state, so two slots sharing one object would
+    # pool their convergence and the second would inherit the first's
+    # already-flat verdict.
     noise_only_3 = [JointMaxLogLSearch(
         "noise_joint_search_3", list(_noise_names), branch="psd")]
+    noise_only_4 = [JointMaxLogLSearch(
+        "noise_joint_search_4", list(_noise_names), branch="psd")]
     noise_vgb = [JointMaxLogLSearch(
         "noise_vgb_joint_search",
         _noise_names + (["vgb_pe"] if _has_vgb else []),
@@ -1133,23 +1143,81 @@ def build_fit():
                   else ([Move("vgb_pe", branch="vgb")] if _has_vgb else []))
         _noise_pre = noise_only_1 if sample_noise else []
         _noise_post = noise_only_2 if sample_noise else []
+        # NOISE TO CONVERGENCE AFTER EVERY RJ PROPOSAL (user ruling
+        # 2026-09-25, gb_search_3 only -- it is the one stage that SAMPLES
+        # the noise). With the cycle's four RJ slots that means:
+        #
+        #   rj_warm_search    -> _noise_pre   (already; it also sits right
+        #                        before the F-stat grid FIT, which is why it
+        #                        is placed there rather than immediately
+        #                        after the warm move)
+        #   rj_fstat_search   -> _noise_post  (already)
+        #   rj_replace        -> _noise_rep   NEW
+        #   rj_prior_removal  -> _noise_rem   NEW
+        #
+        # WHY, in the user's words: "when we are sampling the
+        # noise/foreground it needs to move to convergence after each
+        # proposal as we try to remove the last bit of sources." By stage 3
+        # what is left is marginal, and a stale foreground is exactly what
+        # decides whether a marginal source looks real.
+        #
+        # ⚠ COST. Each JointMaxLogLSearch riding inside gb_search measured
+        # ~6 rounds x 16 s = 93 s per GB iteration at 3mo (job 473, ~15% of
+        # the iteration). Going from two interleaved to four roughly doubles
+        # that share, and 6mo rounds are dearer than 3mo ones.
+        # GB_SEARCH_NOISE_CHECKS=1 is what keeps it affordable -- it stops at
+        # the first round that fails to improve by more than tol, so a slot
+        # whose residual barely moved pays ~2 rounds, not 6.
+        # Stages 1-2 are unaffected: they do not sample the noise, so every
+        # one of these lists is empty there.
+        _noise_rep = noise_only_3 if sample_noise else []
+        _noise_rem = noise_only_4 if sample_noise else []
         _warm = ([Move("rj_warm_search", branch="gb", every=warm_every)]
                  if warm() else [])
         return Stage(
             name=name, kind="gb_search",
+            # THE OTHER SOURCES RUN LAST (user ruling 2026-09-25). They used
+            # to lead the stage. Three reasons, in order of how much they
+            # matter:
+            #
+            #  1. GIBBS ORDERING. The GB cycle now refines against the
+            #     residual the sources left, and the sources are then updated
+            #     against the freshly-improved GB model rather than against
+            #     one a full iteration old.
+            #  2. PREEMPTION COST. Mid-iteration checkpoints sit at every
+            #     sub-move boundary, so the block that runs last is the block
+            #     a spot kill throws away. Measured on job 620 iteration 1:
+            #     sobbh 144 s + mbh 262 s + emri 1266 s = ~28 min, against a
+            #     GB cycle that had not started. Losing the sources is much
+            #     cheaper than losing the GB cycle plus a comb scan.
+            #  3. On the 1-in-10 cadence (GB_SEARCH_SOURCE_EVERY=10) nine
+            #     iterations in ten now open on GB work instead of idling
+            #     through a source block that is not even scheduled.
+            #
+            # ⚠ ONLY ``source_pe`` MOVES -- sobbh / mbh / emri. The NOISE
+            # slots stay exactly where they are: ``_noise`` leads, and
+            # ``_noise_pre`` / ``_noise_post`` BRACKET the F-stat birth move
+            # on purpose, so the grid is always fitted against a current
+            # noise level. In stages 1-2 ``_noise`` is the lone ``vgb_pe``
+            # standing in for the absent psd/galfor moves, which keeps those
+            # stages structurally parallel to stage 3's
+            # ``noise_vgb_joint_search``. Moving either would be a different
+            # and much less safe change.
             moves=(
                 _noise
-                + source_pe(gb_search_cadence=True)
                 + _warm + in_model("in_model") + _noise_pre
                 + [Move("rj_fstat_search", branch="gb")]
                 + _noise_post
                 + in_model("in_model_fstat")
                 + replace()
+                + _noise_rep
                 + in_model("in_model_replace")
                 + [Move("rj_prior_removal", branch="gb")]
+                + _noise_rem
                 + ([Move("gb_ridge_gibbs", branch="gb")]
                    if os.environ.get("GB_RIDGE_GIBBS", "1") == "1" else [])
                 + vgb_ridge()
+                + source_pe(gb_search_cadence=True)
             ),
             step_kwargs=dict(
                 plateau_branch="gb",
