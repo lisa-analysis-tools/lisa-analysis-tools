@@ -935,7 +935,15 @@ export GB_PSD_SHARED_MIRROR=1
 export GB_PSD_MIRROR_PARITY_PROPOSES=0
 
 ### SOME OTHER GB options
-export GB_OPT_SNR_LIMIT_SEARCH=5.0
+# V9-11: 5.0 -> 8.0. The opt-SNR boundary is now a PER-STAGE PROFILE value
+# (V9_SEARCH_STAGE_PROFILES in run_combined_staged.py): gb_search_1 sets 8.0,
+# gb_search_2 and gb_search_3 set 5.0, applied to every GB band move at stage
+# entry and logged as [V9-STAGE ...] opt_snr_rej_samp_limit lines.
+# This export is the value the moves are CONSTRUCTED with, i.e. what is in
+# force before the first stage profile applies, so it is set to stage 1's --
+# if the profile ever failed to apply, the run would hold stage 1's floor
+# rather than silently running stage 1 at stage 2's.
+export GB_OPT_SNR_LIMIT_SEARCH=8.0
 export GB_SEARCH_SOURCE_EVERY=10
 
 # RJ pick thinning. UNSET as of 2026-08-28 -- the value now lives in code
@@ -1254,21 +1262,111 @@ max_passes=${GB_INMODEL_GROUP_MAX_PASSES}"
 # completely normal, logs nothing unusual, and quietly behaves like v8 with
 # caps off. That is the worst possible failure: a wasted allocation that
 # produces plausible output. Refuse instead.
+#
+# ⚠ AND A PRESENCE CHECK IS NOT ENOUGH. The 2026-09-24 audit found the group
+# knobs DEAD while every symbol below existed: the resolver built the env
+# name ``GB_INMODEL_CONVERGE_GROUP*`` while this script, every docstring and
+# every log line said ``GB_INMODEL_GROUP*``. ``hasattr`` cannot see that. So
+# the second half of this preflight RESOLVES the knobs from the environment
+# this script has actually exported and refuses if a value does not come
+# back -- the only check that covers a name mismatch.
 python - <<'PYEOF' || exit 2
 import sys
 from lisatools.globalfit.moves import gbspecialstretch as g
+
 missing = [n for n in ("_InModelConvergeState", "_InModelGroupState",
-                       "_converge_stage_allows", "_converge_gate_mask")
+                       "_converge_stage_allows", "_converge_gate_mask",
+                       "_resolve_converge_knob")
            if not hasattr(g, n)]
 if missing:
     print("[V9-PREFLIGHT] REFUSING: the installed lisatools has no "
           f"in-model convergence support (missing {missing}). The "
           "GB_INMODEL_CONVERGE / GB_INMODEL_GROUP knobs this script exports "
           "would be SILENTLY IGNORED and the run would quietly be v8. "
-          "Install the branch that carries them (gb-inmodel-converge, or "
-          "dev once it has merged).")
+          "Install dev at or after the gb-inmodel-converge merge.")
     sys.exit(2)
-print("[V9-PREFLIGHT] in-model convergence support present.")
+
+# RESOLVE, do not merely probe. Each entry is (knob suffix, family, cast,
+# a default this script's exported value must DIFFER from).
+# The sentinels must be values the cast ACCEPTS (so an unset knob comes back
+# as the sentinel and is reported, rather than raising out of the cast and
+# hiding which knob was missing) and must differ from what this script sets.
+_checks = [
+    ("", "INMODEL_GROUP", g._converge_cast_refill, False),
+    ("iters", "INMODEL_GROUP", g._converge_cast_window, 999999),
+    ("dll", "INMODEL_GROUP", float, -12345.0),
+    ("scale", "INMODEL_GROUP", g._converge_cast_scale, "per_source"),
+    ("max_passes", "INMODEL_GROUP", int, 999999),
+    ("", "INMODEL_CONVERGE", g._converge_cast_mode, "off"),
+]
+bad = []
+for knob, family, cast, sentinel in _checks:
+    try:
+        got = g._resolve_converge_knob("gb", knob, None, sentinel, cast,
+                                       family=family)
+    except TypeError:
+        bad.append(f"{family}_{knob or '<master>'} (resolver has no 'family' "
+                   f"parameter -- this lisatools predates the fix)")
+        continue
+    except Exception as exc:
+        bad.append(f"GB_{family}{'_' + knob.upper() if knob else ''} "
+                   f"did not resolve: {exc!r}")
+        continue
+    if got == sentinel:
+        bad.append(f"GB_{family}{'_' + knob.upper() if knob else ''} "
+                   f"resolved to the sentinel {sentinel!r}, i.e. the "
+                   f"exported value was NOT SEEN")
+if bad:
+    print("[V9-PREFLIGHT] REFUSING: exported knobs are not reaching the "
+          "code:\n  - " + "\n  - ".join(bad))
+    sys.exit(2)
+
+# The v9 recipe restructure and its per-stage profile.
+from lisatools.globalfit import recipe as _r
+from lisatools.sampling import fstat_proposal as _fp
+_need = [("recipe.SearchStageProfileStep", hasattr(_r, "SearchStageProfileStep")),
+         ("recipe.force_fstat_refit", hasattr(_r, "force_fstat_refit")),
+         ("recipe.band_shutoff_w_armed", hasattr(_r, "band_shutoff_w_armed")),
+         ("fstat_proposal.set_peak_min_F_override",
+          hasattr(_fp, "set_peak_min_F_override")),
+         ("GBSpecialRJFStatGridMove.arm_fstat_refit",
+          hasattr(g.GBSpecialRJFStatGridMove, "arm_fstat_refit")),
+         ("Stage kind 'gb_search'", "gb_search" in _r.Stage._KINDS)]
+_absent = [n for n, ok in _need if not ok]
+if _absent:
+    print("[V9-PREFLIGHT] REFUSING: the installed lisatools has no v9 "
+          f"three-stage search support (missing {_absent}). STAGE_V9_SEARCH "
+          "would fail at composition, or worse, compose a single legacy "
+          "gb_search stage with none of the per-stage profiles applied.")
+    sys.exit(2)
+# The other two knobs that are NEW on 2026-09-24 and SILENTLY IGNORED on an
+# older install. Neither goes through _resolve_converge_knob, so the sentinel
+# pass above cannot see them; a plain source probe is enough, because both
+# are read with a literal os.environ.get at a known site.
+import inspect
+# NOTE the fancy-tempering name is built from an f-string
+# (f"{BRANCH}_RUN_FANCY_TEMPERING"), so the literal is not in the source --
+# probe the SUFFIX, which is what the f-string contains.
+_src_checks = [
+    ("_RUN_FANCY_TEMPERING", inspect.getsource(g),
+     "the permuted swaps would stay ON and the ladder would keep adapting "
+     "from them -- v9 expects them OFF with the ladder adapting from the "
+     "VERTICAL swaps instead"),
+    ("GB_REPLACE_WARM_PASS", inspect.getsource(_r),
+     "rj_replace would run SINGLE-pass (F-stat only); the warm pass the "
+     "2026-09-24 ruling asked for would silently not happen"),
+]
+_stale = [f"{n}: not read anywhere in the installed module -- {why}"
+          for n, src, why in _src_checks if n not in src]
+if _stale:
+    print("[V9-PREFLIGHT] REFUSING: knobs this script exports are not "
+          "implemented in the installed lisatools:\n  - "
+          + "\n  - ".join(_stale))
+    sys.exit(2)
+
+print("[V9-PREFLIGHT] in-model convergence + group knobs RESOLVE from the "
+      "environment; v9 stage-profile support present; "
+      "GB_RUN_FANCY_TEMPERING and GB_REPLACE_WARM_PASS are implemented.")
 PYEOF
 # WHAT TO WATCH (grep '[GB_IMGROUP]'):
 #   * "pass N: cold dlnL +X over M occupied sub-band(s); shut A (+B this
@@ -2038,7 +2136,32 @@ export GB_CAP_DEST_BAND=1
 # realized. Chain state stays correct (drift is repaired from the residual) but
 # the per-cell lnL the MH ratio prices against can be wrong by thousands of
 # nats. Re-enable only after the accounting is fixed and re-audited.
-export GB_SEARCH_RJ_REPLACE=0
+# V9-11 RE-ENABLED (user ruling 2026-09-24, reversing the 08-29 disable):
+# "clean up the replace move to modernize ... and add it to each GB search
+# 1-3 before the prior move." The accounting complaint above was raised
+# against the PRE-2026-08-24 move; that redesign replaced the unattainable
+# phase-max credit with rotation-on-accept (the scored rows ARE the final
+# rows) and made both sides exact add-deltas. The user's position is that the
+# original problems may have been the old GPU setup.
+#
+# ⚠ IT IS BEING WATCHED, NOT TRUSTED. Per pass the move now prints
+#   [GB_REPLACE rj_replace] pass i/N: candidate source = WARM|FSTAT container.
+#   [GB_REPLACE rj_replace] pass i/N (src) done: max |dlnL| ... = X
+# and WARNS above 1.0e3 -- the recorded retirement signature was a
+# propose-level drift of 1.5-1.9e3, three orders above every other move.
+# Also watch [GB_ACCEPT replace-split] (per-pass acceptance, gated counts,
+# cold-accepted dll mean/max) and [GB_ORTHO_LL rj_replace] against
+# GB_ORTHO_LL_TOL. If either fires, set GB_SEARCH_RJ_REPLACE=0 and relaunch;
+# nothing else in the cycle depends on it.
+export GB_SEARCH_RJ_REPLACE=1
+# TWO INTERNAL PASSES per propose() (user ruling 2026-09-24: "one internal
+# iteration with the refit/warmstart and one internal iteration of the
+# fstat"). Pass 1 draws replacement candidates from the warm-start mixture
+# (the SAME container object rj_warm_search births from), pass 2 from the
+# F-stat grid; each pass prices both sides of its MH ratio against its own
+# container, so the two never mix. =0 leaves replace single-pass (F-stat
+# only), which is the pre-2026-09-24 behaviour.
+export GB_REPLACE_WARM_PASS=1
 # PE replace OFF too (user ruling 2026-09-02). It was default-ON and would
 # have been the only replace flavor left; in both r2 probes it registered
 # but never exercised a single proposal, and with centering off its
@@ -2621,7 +2744,17 @@ export FSTAT_FDOT_RATIO_MAX=5.0
 # ## stamp and only WARN. Watch for "carries no peak_min_F stamp" in the    ##
 # ## log on the first resume; that line means you must clear it by hand.    ##
 # ############################################################################
-export FSTAT_PEAK_MIN_SNR=6.25
+# V9-11: 6.25 -> 8.0. Per-stage again: gb_search_1 selects peaks at SNR 8,
+# gb_search_2/3 at 6.25. ⚠ THIS ONE CANNOT BE MOVED BY AN ENV VAR MID-RUN --
+# the floor is consumed when the grid is FITTED and stamped into the stage-B
+# cache, whose loader REFUSES a mismatch. So the stage entry installs an
+# in-code override (fstat_proposal.set_peak_min_F_override) AND forces a
+# fresh-epoch refit; the old epoch stays on disk, valid and unread, and
+# NOTHING IS DELETED. Watch for:
+#   [V9-STAGE gb_search_2] F-stat peak floor -> SNR 6.250 (F 19.531)
+#   [V9-STAGE rj_fstat_search] FORCED F-stat refit: opening epoch N
+# This export is the value epoch 0 is fitted at, i.e. stage 1's.
+export FSTAT_PEAK_MIN_SNR=8.0
 # F-STAT CENTERING OFF (probe verdict 2026-09-02, 4-arm A/B, readout
 # artifact 2f5d673c): centered births are a stacking engine in BOTH test
 # bands (A_ctr multiplicity 4.33/walker on a 1-source band, 23% neg-fdot
@@ -2646,7 +2779,15 @@ export GB_RJ_FSTAT_DIST_BIRTH=0
 # unmaximized r1 arm needed ~10 iterations; low-f stayed neutral and all
 # 979 live detailed-balance traces still matched (phase max touches
 # scoring only, never the observable-basis factors).
-export GB_RJ_PHASE_MAXIMIZE=0     # birth lands on target at iteration 0
+# V9-11: 0 -> 1. Phase maximization is now a PER-STAGE PROFILE value:
+# gb_search_1 ON (hunting -- take the credit, and the r2 probes measured the
+# flagship ON TARGET at the first stored iteration with it), gb_search_2 and
+# gb_search_3 OFF. The profile sets it on the RJ moves only; the pure
+# in-model moves stay at their deliberate False (in-model scoring is at the
+# ACTUAL phase). As with the opt-SNR floor, this export is stage 1's value so
+# a profile that failed to apply would hold stage 1's configuration rather
+# than run stage 1 unmaximized.
+export GB_RJ_PHASE_MAXIMIZE=1     # birth lands on target at iteration 0
 # Amp max DEFAULTS TO FOLLOW phase_maximize -- it would silently arm with
 # the line above. User ruling: phase max only, no amp max for now.
 export GB_RJ_AMP_MAXIMIZE=0
@@ -3118,7 +3259,33 @@ export GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS-${STORE_DIR}/warmstar
 # the [WARMSTART-BUILD] lines). SOURCE_TOBS is the SOURCE store's Tobs
 # (3 months), not this run's -- the proposal container rescales to the
 # run Tobs at load.
-export GB_WARM_START_SOURCE_STORE=${GB_WARM_START_SOURCE_STORE-/shared/data/global_fit_output/gf_prod_3mo_v8_10walkers/gf_prod_3mo_testing.h5}
+# ============================================================================
+# V9-12 -- ONE SEED STORE for BOTH the warm start and the noise pin.
+#
+# USER RULING 2026-09-24: "make sure the warmstart and PSD/GB frozen start
+# point come from the same folder (3mo 10 walker noise fix). It should use
+# maxlogL for PSD/GB."
+#
+# GF_SEED_STORE is the single source. The warm-start mixture is fitted from
+# it (GB_WARM_START_SOURCE_STORE below) and the psd/galfor start pin is read
+# from its maxlogL cold walker (the V9-12 block further down). Overriding one
+# without the other is what this variable exists to prevent.
+#
+# ⚠ SET THIS to the 3mo 10-WALKER NOISE-FIX run. The default below is the
+# 10-walker science arm the rest of this file is rebased on; if the noise-fix
+# relaunch lives in a different directory, export GF_SEED_STORE at launch:
+#     GF_SEED_STORE=/shared/data/global_fit_output/<dir>/<store>.h5 \
+#         sbatch scripts/fstat_proposal/submit_gf_6mo_v9_4gpu.sh
+export GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/global_fit_output/gf_prod_3mo_v8_10walkers/gf_prod_3mo_testing.h5}
+export GB_WARM_START_SOURCE_STORE=${GB_WARM_START_SOURCE_STORE-${GF_SEED_STORE}}
+if [ "${GB_WARM_START_SOURCE_STORE}" != "${GF_SEED_STORE}" ]; then
+  echo "[V9-SEED] WARNING: GB_WARM_START_SOURCE_STORE was overridden and no"
+  echo "[V9-SEED] longer matches GF_SEED_STORE. The warm start and the noise"
+  echo "[V9-SEED] pin would then come from DIFFERENT runs, which is exactly"
+  echo "[V9-SEED] what the 2026-09-24 ruling forbids."
+  echo "[V9-SEED]   warm start: ${GB_WARM_START_SOURCE_STORE}"
+  echo "[V9-SEED]   noise pin : ${GF_SEED_STORE}"
+fi
 export GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-7776000}
 export GB_WARM_START_LAST_K=${GB_WARM_START_LAST_K:-10}
 if [ -n "${GB_WARM_START_COMPONENTS}" ] && [ ! -f "${GB_WARM_START_COMPONENTS}" ]; then
@@ -3153,6 +3320,114 @@ export GB_WARM_START_FLOOR_EPS=${GB_WARM_START_FLOOR_EPS:-0.05}
 # minimal-image charge (no DB requirement). 0 would restore minimal
 # image on the PE side too -- never do that in a real PE run.
 export GB_WARM_START_CIRC_IMAGES=${GB_WARM_START_CIRC_IMAGES:-3}
+
+# ============================================================================
+# V9-12 (cont.) -- THE NOISE START PIN, from GF_SEED_STORE's maxlogL point.
+#
+# WHY IT IS MANDATORY FOR v9 AND WAS NOT FOR v8. The v9 recipe's first two
+# search stages DO NOT SAMPLE THE NOISE MODEL -- "fixed noise" is simply the
+# absence of the psd/galfor moves from those stages. psd and galfor are the
+# only sampled branches with no start-coordinate path in run.py, so without a
+# pin their chains begin at a PRIOR DRAW and the whole of gb_search_1 and
+# gb_search_2 would hunt GBs against a random noise level.
+#
+# The values are PHYSICAL/LINEAR. run.py converts them into whatever basis
+# THIS run samples in (psd ln, galfor log10 on amp/fk/f_1/f_2, alpha linear),
+# which is why the interchange format is physical: this run exports
+# GALFOR_LOG_SAMPLING=1 and the source run's basis may differ. The extractor
+# detects the SOURCE basis from the values themselves -- every log-sampled
+# column is strictly positive under its physical prior, so a value <= 0 can
+# only be a log -- and refuses rather than emitting an absurd pin.
+#
+# It ALSO decides the noise stages: with every sampled noise branch pinned,
+# run_combined_staged.py drops noise_search / noise_vgb_search (there is
+# nothing for a convergence-gated burn-in to find). STAGE_FORCE_NOISE_SEARCH=1
+# runs them anyway; leaving the pin unset keeps them, and the driver says
+# which it chose.
+#
+# ⚠ ON FAILURE THIS FALLS BACK, IT DOES NOT ABORT -- but LOUDLY. The
+# fallback ("no pin, so run the noise stages") is not a degraded
+# configuration, it is exactly what v8 ran for months: the noise stages fit
+# psd+galfor to convergence and gb_search_1/2 then freeze them at THAT point
+# instead of at the previous run's. Aborting a 2-node on-demand allocation
+# over it would be the worse outcome.
+#
+# The realistic failure is a seed store from an OLDER galfor
+# PARAMETERIZATION. Measured 2026-09-24 against a v7 store: its galfor
+# columns came back f_1 ~ 2e5, f_2 ~ 4e3 against the current prior range
+# 1e-5..1e-2 -- a different model, not a different basis. The extractor's
+# physical-window check caught it and refused, which is the whole point: a
+# pin from that store would have started the run at a foreground nothing in
+# the current model can represent.
+#
+# Export V9_PIN_REQUIRED=1 to make a failed pin FATAL instead.
+if [ -z "${PSD_START_PARAMS+x}" ] && [ -f "${GF_SEED_STORE}" ]; then
+  if _pin=$(python -m lisatools.globalfit.warmstart.noise_pin \
+              --store "${GF_SEED_STORE}" --export); then
+    eval "${_pin}"
+  else
+    echo "[V9-SEED] ############################################################"
+    echo "[V9-SEED] # NO NOISE PIN: could not extract one from"
+    echo "[V9-SEED] #   ${GF_SEED_STORE}"
+    echo "[V9-SEED] # (see the [NOISE-PIN] line above for the exact reason --"
+    echo "[V9-SEED] #  an out-of-window value means that store predates the"
+    echo "[V9-SEED] #  current galfor parameterization.)"
+    echo "[V9-SEED] #"
+    echo "[V9-SEED] # FALLING BACK: noise_search / noise_vgb_search WILL RUN"
+    echo "[V9-SEED] # and fit psd+galfor from scratch; gb_search_1/2 then"
+    echo "[V9-SEED] # freeze them at THAT converged point. This is correct and"
+    echo "[V9-SEED] # is what v8 did -- it just costs the noise burn-in."
+    echo "[V9-SEED] #"
+    echo "[V9-SEED] # To pin instead: point GF_SEED_STORE at a store written"
+    echo "[V9-SEED] # with the current galfor model, or set PSD_START_PARAMS /"
+    echo "[V9-SEED] # GALFOR_START_PARAMS by hand (PHYSICAL/linear units)."
+    echo "[V9-SEED] # V9_PIN_REQUIRED=1 makes this fatal instead."
+    echo "[V9-SEED] ############################################################"
+    if [ "${V9_PIN_REQUIRED:-0}" = "1" ]; then
+      echo "[V9-SEED] V9_PIN_REQUIRED=1 -- refusing to launch without a pin."
+      exit 2
+    fi
+  fi
+  unset _pin
+elif [ ! -f "${GF_SEED_STORE}" ]; then
+  echo "[V9-SEED] GF_SEED_STORE=${GF_SEED_STORE} not found -- no noise pin."
+  echo "[V9-SEED] noise_search / noise_vgb_search will run and fit it."
+fi
+echo "[V9-SEED] store=${GF_SEED_STORE}"
+echo "[V9-SEED] PSD_START_PARAMS=${PSD_START_PARAMS:-<unset: noise stages will run>}"
+echo "[V9-SEED] GALFOR_START_PARAMS=${GALFOR_START_PARAMS:-<unset>}"
+
+# ============================================================================
+# V9-11 -- THE THREE-STAGE GB SEARCH (user spec 2026-09-24).
+#
+# One gb_search stage becomes gb_search_1 / _2 / _3, each running the cycle
+#
+#   rj_warm_search -> in_model -> rj_fstat_search -> in_model_fstat
+#     -> rj_replace -> in_model_replace -> rj_prior_removal
+#
+# The cycle ENDS on the removal judge (user amendment 2026-09-24): every
+# birth and every swap gets a full in-model refinement pass before it is
+# judged for death, so nothing is ever deleted at coordinates it has not
+# been given a chance to walk away from. Each in-model slot is named for
+# the RJ move it polishes; watch [GF_TIMING] move=in_model* for their cost.
+#
+# and differing only in noise (fixed / fixed / sampled), phase max (on / off /
+# off), opt SNR (8 / 5 / 5) and F-stat peak floor (8 / 6.25 / 6.25). The three
+# knob values live in V9_SEARCH_STAGE_PROFILES in run_combined_staged.py, are
+# applied to the shared move objects at stage entry, and every mutation
+# prints a [V9-STAGE] line. =0 restores the single legacy stage.
+export STAGE_V9_SEARCH=1
+# A stage ENDS when the cold-chain nleaves plateau AND every OCCUPIED
+# (walker, band) pair has shut off (GB_SEARCH_BAND_SHUTOFF_PER_WALKER, armed
+# below). Empty pairs can never shut off -- "all pairs" is unreachable -- so
+# the plateau gate is composed IN rather than replaced, and covers them.
+# Watch: "[V9-STAGE gb_search_1] nleaves plateau reached but N occupied
+# (walker, band) pair(s) have NOT shut off -- holding the stage open."
+#
+# Warm start every 5th iteration in STAGE 3 only (user ruling 2026-09-24): by
+# then the previous run's posterior has been mined, and each hit is expensive.
+# Stages 1-2 run it every iteration.
+export GB_SEARCH_3_WARM_EVERY=5
 
 # ============================================================================
 # CHANGE 3 OF 3 vs 3mo_v8 -- MBHB + EMRI + SOBHB (campaign S6). Non-empty

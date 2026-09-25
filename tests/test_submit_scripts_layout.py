@@ -232,6 +232,56 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         self.assertIn("--job-name=gf6mo_v9_4gpu", src)
         self.assertNotIn("gf6mo_v8_%j.log", src)
 
+    # -- V9-11: the three-stage GB search --------------------------------
+    def test_the_three_stage_search_is_armed(self):
+        """One gb_search stage becomes gb_search_1/2/3. Without this the
+        driver composes the single legacy stage and EVERY per-stage profile
+        -- phase max, opt SNR, the F-stat peak floor -- silently never
+        applies, while the script's own header claims all three."""
+        self.assertEqual(self.v9["STAGE_V9_SEARCH"], "1")
+        self.assertNotIn("STAGE_V9_SEARCH", self.v8)
+
+    def test_the_stage1_values_are_what_the_moves_are_BUILT_with(self):
+        """phase max / opt SNR / peak floor are per-stage PROFILE values
+        now, applied at stage entry. These exports are what is in force
+        BEFORE the first profile applies, so they must be stage 1's: if a
+        profile ever failed to apply, the run would hold stage 1's
+        configuration rather than silently run stage 1 as stage 2."""
+        self.assertEqual(self.v9["GB_RJ_PHASE_MAXIMIZE"], "1")
+        self.assertEqual(self.v9["GB_OPT_SNR_LIMIT_SEARCH"], "8.0")
+        self.assertEqual(self.v9["FSTAT_PEAK_MIN_SNR"], "8.0")
+
+    def test_stage_3_warm_start_rides_a_cadence(self):
+        """User ruling 2026-09-24: warm start every 5th iteration in
+        gb_search_3 only."""
+        self.assertEqual(self.v9["GB_SEARCH_3_WARM_EVERY"], "5")
+
+    def test_rj_replace_is_back_and_two_pass(self):
+        """Reversing the 2026-08-29 disable, with the logging to tell
+        "working" from "misbehaving the way it used to"."""
+        self.assertEqual(self.v9["GB_SEARCH_RJ_REPLACE"], "1")
+        self.assertEqual(self.v9["GB_REPLACE_WARM_PASS"], "1")
+        self.assertEqual(self.v8["GB_SEARCH_RJ_REPLACE"], "0")
+        # PE is explicitly NOT part of the reinstatement.
+        self.assertEqual(self.v9["GB_PE_RJ_REPLACE"], "0")
+
+    # -- V9-12: one seed store for the warm start AND the noise pin -------
+    def test_the_warm_start_and_the_noise_pin_share_one_store(self):
+        """User ruling 2026-09-24: "make sure the warmstart and PSD/GB
+        frozen start point come from the same folder ... It should use
+        maxlogL for PSD/GB." One variable, so overriding one without the
+        other is not something a launch can do by accident."""
+        src = open(SIX_MO_V9).read()
+        self.assertIn("export GF_SEED_STORE=", src)
+        self.assertIn("GB_WARM_START_SOURCE_STORE-${GF_SEED_STORE}", src)
+        self.assertIn("lisatools.globalfit.warmstart.noise_pin", src)
+
+    def test_the_noise_pin_is_read_at_MAXLOGL(self):
+        """noise_pin reads best_logl_noise, i.e. the best-logL cold walker
+        of the last valid row -- not a posterior mean."""
+        src = open(SIX_MO_V9).read()
+        self.assertIn("maxlogL", src)
+
     def test_everything_else_is_still_v8(self):
         """The whole point of a copy-with-deltas: any OTHER knob that
         drifted is either an unrecorded change or a bad merge."""
@@ -248,6 +298,13 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             "GB_SEARCH_BAND_SHUTOFF_CONV_ITER",     # V9-9
             "GB_SEARCH_STAGE_PER_WALKER",           # V9-9
             "GB_FSTAT_REFIT_EVERY_PE",              # V9-10
+            # V9-11, the three-stage search restructure
+            "STAGE_V9_SEARCH", "GB_SEARCH_3_WARM_EVERY",
+            "GB_SEARCH_RJ_REPLACE", "GB_REPLACE_WARM_PASS",
+            "GB_RJ_PHASE_MAXIMIZE", "GB_OPT_SNR_LIMIT_SEARCH",
+            "FSTAT_PEAK_MIN_SNR",
+            # V9-12, the shared seed store + noise pin
+            "GF_SEED_STORE", "GB_WARM_START_SOURCE_STORE",
         }
         drift = {
             k: (self.v8.get(k), self.v9.get(k))
