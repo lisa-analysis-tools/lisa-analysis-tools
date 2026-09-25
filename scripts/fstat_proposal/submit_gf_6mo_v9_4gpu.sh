@@ -1191,17 +1191,38 @@ export GB_INMODEL_CONVERGE=on
 #   export GB_INMODEL_CONVERGE=observe
 
 # W, the patience window, in UNTHINNED in-model repeats (user ruling
-# 2026-09-24, raised from 50). 100 tracks climbs out to ~300 repeats where
-# 50 gave up at 76.
-export GB_INMODEL_CONVERGE_ITERS=100
+# 2026-09-24, raised from 50; 2026-09-25 raised again 100 -> 250 "just to
+# be safe" for births). 100 tracked climbs out to ~300 repeats where 50
+# gave up at 76.
+#
+# MEASURED AT W=100 (job 620): repeats p10/p50/p90/max = 102/260/400/401,
+# only 9.7% retiring at the floor and 94% converging on evidence -- so 100
+# was NOT truncating. 250 buys margin on the tail rather than fixing a
+# known cut-off.
+#
+# ⚠ THE FLOOR MOVES WITH IT. A row cannot retire before W+1, so the floor
+# goes 101 -> 251, and the ceiling below HAS to move with it or the window
+# never gets to speak -- see the note there.
+export GB_INMODEL_CONVERGE_ITERS=250
 # The improvement threshold: D/2 = 0.5 * GB_LEAF_CAP_NDIM, the lnL a
 # genuinely new D-parameter source has to buy. Same number as the leaf cap
 # gate, but see the warning above -- same threshold, different clock.
 export GB_INMODEL_CONVERGE_DLL=4.0
-# Per-row ceiling. 0 = 4x the class budget = 400 here. This is what bounds a
-# row that never settles; the [GB_IMCONV] line reports the fraction that hit
-# it, and a large one means the threshold is too tight for this data.
-export GB_INMODEL_CONVERGE_MAX=0
+# Per-row ceiling. 0 would mean 4x the class budget = 400, which is now
+# WRONG: with W=250 the floor alone is 251, so a 400 ceiling leaves a row
+# only 149 repeats in which to plateau. At W=100 just 3-4% hit the ceiling;
+# at W=250 against a 400 cap most of the distribution would, and the
+# ceiling -- not the evidence -- would be deciding when a birth stops.
+# 1000 keeps the original 4x-the-window ratio.
+#
+# ⚠ COST. This is the worst case per newborn row, and it is 2.5x the old
+# one. What makes it affordable is the serial-within-band freeze restored
+# on the direct-batch path: a cell now pools ONE source per propose, so the
+# newborn population being polished is much smaller than the run that
+# measured 0.76-0.99x duplicate leaves. Watch the [GB_IMCONV] "at floor"
+# and ceiling fractions on the first iteration; if the ceiling fraction is
+# large the threshold (DLL), not the ceiling, is the thing to move.
+export GB_INMODEL_CONVERGE_MAX=1000
 # LADDER GATE: only the COLDEST half of the 24 rungs is tested, frozen, and
 # allowed to hold a block open; hotter rungs keep sampling (they are the
 # transport that feeds the cold rungs) and are reported "released".

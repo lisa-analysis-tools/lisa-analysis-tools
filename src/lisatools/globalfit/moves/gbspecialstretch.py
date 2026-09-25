@@ -14551,6 +14551,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """Clear the per-propose vertical ladder counts."""
         self._vert_ladder_prop = None
         self._vert_ladder_acc = None
+        # The local per-block adaptation cadence counter rides with them:
+        # left running it would make GB_TEMPER_VERT_ADAPT_EVERY count
+        # blocks across the whole RUN, so which block inside a propose
+        # takes the step would drift with the propose index.
+        self._vert_block_i = 0
 
     def _vertical_adapt_ladder(self, band_temps) -> bool:
         """Adapt the band temperature ladder from the VERTICAL swaps.
@@ -17064,11 +17069,53 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     scheduler.relabel_slots(slots, _spec_final)
             _cn = _vert_census
             self._vertical_census_flush(_cn)
-            # Bank this block's per-(band, rung) counts for the ladder
-            # adaptation. Per PROPOSE, not per block: _adapt_band_temps is
-            # a once-per-propose operation and a single block's counts are
-            # far too sparse to steer a ladder with.
+            # Bank this block's per-(band, rung) counts. The banked total is
+            # what the HEAD pools across walkers and adapts from once per
+            # propose -- that pooled step stays the AUTHORITATIVE one and is
+            # what persists into band_info.
             self._vertical_ladder_bank(_cn)
+            # ...and additionally take a LOCAL step every N blocks (user
+            # ruling 2026-09-25: "leave it at every 25 iterations" -- one
+            # block IS 25 in-model sweeps).
+            #
+            # ⚠ WHAT THIS IS AND IS NOT. It is a within-propose refinement:
+            # this rank's own walker keeps swapping against a ladder that
+            # improves as the block proceeds, instead of against the
+            # propose-start ladder for the whole move. It is NOT the
+            # authoritative ladder -- it cannot be, because a rank holds ONE
+            # walker and ``band_temps`` has no walker axis, so four ranks
+            # stepping their own copies diverge by construction. The head
+            # overwrites all four from the POOLED counts at the end of the
+            # propose, which is the "across the 4 walkers" requirement.
+            #
+            # ⚠ SPARSITY IS THE REASON THIS IS NOT PER REPEAT. Measured on
+            # job 621: ~10k swaps proposed per block against
+            # 1232 bands x 23 rung-pairs = 28,336 ladder cells, i.e. 0.35
+            # proposals per cell per BLOCK and 0.014 per REPEAT. At
+            # per-repeat cadence ~99% of the ladder would step on zero
+            # observations every time, and an all-zero ratio column drags
+            # rungs together for an absence of data rather than a
+            # measurement. GB_TEMPER_VERT_ADAPT_EVERY (blocks; 0 disables
+            # the local step entirely and leaves only the pooled one).
+            _adapt_every = int(os.environ.get(
+                "GB_TEMPER_VERT_ADAPT_EVERY", "1") or 0)
+            if _adapt_every > 0 and band_temps is not None:
+                self._vert_block_i = getattr(self, "_vert_block_i", 0) + 1
+                if self._vert_block_i % _adapt_every == 0:
+                    _bp = _cn.get("prop_by_bandrung_dev")
+                    _ba = _cn.get("acc_by_bandrung_dev")
+                    # ⚠ ``_temperature_control``, not the public property:
+                    # eryn's property dereferences the private attribute
+                    # unguarded, so on any object whose ``Move.__init__``
+                    # did not run -- every fake-based test harness -- the
+                    # public read RAISES AttributeError instead of
+                    # answering None. Same class of trap as the ctor one
+                    # that a green fake suite cannot see.
+                    _tc = getattr(self, "_temperature_control", None)
+                    if (_bp is not None and _ba is not None
+                            and _tc is not None
+                            and self.ntemps > 1 and int(_bp.sum()) > 0):
+                        self._adapt_band_temps(band_temps, _ba, _bp)
             _avail = _cn["paired"] / max(_cn["rows"], 1)
             _rate = _cn["accepted"] / max(_cn["proposed"], 1)
             # PAIR AVAILABILITY is the headline: a vertical swap needs both

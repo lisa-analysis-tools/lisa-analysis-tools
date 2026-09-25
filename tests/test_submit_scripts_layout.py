@@ -115,9 +115,27 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         self.assertIn(self.v9["GB_INMODEL_CONVERGE"], ("on", "observe"))
 
     def test_the_convergence_defaults_are_the_ruled_values(self):
-        self.assertEqual(self.v9["GB_INMODEL_CONVERGE_ITERS"], "100")
+        # 100 -> 250 (user, 2026-09-25, "just to be safe" for births).
+        self.assertEqual(self.v9["GB_INMODEL_CONVERGE_ITERS"], "250")
         self.assertEqual(self.v9["GB_INMODEL_CONVERGE_DLL"], "4.0")
         self.assertEqual(self.v9["GB_INMODEL_CONVERGE_CLASSES"], "newborn")
+
+    def test_the_row_ceiling_leaves_room_ABOVE_the_patience_floor(self):
+        """⚠ The floor is W+1: a row cannot retire before the window is
+        full. So the ceiling has to sit well above W or it, not the
+        evidence, decides when a birth stops polishing.
+
+        This is why raising ITERS alone is wrong: at W=250 the default
+        ceiling (0 = 4x the 100-repeat class budget = 400) would leave a
+        row just 149 repeats in which to plateau, against a measured p50 of
+        260 at W=100. Pinned as a RATIO so the two cannot drift apart."""
+        w = int(self.v9["GB_INMODEL_CONVERGE_ITERS"])
+        ceil = int(self.v9["GB_INMODEL_CONVERGE_MAX"])
+        self.assertGreater(ceil, 0, "0 resolves to 4x the CLASS budget, "
+                                    "which does not track the window")
+        self.assertGreaterEqual(
+            ceil, 3 * w,
+            f"ceiling {ceil} is too tight for a {w}-repeat window")
 
     def test_the_ladder_gate_is_on(self):
         """1.0 would make every rung vote, and the hot rungs never retire."""

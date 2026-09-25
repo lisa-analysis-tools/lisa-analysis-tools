@@ -1757,3 +1757,51 @@ class VerticalLadderFanoutTest(unittest.TestCase):
         body = inspect.getsource(g.GBSpecialBase._propose_orchestrated)
         self.assertIn("_ladder_adapted", body)
         self.assertIn("if not _ladder_adapted", body)
+
+
+class VerticalLadderPerBlockStepTest(unittest.TestCase):
+    """The LOCAL per-block ladder step (user: "every 25 iterations").
+
+    One in-model block IS 25 sweeps, so "every block" is that cadence.
+    This step is a within-propose refinement only -- the head still
+    overwrites every rank's ladder from the walker-POOLED counts at the end
+    of the propose, because band_temps has no walker axis.
+    """
+
+    def test_the_cadence_knob_exists_and_defaults_to_every_block(self):
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        body = inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
+        self.assertIn("GB_TEMPER_VERT_ADAPT_EVERY", body)
+        self.assertIn('"GB_TEMPER_VERT_ADAPT_EVERY", "1"', body)
+        self.assertIn("self._adapt_band_temps(band_temps, _ba, _bp)", body)
+
+    def test_it_still_banks_for_the_pooled_step(self):
+        """The local step must not REPLACE the banking -- the head's pooled
+        adaptation is the authoritative one and needs the totals."""
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        body = inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
+        i_bank = body.index("_vertical_ladder_bank(_cn)")
+        i_adapt = body.index("GB_TEMPER_VERT_ADAPT_EVERY")
+        self.assertLess(i_bank, i_adapt, "banking must precede the local step")
+
+    def test_the_block_counter_resets_per_propose(self):
+        """Left running, the cadence would count blocks across the whole RUN
+        and which block takes the step would drift with the propose index."""
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        body = inspect.getsource(g.GBSpecialBase._vertical_ladder_reset)
+        self.assertIn("self._vert_block_i = 0", body)
+
+    def test_zero_disables_the_local_step(self):
+        """0 must leave ONLY the pooled head-side adaptation, which is the
+        fallback if the local step ever looks noisy in a live run."""
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        body = inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
+        self.assertIn("if _adapt_every > 0", body)
