@@ -1335,7 +1335,7 @@ export GB_INMODEL_GROUP_SCALE=flat
 # ⚠ 50 is reasoned, not measured: the group rule was inert on the fan-out
 # path until 2026-09-25, so no run has ever produced a [GB_IMGROUP] pass
 # distribution. The first one settles this number.
-export GB_INMODEL_GROUP_MAX_PASSES=50
+export GB_INMODEL_GROUP_MAX_PASSES=1000
 echo "[V9-IMGROUP] group=${GB_INMODEL_GROUP} iters=${GB_INMODEL_GROUP_ITERS} \
 dll=${GB_INMODEL_GROUP_DLL} scale=${GB_INMODEL_GROUP_SCALE} \
 max_passes=${GB_INMODEL_GROUP_MAX_PASSES}"

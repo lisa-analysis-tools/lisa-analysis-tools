@@ -15546,15 +15546,25 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     self.name, st.passes)
                 break
             if st.passes >= st.max_passes:
+                _B = str(self.branch_name).upper()
                 logger.warning(
-                    "[GB_IMGROUP %s] group hit the %d-pass CEILING with %d "
-                    "sub-band(s) still open (%d of them occupied) -- the "
-                    "group is a cost knob, not a safety net; raise "
-                    "%s_INMODEL_GROUP_MAX_PASSES or loosen "
-                    "%s_INMODEL_GROUP_DLL if this is routine.",
-                    self.name, st.max_passes, n_open, n_occ_open,
-                    str(self.branch_name).upper(),
-                    str(self.branch_name).upper())
+                    "\n"
+                    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+                    "!!  [GB_IMGROUP %s] GROUP HIT THE %d-PASS CEILING    \n"
+                    "!!  %d sub-band(s) STILL OPEN (%d occupied).          \n"
+                    "!!                                                    \n"
+                    "!!  THE CEILING, NOT THE DATA, ENDED THIS GROUP. Those\n"
+                    "!!  sub-bands were still earning more than %s_INMODEL_\n"
+                    "!!  GROUP_DLL per pass when they were cut off, so the \n"
+                    "!!  in-model polish is being TRUNCATED mid-climb.     \n"
+                    "!!                                                    \n"
+                    "!!  At a ceiling this high the fix is almost certainly\n"
+                    "!!  NOT another raise -- it is the THRESHOLD           \n"
+                    "!!  (%s_INMODEL_GROUP_DLL) being too tight for this   \n"
+                    "!!  data, or the SCALE (flat vs per_source) making     \n"
+                    "!!  crowded bands unable to ever fall below it.        \n"
+                    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+                    self.name, st.max_passes, n_open, n_occ_open, _B, _B)
                 break
             # Bank this pass's cold delta before the next one, exactly as
             # the reseed multi-pass path does.
