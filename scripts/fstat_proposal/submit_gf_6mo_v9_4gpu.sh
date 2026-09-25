@@ -3074,7 +3074,21 @@ export GB_TEMPER_SKIP_SHUTOFF_BANDS=1
 # Epochs 0/8/9 were 13513 / 19413 / 19586 peaks, all GB-free. Under the
 # change the count should start falling, and stage-B wall time with it
 # (epoch 8 was 4054 s).
-export GB_FSTAT_REFIT_EVERY=40     # SEARCH stages: 40 ELAPSED iterations
+# 40 -> 10 (user ruling 2026-09-25, SEARCH stages only -- the PE cadence
+# below is untouched). The grid goes stale as the search subtracts what it
+# finds: every accepted birth changes the residual the peaks were fitted
+# against, so a 40-iteration-old grid is aiming births at peaks that have
+# already been claimed. That is the same staleness the [GB_ACCEPT rj-split]
+# birth-staleness ratio measures (s = d_h/h_h << 1 for a claimed peak).
+#
+# ⚠ COST: 4x the refits. What is supposed to pay for it is that each refit
+# gets CHEAPER as sources are found -- the peak list shrinks. Epochs 0/8/9
+# were 13513 / 19413 / 19586 peaks, all GB-free, and epoch 8's stage B was
+# 4054 s. If the peak count is NOT falling by the third epoch this cadence
+# is 4x a fixed 4000 s bill; check with
+#   grep '\[peaks\]' globalfit_run.log
+# before committing a long allocation. GB_FSTAT_REFIT_EVERY=40 reverts.
+export GB_FSTAT_REFIT_EVERY=10     # SEARCH stages: 10 ELAPSED iterations
 # PE-STAGE CADENCE (user ruling 2026-09-24): 250 elapsed iterations.
 # Separate from the search value because full_pe is a RANDOM_CHOICE stage --
 # the GB move is drawn roughly one iteration in N, so a search-tuned cadence

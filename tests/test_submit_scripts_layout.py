@@ -217,7 +217,13 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         """full_pe is a random_choice stage; a search-tuned cadence there
         refits far more often in wall-clock terms than the number says."""
         self.assertEqual(self.v9["GB_FSTAT_REFIT_EVERY_PE"], "250")
-        self.assertEqual(self.v9["GB_FSTAT_REFIT_EVERY"], "40")
+        # SEARCH stages refit 4x more often (user, 2026-09-25): the grid
+        # goes stale as the search subtracts what it finds, so an old grid
+        # aims births at peaks already claimed. PE is deliberately NOT
+        # changed -- the two cadences are separate knobs for that reason.
+        self.assertEqual(self.v9["GB_FSTAT_REFIT_EVERY"], "10")
+        self.assertLess(int(self.v9["GB_FSTAT_REFIT_EVERY"]),
+                        int(self.v9["GB_FSTAT_REFIT_EVERY_PE"]))
 
     # -- V9-4: cap cells off --------------------------------------------
     def test_the_leaf_cap_is_off_and_its_companions_with_it(self):
@@ -528,6 +534,7 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             "GB_SEARCH_BAND_SHUTOFF_CONV_ITER",     # V9-9
             "GB_SEARCH_STAGE_PER_WALKER",           # V9-9
             "GB_FSTAT_REFIT_EVERY_PE",              # V9-10
+            "GB_FSTAT_REFIT_EVERY",                 # V9-14 (40 -> 10)
             # V9-13 (2026-09-25): the RJ schedule itself. The rigid path
             # ran ALL RJ rounds before any polish; the staged scheduler
             # interleaves RJ round -> in-model to convergence -> refill.
