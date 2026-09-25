@@ -1805,3 +1805,49 @@ class VerticalLadderPerBlockStepTest(unittest.TestCase):
         import lisatools.globalfit.moves.gbspecialstretch as g
         body = inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
         self.assertIn("if _adapt_every > 0", body)
+
+
+class StagedFlushConvergesTest(unittest.TestCase):
+    """The staged scheduler's flush must POLISH TO CONVERGENCE.
+
+    User ruling 2026-09-25: "RJ 1 round -> in model converge -> RJ 1 round
+    -> in model converge (PE should be the same except not the in-model
+    converge)."
+
+    Before this, the two paths each had half the answer: direct-batch had
+    the convergence rule and the wrong schedule (ALL RJ rounds, then one
+    in-model phase -- ~12 rounds per propose, so a cell could accept a
+    dozen births unpolished); the staged scheduler had the right schedule
+    and a flat ``inmodel_repeats_survivor`` block with no convergence and
+    no newborn/mature split.
+    """
+
+    def _staged_src(self):
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        return inspect.getsource(g)
+
+    def test_the_flush_splits_by_class_and_passes_converge(self):
+        src = self._staged_src()
+        self.assertIn("for _cls_name, _cls in _split_by_newborn(merged, self.xp)",
+                      src)
+        self.assertIn("converge=_cv,", src)
+
+    def test_the_pool_carries_pick_time_provenance(self):
+        """_split_by_newborn needs a 'newborn' key. Without it every pooled
+        row would take the mature budget -- which is how this path came to
+        run a flat 50 repeats for newborns too."""
+        src = self._staged_src()
+        self.assertIn('held["newborn"] = (~alive_at_pick)[alive_now]', src)
+
+    def test_PE_needs_no_branch(self):
+        """PE gets the same schedule WITHOUT convergence for free: the
+        state factory refuses a PE-stage move, so _cv is None and the class
+        budget applies. A separate PE code path would be a second thing to
+        keep in sync."""
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        body = inspect.getsource(g.GBSpecialBase._converge_state_for)
+        self.assertIn("_converge_stage_allows", body)

@@ -522,6 +522,10 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             "GB_SEARCH_BAND_SHUTOFF_CONV_ITER",     # V9-9
             "GB_SEARCH_STAGE_PER_WALKER",           # V9-9
             "GB_FSTAT_REFIT_EVERY_PE",              # V9-10
+            # V9-13 (2026-09-25): the RJ schedule itself. The rigid path
+            # ran ALL RJ rounds before any polish; the staged scheduler
+            # interleaves RJ round -> in-model to convergence -> refill.
+            "GB_RJ_DIRECT_BATCH",
             # V9-11, the three-stage search restructure
             "STAGE_V9_SEARCH", "GB_SEARCH_3_WARM_EVERY",
             "GB_SEARCH_RJ_REPLACE", "GB_REPLACE_WARM_PASS",

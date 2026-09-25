@@ -8382,6 +8382,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 if picked is not None:
                     if tm is not None:
                         tm.count("picked_sources", int(len(picked["specials"])))
+                    # PICK-TIME PROVENANCE, as on the direct-batch path: a
+                    # row DEAD here that is alive after the RJ step is an
+                    # accepted birth. Without it the flush below cannot
+                    # split newborn from mature and every pooled row would
+                    # take the mature budget -- which is how this path came
+                    # to run a flat 50 repeats for everything.
+                    alive_at_pick = band_sorter.inds[picked["ids"]].copy()
                     rj_seq = self._debug_rj_select(buffer_obj, picked)
                     with _tspan(tm, "rj_step"):
                         if self.rj_replace:
@@ -8421,6 +8428,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     alive_now = self._survivor_pool_mask(alive_now, picked)
                     if bool(alive_now.any()):
                         held = {k: v[alive_now] for k, v in picked.items()}
+                        held["newborn"] = (~alive_at_pick)[alive_now]
                         pending.append(held)
                         pending_specials = self.xp.concatenate(
                             [pending_specials, held["specials"]]
@@ -8466,18 +8474,49 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                             "(temp, walker, band) cells — same-band sources "
                             "must never share an in-model block."
                         )
-                    with _tspan(tm, "inmodel_repeats"):
-                        # Scheduler (non-direct) grouped path: ONE repeat
-                        # count for the whole pool = the survivor/mature
-                        # budget (per-class partitioning lives on the
-                        # direct-batch path only; noted user trade-off).
-                        self._run_in_model_repeats(
-                            model, band_sorter, buffer_obj, band_temps,
-                            merged, ll_change_log, prop_counts, acc_counts,
-                            num_repeats=self.inmodel_repeats_survivor,
-                            cell_ll_state=cell_ll_state,
-                            scheduler=scheduler,
+                    # FLUSH = RJ ROUND -> IN-MODEL TO CONVERGENCE.
+                    #
+                    # This used to be ONE flat ``inmodel_repeats_survivor``
+                    # block for the whole pool -- "per-class partitioning
+                    # lives on the direct-batch path only" -- so newborns
+                    # got the mature budget and the convergence rule never
+                    # ran here at all. That made this path the one with the
+                    # right SCHEDULE and the wrong POLISH, while
+                    # direct-batch had the right polish and the wrong
+                    # schedule (all RJ rounds, then one in-model).
+                    #
+                    # User ruling 2026-09-25: "RJ 1 round -> in model
+                    # converge -> RJ 1 round -> in model converge (PE should
+                    # be the same except not the in-model converge)". The
+                    # PE half needs no branch: ``_converge_state_for``
+                    # already returns None on a PE-stage move, so PE gets
+                    # the same schedule with the fixed budget.
+                    #
+                    # ⚠ The per-row REFILL loop is deliberately NOT ported.
+                    # On this path refill is the SCHEDULER's job -- a cell
+                    # whose source converged retires in
+                    # ``_advance_and_refill`` and a new cell stages into its
+                    # slot -- so running ``_converge_refill_loop`` here as
+                    # well would have two owners swapping the same slots.
+                    _cls_reps = {
+                        "newborn": self.inmodel_repeats_newborn,
+                        "mature": self.inmodel_repeats_survivor,
+                    }
+                    for _cls_name, _cls in _split_by_newborn(merged, self.xp):
+                        _cv = self._converge_state_for(_cls_name)
+                        _reps = (
+                            _cls_reps[_cls_name] if _cv is None or _cv.observe
+                            else max(_cv.max_repeats, _cls_reps[_cls_name])
                         )
+                        with _tspan(tm, "inmodel_repeats"):
+                            self._run_in_model_repeats(
+                                model, band_sorter, buffer_obj, band_temps,
+                                _cls, ll_change_log, prop_counts, acc_counts,
+                                num_repeats=_reps,
+                                cell_ll_state=cell_ll_state,
+                                scheduler=scheduler,
+                                converge=_cv,
+                            )
                     n_flushes += 1
                     flush_sum += n_flushed
                     pending = []

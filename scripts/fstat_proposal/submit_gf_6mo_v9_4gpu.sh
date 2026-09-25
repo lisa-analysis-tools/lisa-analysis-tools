@@ -2526,8 +2526,34 @@ export GB_CAP_LL_CHECK=1
 export GB_RJ_GROUPED_INMODEL=1
 # ---- 2026-08-14 rj stack (ALL code defaults; pinned for the run record;
 #      each =0 reverts that piece independently) --------------------------
-export GB_RJ_DIRECT_BATCH=1        # rigid batches -> one end-of-unit in-model
-                                   # phase; =0 restores the staged scheduler
+# ⚠ 1 -> 0 (user ruling 2026-09-25). THE SCHEDULE IS THE POINT.
+#
+# =1 is the rigid-batch path: it runs ALL RJ rounds -- one source per cell
+# per round, ~12 rounds per propose measured on job 621 (360k birth
+# proposals over ~29.6k cells) -- and only then does ONE end-of-unit
+# in-model phase. So a cell could accept a dozen births with nothing
+# polished in between, which is how the 19.66822 mHz source ended up with
+# 2-3 leaves in 33 of 96 (rung, walker) cells, the extras at 0.76-0.99x
+# amplitude because they were never polished at all.
+#
+# =0 is the staged scheduler, which is the schedule the user asked for:
+#   RJ round -> survivors pool, their cells FREEZE
+#            -> flush: in-model TO CONVERGENCE on the pool
+#            -> cells UNFREEZE, completed cells retire and new bands stage
+#            -> next RJ round
+# ("RJ 1 round -> in model converge -> RJ 1 round -> in model converge",
+#  and "after each converge, you sub out bands that are wholly complete
+#  for new bands" -- the latter is _advance_and_refill, called immediately
+#  after every flush.) PE gets the same schedule WITHOUT the convergence
+#  for free: _converge_state_for returns None on a PE-stage move.
+#
+# ⚠ COST, unmeasured on this hardware: the rigid path exists because "the
+# fixed, repeating fill -> rounds -> accept shape per batch is what CUDA
+# graph capture needs". The staged scheduler's shape changes every round,
+# so graph capture is off. Watch the [GB_TIMING] rj_step / inmodel_repeats
+# split against the 621 baseline; =1 reverts.
+export GB_RJ_DIRECT_BATCH=0        # staged scheduler: RJ round -> converge
+                                   # -> refill -> RJ round; =1 = rigid batches
 # LIVE-CAP PICK OFF (user ruling 2026-08-27, snapshot-2 timing autopsy):
 # under the ALIGNED divisor-1 grid, "saturated across all K cap cells"
 # is "all 1" -- every occupied band trips it at cap 1, so the live-cap
