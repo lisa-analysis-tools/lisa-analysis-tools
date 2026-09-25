@@ -280,9 +280,38 @@ class PSDSetup(Setup):
 # sensitivity.py). Before that fix the foreground was ~1.6 decades too loud
 # per unit amp, so the sampler drove amp down to ~1e-45 and railed at the
 # floor. Three decades either side of the measured value.
+#
+# THE KNEE FLOOR IS 0.8 mHz (user ruling 2026-09-24: "set the knee frequency
+# galfor prior bounds from 0.8 mHz to 10 mHz"). ``fk`` alone among the three
+# frequency parameters keeps a 1e-5 floor no longer -- 0.01 mHz is three
+# decades below anything the confusion foreground can physically knee at,
+# and the whole lower half of that range is unphysical support the sampler
+# still had to start in and walk out of. The ceiling is unchanged: 10 mHz
+# IS the 1e-2 the paragraph above argues for, so this is a floor change
+# only.
+#
+# ⚠ WHY A FLOOR MATTERS HERE and not just as tidiness. ``run.py`` starts
+# galfor from ``priors["galfor"].rvs``, and the basis is uniform-in-log10
+# under GALFOR_LOG_SAMPLING=1 -- so with a 1e-5 floor, 1.9 of the 3 decades
+# were below 0.8 mHz: 63% of walkers started with the knee under the whole
+# analysis band and ``0.5(1 + tanh(-(f - fk)/f_2)) -> 0`` across it. That is
+# the same class of failure the f_1 ceiling caused on the two-year run,
+# approached from the other end: a large fraction of the prior mass sits
+# where the model has no shape left, and a stretch proposal does not escape
+# it. The new floor is 1.1 decades wide against the ceiling, all of it in
+# band.
+#
+# ⚠ RESUME HAZARD, and the one thing to check before reusing a store: a
+# chain already sitting below 0.8 mHz is OUTSIDE the new support, so on the
+# next launch its walkers price at ``log_prior = -inf``. Nothing in the
+# noise-model identity covers prior RANGES, so this will not be refused for
+# you -- grep a candidate store's galfor fk column before resuming it, or
+# start that branch fresh. The same applies to a noise PIN taken from such a
+# store, which ``warmstart.noise_pin`` DOES refuse, by name and with the
+# reason.
 GALFOR_PRIOR_RANGE = (
     (1e-47, 1e-41),  # amp
-    (1e-5, 1e-2),  # fk (knee)
+    (0.8e-3, 1e-2),  # fk (knee): 0.8 mHz .. 10 mHz, user ruling 2026-09-24
     (1e-3, 5.0),  # alpha
     (1e-5, 1e-2),  # f_1
     (1e-5, 1e-2),  # f_2

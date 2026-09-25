@@ -901,6 +901,72 @@ class NoisePinEndToEndTest(unittest.TestCase):
                 noise_pin_from_store(path)
 
 
+class GalforKneePriorTest(unittest.TestCase):
+    """The galfor knee prior is 0.8 mHz .. 10 mHz (user ruling 2026-09-24).
+
+    Pinned as NUMBERS, in both sampling bases, because this range is now read
+    by three independent consumers -- the prior the chain actually samples,
+    ``run.py``'s noise start-pin validation, and ``warmstart.noise_pin``'s
+    refusal -- and a silent drift between them is the failure mode the
+    2026-09-24 audit spent its time on.
+    """
+
+    def _fk(self):
+        from lisatools.globalfit.stock.erebor.noise import (
+            GALFOR_BASIS, GALFOR_PRIOR_RANGE)
+
+        return GALFOR_PRIOR_RANGE[GALFOR_BASIS.index("fk")]
+
+    def test_the_bounds_are_0p8_to_10_mHz(self):
+        lo, hi = self._fk()
+        self.assertAlmostEqual(lo * 1e3, 0.8, places=9, msg="floor != 0.8 mHz")
+        self.assertAlmostEqual(hi * 1e3, 10.0, places=9, msg="ceiling != 10 mHz")
+
+    def test_the_ceiling_was_NOT_moved(self):
+        """10 mHz IS the 1e-2 that ea7790f3 argued for on degeneracy
+        grounds -- this ruling is a FLOOR change only."""
+        self.assertEqual(self._fk()[1], 1e-2)
+
+    def test_draws_land_in_range_in_BOTH_bases(self):
+        """⚠ The log basis is where the floor actually bites: run.py starts
+        galfor from priors.rvs, and uniform-in-log10 over the old 1e-5 floor
+        put 63% of walkers below 0.8 mHz -- knee under the whole analysis
+        band, tanh factor -> 0 across it, no shape left to fit."""
+        from lisatools.globalfit.stock.erebor.noise import (
+            GALFOR_BASIS, galfor_prior_dict)
+
+        lo, hi = self._fk()
+        i = GALFOR_BASIS.index("fk")
+        lin = galfor_prior_dict(log_sampling=False)
+        d = lin[list(lin)[i]].rvs(size=5000)
+        self.assertGreaterEqual(d.min(), lo)
+        self.assertLessEqual(d.max(), hi)
+        lg = galfor_prior_dict(log_sampling=True)
+        d = lg[list(lg)[i]].rvs(size=5000)
+        self.assertGreaterEqual(10.0 ** d.min(), lo * (1 - 1e-9))
+        self.assertLessEqual(10.0 ** d.max(), hi * (1 + 1e-9))
+
+    def test_the_noise_pin_check_follows_the_prior(self):
+        """The pin reads the prior module, so this needs no second edit --
+        which is the point of having deleted the hand-rolled window."""
+        from lisatools.globalfit.warmstart.noise_pin import _check, _windows
+
+        self.assertEqual(_windows("galfor")[1], self._fk())
+        good = [1e-44, 3.0e-3, 1.6, 5.1e-4, 7.2e-4]
+        _check(good, _windows("galfor"), "GALFOR_START_PARAMS")  # no raise
+        low = list(good)
+        low[1] = 1.0e-4          # 0.1 mHz -- legal before today, not now
+        with self.assertRaises(SystemExit):
+            _check(low, _windows("galfor"), "GALFOR_START_PARAMS")
+
+    def test_alpha_is_untouched_by_the_knee_ruling(self):
+        from lisatools.globalfit.stock.erebor.noise import (
+            GALFOR_BASIS, GALFOR_PRIOR_RANGE)
+
+        self.assertEqual(GALFOR_PRIOR_RANGE[GALFOR_BASIS.index("alpha")],
+                         (1e-3, 5.0))
+
+
 class NoisePinSeedingTest(unittest.TestCase):
     """``run.py``'s side: physical env value -> sampling-basis start coords."""
 
