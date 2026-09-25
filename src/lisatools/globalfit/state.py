@@ -1622,20 +1622,38 @@ class GBState(ModuleSubState):
         self.band_info["band_swaps_proposed"] += band_swaps_proposed
         self.band_info["band_swaps_accepted"] += band_swaps_accepted
 
+    def _accumulate_into(self, key, value) -> None:
+        """``band_info[key] += value``, tolerating a host/device mismatch.
+
+        Both callers on the multi-rank fan-out path pool their counts on
+        the HOST -- the ranks ship them over MPI, so the head accumulates
+        into ``np.zeros(...)`` -- while ``band_info`` may be device
+        resident. CuPy refuses implicit host operands
+        (``TypeError: Unsupported type <class 'numpy.ndarray'>``), which is
+        what killed the ladder adaptation in job 627's rj_replace. These
+        three accumulators sit a few lines PAST that crash point on the
+        same propose, so they had never executed either. Coerce to the
+        destination's module rather than make every caller remember.
+        """
+        from lisatools.utils.utility import get_array_module
+
+        dest = self.band_info[key]
+        self.band_info[key] = dest + get_array_module(dest).asarray(value)
+
     def accumulate_proposals(self, proposed, accepted, is_rj: bool) -> None:
         """Accumulate ``(num_bands, ntemps)`` proposal/acceptance counts into
         the RJ or in-model counter family."""
         if is_rj:
-            self.band_info["band_num_proposed_rj"] += proposed
-            self.band_info["band_num_accepted_rj"] += accepted
+            self._accumulate_into("band_num_proposed_rj", proposed)
+            self._accumulate_into("band_num_accepted_rj", accepted)
         else:
-            self.band_info["band_num_proposed"] += proposed
-            self.band_info["band_num_accepted"] += accepted
+            self._accumulate_into("band_num_proposed", proposed)
+            self._accumulate_into("band_num_accepted", accepted)
 
     def accumulate_swaps(self, proposed, accepted) -> None:
         """Accumulate ``(num_bands, ntemps - 1)`` tempering swap counts."""
-        self.band_info["band_swaps_proposed"] += proposed
-        self.band_info["band_swaps_accepted"] += accepted
+        self._accumulate_into("band_swaps_proposed", proposed)
+        self._accumulate_into("band_swaps_accepted", accepted)
 
     def reset_band_counters(self):
         """Zero all per-band proposal/acceptance/swap counters."""

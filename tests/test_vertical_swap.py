@@ -1161,6 +1161,183 @@ class ColumnAtomicStagingTest(unittest.TestCase):
         self.assertEqual(sc.n_slots, 0)
 
 
+class _DeviceLike(np.ndarray):
+    """Stands in for a device array: REFUSES host operands, as CuPy does.
+
+    Plain numpy happily adds a host array to anything, so without these
+    operators the tests below pass with OR without the coercion -- which
+    is precisely how this bug reached production.
+    """
+
+    @staticmethod
+    def _check(other):
+        if isinstance(other, np.ndarray) and not isinstance(other, _DeviceLike):
+            raise TypeError("Unsupported type <class 'numpy.ndarray'>")
+
+    def __add__(self, other):
+        self._check(other)
+        return np.ndarray.__add__(self, other)
+
+    def __iadd__(self, other):
+        self._check(other)
+        return np.ndarray.__iadd__(self, other)
+
+
+class _StrictModule:
+    """numpy, except every ufunc REFUSES a host array, as CuPy does.
+
+    CuPy raises ``TypeError: Unsupported type <class 'numpy.ndarray'>``
+    for an implicit host operand. Plain numpy does not, so a numpy-only
+    test of ``_adapt_band_temps`` passes with OR without the coercion --
+    the same blind spot that let the bug reach production.
+    """
+
+    def asarray(self, x, *a, **k):
+        return np.asarray(x, *a, **k).view(_DeviceLike)
+
+    def __getattr__(self, name):
+        real = getattr(np, name)
+
+        def guarded(*args, **kwargs):
+            for x in args:
+                if isinstance(x, np.ndarray) and not isinstance(x, _DeviceLike):
+                    raise TypeError(
+                        "Unsupported type <class 'numpy.ndarray'>")
+            out = real(*args, **kwargs)
+            return out.view(_DeviceLike) if isinstance(out, np.ndarray) else out
+
+        return guarded
+
+
+class LadderAdaptHostCountsTest(unittest.TestCase):
+    """REGRESSION (job 627, the first rj_replace any job ever reached).
+
+        cp.maximum(band_swaps_proposed, 1)
+        TypeError: Unsupported type <class 'numpy.ndarray'>
+
+    BOTH orchestrated callers pool their per-(band, rung) swap counts on
+    the HOST -- the ranks ship them over MPI, so ``_propose_orchestrated``
+    builds ``np.zeros(...)`` and accumulates ``np.asarray(rep[...])`` into
+    it, for the permuted swaps at one call site and the vertical ones at
+    another. ``_adapt_band_temps`` was written in ``cp``, which is real
+    CuPy on a GPU run.
+
+    The vertical route fired first only because GB_RUN_FANCY_TEMPERING=0
+    keeps the permuted one dormant; the defect was identical there and
+    would have surfaced the moment fancy tempering was re-armed.
+    """
+
+    NB, NT = 6, 4
+
+    def _fake_move(self):
+        return SimpleNamespace(
+            time=5,
+            temperature_control=SimpleNamespace(
+                adaptation_lag=1e4, adaptation_time=100),
+            xp=np,
+        )
+
+    def _band_temps(self):
+        return np.linspace(
+            1.0, 0.1, self.NB * self.NT
+        ).reshape(self.NB, self.NT).view(_DeviceLike)
+
+    def _counts(self):
+        """Host counts with a VARYING ratio, so the ladder must move."""
+        prop = np.full((self.NB, self.NT - 1), 8, dtype=np.int64)
+        acc = np.tile(
+            np.arange(1, self.NT, dtype=np.int64), (self.NB, 1))
+        return acc, prop
+
+    def test_host_counts_are_accepted_and_the_ladder_moves(self):
+        from lisatools.globalfit.moves.gbspecialstretch import GBSpecialBase
+
+        bt = self._band_temps()
+        before = np.array(bt, copy=True)
+        acc, prop = self._counts()
+        self.assertNotIsInstance(acc, _DeviceLike, "counts must be HOST")
+        with mock.patch(
+            "lisatools.globalfit.moves.gbspecialstretch.get_array_module",
+            lambda a: _StrictModule(),
+        ), mock.patch(
+            "lisatools.globalfit.moves.gbspecialstretch.cp", _StrictModule()
+        ):
+            GBSpecialBase._adapt_band_temps(self._fake_move(), bt, acc, prop)
+        self.assertFalse(np.allclose(before, bt), "ladder did not adapt")
+
+    def test_the_strict_module_really_does_reject_host_arrays(self):
+        """Without this the test above could pass for the wrong reason."""
+        m = _StrictModule()
+        with self.assertRaises(TypeError) as cm:
+            m.maximum(np.ones(3), 1)
+        self.assertIn("Unsupported type", str(cm.exception))
+        m.maximum(m.asarray(np.ones(3)), 1)      # coerced: fine
+
+    def test_edge_rungs_stay_pinned(self):
+        from lisatools.globalfit.moves.gbspecialstretch import GBSpecialBase
+
+        bt = self._band_temps()
+        before = np.array(bt, copy=True)
+        acc, prop = self._counts()
+        with mock.patch(
+            "lisatools.globalfit.moves.gbspecialstretch.get_array_module",
+            lambda a: _StrictModule(),
+        ), mock.patch(
+            "lisatools.globalfit.moves.gbspecialstretch.cp", _StrictModule()
+        ):
+            GBSpecialBase._adapt_band_temps(self._fake_move(), bt, acc, prop)
+        np.testing.assert_allclose(before[:, 0], np.asarray(bt)[:, 0])
+        np.testing.assert_allclose(before[:, -1], np.asarray(bt)[:, -1])
+
+    def test_device_counts_still_work(self):
+        """run_tempering passes DEVICE counts; coercion must be a no-op."""
+        from lisatools.globalfit.moves.gbspecialstretch import GBSpecialBase
+
+        bt = self._band_temps()
+        before = np.array(bt, copy=True)
+        acc, prop = (x.view(_DeviceLike) for x in self._counts())
+        with mock.patch(
+            "lisatools.globalfit.moves.gbspecialstretch.get_array_module",
+            lambda a: _StrictModule(),
+        ), mock.patch(
+            "lisatools.globalfit.moves.gbspecialstretch.cp", _StrictModule()
+        ):
+            GBSpecialBase._adapt_band_temps(self._fake_move(), bt, acc, prop)
+        self.assertFalse(np.allclose(before, bt))
+
+
+class AccumulateHostCountsTest(unittest.TestCase):
+    """The same host/device mismatch, three lines further on.
+
+    ``accumulate_proposals`` / ``accumulate_swaps`` do
+    ``band_info[key] += value`` with the SAME host-pooled arrays. They sit
+    just past the ladder adaptation on the same propose, so they had never
+    executed either -- the crash always came first.
+    """
+
+    def test_accumulators_coerce_to_the_destination_module(self):
+        from lisatools.globalfit.state import GBState
+
+        holder = object.__new__(GBState)
+        holder._band_info = {
+                "band_num_proposed_rj": np.zeros((3, 2)).view(_DeviceLike),
+                "band_num_accepted_rj": np.zeros((3, 2)).view(_DeviceLike),
+                "band_swaps_proposed": np.zeros((3, 2)).view(_DeviceLike),
+                "band_swaps_accepted": np.zeros((3, 2)).view(_DeviceLike),
+        }
+        host = np.ones((3, 2))
+        with mock.patch(
+            "lisatools.utils.utility.get_array_module",
+            lambda a: _StrictModule(),
+        ):
+            holder.accumulate_proposals(host, host, is_rj=True)
+            holder.accumulate_swaps(host, host)
+        np.testing.assert_allclose(
+            np.asarray(holder.band_info["band_swaps_proposed"]), 1.0)
+        np.testing.assert_allclose(
+            np.asarray(holder.band_info["band_num_proposed_rj"]), 1.0)
+
+
 class AllRungPairsTest(unittest.TestCase):
     """Vertical pairs over EVERY rung, not just the picked rows.
 

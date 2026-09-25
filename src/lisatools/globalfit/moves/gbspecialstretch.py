@@ -17690,12 +17690,31 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """
         if self.time <= 0:
             return
+        # ---- ARRAY-MODULE COERCION (job 627, rj_replace) -----------------
+        # BOTH orchestrated callers pool their per-(band, rung) counts on
+        # the HOST: the ranks ship them over MPI, so ``_propose_orchestrated``
+        # builds ``np.zeros(...)`` and accumulates ``np.asarray(rep[...])``
+        # into it -- for the permuted swaps AND for the vertical ones. This
+        # body was written in ``cp``, which is real cupy on a GPU run, and
+        #     cp.maximum(<numpy array>, 1)
+        #     TypeError: Unsupported type <class 'numpy.ndarray'>
+        # killed the first rj_replace any job has ever reached. The
+        # vertical route fired first only because GB_RUN_FANCY_TEMPERING=0
+        # keeps the permuted one dormant -- the defect is identical there
+        # and would have surfaced the moment fancy tempering was re-armed.
+        # Coerce to whatever module ``band_temps`` lives in (the array this
+        # function mutates in place) and use it throughout, which also
+        # makes the body correct on a CPU-resolved run on a cupy machine,
+        # where ``cp`` is cupy but ``self.xp`` is numpy.
+        _xp = get_array_module(band_temps)
+        band_swaps_accepted = _xp.asarray(band_swaps_accepted)
+        band_swaps_proposed = _xp.asarray(band_swaps_proposed)
         # Edge bands never receive swap proposals (interior-bands-only grid),
         # so guard the 0/0: an unproposed (band, pair) adapts with ratio 0
         # instead of propagating NaN into the ladder (at ntemps > 2 a NaN
         # here corrupts band_temps for the edge bands' middle temps, which
         # then NaN-poisons every acceptance in those bands).
-        _prop_safe = cp.maximum(band_swaps_proposed, 1)
+        _prop_safe = _xp.maximum(band_swaps_proposed, 1)
         ratios = (band_swaps_accepted / _prop_safe).T
         betas0 = band_temps.copy().T
         betas1 = betas0.copy()
@@ -17710,13 +17729,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         dSs = kappa * (ratios[:-1] - ratios[1:])
 
         # Compute new ladder (hottest and coldest chains don't move).
-        deltaTs = cp.diff(1 / betas1[:-1], axis=0)
+        deltaTs = _xp.diff(1 / betas1[:-1], axis=0)
 
-        deltaTs *= cp.exp(dSs)
-        betas1[1:-1] = 1 / (cp.cumsum(deltaTs, axis=0) + 1 / betas1[0])
+        deltaTs *= _xp.exp(dSs)
+        betas1[1:-1] = 1 / (_xp.cumsum(deltaTs, axis=0) + 1 / betas1[0])
 
         dbetas = betas1 - betas0
-        band_temps += self.xp.asarray(dbetas.T)
+        band_temps += _xp.asarray(dbetas.T)
 
     def run_tempering(self, model, state, band_sorter, band_temps, *,
                       tmp_start=None, adapt_band_temps=True):
