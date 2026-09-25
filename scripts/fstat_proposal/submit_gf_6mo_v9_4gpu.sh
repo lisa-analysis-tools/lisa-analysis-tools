@@ -3271,12 +3271,42 @@ export GB_WARM_START_COMPONENTS=${GB_WARM_START_COMPONENTS-${STORE_DIR}/warmstar
 # from its maxlogL cold walker (the V9-12 block further down). Overriding one
 # without the other is what this variable exists to prevent.
 #
-# ⚠ SET THIS to the 3mo 10-WALKER NOISE-FIX run. The default below is the
-# 10-walker science arm the rest of this file is rebased on; if the noise-fix
-# relaunch lives in a different directory, export GF_SEED_STORE at launch:
+# THE SEED IS THE 3mo 10-WALKER **NOISE-FIX** RUN (user, 2026-09-24), not the
+# plain 10-walker arm the rest of this file is rebased on. Override at launch:
 #     GF_SEED_STORE=/shared/data/global_fit_output/<dir>/<store>.h5 \
-#         sbatch scripts/fstat_proposal/submit_gf_6mo_v9_4gpu.sh
-export GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/global_fit_output/gf_prod_3mo_v8_10walkers/gf_prod_3mo_testing.h5}
+#         NGPUS=4 ./scripts/fstat_proposal/submit_gf_6mo_v9_4gpu.sh
+#
+# It may be given as the .h5 OR as the run DIRECTORY; the resolver below
+# picks the single .h5 inside a directory. ⚠ It does NOT fall back to a
+# DIFFERENT run: a seed is a provenance statement, and quietly substituting
+# another store would be the exact "warm start and noise pin from different
+# folders" split the ruling forbids. A store that cannot be resolved means
+# no pin, which means the noise stages run -- loudly, see below.
+export GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/global_fit_output/gf_prod_3mo_v8_10walkers_noisefix/gf_prod_3mo_testing.h5}
+if [ ! -f "${GF_SEED_STORE}" ]; then
+  _seed_dir="${GF_SEED_STORE}"
+  [ -f "${_seed_dir}" ] || [ -d "${_seed_dir}" ] || _seed_dir=$(dirname "${GF_SEED_STORE}")
+  if [ -d "${_seed_dir}" ]; then
+    _n_h5=$(find "${_seed_dir}" -maxdepth 1 -name '*.h5' 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${_n_h5}" = "1" ]; then
+      GF_SEED_STORE=$(find "${_seed_dir}" -maxdepth 1 -name '*.h5')
+      export GF_SEED_STORE
+      echo "[V9-SEED] resolved the seed store inside ${_seed_dir}:"
+      echo "[V9-SEED]   ${GF_SEED_STORE}"
+    else
+      echo "[V9-SEED] ${_seed_dir} holds ${_n_h5} .h5 files -- cannot pick one."
+      find "${_seed_dir}" -maxdepth 1 -name '*.h5' 2>/dev/null | sed 's/^/[V9-SEED]   /'
+    fi
+  else
+    echo "[V9-SEED] GF_SEED_STORE does not exist: ${GF_SEED_STORE}"
+    echo "[V9-SEED] Candidate 3mo run directories on this filesystem:"
+    find /shared/data/global_fit_output -maxdepth 1 -type d -name 'gf_prod_3mo*' \
+      2>/dev/null | sort | sed 's/^/[V9-SEED]   /'
+    echo "[V9-SEED] Re-launch with GF_SEED_STORE=<one of those>/<store>.h5 to"
+    echo "[V9-SEED] pin the noise; otherwise the noise stages will fit it."
+  fi
+  unset _seed_dir _n_h5
+fi
 export GB_WARM_START_SOURCE_STORE=${GB_WARM_START_SOURCE_STORE-${GF_SEED_STORE}}
 if [ "${GB_WARM_START_SOURCE_STORE}" != "${GF_SEED_STORE}" ]; then
   echo "[V9-SEED] WARNING: GB_WARM_START_SOURCE_STORE was overridden and no"

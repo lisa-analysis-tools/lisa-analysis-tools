@@ -1425,25 +1425,36 @@ class SearchStageProfileStep(RJRecipeStep):
             for m in gb_moves:
                 if not getattr(m, "is_rj_prop", False):
                     continue
-                # ⚠ NEVER rj_replace. It is constructed ``phase_maximize=
-                # False`` with the reason in its own comment: the phase-max
-                # acceptance WAS the root-caused rj_replace lnL-drift flaw
-                # (the maximized value is not attainable at any actual phi0),
-                # and the move is only back in the cycle at all on the
-                # hypothesis that the rest was the old GPU setup. A stage
-                # profile must not re-arm the one thing that retired it.
-                # Its own scoring-side switch is ``_replace_phase_max``
-                # (GB_REPLACE_PHASE_MAX), which has rotation-on-accept behind
-                # it -- a different mechanism with a different safety story.
+                # ⚠ NEVER rj_replace -- and this is NOT "replace does not
+                # phase-maximize". The replace SWAP does, in search, on the
+                # ADDED source only, and must: user ruling 2026-09-24. That
+                # is a different switch (``_replace_phase_max`` /
+                # GB_REPLACE_PHASE_MAX, "auto" -> ON for a search-stage
+                # install), and it is the one with ROTATION-ON-ACCEPT behind
+                # it -- the maximizing angle is written into the accepted
+                # candidate's phi0, so the credited delta is attainable at
+                # the parameters actually kept. The REMOVED source is always
+                # scored at its ACTUAL phase. That asymmetry is the whole
+                # 2026-08-24 redesign.
+                #
+                # ``self.phase_maximize`` is a DIFFERENT quantity on this
+                # move: it drives the in-model repeats the move runs
+                # internally on its survivors (``inmodel_get_add_ll``), and
+                # the ctor sets it False deliberately. Writing a stage
+                # profile onto it would re-arm maximized in-model scoring on
+                # the one move whose unattainable maximized credit was the
+                # root cause of the drift that retired it -- while doing
+                # nothing whatever for the swap, which is already maximized.
                 if getattr(m, "rj_replace", False):
                     if not getattr(self, "_replace_pm_noted", False):
                         self._replace_pm_noted = True
                         logger.info(
-                            "[V9-STAGE %s] %s.phase_maximize LEFT AT %s: the "
-                            "replace move opted out by construction (its "
-                            "phase-max acceptance was the root cause of the "
-                            "drift that retired it). GB_REPLACE_PHASE_MAX is "
-                            "its own, separate switch.",
+                            "[V9-STAGE %s] %s.phase_maximize LEFT AT %s (its "
+                            "INTERNAL in-model scoring). The replace SWAP's "
+                            "phase maximization is GB_REPLACE_PHASE_MAX and "
+                            "is unaffected: in search it maximizes the ADDED "
+                            "source with rotation-on-accept and scores the "
+                            "REMOVED one at its actual phase.",
                             tag, m.name, bool(getattr(m, "phase_maximize",
                                                       False)))
                     continue

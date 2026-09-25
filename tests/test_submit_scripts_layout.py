@@ -276,6 +276,22 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         self.assertIn("GB_WARM_START_SOURCE_STORE-${GF_SEED_STORE}", src)
         self.assertIn("lisatools.globalfit.warmstart.noise_pin", src)
 
+    def test_the_seed_is_the_NOISE_FIX_run(self):
+        """User, 2026-09-24: the seed is the 3mo 10-walker NOISE-FIX run,
+        not the plain 10-walker arm the rest of this file is rebased on."""
+        self.assertIn("gf_prod_3mo_v8_10walkers_noisefix",
+                      self.v9["GF_SEED_STORE"])
+
+    def test_the_seed_never_falls_back_to_a_DIFFERENT_run(self):
+        """The resolver may pick the single .h5 inside a given directory,
+        but it must never substitute another run: a seed is a provenance
+        statement, and quietly swapping it is the exact "warm start and
+        noise pin from different folders" split the ruling forbids."""
+        src = open(SIX_MO_V9).read()
+        self.assertIn("does NOT fall back to a", src)
+        self.assertNotIn("GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/"
+                         "global_fit_output/gf_prod_3mo_v8_10walkers/", src)
+
     def test_the_noise_pin_is_read_at_MAXLOGL(self):
         """noise_pin reads best_logl_noise, i.e. the best-logL cold walker
         of the last valid row -- not a posterior mean."""

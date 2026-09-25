@@ -30,14 +30,21 @@ Driver: `scripts/fstat_proposal/run_combined_staged.py`
    1. `GB_WARM_START_SOURCE_STORE` derives from it. If the refereed
       warm-start npz is absent it is built in-process at recipe build
       (fit → referee → apply).
-   2. The **noise pin** is extracted from the same store:
+   2. The seed defaults to the 3mo 10-walker **noise-fix** run. If the
+      exact `.h5` is absent but the directory holds exactly one, the script
+      resolves it and says so; if the directory is absent it lists the
+      candidate `gf_prod_3mo*` directories. ⚠ It never substitutes a
+      *different* run — a seed is a provenance statement.
+   3. The **noise pin** is extracted from the same store:
       `python -m lisatools.globalfit.warmstart.noise_pin --store $GF_SEED_STORE --export`
       reads the **best-logL cold walker of the last valid row**, converts it
       to PHYSICAL/linear units (auto-detecting the source run's log basis —
       a log-sampled column is strictly positive under its physical prior, so
       a value ≤ 0 can only be a log), and emits
       `PSD_START_PARAMS=` / `GALFOR_START_PARAMS=`, which the shell `eval`s.
-   3. A mismatch between the two sources prints a `[V9-SEED] WARNING`.
+   4. A mismatch between the two sources prints a `[V9-SEED] WARNING`,
+      and an existing warm-start npz is checked against a `.source` sidecar
+      recording which store it was fitted from.
    * ✅ `[V9-SEED] store=…`, `[V9-SEED] PSD_START_PARAMS=…`
 
 3. **`build_fit()` composes the recipe** and prints it.
@@ -255,9 +262,19 @@ Each pass prices **both sides** of its MH ratio against its own container —
 the sorter's death-side `factors` are computed from whichever container the
 pass installs — so the two never mix.
 
+**Phase maximization inside the swap** (`GB_REPLACE_PHASE_MAX`, `auto` →
+ON for a search-stage install): the **ADDED** source is scored
+phase-maximized, the **REMOVED** one always at its **actual** phase. The
+maximizing rotation is written into the accepted candidate's φ₀ before the
+write-back, so the credited Δ is attainable at the parameters actually kept.
+⚠ This is a *different* switch from the move's `phase_maximize` attribute,
+which drives only its internal in-model repeats and stays `False`; the v9
+stage profile deliberately does not touch it.
+
 ⚠ **This move was retired once.** Its recorded failure signature was a
 propose-level lnL drift of **1.5–1.9e3**, three orders above every other move,
-root-caused to a phase-max credit that was not attainable at any actual φ₀.
+root-caused to maximized credit *without* that write-back — unattainable at
+any actual φ₀. Rotation-on-accept is the fix, not renouncing maximization.
 The 2026-08-24 redesign replaced that with rotation-on-accept (the scored rows
 ARE the final rows). It is reinstated on the hypothesis that the rest was the
 old GPU setup — **watched, not trusted**:
