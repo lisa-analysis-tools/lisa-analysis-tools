@@ -924,6 +924,86 @@ class GlobalFit:
         except Exception as exc:  # noqa: BLE001 -- reject, never crash resume
             return False, f"validation error: {exc!r}"
 
+    #: Physical sanity windows for the noise start pin, ``{branch: (lo, hi)}``
+    #: per column. Deliberately WIDE -- these exist to catch a basis mistake
+    #: (a log value pasted where a linear one belongs, which is off by many
+    #: orders), not to police physics.
+    _NOISE_PIN_WINDOWS = {
+        # [Soms_d, Sa_a] square-root levels
+        "psd": ((1e-13, 1e-10), (1e-16, 1e-13)),
+        # (amp, fk, alpha, f_1, f_2)
+        "galfor": ((1e-50, 1e-30), (1e-6, 1e-1), (0.0, 30.0),
+                   (1e-6, 1e-1), (1e-6, 1e-1)),
+    }
+
+    def _seed_noise_start_coords(self, branch: str, raw: str, drawn):
+        """``{PSD,GALFOR}_START_PARAMS`` -> start coords for a noise branch.
+
+        ``raw`` is a comma list of PHYSICAL (linear) values; the return is in
+        the branch's SAMPLING basis, broadcast over the drawn block's shape.
+        Every walker and rung starts at the same point: these are 2- and
+        5-parameter branches whose moves are ensemble proposals over a
+        posterior that is already tight by the time they matter, and a pinned
+        start is meant to BE a pin -- ``*_START_FACTOR`` scatter would defeat
+        the purpose of pinning the maxlogL point of a converged run.
+
+        Raises on a wrong length or an out-of-window value rather than
+        starting the fit somewhere absurd: this knob's whole failure mode is
+        a basis mistake, which is silent and costs a whole allocation.
+        """
+        want = np.asarray(drawn).shape[-1]
+        try:
+            vals = np.array([float(x) for x in raw.split(",") if x.strip()],
+                            dtype=float)
+        except ValueError as exc:
+            raise ValueError(
+                f"{branch.upper()}_START_PARAMS must be a comma list of "
+                f"floats, got {raw!r}."
+            ) from exc
+        if vals.shape[0] != want:
+            raise ValueError(
+                f"{branch.upper()}_START_PARAMS has {vals.shape[0]} values "
+                f"but the {branch!r} branch samples {want} parameters."
+            )
+        for i, (lo, hi) in enumerate(self._NOISE_PIN_WINDOWS.get(branch, ())):
+            if not (lo <= vals[i] <= hi):
+                raise ValueError(
+                    f"{branch.upper()}_START_PARAMS[{i}] = {vals[i]:.6g} is "
+                    f"outside the physical window [{lo:.3g}, {hi:.3g}]. These "
+                    f"knobs take LINEAR values; a raw chain row from a run "
+                    f"with log sampling on would land here. Convert to "
+                    f"physical first (exp for psd, 10** for galfor's amp/fk/"
+                    f"f_1/f_2; alpha is linear in both bases)."
+                )
+        # Into the SAMPLING basis, mirroring prepare_psd_branch /
+        # prepare_galfor_branch: psd is ln of both columns, galfor is log10 of
+        # GALFOR_LOG_PARAMS only (alpha is an O(1) power-law index and stays
+        # linear). The galfor column set is read from the module that defines
+        # it rather than hardcoded, so a basis change cannot desynchronize
+        # this from the prior and the transform.
+        info = self.curr.source_info.get(branch)
+        log_sampling = bool(getattr(info, "log_sampling", False))
+        sampled = vals.copy()
+        if log_sampling:
+            if branch == "psd":
+                sampled = np.log(vals)
+            else:
+                from .stock.erebor.noise import (
+                    GALFOR_BASIS, GALFOR_LOG_PARAMS)
+
+                _cols = [GALFOR_BASIS.index(n) for n in GALFOR_LOG_PARAMS]
+                sampled[_cols] = np.log10(vals[_cols])
+        out = np.broadcast_to(
+            sampled, np.asarray(drawn).shape).astype(float).copy()
+        self.logger.info(
+            "[NOISE-PIN] %s start coords PINNED at the supplied physical "
+            "point %s -> sampling basis %s (log_sampling=%s); every walker "
+            "and rung starts there, no START_FACTOR scatter.",
+            branch, np.array2string(vals, precision=6),
+            np.array2string(sampled, precision=6), log_sampling,
+        )
+        return out
+
     def load_info(self, priors: typing.Dict[str, typing.Any]) -> GFState:
         """
         Load or initialize the MCMC state from backend or priors.
@@ -1207,6 +1287,35 @@ class GlobalFit:
                 inds["galfor"][:] = True
             if "sgwb" in inds:
                 inds["sgwb"][:] = True
+            # NOISE START PIN (user ruling 2026-09-24: "the warmstart and
+            # PSD/GB frozen start point come from the same folder ... it
+            # should use maxlogL"). psd and galfor are the ONLY sampled
+            # branches with no start-coordinate path at all -- they are in
+            # ``_LOAD_INFO_NAMED_BRANCHES``, so the generic injection seeder
+            # below skips them, and the arms above set ``inds`` only. Their
+            # chains therefore begin at a PRIOR DRAW, which for a v9 search
+            # whose first two stages do not sample noise would mean searching
+            # against a random noise level for the whole of both stages.
+            #
+            # ⚠ BASIS. These knobs are PHYSICAL/LINEAR -- psd
+            # ``[Soms_d, Sa_a]`` as square-root levels, galfor the 5-vector
+            # ``(amp, fk, alpha, f_1, f_2)`` -- and are converted here into
+            # whatever basis the branch SAMPLES in, exactly as
+            # ``prepare_psd_branch`` converts the injection (psd is ``ln``,
+            # galfor is ``log10``, and galfor's ``alpha`` column stays
+            # linear). Taking physical values is what makes the knob safe to
+            # fill from another run whose log-sampling flags differ from this
+            # one's; a raw chain row pasted straight in would be silently
+            # double-logged.
+            for _nb in ("psd", "galfor"):
+                if _nb not in coords:
+                    continue
+                _raw = os.environ.get(f"{_nb.upper()}_START_PARAMS", "").strip()
+                if not _raw:
+                    continue
+                coords[_nb] = self._seed_noise_start_coords(
+                    _nb, _raw, coords[_nb]
+                )
             if "mbh" in inds:
                 inds["mbh"][:] = True
                 self.logger.debug("initializing mbh inds to true")

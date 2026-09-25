@@ -88,6 +88,66 @@ def _require(path: str, step: str) -> None:
         )
 
 
+#: Sidecar recording which store a warm-start npz was fitted from.
+_PROVENANCE_SUFFIX = ".source"
+
+
+def _provenance_path(path: str) -> str:
+    return str(path) + _PROVENANCE_SUFFIX
+
+
+def _write_warm_start_provenance(path: str, store: str) -> None:
+    """Record the source store next to a freshly built npz (best effort)."""
+    try:
+        with open(_provenance_path(path), "w") as fh:
+            fh.write(os.path.abspath(store) + "\n")
+    except OSError as exc:  # noqa: BLE001 -- provenance, never a failure
+        logger.debug("warm start: could not write provenance (%r)", exc)
+
+
+def _check_warm_start_provenance(path: str, store: str, log) -> None:
+    """Warn when an EXISTING npz was fitted from a different store.
+
+    ⚠ THE FAILURE THIS CATCHES (2026-09-24 audit). The npz path is a fixed
+    filename inside the run store, and the auto-build fires only when that
+    file is ABSENT. So relaunching the same ``STORE_DIR`` with a different
+    seed store leaves the warm-start mixture fitted from the OLD run while
+    the psd/galfor pin -- read live from the new one -- follows the NEW run.
+    That is precisely the split the 2026-09-24 ruling forbids ("the warmstart
+    and PSD/GB frozen start point come from the same folder"), and nothing
+    else in the chain can see it: the two env vars still agree, the file
+    still exists, and the fit still loads.
+
+    A WARNING rather than a refusal: an npz written before this sidecar
+    existed has no provenance to check, and a deliberate cross-seeding is a
+    legitimate (if unusual) thing to ask for. The log line is what makes it
+    a decision instead of an accident.
+    """
+    if not store:
+        return
+    rec = _provenance_path(path)
+    try:
+        with open(rec) as fh:
+            was = fh.read().strip()
+    except OSError:
+        log.warning(
+            "warm start: %s exists but carries no provenance record, so it "
+            "CANNOT be verified against the current "
+            "GB_WARM_START_SOURCE_STORE=%s. If this store was relaunched "
+            "against a different seed run, the warm-start mixture is from "
+            "the OLD one while the psd/galfor pin is from the new one -- "
+            "delete the npz to force a rebuild.", path, store)
+        return
+    if was and os.path.abspath(was) != os.path.abspath(store):
+        log.warning(
+            "warm start: %s was fitted from\n    %s\nbut this launch's seed "
+            "store is\n    %s\nThe warm-start mixture and the psd/galfor "
+            "pin would then come from DIFFERENT runs. Delete the npz (and "
+            "its %s sidecar) to refit from the current seed, or point "
+            "GF_SEED_STORE back at the original.",
+            path, was, store, _PROVENANCE_SUFFIX)
+
+
 def ensure_warm_start_components(
     path: str,
     *,
@@ -108,11 +168,12 @@ def ensure_warm_start_components(
     (tmp + ``os.replace``), so a waiting rank never sees a partial npz.
     """
     log = log or logger
-    if os.path.exists(path):
-        return path
-
     store = (store or os.environ.get("GB_WARM_START_SOURCE_STORE", "")
              or "").strip()
+    if os.path.exists(path):
+        _check_warm_start_provenance(path, store, log)
+        return path
+
     if not store:
         raise FileNotFoundError(
             f"warm-start components {path!r} do not exist and "
@@ -188,9 +249,13 @@ def ensure_warm_start_components(
                 "--out", tmp_out])
         _require(tmp_out, "referee_apply")
         os.replace(tmp_out, path)
+        # Record WHICH store this was fitted from, so a later launch of the
+        # same run directory against a different seed can be caught (see
+        # _check_warm_start_provenance).
+        _write_warm_start_provenance(path, store)
         log.warning(
-            "[WARMSTART-BUILD] built %s in %.1f s.",
-            path, time.perf_counter() - t0)
+            "[WARMSTART-BUILD] built %s in %.1f s (source %s).",
+            path, time.perf_counter() - t0, store)
         return path
     finally:
         try:
