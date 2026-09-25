@@ -2998,17 +2998,41 @@ def enumerate_center_nodes(cache_dir: str, *, mc_lims=None,
         f0_dxs_all = np.asarray(d["f0_dxs"], dtype=float)
         # legacy single-stack npz vs banded-Mc groups (2026-08-26): one
         # (grids, f0 slice, mc_ax) block per group either way.
+        # ⚠ THE SKY AXES ARE PER GROUP under the f0-adaptive sky
+        # (2026-09-24). ``write_stacked_npz`` emits ``alpha_ax_g{gi}`` /
+        # ``sin_delta_ax_g{gi}`` ONLY when the groups actually differ, and
+        # keeps the flat ``alpha_ax`` / ``sin_delta_ax`` as the shared case
+        # so a pinned-sky cache stays byte-identical. This reader used the
+        # FLAT pair for every group, which is right only in that shared
+        # case; with an adaptive grid it unravelled a group's argmax
+        # against the wrong shape:
+        #
+        #   ValueError: index 358 is out of bounds for array with size 189
+        #
+        # -- and where the group's sky happened to be SMALLER than the flat
+        # axes it would not have raised at all, just silently placed births
+        # at sky angles the grid was never scored at. Resolve per group,
+        # falling back to the flat axes when the suffixed keys are absent.
+        def _sky_for(gi):
+            ka, ks = f"alpha_ax_g{gi}", f"sin_delta_ax_g{gi}"
+            if ka in d.files and ks in d.files:
+                return (np.asarray(d[ka], dtype=float),
+                        np.asarray(d[ks], dtype=float))
+            return al_ax, sd_ax
+
         if "logp_grids" in d.files:
             blocks = [(np.asarray(d["logp_grids"], dtype=float),
                        f0_los_all, f0_dxs_all,
-                       np.asarray(d["mc_ax"], dtype=float))]
+                       np.asarray(d["mc_ax"], dtype=float),
+                       al_ax, sd_ax)]
         else:
             sizes = np.asarray(d["group_sizes"], dtype=int)
             bounds = np.concatenate([[0], np.cumsum(sizes)])
             blocks = [
                 (np.asarray(d[f"logp_grids_g{gi}"], dtype=float),
                  f0_los_all[a:b], f0_dxs_all[a:b],
-                 np.asarray(d[f"mc_ax_g{gi}"], dtype=float))
+                 np.asarray(d[f"mc_ax_g{gi}"], dtype=float),
+                 *_sky_for(gi))
                 for gi, (a, b) in enumerate(zip(bounds[:-1], bounds[1:]))
             ]
         # Under the fdot basis axis 2 is fdot [Hz/s], not Mc, and axis 0
@@ -3019,13 +3043,25 @@ def enumerate_center_nodes(cache_dir: str, *, mc_lims=None,
                   if "grid_basis" in d.files else "Mc")
         _c_t = (float(np.asarray(d["grid_c_t"]).item())
                 if "grid_c_t" in d.files else 0.0)
-        for grids, f0_los, f0_dxs, mc_ax in blocks:
+        for grids, f0_los, f0_dxs, mc_ax, g_al_ax, g_sd_ax in blocks:
             K, n_f0 = grids.shape[0], grids.shape[1]
             # argmax over the (axis2, alpha, sin_delta) block at each
             # (box, f0 node)
             flat = grids.reshape(K, n_f0, -1).argmax(axis=2)
-            i_mc, i_al, i_sd = np.unravel_index(
-                flat, (len(mc_ax), len(al_ax), len(sd_ax)))
+            # The shape MUST be this group's own -- assert it against the
+            # grid rather than trusting the axes, because a mismatch that
+            # happens to be small enough not to overflow places births at
+            # sky angles that were never scored.
+            _want = tuple(int(s) for s in grids.shape[2:5])
+            _have = (len(mc_ax), len(g_al_ax), len(g_sd_ax))
+            if _want != _have:
+                raise ValueError(
+                    f"enumerate_center_nodes: grid block has "
+                    f"(mc, alpha, sin_delta) shape {_want} but the axes "
+                    f"resolved to {_have} -- the per-group sky axes and the "
+                    f"grid disagree, so every center node from this group "
+                    f"would be placed at the wrong sky angle.")
+            i_mc, i_al, i_sd = np.unravel_index(flat, _have)
             f0 = f0_los[:, None] + np.arange(n_f0)[None, :] * f0_dxs[:, None]
             if _basis == "fdot":
                 fd = mc_ax[i_mc]                       # Hz/s at the argmax
@@ -3051,8 +3087,8 @@ def enumerate_center_nodes(cache_dir: str, *, mc_lims=None,
             else:
                 mc_parts.append(mc_ax[i_mc].ravel())
             f0_parts.append(f0.ravel())
-            al_parts.append(al_ax[i_al].ravel())
-            sd_parts.append(sd_ax[i_sd].ravel())
+            al_parts.append(g_al_ax[i_al].ravel())
+            sd_parts.append(g_sd_ax[i_sd].ravel())
             n_peak += int(f0.size)
 
     if os.path.exists(comb_cache):
