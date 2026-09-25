@@ -235,12 +235,6 @@ class FullCompositionTest(unittest.TestCase):
         """User ruling 2026-09-25: "For GB search 3 we also need to add
         noise_search (psd and foreground) after each rj proposal to
         convergence ... as we try to remove the last bit of sources."
-
-        ⚠ ``noise_joint_search_1`` sits before ``rj_fstat_search`` rather
-        than immediately after ``rj_warm_search``: it doubles as the
-        fresh-noise pass the F-stat grid FIT reads, and that placement is
-        load-bearing. It still separates the two RJ proposals, so every RJ
-        slot is followed by a convergence before the next one.
         """
         fit = self._full(PSD_START_PARAMS="1.5e-11,3e-15",
                          GALFOR_START_PARAMS="1e-44,1e-3,1.5,5e-4,5e-4")
@@ -259,6 +253,39 @@ class FullCompositionTest(unittest.TestCase):
                 any(i < j < nxt for j in noise),
                 f"no noise convergence between {names[i]} and "
                 f"{names[nxt] if nxt < len(names) else 'the end'}")
+
+    def test_the_noise_follows_the_IN_MODEL_not_the_bare_rj(self):
+        """User amendment 2026-09-25: "move the noise joint searches to
+        after the in model updates."
+
+        A newborn sits at its BIRTH coordinates until its in-model slot
+        walks it onto its peak. Converging psd+galfor in between fits the
+        foreground against a GB model known to be half-updated and then
+        immediately invalidates it, so each noise pass must follow the
+        polish, not the bare RJ.
+
+        ⚠ ``rj_prior_removal`` has no in-model slot after it by design --
+        the cycle ENDS on the removal judge -- so its noise pass follows it
+        directly. That is the rule holding, not an exception to it.
+        """
+        fit = self._full(PSD_START_PARAMS="1.5e-11,3e-15",
+                         GALFOR_START_PARAMS="1e-44,1e-3,1.5,5e-4,5e-4")
+        names = _names(
+            next(s for s in fit.recipe.stages if s.name == "gb_search_3"))
+        for rj_name, im_name in (("rj_warm_search", "in_model"),
+                                 ("rj_fstat_search", "in_model_fstat"),
+                                 ("rj_replace", "in_model_replace")):
+            i_rj, i_im = names.index(rj_name), names.index(im_name)
+            self.assertLess(i_rj, i_im, f"{im_name} must follow {rj_name}")
+            # the next noise pass comes AFTER the polish, not between
+            nxt_noise = min(j for j, n in enumerate(names)
+                            if n.startswith("noise_joint_search") and j > i_rj)
+            self.assertGreater(
+                nxt_noise, i_im,
+                f"{names[nxt_noise]} runs between {rj_name} and {im_name}")
+        # the removal judge ends the cycle, so its noise pass is adjacent
+        i_rem = names.index("rj_prior_removal")
+        self.assertTrue(names[i_rem + 1].startswith("noise_joint_search"))
 
     def test_the_interleaved_noise_slots_are_DISTINCT_objects(self):
         """JointMaxLogLSearch carries its own plateau state. Two slots

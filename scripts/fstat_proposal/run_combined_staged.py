@@ -1143,17 +1143,31 @@ def build_fit():
                   else ([Move("vgb_pe", branch="vgb")] if _has_vgb else []))
         _noise_pre = noise_only_1 if sample_noise else []
         _noise_post = noise_only_2 if sample_noise else []
-        # NOISE TO CONVERGENCE AFTER EVERY RJ PROPOSAL (user ruling
-        # 2026-09-25, gb_search_3 only -- it is the one stage that SAMPLES
-        # the noise). With the cycle's four RJ slots that means:
+        # NOISE TO CONVERGENCE AFTER EVERY RJ PROPOSAL -- specifically,
+        # after that proposal's IN-MODEL UPDATE (user ruling 2026-09-25,
+        # amended the same day: "move the noise joint searches to after the
+        # in model updates"). gb_search_3 only; it is the one stage that
+        # SAMPLES the noise.
         #
-        #   rj_warm_search    -> _noise_pre   (already; it also sits right
-        #                        before the F-stat grid FIT, which is why it
-        #                        is placed there rather than immediately
-        #                        after the warm move)
-        #   rj_fstat_search   -> _noise_post  (already)
-        #   rj_replace        -> _noise_rep   NEW
-        #   rj_prior_removal  -> _noise_rem   NEW
+        # The pattern is uniform, RJ -> in-model -> noise:
+        #
+        #   rj_warm_search   in_model          _noise_pre
+        #   rj_fstat_search  in_model_fstat    _noise_post
+        #   rj_replace       in_model_replace  _noise_rep
+        #   rj_prior_removal (none)            _noise_rem
+        #
+        # WHY AFTER THE POLISH RATHER THAN STRAIGHT AFTER THE RJ. A newborn
+        # sits at its birth coordinates until its in-model slot walks it
+        # onto its peak; converging psd+galfor in between would fit the
+        # foreground against a GB model that is known to be half-updated,
+        # and then immediately invalidate it. Letting the polish finish
+        # first means each noise convergence sees a settled GB model.
+        #
+        # ⚠ _noise_pre KEEPS ITS POSITION and it is load-bearing: it is
+        # already "after in_model", and it also lands immediately before
+        # rj_fstat_search, which is where the F-stat grid FIT reads the
+        # noise level. The amendment made the other three match IT, not the
+        # other way round.
         #
         # WHY, in the user's words: "when we are sampling the
         # noise/foreground it needs to move to convergence after each
@@ -1207,11 +1221,11 @@ def build_fit():
                 _noise
                 + _warm + in_model("in_model") + _noise_pre
                 + [Move("rj_fstat_search", branch="gb")]
-                + _noise_post
                 + in_model("in_model_fstat")
+                + _noise_post
                 + replace()
-                + _noise_rep
                 + in_model("in_model_replace")
+                + _noise_rep
                 + [Move("rj_prior_removal", branch="gb")]
                 + _noise_rem
                 + ([Move("gb_ridge_gibbs", branch="gb")]
