@@ -4424,6 +4424,155 @@ if recs:
     ax[1].set_title("wall time per propose")
     fig_b64(fig, "timing_moves")
 
+# ---- 8b. SEARCH EFFICIENCY: what each move COSTS against what it BUYS ----
+# Added 2026-09-25 after job 628's first two full gb_search_1 cycles. The
+# panel above answers "how long did this move take"; it cannot answer the
+# question that actually decides whether the recipe is worth its wall time:
+#
+#   * cost per NEW LEAF, which is the number that degrades as the search
+#     saturates. 628 went 5.5 s/leaf on iteration 1 to 70.6 s/leaf on
+#     iteration 2 at an essentially FLAT per-iteration cost -- the
+#     iteration timing alone shows none of that;
+#   * the rj_step vs in-model-polish split inside each move. In 628 the
+#     RJ proposals are ~10% of the GB wall and the convergence polish is
+#     ~85%, so "the RJ schedule is expensive" was the wrong diagnosis;
+#   * per-RJ-move YIELD. rj_replace cost ~1420 s/iteration and accepted
+#     ZERO swaps in 122k proposals x 2 passes x 2 iterations. Nothing on
+#     the page said so.
+#
+# Sources: the ``[GF_TIMING] ... move=<m> it=<k> wall_s=<w>`` records (per
+# ITERATION, unlike the ``[GB_TIMING]`` ones above), ``[GB_TIMING <m> head
+# r0]`` for the internal split, ``[GB_ACCEPT <m>] rj cold`` for the yield,
+# and ``gb_counts`` for the leaf series. Every piece is optional: a run
+# that predates any of them simply drops that subplot.
+GFT_RE = re.compile(
+    r"\[GF_TIMING\] stage=(\S+) move=(\S+) it=(\d+) wall_s=([\d.]+)")
+SPLIT_RE = re.compile(r"\[GB_TIMING (\w+) head r0\] (.*)")
+ACC_RE = re.compile(
+    r"\[GB_ACCEPT (rj_\w+)\] rj cold ([\d.]+) \(n=(\d+)\)")
+try:
+    per_it = {}                      # it -> {move: wall_s}
+    for _m in GFT_RE.finditer(log_text):
+        if _m.group(2) == "__total__":
+            continue
+        per_it.setdefault(int(_m.group(3)), {})[_m.group(2)] = float(_m.group(4))
+    splits = {}                      # move -> (rj_step, inmodel_repeats)
+    for _m in SPLIT_RE.finditer(log_text):
+        _d = {}
+        for _kv in _m.group(2).split():
+            if "=" in _kv and _kv.endswith("s"):
+                _k, _v = _kv.split("=", 1)
+                try:
+                    _d[_k] = float(_v[:-1])
+                except ValueError:
+                    pass
+        splits[_m.group(1)] = (_d.get("rj_step", 0.0),
+                               _d.get("inmodel_repeats", 0.0))
+    yields = {}                      # move -> [cold accepts per propose]
+    for _m in ACC_RE.finditer(log_text):
+        yields.setdefault(_m.group(1), []).append(
+            float(_m.group(2)) * int(_m.group(3)))
+
+    if per_it:
+        its = sorted(per_it)
+        moves = sorted({mv for d in per_it.values() for mv in d},
+                       key=lambda m: -sum(per_it[i].get(m, 0.0) for i in its))
+        fig, ax = plt.subplots(1, 3, figsize=(15, 3.8))
+
+        # (a) stacked wall per move per iteration
+        bot = np.zeros(len(its))
+        for _i, mv in enumerate(moves[:10]):
+            h = np.array([per_it[i].get(mv, 0.0) for i in its])
+            ax[0].bar(its, h, bottom=bot, label=mv,
+                      color=plt.cm.viridis(_i / max(len(moves[:10]) - 1, 1)))
+            bot += h
+        ax[0].set_xlabel("iteration"); ax[0].set_ylabel("wall [s]")
+        ax[0].set_title("where the iteration goes, per move")
+        ax[0].legend(fontsize=6, ncol=2)
+
+        # (b) seconds per NEW leaf -- the saturation curve
+        if "gb_counts" in dir() and len(gb_counts) >= 2:
+            lv = np.asarray(gb_counts, dtype=float).mean(axis=-1)
+            n = min(len(lv), len(its))
+            tot = np.array([sum(per_it[i].values()) for i in its[:n]])
+            d_lv = np.diff(np.concatenate([[0.0], lv[:n]]))
+            with np.errstate(divide="ignore", invalid="ignore"):
+                spl = np.where(d_lv > 0, tot / d_lv, np.nan)
+            ax[1].plot(its[:n], spl, "o-", color=AMBER, lw=1.2, ms=4)
+            ax[1].set_yscale("log")
+            ax[1].set_ylabel("wall [s] per NEW leaf/walker")
+            ax[1].set_xlabel("iteration")
+            ax[1].set_title("search efficiency (lower is better)")
+            for _x, _y, _d in zip(its[:n], spl, d_lv):
+                if np.isfinite(_y):
+                    ax[1].annotate(f"+{_d:.0f}", (_x, _y), fontsize=6,
+                                   textcoords="offset points", xytext=(0, 5))
+        else:
+            ax[1].text(0.5, 0.5, "no leaf series", ha="center",
+                       transform=ax[1].transAxes)
+
+        # (c) per-RJ-move yield: cold accepts on the most recent propose,
+        #     against that move's wall. A bar at zero with a long wall is
+        #     the signature that put rj_replace on the table.
+        rj = [m for m in moves if m.startswith("rj_")]
+        if rj:
+            wall = [per_it[its[-1]].get(m, 0.0) for m in rj]
+            got = [yields.get(m, [0.0])[-1] for m in rj]
+            x = np.arange(len(rj))
+            ax[2].bar(x - 0.2, wall, 0.4, color=CYAN, label="wall [s]")
+            ax2b = ax[2].twinx()
+            ax2b.bar(x + 0.2, got, 0.4, color=GREEN, label="cold accepts")
+            ax2b.set_ylabel("cold RJ accepts", color=GREEN)
+            ax[2].set_xticks(x)
+            ax[2].set_xticklabels([m.replace("rj_", "") for m in rj],
+                                  rotation=30, ha="right", fontsize=7)
+            ax[2].set_ylabel("wall [s]", color=CYAN)
+            ax[2].set_title("cost vs yield, latest iteration")
+        fig_b64(fig, "search_efficiency")
+
+        # The split is a table, not a plot -- three numbers per move.
+        _rows = []
+        for mv in moves:
+            _rs, _im = splits.get(mv, (0.0, 0.0))
+            _w = per_it[its[-1]].get(mv, 0.0)
+            if _w <= 0:
+                continue
+            _rows.append((mv, _w, _rs, _im, 100.0 * _im / max(_w, 1e-9)))
+        SEARCH_SPLIT_ROWS = _rows
+    else:
+        SEARCH_SPLIT_ROWS = []
+except Exception as _e:                       # never break the page
+    SEARCH_SPLIT_ROWS = []
+    MISSING.append(f"search-efficiency panel failed: {_e!r}")
+
+if SEARCH_SPLIT_ROWS:
+    _tot_w = sum(r[1] for r in SEARCH_SPLIT_ROWS)
+    _tot_rs = sum(r[2] for r in SEARCH_SPLIT_ROWS)
+    _tot_im = sum(r[3] for r in SEARCH_SPLIT_ROWS)
+    _cells = "".join(
+        f"<tr><td>{mv}</td><td style='text-align:right'>{w:,.0f}</td>"
+        f"<td style='text-align:right'>{rs:,.0f}</td>"
+        f"<td style='text-align:right'>{im:,.0f}</td>"
+        f"<td style='text-align:right'>{pct:.0f}%</td></tr>"
+        for mv, w, rs, im, pct in SEARCH_SPLIT_ROWS)
+    SEARCH_SPLIT_HTML = (
+        "<table style='width:100%;border-collapse:collapse;font-size:12px'>"
+        "<tr><th style='text-align:left'>move</th>"
+        "<th style='text-align:right'>wall [s] / iteration</th>"
+        "<th style='text-align:right'>rj_step [s] / propose</th>"
+        "<th style='text-align:right'>polish [s] / propose</th>"
+        "<th style='text-align:right'>polish %</th></tr>"
+        + _cells
+        + f"<tr><td><b>total</b></td>"
+          f"<td style='text-align:right'><b>{_tot_w:,.0f}</b></td>"
+          f"<td style='text-align:right'><b>{_tot_rs:,.0f}"
+          f" ({100.0 * _tot_rs / max(_tot_w, 1e-9):.0f}%)</b></td>"
+          f"<td style='text-align:right'><b>{_tot_im:,.0f}"
+          f" ({100.0 * _tot_im / max(_tot_w, 1e-9):.0f}%)</b></td>"
+          f"<td></td></tr></table>")
+else:
+    SEARCH_SPLIT_HTML = "<i>no [GF_TIMING] per-iteration records in this log</i>"
+
 # gpu util CSVs (latest three jobs only -- earlier ones are archived attempts)
 csvs = sorted([fn for fn in os.listdir(RUN_DIR) if fn.startswith("gpu_util")])[-3:]
 if csvs:
@@ -5236,6 +5385,24 @@ model fills. {GB_FATE_TXT}</div></div>
 <div class="panel">{img("timing_moves", "per-move throughput")}
 <div class="caption">Proposal throughput and wall time per propose, per move, against
 elapsed run time.</div></div>
+<div class="panel">{img("search_efficiency", "search efficiency")}
+<div class="caption">What the recipe COSTS against what it BUYS. Left: where an
+iteration's wall time goes, per move. Middle: seconds per NEW cold leaf per walker,
+annotated with the leaf gain &mdash; this is the number that degrades as the search
+saturates, and it moves even when the per-iteration cost is flat. Right: each RJ
+move's wall time (cyan, left axis) beside the cold RJ accepts it actually landed
+(green, right axis) on the latest iteration; a tall cyan bar over a zero green bar
+is a move paying full price for nothing.</div></div>
+<div class="panel">{SEARCH_SPLIT_HTML}
+<div class="caption">Inside each move: how much of its wall is the RJ step itself
+versus the in-model convergence polish that follows it. The polish dominating every
+row is the expected shape once the convergence rule is armed &mdash; it is what makes
+"the RJ schedule got expensive" the wrong reading of a slow iteration.
+&#9888; The wall column is PER ITERATION, the split columns are PER PROPOSE, taken
+from the most recent <code>[GB_TIMING &lt;move&gt; head r0]</code> record. They agree
+for a one-propose move; <code>rj_replace</code> runs TWO passes per iteration, so its
+split row is one pass and its true polish share is about double what the row shows
+(98%, not 49%).</div></div>
 <div class="panel">{img("gb_cap_cells", "cap-cell occupancy")}
 <div class="caption">{CAP_TXT} Left is the direct test of whether the cap is being
 respected: bars at or above the cap are amber, and a bar past it would mean sources are
