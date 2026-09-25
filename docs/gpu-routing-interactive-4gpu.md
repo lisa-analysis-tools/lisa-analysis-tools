@@ -29,6 +29,30 @@ either way. Placement confirmed round-robin A,B,A,B,A with each node's two
 compute ranks on distinct devices, and at `R=2` block 0 was ranks (0,1) —
 i.e. straddling both nodes, as predicted.
 
+## ✅ R=1 PRODUCTION-SHAPE PREFLIGHT PASSED — 2026-09-24
+
+The first GPU execution of the merged code, at the **v9 launch shape**
+(`NWALKERS=4`, `RANKS_PER_BLOCK=1`, knob unset → `n_blocks=4 R=1`), via
+`gate_run.py --stock gb_no_fg_lite`, `NUM_ITERATIONS=2`, 5 ranks / 2 nodes:
+
+* `run_mcmc` **completed both iterations** — `_write_submission()` is called
+  immediately after it returns, and its multi-rank skip warning is in the log
+  (`the head's ACA holds only walkers [0, 1) of 4`, which also confirms the
+  block width).
+* **Zero** `log_like_final disagrees`, `residual hashes disagree`, `fan-out
+  sequence mismatch`, `Traceback`, `Abort`, `walker-count mismatch`.
+* Real GPU path: `cuda13x` backends loaded, GB information matrices built,
+  saver on rank 4 prefixing correctly. Clean interpreter shutdown.
+* `gate_run`'s pin resolution confirmed on hardware: `GB_INMODEL_SETUP_BATCH=2048`
+  and `GB_SIGHET_FOLD_MAX_BYTES=1073741824` both applied as NUMBERS with
+  "shell overrides kept (none)" — the `${VAR:-default}` parser fix working.
+
+⚠ **Two limits on what this proves.** The mojito cache was absent so it fell
+back to `data_mode='synthetic'` (the gate's loud injection was still applied
+on all 5 ranks, so the test is not vacuous, but it is not the real galaxy).
+And it validates the **R=1 path only** — GPUs > walkers remains untested end
+to end.
+
 **Next: G4** (three-factorization parity, ~30 min), then G5 (the decision
 gate, ~1 h).
 
