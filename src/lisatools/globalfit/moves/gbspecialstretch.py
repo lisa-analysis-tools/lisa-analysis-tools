@@ -8047,6 +8047,31 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             self.is_rj_prop
             and os.environ.get("GB_RJ_GROUPED_INMODEL", "1") == "1"
         )
+        # The per-round interleave below has NO survivor pool and no
+        # provenance split, so _converge_state_for is never consulted on
+        # it: every row -- birth, accepted replace, survivor alike -- takes
+        # the flat survivor budget. That is the intended legacy behaviour
+        # (this path exists as the pre-pooling baseline), but combined with
+        # an armed convergence knob it is the silent-no-op shape that has
+        # bitten this run four times, so say so once.
+        if (
+            self.is_rj_prop
+            and not grouped
+            and getattr(self, "inmodel_converge", "off") != "off"
+            and _converge_stage_allows(self)
+            and not getattr(self, "_converge_ungrouped_warned", False)
+        ):
+            self._converge_ungrouped_warned = True
+            logger.warning(
+                "[GB_IMCONV %s] %s_INMODEL_CONVERGE is armed but "
+                "GB_RJ_GROUPED_INMODEL=0 -- the per-round interleave has no "
+                "survivor pool and no provenance split, so it runs a FIXED "
+                "%d repeats for EVERY row: births, accepted replaces and "
+                "survivors alike. Nothing runs to convergence on this path. "
+                "Set GB_RJ_GROUPED_INMODEL=1 (the default) to get it.",
+                self.name, str(self.branch_name).upper(),
+                int(self.inmodel_repeats_survivor),
+            )
 
         round_i = 0
         # DIRECT-BATCH RJ -> in-model (user design 2026-08-14,

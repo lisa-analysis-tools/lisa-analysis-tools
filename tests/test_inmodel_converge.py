@@ -1903,6 +1903,93 @@ class ReplaceGetsConvergencePolishTest(unittest.TestCase):
         self.assertIn("_acc_picked[sel[accept]] = True", body)
         self.assertNotIn("_acc_picked[:] = True", body)
 
+    def _gate(self, name, classes):
+        """Does the convergence driver arm for this move / class?"""
+        from types import SimpleNamespace
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        f = SimpleNamespace(
+            name=name, branch_name="gb", inmodel_converge="on",
+            inmodel_converge_classes=frozenset(classes),
+            inmodel_repeats_newborn=100, inmodel_repeats_survivor=50,
+            inmodel_converge_iters=250, inmodel_converge_max=20000,
+            inmodel_converge_dll=4.0, inmodel_converge_gate_frac=0.5,
+            inmodel_converge_stop_frac=0.5, inmodel_converge_refill=True,
+            ntemps=24, _converge_armed_logged=True, _converge_pe_warned=True,
+        )
+        return {
+            c: g.GBSpecialBase._converge_state_for(f, c) is not None
+            for c in ("newborn", "mature")
+        }
+
+    def test_BOTH_classes_converge_for_replace_under_the_shipped_classes(self):
+        """User ruling 2026-09-25: replace runs "both successful changes
+        and survivors" to convergence.
+
+        Accepted swap -> newborn, rejected swap -> mature, and the shipped
+        GB_INMODEL_CONVERGE_CLASSES=newborn,mature arms BOTH -- so neither
+        falls back to a flat budget. This is the behavioural half of the
+        source assertions above; the tests either side of it would all
+        still pass if the classes knob silently dropped one class.
+        """
+        self.assertEqual(self._gate("rj_replace", ("newborn", "mature")),
+                         {"newborn": True, "mature": True})
+
+    def test_the_default_classes_would_leave_survivors_on_a_flat_budget(self):
+        """The control: the knob is what carries the survivor half, so the
+        stock default really does behave differently. Without this, the
+        test above passes for the wrong reason."""
+        self.assertEqual(self._gate("rj_replace", ("newborn",)),
+                         {"newborn": True, "mature": False})
+
+    def test_replace_PE_still_refuses_both(self):
+        """A convergence-plateau stop is a search-only licence."""
+        self.assertEqual(self._gate("rj_replace_pe", ("newborn", "mature")),
+                         {"newborn": False, "mature": False})
+
+
+class UngroupedPathHasNoConvergenceAndSaysSoTest(unittest.TestCase):
+    """``GB_RJ_GROUPED_INMODEL=0`` silently disables the whole rule.
+
+    The per-round interleave keeps no survivor pool, so it never calls
+    ``_split_by_newborn`` and never consults ``_converge_state_for``: it
+    runs a flat ``inmodel_repeats_survivor`` for every row -- births,
+    accepted replaces and survivors alike. That is the intended legacy
+    behaviour of a baseline path, but an operator who also exported
+    ``GB_INMODEL_CONVERGE=on`` got no convergence and no indication of
+    it, which is the exact "knob resolves, consuming path never runs"
+    shape that produced four separate defects in this run.
+    """
+
+    def _src(self):
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        return inspect.getsource(g.GBSpecialBase._run_band_unit)
+
+    def test_the_ungrouped_path_still_takes_the_flat_survivor_budget(self):
+        """Pin the premise: if this ever gains a pool, the warning is
+        wrong and must go."""
+        src = self._src()
+        self.assertIn("self.inmodel_repeats_survivor\n", src)
+        # the provenance split belongs to the pooled paths only
+        self.assertEqual(src.count("_split_by_newborn"), 2)
+
+    def test_it_warns_once_when_convergence_is_armed(self):
+        src = self._src()
+        self.assertIn("_converge_ungrouped_warned", src)
+        self.assertIn("GB_RJ_GROUPED_INMODEL=0", src)
+        self.assertIn("Nothing runs to convergence on this path.", src)
+
+    def test_the_warning_is_search_scoped_and_rj_scoped(self):
+        """A pure in-model move converges through the GROUP rule instead,
+        and PE has no convergence by design -- neither should be nagged."""
+        src = self._src()
+        blk = src[src.index("grouped = ("):src.index("round_i = 0")]
+        self.assertIn("_converge_ungrouped_warned", blk)
+        self.assertIn("self.is_rj_prop", blk)
+        self.assertIn("_converge_stage_allows(self)", blk)
+
 
 class PerWalkerValveStatisticTest(unittest.TestCase):
     """REGRESSION: the per-walker RJ valve got a ONE-BLOCK lnL with caps off.
