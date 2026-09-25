@@ -3256,7 +3256,19 @@ if [ "${SLURM_NNODES:-1}" -gt 1 ]; then
   # SLURM_NTASKS is always set inside a job step; the :-3 default matches the
   # mpiexec branch below so an odd/manual allocation still launches the
   # head+compute+saver shape instead of dying on an unset var under `set -u`.
+  # I_MPI_JOB_RESPECT_PROCESS_PLACEMENT=0 is what makes `-ppn 1` actually
+  # bind (2026-09-18, first 4-GPU one-walker launch): with the SLURM
+  # bootstrap hydra otherwise honours the scheduler's PER-NODE TASK COUNTS
+  # over -ppn. At 3 tasks over 2 nodes the two placements happen to agree,
+  # which is why WP7 Step 0 never saw it; at 5 tasks (4 compute + saver)
+  # SLURM's block split is 3/2, so node A got compute ranks 0,1,2 and
+  # build_layout refused -- "3 compute ranks but the per-node GPU pool
+  # [0, 1] supports at most 2". With placement respect OFF the round robin
+  # is A,B,A,B,A: node A takes compute 0, compute 2 and the saver, node B
+  # takes compute 1 and 3, two compute ranks per 2-GPU node. Verified by
+  # GF_LAYOUT_DRY_RUN on the live allocation before the relaunch.
   export I_MPI_HYDRA_BOOTSTRAP=slurm I_MPI_FABRICS=shm:ofi FI_PROVIDER=tcp
+  export I_MPI_JOB_RESPECT_PROCESS_PLACEMENT=0
   mpiexec -n "${SLURM_NTASKS:-3}" -ppn 1 python scripts/fstat_proposal/run_combined_staged.py
 else
   mpiexec -n "${SLURM_NTASKS:-3}" python scripts/fstat_proposal/run_combined_staged.py

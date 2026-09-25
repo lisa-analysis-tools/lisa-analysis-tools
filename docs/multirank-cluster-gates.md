@@ -49,8 +49,22 @@ libfabric's tcp provider:
 
 ```sh
 export I_MPI_HYDRA_BOOTSTRAP=slurm I_MPI_FABRICS=shm:ofi FI_PROVIDER=tcp
+export I_MPI_JOB_RESPECT_PROCESS_PLACEMENT=0   # or -ppn is ignored, see below
 mpiexec -n <ntasks> -ppn 1 python ...        # -ppn 1 = round-robin over the hosts
 ```
+
+**`-ppn 1` does not bind on its own** (2026-09-18, the first 4-GPU one-walker
+launch). Under the SLURM bootstrap hydra honours the scheduler's PER-NODE TASK
+COUNTS over `-ppn`. At 3 tasks over 2 nodes block and cyclic happen to agree,
+which is why Step 0 never saw it. At 5 tasks (4 compute + saver) SLURM's block
+split is 3/2, so node A received compute ranks 0, 1 and 2 and `build_layout`
+refused: *"node ...-1: 3 compute ranks but the per-node GPU pool [0, 1]
+supports at most 2"*. `I_MPI_JOB_RESPECT_PROCESS_PLACEMENT=0` restores the
+round robin (A,B,A,B,A): node A takes compute 0, compute 2 and the saver, node
+B takes compute 1 and 3. Both campaign scripts and the 3-month twin export it
+next to the fabric pins; `tests/test_submit_scripts_layout.py` keeps it there.
+Verify on a live allocation in seconds with `GF_LAYOUT_DRY_RUN=1` before
+spending GPU time.
 
 `-ppn 1` places consecutive ranks A, B, A, B, ... — the "cyclic" placement the
 walker-block layout wants (head + saver on node A, the compute ranks spread
