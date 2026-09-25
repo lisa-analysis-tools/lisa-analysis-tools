@@ -971,26 +971,52 @@ class PsdPinPlausibilityTest(unittest.TestCase):
         self.assertAlmostEqual(ratios["Sa_a"], 0.953, places=2)
         self.assertTrue(all(ok for *_, ok in rows))
 
-    def test_sqrt_units_not_squared(self):
-        """The branch samples (Soms_d, Sa_a) in SQRT units; the detector
-        models carry the SQUARED PSD levels. Comparing the two directly
-        would call every correct pin ~1e11x off."""
-        from math import sqrt
+    def test_the_reference_is_psd_truth_levels_in_SQRT_units(self):
+        """⚠ The reference must come from ``psd_truth_levels`` -- "the one
+        place the diagnostic pages should get this pair" -- and it is
+        already in SQRT units, the same basis the branch samples.
 
-        from lisatools.detector import scirdv1
+        TWO WRONG REFERENCES ARE WITHIN EASY REACH and both were reached
+        for on 2026-09-25:
+
+        * a run's ``run_settings.log`` carries ``noise_soms_d /
+          noise_sa_a = 1.496182e-11 / 2.982412e-15``, which looks like the
+          injection and is the EQUAL-arm fit, 0.26% / 0.59% LOW -- the
+          exact literal ``psd_truth_levels`` exists to retire. Using it
+          reports a correct pin as biased;
+        * ``lisatools.detector`` models carry SQUARED levels, so rooting
+          them is an extra step that can silently go missing (a factor
+          ~1e11).
+
+        Pinning the resolved value against the documented constant closes
+        both.
+        """
+        from lisatools.globalfit.stock.erebor.noise import (
+            MOJITO_LIGHT_PSD_INJECTION)
         from lisatools.globalfit.warmstart.noise_pin import psd_plausibility
 
+        # ⚠ RELATIVE comparisons only. ``assertAlmostEqual`` defaults to 7
+        # DECIMAL PLACES, so at 1e-11 it passes for literally any small
+        # number -- including 0.0, and including the equal-arm literal this
+        # test exists to exclude. Every check here is a ratio.
         noms = {n: nom for n, _, nom, _, _ in
                 psd_plausibility([1.0e-11, 3.0e-15])}
-        self.assertAlmostEqual(noms["Soms_d"], sqrt(float(scirdv1.Soms_d)))
-        self.assertAlmostEqual(noms["Sa_a"], sqrt(float(scirdv1.Sa_a)))
-        self.assertAlmostEqual(noms["Soms_d"], 1.5e-11)
+        self.assertAlmostEqual(
+            noms["Soms_d"] / MOJITO_LIGHT_PSD_INJECTION[0], 1.0, places=12)
+        self.assertAlmostEqual(
+            noms["Sa_a"] / MOJITO_LIGHT_PSD_INJECTION[1], 1.0, places=12)
+        self.assertAlmostEqual(noms["Soms_d"] / 1.5e-11, 1.0, places=12)
+        # ...and NOT the equal-arm fit literal, which is 0.26% away -- a gap
+        # only a relative test can see.
+        self.assertGreater(
+            abs(noms["Soms_d"] / 1.4961821164690655e-11 - 1.0), 1e-3)
 
     def test_the_band_is_calibrated_on_the_CONVERGED_v8_posterior(self):
         """The band is measured, not guessed. These are the 6mo v8 4-GPU
         cold-chain medians over the last 50 stored rows to iteration 746,
         which reproduce that run's monitor page ("medians sit -0.0% and
-        +1.5% from injection") and so confirm the injection is scirdv1."""
+        +1.5% from injection") to the digit -- confirming both the band
+        and that the monitor's own truth line is right."""
         from lisatools.globalfit.warmstart.noise_pin import psd_plausibility
 
         rows = psd_plausibility([1.49989144e-11, 3.04400590e-15])
