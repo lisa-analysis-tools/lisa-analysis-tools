@@ -118,12 +118,10 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         # 100 -> 250 (user, 2026-09-25, "just to be safe" for births).
         self.assertEqual(self.v9["GB_INMODEL_CONVERGE_ITERS"], "250")
         self.assertEqual(self.v9["GB_INMODEL_CONVERGE_DLL"], "4.0")
-        # newborn -> newborn,mature (user, 2026-09-25): a row that was
-        # alive at pick and survived the RJ step had just proved it was
-        # worth keeping, and under "newborn" it got the LEAST polish in
-        # the pool -- the flat survivor budget while births converged.
-        self.assertEqual(
-            self.v9["GB_INMODEL_CONVERGE_CLASSES"], "newborn,mature")
+        # NEWBORN only. A survivor's convergence is the GROUP rule in the
+        # pure in-model slot that follows every RJ move, not this per-row
+        # rule inside the RJ pool (user clarification 2026-09-25).
+        self.assertEqual(self.v9["GB_INMODEL_CONVERGE_CLASSES"], "newborn")
 
     def test_the_row_ceiling_leaves_room_ABOVE_the_patience_floor(self):
         """⚠ The floor is W+1: a row cannot retire before the window is
