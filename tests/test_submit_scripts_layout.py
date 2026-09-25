@@ -304,6 +304,60 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         self.assertGreaterEqual(
             int(self.v9["MIDIT_CHECKPOINT_MIN_INTERVAL"]), 0)
 
+    def test_the_galfor_start_is_the_offline_3mo_estimate(self):
+        """User ruling 2026-09-24, chosen explicitly over the 6mo
+        alternative. PHYSICAL/LINEAR, amp MODULATION-CORRECTED (the 90 d
+        window sits on a dim stretch, <M_XX> = 0.808, so the correction
+        RAISES amp -- using the raw number understates by 19%).
+
+        Pinned as numbers against the file they came from, because the
+        vector is only meaningful as a whole: two of its five parameters
+        are unidentified, and cherry-picking one would silently change the
+        curve.
+        """
+        import json
+        import os as _os
+
+        raw = self.v9["GALFOR_START_PARAMS"]
+        got = [float(x) for x in raw.split(",")]
+        self.assertEqual(len(got), 5)
+        src = _os.path.join(
+            _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+            "galfor_6mo_figs", "addback_fixedpoint_90d.json")
+        if not _os.path.exists(src):
+            self.skipTest("addback_fixedpoint_90d.json is untracked scratch")
+        fp = json.load(open(src))["history"][-1]["prior_box_refit"]
+        want = [fp["amp_modulation_corrected"], fp["params"]["fk"],
+                fp["params"]["alpha"], fp["params"]["f_1"],
+                fp["params"]["f_2"]]
+        for g, w, n in zip(got, want, ("amp", "fk", "alpha", "f_1", "f_2")):
+            self.assertAlmostEqual(g / w, 1.0, places=9, msg=n)
+
+    def test_the_galfor_start_is_inside_the_run_prior(self):
+        """⚠ The one check that matters: outside the support, every walker
+        and every rung prices at log_prior = -inf on iteration 0. alpha 5.0
+        is INTERIOR only because GALFOR_ALPHA_MAX=20.0 is also exported --
+        the two knobs are load-bearing together."""
+        from lisatools.globalfit.stock.erebor.noise import (
+            GALFOR_BASIS, GALFOR_PRIOR_RANGE)
+
+        got = [float(x) for x in self.v9["GALFOR_START_PARAMS"].split(",")]
+        box = [list(map(float, r)) for r in GALFOR_PRIOR_RANGE]
+        box[GALFOR_BASIS.index("alpha")][1] = float(
+            self.v9["GALFOR_ALPHA_MAX"])
+        for n, v, (lo, hi) in zip(GALFOR_BASIS, got, box):
+            self.assertTrue(lo <= v <= hi, f"{n}={v:g} outside [{lo:g},{hi:g}]")
+
+    def test_a_hand_set_galfor_start_survives_the_seed_pin(self):
+        """The script hardcodes GALFOR_START_PARAMS and ALSO reads a pin
+        from GF_SEED_STORE. The pin block must not clobber it -- that is
+        what the per-variable guard is for, and it is the whole reason an
+        offline estimate can be supplied at all."""
+        src = open(SIX_MO_V9).read()
+        self.assertIn("_gal_was=${GALFOR_START_PARAMS+set}", src)
+        self.assertIn("was set by hand -- keeping it, not the store's", src)
+        self.assertIn("${GALFOR_START_PARAMS:-", src)
+
     def test_the_noise_pin_is_read_at_MAXLOGL(self):
         """noise_pin reads best_logl_noise, i.e. the best-logL cold walker
         of the last valid row -- not a posterior mean."""
@@ -335,6 +389,8 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             "GF_SEED_STORE", "GB_WARM_START_SOURCE_STORE",
             # mid-iteration checkpoints, pinned explicitly for v9
             "MIDIT_CHECKPOINT", "MIDIT_CHECKPOINT_MIN_INTERVAL",
+            # the offline 3mo galfor start point
+            "GALFOR_START_PARAMS",
         }
         drift = {
             k: (self.v8.get(k), self.v9.get(k))

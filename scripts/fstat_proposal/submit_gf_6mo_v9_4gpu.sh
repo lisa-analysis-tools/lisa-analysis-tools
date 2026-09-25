@@ -3391,6 +3391,51 @@ export GB_WARM_START_CIRC_IMAGES=${GB_WARM_START_CIRC_IMAGES:-3}
 # the current model can represent.
 #
 # Export V9_PIN_REQUIRED=1 to make a failed pin FATAL instead.
+# ---- THE GALFOR START POINT: the OFFLINE 3-MONTH ESTIMATE ----------------
+# USER RULING 2026-09-24, asked for explicitly after being shown the 6-month
+# alternative: use the 3mo offline estimate. "For now" -- the durable
+# mechanism is the maxlogL pin from GF_SEED_STORE, which is what the block
+# below does for psd.
+#
+# PHYSICAL / LINEAR, order (amp, fk, alpha, f_1, f_2). run.py converts into
+# the sampled basis (log10 on amp/fk/f_1/f_2; alpha stays LINEAR).
+# amp is MODULATION-CORRECTED: the raw 90 d Welch fit is 1.160508e-44 and is
+# divided by <M_XX> = 0.8080513 over the leading 90 d, because this run puts
+# M(t) back on top (GALFOR_MODULATION_PATH + _T0=data, exported above).
+# ⚠ The 90 d window sits on a DIM stretch of the annual sweep (<M_XX> < 1,
+# unlike 180 d's 1.1031), so the correction RAISES the amplitude here. Using
+# the raw number would understate the foreground by 19%.
+#
+# PROVENANCE: galfor_6mo_figs/addback_fixedpoint_90d.json,
+# history[-1].prior_box_refit. Add-back fixed point -- the GALFOR brick has a
+# TWO-YEAR resolvable set subtracted (subtract_resolvable_tdi.py output, 8420
+# binaries at SNR>7 / Tobs=1.999yr), so the binaries that no longer clear SNR
+# 7 at 90 d are regenerated and added back; doing that once is a lower bound
+# because the added power demotes more, so it is iterated to a fixed point.
+# Converged at iteration 6: n_drop 5227 -> 6792, delta +7, fit rms 0.0755,
+# fmax 3e-3. ⚠ fit_galfor's DEFAULT fmax 8e-3 RAILS at every Tobs -- three
+# sessions confirmed that independently; 3e-3 is the working value.
+#
+# ⚠ f_1 IS AT ITS CEILING AND IS NOT A MEASUREMENT. The unconstrained fit
+# wants f_1 ~ 0.365 Hz, i.e. exp(-(f/f_1)^alpha) == 1 and the tanh doing all
+# the cutting -- a real property of the 3mo spectrum, not a fit that failed
+# to settle (f_1 sat at 0.14 .. 0.45 Hz across all six iterations at flat
+# rms). Refitting inside the prior support changed the rms by nothing at all
+# (0.07547 constrained vs 0.07547 free), which is exactly what an
+# unidentified parameter looks like, and the curve moves < 2.24% over
+# 0.8-5 mHz. Expect f_1 to sit against 1e-2 and the branch to wander along
+# the exp-vs-tanh degeneracy; that is not a pathology. alpha 5.0 is INTERIOR
+# here only because GALFOR_ALPHA_MAX=20.0 is exported above.
+# Verified through the branch's own prior: total log_prior = -7.077, finite.
+#
+# ⚠ IT IS THE WRONG Tobs, IN THE UNSAFE DIRECTION. The 3mo foreground is
+# louder than the 6mo one (amp 1.436e-44 vs the verified 6mo fixed point's
+# 1.163e-44, x1.235), and a floor that is too HIGH hides sources -- the
+# search's own SNR gate is computed against it. The 6mo fixed point is
+# 1.162927183e-44,0.007332070412,3.371045451,0.002620587616,0.0005505988026
+# (all five interior, no translation needed) if this is ever revisited.
+export GALFOR_START_PARAMS=${GALFOR_START_PARAMS:-1.436180605904e-44,2.533915614978e-03,5.0,1.0e-02,1.405721657329e-03}
+
 #
 # ⚠ A HAND-SET VALUE ALWAYS WINS, PER VARIABLE. The guard used to test
 # PSD_START_PARAMS only, so someone who set GALFOR_START_PARAMS by hand --
