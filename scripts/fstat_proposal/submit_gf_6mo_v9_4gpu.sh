@@ -3391,10 +3391,28 @@ export GB_WARM_START_CIRC_IMAGES=${GB_WARM_START_CIRC_IMAGES:-3}
 # the current model can represent.
 #
 # Export V9_PIN_REQUIRED=1 to make a failed pin FATAL instead.
-if [ -z "${PSD_START_PARAMS+x}" ] && [ -f "${GF_SEED_STORE}" ]; then
+#
+# ⚠ A HAND-SET VALUE ALWAYS WINS, PER VARIABLE. The guard used to test
+# PSD_START_PARAMS only, so someone who set GALFOR_START_PARAMS by hand --
+# which is exactly how an OFFLINE foreground estimate is supplied -- had it
+# silently overwritten by the store's. Both are now saved across the eval and
+# restored, so pinning one by hand still lets the other come from the store.
+# ``${VAR+x}`` is set-ness, not emptiness, so an explicit empty value (the
+# documented "no pin for this branch" escape) is honoured too.
+_psd_was=${PSD_START_PARAMS+set}; _psd_save=${PSD_START_PARAMS-}
+_gal_was=${GALFOR_START_PARAMS+set}; _gal_save=${GALFOR_START_PARAMS-}
+if [ -f "${GF_SEED_STORE}" ] && { [ -z "${_psd_was}" ] || [ -z "${_gal_was}" ]; }; then
   if _pin=$(python -m lisatools.globalfit.warmstart.noise_pin \
               --store "${GF_SEED_STORE}" --export); then
     eval "${_pin}"
+    if [ -n "${_psd_was}" ]; then
+      export PSD_START_PARAMS="${_psd_save}"
+      echo "[V9-SEED] PSD_START_PARAMS was set by hand -- keeping it, not the store's."
+    fi
+    if [ -n "${_gal_was}" ]; then
+      export GALFOR_START_PARAMS="${_gal_save}"
+      echo "[V9-SEED] GALFOR_START_PARAMS was set by hand -- keeping it, not the store's."
+    fi
   else
     echo "[V9-SEED] ############################################################"
     echo "[V9-SEED] # NO NOISE PIN: could not extract one from"
@@ -3419,10 +3437,13 @@ if [ -z "${PSD_START_PARAMS+x}" ] && [ -f "${GF_SEED_STORE}" ]; then
     fi
   fi
   unset _pin
+elif [ -n "${_psd_was}" ] && [ -n "${_gal_was}" ]; then
+  echo "[V9-SEED] both start pins were supplied explicitly -- the seed store is not read."
 elif [ ! -f "${GF_SEED_STORE}" ]; then
   echo "[V9-SEED] GF_SEED_STORE=${GF_SEED_STORE} not found -- no noise pin."
   echo "[V9-SEED] noise_search / noise_vgb_search will run and fit it."
 fi
+unset _psd_was _psd_save _gal_was _gal_save
 echo "[V9-SEED] store=${GF_SEED_STORE}"
 echo "[V9-SEED] PSD_START_PARAMS=${PSD_START_PARAMS:-<unset: noise stages will run>}"
 echo "[V9-SEED] GALFOR_START_PARAMS=${GALFOR_START_PARAMS:-<unset>}"
