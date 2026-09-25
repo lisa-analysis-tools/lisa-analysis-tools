@@ -1275,8 +1275,34 @@ export GB_INMODEL_CONVERGE_STOP_FRAC=0.5
 # 2040 CARRIED rows. Price it from the [GB_IMCONV] generation count, not from
 # a single 73-repeat figure.
 export GB_INMODEL_CONVERGE_REFILL=1
-# Newborns only -- mature survivors keep the fixed SURVIVOR budget above.
-export GB_INMODEL_CONVERGE_CLASSES=newborn
+# newborn -> newborn,mature (user ruling 2026-09-25: "Sources that make it
+# through the RJ proposals without getting removed should also run to
+# convergence just like the births. Let the in model moves mix them up.")
+#
+# A pooled row is MATURE when it was alive at pick and survived the RJ step
+# -- it was judged for death and kept. Under the old setting those rows took
+# the flat GB_INMODEL_REPEATS_SURVIVOR budget (50) while newborns converged,
+# so a source that had just proved it was worth keeping got the LEAST
+# polish of anything in the pool. Now both classes run the window/ceiling
+# rule and stop on their own evidence.
+#
+# ⚠ SCOPE -- this reaches the pool of the RJ moves, not the three pure
+# in-model slots. Their convergence is the GROUP rule ([GB_IMGROUP], per
+# (walker, band) sub-band), which is a different scope and was already
+# correct; _run_in_model_repeats is not passed a converge state on that
+# path. So "mature" here means "mature rows pooled by an RJ move", and
+# adding it does NOT silently change the in_model/in_model_fstat/
+# in_model_replace budget.
+#
+# ⚠ COST. Mature rows are the BULK of the pool once the search has found
+# most of the catalogue, so this is the largest single cost increase in
+# this batch -- newborns were a minority. The stop is evidence-based
+# (window 250, dll 4.0) and GB_INMODEL_CONVERGE_STOP_FRAC=0.5 still ends a
+# block when half the gated rows are done, so it is bounded by the same
+# two mechanisms as the newborn class. Watch the [GB_IMCONV mature] line:
+# a high "at floor" fraction there means mature rows plateau immediately
+# and the convergence is buying nothing for them.
+export GB_INMODEL_CONVERGE_CLASSES=newborn,mature
 
 # ===========================================================================
 # V9-6: IN-GROUP CONVERGENCE FOR THE PURELY IN-MODEL PROPOSALS
