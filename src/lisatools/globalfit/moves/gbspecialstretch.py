@@ -2285,6 +2285,47 @@ def _vert_all_rung_pairs(carrier, occupied, parity, ntemps, xp):
     return ci[keep], tc[keep], th[keep]
 
 
+def _vert_all_rung_tables(t_i, w_i, b_i, ntemps, nwalkers, num_bands,
+                          alive_counts, xp):
+    """``(cols, carrier, occupied)`` covering EVERY rung of every column.
+
+    Columns are the distinct ``(walker, band)`` of the block's picked
+    rows. ``carrier[c, t]`` is the block row index sitting on rung ``t``
+    of column ``c``, or ``-1``. ``occupied[c, t]`` says whether that rung
+    holds any ALIVE source, picked or not -- it is read from
+    ``alive_counts``, a per-packed-special count over the whole sorter,
+    so it sees the unpicked sources the block itself cannot.
+
+    ``occupied`` and ``carrier`` are INDEPENDENT: a rung can be occupied
+    with no carrier (an alive source that was not picked this round),
+    and -- because an RJ subset carries DEAD rows whose band comes from a
+    drawn f0 -- a cell can exist in the scheduler while holding nothing
+    alive. Only ``carrier`` may be used to decide whether a rung is
+    scored live; only ``occupied`` may be used to decide whether a pair
+    is a real move. Conflating them is how the empty<->empty hazard gets
+    back in.
+    """
+    n = int(t_i.shape[0])
+    col_key = (w_i.astype(xp.int64) * int(num_bands)
+               + b_i.astype(xp.int64))
+    cols, inv = xp.unique(col_key, return_inverse=True)
+    n_cols = int(cols.shape[0])
+    carrier = xp.full((n_cols, int(ntemps)), -1, dtype=xp.int64)
+    carrier[inv, t_i.astype(xp.int64)] = xp.arange(n, dtype=xp.int64)
+    w_of = cols // int(num_bands)
+    b_of = cols % int(num_bands)
+    tt = xp.arange(int(ntemps), dtype=xp.int64)
+    # One packer, one convention: never re-derive the packing here.
+    spec = pack_special_index(
+        xp.broadcast_to(tt[None, :], (n_cols, int(ntemps))),
+        xp.broadcast_to(w_of[:, None], (n_cols, int(ntemps))),
+        xp.broadcast_to(b_of[:, None], (n_cols, int(ntemps))),
+        int(nwalkers),
+    )
+    occupied = xp.asarray(alive_counts(spec)) > 0
+    return cols, carrier, occupied
+
+
 def _vert_all_rung_L(carrier, cached, cell_ll_base, ll_ref, ci, t, xp):
     """Whole-cell likelihood of rung ``t`` of column ``ci``.
 

@@ -1247,6 +1247,41 @@ class AllRungPairsTest(unittest.TestCase):
         self.assertEqual(self._pairs(occ, car, 0), [])
         self.assertEqual(self._pairs(occ, car, 1), [])
 
+    def test_tables_see_UNPICKED_alive_sources(self):
+        """``occupied`` must come from the sorter, not from the block:
+        the whole point is to see rungs the block never picked."""
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            _vert_all_rung_tables)
+        NT, NW, NB = 4, 2, 5
+        # one picked row: (t=0, w=1, b=3). Rung 2 of the same column holds
+        # an ALIVE but UNPICKED source; rungs 1 and 3 are empty.
+        t_i = np.array([0]); w_i = np.array([1]); b_i = np.array([3])
+        live = {pack_special_index(0, 1, 3, NW): 1,
+                pack_special_index(2, 1, 3, NW): 1}
+
+        def alive_counts(spec):
+            return np.vectorize(lambda s: live.get(int(s), 0))(spec)
+
+        cols, carrier, occupied = _vert_all_rung_tables(
+            t_i, w_i, b_i, NT, NW, NB, alive_counts, np)
+        self.assertEqual(cols.tolist(), [1 * NB + 3])
+        self.assertEqual(carrier.tolist(), [[0, -1, -1, -1]])
+        self.assertEqual(occupied.tolist(), [[True, False, True, False]],
+                         "rung 2 is alive-but-unpicked and must show up")
+
+    def test_tables_keep_carrier_and_occupied_independent(self):
+        """A rung can be occupied with no carrier. If the builder ever
+        derived one from the other, the empty<->empty hazard returns."""
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            _vert_all_rung_tables)
+        NT, NW, NB = 4, 2, 5
+        t_i = np.array([0]); w_i = np.array([0]); b_i = np.array([1])
+        cols, carrier, occupied = _vert_all_rung_tables(
+            t_i, w_i, b_i, NT, NW, NB,
+            lambda spec: np.ones_like(np.asarray(spec)), np)
+        self.assertEqual(carrier.tolist(), [[0, -1, -1, -1]])
+        self.assertTrue(np.all(occupied), "all rungs alive in this fixture")
+
     def test_L_uses_live_values_for_carriers_and_cache_otherwise(self):
         from lisatools.globalfit.moves.gbspecialstretch import (
             _vert_all_rung_L)
