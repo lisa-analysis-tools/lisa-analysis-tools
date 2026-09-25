@@ -595,7 +595,10 @@ class BandScheduler:
         # walker, then temp), which is what makes whole-column staging a
         # slice rather than a gather. Under "count" ordering they are
         # scattered, so the mode is only available there.
-        self.column_atomic = (cell_order == "band")
+        # ``n_cells == 0`` (nothing to schedule at all) would make the
+        # boolean mask below shorter than ``_is_new`` and raise; the
+        # per-cell path already handles it by staging zero slots.
+        self.column_atomic = (cell_order == "band") and self.n_cells > 0
         if self.column_atomic:
             _b = self.cell_specials % _SPECIAL_INDEX_BASE
             _w = (self.cell_specials // _SPECIAL_INDEX_BASE) % int(nwalkers)
@@ -699,10 +702,31 @@ class BandScheduler:
             # the band ordering exists to provide.
             _slot_col = self._col_of_cell[self.slot_cell]
             _act = self.slot_active
+
+            def _bc(sel):
+                # cupy.bincount evaluates ``int(cupy.max(x)) + 1`` BEFORE it
+                # looks at minlength, so a zero-size selection raises
+                # "zero-size array to reduction operation CUPY_CUB_MAX"
+                # where numpy returns the all-zero histogram. Same guard as
+                # _bc / _cap_cell_counts in gbspecialstretch. BOTH
+                # selections below go empty in ordinary operation:
+                #   _act           -- every column retired and nothing left
+                #                     to stage, i.e. the scheduler has
+                #                     drained (this is what killed job 625
+                #                     in rj_warm_search);
+                #   _act & finished -- any pass where no slot finished,
+                #                     which is the normal state early in a
+                #                     round.
+                # Zeros are the right answer in both cases: _col_ready is
+                # then all-False and advance() takes its n_finished == 0
+                # early return.
+                if int(sel.shape[0]) == 0:
+                    return xp.zeros(int(self.n_cols), dtype=xp.int64)
+                return xp.bincount(sel, minlength=int(self.n_cols))
+
             # per-column: any active slot, and any active-but-unfinished
-            _n_act = xp.bincount(_slot_col[_act], minlength=self.n_cols)
-            _n_done = xp.bincount(_slot_col[_act & finished],
-                                  minlength=self.n_cols)
+            _n_act = _bc(_slot_col[_act])
+            _n_done = _bc(_slot_col[_act & finished])
             _col_ready = (_n_act > 0) & (_n_act == _n_done)
             finished = _act & _col_ready[_slot_col]
 
