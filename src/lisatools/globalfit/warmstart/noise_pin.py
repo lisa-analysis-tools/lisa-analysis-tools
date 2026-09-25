@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 
 import numpy as np
@@ -53,11 +54,31 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["noise_pin_from_store", "main"]
 
-#: Physical sanity windows, mirroring ``run.py``'s ``_NOISE_PIN_WINDOWS``.
-#: Deliberately wide: they catch a BASIS mistake (orders out), not physics.
-_PSD_WINDOW = ((1e-13, 1e-10), (1e-16, 1e-13))
-_GALFOR_WINDOW = ((1e-50, 1e-30), (1e-6, 1e-1), (0.0, 30.0),
-                  (1e-6, 1e-1), (1e-6, 1e-1))
+def _windows(kind):
+    """The PHYSICAL support the run's own prior defines, for one branch.
+
+    Read from the module that DEFINES the prior rather than duplicated here
+    (a hand-rolled window drifts, and this one has to be exactly the box the
+    chain is allowed to live in). ``GALFOR_ALPHA_MAX`` widens alpha the same
+    way ``galfor_prior_dict`` does.
+
+    ⚠ WHY THE PRIOR AND NOT A LOOSER "SANITY" WINDOW. A pin outside the
+    branch's support puts EVERY walker and EVERY rung at ``log_prior =
+    -inf`` on iteration 0. A window that merely catches order-of-magnitude
+    basis mistakes would pass such a point and the run would die -- or
+    worse, sit there. The prior is the real constraint, so it is the test.
+    """
+    from ...globalfit.stock.erebor.noise import (
+        GALFOR_BASIS, GALFOR_PRIOR_RANGE, PSD_PRIOR_RANGE)
+
+    if kind == "psd":
+        return tuple(tuple(map(float, r)) for r in PSD_PRIOR_RANGE)
+    rngs = [tuple(map(float, r)) for r in GALFOR_PRIOR_RANGE]
+    _am = os.environ.get("GALFOR_ALPHA_MAX", "").strip()
+    if _am:
+        ia = GALFOR_BASIS.index("alpha")
+        rngs[ia] = (rngs[ia][0], float(_am))
+    return tuple(rngs)
 
 
 def _looks_log(vals, log_cols) -> bool:
@@ -86,16 +107,38 @@ def _to_physical(vals, kind: str, basis: str):
     return out, basis
 
 
+#: ``fk``/``f_1``/``f_2`` ceilings were tightened on 2026-08-13 by ea7790f3,
+#: "galfor priors: bring the fk / f_1 / f_2 ceilings into the analysis band".
+#: The OLD ceilings (fk 1e-1, f_1 1e7, f_2 1e4) were, in that commit's words,
+#: "the old slope-unit numbers" carried over from the pre-abf52571
+#: parameterization and never updated -- so any store written before it can
+#: hold a perfectly legitimate sample that today's box excludes.
+_PRIOR_TIGHTENED = "2026-08-13 (ea7790f3)"
+
+
 def _check(vals, window, name) -> None:
     for i, (lo, hi) in enumerate(window):
         if not (lo <= float(vals[i]) <= hi):
             raise SystemExit(
                 f"[NOISE-PIN] FATAL: {name}[{i}] = {float(vals[i]):.6g} is "
-                f"outside the physical window [{lo:.3g}, {hi:.3g}] AFTER "
-                f"basis conversion. Either the source store is not what it "
-                f"is claimed to be, or the basis was resolved wrongly -- "
-                f"pass --psd-basis / --galfor-basis explicitly. Refusing to "
-                f"emit a pin that would start the run somewhere absurd."
+                f"outside the run's PRIOR support [{lo:.3g}, {hi:.3g}] "
+                f"AFTER basis conversion.\n"
+                f"[NOISE-PIN] A pin outside the prior puts every walker and "
+                f"every rung at log_prior = -inf on iteration 0, so this is "
+                f"refused rather than started from.\n"
+                f"[NOISE-PIN] TWO likely causes:\n"
+                f"[NOISE-PIN]  (a) the source store predates "
+                f"{_PRIOR_TIGHTENED}, which pulled the galfor fk / f_1 / f_2 "
+                f"ceilings in from the old slope-unit values (1e-1 / 1e7 / "
+                f"1e4) to 1e-2. Such a point is a legitimate sample of the "
+                f"OLD box that sits on the degeneracy that commit removed "
+                f"(both shape factors flat across the band), and it is NOT "
+                f"reachable inside today's box -- measured on a v7 store, "
+                f"the closest in-box fit rails all four shape parameters "
+                f"and is still 1.3x off across the GB band. Use a store "
+                f"written after that date.\n"
+                f"[NOISE-PIN]  (b) the basis was resolved wrongly -- pass "
+                f"--psd-basis / --galfor-basis explicitly."
             )
 
 
@@ -111,8 +154,8 @@ def noise_pin_from_store(store: str, *, psd_basis: str = "auto",
     raw = best_logl_noise(store)
     psd, pb = _to_physical(raw["psd_params"], "psd", psd_basis)
     gal, gb = _to_physical(raw["galfor_params"], "galfor", galfor_basis)
-    _check(psd, _PSD_WINDOW, "PSD_START_PARAMS")
-    _check(gal, _GALFOR_WINDOW, "GALFOR_START_PARAMS")
+    _check(psd, _windows("psd"), "PSD_START_PARAMS")
+    _check(gal, _windows("galfor"), "GALFOR_START_PARAMS")
     return dict(psd=psd.tolist(), galfor=gal.tolist(),
                 iteration=int(raw["iteration"]), walker=int(raw["walker"]),
                 log_like=float(raw["log_like"]),

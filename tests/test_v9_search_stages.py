@@ -756,12 +756,56 @@ class NoisePinBasisTest(unittest.TestCase):
         np.testing.assert_allclose(vals, phys, rtol=1e-12)
         self.assertAlmostEqual(vals[2], 1.7)  # alpha untouched
 
-    def test_out_of_window_values_are_REFUSED(self):
-        from lisatools.globalfit.warmstart.noise_pin import (
-            _PSD_WINDOW, _check)
+    def test_out_of_PRIOR_values_are_REFUSED(self):
+        """⚠ The test is the branch's PRIOR SUPPORT, not a looser
+        plausibility window. A pin outside the prior puts every walker and
+        every rung at log_prior = -inf on iteration 0, so a window that only
+        caught order-of-magnitude basis mistakes would wave through a point
+        that kills the run."""
+        from lisatools.globalfit.warmstart.noise_pin import _check, _windows
 
         with self.assertRaises(SystemExit):
-            _check([1.0, 1.0], _PSD_WINDOW, "PSD_START_PARAMS")
+            _check([1.0, 1.0], _windows("psd"), "PSD_START_PARAMS")
+
+    def test_the_windows_come_from_the_prior_module(self):
+        from lisatools.globalfit.stock.erebor.noise import (
+            GALFOR_PRIOR_RANGE, PSD_PRIOR_RANGE)
+        from lisatools.globalfit.warmstart.noise_pin import _windows
+
+        self.assertEqual(_windows("psd"),
+                         tuple(tuple(map(float, r)) for r in PSD_PRIOR_RANGE))
+        with env(GALFOR_ALPHA_MAX=None):
+            self.assertEqual(
+                _windows("galfor"),
+                tuple(tuple(map(float, r)) for r in GALFOR_PRIOR_RANGE))
+
+    def test_GALFOR_ALPHA_MAX_widens_alpha_exactly_as_the_prior_does(self):
+        from lisatools.globalfit.warmstart.noise_pin import _windows
+
+        with env(GALFOR_ALPHA_MAX="20.0"):
+            self.assertEqual(_windows("galfor")[2][1], 20.0)
+
+    def test_a_PRE_TIGHTENING_store_is_refused_with_the_reason(self):
+        """⚠ MEASURED. The 3mo v7 store's galfor maxlogL point is
+        (amp 9.4e-45, fk 3.4e-2, alpha 6.3e-2, f_1 2.0e5, f_2 3.8e3). That is
+        NOT an old parameterization -- the store postdates abf52571 by months
+        and the old slope form underflows it to exactly zero. It is a
+        legitimate sample of the PRE-ea7790f3 prior box (fk 1e-1 / f_1 1e7 /
+        f_2 1e4, "the old slope-unit numbers" carried over), sitting on the
+        very degeneracy that commit removed: both shape factors are flat
+        across the band, so the curve is a pure f^-7/3 power law. The closest
+        reachable point inside today's box rails all four shape parameters
+        and is still 1.32x off across the GB band, so it is NOT translatable
+        -- the refusal is the right answer, and the message must say why."""
+        from lisatools.globalfit.warmstart.noise_pin import _check, _windows
+
+        with self.assertRaises(SystemExit) as cm:
+            _check([9.4438957e-45, 3.422729e-02, 6.301068e-02,
+                    2.008034e+05, 3.769685e+03],
+                   _windows("galfor"), "GALFOR_START_PARAMS")
+        msg = str(cm.exception)
+        self.assertIn("PRIOR support", msg)
+        self.assertIn("ea7790f3", msg)
 
 
 class NoisePinEndToEndTest(unittest.TestCase):

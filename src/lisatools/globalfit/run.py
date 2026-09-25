@@ -924,17 +924,33 @@ class GlobalFit:
         except Exception as exc:  # noqa: BLE001 -- reject, never crash resume
             return False, f"validation error: {exc!r}"
 
-    #: Physical sanity windows for the noise start pin, ``{branch: (lo, hi)}``
-    #: per column. Deliberately WIDE -- these exist to catch a basis mistake
-    #: (a log value pasted where a linear one belongs, which is off by many
-    #: orders), not to police physics.
-    _NOISE_PIN_WINDOWS = {
-        # [Soms_d, Sa_a] square-root levels
-        "psd": ((1e-13, 1e-10), (1e-16, 1e-13)),
-        # (amp, fk, alpha, f_1, f_2)
-        "galfor": ((1e-50, 1e-30), (1e-6, 1e-1), (0.0, 30.0),
-                   (1e-6, 1e-1), (1e-6, 1e-1)),
-    }
+    @staticmethod
+    def _noise_pin_window(branch: str):
+        """The PHYSICAL support the run's own prior defines, per column.
+
+        Read from the module that DEFINES the prior, never duplicated: a
+        hand-rolled "sanity window" drifts, and the real constraint here is
+        not plausibility but SUPPORT. A pin outside the branch's prior puts
+        every walker and every rung at ``log_prior = -inf`` on iteration 0 --
+        so a looser window that merely caught order-of-magnitude basis
+        mistakes would wave through a point that kills the run.
+
+        ``GALFOR_ALPHA_MAX`` widens alpha exactly as ``galfor_prior_dict``
+        does. Returns ``()`` for an unknown branch (no check).
+        """
+        from .stock.erebor.noise import (
+            GALFOR_BASIS, GALFOR_PRIOR_RANGE, PSD_PRIOR_RANGE)
+
+        if branch == "psd":
+            return tuple(tuple(map(float, r)) for r in PSD_PRIOR_RANGE)
+        if branch != "galfor":
+            return ()
+        rngs = [tuple(map(float, r)) for r in GALFOR_PRIOR_RANGE]
+        _am = os.environ.get("GALFOR_ALPHA_MAX", "").strip()
+        if _am:
+            ia = GALFOR_BASIS.index("alpha")
+            rngs[ia] = (rngs[ia][0], float(_am))
+        return tuple(rngs)
 
     def _seed_noise_start_coords(self, branch: str, raw: str, drawn):
         """``{PSD,GALFOR}_START_PARAMS`` -> start coords for a noise branch.
@@ -965,15 +981,22 @@ class GlobalFit:
                 f"{branch.upper()}_START_PARAMS has {vals.shape[0]} values "
                 f"but the {branch!r} branch samples {want} parameters."
             )
-        for i, (lo, hi) in enumerate(self._NOISE_PIN_WINDOWS.get(branch, ())):
+        for i, (lo, hi) in enumerate(self._noise_pin_window(branch)):
             if not (lo <= vals[i] <= hi):
                 raise ValueError(
                     f"{branch.upper()}_START_PARAMS[{i}] = {vals[i]:.6g} is "
-                    f"outside the physical window [{lo:.3g}, {hi:.3g}]. These "
-                    f"knobs take LINEAR values; a raw chain row from a run "
-                    f"with log sampling on would land here. Convert to "
-                    f"physical first (exp for psd, 10** for galfor's amp/fk/"
-                    f"f_1/f_2; alpha is linear in both bases)."
+                    f"outside the {branch} branch's PRIOR support "
+                    f"[{lo:.3g}, {hi:.3g}], so every walker and every rung "
+                    f"would start at log_prior = -inf. Two likely causes: "
+                    f"(a) these knobs take LINEAR values and a raw chain row "
+                    f"from a log-sampled run was pasted in (convert first: "
+                    f"exp for psd, 10** for galfor's amp/fk/f_1/f_2; alpha "
+                    f"is linear in both bases); (b) the source run predates "
+                    f"2026-08-13 (ea7790f3), which pulled the galfor "
+                    f"fk/f_1/f_2 ceilings in from the old slope-unit values "
+                    f"-- such a point is not reachable inside today's box. "
+                    f"``python -m lisatools.globalfit.warmstart.noise_pin`` "
+                    f"performs both conversions and this check for you."
                 )
         # Into the SAMPLING basis, mirroring prepare_psd_branch /
         # prepare_galfor_branch: psd is ln of both columns, galfor is log10 of
