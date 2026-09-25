@@ -232,6 +232,50 @@ rg = f.get("global_fit/recipe", f.get("recipe"))
 if rg is not None:
     for k in rg:
         recipe[k] = (int(rg[k].attrs.get("order num", 0)), bool(rg[k].attrs.get("status", False)))
+
+# ---- RECIPE STAGE BOUNDARIES ---------------------------------------------
+# ``(iteration, stage name)`` for every step that has COMPLETED, in order.
+# The stamp is ``completed_iteration``, written by
+# hdfbackend.completed_recipe_step since 2026-09-24; every store older than
+# that carries the status flag alone, so this list comes back empty and every
+# panel below simply draws no boundary.
+#
+# WHY IT MATTERS NOW. The v9 restructure replaced one ``gb_search`` with
+# ``gb_search_1/2/3``, and the three differ in phase maximization, the
+# opt-SNR prior boundary (8 -> 5), the F-stat peak floor (8 -> 6.25) and
+# whether the noise model is sampled at all. Every per-iteration trace on
+# this page therefore spans several regimes. A leaf count that jumps at the
+# boundary is a stage lowering its floors, not a discovery -- and with no
+# boundary drawn there is nothing on the page that can tell those apart.
+STAGE_BOUNDS = []
+if rg is not None:
+    for k in rg:
+        _ci = rg[k].attrs.get("completed_iteration", None)
+        if _ci is not None and bool(rg[k].attrs.get("status", False)):
+            STAGE_BOUNDS.append((int(_ci), str(k)))
+    STAGE_BOUNDS.sort()
+
+
+def mark_stages(ax, *, label=True, max_it=None):
+    """Draw the completed recipe-stage boundaries as vertical rules on ``ax``.
+
+    No-op on a store with no stamps (everything written before 2026-09-24),
+    which is what keeps this safe to call from every time-series panel.
+    ``max_it`` drops boundaries past the plotted range.
+    """
+    if not STAGE_BOUNDS:
+        return
+    for _i, (_it, _name) in enumerate(STAGE_BOUNDS):
+        if max_it is not None and _it > max_it:
+            continue
+        ax.axvline(_it, color="0.45", lw=0.9, ls=(0, (4, 3)), zorder=0)
+        if label:
+            ax.annotate(
+                _name, xy=(_it, 1.0), xycoords=("data", "axes fraction"),
+                xytext=(2, -2), textcoords="offset points",
+                fontsize=6, color="0.35", rotation=90,
+                ha="left", va="top", zorder=0,
+            )
 nwalk = ll.shape[1]
 
 # Observation time from domain settings (needed by multiple plot sections)
@@ -1234,6 +1278,14 @@ if _n_zoom >= 3:
     axins_gb.set_title(f"last {_n_zoom} iter", fontsize=7.5, pad=2)
     axins_gb.grid(True, alpha=0.25, lw=0.5)
 
+# Recipe-stage boundaries on the leaf trace. THE reason this panel needs
+# them: under the v9 three-stage search the opt-SNR prior boundary drops
+# 8 -> 5 and the F-stat peak floor 8 -> 6.25 at the gb_search_1 -> _2
+# boundary, so the leaf count is EXPECTED to step up there. Without the rule
+# drawn, that step reads as a discovery burst.
+mark_stages(ax[0], max_it=int(it[-1]) if len(it) else None)
+mark_stages(ax[1], label=False, max_it=int(it[-1]) if len(it) else None)
+
 fig_b64(fig, "gb_leaves")
 
 # ---- 5a. CAP-CELL OCCUPANCY ----------------------------------------------
@@ -1579,6 +1631,12 @@ if _shut_w is not None and _shut_w.ndim == 3 and _occ_wb is not None:
                    color=GREEN, fontsize=8, va="top", ha="right")
         for _b in _bnds:
             ax[0].axvline(_b, color=VIOLET, lw=1.0, alpha=0.7, ls="--")
+        # ⚠ TWO DIFFERENT BOUNDARIES on this axis, and they must not be
+        # confused. The violet dashes are the valve's own RECIPE STEP serial
+        # changing (every step releases the valve wholesale); the grey ones
+        # mark where a recipe STAGE completed. They coincide when every stage
+        # is one step, and diverge the moment anything else advances a step.
+        mark_stages(ax[0], max_it=_sit[-1] if _n else None)
         ax[0].set_ylim(-2, 104)
         ax[0].set_xlabel("iteration")
         ax[0].set_ylabel("% of occupied (walker, band) pairs")
@@ -1593,6 +1651,7 @@ if _shut_w is not None and _shut_w.ndim == 3 and _occ_wb is not None:
         ax[1].plot(_sit, _npend, color=RED, lw=1.6, label="pending (= 0 ends the stage)")
         for _b in _bnds:
             ax[1].axvline(_b, color=VIOLET, lw=1.0, alpha=0.7, ls="--")
+        mark_stages(ax[1], label=False, max_it=_sit[-1] if _n else None)
         ax[1].set_xlabel("iteration"); ax[1].set_ylabel("(walker, band) pairs")
         ax[1].legend(fontsize=8, loc="upper left")
         ax[1].set_title("occupied / shut / pending")
