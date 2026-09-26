@@ -2239,3 +2239,54 @@ class GroupStaticOnePassShutoffTest(unittest.TestCase):
         src = inspect.getsource(g.GBSpecialBase._run_group_passes)
         self.assertIn("all_temp_delta=ll_change_log", src)
         self.assertNotIn("all_temp_delta=ll_change_log[0]", src)
+
+
+class ConvergeReportReachesProductionTest(unittest.TestCase):
+    """The ``[GB_IMCONV]`` report must fire on the path production takes.
+
+    It existed only on the DIRECT-BATCH path, and production runs
+    GB_RJ_DIRECT_BATCH=0 (the staged scheduler). Job 634 emitted twelve
+    [GB_IMCONV] lines and every one was "armed" -- the richest diagnostic
+    the convergence rule has (rows converged vs ceiling vs released,
+    columns fully retired, work as a multiple of the fixed budget, and the
+    window/dll/floor actually in force for THIS class) was unreachable in
+    every production run to date.
+
+    That is the same "knob resolves, consuming path never runs" shape as
+    the defects it is supposed to help find -- in its diagnostic form,
+    which is worse, because a missing diagnostic is invisible by
+    definition.
+
+    It is also the only AFFIRMATIVE evidence that the per-class survivor
+    window does anything: the armed line reports what was CONFIGURED, the
+    report reports what the rows actually did.
+    """
+
+    def _src(self):
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        return inspect.getsource(g.GBSpecialBase._run_band_unit)
+
+    def test_BOTH_flush_paths_emit_it(self):
+        src = self._src()
+        self.assertEqual(
+            src.count("_cv.report("), 2,
+            "one call is the direct-batch path only; production takes the "
+            "staged one and would log nothing")
+
+    def test_each_call_sits_under_a_None_guard(self):
+        """``_converge_state_for`` returns None whenever the rule is off
+        (mode off, class not selected, PE stage), and the report must not
+        fire then."""
+        src = self._src()
+        self.assertEqual(src.count("if _cv is not None:\n"
+                                   "                        _cv.report("), 1)
+        self.assertEqual(src.count("if _cv is not None:\n"
+                                   "                            _cv.report("), 1)
+
+    def test_it_is_keyed_by_CLASS(self):
+        """newborn and mature are separate states with separate windows;
+        one line per class or the survivor window cannot be read off."""
+        src = self._src()
+        self.assertEqual(src.count("self.name, _cls_name,"), 2)

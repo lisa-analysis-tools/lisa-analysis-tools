@@ -8763,6 +8763,35 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                                 scheduler=scheduler,
                                 converge=_cv,
                             )
+                        # THE [GB_IMCONV] REPORT -- it existed only on the
+                        # direct-batch path, which production does not take
+                        # (GB_RJ_DIRECT_BATCH=0). Job 634 emitted 12
+                        # [GB_IMCONV] lines and every one of them was
+                        # "armed": the richest diagnostic the convergence
+                        # rule has -- rows converged vs ceiling vs released,
+                        # columns fully retired, work as a multiple of the
+                        # fixed budget, and the window/dll/floor actually in
+                        # force for THIS class -- was unreachable in every
+                        # production run. Same "knob resolves, consuming
+                        # path never runs" shape as the defects it was
+                        # supposed to help find, in its diagnostic form.
+                        #
+                        # It is also the only affirmative evidence that the
+                        # per-class survivor window is doing anything: the
+                        # armed line says what was CONFIGURED, this says
+                        # what the rows actually did.
+                        if _cv is not None:
+                            _cv.report(
+                                self.name, _cls_name,
+                                {int(i): int(w) * int(self.num_bands) + int(b)
+                                 for i, w, b in zip(
+                                     _to_numpy(_cls["ids"]).tolist(),
+                                     _to_numpy(_cls["walker_inds"]).tolist(),
+                                     _to_numpy(_cls["band_inds"]).tolist())},
+                                [int(i) for i in
+                                 _to_numpy(_cls["ids"]).tolist()],
+                                _cls_reps[_cls_name], observe=_cv.observe,
+                            )
                     n_flushes += 1
                     flush_sum += n_flushed
                     pending = []
