@@ -1380,7 +1380,21 @@ export GB_INMODEL_GROUP=1
 # W in PASSES (not repeats): one pass is already GB_NUM_REPEAT_PROPOSALS
 # repeats per source, so the per-pass gain is a far coarser quantity than
 # the per-repeat one and needs nothing like the 100-repeat window V9-1 uses.
-export GB_INMODEL_GROUP_ITERS=3
+# >>> 3 -> 2 (user ruling 2026-09-26, off job 634's gb_search_1 it 1).
+# >>> The window is a FLOOR: a sub-band cannot be judged until it has W
+# >>> passes of history, so passes 1..W shut NOTHING. Measured:
+# >>>
+# >>>   pass 1  1013 blocks  3,372,150 rep*src   open 448
+# >>>   pass 2  1006 blocks  3,412,575           open 448   <- +shut 0
+# >>>   pass 3  1020 blocks  3,310,825           open 448   <- +shut 0
+# >>>   pass 4   868 blocks  1,543,025           open 118   <- 90% shut here
+# >>>   pass 5+  tail, 57 -> 0 bands, 17.5% of the work
+# >>>
+# >>> The three warm-up passes are 72% of the move's work and the first
+# >>> three quarters of it cannot retire a single band. Dropping to 2
+# >>> removes one full warm-up pass (~3.3M rep*src, ~24% of the move) and
+# >>> lets bands shut at pass 3 instead of pass 4.
+export GB_INMODEL_GROUP_ITERS=2
 # D/2 again, and FLAT per sub-band (user ruling): "When a source is birthed,
 # it is per-source. During the special in-model only proposals it is
 # per-sub-band. I want flat D/2. This will focus more resources on the
@@ -1388,6 +1402,24 @@ export GB_INMODEL_GROUP_ITERS=3
 # dense band posts a larger per-pass gain, clears the flat bar for longer,
 # and so earns more passes. GB_INMODEL_GROUP_SCALE=per_source is the
 # alternative; both numbers are logged every pass.
+# STAYS AT 4.0 = D/2 WHEN THE WINDOW MOVES (user ruling 2026-09-26).
+# I proposed deriving it (2.6667) to hold the per-repeat rate constant
+# when ITERS went 3 -> 2. The user kept 4.0, and that is the right call:
+# D/2 is a PHYSICAL quantity, not a rate. It is the lnL a genuinely new
+# D-parameter source has to buy, and it is deliberately the SAME number
+# the leaf cap's improvement gate uses, "so the two features cannot
+# disagree about what counts as an improvement worth waiting for".
+# Deriving it from the window would have broken that tie and left D/2
+# meaning something different here than it means three knobs away.
+#
+# ⚠ CONSEQUENCE, stated so it is chosen and not discovered: holding dll
+# while the window shortens DOES loosen the per-repeat bar.
+#   3 passes, dll 4.0 -> 4.0/(3*25) = 0.0533 lnL/repeat
+#   2 passes, dll 4.0 -> 4.0/(2*25) = 0.0800 lnL/repeat   (1.5x looser)
+# So sub-bands shut EARLIER than the pass-count change alone implies --
+# which is the direction we want here, on top of the warm-up pass saved.
+# The read is unchanged and still physical: a sub-band retires once its
+# whole model gains less than one source's worth over the window.
 export GB_INMODEL_GROUP_DLL=4.0
 export GB_INMODEL_GROUP_SCALE=flat
 # ⚠ COST KNOB, NOT A SAFETY NET. This group is unbounded by construction:

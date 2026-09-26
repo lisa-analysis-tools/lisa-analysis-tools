@@ -176,12 +176,36 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         together so nobody "tidies" one family into the other."""
         self.assertEqual(self.v9["GB_INMODEL_GROUP"], "1")
         self.assertEqual(self.v9["GB_INMODEL_GROUP_SCALE"], "flat")
+        # D/2 = 0.5 * GB_LEAF_CAP_NDIM (8.0), and it does NOT scale when
+        # the window moves (user ruling 2026-09-26, declining my proposal
+        # to derive it as 2.6667 when ITERS went 3 -> 2). It is a PHYSICAL
+        # quantity -- the lnL a genuinely new D-parameter source has to
+        # buy -- and deliberately the SAME number the leaf cap's
+        # improvement gate uses, so the two features cannot disagree about
+        # what counts as an improvement worth waiting for. Deriving it
+        # from the window would break that tie.
+        #
+        # ⚠ This means shortening ITERS DOES loosen the per-repeat bar
+        # (4.0/(3*25) = 0.0533 -> 4.0/(2*25) = 0.0800). That is chosen,
+        # not overlooked: bands shut earlier, which is the point.
         self.assertEqual(self.v9["GB_INMODEL_GROUP_DLL"], "4.0")
+        self.assertEqual(
+            float(self.v9["GB_INMODEL_GROUP_DLL"]),
+            0.5 * float(self.v9.get("GB_LEAF_CAP_NDIM", 8.0)),
+            "GB_INMODEL_GROUP_DLL must stay D/2; see the comment above",
+        )
         # the group window is in PASSES and must stay far smaller than the
         # row window, which is in repeats -- swapping them would make the
         # group rule unfireable (and the row rule fire on noise)
         self.assertLess(int(self.v9["GB_INMODEL_GROUP_ITERS"]),
                         int(self.v9["GB_INMODEL_CONVERGE_ITERS"]))
+        # The window is a FLOOR: passes 1..W shut NOTHING because a band
+        # needs W passes of history before it can be judged. Job 634
+        # measured those warm-up passes at 62.6% of ALL pure in-model work
+        # across the three slots (each runs its own group state, so the
+        # warm-up is paid once PER SLOT). >= 2 keeps the test meaningful;
+        # 1 would retire a band on a single pass with no history.
+        self.assertGreaterEqual(int(self.v9["GB_INMODEL_GROUP_ITERS"]), 2)
 
     def test_the_group_has_a_hard_pass_ceiling(self):
         """Unbounded by construction: one pass is a full sweep of every
