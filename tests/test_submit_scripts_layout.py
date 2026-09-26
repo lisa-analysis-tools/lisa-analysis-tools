@@ -578,6 +578,10 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # before any F-stat grid is fitted. Named rather than
             # renumbered, so gb_search_1/2/3 are untouched.
             "GB_SEARCH_SEED_ITERS",
+            # V9-17 (2026-09-26): in_model_replace retires with
+            # rj_replace -- a third pure in-model pass over rows the
+            # other two slots already polished, 14% of an iteration.
+            "GB_SEARCH_IN_MODEL_REPLACE",
         }
         drift = {
             k: (self.v8.get(k), self.v9.get(k))

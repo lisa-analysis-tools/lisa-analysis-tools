@@ -2337,6 +2337,17 @@ export GB_CAP_DEST_BAND=1
 # >>> mis-seated rather than missing and a replacement has something to
 # >>> beat.
 export GB_SEARCH_RJ_REPLACE=0
+# ---- in_model_replace retires WITH it (user ruling 2026-09-26) --------
+# "in_model_replace we do not need this anymore." It was the polish slot
+# for rj_replace's survivors; with that move off it is simply a THIRD pure
+# in-model pass over rows in_model and in_model_fstat already polished.
+# Measured on job 634's gb_search_1 iteration 1: 1156 s = 14% of the
+# iteration, reaching IMGROUP pass 14.
+# Pinned explicitly even though the CODE default is now 0, so this run
+# cannot silently change meaning if that default is ever revisited.
+# Independent of GB_SEARCH_RJ_REPLACE on purpose -- reinstating the RJ
+# move for gb_search_3 does not have to drag the polish slot with it.
+export GB_SEARCH_IN_MODEL_REPLACE=0
 # TWO INTERNAL PASSES per propose() (user ruling 2026-09-24: "one internal
 # iteration with the refit/warmstart and one internal iteration of the
 # fstat"). Pass 1 draws replacement candidates from the warm-start mixture

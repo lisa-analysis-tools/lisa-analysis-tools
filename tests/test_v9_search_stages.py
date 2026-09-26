@@ -65,6 +65,11 @@ _BASE_ENV = dict(
     GB_ONLY="1",
     GB_SEARCH_IN_MODEL="1",
     GB_SEARCH_RJ_REPLACE="1",
+    # Both halves of the replace pair ON, so the existing composition
+    # tests keep pinning the FULL seven-slot cycle -- still a valid and
+    # reachable configuration. Production runs both OFF as of 2026-09-26;
+    # InModelReplaceRetiredTest below covers that default.
+    GB_SEARCH_IN_MODEL_REPLACE="1",
     GB_WARM_START_COMPONENTS="/nonexistent/warm.npz",
     STAGE_V9_SEARCH="1",
     GB_SEARCH_3_WARM_EVERY="5",
@@ -1478,3 +1483,73 @@ class SeedStageTest(unittest.TestCase):
             GALFOR_START_PARAMS="1e-44,1e-3,1.5,5e-4,5e-4").recipe.stages]
         self.assertEqual(gb_only[0], "gb_search_seed")
         self.assertEqual(full[0], "gb_search_seed")
+
+
+class InModelReplaceRetiredTest(unittest.TestCase):
+    """``in_model_replace`` is OFF by default (user ruling 2026-09-26:
+    "in_model_replace we do not need this anymore").
+
+    It was the polish slot for ``rj_replace``'s survivors. With that move
+    switched off on yield -- six consecutive zero-yield proposes, 8 swaps
+    accepted in ~707k proposals and none cold -- the slot is simply a THIRD
+    pure in-model pass over rows ``in_model`` and ``in_model_fstat`` have
+    already polished. It cost 1156 s, 14% of job 634's gb_search_1
+    iteration 1, and reached IMGROUP pass 14.
+
+    Independent knobs on purpose: ``rj_replace`` could be reinstated for
+    gb_search_3 with or without its polish slot.
+    """
+
+    def _off(self, **ov):
+        base = dict(_BASE_ENV)
+        base.pop("GB_SEARCH_IN_MODEL_REPLACE", None)   # back to the default
+        base.update(ov)
+        import run_combined_staged as R
+        with env(**base):
+            return R.build_fit()
+
+    def test_absent_by_default(self):
+        for st in _numbered(self._off()):
+            self.assertNotIn("in_model_replace", _names(st), st.name)
+
+    def test_the_other_two_in_model_slots_survive(self):
+        """Only the replace slot retires; the polish that follows the two
+        RJ moves that DO land sources must stay."""
+        for st in _numbered(self._off()):
+            names = _names(st)
+            self.assertIn("in_model", names)
+            self.assertIn("in_model_fstat", names)
+
+    def test_the_knob_restores_it(self):
+        for st in _numbered(self._off(GB_SEARCH_IN_MODEL_REPLACE="1")):
+            self.assertIn("in_model_replace", _names(st), st.name)
+
+    def test_BOTH_stage_assemblies_honour_it(self):
+        """GB_ONLY and the full composition each build their own move
+        lists; gating one only is the silent-no-op shape that has produced
+        several defects in this run."""
+        gb_only = self._off()
+        full_env = dict(_BASE_ENV)
+        full_env.pop("GB_SEARCH_IN_MODEL_REPLACE", None)
+        full_env.pop("GB_ONLY")
+        full_env.update(MBHB_IDS="2,5", STAGE_SKIP_SOURCE_SEARCH="1",
+                        VGB_CHIRP_MASS_BASIS="1",
+                        PSD_START_PARAMS="1.5e-11,3e-15",
+                        GALFOR_START_PARAMS="1e-44,1e-3,1.5,5e-4,5e-4")
+        import run_combined_staged as R
+        with env(**full_env):
+            full = R.build_fit()
+        for fit, tag in ((gb_only, "GB_ONLY"), (full, "full")):
+            for st in _numbered(fit):
+                self.assertNotIn("in_model_replace", _names(st),
+                                 f"{tag}/{st.name}")
+
+    def test_the_seed_stage_never_had_it(self):
+        """Its GB moves are rj_warm_search + in_model and nothing else.
+        (vgb_pe rides along in the FULL composition; under GB_ONLY there is
+        no vgb branch, so the noise slot is empty -- hence the filter.)"""
+        seed = next(s for s in self._off().recipe.stages
+                    if s.name == "gb_search_seed")
+        gb = [n for n in _names(seed)
+              if n.startswith(("rj_", "in_model"))]
+        self.assertEqual(gb, ["rj_warm_search", "in_model"])

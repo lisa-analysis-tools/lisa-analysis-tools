@@ -131,6 +131,13 @@ Key env knobs
                          start (and stay subtracted) at their seeded
                          coords; source proposals only in gb_search +
                          full_pe (exact-truth-start flow, 2026-09-14)
+    GB_SEARCH_SAMPLE_NOISE_ALL_STAGES=1  every v9 GB search stage samples
+                         the noise, not just gb_search_3: the leading joint
+                         psd+galfor+vgb rider plus a noise convergence after
+                         EVERY in-model convergence proposal, so the psd and
+                         foreground adjust as the GB model fills in. Default
+                         OFF -- the 6mo v9 run keeps noise FIXED in
+                         gb_search_1/2 (2026-09-26, the 3mo v9 run)
     STAGE_NOISE_PSD_ONLY=1  the STANDALONE noise stage samples psd ALONE;
                          galfor stays frozen at GALFOR_START_PARAMS (which it
                          REFUSES to run without) until gb_search_3 releases
@@ -765,6 +772,14 @@ def build_fit():
                     if os.environ.get("GB_RIDGE_GIBBS", "1") == "1" else [])
 
         def gb_only_in_model(slot):
+            # Same in_model_replace retirement as the full composition --
+            # there are TWO stage assemblies in this file and gating only
+            # one of them is the "knob resolves, consuming path never runs"
+            # shape that has produced several defects in this run.
+            if slot == "in_model_replace" and os.environ.get(
+                    "GB_SEARCH_IN_MODEL_REPLACE", "0").strip() not in (
+                        "1", "true", "True", "yes", "on"):
+                return []
             return ([Move(slot, branch="gb")]
                     if _env_flag("GB_SEARCH_IN_MODEL") else [])
 
@@ -978,24 +993,26 @@ def build_fit():
     # TODO: CLEAN
     noise_only = [JointMaxLogLSearch(
         "noise_joint_search", list(_standalone_noise_names), branch="psd")]
-    noise_only_1 = [JointMaxLogLSearch(
-        "noise_joint_search_1", list(_noise_names), branch="psd")]
-    noise_only_2 = [JointMaxLogLSearch(
-        "noise_joint_search_2", list(_noise_names), branch="psd")]
-    # _3 / _4 ride AFTER rj_replace and AFTER rj_prior_removal in
-    # gb_search_3 (user ruling 2026-09-25: "add noise_search (psd and
-    # foreground) after each rj proposal to convergence ... as we try to
-    # remove the last bit of sources"). _3 was defined and never used until
-    # then. One object per SLOT, never a shared instance: JointMaxLogLSearch
-    # carries its own plateau state, so two slots sharing one object would
-    # pool their convergence and the second would inherit the first's
-    # already-flat verdict.
-    noise_only_3 = [JointMaxLogLSearch(
-        "noise_joint_search_3", list(_noise_names), branch="psd")]
-    noise_only_4 = [JointMaxLogLSearch(
-        "noise_joint_search_4", list(_noise_names), branch="psd")]
-    # STANDALONE stage -> the psd-only filter applies here too (the rider
-    # below is a gb_search_3 move and deliberately keeps galfor).
+
+    # ⚠ ONE OBJECT PER SLOT PER STAGE, NEVER A SHARED INSTANCE.
+    # JointMaxLogLSearch carries its own plateau state, so two slots sharing
+    # one object pool their convergence and the second inherits the first's
+    # already-flat verdict. These used to be four module-level singletons,
+    # which was safe only because exactly ONE stage (gb_search_3) sampled the
+    # noise. Under GB_SEARCH_SAMPLE_NOISE_ALL_STAGES three stages do, so they
+    # are FACTORIES now and every stage builds its own -- the same rule the
+    # Move descriptors already follow (`fresh Move descriptor per stage`).
+    #
+    # Slots _1 / _2 bracket the F-stat birth move; _3 / _4 ride AFTER
+    # rj_replace and AFTER rj_prior_removal (user ruling 2026-09-25: "add
+    # noise_search (psd and foreground) after each rj proposal to convergence
+    # ... as we try to remove the last bit of sources").
+    def _noise_slot(name):
+        """A fresh interleaved noise-convergence slot for ONE stage."""
+        return [JointMaxLogLSearch(name, list(_noise_names), branch="psd")]
+
+    # STANDALONE stage -> the psd-only filter applies here too (the gb_search
+    # rider below is a search-stage move and deliberately keeps galfor).
     noise_vgb = [JointMaxLogLSearch(
         "noise_vgb_joint_search",
         _standalone_noise_names + (["vgb_pe"] if _has_vgb else []),
@@ -1015,11 +1032,46 @@ def build_fit():
     # standalone noise stages above are untouched.
     _gb_noise_checks = int(os.environ.get("GB_SEARCH_NOISE_CHECKS", "1"))
     _gb_noise_cap = int(os.environ.get("GB_SEARCH_NOISE_ITERS_PER_STEP", "0"))
-    noise_vgb_gb = [JointMaxLogLSearch(
-        "noise_vgb_joint_search",
-        _noise_names + (["vgb_pe"] if _has_vgb else []),
-        branch="psd", num_checks=(_gb_noise_checks or None),
-        iters_per_step=(_gb_noise_cap or None))]
+
+    def _noise_rider():
+        """A fresh leading psd+galfor+vgb rider for ONE stage."""
+        return [JointMaxLogLSearch(
+            "noise_vgb_joint_search",
+            _noise_names + (["vgb_pe"] if _has_vgb else []),
+            branch="psd", num_checks=(_gb_noise_checks or None),
+            iters_per_step=(_gb_noise_cap or None))]
+
+    # ---- GB_SEARCH_SAMPLE_NOISE_ALL_STAGES (user ruling 2026-09-26) -------
+    # Every v9 GB search stage samples the noise, not just gb_search_3: the
+    # leading joint rider plus a noise convergence after EVERY in-model
+    # convergence proposal ("this way the psd and foreground will adjust as
+    # it moves").
+    #
+    # WHY, from the first 3-month run: with the noise FIXED for two whole
+    # stages, the four walkers were frozen at psd values that had drifted
+    # far apart -- each walker searching against its own noise floor, with
+    # no mechanism to reconcile. The standalone stage cannot fix that on its
+    # own either: it maximizes against a residual that still holds the ENTIRE
+    # GB galaxy, so whatever it converges to is galaxy-contaminated, and
+    # freezing it is what makes the contamination permanent. Sampling it
+    # throughout lets the noise track back down as the GB model fills in.
+    #
+    # ⚠ COST, and it is not small. Each JointMaxLogLSearch riding inside
+    # gb_search measured ~93 s per GB iteration at 3mo (job 473, ~15% of the
+    # iteration) at NOISE_SEARCH_CHECKS=5; GB_SEARCH_NOISE_CHECKS=1 is what
+    # keeps it near ~2 rounds. This puts FIVE of them (rider + four slots)
+    # into stages 1 and 2 as well, so budget accordingly and watch
+    # [GF_TIMING] for the noise moves' share.
+    #
+    # ⚠ DEFAULT OFF. The 6mo v9 run shares this driver and its stage table is
+    # unchanged: noise FIXED in gb_search_1/2, sampled in gb_search_3.
+    _noise_all_stages = _env_flag("GB_SEARCH_SAMPLE_NOISE_ALL_STAGES")
+    if _noise_all_stages and not (_has_psd or _has_galfor):
+        raise ValueError(
+            "GB_SEARCH_SAMPLE_NOISE_ALL_STAGES=1 but neither a psd nor a "
+            "galfor branch is present (REMOVE_BRANCHES?), so there is no "
+            "noise for the search stages to sample."
+        )
 
     # gb_search source cadence (user ruling 2026-09-15: "run them in
     # gb_search as before, but make them run every 10 iterations"): the
@@ -1264,6 +1316,19 @@ def build_fit():
         knob-conditional exactly like warm()/replace(). Fresh Move descriptor
         per call (never share one instance across stages).
         """
+        # in_model_replace retires with rj_replace (user ruling
+        # 2026-09-26: "in_model_replace we do not need this anymore").
+        # It was the polish slot for rj_replace's survivors; with that move
+        # off (GB_SEARCH_RJ_REPLACE=0, six consecutive zero-yield proposes)
+        # it is simply a THIRD pure in-model pass over the same rows
+        # in_model and in_model_fstat already polished -- 1156 s = 14% of
+        # job 634's gb_search_1 iteration 1, reaching IMGROUP pass 14.
+        # GB_SEARCH_IN_MODEL_REPLACE=1 restores it; reinstate it alongside
+        # rj_replace in gb_search_3, not on its own.
+        if slot == "in_model_replace" and os.environ.get(
+                "GB_SEARCH_IN_MODEL_REPLACE", "0").strip() not in (
+                    "1", "true", "True", "yes", "on"):
+            return []
         return ([Move(slot, branch="gb")]
                 if _env_flag("GB_SEARCH_IN_MODEL") else [])
 
@@ -1275,10 +1340,10 @@ def build_fit():
         # fitted against a current noise level. FIXED noise: the vgb branch
         # keeps sampling (it is 55 KNOWN sources, nothing to do with the
         # noise model) and the psd/galfor moves are simply absent.
-        _noise = (noise_vgb_gb if sample_noise
+        _noise = (_noise_rider() if sample_noise
                   else ([Move("vgb_pe", branch="vgb")] if _has_vgb else []))
-        _noise_pre = noise_only_1 if sample_noise else []
-        _noise_post = noise_only_2 if sample_noise else []
+        _noise_pre = _noise_slot("noise_joint_search_1") if sample_noise else []
+        _noise_post = _noise_slot("noise_joint_search_2") if sample_noise else []
         # NOISE TO CONVERGENCE AFTER EVERY RJ PROPOSAL -- specifically,
         # after that proposal's IN-MODEL UPDATE (user ruling 2026-09-25,
         # amended the same day: "move the noise joint searches to after the
@@ -1320,8 +1385,8 @@ def build_fit():
         # whose residual barely moved pays ~2 rounds, not 6.
         # Stages 1-2 are unaffected: they do not sample the noise, so every
         # one of these lists is empty there.
-        _noise_rep = noise_only_3 if sample_noise else []
-        _noise_rem = noise_only_4 if sample_noise else []
+        _noise_rep = _noise_slot("noise_joint_search_3") if sample_noise else []
+        _noise_rem = _noise_slot("noise_joint_search_4") if sample_noise else []
         _warm = ([Move("rj_warm_search", branch="gb", every=warm_every)]
                  if warm() else [])
         if seed_only:
@@ -1449,13 +1514,18 @@ def build_fit():
         # log and snapshot. It takes gb_search_1's profile verbatim -- the
         # user's "identical to what is now gb search 2 (e.g. opt snr 8,
         # phase max, etc.)", stage 1 being the one that carries that profile.
+        if _noise_all_stages:
+            print("[combined] GB_SEARCH_SAMPLE_NOISE_ALL_STAGES=1: every GB "
+                  "search stage samples the noise -- leading joint rider + a "
+                  "noise convergence after every in-model slot, in "
+                  "gb_search_1/2 as well as gb_search_3.", flush=True)
         _seed = []
         if _seed_iters() > 0:
             _seed_prof = dict(V9_SEARCH_STAGE_PROFILES[0][1])
             _seed = [_search_stage("gb_search_seed", sample_noise=False,
                                    seed_only=True, **_seed_prof)]
         stages += _seed + [
-            _search_stage(_name, sample_noise=_sampled,
+            _search_stage(_name, sample_noise=(_sampled or _noise_all_stages),
                           warm_every=(_warm3 if _sampled else 1), **_prof)
             for _name, _prof, _sampled in V9_SEARCH_STAGE_PROFILES
         ] + [
@@ -1507,9 +1577,9 @@ def build_fit():
             # and the GB RJ cycle (sobbh -> mbh -> emri banking order).
             # mbh/emri ride at the 1-in-N gb_search cadence (block above);
             # sobbh every iteration.
-            moves=noise_vgb_gb + source_pe(gb_search_cadence=True) + warm() + noise_only_1 + [
+            moves=_noise_rider() + source_pe(gb_search_cadence=True) + warm() + _noise_slot("noise_joint_search_1") + [
                 Move("rj_fstat_search", branch="gb"),
-            ] + noise_only_2 + replace() + [
+            ] + _noise_slot("noise_joint_search_2") + replace() + [
                 Move("rj_prior_removal", branch="gb"),
             ] + ([Move("gb_ridge_gibbs", branch="gb")]
                  if os.environ.get("GB_RIDGE_GIBBS", "1") == "1" else [])
