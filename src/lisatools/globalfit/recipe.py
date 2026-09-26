@@ -1271,6 +1271,43 @@ class RJRecipeStep(BaseRecipeStep):
         # the 3-month run's gb_search advanced after ONE check
         # (found 2026-08-13).
         self._stage_start_iter = int(sampler.backend.iteration)
+        # ---- GF_PERSIST_STAGE_START (user ask 2026-09-26) -----------------
+        # "Can we track things like _stage_start_iter in the backend, so a
+        # resume is a real resume?" -- yes, and this is why it matters: the
+        # plateau test above needs current_iter - _start > 2*convergence_iter,
+        # i.e. 41 iterations at GB_PLATEAU_ITERS=20, and the line above resets
+        # _start to the LIVE iteration on every launch. A run restarted every
+        # few hours therefore never accumulates 41 in-stage iterations and the
+        # stage can never advance on the plateau. Measured on the 3-month v9
+        # run: job 640 started gb_search_1 at iteration 25, job 644 resumed at
+        # 30 and reset the clock there, pushing the earliest possible stage end
+        # from iteration 66 to 71.
+        #
+        # ⚠ DEFAULT OFF (user ruling, same day: "add that tracking as an option
+        # default off for now so it does not mess up the current runs"). Unset,
+        # this block is a no-op and the clock restarts exactly as before.
+        if os.environ.get("GF_PERSIST_STAGE_START", "0").strip() in (
+                "1", "true", "True", "yes", "on"):
+            _name = getattr(self, "stage_name", None) or getattr(
+                self, "_current_step_name", None)
+            if _name:
+                _stored = None
+                if hasattr(sampler.backend, "stage_start_iteration"):
+                    _stored = sampler.backend.stage_start_iteration(_name)
+                if _stored is not None:
+                    self._stage_start_iter = int(_stored)
+                    logger.info(
+                        "[STAGE-START] %s: restored start iteration %d from "
+                        "the backend (live iteration %d) -- the convergence "
+                        "clock survives this resume.",
+                        _name, self._stage_start_iter,
+                        int(sampler.backend.iteration))
+                elif hasattr(sampler.backend, "stamp_stage_start"):
+                    sampler.backend.stamp_stage_start(
+                        _name, self._stage_start_iter)
+                    logger.info(
+                        "[STAGE-START] %s: stamped start iteration %d.",
+                        _name, self._stage_start_iter)
         # TODO: maybe make this the default setup
         sampler.moves = self.moves
         sampler.weights = self.weights
@@ -1526,6 +1563,55 @@ class SearchStageProfileStep(RJRecipeStep):
         """
         stop = super().stopping_function(i, sample, sampler)
         moves = getattr(sampler, "moves", None)
+        # ---- GB_SEARCH_STAGE_END_ON_SHUTOFF (user ruling 2026-09-26) ------
+        # "We want to end the recipe stage when all the (band, walker) pairs
+        # are shutoff from converged logL per (band, walker)." The shutoff
+        # becomes the WHOLE criterion instead of being ANDed with the nleaves
+        # plateau.
+        #
+        # WHY IT MATTERS in practice: the plateau needs 41 in-stage iterations
+        # before it evaluates at all, and its clock resets on every restart
+        # (see GF_PERSIST_STAGE_START), so a stage whose pairs have all shut
+        # off can sit there for hours re-proving a converged model.
+        #
+        # ⚠ TWO GUARDS, BOTH LOAD-BEARING.
+        #   * band_shutoff_w_armed: `pending` is 0 BOTH when everything
+        #     converged and when the valve is off, and only this tells them
+        #     apart. Without it every stage ends at its first check.
+        #   * nleaves > 0: an EMPTY stage has no occupied pairs, so pending is
+        #     0 at entry. gb_search_1 starts at ZERO leaves -- this rule alone
+        #     would end it on its first check, before a single birth. The
+        #     plateau rule carries the same guard ("a search that has not
+        #     found its FIRST source has not plateaued, it has not started").
+        #
+        # ⚠ DEFAULT OFF so the 6mo run's stages keep the composed rule.
+        if (not stop and band_shutoff_w_armed(moves)
+                and os.environ.get(
+                    "GB_SEARCH_STAGE_END_ON_SHUTOFF", "0").strip()
+                in ("1", "true", "True", "yes", "on")):
+            if band_shutoff_w_pending_total(moves) == 0:
+                _n = 0
+                try:
+                    _nl = sampler.backend.get_nleaves(
+                        branch_names=[self.plateau_branch], temp_index=0
+                    )[self.plateau_branch][
+                        int(getattr(self, "_stage_start_iter", 0)):]
+                    _n = int(_nl.max()) if len(_nl) else 0
+                except Exception:  # noqa: BLE001 -- fall through to no-stop
+                    _n = 0
+                if _n > 0:
+                    logger.info(
+                        "[V9-STAGE %s] STAGE COMPLETE on the SHUTOFF rule "
+                        "alone: every occupied (walker, band) pair has shut "
+                        "off (%d cold leaves in-stage; the nleaves plateau "
+                        "was NOT required -- GB_SEARCH_STAGE_END_ON_SHUTOFF).",
+                        self.stage_name or "gb_search", _n)
+                    return True
+                logger.info(
+                    "[V9-STAGE %s] shutoff rule satisfied but the stage has "
+                    "found NO leaves yet -- holding open (a search that has "
+                    "not found its first source has not converged).",
+                    self.stage_name or "gb_search")
         if band_shutoff_w_armed(moves):
             pending = band_shutoff_w_pending_total(moves)
             if stop and pending:

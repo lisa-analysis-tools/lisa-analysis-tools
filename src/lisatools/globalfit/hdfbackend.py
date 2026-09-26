@@ -1020,6 +1020,47 @@ class GFHDFBackend(eryn_HDFBackend):
             if _it is not None:
                 recipe_step_group.attrs["completed_iteration"] = _it
 
+    def stage_start_iteration(self, step_name):
+        """The stored iteration a step STARTED at, or ``None``.
+
+        The companion to ``completed_iteration``'s "where did it end".
+        Written by :meth:`stamp_stage_start` and read on resume so a stage's
+        own convergence clock survives a restart -- see
+        ``RJRecipeStep.setup_run`` and ``GF_PERSIST_STAGE_START``.
+
+        Returns ``None`` for a store written before this existed, for a step
+        that has not started, or on any read error: the caller then falls
+        back to the live iteration, which is the pre-2026-09-26 behaviour.
+        """
+        try:
+            with self.open("r") as f:
+                grp = f[self.name].get("recipe")
+                if grp is None or step_name not in grp:
+                    return None
+                val = grp[step_name].attrs.get("start_iteration")
+                return None if val is None else int(val)
+        except Exception as exc:  # noqa: BLE001 -- diagnostic, never fatal
+            logger.debug("recipe step %s: start_iteration unreadable (%r)",
+                         step_name, exc)
+            return None
+
+    def stamp_stage_start(self, step_name, iteration):
+        """Record the stored iteration ``step_name`` started at.
+
+        Best-effort and idempotent-by-caller: :meth:`stage_start_iteration`
+        is consulted first, so an existing stamp is never overwritten and a
+        resume keeps the ORIGINAL start rather than the restart's.
+        """
+        try:
+            with self.open("a") as f:
+                grp = f[self.name].get("recipe")
+                if grp is None or step_name not in grp:
+                    return
+                grp[step_name].attrs["start_iteration"] = int(iteration)
+        except Exception as exc:  # noqa: BLE001 -- diagnostic, never fatal
+            logger.debug("recipe step %s: could not stamp start_iteration "
+                         "(%r)", step_name, exc)
+
 
 class ModuleSubBackend(eryn_HDFBackend):
     """Generic per-branch sub-backend writing under ``sub_backend/<branch>``.
