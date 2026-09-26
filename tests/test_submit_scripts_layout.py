@@ -962,12 +962,36 @@ class ThreeMonthV9TwinTest(unittest.TestCase):
         self.assertEqual(self.three["GB_REPLACE_WARM_PASS"], "0")
 
     # -- 3MO-3: psd-only first stage, galfor frozen at the reference -----
-    def test_the_first_stage_samples_the_psd_alone(self):
-        self.assertEqual(self.three["STAGE_NOISE_PSD_ONLY"], "1")
+    def test_the_noise_evolves_throughout(self):
+        """Revised 2026-09-26 off the first 3-month run.
+
+        The first attempt fitted the psd ALONE in stage 0 and then FROZE
+        psd+galfor through gb_search_1/2. Two failures at once: the four
+        walkers' psds diverged (S_oms 1.74x, S_tm 7.81x spread, leaf counts
+        ordering exactly inversely to each walker's S_tm) and whatever stage 0
+        converged to was contaminated by the entire unsubtracted GB galaxy.
+        Freezing was the defect, so nothing is frozen now.
+        """
+        self.assertEqual(self.three["GB_SEARCH_SAMPLE_NOISE_ALL_STAGES"], "1")
+        self.assertNotIn(
+            "STAGE_NOISE_PSD_ONLY", self.three,
+            "galfor must sample from iteration 0 -- the psd-only stage is "
+            "exactly what this run learned not to do")
         self.assertEqual(self.three["STAGE_SKIP_NOISE_VGB"], "1")
         self.assertEqual(self.three["NOISE_SEARCH_CHECKS"], "5")
         # global to JointMaxLogLSearch, so it governs this stage too
         self.assertEqual(self.three["MAXLOGL_TOL"], "20")
+
+    def test_the_plateau_is_per_walker_and_freezes_the_converged(self):
+        """The laggard decides, not the best walker.
+
+        ``JointMaxLogLSearch`` tested ``state.log_like[0].max()``, so the
+        stage advanced as soon as the luckiest walker stopped climbing --
+        measured on job 636 row 0, plateau declared at best=52494067.95 with
+        the other three cold walkers 71,050 / 128,080 / 1,600 lnL below it.
+        """
+        self.assertEqual(self.three["MAXLOGL_PER_WALKER"], "1")
+        self.assertEqual(self.three["MAXLOGL_FREEZE_CONVERGED"], "1")
 
     def test_PSD_START_PARAMS_is_unset_or_the_first_stage_disappears(self):
         """Pinning it flips ``_noise_pinned`` and the noise stages are SKIPPED.
@@ -1044,9 +1068,11 @@ class ThreeMonthV9TwinTest(unittest.TestCase):
             "GB_WARM_START_FLOOR_EPS", "GB_WARM_START_CIRC_IMAGES",
             "GF_SEED_STORE", "GB_SEARCH_SEED_ITERS", "GB_SEARCH_3_WARM_EVERY",
             "GB_REPLACE_WARM_PASS",
-            # 3MO-3 psd-only first stage + the inflated reference
-            "STAGE_NOISE_PSD_ONLY", "STAGE_SKIP_NOISE_VGB",
-            "NOISE_SEARCH_CHECKS", "GALFOR_START_PARAMS",
+            # 3MO-3 the noise evolves throughout + the inflated start point
+            "GB_SEARCH_SAMPLE_NOISE_ALL_STAGES", "STAGE_NOISE_PSD_ONLY",
+            "STAGE_SKIP_NOISE_VGB", "NOISE_SEARCH_CHECKS",
+            "MAXLOGL_PER_WALKER", "MAXLOGL_FREEZE_CONVERGED",
+            "GALFOR_START_PARAMS",
             # 3MO-4 data + source branches
             "SOURCE_TYPES", "MBHB_IDS", "EMRI_IDS", "SOBHB_IDS",
             "STAGE_SKIP_SOURCE_SEARCH",

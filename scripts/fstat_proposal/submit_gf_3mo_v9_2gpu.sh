@@ -30,12 +30,20 @@
 #          explicitly EMPTY and GB_SEARCH_SEED_ITERS=0, so rj_warm_search /
 #          rj_warm_pe are absent from every stage and the seed stage is gone.
 #          The seed STORE goes with them: this run reads no previous run's h5.
-#   3MO-3. A PSD-ONLY FIRST STAGE, GALFOR FIXED AT AN INFLATED REFERENCE.
-#          The recipe opens with noise_search sampling psd ALONE against a
-#          residual that still contains the GBs; galfor is held at the 90-day
-#          add-back fixed point inflated by amp x1.25 / fk x1.10;
-#          gb_search_1/2 hold that max-logL psd; gb_search_3 releases both.
-#          New knobs STAGE_NOISE_PSD_ONLY=1 and STAGE_SKIP_NOISE_VGB=1.
+#   3MO-3. THE NOISE EVOLVES THROUGHOUT (revised 2026-09-26 off the first
+#          3-month run). noise_search opens the recipe fitting psd AND
+#          galfor jointly, and the noise then KEEPS SAMPLING in all three
+#          GB search stages -- the leading joint rider plus a noise
+#          convergence after every in-model convergence proposal. galfor
+#          STARTS at the 90-day add-back fixed point inflated by amp x1.25
+#          / fk x1.10 but is free from iteration 0. Knobs
+#          GB_SEARCH_SAMPLE_NOISE_ALL_STAGES=1 + STAGE_SKIP_NOISE_VGB=1.
+#          ⚠ THE FIRST ATTEMPT FROZE psd+galfor through gb_search_1/2 and
+#          failed two ways at once: the four walkers' psds DIVERGED (four
+#          independent prior draws, each maximized to its own optimum, then
+#          frozen apart, each walker searching against its own floor), and
+#          whatever stage 0 converged to was contaminated by the entire
+#          unsubtracted GB galaxy. Freezing was the defect, not the value.
 #   3MO-4. DATA = COMBINED, BRANCHES = gb + vgb + psd + galfor ONLY.
 #          SOURCE_TYPES=COMBINED,GB,VGB with MBHB_IDS / EMRI_IDS / SOBHB_IDS
 #          UNSET (not set-empty -- that breaks `import erebor`) and
@@ -48,11 +56,15 @@
 #
 # The recipe this composes to:
 #
-#   noise_search  psd_pe ONLY (galfor frozen, vgb frozen at exact truth)
-#   gb_search_1   phase_max on,  opt_snr 8, F-stat peak 8     noise FIXED
-#   gb_search_2   phase_max off, opt_snr 5, F-stat peak 6.25  noise FIXED
-#   gb_search_3   phase_max off, opt_snr 5, F-stat peak 6.25  psd+galfor SAMPLED
+#   noise_search  psd_pe + galfor_pe (vgb frozen at exact truth)
+#   gb_search_1   phase_max on,  opt_snr 8, F-stat peak 8     noise SAMPLED
+#   gb_search_2   phase_max off, opt_snr 5, F-stat peak 6.25  noise SAMPLED
+#   gb_search_3   phase_max off, opt_snr 5, F-stat peak 6.25  noise SAMPLED
 #   full_pe
+#
+# Every search stage runs the leading joint psd+galfor+vgb rider AND a noise
+# convergence after each in-model slot; the three still differ in phase
+# maximization, the opt-SNR boundary and the F-stat peak floor.
 #
 # ⚠ FRESH STORE. STORE_DIR below is a new path; the first submission starts
 # from scratch and re-submitting this same script RESUMES it. For a genuinely
@@ -1465,7 +1477,11 @@ export GB_INMODEL_GROUP=1
 # W in PASSES (not repeats): one pass is already GB_NUM_REPEAT_PROPOSALS
 # repeats per source, so the per-pass gain is a far coarser quantity than
 # the per-repeat one and needs nothing like the 100-repeat window V9-1 uses.
-export GB_INMODEL_GROUP_ITERS=3
+# 3 -> 2 (2026-09-26, carried from submit_gf_6mo_v9_4gpu.sh f7f84a89 -- the
+# window is in PASSES and dll stays at D/2, so this tightens the rate the
+# group must sustain). NOT a 3mo-specific knob: the twin test caught it
+# drifting and the 3-month run takes the 6-month value by the derive rule.
+export GB_INMODEL_GROUP_ITERS=2
 # D/2 again, and FLAT per sub-band (user ruling): "When a source is birthed,
 # it is per-source. During the special in-model only proposals it is
 # per-sub-band. I want flat D/2. This will focus more resources on the
@@ -2426,6 +2442,13 @@ export GB_CAP_DEST_BAND=1
 # >>> mis-seated rather than missing and a replacement has something to
 # >>> beat.
 export GB_SEARCH_RJ_REPLACE=0
+# in_model_replace retires WITH it (2026-09-26, carried from
+# submit_gf_6mo_v9_4gpu.sh 0e0067de). It was the polish slot for
+# rj_replace's survivors; with that move off it is simply a THIRD pure
+# in-model pass over rows in_model and in_model_fstat already polished.
+# The driver default is already 0 -- stated here so the run script says
+# what it runs. =1 restores it, alongside rj_replace, not on its own.
+export GB_SEARCH_IN_MODEL_REPLACE=0
 # TWO INTERNAL PASSES per propose() (user ruling 2026-09-24): pass 1 draws
 # replacement candidates from the warm-start mixture (the SAME container
 # rj_warm_search births from), pass 2 from the F-stat grid; each pass prices
@@ -3172,7 +3195,11 @@ export GB_TEMPER_ON_REMOVAL=1      # band swaps run inside rj_prior_removal
 # rj_prior_removal proposes prior BIRTHS as well as deaths in this run
 # (what the 2026-09-21 hand edit did from stored iteration 300 on). The
 # code default is 1 = the original deaths-only pruning move.
-export GB_SEARCH_PRIOR_REMOVAL_ONLY=0
+# 0 -> 1 (2026-09-26, carried from submit_gf_6mo_v9_4gpu.sh 938684fd:
+# "pruning back on"). rj_prior_removal returns to the deaths-only pruning
+# move instead of also proposing prior births. Carried for the same reason
+# as the knob above -- it is a v9 tuning ruling, not a Tobs property.
+export GB_SEARCH_PRIOR_REMOVAL_ONLY=1
 # High-f barren-band birth shutoff (search scope): bands above FMIN with
 # AFTER consecutive zero-birth-accept proposes stop proposing births
 # (deaths + in-model continue; [GB_BAND_SHUTOFF] log line per band).
@@ -3642,86 +3669,131 @@ export GB_ROUTER_THREADED=1
 export GB_WARM_START_COMPONENTS=
 
 # ============================================================================
-# 3MO-3 -- A PSD-ONLY FIRST STAGE, GALFOR FIXED AT AN INFLATED REFERENCE.
-# (user spec 2026-09-26; full design + provenance in
-#  docs/superpowers/specs/2026-09-26-3mo-v9-2gpu-design.md)
+# 3MO-3 -- THE NOISE EVOLVES THROUGHOUT: A noise_search FIRST STAGE, AND A
+#          NOISE CONVERGENCE AFTER EVERY IN-MODEL SLOT IN ALL THREE GB
+#          SEARCH STAGES.
+# (user ruling 2026-09-26, off the first 3-month run; full design +
+#  provenance in docs/superpowers/specs/2026-09-26-3mo-v9-2gpu-design.md)
 #
-#   noise_search   psd_pe ONLY, under one joint max-logL criterion, against a
-#                  residual that STILL CONTAINS THE GBs (vgb and every other
-#                  source are subtracted at truth)
-#   gb_search_1/2  noise FIXED at that max-logL psd + this reference galfor
-#   gb_search_3    psd AND galfor sampled -- the foreground is released here
+#   noise_search     psd_pe + galfor_pe, one joint max-logL criterion,
+#                    against a residual that STILL CONTAINS THE GBs (vgb and
+#                    every other source are subtracted at truth)
+#   gb_search_1/2/3  the leading joint psd+galfor+vgb rider PLUS a noise
+#                    convergence after EVERY in-model convergence proposal
+#   full_pe          psd + galfor PE as always
 #
-# "Fixed galfor" is the ABSENCE of the galfor_pe move, not a runtime pin: an
-# unsampled branch does not move, and setup_acs rebuilds each walker's
-# sensitivity from the state coords every pass, so the branch contributes its
-# START coordinates. That is exactly the mechanism gb_search_1/2 already use
-# at 6 months; this run extends it one stage earlier. The value it is held at
-# is GALFOR_START_PARAMS below.
+# ⚠ THIS REPLACES THE FIRST ATTEMPT, AND THE REASON IS MEASURED, NOT
+# THEORETICAL. The first configuration fitted the psd ALONE in stage 0
+# (STAGE_NOISE_PSD_ONLY=1) and then FROZE psd+galfor for the whole of
+# gb_search_1 and gb_search_2. Two things went wrong at once:
 #
-# THE HANDOVER TO gb_search_1 IS AUTOMATIC. The max-logL search leaves the
-# chain at its maximum-likelihood point and gb_search_1/2 carry no psd move,
-# so they hold exactly that. Nothing copies it; confirm it once on the first
-# snapshot rather than assuming it.
+#   1. THE WALKERS' PSDs DIVERGED. psd has no start pin here (searching it is
+#      the point), so the four walkers begin at four independent PRIOR DRAWS,
+#      and a max-logL search converges each to its own optimum. Freezing then
+#      made that permanent: four walkers each searching for GBs against their
+#      own noise floor, with no mechanism left to reconcile them.
+#   2. WHATEVER STAGE 0 CONVERGES TO IS GALAXY-CONTAMINATED. Nothing has
+#      subtracted a GB yet, so the entire galaxy is in the residual and a
+#      2-parameter psd has nowhere to put it except Soms_d / Sa_a. That was
+#      called out as "bounded" in the design; the run says it is not.
 #
-# ⚠ TWO NEW KNOBS, TWO JOBS. An unrecognized env var is SILENTLY IGNORED (the
-# stock-settings rule in CLAUDE.md), so the preflight immediately below checks
-# that the driver actually reads them.
-#   STAGE_NOISE_PSD_ONLY=1  drops galfor_pe from the STANDALONE noise stage
-#                           ONLY. gb_search_3's four interleaved
-#                           noise_joint_search slots keep BOTH moves -- that
-#                           stage is the one that releases the foreground.
-#                           It REFUSES to run without GALFOR_START_PARAMS:
-#                           galfor would otherwise start at a PRIOR DRAW and
-#                           sit frozen there through three whole stages, which
-#                           is the same failure the existing half-pin guard
-#                           exists to prevent, one layer down.
+# Freezing is the defect in both, not the value. Sampling the noise in every
+# stage lets it track back DOWN as the GB model fills in, and lets the walkers
+# pull back together instead of each carrying its own frozen error.
+#
+# ⚠ COST, and it is not small: this puts FIVE JointMaxLogLSearch slots (the
+# leading rider + four interleaved) into stages 1 and 2 as well as stage 3.
+# One such rider measured ~93 s per GB iteration at 3mo (job 473, ~15% of the
+# iteration) at NOISE_SEARCH_CHECKS=5. GB_SEARCH_NOISE_CHECKS=1 -- the code
+# default, inherited -- is what keeps each near ~2 rounds rather than ~6.
+# Watch the [GF_TIMING] share of the noise moves on the first snapshot.
+#
+# ⚠ ONE NEW KNOB. An unrecognized env var is SILENTLY IGNORED (the
+# stock-settings rule in CLAUDE.md), so the preflight below checks that the
+# driver actually reads it.
+#   GB_SEARCH_SAMPLE_NOISE_ALL_STAGES=1  every v9 GB search stage samples the
+#                           noise, not just gb_search_3. DEFAULT OFF -- the
+#                           6mo v9 run shares this driver and keeps its
+#                           fixed-noise stages 1/2 unchanged.
 #   STAGE_SKIP_NOISE_VGB=1  drops the noise_vgb_search stage (user ruling
 #                           2026-09-26). With VGB_START_FACTOR=0 the VGBs
 #                           start at EXACT truth, so a max-logL burn-in has
 #                           nothing to find; they begin sampling in
-#                           gb_search_1, where vgb_pe already rides the
-#                           fixed-noise stages, and they sit subtracted at
-#                           truth through stage 0 -- which is what makes "all
-#                           sources removed except the GBs" true there.
+#                           gb_search_1, where vgb_pe rides every stage.
+#
+# STAGE_NOISE_PSD_ONLY IS DELIBERATELY NOT SET. The knob still exists in the
+# driver (default off, tested) and freezes galfor through the noise stage --
+# which is exactly what this run just learned not to do. Do not re-arm it here
+# without re-reading the two failures above.
 # ============================================================================
-export STAGE_NOISE_PSD_ONLY=1
+export GB_SEARCH_SAMPLE_NOISE_ALL_STAGES=1
 export STAGE_SKIP_NOISE_VGB=1
 # Plateau length for the STANDALONE noise stage -- the code default, pinned
-# here because this stage's output is the noise reference for two whole
-# stages and should not be inherited silently. MAXLOGL_TOL above is GLOBAL to
-# JointMaxLogLSearch and STAYS AT 20 (user ruling 2026-09-26): against a cold
-# logL of ~1e8 a 20 lnL floor is far below anything that matters, and five
-# consecutive flat rounds is what makes this a plateau test rather than a
-# wobble detector.
+# here because this stage sets where the GB search starts from and should not
+# be inherited silently. MAXLOGL_TOL above is GLOBAL to JointMaxLogLSearch and
+# STAYS AT 20 (user ruling 2026-09-26): against a cold logL of ~1e8 a 20 lnL
+# floor is far below anything that matters, and five consecutive flat rounds
+# is what makes this a plateau test rather than a wobble detector.
 export NOISE_SEARCH_CHECKS=5
+# PER-WALKER PLATEAU (user ruling 2026-09-26). Pinned explicitly even though
+# it is now the code default, because this run's whole first-attempt failure
+# was the criterion it replaces. JointMaxLogLSearch used to test
+# state.log_like[0].MAX() -- the BEST walker -- so the stage advanced as soon
+# as the luckiest walker stopped climbing. Measured on job 636 row 0: plateau
+# declared at best=52494067.95 while the other three cold walkers sat 71,050 /
+# 128,080 / 1,600 lnL below it. Now every walker carries its own baseline and
+# flat counter, the LAGGARD decides, and a walker that has converged is frozen
+# so the remaining rounds go to the ones still climbing.
+# ⚠ NOTE WHAT IT DOES *NOT* FIX: the walkers still START at four independent
+# prior draws (PSD_START_PARAMS is unset). What makes that recoverable here is
+# that noise_search runs with ZERO GB leaves, so all four walkers see the SAME
+# residual and therefore the same likelihood surface -- run each to its own
+# plateau and they land on the same optimum instead of 128k lnL apart. If a
+# snapshot still shows them spread, pin PSD_START_PARAMS (see above).
+# MAXLOGL_PER_WALKER=0 restores the old best-walker rule bit-identically;
+# MAXLOGL_FREEZE_CONVERGED=0 keeps per-walker but stops freezing.
+export MAXLOGL_PER_WALKER=1
+export MAXLOGL_FREEZE_CONVERGED=1
 #
 # ⚠ PSD_START_PARAMS MUST STAY UNSET. run_combined_staged.py SKIPS the noise
 # stages when EVERY sampled noise branch is pinned, so setting it would delete
 # this run's first stage. A galfor-only pin leaves _noise_pinned False, which
 # is exactly the configuration wanted here. STAGE_FORCE_NOISE_SEARCH=1 is the
 # escape if a psd start value is ever wanted as well.
+# ⚠ AND NOTE WHAT IT WOULD ALSO FIX: an explicit PSD_START_PARAMS is the one
+# thing that would start all four walkers at the SAME psd instead of four
+# prior draws. It is left unset because the noise now keeps sampling, which
+# addresses the divergence from the other end -- but if the walkers still
+# spread, pin it (PHYSICAL/linear Soms_d, Sa_a) together with
+# STAGE_FORCE_NOISE_SEARCH=1 so the stage still runs.
 #
-# ---- PREFLIGHT: the two knobs above must actually be CONSUMED --------------
+# ---- PREFLIGHT: the knobs above must actually be CONSUMED ------------------
 # A preflight proves the NAME resolves, not that any code path reads it. Six
 # separate defects this month had that shape. Both knobs are read by the
 # DRIVER (not the package), with literal names, so a grep of the driver source
 # is the honest check -- and it is what catches a stale checkout.
 _DRIVER=scripts/fstat_proposal/run_combined_staged.py
-for _k in STAGE_NOISE_PSD_ONLY STAGE_SKIP_NOISE_VGB; do
+for _k in GB_SEARCH_SAMPLE_NOISE_ALL_STAGES STAGE_SKIP_NOISE_VGB; do
   if ! grep -q "${_k}" "${_DRIVER}"; then
     echo "[3MO-PREFLIGHT] REFUSING: ${_k} is not read anywhere in"
     echo "[3MO-PREFLIGHT]   ${_DRIVER}"
     echo "[3MO-PREFLIGHT] The exported value would be SILENTLY IGNORED and"
-    echo "[3MO-PREFLIGHT] this run would fit psd AND galfor together in its"
-    echo "[3MO-PREFLIGHT] first stage -- plausible output, wrong experiment."
-    echo "[3MO-PREFLIGHT] git pull to at or after the psd-only-noise-stage commit."
+    echo "[3MO-PREFLIGHT] this run would FREEZE the noise through gb_search_1"
+    echo "[3MO-PREFLIGHT] and gb_search_2 -- plausible output, and exactly the"
+    echo "[3MO-PREFLIGHT] failure the first 3-month attempt hit."
+    echo "[3MO-PREFLIGHT] git pull to at or after the all-stage-noise commit."
     exit 2
   fi
 done
 unset _DRIVER _k
 #
-# ---- THE FOREGROUND REFERENCE ---------------------------------------------
+# ---- THE FOREGROUND START POINT -------------------------------------------
+# ⚠ IT IS A START, NOT A HELD REFERENCE, as of the 2026-09-26 revision: the
+# galfor branch samples from iteration 0. The inflation below therefore costs
+# far less than it did in the first attempt -- it sets where the chain BEGINS
+# rather than a floor the whole search is judged against -- but it is kept,
+# because with an empty GB model the foreground climbs to absorb the galaxy
+# anyway, and starting nearer that point shortens the burn-in.
 # PHYSICAL / LINEAR, order (amp, fk, alpha, f_1, f_2). run.py converts into
 # whatever basis this run samples in (galfor log10 on amp/fk/f_1/f_2, alpha
 # LINEAR), which is why the interchange format is physical -- this file
@@ -3808,10 +3880,11 @@ unset _DRIVER _k
 # inflation absorbs part of it rather than leaving all of it to Sa_a.
 # gb_search_3 is what fixes it properly.
 export GALFOR_START_PARAMS=${GALFOR_START_PARAMS:-1.795225757380e-44,2.787307176476e-03,5.0,9.9e-03,1.405721657329e-03}
-echo "[3MO-NOISE] stage 0 = psd-only max-logL search (psd_only=${STAGE_NOISE_PSD_ONLY} skip_vgb_stage=${STAGE_SKIP_NOISE_VGB} checks=${NOISE_SEARCH_CHECKS} tol=${MAXLOGL_TOL})"
-echo "[3MO-NOISE] galfor FROZEN at the inflated 3mo reference (amp x1.25, fk x1.10):"
+echo "[3MO-NOISE] stage 0 = joint psd+galfor max-logL search; the noise then"
+echo "[3MO-NOISE]   KEEPS SAMPLING in every GB search stage (all_stages=${GB_SEARCH_SAMPLE_NOISE_ALL_STAGES} skip_vgb_stage=${STAGE_SKIP_NOISE_VGB} checks=${NOISE_SEARCH_CHECKS} tol=${MAXLOGL_TOL})"
+echo "[3MO-NOISE] galfor STARTS at the inflated 3mo reference (amp x1.25, fk x1.10), free from iteration 0:"
 echo "[3MO-NOISE]   GALFOR_START_PARAMS=${GALFOR_START_PARAMS}"
-echo "[3MO-NOISE] PSD_START_PARAMS=${PSD_START_PARAMS:-<unset: the psd is SEARCHED in stage 0>}"
+echo "[3MO-NOISE] PSD_START_PARAMS=${PSD_START_PARAMS:-<unset: SEARCHED from a prior draw in stage 0>}"
 echo "[3MO-WARM] GB_WARM_START_COMPONENTS='${GB_WARM_START_COMPONENTS}' (empty = NO warm start; rj_warm_search / rj_warm_pe absent from every stage)"
 
 # ============================================================================
@@ -4138,10 +4211,11 @@ if [ -e "${STORE_DIR}/${BASE_FILE_NAME}_testing.h5" ]; then
   echo "        or move this one aside first."
 else
   echo "[FRESH] no store at ${STORE_DIR} -- starting a NEW run from scratch."
-  echo "[FRESH] stages run from the top (noise_search [psd ONLY, galfor"
-  echo "        frozen] -> gb_search_1 -> gb_search_2 -> gb_search_3 ->"
-  echo "        full_pe); the F-stat grid + epoch center table are fitted"
-  echo "        fresh against this run's own residual."
+  echo "[FRESH] stages run from the top (noise_search [psd + galfor] ->"
+  echo "        gb_search_1 -> gb_search_2 -> gb_search_3 -> full_pe, with"
+  echo "        the noise SAMPLED in all three search stages); the F-stat"
+  echo "        grid + epoch center table are fitted fresh against this"
+  echo "        run's own residual."
 fi
 
 # ============================================================================
