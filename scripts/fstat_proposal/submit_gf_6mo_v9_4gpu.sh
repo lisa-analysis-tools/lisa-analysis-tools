@@ -1737,7 +1737,14 @@ export FSTAT_SIGHET_MULTIDEV=1
 # WHY THIS RATHER THAN WIDENING THE GATE: refreshing re-linearizes, so it
 # buys mixing while PRESERVING accuracy; widening buys the same mixing by
 # SPENDING accuracy. Same reason GB_SIGHET_TRUST_PHASE_C stays at 0 here.
-export GB_SIGHET_REFRESH_EVERY=25
+# >>> 25 -> 50 (2026-09-25): inmodel_sighet_refresh was the single largest
+# >>> line item inside the in-model polish in job 628 (167-186 s per RJ
+# >>> move). Halving the cadence halves that. The reference goes staler
+# >>> between rebuilds, so the trade is mixing against accuracy -- and both
+# >>> sides are instrumented: watch [GB_TRUST] (was rejecting 4-13% of
+# >>> candidates) and the end-of-block 'll AUDIT vs exact' COLD median (was
+# >>> 0.026-0.073, max 0.14-0.73). If either degrades materially, revert.
+export GB_SIGHET_REFRESH_EVERY=50
 # DPHASE 0 -> 0.1 rad (2026-09-11, ported from the 10w arm 379ae2e1):
 # refresh only sources drifted past 0.1 rad since their reference build.
 # Error bound at 0.1 rad = 2.4e-7 x SNR^2/2 = 0.004 lnL at SNR 184
@@ -2291,7 +2298,20 @@ export GB_CAP_DEST_BAND=1
 # cold-accepted dll mean/max) and [GB_ORTHO_LL rj_replace] against
 # GB_ORTHO_LL_TOL. If either fires, set GB_SEARCH_RJ_REPLACE=0 and relaunch;
 # nothing else in the cycle depends on it.
-export GB_SEARCH_RJ_REPLACE=1
+# >>> 1 -> 0 (user ruling 2026-09-25, off job 628). NOT because the
+# >>> watchdogs above fired -- max |dlnL| stayed 298-661, under the 1.0e3
+# >>> warn and well under the 1.5-1.9e3 retirement signature. It is being
+# >>> switched off for YIELD: six consecutive zero-yield proposes, 8 swaps
+# >>> accepted out of ~707,000 proposals across 3 iterations x 2 passes,
+# >>> and ZERO at the cold chain -- dead at every temperature, not just
+# >>> cold. It was simultaneously the most expensive move in iteration 3
+# >>> (1610 s = 19.4% of the cycle), ~98% of which is in-model polish on
+# >>> its survivors that in_model_replace then provides anyway.
+# >>> in_model_replace STAYS: it is a plain in-model pass and does not
+# >>> depend on the RJ move. Reinstate for gb_search_3, where sources are
+# >>> mis-seated rather than missing and a replacement has something to
+# >>> beat.
+export GB_SEARCH_RJ_REPLACE=0
 # TWO INTERNAL PASSES per propose() (user ruling 2026-09-24: "one internal
 # iteration with the refit/warmstart and one internal iteration of the
 # fstat"). Pass 1 draws replacement candidates from the warm-start mixture
@@ -2463,7 +2483,15 @@ export GB_SEARCH_CAP_QUIESCENT=0   # V9-4: cap off -> nothing to hold for
 # words) -- empty pairs can never shut off by construction, so "all pairs"
 # is unreachable and the occupied-only reading is the operative one.
 export GB_SEARCH_BAND_SHUTOFF_PER_WALKER=1
-export GB_SEARCH_BAND_SHUTOFF_CONV_ITER=5
+# 5 -> 3 (user ruling 2026-09-25): "let's make sure it's not too many
+# iterations. 2 or 3 is fine." This is how many consecutive iterations an
+# occupied (walker, band) pair must post a converged sub-band logL before
+# it shuts off; the STAGE ends when every occupied pair has. A shorter
+# window ends each search stage sooner, which is what we want now that the
+# per-leaf cost is climbing (7.4 -> 70.6 -> 101.9 s/leaf over 628's three
+# iterations) -- time is better spent in the next stage than re-proving a
+# band that already stopped paying.
+export GB_SEARCH_BAND_SHUTOFF_CONV_ITER=3
 # ⚠ OFF, deliberately: this is the PER-BAND stage schedule (SNR limits and
 # phase maximization moving independently per band). In v9 those move
 # together across RECIPE stages instead, so the per-band schedule must stay
@@ -3106,7 +3134,20 @@ export GB_TEMPER_SKIP_SHUTOFF_BANDS=1
 # is 4x a fixed 4000 s bill; check with
 #   grep '\[peaks\]' globalfit_run.log
 # before committing a long allocation. GB_FSTAT_REFIT_EVERY=40 reverts.
-export GB_FSTAT_REFIT_EVERY=10     # SEARCH stages: 10 ELAPSED iterations
+# >>> 10 -> 1 (user ruling 2026-09-25, off job 628): refit EVERY search
+# >>> iteration, "because everything is happening so quickly with the
+# >>> leaves". Job 628 added 113 then 81 leaves/walker per iteration while
+# >>> rj_fstat_search's cold yield fell 135 -> 96 -> 54, i.e. the grid was
+# >>> proposing against a residual that had moved substantially since it was
+# >>> fitted. 628 never refit once in 7h42m -- it reloaded epoch_0000 every
+# >>> iteration.
+# >>> ⚠ COST, and it is not small: a full fit was 12.0 min stage A + ~18 min
+# >>> stage B + 33 s centres = ~30 min. On an 8307 s iteration that is +22%
+# >>> BEFORE the peak list starts shrinking. Dropping rj_replace below pays
+# >>> back ~1610 s of it. Watch '[peaks]' and '[stageA]' -- if the peak count
+# >>> is not falling by the third epoch this is a fixed ~1800 s/iteration
+# >>> bill and should go back to 5 or 10.
+export GB_FSTAT_REFIT_EVERY=1      # SEARCH stages: EVERY elapsed iteration
 # PE-STAGE CADENCE (user ruling 2026-09-24): 250 elapsed iterations.
 # Separate from the search value because full_pe is a RANDOM_CHOICE stage --
 # the GB move is drawn roughly one iteration in N, so a search-tuned cadence

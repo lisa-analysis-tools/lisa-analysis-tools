@@ -225,7 +225,10 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         # goes stale as the search subtracts what it finds, so an old grid
         # aims births at peaks already claimed. PE is deliberately NOT
         # changed -- the two cadences are separate knobs for that reason.
-        self.assertEqual(self.v9["GB_FSTAT_REFIT_EVERY"], "10")
+        # 10 -> 1 (2026-09-25): refit every search iteration, because
+        # the residual moves fast enough that the grid goes stale --
+        # 628's rj_fstat_search cold yield fell 135 -> 96 -> 54.
+        self.assertEqual(self.v9["GB_FSTAT_REFIT_EVERY"], "1")
         self.assertLess(int(self.v9["GB_FSTAT_REFIT_EVERY"]),
                         int(self.v9["GB_FSTAT_REFIT_EVERY_PE"]))
 
@@ -295,9 +298,12 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         self.assertEqual(self.v9["GB_SEARCH_3_WARM_EVERY"], "5")
 
     def test_rj_replace_is_back_and_two_pass(self):
-        """Reversing the 2026-08-29 disable, with the logging to tell
-        "working" from "misbehaving the way it used to"."""
-        self.assertEqual(self.v9["GB_SEARCH_RJ_REPLACE"], "1")
+        """Reinstated 2026-09-24, then switched OFF again 2026-09-25 on
+        yield: six consecutive zero-yield proposes in job 628, 8 swaps out
+        of ~707k proposals and ZERO at the cold chain, while costing 19.4%
+        of the cycle. The two-pass WIRING stays configured so reinstating
+        it for gb_search_3 is a one-knob change."""
+        self.assertEqual(self.v9["GB_SEARCH_RJ_REPLACE"], "0")
         self.assertEqual(self.v9["GB_REPLACE_WARM_PASS"], "1")
         self.assertEqual(self.v8["GB_SEARCH_RJ_REPLACE"], "0")
         # PE is explicitly NOT part of the reinstatement.
@@ -557,6 +563,12 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # f0-adaptive stage-B sky grid (the F-stat fix, 2026-09-24)
             "FSTAT_STAGEB_SKY_ADAPT", "FSTAT_STAGEB_NSKY_MIN",
             "FSTAT_STAGEB_NSKY_MAX", "FSTAT_STAGEB_GROUP_MAX_GB",
+            # V9-15 (2026-09-25, off job 628): sig-het reference refresh
+            # 25 -> 50. It was the largest single line item inside the
+            # in-model polish (167-186 s per RJ move). Trades reference
+            # staleness for wall time; [GB_TRUST] and the end-of-block
+            # "ll AUDIT vs exact" COLD median are the instruments.
+            "GB_SIGHET_REFRESH_EVERY",
         }
         drift = {
             k: (self.v8.get(k), self.v9.get(k))
