@@ -2125,3 +2125,90 @@ class PerWalkerValveStatisticTest(unittest.TestCase):
             "if self._band_leaf_cap is not None and self.leaf_cap_update:")
         i_elif = body.index("elif cap_stats is not None")
         self.assertLess(i_gate, i_elif, "the stash must be the ELSE branch")
+
+
+class GroupStaticOnePassShutoffTest(unittest.TestCase):
+    """A (walker, band) that moved NOWHERE in the ladder retires at pass 1.
+
+    User ruling 2026-09-26: "track the max logL of a band-walker set over
+    all temperatures. If it is the same at the beginning of the
+    in-model-only move and the end of 1 iteration, then that one gets shut
+    off. Otherwise we use 2 to shut off."
+
+    WHY IT MATTERS: the group window is a FLOOR -- passes 1..W shut
+    nothing, because a pair needs W passes of history before the ring test
+    can fire. On job 634 those warm-up passes were 62.6% of ALL pure
+    in-model work across the three slots (each slot runs its own group
+    state, so the warm-up is paid once PER slot). This is the only exit
+    that does not pay the floor.
+    """
+
+    NW, NB, NT = 2, 4, 3
+
+    def _state(self, window=2, thresh=4.0):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        return g._InModelGroupState(
+            window=window, thresh=thresh, max_passes=100, scale="flat")
+
+    def _occ(self, n=1):
+        return np.full((self.NW, self.NB), float(n))
+
+    def test_a_pair_that_moved_nowhere_shuts_at_pass_1(self):
+        st = self._state()
+        allt = np.zeros((self.NT, self.NW, self.NB))     # nothing accepted
+        st.update(np, allt[0], self._occ(), all_temp_delta=allt)
+        self.assertEqual(st.passes, 1)
+        self.assertTrue(bool(np.asarray(st.shut).all()),
+                        "a fully static ladder must retire on pass 1")
+        self.assertEqual(st.static_shut, self.NW * self.NB)
+
+    def test_movement_on_ANY_rung_keeps_it_open(self):
+        """Cold flat but a HOT rung moving is exactly the case the
+        cold-only statistic would have missed."""
+        st = self._state()
+        allt = np.zeros((self.NT, self.NW, self.NB))
+        allt[2, 0, 0] = 1e-9                              # hottest rung only
+        st.update(np, allt[0], self._occ(), all_temp_delta=allt)
+        self.assertFalse(bool(np.asarray(st.shut)[0, 0]),
+                         "movement anywhere in the ladder must hold it open")
+        self.assertEqual(st.static_shut, self.NW * self.NB - 1)
+
+    def test_the_control_without_the_ladder_nothing_shuts_at_pass_1(self):
+        """THE CONTROL. Same static input, fast path not armed: the window
+        is 2, so pass 1 can retire nothing. If this ever passes, the test
+        above is not measuring the fast path."""
+        st = self._state()
+        allt = np.zeros((self.NT, self.NW, self.NB))
+        st.update(np, allt[0], self._occ())               # no all_temp_delta
+        self.assertFalse(bool(np.asarray(st.shut).any()))
+        self.assertEqual(st.static_shut, 0)
+
+    def test_it_only_fires_on_pass_1(self):
+        """A pair that goes quiet LATER must still be judged by the
+        windowed rule -- the fast path is about never paying the floor,
+        not about a zero-tolerance criterion."""
+        st = self._state()
+        moving = np.zeros((self.NT, self.NW, self.NB)); moving[0] = 50.0
+        st.update(np, moving[0], self._occ(), all_temp_delta=moving)
+        self.assertFalse(bool(np.asarray(st.shut).any()))
+        quiet = np.zeros((self.NT, self.NW, self.NB))
+        st.update(np, quiet[0], self._occ(), all_temp_delta=quiet)
+        self.assertEqual(st.static_shut, 0, "fast path must not re-fire")
+
+    def test_unoccupied_pairs_are_unaffected(self):
+        """They already shut immediately; the fast path must not double
+        count them into static_shut."""
+        st = self._state()
+        allt = np.zeros((self.NT, self.NW, self.NB))
+        st.update(np, allt[0], np.zeros((self.NW, self.NB)),
+                  all_temp_delta=allt)
+        self.assertTrue(bool(np.asarray(st.shut).all()))
+        self.assertEqual(st.static_shut, 0)
+
+    def test_the_call_site_passes_the_WHOLE_ladder(self):
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._run_group_passes)
+        self.assertIn("all_temp_delta=ll_change_log", src)
+        self.assertNotIn("all_temp_delta=ll_change_log[0]", src)

@@ -2521,7 +2521,7 @@ class _InModelGroupState:
         self.shut = xp.zeros(shape, dtype=bool)
         self.shut_at = xp.zeros(shape, dtype=xp.int64)
 
-    def update(self, xp, cold_delta, occ_count):
+    def update(self, xp, cold_delta, occ_count, all_temp_delta=None):
         """Fold one pass in. Returns the number of NEWLY shut pairs.
 
         ``cold_delta`` is ``ll_change_log[0]`` for the pass (nwalkers,
@@ -2536,6 +2536,36 @@ class _InModelGroupState:
         forever (the same trap the peer's stage-scoped valve documents for
         empty pairs, resolved here in the opposite direction because this
         group must terminate inside one propose).
+
+        ``all_temp_delta`` (user ruling 2026-09-26) is the WHOLE
+        ``ll_change_log`` for the pass, ``(ntemps, nwalkers, num_bands)``,
+        and arms a ONE-PASS fast path: *"track the max logL of a
+        band-walker set over all temperatures. If it is the same at the
+        beginning of the in-model-only move and the end of 1 iteration,
+        then that one gets shut off. Otherwise we use 2 to shut off."*
+
+        A pair whose accepted ``delta_ll`` is EXACTLY zero on every rung
+        moved nowhere in the entire ladder during a full pass -- not cold,
+        not hot -- so there is nothing for a second pass to measure. It
+        retires at pass 1 instead of waiting out the window.
+
+        WHY THIS MATTERS: the window is a FLOOR. Passes 1..W shut nothing
+        because a pair needs W passes of history before the ring test can
+        fire, and on job 634 those warm-up passes were 62.6% of ALL pure
+        in-model work across the three slots (each runs its own group
+        state, so the warm-up is paid once PER SLOT). This is the only
+        exit that does not have to pay the floor.
+
+        ⚠ It is deliberately EXACT zero, not a tolerance. The statistic is
+        a sum of ACCEPTED deltas, so zero means no proposal was accepted
+        anywhere in the column; a tolerance would instead retire pairs that
+        ARE moving, just slowly, which is precisely what the windowed rule
+        exists to judge. Exact-zero cancellation across all rungs is not a
+        real failure mode for float sums of independent accepts.
+
+        ⚠ It can only shut a pair EARLIER, never later, and only when
+        nothing moved -- so it cannot change which pairs eventually
+        converge, only when the dead ones stop being swept.
         """
         if self._best is None:
             self._alloc(xp, tuple(cold_delta.shape))
@@ -2555,6 +2585,14 @@ class _InModelGroupState:
         was = self.shut
         flat = (self.passes >= self.window) & (
             (self._best - old) <= self.thresh)
+        # ONE-PASS fast path for a pair that moved NOWHERE in the ladder.
+        # Counted separately so the log can say how much of the shutoff
+        # came from here rather than from the windowed rule.
+        self.static_shut = 0
+        if all_temp_delta is not None and self.passes == 0:
+            _static = (xp.asarray(all_temp_delta) == 0).all(axis=0) & occupied
+            self.static_shut = int(xp.count_nonzero(_static & ~self.shut))
+            flat = flat | _static
         self.shut = self.shut | flat | (~occupied)
         self.shut_at = xp.where(self.shut & ~was, self.passes + 1,
                                 self.shut_at)
@@ -15811,17 +15849,30 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         xp = self.xp
         while True:
             occ = self._group_cold_occupancy(band_sorter)
-            n_new = st.update(xp, ll_change_log[0], occ)
+            # The WHOLE ladder, not just the cold rung: a pair that moved
+            # nowhere on ANY temperature has nothing for a second pass to
+            # measure and retires at pass 1 (user ruling 2026-09-26).
+            # ll_change_log is already (ntemps, nwalkers, num_bands), so
+            # this costs nothing to pass -- the statistic is free, exactly
+            # as the cold one is.
+            n_new = st.update(xp, ll_change_log[0], occ,
+                              all_temp_delta=ll_change_log)
             n_shut, n_open, n_occ_open = st.census(xp)
             _tot = float(_to_numpy(ll_change_log[0].sum()))
             logger.info(
                 "[GB_IMGROUP %s] pass %d: cold dlnL %+.3f over %d occupied "
-                "sub-band(s); shut %d (+%d this pass) / open %d (%d "
+                "sub-band(s); shut %d (+%d this pass%s) / open %d (%d "
                 "occupied); mean gain/occupied band %+.3f, per source "
                 "%+.4f.",
                 self.name, st.passes, _tot,
                 int(_to_numpy(xp.count_nonzero(occ > 0))),
-                n_shut, n_new, n_open, n_occ_open,
+                n_shut, n_new,
+                # How much of pass 1's shutoff came from the one-pass
+                # static path rather than the windowed rule -- without
+                # this the fast path is invisible and cannot be judged.
+                (f", {st.static_shut} static" if getattr(
+                    st, "static_shut", 0) else ""),
+                n_open, n_occ_open,
                 _tot / max(int(_to_numpy(xp.count_nonzero(occ > 0))), 1),
                 _tot / max(float(_to_numpy(occ.sum())), 1.0),
             )
