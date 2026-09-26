@@ -34,11 +34,16 @@ SCRIPTS = [
     # the v9 campaign script: same dispatch machinery as 6mo_v8, three
     # deliberate deltas (see SixMonthV9DeltaTest)
     os.path.join(ROOT, "scripts", "fstat_proposal", "submit_gf_6mo_v9_4gpu.sh"),
+    # the 3-month twin OF THE V9 SCRIPT (2026-09-26): psd-only first stage,
+    # inflated foreground reference, no warm start, 2 GPUs. See
+    # ThreeMonthV9TwinTest for the declared delta list.
+    os.path.join(ROOT, "scripts", "fstat_proposal", "submit_gf_3mo_v9_2gpu.sh"),
 ]
 
 THREE_MO = SCRIPTS[2]
 SIX_MO = SCRIPTS[0]
 SIX_MO_V9 = SCRIPTS[3]
+THREE_MO_V9 = SCRIPTS[4]
 
 # Env knobs the dispatch block reads; stripped from the inherited environment
 # before each scenario applies its own overrides, so a stray value in the
@@ -843,6 +848,205 @@ class ThreeMonthTwinTest(unittest.TestCase):
                             ("SIGHET_TUKEY_ALPHA", "0.01"),
                             ("SOBBH_EIGEN_SCOPE", "walker_max")):
             self.assertEqual(self.three.get(knob), value, knob)
+
+
+class ThreeMonthV9TwinTest(unittest.TestCase):
+    """``submit_gf_3mo_v9_2gpu.sh`` is ``submit_gf_6mo_v9_4gpu.sh`` at 3 months.
+
+    Same silent-failure shape the v8 twin above guards, and the same remedy:
+    the two files are ~99% the same text, so the obvious way to carry a fix
+    across is to copy the block -- and the blocks that must NOT be copied are
+    exactly the ones that look like ordinary knobs. A 3-month run that quietly
+    analysed 6 months of data, armed the source branches, or fitted the
+    foreground in its first stage would produce entirely plausible output and
+    waste the allocation.
+
+    Design + the provenance of every number:
+    ``docs/superpowers/specs/2026-09-26-3mo-v9-2gpu-design.md``.
+    """
+
+    # the 90-day add-back fixed point, before inflation
+    GALFOR_BASE_AMP = 1.436180605904e-44
+    GALFOR_BASE_FK = 2.533915614978e-03
+
+    def setUp(self):
+        self.three = _exports(THREE_MO_V9)
+        self.six = _exports(SIX_MO_V9)
+
+    # -- 3MO-1: Tobs and only its derived settings ----------------------
+    def test_tobs_and_its_derived_settings_are_the_3mo_values(self):
+        self.assertEqual(self.three["TOBS_TARGET"], "7776000")
+        self.assertEqual(self.three["GB_NLEAVES_MAX"], "10000")
+        self.assertEqual(self.three["GB_N_SUBBANDS"], "32768")
+        self.assertEqual(self.three["GB_RJ_INMODEL_CHUNK"], "65536")
+        self.assertEqual(self.three["BASE_FILE_NAME"], "gf_prod_3mo")
+        # 6mo-only; at Nt=2160 the CODE DEFAULTS are the validated values
+        # (nt_layer 64 -> snaps to 60, stride 36 = 36 h; taper 11 + margin 8
+        # = 19 <= the default crop 20).
+        self.assertNotIn("SIGHET_NT_LAYER", self.three)
+        self.assertNotIn("EDGE_CROP_WAVELETS", self.three)
+
+    def test_the_sighet_STAGING_knobs_do_NOT_revert(self):
+        """The v8 3mo arm's aggressive sizing is deliberately NOT taken.
+
+        ``GB_N_SUBBANDS=32768`` is only safe because these four keep the 6mo
+        post-OOM values: the fold chunker sizes each chunk to FILL
+        ``GB_SIGHET_FOLD_MAX_BYTES``, so an 8 GiB cap builds an ~8 GiB
+        transient by design, and that plus one-block staging is what killed
+        the 6mo run in ``bin_fold_real``. Pinned as a PAIR with the slot
+        count above, because raising one without the other is the failure.
+        """
+        for knob, want in (("GB_INMODEL_SETUP_BATCH", "2048"),
+                           ("GB_SIGHET_FOLD_MAX_BYTES", "1073741824"),
+                           ("GB_INFOMAT_MEMPOOL_FREE", "1"),
+                           ("GB_INMODEL_BATCH_MEMPOOL_FREE", "1")):
+            self.assertEqual(self.three[knob], want, knob)
+            self.assertEqual(self.three[knob], self.six[knob], knob)
+
+    # -- 3MO-2: no warm start, no seed stage, no seed store -------------
+    def test_no_warm_start(self):
+        self.assertEqual(
+            self.three.get("GB_WARM_START_COMPONENTS", "<unset>"), "",
+            "a 3-month run is the SOURCE of warm-start components, not a "
+            "consumer; EMPTY (not unset) is the documented off switch, and "
+            "the 6mo `${VAR-default}` form would re-arm it if the line went")
+
+    def test_no_seed_stage_and_no_cadence_knob_left_dangling(self):
+        self.assertEqual(self.three["GB_SEARCH_SEED_ITERS"], "0")
+        self.assertNotIn(
+            "GB_SEARCH_3_WARM_EVERY", self.three,
+            "it cadences rj_warm_search, and there is no warm move to "
+            "cadence -- a knob that resolves and reaches nothing")
+
+    def test_the_seed_store_is_gone_entirely(self):
+        for knob in ("GF_SEED_STORE", "GB_WARM_START_SOURCE_STORE",
+                     "GB_WARM_START_SOURCE_TOBS", "GB_WARM_START_LAST_K",
+                     "GB_WARM_START_FLOOR_EPS", "GB_WARM_START_CIRC_IMAGES"):
+            self.assertNotIn(knob, self.three, knob)
+
+    def test_replace_cannot_run_a_warm_pass_it_has_no_container_for(self):
+        self.assertEqual(self.three["GB_REPLACE_WARM_PASS"], "0")
+
+    # -- 3MO-3: psd-only first stage, galfor frozen at the reference -----
+    def test_the_first_stage_samples_the_psd_alone(self):
+        self.assertEqual(self.three["STAGE_NOISE_PSD_ONLY"], "1")
+        self.assertEqual(self.three["STAGE_SKIP_NOISE_VGB"], "1")
+        self.assertEqual(self.three["NOISE_SEARCH_CHECKS"], "5")
+        # global to JointMaxLogLSearch, so it governs this stage too
+        self.assertEqual(self.three["MAXLOGL_TOL"], "20")
+
+    def test_PSD_START_PARAMS_is_unset_or_the_first_stage_disappears(self):
+        """Pinning it flips ``_noise_pinned`` and the noise stages are SKIPPED.
+
+        That would delete this run's entire first stage while every log line
+        still read as though the psd had been fitted.
+        """
+        self.assertNotIn("PSD_START_PARAMS", self.three)
+
+    def test_the_foreground_reference_is_the_INFLATED_3mo_fixed_point(self):
+        vals = [float(x) for x in
+                self.three["GALFOR_START_PARAMS"].split(",")]
+        self.assertEqual(len(vals), 5)
+        amp, fk, alpha, f_1, f_2 = vals
+        self.assertAlmostEqual(amp / self.GALFOR_BASE_AMP, 1.25, places=9,
+                               msg="amp inflation (user ruling 2026-09-26)")
+        self.assertAlmostEqual(fk / self.GALFOR_BASE_FK, 1.10, places=9,
+                               msg="knee inflation: x1.06 is the "
+                                   "self-consistent G^(3/11) partner of "
+                                   "x1.25 and x1.20 reproduces the 6mo "
+                                   "k~2.0 pathology, so 1.10 is the point")
+        self.assertEqual(alpha, 5.0)
+        self.assertAlmostEqual(f_2, 1.405721657329e-03, places=15)
+        # every value strictly INSIDE its prior box -- f_1 in particular is
+        # nudged off the 1e-2 rail the v9 launch audit flagged.
+        for name, v, lo, hi in (("amp", amp, 1e-47, 1e-41),
+                                ("fk", fk, 0.8e-3, 1e-2),
+                                ("f_1", f_1, 1e-5, 1e-2),
+                                ("f_2", f_2, 1e-5, 1e-2)):
+            self.assertGreater(v, lo, name)
+            self.assertLess(v, hi, f"{name} is ON or past its prior rail")
+
+    # -- 3MO-4: data + source branches -----------------------------------
+    def test_the_data_is_the_COMBINED_stream_with_no_source_branches(self):
+        self.assertEqual(self.three["SOURCE_TYPES"], "COMBINED,GB,VGB")
+
+    def test_source_id_vars_are_UNSET_not_set_empty(self):
+        """Set-empty looks equivalent and breaks ``import erebor`` outright.
+
+        ``source_runtime.default_source_ids`` tests ``... is not None``, so a
+        set-but-empty value replaces the class default with three empty lists
+        and ``FullYearCombinedGlobalFit`` -- a variant this run never uses --
+        raises from the eagerly-built stock registry.
+        """
+        for knob in ("MBHB_IDS", "EMRI_IDS", "SOBHB_IDS"):
+            self.assertNotIn(knob, self.three, knob)
+
+    def test_the_source_search_skip_is_not_set(self):
+        """It is an ERROR, not a no-op, with no armed sources."""
+        self.assertNotIn("STAGE_SKIP_SOURCE_SEARCH", self.three)
+
+    # -- 3MO-6: the fresh store takes the correct reference fit ----------
+    def test_the_unequal_arm_psd_reference_fit_is_taken(self):
+        self.assertEqual(
+            self.six["MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM"], "0",
+            "the 6mo pin exists to keep its v8-lineage store resumable")
+        self.assertNotIn(
+            "MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM", self.three,
+            "this store is FRESH, so it takes the default (=1, unequal arm) "
+            "-- general.psd_injection is the truth line every monitor "
+            "compares against, and the estimator was fitting EQUAL-arm while "
+            "the run ran unequal")
+
+    def test_every_other_knob_matches_the_6mo_v9_script(self):
+        """The whole point of deriving from 6mo: only the listed knobs differ."""
+        allowed = {
+            # 3MO-1 Tobs + derived
+            "TOBS_TARGET", "GB_NLEAVES_MAX", "GB_N_SUBBANDS",
+            "GB_RJ_INMODEL_CHUNK", "SIGHET_NT_LAYER", "EDGE_CROP_WAVELETS",
+            "BASE_FILE_NAME", "STORE_DIR", "SLURM_LOG",
+            # 3MO-2 no warm start / no seed stage / no seed store
+            "GB_WARM_START_COMPONENTS", "GB_WARM_START_SOURCE_STORE",
+            "GB_WARM_START_SOURCE_TOBS", "GB_WARM_START_LAST_K",
+            "GB_WARM_START_FLOOR_EPS", "GB_WARM_START_CIRC_IMAGES",
+            "GF_SEED_STORE", "GB_SEARCH_SEED_ITERS", "GB_SEARCH_3_WARM_EVERY",
+            "GB_REPLACE_WARM_PASS",
+            # 3MO-3 psd-only first stage + the inflated reference
+            "STAGE_NOISE_PSD_ONLY", "STAGE_SKIP_NOISE_VGB",
+            "NOISE_SEARCH_CHECKS", "GALFOR_START_PARAMS",
+            # 3MO-4 data + source branches
+            "SOURCE_TYPES", "MBHB_IDS", "EMRI_IDS", "SOBHB_IDS",
+            "STAGE_SKIP_SOURCE_SEARCH",
+            # 3MO-6 the unequal-arm reference fit
+            "MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM",
+        }
+        keys = (set(self.three) | set(self.six)) - {"_", "SHLVL", "PWD"}
+        diff = {k for k in keys
+                if self.three.get(k, "<unset>") != self.six.get(k, "<unset>")}
+        unexpected = diff - allowed
+        self.assertEqual(
+            unexpected, set(),
+            f"these knobs drifted apart and are not on the 3mo v9 delta "
+            f"list: {sorted(unexpected)}")
+
+    def test_the_v9_search_machinery_came_across_intact(self):
+        """The reason to derive from the 6mo v9 file rather than 3mo_v9.sh."""
+        for knob in ("GB_INMODEL_CONVERGE", "GB_INMODEL_CONVERGE_ITERS",
+                     "GB_INMODEL_CONVERGE_ITERS_SURVIVOR",
+                     "GB_INMODEL_CONVERGE_CLASSES", "GB_INMODEL_GROUP",
+                     "GB_NUM_REPEAT_PROPOSALS", "GB_RJ_DIRECT_BATCH",
+                     "GB_RUN_FANCY_TEMPERING", "GB_TEMPER_VERTICAL",
+                     "GB_SEARCH_BAND_SHUTOFF_PER_WALKER",
+                     "GB_SEARCH_BAND_SHUTOFF_CONV_ITER",
+                     "GB_FSTAT_REFIT_EVERY", "FSTAT_PEAK_MIN_SNR",
+                     "GB_OPT_SNR_LIMIT_SEARCH", "GB_RJ_PHASE_MAXIMIZE",
+                     "GB_LEAF_CAP_START", "STAGE_V9_SEARCH",
+                     "COARSE_Q", "COARSE_GPU_MODE",
+                     # sig-het accuracy: Tobs-independent, and staleness is
+                     # LESS harmful at shorter Tobs, so 50 is safer here
+                     "GB_SIGHET_REFRESH_EVERY", "SIGHET_N_CP",
+                     "SIGHET_TUKEY_ALPHA", "GB_SIGHET_TRUST_PHASE_C",
+                     "NWALKERS", "GB_NTEMPS"):
+            self.assertEqual(self.three.get(knob), self.six.get(knob), knob)
 
 
 class WarmStartPathSeparatorTest(unittest.TestCase):
