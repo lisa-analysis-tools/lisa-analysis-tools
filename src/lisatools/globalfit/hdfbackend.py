@@ -2,8 +2,6 @@
 
 import os
 import shutil
-import subprocess
-import sys
 import time
 import warnings
 from logging import getLogger
@@ -350,101 +348,12 @@ def _atomic_backup_copy(src: str) -> None:
             pass
 
 
-#: Default location of the standalone monitor generator, relative to the
-#: installed package root. Overridden by ``GF_MONITOR_SCRIPT``.
-_MONITOR_SCRIPT_REL = os.path.join(
-    "scripts", "diagnostics", "gf_monitor_gen.py")
-
-
-def _monitor_script_path() -> Optional[str]:
-    """Absolute path to ``gf_monitor_gen.py``, or ``None`` if not found.
-
-    ``GF_MONITOR_SCRIPT`` wins outright. Otherwise walk up from this file
-    looking for ``scripts/diagnostics/gf_monitor_gen.py`` -- present in a
-    source checkout / editable install, absent from a wheel, which is
-    exactly the case that must degrade to "no monitor" rather than an
-    exception on the saver rank.
-    """
-    env = os.environ.get("GF_MONITOR_SCRIPT", "")
-    if env:
-        return env if os.path.exists(env) else None
-    here = os.path.dirname(os.path.abspath(__file__))
-    for _ in range(6):
-        here = os.path.dirname(here)
-        cand = os.path.join(here, _MONITOR_SCRIPT_REL)
-        if os.path.exists(cand):
-            return cand
-    return None
-
-
-def _regenerate_monitor_page(h5_path: str) -> None:
-    """Rebuild the HTML monitor page for this run. Never raises.
-
-    WHY A SUBPROCESS AND NOT AN IMPORT: ``gf_monitor_gen.py`` is a
-    standalone report generator, not a library -- it reads ``sys.argv`` at
-    module level, binds 217 module-level names, mutates global matplotlib
-    rcParams, and ``raise SystemExit(0)`` on import by design. Shelling out
-    is not a workaround for that, it is the better shape here regardless:
-    the page build peaks at ~2.5 GB RSS (measured 2026-09-26, 6mo v9
-    snapshot, 141 s wall, 7.3 MB page), and a separate process returns
-    every byte of it to the OS afterwards instead of fragmenting the
-    long-lived saver rank's heap. A segfault in matplotlib likewise cannot
-    take the saver -- and therefore the run's only writer -- down with it.
-
-    ATOMIC PUBLISH: the generator writes a temp beside the target and this
-    ``os.replace``s it into position, so whoever is refreshing the page
-    never sees a half-written document. Same reasoning, same idiom as
-    :func:`_atomic_backup_copy`.
-
-    The timeout is a hard bound: a hung page build must not wedge the
-    saver, and the next save step will try again.
-    """
-    script = _monitor_script_path()
-    if script is None:
-        logger.warning(
-            "monitor page requested (GF_MONITOR_AFTER_SAVE=1) but "
-            "gf_monitor_gen.py was not found. Set GF_MONITOR_SCRIPT to its "
-            "path. No page written; saves are unaffected.")
-        return
-
-    run_dir = os.path.dirname(os.path.abspath(h5_path))
-    out = os.environ.get(
-        "GF_MONITOR_OUT", os.path.join(run_dir, "gf_monitor.html"))
-    tmp = out + ".tmp"
-    timeout = float(os.environ.get("GF_MONITOR_TIMEOUT", "1800"))
-    st = time.perf_counter()
-    try:
-        # check=True so a non-zero exit is reported rather than silently
-        # leaving the previous page in place looking current.
-        subprocess.run(
-            [sys.executable, script, run_dir, tmp],
-            check=True, timeout=timeout,
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        )
-        os.replace(tmp, out)
-    except subprocess.TimeoutExpired:
-        logger.warning(
-            "monitor page build exceeded GF_MONITOR_TIMEOUT=%.0f s and was "
-            "killed. The previous page is untouched.", timeout)
-    except subprocess.CalledProcessError as e:
-        _err = (e.stderr or b"").decode("utf-8", "replace").strip()
-        logger.warning(
-            "monitor page build failed (exit %s). The previous page is "
-            "untouched. Last stderr: %s", e.returncode, _err[-800:])
-    except Exception as e:                # noqa: BLE001 -- see docstring
-        logger.warning(
-            "monitor page NOT refreshed (%s: %s). Saves are unaffected.",
-            type(e).__name__, e)
-    else:
-        logger.info("monitor page regenerated in %.1f s -> %s",
-                    time.perf_counter() - st, out)
-        return
-    try:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-    except Exception:
-        pass
-
+# THE MONITOR HOOK MOVED INTO THE PACKAGE (2026-09-26). This file used to
+# carry the script lookup and the subprocess call inline; both now live in
+# lisatools.globalfit.monitor, which ships the generator itself, so there
+# is no filesystem hunt for a scripts/ directory and no second copy of the
+# invocation. Imported lazily inside the loop -- hdfbackend is imported by
+# every rank, and only the saver ever needs this.
 
 def save_to_backend_asynchronously_and_plot(
     gb_reader,
@@ -512,6 +421,14 @@ def save_to_backend_asynchronously_and_plot(
     run = True
     i = 0
     total_dropped = 0
+    # Per-run state for the page/snapshot hook: cadence history and the
+    # escalation that turns the hook off if it ever costs stored
+    # iterations. Constructed unconditionally and cheaply -- it also
+    # records the save interval when the hook is off, so turning it on
+    # mid-campaign has a real denominator to judge against.
+    from .monitor.hooks import MonitorWatchdog
+
+    _monitor_watchdog = MonitorWatchdog()
     while run:
         payloads = [comm.recv(source=main_rank)]
         # Drain the backlog without blocking: saves must never queue behind
@@ -541,6 +458,10 @@ def save_to_backend_asynchronously_and_plot(
             )
             logger.debug("save step took %.3f s", time.perf_counter() - st)
             i += 1
+            # Every save, built page or not: the gap between consecutive
+            # saves is the only honest denominator for "is the page hook
+            # expensive", and it has to include the saves it skipped.
+            _monitor_watchdog.note_save()
             # None -> every step: general_info.backup_iter defaults to None
             # in the engine settings, and `i % None` is a TypeError, so a
             # run that never set it would have crashed the saver here.
@@ -573,27 +494,24 @@ def save_to_backend_asynchronously_and_plot(
                     time.perf_counter() - st,
                 )
 
-        # THE HTML MONITOR PAGE (2026-09-26). Same quiet-gap contract as
-        # the plots directly above -- a queued save always wins, so the
-        # page can never delay the science -- but its OWN cadence, because
-        # the two have nothing to do with each other: plot_iter is 100 by
-        # default and the point of the page is that it tracks the run.
+        # THE HTML PAGE + SNAPSHOT TAR (2026-09-26). Same quiet-gap
+        # contract as the plots directly above -- a queued save always
+        # wins -- but its OWN cadence: plot_iter is 100 by default and the
+        # point of the page is that it tracks the run.
         #
         # DEFAULT OFF. This rank is the run's only writer; opting a
-        # 141-second, 2.5 GB subprocess into that position is a decision
-        # for the launcher to make explicitly, not a default that arrives
-        # with an upgrade.
+        # ~140-second, 2.5 GB subprocess into that position is a decision
+        # for the launcher to make explicitly (GF_MONITOR_AFTER_SAVE=1),
+        # not a default that arrives with an upgrade.
         #
-        # Re-checking iprobe: the plot build above may have taken minutes,
-        # and a save that queued during it must be written before the page
-        # starts, not after it finishes.
-        if (
-            i > 0
-            and os.environ.get("GF_MONITOR_AFTER_SAVE", "0") == "1"
-            and (i % max(int(os.environ.get("GF_MONITOR_ITER", "1")), 1)) == 0
-            and not comm.iprobe(source=main_rank)
-        ):
-            _regenerate_monitor_page(gb_reader.filename)
+        # ``total_dropped`` is handed over so the watchdog can tell a
+        # slowdown (recoverable, warn) from lost stored iterations
+        # (unrecoverable, stop building). Re-checking iprobe is inside
+        # the hook: the plot build above may have taken minutes.
+        from .monitor.hooks import after_save as _monitor_after_save
+
+        _monitor_after_save(gb_reader, comm, main_rank, i, _monitor_watchdog,
+                            dropped_so_far=total_dropped)
 
     logger.info(
         "results rank: finished (%d states saved, %d dropped)", i, total_dropped

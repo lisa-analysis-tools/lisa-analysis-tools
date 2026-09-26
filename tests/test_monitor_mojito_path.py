@@ -33,15 +33,15 @@ from unittest import mock
 import h5py
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"
-                       / "diagnostics"))
-import build_truth as bt  # noqa: E402
+# Both moved into the package 2026-09-26 (scripts/diagnostics/*.py are now
+# thin shims). Read the REAL files, not the shims, or every source-level
+# assertion below passes vacuously against a 30-line forwarder.
+from lisatools.globalfit import monitor as _mon  # noqa: E402
+from lisatools.globalfit.monitor import build_truth as bt  # noqa: E402
 
 
 def _monitor_src():
-    p = (Path(__file__).resolve().parents[1] / "scripts" / "diagnostics"
-         / "gf_monitor_gen.py")
-    return p.read_text()
+    return Path(_mon.generator_path()).read_text()
 
 
 class MojitoInfoPathTest(unittest.TestCase):

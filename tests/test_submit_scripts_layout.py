@@ -612,6 +612,18 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # because with rj_replace off there was no dedicated
             # pruning move left anywhere in the cycle.
             "GB_SEARCH_PRIOR_REMOVAL_ONLY",
+            # V9-19 (2026-09-26): MOJITO_INFO_PATH -- the single mojito
+            # path the monitor page needs (the level holding catalogues/
+            # and data/). Read ONLY by the page generator, never by the
+            # sampler, so it changes no physics and no timing. It is the
+            # same value as MOJITO_DATA_PATH on this machine; the page
+            # needed two variables for one directory and the second was
+            # never exported here, so every cluster-built page silently
+            # lost its residual-spectrum and data/template/residual
+            # panels.
+            # TODO: the 3mo launcher wants the same line -- add it there
+            # when that script is next touched, and drop this entry.
+            "MOJITO_INFO_PATH",
         }
         drift = {
             k: (self.v8.get(k), self.v9.get(k))
@@ -1080,6 +1092,14 @@ class ThreeMonthV9TwinTest(unittest.TestCase):
             "STAGE_SKIP_SOURCE_SEARCH",
             # 3MO-6 the unequal-arm reference fit
             "MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM",
+            # 3MO-7 (2026-09-26) MOJITO_INFO_PATH -- the single mojito
+            # path the monitor page reads. Sampler-invisible: no physics,
+            # no timing, page only. Listed rather than propagated because
+            # the 3mo script is not being touched in this change.
+            # TODO: add the same export to the 3mo launcher and drop
+            # this entry -- pages built from 3mo runs have the same
+            # missing-panel problem this variable fixes.
+            "MOJITO_INFO_PATH",
         }
         keys = (set(self.three) | set(self.six)) - {"_", "SHLVL", "PWD"}
         diff = {k for k in keys
