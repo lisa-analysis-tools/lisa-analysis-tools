@@ -133,6 +133,74 @@ SHOW_MATCH_STATS = os.environ.get("GF_MONITOR_MATCH_STATS", "0") == "1"
 # stored row.
 MATCH_MM_THRESH = float(os.environ.get("GF_MONITOR_MATCH_MM", "0.8"))
 
+
+# ---- THE ONE MOJITO PATH ---------------------------------------------------
+# USER RULING 2026-09-26: "the one path you need for the mojito data [is] the
+# folder that contains catalogues/ and data/. Make that MOJITO_INFO_PATH."
+#
+# This page used to need TWO knobs for one directory, and they resolved
+# differently, which is precisely how a render silently loses panels:
+#
+#   MOJITO_DATA_PATH   -> data/INSTRUMENT/L1/NOISE_*   (PSD truth levels)
+#                         NO default, NO expanduser; unset = silent fallback
+#                         to the analytic injection.
+#   MOJITO_CAT /
+#   MOJITO_CACHE_DIR   -> data/{GB,VGB,COMBINED}/L1/* + catalogues/wdwd_cat_*
+#                         defaulted to the laptop's nested brickmarket path,
+#                         so on a cluster it missed and the residual-spectrum
+#                         and data/template/residual panels just vanished.
+#
+# Both want the SAME directory. One knob, one meaning, and it is the level
+# holding BOTH subdirectories -- the level people actually get wrong, since
+# the laptop cache nests two deeper than the cluster's
+# (~/.mojito_cache/brickmarket/mojito_light_v1_0_0 vs /shared/data/
+# mojito_cache). The legacy vars still work as fallbacks so existing
+# runbooks keep rendering, but they are no longer the documented route.
+_MOJITO_SUBDIRS = ("catalogues", "data")
+
+
+def _mojito_info_ok(p):
+    return p and all(
+        os.path.isdir(os.path.join(p, d)) for d in _MOJITO_SUBDIRS)
+
+
+def _resolve_mojito_info_path():
+    """``MOJITO_INFO_PATH``, validated, or ``None``.
+
+    Pointing this one level too high is the expected mistake, so a value
+    that does not hold both subdirectories gets ONE rescue attempt down
+    build_truth.py's nested ``brickmarket/mojito_light_v1_0_0`` layout
+    before being reported. Never guesses further and never fails silently:
+    a wrong path here costs whole panels, and a page that quietly drops
+    them looks exactly like a page whose run produced nothing.
+    """
+    v = os.environ.get("MOJITO_INFO_PATH")
+    if not v:
+        return None
+    v = os.path.expanduser(v)
+    if _mojito_info_ok(v):
+        return v
+    nested = os.path.join(v, "brickmarket", "mojito_light_v1_0_0")
+    if _mojito_info_ok(nested):
+        MISSING.append(
+            f"MOJITO_INFO_PATH={v!r} does not hold catalogues/ and data/, "
+            f"but {nested!r} does -- using that. Point the variable there "
+            "directly to silence this.")
+        return nested
+    _absent = [d for d in _MOJITO_SUBDIRS
+               if not os.path.isdir(os.path.join(v, d))]
+    MISSING.append(
+        f"MOJITO_INFO_PATH={v!r} is missing {'/ '.join(_absent)}. It must be "
+        "the directory that CONTAINS catalogues/ and data/ (cluster: "
+        "/shared/data/mojito_cache; laptop: "
+        "~/.mojito_cache/brickmarket/mojito_light_v1_0_0). Falling back to "
+        "MOJITO_DATA_PATH / MOJITO_CAT.")
+    return None
+
+
+MOJITO_INFO_PATH = _resolve_mojito_info_path()
+
+
 def fig_b64(fig, key, dpi=None):
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=dpi)
@@ -787,8 +855,20 @@ gal_cold = gal_c[:, 0, :, 0, :]                     # (it, 24, 5)  SAMPLING basi
 from lisatools.globalfit.stock.erebor.noise import psd_truth_levels
 
 SOMS_INJ, SA_INJ = psd_truth_levels(
-    mojito_data_path=os.environ.get("MOJITO_DATA_PATH")
+    # MOJITO_INFO_PATH is the documented knob; MOJITO_DATA_PATH is the
+    # legacy fallback. Note this call is the SILENT one -- with neither set
+    # it returns the round injection and says nothing -- so the page has to
+    # say it instead, or "analytic fallback" is invisible on the page and
+    # only appears in whatever scrollback the operator happens to keep.
+    mojito_data_path=MOJITO_INFO_PATH or os.environ.get("MOJITO_DATA_PATH")
 )
+if not (MOJITO_INFO_PATH or os.environ.get("MOJITO_DATA_PATH")):
+    MISSING.append(
+        "no MOJITO_INFO_PATH: the Soms_d / Sa_a truth lines are the analytic "
+        f"injection ({SOMS_INJ:.4g}, {SA_INJ:.4g}), not a fit to the brick. "
+        "The brick refit agrees to 3e-6 / 4e-5, so this is cosmetic here -- "
+        "but set MOJITO_INFO_PATH to the folder holding catalogues/ and "
+        "data/ and the page stops guessing.")
 
 # Under GALFOR_LOG_SAMPLING the four log columns are stored as log10 while
 # alpha stays linear. The trace/histogram panels want the SAMPLING basis
@@ -2023,13 +2103,23 @@ VGB_IDS = None
 # dir" that contains ``data/{GB,VGB,COMBINED,...}/L1/*.h5`` and
 # ``catalogues/wdwd_cat_mojito_lite_processed.hdf5``. That directory lives
 # somewhere different on every machine, so it must be discoverable via env
-# rather than hard-coded. The env chain matches build_truth.py's
-# ``_resolve_catalogue()`` (--catalogue > MOJITO_CAT > MOJITO_CACHE_DIR >
-# default) so a caller who has already exported MOJITO_CAT for build_truth.py
-# does not have to set a second knob. Without the fix, cluster runs (bricks
-# under /shared/data/mojito_cache) fell back to the legacy laptop default and
-# silently dropped the residual-spectrum and data/template/residual panels.
+# rather than hard-coded.
+#
+# Chain: MOJITO_INFO_PATH > MOJITO_CAT > MOJITO_CACHE_DIR > laptop default.
+# MOJITO_INFO_PATH is THE knob (see _resolve_mojito_info_path); the two
+# below it are kept so runbooks that predate it keep rendering, and they
+# still match build_truth.py's own ``_resolve_catalogue()`` order
+# (--catalogue > MOJITO_CAT > MOJITO_CACHE_DIR > default).
+#
+# What the default costs when it misses: cluster runs (bricks under
+# /shared/data/mojito_cache) fell through to the laptop path and silently
+# dropped the residual-spectrum and data/template/residual panels.
 def _resolve_mojito_cat_dir():
+    # MOJITO_INFO_PATH first (user ruling 2026-09-26): it is already
+    # validated to hold BOTH catalogues/ and data/, which is exactly this
+    # function's contract, so nothing below can improve on it.
+    if MOJITO_INFO_PATH:
+        return MOJITO_INFO_PATH
     v = os.environ.get("MOJITO_CAT")
     if v:
         v = os.path.expanduser(v)

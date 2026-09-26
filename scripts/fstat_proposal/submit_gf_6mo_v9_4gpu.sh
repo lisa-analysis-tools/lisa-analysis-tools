@@ -644,6 +644,13 @@ export PROGRESS=0
 
 # ---- run plumbing ----------------------------------------------------------
 export MOJITO_DATA_PATH=/shared/data/mojito_cache
+# The SAME directory, named the way the monitor page asks for it: the level
+# holding catalogues/ and data/ (user ruling 2026-09-26). The page needed two
+# knobs for this one path and the second was never exported here, so a page
+# built on the cluster fell through to the laptop default and silently lost
+# the residual-spectrum and data/template/residual panels. Required by
+# GF_MONITOR_AFTER_SAVE=1; harmless otherwise -- the sampler never reads it.
+export MOJITO_INFO_PATH=/shared/data/mojito_cache
 export USE_GPU=1
 export GPU_BACKEND=cuda13x
 # GPU list follows what slurm actually granted (self-dispatch block above);

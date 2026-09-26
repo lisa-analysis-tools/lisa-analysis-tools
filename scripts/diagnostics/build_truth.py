@@ -62,8 +62,23 @@ waveform set to the plausibly-detectable tail; the same curve is written to
 Usage::
 
     OMP_NUM_THREADS=1 python scripts/diagnostics/build_truth.py \
-        STORE.h5 [--iteration 78] [--out gb_truth_3to21.npz] [--tobs SEC] \
+        STORE.h5 [--iteration N] [--out gb_truth_3to21.npz] [--tobs SEC] \
         [--flo 0.8e-3] [--fhi 2.1944444e-2]
+
+THE NOISE ITERATION DEFAULTS TO THE MOST RECENT SAMPLE (2026-09-26, user
+ruling). It was a hardcoded ``78`` -- an iteration of whichever 3-month
+store this script first ran against, silently reused for every truth set
+since, including on stores that had never been near iteration 78. ``det``
+is defined against "the run's own fitted noise", and that means the latest
+fit, not a stranger's burn-in. ``--iteration N`` (or ``ITERATION=N``) pins
+it; the resolved value is stamped into the npz either way, so a truth set
+always says which noise it was built on. Resolution is rewind- and
+torn-row aware -- see :func:`latest_iteration`.
+
+The one thing this does NOT change: the truth set is still a FROZEN
+denominator. Rebuilding it mid-campaign moves the denominator, so
+completeness before and after are not the same measurement. Rebuild when
+the noise has materially moved, not every time the page is regenerated.
 
 Runs on CPU. THE WAVEFORM COUNT IS SET BY THE PREFILTER, NOT THE BAND --
 measured on the 3-month store at iteration 208:
@@ -200,6 +215,62 @@ def galfor_log_sampling_of(store) -> bool:
     from lisatools.globalfit.stock.erebor.noise import read_noise_model_identity
 
     return bool(read_noise_model_identity(store).get("galfor_log_sampling", False))
+
+
+def latest_iteration(store):
+    """The newest stored row whose noise chains are actually written.
+
+    The default used to be a hardcoded ``78`` -- an iteration of whichever
+    3-month store this script was first run against, carried into every
+    truth set built since. Nothing justified it: the detectability
+    denominator is an SNR statement under "the run's own fitted noise", and
+    the run's own fitted noise is the LATEST one, not one from a different
+    store's early burn-in. (This file's own measurement table quotes
+    iteration 208.)
+
+    Resolving it means repeating the three guards ``gf_monitor_gen.py``
+    applies to the same question, because all three produce a row that
+    exists and reads as zeros rather than an error:
+
+    1. FILLED EXTENT -- ``log_like`` rows are preallocated, so the dataset
+       length is the capacity, not the progress.
+    2. REWIND -- ``reset_recipe_stage`` moves the ``iteration`` attr back
+       and leaves the rows beyond it holding the discarded pre-rewind
+       trajectory until the next ``grow()`` truncates them. Those rows are
+       filled and stale, so the attr wins when it is lower.
+    3. TORN LAST ROW -- a save step writes datasets one at a time and takes
+       ~20 s, so ``log_like`` can be present while ``chain/psd`` and
+       ``chain/galfor`` for that row are still zeros. Reading it gives an
+       all-zero PSD, which propagates to a NaN sensitivity and a silently
+       all-False ``det`` -- the exact failure mode :func:`fitted_noise`
+       already warns about, reached by a different route. Step back until
+       both chains carry something.
+
+    Raises ``RuntimeError`` rather than returning a guess when no row
+    qualifies: a truth set built on zero noise is worse than no truth set.
+    """
+    with h5py.File(store, "r") as f:
+        g = f["global_fit"]
+        ll = g["log_like"][:, 0, 0, :]
+        filled = np.where(np.any(ll != 0.0, axis=1))[0]
+        if not filled.size:
+            raise RuntimeError(f"{store}: no filled iterations to build on.")
+        nit = int(filled.max()) + 1
+        attr = g.attrs.get("iteration")
+        if attr is not None and 0 < int(attr) < nit:
+            print(f"store rewound: iteration attr {int(attr)} < filled rows "
+                  f"{nit}; ignoring the discarded rows past it")
+            nit = int(attr)
+        for it in range(nit - 1, -1, -1):
+            psd = np.asarray(g["chain"]["psd"][it, 0, 0, :, 0, :])
+            gal = np.asarray(g["chain"]["galfor"][it, 0, 0, :, 0, :])
+            if np.any(psd != 0.0) and np.any(gal != 0.0):
+                if it != nit - 1:
+                    print(f"row {nit - 1} is torn (noise chains unwritten); "
+                          f"using iteration {it}")
+                return it
+    raise RuntimeError(
+        f"{store}: no iteration carries written psd AND galfor chains.")
 
 
 def fitted_noise(store, it):
@@ -379,10 +450,23 @@ def opt_snr(phys, sa, se, gbw, df, tobs, nw, batch=20000):
     return out
 
 
-def main(argv=None):
+def make_parser():
+    """The CLI, split out so the resolved defaults can be tested.
+
+    ``--iteration``'s default is evaluated HERE, at ``add_argument`` time,
+    which is why this has to be a function rather than a module-level
+    parser: a parser built at import would freeze whatever ``ITERATION``
+    happened to be set to then.
+    """
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("store")
-    ap.add_argument("--iteration", type=int, default=78)
+    ap.add_argument("--iteration", type=int,
+                    default=(int(os.environ["ITERATION"])
+                             if os.environ.get("ITERATION") else None),
+                    help="store iteration whose fitted noise sets the "
+                         "detectability denominator. DEFAULT: the most "
+                         "recent usable sample (rewind- and torn-row "
+                         "aware). Env ITERATION sets it too; the flag wins.")
     ap.add_argument("--out", default="gb_truth_3to21.npz")
     ap.add_argument("--kappa-out", default="kappa_grid.npz")
     ap.add_argument("--tobs", type=float, default=None,
@@ -408,6 +492,11 @@ def main(argv=None):
     ap.add_argument("--batch", type=int, default=20000,
                     help="waveform rows per run_wave call (default 20000); "
                          "lower it if the build runs out of memory")
+    return ap
+
+
+def main(argv=None):
+    ap = make_parser()
     a = ap.parse_args(argv)
 
     flo, fhi = float(a.flo), float(a.fhi)
@@ -420,8 +509,15 @@ def main(argv=None):
           f"N per waveform = {nw}")
     print(f"band = [{flo:.10g}, {fhi:.10g}] Hz "
           f"({flo * 1e3:.4g}-{fhi * 1e3:.4g} mHz)")
-    psd_p, gal_p = fitted_noise(a.store, a.iteration)
-    print(f"noise @ it {a.iteration}: psd={psd_p} galfor={gal_p}")
+    # Resolve BEFORE reading, and keep the resolved int: it is stamped into
+    # the npz below, and a truth set whose provenance says "None" cannot be
+    # audited against the store it came from.
+    it_used = (latest_iteration(a.store) if a.iteration is None
+               else int(a.iteration))
+    psd_p, gal_p = fitted_noise(a.store, it_used)
+    print(f"noise @ it {it_used}"
+          f"{' (latest)' if a.iteration is None else ' (requested)'}: "
+          f"psd={psd_p} galfor={gal_p}")
     sa, se = sens_grids(psd_p, gal_p, df)
 
     from gbgpu.gbgpu import GBGPU
@@ -488,7 +584,7 @@ def main(argv=None):
 
     np.savez_compressed(
         a.out, f0=phys[:, 1], amp=phys[:, 0], snr=snr, det=det, phys=phys,
-        store=np.array(a.store), iteration=np.array(a.iteration),
+        store=np.array(a.store), iteration=np.array(it_used),
         psd_params=psd_p, galfor_params=gal_p,
         band=np.array([flo, fhi]), tobs=np.array(tobs), nw=np.array(nw),
         # STAMPED so the monitor can refuse to mix ephemerides silently.
