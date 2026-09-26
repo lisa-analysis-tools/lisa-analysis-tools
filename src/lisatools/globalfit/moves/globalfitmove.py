@@ -1017,15 +1017,64 @@ class MaxLogLCombineMove(GFCombineMove):
             int(os.environ.get("MAXLOGL_ITERS_PER_STEP", "10"))
             if _cap is None else int(_cap)
         )
+        # ---- PER-WALKER PLATEAU (user ruling 2026-09-26) -------------------
+        # ⚠ THIS USED TO BE ONE SCALAR: ``float(state.log_like[0].max())``,
+        # i.e. the BEST walker. "Joint" meant joint over the wrapped MOVES,
+        # never over the walkers -- so the stage advanced as soon as the
+        # luckiest walker stopped climbing, and every other walker was handed
+        # to the next stage wherever it happened to be.
+        #
+        # MEASURED, first 3-month v9 run (job 633/636, stored row 0): the
+        # plateau was declared on best=52494067.95 while the other three cold
+        # walkers sat 71,050 / 128,080 / 1,600 lnL below it. Because
+        # gb_search_1/2 then FROZE the noise, those four walkers searched for
+        # GBs against four different noise floors for the rest of the run --
+        # S_oms spread 1.74x, S_tm spread 7.81x across walkers, with the leaf
+        # counts ordering exactly inversely to each walker's S_tm (678 / 341 /
+        # 247 / 235 leaves at 0.66x / 2.51x / 5.03x / 5.12x the injection).
+        #
+        # Now every walker carries its own baseline, its own flat counter and
+        # its own changed_once latch, and the stage advances only when the
+        # LAGGARD has plateaued. MAXLOGL_PER_WALKER=0 restores the old
+        # best-walker scalar rule bit-identically.
+        _pw_env = os.environ.get("MAXLOGL_PER_WALKER", "1").strip()
+        per_walker = _pw_env not in ("0", "false", "False", "no", "off", "")
         if not hasattr(self, "_ml_state"):
+            _n = 1
+            if per_walker:
+                try:
+                    _n = int(np.atleast_1d(np.asarray(state.log_like)[0]).size)
+                except Exception:
+                    # A harness state with no usable log_like row: fall back
+                    # to the scalar rule rather than raising inside a move.
+                    per_walker, _n = False, 1
             self._ml_state = dict(
-                num_so_far=0,
-                max_logl=-np.inf,   # true running best (logging only)
-                ref_logl=-np.inf,   # baseline at last counter reset
-                changed_once=False,
+                num_so_far=np.zeros(_n, dtype=int),
+                max_logl=np.full(_n, -np.inf),   # running best (logging only)
+                ref_logl=np.full(_n, -np.inf),   # baseline at last reset
+                changed_once=np.zeros(_n, dtype=bool),
                 n_iter=0,
+                per_walker=bool(per_walker),
             )
         ms = self._ml_state
+        per_walker = bool(ms["per_walker"])
+        # SHUT OFF A CONVERGED WALKER (same ruling): once a walker's counter
+        # reaches num_checks it stops moving, so the remaining rounds belong
+        # to the walkers still climbing and a converged walker cannot wander
+        # back down off its own maximum.
+        #
+        # ⚠ SEARCH-KIND STAGES ONLY. Restoring a walker's rows is safe while
+        # this move owns the likelihood, which is true in the standalone
+        # noise stage. Riding inside gb_search the GB residual moves between
+        # calls, so a restored log_like would be STALE and would corrupt the
+        # very bookkeeping it is meant to protect -- there the per-walker rule
+        # still governs the loop, but nothing is frozen.
+        _freeze = (
+            per_walker
+            and os.environ.get("MAXLOGL_FREEZE_CONVERGED", "1").strip()
+            not in ("0", "false", "False", "no", "off", "")
+            and str(getattr(self, "gf_stage_kind", "")) == "search"
+        )
         accepted = None
         t0 = time.perf_counter()
         stage = getattr(self, "gf_stage_name", "?")
@@ -1036,48 +1085,94 @@ class MaxLogLCombineMove(GFCombineMove):
         log_every = int(os.environ.get("MAXLOGL_LOG_EVERY", "1"))
         inner = 0
         while inner < max_inner and (
-            ms["num_so_far"] < self.num_checks or accepted is None
+            int(ms["num_so_far"].min()) < self.num_checks or accepted is None
         ):
+            frozen = (
+                ms["num_so_far"] >= self.num_checks if _freeze
+                else np.zeros_like(ms["num_so_far"], dtype=bool)
+            )
+            snap = self._snapshot_walkers(state, frozen) if frozen.any() else None
             state, accepted = self._propose_moves_once(model, state)
+            if snap is not None:
+                state = self._restore_walkers(state, snap)
             ms["n_iter"] += 1
             inner += 1
-            cur = float(state.log_like[0].max())
-            if cur != ms["ref_logl"] and not np.isinf(ms["ref_logl"]):
-                ms["changed_once"] = True
-            if cur > ms["max_logl"]:
-                ms["max_logl"] = cur
-            improved = cur > ms["ref_logl"] + self.tol or np.isinf(ms["ref_logl"])
-            if improved:
-                ms["ref_logl"] = cur
-                ms["num_so_far"] = 0
-            elif ms["changed_once"]:
-                ms["num_so_far"] += 1
+            cur = np.atleast_1d(np.asarray(state.log_like, dtype=float)[0])
+            if not per_walker:
+                cur = np.array([float(cur.max())])
+            # ⚠ THE LATCH IS GLOBAL, NOT PER WALKER, AND THAT IS DELIBERATE.
+            # Its job is "the move has not taken effect yet, so nothing may
+            # trip the exit" -- a property of the MOVE, not of one walker.
+            # Armed per-walker it deadlocks the stage: a walker that is flat
+            # from the first round (stuck, or already at its optimum) never
+            # arms, so its counter never increments, so the laggard rule never
+            # clears and the stage runs to MAXLOGL_MAX_ITER -- which defaults
+            # to 0, i.e. unbounded. Caught on a two-walker scripted case where
+            # w0 sat flat and the stage would not end. Armed globally, that
+            # walker simply counts flat rounds and converges, which is the
+            # right answer: it IS plateaued.
+            _moved = (cur != ms["ref_logl"]) & ~np.isinf(ms["ref_logl"])
+            ms["changed_once"] |= bool(_moved.any())
+            ms["max_logl"] = np.maximum(ms["max_logl"], cur)
+            improved = (cur > ms["ref_logl"] + self.tol) | np.isinf(ms["ref_logl"])
+            # Sub-tol gains do NOT advance the baseline, so a slow accumulated
+            # climb still registers as progress -- per walker now.
+            ms["ref_logl"] = np.where(improved, cur, ms["ref_logl"])
+            ms["num_so_far"] = np.where(
+                improved, 0,
+                np.where(ms["changed_once"], ms["num_so_far"] + 1,
+                         ms["num_so_far"]),
+            )
             if log_every and (ms["n_iter"] % log_every == 0):
+                _n_conv = int((ms["num_so_far"] >= self.num_checks).sum())
+                if per_walker and cur.size > 1:
+                    _lag = int(np.argmin(ms["num_so_far"]))
+                    detail = (
+                        f"logl={cur.min():.6f}..{cur.max():.6f} "
+                        f"(walker spread {cur.max() - cur.min():.3f}) "
+                        f"best={ms['max_logl'].max():.6f} "
+                        f"converged={_n_conv}/{cur.size} walker(s); "
+                        f"laggard w{_lag} flat "
+                        f"{int(ms['num_so_far'][_lag])}/{self.num_checks}"
+                        + (f" frozen={int(frozen.sum())}" if _freeze else "")
+                    )
+                else:
+                    detail = (
+                        f"logl={float(cur[0]):.6f} "
+                        f"best={float(ms['max_logl'][0]):.6f} "
+                        + ("IMPROVED" if bool(improved[0])
+                           else f"flat {int(ms['num_so_far'][0])}/{self.num_checks}")
+                        + f" changed_once={bool(ms['changed_once'][0])}"
+                    )
                 print(
-                    f"[MAXLOGL] stage={stage} iter={ms['n_iter']} "
-                    f"logl={cur:.6f} best={ms['max_logl']:.6f} "
-                    + ("IMPROVED" if improved
-                       else f"flat {ms['num_so_far']}/{self.num_checks}") +
-                    f" changed_once={ms['changed_once']} "
+                    f"[MAXLOGL] stage={stage} iter={ms['n_iter']} {detail} "
                     f"elapsed_s={time.perf_counter() - t0:.1f}",
                     flush=True,
                 )
             if self.max_iter and ms["n_iter"] >= self.max_iter:
                 print(
                     f"[MAXLOGL] stage={stage} hit max_iter={self.max_iter} "
-                    f"before plateau (best={ms['max_logl']:.6f}); advancing.",
+                    f"before plateau (best={ms['max_logl'].max():.6f}); "
+                    "advancing.",
                     flush=True,
                 )
                 break
-        done = ms["num_so_far"] >= self.num_checks or (
+        # EVERY walker, not the best one: the laggard decides.
+        done = bool(int(ms["num_so_far"].min()) >= self.num_checks) or bool(
             self.max_iter and ms["n_iter"] >= self.max_iter
         )
         first_done = done and not getattr(self, "maxlogl_plateau_done", False)
         self.maxlogl_plateau_done = bool(done)
         if first_done:
+            _spread = ""
+            if per_walker and ms["max_logl"].size > 1:
+                _b = ms["max_logl"]
+                _spread = (f", per-walker best {_b.min():.6f}..{_b.max():.6f}"
+                           f" spread {_b.max() - _b.min():.3f}")
             print(
                 f"[MAXLOGL] stage={stage} done after {ms['n_iter']} iterations "
-                f"(best={ms['max_logl']:.6f}, {time.perf_counter() - t0:.1f}s)",
+                f"(best={ms['max_logl'].max():.6f}{_spread}, "
+                f"{time.perf_counter() - t0:.1f}s)",
                 flush=True,
             )
         elif not done:
@@ -1087,3 +1182,51 @@ class MaxLogLCombineMove(GFCombineMove):
                 flush=True,
             )
         return state, accepted
+
+    # ---- converged-walker freeze helpers ----------------------------------
+    # Pure snapshot/restore of whole walker COLUMNS: no index arithmetic into
+    # supps and no reliance on walker_inds, which is where this codebase has
+    # twice scored walkers against each other's residuals. A walker that is
+    # not in ``mask`` is never touched.
+    @staticmethod
+    def _snapshot_walkers(state, mask):
+        w = np.flatnonzero(np.asarray(mask))
+        snap = {"w": w, "branches": {}, "log_like": None, "log_prior": None}
+        try:
+            for name, br in (state.branches or {}).items():
+                entry = {}
+                for attr in ("coords", "inds"):
+                    arr = getattr(br, attr, None)
+                    if arr is not None:
+                        entry[attr] = np.array(arr[:, w])
+                if entry:
+                    snap["branches"][name] = entry
+            for key in ("log_like", "log_prior"):
+                arr = getattr(state, key, None)
+                if arr is not None:
+                    snap[key] = np.array(np.asarray(arr)[:, w])
+        except Exception:
+            # Any layout this does not understand -> freeze nothing rather
+            # than half-restore. The per-walker plateau rule still applies.
+            return None
+        return snap
+
+    @staticmethod
+    def _restore_walkers(state, snap):
+        if snap is None:
+            return state
+        w = snap["w"]
+        for name, entry in snap["branches"].items():
+            br = (state.branches or {}).get(name)
+            if br is None:
+                continue
+            for attr, arr in entry.items():
+                cur = getattr(br, attr, None)
+                if cur is not None and cur[:, w].shape == arr.shape:
+                    cur[:, w] = arr
+        for key in ("log_like", "log_prior"):
+            arr = snap.get(key)
+            cur = getattr(state, key, None)
+            if arr is not None and cur is not None and cur[:, w].shape == arr.shape:
+                cur[:, w] = arr
+        return state
