@@ -619,6 +619,14 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # it entirely, hence the drift; the 3mo v9 twin now carries it
             # too, so this is the only list that still needs the entry.
             "MOJITO_INFO_PATH",
+            # V9-20 (2026-09-26): GB_TEMPER_ALL_RUNGS -- the vertical swap
+            # now covers EVERY rung of a (walker, band) column, including
+            # rungs holding an unpicked source or none at all, so a cell
+            # whose whole model is net-harmful can be evicted upward. v8
+            # predates the feature entirely. Inactive rungs are priced from
+            # a per-block constant and never made resident, so buffer
+            # residency is unchanged.
+            "GB_TEMPER_ALL_RUNGS",
         }
         drift = {
             k: (self.v8.get(k), self.v9.get(k))

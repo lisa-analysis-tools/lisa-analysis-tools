@@ -1662,6 +1662,33 @@ export GB_RUN_FANCY_TEMPERING=0
 # ===========================================================================
 export GB_TEMPER_VERTICAL=1
 
+# ---- ALL-RUNGS VERTICAL SWAP (user ruling 2026-09-26: turn it on) --------
+# Swap EVERY rung of a (walker, band) column, not just the rungs that
+# happen to hold a picked source. "Even if it does not have a source in
+# that band it has a total likelihood ... and should get swapped
+# accordingly." A cold cell whose whole model is net-harmful against the
+# bare slab can now be evicted upward -- the route recorded as missing in
+# project_sole_occupant_swap_gap.
+#
+# Inactive rungs are NOT made resident: their total is computed once per
+# block and swapped against as a number ("you do not need to load
+# information into the buffer for good for bands without an active
+# source"). Buffer residency is unchanged.
+#
+# ⚠ TURNED ON AHEAD OF ITS OWN GATE. The design spec asks for a clean
+# [GB_CELL_LL] sampled-vs-realized line on a real run before this stops
+# being opt-in; it has unit tests and five mutation controls but no
+# production hours. WATCH [GB_CELL_LL] on the first snapshot -- both of
+# this path's failure modes (a mis-credited cell ledger, a half-applied
+# relabel) are invisible in aggregate counts and show up ONLY there.
+# Also watch [GB_VERT] for "N pair(s) dropped as unpriceable" (an
+# occupied-but-unpicked rung, whose total nothing measured) and for the
+# per-rung acceptances staying BELOW ~1.0 -- an empty<->empty pair would
+# be accepted unconditionally and collapse the band's ladder, which is
+# why those pairs are dropped.
+# GB_TEMPER_ALL_RUNGS=0 restores the picked-row-only sweep exactly.
+export GB_TEMPER_ALL_RUNGS=1
+
 # PERMUTED-SWAP CADENCE 3 -> 1 (user ruling 2026-08-26): fire the
 # permuted band swaps after EVERY GB propose -- 3x/iteration in search
 # (was once, on the third move), and every PE iteration (was every ~2-3:
