@@ -47,9 +47,14 @@ class RefSelectorTest(unittest.TestCase):
         m = _move(search=True)
         self.assertEqual(m._fstat_fit_refs_from(self.LLS, 4), [3, 1, 2, 0])
 
-    def test_pe_takes_the_highest_lnl_first(self):
+    def test_pe_takes_the_LOWEST_lnl_first_too(self):
+        """2026-09-26: PE joined search on min-lnL. The old PE rule took the
+        HIGHEST first, which fitted the grid to the emptiest residual in the
+        ensemble. Both modes now agree, and fstat_search_residual selects
+        only whether the GB-free window opens."""
         m = _move(search=False)
-        self.assertEqual(m._fstat_fit_refs_from(self.LLS, 4), [0, 2, 1, 3])
+        self.assertEqual(m._fstat_fit_refs_from(self.LLS, 4),
+                         _move(search=True)._fstat_fit_refs_from(self.LLS, 4))
 
     def test_n_equals_one_reproduces_the_scalar_selector(self):
         for search in (True, False):

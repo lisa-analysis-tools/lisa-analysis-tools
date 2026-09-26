@@ -702,13 +702,13 @@ class GlobalReferenceTest(unittest.TestCase):
         move.name = "gb_test"
         return move
 
-    def test_multi_rank_global_argmax_is_not_the_heads_local_one(self):
-        """The max sits in the SECOND block (not the head's own, [0, 4)):
-        the defect this task fixes -- an argmax over the head's local block
-        only -- would pick an index below 4 here and fail every assertion
-        below."""
+    def test_multi_rank_global_argmin_is_not_the_heads_local_one(self):
+        """The MIN sits in the SECOND block (not the head's own, [0, 4)):
+        the defect this task fixes -- an extremum taken over the head's
+        local block only -- would pick an index below 4 here and fail every
+        assertion below."""
         layout = _build_fake_layout(8, 2)
-        lls = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 50.0, 8.0]  # global max at 6
+        lls = [50.0, 49.0, 48.0, 47.0, 46.0, 45.0, 1.0, 43.0]  # min at 6
         move = self._move()
         move.fanout = _StubFanout(layout, lls)
         w_global, owner_rank, local_index, lls_out = move._fstat_global_reference(
@@ -724,7 +724,7 @@ class GlobalReferenceTest(unittest.TestCase):
         exactly what ``_fstat_reference_walker`` picks today, same local
         index -- the path every current production run takes."""
         layout = _build_fake_layout(6, 1)
-        lls = [3.0, 1.0, 4.0, 1.0, 5.0, 9.0]  # max at 5
+        lls = [9.0, 5.0, 4.0, 3.0, 2.0, 1.0]  # MIN at 5
         move = self._move()
         move.fanout = _StubFanout(layout, lls)
         w_global, owner_rank, local_index, lls_out = move._fstat_global_reference(
@@ -3373,15 +3373,18 @@ def epoch_fit_env(**overrides):
 def _epoch_global_state(nwalkers, drow=6, prow=9, seed=17):
     """``(residual rows, invC rows, lnL)`` for the WHOLE ensemble.
 
-    ``lls`` ascends, so the global argmax is the LAST walker -- under a real
-    fan-out that walker is owned by a WORKER, which is the case the design
-    exists for (the head ships the owner a block-sliced branch and the
-    ``Bcast`` root is not the head).
+    ``lls`` DESCENDS, so the global ARGMIN is the LAST walker -- under a
+    real fan-out that walker is owned by a WORKER, which is the case the
+    design exists for (the head ships the owner a block-sliced branch and
+    the ``Bcast`` root is not the head). It ascended until 2026-09-26, when
+    the epoch-fit reference became min-lnL in PE as well as search; the
+    ORDER was flipped rather than the assertions, so the structural case
+    under test -- extremum on a worker, not on the head -- is preserved.
     """
     rng = np.random.default_rng(seed)
     return (rng.normal(size=(int(nwalkers), int(drow))),
             rng.normal(size=(int(nwalkers), int(prow))),
-            np.arange(int(nwalkers), dtype=float))
+            np.arange(int(nwalkers) - 1, -1, -1, dtype=float))
 
 
 def _epoch_branches(nwalkers, seed=5):
@@ -3529,7 +3532,9 @@ class _EpochFitRankStub:
         return self._acs
 
     def _fstat_reference_walker(self, model):
-        return int(np.argmax(np.asarray(self._acs.likelihood())))
+        # argMIN: the epoch fit ranks by lowest lnL (search AND PE since
+        # 2026-09-26) -- the walker with the most signal left to find.
+        return int(np.argmin(np.asarray(self._acs.likelihood())))
 
     def _fstat_call(self, model, walker_ref, *, holder=None):
         if holder is None:
@@ -3645,7 +3650,9 @@ def run_epoch_fit_world(n_compute, nwalkers, cache_root, *, epoch=0,
         return dict(facts, role="head", n_peaks=int(n_peaks),
                     epoch_reference=epoch_reference,
                     path=G.stacked_grid_path(cache_dir), manifest=manifest,
-                    owner_of_argmax=layout.owner_of(int(np.argmax(lls))),
+                    # argMIN since 2026-09-26: the epoch fit ranks by
+                    # LOWEST lnL in PE as well as search.
+                    owner_of_argmax=layout.owner_of(int(np.argmin(lls))),
                     head_rank=int(layout.head_rank),
                     holder_after_fit=held,
                     holder_after_release=move._fstat_ref_holder,

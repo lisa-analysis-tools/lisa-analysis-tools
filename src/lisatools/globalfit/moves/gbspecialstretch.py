@@ -6115,8 +6115,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     def _fstat_fit_ref_from(self, lls):
         """Index of the walker whose residual an F-stat EPOCH is fitted to.
 
-        ``argmax`` (PE, the original) or ``argmin`` under
-        :attr:`fstat_search_residual` (user ruling 2026-09-21).
+        ``argmin`` -- the MIN-lnL cold walker -- in BOTH search and PE
+        (user ruling 2026-09-21 for search, extended to PE 2026-09-26).
 
         **Why the min in search.** The search fit no longer opens the
         GB-free window, so it sweeps a walker's residual exactly as it
@@ -6128,19 +6128,32 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         (PE) the argument does not apply: every walker's GBs are restored
         before the sweep, so the residuals agree and the max is kept.
 
+        **PE now takes the min too (2026-09-26).** The argument above was
+        originally made for search only, on the grounds that PE opens the
+        GB-free window so every walker's GBs are restored and "the
+        residuals agree". They agree far less than that reasoning assumed
+        -- the walkers carry different MBH/EMRI/SOBBH/noise states, so
+        their lnLs still spread -- and where they do differ the same logic
+        applies: the min-lnL walker is the one with the most signal left in
+        its residual, so its peaks are the ones still worth proposing.
+        Taking the max there fitted the grid to the EMPTIEST residual in
+        the ensemble. Keeping the two paths on one rule also removes a
+        standing trap: ``fstat_search_residual`` now selects ONLY whether
+        the GB-free window opens, not who is ranked.
+
         Only the FIT path routes through here. The F-stat distance-birth
         proposal CENTER (``_fstat_walker_ref``, set once per propose) keeps
         :meth:`_fstat_reference_walker` and its argmax unchanged.
         """
-        return int(np.argmin(lls) if self.fstat_search_residual
-                   else np.argmax(lls))
+        return int(np.argmin(lls))
 
     def _fstat_fit_refs_from(self, lls, n):
         """The ``n`` walkers an F-stat epoch is fitted to, best first.
 
-        The plural of :meth:`_fstat_fit_ref_from`: the ``n`` lowest-lnL cold
-        walkers under :attr:`fstat_search_residual`, the ``n`` highest under
-        PE. ``n = 1`` is the single-reference fit and MUST reproduce the
+        The plural of :meth:`_fstat_fit_ref_from`: the ``n`` LOWEST-lnL cold
+        walkers, in search and in PE alike (see the scalar selector for why
+        PE joined in 2026-09-26). ``n = 1`` is the single-reference fit and
+        MUST reproduce the
         scalar selector exactly, tie-breaks included -- that identity is the
         hinge the whole W=1 bit-identity gate hangs on, which is why the
         sort is ``kind="stable"``: numpy's stable sort takes the lowest index
@@ -6156,12 +6169,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """
         lls = np.asarray(lls, dtype=float).reshape(-1)
         n = max(1, min(int(n), int(lls.size)))
+        # Ascending: lowest lnL first, lowest INDEX first among ties --
+        # the same tie-break ``argmin`` takes, which is what keeps the
+        # n = 1 case bit-identical to the scalar selector.
         order = np.argsort(lls, kind="stable")
-        if not self.fstat_search_residual:
-            # descending by value, but still lowest-index-first among ties:
-            # reverse a stable ascending sort of the NEGATED values rather
-            # than reversing ``order``, which would flip the tie-break.
-            order = np.argsort(-lls, kind="stable")
         return [int(w) for w in order[:n]]
 
     def _fstat_global_reference(self, model):
