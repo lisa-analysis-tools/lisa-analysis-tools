@@ -82,6 +82,21 @@ def _names(stage):
     return [m.name for m in stage.moves]
 
 
+def _numbered(fit):
+    """The three NUMBERED search stages, excluding ``gb_search_seed``.
+
+    ``stages[:3]`` meant this until 2026-09-26, when the seed stage was
+    prepended. Selecting by name rather than by position keeps these tests
+    about the three-stage profile ladder instead of about stage ORDER --
+    and a future stage inserted anywhere cannot silently shift what they
+    assert.
+    """
+    out = [s for s in fit.recipe.stages
+           if s.kind == "gb_search" and s.name != "gb_search_seed"]
+    assert len(out) == 3, [s.name for s in fit.recipe.stages]
+    return out
+
+
 # ======================================================================
 # 1. COMPOSITION
 # ======================================================================
@@ -93,9 +108,10 @@ class StageCompositionTest(unittest.TestCase):
         fit = _build()
         self.assertEqual(
             [s.name for s in fit.recipe.stages],
-            ["gb_search_1", "gb_search_2", "gb_search_3", "full_pe"])
+            ["gb_search_seed", "gb_search_1", "gb_search_2",
+             "gb_search_3", "full_pe"])
         self.assertEqual([s.kind for s in fit.recipe.stages],
-                         ["gb_search", "gb_search", "gb_search", "pe"])
+                         ["gb_search", "gb_search", "gb_search", "gb_search", "pe"])
 
     def test_the_seven_slot_cycle_in_order(self):
         """The user's ordering, 2026-09-24, verbatim:
@@ -110,7 +126,7 @@ class StageCompositionTest(unittest.TestCase):
         deletable than the same source after it has walked onto its peak.
         """
         fit = _build()
-        for st in fit.recipe.stages[:3]:
+        for st in _numbered(fit):
             gb = [n for n in _names(st) if n.startswith(("rj_", "in_model"))]
             self.assertEqual(
                 gb,
@@ -124,7 +140,7 @@ class StageCompositionTest(unittest.TestCase):
         """Distinct NAMES, because a stage's move names must be unique and
         because each slot's timing/acceptance must be attributable."""
         fit = _build()
-        for st in fit.recipe.stages[:3]:
+        for st in _numbered(fit):
             slots = [n for n in _names(st) if n.startswith("in_model")]
             self.assertEqual(len(slots), 3)
             self.assertEqual(len(set(slots)), 3)
@@ -134,13 +150,13 @@ class StageCompositionTest(unittest.TestCase):
         recurs in all three. If this ever became global the whole restructure
         would fail at composition."""
         fit = _build()  # Recipe() runs _check_unique in its ctor
-        self.assertEqual(len(fit.recipe.stages), 4)
+        self.assertEqual(len(fit.recipe.stages), 5)   # + gb_search_seed
 
     def test_warm_start_cadence_is_stage_3_only(self):
         fit = _build(GB_SEARCH_3_WARM_EVERY="7")
         got = [
             next(m.every for m in st.moves if m.name == "rj_warm_search")
-            for st in fit.recipe.stages[:3]
+            for st in _numbered(fit)
         ]
         self.assertEqual(got, [1, 1, 7])
 
@@ -153,13 +169,13 @@ class StageCompositionTest(unittest.TestCase):
         GB_SEARCH_IN_MODEL=1, and a listed-but-unbuilt move fails recipe
         materialization -- so the descriptors must be knob-conditional."""
         fit = _build(GB_SEARCH_IN_MODEL="0")
-        for st in fit.recipe.stages[:3]:
+        for st in _numbered(fit):
             self.assertEqual(
                 [n for n in _names(st) if n.startswith("in_model")], [])
 
     def test_replace_absent_when_disabled(self):
         fit = _build(GB_SEARCH_RJ_REPLACE="0")
-        for st in fit.recipe.stages[:3]:
+        for st in _numbered(fit):
             self.assertNotIn("rj_replace", _names(st))
 
     def test_stage_v9_search_0_restores_the_legacy_single_stage(self):
@@ -218,7 +234,13 @@ class FullCompositionTest(unittest.TestCase):
         """
         fit = self._full(PSD_START_PARAMS="1.5e-11,3e-15",
                          GALFOR_START_PARAMS="1e-44,1e-3,1.5,5e-4,5e-4")
-        for st in fit.recipe.stages[:3]:
+        # gb_search_seed is EXCLUDED by design: it carries no source
+        # moves at all (that is the 2694 s of job 628's first iteration it
+        # exists to skip), so "sources last" is vacuous there.
+        _search = [st for st in fit.recipe.stages
+                   if st.kind == "gb_search" and st.name != "gb_search_seed"]
+        self.assertEqual(len(_search), 3)
+        for st in _search:
             names = _names(st)
             srcs = [n for n in names if n in
                     ("sobbh_pe", "mbh_pe", "emri_pe")]
@@ -325,8 +347,8 @@ class FullCompositionTest(unittest.TestCase):
         fit = self._full(PSD_START_PARAMS="1.5e-11,3e-15",
                          GALFOR_START_PARAMS="1e-44,1e-3,1.5,5e-4,5e-4")
         self.assertEqual([s.name for s in fit.recipe.stages],
-                         ["gb_search_1", "gb_search_2", "gb_search_3",
-                          "full_pe"])
+                         ["gb_search_seed", "gb_search_1", "gb_search_2",
+                          "gb_search_3", "full_pe"])
 
     def test_noise_stages_are_KEPT_when_no_pin_is_supplied(self):
         fit = self._full(PSD_START_PARAMS=None, GALFOR_START_PARAMS=None)
@@ -382,7 +404,7 @@ class ProfileDeclarationTest(unittest.TestCase):
 
     def test_profile_values_per_stage(self):
         fit = _build()
-        got = {s.name: s.step_kwargs["profile"] for s in fit.recipe.stages[:3]}
+        got = {s.name: s.step_kwargs["profile"] for s in _numbered(fit)}
         self.assertEqual(got["gb_search_1"], dict(
             phase_maximize=True, opt_snr=8.0, peak_min_snr=8.0))
         # ⚠ ONLY stage 1 phase-maximizes. Stage 2 is the floor-dropping
@@ -402,7 +424,7 @@ class ProfileDeclarationTest(unittest.TestCase):
         floor are both optimistic, and the ruling is that they never
         compound."""
         fit = _build()
-        prof = {s.name: s.step_kwargs["profile"] for s in fit.recipe.stages[:3]}
+        prof = {s.name: s.step_kwargs["profile"] for s in _numbered(fit)}
         maximizing = {n for n, p in prof.items() if p["phase_maximize"]}
         self.assertEqual(maximizing, {"gb_search_1"})
         for name, p in prof.items():
@@ -413,7 +435,7 @@ class ProfileDeclarationTest(unittest.TestCase):
 
     def test_stage_name_is_declared_for_the_log_lines(self):
         fit = _build()
-        for s in fit.recipe.stages[:3]:
+        for s in _numbered(fit):
             self.assertEqual(s.step_kwargs["stage_name"], s.name)
 
     def test_gb_only_and_full_declare_the_SAME_profiles(self):
@@ -422,7 +444,7 @@ class ProfileDeclarationTest(unittest.TestCase):
         import run_combined_staged as R
 
         gb_only = {s.name: s.step_kwargs["profile"]
-                   for s in _build().recipe.stages[:3]}
+                   for s in _numbered(_build())}
         table = {n: p for n, p, _ in R.V9_SEARCH_STAGE_PROFILES}
         self.assertEqual(gb_only, table)
 
@@ -1348,3 +1370,111 @@ class GroupKnobEnvNameTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class SeedStageTest(unittest.TestCase):
+    """``gb_search_seed``: heavy warm-start seeding before any F-stat fit.
+
+    User ruling 2026-09-26: "The new GB 1 is just the warmstart RJ + in
+    model to convergence. Run that 5 times (1 per full sampler iteration).
+    And then move to GB search 2 as is, no changes. GB stage 1 settings
+    (besides what I just specified) should be IDENTICAL to what is now gb
+    search 2 (e.g. opt snr 8, phase max, etc.)" -- i.e. today's
+    ``gb_search_1`` profile, which is the one carrying opt_snr 8 and phase
+    maximization.
+
+    Named rather than renumbered (user's choice): ``gb_search_1/2/3`` keep
+    their names, their knobs (``GB_SEARCH_3_WARM_EVERY``) and their meaning
+    in every existing log and snapshot.
+    """
+
+    def _seed(self, fit):
+        return next(s for s in fit.recipe.stages if s.name == "gb_search_seed")
+
+    def test_it_leads_the_recipe(self):
+        self.assertEqual(_build().recipe.stages[0].name, "gb_search_seed")
+
+    def test_it_is_only_warm_rj_plus_in_model(self):
+        names = _names(self._seed(_build()))
+        self.assertIn("rj_warm_search", names)
+        self.assertIn("in_model", names)
+        # the whole point: no grid fit is reachable from this stage, so
+        # GB_FSTAT_REFIT_EVERY=1 cannot trigger one here.
+        self.assertNotIn("rj_fstat_search", names)
+        self.assertNotIn("rj_prior_removal", names)
+        self.assertNotIn("in_model_fstat", names)
+        for src in ("sobbh_pe", "mbh_pe", "emri_pe"):
+            self.assertNotIn(src, names, "the sources are the wait this "
+                                         "stage exists to avoid")
+
+    def test_its_profile_is_identical_to_gb_search_1(self):
+        fit = _build()
+        got = self._seed(fit).step_kwargs["profile"]
+        want = next(s for s in fit.recipe.stages
+                    if s.name == "gb_search_1").step_kwargs["profile"]
+        self.assertEqual(got, want)
+        self.assertTrue(got["phase_maximize"])
+        self.assertEqual(got["opt_snr"], 8.0)
+
+    def test_it_runs_a_FIXED_five_iterations(self):
+        import run_combined_staged as R
+
+        fn = self._seed(_build()).step_kwargs["convergence_fn"]
+        self.assertIsInstance(fn, R.FixedIterationStop)
+        self.assertEqual(fn.n, 5)
+
+    def test_the_stopper_is_exact_and_picklable(self):
+        """Exact: 5 means 5, counted from the first call. Picklable: the
+        pre-build fit must survive deepcopy/pickle, so this cannot be a
+        closure."""
+        import pickle
+
+        import run_combined_staged as R
+
+        fn = R.FixedIterationStop(5)
+
+        class _S:
+            def __init__(self, i):
+                self.backend = type("B", (), {"iteration": i})
+
+        got = [fn(0, None, _S(i)) for i in range(10, 18)]
+        self.assertEqual(got, [False] * 5 + [True] * 3)
+        self.assertIsInstance(pickle.loads(pickle.dumps(R.FixedIterationStop(5))),
+                              R.FixedIterationStop)
+        with self.assertRaises(ValueError):
+            R.FixedIterationStop(0)
+
+    def test_the_per_walker_shutoff_valve_is_DISARMED_here(self):
+        """It freezes a band's RJ after GB_SEARCH_BAND_SHUTOFF_CONV_ITER
+        flat iterations within a step. On a 5-iteration stage whose job is
+        to birth hard from the warm start, that would cut the seeding short
+        in exactly the bands slowest to pay off."""
+        self.assertIs(
+            self._seed(_build()).step_kwargs["search_shutoff_per_walker"],
+            False)
+
+    def test_zero_iters_removes_the_stage_entirely(self):
+        """GB_SEARCH_SEED_ITERS=0 must restore the pre-2026-09-26 recipe."""
+        names = [s.name for s in _build(GB_SEARCH_SEED_ITERS="0").recipe.stages]
+        self.assertNotIn("gb_search_seed", names)
+        self.assertEqual(names,
+                         ["gb_search_1", "gb_search_2", "gb_search_3",
+                          "full_pe"])
+
+    def test_the_length_is_configurable(self):
+        fn = self._seed(_build(GB_SEARCH_SEED_ITERS="3")
+                        ).step_kwargs["convergence_fn"]
+        self.assertEqual(fn.n, 3)
+
+    def test_BOTH_stage_assemblies_carry_it(self):
+        """There are two v9 stage assemblies in run_combined_staged -- the
+        GB_ONLY one and the full composition. Adding a stage to only one is
+        the "knob resolves, consuming path never runs" shape that has
+        produced several defects in this run; the first draft of this
+        change did exactly that."""
+        gb_only = [s.name for s in _build().recipe.stages]
+        full = [s.name for s in _build(
+            GB_ONLY="0", PSD_START_PARAMS="1.5e-11,3e-15",
+            GALFOR_START_PARAMS="1e-44,1e-3,1.5,5e-4,5e-4").recipe.stages]
+        self.assertEqual(gb_only[0], "gb_search_seed")
+        self.assertEqual(full[0], "gb_search_seed")

@@ -402,6 +402,49 @@ V9_SEARCH_STAGE_PROFILES = (
 )
 
 
+class FixedIterationStop:
+    """Stop a recipe stage after exactly ``n`` sampler iterations.
+
+    ``RJRecipeStep`` takes a ``convergence_fn`` that fully overrides its
+    leaf-plateau test, which is what lets ``gb_search_seed`` run a FIXED
+    length instead of waiting for convergence (user ruling 2026-09-26:
+    "I do not want to wait too long or wait for convergence").
+
+    A module-level CLASS, not a closure: the pre-build fit has to survive
+    ``pickle``/``deepcopy`` (the sprint-wide rule in CLAUDE.md), and a
+    lambda or a factory-returned closure would not. State is one int plus
+    one optional int.
+
+    The start iteration is latched on the first call rather than read from
+    the step, because ``convergence_fn`` is invoked as
+    ``fn(i, sample, sampler)`` with no access to ``self._stage_start_iter``.
+    """
+
+    def __init__(self, n: int):
+        if int(n) < 1:
+            raise ValueError(f"FixedIterationStop needs n >= 1, got {n}.")
+        self.n = int(n)
+        self._start = None
+
+    def __call__(self, i, sample, sampler) -> bool:
+        cur = int(sampler.backend.iteration)
+        if self._start is None:
+            self._start = cur
+        return (cur - self._start) >= self.n
+
+
+def _seed_iters() -> int:
+    """Length of ``gb_search_seed`` in FULL SAMPLER ITERATIONS (default 5).
+
+    ``GB_SEARCH_SEED_ITERS=0`` drops the stage entirely, which is the
+    pre-2026-09-26 recipe exactly.
+    """
+    n = int(os.environ.get("GB_SEARCH_SEED_ITERS", "5"))
+    if n < 0:
+        raise ValueError(f"GB_SEARCH_SEED_ITERS={n} must be >= 0.")
+    return n
+
+
 def _v9_search_enabled() -> bool:
     """Is the v9 three-stage GB search on? ``STAGE_V9_SEARCH=0`` restores the
     single legacy ``gb_search`` stage, bit-identically."""
@@ -737,6 +780,27 @@ def build_fit():
                 raise ValueError(
                     f"GB_SEARCH_3_WARM_EVERY={_warm3} must be >= 1.")
             _gb_only_stages = []
+            # gb_search_seed leads here TOO. There are two v9 stage
+            # assemblies in this file -- this GB_ONLY one and the full
+            # composition below -- and adding a stage to only one of them
+            # is the "knob resolves, consuming path never runs" shape that
+            # has produced several defects in this run. Same profile
+            # (gb_search_1's), same fixed length, same disarmed valve.
+            if _seed_iters() > 0:
+                _sp = dict(V9_SEARCH_STAGE_PROFILES[0][1])
+                _seed_warm = ([Move("rj_warm_search", branch="gb")]
+                              if warm() else [])
+                _gb_only_stages.append(Stage(
+                    name="gb_search_seed", kind="gb_search",
+                    moves=_seed_warm + gb_only_in_model("in_model"),
+                    step_kwargs=dict(
+                        plateau_branch="gb",
+                        stage_name="gb_search_seed", profile=dict(_sp),
+                        convergence_fn=FixedIterationStop(_seed_iters()),
+                        search_shutoff_per_walker=False,
+                    ),
+                    combine_kwargs=dict(share_temperature_control=False),
+                ))
             for _name, _prof, _sampled in V9_SEARCH_STAGE_PROFILES:
                 _every = _warm3 if _sampled else 1
                 _warm = ([Move("rj_warm_search", branch="gb", every=_every)]
@@ -1132,7 +1196,7 @@ def build_fit():
                 if _env_flag("GB_SEARCH_IN_MODEL") else [])
 
     def _search_stage(name, *, sample_noise, phase_maximize, opt_snr,
-                      peak_min_snr, warm_every=1):
+                      peak_min_snr, warm_every=1, seed_only=False):
         # SAMPLED noise: the legacy gb_search composition verbatim -- the
         # leading joint psd+galfor+vgb search plus the two extra re-tracking
         # rounds that bracket the F-stat birth move, so the grid is always
@@ -1188,6 +1252,43 @@ def build_fit():
         _noise_rem = noise_only_4 if sample_noise else []
         _warm = ([Move("rj_warm_search", branch="gb", every=warm_every)]
                  if warm() else [])
+        if seed_only:
+            # ---- gb_search_seed (user ruling 2026-09-26) ----------------
+            # "The new GB 1 is just the warmstart RJ + in model to
+            # convergence. Run that 5 times (1 per full sampler
+            # iteration)." The point is to seed HARD off the warm-start
+            # posterior before any F-stat grid is fitted, so this stage
+            # deliberately carries NO rj_fstat_search -- which also means
+            # GB_FSTAT_REFIT_EVERY=1 cannot trigger a fit here.
+            #
+            # Everything else is the SAME profile as gb_search_1 (opt_snr
+            # 8, phase maximization on, peak floor 8) -- the caller passes
+            # that dict verbatim.
+            #
+            # vgb_pe rides along (~8 s): it keeps the vgb branch sampling
+            # and keeps the stage structurally parallel to the others. The
+            # source PE moves (sobbh / mbh / emri) are the ones deliberately
+            # absent -- they were 2694 s of job 628's first iteration and
+            # are exactly the wait this stage exists to avoid.
+            return Stage(
+                name=name, kind="gb_search",
+                moves=_noise + _warm + in_model("in_model"),
+                step_kwargs=dict(
+                    profile=dict(phase_maximize=phase_maximize,
+                                 opt_snr=opt_snr, peak_min_snr=peak_min_snr),
+                    stage_name=name,
+                    # FIXED length: no plateau test, no convergence wait.
+                    convergence_fn=FixedIterationStop(_seed_iters()),
+                    # ⚠ The per-(walker, band) RJ shutoff valve is DISARMED
+                    # here. It freezes a band's RJ after
+                    # GB_SEARCH_BAND_SHUTOFF_CONV_ITER (=3) flat iterations
+                    # WITHIN a step -- on a 5-iteration stage whose whole
+                    # job is to birth hard from the warm start, that would
+                    # cut the seeding short in exactly the bands that are
+                    # slowest to pay off. The later stages keep it.
+                    search_shutoff_per_walker=False,
+                ),
+            )
         return Stage(
             name=name, kind="gb_search",
             # THE OTHER SOURCES RUN LAST (user ruling 2026-09-25). They used
@@ -1253,7 +1354,18 @@ def build_fit():
         if _warm3 < 1:
             raise ValueError(
                 f"GB_SEARCH_3_WARM_EVERY={_warm3} must be >= 1.")
-        stages += [
+        # gb_search_seed leads (user ruling 2026-09-26), NOT a renumber of
+        # the three that follow: gb_search_1/2/3 keep their names, their
+        # knobs (GB_SEARCH_3_WARM_EVERY) and their meaning in every existing
+        # log and snapshot. It takes gb_search_1's profile verbatim -- the
+        # user's "identical to what is now gb search 2 (e.g. opt snr 8,
+        # phase max, etc.)", stage 1 being the one that carries that profile.
+        _seed = []
+        if _seed_iters() > 0:
+            _seed_prof = dict(V9_SEARCH_STAGE_PROFILES[0][1])
+            _seed = [_search_stage("gb_search_seed", sample_noise=False,
+                                   seed_only=True, **_seed_prof)]
+        stages += _seed + [
             _search_stage(_name, sample_noise=_sampled,
                           warm_every=(_warm3 if _sampled else 1), **_prof)
             for _name, _prof, _sampled in V9_SEARCH_STAGE_PROFILES

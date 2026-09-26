@@ -568,6 +568,11 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # staleness for wall time; [GB_TRUST] and the end-of-block
             # "ll AUDIT vs exact" COLD median are the instruments.
             "GB_SIGHET_REFRESH_EVERY",
+            # V9-16 (2026-09-26): gb_search_seed -- a new FIRST search
+            # stage, warm-start RJ + in-model only, fixed 5 iterations,
+            # before any F-stat grid is fitted. Named rather than
+            # renumbered, so gb_search_1/2/3 are untouched.
+            "GB_SEARCH_SEED_ITERS",
         }
         drift = {
             k: (self.v8.get(k), self.v9.get(k))

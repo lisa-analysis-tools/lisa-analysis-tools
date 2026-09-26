@@ -3915,6 +3915,30 @@ export STAGE_V9_SEARCH=1
 # Warm start every 5th iteration in STAGE 3 only (user ruling 2026-09-24): by
 # then the previous run's posterior has been mined, and each hit is expensive.
 # Stages 1-2 run it every iteration.
+# ---- gb_search_seed (user ruling 2026-09-26) --------------------------
+# A new FIRST search stage: warm-start RJ + in-model to convergence ONLY,
+# run for a FIXED 5 full sampler iterations, then straight into
+# gb_search_1 unchanged. The point is to seed HARD off the warm-start
+# posterior before any F-stat grid is fitted -- the stage carries no
+# rj_fstat_search, so GB_FSTAT_REFIT_EVERY=1 cannot trigger a fit in it.
+#
+# NAMED, NOT RENUMBERED (user's choice): gb_search_1/2/3 keep their names,
+# their knobs (GB_SEARCH_3_WARM_EVERY above) and their meaning in every
+# existing log and snapshot, so old runs stay directly comparable.
+#
+# Its profile is gb_search_1's verbatim -- opt_snr 8, phase maximization
+# on, F-stat peak floor 8 -- per "identical to what is now gb search 2".
+# It carries vgb_pe (~8 s) but NOT sobbh/mbh/emri: those were 2694 s of
+# job 628's first iteration and are exactly the wait this stage avoids.
+#
+# ⚠ The per-(walker, band) RJ shutoff valve is DISARMED for this stage
+# only. It freezes a band's RJ after GB_SEARCH_BAND_SHUTOFF_CONV_ITER (=3)
+# flat iterations within a step; on a 5-iteration stage whose whole job is
+# to birth hard, that would cut the seeding short in the bands slowest to
+# pay off. Stages 1-3 keep it.
+#
+# 0 disables the stage entirely, restoring the pre-2026-09-26 recipe.
+export GB_SEARCH_SEED_ITERS=5
 export GB_SEARCH_3_WARM_EVERY=5
 
 # ---- MID-ITERATION CHECKPOINTS (user ask 2026-09-24: "make sure there are

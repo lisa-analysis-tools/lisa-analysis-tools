@@ -62,6 +62,14 @@ def _build_fit():
 #: everything else here runs against the DEFAULT composition, which is v9.
 V9_SEARCH_STAGES = ("gb_search_1", "gb_search_2", "gb_search_3")
 
+#: The FULL ordered search list, including ``gb_search_seed`` (prepended
+#: 2026-09-26). Kept separate from ``V9_SEARCH_STAGES`` on purpose: the
+#: tests that ITERATE stages are asserting per-stage move composition, and
+#: the seed stage deliberately carries a reduced list (warm RJ + in-model
+#: only, no F-stat, no sources), so it belongs in the ORDER assertions and
+#: not in those.
+V9_ALL_SEARCH_STAGES = ("gb_search_seed", *V9_SEARCH_STAGES)
+
 
 def _everies(fit, stage_name):
     st = next(s for s in fit.recipe.stages if s.name == stage_name)
@@ -124,7 +132,7 @@ class StagedSourcesWiringTest(unittest.TestCase):
         fit = _build_fit()
         self.assertEqual(
             [st.name for st in fit.recipe.stages],
-            ["noise_search", "noise_vgb_search", *V9_SEARCH_STAGES,
+            ["noise_search", "noise_vgb_search", *V9_ALL_SEARCH_STAGES,
              "full_pe"])
         for b in ("mbh", "emri", "sobbh"):
             self.assertNotIn(b, fit.branches)
@@ -154,7 +162,7 @@ class StagedSourcesWiringTest(unittest.TestCase):
         self.assertEqual(
             [st.name for st in fit.recipe.stages],
             ["source_search", "noise_search", "noise_vgb_search",
-             *V9_SEARCH_STAGES, "full_pe"])
+             *V9_ALL_SEARCH_STAGES, "full_pe"])
         st0 = fit.recipe.stages[0]
         self.assertEqual(st0.kind, "search")
         self.assertEqual([m.name for m in st0.moves],
@@ -222,7 +230,7 @@ class StagedSourcesWiringTest(unittest.TestCase):
         stages = self._stages(fit)
         self.assertEqual(list(stages),
                          ["noise_search", "noise_vgb_search",
-                          *V9_SEARCH_STAGES, "full_pe"])
+                          *V9_ALL_SEARCH_STAGES, "full_pe"])
         # user ruling 2026-09-18 (superseding 09-15's mbh/emri-only
         # 1-in-10): all three ride the GB search stages at a 1-in-5
         # cadence; all three in full_pe uncadenced.
