@@ -131,6 +131,15 @@ Key env knobs
                          start (and stay subtracted) at their seeded
                          coords; source proposals only in gb_search +
                          full_pe (exact-truth-start flow, 2026-09-14)
+    STAGE_NOISE_PSD_ONLY=1  the STANDALONE noise stage samples psd ALONE;
+                         galfor stays frozen at GALFOR_START_PARAMS (which it
+                         REFUSES to run without) until gb_search_3 releases
+                         it. gb_search_3's interleaved noise slots are NOT
+                         touched (2026-09-26, the 3mo v9 run)
+    STAGE_SKIP_NOISE_VGB=1  no noise_vgb_search stage; with
+                         VGB_START_FACTOR=0 the VGBs start at exact truth and
+                         have nothing to converge, so they sit subtracted
+                         through the noise stage and sample from gb_search_1
     STAGE_NOISE_ONLY=1   run only the two noise search stages, then stop
     STAGE_NOISE_VGB_PE=1 searches, then PE-sample psd+galfor+vgb (no GB);
                          bounded by NUM_ITERATIONS
@@ -923,13 +932,52 @@ def build_fit():
     _noise_names = (["psd_pe"] if _has_psd else []) + (
         ["galfor_pe"] if _has_galfor else [])
 
+    # ---- STAGE_NOISE_PSD_ONLY (user spec 2026-09-26, the 3mo v9 run) -------
+    # The STANDALONE noise stage samples psd ALONE; the foreground stays FROZEN
+    # at GALFOR_START_PARAMS -- a deliberately conservative reference, for a run
+    # whose first stage fits the psd against a residual that still contains the
+    # whole GB galaxy. Letting galfor move there is the 6mo disease: with GB
+    # empty the foreground absorbs the unresolved galaxy (measured at 8.5x the
+    # true confusion) and the inflated floor then hides the sources the search
+    # exists to find.
+    #
+    # ⚠ SCOPE IS THE STANDALONE STAGE ONLY. gb_search_3's four interleaved
+    # noise_joint_search_1..4 slots and the noise_vgb_joint_search rider keep
+    # BOTH moves: stage 3 is the stage that RELEASES the foreground, and taking
+    # galfor out of it would leave the run with no foreground fit at all. That
+    # is why this filters a separate name list rather than _noise_names itself.
+    _noise_psd_only = _env_flag("STAGE_NOISE_PSD_ONLY")
+    if _noise_psd_only and _has_galfor and not os.environ.get(
+            "GALFOR_START_PARAMS", "").strip():
+        # A frozen branch sits at its START coordinates, and with no pin those
+        # are a PRIOR DRAW. The run would then hunt GBs against a random
+        # foreground for the whole of noise_search, gb_search_1 and
+        # gb_search_2 -- the same failure the half-pin guard below prevents,
+        # one layer down, and just as silent.
+        raise ValueError(
+            "STAGE_NOISE_PSD_ONLY=1 freezes the galfor branch through the "
+            "noise stage and both fixed-noise GB search stages, but "
+            "GALFOR_START_PARAMS is unset -- the foreground would be frozen "
+            "at a PRIOR DRAW for three whole stages. Set GALFOR_START_PARAMS "
+            "(PHYSICAL/linear: amp, fk, alpha, f_1, f_2), or drop "
+            "STAGE_NOISE_PSD_ONLY and let the noise stage fit the foreground."
+        )
+    _standalone_noise_names = (
+        [n for n in _noise_names if n != "galfor_pe"] if _noise_psd_only
+        else list(_noise_names))
+    if _noise_psd_only:
+        print("[combined] STAGE_NOISE_PSD_ONLY=1: the standalone noise "
+              f"stage samples {_standalone_noise_names} only; galfor stays "
+              "FROZEN at GALFOR_START_PARAMS until gb_search_3 releases it.",
+              flush=True)
+
     # Stage 1: noise alone. Stage 2 and the GB search: noise + VGBs, with the
     # max-logl criterion spanning ALL of them -- one object per stage, so the
     # convergence is joint rather than each move plateauing separately.
 
     # TODO: CLEAN
     noise_only = [JointMaxLogLSearch(
-        "noise_joint_search", list(_noise_names), branch="psd")]
+        "noise_joint_search", list(_standalone_noise_names), branch="psd")]
     noise_only_1 = [JointMaxLogLSearch(
         "noise_joint_search_1", list(_noise_names), branch="psd")]
     noise_only_2 = [JointMaxLogLSearch(
@@ -946,9 +994,11 @@ def build_fit():
         "noise_joint_search_3", list(_noise_names), branch="psd")]
     noise_only_4 = [JointMaxLogLSearch(
         "noise_joint_search_4", list(_noise_names), branch="psd")]
+    # STANDALONE stage -> the psd-only filter applies here too (the rider
+    # below is a gb_search_3 move and deliberately keeps galfor).
     noise_vgb = [JointMaxLogLSearch(
         "noise_vgb_joint_search",
-        _noise_names + (["vgb_pe"] if _has_vgb else []),
+        _standalone_noise_names + (["vgb_pe"] if _has_vgb else []),
         branch="psd")]
     # The SAME joint move riding inside gb_search, with its OWN plateau rule.
     # It never plateaus for good there -- the GB residual moves every
@@ -1078,19 +1128,41 @@ def build_fit():
         )
     elif _has_psd and not _env_flag("STAGE_SKIP_NOISE"):
         if _v9_search_enabled() and not _noise_pinned:
+            # Name the branch(es) that are actually unpinned. The old wording
+            # said "PSD_START_PARAMS / GALFOR_START_PARAMS unset" whichever of
+            # the two was missing, which reads as false on a deliberate
+            # half-pin -- e.g. the 3mo v9 run, which pins galfor to an offline
+            # reference precisely so the noise stage can SEARCH the psd.
+            _unpinned = [
+                n for n, v in (("PSD_START_PARAMS", _has_psd),
+                               ("GALFOR_START_PARAMS", _has_galfor))
+                if v and not os.environ.get(n, "").strip()
+            ]
             print(
-                "[combined] v9: noise_search / noise_vgb_search KEPT -- no "
-                "previous-run noise estimate was supplied "
-                "(PSD_START_PARAMS / GALFOR_START_PARAMS unset), so the psd "
-                "and foreground start from a PRIOR DRAW and must be fitted "
-                "before the fixed-noise search stages freeze them.",
+                "[combined] v9: the noise stage(s) are KEPT -- "
+                f"{' and '.join(_unpinned)} unset, so that branch starts from "
+                "a PRIOR DRAW and must be fitted before the fixed-noise "
+                "search stages freeze it.",
                 flush=True,
             )
         stages.append(Stage(
             name="noise_search", kind="search", moves=noise_only,
             combine_kwargs=dict(share_temperature_control=False),
         ))
-        if _has_vgb:
+        # STAGE_SKIP_NOISE_VGB (user ruling 2026-09-26, the 3mo v9 run): drop
+        # the vgb burn-in stage. With VGB_START_FACTOR=0 the VGBs start at
+        # EXACT truth, so a max-logL stage has nothing to converge -- they sit
+        # subtracted at truth through the noise stage (which is what makes
+        # "every source removed except the GBs" true for a psd-only fit) and
+        # begin sampling in gb_search_1, where vgb_pe already rides the
+        # fixed-noise stages. Deliberately its OWN knob rather than a second
+        # job for STAGE_NOISE_PSD_ONLY.
+        if _has_vgb and _env_flag("STAGE_SKIP_NOISE_VGB"):
+            print("[combined] STAGE_SKIP_NOISE_VGB=1: no noise_vgb_search "
+                  "stage; the VGBs stay at their start coords through "
+                  "noise_search and begin sampling in the first GB search "
+                  "stage.", flush=True)
+        elif _has_vgb:
             # without a vgb branch this stage would duplicate noise_search
             stages.append(Stage(
                 name="noise_vgb_search", kind="search", moves=noise_vgb,
