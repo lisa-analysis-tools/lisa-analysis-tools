@@ -3753,7 +3753,17 @@ export NOISE_SEARCH_CHECKS=5
 # MAXLOGL_PER_WALKER=0 restores the old best-walker rule bit-identically;
 # MAXLOGL_FREEZE_CONVERGED=0 keeps per-walker but stops freezing.
 export MAXLOGL_PER_WALKER=1
-export MAXLOGL_FREEZE_CONVERGED=1
+# ⚠ FREEZE OFF (2026-09-26, after it killed the first relaunch).
+# Shutting a converged walker off means restoring its rows, and a
+# branch with a tempered ModuleSubState is stored TWICE -- the main
+# engine state and state.sub_states[name]. The first version restored
+# only the main one and rank 1 died on the next propose with
+#   ValueError: [psd] cold-chain coords mismatch between the main
+#   state and its sub-state (1 of 2 alive leaves differ)
+# The restore now covers sub-states too, but that path has never run
+# on a real tempered state, so it stays off here. The PER-WALKER
+# plateau above is the substantive fix and is unaffected by this.
+export MAXLOGL_FREEZE_CONVERGED=0
 #
 # ⚠ PSD_START_PARAMS MUST STAY UNSET. run_combined_staged.py SKIPS the noise
 # stages when EVERY sampled noise branch is pinned, so setting it would delete

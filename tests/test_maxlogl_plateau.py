@@ -111,9 +111,11 @@ class PerWalkerPlateauTest(unittest.TestCase):
     def setUp(self):
         os.environ["MAXLOGL_LOG_EVERY"] = "0"
         os.environ["MAXLOGL_PER_WALKER"] = "1"
+        # default OFF since it shipped broken; these cases arm it
+        os.environ["MAXLOGL_FREEZE_CONVERGED"] = "1"
         os.environ["MAXLOGL_ITERS_PER_STEP"] = "500"
         for k in ("MAXLOGL_LOG_EVERY", "MAXLOGL_PER_WALKER",
-                  "MAXLOGL_ITERS_PER_STEP"):
+                  "MAXLOGL_ITERS_PER_STEP", "MAXLOGL_FREEZE_CONVERGED"):
             self.addCleanup(os.environ.pop, k, None)
 
     @staticmethod
@@ -149,6 +151,48 @@ class PerWalkerPlateauTest(unittest.TestCase):
                for i in range(60)]
         # walker 1 tops out at round 10, then 5 flat rounds -> 15.
         self.assertEqual(_run(seq, num_checks=5, tol=5.0), 15)
+
+    def test_a_frozen_walker_restores_BOTH_representations(self):
+        """The regression for what killed the first relaunch.
+
+        A branch with a tempered ModuleSubState is stored twice -- the main
+        engine state and ``state.sub_states[name]`` -- and
+        ``_check_substate_consistency`` compares the main cold row against
+        the sub-state's row 0 on EVERY propose. The first version of the
+        freeze restored only the main state, so rank 1 died with
+        "[psd] cold-chain coords mismatch between the main state and its
+        sub-state (1 of 2 alive leaves differ)".
+        """
+        ntemps, nw, nleaves, ndim = 2, 2, 2, 3
+
+        def _holder(fill):
+            return SimpleNamespace(
+                coords=np.full((ntemps, nw, nleaves, ndim), fill, dtype=float),
+                inds=np.ones((ntemps, nw, nleaves), dtype=bool),
+                tempered_initialized=True)
+
+        main, sub = _holder(1.0), _holder(1.0)
+        state = SimpleNamespace(
+            log_like=np.full((1, nw), -np.inf), log_prior=np.zeros((1, nw)),
+            branches={"psd": main}, sub_states={"psd": sub})
+        mask = np.array([True, False])          # freeze walker 0 only
+        snap = MaxLogLCombineMove._snapshot_walkers(state, mask)
+        self.assertIsNotNone(snap)
+        self.assertIn("psd", snap["subs"], "the sub-state must be captured")
+
+        # A move now scribbles on BOTH representations for both walkers.
+        main.coords[...] = 9.0
+        sub.coords[...] = 9.0
+        MaxLogLCombineMove._restore_walkers(state, snap)
+
+        # Walker 0 is back to 1.0 in BOTH; walker 1 keeps the move's 9.0.
+        for label, holder in (("main", main), ("sub", sub)):
+            self.assertTrue((holder.coords[:, 0] == 1.0).all(),
+                            f"{label}: frozen walker not restored")
+            self.assertTrue((holder.coords[:, 1] == 9.0).all(),
+                            f"{label}: laggard must NOT be restored")
+        # ... and the two agree, which is what check_cold_row enforces.
+        np.testing.assert_array_equal(main.coords[0], sub.coords[0])
 
     def test_converged_walkers_are_frozen_in_a_search_stage(self):
         """A walker past its flat window stops moving; the laggard does not."""

@@ -1069,10 +1069,20 @@ class MaxLogLCombineMove(GFCombineMove):
         # calls, so a restored log_like would be STALE and would corrupt the
         # very bookkeeping it is meant to protect -- there the per-walker rule
         # still governs the loop, but nothing is frozen.
+        # ⚠⚠ DEFAULT OFF, AND IT SHIPPED ON ONCE. The first cut restored only
+        # the MAIN state's rows, so the psd branch's sub-state still held the
+        # pre-freeze coordinates and the next propose died on
+        #   [psd] cold-chain coords mismatch between the main state and its
+        #   sub-state (1 of 2 alive leaves differ)
+        # -- the dual-representation trap, the same one GFRidgeGibbsMove hit
+        # in August. The restore below now covers sub_states too, but that
+        # path has NOT been exercised on a real tempered state, so it stays
+        # opt-in: MAXLOGL_FREEZE_CONVERGED=1 to try it. The per-walker plateau
+        # is independent of this and is ON by default.
         _freeze = (
             per_walker
-            and os.environ.get("MAXLOGL_FREEZE_CONVERGED", "1").strip()
-            not in ("0", "false", "False", "no", "off", "")
+            and os.environ.get("MAXLOGL_FREEZE_CONVERGED", "0").strip()
+            in ("1", "true", "True", "yes", "on")
             and str(getattr(self, "gf_stage_kind", "")) == "search"
         )
         accepted = None
@@ -1184,14 +1194,24 @@ class MaxLogLCombineMove(GFCombineMove):
         return state, accepted
 
     # ---- converged-walker freeze helpers ----------------------------------
-    # Pure snapshot/restore of whole walker COLUMNS: no index arithmetic into
-    # supps and no reliance on walker_inds, which is where this codebase has
-    # twice scored walkers against each other's residuals. A walker that is
-    # not in ``mask`` is never touched.
+    # Whole walker COLUMNS only: no index arithmetic into supps and no
+    # reliance on walker_inds, which is where this codebase has twice scored
+    # walkers against each other's residuals. A walker not in ``mask`` is
+    # never touched.
+    #
+    # ⚠ BOTH REPRESENTATIONS OR NEITHER. A branch that carries a tempered
+    # ModuleSubState is stored TWICE -- the main engine state and
+    # ``state.sub_states[name]`` -- and ``_check_substate_consistency``
+    # compares the main cold row against the sub-state's row 0 on every
+    # propose. Restoring one and not the other is not a silent inconsistency,
+    # it is a hard ValueError on the next move, which is exactly how the
+    # first version of this died on the cluster ("[psd] cold-chain coords
+    # mismatch ... 1 of 2 alive leaves differ").
     @staticmethod
     def _snapshot_walkers(state, mask):
         w = np.flatnonzero(np.asarray(mask))
-        snap = {"w": w, "branches": {}, "log_like": None, "log_prior": None}
+        snap = {"w": w, "branches": {}, "subs": {},
+                "log_like": None, "log_prior": None}
         try:
             for name, br in (state.branches or {}).items():
                 entry = {}
@@ -1201,32 +1221,48 @@ class MaxLogLCombineMove(GFCombineMove):
                         entry[attr] = np.array(arr[:, w])
                 if entry:
                     snap["branches"][name] = entry
+            for name, sub in (getattr(state, "sub_states", None) or {}).items():
+                if sub is None or not getattr(sub, "tempered_initialized", False):
+                    continue
+                entry = {}
+                for attr in ("coords", "inds"):
+                    arr = getattr(sub, attr, None)
+                    if arr is not None:
+                        entry[attr] = np.array(arr[:, w])
+                if entry:
+                    snap["subs"][name] = entry
             for key in ("log_like", "log_prior"):
                 arr = getattr(state, key, None)
                 if arr is not None:
                     snap[key] = np.array(np.asarray(arr)[:, w])
         except Exception:
-            # Any layout this does not understand -> freeze nothing rather
+            # Any layout this does not understand -> freeze NOTHING rather
             # than half-restore. The per-walker plateau rule still applies.
             return None
         return snap
 
-    @staticmethod
-    def _restore_walkers(state, snap):
+    @classmethod
+    def _restore_walkers(cls, state, snap):
         if snap is None:
             return state
         w = snap["w"]
         for name, entry in snap["branches"].items():
-            br = (state.branches or {}).get(name)
-            if br is None:
-                continue
-            for attr, arr in entry.items():
-                cur = getattr(br, attr, None)
-                if cur is not None and cur[:, w].shape == arr.shape:
-                    cur[:, w] = arr
+            cls._restore_cols((state.branches or {}).get(name), entry, w)
+        for name, entry in snap["subs"].items():
+            cls._restore_cols(
+                (getattr(state, "sub_states", None) or {}).get(name), entry, w)
         for key in ("log_like", "log_prior"):
             arr = snap.get(key)
             cur = getattr(state, key, None)
             if arr is not None and cur is not None and cur[:, w].shape == arr.shape:
                 cur[:, w] = arr
         return state
+
+    @staticmethod
+    def _restore_cols(holder, entry, w):
+        if holder is None:
+            return
+        for attr, arr in entry.items():
+            cur = getattr(holder, attr, None)
+            if cur is not None and cur[:, w].shape == arr.shape:
+                cur[:, w] = arr

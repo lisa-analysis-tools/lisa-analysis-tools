@@ -991,7 +991,9 @@ class ThreeMonthV9TwinTest(unittest.TestCase):
         the other three cold walkers 71,050 / 128,080 / 1,600 lnL below it.
         """
         self.assertEqual(self.three["MAXLOGL_PER_WALKER"], "1")
-        self.assertEqual(self.three["MAXLOGL_FREEZE_CONVERGED"], "1")
+        # OFF: the freeze has to restore the sub-state as well as the
+        # main state, and shipping it on killed the first relaunch.
+        self.assertEqual(self.three["MAXLOGL_FREEZE_CONVERGED"], "0")
 
     def test_PSD_START_PARAMS_is_unset_or_the_first_stage_disappears(self):
         """Pinning it flips ``_noise_pinned`` and the noise stages are SKIPPED.
