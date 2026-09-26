@@ -316,12 +316,48 @@ def sens_grids(psd_p, gal_p, df):
 
 
 def find_l1_brick(path=None):
-    """Any mojito L1 file -- they all carry the same orbits/ltt tables."""
+    """Any mojito L1 file -- they all carry the same orbits/ltt tables.
+
+    THE ENV CHAIN IS THE SAME ONE THE PAGE USES (fixed 2026-09-26, user
+    report: "I cannot get the html builder to find the proper orbits. Even
+    when I provide MOJITO_CAT in both ways it does not work.").
+
+    It used to read ONLY ``MOJITO_DATA_PATH`` and ``~/.mojito_cache``.
+    ``MOJITO_CAT`` -- the variable this script documents for finding the
+    catalogue, and the obvious one to reach for -- was never consulted
+    here, so setting it resolved the catalogue perfectly and left the
+    ORBITS on the analytic fallback. The only symptom was one ``print``
+    that scrolls past in a tens-of-minutes build, and a truth set stamped
+    ``analytic`` that the monitor then correctly complains about. Nothing
+    told you which knob was the wrong one.
+
+    Order: explicit path > MOJITO_INFO_PATH (the one knob) > MOJITO_CAT
+    (directory, or the wdwd_cat file, in which case two levels up) >
+    MOJITO_DATA_PATH > MOJITO_CACHE_DIR > the laptop default. Every entry
+    is searched recursively for ``*_L1_*.h5``.
+    """
     import glob
     if path:
         return path
-    for root in (os.environ.get("MOJITO_DATA_PATH"),
-                 os.path.expanduser("~/.mojito_cache")):
+
+    def _cat_root(v):
+        # MOJITO_CAT accepts the containing directory OR the catalogue
+        # file itself (.../catalogues/wdwd_cat_*.hdf5) -- match
+        # _resolve_catalogue, which is what makes the same value work for
+        # both lookups.
+        v = os.path.expanduser(v)
+        return os.path.dirname(os.path.dirname(v)) if os.path.isfile(v) else v
+
+    roots = []
+    for name in ("MOJITO_INFO_PATH", "MOJITO_CAT", "MOJITO_DATA_PATH",
+                 "MOJITO_CACHE_DIR"):
+        v = os.environ.get(name)
+        if v:
+            roots.append(_cat_root(v) if name == "MOJITO_CAT"
+                         else os.path.expanduser(v))
+    roots.append(os.path.expanduser("~/.mojito_cache"))
+
+    for root in roots:
         if not root or not os.path.isdir(root):
             continue
         hits = sorted(glob.glob(os.path.join(root, "**", "*_L1_*.h5"),
@@ -485,6 +521,12 @@ def make_parser():
                     help="GB catalogue hdf5, or the directory holding it. "
                          "Overrides MOJITO_CAT and MOJITO_CACHE_DIR; "
                          f"default {MOJITO_CAT_DEFAULT}")
+    ap.add_argument("--l1-brick", default=None,
+                    help="explicit mojito L1 .h5 to read the orbits/ltt "
+                         "tables from (any L1 file will do -- they all "
+                         "carry the same tables). Overrides the "
+                         "MOJITO_INFO_PATH / MOJITO_CAT / MOJITO_DATA_PATH "
+                         "/ MOJITO_CACHE_DIR search.")
     ap.add_argument("--analytic-orbits", action="store_true",
                     help="build on DefaultOrbits instead of the injected "
                          "mojito L1 orbits. Reproduces truth sets made before "
@@ -532,13 +574,46 @@ def main(argv=None):
     # The two disagree by tens of percent above a few mHz (see l1_orbits).
     orb, orb_src = (None, "--analytic-orbits requested")
     if not a.analytic_orbits:
-        orb, orb_src = l1_orbits()
+        orb, orb_src = l1_orbits(path=a.l1_brick)
     orbits_tag = "mojito_l1"
     if orb is None:
         orbits_tag = "analytic"
-        print(f"WARNING: building on the ANALYTIC ephemeris ({orb_src}). "
-              "SNRs and the detectable set above a few mHz will not match "
-              "the monitor's own overlap block.")
+        if a.analytic_orbits:
+            print(f"orbits: ANALYTIC by request ({orb_src})")
+        else:
+            # LOUD, and it names the knobs. This used to be one print line
+            # in a tens-of-minutes build, so the usual way to discover it
+            # was the monitor complaining days later about a truth set
+            # stamped "analytic" (user report 2026-09-26). A wrong
+            # ephemeris is not a detail: at 7.44-7.60 mHz it moves optimal
+            # SNR 7.96 -> 8.69 and overlap 0.052 -> 0.580.
+            _tried = [n for n in ("MOJITO_INFO_PATH", "MOJITO_CAT",
+                                  "MOJITO_DATA_PATH", "MOJITO_CACHE_DIR")
+                      if os.environ.get(n)]
+            print(
+                "\n"
+                "########################################################\n"
+                "##  NO MOJITO L1 BRICK FOUND -- BUILDING ON THE        \n"
+                "##  ANALYTIC EPHEMERIS. THIS IS PROBABLY NOT WHAT YOU  \n"
+                "##  WANT.                                              \n"
+                "##                                                     \n"
+                f"##  reason: {orb_src}\n"
+                f"##  env set: {', '.join(_tried) if _tried else 'NONE'}\n"
+                "##                                                     \n"
+                "##  Point one of MOJITO_INFO_PATH / MOJITO_CAT /       \n"
+                "##  MOJITO_DATA_PATH / MOJITO_CACHE_DIR at a directory \n"
+                "##  containing *_L1_*.h5 (searched recursively), or    \n"
+                "##  pass --l1-brick /path/to/any_L1_file.h5.           \n"
+                "##                                                     \n"
+                "##  Above a few mHz the analytic ephemeris is simply a \n"
+                "##  different number: optimal SNR 7.96 -> 8.69 and     \n"
+                "##  template overlap 0.052 -> 0.580 at 7.44-7.60 mHz.  \n"
+                "##  Phase maximisation does NOT rescue it. The output  \n"
+                "##  is stamped orbits='analytic' and the monitor page  \n"
+                "##  will say so.                                       \n"
+                "##                                                     \n"
+                "##  Pass --analytic-orbits to silence this and mean it.\n"
+                "########################################################\n")
         orb = lisa_models.DefaultOrbits(force_backend="cpu", frame="icrs")
     else:
         print(f"orbits: mojito L1 {orb_src}")

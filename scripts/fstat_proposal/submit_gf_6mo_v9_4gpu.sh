@@ -1237,7 +1237,25 @@ export GB_INMODEL_CONVERGE_ITERS=250
 # 0 = off (both classes share GB_INMODEL_CONVERGE_ITERS, pre-2026-09-25).
 # Watch: [GB_IMCONV ... armed] now prints both windows, and the survivor
 # block length should collapse toward ~105 from ~280.
-export GB_INMODEL_CONVERGE_ITERS_SURVIVOR=100
+#
+# 100 -> 50 (user ruling 2026-09-26, off job 643). MEASURED over 1,956,023
+# mature rows in five iterations: p10 is pinned at EXACTLY 101 -- the floor,
+# window+1 -- 30.2% of rows stop there, and p50 is only 111-120. So the
+# mature distribution is packed against the floor: the window is not
+# measuring these rows, it is a fixed budget they serve out. Their median
+# gain over the whole block is 0.08-0.23 lnL, i.e. they arrive converged.
+# (Newborns are the opposite and unchanged at 250: median gain 5.18-5.26,
+# above the 4.0 dll, once 09ca4819 stopped them exiting at 5 repeats.)
+#
+# The derived dll follows automatically: 4.0 * 50/250 = 0.8, so the enforced
+# rate stays 0.016 lnL/repeat and only the earliest permitted exit moves.
+# A row still genuinely climbing is unaffected -- it keeps climbing.
+# Mature rows are 89.9% of all in-model row-repeats, so this is the largest
+# remaining lever that costs no evidence.
+# Watch on the next snapshot: mature p10 should read 51, not 101, and p50
+# should fall from ~115 toward ~65. If p10 stays at 101 the knob did not
+# reach the move.
+export GB_INMODEL_CONVERGE_ITERS_SURVIVOR=50
 # The improvement threshold: D/2 = 0.5 * GB_LEAF_CAP_NDIM, the lnL a
 # genuinely new D-parameter source has to buy. Same number as the leaf cap
 # gate, but see the warning above -- same threshold, different clock.

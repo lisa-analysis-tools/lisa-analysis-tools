@@ -713,6 +713,12 @@ export PROGRESS=0
 
 # ---- run plumbing ----------------------------------------------------------
 export MOJITO_DATA_PATH=/shared/data/mojito_cache
+# The SAME directory, named the way the monitor page asks for it: the
+# level holding catalogues/ and data/. The page needed two knobs for
+# this one path and the second was never exported, so a page built on
+# the cluster silently lost its residual-spectrum and
+# data/template/residual panels. Sampler never reads it.
+export MOJITO_INFO_PATH=/shared/data/mojito_cache
 export USE_GPU=1
 export GPU_BACKEND=cuda13x
 # GPU list follows what slurm actually granted (self-dispatch block above);
@@ -1335,7 +1341,12 @@ export GB_INMODEL_CONVERGE_ITERS=250
 # 0 = off (both classes share GB_INMODEL_CONVERGE_ITERS, pre-2026-09-25).
 # Watch: [GB_IMCONV ... armed] now prints both windows, and the survivor
 # block length should collapse toward ~105 from ~280.
-export GB_INMODEL_CONVERGE_ITERS_SURVIVOR=100
+# 100 -> 50 in lockstep with the 6mo script (user ruling 2026-09-26,
+# measured there over 1,956,023 mature rows: p10 pinned at exactly the
+# 101 floor, median gain 0.08-0.23 lnL, i.e. survivors arrive converged
+# and the window is a fixed budget they serve out). The derived dll
+# follows (4.0 * 50/250 = 0.8), so the enforced rate is unchanged.
+export GB_INMODEL_CONVERGE_ITERS_SURVIVOR=50
 # The improvement threshold: D/2 = 0.5 * GB_LEAF_CAP_NDIM, the lnL a
 # genuinely new D-parameter source has to buy. Same number as the leaf cap
 # gate, but see the warning above -- same threshold, different clock.

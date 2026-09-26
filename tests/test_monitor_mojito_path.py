@@ -217,3 +217,108 @@ class BuildTruthIterationDefaultTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class L1BrickLookupTest(unittest.TestCase):
+    """USER REPORT 2026-09-26: "I cannot get the html builder to find the
+    proper orbits. Even when I provide MOJITO_CAT in both ways it does not
+    work."
+
+    Root cause: ``find_l1_brick`` read a DIFFERENT env chain from
+    everything else -- only ``MOJITO_DATA_PATH`` and ``~/.mojito_cache``.
+    ``MOJITO_CAT``, the variable this script documents and the obvious one
+    to reach for, resolved the CATALOGUE correctly and did nothing for the
+    ORBITS, so the build fell back to the analytic ephemeris behind a
+    single print line. The truth set came out stamped ``analytic`` and the
+    monitor complained about it days later, naming neither knob.
+
+    Above a few mHz that fallback is not a refinement: optimal SNR
+    7.96 -> 8.69 and template overlap 0.052 -> 0.580 at 7.44-7.60 mHz.
+    """
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        # build_truth's own nested convention, which is where the two
+        # chains disagreed: MOJITO_CAT points at the inner directory.
+        self.inner = os.path.join(self.d, "brickmarket", "mojito_light_v1_0_0")
+        self.brick = os.path.join(self.inner, "data", "INSTRUMENT", "L1",
+                                  "NOISE_731d_2.5s_L1_source0_0_X.h5")
+        os.makedirs(os.path.dirname(self.brick))
+        open(self.brick, "wb").close()
+        self.catfile = os.path.join(self.inner, "catalogues",
+                                    "wdwd_cat_mojito_lite_processed.hdf5")
+        os.makedirs(os.path.dirname(self.catfile))
+        open(self.catfile, "wb").close()
+        self.env = mock.patch.dict(os.environ, {}, clear=False)
+        self.env.start()
+        for k in ("MOJITO_INFO_PATH", "MOJITO_CAT", "MOJITO_DATA_PATH",
+                  "MOJITO_CACHE_DIR", "HOME"):
+            os.environ.pop(k, None)
+        # Neutralise the ~/.mojito_cache default so a real laptop cache
+        # cannot make these pass for the wrong reason.
+        os.environ["HOME"] = self.d + "/nohome"
+        self.addCleanup(self.env.stop)
+
+    def test_nothing_set_finds_nothing(self):
+        """The control: without it these assertions are vacuous."""
+        self.assertIsNone(bt.find_l1_brick())
+
+    def test_MOJITO_CAT_as_a_DIRECTORY_now_works(self):
+        os.environ["MOJITO_CAT"] = self.inner
+        self.assertEqual(bt.find_l1_brick(), self.brick)
+
+    def test_MOJITO_CAT_as_the_CATALOGUE_FILE_now_works(self):
+        """"both ways" -- MOJITO_CAT accepts the wdwd_cat file, and the
+        brick root is then two levels up, exactly as _resolve_catalogue
+        treats it."""
+        os.environ["MOJITO_CAT"] = self.catfile
+        self.assertEqual(bt.find_l1_brick(), self.brick)
+
+    def test_MOJITO_INFO_PATH_works(self):
+        os.environ["MOJITO_INFO_PATH"] = self.inner
+        self.assertEqual(bt.find_l1_brick(), self.brick)
+
+    def test_MOJITO_DATA_PATH_still_works(self):
+        """The one name that worked before must not regress."""
+        os.environ["MOJITO_DATA_PATH"] = self.inner
+        self.assertEqual(bt.find_l1_brick(), self.brick)
+
+    def test_MOJITO_CACHE_DIR_works(self):
+        os.environ["MOJITO_CACHE_DIR"] = self.d
+        self.assertEqual(bt.find_l1_brick(), self.brick)
+
+    def test_the_search_is_recursive_from_the_cache_root(self):
+        """Pointing at the OUTER cache dir must still find it -- the
+        laptop layout nests two levels deeper than the cluster's."""
+        os.environ["MOJITO_CAT"] = self.d
+        self.assertEqual(bt.find_l1_brick(), self.brick)
+
+    def test_an_explicit_l1_brick_beats_every_env(self):
+        os.environ["MOJITO_CAT"] = self.inner
+        self.assertEqual(bt.find_l1_brick("/explicit/any_L1_file.h5"),
+                         "/explicit/any_L1_file.h5")
+
+    def test_the_CLI_exposes_the_override(self):
+        ap = bt.make_parser()
+        ns = ap.parse_args(["store.h5", "--l1-brick", "/x/y_L1_z.h5"])
+        self.assertEqual(ns.l1_brick, "/x/y_L1_z.h5")
+
+    def test_main_passes_the_override_through(self):
+        src = Path(bt.__file__).read_text()
+        self.assertIn("l1_orbits(path=a.l1_brick)", src)
+
+    def test_the_analytic_fallback_is_loud_and_names_the_knobs(self):
+        """It was one print line in a tens-of-minutes build."""
+        src = Path(bt.__file__).read_text()
+        i = src.index("orbits_tag = \"analytic\"")
+        blk = src[i:i + 2600]
+        self.assertIn("####", blk)
+        for knob in ("MOJITO_INFO_PATH", "MOJITO_CAT", "MOJITO_DATA_PATH",
+                     "--l1-brick"):
+            self.assertIn(knob, blk)
+
+    def test_requesting_analytic_explicitly_does_not_shout(self):
+        """--analytic-orbits is a choice, not an accident."""
+        src = Path(bt.__file__).read_text()
+        i = src.index("orbits_tag = \"analytic\"")
+        self.assertIn("if a.analytic_orbits:", src[i:i + 300])
