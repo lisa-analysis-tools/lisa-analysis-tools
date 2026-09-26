@@ -4502,6 +4502,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             kwargs.get("inmodel_converge_iters_default", 100),
             _converge_cast_window,
         )
+        # SURVIVOR window (2026-09-25). 0 = "same as the newborn window",
+        # which is the historical behaviour. The window is a FLOOR on block
+        # length, survivors are 96.3% of all converging in-model work, and
+        # on job 628 their mean block was 276-306 repeats against a floor of
+        # 255 -- so the floor, not convergence, was setting the bill.
+        # ⚠ The DLL is DERIVED from this so the enforced RATE (thresh/window
+        # lnL per repeat) is unchanged; see _converge_state_for.
+        self.inmodel_converge_iters_survivor = _resolve_converge_knob(
+            branch_name, "iters_survivor",
+            kwargs.get("inmodel_converge_iters_survivor", None),
+            kwargs.get("inmodel_converge_iters_survivor_default", 0),
+            lambda v: int(v),
+        )
         # D/2 -- the same threshold, and the same reasoning, as the leaf
         # cap's lnL-improvement gate (_update_band_leaf_caps): the log
         # likelihood a genuinely new D-parameter source has to buy.
@@ -16028,10 +16041,22 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         if not getattr(self, "_converge_armed_logged", False):
             self._converge_armed_logged = True
             logger.info(
-                "[GB_IMCONV %s] armed (%s): window %d, dll %.2f "
+                "[GB_IMCONV %s] armed (%s): window %d%s, dll %.2f "
                 "(= %.3f lnL/repeat), ceiling %d, stop_frac %.2f, "
                 "gate = coldest %d/%d rung(s), refill %s, classes %s.",
                 self.name, mode, self.inmodel_converge_iters,
+                (
+                    ""
+                    if not int(getattr(
+                        self, "inmodel_converge_iters_survivor", 0) or 0)
+                    or int(self.inmodel_converge_iters_survivor)
+                    == int(self.inmodel_converge_iters)
+                    # Survivors are ~96% of the converging work, so the
+                    # window they actually run under belongs on this line.
+                    else " (newborn) / %d (survivor, dll scaled to hold the "
+                         "same rate)" % int(
+                             self.inmodel_converge_iters_survivor)
+                ),
                 self.inmodel_converge_dll,
                 self.inmodel_converge_dll
                 / max(self.inmodel_converge_iters, 1),
@@ -16047,9 +16072,39 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # rungs and silently disarm the whole test.
         _n_gate = max(1, int(np.ceil(
             int(self.ntemps) * float(self.inmodel_converge_gate_frac))))
+        # ---- PER-CLASS WINDOW (user ruling 2026-09-25, off job 628) ------
+        # The window is a FLOOR on block length: a row cannot converge
+        # before ``seen >= window``, so every block runs at least that many
+        # repeats whatever the physics says. Measured on 628, survivors do
+        # not need 250 and births do:
+        #
+        #   survivors  median 260, p90 320-375, MAX 420-480, ~50% at floor
+        #   births     median 275-285, p90 435-500, max 1200-1865
+        #
+        # and survivors are 96.3% of all converging in-model work against
+        # births' 0.9%, so the survivor floor IS the in-model bill -- their
+        # mean of 276-306 against a floor of 255 means ~90% of that work is
+        # the floor itself, not convergence.
+        #
+        # ⚠ (window, thresh) IS A RATE -- thresh/window lnL per repeat, as
+        # the class docstring says. Shortening the window while holding
+        # thresh does not let survivors stop sooner at the same bar, it
+        # LOWERS the bar (250->100 at a fixed 4.0 is 2.5x looser). So the
+        # survivor threshold scales with its window and the enforced rate
+        # is IDENTICAL for both classes; only the earliest permitted exit
+        # moves. Set {BRANCH}_INMODEL_CONVERGE_ITERS_SURVIVOR to override,
+        # and its DLL is derived unless explicitly given.
+        _win = int(self.inmodel_converge_iters)
+        _thr = float(self.inmodel_converge_dll)
+        if cls_name != "newborn":
+            _win_s = int(getattr(self, "inmodel_converge_iters_survivor", 0)
+                         or _win)
+            if _win_s != _win:
+                _thr = _thr * (_win_s / max(_win, 1))    # hold the RATE
+                _win = _win_s
         return _InModelConvergeState(
-            window=self.inmodel_converge_iters,
-            thresh=self.inmodel_converge_dll,
+            window=_win,
+            thresh=_thr,
             max_repeats=_ceiling,
             stop_frac=self.inmodel_converge_stop_frac,
             observe=(mode == "observe"),

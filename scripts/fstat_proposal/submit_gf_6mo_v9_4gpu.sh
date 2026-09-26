@@ -1204,6 +1204,33 @@ export GB_INMODEL_CONVERGE=on
 # goes 101 -> 251, and the ceiling below HAS to move with it or the window
 # never gets to speak -- see the note there.
 export GB_INMODEL_CONVERGE_ITERS=250
+# ---- SURVIVOR WINDOW (user ruling 2026-09-25, off job 628) -------------
+# 250 stays for BIRTHS; survivors get 100. The window is a FLOOR on block
+# length -- a row cannot converge before seen >= window -- so every block
+# runs at least that many repeats whatever the physics says. Measured over
+# 628's three complete search cycles:
+#
+#   survivors  median 260, p90 320-375, MAX 420-480, ~50% sat exactly at
+#              the 255 floor
+#   births     median 275-285, p90 435-500, max 1200-1865  <- these DO
+#              use the depth, so 250 stays for them
+#
+# and the work is not evenly split: survivors are 96.3% of all converging
+# in-model work, births 0.9%. Survivors' mean of 276-306 against a floor of
+# 255 means ~90% of the in-model bill was the FLOOR, not convergence.
+# Expected saving ~54% of survivor repeats -> ~44% of the iteration.
+#
+# ⚠ (window, thresh) IS A RATE: thresh/window lnL per repeat. Shortening
+# the window at a fixed dll does NOT let survivors stop sooner at the same
+# bar, it LOWERS the bar -- 250->100 at dll 4.0 would be 2.5x looser. The
+# survivor dll is therefore DERIVED (4.0 * 100/250 = 1.6) so the enforced
+# rate is IDENTICAL for both classes and only the earliest permitted exit
+# moves. tests/test_inmodel_converge.py pins that, with a control showing
+# what the unscaled version would have done.
+# 0 = off (both classes share GB_INMODEL_CONVERGE_ITERS, pre-2026-09-25).
+# Watch: [GB_IMCONV ... armed] now prints both windows, and the survivor
+# block length should collapse toward ~105 from ~280.
+export GB_INMODEL_CONVERGE_ITERS_SURVIVOR=100
 # The improvement threshold: D/2 = 0.5 * GB_LEAF_CAP_NDIM, the lnL a
 # genuinely new D-parameter source has to buy. Same number as the leaf cap
 # gate, but see the warning above -- same threshold, different clock.
@@ -1331,26 +1358,24 @@ export GB_INMODEL_CONVERGE_CLASSES=newborn,mature
 # at all. That is exactly the silent no-op the preflight exists to catch.
 export GB_SEARCH_IN_MODEL=1
 # Repeats per source per PASS of that move (the group rule then decides how
-# many passes). 25 -> 100 (user ruling 2026-09-25, off job 628's first two
-# complete gb_search_1 cycles).
+# many passes). 25 per the user's structure.
 #
-# WHAT THIS DOES NOT CHANGE: the total work is NOT 4x. The group rule stops
-# a sub-band when its cold dlnL over a 3-PASS window falls under
-# GB_INMODEL_GROUP_DLL, so a 4x fatter pass posts a ~4x larger per-pass gain
-# and clears the bar in correspondingly fewer passes. 628 reached pass 17 of
-# a 1000 ceiling at 25; expect single digits at 100 for a broadly similar
-# repeat count.
+# ⚠ DO NOT RAISE THIS EXPECTING A SPEEDUP. It was briefly set to 100 on
+# 2026-09-25 and reverted the same day, because the group rule's window is
+# GB_INMODEL_GROUP_ITERS *PASSES* and one pass is this many repeats per
+# source -- so the EFFECTIVE window is 3 x this, against a FIXED
+# GB_INMODEL_GROUP_DLL of 4.0:
 #
-# ⚠ WHAT IT DOES CHANGE, and the reason to watch it: the convergence test
-# gets COARSER. The stopping decision is only ever taken at a pass boundary,
-# so the granularity goes from 25 repeats to 100 -- a sub-band that would
-# have converged at repeat 30 now runs to 100. That overshoot is the cost,
-# and it is paid on the sub-bands that converge FASTEST (the sparse ones).
-# The gain is on the slow, dense sub-bands, which stop being re-polled every
-# 25 repeats. Watch [GB_IMGROUP] "pass N: cold dlnL" -- if pass 1 now lands
-# under ~4x its old value the trade is working; if the pass count does not
-# drop roughly 4x, this is simply 4x the in-model wall.
-export GB_NUM_REPEAT_PROPOSALS=100
+#     25  -> 4.0 over  75 repeats = 0.053 lnL/repeat
+#    100  -> 4.0 over 300 repeats = 0.013 lnL/repeat   (4x STRICTER)
+#
+# A fatter pass posts a proportionally LARGER per-pass gain, so the 3-pass
+# total stays above 4.0 for MORE passes, not fewer. Raising this is 4x the
+# work per pass AND a tighter bar. (Unlike the per-ROW rule in V9-1, this
+# convergence is per SUB-BAND, so there is no per-source averaging to
+# absorb it.) If fatter passes are ever wanted, GB_INMODEL_GROUP_DLL must
+# scale with them -- 50 pairs with dll 8.0 -- to hold the rate.
+export GB_NUM_REPEAT_PROPOSALS=25
 export GB_INMODEL_GROUP=1
 # W in PASSES (not repeats): one pass is already GB_NUM_REPEAT_PROPOSALS
 # repeats per source, so the per-pass gain is a far coarser quantity than

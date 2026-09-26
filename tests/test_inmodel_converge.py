@@ -1948,6 +1948,87 @@ class ReplaceGetsConvergencePolishTest(unittest.TestCase):
                          {"newborn": False, "mature": False})
 
 
+class PerClassConvergeWindowTest(unittest.TestCase):
+    """Survivors get their own convergence WINDOW, at the SAME rate.
+
+    User ruling 2026-09-25, off job 628. The window is a FLOOR on block
+    length -- a row cannot converge before ``seen >= window`` -- and
+    survivors are 96.3% of all converging in-model work against births'
+    0.9%. Their measured mean block was 276-306 repeats against a floor of
+    255, i.e. ~90% of the bill was the floor, not convergence. Births do
+    use the depth: they tail to 1200-1865 where survivors cap at 420-480.
+
+    ⚠ THE PAIR IS A RATE. ``thresh/window`` is lnL per repeat, so
+    shortening the window at a fixed thresh does not let survivors stop
+    sooner at the same bar -- it LOWERS the bar (250 -> 100 at dll 4.0 is
+    2.5x looser, 250 -> 50 is 5x). The survivor threshold is therefore
+    DERIVED from its window, and these tests pin that the enforced rate is
+    identical for both classes. Without that, this "speedup" would be a
+    silent weakening of the convergence criterion.
+    """
+
+    def _move(self, window=250, survivor=0, dll=4.0):
+        return SimpleNamespace(
+            name="rj_warm_search", branch_name="gb", inmodel_converge="on",
+            inmodel_converge_classes=frozenset({"newborn", "mature"}),
+            inmodel_repeats_newborn=100, inmodel_repeats_survivor=50,
+            inmodel_converge_iters=window,
+            inmodel_converge_iters_survivor=survivor,
+            inmodel_converge_max=20000, inmodel_converge_dll=dll,
+            inmodel_converge_gate_frac=0.5, inmodel_converge_stop_frac=0.5,
+            inmodel_converge_refill=True, ntemps=24,
+            _converge_armed_logged=True, _converge_pe_warned=True,
+        )
+
+    def _states(self, **kw):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        m = self._move(**kw)
+        return {c: g.GBSpecialBase._converge_state_for(m, c)
+                for c in ("newborn", "mature")}
+
+    def test_off_by_default_both_classes_identical(self):
+        """0 = historical behaviour; no run changes meaning silently."""
+        st = self._states(survivor=0)
+        self.assertEqual(st["newborn"].window, st["mature"].window)
+        self.assertEqual(st["newborn"].thresh, st["mature"].thresh)
+
+    def test_survivor_window_shortens_only_the_survivor_class(self):
+        st = self._states(window=250, survivor=100)
+        self.assertEqual(st["newborn"].window, 250)
+        self.assertEqual(st["mature"].window, 100)
+
+    def test_the_enforced_RATE_is_identical_across_classes(self):
+        """The whole point. If this fails the change is a weakening of the
+        criterion dressed up as a speedup."""
+        for surv in (50, 100, 150, 250):
+            st = self._states(window=250, survivor=surv)
+            rn = st["newborn"].thresh / st["newborn"].window
+            rm = st["mature"].thresh / st["mature"].window
+            self.assertAlmostEqual(rn, rm, places=12, msg=f"survivor={surv}")
+            self.assertAlmostEqual(rn, 4.0 / 250, places=12)
+
+    def test_the_control_a_fixed_thresh_would_have_loosened_the_bar(self):
+        """Shows the trap this design avoids: had thresh been left at 4.0,
+        a 100-repeat window would enforce 2.5x the permitted drift."""
+        st = self._states(window=250, survivor=100)
+        naive_rate = 4.0 / 100                      # thresh NOT scaled
+        actual_rate = st["mature"].thresh / st["mature"].window
+        self.assertAlmostEqual(actual_rate, 4.0 / 250, places=12)
+        self.assertAlmostEqual(naive_rate / actual_rate, 2.5, places=6)
+
+    def test_survivor_threshold_scales_down_not_up(self):
+        st = self._states(window=250, survivor=100)
+        self.assertLess(st["mature"].thresh, st["newborn"].thresh)
+        self.assertAlmostEqual(st["mature"].thresh, 1.6, places=9)
+
+    def test_the_armed_line_reports_both_windows(self):
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        body = inspect.getsource(g.GBSpecialBase._converge_state_for)
+        self.assertIn("(newborn) / %d (survivor", body)
+
+
 class UngroupedPathHasNoConvergenceAndSaysSoTest(unittest.TestCase):
     """``GB_RJ_GROUPED_INMODEL=0`` silently disables the whole rule.
 
