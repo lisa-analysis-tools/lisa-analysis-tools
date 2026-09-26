@@ -479,7 +479,7 @@
 
 # ---- fill these in ---------------------------------------------------------
 #SBATCH --job-name=gf3mo_v9_2gpu     # job name
-#SBATCH --partition=gpu-80-spot   # DEFAULT partition (2-GPU flow); the
+#SBATCH --partition=gpu-80-ondemand   # DEFAULT partition (2-GPU flow); the
                                   # NGPUS self-dispatch below overrides it
 #SBATCH --gres=gpu:2              # DEFAULT 2 GPUs (GPUS below are LOCAL indices)
 #SBATCH --nodes=1                 # DEFAULT 1 node; NGPUS=4 -> 2 nodes (below)
@@ -499,8 +499,8 @@ set -euo pipefail
 
 # ---- GPU-count self-dispatch + rank-layout knobs (2026-09-16: rank count
 # ---- now derives from the GPU count) ---------------------------------
-# NGPUS=2 -> gpu-80-spot, 1 node x 2 GPUs (default, unchanged partition);
-# NGPUS=4 -> gpu-80-spot, 2 NODES x 2 GPUs each -- the cluster's real 4-GPU
+# NGPUS=2 -> gpu-80-ondemand, 1 node x 2 GPUs (the default here);
+# NGPUS=4 -> gpu-80-ondemand, 2 NODES x 2 GPUs each -- the real 4-GPU
 # allocation shape (there is no single 4-GPU node; see the design spec's
 # "Context" section). #SBATCH lines are static comments, so neither the
 # partition/node/task count can follow an env var through a plain
@@ -508,10 +508,10 @@ set -euo pipefail
 # count and it submits itself with the matching flags:
 #
 #     NGPUS=2 ./submit_gf_3mo_v9_2gpu.sh # THE INTENDED INVOCATION
-#                                        # (gpu-80-spot, 1 node x gpu:2)
+#                                        # (gpu-80-ondemand, 1 node x gpu:2)
 #     NGPUS=4 ./submit_gf_3mo_v9_2gpu.sh # 2 NODES x 2 GPUs, on-demand
 #     sbatch  ./submit_gf_3mo_v9_2gpu.sh # legacy flow: header defaults above
-#                                        # (2 GPUs, gpu-80-spot, --ntasks=3)
+#                                        # (2 GPUs, gpu-80-ondemand, --ntasks=3)
 #
 # ⚠ THIS RUN IS THE FIRST PRODUCTION SHAPE WITH NWALKERS > NGPUS. At NGPUS=2
 # the walker-block layout gives N_COMPUTE = 1 node x 2 GPUs x RANKS_PER_GPU 1
@@ -519,11 +519,11 @@ set -euo pipefail
 # NWALKERS=4 divides cleanly at TWO walkers per rank. Consequences to expect
 # rather than discover: per-rank rows DOUBLE against the 6mo 4-GPU shape
 # (1 walker/rank there), total resident sub-band slots halve (GB_N_SUBBANDS is
-# PER GPU, so per-GPU memory is unchanged and only the pass count moves), and
-# NGPUS=2 is a SPOT partition -- which makes MIDIT_CHECKPOINT load-bearing
-# rather than a nicety. GF_LAYOUT_DRY_RUN=1 prints every rank's placement and
-# stops before the build allocates anything.
-#                                        # (2 GPUs, gpu-80-spot, --ntasks=3)
+# PER GPU, so per-GPU memory is unchanged and only the pass count moves).
+# BOTH GPU counts run ON-DEMAND here, so a silent preemption is no longer
+# the expected way for this run to die; MIDIT_CHECKPOINT stays on anyway.
+# GF_LAYOUT_DRY_RUN=1 prints every rank's placement and stops before the
+# build allocates anything.
 #
 # GPUS_PER_RANK (empty = AUTO) / RANKS_PER_GPU (default 1) size the compute
 # rank count: N_COMPUTE = NGPUS * RANKS_PER_GPU / GPUS_PER_RANK.
@@ -540,7 +540,7 @@ set -euo pipefail
 #
 # Inside the job, the GPU list further below derives from what slurm
 # ACTUALLY granted (SLURM_GPUS_ON_NODE), so a manual
-# `sbatch --partition=gpu-80-spot --gres=gpu:2 --nodes=2 <script>` also
+# `sbatch --partition=gpu-80-ondemand --gres=gpu:2 --nodes=2 <script>` also
 # works.
 if [ -z "${SLURM_JOB_ID:-}" ]; then
   NGPUS=${NGPUS:-2}
@@ -548,7 +548,15 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
   RANKS_PER_GPU=${RANKS_PER_GPU:-1}
   _k=${GPUS_PER_RANK:-1}
   case "${NGPUS}" in
-    2) _NGPU_PART=gpu-80-spot; _NODES=1; _GRES=gpu:2 ;;
+    # ON-DEMAND AT EVERY GPU COUNT (user ruling 2026-09-26). The 6mo script
+    # sends NGPUS=2 to spot because a 1-node job is cheap to lose and the
+    # midit checkpoint recovers it. THIS RUN HAS ALREADY PAID THAT BILL:
+    # job 633 ran 43 minutes of gb_search_1 on gpu-80-spot and was killed
+    # with NO traceback, no abort marker and no further saved iteration --
+    # the log simply stops mid-move, and the relaunch (job 636) had to pick
+    # up from stored iteration 1 on ondemand anyway.
+    # PARTITION=<name> overrides either row without editing this file.
+    2) _NGPU_PART=${PARTITION:-gpu-80-ondemand}; _NODES=1; _GRES=gpu:2 ;;
     # NGPUS=4 -> ON-DEMAND (user ruling 2026-09-18). The 4-GPU shape is
     # 2 nodes x 2 GPUs, and on spot a preemption of EITHER node kills the
     # whole MPI world -- twice the exposure of the 1-node flow for the

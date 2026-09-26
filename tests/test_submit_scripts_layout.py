@@ -1453,7 +1453,13 @@ class SubmitScriptsDispatchTest(unittest.TestCase):
                 lines = self._run_dispatch(script, {"NGPUS": "2"})
                 self.assertIn("--ntasks=3", lines)
                 self.assertIn("--nodes=1", lines)
-                self.assertIn("--partition=gpu-80-spot", lines)
+                # The 3mo v9 run goes ON-DEMAND at every GPU count
+                # (user ruling 2026-09-26): its job 633 lost 43 min of
+                # gb_search_1 to a silent spot kill. Every other script
+                # keeps spot at NGPUS=2, where 1 node is cheap to lose.
+                want = ("gpu-80-ondemand" if script == THREE_MO_V9
+                        else "gpu-80-spot")
+                self.assertIn(f"--partition={want}", lines)
                 self.assertIn("--gres=gpu:2", lines)
                 self._assert_export_contains(lines, "GF_LEGACY_RANK_LAYOUT=0")
 
