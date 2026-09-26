@@ -2343,3 +2343,130 @@ class BlockCannotStopBeforeTheWindowTest(unittest.TestCase):
         arithmetic in the comment stays checkable."""
         import lisatools.globalfit.moves.gbspecialstretch as g
         self.assertEqual(g._CONVERGE_POLL_EVERY, 5)
+
+
+def _strip_comments(body):
+    """Drop ``#`` comment tails from a constructor body.
+
+    Without this the assertions below are satisfied by a COMMENT naming
+    the kwarg dict -- which is exactly how the first version of this test
+    passed its own negative control (2026-09-26). The rule is about what
+    is passed, not what is mentioned.
+    """
+    out = []
+    for line in body.splitlines():
+        # No string literal in these ctor bodies contains a '#', so a
+        # plain split is safe here and keeps the helper honest-simple.
+        out.append(line.split("#", 1)[0])
+    return "\n".join(out)
+
+
+class AllRJMovesShareTheClassRulesTest(unittest.TestCase):
+    """USER RULE 2026-09-26: "our newborn/survivor rules should be the same
+    for all rj moves".
+
+    The per-class budgets reach a move ONLY as the ``_imr_search`` /
+    ``_imr_defaults`` kwarg dict built in ``recipe.py``. A constructor that
+    omits it does not error and does not warn -- it silently falls through
+    to the move's own ``{BRANCH}_MODE`` fallback, so the move runs a
+    DIFFERENT newborn/survivor policy from its siblings in the same cycle.
+    ``rj_refit_search`` and ``rj_refit`` were exactly that (found
+    2026-09-26); this pins every RJ constructor so the next one cannot
+    repeat it.
+
+    Source-level on purpose: building a recipe needs a data load, and the
+    defect is a missing kwarg at the call site, which is visible in the
+    source and nowhere else.
+    """
+
+    #: Not RJ moves -- the in-model-only and VGB moves take the group rule
+    #: (``_InModelGroupState``) and the vgb branch's own knobs.
+    NOT_RJ = frozenset({"vgb"})
+
+    @staticmethod
+    def _constructors():
+        """``[(move_name, ctor_body), ...]`` for every named move."""
+        import re
+        from pathlib import Path
+
+        import lisatools.globalfit.recipe as r
+
+        src = Path(r.__file__).read_text()
+        out = []
+        for m in re.finditer(r"=\s*_?(?:RJ\w+|GBSpecial\w+|\w*Move\w*)\(", src):
+            i = src.index("(", m.end() - 1)
+            depth = 0
+            for j in range(i, len(src)):
+                if src[j] == "(":
+                    depth += 1
+                elif src[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+            body = src[i:j]
+            nm = re.search(r'name\s*=\s*"([^"]+)"', body)
+            if nm:
+                out.append((nm.group(1), _strip_comments(body)))
+        return out
+
+    def test_the_parser_sees_the_moves_we_know_are_there(self):
+        """A parser that silently matched nothing would make every
+        assertion below vacuously true."""
+        names = {n for n, _ in self._constructors()}
+        for expected in ("rj_warm_search", "rj_fstat_search",
+                         "rj_prior_removal", "rj_replace", "rj_refit_search",
+                         "rj_refit"):
+            self.assertIn(expected, names)
+
+    def test_every_rj_move_carries_a_per_class_repeat_dict(self):
+        missing = [
+            n for n, body in self._constructors()
+            if n.startswith("rj_") and n not in self.NOT_RJ
+            and not any(k in body for k in ("_imr_search", "_imr_defaults",
+                                            "_imr_pe"))
+        ]
+        self.assertEqual(
+            missing, [],
+            "RJ move(s) built without the shared newborn/survivor budgets; "
+            "they fall through to the {BRANCH}_MODE fallback and run a "
+            "different policy from the rest of the cycle: %r" % (missing,),
+        )
+
+    def test_search_named_rj_moves_all_take_the_SEARCH_dict(self):
+        """Search-named moves only ever run in search recipes, so they take
+        ``_imr_search`` unconditionally -- resolving by mode would let a
+        GB_MODE slip hand one of them the PE budgets."""
+        for n, body in self._constructors():
+            if n.startswith("rj_") and n.endswith("_search"):
+                self.assertIn("_imr_search", body, n)
+
+    def test_the_two_dicts_carry_the_same_KEYS(self):
+        """Search and PE may differ in VALUES; a key present in one and
+        absent from the other is a class rule that reaches only one
+        stage."""
+        import re
+        from pathlib import Path
+
+        import lisatools.globalfit.recipe as r
+
+        src = Path(r.__file__).read_text()
+
+        def keys(var):
+            i = src.index("%s = {" % var)
+            j = src.index("}", i)
+            return set(re.findall(r'"([^"]+)"\s*:', src[i:j]))
+
+        self.assertEqual(keys("_imr_search"), keys("_imr_pe"))
+        self.assertIn("inmodel_repeats_newborn_default", keys("_imr_search"))
+        self.assertIn("inmodel_repeats_survivor_default", keys("_imr_search"))
+
+    def test_the_converge_window_knobs_are_env_only(self):
+        """The window/dll/classes half of the rule must NOT be passed per
+        move -- it is branch-scoped env, which is what makes all three
+        armed lines identical in production. A ctor kwarg here would be a
+        per-move override that no log line would reveal."""
+        for n, body in self._constructors():
+            for knob in ("inmodel_converge_iters=", "inmodel_converge_dll=",
+                         "inmodel_converge_classes=",
+                         "inmodel_converge_iters_survivor="):
+                self.assertNotIn(knob, body, "%s sets %s per move" % (n, knob))

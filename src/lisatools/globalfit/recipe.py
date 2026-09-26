@@ -3907,8 +3907,14 @@ def build_gb_moves(
             fp=_refit_fp,
             phase_maximize=_rj_phase_max,  # gb_info["pe_info"]["rj_phase_maximize"],
             gpus=[],
+            # _imr_search like every other search-named RJ move (user rule
+            # 2026-09-26: "our newborn/survivor rules should be the same for
+            # all rj moves"). Without it this move alone fell through to the
+            # move's own env-mode fallback -- the same silent
+            # knob-reaches-nothing shape that has bitten this run before.
             **{**gb_move_kwargs, "leaf_cap_update": False,
-               "rj_flip_fraction_default": _search_rj_flip_default()}
+               "rj_flip_fraction_default": _search_rj_flip_default(),
+               **_imr_search}
         )
         gb_search_refit_move.accepted = np.zeros((ntemps, nwalkers_local))
         gb_search_refit_move.install_walker_fanout(curr)
@@ -4547,7 +4553,10 @@ def build_gb_moves(
             fp=_refit_fp,
             phase_maximize=False,  # gb_info["pe_info"]["rj_phase_maximize"],
             gpus=[],
-            **{**gb_move_kwargs, "leaf_cap_update": False, **_pe_cap_off}
+            # _imr_defaults like every other pe-named RJ move -- see the
+            # matching note on rj_refit_search.
+            **{**gb_move_kwargs, "leaf_cap_update": False,
+               **_imr_defaults, **_pe_cap_off}
         )
         gb_pe_refit_move.accepted = np.zeros((ntemps, nwalkers_local))
         gb_pe_refit_move.install_walker_fanout(curr)
