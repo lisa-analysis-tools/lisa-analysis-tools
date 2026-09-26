@@ -3118,10 +3118,41 @@ export GB_FSTAT_CTR_BATCH
 : "${GB_FSTAT_NM_LANE_WEIGHTS:=}"
 export GB_FSTAT_NM_LANE_WEIGHTS
 export GB_TEMPER_ON_REMOVAL=1      # band swaps run inside rj_prior_removal
-# rj_prior_removal proposes prior BIRTHS as well as deaths in this run
-# (what the 2026-09-21 hand edit did from stored iteration 300 on). The
-# code default is 1 = the original deaths-only pruning move.
-export GB_SEARCH_PRIOR_REMOVAL_ONLY=0
+# ---- PRUNING IS BACK ON (user ruling 2026-09-26) ---------------------
+# 0 -> 1, i.e. back to the CODE DEFAULT and to the original deaths-only
+# pruning move: every BIRTH row of this move's RJ step is force-rejected
+# (curr_logp = -inf routes it through the existing keep machinery, so it
+# never reaches the likelihood kernel) and only DEATHS are judged.
+#
+# The 0 was inherited, not chosen for v9: a 2026-09-21 hand edit in
+# recipe.py for the OLD 6mo run from stored iteration 300 on, promoted to
+# a knob on 09-22 with the default left at 1.
+#
+# WHY BACK: with 0 there was NO dedicated pruning anywhere in the cycle --
+# rj_prior_removal proposed births too, and rj_replace is now off. Job 634
+# gb_search_1 iteration 1 measured +312 leaves/walker with only 8 cold RJ
+# accepts from this move, and walker 0 has carried a split source at
+# 19.6682 mHz across several iterations of the previous run.
+#
+# ⚠ NOT SELF-REVERSIBLE, and that is accepted: "a death-only kernel is not
+# self-reversible, so this is NOT a valid MH move on its own -- the USER
+# has explicitly waived detailed-balance concerns for search mode. Pair it
+# with a birth-capable RJ move in the same stage cycle; never use in PE."
+# The condition holds here: rj_warm_search and rj_fstat_search are both
+# birth-capable and share every gb_search cycle. PE is unaffected --
+# GB_PE_RJ_REPLACE / the pe-named moves do not take this.
+#
+# ★ SIDE BENEFIT, worth knowing when reading the logs: with deaths-only,
+# every accept of this move IS a removal, so [GB_ACCEPT rj_prior_removal]
+# "rj cold X/Y" finally reads as a straight cold-removal count. At 0 it
+# was births and deaths mixed and there was no way to separate them --
+# the rj-split line labels everything "births" even here.
+#
+# One setting, all four gb_search stages: the move is built ONCE
+# (recipe.py) and resolved by name in every stage, and the per-stage
+# profile writes only opt_snr / phase_maximize / peak_min_snr. It cannot
+# vary per stage.
+export GB_SEARCH_PRIOR_REMOVAL_ONLY=1
 # High-f barren-band birth shutoff (search scope): bands above FMIN with
 # AFTER consecutive zero-birth-accept proposes stop proposing births
 # (deaths + in-model continue; [GB_BAND_SHUTOFF] log line per band).

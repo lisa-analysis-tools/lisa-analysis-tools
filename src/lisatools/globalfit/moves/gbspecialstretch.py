@@ -2544,10 +2544,23 @@ class _InModelGroupState:
         beginning of the in-model-only move and the end of 1 iteration,
         then that one gets shut off. Otherwise we use 2 to shut off."*
 
-        A pair whose accepted ``delta_ll`` is EXACTLY zero on every rung
-        moved nowhere in the entire ladder during a full pass -- not cold,
-        not hot -- so there is nothing for a second pass to measure. It
-        retires at pass 1 instead of waiting out the window.
+        THE TEST IS ON THE MAX, NOT ON THE ACTIVITY. Per ``(walker, band)``
+        the running gain is tracked on EVERY rung and the pair's statistic
+        is the maximum of those across the ladder -- its best rung. If that
+        maximum does not reach a new high over the pass, the column's best
+        configuration did not improve anywhere and the pair retires at pass
+        1 instead of waiting out the window.
+
+        ⚠ A pair may be BUSY and still retire: *"It can have delta_ll, but
+        over the course of the 1 iteration beginning to end, the max logL
+        did not adjust at all."* Accepted moves that shuffle a cell without
+        lifting its best rung are exactly the churn this is meant to stop
+        paying for. An earlier draft tested ``delta_ll == 0 everywhere``,
+        which only caught the completely dead pairs and missed that case.
+
+        This is the same ``best = max(best, ...)`` idiom the windowed rule
+        uses, over the ladder instead of the cold rung alone and with a
+        window of one pass.
 
         WHY THIS MATTERS: the window is a FLOOR. Passes 1..W shut nothing
         because a pair needs W passes of history before the ring test can
@@ -2569,6 +2582,8 @@ class _InModelGroupState:
         """
         if self._best is None:
             self._alloc(xp, tuple(cold_delta.shape))
+            self._gain_all = None      # (ntemps, nw, nb), lazily sized
+            self._max_best = None      # (nw, nb) running max over the ladder
         occupied = occ_count > 0
         self.occupied = occupied
         self.occ_count = occ_count
@@ -2589,10 +2604,19 @@ class _InModelGroupState:
         # Counted separately so the log can say how much of the shutoff
         # came from here rather than from the windowed rule.
         self.static_shut = 0
-        if all_temp_delta is not None and self.passes == 0:
-            _static = (xp.asarray(all_temp_delta) == 0).all(axis=0) & occupied
-            self.static_shut = int(xp.count_nonzero(_static & ~self.shut))
-            flat = flat | _static
+        if all_temp_delta is not None:
+            _atd = xp.asarray(all_temp_delta)
+            if self._gain_all is None:
+                self._gain_all = xp.zeros_like(_atd)
+                self._max_best = xp.zeros_like(self._gain_all[0])
+            self._gain_all = self._gain_all + _atd
+            _m_new = self._gain_all.max(axis=0)
+            _improved = _m_new > self._max_best
+            self._max_best = xp.maximum(self._max_best, _m_new)
+            if self.passes == 0:
+                _static = (~_improved) & occupied
+                self.static_shut = int(xp.count_nonzero(_static & ~self.shut))
+                flat = flat | _static
         self.shut = self.shut | flat | (~occupied)
         self.shut_at = xp.where(self.shut & ~was, self.passes + 1,
                                 self.shut_at)

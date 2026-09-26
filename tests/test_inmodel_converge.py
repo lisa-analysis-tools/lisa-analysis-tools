@@ -2173,6 +2173,33 @@ class GroupStaticOnePassShutoffTest(unittest.TestCase):
                          "movement anywhere in the ladder must hold it open")
         self.assertEqual(st.static_shut, self.NW * self.NB - 1)
 
+    def test_a_BUSY_pair_whose_MAX_did_not_rise_also_retires(self):
+        """The case my first draft missed. User ruling 2026-09-26: "It can
+        have delta_ll, but over the course of the 1 iteration beginning to
+        end, the max logL did not adjust at all" -- accepted moves that
+        shuffle a cell without lifting its best rung are exactly the churn
+        this is meant to stop paying for. A ``delta_ll == 0 everywhere``
+        test only catches the completely dead pairs."""
+        st = self._state()
+        allt = np.zeros((self.NT, self.NW, self.NB))
+        allt[0, 0, 0] = -5.0        # busy, but DOWN
+        allt[1, 0, 0] = -2.0
+        allt[2, 0, 0] = -0.1
+        self.assertNotEqual(float(np.abs(allt).sum()), 0.0, "must be busy")
+        st.update(np, allt[0], self._occ(), all_temp_delta=allt)
+        self.assertTrue(bool(np.asarray(st.shut)[0, 0]),
+                        "max never rose, so it must retire at pass 1")
+
+    def test_a_pair_whose_max_ROSE_stays_open_even_if_others_fell(self):
+        """The discriminator: one rung up is enough, however much the rest
+        moved down. The statistic is the MAX over the ladder."""
+        st = self._state()
+        allt = np.zeros((self.NT, self.NW, self.NB))
+        allt[0, 0, 0] = -50.0
+        allt[2, 0, 0] = +0.5        # one rung reached a new high
+        st.update(np, allt[0], self._occ(), all_temp_delta=allt)
+        self.assertFalse(bool(np.asarray(st.shut)[0, 0]))
+
     def test_the_control_without_the_ladder_nothing_shuts_at_pass_1(self):
         """THE CONTROL. Same static input, fast path not armed: the window
         is 2, so pass 1 can retire nothing. If this ever passes, the test

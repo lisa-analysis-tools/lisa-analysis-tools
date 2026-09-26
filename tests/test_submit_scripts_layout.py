@@ -606,6 +606,12 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # rj_replace -- a third pure in-model pass over rows the
             # other two slots already polished, 14% of an iteration.
             "GB_SEARCH_IN_MODEL_REPLACE",
+            # V9-18 (2026-09-26): pruning back ON. v8 ran 0 (prior
+            # births AND deaths, inherited from a 2026-09-21 hand
+            # edit); v9 returns to the code default 1 = deaths only,
+            # because with rj_replace off there was no dedicated
+            # pruning move left anywhere in the cycle.
+            "GB_SEARCH_PRIOR_REMOVAL_ONLY",
         }
         drift = {
             k: (self.v8.get(k), self.v9.get(k))
