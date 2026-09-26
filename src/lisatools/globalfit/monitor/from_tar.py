@@ -1,0 +1,168 @@
+"""``snapshot.tar.gz`` -> monitor page, in one command.
+
+    python -m lisatools.globalfit.monitor.from_tar SNAPSHOT.tar.gz [OUT.html]
+
+This is the loop that was being done by hand on every snapshot: make a
+scratch directory, untar, hunt for the run directory somewhere under
+``shared/data/global_fit_output/<run>/``, then call the generator with
+that path. Each step is easy and each one is easy to get subtly wrong --
+pointing the generator at the tar's ROOT, for instance, renders a page
+with every panel missing and no error.
+
+Defaults chosen so the common case is zero flags:
+
+* the run directory is DISCOVERED (the deepest directory holding a
+  ``*testing*.h5``), so the tar's internal layout does not matter;
+* the output lands beside the tarball, named after the run, unless a
+  second argument says otherwise;
+* extraction goes to a scratch directory that is REUSED when it already
+  holds the same tar (``--fresh`` forces a re-extract), because a 130 MB
+  archive is slow to unpack and usually gets rendered more than once;
+* ``MOJITO_INFO_PATH`` is checked up front, because the two things it
+  feeds -- the PSD truth lines and the residual/data panels -- degrade
+  SILENTLY without it, one to the analytic injection and the other to
+  no panels at all.
+
+The page itself is produced by :func:`lisatools.globalfit.monitor.build_monitor`,
+so it is the same fresh-interpreter path as the saver-rank hook and the
+old script entry point -- byte-identical output, not a reimplementation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import shutil
+import sys
+import tarfile
+import time
+
+
+def _default_scratch() -> str:
+    base = (os.environ.get("TMPDIR") or "/tmp").rstrip("/")
+    return os.path.join(base, "gf_monitor_from_tar")
+
+
+def _tar_key(tar_path: str) -> str:
+    """Identity of a tarball without reading 130 MB of it.
+
+    Path + size + mtime. A re-downloaded snapshot with the same name gets
+    a new mtime and therefore a new key, which is the case that matters:
+    the browser names them all ``... (3).gz`` and reusing a stale
+    extraction silently renders the wrong iteration.
+    """
+    st = os.stat(tar_path)
+    h = hashlib.sha1(
+        f"{os.path.abspath(tar_path)}|{st.st_size}|{st.st_mtime_ns}".encode()
+    ).hexdigest()[:16]
+    return h
+
+
+def find_run_dir(root: str) -> str | None:
+    """The run directory inside an extracted snapshot.
+
+    The deepest directory containing a live-looking store. Backups,
+    corrupt copies and extracts are all accepted here -- a snapshot tar
+    normally ships ONLY the ``*_extract.h5``, so requiring a full store
+    would find nothing.
+    """
+    best = None
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        if any(fn.endswith(".h5") and "testing" in fn for fn in filenames):
+            depth = dirpath.count(os.sep)
+            if best is None or depth > best[0]:
+                best = (depth, dirpath)
+    return best[1] if best else None
+
+
+def extract(tar_path: str, scratch: str, fresh: bool = False) -> str:
+    """Untar into a per-tarball scratch directory. Returns that directory."""
+    dest = os.path.join(scratch, _tar_key(tar_path))
+    stamp = os.path.join(dest, ".extracted")
+    if fresh and os.path.isdir(dest):
+        shutil.rmtree(dest, ignore_errors=True)
+    if os.path.exists(stamp):
+        print(f"[from_tar] reusing extraction at {dest} (--fresh to redo)")
+        return dest
+    os.makedirs(dest, exist_ok=True)
+    st = time.perf_counter()
+    with tarfile.open(tar_path, "r:*") as tf:
+        # filter="data" refuses absolute paths and ../ escapes. It is the
+        # default from Python 3.14 and a warning before that; setting it
+        # explicitly keeps behaviour identical across versions.
+        try:
+            tf.extractall(dest, filter="data")
+        except TypeError:                      # pragma: no cover - <3.12
+            tf.extractall(dest)
+    open(stamp, "w").close()
+    print(f"[from_tar] extracted {os.path.basename(tar_path)} in "
+          f"{time.perf_counter() - st:.1f} s -> {dest}")
+    return dest
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="python -m lisatools.globalfit.monitor.from_tar",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("tar", help="the gf_prod_*_snapshot.tar.gz")
+    ap.add_argument("out", nargs="?", default=None,
+                    help="output .html (default: beside the tar, named "
+                         "after the run directory)")
+    ap.add_argument("--scratch", default=None,
+                    help=f"extraction root (default {_default_scratch()})")
+    ap.add_argument("--fresh", action="store_true",
+                    help="re-extract even if this tar was unpacked before")
+    ap.add_argument("--run-dir", default=None,
+                    help="skip discovery and render this directory")
+    ap.add_argument("--timeout", type=float, default=1800.0,
+                    help="seconds before the page build is killed")
+    a = ap.parse_args(argv)
+
+    if not os.path.isfile(a.tar):
+        ap.error(f"{a.tar} is not a file")
+
+    # Checked BEFORE the slow work: both things this feeds degrade
+    # silently, and finding out after a 2-minute render is the annoying
+    # way to learn it.
+    if not os.environ.get("MOJITO_INFO_PATH"):
+        print(
+            "[from_tar] WARNING: MOJITO_INFO_PATH is unset. The page will "
+            "use the ANALYTIC PSD injection instead of a fit to the brick, "
+            "and -- unless the laptop default happens to hold them -- will "
+            "DROP the residual-spectrum and data/template/residual panels "
+            "with no error. Point it at the directory containing "
+            "catalogues/ and data/.", file=sys.stderr)
+
+    root = a.run_dir or extract(
+        a.tar, a.scratch or _default_scratch(), fresh=a.fresh)
+    run_dir = a.run_dir or find_run_dir(root)
+    if run_dir is None:
+        print(f"[from_tar] no run directory (a dir holding *testing*.h5) "
+              f"under {root}", file=sys.stderr)
+        return 2
+    print(f"[from_tar] run dir: {run_dir}")
+
+    out = a.out or os.path.join(
+        os.path.dirname(os.path.abspath(a.tar)),
+        f"{os.path.basename(run_dir.rstrip('/'))}_monitor.html")
+
+    from . import build_monitor
+
+    st = time.perf_counter()
+    try:
+        build_monitor(run_dir, out, timeout=a.timeout)
+    except Exception as e:                       # noqa: BLE001
+        print(f"[from_tar] page build FAILED ({type(e).__name__}: {e})",
+              file=sys.stderr)
+        return 1
+    print(f"[from_tar] wrote {out} "
+          f"({os.path.getsize(out) / 1048576.0:.1f} MB) in "
+          f"{time.perf_counter() - st:.1f} s")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
