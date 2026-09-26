@@ -4682,6 +4682,315 @@ if SEARCH_SPLIT_ROWS:
 else:
     SEARCH_SPLIT_HTML = "<i>no [GF_TIMING] per-iteration records in this log</i>"
 
+# ======================= SEARCH GATES (2026-09-26) =========================
+# User ask: "update the html to be more reflective of the new gates and
+# settings in the run. Like the shutoffs in a given recipe stage and the
+# status of those as the run evolves."
+#
+# The v9 search is governed by four gates that the page could not see, and
+# each of them can be ARMED AND REACHING NOTHING -- the failure shape this
+# run has hit repeatedly. Every panel below is therefore built to answer
+# "is this gate doing anything", not just "what is it set to".
+#
+#   1. per-(walker, band) RJ shutoff  -- and since GB_SEARCH_STAGE_END_ON_
+#      SHUTOFF it is THE stage-end criterion, so its progress is progress
+#      toward the next recipe stage.
+#   2. [GB_CELL_LL] reconciliation    -- the only instrument that catches a
+#      mis-credited cell ledger, and the one the all-rungs vertical swap
+#      was gated on.
+#   3. the vertical swap ladder       -- per rung pair, plus the all-rungs
+#      unpriceable drops.
+#   4. in-model convergence           -- newborn vs survivor repeats and
+#      how many rows sit exactly on the floor.
+_GATE_SHUT = re.compile(
+    r"\[GB_STAGE (\w+)\] per-walker RJ shutoff: (\d+) \(walker, band\) pairs "
+    r"converged.*?(\d+) of (\d+) pairs now shut")
+_GATE_INERT = re.compile(
+    r"\[GB_STAGE (\w+)\] per-walker RJ valve is currently inert")
+_GATE_LIVE = re.compile(
+    r"\[GB_STAGE (\w+)\] per-walker RJ shutoff valve is LIVE "
+    r"\((\d+) walkers x (\d+) bands, window (\d+)")
+_GATE_CELLLL_UNIT = re.compile(r"\[GB_CELL_LL (\w+)\] unit:")
+_GATE_CELLLL_EXC = re.compile(
+    r"\[GB_CELL_LL (\w+)\] per-repeat sampled-vs-actual diff ([\d.eE+-]+) "
+    r"exceeds its temperature-scaled allowance ([\d.eE+-]+) \(temp (\d+)")
+_GATE_VERT = re.compile(
+    r"\[GB_VERT (\w+)\][^\n]*?proposed (\d+) accepted (\d+)")
+_GATE_VERT_DROP = re.compile(r"ALL-RUNGS on, (\d+) pair\(s\) dropped")
+_GATE_RUNGPAIR = re.compile(r"T(\d+)-T(\d+): (\d+)/(\d+)")
+_GATE_IMCONV = re.compile(
+    r"\[GB_IMCONV (\w+)\] (\w+) calibration: repeats p10/p50/p90/max = "
+    r"(\d+)/(\d+)/(\d+)/(\d+), AT FLOOR \(<=(\d+)\) (\d+) \(([\d.]+)%\)")
+_GATE_ARMED = re.compile(r"\[GB_IMCONV (\w+)\] armed \(on\): ([^\n]+)")
+_GATE_STAGE_END = re.compile(r"\[V9-STAGE ([\w-]+)\] ([^\n]{0,150})")
+# The richest progress series there is: it fires every 10 checks and counts
+# the OCCUPIED pairs still paying, i.e. exactly what has to reach zero for
+# the stage to end under GB_SEARCH_STAGE_END_ON_SHUTOFF.
+_GATE_ACTIVE = re.compile(
+    r"\[V9-STAGE ([\w-]+)\] running: (\d+) occupied \(walker, band\) "
+    r"pair\(s\) still active")
+
+GATES_HTML = ""
+NAV_GATES = ""
+_g_shut = {}          # move -> [(shut, total), ...] in log order
+_g_live = {}          # move -> (nwalkers, nbands, window)
+_g_ll_unit = {}       # move -> count of unit reports
+_g_ll_exc = {}        # move -> [ratio, ...]
+_g_ll_cold = {}       # move -> cold-rung exceedances
+_g_vert = {}          # move -> [(proposed, accepted), ...]
+_g_drop = 0
+_g_rung = {}          # cold rung -> [accepted, proposed]
+_g_imconv = {}        # (move, cls) -> [(p50, floor, atfloor_pct), ...]
+_g_armed = {}
+_g_stage_lines = []
+_g_active = {}       # stage -> [occupied-still-active, ...]
+if log_text:
+    for _m in _GATE_SHUT.finditer(log_text):
+        _g_shut.setdefault(_m.group(1), []).append(
+            (int(_m.group(3)), int(_m.group(4))))
+    for _m in _GATE_LIVE.finditer(log_text):
+        _g_live[_m.group(1)] = (int(_m.group(2)), int(_m.group(3)),
+                                int(_m.group(4)))
+    for _m in _GATE_CELLLL_UNIT.finditer(log_text):
+        _g_ll_unit[_m.group(1)] = _g_ll_unit.get(_m.group(1), 0) + 1
+    for _m in _GATE_CELLLL_EXC.finditer(log_text):
+        _mv = _m.group(1)
+        try:
+            _g_ll_exc.setdefault(_mv, []).append(
+                float(_m.group(2)) / max(float(_m.group(3)), 1e-30))
+        except ValueError:
+            pass
+        if int(_m.group(4)) == 0:
+            _g_ll_cold[_mv] = _g_ll_cold.get(_mv, 0) + 1
+    for _m in _GATE_VERT.finditer(log_text):
+        _g_vert.setdefault(_m.group(1), []).append(
+            (int(_m.group(2)), int(_m.group(3))))
+    for _m in _GATE_VERT_DROP.finditer(log_text):
+        _g_drop += int(_m.group(1))
+    for _m in _GATE_RUNGPAIR.finditer(log_text):
+        _r = _g_rung.setdefault(int(_m.group(1)), [0, 0])
+        _r[0] += int(_m.group(3)); _r[1] += int(_m.group(4))
+    for _m in _GATE_IMCONV.finditer(log_text):
+        _g_imconv.setdefault((_m.group(1), _m.group(2)), []).append(
+            (int(_m.group(4)), int(_m.group(7)), float(_m.group(9))))
+    for _m in _GATE_ARMED.finditer(log_text):
+        _g_armed[_m.group(1)] = _m.group(2).strip()
+    for _m in _GATE_ACTIVE.finditer(log_text):
+        _g_active.setdefault(_m.group(1), []).append(int(_m.group(2)))
+    for _m in _GATE_STAGE_END.finditer(log_text):
+        _t = _m.group(2).strip()
+        if ("STAGE COMPLETE" in _t or "holding the stage open" in _t
+                or "still active" in _t):
+            _g_stage_lines.append(f"{_m.group(1)}: {_t}")
+
+if _g_shut or _g_vert or _g_ll_unit or _g_imconv:
+    _np_ = 4
+    fig, ax = plt.subplots(1, _np_, figsize=(16.5, 3.4))
+
+    # --- 1. shutoff progress = progress toward the next recipe stage ----
+    # The ACTIVE count is the real progress series: it is what has to
+    # reach ZERO for the stage to end, it is reported every 10 checks, and
+    # -- unlike "% shut" -- it moves when new births create new occupied
+    # pairs, which is the thing that can push the stage end AWAY.
+    if _g_active:
+        for _st, _seq in sorted(_g_active.items()):
+            ax[0].plot(range(1, len(_seq) + 1), _seq, marker="o", ms=3,
+                       color=AMBER, label=f"{_st} still active")
+            if len(_seq) >= 2:
+                _tr = _seq[-1] - _seq[0]
+                ax[0].text(
+                    0.03, 0.06,
+                    ("RISING +%d over %d checks: births are opening pairs "
+                     "faster than\nthey shut, so the stage end is moving "
+                     "AWAY" % (_tr, len(_seq))) if _tr > 0 else
+                    ("falling %d over %d checks" % (_tr, len(_seq))),
+                    color=(RED if _tr > 0 else GREEN), fontsize=7,
+                    transform=ax[0].transAxes)
+        ax[0].axhline(0.0, color=GREEN, ls="--", lw=1)
+        ax[0].set_ylabel("occupied pairs still active")
+        ax[0].set_xlabel("stage check")
+        ax[0].legend(fontsize=7)
+        ax[0].set_title("progress to stage end (0 = stage ends)")
+    elif _g_shut:
+        for _mv, _seq in sorted(_g_shut.items()):
+            _y = [100.0 * s / max(t, 1) for s, t in _seq]
+            ax[0].plot(range(1, len(_y) + 1), _y, marker="o", ms=3,
+                       label=_mv)
+        ax[0].axhline(100.0, color=GREEN, ls="--", lw=1)
+        ax[0].set_ylim(0, 105)
+        ax[0].legend(fontsize=7)
+        ax[0].set_ylabel("% of pairs shut")
+        ax[0].set_xlabel("shutoff report")
+        ax[0].set_title("(walker, band) pairs shut off")
+    else:
+        ax[0].text(0.5, 0.5, "no shutoff reports", ha="center",
+                   va="center", color=DIM, transform=ax[0].transAxes)
+        ax[0].set_title("progress to stage end")
+
+    # --- 2. the [GB_CELL_LL] instrument ---------------------------------
+    if _g_ll_unit:
+        _mvs = sorted(set(_g_ll_unit) | set(_g_ll_exc))
+        _rate = [100.0 * len(_g_ll_exc.get(m, [])) / max(_g_ll_unit.get(m, 1), 1)
+                 for m in _mvs]
+        _xx = np.arange(len(_mvs))
+        _cols = [RED if r > 50 else (AMBER if r > 5 else GREEN)
+                 for r in _rate]
+        ax[1].bar(_xx, _rate, color=_cols, alpha=0.85)
+        for _i, m in enumerate(_mvs):
+            _c = _g_ll_cold.get(m, 0)
+            ax[1].text(_i, min(_rate[_i] + 3, 100), f"{_c} cold",
+                       ha="center", fontsize=7, color=FG)
+        ax[1].set_xticks(_xx)
+        ax[1].set_xticklabels([m[:13] for m in _mvs], rotation=35,
+                              ha="right", fontsize=7)
+        ax[1].set_ylim(0, 112)
+    else:
+        ax[1].text(0.5, 0.5, "no [GB_CELL_LL] reports", ha="center",
+                   va="center", color=DIM, transform=ax[1].transAxes)
+    ax[1].set_title("cell-ll reconciliation: % of units over allowance")
+    ax[1].set_ylabel("% exceeding")
+
+    # --- 3. the vertical ladder, per rung pair --------------------------
+    if _g_rung:
+        _ks = sorted(_g_rung)
+        _acc = [100.0 * _g_rung[k][0] / max(_g_rung[k][1], 1) for k in _ks]
+        ax[2].plot(_ks, _acc, marker="o", ms=3, color=CYAN)
+        ax[2].axhline(95.0, color=RED, ls="--", lw=1)
+        ax[2].text(0.02, 0.05, "→95% would mean empty↔empty leaked in",
+                   color=RED, fontsize=7, transform=ax[2].transAxes)
+        ax[2].set_ylim(0, 105)
+        ax[2].set_xlabel("cold rung of the pair (T→T+1)")
+    else:
+        ax[2].text(0.5, 0.5, "no [GB_VERT] rung-pair data", ha="center",
+                   va="center", color=DIM, transform=ax[2].transAxes)
+    ax[2].set_title("vertical swap acceptance per rung pair")
+    ax[2].set_ylabel("% accepted")
+
+    # --- 4. in-model convergence: newborn vs survivor -------------------
+    if _g_imconv:
+        _lbl, _p50, _flr, _atf = [], [], [], []
+        for (_mv, _cls), _rows in sorted(_g_imconv.items()):
+            _lbl.append(f"{_mv[:11]}\n{_cls}")
+            _p50.append(float(np.median([r[0] for r in _rows])))
+            _flr.append(float(np.median([r[1] for r in _rows])))
+            _atf.append(float(np.median([r[2] for r in _rows])))
+        _xx = np.arange(len(_lbl))
+        ax[3].bar(_xx, _p50, color=VIOLET, alpha=0.85, label="median repeats")
+        ax[3].plot(_xx, _flr, "_", color=AMBER, ms=18, mew=2,
+                   label="the floor (window+1)")
+        for _i, _a in enumerate(_atf):
+            ax[3].text(_i, _p50[_i], f"{_a:.0f}% at floor", ha="center",
+                       va="bottom", fontsize=6.5, color=FG)
+        ax[3].set_xticks(_xx)
+        ax[3].set_xticklabels(_lbl, fontsize=6.5)
+        ax[3].legend(fontsize=7)
+    else:
+        ax[3].text(0.5, 0.5, "no [GB_IMCONV] calibration", ha="center",
+                   va="center", color=DIM, transform=ax[3].transAxes)
+    ax[3].set_title("in-model repeats vs the floor")
+    ax[3].set_ylabel("repeats")
+
+    fig.tight_layout()
+    fig_b64(fig, "search_gates")
+
+    # ---- the companion table: what each gate is SET to, and reaching ---
+    _rows_html = []
+    # ONE ROW, NOT ONE PER MOVE. Every armed move reads the SAME shared
+    # band_rj_shutoff_w table (recipe._band_shutoff_w_pending dedupes on
+    # id(table)), and only one of them happens to emit the count line. A
+    # per-move row therefore reported "armed, 0 converged" for moves that
+    # were in fact sharing the 31% -- which reads as a broken gate.
+    if _g_live or _g_shut:
+        _shapes = set(_g_live.values())
+        _all_seq = [v for seq in _g_shut.values() for v in seq]
+        _nw, _nb, _win = (sorted(_shapes)[0] if _shapes else (0, 0, 0))
+        if _all_seq:
+            _s, _t = _all_seq[-1]
+            _pct = 100.0 * _s / max(_t, 1)
+            _active = (_g_active.get(sorted(_g_active)[0], [])
+                       if _g_active else [])
+            _trend = ""
+            if len(_active) >= 2:
+                _d = _active[-1] - _active[0]
+                _trend = (
+                    f" &mdash; <span style='color:var(--red)'>still-active "
+                    f"RISING +{_d}</span>" if _d > 0 else
+                    f" &mdash; still-active falling {_d}")
+            _state = (f"<span style='color:var(--green)'>{_s:,} / {_t:,} "
+                      f"({_pct:.0f}%)</span>{_trend}")
+        else:
+            _state = ("<span style='color:var(--amber)'>armed; no pair has "
+                      "converged yet</span>")
+        _shared = ", ".join(sorted(set(_g_live) | set(_g_shut)))
+        _rows_html.append(
+            f"<tr><td>{_shared}</td><td>RJ shutoff "
+            f"<i>(one shared table)</i></td>"
+            f"<td>{_nw}w x {_nb}b, window {_win}</td><td>{_state}</td></tr>")
+    for _mv, _txt in sorted(_g_armed.items()):
+        _win = re.search(r"window (\d+)[^/]*/ (\d+)", _txt)
+        _dll = re.search(r"dll ([\d.]+)", _txt)
+        _rows_html.append(
+            f"<tr><td>{_mv}</td><td>in-model convergence</td>"
+            f"<td>window {_win.group(1)}/{_win.group(2)} (newborn/survivor)"
+            f", dll {_dll.group(1) if _dll else '?'}</td>"
+            f"<td>{len(_g_imconv.get((_mv, 'newborn'), [])):,} newborn / "
+            f"{len(_g_imconv.get((_mv, 'mature'), [])):,} mature reports</td>"
+            f"</tr>")
+    if _g_vert:
+        _vp = sum(p for v in _g_vert.values() for p, a in v)
+        _va = sum(a for v in _g_vert.values() for p, a in v)
+        _rows_html.append(
+            f"<tr><td>all gb moves</td><td>vertical swap</td>"
+            f"<td>{'ALL RUNGS' if _g_drop else 'picked rows only'}</td>"
+            f"<td>{_va:,} / {_vp:,} accepted ({100.0 * _va / max(_vp, 1):.1f}%)"
+            + (f"; {_g_drop:,} unpriceable pair(s) dropped" if _g_drop else "")
+            + "</td></tr>")
+    GATES_TABLE = (
+        "<table style='width:100%;border-collapse:collapse;font-size:12px'>"
+        "<tr><th style='text-align:left'>move</th>"
+        "<th style='text-align:left'>gate</th>"
+        "<th style='text-align:left'>configured</th>"
+        "<th style='text-align:left'>reaching</th></tr>"
+        + "".join(_rows_html) + "</table>") if _rows_html else ""
+    _stage_html = ""
+    if _g_stage_lines:
+        _stage_html = (
+            "<div class='panel'><b>Stage-end decisions, most recent last</b>"
+            "<div class='caption'>" + "<br>".join(
+                s.replace("&", "&amp;").replace("<", "&lt;")
+                for s in _g_stage_lines[-8:])
+            + "</div></div>")
+    NAV_GATES = '<a href="#gates">search gates</a>'
+    GATES_HTML = f"""
+<section id="gates"><h2>Search Gates</h2>
+<div class="panel">{img("search_gates", "search gate status")}
+<div class="caption"><b>Every one of these gates can be armed and reaching
+nothing</b>, which is the failure shape this run has hit repeatedly, so each
+panel answers "is it doing anything" rather than "what is it set to".
+<b>Left:</b> the share of occupied (walker, band) pairs that have shut off.
+Since <code>GB_SEARCH_STAGE_END_ON_SHUTOFF</code> this IS the stage-end
+criterion &mdash; 100% ends the recipe stage, so this curve is progress
+toward the next stage, not just a diagnostic.
+<b>Second:</b> the <code>[GB_CELL_LL]</code> sampled-vs-realized check, the
+only instrument that catches a mis-credited cell ledger. The bar is the share
+of unit reports over their temperature-scaled allowance and the annotation is
+the count at the COLD rung, which is the half that reaches the catalogue.
+&#9888; a high bar is NOT news by itself &mdash; it was already 98&ndash;100%
+for the in-model and RJ moves before the all-rungs swap existed; what matters
+is this moving relative to that baseline.
+<b>Third:</b> vertical-swap acceptance per rung pair. It should rise smoothly
+with temperature; a pair approaching 100% would mean empty&harr;empty pairs
+leaked into the proposal set, which are accepted unconditionally and would
+collapse that band's ladder.
+<b>Right:</b> in-model repeats per provenance class against the floor
+(window+1). A bar sitting ON its floor marker means the window is a fixed
+budget those rows serve out rather than a measurement &mdash; the reason the
+survivor window went 100&nbsp;&rarr;&nbsp;50.</div></div>
+{GATES_TABLE}
+{_stage_html}
+</section>
+"""
+
 # gpu util CSVs (latest three jobs only -- earlier ones are archived attempts)
 csvs = sorted([fn for fn in os.listdir(RUN_DIR) if fn.startswith("gpu_util")])[-3:]
 if csvs:
@@ -5336,7 +5645,7 @@ ul {{ color:var(--dim); font-size:13px; }}
 <nav>
   <a href="#status">status</a><a href="#resid">residual</a>
   <a href="#recovery">recovery</a><a href="#population">population</a>
-  {NAV_PARAMS}<a href="#search">search &amp; cap cells</a>
+  {NAV_PARAMS}<a href="#search">search &amp; cap cells</a>{NAV_GATES}
   <a href="#fstat">f-stat</a><a href="#noise">noise</a>
   <a href="#vgb">verification binaries</a><a href="#detect">detectability</a>
   <a href="#appendix">appendix</a>
@@ -5528,6 +5837,7 @@ sources inside one cell, which is the stacking the rule exists to stop.</div></d
 {CENSUS_PANEL}
 </section>
 
+{GATES_HTML}
 <section id="fstat"><h2>F-statistic Fit</h2>
 <div class="panel">{img("fstat_comb")}
 <div class="caption">Comb scan of the maximised F-statistic across the band

@@ -167,6 +167,41 @@ class FromTarEndToEndTest(unittest.TestCase):
     def test_the_run_is_identified_on_the_page(self):
         self.assertRegex(self._text(), r"gf_prod_\w+")
 
+    # ---- the Search Gates section (2026-09-26) -------------------------
+    # These assert against a REAL run log, which is the only place the
+    # gate parsers can be exercised: the generator SystemExits on import,
+    # so its module-level regexes are unreachable to a unit test.
+    def test_the_search_gates_section_is_rendered(self):
+        txt = self._text()
+        self.assertIn('<section id="gates">', txt)
+        self.assertIn('href="#gates"', txt)
+        self.assertIn('alt="search gate status"', txt)
+
+    def test_the_shutoff_gate_is_reported_as_ONE_shared_table(self):
+        """Every armed move reads the SAME band_rj_shutoff_w table
+        (recipe._band_shutoff_w_pending dedupes on id(table)), and only
+        one emits the count line. A per-move row reported 'armed, 0
+        converged' for moves that were in fact sharing the count, which
+        reads as a broken gate."""
+        txt = self._text()
+        self.assertIn("one shared table", txt)
+        self.assertNotIn("armed, 0 converged", txt)
+
+    def test_the_gate_table_says_what_each_gate_is_REACHING(self):
+        """Not just what it is set to -- an armed gate reaching nothing is
+        the failure shape this run keeps hitting."""
+        txt = self._text()
+        self.assertIn("RJ shutoff", txt)
+        self.assertIn("in-model convergence", txt)
+        self.assertIn("vertical swap", txt)
+        self.assertRegex(txt, r"window \d+/\d+ \(newborn/survivor\)")
+
+    def test_the_cell_ll_baseline_caveat_is_on_the_page(self):
+        """98-100% of unit reports already exceeded the allowance BEFORE
+        the all-rungs swap existed, so a high bar is not news by itself.
+        Saying so on the page is what stops it being misread."""
+        self.assertIn("98", self._text())
+
     # ---- the cache -----------------------------------------------------
     def test_the_extraction_was_cached_under_one_key(self):
         """One tarball -> one keyed extraction, so a re-render reuses it.
