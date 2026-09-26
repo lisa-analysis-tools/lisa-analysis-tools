@@ -2285,9 +2285,77 @@ def _vert_all_rung_pairs(carrier, occupied, parity, ntemps, xp):
     return ci[keep], tc[keep], th[keep]
 
 
+def _vert_all_rungs_on() -> bool:
+    """``GB_TEMPER_ALL_RUNGS`` -- the all-rungs vertical swap. DEFAULT OFF.
+
+    Off by default on the spec's own instruction ("Gate the whole thing
+    behind an env knob, default OFF"), because both of its silent-corruption
+    routes are invisible in aggregate logs. The instrument that catches them
+    is ``[GB_CELL_LL]``'s sampled-vs-realized reconciliation: require a
+    clean line on a real run before considering this default.
+    """
+    return os.environ.get("GB_TEMPER_ALL_RUNGS", "0").strip() in (
+        "1", "true", "True", "yes", "on")
+
+
+def _vert_all_rung_cached(cols, carrier, occupied, n_alive, vert_base,
+                          t_i, w_i, b_i, num_bands, xp):
+    """``(cached, scorable)`` totals for the rungs with no picked row.
+
+    THE FREE MEASUREMENT. An EMPTY rung of a column holds no sources, so
+    its whole-cell likelihood is the BARE parent-walker plane over the band
+    window -- and all rungs of one ``(walker, band)`` read a bit-identical
+    slab, so that is ONE number per column. Whenever some rung of the
+    column is a SOLE-OCCUPANT picked cell, ``_vert_base`` for that row is
+    already exactly that number: it is
+    ``band_likelihoods(source_only=True)`` taken after the picked source
+    was removed, and with no other leaves left the slab is bare.
+
+    That is why this needs no transient buffer bind and therefore cannot
+    trip the ``_rebind`` bracket trap (hazard 1 of the design spec): every
+    value here comes from a measurement the block already took.
+
+    ``scorable`` marks the rungs this can actually price:
+
+    * ``carrier >= 0``           -- scored LIVE, always scorable;
+    * empty and bare known       -- scorable from the column's bare value;
+    * empty and bare NOT known   -- no sole-occupant picked rung in the
+      column, so the bare value was never measured;
+    * occupied but UNPICKED      -- its total is bare + its own sources,
+      which nothing in the block measured.
+
+    The last two need the spec's transient measurement pass and are NOT
+    implemented here; their pairs are dropped and counted, never guessed.
+    A wrong total is a silently mis-weighted swap, which is worse than a
+    swap not offered.
+    """
+    n_cols, ntemps = int(carrier.shape[0]), int(carrier.shape[1])
+    cached = xp.zeros((n_cols, ntemps), dtype=xp.float64)
+    bare_known = xp.zeros(n_cols, dtype=bool)
+    if int(t_i.shape[0]) > 0 and vert_base is not None:
+        # Rows whose cell holds exactly one alive source: for those the
+        # post-removal slab IS the bare slab.
+        col_of_row = (w_i.astype(xp.int64) * int(num_bands)
+                      + b_i.astype(xp.int64))
+        ci_of_row = xp.searchsorted(cols, col_of_row)
+        sole = xp.asarray(n_alive)[ci_of_row, t_i.astype(xp.int64)] == 1
+        if bool(sole.any()):
+            _ci = ci_of_row[sole]
+            # Last writer wins; every sole-occupant row of a column carries
+            # the same bare value, so which one lands is immaterial.
+            bare = xp.zeros(n_cols, dtype=xp.float64)
+            bare[_ci] = xp.asarray(vert_base)[sole].astype(xp.float64)
+            bare_known[_ci] = True
+            cached = xp.broadcast_to(bare[:, None], (n_cols, ntemps)).copy()
+    live = carrier >= 0
+    empty = ~occupied
+    scorable = live | (empty & bare_known[:, None])
+    return cached, scorable
+
+
 def _vert_all_rung_tables(t_i, w_i, b_i, ntemps, nwalkers, num_bands,
                           alive_counts, xp):
-    """``(cols, carrier, occupied)`` covering EVERY rung of every column.
+    """``(cols, carrier, occupied, n_alive)`` over EVERY rung of every column.
 
     Columns are the distinct ``(walker, band)`` of the block's picked
     rows. ``carrier[c, t]`` is the block row index sitting on rung ``t``
@@ -2322,8 +2390,9 @@ def _vert_all_rung_tables(t_i, w_i, b_i, ntemps, nwalkers, num_bands,
         xp.broadcast_to(b_of[:, None], (n_cols, int(ntemps))),
         int(nwalkers),
     )
-    occupied = xp.asarray(alive_counts(spec)) > 0
-    return cols, carrier, occupied
+    n_alive = xp.asarray(alive_counts(spec))
+    occupied = n_alive > 0
+    return cols, carrier, occupied, n_alive
 
 
 def _vert_all_rung_L(carrier, cached, cell_ll_base, ll_ref, ci, t, xp):
@@ -14891,6 +14960,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         return {
             "sweeps": 0, "rows": 0, "paired": 0,
             "proposed": 0, "accepted": 0,
+            # All-rungs path only: pairs DROPPED because one side's total
+            # was not obtainable from the block's own measurements (an
+            # occupied-but-unpicked rung, or an empty rung in a column with
+            # no sole-occupant picked cell to read the bare slab from).
+            # Reported, never guessed -- a wrong total is a silently
+            # mis-weighted swap.
+            "unscorable": 0,
             "acc_by_rung": np.zeros(max(int(ntemps) - 1, 1), dtype=np.int64),
             "prop_by_rung": np.zeros(max(int(ntemps) - 1, 1), dtype=np.int64),
             # Device-side per-sweep accumulators (created lazily by the
@@ -15332,6 +15408,194 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         t_i[h], t_i[c] = t_c, t_h
         beta[h] = band_temps[b_i[h], t_i[h]]
         beta[c] = band_temps[b_i[c], t_i[c]]
+        return n_acc
+
+    def _vertical_swap_sweep_all_rungs(
+            self, band_sorter, band_temps, t_i, w_i, b_i, slots, beta,
+            ll_ref, ll_change_log, prop_counts, acc_counts, cell_ll_state,
+            parity, ar, census=None, cell_ll_base=None):
+        """ONE vertical sweep over EVERY rung of each column. Accepted count.
+
+        The all-rungs half of :meth:`_vertical_swap_sweep`, implementing
+        ``docs/superpowers/specs/2026-09-25-vertical-swap-all-rungs-design.md``
+        (user: "even if it does not have a source in that band it has a
+        total likelihood ... It still holds a total likelihood and should
+        get swapped accordingly").
+
+        DELIBERATELY A SEPARATE METHOD. The picked-row sweep runs in every
+        production block and is the hottest code in the move; this path is
+        opt-in (``GB_TEMPER_ALL_RUNGS``) and must not be able to perturb it
+        even by a refactor. Nothing here is shared by mutation -- the two
+        read the same state and use the same sorter primitives.
+
+        WHAT THIS BUYS. A column's cell can now be swapped against a rung
+        holding NO picked source, so a cold cell whose whole model is
+        net-harmful against the bare slab is evicted upward:
+        ``paccept = -(b_cold - b_hot) * <the cell's add-lnL>``. That is the
+        eviction route recorded as missing in
+        ``project_sole_occupant_swap_gap``.
+
+        ``ar`` is the block's all-rung state:
+        ``(cols, carrier, occupied, cached, scorable)``. ``carrier`` is the
+        single source of truth for which rung is scored live -- the spec's
+        disjointness guard -- and a host-side uniqueness assert on the
+        relabel source set backs it up, because
+        ``exchange_cell_labels_batch`` would otherwise map a duplicated
+        cell's rows to one arbitrary destination with ``GB_INDEX_ASSERTS``
+        off in production.
+
+        Two hazards from the audit are handled here:
+
+        * empty<->empty pairs are dropped by :func:`_vert_all_rung_pairs`
+          (identical ``L`` gives ``paccept == 0.0``, which ``acc =
+          paccept >= log u`` accepts unconditionally and which would drive
+          the measured per-band acceptance to ~1 and collapse the ladder);
+        * ``cell_ll_state`` is re-pointed ONE-SIDED when a partner has no
+          slot: ``spec`` follows the model, ``ll0/led0/rep0`` do not. A
+          two-sided swap is wrong with one side absent and a no-op credits
+          the wrong cell (verified against ``_cell_ll_finalize``).
+        """
+        # Checked BEFORE touching any instance state: the ratio is
+        # meaningless without whole-cell totals, and failing here rather
+        # than partway through keeps the block's state untouched.
+        if cell_ll_base is None:
+            raise ValueError(
+                f"{type(self).__name__}: _vertical_swap_sweep_all_rungs "
+                "needs cell_ll_base -- the ratio compares whole-cell "
+                "totals; ll_ref alone is an add-delta against DIFFERENT "
+                "residuals.")
+        xp = self.xp
+        cols, carrier, occupied, cached, scorable = ar
+        ci, t_c, t_h = _vert_all_rung_pairs(
+            carrier, occupied, parity, int(self.ntemps), xp)
+        if int(ci.shape[0]) == 0:
+            return 0
+        # Drop what cannot be priced rather than guessing a total.
+        ok = scorable[ci, t_c] & scorable[ci, t_h]
+        if census is not None:
+            census["unscorable"] = census.get("unscorable", 0) + int(
+                (~ok).sum())
+        ci, t_c, t_h = ci[ok], t_c[ok], t_h[ok]
+        if int(ci.shape[0]) == 0:
+            return 0
+
+        w_hc = (cols[ci] // int(self.num_bands)).astype(t_i.dtype)
+        b_hc = (cols[ci] % int(self.num_bands)).astype(t_i.dtype)
+        L_c = _vert_all_rung_L(carrier, cached, cell_ll_base, ll_ref,
+                               ci, t_c, xp)
+        L_h = _vert_all_rung_L(carrier, cached, cell_ll_base, ll_ref,
+                               ci, t_h, xp)
+        b_cold = band_temps[b_hc, t_c]
+        b_hot = band_temps[b_hc, t_h]
+        paccept = (b_cold - b_hot) * (L_h - L_c)
+        if census is not None:
+            census["proposed"] += int(paccept.shape[0])
+            _nr = len(census["prop_by_rung"])
+            _pr = xp.bincount(t_c, minlength=_nr)[:_nr]
+            census["prop_by_rung_dev"] = (
+                _pr.astype(xp.int64) if census.get("prop_by_rung_dev") is None
+                else census["prop_by_rung_dev"] + _pr)
+            _pbr = xp.bincount(
+                b_hc.astype(xp.int64) * _nr + t_c.astype(xp.int64),
+                minlength=int(self.num_bands) * _nr,
+            )[: int(self.num_bands) * _nr].reshape(int(self.num_bands), _nr)
+            census["prop_by_bandrung_dev"] = (
+                _pbr.astype(xp.int64)
+                if census.get("prop_by_bandrung_dev") is None
+                else census["prop_by_bandrung_dev"] + _pbr)
+
+        u = self._temper_rng.random(int(paccept.shape[0]))
+        acc = paccept >= xp.log(xp.asarray(u))
+        acc_idx = xp.where(acc)[0]
+        n_acc = int(acc_idx.shape[0])
+        if n_acc == 0:
+            return 0
+        ci, t_c, t_h = ci[acc_idx], t_c[acc_idx], t_h[acc_idx]
+        w_hc, b_hc = w_hc[acc_idx], b_hc[acc_idx]
+        if census is not None:
+            census["accepted"] += n_acc
+            _nr = len(census["acc_by_rung"])
+            _ar_ = xp.bincount(t_c, minlength=_nr)[:_nr]
+            census["acc_by_rung_dev"] = (
+                _ar_.astype(xp.int64) if census.get("acc_by_rung_dev") is None
+                else census["acc_by_rung_dev"] + _ar_)
+            _abr = xp.bincount(
+                b_hc.astype(xp.int64) * _nr + t_c.astype(xp.int64),
+                minlength=int(self.num_bands) * _nr,
+            )[: int(self.num_bands) * _nr].reshape(int(self.num_bands), _nr)
+            census["acc_by_bandrung_dev"] = (
+                _abr.astype(xp.int64)
+                if census.get("acc_by_bandrung_dev") is None
+                else census["acc_by_bandrung_dev"] + _abr)
+
+        # --- sorter: every source of both cells trades its temperature ---
+        spec_h = band_sorter.get_special_band_index(t_h, w_hc, b_hc)
+        spec_c = band_sorter.get_special_band_index(t_c, w_hc, b_hc)
+        # DISJOINTNESS, asserted. ``searchsorted(side="left")`` inside
+        # exchange_cell_labels_batch maps a duplicated source cell to ONE
+        # arbitrary destination -- a half-applied relabel that
+        # GB_INDEX_ASSERTS (off in production) would have caught and the
+        # block-end special_index_check can pass anyway.
+        _src = xp.concatenate([spec_h, spec_c])
+        if int(xp.unique(_src).shape[0]) != int(_src.shape[0]):
+            raise RuntimeError(
+                f"{self.name}: all-rung vertical sweep produced a duplicate "
+                "source cell; parity selection or the carrier table is "
+                "inconsistent. Refusing a half-applied relabel.")
+        band_sorter.exchange_cell_labels_batch(
+            spec_h, t_h, w_hc, spec_c, t_c, w_hc, bands=b_hc)
+
+        # --- per-cell ledgers follow the MODEL, so they trade too ---
+        for arr in (ll_change_log, prop_counts[1], acc_counts[1]):
+            tmp = arr[t_h, w_hc, b_hc].copy()
+            arr[t_h, w_hc, b_hc] = arr[t_c, w_hc, b_hc]
+            arr[t_c, w_hc, b_hc] = tmp
+
+        # --- the all-rung cache follows the model too (spec step 6) ------
+        # This is what keeps the design at ONE measurement per block: an
+        # accepted swap is a pure relabel, so the totals simply change
+        # places. carrier and cached move TOGETHER or _vert_all_rung_L
+        # would read a live row's total out of the stale cache.
+        _cr_h = carrier[ci, t_h].copy()
+        carrier[ci, t_h] = carrier[ci, t_c]
+        carrier[ci, t_c] = _cr_h
+        _cd_h = cached[ci, t_h].copy()
+        cached[ci, t_h] = cached[ci, t_c]
+        cached[ci, t_c] = _cd_h
+        _oc_h = occupied[ci, t_h].copy()
+        occupied[ci, t_h] = occupied[ci, t_c]
+        occupied[ci, t_c] = _oc_h
+        _sc_h = scorable[ci, t_h].copy()
+        scorable[ci, t_h] = scorable[ci, t_c]
+        scorable[ci, t_c] = _sc_h
+
+        # --- cell-ll bookkeeping: ONE-SIDED re-point (hazard 3) ----------
+        # A carrier row's slot now claims the OTHER rung's label. ll0/led0/
+        # rep0 stay put: _cell_ll_finalize credits
+        # ll_change_log[spec] = led0 + (lls - ll0), i.e. ledger-at-open plus
+        # the realized slab delta, to whatever label the slot now claims --
+        # and ll_change_log was already traded above.
+        if cell_ll_state is not None:
+            st = cell_ll_state
+            a = st.get("spec")
+            if a is not None:
+                # carrier has ALREADY been permuted, so the row now on rung
+                # t_h is the one that used to be on t_c and vice versa.
+                for _t_new in (t_h, t_c):
+                    rows = carrier[ci, _t_new]
+                    m = rows >= 0
+                    if bool(m.any()):
+                        a[slots[rows[m]]] = band_sorter.get_special_band_index(
+                            _t_new[m], w_hc[m], b_hc[m])
+
+        # --- block-row labels + the beta they imply (carriers only) ------
+        for _t_new in (t_h, t_c):
+            rows = carrier[ci, _t_new]
+            m = rows >= 0
+            if bool(m.any()):
+                r = rows[m]
+                t_i[r] = _t_new[m].astype(t_i.dtype)
+                beta[r] = band_temps[b_i[r], t_i[r]]
         return n_acc
 
     def _free_inmodel_batch_pools(self, model, where: str) -> None:
@@ -16663,6 +16927,35 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         f"{int(_vert_base.shape[0])} values for "
                         f"{int(slots.shape[0])} block slots."
                     )
+        # ---- ALL-RUNGS VERTICAL SWAP state (GB_TEMPER_ALL_RUNGS, off) ---
+        # Built here, in the same BLOCK scope as _vert_base and for the same
+        # reason: the parent plane is frozen between the removal above and
+        # the write-back, so a non-resident cell's total is a block
+        # constant. Per-propose caching would be WRONG -- a later RJ round
+        # can birth or kill in an unpicked cell.
+        _ar_state = None
+        if _vert_on and _vert_all_rungs_on() and int(t_i.shape[0]) > 0:
+            with _tspan(tm, "inmodel_vertical_allrung_setup"):
+                _ali = band_sorter.inds
+                _sb = band_sorter.special_band_inds[_ali]
+                _uni, _cnt = xp.unique(_sb, return_counts=True)
+
+                def _alive_counts(_q, _u=_uni, _c=_cnt):
+                    """Alive sources per packed special. Whole-sorter, so it
+                    sees the UNPICKED sources the block cannot."""
+                    if int(_u.shape[0]) == 0:
+                        return xp.zeros(_q.shape, dtype=xp.int64)
+                    _j = xp.clip(xp.searchsorted(_u, _q), 0,
+                                 int(_u.shape[0]) - 1)
+                    return xp.where(_u[_j] == _q, _c[_j], 0)
+
+                _cols, _carrier, _occ, _nal = _vert_all_rung_tables(
+                    t_i, w_i, b_i, int(self.ntemps), int(self.nwalkers),
+                    int(self.num_bands), _alive_counts, xp)
+                _cached, _scor = _vert_all_rung_cached(
+                    _cols, _carrier, _occ, _nal, _vert_base,
+                    t_i, w_i, b_i, int(self.num_bands), xp)
+                _ar_state = (_cols, _carrier, _occ, _cached, _scor)
         # NOTE(vertical ll audit): the ratio reads ``ll_ref`` -- the cell
         # ll WITH its picked source in. Do NOT audit that against
         # ``band_likelihoods`` mid-block: that measures the slab with the
@@ -16743,8 +17036,26 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # block's own cells are the exact universe.
         _cell_window = False
         if _vert_on and self._inmodel_labels_deferrable:
-            _cell_window = band_sorter.begin_cell_label_window(
-                band_sorter.get_special_band_index(t_i, w_i, b_i))
+            _win_spec = band_sorter.get_special_band_index(t_i, w_i, b_i)
+            if _ar_state is not None:
+                # WIDEN TO EVERY RUNG OF EVERY COLUMN (spec step 2). With
+                # GB_CELL_LABEL_DEFERRED on (the default), naming a cell
+                # outside the window is a programming error raised at the
+                # flush -- and the all-rungs sweep relabels cells that hold
+                # no picked row, which by definition are not in the
+                # picked-row window. Without this every such run raises.
+                _cols_a, _carrier_a = _ar_state[0], _ar_state[1]
+                _nc = int(_cols_a.shape[0])
+                _tt = xp.arange(int(self.ntemps), dtype=xp.int64)
+                _w_of = (_cols_a // int(self.num_bands)).astype(xp.int64)
+                _b_of = (_cols_a % int(self.num_bands)).astype(xp.int64)
+                _win_spec = pack_special_index(
+                    xp.broadcast_to(_tt[None, :], (_nc, int(self.ntemps))),
+                    xp.broadcast_to(_w_of[:, None], (_nc, int(self.ntemps))),
+                    xp.broadcast_to(_b_of[:, None], (_nc, int(self.ntemps))),
+                    int(self.nwalkers),
+                ).reshape(-1)
+            _cell_window = band_sorter.begin_cell_label_window(_win_spec)
 
         # ---- CONVERGENCE-DRIVEN polish state (None = mode off) ----------
         # Per-ROW: running gain, running best of that gain, the
@@ -17323,12 +17634,21 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
           # whole ladder.
           if _vert_on:
               with _tspan(tm, "inmodel_vertical_swap"):
-                  _n = self._vertical_swap_sweep(
-                      band_sorter, band_temps, t_i, w_i, b_i, slots, beta,
-                      ll_ref, ll_change_log, prop_counts, acc_counts,
-                      cell_ll_state, move_i % 2, census=_vert_census,
-                      swap_census=_swap_cens, cell_ll_base=_vert_base,
-                  )
+                  if _ar_state is not None:
+                      _n = self._vertical_swap_sweep_all_rungs(
+                          band_sorter, band_temps, t_i, w_i, b_i, slots,
+                          beta, ll_ref, ll_change_log, prop_counts,
+                          acc_counts, cell_ll_state, move_i % 2, _ar_state,
+                          census=_vert_census, cell_ll_base=_vert_base,
+                      )
+                  else:
+                      _n = self._vertical_swap_sweep(
+                          band_sorter, band_temps, t_i, w_i, b_i, slots,
+                          beta, ll_ref, ll_change_log, prop_counts,
+                          acc_counts, cell_ll_state, move_i % 2,
+                          census=_vert_census, swap_census=_swap_cens,
+                          cell_ll_base=_vert_base,
+                      )
               if _n:
                   _vert_acc += _n
                   # t_i / beta changed -> the hoisted per-half gathers are
@@ -17603,7 +17923,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 f"{_n_done} repeats x {len(ids)} sources | "
                 f"cap-vetoed {int(_cn.get('cap_vetoed', 0))}"
                 f"{'' if _swap_cens is not None else ' (gate off)'} | "
-                f"per rung pair -- {_rungs or 'none'}"
+                + (
+                    f"ALL-RUNGS on, {int(_cn.get('unscorable', 0))} pair(s) "
+                    f"dropped as unpriceable | "
+                    if _ar_state is not None else ""
+                )
+                + f"per rung pair -- {_rungs or 'none'}"
             )
 
 

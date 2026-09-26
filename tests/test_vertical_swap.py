@@ -1439,7 +1439,12 @@ class AllRungPairsTest(unittest.TestCase):
         def alive_counts(spec):
             return np.vectorize(lambda s: live.get(int(s), 0))(spec)
 
-        cols, carrier, occupied = _vert_all_rung_tables(
+        # 4-tuple since 2026-09-26: n_alive came out alongside
+        # occupied so _vert_all_rung_cached can tell a SOLE-occupant
+        # picked cell (whose post-removal slab is the bare slab, and
+        # therefore the column's free empty-rung total) from a
+        # multi-leaf one (whose is not).
+        cols, carrier, occupied, n_alive = _vert_all_rung_tables(
             t_i, w_i, b_i, NT, NW, NB, alive_counts, np)
         self.assertEqual(cols.tolist(), [1 * NB + 3])
         self.assertEqual(carrier.tolist(), [[0, -1, -1, -1]])
@@ -1453,7 +1458,12 @@ class AllRungPairsTest(unittest.TestCase):
             _vert_all_rung_tables)
         NT, NW, NB = 4, 2, 5
         t_i = np.array([0]); w_i = np.array([0]); b_i = np.array([1])
-        cols, carrier, occupied = _vert_all_rung_tables(
+        # 4-tuple since 2026-09-26: n_alive came out alongside
+        # occupied so _vert_all_rung_cached can tell a SOLE-occupant
+        # picked cell (whose post-removal slab is the bare slab, and
+        # therefore the column's free empty-rung total) from a
+        # multi-leaf one (whose is not).
+        cols, carrier, occupied, n_alive = _vert_all_rung_tables(
             t_i, w_i, b_i, NT, NW, NB,
             lambda spec: np.ones_like(np.asarray(spec)), np)
         self.assertEqual(carrier.tolist(), [[0, -1, -1, -1]])
