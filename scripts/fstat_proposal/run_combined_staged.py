@@ -1270,6 +1270,23 @@ def build_fit():
             # source PE moves (sobbh / mbh / emri) are the ones deliberately
             # absent -- they were 2694 s of job 628's first iteration and
             # are exactly the wait this stage exists to avoid.
+            #
+            # TODO (1-YEAR RUNS): revisit whether the OTHER SOURCES belong
+            # in this stage. The 6mo argument for leaving them out is a
+            # pure wall-time one -- 2694 s against a seed stage meant to be
+            # cheap -- and it assumes the GB warm start is not materially
+            # biased by an unconverged MBH/EMRI/SOBBH model sitting in the
+            # residual. At 1 yr both halves of that weaken: the source
+            # models are dearer AND their residual contribution is larger,
+            # so 5 iterations of hard GB seeding against a stale source
+            # model could bake in GB leaves that are really mis-subtracted
+            # source power. Decide it with a measurement, not by analogy --
+            # run the seed stage once with and once without the source
+            # moves and compare the GB leaf sets (the 19.668 mHz
+            # split-source check and the sub-3-bin pair count above 9 mHz
+            # are the discriminators that have worked before). Note the
+            # eigen sidecar makes the source moves much cheaper on a
+            # resume, which changes the cost side of the trade too.
             return Stage(
                 name=name, kind="gb_search",
                 moves=_noise + _warm + in_model("in_model"),
