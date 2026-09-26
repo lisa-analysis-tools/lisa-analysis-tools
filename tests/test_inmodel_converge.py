@@ -2290,3 +2290,56 @@ class ConvergeReportReachesProductionTest(unittest.TestCase):
         one line per class or the survivor window cannot be read off."""
         src = self._src()
         self.assertEqual(src.count("self.name, _cls_name,"), 2)
+
+
+class BlockCannotStopBeforeTheWindowTest(unittest.TestCase):
+    """A block may not take its early exit before ``window`` repeats.
+
+    User ruling 2026-09-26: "make sure they walk at least 250 steps on the
+    hot rung before shutting them down."
+
+    THE DEFECT. The early exit fires when
+    ``_cols_done >= stop_frac * n_cols``, and a column holding no GATED
+    rung satisfies ``_f_cnt >= _g_cnt`` trivially -- 0 >= 0, "nothing to
+    wait on". Warm-start births land 79.4% on HOT rungs (job 638), so a
+    large share of newborn columns carry no cold rung at all and count as
+    done for free. At stop_frac 0.5 that met the threshold at the FIRST
+    poll, and _CONVERGE_POLL_EVERY is 5 -- which is exactly what 638
+    shows: newborn blocks running 5 repeats at 0.05x a 100-repeat budget,
+    79.4% of their rows released unjudged, against a 250-repeat window.
+
+    A row cannot converge before ``seen >= window``, so ANY break earlier
+    than that is not based on a convergence at all.
+    """
+
+    def _src(self):
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        return inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
+
+    def test_the_early_exit_is_floored_by_the_window(self):
+        src = self._src()
+        self.assertIn("(move_i + 1) >= int(converge.window)", src)
+
+    def test_the_floor_gates_the_stop_frac_exit_specifically(self):
+        """Not the ceiling, not the per-row freeze -- only the early exit,
+        so a converged row still stops proposing and the extra repeats go
+        to the rows still moving."""
+        src = self._src()
+        i = src.index("(move_i + 1) >= int(converge.window)")
+        self.assertIn("_cols_done >= converge.stop_frac", src[i:i + 200])
+
+    def test_the_floor_is_the_window_not_a_literal(self):
+        """250 for newborns, 100 for survivors, automatically -- a literal
+        would silently disagree with the per-class windows the moment
+        either moved."""
+        src = self._src()
+        self.assertNotIn("(move_i + 1) >= 250", src)
+        self.assertNotIn("_MIN_WALK", src)
+
+    def test_poll_cadence_is_what_made_it_5(self):
+        """Pins the number that set the observed block length, so the
+        arithmetic in the comment stays checkable."""
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        self.assertEqual(g._CONVERGE_POLL_EVERY, 5)

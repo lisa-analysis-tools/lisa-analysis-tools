@@ -17390,7 +17390,31 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                       _cv_colidx, weights=_frozen.astype(np.float64),
                       minlength=_cv_ncols)
                   _cols_done = int(np.count_nonzero(_f_cnt >= _g_cnt))
-                  if _cols_done >= converge.stop_frac * _cv_ncols:
+                  # ⚠ MINIMUM WALK BEFORE THE BLOCK MAY STOP (user ruling
+                  # 2026-09-26: "make sure they walk at least 250 steps on
+                  # the hot rung before shutting them down").
+                  #
+                  # A row cannot converge before ``seen >= window``, so a
+                  # break earlier than that is NEVER based on an actual
+                  # convergence -- and one was firing constantly. A column
+                  # holding no GATED rung satisfies ``_f_cnt >= _g_cnt``
+                  # trivially (0 >= 0, "nothing to wait on"), and
+                  # warm-start births land 79.4% on HOT rungs, so a large
+                  # share of newborn columns have no cold rung at all and
+                  # count as done for free. With stop_frac 0.5 that met the
+                  # threshold at the FIRST poll -- _CONVERGE_POLL_EVERY = 5
+                  # -- and job 638 shows the result: newborn blocks running
+                  # exactly 5 repeats at 0.05x a 100-repeat budget, with
+                  # 79.4% of their rows released unjudged.
+                  #
+                  # The floor is the WINDOW itself, so it is 250 for
+                  # newborns and 100 for survivors automatically and cannot
+                  # drift from them. It bounds only the EARLY exit; the
+                  # max_repeats ceiling and the per-row freeze are
+                  # unchanged, and a frozen row still stops proposing, so
+                  # the extra repeats are spent on the rows still moving.
+                  if ((move_i + 1) >= int(converge.window)
+                          and _cols_done >= converge.stop_frac * _cv_ncols):
                       # Enough bands are done -- the hot rungs come along
                       # rather than holding the block open, and the refill
                       # loop hands their slots to the queue.
