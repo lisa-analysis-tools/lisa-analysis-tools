@@ -871,9 +871,26 @@ class Gate6Test(unittest.TestCase):
         self.assertTrue(band_shutoff_w_armed(sampler.moves))
         self.assertTrue(self._plateaued(st, sampler))
 
-    def test_zero_pending_does_NOT_advance_without_the_plateau(self):
-        """The valve is a VETO on the plateau, not a replacement for it. A
-        growing leaf count means the search is still finding sources."""
+    def test_zero_pending_ADVANCES_without_the_plateau(self):
+        """SUPERSEDED RULING (2026-09-26). This case used to assert the
+        opposite -- "the valve is a VETO on the plateau, not a replacement
+        for it" -- because a growing leaf count was read as a search still
+        finding sources.
+
+        The user reversed it: "we want to end the recipe stage when all the
+        (band, walker) pairs are shutoff from converged logL per (band,
+        walker)", and GB_SEARCH_STAGE_END_ON_SHUTOFF now defaults ON. Every
+        occupied pair reporting a converged sub-band logL IS the criterion;
+        the plateau was only ever the half that spoke for EMPTY bands, and
+        the nleaves > 0 guard covers that directly.
+
+        What made the old rule expensive in practice: the plateau cannot be
+        evaluated until 41 in-stage iterations (2 * GB_PLATEAU_ITERS) and its
+        clock restarts on every resume, so a stage whose pairs had all shut
+        off sat for hours re-proving a converged model -- measured on the 3mo
+        v9 run, occupied pairs 1387 -> 54 -> 36 with the plateau gate never
+        once evaluated.
+        """
         moves = [_ValveMove("rj_fstat_search", 0)]
         st = SearchStageProfileStep(
             moves=[_FakeCombine(moves)], convergence_iter=2,
@@ -881,6 +898,19 @@ class Gate6Test(unittest.TestCase):
         st._stage_start_iter = 0
         growing = np.arange(1, 21).reshape(20, 1)
         sampler = _FakeSampler(growing, 20, [_FakeCombine(moves)])
+        self.assertTrue(st.stopping_function(20, None, sampler))
+
+    def test_the_old_veto_semantics_are_one_env_var_away(self):
+        """GB_SEARCH_STAGE_END_ON_SHUTOFF=0 restores the composed rule."""
+        moves = [_ValveMove("rj_fstat_search", 0)]
+        st = SearchStageProfileStep(
+            moves=[_FakeCombine(moves)], convergence_iter=2,
+            plateau_branch="gb", profile={}, stage_name="s")
+        st._stage_start_iter = 0
+        growing = np.arange(1, 21).reshape(20, 1)
+        sampler = _FakeSampler(growing, 20, [_FakeCombine(moves)])
+        os.environ["GB_SEARCH_STAGE_END_ON_SHUTOFF"] = "0"
+        self.addCleanup(os.environ.pop, "GB_SEARCH_STAGE_END_ON_SHUTOFF", None)
         self.assertFalse(st.stopping_function(20, None, sampler))
 
     def test_the_armed_guard_is_load_bearing(self):

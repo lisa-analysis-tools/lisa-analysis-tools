@@ -1584,11 +1584,18 @@ class SearchStageProfileStep(RJRecipeStep):
         #     plateau rule carries the same guard ("a search that has not
         #     found its FIRST source has not plateaued, it has not started").
         #
-        # ⚠ DEFAULT OFF so the 6mo run's stages keep the composed rule.
+        # ⚠ DEFAULT ON (user ruling 2026-09-26, raised from the default-off
+        # it shipped with hours earlier). The shutoff rule IS the criterion
+        # the v9 search stages were designed around; the nleaves plateau was
+        # only ever the half that covered empty bands, and the nleaves > 0
+        # guard below covers that case directly. This also applies to the 6mo
+        # run's gb_search_3 on its next launch.
+        # GB_SEARCH_STAGE_END_ON_SHUTOFF=0 (or empty) restores the composed
+        # "plateau AND shutoff" rule bit-identically.
         if (not stop and band_shutoff_w_armed(moves)
                 and os.environ.get(
-                    "GB_SEARCH_STAGE_END_ON_SHUTOFF", "0").strip()
-                in ("1", "true", "True", "yes", "on")):
+                    "GB_SEARCH_STAGE_END_ON_SHUTOFF", "1").strip()
+                not in ("0", "false", "False", "no", "off", "")):
             if band_shutoff_w_pending_total(moves) == 0:
                 _n = 0
                 try:

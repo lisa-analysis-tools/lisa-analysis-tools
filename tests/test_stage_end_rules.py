@@ -1,15 +1,16 @@
 """The two stage-advance knobs added 2026-09-26, both DEFAULT OFF.
 
-``GB_SEARCH_STAGE_END_ON_SHUTOFF`` makes "every occupied (walker, band) pair
-has shut off" the WHOLE stage criterion instead of one half of an AND with
-the nleaves plateau (user ruling: "we want to end the recipe stage when all
-the (band, walker) pairs are shutoff from converged logL per (band, walker)").
+``GB_SEARCH_STAGE_END_ON_SHUTOFF`` (DEFAULT ON) makes "every occupied
+(walker, band) pair has shut off" the WHOLE stage criterion instead of one
+half of an AND with the nleaves plateau (user ruling: "we want to end the
+recipe stage when all the (band, walker) pairs are shutoff from converged
+logL per (band, walker)"). =0 restores the composed rule.
 
 ``GF_PERSIST_STAGE_START`` keeps a stage's convergence clock across a resume
 by stamping its start iteration in the backend, instead of resetting it to
 the live iteration on every launch.
 
-Both default off so the in-flight 6-month run is untouched.
+``GF_PERSIST_STAGE_START`` stays DEFAULT OFF.
 """
 import os
 import unittest
@@ -73,13 +74,23 @@ class StageEndOnShutoffTest(unittest.TestCase):
         # the cap veto is a separate gate; keep it out of these cases
         os.environ["GB_SEARCH_CAP_QUIESCENT"] = "0"
 
-    def test_default_off_does_not_end_on_shutoff_alone(self):
-        """Unset, a stage well short of the plateau window must NOT stop."""
+    def test_DEFAULT_ON_ends_as_soon_as_every_occupied_pair_shut_off(self):
+        """Unset, the shutoff rule alone ends the stage (user ruling
+        2026-09-26, raised from the default-off it first shipped with).
+        The stage here is well short of the 41-iteration plateau window,
+        which under the old composed rule could not even be evaluated."""
         os.environ.pop("GB_SEARCH_STAGE_END_ON_SHUTOFF", None)
         s = _sampler(iteration=30, nleaves=np.full(30, 500), pending=0)
-        self.assertFalse(_step().stopping_function(30, None, s))
+        self.assertTrue(_step().stopping_function(30, None, s))
 
-    def test_armed_ends_as_soon_as_every_occupied_pair_shut_off(self):
+    def test_explicit_zero_restores_the_composed_plateau_AND_shutoff_rule(self):
+        for off in ("0", ""):
+            with self.subTest(value=off):
+                os.environ["GB_SEARCH_STAGE_END_ON_SHUTOFF"] = off
+                s = _sampler(iteration=30, nleaves=np.full(30, 500), pending=0)
+                self.assertFalse(_step().stopping_function(30, None, s))
+
+    def test_armed_explicitly_behaves_the_same_as_the_default(self):
         os.environ["GB_SEARCH_STAGE_END_ON_SHUTOFF"] = "1"
         s = _sampler(iteration=30, nleaves=np.full(30, 500), pending=0)
         self.assertTrue(_step().stopping_function(30, None, s))
