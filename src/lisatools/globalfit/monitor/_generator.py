@@ -143,6 +143,28 @@ IMGS, MISSING = {}, []
 # -- no completeness/purity, no matched counts, no matched-pair deltas, no
 # recovery split/census. GF_MONITOR_MATCH_STATS=1 restores those panels.
 SHOW_MATCH_STATS = os.environ.get("GF_MONITOR_MATCH_STATS", "0") == "1"
+if not SHOW_MATCH_STATS:
+    # SAY SO (2026-09-26). The gate above removes NINE panels and the whole
+    # Parameter Recovery section, and it used to do it in total silence --
+    # they simply were not there, with no notice and no placeholder. A page
+    # built without the flag therefore looks like a page whose run produced
+    # nothing, and the only way to tell the two apart was to diff against an
+    # older page, which is exactly how this was reported ("does not look
+    # right ... make sure it did not drop anything").
+    #
+    # The DEFAULT stays off: those numbers come from the 2-bin f0 proxy
+    # match, and the 2026-08-19 ruling is that nothing derived from the
+    # page's own match criterion is shown by default. Announcing the
+    # suppression is not the same as reversing it.
+    MISSING.append(
+        "match-criterion panels are SUPPRESSED (GF_MONITOR_MATCH_STATS is "
+        "not set): no completeness/purity curve, no completeness-vs-SNR, no "
+        "overlap CDF, no recovery split, no source-counts / amplitude / sky "
+        "/ nearest-neighbour population panels, and no Parameter Recovery "
+        "section. Nothing is wrong with the run or the snapshot -- these are "
+        "gated off by default because they derive from the 2-bin f0 PROXY "
+        "match rather than a phase-maximised overlap. Re-run with "
+        "GF_MONITOR_MATCH_STATS=1 to include them.")
 
 # Threshold for "matched" once the phase-maximised, noise-weighted overlap MM
 # is computed for each 2-df pair (see below). Default 0.8; override via
