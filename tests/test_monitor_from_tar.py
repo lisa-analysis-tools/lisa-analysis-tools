@@ -129,19 +129,41 @@ class CliTest(unittest.TestCase):
         rc = ft.main([empty, "--scratch", os.path.join(self.d, "s2")])
         self.assertEqual(rc, 2)
 
-    def test_it_warns_up_front_when_MOJITO_INFO_PATH_is_unset(self):
-        """Both things it feeds degrade SILENTLY; finding out after a
-        two-minute render is the annoying way to learn it."""
+    def test_it_RESOLVES_the_mojito_tree_and_says_where_from(self):
+        """One command, not two (user 2026-09-26). The env var is no
+        longer a prerequisite -- it is one source among several, and the
+        chosen one is named so a wrong pick is visible."""
+        import contextlib
+        import io
         import lisatools.globalfit.monitor as mon
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("MOJITO_INFO_PATH", None)
-            with mock.patch.object(mon, "build_monitor"), \
-                    mock.patch.object(ft.os.path, "getsize", return_value=1), \
-                    mock.patch.object(ft.sys, "stderr") as err:
-                ft.main([self.tar, os.path.join(self.d, "q.html"),
-                         "--scratch", os.path.join(self.d, "s3")])
+        buf = io.StringIO()
+        with mock.patch.object(mon, "build_monitor") as bm, \
+                mock.patch.object(ft.os.path, "getsize", return_value=1), \
+                mock.patch.object(
+                    mon, "resolve_mojito_path",
+                    return_value=("/moj/tree", "the default search path")), \
+                contextlib.redirect_stdout(buf):
+            ft.main([self.tar, os.path.join(self.d, "q.html"),
+                     "--scratch", os.path.join(self.d, "s3")])
+        self.assertIn("/moj/tree", buf.getvalue())
+        self.assertIn("the default search path", buf.getvalue())
+        # and it is handed to the builder, not left to the child's env
+        self.assertEqual(bm.call_args.kwargs.get("mojito"), "/moj/tree")
+
+    def test_it_warns_LOUDLY_when_no_mojito_tree_can_be_found(self):
+        """Both things it feeds degrade SILENTLY, so the page cannot tell
+        you; this is the only place it gets said."""
+        import lisatools.globalfit.monitor as mon
+        with mock.patch.object(mon, "build_monitor"), \
+                mock.patch.object(ft.os.path, "getsize", return_value=1), \
+                mock.patch.object(mon, "resolve_mojito_path",
+                                  return_value=(None, "nothing found")), \
+                mock.patch.object(ft.sys, "stderr") as err:
+            ft.main([self.tar, os.path.join(self.d, "q2.html"),
+                     "--scratch", os.path.join(self.d, "s4")])
         said = "".join(str(c) for c in err.write.call_args_list)
-        self.assertIn("MOJITO_INFO_PATH", said)
+        self.assertIn("nothing found", said)
+        self.assertIn("--mojito", said)
 
     def test_run_dir_override_skips_extraction_entirely(self):
         import lisatools.globalfit.monitor as mon

@@ -244,7 +244,13 @@ class L1BrickLookupTest(unittest.TestCase):
         self.brick = os.path.join(self.inner, "data", "INSTRUMENT", "L1",
                                   "NOISE_731d_2.5s_L1_source0_0_X.h5")
         os.makedirs(os.path.dirname(self.brick))
-        open(self.brick, "wb").close()
+        # A REAL brick: find_l1_brick now validates that a candidate opens
+        # and carries the orbit tables, so a zero-byte placeholder is
+        # (correctly) skipped and these tests would look for the wrong
+        # reason. See TruncatedL1BrickTest for why that check exists.
+        with h5py.File(self.brick, "w") as _fh:
+            _fh.create_group("ltts")
+            _fh.create_group("orbits")
         self.catfile = os.path.join(self.inner, "catalogues",
                                     "wdwd_cat_mojito_lite_processed.hdf5")
         os.makedirs(os.path.dirname(self.catfile))
@@ -322,3 +328,109 @@ class L1BrickLookupTest(unittest.TestCase):
         src = Path(bt.__file__).read_text()
         i = src.index("orbits_tag = \"analytic\"")
         self.assertIn("if a.analytic_orbits:", src[i:i + 300])
+
+
+class TruncatedL1BrickTest(unittest.TestCase):
+    """A truncated L1 brick must not kill the truth build.
+
+    CLUSTER FAILURE 2026-09-26:
+
+        OSError: Unable to synchronously open file (truncated file:
+        eof = 5747410944, ..., stored_eof = 5932018145)
+
+    An interrupted transfer left a brick ~184 MB short of what its own
+    HDF5 superblock claims. ``find_l1_brick`` returned ``hits[0]`` -- the
+    first match alphabetically -- with no check, so that one file killed
+    the build even with intact bricks beside it.
+
+    Skipping it is sound, not a paper-over: every mojito L1 file carries
+    the SAME orbits/ltt tables, which is why any of them will do. What
+    would be wrong is failing over silently, so the skip is always named.
+    """
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.root = os.path.join(self.d, "cache")
+        os.makedirs(self.root)
+        self.env = mock.patch.dict(os.environ, {}, clear=False)
+        self.env.start()
+        for k in ("MOJITO_INFO_PATH", "MOJITO_CAT", "MOJITO_DATA_PATH",
+                  "MOJITO_CACHE_DIR"):
+            os.environ.pop(k, None)
+        os.environ["HOME"] = os.path.join(self.d, "nohome")
+        os.environ["MOJITO_DATA_PATH"] = self.root
+        self.addCleanup(self.env.stop)
+
+    def _good(self, name):
+        p = os.path.join(self.root, name)
+        with h5py.File(p, "w") as fh:
+            fh.create_group("ltts")
+            fh.create_group("orbits")
+        return p
+
+    def _truncated(self, name):
+        """A REAL truncation: write a valid file, then chop the tail, so
+        h5py raises the same 'truncated file' OSError as the cluster."""
+        p = self._good(name)
+        with open(p, "r+b") as fh:
+            fh.truncate(os.path.getsize(p) // 2)
+        return p
+
+    def test_a_truncated_brick_really_does_fail_to_open(self):
+        """The control: if this stopped raising, the tests below would
+        pass for the wrong reason."""
+        bad = self._truncated("A_L1_bad.h5")
+        ok, why = bt._l1_usable(bad)
+        self.assertFalse(ok)
+        self.assertTrue(why, "no reason reported")
+
+    def test_it_skips_the_truncated_brick_and_uses_an_intact_one(self):
+        """'A_' sorts first, so the old hits[0] would have taken it."""
+        self._truncated("A_L1_bad.h5")
+        good = self._good("B_L1_good.h5")
+        self.assertEqual(bt.find_l1_brick(), good)
+
+    def test_a_brick_missing_the_orbit_groups_is_also_skipped(self):
+        """Complete, but the wrong kind of file."""
+        p = os.path.join(self.root, "A_L1_wrong.h5")
+        with h5py.File(p, "w") as fh:
+            fh.create_group("something_else")
+        good = self._good("B_L1_good.h5")
+        self.assertEqual(bt.find_l1_brick(), good)
+
+    def test_all_bricks_broken_returns_None(self):
+        """Falls through to the analytic path -- which the caller already
+        reports loudly -- rather than handing back a file that cannot be
+        opened."""
+        self._truncated("A_L1_bad.h5")
+        self._truncated("B_L1_also_bad.h5")
+        self.assertIsNone(bt.find_l1_brick())
+
+    def test_all_broken_is_reported_differently_from_none_found(self):
+        """A directory full of BROKEN bricks is a different problem from a
+        directory with none, and only the message distinguishes them."""
+        import contextlib
+        import io
+        self._truncated("A_L1_bad.h5")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            bt.find_l1_brick()
+        said = buf.getvalue()
+        self.assertIn("NONE", said)
+        self.assertIn("A_L1_bad.h5", said, "the bad file is not named")
+
+    def test_a_skip_is_always_named(self):
+        import contextlib
+        import io
+        self._truncated("A_L1_bad.h5")
+        self._good("B_L1_good.h5")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            bt.find_l1_brick()
+        self.assertIn("A_L1_bad.h5", buf.getvalue())
+
+    def test_an_EXPLICIT_bad_brick_is_not_silently_substituted(self):
+        """The caller named that file on purpose."""
+        bad = self._truncated("A_L1_bad.h5")
+        self._good("B_L1_good.h5")
+        self.assertEqual(bt.find_l1_brick(bad), bad)

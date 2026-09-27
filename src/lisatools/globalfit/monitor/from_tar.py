@@ -117,24 +117,18 @@ def main(argv=None) -> int:
                     help="re-extract even if this tar was unpacked before")
     ap.add_argument("--run-dir", default=None,
                     help="skip discovery and render this directory")
+    ap.add_argument("--mojito", default=None,
+                    help="the mojito tree (the directory holding "
+                         "catalogues/ and data/). Normally unnecessary: it "
+                         "is resolved from MOJITO_INFO_PATH, the run's own "
+                         "settings inside the tar, the legacy MOJITO_* "
+                         "vars, then the standard cluster/laptop paths.")
     ap.add_argument("--timeout", type=float, default=1800.0,
                     help="seconds before the page build is killed")
     a = ap.parse_args(argv)
 
     if not os.path.isfile(a.tar):
         ap.error(f"{a.tar} is not a file")
-
-    # Checked BEFORE the slow work: both things this feeds degrade
-    # silently, and finding out after a 2-minute render is the annoying
-    # way to learn it.
-    if not os.environ.get("MOJITO_INFO_PATH"):
-        print(
-            "[from_tar] WARNING: MOJITO_INFO_PATH is unset. The page will "
-            "use the ANALYTIC PSD injection instead of a fit to the brick, "
-            "and -- unless the laptop default happens to hold them -- will "
-            "DROP the residual-spectrum and data/template/residual panels "
-            "with no error. Point it at the directory containing "
-            "catalogues/ and data/.", file=sys.stderr)
 
     root = a.run_dir or extract(
         a.tar, a.scratch or _default_scratch(), fresh=a.fresh)
@@ -145,6 +139,25 @@ def main(argv=None) -> int:
         return 2
     print(f"[from_tar] run dir: {run_dir}")
 
+    # ONE COMMAND, NOT TWO (user 2026-09-26). Resolved here rather than
+    # left to the caller's shell: one of the sources is the snapshot's own
+    # run_settings.log, so a tarball rendered on the machine that produced
+    # it needs nothing configured at all. Reported either way -- both
+    # things this feeds degrade SILENTLY, and learning that after a
+    # two-minute render is the annoying way.
+    from . import resolve_mojito_path
+
+    _moj, _src = resolve_mojito_path(run_dir=run_dir, explicit=a.mojito)
+    if _moj:
+        print(f"[from_tar] mojito data: {_moj}  (from {_src})")
+    else:
+        print(f"[from_tar] WARNING: {_src}.\n"
+              "[from_tar]          The page will use the ANALYTIC PSD "
+              "injection instead of a fit to the brick and will DROP the "
+              "residual-spectrum and data/template/residual panels, with "
+              "no error on the page itself. Pass --mojito /path/to/tree "
+              "to fix.", file=sys.stderr)
+
     out = a.out or os.path.join(
         os.path.dirname(os.path.abspath(a.tar)),
         f"{os.path.basename(run_dir.rstrip('/'))}_monitor.html")
@@ -153,7 +166,7 @@ def main(argv=None) -> int:
 
     st = time.perf_counter()
     try:
-        build_monitor(run_dir, out, timeout=a.timeout)
+        build_monitor(run_dir, out, timeout=a.timeout, mojito=_moj)
     except Exception as e:                       # noqa: BLE001
         print(f"[from_tar] page build FAILED ({type(e).__name__}: {e})",
               file=sys.stderr)

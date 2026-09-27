@@ -315,6 +315,42 @@ def sens_grids(psd_p, gal_p, df):
     return sa, se
 
 
+def _l1_usable(fp):
+    """``(ok, reason)`` -- does this brick OPEN and carry the orbit tables?
+
+    WHY THIS EXISTS (cluster failure 2026-09-26):
+
+        OSError: Unable to synchronously open file (truncated file:
+        eof = 5747410944, ..., stored_eof = 5932018145)
+
+    A brick whose transfer was interrupted is ~184 MB short of what its
+    own HDF5 superblock claims. ``find_l1_brick`` used to return
+    ``hits[0]`` -- the first match alphabetically -- with no check, so ONE
+    truncated file killed the whole truth build even when intact bricks
+    sat beside it.
+
+    Skipping it is not a papering-over: every mojito L1 file carries the
+    SAME orbits/ltt tables (that is why any of them will do), so the next
+    one is not a degraded substitute, it is the same data. What would be
+    wrong is failing over SILENTLY, which is why the caller names every
+    brick it skipped and why "found some, none opened" is reported
+    differently from "found none".
+
+    The group check matters as well as the open: a file can be complete
+    and still be the wrong kind of brick.
+    """
+    try:
+        import h5py
+
+        with h5py.File(fp, "r") as fh:
+            missing = [g for g in ("ltts", "orbits") if g not in fh]
+            if missing:
+                return False, f"opens, but has no {'/'.join(missing)} group"
+        return True, ""
+    except Exception as e:                       # noqa: BLE001
+        return False, f"{type(e).__name__}: {e}"
+
+
 def find_l1_brick(path=None):
     """Any mojito L1 file -- they all carry the same orbits/ltt tables.
 
@@ -338,6 +374,14 @@ def find_l1_brick(path=None):
     """
     import glob
     if path:
+        # An EXPLICIT --l1-brick is never silently replaced: the caller
+        # named this file on purpose, so a broken one is an error to
+        # report, not a reason to pick a different brick behind their back.
+        ok, why = _l1_usable(path)
+        if not ok:
+            print(f"WARNING: --l1-brick {path} is not usable ({why}). "
+                  "Not substituting another brick for a file you named "
+                  "explicitly; drop the flag to search instead.")
         return path
 
     def _cat_root(v):
@@ -357,13 +401,30 @@ def find_l1_brick(path=None):
                          else os.path.expanduser(v))
     roots.append(os.path.expanduser("~/.mojito_cache"))
 
+    skipped = []
     for root in roots:
         if not root or not os.path.isdir(root):
             continue
         hits = sorted(glob.glob(os.path.join(root, "**", "*_L1_*.h5"),
                                 recursive=True))
-        if hits:
-            return hits[0]
+        for fp in hits:
+            ok, why = _l1_usable(fp)
+            if ok:
+                if skipped:
+                    print(f"WARNING: skipped {len(skipped)} unusable L1 "
+                          f"brick(s) before {os.path.basename(fp)}:")
+                    for bad, reason in skipped:
+                        print(f"    {bad}\n      {reason}")
+                return fp
+            skipped.append((fp, why))
+    if skipped:
+        # Do NOT fail silently into the analytic fallback here: a
+        # directory full of BROKEN bricks is a different problem from a
+        # directory with none, and only this distinguishes them.
+        print(f"WARNING: found {len(skipped)} mojito L1 brick(s) and NONE "
+              f"could be opened:")
+        for bad, reason in skipped:
+            print(f"    {bad}\n      {reason}")
     return None
 
 

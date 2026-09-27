@@ -63,7 +63,112 @@ __all__ = [
     "build_monitor",
     "default_out_path",
     "generator_path",
+    "resolve_mojito_path",
 ]
+
+#: A mojito tree is the level holding BOTH of these. Anything else is
+#: someone pointing one directory too high or too low, which is the
+#: mistake this whole resolution exists to absorb.
+MOJITO_SUBDIRS = ("catalogues", "data")
+
+#: Where mojito data lives when nobody says. The cluster layout is flat;
+#: the laptop cache nests two levels deeper under build_truth.py's
+#: convention, which is exactly the asymmetry people get wrong.
+_MOJITO_CANDIDATES = (
+    "/shared/data/mojito_cache",
+    "~/.mojito_cache/brickmarket/mojito_light_v1_0_0",
+    "~/.mojito_cache",
+)
+
+
+def _mojito_ok(p) -> bool:
+    return bool(p) and all(
+        os.path.isdir(os.path.join(p, d)) for d in MOJITO_SUBDIRS)
+
+
+def _mojito_try(p):
+    """``p``, or its nested brickmarket layout, if either validates."""
+    if not p:
+        return None
+    p = os.path.expanduser(str(p))
+    if _mojito_ok(p):
+        return p
+    nested = os.path.join(p, "brickmarket", "mojito_light_v1_0_0")
+    return nested if _mojito_ok(nested) else None
+
+
+def _mojito_from_run(run_dir):
+    """The path the RUN ITSELF recorded, read back out of the snapshot.
+
+    ``run_settings.log`` carries the ``mojito_data_path`` the job actually
+    loaded bricks from, so a snapshot is self-describing: on the machine
+    that produced it, nothing needs to be configured at all. On another
+    machine the recorded path simply will not exist and the caller falls
+    through to the local candidates.
+    """
+    import glob as _glob
+
+    for pat in ("*_artifacts/run_settings.log", "run_settings.log"):
+        for fp in _glob.glob(os.path.join(run_dir, pat)):
+            try:
+                with open(fp, errors="replace") as fh:
+                    txt = fh.read()
+            except OSError:
+                continue
+            import re as _re
+
+            for m in _re.finditer(r"(/[\w./-]*mojito[\w./-]*)", txt):
+                hit = _mojito_try(m.group(1))
+                if hit:
+                    return hit
+    return None
+
+
+def resolve_mojito_path(run_dir=None, explicit=None):
+    """``(path, where_it_came_from)``, or ``(None, reason)``.
+
+    ONE resolution for the whole monitor, so "set MOJITO_INFO_PATH first"
+    stops being a second step people have to remember. Order:
+
+    1. ``explicit`` (a ``--mojito`` flag) -- a human overriding on purpose;
+    2. ``MOJITO_INFO_PATH`` -- the documented knob;
+    3. the path the SNAPSHOT ITSELF records, so a tarball rendered on the
+       machine that produced it needs no configuration at all;
+    4. the legacy vars, so existing runbooks keep working;
+    5. the standard cluster and laptop locations.
+
+    Every candidate is validated for ``catalogues/`` and ``data/`` and
+    gets one rescue attempt down the nested ``brickmarket`` layout, so
+    pointing one level too high still resolves.
+    """
+    hit = _mojito_try(explicit)
+    if hit:
+        return hit, "--mojito"
+    hit = _mojito_try(os.environ.get("MOJITO_INFO_PATH"))
+    if hit:
+        return hit, "MOJITO_INFO_PATH"
+    if run_dir:
+        hit = _mojito_from_run(run_dir)
+        if hit:
+            return hit, "the run's own run_settings.log"
+    for name in ("MOJITO_CAT", "MOJITO_DATA_PATH", "MOJITO_CACHE_DIR"):
+        v = os.environ.get(name)
+        if v:
+            # MOJITO_CAT may name the catalogue FILE; its tree is two up.
+            v = os.path.expanduser(v)
+            if os.path.isfile(v):
+                v = os.path.dirname(os.path.dirname(v))
+            hit = _mojito_try(v)
+            if hit:
+                return hit, name
+    for cand in _MOJITO_CANDIDATES:
+        hit = _mojito_try(cand)
+        if hit:
+            return hit, "the default search path"
+    return None, ("no directory holding catalogues/ and data/ was found "
+                  "(tried --mojito, MOJITO_INFO_PATH, the run's own "
+                  "settings, MOJITO_CAT/DATA_PATH/CACHE_DIR, and "
+                  + ", ".join(_MOJITO_CANDIDATES) + ")")
 
 
 def generator_path() -> str:
@@ -88,6 +193,7 @@ def default_out_path(run_dir: str) -> str:
 
 def build_monitor(run_dir: str, out_path: Optional[str] = None, *,
                   timeout: float = 1800.0,
+                  mojito: Optional[str] = None,
                   check: bool = True) -> Optional[str]:
     """Build the HTML page for ``run_dir`` in a FRESH interpreter.
 
@@ -104,10 +210,25 @@ def build_monitor(run_dir: str, out_path: Optional[str] = None, *,
     out_path = out_path or default_out_path(run_dir)
     tmp = out_path + ".tmp"
     st = time.perf_counter()
+    # RESOLVE THE MOJITO TREE HERE, so "export MOJITO_INFO_PATH first" is
+    # not a second step every caller has to remember. The child reads it
+    # from the environment, so passing it down is all that is needed; an
+    # already-set MOJITO_INFO_PATH still wins inside resolve_mojito_path.
+    env = dict(os.environ)
+    _moj, _src = resolve_mojito_path(run_dir=run_dir, explicit=mojito)
+    if _moj:
+        env["MOJITO_INFO_PATH"] = _moj
+        logger.info("monitor: mojito data from %s (%s)", _moj, _src)
+    else:
+        logger.warning(
+            "monitor: %s. The page will fall back to the analytic PSD "
+            "injection and DROP the residual-spectrum and "
+            "data/template/residual panels, with no error on the page "
+            "itself.", _src)
     try:
         subprocess.run(
             [sys.executable, generator_path(), run_dir, tmp],
-            check=True, timeout=timeout,
+            check=True, timeout=timeout, env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
         os.replace(tmp, out_path)
