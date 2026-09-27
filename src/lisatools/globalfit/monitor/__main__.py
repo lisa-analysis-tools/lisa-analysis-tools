@@ -35,11 +35,12 @@ including from the run's own settings.
 import sys
 import time
 
-from . import build_monitor, default_out_path, describe_run
+from . import (build_monitor, build_truth_set, check_truth,
+               default_out_path, describe_run)
 from .snapshot import build_snapshot
 
 USAGE = ("usage: python -m lisatools.globalfit.monitor [--snapshot] "
-         "RUN_DIR [OUT.html]\n"
+         "[--build-truth] RUN_DIR [OUT.html]\n"
          "       --snapshot  also build <RUN_DIR>_snapshot.tar.gz, which "
          "will CONTAIN the page\n"
          "       (a downloaded tarball goes the other way: python -m "
@@ -51,6 +52,9 @@ def main(argv=None):
     want_snapshot = "--snapshot" in argv
     if want_snapshot:
         argv.remove("--snapshot")
+    want_truth = "--build-truth" in argv
+    if want_truth:
+        argv.remove("--build-truth")
     if not argv or argv[0] in ("-h", "--help"):
         print(USAGE)
         return 0 if argv else 2
@@ -58,6 +62,22 @@ def main(argv=None):
     run_dir = argv[0]
     # Beside the run directory, not inside it -- see the module docstring.
     out = argv[1] if len(argv) > 1 else default_out_path(run_dir)
+    _truth, _tnote = check_truth(run_dir)
+    if _truth:
+        print(f"[monitor] truth set: {_tnote}")
+    elif want_truth:
+        print(f"[monitor] truth set: {_tnote} -- BUILDING one now "
+              "(tens of minutes, CPU-only)")
+        try:
+            build_truth_set(run_dir)
+            print(f"[monitor] truth set: {check_truth(run_dir)[1]}")
+        except Exception as e:                    # noqa: BLE001
+            print(f"[monitor] truth build FAILED ({type(e).__name__}: {e})",
+                  file=sys.stderr)
+    else:
+        print(f"[monitor] WARNING: {_tnote} -- no detectability overlays. "
+              "Pass --build-truth to generate one.", file=sys.stderr)
+
     _state = describe_run(run_dir)
     if _state:
         print(f"[monitor] run state: {_state}")

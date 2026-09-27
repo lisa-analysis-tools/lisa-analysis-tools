@@ -126,6 +126,12 @@ def main(argv=None) -> int:
                          "is resolved from MOJITO_INFO_PATH, the run's own "
                          "settings inside the tar, the legacy MOJITO_* "
                          "vars, then the standard cluster/laptop paths.")
+    ap.add_argument("--build-truth", action="store_true",
+                    help="generate the detectability truth set into the run "
+                         "directory first if it is missing or was built for "
+                         "a different Tobs. Tens of minutes, CPU-only. "
+                         "Without it the page still renders, just with no "
+                         "detectability overlays.")
     ap.add_argument("--subprocess", action="store_true",
                     help="render in a CHILD interpreter instead of this one. "
                          "Output is identical; use it to keep the ~2.5 GB "
@@ -171,6 +177,31 @@ def main(argv=None) -> int:
               "residual-spectrum and data/template/residual panels, with "
               "no error on the page itself. Pass --mojito /path/to/tree "
               "to fix.", file=sys.stderr)
+
+    # THE TRUTH SET, in the same command (user 2026-09-26: "make the
+    # regeneration part of the full python path"). Reported either way --
+    # without it the page silently loses its completeness denominator and
+    # every detectable-source target line.
+    from . import build_truth_set, check_truth
+
+    _truth, _tnote = check_truth(run_dir)
+    if _truth:
+        print(f"[from_tar] truth set: {_tnote}")
+    elif a.build_truth:
+        print(f"[from_tar] truth set: {_tnote} -- BUILDING one now "
+              "(tens of minutes, CPU-only)")
+        try:
+            build_truth_set(run_dir)
+            _truth, _tnote = check_truth(run_dir)
+            print(f"[from_tar] truth set: {_tnote}")
+        except Exception as e:                    # noqa: BLE001
+            print(f"[from_tar] truth build FAILED ({type(e).__name__}: {e}); "
+                  "rendering without detectability overlays", file=sys.stderr)
+    else:
+        print(f"[from_tar] WARNING: {_tnote}. The page will have NO "
+              "detectability overlays (no completeness denominator, no "
+              "detectable-source target line). Pass --build-truth to "
+              "generate one into the run directory.", file=sys.stderr)
 
     out = a.out or os.path.join(
         os.path.dirname(os.path.abspath(a.tar)),

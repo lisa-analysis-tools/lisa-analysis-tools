@@ -258,6 +258,114 @@ def describe_run(run_dir: str) -> Optional[str]:
         return None
 
 
+#: The generator looks for this EXACT name, in the run directory then the
+#: CWD. The "3to21" is legacy -- the band is read from the file's own
+#: ``band`` stamp, not from its name -- so a 6-month or 1-year set still
+#: has to be called this or the page will not see it.
+TRUTH_NAME = "gb_truth_3to21.npz"
+
+
+def _store_tobs(run_dir):
+    """Observation time of the run, or ``None``."""
+    import glob as _glob
+
+    try:
+        import h5py
+
+        cands = [p for p in _glob.glob(os.path.join(run_dir, "*.h5"))
+                 if "testing" in os.path.basename(p) and "CORRUPT" not in p
+                 and "backup" not in p]
+        if not cands:
+            return None
+        with h5py.File(max(cands, key=os.path.getmtime), "r") as f:
+            a = dict(f["global_fit/domain_settings/args"].attrs)
+        return float(a["0"]) * float(a["1"]) * float(a["2"])
+    except Exception:                             # noqa: BLE001
+        return None
+
+
+def check_truth(run_dir):
+    """``(path, note)`` for the truth set this run can actually use.
+
+    ``path`` is ``None`` when the page will have no detectability
+    overlays -- no completeness denominator, no detectable-source target
+    line on the leaf-count and occupancy panels.
+
+    THE TWO WAYS IT GOES WRONG ARE DIFFERENT and the note says which:
+
+    * absent -- nothing named :data:`TRUTH_NAME` beside the store or in
+      the CWD;
+    * MISMATCHED Tobs -- a set exists but was built for a different
+      observation time. Detectability is per-Tobs (the FD bin width, the
+      waveform duration and hence the optimal SNR all scale with it), so
+      a 3-month set is simply the wrong denominator for a 6-month run and
+      the page is right to refuse it.
+
+    Also reports an ANALYTIC-ephemeris stamp, because that set is usable
+    but wrong above ~5 mHz and the page will say so anyway.
+    """
+    import numpy as np
+
+    tobs = _store_tobs(run_dir)
+    for p in (os.path.join(run_dir, TRUTH_NAME), TRUTH_NAME):
+        if not os.path.exists(p):
+            continue
+        try:
+            T = np.load(p)
+            t_have = float(T["tobs"]) if "tobs" in T.files else None
+            orb = str(T["orbits"]) if "orbits" in T.files else "analytic"
+        except Exception as e:                    # noqa: BLE001
+            return None, f"{p} is unreadable ({type(e).__name__})"
+        if tobs and t_have and abs(t_have - tobs) > 1.0:
+            return None, (
+                f"{os.path.basename(p)} is for Tobs {t_have / 86400:.0f} d "
+                f"but this run is {tobs / 86400:.0f} d -- detectability is "
+                "per-Tobs, so the page will refuse it")
+        note = f"{os.path.basename(p)}, {int(T['det'].sum()):,} detectable"
+        if not orb.startswith("mojito"):
+            note += " (⚠ ANALYTIC ephemeris -- wrong above ~5 mHz)"
+        return p, note
+    return None, f"no {TRUTH_NAME} beside the store or in the CWD"
+
+
+def build_truth_set(run_dir, extra_argv=()):
+    """Generate :data:`TRUTH_NAME` INTO ``run_dir``. Returns the path.
+
+    Straight python -- ``build_truth.main`` is called in this
+    interpreter, no subprocess. Written into the RUN DIRECTORY on purpose:
+    that is where the generator looks first, and it means the next
+    snapshot tar carries its own truth set, so every page built from that
+    tar has its overlays with nothing configured locally.
+
+    Tens of minutes, CPU-only (~9k waveforms). Defaults now do the right
+    thing: the newest usable iteration for the noise, and the INJECTED
+    mojito L1 orbits rather than the analytic ephemeris.
+    """
+    import glob as _glob
+
+    cands = [p for p in _glob.glob(os.path.join(run_dir, "*.h5"))
+             if "testing" in os.path.basename(p) and "CORRUPT" not in p
+             and "backup" not in p and "_extract" not in p]
+    if not cands:
+        # An extract IS usable here: build_truth reads the noise chains and
+        # the domain settings, both of which the reduced store keeps in
+        # full. Preferring a live store is about freshness, not capability.
+        cands = [p for p in _glob.glob(os.path.join(run_dir, "*_extract.h5"))]
+    if not cands:
+        raise FileNotFoundError(f"no store under {run_dir} to build against")
+    store = max(cands, key=os.path.getmtime)
+    out = os.path.join(run_dir, TRUTH_NAME)
+
+    from .build_truth import main as _bt_main
+
+    argv = [store, "--out", out, *extra_argv]
+    logger.info("building the truth set: build_truth %s", " ".join(argv))
+    rc = _bt_main(argv)
+    if rc not in (0, None):
+        raise RuntimeError(f"build_truth exited {rc}")
+    return out
+
+
 def build_monitor_in_process(run_dir: str, out_path: str,
                              mojito: Optional[str] = None) -> str:
     """Render the page in THIS interpreter -- one python, no child.

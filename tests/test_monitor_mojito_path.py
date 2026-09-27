@@ -37,6 +37,8 @@ import numpy as np
 # thin shims). Read the REAL files, not the shims, or every source-level
 # assertion below passes vacuously against a 30-line forwarder.
 from lisatools.globalfit import monitor as _mon  # noqa: E402
+import lisatools.globalfit.monitor as mon_pkg  # noqa: E402
+from lisatools.globalfit.monitor import from_tar as ft_mod  # noqa: E402
 from lisatools.globalfit.monitor import build_truth as bt  # noqa: E402
 
 
@@ -434,3 +436,133 @@ class TruncatedL1BrickTest(unittest.TestCase):
         bad = self._truncated("A_L1_bad.h5")
         self._good("B_L1_good.h5")
         self.assertEqual(bt.find_l1_brick(bad), bad)
+
+
+class TruthSetInThePipelineTest(unittest.TestCase):
+    """Truth-set regeneration is part of the one python path.
+
+    User 2026-09-26: "cant we generate gb_truth_*.npz?" then "make the
+    regeneration part of the full python path."
+
+    Without a usable set the page loses its completeness denominator and
+    every detectable-source target line -- and it did so with only a
+    buried notice, which is how it went unnoticed. The two failure modes
+    are different and the message has to say which:
+
+      * absent      -- nothing named gb_truth_3to21.npz anywhere;
+      * WRONG Tobs  -- a set exists but was built for a different
+        observation time. Detectability is per-Tobs, so a 3-month set is
+        the wrong denominator for a 6-month run. This is the real case:
+        the 3mo file sits in the repo root and gets picked up from the
+        CWD, so "not found" would have been a lie.
+    """
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.run = os.path.join(self.d, "gf_prod_run")
+        os.makedirs(self.run)
+        self.cwd = os.getcwd()
+        os.chdir(self.d)                 # no stray truth npz in the CWD
+        self.addCleanup(os.chdir, self.cwd)
+
+    def _store(self, tobs_days=180.0):
+        p = os.path.join(self.run, "gf_prod_testing.h5")
+        with h5py.File(p, "w") as f:
+            g = f.create_group("global_fit")
+            a = g.create_group("domain_settings").create_group("args")
+            a.attrs["0"] = 1.0
+            a.attrs["1"] = 1.0
+            a.attrs["2"] = tobs_days * 86400.0
+        return p
+
+    def _truth(self, tobs_days, det=1000, orbits=None):
+        import numpy as np
+        kw = dict(tobs=np.array(tobs_days * 86400.0),
+                  det=np.ones(det, dtype=bool))
+        if orbits is not None:
+            kw["orbits"] = np.array(orbits)
+        p = os.path.join(self.run, "gb_truth_3to21.npz")
+        np.savez(p, **kw)
+        return p
+
+    def test_absent_is_reported_as_absent(self):
+        self._store()
+        path, note = mon_pkg.check_truth(self.run)
+        self.assertIsNone(path)
+        self.assertIn("no gb_truth_3to21.npz", note)
+
+    def test_a_WRONG_TOBS_set_is_refused_and_says_so(self):
+        """Not 'missing' -- the file is right there."""
+        self._store(tobs_days=180.0)
+        self._truth(tobs_days=90.0)
+        path, note = mon_pkg.check_truth(self.run)
+        self.assertIsNone(path)
+        self.assertIn("90 d", note)
+        self.assertIn("180 d", note)
+        self.assertIn("per-Tobs", note)
+
+    def test_a_MATCHING_set_is_accepted(self):
+        self._store(tobs_days=180.0)
+        self._truth(tobs_days=180.0, det=1976, orbits="mojito_l1")
+        path, note = mon_pkg.check_truth(self.run)
+        self.assertIsNotNone(path)
+        self.assertIn("1,976 detectable", note)
+        self.assertNotIn("ANALYTIC", note)
+
+    def test_an_ANALYTIC_set_is_accepted_but_FLAGGED(self):
+        """Usable, and wrong above ~5 mHz -- the page says so too."""
+        self._store(tobs_days=180.0)
+        self._truth(tobs_days=180.0)          # unstamped == analytic
+        path, note = mon_pkg.check_truth(self.run)
+        self.assertIsNotNone(path)
+        self.assertIn("ANALYTIC", note)
+
+    def test_it_writes_into_the_RUN_DIR_under_the_name_the_page_reads(self):
+        """Both halves matter: the generator looks for that exact name,
+        and putting it in the run dir means the next snapshot tar carries
+        it, so pages built from the tar need nothing local."""
+        self._store()
+        with mock.patch("lisatools.globalfit.monitor.build_truth.main",
+                        return_value=0) as bt:
+            out = mon_pkg.build_truth_set(self.run)
+        self.assertEqual(out, os.path.join(self.run, "gb_truth_3to21.npz"))
+        argv = bt.call_args[0][0]
+        self.assertIn("--out", argv)
+        self.assertEqual(argv[argv.index("--out") + 1], out)
+        self.assertTrue(argv[0].endswith("gf_prod_testing.h5"))
+
+    def test_it_falls_back_to_an_extract_store(self):
+        """A snapshot tar ships only the *_extract.h5, and build_truth
+        reads the noise chains and domain settings -- both kept in full."""
+        p = os.path.join(self.run, "gf_prod_testing_extract.h5")
+        with h5py.File(p, "w") as f:
+            f.create_group("global_fit")
+        with mock.patch("lisatools.globalfit.monitor.build_truth.main",
+                        return_value=0) as bt:
+            mon_pkg.build_truth_set(self.run)
+        self.assertTrue(bt.call_args[0][0][0].endswith("_extract.h5"))
+
+    def test_a_nonzero_build_raises_rather_than_returning_a_path(self):
+        self._store()
+        with mock.patch("lisatools.globalfit.monitor.build_truth.main",
+                        return_value=2):
+            with self.assertRaises(RuntimeError):
+                mon_pkg.build_truth_set(self.run)
+
+    def test_both_CLIs_expose_build_truth(self):
+        from lisatools.globalfit.monitor import __main__ as m
+        src_ft = Path(ft_mod.__file__).read_text()
+        self.assertIn('"--build-truth"', src_ft)
+        self.assertIn("--build-truth", m.USAGE)
+
+    def test_it_is_called_IN_PROCESS_not_shelled_out(self):
+        """'no subprocesses! straight python flow'."""
+        import inspect
+        src = inspect.getsource(mon_pkg.build_truth_set)
+        self.assertIn("from .build_truth import main", src)
+        # Ban the CALLS, not the word -- the docstring says "no
+        # subprocess", and a substring test on that passes for the wrong
+        # reason. (Third time this exact trap has bitten today.)
+        for bad in ("import subprocess", "subprocess.run", "os.system",
+                    "shell=True", "Popen"):
+            self.assertNotIn(bad, src, bad)

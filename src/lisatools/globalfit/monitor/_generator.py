@@ -4375,6 +4375,14 @@ try:
           f"@ dpi={CORNER_DPI}, figsize={CORNER_IN}")
 except Exception as e:
     MISSING.append(f"VGB ChainConsumer corner plots unavailable: {e!r}")
+    # corner_png IS DEFINED INSIDE THE try ABOVE, so when chainconsumer is
+    # missing it never exists -- and the GB per-source corner block far
+    # below then failed with NameError("name 'corner_png' is not defined")
+    # ONCE PER SOURCE. Three identical NameErrors on the page, none of
+    # which named the actual cause, which was reported as "the html
+    # generator still not working" (2026-09-26). Bind the name so that
+    # block can say the real reason once instead.
+    corner_png = None
 VGB_CORNER_JSON = json.dumps(VGB_CORNER)
 
 # Task 4: the 3 highest-frequency RECOVERED GBs.
@@ -4510,6 +4518,16 @@ if _rows:
         if truth is not None:
             _tc = np.array(truth, dtype=float, copy=True)
             _tc[1] = (_tc[1] - f0_med) * 1e3
+        if corner_png is None:
+            # One honest line for the whole block, not one NameError per
+            # source -- which is what this produced before, naming a
+            # symptom instead of the cause.
+            MISSING.append(
+                "GB per-source corner plots unavailable: chainconsumer is "
+                "not installed, so the shared corner_png helper was never "
+                "defined. pip install chainconsumer to get them (the VGB "
+                "corners above need it too).")
+            break
         try:
             _png = corner_png(_Pc, GB_CORNER_LABELS, _tc, _lab,
                               size_in=GB_CORNER_IN, dpi=GB_CORNER_DPI,
