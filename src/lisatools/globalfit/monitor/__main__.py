@@ -16,12 +16,16 @@ Two directions, two entry points:
 writes ``<RUN_DIR>/gf_monitor.html`` and then
 ``<RUN_DIR>_snapshot.tar.gz``.
 
-⚠ THE ORDER IS LOAD-BEARING, not incidental. The page is written INTO the
-run directory first, so the tar that follows contains it -- ship the
-tarball and the report travels with the data it describes. Build the tar
-first and you get a snapshot of a run with no report in it, which is the
-whole point of doing them together. ``tests/test_monitor_main_cli.py``
-pins the ordering.
+BOTH ARTIFACTS LAND BESIDE THE RUN FOLDER (user ruling 2026-09-26), not
+inside it::
+
+    /data/gf_prod_6mo_v9_4gpu/                    <- the run
+    /data/gf_prod_6mo_v9_4gpu_monitor.html        <- the page
+    /data/gf_prod_6mo_v9_4gpu_snapshot.tar.gz     <- the tar
+
+⚠ This REVERSES an earlier guarantee: the tar used to contain the page,
+because the page was written inside the directory being archived. It no
+longer does. Copy both if the report has to travel with the data.
 
 No environment is required: ``build_monitor`` resolves the mojito tree
 itself (see :func:`lisatools.globalfit.monitor.resolve_mojito_path`),
@@ -31,7 +35,7 @@ including from the run's own settings.
 import sys
 import time
 
-from . import build_monitor, default_out_path
+from . import build_monitor, default_out_path, describe_run
 from .snapshot import build_snapshot
 
 USAGE = ("usage: python -m lisatools.globalfit.monitor [--snapshot] "
@@ -52,10 +56,11 @@ def main(argv=None):
         return 0 if argv else 2
 
     run_dir = argv[0]
-    # Defaulting INTO the run directory is what lets --snapshot carry the
-    # page; an explicit OUT elsewhere is honoured, and then the tar simply
-    # will not contain it.
+    # Beside the run directory, not inside it -- see the module docstring.
     out = argv[1] if len(argv) > 1 else default_out_path(run_dir)
+    _state = describe_run(run_dir)
+    if _state:
+        print(f"[monitor] run state: {_state}")
     st = time.perf_counter()
     # ONE PYTHON (user 2026-09-26). Safe since the font-size pin made
     # in-process byte-identical to the child-interpreter render.

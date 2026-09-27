@@ -185,10 +185,77 @@ def generator_path() -> str:
 def default_out_path(run_dir: str) -> str:
     """Where the page lands when the caller does not say.
 
-    Beside the run it describes, so a snapshot tar of the run directory
-    carries its own page.
+    A SIBLING of the run directory, not a file inside it (user ruling
+    2026-09-26: "same path as to the --snapshot folder (not in the folder
+    same path as that folder)"), so both artifacts land together:
+
+        /data/gf_prod_6mo_v9_4gpu/              <- the run
+        /data/gf_prod_6mo_v9_4gpu_monitor.html  <- the page
+        /data/gf_prod_6mo_v9_4gpu_snapshot.tar.gz
+
+    ⚠ CONSEQUENCE, stated because it reverses an earlier guarantee: the
+    tar no longer CONTAINS the page. It used to, precisely because the
+    page was written inside the directory being archived. Ship both files
+    if the report needs to travel with the data.
     """
-    return os.path.join(os.path.abspath(run_dir), "gf_monitor.html")
+    return os.path.abspath(str(run_dir).rstrip("/")) + "_monitor.html"
+
+
+def describe_run(run_dir: str) -> Optional[str]:
+    """One line saying HOW FAR ALONG the run is, or ``None``.
+
+    The generator never printed this and neither did the wrappers, so the
+    only way to learn what iteration a page describes was to open the
+    page. That is the first thing anyone wants to know about a snapshot --
+    especially when re-rendering a tarball that may be the same one as
+    last time.
+
+    Rewind- and torn-row aware for the same reasons
+    :func:`build_truth.latest_iteration` is: ``log_like`` rows are
+    preallocated so the dataset length is capacity, not progress; a
+    rewound store's ``iteration`` attr is lower than its filled extent and
+    the rows past it are a discarded trajectory. Never raises -- this is a
+    convenience line, not a gate.
+    """
+    import glob as _glob
+
+    try:
+        import h5py
+        import numpy as np
+
+        cands = [p for p in _glob.glob(os.path.join(run_dir, "*.h5"))
+                 if "testing" in os.path.basename(p)
+                 and "CORRUPT" not in p and "backup" not in p]
+        if not cands:
+            return None
+        store = max(cands, key=os.path.getmtime)
+        with h5py.File(store, "r") as f:
+            g = f["global_fit"]
+            ll = g["log_like"][:, 0, 0, :]
+            filled = np.where(np.any(ll != 0.0, axis=1))[0]
+            if not filled.size:
+                return f"{os.path.basename(store)}: no filled iterations yet"
+            nit = int(filled.max()) + 1
+            attr = g.attrs.get("iteration")
+            rewound = attr is not None and 0 < int(attr) < nit
+            if rewound:
+                nit = int(attr)
+            last = nit - 1
+            L = ll[last]
+            bits = [f"iteration {last} ({nit} stored)"]
+            if rewound:
+                bits.append("REWOUND")
+            if "inds/gb" in g:
+                inds = g["inds/gb"]
+                per = [int(np.count_nonzero(inds[last, 0, 0, w]))
+                       for w in range(inds.shape[3])]
+                bits.append(f"{sum(per):,} GB leaves {per}")
+            bits.append(f"max lnL {L.max():.1f} (walker spread "
+                        f"{L.max() - L.min():.1f})")
+            return "; ".join(bits)
+    except Exception as e:                        # noqa: BLE001
+        logger.debug("describe_run failed: %r", e)
+        return None
 
 
 def build_monitor_in_process(run_dir: str, out_path: str,
@@ -227,12 +294,36 @@ def build_monitor_in_process(run_dir: str, out_path: str,
     if _moj:
         os.environ["MOJITO_INFO_PATH"] = _moj
         logger.info("monitor: mojito data from %s (%s)", _moj, _src)
+    ns = None
     try:
-        runpy.run_path(generator_path(), run_name="__main__")
+        ns = runpy.run_path(generator_path(), run_name="__main__")
     except SystemExit as e:
         if e.code not in (0, None):
             raise
     finally:
+        # CLOSE THE GENERATOR'S HDF5 HANDLES. It is a script: it opens the
+        # store at module level and never closes it, because a child
+        # process exits and takes the handle with it. In THIS process the
+        # handle survives, and h5py then refuses to create the snapshot's
+        # ``*_extract.h5``:
+        #
+        #   OSError: Unable to synchronously create file (unable to
+        #            truncate a file which is already open)
+        #
+        # which broke `--snapshot` the moment the render stopped being a
+        # subprocess -- the page was written and the tar silently was not.
+        # runpy hands back the module globals, so the handles are reachable
+        # without the generator having to grow a teardown.
+        for _v in list((ns or {}).values()):
+            try:
+                import h5py
+
+                if isinstance(_v, h5py.File):
+                    _v.close()
+                elif isinstance(_v, h5py.Group) and _v.file:
+                    _v.file.close()
+            except Exception:                     # noqa: BLE001
+                pass
         sys.argv = saved_argv
         if saved_env is None:
             os.environ.pop("MOJITO_INFO_PATH", None)
@@ -244,7 +335,7 @@ def build_monitor_in_process(run_dir: str, out_path: str,
 def build_monitor(run_dir: str, out_path: Optional[str] = None, *,
                   timeout: float = 1800.0,
                   mojito: Optional[str] = None,
-                  in_process: bool = False,
+                  in_process: bool = True,
                   check: bool = True) -> Optional[str]:
     """Build the HTML page for ``run_dir`` in a FRESH interpreter.
 
@@ -279,8 +370,14 @@ def build_monitor(run_dir: str, out_path: Optional[str] = None, *,
     # GF_MONITOR_IN_PROCESS=1 (or in_process=True) renders without a child
     # interpreter -- one python, at the cost of one restyled panel. See
     # build_monitor_in_process for the measurement.
-    _inproc = in_process or os.environ.get(
-        "GF_MONITOR_IN_PROCESS", "0").strip() in ("1", "true", "yes", "on")
+    # STRAIGHT PYTHON FLOW, no child interpreter (user ruling
+    # 2026-09-26: "no subprocesses!"). Safe since the font.size pin made
+    # the in-process render byte-identical to the child one.
+    # GF_MONITOR_SUBPROCESS=1 is the escape hatch for a caller that wants
+    # the ~2.5 GB peak and any matplotlib fault kept out of its own
+    # process -- the saver rank is the case that might.
+    _inproc = in_process and os.environ.get(
+        "GF_MONITOR_SUBPROCESS", "0").strip() not in ("1", "true", "yes", "on")
     try:
         if _inproc:
             build_monitor_in_process(run_dir, tmp, mojito=_moj)
@@ -288,7 +385,12 @@ def build_monitor(run_dir: str, out_path: Optional[str] = None, *,
             subprocess.run(
                 [sys.executable, generator_path(), run_dir, tmp],
                 check=True, timeout=timeout, env=env,
-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                # DO NOT SWALLOW THE GENERATOR'S OWN OUTPUT. It reports
+                # the plot count, the VGB corners, the GB cloud size and
+                # the missing-panel count -- the only running commentary
+                # there is -- and DEVNULL here meant the subprocess path
+                # silently showed less than the in-process one.
+                stderr=subprocess.PIPE,
             )
         os.replace(tmp, out_path)
     except Exception as e:                        # noqa: BLE001

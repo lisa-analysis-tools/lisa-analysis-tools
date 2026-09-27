@@ -45,9 +45,11 @@ class SnapshotFlagTest(unittest.TestCase):
         bm.assert_called_once()
         bs.assert_called_once_with(self.run)
 
-    def test_the_PAGE_IS_BUILT_FIRST_so_the_tar_contains_it(self):
-        """The ordering guarantee. Reversed, both artifacts still appear
-        and only opening the tar reveals the page is missing."""
+    def test_the_page_is_still_built_first(self):
+        """No longer a containment guarantee -- the page is a SIBLING of
+        the run dir now, so the tar does not carry it. Kept because a
+        failed tar must not cost you the page as well: build the cheap
+        certain artifact before the expensive fallible one."""
         order = []
         with mock.patch.object(m, "build_monitor",
                                side_effect=lambda *a, **k: order.append("page")), \
@@ -57,15 +59,18 @@ class SnapshotFlagTest(unittest.TestCase):
             m.main(["--snapshot", self.run])
         self.assertEqual(order, ["page", "tar"])
 
-    def test_the_page_defaults_INTO_the_run_dir(self):
-        """Which is what puts it inside the tar. An explicit OUT elsewhere
-        is honoured, and then it simply is not in the tar."""
+    def test_the_page_defaults_BESIDE_the_run_dir_not_inside_it(self):
+        """User ruling 2026-09-26. Both artifacts sit next to the folder so
+        they are found together; nothing is written into the run."""
         with mock.patch.object(m, "build_monitor") as bm, \
                 mock.patch.object(m, "build_snapshot",
                                   return_value="/t.tar.gz"):
             m.main(["--snapshot", self.run])
-        self.assertEqual(
-            os.path.dirname(bm.call_args[0][1]), os.path.abspath(self.run))
+        out = bm.call_args[0][1]
+        self.assertEqual(out, os.path.abspath(self.run) + "_monitor.html")
+        self.assertEqual(os.path.dirname(out),
+                         os.path.dirname(os.path.abspath(self.run)))
+        self.assertFalse(out.startswith(os.path.abspath(self.run) + os.sep))
 
     def test_an_explicit_out_path_is_honoured(self):
         out = os.path.join(self.d, "elsewhere.html")
@@ -94,11 +99,45 @@ class SnapshotFlagTest(unittest.TestCase):
     def test_help_exits_zero(self):
         self.assertEqual(m.main(["--help"]), 0)
 
-    def test_the_ordering_rationale_is_written_down(self):
-        """It looks like an incidental statement order; it is not."""
+    def test_the_sibling_layout_is_written_down(self):
+        """Including the guarantee it reverses."""
         src = Path(m.__file__).read_text()
-        self.assertIn("ORDER IS LOAD-BEARING", src)
+        self.assertIn("BESIDE THE RUN FOLDER", src)
+        self.assertIn("It no\nlonger does", src)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InProcessHandleLeakTest(unittest.TestCase):
+    """The generator leaves its HDF5 store open; in-process we must close it.
+
+    It is a SCRIPT: it opens the store at module level and never closes
+    it, because a child process exits and takes the handle with it. Once
+    the render stopped being a subprocess the handle survived into the
+    snapshot step and h5py refused to create the extract:
+
+        OSError: Unable to synchronously create file (unable to truncate
+                 a file which is already open)
+
+    The page was written and the tar silently was not -- exit 0 in the
+    first version, which is why --snapshot now also returns nonzero.
+    """
+
+    def test_build_monitor_in_process_closes_what_the_script_left_open(self):
+        import lisatools.globalfit.monitor as mon
+        src = Path(mon.__file__).read_text()
+        i = src.index("def build_monitor_in_process")
+        blk = src[i:i + 4000]
+        self.assertIn("ns = runpy.run_path", blk,
+                      "the module globals must be captured to reach the "
+                      "handles")
+        self.assertIn("isinstance(_v, h5py.File)", blk)
+        self.assertIn(".close()", blk)
+
+    def test_the_reason_is_recorded(self):
+        """Without it this reads as defensive tidying and gets removed."""
+        import lisatools.globalfit.monitor as mon
+        src = Path(mon.__file__).read_text()
+        self.assertIn("truncate a file which is already open", src)

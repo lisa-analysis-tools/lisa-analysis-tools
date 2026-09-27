@@ -224,7 +224,10 @@ class FreshInterpreterTest(unittest.TestCase):
     def test_build_monitor_spawns_a_child_running_the_generator_FILE(self):
         with mock.patch.object(mon.subprocess, "run") as run, \
                 mock.patch.object(mon.os, "replace"):
-            mon.build_monitor("/run/dir", "/tmp/p.html", check=False)
+            # in_process=False: the child path is opt-in since
+            # 2026-09-26 ("no subprocesses! straight python flow").
+            mon.build_monitor("/run/dir", "/tmp/p.html", check=False,
+                              in_process=False)
         argv = run.call_args[0][0]
         self.assertEqual(argv[0], mon.sys.executable)
         self.assertTrue(argv[1].endswith("_generator.py"), argv)
@@ -241,7 +244,8 @@ class FreshInterpreterTest(unittest.TestCase):
     def test_the_page_is_published_atomically(self):
         with mock.patch.object(mon.subprocess, "run") as run, \
                 mock.patch.object(mon.os, "replace") as rep:
-            mon.build_monitor("/run/dir", "/tmp/p.html", check=False)
+            mon.build_monitor("/run/dir", "/tmp/p.html", check=False,
+                              in_process=False)
         self.assertTrue(run.call_args[0][0][3].endswith(".tmp"))
         rep.assert_called_once_with("/tmp/p.html.tmp", "/tmp/p.html")
 
@@ -251,7 +255,8 @@ class FreshInterpreterTest(unittest.TestCase):
                 side_effect=subprocess.CalledProcessError(1, "c", stderr=b"x")), \
                 mock.patch.object(mon.os, "replace") as rep:
             self.assertIsNone(
-                mon.build_monitor("/run/dir", "/tmp/p.html", check=False))
+                mon.build_monitor("/run/dir", "/tmp/p.html", check=False,
+                                  in_process=False))
         rep.assert_not_called()
 
     def test_a_hung_child_is_killed_and_does_not_raise(self):
@@ -260,7 +265,8 @@ class FreshInterpreterTest(unittest.TestCase):
                 side_effect=subprocess.TimeoutExpired("c", 1)), \
                 mock.patch.object(mon.os, "replace") as rep:
             self.assertIsNone(
-                mon.build_monitor("/run/dir", "/tmp/p.html", check=False))
+                mon.build_monitor("/run/dir", "/tmp/p.html", check=False,
+                                  in_process=False))
         rep.assert_not_called()
 
 

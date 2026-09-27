@@ -152,7 +152,14 @@ def main(argv=None) -> int:
     # it needs nothing configured at all. Reported either way -- both
     # things this feeds degrade SILENTLY, and learning that after a
     # two-minute render is the annoying way.
-    from . import resolve_mojito_path
+    from . import describe_run, resolve_mojito_path
+
+    # WHAT ITERATION IS THIS? The first thing anyone wants to know about a
+    # snapshot, and until now the only way to find out was to open the
+    # finished page.
+    _state = describe_run(run_dir)
+    if _state:
+        print(f"[from_tar] run state: {_state}")
 
     _moj, _src = resolve_mojito_path(run_dir=run_dir, explicit=a.mojito)
     if _moj:
