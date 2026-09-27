@@ -144,6 +144,12 @@ def resolve_catalogue(explicit=None):
     tried = []
     for cand in (
         explicit,
+        # MOJITO_INFO_PATH is the ONE knob the rest of the monitor uses,
+        # and it names the tree that holds catalogues/ and data/ -- so it
+        # locates this file too. It was missing from this chain, which is
+        # how a cluster run with the tree at its standard location still
+        # failed to find the catalogue (2026-09-27).
+        os.environ.get("MOJITO_INFO_PATH"),
         os.environ.get("MOJITO_CAT"),
         (os.path.join(os.environ["MOJITO_CACHE_DIR"], "brickmarket",
                       "mojito_light_v1_0_0", "catalogues", MOJITO_CAT_NAME)

@@ -138,6 +138,18 @@ def main(argv=None) -> int:
                          "peak and any matplotlib fault out of this process.")
     ap.add_argument("--timeout", type=float, default=1800.0,
                     help="seconds before the page build is killed")
+    # SPLIT ON `--` BEFORE PARSING, do not use argparse.REMAINDER.
+    # REMAINDER absorbs everything from the first token it does not
+    # recognise onward -- INCLUDING flags this parser defines. With it,
+    # `RUN_DIR --build-truth -- --catalogue X` parsed build_truth as
+    # FALSE and handed "--build-truth" to build_truth instead. It also
+    # meant an unknown flag was swallowed rather than rejected, which is
+    # the behaviour this parser exists to provide.
+    if "--" in argv:
+        _i = argv.index("--")
+        argv, _passthru = argv[:_i], argv[_i + 1:]
+    else:
+        _passthru = []
     a = ap.parse_args(argv)
 
     if not os.path.isfile(a.tar):
@@ -191,7 +203,8 @@ def main(argv=None) -> int:
         print(f"[from_tar] truth set: {_tnote} -- BUILDING one now "
               "(tens of minutes, CPU-only)")
         try:
-            build_truth_set(run_dir)
+            build_truth_set(run_dir,
+extra_argv=_passthru)
             _truth, _tnote = check_truth(run_dir)
             print(f"[from_tar] truth set: {_tnote}")
         except Exception as e:                    # noqa: BLE001

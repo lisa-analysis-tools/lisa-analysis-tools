@@ -356,11 +356,29 @@ def build_truth_set(run_dir, extra_argv=()):
     store = max(cands, key=os.path.getmtime)
     out = os.path.join(run_dir, TRUTH_NAME)
 
+    # HAND IT THE MOJITO TREE. build_truth needs it TWICE -- once for the
+    # GB catalogue and once for the L1 bricks the injected orbits come
+    # from -- and it reads both from the environment. Without this the
+    # caller had to export MOJITO_INFO_PATH by hand or the build fell back
+    # to the ANALYTIC ephemeris and then died on the catalogue, which is
+    # exactly what happened on the cluster (2026-09-27): "env set: NONE".
+    _moj, _src = resolve_mojito_path(run_dir=run_dir)
+    _saved = os.environ.get("MOJITO_INFO_PATH")
+    if _moj:
+        os.environ["MOJITO_INFO_PATH"] = _moj
+        logger.info("build_truth: mojito data from %s (%s)", _moj, _src)
+
     from .build_truth import main as _bt_main
 
     argv = [store, "--out", out, *extra_argv]
     logger.info("building the truth set: build_truth %s", " ".join(argv))
-    rc = _bt_main(argv)
+    try:
+        rc = _bt_main(argv)
+    finally:
+        if _saved is None:
+            os.environ.pop("MOJITO_INFO_PATH", None)
+        else:
+            os.environ["MOJITO_INFO_PATH"] = _saved
     if rc not in (0, None):
         raise RuntimeError(f"build_truth exited {rc}")
     return out

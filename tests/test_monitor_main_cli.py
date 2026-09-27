@@ -93,11 +93,48 @@ class SnapshotFlagTest(unittest.TestCase):
         self.assertIn("--snapshot", m.USAGE)
         self.assertIn("from_tar", m.USAGE)
 
-    def test_no_args_is_usage_and_a_nonzero_exit(self):
-        self.assertEqual(m.main([]), 2)
+    def test_no_args_is_an_error(self):
+        """argparse, not hand-rolled exit codes."""
+        with self.assertRaises(SystemExit) as cm:
+            m.main([])
+        self.assertNotEqual(cm.exception.code, 0)
 
     def test_help_exits_zero(self):
-        self.assertEqual(m.main(["--help"]), 0)
+        with self.assertRaises(SystemExit) as cm:
+            m.main(["--help"])
+        self.assertEqual(cm.exception.code, 0)
+
+    def test_an_UNKNOWN_FLAG_is_rejected_not_used_as_the_out_path(self):
+        """The bug this parser exists for. `RUN_DIR --catalogue X` used to
+        set out="--catalogue" silently -- the command ran, wrote the page
+        to a file called "--catalogue", and never told anyone."""
+        with self.assertRaises(SystemExit) as cm:
+            m.main([self.run, "--no-such-flag"])
+        self.assertNotEqual(cm.exception.code, 0)
+
+    def test_build_truth_args_pass_through_after_a_double_dash(self):
+        """And --build-truth itself must SURVIVE the split. With
+        argparse.REMAINDER it did not: everything from the first
+        unrecognised token on was absorbed, so --build-truth parsed as
+        False and was handed to build_truth as an argument."""
+        with mock.patch.object(m, "build_monitor"), \
+                mock.patch.object(m, "check_truth",
+                                  return_value=(None, "absent")), \
+                mock.patch.object(m, "build_truth_set") as bt:
+            m.main(["--snapshot", self.run, "--build-truth",
+                    "--", "--catalogue", "/p/wdwd.hdf5"])
+        self.assertEqual(bt.call_args.kwargs["extra_argv"],
+                         ["--catalogue", "/p/wdwd.hdf5"])
+
+    def test_passthru_args_without_build_truth_are_called_out(self):
+        """Otherwise they vanish without a word."""
+        with mock.patch.object(m, "build_monitor"), \
+                mock.patch.object(m, "check_truth",
+                                  return_value=(None, "absent")), \
+                mock.patch.object(m.sys, "stderr") as err:
+            m.main([self.run, "--", "--catalogue", "/p/x.hdf5"])
+        said = "".join(str(c) for c in err.write.call_args_list)
+        self.assertIn("--catalogue", said)
 
     def test_the_sibling_layout_is_written_down(self):
         """Including the guarantee it reverses."""
