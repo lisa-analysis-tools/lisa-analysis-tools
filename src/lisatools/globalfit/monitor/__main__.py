@@ -57,7 +57,9 @@ def main(argv=None):
     # will not contain it.
     out = argv[1] if len(argv) > 1 else default_out_path(run_dir)
     st = time.perf_counter()
-    build_monitor(run_dir, out)
+    # ONE PYTHON (user 2026-09-26). Safe since the font-size pin made
+    # in-process byte-identical to the child-interpreter render.
+    build_monitor(run_dir, out, in_process=True)
     print(f"[monitor] wrote {out} in {time.perf_counter() - st:.1f} s")
 
     if want_snapshot:

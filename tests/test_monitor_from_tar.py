@@ -181,8 +181,69 @@ class CliTest(unittest.TestCase):
         byte-identical rather than merely similar."""
         src = Path(ft.__file__).read_text()
         self.assertIn("from . import build_monitor", src)
-        self.assertNotIn("subprocess", src)
+        # It must not spawn or shell out ITSELF. (--subprocess is a flag
+        # name, not a use, so ban the actual calls rather than the word --
+        # the earlier substring ban failed the moment the flag was added.)
+        for bad in ("import subprocess", "subprocess.run", "os.system",
+                    "shell=True"):
+            self.assertNotIn(bad, src, bad)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SingleProcessTest(unittest.TestCase):
+    """One python, both outputs (user 2026-09-26).
+
+    The page used to be rendered in a CHILD interpreter because the output
+    depended on the caller's import history. Root cause, measured: the
+    erebor.noise import chain changes exactly ONE rcParam, font.size
+    10 -> 16, and a figure is drawn immediately after it. Fresh process:
+    set 10, import raises to 16, panel at 16. Already imported: 16 first,
+    the generator's own block sets 10, panel at 10. One panel, 25806
+    pixels, everything else identical.
+
+    Pinning font.size at that point made both paths byte-identical -- AND
+    identical to every page built before the change -- so the CLI no
+    longer needs a child at all.
+    """
+
+    def test_from_tar_renders_in_this_process_by_default(self):
+        import lisatools.globalfit.monitor as mon
+        d = tempfile.mkdtemp()
+        _mk(os.path.join(d, "run", "gf_prod_testing_extract.h5"))
+        tar = os.path.join(d, "s.tar.gz")
+        with tarfile.open(tar, "w:gz") as tf:
+            tf.add(os.path.join(d, "run"), arcname="run")
+        with mock.patch.object(mon, "build_monitor") as bm, \
+                mock.patch.object(ft.os.path, "getsize", return_value=1):
+            ft.main([tar, os.path.join(d, "p.html"),
+                     "--scratch", os.path.join(d, "s")])
+        self.assertIs(bm.call_args.kwargs.get("in_process"), True)
+
+    def test_the_subprocess_escape_hatch_exists(self):
+        """Keeping the ~2.5 GB peak and any matplotlib fault out of the
+        calling process is still sometimes what you want."""
+        import lisatools.globalfit.monitor as mon
+        d = tempfile.mkdtemp()
+        _mk(os.path.join(d, "run", "gf_prod_testing_extract.h5"))
+        tar = os.path.join(d, "s.tar.gz")
+        with tarfile.open(tar, "w:gz") as tf:
+            tf.add(os.path.join(d, "run"), arcname="run")
+        with mock.patch.object(mon, "build_monitor") as bm, \
+                mock.patch.object(ft.os.path, "getsize", return_value=1):
+            ft.main([tar, os.path.join(d, "p.html"), "--subprocess",
+                     "--scratch", os.path.join(d, "s2")])
+        self.assertIs(bm.call_args.kwargs.get("in_process"), False)
+
+    def test_the_font_pin_is_present_and_explained(self):
+        """It looks like an arbitrary literal; it is the inherited value
+        every page to date rendered at, and removing it silently changes
+        one panel on every page."""
+        import lisatools.globalfit.monitor as mon
+        src = Path(mon.generator_path()).read_text()
+        self.assertIn("_NOISE_PANEL_FONT = 16.0", src)
+        self.assertIn('plt.rcParams["font.size"] = _NOISE_PANEL_FONT', src)
+        i = src.index("_NOISE_PANEL_FONT = 16.0")
+        self.assertIn("font.size 10.0 -> 16.0", src[max(0, i - 1800):i])

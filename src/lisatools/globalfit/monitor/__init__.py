@@ -191,9 +191,60 @@ def default_out_path(run_dir: str) -> str:
     return os.path.join(os.path.abspath(run_dir), "gf_monitor.html")
 
 
+def build_monitor_in_process(run_dir: str, out_path: str,
+                             mojito: Optional[str] = None) -> str:
+    """Render the page in THIS interpreter -- one python, no child.
+
+    ⚠ READ THIS BEFORE PREFERRING IT. The generator sets its own dark
+    theme in ``plt.rcParams`` near the top and ~700 lines later imports
+    ``...erebor.noise``, whose chain reaches eryn, which calls
+    ``plt.style.use(["science"])`` as an IMPORT SIDE EFFECT. Run as a
+    script, that side effect lands AFTER the generator's block and the
+    science style wins. In this process ``lisatools`` is already imported,
+    so the side effect has already happened and the generator's block wins
+    instead.
+
+    Measured consequence (2026-09-26): the "instrument noise posteriors"
+    panel renders differently -- 25722 vs 27586 base64 chars, 25806 pixels
+    across the whole plot area -- with all 760 other lines of the page
+    identical. Nothing else changes.
+
+    So this is NOT byte-identical to :func:`build_monitor` and cannot be
+    made so without the generator taking control of its own style
+    ordering. It is offered because one process is sometimes worth more
+    than one panel, not because the difference is imaginary.
+
+    It also keeps the build's ~2.5 GB peak RSS in the caller's heap and
+    puts a matplotlib fault in the caller's process, which is why the
+    saver rank -- the run's only writer -- must not use it.
+    """
+    import runpy
+
+    argv = [generator_path(), str(run_dir), str(out_path)]
+    saved_argv, saved_env = sys.argv, os.environ.get("MOJITO_INFO_PATH")
+    _moj, _src = resolve_mojito_path(run_dir=run_dir, explicit=mojito)
+    sys.argv = argv
+    if _moj:
+        os.environ["MOJITO_INFO_PATH"] = _moj
+        logger.info("monitor: mojito data from %s (%s)", _moj, _src)
+    try:
+        runpy.run_path(generator_path(), run_name="__main__")
+    except SystemExit as e:
+        if e.code not in (0, None):
+            raise
+    finally:
+        sys.argv = saved_argv
+        if saved_env is None:
+            os.environ.pop("MOJITO_INFO_PATH", None)
+        else:
+            os.environ["MOJITO_INFO_PATH"] = saved_env
+    return out_path
+
+
 def build_monitor(run_dir: str, out_path: Optional[str] = None, *,
                   timeout: float = 1800.0,
                   mojito: Optional[str] = None,
+                  in_process: bool = False,
                   check: bool = True) -> Optional[str]:
     """Build the HTML page for ``run_dir`` in a FRESH interpreter.
 
@@ -225,12 +276,20 @@ def build_monitor(run_dir: str, out_path: Optional[str] = None, *,
             "injection and DROP the residual-spectrum and "
             "data/template/residual panels, with no error on the page "
             "itself.", _src)
+    # GF_MONITOR_IN_PROCESS=1 (or in_process=True) renders without a child
+    # interpreter -- one python, at the cost of one restyled panel. See
+    # build_monitor_in_process for the measurement.
+    _inproc = in_process or os.environ.get(
+        "GF_MONITOR_IN_PROCESS", "0").strip() in ("1", "true", "yes", "on")
     try:
-        subprocess.run(
-            [sys.executable, generator_path(), run_dir, tmp],
-            check=True, timeout=timeout, env=env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        )
+        if _inproc:
+            build_monitor_in_process(run_dir, tmp, mojito=_moj)
+        else:
+            subprocess.run(
+                [sys.executable, generator_path(), run_dir, tmp],
+                check=True, timeout=timeout, env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            )
         os.replace(tmp, out_path)
     except Exception as e:                        # noqa: BLE001
         _err = getattr(e, "stderr", b"") or b""

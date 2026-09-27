@@ -18,14 +18,17 @@ Defaults chosen so the common case is zero flags:
 * extraction goes to a scratch directory that is REUSED when it already
   holds the same tar (``--fresh`` forces a re-extract), because a 130 MB
   archive is slow to unpack and usually gets rendered more than once;
-* ``MOJITO_INFO_PATH`` is checked up front, because the two things it
-  feeds -- the PSD truth lines and the residual/data panels -- degrade
-  SILENTLY without it, one to the analytic injection and the other to
-  no panels at all.
+* the mojito tree is RESOLVED, not demanded -- from ``MOJITO_INFO_PATH``,
+  the run's own settings inside the tar, the legacy ``MOJITO_*`` vars, or
+  the standard cluster/laptop paths. Both things it feeds degrade
+  SILENTLY, so the chosen tree is always printed and a failure to find
+  one is warned before the slow work starts.
 
-The page itself is produced by :func:`lisatools.globalfit.monitor.build_monitor`,
-so it is the same fresh-interpreter path as the saver-rank hook and the
-old script entry point -- byte-identical output, not a reimplementation.
+ONE PYTHON PROCESS. The page renders in THIS interpreter; ``--subprocess``
+opts into a child if you would rather keep the ~2.5 GB peak and any
+matplotlib fault out of it. Both produce byte-identical output -- see
+``_generator.py``'s ``_NOISE_PANEL_FONT`` for the one rcParam that used to
+make that untrue.
 """
 
 from __future__ import annotations
@@ -123,6 +126,10 @@ def main(argv=None) -> int:
                          "is resolved from MOJITO_INFO_PATH, the run's own "
                          "settings inside the tar, the legacy MOJITO_* "
                          "vars, then the standard cluster/laptop paths.")
+    ap.add_argument("--subprocess", action="store_true",
+                    help="render in a CHILD interpreter instead of this one. "
+                         "Output is identical; use it to keep the ~2.5 GB "
+                         "peak and any matplotlib fault out of this process.")
     ap.add_argument("--timeout", type=float, default=1800.0,
                     help="seconds before the page build is killed")
     a = ap.parse_args(argv)
@@ -166,7 +173,9 @@ def main(argv=None) -> int:
 
     st = time.perf_counter()
     try:
-        build_monitor(run_dir, out, timeout=a.timeout, mojito=_moj)
+        # ONE PYTHON: no child interpreter. See build_monitor_in_process.
+        build_monitor(run_dir, out, timeout=a.timeout, mojito=_moj,
+                      in_process=not a.subprocess)
     except Exception as e:                       # noqa: BLE001
         print(f"[from_tar] page build FAILED ({type(e).__name__}: {e})",
               file=sys.stderr)

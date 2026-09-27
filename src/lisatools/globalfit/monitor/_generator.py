@@ -940,6 +940,34 @@ GAL_NAMES = [("log10 " + n) if (GALFOR_LOG and n in GALFOR_LOG_PARAMS) else n
 # block only takes effect at figure creation time for new Text, not for
 # already-existing ones. Fixing it here keeps the page tex-free even when the
 # host has no LaTeX (i.e., every cluster node and every fresh container).
+# ---- OWN THE FONT SIZE, DO NOT INHERIT IT (2026-09-26) -------------------
+# MEASURED, not assumed: importing the erebor.noise chain above changes
+# EXACTLY ONE rcParam -- font.size 10.0 -> 16.0. Nothing else moves. (The
+# comment below about plt.style.use(["science"]) describes a real hazard on
+# hosts that HAVE scienceplots, but this one does not have it, so that call
+# fails and the font is the whole story here.)
+#
+# That one number made the page depend on the caller's import history:
+#
+#   fresh interpreter -> this file sets font.size 10 far above, the import
+#                        HERE raises it to 16, and the next figure renders
+#                        at 16.
+#   already imported  -> it was 16 before this file ran, this file's own
+#                        block set it to 10, and the next figure renders
+#                        at 10.
+#
+# One figure is drawn immediately below (the instrument-noise posteriors),
+# so that panel alone came out different: 25722 vs 27586 base64 chars,
+# 25806 pixels across the whole plot area, every other line of the page
+# identical. It is why the page was reproducible only in a child process.
+#
+# Pinned to 16 because that is what every page produced to date rendered
+# at, and reproduction is the requirement. It is NOT a considered choice
+# of font size -- it is an inherited side effect, now stated. If the page
+# should own its typography, change this to _BASE_FONT and expect every
+# noise panel to change with it.
+_NOISE_PANEL_FONT = 16.0
+plt.rcParams["font.size"] = _NOISE_PANEL_FONT
 plt.rcParams["text.usetex"] = _USETEX
 
 _nsh = min(3, SUB_NIT)
