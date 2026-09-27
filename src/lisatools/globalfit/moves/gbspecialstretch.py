@@ -20506,7 +20506,26 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """
         prev = self._recipe_step_serial
         self._recipe_step_serial = None if serial is None else int(serial)
-        if prev is not None and prev == self._recipe_step_serial:
+        if prev is None or prev == self._recipe_step_serial:
+            # ⚠ ``prev is None`` MEANS "FRESH PROCESS", NOT "STEP CHANGED".
+            # It used to fall through to the release, which wiped the
+            # persisted valve on every restart and defeated the whole
+            # ``band_rj_shutoff_w`` / ``band_shutoff_w_step`` channel: the
+            # bind path below is written to compare the STORED stamp against
+            # the current serial and KEEP a mask earned in the same step, and
+            # it never got the chance because setup_run runs first.
+            #
+            # Measured on the 3mo v9 run: occupied (walker, band) pairs still
+            # active went 1387 -> 54 -> 36 over 3.5 h inside job 644, then
+            # RESET to 1693 the moment job 645 restarted. Three restarts in
+            # 16 h meant the valve re-earned the same convergence three times
+            # and gb_search_1 never advanced.
+            #
+            # A fresh process has no opinion about the previous step, so it
+            # defers: the bind path releases if the stored stamp disagrees
+            # with the serial, and honours the mask if it matches. A genuine
+            # in-process step CHANGE still releases, which is the case this
+            # guard exists for.
             return
         self._release_search_band_shutoff("recipe step %s -> %s"
                                           % (prev, self._recipe_step_serial))

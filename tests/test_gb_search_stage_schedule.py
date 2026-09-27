@@ -677,6 +677,13 @@ class RjShutoffValveTest(unittest.TestCase):
 
     def test_a_new_recipe_step_releases_the_valve_and_the_window(self):
         m, bi = self._armed(conv_iter=2)
+        # ANNOUNCE THE STEP THIS VALVE IS EARNED UNDER. Without it the move
+        # has no previous serial and `begin_recipe_step` reads as a FRESH
+        # PROCESS, which deliberately does NOT release (2026-09-26) -- see
+        # test_a_fresh_process_does_NOT_release_the_persisted_valve below.
+        # Production always announces: a stage's setup_run calls
+        # recipe.begin_search_recipe_step(moves, serial) on entry.
+        m.begin_recipe_step(16)
         self._run(m, bi, [self._flat()] * 6)
         self.assertTrue(bi["band_rj_shutoff_w"].any())
         m.begin_recipe_step(17)
@@ -863,6 +870,7 @@ class StageConvergenceInterfaceTest(unittest.TestCase):
 
     def test_a_release_resets_pending_so_a_stage_cannot_read_zero(self):
         m, bi = self._armed(conv_iter=2)
+        m.begin_recipe_step(8)          # the step this valve is earned under
         for _ in range(6):
             self._step(m, bi)
         self.assertEqual(band_shutoff_w_pending_total([m]), 0)
@@ -870,6 +878,45 @@ class StageConvergenceInterfaceTest(unittest.TestCase):
         # the next stage must not inherit "converged" before it has run
         self.assertIsNone(m._shutoff_w_pending)
         self.assertFalse(band_shutoff_w_armed([m]))
+
+    def test_a_fresh_process_does_NOT_release_the_persisted_valve(self):
+        """A RESTART must not wipe what the store is carrying.
+
+        ``prev is None`` means "this process has not announced a step yet",
+        NOT "the step changed". It used to fall through to the release,
+        which defeated the whole band_rj_shutoff_w / band_shutoff_w_step
+        persistence channel: the bind path is written to compare the STORED
+        stamp against the current serial and KEEP a mask earned in the same
+        step, and setup_run's release ran first every time.
+
+        Measured on the 3mo v9 run: occupied (walker, band) pairs went
+        1387 -> 54 -> 36 over 3.5 h inside one job, then RESET to 1693 the
+        moment the next job restarted -- three times in 16 h, so
+        gb_search_1 never advanced.
+        """
+        m, bi = self._armed(conv_iter=2)
+        m.begin_recipe_step(4)
+        for _ in range(6):
+            self._step(m, bi)
+        self.assertTrue(bi["band_rj_shutoff_w"].any())
+        earned = bi["band_rj_shutoff_w"].copy()
+
+        # simulate the restart: a NEW move object over the SAME band_info,
+        # announcing the SAME step it was earned under.
+        m2 = _stage_move(shutoff=True, conv_iter=2)
+        m2._rj_band_shutoff_w = bi["band_rj_shutoff_w"]
+        self.assertIsNone(m2._recipe_step_serial)
+        m2.begin_recipe_step(4)
+        np.testing.assert_array_equal(bi["band_rj_shutoff_w"], earned)
+
+    def test_a_genuine_step_change_still_releases(self):
+        m, bi = self._armed(conv_iter=2)
+        m.begin_recipe_step(4)
+        for _ in range(6):
+            self._step(m, bi)
+        self.assertTrue(bi["band_rj_shutoff_w"].any())
+        m.begin_recipe_step(5)
+        self.assertFalse(bi["band_rj_shutoff_w"].any())
 
     def test_helper_walks_nested_trees_and_unwraps_weights(self):
         m, bi = self._armed(conv_iter=2)
