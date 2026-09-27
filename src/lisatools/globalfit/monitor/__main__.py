@@ -72,6 +72,16 @@ def _parser():
                          "for a different Tobs. Tens of minutes, CPU-only.")
     ap.add_argument("--subprocess", action="store_true",
                     help="render in a child interpreter. Output identical.")
+    # FIRST-CLASS, not just pass-through. These are the two overrides
+    # anyone actually reaches for, and requiring `-- --catalogue X` for
+    # them is a trap: the natural spelling produced "unrecognized
+    # arguments" on a real cluster invocation (2026-09-27).
+    ap.add_argument("--catalogue", default=None,
+                    help="GB catalogue hdf5 (or the directory holding it) "
+                         "for --build-truth. Normally unnecessary.")
+    ap.add_argument("--l1-brick", default=None,
+                    help="explicit mojito L1 .h5 for the injected orbits "
+                         "used by --build-truth. Normally unnecessary.")
     return ap
 
 
@@ -90,6 +100,10 @@ def main(argv=None):
     else:
         extra = []
     a = _parser().parse_args(argv)
+    for _flag, _val in (("--catalogue", a.catalogue),
+                        ("--l1-brick", a.l1_brick)):
+        if _val:
+            extra += [_flag, _val]
     run_dir = a.run_dir
     out = a.out or default_out_path(run_dir)
 

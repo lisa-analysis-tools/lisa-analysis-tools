@@ -178,3 +178,143 @@ class InProcessHandleLeakTest(unittest.TestCase):
         import lisatools.globalfit.monitor as mon
         src = Path(mon.__file__).read_text()
         self.assertIn("truncate a file which is already open", src)
+
+
+class CatalogueFlagTest(unittest.TestCase):
+    """--catalogue / --l1-brick are first-class, not pass-through only.
+
+    The natural spelling -- `--build-truth RUN --catalogue /path/x.hdf5` --
+    produced "unrecognized arguments" on a real cluster run, because the
+    only way through was `-- --catalogue /path/x.hdf5`. Requiring that is
+    a trap for the two overrides anyone actually reaches for.
+    """
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.run = os.path.join(self.d, "gf_prod_run")
+        os.makedirs(self.run)
+
+    def _call(self, argv):
+        with mock.patch.object(m, "build_monitor"), \
+                mock.patch.object(m, "check_truth",
+                                  return_value=(None, "absent")), \
+                mock.patch.object(m, "build_truth_set") as bt:
+            m.main(argv)
+        return bt.call_args.kwargs["extra_argv"]
+
+    def test_catalogue_is_accepted_in_the_natural_position(self):
+        got = self._call([self.run, "--build-truth",
+                          "--catalogue", "/p/wdwd.hdf5"])
+        self.assertEqual(got, ["--catalogue", "/p/wdwd.hdf5"])
+
+    def test_l1_brick_too(self):
+        got = self._call([self.run, "--build-truth",
+                          "--l1-brick", "/p/any_L1_x.h5"])
+        self.assertEqual(got, ["--l1-brick", "/p/any_L1_x.h5"])
+
+    def test_both_plus_double_dash_passthru_compose(self):
+        got = self._call([self.run, "--build-truth",
+                          "--catalogue", "/p/w.hdf5",
+                          "--", "--flo", "5e-4"])
+        self.assertEqual(got, ["--flo", "5e-4", "--catalogue", "/p/w.hdf5"])
+
+    def test_neither_given_means_no_extra_args(self):
+        self.assertEqual(self._call([self.run, "--build-truth"]), [])
+
+
+class CatalogueDirectoryLevelTest(unittest.TestCase):
+    """A directory candidate may be EITHER level.
+
+    MOJITO_CAT historically named the directory holding the file
+    (.../catalogues/); MOJITO_INFO_PATH names the TREE that holds
+    catalogues/ and data/. Trying only <dir>/<name> meant a correct
+    MOJITO_INFO_PATH resolved one level short and the build died having
+    "tried" a path that never existed.
+    """
+
+    def setUp(self):
+        from lisatools.globalfit.monitor import build_truth as bt
+        self.bt = bt
+        self.d = tempfile.mkdtemp()
+        self.cat = os.path.join(self.d, "catalogues", bt.MOJITO_CAT_NAME)
+        os.makedirs(os.path.dirname(self.cat))
+        open(self.cat, "wb").close()
+        self.env = mock.patch.dict(os.environ, {}, clear=False)
+        self.env.start()
+        for k in ("MOJITO_INFO_PATH", "MOJITO_CAT", "MOJITO_CACHE_DIR"):
+            os.environ.pop(k, None)
+        # Neutralise the ~/.mojito_cache default, or a real laptop cache
+        # resolves and the failure test never sees a failure.
+        os.environ["HOME"] = os.path.join(self.d, "nohome")
+        self.addCleanup(self.env.stop)
+
+    def test_the_TREE_level_resolves(self):
+        os.environ["MOJITO_INFO_PATH"] = self.d
+        self.assertEqual(self.bt.resolve_catalogue(), self.cat)
+
+    def test_the_catalogues_level_still_resolves(self):
+        os.environ["MOJITO_CAT"] = os.path.dirname(self.cat)
+        self.assertEqual(self.bt.resolve_catalogue(), self.cat)
+
+    def test_an_explicit_file_still_wins(self):
+        self.assertEqual(self.bt.resolve_catalogue(self.cat), self.cat)
+
+    def test_both_attempted_paths_are_named_when_it_fails(self):
+        """The error has to show what it looked for, or the next person
+        cannot tell a wrong variable from a wrong level."""
+        bad = os.path.join(self.d, "nope")
+        os.makedirs(bad)
+        os.environ["MOJITO_INFO_PATH"] = bad
+        # MOJITO_CAT_DEFAULT is computed at import from the ORIGINAL HOME,
+        # so patch it too -- otherwise the real cache satisfies the lookup.
+        with mock.patch.object(self.bt, "MOJITO_CAT_DEFAULT",
+                               os.path.join(bad, "none.hdf5")):
+            # SystemExit, not Exception -- build_truth is a CLI. That is
+            # precisely why build_truth_set has to convert it.
+            with self.assertRaises(SystemExit) as cm:
+                self.bt.resolve_catalogue()
+        msg = str(cm.exception.code)
+        self.assertIn("catalogues", msg,
+                      "the error must show BOTH levels it tried")
+
+
+class TruthFailureMustNotCostThePageTest(unittest.TestCase):
+    """A failed truth build costs overlays, never the report.
+
+    build_truth is a CLI: resolve_catalogue raises SystemExit, which
+    `except Exception` does not catch. On the cluster (2026-09-27) the
+    catalogue was not found, the truth build aborted, and THE PAGE WAS
+    NEVER WRITTEN -- the command simply ended.
+    """
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.run = os.path.join(self.d, "gf_prod_run")
+        os.makedirs(self.run)
+
+    def test_a_SystemExit_from_build_truth_still_renders_the_page(self):
+        import lisatools.globalfit.monitor as mon
+        with mock.patch.object(mon, "resolve_mojito_path",
+                               return_value=(None, "x")), \
+                mock.patch("lisatools.globalfit.monitor.build_truth.main",
+                           side_effect=SystemExit("no catalogue")), \
+                mock.patch.object(m, "build_monitor") as bm, \
+                mock.patch.object(m, "check_truth",
+                                  return_value=(None, "absent")), \
+                mock.patch.object(m.sys, "stderr"):
+            rc = m.main([self.run, "--build-truth"])
+        self.assertEqual(rc, 0)
+        bm.assert_called_once()
+
+    def test_build_truth_set_converts_SystemExit_to_RuntimeError(self):
+        import lisatools.globalfit.monitor as mon
+        import h5py
+        with h5py.File(os.path.join(self.run, "gf_prod_testing.h5"), "w") as f:
+            f.create_group("global_fit")
+        with mock.patch.object(mon, "resolve_mojito_path",
+                               return_value=(None, "x")), \
+                mock.patch("lisatools.globalfit.monitor.build_truth.main",
+                           side_effect=SystemExit("boom")):
+            with self.assertRaises(RuntimeError) as cm:
+                mon.build_truth_set(self.run)
+        self.assertIn("boom", str(cm.exception))

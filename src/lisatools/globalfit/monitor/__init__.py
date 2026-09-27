@@ -374,6 +374,17 @@ def build_truth_set(run_dir, extra_argv=()):
     logger.info("building the truth set: build_truth %s", " ".join(argv))
     try:
         rc = _bt_main(argv)
+    except SystemExit as e:
+        # build_truth is a CLI: resolve_catalogue and friends raise
+        # SystemExit, which `except Exception` does NOT catch. Left
+        # alone it propagates through the monitor and kills the whole
+        # command -- which is exactly what happened on the cluster
+        # (2026-09-27): the catalogue was not found, the truth build
+        # aborted, AND THE PAGE WAS NEVER WRITTEN. A missing truth set
+        # must cost you overlays, not the report.
+        raise RuntimeError(
+            f"build_truth exited: {e.code}"
+            if not isinstance(e.code, str) else str(e.code)) from e
     finally:
         if _saved is None:
             os.environ.pop("MOJITO_INFO_PATH", None)

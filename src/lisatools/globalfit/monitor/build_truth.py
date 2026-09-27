@@ -159,9 +159,21 @@ def resolve_catalogue(explicit=None):
         if not cand:
             continue
         cand = os.path.expanduser(cand)
-        # a directory is accepted and the catalogue looked up inside it
+        # A DIRECTORY IS ACCEPTED, AND IT MAY BE EITHER LEVEL. MOJITO_CAT
+        # historically named the directory holding the file
+        # (.../catalogues/), while MOJITO_INFO_PATH names the TREE that
+        # holds catalogues/ and data/. Trying only <dir>/<name> meant a
+        # correct MOJITO_INFO_PATH resolved to
+        # /shared/data/mojito_cache/wdwd_...hdf5 -- one level short of the
+        # real file -- and the build died having "tried" a path that never
+        # existed (cluster, 2026-09-27).
         if os.path.isdir(cand):
-            cand = os.path.join(cand, MOJITO_CAT_NAME)
+            for _c in (os.path.join(cand, MOJITO_CAT_NAME),
+                       os.path.join(cand, "catalogues", MOJITO_CAT_NAME)):
+                tried.append(_c)
+                if os.path.isfile(_c):
+                    return _c
+            continue
         tried.append(cand)
         if os.path.isfile(cand):
             return cand

@@ -138,6 +138,16 @@ def main(argv=None) -> int:
                          "peak and any matplotlib fault out of this process.")
     ap.add_argument("--timeout", type=float, default=1800.0,
                     help="seconds before the page build is killed")
+    # FIRST-CLASS, not just pass-through. These are the two overrides
+    # anyone actually reaches for, and requiring `-- --catalogue X` for
+    # them is a trap: the natural spelling produced "unrecognized
+    # arguments" on a real cluster invocation (2026-09-27).
+    ap.add_argument("--catalogue", default=None,
+                    help="GB catalogue hdf5 (or the directory holding it) "
+                         "for --build-truth. Normally unnecessary.")
+    ap.add_argument("--l1-brick", default=None,
+                    help="explicit mojito L1 .h5 for the injected orbits "
+                         "used by --build-truth. Normally unnecessary.")
     # SPLIT ON `--` BEFORE PARSING, do not use argparse.REMAINDER.
     # REMAINDER absorbs everything from the first token it does not
     # recognise onward -- INCLUDING flags this parser defines. With it,
@@ -151,6 +161,10 @@ def main(argv=None) -> int:
     else:
         _passthru = []
     a = ap.parse_args(argv)
+    for _flag, _val in (("--catalogue", a.catalogue),
+                        ("--l1-brick", a.l1_brick)):
+        if _val:
+            _passthru += [_flag, _val]
 
     if not os.path.isfile(a.tar):
         ap.error(f"{a.tar} is not a file")
