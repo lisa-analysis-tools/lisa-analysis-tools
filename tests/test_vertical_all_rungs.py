@@ -235,9 +235,17 @@ class ProductionPathUntouchedTest(unittest.TestCase):
         src = inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
         self.assertIn("_ar_state = None", src)
         self.assertIn("_vert_all_rungs_on()", src)
-        # The old sweep is still what runs when the state is None. Use the
-        # LAST _ar_state branch: the first is the label-window widening.
-        i = src.rindex("if _ar_state is not None:")
+        # The old sweep is still what runs when the state is None.
+        #
+        # Find the branch that actually CONTAINS the sweep rather than the
+        # first or last one: there are now three ``if _ar_state is not
+        # None:`` guards (label-window widening, the sweep, and the
+        # freeze-to-cache at the poll), and indexing by position made this
+        # test break the moment a fourth was added -- it was asserting
+        # about whichever guard happened to be last, not about the sweep.
+        _needle = "self._vertical_swap_sweep_all_rungs("
+        _j = src.index(_needle)
+        i = src.rindex("if _ar_state is not None:", 0, _j)
         blk = src[i:i + 1200]
         self.assertIn("self._vertical_swap_sweep_all_rungs(", blk)
         self.assertIn("else:", blk)
@@ -387,3 +395,122 @@ class AllRungsAreMeasuredNotInferredTest(unittest.TestCase):
             np.zeros(0), self.NB, np)
         # no vert_base -> nothing inferable -> only the live rungs score
         np.testing.assert_array_equal(scor, carrier >= 0)
+
+
+class FrozenRungsArePricedFromCacheTest(unittest.TestCase):
+    """A converged row keeps swapping; it just stops being re-priced.
+
+    USER RULING 2026-09-27: "you still swap the converged rows even if
+    they are turned off since their likelihood is frozen and just a label
+    switch."
+
+    Numerically neutral by construction -- a frozen row is out of
+    ``_half_pre`` so no proposal is ever accepted for it and its
+    ``ll_ref`` cannot move. What this pins is the REPRESENTATION: the
+    sweep must stop reading a frozen row's live arrays, which is the
+    prerequisite for evicting frozen rows from the buffer (1-yr TODO 7/8).
+    """
+
+    NB = 4
+
+    def _ar(self, n_cols=2, ntemps=3):
+        cols = np.array([0 * self.NB + 1, 1 * self.NB + 2], dtype=np.int64)
+        carrier = np.full((n_cols, ntemps), -1, dtype=np.int64)
+        carrier[0, 0] = 0          # row 0 lives on column 0, rung 0
+        carrier[1, 1] = 1          # row 1 lives on column 1, rung 1
+        occupied = np.ones((n_cols, ntemps), bool)
+        cached = np.zeros((n_cols, ntemps))
+        scorable = np.ones((n_cols, ntemps), bool)
+        frozen = np.zeros((n_cols, ntemps), bool)
+        return [cols, carrier, occupied, cached, scorable, frozen]
+
+    def _rows(self):
+        t_i = np.array([0, 1]); w_i = np.array([0, 1]); b_i = np.array([1, 2])
+        base = np.array([-10.0, -20.0]); ll = np.array([1.0, 2.0])
+        return t_i, w_i, b_i, base, ll
+
+    def test_a_frozen_carrier_is_priced_at_its_freeze_time_value(self):
+        ar = self._ar(); t_i, w_i, b_i, base, ll = self._rows()
+        n = g._ar_freeze_rows(ar, np.array([0]), t_i, w_i, b_i, base, ll,
+                              self.NB, np)
+        self.assertEqual(n, 1)
+        cols, carrier, occ, cached, scor, frozen = ar
+        ll[0] += 100.0                      # the live array moves...
+        L = g._vert_all_rung_L(carrier, cached, base, ll,
+                               np.array([0]), np.array([0]), np,
+                               frozen=frozen)
+        self.assertAlmostEqual(float(L[0]), -9.0)   # ...the price does not
+
+    def test_NEGATIVE_CONTROL_an_unfrozen_carrier_follows_the_live_value(self):
+        ar = self._ar(); t_i, w_i, b_i, base, ll = self._rows()
+        cols, carrier, occ, cached, scor, frozen = ar
+        ll[0] += 100.0
+        L = g._vert_all_rung_L(carrier, cached, base, ll,
+                               np.array([0]), np.array([0]), np,
+                               frozen=frozen)
+        self.assertAlmostEqual(float(L[0]), 91.0)
+
+    def test_the_freeze_value_equals_the_live_value_at_freeze_time(self):
+        """Identity: freezing must not shift the price."""
+        ar = self._ar(); t_i, w_i, b_i, base, ll = self._rows()
+        cols, carrier, occ, cached, scor, frozen = ar
+        before = float(g._vert_all_rung_L(carrier, cached, base, ll,
+                                          np.array([0]), np.array([0]), np,
+                                          frozen=frozen)[0])
+        g._ar_freeze_rows(ar, np.array([0]), t_i, w_i, b_i, base, ll,
+                          self.NB, np)
+        after = float(g._vert_all_rung_L(carrier, cached, base, ll,
+                                         np.array([0]), np.array([0]), np,
+                                         frozen=ar[5])[0])
+        self.assertAlmostEqual(before, after)
+
+    def test_freezing_a_row_that_is_not_the_carrier_is_REFUSED(self):
+        ar = self._ar(); t_i, w_i, b_i, base, ll = self._rows()
+        ar[1][0, 0] = 7                      # some other row is the carrier
+        n = g._ar_freeze_rows(ar, np.array([0]), t_i, w_i, b_i, base, ll,
+                              self.NB, np)
+        self.assertEqual(n, 0)
+        self.assertFalse(ar[5].any(), "wrote a cache entry on a bad belief")
+
+    def test_freezing_is_idempotent(self):
+        ar = self._ar(); t_i, w_i, b_i, base, ll = self._rows()
+        self.assertEqual(g._ar_freeze_rows(ar, np.array([0]), t_i, w_i, b_i,
+                                           base, ll, self.NB, np), 1)
+        self.assertEqual(g._ar_freeze_rows(ar, np.array([0]), t_i, w_i, b_i,
+                                           base, ll, self.NB, np), 0)
+
+    def test_an_accepted_swap_permutes_frozen_with_cached_and_carrier(self):
+        """Otherwise the arriving LIVE row is priced from a cache slot
+        that now holds someone else's total -- only for pairs where
+        exactly one side was frozen, which is the hard case to spot."""
+        cols, carrier, occ, cached, scor, frozen = self._ar()
+        ci = np.array([0]); t_c = np.array([0]); t_h = np.array([1])
+        cached[0, 0], cached[0, 1] = -9.0, -3.0
+        frozen[0, 0] = True
+        for arr in (carrier, cached, occ, scor, frozen):
+            _h = arr[ci, t_h].copy()
+            arr[ci, t_h] = arr[ci, t_c]
+            arr[ci, t_c] = _h
+        self.assertTrue(bool(frozen[0, 1]), "the flag stayed behind")
+        self.assertFalse(bool(frozen[0, 0]))
+        self.assertAlmostEqual(float(cached[0, 1]), -9.0)
+
+    def test_the_frozen_flag_does_NOT_clear_the_carrier(self):
+        """t_i / beta must keep following an accepted swap for a frozen
+        row: the cold-lnL observe picks cold slots with ``t_i == 0`` and
+        ``_converge_gate_mask`` reads t_i at the poll and in absorb."""
+        ar = self._ar(); t_i, w_i, b_i, base, ll = self._rows()
+        g._ar_freeze_rows(ar, np.array([0]), t_i, w_i, b_i, base, ll,
+                          self.NB, np)
+        self.assertEqual(int(ar[1][0, 0]), 0,
+                         "carrier cleared; t_i would go stale")
+
+    def test_the_state_tuple_carries_six_entries(self):
+        import inspect
+        src = inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
+        self.assertIn("_ar_state = (_cols, _carrier, _occ, _cached, _scor,",
+                      src)
+        sweep = inspect.getsource(
+            g.GBSpecialBase._vertical_swap_sweep_all_rungs)
+        self.assertIn(
+            "cols, carrier, occupied, cached, scorable, frozen = ar", sweep)

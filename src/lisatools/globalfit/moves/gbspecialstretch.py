@@ -2653,7 +2653,67 @@ def _vert_all_rung_tables(t_i, w_i, b_i, ntemps, nwalkers, num_bands,
     return cols, carrier, occupied, n_alive
 
 
-def _vert_all_rung_L(carrier, cached, cell_ll_base, ll_ref, ci, t, xp):
+def _ar_freeze_rows(ar, rows, t_i, w_i, b_i, cell_ll_base, ll_ref,
+                    num_bands, xp, name="?"):
+    """Move rows from LIVE pricing to the CACHED CONSTANT. Returns #frozen.
+
+    USER RULING 2026-09-27. A converged row stops proposing but keeps
+    transporting: "you still swap the converged rows even if they are
+    turned off since their likelihood is frozen and just a label switch."
+    This records that explicitly -- the rung's total is pinned to what it
+    was at the instant it froze, and the sweep prices it from the cache
+    from then on.
+
+    ⚠ PRICING FLAG ONLY. The row REMAINS the carrier, so an accepted swap
+    still rewrites its ``t_i``/``beta``. Three readers depend on that
+    being current for frozen rows: the cold-lnL ``observe`` at the
+    add-back (it selects cold slots with ``t_i == 0``, and a stale label
+    would fold a hot slab into the cold peak), and
+    ``_converge_gate_mask`` both at the poll and in ``absorb``. Setting
+    ``carrier = -1`` here would break all three.
+
+    ⚠ GUARDED, NOT TRUSTED. Only a row that IS its rung's carrier may be
+    frozen. A mismatch means the all-rung tables and the block disagree
+    about who lives where, and writing a cache entry on that belief would
+    price the swap off another row's likelihood -- silently. Those rows
+    are skipped and reported.
+
+    Idempotent: a rung already frozen is left alone, so repeated polls
+    cost nothing and cannot re-pin a value.
+    """
+    cols, carrier, occupied, cached, scorable, frozen = ar
+    rows = xp.asarray(rows)
+    if int(rows.shape[0]) == 0:
+        return 0
+    col_key = (w_i[rows].astype(xp.int64) * int(num_bands)
+               + b_i[rows].astype(xp.int64))
+    ci = xp.searchsorted(cols, col_key)
+    ci = xp.clip(ci, 0, max(int(cols.shape[0]) - 1, 0))
+    t = t_i[rows].astype(xp.int64)
+    ok = (cols[ci] == col_key) & (carrier[ci, t] == rows)
+    if not bool(ok.all()):
+        logger.warning(
+            "[GB_VERT %s] %d row(s) asked to freeze are not their rung's "
+            "carrier (or their column is absent from the all-rung table); "
+            "skipped. The tables and the block disagree about who lives "
+            "where, and caching on that belief would price a swap off "
+            "another row's likelihood.",
+            name, int((~ok).sum()))
+    fresh = ok & ~frozen[ci, t]
+    if not bool(fresh.any()):
+        return 0
+    _ci, _t, _r = ci[fresh], t[fresh], rows[fresh]
+    cached[_ci, _t] = (xp.asarray(cell_ll_base)[_r].astype(xp.float64)
+                       + xp.asarray(ll_ref)[_r].astype(xp.float64))
+    frozen[_ci, _t] = True
+    # Already true for a carrier; set it so the invariant is local to
+    # this function rather than inherited from how the row got here.
+    scorable[_ci, _t] = True
+    return int(fresh.sum())
+
+
+def _vert_all_rung_L(carrier, cached, cell_ll_base, ll_ref, ci, t, xp,
+                     frozen=None):
     """Whole-cell likelihood of rung ``t`` of column ``ci``.
 
     A rung carrying a picked row is scored LIVE (``cell_ll_base + ll_ref``
@@ -2665,6 +2725,22 @@ def _vert_all_rung_L(carrier, cached, cell_ll_base, ll_ref, ci, t, xp):
     """
     c = carrier[ci, t]
     live = c >= 0
+    if frozen is not None:
+        # A FROZEN row is priced from the cache, not from its live arrays
+        # (user ruling 2026-09-27: "you still swap the converged rows even
+        # if they are turned off since their likelihood is frozen and just
+        # a label switch").
+        #
+        # Numerically this is a no-op BY CONSTRUCTION: a frozen row is out
+        # of ``_half_pre`` so no proposal is ever accepted for it, and its
+        # ``ll_ref`` therefore cannot move -- the cache was written from
+        # ``cell_ll_base + ll_ref`` at the moment it froze and stays equal
+        # to it. What it buys is representational: the sweep stops READING
+        # a frozen row's live arrays, which is the prerequisite for
+        # evicting frozen rows from the buffer at all (1-yr TODO 7/8), and
+        # it makes "frozen rungs still swap" an explicit, tested property
+        # rather than an accident of the row still being a carrier.
+        live = live & ~frozen[ci, t]
     out = xp.asarray(cached[ci, t]).astype(xp.float64).copy()
     if bool(live.any()):
         cl = c[live]
@@ -15919,7 +15995,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 "totals; ll_ref alone is an add-delta against DIFFERENT "
                 "residuals.")
         xp = self.xp
-        cols, carrier, occupied, cached, scorable = ar
+        cols, carrier, occupied, cached, scorable, frozen = ar
         ci, t_c, t_h = _vert_all_rung_pairs(
             carrier, occupied, parity, int(self.ntemps), xp)
         if int(ci.shape[0]) == 0:
@@ -15936,9 +16012,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         w_hc = (cols[ci] // int(self.num_bands)).astype(t_i.dtype)
         b_hc = (cols[ci] % int(self.num_bands)).astype(t_i.dtype)
         L_c = _vert_all_rung_L(carrier, cached, cell_ll_base, ll_ref,
-                               ci, t_c, xp)
+                               ci, t_c, xp, frozen=frozen)
         L_h = _vert_all_rung_L(carrier, cached, cell_ll_base, ll_ref,
-                               ci, t_h, xp)
+                               ci, t_h, xp, frozen=frozen)
         b_cold = band_temps[b_hc, t_c]
         b_hot = band_temps[b_hc, t_h]
         paccept = (b_cold - b_hot) * (L_h - L_c)
@@ -16057,6 +16133,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         _sc_h = scorable[ci, t_h].copy()
         scorable[ci, t_h] = scorable[ci, t_c]
         scorable[ci, t_c] = _sc_h
+        # FROZEN moves with the model too, and it MUST: the flag says
+        # "price this rung from the cache", the cache entry has just
+        # changed places, and leaving the flag behind would price the
+        # arriving LIVE row from a cache slot that now holds someone
+        # else's total -- silently, and only for pairs where exactly one
+        # side was frozen.
+        _fz_h = frozen[ci, t_h].copy()
+        frozen[ci, t_h] = frozen[ci, t_c]
+        frozen[ci, t_c] = _fz_h
 
         # --- cell-ll bookkeeping: ONE-SIDED re-point (hazard 3) ----------
         # A carrier row's slot now claims the OTHER rung's label. ll0/led0/
@@ -17530,7 +17615,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     t_i, w_i, b_i, int(self.num_bands), xp,
                     buffer_obj=buffer_obj,
                     nwalkers=int(band_sorter.nwalkers))
-                _ar_state = (_cols, _carrier, _occ, _cached, _scor)
+                # FROZEN table: which rungs are priced from ``_cached``
+                # rather than from their live arrays. Starts all-False;
+                # rows move into it as they converge (see _ar_freeze_rows).
+                _ar_frozen = xp.zeros(_carrier.shape, dtype=bool)
+                _ar_state = (_cols, _carrier, _occ, _cached, _scor,
+                             _ar_frozen)
         # NOTE(vertical ll audit): the ratio reads ``ll_ref`` -- the cell
         # ll WITH its picked source in. Do NOT audit that against
         # ``band_likelihoods`` mid-block: that measures the slab with the
@@ -17670,6 +17760,17 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 _cv_active = ~(
                     _cv_done & _converge_gate_mask(t_i, converge.n_gate, xp)
                 )
+                # Rows that arrive already converged are priced from the
+                # cache from the first repeat, not from arrays nothing
+                # will move again.
+                if _ar_state is not None:
+                    _fz_n = _ar_freeze_rows(
+                        _ar_state, xp.where(~_cv_active)[0], t_i, w_i, b_i,
+                        _vert_base, ll_ref, int(self.num_bands), xp,
+                        name=self.name)
+                    if _fz_n and _vert_census is not None:
+                        _vert_census["frozen_cached"] = (
+                            _vert_census.get("frozen_cached", 0) + _fz_n)
                 _half_pre = _build_half_pre()
                 if _acc is not None:
                     self._imk_rebuild_halves(_acc, _half_pre)
@@ -18162,6 +18263,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # Hot cells keep their stale reference: the ll error is
                 # beta-suppressed and each refresh is a full setup.
                 far = far & (beta >= self.sighet_refresh_min_beta)
+                # NOT masked by the all-rungs `frozen` table on purpose. A
+                # frozen row is an inactive row: nothing proposes into it,
+                # so `curr` stops changing and `drift` stops growing. Each
+                # frozen row can therefore be flagged at most once more (the
+                # refresh sets ref_track = curr, zeroing the drift), and its
+                # swap price is the cached constant either way. Masking here
+                # would buy ~one setup per frozen row while adding a second
+                # place where `frozen` has to stay in sync with the carrier.
                 if bool(far.any()):
                     with _tspan(tm, "inmodel_sighet_refresh"):
                         buffer_obj.setup_in_model_likelihood(
@@ -18372,6 +18481,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                       # keep sampling: they are the transport that feeds the
                       # cold rungs still working.
                       _cv_n_frozen = _n_fr
+                      # EXACTLY the mask that feeds _cv_active -- the
+                      # union of the rule/ceiling freeze and the phase-B
+                      # tail -- so a phase-B hot row is cached too, not
+                      # just the rule half.
+                      if _ar_state is not None:
+                          _fz_n = _ar_freeze_rows(
+                              _ar_state, xp.where(xp.asarray(_frozen))[0],
+                              t_i, w_i, b_i, _vert_base, ll_ref,
+                              int(self.num_bands), xp, name=self.name)
+                          if _fz_n and _vert_census is not None:
+                              _vert_census["frozen_cached"] = (
+                                  _vert_census.get("frozen_cached", 0)
+                                  + _fz_n)
                       _cv_active = xp.asarray(~_frozen)
                       _half_pre = _build_half_pre()
                       if _acc is not None:
@@ -18552,7 +18674,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 f"{'' if _swap_cens is not None else ' (gate off)'} | "
                 + (
                     f"ALL-RUNGS on, {int(_cn.get('unscorable', 0))} pair(s) "
-                    f"dropped as unpriceable | "
+                    f"dropped as unpriceable, "
+                    f"{int(_cn.get('frozen_cached', 0))} frozen rung(s) "
+                    f"priced from cache | "
                     if _ar_state is not None else ""
                 )
                 + f"per rung pair -- {_rungs or 'none'}"
