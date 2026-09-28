@@ -184,11 +184,34 @@ def after_save(gb_reader, comm, main_rank, i, watchdog, *,
         out = os.environ.get("GF_MONITOR_OUT")
         timeout = _num("GF_MONITOR_TIMEOUT", 1800.0)
 
-        st = time.perf_counter()
-        from . import build_monitor
+        # TAR-ONLY MODE (GF_MONITOR_PAGE=0). The two products cost very
+        # different amounts on the saver rank: the tar is an extract plus
+        # a gzip, the page is a whole child interpreter rendering every
+        # panel. Building only the tar and rendering the page offline
+        # with `python -m lisatools.globalfit.monitor.from_tar SNAP.tar.gz`
+        # is the cheap way to keep per-iteration snapshots, and it was
+        # unreachable until now: GF_MONITOR_SNAPSHOT could turn the tar
+        # OFF but nothing could turn the page off while keeping the tar.
+        _want_page = _flag("GF_MONITOR_PAGE", "1")
+        _want_snap = _flag("GF_MONITOR_SNAPSHOT", "1")
+        if not _want_page and not _want_snap:
+            # Not an error, but it is certainly not what anyone meant:
+            # the hook is armed and would produce nothing at all.
+            if not getattr(watchdog, "_warned_no_products", False):
+                watchdog._warned_no_products = True
+                logger.warning(
+                    "[GF_MONITOR] GF_MONITOR_AFTER_SAVE is on but both "
+                    "GF_MONITOR_PAGE and GF_MONITOR_SNAPSHOT are 0, so "
+                    "the hook produces nothing. Unset "
+                    "GF_MONITOR_AFTER_SAVE to disable it properly.")
+            return
 
-        build_monitor(run_dir, out, timeout=timeout, check=False)
-        if _flag("GF_MONITOR_SNAPSHOT", "1"):
+        st = time.perf_counter()
+        if _want_page:
+            from . import build_monitor
+
+            build_monitor(run_dir, out, timeout=timeout, check=False)
+        if _want_snap:
             from .snapshot import build_snapshot
 
             build_snapshot(run_dir)

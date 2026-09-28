@@ -66,6 +66,11 @@ def _parser():
                          "beside the run folder)")
     ap.add_argument("--snapshot", action="store_true",
                     help="also build <RUN_DIR>_snapshot.tar.gz beside it")
+    ap.add_argument("--snapshot-only", action="store_true",
+                    help="build ONLY the tar, skip the page. The page can "
+                         "then be rendered offline from it with "
+                         "`python -m lisatools.globalfit.monitor.from_tar "
+                         "SNAP.tar.gz`. In-run equivalent: GF_MONITOR_PAGE=0.")
     ap.add_argument("--build-truth", action="store_true",
                     help="generate the detectability truth set into the run "
                          "directory first when it is missing or was built "
@@ -132,18 +137,23 @@ def main(argv=None):
     if _state:
         print(f"[monitor] run state: {_state}")
 
-    st = time.perf_counter()
-    build_monitor(run_dir, out, in_process=not a.subprocess)
-    print(f"[monitor] wrote {out} in {time.perf_counter() - st:.1f} s")
+    if not a.snapshot_only:
+        st = time.perf_counter()
+        build_monitor(run_dir, out, in_process=not a.subprocess)
+        print(f"[monitor] wrote {out} in {time.perf_counter() - st:.1f} s")
 
-    if a.snapshot:
+    if a.snapshot or a.snapshot_only:
         st = time.perf_counter()
         tar = build_snapshot(run_dir)
         if tar:
             print(f"[monitor] wrote {tar} in {time.perf_counter() - st:.1f} s")
         else:
-            print("[monitor] snapshot FAILED (see warnings above); the page "
-                  "was still written", file=sys.stderr)
+            # Under --snapshot-only the tar is the ONLY product, so say
+            # that rather than reassuring the operator about a page that
+            # was never asked for.
+            print("[monitor] snapshot FAILED (see warnings above)"
+                  + ("" if a.snapshot_only else "; the page was still "
+                     "written"), file=sys.stderr)
             return 1
     return 0
 

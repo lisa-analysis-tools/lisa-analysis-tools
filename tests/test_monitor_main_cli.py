@@ -13,6 +13,7 @@ appear, both look right, and only opening the tar shows the page missing.
 
 from __future__ import annotations
 
+import io
 import os
 import tempfile
 import unittest
@@ -44,6 +45,25 @@ class SnapshotFlagTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         bm.assert_called_once()
         bs.assert_called_once_with(self.run)
+
+    def test_snapshot_only_builds_the_TAR_and_NOT_the_page(self):
+        with mock.patch.object(m, "build_monitor") as bm, \
+                mock.patch.object(m, "build_snapshot",
+                                  return_value="/t.tar.gz") as bs:
+            rc = m.main(["--snapshot-only", self.run])
+        self.assertEqual(rc, 0)
+        bm.assert_not_called()
+        bs.assert_called_once_with(self.run)
+
+    def test_snapshot_only_failure_does_not_claim_a_page_was_written(self):
+        """The old message reassured the operator about a page that, in
+        this mode, was never asked for."""
+        with mock.patch.object(m, "build_monitor"), \
+                mock.patch.object(m, "build_snapshot", return_value=None), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            rc = m.main(["--snapshot-only", self.run])
+        self.assertEqual(rc, 1)
+        self.assertNotIn("page was still written", err.getvalue())
 
     def test_the_page_is_still_built_first(self):
         """No longer a containment guarantee -- the page is a SIBLING of

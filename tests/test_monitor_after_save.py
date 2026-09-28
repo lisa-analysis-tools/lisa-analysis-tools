@@ -75,7 +75,7 @@ class HookGateTest(unittest.TestCase):
         self.env = mock.patch.dict(os.environ, {}, clear=False)
         self.env.start()
         for k in ("GF_MONITOR_AFTER_SAVE", "GF_MONITOR_ITER",
-                  "GF_MONITOR_SNAPSHOT"):
+                  "GF_MONITOR_SNAPSHOT", "GF_MONITOR_PAGE"):
             os.environ.pop(k, None)
         self.addCleanup(self.env.stop)
 
@@ -135,6 +135,59 @@ class HookGateTest(unittest.TestCase):
                 mock.patch.object(snap, "build_snapshot") as bs:
             _run_loop(_Comm(_payloads()), _Reader())
         bs.assert_called_once_with("/run/dir")
+
+    def test_GF_MONITOR_PAGE_0_builds_the_TAR_ONLY(self):
+        """The asymmetry this knob removes.
+
+        GF_MONITOR_SNAPSHOT could turn the tar off, but nothing could
+        turn the PAGE off while keeping the tar -- and the page is the
+        expensive half on the saver rank (a whole child interpreter
+        rendering every panel, vs an extract plus a gzip). Tar-only plus
+        offline `monitor.from_tar` is the cheap way to keep a snapshot
+        every iteration.
+        """
+        os.environ["GF_MONITOR_AFTER_SAVE"] = "1"
+        os.environ["GF_MONITOR_PAGE"] = "0"
+        from lisatools.globalfit.monitor import snapshot as snap
+        with mock.patch.object(mon, "build_monitor") as bm, \
+                mock.patch.object(snap, "build_snapshot") as bs:
+            _run_loop(_Comm(_payloads()), _Reader())
+        bm.assert_not_called()
+        bs.assert_called_once_with("/run/dir")
+
+    def test_the_page_is_still_the_DEFAULT(self):
+        """Absent the knob nothing changes -- no silent behaviour flip."""
+        os.environ["GF_MONITOR_AFTER_SAVE"] = "1"
+        from lisatools.globalfit.monitor import snapshot as snap
+        with mock.patch.object(mon, "build_monitor") as bm, \
+                mock.patch.object(snap, "build_snapshot") as bs:
+            _run_loop(_Comm(_payloads()), _Reader())
+        bm.assert_called_once()
+        bs.assert_called_once()
+
+    def test_both_products_off_warns_and_builds_nothing(self):
+        """An armed hook that produces nothing is never what was meant."""
+        os.environ["GF_MONITOR_AFTER_SAVE"] = "1"
+        os.environ["GF_MONITOR_PAGE"] = "0"
+        os.environ["GF_MONITOR_SNAPSHOT"] = "0"
+        from lisatools.globalfit.monitor import snapshot as snap
+        with mock.patch.object(mon, "build_monitor") as bm, \
+                mock.patch.object(snap, "build_snapshot") as bs, \
+                self.assertLogs(mh.logger, level="WARNING") as cap:
+            _run_loop(_Comm(_payloads()), _Reader())
+        bm.assert_not_called()
+        bs.assert_not_called()
+        self.assertTrue(any("produces nothing" in m for m in cap.output))
+
+    def test_tar_only_still_never_reaches_the_saver_loop_on_failure(self):
+        os.environ["GF_MONITOR_AFTER_SAVE"] = "1"
+        os.environ["GF_MONITOR_PAGE"] = "0"
+        reader = _Reader()
+        from lisatools.globalfit.monitor import snapshot as snap
+        with mock.patch.object(snap, "build_snapshot",
+                               side_effect=RuntimeError("boom")):
+            _run_loop(_Comm(_payloads()), reader)   # must not raise
+        self.assertEqual(reader.calls, 1)
 
     def test_a_failing_build_never_reaches_the_saver_loop(self):
         os.environ["GF_MONITOR_AFTER_SAVE"] = "1"
