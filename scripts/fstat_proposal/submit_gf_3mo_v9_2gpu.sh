@@ -1115,7 +1115,15 @@ export GB_PSD_MIRROR_PARITY_PROPOSES=0
 # if the profile ever failed to apply, the run would hold stage 1's floor
 # rather than silently running stage 1 at stage 2's.
 export GB_OPT_SNR_LIMIT_SEARCH=8.0
-export GB_SEARCH_SOURCE_EVERY=10
+# 10 -> 5 (user ruling 2026-09-27). Consumed by
+# run_combined_staged.py::source_pe (NOT by src/ -- a grep of the
+# package alone says this knob is dead, and it is not).
+# Measured on 6mo job 650: sobbh_pe 144.0 s + mbh_pe 95.7 s +
+# emri_pe 71.1 s = 310.8 s on the iterations they run, ~4.9% of a
+# 6377 s iteration. At every-10 that averaged 31 s/iteration; at
+# every-5 it averages 62 s. full_pe is untouched -- all three run
+# every iteration there.
+export GB_SEARCH_SOURCE_EVERY=5
 
 # RJ pick thinning. UNSET as of 2026-08-28 -- the value now lives in code
 # (_SEARCH_RJ_FLIP_DEFAULT / _PE_RJ_FLIP_DEFAULT in recipe.py, both 0.2),

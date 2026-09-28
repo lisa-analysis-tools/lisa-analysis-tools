@@ -28483,15 +28483,50 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         if _k_latest is not None:
             _have = self._epoch_peak_min_F(self._epoch_dir(_k_latest))
             _want = float(fstat_peak_min_F())
-            if (_have is not None
-                    and abs(_have - _want) <= 1e-9 * max(1.0, abs(_want))):
+            _floor_same = (_have is not None
+                           and abs(_have - _want)
+                           <= 1e-9 * max(1.0, abs(_want)))
+            # ⚠ THE FLOOR IS NOT THE ONLY THING THAT GOES STALE
+            # (2026-09-27). This used to decline on the floor alone, which
+            # conflates the two reasons the arming fires: a genuine stage
+            # change (floor moved -> refit) and a RESTART re-arming a step
+            # that never changed (floor identical -> load). The second is
+            # what the decline exists for. But an epoch fitted against a
+            # residual many iterations old is stale whatever its floor
+            # says, and reloading it hands the search a birth grid for a
+            # model that has moved on.
+            #
+            # Staleness is measured with the SAME cadence the ordinary
+            # refit uses, so the two cannot disagree about what "old"
+            # means: if the cadence would have refit by now, refit.
+            _age = None
+            if _floor_same and self.fstat_refit_every > 0:
+                try:
+                    _age = (self._fstat_clock()
+                            - int(self._epoch_fit_clock(_k_latest)))
+                except Exception:      # noqa: BLE001
+                    _age = None
+            _stale = (_age is not None and _age >= self.fstat_refit_every)
+            if _floor_same and not _stale:
                 logger.info(
                     "[V9-STAGE %s] forced refit requested, but epoch %d was "
                     "already fitted at F >= %.4f (SNR %.3f) -- the floor in "
-                    "force. Loading it instead of paying for another comb "
-                    "scan.", self.name, _k_latest, _have,
-                    float(np.sqrt(2.0 * _want)))
+                    "force -- and it is %s old against a cadence of %d. "
+                    "Loading it instead of paying for another comb scan.",
+                    self.name, _k_latest, _have,
+                    float(np.sqrt(2.0 * _want)),
+                    f"{_age} tick(s)" if _age is not None else "of unknown age",
+                    self.fstat_refit_every)
                 return None
+            if _floor_same and _stale:
+                logger.info(
+                    "[V9-STAGE %s] forced refit: epoch %d carries the floor "
+                    "in force (F >= %.4f) but was fitted %d tick(s) ago "
+                    "against a cadence of %d, so its grid is stale for the "
+                    "residual the search is now proposing into. Refitting "
+                    "rather than reloading.",
+                    self.name, _k_latest, _have, _age,
+                    self.fstat_refit_every)
         key = (self._fstat_root, serial)
         k = _FORCED_FSTAT_EPOCH.get(key)
         if k is None:
@@ -28623,7 +28658,24 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
     # class-level so the search and pe instances (which share the root)
     # seed once and journal without fighting.
     _FSTAT_CLOCK_BASENAME = "clock.json"
-    _FSTAT_CLOCK_WRITE_EVERY = 10
+    #: How often the refit clock is journaled to ``clock.json``.
+    #:
+    #: 10 -> 1 (2026-09-27). The clock is SEEDED from that journal on every
+    #: process start, so journaling every 10 ticks meant a job shorter than
+    #: 10 iterations contributed NOTHING: the next process re-seeded from
+    #: the same stale value. Worse, the last-fit mark rides in the epoch's
+    #: DONE.json and does NOT rewind, so the clock could seed BELOW it --
+    #: ``clock - last_fit_hit`` goes negative and the cadence can never
+    #: elapse again.
+    #:
+    #: Measured on 6mo v9 job 650: epoch 4 stamped clock=5 at 21:11, and
+    #: the next refit did not come for EIGHTEEN HOURS -- jobs 646, 648 and
+    #: the first third of 650 were spent climbing back to a value the run
+    #: had already reached the previous day. Epochs 5/6/7 only resumed once
+    #: one process ran long enough to pass it.
+    #:
+    #: A json.dump of one integer against a ~1.8 h iteration is free.
+    _FSTAT_CLOCK_WRITE_EVERY = 1
     _fstat_clock_seeded: set = set()
     _fstat_clock_written: dict = {}
 
@@ -28705,6 +28757,21 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
                 pass
             if stored > counts.get(branch, 0):
                 counts[branch] = stored
+            # ⚠ NEVER SEED BELOW THE LAST-FIT MARK. That mark lives in the
+            # epoch's DONE.json and does not rewind, so a journal that lost
+            # ground (a crash between writes, an older file restored) would
+            # make ``clock - _fstat_last_fit_hit`` NEGATIVE and the cadence
+            # could never elapse again -- silently, with no error and no
+            # refit, which is exactly the 18-hour stall measured on job 650.
+            # Belt to the WRITE_EVERY=1 brace above.
+            _lf = int(getattr(self, "_fstat_last_fit_hit", -1) or -1)
+            if _lf > counts.get(branch, 0):
+                logger.warning(
+                    "[FSTAT_CLOCK] journal said %d but the last fit was "
+                    "stamped at %d; clamping the clock up so the cadence "
+                    "can elapse. A clock behind its own last-fit mark can "
+                    "never refit again.", counts.get(branch, 0), _lf)
+                counts[branch] = _lf
         clock = int(counts.get(branch, 0))
         last_written = GBSpecialRJFStatGridMove._fstat_clock_written.get(
             root, -self._FSTAT_CLOCK_WRITE_EVERY)

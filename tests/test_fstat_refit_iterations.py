@@ -193,3 +193,72 @@ class MultiRankShipTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClockJournalGranularityTest(unittest.TestCase):
+    """The refit clock must not lose a short job's progress.
+
+    REGRESSION (2026-09-27). ``_FSTAT_CLOCK_WRITE_EVERY`` was 10 and the
+    clock is SEEDED from ``clock.json`` on every process start, so a job
+    shorter than 10 iterations contributed nothing -- the next process
+    re-seeded from the same stale value. Measured on 6mo v9 job 650:
+    epoch 4 stamped clock=5 at 21:11 and the next refit came EIGHTEEN
+    HOURS later, because jobs 646/648 and the first third of 650 were
+    spent climbing back to a value the run had already reached.
+    """
+
+    def test_the_journal_is_written_every_tick(self):
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            GBSpecialRJFStatGridMove as M)
+        self.assertEqual(
+            M._FSTAT_CLOCK_WRITE_EVERY, 1,
+            "a granularity above 1 loses every job shorter than it")
+
+    def test_the_clamp_cannot_leave_the_clock_below_its_last_fit(self):
+        """A clock behind its own last-fit mark can never refit again.
+
+        ``clock - _fstat_last_fit_hit`` goes negative and no cadence
+        elapses, silently and with no error -- the shape of the 18-hour
+        stall.
+        """
+        import inspect
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            GBSpecialRJFStatGridMove as M)
+        src = inspect.getsource(M._fstat_clock)
+        self.assertIn("_fstat_last_fit_hit", src)
+        self.assertIn("counts[branch] = _lf", src)
+
+
+class ForcedRefitStalenessTest(unittest.TestCase):
+    """A forced refit declines only for a FRESH epoch, not any epoch.
+
+    The decline exists because the arming decision is process-global and
+    so fires on every restart, which would otherwise open a fresh epoch
+    (a full comb scan) per resume. But it used to key on the peak FLOOR
+    alone, so an epoch fitted against a residual many iterations old was
+    reloaded whatever its age -- handing the search a birth grid for a
+    model that had moved on.
+    """
+
+    def test_it_measures_age_with_the_refit_cadence(self):
+        import inspect
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            GBSpecialRJFStatGridMove as M)
+        src = inspect.getsource(M._consume_forced_refit)
+        # the two halves of the new condition
+        self.assertIn("_floor_same", src)
+        self.assertIn("_stale", src)
+        # staleness is the SAME cadence the ordinary refit uses, so the
+        # two cannot disagree about what "old" means
+        self.assertIn("self.fstat_refit_every", src)
+        self.assertIn("_epoch_fit_clock", src)
+
+    def test_a_fresh_epoch_at_the_same_floor_is_still_reloaded(self):
+        """The restart case the decline exists for must still work."""
+        import inspect
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            GBSpecialRJFStatGridMove as M)
+        src = inspect.getsource(M._consume_forced_refit)
+        self.assertIn("if _floor_same and not _stale:", src)
+        self.assertIn("return None",
+                      src.split("if _floor_same and not _stale:")[1][:800])
