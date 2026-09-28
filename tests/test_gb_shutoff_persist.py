@@ -514,3 +514,65 @@ class MultiRankPeakFoldTest(unittest.TestCase):
         src = inspect.getsource(g.GBSpecialBase._update_search_band_shutoff)
         self.assertIn("walker(s) reporting", src)
         self.assertNotIn("int(np.isfinite(_view.value).sum()),", src)
+
+
+class HeadPeakAllocationTest(unittest.TestCase):
+    """The head-side block peak is sized from the STATE, never ``self.nwalkers``.
+
+    THE CRASH (6mo v9 relaunch, 2026-09-27, first move of the first
+    iteration)::
+
+        File ".../gbspecialstretch.py", line 26288, in _propose_orchestrated
+            (int(self.nwalkers), int(self.num_bands)), -np.inf,
+        AttributeError: 'VGBSpecialStretchMove' object has no attribute 'nwalkers'
+
+    ``self.nwalkers`` is assigned only INSIDE the propose paths, after the
+    branch shapes are read, and no constructor sets it -- so on the first
+    propose of a process it does not exist at the point 65851492 allocated
+    the peak. ``vgb_pe`` is the first GB-family move of the cycle, which is
+    why VGB was the one to hit it.
+    """
+
+    class _Bare:
+        """A move with ``num_bands`` and deliberately NO ``nwalkers``."""
+        num_bands = 5
+
+    class _State:
+        def __init__(self, ntemps, nwalkers):
+            self.log_like = np.zeros((ntemps, nwalkers))
+
+    def test_a_move_without_nwalkers_still_gets_a_peak(self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        move = self._Bare()
+        self.assertFalse(hasattr(move, "nwalkers"), "fixture must reproduce the crash")
+        pk = g.GBSpecialBase._alloc_cold_peak_from_state(move, self._State(3, 4))
+        self.assertEqual(pk.shape, (4, 5), "(nwalkers from state, num_bands from move)")
+        self.assertTrue(np.isneginf(pk).all())
+        self.assertEqual(pk.dtype, np.float64)
+
+    def test_it_takes_the_walker_axis_from_log_like_not_the_temperature_axis(self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        pk = g.GBSpecialBase._alloc_cold_peak_from_state(
+            self._Bare(), self._State(ntemps=24, nwalkers=2))
+        self.assertEqual(pk.shape, (2, 5))
+
+    def test_an_unreadable_state_yields_None_not_an_exception(self):
+        """Telemetry must never take a propose down."""
+        import lisatools.globalfit.moves.gbspecialstretch as g
+
+        class _NoLogLike:
+            pass
+
+        self.assertIsNone(
+            g.GBSpecialBase._alloc_cold_peak_from_state(self._Bare(), _NoLogLike()))
+
+    def test_neither_head_side_propose_path_reads_self_nwalkers_for_the_peak(self):
+        """The regression guard: both allocations go through the helper."""
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        for fn in (g.GBSpecialBase._propose_orchestrated,
+                   g.GBSpecialBase._propose_legacy):
+            src = inspect.getsource(fn)
+            self.assertIn("_alloc_cold_peak_from_state(state)", src, fn.__name__)
+            self.assertNotIn("(int(self.nwalkers), int(self.num_bands)), -np.inf",
+                             src, fn.__name__)

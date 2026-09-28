@@ -21390,6 +21390,38 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     #: w0 == 0, i.e. the head's, and silently reached no other walker.
     _cold_lnl_block_peak = None
 
+    def _alloc_cold_peak_from_state(self, state):
+        """A fresh ``(nwalkers, num_bands)`` -inf block peak, sized from STATE.
+
+        ⚠ NEVER from ``self.nwalkers``. That attribute is only assigned
+        INSIDE the propose paths (``self.nwalkers = nwalkers`` after the
+        branch shapes are read), i.e. AFTER the point where this peak is
+        allocated, and no constructor sets it. On the first propose of a
+        process it does not exist yet -- which is exactly how the 6mo v9
+        relaunch died on its very first move (2026-09-27, cluster
+        traceback: ``AttributeError: 'VGBSpecialStretchMove' object has no
+        attribute 'nwalkers'`` at the head-side allocation in
+        ``_propose_orchestrated``). The GB moves only survived the same
+        line because something earlier in their cycle had happened to set
+        the attribute.
+
+        ``state.log_like`` is ``(ntemps, nwalkers)`` on every ``GFState``
+        the two head-side propose paths receive, and it is what the rank
+        body already sizes its own block peak from (``new_part.log_like``),
+        so both allocations now read the same source of truth. Returns
+        ``None`` rather than raising if the shape cannot be read: the peak
+        is telemetry for the shutoff gate and must never take a propose
+        down; ``observe`` and the folds all skip a ``None`` peak.
+        """
+        try:
+            n_w = int(np.shape(state.log_like)[1])
+            n_b = int(self.num_bands)
+        except Exception:      # noqa: BLE001 -- telemetry, never fatal
+            return None
+        if n_w <= 0 or n_b <= 0:
+            return None
+        return np.full((n_w, n_b), -np.inf, dtype=np.float64)
+
     def _bind_shutoff_window(self, bi, shape) -> None:
         """Record the ``band_info`` handle and ensure its arrays exist.
 
@@ -26408,9 +26440,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # the head folds the blocks back from the replies; without the
         # fan-out there is no serve and no reply, so the whole ensemble is
         # one block starting at w0 = 0 and the fold below is local.
-        self._cold_lnl_block_peak = np.full(
-            (int(self.nwalkers), int(self.num_bands)), -np.inf,
-            dtype=np.float64)
+        # Sized from ``state``, NOT ``self.nwalkers`` -- that attribute is
+        # first assigned further down this method and does not exist on a
+        # first propose (the 2026-09-27 VGB relaunch crash).
+        self._cold_lnl_block_peak = self._alloc_cold_peak_from_state(state)
         # Tempering-cadence census: every propose of this branch ticks the
         # shared counter (see _temper_cadence_fire).
         GBSpecialBase._branch_propose_counts[self.branch_name] = (
@@ -27541,9 +27574,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # the head folds the blocks back from the replies; without the
         # fan-out there is no serve and no reply, so the whole ensemble is
         # one block starting at w0 = 0 and the fold below is local.
-        self._cold_lnl_block_peak = np.full(
-            (int(self.nwalkers), int(self.num_bands)), -np.inf,
-            dtype=np.float64)
+        # Sized from ``state``, NOT ``self.nwalkers`` -- that attribute is
+        # first assigned further down this method and does not exist on a
+        # first propose (the 2026-09-27 VGB relaunch crash).
+        self._cold_lnl_block_peak = self._alloc_cold_peak_from_state(state)
         # Tempering-cadence census: every propose of this branch ticks the
         # shared counter (see _temper_cadence_fire).
         GBSpecialBase._branch_propose_counts[self.branch_name] = (
