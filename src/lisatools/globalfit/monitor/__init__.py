@@ -474,12 +474,20 @@ def build_monitor(run_dir: str, out_path: Optional[str] = None, *,
                   mojito: Optional[str] = None,
                   in_process: bool = True,
                   check: bool = True) -> Optional[str]:
-    """Build the HTML page for ``run_dir`` in a FRESH interpreter.
+    """Build the HTML page for ``run_dir``.
+
+    ⚠ DOCSTRING CORRECTED 2026-09-27. This used to say the build happens
+    "in a FRESH interpreter" and that the subprocess was "a correctness
+    requirement, not a preference". That stopped being true when
+    ``in_process`` became the default: the reason a child was needed was
+    that importing ``lisatools`` pulls eryn's ``plt.style.use(["science"])``
+    before the generator sets its own rcParams, which restyled exactly one
+    panel. That is now handled by pinning ``font.size`` explicitly
+    (``_NOISE_PANEL_FONT``), and both paths were measured byte-identical.
+    ``in_process=False`` keeps the child as an escape hatch.
 
     Returns the path written, or ``None`` when ``check=False`` and the
-    build failed. See the module docstring for why this is a subprocess
-    and not an import -- it is a correctness requirement, not a
-    preference.
+    build failed.
 
     Published atomically: the child writes a temp beside the target and
     this renames it into place, so a browser refreshing the page never

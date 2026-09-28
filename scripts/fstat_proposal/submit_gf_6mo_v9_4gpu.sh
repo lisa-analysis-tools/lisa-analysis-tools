@@ -651,6 +651,32 @@ export MOJITO_DATA_PATH=/shared/data/mojito_cache
 # the residual-spectrum and data/template/residual panels. Required by
 # GF_MONITOR_AFTER_SAVE=1; harmless otherwise -- the sampler never reads it.
 export MOJITO_INFO_PATH=/shared/data/mojito_cache
+# ---- MID-RUN MONITOR (user request 2026-09-27) -----------------------------
+# The saver rank (walkers=[0,0), no sampling work) builds the page and the
+# snapshot tar in the quiet gap after a save, so the artifact tracks the run
+# instead of waiting for a manual pull. Outputs land BESIDE the run folder:
+#   <STORE_DIR>/<run>_monitor.html   and   <run>_snapshot.tar.gz
+#
+# ⚠ THE HOOK CAN DISABLE ITSELF, BY DESIGN. It measures every build against
+# the run's own save cadence and, if a build ever causes the saver to DROP a
+# state -- which would lose a stored iteration permanently, since the saver
+# coalesces to the newest payload when its queue backs up -- it prints a
+# banner and stays off for the rest of the run. The run is never affected.
+# If that fires, raise GF_MONITOR_ITER or set GF_MONITOR_SNAPSHOT=0.
+export GF_MONITOR_AFTER_SAVE=1
+# Build on EVERY save. At ~2 h/iteration against a page build of order
+# minutes this is well inside the 25% warn fraction; the watchdog is the
+# backstop if that stops being true.
+export GF_MONITOR_ITER=1
+# The tar as well as the page -- it is what actually gets downloaded.
+# Set to 0 if the watchdog starts complaining; the page alone is much
+# cheaper than the multi-GB archive.
+export GF_MONITOR_SNAPSHOT=1
+# Hard ceiling on one build. Well above the observed cost; exists so a
+# pathological build cannot sit on the saver indefinitely.
+export GF_MONITOR_TIMEOUT=1800
+# Requires MOJITO_INFO_PATH, exported above.
+
 export USE_GPU=1
 export GPU_BACKEND=cuda13x
 # GPU list follows what slurm actually granted (self-dispatch block above);
