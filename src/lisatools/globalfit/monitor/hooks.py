@@ -214,7 +214,12 @@ def after_save(gb_reader, comm, main_rank, i, watchdog, *,
         if _want_snap:
             from .snapshot import build_snapshot
 
-            build_snapshot(run_dir)
+            # GF_MONITOR_SNAPSHOT_SHORT=1 -> <run>_short.tar.gz: log
+            # information and the most recent state, nothing large. It
+            # is a SEPARATE file from the full snapshot, so turning it
+            # on does not overwrite or invalidate whatever full tar the
+            # run has already produced.
+            build_snapshot(run_dir, short=_flag("GF_MONITOR_SNAPSHOT_SHORT"))
         elapsed = time.perf_counter() - st
 
         watchdog.report(

@@ -66,6 +66,12 @@ def _parser():
                          "beside the run folder)")
     ap.add_argument("--snapshot", action="store_true",
                     help="also build <RUN_DIR>_snapshot.tar.gz beside it")
+    ap.add_argument("--short", action="store_true",
+                    help="build <RUN_DIR>_short.tar.gz instead: log "
+                         "information and the most recent state, no large "
+                         "files (keep=1, every oversized *.log reduced to "
+                         "filtered + tail, nothing over 5 MB, no fstat). "
+                         "In-run equivalent: GF_MONITOR_SNAPSHOT_SHORT=1.")
     ap.add_argument("--snapshot-only", action="store_true",
                     help="build ONLY the tar, skip the page. The page can "
                          "then be rendered offline from it with "
@@ -142,9 +148,9 @@ def main(argv=None):
         build_monitor(run_dir, out, in_process=not a.subprocess)
         print(f"[monitor] wrote {out} in {time.perf_counter() - st:.1f} s")
 
-    if a.snapshot or a.snapshot_only:
+    if a.snapshot or a.snapshot_only or a.short:
         st = time.perf_counter()
-        tar = build_snapshot(run_dir)
+        tar = build_snapshot(run_dir, short=a.short)
         if tar:
             print(f"[monitor] wrote {tar} in {time.perf_counter() - st:.1f} s")
         else:

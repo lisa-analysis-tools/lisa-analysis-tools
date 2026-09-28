@@ -44,7 +44,7 @@ class SnapshotFlagTest(unittest.TestCase):
             rc = m.main(["--snapshot", self.run])
         self.assertEqual(rc, 0)
         bm.assert_called_once()
-        bs.assert_called_once_with(self.run)
+        bs.assert_called_once_with(self.run, short=False)
 
     def test_snapshot_only_builds_the_TAR_and_NOT_the_page(self):
         with mock.patch.object(m, "build_monitor") as bm, \
@@ -53,7 +53,7 @@ class SnapshotFlagTest(unittest.TestCase):
             rc = m.main(["--snapshot-only", self.run])
         self.assertEqual(rc, 0)
         bm.assert_not_called()
-        bs.assert_called_once_with(self.run)
+        bs.assert_called_once_with(self.run, short=False)
 
     def test_snapshot_only_failure_does_not_claim_a_page_was_written(self):
         """The old message reassured the operator about a page that, in
@@ -338,3 +338,36 @@ class TruthFailureMustNotCostThePageTest(unittest.TestCase):
             with self.assertRaises(RuntimeError) as cm:
                 mon.build_truth_set(self.run)
         self.assertIn("boom", str(cm.exception))
+
+
+class ShortFlagTest(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.run = os.path.join(self.d, "gf_prod_run")
+        os.makedirs(self.run)
+
+    def test_short_implies_building_a_tar(self):
+        """--short alone is a request for the short tar; it should not
+        need --snapshot as well."""
+        with mock.patch.object(m, "build_monitor"), \
+                mock.patch.object(m, "build_snapshot",
+                                  return_value="/t_short.tar.gz") as bs:
+            rc = m.main(["--short", self.run])
+        self.assertEqual(rc, 0)
+        bs.assert_called_once_with(self.run, short=True)
+
+    def test_short_with_snapshot_only_skips_the_page(self):
+        with mock.patch.object(m, "build_monitor") as bm, \
+                mock.patch.object(m, "build_snapshot",
+                                  return_value="/t_short.tar.gz") as bs:
+            rc = m.main(["--snapshot-only", "--short", self.run])
+        self.assertEqual(rc, 0)
+        bm.assert_not_called()
+        bs.assert_called_once_with(self.run, short=True)
+
+    def test_plain_snapshot_is_still_the_FULL_one(self):
+        with mock.patch.object(m, "build_monitor"), \
+                mock.patch.object(m, "build_snapshot",
+                                  return_value="/t.tar.gz") as bs:
+            m.main(["--snapshot", self.run])
+        bs.assert_called_once_with(self.run, short=False)
