@@ -27,6 +27,8 @@ import tempfile
 import unittest
 
 import h5py
+import copy
+
 import numpy as np
 
 from lisatools.globalfit.state import (SEARCH_SHUTOFF_WINDOW_FIELDS,
@@ -576,3 +578,116 @@ class HeadPeakAllocationTest(unittest.TestCase):
             self.assertIn("_alloc_cold_peak_from_state(state)", src, fn.__name__)
             self.assertNotIn("(int(self.nwalkers), int(self.num_bands)), -np.inf",
                              src, fn.__name__)
+
+
+class ValveWritesMustLandInNewStateTest(unittest.TestCase):
+    """The valve wrote into the state eryn THROWS AWAY.
+
+    ``_arm_search_stage(state)`` and the ``_cold_lnl_view`` binding both
+    run BEFORE ``new_state = GFState(state, copy=True)``, and
+    ``GBState.__init__`` DEEP-COPIES band_info into a new dict of new
+    arrays. Every cached reference therefore pointed at the incoming
+    state's dict, which is discarded the moment new_state is adopted.
+
+    6mo v9 job 659, store row 23 (iteration 1), after a judge that had
+    just run over 1902 occupied cells:
+        band_cold_logl_peak_w   finite 1905 / 4928   (head folds it into
+                                                      new_state -> saved)
+        band_cold_logl_max_w    finite    0 / 4928   (judge -> old dict)
+        band_cold_logl_w        finite    0 / 4928
+        streak_w, reset_w all 0; band_rj_shutoff_w all False
+    So max stays -inf forever, every pair "improves" at every judge, the
+    streak never leaves 0, and no band can ever shut. 3mo jobs 653/658
+    show the same across six consecutive within-job iterations.
+    """
+
+    NW, NB = 2, 3
+
+    def _band_info(self):
+        import lisatools.globalfit.state as st
+        bi = {"num_bands": self.NB, "nwalkers": self.NW}
+        st.ensure_search_shutoff_window(bi, self.NB, self.NW)
+        bi["band_rj_shutoff_w"] = np.zeros((self.NW, self.NB), dtype=bool)
+        return bi
+
+    @staticmethod
+    def _view(bi, shape):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        return g.cold_band_lnl_from_band_info(bi, shape)
+
+    def test_a_view_on_the_OLD_dict_leaves_the_NEW_one_untouched(self):
+        """The bug, stated as a test."""
+        old = self._band_info()
+        new = copy.deepcopy(old)                  # what GBState does
+        v = self._view(old, (self.NW, self.NB))
+        v.peak[:] = -5.0
+        v.judge(4.0, 3, np.ones((self.NW, self.NB), dtype=np.int64))
+        self.assertTrue(np.isfinite(old["band_cold_logl_max_w"]).all())
+        self.assertFalse(np.isfinite(new["band_cold_logl_max_w"]).any(),
+                         "the new dict must be untouched -- if this ever "
+                         "passes, deepcopy stopped copying and the whole "
+                         "premise changed")
+
+    def test_a_view_on_the_NEW_dict_is_what_gets_saved(self):
+        """The fix: rebind after the copy and the judge's work survives."""
+        old = self._band_info()
+        new = copy.deepcopy(old)
+        v = self._view(new, (self.NW, self.NB))
+        v.peak[:] = -5.0
+        v.judge(4.0, 3, np.ones((self.NW, self.NB), dtype=np.int64))
+        self.assertTrue(np.isfinite(new["band_cold_logl_max_w"]).all())
+        np.testing.assert_allclose(new["band_cold_logl_max_w"], -5.0)
+        np.testing.assert_allclose(new["band_cold_logl_w"], -5.0)
+
+    def test_two_judges_on_the_CARRIED_dict_give_streak_1_then_2(self):
+        """The 3mo signature is 0, 0 -- every judge a first judge."""
+        bi = self._band_info()
+        occ = np.ones((self.NW, self.NB), dtype=np.int64)
+        v = self._view(bi, (self.NW, self.NB))
+        v.peak[:] = -5.0
+        v.judge(4.0, 3, occ)                      # first: sets the max
+        self.assertTrue((bi["band_shutoff_streak_w"] == 0).all())
+        v.peak[:] = -5.0                          # no improvement
+        v.judge(4.0, 3, occ)
+        self.assertTrue((bi["band_shutoff_streak_w"] == 1).all())
+        v.peak[:] = -5.0
+        v.judge(4.0, 3, occ)
+        self.assertTrue((bi["band_shutoff_streak_w"] == 2).all())
+
+    def test_conv_iter_non_improving_judges_shut_the_band(self):
+        bi = self._band_info()
+        occ = np.ones((self.NW, self.NB), dtype=np.int64)
+        v = self._view(bi, (self.NW, self.NB))
+        conv = None
+        for _ in range(4):
+            v.peak[:] = -5.0
+            conv = v.judge(4.0, 3, occ)
+        self.assertTrue(np.asarray(conv).all(),
+                        "3 non-improving judges must converge at conv_iter=3")
+
+    def test_the_peak_is_RESET_after_each_judge(self):
+        """Otherwise new_state's peak accumulates across iterations."""
+        bi = self._band_info()
+        v = self._view(bi, (self.NW, self.NB))
+        v.peak[:] = -5.0
+        v.judge(4.0, 3, np.ones((self.NW, self.NB), dtype=np.int64))
+        self.assertFalse(np.isfinite(v.peak).any())
+
+    def test_the_updater_REBINDS_from_new_state_before_reading_shut(self):
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._update_search_band_shutoff)
+        self.assertIn("_bi_new = self._band_shutoff_band_info(new_state)", src)
+        self.assertIn("self._rj_band_shutoff_w = _bi_new", src)
+        self.assertIn("self._cold_lnl_view = _v_new", src)
+        self.assertLess(src.index("_bi_new = self._band_shutoff_band_info"),
+                        src.index("shut = self._rj_band_shutoff_w"),
+                        "the rebind must precede the read it corrects")
+
+    def test_the_saved_arrays_include_the_window(self):
+        """storage_arrays keeps only np.ndarray entries of band_info, so
+        the values have to be IN that dict to reach the store at all."""
+        import lisatools.globalfit.state as st
+        for name in st.SEARCH_SHUTOFF_WINDOW_FIELDS:
+            bi = self._band_info()
+            self.assertIsInstance(bi[name], np.ndarray, name)

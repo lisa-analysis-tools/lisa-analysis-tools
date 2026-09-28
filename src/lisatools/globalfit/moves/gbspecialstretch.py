@@ -21840,6 +21840,43 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """
         if not self._search_shutoff_per_walker:
             return
+        # ⚠ RESOLVE FROM ``new_state``, NOT FROM THE MOVE'S CACHED REFS.
+        #
+        # ``_arm_search_stage(state)`` and the ``_cold_lnl_view`` binding
+        # both run BEFORE ``new_state = GFState(state, copy=True)``, and
+        # ``GBState.__init__`` DEEP-COPIES band_info -- a new dict with
+        # new arrays. So every cached reference points into the INCOMING
+        # state's dict, which eryn discards the moment it adopts
+        # new_state. The valve was reading and writing a throwaway.
+        #
+        # Measured on 6mo v9 job 659, store row 23 (iteration 1):
+        #   band_cold_logl_peak_w   finite 1905 / 4928  <- the head FOLDS
+        #                                                  this into
+        #                                                  new_state
+        #   band_cold_logl_max_w    finite    0 / 4928  <- the judge wrote
+        #   band_cold_logl_w        finite    0 / 4928     the OLD dict
+        #   streak_w / reset_w all 0, band_rj_shutoff_w all False
+        # The judge had run minutes earlier over 1902 occupied cells and
+        # by construction sets max = cur and streak += 1 on each. None of
+        # it survived; only the peak, which is folded into new_state,
+        # did. Same signature on 3mo jobs 653 and 658 over six
+        # consecutive within-job iterations: every judge behaves like a
+        # first judge, so max stays -inf, every pair "improves", the
+        # streak never leaves 0 and nothing can ever shut.
+        #
+        # Two further consequences of the same bug: the judge saw only
+        # the head's own cap_stats sample and never the multi-rank peak,
+        # so 65851492's fold landed in an array nobody read; and
+        # new_state's peak was never consumed or reset, so it
+        # accumulated across iterations.
+        _bi_new = self._band_shutoff_band_info(new_state)
+        if _bi_new is not None and _bi_new.get("band_rj_shutoff_w") is not None:
+            self._shutoff_band_info = _bi_new
+            self._rj_band_shutoff_w = _bi_new["band_rj_shutoff_w"]
+            _v_new = cold_band_lnl_from_band_info(
+                _bi_new, self._rj_band_shutoff_w.shape)
+            if _v_new is not None:
+                self._cold_lnl_view = _v_new
         shut = self._rj_band_shutoff_w
         if shut is None:
             return
