@@ -55,4 +55,43 @@ def discover_run_logs(run_dir):
                 )
                 continue
             found[key] = path
-    return [found[k] for k in sorted(found)]
+
+    # ---- slurm stdout: the SUPERSET, and the only source of some lines ---
+    #
+    # ⚠ WITHOUT THIS THE PAGE IS BLIND ON THE CLUSTER. Measured on the 6mo
+    # v9 tars (2026-09-28): ``slurm_stdout_<job>.log`` is a verbatim
+    # superset of ``globalfit_run.log`` plus the per-rank logs (3000/3000
+    # and 2960/3000 sampled lines found in it), AND it alone carries
+    # ``[GF_TIMING]``, ``[V9-SEED]``, the ``[r4/saver]`` lines and the
+    # stage table -- those never reach the run logs at all. So:
+    #
+    #  * ``GFT_RE`` could never match on a cluster-built page, which is
+    #    why the "search efficiency" panel has been dead there, and
+    #  * a page built from a snapshot whose head log was shipped as the
+    #    filtered + tail pair (``globalfit_run_filtered.log`` /
+    #    ``_tail.log``, which the names above do not match) saw NO head
+    #    text at all, and a short tar gave it nothing whatsoever.
+    #
+    # Appended LAST so the head log keeps priority for everything it does
+    # carry, and only the NEWEST stdout is taken: older ones are dead jobs
+    # whose lines would be replayed as if current.
+    _stdouts = []
+    for root, dirs, fns in os.walk(run_dir):
+        dirs.sort()
+        for fn in sorted(fns):
+            if re.match(r"^slurm_stdout_\d+\.log$", fn):
+                p = os.path.join(root, fn)
+                try:
+                    _stdouts.append((os.path.getmtime(p), p))
+                except OSError:
+                    continue
+    out = [found[k] for k in sorted(found)]
+    if _stdouts:
+        out.append(max(_stdouts)[1])
+    elif not out:
+        # Neither kind present: say so rather than silently rendering a
+        # page with every log-derived panel empty.
+        print(f"# WARNING: no run log and no slurm_stdout_*.log under "
+              f"{run_dir}; every log-derived panel will be empty",
+              file=sys.stderr)
+    return out

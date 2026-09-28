@@ -573,6 +573,24 @@ class BandScheduler:
             order = xp.lexsort(xp.stack((temp, walker, band)))
         else:
             order = xp.argsort(counts)
+        # ⚠ WRITTEN ONCE, NEVER RE-SYNCED. ``exchange_cell_labels_batch``
+        # relabels the SORTER's sources (special_band_inds / temp_inds /
+        # walker_inds) and touches neither this array nor ``slot_cell``,
+        # so after an accepted vertical swap ``slot_specials[S]`` still
+        # names the slot's OLD label while the sources sitting in that
+        # slot carry the new one. The SET of labels is unchanged -- a
+        # swap exchanges two labels both already present -- so lookups
+        # BY LABEL still resolve; it is the slot -> label ASSOCIATION
+        # that goes stale.
+        #
+        # Acquitted as the cause of the job-662 cold over-credit
+        # (2026-09-28): that error is uncorrelated with accepted swaps
+        # and appears in units with zero of them, and the picked-row
+        # sweep has always relabelled this way while job 643 measured a
+        # clean 0.02. Recorded because nobody had written it down, and
+        # because whether advance() / refill / the all-rungs residency
+        # lookup actually depend on the association is an open question,
+        # not a settled one.
         self.cell_specials = uni[order]
         self.cell_counts = counts[order]
         self.cell_run = xp.zeros_like(self.cell_counts)
@@ -6177,6 +6195,19 @@ class BandSorter(LISAToolsParallelModule):
         With a deferred window open (:meth:`begin_cell_label_window`) this
         composes into the window instead and the table is untouched until
         the flush; the observable end state is identical.
+
+        ⚠ THIS DOES NOT TOUCH THE SCHEDULER. Only the sorter's
+        ``special_band_inds`` / ``temp_inds`` / ``walker_inds`` move.
+        ``BandScheduler.cell_specials`` is written once at setup and
+        ``slot_cell`` is never updated, so afterwards
+        ``scheduler.slot_specials[S]`` names the slot's OLD label while
+        the sources in that slot carry the new one. A caller needing the
+        current slot -> label association must maintain it itself: the
+        cell-ll bracket does (``spec`` re-pointed and the whole bracket
+        traded, in both vertical sweeps), and the all-rungs sweep
+        carries its own ``ar_slot`` map permuted on accept for exactly
+        this reason. See the note at ``cell_specials`` for why this is
+        recorded rather than fixed.
         """
         if self._deferred_labels is not None:
             self._defer_exchange(specials_a, temps_a, walkers_a,

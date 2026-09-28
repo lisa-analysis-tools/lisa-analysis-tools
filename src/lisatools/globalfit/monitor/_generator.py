@@ -98,7 +98,46 @@ def discover_run_logs(run_dir):
                 )
                 continue
             found[key] = path
-    return [found[k] for k in sorted(found)]
+
+    # ---- slurm stdout: the SUPERSET, and the only source of some lines ---
+    #
+    # ⚠ WITHOUT THIS THE PAGE IS BLIND ON THE CLUSTER. Measured on the 6mo
+    # v9 tars (2026-09-28): ``slurm_stdout_<job>.log`` is a verbatim
+    # superset of ``globalfit_run.log`` plus the per-rank logs (3000/3000
+    # and 2960/3000 sampled lines found in it), AND it alone carries
+    # ``[GF_TIMING]``, ``[V9-SEED]``, the ``[r4/saver]`` lines and the
+    # stage table -- those never reach the run logs at all. So:
+    #
+    #  * ``GFT_RE`` could never match on a cluster-built page, which is
+    #    why the "search efficiency" panel has been dead there, and
+    #  * a page built from a snapshot whose head log was shipped as the
+    #    filtered + tail pair (``globalfit_run_filtered.log`` /
+    #    ``_tail.log``, which the names above do not match) saw NO head
+    #    text at all, and a short tar gave it nothing whatsoever.
+    #
+    # Appended LAST so the head log keeps priority for everything it does
+    # carry, and only the NEWEST stdout is taken: older ones are dead jobs
+    # whose lines would be replayed as if current.
+    _stdouts = []
+    for root, dirs, fns in os.walk(run_dir):
+        dirs.sort()
+        for fn in sorted(fns):
+            if re.match(r"^slurm_stdout_\d+\.log$", fn):
+                p = os.path.join(root, fn)
+                try:
+                    _stdouts.append((os.path.getmtime(p), p))
+                except OSError:
+                    continue
+    out = [found[k] for k in sorted(found)]
+    if _stdouts:
+        out.append(max(_stdouts)[1])
+    elif not out:
+        # Neither kind present: say so rather than silently rendering a
+        # page with every log-derived panel empty.
+        print(f"# WARNING: no run log and no slurm_stdout_*.log under "
+              f"{run_dir}; every log-derived panel will be empty",
+              file=sys.stderr)
+    return out
 
 
 if __name__ != "__main__":
@@ -2260,16 +2299,51 @@ else:
     GB_FATE_TXT = ""
 
 # ---- 6. f-stat fit ----
-fdir = os.path.join(RUN_DIR, "gb_fstat_fit", "shared")
-epochs = sorted([d for d in os.listdir(fdir)] if os.path.isdir(fdir) else [])
-# COMPLETE epochs only (2026-08-15): an epoch directory exists as soon as the
-# fit STARTS, and the 23-mo comb alone is a 1.19-billion-evaluation sweep, so
-# a snapshot very often catches a half-written epoch. Requiring both cache
-# files keeps a mid-fit run from killing the whole page.
-epochs = [d for d in epochs
-          if os.path.exists(os.path.join(fdir, d, "fstat_grid_comb.npz"))
-          and os.path.exists(
-              os.path.join(fdir, d, "fstat_grid_peaks_stacked.npz"))]
+# ⚠ THE POOL DIRECTORY IS NOT ALWAYS CALLED "shared". Production writes
+# per-stage pools -- 6mo v9 uses ``gb_fstat_fit/shared_search`` -- so the
+# hard-coded "shared" resolved to a path that does not exist on the
+# cluster and the comb / peaks panels have been silently missing from
+# every cluster-built page. Take any ``gb_fstat_fit/*`` pool, newest
+# usable one wins, with the legacy name still preferred when present so
+# an older run renders exactly as before.
+_froot = os.path.join(RUN_DIR, "gb_fstat_fit")
+_pools = []
+if os.path.isdir(_froot):
+    for _d in sorted(os.listdir(_froot)):
+        _p = os.path.join(_froot, _d)
+        if os.path.isdir(_p):
+            _pools.append(_p)
+_legacy = os.path.join(_froot, "shared")
+if _legacy in _pools:
+    _pools.remove(_legacy)
+    _pools.insert(0, _legacy)
+
+
+def _complete_epochs(d):
+    """Epoch dirs under ``d`` carrying BOTH cache files."""
+    if not os.path.isdir(d):
+        return []
+    return [e for e in sorted(os.listdir(d))
+            if os.path.exists(os.path.join(d, e, "fstat_grid_comb.npz"))
+            and os.path.exists(
+                os.path.join(d, e, "fstat_grid_peaks_stacked.npz"))]
+
+
+fdir, epochs = _legacy, []
+for _p in _pools:
+    _e = _complete_epochs(_p)
+    if _e:
+        fdir, epochs = _p, _e
+        break
+if not epochs and _pools:
+    print(f"# WARNING: gb_fstat_fit pools {[os.path.basename(p) for p in _pools]}"
+          f" hold no COMPLETE epoch (both fstat_grid_comb.npz and "
+          f"fstat_grid_peaks_stacked.npz)", file=sys.stderr)
+# (COMPLETE epochs only -- 2026-08-15 -- is enforced by _complete_epochs
+# above: an epoch directory exists as soon as the fit STARTS, and the
+# 23-mo comb alone is a 1.19-billion-evaluation sweep, so a snapshot very
+# often catches a half-written epoch. Requiring both cache files keeps a
+# mid-fit run from killing the whole page.)
 fstat_meta = {}
 if epochs:
     ed = os.path.join(fdir, epochs[-1])
@@ -2308,9 +2382,12 @@ if epochs:
         fig_b64(fig, "fstat_peaks")
 else:
     MISSING.append(
-        "No COMPLETE fstat epoch cache under gb_fstat_fit/shared -- the grid "
-        "fit is still running (its epoch dir appears at fit start, the "
-        "comb/peaks caches only when it finishes).")
+        "No COMPLETE fstat epoch cache under gb_fstat_fit/* -- either the "
+        "grid fit is still running (its epoch dir appears at fit start, "
+        "the comb/peaks caches only when it finishes), or this page was "
+        "built from a SNAPSHOT: the tar drops everything under "
+        "gb_fstat_fit except DONE.json unless it was built with "
+        "include_fstat.")
 
 # ---- 7. VGB ----
 # Matches the sampled columns in the same order the store writes them, so

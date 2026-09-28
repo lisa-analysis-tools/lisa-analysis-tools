@@ -286,3 +286,119 @@ class ArgvDefaultTest(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm:
                 ft.main()
         self.assertNotEqual(cm.exception.code, 0)
+
+
+def _load_generator():
+    """Load the PACKAGED generator without running its main body.
+
+    ``_generator.py`` guards everything after its helpers with
+    ``if __name__ != "__main__": raise SystemExit(0)`` -- the 2026-09-26
+    rule that it must never be imported (importing lisatools pulls
+    eryn's ``plt.style.use(['science'])`` before the generator's own
+    rcParams and silently restyles a panel). Loading it by spec and
+    swallowing the SystemExit keeps that rule while still letting the
+    helpers above the guard be tested.
+    """
+    import importlib.util
+    import os as _os
+    path = _os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+        "src", "lisatools", "globalfit", "monitor", "_generator.py")
+    spec = importlib.util.spec_from_file_location("_gen_under_test", path)
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except SystemExit:
+        pass
+    return mod
+
+
+class SlurmStdoutIsTheSupersetTest(unittest.TestCase):
+    """The page was blind on the cluster.
+
+    Measured on the 6mo v9 tars (2026-09-28): ``slurm_stdout_<job>.log``
+    is a verbatim SUPERSET of globalfit_run.log plus the rank logs
+    (3000/3000 and 2960/3000 sampled lines found in it), and it ALONE
+    carries [GF_TIMING], [V9-SEED], [r4/saver] and the stage table. So
+    GFT_RE could never match on a cluster-built page -- the "search
+    efficiency" panel has been dead there -- and a page built from a
+    snapshot whose head log shipped as the filtered + tail pair saw no
+    head text at all.
+    """
+
+    def setUp(self):
+        self.g = _load_generator()
+        self.d = tempfile.mkdtemp()
+
+    def _touch(self, rel, text="x\n"):
+        p = os.path.join(self.d, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as fh:
+            fh.write(text)
+        return p
+
+    def test_the_newest_stdout_is_appended_when_run_logs_exist(self):
+        head = self._touch("globalfit_run.log")
+        r1 = self._touch("globalfit_run.rank1.log")
+        old = self._touch("slurm_stdout_650.log")
+        new = self._touch("slurm_stdout_659.log")
+        os.utime(old, (1, 1))
+        os.utime(new, (10**9, 10**9))
+        got = self.g.discover_run_logs(self.d)
+        self.assertEqual(got[:2], [head, r1], "head must keep priority")
+        self.assertEqual(got[-1], new)
+        self.assertNotIn(old, got, "a dead job's stdout must not be replayed")
+
+    def test_a_snapshot_with_only_filtered_and_tail_still_gets_text(self):
+        """The names the short/full tar actually ships for a big log."""
+        self._touch("globalfit_run_filtered.log")
+        self._touch("globalfit_run_tail.log")
+        so = self._touch("slurm_stdout_659.log")
+        self.assertEqual(self.g.discover_run_logs(self.d), [so])
+
+    def test_stdout_alone_is_enough(self):
+        so = self._touch("slurm_stdout_1.log")
+        self.assertEqual(self.g.discover_run_logs(self.d), [so])
+
+    def test_nothing_at_all_warns_rather_than_rendering_empty_panels(self):
+        import contextlib
+        import io as _io
+        err = _io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got = self.g.discover_run_logs(self.d)
+        self.assertEqual(got, [])
+        self.assertIn("no run log and no slurm_stdout", err.getvalue())
+
+    def test_run_logs_only_is_unchanged(self):
+        head = self._touch("globalfit_run.log")
+        r1 = self._touch("globalfit_run.rank1.log")
+        self.assertEqual(self.g.discover_run_logs(self.d), [head, r1])
+
+
+class FstatPoolIsNotAlwaysCalledSharedTest(unittest.TestCase):
+    """Why the comb / peaks panels are missing on every cluster page.
+
+    The generator hard-coded ``gb_fstat_fit/shared``; 6mo v9 writes
+    ``gb_fstat_fit/shared_search`` (confirmed in the snapshot listing:
+    ``gb_fstat_fit/shared_search/epoch_0000/DONE.json``), so the path
+    simply did not exist and the panels degraded silently.
+    """
+
+    def test_the_generator_no_longer_hardcodes_the_pool_name(self):
+        import inspect
+        src = inspect.getsource(_load_generator())
+        self.assertNotIn('"gb_fstat_fit", "shared")', src)
+        self.assertIn('_froot = os.path.join(RUN_DIR, "gb_fstat_fit")', src)
+
+    def test_the_legacy_pool_is_still_preferred_when_present(self):
+        import inspect
+        src = inspect.getsource(_load_generator())
+        self.assertIn("_pools.insert(0, _legacy)", src)
+
+    def test_the_degrade_message_names_the_snapshot_cause_too(self):
+        """A snapshot drops everything under gb_fstat_fit but DONE.json
+        unless include_fstat, so 'the fit is still running' was a
+        misleading explanation for half the cases."""
+        import inspect
+        src = inspect.getsource(_load_generator())
+        self.assertIn("include_fstat", src)
