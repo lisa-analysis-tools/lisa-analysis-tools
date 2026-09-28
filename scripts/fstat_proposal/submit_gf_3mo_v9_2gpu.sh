@@ -1982,7 +1982,20 @@ export FSTAT_SIGHET_MULTIDEV=1
 # >>> sides are instrumented: watch [GB_TRUST] (was rejecting 4-13% of
 # >>> candidates) and the end-of-block 'll AUDIT vs exact' COLD median (was
 # >>> 0.026-0.073, max 0.14-0.73). If either degrades materially, revert.
-export GB_SIGHET_REFRESH_EVERY=50
+export GB_SIGHET_REFRESH_EVERY=25
+# 50 -> 25 (2026-09-28, user ruling). Paired with
+# GB_TEMPER_VERTICAL_AT_REFIT below: the vertical sweep now runs ONLY on
+# repeats that re-anchored the references, so the swap and the refit
+# land in the same repeat. A cold row that swaps up and down across
+# 25-50 proposals against references anchored somewhere else can lose
+# proper dll tracking -- ll_ref is an add-delta against the reference it
+# was built on, so the further a row has walked since, the more the swap
+# ratio compares two cells through different expansion points.
+# Expected cost signature: inmodel_sighet_refresh roughly DOUBLES
+# (twice as many refit ticks) while inmodel_vertical_swap COLLAPSES
+# (~25x fewer sweeps). If vertical_swap does not fall, the gate is not
+# taking -- check [GB_VERT] '(N sweep(s))'.
+export GB_TEMPER_VERTICAL_AT_REFIT=1
 # DPHASE 0 -> 0.1 rad (2026-09-11, ported from the 10w arm 379ae2e1):
 # refresh only sources drifted past 0.1 rad since their reference build.
 # Error bound at 0.1 rad = 2.4e-7 x SNR^2/2 = 0.004 lnL at SNR 184

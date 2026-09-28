@@ -627,6 +627,34 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # a per-block constant and never made resident, so buffer
             # residency is unchanged.
             "GB_TEMPER_ALL_RUNGS",
+            # V9-21 (2026-09-28): GB_TEMPER_VERTICAL_AT_REFIT -- the
+            # vertical sweep now runs ONLY on repeats that re-anchored
+            # the sig-het references, so the swap and the refit land in
+            # the same repeat (paired with GB_SIGHET_REFRESH_EVERY
+            # 50 -> 25, already on this list). Order within the repeat is
+            # unchanged: sample -> refit -> swap. v8 predates both the
+            # knob and the all-rungs sweep it gates.
+            "GB_TEMPER_VERTICAL_AT_REFIT",
+            # --- backfill (2026-09-28) -------------------------------
+            # These shipped earlier in the 09-26/09-27 gate rework and
+            # their entries were never added, so this test had been RED
+            # for reasons unrelated to whatever change was being made.
+            # A permanently-failing drift test guards nothing: it trains
+            # you to ignore it, which is the opposite of the point.
+            #
+            # Level-3/4 valve retuning: the per-band RJ shutoff clock and
+            # its revival window, shortened once the valve state began
+            # persisting so a band can actually reach the threshold
+            # within one job.
+            "GB_RJ_BAND_SHUTOFF_ITERS",
+            "GB_RJ_BAND_SHUTOFF_RESET_ITERS",
+            # sobbh/mbh/emri cadence in the SEARCH stages, 10 -> 5.
+            "GB_SEARCH_SOURCE_EVERY",
+            # The containerised monitor, run on the saver rank after a
+            # save. v8 had no in-run monitor at all, so every one of
+            # these is new rather than changed.
+            "GF_MONITOR_AFTER_SAVE", "GF_MONITOR_ITER",
+            "GF_MONITOR_SNAPSHOT", "GF_MONITOR_TIMEOUT",
         }
         drift = {
             k: (self.v8.get(k), self.v9.get(k))

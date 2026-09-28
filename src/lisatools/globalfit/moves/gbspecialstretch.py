@@ -2499,6 +2499,37 @@ def _vert_all_rungs_on() -> bool:
         "1", "true", "True", "yes", "on")
 
 
+def _vert_at_refit_on() -> bool:
+    """``GB_TEMPER_VERTICAL_AT_REFIT`` -- swap only on refit repeats.
+
+    DEFAULT OFF. With it on, the per-repeat vertical sweep runs only on
+    repeats that re-anchored the sig-het references, so the swap and the
+    refit land in the SAME repeat (user ruling 2026-09-28: "I just want
+    the swap and refit to happen the same iteration"). Order within the
+    repeat is unchanged -- sample, then refit, then swap.
+
+    THE REASONING. A cold row that swaps up and down across 25-50
+    proposals against references anchored somewhere else can lose proper
+    dll tracking: ``ll_ref`` is an add-delta against the reference it was
+    built on, and the further a row has walked since, the more the swap
+    ratio is comparing two cells through slightly different expansion
+    points. Swapping right after every active row has been re-anchored
+    removes that drift from the comparison.
+
+    ⚠ ONLY MEANINGFUL WITH SIG-HET ACTIVE. The chunked-het / FD engines
+    carry exact references and never refresh, so there are no refit
+    repeats and this gate would disable vertical swapping outright. The
+    caller must AND it with ``sighet_active``; see the sweep gate.
+
+    ⚠ The refresh condition carries ``move_i + 1 < n_rep``, so the LAST
+    repeat of a block never refits and therefore never swaps under this
+    knob. That is harmless: the next block opens with fresh references
+    and its own tick follows 25 repeats later.
+    """
+    return os.environ.get("GB_TEMPER_VERTICAL_AT_REFIT", "0").strip() in (
+        "1", "true", "True", "yes", "on")
+
+
 def _ar_repoint_cell_ll(spec_of_slot, rows, slot_of_rung, slots, labels, xp):
     """Point each swapped rung's OPEN cell-ll bracket at its new label.
 
@@ -15666,6 +15697,23 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 "[GB_TEMPER %s] vertical ladder adaptation SKIPPED: no "
                 "vertical swap was proposed this propose.", self.name)
             return False
+        # SMALL-SAMPLE WARNING, not a behaviour change. Under
+        # GB_TEMPER_VERTICAL_AT_REFIT the sweep runs ~refresh_every times
+        # less often, so this pooled count drops by roughly that factor.
+        # It does not bind at production scale -- 6mo v9 job 655 pooled
+        # 21.75 M proposed pairs for rj_warm_search across 2844 blocks,
+        # so /25 still leaves ~870 k -- but a short block list or a small
+        # test run can land somewhere the ratio is noise, and adapting a
+        # ladder on noise is how rungs get dragged together for no
+        # measured reason. Say so rather than adapt silently.
+        if n_prop < 100:
+            logger.warning(
+                "[GB_TEMPER %s] vertical ladder adapting on only %d "
+                "pooled proposal(s) -- the acceptance ratio is noise at "
+                "this count. Expected with GB_TEMPER_VERTICAL_AT_REFIT "
+                "on AND a short propose; if it persists, widen the "
+                "adaptation window (GB_TEMPER_VERT_ADAPT_EVERY) so more "
+                "blocks pool into one adaptation.", self.name, n_prop)
         self._adapt_band_temps(band_temps, acc, prop)
         _r = float(acc.sum()) / max(n_prop, 1)
         logger.info(
@@ -17696,6 +17744,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # buffer is touched. OFF by default. The ladder is NOT adapted here
         # -- ``_adapt_band_temps`` stays exclusive to ``run_tempering``.
         _vert_on = bool(getattr(self, "temper_vertical", False)) and self.ntemps > 1
+        _vert_at_refit = _vert_at_refit_on()
+        # Sweeps ACTUALLY run this block. Printed on [GB_VERT] because
+        # under the at-refit gate it is no longer "one per repeat", and a
+        # cadence you cannot see in the log is a cadence you cannot
+        # confirm took.
+        _vert_sweeps = 0
         _vert_acc = 0
         _vert_census = self._vertical_census_new(self.ntemps) if _vert_on else None
         # VERTICAL SWAP BASE (2026-09-10): the per-row SOURCE-FREE slab
@@ -17914,6 +17968,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # reports this rather than the budget.
         _n_done = 0
         for move_i in range(n_rep if _half_pre else 0):
+          # Did this repeat re-anchor the sig-het references? Under
+          # GB_TEMPER_VERTICAL_AT_REFIT the vertical sweep runs only on
+          # repeats where it did (user ruling 2026-09-28: "I just want
+          # the swap and refit to happen the same iteration"). The order
+          # WITHIN the repeat is unchanged and is what the user asked
+          # for: sample -> refit -> swap.
+          _refit_this_repeat = False
           for _h_i, (sub, sl, n_sub, ids_s, slots_s, N_s, l_s, t_s, w_s, b_s,
                beta_s, n4_s, lo_s, hi_s, cold_s, n_cold_s) in enumerate(_half_pre):
             if self.sequential_parity_repeats:
@@ -18392,6 +18453,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 and (move_i + 1) % self.sighet_refresh_every == 0
                 and move_i + 1 < n_rep
             ):
+                # Set BEFORE the `far.any()` test below: "this repeat is a
+                # refit tick" is what pairs the swap with the refit, and a
+                # tick on which no row happened to have drifted far enough
+                # is still a tick. Gating the swap on far.any() instead
+                # would make the swap cadence depend on drift, which is
+                # not a cadence anyone chose.
+                _refit_this_repeat = True
                 drift, damp = self._sighet_drift_metrics(curr, ref_track, l_i)
                 far = (drift > self.sighet_refresh_dphase) | (damp > np.log(2.0))
                 # Hot cells keep their stale reference: the ll error is
@@ -18450,7 +18518,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
           # the two cells. Alternating parity of the cold rung keeps every
           # row in at most one pair per sweep while still visiting the
           # whole ladder.
-          if _vert_on:
+          # AT-REFIT GATE. Only skips when sig-het is the active engine:
+          # an exact-reference engine never refreshes, so applying it
+          # there would silently stop vertical swapping altogether.
+          _vert_now = _vert_on and not (
+              _vert_at_refit and sighet_active and not _refit_this_repeat)
+          if _vert_now:
+              _vert_sweeps += 1
               with _tspan(tm, "inmodel_vertical_swap"):
                   if _ar_state is not None:
                       _n = self._vertical_swap_sweep_all_rungs(
@@ -18803,7 +18877,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 f"({_cn['paired']}/{_cn['rows']} rows had a partner over "
                 f"{_cn['sweeps']} sweeps) | proposed {_cn['proposed']} "
                 f"accepted {_cn['accepted']} ({100.0 * _rate:.1f}%) over "
-                f"{_n_done} repeats x {len(ids)} sources | "
+                f"{_n_done} repeats x {len(ids)} sources "
+                f"({_vert_sweeps} sweep(s)) "
+                f"({_vert_sweeps} sweep(s)) | "
                 f"cap-vetoed {int(_cn.get('cap_vetoed', 0))}"
                 f"{'' if _swap_cens is not None else ' (gate off)'} | "
                 + (

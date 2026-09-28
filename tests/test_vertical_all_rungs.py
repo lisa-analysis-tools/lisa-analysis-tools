@@ -738,3 +738,118 @@ class TwoSidedCellLabelRepointTest(unittest.TestCase):
         src = inspect.getsource(
             g.GBSpecialBase._vertical_swap_sweep_all_rungs)
         self.assertIn("ar_slot[ci, t_h] = ar_slot[ci, t_c]", src)
+
+
+class SwapAndRefitInTheSameRepeatTest(unittest.TestCase):
+    """``GB_TEMPER_VERTICAL_AT_REFIT`` -- item 2 of the 2026-09-28 ruling.
+
+    USER RULING, verbatim: "i just want the swap and refit to happen the
+    same iteration I guess", with the order WITHIN the repeat left as it
+    already is -- "sample -> refit -> swap". So this is a GATE on which
+    repeats sweep, not a reordering: no hoist of the refresh out of the
+    parity-half loop, because the refresh already runs at the end of the
+    last half and the sweep already runs after it.
+
+    (An earlier relayed spec asked for swap -> refit -> sample plus an
+    opening sweep. The user superseded it directly; there is no opening
+    sweep and nothing was hoisted.)
+    """
+
+    def setUp(self):
+        self.env = mock.patch.dict(os.environ, {}, clear=False)
+        self.env.start()
+        os.environ.pop("GB_TEMPER_VERTICAL_AT_REFIT", None)
+        self.addCleanup(self.env.stop)
+
+    def test_the_knob_is_OFF_by_default(self):
+        self.assertFalse(g._vert_at_refit_on())
+
+    def test_the_knob_reads_the_usual_truthy_spellings(self):
+        for v in ("1", "true", "True", "yes", "on"):
+            os.environ["GB_TEMPER_VERTICAL_AT_REFIT"] = v
+            self.assertTrue(g._vert_at_refit_on(), v)
+        for v in ("0", "no", "off", ""):
+            os.environ["GB_TEMPER_VERTICAL_AT_REFIT"] = v
+            self.assertFalse(g._vert_at_refit_on(), v)
+
+    # -- the gate expression itself, as production evaluates it --------
+    @staticmethod
+    def _gate(vert_on, at_refit, sighet_active, refit_this_repeat):
+        return vert_on and not (
+            at_refit and sighet_active and not refit_this_repeat)
+
+    def test_with_the_knob_ON_only_refit_repeats_sweep(self):
+        self.assertTrue(self._gate(True, True, True, True))
+        self.assertFalse(self._gate(True, True, True, False))
+
+    def test_with_the_knob_OFF_every_repeat_sweeps(self):
+        """Bit-identical to today on both kinds of repeat."""
+        self.assertTrue(self._gate(True, False, True, True))
+        self.assertTrue(self._gate(True, False, True, False))
+
+    def test_an_EXACT_reference_engine_is_never_gated(self):
+        """chunked-het / FD never refresh, so a refit-gated sweep would
+        disable vertical swapping outright. The gate ANDs on
+        ``sighet_active`` precisely to avoid that."""
+        self.assertTrue(self._gate(True, True, False, False))
+        self.assertTrue(self._gate(True, True, False, True))
+
+    def test_the_gate_cannot_switch_vertical_swapping_ON(self):
+        self.assertFalse(self._gate(False, True, True, True))
+        self.assertFalse(self._gate(False, False, True, True))
+
+    # -- cadence over a block ------------------------------------------
+    def test_exactly_one_sweep_per_refresh_tick_over_100_repeats(self):
+        """every=25, n_rep=100: the refresh condition is
+        ``(move_i+1) % every == 0 and move_i+1 < n_rep``, so ticks are
+        repeats 24, 49, 74 -- repeat 99 is excluded by ``< n_rep``."""
+        every, n_rep = 25, 100
+        ticks = [i for i in range(n_rep)
+                 if (i + 1) % every == 0 and i + 1 < n_rep]
+        self.assertEqual(ticks, [24, 49, 74])
+        swept = [i for i in range(n_rep)
+                 if self._gate(True, True, True, i in ticks)]
+        self.assertEqual(swept, ticks)
+        self.assertEqual(len(swept), 3)
+
+    def test_the_LAST_repeat_never_sweeps_and_that_is_documented(self):
+        """``move_i + 1 < n_rep`` excludes it; the next block's own tick
+        covers the gap. Documented so it is not read as a bug."""
+        doc = g._vert_at_refit_on.__doc__
+        self.assertIn("LAST", doc)
+        self.assertIn("move_i + 1 < n_rep", doc)
+
+    # -- wiring --------------------------------------------------------
+    def test_production_gates_the_sweep_on_the_refit_flag(self):
+        import inspect
+        src = inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
+        self.assertIn("_refit_this_repeat = False", src)
+        self.assertIn("_refit_this_repeat = True", src)
+        self.assertIn("_vert_at_refit and sighet_active "
+                      "and not _refit_this_repeat", src)
+        self.assertIn("if _vert_now:", src)
+
+    def test_the_flag_is_set_BEFORE_the_far_any_test(self):
+        """A tick on which nothing had drifted far enough is still a
+        tick; gating the swap on ``far.any()`` would make the swap
+        cadence depend on drift."""
+        import inspect
+        src = inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
+        self.assertLess(src.index("_refit_this_repeat = True"),
+                        src.index("if bool(far.any()):"))
+
+    def test_the_sweep_count_is_printed(self):
+        import inspect
+        src = inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
+        self.assertIn("_vert_sweeps = 0", src)
+        self.assertIn("_vert_sweeps += 1", src)
+        self.assertIn("sweep(s)", src)
+
+    def test_BOTH_launchers_carry_the_new_cadence_and_knob(self):
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parents[1]
+        for name in ("submit_gf_6mo_v9_4gpu.sh", "submit_gf_3mo_v9_2gpu.sh"):
+            src = (root / "scripts" / "fstat_proposal" / name).read_text()
+            self.assertIn("export GB_SIGHET_REFRESH_EVERY=25", src, name)
+            self.assertNotIn("export GB_SIGHET_REFRESH_EVERY=50", src, name)
+            self.assertIn("export GB_TEMPER_VERTICAL_AT_REFIT=1", src, name)
