@@ -737,10 +737,24 @@ export MOJITO_INFO_PATH=/shared/data/mojito_cache
 #           (file is already open for read-only)
 # i.e. a READ-ONLY handle to the live store was still open INSIDE the
 # saver process when the next save came. a4 ruled out extract() leaking
-# src, a swallowed mid-extract exception, the page child,
-# _atomic_backup_copy and cross-process locking; the cause is still
-# open and a4 owns it. Turning the after-save hook off removes the only
-# thing in the saver that opens the store for reading.
+# src, a swallowed mid-extract exception, _atomic_backup_copy and
+# cross-process locking.
+#
+# ⚠ THE PAGE IS THE LEADING SUSPECT, AND IT IS NOT A CHILD PROCESS.
+# build_monitor defaults to in_process=True (09-26 "no subprocesses!"),
+# so the generator runs via runpy INSIDE the saver.
+# build_monitor_in_process closes the generator's module-level HDF5
+# handles only from the namespace runpy RETURNS -- and runpy returns
+# NOTHING when the generator raises, so a FAILED page leaves the store
+# open read-only in this process and the next save_step dies with
+# exactly the error above. The same mechanism was already documented
+# there for the extract ("unable to truncate a file which is already
+# open"). 6mo job 662 built its page 5 times with 0 failures; the 3mo
+# page was erroring standalone. a4 owns the fix (exec into an owned
+# namespace, close in finally, gc.collect, surface the traceback).
+#
+# Turning the after-save hook off removes both the page and the
+# extract, i.e. everything in the saver that opens the store.
 #
 # ⚠ COST: no per-iteration tar and no page for the 3mo run while this
 # is 0. Build them offline from the run directory instead:

@@ -924,10 +924,11 @@ class ThreeMonthTwinTest(unittest.TestCase):
             # save_step_main -> eryn HDFBackend.open with "file is
             # already open for read-only", i.e. a read-only handle to
             # the live store was still open INSIDE the saver process at
-            # the next save. a4 ruled out extract() leaking src, a
-            # swallowed mid-extract exception, the page child,
-            # _atomic_backup_copy and cross-process locking, and owns
-            # the root cause. The 6mo saver has run the same hook for
+            # the next save. Leading suspect is the PAGE, which is NOT
+            # a child: build_monitor defaults to in_process=True, and
+            # build_monitor_in_process closes the generator's handles
+            # only from the namespace runpy returns -- which is nothing
+            # when the generator raises. a4 owns the fix. The 6mo saver has run the same hook for
             # six saves without it and its per-iteration tars are
             # relied on, so the two genuinely differ for now. Remove
             # this entry once 3mo goes back to 1.
