@@ -2759,27 +2759,37 @@ export GB_SEARCH_BAND_SHUTOFF_PER_WALKER=1
 # iterations) -- time is better spent in the next stage than re-proving a
 # band that already stopped paying.
 export GB_SEARCH_BAND_SHUTOFF_CONV_ITER=3
-# LEVEL-3 VALVE TOLERANCE (2026-09-28, Mike's ruling). The bar a
-# (walker, band) must clear to keep its valve OPEN becomes ONE
-# FLOOR-SNR SOURCE: 0.5 * SNR^2 = 0.5 * 8^2 = 32 in gb_search_1.
-# Default without this export is 0.5 * leaf_cap_ndim = 4.0, which is
-# the LEVEL-1/2 per-row dll -- far too fine for a whole-band plateau
-# test, and why 154 pairs sat chronic.
-#   gb_search_2/3 at floor 5 would be 0.5 * 5^2 = 12.5.
-# Left as a CONSTANT rather than derived from the stage profile: three
-# different SNR attributes are in scope here (opt_snr_rej_samp_limit,
-# opt_snr_limit_search_coarse, _fine) and picking the wrong one would
-# silently mis-set a gate threshold. Change it by hand per stage.
+# LEVEL-3 VALVE TOLERANCE. The bar a (walker, band) must clear to keep
+# its valve OPEN. Default without this export is 0.5 * leaf_cap_ndim =
+# 4.0, which is the LEVEL-1/2 per-row dll -- far too fine for a
+# whole-band plateau test, and why 154 pairs sat chronic.
+#
+# 20, set DIRECTLY by Mike on 2026-09-28. ⚠ This is a JUDGEMENT, not a
+# formula: the earlier 32 came from "one floor-SNR source",
+# 0.5 * SNR^2 = 0.5 * 8^2, and 20 is not that expression for any floor
+# in play (the rule would give 32 at floor 8 and 12.5 at floor 5 in
+# gb_search_2/3). Do not "restore" it to a derived value on the
+# assumption the rule still holds -- it was superseded.
+#
+# A CONSTANT rather than derived from the stage profile, deliberately:
+# three different SNR attributes are in scope here
+# (opt_snr_rej_samp_limit, opt_snr_limit_search_coarse, _fine) and
+# picking the wrong one would silently mis-set a gate threshold.
+# Change it by hand per stage.
 # Read from env AT JUDGE TIME and NOT part of the band_shutoff_w_step
 # stamp, so the persisted streak/max survive this change.
-export GB_SEARCH_BAND_SHUTOFF_LL_TOL=32
-# COST: drop the second pure in-model pass. in_model and
-# in_model_fstat are the same class -- one polish per RJ move -- and on
-# job 662 cost 1392 s + 1248 s of a 5564 s iteration (47%). With cold
-# births at ~1e-4 acceptance one group-rule polish per iteration is
-# enough. rj_fstat_search is NOT droppable (designated updater; runs
-# the level-3 judge and the stage-end check) and the knob refuses it.
-export GB_SEARCH_DROP_MOVES=in_model_fstat
+export GB_SEARCH_BAND_SHUTOFF_LL_TOL=20
+# GB_SEARCH_DROP_MOVES EXISTS BUT IS DELIBERATELY UNSET.
+# It omits named pure in-model slots from every search stage. Dropping
+# in_model_fstat was proposed on 2026-09-28 on cost grounds (it and
+# in_model are the same class -- one polish per RJ move -- and cost
+# 1392 s + 1248 s of a 5564 s job-662 iteration, 47%) and MIKE
+# REJECTED IT: in_model_fstat stays, so the stage compositions are
+# unchanged. Unset is a documented no-op; the knob and its guard are
+# kept because the guard is worth having -- rj_fstat_search can never
+# be dropped (designated updater, and the only move that runs the
+# level-3 judge and the stage-end check), and the knob refuses it with
+# a SystemExit rather than leaving a stage unable to end.
 # ⚠ OFF, deliberately: this is the PER-BAND stage schedule (SNR limits and
 # phase maximization moving independently per band). In v9 those move
 # together across RECIPE stages instead, so the per-band schedule must stay

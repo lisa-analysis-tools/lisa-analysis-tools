@@ -648,7 +648,10 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # in_model_fstat are the same class and cost 47% of a job
             # 662 iteration between them. v8 has neither knob.
             "GB_SEARCH_BAND_SHUTOFF_LL_TOL",
-            "GB_SEARCH_DROP_MOVES",
+            # GB_SEARCH_DROP_MOVES is deliberately NOT listed: Mike
+            # rejected dropping in_model_fstat (2026-09-28) and the
+            # export was removed, so a future re-appearance should be
+            # caught by this test rather than pre-authorised.
             # --- backfill (2026-09-28) -------------------------------
             # These shipped earlier in the 09-26/09-27 gate rework and
             # their entries were never added, so this test had been RED

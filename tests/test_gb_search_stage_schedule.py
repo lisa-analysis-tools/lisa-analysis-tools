@@ -1206,15 +1206,28 @@ class IterationTimePackageLauncherTest(unittest.TestCase):
             src = self._src(name)
             self.assertIn("export GB_FSTAT_REFIT_EVERY=2", src, name)
             self.assertNotIn("export GB_FSTAT_REFIT_EVERY=1\n", src, name)
-            self.assertIn("export GB_SEARCH_BAND_SHUTOFF_LL_TOL=32", src, name)
-            self.assertIn("export GB_SEARCH_DROP_MOVES=in_model_fstat",
-                          src, name)
+            self.assertIn("export GB_SEARCH_BAND_SHUTOFF_LL_TOL=20", src, name)
+            # ⚠ ABSENT ON PURPOSE. Dropping in_model_fstat was the
+            # audit window's cost recommendation and MIKE REJECTED IT
+            # (2026-09-28): the move stays, so the stage compositions
+            # are unchanged from before the package. The knob itself
+            # remains in the code as a documented no-op when unset.
+            self.assertNotIn("export GB_SEARCH_DROP_MOVES", src, name)
+            self.assertIn("DELIBERATELY UNSET", src, name)
 
-    def test_the_stage_2_tolerance_is_written_down(self):
-        """Mike changes it by hand per stage, so the number has to be
-        in the launcher rather than in someone's head."""
+    def test_the_tolerance_is_marked_a_JUDGEMENT_not_a_formula(self):
+        """20 is Mike's direct choice (2026-09-28) and is NOT
+        0.5 * SNR^2 for any floor in play -- that rule would give 32 at
+        floor 8 and 12.5 at floor 5. The launcher has to say so, or the
+        next reader "restores" a derived value and silently moves a
+        gate threshold. Both numbers stay written down as the
+        superseded rule, since Mike changes this by hand per stage.
+        """
         for name in ("submit_gf_6mo_v9_4gpu.sh", "submit_gf_3mo_v9_2gpu.sh"):
-            self.assertIn("12.5", self._src(name), name)
+            src = self._src(name)
+            self.assertIn("JUDGEMENT, not a", src, name)
+            self.assertIn("superseded", src, name)
+            self.assertIn("12.5", src, name)     # the rule's stage-2 value
 
 
 class FstatSkipsShutBandsTest(unittest.TestCase):
