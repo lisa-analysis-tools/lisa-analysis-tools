@@ -31,6 +31,7 @@ import dataclasses
 import os
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -1098,3 +1099,119 @@ class FstatPeakFloorTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DropSearchMovesKnobTest(unittest.TestCase):
+    """``GB_SEARCH_DROP_MOVES`` -- omit a pure in-model slot.
+
+    Cost knob from the 2026-09-28 iteration-time package. Job 662
+    iteration 5 (5564 s): ``in_model`` 1392 s + ``in_model_fstat``
+    1248 s = 47% of the wall clock, and the two are the SAME CLASS --
+    one pure in-model polish per RJ move. With cold births at ~1e-4
+    acceptance a single group-rule polish per iteration is enough.
+    """
+
+    def setUp(self):
+        self.env = mock.patch.dict(os.environ, {}, clear=False)
+        self.env.start()
+        os.environ.pop("GB_SEARCH_DROP_MOVES", None)
+        self.addCleanup(self.env.stop)
+        self.m = self._mod()
+        self.m._DROP_LOGGED.clear()
+
+    @staticmethod
+    def _mod():
+        import importlib.util
+        import os as _os
+        p = _os.path.join(
+            _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+            "scripts", "fstat_proposal", "run_combined_staged.py")
+        spec = importlib.util.spec_from_file_location("_rcs_drop", p)
+        mod = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(mod)
+        except SystemExit:
+            pass
+        return mod
+
+    def test_unset_drops_nothing(self):
+        self.assertEqual(self.m._dropped_search_moves(), frozenset())
+        self.assertFalse(self.m._drop_slot("in_model_fstat"))
+
+    def test_the_launcher_value_drops_that_slot_only(self):
+        os.environ["GB_SEARCH_DROP_MOVES"] = "in_model_fstat"
+        self.assertTrue(self.m._drop_slot("in_model_fstat"))
+        self.assertFalse(self.m._drop_slot("in_model"))
+        self.assertFalse(self.m._drop_slot("in_model_replace"))
+
+    def test_a_comma_list_with_spaces_parses(self):
+        os.environ["GB_SEARCH_DROP_MOVES"] = " in_model_fstat , in_model "
+        self.assertEqual(self.m._dropped_search_moves(),
+                         frozenset({"in_model_fstat", "in_model"}))
+
+    def test_rj_fstat_search_is_REFUSED_loudly(self):
+        """Dropping it would leave the stage unable to END, and the
+        symptom is indistinguishable from a broken gate -- which this
+        run has already spent days on."""
+        os.environ["GB_SEARCH_DROP_MOVES"] = "rj_fstat_search"
+        with self.assertRaises(SystemExit) as cm:
+            self.m._dropped_search_moves()
+        msg = str(cm.exception)
+        self.assertIn("designated updater", msg)
+        self.assertIn("stage-end", msg)
+
+    def test_it_is_refused_even_alongside_a_legal_name(self):
+        os.environ["GB_SEARCH_DROP_MOVES"] = "in_model_fstat,rj_fstat_search"
+        with self.assertRaises(SystemExit):
+            self.m._dropped_search_moves()
+
+    def test_the_drop_is_logged_once_per_slot(self):
+        import logging
+        os.environ["GB_SEARCH_DROP_MOVES"] = "in_model_fstat"
+        with self.assertLogs(self.m.logger, level=logging.INFO) as cap:
+            self.m._drop_slot("in_model_fstat")
+            self.m._drop_slot("in_model_fstat")
+            self.m.logger.info("sentinel")
+        hits = [ln for ln in cap.output if "GB_SEARCH_DROP_MOVES" in ln]
+        self.assertEqual(len(hits), 1, "must log once, not once per stage")
+        self.assertIn("[V9-STAGE]", hits[0])
+
+    def test_BOTH_stage_assemblies_consult_the_knob(self):
+        """The file's own warning: gating only one assembly is the
+        'knob resolves, consuming path never runs' shape that has
+        produced several defects in this run."""
+        import inspect
+        src = inspect.getsource(self.m)
+        self.assertEqual(src.count("if _drop_slot(slot):"), 2)
+
+    def test_the_move_is_still_BUILT(self):
+        """Only the stage composition drops it. A listed-but-unbuilt
+        move fails recipe materialization, so removing it from the
+        build would be the more dangerous edit."""
+        import inspect
+        self.assertIn("still BUILT",
+                      inspect.getsource(self.m._drop_slot))
+
+
+class IterationTimePackageLauncherTest(unittest.TestCase):
+    """The three exports Mike should see, in BOTH launchers."""
+
+    def _src(self, name):
+        import pathlib
+        return (pathlib.Path(__file__).resolve().parents[1]
+                / "scripts" / "fstat_proposal" / name).read_text()
+
+    def test_both_launchers_carry_the_package(self):
+        for name in ("submit_gf_6mo_v9_4gpu.sh", "submit_gf_3mo_v9_2gpu.sh"):
+            src = self._src(name)
+            self.assertIn("export GB_FSTAT_REFIT_EVERY=10", src, name)
+            self.assertNotIn("export GB_FSTAT_REFIT_EVERY=1\n", src, name)
+            self.assertIn("export GB_SEARCH_BAND_SHUTOFF_LL_TOL=32", src, name)
+            self.assertIn("export GB_SEARCH_DROP_MOVES=in_model_fstat",
+                          src, name)
+
+    def test_the_stage_2_tolerance_is_written_down(self):
+        """Mike changes it by hand per stage, so the number has to be
+        in the launcher rather than in someone's head."""
+        for name in ("submit_gf_6mo_v9_4gpu.sh", "submit_gf_3mo_v9_2gpu.sh"):
+            self.assertIn("12.5", self._src(name), name)

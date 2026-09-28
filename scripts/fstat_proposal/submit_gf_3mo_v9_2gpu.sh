@@ -2759,6 +2759,27 @@ export GB_SEARCH_BAND_SHUTOFF_PER_WALKER=1
 # iterations) -- time is better spent in the next stage than re-proving a
 # band that already stopped paying.
 export GB_SEARCH_BAND_SHUTOFF_CONV_ITER=3
+# LEVEL-3 VALVE TOLERANCE (2026-09-28, Mike's ruling). The bar a
+# (walker, band) must clear to keep its valve OPEN becomes ONE
+# FLOOR-SNR SOURCE: 0.5 * SNR^2 = 0.5 * 8^2 = 32 in gb_search_1.
+# Default without this export is 0.5 * leaf_cap_ndim = 4.0, which is
+# the LEVEL-1/2 per-row dll -- far too fine for a whole-band plateau
+# test, and why 154 pairs sat chronic.
+#   gb_search_2/3 at floor 5 would be 0.5 * 5^2 = 12.5.
+# Left as a CONSTANT rather than derived from the stage profile: three
+# different SNR attributes are in scope here (opt_snr_rej_samp_limit,
+# opt_snr_limit_search_coarse, _fine) and picking the wrong one would
+# silently mis-set a gate threshold. Change it by hand per stage.
+# Read from env AT JUDGE TIME and NOT part of the band_shutoff_w_step
+# stamp, so the persisted streak/max survive this change.
+export GB_SEARCH_BAND_SHUTOFF_LL_TOL=32
+# COST: drop the second pure in-model pass. in_model and
+# in_model_fstat are the same class -- one polish per RJ move -- and on
+# job 662 cost 1392 s + 1248 s of a 5564 s iteration (47%). With cold
+# births at ~1e-4 acceptance one group-rule polish per iteration is
+# enough. rj_fstat_search is NOT droppable (designated updater; runs
+# the level-3 judge and the stage-end check) and the knob refuses it.
+export GB_SEARCH_DROP_MOVES=in_model_fstat
 # ⚠ OFF, deliberately: this is the PER-BAND stage schedule (SNR limits and
 # phase maximization moving independently per band). In v9 those move
 # together across RECIPE stages instead, so the per-band schedule must stay
@@ -3429,7 +3450,14 @@ export GB_TEMPER_SKIP_SHUTOFF_BANDS=1
 # >>> back ~1610 s of it. Watch '[peaks]' and '[stageA]' -- if the peak count
 # >>> is not falling by the third epoch this is a fixed ~1800 s/iteration
 # >>> bill and should go back to 5 or 10.
-export GB_FSTAT_REFIT_EVERY=1      # SEARCH stages: EVERY elapsed iteration
+export GB_FSTAT_REFIT_EVERY=10     # SEARCH stages: every 10th iteration
+# 1 -> 10 (2026-09-28, iteration-time package). Measured on job 662
+# iteration 5: the refit cost 1129 s of a 5564 s iteration (20%, epochs
+# 11-14 at 1127-1134 s each) and bought ~16 cold births per iteration.
+# Cold births are exhausted at this point in the stage (rj_warm 25 of
+# 253k proposals, rj_fstat 80 of 236k), so a stale peak list costs
+# nothing measurable while the refit costs a fifth of the wall clock.
+# Revert to 1 if cold birth acceptance climbs back.
 # PE-STAGE CADENCE (user ruling 2026-09-24): 250 elapsed iterations.
 # Separate from the search value because full_pe is a RANDOM_CHOICE stage --
 # the GB move is drawn roughly one iteration in N, so a search-tuned cadence

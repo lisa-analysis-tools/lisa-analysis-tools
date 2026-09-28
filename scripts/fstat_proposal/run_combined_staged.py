@@ -207,6 +207,63 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip() in ("1", "true", "True")
 
 
+#: Moves that must never be dropped, whatever ``GB_SEARCH_DROP_MOVES``
+#: says. ``rj_fstat_search`` is the DESIGNATED UPDATER
+#: (``leaf_cap_update=True``) and the only move that runs the level-3
+#: judge and the stage-end check, so dropping it would leave the stage
+#: silently unable to END -- the failure would look like "the gate never
+#: latches", which is exactly the class of bug this run has already spent
+#: days on.
+_UNDROPPABLE_SEARCH_MOVES = frozenset({"rj_fstat_search"})
+
+_DROP_LOGGED = set()
+
+
+def _dropped_search_moves() -> frozenset:
+    """``GB_SEARCH_DROP_MOVES`` -- comma-separated move names to omit.
+
+    Cost knob for a long search stage. 6mo v9 job 662 spent 1392 s in
+    ``in_model`` plus 1248 s in ``in_model_fstat`` out of a 5564 s
+    iteration (47%); the two are the SAME CLASS -- one pure in-model
+    polish per RJ move -- so with cold births at ~1e-4 acceptance a
+    single group-rule polish per iteration is enough and the second is
+    ~1250 s of duplication.
+
+    Applies to the pure in-model SLOTS only, which is where both stage
+    assemblies in this file gate their optional moves. A name this
+    cannot honour is reported rather than ignored: a knob that silently
+    reaches nothing is the recurring failure mode in this run.
+    """
+    raw = os.environ.get("GB_SEARCH_DROP_MOVES", "").strip()
+    if not raw:
+        return frozenset()
+    want = {p.strip() for p in raw.split(",") if p.strip()}
+    bad = want & _UNDROPPABLE_SEARCH_MOVES
+    if bad:
+        raise SystemExit(
+            f"GB_SEARCH_DROP_MOVES lists {sorted(bad)}, which cannot be "
+            f"dropped: rj_fstat_search is the designated updater "
+            f"(leaf_cap_update=True) and the only move that runs the "
+            f"level-3 valve judge and the stage-end check. Dropping it "
+            f"leaves gb_search unable to end, and the symptom is "
+            f"indistinguishable from a broken gate.")
+    return frozenset(want)
+
+
+def _drop_slot(slot: str) -> bool:
+    """Is this stage slot dropped by the knob? Logs once per slot."""
+    if slot not in _dropped_search_moves():
+        return False
+    if slot not in _DROP_LOGGED:
+        _DROP_LOGGED.add(slot)
+        logger.info(
+            "[V9-STAGE] GB_SEARCH_DROP_MOVES: %r omitted from every search "
+            "stage composition. The move is still BUILT (dropping it from "
+            "the build would fail materialization for any stage that still "
+            "lists it); it simply never runs.", slot)
+    return True
+
+
 def _pe_combine_kwargs() -> dict:
     """Combine kwargs shared by every PE stage.
 
@@ -772,6 +829,8 @@ def build_fit():
                     if os.environ.get("GB_RIDGE_GIBBS", "1") == "1" else [])
 
         def gb_only_in_model(slot):
+            if _drop_slot(slot):
+                return []
             # Same in_model_replace retirement as the full composition --
             # there are TWO stage assemblies in this file and gating only
             # one of them is the "knob resolves, consuming path never runs"
@@ -1316,6 +1375,8 @@ def build_fit():
         knob-conditional exactly like warm()/replace(). Fresh Move descriptor
         per call (never share one instance across stages).
         """
+        if _drop_slot(slot):
+            return []
         # in_model_replace retires with rj_replace (user ruling
         # 2026-09-26: "in_model_replace we do not need this anymore").
         # It was the polish slot for rj_replace's survivors; with that move
