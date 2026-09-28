@@ -17034,9 +17034,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 _win = _win_s
         # POST-GATE BUDGET for the UNGATED rungs (user ruling 2026-09-27).
         # Once a column's coldest ``n_gate`` chains are all either unpicked
-        # or converged, the rest of that column's rungs get a FIXED tail
-        # rather than riding along for however long the block happens to
-        # run: births a minimum of 100 steps, survivors none.
+        # or converged, the rest of that column's rungs are held to a
+        # MINIMUM ON THEIR OWN CUMULATIVE CLOCK -- not given a tail of
+        # extra repeats. Births must have taken at least 100 steps since
+        # they were born; if one already has, it is done immediately.
+        # Survivors have a minimum of 0, i.e. they stop at the trigger.
         #
         # Why the asymmetry: a newborn on a hot rung has not yet been given
         # a fair chance to find its source, and cutting it at the moment
@@ -18308,13 +18310,28 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                       if _colB.any():
                           _inB = _colB[_cv_colidx]
                           _unq = ~_gated_h
-                          _tail = _to_numpy(_cv_seen) >= int(
+                          # A MINIMUM ON THE ROW'S OWN CLOCK, NOT A TAIL
+                          # ADDED AT THE TRIGGER (user correction
+                          # 2026-09-27: "assurance of going over the
+                          # minimum is what we want. Did a birth already
+                          # take at least 100 steps? If yes then it is
+                          # done.").
+                          #
+                          # ``_cv_seen`` is the row's CUMULATIVE clock --
+                          # it persists across blocks and generations via
+                          # ``_InModelConvergeState._seen`` -- so for a
+                          # newborn it counts steps since the source was
+                          # born. A birth that already has its 100 is done
+                          # the moment its column's cold four finish; one
+                          # that does not keeps going until it does. No
+                          # extra repeats are ever ADDED to a row that has
+                          # already had enough.
+                          _met_min = _to_numpy(_cv_seen) >= int(
                               converge.post_gate_repeats)
-                          # survivors: post_gate_repeats == 0, so _tail is
-                          # all True and they freeze at the trigger.
-                          # births: they keep going to the 100-step floor.
-                          _frozen = _frozen | (_inB & _unq & _tail)
-                          _owed = bool((_inB & _unq & ~_tail).any())
+                          # survivors: post_gate_repeats == 0, so this is
+                          # all True and they stop at the trigger.
+                          _frozen = _frozen | (_inB & _unq & _met_min)
+                          _owed = bool((_inB & _unq & ~_met_min).any())
                           _n_fr = int(np.count_nonzero(_frozen))
                   # ⚠ MINIMUM WALK BEFORE THE BLOCK MAY STOP (user ruling
                   # 2026-09-26: "make sure they walk at least 250 steps on

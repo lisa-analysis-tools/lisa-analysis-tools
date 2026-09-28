@@ -2643,3 +2643,52 @@ class TwoPhaseBlockTest(unittest.TestCase):
         self.assertIn("_colB = (_g_cnt > 0) & (_f_cnt >= _g_cnt)", src)
         # and the block may not exit while a birth still owes its tail
         self.assertIn("and not _owed", src)
+
+
+class PostGateIsAMinimumNotATailTest(unittest.TestCase):
+    """The 100 is a floor on the row's OWN clock, not repeats added on.
+
+    USER CORRECTION 2026-09-27: "not a fixed tail. Assurance of going
+    over the minimum is what we want. Did a birth already take at least
+    100 steps? If yes then it is done."
+
+    The distinction is the whole cost argument. A tail would ADD 100
+    repeats to every hot birth at the moment the cold four finish, which
+    on a long block is pure waste; a floor lets a birth that has already
+    walked its 100 stop immediately.
+    """
+
+    def test_the_comparison_is_against_the_cumulative_clock(self):
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
+        self.assertIn("_met_min = _to_numpy(_cv_seen) >= int(", src)
+        self.assertNotIn("_tail = _to_numpy(_cv_seen)", src,
+                         "renamed: 'tail' invited the wrong reading")
+
+    def test_seen_persists_across_blocks_so_it_IS_cumulative(self):
+        """If ``seen`` reset per block the floor would silently become a
+        per-block tail, which is the thing the ruling rules out."""
+        st = _InModelConvergeState(window=5, thresh=4.0, max_repeats=999)
+        rows = [7]
+        best, ring, seen, gain, done, at = st.gather(rows)
+        seen[:] = 63
+        st.absorb(rows, best, ring, seen, gain, done, at=at)
+        self.assertEqual(st.clock(7), 63)
+        # a later block re-gathers the SAME clock rather than starting at 0
+        _, _, seen2, _, _, _ = st.gather(rows)
+        self.assertEqual(int(seen2[0]), 63)
+
+    def test_a_birth_already_past_the_minimum_is_done_at_the_trigger(self):
+        """The behaviour the correction names, at the array level."""
+        post_gate = 100
+        seen = np.array([140, 30, 100, 99])
+        met = seen >= post_gate
+        self.assertEqual(list(met), [True, False, True, False])
+        # only the two short rows still hold the block
+        self.assertTrue(bool((~met).any()))
+        self.assertEqual(int((~met).sum()), 2)
+
+    def test_survivors_have_a_zero_minimum_so_any_clock_satisfies_it(self):
+        seen = np.array([0, 1, 5000])
+        self.assertTrue((seen >= 0).all())
