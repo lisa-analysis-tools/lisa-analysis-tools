@@ -691,3 +691,112 @@ class ValveWritesMustLandInNewStateTest(unittest.TestCase):
         for name in st.SEARCH_SHUTOFF_WINDOW_FIELDS:
             bi = self._band_info()
             self.assertIsInstance(bi[name], np.ndarray, name)
+
+
+class Level3ShutPairsRunNothingTest(unittest.TestCase):
+    """USER RULING 2026-09-28 (as corrected): a level-3 shut
+    (walker, band) pair runs NOTHING until the recipe step releases it
+    -- no births, no deaths, no in-model repeats at any rung, and NO
+    vertical swaps.
+
+    The 09-27 "frozen rows still swap" ruling is unchanged but applies
+    to LEVEL-1 frozen rows -- a converged source inside a column that
+    is still active -- not to level-3 shut pairs.
+
+    Job 662: 1680 of 1904 occupied pairs (88%) shut, against 2640 s of
+    pure in-model work and 1381 s of level-1 windows per iteration.
+    """
+
+    NW, NB = 2, 4
+
+    def _mask(self, shut, w_inds, b_inds):
+        """The production expression, applied as production applies it."""
+        return ~np.asarray(shut)[w_inds, b_inds]
+
+    def test_a_shut_pair_contributes_no_picked_rows(self):
+        shut = np.zeros((self.NW, self.NB), dtype=bool)
+        shut[0, 1] = True
+        w = np.array([0, 0, 1, 1]); b = np.array([1, 2, 1, 2])
+        keep = self._mask(shut, w, b)
+        self.assertFalse(bool(keep[0]), "the shut pair was still eligible")
+        # the SAME BAND in another walker is untouched: the valve is
+        # per (walker, band), not per band
+        self.assertTrue(bool(keep[2]))
+        # and another band in the SAME walker is untouched
+        self.assertTrue(bool(keep[1]))
+
+    def test_the_mask_is_applied_at_the_group_eligibility_point(self):
+        """One cascade point: everything per-(walker, band) downstream
+        runs on PICKED ROWS, so a pair never picked spends no GPU time
+        in level-1 windows, cell-ll brackets, sig-het refits or the
+        infomat tables."""
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._run_band_unit)
+        self.assertIn('_shut3 = getattr(self, "_rj_band_shutoff_w", None)',
+                      src)
+        self.assertIn("eligible = eligible & ~_xp3.asarray(_shut3)[", src)
+
+    def test_the_mask_does_NOT_depend_on_is_rj_prop(self):
+        """The pure in-model moves are ~47% of the iteration; they log
+        'valve requested but NOT live (is_rj_prop=False)' about the RJ
+        STEP, and gating the pick mask on that would leave most of the
+        saving unclaimed."""
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._run_band_unit)
+        blk = src[src.index("_shut3 = getattr"):]
+        blk = blk[:blk.index("eligible = eligible & ~_xp3")]
+        self.assertNotIn("is_rj_prop", blk)
+
+    def test_the_RJ_subset_still_skips_it_independently(self):
+        """The RJ path has applied this valve since before the ruling;
+        the new mask does not replace it."""
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g)
+        self.assertIn('_shut_w = getattr(self, "_rj_band_shutoff_w", None)',
+                      src)
+
+    def test_a_shut_column_gets_NO_vertical_swap(self):
+        """Not a separate exclusion: ``_vert_all_rung_tables`` derives
+        its columns from the block's PICKED ROWS
+        (``unique(w_i * num_bands + b_i)``), so a pair that is never
+        picked has no column, no rungs in the table, zero swap
+        proposals and no [GB_VERT] census entry. One mask, nothing to
+        drift out of sync."""
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        # rows for (w=1, b=2) only -- (w=0, b=1) is shut and unpicked
+        t_i = np.array([0, 1]); w_i = np.array([1, 1]); b_i = np.array([2, 2])
+        cols, carrier, occ, nal = g._vert_all_rung_tables(
+            t_i, w_i, b_i, 3, self.NW, self.NB,
+            lambda q: np.ones(q.shape, dtype=np.int64), np)
+        self.assertEqual([int(c) for c in cols], [1 * self.NB + 2])
+        self.assertNotIn(0 * self.NB + 1, [int(c) for c in cols])
+
+    def test_release_makes_a_shut_pair_pickable_again(self):
+        """The step change reopens everything. Per Mike's confirmation
+        the all-time MAX survives; the counters do not."""
+        import lisatools.globalfit.state as st
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        bi = {"num_bands": self.NB, "nwalkers": self.NW}
+        st.ensure_search_shutoff_window(bi, self.NB, self.NW)
+        shut = np.zeros((self.NW, self.NB), dtype=bool)
+        v = g.cold_band_lnl_from_band_info(bi, shut.shape)
+        occ = np.ones((self.NW, self.NB), dtype=np.int64)
+        for _ in range(4):                     # drive it to converged
+            v.peak[:] = -5.0
+            conv = v.judge(4.0, 3, occ)
+        shut[np.asarray(conv)] = True
+        self.assertTrue(shut.all())
+        self.assertFalse(self._mask(shut, np.array([0]), np.array([1]))[0])
+
+        v.release()
+        shut[:] = False
+        self.assertTrue(self._mask(shut, np.array([0]), np.array([1]))[0],
+                        "release must make the pair pickable again")
+        self.assertTrue((bi["band_shutoff_streak_w"] == 0).all())
+        self.assertTrue((bi["band_shutoff_reset_w"] == 0).all())
+        self.assertFalse(np.isfinite(bi["band_cold_logl_peak_w"]).any())
+        # ...and the all-time max SURVIVES (Mike, 2026-09-28)
+        self.assertTrue(np.isfinite(bi["band_cold_logl_max_w"]).all())

@@ -8826,6 +8826,37 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         if _grp is not None:
             eligible = eligible & ~_grp[
                 band_sorter.walker_inds, band_sorter.band_inds]
+        # LEVEL-3 SHUT PAIRS RUN NOTHING (user ruling 2026-09-28,
+        # superseding "skip the survivor windows if cheap"). A
+        # (walker, band) whose cold-chain lnL has been converged for
+        # ``conv_iter`` iterations runs NOTHING until the recipe step
+        # releases it: no births, no deaths, no in-model repeats at any
+        # rung, and no vertical swaps.
+        #
+        # ⚠ THIS IS THE CASCADE POINT, which is why it goes here and not
+        # in each consumer. Everything per-(walker, band) downstream --
+        # the level-1 newborn/survivor windows and their convergence
+        # bookkeeping, the level-2 group-rule passes, the cell-ll
+        # brackets, the sig-het reference builds and refits, the
+        # information-matrix / Cholesky / eigen tables, the cold-band
+        # lnL observe -- operates on PICKED ROWS. A pair that is never
+        # picked spends no GPU time in any of them.
+        #
+        # ⚠ NOT GATED ON ``is_rj_prop``. The RJ subset applies this same
+        # valve separately (see the _shut_w block in the subset build),
+        # and the pure in-model moves log "valve requested but NOT live
+        # (is_rj_prop=False)" -- that is about the RJ STEP, not about
+        # the pick mask. Those two moves are ~47% of the iteration, so
+        # gating the mask on is_rj_prop would leave most of the saving
+        # on the table.
+        #
+        # Measured on job 662: 1680 of 1904 occupied pairs (88%) shut.
+        _shut3 = getattr(self, "_rj_band_shutoff_w", None)
+        if (_shut3 is not None and getattr(self, "search_mode", False)
+                and bool(np.asarray(_to_numpy(_shut3)).any())):
+            _xp3 = get_array_module(band_sorter.band_inds)
+            eligible = eligible & ~_xp3.asarray(_shut3)[
+                band_sorter.walker_inds, band_sorter.band_inds]
         # Unit-scoped eligibility, consumed by _run_rj_step's cap-transition
         # budget adjustment (counting a freed/re-capped cell's UNPICKED
         # staged birth rows requires knowing which main-sorter rows belong
