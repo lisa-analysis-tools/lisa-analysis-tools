@@ -2501,7 +2501,7 @@ def _vert_all_rungs_on() -> bool:
 
 def _vert_all_rung_cached(cols, carrier, occupied, n_alive, vert_base,
                           t_i, w_i, b_i, num_bands, xp,
-                          buffer_obj=None, nwalkers=None):
+                          buffer_obj=None, nwalkers=None, scheduler=None):
     """``(cached, scorable)`` totals for EVERY rung with no picked row.
 
     USER RULING 2026-09-27: "all of the rungs should perform vertical
@@ -2542,9 +2542,23 @@ def _vert_all_rung_cached(cols, carrier, occupied, n_alive, vert_base,
     that is the invariant the all-rungs swap already depends on -- so this
     should be empty in production, and it is counted rather than trusted.
 
-    Falls back to the old inference when no ``buffer_obj`` is supplied
-    (unit tests, an exotic harness), so the previous behaviour is still
-    reachable and still tested.
+    ⚠ THE SLOT LABELS COME FROM THE ``scheduler``, NOT THE BUFFER.
+    ``slot_specials`` / ``slot_active`` are :class:`BandScheduler`
+    properties (``gbbands.py``); ``SubBandBuffer`` has never had either.
+    Reading them off ``buffer_obj`` raises ``AttributeError``, which the
+    blanket ``except`` below turns into the inference fallback -- i.e. the
+    all-rungs feature silently reverts to the behaviour it replaced. That
+    is exactly what happened on 6mo v9 job 654 (2026-09-27): 4,532
+    ``[GB_VERT] all-rung measurement unavailable`` warnings and 162,800
+    pairs per block dropped as unpriceable, with the run otherwise
+    healthy. Slot INDEX space is shared between the two objects
+    (``_cell_ll_open`` does ``buffer_obj.band_likelihoods()[slots]``
+    against ``scheduler.slot_specials``), which is why the pairing works
+    -- but only one of them carries the labels.
+
+    Falls back to the old inference when ``buffer_obj`` or ``scheduler``
+    is missing (unit tests, an exotic harness), so the previous behaviour
+    is still reachable and still tested.
     """
     n_cols, ntemps = int(carrier.shape[0]), int(carrier.shape[1])
     cached = xp.zeros((n_cols, ntemps), dtype=xp.float64)
@@ -2552,10 +2566,12 @@ def _vert_all_rung_cached(cols, carrier, occupied, n_alive, vert_base,
     empty = ~occupied
 
     # ---- the measured path ------------------------------------------
-    if buffer_obj is not None and nwalkers is not None and n_cols > 0:
+    if (buffer_obj is not None and scheduler is not None
+            and nwalkers is not None and n_cols > 0):
         try:
-            _ss = buffer_obj.slot_specials
-            _act = getattr(buffer_obj, "slot_active", None)
+            # SCHEDULER, not buffer_obj -- see the warning in the docstring.
+            _ss = xp.asarray(scheduler.slot_specials).astype(xp.int64)
+            _act = getattr(scheduler, "slot_active", None)
             # Packed (t, w, b) for every cell of the all-rung table, in the
             # SAME packing the sorter uses (pack_special_index), so the
             # lookup cannot disagree with the buffer's own labels.
@@ -2590,10 +2606,21 @@ def _vert_all_rung_cached(cols, carrier, occupied, n_alive, vert_base,
             # cell_ll_base + ll_ref, the rest from this measurement.
             return cached, live | _resident.reshape(n_cols, ntemps)
         except Exception as _e:   # noqa: BLE001 -- fall back, never break
-            logger.warning(
-                "[GB_VERT] all-rung measurement unavailable (%r); falling "
-                "back to the sole-occupant inference, which prices only "
-                "empties in columns that happen to carry one.", _e)
+            # Loud on the first hit, then every 1000th. Job 654 emitted
+            # 4,532 identical copies of this line; the per-block census
+            # ("N pair(s) dropped as unpriceable") is the standing signal.
+            _n = getattr(_vert_all_rung_cached, "_fallback_hits", 0) + 1
+            _vert_all_rung_cached._fallback_hits = _n
+            if _n == 1 or _n % 1000 == 0:
+                logger.warning(
+                    "[GB_VERT] all-rung measurement unavailable (%r) "
+                    "[hit %d]; falling back to the sole-occupant "
+                    "inference, which prices only empties in columns that "
+                    "happen to carry one. THIS IS A DEFECT, not a tuning "
+                    "state: with GB_TEMPER_ALL_RUNGS=1 the measured path "
+                    "is supposed to price every resident rung. Check that "
+                    "the caller passed scheduler= (slot_specials lives on "
+                    "BandScheduler, never on SubBandBuffer).", _e, _n)
 
     # ---- the inference fallback (pre-2026-09-27 behaviour) -----------
     bare_known = xp.zeros(n_cols, dtype=bool)
@@ -9002,6 +9029,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                                     else _cls_reps[_cls_name]
                                 ),
                                 cell_ll_state=cell_ll_state,
+                                scheduler=scheduler,
                                 converge=_cv,
                             )
 
@@ -17613,7 +17641,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 _cached, _scor = _vert_all_rung_cached(
                     _cols, _carrier, _occ, _nal, _vert_base,
                     t_i, w_i, b_i, int(self.num_bands), xp,
-                    buffer_obj=buffer_obj,
+                    buffer_obj=buffer_obj, scheduler=scheduler,
                     nwalkers=int(band_sorter.nwalkers))
                 # FROZEN table: which rungs are priced from ``_cached``
                 # rather than from their live arrays. Starts all-False;

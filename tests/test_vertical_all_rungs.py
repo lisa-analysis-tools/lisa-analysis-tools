@@ -283,19 +283,34 @@ if __name__ == "__main__":
 
 
 class _FakeBuffer:
-    """Minimal buffer: slot labels, an active mask, and a slot-scored ll."""
+    """A slot-scored ll, and NOTHING ELSE.
 
-    def __init__(self, specials, lls, active=None):
-        self.slot_specials = np.asarray(specials, dtype=np.int64)
+    ⚠ DELIBERATELY has no ``slot_specials`` / ``slot_active``. The real
+    :class:`SubBandBuffer` has never had either -- they are
+    :class:`BandScheduler` properties -- and the first version of this
+    fake carried them anyway. Every test here passed while production
+    raised ``AttributeError`` on its first call and fell back to the
+    inference for 4,532 consecutive blocks on 6mo v9 job 654. A fake that
+    is more capable than the real object tests nothing.
+    """
+
+    def __init__(self, lls):
         self._lls = np.asarray(lls, dtype=float)
-        self.slot_active = (np.ones(len(specials), bool) if active is None
-                            else np.asarray(active, bool))
         self.calls = 0
 
     def band_likelihoods(self, source_only=False, slots=None):
         assert source_only, "the gate's unit is -1/2<r|r>, i.e. source_only"
         self.calls += 1
         return self._lls[np.asarray(slots, dtype=np.int64)]
+
+
+class _FakeScheduler:
+    """Slot labels + the active mask -- where the real code reads them."""
+
+    def __init__(self, specials, active=None):
+        self.slot_specials = np.asarray(specials, dtype=np.int64)
+        self.slot_active = (np.ones(len(specials), bool) if active is None
+                            else np.asarray(active, bool))
 
 
 class AllRungsAreMeasuredNotInferredTest(unittest.TestCase):
@@ -332,10 +347,11 @@ class AllRungsAreMeasuredNotInferredTest(unittest.TestCase):
         occupied = np.array([[True, False, True],          # incl. UNPICKED
                              [False, True, False]])
         cols, carrier, occupied, spec, lls = self._setup(carrier, occupied)
-        buf = _FakeBuffer(spec, lls)
+        buf, sch = _FakeBuffer(lls), _FakeScheduler(spec)
         cached, scor = _vert_all_rung_cached(
             cols, carrier, occupied, None, None, np.zeros(0), np.zeros(0),
-            np.zeros(0), self.NB, np, buffer_obj=buf, nwalkers=self.NW)
+            np.zeros(0), self.NB, np, buffer_obj=buf, scheduler=sch,
+            nwalkers=self.NW)
         self.assertTrue(scor.all(), "a resident rung was left unpriceable")
         self.assertEqual(buf.calls, 1, "must be ONE compute for the block")
 
@@ -347,10 +363,11 @@ class AllRungsAreMeasuredNotInferredTest(unittest.TestCase):
         carrier = np.array([[0, -1, -1], [-1, -1, -1]])
         occupied = np.array([[True, True, True], [True, True, True]])
         cols, carrier, occupied, spec, lls = self._setup(carrier, occupied)
-        buf = _FakeBuffer(spec, lls)
+        buf, sch = _FakeBuffer(lls), _FakeScheduler(spec)
         cached, scor = _vert_all_rung_cached(
             cols, carrier, occupied, None, None, np.zeros(0), np.zeros(0),
-            np.zeros(0), self.NB, np, buffer_obj=buf, nwalkers=self.NW)
+            np.zeros(0), self.NB, np, buffer_obj=buf, scheduler=sch,
+            nwalkers=self.NW)
         self.assertTrue(scor.all())
         # the live rung keeps 0 (scored elsewhere from cell_ll_base+ll_ref);
         # every other rung carries its measured slab value
@@ -364,10 +381,11 @@ class AllRungsAreMeasuredNotInferredTest(unittest.TestCase):
         occupied = np.array([[True, False, False], [False, True, False]])
         cols, carrier, occupied, spec, lls = self._setup(carrier, occupied)
         spec2 = spec.copy(); spec2[-1] = 10**9        # evict the last cell
-        buf = _FakeBuffer(spec2, lls)
+        buf, sch = _FakeBuffer(lls), _FakeScheduler(spec2)
         cached, scor = _vert_all_rung_cached(
             cols, carrier, occupied, None, None, np.zeros(0), np.zeros(0),
-            np.zeros(0), self.NB, np, buffer_obj=buf, nwalkers=self.NW)
+            np.zeros(0), self.NB, np, buffer_obj=buf, scheduler=sch,
+            nwalkers=self.NW)
         self.assertFalse(bool(scor.ravel()[-1]))
 
     def test_a_retired_slot_is_not_trusted(self):
@@ -377,10 +395,11 @@ class AllRungsAreMeasuredNotInferredTest(unittest.TestCase):
         occupied = np.array([[True, False, False], [False, True, False]])
         cols, carrier, occupied, spec, lls = self._setup(carrier, occupied)
         act = np.ones(len(spec), bool); act[-1] = False
-        buf = _FakeBuffer(spec, lls, active=act)
+        buf, sch = _FakeBuffer(lls), _FakeScheduler(spec, active=act)
         cached, scor = _vert_all_rung_cached(
             cols, carrier, occupied, None, None, np.zeros(0), np.zeros(0),
-            np.zeros(0), self.NB, np, buffer_obj=buf, nwalkers=self.NW)
+            np.zeros(0), self.NB, np, buffer_obj=buf, scheduler=sch,
+            nwalkers=self.NW)
         self.assertFalse(bool(scor.ravel()[-1]))
 
     def test_without_a_buffer_it_falls_back_to_the_old_inference(self):
@@ -395,6 +414,92 @@ class AllRungsAreMeasuredNotInferredTest(unittest.TestCase):
             np.zeros(0), self.NB, np)
         # no vert_base -> nothing inferable -> only the live rungs score
         np.testing.assert_array_equal(scor, carrier >= 0)
+
+    def test_a_scheduler_is_required_for_the_measured_path(self):
+        """buffer_obj alone must NOT be treated as enough.
+
+        Regression for job 654: the measured path was entered on
+        ``buffer_obj`` alone, went looking for slot labels that only the
+        scheduler has, and the blanket ``except`` converted the
+        AttributeError into a silent reversion to the inference.
+        """
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            _vert_all_rung_cached)
+        carrier = np.array([[0, -1, -1], [-1, 1, -1]])
+        occupied = np.array([[True, True, True], [True, True, True]])
+        cols, carrier, occupied, spec, lls = self._setup(carrier, occupied)
+        buf = _FakeBuffer(lls)
+        cached, scor = _vert_all_rung_cached(
+            cols, carrier, occupied, None, None, np.zeros(0), np.zeros(0),
+            np.zeros(0), self.NB, np, buffer_obj=buf, nwalkers=self.NW)
+        self.assertEqual(buf.calls, 0, "measured without slot labels")
+        np.testing.assert_array_equal(scor, carrier >= 0)
+
+
+class SlotLabelsComeFromTheSchedulerTest(unittest.TestCase):
+    """The contract the fake got wrong, checked against the REAL classes.
+
+    Job 654 (2026-09-27) ran 4,532 blocks with the all-rungs measurement
+    disabled because ``_vert_all_rung_cached`` read ``slot_specials`` off
+    ``buffer_obj``. Every unit test passed: the fake buffer carried the
+    attribute the real one does not. These assertions are cheap, need no
+    instantiation, and are the ones that would have caught it.
+    """
+
+    def test_slot_specials_is_a_BandScheduler_property(self):
+        from lisatools.globalfit.moves.gbbands import BandScheduler
+        self.assertIsInstance(
+            getattr(BandScheduler, "slot_specials", None), property)
+
+    def test_SubBandBuffer_does_NOT_carry_the_slot_labels(self):
+        from lisatools.globalfit.moves.gbbands import SubBandBuffer
+        for name in ("slot_specials", "slot_active"):
+            self.assertFalse(
+                hasattr(SubBandBuffer, name),
+                f"SubBandBuffer grew {name!r}: if that is deliberate, the "
+                "docstring warning in _vert_all_rung_cached and this test "
+                "both need revisiting -- but two sources of slot labels "
+                "is the ambiguity that caused the job 654 regression.")
+
+    def test_the_measured_path_reads_the_labels_off_the_scheduler(self):
+        import inspect
+        from lisatools.globalfit.moves import gbspecialstretch as g
+        src = inspect.getsource(g._vert_all_rung_cached)
+        body = src[src.index("the measured path"):]
+        self.assertIn("scheduler.slot_specials", body)
+        self.assertNotIn("buffer_obj.slot_specials", body)
+
+    def test_every_production_call_site_passes_a_scheduler(self):
+        """The knob reaching nothing is the recurring failure mode."""
+        import inspect, re
+        from lisatools.globalfit.moves import gbspecialstretch as g
+        src = inspect.getsource(g)
+        calls = [m for m in re.finditer(r"_vert_all_rung_cached\(", src)]
+        # one definition + the production call(s)
+        self.assertGreaterEqual(len(calls), 2)
+        for m in calls[1:]:
+            chunk = src[m.end():m.end() + 400]
+            chunk = chunk[:chunk.index(")\n")] if ")\n" in chunk else chunk
+            self.assertIn("scheduler=", chunk,
+                          "a _vert_all_rung_cached call site omits "
+                          "scheduler=, so it silently prices nothing")
+
+    def test_run_in_model_repeats_is_always_given_the_scheduler(self):
+        """Job 654's sibling gap: _polish called it without a scheduler."""
+        import inspect, re
+        from lisatools.globalfit.moves import gbspecialstretch as g
+        src = inspect.getsource(g)
+        for m in re.finditer(r"self\._run_in_model_repeats\(", src):
+            chunk = src[m.end():m.end() + 900]
+            depth, end = 1, len(chunk)
+            for i, ch in enumerate(chunk):
+                depth += (ch == "(") - (ch == ")")
+                if depth == 0:
+                    end = i
+                    break
+            self.assertIn("scheduler=", chunk[:end],
+                          "a _run_in_model_repeats call omits scheduler=, "
+                          "so all-rung pricing is off for that path")
 
 
 class FrozenRungsArePricedFromCacheTest(unittest.TestCase):
