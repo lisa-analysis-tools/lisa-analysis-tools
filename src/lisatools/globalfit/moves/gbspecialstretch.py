@@ -1339,11 +1339,58 @@ def fstat_stage_fingerprint_for(move) -> str:
     a new epoch; the comb npz is keyed separately and is reused, so the
     cost is a re-selection plus stage B, never a re-sweep.
     """
+    out = ""
     mf = fstat_band_min_F_for(move)
-    if mf is None:
-        return ""
-    h = hashlib.sha1(np.asarray(mf, dtype=float).tobytes()).hexdigest()[:12]
-    return f"|stagefloor={h}"
+    if mf is not None:
+        h = hashlib.sha1(
+            np.asarray(mf, dtype=float).tobytes()).hexdigest()[:12]
+        out += f"|stagefloor={h}"
+    # ⚠ THE SKIP SET IS PART OF WHAT A CACHED EPOCH MEANS, for exactly
+    # the reason the floor is: run_fstat_grid_fit short-circuits a
+    # COMPLETE epoch straight off disk without re-selecting peaks. A
+    # catalog selected while 88% of bands were shut would otherwise keep
+    # being handed back AFTER the recipe step released them -- a catalog
+    # missing most of the spectrum, silently, for the rest of the run.
+    # A changed skip set is a new epoch; the comb npz is keyed
+    # separately and is reused, so the cost is a re-selection plus
+    # stage B, never a re-sweep.
+    bs = fstat_band_skip_for(move)
+    if bs is not None:
+        hs = hashlib.sha1(
+            np.asarray(bs, dtype=bool).tobytes()).hexdigest()[:12]
+        out += f"|bandskip={hs}"
+    return out
+
+
+def fstat_band_skip_for(move):
+    """Bands ``move``'s next fit may SKIP, or ``None``.
+
+    ``None`` -- the valve-off answer, and the answer for any object that
+    never bound the table -- scans everything, exactly as before.
+
+    MODULE-LEVEL and taking the move, for the same reason
+    :func:`fstat_band_min_F_for` is: ``_run_fstat_fit`` runs on
+    duck-typed rank stubs, and a getattr degrades to "the feature is off
+    here" instead of crashing the fit path.
+    """
+    from lisatools.sampling.fstat_proposal import fstat_band_skip
+
+    shut = getattr(move, "_rj_band_shutoff_w", None)
+    if shut is None:
+        return None
+    out = fstat_band_skip(shut, int(getattr(move, "num_bands", 0)))
+    if out is not None and bool(out.all()):
+        # EVERY band shut on every walker. Skipping all of them would
+        # produce an empty catalog and no births anywhere -- and the
+        # stage is about to end anyway. Refuse rather than ship a fit
+        # that cannot help.
+        logger.warning(
+            "[GB_STAGE %s] every band is shut on every walker; NOT "
+            "skipping any in the F-stat fit (an empty catalog would "
+            "leave the grid with nothing to propose).",
+            getattr(move, "name", "?"))
+        return None
+    return out
 
 
 def _rj_amp_maximize_on() -> bool:
@@ -30302,6 +30349,14 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             # per-walker half of the schedule is the opt-SNR boundary,
             # which IS per row. See fstat_band_min_F.
             band_min_F=fstat_band_min_F_for(self),
+            # LEVEL-3 SHUT BANDS ARE SKIPPED (user ruling 2026-09-28,
+            # "no fstat refit for shutdown bands"). Shut on EVERY walker
+            # only: one shared catalog, so a band a single open walker
+            # could still use must keep its peaks. Measured split on job
+            # 662 -- stage A 720 s, stage B 409 s of a 1129 s epoch --
+            # so this masks the stage-B third; the stage-A node-range
+            # skip is a separate change.
+            band_skip=fstat_band_skip_for(self),
             cache_dir=cache_dir,
             # THE REFERENCE WALKER IS PART OF THE FINGERPRINT TOO, for the
             # same reason ``gbfree`` is: it changes the RESIDUAL the sweep

@@ -1215,3 +1215,151 @@ class IterationTimePackageLauncherTest(unittest.TestCase):
         in the launcher rather than in someone's head."""
         for name in ("submit_gf_6mo_v9_4gpu.sh", "submit_gf_3mo_v9_2gpu.sh"):
             self.assertIn("12.5", self._src(name), name)
+
+
+class FstatSkipsShutBandsTest(unittest.TestCase):
+    """USER RULING 2026-09-28: "no fstat refit for shutdown bands".
+
+    The scan is a SINGLE SHARED PASS -- ``_run_fstat_fit`` logs
+    ``walker_ref=%d GLOBAL`` and there is one catalog for every walker --
+    so a band may only be skipped when the level-3 valve is shut on
+    EVERY walker. ``any`` would starve the walkers still open there.
+
+    Job 662 split: stage A 720 s, stage B 409 s of a 1129 s epoch. This
+    masks the stage-B third; the stage-A node-range skip is separate.
+    """
+
+    NB = 4
+
+    def _skip(self, shut):
+        from lisatools.sampling.fstat_proposal import fstat_band_skip
+        return fstat_band_skip(np.asarray(shut, dtype=bool), self.NB)
+
+    def test_shut_on_EVERY_walker_is_skipped(self):
+        out = self._skip([[True, False, True, False],
+                          [True, False, False, False]])
+        self.assertEqual([bool(v) for v in out],
+                         [True, False, False, False])
+
+    def test_shut_on_ONE_walker_is_NOT_skipped(self):
+        """The starvation case: walker 1 is still open in band 2."""
+        out = self._skip([[False, False, True, False],
+                          [False, False, False, False]])
+        self.assertFalse(bool(out[2]))
+
+    def test_the_valve_being_off_scans_everything(self):
+        from lisatools.sampling.fstat_proposal import fstat_band_skip
+        self.assertIsNone(fstat_band_skip(None, self.NB))
+
+    def test_a_mismatched_table_raises_rather_than_skipping_wrong_bands(self):
+        from lisatools.sampling.fstat_proposal import fstat_band_skip
+        with self.assertRaises(ValueError) as cm:
+            fstat_band_skip(np.zeros((2, self.NB + 3), dtype=bool), self.NB)
+        self.assertIn("WRONG", str(cm.exception))
+
+    def test_release_reopens_the_band(self):
+        """Release clears the shut flags, so the next fit scans it."""
+        shut = np.ones((2, self.NB), dtype=bool)
+        shut[:, 1] = False
+        self.assertTrue(bool(self._skip(shut)[0]))
+        shut[:] = False                       # what release() does
+        self.assertFalse(self._skip(shut).any())
+
+    def test_ALL_bands_shut_refuses_to_skip_any(self):
+        """An empty catalog proposes nothing anywhere. Refuse rather
+        than ship a fit that cannot help."""
+        import logging
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        mv = SimpleNamespace(
+            _rj_band_shutoff_w=np.ones((2, self.NB), dtype=bool),
+            num_bands=self.NB, name="rj_fstat_search")
+        with self.assertLogs(g.logger, level=logging.WARNING) as cap:
+            self.assertIsNone(g.fstat_band_skip_for(mv))
+        self.assertTrue(any("every band is shut" in m for m in cap.output))
+
+    def test_the_move_side_builder_degrades_when_unbound(self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        self.assertIsNone(g.fstat_band_skip_for(SimpleNamespace()))
+
+    def test_the_skip_set_is_part_of_the_EPOCH_FINGERPRINT(self):
+        """⚠ run_fstat_grid_fit short-circuits a COMPLETE epoch straight
+        off disk without re-selecting peaks. A catalog selected while
+        88% of bands were shut would otherwise keep being handed back
+        AFTER release -- missing most of the spectrum, for the rest of
+        the run."""
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        shut = np.zeros((2, self.NB), dtype=bool); shut[:, 0] = True
+        a = g.fstat_stage_fingerprint_for(SimpleNamespace(
+            _rj_band_shutoff_w=shut.copy(), num_bands=self.NB, name="m"))
+        shut2 = shut.copy(); shut2[:, 1] = True
+        b = g.fstat_stage_fingerprint_for(SimpleNamespace(
+            _rj_band_shutoff_w=shut2, num_bands=self.NB, name="m"))
+        self.assertIn("bandskip=", a)
+        self.assertNotEqual(a, b, "a changed skip set must be a new epoch")
+
+    def test_the_fingerprint_is_EMPTY_with_both_features_off(self):
+        """No existing cache key may change."""
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        self.assertEqual(
+            g.fstat_stage_fingerprint_for(SimpleNamespace()), "")
+
+    def test_the_fit_passes_the_skip_and_logs_the_count(self):
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        import lisatools.sampling.fstat_gridfit as gf
+        self.assertIn("band_skip=fstat_band_skip_for(self)",
+                      inspect.getsource(g.GBSpecialRJFStatGridMove._run_fstat_fit))
+        src = inspect.getsource(gf.run_fstat_grid_fit)
+        self.assertIn("bands skipped as shut on ", src)
+
+    # -- the BEHAVIOUR, not the wiring ---------------------------------
+    def _comb(self):
+        """A 4-band comb with one clear peak per band."""
+        # bands 0..3 over 1.0-5.0 mHz, edges in Hz
+        band_edges_hz = np.array([1e-3, 2e-3, 3e-3, 4e-3, 5e-3])
+        spacing = 1e-4                                   # mHz per node
+        f0 = np.arange(1.0, 5.0, spacing)                # mHz
+        F = np.full(f0.shape, 1.0)
+        for c in (1.5, 2.5, 3.5, 4.5):                   # one per band
+            F[np.argmin(np.abs(f0 - c))] = 1e4
+        return f0, F, band_edges_hz, spacing
+
+    def test_a_SHUT_band_yields_no_peaks_and_an_open_one_still_does(self):
+        from lisatools.sampling.fstat_gridfit import select_comb_peaks
+        f0, F, edges, sp = self._comb()
+        base = select_comb_peaks(f0, F, edges, sp, np, min_F=10.0)
+        bands_before = set(int(r[3]) for r in base)
+        self.assertEqual(bands_before, {1, 2},
+                         "fixture: expect interior bands only")
+
+        skip = np.zeros(self.NB, dtype=bool)
+        skip[1] = True                                   # shut band 1
+        got = select_comb_peaks(f0, F, edges, sp, np, min_F=10.0,
+                                band_skip=skip)
+        bands_after = set(int(r[3]) for r in got)
+        self.assertNotIn(1, bands_after, "a shut band still produced peaks")
+        self.assertIn(2, bands_after, "an open band lost its peaks")
+        self.assertLess(len(got), len(base))
+
+    def test_no_band_skip_is_bit_identical(self):
+        from lisatools.sampling.fstat_gridfit import select_comb_peaks
+        f0, F, edges, sp = self._comb()
+        a = select_comb_peaks(f0, F, edges, sp, np, min_F=10.0)
+        b = select_comb_peaks(f0, F, edges, sp, np, min_F=10.0,
+                              band_skip=None)
+        np.testing.assert_array_equal(a, b)
+
+    def test_skipping_nothing_changes_nothing(self):
+        from lisatools.sampling.fstat_gridfit import select_comb_peaks
+        f0, F, edges, sp = self._comb()
+        a = select_comb_peaks(f0, F, edges, sp, np, min_F=10.0)
+        b = select_comb_peaks(f0, F, edges, sp, np, min_F=10.0,
+                              band_skip=np.zeros(self.NB, dtype=bool))
+        np.testing.assert_array_equal(a, b)
+
+    def test_a_wrong_length_band_skip_raises(self):
+        from lisatools.sampling.fstat_gridfit import select_comb_peaks
+        f0, F, edges, sp = self._comb()
+        with self.assertRaises(ValueError):
+            select_comb_peaks(f0, F, edges, sp, np, min_F=10.0,
+                              band_skip=np.zeros(self.NB + 2, dtype=bool))

@@ -1069,8 +1069,18 @@ class FitClockTest(unittest.TestCase):
         self.assertEqual(self.s._epoch_fit_clock(3), 0)  # missing entirely
 
     def test_journal_throttle(self):
-        # Ticks are iterations as of 2026-09-18; the journal cadence is
-        # counted in the same units and is otherwise untouched.
+        """The throttle MECHANISM, at an explicit cadence.
+
+        ⚠ This used to pin the cadence itself at 10 and had been RED
+        since 2026-09-27, when _FSTAT_CLOCK_WRITE_EVERY became 1 so that
+        a short job cannot lose its clock progress -- while
+        test_fstat_refit_iterations asserted the new value of 1. Two
+        suites contradicting each other, one of them failing, is how a
+        real regression here would go unnoticed. The mechanism is now
+        exercised at a cadence this test SETS, and the production value
+        is checked separately below.
+        """
+        self.s._FSTAT_CLOCK_WRITE_EVERY = 10
         path = os.path.join(self.d, self.s._FSTAT_CLOCK_BASENAME)
         self._tick(3, self.s)
         self.assertEqual(self.s._fstat_clock(), 3)   # first read journals
@@ -1084,6 +1094,19 @@ class FitClockTest(unittest.TestCase):
         self.assertEqual(self.s._fstat_clock(), 13)  # >= WRITE_EVERY: rewrite
         with open(path) as f:
             self.assertEqual(json.load(f)["clock"], 13)
+
+    def test_the_PRODUCTION_cadence_journals_every_tick(self):
+        """_FSTAT_CLOCK_WRITE_EVERY = 1 (2026-09-27): a job that dies
+        after two iterations must not lose both of them."""
+        import lisatools.globalfit.moves.gbspecialstretch as _M
+        self.assertEqual(_M.GBSpecialRJFStatGridMove._FSTAT_CLOCK_WRITE_EVERY,
+                         1)
+        path = os.path.join(self.d, self.s._FSTAT_CLOCK_BASENAME)
+        for n, want in ((3, 3), (6, 9), (4, 13)):
+            self._tick(n, self.s)
+            self.assertEqual(self.s._fstat_clock(), want)
+            with open(path) as f:
+                self.assertEqual(json.load(f)["clock"], want)
 
 
 class CtrTableGBFreeTest(unittest.TestCase):

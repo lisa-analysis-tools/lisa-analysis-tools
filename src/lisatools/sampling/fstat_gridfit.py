@@ -599,7 +599,7 @@ def chunked_fstat_sweep(call_fstat: Callable, params, *, xp, label: str = "",
 
 
 def select_comb_peaks(f0_nodes, F_max, band_edges_hz, spacing, xp,
-                      min_F=None):
+                      min_F=None, band_skip=None):
     """Vectorized per-sub-band peak selection from the comb's ``F_max(f0)``.
 
     Two-tier candidate set -> absolute SNR floor + interior-band mask ->
@@ -659,7 +659,27 @@ def select_comb_peaks(f0_nodes, F_max, band_edges_hz, spacing, xp,
         min_F_row = xp.asarray(_mf)[band_of_node]
         _min_F_lo, _min_F_hi = float(_mf.min()), float(_mf.max())
     interior = (band_of_node >= 1) & (band_of_node <= num_sub_bands - 2)
+    # LEVEL-3 SHUT BANDS PRODUCE NO PEAKS (user ruling 2026-09-28: "no
+    # fstat refit for shutdown bands"). ``band_skip`` is
+    # ``(num_sub_bands,)`` bool, True only where the valve is shut on
+    # EVERY walker -- see fstat_proposal.fstat_band_skip for why ``all``
+    # and not ``any``: there is ONE peak catalog shared by every walker,
+    # so a band may only be skipped when no walker could still use a
+    # peak there. Applied through the SAME ``band_of_node`` lookup the
+    # per-band ``min_F`` uses, so the two can never disagree about which
+    # band a node belongs to.
+    _skip_row = None
+    if band_skip is not None:
+        _bs = np.asarray(band_skip, dtype=bool).reshape(-1)
+        if _bs.shape[0] != num_sub_bands:
+            raise ValueError(
+                f"select_comb_peaks got a band_skip covering "
+                f"{_bs.shape[0]} bands but the grid has {num_sub_bands} "
+                f"sub-bands.")
+        _skip_row = xp.asarray(_bs)[band_of_node]
     cand = (tier1 | local3) & (F_max >= min_F_row) & interior
+    if _skip_row is not None:
+        cand = cand & ~_skip_row
 
     idx = xp.where(cand)[0]
     if int(idx.shape[0]) == 0:
@@ -1083,7 +1103,7 @@ def clear_comb_parts(parts_dir, li, n_parts) -> None:
 def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
                   f0_lims_hz, mc_lims, cache_path: Optional[str] = None,
                   fingerprint_extra: str = "", comb_runner=None,
-                  band_min_F=None):
+                  band_min_F=None, band_skip=None):
     """Dense-in-f0 F-stat comb scan across the sub-band.
 
     With months of data the F-stat f0 peaks are ~1/Tobs wide -- far too
@@ -1187,7 +1207,8 @@ def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
                 total_evals, len(levels))
 
     peaks = select_comb_peaks(f0_nodes, xp.asarray(F_max_host), band_edges_hz,
-                              spacing, xp, min_F=band_min_F)
+                              spacing, xp, min_F=band_min_F,
+                              band_skip=band_skip)
     for f0p, Fp, _, bi in peaks[:10]:
         logger.info("[comb]   %.5f  %10.2f  band %d", f0p, Fp, int(bi))
 
@@ -2304,7 +2325,7 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
                        band_edges_hz, f0_lims_hz, mc_lims, cache_dir: str,
                        fingerprint_extra: str = "", epoch=None,
                        ratio_max=None, sweep_runner=None, comb_runner=None,
-                       band_min_F=None):
+                       band_min_F=None, band_skip=None):
     """Full fit with resume: comb scan -> peak select -> stage B.
 
     ``epoch`` selects the peak-box weighting tilt only (see
@@ -2384,18 +2405,24 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
         # re-selection and a stage-B refit, never a re-sweep.
         peaks = select_comb_peaks(f0_nodes, xp.asarray(d["F_max"]),
                                   band_edges_hz, spacing, xp,
-                                  min_F=band_min_F)
+                                  min_F=band_min_F, band_skip=band_skip)
     else:
         _f0, _F, peaks, _x = run_comb_scan(
             call_fstat, xp=xp, Tobs=Tobs, band_edges_hz=band_edges_hz,
             f0_lims_hz=f0_lims_hz, mc_lims=mc_lims, cache_path=cache_path,
             fingerprint_extra=fingerprint_extra, comb_runner=comb_runner,
-            band_min_F=band_min_F,
+            band_min_F=band_min_F, band_skip=band_skip,
         )
-    logger.info("[stageA] comb + peak selection: %d peaks in %s (%s)",
+    _n_skip = (0 if band_skip is None
+               else int(np.asarray(band_skip, dtype=bool).sum()))
+    _n_band = int(len(band_edges_hz) - 1)
+    logger.info("[stageA] comb + peak selection: %d peaks in %s (%s)%s",
                 int(len(peaks)), _fmt_secs(time.time() - _t_stage_a),
                 "split by node range over the compute ranks"
-                if comb_runner is not None else "serial, this process")
+                if comb_runner is not None else "serial, this process",
+                ("" if band_skip is None else
+                 f"; {_n_skip} of {_n_band} bands skipped as shut on "
+                 f"every walker"))
 
     stacked = run_stacked_stage_b(
         call_fstat, peaks, xp=xp, Tobs=Tobs, band_edges_hz=band_edges_hz,

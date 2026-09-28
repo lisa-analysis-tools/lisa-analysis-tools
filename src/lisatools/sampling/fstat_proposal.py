@@ -310,6 +310,35 @@ def fstat_band_min_F(band_stage, num_bands: int):
     return np.where(stage >= 1, fine, coarse)
 
 
+def fstat_band_skip(shut_w, num_bands: int):
+    """Bands the F-stat fit may SKIP, from a ``(nwalkers, nbands)`` valve.
+
+    Returns a ``(num_bands,)`` bool array, True where the level-3 valve
+    is shut on EVERY walker -- the mirror of :func:`fstat_band_min_F`'s
+    ``max(axis=0)``, and for the same reason. There is ONE peak catalog
+    shared by every walker, so a band may only be skipped when NO walker
+    could still use a peak there; ``any`` would starve the walkers whose
+    pair is still open.
+
+    ``shut_w`` of ``None`` (valve off, or a move that never bound the
+    table) returns ``None``, and the fit scans everything as before.
+    """
+    if shut_w is None:
+        return None
+    shut = np.asarray(shut_w, dtype=bool)
+    if shut.ndim == 2:
+        shut = shut.all(axis=0)
+    shut = shut.reshape(-1)
+    if shut.shape[0] != int(num_bands):
+        raise ValueError(
+            f"band shutoff table covers {shut.shape[0]} bands but the peak "
+            f"grid has {int(num_bands)}. Per-peak ``band_idx`` labels index "
+            f"the band grid, so a mismatched table would skip the WRONG "
+            f"bands -- silently, and the symptom would be missing sources."
+        )
+    return shut
+
+
 def fstat_n_f0(box_width_mHz: float, Tobs_s: float) -> int:
     """f0 node count for a peak box.
 
