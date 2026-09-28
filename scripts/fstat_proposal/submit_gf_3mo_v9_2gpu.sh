@@ -1372,7 +1372,16 @@ export GB_INMODEL_CONVERGE_ITERS=250
 # 101 floor, median gain 0.08-0.23 lnL, i.e. survivors arrive converged
 # and the window is a fixed budget they serve out). The derived dll
 # follows (4.0 * 50/250 = 0.8), so the enforced rate is unchanged.
-export GB_INMODEL_CONVERGE_ITERS_SURVIVOR=50
+# 50 -> 25 (user ruling 2026-09-27). Measured on 6mo job 650 over
+# 52,951 survivor blocks: 40.2% of rows terminate AT the floor, i.e.
+# they arrived already converged and we paid 51 repeats to prove it.
+# The floor is window+1, so 25 proves the same thing in 26. Block
+# medians run p50 60 / p75 76, so rows that DO need refinement keep
+# room. ⚠ the threshold does NOT scale with this any more -- it stays
+# at GB_INMODEL_CONVERGE_DLL=4.0, the same D/2 bar the band valve and
+# the leaf cap use (GB_INMODEL_CONVERGE_DLL_SCALE_WITH_WINDOW=1
+# restores the old rate-preserving rescale).
+export GB_INMODEL_CONVERGE_ITERS_SURVIVOR=25
 # The improvement threshold: D/2 = 0.5 * GB_LEAF_CAP_NDIM, the lnL a
 # genuinely new D-parameter source has to buy. Same number as the leaf cap
 # gate, but see the warning above -- same threshold, different clock.
@@ -1420,6 +1429,19 @@ export GB_INMODEL_CONVERGE_MAX=20000
 # stragglers holding every finished cold source hostage. 1.0 = every rung
 # must converge (the pre-gate behaviour).
 export GB_INMODEL_CONVERGE_GATE_FRAC=0.5
+# COLD-CHAIN-ONLY COLUMN RETIREMENT (user ruling 2026-09-27: "with the
+# vertical swaps working well, we should pull the whole group off the
+# current running block when its cold chain converges").
+#
+# ABSOLUTE rung count, overrides GATE_FRAC above. =1 means the T0 row is
+# the only one with a vote on when a (walker, band) column may leave the
+# in-model block; the whole column goes together and the hot rows are
+# recorded as RELEASED (nothing concluded) rather than converged.
+#
+# NOT the fraction: the exact ratio 1/24 does give one rung, but this file
+# exports a typed decimal and the answer flips on the fourth place --
+# ceil(24 * 0.04) is 1, ceil(24 * 0.0417) is 2.
+export GB_INMODEL_CONVERGE_GATE_RUNGS=1
 # SWAP TRIGGER: end a block once this fraction of its (walker, band) COLUMNS
 # has fully retired, then swap the finished bands out for queued ones.
 # ⚠ 1.0 SILENTLY DISABLES THE REFILL -- at 1.0 every column finishes together,
@@ -3303,14 +3325,25 @@ export GB_RJ_BAND_SHUTOFF_FMIN_MHZ=10.0
 # so those 9 bands get repeated chances instead of one. The cost of the
 # short clock is now a DELAY on a genuinely barren-looking band, not a
 # permanent loss. Revivals log as [GB_BAND_REVIVE <move>].
-export GB_RJ_BAND_SHUTOFF_ITERS=5
+# 5 -> 2 (user ruling 2026-09-27). The 5 was sized to outlast the
+# progressive leaf-CAP ramp -- a band could be empty because its cap
+# had not ramped yet. This schedule has no caps, so an empty band is
+# empty on the evidence and two consecutive zero-occupancy iterations
+# settle it.
+export GB_RJ_BAND_SHUTOFF_ITERS=2
 export GB_RJ_BAND_SHUTOFF_SCOPE=search
 # Backstop revival (new 2026-08-28): iterations with NO new F-stat epoch
 # after which the shut-off set is cleared anyway; 0 disables the trigger.
 # Even with no refit the noise model keeps evolving, so a long stretch
 # should re-open the question on its own. 100 = 2x the refit cadence
 # below, so it only bites if refitting stalls or is turned off.
-export GB_RJ_BAND_SHUTOFF_RESET_ITERS=100
+# 100 -> 10 (user ruling 2026-09-27). This is now a periodic CHECK,
+# not an unconditional revival: the shut-off set is reconsidered every
+# N iterations and reopened ONLY IF THE NOISE HAS MOVED (see
+# GB_RJ_BAND_SHUTOFF_NOISE_TOL, default 1e-3). The check is one
+# fingerprint compare, so it can run ten times as often. With the 6mo
+# noise PINNED it will never revive, which is the intent.
+export GB_RJ_BAND_SHUTOFF_RESET_ITERS=10
 # USER RULING 2026-08-28: a shut-off band is frozen "for RJ and fancy
 # swaps until it resets". The RJ half is enforced in run_proposal; the
 # swap half is this knob (default OFF in code) and it had never been
