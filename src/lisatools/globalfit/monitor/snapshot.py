@@ -148,8 +148,103 @@ def _filter_all_logs(run_dir: str, cap_mb: int, tail_mb: int):
     return out
 
 
+#: Raw bytes of stdout a 6mo job writes per SAVED iteration (measured
+#: 2026-09-28). Used only to decide whether the newest job is too young
+#: to carry a full iteration, in which case the previous job's stdout
+#: rides along so the short tar always spans at least one.
+_STDOUT_BYTES_PER_ITERATION = 35 * 1048576
+
+
+def _job_stdouts(run_dir: str):
+    """``[(mtime, path)]`` for ``slurm_stdout_<id>.log``, newest last."""
+    out = []
+    for root, dirs, fns in os.walk(run_dir):
+        dirs.sort()
+        for fn in sorted(fns):
+            if re.match(r"^slurm_stdout_\d+\.log$", fn):
+                p = os.path.join(root, fn)
+                try:
+                    out.append((os.path.getmtime(p), p))
+                except OSError:
+                    continue
+    out.sort()
+    return out
+
+
+def _short_members(run_dir: str, store: str, young_bytes: int):
+    """The SHORT tar's member list: an ALLOWLIST, not a filtered denylist.
+
+    User ruling 2026-09-28, after the audit measured the previous short
+    tar at 129 MB of which ~95% was filtered dead-job and duplicate
+    logs. What a reader of a short tar actually needs:
+
+    * the NEWEST ``slurm_stdout_<id>.log`` RAW -- it is a verbatim
+      SUPERSET of globalfit_run.log plus the rank logs, and it alone
+      carries [GF_TIMING], [V9-SEED], [r4/saver], the stage table and
+      the INFO-level [GB_CELL_LL] cold breakdown (only the WARNING
+      variant matches LOG_KEEP_PATTERN, so the filtered path would
+      lose it). It gzips ~11x, so raw is both cheaper to produce and
+      more useful than a filtered copy.
+    * the previous job's stdout TOO when the newest is younger than one
+      saved iteration, so the tar always spans at least one.
+    * the reduced extract (keep=1), the page if present, the newest
+      job's gpu_util csv, run_settings.log, the *_setup.log files, the
+      eigen pkl, and gb_fstat_fit/*/DONE.json.
+
+    DROPPED: every globalfit_run* product (duplicated by the stdout),
+    every dead-job stdout, gpu_procs (per-process noise), and the truth
+    and warmstart npz (static, incompressible, identical across tars --
+    94 MB on 6mo).
+
+    NO _filtered/_tail products are written or shipped in short mode.
+    """
+    keep = []
+    stdouts = _job_stdouts(run_dir)
+    if stdouts:
+        keep.append(stdouts[-1][1])
+        if (len(stdouts) > 1
+                and os.path.getsize(stdouts[-1][1]) < int(young_bytes)):
+            keep.append(stdouts[-2][1])
+            logger.info(
+                "short snapshot: newest job is < one saved iteration "
+                "(%.0f MB); shipping the previous job's stdout too",
+                os.path.getsize(stdouts[-1][1]) / 1048576.0)
+    _newest_job = None
+    if stdouts:
+        m = re.search(r"slurm_stdout_(\d+)\.log$", stdouts[-1][1])
+        _newest_job = m.group(1) if m else None
+    if store:
+        ex = store[:-3] + "_extract.h5"
+        if os.path.exists(ex):
+            keep.append(ex)
+    for root, dirs, fns in os.walk(run_dir):
+        dirs.sort()
+        for fn in sorted(fns):
+            p = os.path.join(root, fn)
+            rel = "/" + os.path.relpath(p, run_dir)
+            if fn == "gf_monitor.html":
+                keep.append(p)
+            elif fn == "run_settings.log" or fn.endswith("_setup.log"):
+                keep.append(p)
+            elif fn.endswith("_eigen_tables.pkl"):
+                keep.append(p)
+            elif fn == "DONE.json" and "gb_fstat_fit" in rel:
+                keep.append(p)
+            elif (_newest_job is not None
+                  and fn == f"gpu_util_{_newest_job}.csv"):
+                keep.append(p)
+    # stable, de-duplicated
+    seen, out = set(), []
+    for p in keep:
+        ap = os.path.abspath(p)
+        if ap not in seen:
+            seen.add(ap)
+            out.append(p)
+    return out
+
+
 def _members(run_dir: str, include_fstat: bool, skip_raw_log,
-             max_file_mb: Optional[int] = None):
+             max_file_mb: Optional[int] = None, keep_products=()):
     """Archive members. ``skip_raw_log`` is one path or a set of them.
 
     ``max_file_mb`` drops anything bigger (short mode). The reduced
@@ -163,6 +258,7 @@ def _members(run_dir: str, include_fstat: bool, skip_raw_log,
         skip = {os.path.abspath(p) for p in skip_raw_log}
     else:
         skip = {os.path.abspath(skip_raw_log)}
+    keep_products = {os.path.abspath(p) for p in (keep_products or ())}
     out = []
     dropped = []
     for root, dirs, fns in os.walk(run_dir):
@@ -175,6 +271,18 @@ def _members(run_dir: str, include_fstat: bool, skip_raw_log,
             if any(fn.endswith(s) for s in _EXCLUDE_SUFFIXES):
                 continue
             if ".h5.bak" in fn:
+                continue
+            # STALE REDUCED LOGS. The full build deliberately ships the
+            # globalfit_run_filtered/_tail PAIR when the run log is over
+            # the cap -- _filter_run_log writes it and hands its raw
+            # path back as ``skip``, and SnapshotMatchesTheShellRecipeTest
+            # pins that. But the OLD short mode left
+            # slurm_stdout_<id>_filtered/_tail lying in the run dir
+            # root, and the full build then shipped them BESIDE the raw
+            # logs -- pure duplication. So: keep the products THIS call
+            # produced (``keep_products``), drop every other one.
+            if (fn.endswith(("_filtered.log", "_tail.log"))
+                    and os.path.abspath(p) not in keep_products):
                 continue
             # Full stores out, the reduced extract in.
             if fn.endswith(".h5") and not fn.endswith("_extract.h5"):
@@ -212,10 +320,12 @@ def _members(run_dir: str, include_fstat: bool, skip_raw_log,
 
 
 def build_snapshot(run_dir: str, out_path: Optional[str] = None, *,
-                   keep: int = 5, cold_keep: int = 12,
+                   keep: Optional[int] = None,
+                   cold_keep: Optional[int] = None,
                    include_fstat: bool = False,
                    log_cap_mb: int = 200,
                    short: bool = False,
+                   young_bytes: Optional[int] = None,
                    max_file_mb: Optional[int] = None,
                    tail_mb: int = 5) -> Optional[str]:
     """Build ``<run_dir>_snapshot.tar.gz``. Returns the path, or ``None``.
@@ -240,24 +350,15 @@ def build_snapshot(run_dir: str, out_path: Optional[str] = None, *,
     contract.
     """
     run_dir = os.path.abspath(str(run_dir).rstrip("/"))
-    if short:
-        # Presets, not hard-codes: an explicit kwarg still wins. Compared
-        # against the signature defaults so "the caller said 5" and "the
-        # caller said nothing" are distinguishable without sentinels.
-        if keep == 5:
-            keep = 1
-        if cold_keep == 12:
-            cold_keep = 1
-        if log_cap_mb == 200:
-            log_cap_mb = 20
-        if max_file_mb is None:
-            max_file_mb = 5
-        # ⚠ NO DEAD BAND. A log bigger than max_file_mb but smaller than
-        # log_cap_mb would be left unreduced and then dropped by the
-        # size cap -- silently losing the whole file instead of keeping
-        # its filtered + tail pair. Reduce at the SMALLER of the two so
-        # every log that is too big to ship whole gets reduced first.
-        log_cap_mb = min(int(log_cap_mb), int(max_file_mb))
+    # ⚠ REAL SENTINELS, not value comparison. These used to default to
+    # 5 / 12 and short mode overrode them with ``if keep == 5``, which
+    # makes an EXPLICIT keep=5 indistinguishable from the default and
+    # silently demotes it to 1 -- caught by the test that asserts an
+    # explicit kwarg still wins. ``None`` means "caller said nothing".
+    if keep is None:
+        keep = 1 if short else 5
+    if cold_keep is None:
+        cold_keep = 1 if short else 12
     out_path = out_path or (
         run_dir + ("_short.tar.gz" if short else "_snapshot.tar.gz"))
     st = time.perf_counter()
@@ -271,11 +372,25 @@ def build_snapshot(run_dir: str, out_path: Optional[str] = None, *,
         extract(store, store[:-3] + "_extract.h5", keep,
                 cold_keep=cold_keep)
         if short:
-            skip = _filter_all_logs(run_dir, log_cap_mb, tail_mb)
+            # ALLOWLIST. No log filtering at all: the newest stdout
+            # ships RAW (it gzips ~11x and is a superset of every other
+            # log), and nothing writes _filtered/_tail products into
+            # the run dir -- the old short mode did, and the next FULL
+            # build then shipped them beside the raw logs.
+            members = _short_members(
+                run_dir, store,
+                _STDOUT_BYTES_PER_ITERATION if young_bytes is None
+                else int(young_bytes))
         else:
             skip = _filter_run_log(run_dir, log_cap_mb)
-        members = _members(run_dir, include_fstat, skip,
-                           max_file_mb=max_file_mb)
+            # The pair THIS call produced, if it produced one; every
+            # other *_filtered/_tail in the tree is stale and dropped.
+            _kp = ()
+            if skip:
+                _b = skip[:-4] if skip.endswith(".log") else skip
+                _kp = (_b + "_filtered.log", _b + "_tail.log")
+            members = _members(run_dir, include_fstat, skip,
+                               max_file_mb=max_file_mb, keep_products=_kp)
         # Write to a temp and rename: a consumer polling for the tar must
         # never pick up a partial archive. Same reasoning as the page and
         # the running backup copy.
@@ -300,7 +415,24 @@ def build_snapshot(run_dir: str, out_path: Optional[str] = None, *,
         except Exception:
             pass
         return None
-    logger.info("snapshot %s (%.1f MB) in %.1f s", out_path,
-                os.path.getsize(out_path) / 1048576.0,
+    _mb = os.path.getsize(out_path) / 1048576.0
+    if short:
+        # THE MEMBER LIST, not just the size. A short tar is an
+        # allowlist, so "what did it decide to ship" is the thing that
+        # goes wrong, and it is invisible from the size alone.
+        _rows = []
+        for _p in members:
+            try:
+                _rows.append((os.path.getsize(_p) / 1048576.0,
+                              os.path.relpath(_p, os.path.dirname(run_dir))))
+            except OSError:
+                continue
+        _rows.sort(reverse=True)
+        logger.info(
+            "short snapshot %s: %.1f MB compressed from %d member(s), "
+            "%.1f MB raw --\n%s", out_path, _mb, len(_rows),
+            sum(r[0] for r in _rows),
+            "\n".join(f"    {r[0]:8.2f} MB  {r[1]}" for r in _rows))
+    logger.info("snapshot %s (%.1f MB) in %.1f s", out_path, _mb,
                 time.perf_counter() - st)
     return out_path

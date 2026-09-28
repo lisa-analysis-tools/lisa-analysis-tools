@@ -233,12 +233,33 @@ class SnapshotMatchesTheShellRecipeTest(unittest.TestCase):
                 f"{frag} excluded by the shell but not by the port")
 
     def test_the_default_keep_windows_match(self):
-        import inspect
-        sig = inspect.signature(snap.build_snapshot)
+        """The RESOLVED default, not the signature literal.
+
+        ``keep``/``cold_keep`` are ``None`` sentinels since 2026-09-28
+        (short mode resolves them to 1, and the previous
+        ``if keep == 5`` override silently demoted an EXPLICIT keep=5).
+        The property this test exists for -- the Python default equals
+        the shell recipe's -- is unchanged, so check it by CALLING
+        rather than by reading the declaration.
+        """
+        import tempfile as _tf
+        from unittest import mock as _mock
         self.assertIn("KEEP=${KEEP:-5}", self.sh)
         self.assertIn("COLD_KEEP=${COLD_KEEP:-12}", self.sh)
-        self.assertEqual(sig.parameters["keep"].default, 5)
-        self.assertEqual(sig.parameters["cold_keep"].default, 12)
+        seen = {}
+
+        def _fake(src, dst, keep, cold_keep=None):
+            seen["k"] = (keep, cold_keep)
+            _touch(dst, 32)
+
+        d = _tf.mkdtemp()
+        run = os.path.join(d, "gf_run")
+        _touch(os.path.join(run, "gf_prod_testing.h5"), 64)
+        with _mock.patch(
+                "lisatools.globalfit.monitor._store_extract.extract",
+                side_effect=_fake):
+            snap.build_snapshot(run)
+        self.assertEqual(seen["k"], (5, 12))
 
     def test_the_log_cap_matches(self):
         self.assertIn("LOG_CAP_MB=${LOG_CAP_MB:-200}", self.sh)
@@ -253,147 +274,157 @@ if __name__ == "__main__":
 
 
 class ShortSnapshotTest(unittest.TestCase):
-    """``_short.tar.gz`` -- log information and the most recent state.
+    """``_short.tar.gz`` -- an ALLOWLIST of logs + latest state.
 
-    USER REQUEST 2026-09-28: "only include log information and most
-    recent state info. No fstat fitting. Basically no large files at
-    all."
+    USER RULING 2026-09-28, after the audit measured the first short
+    tar at 129 MB of which ~95% was filtered dead-job and duplicate
+    logs, with LOG_KEEP_PATTERN dropping every gate family
+    (GB_GATE, V9-STAGE, GB_IMCONV, GB_STAGE, GF_TIMING). The recipe is
+    now explicit about what goes IN rather than filtering what to leave
+    out.
     """
 
+    #: Fixture "one saved iteration" in bytes. Small ON PURPOSE: the
+    #: real 35 MB constant made each setUp write ~125 MB, and with no
+    #: cleanup this class alone leaked ~28 GiB of /tmp over one
+    #: afternoon of mutation runs and filled the disk. build_snapshot
+    #: takes ``young_bytes`` so the threshold can be tested without
+    #: writing the real thing.
+    YOUNG = 4096
+
     def setUp(self):
+        import shutil as _shutil
         self.d = tempfile.mkdtemp()
+        self.addCleanup(_shutil.rmtree, self.d, ignore_errors=True)
         self.run = os.path.join(self.d, "gf_run")
+        # three jobs; only the newest should ship
+        _touch(os.path.join(self.run, "slurm_stdout_640.log"), 8192)
+        _touch(os.path.join(self.run, "slurm_stdout_650.log"), 8192)
+        _touch(os.path.join(self.run, "slurm_stdout_662.log"), 8192)
+        for i, n in ((640, 1), (650, 2), (662, 3)):
+            os.utime(os.path.join(self.run, f"slurm_stdout_{i}.log"),
+                     (10 ** 9 + n, 10 ** 9 + n))
         _touch(os.path.join(self.run, "gf_prod_testing.h5"), 4096)
+        _touch(os.path.join(self.run, "gf_monitor.html"), 2048)
         _touch(os.path.join(self.run, "run_settings.log"), 128)
-        # the member that dominates a real snapshot and was never filtered
-        _touch(os.path.join(self.run, "slurm_stdout_650.log"), 30 * 1048576)
-        # a big binary artifact: gb_truth_3to21.npz is 78 MB in production
-        _touch(os.path.join(self.run, "gb_truth_3to21.npz"), 20 * 1048576)
-        _touch(os.path.join(self.run, "gb_fstat_fit/peaks_stacked.npz"), 4096)
+        _touch(os.path.join(self.run, "gb_setup.log"), 256)
+        _touch(os.path.join(self.run, "gf_prod_eigen_tables.pkl"), 512)
+        _touch(os.path.join(self.run, "gpu_util_662.csv"), 1024)
+        _touch(os.path.join(self.run, "gpu_util_650.csv"), 1024)
+        _touch(os.path.join(self.run, "gpu_procs_662.csv"), 1024)
+        _touch(os.path.join(self.run, "gb_fstat_fit/shared_search/"
+                                      "epoch_0011/DONE.json"), 64)
+        _touch(os.path.join(self.run, "gb_truth_3to21.npz"), 4096)
+        _touch(os.path.join(self.run, "warmstart_v7.npz"), 4096)
+        _touch(os.path.join(self.run, "gf_artifacts/globalfit_run.log"), 4096)
+        _touch(os.path.join(self.run, "gf_artifacts/globalfit_run.rank1.log"),
+               4096)
 
     def _fake_extract(self, src, dst, keep, cold_keep=None):
         self.seen_keep = (keep, cold_keep)
         _touch(dst, 32)
 
     def _build(self, **kw):
+        kw.setdefault("young_bytes", self.YOUNG)
         with mock.patch(
                 "lisatools.globalfit.monitor._store_extract.extract",
                 side_effect=self._fake_extract):
             return snap.build_snapshot(self.run, **kw)
 
+    def _names(self, **kw):
+        with tarfile.open(self._build(**kw)) as tf:
+            return set(n.replace("gf_run/", "", 1) for n in tf.getnames())
+
+    # -- identity -------------------------------------------------------
     def test_it_is_a_SEPARATE_file_from_the_full_snapshot(self):
-        """Turning it on must not overwrite the full tar a run already
-        produced -- they answer different questions."""
-        out = self._build(short=True)
-        self.assertTrue(out.endswith("gf_run_short.tar.gz"), out)
-        self.assertFalse(out.endswith("_snapshot.tar.gz"))
+        self.assertTrue(self._build(short=True).endswith("gf_run_short.tar.gz"))
 
     def test_the_default_name_is_unchanged_without_the_flag(self):
         self.assertTrue(self._build().endswith("gf_run_snapshot.tar.gz"))
 
+    # -- (a) the newest stdout, RAW -------------------------------------
+    def test_only_the_NEWEST_stdout_ships_and_it_is_RAW(self):
+        n = self._names(short=True)
+        self.assertIn("slurm_stdout_662.log", n)
+        self.assertNotIn("slurm_stdout_650.log", n)
+        self.assertNotIn("slurm_stdout_640.log", n)
+        self.assertFalse([x for x in n if x.endswith(("_filtered.log",
+                                                      "_tail.log"))],
+                         "short mode must produce no reduced logs at all")
+
+    def test_a_YOUNG_newest_job_brings_the_previous_one_along(self):
+        """So the tar always spans at least one saved iteration."""
+        with open(os.path.join(self.run, "slurm_stdout_662.log"), "wb") as fh:
+            fh.write(b"\0" * 512)                 # < YOUNG
+        os.utime(os.path.join(self.run, "slurm_stdout_662.log"),
+                 (10 ** 9 + 3, 10 ** 9 + 3))
+        n = self._names(short=True)
+        self.assertIn("slurm_stdout_662.log", n)
+        self.assertIn("slurm_stdout_650.log", n)
+        self.assertNotIn("slurm_stdout_640.log", n, "only ONE extra")
+
+    # -- (b)..(e) the rest of the allowlist -----------------------------
     def test_it_keeps_ONE_iteration_of_state(self):
         self._build(short=True)
         self.assertEqual(self.seen_keep, (1, 1))
 
-    def test_the_full_snapshot_still_keeps_five_and_twelve(self):
-        self._build()
-        self.assertEqual(self.seen_keep, (5, 12))
-
     def test_an_explicit_keep_still_overrides_the_preset(self):
-        """Presets, not hard-codes."""
-        self._build(short=True, keep=3)
-        self.assertEqual(self.seen_keep[0], 3)
+        self._build(short=True, keep=5)
+        self.assertEqual(self.seen_keep[0], 5)
 
-    def test_the_state_extract_is_IN(self):
-        with tarfile.open(self._build(short=True)) as tf:
-            names = tf.getnames()
-        self.assertIn("gf_run/gf_prod_testing_extract.h5", names)
+    def test_the_allowlist_members_are_all_present(self):
+        n = self._names(short=True)
+        for want in ("gf_prod_testing_extract.h5", "gf_monitor.html",
+                     "run_settings.log", "gb_setup.log",
+                     "gf_prod_eigen_tables.pkl", "gpu_util_662.csv",
+                     "gb_fstat_fit/shared_search/epoch_0011/DONE.json"):
+            self.assertIn(want, n, want)
 
-    def test_large_files_are_OUT(self):
-        with tarfile.open(self._build(short=True)) as tf:
-            names = tf.getnames()
-        self.assertNotIn("gf_run/gb_truth_3to21.npz", names)
-        self.assertNotIn("gf_run/gf_prod_testing.h5", names)
-
-    def test_small_logs_are_IN(self):
-        with tarfile.open(self._build(short=True)) as tf:
-            names = tf.getnames()
-        self.assertIn("gf_run/run_settings.log", names)
-
-    def test_a_BIG_SLURM_LOG_becomes_filtered_plus_tail(self):
-        """The 386 MB member. _filter_run_log only ever looked at
-        *_artifacts/globalfit_run.log, so these shipped whole."""
-        with tarfile.open(self._build(short=True)) as tf:
-            names = tf.getnames()
-        self.assertNotIn("gf_run/slurm_stdout_650.log", names)
-        self.assertIn("gf_run/slurm_stdout_650_filtered.log", names)
-        self.assertIn("gf_run/slurm_stdout_650_tail.log", names)
-
-    def test_the_FULL_snapshot_still_ships_that_log_whole(self):
-        """No silent change to the existing product."""
-        with tarfile.open(self._build()) as tf:
-            names = tf.getnames()
-        self.assertIn("gf_run/slurm_stdout_650.log", names)
-
-    def test_no_fstat_payload(self):
-        with tarfile.open(self._build(short=True)) as tf:
-            names = tf.getnames()
-        self.assertNotIn("gf_run/gb_fstat_fit/peaks_stacked.npz", names)
-
-    def test_a_BIG_filtered_log_survives_the_size_cap(self):
-        """Caught on a real 6mo run dir: slurm_stdout_654_filtered.log
-        was built and then DROPPED by max_file_mb while its tail
-        survived, so the short tar lost exactly the log information it
-        exists to carry. The reduced products are bounded by the keep
-        pattern and tail_mb, not by a byte cap."""
-        big = os.path.join(self.run, "slurm_stdout_999.log")
-        # every line matches LOG_KEEP_PATTERN, so filtered ~= the whole
-        # file and lands well over the 5 MB cap
-        with open(big, "wb") as fh:
-            fh.write(b"WARNING padpadpadpadpadpadpadpadpadpadpadpad\n"
-                     * 200_000)
-        with tarfile.open(self._build(short=True)) as tf:
-            names = tf.getnames()
-        self.assertIn("gf_run/slurm_stdout_999_filtered.log", names)
-        self.assertGreater(
-            os.path.getsize(
-                os.path.join(self.run, "slurm_stdout_999_filtered.log")),
-            5 * 1048576,
-            "the fixture no longer exceeds the cap; the test proves "
-            "nothing")
+    # -- the drops ------------------------------------------------------
+    def test_the_dropped_families_are_all_absent(self):
+        n = self._names(short=True)
+        for gone in ("gb_truth_3to21.npz", "warmstart_v7.npz",
+                     "gpu_procs_662.csv", "gpu_util_650.csv",
+                     "gf_artifacts/globalfit_run.log",
+                     "gf_artifacts/globalfit_run.rank1.log",
+                     "gf_prod_testing.h5"):
+            self.assertNotIn(gone, n, gone)
 
     def test_the_result_is_actually_small(self):
         out = self._build(short=True)
         self.assertLess(os.path.getsize(out), 2 * 1048576,
                         "a 'short' tar that is not short is not short")
 
-    def test_the_tail_is_capped_by_tail_mb(self):
-        self._build(short=True, tail_mb=1)
-        tail = os.path.join(self.run, "slurm_stdout_650_tail.log")
-        self.assertLessEqual(os.path.getsize(tail), 1_000_000)
-
-    def test_our_own_products_are_not_re_reduced(self):
-        """Idempotence: a second short build must not make
-        ``..._tail_filtered.log``."""
-        self._build(short=True)
-        self._build(short=True)
-        bad = os.path.join(self.run, "slurm_stdout_650_tail_filtered.log")
-        self.assertFalse(os.path.exists(bad))
-
     def test_it_never_raises(self):
-        """Same contract as the full build: it runs on the writer rank."""
         with mock.patch(
                 "lisatools.globalfit.monitor._store_extract.extract",
                 side_effect=RuntimeError("boom")):
             self.assertIsNone(snap.build_snapshot(self.run, short=True))
 
-    def test_no_DEAD_BAND_between_the_reduce_cap_and_the_drop_cap(self):
-        """A log bigger than max_file_mb but smaller than log_cap_mb
-        must still be reduced, not silently dropped whole."""
-        mid = os.path.join(self.run, "slurm_stdout_777.log")
-        _touch(mid, 8 * 1048576)          # > 5 MB drop, < 20 MB reduce
-        with tarfile.open(self._build(short=True)) as tf:
-            names = tf.getnames()
-        self.assertNotIn("gf_run/slurm_stdout_777.log", names)
-        self.assertIn("gf_run/slurm_stdout_777_filtered.log", names)
-        self.assertIn("gf_run/slurm_stdout_777_tail.log", names)
+    # -- the full build must not inherit short mode's leftovers ---------
+    def test_a_FULL_build_after_a_SHORT_one_ships_no_reduced_logs(self):
+        self._build(short=True)
+        n = self._names()
+        self.assertFalse([x for x in n if x.endswith(("_filtered.log",
+                                                      "_tail.log"))])
+        self.assertIn("slurm_stdout_662.log", n, "the full tar keeps them all")
+        self.assertIn("slurm_stdout_640.log", n)
+
+    def test_a_STALE_reduced_log_is_dropped_but_the_run_log_PAIR_is_kept(self):
+        """⚠ The full build DELIBERATELY ships the run-log pair when the
+        run log is over the cap (SnapshotMatchesTheShellRecipeTest pins
+        it). Only products this call did NOT write are stale."""
+        _touch(os.path.join(self.run, "slurm_stdout_650_filtered.log"), 512)
+        _touch(os.path.join(self.run, "slurm_stdout_650_tail.log"), 512)
+        big = os.path.join(self.run, "gf_artifacts/globalfit_run.log")
+        # _filter_run_log tests `getsize // 1048576 > log_cap_mb`, so the
+        # fixture needs to round to at least 1 MB; log_cap_mb=0 then puts
+        # it over the cap without writing the real 200 MB.
+        with open(big, "wb") as fh:
+            fh.write(b"WARNING x\n" * 110_000)        # ~1.1 MB
+        n = self._names(log_cap_mb=0)
+        self.assertIn("gf_artifacts/globalfit_run_filtered.log", n)
+        self.assertIn("gf_artifacts/globalfit_run_tail.log", n)
+        self.assertNotIn("gf_artifacts/globalfit_run.log", n)
+        self.assertNotIn("slurm_stdout_650_filtered.log", n)
+        self.assertNotIn("slurm_stdout_650_tail.log", n)
