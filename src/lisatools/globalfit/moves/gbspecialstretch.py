@@ -2499,6 +2499,50 @@ def _vert_all_rungs_on() -> bool:
         "1", "true", "True", "yes", "on")
 
 
+def _ar_repoint_cell_ll(spec_of_slot, rows, slot_of_rung, slots, labels, xp):
+    """Point each swapped rung's OPEN cell-ll bracket at its new label.
+
+    ``_cell_ll_finalize`` credits ``ll_change_log[spec_of_slot[slot]]``,
+    so after ``exchange_cell_labels_batch`` every slot holding a swapped
+    cell's sources must claim that cell's NEW label. Two slots claiming
+    one label means the second write wins and the other label never gets
+    its realized credit.
+
+    TWO SOURCES OF SLOT, in priority order:
+
+    * ``rows`` -- the CARRIER row of this rung, if it has one. Its slot
+      is ``slots[row]``, which is live per-row bookkeeping and survives a
+      mid-block rebind.
+    * ``slot_of_rung`` -- the all-rung rung -> slot map, for a rung with
+      NO carrier. ``-1`` means the cell is not in the buffer at all.
+
+    ⚠ WHY THE SECOND ONE EXISTS. This used to do the carrier half only,
+    on the premise that "a partner with no carrier has no slot, so no
+    second bracket". ``1cde08f1`` falsified it: the measured path prices
+    RESIDENT non-carrier cells (empty dead-row cells, occupied-but-
+    unpicked cells), and ``_cell_ll_open`` brackets EVERY active slot.
+    Slot A (carrier, label X) re-pointed to Y while resident slot B kept
+    saying Y; at finalize both credited Y and X got nothing -- an error
+    of one whole slab delta, scaling with accepted-swap volume. Measured
+    on 6mo v9 ``[GB_ORTHO_LL]`` rj_warm_search median: 0.020 with the
+    feature off (job 643) -> 29.7 (654) -> 437.8 (655), tolerance 0.05,
+    with ``vgb_pe`` flat at 4e-8 throughout as the control.
+
+    A rung with neither a carrier nor a resident slot is skipped, and
+    that is still correct: there is no bracket to relabel.
+    """
+    rows = xp.asarray(rows)
+    m = rows >= 0
+    if bool(m.any()):
+        spec_of_slot[slots[rows[m]]] = labels[m]
+    if slot_of_rung is None:
+        return
+    _s = xp.asarray(slot_of_rung)
+    m2 = (~m) & (_s >= 0)
+    if bool(m2.any()):
+        spec_of_slot[_s[m2]] = labels[m2]
+
+
 def _vert_all_rung_cached(cols, carrier, occupied, n_alive, vert_base,
                           t_i, w_i, b_i, num_bands, xp,
                           buffer_obj=None, nwalkers=None, scheduler=None):
@@ -2602,9 +2646,17 @@ def _vert_all_rung_cached(cols, carrier, occupied, n_alive, vert_base,
                 _flat = cached.reshape(-1)
                 _flat[_need] = xp.asarray(_lls).astype(xp.float64)
                 cached = _flat.reshape(n_cols, ntemps)
+            # RUNG -> SLOT, -1 where the cell is not in the buffer. This
+            # is what makes the cell-ll re-point TWO-SIDED: a resident
+            # NON-CARRIER partner has an open bracket keyed by its slot,
+            # and until 2026-09-28 nothing relabelled it (see the
+            # re-point block in _vertical_swap_sweep_all_rungs).
+            _ar_slot = xp.where(
+                _resident, _slot, xp.full_like(_slot, -1)
+            ).reshape(n_cols, ntemps)
             # EVERY rung is now priceable: live ones are scored from
             # cell_ll_base + ll_ref, the rest from this measurement.
-            return cached, live | _resident.reshape(n_cols, ntemps)
+            return cached, live | _resident.reshape(n_cols, ntemps), _ar_slot
         except Exception as _e:   # noqa: BLE001 -- fall back, never break
             # Loud on the first hit, then every 1000th. Job 654 emitted
             # 4,532 identical copies of this line; the per-block census
@@ -2635,7 +2687,11 @@ def _vert_all_rung_cached(cols, carrier, occupied, n_alive, vert_base,
             bare[_ci] = xp.asarray(vert_base)[sole].astype(xp.float64)
             bare_known[_ci] = True
             cached = xp.broadcast_to(bare[:, None], (n_cols, ntemps)).copy()
-    return cached, live | (empty & bare_known[:, None])
+    # No slot map on the inference path: it never looked the cells up in
+    # the buffer, so it cannot say which slot holds one. All -1 => the
+    # re-point stays ONE-SIDED here, which is what this path always did.
+    return (cached, live | (empty & bare_known[:, None]),
+            xp.full((n_cols, ntemps), -1, dtype=xp.int64))
 
 
 def _vert_all_rung_tables(t_i, w_i, b_i, ntemps, nwalkers, num_bands,
@@ -2708,7 +2764,7 @@ def _ar_freeze_rows(ar, rows, t_i, w_i, b_i, cell_ll_base, ll_ref,
     Idempotent: a rung already frozen is left alone, so repeated polls
     cost nothing and cannot re-pin a value.
     """
-    cols, carrier, occupied, cached, scorable, frozen = ar
+    cols, carrier, occupied, cached, scorable, frozen, _ = ar
     rows = xp.asarray(rows)
     if int(rows.shape[0]) == 0:
         return 0
@@ -16023,7 +16079,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 "totals; ll_ref alone is an add-delta against DIFFERENT "
                 "residuals.")
         xp = self.xp
-        cols, carrier, occupied, cached, scorable, frozen = ar
+        cols, carrier, occupied, cached, scorable, frozen, ar_slot = ar
         ci, t_c, t_h = _vert_all_rung_pairs(
             carrier, occupied, parity, int(self.ntemps), xp)
         if int(ci.shape[0]) == 0:
@@ -16170,25 +16226,48 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         _fz_h = frozen[ci, t_h].copy()
         frozen[ci, t_h] = frozen[ci, t_c]
         frozen[ci, t_c] = _fz_h
+        # The rung -> slot map permutes with everything else: after the
+        # relabel, the cell CALLED rung t_c is the one whose sources sit
+        # in the slot that used to be rung t_h's.
+        _sl_h = ar_slot[ci, t_h].copy()
+        ar_slot[ci, t_h] = ar_slot[ci, t_c]
+        ar_slot[ci, t_c] = _sl_h
 
-        # --- cell-ll bookkeeping: ONE-SIDED re-point (hazard 3) ----------
-        # A carrier row's slot now claims the OTHER rung's label. ll0/led0/
+        # --- cell-ll bookkeeping: TWO-SIDED re-point (hazard 3) ----------
+        # Each swapped rung's slot now claims that rung's label. ll0/led0/
         # rep0 stay put: _cell_ll_finalize credits
         # ll_change_log[spec] = led0 + (lls - ll0), i.e. ledger-at-open plus
         # the realized slab delta, to whatever label the slot now claims --
         # and ll_change_log was already traded above.
+        #
+        # ⚠ WHY BOTH SIDES. This used to relabel CARRIER slots only, on
+        # the premise that "a partner with no slot has no second bracket".
+        # 1cde08f1 falsified it: the measured path prices RESIDENT
+        # non-carrier cells (empty dead-row cells, occupied-but-unpicked
+        # cells) and _cell_ll_open brackets EVERY active slot, not just
+        # carriers. So slot A (carrier, label X) re-pointed to Y while
+        # resident slot B still said Y -- at finalize both credited Y and
+        # X got no realized credit at all, off by a whole slab delta and
+        # scaling with accepted-swap volume. Measured on 6mo v9:
+        # [GB_ORTHO_LL] rj_warm_search median 0.020 (job 643, feature off)
+        # -> 29.7 (654) -> 437.8 (655), against a 0.05 tolerance, with
+        # vgb_pe flat at 4e-8 as the control.
+        #
+        # A TRULY non-resident partner (ar_slot < 0) still gets the
+        # one-sided treatment, and that remains correct: no second
+        # bracket exists to relabel.
         if cell_ll_state is not None:
             st = cell_ll_state
             a = st.get("spec")
             if a is not None:
-                # carrier has ALREADY been permuted, so the row now on rung
-                # t_h is the one that used to be on t_c and vice versa.
+                # carrier and ar_slot have ALREADY been permuted, so the
+                # cell now called rung t_h is the one that was on t_c.
                 for _t_new in (t_h, t_c):
-                    rows = carrier[ci, _t_new]
-                    m = rows >= 0
-                    if bool(m.any()):
-                        a[slots[rows[m]]] = band_sorter.get_special_band_index(
-                            _t_new[m], w_hc[m], b_hc[m])
+                    _ar_repoint_cell_ll(
+                        a, carrier[ci, _t_new], ar_slot[ci, _t_new], slots,
+                        band_sorter.get_special_band_index(
+                            _t_new, w_hc, b_hc),
+                        xp)
 
         # --- block-row labels + the beta they imply (carriers only) ------
         for _t_new in (t_h, t_c):
@@ -17665,7 +17744,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 _cols, _carrier, _occ, _nal = _vert_all_rung_tables(
                     t_i, w_i, b_i, int(self.ntemps), int(self.nwalkers),
                     int(self.num_bands), _alive_counts, xp)
-                _cached, _scor = _vert_all_rung_cached(
+                _cached, _scor, _ar_slot = _vert_all_rung_cached(
                     _cols, _carrier, _occ, _nal, _vert_base,
                     t_i, w_i, b_i, int(self.num_bands), xp,
                     buffer_obj=buffer_obj, scheduler=scheduler,
@@ -17675,7 +17754,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # rows move into it as they converge (see _ar_freeze_rows).
                 _ar_frozen = xp.zeros(_carrier.shape, dtype=bool)
                 _ar_state = (_cols, _carrier, _occ, _cached, _scor,
-                             _ar_frozen)
+                             _ar_frozen, _ar_slot)
         # NOTE(vertical ll audit): the ratio reads ``ll_ref`` -- the cell
         # ll WITH its picked source in. Do NOT audit that against
         # ``band_likelihoods`` mid-block: that measures the slab with the

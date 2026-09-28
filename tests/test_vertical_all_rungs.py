@@ -158,10 +158,12 @@ class CachedTotalsTest(unittest.TestCase):
     def _call(self, n_alive, carrier, occupied, vert_base, t_i, w_i, b_i,
               nb=4):
         cols = np.array([0], dtype=np.int64)
+        # The third return is the rung -> slot map; these cases exercise
+        # the inference path, which has none, so drop it here.
         return g._vert_all_rung_cached(
             cols, np.asarray(carrier), np.asarray(occupied),
             np.asarray(n_alive), np.asarray(vert_base, dtype=float),
-            np.asarray(t_i), np.asarray(w_i), np.asarray(b_i), nb, np)
+            np.asarray(t_i), np.asarray(w_i), np.asarray(b_i), nb, np)[:2]
 
     def test_a_sole_occupant_picked_row_yields_the_column_bare_value(self):
         """After its one source is removed the slab IS bare, and every rung
@@ -348,7 +350,7 @@ class AllRungsAreMeasuredNotInferredTest(unittest.TestCase):
                              [False, True, False]])
         cols, carrier, occupied, spec, lls = self._setup(carrier, occupied)
         buf, sch = _FakeBuffer(lls), _FakeScheduler(spec)
-        cached, scor = _vert_all_rung_cached(
+        cached, scor, _slotmap = _vert_all_rung_cached(
             cols, carrier, occupied, None, None, np.zeros(0), np.zeros(0),
             np.zeros(0), self.NB, np, buffer_obj=buf, scheduler=sch,
             nwalkers=self.NW)
@@ -364,7 +366,7 @@ class AllRungsAreMeasuredNotInferredTest(unittest.TestCase):
         occupied = np.array([[True, True, True], [True, True, True]])
         cols, carrier, occupied, spec, lls = self._setup(carrier, occupied)
         buf, sch = _FakeBuffer(lls), _FakeScheduler(spec)
-        cached, scor = _vert_all_rung_cached(
+        cached, scor, _slotmap = _vert_all_rung_cached(
             cols, carrier, occupied, None, None, np.zeros(0), np.zeros(0),
             np.zeros(0), self.NB, np, buffer_obj=buf, scheduler=sch,
             nwalkers=self.NW)
@@ -382,7 +384,7 @@ class AllRungsAreMeasuredNotInferredTest(unittest.TestCase):
         cols, carrier, occupied, spec, lls = self._setup(carrier, occupied)
         spec2 = spec.copy(); spec2[-1] = 10**9        # evict the last cell
         buf, sch = _FakeBuffer(lls), _FakeScheduler(spec2)
-        cached, scor = _vert_all_rung_cached(
+        cached, scor, _slotmap = _vert_all_rung_cached(
             cols, carrier, occupied, None, None, np.zeros(0), np.zeros(0),
             np.zeros(0), self.NB, np, buffer_obj=buf, scheduler=sch,
             nwalkers=self.NW)
@@ -396,7 +398,7 @@ class AllRungsAreMeasuredNotInferredTest(unittest.TestCase):
         cols, carrier, occupied, spec, lls = self._setup(carrier, occupied)
         act = np.ones(len(spec), bool); act[-1] = False
         buf, sch = _FakeBuffer(lls), _FakeScheduler(spec, active=act)
-        cached, scor = _vert_all_rung_cached(
+        cached, scor, _slotmap = _vert_all_rung_cached(
             cols, carrier, occupied, None, None, np.zeros(0), np.zeros(0),
             np.zeros(0), self.NB, np, buffer_obj=buf, scheduler=sch,
             nwalkers=self.NW)
@@ -409,7 +411,7 @@ class AllRungsAreMeasuredNotInferredTest(unittest.TestCase):
         carrier = np.array([[0, -1, -1], [-1, 1, -1]])
         occupied = np.array([[True, False, False], [False, True, False]])
         cols, carrier, occupied, spec, lls = self._setup(carrier, occupied)
-        cached, scor = _vert_all_rung_cached(
+        cached, scor, _slotmap = _vert_all_rung_cached(
             cols, carrier, occupied, None, None, np.zeros(0), np.zeros(0),
             np.zeros(0), self.NB, np)
         # no vert_base -> nothing inferable -> only the live rungs score
@@ -429,7 +431,7 @@ class AllRungsAreMeasuredNotInferredTest(unittest.TestCase):
         occupied = np.array([[True, True, True], [True, True, True]])
         cols, carrier, occupied, spec, lls = self._setup(carrier, occupied)
         buf = _FakeBuffer(lls)
-        cached, scor = _vert_all_rung_cached(
+        cached, scor, _slotmap = _vert_all_rung_cached(
             cols, carrier, occupied, None, None, np.zeros(0), np.zeros(0),
             np.zeros(0), self.NB, np, buffer_obj=buf, nwalkers=self.NW)
         self.assertEqual(buf.calls, 0, "measured without slot labels")
@@ -527,7 +529,12 @@ class FrozenRungsArePricedFromCacheTest(unittest.TestCase):
         cached = np.zeros((n_cols, ntemps))
         scorable = np.ones((n_cols, ntemps), bool)
         frozen = np.zeros((n_cols, ntemps), bool)
-        return [cols, carrier, occupied, cached, scorable, frozen]
+        # rung -> slot: identity, every cell resident (the case the
+        # two-sided re-point exists for).
+        ar_slot = np.arange(n_cols * ntemps, dtype=np.int64).reshape(
+            n_cols, ntemps)
+        return [cols, carrier, occupied, cached, scorable, frozen,
+                ar_slot]
 
     def _rows(self):
         t_i = np.array([0, 1]); w_i = np.array([0, 1]); b_i = np.array([1, 2])
@@ -539,7 +546,7 @@ class FrozenRungsArePricedFromCacheTest(unittest.TestCase):
         n = g._ar_freeze_rows(ar, np.array([0]), t_i, w_i, b_i, base, ll,
                               self.NB, np)
         self.assertEqual(n, 1)
-        cols, carrier, occ, cached, scor, frozen = ar
+        cols, carrier, occ, cached, scor, frozen, _slotmap = ar
         ll[0] += 100.0                      # the live array moves...
         L = g._vert_all_rung_L(carrier, cached, base, ll,
                                np.array([0]), np.array([0]), np,
@@ -548,7 +555,7 @@ class FrozenRungsArePricedFromCacheTest(unittest.TestCase):
 
     def test_NEGATIVE_CONTROL_an_unfrozen_carrier_follows_the_live_value(self):
         ar = self._ar(); t_i, w_i, b_i, base, ll = self._rows()
-        cols, carrier, occ, cached, scor, frozen = ar
+        cols, carrier, occ, cached, scor, frozen, _slotmap = ar
         ll[0] += 100.0
         L = g._vert_all_rung_L(carrier, cached, base, ll,
                                np.array([0]), np.array([0]), np,
@@ -558,7 +565,7 @@ class FrozenRungsArePricedFromCacheTest(unittest.TestCase):
     def test_the_freeze_value_equals_the_live_value_at_freeze_time(self):
         """Identity: freezing must not shift the price."""
         ar = self._ar(); t_i, w_i, b_i, base, ll = self._rows()
-        cols, carrier, occ, cached, scor, frozen = ar
+        cols, carrier, occ, cached, scor, frozen, _slotmap = ar
         before = float(g._vert_all_rung_L(carrier, cached, base, ll,
                                           np.array([0]), np.array([0]), np,
                                           frozen=frozen)[0])
@@ -588,17 +595,23 @@ class FrozenRungsArePricedFromCacheTest(unittest.TestCase):
         """Otherwise the arriving LIVE row is priced from a cache slot
         that now holds someone else's total -- only for pairs where
         exactly one side was frozen, which is the hard case to spot."""
-        cols, carrier, occ, cached, scor, frozen = self._ar()
+        cols, carrier, occ, cached, scor, frozen, ar_slot = self._ar()
         ci = np.array([0]); t_c = np.array([0]); t_h = np.array([1])
         cached[0, 0], cached[0, 1] = -9.0, -3.0
         frozen[0, 0] = True
-        for arr in (carrier, cached, occ, scor, frozen):
+        _s0, _s1 = int(ar_slot[0, 0]), int(ar_slot[0, 1])
+        for arr in (carrier, cached, occ, scor, frozen, ar_slot):
             _h = arr[ci, t_h].copy()
             arr[ci, t_h] = arr[ci, t_c]
             arr[ci, t_c] = _h
         self.assertTrue(bool(frozen[0, 1]), "the flag stayed behind")
         self.assertFalse(bool(frozen[0, 0]))
         self.assertAlmostEqual(float(cached[0, 1]), -9.0)
+        # ar_slot rides with them: the cell now CALLED rung t_c is the
+        # one whose sources sit in the slot that was rung t_h's. If this
+        # stays behind, the two-sided re-point relabels the wrong slot.
+        self.assertEqual(int(ar_slot[0, 0]), _s1)
+        self.assertEqual(int(ar_slot[0, 1]), _s0)
 
     def test_the_frozen_flag_does_NOT_clear_the_carrier(self):
         """t_i / beta must keep following an accepted swap for a frozen
@@ -610,12 +623,118 @@ class FrozenRungsArePricedFromCacheTest(unittest.TestCase):
         self.assertEqual(int(ar[1][0, 0]), 0,
                          "carrier cleared; t_i would go stale")
 
-    def test_the_state_tuple_carries_six_entries(self):
+    def test_the_state_tuple_carries_seven_entries(self):
         import inspect
         src = inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
         self.assertIn("_ar_state = (_cols, _carrier, _occ, _cached, _scor,",
                       src)
+        self.assertIn("_ar_frozen, _ar_slot)", src)
         sweep = inspect.getsource(
             g.GBSpecialBase._vertical_swap_sweep_all_rungs)
         self.assertIn(
-            "cols, carrier, occupied, cached, scorable, frozen = ar", sweep)
+            "cols, carrier, occupied, cached, scorable, frozen, ar_slot = ar",
+            sweep)
+
+
+class TwoSidedCellLabelRepointTest(unittest.TestCase):
+    """The credited-ledger bug: both sides of a swap must be relabelled.
+
+    USER RULING 2026-09-28 (item 1). ``_cell_ll_finalize`` credits
+    ``ll_change_log[spec_of_slot[slot]]``. Before this fix only CARRIER
+    slots were re-pointed, so an accepted swap with a RESIDENT
+    non-carrier partner left two slots claiming ONE label: that label
+    was credited twice and the other never. Measured cost on 6mo v9,
+    ``[GB_ORTHO_LL]`` rj_warm_search median against a 0.05 tolerance:
+    0.020 feature-off (job 643) -> 29.7 (654) -> 437.8 (655), with
+    ``vgb_pe`` flat at 4e-8 as the unaffected control.
+
+    THE MODEL used throughout. Two rungs of one column, labels X and Y.
+    Before the swap X's sources sit in slot 0 and Y's in slot 1, so
+    ``spec == [X, Y]``. ``exchange_cell_labels_batch`` trades the
+    labels, so afterwards the cell CALLED X is the one in slot 1 and the
+    cell called Y is the one in slot 0 -- i.e. the correct end state is
+    ``spec == [Y, X]``. ``carrier`` and ``ar_slot`` are already permuted
+    by the time the re-point runs, which is why each rung is described
+    here by its POST-swap slot.
+    """
+
+    X, Y = 1000, 2000
+    SLOTS = np.array([0, 1], dtype=np.int64)      # row -> slot, identity
+
+    def _repoint(self, *rungs, use_map=True):
+        """``rungs`` are (carrier_row, post_swap_slot, label) triples."""
+        spec = np.array([self.X, self.Y], dtype=np.int64)
+        for row, slot, lab in rungs:
+            g._ar_repoint_cell_ll(
+                spec, np.array([row]),
+                np.array([slot]) if use_map else None,
+                self.SLOTS, np.array([lab]), np)
+        return spec
+
+    @staticmethod
+    def _credits(spec):
+        """A fake ``_cell_ll_finalize``: one credit per slot, at the
+        label that slot claims."""
+        out = {}
+        for slot in range(len(spec)):
+            out[int(spec[slot])] = out.get(int(spec[slot]), 0) + 1
+        return out
+
+    def test_a_resident_NON_CARRIER_partner_is_relabelled(self):
+        # X kept a carrier (row 1, now in slot 1); Y has no carrier but
+        # its cell is resident in slot 0.
+        spec = self._repoint((1, 1, self.X), (-1, 0, self.Y))
+        self.assertEqual([int(v) for v in spec], [self.Y, self.X])
+
+    def test_each_label_is_credited_EXACTLY_once(self):
+        spec = self._repoint((1, 1, self.X), (-1, 0, self.Y))
+        self.assertEqual(self._credits(spec), {self.X: 1, self.Y: 1})
+
+    def test_THE_BUG_one_label_credited_twice_and_one_never(self):
+        """The failing control: the carrier-only path, reproduced by
+        withholding the rung -> slot map."""
+        spec = self._repoint((1, 1, self.X), (-1, 0, self.Y),
+                             use_map=False)
+        self.assertEqual(self._credits(spec), {self.X: 2},
+                         "the old bug credits the carrier's label twice")
+        self.assertNotIn(self.Y, self._credits(spec))
+
+    def test_a_TRULY_non_resident_partner_stays_one_sided(self):
+        """No bracket exists to relabel; skipping is correct, not a gap.
+        This is also the inference path, where ar_slot is all -1."""
+        spec = self._repoint((1, 1, self.X), (-1, -1, self.Y))
+        self.assertEqual(int(spec[1]), self.X)
+        self.assertEqual(int(spec[0]), self.X,
+                         "slot 0 has no bracket to fix here")
+
+    def test_two_carriers_are_unaffected_by_the_change(self):
+        """The in_model case: every resident cell has a carrier, so both
+        sides were re-pointed even before the fix. Must not change."""
+        with_map = self._repoint((1, 1, self.X), (0, 0, self.Y))
+        without = self._repoint((1, 1, self.X), (0, 0, self.Y),
+                                use_map=False)
+        self.assertEqual([int(v) for v in with_map], [self.Y, self.X])
+        np.testing.assert_array_equal(with_map, without)
+
+    def test_the_carrier_WINS_when_a_rung_has_both(self):
+        """slots[row] is live per-row bookkeeping; the all-rung map is
+        built once per block and can go stale across a rebind."""
+        spec = np.array([self.X, self.Y], dtype=np.int64)
+        g._ar_repoint_cell_ll(spec, np.array([0]), np.array([1]),
+                              self.SLOTS, np.array([self.X]), np)
+        self.assertEqual(int(spec[0]), self.X)
+        self.assertEqual(int(spec[1]), self.Y, "the stale map was used")
+
+    def test_the_sweep_calls_the_helper_for_BOTH_rungs(self):
+        import inspect
+        src = inspect.getsource(
+            g.GBSpecialBase._vertical_swap_sweep_all_rungs)
+        blk = src[src.index("TWO-SIDED re-point"):]
+        self.assertIn("_ar_repoint_cell_ll(", blk)
+        self.assertIn("for _t_new in (t_h, t_c):", blk)
+
+    def test_ar_slot_is_permuted_in_the_sweep(self):
+        import inspect
+        src = inspect.getsource(
+            g.GBSpecialBase._vertical_swap_sweep_all_rungs)
+        self.assertIn("ar_slot[ci, t_h] = ar_slot[ci, t_c]", src)
