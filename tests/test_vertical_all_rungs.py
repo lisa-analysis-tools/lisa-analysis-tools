@@ -853,3 +853,162 @@ class SwapAndRefitInTheSameRepeatTest(unittest.TestCase):
             self.assertIn("export GB_SIGHET_REFRESH_EVERY=25", src, name)
             self.assertNotIn("export GB_SIGHET_REFRESH_EVERY=50", src, name)
             self.assertIn("export GB_TEMPER_VERTICAL_AT_REFIT=1", src, name)
+
+
+class CreditedEqualsDirectAcrossASwapTest(unittest.TestCase):
+    """FINDING A (2026-09-28): the bracket must TRADE, not just re-point.
+
+    ``_cell_ll_finalize`` credits ``ll_change_log[spec] = led0 + (lls -
+    ll0)``. The picked-row sweep has always traded all four bracket
+    fields between the two slots and sat at 0.02 on job 643. The
+    all-rungs sweep re-pointed ``spec`` only and left ll0/led0/rep0 with
+    the slot, which drops the swap JUMP from the credited value -- so
+    [GB_ORTHO_LL] stayed at 438 / 340 on jobs 655 / 659 even after the
+    two-sided re-point landed and accepted swaps fell 26x, while moves
+    running no sweep at all measured ~0.005-0.009.
+    """
+
+    #: slot A holds cell A's sources, slot B holds cell B's.
+    A, B = 0, 1
+    X, Y = 1000, 2000          # labels: A opens as X, B opens as Y
+
+    def _state(self):
+        return {
+            "spec": np.array([self.X, self.Y], dtype=np.int64),
+            "ll0": np.array([-100.0, -300.0]),    # opening slab lls
+            "led0": np.array([-10.0, -30.0]),     # opening ledgers
+            "rep0": np.array([0, 0], dtype=np.int64),
+        }
+
+    @staticmethod
+    def _finalize(st, lls):
+        """The real credit rule, as _cell_ll_finalize applies it."""
+        return {int(st["spec"][s]): st["led0"][s] + (lls[s] - st["ll0"][s])
+                for s in range(len(lls))}
+
+    # current slab lls: each cell moved a little since open
+    LLS = np.array([-97.0, -295.0])       # A moved +3, B moved +5
+
+    def _direct(self):
+        """What ORTHO's `direct` measures after the labels swap: label Y
+        now denotes cell A, so its value relative to ITS OWN opening
+        baseline is led0_B + (lls_A - ll0_B), and symmetrically for X."""
+        st = self._state()
+        return {
+            self.Y: st["led0"][self.B] + (self.LLS[self.A]
+                                          - st["ll0"][self.B]),
+            self.X: st["led0"][self.A] + (self.LLS[self.B]
+                                          - st["ll0"][self.A]),
+        }
+
+    def test_the_FULL_TRADE_reproduces_direct(self):
+        st = self._state()
+        g._ar_trade_cell_ll(st, np.array([self.A]), np.array([self.B]), np)
+        got = self._finalize(st, self.LLS)
+        for lab, want in self._direct().items():
+            self.assertAlmostEqual(got[lab], want, places=9,
+                                   msg=f"label {lab}")
+
+    def test_SPEC_ONLY_is_short_by_exactly_the_swap_jump(self):
+        """The failing control: today's behaviour, and the size of the
+        error it leaves -- one slab jump, not a rounding difference."""
+        st = self._state()
+        st["spec"][self.A], st["spec"][self.B] = self.Y, self.X
+        got = self._finalize(st, self.LLS)
+        direct = self._direct()
+        jump = st["ll0"][self.A] - st["ll0"][self.B]     # 200.0
+        self.assertNotAlmostEqual(got[self.Y], direct[self.Y], places=3)
+        # short by the jump plus the ledger baseline difference
+        # direct - got = (led0_B - led0_A) + (ll0_A - ll0_B)
+        #              = ledger baseline difference + the swap JUMP
+        self.assertAlmostEqual(
+            direct[self.Y] - got[self.Y],
+            (st["led0"][self.B] - st["led0"][self.A]) + jump, places=9)
+        self.assertGreater(abs(direct[self.Y] - got[self.Y]), 100.0,
+                           "the error should be slab-sized")
+
+    def test_each_label_is_still_credited_exactly_once(self):
+        """The item-1 control must survive the item-A change."""
+        st = self._state()
+        g._ar_trade_cell_ll(st, np.array([self.A]), np.array([self.B]), np)
+        self.assertEqual(sorted(int(v) for v in st["spec"]),
+                         sorted((self.X, self.Y)))
+
+    def test_rep0_travels_with_the_bracket(self):
+        st = self._state()
+        st["rep0"][:] = [7, 9]
+        g._ar_trade_cell_ll(st, np.array([self.A]), np.array([self.B]), np)
+        self.assertEqual([int(v) for v in st["rep0"]], [9, 7])
+
+    def test_a_missing_field_is_skipped_not_fatal(self):
+        st = self._state(); st.pop("rep0")
+        g._ar_trade_cell_ll(st, np.array([self.A]), np.array([self.B]), np)
+        self.assertEqual(int(st["spec"][self.A]), self.Y)
+
+    def test_the_field_list_matches_the_picked_row_sweep(self):
+        """One list, so the two sweeps cannot drift apart again."""
+        import inspect
+        src = inspect.getsource(g.GBSpecialBase._vertical_swap_sweep)
+        self.assertIn('for key in ("spec", "ll0", "led0", "rep0"):', src)
+        self.assertEqual(g._CELL_LL_BRACKET_FIELDS,
+                         ("spec", "ll0", "led0", "rep0"))
+
+    def test_the_all_rungs_sweep_TRADES_when_both_slots_exist(self):
+        import inspect
+        src = inspect.getsource(
+            g.GBSpecialBase._vertical_swap_sweep_all_rungs)
+        self.assertIn("_ar_trade_cell_ll(st,", src)
+        self.assertIn("_both = (_s_c >= 0) & (_s_h >= 0)", src)
+
+    def test_the_one_sided_remainder_is_COUNTED(self):
+        """A truly non-resident partner has no bracket to trade with, so
+        that credit is still short by the jump. Documented and counted,
+        not silent."""
+        import inspect
+        src = inspect.getsource(
+            g.GBSpecialBase._vertical_swap_sweep_all_rungs)
+        self.assertIn('census["one_sided_bracket"]', src)
+
+
+class OpeningSweepTest(unittest.TestCase):
+    """FINDING B (2026-09-28): a 25-repeat block never reaches a tick.
+
+    ``in_model`` / ``in_model_fstat`` run n_rep = 25 with every = 25, and
+    the tick carries ``move_i + 1 < n_rep``, so the only candidate is the
+    final repeat and it is excluded. Job 659: all 320 in_model census
+    blocks printed "(0 sweep(s))", 0 proposed -- and those two moves are
+    ~2,800 s of the iteration.
+    """
+
+    @staticmethod
+    def _ticks(n_rep, every):
+        return [i for i in range(n_rep)
+                if (i + 1) % every == 0 and i + 1 < n_rep]
+
+    def test_a_25_repeat_block_has_NO_tick(self):
+        self.assertEqual(self._ticks(25, 25), [])
+
+    def test_which_is_why_the_opening_sweep_exists(self):
+        """open + ticks: a 25-repeat block sweeps exactly once."""
+        self.assertEqual(1 + len(self._ticks(25, 25)), 1)
+
+    def test_a_255_repeat_block_sweeps_open_plus_ten(self):
+        self.assertEqual(1 + len(self._ticks(255, 25)), 11)
+
+    def test_the_opening_sweep_is_wired_and_gated(self):
+        import inspect
+        src = inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
+        blk = src[src.index("OPENING SWEEP"):]
+        self.assertIn(
+            "if _vert_on and _vert_at_refit and sighet_active and _half_pre:",
+            blk)
+        self.assertLess(src.index("OPENING SWEEP"),
+                        src.index("for move_i in range(n_rep"))
+
+    def test_it_does_NOT_fire_with_the_knob_off(self):
+        """Knob off must stay bit-identical to before item 2."""
+        import inspect
+        src = inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
+        blk = src[src.index("OPENING SWEEP"):]
+        self.assertIn("_vert_at_refit", blk.split("\n            ")[0]
+                      + blk[:800])

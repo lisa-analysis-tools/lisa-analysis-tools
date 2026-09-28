@@ -2530,6 +2530,55 @@ def _vert_at_refit_on() -> bool:
         "1", "true", "True", "yes", "on")
 
 
+_CELL_LL_BRACKET_FIELDS = ("spec", "ll0", "led0", "rep0")
+
+
+def _ar_slot_of_rung(carrier_col, ar_slot_col, slots, xp):
+    """One authoritative slot per rung: the carrier's, else the map.
+
+    ``-1`` where the cell is not in the buffer at all.
+    """
+    rows = xp.asarray(carrier_col)
+    have = rows >= 0
+    return xp.where(have, slots[xp.maximum(rows, 0)], xp.asarray(ar_slot_col))
+
+
+def _ar_trade_cell_ll(st, s_a, s_b, xp):
+    """Trade the WHOLE cell-ll bracket between two slots, as the
+    picked-row sweep does.
+
+    ⚠ SPEC ALONE IS NOT ENOUGH, and this is the whole of finding A
+    (2026-09-28). ``_cell_ll_finalize`` credits
+    ``ll_change_log[spec] = led0 + (lls - ll0)``. Take slot A, holding
+    cell A's sources, whose label goes X -> Y:
+
+    * FULL TRADE (what ``_vertical_swap_sweep`` has always done):
+      ``credit(Y) = led0_B + (lls_A - ll0_B)``
+      ``          = [A's own realized moves] + [ll0_A - ll0_B]``
+      i.e. A's moves PLUS the swap jump -- which is exactly what label Y
+      is now worth relative to open, and what ``[GB_ORTHO_LL]``'s
+      ``direct`` (recomputed from the relabelled sorter) measures.
+    * SPEC ONLY (what the all-rungs sweep did):
+      ``credit(Y) = led0_A + (lls_A - ll0_A)`` = A's moves, NO JUMP.
+
+    So the error is the sum of swap jumps on the cold label: slab-sized,
+    present after a single accepted swap, and only weakly dependent on
+    how many swaps happen. That is every number we have --
+    ``[GB_ORTHO_LL]`` rj_warm_search median 0.020 on job 643 (picked-row
+    sweep, full trade), 438 / 340 on jobs 655 / 659 even after accepted
+    swaps fell 26x, and ~0.005-0.009 on moves where no sweep runs at
+    all. The 2026-09-28 two-sided ``spec`` re-point was necessary -- two
+    slots must not claim one label -- but it was not sufficient.
+    """
+    for key in _CELL_LL_BRACKET_FIELDS:
+        a = st.get(key)
+        if a is None:
+            continue
+        tmp = a[s_a].copy()
+        a[s_a] = a[s_b]
+        a[s_b] = tmp
+
+
 def _ar_repoint_cell_ll(spec_of_slot, rows, slot_of_rung, slots, labels, xp):
     """Point each swapped rung's OPEN cell-ll bracket at its new label.
 
@@ -16306,16 +16355,40 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # bracket exists to relabel.
         if cell_ll_state is not None:
             st = cell_ll_state
-            a = st.get("spec")
-            if a is not None:
-                # carrier and ar_slot have ALREADY been permuted, so the
-                # cell now called rung t_h is the one that was on t_c.
-                for _t_new in (t_h, t_c):
-                    _ar_repoint_cell_ll(
-                        a, carrier[ci, _t_new], ar_slot[ci, _t_new], slots,
-                        band_sorter.get_special_band_index(
-                            _t_new, w_hc, b_hc),
-                        xp)
+            # carrier and ar_slot have ALREADY been permuted, so the cell
+            # now called rung t_h is the one that was on t_c.
+            _s_c = _ar_slot_of_rung(carrier[ci, t_c], ar_slot[ci, t_c],
+                                    slots, xp)
+            _s_h = _ar_slot_of_rung(carrier[ci, t_h], ar_slot[ci, t_h],
+                                    slots, xp)
+            _both = (_s_c >= 0) & (_s_h >= 0)
+            if bool(_both.any()):
+                # BOTH brackets exist -> the picked-row sweep's trade.
+                _ar_trade_cell_ll(st, _s_c[_both], _s_h[_both], xp)
+            # ONE-SIDED REMAINDER. A truly non-resident partner has no
+            # bracket to trade with, so the surviving slot keeps its own
+            # ll0/led0 and its credit is short by the swap jump. We fix
+            # the LABEL (two slots must never claim one) and COUNT the
+            # rest rather than guessing a baseline for a cell that was
+            # never opened. Documented residual, not a silent one: it is
+            # bounded by the non-resident fraction, which is itself the
+            # open structural gap (rungs that never became scheduler
+            # cells; see _vert_all_rung_cached).
+            _one = _s_c >= 0
+            _one = _one != (_s_h >= 0)
+            if bool(_one.any()):
+                if census is not None:
+                    census["one_sided_bracket"] = census.get(
+                        "one_sided_bracket", 0) + int(_one.sum())
+                a = st.get("spec")
+                if a is not None:
+                    for _t_new in (t_h, t_c):
+                        _ar_repoint_cell_ll(
+                            a, carrier[ci, _t_new], ar_slot[ci, _t_new],
+                            slots,
+                            band_sorter.get_special_band_index(
+                                _t_new, w_hc, b_hc),
+                            xp)
 
         # --- block-row labels + the beta they imply (carriers only) ------
         for _t_new in (t_h, t_c):
@@ -17959,6 +18032,48 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     if _fz_n and _vert_census is not None:
                         _vert_census["frozen_cached"] = (
                             _vert_census.get("frozen_cached", 0) + _fz_n)
+                _half_pre = _build_half_pre()
+                if _acc is not None:
+                    self._imk_rebuild_halves(_acc, _half_pre)
+
+        # OPENING SWEEP, at-refit mode only (finding B, 2026-09-28).
+        #
+        # ⚠ WITHOUT THIS, THE PURE IN-MODEL MOVES NEVER SWAP AT ALL. The
+        # refit tick is ``(move_i + 1) % every == 0 and move_i + 1 <
+        # n_rep``. ``in_model`` / ``in_model_fstat`` run blocks of
+        # exactly n_rep = GB_NUM_REPEAT_PROPOSALS = 25 and every = 25, so
+        # the only candidate tick is the final repeat, which ``< n_rep``
+        # excludes -- no tick, no refit, and under the knob no sweep.
+        # Measured on 6mo v9 job 659: all 320 in_model census blocks
+        # printed "(0 sweep(s))" with 0 proposed, and those two moves are
+        # ~2,800 s of the iteration. The RJ moves were unaffected (their
+        # n_rep is the 20000 ceiling with an early break, so ticks fire).
+        #
+        # Block open is the natural "swap at the fit": ll_ref has just
+        # been built against references anchored HERE, so this is the
+        # one moment in the block when every row's reference is exact.
+        # Cost is one sweep. Preferred over letting the tick fire on the
+        # final repeat, which would also buy a refit nothing then uses.
+        if _vert_on and _vert_at_refit and sighet_active and _half_pre:
+            _vert_sweeps += 1
+            with _tspan(tm, "inmodel_vertical_swap"):
+                if _ar_state is not None:
+                    _n0 = self._vertical_swap_sweep_all_rungs(
+                        band_sorter, band_temps, t_i, w_i, b_i, slots,
+                        beta, ll_ref, ll_change_log, prop_counts,
+                        acc_counts, cell_ll_state, 0, _ar_state,
+                        census=_vert_census, cell_ll_base=_vert_base,
+                    )
+                else:
+                    _n0 = self._vertical_swap_sweep(
+                        band_sorter, band_temps, t_i, w_i, b_i, slots,
+                        beta, ll_ref, ll_change_log, prop_counts,
+                        acc_counts, cell_ll_state, 0,
+                        census=_vert_census, swap_census=_swap_cens,
+                        cell_ll_base=_vert_base,
+                    )
+            if _n0:
+                _vert_acc += _n0
                 _half_pre = _build_half_pre()
                 if _acc is not None:
                     self._imk_rebuild_halves(_acc, _half_pre)
