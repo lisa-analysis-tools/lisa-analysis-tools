@@ -421,3 +421,96 @@ class ColdBandLnLTrackerTest(unittest.TestCase):
                 banned, src,
                 f"{banned!r} puts a gate array back on the move; the two "
                 f"pure in-model moves cannot see a move-owned tracker")
+
+
+class MultiRankPeakFoldTest(unittest.TestCase):
+    """Every walker block's peak must reach the head.
+
+    DEFECT found by the audit window (lisa-sprint-2026-4f) in 9c80faf7
+    and confirmed here: ``observe`` wrote into the GLOBAL
+    (nwalkers, nbands) peak using BLOCK-LOCAL walker indices, and
+    ``_cold_lnl_view`` was bound only in the two head-side propose paths.
+    The rank slice carries no band_info at all (``_make_slice_state``
+    says so), so on a 4-rank x 1-walker run only walker 0's repeat groups
+    ever reached the peak -- walkers 1-3 still saw the single mid-cycle
+    ``cap_stats`` sample, i.e. the defect the commit claimed to fix was
+    unfixed for three quarters of the ensemble, silently.
+    """
+
+    def test_observe_targets_a_block_local_array(self):
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
+        self.assertIn("_cold_lnl_block_peak", src)
+        self.assertIn("np.maximum.at(_cold_peak", src)
+        self.assertNotIn("_cold_lnl.observe(", src,
+                         "writing block-local indices into the global peak")
+
+    def test_the_rank_allocates_the_peak_and_ships_it_in_gb_finish(self):
+        """Allocated when the session opens, shipped when it closes.
+
+        The two live in different handlers, and the head merge reads the
+        ``gb_finish`` replies (``replies_f``) -- the same reply that
+        carries ``cap_stats``. Shipping it from ``gb_run_proposal``
+        instead would have been silently dropped.
+        """
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        alloc = inspect.getsource(g.GBSpecialBase._gb_serve_run_proposal)
+        self.assertIn("_cold_lnl_block_peak = (", alloc)
+        ship = inspect.getsource(g.GBSpecialBase._gb_serve_finish)
+        self.assertIn('"cold_lnl_peak"', ship)
+        self.assertIn('"cap_stats"', ship,
+                      "must ride the reply the head actually merges")
+
+    def test_the_head_folds_every_block_at_its_offset(self):
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g)
+        self.assertIn('_rp = rep.get("cold_lnl_peak")', src)
+        self.assertIn("np.maximum(_gv.peak[w0:w1], _rp, out=_gv.peak[w0:w1])",
+                      src)
+
+    def test_the_fold_is_a_max_at_the_offset_not_an_overwrite(self):
+        """The arithmetic the head does, at the array level."""
+        nw, nb = 4, 6
+        peak = np.full((nw, nb), -np.inf)
+        # rank 2 owns walker 2 and observed two cells
+        blk = np.full((1, nb), -np.inf); blk[0, 1] = -3.0; blk[0, 4] = -9.0
+        w0, w1 = 2, 3
+        np.maximum(peak[w0:w1], blk, out=peak[w0:w1])
+        self.assertEqual(float(peak[2, 1]), -3.0)
+        self.assertEqual(float(peak[2, 4]), -9.0)
+        self.assertTrue(np.isneginf(peak[0]).all(), "wrote outside its block")
+        self.assertTrue(np.isneginf(peak[3]).all())
+        # a second, worse observation must not lower it
+        blk2 = np.full((1, nb), -np.inf); blk2[0, 1] = -8.0
+        np.maximum(peak[w0:w1], blk2, out=peak[w0:w1])
+        self.assertEqual(float(peak[2, 1]), -3.0)
+
+    def test_a_neutral_block_cannot_lower_the_peak(self):
+        """A neutral reply ships -inf; the maximum must be a no-op."""
+        peak = np.full((2, 3), -5.0)
+        np.maximum(peak[0:1], np.full((1, 3), -np.inf), out=peak[0:1])
+        self.assertTrue((peak == -5.0).all())
+
+    def test_the_single_process_path_folds_locally(self):
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._fold_local_cold_peak)
+        self.assertIn("fanout_active", src,
+                      "both paths would claim to be the one that works")
+        self.assertIn("np.maximum(view.peak, pk, out=view.peak)", src)
+
+    def test_the_gate_line_reports_cells_OBSERVED_not_cells_finite(self):
+        """The old count could not see its own defect.
+
+        It was isfinite(value) AFTER the single cap_stats fold, so it read
+        as if every occupied cell had been observed even when only one
+        walker block was reporting.
+        """
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._update_search_band_shutoff)
+        self.assertIn("walker(s) reporting", src)
+        self.assertNotIn("int(np.isfinite(_view.value).sum()),", src)

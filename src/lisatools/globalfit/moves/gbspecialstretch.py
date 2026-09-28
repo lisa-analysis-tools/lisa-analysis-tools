@@ -18718,9 +18718,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # ``t_i`` is read AFTER the repeats on purpose: a vertical swap
         # rewrites it, so this asks which rows are cold NOW, not which
         # were cold when the block opened.
-        _cold_lnl = (cold_lnl if cold_lnl is not None
-                     else getattr(self, "_cold_lnl_view", None))
-        if _cold_lnl is not None:
+        # BLOCK-LOCAL, always. ``w_i`` is an index into THIS block's
+        # walkers, so it may only address a (B, nbands) array; the head
+        # folds the blocks into the global peak at their w0 offsets.
+        _cold_peak = (cold_lnl if cold_lnl is not None
+                      else getattr(self, "_cold_lnl_block_peak", None))
+        if _cold_peak is not None:
             with _tspan(tm, "inmodel_cold_band_ll"):
                 try:
                     _cold = _to_numpy(t_i) == 0
@@ -18728,8 +18731,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         _cs = slots[_cold]
                         _lls = buffer_obj.band_likelihoods(
                             source_only=True, slots=_cs)
-                        _cold_lnl.observe(_to_numpy(w_i)[_cold],
-                                          _to_numpy(b_i)[_cold], _lls)
+                        _wl = _to_numpy(w_i)[_cold].astype(np.int64)
+                        _bl = _to_numpy(b_i)[_cold].astype(np.int64)
+                        _vl = np.asarray(_to_numpy(_lls), dtype=np.float64)
+                        _ok = (np.isfinite(_vl)
+                               & (_wl >= 0) & (_wl < _cold_peak.shape[0])
+                               & (_bl >= 0) & (_bl < _cold_peak.shape[1]))
+                        if bool(_ok.any()):
+                            np.maximum.at(_cold_peak,
+                                          (_wl[_ok], _bl[_ok]), _vl[_ok])
                 except Exception as _e:   # never break a propose on telemetry
                     if not getattr(self, "_cold_lnl_warned", False):
                         self._cold_lnl_warned = True
@@ -21247,6 +21257,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     #: does on the sorter.
     _shutoff_band_info = None
     _cold_lnl_view = None
+    #: BLOCK-LOCAL (B, num_bands) cold-lnL peak for this propose. Every
+    #: compute rank -- the head included -- runs its own walker block
+    #: through gf_serve, so ``observe`` must accumulate into a block-local
+    #: array with block-local walker indices and the head folds the blocks
+    #: back at their offsets. Writing straight into the global
+    #: (nwalkers, nbands) peak was correct only for a block starting at
+    #: w0 == 0, i.e. the head's, and silently reached no other walker.
+    _cold_lnl_block_peak = None
 
     def _bind_shutoff_window(self, bi, shape) -> None:
         """Record the ``band_info`` handle and ensure its arrays exist.
@@ -21266,6 +21284,25 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """
         self._shutoff_band_info = bi
         cold_band_lnl_from_band_info(bi, shape)
+
+    def _fold_local_cold_peak(self, new_state) -> None:
+        """Fold THIS process's block peak into the global one.
+
+        A no-op under the fan-out: there every rank ships its block peak
+        in the ``gb_run_proposal`` reply and the head folds the blocks at
+        their w0 offsets, so folding again here would be harmless
+        (idempotent maximum) but would also mask a missing reply. Guarded
+        so the two paths cannot both claim to be the one that works.
+        """
+        if getattr(self, "fanout_active", False):
+            return
+        pk = getattr(self, "_cold_lnl_block_peak", None)
+        if pk is None:
+            return
+        view = cold_band_lnl(new_state, self.branch_name)
+        if view is None or np.shape(pk) != np.shape(view.peak):
+            return
+        np.maximum(view.peak, pk, out=view.peak)
 
     def _update_search_band_shutoff(self, model, new_state,
                                     band_counts) -> None:
@@ -21412,7 +21449,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     "-- streak p50 %.0f p90 %.0f of %d; resets/pair mean "
                     "%.2f max %d; chronic %d young %d fresh %d | "
                     "max-minus-now lnL p50 %.2f p90 %.2f (tol %.2f) | "
-                    "peak observations this iteration: %d cells",
+                    "peak: %d of %d occupied cells observed this cycle "
+                    "(%d walker(s) reporting)",
                     self.name, _n_occ, int((_occ & shut).sum()),
                     100.0 * float((_occ & shut).sum()) / max(_n_occ, 1),
                     _n_act,
@@ -21425,7 +21463,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     float(np.percentile(_gap, 50)) if _gap.size else float("nan"),
                     float(np.percentile(_gap, 90)) if _gap.size else float("nan"),
                     float(tol),
-                    int(np.isfinite(_view.value).sum()),
+                    # OBSERVED, not "finite after the fold". The old count
+                    # was isfinite(value) AFTER the single cap_stats fold,
+                    # so it read as if every occupied cell had been
+                    # observed even when only the head's walker block was
+                    # reporting -- the defect could not be seen in its own
+                    # telemetry. Count cells the repeat groups actually
+                    # reached, and how many walkers contributed any.
+                    int((_occ & np.isfinite(_view.value)
+                         & (_view.value > -np.inf)).sum()),
+                    _n_occ,
+                    int(np.count_nonzero(
+                        (np.isfinite(_view.value) & _occ).any(axis=1))),
                 )
         except Exception as _e:   # telemetry must never break a propose
             logger.debug("[GB_GATE %s] summary skipped: %r", self.name, _e)
@@ -23776,6 +23825,17 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 saved=dict(saved),
             )
             self._gb_session = sess
+            # BLOCK-LOCAL cold-lnL peak, one per propose per rank. Sized
+            # from the SLICE, so its walker axis is this block's and the
+            # block-local ``w_i`` the in-model loop hands ``observe`` is a
+            # valid index by construction. The head folds it back at w0.
+            try:
+                _B_pk = int(new_part.log_like.shape[1])
+            except Exception:      # noqa: BLE001
+                _B_pk = 0
+            self._cold_lnl_block_peak = (
+                np.full((_B_pk, int(self.num_bands)), -np.inf,
+                        dtype=np.float64) if _B_pk > 0 else None)
             if neutral:
                 B, ntemps, nb = self._gb_neutral_shapes(sess)
                 return {
@@ -24334,6 +24394,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # gb_run_proposal; these are the copies stashed just before
                 # (``run_proposal`` / ``_replace_census_report``, both guarded
                 # on ``fanout_active`` so single-process output is untouched)
+                # The block's cold-lnL peak over every in-model repeat
+                # group it ran this propose. -inf where the block observed
+                # nothing, which the head's maximum leaves alone.
+                "cold_lnl_peak": _gb_host(
+                    getattr(self, "_cold_lnl_block_peak", None)),
                 "rj_split": _gb_host(getattr(self, "_rj_split_last", None)),
                 "replace_census": _gb_host(
                     getattr(self, "_replace_split_last", None)),
@@ -26214,6 +26279,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # observe at all (the valve is not live on them, so they have no
         # other route to the arrays).
         self._cold_lnl_view = cold_band_lnl(state, self.branch_name)
+        # SINGLE-PROCESS block peak. Under the fan-out every rank (the head
+        # included) re-allocates this per session from its own slice, and
+        # the head folds the blocks back from the replies; without the
+        # fan-out there is no serve and no reply, so the whole ensemble is
+        # one block starting at w0 = 0 and the fold below is local.
+        self._cold_lnl_block_peak = np.full(
+            (int(self.nwalkers), int(self.num_bands)), -np.inf,
+            dtype=np.float64)
         # Tempering-cadence census: every propose of this branch ticks the
         # shared counter (see _temper_cadence_fire).
         GBSpecialBase._branch_propose_counts[self.branch_name] = (
@@ -27004,6 +27077,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # and ``cap_stats`` takes the HEAD's row alone -- every rank computed
         # that statistic for the same single walker, so concatenating R of them
         # would hand the cap gate R rows for N = 1.
+        _peak_cells_folded = 0
         for rank in layout.compute_ranks:
             w0, w1 = layout.block_of(rank)
             rep = replies_f[rank]
@@ -27027,6 +27101,29 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 log_like_final[w0:w1] = np.asarray(rep["log_like_final"])
             if rep.get("band_dof") is not None:
                 self._band_dof = rep["band_dof"]
+            # ---- fold this block's cold-lnL peak into the global one ----
+            # Every compute rank runs its own walker block, so without
+            # this only the head's walkers ever reached the peak and the
+            # rest fell back to the single mid-cycle cap_stats sample --
+            # which is cause 3 of the 9c80faf7 defect, unfixed for them.
+            # Folded here, BEFORE _update_search_band_shutoff consumes the
+            # peak below. A neutral block ships -inf and the maximum is a
+            # no-op, so it needs no special case.
+            _rp = rep.get("cold_lnl_peak")
+            if _rp is not None:
+                _rp = np.asarray(_rp, dtype=np.float64)
+                _gv = cold_band_lnl(new_state, self.branch_name)
+                if _gv is not None and _rp.shape == (w1 - w0,
+                                                     _gv.peak.shape[1]):
+                    np.maximum(_gv.peak[w0:w1], _rp, out=_gv.peak[w0:w1])
+                    _peak_cells_folded += int(np.isfinite(_rp).sum())
+                elif _gv is not None:
+                    logger.warning(
+                        "[GB_GATE %s] block %d:%d shipped a %s cold-lnL "
+                        "peak against a %s global one; NOT folded, so "
+                        "those walkers fall back to the single "
+                        "per-iteration sample.", self.name, w0, w1,
+                        _rp.shape, _gv.peak.shape)
         if _replica:
             self._replica_merge_finish(
                 work, sub, replies_f, layout, _band_ranges)
@@ -27182,6 +27279,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # promote every occupied band in half the intended patience.
         if self.leaf_cap_update:
             self._update_search_stages(new_state, band_counts)
+            self._fold_local_cold_peak(new_state)
             self._update_search_band_shutoff(model, new_state, band_counts)
 
         accepted = np.zeros((engine_ntemps, N), dtype=bool)
@@ -27314,6 +27412,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # observe at all (the valve is not live on them, so they have no
         # other route to the arrays).
         self._cold_lnl_view = cold_band_lnl(state, self.branch_name)
+        # SINGLE-PROCESS block peak. Under the fan-out every rank (the head
+        # included) re-allocates this per session from its own slice, and
+        # the head folds the blocks back from the replies; without the
+        # fan-out there is no serve and no reply, so the whole ensemble is
+        # one block starting at w0 = 0 and the fold below is local.
+        self._cold_lnl_block_peak = np.full(
+            (int(self.nwalkers), int(self.num_bands)), -np.inf,
+            dtype=np.float64)
         # Tempering-cadence census: every propose of this branch ticks the
         # shared counter (see _temper_cadence_fire).
         GBSpecialBase._branch_propose_counts[self.branch_name] = (
@@ -28036,6 +28142,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # the orchestrated propose.
         if self.leaf_cap_update:
             self._update_search_stages(new_state, band_info["band_counts"])
+            self._fold_local_cold_peak(new_state)
             self._update_search_band_shutoff(
                 model, new_state, band_info["band_counts"])
 
