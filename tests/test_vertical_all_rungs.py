@@ -272,3 +272,118 @@ class ProductionPathUntouchedTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FakeBuffer:
+    """Minimal buffer: slot labels, an active mask, and a slot-scored ll."""
+
+    def __init__(self, specials, lls, active=None):
+        self.slot_specials = np.asarray(specials, dtype=np.int64)
+        self._lls = np.asarray(lls, dtype=float)
+        self.slot_active = (np.ones(len(specials), bool) if active is None
+                            else np.asarray(active, bool))
+        self.calls = 0
+
+    def band_likelihoods(self, source_only=False, slots=None):
+        assert source_only, "the gate's unit is -1/2<r|r>, i.e. source_only"
+        self.calls += 1
+        return self._lls[np.asarray(slots, dtype=np.int64)]
+
+
+class AllRungsAreMeasuredNotInferredTest(unittest.TestCase):
+    """Every rung is priceable, so every rung can swap.
+
+    USER RULING 2026-09-27: "all of the rungs should perform vertical
+    tempering swaps everywhere that happens. The likelihood for non-active
+    rows does not change so it does not need to persist, just needs one
+    compute."
+
+    The old code refused to measure and inferred the bare slab from a
+    sole-occupant picked row, which priced empties only in columns that
+    happened to carry one and dropped OCCUPIED-but-unpicked cells
+    entirely -- 620.0 M of 875.0 M candidate pairs on 6mo job 650.
+    """
+
+    NB, NT, NW = 4, 3, 2
+
+    def _setup(self, carrier, occupied):
+        from lisatools.globalfit.moves.gbbands import pack_special_index
+        cols = np.array([0 * self.NB + 1, 1 * self.NB + 2], dtype=np.int64)
+        n_cols = len(cols)
+        w = (cols // self.NB)[:, None]
+        b = (cols % self.NB)[:, None]
+        t = np.arange(self.NT)[None, :]
+        spec = pack_special_index(t, w, b, self.NW).astype(np.int64).ravel()
+        lls = -np.arange(1.0, spec.size + 1.0)          # distinct per slot
+        return cols, np.asarray(carrier), np.asarray(occupied), spec, lls
+
+    def test_every_resident_rung_becomes_scorable(self):
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            _vert_all_rung_cached)
+        carrier = np.array([[0, -1, -1], [-1, 1, -1]])     # one live each
+        occupied = np.array([[True, False, True],          # incl. UNPICKED
+                             [False, True, False]])
+        cols, carrier, occupied, spec, lls = self._setup(carrier, occupied)
+        buf = _FakeBuffer(spec, lls)
+        cached, scor = _vert_all_rung_cached(
+            cols, carrier, occupied, None, None, np.zeros(0), np.zeros(0),
+            np.zeros(0), self.NB, np, buffer_obj=buf, nwalkers=self.NW)
+        self.assertTrue(scor.all(), "a resident rung was left unpriceable")
+        self.assertEqual(buf.calls, 1, "must be ONE compute for the block")
+
+    def test_the_occupied_but_UNPICKED_bucket_is_now_priced(self):
+        """The bucket that grows as the run converges: a cell holding
+        sources whose rows have all frozen has no picked row."""
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            _vert_all_rung_cached)
+        carrier = np.array([[0, -1, -1], [-1, -1, -1]])
+        occupied = np.array([[True, True, True], [True, True, True]])
+        cols, carrier, occupied, spec, lls = self._setup(carrier, occupied)
+        buf = _FakeBuffer(spec, lls)
+        cached, scor = _vert_all_rung_cached(
+            cols, carrier, occupied, None, None, np.zeros(0), np.zeros(0),
+            np.zeros(0), self.NB, np, buffer_obj=buf, nwalkers=self.NW)
+        self.assertTrue(scor.all())
+        # the live rung keeps 0 (scored elsewhere from cell_ll_base+ll_ref);
+        # every other rung carries its measured slab value
+        self.assertTrue((cached[carrier < 0] != 0.0).all())
+
+    def test_a_non_resident_rung_stays_unscorable(self):
+        """Residency is required, not assumed."""
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            _vert_all_rung_cached)
+        carrier = np.array([[0, -1, -1], [-1, 1, -1]])
+        occupied = np.array([[True, False, False], [False, True, False]])
+        cols, carrier, occupied, spec, lls = self._setup(carrier, occupied)
+        spec2 = spec.copy(); spec2[-1] = 10**9        # evict the last cell
+        buf = _FakeBuffer(spec2, lls)
+        cached, scor = _vert_all_rung_cached(
+            cols, carrier, occupied, None, None, np.zeros(0), np.zeros(0),
+            np.zeros(0), self.NB, np, buffer_obj=buf, nwalkers=self.NW)
+        self.assertFalse(bool(scor.ravel()[-1]))
+
+    def test_a_retired_slot_is_not_trusted(self):
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            _vert_all_rung_cached)
+        carrier = np.array([[0, -1, -1], [-1, 1, -1]])
+        occupied = np.array([[True, False, False], [False, True, False]])
+        cols, carrier, occupied, spec, lls = self._setup(carrier, occupied)
+        act = np.ones(len(spec), bool); act[-1] = False
+        buf = _FakeBuffer(spec, lls, active=act)
+        cached, scor = _vert_all_rung_cached(
+            cols, carrier, occupied, None, None, np.zeros(0), np.zeros(0),
+            np.zeros(0), self.NB, np, buffer_obj=buf, nwalkers=self.NW)
+        self.assertFalse(bool(scor.ravel()[-1]))
+
+    def test_without_a_buffer_it_falls_back_to_the_old_inference(self):
+        """The pre-2026-09-27 path stays reachable and still tested."""
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            _vert_all_rung_cached)
+        carrier = np.array([[0, -1, -1], [-1, 1, -1]])
+        occupied = np.array([[True, False, False], [False, True, False]])
+        cols, carrier, occupied, spec, lls = self._setup(carrier, occupied)
+        cached, scor = _vert_all_rung_cached(
+            cols, carrier, occupied, None, None, np.zeros(0), np.zeros(0),
+            np.zeros(0), self.NB, np)
+        # no vert_base -> nothing inferable -> only the live rungs score
+        np.testing.assert_array_equal(scor, carrier >= 0)

@@ -1449,7 +1449,17 @@ export GB_INMODEL_CONVERGE_GATE_FRAC=0.5
 # NOT the fraction: the exact ratio 1/24 does give one rung, but this file
 # exports a typed decimal and the answer flips on the fourth place --
 # ceil(24 * 0.04) is 1, ceil(24 * 0.0417) is 2.
-export GB_INMODEL_CONVERGE_GATE_RUNGS=1
+# 1 -> 4 (user ruling 2026-09-27, refining the 09-27 cold-only
+# ruling): "make sure that all 4 of the coldest 4 chains have
+# either no picked source or its source has converged to a max
+# logL." The coldest FOUR rungs gate the column, not just T0.
+#
+# Paired with the two-phase block: until those four are done,
+# EVERY row runs to its own convergence; once they are, that
+# column's remaining rungs get a fixed tail --
+# GB_INMODEL_POST_GATE_NEWBORN=100 steps for births,
+# GB_INMODEL_POST_GATE_SURVIVOR=0 for survivors.
+export GB_INMODEL_CONVERGE_GATE_RUNGS=4
 # SWAP TRIGGER: end a block once this fraction of its (walker, band) COLUMNS
 # has fully retired, then swap the finished bands out for queued ones.
 # ⚠ 1.0 SILENTLY DISABLES THE REFILL -- at 1.0 every column finishes together,

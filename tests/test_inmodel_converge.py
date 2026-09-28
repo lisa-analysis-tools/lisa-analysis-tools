@@ -2568,3 +2568,78 @@ class ColdOnlyColumnRetirementTest(unittest.TestCase):
         self.assertTrue(
             st.column_retired(rows),
             "the column did not leave when its cold chain converged")
+
+
+class TwoPhaseBlockTest(unittest.TestCase):
+    """Phase A: every row to its own convergence. Phase B: a fixed tail.
+
+    USER RULING 2026-09-27, stated precisely: track the row likelihood for
+    all chains to convergence on its one moving source; make sure all 4 of
+    the coldest 4 chains have either no picked source or a source that has
+    converged to a max logL; and only THEN give the other rungs a fixed
+    budget -- births a minimum of 100 steps, survivors none. "Up until
+    then everything should be running until convergence based on its row."
+    """
+
+    def _move(self):
+        return SimpleNamespace(
+            name="rj_warm_search", branch_name="gb", inmodel_converge="on",
+            inmodel_converge_classes=frozenset({"newborn", "mature"}),
+            inmodel_repeats_newborn=100, inmodel_repeats_survivor=50,
+            inmodel_converge_iters=250, inmodel_converge_iters_survivor=25,
+            inmodel_converge_max=20000, inmodel_converge_dll=4.0,
+            inmodel_converge_gate_frac=0.5, inmodel_converge_stop_frac=0.5,
+            inmodel_converge_refill=True, ntemps=24,
+            _converge_armed_logged=True, _converge_pe_warned=True,
+        )
+
+    def _state(self, cls_name, env=None):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        with mock.patch.dict(os.environ, env or {}, clear=False):
+            return g.GBSpecialBase._converge_state_for(self._move(), cls_name)
+
+    def test_births_get_a_100_step_tail(self):
+        self.assertEqual(self._state("newborn").post_gate_repeats, 100)
+
+    def test_survivors_get_none(self):
+        self.assertEqual(self._state("mature").post_gate_repeats, 0)
+
+    def test_both_are_env_overridable(self):
+        self.assertEqual(
+            self._state("newborn",
+                        {"GB_INMODEL_POST_GATE_NEWBORN": "40"}
+                        ).post_gate_repeats, 40)
+        self.assertEqual(
+            self._state("mature",
+                        {"GB_INMODEL_POST_GATE_SURVIVOR": "7"}
+                        ).post_gate_repeats, 7)
+
+    def test_the_class_is_recorded_on_the_state(self):
+        self.assertEqual(self._state("newborn").cls_name, "newborn")
+        self.assertEqual(self._state("mature").cls_name, "mature")
+
+    def test_the_gate_is_the_coldest_four_by_default_in_the_launchers(self):
+        """The knob the ruling sets; code default stays the fraction."""
+        import re
+        for p in ("scripts/fstat_proposal/submit_gf_6mo_v9_4gpu.sh",
+                  "scripts/fstat_proposal/submit_gf_3mo_v9_2gpu.sh"):
+            src = open(p).read()
+            m = re.search(r"^export GB_INMODEL_CONVERGE_GATE_RUNGS=(\d+)",
+                          src, re.M)
+            self.assertIsNotNone(m, p)
+            self.assertEqual(m.group(1), "4", p)
+
+    def test_phase_B_is_per_column_and_needs_a_real_gated_rung(self):
+        """A column with NO gated rung must not trigger the tail.
+
+        ``_f_cnt >= _g_cnt`` is satisfied trivially at 0 >= 0, and letting
+        that fire would cut a column's hot rows before anything had
+        converged anywhere -- the same shape as the 2026-09-26 bug where
+        newborn blocks ran exactly 5 repeats.
+        """
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
+        self.assertIn("_colB = (_g_cnt > 0) & (_f_cnt >= _g_cnt)", src)
+        # and the block may not exit while a birth still owes its tail
+        self.assertIn("and not _owed", src)

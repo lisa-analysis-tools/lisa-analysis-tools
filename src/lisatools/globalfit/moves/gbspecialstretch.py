@@ -1992,6 +1992,18 @@ def cold_band_lnl(state, branch_name="gb"):
     return _ColdBandLnL(bi)
 
 
+def _env_int(name, default):
+    """``int`` from the environment, falling back loudly-enough on junk."""
+    v = os.environ.get(name)
+    if v is None or not str(v).strip():
+        return int(default)
+    try:
+        return int(str(v).strip())
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using %s", name, v, default)
+        return int(default)
+
+
 def _scale_dll_with_window(branch_name=None) -> bool:
     """Should the SURVIVOR threshold be rescaled with its window?
 
@@ -2488,58 +2500,115 @@ def _vert_all_rungs_on() -> bool:
 
 
 def _vert_all_rung_cached(cols, carrier, occupied, n_alive, vert_base,
-                          t_i, w_i, b_i, num_bands, xp):
-    """``(cached, scorable)`` totals for the rungs with no picked row.
+                          t_i, w_i, b_i, num_bands, xp,
+                          buffer_obj=None, nwalkers=None):
+    """``(cached, scorable)`` totals for EVERY rung with no picked row.
 
-    THE FREE MEASUREMENT. An EMPTY rung of a column holds no sources, so
-    its whole-cell likelihood is the BARE parent-walker plane over the band
-    window -- and all rungs of one ``(walker, band)`` read a bit-identical
-    slab, so that is ONE number per column. Whenever some rung of the
-    column is a SOLE-OCCUPANT picked cell, ``_vert_base`` for that row is
-    already exactly that number: it is
-    ``band_likelihoods(source_only=True)`` taken after the picked source
-    was removed, and with no other leaves left the slab is bare.
+    USER RULING 2026-09-27: "all of the rungs should perform vertical
+    tempering swaps everywhere that happens. The likelihood for non-active
+    rows does not change so it does not need to persist, just needs one
+    compute."
 
-    That is why this needs no transient buffer bind and therefore cannot
-    trip the ``_rebind`` bracket trap (hazard 1 of the design spec): every
-    value here comes from a measurement the block already took.
+    That is the whole design. Between ``remove_sources_from_band_buffer``
+    and the write-back, a cell with no picked row is NOT TOUCHED -- only
+    picked sources move -- so its whole-cell likelihood is a BLOCK
+    CONSTANT. One measurement per block prices it for every repeat.
 
-    ``scorable`` marks the rungs this can actually price:
+    WHAT THIS REPLACES. The previous version refused to measure and tried
+    to INFER the bare slab instead: whenever some rung of a column
+    happened to be a sole-occupant picked cell, its ``_vert_base`` is the
+    bare plane, so empties in THAT column could be priced for free.
+    Everything else was dropped unpriceable -- measured on 6mo v9 job 650
+    at **620.0 M dropped against 255.0 M proposed, 70.9% of all candidate
+    pairs**, and the drop rate tracked sparsity (100% in a 4-source block,
+    92% at 70 sources, 45% at 563). Two buckets were lost:
 
-    * ``carrier >= 0``           -- scored LIVE, always scorable;
-    * empty and bare known       -- scorable from the column's bare value;
-    * empty and bare NOT known   -- no sole-occupant picked rung in the
-      column, so the bare value was never measured;
-    * occupied but UNPICKED      -- its total is bare + its own sources,
-      which nothing in the block measured.
+    * empty rungs in a column with no sole-occupant picked row;
+    * OCCUPIED rungs that had no source picked this block -- a population
+      that GROWS as the run converges, because a converged row freezes and
+      stops being picked.
 
-    The last two need the spec's transient measurement pass and are NOT
-    implemented here; their pairs are dropped and counted, never guessed.
-    A wrong total is a silently mis-weighted swap, which is worse than a
-    swap not offered.
+    Both are now measured directly, in one ``band_likelihoods`` call.
+
+    ⚠ NO BIND, SO NO ``_rebind`` BRACKET TRAP (hazard 1 of the 2026-09-25
+    spec). ``band_likelihoods(source_only=True, slots=...)`` is a pure READ
+    of the shaped residual/PSD views the buffer already holds. The hazard
+    was about binding a transient INTO the buffer in order to measure; this
+    reads the slab exactly as it already stands.
+
+    ⚠ RESIDENCY IS REQUIRED, NOT ASSUMED. A cell absent from the buffer, or
+    in a retired slot, cannot be priced and stays unscorable. Under
+    ``column_atomic`` staging every rung of a staged column is resident --
+    that is the invariant the all-rungs swap already depends on -- so this
+    should be empty in production, and it is counted rather than trusted.
+
+    Falls back to the old inference when no ``buffer_obj`` is supplied
+    (unit tests, an exotic harness), so the previous behaviour is still
+    reachable and still tested.
     """
     n_cols, ntemps = int(carrier.shape[0]), int(carrier.shape[1])
     cached = xp.zeros((n_cols, ntemps), dtype=xp.float64)
+    live = carrier >= 0
+    empty = ~occupied
+
+    # ---- the measured path ------------------------------------------
+    if buffer_obj is not None and nwalkers is not None and n_cols > 0:
+        try:
+            _ss = buffer_obj.slot_specials
+            _act = getattr(buffer_obj, "slot_active", None)
+            # Packed (t, w, b) for every cell of the all-rung table, in the
+            # SAME packing the sorter uses (pack_special_index), so the
+            # lookup cannot disagree with the buffer's own labels.
+            _w = (cols // int(num_bands)).astype(xp.int64)[:, None]
+            _b = (cols % int(num_bands)).astype(xp.int64)[:, None]
+            _t = xp.arange(ntemps, dtype=xp.int64)[None, :]
+            # pack_special_index, NOT a re-derivation: it is the function
+            # the sorter itself labels slots with, so the lookup cannot
+            # drift from the labels it is matching against. It broadcasts
+            # elementwise over the (n_cols, ntemps) grid.
+            _want = pack_special_index(
+                _t, _w, _b, int(nwalkers)).astype(xp.int64).reshape(-1)
+            # special -> slot. slot_specials is not sorted, so carry an
+            # argsort; n_slots is thousands, this is noise next to the
+            # per-repeat work it unlocks.
+            _order = xp.argsort(_ss)
+            _sorted = _ss[_order]
+            _pos = xp.clip(xp.searchsorted(_sorted, _want, side="left"),
+                           0, max(int(_sorted.shape[0]) - 1, 0))
+            _slot = _order[_pos]
+            _resident = _ss[_slot] == _want
+            if _act is not None:
+                _resident = _resident & _act[_slot]
+            _need = (~live).reshape(-1) & _resident
+            if bool(_need.any()):
+                _lls = buffer_obj.band_likelihoods(
+                    source_only=True, slots=_slot[_need])
+                _flat = cached.reshape(-1)
+                _flat[_need] = xp.asarray(_lls).astype(xp.float64)
+                cached = _flat.reshape(n_cols, ntemps)
+            # EVERY rung is now priceable: live ones are scored from
+            # cell_ll_base + ll_ref, the rest from this measurement.
+            return cached, live | _resident.reshape(n_cols, ntemps)
+        except Exception as _e:   # noqa: BLE001 -- fall back, never break
+            logger.warning(
+                "[GB_VERT] all-rung measurement unavailable (%r); falling "
+                "back to the sole-occupant inference, which prices only "
+                "empties in columns that happen to carry one.", _e)
+
+    # ---- the inference fallback (pre-2026-09-27 behaviour) -----------
     bare_known = xp.zeros(n_cols, dtype=bool)
     if int(t_i.shape[0]) > 0 and vert_base is not None:
-        # Rows whose cell holds exactly one alive source: for those the
-        # post-removal slab IS the bare slab.
         col_of_row = (w_i.astype(xp.int64) * int(num_bands)
                       + b_i.astype(xp.int64))
         ci_of_row = xp.searchsorted(cols, col_of_row)
         sole = xp.asarray(n_alive)[ci_of_row, t_i.astype(xp.int64)] == 1
         if bool(sole.any()):
             _ci = ci_of_row[sole]
-            # Last writer wins; every sole-occupant row of a column carries
-            # the same bare value, so which one lands is immaterial.
             bare = xp.zeros(n_cols, dtype=xp.float64)
             bare[_ci] = xp.asarray(vert_base)[sole].astype(xp.float64)
             bare_known[_ci] = True
             cached = xp.broadcast_to(bare[:, None], (n_cols, ntemps)).copy()
-    live = carrier >= 0
-    empty = ~occupied
-    scorable = live | (empty & bare_known[:, None])
-    return cached, scorable
+    return cached, live | (empty & bare_known[:, None])
 
 
 def _vert_all_rung_tables(t_i, w_i, b_i, ntemps, nwalkers, num_bands,
@@ -2964,11 +3033,28 @@ class _InModelConvergeState:
     """
 
     def __init__(self, window, thresh, max_repeats, stop_frac=1.0,
-                 observe=False, n_gate=None, refill=False):
+                 observe=False, n_gate=None, refill=False,
+                 cls_name=None, post_gate_repeats=None):
         self.window = int(window)
         self.thresh = float(thresh)
         self.max_repeats = int(max_repeats)
         self.stop_frac = float(stop_frac)
+        #: which provenance class this block is (one class per block --
+        #: ``_converge_state_for`` builds a state per class), and how many
+        #: repeats an UNGATED row of that class is owed once its column's
+        #: gated rungs have all finished.
+        #:
+        #: USER RULING 2026-09-27, the two-phase block: "up until then
+        #: everything should be running until convergence based on its
+        #: row"; then, once the coldest ``n_gate`` chains of a column are
+        #: all either unpicked or converged, "the other rungs have births
+        #: run minimum 100 steps and survivors run none".
+        #:
+        #: ``None`` restores the pre-ruling behaviour (ungated rows simply
+        #: ride along until the block stops on stop_frac).
+        self.cls_name = cls_name
+        self.post_gate_repeats = (None if post_gate_repeats is None
+                                  else max(0, int(post_gate_repeats)))
         self.observe = bool(observe)
         # LADDER GATE (user ruling 2026-09-24: "make sure the upper half of
         # temperatures do not hold us up, so once the lower have converged
@@ -16946,6 +17032,24 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 if _scale_dll_with_window(self.branch_name):
                     _thr = _thr * (_win_s / max(_win, 1))
                 _win = _win_s
+        # POST-GATE BUDGET for the UNGATED rungs (user ruling 2026-09-27).
+        # Once a column's coldest ``n_gate`` chains are all either unpicked
+        # or converged, the rest of that column's rungs get a FIXED tail
+        # rather than riding along for however long the block happens to
+        # run: births a minimum of 100 steps, survivors none.
+        #
+        # Why the asymmetry: a newborn on a hot rung has not yet been given
+        # a fair chance to find its source, and cutting it at the moment
+        # the cold half finishes would judge it on however many repeats it
+        # happened to get. A survivor on a hot rung is refining a source
+        # the cold chain has already settled, and its gain random-walks
+        # rather than climbing, so further repeats there are not
+        # refinement -- they are the thing that was making blocks long.
+        _post = _env_int(f"{(self.branch_name or 'GB').upper()}"
+                         "_INMODEL_POST_GATE_NEWBORN", 100)
+        if cls_name != "newborn":
+            _post = _env_int(f"{(self.branch_name or 'GB').upper()}"
+                             "_INMODEL_POST_GATE_SURVIVOR", 0)
         return _InModelConvergeState(
             window=_win,
             thresh=_thr,
@@ -16954,6 +17058,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             observe=(mode == "observe"),
             n_gate=_n_gate,
             refill=bool(self.inmodel_converge_refill),
+            cls_name=cls_name,
+            post_gate_repeats=_post,
         )
 
     def _run_in_model_repeats(self, model, band_sorter, buffer_obj, band_temps,
@@ -17419,7 +17525,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     int(self.num_bands), _alive_counts, xp)
                 _cached, _scor = _vert_all_rung_cached(
                     _cols, _carrier, _occ, _nal, _vert_base,
-                    t_i, w_i, b_i, int(self.num_bands), xp)
+                    t_i, w_i, b_i, int(self.num_bands), xp,
+                    buffer_obj=buffer_obj,
+                    nwalkers=int(band_sorter.nwalkers))
                 _ar_state = (_cols, _carrier, _occ, _cached, _scor)
         # NOTE(vertical ll audit): the ratio reads ``ll_ref`` -- the cell
         # ll WITH its picked source in. Do NOT audit that against
@@ -18175,6 +18283,39 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                       _cv_colidx, weights=_frozen.astype(np.float64),
                       minlength=_cv_ncols)
                   _cols_done = int(np.count_nonzero(_f_cnt >= _g_cnt))
+
+                  # ---- PHASE B, per COLUMN (user ruling 2026-09-27) ----
+                  # "up until then everything should be running until
+                  # convergence based on its row"; then, once a column's
+                  # coldest n_gate chains are ALL either unpicked or
+                  # converged, "the other rungs have births run minimum
+                  # 100 steps and survivors run none".
+                  #
+                  # PER COLUMN, not block-wide: the column is the unit the
+                  # buffer stages and retires, and it is the unit the
+                  # ruling names ("pull the whole group off the block when
+                  # its cold chain converges"). A column that is still
+                  # working does not drag the finished ones along, and a
+                  # finished one does not cut the workers short.
+                  #
+                  # ``_g_cnt > 0`` matters: a column with no gated rung at
+                  # all satisfies ``_f_cnt >= _g_cnt`` trivially (0 >= 0),
+                  # and letting that trigger the tail would cut its hot
+                  # rows before anything had converged anywhere.
+                  _owed = False
+                  if converge.post_gate_repeats is not None:
+                      _colB = (_g_cnt > 0) & (_f_cnt >= _g_cnt)
+                      if _colB.any():
+                          _inB = _colB[_cv_colidx]
+                          _unq = ~_gated_h
+                          _tail = _to_numpy(_cv_seen) >= int(
+                              converge.post_gate_repeats)
+                          # survivors: post_gate_repeats == 0, so _tail is
+                          # all True and they freeze at the trigger.
+                          # births: they keep going to the 100-step floor.
+                          _frozen = _frozen | (_inB & _unq & _tail)
+                          _owed = bool((_inB & _unq & ~_tail).any())
+                          _n_fr = int(np.count_nonzero(_frozen))
                   # ⚠ MINIMUM WALK BEFORE THE BLOCK MAY STOP (user ruling
                   # 2026-09-26: "make sure they walk at least 250 steps on
                   # the hot rung before shutting them down").
@@ -18198,7 +18339,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                   # max_repeats ceiling and the per-row freeze are
                   # unchanged, and a frozen row still stops proposing, so
                   # the extra repeats are spent on the rows still moving.
+                  # ``not _owed``: a phase-B column whose births have not
+                  # yet reached their 100-step floor still holds the block,
+                  # or the tail the ruling asks for would not be run.
                   if ((move_i + 1) >= int(converge.window)
+                          and not _owed
                           and _cols_done >= converge.stop_frac * _cv_ncols):
                       # Enough bands are done -- the hot rungs come along
                       # rather than holding the block open, and the refill
