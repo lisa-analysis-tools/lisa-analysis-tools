@@ -21718,6 +21718,34 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             and bool(getattr(self, "is_rj_prop", False))
         )
 
+    @property
+    def _shutoff_mask_live(self) -> bool:
+        """May this move READ the shut table to exclude shut pairs?
+
+        Same as :meth:`_search_shutoff_per_walker` WITHOUT the
+        ``is_rj_prop`` condition, and the distinction is load-bearing:
+
+        * OWNING the valve -- running the judge, freezing the RJ subset,
+          stamping the step -- is RJ-only, because only an RJ move has
+          births and deaths to freeze and only the designated updater
+          judges. That stays ``_search_shutoff_per_walker``.
+        * READING it to skip shut pairs applies to EVERY gb move in
+          search mode (user ruling 2026-09-28: a shut pair "runs
+          NOTHING"), and the two pure in-model moves are ~47% of the
+          iteration, so they are most of the point.
+
+        ⚠ WHY THIS EXISTS. 98428c32 added the pick mask with a comment
+        saying it was "NOT GATED ON is_rj_prop" -- and the EXPRESSION is
+        not, but the table it reads was left ``None`` on exactly those
+        moves by ``_arm_search_stage``, so the mask was a silent no-op
+        on 47% of the iteration. The test written to catch that checked
+        the text of the block rather than the binding, and passed.
+        """
+        return (
+            bool(getattr(self, "search_shutoff_per_walker", False))
+            and bool(getattr(self, "search_mode", False))
+        )
+
     def begin_recipe_step(self, serial) -> None:
         """Announce a new recipe step: release the per-walker RJ valve.
 
@@ -22245,6 +22273,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             if arrays is not None:
                 self._stage_table = arrays[0]
                 self._snr_lim_table = self._build_snr_lim_table(state)
+        if self._shutoff_mask_live and not self._search_shutoff_per_walker:
+            # READ-ONLY BIND for a non-RJ gb move. It gets the table so
+            # the shut pairs can be excluded from its pick pool AND from
+            # its subset (so shut cells are never staged, never filled,
+            # never bracketed), but NONE of the ownership machinery
+            # below: no window bind, no step stamp, no judge, no
+            # release. Those belong to the RJ moves that own the valve.
+            #
+            # Without this the whole level-3 "a shut pair runs NOTHING"
+            # ruling missed the two pure in-model moves -- ~47% of the
+            # iteration, and on job 662 about 50 s per iteration of
+            # buffer_build + cell_ll + unit_open_close spent staging
+            # cells that were then never picked.
+            self._rj_band_shutoff_w = bi.get("band_rj_shutoff_w")
         if self._search_shutoff_per_walker:
             shut = bi.get("band_rj_shutoff_w")
             if shut is None:

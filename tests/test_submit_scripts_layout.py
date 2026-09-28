@@ -256,13 +256,13 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         # 10 -> 1 (2026-09-25): refit every search iteration, because
         # the residual moves fast enough that the grid goes stale --
         # 628's rj_fstat_search cold yield fell 135 -> 96 -> 54.
-        # 1 -> 10 (2026-09-28): REVERSED once the stage was late enough
+        # 1 -> 2 (2026-09-28, Mike): REVERSED once the stage was late enough
         # that cold births had run out. On job 662 the refit cost 1129 s
         # of a 5564 s iteration (20%) and bought ~16 cold births, with
         # acceptance at 25/253k (rj_warm) and 80/236k (rj_fstat). A
         # stale grid cannot cost what it no longer buys. Revert to 1 if
         # cold birth acceptance climbs back.
-        self.assertEqual(self.v9["GB_FSTAT_REFIT_EVERY"], "10")
+        self.assertEqual(self.v9["GB_FSTAT_REFIT_EVERY"], "2")
         self.assertLess(int(self.v9["GB_FSTAT_REFIT_EVERY"]),
                         int(self.v9["GB_FSTAT_REFIT_EVERY_PE"]))
 

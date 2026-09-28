@@ -3450,8 +3450,9 @@ export GB_TEMPER_SKIP_SHUTOFF_BANDS=1
 # >>> back ~1610 s of it. Watch '[peaks]' and '[stageA]' -- if the peak count
 # >>> is not falling by the third epoch this is a fixed ~1800 s/iteration
 # >>> bill and should go back to 5 or 10.
-export GB_FSTAT_REFIT_EVERY=10     # SEARCH stages: every 10th iteration
-# 1 -> 10 (2026-09-28, iteration-time package). Measured on job 662
+export GB_FSTAT_REFIT_EVERY=2      # SEARCH stages: every 2nd iteration
+# 1 -> 2 (2026-09-28, Mike: "let's do fstat refit every two
+# iterations"; an intermediate 10 was staged and superseded). Measured on job 662
 # iteration 5: the refit cost 1129 s of a 5564 s iteration (20%, epochs
 # 11-14 at 1127-1134 s each) and bought ~16 cold births per iteration.
 # Cold births are exhausted at this point in the stage (rj_warm 25 of

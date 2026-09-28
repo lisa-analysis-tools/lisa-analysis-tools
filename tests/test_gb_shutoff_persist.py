@@ -800,3 +800,50 @@ class Level3ShutPairsRunNothingTest(unittest.TestCase):
         self.assertFalse(np.isfinite(bi["band_cold_logl_peak_w"]).any())
         # ...and the all-time max SURVIVES (Mike, 2026-09-28)
         self.assertTrue(np.isfinite(bi["band_cold_logl_max_w"]).all())
+
+    def test_the_mask_table_IS_BOUND_on_a_pure_in_model_move(self):
+        """⚠ THE DEFECT 98428c32 SHIPPED.
+
+        ``_search_shutoff_per_walker`` requires ``is_rj_prop``, so
+        ``_arm_search_stage`` left ``_rj_band_shutoff_w`` at None on the
+        two pure in-model moves -- and the pick mask reads exactly that
+        attribute. The expression was not gated on is_rj_prop, but the
+        table it reads was, so the mask was a silent no-op on ~47% of
+        the iteration. The test written to catch it checked the TEXT of
+        the block, not the binding, and passed.
+
+        This checks the binding, on the real property.
+        """
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        m = g.GBSpecialBase.__new__(g.GBSpecialBase)
+        m.search_shutoff_per_walker = True
+        m.search_mode = True
+        m.is_rj_prop = False                       # a PURE in-model move
+        self.assertFalse(m._search_shutoff_per_walker,
+                         "owning the valve stays RJ-only")
+        self.assertTrue(m._shutoff_mask_live,
+                        "but reading it to skip shut pairs must not be")
+        m.is_rj_prop = True
+        self.assertTrue(m._search_shutoff_per_walker)
+        self.assertTrue(m._shutoff_mask_live)
+
+    def test_the_read_only_bind_grants_no_ownership(self):
+        """A non-RJ move gets the table and nothing else: no window
+        bind, no step stamp, no judge, no release."""
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._arm_search_stage)
+        i = src.index("_shutoff_mask_live and not self._search_shutoff")
+        blk = src[i:src.index("if self._search_shutoff_per_walker:", i)]
+        self.assertIn("self._rj_band_shutoff_w = bi.get", blk)
+        for forbidden in ("_bind_shutoff_window", "band_shutoff_w_step",
+                          "_release_search_band_shutoff"):
+            self.assertNotIn(forbidden, blk, forbidden)
+
+    def test_the_mask_is_off_outside_search_mode(self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        m = g.GBSpecialBase.__new__(g.GBSpecialBase)
+        m.search_shutoff_per_walker = True
+        m.search_mode = False
+        m.is_rj_prop = False
+        self.assertFalse(m._shutoff_mask_live)

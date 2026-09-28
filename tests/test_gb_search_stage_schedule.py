@@ -1204,7 +1204,7 @@ class IterationTimePackageLauncherTest(unittest.TestCase):
     def test_both_launchers_carry_the_package(self):
         for name in ("submit_gf_6mo_v9_4gpu.sh", "submit_gf_3mo_v9_2gpu.sh"):
             src = self._src(name)
-            self.assertIn("export GB_FSTAT_REFIT_EVERY=10", src, name)
+            self.assertIn("export GB_FSTAT_REFIT_EVERY=2", src, name)
             self.assertNotIn("export GB_FSTAT_REFIT_EVERY=1\n", src, name)
             self.assertIn("export GB_SEARCH_BAND_SHUTOFF_LL_TOL=32", src, name)
             self.assertIn("export GB_SEARCH_DROP_MOVES=in_model_fstat",
