@@ -556,8 +556,131 @@ SEARCH_SHUTOFF_FIELDS = (
     "band_shutoff_w_step",
 )
 
+#: The valve's WINDOW -- the running-best lnL and the consecutive
+#: non-improving count that earn the boolean above (user request
+#: 2026-09-27). Held SEPARATE from :data:`SEARCH_SHUTOFF_FIELDS` on purpose:
+#: those two are an all-or-nothing group, so listing the window there would
+#: make every store written before this existed fail the completeness check
+#: and reopen a valve it had legitimately earned. Here the window is
+#: backfilled on its own, and the boolean survives.
+#:
+#: WHY IT IS PERSISTED AT ALL. It used to live only in
+#: ``GBSpecialBase._shutoff_best`` / ``._shutoff_streak``, so a restart
+#: re-earned the whole window. With ``search_shutoff_conv_iter = 3`` and the
+#: running best starting at -inf, the first iteration after a restart always
+#: counts as an improvement, so FOUR consecutive iterations inside ONE job
+#: were needed before any pair could shut. Measured on the 6mo v9 run at
+#: ~1.8 h/iteration: job 643 (8.9 h) shut 1478 -> 1527 pairs; jobs 646
+#: (2.1 h), 648 (17 min) and 650 (3.2 h) shut ZERO, and 650's valve reported
+#: "inert" twice. The gate could not close because the jobs were shorter
+#: than the window, not because the bands were still paying.
+SEARCH_SHUTOFF_WINDOW_FIELDS = (
+    "band_shutoff_best_w",
+    "band_shutoff_streak_w",
+    "band_cold_logl_max_w",
+    "band_cold_logl_w",
+    "band_shutoff_reset_w",
+    "band_cold_logl_peak_w",
+)
+
+#: ``band_shutoff_reset_w`` counts how many times each (walker, sub-band)
+#: has had its shutoff streak ZEROED -- i.e. how often it beat its
+#: all-time cold-lnL max by more than the tolerance (user ruling
+#: 2026-09-27: "they are resetting? we need to diagnose that").
+#:
+#: A pair can be unshut for three quite different reasons and the streak
+#: alone cannot tell them apart:
+#:   * it keeps resetting        -> high reset count, streak near 0
+#:   * it is simply still young  -> reset count 0, streak 1 or 2
+#:   * it was only just occupied -> reset count 0, streak 0
+#: Persisted with the rest so a snapshot answers this directly instead of
+#: leaving it to be inferred from the shut TOTAL.
+
+#: ``band_cold_logl_w`` is THIS iteration's per-(walker, band) cold-chain
+#: lnL -- the raw statistic the valve judges, recorded so the store keeps a
+#: HISTORY of it (user ruling 2026-09-27: "we should track this better").
+#:
+#: WHY IT DID NOT EXIST. The valve computes the statistic fresh every
+#: iteration through ``_cap_stats_local`` and discards it. The only array
+#: that ever held a per-band cold lnL is ``band_cold_ll``, and that one is
+#: written by the leaf-CAP gate -- which this schedule disarms. Measured on
+#: 6mo v9 job 650: ``band_cold_ll`` and ``cap_cell_cold_ll`` are ``-inf``
+#: in ALL 4,928 cells of every stored row. So the quantity that decides
+#: when a search stage ends had no recorded history at all, which is why
+#: "have the sub-band lnLs converged?" could not be answered from a
+#: snapshot.
+#:
+#: With this, the three arrays together tell the whole story per cell:
+#: the value now, the all-time max it is judged against, and how many
+#: consecutive iterations it has failed to beat that max.
+
+#: ``band_cold_logl_max_w`` is DIFFERENT IN KIND from the two above and is
+#: the reference the valve actually judges against (user ruling
+#: 2026-09-27: "you should hold an absolute logL max value for the cold
+#: chain per (band, walker); it should persist through everything
+#: including saving. We want to monitor against that. Not a simple
+#: increase.").
+#:
+#: ABSOLUTE and NEVER RELEASED. ``band_shutoff_best_w`` and
+#: ``band_shutoff_streak_w`` are the per-STEP window and are cleared
+#: whenever the recipe step changes; this one is the all-time maximum
+#: cold-chain lnL that (walker, band) has ever reached, and it survives a
+#: step change, a restart and a save. That is the whole point: a
+#: reference that resets cannot tell "this band is fitted" from "this
+#: band's evidence was just thrown away", and the resetting reference is
+#: why the valve spent jobs 646/648/650 unable to latch.
+#:
+#: ⚠ IT REVERSES the 2026-09-24 note on ``_release_search_band_shutoff``
+#: ("a step that inherited the previous step's running-best lnL would
+#: re-freeze on its first patience window"). That risk is real and is now
+#: accepted deliberately: if a new step's moves genuinely find something
+#: better they beat the all-time max and the streak resets, and if they
+#: cannot, the band is finished and freezing it is correct.
+SEARCH_SHUTOFF_ABSOLUTE_FIELD = "band_cold_logl_max_w"
+
 #: sentinel for "no recipe step recorded yet" in ``band_shutoff_w_step``
 SEARCH_SHUTOFF_STEP_UNSET = -1
+
+
+def _zero_search_shutoff_window(band_info: dict, num_bands: int,
+                                nwalkers: int) -> None:
+    """Install a fresh (empty) shutoff window: no best, no streak.
+
+    ``-inf`` for the best is the load-bearing value -- it is what makes the
+    first measured lnL count as an improvement, so a fresh window can never
+    shut a band on its first iteration.
+    """
+    band_info["band_shutoff_best_w"] = np.full(
+        (nwalkers, num_bands), -np.inf, dtype=np.float64)
+    band_info["band_shutoff_streak_w"] = np.zeros(
+        (nwalkers, num_bands), dtype=np.int64)
+    # NOT cleared by a release -- see SEARCH_SHUTOFF_ABSOLUTE_FIELD. A
+    # release goes through ``_release_search_band_shutoff``, which never
+    # calls this. What DOES reach here is a fresh install or a grid
+    # change, and in both cases an existing absolute max is meaningless:
+    # there is no history on a fresh grid, and a max measured on a
+    # different band grid belongs to different bands.
+    #
+    # Shape-checked rather than ``setdefault``: this function is the
+    # shape-mismatch recovery path, so a plain setdefault would leave the
+    # very array that failed validation in place.
+    _abs = band_info.get("band_cold_logl_max_w")
+    if _abs is None or np.shape(_abs) != (int(nwalkers), int(num_bands)):
+        band_info["band_cold_logl_max_w"] = np.full(
+            (nwalkers, num_bands), -np.inf, dtype=np.float64)
+    # The per-iteration value is pure telemetry -- nothing reads it back,
+    # so it is always installed fresh rather than preserved.
+    band_info["band_cold_logl_w"] = np.full(
+        (nwalkers, num_bands), -np.inf, dtype=np.float64)
+    # Reset COUNTS ride with the window: a release restarts the question,
+    # so the count is per-step like the streak, not all-time like the max.
+    band_info["band_shutoff_reset_w"] = np.zeros(
+        (nwalkers, num_bands), dtype=np.int64)
+    # WITHIN-ITERATION peak, accumulated at the end of every in-model
+    # repeat group and consumed (and reset) once per iteration by the
+    # gate. -inf so the first observe of a cycle always wins.
+    band_info["band_cold_logl_peak_w"] = np.full(
+        (nwalkers, num_bands), -np.inf, dtype=np.float64)
 
 
 def _zero_search_shutoff(band_info: dict, num_bands: int, nwalkers: int,
@@ -566,6 +689,56 @@ def _zero_search_shutoff(band_info: dict, num_bands: int, nwalkers: int,
     band_info["band_rj_shutoff_w"] = np.zeros(
         (nwalkers, num_bands), dtype=bool)
     band_info["band_shutoff_w_step"] = np.full(1, int(step), dtype=np.int64)
+    # The window goes with it. Reopening the valve while keeping a running
+    # best measured under the old configuration is the exact failure
+    # ``_release_search_band_shutoff`` documents: the model is already
+    # fitted, so nothing beats the inherited best and every pair re-freezes
+    # on its first patience window, which reads as "converged" and is not.
+    _zero_search_shutoff_window(band_info, num_bands, nwalkers)
+
+
+def ensure_search_shutoff_window(band_info: dict, num_bands: int,
+                                 nwalkers: int) -> str:
+    """Backfill/validate the shutoff window alongside the valve.
+
+    Independent of the valve's own completeness check so that a store
+    written before 2026-09-27 -- which has the boolean and the step stamp
+    but neither window array -- KEEPS its earned valve and simply starts
+    the window empty. That is the same degradation the in-memory window
+    always had, so this can only improve on it.
+    """
+    present = [f for f in SEARCH_SHUTOFF_WINDOW_FIELDS
+               if band_info.get(f) is not None]
+    _want = (int(nwalkers), int(num_bands))
+    if len(present) != len(SEARCH_SHUTOFF_WINDOW_FIELDS):
+        _zero_search_shutoff_window(band_info, num_bands, nwalkers)
+        return "fresh" if not present else "reset(partial)"
+    for name in SEARCH_SHUTOFF_WINDOW_FIELDS:
+        if tuple(np.shape(band_info[name])) != _want:
+            logger.warning(
+                "stored RJ shutoff window %r has shape %s but this run's "
+                "grid is %s; restarting the window rather than measuring a "
+                "patience count against a grid it was not earned on.",
+                name, tuple(np.shape(band_info[name])), _want)
+            _zero_search_shutoff_window(band_info, num_bands, nwalkers)
+            return "reset(shape)"
+    # Pin the dtypes. The HDF round trip is faithful (neither name is in
+    # ``legacy_dtype_names``, so they keep float64/int64 rather than being
+    # cast to the backend float), but a migrated or hand-built band_info
+    # need not be, and the streak arithmetic is integer.
+    band_info["band_shutoff_best_w"] = np.asarray(
+        band_info["band_shutoff_best_w"], dtype=np.float64)
+    band_info["band_shutoff_streak_w"] = np.asarray(
+        band_info["band_shutoff_streak_w"], dtype=np.int64)
+    band_info["band_cold_logl_max_w"] = np.asarray(
+        band_info["band_cold_logl_max_w"], dtype=np.float64)
+    band_info["band_cold_logl_w"] = np.asarray(
+        band_info["band_cold_logl_w"], dtype=np.float64)
+    band_info["band_shutoff_reset_w"] = np.asarray(
+        band_info["band_shutoff_reset_w"], dtype=np.int64)
+    band_info["band_cold_logl_peak_w"] = np.asarray(
+        band_info["band_cold_logl_peak_w"], dtype=np.float64)
+    return "restored"
 
 
 def ensure_search_shutoff_fields(band_info: dict, num_bands: int,
@@ -631,6 +804,14 @@ def ensure_search_shutoff_fields(band_info: dict, num_bands: int,
         band_info["band_rj_shutoff_w"], dtype=bool)
     band_info["band_shutoff_w_step"] = np.asarray(
         band_info["band_shutoff_w_step"], dtype=np.int64).reshape(-1)[:1]
+    _win = ensure_search_shutoff_window(band_info, num_bands, _nw)
+    if _win != "restored":
+        # The valve survives; only its window restarts. Say which, because
+        # "restored" on the valve with a fresh window means the run has to
+        # re-earn `search_shutoff_conv_iter` iterations before anything NEW
+        # can shut -- worth seeing in the log rather than inferring from a
+        # stalled counter.
+        return f"restored (window {_win})"
     return "restored"
 
 
@@ -1369,8 +1550,11 @@ class GBState(ModuleSubState):
                 # (GB_SEARCH_STAGE_PER_WALKER) + its min-over-walkers mirror
                 "band_stage_w": 2, "band_stage_occ_last_w": 2,
                 "band_stage_streak_w": 2, "band_stage": 1,
-                # the per-(walker, band) RJ shutoff valve
+                # the per-(walker, band) RJ shutoff valve + its window
                 "band_rj_shutoff_w": 2, "band_shutoff_w_step": 1,
+                "band_shutoff_best_w": 2, "band_shutoff_streak_w": 2,
+                "band_cold_logl_max_w": 2, "band_cold_logl_w": 2,
+                "band_shutoff_reset_w": 2, "band_cold_logl_peak_w": 2,
             }
             for _key, _nd in _bare_ndim.items():
                 _arr = bi.get(_key)
@@ -1461,6 +1645,12 @@ class GBState(ModuleSubState):
                 "band_stage_occ_last_w": (_stored_nw, _stored_nb),
                 "band_stage_streak_w": (_stored_nw, _stored_nb),
                 "band_rj_shutoff_w": (_stored_nw, _stored_nb),
+                "band_shutoff_best_w": (_stored_nw, _stored_nb),
+                "band_shutoff_streak_w": (_stored_nw, _stored_nb),
+                "band_cold_logl_max_w": (_stored_nw, _stored_nb),
+                "band_cold_logl_w": (_stored_nw, _stored_nb),
+                "band_shutoff_reset_w": (_stored_nw, _stored_nb),
+                "band_cold_logl_peak_w": (_stored_nw, _stored_nb),
             }
             for _key, _want in _expected_shapes.items():
                 _arr = bi.get(_key)
@@ -1555,6 +1745,9 @@ class GBState(ModuleSubState):
                     "band_stage_w", "band_stage_occ_last_w",
                     "band_stage_streak_w", "band_stage",
                     "band_rj_shutoff_w", "band_shutoff_w_step",
+                    "band_shutoff_best_w", "band_shutoff_streak_w",
+                    "band_cold_logl_max_w", "band_cold_logl_w",
+                    "band_shutoff_reset_w", "band_cold_logl_peak_w",
                 ):
                     bi.pop(_cap_key, None)
                 return _stored_nt

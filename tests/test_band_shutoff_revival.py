@@ -54,9 +54,15 @@ class ResetItersKnobTest(unittest.TestCase):
         else:
             os.environ["GB_RJ_BAND_SHUTOFF_RESET_ITERS"] = self._saved
 
-    def test_default_is_100(self):
+    def test_default_is_10(self):
+        """100 -> 10 (user ruling 2026-09-27).
+
+        The counter is now a periodic CHECK rather than an unconditional
+        revival, and the check is cheap (one noise fingerprint compare),
+        so it runs ten times as often.
+        """
         os.environ.pop("GB_RJ_BAND_SHUTOFF_RESET_ITERS", None)
-        self.assertEqual(GBSpecialBase._band_shutoff_reset_iters(_Stub()), 100)
+        self.assertEqual(GBSpecialBase._band_shutoff_reset_iters(_Stub()), 10)
 
     def test_explicit_value(self):
         os.environ["GB_RJ_BAND_SHUTOFF_RESET_ITERS"] = "37"
@@ -113,6 +119,12 @@ class _MoveStub:
     name = "rj_fstat_search"
     num_bands = 4
     _band_leaf_cap = None
+    # Needed once a test passes a real ``state``:
+    # ``_band_shutoff_band_info`` looks up
+    # ``state.sub_states[self.branch_name]``. A state without that
+    # sub-state still yields None, so the in-memory behaviour the older
+    # tests rely on is unchanged.
+    branch_name = "gb"
 
     def __init__(self, epoch=0):
         self.band_edges = np.array([1e-3, 5e-3, 9e-3, 11e-3, 13e-3])
@@ -129,6 +141,22 @@ class _MoveStub:
     _band_shutoff_band_info = GBSpecialBase._band_shutoff_band_info
     _band_shutoff_restore = GBSpecialBase._band_shutoff_restore
     _band_shutoff_store = GBSpecialBase._band_shutoff_store
+    # noise-gated periodic revival (2026-09-27). The stub drives
+    # ``_update_band_shutoff`` with ``state=None``, so the fingerprint is
+    # unavailable and ``_band_shutoff_noise_changed`` returns True -- the
+    # permissive direction, which reproduces the pre-2026-09-27 "revive on
+    # the counter alone" behaviour these tests were written against.
+    # staticmethod() re-wrap is REQUIRED on these two: reading a
+    # staticmethod off the owning class yields the plain function, and
+    # binding that as a stub class attribute turns it back into an
+    # instance method that then receives `self` as its first argument.
+    _band_shutoff_epoch_revive_on = staticmethod(
+        GBSpecialBase._band_shutoff_epoch_revive_on)
+    _band_shutoff_noise_fingerprint = staticmethod(
+        GBSpecialBase._band_shutoff_noise_fingerprint)
+    _band_shutoff_noise_tol = GBSpecialBase._band_shutoff_noise_tol
+    _band_shutoff_noise_changed = GBSpecialBase._band_shutoff_noise_changed
+    _band_shutoff_noise_observe = GBSpecialBase._band_shutoff_noise_observe
 
 
 def _env(**kw):
@@ -137,6 +165,13 @@ def _env(**kw):
         "GB_RJ_BAND_SHUTOFF_FMIN_MHZ": "10.0",
         "GB_RJ_BAND_SHUTOFF_ITERS": "5",
         "GB_RJ_BAND_SHUTOFF_RESET_ITERS": "0",  # off unless a test asks
+        # The epoch trigger became OPT-IN on 2026-09-27 (it revived the
+        # valve every iteration once the F-stat refit cadence started
+        # firing every iteration, so the shutoff window could never
+        # complete). The tests below that exercise the trigger keep
+        # testing it -- they just have to ask for it now, like production
+        # would.
+        "GB_RJ_BAND_SHUTOFF_EPOCH_REVIVE": "1",
     }
     base.update(kw)
     return mock.patch.dict(os.environ, base)
@@ -319,15 +354,20 @@ class KillSwitchTest(unittest.TestCase):
             self.assertFalse(m._rj_band_shutoff.any())
             self.assertTrue((m._band_occ_streak == 0).all())
 
-    def test_default_is_five(self):
-        """Unset means 5, not disabled."""
+    def test_default_is_two(self):
+        """Unset means 2, not disabled.
+
+        5 -> 2 (user ruling 2026-09-27): the 5 was sized to outlast the
+        progressive leaf-cap ramp, and this schedule has no caps, so two
+        consecutive zero-occupancy iterations settle it.
+        """
         env = {k: v for k, v in os.environ.items()
                if k not in ("GB_RJ_BAND_SHUTOFF_ITERS", "GB_RJ_BAND_SHUTOFF_AFTER")}
         with mock.patch.dict(os.environ, env, clear=True):
             os.environ["GB_RJ_BAND_SHUTOFF_FMIN_MHZ"] = "10.0"
             os.environ["GB_RJ_BAND_SHUTOFF_RESET_ITERS"] = "0"
             m = _MoveStub()
-            _drive(m, 4)
+            _drive(m, 1)
             self.assertFalse(m._rj_band_shutoff.any())
             _drive(m, 1)
             self.assertTrue(m._rj_band_shutoff[3])
@@ -367,10 +407,10 @@ class LegacyKnobNameTest(unittest.TestCase):
             _drive(m, 1)
             self.assertTrue(m._rj_band_shutoff[3])
 
-    def test_garbage_value_falls_back_to_five(self):
+    def test_garbage_value_falls_back_to_the_default(self):
         with self._clean(GB_RJ_BAND_SHUTOFF_ITERS="not-an-int"):
             m = _MoveStub()
-            _drive(m, 4)
+            _drive(m, 1)
             self.assertFalse(m._rj_band_shutoff.any())
             _drive(m, 1)
             self.assertTrue(m._rj_band_shutoff[3])
@@ -964,3 +1004,140 @@ class ReHomedLeafTest(unittest.TestCase):
             m3 = _PersistMoveStub()
             m3._update_band_shutoff(np.array([0, 0, 0, 1], dtype=np.int64), st)
             self.assertFalse(m3._rj_band_shutoff[3])
+
+
+class _NoiseState:
+    """Just enough state for the noise fingerprint: two branch coord arrays.
+
+    Shapes follow the production layout ``(ntemps, nwalkers, nleaves,
+    ndim)``; the fingerprint reads the COLD rung ``[0]``.
+    """
+
+    def __init__(self, psd, galfor=None):
+        self.branches_coords = {"psd": np.asarray(psd, dtype=float)}
+        if galfor is not None:
+            self.branches_coords["galfor"] = np.asarray(galfor, dtype=float)
+
+
+def _psd(scale=1.0):
+    return np.array([[[[1.5e-11 * scale, 3.0e-15 * scale]],
+                      [[1.6e-11 * scale, 3.1e-15 * scale]]]])
+
+
+class NoiseGatedRevivalTest(unittest.TestCase):
+    """The periodic revival only fires when the NOISE has moved.
+
+    USER RULING 2026-09-27: "the bands that have been shutoff should come
+    back every 10 iterations IF THE NOISE IS CHANGING. If the noise is
+    fixed there is no need."
+
+    The physical argument: a band that has held nothing for the whole
+    window can only become worth proposing into again if what counts as
+    detectable there changes, and that is set by the instrument +
+    foreground model.
+
+    Asserted on the NUMBER OF REVIVALS, not on the final shut/open state.
+    With a 2-iteration arm window and a 3-iteration check, a revived band
+    re-arms within two more iterations, so the end-of-loop state says
+    nothing about whether a revival ever happened.
+    """
+
+    def _run(self, states, reset="3", tol=None):
+        """Drive the stub over ``states``; return the revival count."""
+        m = _MoveStub()
+        env = dict(GB_RJ_BAND_SHUTOFF_ITERS="2",
+                   GB_RJ_BAND_SHUTOFF_RESET_ITERS="0",
+                   GB_RJ_BAND_SHUTOFF_EPOCH_REVIVE="0")
+        with _env(**env):
+            _drive(m, 3)
+        self.assertTrue(m._rj_band_shutoff[3], "fixture did not arm")
+
+        n = {"count": 0}
+        real = m._band_shutoff_revive
+
+        def counting(reason):
+            n["count"] += 1
+            return real(reason)
+
+        m._band_shutoff_revive = counting
+        env["GB_RJ_BAND_SHUTOFF_RESET_ITERS"] = reset
+        if tol is not None:
+            env["GB_RJ_BAND_SHUTOFF_NOISE_TOL"] = tol
+        with _env(**env):
+            for st in states:
+                m._update_band_shutoff(np.array([1, 1, 1, 0]), state=st)
+        return n["count"]
+
+    def test_fixed_noise_does_NOT_revive(self):
+        self.assertEqual(self._run([_NoiseState(_psd())] * 12), 0)
+
+    def test_moving_noise_DOES_revive(self):
+        # 1% per iteration, far above the 0.1% default tolerance
+        states = [_NoiseState(_psd(1.0 + 0.01 * i)) for i in range(12)]
+        self.assertGreater(self._run(states), 0)
+
+    def test_drift_below_tolerance_is_treated_as_fixed(self):
+        states = [_NoiseState(_psd(1.0 + 1e-4 * i)) for i in range(12)]
+        self.assertEqual(self._run(states, tol="1e-2"), 0)
+
+    def test_no_noise_branches_revives_the_permissive_direction(self):
+        """Cannot prove the noise is fixed -> behave as before.
+
+        A band wrongly reopened costs proposals; a band wrongly held shut
+        costs sources. When the fingerprint is unavailable the cheaper
+        mistake is to revive.
+        """
+        self.assertGreater(self._run([None] * 12), 0)
+
+    def test_galfor_alone_counts_as_the_noise_moving(self):
+        """The foreground sets detectability at low f just as the
+        instrument does at high f; both belong in the fingerprint."""
+        states = [_NoiseState(_psd(), galfor=np.array([[[[1.0 + 0.05 * i]]]]))
+                  for i in range(12)]
+        self.assertGreater(self._run(states), 0)
+
+    def test_the_check_is_periodic_not_every_iteration(self):
+        """A moving noise still only reopens on the check boundary."""
+        states = [_NoiseState(_psd(1.0 + 0.05 * i)) for i in range(9)]
+        # reset=9 over 9 iterations -> exactly one check, one revival
+        self.assertEqual(self._run(states, reset="9"), 1)
+
+
+class EpochTriggerIsOptInTest(unittest.TestCase):
+    """The F-stat-epoch trigger is OFF unless asked for.
+
+    Measured on 6mo v9 job 650: with the refit cadence firing every
+    iteration this revived the valve every iteration, so the shutoff
+    window could never complete -- 648 bands went off at 06:30, held to
+    13:48, then reopened permanently with "1/100 iters since revive"
+    forever after.
+    """
+
+    def test_a_new_epoch_does_nothing_by_default(self):
+        m = _MoveStub(epoch=0)
+        with _env(GB_RJ_BAND_SHUTOFF_ITERS="2",
+                  GB_RJ_BAND_SHUTOFF_RESET_ITERS="0",
+                  GB_RJ_BAND_SHUTOFF_EPOCH_REVIVE="0"):
+            _drive(m, 3)
+            self.assertTrue(m._rj_band_shutoff[3])
+            m._fstat_epoch = 1
+            self.assertEqual(m._band_shutoff_epoch_sync(), 0)
+            self.assertTrue(
+                m._rj_band_shutoff[3],
+                "a new F-stat epoch revived the valve with the trigger off")
+
+    def test_the_epoch_is_still_tracked_while_the_trigger_is_off(self):
+        """So switching it back on mid-run cannot fire a stale revival."""
+        m = _MoveStub(epoch=0)
+        with _env(GB_RJ_BAND_SHUTOFF_ITERS="2",
+                  GB_RJ_BAND_SHUTOFF_RESET_ITERS="0",
+                  GB_RJ_BAND_SHUTOFF_EPOCH_REVIVE="0"):
+            _drive(m, 3)
+            m._fstat_epoch = 7
+            m._band_shutoff_epoch_sync()
+        self.assertEqual(m.__dict__["_band_shutoff_epoch"], 7)
+        with _env(GB_RJ_BAND_SHUTOFF_ITERS="2",
+                  GB_RJ_BAND_SHUTOFF_RESET_ITERS="0",
+                  GB_RJ_BAND_SHUTOFF_EPOCH_REVIVE="1"):
+            self.assertEqual(m._band_shutoff_epoch_sync(), 0)
+            self.assertTrue(m._rj_band_shutoff[3])

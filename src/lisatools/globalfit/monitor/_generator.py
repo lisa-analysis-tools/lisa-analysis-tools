@@ -553,6 +553,51 @@ gb_alive_last = g["inds/gb"][NIT-1, 0, 0]           # (24, 10000)
 #      it exists because the same generator is pointed at extracts.)
 POOL_ITS_SAMPLES = 30
 POOL_ITS_POSTERIOR = 30
+
+
+def _zoom_its(n_avail):
+    """Trailing stored iterations a "recent history" zoom should cover.
+
+    Every in-pane inset -- cold-chain lnL, its walker spread, the GB leaf
+    count, the two instrument-parameter traces -- plus the full-size
+    ``psd_evolution_zoom`` panel, which is the same idea at panel scale,
+    used to ask for a flat ``min(50, N)``.
+
+    That is not a zoom early in a run. At N = 14 the inset redraws the
+    parent panel's entire x-range on 35% of its area, so the two carry the
+    same curve and the inset costs its host a third of the plot for
+    nothing. Worse, it is exactly when the run is young -- when the last
+    few iterations are the only ones anyone is reading -- that the zoom
+    stops working.
+
+    Scale the window to what exists (user ruling 2026-09-27):
+
+        N < 25  -> 5      N < 50   -> 10
+        N < 100 -> 25     N >= 100 -> 50
+
+    Clamped to ``N`` so a two-row store still returns something drawable;
+    callers keep their own ``>= 3`` floor on whether to draw at all.
+    """
+    n = int(max(n_avail, 0))
+    if n < 25:
+        w = 5
+    elif n < 50:
+        w = 10
+    elif n < 100:
+        w = 25
+    else:
+        w = 50
+    return min(w, n)
+
+
+# Bound ONCE, here, because the panel and its caption are built ~4500 lines
+# apart and the panel sits inside a try/except that may never run. A
+# caption that says "last 50" over a 5-iteration plot is worse than no
+# caption, and that is exactly what a second min(50, ...) at the caption
+# site would produce the moment the two drifted.
+PSD_ZOOM_N = _zoom_its(SUB_NIT)
+PSD_ZOOM_ALT = f"sensitivity evolution (last {PSD_ZOOM_N} iterations)"
+
 EXTRACT_STORE = "_extract" in os.path.basename(h5path)
 _POOL_FLOOR = {}
 
@@ -850,8 +895,10 @@ ax[0].set_title(f"total log-likelihood ({nwalk} walkers)")
 ax[1].plot(it, ll.max(axis=1) - ll.min(axis=1), color=VIOLET, lw=1.5)
 ax[1].set_xlabel("iteration"); ax[1].set_title("walker lnL spread (max - min)")
 
-# In-pane zoom showing last 50 iterations (user request 2026-09-20).
-_n_zoom = min(50, NIT)
+# In-pane zoom over the recent history (user request 2026-09-20; window
+# made adaptive 2026-09-27 -- see _zoom_its). Shared with the GB leaf-count
+# inset further down, which reuses _n_zoom/_it_zoom.
+_n_zoom = _zoom_its(NIT)
 _it_zoom = it[-_n_zoom:]
 _ll_zoom = ll[-_n_zoom:]
 if _n_zoom >= 3:
@@ -1139,8 +1186,8 @@ for j, (name, inj) in enumerate([("Soms_d", SOMS_INJ), ("Sa_a", SA_INJ)]):
     ax[j].axhline(inj, color=RED, lw=1.4, ls=":", label="injected")
     ax[j].set_title(f"psd: {name}"); ax[j].set_xlabel("iteration"); ax[j].legend()
 
-    # Inset: last 50 iterations
-    _last_n = min(50, SUB_NIT)
+    # Inset: the recent-history window (adaptive, see _zoom_its)
+    _last_n = _zoom_its(SUB_NIT)
     if _last_n >= 3:
         from mpl_toolkits.axes_grid1.inset_locator import inset_axes
         ax_in = inset_axes(ax[j], width="40%", height="35%", loc="center")
@@ -1252,8 +1299,10 @@ try:
         "(light -> dark = later)")
     fig_b64(fig, "psd_evolution")
 
-    # Last 50 iterations zoom
-    _last_n = min(50, SUB_NIT)
+    # Recent-history zoom. Same adaptive window as the insets (_zoom_its):
+    # this is the one full-size panel built to the inset's pattern, so a
+    # flat 50 made it a duplicate of the panel above it on a young run.
+    _last_n = PSD_ZOOM_N
     if _last_n >= 3:
         fig, ax = plt.subplots(figsize=(11, 4.2))
         ax.plot(fr, sens_lisasens(*pm), color=CYAN, lw=1.4,
@@ -5933,8 +5982,8 @@ curve. This is the only panel carrying the injected curve.</div></div>
 <div class="panel">{img("psd_evolution", "sensitivity evolution")}
 <div class="caption">The decline watch on the same axes, one curve per stored iteration,
 light to dark with time.</div></div>
-<div class="panel">{img("psd_evolution_zoom", "sensitivity evolution (last 50 iterations)")}
-<div class="caption">Same as above, zoomed to the last 50 stored iterations.</div></div>
+<div class="panel">{img("psd_evolution_zoom", PSD_ZOOM_ALT)}
+<div class="caption">Same as above, zoomed to the last {PSD_ZOOM_N} stored iterations.</div></div>
 <div class="panel">{img("psd_trace")}
 <div class="caption">Instrument-parameter traces per cold walker; dotted red is the
 injected value.</div></div>

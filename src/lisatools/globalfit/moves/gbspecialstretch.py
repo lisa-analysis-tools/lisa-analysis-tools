@@ -1826,6 +1826,195 @@ def _converge_cast_scale(value):
     return v
 
 
+class _ColdBandLnL:
+    """Per-(walker, SUB-BAND) cold-chain lnL record for the shutoff gate.
+
+    A VIEW over six arrays that live in ``band_info`` -- i.e. in the GB
+    SUB-STATE -- and is itself never stored. That split is forced:
+    ``GBState.storage_arrays`` keeps only ``isinstance(dat, np.ndarray)``
+    entries, so an object placed in ``band_info`` would be dropped from
+    the store silently, with no warning, exactly like the ``save_step``
+    skip that lost the whole ``_w`` family in the first place.
+
+    ⚠ NOT HELD BY A MOVE (user ruling 2026-09-27: "it should not be held
+    by a specific move"). The reason is structural, not stylistic: the
+    two PURE in-model moves are built with ``is_rj_prop=False``, so the
+    valve is "requested but NOT live" on them -- and between them they
+    run ~2,800 s of the ~7,000 s iteration, the single largest block of
+    refinement and precisely the part the gate is currently blind to. A
+    tracker owned by an armed RJ move could never observe it. Looked up
+    from the state once per propose and threaded down as a parameter,
+    the way ``converge`` and ``cell_ll_state`` already are.
+
+    TWO CADENCES, deliberately separated:
+
+    * :meth:`observe` -- end of EVERY in-model repeat group, immediately
+      after ``add_sources_to_band_buffer`` puts the picked source back,
+      when the slab is the complete cold-chain residual for those
+      sub-bands. Pure accumulation: one ``maximum`` into a slice, no
+      decisions, no allocation.
+    * :meth:`judge` -- ONCE per full iteration, at the designated
+      updater. The only place gate logic lives.
+
+    WHY THE PEAK EXISTS AT ALL. The gate used to read the statistic once
+    per iteration, at ``rj_fstat_search`` -- move 4 of 6. Everything
+    ``in_model_fstat`` and ``rj_prior_removal`` did afterwards was
+    invisible to the running max, so the reference was permanently one
+    partial cycle stale and ``cur > max + tol`` fired on refinement the
+    max had simply never been shown. The peak spans the whole cycle.
+    """
+
+    __slots__ = ("peak", "value", "max", "streak", "resets", "shut")
+
+    def __init__(self, band_info):
+        self.peak = band_info["band_cold_logl_peak_w"]
+        self.value = band_info["band_cold_logl_w"]
+        self.max = band_info["band_cold_logl_max_w"]
+        self.streak = band_info["band_shutoff_streak_w"]
+        self.resets = band_info["band_shutoff_reset_w"]
+        self.shut = band_info.get("band_rj_shutoff_w")
+
+    @property
+    def shape(self):
+        return self.peak.shape
+
+    def observe(self, w_idx, b_idx, lls) -> int:
+        """Fold one repeat group's cold band lnLs into the peak.
+
+        ``w_idx`` / ``b_idx`` / ``lls`` are parallel 1-D arrays over the
+        block's COLD cells. Returns how many entries were folded, for the
+        diagnostic line.
+
+        ``np.maximum.at`` rather than fancy-index assignment: a block can
+        legitimately carry two rows for one (walker, band) after a
+        vertical swap relabels rungs, and plain ``peak[w, b] = ...`` would
+        keep whichever landed last instead of the larger.
+        """
+        w_idx = np.asarray(_to_numpy(w_idx), dtype=np.int64).reshape(-1)
+        b_idx = np.asarray(_to_numpy(b_idx), dtype=np.int64).reshape(-1)
+        lls = np.asarray(_to_numpy(lls), dtype=np.float64).reshape(-1)
+        if w_idx.size == 0:
+            return 0
+        good = np.isfinite(lls)
+        if not good.any():
+            return 0
+        np.maximum.at(self.peak, (w_idx[good], b_idx[good]), lls[good])
+        return int(good.sum())
+
+    def judge(self, tol, conv_iter, occ, require_occ=True):
+        """One iteration's verdict. Returns the newly-converged mask.
+
+        Consumes the peak: ``cur`` is the best this (walker, sub-band)
+        reached anywhere in the cycle, compared like-for-like against the
+        best it has EVER reached. The peak is reset afterwards so the next
+        cycle starts clean; ``max`` is never reset.
+
+        A cell the cycle never observed keeps ``-inf`` and therefore
+        cannot improve -- its streak advances, which is correct: nothing
+        refined it, so it did not get better.
+        """
+        cur = np.where(np.isfinite(self.peak), self.peak, -np.inf)
+        self.value[:] = cur
+        improved = cur > (self.max + float(tol))
+        np.maximum(self.max, cur, out=self.max)
+        # Count the RESET, not the improvement: a pair already at streak 0
+        # has no streak to break, and counting that would make a freshly
+        # occupied band look like a chronic resetter.
+        self.resets[improved & (self.streak > 0)] += 1
+        self.streak[improved] = 0
+        self.streak[~improved] += 1
+        converged = self.streak >= int(conv_iter)
+        if self.shut is not None:
+            converged = converged & ~self.shut
+        if require_occ:
+            converged = converged & (np.asarray(occ) > 0)
+        self.peak[:] = -np.inf
+        return converged
+
+    def release(self):
+        """Recipe-step release: clear the WINDOW, keep the all-time max.
+
+        ``max`` is deliberately untouched -- it outlives steps, restarts
+        and saves by design. Clearing it "for symmetry" would restore the
+        resetting-reference behaviour this class exists to remove.
+        """
+        self.peak[:] = -np.inf
+        self.streak[:] = 0
+        self.resets[:] = 0
+
+
+def cold_band_lnl_from_band_info(bi, shape):
+    """Ensure the six arrays exist in ``bi`` at ``shape``, return the view.
+
+    The ALLOCATING twin of :func:`cold_band_lnl`. Writes into ``band_info``
+    rather than into locals, because a local array works perfectly for the
+    rest of the process and is then silently dropped at the save -- the
+    exact failure this whole family exists to remove.
+
+    ``band_cold_logl_max_w`` is preserved when it is already the right
+    shape: it is the ALL-TIME max and must survive a window reseat.
+    """
+    if not isinstance(bi, dict):
+        return None
+    shape = tuple(int(x) for x in shape)
+    _spec = (("band_cold_logl_peak_w", np.float64, -np.inf, False),
+             ("band_cold_logl_w", np.float64, -np.inf, False),
+             ("band_cold_logl_max_w", np.float64, -np.inf, True),
+             ("band_shutoff_streak_w", np.int64, 0, False),
+             ("band_shutoff_reset_w", np.int64, 0, False))
+    for name, dt, fill, keep in _spec:
+        cur = bi.get(name)
+        if (isinstance(cur, np.ndarray) and tuple(cur.shape) == shape
+                and (keep or True)):
+            continue
+        bi[name] = np.full(shape, fill, dtype=dt)
+    return _ColdBandLnL(bi)
+
+
+def cold_band_lnl(state, branch_name="gb"):
+    """The :class:`_ColdBandLnL` view for ``state``, or None.
+
+    Built fresh on every call -- it is six attribute bindings, cheaper
+    than any cache would be to invalidate, and caching it on a move is
+    the exact thing the ruling forbids.
+    """
+    try:
+        bi = state.sub_states[branch_name].band_info
+    except (AttributeError, KeyError, TypeError):
+        return None
+    if not isinstance(bi, dict):
+        return None
+    for _k in ("band_cold_logl_peak_w", "band_cold_logl_w",
+               "band_cold_logl_max_w", "band_shutoff_streak_w",
+               "band_shutoff_reset_w"):
+        if not isinstance(bi.get(_k), np.ndarray):
+            return None
+    return _ColdBandLnL(bi)
+
+
+def _scale_dll_with_window(branch_name=None) -> bool:
+    """Should the SURVIVOR threshold be rescaled with its window?
+
+    Default FALSE (user ruling 2026-09-27: "keep this at 4"). The
+    rescaling held ``thresh/window`` constant, which left the survivor
+    class judged at 0.80 lnL while the newborn class and the per-(walker,
+    band) valve both used D/2 = 4.0. Three gates asking the same question
+    with two different thresholds is what let a band full of converged
+    rows keep clearing the valve's tolerance.
+
+    ``{BRANCH}_INMODEL_CONVERGE_DLL_SCALE_WITH_WINDOW=1`` (or the
+    unprefixed name) restores the old behaviour.
+    """
+    for _n in ((f"{branch_name.upper()}_INMODEL_CONVERGE_DLL_SCALE_WITH_WINDOW",)
+               if branch_name else ()) + (
+                   "GB_INMODEL_CONVERGE_DLL_SCALE_WITH_WINDOW",
+                   "INMODEL_CONVERGE_DLL_SCALE_WITH_WINDOW"):
+        v = os.environ.get(_n)
+        if v is not None:
+            return v.strip() not in ("0", "", "false", "False", "no", "off")
+    return False
+
+
 def _converge_cast_window(value):
     value = int(value)
     if value < 1:
@@ -4232,12 +4421,21 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             )
         #: live reference into ``band_info['band_rj_shutoff_w']``, or None.
         self._rj_band_shutoff_w = None
-        #: IN-MEMORY within-step lnL plateau state. Deliberately not
-        #: persisted: a restart re-earns the window, which leaves bands
-        #: OPEN longer -- the permissive direction, and the one that cannot
-        #: lose sources.
-        self._shutoff_best = None
-        self._shutoff_streak = None
+        #: ⚠ NO ARRAYS ARE HELD HERE (user ruling 2026-09-27: the
+        #: tracker "should not be held by a specific move"). The
+        #: cold-band-lnL record lives in the GB SUB-STATE's ``band_info``
+        #: and is reached through :func:`cold_band_lnl`; this move keeps
+        #: only a per-propose VIEW (``_cold_lnl_view``, set in propose and
+        #: meaningless outside it) and the dict handle below.
+        #:
+        #: The reason is structural: the two PURE in-model moves have the
+        #: valve disarmed (``is_rj_prop=False``) yet run ~2,800 s of the
+        #: iteration's refinement, so a move-owned tracker could never see
+        #: the largest part of what it is supposed to measure.
+        self._cold_lnl_view = None
+        #: WHICH band_info dict the record lives in -- a handle, not the
+        #: data. Class-level default below covers moves that never bind.
+        self._shutoff_band_info = None
         self._stage_band_lls = None
         self._stage_band_lls_stamp = None
         self._shutoff_w_warned_lls = False
@@ -9939,31 +10137,159 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         return True
 
     def _band_shutoff_reset_iters(self) -> int:
-        """Iterations with no F-stat update after which the shut-off set
-        is revived anyway (``GB_RJ_BAND_SHUTOFF_RESET_ITERS``, default
-        100; ``0`` disables this trigger).
+        """Iterations between revival CHECKS
+        (``GB_RJ_BAND_SHUTOFF_RESET_ITERS``, default 10; ``0`` disables).
 
-        USER RULING 2026-08-28. The epoch trigger
-        (:meth:`_band_shutoff_epoch_sync`) covers the case where a refit
-        hands the move a genuinely new proposal grid. But the noise /
-        foreground model keeps evolving BETWEEN refits, so a long enough
-        stretch with no refit at all should re-open the question on its
-        own rather than leaving a band OFF for the rest of the process.
+        USER RULING 2026-09-27, superseding the 2026-08-28 pair of
+        triggers. A shut-off band is reconsidered every N iterations, and
+        then ONLY IF THE NOISE HAS MOVED -- see
+        :meth:`_band_shutoff_noise_changed`. The reasoning is that the one
+        thing which can make a band that has held nothing for N iterations
+        suddenly worth proposing into again is a change in what
+        "detectable" means there, and that is the noise + foreground
+        model. With the noise fixed, reviving buys nothing and costs a
+        full re-earn of the shutoff window across every high-frequency
+        band.
+
+        WHAT THIS REPLACES, and why. The old policy had TWO triggers: this
+        counter (default 100) and a revive on every new F-stat epoch
+        (:meth:`_band_shutoff_epoch_sync`). Measured on 6mo v9 job 650
+        (2026-09-27): once the F-stat refit cadence started firing every
+        iteration, the epoch trigger revived the valve every iteration, so
+        the 5-iteration streak could never complete again -- 648 bands
+        went births-OFF at 06:30, held to 13:48, and were then reopened
+        permanently, with the status line reading "1/100 iters since
+        revive" forever after. A valve that resets faster than it can arm
+        is not a valve. The epoch trigger is now OFF by default
+        (``GB_RJ_BAND_SHUTOFF_EPOCH_REVIVE=1`` restores it).
         """
         try:
-            n = int(os.environ.get("GB_RJ_BAND_SHUTOFF_RESET_ITERS", "100"))
+            n = int(os.environ.get("GB_RJ_BAND_SHUTOFF_RESET_ITERS", "10"))
         except ValueError:
-            return 100
+            return 10
         return max(0, n)
+
+    @staticmethod
+    def _band_shutoff_epoch_revive_on() -> bool:
+        """Is the legacy "revive on every new F-stat epoch" trigger armed?
+
+        Default OFF (user ruling 2026-09-27). See
+        :meth:`_band_shutoff_reset_iters` for the measurement that
+        retired it.
+        """
+        return os.environ.get(
+            "GB_RJ_BAND_SHUTOFF_EPOCH_REVIVE", "0") not in ("0", "", "no")
+
+    def _band_shutoff_noise_tol(self) -> float:
+        """Fractional noise change that counts as "the noise is moving".
+
+        ``GB_RJ_BAND_SHUTOFF_NOISE_TOL``, default 1e-3 (0.1%). Compared
+        against the largest RELATIVE move of any cold-chain instrument or
+        foreground parameter since the last revival check.
+        """
+        try:
+            return abs(float(os.environ.get(
+                "GB_RJ_BAND_SHUTOFF_NOISE_TOL", "1e-3")))
+        except ValueError:
+            return 1e-3
+
+    @staticmethod
+    def _band_shutoff_noise_fingerprint(state):
+        """Cold-chain instrument + foreground parameters as one flat vector.
+
+        ``None`` when the state carries neither branch -- a GB-only
+        harness or a unit test -- in which case the caller must not claim
+        the noise is fixed, because it has no way to know.
+
+        Reads the COLD row of every walker (``coords[0]``), so a change in
+        any walker's noise counts. The band-shutoff question is
+        "could a source here be detectable now", and that is answered
+        against whichever noise realisation the walker carries.
+        """
+        parts = []
+        for name in ("psd", "galfor"):
+            try:
+                arr = state.branches_coords[name]
+            except (AttributeError, KeyError, TypeError):
+                continue
+            if arr is None:
+                continue
+            a = np.asarray(_to_numpy(arr), dtype=float)
+            if a.size:
+                parts.append(a[0].reshape(-1))     # cold rung, all walkers
+        if not parts:
+            return None
+        return np.concatenate(parts)
+
+    def _band_shutoff_noise_changed(self, state):
+        """``(changed, max_rel)`` against the last recorded fingerprint.
+
+        The reference is refreshed on every CHECK, not only on every
+        revival: the question this answers is "has the noise moved since
+        the last time we asked", and asking it against a reference that
+        only advances on revival would let a slow drift accumulate
+        silently until it crossed the tolerance in one step.
+
+        ``changed`` is True when the fingerprint is unavailable or its
+        shape moved (both mean "cannot prove the noise is fixed", and the
+        permissive direction is to revive -- a band wrongly reopened costs
+        proposals, a band wrongly held shut costs sources).
+        """
+        cur = self._band_shutoff_noise_fingerprint(state)
+        d = self.__dict__
+        ref = d.get("_band_shutoff_noise_ref")
+        if cur is None:
+            return True, float("nan")
+        d["_band_shutoff_noise_ref"] = cur
+        if ref is None or np.shape(ref) != np.shape(cur):
+            # No usable baseline. A shape change means the ladder or the
+            # branch set moved, which we cannot interpret -- revive, the
+            # permissive direction. A genuinely absent baseline should not
+            # happen, because :meth:`_band_shutoff_noise_observe` seeds it
+            # on the first iteration the valve runs; if it somehow did,
+            # treating it as "no change" would suppress the first real
+            # revival for a whole period.
+            return ref is not None, float("nan")
+        denom = np.maximum(np.abs(ref), 1e-300)
+        rel = float(np.max(np.abs(cur - ref) / denom))
+        return rel > self._band_shutoff_noise_tol(), rel
+
+    def _band_shutoff_noise_observe(self, state) -> None:
+        """Seed the noise baseline on the first iteration, then leave it.
+
+        Called EVERY iteration; does nothing once a baseline exists. The
+        baseline then advances only at a revival CHECK, so each check
+        compares the noise now against the noise at the previous check --
+        a full period of drift, which is the quantity the policy is about.
+
+        Seeding here rather than at the first check is what stops the
+        first check of a process being a guaranteed no-op: without it the
+        valve would be unable to revive for its first
+        ``GB_RJ_BAND_SHUTOFF_RESET_ITERS`` iterations no matter how fast
+        the noise was moving.
+        """
+        if self.__dict__.get("_band_shutoff_noise_ref") is None:
+            fp = self._band_shutoff_noise_fingerprint(state)
+            if fp is not None:
+                self.__dict__["_band_shutoff_noise_ref"] = fp
 
     def _band_shutoff_iters(self) -> int:
         """Consecutive ZERO-occupancy iterations required to shut a band off.
 
-        ``GB_RJ_BAND_SHUTOFF_ITERS`` (default 5). It is a COUNT, not an
+        ``GB_RJ_BAND_SHUTOFF_ITERS`` (default 2). It is a COUNT, not an
         absolute iteration index: the band shuts off ON the Nth consecutive
         iteration at zero cold-chain occupancy, and any occupancy >= 1
         resets the count to zero. ``0`` or any negative value DISABLES the
         valve entirely (and releases anything already shut off).
+
+        DEFAULT 5 -> 2 (user ruling 2026-09-27). The 5 was sized when the
+        progressive leaf CAP was the thing being waited on: a band could
+        be empty simply because its cap had not yet ramped, so the window
+        had to outlast the ramp. There are no caps in this schedule, so an
+        empty band is empty on the evidence, and two consecutive
+        zero-occupancy iterations are enough to say so. Shorter also
+        matters because the window is now competing with a revival check
+        every 10 iterations rather than every 100.
 
         Legacy name ``GB_RJ_BAND_SHUTOFF_AFTER`` is still honoured, with a
         one-time warning. A hard rename would be silently destructive here:
@@ -9984,12 +10310,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     "(value %s); please rename it in the submit script.",
                     self.name, v)
         try:
-            return int(v) if v is not None else 5
+            return int(v) if v is not None else 2
         except ValueError:
             logger.warning(
                 "%s: GB_RJ_BAND_SHUTOFF_ITERS=%r is not an integer; "
-                "using the default 5.", self.name, v)
-            return 5
+                "using the default 2.", self.name, v)
+            return 2
 
     def _band_shutoff_revive(self, reason: str) -> int:
         """Clear the shut-off set + occupancy streaks -> #bands revived.
@@ -10083,9 +10409,23 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         another adoption site, the once-per-iteration poll in
         :meth:`_update_band_shutoff`, or a re-``setup`` that re-adopts an
         unchanged epoch -- compares equal and returns 0.
+
+        ⚠ OFF BY DEFAULT SINCE 2026-09-27. The gate lives HERE rather than
+        at the three call sites so a future fourth site cannot reinstate
+        the trigger by accident. With the F-stat refit firing every
+        iteration this revived the valve every iteration and the shutoff
+        window could never complete -- see
+        :meth:`_band_shutoff_reset_iters` for the measurement. The epoch
+        still advances (the bookkeeping below is unconditional) so that
+        turning the trigger back on mid-run cannot fire a spurious
+        revival for an epoch that was adopted while it was off.
         """
         d = self.__dict__
         epoch = d.get("_fstat_epoch")
+        if not self._band_shutoff_epoch_revive_on():
+            d["_band_shutoff_epoch"] = epoch
+            d.setdefault("_band_shutoff_since_revive", 0)
+            return 0
         if "_band_shutoff_epoch" not in d:
             # First observation on this move. Nothing can have been shut
             # off under an EARLIER epoch, so adopt silently -- reviving
@@ -10257,12 +10597,40 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         _d = self.__dict__
         _d["_band_shutoff_since_revive"] = (
             _d.get("_band_shutoff_since_revive", 0) + 1)
-        self._band_shutoff_epoch_sync()
+        self._band_shutoff_epoch_sync()      # OFF by default; see the method
+        self._band_shutoff_noise_observe(state)
         _reset_iters = self._band_shutoff_reset_iters()
         if _reset_iters and _d["_band_shutoff_since_revive"] >= _reset_iters:
-            self._band_shutoff_revive(
-                f"{_d['_band_shutoff_since_revive']} iterations with no "
-                "F-stat update")
+            # THE CHECK IS PERIODIC; THE REVIVAL IS CONDITIONAL (user
+            # ruling 2026-09-27). Every _reset_iters iterations we ask
+            # whether anything could have changed the answer, and the only
+            # thing that can is the noise + foreground model: it sets what
+            # "detectable" means in a band that has held nothing. With the
+            # noise fixed there is nothing to reconsider, so the counter
+            # simply restarts and the shut-off set stands.
+            _changed, _rel = self._band_shutoff_noise_changed(state)
+            if _changed:
+                self._band_shutoff_revive(
+                    f"{_d['_band_shutoff_since_revive']} iterations and the "
+                    f"noise model moved "
+                    + (f"by {100.0 * _rel:.3g}% (> "
+                       f"{100.0 * self._band_shutoff_noise_tol():.3g}%)"
+                       if _rel == _rel else "(fingerprint unavailable)"))
+            else:
+                _d["_band_shutoff_since_revive"] = 0
+                if not _d.get("_band_shutoff_noise_hold_logged"):
+                    _d["_band_shutoff_noise_hold_logged"] = True
+                    logger.info(
+                        "[GB_BAND_SHUTOFF %s] revival check at %d "
+                        "iterations: the noise model has moved by %.3g%% "
+                        "(tolerance %.3g%%), so the shut-off set STANDS. "
+                        "A band that has held nothing can only become "
+                        "worth proposing into again if what counts as "
+                        "detectable there changes, and that is the noise. "
+                        "Logged once per process; the check repeats every "
+                        "%d iterations.", self.name, _reset_iters,
+                        100.0 * _rel, 100.0 * self._band_shutoff_noise_tol(),
+                        _reset_iters)
         fmin_mhz = float(os.environ.get("GB_RJ_BAND_SHUTOFF_FMIN_MHZ", "10.0"))
         # Band SHUTOFF stays a per-BAND rule (user design 2026-08-15: only
         # the caps move to the cell grid). It asks "could this band hold a
@@ -15536,8 +15904,43 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # arbitrary destination -- a half-applied relabel that
         # GB_INDEX_ASSERTS (off in production) would have caught and the
         # block-end special_index_check can pass anyway.
-        _src = xp.concatenate([spec_h, spec_c])
-        if int(xp.unique(_src).shape[0]) != int(_src.shape[0]):
+        # O(n) SCATTER, NOT A SORT (2026-09-27). This used to be
+        # ``int(xp.unique(_src).shape[0]) != int(_src.shape[0])``: an
+        # O(n log n) device sort plus TWO device->host syncs, executed
+        # unconditionally on every accepted sweep, every repeat, every
+        # block -- with the GPUs measured at 45-50% utilisation and 120 W,
+        # stalls of this kind are what the iteration is actually made of.
+        #
+        # SAME PREDICATE, exactly. A cell is identified by its
+        # ``(temperature, walker, band)`` triple and ``spec`` is a pure
+        # function of that triple, so the source set has a duplicate iff
+        # the triples do. Scattering True into a flat key space and
+        # counting the marks gives the distinct count directly:
+        # duplicates collapse on write, so ``seen.sum()`` equals the
+        # number of entries iff every entry was distinct.
+        #
+        # The key space is ``ntemps * nwalkers * num_bands`` -- 118,272
+        # bools on the 6mo grid, allocated per call and trivially cheap
+        # next to the 5.5 M-row sorter this sweep already walks.
+        #
+        # STILL ONE SYNC, AND STILL BEFORE THE RELABEL. The raise has to
+        # happen before ``exchange_cell_labels_batch`` or the
+        # half-applied relabel this guard exists to prevent has already
+        # landed, so the check cannot be deferred to a batched end-of-
+        # block flush. One sync instead of two, and no sort.
+        # ``nwalkers`` is taken from the SORTER, not from the move: it is
+        # the value ``pack_special_index`` itself uses, and under the
+        # walker-block layout the move's own count can differ. Same
+        # source, same map, provably same predicate.
+        _nt_k = int(self.ntemps)
+        _nw_k = int(band_sorter.nwalkers)
+        _nb_k = int(self.num_bands)
+        _key = ((xp.concatenate([t_h, t_c]).astype(xp.int64) * _nw_k
+                 + xp.concatenate([w_hc, w_hc]).astype(xp.int64)) * _nb_k
+                + xp.concatenate([b_hc, b_hc]).astype(xp.int64))
+        _seen = xp.zeros(_nt_k * _nw_k * _nb_k, dtype=xp.bool_)
+        _seen[_key] = True
+        if int(_seen.sum()) != int(_key.shape[0]):
             raise RuntimeError(
                 f"{self.name}: all-rung vertical sweep produced a duplicate "
                 "source cell; parity selection or the carrier table is "
@@ -16449,8 +16852,40 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # The gate line: how many of the COLDEST rungs get a vote on when
         # the block may stop. ceil, so a fraction can never round to zero
         # rungs and silently disarm the whole test.
-        _n_gate = max(1, int(np.ceil(
-            int(self.ntemps) * float(self.inmodel_converge_gate_frac))))
+        # ABSOLUTE RUNG COUNT WINS over the fraction when given (user
+        # ruling 2026-09-27: "it should only be the cold-chain that
+        # matters"). ``GB_INMODEL_CONVERGE_GATE_RUNGS=1`` makes T0 the
+        # only rung with a vote on when a column may leave the block.
+        #
+        # Why not just set the fraction to 1/24: the EXACT ratio does
+        # give one rung (24 * (1/24) is exactly 1.0), but a launcher
+        # exports a typed decimal and the answer flips on the fourth
+        # place -- ceil(24 * 0.04) is 1, ceil(24 * 0.0417) is 2. An
+        # absolute count says what it means.
+        #
+        # ⚠ THIS IS A COST KNOB, NOT A STAGE-END KNOB. It governs LEVEL 2
+        # (column retirement inside an in-model block). Levels 3-5 -- the
+        # per-(walker, band) lnL valve, the static per-band valve and the
+        # stage stopping function -- already read the COLD census only
+        # (``band_counts[0]`` / ``occ_max``), so no hot rung has ever had
+        # a vote there. Shortening blocks does feed the stage
+        # INDIRECTLY: less refinement per iteration means a band's lnL
+        # plateaus sooner, which is what the level-3 streak measures.
+        _gate_rungs = os.environ.get(
+            f"{(self.branch_name or 'GB').upper()}"
+            "_INMODEL_CONVERGE_GATE_RUNGS",
+            os.environ.get("GB_INMODEL_CONVERGE_GATE_RUNGS", ""),
+        ).strip()
+        if _gate_rungs:
+            try:
+                _n_gate = max(1, min(int(self.ntemps), int(_gate_rungs)))
+            except ValueError:
+                _n_gate = max(1, int(np.ceil(
+                    int(self.ntemps)
+                    * float(self.inmodel_converge_gate_frac))))
+        else:
+            _n_gate = max(1, int(np.ceil(
+                int(self.ntemps) * float(self.inmodel_converge_gate_frac))))
         # ---- PER-CLASS WINDOW (user ruling 2026-09-25, off job 628) ------
         # The window is a FLOOR on block length: a row cannot converge
         # before ``seen >= window``, so every block runs at least that many
@@ -16479,7 +16914,37 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             _win_s = int(getattr(self, "inmodel_converge_iters_survivor", 0)
                          or _win)
             if _win_s != _win:
-                _thr = _thr * (_win_s / max(_win, 1))    # hold the RATE
+                # ⚠ THE RESCALING IS OFF BY DEFAULT (user ruling
+                # 2026-09-27: "keep this at 4"). Set
+                # {BRANCH}_INMODEL_CONVERGE_DLL_SCALE_WITH_WINDOW=1 to
+                # restore the 2026-09-25 rate-preserving behaviour.
+                #
+                # WHY IT WENT. The rescaling (thresh *= win_s / win) held
+                # thresh/window constant, which made the survivor bar 0.80
+                # against the newborn's and the BAND valve's 4.0. Three
+                # gates that all ask "has the running max stopped
+                # improving by more than X" then used two different X, and
+                # the band valve's X was five times the one the rows were
+                # judged on -- so a band could hold nothing but converged
+                # rows and still clear the band valve's tolerance every
+                # iteration. Measured on 6mo v9 job 650: 17.5% of blocks
+                # that passed the in-model test delivered a median row
+                # gain above 4.0.
+                #
+                # D/2 = 4.0 is the physical unit -- the lnL a genuine new
+                # D-parameter source must buy, and the same threshold the
+                # leaf cap uses. Every gate now uses it, and only the
+                # PATIENCE differs, matched to each gate's clock (50
+                # repeats for a survivor row, 250 for a newborn, 3
+                # iterations for the band valve).
+                #
+                # The consequence is deliberate and is a LOOSENING: at a
+                # 50-repeat window the survivor bar goes 0.80 -> 4.0, so
+                # far more rows retire at the floor. Survivors are ~96% of
+                # converging in-model work, so this is also the largest
+                # single cost lever in the move.
+                if _scale_dll_with_window(self.branch_name):
+                    _thr = _thr * (_win_s / max(_win, 1))
                 _win = _win_s
         return _InModelConvergeState(
             window=_win,
@@ -16494,7 +16959,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     def _run_in_model_repeats(self, model, band_sorter, buffer_obj, band_temps,
                               picked, ll_change_log, prop_counts, acc_counts,
                               num_repeats=None, cell_ll_state=None,
-                              scheduler=None, converge=None):
+                              scheduler=None, converge=None, cold_lnl=None):
         """``num_repeats`` in-model rounds on the picked live sources.
 
         The picked source is first taken OUT of its cell residual, so every
@@ -18068,6 +18533,49 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             seq["ll_ref_final"] = float(_to_numpy(ll_ref)[seq["idx"]])
         with _tspan(tm, "inmodel_addback"):
             buffer_obj.add_sources_to_band_buffer(curr, slots, N_vals, leaf_inds=l_i)
+
+        # ---- COLD-CHAIN BAND lnL, from the buffer, now that it is whole -
+        # USER RULING 2026-09-27: "track it at the end of every in-model
+        # repeat group. It adds back to the residual to form the whole
+        # cold chain. Calculate that with the sub-band buffer specifically
+        # for the cold chains ... that does represent that full buffer at
+        # that time."
+        #
+        # THE POSITION IS THE POINT. One line earlier the picked source is
+        # still OUT of the slab, so the reading would be low by that
+        # source's entire contribution. Here the slab is the complete
+        # cold-chain residual for these sub-bands.
+        #
+        # ``band_likelihoods(source_only=True)`` is -1/2 <r|r> per cell --
+        # the SAME unit as the gate's ``_window_residual_lls``, and exact
+        # (no sig-het anywhere in it). ``slots=`` restricts it to the cold
+        # rows; per the method's own docstring "the subset only removes
+        # work", so this costs a per-row reduction over a few dozen
+        # resident slots, not a global pass.
+        #
+        # ``t_i`` is read AFTER the repeats on purpose: a vertical swap
+        # rewrites it, so this asks which rows are cold NOW, not which
+        # were cold when the block opened.
+        _cold_lnl = (cold_lnl if cold_lnl is not None
+                     else getattr(self, "_cold_lnl_view", None))
+        if _cold_lnl is not None:
+            with _tspan(tm, "inmodel_cold_band_ll"):
+                try:
+                    _cold = _to_numpy(t_i) == 0
+                    if bool(np.any(_cold)):
+                        _cs = slots[_cold]
+                        _lls = buffer_obj.band_likelihoods(
+                            source_only=True, slots=_cs)
+                        _cold_lnl.observe(_to_numpy(w_i)[_cold],
+                                          _to_numpy(b_i)[_cold], _lls)
+                except Exception as _e:   # never break a propose on telemetry
+                    if not getattr(self, "_cold_lnl_warned", False):
+                        self._cold_lnl_warned = True
+                        logger.warning(
+                            "[GB_STAGE %s] cold-chain band lnL tracking is "
+                            "inert (%r); the shutoff gate will fall back to "
+                            "its single per-iteration sample.",
+                            self.name, _e)
         if seq is not None:
             seq["snaps"]["after_addback"] = self._debug_slab_snapshot(
                 buffer_obj, seq["slot"])
@@ -20539,9 +21047,27 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         would re-freeze on its first patience window, which looks exactly
         like "converged" and is not. Pinned by a two-consecutive-steps test
         in ``tests/test_gb_search_stage_schedule``.
+
+        ⚠ CLEARED IN PLACE, not rebound to ``None`` (2026-09-27). The
+        window arrays are now live references into ``band_info``, so
+        dropping the reference here would leave the PERSISTED arrays
+        holding the old step's best -- and the next bind would pick them
+        straight back up. The release has to be visible to the saver, which
+        means writing through it.
         """
-        self._shutoff_best = None
-        self._shutoff_streak = None
+        _v = cold_band_lnl_from_band_info(
+            getattr(self, "_shutoff_band_info", None),
+            np.shape(self._rj_band_shutoff_w)
+            if self._rj_band_shutoff_w is not None else (0, 0))
+        if _v is not None:
+            _v.release()
+        # ⚠ ``band_cold_logl_max_w`` IS DELIBERATELY NOT TOUCHED HERE (and
+        # ``release()`` does not touch it either). It is the
+        # all-time cold-chain maximum per (walker, band) and it outlives
+        # recipe steps, restarts and saves by design (user ruling
+        # 2026-09-27). Clearing it "for symmetry" with the two above would
+        # silently restore the resetting-reference behaviour this whole
+        # change exists to remove.
         self._shutoff_w_pending = None
         shut = self._rj_band_shutoff_w
         if shut is None:
@@ -20552,6 +21078,32 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             logger.info(
                 "[GB_STAGE %s] per-walker RJ valve RELEASED (%s): %d "
                 "(walker, band) pairs reopened.", self.name, why, n_was)
+
+    #: Class-level defaults: a move that never reached ``_bind_stage_tables``
+    #: (a hand-built unit-test double, an exotic harness) must still answer
+    #: these without an AttributeError, the same way ``_deferred_labels``
+    #: does on the sorter.
+    _shutoff_band_info = None
+    _cold_lnl_view = None
+
+    def _bind_shutoff_window(self, bi, shape) -> None:
+        """Record the ``band_info`` handle and ensure its arrays exist.
+
+        NOTHING IS CACHED ON THE MOVE (user ruling 2026-09-27). The arrays
+        belong to the GB sub-state; this only remembers WHICH dict they
+        live in, so ``_release_search_band_shutoff`` can find them, and
+        makes sure they are present and correctly shaped.
+
+        Allocation goes through :func:`cold_band_lnl_from_band_info`,
+        which writes into ``band_info`` rather than into locals -- a local
+        array works perfectly for the rest of the process and is then
+        silently dropped at the save, which is the failure this whole
+        family exists to remove. It preserves ``band_cold_logl_max_w``
+        when the shape already matches, because that one is the ALL-TIME
+        max and must survive a window reseat.
+        """
+        self._shutoff_band_info = bi
+        cold_band_lnl_from_band_info(bi, shape)
 
     def _update_search_band_shutoff(self, model, new_state,
                                     band_counts) -> None:
@@ -20591,9 +21143,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         here rather than replayed stale; if it cannot be obtained at all
         the valve does nothing, which is the permissive direction.
 
-        The running best and the streak are IN-MEMORY and per-step. A
-        restart re-earns the whole window, which leaves bands open longer
-        -- the direction that cannot lose a source.
+        The running best and the streak are PER-STEP and, since
+        2026-09-27, PERSISTED: they live in
+        ``band_info['band_shutoff_best_w'] / ['band_shutoff_streak_w']``
+        and ride the saver's ordinary band-array channel. A restart now
+        resumes the window instead of re-earning it.
+
+        That reverses the original ruling, and deliberately. Re-earning is
+        the permissive direction and cannot lose a source, but it also made
+        the valve unable to close at all on jobs shorter than
+        ``search_shutoff_conv_iter + 1`` iterations -- which, on the 6mo
+        run's ~1.8 h iteration, is every job under about seven hours. The
+        step stamp still releases the whole window whenever the recipe step
+        changes, so nothing here can outlive the configuration it was
+        measured under.
         """
         if not self._search_shutoff_per_walker:
             return
@@ -20613,22 +21176,97 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 f"row by row, so this would freeze a walker's band on "
                 f"another walker's evidence."
             )
-        if self._shutoff_best is None or self._shutoff_best.shape != shut.shape:
-            self._shutoff_best = np.full(shut.shape, -np.inf)
-            self._shutoff_streak = np.zeros(shut.shape, dtype=np.int64)
         tol = self._shutoff_ll_tol()
-        cur = np.where(np.isnan(lls), -np.inf, lls)
-        improved = cur > (self._shutoff_best + tol)
-        np.maximum(self._shutoff_best, cur, out=self._shutoff_best)
-        self._shutoff_streak[improved] = 0
-        self._shutoff_streak[~improved] += 1
-        converged = (
-            (self._shutoff_streak >= self.search_shutoff_conv_iter) & ~shut
-        )
-        if self._shutoff_require_occ():
-            converged &= occ > 0
+        # ---- THE VERDICT, delegated to the sub-state's tracker ----------
+        # All the arithmetic lives in ``_ColdBandLnL.judge`` so there is
+        # exactly ONE place the gate's logic exists, and the arrays it
+        # touches are owned by ``band_info`` rather than by this move.
+        #
+        # ``cur`` is the WITHIN-ITERATION PEAK accumulated by every GB
+        # move's repeat groups (see the observe at the add-back), not the
+        # single mid-cycle sample this used to read. That sample was taken
+        # at rj_fstat_search -- move 4 of 6 -- so ~2,200 s of refinement
+        # from in_model_fstat and rj_prior_removal never reached the max,
+        # leaving the reference permanently one partial cycle stale.
+        #
+        # FALLBACK: with no tracker (a hand-built state, a unit test) the
+        # peak is unavailable, so seed it from this iteration's single
+        # reading and judge on that -- the pre-2026-09-27 behaviour,
+        # explicitly rather than by accident.
+        _view = getattr(self, "_cold_lnl_view", None)
+        if _view is None or _view.shape != shut.shape:
+            _view = cold_band_lnl_from_band_info(
+                self._shutoff_band_info, shut.shape)
+        if _view is None:
+            # ⚠ PUBLISH ANYWAY, THEN BAIL. ``band_shutoff_w_pending_total``
+            # reads 0 both when everything converged and when nothing was
+            # ever published, and a bare ``return`` here would leave the
+            # counter at None -> 0 -> "stage complete" on the very first
+            # check. Report every occupied pair as still pending, which is
+            # the only safe reading when the record is unavailable.
+            self._publish_shutoff_w_pending(shut, occ)
+            if not getattr(self, "_cold_lnl_missing_warned", False):
+                self._cold_lnl_missing_warned = True
+                logger.warning(
+                    "[GB_STAGE %s] the cold-band lnL record is unavailable "
+                    "(no band_info arrays); the per-(walker, band) valve is "
+                    "INERT and every occupied pair is reported as pending "
+                    "so no stage can end on a counter that was never "
+                    "measured.", self.name)
+            return
+        _cur_obs = np.where(np.isnan(lls), -np.inf, lls)
+        np.maximum(_view.peak, _cur_obs, out=_view.peak)
+        converged = _view.judge(tol, self.search_shutoff_conv_iter, occ,
+                                require_occ=self._shutoff_require_occ())
         shut[converged] = True
         self._publish_shutoff_w_pending(shut, occ)
+
+        # ---- GATE TELEMETRY, every iteration (user request 2026-09-27:
+        # "make sure there is logging info to make sure all of our gates
+        # are working properly now"). One line, unconditional, so a run
+        # that is NOT converging says why instead of leaving it to be
+        # inferred from a shut TOTAL that moves by five a night.
+        #
+        # Reads only the arrays the gate just wrote, so it cannot disagree
+        # with the verdict it is reporting.
+        try:
+            _occ = np.asarray(occ) > 0
+            _n_occ = int(_occ.sum())
+            if _n_occ:
+                _act = _occ & ~shut
+                _n_act = int(_act.sum())
+                _st = _view.streak[_act] if _n_act else np.zeros(0)
+                _rs = _view.resets[_act] if _n_act else np.zeros(0)
+                _gap = ((_view.max - _view.value)[_act]
+                        if _n_act else np.zeros(0))
+                _gap = _gap[np.isfinite(_gap)]
+                # The three populations an unshut pair can belong to.
+                _chronic = int(((_rs > 0) & (_st < int(
+                    self.search_shutoff_conv_iter))).sum()) if _n_act else 0
+                _young = int(((_rs == 0) & (_st > 0)).sum()) if _n_act else 0
+                _fresh = int(((_rs == 0) & (_st == 0)).sum()) if _n_act else 0
+                logger.info(
+                    "[GB_GATE %s] occupied %d | shut %d (%.1f%%) | active %d "
+                    "-- streak p50 %.0f p90 %.0f of %d; resets/pair mean "
+                    "%.2f max %d; chronic %d young %d fresh %d | "
+                    "max-minus-now lnL p50 %.2f p90 %.2f (tol %.2f) | "
+                    "peak observations this iteration: %d cells",
+                    self.name, _n_occ, int((_occ & shut).sum()),
+                    100.0 * float((_occ & shut).sum()) / max(_n_occ, 1),
+                    _n_act,
+                    float(np.percentile(_st, 50)) if _n_act else 0.0,
+                    float(np.percentile(_st, 90)) if _n_act else 0.0,
+                    int(self.search_shutoff_conv_iter),
+                    float(_rs.mean()) if _n_act else 0.0,
+                    int(_rs.max()) if _n_act else 0,
+                    _chronic, _young, _fresh,
+                    float(np.percentile(_gap, 50)) if _gap.size else float("nan"),
+                    float(np.percentile(_gap, 90)) if _gap.size else float("nan"),
+                    float(tol),
+                    int(np.isfinite(_view.value).sum()),
+                )
+        except Exception as _e:   # telemetry must never break a propose
+            logger.debug("[GB_GATE %s] summary skipped: %r", self.name, _e)
         if not np.any(converged):
             self._log_shutoff_w_spread(shut)
             return
@@ -20649,8 +21287,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     "[GB_STAGE %s]   w%d band %d [%.4f,%.4f] mHz: "
                     "best=%.3f cur=%.3f occ=%d streak=%d -> SHUT",
                     self.name, w, b, be[b] * 1e3, be[b + 1] * 1e3,
-                    float(self._shutoff_best[w, b]), float(cur[w, b]),
-                    int(occ[w, b]), int(self._shutoff_streak[w, b]),
+                    float(_view.max[w, b]), float(_view.value[w, b]),
+                    int(occ[w, b]), int(_view.streak[w, b]),
                 )
 
     def _shutoff_ll_tol(self) -> float:
@@ -20761,6 +21399,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self._stage_table = None
         self._snr_lim_table = None
         self._rj_band_shutoff_w = None
+        # Drop the window references too. They point INTO a band_info; if
+        # this call is about to bind a different state (or bail out before
+        # binding any), keeping them would let the next update write a
+        # plateau count into an array nobody is saving any more.
+        self._shutoff_band_info = None
         bi = None
         try:
             bi = state.sub_states[self.branch_name].band_info
@@ -20793,6 +21436,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     f"that reached the move has to reach the state."
                 )
             self._rj_band_shutoff_w = shut
+            # The window rides with the boolean: bound from the SAME
+            # band_info, in the same breath, so a release or a reseat can
+            # never leave the three describing different grids.
+            self._bind_shutoff_window(bi, np.shape(shut))
             # STEP STAMP. The move stamps the serial it is running under; a
             # stored valve earned in a DIFFERENT step is released rather
             # than honoured, because the step it was measured under is over
@@ -25395,6 +26042,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 os.environ.get("GB_PROP_TIMING_SYNC", "0"),
             )
         self._prop_timer = tm = _ProposeTimer(sync_fn=_tm_sync)
+        # PER-PROPOSE TRANSIENT, not move state. The cold-band-lnL arrays
+        # are owned by the GB SUB-STATE (band_info); this is only a view
+        # over them, resolved once per propose and dropped at the end,
+        # exactly like ``_prop_timer`` above. Stashing it here rather than
+        # threading ``state`` through _run_band_unit -> _run_in_model_repeats
+        # keeps the plumbing to one line while leaving ownership with the
+        # sub-state -- which is what makes the PURE in-model moves able to
+        # observe at all (the valve is not live on them, so they have no
+        # other route to the arrays).
+        self._cold_lnl_view = cold_band_lnl(state, self.branch_name)
         # Tempering-cadence census: every propose of this branch ticks the
         # shared counter (see _temper_cadence_fire).
         GBSpecialBase._branch_propose_counts[self.branch_name] = (
@@ -26485,6 +27142,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 os.environ.get("GB_PROP_TIMING_SYNC", "0"),
             )
         self._prop_timer = tm = _ProposeTimer(sync_fn=_tm_sync)
+        # PER-PROPOSE TRANSIENT, not move state. The cold-band-lnL arrays
+        # are owned by the GB SUB-STATE (band_info); this is only a view
+        # over them, resolved once per propose and dropped at the end,
+        # exactly like ``_prop_timer`` above. Stashing it here rather than
+        # threading ``state`` through _run_band_unit -> _run_in_model_repeats
+        # keeps the plumbing to one line while leaving ownership with the
+        # sub-state -- which is what makes the PURE in-model moves able to
+        # observe at all (the valve is not live on them, so they have no
+        # other route to the arrays).
+        self._cold_lnl_view = cold_band_lnl(state, self.branch_name)
         # Tempering-cadence census: every propose of this branch ticks the
         # shared counter (see _temper_cadence_fire).
         GBSpecialBase._branch_propose_counts[self.branch_name] = (

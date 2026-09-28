@@ -14,6 +14,7 @@ tests here.
 from __future__ import annotations
 
 import os
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -247,3 +248,41 @@ class SingleProcessTest(unittest.TestCase):
         self.assertIn('plt.rcParams["font.size"] = _NOISE_PANEL_FONT', src)
         i = src.index("_NOISE_PANEL_FONT = 16.0")
         self.assertIn("font.size 10.0 -> 16.0", src[max(0, i - 1800):i])
+
+
+class ArgvDefaultTest(unittest.TestCase):
+    """``main()`` must work with NO argument, the way __main__ calls it.
+
+    REGRESSION (2026-09-27). ``main(argv=None)`` fell straight into
+    ``if "--" in argv`` without resolving the default, so
+    ``sys.exit(main())`` -- the only way the module is ever actually run --
+    raised ``TypeError: argument of type 'NoneType' is not iterable`` on
+    every real command line. Every test in this file passed throughout,
+    because they all call ``main([...])`` with an explicit list: the one
+    path nobody exercised was the one everybody uses.
+    """
+
+    def test_main_with_no_argv_reads_sys_argv(self):
+        import lisatools.globalfit.monitor.from_tar as ft
+        with tempfile.TemporaryDirectory() as d:
+            _mk(os.path.join(d, "run", "gf_prod_testing_extract.h5"))
+            tar = os.path.join(d, "s.tar.gz")
+            with tarfile.open(tar, "w:gz") as tf:
+                tf.add(os.path.join(d, "run"), arcname="run")
+            import lisatools.globalfit.monitor as mon
+            argv = ["from_tar", tar, os.path.join(d, "p.html"),
+                    "--scratch", os.path.join(d, "s2")]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(mon, "build_monitor") as bm, \
+                    mock.patch.object(ft.os.path, "getsize", return_value=1):
+                rc = ft.main()          # <-- NO argument. The broken call.
+            self.assertEqual(rc, 0)
+            self.assertTrue(bm.called)
+
+    def test_no_argv_and_no_tar_exits_cleanly_not_with_a_TypeError(self):
+        """argparse's own "required argument" error, not a crash."""
+        import lisatools.globalfit.monitor.from_tar as ft
+        with mock.patch.object(sys, "argv", ["from_tar"]):
+            with self.assertRaises(SystemExit) as cm:
+                ft.main()
+        self.assertNotEqual(cm.exception.code, 0)

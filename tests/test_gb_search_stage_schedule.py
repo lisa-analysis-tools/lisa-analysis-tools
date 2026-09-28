@@ -88,8 +88,6 @@ def _stage_move(nwalkers=NWALKERS, min_iters=3, coarse=8.0, fine=5.0,
     m._stage_table = None
     m._snr_lim_table = None
     m._rj_band_shutoff_w = None
-    m._shutoff_best = None
-    m._shutoff_streak = None
     m._stage_band_lls = None
     m._stage_band_lls_stamp = None
     m._shutoff_w_warned_lls = False
@@ -587,6 +585,13 @@ class RjShutoffValveTest(unittest.TestCase):
         m = _stage_move(shutoff=True, conv_iter=conv_iter, nwalkers=nwalkers)
         bi = _band_info(nwalkers=nwalkers, shutoff=True)
         m._rj_band_shutoff_w = bi["band_rj_shutoff_w"]
+        # Bind the window through the SAME path production uses, so the
+        # move's arrays are the ones band_info holds. Setting only
+        # ``_rj_band_shutoff_w`` left ``_shutoff_band_info`` unset, and the
+        # move then allocated a DETACHED window -- the tests still passed
+        # because they read the move's attributes, but nothing they
+        # asserted would have reached the saver.
+        m._bind_shutoff_window(bi, np.shape(bi["band_rj_shutoff_w"]))
         return m, bi
 
     @staticmethod
@@ -671,7 +676,7 @@ class RjShutoffValveTest(unittest.TestCase):
         lls = self._flat()
         lls[0, 0] = np.nan
         self._run(m, bi, [lls] * 6)
-        self.assertTrue(np.isfinite(m._shutoff_best[1:, :]).all())
+        self.assertTrue(np.isfinite(bi["band_cold_logl_max_w"][1:, :]).all())
         # a NaN band never improves, so it converges like any flat one
         self.assertTrue(bool(bi["band_rj_shutoff_w"][0, 0]))
 
@@ -690,28 +695,70 @@ class RjShutoffValveTest(unittest.TestCase):
         self.assertFalse(bi["band_rj_shutoff_w"].any())
         # THE WINDOW, not only the boolean: a step that inherited the
         # previous step's running-best lnL would re-freeze immediately.
-        self.assertIsNone(m._shutoff_best)
-        self.assertIsNone(m._shutoff_streak)
+        #
+        # CLEARED IN PLACE, not rebound to None (2026-09-27). The window
+        # arrays are live references into band_info now that they are
+        # persisted, so a release has to be WRITTEN THROUGH -- dropping the
+        # reference would leave the saved arrays holding the old step's
+        # best and the next bind would pick it straight back up.
+        self.assertTrue(np.all(np.isneginf(bi["band_shutoff_best_w"])))
+        self.assertTrue(np.all(bi["band_shutoff_streak_w"] == 0))
 
-    def test_two_consecutive_steps_re_earn_their_shutoffs(self):
-        """The three-search-stage case: step 2 must NOT inherit step 1's
-        verdict, and must not re-freeze on step 1's already-high best."""
+    def test_step_2_is_judged_against_the_ALL_TIME_max(self):
+        """CONTRACT REVERSED 2026-09-27 by user ruling.
+
+        This test used to assert the opposite: "step 2 must NOT inherit
+        step 1's verdict, and must not re-freeze on step 1's already-high
+        best". The reasoning was that step 2 has different moves, caps and
+        floors, so step 1's best is an unfair bar.
+
+        The ruling now is to hold "an absolute logL max value for the cold
+        chain per (band, walker) ... it should persist through everything
+        including saving. We want to monitor against that." The tradeoff
+        is taken knowingly: if step 2's moves genuinely find something
+        better they beat the all-time max and the streak resets; if they
+        cannot, the band IS finished and re-freezing it is the right
+        answer. A reference that resets every step is why the valve could
+        not latch at all across the short jobs of 2026-09-26.
+
+        So: the BOOLEAN still releases at the step boundary (the verdict
+        is re-earned) but the BAR does not move.
+        """
         m, bi = self._armed(conv_iter=3)
         m.begin_recipe_step(1)
         self._run(m, bi, [self._flat(500.0)] * 6)
         self.assertTrue(bi["band_rj_shutoff_w"].all())
+        peak = bi["band_cold_logl_max_w"].copy()
+
         m.begin_recipe_step(2)
+        # the verdict is released ...
         self.assertFalse(bi["band_rj_shutoff_w"].any())
-        # one update into step 2 at the SAME high lnL: if the best had been
-        # inherited this would already be mid-streak; from a fresh -inf it
-        # is an improvement, so the clock is at zero.
-        self._run(m, bi, [self._flat(500.0)])
+        # ... the per-step window is cleared ...
+        self.assertTrue(np.all(np.isneginf(bi["band_shutoff_best_w"])))
+        # ... but the all-time max is NOT.
+        np.testing.assert_array_equal(bi["band_cold_logl_max_w"], peak)
+
+        # Three iterations at the same lnL cannot beat the inherited max,
+        # so the streak runs straight to conv_iter and the band re-shuts.
+        self._run(m, bi, [self._flat(500.0)] * 3)
+        self.assertTrue(
+            bi["band_rj_shutoff_w"].all(),
+            "step 2 failed to re-freeze a band that never beat its "
+            "all-time best")
+
+    def test_a_genuinely_better_step_resets_the_streak(self):
+        """The safety valve on the ruling above: beating the all-time max
+        by more than the tolerance must reopen the question."""
+        m, bi = self._armed(conv_iter=3)
+        m.begin_recipe_step(1)
+        self._run(m, bi, [self._flat(500.0)] * 6)
+        m.begin_recipe_step(2)
+        # +100 lnL is far beyond the D/2 tolerance
+        self._run(m, bi, [self._flat(600.0)])
+        self.assertTrue(np.all(bi["band_shutoff_streak_w"] == 0))
         self.assertFalse(bi["band_rj_shutoff_w"].any())
-        self.assertTrue(np.all(m._shutoff_streak == 0))
-        self._run(m, bi, [self._flat(500.0)] * 2)
-        self.assertFalse(bi["band_rj_shutoff_w"].any())
-        self._run(m, bi, [self._flat(500.0)])
-        self.assertTrue(bi["band_rj_shutoff_w"].all())
+        self.assertAlmostEqual(
+            float(bi["band_cold_logl_max_w"].max()), 600.0, places=6)
 
     def test_the_valve_HOLDS_across_a_mid_step_resume(self):
         """User requirement 2026-09-24: the shutoff holds through a recipe
@@ -726,6 +773,8 @@ class RjShutoffValveTest(unittest.TestCase):
         bi["band_shutoff_w_step"][0] = 2
         self._run(m, bi, [self._flat()] * 6)
         shut_before = bi["band_rj_shutoff_w"].copy()
+        best_before = bi["band_shutoff_best_w"].copy()
+        streak_before = bi["band_shutoff_streak_w"].copy()
         self.assertTrue(shut_before.any())
 
         # ---- the process dies and comes back mid-step ----------------
@@ -735,8 +784,21 @@ class RjShutoffValveTest(unittest.TestCase):
         np.testing.assert_array_equal(
             fresh._rj_band_shutoff_w, shut_before,
             "a mid-step resume released a valve the step had earned")
-        # the WINDOW is re-earned (in-memory, permissive), the VERDICT holds
-        self.assertIsNone(fresh._shutoff_best)
+        # THE WINDOW NOW HOLDS TOO (user request 2026-09-27). It used to be
+        # re-earned from -inf, which is permissive and cannot lose a
+        # source, but it also meant no pair could EVER shut on a job
+        # shorter than conv_iter + 1 iterations -- the 6mo v9 run shut zero
+        # pairs in jobs 646, 648 and 650 for exactly that reason. The step
+        # stamp still releases everything when the step changes, so this
+        # can never outlive the configuration it was measured under.
+        # The arrays are owned by band_info, not by the move (2026-09-27),
+        # so a resume that binds the same state sees the same values --
+        # asserted on band_info directly, because that IS the owner now.
+        np.testing.assert_array_equal(bi["band_shutoff_best_w"], best_before)
+        np.testing.assert_array_equal(bi["band_shutoff_streak_w"],
+                                      streak_before)
+        self.assertIsNotNone(fresh._shutoff_band_info)
+        self.assertIs(fresh._shutoff_band_info, bi)
 
     def test_a_resume_into_a_DIFFERENT_step_releases(self):
         m, bi = self._armed(conv_iter=2)
@@ -790,7 +852,13 @@ class RjShutoffValveTest(unittest.TestCase):
             np.ones((NWALKERS, NUM_BANDS))))
         # inert, not frozen: nothing was measured this iteration
         self.assertFalse(bi["band_rj_shutoff_w"].any())
-        self.assertIsNone(m._shutoff_best)
+        # The window is now pre-bound by the fixture (it has to be, or
+        # nothing the move writes reaches band_info), so "the update bailed
+        # out" is asserted as "the window is untouched" rather than as
+        # "the window is still None".
+        self.assertTrue(np.all(np.isneginf(bi["band_shutoff_best_w"])))
+        self.assertTrue(np.all(np.isneginf(bi["band_cold_logl_max_w"])))
+        self.assertTrue(np.all(bi["band_shutoff_streak_w"] == 0))
 
     def test_pe_mode_never_arms(self):
         m = _stage_move(shutoff=True, search=False)
@@ -825,6 +893,9 @@ class StageConvergenceInterfaceTest(unittest.TestCase):
         m = _stage_move(shutoff=True, conv_iter=conv_iter)
         bi = _band_info(shutoff=True)
         m._rj_band_shutoff_w = bi["band_rj_shutoff_w"]
+        # Bind through the production path so the move knows WHICH
+        # band_info owns the record (it holds no arrays of its own).
+        m._bind_shutoff_window(bi, np.shape(bi["band_rj_shutoff_w"]))
         return m, bi
 
     def _step(self, m, bi, value=0.0, occ=None):

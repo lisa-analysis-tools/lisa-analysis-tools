@@ -1303,6 +1303,29 @@ export GB_INMODEL_CONVERGE_MAX=20000
 # stragglers holding every finished cold source hostage. 1.0 = every rung
 # must converge (the pre-gate behaviour).
 export GB_INMODEL_CONVERGE_GATE_FRAC=0.5
+# COLD-CHAIN-ONLY COLUMN RETIREMENT (user ruling 2026-09-27: "with the
+# vertical swaps working well, we should pull the whole group off the
+# current running block when its cold chain converges").
+#
+# An ABSOLUTE rung count that overrides GATE_FRAC above. =1 means the T0
+# row is the only one with a vote on when a (walker, band) column may
+# leave the in-model block; the whole column -- all 24 rungs -- then goes
+# together, and the hot rows are recorded as RELEASED (nothing was
+# concluded about them) rather than converged.
+#
+# WHY NOT just set GATE_FRAC=1/24: the exact ratio does work, but this
+# file exports a typed decimal and the answer flips on the fourth place --
+# ceil(24 * 0.04) is 1, ceil(24 * 0.0417) is 2. An absolute count says
+# what it means.
+#
+# WHAT IT BUYS. With GATE_FRAC=0.5 a block ran until the slowest of TWELVE
+# rungs converged, and the warmer ones converge more slowly because their
+# gain random-walks rather than climbs. Longer blocks deliver more lnL per
+# iteration, which keeps resetting the per-(walker, band) valve's streak --
+# so the hot rungs were holding the search stage open through the back
+# door. Measured on job 650: 17.5% of blocks that PASSED the in-model test
+# still delivered a median row gain above the valve's 4.0 tolerance.
+export GB_INMODEL_CONVERGE_GATE_RUNGS=1
 # SWAP TRIGGER: end a block once this fraction of its (walker, band) COLUMNS
 # has fully retired, then swap the finished bands out for queued ones.
 # ⚠ 1.0 SILENTLY DISABLES THE REFILL -- at 1.0 every column finishes together,

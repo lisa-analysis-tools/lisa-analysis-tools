@@ -106,6 +106,12 @@ def extract(tar_path: str, scratch: str, fresh: bool = False) -> str:
 
 
 def main(argv=None) -> int:
+    # RESOLVE argv BEFORE ANYTHING READS IT. The `--` split below indexes
+    # argv directly, so leaving it None crashed every real command line
+    # (`TypeError: argument of type 'NoneType' is not iterable`) while
+    # every test passed -- the tests all call main([...]) with an explicit
+    # list, which is exactly the path that was never broken.
+    argv = list(sys.argv[1:] if argv is None else argv)
     ap = argparse.ArgumentParser(
         prog="python -m lisatools.globalfit.monitor.from_tar",
         description=__doc__,

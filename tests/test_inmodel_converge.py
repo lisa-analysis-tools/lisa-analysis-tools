@@ -1997,29 +1997,51 @@ class PerClassConvergeWindowTest(unittest.TestCase):
         self.assertEqual(st["newborn"].window, 250)
         self.assertEqual(st["mature"].window, 100)
 
-    def test_the_enforced_RATE_is_identical_across_classes(self):
-        """The whole point. If this fails the change is a weakening of the
-        criterion dressed up as a speedup."""
-        for surv in (50, 100, 150, 250):
+    def test_the_THRESHOLD_is_identical_across_classes(self):
+        """CONTRACT REVERSED 2026-09-27 by user ruling ("keep this at 4").
+
+        This used to assert the enforced RATE (thresh/window) was equal
+        across classes, which made the survivor threshold 0.80 against
+        the newborn's 4.0. The problem is that the per-(walker, band)
+        valve and the leaf cap both judge at D/2 = 4.0, so three gates
+        asking "has the running max stopped improving by more than X"
+        used two different X -- and the band valve's was 5x the one the
+        rows were judged on. Measured on 6mo v9 job 650: 17.5% of blocks
+        that PASSED the in-model test still delivered a median row gain
+        above 4.0, which is exactly that gap leaking through.
+
+        D/2 is the physical unit (the lnL a genuine new D-parameter
+        source must buy). Every gate now uses it; only the PATIENCE
+        differs, matched to each gate's clock.
+        """
+        for surv in (25, 50, 100, 250):
             st = self._states(window=250, survivor=surv)
-            rn = st["newborn"].thresh / st["newborn"].window
-            rm = st["mature"].thresh / st["mature"].window
-            self.assertAlmostEqual(rn, rm, places=12, msg=f"survivor={surv}")
-            self.assertAlmostEqual(rn, 4.0 / 250, places=12)
+            self.assertAlmostEqual(st["mature"].thresh, 4.0, places=12,
+                                   msg=f"survivor={surv}")
+            self.assertAlmostEqual(st["newborn"].thresh, 4.0, places=12)
+            self.assertEqual(st["mature"].window, surv)
 
-    def test_the_control_a_fixed_thresh_would_have_loosened_the_bar(self):
-        """Shows the trap this design avoids: had thresh been left at 4.0,
-        a 100-repeat window would enforce 2.5x the permitted drift."""
-        st = self._states(window=250, survivor=100)
-        naive_rate = 4.0 / 100                      # thresh NOT scaled
-        actual_rate = st["mature"].thresh / st["mature"].window
-        self.assertAlmostEqual(actual_rate, 4.0 / 250, places=12)
-        self.assertAlmostEqual(naive_rate / actual_rate, 2.5, places=6)
+    def test_the_rescaling_is_still_available_behind_the_env_flag(self):
+        """The old rate-preserving behaviour is one export away."""
+        with mock.patch.dict(
+                os.environ,
+                {"GB_INMODEL_CONVERGE_DLL_SCALE_WITH_WINDOW": "1"}):
+            st = self._states(window=250, survivor=50)
+        self.assertAlmostEqual(st["mature"].thresh, 0.8, places=12)
+        rn = st["newborn"].thresh / st["newborn"].window
+        rm = st["mature"].thresh / st["mature"].window
+        self.assertAlmostEqual(rn, rm, places=12)
 
-    def test_survivor_threshold_scales_down_not_up(self):
-        st = self._states(window=250, survivor=100)
-        self.assertLess(st["mature"].thresh, st["newborn"].thresh)
-        self.assertAlmostEqual(st["mature"].thresh, 1.6, places=9)
+    def test_the_loosening_is_real_and_intended(self):
+        """Names the cost of the ruling so it cannot be mistaken for a
+        no-op: at a 50-repeat window the survivor bar goes 0.80 -> 4.0,
+        five times looser, and survivors are ~96% of converging work."""
+        with mock.patch.dict(
+                os.environ,
+                {"GB_INMODEL_CONVERGE_DLL_SCALE_WITH_WINDOW": "1"}):
+            old = self._states(window=250, survivor=50)["mature"].thresh
+        new = self._states(window=250, survivor=50)["mature"].thresh
+        self.assertAlmostEqual(new / old, 5.0, places=6)
 
     def test_the_armed_line_reports_both_windows(self):
         import inspect
@@ -2470,3 +2492,79 @@ class AllRJMovesShareTheClassRulesTest(unittest.TestCase):
                          "inmodel_converge_classes=",
                          "inmodel_converge_iters_survivor="):
                 self.assertNotIn(knob, body, "%s sets %s per move" % (n, knob))
+
+
+class ColdOnlyColumnRetirementTest(unittest.TestCase):
+    """``GB_INMODEL_CONVERGE_GATE_RUNGS=1`` -- the T0 row alone decides.
+
+    USER RULING 2026-09-27: "with the vertical swaps working well, we
+    should pull the whole group off the current running block when its
+    cold chain converges."
+
+    An ABSOLUTE rung count, because the fraction is FRAGILE here rather
+    than impossible: ``24 * (1/24)`` is exactly 1.0, but a launcher
+    exports a typed decimal, and ``ceil(24 * 0.0417) == 2`` while
+    ``ceil(24 * 0.04) == 1``. A knob whose meaning flips on the fourth
+    decimal place is not a knob you configure a production run with.
+    """
+
+    def _move(self, rungs=None, frac=0.5):
+        return SimpleNamespace(
+            name="rj_warm_search", branch_name="gb", inmodel_converge="on",
+            inmodel_converge_classes=frozenset({"newborn", "mature"}),
+            inmodel_repeats_newborn=100, inmodel_repeats_survivor=50,
+            inmodel_converge_iters=250, inmodel_converge_iters_survivor=50,
+            inmodel_converge_max=20000, inmodel_converge_dll=4.0,
+            inmodel_converge_gate_frac=frac, inmodel_converge_stop_frac=0.5,
+            inmodel_converge_refill=True, ntemps=24,
+            _converge_armed_logged=True, _converge_pe_warned=True,
+        )
+
+    def _n_gate(self, env=None, frac=0.5):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        with mock.patch.dict(os.environ, env or {}, clear=False):
+            if env is None:
+                os.environ.pop("GB_INMODEL_CONVERGE_GATE_RUNGS", None)
+            st = g.GBSpecialBase._converge_state_for(self._move(frac=frac),
+                                                     "mature")
+        return st.n_gate
+
+    def test_the_fraction_still_rules_when_the_count_is_unset(self):
+        self.assertEqual(self._n_gate(), 12)
+
+    def test_one_rung_means_ONE_rung(self):
+        self.assertEqual(
+            self._n_gate({"GB_INMODEL_CONVERGE_GATE_RUNGS": "1"}), 1)
+
+    def test_the_fraction_is_fragile_at_one_rung(self):
+        """The reason the absolute knob exists at all.
+
+        The exact ratio works; the decimals a human would type do not
+        agree with each other.
+        """
+        self.assertEqual(self._n_gate(frac=1.0 / 24.0), 1)   # exact
+        self.assertEqual(self._n_gate(frac=0.04), 1)
+        self.assertEqual(self._n_gate(frac=0.0417), 2)       # flips
+        self.assertEqual(self._n_gate(frac=0.042), 2)
+
+    def test_the_count_is_clamped_to_the_ladder(self):
+        self.assertEqual(
+            self._n_gate({"GB_INMODEL_CONVERGE_GATE_RUNGS": "999"}), 24)
+        self.assertEqual(
+            self._n_gate({"GB_INMODEL_CONVERGE_GATE_RUNGS": "0"}), 1)
+
+    def test_garbage_falls_back_to_the_fraction(self):
+        self.assertEqual(
+            self._n_gate({"GB_INMODEL_CONVERGE_GATE_RUNGS": "cold"}), 12)
+
+    def test_a_converged_COLD_row_retires_the_WHOLE_column(self):
+        """The behaviour the ruling asks for, end to end on the state."""
+        st = _InModelConvergeState(window=2, thresh=4.0, max_repeats=100,
+                                   n_gate=1)
+        rows = [0, 1, 2, 3]                      # rungs T0..T3 of one column
+        st._gated = {0: True, 1: False, 2: False, 3: False}
+        self.assertFalse(st.column_retired(rows))
+        st.converged.add(0)                      # only the cold rung is done
+        self.assertTrue(
+            st.column_retired(rows),
+            "the column did not leave when its cold chain converged")

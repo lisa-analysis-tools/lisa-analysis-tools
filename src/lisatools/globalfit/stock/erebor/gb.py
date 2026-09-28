@@ -1159,8 +1159,62 @@ class GBSetup(Setup, GBSettings):
             # )
             ntemps_pe = 24 # len(snrs_ladder)
             # betas =  1 / snrs_ladder ** 2  # make_ladder(ndim * 10, Tmax=5e6, ntemps=ntemps_pe)
-            betas = 1 / 1.2 ** np.arange(ntemps_pe)
-            betas[-1] = 0.0001
+            #
+            # TWO-SLOPE LADDER (user ruling 2026-09-27). Defaults below
+            # reproduce the historical single-slope ladder EXACTLY
+            # (ratio 1.2 throughout, last rung pinned to 1e-4), so nothing
+            # changes for any run that does not set the knobs.
+            #
+            # WHY A SECOND SLOPE IS AVAILABLE. Measured on 6mo v9 job 650:
+            # adjacent-rung swap acceptance climbs monotonically 31.2%
+            # (T0-T1) -> 71.1% (T20-T21), i.e. the hot half is spaced far
+            # too FINELY -- replica exchange wants ~20-30%, so rungs
+            # T10-T22 buy 60-71% where 30% would do. Then T22 (beta
+            # 1.765e-2, T=55.3) jumps straight to the pinned T23 (beta
+            # 1e-4, T=10,000), a 176x gap, and that rung holds 64.5
+            # sources/walker against T22's 933 -- 93% shed -- and couples
+            # at 15.4%. The 3mo run measured the same cliff at 181x with
+            # 95.8% shed.
+            #
+            # Fitting sources/walker against ln(T) over T0..T22 gives
+            # ``2284 - 313*ln(T)``, which reaches zero near T ~ 1460. The
+            # hottest working rung is T=55, so roughly a factor of 26 of
+            # USABLE temperature is skipped before the pinned rung
+            # overshoots it by 7x. Spending the hot half's excess
+            # acceptance on range closes both gaps at once.
+            #
+            #   GB_LADDER_RATIO       cold-half ratio           (1.2)
+            #   GB_LADDER_HOT_RATIO   hot-half ratio, 0 = off   (0 -> same)
+            #   GB_LADDER_HOT_FROM    first rung of the hot half (10)
+            #   GB_LADDER_PIN_LAST    beta for the top rung, 0 = leave it
+            #                         on the geometric progression (1e-4)
+            #
+            # ⚠ A RESUME IGNORES ALL OF THIS. ``band_temps`` lives in the
+            # store and ``initialize_band_information`` restores it, so
+            # changing these knobs only affects a run that starts fresh or
+            # whose store has had its ladder migrated. The launcher's
+            # LADDER PREFLIGHT compares the rung COUNT, not the values, so
+            # a value change is otherwise a silent no-op.
+            def _env_f(name, default):
+                try:
+                    return float(os.environ.get(name, "") or default)
+                except ValueError:
+                    return float(default)
+
+            _ratio = _env_f("GB_LADDER_RATIO", 1.2)
+            _hot_ratio = _env_f("GB_LADDER_HOT_RATIO", 0.0)
+            _hot_from = int(_env_f("GB_LADDER_HOT_FROM", 10))
+            _pin_last = _env_f("GB_LADDER_PIN_LAST", 1e-4)
+
+            if _hot_ratio > 0.0 and 0 < _hot_from < ntemps_pe:
+                _steps = np.zeros(ntemps_pe)
+                _steps[1:_hot_from + 1] = np.log(_ratio)
+                _steps[_hot_from + 1:] = np.log(_hot_ratio)
+                betas = np.exp(-np.cumsum(_steps))
+            else:
+                betas = 1 / _ratio ** np.arange(ntemps_pe)
+            if _pin_last > 0.0:
+                betas[-1] = _pin_last
             self.betas = betas
 
         if self.other_tempering_kwargs is None:
