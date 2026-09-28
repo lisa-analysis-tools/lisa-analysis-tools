@@ -1893,6 +1893,115 @@ criterion &mdash; when the red pending line reaches zero the stage has converged
 which bands are holding it open.</div></div>"""
         del _sw, _occ
 
+# ---- 5b-2b. WHY the valve has or has not latched (2026-09-27) ------------
+# The shutoff share above says WHETHER pairs are shutting. These three say
+# WHY the rest are not, which is the question the 6mo run spent a day
+# unable to answer: the statistic the valve judges was computed fresh each
+# iteration and thrown away, and the only per-band cold-lnL array in the
+# store (``band_cold_ll``) is written by the leaf-CAP gate -- so with caps
+# disarmed it is -inf in every cell of every row.
+GATE_WHY_PANEL = ""
+_cmax = _opt(sub, "gb/band_cold_logl_max_w")
+_cnow = _opt(sub, "gb/band_cold_logl_w")
+_strk = _opt(sub, "gb/band_shutoff_streak_w")
+_rset = _opt(sub, "gb/band_shutoff_reset_w")
+if (_cmax is not None and _cnow is not None and _strk is not None
+        and _rset is not None and _shut_w is not None and _occ_wb is not None
+        and np.ndim(_cmax) == 3):
+    try:
+        _n2 = min(len(_cmax), len(_cnow), len(_strk), len(_rset),
+                  len(_shut_w), len(_occ_wb))
+        _mx = np.asarray(_cmax[:_n2], float)
+        _nw_ = np.asarray(_cnow[:_n2], float)
+        _sk = np.asarray(_strk[:_n2], float)
+        _rs = np.asarray(_rset[:_n2], float)
+        _sh = np.asarray(_shut_w[:_n2], bool)
+        _oc = np.asarray(_occ_wb[:_n2]) > 0
+        _last = _n2 - 1
+        _act = _oc[_last] & ~_sh[_last]                  # occupied, not shut
+        _tol = float(os.environ.get("GB_SEARCH_BAND_SHUTOFF_LL_TOL", "4.0"))
+        _ci = float(os.environ.get("GB_SEARCH_BAND_SHUTOFF_CONV_ITER", "3"))
+        if not _act.any():
+            raise ValueError("no active occupied pairs in the last row")
+
+        fig, ax = plt.subplots(1, 3, figsize=(15.0, 3.6),
+                               gridspec_kw=dict(wspace=0.40))
+
+        # (a) HOW FAR each still-active pair is from its own all-time best.
+        # A pair converges when this stays above -tol for conv_iter
+        # iterations; a pair sitting near zero is one that keeps matching
+        # its own record, which is what a chronic resetter looks like.
+        _gap = (_mx[_last] - _nw_[_last])[_act]
+        _gap = _gap[np.isfinite(_gap)]
+        if _gap.size:
+            ax[0].hist(np.clip(_gap, -2.0 * _tol, 6.0 * _tol), bins=50,
+                       color=AMBER, alpha=0.9)
+            ax[0].axvline(_tol, color=RED, ls="--", lw=1.4)
+            ax[0].text(_tol, ax[0].get_ylim()[1], f" tol {_tol:g} ",
+                       color=RED, fontsize=8, va="top")
+            ax[0].axvline(0.0, color=FG, ls=":", lw=1.0)
+        ax[0].set_xlabel("all-time max  -  this iteration  [lnL]")
+        ax[0].set_ylabel("active (walker, sub-band) pairs")
+        ax[0].set_title("distance from each pair's own record", fontsize=10)
+
+        # (b) THE PATIENCE CLOCK. Everything at conv_iter-1 is one quiet
+        # iteration from shutting; a pile at 0 is the resetting population.
+        _skv = _sk[_last][_act]
+        ax[1].hist(_skv, bins=np.arange(0, max(_skv.max(), _ci) + 2) - 0.5,
+                   color=CYAN, alpha=0.9)
+        ax[1].axvline(_ci, color=GREEN, ls="--", lw=1.4)
+        ax[1].text(_ci, ax[1].get_ylim()[1], f" shuts at {_ci:g} ",
+                   color=GREEN, fontsize=8, va="top", ha="right")
+        ax[1].set_xlabel("consecutive non-improving iterations")
+        ax[1].set_ylabel("active pairs")
+        ax[1].set_title("patience clock", fontsize=10)
+
+        # (c) THE THREE POPULATIONS over time. Streak alone cannot tell a
+        # chronic resetter (high reset count, streak near 0) from a pair
+        # that was simply occupied last iteration (both zero).
+        _ch, _yo, _fr = [], [], []
+        for _i in range(_n2):
+            _a = _oc[_i] & ~_sh[_i]
+            if not _a.any():
+                _ch.append(0); _yo.append(0); _fr.append(0); continue
+            _r, _k = _rs[_i][_a], _sk[_i][_a]
+            _ch.append(int(((_r > 0) & (_k < _ci)).sum()))
+            _yo.append(int(((_r == 0) & (_k > 0)).sum()))
+            _fr.append(int(((_r == 0) & (_k == 0)).sum()))
+        _x2 = np.arange(_n2)
+        ax[2].stackplot(_x2, _ch, _yo, _fr,
+                        labels=["chronic resetter", "still young",
+                                "newly occupied"],
+                        colors=[RED, AMBER, DIM], alpha=0.9)
+        ax[2].legend(fontsize=7, loc="upper left")
+        ax[2].set_xlabel("stored iteration")
+        ax[2].set_ylabel("active pairs")
+        ax[2].set_title("why each active pair is still open", fontsize=10)
+        fig_b64(fig, "gate_why")
+
+        GATE_WHY_PANEL = f"""<div class="panel">{img("gate_why", "why the valve has not latched")}
+<div class="caption">The panel above says WHETHER pairs are shutting; these say
+WHY the rest are not. <b>Left:</b> how far each still-active pair sits below its
+own all-time cold-chain record. A pair only advances its patience clock while
+this stays above the tolerance (dashed red); a pile near zero is a pair that
+keeps matching its own record. <b>Middle:</b> the patience clock itself &mdash;
+anything one short of the green line shuts on its next quiet iteration.
+<b>Right:</b> the three reasons a pair can still be open, which the streak alone
+cannot separate: a <em>chronic resetter</em> keeps beating its record, one that is
+<em>still young</em> simply has not had enough consecutive quiet iterations yet,
+and a <em>newly occupied</em> pair started its clock this iteration. A run that is
+converging shows the red band shrinking; a run whose gate is mis-specified shows
+it flat.</div></div>"""
+    except Exception as _e:   # noqa: BLE001
+        MISSING.append(f"gate-diagnosis panel unavailable: {_e!r}")
+elif _shut_w is not None:
+    MISSING.append(
+        "gate-diagnosis panel skipped: this store predates the "
+        "band_cold_logl_max_w / _w / streak / reset telemetry (added "
+        "2026-09-27). Run scripts/fstat_proposal/migrate_gb_shutoff_persist.py "
+        "with the job down to add them; the run does not need it to keep "
+        "going, but nothing about the gate is recorded without it.")
+
 # ---- 5b-3. the per-(walker, band) search STAGE (coarse -> fine) -----------
 _stage_w = _opt(sub, "gb/band_stage_w")
 if _stage_w is not None and _stage_w.ndim == 3:
@@ -5080,6 +5189,7 @@ if _g_shut or _g_vert or _g_ll_unit or _g_imconv:
     NAV_GATES = '<a href="#gates">search gates</a>'
     GATES_HTML = f"""
 <section id="gates"><h2>Search Gates</h2>
+{GATE_WHY_PANEL}
 <div class="panel">{img("search_gates", "search gate status")}
 <div class="caption"><b>Every one of these gates can be armed and reaching
 nothing</b>, which is the failure shape this run has hit repeatedly, so each
