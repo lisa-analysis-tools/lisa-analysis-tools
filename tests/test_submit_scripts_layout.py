@@ -919,6 +919,19 @@ class ThreeMonthTwinTest(unittest.TestCase):
             # transient knobs -- no stored number depends on them -- and both
             # scripts make them env-overridable, so the split is a default,
             # not a fork.
+            # GF_MONITOR_AFTER_SAVE: 0 on 3mo, 1 on 6mo (2026-09-28).
+            # MITIGATION, root cause unknown. The 3mo saver died in
+            # save_step_main -> eryn HDFBackend.open with "file is
+            # already open for read-only", i.e. a read-only handle to
+            # the live store was still open INSIDE the saver process at
+            # the next save. a4 ruled out extract() leaking src, a
+            # swallowed mid-extract exception, the page child,
+            # _atomic_backup_copy and cross-process locking, and owns
+            # the root cause. The 6mo saver has run the same hook for
+            # six saves without it and its per-iteration tars are
+            # relied on, so the two genuinely differ for now. Remove
+            # this entry once 3mo goes back to 1.
+            "GF_MONITOR_AFTER_SAVE",
             "GB_INMODEL_SETUP_BATCH", "GB_SIGHET_FOLD_MAX_BYTES",
             "GB_INFOMAT_MEMPOOL_FREE", "GB_INMODEL_BATCH_MEMPOOL_FREE",
         }
@@ -1121,6 +1134,16 @@ class ThreeMonthV9TwinTest(unittest.TestCase):
         """The whole point of deriving from 6mo: only the listed knobs differ."""
         allowed = {
             # 3MO-1 Tobs + derived
+            # GF_MONITOR_AFTER_SAVE: 0 on 3mo, 1 on 6mo (2026-09-28), a
+            # MITIGATION for the 3mo saver dying in save_step_main ->
+            # HDFBackend.open ("file is already open for read-only").
+            # Root cause unknown and owned by a4; the 6mo saver has run
+            # the same hook cleanly for six saves and its per-iteration
+            # tars are relied on. Remove once 3mo goes back to 1.
+            # (TWO twin tests, TWO allowed lists -- authorising only one
+            # is the same "gated one assembly, not the other" shape this
+            # file warns about elsewhere.)
+            "GF_MONITOR_AFTER_SAVE",
             "TOBS_TARGET", "GB_NLEAVES_MAX", "GB_N_SUBBANDS",
             "GB_RJ_INMODEL_CHUNK", "SIGHET_NT_LAYER", "EDGE_CROP_WAVELETS",
             "BASE_FILE_NAME", "STORE_DIR", "SLURM_LOG",

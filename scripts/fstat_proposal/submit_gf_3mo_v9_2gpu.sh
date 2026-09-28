@@ -731,7 +731,24 @@ export MOJITO_INFO_PATH=/shared/data/mojito_cache
 # coalesces to the newest payload when its queue backs up -- it prints a
 # banner and stays off for the rest of the run. The run is never affected.
 # If that fires, raise GF_MONITOR_ITER or set GF_MONITOR_SNAPSHOT=0.
-export GF_MONITOR_AFTER_SAVE=1
+# ⚠ OFF ON THE 3MO ONLY (2026-09-28) -- MITIGATION, ROOT CAUSE UNKNOWN.
+# The 3mo saver died in save_step_main -> eryn HDFBackend.open with
+#   OSError: Unable to synchronously open file
+#           (file is already open for read-only)
+# i.e. a READ-ONLY handle to the live store was still open INSIDE the
+# saver process when the next save came. a4 ruled out extract() leaking
+# src, a swallowed mid-extract exception, the page child,
+# _atomic_backup_copy and cross-process locking; the cause is still
+# open and a4 owns it. Turning the after-save hook off removes the only
+# thing in the saver that opens the store for reading.
+#
+# ⚠ COST: no per-iteration tar and no page for the 3mo run while this
+# is 0. Build them offline from the run directory instead:
+#   python -m lisatools.globalfit.monitor RUN_DIR --snapshot
+# The 6MO LAUNCHER STAYS AT 1 -- its saver has run the same hook for
+# six saves without the error and the per-iteration tars are relied on.
+# Restore to 1 here once a4 lands the root cause.
+export GF_MONITOR_AFTER_SAVE=0
 # Build on EVERY save. At ~2 h/iteration against a page build of order
 # minutes this is well inside the 25% warn fraction; the watchdog is the
 # backstop if that stops being true.
