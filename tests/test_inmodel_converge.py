@@ -55,6 +55,22 @@ from lisatools.globalfit.moves.gbspecialstretch import (
 # --------------------------------------------------------------------------
 # knob resolution
 # --------------------------------------------------------------------------
+
+def _real_gate(ns):
+    """Bind the PRODUCTION gate resolver onto a namespace fake.
+
+    The fake must NOT reimplement it. 6mo v9 job 654 shipped two
+    resolvers for the same number -- the real one, and the copy inside
+    the ``[GB_IMCONV] armed`` log line -- and the operator read the
+    wrong one. A fake carrying a third copy would hide the next one.
+    """
+    import types as _t
+    from lisatools.globalfit.moves import gbspecialstretch as _g
+    ns._converge_gate_rungs = _t.MethodType(
+        _g.GBSpecialBase._converge_gate_rungs, ns)
+    return ns
+
+
 class ConvergeKnobTest(unittest.TestCase):
     def test_default_is_off(self):
         with mock.patch.dict(os.environ, {}, clear=False):
@@ -889,10 +905,10 @@ class ConvergeRefillLoopTest(unittest.TestCase):
         return mv
 
     def _sorter(self, pool):
-        return SimpleNamespace(
+        return _real_gate(SimpleNamespace(
             special_band_inds=pool["specials"].copy(),
             temp_inds=pool["temp_inds"].copy(),
-        )
+        ))
 
     def test_finished_columns_are_replaced_not_waited_on(self):
         """A column that finishes in generation 1 must free its slots for a
@@ -1908,7 +1924,7 @@ class ReplaceGetsConvergencePolishTest(unittest.TestCase):
         from types import SimpleNamespace
 
         import lisatools.globalfit.moves.gbspecialstretch as g
-        f = SimpleNamespace(
+        f = _real_gate(SimpleNamespace(
             name=name, branch_name="gb", inmodel_converge="on",
             inmodel_converge_classes=frozenset(classes),
             inmodel_repeats_newborn=100, inmodel_repeats_survivor=50,
@@ -1916,7 +1932,7 @@ class ReplaceGetsConvergencePolishTest(unittest.TestCase):
             inmodel_converge_dll=4.0, inmodel_converge_gate_frac=0.5,
             inmodel_converge_stop_frac=0.5, inmodel_converge_refill=True,
             ntemps=24, _converge_armed_logged=True, _converge_pe_warned=True,
-        )
+        ))
         return {
             c: g.GBSpecialBase._converge_state_for(f, c) is not None
             for c in ("newborn", "mature")
@@ -1968,7 +1984,7 @@ class PerClassConvergeWindowTest(unittest.TestCase):
     """
 
     def _move(self, window=250, survivor=0, dll=4.0):
-        return SimpleNamespace(
+        return _real_gate(SimpleNamespace(
             name="rj_warm_search", branch_name="gb", inmodel_converge="on",
             inmodel_converge_classes=frozenset({"newborn", "mature"}),
             inmodel_repeats_newborn=100, inmodel_repeats_survivor=50,
@@ -1978,7 +1994,7 @@ class PerClassConvergeWindowTest(unittest.TestCase):
             inmodel_converge_gate_frac=0.5, inmodel_converge_stop_frac=0.5,
             inmodel_converge_refill=True, ntemps=24,
             _converge_armed_logged=True, _converge_pe_warned=True,
-        )
+        ))
 
     def _states(self, **kw):
         import lisatools.globalfit.moves.gbspecialstretch as g
@@ -2509,7 +2525,7 @@ class ColdOnlyColumnRetirementTest(unittest.TestCase):
     """
 
     def _move(self, rungs=None, frac=0.5):
-        return SimpleNamespace(
+        return _real_gate(SimpleNamespace(
             name="rj_warm_search", branch_name="gb", inmodel_converge="on",
             inmodel_converge_classes=frozenset({"newborn", "mature"}),
             inmodel_repeats_newborn=100, inmodel_repeats_survivor=50,
@@ -2518,7 +2534,7 @@ class ColdOnlyColumnRetirementTest(unittest.TestCase):
             inmodel_converge_gate_frac=frac, inmodel_converge_stop_frac=0.5,
             inmodel_converge_refill=True, ntemps=24,
             _converge_armed_logged=True, _converge_pe_warned=True,
-        )
+        ))
 
     def _n_gate(self, env=None, frac=0.5):
         import lisatools.globalfit.moves.gbspecialstretch as g
@@ -2531,6 +2547,47 @@ class ColdOnlyColumnRetirementTest(unittest.TestCase):
 
     def test_the_fraction_still_rules_when_the_count_is_unset(self):
         self.assertEqual(self._n_gate(), 12)
+
+    def test_the_ARMED_LINE_reports_the_gate_the_block_actually_runs(self):
+        """6mo v9 job 654: behaviour 4/24, log line 12/24.
+
+        The armed line recomputed ``ceil(ntemps * gate_frac)`` inline and
+        never read the env var. The gate was right; the only thing an
+        operator could see said otherwise. The user asked for logging
+        that verifies the gates -- a line doing its own arithmetic
+        verifies nothing, so the number is now resolved ONCE.
+        """
+        import logging
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        mv = self._move()
+        mv._converge_armed_logged = False          # let the line fire
+        env = {"GB_INMODEL_CONVERGE_GATE_RUNGS": "4"}
+        with mock.patch.dict(os.environ, env, clear=False):
+            with self.assertLogs(g.logger, level=logging.INFO) as cap:
+                st = g.GBSpecialBase._converge_state_for(mv, "mature")
+        armed = [m for m in cap.output if "armed" in m]
+        self.assertTrue(armed, "the armed line did not fire")
+        self.assertEqual(st.n_gate, 4)
+        self.assertIn("gate = coldest 4/24 rung(s)", armed[0])
+        self.assertNotIn("coldest 12/24", armed[0])
+
+    def test_one_resolver_only(self):
+        """No second copy of the gate arithmetic anywhere in the module."""
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g)
+        self.assertEqual(
+            src.count("int(self.ntemps) * float("
+                      "self.inmodel_converge_gate_frac)"), 1,
+            "the gate arithmetic appears in more than one place; that is "
+            "exactly how job 654 ended up reporting a gate it was not "
+            "running")
+        # ...and it lives in the resolver, not at a call site.
+        self.assertIn(
+            "int(self.ntemps) * float(self.inmodel_converge_gate_frac)",
+            inspect.getsource(g.GBSpecialBase._converge_gate_rungs))
 
     def test_one_rung_means_ONE_rung(self):
         self.assertEqual(
@@ -2582,7 +2639,7 @@ class TwoPhaseBlockTest(unittest.TestCase):
     """
 
     def _move(self):
-        return SimpleNamespace(
+        return _real_gate(SimpleNamespace(
             name="rj_warm_search", branch_name="gb", inmodel_converge="on",
             inmodel_converge_classes=frozenset({"newborn", "mature"}),
             inmodel_repeats_newborn=100, inmodel_repeats_survivor=50,
@@ -2591,7 +2648,7 @@ class TwoPhaseBlockTest(unittest.TestCase):
             inmodel_converge_gate_frac=0.5, inmodel_converge_stop_frac=0.5,
             inmodel_converge_refill=True, ntemps=24,
             _converge_armed_logged=True, _converge_pe_warned=True,
-        )
+        ))
 
     def _state(self, cls_name, env=None):
         import lisatools.globalfit.moves.gbspecialstretch as g

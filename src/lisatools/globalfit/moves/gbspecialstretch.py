@@ -16972,6 +16972,40 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             active = keep
         return n_blocks
 
+    def _converge_gate_rungs(self) -> int:
+        """How many of the COLDEST rungs get a vote on stopping a block.
+
+        ONE resolver, because there used to be two. The ``[GB_IMCONV]
+        armed`` line recomputed ``ceil(ntemps * gate_frac)`` inline and
+        never looked at the env var, so 6mo v9 job 654 reported "gate =
+        coldest 12/24 rung(s)" while every block actually ran the 4/24
+        the launcher asked for. The behaviour was right and the line that
+        existed to verify it was wrong, which is worse than either alone:
+        the operator reads the line.
+
+        ABSOLUTE RUNG COUNT WINS over the fraction when given (user ruling
+        2026-09-27: "it should only be the cold-chain that matters").
+        ``..._GATE_RUNGS=1`` makes T0 the only rung with a vote. ``ceil``
+        on the fraction path, so a fraction can never round to zero rungs
+        and silently disarm the whole test.
+        """
+        _raw = os.environ.get(
+            f"{(self.branch_name or 'GB').upper()}"
+            "_INMODEL_CONVERGE_GATE_RUNGS",
+            os.environ.get("GB_INMODEL_CONVERGE_GATE_RUNGS", ""),
+        ).strip()
+        if _raw:
+            try:
+                return max(1, min(int(self.ntemps), int(_raw)))
+            except ValueError:
+                logger.warning(
+                    "[GB_IMCONV %s] %s_INMODEL_CONVERGE_GATE_RUNGS=%r is "
+                    "not an integer; falling back to the fraction %.3f.",
+                    self.name, str(self.branch_name).upper(), _raw,
+                    float(self.inmodel_converge_gate_frac))
+        return max(1, int(np.ceil(
+            int(self.ntemps) * float(self.inmodel_converge_gate_frac))))
+
     def _converge_state_for(self, cls_name):
         """A FRESH convergence state for one provenance class, or ``None``.
 
@@ -17017,8 +17051,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             self.inmodel_repeats_newborn if cls_name == "newborn"
             else self.inmodel_repeats_survivor
         )
+        # (gate resolution lives in _converge_gate_rungs, below)
         _ceiling = int(self.inmodel_converge_max) or 4 * _budget
         _ceiling = max(_ceiling, self.inmodel_converge_iters + 1)
+        # Computed BEFORE the armed line, because the armed line reports it.
+        # It used to recompute the fraction inline and so reported 12/24 on
+        # 6mo v9 job 654 while the gate the block actually ran was 4/24 --
+        # the env var was honoured, the log line just never read it. A
+        # verification line that does its own arithmetic is not a
+        # verification line.
+        _n_gate = self._converge_gate_rungs()
         if not getattr(self, "_converge_armed_logged", False):
             self._converge_armed_logged = True
             logger.info(
@@ -17042,8 +17084,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 self.inmodel_converge_dll
                 / max(self.inmodel_converge_iters, 1),
                 _ceiling, self.inmodel_converge_stop_frac,
-                max(1, int(np.ceil(int(self.ntemps)
-                                   * float(self.inmodel_converge_gate_frac)))),
+                _n_gate,
                 int(self.ntemps),
                 "on" if self.inmodel_converge_refill else "off",
                 ",".join(sorted(self.inmodel_converge_classes)),
@@ -17070,21 +17111,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # a vote there. Shortening blocks does feed the stage
         # INDIRECTLY: less refinement per iteration means a band's lnL
         # plateaus sooner, which is what the level-3 streak measures.
-        _gate_rungs = os.environ.get(
-            f"{(self.branch_name or 'GB').upper()}"
-            "_INMODEL_CONVERGE_GATE_RUNGS",
-            os.environ.get("GB_INMODEL_CONVERGE_GATE_RUNGS", ""),
-        ).strip()
-        if _gate_rungs:
-            try:
-                _n_gate = max(1, min(int(self.ntemps), int(_gate_rungs)))
-            except ValueError:
-                _n_gate = max(1, int(np.ceil(
-                    int(self.ntemps)
-                    * float(self.inmodel_converge_gate_frac))))
-        else:
-            _n_gate = max(1, int(np.ceil(
-                int(self.ntemps) * float(self.inmodel_converge_gate_frac))))
+        # (already resolved above, via the ONE helper the armed line reads)
         # ---- PER-CLASS WINDOW (user ruling 2026-09-25, off job 628) ------
         # The window is a FLOOR on block length: a row cannot converge
         # before ``seen >= window``, so every block runs at least that many
