@@ -418,3 +418,54 @@ class ProposalCholeskyEndToEndTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InfomatFallThroughNeedsRowsTest(unittest.TestCase):
+    """A per-source rate needs sources.
+
+    ``_infomat_route_check`` divides a fixed per-call overhead by
+    ``nrows``, so a single-row call always looks slow. 6mo v9 job 662
+    emitted 404 of these warnings: 400 were "over 1 rows" at ~17.7
+    ms/source, against 3 at 2 rows and 1 at 11 rows / 52.9 ms. A warning
+    that fires on arithmetic rather than on the condition it names
+    trains the reader to ignore it.
+    """
+
+    def _move(self):
+        from types import SimpleNamespace
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        m = g.GBSpecialBase.__new__(g.GBSpecialBase)
+        m.name = "rj_warm_search"
+        m.branch_name = "gb"
+        m._infomat_warned = False
+        return m
+
+    def _fires(self, nrows, ms_per_row):
+        import logging
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        comp = object()          # no `chunked` attr -> the WARNING leg
+        m = self._move()
+        dt = ms_per_row * nrows / 1e3
+        with self.assertLogs(g.logger, level=logging.INFO) as cap:
+            g.GBSpecialBase._infomat_route_check(
+                m, dt, nrows, fast_wired=False, comp=comp)
+            logging.getLogger(g.logger.name).info("sentinel")
+        return any("GB_INFOMAT" in line for line in cap.output)
+
+    def test_one_row_no_longer_warns(self):
+        """The 400-of-404 case."""
+        self.assertFalse(self._fires(1, 17.7))
+
+    def test_a_real_fall_through_still_warns(self):
+        """11 rows at 52.9 ms/source -- the one genuine line in 662."""
+        self.assertTrue(self._fires(11, 52.9))
+
+    def test_the_floor_is_four_rows(self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        self.assertEqual(g.GBSpecialBase._INFOMAT_MIN_ROWS, 4)
+        self.assertFalse(self._fires(3, 100.0))
+        self.assertTrue(self._fires(4, 100.0))
+
+    def test_a_fast_call_above_the_floor_is_still_quiet(self):
+        """The floor must not become a licence to warn."""
+        self.assertFalse(self._fires(50, 1.0))

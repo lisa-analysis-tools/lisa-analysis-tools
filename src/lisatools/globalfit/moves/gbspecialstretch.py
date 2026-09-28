@@ -8099,6 +8099,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             "ll0": xp.zeros(n),
             "led0": xp.zeros(n),
             "rep0": xp.zeros(n, dtype=int),
+            # RJ-proposal baseline, for the COLD over-credit breakdown
+            # below. Without it "did this cell receive birth proposals
+            # during its stay" is unanswerable at finalize time.
+            "rj0": xp.zeros(n, dtype=int),
+            # sum(actual), sum(sampled), n -- COLD cells only, split by
+            # whether the cell saw any RJ proposal during its stay.
+            "cold": {"rj": [0.0, 0.0, 0], "norj": [0.0, 0.0, 0]},
             "spec": xp.zeros(n, dtype=spec.dtype),
             "open": xp.zeros(n, dtype=bool),
             "band_temps": band_temps,
@@ -8119,6 +8126,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         st["ll0"][slots] = lls[slots]
         st["led0"][slots] = ll_change_log[t_i, w_i, b_i]
         st["rep0"][slots] = prop_counts[1][t_i, w_i, b_i]
+        st["rj0"][slots] = prop_counts[0][t_i, w_i, b_i]
         st["spec"][slots] = specials
         st["open"][slots] = True
 
@@ -8138,6 +8146,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     #: order of magnitude of headroom either side, so it does not fire on
     #: ordinary slow blocks.
     _INFOMAT_SLOW_MS = 15.0
+    #: Rows below which a per-source rate is dominated by fixed per-call
+    #: overhead and says nothing about the route. See _infomat_route_check.
+    _INFOMAT_MIN_ROWS = 4
 
     def _infomat_route_check(self, dt, nrows, *, fast_wired, comp):
         """Warn ONCE per propose if the info matrix missed the sig-het route.
@@ -8148,6 +8159,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         the silent case this exists to surface.
         """
         if nrows <= 0 or getattr(self, "_infomat_warned", False):
+            return
+        # ⚠ A PER-SOURCE RATE NEEDS SOURCES. Dividing a fixed per-call
+        # overhead by nrows=1 makes every single-row call look like a
+        # fall-through: 6mo v9 job 662 emitted 404 of these warnings and
+        # 400 of them were "over 1 rows" at ~17.7 ms/source, against 3 at
+        # 2 rows and 1 at 11 rows / 52.9 ms. A warning that fires on
+        # arithmetic rather than on the condition it names is noise, and
+        # noise is how the real one gets missed.
+        if nrows < self._INFOMAT_MIN_ROWS:
             return
         ms = 1e3 * dt / nrows
         if ms < self._INFOMAT_SLOW_MS:
@@ -8451,6 +8471,31 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 int(t_i[k]), int(w_i[k]), int(b_i[k]), int(nrep[k]),
                 float(mm[k]), float(rate[k]), float(allowed[k]),
             )
+        # ---- COLD OVER-CREDIT BREAKDOWN (6mo v9 job 662) -------------
+        # The ledger claims ~1600 lnL more gain than the residual shows,
+        # per propose, in rj_warm_search; the error is DIFFUSE (~0.067
+        # lnL per credited cell, scaling with cells credited) and does
+        # NOT correlate with accepted vertical swaps. The discriminating
+        # question is whether it lives in cells that received BIRTH
+        # PROPOSALS during their stay -- rj_warm_search >> rj_fstat >>
+        # in_model matches that shape -- so split the cold cells on it
+        # and report sum(actual) vs sum(sampled) for each side. Cheap:
+        # two masked sums per finalize, cold rows only.
+        try:
+            _cold = _to_numpy(t_i) == 0
+            if _cold.any():
+                _nrj = _to_numpy(
+                    prop_counts[0][t_i, w_i, b_i]) - _to_numpy(st["rj0"][slots])
+                _ac, _sa = _to_numpy(actual), _to_numpy(sampled)
+                for _key, _m in (("rj", _cold & (_nrj > 0)),
+                                 ("norj", _cold & (_nrj <= 0))):
+                    if _m.any():
+                        _c = st["cold"][_key]
+                        _c[0] += float(_ac[_m].sum())
+                        _c[1] += float(_sa[_m].sum())
+                        _c[2] += int(_m.sum())
+        except Exception:          # diagnostic only, never fatal
+            pass
         st["max_mm"] = max(st["max_mm"], float(xp.abs(mm).max()))
         st["sum_abs_mm"] += float(xp.abs(mm).sum())
         st["n_done"] += int(len(slots))
@@ -8469,6 +8514,25 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             f" (temp {t_i}, walker {w_i}, band {b_i}, {nrep} reps,"
             f" diff {mm:.3e})."
         )
+        # The cold split. ``credited - realized`` POSITIVE means the
+        # ledger claimed more gain than the residual delivered, which is
+        # the job-662 signature; per-cell is the number to compare
+        # across moves (rj_warm_search measured ~0.067 lnL/cell against
+        # in_model's ~0.0001).
+        _cold = st.get("cold")
+        if _cold:
+            _parts = []
+            for _k, _lab in (("rj", "saw-RJ"), ("norj", "no-RJ")):
+                _a, _s, _n = _cold[_k]
+                if _n:
+                    _parts.append(
+                        f"{_lab} n={_n} realized {_a:+.1f} credited {_s:+.1f}"
+                        f" over-credit {(_s - _a):+.1f} ({(_s - _a) / _n:+.4f}"
+                        f"/cell)")
+            if _parts:
+                logger.info(
+                    f"[GB_CELL_LL {self.name}] COLD breakdown -- "
+                    + "; ".join(_parts))
         if rate > allowed:
             logger.warning(
                 f"[GB_CELL_LL {self.name}] per-repeat sampled-vs-actual diff"
@@ -19001,7 +19065,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     f"ALL-RUNGS on, {int(_cn.get('unscorable', 0))} pair(s) "
                     f"dropped as unpriceable, "
                     f"{int(_cn.get('frozen_cached', 0))} frozen rung(s) "
-                    f"priced from cache | "
+                    f"priced from cache, "
+                    # Counted since 7b99f99b but never printed, so the
+                    # one remaining known-short credit path was
+                    # invisible. These are accepted swaps whose partner
+                    # had NO cell-ll bracket to trade with, so their
+                    # credit is short by that swap's jump.
+                    f"{int(_cn.get('one_sided_bracket', 0))} one-sided "
+                    f"bracket(s) | "
                     if _ar_state is not None else ""
                 )
                 + f"per rung pair -- {_rungs or 'none'}"
@@ -24526,9 +24597,21 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             logger.debug(f"After proposal check: {start_diffs=}, {check=}")
             drift = float(np.abs(check).max())
             if drift >= 1e-4:
+                # SIGNED, not just the magnitude. check = ll_after -
+                # credited, so a NEGATIVE value means the ledger claimed
+                # MORE gain than the residual actually shows -- an
+                # over-credit -- and a positive one means it under-
+                # claimed. On 6mo v9 job 662 this was negative in 99 of
+                # 100 sampled lines, which is the single most
+                # discriminating fact about the defect and was invisible
+                # behind the abs(). Report the extreme in each direction.
+                _sv = _to_numpy(check)
                 logger.warning(
                     f"{self._rank_tag()}{self.name}: incremental ll drift "
-                    f"{drift:.3e} after proposal; rebuilding log_like from the "
+                    f"{drift:.3e} after proposal "
+                    f"(signed min {float(_sv.min()):+.3e} "
+                    f"max {float(_sv.max()):+.3e}; negative = the ledger "
+                    f"OVER-credited); rebuilding log_like from the "
                     "residual.")
                 try:
                     _chk = _to_numpy(check)
