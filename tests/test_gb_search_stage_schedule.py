@@ -1376,3 +1376,130 @@ class FstatSkipsShutBandsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             select_comb_peaks(f0, F, edges, sp, np, min_F=10.0,
                               band_skip=np.zeros(self.NB + 2, dtype=bool))
+
+
+class InModelAfterRemovalTest(unittest.TestCase):
+    """A pure in-model pass after ``rj_prior_removal``.
+
+    USER RULING 2026-09-28. ``rj_prior_removal`` was the ONLY RJ move
+    with no in-model partner, so the SAVED state -- and the residual
+    the next iteration's births are drawn against -- was the post-death
+    state with no group-rule pass over it. The surviving twin of a
+    killed double is exactly the cell that needs readjusting.
+
+    ⚠ NOT a doubles cure: deaths are still JUDGED on the unadjusted
+    residual. Correctness of the saved state, and better births.
+    """
+
+    def setUp(self):
+        self.env = mock.patch.dict(os.environ, {}, clear=False)
+        self.env.start()
+        for k in ("GB_SEARCH_INMODEL_AFTER_REMOVAL", "GB_SEARCH_DROP_MOVES"):
+            os.environ.pop(k, None)
+        self.addCleanup(self.env.stop)
+        self.m = self._mod()
+        self.m._DROP_LOGGED.clear()
+
+    @staticmethod
+    def _mod():
+        import importlib.util
+        import os as _os
+        p = _os.path.join(
+            _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+            "scripts", "fstat_proposal", "run_combined_staged.py")
+        spec = importlib.util.spec_from_file_location("_rcs_rem", p)
+        mod = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(mod)
+        except SystemExit:
+            pass
+        return mod
+
+    @staticmethod
+    def _src():
+        import pathlib
+        return (pathlib.Path(__file__).resolve().parents[1] / "scripts"
+                / "fstat_proposal" / "run_combined_staged.py").read_text()
+
+    # (a) composition and ORDER
+    def test_it_FOLLOWS_rj_prior_removal_in_both_assemblies(self):
+        """Before the removal it would polish the pre-death state,
+        which is the opposite of the point."""
+        import re
+        src = self._src()
+        # IMMEDIATELY after: nothing but whitespace and the list "+"
+        # may sit between the removal move and its in-model partner.
+        # An earlier version of this test used rindex to find "the
+        # previous rj_prior_removal", which still succeeded when the
+        # call was moved BEFORE it -- the spec's own mutation did not
+        # fail. This pattern cannot be satisfied by the wrong order.
+        pat = re.compile(
+            r'Move\("rj_prior_removal",\s*branch="gb"\)\]\s*\+\s*'
+            r'(?:gb_only_)?in_model\("in_model_removal"\)')
+        self.assertEqual(
+            len(pat.findall(src)), 2,
+            "in_model_removal must directly follow rj_prior_removal in "
+            "BOTH stage assemblies")
+
+    def test_it_precedes_the_ridge_move(self):
+        src = self._src()
+        i = src.index('gb_only_in_model("in_model_removal")')
+        self.assertLess(i, src.index("ridge()),", i))
+
+    def test_BOTH_assemblies_gate_on_the_knob(self):
+        """Gating one and not the other is the shape this file warns
+        about; it has already bitten twice here."""
+        self.assertEqual(
+            self._src().count(
+                'if slot == "in_model_removal" and not '
+                "_inmodel_after_removal():"), 2)
+
+    # (b) the knob
+    def test_the_knob_is_ON_by_default(self):
+        self.assertTrue(self.m._inmodel_after_removal())
+
+    def test_turning_it_OFF_removes_the_slot(self):
+        os.environ["GB_SEARCH_INMODEL_AFTER_REMOVAL"] = "0"
+        self.assertFalse(self.m._inmodel_after_removal())
+
+    # (d) it composes with the drop knob, guard unaffected
+    def test_DROP_MOVES_can_name_it(self):
+        os.environ["GB_SEARCH_DROP_MOVES"] = "in_model_removal"
+        self.assertTrue(self.m._drop_slot("in_model_removal"))
+        self.assertFalse(self.m._drop_slot("in_model"))
+
+    def test_the_undroppable_guard_is_unaffected(self):
+        os.environ["GB_SEARCH_DROP_MOVES"] = "rj_fstat_search"
+        with self.assertRaises(SystemExit):
+            self.m._dropped_search_moves()
+
+    # the slot has to EXIST or materialization fails
+    def test_the_slot_is_registered_so_the_move_is_BUILT(self):
+        """A listed-but-unbuilt move fails recipe materialization."""
+        import lisatools.globalfit.recipe as r
+        import inspect
+        src = inspect.getsource(r)
+        i = src.index("GB_IN_MODEL_SLOTS = (")
+        self.assertIn("in_model_removal", src[i:i + 200])
+
+    # (c) the stage profile reaches it
+    def test_the_profile_applies_by_DISCOVERY_not_a_name_list(self):
+        """_apply_profile walks gb_moves_in_tree, so a new GB move in
+        the stage is covered automatically and the '[V9-STAGE] ... over
+        N GB move(s) [...]' line names it. Asserted because the spec
+        assumed a name list that would have had to be edited."""
+        import inspect
+        import lisatools.globalfit.recipe as r
+        src = inspect.getsource(r.SearchStageProfileStep._apply_profile)
+        self.assertIn("gb_moves_in_tree(self.moves)", src)
+        self.assertNotIn('"in_model_fstat"', src)
+
+    # (e) the launchers
+    def test_BOTH_launchers_export_it(self):
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parents[1]
+        for name in ("submit_gf_6mo_v9_4gpu.sh", "submit_gf_3mo_v9_2gpu.sh"):
+            src = (root / "scripts" / "fstat_proposal" / name).read_text()
+            self.assertIn("export GB_SEARCH_INMODEL_AFTER_REMOVAL=1",
+                          src, name)
+            self.assertIn("NOT A DOUBLES CURE", src, name)

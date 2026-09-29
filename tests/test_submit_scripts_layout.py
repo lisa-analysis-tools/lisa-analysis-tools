@@ -656,6 +656,12 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # interim compromise -- one global knob cannot suit both
             # halves -- pending the per-axis scaling on the
             # gb-inmodel-axis-adapt branch.
+            # V9-24 (2026-09-28): GB_SEARCH_INMODEL_AFTER_REMOVAL --
+            # a pure in-model pass after rj_prior_removal, the only RJ
+            # move that had no in-model partner, so the SAVED state was
+            # the post-death state with no group-rule pass over it. v8
+            # predates the slot entirely.
+            "GB_SEARCH_INMODEL_AFTER_REMOVAL",
             "GB_INMODEL_OBSERVABLE_JUMP",
             "GB_SEARCH_BAND_SHUTOFF_LL_TOL",
             # GB_SEARCH_DROP_MOVES is deliberately NOT listed: Mike

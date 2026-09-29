@@ -4105,7 +4105,8 @@ def build_gb_moves(
     #:
     #: The first keeps the historical bare name so single-stage recipes, the
     #: ``gb_no_fg`` auto-insertion and every existing runbook still resolve.
-    GB_IN_MODEL_SLOTS = ("in_model", "in_model_fstat", "in_model_replace")
+    GB_IN_MODEL_SLOTS = ("in_model", "in_model_fstat", "in_model_replace",
+                         "in_model_removal")
 
     gb_in_model_moves = []
     if _gb_mode_search and getattr(gb_info, "search_in_model", False):

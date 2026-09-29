@@ -2721,6 +2721,19 @@ export GB_SEARCH_BAND_SHUTOFF_CONV_ITER=3
 # Read from env AT JUDGE TIME and NOT part of the band_shutoff_w_step
 # stamp, so the persisted streak/max survive this change.
 export GB_SEARCH_BAND_SHUTOFF_LL_TOL=20
+# A PURE IN-MODEL PASS AFTER rj_prior_removal (2026-09-28, Mike).
+# rj_prior_removal is the ONLY RJ move with no in-model partner, so the
+# SAVED STATE -- and the residual the next iteration's births are drawn
+# against -- was the post-death state with no group-rule pass over it.
+# The surviving twin of a killed double is exactly the cell that needs
+# readjusting after the death.
+# ⚠ NOT A DOUBLES CURE: deaths are still JUDGED on the unadjusted
+# residual. This is correctness of the saved state and better births.
+# Same move class as in_model / in_model_fstat, so it inherits the
+# level-2 group rule, the level-3 shut mask and the census. Cost is the
+# same class too: ~1400 s at a fully open population, under 200 s once
+# most pairs are shut. GB_SEARCH_DROP_MOVES can name it.
+export GB_SEARCH_INMODEL_AFTER_REMOVAL=1
 # GB_SEARCH_DROP_MOVES EXISTS BUT IS DELIBERATELY UNSET.
 # It omits named pure in-model slots from every search stage. Dropping
 # in_model_fstat was proposed on 2026-09-28 on cost grounds (it and

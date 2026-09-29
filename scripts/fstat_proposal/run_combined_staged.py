@@ -250,6 +250,25 @@ def _dropped_search_moves() -> frozenset:
     return frozenset(want)
 
 
+def _inmodel_after_removal() -> bool:
+    """``GB_SEARCH_INMODEL_AFTER_REMOVAL`` -- default ON.
+
+    ``rj_prior_removal`` is the ONLY RJ move with no in-model partner,
+    so until now the saved state -- and the residual the NEXT
+    iteration's births are drawn against -- was the post-death state
+    with no group-rule pass over it. The surviving twin of a killed
+    double is precisely the cell that needs readjusting after the
+    death.
+
+    ⚠ NOT A DOUBLES CURE, and the comment is here so nobody reads it as
+    one: deaths are still JUDGED on the unadjusted residual. This is
+    correctness of the saved state and better births from it.
+    """
+    return os.environ.get(
+        "GB_SEARCH_INMODEL_AFTER_REMOVAL", "1").strip() in (
+            "1", "true", "True", "yes", "on")
+
+
 def _drop_slot(slot: str) -> bool:
     """Is this stage slot dropped by the knob? Logs once per slot."""
     if slot not in _dropped_search_moves():
@@ -831,6 +850,8 @@ def build_fit():
         def gb_only_in_model(slot):
             if _drop_slot(slot):
                 return []
+            if slot == "in_model_removal" and not _inmodel_after_removal():
+                return []
             # Same in_model_replace retirement as the full composition --
             # there are TWO stage assemblies in this file and gating only
             # one of them is the "knob resolves, consuming path never runs"
@@ -896,6 +917,7 @@ def build_fit():
                            + replace()
                            + gb_only_in_model("in_model_replace")
                            + [Move("rj_prior_removal", branch="gb")]
+                           + gb_only_in_model("in_model_removal")
                            + ridge()),
                     step_kwargs=dict(
                         plateau_branch="gb",
@@ -1377,6 +1399,8 @@ def build_fit():
         """
         if _drop_slot(slot):
             return []
+        if slot == "in_model_removal" and not _inmodel_after_removal():
+            return []
         # in_model_replace retires with rj_replace (user ruling
         # 2026-09-26: "in_model_replace we do not need this anymore").
         # It was the polish slot for rj_replace's survivors; with that move
@@ -1543,6 +1567,7 @@ def build_fit():
                 + in_model("in_model_replace")
                 + _noise_rep
                 + [Move("rj_prior_removal", branch="gb")]
+                + in_model("in_model_removal")
                 + _noise_rem
                 + ([Move("gb_ridge_gibbs", branch="gb")]
                    if os.environ.get("GB_RIDGE_GIBBS", "1") == "1" else [])
