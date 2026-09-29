@@ -697,6 +697,7 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # exactly cancelled on every axis the information matrix could
             # measure (the launcher block says why, at length).
             "GB_INMODEL_OBSERVABLE_AXIS_SCALE",
+            "GB_INMODEL_OBSERVABLE_AXIS_BETA",
             "GB_INMODEL_OBSERVABLE_AXIS_ADAPT",
             "GB_INMODEL_OBSERVABLE_AXIS_TARGET",
             "GB_INMODEL_OBSERVABLE_AXIS_GAIN",

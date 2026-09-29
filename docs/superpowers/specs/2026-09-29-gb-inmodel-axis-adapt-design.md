@@ -39,6 +39,7 @@ choose the *directions* and cannot touch the *size*.
 | `GB_INMODEL_OBSERVABLE_SHEAR` | **LIVE.** It changes the internal basis, hence `Γ_z` and the axes themselves |
 | `GB_INMODEL_OBSERVABLE_FIBER_WEIGHT` | **LIVE.** It gates the fiber column |
 | `GB_INMODEL_OBSERVABLE_AXIS_SCALE` | **LIVE** — added here, `1.0` = inert. Multiplies `sig`, which is the other thing that can |
+| `GB_INMODEL_OBSERVABLE_AXIS_BETA` | **LIVE** — added here, `0` = inert. The analytic rung factor; cold chain unaffected |
 
 ### The consequence, and the cheapest fix
 
@@ -62,6 +63,48 @@ The adaptation in §3 then buys the per-band / per-rung *spread* around
 2.38 rather than the factor itself — and from a `1.0` start at gain 0.2
 it takes roughly 16 proposes just to walk to 2.38, so arming it without
 setting `AXIS_SCALE` wastes that time.
+
+⚠ `AXIS_SCALE` only exists on this branch. The experiment needs
+`354c5365` on `dev` (or the branch checked out on the cluster), not just
+an export. The knob is inert at its default, so the cherry-pick itself
+changes nothing.
+
+### The rung factor, which is a second thing entirely
+
+The information matrix is the **cold** likelihood's curvature, and
+nothing in this chain has ever seen a temperature — zero occurrences of
+`beta` between the `Γ_z` stash and the draw. So every rung takes a 1σ
+step in the *cold* posterior's width. At inverse temperature β the
+tempered target is `L^β · prior`, curvature `β·Γ`, so its own σ is
+`σ_cold/√β`: a hot rung wants a **wider** step by `1/√β` and today takes
+only `√β` of its target's σ.
+
+Corroborated by the launcher's own record: `obs_basis` acceptance
+**cold 0.71 vs all-rung 0.78** — the hot rungs over-accept *more*, which
+is the direction this predicts.
+
+`GB_INMODEL_OBSERVABLE_AXIS_BETA=1` applies it. β = 1 on rung 0, so it
+leaves the cold chain untouched and is a **separable** experiment from
+`AXIS_SCALE`. This closes the standing TODO
+`project_todo_eigen_walker_max_beta_scaling_0918`.
+
+⚠ When it is on, `SMAX` travels with the rung too (`smax/√β`). "Never
+more than 10× the analytic width" is a statement about a *cold* width
+(`w` goes as `1/rho`, no β), so a fixed cap would clip the wanted 23.8
+back to 10 at β = 0.01 and re-break exactly what the factor fixes.
+`AXIS_SCALE` does **not** move the cap — it corrects the optimum at a
+given width rather than changing what the natural width is, so an
+unmeasurable direction stays bounded as before. A test caught that
+interaction, not a review.
+
+### How to judge the experiment
+
+Acceptance alone is not the success criterion (audit window's caveat,
+and it is right). Watch pooled cold acceptance moving toward 0.44
+**and** faster level-1 / level-2 convergence. Two standing caveats:
+2.38 is the *Gaussian* 1-D optimum and the information matrix is not the
+posterior curvature everywhere; and the `1/√β` factor is the analytic
+rung correction, not a substitute for measuring it.
 
 ## 1. `GB_INMODEL_OBSERVABLE_JUMP` does not reach the eigen step
 
@@ -232,6 +275,7 @@ moves that run most of the in-model repeats.
 | knob | default | meaning |
 |---|---|---|
 | `GB_INMODEL_OBSERVABLE_AXIS_SCALE` | `1.0` | **static** width multiplier on `sig`, re-capped at `SMAX`. Theory value 2.38 (§0) |
+| `GB_INMODEL_OBSERVABLE_AXIS_BETA` | `0` | apply the analytic `1/sqrt(beta)` rung factor; moves `SMAX` with the rung. Cold chain untouched |
 | `GB_INMODEL_OBSERVABLE_AXIS_ADAPT` | `0` | master arm. Off = table stays `None`, step byte-identical, and no keys are bound so the accumulator costs nothing |
 | `GB_INMODEL_OBSERVABLE_AXIS_TARGET` | `0.44` | target acceptance; 1-D optimum, since axis mode draws one axis per repeat |
 | `GB_INMODEL_OBSERVABLE_AXIS_GAIN` | `0.2` | log-space gain per propose |

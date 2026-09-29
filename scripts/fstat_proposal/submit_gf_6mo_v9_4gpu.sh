@@ -3139,6 +3139,23 @@ echo "[GB-OBS-EIGEN] GB_INMODEL_OBSERVABLE_EIGEN='${GB_INMODEL_OBSERVABLE_EIGEN}
 # matrix MEASURED, while a railed axis is one it could not measure,
 # where the cap is making a different statement and must still bind.
 export GB_INMODEL_OBSERVABLE_AXIS_SCALE=${GB_INMODEL_OBSERVABLE_AXIS_SCALE:-1.0}
+# THE RUNG FACTOR. The information matrix is the COLD likelihood's
+# curvature and nothing in the observable chain has ever seen a
+# temperature, so EVERY rung takes a 1-sigma step in the COLD
+# posterior's width. At inverse temperature beta the tempered target is
+# L^beta * prior, curvature beta * Gamma, so its own sigma is
+# sigma_cold/sqrt(beta): a hot rung wants a WIDER step by 1/sqrt(beta)
+# and today takes only sqrt(beta) of its target's sigma. The launcher's
+# own record corroborates the direction -- obs_basis acceptance cold
+# 0.71 vs all-rung 0.78, i.e. the hot rungs over-accept MORE.
+# beta = 1 on rung 0, so this leaves the COLD chain untouched and is a
+# SEPARABLE experiment from GB_INMODEL_OBSERVABLE_AXIS_SCALE above.
+# When on, GB_INMODEL_OBSERVABLE_EIGEN_SMAX travels with the rung too
+# (smax/sqrt(beta)) -- "10x the analytic width" is a statement about a
+# COLD width, and a fixed cap would clip 23.8 back to 10 at beta=0.01
+# and re-break exactly what this fixes.
+# Closes the standing TODO "walker_max eigen needs 1/sqrt(beta)".
+export GB_INMODEL_OBSERVABLE_AXIS_BETA=${GB_INMODEL_OBSERVABLE_AXIS_BETA:-0}
 # ---- PER-AXIS ADAPTIVE STEP SCALES (branch gb-inmodel-axis-adapt) ------
 # ⚠ READ THIS BEFORE RE-TUNING GB_INMODEL_OBSERVABLE_JUMP ABOVE. Under
 # GB_INMODEL_OBSERVABLE_EIGEN=axis that knob is EXACTLY CANCELLED on

@@ -1136,7 +1136,8 @@ class AxisAdaptEndToEndTest(unittest.TestCase):
         import inspect
         import lisatools.globalfit.moves.gbspecialstretch as g
         src = inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
-        self.assertIn("self._obs_axis_bind_keys(band_sorter)", src)
+        self.assertIn("self._obs_axis_bind_keys(band_sorter, band_temps)",
+                      src)
 
 
 class EigenStepIsAlwaysOneSigmaTest(unittest.TestCase):
@@ -1231,3 +1232,150 @@ class StaticAxisScaleTest(unittest.TestCase):
             return np.minimum(1.0, np.exp(-0.5 * (y ** 2 - x ** 2))).mean()
         self.assertAlmostEqual(acc(1.0), 0.705, places=2)
         self.assertAlmostEqual(acc(2.38), 0.445, places=2)
+
+
+class RungWidthFactorTest(unittest.TestCase):
+    """The information matrix is the COLD curvature, and nothing in the
+    observable chain has ever seen a temperature. At inverse temperature
+    beta the tempered target's sigma is sigma_cold/sqrt(beta), so a hot
+    rung takes a step of only sqrt(beta) of its OWN target's width."""
+
+    POOL, N = 20, 4
+
+    def _mags(self, betas, on, scale=None):
+        s = _stub()
+        s._obs_rho = np.full(self.POOL, 40.0)
+        ids = np.arange(self.N)
+        w = np.asarray(s._observable_step_scales(None, ids, NDIM))
+        gz = np.full((self.POOL, NDIM, NDIM), np.nan)
+        for k in range(self.N):
+            gz[k] = np.diag(np.ones(NDIM) / w[k] ** 2)
+        s._obs_gamma_z = gz
+        # band_temps is [band, temp] and holds BETAS
+        # the stub is a SimpleNamespace, exactly like a rank-process
+        # object: it has no _obs_row_beta, which is why the hook is
+        # module-level. Bind the real method so this test drives the
+        # production lookup rather than a reimplementation of it.
+        import lisatools.globalfit.moves.gbspecialstretch as _g
+        s._obs_beta_src = (np.arange(self.N), np.zeros(self.N, int),
+                           np.asarray(betas, float)[:, None])
+        s._obs_row_beta = functools.partial(
+            _g.GBSpecialBase._obs_row_beta, s)
+        env = {"GB_INMODEL_OBSERVABLE_AXIS_BETA": "1" if on else "0"}
+        if scale is not None:
+            env["GB_INMODEL_OBSERVABLE_AXIS_SCALE"] = str(scale)
+        with mock.patch.dict(os.environ, env):
+            s._observable_eigen_prepare(None, ids, self.POOL)
+        return np.linalg.norm(np.asarray(s._obs_eigen_table)[:self.N],
+                              axis=1)
+
+    def test_a_hot_rung_gets_a_WIDER_step_by_one_over_sqrt_beta(self):
+        betas = np.array([1.0, 0.25, 0.04, 0.01])
+        off = self._mags(betas, on=False)
+        on = self._mags(betas, on=True)
+        np.testing.assert_allclose((on / off)[:, 0], 1.0 / np.sqrt(betas),
+                                   rtol=1e-10)
+
+    def test_the_COLD_chain_is_untouched_so_it_cannot_confound_the_scale(
+            self):
+        """beta = 1 on rung 0, so this factor and AXIS_SCALE are
+        separable experiments."""
+        betas = np.array([1.0, 1.0, 1.0, 1.0])
+        np.testing.assert_allclose(self._mags(betas, on=True),
+                                   self._mags(betas, on=False), rtol=1e-12)
+
+    def test_OFF_by_default_and_byte_identical(self):
+        betas = np.array([1.0, 0.25, 0.04, 0.01])
+        s = _stub()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GB_INMODEL_OBSERVABLE_AXIS_BETA", None)
+            base = self._mags(betas, on=False)
+        np.testing.assert_array_equal(base, self._mags(betas, on=False))
+
+    def test_it_composes_with_AXIS_SCALE(self):
+        betas = np.array([1.0, 0.25, 0.04, 0.01])
+        off = self._mags(betas, on=False)
+        both = self._mags(betas, on=True, scale=2.38)
+        np.testing.assert_allclose((both / off)[:, 0],
+                                   2.38 / np.sqrt(betas), rtol=1e-10)
+
+    def test_no_band_temps_means_no_factor_rather_than_a_crash(self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        m = g.GBSpecialBase.__new__(g.GBSpecialBase)
+        g.GBSpecialBase._obs_axis_bind_keys(m, None, None)
+        self.assertIsNone(m._obs_beta_src)
+        self.assertIsNone(g.GBSpecialBase._obs_row_beta(m, np.arange(3), np))
+
+    def test_the_beta_lookup_is_bound_even_when_adaptation_is_OFF(self):
+        """The rung factor is its own knob and must not depend on the
+        adaptation being armed."""
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        m = g.GBSpecialBase.__new__(g.GBSpecialBase)
+        sorter = types.SimpleNamespace(
+            band_inds=np.array([0, 1]), temp_inds=np.array([0, 1]),
+            ntemps=2, nwalkers=1, num_bands=2)
+        bt = np.array([[1.0, 0.5], [1.0, 0.25]])
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GB_INMODEL_OBSERVABLE_AXIS_ADAPT", None)
+            g.GBSpecialBase._obs_axis_bind_keys(m, sorter, bt)
+        self.assertIsNone(m._obs_axis_keys)
+        np.testing.assert_allclose(
+            g.GBSpecialBase._obs_row_beta(m, np.array([0, 1]), np),
+            [1.0, 0.25])
+
+    def test_the_block_open_passes_band_temps(self):
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
+        self.assertIn("self._obs_axis_bind_keys(band_sorter, band_temps)",
+                      src)
+
+    def test_the_convention_matches_the_rest_of_the_file(self):
+        """band_temps is [band, temp] and holds BETAS -- the one thing
+        a 1/sqrt(beta) factor can get silently backwards."""
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._obs_row_beta)
+        self.assertIn("bt[b[i], t[i]]", src)
+
+
+class RungCapTravelsWithTheRungTest(RungWidthFactorTest):
+    """SMAX means "10x the analytic width". The analytic width is COLD
+    (1/rho, no beta), so at rung beta the same statement is
+    smax/sqrt(beta). A fixed cap would re-break what the rung factor
+    fixes: at beta=0.01 the wanted factor is 23.8 and a cold cap of 10
+    clips it straight back to 2.4x too narrow."""
+
+    def test_the_cap_scales_with_the_rung_so_it_does_not_reclip(self):
+        betas = np.array([1.0, 0.25, 0.04, 0.01])
+        off = self._mags(betas, on=False)
+        both = self._mags(betas, on=True, scale=2.38)
+        # 2.38/sqrt(0.01) = 23.8, well past a cold cap of 10
+        np.testing.assert_allclose((both / off)[:, 0],
+                                   2.38 / np.sqrt(betas), rtol=1e-10)
+
+    def test_AXIS_SCALE_alone_does_NOT_move_the_cap(self):
+        """It corrects the OPTIMUM at a given width, not what the
+        natural width is, so an unmeasurable direction stays bounded."""
+        s = _stub()
+        s._obs_rho = np.full(self.POOL, 40.0)
+        ids = np.arange(self.N)
+        w = np.asarray(s._observable_step_scales(None, ids, NDIM))
+        gz = np.full((self.POOL, NDIM, NDIM), np.nan)
+        for k in range(self.N):
+            gz[k] = np.diag(np.full(NDIM, 1e-6) / w[k] ** 2)   # all railed
+        s._obs_gamma_z = gz
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GB_INMODEL_OBSERVABLE_AXIS_SCALE", None)
+            os.environ.pop("GB_INMODEL_OBSERVABLE_AXIS_BETA", None)
+            s._observable_eigen_prepare(None, ids, self.POOL)
+        base = np.linalg.norm(np.asarray(s._obs_eigen_table)[:self.N],
+                              axis=1).copy()
+        s._obs_eigen_table = None
+        with mock.patch.dict(
+            os.environ, {"GB_INMODEL_OBSERVABLE_AXIS_SCALE": "2.38"}
+        ):
+            s._observable_eigen_prepare(None, ids, self.POOL)
+        np.testing.assert_allclose(
+            np.linalg.norm(np.asarray(s._obs_eigen_table)[:self.N], axis=1),
+            base, rtol=1e-10)

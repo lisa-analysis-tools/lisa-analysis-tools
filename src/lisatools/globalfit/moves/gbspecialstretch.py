@@ -1390,6 +1390,20 @@ def _obs_axis_adapt_accum_for(move, pick, w, wa, na, xp):
         fn(pick, w, wa, na, xp)
 
 
+def obs_row_beta_for(move, ids, xp):
+    """Per-row inverse temperature for ``move``, or ``None``.
+
+    MODULE-LEVEL for the reason the sibling hooks are: the eigen
+    prepare is driven by duck-typed stubs in the observable test
+    suites and by whatever a fan-out stands up in a rank process. A
+    bound method would make every such object grow one or crash the
+    table build; a getattr degrades to "no ladder visible here", which
+    correctly leaves the rung factor off.
+    """
+    fn = getattr(move, "_obs_row_beta", None)
+    return None if fn is None else fn(ids, xp)
+
+
 def _obs_axis_dom_accum_for(move, dom, ok, xp):
     """Tally WHICH coordinate dominates each axis rank, or do nothing.
 
@@ -14430,7 +14444,23 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             or "search" in str(getattr(self, "name", "")).lower()
         )
 
-    def _obs_axis_bind_keys(self, band_sorter) -> None:
+    def _obs_row_beta(self, ids, xp):
+        """Per-row inverse temperature, or ``None``.
+
+        ``band_temps`` holds BETAS indexed ``[band, temp]`` -- the
+        convention ``_vertical_adapt_ladder`` fixes (``betas0 =
+        band_temps.T``; ``1 / betas`` is the temperature) and that
+        twelve other sites in this file read as
+        ``band_temps[b_i, t_i]``. Rung 0 is beta = 1.
+        """
+        src = getattr(self, "_obs_beta_src", None)
+        if src is None:
+            return None
+        b, t, bt = src
+        i = xp.asarray(ids).ravel()
+        return bt[b[i], t[i]]
+
+    def _obs_axis_bind_keys(self, band_sorter, band_temps=None) -> None:
         """Bind this propose's per-row ``(temp, walker, band)`` labels.
 
         Called at BLOCK OPEN, where the sorter is in hand; the draw path
@@ -14439,6 +14469,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         bind too many and is kept only because the block open is the one
         place that has the sorter.
         """
+        # The beta lookup is bound UNCONDITIONALLY: the 1/sqrt(beta)
+        # width factor is its own knob and must not depend on whether
+        # the adaptation is armed.
+        self._obs_beta_src = (
+            None if (band_sorter is None or band_temps is None)
+            else (band_sorter.band_inds, band_sorter.temp_inds, band_temps))
         # UNARMED => no keys, which makes ``_obs_axis_adapt_accum`` a
         # single attribute read per repeat instead of two bincounts over
         # a (ntemps * nwalkers * nbands * naxes) array. "Off" has to be
@@ -15193,9 +15229,51 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # MEASURED; an axis railed at SMAX is one it could not measure,
         # where the cap is making a different statement and must still
         # bind.
+        #
+        # THE RUNG FACTOR, same place and the same argument. The
+        # information matrix is the COLD likelihood's curvature, and
+        # nothing in this chain has ever seen a temperature (zero
+        # occurrences of ``beta`` between the Gamma_z stash and the
+        # draw) -- so every rung takes a 1-sigma step in the COLD
+        # posterior's width. At inverse temperature beta the tempered
+        # target is L^beta * prior, whose curvature is beta * Gamma, so
+        # its own sigma is sigma_cold / sqrt(beta): a hot rung wants a
+        # WIDER step by 1/sqrt(beta), and today takes a step of only
+        # sqrt(beta) of its target's sigma.
+        # Corroboration from the launcher's own record: obs_basis
+        # acceptance cold 0.71 vs all-rung 0.78 -- the hot rungs
+        # over-accept MORE than the cold chain, which is the direction
+        # this predicts.
+        # ⚠ beta = 1 on rung 0, so this factor leaves the COLD chain
+        # untouched and cannot confound an AXIS_SCALE experiment.
+        # Closes the standing TODO in
+        # project-todo-eigen-walker-max-beta-scaling-0918.
         _st = _observable_knob("GB_INMODEL_OBSERVABLE_AXIS_SCALE", 1.0)
-        if _st != 1.0:
-            sig_w = xp.minimum(sig_w * _st, smax)
+        _mult = None
+        if _observable_knob("GB_INMODEL_OBSERVABLE_AXIS_BETA", 0.0):
+            _b = obs_row_beta_for(self, ids_x, xp)
+            if _b is not None:
+                _mult = 1.0 / xp.sqrt(xp.clip(xp.asarray(_b, dtype=float),
+                                              1e-12, None))
+        if _st != 1.0 or _mult is not None:
+            # ⚠ THE CAP TRAVELS WITH THE RUNG, and only with the rung.
+            # ``SMAX`` says "never step more than 10x the analytic
+            # width", and the analytic width ``w`` is a COLD quantity
+            # (it goes as 1/rho and has no beta in it). At rung beta the
+            # natural width is w/sqrt(beta), so 10x the natural width at
+            # THIS rung is smax/sqrt(beta). Leaving the cap at the cold
+            # value would re-break what the rung factor just fixed: at
+            # beta = 0.01 the wanted factor is 23.8 and a fixed cap of
+            # 10 clips it back to 2.4x too narrow -- silently, which is
+            # the whole failure mode of this area. (A test caught this,
+            # not a review.)
+            # ``AXIS_SCALE`` does NOT move the cap: it is a correction
+            # to the OPTIMUM at a given width, not a change in what the
+            # natural width is, so an unmeasurable direction stays
+            # bounded exactly as before.
+            _f = _st if _mult is None else (_st * _mult)[:, None]
+            _cap = smax if _mult is None else smax * _mult[:, None]
+            sig_w = xp.minimum(sig_w * _f, _cap)
         # PER-EIGEN-AXIS ADAPTIVE SCALE. On ``sigma_w``, which is the one
         # factor of the product below that does not cancel -- see
         # :func:`obs_axis_scale_for`. ``None`` leaves the table
@@ -18567,7 +18645,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # The adaptive per-axis multipliers are keyed by
             # (temp, walker, band); the draw path sees source ids only,
             # so the row labels are bound here, where the sorter is.
-            self._obs_axis_bind_keys(band_sorter)
+            self._obs_axis_bind_keys(band_sorter, band_temps)
             # OBSERVABLE + EIGENBASIS: build the block-frozen eigen table
             # HERE -- after the rho snapshot (the whitening scales need it)
             # and never inside the repeat loop (the freeze is what keeps
