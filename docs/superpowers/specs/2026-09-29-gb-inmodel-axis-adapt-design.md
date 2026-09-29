@@ -97,6 +97,41 @@ given width rather than changing what the natural width is, so an
 unmeasurable direction stays bounded as before. A test caught that
 interaction, not a review.
 
+### The numbers each step should produce
+
+The 1-D RWM law is exact for a Gaussian target with a Gaussian
+proposal: `a(s) = (2/π)·arctan(2/s)`, with `s` the step in units of the
+*target's* σ. The step is fixed at `1·σ_cold` on every rung, so at
+rung β, `s = √β`.
+
+| | predicted | measured (job 663) |
+|---|---|---|
+| cold rung, today | **0.705** | **0.71** |
+| all-rung, today, ladder β_min = 0.1 … 0.01 | 0.82 … 0.88 | **0.78** |
+
+The cold number is the headline: the identity predicts it essentially
+exactly, which is what makes this a diagnosis.
+
+The all-rung number is **lower than the naive ladder predicts**, and
+that is worth saying rather than burying. Inverting it, 0.78 implies an
+effective `β_min ≈ 0.25` (insensitive to `ntemps`) — so either the
+per-band ladders are shallow in the bands being sampled, or the
+in-model draws are concentrated on the cool rungs. Either way the rung
+effect is *weaker* than the ladder alone suggests, so temper the
+expected gain from `AXIS_BETA` accordingly.
+
+Falsifiable, and separable because β = 1 on rung 0:
+
+| change | cold | all-rung |
+|---|---|---|
+| `AXIS_BETA=1` alone | unchanged 0.71 | 0.78 → **0.705** (collapses onto cold) |
+| `AXIS_SCALE=2.38` alone | 0.71 → **0.445** | falls by roughly the same factor |
+| both | **0.445** | **0.445** (every rung steps 2.38σ of its own target) |
+
+If `AXIS_SCALE=2.38` does *not* move cold acceptance to ≈0.44, the
+Gaussian assumption behind 2.38 is the first thing to doubt — the
+information matrix is not the posterior curvature everywhere.
+
 ### How to judge the experiment
 
 Acceptance alone is not the success criterion (audit window's caveat,
