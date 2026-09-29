@@ -919,20 +919,17 @@ class ThreeMonthTwinTest(unittest.TestCase):
             # transient knobs -- no stored number depends on them -- and both
             # scripts make them env-overridable, so the split is a default,
             # not a fork.
-            # GF_MONITOR_AFTER_SAVE: 0 on 3mo, 1 on 6mo (2026-09-28).
-            # MITIGATION, root cause unknown. The 3mo saver died in
-            # save_step_main -> eryn HDFBackend.open with "file is
-            # already open for read-only", i.e. a read-only handle to
-            # the live store was still open INSIDE the saver process at
-            # the next save. Leading suspect is the PAGE, which is NOT
-            # a child: build_monitor defaults to in_process=True, and
-            # build_monitor_in_process closes the generator's handles
-            # only from the namespace runpy returns -- which is nothing
-            # when the generator raises. a4 owns the fix. The 6mo saver has run the same hook for
-            # six saves without it and its per-iteration tars are
-            # relied on, so the two genuinely differ for now. Remove
-            # this entry once 3mo goes back to 1.
-            "GF_MONITOR_AFTER_SAVE",
+            # GF_MONITOR_PAGE: 0 on 3mo, unset (page ON) on 6mo
+            # (2026-09-28). The in-process page render leaked the live
+            # store handle when the generator raised, killing the 3mo
+            # saver; a4 fixed that, but the in-process path still has
+            # no timeout wired, so a page that HANGS rather than raises
+            # would still block the saver. 3mo is tar-only until that
+            # is wired and one clean stage has run on the 6mo, which
+            # keeps the page. Remove this entry when 3mo takes it back.
+            # (TWO twin tests, TWO allowed lists -- authorising only one
+            # leaves the other failing.)
+            "GF_MONITOR_PAGE",
             "GB_INMODEL_SETUP_BATCH", "GB_SIGHET_FOLD_MAX_BYTES",
             "GB_INFOMAT_MEMPOOL_FREE", "GB_INMODEL_BATCH_MEMPOOL_FREE",
         }
@@ -1135,16 +1132,17 @@ class ThreeMonthV9TwinTest(unittest.TestCase):
         """The whole point of deriving from 6mo: only the listed knobs differ."""
         allowed = {
             # 3MO-1 Tobs + derived
-            # GF_MONITOR_AFTER_SAVE: 0 on 3mo, 1 on 6mo (2026-09-28), a
-            # MITIGATION for the 3mo saver dying in save_step_main ->
-            # HDFBackend.open ("file is already open for read-only").
-            # Root cause unknown and owned by a4; the 6mo saver has run
-            # the same hook cleanly for six saves and its per-iteration
-            # tars are relied on. Remove once 3mo goes back to 1.
+            # GF_MONITOR_PAGE: 0 on 3mo, unset (page ON) on 6mo
+            # (2026-09-28). The in-process page render leaked the live
+            # store handle when the generator raised, killing the 3mo
+            # saver; a4 fixed that, but the in-process path still has
+            # no timeout wired, so a page that HANGS rather than raises
+            # would still block the saver. 3mo is tar-only until that
+            # is wired and one clean stage has run on the 6mo, which
+            # keeps the page. Remove this entry when 3mo takes it back.
             # (TWO twin tests, TWO allowed lists -- authorising only one
-            # is the same "gated one assembly, not the other" shape this
-            # file warns about elsewhere.)
-            "GF_MONITOR_AFTER_SAVE",
+            # leaves the other failing.)
+            "GF_MONITOR_PAGE",
             "TOBS_TARGET", "GB_NLEAVES_MAX", "GB_N_SUBBANDS",
             "GB_RJ_INMODEL_CHUNK", "SIGHET_NT_LAYER", "EDGE_CROP_WAVELETS",
             "BASE_FILE_NAME", "STORE_DIR", "SLURM_LOG",

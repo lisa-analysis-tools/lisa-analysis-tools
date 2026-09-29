@@ -731,38 +731,35 @@ export MOJITO_INFO_PATH=/shared/data/mojito_cache
 # coalesces to the newest payload when its queue backs up -- it prints a
 # banner and stays off for the rest of the run. The run is never affected.
 # If that fires, raise GF_MONITOR_ITER or set GF_MONITOR_SNAPSHOT=0.
-# ⚠ OFF ON THE 3MO ONLY (2026-09-28) -- MITIGATION, ROOT CAUSE UNKNOWN.
-# The 3mo saver died in save_step_main -> eryn HDFBackend.open with
+# 3MO IS TAR-ONLY (2026-09-28). The hook is back ON; the PAGE is off.
+#
+# ROOT CAUSE, now KNOWN and fixed by a4: the page renders IN-PROCESS
+# (build_monitor defaults to in_process=True, the 09-26 "no
+# subprocesses!" ruling), and build_monitor_in_process closed the
+# generator's module-level HDF5 handles only from the namespace
+# runpy.run_path RETURNS -- which is nothing when the generator
+# raises. So a FAILED page left the live store open read-only inside
+# the saver, and the next save_step died with
 #   OSError: Unable to synchronously open file
 #           (file is already open for read-only)
-# i.e. a READ-ONLY handle to the live store was still open INSIDE the
-# saver process when the next save came. a4 ruled out extract() leaking
-# src, a swallowed mid-extract exception, _atomic_backup_copy and
-# cross-process locking.
+# The 6mo never hit it because its page never failed (job 662: 5
+# builds, 0 failures); the 3mo page was erroring standalone.
 #
-# ⚠ THE PAGE IS THE LEADING SUSPECT, AND IT IS NOT A CHILD PROCESS.
-# build_monitor defaults to in_process=True (09-26 "no subprocesses!"),
-# so the generator runs via runpy INSIDE the saver.
-# build_monitor_in_process closes the generator's module-level HDF5
-# handles only from the namespace runpy RETURNS -- and runpy returns
-# NOTHING when the generator raises, so a FAILED page leaves the store
-# open read-only in this process and the next save_step dies with
-# exactly the error above. The same mechanism was already documented
-# there for the extract ("unable to truncate a file which is already
-# open"). 6mo job 662 built its page 5 times with 0 failures; the 3mo
-# page was erroring standalone. a4 owns the fix (exec into an owned
-# namespace, close in finally, gc.collect, surface the traceback).
+# WHY THE PAGE STAYS OFF HERE ANYWAY, with the fix landed: the
+# in-process path has no timeout knob wired yet, so a page that hangs
+# rather than raises still blocks the saver. It goes back on once that
+# is wired AND one clean stage has run on the 6mo, which keeps it on.
 #
-# Turning the after-save hook off removes both the page and the
-# extract, i.e. everything in the saver that opens the store.
+# WHAT STILL RUNS: the tar. That path is the EXTRACT alone, which is
+# tested to close its handles, so it does not carry the failure above.
+# Build the page offline from the tar whenever you want it:
+#   python -m lisatools.globalfit.monitor.from_tar SNAP.tar.gz OUT.html
 #
-# ⚠ COST: no per-iteration tar and no page for the 3mo run while this
-# is 0. Build them offline from the run directory instead:
-#   python -m lisatools.globalfit.monitor RUN_DIR --snapshot
-# The 6MO LAUNCHER STAYS AT 1 -- its saver has run the same hook for
-# six saves without the error and the per-iteration tars are relied on.
-# Restore to 1 here once a4 lands the root cause.
-export GF_MONITOR_AFTER_SAVE=0
+# FULL tar, not --short: Mike's morning workflow downloads it.
+export GF_MONITOR_AFTER_SAVE=1
+# PAGE OFF, TAR ON (GF_MONITOR_PAGE, a789d6bd). The 6MO LAUNCHER KEEPS
+# THE PAGE -- do not copy this line across.
+export GF_MONITOR_PAGE=0
 # Build on EVERY save. At ~2 h/iteration against a page build of order
 # minutes this is well inside the 25% warn fraction; the watchdog is the
 # backstop if that stops being true.
