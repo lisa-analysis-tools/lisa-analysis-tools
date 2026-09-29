@@ -938,7 +938,10 @@ class AxisAdaptCellKeyTest(unittest.TestCase):
                 walker_inds=np.array([0, 1, 0, 1]),
                 band_inds=np.array([3, 3, 1, 1]),
                 ntemps=self.NT, nwalkers=self.NW, num_bands=self.NB)
-            g.GBSpecialBase._obs_axis_bind_keys(m, sorter)
+            with mock.patch.dict(
+                os.environ, {"GB_INMODEL_OBSERVABLE_AXIS_ADAPT": "1"}
+            ):
+                g.GBSpecialBase._obs_axis_bind_keys(m, sorter)
         return m
 
     def test_the_dims_come_from_the_SORTER_not_from_the_rows(self):
@@ -946,6 +949,25 @@ class AxisAdaptCellKeyTest(unittest.TestCase):
         resize the table -- that would discard everything learned."""
         m = self._mv()
         self.assertEqual(m._obs_axis_keys[3], (self.NT, self.NW, self.NB))
+
+    def test_UNARMED_binds_no_keys_so_the_accumulator_costs_nothing(self):
+        """Off has to be FREE, not just harmless: with no keys the
+        per-repeat accumulator is one attribute read instead of two
+        bincounts over a (ntemps*nwalkers*nbands*naxes) array."""
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        m = self._mv(bound=False)
+        sorter = types.SimpleNamespace(
+            temp_inds=np.zeros(4, int), walker_inds=np.zeros(4, int),
+            band_inds=np.zeros(4, int),
+            ntemps=self.NT, nwalkers=self.NW, num_bands=self.NB)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GB_INMODEL_OBSERVABLE_AXIS_ADAPT", None)
+            g.GBSpecialBase._obs_axis_bind_keys(m, sorter)
+        self.assertIsNone(m._obs_axis_keys)
+        m._last_obs_axis_ids = np.arange(4)
+        g.GBSpecialBase._obs_axis_adapt_accum(
+            m, np.zeros(4, int), np.ones(4), np.ones(4), self.NA, np)
+        self.assertIsNone(m._obs_axis_nd)
 
     def test_no_sorter_means_no_key_and_no_multiplier(self):
         import lisatools.globalfit.moves.gbspecialstretch as g
@@ -1010,11 +1032,14 @@ class AxisAdaptEndToEndTest(unittest.TestCase):
         m.gb_search_stage = True
         m._obs_axis_g = None
         m._obs_axis_nd = m._obs_axis_na_acc = None
-        g.GBSpecialBase._obs_axis_bind_keys(m, types.SimpleNamespace(
-            temp_inds=np.array([0, 0, 1, 1]),
-            walker_inds=np.zeros(4, int),
-            band_inds=np.array([0, 0, 1, 1]),
-            ntemps=self.NT, nwalkers=self.NW, num_bands=self.NB))
+        with mock.patch.dict(
+            os.environ, {"GB_INMODEL_OBSERVABLE_AXIS_ADAPT": "1"}
+        ):
+            g.GBSpecialBase._obs_axis_bind_keys(m, types.SimpleNamespace(
+                temp_inds=np.array([0, 0, 1, 1]),
+                walker_inds=np.zeros(4, int),
+                band_inds=np.array([0, 0, 1, 1]),
+                ntemps=self.NT, nwalkers=self.NW, num_bands=self.NB))
         return m
 
     def _feed(self, m, pick, acc, ids=None):

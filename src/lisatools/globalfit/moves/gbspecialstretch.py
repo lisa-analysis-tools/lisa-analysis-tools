@@ -14439,7 +14439,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         bind too many and is kept only because the block open is the one
         place that has the sorter.
         """
-        if band_sorter is None:
+        # UNARMED => no keys, which makes ``_obs_axis_adapt_accum`` a
+        # single attribute read per repeat instead of two bincounts over
+        # a (ntemps * nwalkers * nbands * naxes) array. "Off" has to be
+        # free, not just harmless.
+        if band_sorter is None or not obs_axis_adapt_on(self):
             self._obs_axis_keys = None
             return
         try:
