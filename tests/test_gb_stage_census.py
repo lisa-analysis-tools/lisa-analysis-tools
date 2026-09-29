@@ -39,7 +39,12 @@ class StageCellCensusTest(unittest.TestCase):
     def test_the_buckets_are_exhaustive(self):
         cells = [(0, 0, 0), (0, 1, 1), (1, 0, 2), (1, 1, 3)]
         c = self._census(cells, alive=[(0, 0, 0)])
-        self.assertEqual(sum(c.values()), len(cells))
+        self.assertEqual(sum(c[k] for k in g.STAGE_CENSUS_BUCKETS),
+                         len(cells))
+        # ``pairs`` rides alongside the buckets and is NOT one of them:
+        # it counts distinct (walker, band), which is what the open-pair
+        # ceiling bounds.
+        self.assertEqual(c["pairs"], 4)
 
     def test_an_occupied_cell_in_a_SHUT_pair_is_the_defect_bucket(self):
         shut = np.zeros((NW, self.NB), bool)
@@ -120,7 +125,7 @@ class StageCensusWiringTest(unittest.TestCase):
                 g.GBSpecialBase._log_stage_census(m, 3, s, sp, np)
         out = "\n".join(cm.output)
         self.assertIn("[GB_STAGE_CENSUS rj_fstat_search] unit 3", out)
-        self.assertIn("staged 2", out)
+        self.assertIn("staged 2 cells in 2 pairs", out)  # (0,0) and (0,2)
         self.assertIn("filter removed 7", out)
         for tok in ("active-occ", "SHUT-OCC", "empty-valved",
                     "empty-open<FMIN", "empty-open>=FMIN"):
@@ -280,16 +285,97 @@ class ValveStateAtStageTimeTest(unittest.TestCase):
         return "\n".join(cm.output)
 
     def test_an_EMPTY_valve_is_reported_as_zero_of_its_size(self):
-        self.assertIn("valve 0/6 pairs shut at stage time",
+        self.assertIn("level3 0/6 pairs",
                       self._line(np.zeros((NW, 3), bool)))
 
     def test_a_POPULATED_valve_reports_its_count(self):
         sw = np.zeros((NW, 3), bool)
         sw[0, 1] = sw[1, 2] = sw[0, 2] = True
-        self.assertIn("valve 3/6 pairs shut at stage time", self._line(sw))
+        self.assertIn("level3 3/6 pairs", self._line(sw))
 
     def test_NO_valve_at_all_is_distinguishable_from_an_empty_one(self):
         """0/0 says the table was never bound; 0/N says it was bound and
         nothing had qualified yet. Different defects."""
-        self.assertIn("valve 0/0 pairs shut at stage time",
+        self.assertIn("level3 0/0 pairs",
                       self._line(None))
+
+
+class OpenPairCeilingTest(unittest.TestCase):
+    """``distinct staged pairs <= open pairs`` -- whatever the birth
+    distribution does.
+
+    Where a move's dead-row f0 draws land decides how many of the
+    available open pairs get a row; it can never create one. So an
+    excess is distribution-proof evidence that a filter did not apply,
+    which a raw cell count can never be: job 663 saw rj_warm_search's
+    staged cells RISE from 925 to 2100 as the valve went 97% -> 100%
+    shut, purely because its warm-start population moved.
+    """
+
+    NB = 4
+
+    def test_neither_table_means_no_ceiling_is_claimed(self):
+        self.assertEqual(g.stage_open_pairs(None, None, np), 0)
+
+    def test_it_counts_pairs_NEITHER_valve_shut(self):
+        sw = np.zeros((NW, self.NB), bool)
+        sw[0, 0] = True                       # level-3 shuts one pair
+        sb = np.zeros(self.NB, bool)
+        sb[3] = True                          # per-band shuts one band
+        # 2*4 = 8 pairs; minus (0,0); minus (0,3) and (1,3)
+        self.assertEqual(g.stage_open_pairs(sw, sb, np), 5)
+
+    def test_BOTH_valves_count_because_they_have_different_lifetimes(self):
+        """_band_shutoff_revive clears the per-band set on every new
+        F-stat epoch and the launcher runs GB_FSTAT_REFIT_EVERY=2, so
+        the per-band valve is the easier of the two to lose -- and
+        '[GB_BAND_SHUTOFF status] N qualifying now' reports what WOULD
+        qualify, not what is live at staging time."""
+        sb = np.array([True, True, False, False])
+        self.assertEqual(g.stage_open_pairs(None, sb, np), 2)
+        sw = np.zeros((NW, self.NB), bool)
+        self.assertEqual(g.stage_open_pairs(sw, sb, np), 4)
+
+    def test_the_line_FLAGS_an_over_ceiling_unit(self):
+        m = g.GBSpecialBase.__new__(g.GBSpecialBase)
+        m.name = "rj_fstat_search"
+        m._rj_band_shutoff = None
+        m._last_stage_removed = 0
+        m._alive_cells_cache = None
+        m.band_edges = np.array([1e-3, 5e-3, 11e-3, 20e-3])
+        sw = np.ones((NW, 3), bool)
+        sw[0, 0] = False                       # exactly ONE open pair
+        m._rj_band_shutoff_w = sw
+        s = types.SimpleNamespace(
+            inds=np.array([False, False]),
+            temp_inds=np.array([0, 0]), walker_inds=np.array([0, 0]),
+            band_inds=np.array([0, 2]), nwalkers=NW)
+        with mock.patch.dict(os.environ, {"GB_STAGE_CENSUS": "1"}):
+            with self.assertLogs(
+                    "lisatools.globalfit.moves.gbspecialstretch",
+                    "INFO") as cm:
+                g.GBSpecialBase._log_stage_census(
+                    m, 0, s, _spec([0, 0], [0, 0], [0, 2]), np)
+        out = "\n".join(cm.output)
+        self.assertIn("OPEN PAIRS 1", out)
+        self.assertIn("** OVER CEILING **", out)
+
+    def test_a_within_ceiling_unit_is_NOT_flagged(self):
+        m = g.GBSpecialBase.__new__(g.GBSpecialBase)
+        m.name = "rj_fstat_search"
+        m._rj_band_shutoff = None
+        m._rj_band_shutoff_w = np.zeros((NW, 3), bool)
+        m._last_stage_removed = 0
+        m._alive_cells_cache = None
+        m.band_edges = np.array([1e-3, 5e-3, 11e-3, 20e-3])
+        s = types.SimpleNamespace(
+            inds=np.array([False, False]),
+            temp_inds=np.array([0, 0]), walker_inds=np.array([0, 0]),
+            band_inds=np.array([0, 2]), nwalkers=NW)
+        with mock.patch.dict(os.environ, {"GB_STAGE_CENSUS": "1"}):
+            with self.assertLogs(
+                    "lisatools.globalfit.moves.gbspecialstretch",
+                    "INFO") as cm:
+                g.GBSpecialBase._log_stage_census(
+                    m, 0, s, _spec([0, 0], [0, 0], [0, 2]), np)
+        self.assertNotIn("OVER CEILING", "\n".join(cm.output))

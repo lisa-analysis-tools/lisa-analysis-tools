@@ -214,6 +214,7 @@ from .gbbands import (
     pack_special_index,
     return_x,
     unpack_special_index,
+    _SPECIAL_INDEX_BASE,
 )
 
 
@@ -2630,6 +2631,7 @@ def stage_cell_census(specials, alive_specials, shut_w, shut_b, eligible_b,
     and those are different cells with different work.
     """
     out = dict.fromkeys(STAGE_CENSUS_BUCKETS, 0)
+    out["pairs"] = 0
     if specials is None or int(len(specials)) == 0:
         return out
     t, w, b = unpack_special_index(specials, int(nwalkers))
@@ -2650,7 +2652,43 @@ def stage_cell_census(specials, alive_specials, shut_w, shut_b, eligible_b,
                  ("empty_open_lo", open_e & ~elig),
                  ("empty_open_hi", open_e & elig)):
         out[k] = int(m.sum())
+    # Distinct (walker, band) PAIRS among the staged cells. This is the
+    # quantity the ceiling below bounds, and unlike the cell count it
+    # does not depend on how many rungs a pair happens to carry.
+    out["pairs"] = int(xp.unique(w * _SPECIAL_INDEX_BASE + b).size)
     return out
+
+
+def stage_open_pairs(shut_w, shut_b, xp):
+    """How many (walker, band) pairs NEITHER valve has shut. ``int``.
+
+    THE CEILING, and the reason it is worth logging next to the staged
+    count: if the subset filter applies, every staged cell lives in an
+    open pair, so ``distinct staged pairs <= open pairs`` -- **whatever
+    the birth distribution does**. Where a move's dead-row ``f0`` draws
+    land decides how many of the available open pairs get a row; it can
+    never create one. So an excess is distribution-proof evidence that
+    a filter did not apply, which a raw cell count can never be: job
+    663 saw ``rj_warm_search`` staging RISE from 925 to 2100 as the
+    valve went 97% -> 100% shut, purely because its warm-start
+    population moved.
+
+    ⚠ BOTH VALVES, because they have different lifetimes and the
+    per-band one is the easier to lose: ``_band_shutoff_revive`` clears
+    its whole set on every new F-stat epoch, and the launcher runs
+    ``GB_FSTAT_REFIT_EVERY=2``. ``[GB_BAND_SHUTOFF status] ... N
+    qualifying now`` reports what WOULD qualify, not what is live at
+    staging time -- the two are not the same number and only the second
+    one bounds anything.
+    """
+    if shut_w is None and shut_b is None:
+        return 0
+    if shut_w is None:
+        sb = xp.asarray(shut_b)
+        return int((~sb).sum())
+    sw = xp.asarray(shut_w)
+    both = sw if shut_b is None else (sw | xp.asarray(shut_b)[None, :])
+    return int((~both).sum())
 
 
 def stage_census_on() -> bool:
@@ -8983,17 +9021,23 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # why it is not left to be cross-referenced against a
         # [GB_BAND_SHUTOFF] line emitted at a different moment.
         _sw = getattr(self, "_rj_band_shutoff_w", None)
+        _sb = getattr(self, "_rj_band_shutoff", None)
         _npair = 0 if _sw is None else int(np.asarray(_to_numpy(_sw)).size)
         _nshut = 0 if _sw is None else int(np.asarray(_to_numpy(_sw)).sum())
+        _nband = 0 if _sb is None else int(np.asarray(_to_numpy(_sb)).sum())
+        _open = stage_open_pairs(_sw, _sb, xp)
         logger.info(
-            "[GB_STAGE_CENSUS %s] unit %s: staged %d = active-occ %d + "
-            "SHUT-OCC %d + empty-valved %d + empty-open<FMIN %d + "
-            "empty-open>=FMIN %d; filter removed %d; valve %d/%d pairs "
-            "shut at stage time",
+            "[GB_STAGE_CENSUS %s] unit %s: staged %d cells in %d pairs "
+            "= active-occ %d + SHUT-OCC %d + empty-valved %d + "
+            "empty-open<FMIN %d + empty-open>=FMIN %d; filter removed "
+            "%d; at stage time level3 %d/%d pairs, per-band %d bands, "
+            "OPEN PAIRS %d%s",
             self.name, "?" if unit_i is None else int(unit_i), n,
-            c["active_occ"], c["shut_occ"], c["empty_valved"],
+            c["pairs"], c["active_occ"], c["shut_occ"], c["empty_valved"],
             c["empty_open_lo"], c["empty_open_hi"],
-            int(getattr(self, "_last_stage_removed", 0)), _nshut, _npair)
+            int(getattr(self, "_last_stage_removed", 0)), _nshut, _npair,
+            _nband, _open,
+            " ** OVER CEILING **" if c["pairs"] > _open > 0 else "")
 
     def _run_band_unit(self, model, band_sorter, subset, band_temps,
                        ll_change_log, prop_counts, acc_counts,
