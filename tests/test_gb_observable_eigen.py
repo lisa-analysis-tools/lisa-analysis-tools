@@ -497,3 +497,329 @@ class AxisMultSeamTest(unittest.TestCase):
         mv = SimpleNamespace(_obs_axis_mult=lambda ids, n: want)
         np.testing.assert_array_equal(
             g._obs_axis_mult_for(mv, None, 9), want)
+
+
+class AxisIdentityIsStableTest(unittest.TestCase):
+    """The eigen table's COLUMN INDEX has to mean something.
+
+    ``eigen_axis_set`` orders columns by ``|overlap with the fiber|``.
+    The fiber is projected out EXACTLY, so the other eight eigenvectors
+    are orthogonal to it to machine precision and that sort key is
+    rounding noise -- a permutation redrawn every block. Three things
+    depend on the index being an identity: the per-axis census labels,
+    a per-axis multiplier learned between blocks, and the per-band mean
+    table a newborn is initialised from.
+    """
+
+    D = 9
+    LOGGER = "lisatools.globalfit.moves.gbspecialstretch"
+
+    def _batch(self, n=400, seed=5, spread=1.0):
+        rng = np.random.default_rng(seed)
+        A = rng.normal(size=(n, self.D, self.D))
+        g = np.einsum("nij,nkj->nik", A, A)
+        _, evec = np.linalg.eigh(g)
+        lam = 10.0 ** rng.uniform(-spread, spread, size=(n, self.D))
+        gw = np.einsum("nij,nj,nkj->nik", evec, lam, evec)
+        pert = gw * (1.0 + 0.01 * rng.normal(size=gw.shape))
+        return gw, 0.5 * (pert + np.swapaxes(pert, -1, -2))
+
+    def _axes(self, gw, reorder, fiber=True):
+        from eryn.moves.eigenaxis import eigen_axis_set
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        n = int(gw.shape[0])
+        tf = None
+        if fiber:
+            tf = np.zeros((n, self.D))
+            tf[:, self.D - 1] = 1.0
+        a, s = eigen_axis_set(gw, t_fiber=tf, sigma_max=10.0)
+        if not reorder:
+            return a, s, None
+        return g.obs_axis_reorder(a, s, gw, fiber, np)
+
+    @staticmethod
+    def _held(a1, a2, ncol):
+        return float((np.abs(np.einsum("nik,nik->nk", a1, a2))[:, :ncol]
+                      > 0.9).mean())
+
+    # --- the pair that makes the reorder non-deletable -------------------
+    def test_column_k_SURVIVES_a_1pct_change_to_the_matrix(self):
+        gw, pert = self._batch()
+        a1, _, _ = self._axes(gw, True)
+        a2, _, _ = self._axes(pert, True)
+        held = self._held(a1, a2, self.D - 1)
+        self.assertGreater(
+            held, 0.9,
+            f"only {held:.3f} of non-fiber columns kept their direction; "
+            "a multiplier learned last block would land on a different axis")
+
+    def test_NEGATIVE_CONTROL_the_shipped_order_does_NOT_survive_it(self):
+        """Delete the reorder and the test above becomes this number."""
+        gw, pert = self._batch()
+        a1, _, _ = self._axes(gw, False)
+        a2, _, _ = self._axes(pert, False)
+        held = self._held(a1, a2, self.D - 1)
+        self.assertLess(
+            held, 0.3,
+            f"{held:.3f} -- the |fiber overlap| order was expected to be "
+            "noise; if this passes the premise of obs_axis_reorder is gone")
+
+    def test_the_sort_key_is_ROUNDING_NOISE_without_the_reorder(self):
+        from eryn.moves.eigenaxis import project_out_direction
+        gw, _ = self._batch(n=200)
+        tf = np.zeros((200, self.D))
+        tf[:, self.D - 1] = 1.0
+        _, evecs = np.linalg.eigh(project_out_direction(gw, tf))
+        ov = np.sort(np.abs(np.einsum("ni,nij->nj", tf, evecs)), axis=-1)
+        self.assertLess(float(np.median(ov[:, self.D - 2])), 1e-10)
+        self.assertGreater(float(np.median(ov[:, self.D - 1])), 0.99)
+
+    # --- what the new order MEANS ----------------------------------------
+    def test_axis_0_is_the_WIDEST_and_the_last_non_fiber_the_tightest(self):
+        gw, _ = self._batch()
+        a, _, _ = self._axes(gw, True)
+        quad = np.einsum("nik,nij,njk->nk", a, gw, a)[:, :self.D - 1]
+        self.assertTrue(np.all(np.diff(quad, axis=-1) >= -1e-9),
+                        "curvature must ascend => width must descend")
+
+    def test_the_sort_key_is_the_UNCAPPED_width(self):
+        """``sig`` is capped at ``sigma_max``, so every railed axis
+        carries the same value; sorting on it would leave exactly the
+        near-null axes in an arbitrary order again."""
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.obs_axis_reorder)
+        self.assertIn('xp.einsum("nik,nij,njk->nk", axes, gw, axes)', src)
+        gw, _ = self._batch()
+        gw = gw * 1e-12                          # everything rails
+        a, s, _ = self._axes(gw, True)
+        self.assertTrue(np.allclose(s, 10.0), "precondition: all railed")
+        quad = np.einsum("nik,nij,njk->nk", a, gw, a)[:, :self.D - 1]
+        self.assertTrue(np.all(np.diff(quad, axis=-1) >= -1e-30))
+
+    def test_the_fiber_STAYS_in_the_last_column(self):
+        """``_observable_proposal`` drops the last column from the pick
+        set and weights it separately; moving it would silently start
+        proposing along the flat direction."""
+        gw, _ = self._batch(n=200)
+        a0, _, _ = self._axes(gw, False)
+        a1, _, _ = self._axes(gw, True)
+        np.testing.assert_allclose(a1[:, :, -1], a0[:, :, -1], atol=1e-12)
+
+    def test_it_is_a_PERMUTATION_so_the_draw_DISTRIBUTION_is_unchanged(self):
+        """axis mode picks uniformly and full mode contracts with iid
+        normals -- both are invariant under a column permutation."""
+        gw, _ = self._batch(n=150)
+        a0, s0, _ = self._axes(gw, False)
+        a1, s1, _ = self._axes(gw, True)
+        np.testing.assert_allclose(np.sort(s0, axis=-1),
+                                   np.sort(s1, axis=-1), atol=1e-12)
+        for src, out in ((a0, a1),):
+            k0 = np.sort(np.abs(src).sum(axis=1), axis=-1)
+            k1 = np.sort(np.abs(out).sum(axis=1), axis=-1)
+            np.testing.assert_allclose(k0, k1, atol=1e-10)
+
+    def test_a_FIBERLESS_layout_sorts_EVERY_column(self):
+        """The VGB restriction pins ``Mc``: there is no fiber column to
+        hold back, and leaving the last one unsorted would exempt it."""
+        gw, _ = self._batch(n=150)
+        a, _, _ = self._axes(gw, True, fiber=False)
+        quad = np.einsum("nik,nij,njk->nk", a, gw, a)
+        self.assertTrue(np.all(np.diff(quad, axis=-1) >= -1e-9))
+
+    def test_dom_names_the_coordinate_that_dominates_each_axis(self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        axes = np.zeros((2, 3, 3))
+        axes[0, 2, 0] = axes[0, 0, 1] = axes[0, 1, 2] = 1.0
+        axes[1] = axes[0]
+        gw = np.broadcast_to(np.eye(3), (2, 3, 3)).copy()
+        _, _, dom = g.obs_axis_reorder(axes, np.ones((2, 3)), gw, False, np)
+        # identity gw => quad all 1 => stable sort keeps the order
+        np.testing.assert_array_equal(dom[0], [2, 0, 1])
+
+
+class CensusLabelsAreRanksNotCoordinatesTest(unittest.TestCase):
+    """The census line used to label bucket ``k`` ``GB_INTERNAL_BASIS[k]``.
+
+    That reads as "the f_mid axis accepted 7%" and is what the launcher's
+    2.0 -> 1.5 decision was argued from. Bucket ``k`` is an axis RANK.
+    """
+
+    LOGGER = "lisatools.globalfit.moves.gbspecialstretch"
+
+    def _move(self, nax=9):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        m = g.GBSpecialBase.__new__(g.GBSpecialBase)
+        t = np.zeros((6, nax))
+        t[0] = 10.0                       # draws
+        t[1] = np.arange(nax)             # accepts
+        m._obs_axis_acc = t
+        m._obs_axis_dom = None
+        m.name = "in_model"
+        return m
+
+    def _line(self, m):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        with self.assertLogs(self.LOGGER, "INFO") as cm:
+            g.GBSpecialBase._report_obs_axis(m)
+        return "\n".join(cm.output)
+
+    def test_the_buckets_are_labelled_by_RANK(self):
+        out = self._line(self._move())
+        self.assertIn("s0 ", out)
+        self.assertIn("s7 ", out)
+        self.assertIn("fib ", out)
+        self.assertIn("s0=widest", out)
+
+    def test_a_bucket_is_NOT_labelled_with_the_coordinate_at_its_index(self):
+        out = self._line(self._move())
+        for bad in ("lnA d=", "f_mid d=", "fdot d=", "phi0 d="):
+            self.assertNotIn(bad, out, f"{bad!r} names a coordinate, not "
+                                       "the axis that bucket holds")
+
+    def test_dom_names_the_coordinate_the_rank_is_USUALLY_made_of(self):
+        m = self._move()
+        h = np.zeros((9, 9))
+        h[0, 5] = 30.0                   # rank 0 dominated by psi
+        h[0, 1] = 10.0
+        m._obs_axis_dom = h
+        out = self._line(m)
+        self.assertIn("s0 dom=psi(0.75)", out)
+
+    def test_the_histogram_counts_the_dominant_coordinate_per_rank(self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        m = g.GBSpecialBase.__new__(g.GBSpecialBase)
+        m._obs_axis_dom = None
+        # (n_src, n_axes); the eigen table is square, so a dominant
+        # coordinate index and an axis index share the same range.
+        dom = np.array([[2, 0, 1], [2, 1, 0]])
+        g.GBSpecialBase._obs_axis_dom_accum(m, dom, None, np)
+        self.assertEqual(m._obs_axis_dom.shape, (3, 3))
+        self.assertEqual(float(m._obs_axis_dom[0, 2]), 2.0)
+        self.assertEqual(float(m._obs_axis_dom[1, 0]), 1.0)
+        self.assertEqual(float(m._obs_axis_dom[1, 1]), 1.0)
+
+    def test_rows_with_NO_finite_table_are_left_out_of_the_histogram(self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        m = g.GBSpecialBase.__new__(g.GBSpecialBase)
+        m._obs_axis_dom = None
+        g.GBSpecialBase._obs_axis_dom_accum(
+            m, np.array([[0, 1], [1, 0]]), np.array([True, False]), np)
+        self.assertEqual(float(m._obs_axis_dom.sum()), 2.0)
+
+    def test_the_table_build_FEEDS_the_histogram(self):
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._observable_eigen_prepare)
+        self.assertIn("obs_axis_reorder(", src)
+        self.assertIn("_obs_axis_dom_accum_for(", src)
+
+    def test_the_hook_is_MODULE_LEVEL_so_a_stub_without_it_is_fine(self):
+        from types import SimpleNamespace
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        g._obs_axis_dom_accum_for(SimpleNamespace(), None, None, np)
+
+
+class PerAxisScaleReachesTheStepTest(unittest.TestCase):
+    """A per-axis multiplier has exactly one place it can go.
+
+    The step scales ``w`` are consumed as a WHITENING METRIC:
+    ``gw = gz * w (x) w`` and ``sigma_w = 1/sqrt(a^T gw a)``, so
+    ``w -> c w`` gives ``sigma_w -> sigma_w / c`` and the table product
+    ``w * a_w * sigma_w`` comes out unchanged. ``axis_mult`` and
+    ``GB_INMODEL_OBSERVABLE_JUMP`` both enter there, so on the eigen path
+    they move only the axes railed at ``SMAX``. ``obs_axis_scale_for``
+    enters at ``sigma_w``, where nothing cancels it.
+    """
+
+    N, POOL = 4, 20
+
+    def _prep(self, curv=None, scale=None, jump=None, axis_mult=None):
+        s = _stub()
+        s._obs_rho = np.full(self.POOL, 40.0)
+        ids = np.arange(self.N)
+        w = np.asarray(s._observable_step_scales(None, ids, NDIM))
+        c = (np.full((self.N, NDIM), 1.0) if curv is None
+             else np.asarray(curv, float))
+        gz = np.full((self.POOL, NDIM, NDIM), np.nan)
+        for k in range(self.N):
+            gz[k] = np.diag(c[k] / w[k] ** 2)
+        s._obs_gamma_z = gz
+        if scale is not None:
+            s._obs_axis_scale = lambda _ids, na, _g=scale: _g
+        if axis_mult is not None:
+            s._obs_axis_mult = lambda _ids, nz, _m=axis_mult: _m
+        env = {} if jump is None else {
+            "GB_INMODEL_OBSERVABLE_JUMP": str(jump)}
+        with mock.patch.dict(os.environ, env):
+            s._observable_eigen_prepare(None, ids, self.POOL)
+        return np.linalg.norm(np.asarray(s._obs_eigen_table)[:self.N],
+                              axis=1)
+
+    # --- the new seam ----------------------------------------------------
+    def test_the_multiplier_scales_axis_k_by_EXACTLY_g_k(self):
+        rng = np.random.default_rng(4)
+        curv = rng.uniform(0.5, 4.0, (self.N, NDIM))
+        g = rng.uniform(0.3, 3.0, (self.N, NDIM))
+        base = self._prep(curv=curv)
+        got = self._prep(curv=curv, scale=g)
+        np.testing.assert_allclose(got / base, g, rtol=1e-12)
+
+    def test_None_leaves_the_table_byte_identical(self):
+        curv = np.random.default_rng(6).uniform(0.5, 4.0, (self.N, NDIM))
+        np.testing.assert_array_equal(self._prep(curv=curv),
+                                      self._prep(curv=curv, scale=None))
+
+    def test_a_MISSHAPEN_multiplier_raises_instead_of_broadcasting(self):
+        with self.assertRaises(ValueError) as cm:
+            self._prep(scale=np.ones((self.N, NDIM - 1)))
+        self.assertIn("wrong axis", str(cm.exception))
+
+    def test_the_hook_is_MODULE_LEVEL_so_a_stub_without_it_is_fine(self):
+        from types import SimpleNamespace
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        self.assertIsNone(
+            g.obs_axis_scale_for(SimpleNamespace(), np.arange(3), 9))
+
+    # --- why the OLD seam could not be used ------------------------------
+    def test_NEGATIVE_CONTROL_the_same_factor_via_axis_mult_does_NOTHING(
+            self):
+        """``axis_mult`` is the seam that was built for this in
+        `_obs_axis_mult_for`. On the eigen path it cancels exactly."""
+        curv = np.random.default_rng(8).uniform(0.5, 4.0, (self.N, NDIM))
+        base = self._prep(curv=curv)
+        via_mult = self._prep(curv=curv,
+                              axis_mult=np.full((self.N, NDIM), 2.5))
+        np.testing.assert_allclose(np.sort(via_mult, axis=-1),
+                                   np.sort(base, axis=-1), rtol=1e-10)
+
+    def test_NEGATIVE_CONTROL_the_JUMP_knob_is_cancelled_too(self):
+        """``GB_INMODEL_OBSERVABLE_JUMP`` enters at the same place. The
+        launcher's 1.0 -> 2.0 -> 1.5 history was argued as a step-size
+        change under ``*_OBSERVABLE_EIGEN=axis``; on every axis the
+        information matrix could measure, it is not one."""
+        curv = np.random.default_rng(10).uniform(0.5, 4.0, (self.N, NDIM))
+        base = self._prep(curv=curv, jump=1.0)
+        for j in (1.5, 2.0, 7.3):
+            got = self._prep(curv=curv, jump=j)
+            np.testing.assert_allclose(
+                np.sort(got, axis=-1), np.sort(base, axis=-1), rtol=1e-10,
+                err_msg=f"jump={j} moved a non-railed axis")
+
+    def test_the_jump_knob_DOES_reach_an_axis_railed_at_SMAX(self):
+        """Where it survives: the directions the matrix could not
+        measure -- i.e. exactly the ones already overshooting."""
+        curv = np.full((self.N, NDIM), 1e-6)     # sigma ~ 1e3 >> smax 10
+        base = self._prep(curv=curv, jump=1.0)
+        got = self._prep(curv=curv, jump=2.0)
+        np.testing.assert_allclose(np.sort(got, axis=-1),
+                                   2.0 * np.sort(base, axis=-1), rtol=1e-10)
+
+    def test_the_multiplier_still_works_on_a_RAILED_axis(self):
+        """It is applied AFTER the cap on purpose: the cap bounds what
+        the information matrix may claim, not what the acceptance
+        measured."""
+        curv = np.full((self.N, NDIM), 1e-6)
+        base = self._prep(curv=curv)
+        got = self._prep(curv=curv, scale=np.full((self.N, NDIM), 0.25))
+        np.testing.assert_allclose(got / base, 0.25, rtol=1e-12)

@@ -1377,6 +1377,18 @@ def _obs_axis_accum_for(move, a, d_fmid, d_lnfd, ok, xp):
         fn(a, d_fmid, d_lnfd, ok, xp)
 
 
+def _obs_axis_dom_accum_for(move, dom, ok, xp):
+    """Tally WHICH coordinate dominates each axis rank, or do nothing.
+
+    MODULE-LEVEL for the same reason :func:`_obs_axis_accum_for` is: the
+    table build runs against duck-typed stubs, and a getattr degrades to
+    "this object keeps no census" rather than crashing the prepare.
+    """
+    fn = getattr(move, "_obs_axis_dom_accum", None)
+    if fn is not None:
+        fn(dom, ok, xp)
+
+
 def _obs_axis_mult_for(move, source_ids, n_z):
     """PER-SOURCE per-axis step multipliers for ``move``, or ``None``.
 
@@ -1400,9 +1412,127 @@ def _obs_axis_mult_for(move, source_ids, n_z):
     healthy. A multiplier fixed before any draw and changed only
     BETWEEN blocks does not. Anything that reads the current point
     must not enter here.
+
+    ⚠⚠ THIS IS **NOT** THE PER-EIGEN-AXIS SEAM, AND IT CANNOT BE. It
+    indexes the z COLUMNS (``lnA``, ``f_mid``, ...), and on the eigen
+    path the step scales are consumed as a WHITENING metric:
+    ``gw = gz * w (x) w``, then ``table = w * a_w * sigma_w`` with
+    ``sigma_w = 1/sqrt(a^T gw a)``. Scale ``w`` by ``c`` and ``sigma_w``
+    scales by ``1/c`` -- the table is **unchanged, exactly**. Measured
+    over 400 synthetic sources: with no axis railed, the per-axis step
+    magnitudes under ``jump`` 1.5, 2.0 and 7.3 are identical to the
+    ``jump=1`` values to every digit (min = median = max ratio
+    1.000000). The multiplier survives only where ``sigma_w`` hits
+    ``GB_INMODEL_OBSERVABLE_EIGEN_SMAX`` -- i.e. on the axes the
+    information matrix could not measure -- and on rows with no table at
+    all, which take the diagonal draw.
+
+    The same algebra applies to ``GB_INMODEL_OBSERVABLE_JUMP``, which
+    enters at the same place: under ``*_OBSERVABLE_EIGEN=axis`` that
+    knob moves the railed axes and the table-less rows and nothing else.
+    The per-EIGEN-AXIS multiplier is :func:`obs_axis_scale_for`, applied
+    to ``sigma_w`` where it cannot cancel.
     """
     fn = getattr(move, "_obs_axis_mult", None)
     return None if fn is None else fn(source_ids, n_z)
+
+
+def obs_axis_scale_for(move, source_ids, n_axes):
+    """PER-EIGEN-AXIS step multipliers for ``move``, or ``None``.
+
+    ``(n_src, n_axes)``, applied to ``sigma_w`` in
+    :meth:`GBSpecialBase._observable_eigen_prepare` so that axis ``k``'s
+    step is scaled by exactly ``g[:, k]``. ``None`` -- the answer until
+    a table exists, and for any object that never grew one -- leaves the
+    table byte-identical.
+
+    WHY HERE AND NOT THROUGH ``axis_mult``: the step scales are the
+    whitening metric, and a multiplier applied there cancels against the
+    ``sigma_w`` it induces. See :func:`_obs_axis_mult_for` for the
+    algebra and the measurement. ``sigma_w`` is the one factor of the
+    table product that nothing downstream recomputes.
+
+    APPLIED AFTER THE ``SMAX`` CAP, deliberately. The cap bounds what
+    the *information matrix* is allowed to claim about a direction it
+    could not measure; this multiplier is a *measured* correction from
+    the axis's own acceptance, and clamping it to the same ceiling would
+    make an axis that genuinely wants a wider step indistinguishable
+    from one the matrix failed on. Its own bound belongs on the
+    multiplier (see the adaptation's clamp), not on the cap.
+
+    ⚠ SAME CONSTANT-FOR-THE-PROPOSE RULE as ``axis_mult``: the table is
+    frozen for the block, so anything that reads the current point
+    breaks the proposal's symmetry while the acceptance rate keeps
+    looking healthy.
+
+    MODULE-LEVEL and taking the move, for the same reason
+    :func:`fstat_band_min_F_for` is: the prepare runs against duck-typed
+    stubs and whatever a fan-out stands up in a rank process.
+    """
+    fn = getattr(move, "_obs_axis_scale", None)
+    return None if fn is None else fn(source_ids, n_axes)
+
+
+def obs_axis_reorder(axes, sig, gw, has_fiber, xp):
+    """Give the eigen table's COLUMN INDEX a stable, meaningful identity.
+
+    Returns ``(axes, sig, dom)`` reordered, with ``dom[n, k]`` the
+    internal-basis coordinate that dominates axis ``k`` of source ``n``.
+
+    ⚠ WHY THIS EXISTS. ``eigen_axis_set`` orders its columns by
+    ``|overlap with the fiber|`` so the fiber-aligned eigenvector lands
+    last. That is the right key for ONE column and a non-key for the
+    other eight: the fiber is projected out EXACTLY (``P F P``), so the
+    remaining eigenvectors are orthogonal to it to machine precision and
+    their overlaps are rounding noise -- measured median ``3e-18`` to
+    ``2e-14`` on a 9-column basis. ``argsort`` over rounding noise is a
+    permutation, redrawn every time the table is rebuilt. Measured: after
+    a 1% change to the matrix, column ``k`` still holds the same
+    direction **7.7% of the time** (median ``|<a_k, a_k'>| = 0.002``).
+    Sorting by the axis's own curvature instead: **97.8%**, median 0.999.
+
+    So the column index was never an identity, and three things quietly
+    depended on it being one:
+
+    1. the per-axis census labelled bucket ``k`` with
+       ``GB_INTERNAL_BASIS[k]`` -- ``f_mid``, ``fdot``, ... -- which
+       names a coordinate, not this axis;
+    2. any per-axis MULTIPLIER learned last block would land on a
+       different direction this block;
+    3. a per-band mean table (newborn initialisation) needs axis ``k`` to
+       mean the same thing for every source in the band, which a
+       per-source noise permutation cannot give.
+
+    SORT KEY = the UNCAPPED whitened curvature ``a^T Gamma_w a``,
+    recomputed here rather than taken from ``sig``: ``sig`` is
+    ``min(1/sqrt(quad), sigma_max)``, so every railed axis carries the
+    SAME value and sorting on it would put the near-null axes -- the ones
+    that most need telling apart -- back in an arbitrary order.
+    Ascending ``quad`` = descending width, so **axis 0 is the widest step
+    and axis n-2 the tightest**, with the fiber (when there is one) left
+    in the last column where ``_observable_proposal`` expects it.
+
+    DISTRIBUTION-NEUTRAL. ``axis`` mode picks uniformly over the
+    non-fiber columns and ``full`` mode contracts the table with iid
+    normals; permuting columns changes neither draw's distribution. It
+    changes which column a given RNG value selects, so the realised
+    stream differs -- neutral, not byte-identical.
+    """
+    quad = xp.einsum("nik,nij,njk->nk", axes, gw, axes)
+    n, nd = int(quad.shape[0]), int(quad.shape[1])
+    k = nd - 1 if has_fiber else nd
+    order = xp.argsort(quad[:, :k], axis=-1)
+    if has_fiber:
+        order = xp.concatenate(
+            [order, xp.full((n, 1), nd - 1, dtype=order.dtype)], axis=-1)
+    axes = xp.take_along_axis(axes, order[:, None, :], axis=-1)
+    sig = xp.take_along_axis(sig, order, axis=-1)
+    # The dominant coordinate is read off the WHITENED axis, which is a
+    # unit vector -- comparing raw ``z`` components across coordinates
+    # that carry different units would just name whichever one happens to
+    # be quoted in the smallest unit.
+    dom = xp.argmax(xp.abs(axes), axis=1)
+    return axes, sig, dom
 
 
 def fstat_band_skip_for(move):
@@ -14130,6 +14260,30 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self._obs_axis_acc = t
         self._last_obs_axis_pick = None
 
+    def _obs_axis_dom_accum(self, dom, ok, xp):    # noqa: D401
+        """Histogram of the dominant coordinate of each axis RANK.
+
+        ``dom`` is ``(n_src, n_axes)`` from :func:`obs_axis_reorder`,
+        filled at table-build time; ``ok`` marks the rows whose table is
+        finite. The result answers the only question the rank labels
+        cannot: rank 0 is "the widest axis", but WHICH coordinate is it
+        usually made of? Accumulated over sources so the census line can
+        name it.
+        """
+        if dom is None:
+            return
+        na = int(dom.shape[1])
+        h = getattr(self, "_obs_axis_dom", None)
+        if h is None or h.shape != (na, na):
+            h = xp.zeros((na, na), dtype=xp.float64)
+        use = dom if ok is None else dom[ok]
+        if int(use.shape[0]) == 0:
+            self._obs_axis_dom = h
+            return
+        for k in range(na):
+            h[k] = h[k] + xp.bincount(use[:, k], minlength=na)[:na]
+        self._obs_axis_dom = h
+
     def _report_obs_motion(self):
         """Log the observable-path motion census, then reset."""
         m = getattr(self, "_obs_motion", None)
@@ -14157,13 +14311,29 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         Added alongside the two-axis line, which is left BYTE-IDENTICAL
         so nothing downstream (LOG_KEEP_PATTERN, the monitor's regexes,
         the bench scripts) has to change.
+
+        ⚠ THE BUCKETS ARE AXIS RANKS, NOT COORDINATES. This line used to
+        label bucket ``k`` ``GB_INTERNAL_BASIS[k]`` -- ``lnA``,
+        ``f_mid``, ``fdot``, ... -- which reads as "the f_mid axis
+        accepted 7%" and was never what the bucket held: the table's
+        column order carried no identity at all before
+        :func:`obs_axis_reorder` (see its docstring). Buckets are now
+        ``s0`` = widest axis .. ``s{n-2}`` = tightest, ``fib`` = the
+        fiber, and each carries ``dom=`` -- the coordinate that most
+        often dominates that rank, with the fraction of sources it
+        dominated for. ``dom`` is a description of the axis, not its
+        name: ``s0 dom=psi(0.41)`` means the widest axis was mostly
+        ``psi`` for 41% of sources and something else for the rest.
         """
         t = getattr(self, "_obs_axis_acc", None)
         if t is None:
             return
         self._obs_axis_acc = None
+        dom = getattr(self, "_obs_axis_dom", None)
+        self._obs_axis_dom = None
         try:
             v = _to_numpy(t)
+            dv = None if dom is None else _to_numpy(dom)
         except Exception:               # noqa: BLE001 -- diagnostic only
             return
         if float(v[0].sum()) <= 0:
@@ -14174,21 +14344,27 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             names = list(GB_INTERNAL_BASIS)
         except Exception:               # noqa: BLE001
             names = []
+        nax = int(v.shape[1])
         parts = []
-        for k in range(v.shape[1]):
+        for k in range(nax):
             d = float(v[0, k])
             if d <= 0:
                 continue
             acc = float(v[1, k])
-            nm = names[k] if k < len(names) else f"ax{k}"
+            nm = "fib" if k == nax - 1 else f"s{k}"
+            lab = ""
+            if dv is not None and k < dv.shape[0] and dv[k].sum() > 0:
+                j = int(np.argmax(dv[k]))
+                cn = names[j] if j < len(names) else f"z{j}"
+                lab = f" dom={cn}({dv[k, j] / dv[k].sum():.2f})"
             parts.append(
-                f"{nm} d={int(d)} a={int(acc)} ({acc / d:.3f}) "
+                f"{nm}{lab} d={int(d)} a={int(acc)} ({acc / d:.3f}) "
                 f"|dz| p={v[2, k] / d:.3f} a={v[3, k] / max(acc, 1.0):.3f} "
                 f"|df_mid| p={v[4, k] / d:.4f} a="
                 f"{v[5, k] / max(acc, 1.0):.4f}")
         if not parts:
             return
-        logger.info("[GB_OBS_BASIS %s] per-axis: %s", self.name,
+        logger.info("[GB_OBS_BASIS %s] per-axis (s0=widest): %s", self.name,
                     "; ".join(parts))
 
     #: Opt-in for the GENERIC (no-fiber) eigen-axis table on bases without
@@ -14696,6 +14872,27 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         smax = _observable_knob("GB_INMODEL_OBSERVABLE_EIGEN_SMAX", 10.0)
         axes_w, sig_w = _eigen_axis_set_generic(
             gw, t_fiber=t_fiber, sigma_max=smax)
+        # STABLE COLUMN IDENTITY. Without this the column index is a
+        # per-source permutation redrawn every block -- see
+        # :func:`obs_axis_reorder` for the measurement and for why the
+        # census, the adaptive multiplier and the per-band newborn table
+        # all silently depend on it.
+        axes_w, sig_w, _dom = obs_axis_reorder(
+            axes_w, sig_w, gw, t_fiber is not None, xp)
+        _obs_axis_dom_accum_for(self, _dom, ok, xp)
+        # PER-EIGEN-AXIS ADAPTIVE SCALE. On ``sigma_w``, which is the one
+        # factor of the product below that does not cancel -- see
+        # :func:`obs_axis_scale_for`. ``None`` leaves the table
+        # byte-identical.
+        _g = obs_axis_scale_for(self, ids_x, int(sig_w.shape[1]))
+        if _g is not None:
+            _g = xp.asarray(_g, dtype=sig_w.dtype)
+            if _g.shape != sig_w.shape:
+                raise ValueError(
+                    f"per-axis scale has shape {_g.shape} but the eigen "
+                    f"widths are {sig_w.shape}. A silently broadcast "
+                    f"multiplier would scale the wrong axis for every row.")
+            sig_w = sig_w * _g
         # table column = sigma_z_k * axis_z_k; the normalize/rescale of the
         # un-whitening cancels in the product: w*a_w*sigma_w exactly.
         table = (w[:, :, None] * axes_w) * sig_w[:, None, :]
