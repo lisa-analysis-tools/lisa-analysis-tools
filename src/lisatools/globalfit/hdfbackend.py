@@ -163,6 +163,52 @@ def _validate_resume_readable(path: str) -> None:
         root = f["global_fit"] if "global_fit" in f else f
         it = int(root.attrs.get("iteration", 0))
         row = max(it - 1, 0)
+
+        # ---- THE RECIPE GROUP (2026-09-29) --------------------------------
+        # A resume reads this too -- prepare_main -> add_recipe opens every
+        # recipe step group and reads its attrs -- and until now this
+        # function did not, which is how the 3-month run lost BOTH copies at
+        # once.
+        #
+        # Job 666 died at resume on
+        #   KeyError: 'Unable to synchronously open object
+        #              (message not aligned)'
+        # a malformed OBJECT HEADER on one recipe step group, while every
+        # chain and sub-backend in the same file read perfectly. A recipe
+        # step group is tiny but its attrs (status, order num,
+        # completed_iteration, start_iteration) are rewritten at every stage
+        # transition, and an attr write rewrites the header -- so a kill or
+        # MPI abort in that window tears exactly this and nothing else.
+        #
+        # ⚠ WHY IT COST THE BACKUP TOO. `_atomic_backup_copy` is a BYTE copy
+        # (shutil.copyfile) gated on THIS function. Because the sweep below
+        # stops at sub_backend, a torn recipe header passed validation, was
+        # duplicated faithfully into the running backup copy, and
+        # `promote_backup_if_store_unreadable` never fired either -- it
+        # validates the primary, sees no fault in the region it checks and
+        # reports the primary fine. Both generations were lost to a gap in
+        # the check, not to two independent failures.
+        #
+        # ⚠ AHEAD of the sub_backend early-return on purpose: a noise-only
+        # store has no sub_backend and can still carry a torn recipe.
+        # Reading it is microseconds (five groups, two attrs each).
+        if bool(root.attrs.get("has_recipe", False)) and "recipe" in root:
+            recipe_group = root["recipe"]
+            for key in recipe_group:
+                try:
+                    step = recipe_group[key]      # opens the object header
+                    step.attrs["status"]
+                    step.attrs["order num"]
+                except Exception as e:            # noqa: BLE001
+                    raise ValueError(
+                        f"recipe step {key!r} is unreadable "
+                        f"({type(e).__name__}: {e}). The link resolves but the "
+                        "object does not, which is a torn object header -- the "
+                        "signature of a kill during an attr write at a stage "
+                        "transition. A resume reads this in add_recipe and "
+                        "would die there."
+                    ) from e
+
         if "sub_backend" not in root:
             return
         for branch in root["sub_backend"]:

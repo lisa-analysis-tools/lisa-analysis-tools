@@ -98,5 +98,91 @@ class TornSaveIsCaughtAtResume(unittest.TestCase):
         _validate_resume_readable(self.p)          # must not raise
 
 
+class TornRecipeGroupIsCaughtAtResume(unittest.TestCase):
+    """A torn RECIPE group must fail validation, or it eats the backup.
+
+    2026-09-29, 3-month job 666. The run resumed, read every chain and
+    sub-backend, reached "initial log likelihood", then died in
+    ``add_recipe``:
+
+        KeyError: 'Unable to synchronously open object (message not aligned)'
+
+    -- a malformed OBJECT HEADER on one recipe step group. The group is
+    tiny, but its attrs are rewritten at every stage transition and an attr
+    write rewrites the header, so a kill in that window tears this and
+    nothing else.
+
+    ⚠ IT COST BOTH COPIES. ``_atomic_backup_copy`` is a BYTE copy gated on
+    ``_validate_resume_readable``, and that sweep stopped at
+    ``sub_backend`` -- so the torn header passed, was duplicated into the
+    running backup copy, and ``promote_backup_if_store_unreadable`` never
+    fired either. Two generations lost to a gap in the check, not to two
+    failures. These tests pin the gap shut.
+
+    The fixture uses a DANGLING EXTERNAL LINK, which reproduces the exact
+    shape of the production fault -- ``key in group`` is True because the
+    link resolves, while ``group[key]`` raises because the object does not
+    -- without needing real on-disk corruption, which cannot be created
+    deterministically.
+    """
+
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory()
+        self.addCleanup(self.d.cleanup)
+        self.p = os.path.join(self.d.name, "store.h5")
+
+    def _store_with_recipe(self, *, dangle=None, drop_attrs=False,
+                           has_recipe=True, no_group=False):
+        with h5py.File(self.p, "w") as f:
+            root = f.create_group("global_fit")
+            root.attrs["iteration"] = 2
+            root.attrs["has_recipe"] = has_recipe
+            root.create_group("inds").create_dataset(
+                "psd", data=np.ones((2, 1, 1, 4, 1), dtype=bool))
+            if no_group:
+                return
+            grp = root.create_group("recipe")
+            for i, name in enumerate(
+                    ["noise_search", "gb_search_1", "full_pe"], start=1):
+                if name == dangle:
+                    # link resolves, object does not -- the job-666 shape
+                    grp[name] = h5py.ExternalLink(
+                        os.path.join(self.d.name, "gone.h5"), "/nope")
+                    continue
+                step = grp.create_group(name)
+                if not drop_attrs:
+                    step.attrs["status"] = (name == "noise_search")
+                    step.attrs["order num"] = i
+
+    def test_a_recipe_step_whose_OBJECT_will_not_open_fails_validation(self):
+        """THE REGRESSION -- this is what job 666 hit at add_recipe."""
+        self._store_with_recipe(dangle="gb_search_1")
+        with self.assertRaises(ValueError) as cm:
+            _validate_resume_readable(self.p)
+        msg = str(cm.exception)
+        self.assertIn("gb_search_1", msg)
+        self.assertIn("torn object header", msg)
+
+    def test_a_recipe_step_missing_its_attrs_fails_validation(self):
+        """The other half-written signature: the group exists, the attrs
+        add_recipe reads do not."""
+        self._store_with_recipe(drop_attrs=True)
+        with self.assertRaises(ValueError):
+            _validate_resume_readable(self.p)
+
+    def test_a_healthy_recipe_group_passes(self):
+        """THE CONTROL. Nothing about a sound store may change."""
+        self._store_with_recipe()
+        _validate_resume_readable(self.p)          # must not raise
+
+    def test_a_store_with_no_recipe_group_is_tolerated(self):
+        """Stores predating the recipe, and the has_recipe=False case --
+        neither is damage and neither may start failing validation."""
+        self._store_with_recipe(no_group=True, has_recipe=False)
+        _validate_resume_readable(self.p)
+        self._store_with_recipe(has_recipe=False)  # group present, flag off
+        _validate_resume_readable(self.p)
+
+
 if __name__ == "__main__":
     unittest.main()
