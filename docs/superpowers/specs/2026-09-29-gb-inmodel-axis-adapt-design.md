@@ -316,6 +316,31 @@ moves that run most of the in-model repeats.
 | `GB_INMODEL_OBSERVABLE_AXIS_GAIN` | `0.2` | log-space gain per propose |
 | `GB_INMODEL_OBSERVABLE_AXIS_BOUND` | `8.0` | multiplier clamp, `[1/8, 8]` |
 
+### Interaction with the band shutoff, and with the per-walker spread
+
+Two things from the job 669 readout bear on a band-keyed table, so
+they are recorded here rather than rediscovered when someone arms it.
+
+**A band that shuts stops feeding its cells, and that is correct by
+construction.** No draws ⇒ `n_draw == 0` ⇒ the cell is returned
+unchanged (`test_a_cell_with_NO_draws_is_returned_unchanged`), so a
+shut band's multipliers freeze at what they had learned rather than
+drifting toward the initial value on no evidence. If the band later
+re-opens through the reset machinery it resumes from that value, which
+is the right default: shutting says the *residual* is converged, not
+that the band's geometry changed. This also means a pending change to
+the shutoff tolerance (per-stage `0.5·floor²` or a per-stage baseline)
+changes *how much* evidence the table gets, never whether it is
+correct.
+
+**Walkers differ enough to justify the walker axis in the key.** Job
+669 measured active pairs per walker `[4, 14, 16, 18]` holding
+`[24, 121, 186, 179]` sources — a ~4.5× spread in pairs and ~7× in
+sources. Pooling walkers would have let walker 3 dominate the estimate
+for a cell that walker 0 explores under quite different conditions.
+The cost is that walker 0's cells adapt roughly 7× more slowly; under
+a constant gain that is a slower tracker, not a bias.
+
 ### What to watch
 
 ```
