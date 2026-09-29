@@ -405,7 +405,8 @@ def r_from_fdot(fdot, f0_hz, mc):
 
 def gb_observable_step_scales(snr, tobs, *, extrinsic_scales, mc_step,
                               jump=1.0, snr_clip=(1.0, 1.0e4),
-                              internal_basis=GB_INTERNAL_BASIS):
+                              internal_basis=GB_INTERNAL_BASIS,
+                              axis_mult=None):
     """Per-column step scales in the INTERNAL basis. ``(n,) -> (n, n_z)``.
 
     **This function deliberately cannot see ``coords``.** State-dependence
@@ -414,6 +415,16 @@ def gb_observable_step_scales(snr, tobs, *, extrinsic_scales, mc_step,
     ``factors = Jacobian only`` wrong -- while leaving the acceptance rate
     looking perfectly healthy. Making the signature incapable of expressing it
     is cheaper than remembering not to.
+
+    ``axis_mult`` is an optional ``(n, n_z)`` PER-ROW PER-COLUMN
+    multiplier applied on top of ``jump``. It exists for the per-source
+    adaptive step scales, and it does NOT weaken the rule above: a
+    multiplier is a per-leaf CONSTANT for the whole propose, fixed
+    before any draw and not a function of the current point, so the
+    proposal stays symmetric and ``factors = Jacobian only`` stays
+    correct. The signature still cannot express coord-dependence, which
+    is the property that matters -- ``axis_mult`` is supplied by the
+    caller, the same way ``extrinsic_scales`` already is.
 
     ``(lnA, f_mid, fdot)`` are analytic and go as ``1/rho``; the extrinsic
     block is supplied by the caller (from the information matrix, whose
@@ -455,7 +466,16 @@ def gb_observable_step_scales(snr, tobs, *, extrinsic_scales, mc_step,
             f"extrinsic_scales has {int(ex.shape[-1])} columns but the "
             f"internal basis {names} carries {k} pass-through coordinates."
         )
-    return out * float(jump)
+    out = out * float(jump)
+    if axis_mult is None:
+        return out
+    am = np.asarray(axis_mult, dtype=out.dtype)
+    if am.shape != out.shape:
+        raise ValueError(
+            f"axis_mult has shape {am.shape} but the step scales are "
+            f"{out.shape}. A silently broadcast multiplier would scale "
+            f"the wrong axis for every row.")
+    return out * am
 
 
 class GBObservableFiberBasis:

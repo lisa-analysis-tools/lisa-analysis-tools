@@ -1362,6 +1362,49 @@ def fstat_stage_fingerprint_for(move) -> str:
     return out
 
 
+def _obs_axis_accum_for(move, a, d_fmid, d_lnfd, ok, xp):
+    """Per-axis tally for ``move``, or nothing if it has none.
+
+    MODULE-LEVEL for the same reason :func:`_obs_axis_mult_for` is:
+    ``_obs_motion_accum`` is driven by duck-typed stubs in
+    test_gb_observable_basis_wiring's MotionCensusTest, and calling a
+    method on ``self`` from there broke four of them. A getattr
+    degrades to "no per-axis census here", which is the right answer
+    for an object that never had one.
+    """
+    fn = getattr(move, "_obs_axis_accum", None)
+    if fn is not None:
+        fn(a, d_fmid, d_lnfd, ok, xp)
+
+
+def _obs_axis_mult_for(move, source_ids, n_z):
+    """PER-SOURCE per-axis step multipliers for ``move``, or ``None``.
+
+    THE SEAM for the adaptive per-source scales. ``None`` -- the answer
+    until the table exists, and the answer for any object that never
+    grew one -- leaves the step byte-identical to the pre-2026-09-28
+    behaviour, so the telemetry landing changes no sampling.
+
+    MODULE-LEVEL and taking the move, for the same reason
+    :func:`fstat_band_min_F_for` is: ``_observable_proposal`` is driven
+    by duck-typed stubs in the tests and by whatever a fan-out stands
+    up in a rank process. A bound method would make every such object
+    grow one or crash the draw path; a getattr degrades to "the feature
+    is off here", which is the correct answer for anything that never
+    armed it.
+
+    ⚠ WHATEVER FILLS THIS MUST BE A PER-LEAF CONSTANT FOR THE WHOLE
+    PROPOSE. ``gb_observable_step_scales`` deliberately cannot see
+    ``coords`` because a state-dependent step size breaks the
+    proposal's symmetry while leaving the acceptance rate looking
+    healthy. A multiplier fixed before any draw and changed only
+    BETWEEN blocks does not. Anything that reads the current point
+    must not enter here.
+    """
+    fn = getattr(move, "_obs_axis_mult", None)
+    return None if fn is None else fn(source_ids, n_z)
+
+
 def fstat_band_skip_for(move):
     """Bands ``move``'s next fit may SKIP, or ``None``.
 
@@ -14041,6 +14084,51 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         m[4] += d_fmid.sum()
         m[5] += (d_fmid * a).sum()
         self._obs_motion = m
+        _obs_axis_accum_for(self, a, d_fmid, d_lnfd, ok, xp)
+
+    #: Bucket index for rows that took the DIAGONAL fallback (no eigen
+    #: table) -- they belong to no axis and must not be attributed to
+    #: one. Reported as "diag".
+    _OBS_AXIS_DIAG = -1
+
+    def _obs_axis_accum(self, a, d_fmid, d_lnfd, ok, xp):   # noqa: D401
+        """Per-eigen-axis tally for the observable path.
+
+        The pooled two-axis line cannot say WHICH axis is timid: with one
+        axis drawn per row, an axis's accepted/proposed ratio is its OWN
+        acceptance, and a 0.7 pooled rate is consistent with f_mid
+        accepting 7% while seven other axes accept 80%. That is the
+        distinction this exists to make.
+
+        ⚠ LENGTH-GUARDED like the legacy ``_last_axis_pick`` tally: if
+        the gate compacted rows, ``pick`` no longer aligns with
+        ``accept`` and the whole tally is SKIPPED rather than silently
+        attributed to the wrong axes.
+        """
+        pick = getattr(self, "_last_obs_axis_pick", None)
+        if pick is None:
+            return
+        n = int(a.shape[0])
+        if int(pick.shape[0]) != n:
+            return
+        absz = getattr(self, "_last_obs_axis_absz", None)
+        if absz is None or int(absz.shape[0]) != n:
+            return
+        _ok = getattr(self, "_last_obs_axis_ok", None)
+        use = (ok if _ok is None or int(_ok.shape[0]) != n else (ok & _ok))
+        na = int(getattr(self, "_eigen_axis_min_dim", 9))
+        t = getattr(self, "_obs_axis_acc", None)
+        if t is None or t.shape[1] != na:
+            t = xp.zeros((6, na), dtype=xp.float64)
+        w = use.astype(xp.float64)
+        wa = w * a
+        for row, vals in ((0, w), (1, wa),
+                          (2, w * absz), (3, wa * absz),
+                          (4, w * d_fmid), (5, wa * d_fmid)):
+            t[row] = t[row] + xp.bincount(pick, weights=vals,
+                                          minlength=na)[:na]
+        self._obs_axis_acc = t
+        self._last_obs_axis_pick = None
 
     def _report_obs_motion(self):
         """Log the observable-path motion census, then reset."""
@@ -14058,7 +14146,50 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             self.name, int(v[0]), int(v[1]), v[1] / max(v[0], 1.0),
             v[2] / max(v[0], 1.0), v[3] / max(v[1], 1.0),
             v[4] / max(v[0], 1.0), v[5] / max(v[1], 1.0))
+        _fn = getattr(self, "_report_obs_axis", None)
+        if _fn is not None:
+            _fn()
         self._obs_motion = None
+
+    def _report_obs_axis(self):
+        """One greppable per-eigen-axis line, then reset.
+
+        Added alongside the two-axis line, which is left BYTE-IDENTICAL
+        so nothing downstream (LOG_KEEP_PATTERN, the monitor's regexes,
+        the bench scripts) has to change.
+        """
+        t = getattr(self, "_obs_axis_acc", None)
+        if t is None:
+            return
+        self._obs_axis_acc = None
+        try:
+            v = _to_numpy(t)
+        except Exception:               # noqa: BLE001 -- diagnostic only
+            return
+        if float(v[0].sum()) <= 0:
+            return
+        try:
+            from lisatools.sampling.gb_observable_basis import (
+                GB_INTERNAL_BASIS)
+            names = list(GB_INTERNAL_BASIS)
+        except Exception:               # noqa: BLE001
+            names = []
+        parts = []
+        for k in range(v.shape[1]):
+            d = float(v[0, k])
+            if d <= 0:
+                continue
+            acc = float(v[1, k])
+            nm = names[k] if k < len(names) else f"ax{k}"
+            parts.append(
+                f"{nm} d={int(d)} a={int(acc)} ({acc / d:.3f}) "
+                f"|dz| p={v[2, k] / d:.3f} a={v[3, k] / max(acc, 1.0):.3f} "
+                f"|df_mid| p={v[4, k] / d:.4f} a="
+                f"{v[5, k] / max(acc, 1.0):.4f}")
+        if not parts:
+            return
+        logger.info("[GB_OBS_BASIS %s] per-axis: %s", self.name,
+                    "; ".join(parts))
 
     #: Opt-in for the GENERIC (no-fiber) eigen-axis table on bases without
     #: the GB dist/Mc/r columns (e.g. VGB's reduced basis). OFF here so a
@@ -14452,6 +14583,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             mc_step=mc_step,
             jump=_observable_knob(self._obs_jump_knob(), 1.0),
             internal_basis=m.INTERNAL_BASIS,
+            axis_mult=_obs_axis_mult_for(
+                self, source_ids, len(m.INTERNAL_BASIS)),
         )
 
     def _obs_jump_knob(self) -> str:
@@ -14629,15 +14762,32 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         _zz = xp.asarray(xp.random.randn(int(nrow)))
                         dz_e = (T_safe[xp.arange(int(nrow)), :, pick]
                                 * _zz[:, None])
+                        # PER-AXIS CENSUS HOOK. One axis per row is
+                        # drawn here and nowhere else, so the index is
+                        # only knowable at this point -- the legacy
+                        # infomat path records ``_last_axis_pick`` the
+                        # same way. ``ok`` rides along because rows
+                        # without a table fall back to the diagonal
+                        # draw and must not be attributed to an axis.
+                        # ``|zz|`` is the step in the axis's OWN unit
+                        # (whitened widths), which is what a per-axis
+                        # multiplier scales.
+                        self._last_obs_axis_pick = pick
+                        self._last_obs_axis_ok = ok
+                        self._last_obs_axis_absz = xp.abs(_zz)
                     else:  # "full": joint correlated step, all axes
                         _rnd = xp.asarray(
                             xp.random.randn(int(nrow), int(ndim_z)))
                         dz_e = xp.einsum("nij,nj->ni", T_safe, _rnd)
+                        # No single axis to attribute to; clear so the
+                        # census cannot reuse a previous repeat's pick.
+                        self._last_obs_axis_pick = None
                     dz_diag = xp.asarray(
                         xp.random.randn(*z.shape)) * scales
                     dz = xp.where(ok[:, None], dz_e, dz_diag)
         if dz is None:
             dz = xp.asarray(xp.random.randn(*z.shape)) * scales
+            self._last_obs_axis_pick = None
         # Fiber weight defaults to 0.0 at first arming: the change under
         # test is the 8-observable step, and ``gb_ridge_gibbs`` already
         # supplies fiber mixing on the main state for free. Independent

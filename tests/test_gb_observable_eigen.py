@@ -313,3 +313,187 @@ class DrawTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PerAxisCensusTest(unittest.TestCase):
+    """One axis is drawn per row, so an axis's accepted/proposed ratio
+    IS its own acceptance -- and a healthy POOLED rate hides a timid
+    axis completely.
+
+    Job 663: cold acceptance 0.55-0.79 while mean |df_mid| accepted /
+    proposed was 0.01-0.34 and |dln_fdot| 0.04-0.10, i.e. f_mid and
+    fdot were accepting a small fraction of their own draws while the
+    other seven axes ran at ~80% to make up the pooled number. The
+    two-axis line could not show that; this one can.
+    """
+
+    NA = 9
+
+    def _move(self, pick, absz, ok=None, na=None):
+        from types import SimpleNamespace
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        m = g.GBSpecialBase.__new__(g.GBSpecialBase)
+        m._last_obs_axis_pick = np.asarray(pick)
+        m._last_obs_axis_absz = np.asarray(absz, dtype=float)
+        m._last_obs_axis_ok = (np.ones(len(pick), bool) if ok is None
+                               else np.asarray(ok, bool))
+        m._eigen_axis_min_dim = self.NA if na is None else na
+        m._obs_axis_acc = None
+        m.name = "rj_warm_search"
+        return m
+
+    def _accum(self, m, accept, d_fmid=None, d_lnfd=None, ok=None):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        n = len(accept)
+        a = np.asarray(accept, dtype=float)
+        g.GBSpecialBase._obs_axis_accum(
+            m, a,
+            np.ones(n) if d_fmid is None else np.asarray(d_fmid, float),
+            np.ones(n) if d_lnfd is None else np.asarray(d_lnfd, float),
+            np.ones(n, bool) if ok is None else np.asarray(ok, bool),
+            np)
+        return m._obs_axis_acc
+
+    # (a) the counts reconcile with the pooled totals
+    def test_per_axis_draws_and_accepts_SUM_to_the_pooled_totals(self):
+        pick = [0, 1, 1, 2, 8, 8, 8]
+        acc = [1, 0, 1, 1, 0, 0, 1]
+        t = self._accum(self._move(pick, np.ones(len(pick))), acc)
+        self.assertEqual(int(t[0].sum()), len(pick))
+        self.assertEqual(int(t[1].sum()), sum(acc))
+
+    def test_each_axis_gets_its_OWN_draws_and_accepts(self):
+        pick = [1, 1, 1, 2]
+        acc = [1, 0, 0, 1]
+        t = self._accum(self._move(pick, np.ones(4)), acc)
+        self.assertEqual((int(t[0, 1]), int(t[1, 1])), (3, 1))
+        self.assertEqual((int(t[0, 2]), int(t[1, 2])), (1, 1))
+        self.assertEqual(int(t[0, 0]), 0)
+
+    def test_the_df_mid_means_are_attributed_to_the_DRAWN_axis(self):
+        pick = [1, 2]
+        t = self._accum(self._move(pick, np.ones(2)), [1, 1],
+                        d_fmid=[0.5, 0.1])
+        self.assertAlmostEqual(float(t[4, 1]), 0.5)
+        self.assertAlmostEqual(float(t[4, 2]), 0.1)
+
+    def test_the_step_size_is_recorded_in_the_axis_OWN_unit(self):
+        """|zz| is the whitened step -- what a per-axis multiplier
+        scales -- not the observable-space delta."""
+        t = self._accum(self._move([3, 3], [2.0, 4.0]), [1, 0])
+        self.assertAlmostEqual(float(t[2, 3]), 6.0)      # proposed
+        self.assertAlmostEqual(float(t[3, 3]), 2.0)      # accepted only
+
+    # the guards
+    def test_a_DIAGONAL_fallback_row_is_attributed_to_NO_axis(self):
+        """Rows with no eigen table take the diagonal draw; counting
+        them under an axis would corrupt exactly the number the
+        adaptation will read."""
+        t = self._accum(self._move([0, 1], np.ones(2), ok=[True, False]),
+                        [1, 1])
+        self.assertEqual(int(t[0].sum()), 1)
+        self.assertEqual(int(t[0, 0]), 1)
+        self.assertEqual(int(t[0, 1]), 0)
+
+    def test_a_LENGTH_MISMATCH_skips_the_tally_entirely(self):
+        """If the gate compacted rows the pick no longer aligns, and a
+        wrong attribution is worse than none."""
+        m = self._move([0, 1, 2], np.ones(3))
+        t = self._accum(m, [1, 0])          # 2 accepts vs 3 picks
+        self.assertIsNone(t)
+
+    def test_no_pick_means_no_tally(self):
+        """full / diagonal modes draw no single axis and clear it."""
+        m = self._move([0], [1.0])
+        m._last_obs_axis_pick = None
+        self.assertIsNone(self._accum(m, [1]))
+
+    def test_the_pick_is_CONSUMED_so_a_repeat_cannot_double_count(self):
+        m = self._move([0, 0], np.ones(2))
+        self._accum(m, [1, 1])
+        self.assertIsNone(m._last_obs_axis_pick)
+        self._accum(m, [1, 1])              # second call, stale pick
+        self.assertEqual(int(m._obs_axis_acc[0].sum()), 2)
+
+    # wiring
+    def test_the_draw_site_records_the_pick(self):
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._observable_proposal)
+        self.assertIn("self._last_obs_axis_pick = pick", src)
+        self.assertIn("self._last_obs_axis_absz", src)
+        self.assertIn("self._last_obs_axis_pick = None", src,
+                      "full/diagonal must clear it")
+
+    def test_the_two_axis_line_is_still_emitted(self):
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._report_obs_motion)
+        self.assertIn("in-model motion -- draws %d accepted %d", src)
+        self.assertIn("_report_obs_axis", src)
+
+
+class AxisMultSeamTest(unittest.TestCase):
+    """``axis_mult`` may enter the step scales; ``coords`` may not."""
+
+    def _args(self, n=3):
+        from lisatools.sampling.gb_observable_basis import GB_INTERNAL_BASIS
+        return dict(
+            snr=np.full(n, 20.0), tobs=1.0e7,
+            extrinsic_scales=np.ones((n, 5)), mc_step=1e-3,
+            internal_basis=GB_INTERNAL_BASIS)
+
+    def test_the_signature_STILL_cannot_see_coords(self):
+        """The property the function exists to guarantee."""
+        import inspect
+        from lisatools.sampling import gb_observable_basis as m
+        sig = inspect.signature(m.gb_observable_step_scales)
+        self.assertNotIn("coords", sig.parameters)
+        self.assertIn("axis_mult", sig.parameters)
+
+    def test_None_is_byte_identical_to_before(self):
+        from lisatools.sampling.gb_observable_basis import (
+            gb_observable_step_scales as f)
+        a = f(jump=2.0, **self._args())
+        b = f(jump=2.0, axis_mult=None, **self._args())
+        np.testing.assert_array_equal(a, b)
+
+    def test_it_multiplies_ON_TOP_of_jump(self):
+        from lisatools.sampling.gb_observable_basis import (
+            gb_observable_step_scales as f)
+        base = f(jump=2.0, **self._args())
+        mult = np.full(base.shape, 3.0)
+        got = f(jump=2.0, axis_mult=mult, **self._args())
+        np.testing.assert_allclose(got, base * 3.0)
+
+    def test_a_MISSHAPEN_multiplier_raises_rather_than_broadcasting(self):
+        """A silently broadcast multiplier scales the wrong axis for
+        every row."""
+        from lisatools.sampling.gb_observable_basis import (
+            gb_observable_step_scales as f)
+        with self.assertRaises(ValueError):
+            f(jump=1.0, axis_mult=np.ones(3), **self._args())
+
+    def test_the_seam_defaults_to_None(self):
+        """A+B is telemetry only: the step must be unchanged."""
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        self.assertIsNone(g._obs_axis_mult_for(object(), None, 9))
+
+    def test_the_seam_is_MODULE_LEVEL_so_stubs_do_not_crash(self):
+        """``_observable_proposal`` is driven by duck-typed stubs in
+        these very tests and by rank processes; a bound method would
+        make every such object grow one or crash the draw path. Same
+        rationale as fstat_band_min_F_for, and the first version of
+        this WAS a method and broke five existing DrawTest cases."""
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        self.assertTrue(inspect.isfunction(g._obs_axis_mult_for))
+        self.assertFalse(hasattr(g.GBSpecialBase, "_obs_axis_mult"))
+
+    def test_a_move_that_DOES_define_one_is_used(self):
+        from types import SimpleNamespace
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        want = np.full((2, 9), 4.0)
+        mv = SimpleNamespace(_obs_axis_mult=lambda ids, n: want)
+        np.testing.assert_array_equal(
+            g._obs_axis_mult_for(mv, None, 9), want)
