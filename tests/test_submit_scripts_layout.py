@@ -647,6 +647,16 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # second pure in-model pass is dropped -- in_model and
             # in_model_fstat are the same class and cost 47% of a job
             # 662 iteration between them. v8 has neither knob.
+            # V9-23 (2026-09-28): GB_INMODEL_OBSERVABLE_JUMP 2.0 -> 1.5.
+            # Under GB_INMODEL_OBSERVABLE_EIGEN=axis one eigen axis is
+            # drawn per repeat, so an axis's accepted/proposed motion
+            # ratio is its OWN acceptance: job 663 had f_mid at ~7% and
+            # fdot 3-7% against a pooled 0.55-0.79, and the 09-19
+            # doubling made accepted f motion SMALLER. 1.5 is an
+            # interim compromise -- one global knob cannot suit both
+            # halves -- pending the per-axis scaling on the
+            # gb-inmodel-axis-adapt branch.
+            "GB_INMODEL_OBSERVABLE_JUMP",
             "GB_SEARCH_BAND_SHUTOFF_LL_TOL",
             # GB_SEARCH_DROP_MOVES is deliberately NOT listed: Mike
             # rejected dropping in_model_fstat (2026-09-28) and the

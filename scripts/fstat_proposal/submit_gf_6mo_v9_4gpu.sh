@@ -3027,7 +3027,25 @@ export GB_INMODEL_OBSERVABLE_FIBER_WEIGHT=0.0
 # 0.71 says the step wants roughly doubling -- which is this knob, and
 # deliberately NOT GB_JUMP_FACTOR (that one was tuned against the
 # eigen-floored draw; see the block above).
-export GB_INMODEL_OBSERVABLE_JUMP=2.0
+# 2.0 -> 1.5 (2026-09-28, Mike). The 09-19 doubling to 2.0 was too
+# far, and the evidence is per-axis: under
+# GB_INMODEL_OBSERVABLE_EIGEN=axis ONE eigen axis is drawn per repeat,
+# so an axis's accepted/proposed motion ratio IS its own acceptance.
+# Job 663 measured mean |df_mid| accepted/proposed at 0.01-0.34 and
+# |dln_fdot| at 0.04-0.10 against a POOLED cold acceptance of
+# 0.55-0.79 -- i.e. f_mid was accepting ~7% of its own draws and fdot
+# 3-7%, while the other seven axes ran ~80% to make up the pooled
+# number. The doubling itself made accepted f motion SMALLER
+# (0.0032 -> 0.0020 bins), which is the signature of a step already
+# past its optimum on that axis.
+#
+# ⚠ ONE GLOBAL KNOB CANNOT FIX BOTH HALVES: 1.5 helps f_mid and fdot
+# and costs the seven axes that were happy at 2.0. It is an interim
+# compromise until the per-axis / per-source scaling lands (that work
+# is on the gb-inmodel-axis-adapt branch, deliberately NOT on dev).
+# The per-axis census added alongside this is what will show whether
+# 1.5 moved the right axes.
+export GB_INMODEL_OBSERVABLE_JUMP=1.5
 # Mc step as a FRACTION of the m_chirp prior box (only reachable when the
 # fiber weight above is non-zero).
 export GB_INMODEL_OBSERVABLE_MC_STEP=0.05
