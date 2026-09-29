@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import h5py
 import copy
@@ -847,3 +848,166 @@ class Level3ShutPairsRunNothingTest(unittest.TestCase):
         m.search_mode = False
         m.is_rj_prop = False
         self.assertFalse(m._shutoff_mask_live)
+
+
+class ShutCellsAreNeverSTAGEDTest(unittest.TestCase):
+    """The invariant: no staged cell, on any move, has a shut pair.
+
+    ⚠ THE PICK MASK WAS NOT ENOUGH. 98428c32 gated ``eligible`` at the
+    group eligibility point -- which runs AFTER ``BandScheduler`` is
+    built from ``subset.special_band_inds`` and after the buffer is
+    filled. So shut cells were still STAGED on every move; only the
+    picking stopped. Job 663 rows 31-32 measured it: cells per unit
+    in_model 52 (its subset is alive-only, so its shut rows were
+    filtered) but rj_warm_search 904 and rj_fstat_search 1863, with
+    37911 occupied cells inside shut pairs at row 32 and 843 of 844
+    newly-alive sources landing in pairs that were shut.
+
+    Keyed on the SPECIAL, not on a row's ``band_inds``: the cell's
+    (walker, band) is IN the key, so the filter cannot be wrong about
+    which band a cell is in -- which the row-level subset filter can be
+    for the RJ path's dead rows.
+    """
+
+    NT, NW, NB = 3, 2, 4
+    SHUT_W, SHUT_B = 0, 1
+    OPEN_W, OPEN_B = 0, 2
+
+    def _shut(self):
+        s = np.zeros((self.NW, self.NB), dtype=bool)
+        s[self.SHUT_W, self.SHUT_B] = True
+        return s
+
+    def _specials(self):
+        """Cells at EVERY rung for one shut pair and one active pair,
+        plus the same band in the other walker (must survive)."""
+        from lisatools.globalfit.moves.gbbands import pack_special_index
+        out = []
+        for t in range(self.NT):
+            for w, b in ((self.SHUT_W, self.SHUT_B),
+                         (self.OPEN_W, self.OPEN_B),
+                         (1, self.SHUT_B)):
+                out.append(int(pack_special_index(t, w, b, self.NW)))
+        return np.array(out, dtype=np.int64)
+
+    def _filter(self, specials, shut):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        return g._drop_shut_specials(specials, shut, self.NW, np)
+
+    def _decode(self, specials):
+        from lisatools.globalfit.moves.gbbands import unpack_special_index
+        t, w, b = unpack_special_index(np.asarray(specials), self.NW)
+        return set(zip([int(x) for x in w], [int(x) for x in b]))
+
+    # (a) zero staged cells in the shut pair, at EVERY rung
+    def test_the_shut_pair_is_gone_from_the_staged_list_at_every_rung(self):
+        kept, n = self._filter(self._specials(), self._shut())
+        self.assertEqual(n, self.NT, "one cell per rung should be dropped")
+        self.assertNotIn((self.SHUT_W, self.SHUT_B), self._decode(kept))
+
+    # (e) the active pair keeps everything
+    def test_the_ACTIVE_pair_survives_at_every_rung(self):
+        kept, _ = self._filter(self._specials(), self._shut())
+        pairs = self._decode(kept)
+        self.assertIn((self.OPEN_W, self.OPEN_B), pairs)
+        self.assertEqual(len(kept), 2 * self.NT)
+
+    def test_the_SAME_BAND_in_another_walker_survives(self):
+        """The valve is per (walker, band). A per-band filter here would
+        starve walker 1 of a band only walker 0 has finished."""
+        kept, _ = self._filter(self._specials(), self._shut())
+        self.assertIn((1, self.SHUT_B), self._decode(kept))
+
+    def test_nothing_shut_changes_nothing(self):
+        sp = self._specials()
+        kept, n = self._filter(sp, np.zeros((self.NW, self.NB), dtype=bool))
+        self.assertEqual(n, 0)
+        np.testing.assert_array_equal(kept, sp)
+
+    def test_the_valve_being_unbound_changes_nothing(self):
+        sp = self._specials()
+        kept, n = self._filter(sp, None)
+        self.assertEqual(n, 0)
+        np.testing.assert_array_equal(kept, sp)
+
+    def test_a_broken_table_never_breaks_STAGING(self):
+        """Staging must not be the thing that takes the run down."""
+        import logging
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        sp = self._specials()
+        # A table too SMALL for the grid: .any() is True so the early
+        # return is skipped, and the lookup then raises IndexError. An
+        # all-zeros table of the wrong shape would return early and test
+        # nothing.
+        with self.assertLogs(g.logger, level=logging.WARNING):
+            kept, n = g._drop_shut_specials(sp, np.ones((1, 1), bool),
+                                            self.NW, np)
+        self.assertEqual(n, 0)
+        np.testing.assert_array_equal(kept, sp)
+
+    # -- the STEP, behaviourally ---------------------------------------
+    def _move(self, shut, search=True):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        m = g.GBSpecialBase.__new__(g.GBSpecialBase)
+        m.search_mode = search
+        m._rj_band_shutoff_w = shut
+        m.nwalkers = self.NW
+        m.name = "rj_warm_search"
+        # ``xp`` is a read-only PROPERTY (the deepcopy-safety rule in
+        # CLAUDE.md: never store the array module as an instance
+        # attribute), so it is patched on the class, not assigned.
+        return m
+
+    def _staged(self, m, specials):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        with mock.patch.object(g.GBSpecialBase, "xp", np):
+            return g.GBSpecialBase._staged_specials(m, specials)
+
+    def test_the_STEP_drops_shut_cells(self):
+        """⚠ THE CONTROL THAT MATTERS. An inline ``if`` here was
+        disabled by a one-word mutation and all 64 tests still passed,
+        because they exercised the helper and the source text rather
+        than this step. This one fails when the step stops filtering."""
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        out = self._staged(self._move(self._shut()), self._specials())
+        self.assertNotIn((self.SHUT_W, self.SHUT_B), self._decode(out))
+        self.assertEqual(len(out), 2 * self.NT)
+
+    def test_the_STEP_is_the_identity_outside_search_mode(self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        sp = self._specials()
+        out = self._staged(self._move(self._shut(), search=False), sp)
+        np.testing.assert_array_equal(out, sp)
+
+    def test_the_SCHEDULER_is_built_from_the_step_output(self):
+        """Removing the CALL is a different mutation from breaking the
+        step, so both are pinned."""
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._run_band_unit)
+        self.assertIn("_sched_specials = self._staged_specials(", src)
+        self.assertLess(src.index("self._staged_specials("),
+                        src.index("scheduler = BandScheduler("),
+                        "the filter must run BEFORE the scheduler exists")
+
+    def test_there_is_exactly_ONE_scheduler_construction(self):
+        """The filter's coverage argument depends on it: cell_specials
+        is assigned once, from this input, so every later cell
+        (advance/refill, the all-rung swap tables) descends from it."""
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        self.assertEqual(
+            inspect.getsource(g).count("scheduler = BandScheduler("), 1)
+
+    def test_the_count_is_logged_per_unit(self):
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._run_band_unit)
+        self.assertIn("excluded from ", src)
+
+    def test_the_PICK_mask_is_kept_as_belt_and_braces(self):
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._run_band_unit)
+        self.assertIn("_shut3 = getattr(self, \"_rj_band_shutoff_w\", None)",
+                      src)

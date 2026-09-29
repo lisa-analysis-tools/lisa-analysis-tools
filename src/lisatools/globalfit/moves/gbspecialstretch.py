@@ -2546,6 +2546,50 @@ def _vert_all_rungs_on() -> bool:
         "1", "true", "True", "yes", "on")
 
 
+def _drop_shut_specials(specials, shut_w, nwalkers, xp):
+    """Remove cells whose (walker, band) is level-3 SHUT. ``(kept, n)``.
+
+    ⚠ KEYED ON THE SPECIAL, which is the CELL IDENTITY the scheduler
+    actually works in, not on a row's ``band_inds``. That distinction is
+    the whole point: the subset filter at the RJ path tests each ROW's
+    band, and a dead (birth-reserve) row's band need not be the band the
+    cell it stages ends up being -- which is why the subset filter left
+    rj_warm_search staging ~904 cells per unit and rj_fstat_search
+    ~1863, against in_model's 52, with 37911 occupied cells inside shut
+    pairs at row 32 of job 663. Filtering the CELL LIST cannot be wrong
+    about which band a cell is in, because the band is IN the key.
+
+    ⚠ THIS IS THE ONE CHOKE POINT. ``BandScheduler`` is constructed
+    exactly once, from ``_sched_specials``, and ``cell_specials`` is
+    assigned exactly once from that input -- so every later cell
+    (``advance``/refill, the all-rung swap tables built from picked
+    rows) descends from this list. The invariant to hold is "no staged
+    cell, on any move, has a shut (walker, band)", not "this builder
+    filters".
+
+    The 2026-09-28 pick mask stays as belt-and-braces: it gates
+    ``eligible`` AFTER the scheduler exists, so it never prevented
+    staging -- only picking. That is why in_model got cheaper (its
+    pick-driven work vanished) while buffer_build / cell_ll /
+    unit_open_close on shut cells did not.
+    """
+    if shut_w is None or specials is None:
+        return specials, 0
+    try:
+        if not bool(xp.asarray(shut_w).any()):
+            return specials, 0
+        _t, _w, _b = unpack_special_index(specials, int(nwalkers))
+        _sd = xp.asarray(shut_w)
+        keep = ~_sd[_w, _b]
+        n = int((~keep).sum())
+        return (specials[keep], n) if n else (specials, 0)
+    except Exception as e:          # noqa: BLE001 -- never break staging
+        logger.warning(
+            "[GB_STAGE] shut-cell staging filter unavailable (%r); shut "
+            "pairs WILL be staged this unit.", e)
+        return specials, 0
+
+
 def _vert_at_refit_on() -> bool:
     """``GB_TEMPER_VERTICAL_AT_REFIT`` -- swap only on refit repeats.
 
@@ -8710,6 +8754,30 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 exc_info=_first,
             )
 
+    def _staged_specials(self, specials):
+        """The cell list the scheduler is built from, shut pairs removed.
+
+        LEVEL-3 SHUT CELLS ARE NEVER STAGED (user ruling 2026-09-28: a
+        shut pair "runs NOTHING"). A METHOD, not an inline block, so the
+        behaviour is testable on its own -- an inline ``if`` here was
+        disabled by a one-word mutation and every test still passed,
+        because they exercised the helper and the source text rather
+        than this step.
+
+        Search mode only; outside it the valve does not exist and this
+        is the identity.
+        """
+        if not getattr(self, "search_mode", False):
+            return specials
+        out, n = _drop_shut_specials(
+            specials, getattr(self, "_rj_band_shutoff_w", None),
+            self.nwalkers, self.xp)
+        if n:
+            logger.info(
+                "[GB_STAGE %s] %d cell(s) in shut pairs excluded from "
+                "staging (%d staged)", self.name, n, int(len(out)))
+        return out
+
     def _run_band_unit(self, model, band_sorter, subset, band_temps,
                        ll_change_log, prop_counts, acc_counts):
         """Drive one parity unit's cells through the sub-band buffer."""
@@ -8734,6 +8802,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # hold >= cap alive rows), so the cell set is unchanged.
             _countable = subset.inds | ~_cap_m[subset.inds_main_band_sorter]
             _sched_specials = subset.special_band_inds[_countable]
+        _sched_specials = self._staged_specials(_sched_specials)
         scheduler = BandScheduler(
             _sched_specials, self.num_band_preload_total, xp=self.xp,
             cell_order=getattr(self, "temper_cell_order", "count"),
