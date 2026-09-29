@@ -967,9 +967,49 @@ class GFHDFBackend(eryn_HDFBackend):
                 for i, recipe_step in enumerate(recipe.recipe):
                     key = recipe_step["name"]
                     assert key in recipe_group
-                    recipe_step_group = recipe_group[key]
-                    recipe.recipe[i]["status"] = recipe_step_group.attrs["status"]
-                    order_i_in_file = recipe_step_group.attrs["order num"]
+                    # ⚠ THE LINK EXISTING DOES NOT MEAN THE OBJECT READS.
+                    # The assert above tests the LINK; opening the group
+                    # reads its object header, and a header torn by a kill
+                    # mid-attr-write fails here with HDF5's own wording
+                    # wrapped in a KeyError:
+                    #
+                    #   KeyError: 'Unable to synchronously open object
+                    #              (message not aligned)'
+                    #
+                    # which reads as "no such recipe step" and sends the
+                    # next person looking for a recipe bug that does not
+                    # exist. Measured 2026-09-29, 3mo job 666: every chain,
+                    # log_like and sub_backend in that store read fine and
+                    # the run reached "initial log likelihood" -- only this
+                    # group was damaged. Attr writes (status,
+                    # completed_iteration, start_iteration) rewrite the
+                    # object header, so this group is rewritten far more
+                    # often than its size suggests and an MPI abort landing
+                    # there is exactly how it tears. Say so, and name the
+                    # recovery point, rather than raising the raw KeyError.
+                    try:
+                        recipe_step_group = recipe_group[key]
+                        _status = recipe_step_group.attrs["status"]
+                        order_i_in_file = recipe_step_group.attrs["order num"]
+                    except (KeyError, OSError) as e:
+                        _bak = self.filename[:-3] + "_running_backup_copy.h5"
+                        raise RuntimeError(
+                            f"the recipe step {key!r} is present as a link in "
+                            f"{self.filename} but its object CANNOT BE READ "
+                            f"({type(e).__name__}: {e}). This is HDF5 file "
+                            f"DAMAGE, not a missing or renamed recipe step -- "
+                            f"a job killed or MPI-aborted while an attr was "
+                            f"being written to this group leaves its object "
+                            f"header malformed. The rest of the store may be "
+                            f"perfectly readable, as the chains were here. "
+                            f"RECOVERY, in order of preference: (1) transplant "
+                            f"just this group from {_bak} (keeps every stored "
+                            f"iteration); (2) restore that backup wholesale "
+                            f"(loses at most `backup_iter` saves). COPY THE "
+                            f"PRIMARY ASIDE BEFORE EITHER -- never repair the "
+                            f"only copy."
+                        ) from e
+                    recipe.recipe[i]["status"] = _status
                     assert order_i_in_file == i + 1
 
         else:
