@@ -958,10 +958,11 @@ class ShutCellsAreNeverSTAGEDTest(unittest.TestCase):
         # attribute), so it is patched on the class, not assigned.
         return m
 
-    def _staged(self, m, specials):
+    def _staged(self, m, specials, nwalkers=None):
         import lisatools.globalfit.moves.gbspecialstretch as g
         with mock.patch.object(g.GBSpecialBase, "xp", np):
-            return g.GBSpecialBase._staged_specials(m, specials)
+            return g.GBSpecialBase._staged_specials(
+                m, specials, self.NW if nwalkers is None else nwalkers)
 
     def test_the_STEP_drops_shut_cells(self):
         """⚠ THE CONTROL THAT MATTERS. An inline ``if`` here was
@@ -978,6 +979,37 @@ class ShutCellsAreNeverSTAGEDTest(unittest.TestCase):
         sp = self._specials()
         out = self._staged(self._move(self._shut(), search=False), sp)
         np.testing.assert_array_equal(out, sp)
+
+    def test_nwalkers_comes_from_the_SORTER_not_the_MOVE(self):
+        """⚠ Under the walker-block layout the move's own count can
+        differ from the one ``pack_special_index`` packed with, and the
+        all-rungs sweep already takes it from the sorter for exactly
+        this reason. With the move's count the specials decode to the
+        WRONG (walker, band) -- and the blanket except in
+        _drop_shut_specials would turn that into a logged "shut pairs
+        WILL be staged", i.e. a silent no-op.
+        """
+        m = self._move(self._shut())
+        m.nwalkers = self.NW + 2                 # the move disagrees
+        # Packed with self.NW, so decoding with self.NW is correct...
+        out = self._staged(m, self._specials(), nwalkers=self.NW)
+        self.assertNotIn((self.SHUT_W, self.SHUT_B), self._decode(out))
+        self.assertEqual(len(out), 2 * self.NT)
+        # ...and decoding with the MOVE's count is not: the shut pair
+        # survives, which is the production symptom.
+        bad = self._staged(m, self._specials(), nwalkers=m.nwalkers)
+        self.assertNotEqual(
+            len(bad), len(out),
+            "decoding with the wrong nwalkers must not silently agree; "
+            "if it does, this fixture no longer discriminates")
+
+    def test_the_call_site_passes_the_SORTER_count(self):
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._run_band_unit)
+        self.assertIn("band_sorter.nwalkers", src)
+        self.assertNotIn("self._staged_specials(\n            "
+                         "_sched_specials, self.nwalkers)", src)
 
     def test_the_SCHEDULER_is_built_from_the_step_output(self):
         """Removing the CALL is a different mutation from breaking the

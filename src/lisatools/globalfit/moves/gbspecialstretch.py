@@ -8754,8 +8754,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 exc_info=_first,
             )
 
-    def _staged_specials(self, specials):
+    def _staged_specials(self, specials, nwalkers):
         """The cell list the scheduler is built from, shut pairs removed.
+
+        ⚠ ``nwalkers`` COMES FROM THE SORTER, NOT FROM THE MOVE. It is
+        the value ``pack_special_index`` packed these specials with, and
+        under the walker-block layout the move's own count can differ --
+        the all-rungs sweep already takes it from the sorter for exactly
+        this reason and says so. Taking ``self.nwalkers`` happens to
+        agree on a rank today (both are the block width B), but a
+        mismatch would decode every special to the wrong (walker, band)
+        and the blanket ``except`` in ``_drop_shut_specials`` would turn
+        that into a logged "shut pairs WILL be staged this unit" -- the
+        silent-no-op shape this run has hit four times in one day.
 
         LEVEL-3 SHUT CELLS ARE NEVER STAGED (user ruling 2026-09-28: a
         shut pair "runs NOTHING"). A METHOD, not an inline block, so the
@@ -8771,7 +8782,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             return specials
         out, n = _drop_shut_specials(
             specials, getattr(self, "_rj_band_shutoff_w", None),
-            self.nwalkers, self.xp)
+            nwalkers, self.xp)
         if n:
             logger.info(
                 "[GB_STAGE %s] %d cell(s) in shut pairs excluded from "
@@ -8802,7 +8813,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # hold >= cap alive rows), so the cell set is unchanged.
             _countable = subset.inds | ~_cap_m[subset.inds_main_band_sorter]
             _sched_specials = subset.special_band_inds[_countable]
-        _sched_specials = self._staged_specials(_sched_specials)
+        _sched_specials = self._staged_specials(
+            _sched_specials, band_sorter.nwalkers)
         scheduler = BandScheduler(
             _sched_specials, self.num_band_preload_total, xp=self.xp,
             cell_order=getattr(self, "temper_cell_order", "count"),
