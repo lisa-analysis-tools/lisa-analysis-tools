@@ -4703,6 +4703,21 @@ def build_gb_moves(
         list(gb_search_moves) + list(gb_pe_moves), general_info.random_seed
     )
 
+    # SEARCH-STAGE STAMP. Read by ``obs_axis_adapt_on``: the per-axis step
+    # multipliers are LEARNED from the chain's own acceptance, which the
+    # PE stage cannot have and keep detailed balance. A stamp rather than
+    # the "search" in the name idiom (``_replace_fstat_max``) because the
+    # in-model slots are named ``in_model*`` and the removal move
+    # ``rj_prior_removal`` -- none of them carry the stage in the name,
+    # and all of them run the observable in-model repeats.
+    # A move present in BOTH lists (``gb_ridge_gibbs`` is one object
+    # appended to each) is left UNSTAMPED: one object cannot be in two
+    # stages, and "do not adapt" is the safe resolution.
+    _pe_ids = {id(_m) for _m in gb_pe_moves}
+    for _m in gb_search_moves:
+        if id(_m) not in _pe_ids:
+            _m.gb_search_stage = True
+
     return gb_search_moves, gb_pe_moves
 
 def build_vgb_moves(

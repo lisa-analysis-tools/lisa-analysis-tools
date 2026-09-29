@@ -746,7 +746,7 @@ class PerAxisScaleReachesTheStepTest(unittest.TestCase):
             gz[k] = np.diag(c[k] / w[k] ** 2)
         s._obs_gamma_z = gz
         if scale is not None:
-            s._obs_axis_scale = lambda _ids, na, _g=scale: _g
+            s._obs_axis_scale = lambda _ids, na, _xp, _g=scale: _g
         if axis_mult is not None:
             s._obs_axis_mult = lambda _ids, nz, _m=axis_mult: _m
         env = {} if jump is None else {
@@ -779,7 +779,7 @@ class PerAxisScaleReachesTheStepTest(unittest.TestCase):
         from types import SimpleNamespace
         import lisatools.globalfit.moves.gbspecialstretch as g
         self.assertIsNone(
-            g.obs_axis_scale_for(SimpleNamespace(), np.arange(3), 9))
+            g.obs_axis_scale_for(SimpleNamespace(), np.arange(3), 9, np))
 
     # --- why the OLD seam could not be used ------------------------------
     def test_NEGATIVE_CONTROL_the_same_factor_via_axis_mult_does_NOTHING(
@@ -823,3 +823,292 @@ class PerAxisScaleReachesTheStepTest(unittest.TestCase):
         base = self._prep(curv=curv)
         got = self._prep(curv=curv, scale=np.full((self.N, NDIM), 0.25))
         np.testing.assert_allclose(got / base, 0.25, rtol=1e-12)
+
+
+class AxisAdaptUpdateTest(unittest.TestCase):
+    """The update rule itself, as a pure function."""
+
+    def _u(self, g, nd, na, **kw):
+        import lisatools.globalfit.moves.gbspecialstretch as m
+        return m.obs_axis_adapt_update(
+            np.asarray(g, float), np.asarray(nd, float),
+            np.asarray(na, float), np, **kw)
+
+    def test_accepting_ABOVE_target_widens_the_step(self):
+        g = self._u([[1.0]], [[10]], [[10]], target=0.44, gain=0.2)
+        self.assertGreater(float(g[0, 0]), 1.0)
+
+    def test_accepting_BELOW_target_narrows_it(self):
+        g = self._u([[1.0]], [[10]], [[0]], target=0.44, gain=0.2)
+        self.assertLess(float(g[0, 0]), 1.0)
+
+    def test_AT_target_is_a_fixed_point(self):
+        g = self._u([[2.0]], [[100]], [[44]], target=0.44, gain=0.2)
+        self.assertAlmostEqual(float(g[0, 0]), 2.0, places=12)
+
+    def test_a_cell_with_NO_draws_is_returned_unchanged(self):
+        """Most cells see no draw in a given propose; drifting them
+        toward the initial value would be adaptation from no data."""
+        g = self._u([[0.3, 5.0]], [[0, 0]], [[0, 0]])
+        np.testing.assert_allclose(g, [[0.3, 5.0]], rtol=1e-12)
+
+    def test_the_step_is_gain_times_the_rate_error_in_LOG_space(self):
+        g = self._u([[1.0]], [[4]], [[3]], target=0.5, gain=0.4)
+        self.assertAlmostEqual(float(np.log(g[0, 0])), 0.4 * (0.75 - 0.5))
+
+    def test_the_multiplier_is_CLAMPED_both_ways(self):
+        hi = self._u([[100.0]], [[10]], [[10]], bound=8.0)
+        lo = self._u([[0.001]], [[10]], [[0]], bound=8.0)
+        self.assertAlmostEqual(float(hi[0, 0]), 8.0)
+        self.assertAlmostEqual(float(lo[0, 0]), 0.125)
+
+    def test_each_cell_moves_on_its_OWN_evidence(self):
+        g = self._u([[1.0, 1.0]], [[10, 10]], [[10, 0]], target=0.44,
+                    gain=0.2)
+        self.assertGreater(float(g[0, 0]), 1.0)
+        self.assertLess(float(g[0, 1]), 1.0)
+
+
+class AxisAdaptArmingTest(unittest.TestCase):
+    """Adaptation is SEARCH-ONLY: a learned step scale is not a fixed
+    proposal, and the PE stage has to keep detailed balance."""
+
+    def _mv(self, **kw):
+        from types import SimpleNamespace
+        return SimpleNamespace(**kw)
+
+    def _on(self, mv, adapt="1"):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        with mock.patch.dict(
+            os.environ, {"GB_INMODEL_OBSERVABLE_AXIS_ADAPT": adapt}
+        ):
+            return g.obs_axis_adapt_on(mv)
+
+    def test_OFF_by_default(self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GB_INMODEL_OBSERVABLE_AXIS_ADAPT", None)
+            self.assertFalse(g.obs_axis_adapt_on(
+                self._mv(_is_search_move=lambda: True)))
+
+    def test_armed_for_a_SEARCH_move(self):
+        self.assertTrue(self._on(self._mv(_is_search_move=lambda: True)))
+
+    def test_NOT_armed_for_a_PE_move_even_with_the_knob_on(self):
+        self.assertFalse(self._on(self._mv(_is_search_move=lambda: False)))
+
+    def test_the_stamp_or_the_name_both_say_search(self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        f = g.GBSpecialBase._is_search_move
+        self.assertTrue(f(self._mv(name="rj_warm_search")))
+        self.assertTrue(f(self._mv(name="in_model", gb_search_stage=True)))
+        self.assertTrue(f(self._mv(name="rj_replace",
+                                   replace_search_stage=True)))
+        self.assertFalse(f(self._mv(name="in_model")))
+        self.assertFalse(f(self._mv(name="rj_prior_removal")))
+
+    def test_the_recipe_stamps_search_EXCLUSIVE_moves_only(self):
+        """``gb_ridge_gibbs`` is ONE object in both lists; a single
+        object cannot be in two stages, so it is left unstamped."""
+        import inspect
+        from lisatools.globalfit import recipe
+        src = inspect.getsource(recipe.build_gb_moves)
+        self.assertIn("_pe_ids = {id(_m) for _m in gb_pe_moves}", src)
+        self.assertIn("_m.gb_search_stage = True", src)
+
+
+class AxisAdaptCellKeyTest(unittest.TestCase):
+    """The key is (temp, walker, band, axis)."""
+
+    NT, NW, NB, NA = 3, 2, 4, 5
+
+    def _mv(self, bound=True):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        m = g.GBSpecialBase.__new__(g.GBSpecialBase)
+        # ``xp`` is a read-only property; every hook takes it explicitly.
+        m.name = "rj_warm_search"
+        m.gb_search_stage = True
+        m._obs_axis_g = None
+        m._obs_axis_nd = m._obs_axis_na_acc = None
+        m._last_obs_axis_ids = None
+        m._obs_axis_keys = None
+        if bound:
+            sorter = types.SimpleNamespace(
+                temp_inds=np.array([0, 0, 2, 2]),
+                walker_inds=np.array([0, 1, 0, 1]),
+                band_inds=np.array([3, 3, 1, 1]),
+                ntemps=self.NT, nwalkers=self.NW, num_bands=self.NB)
+            g.GBSpecialBase._obs_axis_bind_keys(m, sorter)
+        return m
+
+    def test_the_dims_come_from_the_SORTER_not_from_the_rows(self):
+        """A propose that populates no row on the top rung must not
+        resize the table -- that would discard everything learned."""
+        m = self._mv()
+        self.assertEqual(m._obs_axis_keys[3], (self.NT, self.NW, self.NB))
+
+    def test_no_sorter_means_no_key_and_no_multiplier(self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        m = self._mv(bound=False)
+        g.GBSpecialBase._obs_axis_bind_keys(m, None)
+        self.assertIsNone(m._obs_axis_keys)
+        self.assertIsNone(
+            g.GBSpecialBase._obs_axis_scale(m, np.arange(4), self.NA, np))
+
+    def test_rows_in_the_SAME_cell_share_a_multiplier(self):
+        """Which is what gives a newborn its band's learned value for
+        free -- there is no separate newborn table."""
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        m = self._mv()
+        m._obs_axis_keys = (np.array([0, 0]), np.array([1, 1]),
+                            np.array([2, 2]), (self.NT, self.NW, self.NB))
+        gtab = np.ones((self.NT, self.NW, self.NB, self.NA))
+        gtab[0, 1, 2] = np.arange(1, self.NA + 1)
+        m._obs_axis_g = gtab
+        out = g.GBSpecialBase._obs_axis_scale(m, np.array([0, 1]), self.NA, np)
+        np.testing.assert_allclose(out[0], np.arange(1, self.NA + 1))
+        np.testing.assert_allclose(out[1], out[0])
+
+    def test_different_TEMPS_get_different_multipliers(self):
+        """The optimal width goes as 1/sqrt(beta); keying on the rung is
+        what lets the adaptation discover that."""
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        m = self._mv()
+        gtab = np.ones((self.NT, self.NW, self.NB, self.NA))
+        gtab[0, 0, 3] = 2.0
+        gtab[2, 0, 1] = 0.5
+        m._obs_axis_g = gtab
+        out = g.GBSpecialBase._obs_axis_scale(m, np.arange(4), self.NA, np)
+        np.testing.assert_allclose(out[0], 2.0)      # t0 w0 b3
+        np.testing.assert_allclose(out[2], 0.5)      # t2 w0 b1
+
+    def test_a_LAYOUT_change_raises_rather_than_scaling_the_wrong_axis(
+            self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        m = self._mv()
+        m._obs_axis_g = np.ones((self.NT, self.NW, self.NB, self.NA - 1))
+        with self.assertRaises(ValueError):
+            g.GBSpecialBase._obs_axis_scale(m, np.arange(4), self.NA, np)
+
+    def test_no_table_yet_means_no_multiplier(self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        self.assertIsNone(
+            g.GBSpecialBase._obs_axis_scale(self._mv(), np.arange(4),
+                                            self.NA, np))
+
+
+class AxisAdaptEndToEndTest(unittest.TestCase):
+    """Draws in, multipliers out."""
+
+    NT, NW, NB, NA = 2, 1, 2, 3
+
+    def _mv(self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        m = g.GBSpecialBase.__new__(g.GBSpecialBase)
+        # ``xp`` is a read-only property; every hook takes it explicitly.
+        m.name = "rj_warm_search"
+        m.gb_search_stage = True
+        m._obs_axis_g = None
+        m._obs_axis_nd = m._obs_axis_na_acc = None
+        g.GBSpecialBase._obs_axis_bind_keys(m, types.SimpleNamespace(
+            temp_inds=np.array([0, 0, 1, 1]),
+            walker_inds=np.zeros(4, int),
+            band_inds=np.array([0, 0, 1, 1]),
+            ntemps=self.NT, nwalkers=self.NW, num_bands=self.NB))
+        return m
+
+    def _feed(self, m, pick, acc, ids=None):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        n = len(pick)
+        m._last_obs_axis_ids = (np.arange(n) if ids is None
+                                else np.asarray(ids))
+        g.GBSpecialBase._obs_axis_adapt_accum(
+            m, np.asarray(pick), np.ones(n),
+            np.asarray(acc, float), self.NA, np)
+
+    def _step(self, m, **env):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        e = {"GB_INMODEL_OBSERVABLE_AXIS_ADAPT": "1"}
+        e.update({k: str(v) for k, v in env.items()})
+        with mock.patch.dict(os.environ, e):
+            g.GBSpecialBase._obs_axis_adapt_step(m, np)
+        return m._obs_axis_g
+
+    def test_an_always_accepting_cell_axis_WIDENS(self):
+        m = self._mv()
+        self._feed(m, [0, 0, 1, 1], [1, 1, 1, 1])
+        g = self._step(m)
+        self.assertGreater(float(g[0, 0, 0, 0]), 1.0)   # t0 b0 axis0
+        self.assertGreater(float(g[1, 0, 1, 1]), 1.0)   # t1 b1 axis1
+        self.assertAlmostEqual(float(g[0, 0, 0, 2]), 1.0)  # untouched
+
+    def test_a_never_accepting_cell_axis_NARROWS(self):
+        m = self._mv()
+        self._feed(m, [2, 2, 2, 2], [0, 0, 0, 0])
+        g = self._step(m)
+        self.assertLess(float(g[0, 0, 0, 2]), 1.0)
+
+    def test_the_table_PERSISTS_and_compounds_across_proposes(self):
+        """The whole point: within one propose the source ids are
+        stable, across proposes only the cell key is."""
+        m = self._mv()
+        seen = []
+        for _ in range(3):
+            self._feed(m, [0, 0, 0, 0], [1, 1, 1, 1])
+            seen.append(float(self._step(m)[0, 0, 0, 0]))
+        self.assertLess(seen[0], seen[1])
+        self.assertLess(seen[1], seen[2])
+
+    def test_the_counters_RESET_each_propose(self):
+        m = self._mv()
+        self._feed(m, [0, 0, 0, 0], [1, 1, 1, 1])
+        self._step(m)
+        self.assertIsNone(m._obs_axis_nd)
+        first = float(m._obs_axis_g[0, 0, 0, 0])
+        self._step(m)                       # no new evidence
+        self.assertAlmostEqual(float(m._obs_axis_g[0, 0, 0, 0]), first)
+
+    def test_a_PE_move_accumulates_NOTHING_and_keeps_no_table(self):
+        m = self._mv()
+        m.gb_search_stage = False
+        m.name = "in_model"
+        self._feed(m, [0, 0, 0, 0], [1, 1, 1, 1])
+        self.assertIsNone(self._step(m))
+
+    def test_a_length_MISMATCH_drops_the_tally_rather_than_misattribute(
+            self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        m = self._mv()
+        m._last_obs_axis_ids = np.arange(3)
+        g.GBSpecialBase._obs_axis_adapt_accum(
+            m, np.zeros(4, int), np.ones(4), np.ones(4), self.NA, np)
+        self.assertIsNone(m._obs_axis_nd)
+
+    def test_the_census_guards_carry_over_to_the_adaptation(self):
+        """``w`` is the census's use-weight: a row that took the
+        diagonal fallback is zero-weighted and cannot vote."""
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._obs_axis_accum)
+        self.assertIn("_obs_axis_adapt_accum_for(self, pick, w, wa, na, xp)",
+                      src)
+
+    def test_the_draw_site_records_the_SOURCE_IDS(self):
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._observable_proposal)
+        self.assertIn("self._last_obs_axis_ids", src)
+
+    def test_the_propose_boundary_runs_the_step_BEFORE_the_census(self):
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase.run_proposal)
+        i = src.index("self._obs_axis_adapt_step(self.xp)")
+        j = src.index("self._report_obs_motion()")
+        self.assertLess(i, j)
+
+    def test_the_block_open_binds_the_keys(self):
+        import inspect
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        src = inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
+        self.assertIn("self._obs_axis_bind_keys(band_sorter)", src)

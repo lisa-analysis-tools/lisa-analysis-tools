@@ -1377,6 +1377,19 @@ def _obs_axis_accum_for(move, a, d_fmid, d_lnfd, ok, xp):
         fn(a, d_fmid, d_lnfd, ok, xp)
 
 
+def _obs_axis_adapt_accum_for(move, pick, w, wa, na, xp):
+    """Feed the per-axis ADAPTATION, or do nothing.
+
+    Separate from :func:`_obs_axis_accum_for` although both are driven
+    from the same place: the census is unconditional telemetry and this
+    is a sampling input, so an object may legitimately have one and not
+    the other. MODULE-LEVEL for the usual duck-typed-stub reason.
+    """
+    fn = getattr(move, "_obs_axis_adapt_accum", None)
+    if fn is not None:
+        fn(pick, w, wa, na, xp)
+
+
 def _obs_axis_dom_accum_for(move, dom, ok, xp):
     """Tally WHICH coordinate dominates each axis rank, or do nothing.
 
@@ -1437,7 +1450,7 @@ def _obs_axis_mult_for(move, source_ids, n_z):
     return None if fn is None else fn(source_ids, n_z)
 
 
-def obs_axis_scale_for(move, source_ids, n_axes):
+def obs_axis_scale_for(move, source_ids, n_axes, xp):
     """PER-EIGEN-AXIS step multipliers for ``move``, or ``None``.
 
     ``(n_src, n_axes)``, applied to ``sigma_w`` in
@@ -1470,7 +1483,7 @@ def obs_axis_scale_for(move, source_ids, n_axes):
     stubs and whatever a fan-out stands up in a rank process.
     """
     fn = getattr(move, "_obs_axis_scale", None)
-    return None if fn is None else fn(source_ids, n_axes)
+    return None if fn is None else fn(source_ids, n_axes, xp)
 
 
 def obs_axis_reorder(axes, sig, gw, has_fiber, xp):
@@ -1533,6 +1546,77 @@ def obs_axis_reorder(axes, sig, gw, has_fiber, xp):
     # be quoted in the smallest unit.
     dom = xp.argmax(xp.abs(axes), axis=1)
     return axes, sig, dom
+
+
+#: Per-axis adaptation defaults. The target is 0.44 because
+#: ``*_OBSERVABLE_EIGEN=axis`` draws ONE axis per repeat, which is a 1-D
+#: move -- the launcher's own comment already argues from this number.
+_OBS_AXIS_TARGET = 0.44
+_OBS_AXIS_GAIN = 0.2
+_OBS_AXIS_BOUND = 8.0
+
+
+def obs_axis_adapt_update(g, n_draw, n_acc, xp, *, target=_OBS_AXIS_TARGET,
+                          gain=_OBS_AXIS_GAIN, bound=_OBS_AXIS_BOUND):
+    """One adaptation step on the per-(source, axis) step multiplier.
+
+    ``g``, ``n_draw`` and ``n_acc`` are ``(n_src, n_axes)``; the result
+    is the new ``g``. A row with no draws is returned unchanged, which
+    is what makes the sparse case -- most (source, axis) pairs see zero
+    or one draw in a propose -- a no-op rather than a drift toward
+    whatever the initial value was.
+
+    ``log g += gain * (accept_rate - target)``, clipped to
+    ``[1/bound, bound]``. Acceptance above target means the step was too
+    SMALL, so ``g`` goes up.
+
+    CONSTANT GAIN, NOT A DECAYING ROBBINS-MONRO SCHEDULE, deliberately.
+    A vanishing gain buys convergence of the adapted parameter for a
+    chain whose target is fixed. Neither half applies here: this runs in
+    the SEARCH stage only (see :func:`obs_axis_adapt_on`), where the
+    posterior a source is exploring moves under it as neighbours are
+    found and subtracted, and where detailed balance is already not
+    claimed. A constant gain is a tracking filter, which is the right
+    object for a moving target; a decaying one would freeze each source
+    at whatever its step wanted early in the search. Swapping in
+    ``gain / (1 + visits) ** kappa`` is a one-line change IF a stage
+    that needs a convergent adaptation ever wants one -- but the PE
+    stage must not adapt at all, so that stage is not it.
+
+    THE BOUND IS ON THE MULTIPLIER, not on the resulting width. The
+    ``SMAX`` cap already bounds what the information matrix may claim
+    about a direction it could not measure; this bounds how far the
+    measured acceptance may override the matrix. Two different
+    statements, so two different limits -- see
+    :func:`obs_axis_scale_for` for why the multiplier is applied after
+    the cap.
+    """
+    nd = xp.asarray(n_draw, dtype=xp.float64)
+    rate = xp.asarray(n_acc, dtype=xp.float64) / xp.maximum(nd, 1.0)
+    step = xp.where(nd > 0, float(gain) * (rate - float(target)), 0.0)
+    lo, hi = -np.log(float(bound)), np.log(float(bound))
+    return xp.exp(xp.clip(xp.log(xp.asarray(g, dtype=xp.float64)) + step,
+                          lo, hi))
+
+
+def obs_axis_adapt_on(move) -> bool:
+    """Is the per-axis adaptation armed for ``move``?
+
+    ``GB_INMODEL_OBSERVABLE_AXIS_ADAPT``, **and** the move must be a
+    SEARCH-stage move. The step scales stop being a fixed function of
+    the state once they are learned from the chain's own acceptance, and
+    a PE stage that needs detailed balance cannot have that -- the same
+    line [[feedback-search-no-detailed-balance]] draws everywhere else.
+    A frozen table is still used in PE; only the UPDATE is search-only.
+
+    MODULE-LEVEL and taking the move for the usual reason: this is read
+    on duck-typed stubs and on whatever a fan-out stands up in a rank
+    process.
+    """
+    if not _observable_knob("GB_INMODEL_OBSERVABLE_AXIS_ADAPT", 0.0):
+        return False
+    fn = getattr(move, "_is_search_move", None)
+    return True if fn is None else bool(fn())
 
 
 def fstat_band_skip_for(move):
@@ -7796,6 +7880,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                             self.jump_factor)
                 self._im_kind_counts = {}
             self._report_axis_acceptance()
+            # BEFORE the census report, which resets the same evidence.
+            # Once per propose: source ids are only stable that long,
+            # and the eigen table is rebuilt from scratch afterwards.
+            self._obs_axis_adapt_step(self.xp)
             self._report_obs_motion()
             # GB_JUMP_TRACE: emitted next to [GB_ACCEPT] so the rate and the
             # displacement that produced it are read together.
@@ -14258,7 +14346,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             t[row] = t[row] + xp.bincount(pick, weights=vals,
                                           minlength=na)[:na]
         self._obs_axis_acc = t
+        # The adaptation reads the SAME weights the census does -- ``w``
+        # already zeroes the rows that took the diagonal fallback -- so
+        # the two can never disagree about what was drawn.
+        _obs_axis_adapt_accum_for(self, pick, w, wa, na, xp)
         self._last_obs_axis_pick = None
+        self._last_obs_axis_ids = None
 
     def _obs_axis_dom_accum(self, dom, ok, xp):    # noqa: D401
         """Histogram of the dominant coordinate of each axis RANK.
@@ -14283,6 +14376,196 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         for k in range(na):
             h[k] = h[k] + xp.bincount(use[:, k], minlength=na)[:na]
         self._obs_axis_dom = h
+
+    # ---- per-axis adaptive step scales --------------------------------
+    #
+    # THE KEY IS (temp, walker, band, axis), NOT (source, axis).
+    #
+    # The spec this was built from said per-SOURCE, carried on
+    # ``branch_supplemental`` through the leaf repack. Three things
+    # argue against it, and all three were found by reading the code
+    # rather than by running it:
+    #
+    # 1. STATISTICS. One axis is drawn per repeat and a source sees a
+    #    handful of repeats per propose, so most (source, axis) pairs
+    #    collect ZERO or ONE draw. A per-source rate is then 0 or 1 and
+    #    the update is a coin flip. Pooling over the sources of a band
+    #    is the difference between an estimate and a random walk.
+    # 2. THE KEY. A source's identity is ``(temp, walker, leaf)``, and
+    #    every one of the three moves under it: leaves are repacked
+    #    every propose, RJ births and deaths renumber them, and
+    #    temperature swaps exchange whole walkers. Following the source
+    #    means carrying the value through all of that. ``band`` and
+    #    ``temp`` are SLOT properties -- a band is fixed for the run and
+    #    the band assignment is frozen per propose -- so nothing has to
+    #    be carried at all.
+    # 3. WHAT IS ACTUALLY WRONG. The step already divides by ``rho`` and
+    #    is whitened by the source's own information matrix, so the
+    #    per-source part of the answer is largely in there. What the
+    #    matrix gets SYSTEMATICALLY wrong is a property of the frequency
+    #    regime and of the axis -- which is per band.
+    #
+    # Keying on ``temp`` is a bonus, not a cost: the optimal width goes
+    # as 1/sqrt(beta) and nothing in this path knows that today (the
+    # standing TODO in project-todo-eigen-walker-max-beta-scaling-0918).
+    # Per-rung adaptation can discover it. And a newborn source starts
+    # at its band's learned value for free, which is what the spec's
+    # "band-mean table for newborns" was reaching for -- here it is not
+    # a second table, it IS the table.
+    #
+    # ⚠ The per-SOURCE residual -- two sources in one band that want
+    # different steps -- is NOT captured. That needs the
+    # ``branch_supplemental`` carrier and is the documented follow-up.
+
+    def _is_search_move(self) -> bool:
+        """Is this move installed in the SEARCH stage?
+
+        The stamp comes from ``build_gb_moves``; the name test is the
+        same fallback :meth:`_replace_fstat_max` uses, and covers moves
+        a hand-built recipe never stamped.
+        """
+        return (
+            bool(getattr(self, "gb_search_stage", False))
+            or bool(getattr(self, "replace_search_stage", False))
+            or "search" in str(getattr(self, "name", "")).lower()
+        )
+
+    def _obs_axis_bind_keys(self, band_sorter) -> None:
+        """Bind this propose's per-row ``(temp, walker, band)`` labels.
+
+        Called at BLOCK OPEN, where the sorter is in hand; the draw path
+        sees only ``source_ids``. The band assignment is frozen for the
+        propose (the standing invariant), so one bind per block is one
+        bind too many and is kept only because the block open is the one
+        place that has the sorter.
+        """
+        if band_sorter is None:
+            self._obs_axis_keys = None
+            return
+        try:
+            # The DECLARED dimensions, never ``temp_inds.max() + 1``: a
+            # propose that happens to populate no row on the top rung
+            # would give a smaller table, and the shape check in
+            # :meth:`_obs_axis_adapt_step` would then silently reallocate
+            # and throw away everything learned so far.
+            #
+            # Under the walker-block port ``nwalkers`` is THIS RANK's
+            # block width and ``walker_inds`` are block-local, so the
+            # table is rank-local too -- which is right: a rank owns a
+            # fixed block of walkers for the run.
+            self._obs_axis_keys = (
+                band_sorter.temp_inds, band_sorter.walker_inds,
+                band_sorter.band_inds,
+                (int(band_sorter.ntemps), int(band_sorter.nwalkers),
+                 int(band_sorter.num_bands)),
+            )
+        except AttributeError:
+            self._obs_axis_keys = None
+
+    def _obs_axis_cell(self, ids, na, xp):
+        """Flat ``(temp, walker, band, axis)`` index for rows ``ids``.
+
+        Returns ``(base, size)`` where ``base`` is the cell index with
+        the axis term omitted -- callers add the axis. ``None`` when the
+        keys are not bound.
+        """
+        k = getattr(self, "_obs_axis_keys", None)
+        if k is None:
+            return None, 0
+        t, w, b, (nt, nw, nb) = k
+        i = xp.asarray(ids).ravel()
+        base = ((t[i] * nw + w[i]) * nb + b[i]) * na
+        return base, nt * nw * nb * na
+
+    def _obs_axis_scale(self, source_ids, n_axes, xp):
+        """Per-row per-axis multipliers for the eigen table, or ``None``.
+
+        The seam :func:`obs_axis_scale_for` reads. Every row of a band
+        at one temperature gets that cell's multipliers, so a source
+        born this propose starts where the band already is.
+        """
+        g = getattr(self, "_obs_axis_g", None)
+        if g is None:
+            return None
+        na = int(n_axes)
+        if int(g.shape[-1]) != na:
+            raise ValueError(
+                f"the per-axis multiplier table has {int(g.shape[-1])} "
+                f"axes but the eigen table has {na}. One move cannot "
+                f"have two bases; this is a layout change, not a resize.")
+        base, _ = self._obs_axis_cell(source_ids, na, xp)
+        if base is None:
+            return None
+        return g.reshape(-1)[base[:, None] + xp.arange(na)[None, :]]
+
+    def _obs_axis_adapt_accum(self, pick, w, wa, na, xp):    # noqa: D401
+        """Scatter this repeat's draws and accepts into the cells.
+
+        ``w`` already carries the census's own guards -- rows that took
+        the diagonal fallback are zero-weighted, so a row with no eigen
+        table cannot vote on a multiplier it never used.
+        """
+        ids = getattr(self, "_last_obs_axis_ids", None)
+        if ids is None or int(ids.shape[0]) != int(pick.shape[0]):
+            return
+        base, size = self._obs_axis_cell(ids, int(na), xp)
+        if base is None:
+            return
+        flat = base + pick
+        nd = getattr(self, "_obs_axis_nd", None)
+        if nd is None or int(nd.shape[0]) != size:
+            nd = xp.zeros(size, dtype=xp.float64)
+            self._obs_axis_na_acc = xp.zeros(size, dtype=xp.float64)
+        self._obs_axis_nd = nd + xp.bincount(flat, weights=w,
+                                             minlength=size)[:size]
+        self._obs_axis_na_acc = self._obs_axis_na_acc + xp.bincount(
+            flat, weights=wa, minlength=size)[:size]
+
+    def _obs_axis_adapt_step(self, xp) -> None:
+        """Apply the propose's acceptance to the multipliers, then reset.
+
+        Called once per propose, at the same boundary the census resets
+        at: that is where all of this propose's evidence is in, and the
+        eigen table is rebuilt from scratch afterwards anyway.
+        """
+        if not obs_axis_adapt_on(self):
+            self._obs_axis_nd = self._obs_axis_na_acc = None
+            return
+        nd = getattr(self, "_obs_axis_nd", None)
+        acc = getattr(self, "_obs_axis_na_acc", None)
+        self._obs_axis_nd = self._obs_axis_na_acc = None
+        keys = getattr(self, "_obs_axis_keys", None)
+        if nd is None or acc is None or keys is None:
+            return
+        nt, nw, nb = keys[3]
+        na = int(nd.shape[0]) // max(nt * nw * nb, 1)
+        shape = (nt, nw, nb, na)
+        g = getattr(self, "_obs_axis_g", None)
+        if g is None or tuple(int(x) for x in g.shape) != shape:
+            g = xp.ones(shape, dtype=xp.float64)
+        g = obs_axis_adapt_update(
+            g, nd.reshape(shape), acc.reshape(shape), xp,
+            target=_observable_knob("GB_INMODEL_OBSERVABLE_AXIS_TARGET",
+                                    _OBS_AXIS_TARGET),
+            gain=_observable_knob("GB_INMODEL_OBSERVABLE_AXIS_GAIN",
+                                  _OBS_AXIS_GAIN),
+            bound=_observable_knob("GB_INMODEL_OBSERVABLE_AXIS_BOUND",
+                                   _OBS_AXIS_BOUND))
+        self._obs_axis_g = g
+        touched = nd > 0
+        if not bool(touched.any()):
+            return
+        lg = xp.log(g.reshape(-1)[touched])
+        logger.info(
+            "[GB_OBS_AXIS %s] adapted %d of %d (temp, walker, band, axis) "
+            "cells on %d draws; log-multiplier mean %+.3f min %+.3f max "
+            "%+.3f; at the bound %d",
+            self.name, int(touched.sum()), int(nd.shape[0]),
+            int(nd.sum()), float(lg.mean()), float(lg.min()),
+            float(lg.max()),
+            int((xp.abs(lg) >= np.log(_observable_knob(
+                "GB_INMODEL_OBSERVABLE_AXIS_BOUND", _OBS_AXIS_BOUND))
+                - 1e-9).sum()))
 
     def _report_obs_motion(self):
         """Log the observable-path motion census, then reset."""
@@ -14884,7 +15167,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # factor of the product below that does not cancel -- see
         # :func:`obs_axis_scale_for`. ``None`` leaves the table
         # byte-identical.
-        _g = obs_axis_scale_for(self, ids_x, int(sig_w.shape[1]))
+        _g = obs_axis_scale_for(self, ids_x, int(sig_w.shape[1]), xp)
         if _g is not None:
             _g = xp.asarray(_g, dtype=sig_w.dtype)
             if _g.shape != sig_w.shape:
@@ -14972,6 +15255,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         self._last_obs_axis_pick = pick
                         self._last_obs_axis_ok = ok
                         self._last_obs_axis_absz = xp.abs(_zz)
+                        # The adaptive multiplier is keyed by the row's
+                        # (temp, walker, band) cell, which only the
+                        # sorter knows; ``source_ids`` is the handle
+                        # back to it and is only in scope here.
+                        self._last_obs_axis_ids = xp.asarray(
+                            source_ids).ravel()
                     else:  # "full": joint correlated step, all axes
                         _rnd = xp.asarray(
                             xp.random.randn(int(nrow), int(ndim_z)))
@@ -18242,6 +18531,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         if self._observable_basis_ready():
             self._observable_rho_snapshot(
                 buffer_obj, ids, int(band_sorter.inds.shape[0]))
+            # The adaptive per-axis multipliers are keyed by
+            # (temp, walker, band); the draw path sees source ids only,
+            # so the row labels are bound here, where the sorter is.
+            self._obs_axis_bind_keys(band_sorter)
             # OBSERVABLE + EIGENBASIS: build the block-frozen eigen table
             # HERE -- after the rho snapshot (the whitening scales need it)
             # and never inside the repeat loop (the freeze is what keeps
