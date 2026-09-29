@@ -373,7 +373,11 @@ def _stub(container, **over):
                  "_maybe_observable_proposal", "_observable_rho_snapshot"):
         setattr(s, name, types.MethodType(getattr(GBSpecialBase, name), s))
     # the per-branch hooks the VGB move overrides
-    for name in ("_inmodel_kind", "_obs_eigen_mode"):
+    # ⚠ _obs_jump_knob is OVERRIDDEN by VGB (the 09-19 split: VGB must
+    # not silently take GB_INMODEL_OBSERVABLE_JUMP), so it is bound
+    # from the VGB class here, not from the base list above. Missing
+    # entirely until 2026-09-28, which is why this suite had 9 errors.
+    for name in ("_inmodel_kind", "_obs_eigen_mode", "_obs_jump_knob"):
         setattr(s, name,
                 types.MethodType(getattr(VGBSpecialStretchMove, name), s))
     s._observable_map_class = VGBSpecialStretchMove._observable_map_class

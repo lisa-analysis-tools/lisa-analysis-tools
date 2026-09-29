@@ -106,6 +106,16 @@ def _stub(**over):
                  "_eigen_axis_ready", "_eigen_axis_widths",
                  "_doppler_jump_should_fire", "_inmodel_kind",
                  "_obs_eigen_mode", "_observable_leaf_kw",
+                 # ⚠ ADDED 2026-09-28. The 09-19 GB/VGB knob split gave
+                 # _observable_step_scales a per-branch
+                 # ``_obs_jump_knob()``; this stub predated it, so BOTH
+                 # observable suites have been red for nine days with
+                 # "'SimpleNamespace' has no attribute '_obs_jump_knob'"
+                 # -- 19 errors here and 9 in the VGB suite. Bound from
+                 # the REAL class (like every other hook in this list)
+                 # rather than hard-coding the env name, so the stub
+                 # cannot drift from production the way it just did.
+                 "_obs_jump_knob",
                  "_maybe_observable_proposal"):
         setattr(s, meth, getattr(GBSpecialStretchMove, meth).__get__(s))
     return s
