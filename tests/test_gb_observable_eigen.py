@@ -1137,3 +1137,97 @@ class AxisAdaptEndToEndTest(unittest.TestCase):
         import lisatools.globalfit.moves.gbspecialstretch as g
         src = inspect.getsource(g.GBSpecialBase._run_in_model_repeats)
         self.assertIn("self._obs_axis_bind_keys(band_sorter)", src)
+
+
+class EigenStepIsAlwaysOneSigmaTest(unittest.TestCase):
+    """The identity the whole finding rests on.
+
+    ``col = w * a * sig`` with ``sig = 1/sqrt(a^T D_w Gamma_z D_w a)``.
+    Put ``v = D_w a``: ``col = v / sqrt(v^T Gamma_z v)``, so
+    ``col^T Gamma_z col == 1`` for every column and every ``w``. An
+    eigen-axis step is ALWAYS exactly 1 sigma of the source's own
+    information matrix; the step scales choose the directions and
+    cannot touch the size. A 1-sigma step accepts 0.705 in 1-D against
+    an optimum of 0.44 at 2.38 sigma -- and job 663 reported pooled
+    cold acceptance 0.55-0.79.
+    """
+
+    D, FIB = 9, 8
+
+    def _cols(self, w, seed=23, n=300):
+        from eryn.moves.eigenaxis import eigen_axis_set
+        rng = np.random.default_rng(seed)
+        A = rng.normal(size=(n, self.D, self.D))
+        _, ev = np.linalg.eigh(np.einsum("nij,nkj->nik", A, A))
+        gz = np.einsum("nij,nj,nkj->nik", ev,
+                       10.0 ** rng.uniform(-1, 1, (n, self.D)), ev)
+        tf = np.zeros((n, self.D))
+        tf[:, self.FIB] = 1.0
+        gw = gz * w[:, :, None] * w[:, None, :]
+        a, s = eigen_axis_set(gw, t_fiber=tf, sigma_max=np.inf)
+        T = (w[:, :, None] * a) * s[:, None, :]
+        return np.einsum("nik,nij,njk->nk", T, gz, T)[:, :self.FIB]
+
+    def test_every_pick_axis_steps_exactly_one_sigma_whatever_w_is(self):
+        rng = np.random.default_rng(1)
+        n = 300
+        for lab, w in (
+            ("unit", np.ones((n, self.D))),
+            ("per-column random",
+             10.0 ** rng.uniform(-2, 2, (n, self.D))),
+            ("the same, times 7.3",
+             7.3 * 10.0 ** rng.uniform(-2, 2, (n, self.D))),
+        ):
+            q = self._cols(w)
+            np.testing.assert_allclose(q, 1.0, rtol=1e-9,
+                                       err_msg=f"w = {lab}")
+
+
+class StaticAxisScaleTest(unittest.TestCase):
+    """``GB_INMODEL_OBSERVABLE_AXIS_SCALE``: the knob that CAN resize an
+    eigen step, because it multiplies ``sig`` rather than ``w``."""
+
+    N, POOL = 4, 20
+
+    def _mags(self, scale=None, curv=1.0):
+        s = _stub()
+        s._obs_rho = np.full(self.POOL, 40.0)
+        ids = np.arange(self.N)
+        w = np.asarray(s._observable_step_scales(None, ids, NDIM))
+        gz = np.full((self.POOL, NDIM, NDIM), np.nan)
+        for k in range(self.N):
+            gz[k] = np.diag(np.full(NDIM, curv) / w[k] ** 2)
+        s._obs_gamma_z = gz
+        env = {} if scale is None else {
+            "GB_INMODEL_OBSERVABLE_AXIS_SCALE": str(scale)}
+        with mock.patch.dict(os.environ, env):
+            s._observable_eigen_prepare(None, ids, self.POOL)
+        return np.linalg.norm(np.asarray(s._obs_eigen_table)[:self.N],
+                              axis=1)
+
+    def test_it_scales_the_step_unlike_JUMP(self):
+        base = self._mags()
+        np.testing.assert_allclose(self._mags(scale=2.38) / base, 2.38,
+                                   rtol=1e-10)
+
+    def test_1_0_is_byte_identical(self):
+        np.testing.assert_array_equal(self._mags(), self._mags(scale=1.0))
+
+    def test_it_is_RE_CAPPED_so_a_railed_axis_stays_railed(self):
+        """2.38 is the optimum for a direction the matrix MEASURED. A
+        railed axis is one it could not measure, where SMAX is making a
+        different statement and must still bind."""
+        base = self._mags(curv=1e-6)            # sigma ~ 1e3, all railed
+        np.testing.assert_allclose(self._mags(scale=2.38, curv=1e-6),
+                                   base, rtol=1e-10)
+
+    def test_a_1_sigma_step_predicts_the_acceptance_the_run_reported(self):
+        """Not a code test -- the arithmetic that makes the identity
+        actionable, pinned so it cannot drift out of the docstring."""
+        rng = np.random.default_rng(0)
+        x = rng.normal(size=400_000)
+        def acc(c):
+            y = x + c * rng.normal(size=x.size)
+            return np.minimum(1.0, np.exp(-0.5 * (y ** 2 - x ** 2))).mean()
+        self.assertAlmostEqual(acc(1.0), 0.705, places=2)
+        self.assertAlmostEqual(acc(2.38), 0.445, places=2)

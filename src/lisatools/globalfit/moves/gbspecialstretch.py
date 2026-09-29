@@ -15167,6 +15167,35 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         axes_w, sig_w, _dom = obs_axis_reorder(
             axes_w, sig_w, gw, t_fiber is not None, xp)
         _obs_axis_dom_accum_for(self, _dom, ok, xp)
+        # STATIC per-axis width scaling, and the reason it has to exist.
+        #
+        # Write the table column out: with ``v = D_w a``,
+        # ``col = w * a * sig = v / sqrt(v^T Gamma_z v)``, so
+        # ``col^T Gamma_z col == 1`` for EVERY column and EVERY choice of
+        # ``w`` (verified to 1.000000 on all 8 pick axes for uniform,
+        # per-column and scaled-random ``w``). An eigen-axis step is
+        # therefore always **exactly 1 sigma** of the source's own
+        # information matrix. The step scales choose the DIRECTIONS --
+        # they are the metric of the generalized eigenproblem
+        # ``Gamma_z v = lambda D_w^-2 v`` -- and cannot touch the SIZE.
+        # That is the whole reason ``GB_INMODEL_OBSERVABLE_JUMP`` does
+        # nothing here (see :func:`_obs_axis_mult_for`).
+        #
+        # A 1-sigma step is not the right size: the 1-D optimum is
+        # 2.38 sigma at acceptance 0.44, while 1 sigma accepts 0.705.
+        # Job 663 measured pooled cold acceptance 0.55-0.79 -- i.e. the
+        # identity predicts the number the run actually reported, which
+        # is the corroboration that this is what is happening and not
+        # just algebra.
+        #
+        # SCALED THEN RE-CAPPED, unlike the adaptive multiplier below.
+        # 2.38 is the optimal scaling for a direction the matrix
+        # MEASURED; an axis railed at SMAX is one it could not measure,
+        # where the cap is making a different statement and must still
+        # bind.
+        _st = _observable_knob("GB_INMODEL_OBSERVABLE_AXIS_SCALE", 1.0)
+        if _st != 1.0:
+            sig_w = xp.minimum(sig_w * _st, smax)
         # PER-EIGEN-AXIS ADAPTIVE SCALE. On ``sigma_w``, which is the one
         # factor of the product below that does not cancel -- see
         # :func:`obs_axis_scale_for`. ``None`` leaves the table

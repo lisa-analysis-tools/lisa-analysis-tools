@@ -10,6 +10,59 @@ are §1 and §2.
 
 ---
 
+## 0. Which launcher knobs are inert under `EIGEN=axis`
+
+**Read this before re-tuning anything in the observable block against a
+running job.** The general statement, which §1 is a special case of:
+
+> An eigen-axis step is **always exactly 1σ** of the source's own
+> information matrix, whatever the step scales say.
+
+Write the table column out with `v = D_w a`:
+
+```
+col = w · a · sig = v / sqrt(vᵀ Γ_z v)      ⇒   colᵀ Γ_z col ≡ 1
+```
+
+for every column and every `w` — verified to `1.000000` on all 8 pick
+axes for uniform, per-column, and scaled-random `w`. The step scales are
+the **metric of the generalized eigenproblem** `Γ_z v = λ D_w⁻² v`: they
+choose the *directions* and cannot touch the *size*.
+
+| knob | under `EIGEN=axis` |
+|---|---|
+| `GB_INMODEL_OBSERVABLE_JUMP` | **INERT** on every measured axis (uniform scaling of `w`, exactly cancelled). Live only on `SMAX`-railed axes and on rows with no table yet (fresh births take the diagonal draw) |
+| `GB_INMODEL_OBSERVABLE_MC_STEP` | **INERT**. It scales only the `Mc` column of `w`, and `Mc` is the fiber: projected out of the 8 pick axes exactly, and at `FIBER_WEIGHT=0` the fiber column is both dropped from the pick set and zeroed in the step. Measured ratio on all 9 columns: 1.000000 at `mc_step ×2` and `×10` |
+| `VGB_INMODEL_OBSERVABLE_JUMP` | **INERT**, same algebra. The VGB map is fiberless (`Mc` pinned) so every column is a pick axis, but the cancellation does not care |
+| the extrinsic block (Cholesky × `_proposal_param_scales`) | **not** a size knob. A per-column change of `w` *rotates* the axes (measured median best-overlap 0.92 after one column ×2) while every column still has `colᵀ Γ_z col = 1` |
+| `GB_INMODEL_OBSERVABLE_EIGEN_SMAX` | **LIVE.** It clips `sig`, so it is one of only two things that can change a step's size |
+| `GB_INMODEL_OBSERVABLE_SHEAR` | **LIVE.** It changes the internal basis, hence `Γ_z` and the axes themselves |
+| `GB_INMODEL_OBSERVABLE_FIBER_WEIGHT` | **LIVE.** It gates the fiber column |
+| `GB_INMODEL_OBSERVABLE_AXIS_SCALE` | **LIVE** — added here, `1.0` = inert. Multiplies `sig`, which is the other thing that can |
+
+### The consequence, and the cheapest fix
+
+A 1σ step is the wrong size. In 1-D the optimum is **2.38σ at acceptance
+0.44**; a 1σ step accepts **0.705**. Job 663 measured pooled cold
+acceptance **0.55–0.79** — the identity *predicts the number the run
+reported*, which is what turns this from algebra into a diagnosis.
+
+So the observable eigen axes have been running roughly **2.4× too
+narrow** for the whole campaign, and no knob in either launcher could
+have fixed it — which is also why the `1.0 → 2.0 → 1.5` tuning produced
+muddled evidence.
+
+**`GB_INMODEL_OBSERVABLE_AXIS_SCALE=2.38` is the one-line version of the
+fix**, and is worth trying before any of the adaptive machinery below:
+it is static, principled, reversible, and needs no learning period. It
+is scaled-then-re-capped at `SMAX`, because 2.38 is the optimum for a
+direction the matrix *measured* and a railed axis is one it could not.
+
+The adaptation in §3 then buys the per-band / per-rung *spread* around
+2.38 rather than the factor itself — and from a `1.0` start at gain 0.2
+it takes roughly 16 proposes just to walk to 2.38, so arming it without
+setting `AXIS_SCALE` wastes that time.
+
 ## 1. `GB_INMODEL_OBSERVABLE_JUMP` does not reach the eigen step
 
 Under `GB_INMODEL_OBSERVABLE_EIGEN=axis` (the production setting), the
@@ -178,7 +231,8 @@ moves that run most of the in-model repeats.
 
 | knob | default | meaning |
 |---|---|---|
-| `GB_INMODEL_OBSERVABLE_AXIS_ADAPT` | `0` | master arm. Off = table stays `None`, step byte-identical |
+| `GB_INMODEL_OBSERVABLE_AXIS_SCALE` | `1.0` | **static** width multiplier on `sig`, re-capped at `SMAX`. Theory value 2.38 (§0) |
+| `GB_INMODEL_OBSERVABLE_AXIS_ADAPT` | `0` | master arm. Off = table stays `None`, step byte-identical, and no keys are bound so the accumulator costs nothing |
 | `GB_INMODEL_OBSERVABLE_AXIS_TARGET` | `0.44` | target acceptance; 1-D optimum, since axis mode draws one axis per repeat |
 | `GB_INMODEL_OBSERVABLE_AXIS_GAIN` | `0.2` | log-space gain per propose |
 | `GB_INMODEL_OBSERVABLE_AXIS_BOUND` | `8.0` | multiplier clamp, `[1/8, 8]` |

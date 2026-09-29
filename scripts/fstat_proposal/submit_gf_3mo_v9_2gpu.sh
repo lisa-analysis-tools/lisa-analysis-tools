@@ -3199,6 +3199,32 @@ export GB_INMODEL_OBSERVABLE_SHEAR=0.5
 #   GB_INMODEL_OBSERVABLE_EIGEN=full  -> the 2026-09-14 joint draw
 export GB_INMODEL_OBSERVABLE_EIGEN=${GB_INMODEL_OBSERVABLE_EIGEN-axis}
 echo "[GB-OBS-EIGEN] GB_INMODEL_OBSERVABLE_EIGEN='${GB_INMODEL_OBSERVABLE_EIGEN}' (empty = diagonal draw)"
+# ---- THE ONE KNOB THAT CAN RESIZE AN EIGEN STEP -----------------------
+# An eigen-axis step is ALWAYS EXACTLY 1 SIGMA of the source's own
+# information matrix, whatever the step scales say. Write the table
+# column out with v = D_w a:
+#     col = w * a * sig = v / sqrt(v^T Gamma_z v)   =>  col^T Gamma_z col = 1
+# for every column and every w (verified to 1.000000 on all 8 pick axes
+# for uniform, per-column and scaled-random w). The step scales choose
+# the DIRECTIONS -- they are the metric of the generalized eigenproblem
+# Gamma_z v = lambda D_w^-2 v -- and cannot touch the SIZE. That is why
+# GB_INMODEL_OBSERVABLE_JUMP above does nothing on this path.
+#
+# 1 sigma is the WRONG size. The 1-D optimum is 2.38 sigma at acceptance
+# 0.44; a 1-sigma step accepts 0.705. Job 663 measured pooled cold
+# acceptance 0.55-0.79 -- the identity predicts the number the run
+# actually reported, which is the corroboration that this is what is
+# happening and not just algebra. So the observable eigen axes have
+# been running ~2.4x too NARROW for the whole campaign, and no knob in
+# this file could have fixed it.
+#
+# This one multiplies sig, so it can. 2.38 is the theory value; it is
+# left at 1.0 (inert, byte-identical to dev) because turning it on is a
+# production sampling change. SCALED THEN RE-CAPPED at
+# GB_INMODEL_OBSERVABLE_EIGEN_SMAX: 2.38 is right for a direction the
+# matrix MEASURED, while a railed axis is one it could not measure,
+# where the cap is making a different statement and must still bind.
+export GB_INMODEL_OBSERVABLE_AXIS_SCALE=${GB_INMODEL_OBSERVABLE_AXIS_SCALE:-1.0}
 # ---- PER-AXIS ADAPTIVE STEP SCALES (branch gb-inmodel-axis-adapt) ------
 # ⚠ READ THIS BEFORE RE-TUNING GB_INMODEL_OBSERVABLE_JUMP ABOVE. Under
 # GB_INMODEL_OBSERVABLE_EIGEN=axis that knob is EXACTLY CANCELLED on
