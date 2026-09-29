@@ -2589,6 +2589,76 @@ def _vert_all_rungs_on() -> bool:
         "1", "true", "True", "yes", "on")
 
 
+#: Buckets of :func:`stage_cell_census`, in report order.
+STAGE_CENSUS_BUCKETS = ("active_occ", "shut_occ", "empty_valved",
+                        "empty_open_lo", "empty_open_hi")
+
+
+def stage_cell_census(specials, alive_specials, shut_w, shut_b, eligible_b,
+                      nwalkers, xp):
+    """Classify one unit's STAGED cells. ``{bucket: count}``.
+
+    Diagnostic only -- it decides nothing. It exists because the staged
+    count per unit (job 669: ``rj_fstat_search`` 1866-1921,
+    ``rj_warm_search`` 846-990, ``in_model`` 26-34) cannot be attributed
+    from the logs, and the two candidate explanations call for opposite
+    fixes: level-3-shut OCCUPIED cells mean the staging filter has a
+    defect, while EMPTY open-band birth cells mean the filter is fine
+    and the floor needs a valve of its own.
+
+    Buckets are mutually exclusive and exhaustive, occupancy first:
+
+    ``active_occ``      holds a live source, pair not shut -- real work.
+    ``shut_occ``        holds a live source, pair level-3 SHUT. **Any
+                        non-zero here is a defect**: a shut pair is
+                        ruled to run nothing, so its cells must never
+                        reach a scheduler.
+    ``empty_valved``    no live source, and shut by either valve (the
+                        per-band barren one or the per-(walker, band)
+                        one). Already suppressed.
+    ``empty_open_lo``   no live source, open, band BELOW the per-band
+                        valve's ``GB_RJ_BAND_SHUTOFF_FMIN_MHZ`` floor --
+                        so the existing valve can never reach it however
+                        barren it is.
+    ``empty_open_hi``   no live source, open, band at or above the floor
+                        -- eligible for the existing valve but not yet
+                        qualifying.
+
+    ``alive_specials`` is the packed cell id of every ALIVE row, so
+    occupancy is judged per ``(temp, walker, band)`` cell and not per
+    band: a band occupied on the cold chain may be empty on a hot rung,
+    and those are different cells with different work.
+    """
+    out = dict.fromkeys(STAGE_CENSUS_BUCKETS, 0)
+    if specials is None or int(len(specials)) == 0:
+        return out
+    t, w, b = unpack_special_index(specials, int(nwalkers))
+    occ = (xp.isin(specials, alive_specials) if alive_specials is not None
+           else xp.zeros(specials.shape, dtype=bool))
+    shut = (xp.zeros(specials.shape, dtype=bool) if shut_w is None
+            else xp.asarray(shut_w)[w, b])
+    band_shut = (xp.zeros(specials.shape, dtype=bool) if shut_b is None
+                 else xp.asarray(shut_b)[b])
+    elig = (xp.ones(specials.shape, dtype=bool) if eligible_b is None
+            else xp.asarray(eligible_b)[b])
+    empty = ~occ
+    valved = empty & (shut | band_shut)
+    open_e = empty & ~(shut | band_shut)
+    for k, m in (("active_occ", occ & ~shut),
+                 ("shut_occ", occ & shut),
+                 ("empty_valved", valved),
+                 ("empty_open_lo", open_e & ~elig),
+                 ("empty_open_hi", open_e & elig)):
+        out[k] = int(m.sum())
+    return out
+
+
+def stage_census_on() -> bool:
+    """``GB_STAGE_CENSUS`` (default ON). One INFO line per unit."""
+    return os.environ.get("GB_STAGE_CENSUS", "1").strip() not in (
+        "", "0", "off", "false")
+
+
 def _drop_shut_specials(specials, shut_w, nwalkers, xp):
     """Remove cells whose (walker, band) is level-3 SHUT. ``(kept, n)``.
 
@@ -7527,6 +7597,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 self._run_band_unit(
                     model, band_sorter, subset, band_temps,
                     ll_change_log, prop_counts, acc_counts,
+                    unit_i=unit_i,
                 )
                 # [GB_ORTHO] premise check (default OFF, GB_ORTHO_CHECK=1):
                 # sample this unit's closest-frequency cross-band boundary
@@ -8826,14 +8897,89 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         out, n = _drop_shut_specials(
             specials, getattr(self, "_rj_band_shutoff_w", None),
             nwalkers, self.xp)
+        # Stashed so the census can report what the filter removed
+        # alongside what survived; the two together are what say whether
+        # a non-zero ``shut_occ`` is a filter defect or a filter that
+        # was never reached.
+        self._last_stage_removed = int(n)
         if n:
             logger.info(
                 "[GB_STAGE %s] %d cell(s) in shut pairs excluded from "
                 "staging (%d staged)", self.name, n, int(len(out)))
         return out
 
+    def _band_shutoff_eligible_mask(self):
+        """Bands the PER-BAND barren valve is allowed to shut, or ``None``.
+
+        Its floor is a frequency, ``GB_RJ_BAND_SHUTOFF_FMIN_MHZ``
+        (default 10 mHz), applied to the band's LOWER edge -- so on the
+        6mo grid 544 of 1232 bands are permanently out of its reach
+        however barren they get. Recomputed here rather than shared with
+        the valve so the census cannot report a mask the valve did not
+        use; the two agree because they read the same env knob against
+        the same edges, and a test pins that.
+        """
+        edges = getattr(self, "band_edges", None)
+        if edges is None:
+            return None
+        fmin = float(os.environ.get(
+            "GB_RJ_BAND_SHUTOFF_FMIN_MHZ", "10.0")) * 1e-3
+        return np.asarray(_to_numpy(edges))[:-1] >= fmin
+
+    def _alive_cell_specials(self, band_sorter, xp):
+        """Packed cell ids holding at least one ALIVE row, cached.
+
+        Per PROPOSE, not per unit: the band assignment is frozen for the
+        propose (the standing invariant), so the alive cell set cannot
+        change between units, and recomputing it nine times would make a
+        diagnostic cost real GPU work.
+        """
+        key = id(band_sorter)
+        got = getattr(self, "_alive_cells_cache", None)
+        if got is not None and got[0] == key:
+            return got[1]
+        alive = band_sorter.inds
+        out = xp.unique(pack_special_index(
+            band_sorter.temp_inds[alive], band_sorter.walker_inds[alive],
+            band_sorter.band_inds[alive], int(band_sorter.nwalkers)))
+        self._alive_cells_cache = (key, out)
+        return out
+
+    def _log_stage_census(self, unit_i, band_sorter, specials, xp) -> None:
+        """One INFO line per unit saying WHAT the staged cells are.
+
+        Emitted on the head and on every rank, because the question it
+        answers ("is the staging floor shut-occupied cells the filter
+        should have removed, or empty-band birth cells that need a valve
+        of their own?") has opposite answers available per rank and the
+        head sees only its own block.
+        """
+        if not stage_census_on():
+            return
+        try:
+            c = stage_cell_census(
+                specials, self._alive_cell_specials(band_sorter, xp),
+                getattr(self, "_rj_band_shutoff_w", None),
+                getattr(self, "_rj_band_shutoff", None),
+                self._band_shutoff_eligible_mask(),
+                int(band_sorter.nwalkers), xp)
+        except Exception as e:            # noqa: BLE001 -- diagnostic only
+            logger.warning("[GB_STAGE_CENSUS %s] unavailable (%r)",
+                           self.name, e)
+            return
+        n = int(len(specials)) if specials is not None else 0
+        logger.info(
+            "[GB_STAGE_CENSUS %s] unit %s: staged %d = active-occ %d + "
+            "SHUT-OCC %d + empty-valved %d + empty-open<FMIN %d + "
+            "empty-open>=FMIN %d; filter removed %d",
+            self.name, "?" if unit_i is None else int(unit_i), n,
+            c["active_occ"], c["shut_occ"], c["empty_valved"],
+            c["empty_open_lo"], c["empty_open_hi"],
+            int(getattr(self, "_last_stage_removed", 0)))
+
     def _run_band_unit(self, model, band_sorter, subset, band_temps,
-                       ll_change_log, prop_counts, acc_counts):
+                       ll_change_log, prop_counts, acc_counts,
+                       unit_i=None):
         """Drive one parity unit's cells through the sub-band buffer."""
         tm = getattr(self, "_prop_timer", None)
         _sched_specials = subset.special_band_inds
@@ -8858,6 +9004,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             _sched_specials = subset.special_band_inds[_countable]
         _sched_specials = self._staged_specials(
             _sched_specials, band_sorter.nwalkers)
+        self._log_stage_census(unit_i, band_sorter, _sched_specials,
+                               self.xp)
         scheduler = BandScheduler(
             _sched_specials, self.num_band_preload_total, xp=self.xp,
             cell_order=getattr(self, "temper_cell_order", "count"),

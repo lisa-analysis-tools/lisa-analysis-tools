@@ -47,8 +47,13 @@ LOG_KEEP_PATTERN = (
     r"\[V8-NOISE|\[COARSE_AUDIT|\[GB_TRUST|\[GB_VERT|\[unequal-arm|"
     r"\[galfor-modulation|\[LADDER|\[MIDIT_CKPT|WARNING|ERROR|CRITICAL|"
     r"Traceback|ll AUDIT|DELTA-vs-DELTA|sig-het engine resolved|"
-    r"\[GB_SWEEP|\[LOGMIRROR|\[GB_REPLACE"
+    r"\[GB_SWEEP|\[LOGMIRROR|\[GB_REPLACE|\[GB_STAGE"
 )
+#: ⚠ ``\[GB_STAGE`` covers BOTH the shut-pair exclusion line and
+#: ``[GB_STAGE_CENSUS]``. Neither matched before 2026-09-29, so the
+#: filtered logs in every tar dropped them -- and "the exclusion
+#: line never fires" was read off exactly those files. An absence in
+#: a filtered log is evidence of nothing unless the prefix is here.
 
 #: Name fragments that never enter a snapshot, whatever else matches.
 _EXCLUDE_PATH_PARTS = ("fstat_grid_parts", "/dissect/", "_artifacts/diagnostics/")

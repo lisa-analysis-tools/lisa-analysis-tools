@@ -87,7 +87,7 @@ for d in "${DIRS[@]}"; do
     logmb=$(( $(stat -c %s "$runlog" 2>/dev/null || stat -f %z "$runlog") / 1048576 ))
     if [ "$logmb" -gt "$LOG_CAP_MB" ]; then
       echo "== $d: run log ${logmb} MB > ${LOG_CAP_MB} MB -- filtering"
-      grep -aE "\[SAVE\]|\[GB_ACCEPT|\[GB_OBS_BASIS|\[GB_INMODEL_TRACE|MISMATCH|\[GB_TEMPER_CHECK|\[GB_CAP|\[GB_ORTHO|\[stageB\]|epoch .* done in|\[FSTAT_CTR|\[GB_TIMING|\[GB_BAND_SHUTOFF|\[GB_BAND_REVIVE|\[V8-NOISE|\[COARSE_AUDIT|\[GB_TRUST|\[GB_VERT|\[unequal-arm|\[galfor-modulation|\[LADDER|\[MIDIT_CKPT|WARNING|ERROR|CRITICAL|Traceback|ll AUDIT|DELTA-vs-DELTA|sig-het engine resolved|\[GB_SWEEP|\[LOGMIRROR|\[GB_REPLACE" \
+      grep -aE "\[SAVE\]|\[GB_ACCEPT|\[GB_OBS_BASIS|\[GB_INMODEL_TRACE|MISMATCH|\[GB_TEMPER_CHECK|\[GB_CAP|\[GB_ORTHO|\[stageB\]|epoch .* done in|\[FSTAT_CTR|\[GB_TIMING|\[GB_BAND_SHUTOFF|\[GB_BAND_REVIVE|\[V8-NOISE|\[COARSE_AUDIT|\[GB_TRUST|\[GB_VERT|\[unequal-arm|\[galfor-modulation|\[LADDER|\[MIDIT_CKPT|WARNING|ERROR|CRITICAL|Traceback|ll AUDIT|DELTA-vs-DELTA|sig-het engine resolved|\[GB_SWEEP|\[LOGMIRROR|\[GB_REPLACE|\[GB_STAGE" \
         "$runlog" > "${runlog%.log}_filtered.log" || true
       tail -c 20000000 "$runlog" > "${runlog%.log}_tail.log" || true
       LOG_EXCL=(! -path "$runlog")
