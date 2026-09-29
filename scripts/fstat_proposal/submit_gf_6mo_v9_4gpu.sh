@@ -664,10 +664,15 @@ export MOJITO_INFO_PATH=/shared/data/mojito_cache
 # banner and stays off for the rest of the run. The run is never affected.
 # If that fires, raise GF_MONITOR_ITER or set GF_MONITOR_SNAPSHOT=0.
 export GF_MONITOR_AFTER_SAVE=1
-# Build on EVERY save. At ~2 h/iteration against a page build of order
-# minutes this is well inside the 25% warn fraction; the watchdog is the
-# backstop if that stops being true.
-export GF_MONITOR_ITER=1
+# EVERY THIRD save (1 -> 3, 2026-09-28). ⚠ The old comment's premise
+# -- "~2 h/iteration against a page build of order minutes" -- stopped
+# being true: on job 663 the page+tar build took 443 s while the
+# iteration itself fell to ~500 s once the level-3 mask started
+# skipping shut pairs, and it delayed a save. At 1-in-3 the artifacts
+# keep flowing at under a quarter of the writer's time, which is the
+# watchdog's own warn fraction. Raise it further if iterations get
+# faster again; the watchdog is still the backstop.
+export GF_MONITOR_ITER=3
 # The tar as well as the page -- it is what actually gets downloaded.
 # Set to 0 if the watchdog starts complaining; the page alone is much
 # cheaper than the multi-GB archive.
