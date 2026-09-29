@@ -8968,14 +8968,32 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                            self.name, e)
             return
         n = int(len(specials)) if specials is not None else 0
+        # ⚠ HOW FULL THE VALVE WAS **AT STAGING TIME**, on the same line.
+        # Without it the census cannot separate the two innocent
+        # explanations from the guilty one. The subset build ANDs the
+        # shut mask into ``inds_keep`` (gbbands ``get_subset_bool``), so
+        # a populated valve makes shut-pair cells unstageable -- dead
+        # rows included, since their band follows their drawn f0 like
+        # any other row's. Therefore a large staged count means EITHER
+        # the valve was still empty when this unit was staged (it is
+        # released at every recipe-step change and re-earned over
+        # ``CONV_ITER`` iterations, so early units in a stage legitimately
+        # see nothing shut) OR the filter is not seeing the table. Those
+        # need opposite fixes and differ only in this number, which is
+        # why it is not left to be cross-referenced against a
+        # [GB_BAND_SHUTOFF] line emitted at a different moment.
+        _sw = getattr(self, "_rj_band_shutoff_w", None)
+        _npair = 0 if _sw is None else int(np.asarray(_to_numpy(_sw)).size)
+        _nshut = 0 if _sw is None else int(np.asarray(_to_numpy(_sw)).sum())
         logger.info(
             "[GB_STAGE_CENSUS %s] unit %s: staged %d = active-occ %d + "
             "SHUT-OCC %d + empty-valved %d + empty-open<FMIN %d + "
-            "empty-open>=FMIN %d; filter removed %d",
+            "empty-open>=FMIN %d; filter removed %d; valve %d/%d pairs "
+            "shut at stage time",
             self.name, "?" if unit_i is None else int(unit_i), n,
             c["active_occ"], c["shut_occ"], c["empty_valved"],
             c["empty_open_lo"], c["empty_open_hi"],
-            int(getattr(self, "_last_stage_removed", 0)))
+            int(getattr(self, "_last_stage_removed", 0)), _nshut, _npair)
 
     def _run_band_unit(self, model, band_sorter, subset, band_temps,
                        ll_change_log, prop_counts, acc_counts,

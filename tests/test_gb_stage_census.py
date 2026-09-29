@@ -236,3 +236,60 @@ class CensusSurvivesTheTarTest(unittest.TestCase):
         self.assertEqual(
             {a for a in m.group(1).replace("\\\n", "").split("|") if a},
             {a for a in snap.LOG_KEEP_PATTERN.split("|") if a})
+
+
+class ValveStateAtStageTimeTest(unittest.TestCase):
+    """The census must say how full the valve was WHEN it staged.
+
+    The subset build ANDs the shut mask into ``inds_keep``, so a
+    populated valve makes shut-pair cells unstageable -- dead rows
+    included, since a dead row's band follows its drawn f0 like any
+    other row's. A large staged count therefore has two innocent
+    readings and one guilty one, and they differ only in this number:
+
+      valve empty at stage time  -> nothing was shuttable yet (the valve
+                                    releases at every recipe-step change
+                                    and is re-earned over CONV_ITER
+                                    iterations)
+      valve full, SHUT-OCC == 0  -> the filter worked; the floor is
+                                    genuinely empty-band birth cells
+      valve full, SHUT-OCC  > 0  -> the filter is not seeing the table
+
+    Cross-referencing a [GB_BAND_SHUTOFF] line emitted at a different
+    moment cannot separate these, which is why the count is inline.
+    """
+
+    LOGGER = "lisatools.globalfit.moves.gbspecialstretch"
+
+    def _line(self, shut_w):
+        m = g.GBSpecialBase.__new__(g.GBSpecialBase)
+        m.name = "rj_fstat_search"
+        m._rj_band_shutoff_w = shut_w
+        m._rj_band_shutoff = None
+        m._last_stage_removed = 0
+        m._alive_cells_cache = None
+        m.band_edges = np.array([1e-3, 5e-3, 11e-3, 20e-3])
+        s = types.SimpleNamespace(
+            inds=np.array([True, False]),
+            temp_inds=np.array([0, 0]), walker_inds=np.array([0, 0]),
+            band_inds=np.array([0, 2]), nwalkers=NW)
+        with mock.patch.dict(os.environ, {"GB_STAGE_CENSUS": "1"}):
+            with self.assertLogs(self.LOGGER, "INFO") as cm:
+                g.GBSpecialBase._log_stage_census(
+                    m, 0, s, _spec([0, 0], [0, 0], [0, 2]), np)
+        return "\n".join(cm.output)
+
+    def test_an_EMPTY_valve_is_reported_as_zero_of_its_size(self):
+        self.assertIn("valve 0/6 pairs shut at stage time",
+                      self._line(np.zeros((NW, 3), bool)))
+
+    def test_a_POPULATED_valve_reports_its_count(self):
+        sw = np.zeros((NW, 3), bool)
+        sw[0, 1] = sw[1, 2] = sw[0, 2] = True
+        self.assertIn("valve 3/6 pairs shut at stage time", self._line(sw))
+
+    def test_NO_valve_at_all_is_distinguishable_from_an_empty_one(self):
+        """0/0 says the table was never bound; 0/N says it was bound and
+        nothing had qualified yet. Different defects."""
+        self.assertIn("valve 0/0 pairs shut at stage time",
+                      self._line(None))
