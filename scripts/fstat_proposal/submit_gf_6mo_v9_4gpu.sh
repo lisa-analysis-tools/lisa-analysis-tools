@@ -3113,6 +3113,45 @@ export GB_INMODEL_OBSERVABLE_SHEAR=0.5
 #   GB_INMODEL_OBSERVABLE_EIGEN=full  -> the 2026-09-14 joint draw
 export GB_INMODEL_OBSERVABLE_EIGEN=${GB_INMODEL_OBSERVABLE_EIGEN-axis}
 echo "[GB-OBS-EIGEN] GB_INMODEL_OBSERVABLE_EIGEN='${GB_INMODEL_OBSERVABLE_EIGEN}' (empty = diagonal draw)"
+# ---- PER-AXIS ADAPTIVE STEP SCALES (branch gb-inmodel-axis-adapt) ------
+# ⚠ READ THIS BEFORE RE-TUNING GB_INMODEL_OBSERVABLE_JUMP ABOVE. Under
+# GB_INMODEL_OBSERVABLE_EIGEN=axis that knob is EXACTLY CANCELLED on
+# every eigen axis the information matrix could measure. The step scales
+# are consumed as a WHITENING METRIC -- gw = gz * w (x) w, then
+# sigma = 1/sqrt(a^T gw a) -- so w -> c*w gives sigma -> sigma/c and the
+# table product w * a * sigma is unchanged. Measured over 400 synthetic
+# sources with nothing railed: the per-axis step magnitudes under jump
+# 1.5, 2.0 and 7.3 match jump=1 to every digit. The knob survives only
+# on axes railed at GB_INMODEL_OBSERVABLE_EIGEN_SMAX -- the ones the
+# matrix could NOT measure, i.e. the ones already overshooting -- and on
+# rows with no table yet. So the 1.0 -> 2.0 -> 1.5 history above moved
+# the railed axes and the newborns, not the axes it was arguing about.
+# Full write-up: docs/superpowers/specs/2026-09-29-gb-inmodel-axis-adapt-design.md
+#
+# This is the knob that does reach the step: a per-(temp, walker, band,
+# axis) multiplier applied to sigma, learned from each cell's OWN
+# acceptance. SEARCH STAGE ONLY -- a learned step scale is not a fixed
+# proposal, and PE has to keep detailed balance.
+#   0 (default) -> no table, step byte-identical to dev
+#   1           -> adapt
+export GB_INMODEL_OBSERVABLE_AXIS_ADAPT=${GB_INMODEL_OBSERVABLE_AXIS_ADAPT:-0}
+# Target acceptance. 0.44 because axis mode draws ONE axis per repeat,
+# which is a 1-D move -- the same number the JUMP block above argues
+# from. Per-axis now, instead of one global compromise.
+export GB_INMODEL_OBSERVABLE_AXIS_TARGET=${GB_INMODEL_OBSERVABLE_AXIS_TARGET:-0.44}
+# Log-space gain per PROPOSE. 0.2 moves a cell at most ~11% per propose
+# (|rate - target| <= 0.56), so a cell that wants 2x takes ~7 proposes.
+# Constant, not a decaying Robbins-Monro schedule: the search stage's
+# target moves as neighbours are found and subtracted, so a tracking
+# filter is the right object and a vanishing gain would freeze every
+# source at whatever its step wanted early in the search.
+export GB_INMODEL_OBSERVABLE_AXIS_GAIN=${GB_INMODEL_OBSERVABLE_AXIS_GAIN:-0.2}
+# Clamp on the multiplier itself: [1/8, 8]. Separate from
+# GB_INMODEL_OBSERVABLE_EIGEN_SMAX on purpose -- SMAX bounds what the
+# information MATRIX may claim about a direction it could not measure,
+# this bounds how far the MEASURED acceptance may override the matrix.
+export GB_INMODEL_OBSERVABLE_AXIS_BOUND=${GB_INMODEL_OBSERVABLE_AXIS_BOUND:-8.0}
+echo "[GB-OBS-AXIS] adapt=${GB_INMODEL_OBSERVABLE_AXIS_ADAPT} target=${GB_INMODEL_OBSERVABLE_AXIS_TARGET} gain=${GB_INMODEL_OBSERVABLE_AXIS_GAIN} bound=${GB_INMODEL_OBSERVABLE_AXIS_BOUND}"
 # ---- AND THE F-STAT GRID IN THE SAME BASIS -------------------------
 # fdot becomes a FIRST-CLASS grid axis instead of the r = 0 manifold the
 # grid searches today. Measured in v7: 39.6% of low-f and 10.5% of high-f

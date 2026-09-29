@@ -688,6 +688,18 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # these is new rather than changed.
             "GF_MONITOR_AFTER_SAVE", "GF_MONITOR_ITER",
             "GF_MONITOR_SNAPSHOT", "GF_MONITOR_TIMEOUT",
+            # Per-axis adaptive step scales (branch gb-inmodel-axis-adapt,
+            # 2026-09-29). All four are new in v9 and the master arm ships
+            # at 0, so the step is byte-identical until someone turns it
+            # on -- the knobs are here so the branch is runnable without a
+            # hand edit. GB_INMODEL_OBSERVABLE_JUMP above is the knob they
+            # exist to replace: under *_OBSERVABLE_EIGEN=axis it is
+            # exactly cancelled on every axis the information matrix could
+            # measure (the launcher block says why, at length).
+            "GB_INMODEL_OBSERVABLE_AXIS_ADAPT",
+            "GB_INMODEL_OBSERVABLE_AXIS_TARGET",
+            "GB_INMODEL_OBSERVABLE_AXIS_GAIN",
+            "GB_INMODEL_OBSERVABLE_AXIS_BOUND",
         }
         drift = {
             k: (self.v8.get(k), self.v9.get(k))
