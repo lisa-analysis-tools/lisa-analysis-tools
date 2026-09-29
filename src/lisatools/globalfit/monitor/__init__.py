@@ -422,7 +422,7 @@ def build_monitor_in_process(run_dir: str, out_path: str,
     puts a matplotlib fault in the caller's process, which is why the
     saver rank -- the run's only writer -- must not use it.
     """
-    import runpy
+    import gc
 
     argv = [generator_path(), str(run_dir), str(out_path)]
     saved_argv, saved_env = sys.argv, os.environ.get("MOJITO_INFO_PATH")
@@ -431,9 +431,27 @@ def build_monitor_in_process(run_dir: str, out_path: str,
     if _moj:
         os.environ["MOJITO_INFO_PATH"] = _moj
         logger.info("monitor: mojito data from %s (%s)", _moj, _src)
-    ns = None
+    # ⚠ OWN THE NAMESPACE -- do NOT go back to ``runpy.run_path``.
+    # run_path hands the module globals back only on SUCCESS, so a
+    # generator that RAISED left ``ns`` None, the teardown below closed
+    # NOTHING, and the store stayed open read-only inside the run's only
+    # writer. Refcounting did not save it either: a module globals dict is
+    # a reference cycle (every function's ``__globals__`` points back at
+    # it), so it outlives the traceback and waits for the cyclic GC. The
+    # next save was then
+    #   OSError: Unable to synchronously open file
+    #            (file is already open for read-only)
+    # which is how the 3-month run died on 2026-09-28. Executing the code
+    # in a dict we created means the handles are reachable on EVERY path.
+    # ``__name__`` must stay "__main__": the generator guards on it and
+    # raises SystemExit(0) otherwise.
+    # Covered by tests/test_monitor_in_process_handle_leak.py.
+    _gen = generator_path()
+    ns = {"__name__": "__main__", "__file__": _gen}
     try:
-        ns = runpy.run_path(generator_path(), run_name="__main__")
+        with open(_gen, "rb") as _fh:
+            _code = compile(_fh.read(), _gen, "exec")
+        exec(_code, ns)                           # noqa: S102
     except SystemExit as e:
         if e.code not in (0, None):
             raise
@@ -457,10 +475,18 @@ def build_monitor_in_process(run_dir: str, out_path: str,
 
                 if isinstance(_v, h5py.File):
                     _v.close()
-                elif isinstance(_v, h5py.Group) and _v.file:
+                # Dataset too, not only Group: the generator keeps
+                # ``g["log_like"]`` style handles at module level and a
+                # live Dataset holds its File open just as firmly.
+                elif isinstance(_v, (h5py.Group, h5py.Dataset)) and _v.file:
                     _v.file.close()
             except Exception:                     # noqa: BLE001
                 pass
+        # Break the globals cycle now rather than leaving it to whenever
+        # the collector next runs -- this process is the run's only writer
+        # and the next thing it does is open the store for APPEND.
+        ns.clear()
+        gc.collect()
         sys.argv = saved_argv
         if saved_env is None:
             os.environ.pop("MOJITO_INFO_PATH", None)
@@ -542,10 +568,20 @@ def build_monitor(run_dir: str, out_path: Optional[str] = None, *,
         _err = getattr(e, "stderr", b"") or b""
         if isinstance(_err, bytes):
             _err = _err.decode("utf-8", "replace")
+        if _err:
+            _detail = " Last stderr: " + _err.strip()[-800:]
+        else:
+            # THE IN-PROCESS PATH HAS NO ``.stderr``. Without this the
+            # whole failure was one line naming the exception type, which
+            # is why the 3-month page could fail on every save with nobody
+            # able to say why -- and the same failing page was leaking the
+            # store handle that killed the run. The subprocess path gets
+            # the child's stderr; this is its equivalent.
+            import traceback
+            _detail = "\n" + traceback.format_exc().strip()[-4000:]
         logger.warning(
             "monitor page NOT refreshed (%s: %s). Any previous page is "
-            "untouched.%s", type(e).__name__, e,
-            (" Last stderr: " + _err.strip()[-800:]) if _err else "")
+            "untouched.%s", type(e).__name__, e, _detail)
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)

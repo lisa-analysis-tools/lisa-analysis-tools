@@ -186,11 +186,28 @@ class InProcessHandleLeakTest(unittest.TestCase):
         import lisatools.globalfit.monitor as mon
         src = Path(mon.__file__).read_text()
         i = src.index("def build_monitor_in_process")
-        blk = src[i:i + 4000]
-        self.assertIn("ns = runpy.run_path", blk,
-                      "the module globals must be captured to reach the "
-                      "handles")
+        blk = src[i:i + 6000]
+        # MECHANISM CHANGED 2026-09-28: runpy.run_path -> exec into a dict
+        # we own. run_path hands the globals back only on SUCCESS, so a
+        # page that RAISED closed nothing, the store stayed open read-only
+        # in the saver rank, and the next save_step died with
+        # "file is already open for read-only" -- how the 3mo run died.
+        # Pin the INVARIANT (the namespace is ours before the code runs),
+        # not whichever call happens to provide it.
+        self.assertIn('ns = {"__name__": "__main__"', blk,
+                      "the module globals must be captured BEFORE the "
+                      "generator runs, so they are reachable even when it "
+                      "raises")
+        # Match the IMPORT, not the name: the comment above the fix cites
+        # ``runpy.run_path`` precisely to stop anyone reinstating it, and
+        # an assertNotIn on the bare name would fire on that warning.
+        self.assertNotIn("import runpy", blk,
+                         "runpy.run_path cannot reach the handles of a page "
+                         "that FAILED -- it returns the globals only on "
+                         "success. See test_monitor_in_process_handle_leak.")
         self.assertIn("isinstance(_v, h5py.File)", blk)
+        # a live Dataset holds its File open just as firmly as a Group
+        self.assertIn("h5py.Dataset", blk)
         self.assertIn(".close()", blk)
 
     def test_the_reason_is_recorded(self):
