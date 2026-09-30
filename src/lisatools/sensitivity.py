@@ -2482,7 +2482,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             window_normalization = 1.0
 
         if self.filters_response is not None:
-            self.noise_normalization = window_normalization * self.xp.ascontiguousarray(self.filters_response)
+            self.noise_normalization = window_normalization * self.xp.ascontiguousarray(self.xp.asarray(self.filters_response))
         else:
             self.noise_normalization = window_normalization * self.xp.ones(len(self.basis_settings.f_arr), dtype=self.xp.float64)
                 
