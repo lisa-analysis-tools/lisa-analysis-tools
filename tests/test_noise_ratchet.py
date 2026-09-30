@@ -654,11 +654,51 @@ class ForcedStepTest(unittest.TestCase):
             move.forced_noise_step(model, state, {"galfor": np.full(5, 100.0)})
         np.testing.assert_array_equal(state.branches["galfor"].coords, before_g)
         self.assertEqual(built, [])
+        self.assertIsNone(move._forced_step_deltas)
 
     def test_unsampled_branch_is_refused(self):
         move, model, state, acs, built = self._fixture()
         with self.assertRaises(ValueError):
             move.forced_noise_step(model, state, {"psd": np.zeros(2)})
+
+    def test_the_step_goes_through_propose_and_clears_its_shift(self):
+        """6mo job 671 died because the forced step entered the body directly
+        on the full 4-walker state while each rank's ACA held one walker.
+        The step must enter through ``propose`` (the fan-out's slicing door)
+        and leave no pending shift behind for the next ordinary proposal."""
+        move, model, state, acs, built = self._fixture()
+        seen = []
+        real = move.propose
+
+        def spy(m, s):
+            seen.append(None if move._forced_step_deltas is None
+                        else {k: v.copy() for k, v in move._forced_step_deltas.items()})
+            return real(m, s)
+
+        move.propose = spy
+        delta = np.array([-0.05, -0.10, 0.0, 0.0, -0.15])
+        move.forced_noise_step(model, state, {"galfor": delta})
+        self.assertEqual(len(seen), 1)
+        np.testing.assert_allclose(seen[0]["galfor"], delta)
+        self.assertIsNone(move._forced_step_deltas)
+
+    def test_shift_rides_in_the_fanout_payload_and_is_installed_per_rank(self):
+        """Block layout: the head ships the shift in the propose payload's
+        ``extra``; a rank installs it before its body and DROPS it when the
+        next payload carries none."""
+        move, model, state, acs, built = self._fixture()
+        self.assertNotIn("forced_step_deltas", move.fanout_payload_extra())
+        move._forced_step_deltas = {"galfor": np.array([-0.05, -0.1, 0, 0, -0.15])}
+        extra = move.fanout_payload_extra()
+        np.testing.assert_allclose(extra["forced_step_deltas"]["galfor"],
+                                   [-0.05, -0.1, 0, 0, -0.15])
+        self.assertIn("betas", extra)
+        rank = self._fixture()[0]
+        rank.fanout_apply_extra(extra)
+        np.testing.assert_allclose(rank._forced_step_deltas["galfor"],
+                                   [-0.05, -0.1, 0, 0, -0.15])
+        rank.fanout_apply_extra({"betas": extra["betas"]})
+        self.assertIsNone(rank._forced_step_deltas)
 
 
 # ======================================================================
