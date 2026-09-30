@@ -75,6 +75,7 @@ blocks rather than erroring when it cannot take the lock.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 import h5py
@@ -90,6 +91,35 @@ def _leaf_counts(grp, branch, n_rows):
 def _first_populated(counts):
     nz = np.where(counts > 0)[0]
     return int(nz.min()) if nz.size else None
+
+
+def _set_checkpoint_aside(store, it_now):
+    """Move the mid-iteration checkpoint out of the resume's way on a REWIND.
+
+    ⚠ WHY THIS IS NOT OPTIONAL (6mo jobs 671/672, 2026-09-30). The resume
+    rule in ``midit_checkpoint.load_for_resume`` is "the checkpoint wins iff
+    it was written at or after the store's stored iteration" -- right for a
+    preempted save, where the checkpoint is the newer truth. After a rewind
+    the store's counter goes DOWN, so a checkpoint from the discarded future
+    passes that test and is adopted: both relaunches after the rewind to 47
+    started from job 670's mid-iteration state (its iteration-2 checkpoint
+    said 48), not from row 46, and the rewind was silently undone for the
+    in-memory state while the store's rows were overwritten from 47 on.
+
+    Renamed, not deleted (``<ckpt>.rewound-<old iteration>``), so nothing is
+    lost. Returns the new path, or None when there was no checkpoint.
+    """
+    base, _ = os.path.splitext(store)
+    ckpt = base + "_midit_checkpoint.pkl"
+    if not os.path.exists(ckpt):
+        return None
+    dst = f"{ckpt}.rewound-{int(it_now)}"
+    k = 1
+    while os.path.exists(dst):
+        dst = f"{ckpt}.rewound-{int(it_now)}.{k}"
+        k += 1
+    os.replace(ckpt, dst)
+    return dst
 
 
 def main(argv=None):
@@ -196,6 +226,9 @@ def main(argv=None):
             print(f"    re-opened {', '.join(changed)}")
         if it_new is not None:
             print(f"    iteration = {it_new}")
+            _moved = _set_checkpoint_aside(args.store, it_now)
+            if _moved:
+                print(f"    mid-iteration checkpoint set aside -> {_moved}")
         print("  resubmit the job.")
 
         # A ladder mismatch survives any rewind (shapes are not per-row) and
