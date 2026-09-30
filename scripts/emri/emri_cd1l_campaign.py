@@ -63,11 +63,11 @@ def peak_rss_gb():
     return r / 1e9 if platform.system() == "Darwin" else r / 1e6   # bytes on macOS, kB on Linux
 
 
-def flat_stats(a, b, act):
-    """Per channel flat 1 - Re(O) and |a|/|b| over the active (edge-cropped) layers."""
+def flat_stats(a, b):
+    """Per channel flat 1 - Re(O) and |a|/|b| (arrays already cropped to the active band)."""
     mm, amp = [], []
     for c in range(3):
-        x, y = a[c][:, act], b[c][:, act]
+        x, y = a[c], b[c]
         den = float(np.sqrt(np.sum(x * x) * np.sum(y * y)))
         mm.append(1.0 - float(np.sum(x * y)) / den if den > 0 else float("nan"))
         ny = float(np.linalg.norm(y))
@@ -122,11 +122,19 @@ def main():
 
     t_start = time.perf_counter()
     params, data, data_t0, orb = W.load(args.src)
+    # templates are built on the FULL grid (the direct assembly needs every pixel) and scored
+    # on the production-style cropped grid: crop() slices a full array to wdm's active band
+    wdm_full = WDMSettings(NF, nt, DT, force_backend="cpu")
     wdm = WDMSettings(NF, nt, DT, min_time=EDGE_LAYERS * NF * DT, max_time=(nt - EDGE_LAYERS) * NF * DT,
                       force_backend="cpu")
     tds = TDSettings(n_win, DT, t0=0.0, force_backend="cpu")
-    act = (np.arange(nt) >= EDGE_LAYERS) & (np.arange(nt) < nt - EDGE_LAYERS)
-    d_arr = np.asarray(TDSignal(data, tds).transform(wdm).arr)
+
+    def crop(arr):
+        out = np.ascontiguousarray(np.asarray(arr)[:, wdm.active_slice_f, wdm.active_slice_t])
+        assert out.shape[1:] == (wdm.Nf_active, wdm.Nt_active), (out.shape, wdm.Nf_active, wdm.Nt_active)
+        return out
+
+    d_arr = crop(TDSignal(data, tds).transform(wdm_full).arr)
     del data
     gc.collect()
     sens = XYZ2SensitivityMatrix(wdm, model="scirdv1")
@@ -149,7 +157,7 @@ def main():
         from lisatools.domains import WDMLookupTable
         from lisatools.sources.emri.wdm_direct import EMRIDirectWDM
         table = WDMLookupTable.from_file(args.table, force_backend="cpu")
-        direct_gen = EMRIDirectWDM(gen, table, wdm, orbits=orb, tdi_config=TDIConfig("2nd generation", force_backend="cpu"),
+        direct_gen = EMRIDirectWDM(gen, table, wdm_full, orbits=orb, tdi_config=TDIConfig("2nd generation", force_backend="cpu"),
                                    t_start=W.REF, data_t0=data_t0, n_fine=W.N_FINE, mode_batch=W.MODE_BATCH)
 
     for thr in [float(x) for x in args.thresh.split(",")]:
@@ -159,14 +167,14 @@ def main():
             t0 = time.perf_counter()
             try:
                 if tag == "prod":
-                    h = np.asarray(TDSignal(W.legacy_td(params, wg, offset_int, thr), tds).transform(wdm).arr)
+                    h = crop(TDSignal(W.legacy_td(params, wg, offset_int, thr), tds).transform(wdm_full).arr)
                 elif tag == "tof":
                     td, nsub, n_in = W.tof_td(params, orb, data_t0, thr, gen)
                     row["tof_nsub"], row["tof_inside_samples"] = nsub, n_in
-                    h = np.asarray(TDSignal(td, tds).transform(wdm).arr)
+                    h = crop(TDSignal(td, tds).transform(wdm_full).arr)
                     del td
                 else:
-                    h = np.asarray(direct_gen(*params, mode_selection_threshold=thr).arr)
+                    h = crop(direct_gen(*params, mode_selection_threshold=thr).arr)
                     row.update({f"direct_{k}": v for k, v in direct_gen.last_stats.items()})
             except Exception as exc:   # record and keep going: this is a debugging campaign
                 row[f"{tag}_error"] = f"{type(exc).__name__}: {exc}"
@@ -186,7 +194,7 @@ def main():
             row[f"{tag}_snr_ratio"] = float(np.real(opt)) / np.sqrt(dd)
             dh = 0.5 * (dd + hh + 2 * ll)                       # <d|h> from -1/2<d-h|d-h>
             row[f"{tag}_mm_data"] = 1.0 - dh / np.sqrt(dd * hh) if hh > 0 else float("nan")
-            row[f"{tag}_flat_mm_data"], row[f"{tag}_flat_amp_data"] = flat_stats(h, d_arr, act)
+            row[f"{tag}_flat_mm_data"], row[f"{tag}_flat_amp_data"] = flat_stats(h, d_arr)
             print(f"[campaign] thr={thr:g} {tag}: logL={ll:+.4f} mm_data={row[f'{tag}_mm_data']:.3e} "
                   f"snr_opt/data={row[f'{tag}_snr_ratio']:.6f} wall={row[f'{tag}_wall_s']:.0f}s "
                   f"rss={row[f'{tag}_peak_rss_gb']:.1f}GB", flush=True)
@@ -202,7 +210,7 @@ def main():
                 ab = 0.5 * (bb + aa + 2 * ll)
                 row[f"mm_{a}_{b}"] = 1.0 - ab / np.sqrt(aa * bb) if aa > 0 and bb > 0 else float("nan")
                 row[f"dlogL_{a}_{b}"] = row[f"{a}_logL"] - row[f"{b}_logL"]
-                row[f"flat_mm_{a}_{b}"], row[f"flat_amp_{a}_{b}"] = flat_stats(arrs[a], arrs[b], act)
+                row[f"flat_mm_{a}_{b}"], row[f"flat_amp_{a}_{b}"] = flat_stats(arrs[a], arrs[b])
                 print(f"[campaign] thr={thr:g} {a} vs {b}: mm={row[f'mm_{a}_{b}']:.3e} "
                       f"dlogL={row[f'dlogL_{a}_{b}']:+.4e}", flush=True)
         row["total_wall_s"] = time.perf_counter() - t_start
