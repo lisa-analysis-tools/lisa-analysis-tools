@@ -69,6 +69,30 @@ model is at 1.9e-4 (median, before 0.9 t_plunge), the table's f/fdot interpolati
 9. Retrograde input: FEW maps xI0 < 0 to (-a, +1) before its sign rule; the harmonic tracks
    now do the same (the old code flipped the phase for the user form).
 
+## CD1L campaign: all 8 EMRIs at 6 and 24 months
+
+`scripts/emri/emri_cd1l_campaign.sh` runs `emri_cd1l_campaign.py` serially for every CD1L
+EMRI (rows 0-7) at 6mo (180 d, Nt 4320) and 24mo (720 d, Nt 17280), one process per
+(source, duration), and writes `results.jsonl`, one log per run and `summary.md`.
+Each run scores the production, TDI-on-the-fly and direct-WDM templates against the
+source-only mojito L1 stream in the WDM domain (SciRD v1): logL = -1/2<d-h|d-h>,
+noise-weighted mismatch, opt/det SNR, flat per-channel mismatch and norm ratio, and the
+template-vs-template mismatch and dlogL. A failing template is recorded (error and
+traceback in the JSON row) and the run continues.
+
+```bash
+export MOJITO_LIGHT_PATH=/path/to/mojito_light_v1_0_0          # catalogues/ + data/EMRI/L1/
+export EMRI_WDM_TABLE=/path/to/wdm_lookup_emri_cx_NF180_DT20_TL32_fd8x0p01_nld2.h5   # 30 MB
+bash scripts/emri/emri_cd1l_campaign.sh                          # OUT_DIR=emri_cd1l_campaign_out
+python scripts/emri/emri_cd1l_campaign.py --src 1 --duration 4d --table $EMRI_WDM_TABLE   # smoke
+```
+
+Knobs: `SOURCES`, `DURATIONS`, `TEMPLATES`, `THRESH` (driver); `TOF_FINE_DT` (fine
+trajectory spacing, default 300 s), `MODE_BATCH` (16), `EVAL_CHUNK`, `RSS_LIMIT_GB`,
+`START_OFFSET_S` (script). The driver skips pairs with a `.done` marker, so a rerun resumes.
+Long windows are untested territory: the TOF and direct paths were validated to 170 d;
+memory and wall time at 6 and 24 months are what the campaign measures.
+
 ## Open items
 
 1. (resolved) TOF vs production at the abrupt plunge end.
