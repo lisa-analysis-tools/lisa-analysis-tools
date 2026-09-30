@@ -124,11 +124,15 @@ class StageCompositionTest(unittest.TestCase):
         warm -> in-model -> fstat -> in-model -> replace -> in-model
         -> prior-removal.
 
-        Order is the whole point, and the cycle ENDS on the removal judge
-        (user amendment 2026-09-24). Every birth and every swap gets a full
+        Order is the whole point. Every birth and every swap gets a full
         in-model refinement pass BEFORE ``rj_prior_removal`` sees it -- a
         source still sitting at its birth or swap coordinates looks far more
         deletable than the same source after it has walked onto its peak.
+        The cycle ended on the removal judge until 2026-09-28 (05859ed5,
+        user ruling): a pure in-model pass ``in_model_removal`` now follows
+        the deaths by default (GB_SEARCH_INMODEL_AFTER_REMOVAL), so the
+        SAVED state -- the residual the next births draw against -- has had
+        a group-rule pass over the surviving twins.
         """
         fit = _build()
         for st in _numbered(fit):
@@ -137,18 +141,19 @@ class StageCompositionTest(unittest.TestCase):
                 gb,
                 ["rj_warm_search", "in_model", "rj_fstat_search",
                  "in_model_fstat", "rj_replace", "in_model_replace",
-                 "rj_prior_removal"],
+                 "rj_prior_removal", "in_model_removal"],
                 f"{st.name} cycle is wrong",
             )
 
-    def test_three_distinct_in_model_slots_per_stage(self):
+    def test_four_distinct_in_model_slots_per_stage(self):
         """Distinct NAMES, because a stage's move names must be unique and
-        because each slot's timing/acceptance must be attributable."""
+        because each slot's timing/acceptance must be attributable. Four
+        since 05859ed5 (the pass after the removal judge)."""
         fit = _build()
         for st in _numbered(fit):
             slots = [n for n in _names(st) if n.startswith("in_model")]
-            self.assertEqual(len(slots), 3)
-            self.assertEqual(len(set(slots)), 3)
+            self.assertEqual(len(slots), 4)
+            self.assertEqual(len(set(slots)), 4)
 
     def test_recipe_accepts_the_duplicated_move_names_across_stages(self):
         """``_check_unique`` is per-stage; the same stock move legitimately
@@ -291,9 +296,9 @@ class FullCompositionTest(unittest.TestCase):
         immediately invalidates it, so each noise pass must follow the
         polish, not the bare RJ.
 
-        ⚠ ``rj_prior_removal`` has no in-model slot after it by design --
-        the cycle ENDS on the removal judge -- so its noise pass follows it
-        directly. That is the rule holding, not an exception to it.
+        Since 05859ed5 (2026-09-28) ``rj_prior_removal`` has an in-model
+        partner too, ``in_model_removal``, and the rule holds there as well:
+        the noise pass follows that polish, not the bare deaths.
         """
         fit = self._full(PSD_START_PARAMS="1.5e-11,3e-15",
                          GALFOR_START_PARAMS="1e-44,1e-3,1.5,5e-4,5e-4")
@@ -301,7 +306,8 @@ class FullCompositionTest(unittest.TestCase):
             next(s for s in fit.recipe.stages if s.name == "gb_search_3"))
         for rj_name, im_name in (("rj_warm_search", "in_model"),
                                  ("rj_fstat_search", "in_model_fstat"),
-                                 ("rj_replace", "in_model_replace")):
+                                 ("rj_replace", "in_model_replace"),
+                                 ("rj_prior_removal", "in_model_removal")):
             i_rj, i_im = names.index(rj_name), names.index(im_name)
             self.assertLess(i_rj, i_im, f"{im_name} must follow {rj_name}")
             # the next noise pass comes AFTER the polish, not between
@@ -310,8 +316,8 @@ class FullCompositionTest(unittest.TestCase):
             self.assertGreater(
                 nxt_noise, i_im,
                 f"{names[nxt_noise]} runs between {rj_name} and {im_name}")
-        # the removal judge ends the cycle, so its noise pass is adjacent
-        i_rem = names.index("rj_prior_removal")
+        # the removal polish ends the cycle, so its noise pass is adjacent
+        i_rem = names.index("in_model_removal")
         self.assertTrue(names[i_rem + 1].startswith("noise_joint_search"))
 
     def test_the_interleaved_noise_slots_are_DISTINCT_objects(self):
@@ -419,8 +425,13 @@ class ProfileDeclarationTest(unittest.TestCase):
         # 2026-09-25, correcting the same day's "1 and 2").
         self.assertEqual(got["gb_search_2"], dict(
             phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25))
+        # stage 3 additionally re-learns the shutoff valve's per-band cold
+        # lnL max from -inf (user ruling 2026-09-30): its noise MOVES, and a
+        # max earned under the fixed-noise stages shut job 672's pairs after
+        # three iterations.
         self.assertEqual(got["gb_search_3"], dict(
-            phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25))
+            phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25,
+            reset_band_max=True))
 
     def test_phase_max_is_STAGE_1_ONLY_and_tracks_the_high_floor(self):
         """The rule in one place, stated as a relationship rather than as

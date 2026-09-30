@@ -198,6 +198,55 @@ class CombineLegsTest(unittest.TestCase):
             GFCombineMove(moves=[_Move("rj_fstat_search", [])],
                           share_temperature_control=False, leg_ends=["in_model"])
 
+    def test_a_move_that_changed_the_noise_ends_the_leg_early(self):
+        """User ruling 2026-09-30: a save after the in-model noise step
+        WHENEVER IT RUNS. The gated noise head sets ``gf_leg_end_now`` when
+        it nudged or released (and ran its in-model pass); the leg ends
+        there and the row is saved after the gate's name. On a hold the flag
+        stays False and the leg runs on to in_model as usual."""
+        from lisatools.globalfit.moves.globalfitmove import GFCombineMove
+
+        order = ["noise_ratchet_search", "vgb_pe", "rj_warm_search", "in_model",
+                 "rj_fstat_search", "in_model_fstat",
+                 "rj_prior_removal", "in_model_removal", "mbh_pe"]
+        log = []
+
+        class _Gate(_Move):
+            changed = True
+
+            def propose(self, model, state):
+                self.gf_leg_end_now = self.changed
+                return super().propose(model, state)
+
+        moves = [(_Gate if n == "noise_ratchet_search" else _Move)(n, log) for n in order]
+        cm = GFCombineMove(moves=moves, share_temperature_control=False, leg_ends="auto")
+        cm.gf_stage_name = "gb_search_3"
+        # nudge cycle: the gate ends leg 1 on its own; the rest of leg 1 follows
+        st, _ = cm.propose(None, _state())
+        self.assertEqual(log, ["noise_ratchet_search"])
+        self.assertEqual(st.gf_saved_after, "noise_ratchet_search")
+        log.clear(); st, _ = cm.propose(None, _state())
+        self.assertEqual(log, ["vgb_pe", "rj_warm_search", "in_model"])
+        self.assertEqual(st.gf_saved_after, "in_model")
+        log.clear(); cm.propose(None, _state()); log.clear(); cm.propose(None, _state())
+        self.assertEqual(cm.gf_legs.cycles, 1)        # 4 rows, ONE cycle
+        # hold cycle: the gate ran but changed nothing -> no extra row
+        moves[0].changed = False
+        log.clear(); st, _ = cm.propose(None, _state())
+        self.assertEqual(log, ["noise_ratchet_search", "vgb_pe", "rj_warm_search", "in_model"])
+        self.assertEqual(st.gf_saved_after, "in_model")
+        # a stale flag can never end a later leg: it is consumed when read
+        self.assertFalse(getattr(moves[0], "gf_leg_end_now", False))
+
+    def test_resume_after_the_gate_lands_on_vgb(self):
+        c = LegCursor(["noise_ratchet_search", "vgb_pe", "in_model", "rj_fstat_search",
+                       "in_model_fstat"], ["in_model", "in_model_fstat"])
+        self.assertTrue(c.set_after("noise_ratchet_search"))
+        self.assertEqual(c.order[c.cursor], "vgb_pe")
+        # rows saved after the gate do not count as cycles
+        self.assertEqual(c.cycles_from_history(
+            ["noise_ratchet_search", "in_model", "in_model_fstat", "noise_ratchet_search"]), 1)
+
     def test_no_leg_ends_means_the_old_one_row_per_cycle(self):
         from lisatools.globalfit.moves.globalfitmove import GFCombineMove
 

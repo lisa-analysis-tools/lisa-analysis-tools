@@ -112,19 +112,33 @@ class LegCursor:
             self.cycles += 1
 
     def set_after(self, name: Optional[str]) -> bool:
-        """Position the cursor after leg-ender ``name`` (a resume).
+        """Position the cursor after move ``name`` (a resume).
 
-        Returns False and starts at the head when ``name`` is None or not a
-        leg-ender of this list -- an old store, or a changed composition.
+        ``name`` is normally a leg-ender, but a move that ended its leg
+        EARLY (see :meth:`end_early_at`; the gated noise head when it changed
+        the noise) is a valid saved-after name too. Returns False and starts
+        at the head when ``name`` is None or not in this list -- an old
+        store, or a changed composition.
         """
-        if name is None or name not in self.ends:
+        if name is None or name not in self.order:
             self.cursor = 0
             return False
         if name == self.ends[-1]:
             self.cursor = 0
             return True
-        self.cursor = self.order.index(name) + 1
+        self.cursor = (self.order.index(name) + 1) % len(self.order)
         return True
+
+    def end_early_at(self, index: int) -> None:
+        """End the current leg right after move ``index`` (before its static
+        leg-ender): the row is saved after THAT move and the rest of the leg
+        runs in the next propose. Only a move past the last static leg-ender
+        (the tail) wraps the cycle."""
+        index = int(index)
+        self.cursor = index + 1
+        if index >= self._end_idx[-1] or self.cursor >= len(self.order):
+            self.cursor = 0
+            self.cycles += 1
 
     def cycles_from_history(self, names: Iterable[Optional[str]]) -> int:
         """Completed cycles = rows saved after the LAST leg-ender."""
