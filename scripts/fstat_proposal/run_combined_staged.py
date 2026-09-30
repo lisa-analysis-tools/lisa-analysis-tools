@@ -1546,8 +1546,9 @@ def build_fit():
         # ---- the galfor RATCHET (user design 2026-09-30) -------------------
         # GALFOR_RATCHET=1 replaces the leading rider AND the four interleaved
         # noise slots with ONE gated noise proposal at the head of the
-        # iteration (vgb_pe keeps its own slot in front of it: 55 known
-        # sources, nothing to do with the noise schedule). The stage step
+        # iteration, with vgb_pe RIGHT AFTER it (user ruling 2026-09-30: the
+        # 55 known sources are refined against the noise the gate just set,
+        # never against the one it is about to change). The stage step
         # drives the gate -- nudge / hold / release -- from the stage-local
         # iteration; see lisatools.globalfit.noise_ratchet. Unset, the
         # composition below is byte-identical to before.
@@ -1565,11 +1566,12 @@ def build_fit():
                 "against it, and that pass is the stock 'in_model' move.")
         _slots = sample_noise and _ratchet is None
         if _ratchet is not None:
-            _noise = ([Move("vgb_pe", branch="vgb")] if _has_vgb else []) + [
+            _noise = [
                 GatedNoiseSearch(
                     "noise_ratchet_search", _noise_names, _ratchet_delta,
                     branch="psd", num_checks=(_gb_noise_checks or None),
-                    iters_per_step=(_gb_noise_cap or None))]
+                    iters_per_step=(_gb_noise_cap or None))
+            ] + ([Move("vgb_pe", branch="vgb")] if _has_vgb else [])
             print(f"[combined] {name}: GALFOR_RATCHET {_ratchet} -- one gated "
                   f"noise proposal at the head of the iteration, nudge "
                   f"{list(_ratchet_delta)} in the sampled galfor basis; the "

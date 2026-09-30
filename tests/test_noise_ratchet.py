@@ -793,14 +793,16 @@ class CompositionTest(unittest.TestCase):
         fit = self._full(GALFOR_RATCHET="1")
         by = {s.name: s for s in fit.recipe.stages}
         names = self._names(by["gb_search_3"])
-        self.assertEqual(names[:2], ["vgb_pe", "noise_ratchet_search"])
+        # the gate leads; the known VGBs are refined against the noise it
+        # just set (user ruling 2026-09-30: "put vgbs right after the noise")
+        self.assertEqual(names[:2], ["noise_ratchet_search", "vgb_pe"])
         self.assertNotIn("noise_vgb_joint_search", names)
         self.assertEqual([n for n in names if n.startswith("noise_joint_search")], [])
         # the GB cycle itself is untouched
         for n in ("in_model", "rj_fstat_search", "in_model_fstat",
                   "rj_prior_removal", "in_model_removal"):
             self.assertIn(n, names)
-        gate = by["gb_search_3"].moves[1]
+        gate = by["gb_search_3"].moves[0]
         self.assertEqual(sorted(gate.inner_names), ["galfor_pe", "psd_pe"])
         # the in-model follow-up is a declared dependency so it gets BUILT
         self.assertIn("in_model", gate.stock_dependencies())
