@@ -121,8 +121,10 @@ class WaveletLookupTableWrapJAX:
             # parity is bit-tight against the reference path.
             x1 = self.df_interp * fi
             x2 = self.df_interp * (fi + 1)
-            y1 = self.df_interp * fdi
-            y2 = self.df_interp * (fdi + 1)
+            # fdot axis: its own spacing AND offset (was df_interp with no min_fdot;
+            # inert while every table had num_fdot == 1).
+            y1 = self.min_fdot + self.dfdot_interp * fdi
+            y2 = self.min_fdot + self.dfdot_interp * (fdi + 1)
 
             # z_slice is a (num_fdot, num_f) 2-D array; (fdi, fi) are
             # scalars so this gather is just basic indexing.
@@ -131,10 +133,11 @@ class WaveletLookupTableWrapJAX:
             z21 = z_slice[fdi, fi + 1]
             z22 = z_slice[fdi + 1, fi + 1]
 
-            # Bilinear (matches C++; preserves the f_x_y2 typo that uses
-            # z21 in place of z12 for bit-tight parity).
+            # Bilinear. f_x_y2 is the row fdi+1, i.e. corners z12 and z22 (the
+            # historical copy read z21, a typo mirrored from the C++; fix the C++
+            # copy too if it is revived).
             f_x_y1 = (x2 - f_scaled) / (x2 - x1) * z11 + (f_scaled - x1) / (x2 - x1) * z21
-            f_x_y2 = (x2 - f_scaled) / (x2 - x1) * z21 + (f_scaled - x1) / (x2 - x1) * z22
+            f_x_y2 = (x2 - f_scaled) / (x2 - x1) * z12 + (f_scaled - x1) / (x2 - x1) * z22
             f_xy = (y2 - fdot) / (y2 - y1) * f_x_y1 + (fdot - y1) / (y2 - y1) * f_x_y2
             return jnp.where(in_bounds, f_xy, 0.0)
         else:
