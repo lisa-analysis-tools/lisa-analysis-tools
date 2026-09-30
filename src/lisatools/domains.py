@@ -3494,6 +3494,13 @@ class WDMLookupTable(WDMSettings):
     # or globally via env var WDM_BUILD_KIND.
     BUILD_KIND = os.environ.get("WDM_BUILD_KIND", "n_ref_only")
 
+    # n_ref eval rule: "quarter_turn" (derived, see get_wdm_coeffs) or "legacy_2way"
+    # (the historical (-1)^dn + parity swap; negative-control only).
+    BASIS_CYCLE = "quarter_turn"
+    # (fdot, f) interpolation of the n_ref tables: "linear" (historical) or "cubic"
+    # (scipy RegularGridInterpolator; mid-node fdot error converges far faster).
+    INTERP_METHOD = os.environ.get("WDM_LOOKUP_INTERP", "linear")
+
     def __init__(self, settings: WDMSettings, nchannels: int, m_ref: int = None, norm_freq_single_layer: np.ndarray = None, m_diffs: np.ndarray = None, fdot_vals: np.ndarray = None, store_path: Optional[str] = None, batch_size_gen: Optional[int] = 20, td_window: Optional[np.ndarray] = None, verbose: bool = False, build_kind: Optional[str] = None, time_layers: Optional[int] = None):
         WDMSettings.__init__(self, *settings.args, **settings.kwargs)
         # TODO: CHECK FIRST AND LAST TIME LAYERS DUE TO TIME WINDOWING?
@@ -4173,7 +4180,7 @@ class WDMLookupTable(WDMSettings):
                 return interpolate.RegularGridInterpolator(
                     (self.fdot_vals, self.f_vals_norm),
                     table,
-                    method="linear",
+                    method=self.INTERP_METHOD,
                     bounds_error=False,
                     fill_value=0.0,
                 )
@@ -4247,6 +4254,28 @@ class WDMLookupTable(WDMSettings):
         cos_coeffs[np.isnan(cos_coeffs)] = 0.0
         return (sin_coeffs, cos_coeffs)
 
+    def _sin_unbaked_coeffs(self, f_norm, fdot):
+        """Sin-table value with the build's (-1)^block bake undone at the nodes.
+
+        block = floor(f_norm / layer_df) of each NODE; undoing it node-wise makes the
+        stored function continuous across block seams, so linear interpolation is
+        valid everywhere (built lazily, once).
+        """
+        if getattr(self, "_sin_unbaked_interp", None) is None:
+            raw = self.xp.imag(self.table_cx) if self.build_kind == "n_ref_complex" else self.table_sin
+            raw = self.xp.asarray(raw).copy()
+            node_block = self.xp.floor(self.f_vals_norm / self.layer_df + 1e-9).astype(int)
+            sign = self.xp.where(node_block % 2 != 0, -1.0, 1.0)
+            raw = raw * sign.reshape((1,) * (raw.ndim - 1) + (-1,))
+            self._sin_unbaked_interp = self.build_interpolator(raw)
+        if self.run_fdot:
+            out = self._sin_unbaked_interp(self.xp.stack([fdot, f_norm], axis=-1))
+        else:
+            out = self._sin_unbaked_interp(f_norm)
+        out = self.xp.asarray(out)
+        out[self.xp.isnan(out)] = 0.0
+        return out
+
     def get_wdm_coeffs(self, amp_arr: np.ndarray, phi_arr: np.ndarray, f_arr: np.ndarray, fdot_arr: np.ndarray, n_arr: np.ndarray, num_m_layers: int = 1):
         """Compute WDM coefficients using the universal-table 2-layer-per-element rule.
 
@@ -4291,18 +4320,28 @@ class WDMLookupTable(WDMSettings):
             # The n_ref_complex storage packs (cos, sin) into (Re, Im) of
             # table_cx after the same build-time heroics; the eval path
             # below reuses the real-path branch unchanged.
+            if self.build_kind in ("n_ref_only", "n_ref_complex") and self.BASIS_CYCLE == "quarter_turn":
+                # Derived numerically (scripts/wdm/derive_basis_cycle.py; worst 1.4e-5 of
+                # the peak over 2688 (pixel, offset, fdot) samples in 6 offset blocks):
+                # the stored chirp (sin) term carries a (-1)^block bake, then pixels of odd
+                # (m - m_ref) + (n - n_ref) take a -90 degree turn (c, s) -> (s, -c).
+                # No other sign: the raw table values already carry the build's baking.
+                # s from the seam-continuous table (block sign undone at the nodes): a
+                # per-pixel flip of interpolated values is wrong inside the one-step
+                # interval straddling each block seam (f exactly on a layer boundary).
+                s_eff = self._sin_unbaked_coeffs(f_norm, fdot_arr[keep_now])
+                odd = ((ms_to_use[keep_now] - self.m_ref) + (n_arr[keep_now] - self.n_ref)) % 2 != 0
+                cos_coeffs = self.xp.where(odd, s_eff, _cos_coeffs)
+                sin_coeffs = self.xp.where(odd, -_cos_coeffs, s_eff)
+                wdm_coeffs_out[keep_now, i] = amp_arr[keep_now] * (
+                    cos_coeffs * self.xp.cos(phi_arr[keep_now]) - sin_coeffs * self.xp.sin(phi_arr[keep_now])
+                )   # cos(x + phi) = cos x cos phi - sin x sin phi; (c, s) = responses to cos x, sin x
+                m_map[keep_now, i] = ms_to_use[keep_now]
+                continue
+
             if self.build_kind in ("n_ref_only", "n_ref_complex"):
-                # Plan A — n-translation from per_n_at_n_ref to per_n_at_n_eval.
-                # Currently only the (-1)^dn parity sign is applied; this is
-                # exact for fdot=0 sources and an approximation for chirp.
-                # Note re fdot: the fdot dependence enters at BUILD time
-                # (each table cell stores the response for a chirp source
-                # with that fdot) and at EVAL time via the per-pixel
-                # instantaneous frequency f_arr = f0 + fdot·τ + the
-                # caller-passed phi_t which already includes the chirp
-                # accumulated phase. No additional per-pixel chirp
-                # rotation here — I tried R(±π·fdot·τ²) and it broke
-                # both fdot=0 (regression) and made fdot != 0 worse.
+                # legacy_2way (historical, stalled at mm ~0.5); kept ONLY as the
+                # negative control of tests/test_wdm_lookup_basis_cycle.py.
                 _dn_sign = self.xp.where(
                     ((n_arr[keep_now] - self.n_ref) % 2 == 1), -1.0, 1.0
                 )
