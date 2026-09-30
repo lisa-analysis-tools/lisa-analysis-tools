@@ -114,5 +114,53 @@ class HarmonicTrackTest(unittest.TestCase):
         np.testing.assert_allclose(h_sum, ref, rtol=1e-12)
 
 
+class HandoffTest(unittest.TestCase):
+    """A7: handoff on the cubic (curvature) term OR the fdot range, whichever fires first;
+    a chunk whose intra-chunk sweep passes the SOBBH-measured collapse raises."""
+
+    def setUp(self):
+        from lisatools.sources.emri import wdm_direct as wd
+
+        self.wd = wd
+        self.layer_dt, self.layer_df = 3600.0, 1.0 / 7200.0
+
+    def _track(self, fdot, fddot, P=100):
+        t = np.arange(P) * self.layer_dt
+        z = np.zeros(P)
+        return self.wd.HarmonicTrack((2, 2, 0, 0), t, np.ones(P), z, z + 1e-3,
+                                     np.broadcast_to(fdot, (P,)).astype(float),
+                                     np.broadcast_to(fddot, (P,)).astype(float))
+
+    def test_curvature_trips_before_range(self):
+        tau = self.wd.WDM_HALF_SUPPORT_LAYERS * self.layer_dt
+        fddot = 0.2 / ((np.pi / 3) * tau ** 3)
+        tr = self._track(1e-8, fddot)
+        self.assertEqual(self.wd.handoff_pixel(tr, self.layer_dt, self.layer_df, 8 * self.layer_df / self.layer_dt), 0)
+
+    def test_range_trips_when_fdot_leaves_axis(self):
+        tr = self._track(1e-6, 0.0)
+        self.assertEqual(self.wd.handoff_pixel(tr, self.layer_dt, self.layer_df, 3.086e-7), 0)
+
+    def test_handoff_is_first_trip_along_the_track(self):
+        fdot = np.linspace(0.0, 1e-6, 100)          # leaves a 3.086e-7 axis at pixel 31
+        tr = self._track(fdot, 0.0)
+        n = self.wd.handoff_pixel(tr, self.layer_dt, self.layer_df, 3.086e-7)
+        self.assertEqual(n, int(np.argmax(fdot > 3.086e-7)))
+
+    def test_no_trip_for_slow_source(self):
+        tr = self._track(1e-11, 1e-19)
+        self.assertEqual(self.wd.handoff_pixel(tr, self.layer_dt, self.layer_df, 3.086e-7), 100)
+
+    def test_kappa_raises_past_collapse(self):
+        with self.assertRaises(ValueError):
+            self.wd.assert_chunk_kappa(fdot_max=1e-6, fddot_max=1e-9, Nt_sub=64,
+                                       layer_dt=self.layer_dt, layer_df=self.layer_df)
+
+    def test_kappa_passes_slow_chunk(self):
+        k = self.wd.assert_chunk_kappa(fdot_max=1e-10, fddot_max=0.0, Nt_sub=64,
+                                       layer_dt=self.layer_dt, layer_df=self.layer_df)
+        self.assertLess(k, self.wd.CHUNK_KAPPA_MAX)
+
+
 if __name__ == "__main__":
     unittest.main()

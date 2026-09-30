@@ -72,15 +72,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fdot-max-factor", type=float, default=8.0)
 
     # Build knobs
-    p.add_argument("--build-kind", choices=("n_ref_only", "per_n"),
-                   default="n_ref_only")
+    p.add_argument("--build-kind", choices=("n_ref_complex", "n_ref_only", "per_n"),
+                   default="n_ref_complex",
+                   help="n_ref_complex: one complex transform per entry (2x faster than "
+                        "n_ref_only, same table); per_n cannot hold an fdot axis.")
     p.add_argument("--time-layers", type=int, default=256,
                    help="Nt of the synthetic transform used during build "
                         "(n_ref_only only; smaller = faster, must be even).")
     p.add_argument("--batch-size", type=int, default=20)
     p.add_argument("--nchannels", type=int, default=3)
-    p.add_argument("--backend", default="gpu",
-                   help="lisatools backend: cpu, cuda11x, cuda12x, cuda13x, cuda, gpu.")
+    p.add_argument("--backend", default=None,
+                   help="lisatools backend: cpu, cuda11x, cuda12x, cuda13x, cuda, gpu. "
+                        "Default: gpu if available, else cpu.")
 
     # Output
     p.add_argument("--out", required=True, help="Output HDF5 path.")
@@ -91,6 +94,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.backend is None:
+        args.backend = "gpu" if lisatools.has_backend("gpu") else "cpu"
 
     if not lisatools.has_backend(args.backend):
         raise SystemExit(
@@ -159,13 +164,17 @@ def main() -> None:
         store_path=args.out,
         batch_size_gen=args.batch_size,
         build_kind=args.build_kind,
-        time_layers=args.time_layers if args.build_kind == "n_ref_only" else None,
+        # both n_ref kinds build on a short sub grid (was n_ref_only only: complex builds
+        # silently used the full Nt, 32x the samples per entry at Nt=1024 vs 32)
+        time_layers=args.time_layers if args.build_kind in ("n_ref_only", "n_ref_complex") else None,
         verbose=True,
     )
 
-    print("done. table_cos:", table.table_cos.shape,
-          "table_sin:", table.table_sin.shape,
-          "-> wrote", args.out)
+    if args.build_kind == "n_ref_complex":
+        print("done. table_cx:", table.table_cx.shape, "-> wrote", args.out)
+    else:
+        print("done. table_cos:", table.table_cos.shape,
+              "table_sin:", table.table_sin.shape, "-> wrote", args.out)
 
 
 if __name__ == "__main__":

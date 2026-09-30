@@ -56,6 +56,17 @@ class WDMLookupRestoreTest(unittest.TestCase):
         np.testing.assert_allclose(np.real(cx.table_cx), real.table_cos, rtol=0, atol=1e-12 * peak)
         np.testing.assert_allclose(np.imag(cx.table_cx), real.table_sin, rtol=0, atol=1e-7 * peak)
 
+    def test_fdot_on_table_reduces_to_fdot_off_row(self):
+        # the first tables ever built with fdot_vals != [0.0]: the fdot = 0 row of an
+        # fdot-on table must equal the fdot-off table
+        fdot_vals = self.WDMLookupTable.apply_eps_fdot(0.25, self.wdm_set, fdot_max_factor=1.0)
+        self.assertIn(0.0, list(fdot_vals))
+        on = self._build("n_ref_complex", fdot_vals, tag="on")
+        off = self._build("n_ref_complex", np.array([0.0]), tag="off")
+        X_on = np.asarray(on.table_cx).reshape(len(fdot_vals), -1)
+        row0 = int(np.argmin(np.abs(fdot_vals)))
+        np.testing.assert_allclose(X_on[row0], np.asarray(off.table_cx).ravel(), rtol=0, atol=1e-12)
+
     def test_out_of_support_f_norm_raises(self):
         # num_layers_diff=0 -> m_diffs spans only [-1, 0]: the upper neighbour layer of an
         # in-band carrier falls outside the table's frequency support.

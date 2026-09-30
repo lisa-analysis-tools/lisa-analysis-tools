@@ -86,3 +86,76 @@ def harmonic_tracks_from_holder(holder, integrator, t_pixels, *, a, xI0):
             minus.append(HarmonicTrack((int(l), -int(m), -int(k), -int(n)), t_pixels, amp_m,
                                        -ph, -f, -fd, -fdd))
     return tracks + minus
+
+
+# ----------------------------------------------------------------------
+# Handoff from the lookup to the plunge chunk
+# ----------------------------------------------------------------------
+
+#: Half-support of the WDM wavelet in units of layer_dt used by the curvature trigger.
+#: Calibrated against the plunging gate source in Task A6 (see the ledger).
+WDM_HALF_SUPPORT_LAYERS = 1.0
+#: Intra-chunk sweep [layers] beyond which the chunk sheds chirped power SILENTLY
+#: (SOBBH measurement: optimum ~3.5, tolerable to 7, collapse by 14;
+#: globalfit/stock/erebor/source_runtime.py resolve_sobbh_nt_sub).
+CHUNK_KAPPA_MAX = 7.0
+
+
+def handoff_pixel(track, layer_dt, layer_df, fdot_axis_max, tol_rad=0.1):
+    """First pixel index where the local-quadratic lookup stops being valid.
+
+    Trips on the cubic phase term ``(pi/3) |fddot| tau^3 > tol_rad`` (tau = the wavelet
+    half-support) OR on ``|fdot|`` leaving the table's fdot axis, whichever comes
+    first. Never on fdot alone: the dominant harmonic can stay inside the fdot axis
+    and still fail on curvature. Returns ``len(track.t)`` if it never trips.
+    """
+    tau = WDM_HALF_SUPPORT_LAYERS * layer_dt
+    cubic = (np.pi / 3.0) * np.abs(np.asarray(track.fddot)) * tau ** 3
+    trip = (cubic > tol_rad) | (np.abs(np.asarray(track.fdot)) > fdot_axis_max)
+    idx = np.flatnonzero(trip)
+    return int(idx[0]) if idx.size else int(np.asarray(track.t).size)
+
+
+def chunk_kappa(fdot_max, fddot_max, Nt_sub, layer_dt, layer_df):
+    """Carrier sweep across one chunk, in layers: (|fdot| T + |fddot| T^2 / 2) / layer_df."""
+    T = Nt_sub * layer_dt
+    return (abs(fdot_max) * T + 0.5 * abs(fddot_max) * T ** 2) / layer_df
+
+
+def assert_chunk_kappa(fdot_max, fddot_max, Nt_sub, layer_dt, layer_df):
+    """Raise instead of letting a chunk shed chirped power silently."""
+    kappa = chunk_kappa(fdot_max, fddot_max, Nt_sub, layer_dt, layer_df)
+    if kappa > CHUNK_KAPPA_MAX:
+        raise ValueError(
+            f"plunge chunk sweep kappa={kappa:.1f} layers > {CHUNK_KAPPA_MAX}: the chunk would "
+            "shed chirped power silently; shrink Nt_sub or hand off earlier")
+    return kappa
+
+
+def plunge_chunk_wdm(td_tail_fn, n_h, Nt, Nf, dt, Nt_sub=128, n_end=None, ind_max_t=None, backend="cpu"):
+    """WDM of the plunge tail ``[n_h, n_end)`` from ONE even-start chunk.
+
+    Args:
+        td_tail_fn: ``(start_sample, n_samples) -> (nch, n_samples)`` dense TD of the
+            signal over the chunk window only (no window/taper).
+        n_h: first pixel handed off to the chunk; n_end: one past the last pixel to
+            fill (default ``Nt``).
+        ind_max_t: the production time crop's last kept pixel + 1; a chunk reaching
+            past it would carry a tapered tail, so this raises instead.
+    Returns ``(chunk, n0, keep_lo, keep_hi)`` for :func:`lisatools.wdm_het.splice_chunk`.
+    """
+    from ...wdm_het import chunk_start_for_pixels, wdm_chunk_of_td
+
+    n_end = int(Nt if n_end is None else n_end)
+    # Edge contamination decays algebraically from each chunk edge (Nt_sub=128: 0.2 at
+    # the edge, 5e-5 at 16 px, 6e-6 at 24 px; a Tukey does not help) -> discard a
+    # quarter of the chunk on each side (tests/test_wdm_chunk_splice.py measures it).
+    n_pad = Nt_sub // 4
+    n0 = chunk_start_for_pixels(n_h, n_end, Nt, Nt_sub, n_pad)
+    if ind_max_t is not None and n0 + Nt_sub > int(ind_max_t):
+        raise ValueError(
+            f"plunge chunk [{n0}, {n0 + Nt_sub}) runs into the production time crop "
+            f"(ind_max_t={ind_max_t}); it would include tapered/cropped samples")
+    td = td_tail_fn(n0 * int(Nf), int(Nf) * int(Nt_sub))
+    chunk = wdm_chunk_of_td(td, 0, Nf, Nt_sub, dt, backend=backend)
+    return chunk, n0, int(n_h) - n0, n_end - n0
