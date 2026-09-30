@@ -36,8 +36,11 @@ mismatch is the production mode threshold's content loss, not the template metho
 |---|---|---|
 | < 0.90 (lookup) | 0.7-1.0e-4 | ~3e-12 |
 | 0.90-0.99 (chunk) | 0.9-1.4e-5 | ~5e-8 |
-| >= 0.99 (chunk) | ~1e-14 | 1.3-1.7e-3 (open item 1) |
-| whole window | 1.3-1.5e-5 | 4.3-5.2e-4 |
+| >= 0.99 (chunk) | ~1e-14 | 1e-6 to 1.2e-5 (was 1.3-1.7e-3, fixed: plunge-end tail) |
+| whole window | 1.3-1.5e-5 | 3e-7 to 3.8e-6 |
+
+Direct vs production over the whole window: 1.4-1.9e-5 per channel; norm ratios within
+1e-4 (whole window) and 1e-3 (< 0.90 region) of 1.
 
 **Error budget of the lookup** (single harmonic, 170 d, p0 = 10.2): the exact local-chirp
 model is at 1.9e-4 (median, before 0.9 t_plunge), the table's f/fdot interpolation at
@@ -56,10 +59,14 @@ model is at 1.9e-4 (median, before 0.9 t_plunge), the table's f/fdot interpolati
 6. Lookup support must cover offsets [-2, 3] layers; 5 layers per pixel are needed.
 7. An even-start WDM chunk is not exact in its interior: edge contamination decays
    algebraically (0.2 at the edge, 5e-5 at 16 px): discard Nt_sub/4 per side.
+8. At a plunge the on-the-fly response grid ended 720 s early (delay trim at the end of the
+   fine feed): the feed now continues past the stop with zero amplitude (two delay margins).
+9. Retrograde input: FEW maps xI0 < 0 to (-a, +1) before its sign rule; the harmonic tracks
+   now do the same (the old code flipped the phase for the user form).
 
 ## Open items
 
-1. TOF vs production differs by ~1e-3 in the last 1% before plunge (abrupt end).
+1. (resolved) TOF vs production at the abrupt plunge end.
 2. Table resolution: finer fdot rows near 0 (where most pixels sit) to reach the model's
    ~1e-4 per-pixel level; production-grid table (Nf 1440, dt 2.5) on the cluster GPU.
 3. Speed: EMRIDirectWDM is Python per harmonic and channel on CPU (88 s for 38 modes, 16 d).
@@ -68,3 +75,12 @@ model is at 1.9e-4 (median, before 0.9 t_plunge), the table's f/fdot interpolati
    (`few/amplitude/ampinterp2d.py:235`), a ~6 GB transient footprint. One per process.
 5. EMRIs 0, 2-7: their L1 bricks are not on the laptop; run
    `scripts/emri/emri_direct_wdm_mismatch.py --src N` on the cluster.
+6. Neighbour layers per pixel: 5 (num_m_layers=2) hold an EMRI inspiral (fdot mostly
+   < 0.1 layer_df/layer_dt); a chirp at 0.25 units keeps ~1.3% of its power two layers out and
+   loses ~2e-2 rel L2 in layers three out. Make num_m_layers grow with fdot if needed.
+7. Mode selection: EMRIDirectWDM selects modes on a 256-point trajectory over ITS window;
+   the production wrapper selects over its own span from the reference epoch. For a
+   like-for-like comparison on another window, pass the production modes via
+   `mode_selection=[(l, m, k, n), ...]`.
+8. The kappa (intra-chunk sweep) guard was removed: the SOBBH limit is for heterodyned
+   chunks; the plunge chunk is a raw TD->WDM transform, exact through the plunge.

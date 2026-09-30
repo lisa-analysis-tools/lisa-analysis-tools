@@ -10,7 +10,7 @@ START_OFFSET_S after the data start, compare in the WDM domain, per channel X, Y
 * ``prod``: the production response (get_emri_response_wrapper, the 6mo base signal);
 * ``data``: the mojito L1 source-only stream, decimated 2.5 s -> 20 s.
 
-Mismatch 1 - Re(O) (flat, NO maximisation) over pixels at least EDGE layers from the
+Mismatch 1 - Re(O) (flat, NO maximisation) AND the norm ratio |a|/|b| (amplitude safeguard) over pixels at least EDGE layers from the
 window ends (production crops edges too). Appends one JSON line per (src, thresh).
 Env: MOJITO_LIGHT_PATH, NT (layers, default 384 = 16 d), THRESH (default "1e-3").
 """
@@ -97,6 +97,8 @@ def main():
         for tag, a, b in (("direct_data", h_dir, h_data), ("prod_data", h_prod, h_data), ("tof_data", h_tof, h_data),
                           ("direct_prod", h_dir, h_prod), ("direct_tof", h_dir, h_tof), ("tof_prod", h_tof, h_prod)):
             row[f"mm_{tag}"] = [mm(a[c][:, act], b[c][:, act]) for c in range(3)]
+            # the amplitude safeguard: a normalised overlap is blind to an overall scale
+            row[f"amp_{tag}"] = [float(np.linalg.norm(a[c][:, act]) / np.linalg.norm(b[c][:, act])) for c in range(3)]
         with open(args.out, "a") as f:
             f.write(json.dumps(row) + "\n")
         print(json.dumps(row), flush=True)

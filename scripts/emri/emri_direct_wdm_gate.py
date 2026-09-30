@@ -68,9 +68,14 @@ def main():
 
     off = data_t0 - REF
     offset_int = int(round(off / DT))
+    from lisatools.globalfit.stock import erebor
+
+    fit = erebor.get_stock("all_sources")        # the production knobs (see threeway.legacy_wrapper)
+    tdi = TDIConfig(fit.general.tdi_gen_str, force_backend="cpu")
     wg = get_emri_response_wrapper(Tobs=(NF * NT + offset_int) * DT + 4e4, dt=DT, t_start=REF,
                                    t0_shift_to_data=off - offset_int * DT, tdi_config=tdi,
-                                   tdi_chan="XYZ", force_backend="cpu", orbits=orb)
+                                   tdi_chan=fit.general.tdi_chan, order=fit.emri.response_order,
+                                   force_backend="cpu", orbits=orb)
     gen = wg.waveform_gen.waveform_generator
     if args.modes == "all":
         modes = None
@@ -156,7 +161,10 @@ def main():
     for tag, a, b in (("direct-tof", h_dir, h_tof), ("direct-prod", h_dir, h_prod), ("tof-prod", h_tof, h_prod)):
         for c, ch in enumerate("XYZ"):
             vals = [mm(a[c][:, sel], b[c][:, sel]) if np.any(sel) else np.nan for _, sel in regions]
-            print(f"{tag:>12} {ch:>2} " + " ".join(f"{v:11.3e}" for v in vals), flush=True)
+            amps = [np.linalg.norm(a[c][:, sel]) / np.linalg.norm(b[c][:, sel]) if np.any(sel) else np.nan
+                    for _, sel in regions]
+            print(f"{tag:>12} {ch:>2} " + " ".join(f"{v:11.3e}" for v in vals)
+                  + "   amp " + " ".join(f"{r:.6f}" for r in amps), flush=True)
 
 
 if __name__ == "__main__":

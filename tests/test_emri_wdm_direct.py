@@ -75,11 +75,17 @@ class HarmonicTrackTest(unittest.TestCase):
         im = CubicSpline(h.t_arr, h.teuk_modes[:, 0].imag)(self.t_pix)
         np.testing.assert_allclose(tr.amp, (re + 1j * im) * h.ylms[0], rtol=1e-12)
 
-    def test_retrograde_flips_phi_phi_sign(self):
+    def test_retrograde_user_form_is_canonicalised_like_few(self):
+        # FEW first maps xI0 < 0 -> (a, xI0) = (-a, +1) (few/waveform/base.py:208-212), so its
+        # "if a > 0: Phi_phi *= sign(xI0)" never flips for this model: retrograde lives in the
+        # trajectory's a < 0. The user form (a=0.9, xI0=-1) must NOT flip the holder phase.
         integ = _FakeIntegrator()
         retro = self.fn(_fake_holder(self.t_knots), integ, self.t_pix, a=0.9, xI0=-1.0)[0]
-        t = self.t_pix
-        np.testing.assert_allclose(retro.phase, -2 * self._phi(integ, t) + 0.3 * integ.w * t, rtol=1e-12)
+        canon = self.fn(_fake_holder(self.t_knots), integ, self.t_pix, a=-0.9, xI0=1.0)[0]
+        pro = self.fn(_fake_holder(self.t_knots), integ, self.t_pix, a=0.9, xI0=1.0)[0]
+        np.testing.assert_allclose(retro.phase, canon.phase, rtol=1e-14)
+        np.testing.assert_allclose(retro.phase, pro.phase, rtol=1e-14)
+        np.testing.assert_allclose(retro.f, pro.f, rtol=1e-14)
 
     def test_backwards_offset_applied(self):
         integ = _FakeIntegrator()
@@ -115,8 +121,9 @@ class HarmonicTrackTest(unittest.TestCase):
 
 
 class HandoffTest(unittest.TestCase):
-    """A7: handoff on the cubic (curvature) term OR the fdot range, whichever fires first;
-    a chunk whose intra-chunk sweep passes the SOBBH-measured collapse raises."""
+    """A7: handoff on the cubic (curvature) term OR the fdot range, whichever fires first.
+    (No intra-chunk sweep guard: the SOBBH kappa limit is for HETERODYNED chunks; the plunge
+    chunk is a raw TD->WDM transform, exact through the plunge — A8 gate, ~1e-14.)"""
 
     def setUp(self):
         from lisatools.sources.emri import wdm_direct as wd
@@ -151,15 +158,104 @@ class HandoffTest(unittest.TestCase):
         tr = self._track(1e-11, 1e-19)
         self.assertEqual(self.wd.handoff_pixel(tr, self.layer_dt, self.layer_df, 3.086e-7), 100)
 
-    def test_kappa_raises_past_collapse(self):
-        with self.assertRaises(ValueError):
-            self.wd.assert_chunk_kappa(fdot_max=1e-6, fddot_max=1e-9, Nt_sub=64,
-                                       layer_dt=self.layer_dt, layer_df=self.layer_df)
 
-    def test_kappa_passes_slow_chunk(self):
-        k = self.wd.assert_chunk_kappa(fdot_max=1e-10, fddot_max=0.0, Nt_sub=64,
-                                       layer_dt=self.layer_dt, layer_df=self.layer_df)
-        self.assertLess(k, self.wd.CHUNK_KAPPA_MAX)
+class AssemblyTest(unittest.TestCase):
+    """A8: accumulate_harmonic_batch places the lookup before the handoff and the chunk
+    after it, and the sum reproduces the TD->WDM truth of a linear chirp across both."""
+
+    NF, NT, DT = 64, 128, 56.25
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        import tempfile
+
+        from lisatools.domains import TDSettings, TDSignal, WDMLookupTable, WDMSettings
+
+        cls.wdm = WDMSettings(Nf=cls.NF, Nt=cls.NT, dt=cls.DT, force_backend="cpu")
+        nf, md, mr = WDMLookupTable.apply_eps_frequency(0.005, cls.wdm, m_ref=20, num_layers_diff=2)
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.table = WDMLookupTable(cls.wdm, 1, m_ref=mr, norm_freq_single_layer=nf, m_diffs=md,
+                                   fdot_vals=WDMLookupTable.apply_eps_fdot(0.05, cls.wdm, fdot_max_factor=1.0),
+                                   store_path=os.path.join(cls.tmp.name, "t.h5"), batch_size_gen=32,
+                                   build_kind="n_ref_complex", time_layers=64)
+        df, ldt = cls.wdm.layer_df, cls.wdm.layer_dt
+        # a slow chirp (0.05 layer per pixel, on a table node): 5 layers hold its power;
+        # faster chirps need more neighbour layers (open item in docs/emri-direct-wdm.md)
+        cls.f0, cls.fdot, cls.phi0 = 18.2 * df, 0.05 * df / ldt, 0.4
+        N = cls.NF * cls.NT
+        cls.t = np.arange(N) * cls.DT
+        cls.y = np.cos(2 * np.pi * (cls.f0 * cls.t + 0.5 * cls.fdot * cls.t ** 2) + cls.phi0)[None, :]
+        cls.truth = np.asarray(TDSignal(cls.y, TDSettings(N, cls.DT, force_backend="cpu")).transform(cls.wdm).arr)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def _run(self, n_h):
+        from lisatools.sources.emri import wdm_direct as wd
+
+        ldt, ldf = self.wdm.layer_dt, self.wdm.layer_df
+        n_ok = np.arange(40, self.NT - 8)
+        tn = n_ok * ldt
+        f = self.f0 + self.fdot * tn
+        phase = 2 * np.pi * (self.f0 * tn + 0.5 * self.fdot * tn ** 2) + self.phi0
+        fddot = np.where(n_ok >= n_h, 1.0, 0.0)          # trips the curvature trigger at n_h
+        track = wd.HarmonicTrack((2, 2, 0, 0), tn, np.ones_like(tn), phase, f, np.full_like(tn, self.fdot), fddot)
+        tracer = (np.ones((1, 1, tn.size)), phase[None, None], f[None, None], np.full((1, 1, tn.size), self.fdot))
+        tail_td = lambda ts: np.cos(2 * np.pi * (self.f0 * ts + 0.5 * self.fdot * ts ** 2) + self.phi0)[None, None, :]
+        acc = np.zeros((1, self.NF, self.NT))
+        stats = wd.accumulate_harmonic_batch(
+            acc, self.table, [track], tracer, n_ok, tail_td, Nf=self.NF, Nt=self.NT, dt=self.DT,
+            layer_dt=ldt, layer_df=ldf, t0=0.0, Nt_sub=128, num_m_layers=2,
+            fdot_axis_max=float(np.max(np.abs(self.table.fdot_vals))), pixel_edge=8)
+        return acc, stats, n_ok
+
+    def test_lookup_then_chunk_reproduces_truth(self):
+        n_h = 90
+        acc, stats, n_ok = self._run(n_h)
+        self.assertEqual(stats["lookup_pixels"], int(np.sum(n_ok < n_h)))
+        self.assertGreater(stats["chunk_pixels"], 0)
+        sl = slice(40, self.NT - 32)   # the (non-stopping) truth carries grid-end contamination
+        rel = np.linalg.norm(acc[..., sl] - self.truth[..., sl]) / np.linalg.norm(self.truth[..., sl])
+        self.assertLess(rel, 2e-3, f"rel L2 {rel:.2e}")
+        # nothing written before the first tracked pixel
+        self.assertTrue(np.all(acc[..., :32] == 0.0))
+
+    def test_all_lookup_matches_truth_too(self):
+        acc, stats, n_ok = self._run(10 ** 6)          # never hands off
+        self.assertEqual(stats["chunk_pixels"], 0)
+        sl = slice(40, self.NT - 32)   # the (non-stopping) truth carries grid-end contamination
+        rel = np.linalg.norm(acc[..., sl] - self.truth[..., sl]) / np.linalg.norm(self.truth[..., sl])
+        self.assertLess(rel, 2e-3, f"rel L2 {rel:.2e}")
+
+
+class TracerTest(unittest.TestCase):
+    """tracer_from_tof_output: amplitude, phase and analytic f/fdot of a known channel
+    phase; negative-frequency subs mirrored to positive frequency."""
+
+    def test_known_quadratic_phase(self):
+        from lisatools.sources.emri.wdm_direct import tracer_from_tof_output
+
+        f0, fd = 3e-3, 2e-9
+
+        class Out:
+            def eval_spline_vals(self, t):
+                t = np.asarray(t, float)
+                ph = 2 * np.pi * (f0 * t + 0.5 * fd * t ** 2)
+                amp = np.stack([np.full((3, t.size), 2.0), np.full((3, t.size), 1.0)])
+                tdi_phase = np.stack([np.zeros((3, t.size)), np.zeros((3, t.size))])
+                phase_ref = np.stack([ph, -ph])                    # sub 1: negative frequency
+                return amp, tdi_phase, phase_ref
+
+        t = np.linspace(1e5, 2e5, 11)
+        amp, phase, f, fdot = tracer_from_tof_output(Out(), t)
+        ph = 2 * np.pi * (f0 * t + 0.5 * fd * t ** 2)
+        for s_ in (0, 1):
+            np.testing.assert_allclose(f[s_], np.broadcast_to(f0 + fd * t, (3, t.size)), rtol=1e-8)
+            np.testing.assert_allclose(fdot[s_], fd, rtol=1e-6)
+            np.testing.assert_allclose(phase[s_], np.broadcast_to(ph, (3, t.size)), rtol=1e-12)
+        np.testing.assert_allclose(amp[0], 2.0)
 
 
 if __name__ == "__main__":

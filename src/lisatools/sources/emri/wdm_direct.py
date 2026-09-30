@@ -3,7 +3,8 @@
 Harmonic tracks follow FEW's own conventions (few/waveform/base.py:357-364 and
 few/summation/directmodesum.py):
 
-* for ``a > 0`` the azimuthal phase is multiplied by ``sign(xI0)``;
+* ``xI0 < 0`` is first mapped to ``(a, xI0) = (-a, +1)`` as FEW does; then for ``a > 0``
+  the azimuthal phase is multiplied by ``sign(xI0)`` (a no-op after that mapping);
 * for ``integrate_backwards`` the knot-end offset ``Phi[-1] + Phi[0]`` is added;
 * the ``+m`` harmonic is ``Y_lm A e^{-i Phi}``; its ``-m`` partner (holder built with
   ``include_minus_mkn=True``, ``ylms`` of length ``2 * nmodes``) is
@@ -55,6 +56,8 @@ def harmonic_tracks_from_holder(holder, integrator, t_pixels, *, a, xI0):
         a, xI0: spin and inclination cosine (retrograde convention).
     """
     t_pixels = np.asarray(t_pixels, dtype=float)
+    if xI0 < 0:   # FEW's internal convention first (few/waveform/base.py:208-212)
+        a, xI0 = -a, -xI0
     P = [_phase_columns(integrator, t_pixels, k) for k in (0, 1, 2, 3)]
     if a > 0:
         for arr in P:
@@ -99,12 +102,6 @@ def harmonic_tracks_from_holder(holder, integrator, t_pixels, *, a, xI0):
 #: (~3-5e-3) near 0.9 t_plunge, where (pi/3)|fddot| layer_dt^3 ~ 1.2e-3 rad; a 0.1 rad
 #: trigger there needs tau ~ 4 layer_dt (the WDM wavelet's tails are wide).
 WDM_HALF_SUPPORT_LAYERS = 4.0
-#: Intra-chunk sweep [layers] beyond which the chunk sheds chirped power SILENTLY
-#: (SOBBH measurement: optimum ~3.5, tolerable to 7, collapse by 14;
-#: globalfit/stock/erebor/source_runtime.py resolve_sobbh_nt_sub).
-CHUNK_KAPPA_MAX = 7.0
-
-
 def handoff_pixel(track, layer_dt, layer_df, fdot_axis_max, tol_rad=0.1):
     """First pixel index where the local-quadratic lookup stops being valid.
 
@@ -118,22 +115,6 @@ def handoff_pixel(track, layer_dt, layer_df, fdot_axis_max, tol_rad=0.1):
     trip = (cubic > tol_rad) | (np.abs(np.asarray(track.fdot)) > fdot_axis_max)
     idx = np.flatnonzero(trip)
     return int(idx[0]) if idx.size else int(np.asarray(track.t).size)
-
-
-def chunk_kappa(fdot_max, fddot_max, Nt_sub, layer_dt, layer_df):
-    """Carrier sweep across one chunk, in layers: (|fdot| T + |fddot| T^2 / 2) / layer_df."""
-    T = Nt_sub * layer_dt
-    return (abs(fdot_max) * T + 0.5 * abs(fddot_max) * T ** 2) / layer_df
-
-
-def assert_chunk_kappa(fdot_max, fddot_max, Nt_sub, layer_dt, layer_df):
-    """Raise instead of letting a chunk shed chirped power silently."""
-    kappa = chunk_kappa(fdot_max, fddot_max, Nt_sub, layer_dt, layer_df)
-    if kappa > CHUNK_KAPPA_MAX:
-        raise ValueError(
-            f"plunge chunk sweep kappa={kappa:.1f} layers > {CHUNK_KAPPA_MAX}: the chunk would "
-            "shed chirped power silently; shrink Nt_sub or hand off earlier")
-    return kappa
 
 
 def plunge_chunk_wdm(td_tail_fn, n_h, Nt, Nf, dt, Nt_sub=128, n_end=None, ind_max_t=None, backend="cpu"):
@@ -198,6 +179,63 @@ def tracer_from_tof_output(out, t_pixels, h=30.0, h_fdot=None):
     return amp, np.where(neg, -ph0, ph0), np.where(neg, -f, f), np.where(neg, -fdot, fdot)
 
 
+def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, Nt, dt, layer_dt,
+                              layer_df, t0, Nt_sub=128, num_m_layers=2, fdot_axis_max=np.inf,
+                              pixel_edge=8, backend="cpu"):
+    """Add one batch of harmonics to ``acc`` (``(nch, Nf, Nt)``, global layers x pixels).
+
+    Per sub ``s`` (``tracks[s]``, tracer row ``s``): the n_ref lookup on pixels before its
+    handoff pixel, then even-start chunks of its own dense TD over ``[n_h, n_end)``
+    (``n_end`` = a quarter chunk past the last tracked pixel: the abrupt stop at plunge
+    rings ~24 px). The tail TD is evaluated ONCE per chunk window for all subs that need it
+    (``tail_td(ts) -> (num_sub, nch, ts.size)``, zero outside the response support) and
+    chunks are added in place over their kept slice (no full-grid temporaries).
+
+    Args:
+        tracer: ``(amp, phase, f, fdot)`` from :func:`tracer_from_tof_output`,
+            each ``(num_sub, nch, n_ok.size)``.
+        n_ok: pixel indices of the tracer/track samples (ascending).
+        t0: absolute time of pixel 0.
+    Returns a stats dict (lookup pixels, chunk pixels, pixels dropped before the handoff
+    because the channel fdot left the table or f was below 2 layers).
+    """
+    from ...wdm_het import tail_chunk_plan, wdm_chunk_of_td
+
+    amp, phase, f, fdot = tracer
+    nch = amp.shape[1]
+    n_ok = np.asarray(n_ok)
+    stats = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
+    windows = {}
+    for s, tr in enumerate(tracks):
+        k_h = handoff_pixel(tr, layer_dt, layer_df, fdot_axis_max)
+        before = np.arange(n_ok.size) < k_h
+        for ch in range(nch):
+            sel = before & (np.abs(fdot[s, ch]) <= fdot_axis_max) & (f[s, ch] > 2 * layer_df)
+            stats["dropped_pixels"] += int(np.sum(before & ~sel))
+            if np.any(sel):
+                co, mm = table.get_wdm_coeffs(amp[s, ch, sel], phase[s, ch, sel], f[s, ch, sel],
+                                              fdot[s, ch, sel], n_ok[sel], num_m_layers=num_m_layers,
+                                              out_of_support="zero")
+                co, mm = np.asarray(co), np.asarray(mm)
+                for c in range(co.shape[1]):
+                    good = mm[:, c] >= 0
+                    np.add.at(acc[ch], (mm[good, c], n_ok[sel][good]), co[good, c])
+                stats["lookup_pixels"] += int(sel.sum())
+        if k_h < n_ok.size:
+            n_h = int(n_ok[k_h])
+            n_end = min(int(n_ok[-1]) + 1 + Nt_sub // 4, Nt - pixel_edge)
+            for n0, klo, khi in tail_chunk_plan(n_h, n_end, Nt, Nt_sub):
+                windows.setdefault(n0, []).append((s, klo, khi))
+    for n0, items in windows.items():
+        ts = t0 + (n0 * Nf + np.arange(Nf * Nt_sub)) * dt
+        td_all = np.asarray(tail_td(ts))                     # one evaluation per window
+        for s, klo, khi in items:
+            chunk = np.asarray(wdm_chunk_of_td(td_all[s], 0, Nf, Nt_sub, dt, backend=backend))
+            acc[:, :chunk.shape[-2], n0 + klo:n0 + khi] += chunk[:, :, klo:khi]   # chunk rows = global layers
+            stats["chunk_pixels"] += khi - klo
+    return stats
+
+
 class EMRIDirectWDM:
     """EMRI template built directly in the WDM domain.
 
@@ -256,7 +294,6 @@ class EMRIDirectWDM:
 
     def __call__(self, *few_args, **few_kwargs):
         from ...domains import WDMSignal
-        from ...wdm_het import splice_chunk, tail_chunk_plan, wdm_chunk_of_td
         from .emritdionfly import EMRITDIonFly
 
         wdm = self.wdm
@@ -265,13 +302,12 @@ class EMRIDirectWDM:
         n_all = np.arange(self.pixel_edge, Nt - self.pixel_edge)
         t_pix = self.data_t0 + n_all * ldt
         T_traj = self.data_t0 - self.t_start + span + 2000.0
-        acc = np.zeros((3, Nf, Nt))
-        n_pad = self.Nt_sub // 4
+        acc = np.zeros((self.tdi_config.nchannels, Nf, Nt))
         few_kwargs = dict(few_kwargs)
         modes = few_kwargs.pop("mode_selection", None)      # explicit (l, m, k, n) list, e.g. gates
         if modes is None:
             modes = self._mode_list(few_args, few_kwargs)
-        n_lookup = n_chunk_px = 0
+        totals = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
         few_kwargs.pop("mode_selection_threshold", None)
 
         for j in range(0, len(modes), self.mode_batch):
@@ -288,43 +324,23 @@ class EMRIDirectWDM:
             if n_ok.size == 0:
                 continue
             tracks = harmonic_tracks_from_holder(H, integ, tt - self.t_start, a=few_args[2], xI0=few_args[5])
-            amp, phase, f, fdot = tracer_from_tof_output(out, tt)
-            assert amp.shape[0] == len(tracks), (amp.shape, len(tracks))
-            # dense TD of every sub over the tail region (chunks), evaluated lazily below
-            for s, tr in enumerate(tracks):
-                k_h = handoff_pixel(tr, ldt, ldf, self.fdot_axis_max)
-                for ch in range(3):
-                    sel = np.arange(n_ok.size) < k_h
-                    sel &= np.abs(fdot[s, ch]) <= self.fdot_axis_max
-                    sel &= f[s, ch] > 2 * ldf
-                    if np.any(sel):
-                        co, mm = self.table.get_wdm_coeffs(amp[s, ch, sel], phase[s, ch, sel], f[s, ch, sel],
-                                                           fdot[s, ch, sel], n_ok[sel], num_m_layers=self.num_m_layers,
-                                                           out_of_support="zero")
-                        co, mm = np.asarray(co), np.asarray(mm)
-                        for c in range(co.shape[1]):
-                            good = mm[:, c] >= 0
-                            np.add.at(acc[ch], (mm[good, c], n_ok[sel][good]), co[good, c])
-                        n_lookup += int(sel.sum())
-                if k_h < n_ok.size:
-                    # the waveform stops abruptly at plunge: the transform of that stop rings
-                    # ~24 px past it (production has the same stop) -> run the chunk tiling a
-                    # quarter chunk beyond the last trajectory pixel (td is 0 there)
-                    n_h = int(n_ok[k_h])
-                    n_end = min(int(n_ok[-1]) + 1 + self.Nt_sub // 4, Nt - self.pixel_edge)
-                    for n0, klo, khi in tail_chunk_plan(n_h, n_end, Nt, self.Nt_sub):
-                        ts = self.data_t0 + (n0 * Nf + np.arange(Nf * self.Nt_sub)) * dt
-                        live = (ts > x[s, 0]) & (ts < x[s, -1])
-                        td = np.zeros((3, ts.size))
-                        if np.any(live):
-                            td[:, live] = np.asarray(out.eval_tdi(ts[live]))[s]
-                        chunk = np.asarray(wdm_chunk_of_td(td, 0, Nf, self.Nt_sub, dt, backend=self.force_backend))
-                        full_chunk = np.zeros((3, Nf, self.Nt_sub))
-                        full_chunk[:, :chunk.shape[-2], :] = chunk   # chunk grid is full-band: rows = global layers
-                        tmp = np.zeros_like(acc)
-                        splice_chunk(tmp, full_chunk, n0, klo, khi)
-                        acc += tmp
-                        n_chunk_px += khi - klo
+            tracer = tracer_from_tof_output(out, tt)
+            assert tracer[0].shape[0] == len(tracks), (tracer[0].shape, len(tracks))
+            x_lo, x_hi = x[:, 0][:, None, None], x[:, -1][:, None, None]
+
+            def tail_td(ts, out=out, x_lo=x_lo, x_hi=x_hi):
+                live = (ts > x_lo.max()) & (ts < x_hi.min())
+                td = np.zeros((x.shape[0], tracer[0].shape[1], ts.size))
+                if np.any(live):
+                    td[:, :, live] = np.asarray(out.eval_tdi(ts[live]))
+                return td
+
+            st = accumulate_harmonic_batch(
+                acc, self.table, tracks, tracer, n_ok, tail_td, Nf=Nf, Nt=Nt, dt=dt, layer_dt=ldt,
+                layer_df=ldf, t0=self.data_t0, Nt_sub=self.Nt_sub, num_m_layers=self.num_m_layers,
+                fdot_axis_max=self.fdot_axis_max, pixel_edge=self.pixel_edge, backend=self.force_backend)
+            for key in totals:
+                totals[key] += st[key]
             del out, fly
-        self.last_stats = dict(modes=len(modes), lookup_pixels=n_lookup, chunk_pixels=n_chunk_px)
+        self.last_stats = dict(modes=len(modes), **totals)
         return WDMSignal(acc, wdm)

@@ -157,16 +157,20 @@ def legacy_wrapper(orb, data_t0):
     Returns ``(wrapper, offset_int, few_generator)``; the FEW generator inside is
     reused by the TOF so the process holds a single FEW construction.
     """
+    from lisatools.globalfit.stock import erebor
     from lisatools.response.tdiconfig import TDIConfig
     from lisatools.sources.emri.response import get_emri_response_wrapper
 
+    # the production knobs, read from the stock fit the 6mo run is built from (construction
+    # is validation-only; env overrides set by the launchers are honoured)
+    fit = erebor.get_stock("all_sources")
     off = data_t0 - REF
     offset_int = int(round(off / DT))
     wg = get_emri_response_wrapper(
         Tobs=(N_WIN + offset_int) * DT + LEG_TAIL_S, dt=DT, t_start=REF,
         t0_shift_to_data=off - offset_int * DT,
-        tdi_config=TDIConfig("2nd generation", force_backend="cpu"), tdi_chan="XYZ",
-        force_backend="cpu", orbits=orb)
+        tdi_config=TDIConfig(fit.general.tdi_gen_str, force_backend="cpu"), tdi_chan=fit.general.tdi_chan,
+        order=fit.emri.response_order, force_backend="cpu", orbits=orb)
     return wg, offset_int, wg.waveform_gen.waveform_generator
 
 
