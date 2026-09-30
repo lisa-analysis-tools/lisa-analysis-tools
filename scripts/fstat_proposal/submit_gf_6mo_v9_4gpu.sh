@@ -3360,7 +3360,25 @@ export GB_TEMPER_ON_REMOVAL=1      # band swaps run inside rj_prior_removal
 # (recipe.py) and resolved by name in every stage, and the per-stage
 # profile writes only opt_snr / phase_maximize / peak_min_snr. It cannot
 # vary per stage.
-export GB_SEARCH_PRIOR_REMOVAL_ONLY=1
+# ⚠ AND IT CANNOT BE MADE TO, cheaply. rj_removal_only IS read at
+# propose time (gbspecialstretch :7295 and four more), so flipping it on
+# stage entry would work -- but SearchStageProfileStep._apply_profile
+# writes its profile to EVERY GB move in the stage tree, and this
+# attribute is not safe to broadcast: on rj_fstat_search, True makes
+# apply_inds true (alive rows only => NO births at all, silently
+# gutting the search), and rj_removal_only with rj_replace RAISES
+# (:4383). A per-stage form therefore needs move-SCOPED profile
+# entries, which _apply_profile has no concept of -- real plumbing with
+# a loud failure mode, not a table row like GB_SEARCH_3_OPT_SNR.
+#
+# OVERRIDABLE FROM THE COMMAND LINE (2026-09-29, Mike: "let's also
+# adjust the gb search 3 stage prior removal to be not just removal
+# only"). The hard-coded value meant an exported 0 could not reach the
+# run at all. Default unchanged; the stage-3 test passes 0, and because
+# the store resumes INSIDE stage 3 the global scope is not a problem
+# for it.
+export GB_SEARCH_PRIOR_REMOVAL_ONLY=${GB_SEARCH_PRIOR_REMOVAL_ONLY:-1}
+echo "[GB-PRIOR-REMOVAL] GB_SEARCH_PRIOR_REMOVAL_ONLY=${GB_SEARCH_PRIOR_REMOVAL_ONLY} (1 = deaths only; 0 = prior births AND deaths, ALL search stages)"
 # High-f barren-band birth shutoff (search scope): bands above FMIN with
 # AFTER consecutive zero-birth-accept proposes stop proposing births
 # (deaths + in-model continue; [GB_BAND_SHUTOFF] log line per band).

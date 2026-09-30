@@ -187,3 +187,67 @@ class TheValueReachesTheMovesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PriorRemovalKnobIsOverridableTest(unittest.TestCase):
+    """The second half of the same stage-3 experiment.
+
+    Mike, 2026-09-29: "let's also adjust the gb search 3 stage prior
+    removal to be not just removal only." That is
+    ``rj_prior_removal``'s ``rj_removal_only``
+    (``GB_SEARCH_PRIOR_REMOVAL_ONLY``, default 1 = deaths only; 0 =
+    prior births AND deaths). Both launchers hard-coded ``=1``, so an
+    exported 0 could not reach the run at all.
+
+    ⚠ NO PER-STAGE FORM, and the reason is not cost. ``rj_removal_only``
+    IS read at propose time, so flipping it on stage entry would work --
+    but ``_apply_profile`` writes its profile to EVERY GB move in the
+    stage tree, and this attribute is not safe to broadcast: ``True`` on
+    ``rj_fstat_search`` sets ``apply_inds`` (alive rows only, so NO
+    births at all) and ``rj_removal_only`` with ``rj_replace`` raises.
+    """
+
+    SCRIPTS = ("submit_gf_6mo_v9_4gpu.sh", "submit_gf_3mo_v9_2gpu.sh")
+    VAR = "GB_SEARCH_PRIOR_REMOVAL_ONLY"
+
+    def _line(self, script):
+        for ln in (REPO / "scripts" / "fstat_proposal" / script
+                   ).read_text().splitlines():
+            if ln.startswith(f"export {self.VAR}="):
+                return ln
+        self.fail(f"{script} does not export {self.VAR}")
+
+    def _resolve(self, script, preset=None):
+        """Run the export line in a real shell and read the result."""
+        import subprocess
+        env = dict(os.environ)
+        env.pop(self.VAR, None)
+        if preset is not None:
+            env[self.VAR] = preset
+        out = subprocess.run(
+            ["bash", "-c", f'{self._line(script)}; echo "${self.VAR}"'],
+            capture_output=True, text=True, env=env, check=True)
+        return out.stdout.strip()
+
+    def test_both_launchers_keep_the_default_when_it_is_unset(self):
+        for s in self.SCRIPTS:
+            self.assertEqual(self._resolve(s), "1", s)
+
+    def test_a_command_line_value_REACHES_the_run(self):
+        """The whole point: the hard-coded form swallowed this."""
+        for s in self.SCRIPTS:
+            self.assertEqual(self._resolve(s, preset="0"), "0", s)
+
+    def test_the_hard_coded_form_is_gone_from_both(self):
+        for s in self.SCRIPTS:
+            self.assertNotEqual(self._line(s), f"export {self.VAR}=1", s)
+            self.assertIn(":-1}", self._line(s), s)
+
+    def test_the_resolved_value_is_echoed_for_the_run_log(self):
+        for s in self.SCRIPTS:
+            txt = (REPO / "scripts" / "fstat_proposal" / s).read_text()
+            self.assertIn("[GB-PRIOR-REMOVAL]", txt, s)
+
+    def test_the_twins_agree(self):
+        self.assertEqual(self._line(self.SCRIPTS[0]),
+                         self._line(self.SCRIPTS[1]))
