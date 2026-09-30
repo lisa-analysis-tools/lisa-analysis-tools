@@ -229,6 +229,81 @@ def compute_wdm_window(Nf, Nt_sub, dt, backend="cpu"):
 
 
 # ----------------------------------------------------------------------
+# Source-agnostic single-chunk primitives (EMRI plunge chunk)
+# ----------------------------------------------------------------------
+
+def wdm_chunk_of_td(td_arr, start_sample, Nf, Nt_sub, dt, backend="cpu"):
+    """TD->WDM of ONE contiguous chunk of ``Nf * Nt_sub`` samples, no window.
+
+    Lifted from scripts/diagnostics/check_shortened_wdm.py (``wdm_of_td_slice``)
+    with the Tukey removed: the chunk EXCLUDES the global taper (the chunked-het
+    edge rule), and the lookup side never sees a window. Start on an EVEN global
+    pixel (``start_sample = n0 * Nf``, ``n0`` even) or the real WDM differs from
+    the full transform; discard ``n_pad`` pixels at each edge.
+    Returns the chunk's ``(nch, Nf_active, Nt_sub)`` coefficient array.
+    """
+    from .domains import TDSettings, TDSignal, WDMSettings  # domains imports this module
+
+    n = int(Nf) * int(Nt_sub)
+    sub = td_arr[..., int(start_sample):int(start_sample) + n]
+    if sub.shape[-1] != n:
+        raise ValueError(f"chunk needs {n} samples from {start_sample}, got {sub.shape[-1]}")
+    sig = TDSignal(sub, TDSettings(n, dt, force_backend=backend)).transform(
+        WDMSettings(Nf=int(Nf), Nt=int(Nt_sub), dt=dt, force_backend=backend))
+    return sig.arr
+
+
+def chunk_start_for_pixels(n_lo, n_hi, Nt, Nt_sub, n_pad):
+    """EVEN global start pixel ``n0`` with ``[n_lo, n_hi)`` inside
+    ``[n0 + n_pad, n0 + Nt_sub - n_pad)`` (the last chunk of the grid may keep its
+    right edge: nothing follows it). Raises if no such chunk exists."""
+    n_lo, n_hi, Nt, Nt_sub, n_pad = map(int, (n_lo, n_hi, Nt, Nt_sub, n_pad))
+    # the last n_pad pixels of the grid can only come from the grid-end chunk
+    right_pad = 0 if n_hi > Nt - n_pad else n_pad
+    if n_hi - n_lo > Nt_sub - n_pad - right_pad:
+        raise ValueError(
+            f"pixels [{n_lo}, {n_hi}) exceed the chunk interior ({Nt_sub - n_pad - right_pad}); "
+            "use a larger Nt_sub")
+    # valid starts: the chunk must reach n_hi (n0 >= lower) and keep n_lo inside its left
+    # pad (n0 <= upper; the grid-start chunk may keep pixels from 0); pick the lowest EVEN
+    lower = max(0, n_hi - (Nt_sub - right_pad))
+    upper = min(n_lo - n_pad if n_lo >= n_pad else 0, Nt - Nt_sub)
+    # keeping the right edge is only valid for the chunk that ENDS at the grid end
+    n0 = (Nt - Nt_sub) if right_pad == 0 else lower + (lower % 2)
+    if n0 > upper or n0 < lower or n0 % 2:
+        raise ValueError(f"no even-start chunk of {Nt_sub} covers [{n_lo}, {n_hi}) with n_pad={n_pad}")
+    return n0
+
+
+def tail_chunk_plan(n_lo, n_hi, Nt, Nt_sub):
+    """Tile ``[n_lo, n_hi)`` with even-start chunks: list of ``(n0, keep_lo, keep_hi)``.
+
+    Each chunk keeps its interior ``[n_pad, Nt_sub - n_pad)`` (``n_pad = Nt_sub // 4``;
+    the grid-end chunk keeps through its end). The step is the interior minus 2 so the
+    even-start constraint always fits.
+    """
+    n_pad = Nt_sub // 4
+    plan = []
+    start = int(n_lo)
+    while start < n_hi:
+        stop = min(int(n_hi), start + Nt_sub - 2 * n_pad - 2)
+        if stop > Nt - n_pad:                # the grid-end chunk takes the rest
+            stop = int(n_hi)
+        n0 = chunk_start_for_pixels(start, stop, Nt, Nt_sub, n_pad)
+        plan.append((n0, start - n0, stop - n0))
+        start = stop
+    return plan
+
+
+def splice_chunk(out, chunk, n0, keep_lo, keep_hi):
+    """Raw-assignment splice ``out[..., n0+keep_lo : n0+keep_hi] = chunk[..., keep_lo:keep_hi]``.
+
+    Not ``add_signal``: ``domains._apply_wdm_add`` has no partial-overlap path.
+    """
+    out[..., int(n0) + int(keep_lo):int(n0) + int(keep_hi)] = chunk[..., int(keep_lo):int(keep_hi)]
+
+
+# ----------------------------------------------------------------------
 # Layer-grouping (narrow-band GB inner product)
 # ----------------------------------------------------------------------
 
