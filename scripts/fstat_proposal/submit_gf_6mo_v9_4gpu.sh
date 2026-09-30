@@ -1508,7 +1508,13 @@ export GB_INMODEL_GROUP=1
 # >>> three quarters of it cannot retire a single band. Dropping to 2
 # >>> removes one full warm-up pass (~3.3M rep*src, ~24% of the move) and
 # >>> lets bands shut at pass 3 instead of pass 4.
-export GB_INMODEL_GROUP_ITERS=2
+# >>> 2 -> 3 (user ruling 2026-10-01, "for now", for the ratcheted
+# >>> gb_search_3 relaunch): the noise is MOVING in that stage (nudge /
+# >>> release), so a sub-band's per-pass gain is judged against a
+# >>> residual that just changed under it; one more pass of history
+# >>> before a sub-band can retire. The per-repeat bar goes back to
+# >>> 4.0/(3*25) = 0.0533 lnL/repeat (see the CONSEQUENCE note below).
+export GB_INMODEL_GROUP_ITERS=3
 # D/2 again, and FLAT per sub-band (user ruling): "When a source is birthed,
 # it is per-source. During the special in-model only proposals it is
 # per-sub-band. I want flat D/2. This will focus more resources on the

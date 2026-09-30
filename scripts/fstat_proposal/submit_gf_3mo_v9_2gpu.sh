@@ -1607,7 +1607,10 @@ export GB_INMODEL_GROUP=1
 # window is in PASSES and dll stays at D/2, so this tightens the rate the
 # group must sustain). NOT a 3mo-specific knob: the twin test caught it
 # drifting and the 3-month run takes the 6-month value by the derive rule.
-export GB_INMODEL_GROUP_ITERS=2
+# 2 -> 3 (user ruling 2026-10-01, "for now"; carried from the 6mo script:
+# one more pass of history before a sub-band can retire while the noise
+# is moving under the galfor ratchet).
+export GB_INMODEL_GROUP_ITERS=3
 # D/2 again, and FLAT per sub-band (user ruling): "When a source is birthed,
 # it is per-source. During the special in-model only proposals it is
 # per-sub-band. I want flat D/2. This will focus more resources on the
