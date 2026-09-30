@@ -174,36 +174,35 @@ plt.rcParams.update({
 
 IMGS, MISSING = {}, []
 
-# MATCH-CRITERION CONTENT GATE (user ruling 2026-08-19). The page's
-# completeness / purity / matched-pair numbers all come from the 2-bin f0
-# PROXY match, not the real phase-maximised overlap statistic (too heavy to
-# compute at page-build time). Ruling: catalogue TRUTHS stay on every visual
-# overlay, but nothing derived from the page's own match criterion is shown
-# -- no completeness/purity, no matched counts, no matched-pair deltas, no
-# recovery split/census. GF_MONITOR_MATCH_STATS=1 restores those panels.
-SHOW_MATCH_STATS = os.environ.get("GF_MONITOR_MATCH_STATS", "0") == "1"
+# MATCH-CRITERION CONTENT GATE. History: the 2026-08-19 ruling gated every
+# match-derived number OFF because the page's only criterion then was the
+# 2-df-bin f0 PROXY. Since the phase-maximised, noise-weighted overlap is
+# computed for every proxy pair at the last stored row (see the waveform-
+# level block below), the HEADLINE numbers -- matched count, completeness,
+# purity, the F4 three-way split, completeness-vs-SNR, the zoomable-plot
+# classes -- are the OVERLAP-refined match (>= GF_MONITOR_MATCH_MM, default
+# 0.8). User request 2026-09-30 ("get back to including the phase maximized
+# computations of match"): the gate is ON by default. What stays proxy, and
+# says so in its caption: the per-iteration completeness/purity CURVES
+# (F2) and the cross-arm table, which run on every stored row where a
+# waveform per pair is not affordable. GF_MONITOR_MATCH_STATS=0 restores
+# the match-free page.
+SHOW_MATCH_STATS = os.environ.get("GF_MONITOR_MATCH_STATS", "1") != "0"
 if not SHOW_MATCH_STATS:
-    # SAY SO (2026-09-26). The gate above removes NINE panels and the whole
+    # SAY SO (2026-09-26). The gate removes NINE panels and the whole
     # Parameter Recovery section, and it used to do it in total silence --
     # they simply were not there, with no notice and no placeholder. A page
-    # built without the flag therefore looks like a page whose run produced
+    # built without them therefore looks like a page whose run produced
     # nothing, and the only way to tell the two apart was to diff against an
     # older page, which is exactly how this was reported ("does not look
     # right ... make sure it did not drop anything").
-    #
-    # The DEFAULT stays off: those numbers come from the 2-bin f0 proxy
-    # match, and the 2026-08-19 ruling is that nothing derived from the
-    # page's own match criterion is shown by default. Announcing the
-    # suppression is not the same as reversing it.
     MISSING.append(
-        "match-criterion panels are SUPPRESSED (GF_MONITOR_MATCH_STATS is "
-        "not set): no completeness/purity curve, no completeness-vs-SNR, no "
-        "overlap CDF, no recovery split, no source-counts / amplitude / sky "
-        "/ nearest-neighbour population panels, and no Parameter Recovery "
-        "section. Nothing is wrong with the run or the snapshot -- these are "
-        "gated off by default because they derive from the 2-bin f0 PROXY "
-        "match rather than a phase-maximised overlap. Re-run with "
-        "GF_MONITOR_MATCH_STATS=1 to include them.")
+        "match-criterion panels are SUPPRESSED (GF_MONITOR_MATCH_STATS=0): "
+        "no completeness/purity curve, no completeness-vs-SNR, no overlap "
+        "CDF, no recovery split, no source-counts / amplitude / sky / "
+        "nearest-neighbour population panels, and no Parameter Recovery "
+        "section. Nothing is wrong with the run or the snapshot. Unset the "
+        "knob (default ON since 2026-09-30) to include them.")
 
 # Threshold for "matched" once the phase-maximised, noise-weighted overlap MM
 # is computed for each 2-df pair (see below). Default 0.8; override via
@@ -3493,6 +3492,22 @@ if TRU is not None:
             f"falls back to the 2-df proxy.")
         MATCH_CRIT_TXT = f"matched = within {TOL_BINS:.0f} df bins (2-df proxy)"
 
+    # ---- HEADLINE NUMBERS = the overlap-refined match when it exists ------
+    # (user request 2026-09-30). The proxy values are kept alongside, named
+    # as such, for the caption that has to explain the per-iteration curves.
+    SCI.update(n_match_proxy=int(MI.size),
+               completeness_proxy=MI.size / NDET,
+               purity_proxy=MI.size / max(REC9.shape[0], 1))
+    if MM is not None and MM.size:
+        TI_OV = _TI_ov
+        SCI.update(n_match=int(MATCHED_MM.sum()),
+                   completeness=float(FOUND_MM.sum()) / NDET,
+                   purity=float(MATCHED_MM.sum()) / max(REC9.shape[0], 1),
+                   match_is_overlap=True)
+    else:
+        TI_OV = TI
+        SCI.update(match_is_overlap=False)
+
     # ---- cross-arm cache -------------------------------------------------
     # The v2/v3 comparison must be made on GB-SEARCH iterations, not absolute
     # ones (v2's first GB leaf lands at iteration 5, v3's at 16), so each arm
@@ -3504,8 +3519,11 @@ if TRU is not None:
     ARM_TAG = {"3mo_v3": "v3", "3mo_v4": "v4", "3mo": "v2"}.get(
         RUN_KIND, RUN_KIND)
     try:
+        # ``ti`` = the truth indices FOUND at the last row under the page's
+        # headline criterion (overlap-refined when available): F6's
+        # completeness-vs-SNR reads it. ``n_match`` stays the per-row proxy.
         np.savez(f"gf_arm_{ARM_TAG}.npz", n_all=n_all, n_band=n_band,
-                 n_match=n_match, it0=IT0, ti=TI, mm=MM,
+                 n_match=n_match, it0=IT0, ti=TI_OV, mm=MM,
                  rec_f0=REC9[:, 1] * 1e-3, ndet=NDET)
     except Exception:
         pass
@@ -5553,20 +5571,24 @@ if len(globals().get("ARMS", {})) >= 2 and SCI and SHOW_MATCH_STATS:
 <tr style="border-bottom:1px solid var(--line)"><th style="text-align:left;padding:4px 0">
 at {_K} galactic-binary search iterations</th>{_hdr}</tr>
 {_row("model sources", lambda r: f"{r[1]:,}")}
-{_row("matched to a detectable injection", lambda r: f"{r[2]:,}")}
-{_row("completeness", lambda r: pct(r[3]))}
-{_row("purity", lambda r: pct(r[4]))}
+{_row("matched to a detectable injection (2-df proxy, per iteration)", lambda r: f"{r[2]:,}")}
+{_row("completeness (proxy)", lambda r: pct(r[3]))}
+{_row("purity (proxy)", lambda r: pct(r[4]))}
 {_row("search iterations completed in total", lambda r: f"{r[5]}")}
 </table>"""
 
 # ---- captions, every number read off the arrays that made the figure ------
 if SCI:
     cap_f2 = (
-        f"Completeness (solid, left axis) is the share of the {SCI['ndet']} "
-        f"detectable injections matched by a model source within "
-        f"{TOL_BINS:.0f} frequency bins; purity (dashed, right axis) is the "
-        f"share of model sources that so match. Now "
-        f"{pct(SCI['completeness'])} and {pct(SCI['purity'])}.")
+        f"Per stored iteration, completeness (solid, left axis) is the share "
+        f"of the {SCI['ndet']} detectable injections with a model source "
+        f"within {TOL_BINS:.0f} frequency bins and purity (dashed, right "
+        f"axis) the share of model sources that so pair: the 2-df proxy, "
+        f"because a waveform per pair per row is not affordable. At the last "
+        f"row the headline criterion is {MATCH_CRIT_TXT}: completeness "
+        f"{pct(SCI['completeness'])} and purity {pct(SCI['purity'])} "
+        f"(proxy {pct(SCI.get('completeness_proxy', SCI['completeness']))} "
+        f"and {pct(SCI.get('purity_proxy', SCI['purity']))}).")
     cap_f3 = (
         f"Noise-weighted overlap between each matched pair, maximised over an "
         f"overall phase. Read the lower panel's height at any overlap as the "
@@ -5745,9 +5767,11 @@ missing_html = "".join(f"<li>{m}</li>" for m in MISSING)
 
 # ---- match-criterion fragments (SHOW_MATCH_STATS gate) --------------------
 if SHOW_MATCH_STATS:
-    KPI_MATCH = f"""  <div><b>{SCI.get("n_match", 0):,}</b><span>matched to an injection</span></div>
-  <div><b>{pct(SCI["completeness"]) if SCI else "&mdash;"}</b><span>completeness</span></div>
-  <div><b>{pct(SCI["purity"]) if SCI else "&mdash;"}</b><span>purity</span></div>"""
+    _crit_kpi = ("phase-max overlap" if SCI and SCI.get("match_is_overlap")
+                 else "2-df proxy")
+    KPI_MATCH = f"""  <div><b>{SCI.get("n_match", 0):,}</b><span>matched to an injection ({_crit_kpi})</span></div>
+  <div><b>{pct(SCI["completeness"]) if SCI else "&mdash;"}</b><span>completeness ({_crit_kpi})</span></div>
+  <div><b>{pct(SCI["purity"]) if SCI else "&mdash;"}</b><span>purity ({_crit_kpi})</span></div>"""
     REC_MATCH_PANELS = f"""<div class="panel">{img("f2_progress", "completeness and purity vs GB-search iteration")}
 <div class="caption">{cap_f2}</div></div>
 <div class="panel">{img("f3_match", "overlap CDF and survival count")}
