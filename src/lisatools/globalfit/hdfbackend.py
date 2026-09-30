@@ -1069,7 +1069,7 @@ class GFHDFBackend(eryn_HDFBackend):
 
                 f[self.name].attrs["has_recipe"] = True
 
-    def completed_recipe_step(self, step_name):
+    def completed_recipe_step(self, step_name, next_step_name=None):
         """Mark ``step_name`` as completed in the on-disk recipe metadata.
 
         Also stamps ``completed_iteration``: the stored iteration the step
@@ -1105,6 +1105,17 @@ class GFHDFBackend(eryn_HDFBackend):
             recipe_step_group.attrs["status"] = True
             if _it is not None:
                 recipe_step_group.attrs["completed_iteration"] = _it
+                # The NEXT step starts where this one completed. Stamped in
+                # the SAME open as the completion (one write event at the
+                # boundary, not two) so a stage's start survives a resume:
+                # the galfor ratchet's schedule is keyed on the stage-local
+                # iteration and would otherwise nudge again on every
+                # relaunch. Companion to ``stage_start_iteration`` /
+                # ``stamp_stage_start``; an existing stamp is kept.
+                if next_step_name is not None and next_step_name in recipe_group:
+                    _nxt = recipe_group[next_step_name]
+                    if _nxt.attrs.get("start_iteration") is None:
+                        _nxt.attrs["start_iteration"] = _it
 
     def stage_start_iteration(self, step_name):
         """The stored iteration a step STARTED at, or ``None``.

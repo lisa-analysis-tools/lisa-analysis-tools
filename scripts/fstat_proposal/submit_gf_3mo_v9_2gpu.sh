@@ -3438,6 +3438,34 @@ export GB_TEMPER_ON_REMOVAL=1      # band swaps run inside rj_prior_removal
 # for it.
 export GB_SEARCH_PRIOR_REMOVAL_ONLY=${GB_SEARCH_PRIOR_REMOVAL_ONLY:-1}
 echo "[GB-PRIOR-REMOVAL] GB_SEARCH_PRIOR_REMOVAL_ONLY=${GB_SEARCH_PRIOR_REMOVAL_ONLY} (1 = deaths only; 0 = prior births AND deaths, ALL search stages)"
+# ---- the galfor RATCHET (user design 2026-09-30) ----------------------------
+# GALFOR_RATCHET=1 on the launch line: gb_search_3 carries ONE gated noise
+# proposal at the head of the iteration instead of the rider plus the four
+# interleaved slots. Stage-local schedule: iteration 0 of a cycle FORCES the
+# galfor coordinates down (DLOG10_* in the sampled log10 basis, every rung and
+# walker, published through the noise move's own accept path, hard F-stat
+# refit armed, then one GB in-model pass), the next HOLD-1 iterations hold the
+# noise fixed, then RELEASE iterations run the ordinary joint noise search
+# (each followed by the same in-model pass). CYCLES nudges, then permanent
+# release. The release is the measurement: a region of the curve that comes
+# back was honest, one that stays down had been absorbing resolvable sources.
+# STEP SIZE: one nudge takes the 3-5 mHz total noise from 2-5x the add-back
+# estimate to ~0.75-1.5x, where the F-stat peak floor (SNR 6.25) admits true
+# SNR-8 sources across the band (lisatools.globalfit.noise_ratchet docstring).
+# CYCLES=2 (user ruling 2026-09-30, "do at least 2 cycles for now"). ⚠ The
+# second nudge applies the same delta to whatever the first release left: on
+# a fit that stayed down it lands at 0.2-0.6x the estimate below 4.5 mHz, so
+# read its release with the junk indicators (birth truth-partner fraction,
+# power share per band) before going further.
+# Overridable here, default OFF = today's composition byte-identical.
+export GALFOR_RATCHET=${GALFOR_RATCHET:-0}
+export GALFOR_RATCHET_HOLD=${GALFOR_RATCHET_HOLD:-3}
+export GALFOR_RATCHET_RELEASE=${GALFOR_RATCHET_RELEASE:-2}
+export GALFOR_RATCHET_CYCLES=${GALFOR_RATCHET_CYCLES:-2}
+export GALFOR_RATCHET_DLOG10_AMP=${GALFOR_RATCHET_DLOG10_AMP:--0.05}
+export GALFOR_RATCHET_DLOG10_FK=${GALFOR_RATCHET_DLOG10_FK:--0.10}
+export GALFOR_RATCHET_DLOG10_F2=${GALFOR_RATCHET_DLOG10_F2:--0.15}
+echo "[GALFOR-RATCHET] GALFOR_RATCHET=${GALFOR_RATCHET} hold=${GALFOR_RATCHET_HOLD} release=${GALFOR_RATCHET_RELEASE} cycles=${GALFOR_RATCHET_CYCLES} dlog10 amp/fk/f2=${GALFOR_RATCHET_DLOG10_AMP}/${GALFOR_RATCHET_DLOG10_FK}/${GALFOR_RATCHET_DLOG10_F2} (0 = off: rider + 4 interleaved noise slots as before)"
 # High-f barren-band birth shutoff (search scope): bands above FMIN with
 # AFTER consecutive zero-birth-accept proposes stop proposing births
 # (deaths + in-model continue; [GB_BAND_SHUTOFF] log line per band).

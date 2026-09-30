@@ -594,6 +594,12 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             "MIDIT_CHECKPOINT", "MIDIT_CHECKPOINT_MIN_INTERVAL",
             # the offline 3mo galfor start point
             "GALFOR_START_PARAMS",
+            # the galfor RATCHET (2026-09-30): one gated noise proposal at
+            # the head of gb_search_3 -- nudge / hold / release -- v9 only,
+            # default OFF. See lisatools.globalfit.noise_ratchet.
+            "GALFOR_RATCHET", "GALFOR_RATCHET_HOLD", "GALFOR_RATCHET_RELEASE",
+            "GALFOR_RATCHET_CYCLES", "GALFOR_RATCHET_DLOG10_AMP",
+            "GALFOR_RATCHET_DLOG10_FK", "GALFOR_RATCHET_DLOG10_F2",
             # f0-adaptive stage-B sky grid (the F-stat fix, 2026-09-24)
             "FSTAT_STAGEB_SKY_ADAPT", "FSTAT_STAGEB_NSKY_MIN",
             "FSTAT_STAGEB_NSKY_MAX", "FSTAT_STAGEB_GROUP_MAX_GB",

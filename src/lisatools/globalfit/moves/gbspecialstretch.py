@@ -29660,7 +29660,8 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
 
     # ---- forced refit (per-stage profile) ----------------------------------
 
-    def arm_fstat_refit(self, serial, reason: str = "") -> None:
+    def arm_fstat_refit(self, serial, reason: str = "",
+                        ignore_age: bool = False) -> None:
         """Request a fresh-epoch F-stat fit at this move's next ``setup()``.
 
         Called by the recipe's per-stage profile when the stage changes
@@ -29676,11 +29677,18 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
 
         Idempotent per ``serial``: re-arming the same step (a resume
         re-announces the active step) does not buy a second refit.
+
+        ``ignore_age=True`` is the HARD form (the galfor ratchet, 2026-09-30):
+        the NOISE CURVE changed, so an epoch fitted under the previous curve
+        selected the wrong peaks whatever its floor or tick age says. The
+        soft decline in :meth:`_consume_forced_refit` ("already fitted at the
+        floor in force and not stale") is skipped for a hard arm.
         """
         if serial is None:
             return
         self._force_refit_serial = serial
         self._force_refit_reason = str(reason or "")
+        self._force_refit_hard = bool(ignore_age)
 
     def _consume_forced_refit(self):
         """``(epoch, reason)`` when a forced refit is due now, else ``None``.
@@ -29692,6 +29700,19 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         if serial is None or serial == getattr(self, "_force_refit_done", None):
             return None
         self._force_refit_done = serial
+        # HARD arm (galfor ratchet): the noise curve moved, so the latest
+        # epoch's peak list is wrong for the residual now in force whatever
+        # its floor stamp and tick age say. Consumed with the request so a
+        # later SOFT arm gets the ordinary decline below.
+        _hard = bool(getattr(self, "_force_refit_hard", False))
+        self._force_refit_hard = False
+        _k_latest = self._latest_epoch()
+        if _hard and _k_latest is not None:
+            logger.info(
+                "[V9-STAGE %s] HARD forced refit (%s): epoch %d is not "
+                "reused -- its peaks were selected against a different noise "
+                "curve.", self.name, self._force_refit_reason or "noise changed",
+                _k_latest)
         # ⚠ RESUME. The arming decision is made against a PROCESS-GLOBAL
         # override that is None in a fresh process, so on every restart the
         # stage looks like it has just changed the peak floor and would open
@@ -29702,8 +29723,7 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         # it. Only a genuine change refits.
         from lisatools.sampling.fstat_proposal import fstat_peak_min_F
 
-        _k_latest = self._latest_epoch()
-        if _k_latest is not None:
+        if _k_latest is not None and not _hard:
             _have = self._epoch_peak_min_F(self._epoch_dir(_k_latest))
             _want = float(fstat_peak_min_F())
             _floor_same = (_have is not None

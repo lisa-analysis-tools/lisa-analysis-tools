@@ -420,6 +420,61 @@ class JointMaxLogLSearch(Move):
         return mv
 
 
+class GatedNoiseSearch(JointMaxLogLSearch):
+    """The ONE noise proposal of a ratcheted search stage (GALFOR_RATCHET=1).
+
+    Wraps the same psd+galfor joint max-logL search as :class:`JointMaxLogLSearch`
+    in a :class:`~lisatools.globalfit.noise_ratchet.NoiseRatchetGate`, whose
+    per-iteration mode the stage's ``SearchStageProfileStep`` drives from the
+    stage-local iteration: NUDGE (force the galfor coordinates down by
+    ``delta`` on every rung and walker, then one GB in-model pass), HOLD
+    (nothing runs) or RELEASE (the ordinary search, then the same in-model
+    pass). User design 2026-09-30: "take out the noise_search modules from gb
+    search 3, only put one in there, at the beginning of an iteration, then
+    gate that one proposal so that it does the schedule we want"; the in-model
+    follow-up "should run anytime the noise is changing whether forced or
+    free, just not when it is held fixed."
+
+    Module level, not a closure: the pre-build fit must pickle/deepcopy.
+    """
+
+    def __init__(self, name, inner_names, delta, in_model_name="in_model",
+                 **kwargs):
+        super().__init__(name, inner_names, **kwargs)
+        self.delta = [float(x) for x in delta]
+        self.in_model_name = in_model_name
+
+    def stock_dependencies(self):
+        """The wrapped noise moves PLUS the in-model follow-up, so all are built."""
+        deps = list(self.inner_names)
+        if self.in_model_name and self.in_model_name not in deps:
+            deps.append(self.in_model_name)
+        return deps
+
+    def setup(self, ctx):
+        from lisatools.globalfit.noise_ratchet import NoiseRatchetGate
+
+        inner = super().setup(ctx)
+        galfor = ctx.stock_moves.get("galfor_pe")
+        if galfor is None:
+            raise ValueError(
+                f"{self.name}: the galfor ratchet needs the stock 'galfor_pe' "
+                f"move to perform the forced step (available: "
+                f"{sorted(ctx.stock_moves)}).")
+        in_model = None
+        if self.in_model_name:
+            in_model = ctx.stock_moves.get(self.in_model_name)
+            if in_model is None:
+                raise ValueError(
+                    f"{self.name}: the in-model follow-up move "
+                    f"{self.in_model_name!r} is not built (GB_SEARCH_IN_MODEL=0?). "
+                    "The ratchet requires it: the GB sources must settle to a "
+                    "changed noise before any RJ move scores against it.")
+        gate = NoiseRatchetGate(inner, galfor, self.delta, in_model_move=in_model)
+        gate.gf_move_name = self.name
+        return gate
+
+
 # mbh/emri/sobbh arming (campaign S6): branch -> (env, mojito class), in the
 # sobbh -> mbh -> emri BANKING order (user ruling 2026-08-27: the cheap
 # branch banks its progress before the minutes-per-leaf MBH/EMRI proposals
@@ -1488,10 +1543,43 @@ def build_fit():
         # fitted against a current noise level. FIXED noise: the vgb branch
         # keeps sampling (it is 55 KNOWN sources, nothing to do with the
         # noise model) and the psd/galfor moves are simply absent.
-        _noise = (_noise_rider() if sample_noise
-                  else ([Move("vgb_pe", branch="vgb")] if _has_vgb else []))
-        _noise_pre = _noise_slot("noise_joint_search_1") if sample_noise else []
-        _noise_post = _noise_slot("noise_joint_search_2") if sample_noise else []
+        # ---- the galfor RATCHET (user design 2026-09-30) -------------------
+        # GALFOR_RATCHET=1 replaces the leading rider AND the four interleaved
+        # noise slots with ONE gated noise proposal at the head of the
+        # iteration (vgb_pe keeps its own slot in front of it: 55 known
+        # sources, nothing to do with the noise schedule). The stage step
+        # drives the gate -- nudge / hold / release -- from the stage-local
+        # iteration; see lisatools.globalfit.noise_ratchet. Unset, the
+        # composition below is byte-identical to before.
+        from lisatools.globalfit.noise_ratchet import (
+            nudge_delta_from_env, ratchet_from_env)
+
+        _ratchet = ratchet_from_env() if sample_noise else None
+        _ratchet_delta = ([float(x) for x in nudge_delta_from_env()]
+                          if _ratchet is not None else None)
+        if _ratchet is not None and not _env_flag("GB_SEARCH_IN_MODEL"):
+            raise ValueError(
+                "GALFOR_RATCHET=1 needs GB_SEARCH_IN_MODEL=1: every noise change "
+                "(forced or free) is followed by one GB in-model pass so the "
+                "sources settle to the new noise before any RJ move scores "
+                "against it, and that pass is the stock 'in_model' move.")
+        _slots = sample_noise and _ratchet is None
+        if _ratchet is not None:
+            _noise = ([Move("vgb_pe", branch="vgb")] if _has_vgb else []) + [
+                GatedNoiseSearch(
+                    "noise_ratchet_search", _noise_names, _ratchet_delta,
+                    branch="psd", num_checks=(_gb_noise_checks or None),
+                    iters_per_step=(_gb_noise_cap or None))]
+            print(f"[combined] {name}: GALFOR_RATCHET {_ratchet} -- one gated "
+                  f"noise proposal at the head of the iteration, nudge "
+                  f"{list(_ratchet_delta)} in the sampled galfor basis; the "
+                  f"interleaved noise_joint_search_1..4 slots are OUT.",
+                  flush=True)
+        else:
+            _noise = (_noise_rider() if sample_noise
+                      else ([Move("vgb_pe", branch="vgb")] if _has_vgb else []))
+        _noise_pre = _noise_slot("noise_joint_search_1") if _slots else []
+        _noise_post = _noise_slot("noise_joint_search_2") if _slots else []
         # NOISE TO CONVERGENCE AFTER EVERY RJ PROPOSAL -- specifically,
         # after that proposal's IN-MODEL UPDATE (user ruling 2026-09-25,
         # amended the same day: "move the noise joint searches to after the
@@ -1533,8 +1621,8 @@ def build_fit():
         # whose residual barely moved pays ~2 rounds, not 6.
         # Stages 1-2 are unaffected: they do not sample the noise, so every
         # one of these lists is empty there.
-        _noise_rep = _noise_slot("noise_joint_search_3") if sample_noise else []
-        _noise_rem = _noise_slot("noise_joint_search_4") if sample_noise else []
+        _noise_rep = _noise_slot("noise_joint_search_3") if _slots else []
+        _noise_rem = _noise_slot("noise_joint_search_4") if _slots else []
         _warm = ([Move("rj_warm_search", branch="gb", every=warm_every)]
                  if warm() else [])
         if seed_only:
@@ -1643,6 +1731,9 @@ def build_fit():
                 stage_name=name,
                 profile=dict(phase_maximize=phase_maximize, opt_snr=opt_snr,
                              peak_min_snr=peak_min_snr),
+                # the galfor ratchet schedule (None = off) and its nudge
+                ratchet=_ratchet,
+                ratchet_delta=_ratchet_delta,
             ),
             combine_kwargs=dict(share_temperature_control=False),
         )

@@ -3031,9 +3031,105 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         Runs on the FULL state single-process and on this rank's walker slice
         under several compute ranks (``WalkerFanoutMixin.propose`` dispatches).
 
+        The begin (working state) and finish (write-back + publish) halves
+        are :meth:`_begin_propose` / :meth:`_finish_propose`, shared with
+        :meth:`forced_noise_step` so a forced step publishes through exactly
+        this path.
+
         Returns:
             Tuple ``(new_state, accepted)``.
         """
+        ctx = self._begin_propose(model, state)
+        tmp_state, tmp_model, _tm = ctx.tmp_state, ctx.tmp_model, ctx.tm
+
+        with _tspan(_tm, "sample"):
+            if self.max_logl_mode:
+                tmp_state, accepted = self.run_move_max_likelihood(tmp_model, tmp_state)
+
+            elif self._ensemble_search_active():
+                # Tiled per-walker ensemble, SEARCH stages only. One block
+                # per propose: the enclosing MaxLogLCombineMove plateau is
+                # what "run until the maximum likelihood converges" means
+                # here, so this stays chunked exactly like run_move_for_loop
+                # rather than owning a second convergence loop.
+                tmp_state, accepted = self.run_move_ensemble_search(tmp_model, tmp_state)
+
+            else:
+                tmp_state, accepted = self.run_move_for_loop(tmp_model, tmp_state, self.num_repeats)
+
+        return self._finish_propose(state, ctx, tmp_state, accepted)
+
+    def forced_noise_step(self, model, state, deltas):
+        """Shift sampled noise coordinates by a fixed vector and PUBLISH.
+
+        The galfor ratchet's "forced lowering" (user design 2026-09-30):
+        ``deltas`` maps a branch this move samples to a shift in the SAMPLED
+        basis (the run's ``log10`` galfor basis: ``[amp, fk, alpha, f_1,
+        f_2]``), applied to EVERY rung and walker. No Metropolis step: the
+        new coordinates are accepted unconditionally, their log-prior and
+        log-likelihood recomputed, and the result written back and published
+        to every walker's container through the same :meth:`_finish_propose`
+        an ordinary accepted proposal uses -- so the residual, the
+        sensitivity matrices, the replicas and the stored cold row all agree.
+
+        Refuses (``ValueError``, ``state`` untouched) a branch this move does
+        not sample, a malformed shift, or a shift that leaves the prior box
+        on any row: a silently clipped or half-applied nudge would be a
+        worse outcome than no nudge.
+
+        Returns:
+            Tuple ``(new_state, accepted)`` with ``accepted`` all True at the
+            engine ladder shape.
+        """
+        noise_branches = self._resolve_sampled(state)
+        deltas = {str(k): np.asarray(v, dtype=float) for k, v in dict(deltas).items()}
+        for key, d in deltas.items():
+            if key not in noise_branches:
+                raise ValueError(
+                    f"forced_noise_step: {key!r} is not sampled by this move "
+                    f"(sampled: {noise_branches}).")
+            ndim = int(np.shape(state.branches_coords[key])[-1])
+            if d.shape != (ndim,):
+                raise ValueError(
+                    f"forced_noise_step: shift for {key!r} has shape {d.shape}; "
+                    f"expected ({ndim},).")
+        ctx = self._begin_propose(model, state, resolve_inner=False)
+        tmp_state = ctx.tmp_state
+        for key, d in deltas.items():
+            tmp_state.branches[key].coords[:] = tmp_state.branches[key].coords + d
+        coords = tmp_state.branches_coords
+        logp = np.asarray(self.compute_log_prior(coords))
+        if np.any(np.isinf(logp)):
+            raise ValueError(
+                "forced_noise_step: the shifted coordinates leave the prior on "
+                f"{int(np.sum(np.isinf(logp)))} of {logp.size} rows -- the nudge "
+                f"{ {k: v.tolist() for k, v in deltas.items()} } is too large "
+                "for the sampled box; nothing was changed.")
+        logl = ctx.init_like_fn(coords, logp=logp, supps=tmp_state.supplemental)[0]
+        tmp_state.log_prior = logp
+        tmp_state.log_like = np.asarray(logl)
+        accepted = np.ones((ctx.nt_mod, ctx.nwalkers_mod), dtype=bool)
+        logger.info(
+            "[GALFOR_RATCHET %s] forced noise step: %s shifted on %d rung(s) x %d "
+            "walker(s); cold lnL before/after (walker mean) %.1f -> %.1f",
+            getattr(self, "name", "psd"),
+            ", ".join(f"{k} += {v.tolist()}" for k, v in deltas.items()),
+            ctx.nt_mod, ctx.nwalkers_mod,
+            float(np.mean(state.log_like[0])), float(np.mean(tmp_state.log_like[0])))
+        return self._finish_propose(state, ctx, tmp_state, accepted)
+
+    def _begin_propose(self, model, state, resolve_inner: bool = True):
+        """The begin half of :meth:`propose_local`: freeze the fixed noise
+        branches, replay the begin prep, build the working (module-ladder)
+        state and model. ``resolve_inner=False`` skips the inner-proposal
+        resolution (eigen tables etc.) for a caller that runs no inner loop.
+
+        Returns a namespace with ``tmp_state``, ``tmp_model``, ``tm``,
+        ``noise_branches``, ``engine_ntemps``, ``nt_mod``, ``nwalkers_mod``,
+        ``init_like_fn``, ``before_vals``, ``t0``.
+        """
+        from types import SimpleNamespace
+
         _t_prop0 = time.perf_counter()
         # GB_PROP_TIMING_SYNC=1 attributes device time to the span that
         # launched it rather than the one that forces the sync (same
@@ -3104,7 +3200,9 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
             if getattr(self, "fanout", None) is not None
             else nwalkers_mod
         )
-        if self._ensemble_search_active():
+        if not resolve_inner:
+            pass  # a forced step runs no inner loop: no kind, no tables
+        elif self._ensemble_search_active():
             # The tiled ensemble supplies its own complement, so neither the
             # block-width resolution nor the information matrix applies:
             # _resolve_inner_kind would either pick `eigen` (and pay for the
@@ -3177,20 +3275,23 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
             model.random,
         )
 
-        with _tspan(_tm, "sample"):
-            if self.max_logl_mode:
-                tmp_state, accepted = self.run_move_max_likelihood(tmp_model, tmp_state)
+        return SimpleNamespace(
+            t0=_t_prop0, tm=_tm, noise_branches=noise_branches,
+            engine_ntemps=engine_ntemps, nt_mod=nt_mod, nwalkers_mod=nwalkers_mod,
+            tmp_state=tmp_state, tmp_model=tmp_model, init_like_fn=_init_like_fn,
+            before_vals=before_vals,
+        )
 
-            elif self._ensemble_search_active():
-                # Tiled per-walker ensemble, SEARCH stages only. One block
-                # per propose: the enclosing MaxLogLCombineMove plateau is
-                # what "run until the maximum likelihood converges" means
-                # here, so this stays chunked exactly like run_move_for_loop
-                # rather than owning a second convergence loop.
-                tmp_state, accepted = self.run_move_ensemble_search(tmp_model, tmp_state)
-
-            else:
-                tmp_state, accepted = self.run_move_for_loop(tmp_model, tmp_state, self.num_repeats)
+    def _finish_propose(self, state, ctx, tmp_state, accepted):
+        """The finish half of :meth:`propose_local`: write the working state's
+        sampled branches back into a copy of ``state`` (full ladder into the
+        sub-states, cold row into the engine state), publish each walker's
+        accepted noise model onto its container (replicas included), and
+        return ``(new_state, accepted)`` at the engine ladder shape."""
+        _tm = ctx.tm
+        noise_branches = ctx.noise_branches
+        engine_ntemps = ctx.engine_ntemps
+        _t_prop0 = ctx.t0
 
         # CHECK THIS STATE SETUP
         new_state = GFState(state, copy=True)

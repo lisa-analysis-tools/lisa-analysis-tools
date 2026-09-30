@@ -399,7 +399,7 @@ class RecipeFanoutHooksTest(unittest.TestCase):
                 return self.stops.pop(0)
 
         class _Backend:
-            def completed_recipe_step(self, name):
+            def completed_recipe_step(self, name, next_step_name=None):
                 calls.append(("done", name))
 
         recipe = Recipe()
