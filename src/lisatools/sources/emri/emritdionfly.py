@@ -237,7 +237,25 @@ class EMRITDIonFly:
             Kerr_wave, include_minus_mkn=include_minus_mkn, amp_factor=self.AMP_FACTOR
         )
 
-        t_arr_in = self.t0 + np.repeat(Kerr_wave.t_arr[:, None], mode_phase.shape[0], axis=-1).T
+        t_src = np.asarray(Kerr_wave.t_arr, dtype=float)
+        if self.n_fine is not None and t_src.size > 2:
+            # A plunge inside the requested window: FEW's fix_t cut the fine grid at the
+            # trajectory end, and the delay trim below would then drop the last
+            # ~delay_margin of signal plus the response's tail after the stop. Continue
+            # the feed past the end with ZERO amplitude (the production waveform is
+            # zero-padded after the plunge); the phase continues linearly.
+            requested_end = float(self._fine_times()[-1])
+            sp = float(t_src[-1] - t_src[-2])
+            if t_src[-1] < requested_end - 0.5 * sp:
+                # one delay_margin is eaten by the trim, the second covers the response's
+                # tail after the stop (SSB projection |k.x| <~ 500 s)
+                n_ext = int(np.ceil((2.0 * self.delay_margin + 2.0 * sp) / sp)) + 2
+                steps = np.arange(1, n_ext + 1, dtype=float)
+                t_src = np.concatenate([t_src, t_src[-1] + sp * steps])
+                dphi = (mode_phase[:, -1] - mode_phase[:, -2])[:, None]
+                mode_phase = np.concatenate([mode_phase, mode_phase[:, -1:] + dphi * steps[None, :]], axis=1)
+                mode_amp = np.concatenate([mode_amp, np.zeros((mode_amp.shape[0], n_ext))], axis=1)
+        t_arr_in = self.t0 + np.repeat(t_src[:, None], mode_phase.shape[0], axis=-1).T
         # Trim the TDI grid inside the waveform spline by the max response delay so
         # the delayed waveform queries (t - k.x) never fall outside the spline.
         dt_traj = float(t_arr_in[0, 1] - t_arr_in[0, 0]) if t_arr_in.shape[1] > 1 else self.dt

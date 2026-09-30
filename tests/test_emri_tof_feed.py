@@ -298,5 +298,64 @@ class EMRITofVsInjectionTest(unittest.TestCase):
             self.assertIs(gen.inspiral_kwargs[k], v)
 
 
+class EMRITofPlungeEndTest(unittest.TestCase):
+    """At a plunge the fine feed ends with the trajectory; the response's delay trim then
+    dropped the last ~720 s (and the response's ~470 s tail after the stop). The feed must
+    run past the end with zero amplitude, as the production waveform's zero padding does."""
+
+    NF, DT, NT = 180, 20.0, 1024
+
+    @classmethod
+    def setUpClass(cls):
+        import sys
+        try:
+            import mojito  # noqa: F401
+        except Exception as exc:  # pragma: no cover
+            raise unittest.SkipTest(f"needs mojito: {exc}")
+        if not os.path.isdir(PATH):
+            raise unittest.SkipTest("local mojito cache missing")
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts", "emri"))
+        import emri_tof_xyz_threeway as W
+
+        W.N_WIN = cls.NF * cls.NT
+        _, _, _, cls.orb = W.load(1)
+        cls.data_t0 = REF + 5e4
+        cls.span = cls.NF * cls.NT * cls.DT
+
+    def test_plunge_end_matches_production(self):
+        from lisatools.response.tdiconfig import TDIConfig
+        from lisatools.sources.emri import EMRITDIonFly
+        from lisatools.sources.emri.response import get_emri_response_wrapper
+
+        NF, DT = self.NF, self.DT
+        params = [1e6, 1e2, 0.9, 7.0, 0.4, 1.0, 1.0, 1.1, 2.3, 0.7, 4.0, 0.2, 0.0, 0.7]   # plunges ~34 d
+        off = self.data_t0 - REF
+        k = int(round(off / DT))
+        tdi = TDIConfig("2nd generation", force_backend="cpu")
+        wg = get_emri_response_wrapper(Tobs=(NF * self.NT + k) * DT + 4e4, dt=DT, t_start=REF,
+                                       t0_shift_to_data=off - k * DT, tdi_config=tdi, tdi_chan="XYZ",
+                                       force_backend="cpu", orbits=self.orb)
+        modes = [(2, 2, 0, 0)]
+        prod = np.atleast_2d(np.asarray(wg(*params, mode_selection=modes,
+                                            mode_selection_threshold=1e-5)))[:3, k:k + NF * self.NT]
+        fly = EMRITDIonFly(wg.waveform_gen.waveform_generator, self.orb, tdi, DT, off + self.span + 2000.0, REF,
+                           frame="icrs_special", n_fine=int(self.span / 80),
+                           t_fine_window=(self.data_t0, self.data_t0 + self.span))
+        out = fly(*params, mode_selection=modes)
+        t_end = REF + float(np.asarray(fly.last_holder.t_arr)[-1])
+        tg = self.data_t0 + np.arange(NF * self.NT) * DT
+        x = np.asarray(out.x)
+        ins = (tg > x[:, 0].max()) & (tg < x[:, -1].min())
+        tof = np.zeros_like(prod)
+        tof[:, ins] = np.real(np.sum(np.asarray(out.eval_tdi(tg[ins])), axis=0))
+        sl = (tg > t_end - 3000.0) & (tg < t_end + 600.0)
+        rel = [np.linalg.norm(tof[c, sl] - prod[c, sl]) / np.linalg.norm(prod[c, sl]) for c in range(3)]
+        amp = [np.linalg.norm(tof[c, sl]) / np.linalg.norm(prod[c, sl]) for c in range(3)]
+        print(f"\n[plunge end] rel L2 XYZ {np.round(rel, 4)}, amplitude ratio {np.round(amp, 4)}, "
+              f"TOF grid ends {x[:, -1].min() - t_end:+.0f} s rel. to the trajectory end")
+        self.assertGreaterEqual(x[:, -1].min(), t_end + 300.0)          # grid runs past the stop
+        self.assertTrue(np.all(np.array(rel) < 0.05), rel)
+
+
 if __name__ == "__main__":
     unittest.main()
