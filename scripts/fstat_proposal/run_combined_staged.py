@@ -493,6 +493,66 @@ V9_SEARCH_STAGE_PROFILES = (
      dict(phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25), True),
 )
 
+#: Per-stage override of the profile's ``opt_snr`` -- the OPTIMAL-SNR
+#: prior boundary (``opt_snr_rej_samp_limit``), NOT the F-stat peak
+#: floor, which stays on ``peak_min_snr`` and is not touched here.
+#:
+#: Added 2026-09-29 for Mike's "let's test a gb search 3 rerun with snr
+#: limit 3 and see what happens". Until now the profile row hard-coded
+#: 5.0 and ``SearchStageProfileStep._apply_profile`` writes it onto every
+#: GB move on stage entry, so ``GB_OPT_SNR_LIMIT_SEARCH`` was overridden
+#: and there was no per-stage way in.
+#:
+#: Stage 2 gets the symmetric knob because it costs one table row and
+#: because a stage-3-only knob invites the next experiment to hard-edit
+#: the row again -- which is what this replaces.
+_SEARCH_STAGE_OPT_SNR_KNOBS = {
+    "gb_search_2": "GB_SEARCH_2_OPT_SNR",
+    "gb_search_3": "GB_SEARCH_3_OPT_SNR",
+}
+
+
+def search_stage_profiles():
+    """:data:`V9_SEARCH_STAGE_PROFILES` with the env overrides applied.
+
+    ⚠ CALL THIS, never the constant. Both v9 stage assemblies (the
+    GB_ONLY one and the full composition) build from the table, and a
+    knob wired into one of them is the "knob resolves, consuming path
+    never runs" shape this file has already produced several defects
+    in. One resolver, two call sites, and a test that reads the source
+    of both.
+
+    Unset knobs leave the table byte-identical, so the default run is
+    unchanged. A value <= 0 raises rather than quietly disabling the
+    boundary: ``opt_snr_rej_samp_limit = 0`` is a legal "off" elsewhere
+    in the tree, so a fat-fingered 0 here would read as a deliberate
+    choice and silently admit every birth.
+    """
+    out = []
+    for name, prof, sampled in V9_SEARCH_STAGE_PROFILES:
+        knob = _SEARCH_STAGE_OPT_SNR_KNOBS.get(name)
+        raw = os.environ.get(knob) if knob else None
+        if raw is not None and raw.strip() != "":
+            try:
+                val = float(raw)
+            except ValueError:
+                raise ValueError(
+                    f"{knob}={raw!r} is not a number.") from None
+            if val <= 0.0:
+                raise ValueError(
+                    f"{knob}={val} must be > 0. Zero would read as a "
+                    f"deliberate 'no optimal-SNR boundary' and admit "
+                    f"every birth; unset the knob to keep the default "
+                    f"{prof['opt_snr']}.")
+            was = prof["opt_snr"]
+            prof = dict(prof, opt_snr=val)
+            print(f"[V9-STAGE {name}] profile {prof} -- opt_snr={val} "
+                  f"from {knob} (default {was}; the F-stat peak floor "
+                  f"peak_min_snr={prof['peak_min_snr']} is NOT affected)",
+                  flush=True)
+        out.append((name, prof, sampled))
+    return tuple(out)
+
 
 class FixedIterationStop:
     """Stop a recipe stage after exactly ``n`` sampler iterations.
@@ -883,6 +943,9 @@ def build_fit():
             if _warm3 < 1:
                 raise ValueError(
                     f"GB_SEARCH_3_WARM_EVERY={_warm3} must be >= 1.")
+            # Resolved ONCE per assembly so the override logs once and
+            # the seed row and the loop cannot disagree.
+            _profiles = search_stage_profiles()
             _gb_only_stages = []
             # gb_search_seed leads here TOO. There are two v9 stage
             # assemblies in this file -- this GB_ONLY one and the full
@@ -891,7 +954,7 @@ def build_fit():
             # has produced several defects in this run. Same profile
             # (gb_search_1's), same fixed length, same disarmed valve.
             if _seed_iters() > 0:
-                _sp = dict(V9_SEARCH_STAGE_PROFILES[0][1])
+                _sp = dict(_profiles[0][1])
                 _seed_warm = ([Move("rj_warm_search", branch="gb")]
                               if warm() else [])
                 _gb_only_stages.append(Stage(
@@ -905,7 +968,7 @@ def build_fit():
                     ),
                     combine_kwargs=dict(share_temperature_control=False),
                 ))
-            for _name, _prof, _sampled in V9_SEARCH_STAGE_PROFILES:
+            for _name, _prof, _sampled in _profiles:
                 _every = _warm3 if _sampled else 1
                 _warm = ([Move("rj_warm_search", branch="gb", every=_every)]
                          if warm() else [])
@@ -1605,15 +1668,17 @@ def build_fit():
                   "search stage samples the noise -- leading joint rider + a "
                   "noise convergence after every in-model slot, in "
                   "gb_search_1/2 as well as gb_search_3.", flush=True)
+        # Resolved ONCE per assembly, as in the GB_ONLY branch above.
+        _profiles = search_stage_profiles()
         _seed = []
         if _seed_iters() > 0:
-            _seed_prof = dict(V9_SEARCH_STAGE_PROFILES[0][1])
+            _seed_prof = dict(_profiles[0][1])
             _seed = [_search_stage("gb_search_seed", sample_noise=False,
                                    seed_only=True, **_seed_prof)]
         stages += _seed + [
             _search_stage(_name, sample_noise=(_sampled or _noise_all_stages),
                           warm_every=(_warm3 if _sampled else 1), **_prof)
-            for _name, _prof, _sampled in V9_SEARCH_STAGE_PROFILES
+            for _name, _prof, _sampled in _profiles
         ] + [
             Stage(
                 name="full_pe", kind="pe",
