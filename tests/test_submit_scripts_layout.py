@@ -602,6 +602,8 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             "GALFOR_RATCHET_DLOG10_FK", "GALFOR_RATCHET_DLOG10_F2",
             # match-criterion panels back on for the v9 pages (2026-09-30)
             "GF_MONITOR_MATCH_STATS",
+            # search legs: one row per in-model leg (2026-09-30)
+            "GB_SEARCH_LEGS",
             # f0-adaptive stage-B sky grid (the F-stat fix, 2026-09-24)
             "FSTAT_STAGEB_SKY_ADAPT", "FSTAT_STAGEB_NSKY_MIN",
             "FSTAT_STAGEB_NSKY_MAX", "FSTAT_STAGEB_GROUP_MAX_GB",

@@ -1401,7 +1401,7 @@ class SearchStageProfileStep(RJRecipeStep):
 
     def __init__(self, *args, profile: typing.Optional[dict] = None,
                  stage_name: str = "", ratchet=None, ratchet_delta=None,
-                 **kwargs):
+                 legs: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.profile = dict(profile or {})
         _unknown = sorted(set(self.profile) - {
@@ -1430,6 +1430,11 @@ class SearchStageProfileStep(RJRecipeStep):
                               else np.asarray(ratchet_delta, dtype=float))
         self._ratchet_last_k = None
         self._ratchet_pre_nudge = None
+        # ---- search LEGS (user design 2026-09-30) -------------------------
+        # One stored row per leg of the cycle; the stage combine carries the
+        # cursor (``gf_legs``), this step positions it at entry from the last
+        # row's leg-ender NAME. See lisatools.globalfit.legs.
+        self.legs = bool(legs)
 
     # ---- profile application ----------------------------------------------
 
@@ -1447,7 +1452,71 @@ class SearchStageProfileStep(RJRecipeStep):
         self._profile_serial = serial
         self._profile_applied = True
         self._apply_profile(serial)
+        self._legs_enter()
         self._ratchet_enter()
+
+    # ---- search legs --------------------------------------------------------
+
+    def _stage_combine(self):
+        """The stage combine carrying the leg cursor, or None."""
+        for m in list(getattr(self, "moves", None) or []):
+            mm = m[0] if isinstance(m, (tuple, list)) and m else m
+            if getattr(mm, "gf_legs", None) is not None:
+                return mm
+        return None
+
+    def _legs_enter(self) -> None:
+        """Position the leg cursor from the store (HEAD-ONLY announce path).
+
+        The resume position is the NAME of the leg-ender the last row was
+        saved after; a fresh stage (no rows of its own yet), an old store or
+        a changed composition all start at the head of the list, loudly.
+        """
+        if not getattr(self, "legs", False):
+            return
+        cm = self._stage_combine()
+        tag = self.stage_name or "gb_search"
+        if cm is None:
+            logger.warning(
+                "[LEG %s] legs=True but the stage combine carries no leg "
+                "cursor -- compose the stage with leg_ends (GB_SEARCH_LEGS=1).",
+                tag)
+            return
+        cur = cm.gf_legs
+        be = getattr(self, "_ratchet_backend", None)
+        live = int(getattr(self, "_ratchet_live_iter",
+                           getattr(self, "_stage_start_iter", 0)))
+        origin = self._ratchet_stage_origin()
+        name, hist, stored = None, [], None
+        if live > origin:
+            fn = getattr(be, "saved_after", None)
+            name = fn(live - 1) if callable(fn) else None
+            fn = getattr(be, "saved_after_history", None)
+            hist = fn(origin, live) if callable(fn) else []
+        fn = getattr(be, "stage_move_order", None)
+        stored = fn(self.stage_name) if (callable(fn) and self.stage_name) else None
+        if stored is not None and list(stored) != list(cur.order):
+            logger.warning(
+                "[LEG %s] the stage's stored move order %s differs from the "
+                "live composition %s -- resuming at the HEAD of the cycle "
+                "rather than trusting a row name from a different list.",
+                tag, list(stored), list(cur.order))
+            cur.set_after(None)
+            cur.cycles = 0
+        else:
+            ok = cur.set_after(name)
+            if name and not ok:
+                logger.warning(
+                    "[LEG %s] last row was saved after %r, which is not a "
+                    "leg-ender of %s -- resuming at the head of the cycle.",
+                    tag, name, cur.ends)
+            cur.cycles = cur.cycles_from_history(hist)
+        logger.info(
+            "[LEG %s] resume: rows %d..%d of this stage, last saved after %r -> "
+            "next move %r (leg %d/%d), %d cycle(s) completed",
+            tag, origin, live - 1, name,
+            cur.order[cur.cursor] if cur.cursor < len(cur.order) else "?",
+            cur.leg_index + 1, cur.nlegs, cur.cycles)
 
     # ---- the galfor ratchet -----------------------------------------------
 
@@ -1507,7 +1576,11 @@ class SearchStageProfileStep(RJRecipeStep):
         self._ratchet_origin = self._ratchet_stage_origin()
         live = int(getattr(self, "_ratchet_live_iter",
                            getattr(self, "_stage_start_iter", 0)))
-        self._ratchet_k = live - self._ratchet_origin
+        cm = self._stage_combine() if getattr(self, "legs", False) else None
+        # CYCLE units under legs (the cursor's completed-cycle count, set
+        # from the store by _legs_enter just before this); rows otherwise.
+        self._ratchet_k = (int(cm.gf_legs.cycles) if cm is not None
+                           else live - self._ratchet_origin)
         self._ratchet_capture_reference(
             self._ratchet_k, getattr(self, "_ratchet_last_sample", None))
         self._drive_ratchet(self._ratchet_k, self.moves)
@@ -1775,9 +1848,17 @@ class SearchStageProfileStep(RJRecipeStep):
         moves = getattr(sampler, "moves", None)
         # IN-PROCESS clock: one stopping_function call = one completed
         # iteration. Never re-read backend.iteration here -- on the head it
-        # lags the handoff by one save (see _ratchet_enter).
+        # lags the handoff by one save (see _ratchet_enter). Under LEGS the
+        # clock is the cursor's completed-cycle count, so the gate is driven
+        # once per CYCLE (at the wrap), not once per row.
         _k_done = int(getattr(self, "_ratchet_k", 0))
-        _k_next = _k_done + 1
+        _cm = self._stage_combine() if getattr(self, "legs", False) else None
+        if _cm is not None:
+            _k_next = int(_cm.gf_legs.cycles)
+            _advanced = _k_next > _k_done
+        else:
+            _k_next = _k_done + 1
+            _advanced = True
         self._ratchet_readout(_k_done, sample)
         if stop and self._ratchet_schedule_pending(_k_next):
             logger.info(
@@ -1788,7 +1869,7 @@ class SearchStageProfileStep(RJRecipeStep):
                 self.stage_name or "gb_search", _k_done, _k_next,
                 self.ratchet.cycles * self.ratchet.cycle_length)
             stop = False
-        if not stop:
+        if not stop and _advanced:
             self._ratchet_k = _k_next
             self._ratchet_capture_reference(_k_next, sample)
             self._drive_ratchet(_k_next, moves)

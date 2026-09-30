@@ -1679,6 +1679,15 @@ def build_fit():
                     search_shutoff_per_walker=False,
                 ),
             )
+        # ---- search LEGS (user design 2026-09-30) ---------------------------
+        # GB_SEARCH_LEGS=1: one stored row per leg of the cycle (after every
+        # in_model* move) instead of one per full cycle; the resume position
+        # is the leg-ender NAME the last row was saved after. Cadences
+        # (warm_every) and the galfor ratchet then count CYCLES. Off = today.
+        _legs = _env_flag("GB_SEARCH_LEGS")
+        _combine_kwargs = dict(share_temperature_control=False)
+        if _legs:
+            _combine_kwargs["leg_ends"] = "auto"
         return Stage(
             name=name, kind="gb_search",
             # THE OTHER SOURCES RUN LAST (user ruling 2026-09-25). They used
@@ -1734,8 +1743,9 @@ def build_fit():
                 # the galfor ratchet schedule (None = off) and its nudge
                 ratchet=_ratchet,
                 ratchet_delta=_ratchet_delta,
+                legs=_legs,
             ),
-            combine_kwargs=dict(share_temperature_control=False),
+            combine_kwargs=_combine_kwargs,
         )
 
     if _v9_stages:

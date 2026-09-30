@@ -3414,6 +3414,16 @@ export GALFOR_RATCHET_CYCLES=${GALFOR_RATCHET_CYCLES:-2}
 export GALFOR_RATCHET_DLOG10_AMP=${GALFOR_RATCHET_DLOG10_AMP:--0.05}
 export GALFOR_RATCHET_DLOG10_FK=${GALFOR_RATCHET_DLOG10_FK:--0.10}
 export GALFOR_RATCHET_DLOG10_F2=${GALFOR_RATCHET_DLOG10_F2:--0.15}
+# ---- search LEGS (user design 2026-09-30) ----------------------------------
+# GB_SEARCH_LEGS=1: the numbered search stages store one row per LEG of the
+# cycle -- after in_model, after in_model_fstat, after in_model_removal --
+# instead of one per full cycle. The resume position is the NAME of the
+# in-model move the last row was saved after (stored per row), so a gated
+# move that skipped a cycle cannot mis-align a relaunch; cadences
+# (GB_SEARCH_3_WARM_EVERY) and the galfor ratchet then count CYCLES. With a
+# row per leg the mid-iteration checkpoint only guards part of one leg;
+# MIDIT_CHECKPOINT=0 is reasonable for a legged search. Off = today.
+export GB_SEARCH_LEGS=${GB_SEARCH_LEGS:-0}
 echo "[GALFOR-RATCHET] GALFOR_RATCHET=${GALFOR_RATCHET} hold=${GALFOR_RATCHET_HOLD} release=${GALFOR_RATCHET_RELEASE} cycles=${GALFOR_RATCHET_CYCLES} dlog10 amp/fk/f2=${GALFOR_RATCHET_DLOG10_AMP}/${GALFOR_RATCHET_DLOG10_FK}/${GALFOR_RATCHET_DLOG10_F2} (0 = off: rider + 4 interleaved noise slots as before)"
 # High-f barren-band birth shutoff (search scope): bands above FMIN with
 # AFTER consecutive zero-birth-accept proposes stop proposing births
