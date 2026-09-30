@@ -2141,11 +2141,19 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             otherwise the dictionary is passed to :meth:`_setup_galactic_grid`.
         window_values: Optional window applied to the time-domain data; used for
             normalising the resulting PSD (accounts for windowing-induced loss
-            of power).
+            of power). If ``convolve_window`` is ``True``, the window values are
+            convolved with the sensitivity matrix components along the main frequency diagonal. 
+            Otherwise, only the amplitude is corrected.
+        convolve_window: Whether to convolve the window with the sensitivity
+            matrix components along the main frequency diagonal. Default is ``False``.
+            If ``True``, the backend likelihood computation will be split in two steps, with the convolution applied in python.
+        filters_response: Optional array of filter responses to apply to the sensitivity matrix. If provided, it should be of shape (n_freqs).
         average_transfer_functions: Whether to average the TDI transfer functions
             over the orbit (``True``) or use the values at a single average epoch
             (``False``), in the case of a frequency-domain basis. Default is
             ``False``.
+        smoothing_sigma: Sigma for smoothing the sensitivity matrix around the
+            zero dips. Default is ``1.0``. If ``None``, no smoothing is applied.
     """
 
     def __init__(
@@ -2159,7 +2167,10 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         mask_percentage: Optional[float] = None,
         galactic_grid_kwargs: Optional[dict] = None,
         window_values: Optional[NDArrayLike] = None,
+        convolve_window: bool = False,
+        filters_response: Optional[NDArrayLike] = None,
         average_transfer_functions: bool = False,
+        smoothing_sigma: Optional[float] = 1.0,
     ):
         LISAToolsParallelModule.__init__(self, force_backend=force_backend)
         SensitivityMatrixBase.__init__(self, settings)
@@ -2180,8 +2191,11 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         )
 
         self.mask_percentage = mask_percentage if mask_percentage is not None else 0.05
+        self._smoothing_sigma = smoothing_sigma
 
         self.window_values = window_values
+        self.convolve_window = convolve_window
+        self.filters_response = filters_response
 
         self.average_transfer_functions = average_transfer_functions
         self._averaging_active = False   # set True by get_averaged_ltts() in FD averaged mode
@@ -2205,9 +2219,12 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             "spline_order": self.spline_order,
             "force_backend": self.backend.backend_name.split("_")[-1],
             "mask_percentage": self.mask_percentage,
+            "filters_response": self.filters_response,
             "galactic_grid_kwargs": self.galactic_grid_kwargs,  # propagate to copies
             "window_values": self.window_values,
+            "convolve_window": self.convolve_window,
             "average_transfer_functions": self.average_transfer_functions,
+            "smoothing_sigma": self.smoothing_sigma,
         }
 
     @property
@@ -2218,7 +2235,12 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
     @property
     def smoothing_sigma(self):
         """Sigma for smoothing the sensitivity matrix around the zero dips."""
-        return 5
+        return self._smoothing_sigma
+
+    @smoothing_sigma.setter
+    def smoothing_sigma(self, x):
+        """Set the smoothing sigma for the sensitivity matrix around the zero dips."""
+        self._smoothing_sigma = x
 
     @property
     def time_indices(self):
@@ -2230,6 +2252,35 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
     def time_indices(self, x):
         """Set the time-index array used by the C++ backend."""
         self._time_indices = x
+
+    @property
+    def window_kernel(self):
+        """Window kernel for convolution with the sensitivity matrix."""
+        if not hasattr(self, "_window_kernel"):
+            raise AttributeError("Window kernel has not been set")
+        return self._window_kernel
+
+    @property
+    def window_kernel_fft(self):
+        """FFT of the window kernel for convolution with the sensitivity matrix."""
+        if not hasattr(self, "_window_kernel_fft"):
+            raise AttributeError("Window kernel FFT has not been set")
+        return self._window_kernel_fft
+
+    @window_kernel.setter
+    def window_kernel(self, x):
+        """Set the window kernel for convolution with the sensitivity matrix."""
+        self._window_kernel = x
+        self._window_kernel_fft = self.xp.fft.fft(self._window_kernel)
+
+    @property
+    def active_slice(self):
+        """Slice object for the active frequency bins in the sensitivity matrix."""
+
+        if hasattr(self.basis_settings, "active_slice"):
+            return self.basis_settings.active_slice
+        else:
+            return slice(None)
 
     def get_averaged_ltts(self) -> tuple[np.ndarray, np.ndarray]:
         """Compute averaged and differential light-travel times across LISA links.
@@ -2329,7 +2380,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             self.orbits.armlength,
             self.tdi_generation,
             self.use_splines,
-            self.window_normalization,
+            self.noise_normalization,
         ]
 
         # XYZBackend disabled (symbol issues on Linux): SensitivityMatrixWrap may be absent.
@@ -2390,7 +2441,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
         # Manually copy attributes
         for key, value in self.__dict__.items():
-            if key in ("_backend", "pycpp_sensitivity_matrix", "_galactic_grid", "_avg_tf_arrays"):
+            if key in ("_backend", "pycpp_sensitivity_matrix", "_galactic_grid", "_avg_tf_arrays", "noise_normalization"):
                 # Don't deepcopy backend objects - just reference.
                 # _avg_tf_arrays is referenced by raw pointers inside the (shared)
                 # pycpp_sensitivity_matrix, so copies MUST share these arrays.
@@ -2407,6 +2458,9 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         
         return new_obj
 
+    def _get_window_kernel(self):
+        return self.xp.abs(self.xp.fft.fft(self.window_values)) ** 2 / self.window_values.shape[0] ** 2
+
     def _setup_window(self):
         """Setup window values for the c++ backend."""
         if self.window_values is not None:
@@ -2416,11 +2470,21 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             self.window_values = self.xp.asarray(self.window_values)
 
             num_points = self.window_values.shape[0]
-            self.window_normalization = float(
-                self.xp.sum(self.window_values ** 2) / num_points
-            )
+
+            if self.convolve_window:
+                self.window_kernel = self._get_window_kernel()
+                window_normalization = 1.0  # normalization is handled by the convolution
+            else:
+                window_normalization = float(
+                    self.xp.sum(self.window_values ** 2) / num_points
+                ) # normalization factor for the windowed PSD. only the amplitude is corrected, and not the frequency features.
         else:
-            self.window_normalization = 1.0
+            window_normalization = 1.0
+
+        if self.filters_response is not None:
+            self.noise_normalization = window_normalization * self.xp.ascontiguousarray(self.filters_response)
+        else:
+            self.noise_normalization = window_normalization * self.xp.ones(len(self.basis_settings.f_arr), dtype=self.xp.float64)
                 
     def _init_basis_settings(self):
         """Initialize basis settings from domain settings."""
@@ -2442,7 +2506,6 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
     def _find_dips_with_percentage(self, tf, mask_percentage=0.05):
         """Return indices of bins within ``mask_percentage`` of every transfer-function dip."""
-        f_arr = asnumpy(self.f_arr)
         tf = asnumpy(tf)
 
         peaks = find_peaks(-tf)[0]
@@ -2670,40 +2733,66 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         f_2=0,
         knots_position_all: NDArrayLike = None,
         knots_amplitude_all: NDArrayLike = None,
+        run_async: bool = False,
+        convolve_window: Optional[bool] = None,
     ):
-        """Compute the 6 sensitivity matrix terms using the c++ backend."""
+        """Compute the 6 sensitivity matrix terms using the c++ backend.
+
+        Noise parameters may be scalars or arrays of shape ``(num_psds,)`` (broadcast
+        against each other); all ``num_psds`` covariances are computed in one kernel
+        launch. With all-scalar inputs each returned term has shape ``(total_terms,)``
+        (unchanged legacy behaviour); otherwise ``(num_psds, total_terms)``.
+
+        When ``use_splines`` is set, every PSD carries its own knots, as in
+        :meth:`compute_log_like`: ``knots_position_all`` / ``knots_amplitude_all`` have
+        shape ``(2, num_psds, n_knots)`` (``(2, n_knots)`` for a single PSD), axis 0
+        being the (ISI/OMS, test-mass) pair. Knots are never shared across PSDs; a
+        batch size that does not match ``num_psds`` raises ``ValueError``.
+
+        With ``run_async=True`` the CUDA backend returns before the kernel finishes
+        (stream-ordered on the default stream); synchronize before reading on host.
+        """
 
         xp = self.xp
         total_terms = self.basis_settings.total_terms
+        num_freqs = len(freqs)
 
-        c00 = xp.empty(total_terms, dtype=xp.float64)
-        c11 = xp.empty(total_terms, dtype=xp.float64)
-        c22 = xp.empty(total_terms, dtype=xp.float64)
-        c01 = xp.empty(total_terms, dtype=xp.complex128)
-        c02 = xp.empty(total_terms, dtype=xp.complex128)
-        c12 = xp.empty(total_terms, dtype=xp.complex128)
+        noise_params = (Soms_d_in, Sa_a_in, Amp, alpha, f_1, kn, f_2)
+        batched = any(xp.ndim(p) > 0 for p in noise_params)
+        noise_params = [xp.atleast_1d(xp.asarray(p, dtype=xp.float64)).ravel() for p in noise_params]
+        num_psds = max(len(p) for p in noise_params)
+        # xp.array copies: broadcast views are read-only, which nanobind rejects
+        noise_params = [xp.array(xp.broadcast_to(p, (num_psds,))) for p in noise_params]
 
+        c00 = xp.empty(num_psds * total_terms, dtype=xp.float64)
+        c11 = xp.empty(num_psds * total_terms, dtype=xp.float64)
+        c22 = xp.empty(num_psds * total_terms, dtype=xp.float64)
+        c01 = xp.empty(num_psds * total_terms, dtype=xp.complex128)
+        c02 = xp.empty(num_psds * total_terms, dtype=xp.complex128)
+        c12 = xp.empty(num_psds * total_terms, dtype=xp.complex128)
+
+        # per-PSD spline weights, layout [psd_i * num_freqs + f_idx] (same as compute_log_like)
         if self.use_splines:
             assert knots_position_all is not None and knots_amplitude_all is not None
             splines_out = self.spline_interpolant(xp.log10(freqs), knots_position_all, knots_amplitude_all)
-            splines_in_isi_oms = splines_out[0]
-            spline_in_testmass = splines_out[1]
+            if splines_out[0].size != num_psds * num_freqs:
+                raise ValueError(
+                    f"Spline knots must be given per PSD, shape (2, num_psds={num_psds}, n_knots); "
+                    f"got knots of shape {tuple(knots_position_all.shape)}."
+                )
+            splines_in_isi_oms = xp.ascontiguousarray(splines_out[0], dtype=xp.float64).ravel()
+            spline_in_testmass = xp.ascontiguousarray(splines_out[1], dtype=xp.float64).ravel()
         else:
-            splines_in_isi_oms = xp.zeros(len(freqs), dtype=xp.float64)
-            spline_in_testmass = xp.zeros(len(freqs), dtype=xp.float64)
+            splines_in_isi_oms = xp.zeros(num_psds * num_freqs, dtype=xp.float64)
+            spline_in_testmass = xp.zeros(num_psds * num_freqs, dtype=xp.float64)
 
         if self.pycpp_sensitivity_matrix is None:
             raise RuntimeError("XYZBackend disabled (symbol issues on Linux): get_noise_covariance unavailable.")
+        
         self.pycpp_sensitivity_matrix.get_noise_covariance_wrap(
             xp.asarray(freqs),
             self.time_indices,
-            float(Soms_d_in),
-            float(Sa_a_in),
-            float(Amp),
-            float(alpha),
-            float(f_1),
-            float(kn),
-            float(f_2),
+            *noise_params,
             splines_in_isi_oms,
             spline_in_testmass,
             c00,
@@ -2712,16 +2801,55 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             c11,
             c12,
             c22,
-            len(freqs),
+            num_freqs,
             len(self.time_indices),
+            num_psds,
+            run_async,
         )
+
+        c00, c11, c22, c01, c02, c12 = [
+            c.reshape(num_psds, total_terms) for c in (c00, c11, c22, c01, c02, c12)
+        ]
+
+        convolve = self.convolve_window if convolve_window is None else convolve_window
+        if convolve:
+            c00, c11, c22, c01, c02, c12 = self._convolve_matrix_components(c00, c11, c22, c01, c02, c12, num_psds=num_psds)
 
         return c00, c11, c22, c01, c02, c12
 
-    def _fill_matrix(self, c00, c11, c22, c01, c02, c12):
+    def _convolve_matrix_components(self, c00, c11, c22, c01, c02, c12, num_psds: int = 1):
+        """Convolve one-sided PSD entries with the window's two-sided spectral window.
+
+        ``entries`` may live on the active band only; they are embedded into the full
+        one-sided grid (out-of-band PSD assumed zero), convolved on the full length-N
+        circle, and sliced back. Pass the full grid whenever you can.
+        """
+        xp = self.xp
+        entries = xp.array([c00, c11, c22, c01, c02, c12], dtype=xp.complex128).reshape(6, num_psds, *self.basis_settings.basis_shape_active)
+
+        #guard the first entry to avoid NaN in the convolution. This would be the case if the first frequency point is zero.
+        if not xp.isfinite(entries[..., 0]).all():
+            entries[..., 0] = entries[..., 1] 
+
+        N = len(self.window_values)
+        nf_full = N // 2 + 1
+        fill_low = entries[..., 0:1]
+        fill_high = entries[..., -1:]
+        full = xp.ones(entries.shape[:-1] + (nf_full,), dtype=xp.complex128) * fill_low
+        full[..., self.active_slice] = entries
+        #  pad the low-frequency entries with the lowest frequency (DC) value
+        full[..., self.active_slice.stop:] = fill_high
+
+        two_sided = xp.concatenate([full, xp.conj(full[..., 1:(N + 1) // 2][..., ::-1])], axis=-1)
+
+        conv = xp.fft.ifft(xp.fft.fft(two_sided, axis=-1) * self.window_kernel_fft, axis=-1)
+        conv = conv[..., :nf_full][..., self.active_slice]
+        return [xp.real(conv[i].reshape(num_psds, -1)) for i in range(3)] + [conv[i].reshape(num_psds, -1) for i in range(3, 6)]
+
+    def _fill_matrix(self, c00, c11, c22, c01, c02, c12, num_psds: int = 1):
         """Fill the full 3x3 sensitivity matrix from its 6 unique elements."""
         xp = self.xp
-        shape = self.basis_settings.basis_shape_active
+        shape = self.basis_settings.basis_shape_active if num_psds == 1 else (num_psds,) + self.basis_settings.basis_shape_active
 
         # Reshape views (no copy)
         c00 = c00.reshape(shape)
@@ -2732,21 +2860,27 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         c12 = c12.reshape(shape)
 
         # Direct assignment is faster than stack (no intermediate copies)
-        matrix = xp.empty(self.channel_shape + shape, dtype=xp.complex128)
-        matrix[0, 0] = c00
-        matrix[1, 1] = c11
-        matrix[2, 2] = c22
-        matrix[0, 1] = c01
-        matrix[1, 0] = c01.conj()
-        matrix[0, 2] = c02
-        matrix[2, 0] = c02.conj()
-        matrix[1, 2] = c12
-        matrix[2, 1] = c12.conj()
+        matrix_shape = (num_psds,) + self.channel_shape + self.basis_settings.basis_shape_active
+        matrix = xp.empty(matrix_shape, dtype=xp.complex128)
+        matrix[:, 0, 0] = c00
+        matrix[:, 1, 1] = c11
+        matrix[:, 2, 2] = c22
+        matrix[:, 0, 1] = c01
+        matrix[:, 1, 0] = c01.conj()
+        matrix[:, 0, 2] = c02
+        matrix[:, 2, 0] = c02.conj()
+        matrix[:, 1, 2] = c12
+        matrix[:, 2, 1] = c12.conj()
 
+        if num_psds == 1:
+            matrix = matrix[0]  # remove the leading PSD axis for single-PSD case
         return matrix
 
     def _extract_matrix_elements(self, matrix_in, flatten=False):
         """Extract the 6 unique sensitivity matrix elements from the full 3x3 matrix."""
+
+        if matrix_in.shape[:len(self.channel_shape)] != self.channel_shape:
+            raise ValueError(f"Input matrix shape {matrix_in.shape} does not match expected channel shape {self.channel_shape}.")
 
         c00 = matrix_in[0, 0].real
         c11 = matrix_in[1, 1].real
@@ -2769,16 +2903,16 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
     def compute_sensitivity_matrix(
         self,
-        freqs: NDArrayLike,
-        Soms_d_in: float = 15e-12,
-        Sa_a_in: float = 3e-15,
-        Amp: float = 0.0,
-        alpha: float = 0.0,
-        f_1: float = 0.0,
-        kn: float = 0.0,
-        f_2: float = 0.0,
+        Soms_d_in: float | NDArrayLike = 15e-12,
+        Sa_a_in: float | NDArrayLike = 3e-15,
+        Amp: float | NDArrayLike = 0.0,
+        alpha: float | NDArrayLike = 0.0,
+        f_1: float | NDArrayLike = 0.0,
+        kn: float | NDArrayLike = 0.0,
+        f_2: float | NDArrayLike = 0.0,
         knots_position_all: NDArrayLike = None,
         knots_amplitude_all: NDArrayLike = None,
+        convolve_window: Optional[bool] = None,
         smooth: bool = False,
     ) -> NDArrayLike:
         """Compute the full 3×3 XYZ covariance matrix at arbitrary frequencies.
@@ -2791,11 +2925,9 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
         Unlike :meth:`set_sensitivity_matrix`, this method does **not** update the
         internal ``sens_mat`` attribute; it is for one-off evaluations (e.g.,
-        diagnostics, plotting).
+        diagnostics, likelihood calculations, plotting).
 
         Args:
-            freqs: Frequency array at which to evaluate the matrix [Hz].
-                   Shape ``(n_freqs,)`` or ``(n_times, n_freqs)`` depending on the domain.
             Soms_d_in: Displacement (OMS) noise amplitude ``S_oms`` [m/√Hz]. Default 15 pm/√Hz.
             Sa_a_in: Test-mass acceleration noise amplitude ``S_acc`` [m s⁻²/√Hz]. Default 3 fm s⁻²/√Hz.
             Amp: Galactic foreground spectral amplitude ``A`` [Hz⁻¹]. Pass 0 to omit.
@@ -2807,6 +2939,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
                 noise residuals. Shape ``(2, n_knots)``. ``None`` if not using splines.
             knots_amplitude_all: Spline knot amplitudes for noise residuals.
                 Shape ``(2, n_knots)``. ``None`` if not using splines.
+            convolve_window: If ``True``, convolve the PSD with the window's two-sided spectral window before returning. Default ``None``, which uses the init ``convolve_window`` setting.
             smooth: If ``True``, apply Gaussian smoothing around the TDI notches
                 (zeros of the transfer function) before returning. Default ``False``.
 
@@ -2816,7 +2949,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             dtype ``complex128``.
         """
         c00, c11, c22, c01, c02, c12 = self._compute_matrix_elements(
-            freqs,
+            self.f_arr,
             Soms_d_in,
             Sa_a_in,
             Amp,
@@ -2826,10 +2959,12 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             f_2,
             knots_position_all,
             knots_amplitude_all,
+            run_async=False,
+            convolve_window=convolve_window
         )
         matrix = self._fill_matrix(c00, c11, c22, c01, c02, c12)
         
-        if smooth:
+        if smooth and self.smoothing_sigma > 0:
             matrix = self.smooth_sensitivity_matrix(matrix, sigma=self.smoothing_sigma)
 
         return matrix
@@ -2870,23 +3005,23 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             kn: Galactic foreground knee frequency ``f_knee`` [Hz].
             f_2: Galactic foreground high-frequency roll-off scale ``f₂`` [Hz].
         """
+        # this method only sets the internal matrix, and therefore cannot accept batched inputs (num_psds > 1).  Use compute_sensitivity_matrix for one-off evaluations.
 
-        c00, c11, c22, c01, c02, c12 = self._compute_matrix_elements(
-            self.f_arr,
-            Soms_d_in,
-            Sa_a_in,
-            Amp,
-            alpha,
-            f_1,
-            kn,
-            f_2,
-            knots_position_all,
-            knots_amplitude_all,
+        assert np.isscalar(Soms_d_in) and np.isscalar(Sa_a_in) and np.isscalar(Amp) and np.isscalar(alpha) and np.isscalar(f_1) and np.isscalar(kn) and np.isscalar(f_2), "set_sensitivity_matrix only accepts scalar inputs; use compute_sensitivity_matrix for batched evaluations."
+
+        self.sens_mat = self.compute_sensitivity_matrix(
+            Soms_d_in=Soms_d_in,
+            Sa_a_in=Sa_a_in,
+            knots_position_all=knots_position_all,
+            knots_amplitude_all=knots_amplitude_all,
+            Amp=Amp,
+            alpha=alpha,
+            f_1=f_1,
+            kn=kn,
+            f_2=f_2,
+            smooth=True,  # always smooth when setting the internal matrix
+            convolve_window=self.convolve_window  # use the init setting for internal matrix
         )
-
-        sens_mat = self._fill_matrix(c00, c11, c22, c01, c02, c12)
-
-        self.sens_mat = self.smooth_sensitivity_matrix(sens_mat, sigma=self.smoothing_sigma)
 
     def _setup_det_and_inv(self):
         """use the c++ backend to compute the log-determinant and inverse of the sensitivity matrix."""
@@ -3051,13 +3186,14 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         f_2_in_all: NDArrayLike,
         knots_position_all: NDArrayLike = None,
         knots_amplitude_all: NDArrayLike = None,
+        convolve_window: Optional[bool] = None,
         run_async: bool = False,
     ) -> NDArrayLike:
         """
         Compute log-likelihood using the c++ backend.
 
         Args:
-            data_in_all: Input data array. Shape (num_psds, num_freqs * num_times)
+            data_in_all: Input data array. Shape (num_psds * num_channels * num_freqs * num_times)
             data_index_all: Data indices array to keep track of which data corresponds to which PSD. Shape (num_psds)
             Soms_in_all: Displacement noise levels for each walker. Shape (num_psds)
             Sa_in_all: Acceleration noise levels for each walker. Shape (num_psds)
@@ -3066,8 +3202,9 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             f_1_in_all: First galactic foreground scale-frequency parameter for each walker. Shape (num_psds)
             kn_in_all: Galactic foreground knee frequency parameter for each walker. Shape (num_psds)
             f_2_in_all: Second galactic foreground scale-frequency parameter for each walker. Shape (num_psds)
-            knots_position_all: Positions of spline knots for noise modeling. Shape (2 * num_psds, num_knots)
-            knots_amplitude_all: Amplitudes of spline knots for noise modeling. Shape (2 * num_psds, num_knots)
+            knots_position_all: Log10-frequency positions of spline knots for noise modeling, one set
+                per walker (never shared). Shape (2, num_psds, num_knots), axis 0 = (ISI/OMS, test-mass).
+            knots_amplitude_all: Amplitudes of spline knots for noise modeling. Shape (2, num_psds, num_knots)
             run_async: Whether to run the CUDA computation asynchronously. Default is False.
 
         Returns:
@@ -3076,15 +3213,19 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
         xp = self.xp
 
-        # sanitize input
-        Soms_in_all = xp.atleast_1d(Soms_in_all)
-        Sa_in_all = xp.atleast_1d(Sa_in_all)
+        # sanitize input: nanobind accepts strided views but the kernel reads .data() as
+        # contiguous, so e.g. a column params[:, j] would hand walker i>0 the wrong values
+        def _sanitize(p):
+            return xp.ascontiguousarray(xp.atleast_1d(xp.asarray(p)), dtype=xp.float64)
 
-        Amp_in_all = xp.atleast_1d(Amp_in_all)
-        alpha_in_all = xp.atleast_1d(alpha_in_all)
-        f_1_in_all = xp.atleast_1d(f_1_in_all)
-        kn_in_all = xp.atleast_1d(kn_in_all)
-        f_2_in_all = xp.atleast_1d(f_2_in_all)
+        Soms_in_all = _sanitize(Soms_in_all)
+        Sa_in_all = _sanitize(Sa_in_all)
+
+        Amp_in_all = _sanitize(Amp_in_all)
+        alpha_in_all = _sanitize(alpha_in_all)
+        f_1_in_all = _sanitize(f_1_in_all)
+        kn_in_all = _sanitize(kn_in_all)
+        f_2_in_all = _sanitize(f_2_in_all)
         
         # same for splines?
 
@@ -3092,21 +3233,54 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
         log_like_out = xp.zeros(shape=(num_psds,), dtype=xp.float64)
 
-        if self.use_splines:
-            splines_weights = self.spline_interpolant(
-                xp.log10(self.f_arr), knots_position_all, knots_amplitude_all
-            )
-            splines_weights_isi_oms = splines_weights[0].flatten()
-            splines_weights_testmass = splines_weights[1].flatten()
-            # splines_weights_isi_oms = splines_weights[:num_psds].flatten()
-            # splines_weights_testmass = splines_weights[num_psds:].flatten()
-
-        else:
-            splines_weights_isi_oms = xp.zeros(shape=(num_psds * self.num_freqs))
-            splines_weights_testmass = xp.zeros(shape=(num_psds * self.num_freqs))
-
         if self.pycpp_sensitivity_matrix is None:
             raise RuntimeError("XYZBackend disabled (symbol issues on Linux): psd_likelihood unavailable.")
+
+        # Exactly one path consumes the splines / the external matrix; the kernel never
+        # reads the other's arrays, so those are passed empty (the binding accepts it).
+        empty_real = xp.empty(0, dtype=xp.float64)
+        empty_cplx = xp.empty(0, dtype=xp.complex128)
+
+        convolve_window = self.convolve_window if convolve_window is None else convolve_window
+        if convolve_window:
+            # splines are interpolated (and their per-walker shape validated) in here
+            splines_weights_isi_oms = splines_weights_testmass = empty_real
+            c00_all, c11_all, c22_all, c01_all, c02_all, c12_all = self._compute_matrix_elements(
+                self.f_arr,
+                Soms_in_all,
+                Sa_in_all,
+                Amp_in_all,
+                alpha_in_all,
+                f_1_in_all,
+                kn_in_all,
+                f_2_in_all,
+                knots_position_all,
+                knots_amplitude_all,
+                run_async=run_async,
+                convolve_window=convolve_window
+            )
+        else:
+            c00_all = c11_all = c22_all = empty_real
+            c01_all = c02_all = c12_all = empty_cplx
+
+            if self.use_splines:
+                splines_weights = self.spline_interpolant(
+                    xp.log10(self.f_arr), knots_position_all, knots_amplitude_all
+                )
+                # the CUDA binding skips length checks: guard here so a mis-shaped
+                # knot batch cannot read past the end of the spline buffer
+                if splines_weights[0].size != num_psds * self.num_freqs:
+                    raise ValueError(
+                        f"Spline knots must be given per walker, shape (2, num_psds={num_psds}, n_knots); "
+                        f"got knots of shape {tuple(knots_position_all.shape)}."
+                    )
+                splines_weights_isi_oms = splines_weights[0].flatten()
+                splines_weights_testmass = splines_weights[1].flatten()
+            else:
+                splines_weights_isi_oms = xp.zeros(shape=(num_psds * self.num_freqs))
+                splines_weights_testmass = xp.zeros(shape=(num_psds * self.num_freqs))
+
+        
         self.pycpp_sensitivity_matrix.psd_likelihood_wrap(
             log_like_out,
             self.f_arr,
@@ -3127,6 +3301,13 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             self.num_times,
             self.dips_mask,
             num_psds,
+            c00_all.flatten(),
+            c11_all.flatten(),
+            c22_all.flatten(),
+            c01_all.flatten(),
+            c02_all.flatten(),
+            c12_all.flatten(),
+            convolve_window,
             run_async
         )
 

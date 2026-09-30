@@ -69,14 +69,15 @@ def _per_epoch_mean_cov(backend, f_arr, avg, delta):
     # locals (an inline temporary is freed before get_noise_covariance_wrap runs).
     avg_flat = np.ascontiguousarray(avg.flatten())
     delta_flat = np.ascontiguousarray(delta.flatten())
+    noise_norm = np.ones(nf)
     wrap = backend.backend.SensitivityMatrixWrap(
-        avg_flat, delta_flat, N, float(backend.orbits.armlength), 2, False, 1.0)
+        avg_flat, delta_flat, N, float(backend.orbits.armlength), 2, False, noise_norm)
     c = [np.empty(N * nf, dtype=np.float64 if r else np.complex128)
          for r in (True, False, False, True, False, True)]
+    params = [np.array([p], dtype=np.float64) for p in (Soms_d, Sa_a, 0.0, 0.0, 0.0, 0.0, 0.0)]
     wrap.get_noise_covariance_wrap(
-        np.ascontiguousarray(f_arr), np.arange(N, dtype=np.int32),
-        float(Soms_d), float(Sa_a), 0.0, 0.0, 0.0, 0.0, 0.0,
-        np.zeros(nf), np.zeros(nf), c[0], c[1], c[2], c[3], c[4], c[5], nf, N)
+        np.ascontiguousarray(f_arr), np.arange(N, dtype=np.int32), *params,
+        np.zeros(nf), np.zeros(nf), c[0], c[1], c[2], c[3], c[4], c[5], nf, N, 1)
     r = lambda a: a.reshape(N, nf)
     C = np.empty((3, 3, N, nf), dtype=np.complex128)
     C[0, 0] = r(c[0]); C[1, 1] = r(c[3]); C[2, 2] = r(c[5])
@@ -94,7 +95,7 @@ def test_averaged_backend_matches_per_epoch_mean():
     favg, fdelta = bk.get_averaged_ltts()
     favg = _to_np(favg); fdelta = _to_np(fdelta)
     f_arr = np.asarray(bk.f_arr)
-    C_backend = np.asarray(bk.compute_sensitivity_matrix(bk.f_arr, Soms_d, Sa_a))
+    C_backend = np.asarray(bk.compute_sensitivity_matrix(Soms_d, Sa_a))
     C_ref = _per_epoch_mean_cov(bk, f_arr, favg, fdelta)
     assert np.allclose(C_backend, C_ref, rtol=1e-9, atol=0.0)
 
@@ -104,8 +105,8 @@ def test_averaging_shifts_TT_not_AA():
     _, bk_avg = _backend(True)
     _, bk_one = _backend(False)   # single median-LTT epoch, i.e. C(E[L])
     f = np.asarray(bk_avg.f_arr)
-    Cavg = np.asarray(bk_avg.compute_sensitivity_matrix(bk_avg.f_arr, Soms_d, Sa_a))
-    Cone = np.asarray(bk_one.compute_sensitivity_matrix(bk_one.f_arr, Soms_d, Sa_a))
+    Cavg = np.asarray(bk_avg.compute_sensitivity_matrix(Soms_d, Sa_a))
+    Cone = np.asarray(bk_one.compute_sensitivity_matrix(Soms_d, Sa_a))
     lowf = f < 5e-4
     assert to_tt(Cavg)[lowf].mean() > 1.05 * to_tt(Cone)[lowf].mean()        # TT null raised
     assert np.allclose(to_aet_diag(Cavg)[0], to_aet_diag(Cone)[0], rtol=0.02)  # AA ~unchanged

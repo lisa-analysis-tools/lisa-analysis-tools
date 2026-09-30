@@ -68,7 +68,7 @@ public:
     int     n_links;
     int     left_mosas[3];
     int     generation;
-    double window_factor;
+    double *noise_normalization;
 
     NoiseLevels noise_levels;
 
@@ -89,7 +89,7 @@ public:
     // ---- constructor ----
     XYZSensitivityMatrix(double *averaged_ltts_arr_, double *delta_ltts_arr_,
                          int n_times_, double armlength_,
-                         int generation_, bool spline_noise_, double window_factor_)
+                         int generation_, bool spline_noise_, double *noise_normalization_)
         : noise_levels(true, spline_noise_, .4e-3, 8e-3, 2.0e-3)
     {
         averaged_ltts_arr = averaged_ltts_arr_;
@@ -101,7 +101,7 @@ public:
         left_mosas[0]     = 12;
         left_mosas[1]     = 23;
         left_mosas[2]     = 31;
-        window_factor     = window_factor_;
+        noise_normalization = noise_normalization_;
         // galactic foreground disabled by default
         gal_R_avg    = nullptr;
         use_galactic = false;
@@ -161,16 +161,18 @@ public:
         double *Amp_all, double *alpha_all, double *f_1_all, double *f_knee_all, double *f_2_all,
         double *spline_in_isi_oms_all, double *spline_in_testmass_all,
         double differential_component, int num_freqs, int num_times,
-        bool *dips_mask, int num_psds, bool run_async = false);
+        bool *dips_mask, int num_psds, 
+        double *c00_all, double *c11_all, double *c22_all, cmplx *c01_all, cmplx *c02_all, cmplx *c12_all,
+        bool use_external_matrix = false, bool run_async = false);
 
     void get_noise_covariance_arr(
         double *freqs, int *time_indices,
-        double Soms_d_in, double Sa_a_in,
-        double Amp, double alpha, double f_1, double f_knee, double f_2,
+        double *Soms_d_in_all, double *Sa_a_in_all,
+        double *Amp_all, double *alpha_all, double *f_1_all, double *f_knee_all, double *f_2_all,
         double *spline_in_isi_oms_all, double *spline_in_testmass_all,
         double *c00_arr, gcmplx::complex<double> *c01_arr, gcmplx::complex<double> *c02_arr,
         double *c11_arr, gcmplx::complex<double> *c12_arr, double *c22_arr,
-        int num_freqs, int num_times);
+        int num_freqs, int num_times, int num_psds, bool run_async = false);
 
     void get_inverse_det_arr(
         double *c00_arr, gcmplx::complex<double> *c01_arr, gcmplx::complex<double> *c02_arr,

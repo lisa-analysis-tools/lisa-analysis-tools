@@ -248,12 +248,19 @@ class XYZSensitivityMatrixWrap {
 public:
     XYZSensitivityMatrix *sensitivity_matrix;
 
-    XYZSensitivityMatrixWrap(array_type<double> averaged_ltts_arr_, array_type<double> delta_ltts_arr_, int n_times_, double armlength_, int generation_, bool spline_noise_, double window_factor_)
+    // noise_normalization_: per-frequency factor (window power x filter response) over the
+    // active band, indexed by f_idx in the kernels. Stored NON-OWNED: keep it alive in Python.
+    XYZSensitivityMatrixWrap(array_type<double> averaged_ltts_arr_, array_type<double> delta_ltts_arr_, int n_times_, double armlength_, int generation_, bool spline_noise_, array_type<double> noise_normalization_)
     {
         double *_averaged_ltts_arr = return_pointer_and_check_length(averaged_ltts_arr_, std::string("averaged_ltts_arr"), n_times_, 6);
         double *_delta_ltts_arr = return_pointer_and_check_length(delta_ltts_arr_, std::string("delta_ltts_arr"), n_times_, 6);
 
-        sensitivity_matrix = new XYZSensitivityMatrix(_averaged_ltts_arr, _delta_ltts_arr, n_times_, armlength_, generation_, spline_noise_, window_factor_);
+        // the active-band length is unknown here; at least reject an empty array
+        if (noise_normalization_.size() == 0)
+            throw std::invalid_argument("noise_normalization: empty array; expected one factor per active frequency.");
+        double *_noise_normalization = noise_normalization_.data();
+
+        sensitivity_matrix = new XYZSensitivityMatrix(_averaged_ltts_arr, _delta_ltts_arr, n_times_, armlength_, generation_, spline_noise_, _noise_normalization);
     }
 
     ~XYZSensitivityMatrixWrap() {
@@ -303,16 +310,21 @@ public:
         array_type<double> f_1_all, array_type<double> f_knee_all, array_type<double> f_2_all,
         array_type<double> spline_in_isi_oms_all, array_type<double> spline_in_testmass_all,
         double differential_component, int num_freqs, int num_times,
-        array_type<bool> dips_mask, int num_psds, bool run_async = false);
+        array_type<bool> dips_mask, int num_psds,
+        array_type<double> c00_all, array_type<double> c11_all, array_type<double> c22_all,
+        array_type<std::complex<double>> c01_all, array_type<std::complex<double>> c02_all,
+        array_type<std::complex<double>> c12_all,
+        bool use_external_matrix = false, bool run_async = false);
 
     void get_noise_covariance_wrap(
         array_type<double> freqs, array_type<int> time_indices,
-        double Soms_d_in, double Sa_a_in,
-        double Amp, double alpha, double f_1, double f_knee, double f_2,
-        array_type<double> spline_in_isi_oms_arr, array_type<double> spline_in_testmass_arr,
+        array_type<double> Soms_d_in_all, array_type<double> Sa_a_in_all,
+        array_type<double> Amp_all, array_type<double> alpha_all,
+        array_type<double> f_1_all, array_type<double> f_knee_all, array_type<double> f_2_all,
+        array_type<double> spline_in_isi_oms_all, array_type<double> spline_in_testmass_all,
         array_type<double> c00_arr, array_type<std::complex<double>> c01_arr, array_type<std::complex<double>> c02_arr,
         array_type<double> c11_arr, array_type<std::complex<double>> c12_arr, array_type<double> c22_arr,
-        int num_freqs, int num_times);
+        int num_freqs, int num_times, int num_psds, bool run_async = false);
 
     void set_averaged_tfs_wrap(
         array_type<double> oms_xx, array_type<std::complex<double>> oms_xy, array_type<std::complex<double>> oms_xz,

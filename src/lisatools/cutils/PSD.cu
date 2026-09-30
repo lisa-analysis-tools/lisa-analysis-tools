@@ -290,6 +290,8 @@ CUDA_KERNEL void psd_likelihood_xyz_kernel(
     double *Amp_all, double *alpha_all, double *f_1_all, double *f_knee_all, double *f_2_all,
     double *spline_in_isi_oms_all, double *spline_in_testmass_all,
     double differential_component, int num_freqs, int num_times, bool *dips_mask, int num_psds, 
+    double *c00_all, double *c11_all, double *c22_all, cmplx *c01_all, cmplx *c02_all, cmplx *c12_all,
+    bool use_external_matrix,
     XYZSensitivityMatrix sensitivity_matrix)
 {
     int tid;
@@ -304,10 +306,11 @@ CUDA_KERNEL void psd_likelihood_xyz_kernel(
     double f;
     int data_index, time_index;
     cmplx d_X, d_Y, d_Z;
-    
-    // Covariance matrix elements (Upper triangle of 3x3 Hermitian)
+
+    // matrix elements
     double c00, c11, c22;
     cmplx c01, c02, c12;
+    
     // Inverse elements
     double i00, i11, i22, det;
     cmplx i01, i02, i12;
@@ -341,13 +344,15 @@ CUDA_KERNEL void psd_likelihood_xyz_kernel(
         data_index = data_index_all[psd_i];
 
         // Noise parameters for this PSD
-        Soms_d_in = Soms_d_in_all[psd_i];
-        Sa_a_in = Sa_a_in_all[psd_i];
-        Amp = Amp_all[psd_i];
-        alpha = alpha_all[psd_i];
-        f_1 = f_1_all[psd_i];
-        f_knee = f_knee_all[psd_i];
-        f_2 = f_2_all[psd_i];
+         if (use_external_matrix == false) {
+          Soms_d_in = Soms_d_in_all[psd_i];
+          Sa_a_in = Sa_a_in_all[psd_i];
+          Amp = Amp_all[psd_i];
+          alpha = alpha_all[psd_i];
+          f_1 = f_1_all[psd_i];
+          f_knee = f_knee_all[psd_i];
+          f_2 = f_2_all[psd_i];
+         }
 
         // Initialize reduction
         like_vals[tid] = 0.0;
@@ -382,19 +387,29 @@ CUDA_KERNEL void psd_likelihood_xyz_kernel(
             {
                 f = f_arr[f_idx + 1]; // Avoid zero frequency 
             }
-            
-            double spline_in_isi_oms = spline_in_isi_oms_all[psd_i * num_freqs + f_idx];
-            double spline_in_testmass = spline_in_testmass_all[psd_i * num_freqs + f_idx];
 
-            // Get noise covariance matrix for this (time, frequency) pair
-            sensitivity_matrix.get_noise_covariance(
-                f, time_index, f_idx,
-                Soms_d_in, Sa_a_in,
-                Amp, alpha, f_1, f_knee, f_2,
-                spline_in_isi_oms, spline_in_testmass,
-                &c00, &c01, &c02, &c11, &c12, &c22
-            );
+            // read the pre-computed covariance matrix elements for this (psd_i, time, frequency) index
+            if (use_external_matrix) {
+                c00 = c00_all[psd_i * total_tf_pairs + idx];
+                c11 = c11_all[psd_i * total_tf_pairs + idx];
+                c22 = c22_all[psd_i * total_tf_pairs + idx];
+                c01 = c01_all[psd_i * total_tf_pairs + idx];
+                c02 = c02_all[psd_i * total_tf_pairs + idx];
+                c12 = c12_all[psd_i * total_tf_pairs + idx];
+            } else {
+                // Compute covariance matrix elements for this (time, frequency) pair
+                double spline_in_isi_oms = spline_in_isi_oms_all[psd_i * num_freqs + f_idx];
+                double spline_in_testmass = spline_in_testmass_all[psd_i * num_freqs + f_idx];
 
+                // Get noise covariance matrix for this (time, frequency) pair
+                sensitivity_matrix.get_noise_covariance(
+                    f, time_index, f_idx,
+                    Soms_d_in, Sa_a_in,
+                    Amp, alpha, f_1, f_knee, f_2,
+                    spline_in_isi_oms, spline_in_testmass,
+                    &c00, &c01, &c02, &c11, &c12, &c22
+                );
+              }
             // Invert C -> C^-1
             invert_3x3_hermitian(c00, c01, c02, c11, c12, c22, 
                                  i00, i01, i02, i11, i12, i22, det);
@@ -524,7 +539,10 @@ void XYZSensitivityMatrix::psd_likelihood_wrap(
     double* Amp_all, double* alpha_all, double* f_1_all, double* f_knee_all,
     double* f_2_all, double* spline_in_isi_oms_all, double* spline_in_testmass_all,
     double differential_component, int num_freqs,
-    int num_times, bool* dips_mask, int num_psds, bool run_async) {
+    int num_times, bool* dips_mask, int num_psds,
+    double *c00_all, double *c11_all, double *c22_all, cmplx *c01_all, cmplx *c02_all, cmplx *c12_all,
+    bool use_external_matrix, bool run_async
+  ) {
   int total_tf_pairs = num_times * num_freqs;
 
 #ifdef __CUDACC__
@@ -555,7 +573,8 @@ void XYZSensitivityMatrix::psd_likelihood_wrap(
       like_contrib, f_arr, data, data_index_all, time_index_all, Soms_d_in_all,
       Sa_a_in_all, Amp_all, alpha_all,f_1_all, f_knee_all, f_2_all,
       spline_in_isi_oms_all, spline_in_testmass_all, differential_component,
-      num_freqs, num_times, dips_mask, num_psds, *this);
+      num_freqs, num_times, dips_mask, num_psds, c00_all, c11_all, c22_all, c01_all, c02_all, c12_all,
+      use_external_matrix, *this);
 
   // cudaStreamSynchronize(cudaStreamDefault); avoid explicit sync by using
   // async free after reduction
@@ -581,7 +600,9 @@ void XYZSensitivityMatrix::psd_likelihood_wrap(
         Soms_d_in_all, Sa_a_in_all,
         Amp_all, alpha_all, f_1_all, f_knee_all, f_2_all,
         spline_in_isi_oms_all, spline_in_testmass_all,
-        differential_component, num_freqs, num_times, dips_mask, num_psds, *this);
+        differential_component, num_freqs, num_times, dips_mask, num_psds, 
+        c00_all, c11_all, c22_all, c01_all, c02_all, c12_all,
+        use_external_matrix, *this);
 #endif
 }
 
@@ -883,34 +904,36 @@ void XYZSensitivityMatrix::get_noise_covariance(
       
     }
   
-  *c00 *= window_factor;
-  *c11 *= window_factor;
-  *c22 *= window_factor;
-  *c01 *= window_factor;
-  *c02 *= window_factor;
-  *c12 *= window_factor;
+  *c00 *= noise_normalization[f_idx];
+  *c11 *= noise_normalization[f_idx];
+  *c22 *= noise_normalization[f_idx];
+  *c01 *= noise_normalization[f_idx];
+  *c02 *= noise_normalization[f_idx];
+  *c12 *= noise_normalization[f_idx];
 }
 
 CUDA_KERNEL
 void get_noise_covariance_kernel(
     double *frequencies, int *time_indices,
-    double Soms_d_in, double Sa_a_in,
-    double Amp, double alpha, double f_1, double f_knee, double f_2,
-    double *spline_in_isi_oms_arr, double *spline_in_testmass_arr,
+    double *Soms_d_in_all, double *Sa_a_in_all,
+    double *Amp_all, double *alpha_all, double *f_1_all, double *f_knee_all, double *f_2_all,
+    double *spline_in_isi_oms_all, double *spline_in_testmass_all,
     double *c00_arr, cmplx *c01_arr, cmplx *c02_arr,
     double *c11_arr, cmplx *c12_arr, double *c22_arr,
-    int num_freqs, int num_times,
+    int num_freqs, int num_times, int num_psds,
     XYZSensitivityMatrix* sensitivity_matrix)
 {
-    // Memory layout: output[t_idx * num_freqs + f_idx]
+    // Memory layout: output[psd_i * num_times * num_freqs + t_idx * num_freqs + f_idx]
     // Frequencies are the fast-varying dimension for coalesced access
     
     int start_freq, end_freq, increment_freq;
     int start_time, end_time, increment_time;
+    int start_psd, end_psd, increment_psd;
     double spline_in_isi_oms, spline_in_testmass;
+    double Soms_d_in, Sa_a_in, Amp, alpha, f_1, f_knee, f_2;
 
 #ifdef __CUDACC__
-  // X dimension for frequencies (fast), Y dimension for times (slow)
+  // X dimension for frequencies (fast), Y dimension for times, Z dimension for PSDs (slow)
   start_freq = blockIdx.x * blockDim.x + threadIdx.x;
   end_freq = num_freqs;
   increment_freq = gridDim.x * blockDim.x;
@@ -918,6 +941,10 @@ void get_noise_covariance_kernel(
   start_time = blockIdx.y * blockDim.y + threadIdx.y;
   end_time = num_times;
   increment_time = gridDim.y * blockDim.y;
+
+  start_psd = blockIdx.z;
+  end_psd = num_psds;
+  increment_psd = gridDim.z;
 #else
   start_freq = 0;
   end_freq = num_freqs;
@@ -925,79 +952,109 @@ void get_noise_covariance_kernel(
   start_time = 0;
   end_time = num_times;
   increment_time = 1;
+  start_psd = 0;
+  end_psd = num_psds;
+  increment_psd = 1;
 #endif
 
-    for (int t_idx = start_time; t_idx < end_time; t_idx += increment_time)
+    for (int psd_i = start_psd; psd_i < end_psd; psd_i += increment_psd)
     {
-        int time_index = time_indices[t_idx];
-        int base_out_idx = t_idx * num_freqs;
+        // Noise parameters for this PSD
+        Soms_d_in = Soms_d_in_all[psd_i];
+        Sa_a_in = Sa_a_in_all[psd_i];
+        Amp = Amp_all[psd_i];
+        alpha = alpha_all[psd_i];
+        f_1 = f_1_all[psd_i];
+        f_knee = f_knee_all[psd_i];
+        f_2 = f_2_all[psd_i];
 
-        for (int f_idx = start_freq; f_idx < end_freq; f_idx += increment_freq)
+        // 64-bit: num_psds * num_times * num_freqs can exceed INT_MAX
+        long long base_psd_idx = (long long)psd_i * num_times * num_freqs;
+
+        for (int t_idx = start_time; t_idx < end_time; t_idx += increment_time)
         {
-            double f = frequencies[f_idx];
-            int out_idx = base_out_idx + f_idx;
+            int time_index = time_indices[t_idx];
+            long long base_out_idx = base_psd_idx + (long long)t_idx * num_freqs;
 
-            spline_in_isi_oms = spline_in_isi_oms_arr[f_idx];
-            spline_in_testmass = spline_in_testmass_arr[f_idx];
+            for (int f_idx = start_freq; f_idx < end_freq; f_idx += increment_freq)
+            {
+                double f = frequencies[f_idx];
+                long long out_idx = base_out_idx + f_idx;
 
-            sensitivity_matrix->get_noise_covariance(
-                f, time_index, f_idx,
-                Soms_d_in, Sa_a_in,
-                Amp, alpha, f_1, f_knee, f_2,
-                spline_in_isi_oms, spline_in_testmass,
-                &c00_arr[out_idx], &c01_arr[out_idx], &c02_arr[out_idx],
-                &c11_arr[out_idx], &c12_arr[out_idx], &c22_arr[out_idx]
-            );
+                spline_in_isi_oms = spline_in_isi_oms_all[psd_i * num_freqs + f_idx];
+                spline_in_testmass = spline_in_testmass_all[psd_i * num_freqs + f_idx];
+
+                sensitivity_matrix->get_noise_covariance(
+                    f, time_index, f_idx,
+                    Soms_d_in, Sa_a_in,
+                    Amp, alpha, f_1, f_knee, f_2,
+                    spline_in_isi_oms, spline_in_testmass,
+                    &c00_arr[out_idx], &c01_arr[out_idx], &c02_arr[out_idx],
+                    &c11_arr[out_idx], &c12_arr[out_idx], &c22_arr[out_idx]
+                );
+            }
         }
     }
   }
 
 void XYZSensitivityMatrix::get_noise_covariance_arr(
     double *freqs, int *time_indices,
-    double Soms_d_in, double Sa_a_in,
-    double Amp, double alpha, double f_1, double f_knee, double f_2,
-    double *spline_in_isi_oms_arr, double *spline_in_testmass_arr,
+    double *Soms_d_in_all, double *Sa_a_in_all,
+    double *Amp_all, double *alpha_all, double *f_1_all, double *f_knee_all, double *f_2_all,
+    double *spline_in_isi_oms_all, double *spline_in_testmass_all,
     double *c00_arr, cmplx *c01_arr, cmplx *c02_arr,
     double *c11_arr, cmplx *c12_arr, double *c22_arr,
-    int num_freqs, int num_times)
+    int num_freqs, int num_times, int num_psds, bool run_async)
 {
 #ifdef __CUDACC__
-    // 2D grid: X for frequencies (coalesced), Y for time indices
+    // 3D grid: X for frequencies (coalesced), Y for time indices, Z for PSDs
     // Use more threads in X for better coalescing
-    dim3 block(32, 8);  // 32 threads in freq dimension for warp coalescing
+    dim3 block(32, 8, 1);  // 32 threads in freq dimension for warp coalescing
     dim3 grid(
         (num_freqs + block.x - 1) / block.x,
-        (num_times + block.y - 1) / block.y
+        (num_times + block.y - 1) / block.y,
+        std::min(num_psds, 65535)
     );
     
-    // Copy self to GPU
+    // Copy self to GPU (stream-ordered when run_async)
     XYZSensitivityMatrix *sensitivity_matrix_gpu;
-    gpuErrchk(cudaMalloc(&sensitivity_matrix_gpu, sizeof(XYZSensitivityMatrix)));
-    gpuErrchk(cudaMemcpy(sensitivity_matrix_gpu, this, sizeof(XYZSensitivityMatrix), cudaMemcpyHostToDevice));
+    if (run_async) {
+        gpuErrchk(cudaMallocAsync(&sensitivity_matrix_gpu, sizeof(XYZSensitivityMatrix), cudaStreamDefault));
+        gpuErrchk(cudaMemcpyAsync(sensitivity_matrix_gpu, this, sizeof(XYZSensitivityMatrix),
+                                  cudaMemcpyHostToDevice, cudaStreamDefault));
+    } else {
+        gpuErrchk(cudaMalloc(&sensitivity_matrix_gpu, sizeof(XYZSensitivityMatrix)));
+        gpuErrchk(cudaMemcpy(sensitivity_matrix_gpu, this, sizeof(XYZSensitivityMatrix), cudaMemcpyHostToDevice));
+    }
     
-    get_noise_covariance_kernel<<<grid, block>>>(
+    get_noise_covariance_kernel<<<grid, block, 0, cudaStreamDefault>>>(
         freqs, time_indices,
-        Soms_d_in, Sa_a_in,
-        Amp, alpha, f_1, f_knee, f_2,
-        spline_in_isi_oms_arr, spline_in_testmass_arr,
+        Soms_d_in_all, Sa_a_in_all,
+        Amp_all, alpha_all, f_1_all, f_knee_all, f_2_all,
+        spline_in_isi_oms_all, spline_in_testmass_all,
         c00_arr, c01_arr, c02_arr,
         c11_arr, c12_arr, c22_arr,
-        num_freqs, num_times,
+        num_freqs, num_times, num_psds,
         sensitivity_matrix_gpu
     );
-    
-    cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
-    gpuErrchk(cudaFree(sensitivity_matrix_gpu));
+
+    if (run_async) {
+        // stream-ordered free: released only after the kernel completes
+        gpuErrchk(cudaFreeAsync(sensitivity_matrix_gpu, cudaStreamDefault));
+    } else {
+        gpuErrchk(cudaFree(sensitivity_matrix_gpu));
+        cudaDeviceSynchronize();  // Ensure all GPU work is done before returning
+    }
 #else
     get_noise_covariance_kernel(
         freqs, time_indices,
-        Soms_d_in, Sa_a_in,
-        Amp, alpha, f_1, f_knee, f_2,
-        spline_in_isi_oms_arr, spline_in_testmass_arr,
+        Soms_d_in_all, Sa_a_in_all,
+        Amp_all, alpha_all, f_1_all, f_knee_all, f_2_all,
+        spline_in_isi_oms_all, spline_in_testmass_all,
         c00_arr, c01_arr, c02_arr,
         c11_arr, c12_arr, c22_arr,
-        num_freqs, num_times,
+        num_freqs, num_times, num_psds,
         this
     );
 #endif

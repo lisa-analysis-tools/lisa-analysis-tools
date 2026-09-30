@@ -6,6 +6,7 @@ and to Federico Pozzoli for the integration of the filters response.
 """
 
 import dataclasses
+from fractions import Fraction
 import logging
 import os
 from typing import Callable, Optional, Sequence
@@ -529,6 +530,7 @@ class SignalProcessor:
         self.N = times.shape[0]
         self.T = self.N * self.dt # total duration. Takes into account that times[0] may not be zero.
         self.data = data
+        self.original_fs = fs
         self.fs = fs
         self.verbose = verbose
         self.do_plots = do_plots
@@ -897,24 +899,59 @@ class BaseProcessingStep(SignalProcessor):
             if self.verbose:
                 logger.info("Applying highpass filter...")
             self.data = self.highpass_filter(**highpass_kwargs, **kwargs)
+            
+            self.sos_highpass = filter_funcs[highpass_kwargs.get("filter_type", "butterworth")](
+                highpass_kwargs["order"],
+                highpass_kwargs["cutoff"],
+                btype="highpass",
+                fs=self.fs,
+                output="sos"
+            )
+            self.p_highpass = 4 if highpass_kwargs.get("zero_phase", True) else 2
             filtered = True
 
         if lowpass_kwargs is not None:
             if self.verbose:
                 logger.info("Applying lowpass filter...")
             self.data = self.lowpass_filter(**lowpass_kwargs, **kwargs)
+            
+            self.sos_lowpass = filter_funcs[lowpass_kwargs.get("filter_type", "butterworth")](
+                lowpass_kwargs["order"],
+                lowpass_kwargs["cutoff"],
+                btype="lowpass",
+                fs=self.fs,
+                output="sos"
+            )
+            self.p_lowpass = 4 if lowpass_kwargs.get("zero_phase", True) else 2
             filtered = True
 
         if bandpass_kwargs is not None:
             if self.verbose:
                 logger.info("Applying bandpass filter...")
             self.data = self.bandpass_filter(**bandpass_kwargs, **kwargs)
+            
+            self.sos_bandpass = filter_funcs[bandpass_kwargs.get("filter_type", "butterworth")](
+                bandpass_kwargs["order"],
+                [bandpass_kwargs["low"], bandpass_kwargs["high"]],
+                btype="bandpass",
+                fs=self.fs,
+                output="sos"
+            )
+            self.p_bandpass = 4 if bandpass_kwargs.get("zero_phase", True) else 2
             filtered = True
 
         if downsample_kwargs is not None:
             if self.verbose:
                 logger.info("Downsampling data...")
             self.downsample(**downsample_kwargs)
+            
+            ratio = Fraction(downsample_kwargs["target_fs"] / self.original_fs).limit_denominator(10000)
+            _, down = ratio.numerator, ratio.denominator
+            self.fir = signal.firwin(
+                numtaps= 2 * 10 * down + 1,
+                cutoff=1.0 / down, 
+                window=downsample_kwargs.get("window", ("kaiser", 31.0))
+                )
 
         if trim_kwargs is not None:
             if self.verbose:
@@ -1025,6 +1062,66 @@ class BaseProcessingStep(SignalProcessor):
             return data_signal, self.orbits
         return data_signal
 
+    def get_filter_response(self, freqs: float | np.ndarray) -> np.ndarray:
+        """
+        Compute the power response of the applied filters at given frequencies.
+
+        Args:
+            freqs (np.ndarray): Frequencies at which to compute the power response.
+
+        Returns:
+            np.ndarray: Power response of the filters at the specified frequencies.
+        """
+        # Initialize power response to 1 (no filtering)
+        freqs = np.asarray(freqs)
+        power_response = np.ones_like(freqs, dtype=np.float64)
+
+        # Apply highpass filter response if it was applied
+        if hasattr(self, "sos_highpass"):
+            w, h = freqz_sos(self.sos_highpass, worN=np.abs(freqs), fs=self.original_fs)
+            power_response *= np.abs(h) ** self.p_highpass
+
+        # Apply lowpass filter response if it was applied
+        if hasattr(self, "sos_lowpass"):
+            w, h = freqz_sos(self.sos_lowpass, worN=np.abs(freqs), fs=self.original_fs)
+            power_response *= np.abs(h) ** self.p_lowpass
+
+        # Apply bandpass filter response if it was applied
+        if hasattr(self, "sos_bandpass"):
+            w, h = freqz_sos(self.sos_bandpass, worN=np.abs(freqs), fs=self.original_fs)
+            power_response *= np.abs(h) ** self.p_bandpass
+
+        return power_response
+
+    def get_fir_response(self, freqs: float | np.ndarray) -> np.ndarray:
+        """
+        Compute the frequency response of the FIR filter used in downsampling.
+
+        Args:
+            freqs (np.ndarray): Frequencies at which to compute the FIR response.
+        
+        Returns:
+            np.ndarray: Frequency response of the FIR filter at the specified frequencies.
+        """
+        freqs = np.asarray(freqs)
+        if not hasattr(self, "fir"):
+            return np.ones_like(freqs, dtype=np.float64)  # No FIR filter applied
+
+        return np.abs(signal.freqz(self.fir, worN=np.abs(freqs), fs=self.original_fs)[1]) ** 2
+
+    def get_total_response(self, freqs: float | np.ndarray) -> np.ndarray:
+        """
+        Compute the total power response of all applied filters (highpass, lowpass, bandpass, FIR) at given frequencies.
+
+        Args:
+            freqs (np.ndarray): Frequencies at which to compute the total power response.
+
+        Returns:
+            np.ndarray: Total power response of all filters at the specified frequencies.
+        """
+        power_response = self.get_filter_response(freqs)
+        fir_response = self.get_fir_response(freqs)
+        return power_response * fir_response
 
 class L1ProcessingStep(L1DataLoader, BaseProcessingStep):
     """
