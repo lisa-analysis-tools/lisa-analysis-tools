@@ -929,18 +929,42 @@ class GFCombineMove(CombineMove, GlobalFitMove):
                 skipped.append(name)
         stage = getattr(self, "gf_stage_name", "?")
         leg_i = cur.leg_index
-        state, accepted = self._run_sequence(model, state, due)
-        # tag the state eryn is about to save: the row's leg-ender NAME (the
-        # resume position) plus the ordered list the saver stamps once
+        cycles0 = cur.cycles
+        # One move at a time, so a CONDITIONAL leg-ender can stop the leg:
+        # a move that sets ``gf_leg_end_now`` on itself (the gated noise
+        # head after it CHANGED the noise and ran its in-model pass -- user
+        # ruling 2026-09-30, "a save after the in-model noise step whenever
+        # it runs") ends the leg right there; the row is saved after ITS
+        # name and the rest of the leg runs in the next propose. On a hold
+        # the flag stays False and the leg runs on to its static ender.
+        accepted = None
+        ran = []
+        ended_early = False
+        for k_due, mm in enumerate(due):
+            state, acc = self._run_sequence(model, state, [mm])
+            accepted = acc.copy() if accepted is None else accepted + acc
+            name = getattr(mm, "gf_move_name", type(mm).__name__)
+            ran.append(name)
+            flag = bool(getattr(mm, "gf_leg_end_now", False))
+            if flag:
+                mm.gf_leg_end_now = False        # consumed: never ends a later leg
+            if flag and name != end_name:
+                end_name = name
+                cur.end_early_at(cur.order.index(name))
+                ended_early = True
+                break
+        if not ended_early:
+            cur.advance()
+        # tag the state eryn is about to save: the row's saved-after NAME
+        # (the resume position) plus the ordered list the saver stamps once
         state.gf_saved_after = end_name
         state.gf_move_order = list(cur.order)
         state.gf_stage_name = stage
         logger.info(
-            "[LEG %s] cycle %d leg %d/%d: ran %s -> row saved after %r%s",
-            stage, cur.cycles, leg_i + 1, cur.nlegs,
-            [getattr(m, "gf_move_name", type(m).__name__) for m in due],
-            end_name, f" (cadence skipped {skipped})" if skipped else "")
-        cur.advance()
+            "[LEG %s] cycle %d leg %d/%d: ran %s -> row saved after %r%s%s",
+            stage, cycles0, leg_i + 1, cur.nlegs, ran, end_name,
+            " (the noise changed: leg ended early)" if ended_early else "",
+            f" (cadence skipped {skipped})" if skipped else "")
         return state, accepted
 
     def _run_sequence(self, model, state, moves):

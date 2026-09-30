@@ -544,8 +544,16 @@ V9_SEARCH_STAGE_PROFILES = (
     # confidence pass -- maximizes.
     ("gb_search_2",
      dict(phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25), False),
+    # reset_band_max (user ruling 2026-09-30): stage 3 is the stage whose noise
+    # MOVES, so the shutoff valve's per-(walker, band) cold-lnL max carried in
+    # from the fixed-noise stages is re-learned from -inf at entry instead of
+    # inherited ("instead of starting from the stored value, let's reset
+    # that"). Job 672's stage 3 ended on the shutoff rule after three
+    # iterations because every band sat below a max earned under the old
+    # noise. The galfor ratchet resets it again at every nudge.
     ("gb_search_3",
-     dict(phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25), True),
+     dict(phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25,
+          reset_band_max=True), True),
 )
 
 #: Per-stage override of the profile's ``opt_snr`` -- the OPTIMAL-SNR
@@ -1536,7 +1544,14 @@ def build_fit():
                 if _env_flag("GB_SEARCH_IN_MODEL") else [])
 
     def _search_stage(name, *, sample_noise, phase_maximize, opt_snr,
-                      peak_min_snr, warm_every=1, seed_only=False):
+                      peak_min_snr, reset_band_max=False, warm_every=1,
+                      seed_only=False):
+        # the stage profile as the step sees it; reset_band_max is only
+        # written when set so the other stages' dicts stay byte-identical
+        _profile = dict(phase_maximize=phase_maximize, opt_snr=opt_snr,
+                        peak_min_snr=peak_min_snr)
+        if reset_band_max:
+            _profile["reset_band_max"] = True
         # SAMPLED noise: the legacy gb_search composition verbatim -- the
         # leading joint psd+galfor+vgb search plus the two extra re-tracking
         # rounds that bracket the F-stat birth move, so the grid is always
@@ -1666,8 +1681,7 @@ def build_fit():
                 name=name, kind="gb_search",
                 moves=_noise + _warm + in_model("in_model"),
                 step_kwargs=dict(
-                    profile=dict(phase_maximize=phase_maximize,
-                                 opt_snr=opt_snr, peak_min_snr=peak_min_snr),
+                    profile=dict(_profile),
                     stage_name=name,
                     # FIXED length: no plateau test, no convergence wait.
                     convergence_fn=FixedIterationStop(_seed_iters()),
@@ -1740,8 +1754,7 @@ def build_fit():
                 plateau_branch="gb",
                 convergence_iter=int(os.environ.get("GB_PLATEAU_ITERS", "5")),
                 stage_name=name,
-                profile=dict(phase_maximize=phase_maximize, opt_snr=opt_snr,
-                             peak_min_snr=peak_min_snr),
+                profile=dict(_profile),
                 # the galfor ratchet schedule (None = off) and its nudge
                 ratchet=_ratchet,
                 ratchet_delta=_ratchet_delta,

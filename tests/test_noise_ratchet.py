@@ -257,6 +257,18 @@ class GateTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             gate.set_mode("wobble")
 
+    def test_gate_flags_a_leg_end_only_when_the_noise_changed(self):
+        """Search legs: a row right after the in-model noise step whenever it
+        runs (user ruling 2026-09-30) -- nudge and release set the flag, a
+        hold does not."""
+        gate, _ = self._gate()
+        gate.set_mode("nudge"); gate.propose(None, _state())
+        self.assertTrue(gate.gf_leg_end_now)
+        gate.set_mode("hold"); gate.propose(None, _state())
+        self.assertFalse(gate.gf_leg_end_now)
+        gate.set_mode("release"); gate.propose(None, _state())
+        self.assertTrue(gate.gf_leg_end_now)
+
 
 # ======================================================================
 # 4. the HARD forced refit (ignores the epoch's tick age)

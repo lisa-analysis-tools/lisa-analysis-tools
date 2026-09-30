@@ -1138,6 +1138,37 @@ def force_fstat_refit(moves, serial, reason: str = "", hard: bool = False) -> in
     return n
 
 
+def reset_band_logl_max(state, branch: str = "gb") -> int:
+    """Reset the valve's all-time per-(walker, band) cold-lnL maximum to -inf.
+
+    User ruling 2026-09-30 for gb_search_3 ("instead of starting from the
+    stored value, let's reset that"): the max carried in from the fixed-noise
+    stages was earned under a DIFFERENT noise curve. Once the foreground
+    moves (the stage's own noise search, or a ratchet nudge) the cold lnL of
+    every band changes scale, a stored max can sit above anything the band
+    can now reach, and the valve reads "no improvement" and shuts pairs that
+    were never given a fair window -- 6mo job 672's stage 3 completed on the
+    shutoff rule after three iterations for exactly this reason. Written IN
+    PLACE into ``state.sub_states[branch].band_info`` (the arrays the
+    judge holds live references to and the saver persists), so the very next
+    judge re-learns the max under the noise now in force; the streaks reset
+    themselves at that first judge because -inf + tol is always beaten.
+
+    Returns the number of entries reset, 0 when the state carries no such
+    array (valve off, or a fake state).
+    """
+    try:
+        bi = state.sub_states[branch].band_info
+        arr = bi["band_cold_logl_max_w"]
+    except (AttributeError, KeyError, TypeError):
+        return 0
+    arr = np.asarray(arr)
+    if arr.size == 0:
+        return 0
+    arr[...] = -np.inf
+    return int(arr.size)
+
+
 def _arm_cap_headroom_grant(moves) -> None:
     """Set the one-shot ``_grant_cap_headroom`` flag on every move in the tree
     that publishes a headroom deficit, so the next cap update grants +1 slot to
@@ -1405,7 +1436,7 @@ class SearchStageProfileStep(RJRecipeStep):
         super().__init__(*args, **kwargs)
         self.profile = dict(profile or {})
         _unknown = sorted(set(self.profile) - {
-            "phase_maximize", "opt_snr", "peak_min_snr"})
+            "phase_maximize", "opt_snr", "peak_min_snr", "reset_band_max"})
         if _unknown:
             raise ValueError(
                 f"SearchStageProfileStep({stage_name!r}): unknown profile "
@@ -1452,6 +1483,15 @@ class SearchStageProfileStep(RJRecipeStep):
         self._profile_serial = serial
         self._profile_applied = True
         self._apply_profile(serial)
+        if self.profile.get("reset_band_max"):
+            # user ruling 2026-09-30 (gb_search_3): the valve's stored per-band
+            # max was earned under another noise curve -- re-learn it here
+            _n = reset_band_logl_max(getattr(self, "_ratchet_last_sample", None))
+            logger.info(
+                "[V9-STAGE %s] band_cold_logl_max_w RESET to -inf (%d entries): "
+                "the shutoff valve re-learns each (walker, band)'s best cold lnL "
+                "under this stage's noise instead of the stored value.",
+                self.stage_name or "gb_search", _n)
         self._legs_enter()
         self._ratchet_enter()
 
@@ -1581,9 +1621,12 @@ class SearchStageProfileStep(RJRecipeStep):
         # from the store by _legs_enter just before this); rows otherwise.
         self._ratchet_k = (int(cm.gf_legs.cycles) if cm is not None
                            else live - self._ratchet_origin)
-        self._ratchet_capture_reference(
-            self._ratchet_k, getattr(self, "_ratchet_last_sample", None))
-        self._drive_ratchet(self._ratchet_k, self.moves)
+        _sample = getattr(self, "_ratchet_last_sample", None)
+        # a resume mid-cycle (legs) after the gate already ran keeps the
+        # reference captured before that nudge; only a cycle head recaptures
+        if cm is None or cm.gf_legs.cursor == 0:
+            self._ratchet_capture_reference(self._ratchet_k, _sample)
+        self._drive_ratchet(self._ratchet_k, self.moves, sample=_sample)
 
     def _ratchet_capture_reference(self, k, sample) -> None:
         """Before a NUDGE runs, remember the cold-mean galfor vector it starts
@@ -1622,14 +1665,17 @@ class SearchStageProfileStep(RJRecipeStep):
                 return m
         return None
 
-    def _drive_ratchet(self, k, moves) -> None:
-        """Set the gate's mode for stage-local iteration ``k``.
+    def _drive_ratchet(self, k, moves, sample=None) -> None:
+        """Set the gate's mode for stage-local cycle ``k``.
 
-        Called at stage entry (``setup_run``) and at the end of every
-        iteration (``stopping_function``, when the backend already points at
-        the NEXT row). A nudge additionally arms a HARD F-stat refit on every
-        grid move in the stage: the grid must be re-fitted against the
-        lowered noise before the next birth proposal draws from it.
+        Called at stage entry and at the end of every iteration (per cycle
+        under legs). A nudge additionally arms a HARD F-stat refit on every
+        grid move in the stage (the grid must be re-fitted against the
+        lowered noise before the next birth proposal draws from it) and
+        RESETS the shutoff valve's per-band cold-lnL max on ``sample`` (the
+        state the nudge will run on): a max earned under the old noise
+        would otherwise read every band as "no improvement" -- see
+        :func:`reset_band_logl_max`.
         """
         if getattr(self, "ratchet", None) is None:
             return
@@ -1659,15 +1705,17 @@ class SearchStageProfileStep(RJRecipeStep):
                 moves, serial,
                 f"galfor ratchet nudge at stage-local iteration {k}",
                 hard=True)
+            _nmax = reset_band_logl_max(sample) if sample is not None else 0
             logger.info(
                 "[GALFOR_RATCHET %s] iteration %d: NUDGE (cycle %d of %d) -- "
                 "galfor shift %s in the sampled basis; hard F-stat refit "
-                "armed on %d grid move(s); the noise moves then HOLD for %d "
-                "iteration(s) and RELEASE for %d.",
+                "armed on %d grid move(s); valve per-band lnL max reset (%d "
+                "entries); the noise moves then HOLD for %d iteration(s) and "
+                "RELEASE for %d.",
                 tag, k, k // self.ratchet.cycle_length + 1, self.ratchet.cycles,
                 np.array2string(np.asarray(self.ratchet_delta), precision=3)
                 if self.ratchet_delta is not None else "?",
-                n, self.ratchet.hold - 1, self.ratchet.release)
+                n, _nmax, self.ratchet.hold - 1, self.ratchet.release)
         elif action != (self._ratchet_last_action if hasattr(
                 self, "_ratchet_last_action") else None):
             logger.info("[GALFOR_RATCHET %s] iteration %d: %s", tag, k,
@@ -1872,7 +1920,7 @@ class SearchStageProfileStep(RJRecipeStep):
         if not stop and _advanced:
             self._ratchet_k = _k_next
             self._ratchet_capture_reference(_k_next, sample)
-            self._drive_ratchet(_k_next, moves)
+            self._drive_ratchet(_k_next, moves, sample=sample)
         return stop
 
     def _stopping_rules(self, i, sample, sampler) -> bool:

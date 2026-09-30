@@ -219,6 +219,12 @@ class NoiseRatchetGate(GFCombineMove):
     """
 
     is_noise_ratchet_gate = True
+    #: Search legs: True right after a propose that CHANGED the noise (nudge
+    #: or release, followed by the in-model pass), so the stage combine ends
+    #: the leg here and a row is saved after this move (user ruling
+    #: 2026-09-30: "a save after the in-model noise step whenever it runs").
+    #: Consumed by the combine; False after a hold.
+    gf_leg_end_now = False
 
     def __init__(self, inner, galfor_move, delta, in_model_move=None, **kwargs):
         super().__init__([inner], share_temperature_control=False, **kwargs)
@@ -239,6 +245,7 @@ class NoiseRatchetGate(GFCombineMove):
         self.mode = mode
 
     def _propose_moves(self, model, state):
+        self.gf_leg_end_now = False
         if self.mode == "hold":
             return state, np.zeros(np.shape(state.log_like), dtype=bool)
         if self.mode == "nudge":
@@ -257,4 +264,6 @@ class NoiseRatchetGate(GFCombineMove):
             # to it before any RJ move scores against the new residual.
             self._gf_precondition(self.in_model_move, model)
             state, _ = self.in_model_move.propose(model, state)
+        # the noise changed: under search legs this ends the leg here
+        self.gf_leg_end_now = True
         return state, accepted
