@@ -54,6 +54,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import emri_tof_xyz_threeway as W  # noqa: E402  (loader, production wrapper, TOF helpers)
 
 NF, DT = 180, 20.0
+# frequency bands for the residual power left after subtracting a template [Hz] (None = grid edge)
+BANDS = [(None, 1e-3), (1e-3, 3e-3), (3e-3, 1e-2), (1e-2, None)]
 DURATIONS = {"6mo": 15552000.0, "24mo": 4 * 15552000.0}
 EDGE_LAYERS = 20
 
@@ -129,22 +131,33 @@ def main():
                       force_backend="cpu")
     tds = TDSettings(n_win, DT, t0=0.0, force_backend="cpu")
 
-    def crop(arr):
-        out = np.ascontiguousarray(np.asarray(arr)[:, wdm.active_slice_f, wdm.active_slice_t])
-        assert out.shape[1:] == (wdm.Nf_active, wdm.Nt_active), (out.shape, wdm.Nf_active, wdm.Nt_active)
+    def crop(arr, s=None):
+        s = wdm if s is None else s
+        out = np.ascontiguousarray(np.asarray(arr)[:, s.active_slice_f, s.active_slice_t])
+        assert out.shape[1:] == (s.Nf_active, s.Nt_active), (out.shape, s.Nf_active, s.Nt_active)
         return out
 
-    d_arr = crop(TDSignal(data, tds).transform(wdm_full).arr)
+    d_full = np.asarray(TDSignal(data, tds).transform(wdm_full).arr)
+    d_arr = crop(d_full)
     del data
     gc.collect()
     sens = XYZ2SensitivityMatrix(wdm, model="scirdv1")
     ac_data = AnalysisContainer(DataResidualArray(WDMSignal(d_arr, wdm)), sens)
     dd = float(np.real(ac_data.inner_product()))
+    # per-band containers: the residual power a subtracted template leaves, by frequency
+    band_ac = []
+    for lo, hi in BANDS:
+        sb = WDMSettings(NF, nt, DT, min_freq=lo, max_freq=hi, min_time=EDGE_LAYERS * NF * DT,
+                         max_time=(nt - EDGE_LAYERS) * NF * DT, force_backend="cpu")
+        band_ac.append((sb, AnalysisContainer(DataResidualArray(WDMSignal(crop(d_full, sb), sb)),
+                                              XYZ2SensitivityMatrix(sb, model="scirdv1"))))
+    del d_full
     base = dict(src=args.src, duration=args.duration, tobs_s=tobs, dt=DT, nf=NF, nt=nt,
                 edge_layers=EDGE_LAYERS, window_start_after_ref_s=data_t0 - W.REF,
                 tof_fine_dt=fine_dt, n_fine=W.N_FINE, mode_batch=W.MODE_BATCH,
                 host=socket.gethostname(), load_wall_s=time.perf_counter() - t_start,
-                snr_data=float(np.sqrt(dd)), logL0=-0.5 * dd)
+                snr_data=float(np.sqrt(dd)), logL0=-0.5 * dd, bands_hz=BANDS,
+                data_snr2_bands=[float(np.real(ac.inner_product())) for _, ac in band_ac])
     print(f"[campaign] src={args.src} {args.duration}: Nt={nt} snr_data={np.sqrt(dd):.3f} "
           f"start REF+{data_t0 - W.REF:.0f}s", flush=True)
 
@@ -167,15 +180,17 @@ def main():
             t0 = time.perf_counter()
             try:
                 if tag == "prod":
-                    h = crop(TDSignal(W.legacy_td(params, wg, offset_int, thr), tds).transform(wdm_full).arr)
+                    h_full = np.asarray(TDSignal(W.legacy_td(params, wg, offset_int, thr), tds).transform(wdm_full).arr)
+                    row["prod_nmodes"] = int(getattr(gen, "num_modes_kept", -1))
                 elif tag == "tof":
                     td, nsub, n_in = W.tof_td(params, orb, data_t0, thr, gen)
                     row["tof_nsub"], row["tof_inside_samples"] = nsub, n_in
-                    h = crop(TDSignal(td, tds).transform(wdm_full).arr)
+                    h_full = np.asarray(TDSignal(td, tds).transform(wdm_full).arr)
                     del td
                 else:
-                    h = crop(direct_gen(*params, mode_selection_threshold=thr).arr)
+                    h_full = np.asarray(direct_gen(*params, mode_selection_threshold=thr).arr)
                     row.update({f"direct_{k}": v for k, v in direct_gen.last_stats.items()})
+                h = crop(h_full)
             except Exception as exc:   # record and keep going: this is a debugging campaign
                 row[f"{tag}_error"] = f"{type(exc).__name__}: {exc}"
                 row[f"{tag}_traceback"] = traceback.format_exc()[-4000:]
@@ -189,13 +204,18 @@ def main():
             ll = float(np.real(ac_data.template_likelihood(hs)))
             hh = float(np.real(opt)) ** 2
             row[f"{tag}_logL"] = ll
+            row[f"{tag}_resid_snr2"] = -2.0 * ll                # power left in the residual
+            row[f"{tag}_resid_snr2_bands"] = [
+                -2.0 * float(np.real(ac.template_likelihood(WDMSignal(crop(h_full, sb), sb)))) for sb, ac in band_ac]
+            del h_full
             row[f"{tag}_snr_opt"] = float(np.real(opt))
             row[f"{tag}_snr_det"] = float(np.real(det))
             row[f"{tag}_snr_ratio"] = float(np.real(opt)) / np.sqrt(dd)
             dh = 0.5 * (dd + hh + 2 * ll)                       # <d|h> from -1/2<d-h|d-h>
             row[f"{tag}_mm_data"] = 1.0 - dh / np.sqrt(dd * hh) if hh > 0 else float("nan")
             row[f"{tag}_flat_mm_data"], row[f"{tag}_flat_amp_data"] = flat_stats(h, d_arr)
-            print(f"[campaign] thr={thr:g} {tag}: logL={ll:+.4f} mm_data={row[f'{tag}_mm_data']:.3e} "
+            print(f"[campaign] thr={thr:g} {tag}: logL={ll:+.4f} resid_snr2 bands="
+                  f"{'/'.join(f'{x:.3g}' for x in row[f'{tag}_resid_snr2_bands'])} mm_data={row[f'{tag}_mm_data']:.3e} "
                   f"snr_opt/data={row[f'{tag}_snr_ratio']:.6f} wall={row[f'{tag}_wall_s']:.0f}s "
                   f"rss={row[f'{tag}_peak_rss_gb']:.1f}GB", flush=True)
             gc.collect()
