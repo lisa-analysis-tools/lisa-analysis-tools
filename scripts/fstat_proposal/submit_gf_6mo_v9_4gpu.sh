@@ -663,6 +663,14 @@ export MOJITO_INFO_PATH=/shared/data/mojito_cache
 # coalesces to the newest payload when its queue backs up -- it prints a
 # banner and stays off for the rest of the run. The run is never affected.
 # If that fires, raise GF_MONITOR_ITER or set GF_MONITOR_SNAPSHOT=0.
+# MATCH PANELS ON (user request 2026-09-30: "get back to including the phase
+# maximized computations of match"). Restores the nine match-criterion panels
+# and the Parameter Recovery section. Of those, the F4 three-way split and the
+# zoomable-plot marker classes use the REAL phase-maximised, noise-weighted
+# overlap (GF_MONITOR_MATCH_MM, default 0.8); the per-iteration
+# completeness / purity curves still key off the 2-df-bin f0 proxy so they can
+# run on every stored row. Overridable; =0 restores the 2026-08-19 default.
+export GF_MONITOR_MATCH_STATS=${GF_MONITOR_MATCH_STATS:-1}
 export GF_MONITOR_AFTER_SAVE=1
 # EVERY THIRD save (1 -> 3, 2026-09-28). ⚠ The old comment's premise
 # -- "~2 h/iteration against a page build of order minutes" -- stopped

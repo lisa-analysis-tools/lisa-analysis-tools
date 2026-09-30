@@ -404,18 +404,81 @@ class StepDrivesRatchetTest(unittest.TestCase):
         self.assertIn(0, serial)          # stage-local iteration 0 in the serial
         self.assertIn("ratchet", reason)
 
-    def test_schedule_follows_the_stored_iteration(self):
+    def test_schedule_counts_completed_iterations_not_the_store_attr(self):
+        """6mo job 672 nudged TWICE in a row: at the end of iteration 0 the
+        head's ``backend.iteration`` still read 47 (the save is a handoff to
+        the saver rank; the attr lags one save), so a re-read gave k = 0
+        again. The clock must count stopping_function calls. Here the fake
+        backend attr is STALE on purpose and must be ignored."""
         st, gate, grid, tree = self._step()
         self._enter(st, tree, 47)
-        # end of iteration 0 -> the backend now points at row 48 -> k = 1
-        for it in (48, 49, 50, 51, 52):
-            st.stopping_function(it, None, _FakeSampler(it, tree))
+        for _ in range(5):
+            st.stopping_function(47, None, _FakeSampler(47, tree))   # stale attr
         self.assertEqual(gate.modes, ["nudge", "hold", "hold", "release",
                                       "release", "nudge"])
-        # two nudges, two DISTINCT hard serials
+        # two nudges, two DISTINCT hard serials (job 672's second nudge
+        # reused serial k=0 and its refit was silently skipped)
         self.assertEqual(len(grid.armed), 2)
         self.assertNotEqual(grid.armed[0][0], grid.armed[1][0])
         self.assertTrue(all(h for _, _, h in grid.armed))
+
+    def _sample(self, cold_galfor):
+        """A minimal state: cold galfor rows for 2 walkers (nt=1)."""
+        g = np.asarray(cold_galfor, float)[None, :, None, :]   # (nt, nw, 1, 5)
+        return SimpleNamespace(branches_coords={"galfor": g})
+
+    def test_pre_nudge_reference_is_the_state_BEFORE_each_nudge(self):
+        """Job 672's readout captured its reference AFTER the first nudge and
+        reported the nudged curve as 1.0."""
+        st, gate, grid, tree = self._step()
+        pre = self._sample([[-43.8, -2.6, 5.0, -2.0, -2.85]] * 2)
+        st.setup_run(47, pre, _FakeSampler(47, tree))
+        st.note_recipe_step(3)
+        np.testing.assert_allclose(st._ratchet_pre_nudge, [-43.8, -2.6, 5.0, -2.0, -2.85])
+        # holds and releases do not move the reference ...
+        post = self._sample([[-43.9, -2.7, 5.0, -2.0, -3.0]] * 2)
+        for _ in range(4):
+            st.stopping_function(48, post, _FakeSampler(48, tree))
+        np.testing.assert_allclose(st._ratchet_pre_nudge, [-43.8, -2.6, 5.0, -2.0, -2.85])
+        # ... the second nudge re-captures from the state it starts from
+        released = self._sample([[-43.85, -2.55, 6.0, -2.1, -3.2]] * 2)
+        st.stopping_function(52, released, _FakeSampler(52, tree))
+        self.assertEqual(gate.modes[-1], "nudge")
+        np.testing.assert_allclose(st._ratchet_pre_nudge, [-43.85, -2.55, 6.0, -2.1, -3.2])
+
+    def test_stage_is_held_open_until_the_schedule_has_run(self):
+        """Job 672's stage 3 completed on the shutoff rule after nudge, nudge,
+        hold -- before any release -- and full_pe inherited a foreground two
+        shifts down. While the schedule is pending the stage must not end."""
+        from lisatools.globalfit.recipe import SearchStageProfileStep
+
+        gate = _FakeGate()
+        valve = _FakeGrid()
+        valve._shutoff_w_pending = 0          # armed AND every pair shut
+        tree = [SimpleNamespace(moves=[gate, valve])]
+        st = SearchStageProfileStep(
+            moves=tree, convergence_iter=2, plateau_branch="gb", profile={},
+            stage_name="gb_search_3",
+            ratchet=RatchetSchedule(hold=2, release=1, cycles=1),
+            ratchet_delta=np.zeros(5))
+        with env(GALFOR_RATCHET_HOLD_STAGE=None, GB_SEARCH_STAGE_END_ON_SHUTOFF=None):
+            st.setup_run(47, None, _FakeSampler(47, tree))
+            st.note_recipe_step(3)
+            # schedule: nudge (k0), hold (k1), release (k2) = 3 iterations
+            self.assertFalse(st.stopping_function(48, None, _FakeSampler(48, tree)))
+            self.assertFalse(st.stopping_function(49, None, _FakeSampler(49, tree)))
+            self.assertEqual(gate.modes, ["nudge", "hold", "release"])
+            # the release has run: now the shutoff rule may end the stage
+            self.assertTrue(st.stopping_function(50, None, _FakeSampler(50, tree)))
+        with env(GALFOR_RATCHET_HOLD_STAGE="0", GB_SEARCH_STAGE_END_ON_SHUTOFF=None):
+            st2 = SearchStageProfileStep(
+                moves=tree, convergence_iter=2, plateau_branch="gb", profile={},
+                stage_name="gb_search_3",
+                ratchet=RatchetSchedule(hold=2, release=1, cycles=1),
+                ratchet_delta=np.zeros(5))
+            st2.setup_run(47, None, _FakeSampler(47, tree))
+            st2.note_recipe_step(3)
+            self.assertTrue(st2.stopping_function(48, None, _FakeSampler(48, tree)))
 
     def test_resume_mid_hold_does_not_re_nudge(self):
         """A relaunch at stored iteration 49 whose recipe group says the
@@ -424,7 +487,7 @@ class StepDrivesRatchetTest(unittest.TestCase):
         self._enter(st, tree, 49, stage_start=47)
         self.assertEqual(gate.modes, ["hold"])
         self.assertEqual(grid.armed, [])
-        # and the clock keeps the stored origin afterwards: 50 -> k = 3
+        # and the clock advances by counting: next iteration is k = 3
         st.stopping_function(50, None, _FakeSampler(50, tree, stage_start=47))
         self.assertEqual(gate.modes[-1], "release")
 

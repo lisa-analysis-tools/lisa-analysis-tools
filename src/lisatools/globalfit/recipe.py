@@ -1460,6 +1460,7 @@ class SearchStageProfileStep(RJRecipeStep):
         # only the recipe's announce path calls.
         self._ratchet_live_iter = int(iteration)
         self._ratchet_backend = getattr(sampler, "backend", None)
+        self._ratchet_last_sample = last_sample
 
     def _ratchet_stage_origin(self) -> int:
         """The stored iteration this stage STARTED at -- the ratchet's clock.
@@ -1491,13 +1492,54 @@ class SearchStageProfileStep(RJRecipeStep):
         return stored
 
     def _ratchet_enter(self) -> None:
-        """Drive the gate for the iteration about to run (stage entry/resume)."""
+        """Drive the gate for the iteration about to run (stage entry/resume).
+
+        Sets the IN-PROCESS clock ``_ratchet_k`` from the store once, here.
+        ⚠ Afterwards the clock is advanced by counting ``stopping_function``
+        calls, NOT by re-reading ``backend.iteration``: on the head the save
+        is a handoff to the saver rank and the store's iteration attr lags
+        one save behind, so a re-read at the end of an iteration still shows
+        the row that was just handed off. 6mo job 672 nudged TWICE in a row
+        that way (k read as 0 twice), stacking two shifts.
+        """
         if getattr(self, "ratchet", None) is None:
             return
         self._ratchet_origin = self._ratchet_stage_origin()
         live = int(getattr(self, "_ratchet_live_iter",
                            getattr(self, "_stage_start_iter", 0)))
-        self._drive_ratchet(live - self._ratchet_origin, self.moves)
+        self._ratchet_k = live - self._ratchet_origin
+        self._ratchet_capture_reference(
+            self._ratchet_k, getattr(self, "_ratchet_last_sample", None))
+        self._drive_ratchet(self._ratchet_k, self.moves)
+
+    def _ratchet_capture_reference(self, k, sample) -> None:
+        """Before a NUDGE runs, remember the cold-mean galfor vector it starts
+        from: the readout compares every later row against THIS, so a release
+        that climbs back reads as ~1 and one that stays down reads low."""
+        if sample is None or self.ratchet.action(k) != "nudge":
+            return
+        try:
+            bc = getattr(sample, "branches_coords", None)
+            if bc is not None and "galfor" in bc:
+                self._ratchet_pre_nudge = np.asarray(bc["galfor"])[0, :, 0, :].mean(axis=0).copy()
+        except Exception as e:  # noqa: BLE001 -- a readout reference, never fatal
+            logger.debug("[GALFOR_RATCHET] reference capture skipped: %r", e)
+
+    def _ratchet_schedule_pending(self, k_next) -> bool:
+        """True while the schedule still has a nudge/hold/release to run.
+
+        The stage must not COMPLETE while the ratchet is mid-schedule (user
+        design 2026-09-30: the release IS the measurement). 6mo job 672's
+        stage 3 ended on the shutoff rule after nudge, nudge, hold -- before
+        a single release -- and handed full_pe a foreground two shifts down.
+        ``GALFOR_RATCHET_HOLD_STAGE=0`` restores the plain stopping rule.
+        """
+        if getattr(self, "ratchet", None) is None:
+            return False
+        if os.environ.get("GALFOR_RATCHET_HOLD_STAGE", "1").strip() in (
+                "0", "false", "False", "no", "off"):
+            return False
+        return int(k_next) < self.ratchet.cycles * self.ratchet.cycle_length
 
     def _ratchet_gate(self, moves):
         from .noise_ratchet import is_noise_ratchet_gate
@@ -1535,7 +1577,11 @@ class SearchStageProfileStep(RJRecipeStep):
         action = self.ratchet.action(k)
         gate.set_mode(action)
         if action == "nudge":
-            serial = ("galfor_ratchet", tag, k)
+            # the nudge COUNT is part of the serial: arm_fstat_refit is
+            # idempotent per serial, and a repeated k (job 672) silently
+            # skipped the second nudge's refit
+            self._ratchet_nudges = int(getattr(self, "_ratchet_nudges", 0)) + 1
+            serial = ("galfor_ratchet", tag, k, self._ratchet_nudges)
             n = force_fstat_refit(
                 moves, serial,
                 f"galfor ratchet nudge at stage-local iteration {k}",
@@ -1556,11 +1602,11 @@ class SearchStageProfileStep(RJRecipeStep):
         self._ratchet_last_action = action
         self._ratchet_last_k = k
 
-    def _ratchet_readout(self, k, sample) -> None:
-        """One [GALFOR_RATCHET] line per iteration with the cold-mean galfor
-        curve against the pre-nudge curve at 1..5 mHz -- the release IS the
-        measurement: a region that comes back was honest, one that stays
-        down had been absorbing resolvable power."""
+    def _ratchet_readout(self, k_done, sample) -> None:
+        """One [GALFOR_RATCHET] line per completed iteration ``k_done`` with
+        the cold-mean galfor curve against the PRE-nudge curve at 1..5 mHz --
+        the release IS the measurement: a region that comes back was honest,
+        one that stays down had been absorbing resolvable power."""
         if getattr(self, "ratchet", None) is None or sample is None:
             return
         try:
@@ -1569,18 +1615,23 @@ class SearchStageProfileStep(RJRecipeStep):
             bc = getattr(sample, "branches_coords", None)
             if bc is None or "galfor" not in bc:
                 return
-            cold = np.asarray(bc["galfor"])[0, :, 0, :]
-            mean = cold.mean(axis=0)
-            if self._ratchet_pre_nudge is None or self.ratchet.action(k) == "nudge":
-                # the state BEFORE the coming nudge is the reference
-                self._ratchet_pre_nudge = mean.copy()
+            mean = np.asarray(bc["galfor"])[0, :, 0, :].mean(axis=0)
+            ref = getattr(self, "_ratchet_pre_nudge", None)
             f = np.array([1.0, 2.0, 3.0, 3.5, 4.0, 4.5, 5.0]) * 1e-3
-            r = galfor_curve_ratio(mean, self._ratchet_pre_nudge, f)
+            if ref is None:
+                logger.info(
+                    "[GALFOR_RATCHET %s] after iteration %d (%s): cold-mean galfor "
+                    "%s; no pre-nudge reference captured yet",
+                    self.stage_name or "gb_search", k_done,
+                    self.ratchet.action(k_done).upper(),
+                    np.array2string(mean, precision=4))
+                return
+            r = galfor_curve_ratio(mean, ref, f)
             logger.info(
                 "[GALFOR_RATCHET %s] after iteration %d (%s): cold-mean galfor "
                 "%s; curve / pre-nudge at 1,2,3,3.5,4,4.5,5 mHz = %s",
-                self.stage_name or "gb_search", k - 1,
-                self.ratchet.action(max(k - 1, 0)).upper(),
+                self.stage_name or "gb_search", k_done,
+                self.ratchet.action(k_done).upper(),
                 np.array2string(mean, precision=4),
                 np.array2string(r, precision=3))
         except Exception as e:  # noqa: BLE001 -- a readout must never stop a run
@@ -1712,6 +1763,38 @@ class SearchStageProfileStep(RJRecipeStep):
     # ---- stopping ----------------------------------------------------------
 
     def stopping_function(self, i, sample, sampler) -> bool:
+        """The stage's stopping rules (:meth:`_stopping_rules`) with the galfor
+        ratchet layered on top: the stage-local clock advances by one per
+        call, the readout line is written, the stage is HELD OPEN while the
+        ratchet schedule is still pending, and the gate is driven for the
+        iteration about to start."""
+        stop = self._stopping_rules(i, sample, sampler)
+        # getattr: fake-based suites build this step without __init__
+        if getattr(self, "ratchet", None) is None:
+            return stop
+        moves = getattr(sampler, "moves", None)
+        # IN-PROCESS clock: one stopping_function call = one completed
+        # iteration. Never re-read backend.iteration here -- on the head it
+        # lags the handoff by one save (see _ratchet_enter).
+        _k_done = int(getattr(self, "_ratchet_k", 0))
+        _k_next = _k_done + 1
+        self._ratchet_readout(_k_done, sample)
+        if stop and self._ratchet_schedule_pending(_k_next):
+            logger.info(
+                "[GALFOR_RATCHET %s] stage would complete after iteration "
+                "%d but the ratchet schedule is mid-way (%d of %d "
+                "iterations) -- holding the stage open so the release "
+                "can be read (GALFOR_RATCHET_HOLD_STAGE=0 disables).",
+                self.stage_name or "gb_search", _k_done, _k_next,
+                self.ratchet.cycles * self.ratchet.cycle_length)
+            stop = False
+        if not stop:
+            self._ratchet_k = _k_next
+            self._ratchet_capture_reference(_k_next, sample)
+            self._drive_ratchet(_k_next, moves)
+        return stop
+
+    def _stopping_rules(self, i, sample, sampler) -> bool:
         """Nleaves plateau AND the per-(walker, band) RJ valve (gate 6).
 
         COMPOSED, never replaced. The criterion the user sanctioned is
@@ -1808,15 +1891,6 @@ class SearchStageProfileStep(RJRecipeStep):
                 "(the per-(walker, band) RJ valve is NOT armed -- export "
                 "GB_SEARCH_BAND_SHUTOFF_PER_WALKER=1 to add it).",
                 self.stage_name or "gb_search")
-        # getattr: fake-based suites build this step without __init__
-        if getattr(self, "ratchet", None) is not None and not stop:
-            # the backend already points at the NEXT row: drive the gate for
-            # the iteration about to start, and read out the one just done.
-            _k_next = (int(sampler.backend.iteration)
-                       - int(getattr(self, "_ratchet_origin",
-                                     getattr(self, "_stage_start_iter", 0))))
-            self._ratchet_readout(_k_next, sample)
-            self._drive_ratchet(_k_next, moves)
         return stop
 
 

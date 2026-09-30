@@ -756,6 +756,14 @@ export MOJITO_INFO_PATH=/shared/data/mojito_cache
 #   python -m lisatools.globalfit.monitor.from_tar SNAP.tar.gz OUT.html
 #
 # FULL tar, not --short: Mike's morning workflow downloads it.
+# MATCH PANELS ON (user request 2026-09-30: "get back to including the phase
+# maximized computations of match"). Restores the nine match-criterion panels
+# and the Parameter Recovery section. Of those, the F4 three-way split and the
+# zoomable-plot marker classes use the REAL phase-maximised, noise-weighted
+# overlap (GF_MONITOR_MATCH_MM, default 0.8); the per-iteration
+# completeness / purity curves still key off the 2-df-bin f0 proxy so they can
+# run on every stored row. Overridable; =0 restores the 2026-08-19 default.
+export GF_MONITOR_MATCH_STATS=${GF_MONITOR_MATCH_STATS:-1}
 export GF_MONITOR_AFTER_SAVE=1
 # PAGE OFF, TAR ON (GF_MONITOR_PAGE, a789d6bd). The 6MO LAUNCHER KEEPS
 # THE PAGE -- do not copy this line across.
