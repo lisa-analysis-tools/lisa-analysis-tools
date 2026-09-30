@@ -3,8 +3,10 @@
 The evaluation rule (derived numerically by scripts/wdm/derive_basis_cycle.py; worst
 1.4e-5 of the peak over 2688 (pixel, offset, fdot) samples in 6 offset blocks):
 
-    (c, s) = table (cos, sin) at offset delta = f - m*df and fdot;  s *= (-1)**floor(delta/df)
-    if ((m - m_ref) + (n - n_ref)) is odd:  (c, s) -> (s, -c)
+    (c, s) = table (cos, sin) at offset delta = f - m*df and fdot
+    if (m_ref + n_ref) is odd:  (c, s) -> (-c, s)
+    s *= (-1)**floor(delta/df)                 (undone at the table nodes)
+    if (m + n) is odd:  (c, s) -> (s, -c)
     w[m, n] = A * (c cos(phi) - s sin(phi)),   phi = carrier phase at t_n = n * layer_dt
     ((c, s) are the pixel responses to the cos and sin carriers).
 
@@ -24,13 +26,15 @@ EDGE = 10                              # skip WDM time-edge pixels
 
 
 class BasisCycleChirpTest(unittest.TestCase):
+    M_REF = 20          # even m_ref + n_ref
+
     @classmethod
     def setUpClass(cls):
         from lisatools.domains import TDSettings, TDSignal, WDMLookupTable, WDMSettings
 
         cls.WDMLookupTable = WDMLookupTable
         cls.wdm = WDMSettings(Nf=NF, Nt=NT, dt=DT, force_backend="cpu")
-        norm_f, m_diffs, m_ref = WDMLookupTable.apply_eps_frequency(0.005, cls.wdm, m_ref=20, num_layers_diff=2)
+        norm_f, m_diffs, m_ref = WDMLookupTable.apply_eps_frequency(0.005, cls.wdm, m_ref=cls.M_REF, num_layers_diff=2)
         fdot_vals = WDMLookupTable.apply_eps_fdot(0.05, cls.wdm, fdot_max_factor=1.0)
         cls.tmp = tempfile.TemporaryDirectory()
         cls.table = WDMLookupTable(
@@ -91,6 +95,13 @@ class BasisCycleChirpTest(unittest.TestCase):
         finally:
             del self.table.BASIS_CYCLE     # back to the class attribute
         self.assertGreater(max(errs), 1e-1, f"legacy errs {errs}")
+
+
+class BasisCycleChirpOddRefTest(BasisCycleChirpTest):
+    """Odd m_ref + n_ref: the build bakes a different rotation (is_m_ref_n_ref_even);
+    the evaluation must first map the table's (c, s) -> (-c, s)."""
+
+    M_REF = 21
 
 
 if __name__ == "__main__":

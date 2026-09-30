@@ -4324,15 +4324,20 @@ class WDMLookupTable(WDMSettings):
                 # Derived numerically (scripts/wdm/derive_basis_cycle.py; worst 1.4e-5 of
                 # the peak over 2688 (pixel, offset, fdot) samples in 6 offset blocks):
                 # the stored chirp (sin) term carries a (-1)^block bake, then pixels of odd
-                # (m - m_ref) + (n - n_ref) take a -90 degree turn (c, s) -> (s, -c).
+                # absolute parity (m + n) take a -90 degree turn (c, s) -> (s, -c); tables
+                # with odd (m_ref + n_ref) first map (c, s) -> (-c, s) (checked for m_ref
+                # 20 and 21: worst 1.4e-5 of peak each).
                 # No other sign: the raw table values already carry the build's baking.
                 # s from the seam-continuous table (block sign undone at the nodes): a
                 # per-pixel flip of interpolated values is wrong inside the one-step
                 # interval straddling each block seam (f exactly on a layer boundary).
                 s_eff = self._sin_unbaked_coeffs(f_norm, fdot_arr[keep_now])
-                odd = ((ms_to_use[keep_now] - self.m_ref) + (n_arr[keep_now] - self.n_ref)) % 2 != 0
-                cos_coeffs = self.xp.where(odd, s_eff, _cos_coeffs)
-                sin_coeffs = self.xp.where(odd, -_cos_coeffs, s_eff)
+                # odd (m_ref + n_ref): the build baked a different rotation
+                # (is_m_ref_n_ref_even) -> the table's (c, s) maps to (-c, s) first
+                c_eff = -_cos_coeffs if (self.m_ref + self.n_ref) % 2 else _cos_coeffs
+                odd = (ms_to_use[keep_now] + n_arr[keep_now]) % 2 != 0     # ABSOLUTE pixel parity
+                cos_coeffs = self.xp.where(odd, s_eff, c_eff)
+                sin_coeffs = self.xp.where(odd, -c_eff, s_eff)
                 wdm_coeffs_out[keep_now, i] = amp_arr[keep_now] * (
                     cos_coeffs * self.xp.cos(phi_arr[keep_now]) - sin_coeffs * self.xp.sin(phi_arr[keep_now])
                 )   # cos(x + phi) = cos x cos phi - sin x sin phi; (c, s) = responses to cos x, sin x

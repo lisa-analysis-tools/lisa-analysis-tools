@@ -39,7 +39,7 @@ N = NF * NT
 t = np.arange(N) * DT
 td_set = TDSettings(N, DT, force_backend="cpu")
 
-norm_f, m_diffs, m_ref = WDMLookupTable.apply_eps_frequency(EPS_F, wdm, m_ref=20, num_layers_diff=2)
+norm_f, m_diffs, m_ref = WDMLookupTable.apply_eps_frequency(EPS_F, wdm, m_ref=int(os.environ.get("M_REF", "20")), num_layers_diff=2)
 fdot_vals = WDMLookupTable.apply_eps_fdot(EPS_FD, wdm, fdot_max_factor=FD_FACTOR)
 table = WDMLookupTable(wdm, 1, m_ref=m_ref, norm_freq_single_layer=norm_f, m_diffs=m_diffs,
                        fdot_vals=fdot_vals, store_path=os.path.join(tempfile.mkdtemp(), "t.h5"),
@@ -109,9 +109,15 @@ if os.environ.get("DERIVE_WORST"):
 
 
 def rule(dm, dn, block, tab):
-    """Candidate: s -> (-1)^block s, then rotate -90 deg when (dm + dn) is odd."""
-    c, sn = tab[0], ((-1.0) ** block) * tab[1]
-    return np.array([c, sn]) if (dm + dn) % 2 == 0 else np.array([sn, -c])
+    """General rule: odd (m_ref + n_ref) tables first map (c, s) -> (-c, s); then the
+    (-1)^block bake on s is undone; then pixels of odd ABSOLUTE parity (m + n) turn
+    (c, s) -> (s, -c)."""
+    c, sn = tab[0], tab[1]
+    if (m_ref + n_ref) % 2:
+        c = -c
+    sn = ((-1.0) ** block) * sn
+    odd = (dm + dn + m_ref + n_ref) % 2 != 0
+    return np.array([sn, -c]) if odd else np.array([c, sn])
 
 
 peak = max(np.linalg.norm(tab) for v in samples.values() for tab, _ in v)
