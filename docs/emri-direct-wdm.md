@@ -22,10 +22,15 @@ mode thresholds 1e-3 and 1e-7; dlogL difference <= 4e-7. Signed off 2026-09-30.
 
 **Direct-to-WDM vs production, CD1L EMRI 1** (16 d window, no plunge in the window):
 
-| mode threshold | modes | direct vs production | direct vs data | production vs data |
-|---|---|---|---|---|
-| 1e-3 (production EMRI_EPS) | 38 | 1.05e-6 | 0.10 | 0.10 |
-| 1e-5 | 111 | 1.11e-6 | 2.6e-3 | 2.6e-3 |
+| mode threshold | table interp | modes | direct vs production | norm ratio vs production | direct vs data | production vs data |
+|---|---|---|---|---|---|---|
+| 1e-3 (production EMRI_EPS) | linear | 38 | 1.05e-6 | 0.99973-0.99976 | 0.10 | 0.10 |
+| 1e-3 (production EMRI_EPS) | **cubic (default)** | 38 | **3.5e-8** | **0.999995-0.999997** | 0.10 | 0.10 |
+| 1e-5 | linear | 111 | 1.11e-6 | not measured | 2.6e-3 | 2.6e-3 |
+
+The normalised mismatch alone hid a 2.5e-4 amplitude deficit with linear table interpolation
+(the bias of linear interpolation across the table's peaked frequency response); cubic
+removes it (EMRIDirectWDM default, `interp="cubic"`; CPU only).
 
 The direct template is as close to the data as the production template; the data
 mismatch is the production mode threshold's content loss, not the template method.
@@ -67,7 +72,7 @@ model is at 1.9e-4 (median, before 0.9 t_plunge), the table's f/fdot interpolati
 ## Open items
 
 1. (resolved) TOF vs production at the abrupt plunge end.
-2. Table resolution: finer fdot rows near 0 (where most pixels sit) to reach the model's
+2. Table resolution (fdot direction; cubic fixed the f-direction bias): finer fdot rows near 0 (where most pixels sit) to reach the model's
    ~1e-4 per-pixel level; production-grid table (Nf 1440, dt 2.5) on the cluster GPU.
 3. Speed: EMRIDirectWDM is Python per harmonic and channel on CPU (88 s for 38 modes, 16 d).
    The GPU work (FEW Part B) and a vectorised lookup are the path.

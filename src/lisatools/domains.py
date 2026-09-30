@@ -4254,6 +4254,24 @@ class WDMLookupTable(WDMSettings):
         cos_coeffs[np.isnan(cos_coeffs)] = 0.0
         return (sin_coeffs, cos_coeffs)
 
+    def set_interp_method(self, method: str) -> None:
+        """Switch the (fdot, f) interpolation and rebuild the interpolators (built at load).
+
+        ``"linear"`` (historical default) or ``"cubic"``. Cubic removes most of linear's bias
+        across the table's peaked response (A9, CD1L EMRI 1: amplitude deficit 2.5e-4 ->
+        5e-6, mismatch 1e-6 -> 3.5e-8). CPU (scipy) only: cupyx's RegularGridInterpolator
+        has no cubic method.
+        """
+        if method not in ("linear", "cubic"):
+            raise ValueError(f"interp method must be 'linear' or 'cubic', got {method!r}")
+        self.INTERP_METHOD = method
+        self._sin_unbaked_interp = None
+        if self.build_kind == "n_ref_complex":
+            self.table_cx = self._table_cx
+        else:
+            self.table_sin = self._table_sin
+            self.table_cos = self._table_cos
+
     def _sin_unbaked_coeffs(self, f_norm, fdot):
         """Sin-table value with the build's (-1)^block bake undone at the nodes.
 

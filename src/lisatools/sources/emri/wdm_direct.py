@@ -254,11 +254,12 @@ class EMRIDirectWDM:
         data_t0: absolute time of WDM pixel 0.
         n_fine: fine trajectory points over the window (default: one per 80 s).
         pixel_edge: pixels dropped at each grid end (response spline support).
+        interp: table interpolation to use (``"cubic"`` default; ``None`` keeps the table's).
     """
 
     def __init__(self, few_gen, table, wdm_set, *, orbits, tdi_config, t_start, data_t0,
                  Nt_sub=128, n_fine=None, mode_batch=64, pixel_edge=8, num_m_layers=2,
-                 force_backend="cpu"):
+                 interp="cubic", force_backend="cpu"):
         self.few_gen, self.table, self.wdm = few_gen, table, wdm_set
         self.orbits, self.tdi_config = orbits, tdi_config
         self.t_start, self.data_t0 = float(t_start), float(data_t0)
@@ -270,6 +271,10 @@ class EMRIDirectWDM:
         self.n_fine = int(n_fine) if n_fine is not None else max(1024, int(span / 80.0))
         self.force_backend = force_backend
         self.fdot_axis_max = float(np.max(np.abs(np.asarray(table.fdot_vals))))
+        # cubic table interpolation: linear left a ~2.5e-4 amplitude deficit (A9, EMRI 1).
+        # NOTE: this switches the passed table's interpolators (set_interp_method).
+        if interp is not None and getattr(table, "INTERP_METHOD", None) != interp:
+            table.set_interp_method(interp)
         self.last_stats = {}
 
     def _mode_list(self, few_args, few_kwargs):

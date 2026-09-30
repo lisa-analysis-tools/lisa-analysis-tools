@@ -97,6 +97,30 @@ class BasisCycleChirpTest(unittest.TestCase):
         self.assertGreater(max(errs), 1e-1, f"legacy errs {errs}")
 
 
+class InterpMethodTest(BasisCycleChirpTest):
+    """set_interp_method rebuilds the interpolators (built once at load); cubic beats linear
+    off the table nodes (A9: EMRI 1 amplitude deficit 2.5e-4 -> 5e-6)."""
+
+    def test_cubic_beats_linear_off_node(self):
+        # the frequency-direction bias of linear interpolation across the peaked response
+        # (what dominated A9); the fdot direction has fine structure cubic cannot fix (A3 scan)
+        df = self.wdm.layer_df
+        case = (20.31270 * df, 0.0, 0.4)                     # f between nodes (step 0.005 df)
+        try:
+            self.table.set_interp_method("linear")
+            e_lin = self._rel_err(*case)
+            self.table.set_interp_method("cubic")
+            self.assertEqual(self.table.INTERP_METHOD, "cubic")
+            e_cub = self._rel_err(*case)
+        finally:
+            self.table.set_interp_method("linear")
+        self.assertLess(e_cub, 0.5 * e_lin, f"linear {e_lin:.2e} cubic {e_cub:.2e}")
+
+    def test_rejects_unknown_method(self):
+        with self.assertRaises(ValueError):
+            self.table.set_interp_method("quintic")
+
+
 class BasisCycleChirpOddRefTest(BasisCycleChirpTest):
     """Odd m_ref + n_ref: the build bakes a different rotation (is_m_ref_n_ref_even);
     the evaluation must first map the table's (c, s) -> (-c, s)."""
