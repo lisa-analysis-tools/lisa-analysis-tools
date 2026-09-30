@@ -75,6 +75,17 @@ class WDMLookupRestoreTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             t.get_wdm_coeffs(np.ones(1), np.zeros(1), f, np.zeros(1), np.array([t.n_ref]))
 
+    def test_out_of_support_zero_option(self):
+        # out_of_support="zero": entries outside the table contribute 0 (far layers);
+        # entries inside are unchanged
+        t = self._build("n_ref_only", np.array([0.0]), num_layers_diff=0, tag="narrowz")
+        f = np.array([(t.m_ref + 0.3) * self.wdm_set.layer_df])
+        co, mm = t.get_wdm_coeffs(np.ones(1), np.zeros(1), f, np.zeros(1), np.array([t.n_ref]),
+                                  out_of_support="zero")
+        co = np.asarray(co)
+        self.assertEqual(float(co[0, 0]), 0.0)          # m-1 needs f_norm ~ 1.3 df: outside -> 0
+        self.assertNotEqual(float(co[0, 1]), 0.0)       # carrier layer inside the table
+
     def test_regression_against_committed_table(self):
         ref = os.environ.get("WDM_LOOKUP_REF_H5", "")
         if not ref or not os.path.exists(ref):

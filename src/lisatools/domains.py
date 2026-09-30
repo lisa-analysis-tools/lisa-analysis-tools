@@ -4276,7 +4276,7 @@ class WDMLookupTable(WDMSettings):
         out[self.xp.isnan(out)] = 0.0
         return out
 
-    def get_wdm_coeffs(self, amp_arr: np.ndarray, phi_arr: np.ndarray, f_arr: np.ndarray, fdot_arr: np.ndarray, n_arr: np.ndarray, num_m_layers: int = 1):
+    def get_wdm_coeffs(self, amp_arr: np.ndarray, phi_arr: np.ndarray, f_arr: np.ndarray, fdot_arr: np.ndarray, n_arr: np.ndarray, num_m_layers: int = 1, out_of_support: str = "raise"):
         """Compute WDM coefficients using the universal-table 2-layer-per-element rule.
 
         For each source/time element the 2 active vertical layers are picked
@@ -4307,6 +4307,13 @@ class WDMLookupTable(WDMSettings):
             assert ms_to_use[keep_now].min() >= 0
             f_norm = (f_arr[keep_now] - ms_to_use[keep_now] * self.layer_df)
 
+            _in = (f_norm >= self.f_vals_norm.min()) & (f_norm <= self.f_vals_norm.max())
+            if out_of_support == "zero" and not bool(self.xp.all(_in)):
+                # entries outside the table (far layers, ~1e-8 of the power) contribute 0
+                keep_now = keep_now[_in]
+                f_norm = f_norm[_in]
+                if keep_now.size == 0:
+                    continue
             if not bool(self.xp.all((f_norm >= self.f_vals_norm.min()) & (f_norm <= self.f_vals_norm.max()))):
                 raise ValueError(
                     "WDMLookupTable.get_wdm_coeffs: f_norm outside the table's frequency support "

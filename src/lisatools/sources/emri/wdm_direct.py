@@ -17,6 +17,7 @@ spline (orders 1, 2, 3), never from differencing an unwrapped phase.
 from __future__ import annotations
 
 import dataclasses
+import os
 
 import numpy as np
 from scipy.interpolate import CubicSpline
@@ -168,7 +169,7 @@ def plunge_chunk_wdm(td_tail_fn, n_h, Nt, Nf, dt, Nt_sub=128, n_end=None, ind_ma
 # Per-channel tracer from the TDI-on-the-fly output, and the full assembly
 # ----------------------------------------------------------------------
 
-def tracer_from_tof_output(out, t_pixels, h=30.0):
+def tracer_from_tof_output(out, t_pixels, h=30.0, h_fdot=None):
     """Per-sub, per-channel ``(amp, phase, f, fdot)`` at ``t_pixels`` [absolute s].
 
     The channel signal is ``Re[amp exp(-i phase)]`` with ``phase = tdi_phase + phase_ref``
@@ -190,7 +191,9 @@ def tracer_from_tof_output(out, t_pixels, h=30.0):
     ph0 = np.asarray(tph) + np.asarray(pref)[:, None, :]
     php, phm = _ph(t + h), _ph(t - h)
     f = (php - phm) / (2 * h) / (2 * np.pi)
-    fdot = (php - 2 * ph0 + phm) / h ** 2 / (2 * np.pi)
+    hd = float(os.environ.get("EMRI_TRACER_H_FDOT", "300")) if h_fdot is None else float(h_fdot)
+    fdot = (_ph(t + hd) - 2 * ph0 + _ph(t - hd)) / hd ** 2 / (2 * np.pi)   # phase ~1e5 rad: a short
+    #                                                   step turns roundoff into fdot noise
     neg = f < 0
     return amp, np.where(neg, -ph0, ph0), np.where(neg, -f, f), np.where(neg, -fdot, fdot)
 
@@ -216,11 +219,15 @@ class EMRIDirectWDM:
     """
 
     def __init__(self, few_gen, table, wdm_set, *, orbits, tdi_config, t_start, data_t0,
-                 Nt_sub=128, n_fine=None, mode_batch=64, pixel_edge=8, force_backend="cpu"):
+                 Nt_sub=128, n_fine=None, mode_batch=64, pixel_edge=8, num_m_layers=2,
+                 force_backend="cpu"):
         self.few_gen, self.table, self.wdm = few_gen, table, wdm_set
         self.orbits, self.tdi_config = orbits, tdi_config
         self.t_start, self.data_t0 = float(t_start), float(data_t0)
         self.Nt_sub, self.mode_batch, self.pixel_edge = int(Nt_sub), int(mode_batch), int(pixel_edge)
+        # layers m-num_m_layers..m+num_m_layers per pixel: a chirping carrier near a layer edge
+        # puts ~2.5e-4 of its energy two layers away (A8 gate); needs table support [-2, 3) df
+        self.num_m_layers = int(os.environ.get("EMRI_DIRECT_NUM_M_LAYERS", num_m_layers))
         span = wdm_set.Nt * wdm_set.layer_dt
         self.n_fine = int(n_fine) if n_fine is not None else max(1024, int(span / 80.0))
         self.force_backend = force_backend
@@ -249,7 +256,7 @@ class EMRIDirectWDM:
 
     def __call__(self, *few_args, **few_kwargs):
         from ...domains import WDMSignal
-        from ...wdm_het import chunk_start_for_pixels, splice_chunk, wdm_chunk_of_td
+        from ...wdm_het import splice_chunk, tail_chunk_plan, wdm_chunk_of_td
         from .emritdionfly import EMRITDIonFly
 
         wdm = self.wdm
@@ -292,18 +299,20 @@ class EMRIDirectWDM:
                     sel &= f[s, ch] > 2 * ldf
                     if np.any(sel):
                         co, mm = self.table.get_wdm_coeffs(amp[s, ch, sel], phase[s, ch, sel], f[s, ch, sel],
-                                                           fdot[s, ch, sel], n_ok[sel])
+                                                           fdot[s, ch, sel], n_ok[sel], num_m_layers=self.num_m_layers,
+                                                           out_of_support="zero")
                         co, mm = np.asarray(co), np.asarray(mm)
                         for c in range(co.shape[1]):
                             good = mm[:, c] >= 0
                             np.add.at(acc[ch], (mm[good, c], n_ok[sel][good]), co[good, c])
                         n_lookup += int(sel.sum())
                 if k_h < n_ok.size:
-                    n_h, n_end = int(n_ok[k_h]), int(n_ok[-1]) + 1
-                    start = n_h
-                    while start < n_end:
-                        stop = min(n_end, start + self.Nt_sub - 2 * n_pad)
-                        n0 = chunk_start_for_pixels(start, stop, Nt, self.Nt_sub, n_pad)
+                    # the waveform stops abruptly at plunge: the transform of that stop rings
+                    # ~24 px past it (production has the same stop) -> run the chunk tiling a
+                    # quarter chunk beyond the last trajectory pixel (td is 0 there)
+                    n_h = int(n_ok[k_h])
+                    n_end = min(int(n_ok[-1]) + 1 + self.Nt_sub // 4, Nt - self.pixel_edge)
+                    for n0, klo, khi in tail_chunk_plan(n_h, n_end, Nt, self.Nt_sub):
                         ts = self.data_t0 + (n0 * Nf + np.arange(Nf * self.Nt_sub)) * dt
                         live = (ts > x[s, 0]) & (ts < x[s, -1])
                         td = np.zeros((3, ts.size))
@@ -313,10 +322,9 @@ class EMRIDirectWDM:
                         full_chunk = np.zeros((3, Nf, self.Nt_sub))
                         full_chunk[:, :chunk.shape[-2], :] = chunk   # chunk grid is full-band: rows = global layers
                         tmp = np.zeros_like(acc)
-                        splice_chunk(tmp, full_chunk, n0, start - n0, stop - n0)
+                        splice_chunk(tmp, full_chunk, n0, klo, khi)
                         acc += tmp
-                        n_chunk_px += stop - start
-                        start = stop
+                        n_chunk_px += khi - klo
             del out, fly
         self.last_stats = dict(modes=len(modes), lookup_pixels=n_lookup, chunk_pixels=n_chunk_px)
         return WDMSignal(acc, wdm)

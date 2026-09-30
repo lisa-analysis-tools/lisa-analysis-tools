@@ -258,17 +258,41 @@ def chunk_start_for_pixels(n_lo, n_hi, Nt, Nt_sub, n_pad):
     ``[n0 + n_pad, n0 + Nt_sub - n_pad)`` (the last chunk of the grid may keep its
     right edge: nothing follows it). Raises if no such chunk exists."""
     n_lo, n_hi, Nt, Nt_sub, n_pad = map(int, (n_lo, n_hi, Nt, Nt_sub, n_pad))
-    right_pad = 0 if n_hi >= Nt else n_pad
+    # the last n_pad pixels of the grid can only come from the grid-end chunk
+    right_pad = 0 if n_hi > Nt - n_pad else n_pad
     if n_hi - n_lo > Nt_sub - n_pad - right_pad:
         raise ValueError(
             f"pixels [{n_lo}, {n_hi}) exceed the chunk interior ({Nt_sub - n_pad - right_pad}); "
             "use a larger Nt_sub")
-    n0 = min(n_hi - (Nt_sub - right_pad), Nt - Nt_sub)
-    n0 = max(0, n0)
-    n0 -= n0 % 2
-    if n0 + n_pad > n_lo or n0 + Nt_sub - right_pad < n_hi:
+    # valid starts: the chunk must reach n_hi (n0 >= lower) and keep n_lo inside its left
+    # pad (n0 <= upper; the grid-start chunk may keep pixels from 0); pick the lowest EVEN
+    lower = max(0, n_hi - (Nt_sub - right_pad))
+    upper = min(n_lo - n_pad if n_lo >= n_pad else 0, Nt - Nt_sub)
+    # keeping the right edge is only valid for the chunk that ENDS at the grid end
+    n0 = (Nt - Nt_sub) if right_pad == 0 else lower + (lower % 2)
+    if n0 > upper or n0 < lower or n0 % 2:
         raise ValueError(f"no even-start chunk of {Nt_sub} covers [{n_lo}, {n_hi}) with n_pad={n_pad}")
     return n0
+
+
+def tail_chunk_plan(n_lo, n_hi, Nt, Nt_sub):
+    """Tile ``[n_lo, n_hi)`` with even-start chunks: list of ``(n0, keep_lo, keep_hi)``.
+
+    Each chunk keeps its interior ``[n_pad, Nt_sub - n_pad)`` (``n_pad = Nt_sub // 4``;
+    the grid-end chunk keeps through its end). The step is the interior minus 2 so the
+    even-start constraint always fits.
+    """
+    n_pad = Nt_sub // 4
+    plan = []
+    start = int(n_lo)
+    while start < n_hi:
+        stop = min(int(n_hi), start + Nt_sub - 2 * n_pad - 2)
+        if stop > Nt - n_pad:                # the grid-end chunk takes the rest
+            stop = int(n_hi)
+        n0 = chunk_start_for_pixels(start, stop, Nt, Nt_sub, n_pad)
+        plan.append((n0, start - n0, stop - n0))
+        start = stop
+    return plan
 
 
 def splice_chunk(out, chunk, n0, keep_lo, keep_hi):

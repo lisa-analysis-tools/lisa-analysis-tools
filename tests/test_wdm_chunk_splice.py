@@ -71,6 +71,24 @@ class ChunkSpliceTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.start(100, 170, NT, 128, 32)
 
+    def test_tail_chunk_plan_tiles_any_span(self):
+        from lisatools.wdm_het import tail_chunk_plan
+
+        for Nt in (256, 1024):
+            for n_h in range(33, Nt - 40, 7):
+                for n_end in (n_h + 1, n_h + 63, n_h + 64, n_h + 65, min(Nt, n_h + 300), Nt):
+                    if n_end > Nt or n_end <= n_h:
+                        continue
+                    plan = tail_chunk_plan(n_h, n_end, Nt, 128)
+                    covered = []
+                    for n0, lo, hi in plan:
+                        self.assertEqual(n0 % 2, 0)
+                        self.assertTrue(0 <= n0 and n0 + 128 <= Nt)
+                        self.assertGreaterEqual(lo, 32 if n0 > 0 else 0)
+                        self.assertLessEqual(hi, 128 if n0 + 128 == Nt else 96)
+                        covered.extend(range(n0 + lo, n0 + hi))
+                    self.assertEqual(covered, list(range(n_h, n_end)), (Nt, n_h, n_end))
+
     def test_plunge_chunk_splices_tail_exactly(self):
         from lisatools.sources.emri.wdm_direct import plunge_chunk_wdm
 
