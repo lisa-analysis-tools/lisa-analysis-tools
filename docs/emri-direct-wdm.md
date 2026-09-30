@@ -93,6 +93,23 @@ trajectory spacing, default 300 s), `MODE_BATCH` (16), `EVAL_CHUNK`, `RSS_LIMIT_
 Long windows are untested territory: the TOF and direct paths were validated to 170 d;
 memory and wall time at 6 and 24 months are what the campaign measures.
 
+**Mode-threshold sweep (cheap, production template only, ~30 s per run):**
+
+```bash
+TEMPLATES=prod THRESH=1e-2,1e-3,1e-4,1e-5 OUT_DIR=emri_cd1l_thresh bash scripts/emri/emri_cd1l_campaign.sh
+```
+
+Each row also carries `prod_resid_snr2` (= -2 logL: the power a subtracted template leaves
+in the residual), its split over the bands <1, 1-3, 3-10, >10 mHz, and the kept-mode count.
+EMRI 1, 6 months (data SNR 21.8), production template:
+
+| threshold | modes kept | residual SNR^2 | of which 3-10 mHz | opt/data SNR |
+|---|---|---|---|---|
+| 1e-2 | 14 | 26.8 | 23.9 | 1.056 |
+| 1e-3 (production) | 38 | 2.94 | 2.64 | 1.011 |
+| 1e-4 | 67 | 0.37 | 0.27 | 1.0002 |
+| 1e-5 | 112 | 0.037 | 0.027 | 0.9998 |
+
 ## Open items
 
 1. (resolved) TOF vs production at the abrupt plunge end.
