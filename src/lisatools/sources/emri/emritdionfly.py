@@ -232,6 +232,7 @@ class EMRITDIonFly:
                 _ik.clear()
                 _ik.update(_ik_saved)
 
+        self.last_holder = Kerr_wave   # consumers (EMRIDirectWDM) need the same trajectory's modes
         mode_amp, mode_phase = self.mode_amp_phase(
             Kerr_wave, include_minus_mkn=include_minus_mkn, amp_factor=self.AMP_FACTOR
         )

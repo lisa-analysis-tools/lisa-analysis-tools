@@ -93,8 +93,11 @@ def harmonic_tracks_from_holder(holder, integrator, t_pixels, *, a, xI0):
 # ----------------------------------------------------------------------
 
 #: Half-support of the WDM wavelet in units of layer_dt used by the curvature trigger.
-#: Calibrated against the plunging gate source in Task A6 (see the ledger).
-WDM_HALF_SUPPORT_LAYERS = 1.0
+#: Calibrated in Task A6 (scripts/emri/emri_single_harmonic_gate.py): the exact local-chirp
+#: model error (1.9e-4 median over the inspiral) passes the table-interpolation error
+#: (~3-5e-3) near 0.9 t_plunge, where (pi/3)|fddot| layer_dt^3 ~ 1.2e-3 rad; a 0.1 rad
+#: trigger there needs tau ~ 4 layer_dt (the WDM wavelet's tails are wide).
+WDM_HALF_SUPPORT_LAYERS = 4.0
 #: Intra-chunk sweep [layers] beyond which the chunk sheds chirped power SILENTLY
 #: (SOBBH measurement: optimum ~3.5, tolerable to 7, collapse by 14;
 #: globalfit/stock/erebor/source_runtime.py resolve_sobbh_nt_sub).
@@ -159,3 +162,161 @@ def plunge_chunk_wdm(td_tail_fn, n_h, Nt, Nf, dt, Nt_sub=128, n_end=None, ind_ma
     td = td_tail_fn(n0 * int(Nf), int(Nf) * int(Nt_sub))
     chunk = wdm_chunk_of_td(td, 0, Nf, Nt_sub, dt, backend=backend)
     return chunk, n0, int(n_h) - n0, n_end - n0
+
+
+# ----------------------------------------------------------------------
+# Per-channel tracer from the TDI-on-the-fly output, and the full assembly
+# ----------------------------------------------------------------------
+
+def tracer_from_tof_output(out, t_pixels, h=30.0):
+    """Per-sub, per-channel ``(amp, phase, f, fdot)`` at ``t_pixels`` [absolute s].
+
+    The channel signal is ``Re[amp exp(-i phase)]`` with ``phase = tdi_phase + phase_ref``
+    (``TDTDIOutput.eval_tdi``). ``f`` and ``fdot`` are central differences (step ``h``)
+    of that CONTINUOUS spline phase, so they carry the Doppler shift of the channel
+    (the source-frame f is off by ~1e-4 f, a ~1% pixel error). A negative-frequency
+    sub (a -m partner) is mirrored to positive frequency: cos is even, so
+    ``phase -> -phase``, ``f -> -f``, ``fdot -> -fdot``.
+    Returns arrays of shape ``(num_sub, nch, P)``.
+    """
+    t = np.asarray(t_pixels, dtype=float)
+
+    def _ph(tt):
+        _, tph, pref = out.eval_spline_vals(tt)
+        return np.asarray(tph) + np.asarray(pref)[:, None, :]
+
+    amp, tph, pref = out.eval_spline_vals(t)
+    amp = np.asarray(amp)
+    ph0 = np.asarray(tph) + np.asarray(pref)[:, None, :]
+    php, phm = _ph(t + h), _ph(t - h)
+    f = (php - phm) / (2 * h) / (2 * np.pi)
+    fdot = (php - 2 * ph0 + phm) / h ** 2 / (2 * np.pi)
+    neg = f < 0
+    return amp, np.where(neg, -ph0, ph0), np.where(neg, -f, f), np.where(neg, -fdot, fdot)
+
+
+class EMRIDirectWDM:
+    """EMRI template built directly in the WDM domain.
+
+    Per harmonic: the n_ref lookup up to its handoff pixel (curvature or fdot range),
+    then even-start chunks of its own dense TDI-on-the-fly TD over the plunge tail.
+    Harmonics are processed in batches of ``mode_batch`` so the per-harmonic response
+    splines never all live at once (the scale-up constraint).
+
+    Args:
+        few_gen: FEW generator (the production one; its inspiral options are restored
+            after every call by EMRITDIonFly).
+        table: :class:`lisatools.domains.WDMLookupTable` built on the same Nf, dt.
+        wdm_set: target :class:`WDMSettings` (grid starts at ``data_t0``).
+        orbits, tdi_config: as for :class:`EMRITDIonFly` (ICRS orbits, special frame).
+        t_start: FEW reference epoch (trajectory clock origin), e.g. MOJITO_REFERENCE_TIME.
+        data_t0: absolute time of WDM pixel 0.
+        n_fine: fine trajectory points over the window (default: one per 80 s).
+        pixel_edge: pixels dropped at each grid end (response spline support).
+    """
+
+    def __init__(self, few_gen, table, wdm_set, *, orbits, tdi_config, t_start, data_t0,
+                 Nt_sub=128, n_fine=None, mode_batch=64, pixel_edge=8, force_backend="cpu"):
+        self.few_gen, self.table, self.wdm = few_gen, table, wdm_set
+        self.orbits, self.tdi_config = orbits, tdi_config
+        self.t_start, self.data_t0 = float(t_start), float(data_t0)
+        self.Nt_sub, self.mode_batch, self.pixel_edge = int(Nt_sub), int(mode_batch), int(pixel_edge)
+        span = wdm_set.Nt * wdm_set.layer_dt
+        self.n_fine = int(n_fine) if n_fine is not None else max(1024, int(span / 80.0))
+        self.force_backend = force_backend
+        self.fdot_axis_max = float(np.max(np.abs(np.asarray(table.fdot_vals))))
+        self.last_stats = {}
+
+    def _mode_list(self, few_args, few_kwargs):
+        from few.utils.utility import get_viewing_angles
+
+        m1, m2, a, p0, e0, x0, dist, qS, phiS, qK, phiK, Pp, Pt, Pr = few_args[:14]
+        th, ph = get_viewing_angles(qS, phiS, qK, phiK)
+        saved = dict(self.few_gen.inspiral_kwargs)
+        span = self.wdm.Nt * self.wdm.layer_dt
+        lo = self.data_t0 - self.t_start
+        try:
+            H = self.few_gen(m1, m2, a, p0, e0, x0, th, ph, dist=dist, Phi_phi0=Pp, Phi_theta0=Pt,
+                             Phi_r0=Pr, T=(lo + span + 2000.0) / 3.15581497635456e7, dt=self.wdm.data_dt,
+                             return_sparse_holder=True, include_minus_mkn=True,
+                             inspiral_kwargs={"upsample": True, "fix_t": True,
+                                              "new_t": np.linspace(max(lo, 0.0), lo + span, 256)},
+                             **{k: v for k, v in few_kwargs.items() if k != "inspiral_kwargs"})
+        finally:
+            self.few_gen.inspiral_kwargs.clear()
+            self.few_gen.inspiral_kwargs.update(saved)
+        return [(int(l), int(m), int(k), int(n)) for l, m, k, n in zip(H.ls, H.ms, H.ks, H.ns)]
+
+    def __call__(self, *few_args, **few_kwargs):
+        from ...domains import WDMSignal
+        from ...wdm_het import chunk_start_for_pixels, splice_chunk, wdm_chunk_of_td
+        from .emritdionfly import EMRITDIonFly
+
+        wdm = self.wdm
+        Nf, Nt, dt, ldt, ldf = wdm.Nf, wdm.Nt, wdm.data_dt, wdm.layer_dt, wdm.layer_df
+        span = Nt * ldt
+        n_all = np.arange(self.pixel_edge, Nt - self.pixel_edge)
+        t_pix = self.data_t0 + n_all * ldt
+        T_traj = self.data_t0 - self.t_start + span + 2000.0
+        acc = np.zeros((3, Nf, Nt))
+        n_pad = self.Nt_sub // 4
+        few_kwargs = dict(few_kwargs)
+        modes = few_kwargs.pop("mode_selection", None)      # explicit (l, m, k, n) list, e.g. gates
+        if modes is None:
+            modes = self._mode_list(few_args, few_kwargs)
+        n_lookup = n_chunk_px = 0
+        few_kwargs.pop("mode_selection_threshold", None)
+
+        for j in range(0, len(modes), self.mode_batch):
+            fly = EMRITDIonFly(self.few_gen, self.orbits, self.tdi_config, dt, T_traj, self.t_start,
+                               frame="icrs_special", n_fine=self.n_fine,
+                               t_fine_window=(self.data_t0, self.data_t0 + span))
+            out = fly(*few_args, mode_selection=modes[j:j + self.mode_batch], **few_kwargs)
+            x = np.asarray(out.x)
+            integ = self.few_gen.inspiral_generator.inspiral_generator
+            H = fly.last_holder
+            t_traj_end = float(np.asarray(H.t_arr)[-1])
+            ok_t = (t_pix > x[:, 0].max()) & (t_pix < x[:, -1].min()) & (t_pix - self.t_start <= t_traj_end)
+            n_ok, tt = n_all[ok_t], t_pix[ok_t]
+            if n_ok.size == 0:
+                continue
+            tracks = harmonic_tracks_from_holder(H, integ, tt - self.t_start, a=few_args[2], xI0=few_args[5])
+            amp, phase, f, fdot = tracer_from_tof_output(out, tt)
+            assert amp.shape[0] == len(tracks), (amp.shape, len(tracks))
+            # dense TD of every sub over the tail region (chunks), evaluated lazily below
+            for s, tr in enumerate(tracks):
+                k_h = handoff_pixel(tr, ldt, ldf, self.fdot_axis_max)
+                for ch in range(3):
+                    sel = np.arange(n_ok.size) < k_h
+                    sel &= np.abs(fdot[s, ch]) <= self.fdot_axis_max
+                    sel &= f[s, ch] > 2 * ldf
+                    if np.any(sel):
+                        co, mm = self.table.get_wdm_coeffs(amp[s, ch, sel], phase[s, ch, sel], f[s, ch, sel],
+                                                           fdot[s, ch, sel], n_ok[sel])
+                        co, mm = np.asarray(co), np.asarray(mm)
+                        for c in range(co.shape[1]):
+                            good = mm[:, c] >= 0
+                            np.add.at(acc[ch], (mm[good, c], n_ok[sel][good]), co[good, c])
+                        n_lookup += int(sel.sum())
+                if k_h < n_ok.size:
+                    n_h, n_end = int(n_ok[k_h]), int(n_ok[-1]) + 1
+                    start = n_h
+                    while start < n_end:
+                        stop = min(n_end, start + self.Nt_sub - 2 * n_pad)
+                        n0 = chunk_start_for_pixels(start, stop, Nt, self.Nt_sub, n_pad)
+                        ts = self.data_t0 + (n0 * Nf + np.arange(Nf * self.Nt_sub)) * dt
+                        live = (ts > x[s, 0]) & (ts < x[s, -1])
+                        td = np.zeros((3, ts.size))
+                        if np.any(live):
+                            td[:, live] = np.asarray(out.eval_tdi(ts[live]))[s]
+                        chunk = np.asarray(wdm_chunk_of_td(td, 0, Nf, self.Nt_sub, dt, backend=self.force_backend))
+                        full_chunk = np.zeros((3, Nf, self.Nt_sub))
+                        full_chunk[:, :chunk.shape[-2], :] = chunk   # chunk grid is full-band: rows = global layers
+                        tmp = np.zeros_like(acc)
+                        splice_chunk(tmp, full_chunk, n0, start - n0, stop - n0)
+                        acc += tmp
+                        n_chunk_px += stop - start
+                        start = stop
+            del out, fly
+        self.last_stats = dict(modes=len(modes), lookup_pixels=n_lookup, chunk_pixels=n_chunk_px)
+        return WDMSignal(acc, wdm)
