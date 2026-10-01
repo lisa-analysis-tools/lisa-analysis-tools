@@ -52,6 +52,7 @@ from .moves import (
     PSDMove,
     ResidualAddOneRemoveOneMove,
     SOBBHChunkedLikeMove,
+    MBHBatchedLikeMove,
     GBSpecialRJPriorMove,
     GBSpecialRJFStatGridMove,
     GBSpecialStretchMove,
@@ -717,7 +718,16 @@ class Recipe:
             iteration, last_sample, sampler
         )
         if stop_here:
-            self.backend.completed_recipe_step(self._current_recipe_step["name"])
+            # the next INCOMPLETE step, so its start_iteration can be stamped
+            # in the same write as this step's completion (see
+            # GFHDFBackend.completed_recipe_step)
+            _next_name = None
+            for _j in range(self._current_iter + 1, len(self.recipe)):
+                if not self.recipe[_j]["status"]:
+                    _next_name = self.recipe[_j]["name"]
+                    break
+            self.backend.completed_recipe_step(
+                self._current_recipe_step["name"], next_step_name=_next_name)
             self._current_recipe_step["status"] = True
             next(self)
 
@@ -1106,21 +1116,114 @@ def gb_moves_in_tree(moves):
             yield m
 
 
-def force_fstat_refit(moves, serial, reason: str = "") -> int:
+def force_fstat_refit(moves, serial, reason: str = "", hard: bool = False) -> int:
     """Arm a forced fresh-epoch F-stat refit on every grid move in the tree.
 
     Returns how many moves were armed (0 when the tree carries no F-stat
     grid move, e.g. a GB-less recipe). See
     :meth:`~lisatools.globalfit.moves.gbspecialstretch.GBSpecialRJFStatGridMove.arm_fstat_refit`
     for why a refit, and not an environment change, is the mechanism.
+
+    ``hard=True`` arms the age-ignoring form (the galfor ratchet: the noise
+    curve changed, so the latest epoch is wrong however fresh it is).
     """
     n = 0
     for m in iter_move_tree(moves):
         fn = getattr(m, "arm_fstat_refit", None)
         if callable(fn):
-            fn(serial, reason)
+            if hard:
+                fn(serial, reason, ignore_age=True)
+            else:
+                fn(serial, reason)
             n += 1
     return n
+
+
+def reset_band_logl_max(state, branch: str = "gb") -> int:
+    """Reset the valve's all-time per-(walker, band) cold-lnL maximum to -inf.
+
+    User ruling 2026-09-30 for gb_search_3 ("instead of starting from the
+    stored value, let's reset that"): the max carried in from the fixed-noise
+    stages was earned under a DIFFERENT noise curve. Once the foreground
+    moves (the stage's own noise search, or a ratchet nudge) the cold lnL of
+    every band changes scale, a stored max can sit above anything the band
+    can now reach, and the valve reads "no improvement" and shuts pairs that
+    were never given a fair window -- 6mo job 672's stage 3 completed on the
+    shutoff rule after three iterations for exactly this reason. Written IN
+    PLACE into ``state.sub_states[branch].band_info`` (the arrays the
+    judge holds live references to and the saver persists), so the very next
+    judge re-learns the max under the noise now in force; the streaks reset
+    themselves at that first judge because -inf + tol is always beaten.
+
+    Returns the number of entries reset, 0 when the state carries no such
+    array (valve off, or a fake state).
+    """
+    try:
+        bi = state.sub_states[branch].band_info
+        arr = bi["band_cold_logl_max_w"]
+    except (AttributeError, KeyError, TypeError):
+        return 0
+    arr = np.asarray(arr)
+    if arr.size == 0:
+        return 0
+    arr[...] = -np.inf
+    return int(arr.size)
+
+
+def release_band_shutoff_window(state, serial, branch: str = "gb"):
+    """Release the level-3 valve ON THE STATE at recipe-step entry.
+
+    Returns ``(n_reopened, released)``.
+
+    The per-(walker, band) RJ shutoff valve is scoped to a recipe step: a
+    stored table earned under another step is released, not honoured. Until
+    2026-10-01 that release lived ONLY in the RJ moves' bind path
+    (``_arm_search_stage`` on rj_fstat_search / rj_warm_search, at THEIR
+    first propose). The pure in-model moves bind the same table READ-ONLY
+    for their pick mask -- no stamp check, no release -- so the first
+    non-RJ GB move of a new step read the previous step's table. 6mo job
+    675 (the first ratcheted relaunch): gb_search_2 had ended with every
+    occupied pair shut (that is the stage-end rule), the gated noise head's
+    in-model follow-up was the first GB move of gb_search_3, its pick mask
+    excluded every shut pair, and it ran ZERO proposals
+    (``[GB_ACCEPT in_model] in-model cold 0/0``, one 1 s "pass" with every
+    occupied sub-band static) -- the one pass the ratchet design exists to
+    run before any RJ move sees the nudged residual. Job 672 did not show it
+    because its state came from a stage-3 checkpoint whose stamp matched.
+
+    Same rule as the bind path, applied earlier and on the live arrays the
+    moves will bind: stamp differs from ``serial`` (the unset sentinel
+    included) -> clear the shut booleans and the window (peak / streak /
+    resets; the all-time max is untouched by the 2026-09-27 ruling) and
+    re-stamp; same stamp (a resume inside the step) -> honour it. In place,
+    so the saver persists the release and the RJ move's own bind then sees a
+    matching stamp and releases nothing twice.
+    """
+    if serial is None:
+        return 0, False
+    try:
+        bi = state.sub_states[branch].band_info
+    except (AttributeError, KeyError, TypeError):
+        return 0, False
+    if not isinstance(bi, dict):
+        return 0, False
+    shut = bi.get("band_rj_shutoff_w")
+    stamp = bi.get("band_shutoff_w_step")
+    if shut is None or stamp is None:
+        return 0, False
+    shut = np.asarray(shut)
+    stamp = np.asarray(stamp)
+    if stamp.size == 0 or int(stamp.ravel()[0]) == int(serial):
+        return 0, False
+    from .moves.gbspecialstretch import cold_band_lnl_from_band_info
+
+    view = cold_band_lnl_from_band_info(bi, shut.shape)
+    if view is not None:
+        view.release()
+    n = int(np.count_nonzero(shut))
+    shut[...] = False
+    stamp.ravel()[0] = int(serial)
+    return n, True
 
 
 def _arm_cap_headroom_grant(moves) -> None:
@@ -1385,11 +1488,12 @@ class SearchStageProfileStep(RJRecipeStep):
     """
 
     def __init__(self, *args, profile: typing.Optional[dict] = None,
-                 stage_name: str = "", **kwargs):
+                 stage_name: str = "", ratchet=None, ratchet_delta=None,
+                 legs: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.profile = dict(profile or {})
         _unknown = sorted(set(self.profile) - {
-            "phase_maximize", "opt_snr", "peak_min_snr"})
+            "phase_maximize", "opt_snr", "peak_min_snr", "reset_band_max"})
         if _unknown:
             raise ValueError(
                 f"SearchStageProfileStep({stage_name!r}): unknown profile "
@@ -1403,6 +1507,22 @@ class SearchStageProfileStep(RJRecipeStep):
         #: Whether this step has ever been announced. Read by the
         #: ``stopping_function`` guard below.
         self._profile_applied = False
+        # ---- the galfor RATCHET (user design 2026-09-30) -------------------
+        # ``ratchet`` is a ``noise_ratchet.RatchetSchedule`` (or None = off);
+        # ``ratchet_delta`` the per-nudge shift of the galfor coordinates in
+        # the sampled basis. The schedule is keyed on the STAGE-LOCAL
+        # iteration (backend iteration - stage start), so a resume lands in
+        # the right phase instead of nudging again -- see _drive_ratchet.
+        self.ratchet = ratchet
+        self.ratchet_delta = (None if ratchet_delta is None
+                              else np.asarray(ratchet_delta, dtype=float))
+        self._ratchet_last_k = None
+        self._ratchet_pre_nudge = None
+        # ---- search LEGS (user design 2026-09-30) -------------------------
+        # One stored row per leg of the cycle; the stage combine carries the
+        # cursor (``gf_legs``), this step positions it at entry from the last
+        # row's leg-ender NAME. See lisatools.globalfit.legs.
+        self.legs = bool(legs)
 
     # ---- profile application ----------------------------------------------
 
@@ -1420,6 +1540,293 @@ class SearchStageProfileStep(RJRecipeStep):
         self._profile_serial = serial
         self._profile_applied = True
         self._apply_profile(serial)
+        # Release the level-3 valve on the LIVE state before the step's first
+        # move (6mo job 675: the gated noise head's in-model pass, a non-RJ
+        # move, read gb_search_2's all-shut table and picked nothing).
+        _n_open, _released = release_band_shutoff_window(
+            getattr(self, "_ratchet_last_sample", None), serial)
+        if _released:
+            logger.info(
+                "[V9-STAGE %s] per-walker RJ valve RELEASED at step entry "
+                "(stored step != %s): %d (walker, band) pairs reopened and the "
+                "window cleared BEFORE the step's first move, so a non-RJ move "
+                "running first (the gated noise head's in-model pass) picks "
+                "from this step's table, not the previous step's.",
+                self.stage_name or "gb_search", serial, _n_open)
+        if self.profile.get("reset_band_max"):
+            # user ruling 2026-09-30 (gb_search_3): the valve's stored per-band
+            # max was earned under another noise curve -- re-learn it here
+            _n = reset_band_logl_max(getattr(self, "_ratchet_last_sample", None))
+            logger.info(
+                "[V9-STAGE %s] band_cold_logl_max_w RESET to -inf (%d entries): "
+                "the shutoff valve re-learns each (walker, band)'s best cold lnL "
+                "under this stage's noise instead of the stored value.",
+                self.stage_name or "gb_search", _n)
+        self._legs_enter()
+        self._ratchet_enter()
+
+    # ---- search legs --------------------------------------------------------
+
+    def _stage_combine(self):
+        """The stage combine carrying the leg cursor, or None."""
+        for m in list(getattr(self, "moves", None) or []):
+            mm = m[0] if isinstance(m, (tuple, list)) and m else m
+            if getattr(mm, "gf_legs", None) is not None:
+                return mm
+        return None
+
+    def _legs_enter(self) -> None:
+        """Position the leg cursor from the store (HEAD-ONLY announce path).
+
+        The resume position is the NAME of the leg-ender the last row was
+        saved after; a fresh stage (no rows of its own yet), an old store or
+        a changed composition all start at the head of the list, loudly.
+        """
+        if not getattr(self, "legs", False):
+            return
+        cm = self._stage_combine()
+        tag = self.stage_name or "gb_search"
+        if cm is None:
+            logger.warning(
+                "[LEG %s] legs=True but the stage combine carries no leg "
+                "cursor -- compose the stage with leg_ends (GB_SEARCH_LEGS=1).",
+                tag)
+            return
+        cur = cm.gf_legs
+        be = getattr(self, "_ratchet_backend", None)
+        live = int(getattr(self, "_ratchet_live_iter",
+                           getattr(self, "_stage_start_iter", 0)))
+        origin = self._ratchet_stage_origin()
+        name, hist, stored = None, [], None
+        if live > origin:
+            fn = getattr(be, "saved_after", None)
+            name = fn(live - 1) if callable(fn) else None
+            fn = getattr(be, "saved_after_history", None)
+            hist = fn(origin, live) if callable(fn) else []
+        fn = getattr(be, "stage_move_order", None)
+        stored = fn(self.stage_name) if (callable(fn) and self.stage_name) else None
+        if stored is not None and list(stored) != list(cur.order):
+            logger.warning(
+                "[LEG %s] the stage's stored move order %s differs from the "
+                "live composition %s -- resuming at the HEAD of the cycle "
+                "rather than trusting a row name from a different list.",
+                tag, list(stored), list(cur.order))
+            cur.set_after(None)
+            cur.cycles = 0
+        else:
+            ok = cur.set_after(name)
+            if name and not ok:
+                logger.warning(
+                    "[LEG %s] last row was saved after %r, which is not a "
+                    "leg-ender of %s -- resuming at the head of the cycle.",
+                    tag, name, cur.ends)
+            cur.cycles = cur.cycles_from_history(hist)
+        logger.info(
+            "[LEG %s] resume: rows %d..%d of this stage, last saved after %r -> "
+            "next move %r (leg %d/%d), %d cycle(s) completed",
+            tag, origin, live - 1, name,
+            cur.order[cur.cursor] if cur.cursor < len(cur.order) else "?",
+            cur.leg_index + 1, cur.nlegs, cur.cycles)
+
+    # ---- the galfor ratchet -----------------------------------------------
+
+    def setup_run(self, iteration, last_sample, sampler):
+        super().setup_run(iteration, last_sample, sampler)
+        # Stash what the HEAD-ONLY announce path needs. ⚠ setup_run itself
+        # runs on every compute rank too (run.py's build loop calls it with
+        # iteration=0 against a shell engine), so nothing here may read the
+        # store or drive the gate -- that happens in note_recipe_step, which
+        # only the recipe's announce path calls.
+        self._ratchet_live_iter = int(iteration)
+        self._ratchet_backend = getattr(sampler, "backend", None)
+        self._ratchet_last_sample = last_sample
+
+    def _ratchet_stage_origin(self) -> int:
+        """The stored iteration this stage STARTED at -- the ratchet's clock.
+
+        Read from the recipe group's ``start_iteration`` (stamped on the
+        head's transition path, and by the rewind tool), so a resume lands in
+        the right phase of the schedule instead of nudging again. Falls back
+        to the live stage start when the store carries no stamp.
+        """
+        live = int(getattr(self, "_stage_start_iter", 0))
+        be = getattr(self, "_ratchet_backend", None)
+        fn = getattr(be, "stage_start_iteration", None)
+        if not callable(fn) or not self.stage_name:
+            return live
+        try:
+            stored = fn(self.stage_name)
+        except Exception:  # noqa: BLE001 -- a clock, never fatal
+            stored = None
+        if stored is None:
+            return live
+        stored = int(stored)
+        if stored > int(getattr(self, "_ratchet_live_iter", live)):
+            logger.warning(
+                "[GALFOR_RATCHET %s] stored start_iteration %d is AHEAD of the "
+                "live iteration %d -- ignoring it (a stale stamp); the "
+                "ratchet clock starts at the live iteration.",
+                self.stage_name, stored, self._ratchet_live_iter)
+            return live
+        return stored
+
+    def _ratchet_enter(self) -> None:
+        """Drive the gate for the iteration about to run (stage entry/resume).
+
+        Sets the IN-PROCESS clock ``_ratchet_k`` from the store once, here.
+        ⚠ Afterwards the clock is advanced by counting ``stopping_function``
+        calls, NOT by re-reading ``backend.iteration``: on the head the save
+        is a handoff to the saver rank and the store's iteration attr lags
+        one save behind, so a re-read at the end of an iteration still shows
+        the row that was just handed off. 6mo job 672 nudged TWICE in a row
+        that way (k read as 0 twice), stacking two shifts.
+        """
+        if getattr(self, "ratchet", None) is None:
+            return
+        self._ratchet_origin = self._ratchet_stage_origin()
+        live = int(getattr(self, "_ratchet_live_iter",
+                           getattr(self, "_stage_start_iter", 0)))
+        cm = self._stage_combine() if getattr(self, "legs", False) else None
+        # CYCLE units under legs (the cursor's completed-cycle count, set
+        # from the store by _legs_enter just before this); rows otherwise.
+        self._ratchet_k = (int(cm.gf_legs.cycles) if cm is not None
+                           else live - self._ratchet_origin)
+        _sample = getattr(self, "_ratchet_last_sample", None)
+        # a resume mid-cycle (legs) after the gate already ran keeps the
+        # reference captured before that nudge; only a cycle head recaptures
+        if cm is None or cm.gf_legs.cursor == 0:
+            self._ratchet_capture_reference(self._ratchet_k, _sample)
+        self._drive_ratchet(self._ratchet_k, self.moves, sample=_sample)
+
+    def _ratchet_capture_reference(self, k, sample) -> None:
+        """Before a NUDGE runs, remember the cold-mean galfor vector it starts
+        from: the readout compares every later row against THIS, so a release
+        that climbs back reads as ~1 and one that stays down reads low."""
+        if sample is None or self.ratchet.action(k) != "nudge":
+            return
+        try:
+            bc = getattr(sample, "branches_coords", None)
+            if bc is not None and "galfor" in bc:
+                self._ratchet_pre_nudge = np.asarray(bc["galfor"])[0, :, 0, :].mean(axis=0).copy()
+        except Exception as e:  # noqa: BLE001 -- a readout reference, never fatal
+            logger.debug("[GALFOR_RATCHET] reference capture skipped: %r", e)
+
+    def _ratchet_schedule_pending(self, k_next) -> bool:
+        """True while the schedule still has a nudge/hold/release to run.
+
+        The stage must not COMPLETE while the ratchet is mid-schedule (user
+        design 2026-09-30: the release IS the measurement). 6mo job 672's
+        stage 3 ended on the shutoff rule after nudge, nudge, hold -- before
+        a single release -- and handed full_pe a foreground two shifts down.
+        ``GALFOR_RATCHET_HOLD_STAGE=0`` restores the plain stopping rule.
+        """
+        if getattr(self, "ratchet", None) is None:
+            return False
+        if os.environ.get("GALFOR_RATCHET_HOLD_STAGE", "1").strip() in (
+                "0", "false", "False", "no", "off"):
+            return False
+        return int(k_next) < self.ratchet.cycles * self.ratchet.cycle_length
+
+    def _ratchet_gate(self, moves):
+        from .noise_ratchet import is_noise_ratchet_gate
+
+        for m in iter_move_tree(moves):
+            if is_noise_ratchet_gate(m):
+                return m
+        return None
+
+    def _drive_ratchet(self, k, moves, sample=None) -> None:
+        """Set the gate's mode for stage-local cycle ``k``.
+
+        Called at stage entry and at the end of every iteration (per cycle
+        under legs). A nudge additionally arms a HARD F-stat refit on every
+        grid move in the stage (the grid must be re-fitted against the
+        lowered noise before the next birth proposal draws from it) and
+        RESETS the shutoff valve's per-band cold-lnL max on ``sample`` (the
+        state the nudge will run on): a max earned under the old noise
+        would otherwise read every band as "no improvement" -- see
+        :func:`reset_band_logl_max`.
+        """
+        if getattr(self, "ratchet", None) is None:
+            return
+        k = int(k)
+        if k < 0:
+            return
+        gate = self._ratchet_gate(moves)
+        tag = self.stage_name or "gb_search"
+        if gate is None:
+            if self._ratchet_last_k is None:
+                logger.warning(
+                    "[GALFOR_RATCHET %s] a ratchet schedule is set but the "
+                    "stage carries no NoiseRatchetGate -- the schedule "
+                    "reaches NOTHING. Compose the stage with the gated noise "
+                    "head (GALFOR_RATCHET=1 in the launcher).", tag)
+            self._ratchet_last_k = k
+            return
+        action = self.ratchet.action(k)
+        gate.set_mode(action)
+        if action == "nudge":
+            # the nudge COUNT is part of the serial: arm_fstat_refit is
+            # idempotent per serial, and a repeated k (job 672) silently
+            # skipped the second nudge's refit
+            self._ratchet_nudges = int(getattr(self, "_ratchet_nudges", 0)) + 1
+            serial = ("galfor_ratchet", tag, k, self._ratchet_nudges)
+            n = force_fstat_refit(
+                moves, serial,
+                f"galfor ratchet nudge at stage-local iteration {k}",
+                hard=True)
+            _nmax = reset_band_logl_max(sample) if sample is not None else 0
+            logger.info(
+                "[GALFOR_RATCHET %s] iteration %d: NUDGE (cycle %d of %d) -- "
+                "galfor shift %s in the sampled basis; hard F-stat refit "
+                "armed on %d grid move(s); valve per-band lnL max reset (%d "
+                "entries); the noise moves then HOLD for %d iteration(s) and "
+                "RELEASE for %d.",
+                tag, k, k // self.ratchet.cycle_length + 1, self.ratchet.cycles,
+                np.array2string(np.asarray(self.ratchet_delta), precision=3)
+                if self.ratchet_delta is not None else "?",
+                n, _nmax, self.ratchet.hold - 1, self.ratchet.release)
+        elif action != (self._ratchet_last_action if hasattr(
+                self, "_ratchet_last_action") else None):
+            logger.info("[GALFOR_RATCHET %s] iteration %d: %s", tag, k,
+                        action.upper())
+        self._ratchet_last_action = action
+        self._ratchet_last_k = k
+
+    def _ratchet_readout(self, k_done, sample) -> None:
+        """One [GALFOR_RATCHET] line per completed iteration ``k_done`` with
+        the cold-mean galfor curve against the PRE-nudge curve at 1..5 mHz --
+        the release IS the measurement: a region that comes back was honest,
+        one that stays down had been absorbing resolvable power."""
+        if getattr(self, "ratchet", None) is None or sample is None:
+            return
+        try:
+            from .noise_ratchet import galfor_curve_ratio
+
+            bc = getattr(sample, "branches_coords", None)
+            if bc is None or "galfor" not in bc:
+                return
+            mean = np.asarray(bc["galfor"])[0, :, 0, :].mean(axis=0)
+            ref = getattr(self, "_ratchet_pre_nudge", None)
+            f = np.array([1.0, 2.0, 3.0, 3.5, 4.0, 4.5, 5.0]) * 1e-3
+            if ref is None:
+                logger.info(
+                    "[GALFOR_RATCHET %s] after iteration %d (%s): cold-mean galfor "
+                    "%s; no pre-nudge reference captured yet",
+                    self.stage_name or "gb_search", k_done,
+                    self.ratchet.action(k_done).upper(),
+                    np.array2string(mean, precision=4))
+                return
+            r = galfor_curve_ratio(mean, ref, f)
+            logger.info(
+                "[GALFOR_RATCHET %s] after iteration %d (%s): cold-mean galfor "
+                "%s; curve / pre-nudge at 1,2,3,3.5,4,4.5,5 mHz = %s",
+                self.stage_name or "gb_search", k_done,
+                self.ratchet.action(k_done).upper(),
+                np.array2string(mean, precision=4),
+                np.array2string(r, precision=3))
+        except Exception as e:  # noqa: BLE001 -- a readout must never stop a run
+            logger.debug("[GALFOR_RATCHET] readout skipped: %r", e)
 
     def _apply_profile(self, serial) -> None:
         tag = self.stage_name or "gb_search"
@@ -1547,6 +1954,46 @@ class SearchStageProfileStep(RJRecipeStep):
     # ---- stopping ----------------------------------------------------------
 
     def stopping_function(self, i, sample, sampler) -> bool:
+        """The stage's stopping rules (:meth:`_stopping_rules`) with the galfor
+        ratchet layered on top: the stage-local clock advances by one per
+        call, the readout line is written, the stage is HELD OPEN while the
+        ratchet schedule is still pending, and the gate is driven for the
+        iteration about to start."""
+        stop = self._stopping_rules(i, sample, sampler)
+        # getattr: fake-based suites build this step without __init__
+        if getattr(self, "ratchet", None) is None:
+            return stop
+        moves = getattr(sampler, "moves", None)
+        # IN-PROCESS clock: one stopping_function call = one completed
+        # iteration. Never re-read backend.iteration here -- on the head it
+        # lags the handoff by one save (see _ratchet_enter). Under LEGS the
+        # clock is the cursor's completed-cycle count, so the gate is driven
+        # once per CYCLE (at the wrap), not once per row.
+        _k_done = int(getattr(self, "_ratchet_k", 0))
+        _cm = self._stage_combine() if getattr(self, "legs", False) else None
+        if _cm is not None:
+            _k_next = int(_cm.gf_legs.cycles)
+            _advanced = _k_next > _k_done
+        else:
+            _k_next = _k_done + 1
+            _advanced = True
+        self._ratchet_readout(_k_done, sample)
+        if stop and self._ratchet_schedule_pending(_k_next):
+            logger.info(
+                "[GALFOR_RATCHET %s] stage would complete after iteration "
+                "%d but the ratchet schedule is mid-way (%d of %d "
+                "iterations) -- holding the stage open so the release "
+                "can be read (GALFOR_RATCHET_HOLD_STAGE=0 disables).",
+                self.stage_name or "gb_search", _k_done, _k_next,
+                self.ratchet.cycles * self.ratchet.cycle_length)
+            stop = False
+        if not stop and _advanced:
+            self._ratchet_k = _k_next
+            self._ratchet_capture_reference(_k_next, sample)
+            self._drive_ratchet(_k_next, moves, sample=sample)
+        return stop
+
+    def _stopping_rules(self, i, sample, sampler) -> bool:
         """Nleaves plateau AND the per-(walker, band) RJ valve (gate 6).
 
         COMPOSED, never replaced. The criterion the user sanctioned is
@@ -5363,6 +5810,19 @@ class MBHMoveBuilder(SingleSourcePEBuilder):
     """:class:`SingleSourcePEBuilder` for the ``"mbh"`` branch."""
 
     branch_name = "mbh"
+
+
+class MBHBatchedMoveBuilder(MBHMoveBuilder):
+    """:class:`MBHMoveBuilder` constructing :class:`MBHBatchedLikeMove`.
+
+    ``wave_gen`` stays the SLOW exact generator (residual parity with the
+    engine + the fast-vs-slow cross-check); the windowed adapter and its knobs
+    pass through ``move_kwargs`` (``batched_gen=``, ``batch_max_size=``,
+    ``window_*=``). The DCGA branch is skipped: the move raises if handed one.
+    """
+
+    move_class = MBHBatchedLikeMove
+    use_dcga = False
 
 
 class EMRIMoveBuilder(SingleSourcePEBuilder):

@@ -2976,12 +2976,25 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         return [self.temperature_control]
 
     def fanout_payload_extra(self):
-        return {"betas": np.array(self.temperature_control.betas, dtype=float, copy=True)}
+        extra = {"betas": np.array(self.temperature_control.betas, dtype=float, copy=True)}
+        if self._forced_step_deltas is not None:
+            # the galfor ratchet's forced shift: every rank applies the same
+            # vector to its own walker block (host numpy, like the ladder)
+            extra["forced_step_deltas"] = {
+                k: np.asarray(v, dtype=float).copy()
+                for k, v in self._forced_step_deltas.items()}
+        return extra
 
     def fanout_apply_extra(self, extra):
         if "betas" in extra:
             # rebind, never write in place: the control may alias the recipe's betas array
             self.temperature_control.betas = np.asarray(extra["betas"], dtype=float).copy()
+        # ALWAYS assigned: a rank must never carry a forced shift into the
+        # next ordinary propose because the head did not ship a fresh one
+        fd = extra.get("forced_step_deltas")
+        self._forced_step_deltas = (
+            None if fd is None
+            else {str(k): np.asarray(v, dtype=float) for k, v in dict(fd).items()})
 
     @staticmethod
     def _tally_or_empty(arr):
@@ -3031,9 +3044,158 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         Runs on the FULL state single-process and on this rank's walker slice
         under several compute ranks (``WalkerFanoutMixin.propose`` dispatches).
 
+        The begin (working state) and finish (write-back + publish) halves
+        are :meth:`_begin_propose` / :meth:`_finish_propose`, shared with
+        :meth:`forced_noise_step` so a forced step publishes through exactly
+        this path.
+
         Returns:
             Tuple ``(new_state, accepted)``.
         """
+        deltas = self._forced_step_deltas
+        ctx = self._begin_propose(model, state, resolve_inner=deltas is None)
+        tmp_state, tmp_model, _tm = ctx.tmp_state, ctx.tmp_model, ctx.tm
+
+        if deltas is not None:
+            # THE FORCED STEP (galfor ratchet). No Metropolis loop: shift the
+            # working coordinates on every rung and walker of THIS body's
+            # slice, recompute prior and likelihood, accept unconditionally.
+            # Runs wherever an ordinary body runs -- on the head for a
+            # single-process / flat layout, on each compute rank for the
+            # block layout (the deltas travel in the propose payload's
+            # ``extra``) -- so the scoring seams and the publish below see
+            # exactly the width they always see.
+            with _tspan(_tm, "sample"):
+                tmp_state, accepted = self._apply_forced_step(
+                    state, ctx, tmp_state, deltas)
+            return self._finish_propose(state, ctx, tmp_state, accepted)
+
+        with _tspan(_tm, "sample"):
+            if self.max_logl_mode:
+                tmp_state, accepted = self.run_move_max_likelihood(tmp_model, tmp_state)
+
+            elif self._ensemble_search_active():
+                # Tiled per-walker ensemble, SEARCH stages only. One block
+                # per propose: the enclosing MaxLogLCombineMove plateau is
+                # what "run until the maximum likelihood converges" means
+                # here, so this stays chunked exactly like run_move_for_loop
+                # rather than owning a second convergence loop.
+                tmp_state, accepted = self.run_move_ensemble_search(tmp_model, tmp_state)
+
+            else:
+                tmp_state, accepted = self.run_move_for_loop(tmp_model, tmp_state, self.num_repeats)
+
+        return self._finish_propose(state, ctx, tmp_state, accepted)
+
+    # ---- the forced noise step (galfor ratchet) -----------------------------
+    #: Pending forced shift ``{branch: (ndim,) array}`` in the sampled basis,
+    #: or None. Set by :meth:`forced_noise_step` for the duration of ONE
+    #: propose; shipped to the compute ranks in the propose payload's
+    #: ``extra`` (:meth:`fanout_payload_extra` / :meth:`fanout_apply_extra`).
+    _forced_step_deltas = None
+
+    def forced_noise_step(self, model, state, deltas):
+        """Shift sampled noise coordinates by a fixed vector and PUBLISH.
+
+        The galfor ratchet's "forced lowering" (user design 2026-09-30):
+        ``deltas`` maps a branch this move samples to a shift in the SAMPLED
+        basis (the run's ``log10`` galfor basis: ``[amp, fk, alpha, f_1,
+        f_2]``), applied to EVERY rung and walker. No Metropolis step: the
+        new coordinates are accepted unconditionally, their log-prior and
+        log-likelihood recomputed, and the result written back and published
+        to every walker's container through the same finish half an ordinary
+        accepted proposal uses -- so the residual, the sensitivity matrices,
+        the replicas and the stored cold row all agree.
+
+        ⚠ ROUTED THROUGH :meth:`propose`, never straight into the body: under
+        the block layout each compute rank's ACA holds only its own walkers,
+        and the mixin's ``propose`` is what slices the ensemble per rank and
+        merges the replies (6mo job 671 died on a 4-walker state against a
+        1-walker ACA when this was called directly). The shift itself rides
+        in the payload ``extra``, so every rank applies the same vector.
+
+        Refuses (``ValueError``, ``state`` untouched, nothing shipped) a
+        branch this move does not sample, a malformed shift, or a shift that
+        leaves the prior box on any row: a silently clipped or half-applied
+        nudge would be a worse outcome than no nudge.
+
+        Returns:
+            Tuple ``(new_state, accepted)`` with ``accepted`` all True at the
+            engine ladder shape.
+        """
+        noise_branches = self._resolve_sampled(state)
+        deltas = {str(k): np.asarray(v, dtype=float) for k, v in dict(deltas).items()}
+        for key, d in deltas.items():
+            if key not in noise_branches:
+                raise ValueError(
+                    f"forced_noise_step: {key!r} is not sampled by this move "
+                    f"(sampled: {noise_branches}).")
+            ndim = int(np.shape(state.branches_coords[key])[-1])
+            if d.shape != (ndim,):
+                raise ValueError(
+                    f"forced_noise_step: shift for {key!r} has shape {d.shape}; "
+                    f"expected ({ndim},).")
+        # prior check on the FULL ensemble before anything is shipped: the
+        # prior needs no ACA, and a refusal must leave every rank untouched
+        shifted = {
+            key: np.asarray(self._work_branch(state, key).coords) + deltas.get(key, 0.0)
+            for key in noise_branches
+        }
+        logp = np.asarray(self.compute_log_prior(shifted))
+        if np.any(np.isinf(logp)):
+            raise ValueError(
+                "forced_noise_step: the shifted coordinates leave the prior on "
+                f"{int(np.sum(np.isinf(logp)))} of {logp.size} rows -- the nudge "
+                f"{ {k: v.tolist() for k, v in deltas.items()} } is too large "
+                "for the sampled box; nothing was changed.")
+        logger.info(
+            "[GALFOR_RATCHET %s] forced noise step: %s on every rung and walker; "
+            "cold lnL before (walker mean) %.1f",
+            getattr(self, "name", "psd"),
+            ", ".join(f"{k} += {v.tolist()}" for k, v in deltas.items()),
+            float(np.mean(state.log_like[0])))
+        self._forced_step_deltas = deltas
+        try:
+            new_state, accepted = self.propose(model, state)
+        finally:
+            self._forced_step_deltas = None
+        logger.info(
+            "[GALFOR_RATCHET %s] forced noise step published; cold lnL after "
+            "(walker mean) %.1f", getattr(self, "name", "psd"),
+            float(np.mean(new_state.log_like[0])))
+        return new_state, accepted
+
+    def _apply_forced_step(self, state, ctx, tmp_state, deltas):
+        """Body half of the forced step on THIS body's working state."""
+        for key, d in deltas.items():
+            if key not in tmp_state.branches:
+                continue
+            tmp_state.branches[key].coords[:] = tmp_state.branches[key].coords + np.asarray(d)
+        coords = tmp_state.branches_coords
+        logp = np.asarray(self.compute_log_prior(coords))
+        if np.any(np.isinf(logp)):
+            # the head checked the full ensemble already; a rank can only get
+            # here if the two disagree, which is a bug worth a loud stop
+            raise ValueError(
+                "forced_noise_step: the shifted coordinates leave the prior on "
+                f"{int(np.sum(np.isinf(logp)))} of {logp.size} rows of this body.")
+        logl = ctx.init_like_fn(coords, logp=logp, supps=tmp_state.supplemental)[0]
+        tmp_state.log_prior = logp
+        tmp_state.log_like = np.asarray(logl)
+        return tmp_state, np.ones((ctx.nt_mod, ctx.nwalkers_mod), dtype=bool)
+
+    def _begin_propose(self, model, state, resolve_inner: bool = True):
+        """The begin half of :meth:`propose_local`: freeze the fixed noise
+        branches, replay the begin prep, build the working (module-ladder)
+        state and model. ``resolve_inner=False`` skips the inner-proposal
+        resolution (eigen tables etc.) for a caller that runs no inner loop.
+
+        Returns a namespace with ``tmp_state``, ``tmp_model``, ``tm``,
+        ``noise_branches``, ``engine_ntemps``, ``nt_mod``, ``nwalkers_mod``,
+        ``init_like_fn``, ``before_vals``, ``t0``.
+        """
+        from types import SimpleNamespace
+
         _t_prop0 = time.perf_counter()
         # GB_PROP_TIMING_SYNC=1 attributes device time to the span that
         # launched it rather than the one that forces the sync (same
@@ -3104,7 +3266,9 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
             if getattr(self, "fanout", None) is not None
             else nwalkers_mod
         )
-        if self._ensemble_search_active():
+        if not resolve_inner:
+            pass  # a forced step runs no inner loop: no kind, no tables
+        elif self._ensemble_search_active():
             # The tiled ensemble supplies its own complement, so neither the
             # block-width resolution nor the information matrix applies:
             # _resolve_inner_kind would either pick `eigen` (and pay for the
@@ -3177,20 +3341,23 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
             model.random,
         )
 
-        with _tspan(_tm, "sample"):
-            if self.max_logl_mode:
-                tmp_state, accepted = self.run_move_max_likelihood(tmp_model, tmp_state)
+        return SimpleNamespace(
+            t0=_t_prop0, tm=_tm, noise_branches=noise_branches,
+            engine_ntemps=engine_ntemps, nt_mod=nt_mod, nwalkers_mod=nwalkers_mod,
+            tmp_state=tmp_state, tmp_model=tmp_model, init_like_fn=_init_like_fn,
+            before_vals=before_vals,
+        )
 
-            elif self._ensemble_search_active():
-                # Tiled per-walker ensemble, SEARCH stages only. One block
-                # per propose: the enclosing MaxLogLCombineMove plateau is
-                # what "run until the maximum likelihood converges" means
-                # here, so this stays chunked exactly like run_move_for_loop
-                # rather than owning a second convergence loop.
-                tmp_state, accepted = self.run_move_ensemble_search(tmp_model, tmp_state)
-
-            else:
-                tmp_state, accepted = self.run_move_for_loop(tmp_model, tmp_state, self.num_repeats)
+    def _finish_propose(self, state, ctx, tmp_state, accepted):
+        """The finish half of :meth:`propose_local`: write the working state's
+        sampled branches back into a copy of ``state`` (full ladder into the
+        sub-states, cold row into the engine state), publish each walker's
+        accepted noise model onto its container (replicas included), and
+        return ``(new_state, accepted)`` at the engine ladder shape."""
+        _tm = ctx.tm
+        noise_branches = ctx.noise_branches
+        engine_ntemps = ctx.engine_ntemps
+        _t_prop0 = ctx.t0
 
         # CHECK THIS STATE SETUP
         new_state = GFState(state, copy=True)

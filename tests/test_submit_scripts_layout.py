@@ -499,6 +499,20 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         self.assertGreaterEqual(
             int(self.v9["MIDIT_CHECKPOINT_MIN_INTERVAL"]), 0)
 
+    def test_mid_iteration_checkpoints_can_be_switched_off_from_the_command_line(self):
+        """User ruling 2026-10-01: "MIDIT_CHECKPOINT=0 in the launch command
+        is good" (a legged search lands a row after every leg, and the
+        checkpoint's adoption rule cannot tell a startup copy from a
+        half-nudged state -- jobs 673/674/675). The export was a hard
+        ``=1`` until then, so the command-line knob reached NOTHING; pin the
+        ``${K:-1}`` form in both launchers, default still 1."""
+        for path in (SIX_MO_V9, THREE_MO_V9):
+            src = open(path).read()
+            self.assertRegex(
+                src, r"(?m)^export MIDIT_CHECKPOINT=\$\{MIDIT_CHECKPOINT:-1\}$",
+                f"{path}: MIDIT_CHECKPOINT must be exported as "
+                f"${{MIDIT_CHECKPOINT:-1}} so the launch command can turn it off")
+
     def test_the_galfor_start_is_the_offline_3mo_estimate(self):
         """User ruling 2026-09-24, chosen explicitly over the 6mo
         alternative. PHYSICAL/LINEAR, amp MODULATION-CORRECTED (the 90 d
@@ -594,6 +608,16 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             "MIDIT_CHECKPOINT", "MIDIT_CHECKPOINT_MIN_INTERVAL",
             # the offline 3mo galfor start point
             "GALFOR_START_PARAMS",
+            # the galfor RATCHET (2026-09-30): one gated noise proposal at
+            # the head of gb_search_3 -- nudge / hold / release -- v9 only,
+            # default OFF. See lisatools.globalfit.noise_ratchet.
+            "GALFOR_RATCHET", "GALFOR_RATCHET_HOLD", "GALFOR_RATCHET_RELEASE",
+            "GALFOR_RATCHET_CYCLES", "GALFOR_RATCHET_DLOG10_AMP",
+            "GALFOR_RATCHET_DLOG10_FK", "GALFOR_RATCHET_DLOG10_F2",
+            # match-criterion panels back on for the v9 pages (2026-09-30)
+            "GF_MONITOR_MATCH_STATS",
+            # search legs: one row per in-model leg (2026-09-30)
+            "GB_SEARCH_LEGS",
             # f0-adaptive stage-B sky grid (the F-stat fix, 2026-09-24)
             "FSTAT_STAGEB_SKY_ADAPT", "FSTAT_STAGEB_NSKY_MIN",
             "FSTAT_STAGEB_NSKY_MAX", "FSTAT_STAGEB_GROUP_MAX_GB",

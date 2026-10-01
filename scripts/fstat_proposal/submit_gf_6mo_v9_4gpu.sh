@@ -663,6 +663,14 @@ export MOJITO_INFO_PATH=/shared/data/mojito_cache
 # coalesces to the newest payload when its queue backs up -- it prints a
 # banner and stays off for the rest of the run. The run is never affected.
 # If that fires, raise GF_MONITOR_ITER or set GF_MONITOR_SNAPSHOT=0.
+# MATCH PANELS ON (user request 2026-09-30: "get back to including the phase
+# maximized computations of match"). Restores the nine match-criterion panels
+# and the Parameter Recovery section. Of those, the F4 three-way split and the
+# zoomable-plot marker classes use the REAL phase-maximised, noise-weighted
+# overlap (GF_MONITOR_MATCH_MM, default 0.8); the per-iteration
+# completeness / purity curves still key off the 2-df-bin f0 proxy so they can
+# run on every stored row. Overridable; =0 restores the 2026-08-19 default.
+export GF_MONITOR_MATCH_STATS=${GF_MONITOR_MATCH_STATS:-1}
 export GF_MONITOR_AFTER_SAVE=1
 # EVERY THIRD save (1 -> 3, 2026-09-28). ⚠ The old comment's premise
 # -- "~2 h/iteration against a page build of order minutes" -- stopped
@@ -1500,7 +1508,13 @@ export GB_INMODEL_GROUP=1
 # >>> three quarters of it cannot retire a single band. Dropping to 2
 # >>> removes one full warm-up pass (~3.3M rep*src, ~24% of the move) and
 # >>> lets bands shut at pass 3 instead of pass 4.
-export GB_INMODEL_GROUP_ITERS=2
+# >>> 2 -> 3 (user ruling 2026-10-01, "for now", for the ratcheted
+# >>> gb_search_3 relaunch): the noise is MOVING in that stage (nudge /
+# >>> release), so a sub-band's per-pass gain is judged against a
+# >>> residual that just changed under it; one more pass of history
+# >>> before a sub-band can retire. The per-repeat bar goes back to
+# >>> 4.0/(3*25) = 0.0533 lnL/repeat (see the CONSEQUENCE note below).
+export GB_INMODEL_GROUP_ITERS=3
 # D/2 again, and FLAT per sub-band (user ruling): "When a source is birthed,
 # it is per-source. During the special in-model only proposals it is
 # per-sub-band. I want flat D/2. This will focus more resources on the
@@ -3379,6 +3393,44 @@ export GB_TEMPER_ON_REMOVAL=1      # band swaps run inside rj_prior_removal
 # for it.
 export GB_SEARCH_PRIOR_REMOVAL_ONLY=${GB_SEARCH_PRIOR_REMOVAL_ONLY:-1}
 echo "[GB-PRIOR-REMOVAL] GB_SEARCH_PRIOR_REMOVAL_ONLY=${GB_SEARCH_PRIOR_REMOVAL_ONLY} (1 = deaths only; 0 = prior births AND deaths, ALL search stages)"
+# ---- the galfor RATCHET (user design 2026-09-30) ----------------------------
+# GALFOR_RATCHET=1 on the launch line: gb_search_3 carries ONE gated noise
+# proposal at the head of the iteration instead of the rider plus the four
+# interleaved slots. Stage-local schedule: iteration 0 of a cycle FORCES the
+# galfor coordinates down (DLOG10_* in the sampled log10 basis, every rung and
+# walker, published through the noise move's own accept path, hard F-stat
+# refit armed, then one GB in-model pass), the next HOLD-1 iterations hold the
+# noise fixed, then RELEASE iterations run the ordinary joint noise search
+# (each followed by the same in-model pass). CYCLES nudges, then permanent
+# release. The release is the measurement: a region of the curve that comes
+# back was honest, one that stays down had been absorbing resolvable sources.
+# STEP SIZE: one nudge takes the 3-5 mHz total noise from 2-5x the add-back
+# estimate to ~0.75-1.5x, where the F-stat peak floor (SNR 6.25) admits true
+# SNR-8 sources across the band (lisatools.globalfit.noise_ratchet docstring).
+# CYCLES=2 (user ruling 2026-09-30, "do at least 2 cycles for now"). ⚠ The
+# second nudge applies the same delta to whatever the first release left: on
+# a fit that stayed down it lands at 0.2-0.6x the estimate below 4.5 mHz, so
+# read its release with the junk indicators (birth truth-partner fraction,
+# power share per band) before going further.
+# Overridable here, default OFF = today's composition byte-identical.
+export GALFOR_RATCHET=${GALFOR_RATCHET:-0}
+export GALFOR_RATCHET_HOLD=${GALFOR_RATCHET_HOLD:-3}
+export GALFOR_RATCHET_RELEASE=${GALFOR_RATCHET_RELEASE:-2}
+export GALFOR_RATCHET_CYCLES=${GALFOR_RATCHET_CYCLES:-2}
+export GALFOR_RATCHET_DLOG10_AMP=${GALFOR_RATCHET_DLOG10_AMP:--0.05}
+export GALFOR_RATCHET_DLOG10_FK=${GALFOR_RATCHET_DLOG10_FK:--0.10}
+export GALFOR_RATCHET_DLOG10_F2=${GALFOR_RATCHET_DLOG10_F2:--0.15}
+# ---- search LEGS (user design 2026-09-30) ----------------------------------
+# GB_SEARCH_LEGS=1: the numbered search stages store one row per LEG of the
+# cycle -- after in_model, after in_model_fstat, after in_model_removal --
+# instead of one per full cycle. The resume position is the NAME of the
+# in-model move the last row was saved after (stored per row), so a gated
+# move that skipped a cycle cannot mis-align a relaunch; cadences
+# (GB_SEARCH_3_WARM_EVERY) and the galfor ratchet then count CYCLES. With a
+# row per leg the mid-iteration checkpoint only guards part of one leg;
+# MIDIT_CHECKPOINT=0 is reasonable for a legged search. Off = today.
+export GB_SEARCH_LEGS=${GB_SEARCH_LEGS:-0}
+echo "[GALFOR-RATCHET] GALFOR_RATCHET=${GALFOR_RATCHET} hold=${GALFOR_RATCHET_HOLD} release=${GALFOR_RATCHET_RELEASE} cycles=${GALFOR_RATCHET_CYCLES} dlog10 amp/fk/f2=${GALFOR_RATCHET_DLOG10_AMP}/${GALFOR_RATCHET_DLOG10_FK}/${GALFOR_RATCHET_DLOG10_F2} (0 = off: rider + 4 interleaved noise slots as before)"
 # High-f barren-band birth shutoff (search scope): bands above FMIN with
 # AFTER consecutive zero-birth-accept proposes stop proposing births
 # (deaths + in-model continue; [GB_BAND_SHUTOFF] log line per band).
@@ -4283,10 +4335,26 @@ export GB_SEARCH_3_WARM_EVERY=5
 # 0 writes at every boundary. Both pinned explicitly here rather than left
 # to the code defaults, because on a SPOT partition this is the knob that
 # decides how much a preemption costs.
-export MIDIT_CHECKPOINT=1
+# OVERRIDABLE from the command line since 2026-10-01 (it was a hard
+# `export MIDIT_CHECKPOINT=1`, so `MIDIT_CHECKPOINT=0 ./submit...` reached
+# nothing -- the documented knob-reaches-nothing failure). Mike's ruling for
+# the legged + ratcheted search: "MIDIT_CHECKPOINT=0 in the launch command
+# is good". Under GB_SEARCH_LEGS=1 a row lands after every leg, so the
+# checkpoint protects at most one leg of work, while its adoption rule
+# (checkpoint stored_iteration >= store iteration) cannot tell a harmless
+# startup copy from a half-nudged state: jobs 673/674 each ran the galfor
+# NUDGE and were stopped; ten more minutes and either would have written a
+# post-nudge checkpoint at stored iteration 47 that job 675 would have
+# adopted and nudged AGAIN (the job-672 double nudge by another door). The
+# default stays 1 for the unlegged runs.
+export MIDIT_CHECKPOINT=${MIDIT_CHECKPOINT:-1}
 export MIDIT_CHECKPOINT_MIN_INTERVAL=${MIDIT_CHECKPOINT_MIN_INTERVAL:-600}
-echo "[V9-CKPT] mid-iteration checkpoints ON, min interval ${MIDIT_CHECKPOINT_MIN_INTERVAL}s"
-echo "[V9-CKPT] watch: [MIDIT_CKPT] wrote ... at stored iteration N (boundary '...')"
+if [ "${MIDIT_CHECKPOINT}" = "1" ]; then
+  echo "[V9-CKPT] mid-iteration checkpoints ON, min interval ${MIDIT_CHECKPOINT_MIN_INTERVAL}s"
+  echo "[V9-CKPT] watch: [MIDIT_CKPT] wrote ... at stored iteration N (boundary '...')"
+else
+  echo "[V9-CKPT] mid-iteration checkpoints OFF (MIDIT_CHECKPOINT=${MIDIT_CHECKPOINT}); under GB_SEARCH_LEGS a row lands after every leg instead"
+fi
 
 # ============================================================================
 # CHANGE 3 OF 3 vs 3mo_v8 -- MBHB + EMRI + SOBHB (campaign S6). Non-empty

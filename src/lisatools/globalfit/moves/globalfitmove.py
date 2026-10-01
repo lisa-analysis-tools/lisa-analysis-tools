@@ -514,12 +514,29 @@ class GFCombineMove(CombineMove, GlobalFitMove):
         weighted_cycle: bool = False,
         move_weights=None,
         move_every=None,
+        leg_ends=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.random_choice = bool(random_choice)
         self.weighted_cycle = bool(weighted_cycle)
         self.move_weights = self._validate_move_weights(move_weights)
+        # ---- search LEGS (user design 2026-09-30) ------------------------
+        # ``leg_ends`` = "auto" (every in_model* move) or an explicit list of
+        # move names; None = the historical one-propose-runs-all cycle. With
+        # legs, ONE propose runs from the cursor through the next leg-ender
+        # and the state comes back tagged with that name, so eryn's save
+        # after it is a row per leg. See lisatools.globalfit.legs.
+        self.gf_legs = None
+        if leg_ends is not None:
+            if self.random_choice or self.weighted_cycle:
+                raise ValueError(
+                    "leg_ends needs the fixed sequential path (random_choice / "
+                    "weighted_cycle draw their own cycle).")
+            from ..legs import LegCursor, leg_ends_from_names
+
+            names = self.gf_move_names()
+            self.gf_legs = LegCursor(names, leg_ends_from_names(names, leg_ends))
         # Per-sub-move iteration cadence (aligned with ``moves``): sub-move
         # i runs only when (stage propose count) % move_every[i] == 0. The
         # counter is THIS combine's, i.e. stage-local — the same shared
@@ -789,6 +806,11 @@ class GFCombineMove(CombineMove, GlobalFitMove):
         return plan
 
     def _propose_moves(self, model, state):
+        # search LEGS first: the cursor owns the plan AND the cadence (in
+        # cycle units), so neither the PE draw-one plan nor the per-propose
+        # cadence plan below may run ahead of it
+        if getattr(self, "gf_legs", None) is not None:
+            return self._propose_leg(model, state)
         plan = self._pe_rj_draw_one_plan(model)
         if plan is not None:
             plan, _skipped = self._gf_cadence_plan(plan)
@@ -876,6 +898,74 @@ class GFCombineMove(CombineMove, GlobalFitMove):
         ):
             return super().propose(model, state)
         return self._run_sequence(model, state, self.moves)
+
+    # ---- search legs --------------------------------------------------------
+    def gf_move_names(self):
+        """The wrapped moves' declarative names, in order."""
+        out = []
+        for m in self.moves:
+            mm = m[0] if isinstance(m, tuple) else m
+            out.append(str(getattr(mm, "gf_move_name", type(mm).__name__)))
+        return out
+
+    def _propose_leg(self, model, state):
+        """Run ONE leg: cursor -> next leg-ender, cadence gates in CYCLE units.
+
+        The leg-ender itself is never gated: it is what the row is saved
+        after, and a leg with no row would break the resume-by-name contract.
+        """
+        cur = self.gf_legs
+        idx, end_name, _last = cur.plan()
+        every = self.gf_move_every
+        due, skipped = [], []
+        for i in idx:
+            m = self.moves[i]
+            mm = m[0] if isinstance(m, tuple) else m
+            e = 1 if every is None else int(every[i])
+            name = cur.order[i]
+            if name == end_name or cur.cycles % e == 0:
+                due.append(mm)
+            else:
+                skipped.append(name)
+        stage = getattr(self, "gf_stage_name", "?")
+        leg_i = cur.leg_index
+        cycles0 = cur.cycles
+        # One move at a time, so a CONDITIONAL leg-ender can stop the leg:
+        # a move that sets ``gf_leg_end_now`` on itself (the gated noise
+        # head after it CHANGED the noise and ran its in-model pass -- user
+        # ruling 2026-09-30, "a save after the in-model noise step whenever
+        # it runs") ends the leg right there; the row is saved after ITS
+        # name and the rest of the leg runs in the next propose. On a hold
+        # the flag stays False and the leg runs on to its static ender.
+        accepted = None
+        ran = []
+        ended_early = False
+        for k_due, mm in enumerate(due):
+            state, acc = self._run_sequence(model, state, [mm])
+            accepted = acc.copy() if accepted is None else accepted + acc
+            name = getattr(mm, "gf_move_name", type(mm).__name__)
+            ran.append(name)
+            flag = bool(getattr(mm, "gf_leg_end_now", False))
+            if flag:
+                mm.gf_leg_end_now = False        # consumed: never ends a later leg
+            if flag and name != end_name:
+                end_name = name
+                cur.end_early_at(cur.order.index(name))
+                ended_early = True
+                break
+        if not ended_early:
+            cur.advance()
+        # tag the state eryn is about to save: the row's saved-after NAME
+        # (the resume position) plus the ordered list the saver stamps once
+        state.gf_saved_after = end_name
+        state.gf_move_order = list(cur.order)
+        state.gf_stage_name = stage
+        logger.info(
+            "[LEG %s] cycle %d leg %d/%d: ran %s -> row saved after %r%s%s",
+            stage, cycles0, leg_i + 1, cur.nlegs, ran, end_name,
+            " (the noise changed: leg ended early)" if ended_early else "",
+            f" (cadence skipped {skipped})" if skipped else "")
+        return state, accepted
 
     def _run_sequence(self, model, state, moves):
         """Run ``moves`` in order -- eryn CombineMove.propose semantics plus

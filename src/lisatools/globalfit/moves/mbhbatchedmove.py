@@ -1,0 +1,663 @@
+"""MBH add/remove move scored by the batched, windowed grid-aligned likelihood.
+
+:class:`MBHBatchedLikeMove` keeps ALL of :class:`ResidualAddOneRemoveOneMove`'s
+choreography (per-leaf expose/fold, in-model repeats, per-leaf tempering,
+cold-chain bookkeeping) and swaps the scoring and fill paths, exactly as
+:class:`SOBBHChunkedLikeMove` does for SOBBH:
+
+* every chunk of ``batch_max_size`` rows is ONE batched ``compute_tdi_channels``
+  launch on the leaf's shared lattice (the ``WindowedGridAlignedMBHWaveform``
+  behind a ``MBHWindowedWDMSignalGen``), then a per-row segment WDM transform;
+* every row is scored against ITS OWN container: the residual and the PSD are
+  sliced to the template's box (``AnalysisContainer._slice_to_template``), so
+  per-walker PSD samples are honoured;
+* the convention bridge is the SOBBH one: ``compute_like`` returns
+  ``offset[walker] + <r|h> - 1/2 <h|h>`` with ``offset = acs.likelihood()`` on
+  the freshly exposed residual, which reproduces the container path's
+  ``-1/2 <r-h|r-h>`` + noise term on every scoring site;
+* the leaf window (kept WDM layers around the leaf's median cold-chain merger
+  time) is fixed on expose/setup and locked for the visit; it is rebuilt only
+  when the median leaves the margin band, and never on fold-back.
+* times: the window is placed with the adapter's ``t0_abs`` (the ABSOLUTE
+  time of WDM layer 0, ``general_info.data_t0``), never with a settings
+  ``t0``; and every generated template is re-labelled onto a box cut from the
+  CONTAINERS' own data settings before scoring and fill. A stock erebor build
+  gives the containers ``t0 = 0`` (the WDM factory ignores ``times[0]``) and
+  mutates ``general_info.domain_settings.t0`` to the data start when a GB
+  comp is built, so neither settings ``t0`` is the data start in general.
+
+A batch the response refuses (``BatchNotLaunchable``) or a domain error in the
+chunk falls back to the per-row container path for that chunk, LOUDLY, and is
+counted in ``n_batch_fallbacks``. ``MBH_BATCHED_FILL=0`` restores the dense
+per-row expose/fold. The built-in fast-vs-slow check (``_verify_prev_logl``)
+recomputes through the stock generator at matching convention with
+``MBH_CHECK_LL_TOL`` (default 0.5 nats), gating on the COLD rung only (hot
+rungs reported), every 10th visit unless ``MBH_CHECK_LL_EVERY`` is set.
+Generation runs under both the cupy and the JAX device context of the
+owning shard (phentax is JAX).
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from contextlib import contextmanager
+
+import numpy as np
+
+from ...analysiscontainer import shard_lookup_maps
+from ...diagnostic import inner_product
+from ...domains import WDMSettings, WDMSignal
+from ...utils.device import device_context, jax_device_context
+from ...utils.exceptions import BatchNotLaunchable, WaveformDomainError
+from ...utils.utility import asnumpy, get_array_module
+from .addremovemove import ResidualAddOneRemoveOneMove
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["MBHBatchedLikeMove", "mbh_window_layers"]
+
+#: waveform-basis column of the merger time (seconds relative to waveform_t0)
+_T_PLUNGE_COL = 10
+#: the only generator kwargs the grid-aligned generator accepts
+_ACCEPTED_GEN_KWARGS = ("start_freq", "ref_freq", "T")
+
+
+def mbh_window_layers(
+    wdm, t_merge_abs, window_before, window_after, window_pad, window_margin, t0_abs=None,
+):
+    """Kept-box and pad geometry, in WDM layers of ``wdm``, for a merger at ``t_merge_abs``.
+
+    ``t0_abs`` is the ABSOLUTE time of layer 0 of ``wdm``'s grid (the data
+    start, ``general_info.data_t0``); it defaults to ``wdm.t0`` for callers
+    whose settings carry it. A stock erebor build's settings do NOT: the WDM
+    factory builds ``t0 = 0`` and a GB comp build later sets it to the data
+    start in place, so ``wdm.t0`` is 0 or ``data_t0`` depending on build
+    order -- the batched move always passes ``t0_abs`` explicitly.
+
+    Returns ``dict(n_start, Nt_keep, n_pad, n_pad_lo, n_pad_hi)``: kept layers
+    ``[n_start, n_start + Nt_keep)`` cover ``[t - before - margin, t + after +
+    margin]`` snapped OUTWARD to layer boundaries, clamped to the data's
+    ACTIVE time box ``[ind_min_t, ind_max_t]``. The transform segment is
+    ``[n_start - n_pad_lo, n_start + Nt_keep + n_pad_hi)``, always
+    ``Nt_keep + 2 n_pad`` layers long, clamped to the grid ``[0, Nt)``:
+
+    * interior: ``n_pad_lo = n_pad_hi = n_pad``;
+    * near a grid edge the segment stops AT the edge, so that side's pad
+      shrinks (to 0 when the box touches the edge) and the other side's pad
+      grows by the same amount. The kept box still reaches the edge, so a
+      merger in the first/last days of the data is covered. The segment
+      transform's periodic wrap then touches the far end of the segment --
+      pad, where the template is zero (onset inside the box) -- and the edge
+      itself is tapered by the data window.
+
+    ``Nt_keep`` and the segment length depend on the durations only (never on
+    ``t_merge_abs``), so the shared lattice length -- and phentax's jit cache
+    -- is constant across leaves, edges included. ``Nt_keep + 2 n_pad`` is
+    made even (``WDMSettings`` needs an even layer count). The adapter's
+    even-start parity rule then grows the low pad by one only for an odd
+    interior start; a start clamped to layer 0 or to ``Nt - Nt_seg`` is
+    already even.
+    """
+    layer_dt = float(wdm.layer_dt)
+    t0 = float(wdm.t0) if t0_abs is None else float(t0_abs)
+    Nt = int(wdm.Nt)
+    act_lo = int(wdm.ind_min_t)
+    act_hi = int(wdm.ind_max_t) + 1
+    n_pad = int(np.ceil(float(window_pad) / layer_dt))
+    span = float(window_before) + float(window_after) + 2.0 * float(window_margin)
+    Nt_keep = int(np.ceil(span / layer_dt)) + 1
+    if (Nt_keep + 2 * n_pad) % 2:
+        Nt_keep += 1
+    Nt_seg = Nt_keep + 2 * n_pad
+    if Nt_seg > Nt or Nt_keep > act_hi - act_lo:
+        raise ValueError(
+            f"MBH window ({span / 86400:.1f} d = {Nt_keep} kept layers + 2 x {n_pad} "
+            f"pad layers = {Nt_seg} layers) does not fit the WDM grid of {Nt} layers "
+            f"(active time layers [{act_lo}, {act_hi})) x {layer_dt:.0f} s; shorten "
+            "MBH_WINDOW_BEFORE_DAYS / MBH_WINDOW_PAD_DAYS for this data span."
+        )
+    lo_abs = float(t_merge_abs) - float(window_before) - float(window_margin)
+    n_start = int(np.floor((lo_abs - t0) / layer_dt))
+    n_start = min(max(n_start, act_lo), act_hi - Nt_keep)
+    s0 = min(max(n_start - n_pad, 0), Nt - Nt_seg)
+    n_pad_lo = n_start - s0
+    n_pad_hi = s0 + Nt_seg - (n_start + Nt_keep)
+    return dict(
+        n_start=int(n_start), Nt_keep=int(Nt_keep), n_pad=int(n_pad),
+        n_pad_lo=int(n_pad_lo), n_pad_hi=int(n_pad_hi),
+    )
+
+
+class MBHBatchedLikeMove(ResidualAddOneRemoveOneMove):
+    """Add/remove move for the MBH branch scored through the batched windowed path.
+
+    Args:
+        *args: Positional arguments of :class:`ResidualAddOneRemoveOneMove`.
+            ``waveform_gen`` stays the SLOW exact generator (or ``None`` to use
+            the containers' installed one): it still owns the cross-check.
+        batched_gen: the windowed sub-transform adapter
+            (:class:`~lisatools.sources.batching.MBHWindowedWDMSignalGen`), or a
+            ``DeviceLocalWaveGen`` resolving to one per device. Must expose
+            ``set_window``, ``window_key``, ``waveform_t0``, ``t_plunge_snap``
+            and ``t0_abs`` (the absolute time of WDM layer 0).
+        batch_max_size: rows per generator launch (``MBH_BATCH_MAX_SIZE``).
+        window_before, window_after, window_pad, window_margin: seconds.
+        **kwargs: Keyword arguments of the base. ``dcga`` must be ``None``.
+
+    Window hysteresis relies on the walkers' spread in merger time (the
+    posterior width, plus hot-rung excursions) staying inside
+    ``window_margin`` of the locked window's reference time; a much wider
+    spread needs ``MBH_WINDOW_MARGIN_DAYS`` resized to match, or rows land
+    outside the locked kept box (counted as ``outside_box`` in the
+    ``[MBH_BATCH]`` telemetry).
+    """
+
+    _record_dh_default = "1"
+    #: The cross-check rebuilds every row through the STOCK generator (a
+    #: 90-day waveform per row), so it runs every 10th visit unless
+    #: ``MBH_CHECK_LL_EVERY`` is set explicitly.
+    _check_ll_every_default = "10"
+
+    def __init__(
+        self, *args, batched_gen=None, batch_max_size=16,
+        window_before=90 * 86400.0, window_after=10 * 86400.0,
+        window_pad=4 * 86400.0, window_margin=86400.0, **kwargs,
+    ):
+        if kwargs.get("dcga") is not None:
+            raise ValueError(
+                "MBHBatchedLikeMove has no DCGA (replica) path: the batched "
+                "generator scores against the ACA containers directly, and "
+                "multi-GPU walker shards are served by per-shard routing inside "
+                "compute_like_local. Build it without dcga= (use_dcga=False)."
+            )
+        if batched_gen is None:
+            raise ValueError("MBHBatchedLikeMove requires batched_gen= (the windowed adapter).")
+        super().__init__(*args, **kwargs)
+        self.batched_gen = batched_gen
+        self.batch_max_size = max(1, int(batch_max_size))
+        self.window_before = float(window_before)
+        self.window_after = float(window_after)
+        self.window_pad = float(window_pad)
+        self.window_margin = float(window_margin)
+        self._wdm = self.acs.acs.flatten()[0].data.settings
+        if not isinstance(self._wdm, WDMSettings):
+            raise ValueError(
+                "MBH_LIKELIHOOD=batched needs a WDM run domain; the containers "
+                f"carry {type(self._wdm).__name__}."
+            )
+        # Fail at BUILD, not at the first leaf, when the window cannot fit the
+        # grid (the geometry's size is independent of the merger time and of
+        # the layer-0 time, so the settings' own t0 serves for both here).
+        mbh_window_layers(
+            self._wdm, float(self._wdm.t0), self.window_before, self.window_after,
+            self.window_pad, self.window_margin,
+        )
+        self._exposed_offset = None
+        self._leaf_windows = {}
+        self.n_batch_fallbacks = 0
+        self.last_batch_error = None
+        self._warned_fallback_leaf = None
+        self.check_ll_tol = float(
+            os.environ.get(f"{self._dbg_prefix}_CHECK_LL_TOL", "0.5")
+        )
+        gen_kwargs = dict(self.waveform_gen_kwargs or {})
+        dropped = sorted(set(gen_kwargs) - set(_ACCEPTED_GEN_KWARGS))
+        self._gen_kwargs = {k: v for k, v in gen_kwargs.items() if k in _ACCEPTED_GEN_KWARGS}
+        if dropped:
+            logger.info(
+                "[MBH_BATCH] waveform kwargs not forwarded to the grid-aligned "
+                "generator (it takes only %s): %s", _ACCEPTED_GEN_KWARGS, dropped,
+            )
+        self._stats = self._new_stats()
+
+    @staticmethod
+    def _new_stats():
+        # ``leaf`` is recorded when accumulation STARTS (first scored chunk),
+        # so the flush -- which runs at the NEXT leaf's setup -- labels the
+        # numbers with the leaf they belong to.
+        return dict(
+            leaf=None, rows=0, seconds=0.0, chunks=0, fallbacks=0,
+            gen_s=0.0, score_s=0.0, outside_box=0, outside_data=0,
+        )
+
+    # ------------------------------------------------------------------
+    # window management
+    # ------------------------------------------------------------------
+
+    def _adapter(self):
+        resolve = getattr(self.batched_gen, "_resolve", None)
+        return resolve() if callable(resolve) else self.batched_gen
+
+    @staticmethod
+    def _gen_attr(adapter, name):
+        """REQUIRED ``adapter.name``, else the wrapped ``adapter.wave_gen.name``.
+
+        Used for ``waveform_t0`` (the SNAPPED, on-lattice epoch the batched
+        generator was built with), ``t_plunge_snap`` (snapped minus stock
+        epoch) and ``t0_abs`` (absolute time of WDM layer 0, an adapter
+        property). ``MBHWindowedWDMSignalGen`` does not forward the first two,
+        so the wiring sets them on the adapter (or they live on the wrapped
+        generator). There is deliberately NO default: a missing snap read as
+        0 would shift every template by up to dt/2, and a layer-0 time read
+        off the containers' settings would misplace every window by the data
+        start, with no error anywhere.
+        """
+        if hasattr(adapter, name):
+            return getattr(adapter, name)
+        inner = getattr(adapter, "wave_gen", None)
+        if inner is not None and hasattr(inner, name):
+            return getattr(inner, name)
+        raise AttributeError(
+            f"MBHBatchedLikeMove: batched_gen exposes no {name!r} (neither the "
+            f"adapter nor its wave_gen). Set adapter.{name} when wiring the "
+            "batched MBH likelihood (waveform_t0 = the snapped epoch the "
+            "generator was built with, t_plunge_snap = snapped - stock epoch; "
+            "0.0 only if the stock epoch is already on the data lattice; "
+            "t0_abs = the absolute data start, MBHWindowedWDMSignalGen(t0_abs=))."
+        )
+
+    def _stock_waveform_t0(self):
+        """The UNSNAPPED epoch the rows' ``t_plunge`` is relative to.
+
+        Two run constants: resolved ONCE, under the primary shard's device
+        contexts (resolving a ``DeviceLocalWaveGen`` outside any context would
+        build a generator replica on whatever device happens to be current),
+        and cached on the move."""
+        cached = getattr(self, "_stock_t0_cache", None)
+        if cached is not None:
+            return cached
+        with self._device_contexts(self._primary_device()):
+            adapter = self._adapter()
+            val = float(self._gen_attr(adapter, "waveform_t0")) - float(
+                self._gen_attr(adapter, "t_plunge_snap")
+            )
+        self._stock_t0_cache = val
+        return val
+
+    def _grid_t0_abs(self):
+        """ABSOLUTE time of WDM layer 0: the adapter's REQUIRED ``t0_abs``.
+
+        Never ``self._wdm.t0``: the containers' data settings carry whatever
+        ``t0`` they had when the data were poured -- 0 in a stock erebor build
+        (``WDMSettings.make_factory`` ignores ``times[0]``) -- while merger
+        times are absolute. Like :meth:`_stock_waveform_t0`, a run constant
+        resolved once under the primary shard's device contexts."""
+        cached = getattr(self, "_grid_t0_cache", None)
+        if cached is not None:
+            return cached
+        with self._device_contexts(self._primary_device()):
+            val = float(self._gen_attr(self._adapter(), "t0_abs"))
+        self._grid_t0_cache = val
+        return val
+
+    def _leaf_window(self, leaf, coords_ws, allow_rebuild):
+        t_ref = self._stock_waveform_t0() + float(np.median(coords_ws[:, _T_PLUNGE_COL]))
+        win = self._leaf_windows.get(leaf)
+        if win is not None and (
+            not allow_rebuild or abs(t_ref - win["t_ref"]) <= self.window_margin
+        ):
+            return win
+        if win is None and not allow_rebuild:
+            raise RuntimeError(
+                f"MBHBatchedLikeMove: leaf {leaf} fold-back reached before any "
+                "expose set its window (propose choreography violated)."
+            )
+        geom = mbh_window_layers(
+            self._wdm, t_ref, self.window_before, self.window_after,
+            self.window_pad, self.window_margin, t0_abs=self._grid_t0_abs(),
+        )
+        geom["t_ref"] = t_ref
+        if win is not None:
+            logger.info(
+                "[MBH_BATCH] leaf %d window rebuilt: median merger moved %.2f h "
+                "(layers %d -> %d)", leaf, (t_ref - win["t_ref"]) / 3600.0,
+                win["n_start"], geom["n_start"],
+            )
+        self._leaf_windows[leaf] = geom
+        return geom
+
+    @staticmethod
+    def _apply_window(adapter, geom):
+        key = (geom["n_start"], geom["Nt_keep"], geom["n_pad_lo"], geom["n_pad_hi"])
+        if getattr(adapter, "window_key", None) != key:
+            adapter.set_window(*key)
+
+    @contextmanager
+    def _device_contexts(self, device):
+        """cupy AND JAX placement on ``device`` (phentax runs in JAX).
+
+        cupy's :func:`device_context` does not move JAX: without the JAX
+        twin every shard's phentax generation lands on JAX's default device
+        (gpu0). Same pairing as the stock ``SourceSignalGen``."""
+        xp = getattr(getattr(self, "acs", None), "xp", None)
+        with device_context(xp, device), jax_device_context(device):
+            yield
+
+    def _primary_device(self):
+        gpus = getattr(getattr(self, "acs", None), "gpus", None)
+        return None if gpus is None else int(np.atleast_1d(gpus)[0])
+
+    # ------------------------------------------------------------------
+    # shard routing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _split_rows_static(holder, idx):
+        """``[(device, positions)]`` grouping ``idx`` rows by owning walker shard."""
+        idx = np.asarray(idx, dtype=np.int64).reshape(-1)
+        n_shards = len(holder.linear_data_arr)
+        if holder.gpus is None:
+            return [(None, np.arange(idx.size))]
+        if n_shards == 1:
+            return [(int(holder.gpus[0]), np.arange(idx.size))]
+        split_map, _ = shard_lookup_maps(holder)
+        owner = np.asarray(split_map)[idx]
+        return [
+            (int(holder.gpus[s]), np.where(owner == s)[0])
+            for s in range(n_shards) if np.any(owner == s)
+        ]
+
+    def _split_rows(self, idx):
+        return self._split_rows_static(self.acs, idx)
+
+    # ------------------------------------------------------------------
+    # likelihood
+    # ------------------------------------------------------------------
+
+    def setup_likelihood_here(self, coords):
+        """Arm the per-walker exposed-residual offset and the leaf window."""
+        self._flush_stats()
+        self._exposed_offset = np.asarray(asnumpy(self.acs.likelihood()), dtype=float)
+        coords_np = np.atleast_2d(np.asarray(asnumpy(coords), dtype=np.float64))
+        self._leaf_window(int(self._current_leaf), coords_np, allow_rebuild=True)
+        super().setup_likelihood_here(coords)
+
+    def compute_like_local(self, coords_in, data_index):
+        if self._dcga is not None:  # unreachable (ctor guard); keep loud
+            raise NotImplementedError("MBHBatchedLikeMove has no DCGA path.")
+        if self._exposed_offset is None:
+            raise RuntimeError(
+                "compute_like_local called before setup_likelihood_here armed the "
+                "exposed-residual offset (propose() choreography violated)."
+            )
+        t_start = time.perf_counter()
+        coords = np.atleast_2d(np.asarray(asnumpy(coords_in), dtype=np.float64))
+        idx = np.asarray(asnumpy(data_index)).astype(np.int64).reshape(-1)
+        n = int(coords.shape[0])
+        out = np.full(n, -1e300, dtype=float)
+        d_h = np.full(n, np.nan)
+        h_h = np.full(n, np.nan)
+        self._last_d_h = d_h
+        self._last_h_h = h_h
+        valid = np.all(np.isfinite(coords), axis=1)
+        if not np.any(valid):
+            return out
+        leaf = int(self._current_leaf)
+        geom = self._leaf_windows.get(leaf)
+        if geom is None:
+            raise RuntimeError(f"MBHBatchedLikeMove: leaf {leaf} window not set.")
+        if self._stats["leaf"] is None:
+            self._stats["leaf"] = leaf
+        valid_pos = np.where(valid)[0]
+        # rows whose IN-DATA merger falls outside the locked kept box: their
+        # template is truncated there (the scoring is still a valid windowed
+        # likelihood, but a steady count means the margin/prior sizing is off
+        # -- see the class docstring). A merger outside the data's active
+        # time box is clamped to that box's edge first: the data itself ends
+        # there, so a row merging after the data end is truncated by the box
+        # only if the box stops short of the data end (and likewise at the
+        # start). Such rows are counted separately, as information.
+        layer_dt = float(self._wdm.layer_dt)
+        t0_grid = self._grid_t0_abs()
+        box_lo = t0_grid + geom["n_start"] * layer_dt
+        box_hi = box_lo + geom["Nt_keep"] * layer_dt
+        act_lo = t0_grid + int(self._wdm.ind_min_t) * layer_dt
+        act_hi = t0_grid + (int(self._wdm.ind_max_t) + 1) * layer_dt
+        t_merge = self._stock_waveform_t0() + coords[valid_pos, _T_PLUNGE_COL]
+        self._stats["outside_box"] += int(np.sum(
+            (np.maximum(t_merge, act_lo) < box_lo) | (np.minimum(t_merge, act_hi) > box_hi)
+        ))
+        self._stats["outside_data"] += int(np.sum((t_merge < act_lo) | (t_merge >= act_hi)))
+        for device, pos in self._split_rows(idx[valid_pos]):
+            rows = valid_pos[pos]
+            with self._device_contexts(device):
+                adapter = self._adapter()
+                self._apply_window(adapter, geom)
+                for lo in range(0, rows.size, self.batch_max_size):
+                    sel = rows[lo: lo + self.batch_max_size]
+                    ll_c, dh_c, hh_c = self._score_chunk(adapter, coords[sel], idx[sel], leaf)
+                    out[sel] = ll_c
+                    d_h[sel] = dh_c
+                    h_h[sel] = hh_c
+                    self._stats["chunks"] += 1
+        self._stats["rows"] += n
+        self._stats["seconds"] += time.perf_counter() - t_start
+        return out
+
+    def _generate(self, adapter, coords):
+        params = np.array(coords, dtype=np.float64, copy=True)
+        params[:, _T_PLUNGE_COL] -= float(self._gen_attr(adapter, "t_plunge_snap"))
+        return adapter(*params.T, **self._gen_kwargs)
+
+    def _on_container_box(self, tmpl):
+        """``tmpl`` re-labelled onto a sub-box of the CONTAINERS' data settings.
+
+        The adapter labels its output with a box cut from ITS settings (a
+        device-local copy of ``general_info.domain_settings``); scoring and
+        fill slice the containers' data, which carry the ``t0`` their settings
+        had when the data were poured. In a stock erebor build the two can
+        disagree (factory ``t0 = 0``; a GB comp build later sets
+        ``domain_settings.t0 = data_t0`` in place), and
+        :meth:`~lisatools.domains.WDMSettings.sub_box_slices` rightly refuses
+        any ``t0`` disagreement. The coefficients do not depend on either
+        label -- the segment is placed by the adapter's ``t0_abs`` -- so the
+        SAME relative layers are re-cut from ``self._wdm``. Only ``t0`` is
+        forgiven: the box is located by ``sub_box_slices`` itself against a
+        copy of the template's settings carrying the containers' ``t0``, so a
+        different wavelet grid or a box outside the data still raises.
+        Downstream reads only the label's indices (the window/omega arrays it
+        carries are never computed with), so the primary container's settings
+        serve every shard."""
+        box = tmpl.settings
+        probe = WDMSettings(*box.args, **dict(box.kwargs, t0=self._wdm.t0))
+        new_box = self._wdm.get_slice(self._wdm.sub_box_slices(probe))
+        return WDMSignal(tmpl.arr, new_box)
+
+    def _score_chunk(self, adapter, coords, idx, leaf):
+        t_gen = time.perf_counter()
+        try:
+            tmpl = self._generate(adapter, coords)
+        except (BatchNotLaunchable, WaveformDomainError) as exc:
+            self._stats["gen_s"] += time.perf_counter() - t_gen
+            self.n_batch_fallbacks += 1
+            self._stats["fallbacks"] += 1
+            self.last_batch_error = exc
+            if self._warned_fallback_leaf != leaf:
+                self._warned_fallback_leaf = leaf
+                logger.warning(
+                    "[MBH_BATCH] leaf %d: batch refused (%s); scoring %d rows through "
+                    "the per-row container path. Watch n_batch_fallbacks.",
+                    leaf, exc, int(coords.shape[0]),
+                )
+            t_score = time.perf_counter()
+            ll = np.real(np.asarray(
+                self.compute_acs_like(coords, idx, **self.waveform_like_kwargs), dtype=float
+            )).reshape(-1)
+            self._stats["score_s"] += time.perf_counter() - t_score
+            return ll, np.full(ll.shape, np.nan), np.full(ll.shape, np.nan)
+        t_score = time.perf_counter()
+        self._stats["gen_s"] += t_score - t_gen
+        out = self._score_templates(tmpl, idx)
+        self._stats["score_s"] += time.perf_counter() - t_score
+        return out
+
+    def _score_templates(self, tmpl, idx):
+        like_kw = {
+            k: v for k, v in (self.waveform_like_kwargs or {}).items()
+            if k not in ("psd", "complex", "include_psd_info")
+        }
+        tmpl = self._on_container_box(tmpl)
+        box = tmpl.settings
+        acs_flat = self.acs.acs.flatten()
+        arr = tmpl.arr if tmpl.is_batched else tmpl.arr[None]
+        xp = get_array_module(arr)
+        idx = np.asarray(idx, dtype=np.int64).reshape(-1)
+        n = int(idx.size)
+        # One BATCHED inner_product pair per distinct walker in the chunk:
+        # the walker's rows go in as one template stack (leading source axis)
+        # against its sliced residual / PSD. A batched call returns one value
+        # per source and stays on device (inner_product only ``.item()``s the
+        # UNBATCHED case -- a sync per call, which the per-row loop paid twice
+        # per row). <h|h> is the batched stack against itself (equal nbatch:
+        # elementwise product, per-source reduction). Everything is gathered
+        # on device and pulled ONCE per chunk.
+        cache = {}
+        order = []
+        dh_dev = []
+        hh_dev = []
+        for g in np.unique(idx):
+            rows_g = np.where(idx == g)[0]
+            h_g = WDMSignal(arr[rows_g], box)
+            if g not in cache:
+                r_box, _, s_box = acs_flat[int(g)]._slice_to_template(h_g)
+                cache[g] = (r_box, s_box)
+            r_box, s_box = cache[g]
+            dh_dev.append(xp.real(inner_product(r_box, h_g, psd=s_box, **like_kw)).reshape(-1))
+            hh_dev.append(xp.real(inner_product(h_g, h_g, psd=s_box, **like_kw)).reshape(-1))
+            order.append(rows_g)
+        both = asnumpy(xp.stack([xp.concatenate(dh_dev), xp.concatenate(hh_dev)]))
+        pos = np.concatenate(order)
+        dh = np.empty(n)
+        hh = np.empty(n)
+        dh[pos] = np.asarray(both[0], dtype=float)
+        hh[pos] = np.asarray(both[1], dtype=float)
+        ll = self._exposed_offset[idx] + dh - 0.5 * hh
+        return ll, dh, hh
+
+    # ------------------------------------------------------------------
+    # expose / fold
+    # ------------------------------------------------------------------
+
+    def _apply_cold_chain_sources(self, coords, sign):
+        what = "EXPOSE (r += h)" if sign > 0 else "FOLD-BACK (r -= h)"
+        if os.environ.get("MBH_BATCHED_FILL", "1").strip() != "1":
+            logger.info(
+                "[MBH_FILL] %s via the DENSE per-row path (MBH_BATCHED_FILL=0): %d rows",
+                what, int(np.shape(coords)[0]),
+            )
+            return super()._apply_cold_chain_sources(coords, sign)
+        coords_np = np.atleast_2d(np.asarray(asnumpy(coords), dtype=np.float64))
+        leaf = int(self._current_leaf)
+        geom = self._leaf_window(leaf, coords_np, allow_rebuild=(sign > 0))
+        idx_all = np.arange(coords_np.shape[0])
+        valid = np.all(np.isfinite(coords_np), axis=1)
+        if not np.any(valid):
+            return
+        t_start = time.perf_counter()
+        n_fallback = 0
+        valid_idx = idx_all[valid]
+        for device, pos in self._split_rows(valid_idx):
+            rows = valid_idx[pos]
+            with self._device_contexts(device):
+                adapter = self._adapter()
+                self._apply_window(adapter, geom)
+                for lo in range(0, rows.size, self.batch_max_size):
+                    sel = rows[lo: lo + self.batch_max_size]
+                    try:
+                        tmpl = self._generate(adapter, coords_np[sel])
+                    except (BatchNotLaunchable, WaveformDomainError) as exc:
+                        n_fallback += 1
+                        self.last_batch_error = exc
+                        self.acs.apply_signal_from_params(
+                            sign, {self.branch_name: coords_np[sel]}, index=sel,
+                            waveform_kwargs=self._branch_waveform_kwargs(),
+                            signal_gen_resolver=self._resolve_signal_gen_override,
+                            apply_transform=False, domain_error="skip",
+                        )
+                        continue
+                    self.acs.signal_operation(
+                        sign, self._on_container_box(tmpl), data_index=sel
+                    )
+        logger.info(
+            "[MBH_FILL] %s via batched windowed templates: %d rows (%d skipped, "
+            "%d chunk fallbacks) in %.2f s", what, int(valid.sum()),
+            int((~valid).sum()), n_fallback, time.perf_counter() - t_start,
+        )
+
+    # ------------------------------------------------------------------
+    # records, checks, telemetry
+    # ------------------------------------------------------------------
+
+    def _record_leaf_inner_products(self, new_state, add_coords_in, leaf):
+        """Record cold-chain ``<d|h>``, ``<h|h>`` from the batched scorer (free)."""
+        if not getattr(self, "record_inner_products", False):
+            return
+        _sub = (getattr(new_state, "sub_states", None) or {}).get(self.branch_name)
+        if _sub is None or getattr(_sub, "d_h", None) is None:
+            return
+        walker_idx = np.arange(self.nwalkers, dtype=np.int32)
+        self.compute_like(add_coords_in, walker_idx)
+        _sub.d_h[:, leaf] = self._last_d_h[: self.nwalkers]
+        _sub.h_h[:, leaf] = self._last_h_h[: self.nwalkers]
+
+    def _verify_prev_logl(self, prev_logl, old_coords_in, data_index_in, leaf):
+        """Built-in fast-vs-slow A/B at MATCHING convention (see the SOBBH move).
+
+        GATES ON THE COLD RUNG ONLY (temperature index 0 of ``prev_logl``'s
+        ``(ntemps, nwalkers)`` shape). Hot rungs sit far from the posterior,
+        where any 1e-8 template difference is amplified by a huge ``<r|delta>``
+        (mojito id 17: 76 nats between two EXACT stock variants at logL ~ -1e5);
+        their max|diff| is reported in the same log line, never gating."""
+        acs_like = (
+            self.compute_check_like(old_coords_in, data_index_in)
+            .reshape(prev_logl.shape)
+            .real
+        )
+        prev2 = np.atleast_2d(prev_logl)
+        acs2 = np.atleast_2d(acs_like)
+        both = (
+            np.isfinite(prev2) & np.isfinite(acs2)
+            & (prev2 > -1e299) & (acs2 > -1e299)
+        )
+        cold = both[0]
+        if not np.any(cold):
+            return
+        diff = prev2[0][cold] - acs2[0][cold]
+        max_abs = float(np.abs(diff).max())
+        if max_abs <= self.check_ll_tol:
+            return
+        spread = float(diff.max() - diff.min())
+        hot = both[1:]
+        hot_txt = (
+            f"{float(np.abs(prev2[1:][hot] - acs2[1:][hot]).max()):.6e} over "
+            f"{int(hot.sum())} points" if np.any(hot) else "n/a"
+        )
+        msg = (
+            f"{self.branch_name} leaf {leaf}: batched windowed fast path vs slow "
+            f"container path disagree beyond tol={self.check_ll_tol} on the COLD "
+            f"rung: max|diff|={max_abs:.6e}, spread={spread:.6e} over "
+            f"{int(cold.sum())} points (hot rungs, not gating: max|diff|={hot_txt}). "
+            "A small spread at high SNR is sub-transform truncation "
+            "(widen MBH_WINDOW_PAD_DAYS / raise MBH_CHECK_LL_TOL); a large spread "
+            "means a window, snap or residual bug."
+        )
+        if self.check_ll_mode == "strict":
+            raise ValueError(msg)
+        logger.warning(msg)
+
+    def _flush_stats(self):
+        st = self._stats
+        if st["rows"]:
+            logger.info(
+                "[MBH_BATCH] leaf %s: %d rows in %d chunks, %.1f s (%.3f s/row; "
+                "generate=%.2f s, score=%.2f s), %d fallbacks, outside_box=%d "
+                "(rows whose in-data merger falls outside the kept box), "
+                "outside_data=%d (rows merging outside the data's active time "
+                "box: expected for a source merging near/after a data edge)",
+                st["leaf"], st["rows"], st["chunks"], st["seconds"],
+                st["seconds"] / st["rows"], st["gen_s"], st["score_s"],
+                st["fallbacks"], st["outside_box"], st["outside_data"],
+            )
+        self._stats = self._new_stats()

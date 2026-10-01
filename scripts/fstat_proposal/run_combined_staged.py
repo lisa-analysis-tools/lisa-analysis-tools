@@ -420,6 +420,61 @@ class JointMaxLogLSearch(Move):
         return mv
 
 
+class GatedNoiseSearch(JointMaxLogLSearch):
+    """The ONE noise proposal of a ratcheted search stage (GALFOR_RATCHET=1).
+
+    Wraps the same psd+galfor joint max-logL search as :class:`JointMaxLogLSearch`
+    in a :class:`~lisatools.globalfit.noise_ratchet.NoiseRatchetGate`, whose
+    per-iteration mode the stage's ``SearchStageProfileStep`` drives from the
+    stage-local iteration: NUDGE (force the galfor coordinates down by
+    ``delta`` on every rung and walker, then one GB in-model pass), HOLD
+    (nothing runs) or RELEASE (the ordinary search, then the same in-model
+    pass). User design 2026-09-30: "take out the noise_search modules from gb
+    search 3, only put one in there, at the beginning of an iteration, then
+    gate that one proposal so that it does the schedule we want"; the in-model
+    follow-up "should run anytime the noise is changing whether forced or
+    free, just not when it is held fixed."
+
+    Module level, not a closure: the pre-build fit must pickle/deepcopy.
+    """
+
+    def __init__(self, name, inner_names, delta, in_model_name="in_model",
+                 **kwargs):
+        super().__init__(name, inner_names, **kwargs)
+        self.delta = [float(x) for x in delta]
+        self.in_model_name = in_model_name
+
+    def stock_dependencies(self):
+        """The wrapped noise moves PLUS the in-model follow-up, so all are built."""
+        deps = list(self.inner_names)
+        if self.in_model_name and self.in_model_name not in deps:
+            deps.append(self.in_model_name)
+        return deps
+
+    def setup(self, ctx):
+        from lisatools.globalfit.noise_ratchet import NoiseRatchetGate
+
+        inner = super().setup(ctx)
+        galfor = ctx.stock_moves.get("galfor_pe")
+        if galfor is None:
+            raise ValueError(
+                f"{self.name}: the galfor ratchet needs the stock 'galfor_pe' "
+                f"move to perform the forced step (available: "
+                f"{sorted(ctx.stock_moves)}).")
+        in_model = None
+        if self.in_model_name:
+            in_model = ctx.stock_moves.get(self.in_model_name)
+            if in_model is None:
+                raise ValueError(
+                    f"{self.name}: the in-model follow-up move "
+                    f"{self.in_model_name!r} is not built (GB_SEARCH_IN_MODEL=0?). "
+                    "The ratchet requires it: the GB sources must settle to a "
+                    "changed noise before any RJ move scores against it.")
+        gate = NoiseRatchetGate(inner, galfor, self.delta, in_model_move=in_model)
+        gate.gf_move_name = self.name
+        return gate
+
+
 # mbh/emri/sobbh arming (campaign S6): branch -> (env, mojito class), in the
 # sobbh -> mbh -> emri BANKING order (user ruling 2026-08-27: the cheap
 # branch banks its progress before the minutes-per-leaf MBH/EMRI proposals
@@ -489,8 +544,16 @@ V9_SEARCH_STAGE_PROFILES = (
     # confidence pass -- maximizes.
     ("gb_search_2",
      dict(phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25), False),
+    # reset_band_max (user ruling 2026-09-30): stage 3 is the stage whose noise
+    # MOVES, so the shutoff valve's per-(walker, band) cold-lnL max carried in
+    # from the fixed-noise stages is re-learned from -inf at entry instead of
+    # inherited ("instead of starting from the stored value, let's reset
+    # that"). Job 672's stage 3 ended on the shutoff rule after three
+    # iterations because every band sat below a max earned under the old
+    # noise. The galfor ratchet resets it again at every nudge.
     ("gb_search_3",
-     dict(phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25), True),
+     dict(phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25,
+          reset_band_max=True), True),
 )
 
 #: Per-stage override of the profile's ``opt_snr`` -- the OPTIMAL-SNR
@@ -1481,17 +1544,59 @@ def build_fit():
                 if _env_flag("GB_SEARCH_IN_MODEL") else [])
 
     def _search_stage(name, *, sample_noise, phase_maximize, opt_snr,
-                      peak_min_snr, warm_every=1, seed_only=False):
+                      peak_min_snr, reset_band_max=False, warm_every=1,
+                      seed_only=False):
+        # the stage profile as the step sees it; reset_band_max is only
+        # written when set so the other stages' dicts stay byte-identical
+        _profile = dict(phase_maximize=phase_maximize, opt_snr=opt_snr,
+                        peak_min_snr=peak_min_snr)
+        if reset_band_max:
+            _profile["reset_band_max"] = True
         # SAMPLED noise: the legacy gb_search composition verbatim -- the
         # leading joint psd+galfor+vgb search plus the two extra re-tracking
         # rounds that bracket the F-stat birth move, so the grid is always
         # fitted against a current noise level. FIXED noise: the vgb branch
         # keeps sampling (it is 55 KNOWN sources, nothing to do with the
         # noise model) and the psd/galfor moves are simply absent.
-        _noise = (_noise_rider() if sample_noise
-                  else ([Move("vgb_pe", branch="vgb")] if _has_vgb else []))
-        _noise_pre = _noise_slot("noise_joint_search_1") if sample_noise else []
-        _noise_post = _noise_slot("noise_joint_search_2") if sample_noise else []
+        # ---- the galfor RATCHET (user design 2026-09-30) -------------------
+        # GALFOR_RATCHET=1 replaces the leading rider AND the four interleaved
+        # noise slots with ONE gated noise proposal at the head of the
+        # iteration, with vgb_pe RIGHT AFTER it (user ruling 2026-09-30: the
+        # 55 known sources are refined against the noise the gate just set,
+        # never against the one it is about to change). The stage step
+        # drives the gate -- nudge / hold / release -- from the stage-local
+        # iteration; see lisatools.globalfit.noise_ratchet. Unset, the
+        # composition below is byte-identical to before.
+        from lisatools.globalfit.noise_ratchet import (
+            nudge_delta_from_env, ratchet_from_env)
+
+        _ratchet = ratchet_from_env() if sample_noise else None
+        _ratchet_delta = ([float(x) for x in nudge_delta_from_env()]
+                          if _ratchet is not None else None)
+        if _ratchet is not None and not _env_flag("GB_SEARCH_IN_MODEL"):
+            raise ValueError(
+                "GALFOR_RATCHET=1 needs GB_SEARCH_IN_MODEL=1: every noise change "
+                "(forced or free) is followed by one GB in-model pass so the "
+                "sources settle to the new noise before any RJ move scores "
+                "against it, and that pass is the stock 'in_model' move.")
+        _slots = sample_noise and _ratchet is None
+        if _ratchet is not None:
+            _noise = [
+                GatedNoiseSearch(
+                    "noise_ratchet_search", _noise_names, _ratchet_delta,
+                    branch="psd", num_checks=(_gb_noise_checks or None),
+                    iters_per_step=(_gb_noise_cap or None))
+            ] + ([Move("vgb_pe", branch="vgb")] if _has_vgb else [])
+            print(f"[combined] {name}: GALFOR_RATCHET {_ratchet} -- one gated "
+                  f"noise proposal at the head of the iteration, nudge "
+                  f"{list(_ratchet_delta)} in the sampled galfor basis; the "
+                  f"interleaved noise_joint_search_1..4 slots are OUT.",
+                  flush=True)
+        else:
+            _noise = (_noise_rider() if sample_noise
+                      else ([Move("vgb_pe", branch="vgb")] if _has_vgb else []))
+        _noise_pre = _noise_slot("noise_joint_search_1") if _slots else []
+        _noise_post = _noise_slot("noise_joint_search_2") if _slots else []
         # NOISE TO CONVERGENCE AFTER EVERY RJ PROPOSAL -- specifically,
         # after that proposal's IN-MODEL UPDATE (user ruling 2026-09-25,
         # amended the same day: "move the noise joint searches to after the
@@ -1533,8 +1638,8 @@ def build_fit():
         # whose residual barely moved pays ~2 rounds, not 6.
         # Stages 1-2 are unaffected: they do not sample the noise, so every
         # one of these lists is empty there.
-        _noise_rep = _noise_slot("noise_joint_search_3") if sample_noise else []
-        _noise_rem = _noise_slot("noise_joint_search_4") if sample_noise else []
+        _noise_rep = _noise_slot("noise_joint_search_3") if _slots else []
+        _noise_rem = _noise_slot("noise_joint_search_4") if _slots else []
         _warm = ([Move("rj_warm_search", branch="gb", every=warm_every)]
                  if warm() else [])
         if seed_only:
@@ -1576,8 +1681,7 @@ def build_fit():
                 name=name, kind="gb_search",
                 moves=_noise + _warm + in_model("in_model"),
                 step_kwargs=dict(
-                    profile=dict(phase_maximize=phase_maximize,
-                                 opt_snr=opt_snr, peak_min_snr=peak_min_snr),
+                    profile=dict(_profile),
                     stage_name=name,
                     # FIXED length: no plateau test, no convergence wait.
                     convergence_fn=FixedIterationStop(_seed_iters()),
@@ -1591,6 +1695,15 @@ def build_fit():
                     search_shutoff_per_walker=False,
                 ),
             )
+        # ---- search LEGS (user design 2026-09-30) ---------------------------
+        # GB_SEARCH_LEGS=1: one stored row per leg of the cycle (after every
+        # in_model* move) instead of one per full cycle; the resume position
+        # is the leg-ender NAME the last row was saved after. Cadences
+        # (warm_every) and the galfor ratchet then count CYCLES. Off = today.
+        _legs = _env_flag("GB_SEARCH_LEGS")
+        _combine_kwargs = dict(share_temperature_control=False)
+        if _legs:
+            _combine_kwargs["leg_ends"] = "auto"
         return Stage(
             name=name, kind="gb_search",
             # THE OTHER SOURCES RUN LAST (user ruling 2026-09-25). They used
@@ -1641,10 +1754,13 @@ def build_fit():
                 plateau_branch="gb",
                 convergence_iter=int(os.environ.get("GB_PLATEAU_ITERS", "5")),
                 stage_name=name,
-                profile=dict(phase_maximize=phase_maximize, opt_snr=opt_snr,
-                             peak_min_snr=peak_min_snr),
+                profile=dict(_profile),
+                # the galfor ratchet schedule (None = off) and its nudge
+                ratchet=_ratchet,
+                ratchet_delta=_ratchet_delta,
+                legs=_legs,
             ),
-            combine_kwargs=dict(share_temperature_control=False),
+            combine_kwargs=_combine_kwargs,
         )
 
     if _v9_stages:

@@ -756,6 +756,14 @@ export MOJITO_INFO_PATH=/shared/data/mojito_cache
 #   python -m lisatools.globalfit.monitor.from_tar SNAP.tar.gz OUT.html
 #
 # FULL tar, not --short: Mike's morning workflow downloads it.
+# MATCH PANELS ON (user request 2026-09-30: "get back to including the phase
+# maximized computations of match"). Restores the nine match-criterion panels
+# and the Parameter Recovery section. Of those, the F4 three-way split and the
+# zoomable-plot marker classes use the REAL phase-maximised, noise-weighted
+# overlap (GF_MONITOR_MATCH_MM, default 0.8); the per-iteration
+# completeness / purity curves still key off the 2-df-bin f0 proxy so they can
+# run on every stored row. Overridable; =0 restores the 2026-08-19 default.
+export GF_MONITOR_MATCH_STATS=${GF_MONITOR_MATCH_STATS:-1}
 export GF_MONITOR_AFTER_SAVE=1
 # PAGE OFF, TAR ON (GF_MONITOR_PAGE, a789d6bd). The 6MO LAUNCHER KEEPS
 # THE PAGE -- do not copy this line across.
@@ -1599,7 +1607,10 @@ export GB_INMODEL_GROUP=1
 # window is in PASSES and dll stays at D/2, so this tightens the rate the
 # group must sustain). NOT a 3mo-specific knob: the twin test caught it
 # drifting and the 3-month run takes the 6-month value by the derive rule.
-export GB_INMODEL_GROUP_ITERS=2
+# 2 -> 3 (user ruling 2026-10-01, "for now"; carried from the 6mo script:
+# one more pass of history before a sub-band can retire while the noise
+# is moving under the galfor ratchet).
+export GB_INMODEL_GROUP_ITERS=3
 # D/2 again, and FLAT per sub-band (user ruling): "When a source is birthed,
 # it is per-source. During the special in-model only proposals it is
 # per-sub-band. I want flat D/2. This will focus more resources on the
@@ -3438,6 +3449,44 @@ export GB_TEMPER_ON_REMOVAL=1      # band swaps run inside rj_prior_removal
 # for it.
 export GB_SEARCH_PRIOR_REMOVAL_ONLY=${GB_SEARCH_PRIOR_REMOVAL_ONLY:-1}
 echo "[GB-PRIOR-REMOVAL] GB_SEARCH_PRIOR_REMOVAL_ONLY=${GB_SEARCH_PRIOR_REMOVAL_ONLY} (1 = deaths only; 0 = prior births AND deaths, ALL search stages)"
+# ---- the galfor RATCHET (user design 2026-09-30) ----------------------------
+# GALFOR_RATCHET=1 on the launch line: gb_search_3 carries ONE gated noise
+# proposal at the head of the iteration instead of the rider plus the four
+# interleaved slots. Stage-local schedule: iteration 0 of a cycle FORCES the
+# galfor coordinates down (DLOG10_* in the sampled log10 basis, every rung and
+# walker, published through the noise move's own accept path, hard F-stat
+# refit armed, then one GB in-model pass), the next HOLD-1 iterations hold the
+# noise fixed, then RELEASE iterations run the ordinary joint noise search
+# (each followed by the same in-model pass). CYCLES nudges, then permanent
+# release. The release is the measurement: a region of the curve that comes
+# back was honest, one that stays down had been absorbing resolvable sources.
+# STEP SIZE: one nudge takes the 3-5 mHz total noise from 2-5x the add-back
+# estimate to ~0.75-1.5x, where the F-stat peak floor (SNR 6.25) admits true
+# SNR-8 sources across the band (lisatools.globalfit.noise_ratchet docstring).
+# CYCLES=2 (user ruling 2026-09-30, "do at least 2 cycles for now"). ⚠ The
+# second nudge applies the same delta to whatever the first release left: on
+# a fit that stayed down it lands at 0.2-0.6x the estimate below 4.5 mHz, so
+# read its release with the junk indicators (birth truth-partner fraction,
+# power share per band) before going further.
+# Overridable here, default OFF = today's composition byte-identical.
+export GALFOR_RATCHET=${GALFOR_RATCHET:-0}
+export GALFOR_RATCHET_HOLD=${GALFOR_RATCHET_HOLD:-3}
+export GALFOR_RATCHET_RELEASE=${GALFOR_RATCHET_RELEASE:-2}
+export GALFOR_RATCHET_CYCLES=${GALFOR_RATCHET_CYCLES:-2}
+export GALFOR_RATCHET_DLOG10_AMP=${GALFOR_RATCHET_DLOG10_AMP:--0.05}
+export GALFOR_RATCHET_DLOG10_FK=${GALFOR_RATCHET_DLOG10_FK:--0.10}
+export GALFOR_RATCHET_DLOG10_F2=${GALFOR_RATCHET_DLOG10_F2:--0.15}
+# ---- search LEGS (user design 2026-09-30) ----------------------------------
+# GB_SEARCH_LEGS=1: the numbered search stages store one row per LEG of the
+# cycle -- after in_model, after in_model_fstat, after in_model_removal --
+# instead of one per full cycle. The resume position is the NAME of the
+# in-model move the last row was saved after (stored per row), so a gated
+# move that skipped a cycle cannot mis-align a relaunch; cadences
+# (GB_SEARCH_3_WARM_EVERY) and the galfor ratchet then count CYCLES. With a
+# row per leg the mid-iteration checkpoint only guards part of one leg;
+# MIDIT_CHECKPOINT=0 is reasonable for a legged search. Off = today.
+export GB_SEARCH_LEGS=${GB_SEARCH_LEGS:-0}
+echo "[GALFOR-RATCHET] GALFOR_RATCHET=${GALFOR_RATCHET} hold=${GALFOR_RATCHET_HOLD} release=${GALFOR_RATCHET_RELEASE} cycles=${GALFOR_RATCHET_CYCLES} dlog10 amp/fk/f2=${GALFOR_RATCHET_DLOG10_AMP}/${GALFOR_RATCHET_DLOG10_FK}/${GALFOR_RATCHET_DLOG10_F2} (0 = off: rider + 4 interleaved noise slots as before)"
 # High-f barren-band birth shutoff (search scope): bands above FMIN with
 # AFTER consecutive zero-birth-accept proposes stop proposing births
 # (deaths + in-model continue; [GB_BAND_SHUTOFF] log line per band).
@@ -4216,9 +4265,16 @@ export GB_SEARCH_SEED_ITERS=0
 # 0 writes at every boundary. Both pinned explicitly here rather than left
 # to the code defaults, because on a SPOT partition this is the knob that
 # decides how much a preemption costs.
-export MIDIT_CHECKPOINT=1
+# Overridable from the command line since 2026-10-01 (carried from the 6mo
+# script, where the reasoning lives): `MIDIT_CHECKPOINT=0 ./submit...` for a
+# legged + ratcheted search; default 1 otherwise.
+export MIDIT_CHECKPOINT=${MIDIT_CHECKPOINT:-1}
 export MIDIT_CHECKPOINT_MIN_INTERVAL=${MIDIT_CHECKPOINT_MIN_INTERVAL:-600}
-echo "[V9-CKPT] mid-iteration checkpoints ON, min interval ${MIDIT_CHECKPOINT_MIN_INTERVAL}s"
+if [ "${MIDIT_CHECKPOINT}" = "1" ]; then
+  echo "[V9-CKPT] mid-iteration checkpoints ON, min interval ${MIDIT_CHECKPOINT_MIN_INTERVAL}s"
+else
+  echo "[V9-CKPT] mid-iteration checkpoints OFF (MIDIT_CHECKPOINT=${MIDIT_CHECKPOINT}); under GB_SEARCH_LEGS a row lands after every leg instead"
+fi
 echo "[V9-CKPT] watch: [MIDIT_CKPT] wrote ... at stored iteration N (boundary '...')"
 
 # ============================================================================

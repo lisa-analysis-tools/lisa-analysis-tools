@@ -45,6 +45,7 @@ from ...preprocessing import normalize_source_ids
 from ...recipe import (
     MOJITO_REFERENCE_TIME,
     EMRIMoveBuilder,
+    MBHBatchedMoveBuilder,
     MBHMoveBuilder,
     SOBBHChunkedMoveBuilder,
     SOBBHMoveBuilder,
@@ -448,6 +449,10 @@ def _env_optional_duration(var: str, default: float):
 # ============================================================
 # Per-branch settings blocks (shared bases)
 # ============================================================
+#: Hard default of ``SourceMBHSettings.waveform_duration`` (1/12 yr).
+MBH_DEFAULT_WAVEFORM_DURATION = YRSID_SI / 12.0
+
+
 @dataclasses.dataclass
 class SourceMBHSettings(MBHSettings):
     """MBH branch block. Default path: LEGACY ``PhenomTHMTDIWaveform``."""
@@ -467,11 +472,41 @@ class SourceMBHSettings(MBHSettings):
     higher_modes: typing.Tuple[int, ...] = (21, 33, 44)
     phenom_tol: float = 1e-12
     start_freq: float = 7e-5
-    response_order: int = 30
+    # Response Lagrange order. User ruling 2026-09-29: default 8 (PR #82
+    # evidence: mismatch flat from order 30 down to 4; ~1.6x cheaper).
+    response_order: int = dataclasses.field(
+        default_factory=env_default("MBH_RESPONSE_ORDER", 8, int)
+    )
+    # Scoring path: "full" (stock per-row container path) or "batched" (the
+    # MBHBatchedLikeMove: one grid-aligned response launch per chunk of rows
+    # on a per-leaf window, segment WDM transform, per-walker residual+PSD).
+    likelihood: str = dataclasses.field(
+        default_factory=env_default("MBH_LIKELIHOOD", "full", str)
+    )
+    batch_max_size: int = dataclasses.field(
+        default_factory=env_default("MBH_BATCH_MAX_SIZE", 16, int)
+    )
+    # Per-leaf window around the median cold-chain merger (days): kept box =
+    # [t - before - margin, t + after + margin]; pad = discarded segment edge
+    # (must be >= buffer_time: the response zeroes that much of the head).
+    window_before_days: float = dataclasses.field(
+        default_factory=env_default("MBH_WINDOW_BEFORE_DAYS", 90.0, float)
+    )
+    window_after_days: float = dataclasses.field(
+        default_factory=env_default("MBH_WINDOW_AFTER_DAYS", 10.0, float)
+    )
+    window_pad_days: float = dataclasses.field(
+        default_factory=env_default("MBH_WINDOW_PAD_DAYS", 4.0, float)
+    )
+    window_margin_days: float = dataclasses.field(
+        default_factory=env_default("MBH_WINDOW_MARGIN_DAYS", 1.0, float)
+    )
     buffer_time: float = 15_000.0
     # phentax generation window (None -> full data span).
     waveform_duration: typing.Optional[float] = dataclasses.field(
-        default_factory=_env_optional_duration("MBH_WAVEFORM_DURATION", YRSID_SI / 12.0)
+        default_factory=_env_optional_duration(
+            "MBH_WAVEFORM_DURATION", MBH_DEFAULT_WAVEFORM_DURATION
+        )
     )
     tdionfly_margin: float = MBH_TDIONFLY_MARGIN
     logM_prior: typing.Tuple[float, float] = (np.log(1e5), np.log(1e8))
@@ -479,10 +514,15 @@ class SourceMBHSettings(MBHSettings):
     t_plunge_pad: float = 3600.0
     # An MBH is only added to the sampler if its merger lands within the
     # observed data plus this buffer past the end (seconds): keep iff
-    # ``t_merge < observation_end + mbh_merger_time_buffer``. Default ~2 days.
+    # ``observation_start <= t_merge < observation_end +
+    # mbh_merger_time_buffer``. Default 7 days:
+    # a source merging up to a week after the data end still has its late
+    # inspiral in the data, so it is kept (user, 2026-09-30: drop an MBH only
+    # where the data itself is dropped). The ``t_plunge`` prior's upper edge
+    # follows this buffer so every admitted source sits inside its own prior.
     # (Merger-window filtering is MBH-only for now.)
     mbh_merger_time_buffer: float = dataclasses.field(
-        default_factory=env_default("MBH_MERGER_TIME_BUFFER", 2 * 86400.0, float)
+        default_factory=env_default("MBH_MERGER_TIME_BUFFER", 7 * 86400.0, float)
     )
 
 
@@ -910,30 +950,36 @@ def prepare_mbh_branch(mbh, general_setup: GeneralSetup, gs):
         )
 
     # Merger-window filter (MBH-only for now): only add an MBH to the sampler
-    # if its merger falls within the observed data plus a small buffer past the
-    # end, i.e. ``t_merge < observation_end + buffer``. The sampling-basis
-    # ``t_plunge`` (injection[:, -1], == TimeCoalescencePhenomTPHMSSBFrame in
-    # mojito mode) and the data window are both referenced to
-    # ``gs.mbh_waveform_t0``, so the data ends at
-    # ``(data_t0 - mbh_waveform_t0) + Tobs`` in that frame.
+    # if its merger falls within the observed data plus a buffer past the
+    # end, i.e. ``observation_start <= t_merge < observation_end + buffer``.
+    # A merger BEFORE the data start leaves no inspiral in the data (only a
+    # minutes-long ringdown), and the ``t_plunge`` prior below starts at the
+    # data start, so such a source is dropped rather than admitted outside
+    # its own prior. The sampling-basis ``t_plunge`` (injection[:, -1], ==
+    # TimeCoalescencePhenomTPHMSSBFrame in mojito mode) and the data window
+    # are both referenced to ``gs.mbh_waveform_t0``, so the data spans
+    # ``[data_t0 - mbh_waveform_t0, data_t0 - mbh_waveform_t0 + Tobs]`` in
+    # that frame.
     buffer = getattr(mbh, "mbh_merger_time_buffer", 0.0)
-    obs_end = (general_setup.data_t0 - gs.mbh_waveform_t0) + general_setup.Tobs
+    obs_start = general_setup.data_t0 - gs.mbh_waveform_t0
+    obs_end = obs_start + general_setup.Tobs
     t_merge = np.asarray(injection[:, -1], dtype=float)
-    keep = t_merge < (obs_end + buffer)
+    keep = (t_merge >= obs_start) & (t_merge < (obs_end + buffer))
     if not bool(keep.all()):
         dropped = [inj_ids[k] for k in range(len(inj_ids)) if not keep[k]]
         logger.info(
             "MBH merger-window filter: dropping %d/%d MBHB source(s) %s with "
-            "t_merge >= observation_end (%.6e s) + buffer (%.6e s).",
-            len(dropped), len(inj_ids), dropped, obs_end, buffer,
+            "t_merge outside [observation_start (%.6e s), observation_end "
+            "(%.6e s) + buffer (%.6e s)).",
+            len(dropped), len(inj_ids), dropped, obs_start, obs_end, buffer,
         )
         injection = injection[keep]
     if injection.shape[0] == 0:
         logger.warning(
             "MBH merger-window filter removed every requested MBHB source; the "
-            "MBH branch will have zero leaves (nothing merges before "
-            "observation_end + buffer = %.6e s).",
-            obs_end + buffer,
+            "MBH branch will have zero leaves (nothing merges inside "
+            "[%.6e s, observation_end + buffer = %.6e s)).",
+            obs_start, obs_end + buffer,
         )
     if mbh.injection is None:
         mbh.injection = injection
@@ -943,8 +989,13 @@ def prepare_mbh_branch(mbh, general_setup: GeneralSetup, gs):
         mbh.transform = make_mbh_transform_container()
     if mbh.priors is None:
         # t_plunge is sampled relative to the waveform t0 epoch; the data
-        # span starts at data_t0.
-        t_rel_min = general_setup.data_t0 - gs.mbh_waveform_t0
+        # span starts at data_t0 (the filter's lower edge). The upper edge
+        # reaches past the data end by the merger-window buffer PLUS
+        # t_plunge_pad: a source the filter above admits is inside its own
+        # prior with t_plunge_pad of headroom, so the start-walker scatter
+        # around a merger just under end + buffer cannot land at -inf.
+        t_rel_min = obs_start
+        t_plunge_hi = obs_end + float(buffer) + float(mbh.t_plunge_pad)
         mbh.priors = {
             "mbh": ProbDistContainer(
                 {
@@ -960,10 +1011,7 @@ def prepare_mbh_branch(mbh, general_setup: GeneralSetup, gs):
                     "psi": uniform_dist(0.0, np.pi),
                     "alpha": uniform_dist(0.0, 2 * np.pi),
                     "sin_delta": uniform_dist(-1.0 + 1e-6, 1.0 - 1e-6),
-                    "t_plunge": uniform_dist(
-                        t_rel_min,
-                        t_rel_min + general_setup.Tobs + mbh.t_plunge_pad,
-                    ),
+                    "t_plunge": uniform_dist(t_rel_min, t_plunge_hi),
                 }
             )
         }
@@ -1002,9 +1050,104 @@ def make_mbh_initialize_kwargs(mbh, general_setup: GeneralSetup, gs) -> dict:
 # ============================================================
 # Runtime signal-gen config + cached wave-wrap generators
 # ============================================================
+def resolve_mbh_batched_cfg(mbh) -> dict:
+    """Plain-value MBH scoring-path config, with the batched-mode consistency rules.
+
+    ``batched`` pins BOTH generators (the stock one the engine installs for
+    residual rebuilds and the cross-check, and the windowed one) to
+    ``waveform_duration = window_before`` so the two agree on the inspiral
+    length; an explicit ``MBH_WAVEFORM_DURATION`` that disagrees is refused,
+    and so is ``use_tdionfly`` (the windowed generator is the legacy-response
+    family). The discarded segment pad must also cover ``buffer_time``: the
+    response ZEROES the first ``buffer_time`` of the lattice head, so a
+    shorter pad would let that dead stretch reach the kept box. ``full``
+    passes the stock values through untouched.
+    """
+    mode = str(mbh.likelihood)
+    if mode not in ("full", "batched"):
+        raise ValueError(f"MBH_LIKELIHOOD must be 'full' or 'batched'; got {mode!r}")
+    before = float(mbh.window_before_days) * 86400.0
+    after = float(mbh.window_after_days) * 86400.0
+    pad = float(mbh.window_pad_days) * 86400.0
+    margin = float(mbh.window_margin_days) * 86400.0
+    duration = mbh.waveform_duration
+    if mode == "batched":
+        if bool(mbh.use_tdionfly):
+            raise ValueError(
+                "MBH_LIKELIHOOD=batched uses the legacy-response grid-aligned "
+                "generator; it cannot be combined with USE_TDIONFLY=1."
+            )
+        explicit = os.environ.get("MBH_WAVEFORM_DURATION")
+        if explicit is not None and (duration is None or abs(float(duration) - before) > 1.0):
+            raise ValueError(
+                f"MBH_LIKELIHOOD=batched generates {mbh.window_before_days} days before "
+                f"the merger (MBH_WINDOW_BEFORE_DAYS) for BOTH the stock and the "
+                f"windowed generator; MBH_WAVEFORM_DURATION={explicit} disagrees. "
+                "Unset it or make the two equal."
+            )
+        if explicit is None and (
+            duration is None
+            or (
+                abs(float(duration) - MBH_DEFAULT_WAVEFORM_DURATION) > 1.0
+                and abs(float(duration) - before) > 1.0
+            )
+        ):
+            # Set programmatically (not the default, not the window): the
+            # window wins, but say so -- the caller asked for something else.
+            logger.warning(
+                "MBH_LIKELIHOOD=batched: mbh.waveform_duration=%r is overridden by "
+                "the window (MBH_WINDOW_BEFORE_DAYS=%s -> %.1f s) for both the stock "
+                "and the windowed generator.",
+                duration, mbh.window_before_days, before,
+            )
+        buffer_time = float(mbh.buffer_time or 0.0)
+        if pad < buffer_time:
+            raise ValueError(
+                f"MBH_WINDOW_PAD_DAYS={mbh.window_pad_days} ({pad:.0f} s) is shorter "
+                f"than the MBH response buffer_time ({buffer_time:.0f} s), which the "
+                "response zeroes at the lattice head; the discarded pad must cover it."
+            )
+        duration = before
+    return dict(
+        mbh_likelihood=mode,
+        mbh_batch_max_size=int(mbh.batch_max_size),
+        mbh_window_before=before,
+        mbh_window_after=after,
+        mbh_window_pad=pad,
+        mbh_window_margin=margin,
+        mbh_waveform_duration=duration,
+    )
+
+
+def mbh_injection_duration(mbh):
+    """``waveform_duration`` an MBH INJECTION must be generated with.
+
+    The resolved value from :func:`resolve_mbh_batched_cfg`: the raw
+    ``mbh.waveform_duration`` on the ``full`` path, the window length
+    (``window_before``) on the ``batched`` path, so the injected signal and
+    the templates agree on the inspiral length.
+    """
+    return resolve_mbh_batched_cfg(mbh)["mbh_waveform_duration"]
+
+
+def snap_waveform_t0_to_lattice(waveform_t0: float, data_t0: float, dt: float):
+    """``(waveform_t0_snapped, snap)`` with the snapped epoch on ``data_t0 + k*dt``.
+
+    ``snap = waveform_t0_snapped - waveform_t0``; callers subtract it from
+    every ``t_plunge`` so absolute merger times are unchanged (PR #82 remedy
+    for ``GridAlignedPhenomTHMTDIWaveform._check_alignable``).
+    """
+    offset = float(waveform_t0) - float(data_t0)
+    k = int(np.rint(offset / float(dt)))
+    snapped = float(data_t0) + k * float(dt)
+    return snapped, snapped - float(waveform_t0)
+
+
 def source_signal_cfg(gs, mbh, sobbh, emri) -> dict:
     """Plain-value config consumed by the wave-wrap getters below."""
+    _mbh_batched = resolve_mbh_batched_cfg(mbh)
     return dict(
+        **_mbh_batched,
         tdi_chan=gs.tdi_chan,
         tdi_gen_str=gs.tdi_gen_str,
         nchannels=gs.nchannels,
@@ -1037,7 +1180,7 @@ def source_signal_cfg(gs, mbh, sobbh, emri) -> dict:
         sobbh_m_band_half_width=sobbh.m_band_half_width,
         sobbh_fill_m_band_half_width=sobbh.fill_m_band_half_width,
         mbh_phenom_kwargs=dict(
-            waveform_duration=mbh.waveform_duration,
+            waveform_duration=_mbh_batched["mbh_waveform_duration"],
             higher_modes=mbh.higher_modes,
             phenom_tol=mbh.phenom_tol,
             start_freq=mbh.start_freq,
@@ -1259,9 +1402,20 @@ def get_mbh_phenom_gen(general_info, cfg):
     output_domain_settings = _device_local_domain_settings(
         general_info.domain_settings, xp, primary
     )
-    return get_mbh_phenom_wave_gen(
+    waveform_t0, snap = cfg["mbh_waveform_t0"], 0.0
+    if cfg.get("mbh_likelihood", "full") == "batched":
+        # The batched move's windowed generator runs on the lattice-snapped
+        # epoch; give the stock generator (engine residual rebuilds AND the
+        # move's cross-check) the SAME epoch, t_plunge shifted by the snap.
+        # Measured (mojito id 17, SNR 1420, 2026-09-30): against the
+        # UNSNAPPED stock the near-truth rows differ by up to 0.59 nats; the
+        # snapped stock agrees to 1.5e-3.
+        waveform_t0, snap = snap_waveform_t0_to_lattice(
+            waveform_t0, general_info.data_t0, general_info.dt
+        )
+    gen = get_mbh_phenom_wave_gen(
         data_td_settings=general_info.data_td_settings,
-        waveform_t0=cfg["mbh_waveform_t0"],
+        waveform_t0=waveform_t0,
         dt=general_info.dt,
         orbits=orbits,
         output_domain_settings=output_domain_settings,
@@ -1272,6 +1426,150 @@ def get_mbh_phenom_gen(general_info, cfg):
         tdi_chan=cfg["tdi_chan"],
         **cfg["mbh_phenom_kwargs"],
     )
+    if snap == 0.0:
+        return gen
+    key = ("mbh_snapped_stock", id(gen), snap)
+    if key not in _WAVE_WRAP_CACHE:
+        _WAVE_WRAP_CACHE[key] = SnappedEpochMBHGen(gen, snap)
+    return _WAVE_WRAP_CACHE[key]
+
+
+class SnappedEpochMBHGen:
+    """Stock MBH generator built on the lattice-SNAPPED epoch, fed stock rows.
+
+    ``gen`` was built with ``waveform_t0 = stock epoch + snap``; the rows'
+    ``t_plunge`` (waveform-basis column 10 -- the LAST positional, which
+    ``compute_tdi_channels`` peels as ``merger_time`` -- or the
+    ``merger_time`` keyword) is relative to the STOCK epoch, so it is shifted
+    by ``-snap`` here: the same absolute merger, evaluated on the data
+    lattice exactly like the batched windowed generator (MBH_LIKELIHOOD=
+    batched only). ``waveform_t0`` reports the STOCK epoch the rows are
+    relative to; every other attribute forwards to ``gen``.
+    """
+
+    def __init__(self, gen, snap):
+        self.gen = gen
+        self.t_plunge_snap = float(snap)
+
+    @property
+    def waveform_t0(self):
+        return float(self.gen.waveform_t0) - self.t_plunge_snap
+
+    def _shift(self, args, kwargs):
+        if kwargs.get("merger_time") is not None:
+            kwargs = dict(kwargs)
+            kwargs["merger_time"] = kwargs["merger_time"] - self.t_plunge_snap
+            return args, kwargs
+        if not args:
+            raise TypeError("SnappedEpochMBHGen: no t_plunge (positional or merger_time=)")
+        args = list(args)
+        args[-1] = args[-1] - self.t_plunge_snap
+        return tuple(args), kwargs
+
+    def get_signals_for_residuals(self, *args, **kwargs):
+        args, kwargs = self._shift(args, kwargs)
+        return self.gen.get_signals_for_residuals(*args, **kwargs)
+
+    def compute_tdi_channels(self, *args, **kwargs):
+        args, kwargs = self._shift(args, kwargs)
+        return self.gen.compute_tdi_channels(*args, **kwargs)
+
+    def __call__(self, *args, **kwargs):
+        args, kwargs = self._shift(args, kwargs)
+        return self.gen(*args, **kwargs)
+
+    def __getattr__(self, name):
+        # dunder/underscore guard (deepcopy/pickle probing, pre-__init__)
+        if name.startswith("_") or name == "gen":
+            raise AttributeError(name)
+        return getattr(self.gen, name)
+
+
+def get_mbh_windowed_gen(general_info, cfg):
+    """Per-device (cached) windowed grid-aligned MBH generator in its sub-transform adapter.
+
+    Built like :func:`get_mbh_phenom_gen` (device-local orbits and domain
+    settings; same generator kwargs as
+    :func:`~.wrappers.get_mbh_phenom_wave_gen`) but from
+    :class:`WindowedGridAlignedMBHWaveform`, with ``waveform_t0`` snapped onto
+    the data lattice; the adapter carries ``waveform_t0`` (snapped),
+    ``t_plunge_snap`` and ``t0_abs = general_info.data_t0`` (the absolute time
+    of WDM layer 0) for the move.
+    """
+    from lisatools.domains import WDMSettings
+    from lisatools.sources.batching import MBHWindowedWDMSignalGen
+    from lisatools.sources.bbh.gridaligned import WindowedGridAlignedMBHWaveform
+
+    xp = _general_info_xp(general_info)
+    primary = _primary_device(general_info)
+    base_orbits = (
+        general_info.gpu_orbits if general_info.gpus is not None else general_info.orbits
+    )
+    orbits = _device_local_orbits(base_orbits, xp, primary)
+    wdm = _device_local_domain_settings(general_info.domain_settings, xp, primary)
+    pk = cfg["mbh_phenom_kwargs"]
+    # Device-local orbits/settings key the device; the cfg values that shape
+    # the generator key the configuration (a cfg change must not be served a
+    # stale generator).
+    key = (
+        "mbh_windowed", id(general_info), id(orbits), id(wdm), cfg["nchannels"],
+        cfg["mbh_waveform_t0"], tuple(sorted((k, tuple(v) if isinstance(v, (list, tuple)) else v)
+                                             for k, v in pk.items())),
+    )
+    if key in _WAVE_WRAP_CACHE:
+        return _WAVE_WRAP_CACHE[key]
+    if not isinstance(wdm, WDMSettings):
+        raise ValueError(
+            "MBH_LIKELIHOOD=batched needs a WDM run domain "
+            f"(general.domain_settings is {type(wdm).__name__})."
+        )
+    t0_snapped, snap = snap_waveform_t0_to_lattice(
+        cfg["mbh_waveform_t0"], general_info.data_t0, general_info.dt
+    )
+    if snap != 0.0:
+        logger.info(
+            "[MBH_BATCH] waveform_t0 snapped onto the data lattice by %+.6f s "
+            "(t_plunge rows are shifted by the same amount inside the move)", snap,
+        )
+    gen = WindowedGridAlignedMBHWaveform(
+        waveform_kwargs=dict(
+            higher_modes=list(pk["higher_modes"]), include_negative_modes=True,
+            t_low_fit=True, coarse_grain=False, atol=pk["phenom_tol"], rtol=pk["phenom_tol"],
+        ),
+        Tobs=float(pk["waveform_duration"]),
+        start_freq=pk["start_freq"],
+        use_reference_time=True,
+        waveform_t0=t0_snapped,
+        data_td_settings=general_info.data_td_settings,
+        tdi_generation=cfg["tdi_gen_str"],
+        tdi_channels=cfg["tdi_chan"],
+        sampling_frequency=1.0 / general_info.dt,
+        orbits=orbits,
+        order=pk["response_order"],
+        tukey_alpha=general_info.window_alpha,
+        stft_dt=None,
+        freq_min=pk["min_freq"],
+        freq_max=pk["max_freq"],
+        # Only chunks the FULL-grid rfft loop, which the windowed adapter never
+        # uses (it calls compute_tdi_channels + its own segment transform).
+        fft_batch_size=1,
+        buffer_time=pk["buffer_time"],
+        output_domain_settings=wdm,
+        force_backend=general_info.force_backend,
+    )
+    # t0_abs: the data start is the ABSOLUTE time of WDM layer 0. NOT
+    # ``wdm.t0``: ``WDMSettings.make_factory`` builds t0 = 0 (it ignores
+    # times[0]) and a GB comp build later sets ``domain_settings.t0 =
+    # data_t0`` in place (recipe.py GBFillGlobalSignalGen._comp, gb_no_fg /
+    # vgb setup), so that t0 depends on build order.
+    adapter = MBHWindowedWDMSignalGen(
+        gen, wdm, nchannels=cfg["nchannels"], tukey_alpha=general_info.window_alpha,
+        t0_abs=float(general_info.data_t0),
+    )
+    adapter.waveform_t0 = t0_snapped
+    adapter.t_plunge_snap = snap
+    _WAVE_WRAP_CACHE[key] = adapter
+    return adapter
 
 
 class SourceSignalGen:
@@ -1619,9 +1917,23 @@ def build_sobbh_move_runtime(curr, acs, priors, state, cfg):
 
 
 def build_mbh_move_runtime(curr, acs, priors, state, cfg):
-    """MBH PE move: stretch RJ move on the tdionfly wrap, or the stock
-    ``build_mbh_moves_phenom`` builder around the cached phentax generator."""
+    """MBH PE move: batched windowed (MBH_LIKELIHOOD=batched), stretch RJ move on
+    the tdionfly wrap, or the stock ``build_mbh_moves_phenom`` builder around
+    the cached phentax generator."""
     mbh_info = curr.source_info["mbh"]
+    if cfg.get("mbh_likelihood", "full") == "batched":
+        slow = DeviceLocalWaveGen(get_mbh_phenom_gen, curr.general_info, cfg)
+        batched = DeviceLocalWaveGen(get_mbh_windowed_gen, curr.general_info, cfg)
+        _, moves = MBHBatchedMoveBuilder(
+            wave_gen=slow.get_signals_for_residuals,
+            batched_gen=batched,
+            batch_max_size=cfg["mbh_batch_max_size"],
+            window_before=cfg["mbh_window_before"],
+            window_after=cfg["mbh_window_after"],
+            window_pad=cfg["mbh_window_pad"],
+            window_margin=cfg["mbh_window_margin"],
+        ).build(None, curr, acs, priors, state)
+        return moves[0]
     if not cfg["mbh_use_tdionfly"]:
         wave_gen = DeviceLocalWaveGen(get_mbh_phenom_gen, curr.general_info, cfg)
         _, move = build_mbh_moves_phenom(
@@ -1649,36 +1961,20 @@ def build_source_moves(curr, acs, priors, state, cfg) -> dict:
     """Build the mbh/emri/sobbh PE moves present on ``curr`` into a name->move
     dict (matching the ``mbh_pe`` / ``emri_pe`` / ``sobbh_pe`` stock-move names).
 
-    TODO(mbh/emri batching) -- KNOWN, DEFERRED BY DECISION (2026-08-28), not
-    an oversight. ``mbh_pe`` and ``emri_pe`` score ONE ROW AT A TIME through
-    ``AnalysisContainer.build_template`` (the base
-    ``ResidualAddOneRemoveOneMove`` path), where ``sobbh_pe`` was moved onto
-    the batched chunked-heterodyne kernel. Measured on the 6-mo probe, job
-    373:
+    MBH scoring path: ``MBH_LIKELIHOOD=full`` (default) scores ONE ROW AT A
+    TIME through ``AnalysisContainer.build_template`` (the base
+    ``ResidualAddOneRemoveOneMove`` path); ``MBH_LIKELIHOOD=batched`` builds
+    :class:`~lisatools.globalfit.moves.MBHBatchedLikeMove` instead -- batched
+    grid-aligned phentax generation on a per-leaf window with a segment WDM
+    transform (``MBHBatchedMoveBuilder``, spec
+    ``docs/superpowers/specs/2026-09-29-mbh-batched-windowed-likelihood-design.md``).
+    ``sobbh_pe`` uses the batched chunked-heterodyne kernel.
 
-        sobbh   8.0 s/leaf   2880 rows      2.78 ms/row   (chunked, batched)
-        mbh     344 s/leaf    240 rows   ~1430 ms/row     (dense, per-row)
-        emri    250 s/leaf    240 rows   ~1040 ms/row     (dense, per-row)
-
-    i.e. the SOBBH proposal is ~1.4% of an iteration and MBH+EMRI are ~98%.
-
-    NOT being optimized now, deliberately: these branches are a PROOF OF
-    CONCEPT at 6 months, and faster waveforms plus wider batching support
-    are expected from upstream in the near future -- which would make any
-    batching layer written here now both redundant and a merge hazard. The
-    production 6-mo run that includes these branches simply runs them as
-    they are, with LOW ntemps and LOW repeats (the stock ``num_prop_repeats``
-    default of 2), accepting the per-row cost.
-
-    When it IS time, the routes differ per branch: MBH can go through BBHx's
-    existing batched ``numBinAll`` PhenomHM FD machinery (convention-sensitive
-    -- read the producer before assuming the strain/response conventions
-    match); EMRI has no batched representation today because FEW's ODE is
-    adaptive per source, so its route is the parked multimodal-heterodyne
-    plan rather than a batch axis. Their expose/fold is already cheap
-    (template builds cache -- the injection stage showed 14 s for the first
-    EMRI then <1 s after), so the win is in SCORING, not in the residual
-    bookkeeping that ``sobbh_pe`` fixed.
+    EMRI batching remains DEFERRED BY DECISION (2026-08-28): ``emri_pe`` scores
+    per row (~1040 ms/row on the 6-mo probe, job 373). FEW's ODE is adaptive
+    per source, so EMRI has no batch axis today; its route is the parked
+    multimodal-heterodyne plan. Its expose/fold is already cheap (template
+    builds cache), so the win is in SCORING.
     """
     stock_moves = {}
     if "mbh" in curr.source_info:

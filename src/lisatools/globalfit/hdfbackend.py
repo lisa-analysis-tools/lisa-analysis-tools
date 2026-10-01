@@ -339,6 +339,51 @@ def promote_backup_if_store_unreadable(path: str) -> bool:
         return True
 
 
+#: Per-row dataset in the main group: the leg-ender name each row was saved
+#: after ("" for rows saved by a stage without legs). See lisatools.globalfit.legs.
+SAVED_AFTER_DS = "saved_after"
+
+
+def write_saved_after(g, iteration, name):
+    """Record that row ``iteration - 1`` of main group ``g`` was saved after
+    leg-ender ``name``. Creates the resizable string dataset on first use
+    (earlier rows read back as unknown) and grows it as rows are added."""
+    n = int(iteration)
+    if n <= 0:
+        return
+    if SAVED_AFTER_DS not in g:
+        ds = g.create_dataset(
+            SAVED_AFTER_DS, shape=(n,), maxshape=(None,),
+            dtype=h5py.string_dtype(encoding="utf-8"), chunks=(64,))
+        ds[:] = [""] * n
+    else:
+        ds = g[SAVED_AFTER_DS]
+        if int(ds.shape[0]) < n:
+            old = int(ds.shape[0])
+            ds.resize((n,))
+            ds[old:n] = [""] * (n - old)
+    ds[n - 1] = str(name)
+
+
+def stamp_move_order(g, step_name, order):
+    """Stamp the stage's ordered move-name list on its recipe group, ONCE.
+
+    An existing stamp is kept: it records the composition the stage's rows
+    were written under, which is what a resume compares the live list to.
+    Returns True when written.
+    """
+    import json
+
+    grp = g.get("recipe")
+    if grp is None or step_name not in grp:
+        return False
+    s = grp[step_name]
+    if s.attrs.get("move_order") is not None:
+        return False
+    s.attrs["move_order"] = json.dumps([str(x) for x in order])
+    return True
+
+
 def _atomic_backup_copy(src: str) -> None:
     """Refresh ``<src>_running_backup_copy.h5`` so it can never be torn.
 
@@ -880,6 +925,18 @@ class GFHDFBackend(eryn_HDFBackend):
             # minus one because it was updated in the super function
             iteration = g.attrs["iteration"] - 1
 
+            # Search LEGS (user design 2026-09-30): the row's leg-ender name,
+            # the resume position, plus the stage's ordered move list, once.
+            # Both written HERE, on the saver -- the single writer -- never
+            # from the head (the recipe-group tears of 09-28/29).
+            _after = getattr(state, "gf_saved_after", None)
+            if _after:
+                write_saved_after(g, iteration + 1, _after)
+                _order = getattr(state, "gf_move_order", None)
+                _stage = getattr(state, "gf_stage_name", None)
+                if _order and _stage:
+                    stamp_move_order(g, _stage, _order)
+
             if self.sub_backend is not None:
                 # resize all the arrays accordingly
 
@@ -1069,7 +1126,7 @@ class GFHDFBackend(eryn_HDFBackend):
 
                 f[self.name].attrs["has_recipe"] = True
 
-    def completed_recipe_step(self, step_name):
+    def completed_recipe_step(self, step_name, next_step_name=None):
         """Mark ``step_name`` as completed in the on-disk recipe metadata.
 
         Also stamps ``completed_iteration``: the stored iteration the step
@@ -1105,6 +1162,67 @@ class GFHDFBackend(eryn_HDFBackend):
             recipe_step_group.attrs["status"] = True
             if _it is not None:
                 recipe_step_group.attrs["completed_iteration"] = _it
+                # The NEXT step starts where this one completed. Stamped in
+                # the SAME open as the completion (one write event at the
+                # boundary, not two) so a stage's start survives a resume:
+                # the galfor ratchet's schedule is keyed on the stage-local
+                # iteration and would otherwise nudge again on every
+                # relaunch. Companion to ``stage_start_iteration`` /
+                # ``stamp_stage_start``; an existing stamp is kept.
+                if next_step_name is not None and next_step_name in recipe_group:
+                    _nxt = recipe_group[next_step_name]
+                    if _nxt.attrs.get("start_iteration") is None:
+                        _nxt.attrs["start_iteration"] = _it
+
+    # ---- search legs: the row's leg-ender name + the stage's move order ----
+    def saved_after(self, it):
+        """The leg-ender name row ``it`` was saved after, or ``None``.
+
+        ``None`` for a store written before legs existed, a row saved by a
+        stage without legs, or a row outside the dataset.
+        """
+        return self.saved_after_history(int(it), int(it) + 1)[0]
+
+    def saved_after_history(self, start, stop):
+        """``saved_after`` for rows ``start..stop-1`` in one file open."""
+        start, stop = int(start), int(stop)
+        out = [None] * max(stop - start, 0)
+        if stop <= start:
+            return out
+        try:
+            with self.open("r") as f:
+                ds = f[self.name].get(SAVED_AFTER_DS)
+                if ds is None:
+                    return out
+                n = int(ds.shape[0])
+                for k, it in enumerate(range(start, stop)):
+                    if 0 <= it < n:
+                        v = ds[it]
+                        if isinstance(v, bytes):
+                            v = v.decode("utf-8", "replace")
+                        out[k] = str(v) or None
+        except Exception as exc:  # noqa: BLE001 -- a resume hint, never fatal
+            logger.debug("saved_after rows %d..%d unreadable (%r)", start, stop, exc)
+        return out
+
+    def stage_move_order(self, step_name):
+        """The ordered move-name list stamped for ``step_name``, or ``None``."""
+        import json
+
+        try:
+            with self.open("r") as f:
+                grp = f[self.name].get("recipe")
+                if grp is None or step_name not in grp:
+                    return None
+                raw = grp[step_name].attrs.get("move_order")
+                if raw is None:
+                    return None
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", "replace")
+                return [str(x) for x in json.loads(str(raw))]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("recipe step %s: move_order unreadable (%r)", step_name, exc)
+            return None
 
     def stage_start_iteration(self, step_name):
         """The stored iteration a step STARTED at, or ``None``.
