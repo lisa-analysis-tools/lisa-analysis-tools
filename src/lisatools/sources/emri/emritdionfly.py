@@ -38,6 +38,25 @@ from lisatools.utils.constants import YRSID_SI
 from .domain import few_domain_guard
 
 
+def host_holder(H):
+    """Host (numpy) copy of a FEW SparseInfoHolder.
+
+    On a GPU FEW generator the holder's arrays are cupy; the TOF feed, the harmonic tracks
+    and the mode bookkeeping are small host-side computations (the response itself runs on
+    the TOF backend), so everything downstream reads this copy.
+    """
+    import types
+
+    def _h(x):
+        return x.get() if hasattr(x, "get") else (np.asarray(x) if x is not None else None)
+
+    return types.SimpleNamespace(
+        t_arr=_h(H.t_arr), teuk_modes=_h(H.teuk_modes), phases=_h(getattr(H, "phases", None)),
+        freqs=_h(getattr(H, "freqs", None)), ylms=_h(H.ylms), ls=_h(H.ls), ms=_h(H.ms), ks=_h(H.ks),
+        ns=_h(H.ns), integrate_backwards=bool(getattr(H, "integrate_backwards", False)),
+    )
+
+
 class EMRITDIonFly:
     """Build the TDI response of a FEW EMRI waveform mode-by-mode on the fly.
 
@@ -242,6 +261,7 @@ class EMRITDIonFly:
                 _ik.clear()
                 _ik.update(_ik_saved)
 
+        Kerr_wave = host_holder(Kerr_wave)   # GPU generator: cupy holder -> host copy
         self.last_holder = Kerr_wave   # consumers (EMRIDirectWDM) need the same trajectory's modes
         mode_amp, mode_phase = self.mode_amp_phase(
             Kerr_wave, include_minus_mkn=include_minus_mkn, amp_factor=self.AMP_FACTOR

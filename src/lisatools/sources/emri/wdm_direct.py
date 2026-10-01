@@ -358,6 +358,9 @@ class EMRIDirectWDM:
         finally:
             self.few_gen.inspiral_kwargs.clear()
             self.few_gen.inspiral_kwargs.update(saved)
+        from .emritdionfly import host_holder
+
+        H = host_holder(H)                                  # GPU generator: cupy -> host
         modes = [(int(l), int(m), int(k), int(n)) for l, m, k, n in zip(H.ls, H.ms, H.ks, H.ns)]
         return modes, self._chunk_start(H, few_args)
 
