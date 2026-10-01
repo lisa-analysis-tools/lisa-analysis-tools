@@ -82,6 +82,10 @@ class LISAToolsBackendMethods(BackendMethods):
     # chunked-het + signal-het kernels.
     TDITypeDict: object
 
+    # Template-batched TD TDI-on-the-fly with exact dense-output phases (EMRI,
+    # 2026-09-30). ``None`` on a module built before it landed.
+    TDDenseTDIWaveformWrap: typing.Optional[object] = dataclasses.field(default=None, kw_only=True)
+
 
 class LISAToolsBackend:
     """Mixin attaching LISA-specific native symbols to a backend class.
@@ -112,6 +116,7 @@ class LISAToolsBackend:
     STFTFresnelWrap: object
     psd_likelihood: typing.Callable[(...), None]
     compute_logpdf: typing.Callable[(...), None]
+    TDDenseTDIWaveformWrap: typing.Optional[object]
     # Phase 3L.7k LISA-response Wraps (see LISAToolsBackendMethods).
     TDSplineTDIWaveformWrap: object
     FDSplineTDIWaveformWrap: object
@@ -144,6 +149,7 @@ class LISAToolsBackend:
         self.STFTFresnelWrap = lisatools_backend_methods.STFTFresnelWrap
         self.psd_likelihood = lisatools_backend_methods.psd_likelihood
         self.compute_logpdf = lisatools_backend_methods.compute_logpdf
+        self.TDDenseTDIWaveformWrap = lisatools_backend_methods.TDDenseTDIWaveformWrap
         # Phase 3L.7k -- LISA-response wraps absorbed from
         # fastlisaresponse cutils backend (which is being retired).
         self.TDSplineTDIWaveformWrap = lisatools_backend_methods.TDSplineTDIWaveformWrap
@@ -202,6 +208,7 @@ class LISAToolsCpuBackend(CpuBackend, LISAToolsBackend):
             STFTFresnelWrap=_lat_pd.STFTFresnelWrapCPU,
             psd_likelihood=_lat_pd.psd_likelihood,
             compute_logpdf=_lat_pd.compute_logpdf,
+            TDDenseTDIWaveformWrap=getattr(_lat_pd, "TDDenseTDIWaveformWrapCPU", None),
             # Phase 3L.7k LISA-response wraps absorbed from fastlisaresponse.
             TDSplineTDIWaveformWrap=_lat_pd.TDSplineTDIWaveformWrapCPU,
             FDSplineTDIWaveformWrap=_lat_pd.FDSplineTDIWaveformWrapCPU,
@@ -272,6 +279,7 @@ class LISAToolsCuda11xBackend(Cuda11xBackend, LISAToolsBackend):
             STFTFresnelWrap=_lat_pd.STFTFresnelWrapGPU,
             psd_likelihood=_lat_pd.psd_likelihood,
             compute_logpdf=_lat_pd.compute_logpdf,
+            TDDenseTDIWaveformWrap=getattr(_lat_pd, "TDDenseTDIWaveformWrapGPU", None),
             # Phase 3L.7k LISA-response wraps absorbed from fastlisaresponse.
             TDSplineTDIWaveformWrap=_lat_pd.TDSplineTDIWaveformWrapGPU,
             FDSplineTDIWaveformWrap=_lat_pd.FDSplineTDIWaveformWrapGPU,
@@ -339,6 +347,7 @@ class LISAToolsCuda12xBackend(Cuda12xBackend, LISAToolsBackend):
             STFTFresnelWrap=_lat_pd.STFTFresnelWrapGPU,
             psd_likelihood=_lat_pd.psd_likelihood,
             compute_logpdf=_lat_pd.compute_logpdf,
+            TDDenseTDIWaveformWrap=getattr(_lat_pd, "TDDenseTDIWaveformWrapGPU", None),
             # Phase 3L.7k LISA-response wraps absorbed from fastlisaresponse.
             TDSplineTDIWaveformWrap=_lat_pd.TDSplineTDIWaveformWrapGPU,
             FDSplineTDIWaveformWrap=_lat_pd.FDSplineTDIWaveformWrapGPU,
@@ -407,6 +416,7 @@ class LISAToolsCuda13xBackend(Cuda13xBackend, LISAToolsBackend):
             STFTFresnelWrap=_lat_pd.STFTFresnelWrapGPU,
             psd_likelihood=_lat_pd.psd_likelihood,
             compute_logpdf=_lat_pd.compute_logpdf,
+            TDDenseTDIWaveformWrap=getattr(_lat_pd, "TDDenseTDIWaveformWrapGPU", None),
             # Phase 3L.7k LISA-response wraps absorbed from fastlisaresponse.
             TDSplineTDIWaveformWrap=_lat_pd.TDSplineTDIWaveformWrapGPU,
             FDSplineTDIWaveformWrap=_lat_pd.FDSplineTDIWaveformWrapGPU,

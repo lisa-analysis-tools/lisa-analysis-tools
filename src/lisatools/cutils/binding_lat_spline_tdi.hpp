@@ -28,10 +28,12 @@
 #define LISATDIonTheFlyWrap     LISATDIonTheFlyWrapGPU
 #define TDSplineTDIWaveformWrap TDSplineTDIWaveformWrapGPU
 #define FDSplineTDIWaveformWrap FDSplineTDIWaveformWrapGPU
+#define TDDenseTDIWaveformWrap TDDenseTDIWaveformWrapGPU
 #else
 #define LISATDIonTheFlyWrap     LISATDIonTheFlyWrapCPU
 #define TDSplineTDIWaveformWrap TDSplineTDIWaveformWrapCPU
 #define FDSplineTDIWaveformWrap FDSplineTDIWaveformWrapCPU
+#define TDDenseTDIWaveformWrap TDDenseTDIWaveformWrapCPU
 #endif
 
 // Common base for all LISATDIonTheFly Wrap subclasses. Pure data holder
@@ -115,6 +117,54 @@ class TDSplineTDIWaveformWrap : public LISATDIonTheFlyWrap {
     }
 
     inline int get_buffer_size(int N){return waveform->get_td_spline_buffer_size(N);}
+};
+
+// Template-batched TD TDI-on-the-fly with exact dense-output phases (see
+// TDDenseTDIWaveform). The data arrays are NOT copied: the Python side keeps
+// them alive for the life of the wrap.
+class TDDenseTDIWaveformWrap : public LISATDIonTheFlyWrap {
+  public:
+    TDDenseTDIWaveform *waveform;
+    TDDenseTDIWaveformWrap(OrbitsWrap *orbits_, TDIConfigWrap *tdi_config_, int n_temp, int K, int num_sub,
+        double amp_factor, array_type<int> sub_temp, array_type<int> sub_mkn, array_type<int> n_knots,
+        array_type<double> t_knots, array_type<double> phase_coeffs, array_type<double> amp_re,
+        array_type<double> amp_im): LISATDIonTheFlyWrap(orbits_, tdi_config_)
+    {
+        waveform = new TDDenseTDIWaveform(orbits_->orbits, tdi_config_->tdi_config, n_temp, K, num_sub, amp_factor,
+            return_pointer_and_check_length(sub_temp, "sub_temp", num_sub, 1),
+            return_pointer_and_check_length(sub_mkn, "sub_mkn", num_sub, 3),
+            return_pointer_and_check_length(n_knots, "n_knots", n_temp, 1),
+            return_pointer_and_check_length(t_knots, "t_knots", K, n_temp),
+            return_pointer_and_check_length(phase_coeffs, "phase_coeffs", (K - 1) * 3 * 8, n_temp),
+            return_pointer_and_check_length(amp_re, "amp_re", (K - 1) * 4, num_sub),
+            return_pointer_and_check_length(amp_im, "amp_im", (K - 1) * 4, num_sub));
+    };
+    ~TDDenseTDIWaveformWrap(){
+        delete waveform;
+    };
+
+    inline void run_wave_tdi_wrap(
+        array_type<std::complex<double>> tdi_channels_arr,
+        array_type<double> tdi_amp, array_type<double> tdi_phase, array_type<double> phi_ref,
+        array_type<double> params, array_type<double> t_arr, array_type<int> sub_offsets,
+        int N, int n_params, int nchannels)
+    {
+        int num_sub = waveform->num_sub;
+        int n_temp = waveform->n_temp;
+        td_dense_run_wave_tdi_wrap(
+            waveform,
+            (cmplx*)return_pointer_and_check_length(tdi_channels_arr, "tdi_channels_arr", N, num_sub * nchannels),
+            return_pointer_and_check_length(tdi_amp, "tdi_amp", N, num_sub * nchannels),
+            return_pointer_and_check_length(tdi_phase, "tdi_phase", N, num_sub * nchannels),
+            return_pointer_and_check_length(phi_ref, "phi_ref", N, num_sub),
+            return_pointer_and_check_length(params, "params", n_params, n_temp),
+            return_pointer_and_check_length(t_arr, "t_arr", N, n_temp),
+            return_pointer_and_check_length(sub_offsets, "sub_offsets", n_temp + 1, 1),
+            N, n_params, nchannels
+        );
+    }
+
+    inline int get_buffer_size(int N){return waveform->get_td_dense_buffer_size(N);}
 };
 
 #endif // __BINDING_LAT_SPLINE_TDI_HPP__
