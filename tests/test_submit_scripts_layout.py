@@ -847,10 +847,12 @@ class SixMonthMBHBatchedTest(unittest.TestCase):
         self.assertIn("but the settings resolve", out)
 
     def test_the_3mo_twin_does_not_inherit_it(self):
-        """Evidence for NOT copying the block into the 3-month twin: the
-        batched window does not fit a 90-day grid (the move's constructor
-        raises), so the twin's documented ``MBHB_IDS=5`` escape would die at
-        build. The same geometry fits the 6-month grid with room to spare."""
+        """The 3-month twin does not export the 6-month MBH block, and it does
+        not need to: since the batched path became the library default
+        (MBH_LIKELIHOOD=auto, 2026-10-01) a window longer than the 90-day grid
+        is CLAMPED to the data's active box instead of raising, so the twin's
+        ``MBHB_IDS=5`` escape builds on the batched path too. The 6-month
+        grid fits the full window with room to spare."""
         import types
 
         from lisatools.globalfit.moves.mbhbatchedmove import mbh_window_layers
@@ -869,8 +871,11 @@ class SixMonthMBHBatchedTest(unittest.TestCase):
         geom = mbh_window_layers(six, 100 * 86400.0, *win)
         self.assertLessEqual(geom["Nt_keep"] + 2 * geom["n_pad"], six.Nt)
         three = grid(self.three["TOBS_TARGET"], 20)
-        with self.assertRaises(ValueError):
-            mbh_window_layers(three, 60 * 86400.0, *win)
+        clamped = mbh_window_layers(three, 60 * 86400.0, *win)
+        # kept box clamped inside the active box; segment inside the grid
+        self.assertGreaterEqual(clamped["n_start"], three.ind_min_t)
+        self.assertLessEqual(clamped["n_start"] + clamped["Nt_keep"], three.ind_max_t + 1)
+        self.assertLess(clamped["Nt_keep"], geom["Nt_keep"])
 
 
 class MpiPlacementTest(unittest.TestCase):

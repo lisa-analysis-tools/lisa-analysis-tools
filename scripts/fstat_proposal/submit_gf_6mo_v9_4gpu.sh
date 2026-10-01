@@ -4597,9 +4597,14 @@ except ImportError as exc:
           "mbh_pe would run the per-row path. Pull dev at/after the batched MBH "
           "merge, or launch with MBH_LIKELIHOOD=full.")
     sys.exit(2)
+from lisatools.domains import WDMSettings
+
 mbh = SourceMBHSettings()
+# The resolver needs the run-domain spec (MBH_LIKELIHOOD=auto/batched check the
+# domain is WDM). This run's grid: Nf 1440 x Nt 4320 at dt 2.5 s.
 try:
-    cfg = resolve_mbh_batched_cfg(mbh)
+    cfg = resolve_mbh_batched_cfg(
+        mbh, domain_settings=WDMSettings.make_factory(1440, 4320))
 except ValueError as exc:
     print(f"[MBH-PREFLIGHT] REFUSING: {exc}")
     sys.exit(2)
