@@ -231,6 +231,35 @@ severity use the base `MBH_CHECK_LL` / `MBH_CHECK_LL_EVERY` knobs.
 | `window_pad_days` | `MBH_WINDOW_PAD_DAYS` | 4.0 |
 | `response_order` | `MBH_RESPONSE_ORDER` | 8 (was 30, not env-backed) |
 
+**Update 2026-09-30 (user: "make this new path the default").** The table
+above is the 2026-09-29 opt-in state; R10's "defaults leave the current
+behaviour in place" and §7 step 1 ("knob OFF") are superseded:
+
+- `MBH_LIKELIHOOD` default `"auto"` (values `auto` / `batched` / `full`):
+  resolves to `batched` whenever the run can use it, else to `full` with one
+  INFO line naming the reason -- `USE_TDIONFLY=1`, a non-WDM run domain (or
+  one that cannot be identified before the build: a hand-written domain
+  factory; the `make_factory` factories declare `domain_settings_class`), or
+  `MBH_WAVEFORM_DURATION` set in the environment to a value other than
+  `window_before`. An explicit `batched` still raises on those conflicts
+  (an unidentifiable domain excepted: the windowed generator checks the built
+  one). `resolve_mbh_batched_cfg` / `mbh_injection_duration` /
+  `source_signal_cfg` take the run-domain SPEC as a required keyword so the
+  injection sites and the moves resolve `auto` identically
+  (`run_domain_spec(general_info)` recovers it after the build).
+- `MBH_BATCH_MAX_SIZE` default 8 (controller ruling from the H100 benchmark:
+  B=8 adds +8.5 GB of device memory for 0.037 s/row, B=16 +18.5 GB for
+  0.034 s/row; production cards also carry the GB buffers).
+- A data span shorter than the window (3-month runs, the lite smokes) no
+  longer raises: `mbh_window_layers` clamps the kept box to the data's active
+  box and the segment to the grid (pads shrink to what fits, possibly 0),
+  logged once. A whole-grid, zero-pad segment is the stock full-grid
+  transform: on the toys the kept layers are bit-identical to it (max rel
+  diff 0.0, with and without the Tukey window, cropped active box too) and
+  the move's batched lnL matches the container path to 2.9e-11 on |lnL| ~
+  2e5 (tests/test_mbh_windowed_signal_gen.py `WindowedWholeGridClampTest`,
+  tests/test_mbh_batched_move.py `MBHBatchedWholeGridClampParityTest`).
+
 Consistency rule for `batched`: both generators (the stock one the engine
 installs for residual rebuilds and the check path, and the windowed one)
 use `waveform_duration = window_before`. If `MBH_WAVEFORM_DURATION` is set

@@ -260,6 +260,59 @@ class WindowedEdgeClampTest(unittest.TestCase):
         self.assertLess(err_t.max(), 1e-4)
 
 
+class WindowedWholeGridClampTest(unittest.TestCase):
+    """A data span SHORTER than the window (2026-09-30: the batched path is the
+    default, so 3-month runs and the lite smokes use it): ``mbh_window_layers``
+    clamps the kept box to the active box and the segment to the whole grid
+    with zero pads. That segment transform IS the stock full-grid transform,
+    so the kept layers must equal it at float rounding -- not merely at the
+    ~1e-5 windowed (pad-truncation) tolerance above."""
+
+    HUGE = dict(window_before=200 * NF * DT, window_after=10 * NF * DT,
+                window_pad=8 * NF * DT, window_margin=1 * NF * DT)
+
+    def setUp(self):
+        import lisatools.globalfit.moves.mbhbatchedmove as mod
+
+        mod._CLAMP_LOGGED.clear()
+        self.addCleanup(mod._CLAMP_LOGGED.clear)
+
+    def _run(self, run_wdm, h_td, alpha):
+        from lisatools.globalfit.moves.mbhbatchedmove import mbh_window_layers
+        from lisatools.sources.batching import MBHWindowedWDMSignalGen
+
+        g = mbh_window_layers(run_wdm, 64 * NF * DT, **self.HUGE)
+        sg = MBHWindowedWDMSignalGen(_SegmentGen(h_td), run_wdm, nchannels=3, tukey_alpha=alpha)
+        sg.set_window(g["n_start"], g["Nt_keep"], g["n_pad_lo"], g["n_pad_hi"])
+        full = _wdm()   # the uncropped grid: kept layers are ABSOLUTE layers
+        window = lat_tukey(N, alpha, xp=np) if alpha > 0 else None
+        ref = TDSignal(h_td, TDSettings(N, DT, force_backend="cpu")).transform(full, window=window).arr
+        kept = ref[..., g["n_start"]: g["n_start"] + g["Nt_keep"]]
+        out = np.asarray(sg(1.0).arr)
+        return g, sg.geometry, float(np.abs(out - kept).max() / np.abs(kept).max())
+
+    def test_whole_grid_segment_equals_the_full_grid_transform(self):
+        for alpha in (0.0, 0.3):
+            # a chirp reaching both grid edges: no pad absorbs anything here
+            g, a, err = self._run(_wdm(), _chirp(0, 128), alpha)
+            self.assertEqual((g["n_start"], g["Nt_keep"], g["n_pad_lo"], g["n_pad_hi"]), (0, NT, 0, 0))
+            self.assertEqual((a["s0"], a["Nt_seg"]), (0, NT))
+            print(f"[whole-grid clamp, alpha={alpha}] kept-layer max rel err {err:.3e}")
+            self.assertLess(err, 1e-12)
+
+    def test_cropped_active_box_keeps_the_box_and_the_whole_grid(self):
+        """Active box [4, 124) of the 128-layer grid: kept box = the active
+        box, segment = the whole grid (pads 4 / 4) -- again the stock
+        full-grid transform restricted to the active box."""
+        run = WDMSettings(NF, NT, DT, min_time=4 * NF * DT, max_time=123.5 * NF * DT, force_backend="cpu")
+        self.assertEqual((int(run.ind_min_t), int(run.ind_max_t) + 1), (4, 124))
+        g, a, err = self._run(run, _chirp(2, 126), 0.0)
+        self.assertEqual((g["n_start"], g["Nt_keep"], g["n_pad_lo"], g["n_pad_hi"]), (4, 120, 4, 4))
+        self.assertEqual((a["s0"], a["Nt_seg"]), (0, NT))
+        print(f"[whole-grid clamp, cropped active box] kept-layer max rel err {err:.3e}")
+        self.assertLess(err, 1e-12)
+
+
 class WindowedLeadCoversZeroedHeadTest(unittest.TestCase):
     """No phentax: ``_apply_response`` zeros the first ``buffer_time / dt``
     output samples of the lattice (15000 s by default) -- far more than the

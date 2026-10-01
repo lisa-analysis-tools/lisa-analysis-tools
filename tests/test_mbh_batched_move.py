@@ -191,8 +191,10 @@ class WindowLayersTest(unittest.TestCase):
         hi = mbh_window_layers(wdm, T0 + 127 * LAYER, **WINDOW)
         self.assertEqual(hi["n_start"] + hi["Nt_keep"], NT)
         self.assertEqual((hi["n_pad_hi"], hi["n_pad_lo"]), (0, 2 * hi["n_pad"]))
-        with self.assertRaises(ValueError):
-            mbh_window_layers(wdm, T0 + 64 * LAYER, window_before=100 * LAYER, window_after=100 * LAYER, window_pad=LAYER, window_margin=0.0)
+        # a window longer than the data no longer raises (2026-09-30): it is
+        # clamped to the whole grid (WindowClampShortSpanTest)
+        big = mbh_window_layers(wdm, T0 + 64 * LAYER, window_before=100 * LAYER, window_after=100 * LAYER, window_pad=LAYER, window_margin=0.0)
+        self.assertEqual((big["n_start"], big["Nt_keep"], big["n_pad_lo"], big["n_pad_hi"]), (0, NT, 0, 0))
 
     def test_absolute_layer0_time_overrides_settings_t0(self):
         """Stock erebor build: the settings carry t0 = 0 while the merger time
@@ -302,6 +304,167 @@ class WindowEdgeProductionGeometryTest(unittest.TestCase):
         self.assertEqual(g["n_start"], lo_a)
         self.assertEqual(g["n_pad_lo"], min(g["n_pad"], lo_a))
         self._adapter_accepts(wdm, g)
+
+
+class WindowClampShortSpanTest(unittest.TestCase):
+    """Data spans SHORTER than the window (2026-09-30: batched is the default,
+    so a 3-month run and the lite smokes must build). The configured window
+    is clamped -- kept box to the active box, segment to the grid, pads
+    shrinking to what fits (possibly 0) -- logged once; only a geometry with
+    no valid segment raises."""
+
+    L = WindowEdgeProductionGeometryTest.L
+    T0D = WindowEdgeProductionGeometryTest.T0D
+    PROD = WindowEdgeProductionGeometryTest.PROD
+    _adapter_accepts = WindowEdgeProductionGeometryTest._adapter_accepts
+    _covers = WindowEdgeProductionGeometryTest._covers
+    LOGGER = "lisatools.globalfit.moves.mbhbatchedmove"
+
+    def setUp(self):
+        import lisatools.globalfit.moves.mbhbatchedmove as mod
+
+        mod._CLAMP_LOGGED.clear()
+        self.addCleanup(mod._CLAMP_LOGGED.clear)
+
+    def _wdm(self, nt, **kw):
+        return WDMSettings(32, nt, self.L / 32, t0=self.T0D, force_backend="cpu", **kw)
+
+    def test_three_month_grid_clamps_to_the_whole_active_box_and_grid(self):
+        """90-day grid (180 x 12-h layers), 2-layer edge crop: the 102-d box
+        cannot fit, so the kept box is the whole active box [2, 178) and the
+        segment the whole grid (pads 2 / 2) for EVERY merger time -- logged
+        once, never again."""
+        import logging
+
+        from lisatools.globalfit.moves.mbhbatchedmove import mbh_window_layers
+
+        wdm = self._wdm(180, min_time=2 * self.L, max_time=178.5 * self.L)
+        self.assertEqual((int(wdm.ind_min_t), int(wdm.ind_max_t) + 1), (2, 179))
+        act_lo, act_hi = 2, 179
+        with self.assertLogs(self.LOGGER, logging.INFO) as cm:
+            first = mbh_window_layers(wdm, self.T0D + 45 * 86400.0, **self.PROD)
+        self.assertEqual(len(cm.output), 1)
+        self.assertIn("window clamped to the data span", cm.output[0])
+        self.assertIn("(the whole active box)", cm.output[0])
+        self.assertIn("(the whole grid)", cm.output[0])
+        with self.assertNoLogs(self.LOGGER, logging.INFO):
+            for day in np.arange(0.25, 90.0, 1.0):
+                t_m = self.T0D + day * 86400.0
+                g = mbh_window_layers(wdm, t_m, **self.PROD)
+                self.assertEqual(g, first)                      # merger-independent
+                if act_lo * self.L <= day * 86400.0 < act_hi * self.L:
+                    self.assertTrue(self._covers(wdm, g, t_m), (day, g))
+        self.assertEqual((first["n_start"], first["Nt_keep"]), (act_lo, act_hi - act_lo))
+        self.assertEqual((first["n_pad_lo"], first["n_pad_hi"]), (2, 1))
+        self.assertEqual(first["n_pad"], 8)                     # the CONFIGURED pad
+        a = self._adapter_accepts(wdm, first)
+        self.assertEqual((a["s0"], a["Nt_seg"]), (0, 180))      # the whole grid
+
+    def test_segment_only_clamp_shrinks_the_pads(self):
+        """105-day grid: the kept box fits (206 layers) but box + 2 x 8 pad
+        layers does not -- the segment becomes the whole grid and the pads
+        shrink to the 4 spare layers, split by where the box sits."""
+        from lisatools.globalfit.moves.mbhbatchedmove import mbh_window_layers
+
+        wdm = self._wdm(210)
+        for day in (2.0, 92.0, 93.5, 104.0):
+            t_m = self.T0D + day * 86400.0
+            g = mbh_window_layers(wdm, t_m, **self.PROD)
+            self.assertEqual(g["Nt_keep"], 206)
+            self.assertEqual(g["n_pad_lo"] + g["n_pad_hi"], 210 - 206)
+            self.assertGreaterEqual(min(g["n_pad_lo"], g["n_pad_hi"]), 0)
+            self.assertTrue(self._covers(wdm, g, t_m), (day, g))
+            a = self._adapter_accepts(wdm, g)
+            self.assertEqual((a["s0"], a["Nt_seg"]), (0, 210))
+
+    def test_odd_clamped_box_gets_the_spare_layer_as_pad(self):
+        """Active box of 195 layers inside a 240-layer grid: the kept box is
+        the (odd) active box and the segment 195 + 16 + 1 = 212 layers (even)
+        with the spare layer as high pad; the adapter's even-start rule still
+        holds at an even and at an odd segment start."""
+        from lisatools.globalfit.moves.mbhbatchedmove import mbh_window_layers
+
+        for lo, s0_expect in ((20, 12), (21, 13)):
+            wdm = self._wdm(240, min_time=lo * self.L, max_time=(lo + 194.5) * self.L)
+            self.assertEqual((int(wdm.ind_min_t), int(wdm.ind_max_t) + 1), (lo, lo + 195))
+            g = mbh_window_layers(wdm, self.T0D + 60 * 86400.0, **self.PROD)
+            self.assertEqual((g["n_start"], g["Nt_keep"]), (lo, 195))
+            self.assertEqual((g["n_pad_lo"], g["n_pad_hi"]), (8, 9))
+            self.assertEqual(g["n_start"] - g["n_pad_lo"], s0_expect)
+            a = self._adapter_accepts(wdm, g)
+            self.assertEqual(a["Nt_seg"] % 2, 0)
+
+    def test_a_fitting_window_is_not_clamped_or_logged(self):
+        import logging
+
+        from lisatools.globalfit.moves.mbhbatchedmove import mbh_window_layers
+
+        wdm = self._wdm(240)
+        with self.assertNoLogs(self.LOGGER, logging.INFO):
+            g = mbh_window_layers(wdm, self.T0D + 60 * 86400.0, **self.PROD)
+        self.assertEqual(g["n_pad_lo"] + g["n_pad_hi"], 2 * g["n_pad"])
+        self.assertEqual(g["Nt_keep"], 206)
+
+    def test_impossible_geometry_still_raises(self):
+        """No valid segment: an empty active box, or a whole-grid segment on an
+        odd-length grid (not a valid WDM grid; duck-typed stubs)."""
+        from types import SimpleNamespace
+
+        from lisatools.globalfit.moves.mbhbatchedmove import mbh_window_layers
+
+        empty = SimpleNamespace(layer_dt=self.L, t0=0.0, Nt=180, ind_min_t=10, ind_max_t=9)
+        with self.assertRaisesRegex(ValueError, "cannot be placed"):
+            mbh_window_layers(empty, 50 * self.L, **self.PROD)
+        odd = SimpleNamespace(layer_dt=self.L, t0=0.0, Nt=181, ind_min_t=0, ind_max_t=180)
+        with self.assertRaisesRegex(ValueError, "cannot be placed"):
+            mbh_window_layers(odd, 50 * self.L, **self.PROD)
+        # the same odd grid is fine when the clamped segment stays inside it
+        odd_wide = SimpleNamespace(layer_dt=self.L, t0=0.0, Nt=241, ind_min_t=20, ind_max_t=214)
+        g = mbh_window_layers(odd_wide, 60 * 86400.0, **self.PROD)
+        self.assertEqual((g["Nt_keep"], g["n_pad_lo"] + g["n_pad_hi"]), (195, 17))
+
+
+#: A window far longer than the toy grid (128 layers): clamped to the whole
+#: grid with zero pads -- the stock full-grid transform.
+WINDOW_HUGE = dict(window_before=200 * LAYER, window_after=10 * LAYER, window_pad=8 * LAYER, window_margin=1 * LAYER)
+
+
+class MBHBatchedWholeGridClampParityTest(unittest.TestCase):
+    """The batched move on a CLAMPED (whole-grid, zero-pad) window equals the
+    container path: a whole-grid segment IS the stock full-grid transform, so
+    the parity is at float rounding, far inside the windowed 5e-2 bound."""
+
+    def test_whole_grid_window_matches_container_path(self):
+        import lisatools.globalfit.moves.mbhbatchedmove as mod
+
+        mod._CLAMP_LOGGED.clear()
+        self.addCleanup(mod._CLAMP_LOGGED.clear)
+        acs, adapter, fast, wdm = _build()
+        move = _build_move(acs, adapter, **WINDOW_HUGE)
+        before = [np.array(ac.data.arr, copy=True) for ac in acs.acs.flatten()]
+        cold = _cold_rows()
+        move.remove_cold_chain_sources(cold)          # expose (batched fill)
+        move.setup_likelihood_here(cold)
+        g = move._leaf_windows[0]
+        self.assertEqual((g["n_start"], g["Nt_keep"], g["n_pad_lo"], g["n_pad_hi"]), (0, NT, 0, 0))
+        self.assertEqual((adapter.geometry["s0"], adapter.geometry["Nt_seg"]), (0, NT))
+        rows = _proposal_rows(6)
+        idx = np.array([0, 1, 2, 1, 0, 1])
+        fast_ll = move.compute_like(rows, idx)
+        slow_ll = move.compute_acs_like(rows, idx)
+        d = float(np.abs(fast_ll - slow_ll).max())
+        # template-level: windowed (whole-grid segment) vs the stock full-grid transform
+        tmpl = np.asarray(move._on_container_box(move._generate(adapter, rows[:2])).arr)
+        ref = np.stack([np.asarray(_slow_gen(*r).arr) for r in rows[:2]])
+        rel = float(np.abs(tmpl - ref).max() / np.abs(ref).max())
+        print(f"[mbh batched whole-grid clamp] max |fast-slow| = {d:.3e} on lnL ~ "
+              f"{np.abs(slow_ll).max():.3e}; template max rel diff {rel:.3e}")
+        self.assertLess(rel, 1e-12)
+        np.testing.assert_allclose(fast_ll, slow_ll, rtol=0, atol=1e-6)
+        self.assertEqual(move.n_batch_fallbacks, 0)
+        move.add_back_in_cold_chain_sources(cold)     # fold-back restores the residual
+        for ac, b in zip(acs.acs.flatten(), before):
+            np.testing.assert_allclose(ac.data.arr, b, rtol=0, atol=1e-12 * np.abs(b).max())
 
 
 class MBHBatchedParityTest(unittest.TestCase):
@@ -850,12 +1013,21 @@ class MBHBatchedRoutingTest(unittest.TestCase):
         self.assertEqual(move._grid_t0_abs(), 9.7e7)   # a run constant: cached
 
     def test_ctor_guards(self):
+        from unittest import mock
+
+        import lisatools.globalfit.moves.mbhbatchedmove as mod
+
         acs, adapter, fast, wdm = _build()
         with self.assertRaises(ValueError):
             _build_move(acs, None)
-        # a window that cannot fit the grid fails at BUILD, not at the first leaf
-        with self.assertRaisesRegex(ValueError, "does not fit the WDM grid"):
-            _build_move(acs, adapter, window_before=200 * LAYER)
+        # a window longer than the data BUILDS (clamped; 2026-09-30) ...
+        move = _build_move(acs, adapter, window_before=200 * LAYER)
+        self.assertEqual(move.window_before, 200 * LAYER)
+        # ... and the geometry is still validated at BUILD, not at the first
+        # leaf: an impossible geometry (mbh_window_layers raises) fails here
+        with mock.patch.object(mod, "mbh_window_layers", side_effect=ValueError("no geometry")):
+            with self.assertRaisesRegex(ValueError, "no geometry"):
+                _build_move(acs, adapter)
         from eryn.moves import StretchMove
         from eryn.prior import ProbDistContainer, uniform_dist
         from lisatools.globalfit.moves import MBHBatchedLikeMove

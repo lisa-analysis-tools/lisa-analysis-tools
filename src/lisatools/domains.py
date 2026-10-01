@@ -1179,6 +1179,10 @@ class FDSettings(DomainSettingsBase):
                 N=Nf, df=df, min_freq=min_freq, max_freq=max_freq,
                 force_backend=force_backend,
             )
+        # The class the factory builds, readable BEFORE it is called (a run
+        # configured with the factory can dispatch on its domain at config
+        # time, e.g. the stock MBH_LIKELIHOOD=auto resolution).
+        _factory.domain_settings_class = FDSettings
         return _factory
 
     @property
@@ -1766,6 +1770,7 @@ class STFTSettings(DomainSettingsBase):
                 min_freq=min_freq, max_freq=max_freq,
                 force_backend=force_backend,
             )
+        _factory.domain_settings_class = STFTSettings  # see FDSettings.make_factory
         return _factory
 
     @staticmethod
@@ -2297,6 +2302,7 @@ class WDMSettings(DomainSettingsBase):
                 min_time=min_time, max_time=max_time,
                 force_backend=force_backend,
             )
+        _factory.domain_settings_class = WDMSettings  # see FDSettings.make_factory
         return _factory
 
     @staticmethod
