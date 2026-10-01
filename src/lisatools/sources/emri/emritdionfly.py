@@ -296,8 +296,12 @@ class EMRITDIonFly:
         mode_amp, mode_phase = self.mode_amp_phase(
             Kerr_wave, include_minus_mkn=include_minus_mkn, amp_factor=self.AMP_FACTOR
         )
+        return self.prepare_feed_arrays(np.asarray(Kerr_wave.t_arr, dtype=float), mode_amp, mode_phase)
 
-        t_src = np.asarray(Kerr_wave.t_arr, dtype=float)
+    def prepare_feed_arrays(self, t_src, mode_amp, mode_phase):
+        """(t_src [FEW clock], amp (S, n), phase (S, n)) -> (t_arr_in, mode_amp, mode_phase, t_arr_tdi):
+        zero-amplitude continuation past an in-window stop and the delay-margin trim."""
+        t_src = np.asarray(t_src, dtype=float)
         if self.n_fine is not None and t_src.size > 2:
             # A plunge inside the requested window: FEW's fix_t cut the fine grid at the
             # trajectory end, and the delay trim below would then drop the last

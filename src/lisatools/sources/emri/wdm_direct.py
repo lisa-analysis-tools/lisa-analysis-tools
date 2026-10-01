@@ -299,6 +299,16 @@ def _accumulate_harmonic_batch_loop(acc, table, tracks, tracer, n_ok, tail_td, *
     return stats
 
 
+def feed_from_tracks(tracks, amp_factor):
+    """Per-sub (amp, phase) with h = sum amp exp(-i phase) from harmonic tracks on the feed grid.
+
+    A track term is ``track.amp * exp(-i track.phase)`` (FEW's mode sum, -m partners included),
+    so amp = |track.amp| * amp_factor and phase = track.phase - unwrap(arg(track.amp))."""
+    amp = np.stack([np.abs(tr.amp) for tr in tracks]) * amp_factor
+    phase = np.stack([tr.phase - np.unwrap(np.angle(tr.amp)) for tr in tracks])
+    return amp, phase
+
+
 def slice_holder(H, idx):
     """The host holder restricted to modes ``idx`` (m >= 0 rows; the -m partners' Ylm follow)."""
     import types
@@ -361,7 +371,7 @@ class EMRIDirectWDM:
 
     def __init__(self, few_gen, table, wdm_set, *, orbits, tdi_config, t_start, data_t0,
                  Nt_sub=128, n_fine=None, fine_dt=1800.0, fine_dt_plunge=80.0, mode_batch=None,
-                 pixel_edge=8, num_m_layers=2, interp="spline", force_backend="cpu"):
+                 pixel_edge=8, num_m_layers=2, interp="spline", force_backend="cpu", feed="knots"):
         self.few_gen, self.table, self.wdm = few_gen, table, wdm_set
         self.orbits, self.tdi_config = orbits, tdi_config
         self.t_start, self.data_t0 = float(t_start), float(data_t0)
@@ -371,6 +381,12 @@ class EMRIDirectWDM:
         # puts ~2.5e-4 of its energy two layers away (A8 gate); needs table support [-2, 3) df
         self.num_m_layers = int(os.environ.get("EMRI_DIRECT_NUM_M_LAYERS", num_m_layers))
         span = wdm_set.Nt * wdm_set.layer_dt
+        if feed not in ("knots", "fine"):
+            raise ValueError("feed must be 'knots' or 'fine'")
+        # "knots": FEW amplitudes at the integrator knots, splined to the response grid, phases
+        # from the integrator's dense output (production's construction; the cheap FEW call).
+        # "fine": FEW evaluates amplitudes at every fine point (the earlier feed).
+        self.feed = feed
         self.n_fine_fixed = int(n_fine) if n_fine is not None else None
         self.fine_dt, self.fine_dt_plunge = float(fine_dt), float(fine_dt_plunge)
         self.n_fine = self.n_fine_fixed or max(64, int(span / self.fine_dt_plunge))   # set per call
@@ -413,6 +429,32 @@ class EMRIDirectWDM:
             self.few_gen.inspiral_kwargs.update(saved)
         return host_holder(H)                               # GPU generator: cupy -> host
 
+    def _few_knots(self, few_args, few_kwargs, mode_selection=None):
+        """ONE FEW call on the integrator's own knots (no upsampling: amplitudes at ~10^2-10^3
+        knots, as the production mode sum) -> host sparse holder; mode selection by the call's
+        threshold unless ``mode_selection`` is given."""
+        from few.utils.utility import get_viewing_angles
+
+        from .emritdionfly import host_holder
+
+        m1, m2, a, p0, e0, x0, dist, qS, phiS, qK, phiK, Pp, Pt, Pr = few_args[:14]
+        th, ph = get_viewing_angles(qS, phiS, qK, phiK)
+        kw = {k: v for k, v in few_kwargs.items() if k != "inspiral_kwargs"}
+        if mode_selection is not None:
+            kw.pop("mode_selection_threshold", None)
+            kw["mode_selection"] = [tuple(int(v) for v in md) for md in mode_selection]
+        span = self.wdm.Nt * self.wdm.layer_dt
+        T = (self.data_t0 - self.t_start + span + 2000.0) / 3.15581497635456e7
+        saved = dict(self.few_gen.inspiral_kwargs)
+        try:
+            H = self.few_gen(m1, m2, a, p0, e0, x0, th, ph, dist=dist, Phi_phi0=Pp, Phi_theta0=Pt,
+                             Phi_r0=Pr, T=T, dt=self.wdm.data_dt, return_sparse_holder=True,
+                             include_minus_mkn=True, **kw)
+        finally:
+            self.few_gen.inspiral_kwargs.clear()
+            self.few_gen.inspiral_kwargs.update(saved)
+        return host_holder(H)
+
     def _pixel_times(self, H):
         """Pixel indices (and times, FEW clock) inside the holder's trajectory span."""
         t_arr = np.asarray(H.t_arr)
@@ -427,7 +469,10 @@ class EMRIDirectWDM:
 
         One FEW call on the coarse fine grid; the holder and its harmonic tracks are kept
         (``_last_holder``, ``_last_tracks``) so the template reuses them."""
-        H = self._few_holder(few_args, few_kwargs, self._fine_grid(None))
+        if self.feed == "knots":
+            H = self._few_knots(few_args, few_kwargs, mode_selection=few_kwargs.get("mode_selection"))
+        else:
+            H = self._few_holder(few_args, few_kwargs, self._fine_grid(None))
         modes = [(int(l), int(m), int(k), int(n)) for l, m, k, n in zip(H.ls, H.ms, H.ks, H.ns)]
         n_in, t_rel = self._pixel_times(H)
         integ = self.few_gen.inspiral_generator.inspiral_generator
@@ -471,9 +516,78 @@ class EMRIDirectWDM:
         dense = np.append(np.arange(d0, b, self.fine_dt_plunge), b)
         return np.union1d(coarse[coarse < d0], dense)
 
+    def _knots_feed(self, H, few_args, t_fine, fly):
+        """Response feed on ``t_fine`` from the knots holder ``H``: amplitudes splined over the
+        knots, phases from the integrator's dense output (call right after H's FEW call: the
+        integrator holds H's trajectory). Returns ``fly.prepare_feed_arrays(...)``."""
+        from .emritdionfly import EMRITDIonFly
+
+        t_end = float(np.asarray(H.t_arr)[-1])
+        t_src = t_fine[t_fine <= t_end]
+        if t_src[-1] < t_end - 1e-6:
+            t_src = np.append(t_src, t_end)
+        integ = self.few_gen.inspiral_generator.inspiral_generator
+        tr = harmonic_tracks_from_holder(H, integ, t_src, a=few_args[2], xI0=few_args[5])
+        amp, ph = feed_from_tracks(tr, EMRITDIonFly.AMP_FACTOR)
+        return fly.prepare_feed_arrays(t_src, amp, ph)
+
+    def _call_knots(self, few_args, few_kwargs, modes):
+        from ...domains import WDMSignal
+        from .emritdionfly import EMRITDIonFly
+
+        wdm = self.wdm
+        Nf, Nt, dt, ldt, ldf = wdm.Nf, wdm.Nt, wdm.data_dt, wdm.layer_dt, wdm.layer_df
+        span = Nt * ldt
+        n_all = np.arange(self.pixel_edge, Nt - self.pixel_edge)
+        t_pix = self.data_t0 + n_all * ldt
+        T_traj = self.data_t0 - self.t_start + span + 2000.0
+        xp = self.xp
+        acc = xp.zeros((self.tdi_config.nchannels, Nf, Nt))
+        kw = dict(few_kwargs)
+        if modes is not None:
+            kw["mode_selection"] = modes
+        modes, chunk_start = self._mode_list(few_args, kw)
+        H, tracks_pix, n_tr = self._last_holder, self._last_tracks, self._last_track_n
+        t_fine = self._fine_grid(chunk_start)
+        self.n_fine, self.last_t_fine = int(t_fine.size), t_fine
+        fly = EMRITDIonFly(self.few_gen, self.orbits, self.tdi_config, dt, T_traj, self.t_start,
+                           frame="icrs_special", t_fine_window=(self.data_t0, self.data_t0 + span), t_fine=t_fine)
+        _, _, psi, lam, beta = fly.sky(few_args[7], few_args[8], few_args[9], few_args[10])
+        feed = self._knots_feed(H, few_args, t_fine, fly)
+        out = fly.run_response([tuple(feed) + (psi, lam, beta)])
+        x = np.asarray(out.x.get() if hasattr(out.x, "get") else out.x)
+        t_traj_end = float(np.asarray(H.t_arr)[-1])
+        ok_t = (t_pix > x[:, 0].max()) & (t_pix < x[:, -1].min()) & (t_pix - self.t_start <= t_traj_end)
+        n_ok, tt = n_all[ok_t], t_pix[ok_t]
+        totals = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
+        if n_ok.size:
+            pos = np.searchsorted(n_tr, n_ok)
+            assert np.array_equal(n_tr[pos], n_ok)
+            tracks = [subset_track(t, pos) for t in tracks_pix]
+            tracer = tracer_from_tof_output(out, xp.asarray(tt))
+            assert tracer[0].shape[0] == len(tracks), (tracer[0].shape, len(tracks))
+
+            def tail_td(ts, out=out, x_lo=float(x[:, 0].max()), x_hi=float(x[:, -1].min())):
+                live = (ts > x_lo) & (ts < x_hi)
+                td = xp.zeros((x.shape[0], tracer[0].shape[1], ts.size))
+                if bool(xp.any(live)):
+                    td[:, :, live] = xp.asarray(out.eval_tdi(ts[live]))
+                return td
+
+            totals = accumulate_harmonic_batch(
+                acc, self.table, tracks, tracer, n_ok, tail_td, Nf=Nf, Nt=Nt, dt=dt, layer_dt=ldt,
+                layer_df=ldf, t0=self.data_t0, Nt_sub=self.Nt_sub, num_m_layers=self.num_m_layers,
+                fdot_axis_max=self.fdot_axis_max, pixel_edge=self.pixel_edge, backend=self.force_backend)
+        self.last_stats = dict(modes=len(modes), n_fine=self.n_fine, feed="knots", chunk_start=chunk_start, **totals)
+        return WDMSignal(acc, wdm)
+
     def __call__(self, *few_args, **few_kwargs):
         from ...domains import WDMSignal
         from .emritdionfly import EMRITDIonFly
+
+        if self.feed == "knots" and self.n_fine_fixed is None:
+            kw = dict(few_kwargs)
+            return self._call_knots(few_args, kw, kw.pop("mode_selection", None))
 
         wdm = self.wdm
         Nf, Nt, dt, ldt, ldf = wdm.Nf, wdm.Nt, wdm.data_dt, wdm.layer_dt, wdm.layer_df
@@ -556,7 +670,31 @@ class EMRIDirectWDM:
                                chunk_start=None if chunk_start == "unknown" else chunk_start, **totals)
         return WDMSignal(acc, wdm)
 
-    def batch(self, rows, **few_kwargs):
+    def batch(self, rows, chunk_rows=16, consume=None, **few_kwargs):
+        """Templates for many parameter rows, ``chunk_rows`` per response call (bounds GPU memory:
+        one 6-month production-grid template is ~150 MB of WDM coefficients).
+
+        ``consume(row_indices, arr)`` (optional) receives each chunk's ``(n, nch, Nf, Nt)`` array
+        and nothing is kept; otherwise the full ``(n_rows, nch, Nf, Nt)`` array is returned.
+        ``last_stats`` sums the chunks' stats."""
+        rows = list(rows)
+        parts, tot = [], {}
+        for i in range(0, len(rows), max(1, int(chunk_rows))):
+            idx = list(range(i, min(i + int(chunk_rows), len(rows))))
+            arr = self._batch_chunk([rows[k] for k in idx], **few_kwargs)
+            for k, v in self.last_stats.items():
+                tot[k] = tot.get(k, 0) + v if isinstance(v, (int, float)) else v
+            if consume is not None:
+                consume(idx, arr)
+                del arr
+            else:
+                parts.append(arr)
+        self.last_stats = tot
+        if consume is not None:
+            return None
+        return parts[0] if len(parts) == 1 else self.xp.concatenate(parts, axis=0)
+
+    def _batch_chunk(self, rows, **few_kwargs):
         """Many templates with ONE TDI-on-the-fly response call, ONE tracer and ONE lookup.
 
         ``rows``: parameter rows (as for ``__call__``). FEW runs once per row (it is a
@@ -589,7 +727,10 @@ class EMRIDirectWDM:
                 continue
             H = self._last_holder
             _, _, psi, lam, beta = fly.sky(p[7], p[8], p[9], p[10])
-            t_in, amp, ph, t_tdi = fly.prepare_feed(H, True)
+            if self.feed == "knots":
+                t_in, amp, ph, t_tdi = self._knots_feed(H, p, t_fine, fly)
+            else:
+                t_in, amp, ph, t_tdi = fly.prepare_feed(H, True)
             feeds.append((t_in, amp, ph, t_tdi, psi, lam, beta))
             tracks.append(self._last_tracks)
             n_trs.append(self._last_track_n)
