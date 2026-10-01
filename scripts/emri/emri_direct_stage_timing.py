@@ -36,7 +36,8 @@ def main():
     ap.add_argument("--orbits", choices=("auto", "l1", "equal-arm"), default="auto")
     ap.add_argument("--direct-table", required=True)
     ap.add_argument("--batch-rows", type=int, default=0,
-                    help="also time EMRIDirectWDM.batch over this many parameter rows (one response call)")
+                    help="also time EMRIDirectWDM.batch over this many parameter rows")
+    ap.add_argument("--chunk-rows", type=int, default=16, help="rows per response call in the batch")
     args = ap.parse_args()
 
     from lisatools.domains import TDSettings, TDSignal, WDMLookupTable, WDMSettings
@@ -139,15 +140,16 @@ def main():
             print(f"  {k:48s} {T[k] / args.reps * 1e3:8.1f} ms  ({C[k] // args.reps} calls)", flush=True)
         if args.batch_rows > 0:
             rows = B.batch_rows(params, args.batch_rows)
-            direct.batch(rows[:2], mode_selection_threshold=thr)        # warm-up
+            sink = lambda idx, arr: None                                 # noqa: E731 (timing only)
+            direct.batch(rows[:2], chunk_rows=args.chunk_rows, consume=sink, mode_selection_threshold=thr)
             sync()
             T.clear()
             C.clear()
             t0 = time.perf_counter()
-            direct.batch(rows, mode_selection_threshold=thr)
+            direct.batch(rows, chunk_rows=args.chunk_rows, consume=sink, mode_selection_threshold=thr)
             sync()
             t_b = time.perf_counter() - t0
-            print(f"[stages] thr={thr:g} BATCH of {len(rows)}: {t_b * 1e3:.0f} ms total = "
+            print(f"[stages] thr={thr:g} BATCH of {len(rows)} ({args.chunk_rows} per call): {t_b * 1e3:.0f} ms total = "
                   f"{t_b / len(rows) * 1e3:.0f} ms per template (production {t_prod * 1e3:.0f}) {direct.last_stats}",
                   flush=True)
             for k in [lab for lab in LABELS if lab in T]:
