@@ -639,13 +639,28 @@ def _apply_stft_add(target, sign, template_arr, template_settings):
 
 
 def _apply_wdm_add(target, sign, template_arr, template_settings):
-    """Add ``sign * template_arr`` (WDM) to ``target.arr``; shapes must already match."""
-    if target.arr.shape[-2:] != template_arr.shape[-2:]:
+    """Add ``sign * template_arr`` (WDM) to ``target.arr``.
+
+    Same active box: plain in-place add (unchanged behaviour). A template whose
+    active box is a SUB-BOX of the target's -- same grid (``Nf``, ``Nt``,
+    ``dt``, ``t0``), ``ind_min/max`` inside -- is added into that box (the MBH
+    batched windowed templates, 2026-09-29). Anything else raises.
+    """
+    ts = template_settings
+    same_origin = (
+        int(ts.ind_min_f) == int(target.ind_min_f)
+        and int(ts.ind_min_t) == int(target.ind_min_t)
+    )
+    if target.arr.shape[-2:] == template_arr.shape[-2:] and same_origin:
+        target.arr[...] += sign * template_arr
+        return
+    f_sl, t_sl = target.sub_box_slices(ts)
+    if tuple(template_arr.shape[-2:]) != (f_sl.stop - f_sl.start, t_sl.stop - t_sl.start):
         raise ValueError(
-            f"WDM add_signal requires matching (Nf_active, Nt_active) shapes; "
-            f"got data {target.arr.shape[-2:]} vs template {template_arr.shape[-2:]}."
+            f"WDM add_signal: template array {tuple(template_arr.shape[-2:])} does "
+            f"not match its box {(f_sl.stop - f_sl.start, t_sl.stop - t_sl.start)}."
         )
-    target.arr[...] += sign * template_arr
+    target.arr[..., f_sl, t_sl] += sign * template_arr
 
 
 class TDSettings(DomainSettingsBase):
@@ -2395,6 +2410,88 @@ class WDMSettings(DomainSettingsBase):
             and (value.data_dt == self.data_dt)
             and (bool(getattr(value, "is_complex", False)) == bool(self.is_complex))
         )
+
+    def sub_box_slices(self, other: "WDMSettings") -> Tuple[slice, slice]:
+        """``(f_slice, t_slice)`` locating ``other``'s active box inside this one's.
+
+        Slices are RELATIVE to this settings' active box (the axes of an
+        ``(Nf_active, Nt_active)`` array), i.e. the index
+        :meth:`get_slice` / :meth:`DomainBase.get_array_slice` take. The ONE
+        place the sub-box rules live, shared by the WDM ``add_signal`` path and
+        :meth:`AnalysisContainer._slice_wdm_to_template`: both must share the
+        wavelet grid (``Nf``, ``Nt``, ``dt``, ``t0``) and ``other``'s box must
+        lie inside this one's; anything else raises ``ValueError``.
+        """
+        if not self.eq_without_inds(other) or abs(
+            float(other.t0) - float(self.t0)
+        ) > 1e-6 * float(self.data_dt):
+            raise ValueError(
+                "WDM template and data must share the wavelet grid (Nf, Nt, dt, "
+                f"t0); got template Nf={other.Nf} Nt={other.Nt} dt={other.data_dt} "
+                f"t0={other.t0} vs data Nf={self.Nf} Nt={self.Nt} dt={self.data_dt} "
+                f"t0={self.t0}."
+            )
+        f0 = int(other.ind_min_f) - int(self.ind_min_f)
+        f1 = int(other.ind_max_f) - int(self.ind_min_f) + 1
+        t0 = int(other.ind_min_t) - int(self.ind_min_t)
+        t1 = int(other.ind_max_t) - int(self.ind_min_t) + 1
+        if f0 < 0 or t0 < 0 or f1 > int(self.Nf_active) or t1 > int(self.Nt_active):
+            raise ValueError(
+                f"WDM template box f[{other.ind_min_f}:{other.ind_max_f}] "
+                f"t[{other.ind_min_t}:{other.ind_max_t}] is not inside the data box "
+                f"f[{self.ind_min_f}:{self.ind_max_f}] "
+                f"t[{self.ind_min_t}:{self.ind_max_t}]."
+            )
+        return slice(f0, f1), slice(t0, t1)
+
+    def get_slice(self, index: tuple) -> "WDMSettings":
+        """Settings for a SUB-BOX of this settings' active box.
+
+        ``index = (f_slice, t_slice)`` is RELATIVE to the active box -- the
+        same index :meth:`DomainBase.get_array_slice` applies to the stored
+        ``(Nf_active, Nt_active)`` array, so array and settings stay in step.
+        The grid (``Nf``, ``Nt``, ``dt``, ``t0``, window) is unchanged; only
+        ``ind_min/max_{f,t}`` narrow.
+
+        The result is rebuilt through the PHYSICAL ``min/max_*`` setters,
+        because every ``WDMSignal`` reconstructs its settings from
+        ``(args, kwargs)`` and ``kwargs`` carries those inputs, not the
+        indices: setting ``ind_*`` directly would be undone by the next
+        reconstruction. Half-bin offsets make the setters' ceil/floor land
+        exactly on the requested integers; the result is checked.
+        """
+        if not isinstance(index, tuple) or len(index) != 2:
+            raise ValueError("WDMSettings.get_slice expects (f_slice, t_slice).")
+        f_sl, t_sl = index
+        for sl in (f_sl, t_sl):
+            if not isinstance(sl, slice) or sl.step not in (None, 1):
+                raise ValueError(
+                    "WDMSettings.get_slice: slices must be contiguous (step 1)."
+                )
+        f_lo, f_hi, _ = f_sl.indices(int(self.Nf_active))
+        t_lo, t_hi, _ = t_sl.indices(int(self.Nt_active))
+        if f_hi <= f_lo or t_hi <= t_lo:
+            raise ValueError(f"WDMSettings.get_slice: empty slice {index!r}.")
+        want = (
+            int(self.ind_min_f) + f_lo,
+            int(self.ind_min_f) + f_hi - 1,
+            int(self.ind_min_t) + t_lo,
+            int(self.ind_min_t) + t_hi - 1,
+        )
+        kw = dict(self.kwargs)
+        kw.update(
+            min_freq=None if want[0] == 0 else (want[0] - 0.5) * self.layer_df,
+            max_freq=(want[1] + 0.5) * self.layer_df,
+            min_time=None if want[2] == 0 else (want[2] - 0.5) * self.layer_dt,
+            max_time=(want[3] + 0.5) * self.layer_dt,
+        )
+        new = WDMSettings(*self.args, **kw)
+        got = (int(new.ind_min_f), int(new.ind_max_f), int(new.ind_min_t), int(new.ind_max_t))
+        if got != want:
+            raise RuntimeError(
+                f"WDMSettings.get_slice: rebuilt box {got} != requested {want}"
+            )
+        return new
 
     @property
     def basis_shape(self) -> tuple:

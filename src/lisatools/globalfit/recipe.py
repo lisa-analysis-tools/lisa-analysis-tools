@@ -52,6 +52,7 @@ from .moves import (
     PSDMove,
     ResidualAddOneRemoveOneMove,
     SOBBHChunkedLikeMove,
+    MBHBatchedLikeMove,
     GBSpecialRJPriorMove,
     GBSpecialRJFStatGridMove,
     GBSpecialStretchMove,
@@ -5363,6 +5364,19 @@ class MBHMoveBuilder(SingleSourcePEBuilder):
     """:class:`SingleSourcePEBuilder` for the ``"mbh"`` branch."""
 
     branch_name = "mbh"
+
+
+class MBHBatchedMoveBuilder(MBHMoveBuilder):
+    """:class:`MBHMoveBuilder` constructing :class:`MBHBatchedLikeMove`.
+
+    ``wave_gen`` stays the SLOW exact generator (residual parity with the
+    engine + the fast-vs-slow cross-check); the windowed adapter and its knobs
+    pass through ``move_kwargs`` (``batched_gen=``, ``batch_max_size=``,
+    ``window_*=``). The DCGA branch is skipped: the move raises if handed one.
+    """
+
+    move_class = MBHBatchedLikeMove
+    use_dcga = False
 
 
 class EMRIMoveBuilder(SingleSourcePEBuilder):

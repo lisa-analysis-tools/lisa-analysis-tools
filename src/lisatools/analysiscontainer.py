@@ -732,6 +732,8 @@ class AnalysisContainer:
 
         elif isinstance(data_settings, domains.STFTSettings):
             return self._slice_stft_to_template(template)
+        elif isinstance(data_settings, domains.WDMSettings):
+            return self._slice_wdm_to_template(template)
         else:
             raise NotImplementedError(
                 f"Automatic region slicing not yet implemented for "
@@ -785,6 +787,19 @@ class AnalysisContainer:
         sliced_template = template.get_array_slice(templ_slice)
 
         return sliced_data, sliced_template, sliced_sens_mat
+
+    def _slice_wdm_to_template(
+        self, template: DomainBase
+    ) -> Tuple[DomainBase, DomainBase, SensitivityMatrixBase]:
+        """WDM slice helper used by :meth:`_slice_to_template`.
+
+        The template's active box must be a sub-box of the data's on the SAME
+        wavelet grid (the MBH batched windowed templates). Returns the data and
+        the sensitivity matrix restricted to that box (views, not copies) and
+        the template itself, so ``inner_product`` sees matching shapes.
+        """
+        box = self._data.sub_box_slices(template.settings)
+        return self._data.get_array_slice(box), template, self.sens_mat.get_slice(box)
 
     def template_inner_product(
         self, template: Union[DomainBase, DataResidualArray], **kwargs: dict

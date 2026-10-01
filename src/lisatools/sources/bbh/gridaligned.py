@@ -14,8 +14,9 @@ import numpy as np
 from ...utils.constants import *
 from .waveform import PhenomTHMTDIWaveform, jax, jnp
 from ...utils.exceptions import BatchNotLaunchable
+from ...utils.utility import get_array_module
 
-__all__ = ["GridAlignedPhenomTHMTDIWaveform"]
+__all__ = ["GridAlignedPhenomTHMTDIWaveform", "WindowedGridAlignedMBHWaveform"]
 
 
 class GridAlignedPhenomTHMTDIWaveform(PhenomTHMTDIWaveform):
@@ -162,11 +163,43 @@ class GridAlignedPhenomTHMTDIWaveform(PhenomTHMTDIWaveform):
         (``Signal length (262985) != target FFT length (197238)``). Sizing on
         the analysis window also makes ``_apply_response``'s ``start_ind`` crop
         remove exactly the lead margin and leave precisely the data grid.
+
+        Plus a TAIL of :meth:`_tail_samples` past the data end, which the
+        dispatch crops off again after the response (:meth:`_crop_tail`), so
+        the output is still precisely the data grid. The response reads the
+        strain up to ~500 s AHEAD of each output sample (the SSB ->
+        spacecraft delay) and ``_apply_response`` zero-pads the strain after
+        the lattice: for a source still inspiralling at the data end (a
+        merger after it, e.g. a truncated epoch) a lattice stopping there is
+        a strain STEP the stock waveform does not have, and the last few
+        hundred seconds of output carry its response (measured on the
+        windowed subclass: 2.1e3 x the local stock signal; mojito id 16
+        leaked 3.4e-3 of noise-weighted ||delta|| into the WDM box).
         """
         dt = float(self.dt)
         n_lead = int(np.ceil(self.tdi_buffer_time / dt)) + 1
         k_data = int(np.rint((self.data_t0 - self.waveform_t0) / dt))
-        return k_data - n_lead, n_lead + int(self.domain_settings.N)
+        return k_data - n_lead, n_lead + int(self.domain_settings.N) + self._tail_samples()
+
+    def _tail_samples(self) -> int:
+        """Lattice samples past the end of the kept output: ``tdi_buffer_time``
+        (>= the response's forward read) plus one sample."""
+        return int(np.ceil(float(self.tdi_buffer_time) / float(self.dt))) + 1
+
+    def _output_tail_samples(self) -> int:
+        """Trailing output samples :meth:`_crop_tail` drops: the lattice tail
+        (a stubbed lattice without one overrides this to 0)."""
+        return self._tail_samples()
+
+    def _crop_tail(self, times, channels):
+        """Drop the lattice tail from the response output (see
+        :meth:`_common_grid_spec`): the output ends at the data end (parent)
+        or the segment end (windowed subclass) again -- the parent's is
+        precisely the data grid, as FD consumers require."""
+        n = int(self._output_tail_samples())
+        if n <= 0:
+            return times, channels
+        return times[..., :-n], channels[..., :-n]
 
     def _aligned_polarizations(
         self, m1, m2, s1z, s2z, distance, phi_ref, inclination, psi,
@@ -175,10 +208,12 @@ class GridAlignedPhenomTHMTDIWaveform(PhenomTHMTDIWaveform):
     ):
         """Batched polarizations on a grid of exact multiples of ``dt``.
 
-        Returns ``(times, h_plus, h_cross, merger_time_on_grid)``. The fourth
-        item is what must reach :meth:`_apply_response` in place of the
-        requested ``merger_time``: the sub-sample part has already been spent
-        inside the waveform.
+        Returns ``(times, h_plus, h_cross, merger_time_on_grid, onset_abs)``.
+        The fourth item is what must reach :meth:`_apply_response` in place of
+        the requested ``merger_time``: the sub-sample part has already been
+        spent inside the waveform. The fifth is each row's ABSOLUTE onset
+        label (its first valid lattice sample, clamped to the lattice start),
+        consumed by :meth:`_zero_onset_warmup`.
         """
         self._check_alignable()
         xp = self.xp
@@ -293,10 +328,55 @@ class GridAlignedPhenomTHMTDIWaveform(PhenomTHMTDIWaveform):
             h_plus = h_plus * ramp
             h_cross = h_cross * ramp
 
+        # Column j_start is the lattice point NEAREST the row's first valid
+        # phentax time (e_idx rounds, and j_start = e_idx - (n_valid - 1)):
+        # exactly where the stock response array begins after its
+        # t0_shift_to_data re-alignment, so the warm-up zeroing below is
+        # anchored on the same sample as the stock's.
+        onset_abs = float(self.waveform_t0) + (k0 + np.maximum(j_start, 0)) * dt
+
         # The merger lattice offset is already INSIDE the grid, so
         # ``_apply_response`` must shift by zero. It uses merger_time only for
         # shifted_t_arr; every other reference is logging.
-        return times_out, h_plus, h_cross, np.zeros_like(m_grid)
+        return times_out, h_plus, h_cross, np.zeros_like(m_grid), onset_abs
+
+    def _zero_onset_warmup(self, times, channels, onset_abs):
+        """Zero each row's first ``buffer_time`` of TDI output after ITS onset.
+
+        STOCK PARITY. In the stock (non-grid-aligned) path the response
+        array starts at the waveform's own first sample -- unless that
+        sample precedes ``data_t0 - tdi_buffer_time``, in which case
+        ``TDWaveformBase._apply_response``'s ``_lead`` crop re-bases the
+        array start there -- and the response zeros the first
+        ``buffer_time / dt`` output samples of that array: the turn-on
+        transient of a waveform that starts abruptly (or through a short
+        ramp) mid-data. On the shared lattice the response array starts at
+        the LATTICE head instead, so the same zeroing lands there and a row
+        whose onset is interior kept its transient: mojito MBHB id 17 carried
+        a 7e-24 TDI spike, 200x the local signal, for ~5000 s after onset --
+        2.4 nats of logL at truth against the stock template (2026-09-30).
+        This method reproduces only the INTERIOR-onset case. Rows whose onset
+        precedes the lattice are clamped to the lattice start, where the
+        zeroing coincides with the lattice-head zeroing ``_apply_response``
+        already did (itself subject to the same ``_lead`` re-basing near
+        ``data_t0``) -- nothing extra is removed there.
+        """
+        n_buf = int(self.buffer_time / self.dt)
+        if n_buf <= 0:
+            return times, channels
+        xp = get_array_module(channels)
+        t = xp.atleast_2d(xp.asarray(times))
+        cut = xp.asarray(np.atleast_1d(onset_abs), dtype=xp.float64) + (n_buf - 0.5) * float(self.dt)
+        keep = t >= cut[:, None]                       # (B, N)
+        # In place: ``channels`` is the fresh ``xp.array`` copy
+        # ``_apply_response`` builds from the response output (or a crop view
+        # of it), owned by this call -- no second (B, C, N) array (~2 GB at
+        # B = 24 on GPU).
+        if channels.ndim == 3:
+            channels *= keep[:, None, :]
+        else:                                          # single row: (C, N)
+            channels *= keep[0][None, :]
+        return times, channels
 
     # -- dispatch ----------------------------------------------------------
     # These exist so the SPLIT merger time reaches ``_apply_response``.
@@ -325,9 +405,10 @@ class GridAlignedPhenomTHMTDIWaveform(PhenomTHMTDIWaveform):
                 *args, ra=ra, dec=dec, merger_time=merger_time, **kwargs)
         kwargs.pop("ref_freq", None)
         self._drop_container_flags(kwargs)
-        t, hp, hc, m_grid = self._aligned_polarizations(
+        t, hp, hc, m_grid, onset_abs = self._aligned_polarizations(
             *args, merger_time=merger_time, **kwargs)
-        return self._apply_response(t, hp, hc, ra, dec, m_grid)
+        times, channels = self._apply_response(t, hp, hc, ra, dec, m_grid)
+        return self._crop_tail(*self._zero_onset_warmup(times, channels, onset_abs))
 
     def _call_single(self, *args, ra, dec, merger_time, **kwargs):
         if not self.grid_align:
@@ -338,7 +419,94 @@ class GridAlignedPhenomTHMTDIWaveform(PhenomTHMTDIWaveform):
         # SAME ramp setting as _call_batched. These disagreed before -- single
         # used onset_ramp=False, batched used True -- which is a ~3000 s taper
         # of difference between serial and batched for the identical row.
-        t, hp, hc, m_grid = self._aligned_polarizations(
+        t, hp, hc, m_grid, onset_abs = self._aligned_polarizations(
             *args, merger_time=merger_time, **kwargs)
-        return self._apply_response(
+        times, channels = self._apply_response(
             t[0], hp[0], hc[0], float(ra), float(dec), float(m_grid[0]))
+        return self._crop_tail(*self._zero_onset_warmup(times, channels, onset_abs))
+
+
+class WindowedGridAlignedMBHWaveform(GridAlignedPhenomTHMTDIWaveform):
+    """Grid-aligned generation on a PER-LEAF window instead of the analysis window.
+
+    The parent's shared lattice spans the whole analysis window
+    (``domain_settings.N``) -- six months of samples for a source that lives
+    for 90 days. The global fit sets a window around each leaf's merger
+    (user ruling 2026-09-29: 90 days before to 10 days after, plus pads) and
+    this class evaluates the batch on THAT lattice. Everything else -- the
+    exact integer lattice, the split merger time, ``merger_time = 0`` handed
+    to ``_apply_response`` -- is the parent's.
+
+    ``set_window`` takes the ABSOLUTE segment start (a data-lattice time that
+    is also a WDM layer boundary) and the segment's sample count; the lattice
+    is prepended with ``n_lead`` samples so the invalid head lands outside
+    the segment, where the placement clips it, and appended with
+    ``tdi_buffer_time`` of tail so the response's forward read (the SSB ->
+    spacecraft delay, <= ~500 s) sees the real strain at the segment end even
+    when the source merges after it. Two heads are invalid:
+
+    * the response's retarded reads reach up to ``tdi_buffer_time`` (600 s)
+      before a sample, so the first ``tdi_buffer_time`` of output is
+      warm-up;
+    * ``_apply_response`` then ZEROS the first ``buffer_time / dt`` output
+      samples of the lattice outright (``buffer_time`` defaults to 15000 s,
+      ``MBH_PHENOM_DEFAULT_BUFFER_TIME``).
+
+    The lead is therefore sized on ``max(tdi_buffer_time, buffer_time)``.
+    Sizing it on ``tdi_buffer_time`` alone (610 s at dt = 10 s) let the
+    zeroed head run ~14.4 ks INTO the segment, silently deleting any signal
+    there. Generating without a window is refused: silently falling back
+    to the analysis-window lattice is exactly the 6-month generation this
+    class exists to avoid.
+
+    Exception near the data start: the lead keeps the zeroed head outside the
+    segment only while the lattice start lies after ``data_t0 -
+    tdi_buffer_time``. For a segment starting within ~``buffer_time``
+    (~4 h) of the run's ``data_t0`` (an edge-clamped window, see
+    ``mbh_window_layers``), ``_apply_response``'s ``_lead`` crop re-bases
+    the array start to ``data_t0 - tdi_buffer_time`` and the
+    ``buffer_time`` zeroing then removes the first ~4 h of the segment. The
+    stock path does exactly the same there (identical crop and zeroing), so
+    windowed and stock templates still agree; those hours sit inside the
+    data window's taper.
+    """
+
+    _window_spec = None
+
+    def set_window(self, t_seg_abs: float, n_seg: int) -> None:
+        dt = float(self.dt)
+        rel = (float(t_seg_abs) - float(self.waveform_t0)) / dt
+        k_seg = int(np.rint(rel))
+        if abs(rel - k_seg) > 1e-6:
+            raise ValueError(
+                f"segment start {t_seg_abs!r} is not on the waveform lattice "
+                f"(waveform_t0 + k*dt): residual {(rel - k_seg) * dt:.3e} s"
+            )
+        # Cover BOTH invalid heads (see the class docstring): the retarded-read
+        # warm-up and the ``buffer_time`` zeroing in ``_apply_response``.
+        lead_time = max(float(self.tdi_buffer_time), float(getattr(self, "buffer_time", 0.0) or 0.0))
+        n_lead = int(np.ceil(lead_time / dt)) + 1
+        # ...and run PAST the segment end by ``tdi_buffer_time``: the response
+        # reads the strain up to ~500 s AHEAD of each output sample (the SSB
+        # -> spacecraft delay), and ``_apply_response`` zero-pads the strain
+        # after the lattice. For a source still inspiralling at the segment
+        # end (merger after the data end, edge-clamped box) a lattice stopping
+        # there is a strain STEP the stock waveform does not have: mojito
+        # MBHB id 16 merging 1 d after the grid end carried a 2.6e5 x spike in
+        # the segment's last ~300 s, leaking 3.4e-3 of noise-weighted
+        # ||delta|| into the active box through the WDM transform
+        # (2026-09-30). The dispatch crops the tail off after the response
+        # (``_crop_tail``), so the output ends at the segment end.
+        self._window_spec = (k_seg - n_lead, n_lead + int(n_seg) + self._tail_samples())
+
+    @property
+    def window_spec(self):
+        return self._window_spec
+
+    def _common_grid_spec(self, T):
+        if self._window_spec is None:
+            raise RuntimeError(
+                "WindowedGridAlignedMBHWaveform.set_window() was never called; "
+                "refusing to fall back to the full analysis-window lattice."
+            )
+        return self._window_spec

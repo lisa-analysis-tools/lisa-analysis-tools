@@ -25,10 +25,17 @@ from typing import Any
 
 import numpy as np
 
-from ..domains import DomainBase, DomainBaseArray
-from ..utils.utility import get_array_module
+from ..domains import (
+    DomainBase,
+    DomainBaseArray,
+    TDSettings,
+    WDMSettings,
+    WDMSignal,
+    place_td_signal_on_grid,
+)
+from ..utils.utility import get_array_module, tukey
 
-__all__ = ["BatchedDomainSignalGen"]
+__all__ = ["BatchedDomainSignalGen", "MBHWindowedWDMSignalGen"]
 
 
 class BatchedDomainSignalGen:
@@ -128,3 +135,169 @@ class BatchedDomainSignalGen:
         xp = get_array_module(doms[0].arr)
         stacked = xp.stack([d.arr for d in doms], axis=0)
         return settings.associated_class(stacked, settings)
+
+
+class MBHWindowedWDMSignalGen(BatchedDomainSignalGen):
+    """Batched ``signal_gen`` whose per-row domain step is a SEGMENT transform.
+
+    Each row's TD channels are placed on a segment of the data lattice that
+    is ``n_pad`` WDM layers wider than the kept box on each side, transformed
+    on a segment ``WDMSettings`` (same ``Nf``, ``dt``; ``Nt_seg`` layers), and
+    the ``n_pad`` edge layers are discarded. The result is a ``WDMSignal`` on
+    the RUN's settings with ``active_slice_t = [n_start, n_start + Nt_keep)``,
+    so containers slice their residual and PSD to it (``_slice_to_template``)
+    and fills add it into the full residual (``add_signal``) -- the batched
+    move first re-labels it onto the containers' own settings, whose ``t0``
+    need not match these settings' (see ``t0_abs`` below). The template is
+    zero at both segment ends (onset ramp inside the box; ringdown dead), so
+    the periodic segment transform's wrap-around touches only the discarded
+    pad layers -- measured on a toy grid: kept-layer relative error 1.2e-5 at
+    8 pad layers, 9e-7 at 16 (tests/test_mbh_windowed_signal_gen.py).
+
+    Args:
+        wave_gen: generator exposing ``compute_tdi_channels`` (times on the
+            data lattice, ABSOLUTE seconds). If it also exposes
+            ``set_window(t_seg_abs, n_seg)`` it is told the segment.
+        wdm_settings: the run's :class:`WDMSettings` (device-local). Only its
+            GRID is used (``Nf``, ``Nt``, ``dt``, active box, window); its
+            ``t0`` is not trusted as a time.
+        nchannels: TDI channels the data carries (leading channels kept).
+        tukey_alpha: the run's full-length data window alpha; the matching
+            slice of that window multiplies the segment (0 -> none).
+        t0_abs: ABSOLUTE time of layer 0 of the grid (the data start,
+            ``general_info.data_t0``); the segment starts at ``t0_abs + s0 *
+            layer_dt``. Defaults to ``wdm_settings.t0`` (read at
+            :meth:`set_window`) for callers whose settings carry the data
+            start. A stock erebor build's settings do NOT (the WDM factory
+            builds ``t0 = 0``; a GB comp build later sets it to the data start
+            in place), so the global fit passes it explicitly.
+    """
+
+    def __init__(
+        self, wave_gen, wdm_settings, nchannels: int = 3, tukey_alpha: float = 0.0,
+        t0_abs: float | None = None,
+    ):
+        super().__init__(wave_gen)
+        self.wdm = wdm_settings
+        self.nchannels = int(nchannels)
+        self.tukey_alpha = float(tukey_alpha or 0.0)
+        self._t0_abs = None if t0_abs is None else float(t0_abs)
+        self.geometry = None
+        self._seg_td = None
+        self._seg_wdm = None
+        self._box = None
+        self._win_seg = None
+
+    @property
+    def t0_abs(self) -> float:
+        """ABSOLUTE time of WDM layer 0 (``wdm.t0`` when none was given)."""
+        return float(self.wdm.t0) if self._t0_abs is None else self._t0_abs
+
+    @property
+    def window_key(self):
+        """``(n_start, Nt_keep, n_pad, n_pad_hi)`` as last passed to :meth:`set_window`."""
+        g = self.geometry
+        return None if g is None else (
+            g["n_start"], g["Nt_keep"], g["n_pad"], g["n_pad_hi_req"]
+        )
+
+    def set_window(
+        self, n_start: int, Nt_keep: int, n_pad: int, n_pad_hi: int | None = None
+    ) -> None:
+        """Kept layers ``[n_start, n_start + Nt_keep)``; segment pads ``n_pad``
+        below and ``n_pad_hi`` (default ``n_pad``) above. An edge-clamped
+        window (:func:`~lisatools.globalfit.moves.mbhbatchedmove.mbh_window_layers`)
+        passes a 0 pad on the side where the segment meets the grid edge."""
+        n_start, Nt_keep, n_pad = int(n_start), int(Nt_keep), int(n_pad)
+        n_pad_hi_req = n_pad if n_pad_hi is None else int(n_pad_hi)
+        if Nt_keep < 1 or n_pad < 0 or n_pad_hi_req < 0:
+            raise ValueError(
+                f"set_window: Nt_keep={Nt_keep} n_pad={n_pad} n_pad_hi={n_pad_hi_req}"
+            )
+        # The real WDM basis alternates with the parity of the ABSOLUTE layer
+        # index (n + m), so a segment whose layer 0 is an odd run layer
+        # transforms in the opposite phase convention: measured kept-layer
+        # error 1.36 at s0 odd vs 2.9e-5 at s0 even. Grow the low pad by one
+        # layer to put the segment start on an even layer (an odd start is
+        # >= 1, so there is always room; a start at layer 0 is even already).
+        n_pad_lo = n_pad + ((n_start - n_pad) % 2)
+        n_pad_hi = n_pad_hi_req
+        Nt_seg = Nt_keep + n_pad_lo + n_pad_hi
+        if Nt_seg % 2:  # WDMSettings needs an even layer count
+            Nt_seg += 1
+            n_pad_hi += 1
+        s0 = n_start - n_pad_lo
+        Nt = int(self.wdm.Nt)
+        if s0 < 0 or s0 + Nt_seg > Nt:
+            raise ValueError(
+                f"segment layers [{s0}, {s0 + Nt_seg}) fall outside the WDM grid [0, {Nt})"
+            )
+        rel_t0 = n_start - int(self.wdm.ind_min_t)
+        if rel_t0 < 0 or rel_t0 + Nt_keep > int(self.wdm.Nt_active):
+            raise ValueError(
+                f"kept layers [{n_start}, {n_start + Nt_keep}) fall outside the data's "
+                f"active box [{self.wdm.ind_min_t}, {self.wdm.ind_max_t + 1})"
+            )
+        Nf = int(self.wdm.Nf)
+        dt = float(self.wdm.data_dt)
+        layer_dt = float(self.wdm.layer_dt)
+        t_seg = self.t0_abs + s0 * layer_dt
+        backend = self.wdm.backend
+        self._seg_td = TDSettings(Nf * Nt_seg, dt, t0=t_seg, force_backend=backend)
+        self._seg_wdm = WDMSettings(
+            Nf, Nt_seg, dt, t0=t_seg, oversample=self.wdm.oversample,
+            min_freq=self.wdm.min_freq, max_freq=self.wdm.max_freq,
+            is_complex=self.wdm.is_complex, force_backend=backend,
+        )
+        if (
+            int(self._seg_wdm.Nf_active) != int(self.wdm.Nf_active)
+            or int(self._seg_wdm.ind_min_f) != int(self.wdm.ind_min_f)
+        ):
+            raise RuntimeError(
+                "segment WDM settings do not reproduce the run's active frequency layers"
+            )
+        self._box = self.wdm.get_slice(
+            (slice(0, int(self.wdm.Nf_active)), slice(rel_t0, rel_t0 + Nt_keep))
+        )
+        if self.tukey_alpha > 0.0:
+            w = tukey(int(self.wdm.N), self.tukey_alpha, xp=np)
+            self._win_seg = self.wdm.xp.asarray(w[s0 * Nf:(s0 + Nt_seg) * Nf])
+        else:
+            self._win_seg = None
+        self.geometry = dict(
+            n_start=n_start, Nt_keep=Nt_keep, n_pad=n_pad, n_pad_lo=n_pad_lo,
+            n_pad_hi=n_pad_hi, n_pad_hi_req=n_pad_hi_req,
+            s0=s0, Nt_seg=Nt_seg, t_seg=t_seg,
+        )
+        if hasattr(self.wave_gen, "set_window"):
+            self.wave_gen.set_window(t_seg, Nf * Nt_seg)
+
+    def _to_domain(self, times, channels):
+        # No guard here: this is an internal helper, only ever reached via
+        # __call__, which checks self.geometry before touching wave_gen at
+        # all -- a second check here would just be dead code (see the
+        # mutation rule: every behaviour must have a test that fails if the
+        # line is deleted, and no test can distinguish a raise here from the
+        # one in __call__ since __call__ always fires first).
+        g = self.geometry
+        placed = place_td_signal_on_grid(
+            channels[: self.nchannels], self._seg_td, times=times
+        )
+        seg = placed.transform(self._seg_wdm, window=self._win_seg)
+        kept = seg.arr[..., g["n_pad_lo"]: g["n_pad_lo"] + g["Nt_keep"]]
+        return WDMSignal(kept, self._box)
+
+    def __call__(self, *params, **kwargs):
+        if self.geometry is None:
+            raise RuntimeError(
+                "MBHWindowedWDMSignalGen: call set_window() before generating"
+            )
+        times, channels = self.wave_gen.compute_tdi_channels(*params, **kwargs)
+        if getattr(times, "ndim", 1) == 1:
+            return self._to_domain(times, channels)
+        n_src = int(times.shape[0])
+        squeezed = channels.ndim == times.ndim
+        return self._stack([
+            self._to_domain(times[i], channels if squeezed else channels[i])
+            for i in range(n_src)
+        ])
