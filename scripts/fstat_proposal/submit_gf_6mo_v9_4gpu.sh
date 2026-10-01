@@ -4335,10 +4335,26 @@ export GB_SEARCH_3_WARM_EVERY=5
 # 0 writes at every boundary. Both pinned explicitly here rather than left
 # to the code defaults, because on a SPOT partition this is the knob that
 # decides how much a preemption costs.
-export MIDIT_CHECKPOINT=1
+# OVERRIDABLE from the command line since 2026-10-01 (it was a hard
+# `export MIDIT_CHECKPOINT=1`, so `MIDIT_CHECKPOINT=0 ./submit...` reached
+# nothing -- the documented knob-reaches-nothing failure). Mike's ruling for
+# the legged + ratcheted search: "MIDIT_CHECKPOINT=0 in the launch command
+# is good". Under GB_SEARCH_LEGS=1 a row lands after every leg, so the
+# checkpoint protects at most one leg of work, while its adoption rule
+# (checkpoint stored_iteration >= store iteration) cannot tell a harmless
+# startup copy from a half-nudged state: jobs 673/674 each ran the galfor
+# NUDGE and were stopped; ten more minutes and either would have written a
+# post-nudge checkpoint at stored iteration 47 that job 675 would have
+# adopted and nudged AGAIN (the job-672 double nudge by another door). The
+# default stays 1 for the unlegged runs.
+export MIDIT_CHECKPOINT=${MIDIT_CHECKPOINT:-1}
 export MIDIT_CHECKPOINT_MIN_INTERVAL=${MIDIT_CHECKPOINT_MIN_INTERVAL:-600}
-echo "[V9-CKPT] mid-iteration checkpoints ON, min interval ${MIDIT_CHECKPOINT_MIN_INTERVAL}s"
-echo "[V9-CKPT] watch: [MIDIT_CKPT] wrote ... at stored iteration N (boundary '...')"
+if [ "${MIDIT_CHECKPOINT}" = "1" ]; then
+  echo "[V9-CKPT] mid-iteration checkpoints ON, min interval ${MIDIT_CHECKPOINT_MIN_INTERVAL}s"
+  echo "[V9-CKPT] watch: [MIDIT_CKPT] wrote ... at stored iteration N (boundary '...')"
+else
+  echo "[V9-CKPT] mid-iteration checkpoints OFF (MIDIT_CHECKPOINT=${MIDIT_CHECKPOINT}); under GB_SEARCH_LEGS a row lands after every leg instead"
+fi
 
 # ============================================================================
 # CHANGE 3 OF 3 vs 3mo_v8 -- MBHB + EMRI + SOBHB (campaign S6). Non-empty
