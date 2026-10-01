@@ -106,5 +106,35 @@ class TDDenseTest(unittest.TestCase):
         np.testing.assert_array_equal(np.asarray(out.tdi_amp), 0.0)
 
 
+class TDDenseGPUParityTest(TDDenseTest):
+    """GPU build of the dense kernel == its CPU build (skips without a GPU backend)."""
+
+    def test_gpu_equals_cpu(self):
+        import lisatools
+        from lisatools.detector import EqualArmlengthOrbits
+        from lisatools.response.tdiconfig import TDIConfig
+        from lisatools.response.tdionfly import TDDenseTDIonTheFly
+
+        if not lisatools.has_backend("gpu"):
+            self.skipTest("no GPU backend")
+        K = self.t_k.size
+        Phi_k = self._fund(self.t_k)
+        rng = np.random.default_rng(3)
+        S = 5
+        are = rng.normal(size=(S, K - 1, 4)) * np.array([1.0, 1e-6, 1e-12, 1e-18])
+        aim = rng.normal(size=(S, K - 1, 4)) * np.array([1.0, 1e-6, 1e-12, 1e-18])
+        mkn = np.array([[2, 0, 0], [3, 0, 1], [-2, 0, -1], [2, 0, 1], [1, 0, -2]])
+        args = (np.tile(self.t_eval, (2, 1)), np.array([0, 3, 5]), mkn, np.tile(self.t_k, (2, 1)), np.full(2, K),
+                np.tile(_dense_linear(self.t_k, Phi_k)[None], (2, 1, 1, 1)), are, aim)
+        outs = []
+        for be in ("cpu", "gpu"):
+            orb = EqualArmlengthOrbits(force_backend=be)
+            tdi = TDIConfig("2nd generation", force_backend=be)
+            o = TDDenseTDIonTheFly(*args, amp_factor=0.5, tdi_config=tdi, orbits=orb, force_backend=be)(self.params, return_spline=False)
+            outs.append([np.asarray(x.get() if hasattr(x, "get") else x) for x in (o.tdi_amp, o.tdi_phase, o.phase_ref)])
+        for a, b in zip(*outs):
+            np.testing.assert_allclose(b, a, rtol=1e-10, atol=1e-10 * np.max(np.abs(a)))
+
+
 if __name__ == "__main__":
     unittest.main()
