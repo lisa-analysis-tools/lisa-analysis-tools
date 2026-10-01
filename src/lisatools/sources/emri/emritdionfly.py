@@ -79,7 +79,7 @@ class EMRITDIonFly:
     FRAMES = ("ecliptic", "icrs_special")
 
     def __init__(self, wave_gen, orbits, tdi_config, dt, Tobs, t0, delay_margin=600.0,
-                 frame="ecliptic", n_fine=None, t_fine_window=None):
+                 frame="ecliptic", n_fine=None, t_fine_window=None, t_fine=None):
         if frame not in self.FRAMES:
             raise ValueError(f"frame must be one of {self.FRAMES}, got {frame!r}")
         if n_fine is not None and int(n_fine) < 16:
@@ -94,6 +94,14 @@ class EMRITDIonFly:
         self.frame = frame
         self.n_fine = None if n_fine is None else int(n_fine)
         self.t_fine_window = t_fine_window
+        # explicit (possibly NON-uniform) fine times relative to t0: the input splines
+        # auto-detect general spacing and the response is evaluated point by point
+        self.t_fine = None
+        if t_fine is not None:
+            self.t_fine = np.unique(np.asarray(t_fine, dtype=float))
+            if self.t_fine.size < 16:
+                raise ValueError("t_fine needs >= 16 points")
+            self.n_fine = int(self.t_fine.size)
 
     # cancels the inc=0 kernel factor (1 + cos^2 0) = 2 of the TDI-on-the-fly response
     AMP_FACTOR = 1 / 2.0
@@ -136,6 +144,8 @@ class EMRITDIonFly:
 
     def _fine_times(self) -> np.ndarray:
         """Fine trajectory times, relative to ``t0`` (FEW's clock)."""
+        if self.t_fine is not None:
+            return self.t_fine
         if self.t_fine_window is None:
             lo, hi = 0.0, float(self.T)
         else:
@@ -259,8 +269,14 @@ class EMRITDIonFly:
         # Trim the TDI grid inside the waveform spline by the max response delay so
         # the delayed waveform queries (t - k.x) never fall outside the spline.
         dt_traj = float(t_arr_in[0, 1] - t_arr_in[0, 0]) if t_arr_in.shape[1] > 1 else self.dt
-        n_trim = max(1, int(np.ceil(self.delay_margin / dt_traj)) + 1)
-        t_arr_tdi = t_arr_in[:, n_trim:-n_trim]
+        steps = np.diff(t_src)
+        if steps.size and np.allclose(steps, steps[0], rtol=1e-9, atol=0.0):
+            n_trim = max(1, int(np.ceil(self.delay_margin / dt_traj)) + 1)
+            t_arr_tdi = t_arr_in[:, n_trim:-n_trim]
+        else:   # non-uniform feed: trim by TIME (one local step beyond the delay margin)
+            keep = ((t_src >= t_src[0] + self.delay_margin + steps[0])
+                    & (t_src <= t_src[-1] - self.delay_margin - steps[-1]))
+            t_arr_tdi = t_arr_in[:, keep]
         if t_arr_tdi.shape[1] < 4:
             raise ValueError(
                 f"EMRITDIonFly: only {t_arr_in.shape[1]} trajectory points; the {self.delay_margin:g} s "

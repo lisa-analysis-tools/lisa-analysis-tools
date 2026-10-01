@@ -71,7 +71,7 @@ def main():
         h_dir = np.asarray(direct(*params, mode_selection_threshold=thr).arr)
         row["wall_direct_s"] = time.perf_counter() - t0
         row.update({f"direct_{k}": v for k, v in direct.last_stats.items()})
-        modes = direct._mode_list(params, {"mode_selection_threshold": thr})
+        modes, _ = direct._mode_list(params, {"mode_selection_threshold": thr})
 
         t0 = time.perf_counter()
         tg = data_t0 + np.arange(NF * NT) * DT

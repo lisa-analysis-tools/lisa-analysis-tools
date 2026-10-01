@@ -24,6 +24,9 @@ No files at all:
     python scripts/emri/emri_batch_speed.py --catalog fixed --orbits equal-arm --backend cuda12x --workers 8
 Example (cluster GPU, 6mo production grid):
     python scripts/emri/emri_batch_speed.py --src 1 --backend cuda12x --workers 8 --rows 64
+Direct-to-WDM template too (table grid Nf=180, dt=20 s; production on the same grid):
+    python scripts/emri/emri_batch_speed.py --src 1 --backend cuda12x --dt 20 --workers 8 --rows 64 \
+        --direct-table wdm_lookup_emri_cx_NF180_DT20_TL32_fd8x0p01_nld2.h5
 Laptop smoke:
     python scripts/emri/emri_batch_speed.py --src 1 --backend cpu --days 4 --dt 20 --rows 8 --workers 2
 """
@@ -138,6 +141,11 @@ def main():
                          "'fixed' = a built-in source, no files")
     ap.add_argument("--l1-dir", default=None, help="dir of EMRI L1 bricks (default: $MOJITO_LIGHT_PATH/data/EMRI/L1)")
     ap.add_argument("--orbits", choices=("auto", "l1", "equal-arm"), default="auto")
+    ap.add_argument("--direct-table", default=None,
+                    help="WDM lookup table h5: also time the direct-to-WDM template (EMRIDirectWDM) and score it "
+                         "against the production template. The table's Nf/dt must match the grid "
+                         "(laptop table: --dt 20)")
+    ap.add_argument("--direct-mode-batch", type=int, default=64)
     args = ap.parse_args()
 
     from few.trajectory.pool import TrajectoryCache, TrajectoryPool, inspiral_init_kwargs_from, reset_stepper
@@ -178,6 +186,22 @@ def main():
         h = xp.stack([xp.asarray(c) for c in h]) if isinstance(h, (list, tuple)) else xp.atleast_2d(h)
         h = h[:3, offset_int:offset_int + n]
         return TDSignal(h, tds).transform(wdm).arr
+
+    direct = None
+    if args.direct_table:
+        from lisatools.domains import WDMLookupTable
+        from lisatools.sources.emri.wdm_direct import EMRIDirectWDM
+        table = WDMLookupTable.from_file(args.direct_table, force_backend=args.backend)
+        if int(table.Nf) != nf or abs(float(table.data_dt) - args.dt) > 1e-9:
+            raise SystemExit(f"--direct-table is built for Nf={table.Nf} dt={table.data_dt}; this grid is "
+                             f"Nf={nf} dt={args.dt} (pass --dt {table.data_dt})")
+        direct = EMRIDirectWDM(gen, table, wdm, orbits=orb,
+                               tdi_config=TDIConfig(fit.general.tdi_gen_str, force_backend=args.backend),
+                               t_start=W.REF, data_t0=data_t0, mode_batch=args.direct_mode_batch,
+                               force_backend=args.backend)
+
+    def host(x):
+        return x.get() if hasattr(x, "get") else np.asarray(x)
 
     rows = batch_rows(params, args.rows)
     t0 = time.perf_counter()
@@ -247,6 +271,32 @@ def main():
             a, b = (x.get() if hasattr(x, "get") else np.asarray(x) for x in (a, b))
             maxdiff = max(maxdiff, float(np.max(np.abs(a - b)) / max(np.max(np.abs(b)), 1e-300)))
         cache.clear()
+
+        if direct is not None:
+            TrajectoryCache.uninstall(gen)
+            reset_stepper(gen.inspiral_generator)
+            h_dir = host(direct(*rows[0], mode_selection_threshold=thr).arr)      # warm-up + accuracy row
+            reset_stepper(gen.inspiral_generator)
+            h_prod = host(template(*rows[0]))
+            act = slice(20, nt - 20)                                             # production edge crop
+            dmm, damp = [], []
+            for c in range(3):
+                a_, b_ = h_dir[c][:, act], h_prod[c][:, act]
+                dmm.append(float(1 - np.sum(a_ * b_) / np.sqrt(np.sum(a_ * a_) * np.sum(b_ * b_))))
+                damp.append(float(np.linalg.norm(a_) / np.linalg.norm(b_)))
+            sync()
+            t_dir = time.perf_counter()
+            for r in rows:
+                reset_stepper(gen.inspiral_generator)
+                direct(*r, mode_selection_threshold=thr)
+            sync()
+            t_dir = time.perf_counter() - t_dir
+            rec.update(direct_s=t_dir, direct_per_template_s=t_dir / len(rows), direct_mm_vs_prod=dmm,
+                       direct_amp_vs_prod=damp, direct_stats=direct.last_stats)
+            print(f"[speed] thr={thr:g} DIRECT {t_dir / len(rows) * 1e3:.0f} ms/tmpl (production serial "
+                  f"{t_ser / len(rows) * 1e3:.0f}) mm vs prod {'/'.join(f'{x:.1e}' for x in dmm)} "
+                  f"amp {'/'.join(f'{x:.6f}' for x in damp)} {direct.last_stats}", flush=True)
+            cache = TrajectoryCache.install(gen)
 
         rec.update(nmodes=int(getattr(gen, "num_modes_kept", -1)), unique_trajectories=len(uniq),
                    serial_s=t_ser, serial_per_template_s=t_ser / len(rows), traj_only_s=t_traj,
