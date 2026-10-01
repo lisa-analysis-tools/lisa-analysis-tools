@@ -49,6 +49,19 @@ import logging
 
 logger = logging.getLogger("lisatools.domains")
 
+# Byte budget for the per-block complex intermediates inside
+# ``FDSignal.wdmtransform``. Frequency layers are independent, so the transform
+# walks them in blocks sized to keep the two temporary (outer..., block, Nt)
+# complex arrays under this. 256 MiB is small enough to keep a large batch off
+# the memory ceiling and large enough that the block loop stays short.
+# Override per-settings with ``wdm_layer_budget_bytes`` / ``wdm_layer_chunk``.
+_WDM_LAYER_BUDGET = 256 * 1024 * 1024
+
+# Opt-in restoration of the per-transform cuFFT plan-cache wipe (see
+# wdmtransform). Default OFF: it cost 172 ms/call and the cache never hit.
+_WDM_CLEAR_FFT_CACHE = os.environ.get("LISATOOLS_WDM_CLEAR_FFT_CACHE", "0") not in ("0", "", "false", "False")
+
+
 @dataclasses.dataclass
 class DomainSettingsBase(LISAToolsParallelModule):
     """Base class for domain settings (TD, FD, STFT, WDM, ...).
@@ -1051,10 +1064,35 @@ def place_td_signal_on_grid(
             arr = signals[..., :N_target]
         return TDSignal(arr, settings)
 
+    if times.ndim == 2:
+        # Batched: ``times`` is (nbatch, num_times) and ``signals`` is
+        # (nbatch, ..., num_times). Sources generally start at different
+        # samples -- ``_apply_response`` crops the batch by a single shared
+        # ``start_ind`` but each source keeps its own t0 -- so the placement
+        # offset is per source and the sources are placed one at a time.
+        #
+        # This loop is bookkeeping, not compute: it is a slice-assign per
+        # source into a preallocated grid, with no waveform or response work
+        # in it. The expensive stages upstream (waveform, TDI response) and
+        # downstream (WDM transform, inner products) are all genuinely
+        # batched, so this stays in the noise.
+        nbatch = times.shape[0]
+        if signals.shape[0] != nbatch:
+            raise ValueError(
+                f"Batched place_td_signal_on_grid: signals batch dim "
+                f"{signals.shape[0]} != times batch dim {nbatch}."
+            )
+        out = xp.zeros(signals.shape[:-1] + (N_target,), dtype=signals.dtype)
+        for b in range(nbatch):
+            out[b] = place_td_signal_on_grid(
+                signals[b], settings, times=times[b]
+            ).arr
+        return TDSignal(out, settings)
+
     if times.ndim != 1:
         raise NotImplementedError(
-            "place_td_signal_on_grid handles one source at a time; loop over "
-            "the batch dimension for batched inputs."
+            f"place_td_signal_on_grid handles 1D (single source) or 2D "
+            f"(batched) time arrays; got ndim={times.ndim}."
         )
 
     # Drop leading samples before the grid start (unobserved).
@@ -1311,9 +1349,17 @@ class FDSignal(FDSettings, DomainBase):
         return FDSettings(*self.args, **self.kwargs)
 
     def pad_array(self, arr: np.ndarray) -> np.ndarray:
-        """Zero-pad ``arr`` (2D) back to the full ``N``-bin grid before an inverse transform."""
-        assert arr.ndim == 2
-        _arr = self.xp.pad(arr, ((0, 0), (self.ind_min - 1, self.N - 1 - self.ind_max)), mode="constant", constant_values=0.0)
+        """Zero-pad ``arr`` back to the full ``N``-bin grid before an inverse transform.
+
+        Pads the trailing (frequency) axis only, so it accepts both the
+        unbatched ``(nchannels, N)`` layout and the batched
+        ``(nbatch, nchannels, N)`` one.
+        """
+        assert arr.ndim >= 2
+        pad_width = [(0, 0)] * (arr.ndim - 1) + [
+            (self.ind_min - 1, self.N - 1 - self.ind_max)
+        ]
+        _arr = self.xp.pad(arr, pad_width, mode="constant", constant_values=0.0)
         return _arr
 
     def ifft(self, settings=None, window=None):
@@ -1416,74 +1462,175 @@ class FDSignal(FDSettings, DomainBase):
         m_special_1d, k, herm, _ = settings.fold_shift_map()
         base_window = (settings.window[:])
 
-        arr_in = self.arr.copy()
+        # No .copy(): every use below is a READ. The gather ``arr_in[..., k]``
+        # produces a new array and all arithmetic happens on that, so nothing
+        # ever writes through to ``self.arr``. The copy duplicated the whole
+        # frequency-domain array -- 1.2 GiB for a batch of 8 over two years,
+        # the single largest allocation in this transform -- for nothing.
+        # ``pad_array`` already returns a fresh array on the trimmed path.
+        arr_in = self.arr
 
         if self.ind_min != 0 or self.ind_max != self.N - 1:
             warnings.warn("Doing an ifft with a trimmed frequency domain array. Zero-padding.")
             arr_in = self.pad_array(arr_in)
 
-        before_ifft = arr_in[:, k] / settings.data_dt
-
-        if not is_psd:
-            if herm.any():
-                before_ifft[:, herm] = self.xp.conj(before_ifft[:, herm])
-
+        # Every index below addresses the TRAILING axes -- (..., n_special, Nt)
+        # for the layer grid, (..., N) for the frequency axis -- so the same
+        # code serves the unbatched ``(nchannels, N)`` layout and the batched
+        # ``(nbatch, nchannels, N)`` one. ``k``, ``herm`` and ``set_zero`` are
+        # all (n_special, Nt) masks over the two trailing axes; indexing them
+        # positionally (``arr[:, k]``) silently addressed the CHANNEL axis as
+        # soon as a batch axis was present, which is why a batched WDM
+        # transform used to raise IndexError instead of broadcasting.
         if is_psd:
+            before_ifft = arr_in[..., k] / settings.data_dt
             tmp_arr = before_ifft.copy()
-            tmp_arr[:] *= (base_window[None, None, :]) ** 2 * np.pi * settings.data_dt
+            tmp_arr *= base_window**2 * np.pi * settings.data_dt
             psd_sum_tmp = tmp_arr.sum(axis=-1)
             psd_sum_tmp /= settings.Nf * settings.Nt   # = N
 
-            wdmpsd_active = self.xp.zeros((self.nchannels, Nf_act, settings.Nt), dtype=complex)
+            wdmpsd_active = self.xp.zeros(
+                self.outer_shape + (Nf_act, settings.Nt), dtype=complex
+            )
             if include_top:
                 # row 0 == m=0, row -1 == m=Nf, rows 1..Nf_act-1 == m=1..ind_max_f
-                wdmpsd_active[:, 1:] = psd_sum_tmp[:, 1:Nf_act, None]
-                wdmpsd_active[:, 0, 0::2] = psd_sum_tmp[:, 0, None]
-                wdmpsd_active[:, 0, 1::2] = psd_sum_tmp[:, -1, None]
+                wdmpsd_active[..., 1:, :] = psd_sum_tmp[..., 1:Nf_act, None]
+                wdmpsd_active[..., 0, 0::2] = psd_sum_tmp[..., 0, None]
+                wdmpsd_active[..., 0, 1::2] = psd_sum_tmp[..., -1, None]
             else:
                 # rows 0..Nf_act-1 map directly to m=ind_min_f..ind_max_f
-                wdmpsd_active[:] = psd_sum_tmp[:, :Nf_act, None]
+                wdmpsd_active[...] = psd_sum_tmp[..., :Nf_act, None]
 
-            wdmpsd_out = wdmpsd_active[:, :, settings.active_slice_t]
+            wdmpsd_out = wdmpsd_active[..., settings.active_slice_t]
             return wdmpsd_out
-
-        before_ifft[:] *= base_window[None, None, :]
-        after_ifft = self.xp.fft.ifft(before_ifft, axis=-1)
-
-        # TODO: fix this
-
-        if self.backend.uses_cupy:
-            # some issue with cupy and xp.real/imag
-            cache = self.xp.fft.config.get_plan_cache()
-            cache.clear()
 
         is_complex = bool(getattr(settings, "is_complex", False))
         out_dtype = complex if is_complex else float
-        tmp_w_mn = self.xp.zeros((self.nchannels, n_special, settings.Nt), dtype=out_dtype)
+        # Only the ACTIVE time columns are ever returned -- the old code built
+        # all Nt and threw the rest away at the last line. When min_time /
+        # max_time narrow the box (an MBHB occupies ~100 of 1451 layers at two
+        # years) that is most of two large arrays wasted. Keep the active
+        # columns and, for the two rows whose assembly reads other columns
+        # (m=0 pulls from m=Nf at n-1), keep those two rows at full length --
+        # two rows out of n_special is nothing.
+        _t_sl = settings.active_slice_t
+        t_lo = 0 if _t_sl.start is None else int(_t_sl.start)
+        t_hi = settings.Nt if _t_sl.stop is None else int(_t_sl.stop)
+        if _t_sl.step not in (None, 1):
+            # Strided active slices are not something the assembly below can
+            # express column-wise; fall back to the full axis and slice at the
+            # end, exactly as before.
+            t_lo, t_hi = 0, settings.Nt
+            _slice_at_end = True
+        else:
+            _slice_at_end = False
+        Nt_keep = t_hi - t_lo
+
+        tmp_w_mn = self.xp.zeros(
+            self.outer_shape + (n_special, Nt_keep), dtype=out_dtype
+        )
+        # Rows the m=0 assembly reads from, kept over the full time axis.
+        _full_rows = {} if not include_top else {0: None, n_special - 1: None}
         kappa = 2 * np.sqrt(np.pi * settings.data_dt) / settings.Nf
-        m_here = self.xp.repeat(m_special_1d[:, None], settings.Nt, axis=-1)
-        n_here = self.xp.tile(self.xp.arange(settings.Nt), (n_special, 1))
-        set_zero = ((m_here == settings.Nf) | (m_here == 0)) & ((m_here + n_here) % 2 != 0)
-        projected = self.xp.conj(settings.get_Cmn(m_here[~set_zero], n_here[~set_zero])) * after_ifft[:, ~set_zero]
-        if is_complex:
-            # keep both Re (standard WDM) and Im (Hilbert/quadrature companion)
-            tmp_w_mn[:, ~set_zero] = (
-                kappa * (-1) ** ((m_here + 1) * n_here)[~set_zero] * projected
-            )
-        else:
-            tmp_w_mn[:, ~set_zero] = (
-                kappa * (-1) ** ((m_here + 1) * n_here)[~set_zero] * self.xp.real(projected)
-            )
 
-        w_mn_active = self.xp.zeros((self.nchannels, Nf_act, settings.Nt), dtype=out_dtype)
+        # Frequency layers are INDEPENDENT: layer m needs only its own row of
+        # ``k`` and its own length-Nt iFFT. Doing all n_special at once
+        # materialises two (outer..., n_special, Nt) COMPLEX arrays at the same
+        # time -- 2.6 GiB of the 4.0 GiB peak for a batch of 8 over 2 years,
+        # for a template that occupies ~60 of 1451 time layers. Walking the
+        # layer axis in blocks bounds those two intermediates without changing
+        # a single arithmetic operation, so the result is bitwise identical.
+        #
+        # The block size is chosen from a byte budget rather than exposed as a
+        # tuning knob: the whole point is that the caller should not have to
+        # know n_special or Nt to avoid an out-of-memory failure.
+        per_layer_bytes = int(np.prod(self.outer_shape)) * settings.Nt * 16
+        budget = int(getattr(settings, "wdm_layer_budget_bytes", 0) or 0) or _WDM_LAYER_BUDGET
+        layer_chunk = int(getattr(settings, "wdm_layer_chunk", 0) or 0) or max(
+            1, min(n_special, budget // max(per_layer_bytes, 1))
+        )
+
+        for _lo in range(0, n_special, layer_chunk):
+            _hi = min(_lo + layer_chunk, n_special)
+            m_here = self.xp.repeat(m_special_1d[_lo:_hi, None], settings.Nt, axis=-1)
+            n_here = self.xp.tile(self.xp.arange(settings.Nt), (_hi - _lo, 1))
+
+            # Gather THIS block's frequency bins only, so the (outer, block, Nt)
+            # complex array is the largest thing alive rather than the full
+            # (outer, n_special, Nt).
+            _k = k[_lo:_hi]
+            _b = arr_in[..., _k] / settings.data_dt
+            # ``herm`` is what fold_shift_map returns; it IS ``neg_k | over_k``,
+            # both of which are now local to that method.
+            _herm = herm[_lo:_hi]
+            if _herm.any():
+                _b[..., _herm] = self.xp.conj(_b[..., _herm])
+            _b *= base_window
+            _a = self.xp.fft.ifft(_b, axis=-1)
+            del _b
+
+            set_zero = ((m_here == settings.Nf) | (m_here == 0)) & (
+                (m_here + n_here) % 2 != 0
+            )
+            projected = self.xp.conj(
+                settings.get_Cmn(m_here[~set_zero], n_here[~set_zero])
+            ) * _a[..., ~set_zero]
+            del _a
+            _phase = kappa * (-1) ** ((m_here + 1) * n_here)[~set_zero]
+
+            # Write via an explicit block, not chained indexing: assigning into
+            # ``tmp_w_mn[..., lo:hi, :][..., mask]`` relies on the first index
+            # returning a view, which is true for basic slicing but is exactly
+            # the sort of thing that silently stops being true.
+            _blk = self.xp.zeros(
+                self.outer_shape + (_hi - _lo, settings.Nt), dtype=out_dtype
+            )
+            _blk[..., ~set_zero] = (
+                _phase * projected if is_complex else _phase * self.xp.real(projected)
+            )
+            for _r in _full_rows:
+                if _lo <= _r < _hi:
+                    _full_rows[_r] = _blk[..., _r - _lo, :].copy()
+            tmp_w_mn[..., _lo:_hi, :] = _blk[..., t_lo:t_hi]
+            del projected, _blk
+
+        if self.backend.uses_cupy and _WDM_CLEAR_FFT_CACHE:
+            # Wiping the whole cuFFT plan cache here costs 172 ms PER CALL
+            # (measured: cProfile shows PlanCache.clear -> _clear_LinkedList at
+            # 0.172 s of a 0.178 s transform, and the cache reports 0 hits
+            # ever). That is ~30% of an entire MBH likelihood evaluation, so in
+            # a sampler it dominates everything else.
+            #
+            # The original comment read only "some issue with cupy and
+            # xp.real/imag", with no reproducer. Kept behind an opt-in env var
+            # rather than deleted, so the workaround is recoverable if that
+            # issue resurfaces: set LISATOOLS_WDM_CLEAR_FFT_CACHE=1.
+            cache = self.xp.fft.config.get_plan_cache()
+            cache.clear()
+
+        w_mn_active = self.xp.zeros(
+            self.outer_shape + (Nf_act, Nt_keep), dtype=out_dtype
+        )
         if include_top:
-            w_mn_active[:, 1:] = tmp_w_mn[:, 1:Nf_act]
-            w_mn_active[:, 0, 0::2] = tmp_w_mn[:, 0, 0::2] / np.sqrt(2.)
-            w_mn_active[:, 0, 1::2] = tmp_w_mn[:, -1, 0::2] / np.sqrt(2.)
+            w_mn_active[..., 1:, :] = tmp_w_mn[..., 1:Nf_act, :]
+            # Row 0 interleaves two sources by ABSOLUTE column parity: even
+            # columns come from m=0 at the same column, odd columns from m=Nf
+            # at column n-1. Windowing shifts the local index, so resolve the
+            # parity against absolute indices and read the two special rows,
+            # which were kept full length for exactly this reason.
+            _abs = self.xp.arange(t_lo, t_hi)
+            _even = (_abs % 2) == 0
+            _r0 = _full_rows[0]
+            _rN = _full_rows[n_special - 1]
+            w_mn_active[..., 0, _even] = _r0[..., _abs[_even]] / np.sqrt(2.)
+            w_mn_active[..., 0, ~_even] = _rN[..., _abs[~_even] - 1] / np.sqrt(2.)
         else:
-            w_mn_active[:] = tmp_w_mn[:, :Nf_act]
+            w_mn_active[...] = tmp_w_mn[..., :Nf_act, :]
 
-        output = w_mn_active[:, :, settings.active_slice_t]
+        # Already restricted to the active columns above, unless a strided
+        # active slice forced the old full-axis path.
+        output = (w_mn_active[..., settings.active_slice_t]
+                  if _slice_at_end else w_mn_active)
 
         return WDMSignal(output, settings=settings)
 
@@ -2219,6 +2366,10 @@ class WDMSettings(DomainSettingsBase):
         state.pop("_sparse_psd_fold_cache", None)
         state.pop("_sparse_psd_layer_fold_cache", None)
         state.pop("_wdm_layer_quadrature_cache", None)
+        # Layer-mask caches (PR #82): device arrays keyed on the CURRENT
+        # device; a copy on another device must rebuild them.
+        state.pop("_freq_layer_mask_cache", None)
+        state.pop("_time_layer_mask_cache", None)
         return state
 
     def __eq__(self, value):
@@ -2733,16 +2884,57 @@ class WDMSettings(DomainSettingsBase):
             ind_max_t = self.Nt - 1
         self._ind_max_t = ind_max_t
 
+    def _mask_cache_device_tag(self) -> Optional[int]:
+        """Current CUDA device id for the layer-mask caches; ``None`` on CPU."""
+        cuda = getattr(self.xp, "cuda", None)
+        if cuda is None:
+            return None
+        try:
+            return int(cuda.runtime.getDevice())
+        except Exception:
+            return None
+
     @property
     def frequency_layer_mask(self) -> Optional[np.ndarray]:
+        # CACHED. This is a @property that allocated a fresh (Nf,) device array
+        # on EVERY access, and diagnostic.inner_product touches it ~6x per call
+        # (two existence checks, two inside np.array_equal -- which also forces a
+        # device->host sync -- then two more selecting the branch). Measured 3780
+        # allocations across 60 template_likelihood calls (63 each), costing
+        # ~19.5 ms per likelihood INDEPENDENT of N_WIN (identical at N_WIN
+        # 414,720 / 207,360 / 103,680). The mask depends only on (Nf,
+        # active_slice_f), so it is cached and invalidated if either changes.
+        #
+        # The key also carries the CURRENT CUDA device (dev merge, 2026-09-29):
+        # ``self.xp.zeros`` lands on whichever device is current, and one
+        # settings object serves every GPU of a multi-device run, so a mask
+        # cached on device 0 must not be handed to a kernel on device 1.
+        # ``__getstate__`` drops both caches so copies rebuild them.
+        key = (self.Nf, self.active_slice_f, self._mask_cache_device_tag())
+        cached = getattr(self, "_freq_layer_mask_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
         mask = self.xp.zeros(self.Nf, dtype=bool)
         mask[self.active_slice_f] = True
+        try:
+            object.__setattr__(self, "_freq_layer_mask_cache", (key, mask))
+        except Exception:
+            pass          # frozen/slotted settings: fall back to recomputing
         return mask
     
     @property
     def time_layer_mask(self) -> Optional[np.ndarray]:
+        # Cached for the same reason as frequency_layer_mask above.
+        key = (self.Nt, self.active_slice_t, self._mask_cache_device_tag())
+        cached = getattr(self, "_time_layer_mask_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
         mask = self.xp.zeros(self.Nt, dtype=bool)
         mask[self.active_slice_t] = True
+        try:
+            object.__setattr__(self, "_time_layer_mask_cache", (key, mask))
+        except Exception:
+            pass
         return mask
         
     @property
