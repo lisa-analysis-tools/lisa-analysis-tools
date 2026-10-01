@@ -38,6 +38,10 @@ from lisatools.utils.constants import YRSID_SI
 from .domain import few_domain_guard
 
 
+class _SkipFew(Exception):
+    """Internal: a precomputed holder replaces the FEW call."""
+
+
 def host_holder(H):
     """Host (numpy) copy of a FEW SparseInfoHolder.
 
@@ -202,6 +206,7 @@ class EMRITDIonFly:
         Phi_r0: float,
         *add_args: Optional[tuple],
         include_minus_mkn: bool = True,
+        holder=None,
         **kwargs: Optional[dict],
     ):
         # (qS, phiS, qK, phiK) are ECLIPTIC polar angles -> the FEW viewing
@@ -235,7 +240,15 @@ class EMRITDIonFly:
 
         # Out-of-domain (a, p0, e0) raises bare ValueError/AssertionError in
         # FEW; re-raise typed so the sampler can score the point at -1e300.
+        if holder is not None:
+            # a precomputed FEW sparse holder on THIS fine grid (EMRIDirectWDM's one FEW
+            # call): no second FEW call
+            if self.n_fine is None:
+                raise ValueError("EMRITDIonFly(holder=...) needs the fine grid it was made on (t_fine/n_fine)")
+            Kerr_wave = holder
         try:
+            if holder is not None:
+                raise _SkipFew()
             with few_domain_guard():
                 Kerr_wave = self.wave_gen(
                     m1,
@@ -256,6 +269,8 @@ class EMRITDIonFly:
                     include_minus_mkn=include_minus_mkn,
                     **kwargs,
                 )
+        except _SkipFew:
+            pass
         finally:
             if _ik_saved is not None:
                 _ik.clear()

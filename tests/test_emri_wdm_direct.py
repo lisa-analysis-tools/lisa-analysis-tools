@@ -230,6 +230,41 @@ class AssemblyTest(unittest.TestCase):
         self.assertLess(rel, 2e-3, f"rel L2 {rel:.2e}")
 
 
+class HolderSliceTest(unittest.TestCase):
+    """slice_holder + track_rows: the tracks of a mode subset taken from the full holder's
+    tracks equal the tracks built from the sliced holder (same rows, same order), and the TOF
+    feed of the sliced holder equals the matching rows of the full feed."""
+
+    def test_subset_rows_match_sliced_holder(self):
+        from lisatools.sources.emri.emritdionfly import EMRITDIonFly
+        from lisatools.sources.emri.wdm_direct import harmonic_tracks_from_holder, slice_holder, track_rows
+
+        t_k = np.linspace(0.0, 1e6, 60)
+        rng = np.random.default_rng(4)
+        teuk = rng.normal(size=(t_k.size, 4)) + 1j * rng.normal(size=(t_k.size, 4))
+        ylms = rng.normal(size=8) + 1j * rng.normal(size=8)
+        H = SimpleNamespace(t_arr=t_k, teuk_modes=teuk, ylms=ylms, ls=np.array([2, 2, 3, 4]),
+                            ms=np.array([2, 0, 1, 3]), ks=np.zeros(4, int), ns=np.array([0, 1, -1, 2]),
+                            phases=np.stack([1e-3 * t_k, 0 * t_k, 3e-4 * t_k], -1), freqs=None,
+                            integrate_backwards=False)
+        integ = _FakeIntegrator()
+        t_pix = np.arange(5, 200) * 3600.0
+        full = harmonic_tracks_from_holder(H, integ, t_pix, a=0.9, xI0=1.0)
+        amp_f, ph_f = EMRITDIonFly.mode_amp_phase(H, include_minus_mkn=True)
+        for idx in (np.array([1, 2]), np.array([0, 3]), np.array([1])):
+            Hs = slice_holder(H, idx)
+            sub = harmonic_tracks_from_holder(Hs, integ, t_pix, a=0.9, xI0=1.0)
+            rows = track_rows(H, idx)
+            self.assertEqual(len(rows), len(sub))
+            for r, tr in zip(rows, sub):
+                self.assertEqual(full[r].lmkn, tr.lmkn)
+                np.testing.assert_array_equal(full[r].amp, tr.amp)
+                np.testing.assert_array_equal(full[r].phase, tr.phase)
+            amp_s, ph_s = EMRITDIonFly.mode_amp_phase(Hs, include_minus_mkn=True)
+            np.testing.assert_allclose(amp_s, amp_f[rows], rtol=1e-14, atol=0)
+            np.testing.assert_allclose(ph_s, ph_f[rows], rtol=1e-12, atol=1e-12)
+
+
 class VectorisedAccumulateTest(AssemblyTest):
     """accumulate_harmonic_batch (one table call + one scatter-add for every sub, channel
     and pixel) == the per-(sub, channel) loop it replaced, stats included."""

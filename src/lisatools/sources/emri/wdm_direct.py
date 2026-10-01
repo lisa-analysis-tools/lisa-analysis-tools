@@ -289,6 +289,40 @@ def _accumulate_harmonic_batch_loop(acc, table, tracks, tracer, n_ok, tail_td, *
     return stats
 
 
+def slice_holder(H, idx):
+    """The host holder restricted to modes ``idx`` (m >= 0 rows; the -m partners' Ylm follow)."""
+    import types
+
+    idx = np.asarray(idx)
+    nm = len(H.ls)
+    ylms = np.asarray(H.ylms)
+    yl = np.concatenate([ylms[idx], ylms[nm + idx]]) if ylms.shape[0] == 2 * nm else ylms[idx]
+    return types.SimpleNamespace(t_arr=H.t_arr, teuk_modes=np.asarray(H.teuk_modes)[:, idx], phases=H.phases,
+                                 freqs=H.freqs, ylms=yl, ls=np.asarray(H.ls)[idx], ms=np.asarray(H.ms)[idx],
+                                 ks=np.asarray(H.ks)[idx], ns=np.asarray(H.ns)[idx],
+                                 integrate_backwards=H.integrate_backwards)
+
+
+def track_rows(H, idx):
+    """Rows of ``harmonic_tracks_from_holder(H, ...)`` for modes ``idx``, in the order the same
+    function (and ``EMRITDIonFly.mode_amp_phase``) gives for ``slice_holder(H, idx)``: the m >= 0
+    modes, then the -m partners of those with m != 0."""
+    ms = np.asarray(H.ms)
+    nm = ms.size
+    with_minus = np.asarray(H.ylms).shape[0] == 2 * nm
+    minus_row = np.full(nm, -1)
+    minus_row[ms != 0] = nm + np.arange(int(np.sum(ms != 0)))
+    rows = list(np.asarray(idx))
+    if with_minus:
+        rows += [int(minus_row[i]) for i in idx if ms[i] != 0]
+    return rows
+
+
+def subset_track(tr, pos):
+    """A HarmonicTrack restricted to sample positions ``pos``."""
+    return HarmonicTrack(tr.lmkn, tr.t[pos], tr.amp[pos], tr.phase[pos], tr.f[pos], tr.fdot[pos], tr.fddot[pos])
+
+
 class EMRIDirectWDM:
     """EMRI template built directly in the WDM domain.
 
@@ -316,12 +350,13 @@ class EMRIDirectWDM:
     """
 
     def __init__(self, few_gen, table, wdm_set, *, orbits, tdi_config, t_start, data_t0,
-                 Nt_sub=128, n_fine=None, fine_dt=1800.0, fine_dt_plunge=80.0, mode_batch=64,
+                 Nt_sub=128, n_fine=None, fine_dt=1800.0, fine_dt_plunge=80.0, mode_batch=None,
                  pixel_edge=8, num_m_layers=2, interp="spline", force_backend="cpu"):
         self.few_gen, self.table, self.wdm = few_gen, table, wdm_set
         self.orbits, self.tdi_config = orbits, tdi_config
         self.t_start, self.data_t0 = float(t_start), float(data_t0)
-        self.Nt_sub, self.mode_batch, self.pixel_edge = int(Nt_sub), int(mode_batch), int(pixel_edge)
+        self.Nt_sub, self.pixel_edge = int(Nt_sub), int(pixel_edge)
+        self.mode_batch = None if mode_batch is None else int(mode_batch)   # None: all modes in one batch
         # layers m-num_m_layers..m+num_m_layers per pixel: a chirping carrier near a layer edge
         # puts ~2.5e-4 of its energy two layers away (A8 gate); needs table support [-2, 3) df
         self.num_m_layers = int(os.environ.get("EMRI_DIRECT_NUM_M_LAYERS", num_m_layers))
@@ -340,46 +375,71 @@ class EMRIDirectWDM:
             table.set_interp_method(interp)
         self.last_stats = {}
 
-    def _mode_list(self, few_args, few_kwargs):
+    def _few_holder(self, few_args, few_kwargs, new_t, mode_selection=None):
+        """ONE FEW call on the fine grid ``new_t`` (FEW clock) -> host sparse holder.
+
+        Mode selection by ``few_kwargs['mode_selection_threshold']`` unless ``mode_selection``
+        is given. The generator's inspiral_kwargs are restored afterwards (FEW merges
+        call-time ones permanently)."""
         from few.utils.utility import get_viewing_angles
+
+        from .emritdionfly import host_holder
 
         m1, m2, a, p0, e0, x0, dist, qS, phiS, qK, phiK, Pp, Pt, Pr = few_args[:14]
         th, ph = get_viewing_angles(qS, phiS, qK, phiK)
+        kw = {k: v for k, v in few_kwargs.items() if k != "inspiral_kwargs"}
+        if mode_selection is not None:
+            kw.pop("mode_selection_threshold", None)
+            kw["mode_selection"] = [tuple(int(v) for v in md) for md in mode_selection]
+        new_t = np.asarray(new_t, dtype=float)
         saved = dict(self.few_gen.inspiral_kwargs)
-        span = self.wdm.Nt * self.wdm.layer_dt
-        lo = self.data_t0 - self.t_start
         try:
             H = self.few_gen(m1, m2, a, p0, e0, x0, th, ph, dist=dist, Phi_phi0=Pp, Phi_theta0=Pt,
-                             Phi_r0=Pr, T=(lo + span + 2000.0) / 3.15581497635456e7, dt=self.wdm.data_dt,
+                             Phi_r0=Pr, T=float(new_t[-1]) / 3.15581497635456e7, dt=self.wdm.data_dt,
                              return_sparse_holder=True, include_minus_mkn=True,
-                             inspiral_kwargs={"upsample": True, "fix_t": True,
-                                              "new_t": np.linspace(max(lo, 0.0), lo + span, 256)},
-                             **{k: v for k, v in few_kwargs.items() if k != "inspiral_kwargs"})
+                             inspiral_kwargs={"upsample": True, "fix_t": True, "new_t": new_t}, **kw)
         finally:
             self.few_gen.inspiral_kwargs.clear()
             self.few_gen.inspiral_kwargs.update(saved)
-        from .emritdionfly import host_holder
+        return host_holder(H)                               # GPU generator: cupy -> host
 
-        H = host_holder(H)                                  # GPU generator: cupy -> host
-        modes = [(int(l), int(m), int(k), int(n)) for l, m, k, n in zip(H.ls, H.ms, H.ks, H.ns)]
-        return modes, self._chunk_start(H, few_args)
-
-    def _chunk_start(self, H, few_args):
-        """Earliest time (FEW clock) at which any harmonic of the mode-selection holder ``H``
-        hands off to the plunge chunk inside the window, or ``None`` if none does. The chunk
-        reads the dense response, so the fine grid must be dense from there on."""
-        t_arr = np.asarray(H.t_arr.get() if hasattr(H.t_arr, "get") else H.t_arr)
+    def _pixel_times(self, H):
+        """Pixel indices (and times, FEW clock) inside the holder's trajectory span."""
+        t_arr = np.asarray(H.t_arr)
         lo = self.data_t0 - self.t_start
         n_all = np.arange(self.pixel_edge, self.wdm.Nt - self.pixel_edge)
         t_rel = lo + n_all * self.wdm.layer_dt
-        t_rel = t_rel[(t_rel >= t_arr[0]) & (t_rel <= t_arr[-1])]
-        first = np.inf
-        if t_rel.size:
+        inside = (t_rel >= t_arr[0]) & (t_rel <= t_arr[-1])
+        return n_all[inside], t_rel[inside]
+
+    def _mode_list(self, few_args, few_kwargs):
+        """Modes kept at the call's threshold and the earliest in-window handoff time.
+
+        One FEW call on the coarse fine grid; the holder and its harmonic tracks are kept
+        (``_last_holder``, ``_last_tracks``) so the template reuses them."""
+        H = self._few_holder(few_args, few_kwargs, self._fine_grid(None))
+        modes = [(int(l), int(m), int(k), int(n)) for l, m, k, n in zip(H.ls, H.ms, H.ks, H.ns)]
+        n_in, t_rel = self._pixel_times(H)
+        integ = self.few_gen.inspiral_generator.inspiral_generator
+        tracks = harmonic_tracks_from_holder(H, integ, t_rel, a=few_args[2], xI0=few_args[5]) if t_rel.size else []
+        self._last_holder, self._last_tracks, self._last_track_n = H, tracks, n_in
+        return modes, self._chunk_start(H, few_args, tracks=tracks, t_rel=t_rel)
+
+    def _chunk_start(self, H, few_args, tracks=None, t_rel=None):
+        """Earliest time (FEW clock) at which any harmonic of the holder ``H`` hands off to the
+        plunge chunk inside the window, or ``None`` if none does. The chunk reads the dense
+        response, so the fine grid must be dense from there on."""
+        t_arr = np.asarray(H.t_arr)
+        lo = self.data_t0 - self.t_start
+        if tracks is None:
+            _, t_rel = self._pixel_times(H)
             integ = self.few_gen.inspiral_generator.inspiral_generator
-            for tr in harmonic_tracks_from_holder(H, integ, t_rel, a=few_args[2], xI0=few_args[5]):
-                k = handoff_pixel(tr, self.wdm.layer_dt, self.wdm.layer_df, self.fdot_axis_max)
-                if k < t_rel.size:
-                    first = min(first, float(t_rel[k]))
+            tracks = harmonic_tracks_from_holder(H, integ, t_rel, a=few_args[2], xI0=few_args[5]) if t_rel.size else []
+        first = np.inf
+        for tr in tracks:
+            k = handoff_pixel(tr, self.wdm.layer_dt, self.wdm.layer_df, self.fdot_axis_max)
+            if k < t_rel.size:
+                first = min(first, float(t_rel[k]))
         span = self.wdm.Nt * self.wdm.layer_dt
         if t_arr[-1] < lo + span - 1.0:                      # stops in the window
             first = min(first, float(t_arr[-1]) - self.Nt_sub * self.wdm.layer_dt)
@@ -415,34 +475,55 @@ class EMRIDirectWDM:
         acc = xp.zeros((self.tdi_config.nchannels, Nf, Nt))
         few_kwargs = dict(few_kwargs)
         modes = few_kwargs.pop("mode_selection", None)      # explicit (l, m, k, n) list, e.g. gates
-        t_fine, chunk_start = None, "unknown"                 # explicit modes: dense everywhere
-        if modes is None:
-            modes, chunk_start = self._mode_list(few_args, few_kwargs)
-        if self.n_fine_fixed is not None:
-            self.n_fine = self.n_fine_fixed
-        elif chunk_start == "unknown":
-            self.n_fine = max(64, int(span / self.fine_dt_plunge))
-        else:
-            t_fine = self._fine_grid(chunk_start)
-            self.n_fine = int(t_fine.size)
-        self.last_t_fine = t_fine                             # None: uniform n_fine over the window
         totals = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
+        H = tracks_all = n_tr = None
+        t_fine, chunk_start = None, "unknown"
+        if modes is None and self.n_fine_fixed is None:
+            # ONE FEW call on the coarse grid gives the modes, the holder the response is fed
+            # from and the harmonic tracks; a second (explicit-mode) call only when a harmonic
+            # hands off to the plunge chunk inside the window and the grid must be densified
+            modes, chunk_start = self._mode_list(few_args, few_kwargs)
+            H, tracks_all, n_tr = self._last_holder, self._last_tracks, self._last_track_n
+            t_fine = self._fine_grid(chunk_start)
+            if chunk_start is not None:
+                H = self._few_holder(few_args, few_kwargs, t_fine, mode_selection=modes)
+                n_tr, t_rel = self._pixel_times(H)
+                integ = self.few_gen.inspiral_generator.inspiral_generator
+                tracks_all = harmonic_tracks_from_holder(H, integ, t_rel, a=few_args[2], xI0=few_args[5])
+            self.n_fine = int(t_fine.size)
+        else:                                               # explicit modes / fixed n_fine: FEW per batch
+            if modes is None:
+                modes, chunk_start = self._mode_list(few_args, few_kwargs)
+            self.n_fine = self.n_fine_fixed if self.n_fine_fixed is not None else max(64, int(span / self.fine_dt_plunge))
+        self.last_t_fine = t_fine                             # None: uniform n_fine over the window
         few_kwargs.pop("mode_selection_threshold", None)
 
-        for j in range(0, len(modes), self.mode_batch):
+        nm = len(modes)
+        batch = nm if (self.mode_batch is None or self.mode_batch <= 0) else int(self.mode_batch)
+        for j in range(0, nm, batch):
+            idx = np.arange(j, min(j + batch, nm))
             fly = EMRITDIonFly(self.few_gen, self.orbits, self.tdi_config, dt, T_traj, self.t_start,
                                frame="icrs_special", n_fine=None if t_fine is not None else self.n_fine,
                                t_fine_window=(self.data_t0, self.data_t0 + span), t_fine=t_fine)
-            out = fly(*few_args, mode_selection=modes[j:j + self.mode_batch], **few_kwargs)
+            if H is not None:
+                Hb = H if idx.size == nm else slice_holder(H, idx)
+                out = fly(*few_args, holder=Hb, **few_kwargs)
+            else:
+                out = fly(*few_args, mode_selection=[modes[i] for i in idx], **few_kwargs)
+                Hb = fly.last_holder
             x = np.asarray(out.x.get() if hasattr(out.x, "get") else out.x)
-            integ = self.few_gen.inspiral_generator.inspiral_generator
-            H = fly.last_holder
-            t_traj_end = float(np.asarray(H.t_arr)[-1])
+            t_traj_end = float(np.asarray(Hb.t_arr)[-1])
             ok_t = (t_pix > x[:, 0].max()) & (t_pix < x[:, -1].min()) & (t_pix - self.t_start <= t_traj_end)
             n_ok, tt = n_all[ok_t], t_pix[ok_t]
             if n_ok.size == 0:
                 continue
-            tracks = harmonic_tracks_from_holder(H, integ, tt - self.t_start, a=few_args[2], xI0=few_args[5])
+            if tracks_all is not None:
+                pos = np.searchsorted(n_tr, n_ok)
+                assert np.array_equal(n_tr[pos], n_ok)
+                tracks = [subset_track(tracks_all[i], pos) for i in track_rows(H, idx)]
+            else:
+                integ = self.few_gen.inspiral_generator.inspiral_generator
+                tracks = harmonic_tracks_from_holder(Hb, integ, tt - self.t_start, a=few_args[2], xI0=few_args[5])
             tracer = tracer_from_tof_output(out, xp.asarray(tt))
             assert tracer[0].shape[0] == len(tracks), (tracer[0].shape, len(tracks))
             x_lo, x_hi = x[:, 0][:, None, None], x[:, -1][:, None, None]
@@ -461,6 +542,6 @@ class EMRIDirectWDM:
             for key in totals:
                 totals[key] += st[key]
             del out, fly
-        self.last_stats = dict(modes=len(modes), n_fine=self.n_fine,
+        self.last_stats = dict(modes=nm, n_fine=self.n_fine,
                                chunk_start=None if chunk_start == "unknown" else chunk_start, **totals)
         return WDMSignal(acc, wdm)
