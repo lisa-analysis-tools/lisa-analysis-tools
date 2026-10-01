@@ -1,0 +1,140 @@
+"""Stage timing of the direct-to-WDM EMRI template (GPU or CPU): where do the milliseconds go?
+
+Wraps the stages of one EMRIDirectWDM call with timers (a device synchronise before each
+timer stops, so GPU time lands on the stage that launched it) and prints per-template totals
+next to the production template's wall time on the same grid.
+
+    python scripts/emri/emri_direct_stage_timing.py --backend cuda13x --dt 2.5 --reps 5 \
+        --catalog /path/emri_cat_mojito_lite_processed_MT.hdf5 --orbits equal-arm \
+        --direct-table wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5 --thresh 1e-3,1e-5
+"""
+import argparse
+import collections
+import functools
+import os
+import sys
+import time
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import emri_batch_speed as B  # noqa: E402  (source loader, grid conventions)
+import emri_tof_xyz_threeway as W  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--src", type=int, default=1)
+    ap.add_argument("--backend", default="cpu")
+    ap.add_argument("--dt", type=float, default=2.5)
+    ap.add_argument("--days", type=float, default=180.0)
+    ap.add_argument("--reps", type=int, default=5)
+    ap.add_argument("--thresh", default="1e-3,1e-5")
+    ap.add_argument("--mode-batch", type=int, default=64)
+    ap.add_argument("--catalog", default=None)
+    ap.add_argument("--l1-dir", default=None)
+    ap.add_argument("--orbits", choices=("auto", "l1", "equal-arm"), default="auto")
+    ap.add_argument("--direct-table", required=True)
+    args = ap.parse_args()
+
+    from lisatools.domains import TDSettings, TDSignal, WDMLookupTable, WDMSettings
+    from lisatools.globalfit.stock import erebor
+    from lisatools.response import tdionfly as TF
+    from lisatools.response.tdiconfig import TDIConfig
+    from lisatools.sources.emri import emritdionfly as EF
+    from lisatools.sources.emri import wdm_direct as WD
+    from lisatools.sources.emri.response import get_emri_response_wrapper
+    import lisatools.wdm_het as WH
+
+    gpu = args.backend != "cpu"
+    if gpu:
+        import cupy as cp
+
+    def sync():
+        if gpu:
+            cp.cuda.Device().synchronize()
+
+    T = collections.defaultdict(float)
+    C = collections.Counter()
+    LABELS = []
+
+    def wrap(owner, name, label):
+        f = getattr(owner, name)
+        LABELS.append(label)
+
+        @functools.wraps(f)
+        def g(*a, **k):
+            sync()
+            t0 = time.perf_counter()
+            try:
+                return f(*a, **k)
+            finally:
+                sync()
+                T[label] += time.perf_counter() - t0
+                C[label] += 1
+        import inspect
+        static = isinstance(owner, type) and isinstance(inspect.getattr_static(owner, name), staticmethod)
+        setattr(owner, name, staticmethod(g) if static else g)
+
+    nf = int(round(B.LAYER_DT / args.dt))
+    nt = int(round(args.days * 86400.0 / B.LAYER_DT))
+    n = nf * nt
+    params, data_t0, orb = B.load_source(args.src, args.backend, n * args.dt, catalog=args.catalog,
+                                         l1_dir=args.l1_dir, orbits=args.orbits)
+    fit = erebor.get_stock("all_sources")
+    off = data_t0 - W.REF
+    oi = int(round(off / args.dt))
+    tdi = TDIConfig(fit.general.tdi_gen_str, force_backend=args.backend)
+    wg = get_emri_response_wrapper(Tobs=(n + oi) * args.dt + 4e4, dt=args.dt, t_start=W.REF,
+                                   t0_shift_to_data=off - oi * args.dt, tdi_config=tdi,
+                                   tdi_chan=fit.general.tdi_chan, order=fit.emri.response_order,
+                                   force_backend=args.backend, orbits=orb)
+    gen = wg.waveform_gen.waveform_generator
+    tds = TDSettings(n, args.dt, t0=0.0, force_backend=args.backend)
+    wdm = WDMSettings(nf, nt, args.dt, force_backend=args.backend)
+    table = WDMLookupTable.from_file(args.direct_table, force_backend=args.backend)
+    direct = WD.EMRIDirectWDM(gen, table, wdm, orbits=orb, tdi_config=tdi, t_start=W.REF, data_t0=data_t0,
+                              mode_batch=args.mode_batch, force_backend=args.backend)
+
+    wrap(WD.EMRIDirectWDM, "_mode_list", "1 mode list (FEW call #1 + handoff check)")
+    wrap(type(gen), "__call__", "  FEW generator calls (both)")
+    wrap(EF.EMRITDIonFly, "__call__", "2 TOF total (FEW call #2 + feed + response)")
+    wrap(EF.EMRITDIonFly, "mode_amp_phase", "  TOF feed: mode amp/phase")
+    wrap(TF.TDTDIonTheFly, "__init__", "  TOF input splines")
+    wrap(TF.TDTDIonTheFly, "__call__", "  TOF response kernel + output splines")
+    wrap(WD, "harmonic_tracks_from_holder", "3 harmonic tracks")
+    wrap(WD, "tracer_from_tof_output", "4 tracer (output spline evals)")
+    wrap(WD, "accumulate_harmonic_batch", "5 lookup + scatter-add")
+    wrap(type(table), "get_wdm_coeffs", "  table get_wdm_coeffs")
+    wrap(WH, "wdm_chunk_of_td", "6 plunge chunks")
+
+    def prod(thr):
+        h = wg(*params, mode_selection_threshold=thr)
+        xp = cp if gpu else np
+        h = xp.stack([xp.asarray(c) for c in h]) if isinstance(h, (list, tuple)) else xp.atleast_2d(h)
+        return TDSignal(h[:3, oi:oi + n], tds).transform(wdm).arr
+
+    for thr in [float(x) for x in args.thresh.split(",")]:
+        prod(thr), direct(*params, mode_selection_threshold=thr)       # warm-up
+        sync()
+        t0 = time.perf_counter()
+        for _ in range(args.reps):
+            prod(thr)
+        sync()
+        t_prod = (time.perf_counter() - t0) / args.reps
+        T.clear()
+        C.clear()
+        t0 = time.perf_counter()
+        for _ in range(args.reps):
+            direct(*params, mode_selection_threshold=thr)
+        sync()
+        t_dir = (time.perf_counter() - t0) / args.reps
+        print(f"\n[stages] thr={thr:g} modes={direct.last_stats.get('modes')} n_fine={direct.last_stats.get('n_fine')} "
+              f"backend={args.backend} grid Nf={nf} Nt={nt} dt={args.dt}: direct {t_dir * 1e3:.0f} ms, "
+              f"production {t_prod * 1e3:.0f} ms (per template)", flush=True)
+        for k in [lab for lab in LABELS if lab in T]:
+            print(f"  {k:48s} {T[k] / args.reps * 1e3:8.1f} ms  ({C[k] // args.reps} calls)", flush=True)
+
+
+if __name__ == "__main__":
+    main()
