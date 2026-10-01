@@ -276,6 +276,21 @@ class EMRITDIonFly:
                 _ik.clear()
                 _ik.update(_ik_saved)
 
+        t_arr_in, mode_amp, mode_phase, t_arr_tdi = self.prepare_feed(Kerr_wave, include_minus_mkn)
+        return self.run_response([(t_arr_in, mode_amp, mode_phase, t_arr_tdi, psi, lam, beta)])
+
+    def sky(self, qS, phiS, qK, phiK):
+        """(theta, phi) for FEW and (psi, lam, beta) for the response, in this instance's frame."""
+        theta, phi = get_viewing_angles(qS, phiS, qK, phiK)
+        psi = get_polarization_angle(qS, phiS, qK, phiK)
+        if self.frame == "icrs_special":
+            lam, beta = ecliptic_to_icrs(phiS, np.pi / 2 - qS)
+        else:
+            lam, beta = phiS, np.pi / 2 - qS
+        return theta, phi, psi, lam, beta
+
+    def prepare_feed(self, Kerr_wave, include_minus_mkn=True):
+        """Host holder -> (t_arr_in, mode_amp, mode_phase, t_arr_tdi) for the response."""
         Kerr_wave = host_holder(Kerr_wave)   # GPU generator: cupy holder -> host copy
         self.last_holder = Kerr_wave   # consumers (EMRIDirectWDM) need the same trajectory's modes
         mode_amp, mode_phase = self.mode_amp_phase(
@@ -318,22 +333,32 @@ class EMRITDIonFly:
                 "delay trim leaves too few for the response grid. Pass n_fine (e.g. span/80 s) "
                 "to feed a fine trajectory."
             )
-        num_sub = mode_amp.shape[0]
+        return t_arr_in, mode_amp, mode_phase, t_arr_tdi
 
+    def run_response(self, feeds):
+        """ONE TDI-on-the-fly response for every sub of every feed.
+
+        ``feeds``: list of ``(t_arr_in, mode_amp, mode_phase, t_arr_tdi, psi, lam, beta)`` (one per
+        template, e.g. from :meth:`prepare_feed`); all must share the fine-grid lengths. The
+        output's sub axis is the concatenation in feed order. Many templates in one call fill
+        the GPU (the kernel launches one block per sub)."""
+        t_in = np.concatenate([f[0] for f in feeds], axis=0)
+        amp = np.concatenate([f[1] for f in feeds], axis=0)
+        ph = np.concatenate([f[2] for f in feeds], axis=0)
+        t_tdi = np.concatenate([f[3] for f in feeds], axis=0)
+        num_sub = amp.shape[0]
         self.tdi_gen = TDTDIonTheFly(
-            t_arr_tdi,
-            mode_amp,
-            mode_phase,
+            t_tdi,
+            amp,
+            ph,
             self.dt,
             num_sub,
-            t_input=t_arr_in,
+            t_input=t_in,
             tdi_config=self.tdi_config,
             orbits=self.orbits,
         )
-
         inc = np.zeros(num_sub)
-        psi_in = np.full(num_sub, psi)
-        lam_in = np.full(num_sub, lam)
-        beta_in = np.full(num_sub, beta)
-        # sky + polarization in the ECLIPTIC frame, matching frame="ecliptic" orbits.
+        psi_in = np.concatenate([np.full(f[1].shape[0], f[4]) for f in feeds])
+        lam_in = np.concatenate([np.full(f[1].shape[0], f[5]) for f in feeds])
+        beta_in = np.concatenate([np.full(f[1].shape[0], f[6]) for f in feeds])
         return self.tdi_gen(inc, psi_in, lam_in, beta_in, return_spline=True)
