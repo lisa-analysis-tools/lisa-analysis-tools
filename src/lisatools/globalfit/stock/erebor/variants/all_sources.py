@@ -70,6 +70,7 @@ from ..source_runtime import (
     SourceSignalGen,
     build_source_moves,
     find_source_cfg,
+    mbh_injection_duration,
     make_emri_injections,
     make_mbh_injections,
     make_sobbh_injections,
@@ -543,7 +544,7 @@ class AllSourcesGlobalFit(EreborFit):
                 tdi_gen_str=gs.tdi_gen_str,
                 synth_force_backend=force_backend,
                 mbh_phenom_kwargs=dict(
-                    waveform_duration=_mbh.waveform_duration,
+                    waveform_duration=mbh_injection_duration(_mbh),
                     higher_modes=_mbh.higher_modes,
                     phenom_tol=_mbh.phenom_tol,
                     start_freq=_mbh.start_freq,
@@ -650,7 +651,7 @@ class AllSourcesGlobalFit(EreborFit):
                             tdi_gen_str=gs.tdi_gen_str,
                             sobbh_reference_time=gs.sobbh_reference_time,
                             mbh_phenom_kwargs=dict(
-                                waveform_duration=mbh.waveform_duration,
+                                waveform_duration=mbh_injection_duration(mbh),
                                 higher_modes=mbh.higher_modes,
                                 phenom_tol=mbh.phenom_tol,
                                 start_freq=mbh.start_freq,

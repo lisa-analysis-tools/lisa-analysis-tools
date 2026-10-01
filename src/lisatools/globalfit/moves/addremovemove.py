@@ -759,8 +759,11 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
             os.environ.get(f"{p}_CHECK_LL")
             or os.environ.get("ADDREMOVE_CHECK_LL", "1")
         ).strip().lower()
+        # ``{BRANCH}_CHECK_LL_EVERY`` wins when set; otherwise the class
+        # default (every visit here; subclasses whose cross-check is a costly
+        # slow-path rebuild override ``_check_ll_every_default``).
         self.check_ll_every = max(
-            1, int(os.environ.get(f"{p}_CHECK_LL_EVERY", "1"))
+            1, int(os.environ.get(f"{p}_CHECK_LL_EVERY") or self._check_ll_every_default)
         )
         # Per-leaf cold-chain <d|h>/<h|h> sub-state record. On the slow
         # container path it costs one EXTRA nwalkers waveform batch per
@@ -1432,6 +1435,8 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
     #: overrides): OFF on the slow container path (one extra nwalkers
     #: waveform batch per leaf); fast-kernel subclasses set "1".
     _record_dh_default = "0"
+    #: ``{BRANCH}_CHECK_LL_EVERY`` when the env var is unset (see _setup_debug)
+    _check_ll_every_default = "1"
 
     def _record_leaf_inner_products(self, new_state, add_coords_in, leaf):
         """Record this leaf's cold-chain ``<d|h>``, ``<h|h>`` on the sub-state.

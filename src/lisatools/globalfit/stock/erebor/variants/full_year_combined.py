@@ -63,6 +63,7 @@ from ..source_runtime import (
     build_source_moves,
     default_source_ids,
     find_source_cfg,
+    mbh_injection_duration,
     prepare_emri_branch,
     prepare_mbh_branch,
     prepare_sobbh_branch,
@@ -388,7 +389,7 @@ class FullYearCombinedGlobalFit(EreborFit):
                 tdi_gen_str=gs.tdi_gen_str,
                 sobbh_reference_time=gs.sobbh_reference_time,
                 mbh_phenom_kwargs=dict(
-                    waveform_duration=mbh.waveform_duration,
+                    waveform_duration=mbh_injection_duration(mbh),
                     higher_modes=mbh.higher_modes,
                     phenom_tol=mbh.phenom_tol,
                     start_freq=mbh.start_freq,
