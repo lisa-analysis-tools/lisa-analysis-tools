@@ -4265,9 +4265,16 @@ export GB_SEARCH_SEED_ITERS=0
 # 0 writes at every boundary. Both pinned explicitly here rather than left
 # to the code defaults, because on a SPOT partition this is the knob that
 # decides how much a preemption costs.
-export MIDIT_CHECKPOINT=1
+# Overridable from the command line since 2026-10-01 (carried from the 6mo
+# script, where the reasoning lives): `MIDIT_CHECKPOINT=0 ./submit...` for a
+# legged + ratcheted search; default 1 otherwise.
+export MIDIT_CHECKPOINT=${MIDIT_CHECKPOINT:-1}
 export MIDIT_CHECKPOINT_MIN_INTERVAL=${MIDIT_CHECKPOINT_MIN_INTERVAL:-600}
-echo "[V9-CKPT] mid-iteration checkpoints ON, min interval ${MIDIT_CHECKPOINT_MIN_INTERVAL}s"
+if [ "${MIDIT_CHECKPOINT}" = "1" ]; then
+  echo "[V9-CKPT] mid-iteration checkpoints ON, min interval ${MIDIT_CHECKPOINT_MIN_INTERVAL}s"
+else
+  echo "[V9-CKPT] mid-iteration checkpoints OFF (MIDIT_CHECKPOINT=${MIDIT_CHECKPOINT}); under GB_SEARCH_LEGS a row lands after every leg instead"
+fi
 echo "[V9-CKPT] watch: [MIDIT_CKPT] wrote ... at stored iteration N (boundary '...')"
 
 # ============================================================================
