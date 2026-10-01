@@ -712,6 +712,10 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # these is new rather than changed.
             "GF_MONITOR_AFTER_SAVE", "GF_MONITOR_ITER",
             "GF_MONITOR_SNAPSHOT", "GF_MONITOR_TIMEOUT",
+            # V9-25 (2026-09-30): mbh_pe on the batched, windowed MBH
+            # likelihood at B=8, response order 8 pinned. v8 predates the
+            # knobs entirely; SixMonthMBHBatchedTest pins the block.
+            "MBH_LIKELIHOOD", "MBH_BATCH_MAX_SIZE", "MBH_RESPONSE_ORDER",
         }
         drift = {
             k: (self.v8.get(k), self.v9.get(k))
@@ -722,6 +726,151 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             and k not in allowed
         }
         self.assertEqual(drift, {}, f"undeclared v8 -> v9 drift: {drift}")
+
+
+def _mbh_preflight_source(path):
+    """The python body of the launcher's MBH preflight heredoc."""
+    with open(path) as fh:
+        lines = fh.read().split("\n")
+    start = next(i for i, l in enumerate(lines) if l.startswith("# MBH PREFLIGHT."))
+    head = next(i for i in range(start, len(lines))
+                if lines[i] == "python - <<'PYEOF' || exit 2")
+    end = next(i for i in range(head + 1, len(lines)) if lines[i] == "PYEOF")
+    return "\n".join(lines[head + 1:end])
+
+
+class SixMonthMBHBatchedTest(unittest.TestCase):
+    """V9-25 (2026-09-30): mbh_pe runs the batched, windowed MBH likelihood.
+
+    ``MBH_LIKELIHOOD=batched`` makes ``build_mbh_move_runtime`` build
+    ``MBHBatchedLikeMove`` on every compute rank. B=8 is the controller's
+    ruling off the H100 benchmark on the production 6-month grid (B=8 +8.5 GB
+    at 0.037 s/row vs B=16 +18.5 GB at 0.034). An unknown env var is silently
+    ignored, so the launcher preflights the knobs through the real settings
+    class and the real consistency rule; these tests run that preflight.
+    """
+
+    def setUp(self):
+        self.v9 = _exports(SIX_MO_V9)
+        self.three = _exports(THREE_MO_V9)
+
+    def test_mbh_pe_runs_batched_at_b8_with_order_8(self):
+        self.assertEqual(self.v9["MBH_LIKELIHOOD"], "batched")
+        self.assertEqual(self.v9["MBH_BATCH_MAX_SIZE"], "8")
+        self.assertEqual(self.v9["MBH_RESPONSE_ORDER"], "8")
+
+    def test_every_mbh_knob_is_overridable_from_the_launch_line(self):
+        """``MBH_LIKELIHOOD=full`` is the escape and ``MBH_RESPONSE_ORDER=30``
+        restores the old order: a hard ``export K=v`` would make both reach
+        nothing (the MIDIT_CHECKPOINT lesson)."""
+        src = open(SIX_MO_V9).read()
+        for knob, default in (("MBH_LIKELIHOOD", "batched"),
+                              ("MBH_BATCH_MAX_SIZE", "8"),
+                              ("MBH_RESPONSE_ORDER", "8")):
+            self.assertRegex(
+                src, rf"(?m)^export {knob}=\$\{{{knob}:-{default}\}}$", knob)
+
+    def test_nothing_in_the_launcher_conflicts_with_batched(self):
+        """Batched pins BOTH generators to the 90 d window and refuses an
+        explicit MBH_WAVEFORM_DURATION or USE_TDIONFLY; the cross-check
+        cadence stays at the batched move's own default (every 10th visit)."""
+        for knob in ("MBH_WAVEFORM_DURATION", "USE_TDIONFLY",
+                     "MBH_CHECK_LL_EVERY", "MBH_CHECK_LL"):
+            self.assertNotIn(knob, self.v9, knob)
+
+    def _run_preflight(self, **env):
+        """Exec the launcher's MBH preflight in-process: (exit code, stdout)."""
+        import contextlib
+        import io
+        from unittest import mock
+
+        # import BEFORE patching the env: erebor's module-level defaults
+        # snapshot env-backed fields at import time and must not capture the
+        # patched values for the rest of this process
+        from lisatools.globalfit.stock.erebor import source_runtime  # noqa: F401
+
+        code = compile(_mbh_preflight_source(SIX_MO_V9), "mbh_preflight", "exec")
+        base = {k: self.v9[k] for k in
+                ("MBH_LIKELIHOOD", "MBH_BATCH_MAX_SIZE", "MBH_RESPONSE_ORDER")}
+        base.update(env)
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, base):
+            for k in ("MBH_WAVEFORM_DURATION", "USE_TDIONFLY"):
+                if k not in env:
+                    os.environ.pop(k, None)
+            with contextlib.redirect_stdout(out):
+                try:
+                    exec(code, {"__name__": "__main__"})
+                except SystemExit as exc:
+                    return exc.code, out.getvalue()
+        return 0, out.getvalue()
+
+    def test_the_shipped_block_passes_its_own_preflight(self):
+        rc, out = self._run_preflight()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("mbh_pe scoring=batched batch<=8 response_order=8", out)
+        self.assertIn("waveform_duration=90.0 d", out)
+
+    def test_the_preflight_refuses_what_the_build_would_refuse(self):
+        for env in ({"MBH_WAVEFORM_DURATION": "2592000"},
+                    {"USE_TDIONFLY": "1"}):
+            rc, out = self._run_preflight(**env)
+            self.assertEqual(rc, 2, f"{env}: {out}")
+            self.assertIn("[MBH-PREFLIGHT] REFUSING", out)
+
+    def test_the_preflight_refuses_an_install_without_the_batched_move(self):
+        import sys
+        from unittest import mock
+
+        # everything imported up front: patch.dict(sys.modules) drops any
+        # module first imported inside it when it restores the dict
+        from lisatools.globalfit.stock.erebor import source_runtime  # noqa: F401
+
+        with mock.patch.dict(sys.modules,
+                             {"lisatools.globalfit.moves.mbhbatchedmove": None}):
+            rc, out = self._run_preflight()
+        self.assertEqual(rc, 2, out)
+        self.assertIn("SILENTLY IGNORED", out)
+
+    def test_the_preflight_refuses_settings_that_ignore_the_env(self):
+        """A settings class that does not read MBH_LIKELIHOOD (an install
+        whose field is named differently) resolves to its own default."""
+        import functools
+        from unittest import mock
+
+        from lisatools.globalfit.stock.erebor import source_runtime as sr
+
+        stale = functools.partial(sr.SourceMBHSettings, likelihood="full")
+        with mock.patch.object(sr, "SourceMBHSettings", stale):
+            rc, out = self._run_preflight()
+        self.assertEqual(rc, 2, out)
+        self.assertIn("but the settings resolve", out)
+
+    def test_the_3mo_twin_does_not_inherit_it(self):
+        """Evidence for NOT copying the block into the 3-month twin: the
+        batched window does not fit a 90-day grid (the move's constructor
+        raises), so the twin's documented ``MBHB_IDS=5`` escape would die at
+        build. The same geometry fits the 6-month grid with room to spare."""
+        import types
+
+        from lisatools.globalfit.moves.mbhbatchedmove import mbh_window_layers
+
+        for knob in ("MBH_LIKELIHOOD", "MBH_BATCH_MAX_SIZE", "MBH_RESPONSE_ORDER"):
+            self.assertNotIn(knob, self.three, knob)
+        layer_dt = 1440 * 2.5  # Nf x dt on both grids
+        win = (90 * 86400.0, 10 * 86400.0, 4 * 86400.0, 86400.0)
+
+        def grid(tobs, crop):
+            nt = int(round(float(tobs) / layer_dt))
+            return types.SimpleNamespace(layer_dt=layer_dt, t0=0.0, Nt=nt,
+                                         ind_min_t=crop, ind_max_t=nt - crop - 1)
+
+        six = grid(self.v9["TOBS_TARGET"], int(self.v9["EDGE_CROP_WAVELETS"]))
+        geom = mbh_window_layers(six, 100 * 86400.0, *win)
+        self.assertLessEqual(geom["Nt_keep"] + 2 * geom["n_pad"], six.Nt)
+        three = grid(self.three["TOBS_TARGET"], 20)
+        with self.assertRaises(ValueError):
+            mbh_window_layers(three, 60 * 86400.0, *win)
 
 
 class MpiPlacementTest(unittest.TestCase):
@@ -1202,6 +1351,12 @@ class ThreeMonthV9TwinTest(unittest.TestCase):
             "STAGE_SKIP_SOURCE_SEARCH",
             # 3MO-6 the unequal-arm reference fit
             "MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM",
+            # 3MO-7 (2026-09-30): the 6mo batched-MBH block is NOT carried
+            # across. No MBH branch is armed here, AND the batched default
+            # window (90 + 10 + 2 x 1 d kept + 2 x 4 d pad) does not fit a
+            # 90-day grid, so the documented MBHB_IDS=5 escape would die at
+            # build. See SixMonthMBHBatchedTest.test_the_3mo_twin_does_not_inherit_it.
+            "MBH_LIKELIHOOD", "MBH_BATCH_MAX_SIZE", "MBH_RESPONSE_ORDER",
         }
         keys = (set(self.three) | set(self.six)) - {"_", "SHLVL", "PWD"}
         diff = {k for k in keys
