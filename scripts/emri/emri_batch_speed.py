@@ -145,7 +145,8 @@ def main():
                     help="WDM lookup table h5: also time the direct-to-WDM template (EMRIDirectWDM) and score it "
                          "against the production template. The table's Nf/dt must match the grid "
                          "(laptop table: --dt 20)")
-    ap.add_argument("--direct-mode-batch", type=int, default=64)
+    ap.add_argument("--direct-mode-batch", type=int, default=0, help="0: all modes in one batch")
+    ap.add_argument("--direct-response", choices=("spline", "dense"), default="dense")
     args = ap.parse_args()
 
     from few.trajectory.pool import TrajectoryCache, TrajectoryPool, inspiral_init_kwargs_from, reset_stepper
@@ -197,8 +198,8 @@ def main():
                              f"Nf={nf} dt={args.dt} (pass --dt {table.data_dt})")
         direct = EMRIDirectWDM(gen, table, wdm, orbits=orb,
                                tdi_config=TDIConfig(fit.general.tdi_gen_str, force_backend=args.backend),
-                               t_start=W.REF, data_t0=data_t0, mode_batch=args.direct_mode_batch,
-                               force_backend=args.backend)
+                               t_start=W.REF, data_t0=data_t0, mode_batch=args.direct_mode_batch or None,
+                               force_backend=args.backend, response=args.direct_response)
 
     def host(x):
         return x.get() if hasattr(x, "get") else np.asarray(x)

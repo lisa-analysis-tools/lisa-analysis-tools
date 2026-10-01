@@ -89,7 +89,7 @@ def main():
         WD.WDM_HALF_SUPPORT_LAYERS = 0.0          # curvature never trips
     fdot_save = None
     direct = WD.EMRIDirectWDM(gen, table, wdm, orbits=orb, tdi_config=tdi, t_start=REF, data_t0=data_t0,
-                              mode_batch=16)
+                              mode_batch=16, response=os.environ.get("GATE_RESPONSE", "spline"))
     if args.no_handoff:
         fdot_save, direct.fdot_axis_max = direct.fdot_axis_max, np.inf
     t0 = time.perf_counter()

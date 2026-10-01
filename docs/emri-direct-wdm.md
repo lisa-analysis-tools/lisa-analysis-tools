@@ -123,6 +123,29 @@ script) are unsafe for EMRIs plunging inside the window. Production (2.5 s) is n
 geometry per (harmonic, time): the next step is a kernel that shares it across the harmonics of a
 template (plan: ~/.claude/plans/emri-tof-dense-phase-overnight.md).
 
+## Dense-phase response kernel (`TDDenseTDIonTheFly`, 10-01)
+
+`response="dense"` in `EMRIDirectWDM` feeds a new, opt-in TD TDI-on-the-fly kernel
+(`TDDenseTDIWaveform`, lat_spline_tdi_waveform.{hh,cu}; binding `TDDenseTDIWaveformWrap`):
+
+- per template: the integrator's knots and DOPR853 8th-order dense-output phase coefficients
+  (re-expressed exactly on FEW's holder knots, whose last knot FEW cuts at T); per harmonic: the
+  integers (m, k, n) and a complex amplitude cubic spline over the knots
+  (`dense_inputs_from_holder`). The phase is exact everywhere: no fine-grid phase splines.
+- kernel 1, one thread per (template, time): the link geometry and the three fundamental phases
+  are computed ONCE per TDI unit and reused by every harmonic (unit term
+  `sign * pre * (xi_p A_p + xi_c A_c) (z_em - z_rec)`, `z = amp_factor c exp(-i Phi)`); many
+  templates per launch. Delayed times outside the trajectory contribute zero (plunge without a
+  feed extension); the reference phase continues linearly outside the trajectory.
+- kernel 2, one block per harmonic: the existing amplitude/phase extraction + unwrap.
+
+CPU results (laptop): EMRI 1, 16 d: mismatch vs production 3.55e-8 (= spline response), whole
+template 1.6 s -> 0.8 s. Plunging single harmonic: direct vs production 1.5-1.7e-5 over the
+window, 7e-6 in the last 1% (spline response: 9e-6..1.2e-5). Tests: `tests/test_tdi_dense.py`
+(== the spline-fed kernel to 1e-9 on exactly representable input, 2 templates x 5 harmonics,
+inc != 0; polarisation and strain-sign mutations caught), `tests/test_emri_dense_inputs.py`.
+The CUDA build of the kernel has NOT been compiled or run yet.
+
 ## Open items
 
 1. (resolved) TOF vs production at the abrupt plunge end.

@@ -308,6 +308,93 @@ def _accumulate_harmonic_batch_loop(acc, table, tracks, tracer, n_ok, tail_td, *
     return stats
 
 
+def dense_inputs_from_holder(holder, integrator, *, a, xI0):
+    """Inputs of :class:`lisatools.response.tdionfly.TDDenseTDIonTheFly` for one template.
+
+    Returns ``(t_k (K,), phase_coeffs (K-1, 3, 8), mkn (S, 3), amp_re (S, K-1, 4),
+    amp_im (S, K-1, 4))`` with the harmonics in :func:`harmonic_tracks_from_holder`'s order
+    (m >= 0 modes, then the -m partners). The DOPR853 dense-output coefficients carry every
+    convention of ``harmonic_tracks_from_holder`` (massratio scaling, the integrator's backwards
+    adjustment, sign(xI0) on Phi_phi for a > 0, the holder's backwards offset), so the dense
+    polynomial IS the track phase; the amplitude splines are the tracks' (scipy CubicSpline over
+    the knots, monomial coefficients in ``t - t_knot``).
+    """
+    if xI0 < 0:
+        a, xI0 = -a, -xI0
+    t_int = np.asarray(integrator.integrator_t_cache, dtype=float).copy()
+    t_k = np.asarray(holder.t_arr, dtype=float).copy()     # amplitude knots (FEW cuts the last at T)
+    C = np.array(integrator.integrator_spline_coeff, dtype=float)[:, 3:6, :] / integrator.massratio
+    if integrator.integrate_backwards:              # eval_integrator_spline's adjustment
+        traj = np.asarray(integrator.trajectory)
+        C[:, :, 0] += (traj[0, 4:7] + traj[-1, 4:7])[None, :]
+    if a > 0:
+        C[:, 0, :] *= np.sign(xI0)
+    if holder.integrate_backwards:                  # base.py:361-364 (as harmonic_tracks_from_holder)
+        knots = _phase_columns(integrator, t_k, 0)
+        if a > 0:
+            knots[:, 0] *= np.sign(xI0)
+        C[:, :, 0] += (knots[-1] + knots[0])[None, :]
+    C = _dense_on_grid(t_int, C, t_k)                        # phases re-expressed on the amplitude knots
+    teuk = np.asarray(holder.teuk_modes)
+    nm = teuk.shape[1]
+    cr = CubicSpline(t_k, teuk.real, axis=0).c[::-1]         # (4, K-1, nm), a0..a3
+    ci = CubicSpline(t_k, teuk.imag, axis=0).c[::-1]
+    ylms = np.asarray(holder.ylms)
+    ls, ms, ks, ns = (np.asarray(x) for x in (holder.ls, holder.ms, holder.ks, holder.ns))
+    mkn, are, aim = [], [], []
+    for j in range(nm):                                      # A * Ylm
+        y = ylms[j]
+        are.append((y.real * cr[:, :, j] - y.imag * ci[:, :, j]).T)
+        aim.append((y.real * ci[:, :, j] + y.imag * cr[:, :, j]).T)
+        mkn.append((ms[j], ks[j], ns[j]))
+    if ylms.shape[0] == 2 * nm:                              # (-1)^l Y_{l,-m} conj(A), phase -Phi
+        for j in np.flatnonzero(ms != 0):
+            y = ((-1.0) ** ls[j]) * ylms[nm + j]
+            are.append((y.real * cr[:, :, j] + y.imag * ci[:, :, j]).T)
+            aim.append((-y.real * ci[:, :, j] + y.imag * cr[:, :, j]).T)
+            mkn.append((-ms[j], -ks[j], -ns[j]))
+    return t_k, C, np.array(mkn, dtype=np.int32), np.array(are), np.array(aim)
+
+
+def _dense_basis(s):
+    """The DOPR853 nested dense-output basis at s (n,) -> (n, 8): the polynomial is basis @ r."""
+    s1 = 1.0 - s
+    return np.stack([np.ones_like(s), s, s * s1, s ** 2 * s1, s ** 2 * s1 ** 2, s ** 3 * s1 ** 2,
+                     s ** 3 * s1 ** 3, s ** 4 * s1 ** 3], axis=-1)
+
+
+def _dense_on_grid(t_int, C, t_new):
+    """DOPR853 coefficients ``C`` (n_int - 1, P, 8) on knots ``t_int`` re-expressed on knots
+    ``t_new`` (a subset of ``t_int`` plus a cut inside a segment, e.g. FEW's final point at T).
+
+    Segments shared by both grids keep their coefficients; any other is refit EXACTLY (the 8
+    nested basis functions span all degree-7 polynomials) from 16 Chebyshev points of the
+    original polynomial."""
+    t_new = np.asarray(t_new, dtype=float)
+    out = np.empty((t_new.size - 1,) + C.shape[1:])
+    j = np.clip(np.searchsorted(t_int, t_new[:-1], side="right") - 1, 0, t_int.size - 2)
+    same = (np.abs(t_int[j] - t_new[:-1]) <= 1e-9 * np.abs(t_new[:-1]).max()) & \
+           (np.abs(t_int[j + 1] - t_new[1:]) <= 1e-9 * np.abs(t_new[1:]).max())
+    out[same] = C[j[same]]
+    x = 0.5 * (1 - np.cos(np.pi * (np.arange(16) + 0.5) / 16))
+    B = _dense_basis(x)
+    for q in np.flatnonzero(~same):
+        ts = t_new[q] + x * (t_new[q + 1] - t_new[q])
+        vals = dense_phase_eval(t_int, C, ts)                # (16, P)
+        out[q] = np.linalg.lstsq(B, vals, rcond=None)[0].T
+    return out
+
+
+def dense_phase_eval(t_k, C, t):
+    """Evaluate DOPR853 dense-output coefficients ``C`` (K-1, P, 8) at ``t`` (reference for tests)."""
+    t = np.asarray(t, dtype=float)
+    seg = np.clip(np.searchsorted(t_k, t, side="right") - 1, 0, t_k.size - 2)
+    s = ((t - t_k[seg]) / np.diff(t_k)[seg])[:, None]
+    s1 = 1.0 - s
+    c = C[seg]
+    return c[..., 0] + s * (c[..., 1] + s1 * (c[..., 2] + s * (c[..., 3] + s1 * (c[..., 4] + s * (c[..., 5] + s1 * (c[..., 6] + s * c[..., 7]))))))
+
+
 def feed_from_tracks(tracks, amp_factor):
     """Per-sub (amp, phase) with h = sum amp exp(-i phase) from harmonic tracks on the feed grid.
 
@@ -380,7 +467,8 @@ class EMRIDirectWDM:
 
     def __init__(self, few_gen, table, wdm_set, *, orbits, tdi_config, t_start, data_t0,
                  Nt_sub=128, n_fine=None, fine_dt=3600.0, fine_dt_plunge=80.0, mode_batch=None,
-                 pixel_edge=8, num_m_layers=2, interp="spline", force_backend="cpu", feed="knots"):
+                 pixel_edge=8, num_m_layers=2, interp="spline", force_backend="cpu", feed="knots",
+                 response="spline"):
         self.few_gen, self.table, self.wdm = few_gen, table, wdm_set
         self.orbits, self.tdi_config = orbits, tdi_config
         self.t_start, self.data_t0 = float(t_start), float(data_t0)
@@ -396,6 +484,14 @@ class EMRIDirectWDM:
         # from the integrator's dense output (production's construction; the cheap FEW call).
         # "fine": FEW evaluates amplitudes at every fine point (the earlier feed).
         self.feed = feed
+        if response not in ("spline", "dense"):
+            raise ValueError("response must be 'spline' or 'dense'")
+        # "dense": TDDenseTDIonTheFly (exact dense-output phases, geometry shared across the
+        # harmonics of a template, many templates per launch); needs feed="knots" and a backend
+        # module built with TDDenseTDIWaveformWrap. "spline": EMRITDIonFly -> TDTDIonTheFly.
+        self.response = response
+        if response == "dense" and feed != "knots":
+            raise ValueError("response='dense' needs feed='knots'")
         self.n_fine_fixed = int(n_fine) if n_fine is not None else None
         self.fine_dt, self.fine_dt_plunge = float(fine_dt), float(fine_dt_plunge)
         self.n_fine = self.n_fine_fixed or max(64, int(span / self.fine_dt_plunge))   # set per call
@@ -540,6 +636,35 @@ class EMRIDirectWDM:
         amp, ph = feed_from_tracks(tr, EMRITDIonFly.AMP_FACTOR)
         return fly.prepare_feed_arrays(t_src, amp, ph)
 
+    def _dense_response(self, items, t_fine):
+        """ONE TDDenseTDIonTheFly call for ``items`` = [(dense inputs, (psi, lam, beta)), ...]."""
+        from ...response.tdionfly import TDDenseTDIonTheFly
+        from .emritdionfly import EMRITDIonFly
+
+        K = max(it[0][0].size for it in items)
+        n_temp = len(items)
+        t_k = np.empty((n_temp, K))
+        C = np.zeros((n_temp, K - 1, 3, 8))
+        n_k = np.zeros(n_temp, dtype=np.int32)
+        mkn, are, aim, offs, par = [], [], [], [0], []
+        for b, ((tk, Cb, mk, ar, ai), (psi, lam, beta)) in enumerate(items):
+            nk = tk.size
+            tk = self.t_start + tk                                 # FEW clock -> absolute (the response's clock)
+            t_k[b, :nk], t_k[b, nk:] = tk, tk[-1]
+            C[b, :nk - 1] = Cb
+            n_k[b] = nk
+            pad = ((0, 0), (0, K - nk), (0, 0))
+            mkn.append(mk)
+            are.append(np.pad(ar, pad))
+            aim.append(np.pad(ai, pad))
+            offs.append(offs[-1] + mk.shape[0])
+            par.append((0.0, psi, lam, beta))
+        dense = TDDenseTDIonTheFly(
+            np.tile(self.t_start + np.asarray(t_fine), (n_temp, 1)), np.array(offs), np.concatenate(mkn),
+            t_k, n_k, C, np.concatenate(are), np.concatenate(aim), amp_factor=EMRITDIonFly.AMP_FACTOR,
+            tdi_config=self.tdi_config, orbits=self.orbits, force_backend=self.force_backend)
+        return dense(np.array(par))
+
     def _call_knots(self, few_args, few_kwargs, modes):
         from ...domains import WDMSignal
         from .emritdionfly import EMRITDIonFly
@@ -562,8 +687,20 @@ class EMRIDirectWDM:
         fly = EMRITDIonFly(self.few_gen, self.orbits, self.tdi_config, dt, T_traj, self.t_start,
                            frame="icrs_special", t_fine_window=(self.data_t0, self.data_t0 + span), t_fine=t_fine)
         _, _, psi, lam, beta = fly.sky(few_args[7], few_args[8], few_args[9], few_args[10])
-        feed = self._knots_feed(H, few_args, t_fine, fly)
-        out = fly.run_response([tuple(feed) + (psi, lam, beta)])
+        if self.response == "dense":
+            integ = self.few_gen.inspiral_generator.inspiral_generator
+            din = dense_inputs_from_holder(H, integ, a=few_args[2], xI0=few_args[5])
+            t_end = float(np.asarray(H.t_arr)[-1])
+            t_resp = t_fine
+            if t_end < t_fine[-1] - 1.0:
+                # stops in the window: end the response grid two delay margins after the stop
+                # (as the spline feed's zero-amplitude continuation does); beyond it the channel
+                # is exactly zero and its extracted phase meaningless, so it must not be splined
+                t_resp = t_fine[t_fine <= t_end + 2 * 600.0 + 2 * self.fine_dt_plunge]
+            out = self._dense_response([(din, (psi, lam, beta))], t_resp)
+        else:
+            feed = self._knots_feed(H, few_args, t_fine, fly)
+            out = fly.run_response([tuple(feed) + (psi, lam, beta)])
         x = np.asarray(out.x.get() if hasattr(out.x, "get") else out.x)
         t_traj_end = float(np.asarray(H.t_arr)[-1])
         ok_t = (t_pix > x[:, 0].max()) & (t_pix < x[:, -1].min()) & (t_pix - self.t_start <= t_traj_end)
@@ -736,11 +873,15 @@ class EMRIDirectWDM:
                 continue
             H = self._last_holder
             _, _, psi, lam, beta = fly.sky(p[7], p[8], p[9], p[10])
-            if self.feed == "knots":
-                t_in, amp, ph, t_tdi = self._knots_feed(H, p, t_fine, fly)
+            if self.response == "dense":
+                integ = self.few_gen.inspiral_generator.inspiral_generator
+                feeds.append((dense_inputs_from_holder(H, integ, a=p[2], xI0=p[5]), (psi, lam, beta)))
             else:
-                t_in, amp, ph, t_tdi = fly.prepare_feed(H, True)
-            feeds.append((t_in, amp, ph, t_tdi, psi, lam, beta))
+                if self.feed == "knots":
+                    t_in, amp, ph, t_tdi = self._knots_feed(H, p, t_fine, fly)
+                else:
+                    t_in, amp, ph, t_tdi = fly.prepare_feed(H, True)
+                feeds.append((t_in, amp, ph, t_tdi, psi, lam, beta))
             tracks.append(self._last_tracks)
             n_trs.append(self._last_track_n)
             t_ends.append(float(np.asarray(H.t_arr)[-1]))
@@ -748,7 +889,7 @@ class EMRIDirectWDM:
         if not feeds:
             self.last_stats = stats
             return out_arr
-        out = fly.run_response(feeds)
+        out = self._dense_response(feeds, t_fine) if self.response == "dense" else fly.run_response(feeds)
         x = np.asarray(out.x.get() if hasattr(out.x, "get") else out.x)
         ok_t = (t_pix > x[:, 0].max()) & (t_pix < x[:, -1].min()) & (t_pix - self.t_start <= min(t_ends))
         n_ok, tt = n_all[ok_t], t_pix[ok_t]
