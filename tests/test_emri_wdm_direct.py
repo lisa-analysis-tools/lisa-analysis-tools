@@ -230,6 +230,43 @@ class AssemblyTest(unittest.TestCase):
         self.assertLess(rel, 2e-3, f"rel L2 {rel:.2e}")
 
 
+class VectorisedAccumulateTest(AssemblyTest):
+    """accumulate_harmonic_batch (one table call + one scatter-add for every sub, channel
+    and pixel) == the per-(sub, channel) loop it replaced, stats included."""
+
+    def test_vectorised_equals_loop(self):
+        from lisatools.sources.emri import wdm_direct as wd
+
+        ldt, ldf = self.wdm.layer_dt, self.wdm.layer_df
+        n_ok = np.arange(40, self.NT - 8)
+        tn = n_ok * ldt
+        tracks, amps, phs, fs, fds = [], [], [], [], []
+        for s, (f0, n_h) in enumerate(((18.2, 90), (18.6, 10 ** 6), (22.9, 70))):   # subs 0,1 share layers: duplicate scatter targets
+            f0 = f0 * ldf
+            f = f0 + self.fdot * tn
+            ph = 2 * np.pi * (f0 * tn + 0.5 * self.fdot * tn ** 2) + 0.3 * s
+            fdd = np.where(n_ok >= n_h, 1.0, 0.0)
+            tracks.append(wd.HarmonicTrack((2, 2, s, 0), tn, np.ones_like(tn), ph, f, np.full_like(tn, self.fdot), fdd))
+            amps.append(np.stack([np.ones_like(tn), 0.5 + 0.1 * np.sin(tn / 1e5)]))
+            phs.append(np.stack([ph, ph + 0.7]))
+            fs.append(np.stack([f, f]))
+            fd = np.full((2, tn.size), self.fdot)
+            fd[1, :5] = 1e3                                   # off the table axis: dropped
+            fds.append(fd)
+        tracer = tuple(np.stack(x) for x in (amps, phs, fs, fds))
+        tail_td = lambda ts: np.stack([np.stack([np.cos(2 * np.pi * 1e-4 * ts + k), np.sin(2 * np.pi * 1e-4 * ts)])
+                                       for k in range(3)])
+        kw = dict(Nf=self.NF, Nt=self.NT, dt=self.DT, layer_dt=ldt, layer_df=ldf, t0=0.0, Nt_sub=128,
+                  num_m_layers=2, fdot_axis_max=float(np.max(np.abs(self.table.fdot_vals))), pixel_edge=8)
+        a1, a2 = np.zeros((2, self.NF, self.NT)), np.zeros((2, self.NF, self.NT))
+        s1 = wd.accumulate_harmonic_batch(a1, self.table, tracks, tracer, n_ok, tail_td, **kw)
+        s2 = wd._accumulate_harmonic_batch_loop(a2, self.table, tracks, tracer, n_ok, tail_td, **kw)
+        self.assertEqual(s1, s2)
+        self.assertGreater(s1["dropped_pixels"], 0)
+        self.assertGreater(s1["chunk_pixels"], 0)
+        np.testing.assert_allclose(a1, a2, rtol=0, atol=1e-13 * np.max(np.abs(a2)))
+
+
 class TracerTest(unittest.TestCase):
     """tracer_from_tof_output: amplitude, phase and analytic f/fdot of a known channel
     phase; negative-frequency subs mirrored to positive frequency."""

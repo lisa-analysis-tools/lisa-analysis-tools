@@ -116,6 +116,34 @@ class InterpMethodTest(BasisCycleChirpTest):
             self.table.set_interp_method("linear")
         self.assertLess(e_cub, 0.5 * e_lin, f"linear {e_lin:.2e} cubic {e_cub:.2e}")
 
+    def test_spline_matches_cubic_accuracy_off_node(self):
+        """The GPU-capable uniform spline (prefiltered B-spline + map_coordinates) is as
+        accurate as scipy's cubic RegularGridInterpolator off the nodes, and beats linear."""
+        df = self.wdm.layer_df
+        case = (20.31270 * df, 0.0, 0.4)
+        try:
+            self.table.set_interp_method("linear")
+            e_lin = self._rel_err(*case)
+            self.table.set_interp_method("cubic")
+            e_cub = self._rel_err(*case)
+            self.table.set_interp_method("spline")
+            e_spl = self._rel_err(*case)
+        finally:
+            self.table.set_interp_method("linear")
+        self.assertLess(e_spl, 0.5 * e_lin, f"linear {e_lin:.2e} spline {e_spl:.2e}")
+        self.assertLess(e_spl, 1.5 * e_cub + 1e-12, f"cubic {e_cub:.2e} spline {e_spl:.2e}")
+
+    def test_spline_reproduces_nodes_and_zero_outside(self):
+        from lisatools.domains import _UniformCubicSpline
+
+        rng = np.random.default_rng(2)
+        fd, fv = np.linspace(-1, 1, 9), np.linspace(-3, 3, 31)
+        tab = rng.normal(size=(9, 31))
+        sp = _UniformCubicSpline(tab, fd, fv, np, False)
+        FD, FV = np.meshgrid(fd, fv, indexing="ij")
+        np.testing.assert_allclose(sp(np.stack([FD, FV], -1)), tab, rtol=0, atol=1e-12)
+        self.assertEqual(float(sp(np.array([[0.0, 3.5]]))[0]), 0.0)
+
     def test_rejects_unknown_method(self):
         with self.assertRaises(ValueError):
             self.table.set_interp_method("quintic")

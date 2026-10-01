@@ -161,27 +161,80 @@ def tracer_from_tof_output(out, t_pixels, h=30.0, h_fdot=None):
     ``phase -> -phase``, ``f -> -f``, ``fdot -> -fdot``.
     Returns arrays of shape ``(num_sub, nch, P)``.
     """
-    t = np.asarray(t_pixels, dtype=float)
-
-    def _ph(tt):
-        _, tph, pref = out.eval_spline_vals(tt)
-        return np.asarray(tph) + np.asarray(pref)[:, None, :]
-
-    amp, tph, pref = out.eval_spline_vals(t)
-    amp = np.asarray(amp)
-    ph0 = np.asarray(tph) + np.asarray(pref)[:, None, :]
-    php, phm = _ph(t + h), _ph(t - h)
-    f = (php - phm) / (2 * h) / (2 * np.pi)
+    xp = getattr(out, "xp", np)
+    t = xp.asarray(t_pixels, dtype=float)
     hd = float(os.environ.get("EMRI_TRACER_H_FDOT", "300")) if h_fdot is None else float(h_fdot)
-    fdot = (_ph(t + hd) - 2 * ph0 + _ph(t - hd)) / hd ** 2 / (2 * np.pi)   # phase ~1e5 rad: a short
+    P = t.size
+    # ONE spline evaluation at all five stencils (t, t +- h, t +- hd)
+    amp_all, tph, pref = out.eval_spline_vals(xp.concatenate([t, t + h, t - h, t + hd, t - hd]))
+    ph = xp.asarray(tph) + xp.asarray(pref)[:, None, :]
+    ph0, php, phm, phpd, phmd = (ph[..., k * P:(k + 1) * P] for k in range(5))
+    amp = xp.asarray(amp_all)[..., :P]
+    f = (php - phm) / (2 * h) / (2 * np.pi)
+    fdot = (phpd - 2 * ph0 + phmd) / hd ** 2 / (2 * np.pi)   # phase ~1e5 rad: a short
     #                                                   step turns roundoff into fdot noise
     neg = f < 0
-    return amp, np.where(neg, -ph0, ph0), np.where(neg, -f, f), np.where(neg, -fdot, fdot)
+    return amp, xp.where(neg, -ph0, ph0), xp.where(neg, -f, f), xp.where(neg, -fdot, fdot)
+
+
+def _scatter_add(xp, acc, idx, vals):
+    """acc[idx] += vals with repeated indices accumulated (numpy add.at / cupyx scatter_add)."""
+    if xp is np:
+        np.add.at(acc, idx, vals)
+    else:
+        import cupyx
+        cupyx.scatter_add(acc, idx, vals)
 
 
 def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, Nt, dt, layer_dt,
                               layer_df, t0, Nt_sub=128, num_m_layers=2, fdot_axis_max=np.inf,
                               pixel_edge=8, backend="cpu"):
+    """Vectorised :func:`_accumulate_harmonic_batch_loop`: ONE table evaluation for every
+    (sub, channel, pixel) of the batch and one scatter-add, on the array module of ``acc``
+    (numpy or cupy). Same arguments, same result up to summation order."""
+    from ...wdm_het import tail_chunk_plan, wdm_chunk_of_td
+    from ...utils.utility import get_array_module
+
+    xp = get_array_module(acc)
+    amp, phase, f, fdot = (xp.asarray(a) for a in tracer)
+    S, nch, P = amp.shape
+    n_ok_x = xp.asarray(n_ok)
+    stats = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
+    k_h = np.array([handoff_pixel(tr, layer_dt, layer_df, fdot_axis_max) for tr in tracks])
+    before = xp.arange(P)[None, :] < xp.asarray(k_h)[:, None]                       # (S, P)
+    sel = before[:, None, :] & (xp.abs(fdot) <= fdot_axis_max) & (f > 2 * layer_df)  # (S, C, P)
+    stats["dropped_pixels"] = int(nch * int(before.sum()) - int(sel.sum()))
+    s_i, c_i, p_i = xp.nonzero(sel)
+    if s_i.size:
+        co, mm = table.get_wdm_coeffs(amp[sel], phase[sel], f[sel], fdot[sel], n_ok_x[p_i],
+                                      num_m_layers=num_m_layers, out_of_support="zero")
+        co, mm = xp.asarray(co), xp.asarray(mm)
+        n_e = n_ok_x[p_i]
+        for c in range(co.shape[1]):
+            good = mm[:, c] >= 0
+            _scatter_add(xp, acc, (c_i[good], mm[good, c], n_e[good]), co[good, c])
+        stats["lookup_pixels"] = int(s_i.size)
+    windows = {}
+    n_ok_h = np.asarray(n_ok.get() if hasattr(n_ok, "get") else n_ok)
+    for s in range(S):
+        if k_h[s] < n_ok_h.size:
+            n_h = int(n_ok_h[k_h[s]])
+            n_end = min(int(n_ok_h[-1]) + 1 + Nt_sub // 4, Nt - pixel_edge)
+            for n0, klo, khi in tail_chunk_plan(n_h, n_end, Nt, Nt_sub):
+                windows.setdefault(n0, []).append((s, klo, khi))
+    for n0, items in windows.items():
+        ts = t0 + (n0 * Nf + xp.arange(Nf * Nt_sub)) * dt
+        td_all = xp.asarray(tail_td(ts))
+        for s, klo, khi in items:
+            chunk = xp.asarray(wdm_chunk_of_td(td_all[s], 0, Nf, Nt_sub, dt, backend=backend))
+            acc[:, :chunk.shape[-2], n0 + klo:n0 + khi] += chunk[:, :, klo:khi]
+            stats["chunk_pixels"] += khi - klo
+    return stats
+
+
+def _accumulate_harmonic_batch_loop(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, Nt, dt, layer_dt,
+                                    layer_df, t0, Nt_sub=128, num_m_layers=2, fdot_axis_max=np.inf,
+                                    pixel_edge=8, backend="cpu"):
     """Add one batch of harmonics to ``acc`` (``(nch, Nf, Nt)``, global layers x pixels).
 
     Per sub ``s`` (``tracks[s]``, tracer row ``s``): the n_ref lookup on pixels before its
@@ -252,14 +305,19 @@ class EMRIDirectWDM:
         orbits, tdi_config: as for :class:`EMRITDIonFly` (ICRS orbits, special frame).
         t_start: FEW reference epoch (trajectory clock origin), e.g. MOJITO_REFERENCE_TIME.
         data_t0: absolute time of WDM pixel 0.
-        n_fine: fine trajectory points over the window (default: one per 80 s).
+        n_fine: fixed number of fine trajectory points over the window. Default ``None``:
+            one per ``fine_dt`` (1800 s: direct-vs-production unchanged from 80 s to 3600 s
+            on CD1L EMRI 1, 16 d), or one per ``fine_dt_plunge`` (80 s) when the
+            trajectory ends inside the window or the modes are given explicitly (the
+            plunge chunk reads the dense response from these splines).
         pixel_edge: pixels dropped at each grid end (response spline support).
-        interp: table interpolation to use (``"cubic"`` default; ``None`` keeps the table's).
+        interp: table interpolation (``"spline"`` default: uniform cubic B-spline, CPU and GPU;
+            ``"cubic"`` scipy-only; ``None`` keeps the table's).
     """
 
     def __init__(self, few_gen, table, wdm_set, *, orbits, tdi_config, t_start, data_t0,
-                 Nt_sub=128, n_fine=None, mode_batch=64, pixel_edge=8, num_m_layers=2,
-                 interp="cubic", force_backend="cpu"):
+                 Nt_sub=128, n_fine=None, fine_dt=1800.0, fine_dt_plunge=80.0, mode_batch=64,
+                 pixel_edge=8, num_m_layers=2, interp="spline", force_backend="cpu"):
         self.few_gen, self.table, self.wdm = few_gen, table, wdm_set
         self.orbits, self.tdi_config = orbits, tdi_config
         self.t_start, self.data_t0 = float(t_start), float(data_t0)
@@ -268,9 +326,14 @@ class EMRIDirectWDM:
         # puts ~2.5e-4 of its energy two layers away (A8 gate); needs table support [-2, 3) df
         self.num_m_layers = int(os.environ.get("EMRI_DIRECT_NUM_M_LAYERS", num_m_layers))
         span = wdm_set.Nt * wdm_set.layer_dt
-        self.n_fine = int(n_fine) if n_fine is not None else max(1024, int(span / 80.0))
+        self.n_fine_fixed = int(n_fine) if n_fine is not None else None
+        self.fine_dt, self.fine_dt_plunge = float(fine_dt), float(fine_dt_plunge)
+        self.n_fine = self.n_fine_fixed or max(64, int(span / self.fine_dt_plunge))   # set per call
         self.force_backend = force_backend
-        self.fdot_axis_max = float(np.max(np.abs(np.asarray(table.fdot_vals))))
+        from ...utils.utility import asnumpy
+        from ... import get_backend
+        self.xp = get_backend(force_backend).xp
+        self.fdot_axis_max = float(np.max(np.abs(asnumpy(table.fdot_vals))))
         # cubic table interpolation: linear left a ~2.5e-4 amplitude deficit (A9, EMRI 1).
         # NOTE: this switches the passed table's interpolators (set_interp_method).
         if interp is not None and getattr(table, "INTERP_METHOD", None) != interp:
@@ -295,7 +358,45 @@ class EMRIDirectWDM:
         finally:
             self.few_gen.inspiral_kwargs.clear()
             self.few_gen.inspiral_kwargs.update(saved)
-        return [(int(l), int(m), int(k), int(n)) for l, m, k, n in zip(H.ls, H.ms, H.ks, H.ns)]
+        modes = [(int(l), int(m), int(k), int(n)) for l, m, k, n in zip(H.ls, H.ms, H.ks, H.ns)]
+        return modes, self._chunk_start(H, few_args)
+
+    def _chunk_start(self, H, few_args):
+        """Earliest time (FEW clock) at which any harmonic of the mode-selection holder ``H``
+        hands off to the plunge chunk inside the window, or ``None`` if none does. The chunk
+        reads the dense response, so the fine grid must be dense from there on."""
+        t_arr = np.asarray(H.t_arr.get() if hasattr(H.t_arr, "get") else H.t_arr)
+        lo = self.data_t0 - self.t_start
+        n_all = np.arange(self.pixel_edge, self.wdm.Nt - self.pixel_edge)
+        t_rel = lo + n_all * self.wdm.layer_dt
+        t_rel = t_rel[(t_rel >= t_arr[0]) & (t_rel <= t_arr[-1])]
+        first = np.inf
+        if t_rel.size:
+            integ = self.few_gen.inspiral_generator.inspiral_generator
+            for tr in harmonic_tracks_from_holder(H, integ, t_rel, a=few_args[2], xI0=few_args[5]):
+                k = handoff_pixel(tr, self.wdm.layer_dt, self.wdm.layer_df, self.fdot_axis_max)
+                if k < t_rel.size:
+                    first = min(first, float(t_rel[k]))
+        span = self.wdm.Nt * self.wdm.layer_dt
+        if t_arr[-1] < lo + span - 1.0:                      # stops in the window
+            first = min(first, float(t_arr[-1]) - self.Nt_sub * self.wdm.layer_dt)
+        return None if not np.isfinite(first) else first
+
+    def _fine_grid(self, chunk_start):
+        """Fine trajectory times (FEW clock): ``fine_dt`` over the window, ``fine_dt_plunge``
+        from a chunk length before ``chunk_start`` to the end (non-uniform is fine: the
+        response splines auto-detect general spacing)."""
+        lo = self.data_t0 - self.t_start
+        span = self.wdm.Nt * self.wdm.layer_dt
+        pad = 600.0 + 2.0 * self.fine_dt                     # delay margin + spline support
+        a = max(0.0, lo - pad)
+        b = lo + span + 2000.0                                # = the integration span (T_traj)
+        coarse = np.append(np.arange(a, b, self.fine_dt), b)
+        if chunk_start is None:
+            return coarse
+        d0 = max(a, chunk_start - self.Nt_sub * self.wdm.layer_dt)
+        dense = np.append(np.arange(d0, b, self.fine_dt_plunge), b)
+        return np.union1d(coarse[coarse < d0], dense)
 
     def __call__(self, *few_args, **few_kwargs):
         from ...domains import WDMSignal
@@ -307,20 +408,30 @@ class EMRIDirectWDM:
         n_all = np.arange(self.pixel_edge, Nt - self.pixel_edge)
         t_pix = self.data_t0 + n_all * ldt
         T_traj = self.data_t0 - self.t_start + span + 2000.0
-        acc = np.zeros((self.tdi_config.nchannels, Nf, Nt))
+        xp = self.xp
+        acc = xp.zeros((self.tdi_config.nchannels, Nf, Nt))
         few_kwargs = dict(few_kwargs)
         modes = few_kwargs.pop("mode_selection", None)      # explicit (l, m, k, n) list, e.g. gates
+        t_fine, chunk_start = None, "unknown"                 # explicit modes: dense everywhere
         if modes is None:
-            modes = self._mode_list(few_args, few_kwargs)
+            modes, chunk_start = self._mode_list(few_args, few_kwargs)
+        if self.n_fine_fixed is not None:
+            self.n_fine = self.n_fine_fixed
+        elif chunk_start == "unknown":
+            self.n_fine = max(64, int(span / self.fine_dt_plunge))
+        else:
+            t_fine = self._fine_grid(chunk_start)
+            self.n_fine = int(t_fine.size)
+        self.last_t_fine = t_fine                             # None: uniform n_fine over the window
         totals = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
         few_kwargs.pop("mode_selection_threshold", None)
 
         for j in range(0, len(modes), self.mode_batch):
             fly = EMRITDIonFly(self.few_gen, self.orbits, self.tdi_config, dt, T_traj, self.t_start,
-                               frame="icrs_special", n_fine=self.n_fine,
-                               t_fine_window=(self.data_t0, self.data_t0 + span))
+                               frame="icrs_special", n_fine=None if t_fine is not None else self.n_fine,
+                               t_fine_window=(self.data_t0, self.data_t0 + span), t_fine=t_fine)
             out = fly(*few_args, mode_selection=modes[j:j + self.mode_batch], **few_kwargs)
-            x = np.asarray(out.x)
+            x = np.asarray(out.x.get() if hasattr(out.x, "get") else out.x)
             integ = self.few_gen.inspiral_generator.inspiral_generator
             H = fly.last_holder
             t_traj_end = float(np.asarray(H.t_arr)[-1])
@@ -329,15 +440,15 @@ class EMRIDirectWDM:
             if n_ok.size == 0:
                 continue
             tracks = harmonic_tracks_from_holder(H, integ, tt - self.t_start, a=few_args[2], xI0=few_args[5])
-            tracer = tracer_from_tof_output(out, tt)
+            tracer = tracer_from_tof_output(out, xp.asarray(tt))
             assert tracer[0].shape[0] == len(tracks), (tracer[0].shape, len(tracks))
             x_lo, x_hi = x[:, 0][:, None, None], x[:, -1][:, None, None]
 
-            def tail_td(ts, out=out, x_lo=x_lo, x_hi=x_hi):
-                live = (ts > x_lo.max()) & (ts < x_hi.min())
-                td = np.zeros((x.shape[0], tracer[0].shape[1], ts.size))
-                if np.any(live):
-                    td[:, :, live] = np.asarray(out.eval_tdi(ts[live]))
+            def tail_td(ts, out=out, x_lo=float(x_lo.max()), x_hi=float(x_hi.min())):
+                live = (ts > x_lo) & (ts < x_hi)
+                td = xp.zeros((x.shape[0], tracer[0].shape[1], ts.size))
+                if bool(xp.any(live)):
+                    td[:, :, live] = xp.asarray(out.eval_tdi(ts[live]))
                 return td
 
             st = accumulate_harmonic_batch(
@@ -347,5 +458,6 @@ class EMRIDirectWDM:
             for key in totals:
                 totals[key] += st[key]
             del out, fly
-        self.last_stats = dict(modes=len(modes), **totals)
+        self.last_stats = dict(modes=len(modes), n_fine=self.n_fine,
+                               chunk_start=None if chunk_start == "unknown" else chunk_start, **totals)
         return WDMSignal(acc, wdm)

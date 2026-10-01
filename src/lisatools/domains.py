@@ -3234,6 +3234,53 @@ class WDMSignal(WDMSettings, DomainBase):
 # ---------------------------------------------------------------------------
 import h5py
 
+class _UniformCubicSpline:
+    """Interpolating cubic spline on a uniform 1-D or 2-D grid, CPU (scipy) or GPU (cupyx).
+
+    The B-spline coefficients are prefiltered ONCE (``ndimage.spline_filter``, mirror
+    boundaries); a call is one ``ndimage.map_coordinates(order=3)``. Same API in scipy and
+    cupyx, so the table evaluates on either backend (cupyx's RegularGridInterpolator has no
+    cubic method). Called with ``pts`` of shape ``(..., 2)`` = ``(fdot, f_norm)`` for a 2-D
+    table, or the ``f_norm`` array for a 1-D one. Points outside the grid return 0 (as the
+    RegularGridInterpolator path's ``fill_value``).
+    """
+
+    def __init__(self, table, fdot_axis, f_axis, xp, gpu):
+        if gpu:
+            from cupyx.scipy import ndimage as ndi
+        else:
+            from scipy import ndimage as ndi
+        self.ndi, self.xp = ndi, xp
+        self.two_d = fdot_axis is not None
+        tab = xp.asarray(table, dtype=xp.float64)
+        if self.two_d:
+            tab = tab.reshape(len(fdot_axis), len(f_axis))
+        else:
+            tab = tab.reshape(-1)
+        self.axes = []
+        for ax in ([fdot_axis] if self.two_d else []) + [f_axis]:
+            ax = xp.asarray(ax, dtype=xp.float64)
+            step = float(ax[1] - ax[0])
+            if not bool(xp.allclose(xp.diff(ax), step, rtol=1e-8, atol=0.0)):
+                raise ValueError("_UniformCubicSpline needs a uniform grid")
+            self.axes.append((float(ax[0]), step, int(ax.size)))
+        self.coeffs = ndi.spline_filter(tab, order=3, mode="mirror")
+
+    def __call__(self, pts):
+        xp = self.xp
+        pts = xp.asarray(pts, dtype=xp.float64)
+        cols = [pts[..., 0], pts[..., 1]] if self.two_d else [pts]
+        idx, inside = [], None
+        for c, (x0, step, n) in zip(cols, self.axes):
+            i = (c - x0) / step
+            ok = (i >= -1e-9) & (i <= n - 1 + 1e-9)
+            inside = ok if inside is None else inside & ok
+            idx.append(i)
+        out = self.ndi.map_coordinates(self.coeffs, xp.stack([i.ravel() for i in idx]), order=3,
+                                       mode="mirror", prefilter=False).reshape(idx[0].shape)
+        return xp.where(inside, out, 0.0)
+
+
 class WDMLookupTable(WDMSettings):
     """Pre-computed sine/cosine WDM-pixel coefficient lookup table.
 
@@ -4172,6 +4219,10 @@ class WDMLookupTable(WDMSettings):
         else:
             interpolate = interpolate_cpu
 
+        if self.INTERP_METHOD == "spline" and self.build_kind in ("n_ref_only", "n_ref_complex"):
+            return _UniformCubicSpline(self.xp.asarray(table), self.fdot_vals if self.run_fdot else None,
+                                       self.f_vals_norm, self.xp, self.backend.uses_cupy)
+
         if self.build_kind in ("n_ref_only", "n_ref_complex"):
             # Both kinds use the same (fdot, f_norm) grid; the complex
             # variant invokes this twice (Re and Im) on the same axes.
@@ -4250,8 +4301,8 @@ class WDMLookupTable(WDMSettings):
         else:
             raise ValueError(f"Unknown WDMLookupTable.build_kind={self.build_kind!r}")
 
-        sin_coeffs[np.isnan(sin_coeffs)] = 0.0
-        cos_coeffs[np.isnan(cos_coeffs)] = 0.0
+        sin_coeffs[self.xp.isnan(sin_coeffs)] = 0.0
+        cos_coeffs[self.xp.isnan(cos_coeffs)] = 0.0
         return (sin_coeffs, cos_coeffs)
 
     def set_interp_method(self, method: str) -> None:
@@ -4262,8 +4313,8 @@ class WDMLookupTable(WDMSettings):
         5e-6, mismatch 1e-6 -> 3.5e-8). CPU (scipy) only: cupyx's RegularGridInterpolator
         has no cubic method.
         """
-        if method not in ("linear", "cubic"):
-            raise ValueError(f"interp method must be 'linear' or 'cubic', got {method!r}")
+        if method not in ("linear", "cubic", "spline"):
+            raise ValueError(f"interp method must be 'linear', 'cubic' or 'spline', got {method!r}")
         self.INTERP_METHOD = method
         self._sin_unbaked_interp = None
         if self.build_kind == "n_ref_complex":
@@ -4313,6 +4364,13 @@ class WDMLookupTable(WDMSettings):
         universal layout is hard-wired to 2 layers per element.
         """
         ms = (f_arr / self.layer_df).astype(int)
+        if getattr(self, "_f_norm_bounds", None) is None:     # f_vals rebuilds + checks on every access
+            _fv = self.f_vals_norm
+            self._f_norm_bounds = (float(_fv.min()), float(_fv.max()))
+            self._fdot_bounds = (float(self.xp.min(self.xp.asarray(self.fdot_vals))),
+                                 float(self.xp.max(self.xp.asarray(self.fdot_vals))))
+        f_lo, f_hi = self._f_norm_bounds
+        fd_lo, fd_hi = self._fdot_bounds
         wdm_coeffs_out = self.xp.zeros((amp_arr.shape[0], num_m_layers * 2 + 1))
         m_map = -self.xp.ones((amp_arr.shape[0], num_m_layers * 2 + 1), dtype=int)
         is_m_ref_n_ref_even = (self.m_ref + self.n_ref) % 2 == 0
@@ -4321,23 +4379,21 @@ class WDMLookupTable(WDMSettings):
             ms_to_use = (ms + m_diff).astype(int)
             keep_now = self.xp.arange(ms_to_use.shape[0])[(ms_to_use >= 0) & (ms_to_use < self.Nf)]
 
-            assert ms_to_use[keep_now].max() <= self.Nf + 1
-            assert ms_to_use[keep_now].min() >= 0
             f_norm = (f_arr[keep_now] - ms_to_use[keep_now] * self.layer_df)
 
-            _in = (f_norm >= self.f_vals_norm.min()) & (f_norm <= self.f_vals_norm.max())
+            _in = (f_norm >= f_lo) & (f_norm <= f_hi)
             if out_of_support == "zero" and not bool(self.xp.all(_in)):
                 # entries outside the table (far layers, ~1e-8 of the power) contribute 0
                 keep_now = keep_now[_in]
                 f_norm = f_norm[_in]
                 if keep_now.size == 0:
                     continue
-            if not bool(self.xp.all((f_norm >= self.f_vals_norm.min()) & (f_norm <= self.f_vals_norm.max()))):
+            if not bool(self.xp.all((f_norm >= f_lo) & (f_norm <= f_hi))):
                 raise ValueError(
                     "WDMLookupTable.get_wdm_coeffs: f_norm outside the table's frequency support "
-                    f"[{float(self.f_vals_norm.min()):.3e}, {float(self.f_vals_norm.max()):.3e}] Hz"
+                    f"[{f_lo:.3e}, {f_hi:.3e}] Hz"
                 )
-            if not bool(self.xp.all((fdot_arr[keep_now] >= self.fdot_vals.min()) & (fdot_arr[keep_now] <= self.fdot_vals.max()))):
+            if not bool(self.xp.all((fdot_arr[keep_now] >= fd_lo) & (fdot_arr[keep_now] <= fd_hi))):
                 raise ValueError("WDMLookupTable.get_wdm_coeffs: fdot outside the table's fdot axis")
 
             _sin_coeffs, _cos_coeffs = self.get_table_coeffs(f_norm, fdot_arr[keep_now], n_arr[keep_now])

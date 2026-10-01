@@ -25,7 +25,7 @@ mode thresholds 1e-3 and 1e-7; dlogL difference <= 4e-7. Signed off 2026-09-30.
 | mode threshold | table interp | modes | direct vs production | norm ratio vs production | direct vs data | production vs data |
 |---|---|---|---|---|---|---|
 | 1e-3 (production EMRI_EPS) | linear | 38 | 1.05e-6 | 0.99973-0.99976 | 0.10 | 0.10 |
-| 1e-3 (production EMRI_EPS) | **cubic (default)** | 38 | **3.5e-8** | **0.999995-0.999997** | 0.10 | 0.10 |
+| 1e-3 (production EMRI_EPS) | **cubic** (spline default since 09-30, same accuracy) | 38 | **3.5e-8** | **0.999995-0.999997** | 0.10 | 0.10 |
 | 1e-5 | linear | 111 | 1.11e-6 | not measured | 2.6e-3 | 2.6e-3 |
 
 The normalised mismatch alone hid a 2.5e-4 amplitude deficit with linear table interpolation
@@ -115,8 +115,13 @@ EMRI 1, 6 months (data SNR 21.8), production template:
 1. (resolved) TOF vs production at the abrupt plunge end.
 2. Table resolution (fdot direction; cubic fixed the f-direction bias): finer fdot rows near 0 (where most pixels sit) to reach the model's
    ~1e-4 per-pixel level; production-grid table (Nf 1440, dt 2.5) on the cluster GPU.
-3. Speed: EMRIDirectWDM is Python per harmonic and channel on CPU (88 s for 38 modes, 16 d).
-   The GPU work (FEW Part B) and a vectorised lookup are the path.
+3. Speed (09-30): EMRI 1, 16 d, 38 modes, laptop CPU: 27 s -> 2.75 s with the same mismatch vs
+   production (3.6e-8). Changes: the response is fed on a 1800 s grid when no harmonic hands off
+   inside the window (coarse + 80 s from the earliest handoff otherwise; TOF accepts non-uniform
+   times); one vectorised table call + one scatter-add per batch; interpolation `"spline"` (uniform
+   cubic B-spline via ndimage, same code on scipy/cupyx; default); one tracer spline call.
+   Remaining CPU cost: two FEW calls (~1.4 s) and the response (~0.9 s). Code is numpy/cupy
+   agnostic but has NOT run on a GPU yet: `scripts/emri/emri_batch_speed.py --direct-table`.
 4. Memory: every FEW EMRI generator reads the whole 5.1 GB amplitude file at construction
    (`few/amplitude/ampinterp2d.py:235`), a ~6 GB transient footprint. One per process.
 5. EMRIs 0, 2-7: their L1 bricks are not on the laptop; run
