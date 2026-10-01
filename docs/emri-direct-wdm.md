@@ -110,6 +110,19 @@ EMRI 1, 6 months (data SNR 21.8), production template:
 | 1e-4 | 67 | 0.37 | 0.27 | 1.0002 |
 | 1e-5 | 112 | 0.037 | 0.027 | 0.9998 |
 
+**Aliasing at 20 s (09-30).** On the plunging gate source, TDI-on-the-fly vs production per
+harmonic was 3e-3..0.8 for m >= 3 at dt = 20 s and drops to 3e-5..4e-4 at dt = 5 s ((4,4,0,1)
+5.3e-2 -> 2.5e-5, (6,6,0,2) 0.79 -> 4e-5): near the plunge the high harmonics exceed the 25 mHz
+Nyquist of the 20 s grid. The response is fine; 20 s grids (the laptop table, the CD1L campaign
+script) are unsafe for EMRIs plunging inside the window. Production (2.5 s) is not affected.
+
+**GPU timing (09-30, H100 cuda13x, 6 months, production grid, EMRI 1, batch of 64 in chunks of
+16):** direct 157 ms/template at eps 1e-3 (38 modes) and 418 ms at 1e-5 (112 modes) vs production
+94 / 101 ms. Per template: FEW 11 ms (knot feed), response kernel 79 / 223 ms, harmonic tracks
+(CPU) 21 / 53 ms, tracer 4 / 11 ms, lookup 6 / 16 ms. The response kernel recomputes the full
+geometry per (harmonic, time): the next step is a kernel that shares it across the harmonics of a
+template (plan: ~/.claude/plans/emri-tof-dense-phase-overnight.md).
+
 ## Open items
 
 1. (resolved) TOF vs production at the abrupt plunge end.

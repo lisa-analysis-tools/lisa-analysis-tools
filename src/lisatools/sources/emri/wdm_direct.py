@@ -45,7 +45,7 @@ def _phase_columns(integrator, t, order):
     return np.array(cols, dtype=float, copy=True)
 
 
-def harmonic_tracks_from_holder(holder, integrator, t_pixels, *, a, xI0):
+def harmonic_tracks_from_holder(holder, integrator, t_pixels, *, a, xI0, phase_only=False):
     """Per-harmonic tracks at ``t_pixels`` [s, trajectory clock] from a FEW sparse holder.
 
     Args:
@@ -54,11 +54,15 @@ def harmonic_tracks_from_holder(holder, integrator, t_pixels, *, a, xI0):
             exposing ``eval_integrator_spline`` / ``eval_integrator_derivative_spline``.
         t_pixels: evaluation times, same clock as ``holder.t_arr``.
         a, xI0: spin and inclination cosine (retrograde convention).
+        phase_only: skip the frequency derivatives (``f``, ``fdot``, ``fddot`` are None): the
+            response feed needs amplitude and phase only.
+    Vectorised over modes (one matrix product per derivative order).
     """
     t_pixels = np.asarray(t_pixels, dtype=float)
     if xI0 < 0:   # FEW's internal convention first (few/waveform/base.py:208-212)
         a, xI0 = -a, -xI0
-    P = [_phase_columns(integrator, t_pixels, k) for k in (0, 1, 2, 3)]
+    orders = (0,) if phase_only else (0, 1, 2, 3)
+    P = [_phase_columns(integrator, t_pixels, k) for k in orders]
     if a > 0:
         for arr in P:
             arr[:, 0] *= np.sign(xI0)
@@ -74,21 +78,26 @@ def harmonic_tracks_from_holder(holder, integrator, t_pixels, *, a, xI0):
     A = CubicSpline(t_k, teuk.real, axis=0)(t_pixels) + 1j * CubicSpline(t_k, teuk.imag, axis=0)(t_pixels)
     ylms = np.asarray(holder.ylms)
     with_minus = ylms.shape[0] == 2 * nm
-
+    ls, ms, ks, ns = (np.asarray(x) for x in (holder.ls, holder.ms, holder.ks, holder.ns))
+    Wm = np.stack([ms, ks, ns]).astype(float)                       # (3, nm)
+    D = [Pk @ Wm for Pk in P]                                       # each (T, nm)
+    ph = D[0]
+    f, fd, fdd = ((D[k] / (2 * np.pi)) for k in (1, 2, 3)) if not phase_only else (None, None, None)
+    amp = A * ylms[None, :nm]
     tracks = []
+    for j in range(nm):
+        lmkn = (int(ls[j]), int(ms[j]), int(ks[j]), int(ns[j]))
+        tracks.append(HarmonicTrack(lmkn, t_pixels, amp[:, j], ph[:, j],
+                                    None if f is None else f[:, j], None if fd is None else fd[:, j],
+                                    None if fdd is None else fdd[:, j]))
     minus = []
-    for j, (l, m, k, n) in enumerate(zip(holder.ls, holder.ms, holder.ks, holder.ns)):
-        w = np.array([m, k, n], dtype=float)
-        ph = P[0] @ w
-        f = (P[1] @ w) / (2 * np.pi)
-        fd = (P[2] @ w) / (2 * np.pi)
-        fdd = (P[3] @ w) / (2 * np.pi)
-        lmkn = (int(l), int(m), int(k), int(n))
-        tracks.append(HarmonicTrack(lmkn, t_pixels, A[:, j] * ylms[j], ph, f, fd, fdd))
-        if with_minus and m != 0:
-            amp_m = ((-1.0) ** int(l)) * ylms[nm + j] * np.conj(A[:, j])
-            minus.append(HarmonicTrack((int(l), -int(m), -int(k), -int(n)), t_pixels, amp_m,
-                                       -ph, -f, -fd, -fdd))
+    if with_minus:
+        jm = np.flatnonzero(ms != 0)
+        amp_m = ((-1.0) ** ls[jm])[None, :] * ylms[None, nm + jm] * np.conj(A[:, jm])
+        for c, j in enumerate(jm):
+            minus.append(HarmonicTrack((int(ls[j]), -int(ms[j]), -int(ks[j]), -int(ns[j])), t_pixels,
+                                       amp_m[:, c], -ph[:, j], None if f is None else -f[:, j],
+                                       None if fd is None else -fd[:, j], None if fdd is None else -fdd[:, j]))
     return tracks + minus
 
 
@@ -360,7 +369,7 @@ class EMRIDirectWDM:
         t_start: FEW reference epoch (trajectory clock origin), e.g. MOJITO_REFERENCE_TIME.
         data_t0: absolute time of WDM pixel 0.
         n_fine: fixed number of fine trajectory points over the window. Default ``None``:
-            one per ``fine_dt`` (1800 s: direct-vs-production unchanged from 80 s to 3600 s
+            one per ``fine_dt`` (3600 s: direct-vs-production unchanged from 80 s to 3600 s; 6 months: 1800 and 3600 s identical, mm 1e-7..4e-7
             on CD1L EMRI 1, 16 d), or one per ``fine_dt_plunge`` (80 s) when the
             trajectory ends inside the window or the modes are given explicitly (the
             plunge chunk reads the dense response from these splines).
@@ -370,7 +379,7 @@ class EMRIDirectWDM:
     """
 
     def __init__(self, few_gen, table, wdm_set, *, orbits, tdi_config, t_start, data_t0,
-                 Nt_sub=128, n_fine=None, fine_dt=1800.0, fine_dt_plunge=80.0, mode_batch=None,
+                 Nt_sub=128, n_fine=None, fine_dt=3600.0, fine_dt_plunge=80.0, mode_batch=None,
                  pixel_edge=8, num_m_layers=2, interp="spline", force_backend="cpu", feed="knots"):
         self.few_gen, self.table, self.wdm = few_gen, table, wdm_set
         self.orbits, self.tdi_config = orbits, tdi_config
@@ -527,7 +536,7 @@ class EMRIDirectWDM:
         if t_src[-1] < t_end - 1e-6:
             t_src = np.append(t_src, t_end)
         integ = self.few_gen.inspiral_generator.inspiral_generator
-        tr = harmonic_tracks_from_holder(H, integ, t_src, a=few_args[2], xI0=few_args[5])
+        tr = harmonic_tracks_from_holder(H, integ, t_src, a=few_args[2], xI0=few_args[5], phase_only=True)
         amp, ph = feed_from_tracks(tr, EMRITDIonFly.AMP_FACTOR)
         return fly.prepare_feed_arrays(t_src, amp, ph)
 
