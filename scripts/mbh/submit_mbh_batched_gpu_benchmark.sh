@@ -10,11 +10,10 @@
 # cross-check generator). Markdown table in the log, everything in the JSON.
 #
 # PRECONDITION: the cluster checkout /shared/home/mlkatz1/lisa-analysis-tools
-# must contain the cd1l-merge branch (MBHBatchedLikeMove, MBHWindowedWDMSignalGen,
-# WindowedGridAlignedMBHWaveform, utils/stagetimer.py and this script). As of
-# 2026-09-30 that work is STAGED, NOT COMMITTED in the laptop worktree
-# LISAanalysistools-cd1l -- commit/push it and check it out (and rebuild if the
-# .cu changed: LISAResponse.cu is modified on that branch) before submitting.
+# must be on dev at or after the 2026-09-30 cd1l-merge merge (MBHBatchedLikeMove,
+# MBHWindowedWDMSignalGen, WindowedGridAlignedMBHWaveform, utils/stagetimer.py,
+# this script) with Eryn dev >= e448a17 (PR #50). LISAResponse.cu changed in
+# that merge: rebuild the LAT GPU backend before submitting.
 #
 # The --output directory must exist before sbatch (slurm does not create it):
 #   mkdir -p /shared/data/global_fit_output/mbh_benchmark
