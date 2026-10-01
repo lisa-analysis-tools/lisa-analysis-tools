@@ -455,7 +455,9 @@ MBH_DEFAULT_WAVEFORM_DURATION = YRSID_SI / 12.0
 
 @dataclasses.dataclass
 class SourceMBHSettings(MBHSettings):
-    """MBH branch block. Default path: LEGACY ``PhenomTHMTDIWaveform``."""
+    """MBH branch block. Default waveform path: LEGACY phentax response
+    (``use_tdionfly=False``); default scoring path ``likelihood="auto"`` (the
+    batched windowed likelihood wherever the run can use it)."""
 
     # In-model stretch repeats per leaf visit: the expose/fold residual
     # round-trip and the prev_logl batch are paid once per visit, so more
@@ -477,18 +479,30 @@ class SourceMBHSettings(MBHSettings):
     response_order: int = dataclasses.field(
         default_factory=env_default("MBH_RESPONSE_ORDER", 8, int)
     )
-    # Scoring path: "full" (stock per-row container path) or "batched" (the
-    # MBHBatchedLikeMove: one grid-aligned response launch per chunk of rows
-    # on a per-leaf window, segment WDM transform, per-walker residual+PSD).
+    # Scoring path: "batched" (the MBHBatchedLikeMove: one grid-aligned
+    # response launch per chunk of rows on a per-leaf window, segment WDM
+    # transform, per-walker residual+PSD), "full" (stock per-row container
+    # path), or "auto" (DEFAULT since 2026-09-30, user "make this new path the
+    # default"): "batched" whenever the run can use it, else "full" with one
+    # INFO line naming why -- USE_TDIONFLY=1, a non-WDM run domain, or an
+    # MBH_WAVEFORM_DURATION env value other than the window
+    # (resolve_mbh_batched_cfg). An explicit "batched" still raises on those.
     likelihood: str = dataclasses.field(
-        default_factory=env_default("MBH_LIKELIHOOD", "full", str)
+        default_factory=env_default("MBH_LIKELIHOOD", "auto", str)
     )
+    # Rows per batched generator launch. 8 (was 16; controller ruling
+    # 2026-09-30 from the H100 benchmark): B=8 adds +8.5 GB of device memory
+    # for 0.037 s/row, B=16 +18.5 GB for 0.034 s/row, and production cards
+    # also carry the GB buffers.
     batch_max_size: int = dataclasses.field(
-        default_factory=env_default("MBH_BATCH_MAX_SIZE", 16, int)
+        default_factory=env_default("MBH_BATCH_MAX_SIZE", 8, int)
     )
     # Per-leaf window around the median cold-chain merger (days): kept box =
     # [t - before - margin, t + after + margin]; pad = discarded segment edge
     # (must be >= buffer_time: the response zeroes that much of the head).
+    # A data span shorter than the window (3 months, the lite smokes) clamps
+    # the kept box to the data's active box and the pads to the grid
+    # (mbh_window_layers) instead of refusing the run.
     window_before_days: float = dataclasses.field(
         default_factory=env_default("MBH_WINDOW_BEFORE_DAYS", 90.0, float)
     )
@@ -1050,41 +1064,131 @@ def make_mbh_initialize_kwargs(mbh, general_setup: GeneralSetup, gs) -> dict:
 # ============================================================
 # Runtime signal-gen config + cached wave-wrap generators
 # ============================================================
-def resolve_mbh_batched_cfg(mbh) -> dict:
+def run_domain_settings_class(domain_settings):
+    """The :class:`~lisatools.domains.DomainSettingsBase` subclass a run-domain
+    SPEC resolves to, or ``None`` when it cannot be known before the build.
+
+    ``domain_settings`` is what ``general.domain_settings`` holds: a settings
+    instance (its class), a ``make_factory`` factory (the class it declares as
+    ``domain_settings_class``), a hand-written factory (``None``: unknown), or
+    ``None``."""
+    from lisatools.domains import DomainSettingsBase
+
+    if isinstance(domain_settings, DomainSettingsBase):
+        return type(domain_settings)
+    cls = getattr(domain_settings, "domain_settings_class", None)
+    return cls if isinstance(cls, type) else None
+
+
+def run_domain_spec(general_info):
+    """The run-domain SPEC a built ``general_info`` was configured with.
+
+    The injection sites resolve ``MBH_LIKELIHOOD=auto`` from the resolved
+    general settings' ``domain_settings`` (a factory before the build);
+    :class:`~lisatools.globalfit.engine.GeneralSetup` keeps exactly that
+    object as ``.settings`` and replaces its own ``domain_settings`` with the
+    built instance. Returning the SPEC makes the moves' resolution see what
+    the injection saw (identical even for a hand-written factory, which is
+    ``unknown`` at both sites); the built instance is the fallback."""
+    spec = getattr(getattr(general_info, "settings", None), "domain_settings", None)
+    return spec if spec is not None else getattr(general_info, "domain_settings", None)
+
+
+#: ``MBH_LIKELIHOOD`` values; ``auto`` resolves to ``batched`` or ``full``.
+MBH_LIKELIHOOD_MODES = ("auto", "batched", "full")
+
+
+def _mbh_batched_blockers(mbh, domain_settings, *, explicit_batched) -> list:
+    """Why the batched path cannot serve this run (empty: it can).
+
+    Shared by ``auto`` (falls back to ``full`` naming the reasons) and an
+    explicit ``batched`` (raises with them). A run domain that cannot be
+    identified before the build (a hand-written factory) blocks ``auto`` only:
+    an explicit ``batched`` is taken at its word and the windowed generator
+    checks the BUILT domain itself (:func:`get_mbh_windowed_gen`)."""
+    from lisatools.domains import WDMSettings
+
+    before = float(mbh.window_before_days) * 86400.0
+    out = []
+    if bool(mbh.use_tdionfly):
+        out.append(
+            "USE_TDIONFLY=1 (the batched path is the legacy-response grid-aligned "
+            "generator)"
+        )
+    cls = run_domain_settings_class(domain_settings)
+    if cls is None:
+        if not explicit_batched:
+            out.append(
+                "the run domain cannot be identified before the build "
+                f"(general.domain_settings is {type(domain_settings).__name__}; a "
+                "factory must declare domain_settings_class, as the make_factory "
+                "ones do)"
+            )
+    elif not issubclass(cls, WDMSettings):
+        out.append(f"the run domain is {cls.__name__}, not WDM")
+    explicit = os.environ.get("MBH_WAVEFORM_DURATION")
+    duration = mbh.waveform_duration
+    if explicit is not None and (duration is None or abs(float(duration) - before) > 1.0):
+        out.append(
+            f"MBH_WAVEFORM_DURATION={explicit} disagrees with the window: the batched "
+            f"path generates {mbh.window_before_days} days before the merger "
+            "(MBH_WINDOW_BEFORE_DAYS) for BOTH the stock and the windowed generator"
+        )
+    return out
+
+
+def resolve_mbh_batched_cfg(mbh, *, domain_settings) -> dict:
     """Plain-value MBH scoring-path config, with the batched-mode consistency rules.
+
+    ``domain_settings`` is the run-domain SPEC (``general.domain_settings`` of
+    the RESOLVED general settings: an instance or a ``make_factory`` factory;
+    :func:`run_domain_spec` recovers it from a built ``general_info``). It is
+    REQUIRED so every site -- the injections (:func:`mbh_injection_duration`)
+    and the moves (:func:`source_signal_cfg`) -- resolves ``auto`` the same way.
+
+    ``auto`` (the default) becomes ``batched`` unless :func:`_mbh_batched_blockers`
+    names a reason -- ``USE_TDIONFLY=1``, a non-WDM (or unidentifiable) run
+    domain, an ``MBH_WAVEFORM_DURATION`` env value other than the window --
+    in which case it becomes ``full`` with ONE INFO line naming the reason(s).
+    An explicit ``batched`` raises on the same reasons; ``full`` passes the
+    stock values through untouched. The returned ``mbh_likelihood`` is always
+    the RESOLVED mode (``batched`` / ``full``), never ``auto``.
 
     ``batched`` pins BOTH generators (the stock one the engine installs for
     residual rebuilds and the cross-check, and the windowed one) to
     ``waveform_duration = window_before`` so the two agree on the inspiral
-    length; an explicit ``MBH_WAVEFORM_DURATION`` that disagrees is refused,
-    and so is ``use_tdionfly`` (the windowed generator is the legacy-response
-    family). The discarded segment pad must also cover ``buffer_time``: the
+    length. The discarded segment pad must also cover ``buffer_time``: the
     response ZEROES the first ``buffer_time`` of the lattice head, so a
-    shorter pad would let that dead stretch reach the kept box. ``full``
-    passes the stock values through untouched.
+    shorter pad would let that dead stretch reach the kept box.
     """
     mode = str(mbh.likelihood)
-    if mode not in ("full", "batched"):
-        raise ValueError(f"MBH_LIKELIHOOD must be 'full' or 'batched'; got {mode!r}")
+    if mode not in MBH_LIKELIHOOD_MODES:
+        raise ValueError(
+            f"MBH_LIKELIHOOD must be one of {MBH_LIKELIHOOD_MODES}; got {mode!r}"
+        )
     before = float(mbh.window_before_days) * 86400.0
     after = float(mbh.window_after_days) * 86400.0
     pad = float(mbh.window_pad_days) * 86400.0
     margin = float(mbh.window_margin_days) * 86400.0
     duration = mbh.waveform_duration
+    if mode != "full":
+        blockers = _mbh_batched_blockers(
+            mbh, domain_settings, explicit_batched=(mode == "batched")
+        )
+        if blockers and mode == "batched":
+            raise ValueError(
+                "MBH_LIKELIHOOD=batched cannot serve this run: " + "; ".join(blockers)
+                + ". Fix the conflict or use MBH_LIKELIHOOD=auto/full."
+            )
+        if blockers:
+            logger.info(
+                "MBH_LIKELIHOOD=auto -> full: %s.", "; ".join(blockers)
+            )
+            mode = "full"
+        else:
+            mode = "batched"
     if mode == "batched":
-        if bool(mbh.use_tdionfly):
-            raise ValueError(
-                "MBH_LIKELIHOOD=batched uses the legacy-response grid-aligned "
-                "generator; it cannot be combined with USE_TDIONFLY=1."
-            )
         explicit = os.environ.get("MBH_WAVEFORM_DURATION")
-        if explicit is not None and (duration is None or abs(float(duration) - before) > 1.0):
-            raise ValueError(
-                f"MBH_LIKELIHOOD=batched generates {mbh.window_before_days} days before "
-                f"the merger (MBH_WINDOW_BEFORE_DAYS) for BOTH the stock and the "
-                f"windowed generator; MBH_WAVEFORM_DURATION={explicit} disagrees. "
-                "Unset it or make the two equal."
-            )
         if explicit is None and (
             duration is None
             or (
@@ -1119,15 +1223,18 @@ def resolve_mbh_batched_cfg(mbh) -> dict:
     )
 
 
-def mbh_injection_duration(mbh):
+def mbh_injection_duration(mbh, *, domain_settings):
     """``waveform_duration`` an MBH INJECTION must be generated with.
 
-    The resolved value from :func:`resolve_mbh_batched_cfg`: the raw
-    ``mbh.waveform_duration`` on the ``full`` path, the window length
-    (``window_before``) on the ``batched`` path, so the injected signal and
-    the templates agree on the inspiral length.
+    The resolved value from :func:`resolve_mbh_batched_cfg` (same required
+    run-domain spec, so ``auto`` resolves here exactly as it does for the
+    moves): the raw ``mbh.waveform_duration`` on the ``full`` path, the
+    window length (``window_before``) on the ``batched`` path, so the
+    injected signal and the templates agree on the inspiral length.
     """
-    return resolve_mbh_batched_cfg(mbh)["mbh_waveform_duration"]
+    return resolve_mbh_batched_cfg(mbh, domain_settings=domain_settings)[
+        "mbh_waveform_duration"
+    ]
 
 
 def snap_waveform_t0_to_lattice(waveform_t0: float, data_t0: float, dt: float):
@@ -1143,9 +1250,14 @@ def snap_waveform_t0_to_lattice(waveform_t0: float, data_t0: float, dt: float):
     return snapped, snapped - float(waveform_t0)
 
 
-def source_signal_cfg(gs, mbh, sobbh, emri) -> dict:
-    """Plain-value config consumed by the wave-wrap getters below."""
-    _mbh_batched = resolve_mbh_batched_cfg(mbh)
+def source_signal_cfg(gs, mbh, sobbh, emri, *, domain_settings) -> dict:
+    """Plain-value config consumed by the wave-wrap getters below.
+
+    ``domain_settings``: the run-domain SPEC, for the MBH scoring-path
+    resolution (:func:`resolve_mbh_batched_cfg`); variants pass
+    ``run_domain_spec(self.general_info)`` so it matches the injection
+    sites' (``general.domain_settings`` of the resolved general settings)."""
+    _mbh_batched = resolve_mbh_batched_cfg(mbh, domain_settings=domain_settings)
     return dict(
         **_mbh_batched,
         tdi_chan=gs.tdi_chan,
@@ -1917,9 +2029,10 @@ def build_sobbh_move_runtime(curr, acs, priors, state, cfg):
 
 
 def build_mbh_move_runtime(curr, acs, priors, state, cfg):
-    """MBH PE move: batched windowed (MBH_LIKELIHOOD=batched), stretch RJ move on
-    the tdionfly wrap, or the stock ``build_mbh_moves_phenom`` builder around
-    the cached phentax generator."""
+    """MBH PE move: batched windowed (``cfg["mbh_likelihood"] == "batched"``,
+    the resolved ``auto`` default on a WDM legacy-response run), stretch RJ
+    move on the tdionfly wrap, or the stock ``build_mbh_moves_phenom`` builder
+    around the cached phentax generator."""
     mbh_info = curr.source_info["mbh"]
     if cfg.get("mbh_likelihood", "full") == "batched":
         slow = DeviceLocalWaveGen(get_mbh_phenom_gen, curr.general_info, cfg)
@@ -1961,13 +2074,17 @@ def build_source_moves(curr, acs, priors, state, cfg) -> dict:
     """Build the mbh/emri/sobbh PE moves present on ``curr`` into a name->move
     dict (matching the ``mbh_pe`` / ``emri_pe`` / ``sobbh_pe`` stock-move names).
 
-    MBH scoring path: ``MBH_LIKELIHOOD=full`` (default) scores ONE ROW AT A
-    TIME through ``AnalysisContainer.build_template`` (the base
-    ``ResidualAddOneRemoveOneMove`` path); ``MBH_LIKELIHOOD=batched`` builds
-    :class:`~lisatools.globalfit.moves.MBHBatchedLikeMove` instead -- batched
+    MBH scoring path (``cfg["mbh_likelihood"]``, ALREADY resolved from the
+    ``MBH_LIKELIHOOD=auto`` default by :func:`resolve_mbh_batched_cfg`):
+    ``batched`` -- the default wherever the run allows it (WDM domain, legacy
+    response, no conflicting ``MBH_WAVEFORM_DURATION``) -- builds
+    :class:`~lisatools.globalfit.moves.MBHBatchedLikeMove`: batched
     grid-aligned phentax generation on a per-leaf window with a segment WDM
     transform (``MBHBatchedMoveBuilder``, spec
-    ``docs/superpowers/specs/2026-09-29-mbh-batched-windowed-likelihood-design.md``).
+    ``docs/superpowers/specs/2026-09-29-mbh-batched-windowed-likelihood-design.md``);
+    ``full`` scores ONE ROW AT A TIME through
+    ``AnalysisContainer.build_template`` (the base
+    ``ResidualAddOneRemoveOneMove`` path).
     ``sobbh_pe`` uses the batched chunked-heterodyne kernel.
 
     EMRI batching remains DEFERRED BY DECISION (2026-08-28): ``emri_pe`` scores

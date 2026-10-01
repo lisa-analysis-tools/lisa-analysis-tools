@@ -247,6 +247,9 @@ class SlowWaveformEquivalenceTest(unittest.TestCase):
 
     # -- per-branch equivalence --------------------------------------------
     def test_mbh_equivalence(self):
+        from lisatools.globalfit.stock.erebor.source_runtime import (
+            snap_waveform_t0_to_lattice,
+        )
         from lisatools.sources.bbh.waveform import PhenomTHMTDIWaveform
 
         gi, cfg = self._essentials()
@@ -254,8 +257,18 @@ class SlowWaveformEquivalenceTest(unittest.TestCase):
         info, row, params_in = self._row_and_params("mbh")
         ref = info.signal_gen(*row)
         orbits = gi.gpu_orbits if getattr(gi, "gpus", None) is not None else gi.orbits
+        # 2026-09-30: the default MBH_LIKELIHOOD=auto resolves to batched on
+        # this WDM run, whose stock generator runs on the lattice-SNAPPED
+        # epoch with waveform_duration = the 90-d window; build the aligned
+        # class in the RESOLVED mode (full: stock epoch, its own duration).
+        t0, snap = cfg["mbh_waveform_t0"], 0.0
+        if cfg["mbh_likelihood"] == "batched":
+            t0, snap = snap_waveform_t0_to_lattice(t0, gi.data_t0, gi.dt)
+        params_in = np.array(params_in, dtype=float, copy=True)
+        params_in[-1] -= snap
         aligned = PhenomTHMTDIWaveform(
-            waveform_t0=cfg["mbh_waveform_t0"],
+            waveform_t0=t0,
+            Tobs=cfg["mbh_phenom_kwargs"]["waveform_duration"],
             data_td_settings=gi.data_td_settings,
             orbits=orbits,
             output_domain_settings=gi.domain_settings,

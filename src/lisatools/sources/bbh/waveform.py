@@ -67,7 +67,9 @@ MBH_PHENOM_DEFAULT_WAVEFORM_KWARGS = dict(
 )
 MBH_PHENOM_DEFAULT_TOBS = YRSID_SI / 12.0  # phentax generation window (seconds)
 MBH_PHENOM_DEFAULT_START_FREQ = 7e-5
-MBH_PHENOM_DEFAULT_RESPONSE_ORDER = 30
+# Response Lagrange order: 8 (user ruling 2026-09-29; PR #82 measured the MBH
+# mismatch flat from order 30 down to 4, ~1.6x cheaper). Set 30 for the old value.
+MBH_PHENOM_DEFAULT_RESPONSE_ORDER = 8
 MBH_PHENOM_DEFAULT_BUFFER_TIME = 15_000.0
 MBH_PHENOM_DEFAULT_FREQ_MIN = 1e-4
 MBH_PHENOM_DEFAULT_FREQ_MAX = 2.5e-2

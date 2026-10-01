@@ -288,12 +288,16 @@ class RuntimeWiringTest(unittest.TestCase):
     def _cfg(self, eps):
         from lisatools.globalfit.stock.erebor.source_runtime import (
             SourceEMRISettings,
+            SourceMBHSettings,
             source_signal_cfg,
         )
 
         emri = SourceEMRISettings(eps=eps, waveform_kwargs=dict())
+        # A real MBH block: the MBH scoring-path resolution validates
+        # mbh.likelihood (a MagicMock is no valid mode) and needs the domain.
         return source_signal_cfg(
-            mock.MagicMock(), mock.MagicMock(), mock.MagicMock(), emri
+            mock.MagicMock(), SourceMBHSettings(likelihood="full"), mock.MagicMock(),
+            emri, domain_settings=None,
         )
 
     def test_cfg_carries_the_effective_threshold(self):
@@ -340,8 +344,8 @@ class EnvKnobSubprocessTest(unittest.TestCase):
 
     CODE = (
         "from lisatools.globalfit.stock.erebor.source_runtime import (\n"
-        "    SourceEMRISettings, apply_emri_mode_selection_threshold,\n"
-        "    source_signal_cfg,\n"
+        "    SourceEMRISettings, SourceMBHSettings,\n"
+        "    apply_emri_mode_selection_threshold, source_signal_cfg,\n"
         ")\n"
         "from lisatools.globalfit.recipe import EMRIMoveBuilder\n"
         "from unittest import mock\n"
@@ -358,8 +362,9 @@ class EnvKnobSubprocessTest(unittest.TestCase):
         "assert key not in emri.waveform_kwargs, emri.waveform_kwargs\n"
         "like_kw = EMRIMoveBuilder(wave_gen=None).assemble_like_kwargs(emri)\n"
         "assert key not in like_kw, like_kw\n"
-        "cfg = source_signal_cfg(mock.MagicMock(), mock.MagicMock(),\n"
-        "                        mock.MagicMock(), emri)\n"
+        "cfg = source_signal_cfg(mock.MagicMock(),\n"
+        "                        SourceMBHSettings(likelihood='full'),\n"
+        "                        mock.MagicMock(), emri, domain_settings=None)\n"
         "assert cfg['emri_mode_selection_threshold'] == want, cfg[\n"
         "    'emri_mode_selection_threshold']\n"
         "print('EMRI_EPS_OK')\n"

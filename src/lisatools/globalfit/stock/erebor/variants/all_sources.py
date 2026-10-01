@@ -77,6 +77,7 @@ from ..source_runtime import (
     prepare_emri_branch,
     prepare_mbh_branch,
     prepare_sobbh_branch,
+    run_domain_spec,
     source_signal_cfg,
 )
 from ..stochastic import SGWBSetup
@@ -544,7 +545,9 @@ class AllSourcesGlobalFit(EreborFit):
                 tdi_gen_str=gs.tdi_gen_str,
                 synth_force_backend=force_backend,
                 mbh_phenom_kwargs=dict(
-                    waveform_duration=mbh_injection_duration(_mbh),
+                    waveform_duration=mbh_injection_duration(
+                        _mbh, domain_settings=gs.domain_settings
+                    ),
                     higher_modes=_mbh.higher_modes,
                     phenom_tol=_mbh.phenom_tol,
                     start_freq=_mbh.start_freq,
@@ -651,7 +654,9 @@ class AllSourcesGlobalFit(EreborFit):
                             tdi_gen_str=gs.tdi_gen_str,
                             sobbh_reference_time=gs.sobbh_reference_time,
                             mbh_phenom_kwargs=dict(
-                                waveform_duration=mbh_injection_duration(mbh),
+                                waveform_duration=mbh_injection_duration(
+                                    mbh, domain_settings=gs.domain_settings
+                                ),
                                 higher_modes=mbh.higher_modes,
                                 phenom_tol=mbh.phenom_tol,
                                 start_freq=mbh.start_freq,
@@ -873,7 +878,11 @@ class AllSourcesGlobalFit(EreborFit):
         mbh = _prep("mbh", AllSourcesMBHSettings())
         sobbh = _prep("sobbh", AllSourcesSOBBHSettings())
         emri = _prep("emri", AllSourcesEMRISettings())
-        cfg = source_signal_cfg(gs, mbh, sobbh, emri)
+        # The run-domain SPEC the injection sites resolved MBH_LIKELIHOOD=auto
+        # from (set_default_processor sees the resolved general settings).
+        cfg = source_signal_cfg(
+            gs, mbh, sobbh, emri, domain_settings=run_domain_spec(self.general_info)
+        )
         for branch in source_branches:
             info = self.source_info[branch]
             info.signal_gen = SourceSignalGen(

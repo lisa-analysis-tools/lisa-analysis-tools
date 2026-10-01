@@ -1,5 +1,13 @@
 """MBH add/remove move scored by the batched, windowed grid-aligned likelihood.
 
+The DEFAULT MBH scoring path of the stock erebor fits since 2026-09-30
+(``MBH_LIKELIHOOD=auto`` resolves to it on every WDM, legacy-response run
+without a conflicting ``MBH_WAVEFORM_DURATION``; see
+``stock.erebor.source_runtime.resolve_mbh_batched_cfg``). ``MBH_LIKELIHOOD=full``
+keeps the per-row container path. A data span shorter than the window
+(3-month runs, the lite smokes) clamps the window to the data
+(:func:`mbh_window_layers`) instead of refusing the build.
+
 :class:`MBHBatchedLikeMove` keeps ALL of :class:`ResidualAddOneRemoveOneMove`'s
 choreography (per-leaf expose/fold, in-model repeats, per-leaf tempering,
 cold-chain bookkeeping) and swaps the scoring and fill paths, exactly as
@@ -62,6 +70,8 @@ __all__ = ["MBHBatchedLikeMove", "mbh_window_layers"]
 _T_PLUNGE_COL = 10
 #: the only generator kwargs the grid-aligned generator accepts
 _ACCEPTED_GEN_KWARGS = ("start_freq", "ref_freq", "T")
+#: clamped geometries already logged by :func:`mbh_window_layers` (log once)
+_CLAMP_LOGGED: set = set()
 
 
 def mbh_window_layers(
@@ -99,6 +109,18 @@ def mbh_window_layers(
     even-start parity rule then grows the low pad by one only for an odd
     interior start; a start clamped to layer 0 or to ``Nt - Nt_seg`` is
     already even.
+
+    SHORT DATA SPANS (2026-09-30; a 3-month run, the lite smokes): when the
+    configured window does not fit, it is CLAMPED instead of refused --
+    ``Nt_keep = min(Nt_keep, active layers)`` and the segment ``min(Nt_keep +
+    2 n_pad, Nt)`` (still even; an odd clamped ``Nt_keep`` gets the spare
+    layer as pad), so the pads shrink to what fits on each side, possibly 0.
+    A window that covers the whole active box AND the whole grid is the stock
+    full-grid transform restricted to the active box. Logged once per
+    geometry (``[MBH_BATCH]``, INFO). ``n_pad`` keeps the CONFIGURED pad; the
+    actual pads are ``n_pad_lo`` / ``n_pad_hi``. Only a geometry with no
+    valid segment raises: an empty active box, or a whole-grid segment on an
+    odd-length grid.
     """
     layer_dt = float(wdm.layer_dt)
     t0 = float(wdm.t0) if t0_abs is None else float(t0_abs)
@@ -112,12 +134,31 @@ def mbh_window_layers(
         Nt_keep += 1
     Nt_seg = Nt_keep + 2 * n_pad
     if Nt_seg > Nt or Nt_keep > act_hi - act_lo:
-        raise ValueError(
-            f"MBH window ({span / 86400:.1f} d = {Nt_keep} kept layers + 2 x {n_pad} "
-            f"pad layers = {Nt_seg} layers) does not fit the WDM grid of {Nt} layers "
-            f"(active time layers [{act_lo}, {act_hi})) x {layer_dt:.0f} s; shorten "
-            "MBH_WINDOW_BEFORE_DAYS / MBH_WINDOW_PAD_DAYS for this data span."
-        )
+        keep_c = min(Nt_keep, act_hi - act_lo)
+        seg_c = keep_c + 2 * n_pad
+        if seg_c % 2:  # odd clamped box: the spare layer is pad
+            seg_c += 1
+        seg_c = min(seg_c, Nt)
+        if keep_c < 1 or seg_c % 2:
+            raise ValueError(
+                f"MBH window cannot be placed on this WDM grid of {Nt} layers (active "
+                f"time layers [{act_lo}, {act_hi})) x {layer_dt:.0f} s: the clamped "
+                f"segment would be {seg_c} layers around a kept box of {keep_c} (a "
+                "segment needs >= 1 kept layer and an even layer count)."
+            )
+        key = (Nt, act_lo, act_hi, layer_dt, Nt_keep, n_pad, keep_c, seg_c)
+        if key not in _CLAMP_LOGGED:
+            _CLAMP_LOGGED.add(key)
+            logger.info(
+                "[MBH_BATCH] window clamped to the data span: configured %.1f d box = "
+                "%d kept + 2 x %d pad layers (%d) does not fit the WDM grid of %d layers "
+                "(active time layers [%d, %d)) x %.0f s; kept box -> %d layers%s, "
+                "segment -> %d layers%s.", span / 86400.0, Nt_keep, n_pad, Nt_seg, Nt,
+                act_lo, act_hi, layer_dt, keep_c,
+                " (the whole active box)" if keep_c == act_hi - act_lo else "",
+                seg_c, " (the whole grid)" if seg_c == Nt else "",
+            )
+        Nt_keep, Nt_seg = keep_c, seg_c
     lo_abs = float(t_merge_abs) - float(window_before) - float(window_margin)
     n_start = int(np.floor((lo_abs - t0) / layer_dt))
     n_start = min(max(n_start, act_lo), act_hi - Nt_keep)
@@ -161,7 +202,7 @@ class MBHBatchedLikeMove(ResidualAddOneRemoveOneMove):
     _check_ll_every_default = "10"
 
     def __init__(
-        self, *args, batched_gen=None, batch_max_size=16,
+        self, *args, batched_gen=None, batch_max_size=8,
         window_before=90 * 86400.0, window_after=10 * 86400.0,
         window_pad=4 * 86400.0, window_margin=86400.0, **kwargs,
     ):
@@ -187,9 +228,10 @@ class MBHBatchedLikeMove(ResidualAddOneRemoveOneMove):
                 "MBH_LIKELIHOOD=batched needs a WDM run domain; the containers "
                 f"carry {type(self._wdm).__name__}."
             )
-        # Fail at BUILD, not at the first leaf, when the window cannot fit the
-        # grid (the geometry's size is independent of the merger time and of
-        # the layer-0 time, so the settings' own t0 serves for both here).
+        # Fail at BUILD, not at the first leaf, when the window has no valid
+        # geometry on this grid (a short data span is CLAMPED, logged once,
+        # not refused; the geometry's size is independent of the merger time
+        # and of the layer-0 time, so the settings' own t0 serves here).
         mbh_window_layers(
             self._wdm, float(self._wdm.t0), self.window_before, self.window_after,
             self.window_pad, self.window_margin,
