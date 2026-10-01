@@ -1169,6 +1169,62 @@ def reset_band_logl_max(state, branch: str = "gb") -> int:
     return int(arr.size)
 
 
+def release_band_shutoff_window(state, serial, branch: str = "gb"):
+    """Release the level-3 valve ON THE STATE at recipe-step entry.
+
+    Returns ``(n_reopened, released)``.
+
+    The per-(walker, band) RJ shutoff valve is scoped to a recipe step: a
+    stored table earned under another step is released, not honoured. Until
+    2026-10-01 that release lived ONLY in the RJ moves' bind path
+    (``_arm_search_stage`` on rj_fstat_search / rj_warm_search, at THEIR
+    first propose). The pure in-model moves bind the same table READ-ONLY
+    for their pick mask -- no stamp check, no release -- so the first
+    non-RJ GB move of a new step read the previous step's table. 6mo job
+    675 (the first ratcheted relaunch): gb_search_2 had ended with every
+    occupied pair shut (that is the stage-end rule), the gated noise head's
+    in-model follow-up was the first GB move of gb_search_3, its pick mask
+    excluded every shut pair, and it ran ZERO proposals
+    (``[GB_ACCEPT in_model] in-model cold 0/0``, one 1 s "pass" with every
+    occupied sub-band static) -- the one pass the ratchet design exists to
+    run before any RJ move sees the nudged residual. Job 672 did not show it
+    because its state came from a stage-3 checkpoint whose stamp matched.
+
+    Same rule as the bind path, applied earlier and on the live arrays the
+    moves will bind: stamp differs from ``serial`` (the unset sentinel
+    included) -> clear the shut booleans and the window (peak / streak /
+    resets; the all-time max is untouched by the 2026-09-27 ruling) and
+    re-stamp; same stamp (a resume inside the step) -> honour it. In place,
+    so the saver persists the release and the RJ move's own bind then sees a
+    matching stamp and releases nothing twice.
+    """
+    if serial is None:
+        return 0, False
+    try:
+        bi = state.sub_states[branch].band_info
+    except (AttributeError, KeyError, TypeError):
+        return 0, False
+    if not isinstance(bi, dict):
+        return 0, False
+    shut = bi.get("band_rj_shutoff_w")
+    stamp = bi.get("band_shutoff_w_step")
+    if shut is None or stamp is None:
+        return 0, False
+    shut = np.asarray(shut)
+    stamp = np.asarray(stamp)
+    if stamp.size == 0 or int(stamp.ravel()[0]) == int(serial):
+        return 0, False
+    from .moves.gbspecialstretch import cold_band_lnl_from_band_info
+
+    view = cold_band_lnl_from_band_info(bi, shut.shape)
+    if view is not None:
+        view.release()
+    n = int(np.count_nonzero(shut))
+    shut[...] = False
+    stamp.ravel()[0] = int(serial)
+    return n, True
+
+
 def _arm_cap_headroom_grant(moves) -> None:
     """Set the one-shot ``_grant_cap_headroom`` flag on every move in the tree
     that publishes a headroom deficit, so the next cap update grants +1 slot to
@@ -1483,6 +1539,19 @@ class SearchStageProfileStep(RJRecipeStep):
         self._profile_serial = serial
         self._profile_applied = True
         self._apply_profile(serial)
+        # Release the level-3 valve on the LIVE state before the step's first
+        # move (6mo job 675: the gated noise head's in-model pass, a non-RJ
+        # move, read gb_search_2's all-shut table and picked nothing).
+        _n_open, _released = release_band_shutoff_window(
+            getattr(self, "_ratchet_last_sample", None), serial)
+        if _released:
+            logger.info(
+                "[V9-STAGE %s] per-walker RJ valve RELEASED at step entry "
+                "(stored step != %s): %d (walker, band) pairs reopened and the "
+                "window cleared BEFORE the step's first move, so a non-RJ move "
+                "running first (the gated noise head's in-model pass) picks "
+                "from this step's table, not the previous step's.",
+                self.stage_name or "gb_search", serial, _n_open)
         if self.profile.get("reset_band_max"):
             # user ruling 2026-09-30 (gb_search_3): the valve's stored per-band
             # max was earned under another noise curve -- re-learn it here
