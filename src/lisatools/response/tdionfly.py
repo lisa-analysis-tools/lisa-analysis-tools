@@ -924,3 +924,64 @@ class SOBBHTDIonTheFly(TDIonTheFly):
             phase_ref.reshape(self.t_arr.shape),
             force_backend=self.backend
         ), fill_splines=return_spline)
+
+class TDDenseTDIonTheFly(TDIonTheFly):
+    """Template-batched TD TDI-on-the-fly for multi-harmonic sources sharing one trajectory
+    (EMRIs), with EXACT phases from the integrator's 8th-order dense output.
+
+    Per template ``b``: the evaluation times ``t[b]`` (one common length ``N``), the
+    integrator knots ``t_knots[b, :n_knots[b]]`` and DOPR853 phase coefficients
+    ``phase_coeffs[b, K-1, 3, 8]`` (conventions -- massratio scaling, sign(xI0), the backwards
+    offset -- already applied). Per harmonic ``s`` (templates' harmonics contiguous,
+    ``sub_offsets``): integers ``sub_mkn[s] = (m, k, n)`` and a complex amplitude cubic spline
+    over its template's knots, ``amp_re/amp_im[s, K-1, 4]`` (monomial coefficients in
+    ``t - t_knot``). The strain term is ``amp_factor * c_s(t) * exp(-i Phi_s(t))``.
+
+    The kernel computes the link geometry once per (template, time) and reuses it for every
+    harmonic; the output is a :class:`TDTDIOutput` over all harmonics (``phase_ref`` = the pure
+    carrier ``Phi_s`` at spacecraft-1 time; the amplitude's phase lands in ``tdi_phase``).
+    """
+
+    def __init__(self, t, sub_offsets, sub_mkn, t_knots, n_knots, phase_coeffs, amp_re, amp_im,
+                 amp_factor=1.0, tdi_config=None, orbits=None, force_backend=None):
+        sub_offsets = np.asarray(sub_offsets.get() if hasattr(sub_offsets, "get") else sub_offsets, dtype=np.int32)
+        num_sub = int(sub_offsets[-1])
+        super().__init__(1.0, num_sub, n_params=4, tdi_config=tdi_config, orbits=orbits, force_backend=force_backend)
+        if self.backend.TDDenseTDIWaveformWrap is None:
+            raise RuntimeError("this lisatools backend module has no TDDenseTDIWaveformWrap; rebuild it")
+        xp = self.xp
+        self.t = xp.ascontiguousarray(xp.asarray(t, dtype=xp.float64))
+        self.n_temp, self.N = self.t.shape
+        self.sub_offsets = xp.asarray(sub_offsets, dtype=xp.int32)
+        sub_temp = np.repeat(np.arange(self.n_temp, dtype=np.int32), np.diff(sub_offsets))
+        self.sub_temp_host = sub_temp
+        self.sub_temp = xp.asarray(sub_temp, dtype=xp.int32)
+        self.sub_mkn = xp.ascontiguousarray(xp.asarray(sub_mkn, dtype=xp.int32).reshape(num_sub, 3))
+        self.K = int(np.asarray(t_knots.shape)[-1])
+        self.t_knots = xp.ascontiguousarray(xp.asarray(t_knots, dtype=xp.float64).reshape(self.n_temp, self.K))
+        self.n_knots = xp.asarray(n_knots, dtype=xp.int32)
+        self.phase_coeffs = xp.ascontiguousarray(xp.asarray(phase_coeffs, dtype=xp.float64).reshape(self.n_temp, self.K - 1, 3, 8))
+        self.amp_re = xp.ascontiguousarray(xp.asarray(amp_re, dtype=xp.float64).reshape(num_sub, self.K - 1, 4))
+        self.amp_im = xp.ascontiguousarray(xp.asarray(amp_im, dtype=xp.float64).reshape(num_sub, self.K - 1, 4))
+        self.amp_factor = float(amp_factor)
+        # the wrap keeps raw pointers: these arrays live on self
+        self.wave_gen = self.backend.TDDenseTDIWaveformWrap(
+            self.cpp_orbits, self.cpp_tdi_config, self.n_temp, self.K, num_sub, self.amp_factor,
+            self.sub_temp, self.sub_mkn.ravel(), self.n_knots, self.t_knots.ravel(),
+            self.phase_coeffs.ravel(), self.amp_re.ravel(), self.amp_im.ravel())
+
+    def __call__(self, params, return_spline: bool = True) -> "TDTDIOutput":
+        """``params``: (n_temp, 4) = (inc, psi, lam, beta) per template."""
+        xp = self.xp
+        params = xp.ascontiguousarray(xp.asarray(params, dtype=xp.float64).reshape(self.n_temp, 4))
+        nch = self.tdi_config.nchannels
+        S, N = self.num_sub, self.N
+        chans = xp.zeros(S * nch * N, dtype=complex)
+        amp = xp.zeros(S * nch * N, dtype=float)
+        phase = xp.zeros(S * nch * N, dtype=float)
+        phi_ref = xp.zeros(S * N, dtype=float)
+        self.wave_gen.run_wave_tdi_wrap(chans, amp, phase, phi_ref, params.ravel(), self.t.ravel(),
+                                        self.sub_offsets, N, 4, nch)
+        x = self.t[self.sub_temp]
+        return TDTDIOutput(x, amp.reshape(S, nch, N), phase.reshape(S, nch, N), phi_ref.reshape(S, N),
+                           fill_splines=return_spline, force_backend=self.backend.name.split("_")[-1])
