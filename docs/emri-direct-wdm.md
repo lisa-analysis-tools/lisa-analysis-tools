@@ -146,6 +146,18 @@ window, 7e-6 in the last 1% (spline response: 9e-6..1.2e-5). Tests: `tests/test_
 inc != 0; polarisation and strain-sign mutations caught), `tests/test_emri_dense_inputs.py`.
 The CUDA build of the kernel has NOT been compiled or run yet.
 
+More CPU checks (10-01):
+
+| check | result |
+|---|---|
+| EMRI 1, eps 1e-5 (111-112 modes), dense vs spline response, wall | 16 d 1.6 vs 3.8 s; 60 d 5.4 vs 15.3 s; 180 d 16.0 vs 49.8 s |
+| same, dense vs spline template | mismatch <= 4e-13, norm ratio 1.0000000 |
+| plunging source, 69 modes, dt 5 s (table NF720_DT5), dense direct vs production | whole window 1.3-2.5e-4; < 0.9 t_p 7.5-9.2e-5 (table); 0.9-0.99 3.8-6.0e-6; last 1% 5.9e-4..1.2e-3 |
+| same at dt 20 s | 2.6-4.7e-2 (aliasing of m >= 3 near plunge) |
+| per mode, dense response vs production at 5 s | (2,2,0,0) 2.5e-6, (4,4,0,1) 2.0e-5, (3,3,0,2) 1.5e-4, (5,5,0,0) 1.8e-4; the last two entirely in the final 1% before plunge (production's interpolated strain across the abrupt stop) |
+
+Lookup memory: the table call is chunked (`EMRI_DIRECT_LOOKUP_CHUNK`, default 2e6 entries).
+
 ## Open items
 
 1. (resolved) TOF vs production at the abrupt plunge end.
