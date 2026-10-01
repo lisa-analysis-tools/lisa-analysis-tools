@@ -197,14 +197,17 @@ def _scatter_add(xp, acc, idx, vals):
 
 def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, Nt, dt, layer_dt,
                               layer_df, t0, Nt_sub=128, num_m_layers=2, fdot_axis_max=np.inf,
-                              pixel_edge=8, backend="cpu", sub_row=None):
+                              pixel_edge=8, backend="cpu", sub_row=None, lookup_chunk=None):
     """Vectorised :func:`_accumulate_harmonic_batch_loop`: ONE table evaluation for every
     (sub, channel, pixel) of the batch and one scatter-add, on the array module of ``acc``
     (numpy or cupy). Same arguments, same result up to summation order.
 
     ``sub_row`` (optional, length num_sub): the template each sub belongs to; ``acc`` is then
     ``(n_templates, nch, Nf, Nt)`` and many templates accumulate in one call (no plunge
-    chunks allowed in that mode)."""
+    chunks allowed in that mode).
+    ``lookup_chunk``: max (sub, channel, pixel) entries per table call (bounds the lookup's
+    temporaries: ~6 arrays of (entries, 2 num_m_layers + 1) doubles); default from env
+    EMRI_DIRECT_LOOKUP_CHUNK or 2,000,000."""
     from ...wdm_het import tail_chunk_plan, wdm_chunk_of_td
     from ...utils.utility import get_array_module
 
@@ -217,20 +220,25 @@ def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, 
     before = xp.arange(P)[None, :] < xp.asarray(k_h)[:, None]                       # (S, P)
     sel = before[:, None, :] & (xp.abs(fdot) <= fdot_axis_max) & (f > 2 * layer_df)  # (S, C, P)
     stats["dropped_pixels"] = int(nch * int(before.sum()) - int(sel.sum()))
-    s_i, c_i, p_i = xp.nonzero(sel)
-    if s_i.size:
-        co, mm = table.get_wdm_coeffs(amp[sel], phase[sel], f[sel], fdot[sel], n_ok_x[p_i],
+    s_all, c_all, p_all = xp.nonzero(sel)
+    chunk = int(lookup_chunk or os.environ.get("EMRI_DIRECT_LOOKUP_CHUNK", 2_000_000))
+    sub_row_x = None if sub_row is None else xp.asarray(sub_row)
+    for j0 in range(0, int(s_all.size), chunk):
+        s_i, c_i, p_i = s_all[j0:j0 + chunk], c_all[j0:j0 + chunk], p_all[j0:j0 + chunk]
+        co, mm = table.get_wdm_coeffs(amp[s_i, c_i, p_i], phase[s_i, c_i, p_i], f[s_i, c_i, p_i],
+                                      fdot[s_i, c_i, p_i], n_ok_x[p_i],
                                       num_m_layers=num_m_layers, out_of_support="zero")
         co, mm = xp.asarray(co), xp.asarray(mm)
         n_e = n_ok_x[p_i]
-        r_i = None if sub_row is None else xp.asarray(sub_row)[s_i]
+        r_i = None if sub_row_x is None else sub_row_x[s_i]
         for c in range(co.shape[1]):
             good = mm[:, c] >= 0
             idx = (c_i[good], mm[good, c], n_e[good])
             if r_i is not None:
                 idx = (r_i[good],) + idx
             _scatter_add(xp, acc, idx, co[good, c])
-        stats["lookup_pixels"] = int(s_i.size)
+        del co, mm
+    stats["lookup_pixels"] = int(s_all.size)
     windows = {}
     n_ok_h = np.asarray(n_ok.get() if hasattr(n_ok, "get") else n_ok)
     for s in range(S):

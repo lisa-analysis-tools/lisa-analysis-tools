@@ -295,6 +295,10 @@ class VectorisedAccumulateTest(AssemblyTest):
                   num_m_layers=2, fdot_axis_max=float(np.max(np.abs(self.table.fdot_vals))), pixel_edge=8)
         a1, a2 = np.zeros((2, self.NF, self.NT)), np.zeros((2, self.NF, self.NT))
         s1 = wd.accumulate_harmonic_batch(a1, self.table, tracks, tracer, n_ok, tail_td, **kw)
+        a3 = np.zeros_like(a1)                                   # tiny lookup chunks: same result
+        s3 = wd.accumulate_harmonic_batch(a3, self.table, tracks, tracer, n_ok, tail_td, lookup_chunk=37, **kw)
+        self.assertEqual(s1, s3)
+        np.testing.assert_allclose(a3, a1, rtol=0, atol=1e-14 * np.max(np.abs(a1)))
         s2 = wd._accumulate_harmonic_batch_loop(a2, self.table, tracks, tracer, n_ok, tail_td, **kw)
         self.assertEqual(s1, s2)
         self.assertGreater(s1["dropped_pixels"], 0)

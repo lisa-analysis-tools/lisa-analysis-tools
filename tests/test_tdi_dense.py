@@ -115,7 +115,9 @@ class TDDenseGPUParityTest(TDDenseTest):
         from lisatools.response.tdiconfig import TDIConfig
         from lisatools.response.tdionfly import TDDenseTDIonTheFly
 
-        if not lisatools.has_backend("gpu"):
+        try:
+            lisatools.get_backend("gpu")
+        except Exception:
             self.skipTest("no GPU backend")
         K = self.t_k.size
         Phi_k = self._fund(self.t_k)

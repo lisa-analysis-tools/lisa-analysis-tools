@@ -24,7 +24,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import emri_tof_xyz_threeway as W  # noqa: E402  (orbits/params loading, REF)
 
-NF, DT, NT = 180, 20.0, 1024
+DT = float(os.environ.get("GATE_DT", "20"))   # 20 s aliases the high harmonics near plunge: use 5 s for those
+NF, NT = int(round(3600.0 / DT)), 1024
 START_OFFSET_S = 5e4
 
 
