@@ -15,7 +15,13 @@ on ``--backend`` (cuda12x on the cluster). Reports wall per template, the trajec
 share, the precompute cost, the speedup, and a bitwise check that pooled templates equal
 serial ones. Appends one JSON line per threshold to ``--out``.
 
-Env: MOJITO_LIGHT_PATH (mojito light v1.0.0 dir), START_OFFSET_S (default 5e4).
+Inputs: only source PARAMETERS and orbits are needed (no data samples are read). Params come
+from ``--catalog`` (or ``--catalog fixed``: a built-in source, no files); orbits from the
+source's L1 brick when found (``--l1-dir``), else the packaged equal-arm file
+(``--orbits equal-arm`` forces it). Env: MOJITO_LIGHT_PATH (default root for both),
+START_OFFSET_S (default 5e4).
+No files at all:
+    python scripts/emri/emri_batch_speed.py --catalog fixed --orbits equal-arm --backend cuda12x --workers 8
 Example (cluster GPU, 6mo production grid):
     python scripts/emri/emri_batch_speed.py --src 1 --backend cuda12x --workers 8 --rows 64
 Laptop smoke:
@@ -37,27 +43,51 @@ import emri_tof_xyz_threeway as W  # noqa: E402  (catalogue reader constants: PA
 LAYER_DT = 3600.0
 
 
-def load_source(src, backend, span):
-    """Catalogue params (FEW order, special frame), data start, and ICRS L1 orbits."""
-    from mojito import MojitoL1File
+# a plausible plunging EMRI (FEW order, special frame) for runs with no catalogue at hand
+FIXED_PARAMS = [1e6, 10.0, 0.9, 10.0, 0.3, 1.0, 1.0, 1.0, 2.0, 0.8, 0.5, 0.1, 0.0, 0.2]
 
-    from lisatools.detector import L1Orbits
+
+def load_source(src, backend, span, catalog=None, l1_dir=None, orbits="auto"):
+    """Params (FEW order, special frame), window start, and ICRS orbits.
+
+    ``catalog``: the mojito EMRI catalogue h5 (default under MOJITO_LIGHT_PATH); ``"fixed"``
+    uses FIXED_PARAMS. ``orbits``: ``"l1"`` reads the source's L1 brick (orbits + its start
+    time; needs ``l1_dir``), ``"equal-arm"`` uses the packaged equal-arm file (no data at
+    all), ``"auto"`` takes the brick when it is found. The speed test never reads data samples.
+    """
+    from lisatools.detector import EqualArmlengthOrbits, L1Orbits
     from lisatools.globalfit.preprocessing import find_file
     from lisatools.sources.utils import icrs_to_ecliptic
 
-    path = os.environ.get("MOJITO_LIGHT_PATH", W.PATH)
-    with h5py.File(os.path.join(path, "catalogues", "emri_cat_mojito_lite_processed_MT.hdf5"), "r") as f:
-        b = f["Binaries"]
-        g = lambda k: float(b[k][src])  # noqa: E731
-        lam, beta = icrs_to_ecliptic(g("RightAscension") % (2 * np.pi), g("Declination"))
-        params = [g("PrimaryMassSSBFrame"), g("SecondaryMassSSBFrame"), g("PrimarySpinParameter"),
-                  g("SemiLatusRectum"), g("Eccentricity"), 1.0, g("LuminosityDistance") / 1e3,
-                  float(np.pi / 2 - beta), float(lam) % (2 * np.pi),
-                  g("PolarAnglePrimarySpin"), g("AzimuthalAnglePrimarySpin"),
-                  g("AzimuthalPhase"), g("PolarPhase"), g("RadialPhase")]
-    fp = find_file(os.path.join(path, "data", "EMRI", "L1"), "EMRI", src)
-    ts = MojitoL1File(fp).tdis.time_sampling
-    data_t0 = float(ts.t0) + float(os.environ.get("START_OFFSET_S", "5e4"))
+    root = os.environ.get("MOJITO_LIGHT_PATH", W.PATH)
+    catalog = catalog or os.path.join(root, "catalogues", "emri_cat_mojito_lite_processed_MT.hdf5")
+    if catalog == "fixed":
+        params = list(FIXED_PARAMS)
+    else:
+        with h5py.File(catalog, "r") as f:
+            b = f["Binaries"]
+            g = lambda k: float(b[k][src])  # noqa: E731
+            lam, beta = icrs_to_ecliptic(g("RightAscension") % (2 * np.pi), g("Declination"))
+            params = [g("PrimaryMassSSBFrame"), g("SecondaryMassSSBFrame"), g("PrimarySpinParameter"),
+                      g("SemiLatusRectum"), g("Eccentricity"), 1.0, g("LuminosityDistance") / 1e3,
+                      float(np.pi / 2 - beta), float(lam) % (2 * np.pi),
+                      g("PolarAnglePrimarySpin"), g("AzimuthalAnglePrimarySpin"),
+                      g("AzimuthalPhase"), g("PolarPhase"), g("RadialPhase")]
+    start_offset = float(os.environ.get("START_OFFSET_S", "5e4"))
+    fp = None
+    if orbits in ("auto", "l1"):
+        try:
+            fp = find_file(l1_dir or os.path.join(root, "data", "EMRI", "L1"), "EMRI", src)
+        except Exception:
+            if orbits == "l1":
+                raise
+    if fp is None:
+        print("[speed] orbits: packaged equal-arm (no L1 brick used)", flush=True)
+        return params, W.REF + start_offset, EqualArmlengthOrbits(force_backend=backend, frame="icrs")
+    from mojito import MojitoL1File
+
+    print(f"[speed] orbits: L1 brick {os.path.basename(fp)}", flush=True)
+    data_t0 = float(MojitoL1File(fp).tdis.time_sampling.t0) + start_offset
     orb = L1Orbits(fp, force_backend=backend, frame="icrs")
     if backend != "cpu":
         return params, data_t0, orb          # GPU nodes: keep the full table (no host-side trim)
@@ -103,6 +133,11 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--thresh", default="1e-3,1e-4,1e-5")
     ap.add_argument("--out", default="emri_batch_speed.jsonl")
+    ap.add_argument("--catalog", default=None,
+                    help="EMRI catalogue h5 (default: $MOJITO_LIGHT_PATH/catalogues/emri_cat_mojito_lite_processed_MT.hdf5); "
+                         "'fixed' = a built-in source, no files")
+    ap.add_argument("--l1-dir", default=None, help="dir of EMRI L1 bricks (default: $MOJITO_LIGHT_PATH/data/EMRI/L1)")
+    ap.add_argument("--orbits", choices=("auto", "l1", "equal-arm"), default="auto")
     args = ap.parse_args()
 
     from few.trajectory.pool import TrajectoryCache, TrajectoryPool, inspiral_init_kwargs_from, reset_stepper
@@ -115,7 +150,8 @@ def main():
     nf = int(round(LAYER_DT / args.dt))
     nt = int(round(args.days * 86400.0 / LAYER_DT))
     n = nf * nt
-    params, data_t0, orb = load_source(args.src, args.backend, n * args.dt)
+    params, data_t0, orb = load_source(args.src, args.backend, n * args.dt, catalog=args.catalog,
+                                       l1_dir=args.l1_dir, orbits=args.orbits)
     fit = erebor.get_stock("all_sources")
     off = data_t0 - W.REF
     offset_int = int(round(off / args.dt))
