@@ -35,6 +35,8 @@ def main():
     ap.add_argument("--l1-dir", default=None)
     ap.add_argument("--orbits", choices=("auto", "l1", "equal-arm"), default="auto")
     ap.add_argument("--direct-table", required=True)
+    ap.add_argument("--batch-rows", type=int, default=0,
+                    help="also time EMRIDirectWDM.batch over this many parameter rows (one response call)")
     args = ap.parse_args()
 
     from lisatools.domains import TDSettings, TDSignal, WDMLookupTable, WDMSettings
@@ -100,6 +102,7 @@ def main():
     wrap(type(gen), "__call__", "  FEW generator calls (both)")
     wrap(EF.EMRITDIonFly, "__call__", "2 TOF total (FEW call #2 + feed + response)")
     wrap(EF.EMRITDIonFly, "mode_amp_phase", "  TOF feed: mode amp/phase")
+    wrap(EF.EMRITDIonFly, "run_response", "  TOF run_response (input splines + kernel + output)")
     wrap(TF.TDTDIonTheFly, "__init__", "  TOF input splines")
     wrap(TF.TDTDIonTheFly, "__call__", "  TOF response kernel + output splines")
     wrap(WD, "harmonic_tracks_from_holder", "3 harmonic tracks")
@@ -134,6 +137,21 @@ def main():
               f"production {t_prod * 1e3:.0f} ms (per template)", flush=True)
         for k in [lab for lab in LABELS if lab in T]:
             print(f"  {k:48s} {T[k] / args.reps * 1e3:8.1f} ms  ({C[k] // args.reps} calls)", flush=True)
+        if args.batch_rows > 0:
+            rows = B.batch_rows(params, args.batch_rows)
+            direct.batch(rows[:2], mode_selection_threshold=thr)        # warm-up
+            sync()
+            T.clear()
+            C.clear()
+            t0 = time.perf_counter()
+            direct.batch(rows, mode_selection_threshold=thr)
+            sync()
+            t_b = time.perf_counter() - t0
+            print(f"[stages] thr={thr:g} BATCH of {len(rows)}: {t_b * 1e3:.0f} ms total = "
+                  f"{t_b / len(rows) * 1e3:.0f} ms per template (production {t_prod * 1e3:.0f}) {direct.last_stats}",
+                  flush=True)
+            for k in [lab for lab in LABELS if lab in T]:
+                print(f"  {k:48s} {T[k] / len(rows) * 1e3:8.1f} ms per template  ({C[k]} calls)", flush=True)
 
 
 if __name__ == "__main__":

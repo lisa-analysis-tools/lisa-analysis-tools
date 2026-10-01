@@ -188,10 +188,14 @@ def _scatter_add(xp, acc, idx, vals):
 
 def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, Nt, dt, layer_dt,
                               layer_df, t0, Nt_sub=128, num_m_layers=2, fdot_axis_max=np.inf,
-                              pixel_edge=8, backend="cpu"):
+                              pixel_edge=8, backend="cpu", sub_row=None):
     """Vectorised :func:`_accumulate_harmonic_batch_loop`: ONE table evaluation for every
     (sub, channel, pixel) of the batch and one scatter-add, on the array module of ``acc``
-    (numpy or cupy). Same arguments, same result up to summation order."""
+    (numpy or cupy). Same arguments, same result up to summation order.
+
+    ``sub_row`` (optional, length num_sub): the template each sub belongs to; ``acc`` is then
+    ``(n_templates, nch, Nf, Nt)`` and many templates accumulate in one call (no plunge
+    chunks allowed in that mode)."""
     from ...wdm_het import tail_chunk_plan, wdm_chunk_of_td
     from ...utils.utility import get_array_module
 
@@ -210,9 +214,13 @@ def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, 
                                       num_m_layers=num_m_layers, out_of_support="zero")
         co, mm = xp.asarray(co), xp.asarray(mm)
         n_e = n_ok_x[p_i]
+        r_i = None if sub_row is None else xp.asarray(sub_row)[s_i]
         for c in range(co.shape[1]):
             good = mm[:, c] >= 0
-            _scatter_add(xp, acc, (c_i[good], mm[good, c], n_e[good]), co[good, c])
+            idx = (c_i[good], mm[good, c], n_e[good])
+            if r_i is not None:
+                idx = (r_i[good],) + idx
+            _scatter_add(xp, acc, idx, co[good, c])
         stats["lookup_pixels"] = int(s_i.size)
     windows = {}
     n_ok_h = np.asarray(n_ok.get() if hasattr(n_ok, "get") else n_ok)
@@ -222,6 +230,8 @@ def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, 
             n_end = min(int(n_ok_h[-1]) + 1 + Nt_sub // 4, Nt - pixel_edge)
             for n0, klo, khi in tail_chunk_plan(n_h, n_end, Nt, Nt_sub):
                 windows.setdefault(n0, []).append((s, klo, khi))
+    if windows and sub_row is not None:
+        raise NotImplementedError("plunge chunks are not batched across templates; build that template alone")
     for n0, items in windows.items():
         ts = t0 + (n0 * Nf + xp.arange(Nf * Nt_sub)) * dt
         td_all = xp.asarray(tail_td(ts))
@@ -545,3 +555,66 @@ class EMRIDirectWDM:
         self.last_stats = dict(modes=nm, n_fine=self.n_fine,
                                chunk_start=None if chunk_start == "unknown" else chunk_start, **totals)
         return WDMSignal(acc, wdm)
+
+    def batch(self, rows, **few_kwargs):
+        """Many templates with ONE TDI-on-the-fly response call, ONE tracer and ONE lookup.
+
+        ``rows``: parameter rows (as for ``__call__``). FEW runs once per row (it is a
+        single-template generator); every row whose harmonics stay on the lookup feeds one
+        response kernel launch (num_sub x n_rows blocks fill the GPU), one tracer evaluation
+        and one table call + scatter-add into ``(n_rows, nch, Nf, Nt)``. A row that hands off
+        to the plunge chunk is built alone with ``__call__``. Returns the array (backend xp).
+        """
+        from .emritdionfly import EMRITDIonFly
+
+        wdm = self.wdm
+        Nf, Nt, dt, ldt, ldf = wdm.Nf, wdm.Nt, wdm.data_dt, wdm.layer_dt, wdm.layer_df
+        span = Nt * ldt
+        xp = self.xp
+        n_all = np.arange(self.pixel_edge, Nt - self.pixel_edge)
+        t_pix = self.data_t0 + n_all * ldt
+        T_traj = self.data_t0 - self.t_start + span + 2000.0
+        out_arr = xp.zeros((len(rows), self.tdi_config.nchannels, Nf, Nt))
+        few_kwargs = dict(few_kwargs)
+        t_fine = self._fine_grid(None)
+        fly = EMRITDIonFly(self.few_gen, self.orbits, self.tdi_config, dt, T_traj, self.t_start,
+                           frame="icrs_special", t_fine_window=(self.data_t0, self.data_t0 + span), t_fine=t_fine)
+        feeds, tracks, rows_in, n_trs, t_ends = [], [], [], [], []
+        stats = dict(rows=len(rows), alone=0, subs=0)
+        for r, p in enumerate(rows):
+            modes, chunk_start = self._mode_list(p, few_kwargs)
+            if chunk_start is not None:                      # plunge chunk: build this one alone
+                out_arr[r] = xp.asarray(self(*p, **few_kwargs).arr)
+                stats["alone"] += 1
+                continue
+            H = self._last_holder
+            _, _, psi, lam, beta = fly.sky(p[7], p[8], p[9], p[10])
+            t_in, amp, ph, t_tdi = fly.prepare_feed(H, True)
+            feeds.append((t_in, amp, ph, t_tdi, psi, lam, beta))
+            tracks.append(self._last_tracks)
+            n_trs.append(self._last_track_n)
+            t_ends.append(float(np.asarray(H.t_arr)[-1]))
+            rows_in.append(r)
+        if not feeds:
+            self.last_stats = stats
+            return out_arr
+        out = fly.run_response(feeds)
+        x = np.asarray(out.x.get() if hasattr(out.x, "get") else out.x)
+        ok_t = (t_pix > x[:, 0].max()) & (t_pix < x[:, -1].min()) & (t_pix - self.t_start <= min(t_ends))
+        n_ok, tt = n_all[ok_t], t_pix[ok_t]
+        sub_row, trk = [], []
+        for k, r in enumerate(rows_in):
+            pos = np.searchsorted(n_trs[k], n_ok)
+            assert np.array_equal(n_trs[k][pos], n_ok)
+            trk += [subset_track(tr, pos) for tr in tracks[k]]
+            sub_row += [r] * len(tracks[k])
+        tracer = tracer_from_tof_output(out, xp.asarray(tt))
+        assert tracer[0].shape[0] == len(trk), (tracer[0].shape, len(trk))
+        st = accumulate_harmonic_batch(
+            out_arr, self.table, trk, tracer, n_ok, None, Nf=Nf, Nt=Nt, dt=dt, layer_dt=ldt,
+            layer_df=ldf, t0=self.data_t0, Nt_sub=self.Nt_sub, num_m_layers=self.num_m_layers,
+            fdot_axis_max=self.fdot_axis_max, pixel_edge=self.pixel_edge, backend=self.force_backend,
+            sub_row=np.asarray(sub_row))
+        stats.update(subs=len(trk), **st)
+        self.last_stats = stats
+        return out_arr
