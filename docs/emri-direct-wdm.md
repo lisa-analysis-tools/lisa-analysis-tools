@@ -123,6 +123,41 @@ script) are unsafe for EMRIs plunging inside the window. Production (2.5 s) is n
 geometry per (harmonic, time): the next step is a kernel that shares it across the harmonics of a
 template (plan: ~/.claude/plans/emri-tof-dense-phase-overnight.md).
 
+## Dense-phase response kernel (`TDDenseTDIonTheFly`, 10-01)
+
+`response="dense"` in `EMRIDirectWDM` feeds a new, opt-in TD TDI-on-the-fly kernel
+(`TDDenseTDIWaveform`, lat_spline_tdi_waveform.{hh,cu}; binding `TDDenseTDIWaveformWrap`):
+
+- per template: the integrator's knots and DOPR853 8th-order dense-output phase coefficients
+  (re-expressed exactly on FEW's holder knots, whose last knot FEW cuts at T); per harmonic: the
+  integers (m, k, n) and a complex amplitude cubic spline over the knots
+  (`dense_inputs_from_holder`). The phase is exact everywhere: no fine-grid phase splines.
+- kernel 1, one thread per (template, time): the link geometry and the three fundamental phases
+  are computed ONCE per TDI unit and reused by every harmonic (unit term
+  `sign * pre * (xi_p A_p + xi_c A_c) (z_em - z_rec)`, `z = amp_factor c exp(-i Phi)`); many
+  templates per launch. Delayed times outside the trajectory contribute zero (plunge without a
+  feed extension); the reference phase continues linearly outside the trajectory.
+- kernel 2, one block per harmonic: the existing amplitude/phase extraction + unwrap.
+
+CPU results (laptop): EMRI 1, 16 d: mismatch vs production 3.55e-8 (= spline response), whole
+template 1.6 s -> 0.8 s. Plunging single harmonic: direct vs production 1.5-1.7e-5 over the
+window, 7e-6 in the last 1% (spline response: 9e-6..1.2e-5). Tests: `tests/test_tdi_dense.py`
+(== the spline-fed kernel to 1e-9 on exactly representable input, 2 templates x 5 harmonics,
+inc != 0; polarisation and strain-sign mutations caught), `tests/test_emri_dense_inputs.py`.
+The CUDA build of the kernel has NOT been compiled or run yet.
+
+More CPU checks (10-01):
+
+| check | result |
+|---|---|
+| EMRI 1, eps 1e-5 (111-112 modes), dense vs spline response, wall | 16 d 1.6 vs 3.8 s; 60 d 5.4 vs 15.3 s; 180 d 16.0 vs 49.8 s |
+| same, dense vs spline template | mismatch <= 4e-13, norm ratio 1.0000000 |
+| plunging source, 69 modes, dt 5 s (table NF720_DT5), dense direct vs production | whole window 1.3-2.5e-4; < 0.9 t_p 7.5-9.2e-5 (table); 0.9-0.99 3.8-6.0e-6; last 1% 5.9e-4..1.2e-3 |
+| same at dt 20 s | 2.6-4.7e-2 (aliasing of m >= 3 near plunge) |
+| per mode, dense response vs production at 5 s | (2,2,0,0) 2.5e-6, (4,4,0,1) 2.0e-5, (3,3,0,2) 1.5e-4, (5,5,0,0) 1.8e-4; the last two entirely in the final 1% before plunge (production's interpolated strain across the abrupt stop) |
+
+Lookup memory: the table call is chunked (`EMRI_DIRECT_LOOKUP_CHUNK`, default 2e6 entries).
+
 ## Open items
 
 1. (resolved) TOF vs production at the abrupt plunge end.

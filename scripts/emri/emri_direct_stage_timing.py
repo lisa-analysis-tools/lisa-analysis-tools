@@ -38,6 +38,9 @@ def main():
     ap.add_argument("--batch-rows", type=int, default=0,
                     help="also time EMRIDirectWDM.batch over this many parameter rows")
     ap.add_argument("--chunk-rows", type=int, default=16, help="rows per response call in the batch")
+    ap.add_argument("--response", choices=("spline", "dense"), default="dense",
+                    help="TDI-on-the-fly response: 'dense' (TDDenseTDIonTheFly: exact phases, geometry shared "
+                         "across harmonics; needs a backend built with it) or 'spline' (TDTDIonTheFly)")
     args = ap.parse_args()
 
     from lisatools.domains import TDSettings, TDSignal, WDMLookupTable, WDMSettings
@@ -97,13 +100,14 @@ def main():
     wdm = WDMSettings(nf, nt, args.dt, force_backend=args.backend)
     table = WDMLookupTable.from_file(args.direct_table, force_backend=args.backend)
     direct = WD.EMRIDirectWDM(gen, table, wdm, orbits=orb, tdi_config=tdi, t_start=W.REF, data_t0=data_t0,
-                              mode_batch=args.mode_batch, force_backend=args.backend)
+                              mode_batch=args.mode_batch, force_backend=args.backend, response=args.response)
 
     wrap(WD.EMRIDirectWDM, "_mode_list", "1 mode list (FEW call #1 + handoff check)")
     wrap(type(gen), "__call__", "  FEW generator calls (both)")
     wrap(EF.EMRITDIonFly, "__call__", "2 TOF total (FEW call #2 + feed + response)")
     wrap(EF.EMRITDIonFly, "mode_amp_phase", "  TOF feed: mode amp/phase")
     wrap(EF.EMRITDIonFly, "run_response", "  TOF run_response (input splines + kernel + output)")
+    wrap(WD.EMRIDirectWDM, "_dense_response", "  DENSE response (kernel + output splines)")
     wrap(TF.TDTDIonTheFly, "__init__", "  TOF input splines")
     wrap(TF.TDTDIonTheFly, "__call__", "  TOF response kernel + output splines")
     wrap(WD, "harmonic_tracks_from_holder", "3 harmonic tracks")
@@ -133,7 +137,7 @@ def main():
             direct(*params, mode_selection_threshold=thr)
         sync()
         t_dir = (time.perf_counter() - t0) / args.reps
-        print(f"\n[stages] thr={thr:g} modes={direct.last_stats.get('modes')} n_fine={direct.last_stats.get('n_fine')} "
+        print(f"\n[stages] response={args.response} thr={thr:g} modes={direct.last_stats.get('modes')} n_fine={direct.last_stats.get('n_fine')} "
               f"backend={args.backend} grid Nf={nf} Nt={nt} dt={args.dt}: direct {t_dir * 1e3:.0f} ms, "
               f"production {t_prod * 1e3:.0f} ms (per template)", flush=True)
         for k in [lab for lab in LABELS if lab in T]:
