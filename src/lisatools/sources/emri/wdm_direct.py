@@ -646,7 +646,7 @@ class EMRIDirectWDM:
 
     def _dense_response(self, items, t_fine):
         """ONE TDDenseTDIonTheFly call for ``items`` = [(dense inputs, (psi, lam, beta)), ...]."""
-        from ...response.tdionfly import TDDenseTDIonTheFly, TDTDIOutput
+        from ...response.tdionfly import TDDenseTDIonTheFly
         from .emritdionfly import EMRITDIonFly
 
         K = max(it[0][0].size for it in items)
@@ -671,29 +671,8 @@ class EMRIDirectWDM:
             np.tile(self.t_start + np.asarray(t_fine), (n_temp, 1)), np.array(offs), np.concatenate(mkn),
             t_k, n_k, C, np.concatenate(are), np.concatenate(aim), amp_factor=EMRITDIonFly.AMP_FACTOR,
             tdi_config=self.tdi_config, orbits=self.orbits, force_backend=self.force_backend)
-        out = dense(np.array(par), return_spline=False)
-        # The kernel does not evaluate the phase outside the trajectory: there the reference phase
-        # is exactly zero. Keep only the time points where every harmonic with a nonzero phase
-        # (m, k, n) != 0 has its reference phase inside the trajectory, so no spline straddles a
-        # jump to zero (after an in-window stop this drops the last <~500 s, where the signal has
-        # already left spacecraft 1).
-        xp = dense.xp
-        mk = np.concatenate(mkn)
-        live = np.any(mk != 0, axis=1)
-        pr = out.phase_ref[xp.asarray(live)] if bool(np.any(live)) else out.phase_ref
-        inside = xp.all(pr != 0.0, axis=0)
-        ok = np.asarray(inside.get() if hasattr(inside, "get") else inside)
-        if not ok.all():
-            idx = np.flatnonzero(ok)
-            sl = slice(int(idx[0]), int(idx[-1]) + 1)
-            if not ok[sl].all():
-                raise RuntimeError("dense response: reference phase outside the trajectory inside the grid")
-            out = TDTDIOutput(out.x[:, sl], out.tdi_amp[:, :, sl], out.tdi_phase[:, :, sl], out.phase_ref[:, sl],
-                              fill_splines=True, force_backend=dense.backend.name.split("_")[-1])
-        else:
-            out = TDTDIOutput(out.x, out.tdi_amp, out.tdi_phase, out.phase_ref, fill_splines=True,
-                              force_backend=dense.backend.name.split("_")[-1])
-        return out
+        # outside the trajectory the kernel holds the reference phase at the trajectory end (no jump)
+        return dense(np.array(par))
 
     def _call_knots(self, few_args, few_kwargs, modes):
         from ...domains import WDMSignal

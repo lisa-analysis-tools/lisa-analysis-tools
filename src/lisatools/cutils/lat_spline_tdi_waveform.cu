@@ -528,9 +528,20 @@ void TDDenseTDIWaveform::channels_point(int b, int i, double t, double *params_b
         double t_sc = t - k.dot(x1) * C_inv;
         double P3[3] = {0.0, 0.0, 0.0};
         int seg = segment(b, t_sc, false);
-        // outside the trajectory the phase is not evaluated: the reference phase is zero there
-        // (as is the signal: every delayed time beyond the trajectory contributes nothing)
-        if (seg >= 0) phases(b, seg, t_sc, P3);
+        if (seg >= 0)
+        {
+            phases(b, seg, t_sc, P3);
+        }
+        else
+        {
+            // outside the trajectory the phase is NOT evaluated: the reference phase is HELD at
+            // its value at the nearest trajectory end (no jump for the output splines; the
+            // channel's remaining phase -- its short TDI tail after the wave passes spacecraft 1
+            // -- lands in tdi_phase)
+            int nk = n_knots[b];
+            double t_end = (t_sc > t_knots[(size_t)b * K + nk - 1]) ? t_knots[(size_t)b * K + nk - 1] : t_knots[(size_t)b * K];
+            phases(b, segment(b, t_end, true), t_end, P3);
+        }
         for (int s = sub_lo; s < sub_hi; s += 1)
         {
             phi_ref[(size_t)s * N + i] = sub_mkn[3 * s] * P3[0] + sub_mkn[3 * s + 1] * P3[1] + sub_mkn[3 * s + 2] * P3[2];
