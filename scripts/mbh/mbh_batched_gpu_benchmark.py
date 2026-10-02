@@ -26,20 +26,53 @@ batched - logL stock| on the first rows, the stock side being the move's own
 cross-check generator (T = window_before, lattice-SNAPPED epoch, the batched
 response order), so a speed number never comes from a broken path.
 
-Defaults = the production 6-month run (scripts/fstat_proposal/submit_gf_6mo.sh):
-dt 2.5 s, Nf 1440 x Nt 4320 (1-h layers, 180 d), MIN_FREQ 4e-4, MAX_FREQ 2.5e-2,
-EDGE_CROP_WAVELETS 60 (the active time box), data-window alpha = the stock fit's
-default taper (WINDOW_TAPER_WAVELETS = 2 -> alpha = 2 * 2 / Nt, erebor fit.py).
+Defaults = the production 6-month run (scripts/fstat_proposal/submit_gf_6mo_v9_4gpu.sh):
+dt 2.5 s, Nf 1440 x Nt 4320 (1-h layers, 180 d), MIN_FREQ 2.5e-4 (v9; job 677 ran the
+v8 launcher's 4e-4), MAX_FREQ 2.5e-2, EDGE_CROP_WAVELETS 60 (the active time box),
+data-window alpha = the stock fit's default taper (WINDOW_TAPER_WAVELETS = 2 -> alpha =
+2 * 2 / Nt, erebor fit.py). Noise weighting (``--foreground``; mbh_harness.py: the
+EMRI harness's ``RunBox`` noise, imported from scripts/emri/emri_batch_speed.py):
+XYZ2 scirdv1 + the FittedHyperbolicTangentGalacticForeground at Tobs = Nf*Nt*dt (on,
+default) or the instrument alone (off; job 677's weighting). Every grid passes the EMRI
+harness's ``check_window`` (window end + 4e4 s inside the orbits' ltt table; packaged
+equal-arm ends REF + 697.9 d, so 720 d needs a brick or a placement that fits).
 
     # cluster (one GPU; see submit_mbh_batched_gpu_benchmark.sh)
     python scripts/mbh/mbh_batched_gpu_benchmark.py --backend cuda13x --out-dir OUT
+    # one duration of scripts/mbh/mbh_speed_durations.sh (Nt = days * 24 one-hour layers)
+    python scripts/mbh/mbh_batched_gpu_benchmark.py --backend cuda13x --nt 8640 \
+        --batch-sizes 1,2,4,8,16,32 --stock-orders 8 --stock-T-days default,window \
+        --orbits auto --out-dir OUT --tag 360d --jsonl OUT/speed.jsonl --strict
     # laptop smoke (tiny CPU grid, a few minutes, < 3 GB RSS)
     python scripts/mbh/mbh_batched_gpu_benchmark.py --smoke --backend cpu
+
+``--jsonl`` APPENDS one JSON line per configuration (plus one ``kind=summary``
+line) with the grid, source, its optimal SNR, the orbits and the noise model
+next to the record; ``--strict`` exits 3 when a configuration errors (OOM
+excepted: it is a result), the accuracy guard fails, or no stock / batched
+configuration completes.
+
+ORBITS AND PLACEMENT. ``--orbits equal-arm`` (default): EqualArmlengthOrbits, the
+merger mid-grid (``--merger-day`` moves it). ``--orbits auto`` / ``l1`` /
+``--orbits-file``: the source's own mojito MBHB L1 brick (searched as the EMRI
+harness does: ``--l1-dir``, MOJITO_LIGHT_PATH/data/MBHB/L1, then recursively
+MOJITO_DATA_PATH, MOJITO_INFO_PATH, the catalogue's root) supplies the orbits --
+its light-travel times read over the grid's span only (``WindowedL1Orbits`` of
+mbh_batched_mojito_check.py: exact inside the slice, the full-mission 25 M x 6
+ltt table never enters memory) -- AND the time frame: the window starts
+``--start-offset-s`` (START_OFFSET_S, 5e4 s) after the brick's start, the
+catalogue places the merger, and a merger outside ``[start, end + 7 d)`` (the
+production admission rule) exits 4 (NOT ADMITTED). ``auto`` without a brick
+falls back to equal-arm.
 
 The residual content does not affect cost: every container holds the injected
 stock template (the same source), so near-truth rows score near logL = 0,
 which is also where the accuracy guard is meaningful (far from the posterior
 any 1e-8 template difference is amplified by <r|delta>).
+
+Importable (``import mbh_batched_gpu_benchmark``, as mbh_batched_accuracy.py
+does for its grid / generator builders): the command line is parsed, and the
+process environment and RSS watchdog set up, only when run as a script.
 """
 from __future__ import annotations
 
@@ -88,7 +121,8 @@ CATALOGUE = {
 # (YRSID/12 ~ 30.4 d), "window" = window_before (the batched T); else days.
 PRESETS = {
     "full": dict(
-        dt=2.5, nf=1440, nt=4320, min_freq=4e-4, max_freq=2.5e-2, edge_crop=60,
+        # min_freq: the v9 6-month launcher's MIN_FREQ (layer 2 of the 1-h grid)
+        dt=2.5, nf=1440, nt=4320, min_freq=2.5e-4, max_freq=2.5e-2, edge_crop=60,
         taper_wavelets=2, window_before_days=90.0, window_after_days=10.0,
         window_pad_days=4.0, window_margin_days=1.0,
         batch_sizes="1,2,4,8,16,24,32", min_rows=32,
@@ -132,6 +166,9 @@ def parse_args(argv=None):
     g.add_argument("--edge-crop", type=int, help="EDGE_CROP_WAVELETS (active time box)")
     g.add_argument("--taper-wavelets", type=int, help="WINDOW_TAPER_WAVELETS (alpha = 2K/Nt)")
     g.add_argument("--window-alpha", type=float, help="explicit data-window Tukey alpha (overrides the taper)")
+    g.add_argument("--foreground", default="on", choices=("on", "off"),
+                   help="noise weighting (mbh_harness.py / RunBox): XYZ2 scirdv1 + the fitted tanh galactic "
+                        "foreground at Tobs = Nf*Nt*dt (on, default) or the instrument alone (off)")
     w = p.add_argument_group("MBH window / generator")
     w.add_argument("--window-before-days", type=float)
     w.add_argument("--window-after-days", type=float)
@@ -163,7 +200,16 @@ def parse_args(argv=None):
     src.add_argument("--merger-day", type=float, help="merger position in the grid (default: mid-grid)")
     src.add_argument("--snap-frac", type=float, default=0.2,
                      help="data_t0 offset from the epoch lattice, in dt (0.2 -> +0.5 s at 2.5 s, as mojito)")
-    src.add_argument("--orbits-file", help="mojito L1 file for L1Orbits(frame='icrs') (default EqualArmlengthOrbits)")
+    src.add_argument("--orbits", default="equal-arm", choices=("equal-arm", "auto", "l1"),
+                     help="equal-arm (default; synthetic placement), auto (the source's own mojito MBHB L1 "
+                          "brick when found, else equal-arm) or l1 (the brick, required): with a brick the "
+                          "orbits are its WindowedL1Orbits(frame='icrs') and the window starts "
+                          "--start-offset-s after its start (the EMRI harness's run box)")
+    src.add_argument("--orbits-file", help="this mojito MBHB L1 brick (overrides --orbits' search)")
+    src.add_argument("--l1-dir", help="first place --orbits auto/l1 look for the source's brick")
+    src.add_argument("--start-offset-s", type=float, default=float(os.environ.get("START_OFFSET_S", "5e4")),
+                     help="with a brick: window start after the brick's tdis t0 [s] (env START_OFFSET_S, "
+                          "default 5e4 as the EMRI harness; production MBH starts at the file start, 0)")
     src.add_argument("--orbits-dt", type=float,
                      help="EqualArmlengthOrbits grid step in s (0 = library default 50-s linear-interp grid)")
     src.add_argument("--jitter-scale", type=float, default=1.0)
@@ -176,6 +222,10 @@ def parse_args(argv=None):
     o.add_argument("--git-snapshot", dest="git_snapshot", action="store_true", default=None,
                    help="record `git stash create` (default on in full mode, off in --smoke)")
     o.add_argument("--no-git-snapshot", dest="git_snapshot", action="store_false", default=None)
+    o.add_argument("--jsonl", help="APPEND one JSON line per configuration (+ a summary line) here")
+    o.add_argument("--strict", action="store_true",
+                   help="exit 3 on a configuration error (OOM excepted), a failed accuracy guard, or no "
+                        "completed stock / batched configuration")
     args = p.parse_args(argv)
     preset = PRESETS["smoke" if args.smoke else "full"]
     for k, v in preset.items():
@@ -184,23 +234,28 @@ def parse_args(argv=None):
     return args
 
 
-ARGS = parse_args()
+#: None when imported as a module (mbh_batched_accuracy.py): the importer parses
+#: its own command line with :func:`parse_args` and sets the process environment
+#: itself, before its own numpy/jax import.
+ARGS = parse_args() if __name__ == "__main__" else None
 
 # ---- process environment BEFORE numpy/jax/lisatools import -----------------
-for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "MKL_NUM_THREADS"):
-    os.environ.setdefault(_v, "1")
-# JAX on demand (lisatools.detector sets the same at import): without it JAX
-# preallocates 75 % of the GPU and every device-level number is that constant.
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-if ARGS.backend == "cpu":
-    os.environ.setdefault("JAX_PLATFORMS", "cpu")
-    # One XLA CPU thread for execution AND codegen: the shared-laptop CPU
-    # budget, and a bounded compile transient (parallel LLVM codegen splits
-    # made the smoke's host-RSS peak vary by ~0.8 GB run to run).
-    os.environ.setdefault(
-        "XLA_FLAGS",
-        "--xla_cpu_multi_thread_eigen=false --xla_cpu_parallel_codegen_split_count=1",
-    )
+# (mirrored by mbh_batched_accuracy.py's _configure_process: keep them equal)
+if ARGS is not None:
+    for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(_v, "1")
+    # JAX on demand (lisatools.detector sets the same at import): without it JAX
+    # preallocates 75 % of the GPU and every device-level number is that constant.
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    if ARGS.backend == "cpu":
+        os.environ.setdefault("JAX_PLATFORMS", "cpu")
+        # One XLA CPU thread for execution AND codegen: the shared-laptop CPU
+        # budget, and a bounded compile transient (parallel LLVM codegen splits
+        # made the smoke's host-RSS peak vary by ~0.8 GB run to run).
+        os.environ.setdefault(
+            "XLA_FLAGS",
+            "--xla_cpu_multi_thread_eigen=false --xla_cpu_parallel_codegen_split_count=1",
+        )
 
 import numpy as np  # noqa: E402
 
@@ -221,8 +276,14 @@ def _watchdog(cap):
         time.sleep(0.3)
 
 
-if ARGS.mem_cap_gb and ARGS.mem_cap_gb > 0:
-    threading.Thread(target=_watchdog, args=(float(ARGS.mem_cap_gb),), daemon=True).start()
+def start_watchdog(cap_gb):
+    """Daemon thread: hard exit 42 once the PEAK RSS passes ``cap_gb`` (0 / None = off)."""
+    if cap_gb and float(cap_gb) > 0:
+        threading.Thread(target=_watchdog, args=(float(cap_gb),), daemon=True).start()
+
+
+if ARGS is not None:
+    start_watchdog(ARGS.mem_cap_gb)
 
 T_START = time.perf_counter()
 
@@ -260,12 +321,15 @@ from lisatools.globalfit.stock.erebor.source_runtime import (  # noqa: E402
     SnappedEpochMBHGen,
     snap_waveform_t0_to_lattice,
 )
-from lisatools.sensitivity import XYZ2SensitivityMatrix  # noqa: E402
 from lisatools.sources.batching import MBHWindowedWDMSignalGen  # noqa: E402
 from lisatools.sources.bbh.gridaligned import WindowedGridAlignedMBHWaveform  # noqa: E402
 from lisatools.utils import stagetimer  # noqa: E402
 from lisatools.utils.device import synchronize  # noqa: E402
 from lisatools.utils.utility import asnumpy  # noqa: E402
+
+if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mbh_harness import DIFFERS_FROM_EMRI, check_window, harness_box, noise_record  # noqa: E402
 
 assert abs(MOJITO_REFERENCE_TIME - REF_EPOCH) < 1e-6, MOJITO_REFERENCE_TIME
 
@@ -582,6 +646,79 @@ class Ctx:
     """Plain container for the run objects (script-local; never pickled)."""
 
 
+#: ltt kept beyond the grid's span and the merger (mbh_cd1l_campaign.LTT_PAD)
+LTT_PAD = 1.0e5
+
+
+class NotAdmitted(Exception):
+    """The source's merger falls outside the brick-placed window under the production
+    admission rule (``window_start <= t_merge < window_end + MBH_MERGER_TIME_BUFFER``)."""
+
+
+def _campaign():
+    """mbh_cd1l_campaign.py (the MBH data loader: brick search, file sampling, the
+    windowed ltt reader, the production knobs); side-effect free at import."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import mbh_cd1l_campaign
+
+    return mbh_cd1l_campaign
+
+
+def windowed_l1_orbits_class(out_dir):
+    """``WindowedL1Orbits`` (mbh_batched_mojito_check.py) through the campaign's
+    side-effect-neutralising importer (its watchdog off, MBH_CHECK_OUT -> ``out_dir``)."""
+    os.makedirs(out_dir, exist_ok=True)
+    return _campaign().windowed_orbits_class(os.path.abspath(out_dir))
+
+
+def resolve_brick(args):
+    """The source's mojito MBHB L1 brick for the orbits (and the window start), or None.
+
+    ``--orbits-file`` names it; else ``--orbits auto`` / ``l1`` search for the source's
+    own brick (mbh_cd1l_campaign.find_mbhb_brick: ``--l1-dir``, MOJITO_LIGHT_PATH/data/
+    MBHB/L1, then recursively MOJITO_DATA_PATH, MOJITO_INFO_PATH, the catalogue's root --
+    the EMRI harness's search order); ``l1`` refuses to run without one, ``equal-arm``
+    never looks."""
+    if args.orbits_file:
+        if not os.path.isfile(args.orbits_file):
+            raise SystemExit(f"--orbits-file {args.orbits_file}: no such file")
+        return args.orbits_file
+    if args.orbits == "equal-arm":
+        return None
+    path = _campaign().find_mbhb_brick(args.source_id, l1_dir=args.l1_dir, catalogue=args.catalogue)
+    if path is None and args.orbits == "l1":
+        raise SystemExit(f"--orbits l1: no MBHB L1 brick for source {args.source_id} "
+                         f"({_campaign().brick_search_roots(args.l1_dir, args.catalogue)})")
+    return path
+
+
+def _place_on_brick(ctx, args, path):
+    """EMRI's run box on the brick: data_t0 = the brick's tdis t0 + START_OFFSET_S
+    (``--start-offset-s``, rounded to the sample lattice); the merger stays where the
+    catalogue puts it and must pass the production admission rule (else NotAdmitted)."""
+    camp = _campaign()
+    t0_file, dt_file, size = camp.file_sampling(path)
+    i0 = int(round(float(args.start_offset_s) / ctx.dt))
+    if i0 < 0 or (i0 + ctx.N) * ctx.dt > size * dt_file + 1e-6:
+        raise SystemExit(
+            f"{os.path.basename(path)} holds {size * dt_file / DAY:.2f} d: a {ctx.Tobs / DAY:.2f}-d window "
+            f"starting {i0 * ctx.dt:.0f} s in does not fit")
+    data_t0 = t0_file + i0 * ctx.dt
+    t_m = ctx.epoch + float(ctx.truth[10])
+    buffer = camp.production_knobs(None)["merger_time_buffer"]
+    if not data_t0 <= t_m < data_t0 + ctx.Tobs + buffer:
+        raise NotAdmitted(
+            f"source {args.source_id} merges {(t_m - data_t0) / DAY:.2f} d into the {ctx.Tobs / DAY:g}-d window "
+            f"starting {i0 * ctx.dt:.0f} s after the start of {os.path.basename(path)} (admitted: "
+            f"[0, {(ctx.Tobs + buffer) / DAY:g}) d, MBH_MERGER_TIME_BUFFER {buffer / DAY:g} d)")
+    ctx.brick_t0, ctx.start_offset_s = t0_file, i0 * ctx.dt
+    ctx.placement_note = (f"brick start + {i0 * ctx.dt:.0f} s (START_OFFSET_S); merger "
+                          f"{(t_m - data_t0) / DAY:.2f} d in")
+    return data_t0
+
+
 def build_context(args):
     ctx = Ctx()
     ctx.args = args
@@ -611,12 +748,22 @@ def build_context(args):
         transform.both_transforms(np.asarray(mbh_catalogue_to_sampling_basis(cat), float)), float
     )
 
-    # data_t0: merger at ``merger_day`` into the grid; data_t0 sits snap_frac*dt
-    # off the epoch's lattice so the snap (and the stock path's sub-sample
-    # t0_shift_to_data) is exercised exactly as on mojito (+0.5 s at dt 2.5 s).
-    merger_s = (float(args.merger_day) * DAY) if args.merger_day is not None else 0.5 * ctx.Tobs
-    k = int(np.rint((ctx.truth[10] - merger_s) / ctx.dt))
-    ctx.data_t0 = ctx.epoch + k * ctx.dt + float(args.snap_frac) * ctx.dt
+    ctx.brick = resolve_brick(args)
+    ctx.brick_t0 = ctx.start_offset_s = None
+    if ctx.brick is not None:
+        # a mojito brick: its orbits AND its time frame (the EMRI harness's run box)
+        if args.merger_day is not None:
+            raise SystemExit("--merger-day places a synthetic grid; with an L1 brick the window starts "
+                             "--start-offset-s after the brick start and the catalogue places the merger")
+        ctx.data_t0 = _place_on_brick(ctx, args, ctx.brick)
+    else:
+        # data_t0: merger at ``merger_day`` into the grid; data_t0 sits snap_frac*dt
+        # off the epoch's lattice so the snap (and the stock path's sub-sample
+        # t0_shift_to_data) is exercised exactly as on mojito (+0.5 s at dt 2.5 s).
+        merger_s = (float(args.merger_day) * DAY) if args.merger_day is not None else 0.5 * ctx.Tobs
+        ctx.placement_note = "merger at --merger-day" if args.merger_day is not None else "merger mid-grid"
+        k = int(np.rint((ctx.truth[10] - merger_s) / ctx.dt))
+        ctx.data_t0 = ctx.epoch + k * ctx.dt + float(args.snap_frac) * ctx.dt
     ctx.t_merge_abs = ctx.epoch + ctx.truth[10]
     ctx.t0_snapped, ctx.snap = snap_waveform_t0_to_lattice(ctx.epoch, ctx.data_t0, ctx.dt)
 
@@ -639,12 +786,22 @@ def build_context(args):
         )
     ctx.xp = ctx.wdm.xp
     ctx.sync = lambda: synchronize(ctx.xp)
+    # what weights every inner product (the containers; mbh_batched_accuracy.py too)
+    # (mbh_harness.py: the EMRI harness's RunBox on this grid -- scirdv1 XYZ + the fitted tanh
+    # galactic foreground at Tobs = Nf*Nt*dt unless --foreground off)
+    ctx.box = harness_box(ctx.wdm, crop, args.foreground)
+    ctx.noise = noise_record(ctx.box)
+    ctx.noise_label = ctx.box.describe()
 
-    if args.orbits_file:
-        from lisatools.detector import L1Orbits
-
-        ctx.orbits = L1Orbits(args.orbits_file, force_backend=ctx.backend, frame="icrs")
-        ctx.orbits_desc = f"L1Orbits({args.orbits_file}, frame='icrs')"
+    if ctx.brick is not None:
+        # the ltt table read over the grid's span only (mbh_cd1l_campaign.py's
+        # slice: LTT_PAD beyond the data and the merger), positions whole
+        wl1 = windowed_l1_orbits_class(args.out_dir)
+        lo = ctx.data_t0 - LTT_PAD
+        hi = max(ctx.data_t0 + ctx.Tobs, ctx.t_merge_abs) + LTT_PAD
+        ctx.orbits = wl1(ctx.brick, lo, hi, force_backend=ctx.backend, frame="icrs")
+        ctx.orbits_desc = (f"WindowedL1Orbits({os.path.basename(ctx.brick)}, frame='icrs', "
+                           f"ltt slice [{lo:.0f}, {hi:.0f}] s)")
     else:
         from lisatools.detector import EqualArmlengthOrbits
 
@@ -659,6 +816,9 @@ def build_context(args):
     ensure = getattr(ctx.orbits, "_ensure_configured", None)
     if callable(ensure):
         ensure()
+    # the EMRI harness's rule: the window (+ the production wrapper's 4e4 s) must end inside
+    # the orbits' light-travel-time table -- a loud refusal, never an extrapolated response
+    check_window(ctx.orbits, ctx.data_t0, ctx.Tobs, "L1 brick" if ctx.brick is not None else "packaged equal-arm")
     return ctx
 
 
@@ -713,7 +873,8 @@ def build_containers(ctx, h_inj):
     acs_list = []
     for _ in range(int(ctx.args.n_containers)):
         data = WDMSignal(ctx.xp.array(h_inj.arr, copy=True), h_inj.settings)
-        acs_list.append(AnalysisContainer(data, XYZ2SensitivityMatrix(ctx.wdm, model="scirdv1")))
+        # one RunBox noise matrix per walker container (ctx.box's construction, fresh arrays)
+        acs_list.append(AnalysisContainer(data, harness_box(ctx.wdm, ctx.args.edge_crop, ctx.args.foreground).sens))
     return AnalysisContainerArray(acs_list, gpus=None if ctx.backend == "cpu" else [0])
 
 
@@ -1018,13 +1179,18 @@ def main():
     args = ARGS
     mode = "smoke" if args.smoke else "full"
     mark(f"mode={mode} backend={args.backend} jax devices={jax.devices()}")
-    ctx = build_context(args)
+    try:
+        ctx = build_context(args)
+    except NotAdmitted as exc:
+        print(f"[bench] NOT ADMITTED: {exc}; pick a source merging inside the window", flush=True)
+        sys.exit(4)
     layer_h = ctx.layer / 3600.0
     mark(f"grid Nf={ctx.Nf} Nt={ctx.Nt} dt={ctx.dt} ({ctx.Tobs / DAY:.2f} d, {layer_h:.3g}-h layers), "
          f"active f [{ctx.wdm.ind_min_f}, {ctx.wdm.ind_max_f}] t [{ctx.wdm.ind_min_t}, {ctx.wdm.ind_max_t}], "
          f"window alpha {ctx.window_alpha:.4g}; data_t0 {ctx.data_t0:.6f}; merger at "
-         f"{(ctx.t_merge_abs - ctx.data_t0) / DAY:.3f} d; snap {ctx.snap:+.6f} s")
+         f"{(ctx.t_merge_abs - ctx.data_t0) / DAY:.3f} d ({ctx.placement_note}); snap {ctx.snap:+.6f} s")
     print(ORBITS_NOTE, f"[{ctx.orbits_desc}]", flush=True)
+    print(f"noise weighting: {ctx.noise_label}", flush=True)
     print("truth (waveform basis m1 m2 s1z s2z dist[Mpc] phi_ref inc psi ra dec t_plunge):",
           np.array2string(ctx.truth, precision=8), flush=True)
 
@@ -1041,6 +1207,11 @@ def main():
     h_inj = cache_relief(ref_gen.get_signals_for_residuals, args)(*ctx.truth)
     acs = build_containers(ctx, h_inj)
     del h_inj
+    # the source's optimal SNR at this duration (sqrt<h|h> of the injected truth over the
+    # active box, the harness noise): container 0 holds exactly h_inj before any expose
+    ctx.snr = float(np.sqrt(max(float(np.real(asnumpy(acs.acs.flatten()[0].inner_product()))), 0.0)))
+    mark(f"[speed] source {args.source_id} optimal SNR at {ctx.Tobs / DAY:g} d: {ctx.snr:.2f} "
+         f"(stock 90-d snapped truth template, {ctx.noise_label})")
     windowed, adapter = build_windowed_adapter(ctx)
     geom = mbh_window_layers(ctx.wdm, ctx.t_merge_abs, ctx.W_before, ctx.W_after, ctx.W_pad, ctx.W_margin)
     adapter.set_window(geom["n_start"], geom["Nt_keep"], geom["n_pad_lo"], geom["n_pad_hi"])
@@ -1100,6 +1271,7 @@ def main():
         "cudaMemGetInfo every --sample-ms (+delta over the config's starting usage).",
         "accuracy: max |logL batched - logL stock| on the first rows; stock = the move's "
         "cross-check generator (T = window_before, snapped epoch, batched order).",
+        f"noise weighting (every container): {ctx.noise_label}.",
     ]
     if args.clear_jax_caches:
         notes.append(
@@ -1124,12 +1296,14 @@ def main():
                   ind_min_f=int(ctx.wdm.ind_min_f), ind_max_f=int(ctx.wdm.ind_max_f),
                   ind_min_t=int(ctx.wdm.ind_min_t), ind_max_t=int(ctx.wdm.ind_max_t),
                   window_alpha=ctx.window_alpha, edge_crop=int(args.edge_crop),
-                  data_t0=ctx.data_t0, epoch=ctx.epoch, snap=ctx.snap, t0_snapped=ctx.t0_snapped),
+                  data_t0=ctx.data_t0, epoch=ctx.epoch, snap=ctx.snap, t0_snapped=ctx.t0_snapped,
+                  placement=ctx.placement_note, brick=ctx.brick, brick_t0=ctx.brick_t0,
+                  start_offset_s=ctx.start_offset_s),
         window=dict(before_s=ctx.W_before, after_s=ctx.W_after, pad_s=ctx.W_pad, margin_s=ctx.W_margin,
                     buffer_time_s=ctx.buffer_time, geometry=geometry),
         source=dict(id=args.source_id, catalogue_source=ctx.cat_src, catalogue=ctx.cat,
-                    truth_waveform_basis=ctx.truth, t_merge_abs=ctx.t_merge_abs),
-        orbits=ctx.orbits_desc, rows=rows, data_index=idx,
+                    truth_waveform_basis=ctx.truth, t_merge_abs=ctx.t_merge_abs, snr_stock90=ctx.snr),
+        orbits=ctx.orbits_desc, noise=ctx.noise, rows=rows, data_index=idx,
         stock=stock, batched=batched, reference=dict(label=ref_label, s_per_row=ref_s),
         accuracy_reference=dict(ll=state.get("ll_ref"), s_per_row=state.get("ll_ref_s_per_row")),
         accuracy_ok=all(r["accuracy"]["ok"] for r in batched if r.get("accuracy")),
@@ -1141,7 +1315,76 @@ def main():
     with open(path, "w") as f:
         json.dump(result, f, indent=2, default=_json_default)
     mark(f"wrote {path}")
+    failures = strict_failures(args, stock, batched, state)
+    if args.jsonl:
+        lines = jsonl_lines(ctx, args, result, stock, batched, geometry, failures)
+        with open(args.jsonl, "a") as f:
+            for line in lines:
+                f.write(json.dumps(line, default=_json_default) + "\n")
+        mark(f"appended {len(lines)} lines to {args.jsonl}")
+    print(f"[bench] {'FAIL' if failures else 'PASS'}: " + ("; ".join(failures) if failures else
+          "every configuration completed or ran out of memory, accuracy guard held"), flush=True)
     print("DONE", flush=True)
+    if failures and args.strict:
+        sys.exit(3)
+
+
+def strict_failures(args, stock, batched, state):
+    """What ``--strict`` fails on (an OOM is a RESULT -- B stops growing -- not a failure)."""
+    out = []
+    for r in list(stock) + list(batched):
+        name = r["label"] + (f" B={r['B']}" if "B" in r else "")
+        if r.get("error") and not r.get("oom"):
+            out.append(f"{name}: {r['error'][:200]}")
+        acc = r.get("accuracy")
+        if acc is not None and not acc["ok"]:
+            out.append(f"{name}: accuracy guard max|dlogL| {acc['max_abs_dlogL']:.3g} > {args.acc_tol:g}")
+    if not args.skip_stock and not any(r.get("s_per_row") for r in stock):
+        out.append("no stock configuration completed")
+    if not args.skip_batched:
+        if not any(r.get("s_per_row") for r in batched):
+            out.append("no batched configuration completed")
+        if state.get("ll_ref") is None:
+            out.append("no accuracy reference (stock cross-check) was computed")
+    return out
+
+
+def jsonl_lines(ctx, args, result, stock, batched, geometry, failures):
+    """One flat-ish JSON line per configuration + one summary line (``--jsonl``)."""
+    env = result["env"]
+    base = dict(
+        script="mbh_batched_gpu_benchmark", mode=result["mode"], backend=args.backend, tag=args.tag,
+        days=ctx.Tobs / DAY, Nf=ctx.Nf, Nt=ctx.Nt, dt=ctx.dt, edge_crop=int(args.edge_crop),
+        active_t_layers=[int(ctx.wdm.ind_min_t), int(ctx.wdm.ind_max_t)],
+        source_id=args.source_id, catalogue_source=ctx.cat_src, orbits=ctx.orbits_desc,
+        # the EMRI harness's names: brick (file name), tobs_s, foreground (bool), noise, data_snr
+        # (None: the speed step reads no mojito stream; the data step scores it)
+        brick=None if ctx.brick is None else os.path.basename(ctx.brick), start_offset_s=ctx.start_offset_s,
+        **ctx.noise, data_snr=None,
+        snr_stock90=ctx.snr,   # the injected truth template's optimal SNR (the source at this duration)
+        differs_from_emri=list(DIFFERS_FROM_EMRI),
+        placement=ctx.placement_note, merger_day=(ctx.t_merge_abs - ctx.data_t0) / DAY,
+        window_days=dict(before=ctx.W_before / DAY, after=ctx.W_after / DAY, pad=ctx.W_pad / DAY,
+                         margin=ctx.W_margin / DAY),
+        Nt_keep=int(geometry["Nt_keep"]), Nt_seg=int(geometry["Nt_seg"]),
+        lattice_samples=int(geometry["lattice_samples"]), grid_samples=int(ctx.N),
+        gpu_name=env.get("gpu_name"), hostname=env.get("hostname"), slurm_job_id=env.get("slurm_job_id"),
+        git=env["git"]["snapshot"],
+    )
+    out = []
+    for r in list(stock) + list(batched):
+        out.append(dict(base, **{k: v for k, v in r.items() if k not in ("logL", "stagetimer")}))
+    ok_b = [r for r in batched if r.get("s_per_row")]
+    best = min(ok_b, key=lambda r: r["s_per_row"]) if ok_b else None
+    out.append(dict(
+        base, kind="summary", reference=result["reference"], accuracy_ok=result["accuracy_ok"],
+        accuracy_reference_s_per_row=result["accuracy_reference"]["s_per_row"],
+        stock_s_per_row={r["label"]: r.get("s_per_row") for r in stock},
+        batched_s_per_row={str(r["B"]): r.get("s_per_row") for r in batched},
+        best_batched=None if best is None else dict(B=best["B"], s_per_row=best["s_per_row"]),
+        failures=failures, wall_s=result["wall_s"], peak_rss_gb=result["peak_rss_gb"],
+    ))
+    return out
 
 
 if __name__ == "__main__":

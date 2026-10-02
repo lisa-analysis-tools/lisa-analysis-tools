@@ -3,8 +3,15 @@
 
 For ONE CD1L MBHB (catalogue row ``--src``, 0-19) and ONE analysis window (``--window``),
 build up to four templates on the data grid and score each in the WDM domain against the
-per-source mojito L1 stream (noise-free, source only; SciRD v1 XYZ sensitivity; no time,
-phase or amplitude maximisation):
+per-source mojito L1 stream (noise-free, source only; no time, phase or amplitude
+maximisation). Noise weighting (mbh_harness.py: the EMRI harness's ``RunBox`` noise,
+imported from scripts/emri/emri_batch_speed.py; recorded as ``noise`` / ``foreground`` /
+``tobs_s`` in every row): SciRD v1 XYZ (TDI-2) PLUS the
+FittedHyperbolicTangentGalacticForeground at Tobs = Nf*Nt*dt of the window's grid
+(``--foreground on``, the default since 2026-10-02); ``--foreground off`` is the SciRD
+v1 instrument alone, as every row before that date. Templates are scored through the
+container slicing (``AnalysisContainer._slice_to_template``: the batched one on its
+sub-box), not ``RunBox.score``:
 
 * ``prod``     the production MBH_LIKELIHOOD=full path today: the stock
                ``PhenomTHMTDIWaveform`` from ``get_mbh_phenom_wave_gen`` with the stock
@@ -29,7 +36,8 @@ templates unwindowed; the edge crop removes the edges).
 
 Windows (dt 2.5 s, Nf = ``--nf`` = 1440 -> 3600 s layers, edge crop ``--edge-crop`` = 60
 layers per side as the production EDGE_CROP_WAVELETS, ``--min-freq``/``--max-freq`` 4e-4 /
-2.5e-2 Hz):
+2.5e-2 Hz by default -- the v8 launcher's; the v9 6-month launcher and
+mbh_speed_durations.sh use 2.5e-4):
 
 * ``6mo``      Nt 4320 (Tobs = TOBS_TARGET = 15552000 s). PLACED AS PRODUCTION: the stock
                all_sources mojito loader (L1ProcessingStepWithSyntheticNoise(Tobs=Nf*Nt*dt),
@@ -37,6 +45,11 @@ layers per side as the production EDGE_CROP_WAVELETS, ``--min-freq``/``--max-fre
                highpass / trim) keeps file samples [0, Nf*Nt): the window starts AT THE FILE
                START, data_t0 = the file's tdis t0.
 * ``24mo``     likewise, Nt 17280 (4 x 15552000 s = 720 d of the 731-d files).
+* ``<N>d``     likewise, N days from the file start: Nt = N * 24 one-hour layers (``180d`` is
+               ``6mo``, ``720d`` is ``24mo``) -- the DAYS sweep ("180 360 720") of
+               scripts/mbh/mbh_speed_durations.sh's data step. The bricks' data and ltts end
+               REF + 730.5 d and the EMRI harness's check_window (run on every real window)
+               wants the window end + 4e4 s inside the ltt table.
 * ``centered`` ``--window-days`` (default 120) with the catalogue merger ``--merger-at-days``
                (default 100) in: the mbh_batched_mojito_check.py placement. A window that
                the file cannot hold is recorded as ``skipped_window_outside_file``.
@@ -52,6 +65,18 @@ m * layer_df lies in [<1, 1-5, 5-15, 15-25] mHz (is a ~20 mHz response burst noi
 significant?) with ``band_sum_check`` = sum of the band <r|r> / total <r|r> (1 by
 construction), wall s and peak RSS. Per window: logL0 = -1/2 <d|d>, snr_data, the data's
 band SNRs, the batched kept-box geometry (merger layer, active box, clamps, outside flags).
+The EMRI harness's names ride along (mbh_speed_durations.sh's data step): ``data_snr``,
+``brick`` (file name), ``tobs_s``, ``foreground`` (bool), ``noise`` (RunBox.describe()), per
+template ``snr_<name>`` and ``data_<name>`` = {mm, logL, snr_ratio, snr} (name: production
+for prod, prod90, batched, tof), ``mm_vs_production`` = the batched vs production
+noise-weighted mismatch, and ``differs_from_emri`` (mbh_harness.DIFFERS_FROM_EMRI).
+
+Bricks: the source's ``MBHB_*_L1_source<id>_*.h5``, searched as the EMRI harness does
+(``--l1-dir`` alone when given; else MOJITO_LIGHT_PATH/data/MBHB/L1, then MOJITO_DATA_PATH,
+MOJITO_INFO_PATH, the catalogue's root -- each directly, then recursively); its orbits are
+read through ``WindowedL1Orbits`` (the ltt slice only) and pass the EMRI harness's
+``check_window``. ``--start-offset-s`` starts the file-start windows that many seconds
+into the brick (default 0, production; the harness passes START_OFFSET_S = 5e4).
 Pairwise (batched-prod90, batched-prod, prod90-prod; tof-prod / tof-prod90): noise-weighted
 mm, dlogL, ||a-b|| (noise weighted), flat per-channel mm + amplitude ratio; plus the
 fraction of prod90's flat power outside the batched kept box. One JSON line per
@@ -60,8 +85,10 @@ fraction of prod90's flat power outside the batched kept box. One JSON line per
 Usage (the other computer; MOJITO_LIGHT_PATH holds catalogues/ and data/MBHB/L1/):
 
     export MOJITO_LIGHT_PATH=/path/to/mojito_light_v1_0_0
-    # placement / admission / batched geometry for every source, no data, no waveforms:
+    # placement / admission / batched geometry for every source, no data, no waveforms
+    # (one '[admitted] <window> l1=<ids> no_l1=<ids>' line per window closes the table):
     python scripts/mbh/mbh_cd1l_campaign.py --src all --window 6mo,24mo,centered --dry-run
+    python scripts/mbh/mbh_cd1l_campaign.py --src all --window 180d,360d,720d --dry-run
     # one (source, window):
     python scripts/mbh/mbh_cd1l_campaign.py --src 16 --window centered --out mbh_cd1l.jsonl
     python scripts/mbh/mbh_cd1l_campaign.py --src 16 --window 6mo --backend cuda12x --out mbh_cd1l.jsonl
@@ -90,10 +117,13 @@ a CUDA backend sets XLA_PYTHON_CLIENT_PREALLOCATE=false (unless set) so JAX (phe
 and cupy share the device.
 """
 import argparse
+import functools
 import gc
+import glob
 import json
 import os
 import platform
+import re
 import resource
 import socket
 import subprocess
@@ -109,6 +139,20 @@ DT = 2.5
 TOBS_6MO = 15552000.0                  # production TOBS_TARGET of the 6mo campaign
 WINDOWS = {"6mo": TOBS_6MO, "24mo": 4 * TOBS_6MO}
 ALL_WINDOWS = ("6mo", "24mo", "centered")
+#: '<N>d': N days from the file start, placed as production (like 6mo / 24mo)
+DAYS_WINDOW = re.compile(r"^([0-9]+(?:\.[0-9]+)?)d$")
+
+
+def file_start_tobs(window):
+    """Tobs [s] of a window placed at the FILE START (6mo, 24mo, '<N>d'); None otherwise."""
+    if window in WINDOWS:
+        return WINDOWS[window]
+    m = DAYS_WINDOW.match(window)
+    return None if m is None else float(m.group(1)) * 86400.0
+
+
+def valid_window(window):
+    return window in ALL_WINDOWS or DAYS_WINDOW.match(window) is not None
 ALL_TEMPLATES = ("prod", "prod90", "batched", "tof")
 PAIRS = (("batched", "prod90"), ("batched", "prod"), ("prod90", "prod"),
          ("tof", "prod"), ("tof", "prod90"))
@@ -180,15 +224,49 @@ def load_catalogue(path):
     return [{k: float(v[i]) for k, v in cols.items()} for i in range(n)]
 
 
-def l1_file(src):
-    """Path of source ``src``'s MBHB L1 file, or None (``find_file``'s matching rule)."""
-    folder = os.path.join(mojito_root(), "data", "MBHB", "L1")
-    if not os.path.isdir(folder):
-        return None
-    for name in sorted(os.listdir(folder)):
-        if name.startswith("MBHB_") and f"source{src}_" in name:
-            return os.path.join(folder, name)
+def brick_search_roots(l1_dir=None, catalogue=None):
+    """Directories searched for a source's brick, in the EMRI harness's order
+    (scripts/emri/emri_batch_speed.find_emri_brick, origin/dev ddaad46f): an explicit
+    ``l1_dir`` ALONE; otherwise MOJITO_LIGHT_PATH/data/MBHB/L1, MOJITO_DATA_PATH
+    (/shared/data/mojito_cache on the cluster), MOJITO_INFO_PATH and the catalogue's root
+    (two levels above the catalogue file)."""
+    if l1_dir:
+        return [os.path.expanduser(l1_dir)]
+    roots = [os.path.join(mojito_root(), "data", "MBHB", "L1")]
+    roots += [os.path.expanduser(os.environ[k]) for k in ("MOJITO_DATA_PATH", "MOJITO_INFO_PATH")
+              if os.environ.get(k)]
+    if catalogue and os.path.isfile(catalogue):
+        roots.append(os.path.dirname(os.path.dirname(os.path.abspath(catalogue))))
+    return roots
+
+
+@functools.lru_cache(maxsize=None)
+def _bricks_under(root):
+    """``(direct, recursive)`` sorted MBHB L1 brick paths under ``root`` (one walk per root
+    and process: the dry-run asks for 20 sources)."""
+    if not os.path.isdir(root):
+        return (), ()
+    direct = tuple(sorted(glob.glob(os.path.join(root, "MBHB_*_L1_source*.h5"))))
+    deep = tuple(sorted(glob.glob(os.path.join(root, "**", "MBHB_*_L1_source*.h5"), recursive=True)))
+    return direct, deep
+
+
+def find_mbhb_brick(src, l1_dir=None, catalogue=None):
+    """Path of source ``src``'s MBHB L1 brick (``MBHB_*_L1_source<src>_*.h5``; ``source1_`` never
+    matches ``source11_``), or None: per root of :func:`brick_search_roots`, the first sorted
+    direct match, else the first recursive one -- find_emri_brick's rule."""
+    tag = f"_L1_source{int(src)}_"
+    for root in brick_search_roots(l1_dir, catalogue):
+        for hits in _bricks_under(root):
+            hits = [p for p in hits if tag in os.path.basename(p)]
+            if hits:
+                return hits[0]
     return None
+
+
+def l1_file(src):
+    """Path of source ``src``'s MBHB L1 file, or None (:func:`find_mbhb_brick`, no ``l1_dir``)."""
+    return find_mbhb_brick(src)
 
 
 def file_sampling(path):
@@ -224,10 +302,14 @@ def production_knobs(order):
 def placement(window, args, ref, file_t0, file_size, t_merge_rel, merger_buffer):
     """Window start / size and the production admission verdict, from metadata only."""
     layer = args.nf * DT
-    if window in WINDOWS:
-        nt = int(round(WINDOWS[window] / layer))
-        start = 0   # production: file samples [0, Nf*Nt) (window_start_offset = 0)
-        how = "file start + 0 s (all_sources mojito loader, window_start_offset=0)"
+    tobs_target = file_start_tobs(window)
+    if tobs_target is not None:
+        nt = int(round(tobs_target / layer))
+        # production: file samples [0, Nf*Nt) (window_start_offset = 0); --start-offset-s
+        # moves the start (mbh_speed_durations.sh: START_OFFSET_S = 5e4, the EMRI run box)
+        start = int(round(float(getattr(args, "start_offset_s", 0.0)) / DT))
+        how = (f"file start + {start * DT:.0f} s" + (
+            " (all_sources mojito loader, window_start_offset=0)" if start == 0 else " (--start-offset-s)"))
     else:
         nt = int(round(args.window_days * 86400.0 / layer))
         start = int(round((ref + t_merge_rel - args.merger_at_days * 86400.0 - file_t0) / DT))
@@ -348,8 +430,9 @@ def dry_run(args, srcs, windows):
     from lisatools.globalfit.recipe import MOJITO_REFERENCE_TIME as REF
 
     k = production_knobs(args.order)
-    cat = load_catalogue(os.path.join(mojito_root(), "catalogues", CAT_NAME))
-    have = {s: l1_file(s) for s in srcs}
+    cat_path = os.path.join(mojito_root(), "catalogues", CAT_NAME)
+    cat = load_catalogue(cat_path)
+    have = {s: find_mbhb_brick(s, args.l1_dir, cat_path) for s in srcs}
     sampling = {s: file_sampling(p) for s, p in have.items() if p}
     if not sampling:
         # no L1 file at all: every brick is a 731-d, 2.5-s stream; borrow nothing
@@ -366,12 +449,15 @@ def dry_run(args, srcs, windows):
     print("| src | window | status | L1 | merger d in file | window [d in file] | merger d in window "
           "| merger layer | active t layers | kept layers (Nt_keep) | kept box d | clamp lo/hi | outside box/data |")
     print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    admitted = {w: [] for w in windows}
     for s in srcs:
         t0, dt, size = sampling.get(s, sampling[lender])
         assert abs(dt - DT) < 1e-9, dt
         t_rel = cat[s][T_MERGE_KEY]
         for w in windows:
             p = placement(w, args, REF, t0, size, t_rel, k["merger_time_buffer"])
+            if p["status"] == "ok":
+                admitted[w].append(s)
             g = {}
             if p["in_file"]:
                 wdm, _ = make_grid(p, args, "cpu")
@@ -386,6 +472,12 @@ def dry_run(args, srcs, windows):
             print(f"| {s} | {w} | {p['status']} | {'yes' if have[s] else 'borrowed'} "
                   f"| {(REF + t_rel - t0) / 86400:.2f} | {lo:.2f}..{lo + p['window_days']:.2f} "
                   f"| {p['merger_days_in_window']:.2f} " + geo, flush=True)
+    # machine-readable admission per window (mbh_speed_durations.sh's data step runs l1=):
+    # admitted AND an L1 file present / admitted on borrowed file timing, no L1 file
+    for w in windows:
+        with_l1 = ",".join(str(s) for s in admitted[w] if have[s]) or "-"
+        without = ",".join(str(s) for s in admitted[w] if not have[s]) or "-"
+        print(f"[admitted] {w} l1={with_l1} no_l1={without}", flush=True)
 
 
 def main():
@@ -393,7 +485,8 @@ def main():
     ap.add_argument("--src", required=True,
                     help="CD1L MBHB catalogue row (0-19); with --dry-run also a comma list or 'all'")
     ap.add_argument("--window", required=True,
-                    help="6mo, 24mo or centered; with --dry-run also a comma list or 'all'")
+                    help="6mo, 24mo, '<N>d' (N days from the file start) or centered; with --dry-run "
+                         "also a comma list or 'all' (= 6mo,24mo,centered)")
     ap.add_argument("--templates", default="prod,prod90,batched",
                     help="comma list of prod,prod90,batched,tof (default prod,prod90,batched)")
     ap.add_argument("--order", type=int, default=None,
@@ -406,6 +499,16 @@ def main():
     ap.add_argument("--edge-crop", type=int, default=60, help="WDM time-edge crop per side [layers]")
     ap.add_argument("--min-freq", type=float, default=4e-4)
     ap.add_argument("--max-freq", type=float, default=2.5e-2)
+    ap.add_argument("--l1-dir", default=None,
+                    help="first place to look for the source's MBHB L1 brick (then MOJITO_LIGHT_PATH/data/"
+                         "MBHB/L1, then recursively MOJITO_DATA_PATH, MOJITO_INFO_PATH, the catalogue root)")
+    ap.add_argument("--start-offset-s", type=float, default=0.0,
+                    help="file-start windows (6mo, 24mo, <N>d): start this many seconds after the brick's "
+                         "tdis t0 (default 0 = production; mbh_speed_durations.sh passes START_OFFSET_S)")
+    ap.add_argument("--foreground", default="on", choices=("on", "off"),
+                    help="noise weighting (mbh_harness.py / RunBox): XYZ2 scirdv1 + the fitted tanh galactic "
+                         "foreground at Tobs = Nf*Nt*dt of the window (on, default) or the instrument "
+                         "alone (off: the campaign's numbers before 2026-10-02)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print placement / admission / batched geometry only (no data, no waveforms)")
     ap.add_argument("--out", default="mbh_cd1l_campaign.jsonl")
@@ -421,8 +524,9 @@ def main():
     if bad:
         ap.error(f"unknown templates {sorted(bad)}")
     windows = list(ALL_WINDOWS) if args.window == "all" else [w.strip() for w in args.window.split(",")]
-    if set(windows) - set(ALL_WINDOWS):
-        ap.error(f"--window must be among {ALL_WINDOWS}")
+    bad_w = [w for w in windows if not valid_window(w)]
+    if bad_w:
+        ap.error(f"--window {bad_w}: must be among {ALL_WINDOWS} or '<N>d'")
 
     if args.dry_run:
         n_cat = len(load_catalogue(os.path.join(mojito_root(), "catalogues", CAT_NAME)))
@@ -437,16 +541,21 @@ def main():
     if rss_limit > 0:
         watchdog(rss_limit)
     t_start = time.perf_counter()
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    from mbh_harness import DIFFERS_FROM_EMRI, check_window, harness_box, noise_record
 
     from lisatools.globalfit.recipe import MOJITO_REFERENCE_TIME as REF
 
     k = production_knobs(args.order)
-    cat = load_catalogue(os.path.join(mojito_root(), "catalogues", CAT_NAME))
+    cat_path = os.path.join(mojito_root(), "catalogues", CAT_NAME)
+    cat = load_catalogue(cat_path)
     if not 0 <= src < len(cat):
         ap.error(f"--src {src} outside the catalogue's {len(cat)} rows")
-    path = l1_file(src)
+    path = find_mbhb_brick(src, args.l1_dir, cat_path)
     if path is None:
-        print(f"[campaign] no MBHB L1 file for source {src} under {mojito_root()}", flush=True)
+        print(f"[campaign] no MBHB L1 file for source {src} (searched "
+              f"{brick_search_roots(args.l1_dir, cat_path)})", flush=True)
         return 3
     file_t0, file_dt, file_size = file_sampling(path)
     assert abs(file_dt - DT) < 1e-9, file_dt
@@ -454,9 +563,11 @@ def main():
     row = dict(src=src, window=window, status=p["status"], placement=p, knobs=k,
                templates=templates, backend=args.backend, host=socket.gethostname(),
                platform=platform.platform(), python=sys.version.split()[0], argv=sys.argv,
-               l1_file=os.path.basename(path), edge_crop=int(args.edge_crop),
+               l1_file=os.path.basename(path), brick=os.path.basename(path), edge_crop=int(args.edge_crop),
                min_freq=args.min_freq, max_freq=args.max_freq, dt=DT, nf=p["nf"], nt=p["nt"],
-               tobs_s=p["tobs_s"], versions=versions(args.backend))
+               tobs_s=p["tobs_s"], versions=versions(args.backend),
+               # the EMRI harness's record fields (noise / data_snr filled once the grid exists)
+               foreground=args.foreground == "on", data_snr=None, differs_from_emri=list(DIFFERS_FROM_EMRI))
     print(f"[campaign] src={src} {window}: {p['status']}; window {p['window_days']:.2f} d from "
           f"file day {p['window_start_days_after_file_start']:.3f}; merger "
           f"{p['merger_days_in_window']:.3f} d in", flush=True)
@@ -474,13 +585,25 @@ def main():
     from lisatools.globalfit.stock.erebor.source_runtime import (
         SnappedEpochMBHGen, snap_waveform_t0_to_lattice)
     from lisatools.globalfit.stock.erebor import wrappers
-    from lisatools.sensitivity import XYZ2SensitivityMatrix
     from lisatools.utils.utility import asnumpy
 
     WindowedL1Orbits = windowed_orbits_class(os.path.dirname(os.path.abspath(args.out)))
     backend = args.backend
     window_t0, n, tobs = p["window_t0"], p["n"], p["tobs_s"]
     t_merge_abs = p["t_merge_abs"]
+
+    # ---- orbits FIRST (refuse before reading the data): the ltt slice -- the stock response
+    # reads from data_t0 - tdi_buffer to the merger + ringdown + buffer_time (a merger up to
+    # 7 d after the window end is admitted); the TOF reads its whole phentax span, T = window +
+    # margin before the merger -- and the EMRI harness's rule: the window end + the production
+    # wrapper's 4e4 s inside the ltt table
+    ltt_lo = window_t0 - LTT_PAD
+    if "tof" in templates:
+        ltt_lo = min(ltt_lo, t_merge_abs - (tobs + k["tdionfly_margin"]) - LTT_PAD)
+    ltt_hi = max(window_t0 + tobs, t_merge_abs) + LTT_PAD
+    orb = WindowedL1Orbits(path, ltt_lo, ltt_hi, force_backend=backend, frame="icrs")
+    orb._ensure_configured()
+    check_window(orb, window_t0, tobs, "L1 brick")
 
     # ---- data: the same dataset L1DataLoader reads (X2,Y2,Z2 / laser_frequency), window only
     with MojitoL1File(path) as f:
@@ -491,7 +614,11 @@ def main():
     d_sig = TDSignal(xp.asarray(data_td), tds).transform(wdm)
     del data_td
     gc.collect()
-    sens = XYZ2SensitivityMatrix(wdm, model="scirdv1")
+    # mbh_harness.py: the EMRI harness's RunBox noise on this grid -- XYZ2 scirdv1 + (default)
+    # the fitted tanh galactic foreground at Tobs = Nf*Nt*dt; --foreground off = the instrument
+    box = harness_box(wdm, args.edge_crop, args.foreground)
+    sens = box.sens
+    row.update(noise_record(box))
     ac_data = AnalysisContainer(d_sig, sens)
     d_arr = d_sig.arr
     box_shape = (3, int(wdm.Nf_active), int(wdm.Nt_active))
@@ -519,6 +646,7 @@ def main():
         bands={label: [int(m_abs[fsl.start]), int(m_abs[fsl.stop - 1])] for label, fsl, _ in bands},
         snr_data=float(np.sqrt(max(dd, 0.0))), logL0=-0.5 * dd, band_snr_data=band_snrs(d_arr),
     )
+    row["data_snr"] = row["snr_data"]    # the EMRI / SOBBH harness's name for sqrt<d|d>
     print(f"[campaign] grid Nf={p['nf']} Nt={p['nt']} active f {row['active_f_layers']} t "
           f"{row['active_t_layers']}; snr_data={row['snr_data']:.3f}; band SNR "
           f"{ {b: round(v, 3) for b, v in row['band_snr_data'].items()} }", flush=True)
@@ -528,15 +656,6 @@ def main():
     row["truth_waveform_basis"] = truth.tolist()
     assert abs(truth[10] - p["t_merge_rel"]) < 1e-6, (truth[10], p["t_merge_rel"])
 
-    # ltt slice: the stock response reads from data_t0 - tdi_buffer to the merger + ringdown +
-    # buffer_time (a merger up to 7 d after the window end is admitted); the TOF reads its whole
-    # phentax span, T = window + margin before the merger.
-    ltt_lo = window_t0 - LTT_PAD
-    if "tof" in templates:
-        ltt_lo = min(ltt_lo, t_merge_abs - (tobs + k["tdionfly_margin"]) - LTT_PAD)
-    ltt_hi = max(window_t0 + tobs, t_merge_abs) + LTT_PAD
-    orb = WindowedL1Orbits(path, ltt_lo, ltt_hi, force_backend=backend, frame="icrs")
-    orb._ensure_configured()
     t0s, snap = snap_waveform_t0_to_lattice(REF, window_t0, DT)
     geom = batched_geometry(wdm, t_merge_abs, k)
     row.update(snap=snap, ltt_slice=[ltt_lo, ltt_hi], batched_geometry=geom,
@@ -621,6 +740,13 @@ def main():
                 f"{tag}_band_resid_snr": bres,
                 f"{tag}_band_sum_check": (sum(v * v for v in bres.values()) / (-2.0 * ll)) if ll < 0 else float("nan"),
             })
+            # the EMRI harness's names: snr_<name> = sqrt<h|h> and data_<name> = RunBox.score's
+            # {mm = 1 - <d|h>/sqrt(<d|d><h|h>), logL = -1/2<d-h|d-h>, snr_ratio = sqrt(<h|h>/<d|d>),
+            # snr}, the batched one through the container's sub-box slicing
+            name = "production" if tag == "prod" else tag
+            row[f"snr_{name}"] = opt
+            row[f"data_{name}"] = dict(mm=row[f"{tag}_mm_data"], logL=ll, snr_ratio=row[f"{tag}_snr_ratio"],
+                                       snr=opt)
             host[tag] = np.asarray(asnumpy(h))
             row[f"{tag}_flat_mm_data"], row[f"{tag}_flat_amp_data"] = flat_stats(host[tag], d_host)
             arrs[tag] = h
@@ -652,6 +778,8 @@ def main():
             row[f"dlogL_{a}_{b}"] = row[f"{a}_logL"] - row[f"{b}_logL"]
             row[f"delta_norm_{a}_{b}"] = fval(ac_data.template_snr(WDMSignal(arrs[a] - arrs[b], wdm))[0])
             row[f"flat_mm_{a}_{b}"], row[f"flat_amp_{a}_{b}"] = flat_stats(host[a], host[b])
+            if (a, b) == ("batched", "prod"):   # the EMRI harness's fast-vs-production key
+                row["mm_vs_production"] = row[f"mm_{a}_{b}"]
             print(f"[campaign] {a} vs {b}: mm={row[f'mm_{a}_{b}']:.3e} dlogL={row[f'dlogL_{a}_{b}']:+.4e} "
                   f"||a-b||={row[f'delta_norm_{a}_{b}']:.3e}", flush=True)
             del ac_b
