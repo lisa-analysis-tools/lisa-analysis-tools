@@ -2163,14 +2163,10 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             for all MOSAs. ``"asymmetric"`` uses one amplitude per MOSA (6 OMS + 6 TM,
             ordered as ``orbits.LINKS``: 12, 23, 31, 13, 32, 21) on the same
             spectral shapes. See :meth:`split_psd_params` for the parameter layout.
-<<<<<<< HEAD
         fft_batch_size: Number of rows (one row = one PSD component in one time
             segment) per FFT batch in the window convolution. Batches are padded to
             this fixed size so a single cuFFT plan is reused. Default is ``512``.
             If ``None``, all rows go through in one batch.
-=======
-        fft_batch_size: Batch size for FFTs in the convolution of the window with the sensitivity matrix. Default is 64.
->>>>>>> f93f71d008c3a22374281ea19ddb207b80d97608
     """
 
     def __init__(
