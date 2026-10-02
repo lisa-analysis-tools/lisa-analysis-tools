@@ -41,6 +41,14 @@ def env(**kw):
                 os.environ[k] = v
 
 
+def _clear_peak_floor_override():
+    """The PE step's entry sets a PROCESS-GLOBAL F-stat peak floor; clear it so
+    later test modules (the per-walker floor tests expect SNR 8) are not fed 6.25."""
+    from lisatools.sampling.fstat_proposal import set_peak_min_F_override
+
+    set_peak_min_F_override(None)
+
+
 def _gb(name, **kw):
     base = dict(name=name, branch_name="gb", opt_snr_rej_samp_limit=8.0,
                 phase_maximize=False, _snr_lim_table=None, is_rj_prop=True,
@@ -73,6 +81,9 @@ def _step(profile, tree):
 
 
 class ApplyProfilePriorBirthsTest(unittest.TestCase):
+
+    def tearDown(self):
+        _clear_peak_floor_override()
 
     def test_only_the_prior_move_changes_and_the_fstat_move_never_does(self):
         prior = _gb("rj_prior_removal", rj_removal_only=True)      # built deaths-only
