@@ -4828,6 +4828,109 @@ print(f"[EMRI-PREFLIGHT] emri_pe scoring=direct batch<={cfg['emri_batch_max_size
 PYEOF
 
 # ============================================================================
+# SOBBH LOOKUP SCORING (2026-10-02). SOBBH_LIKELIHOOD=lookup scores and fills
+# the SOBBH add/remove proposals (the existing SOBBHChunkedLikeMove; the comp
+# is a drop-in) with the direct-to-WDM n_ref lookup template
+# (docs/sobbh-wdm-lookup.md): one batched TDI-on-the-fly response per call on
+# a SPARSE 12-h grid splined to the pixel centres, the table evaluated at 5
+# layers per pixel. Cluster, one H100, production grid: 0.11 s per 8-row call
+# vs 1.70 s for the chunked comp (15x), 0.39 s at 288 rows (9.6x); accuracy
+# vs the dense transform mismatch 1e-7..1e-6, dlogL 1e-5..1e-3 (laptop gate).
+# To run it:
+#     SOBBH_LIKELIHOOD=lookup NGPUS=4 ./submit_gf_6mo_v9_4gpu.sh
+# SINGLE-DEVICE: the lookup comp lives on one GPU; the walker-block layout
+# (GPUS_PER_RANK unset = one device per compute rank) is fine, GPUS_PER_RANK>1
+# is refused (per-device replicas are a follow-up).
+# LOOKUP TABLE: SOBBH_LOOKUP_TABLE_PATH points to a specific table (any (Nf, dt)
+# with this run's 3600-s layer duration); unset (default) it is the canonical
+# file in this run's folder -- the SAME file EMRI_LIKELIHOOD=direct uses,
+#     ${STORE_DIR}/wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5
+# found there or built and saved there by the preflight below on this node's
+# GPU before mpiexec (lisatools.wdm_lookup_store), so a restart never rebuilds.
+# SOBBH_M_BAND_HALF_WIDTH / SOBBH_FILL_M_BAND_HALF_WIDTH are ignored by it.
+# RESUME-SAFE: no stored shape changes.
+# WATCH: "[SOBBH_LOOKUP] lookup table ... (found|built|waited|explicit)" at
+# build, and the [SOBBH_LL_TIMING] leaf windows (ms/call should be ~100-400).
+export SOBBH_LIKELIHOOD=${SOBBH_LIKELIHOOD:-chunked}
+export SOBBH_LOOKUP_TABLE_PATH=${SOBBH_LOOKUP_TABLE_PATH:-}
+export SOBBH_LOOKUP_EVAL_DT=${SOBBH_LOOKUP_EVAL_DT:-43200}
+export SOBBH_LOOKUP_ROW_BATCH=${SOBBH_LOOKUP_ROW_BATCH:-32}
+#
+# SOBBH PREFLIGHT. An unknown env var is SILENTLY IGNORED, so resolve the knobs
+# through the real settings class; for lookup, refuse a lisatools without the
+# lookup comp, refuse GPUS_PER_RANK>1, and find -- or build and save -- the
+# lookup table (above). Refuses before mpiexec on any gap.
+python - <<'PYEOF' || exit 2
+import os
+import sys
+
+try:
+    from lisatools.globalfit.stock.erebor.source_runtime import (
+        SOBBH_FAST_LIKELIHOODS, SourceSOBBHSettings, resolve_sobbh_lookup_table)
+except ImportError as exc:
+    if os.environ["SOBBH_LIKELIHOOD"] != "lookup":
+        print(f"[SOBBH-PREFLIGHT] sobbh scoring={os.environ['SOBBH_LIKELIHOOD']} (the "
+              "installed lisatools predates the lookup comp; not requested).")
+        sys.exit(0)
+    print("[SOBBH-PREFLIGHT] REFUSING: the installed lisatools has no SOBBH lookup "
+          f"likelihood ({exc}). SOBBH_LIKELIHOOD=lookup would be SILENTLY IGNORED. Pull dev "
+          "at/after the SOBBH lookup merge, or launch with SOBBH_LIKELIHOOD=chunked.")
+    sys.exit(2)
+sobbh = SourceSOBBHSettings()
+want = (os.environ["SOBBH_LIKELIHOOD"], os.environ["SOBBH_LOOKUP_TABLE_PATH"],
+        float(os.environ["SOBBH_LOOKUP_EVAL_DT"]), int(os.environ["SOBBH_LOOKUP_ROW_BATCH"]))
+got = (sobbh.likelihood, sobbh.lookup_table_path, float(sobbh.lookup_eval_dt),
+       int(sobbh.lookup_row_batch))
+if got != want:
+    print("[SOBBH-PREFLIGHT] REFUSING: exported (likelihood, table, eval_dt, row_batch) = "
+          f"{want} but the settings resolve {got}.")
+    sys.exit(2)
+if sobbh.likelihood != "lookup":
+    print(f"[SOBBH-PREFLIGHT] sobbh scoring={sobbh.likelihood}.")
+    sys.exit(0)
+if "lookup" not in SOBBH_FAST_LIKELIHOODS:
+    print(f"[SOBBH-PREFLIGHT] REFUSING: SOBBH_FAST_LIKELIHOODS={SOBBH_FAST_LIKELIHOODS}: the "
+          "installed lisatools has no lookup comp.")
+    sys.exit(2)
+gpr = os.environ.get("GPUS_PER_RANK", "")
+if gpr and int(gpr) > 1:
+    print(f"[SOBBH-PREFLIGHT] REFUSING: SOBBH_LIKELIHOOD=lookup is single-device and "
+          f"GPUS_PER_RANK={gpr} > 1 (the stock getter refuses it at build). Launch with "
+          "GPUS_PER_RANK unset (one device per compute rank) or SOBBH_LIKELIHOOD=chunked.")
+    sys.exit(2)
+import time
+from types import SimpleNamespace
+
+import lisatools
+from lisatools.domains import WDMLookupTable
+
+try:  # build on this node's GPU when there is one (has_backend("gpu") raises without)
+    lisatools.get_backend("gpu")
+    table_backend = "gpu"
+except Exception:
+    table_backend = "cpu"
+# this run's grid: Nf 1440 x Nt 4320 at dt 2.5 s, layer 3600 s (the resolver reads only
+# these three; the file is the same canonical table EMRI direct uses)
+gi = SimpleNamespace(domain_settings=SimpleNamespace(Nf=1440, data_dt=2.5, layer_dt=3600.0),
+                     file_store_dir=os.environ["FILE_STORE_DIR"], force_backend=table_backend)
+t_table = time.time()
+try:
+    path, status = resolve_sobbh_lookup_table(
+        gi, {"sobbh_lookup_table_path": sobbh.lookup_table_path}, force_backend=table_backend)
+    layer = float(WDMLookupTable.from_file(path, force_backend="cpu").layer_dt)
+except (ValueError, OSError, TimeoutError) as exc:
+    print(f"[SOBBH-PREFLIGHT] REFUSING: lookup table: {exc}")
+    sys.exit(2)
+if abs(layer - 3600.0) > 1e-6:
+    print(f"[SOBBH-PREFLIGHT] REFUSING: lookup table {path} has layer duration {layer:g} s; "
+          "this run's is 3600 s.")
+    sys.exit(2)
+print(f"[SOBBH-PREFLIGHT] sobbh scoring=lookup eval_dt={sobbh.lookup_eval_dt:g} "
+      f"row_batch={sobbh.lookup_row_batch} table={path} ({status}, "
+      f"{time.time() - t_table:.0f} s)")
+PYEOF
+
+# ============================================================================
 # FRESH-RUN GUARD (2026-08-15). This submission starts a NEW run in a NEW
 # store dir: every piece of state -- the VGB beta ladder, the GB cap-cell
 # grid, the band grid, the F-stat epoch cache -- is built from the config
