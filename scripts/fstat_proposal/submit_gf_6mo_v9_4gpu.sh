@@ -3433,6 +3433,11 @@ export GALFOR_RATCHET_CYCLES=${GALFOR_RATCHET_CYCLES:-2}
 export GALFOR_RATCHET_DLOG10_AMP=${GALFOR_RATCHET_DLOG10_AMP:--0.05}
 export GALFOR_RATCHET_DLOG10_FK=${GALFOR_RATCHET_DLOG10_FK:--0.10}
 export GALFOR_RATCHET_DLOG10_F2=${GALFOR_RATCHET_DLOG10_F2:--0.15}
+# The gain rule (GALFOR_RATCHET_MIN_GAIN) may not stop the ratchet before this
+# many nudges have run in the process (user ruling 2026-10-02: "I generally
+# want it to do minimum 2 nudges total"). Counted per process: a relaunch
+# starts the count again. 0 = no floor.
+export GALFOR_RATCHET_MIN_NUDGES=${GALFOR_RATCHET_MIN_NUDGES:-2}
 # ---- search LEGS (user design 2026-09-30) ----------------------------------
 # GB_SEARCH_LEGS=1: the numbered search stages store one row per LEG of the
 # cycle -- after in_model, after in_model_fstat, after in_model_removal --

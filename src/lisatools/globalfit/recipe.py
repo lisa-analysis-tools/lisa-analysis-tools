@@ -1588,7 +1588,8 @@ class SearchStageProfileStep(RJRecipeStep):
 
     def __init__(self, *args, profile: typing.Optional[dict] = None,
                  stage_name: str = "", ratchet=None, ratchet_delta=None,
-                 ratchet_min_gain: float = 0.0, legs: bool = False, **kwargs):
+                 ratchet_min_gain: float = 0.0, ratchet_min_nudges: int = 0,
+                 legs: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.profile = dict(profile or {})
         _unknown = sorted(set(self.profile) - {
@@ -1620,6 +1621,12 @@ class SearchStageProfileStep(RJRecipeStep):
         # release whose max cold lnL gained less than this over the previous
         # release, no more nudges (user design 2026-10-02; _ratchet_check_gain).
         self.ratchet_min_gain = float(ratchet_min_gain or 0.0)
+        # ``ratchet_min_nudges``: the gain rule may not stop the ratchet before
+        # this many nudges have run IN THIS PROCESS (user ruling 2026-10-02:
+        # "I want to force at least 1 more nudge"). 0 = no floor. Counted on
+        # ``_ratchet_nudges``, which _drive_ratchet increments per nudge; a
+        # relaunch starts the count again.
+        self.ratchet_min_nudges = int(ratchet_min_nudges or 0)
         self._ratchet_stopped = False
         self._ratchet_last_release_max = None
         self._ratchet_release_maxes = []
@@ -1930,6 +1937,16 @@ class SearchStageProfileStep(RJRecipeStep):
                 "mean %.3f), %+.1f over the previous release -- a real step "
                 "(threshold %.0f); ratcheting continues.", tag, k_done, mx, mean,
                 gain, gain_min)
+            return
+        _n_nudges = int(getattr(self, "_ratchet_nudges", 0) or 0)
+        _min_nudges = int(getattr(self, "ratchet_min_nudges", 0) or 0)
+        if _n_nudges < _min_nudges:
+            logger.info(
+                "[GALFOR_RATCHET %s] after RELEASE %d: max cold lnL %.3f (walker "
+                "mean %.3f), %+.1f over the previous release < %.0f -- but only %d "
+                "of the required %d nudge(s) have run in this process "
+                "(GALFOR_RATCHET_MIN_NUDGES); ratcheting continues.", tag, k_done,
+                mx, mean, gain, gain_min, _n_nudges, _min_nudges)
             return
         self._ratchet_stopped = True
         gate = self._ratchet_gate(moves) if moves is not None else None
