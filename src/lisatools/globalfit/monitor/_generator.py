@@ -556,9 +556,8 @@ if SUB_NIT < NIT:
     psd_sw_a = psd_sw_a[:SUB_NIT]; psd_sw_p = psd_sw_p[:SUB_NIT]
     gal_sw_a = gal_sw_a[:SUB_NIT]; gal_sw_p = gal_sw_p[:SUB_NIT]
 VGB_NIT = SUB_NIT
-gb_inds = g["inds/gb"][:NIT, 0, 0]                  # (it, 24, 10000)
-gb_chain_cold = g["chain/gb"][NIT-1, 0, 0]          # (24, 10000, 9) last iter
-gb_alive_last = g["inds/gb"][NIT-1, 0, 0]           # (24, 10000)
+# gb_inds / gb_chain_cold / gb_alive_last are loaded below _row, which they
+# read through.
 
 # ---- POOLED SAMPLE WINDOWS (2026-08-27, user request) --------------------
 # Every panel that SCATTERS per-leaf cold-chain samples used to draw ONE
@@ -694,17 +693,21 @@ def _pool_gb_iter(nwant, cols=None):
     ``alive`` is THAT iteration's own ``inds`` row -- rule 2 above. ``chain``
     is ``(nwalk, nleaf, len(cols))``, sliced column-wise because the chain is
     chunked ``(..., 1)`` on the parameter axis: pulling three columns
-    decompresses a third of the bytes a full-row read would.
+    decompresses a third of the bytes a full-row read would. A row that
+    cannot be read (see ``_row``) is left out of the pool.
     """
     for _i in _pool_its(nwant, "gb"):
         _al = gb_inds[_i]
         if not _al.any():
             continue
         if cols is None:
-            _ch = g["chain/gb"][_i, 0, 0]
+            _ch = _row("chain/gb", (_i, 0, 0))
         else:
-            _ch = np.stack([g["chain/gb"][_i, 0, 0, :, :, _c] for _c in cols],
-                           axis=-1)
+            _cs = [_row("chain/gb", (_i, 0, 0, slice(None), slice(None), _c))
+                   for _c in cols]
+            _ch = None if any(_c is None for _c in _cs) else np.stack(_cs, axis=-1)
+        if _ch is None:
+            continue
         yield int(_i), _al, _ch
         del _ch
 
@@ -788,6 +791,62 @@ def _safe(node, key, default=None, label=None):
             f"{label or key}: unreadable in this snapshot "
             f"(likely copied mid-save) -- {type(e).__name__}")
         return default
+
+
+# PER-ROW READS GET THE SAME LADDER (2026-10-02). ``_safe`` guards whole
+# datasets; the GB panels read ``chain/gb`` one stored row at a time,
+# straight off ``g`` and outside any try, so one unreadable row killed the
+# whole page (6mo cluster, ``python -m lisatools.globalfit.monitor`` on the
+# LIVE run dir):
+#   _leaf_f0 -> g["chain/gb"][it_, 0, 0, w, :, 1]
+#   OSError: Can't synchronously read data (filter returned failure during read)
+# That build had already read every chain/gb row cleanly at the leaf-count
+# panel, so the row was not torn on disk: the saver appended in between, and
+# a reader without SWMR is reading a file that is changing under it.
+# _store_extract met the same thing on 2026-08-22 and takes the same ladder:
+# the live row, else the same row from the run's backup copy (closed,
+# atomically replaced, one save behind -- the row is identical, not an
+# approximation), else skip that row and say so on the page.
+_TORN_ROWS = []
+
+
+def _row(name, sel):
+    """``g[name][sel]`` for stored row(s) ``sel[0]``, or ``None`` if unreadable.
+
+    ``sel[0]`` is a row index or a slice of rows. The backup copy only
+    supplies rows below its own ``iteration`` attr: it is preallocated, and a
+    row it has not written yet reads back as zeros -- which every GB panel
+    would render as the model losing all of its sources.
+    """
+    try:
+        return g[name][sel]
+    except OSError:
+        pass
+    r0 = sel[0]
+    hi = (r0.stop if r0.stop is not None else NIT) if isinstance(r0, slice) else int(r0) + 1
+    where = f"rows {r0.start or 0}-{hi - 1}" if isinstance(r0, slice) else f"row {int(r0)}"
+    bg = _backup_group()
+    if bg is not None:
+        try:
+            if hi <= int(bg.attrs.get("iteration", 0)):
+                val = bg[name][sel]
+                _TORN_ROWS.append(f"{name} {where} <- backup copy")
+                return val
+        except Exception:
+            pass
+    _TORN_ROWS.append(f"{name} {where} SKIPPED")
+    return None
+
+
+# Every GB panel stands on these two; without them there is no page to degrade to.
+gb_inds = _row("inds/gb", (slice(0, NIT), 0, 0))     # (it, 24, 10000)
+gb_chain_cold = _row("chain/gb", (NIT - 1, 0, 0))    # (24, 10000, 9) last iter
+if gb_inds is None or gb_chain_cold is None:
+    raise RuntimeError(
+        "chain/gb or inds/gb is unreadable in the store AND its running backup "
+        f"copy ({'; '.join(_TORN_ROWS)}). If the run is live, rebuild after "
+        "the save completes.")
+gb_alive_last = gb_inds[NIT - 1]                     # (24, 10000)
 
 
 def _opt(node, key):
@@ -1454,9 +1513,14 @@ ax[0].plot(it, gb_counts.max(axis=1), color=GREEN, lw=1.8, label="all f")
 # the model's leaf count restricted to that SAME range, so the two lines
 # are comparable rather than merely adjacent.
 if DET_F0 is not None:
-    _f0_it = g["chain/gb"][:NIT, 0, 0][..., 1] * 1e-3     # (it, walker, leaf)
-    _in = (_f0_it >= DET_LO) & (_f0_it <= DET_HI) & gb_inds
-    _cnt = _in.sum(axis=2)                                # (it, walker)
+    # row by row, f0 column only; an unreadable row is a gap (NaN), not a 0
+    _cnt = np.full((NIT, gb_inds.shape[1]), np.nan)       # (it, walker)
+    for _i in range(NIT):
+        _f0_i = _row("chain/gb", (_i, 0, 0, slice(None), slice(None), 1))
+        if _f0_i is not None:
+            _f0_i = _f0_i * 1e-3
+            _cnt[_i] = ((_f0_i >= DET_LO) & (_f0_i <= DET_HI)
+                        & gb_inds[_i]).sum(axis=1)
     ax[0].plot(it, _cnt.max(axis=1), color=CYAN, lw=1.6,
                label=f"{_mhz(DET_LO)}-{_mhz(DET_HI)} mHz")
     ax[0].axhline(DET_F0.size, color=RED, ls=":", lw=1.5)
@@ -1562,9 +1626,18 @@ if cap_cells is not None and cap_cells.size and cap_edges_arr is not None:
         _crow -= 1
 
     def _cell_counts(iteration):
-        """Sources per cap cell, per cold walker, at one stored iteration."""
-        alive = g["inds/gb"][iteration, 0, 0]                    # (nw, nleaf)
-        f0 = g["chain/gb"][iteration, 0, 0][..., 1] * 1e-3       # mHz -> Hz
+        """Sources per cap cell, per cold walker, at one stored iteration.
+
+        ``None`` when that row of the chain cannot be read (see ``_row``).
+        """
+        alive = gb_inds[iteration]                               # (nw, nleaf)
+        if iteration == NIT - 1:
+            f0 = gb_chain_cold[..., 1]                           # already read
+        else:
+            f0 = _row("chain/gb", (iteration, 0, 0, slice(None), slice(None), 1))
+            if f0 is None:
+                return None
+        f0 = f0 * 1e-3                                           # mHz -> Hz
         out = np.zeros((alive.shape[0], ncell), dtype=np.int32)
         for w in range(alive.shape[0]):
             fv = f0[w][alive[w]]
@@ -1631,6 +1704,8 @@ if cap_cells is not None and cap_cells.size and cap_edges_arr is not None:
     _cap_its, _atcap = [], []
     for i in range(NIT):
         cc = _cell_counts(i)
+        if cc is None:
+            continue
         capi = cap_cells[min(i, _crow)]
         _its.append(i)
         _occ.append((cc > 0).sum() / nw_)
@@ -4127,9 +4202,12 @@ def _leaf_f0(it_, w):
 
     Sliced column-wise: the chain is chunked (..., 1) on the parameter axis,
     so pulling only f0 reads ~1/9 of the bytes a full-row read would.
+    ``None`` when that row cannot be read (see ``_row``).
     """
-    al = g["inds/gb"][it_, 0, 0, w]
-    return (g["chain/gb"][it_, 0, 0, w, :, 1] * 1e-3)[al]
+    f0 = _row("chain/gb", (it_, 0, 0, w, slice(None), 1))
+    if f0 is None:
+        return None
+    return (f0 * 1e-3)[gb_inds[it_, w]]
 
 
 if TRU is not None:
@@ -4151,6 +4229,13 @@ if TRU is not None:
     n_match = np.zeros(NIT, int)
     for _i in range(NIT):
         _fv = _leaf_f0(_i, int(_wb[_i]))
+        if _fv is None:
+            # unreadable row: hold the previous row's counts rather than plot
+            # a drop to zero; the row is named on the page via _TORN_ROWS
+            if _i:
+                n_all[_i] = n_all[_i - 1]; n_band[_i] = n_band[_i - 1]
+                n_match[_i] = n_match[_i - 1]
+            continue
         n_all[_i] = _fv.size
         _fv = _fv[(_fv >= FLO) & (_fv <= FHI)]
         n_band[_i] = _fv.size
@@ -4161,8 +4246,7 @@ if TRU is not None:
 
     # ---- the last stored iteration, in full ------------------------------
     WB = int(_wb[-1])
-    _alive = g["inds/gb"][NIT - 1, 0, 0, WB]
-    REC9 = g["chain/gb"][NIT - 1, 0, 0, WB][_alive]
+    REC9 = gb_chain_cold[WB][gb_alive_last[WB]]           # row NIT-1, read once
     _inb = (REC9[:, 1] * 1e-3 >= FLO) & (REC9[:, 1] * 1e-3 <= FHI)
     REC9 = REC9[_inb]
     MI, TI, DFH = _match_pairs(REC9[:, 1] * 1e-3, T_F0, _tol)
@@ -5517,7 +5601,9 @@ if _rows:
         _al = gb_inds[_it]                             # THIS iteration's mask
         if not _al.any():
             continue
-        _ch = g["chain/gb"][_it, 0, 0]                 # (nwalk, nleaf, 9)
+        _ch = _row("chain/gb", (_it, 0, 0))            # (nwalk, nleaf, 9)
+        if _ch is None:
+            continue
         for _k, _c0 in enumerate(_centers):
             _got = 0
             for _w in range(nwalk):
@@ -6569,6 +6655,17 @@ RUN_HEALTH = (
     + ("; ".join(_arm_bits) + ". " if _arm_bits else "")
     + "Neither arm has converged, so every number here is a progress readout "
       "rather than a result.")
+
+if _TORN_ROWS:
+    _tr = sorted(set(_TORN_ROWS))
+    MISSING.append(
+        f"{len(_tr)} chain row read(s) failed in the store (\"filter returned "
+        "failure during read\": a run writing the file while this page read "
+        "it, or a save cut short): " + "; ".join(_tr[:12])
+        + (f"; ... and {len(_tr) - 12} more" if len(_tr) > 12 else "")
+        + ". Rows from the backup copy are exact; a SKIPPED row is left out "
+          "of its panel (the per-iteration recovery trace holds the previous "
+          "row's value there).")
 
 missing_html = "".join(f"<li>{m}</li>" for m in MISSING)
 
