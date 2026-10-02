@@ -1850,7 +1850,11 @@ export GB_SEARCH_NOISE_ITERS_PER_STEP=100
 export MAXLOGL_TOL=20
 # PE-only exclusive RJ draw (b9aae51f).
 export GB_PE_RJ_DRAW_ONE=1
-export GB_PE_RJ_FSTAT_FRACTION=0.5
+# ONE of rj_fstat_pe / rj_prior_pe / rj_warm_pe per PE iteration (user ruling
+# 2026-10-02: "put the warm proposal in with the other two rj moves. Draw them
+# at 0.45 prior, 0.45 fstat, 0.1 warm start"); prior takes the remainder.
+export GB_PE_RJ_FSTAT_FRACTION=0.45
+export GB_PE_RJ_WARM_FRACTION=0.1
 # Per-block EXACT info matrices through the sig-het fast route
 # (~2.4 ms/src vs ~29-46 chunked). The data_index misindex is FIXED and
 # multi-GPU slots now route by the BUFFER's slot shards. First
@@ -3562,7 +3566,11 @@ export GB_FSTAT_REFIT_EVERY=2      # SEARCH stages: every 2nd iteration
 # (gb_search) the two coincide exactly, so 40 above is unchanged in meaning;
 # in full_pe the old clock ticked ~1/N as fast and the knob silently meant N
 # times more iterations than it said.
-export GB_FSTAT_REFIT_EVERY_PE=250
+# refit the F-stat birth grid every 50 PE ITERATIONS (the clock counts
+# iterations; the decision runs when rj_fstat_pe proposes, so the actual
+# spacing is the first rj_fstat_pe draw at or after 50) -- user ruling
+# 2026-10-02: "during PE fstat should refit every 50 iterations" (was 250).
+export GB_FSTAT_REFIT_EVERY_PE=50
 export FSTAT_PEAKS_PER_BAND=200    # per-sub-band peak cap (code default; explicit)
 # STAGE-B STACK CHUNKING -- fixes the 2026-09-21 epoch-9 OOM.
 # StackedFStatProposal4D.__init__ corner-averages the ENTIRE K-box 4-D grid
@@ -4457,6 +4465,16 @@ export EMRI_NUM_PROP_REPEATS=2
 # 605 ms group launch: the in-code reference for this configuration is
 # 2.78 ms/row (sobbhspecialmove.py, job-373 note), ~58x away.
 export SOBBH_NUM_PROP_REPEATS=${SOBBH_NUM_PROP_REPEATS:-10}
+# full_pe ONLY (user ruling 2026-10-02: "in-model repeats of 25 for all
+# sources except emris for right now for PE. This includes VGBs and GBs
+# ... that way we have a general 'thinning' factor of 25"): the PE stage
+# declares the in-model repeat count for the listed branches on entry, on
+# the built moves it shares with the search stages, so the search stages
+# keep SOBBH 10 / MBH 2 / VGB 1 / GB 25 / PSD 10 / GALFOR 10 from the knobs
+# above. EMRI stays at its own knob. Unset PE_INMODEL_REPEATS = every move
+# as built.
+export PE_INMODEL_REPEATS=${PE_INMODEL_REPEATS:-25}
+export PE_INMODEL_REPEATS_BRANCHES=${PE_INMODEL_REPEATS_BRANCHES:-gb,vgb,sobbh,mbh,psd,galfor}
 export MBH_PERMUTE_EVERY=10
 export EMRI_PERMUTE_EVERY=10
 export SOBBH_PERMUTE_EVERY=10

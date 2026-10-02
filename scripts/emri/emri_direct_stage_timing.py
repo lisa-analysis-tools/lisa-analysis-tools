@@ -7,10 +7,17 @@ next to the production template's wall time on the same grid.
     python scripts/emri/emri_direct_stage_timing.py --backend cuda13x --dt 2.5 --reps 5 \
         --catalog /path/emri_cat_mojito_lite_processed_MT.hdf5 --orbits equal-arm \
         --direct-table wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5 --thresh 1e-3,1e-5
+
+Sweeps in ONE process (FEW and the table load once): ``--response-grid sparse,pixels`` (the
+dense response's grid) and ``--chunk-rows 1,2,4,8,16,32`` (rows per response call, timed over
+``--batch-rows`` rows each). Each (threshold, grid, chunk) prints its stage split and, on a GPU,
+the cupy memory-pool footprint of that batch; ``--out`` appends one JSON line per run and a
+summary table (ms per template vs rows per call) closes each threshold.
 """
 import argparse
 import collections
 import functools
+import json
 import os
 import sys
 import time
@@ -37,7 +44,11 @@ def main():
     ap.add_argument("--direct-table", required=True)
     ap.add_argument("--batch-rows", type=int, default=0,
                     help="also time EMRIDirectWDM.batch over this many parameter rows")
-    ap.add_argument("--chunk-rows", type=int, default=16, help="rows per response call in the batch")
+    ap.add_argument("--chunk-rows", default="16",
+                    help="rows per response call in the batch; a comma list sweeps them (e.g. 1,2,4,8,16,32)")
+    ap.add_argument("--response-grid", default="sparse",
+                    help="dense response grid(s): sparse, pixels, or a comma list of both")
+    ap.add_argument("--out", default=None, help="append one JSON line per (threshold, grid, chunk) here")
     ap.add_argument("--response", choices=("spline", "dense"), default="dense",
                     help="TDI-on-the-fly response: 'dense' (TDDenseTDIonTheFly: exact phases, geometry shared "
                          "across harmonics; needs a backend built with it) or 'spline' (TDTDIonTheFly)")
@@ -99,8 +110,12 @@ def main():
     tds = TDSettings(n, args.dt, t0=0.0, force_backend=args.backend)
     wdm = WDMSettings(nf, nt, args.dt, force_backend=args.backend)
     table = WDMLookupTable.from_file(args.direct_table, force_backend=args.backend)
-    direct = WD.EMRIDirectWDM(gen, table, wdm, orbits=orb, tdi_config=tdi, t_start=W.REF, data_t0=data_t0,
-                              mode_batch=args.mode_batch, force_backend=args.backend, response=args.response)
+    grids = [g.strip() for g in args.response_grid.split(",") if g.strip()]
+    chunks = [int(c) for c in str(args.chunk_rows).split(",") if c.strip()]
+    directs = {g: WD.EMRIDirectWDM(gen, table, wdm, orbits=orb, tdi_config=tdi, t_start=W.REF, data_t0=data_t0,
+                                   mode_batch=args.mode_batch, force_backend=args.backend, response=args.response,
+                                   response_grid=g) for g in grids}
+    pool = cp.get_default_memory_pool() if gpu else None
 
     wrap(WD.EMRIDirectWDM, "_mode_list", "1 mode list (FEW call #1 + handoff check)")
     wrap(type(gen), "__call__", "  FEW generator calls (both)")
@@ -122,42 +137,76 @@ def main():
         h = xp.stack([xp.asarray(c) for c in h]) if isinstance(h, (list, tuple)) else xp.atleast_2d(h)
         return TDSignal(h[:3, oi:oi + n], tds).transform(wdm).arr
 
+    def record(**rec):
+        if args.out:
+            with open(args.out, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+
+    base = dict(src=args.src, days=args.days, dt=args.dt, nf=nf, nt=nt, backend=args.backend,
+                response=args.response)
     for thr in [float(x) for x in args.thresh.split(",")]:
-        prod(thr), direct(*params, mode_selection_threshold=thr)       # warm-up
+        prod(thr)                                                        # warm-up
         sync()
         t0 = time.perf_counter()
         for _ in range(args.reps):
             prod(thr)
         sync()
         t_prod = (time.perf_counter() - t0) / args.reps
-        T.clear()
-        C.clear()
-        t0 = time.perf_counter()
-        for _ in range(args.reps):
-            direct(*params, mode_selection_threshold=thr)
-        sync()
-        t_dir = (time.perf_counter() - t0) / args.reps
-        print(f"\n[stages] response={args.response} thr={thr:g} modes={direct.last_stats.get('modes')} n_fine={direct.last_stats.get('n_fine')} "
-              f"backend={args.backend} grid Nf={nf} Nt={nt} dt={args.dt}: direct {t_dir * 1e3:.0f} ms, "
-              f"production {t_prod * 1e3:.0f} ms (per template)", flush=True)
-        for k in [lab for lab in LABELS if lab in T]:
-            print(f"  {k:48s} {T[k] / args.reps * 1e3:8.1f} ms  ({C[k] // args.reps} calls)", flush=True)
-        if args.batch_rows > 0:
-            rows = B.batch_rows(params, args.batch_rows)
-            sink = lambda idx, arr: None                                 # noqa: E731 (timing only)
-            direct.batch(rows[:2], chunk_rows=args.chunk_rows, consume=sink, mode_selection_threshold=thr)
+        summary = {}
+        for grid, direct in directs.items():
+            direct(*params, mode_selection_threshold=thr)               # warm-up
             sync()
             T.clear()
             C.clear()
             t0 = time.perf_counter()
-            direct.batch(rows, chunk_rows=args.chunk_rows, consume=sink, mode_selection_threshold=thr)
+            for _ in range(args.reps):
+                direct(*params, mode_selection_threshold=thr)
             sync()
-            t_b = time.perf_counter() - t0
-            print(f"[stages] thr={thr:g} BATCH of {len(rows)} ({args.chunk_rows} per call): {t_b * 1e3:.0f} ms total = "
-                  f"{t_b / len(rows) * 1e3:.0f} ms per template (production {t_prod * 1e3:.0f}) {direct.last_stats}",
+            t_dir = (time.perf_counter() - t0) / args.reps
+            print(f"\n[stages] response={args.response} grid={grid} thr={thr:g} modes={direct.last_stats.get('modes')} "
+                  f"n_fine={direct.last_stats.get('n_fine')} backend={args.backend} grid Nf={nf} Nt={nt} dt={args.dt} "
+                  f"({args.days:g} d): direct {t_dir * 1e3:.0f} ms, production {t_prod * 1e3:.0f} ms (per template)",
                   flush=True)
             for k in [lab for lab in LABELS if lab in T]:
-                print(f"  {k:48s} {T[k] / len(rows) * 1e3:8.1f} ms per template  ({C[k]} calls)", flush=True)
+                print(f"  {k:48s} {T[k] / args.reps * 1e3:8.1f} ms  ({C[k] // args.reps} calls)", flush=True)
+            stages = {k.strip(): T[k] / args.reps * 1e3 for k in LABELS if k in T}
+            record(**base, thr=thr, grid=grid, chunk=0, rows=1, modes=direct.last_stats.get("modes"),
+                   n_response=direct.last_stats.get("n_fine"), ms_per_template=t_dir * 1e3,
+                   production_ms=t_prod * 1e3, stages_ms=stages)
+            summary[(grid, 0)] = t_dir * 1e3
+            if args.batch_rows <= 0:
+                continue
+            rows = B.batch_rows(params, max(args.batch_rows, max(chunks)))
+            sink = lambda idx, arr: None                                 # noqa: E731 (timing only)
+            for chunk in chunks:
+                direct.batch(rows[:min(2, chunk)], chunk_rows=chunk, consume=sink, mode_selection_threshold=thr)
+                sync()
+                if pool is not None:
+                    pool.free_all_blocks()
+                T.clear()
+                C.clear()
+                t0 = time.perf_counter()
+                direct.batch(rows, chunk_rows=chunk, consume=sink, mode_selection_threshold=thr)
+                sync()
+                t_b = time.perf_counter() - t0
+                mem = pool.total_bytes() / 1e9 if pool is not None else float("nan")
+                print(f"[stages] grid={grid} thr={thr:g} BATCH of {len(rows)} ({chunk} per call): {t_b * 1e3:.0f} ms "
+                      f"total = {t_b / len(rows) * 1e3:.0f} ms per template (production {t_prod * 1e3:.0f}); "
+                      f"gpu pool {mem:.1f} GB {direct.last_stats}", flush=True)
+                for k in [lab for lab in LABELS if lab in T]:
+                    print(f"  {k:48s} {T[k] / len(rows) * 1e3:8.1f} ms per template  ({C[k]} calls)", flush=True)
+                stages = {k.strip(): T[k] / len(rows) * 1e3 for k in LABELS if k in T}
+                record(**base, thr=thr, grid=grid, chunk=chunk, rows=len(rows),
+                       modes=direct.last_stats.get("modes"), n_response=direct.last_stats.get("n_response"),
+                       ms_per_template=t_b / len(rows) * 1e3, production_ms=t_prod * 1e3, gpu_pool_gb=mem,
+                       stages_ms=stages)
+                summary[(grid, chunk)] = t_b / len(rows) * 1e3
+        cols = [0] + (chunks if args.batch_rows > 0 else [])
+        head = "  ".join(f"{('single' if c == 0 else f'{c}/call'):>8s}" for c in cols)
+        print(f"\n[summary] {args.days:g} d thr={thr:g}: ms per template (production {t_prod * 1e3:.0f})\n"
+              f"  {'grid':8s}{head}", flush=True)
+        for grid in directs:
+            print(f"  {grid:8s}" + "  ".join(f"{summary.get((grid, c), float('nan')):8.0f}" for c in cols), flush=True)
 
 
 if __name__ == "__main__":
