@@ -39,10 +39,10 @@ equal-arm ends REF + 697.9 d, so 720 d needs a brick or a placement that fits).
 
     # cluster (one GPU; see submit_mbh_batched_gpu_benchmark.sh)
     python scripts/mbh/mbh_batched_gpu_benchmark.py --backend cuda13x --out-dir OUT
-    # one duration of scripts/mbh/mbh_speed_durations.sh (Nt = days * 24 one-hour layers)
-    python scripts/mbh/mbh_batched_gpu_benchmark.py --backend cuda13x --nt 8640 \
+    # scripts/mbh/mbh_speed_durations.sh's speed step: the merger-centred 120-d grid
+    python scripts/mbh/mbh_batched_gpu_benchmark.py --backend cuda13x --nt 2880 --merger-day 100 \
         --batch-sizes 1,2,4,8,16,32 --stock-orders 8 --stock-T-days default,window \
-        --orbits auto --out-dir OUT --tag 360d --jsonl OUT/speed.jsonl --strict
+        --orbits auto --out-dir OUT --tag src16 --jsonl OUT/speed.jsonl --strict
     # laptop smoke (tiny CPU grid, a few minutes, < 3 GB RSS)
     python scripts/mbh/mbh_batched_gpu_benchmark.py --smoke --backend cpu
 
@@ -59,11 +59,13 @@ harness does: ``--l1-dir``, MOJITO_LIGHT_PATH/data/MBHB/L1, then recursively
 MOJITO_DATA_PATH, MOJITO_INFO_PATH, the catalogue's root) supplies the orbits --
 its light-travel times read over the grid's span only (``WindowedL1Orbits`` of
 mbh_batched_mojito_check.py: exact inside the slice, the full-mission 25 M x 6
-ltt table never enters memory) -- AND the time frame: the window starts
-``--start-offset-s`` (START_OFFSET_S, 5e4 s) after the brick's start, the
-catalogue places the merger, and a merger outside ``[start, end + 7 d)`` (the
-production admission rule) exits 4 (NOT ADMITTED). ``auto`` without a brick
-falls back to equal-arm.
+ltt table never enters memory) -- AND the time frame. With ``--merger-day``
+(mbh_speed_durations.sh: 100 d into a 120-d grid) the grid is merger-centred:
+it starts that long before the catalogue merger, shifted into the brick near
+its ends. Without it the window starts ``--start-offset-s`` (START_OFFSET_S,
+5e4 s) after the brick's start, the catalogue places the merger, and a merger
+outside ``[start, end + 7 d)`` (the production admission rule) exits 4 (NOT
+ADMITTED). ``auto`` without a brick falls back to equal-arm.
 
 The residual content does not affect cost: every container holds the injected
 stock template (the same source), so near-truth rows score near logL = 0,
@@ -197,7 +199,9 @@ def parse_args(argv=None):
     src.add_argument("--source-id", type=int, default=16, help="mojito MBHB id (16, 17 hardcoded)")
     src.add_argument("--catalogue", help="mojito MBHB catalogue hdf5 (reads Binaries/<key>[source-id])")
     src.add_argument("--epoch", type=float, default=REF_EPOCH, help="waveform_t0 (t_plunge epoch)")
-    src.add_argument("--merger-day", type=float, help="merger position in the grid (default: mid-grid)")
+    src.add_argument("--merger-day", type=float,
+                     help="merger position in the grid (default: mid-grid; with a brick: centre the grid on "
+                          "the catalogue merger this far in, shifted into the file near its ends)")
     src.add_argument("--snap-frac", type=float, default=0.2,
                      help="data_t0 offset from the epoch lattice, in dt (0.2 -> +0.5 s at 2.5 s, as mojito)")
     src.add_argument("--orbits", default="equal-arm", choices=("equal-arm", "auto", "l1"),
@@ -700,13 +704,26 @@ def _place_on_brick(ctx, args, path):
     catalogue puts it and must pass the production admission rule (else NotAdmitted)."""
     camp = _campaign()
     t0_file, dt_file, size = camp.file_sampling(path)
+    t_m = ctx.epoch + float(ctx.truth[10])
+    if args.merger_day is not None:
+        # merger-centred (the campaign's ``centered`` placement): the grid starts
+        # --merger-day before the merger, shifted into the file near its ends
+        i0 = int(round((t_m - float(args.merger_day) * DAY - t0_file) / ctx.dt))
+        hi = int(size * dt_file / ctx.dt) - ctx.N - int(round(camp.CENTERED_END_GUARD_S / ctx.dt))
+        if hi < 0:
+            raise SystemExit(f"{os.path.basename(path)} holds {size * dt_file / DAY:.2f} d: a "
+                             f"{ctx.Tobs / DAY:.2f}-d grid does not fit")
+        i0 = min(max(i0, 0), hi)
+        ctx.brick_t0, ctx.start_offset_s = t0_file, i0 * ctx.dt
+        ctx.placement_note = (f"brick, merger-centred: merger {(t_m - t0_file - i0 * ctx.dt) / DAY:.2f} d in "
+                              f"(asked {float(args.merger_day):g})")
+        return t0_file + i0 * ctx.dt
     i0 = int(round(float(args.start_offset_s) / ctx.dt))
     if i0 < 0 or (i0 + ctx.N) * ctx.dt > size * dt_file + 1e-6:
         raise SystemExit(
             f"{os.path.basename(path)} holds {size * dt_file / DAY:.2f} d: a {ctx.Tobs / DAY:.2f}-d window "
             f"starting {i0 * ctx.dt:.0f} s in does not fit")
     data_t0 = t0_file + i0 * ctx.dt
-    t_m = ctx.epoch + float(ctx.truth[10])
     buffer = camp.production_knobs(None)["merger_time_buffer"]
     if not data_t0 <= t_m < data_t0 + ctx.Tobs + buffer:
         raise NotAdmitted(
@@ -751,10 +768,8 @@ def build_context(args):
     ctx.brick = resolve_brick(args)
     ctx.brick_t0 = ctx.start_offset_s = None
     if ctx.brick is not None:
-        # a mojito brick: its orbits AND its time frame (the EMRI harness's run box)
-        if args.merger_day is not None:
-            raise SystemExit("--merger-day places a synthetic grid; with an L1 brick the window starts "
-                             "--start-offset-s after the brick start and the catalogue places the merger")
+        # a mojito brick: its orbits AND its time frame; --merger-day centres the grid on
+        # the catalogue merger, else it starts --start-offset-s after the brick start
         ctx.data_t0 = _place_on_brick(ctx, args, ctx.brick)
     else:
         # data_t0: merger at ``merger_day`` into the grid; data_t0 sits snap_frac*dt

@@ -49,14 +49,15 @@ move's MBH_CHECK_LL_TOL) and mismatch < --mm-tol (1e-6); one line
 line per (row, reference) and one ``kind=accuracy_source`` line; ``--strict`` exits 3 on
 FAIL.
 
-    # cluster (one GPU), 12-month grid, mojito MBHB id 17, equal-arm orbits, merger mid-grid
-    python scripts/mbh/mbh_batched_accuracy.py --backend cuda13x --nt 8640 --source-id 17 \\
-        --jsonl OUT/accuracy.jsonl --strict
+    # cluster (one GPU), the merger-centred 120-d grid (merger 100 d in), mojito MBHB id 17,
+    # equal-arm orbits
+    python scripts/mbh/mbh_batched_accuracy.py --backend cuda13x --nt 2880 --merger-day 100 \\
+        --source-id 17 --jsonl OUT/accuracy.jsonl --strict
     # the source's own mojito brick: its L1 orbits (windowed ltt read) and its time frame
-    # (window START_OFFSET_S = 5e4 s after its start; a merger the window does not admit
-    # prints SKIPPED and exits 0)
+    # (the grid centred on the catalogue merger, shifted into the file near its ends)
     MOJITO_DATA_PATH=/shared/data/mojito_cache python scripts/mbh/mbh_batched_accuracy.py \\
-        --backend cuda13x --nt 4320 --source-id 16 --orbits auto --jsonl OUT/accuracy.jsonl --strict
+        --backend cuda13x --nt 2880 --merger-day 100 --source-id 16 --orbits auto \\
+        --jsonl OUT/accuracy.jsonl --strict
     # laptop smoke (the benchmark's tiny CPU grid, truth + one near row, < 3 GB RSS)
     python scripts/mbh/mbh_batched_accuracy.py --smoke --backend cpu
 

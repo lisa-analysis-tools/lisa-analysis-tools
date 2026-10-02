@@ -51,8 +51,13 @@ mbh_speed_durations.sh use 2.5e-4):
                REF + 730.5 d and the EMRI harness's check_window (run on every real window)
                wants the window end + 4e4 s inside the ltt table.
 * ``centered`` ``--window-days`` (default 120) with the catalogue merger ``--merger-at-days``
-               (default 100) in: the mbh_batched_mojito_check.py placement. A window that
-               the file cannot hold is recorded as ``skipped_window_outside_file``.
+               (default 100) in: the mbh_batched_mojito_check.py placement and THE MBH
+               harness window (mbh_speed_durations.sh's data step) -- the batched template's
+               90 d before / 10 d after the merger + margins + pads + edge crop fit inside.
+               A merger within 100 d of the file start (or 20 d + 1 d of its end) SHIFTS
+               the window into the file (the merger moves off 100 d; the batched window
+               clamps to the active box as production clamps at the data edges); only a
+               file shorter than the window is ``skipped_window_outside_file``.
 A source whose merger violates the production admission rule
 ``window_start <= t_merge < window_end + MBH_MERGER_TIME_BUFFER`` (7 d) is recorded as
 ``skipped_outside_window`` (not an error; production drops it from the MBH branch).
@@ -141,6 +146,8 @@ WINDOWS = {"6mo": TOBS_6MO, "24mo": 4 * TOBS_6MO}
 ALL_WINDOWS = ("6mo", "24mo", "centered")
 #: '<N>d': N days from the file start, placed as production (like 6mo / 24mo)
 DAYS_WINDOW = re.compile(r"^([0-9]+(?:\.[0-9]+)?)d$")
+#: a centered window shifted against the file end stops this far before it (ltt table cover)
+CENTERED_END_GUARD_S = 86400.0
 
 
 def file_start_tobs(window):
@@ -312,8 +319,19 @@ def placement(window, args, ref, file_t0, file_size, t_merge_rel, merger_buffer)
             " (all_sources mojito loader, window_start_offset=0)" if start == 0 else " (--start-offset-s)"))
     else:
         nt = int(round(args.window_days * 86400.0 / layer))
+        nt -= nt % 2
         start = int(round((ref + t_merge_rel - args.merger_at_days * 86400.0 - file_t0) / DT))
         how = f"catalogue merger {args.merger_at_days:g} d in (mbh_batched_mojito_check placement)"
+        # a merger too near either end of the file: SHIFT the window into the file (the
+        # merger stays inside it; the batched window clamps to the active box, as production
+        # clamps at the data edges) rather than dropping the source. The end keeps
+        # CENTERED_END_GUARD_S clear so the ltt table (REF + 730.5 d on the 731-d bricks)
+        # covers the window end + the production wrapper's 4e4 s (check_window).
+        hi = file_size - args.nf * nt - int(round(CENTERED_END_GUARD_S / DT))
+        if 0 <= hi and not 0 <= start <= hi:
+            start = min(max(start, 0), hi)
+            how += (f"; SHIFTED into the file: merger "
+                    f"{(ref + t_merge_rel - file_t0 - start * DT) / 86400.0:.2f} d in")
     nt -= nt % 2   # WDMSettings needs an even layer count
     n = args.nf * nt
     window_t0 = file_t0 + start * DT

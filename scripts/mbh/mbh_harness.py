@@ -44,11 +44,11 @@ DIFFERS_FROM_EMRI = (
     "gates on the 90-d one",
     "extras: band residual SNRs, kept-box geometry, the reference's power outside the kept box, the "
     "pairwise prod90 comparisons",
-    "placement: production MBH starts the data window AT the brick start (offset 0); this harness uses "
-    "START_OFFSET_S (5e4 s) like EMRI -- it changes only which mergers are admitted",
-    "no brick: the merger is placed mid-grid (an MBH merger must be inside the window; EMRI places at "
-    "REF + START_OFFSET_S); speed / accuracy score injected noiseless stock templates, the mojito "
-    "stream is scored in the separate data step (mbh_cd1l_campaign.py)",
+    "grid: ONE merger-centred grid (WINDOW_DAYS 120 d, the merger MERGER_AT_DAYS 100 d in; shifted into "
+    "the brick near its ends) instead of EMRI's 180 / 360 / 720-d sweep from START_OFFSET_S: an MBH "
+    "template is always the 90 d before / 10 d after its merger, whatever the data length",
+    "templates: speed / accuracy score injected noiseless stock templates; the mojito stream is scored "
+    "in the separate data step (mbh_cd1l_campaign.py --window centered)",
 )
 
 

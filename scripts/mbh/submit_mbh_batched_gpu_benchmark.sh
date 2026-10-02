@@ -24,7 +24,7 @@
 #       L1 orbits + time frame (window START_OFFSET_S = 5e4 s after its start)
 # Since 2026-10-02 the defaults are the v9 launcher's MIN_FREQ 2.5e-4 (job 677: 4e-4) and the
 # noise includes the fitted tanh galactic foreground (--foreground off = job 677's weighting).
-# The whole 6/12/24-month sweep with accuracy and mojito data: scripts/mbh/mbh_speed_durations.sh.
+# Speed + accuracy + mojito data on the merger-centred window: scripts/mbh/mbh_speed_durations.sh.
 # ============================================================================
 
 #SBATCH --job-name=mbhbench

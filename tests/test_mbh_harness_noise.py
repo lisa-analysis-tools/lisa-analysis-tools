@@ -7,7 +7,7 @@ weights every inner product of the speed / accuracy / data harness
 ``XYZ2SensitivityMatrix(dom, model="scirdv1", stochastic_params=(Tobs,))`` -- SciRD v1 XYZ
 (TDI-2) plus ``FittedHyperbolicTangentGalacticForeground`` at the grid's ``Tobs = Nf * Nt *
 dt`` (the stock erebor convention). Pinned on the harness grid (Nf 1440, dt 2.5 s, BAND
-0.25-25 mHz) at the harness durations 180 / 360 / 720 d -- a wide edge crop leaves 8 active
+0.25-25 mHz) at three Tobs, 180 / 360 / 720 d -- a wide edge crop leaves 8 active
 time layers so the matrices stay small: the foreground IS the fitted tanh model, raises the
 PSD at 0.3-3 mHz, is absent above 10 mHz, falls with Tobs at the knee (the fitted knee moves
 down as more binaries are resolved), uses the grid's own Tobs and is recorded so, ``off`` is
