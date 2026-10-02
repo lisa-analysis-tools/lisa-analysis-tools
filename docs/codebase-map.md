@@ -38,6 +38,8 @@ package.
 | `diagnostic.py` | `inner_product`, likelihood terms, information matrix `info_matrix`/`covariance`, SNR, Cutler–Vallisneri bias. |
 | `stochastic.py` | Stochastic foregrounds/SGWB (`FittedHyperbolicTangentGalacticForeground`, `PowerLawSGWB`, …). |
 | `chunked_het.py` | `WDMComputationsBase` — source-agnostic chunked-heterodyne WDM likelihood base (GB/SOBBH subclass it downstream). |
+| `wdm_lookup_eval.py` | `WDMLookupEvaluator` — vectorized (numpy/cupy) evaluation of an `n_ref` WDM lookup table with the quarter-turn rule (linear / Keys cubic). |
+| `sources/sobbh/wdm_direct.py` | SOBBH direct-to-WDM: batched 3.5PN, batched TDI-on-the-fly, tracer, sparse lookup template, sparse inner products / fill, and `SOBBHLookupComputations` (the `SOBBH_LIKELIHOOD=lookup` comp for `SOBBHChunkedLikeMove`). |
 | `wdm_het.py` / `signal_het.py` | WDM chunk geometry / window / layer-grouping helpers; sparse-time signal-heterodyne helpers. |
 | `response/` | LISA-response Python frontends (absorbed from `fastlisaresponse`): `parallelbase`, `tdiconfig`, `directresponse` (`pyResponseTDI`, `ResponseWrapper`), `tdionfly` (`TDIonTheFly` family + GB/SOBBH/FD variants). |
 | `jax/` | Pure-JAX backend (`backend.py`, `jaxbase.py`, `orbits.py`) + `response/` and `wdm/` JAX mirrors. |
