@@ -107,6 +107,30 @@ def load_source(src, backend, span, catalog=None, l1_dir=None, orbits="auto"):
     return params, data_t0, orb
 
 
+_SNR_BOX = {}
+
+
+def opt_snr(arr, dt, backend, edge=60, min_freq=2.5e-4, max_freq=2.5e-2):
+    """Optimal SNR sqrt(<h|h>) of a full-grid WDM template ``arr`` (3 channels X, Y, Z, Nf, Nt)
+    on the fit's run box: layers min_freq..max_freq, ``edge`` pixels cropped at each grid end
+    (the launcher's EDGE_CROP_WAVELETS), against the scirdv1 XYZ sensitivity -- the fit wiring
+    check's noise model, NOT the run's fitted PSD (no galactic foreground)."""
+    from lisatools.analysiscontainer import AnalysisContainer
+    from lisatools.domains import WDMSettings, WDMSignal
+    from lisatools.sensitivity import XYZ2SensitivityMatrix
+
+    nch, nf, nt = (int(v) for v in arr.shape)
+    key = (nf, nt, float(dt), backend, int(edge), float(min_freq), float(max_freq))
+    if key not in _SNR_BOX:
+        layer = nf * dt
+        dom = WDMSettings(nf, nt, dt, min_freq=min_freq, max_freq=max_freq, min_time=edge * layer,
+                          max_time=(nt - edge) * layer, force_backend=backend)
+        _SNR_BOX[key] = (dom, XYZ2SensitivityMatrix(dom, model="scirdv1"))
+    dom, sens = _SNR_BOX[key]
+    box = dom.xp.ascontiguousarray(dom.xp.asarray(arr)[:, dom.active_slice_f, dom.active_slice_t])
+    return float(np.sqrt(np.real(AnalysisContainer(WDMSignal(box, dom), sens).inner_product())))
+
+
 def batch_rows(params, n_rows, seed=11):
     """Information-matrix rows (+/- a step per parameter; x0 held) then jittered walker rows."""
     p = np.asarray(params, dtype=float)

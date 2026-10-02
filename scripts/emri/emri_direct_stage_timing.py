@@ -12,7 +12,9 @@ Sweeps in ONE process (FEW and the table load once): ``--response-grid sparse,pi
 dense response's grid), ``--lookup kernel,python`` (the fused C++/CUDA lookup-sum kernel vs the
 Python tracer + table + scatter-add) and ``--chunk-rows 1,2,4,8,16,32`` (rows per response call,
 timed over ``--batch-rows`` rows each). ``--band-hz 2.5e-4,2.5e-2`` builds the batch on the
-run's active band only (as the fit's adapter does). Each (threshold, grid, chunk) prints its stage split and, on a GPU,
+run's active band only (as the fit's adapter does). Per threshold it prints the source's optimal
+SNR (production template, and each direct template) on the fit's run box -- 0.25-25 mHz, ``--edge``
+pixels cropped at each end -- against the scirdv1 XYZ sensitivity (no galactic foreground). Each (threshold, grid, chunk) prints its stage split and, on a GPU,
 the cupy memory-pool footprint of that batch; ``--out`` appends one JSON line per run and a
 summary table (ms per template vs rows per call) closes each threshold.
 """
@@ -54,6 +56,8 @@ def main():
                     help="lookup path(s): kernel, python, or a comma list of both")
     ap.add_argument("--band-hz", default="",
                     help="f_lo,f_hi [Hz]: batch output restricted to these layers (default: all)")
+    ap.add_argument("--edge", type=int, default=60,
+                    help="pixels cropped at each grid end for the SNR box (the launcher's EDGE_CROP_WAVELETS)")
     ap.add_argument("--out", default=None, help="append one JSON line per (threshold, grid, lookup, chunk) here")
     ap.add_argument("--response", choices=("spline", "dense"), default="dense",
                     help="TDI-on-the-fly response: 'dense' (TDDenseTDIonTheFly: exact phases, geometry shared "
@@ -159,7 +163,9 @@ def main():
     base = dict(src=args.src, days=args.days, dt=args.dt, nf=nf, nt=nt, backend=args.backend,
                 response=args.response, band=band)
     for thr in [float(x) for x in args.thresh.split(",")]:
-        prod(thr)                                                        # warm-up
+        snr = {"production": B.opt_snr(prod(thr), args.dt, args.backend, edge=args.edge)}   # + warm-up
+        print(f"\n[snr] {args.days:g} d thr={thr:g}: production optimal SNR {snr['production']:.3f} "
+              f"(scirdv1 XYZ, 0.25-25 mHz, {args.edge} px edges cropped)", flush=True)
         sync()
         t0 = time.perf_counter()
         for _ in range(args.reps):
@@ -168,7 +174,8 @@ def main():
         t_prod = (time.perf_counter() - t0) / args.reps
         summary = {}
         for grid, direct in directs.items():
-            direct(*params, mode_selection_threshold=thr)               # warm-up
+            snr[grid] = B.opt_snr(direct(*params, mode_selection_threshold=thr).arr, args.dt, args.backend,
+                                  edge=args.edge)                        # + warm-up
             sync()
             T.clear()
             C.clear()
@@ -179,14 +186,15 @@ def main():
             t_dir = (time.perf_counter() - t0) / args.reps
             print(f"\n[stages] response={args.response} grid/lookup={grid} thr={thr:g} modes={direct.last_stats.get('modes')} "
                   f"n_fine={direct.last_stats.get('n_fine')} backend={args.backend} grid Nf={nf} Nt={nt} dt={args.dt} "
-                  f"({args.days:g} d): direct {t_dir * 1e3:.0f} ms, production {t_prod * 1e3:.0f} ms (per template)",
-                  flush=True)
+                  f"({args.days:g} d): direct {t_dir * 1e3:.0f} ms, production {t_prod * 1e3:.0f} ms (per template); "
+                  f"SNR direct {snr[grid]:.3f} production {snr['production']:.3f}", flush=True)
             for k in [lab for lab in LABELS if lab in T]:
                 print(f"  {k:48s} {T[k] / args.reps * 1e3:8.1f} ms  ({C[k] // args.reps} calls)", flush=True)
             stages = {k.strip(): T[k] / args.reps * 1e3 for k in LABELS if k in T}
             record(**base, thr=thr, grid=grid, chunk=0, rows=1, modes=direct.last_stats.get("modes"),
                    n_response=direct.last_stats.get("n_fine"), ms_per_template=t_dir * 1e3,
-                   production_ms=t_prod * 1e3, stages_ms=stages)
+                   production_ms=t_prod * 1e3, stages_ms=stages, snr_direct=snr[grid],
+                   snr_production=snr["production"], snr_edge=args.edge)
             summary[(grid, 0)] = t_dir * 1e3
             if args.batch_rows <= 0:
                 continue
@@ -221,6 +229,9 @@ def main():
               f"  {'grid/lookup':16s}{head}", flush=True)
         for grid in directs:
             print(f"  {grid:16s}" + "  ".join(f"{summary.get((grid, c), float('nan')):8.0f}" for c in cols), flush=True)
+        print(f"  optimal SNR (scirdv1 XYZ, 0.25-25 mHz, {args.edge} px edges cropped): production "
+              f"{snr['production']:.3f}; " + ", ".join(f"{g} {snr[g]:.3f} (ratio {snr[g] / snr['production']:.6f})"
+                                                       for g in directs), flush=True)
 
 
 if __name__ == "__main__":

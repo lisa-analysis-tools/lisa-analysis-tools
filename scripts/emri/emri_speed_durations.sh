@@ -12,12 +12,15 @@
 #      threshold, and one JSON line per run in ${OUT}/stages.jsonl.
 #   2. emri_direct_sparse_check.py: mismatch sparse-vs-pixels and both vs production on the
 #      grid of that duration, plus single and batched ms per template.
+#   Both print the source's optimal SNR at that duration (production and direct templates) on
+#   the fit's run box: 0.25-25 mHz, EDGE pixels cropped at each end, scirdv1 XYZ sensitivity
+#   (no galactic foreground).
 #
 #   salloc ... (1 GPU), then from the repo root:
 #       bash scripts/emri/emri_speed_durations.sh
 #   knobs (env): BACKEND (cuda13x), DAYS ("180 365 730"), THRESH ("1e-3,1e-5"), SRC (1),
 #   TABLE, CATALOG, ORBITS (equal-arm), CHUNKS ("1,2,4,8,16,32"), ROWS (32), GRIDS
-#   ("sparse,pixels"), LOOKUPS ("kernel,python"), BAND ("2.5e-4,2.5e-2"; "" = all layers),
+#   ("sparse,pixels"), LOOKUPS ("kernel,python"), BAND ("2.5e-4,2.5e-2"; "" = all layers), EDGE (60),
 #   REPS (3), OUT (emri_speed_durations_<date>).
 #
 # Memory: a direct template holds a (3, n_m, Nt) float64 accumulator while it is built: on the
@@ -38,13 +41,14 @@ ROWS=${ROWS:-32}
 GRIDS=${GRIDS:-sparse,pixels}
 LOOKUPS=${LOOKUPS:-kernel,python}
 BAND=${BAND-2.5e-4,2.5e-2}
+EDGE=${EDGE:-60}
 REPS=${REPS:-3}
 OUT=${OUT:-emri_speed_durations_$(date +%Y%m%d_%H%M)}
 mkdir -p "${OUT}"
 [ -f "${TABLE}" ] || { echo "[durations] lookup table ${TABLE} not found (set TABLE=...)"; exit 2; }
 
 common=(--backend "${BACKEND}" --dt 2.5 --src "${SRC}" --direct-table "${TABLE}"
-        --catalog "${CATALOG}" --orbits "${ORBITS}")
+        --catalog "${CATALOG}" --orbits "${ORBITS}" --edge "${EDGE}")
 for days in ${DAYS}; do
   log="${OUT}/stages_${days}d.log"
   echo "[durations] ${days} d: grids ${GRIDS}, lookups ${LOOKUPS}, band ${BAND:-all}, rows per call ${CHUNKS} over ${ROWS} rows -> ${log}"
@@ -53,6 +57,7 @@ for days in ${DAYS}; do
     --batch-rows "${ROWS}" --chunk-rows "${CHUNKS}" \
     --reps "${REPS}" --out "${OUT}/stages.jsonl" 2>&1 | grep -v "ModeSelector\|lisaconstants\|warnings.warn" \
     > "${log}" || echo "[durations] FAILED: ${log}"
+  grep "^\[snr\]" "${log}" || true
   sed -n '/^\[summary\]/,/^$/p' "${log}" || true
   log="${OUT}/accuracy_${days}d.log"
   echo "[durations] ${days} d accuracy sparse vs pixels vs production -> ${log}"

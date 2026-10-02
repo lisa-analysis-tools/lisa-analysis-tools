@@ -3,7 +3,9 @@ dense-output carrier at the pixels) vs the response on the PIXEL grid (one sampl
 whole phase splined) vs production, on a CD1L source.
 
 Reports per channel the mismatch sparse-vs-pixels and both vs production (active box), the
-response points, and the wall time per template single and batched.
+response points, the wall time per template single and batched, and the optimal SNR of the
+production and both direct templates on the fit's run box (0.25-25 mHz, ``--edge`` pixels
+cropped at each end; scirdv1 XYZ sensitivity, no galactic foreground).
 
 laptop (CPU, the 20 s table)::
 
@@ -42,6 +44,8 @@ def main():
     ap.add_argument("--thresh", default="1e-3")
     ap.add_argument("--rows", type=int, default=4, help="templates timed (batched in one call)")
     ap.add_argument("--sparse-dt", type=float, default=43200.0)
+    ap.add_argument("--edge", type=int, default=60,
+                    help="pixels cropped at each grid end for the SNR box (the launcher's EDGE_CROP_WAVELETS)")
     args = ap.parse_args()
 
     from lisatools.domains import TDSettings, TDSignal, WDMLookupTable, WDMSettings
@@ -98,7 +102,8 @@ def main():
         xp = cp if gpu else np
         h = xp.stack([xp.asarray(c) for c in h]) if isinstance(h, (list, tuple)) else xp.atleast_2d(h)
         h_prod = host(TDSignal(h[:3, oi:oi + n], tds).transform(wdm).arr)
-        rec = dict(src=args.src, days=args.days, dt=args.dt, thr=thr, backend=args.backend)
+        rec = dict(src=args.src, days=args.days, dt=args.dt, thr=thr, backend=args.backend,
+                   snr_production=S.opt_snr(h_prod, args.dt, args.backend, edge=args.edge), snr_edge=args.edge)
         tmpl = {}
         for g, d in gens.items():
             d(*params, mode_selection_threshold=thr)                     # warm-up
@@ -109,6 +114,7 @@ def main():
             rec[f"{g}_single_ms"] = 1e3 * (time.perf_counter() - t0)
             rec[f"{g}_n_response"] = int(d.n_fine)
             rec[f"{g}_mm_vs_prod"] = mm(tmpl[g], h_prod)
+            rec[f"{g}_snr"] = S.opt_snr(tmpl[g], args.dt, args.backend, edge=args.edge)
             sync()
             t0 = time.perf_counter()
             d.batch(rows, chunk_rows=len(rows), mode_selection_threshold=thr)
@@ -125,6 +131,9 @@ def main():
               f"{rec['sparse_single_ms']:.0f} | batch of {len(rows)}: pixels "
               f"{rec['pixels_batch_ms_per_template']:.0f}, sparse {rec['sparse_batch_ms_per_template']:.0f}",
               flush=True)
+        print(f"[sparse] thr={thr:g} optimal SNR ({args.days:g} d; scirdv1 XYZ, 0.25-25 mHz, {args.edge} px "
+              f"edges cropped): production {rec['snr_production']:.3f}, pixels {rec['pixels_snr']:.3f}, "
+              f"sparse {rec['sparse_snr']:.3f}", flush=True)
         print(json.dumps(rec), flush=True)
 
 
