@@ -158,6 +158,32 @@ More CPU checks (10-01):
 
 Lookup memory: the table call is chunked (`EMRI_DIRECT_LOOKUP_CHUNK`, default 2e6 entries).
 
+## Sparse response grid (10-02, default with `response="dense"`)
+
+The response no longer needs one sample per pixel. `EMRIDirectWDM(response_grid="sparse")`
+(default; `EMRI_DIRECT_RESPONSE_GRID=pixels` restores the old grid) evaluates the dense kernel on
+the integrator knots plus a point every `sparse_dt` (43200 s; `EMRI_DIRECT_SPARSE_DT`) and
+reads the pixels through `ExactPhaseTDIOutput`: channel phase = the harmonic's EXACT dense-output
+carrier `Phi_s(t)` (same coefficients as the kernel) + a splined residual `r = tdi_phase +
+phase_ref - Phi_s` (Doppler delay to spacecraft 1, polarisation and transfer-function phase, the
+mode amplitude's phase), amplitude splined; `f`, `fdot` from the same total phase. Only slow
+quantities are splined, so the grid follows the trajectory, not the pixels.
+
+The grid must stay where the response is COMPLETE (`sparse_response_grid`): a delay margin
+(600 s) inside the trajectory and inside the orbit tables (`_orbit_span`). Outside either the
+kernel zeroes the channel, and a half-day spline across that edge rings into the window
+(measured: 2 % amplitude two intervals in at a trajectory end; 4e-4 rad at the first pixels of a
+laptop-trimmed L1 table). An in-window plunge keeps the 80 s segment. Batched templates get their
+own grids, padded to a common length by halving their widest intervals (`pad_grid`).
+
+| check | result |
+|---|---|
+| synthetic, 12 h knots vs 60 s grid (phase / f / fdot / amp) | 8e-9 rad / 4e-12 Hz / 4e-15 Hz/s / 1.4e-8 |
+| power-law chirp (all polynomial orders), 6 h knots | exact carrier 1.6e-6 rad vs whole-phase spline 7.3e-4 |
+| CD1L EMRI 1, 16 d, 20 s, CPU: response points | 388 -> 37 |
+| same, mismatch vs production (fit domain, sensitivity-weighted) | 2.386e-8, identical to the pixel grid; dlogL 1.8e-6 |
+| same, s/row (fit wiring check, CPU) | direct 0.66 vs production 1.33 |
+
 ## In the global fit: `EMRI_LIKELIHOOD=direct` (10-02)
 
 `emri_pe` becomes `EMRIDirectLikeMove` (`globalfit/moves/emridirectmove.py`), built by

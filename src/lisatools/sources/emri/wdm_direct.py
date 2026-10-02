@@ -403,6 +403,100 @@ def dense_phase_eval(t_k, C, t):
     return c[..., 0] + s * (c[..., 1] + s1 * (c[..., 2] + s * (c[..., 3] + s1 * (c[..., 4] + s * (c[..., 5] + s1 * (c[..., 6] + s * c[..., 7]))))))
 
 
+def sparse_response_grid(knots, a, b, sparse_dt, margin):
+    """Sparse response times over ``[a, b]``, kept where the response is COMPLETE.
+
+    The knots inside, plus a point every ``sparse_dt`` at most, restricted to ``[knots[0] +
+    margin, knots[-1] - margin]``: at a time within ``margin`` (the TDI delay margin) of a
+    trajectory end some delayed source times fall outside the trajectory and the channel
+    amplitude drops to zero there. A cubic spline over half-day intervals across that drop
+    rings back into the interior (2 % in amplitude, 0.3 rad in phase two intervals in), so the
+    sparse grid must never contain such a point; an in-window plunge is resolved by the dense
+    ``fine_dt_plunge`` segment instead."""
+    knots = np.asarray(knots, dtype=float)
+    lo = max(float(a), float(knots[0]) + margin)
+    hi = min(float(b), float(knots[-1]) - margin)
+    if hi <= lo:
+        return np.array([lo, lo + 1.0])
+    inner = knots[(knots > lo) & (knots < hi)]
+    return np.union1d(np.append(np.arange(lo, hi, sparse_dt), hi), inner)
+
+
+def pad_grid(g, N):
+    """``g`` grown to ``N`` points by halving its longest intervals (stays inside ``g``'s span:
+    a template's grid is padded to the batch's common length without leaving the region where
+    its response is complete)."""
+    g = np.asarray(g, dtype=float)
+    while g.size < N:
+        d = np.diff(g)
+        k = min(N - g.size, d.size)
+        widest = np.argsort(d)[::-1][:k]
+        g = np.sort(np.concatenate([g, g[widest] + 0.5 * d[widest]]))
+    return g
+
+
+class ExactPhaseTDIOutput:
+    """A dense TDI response computed on a SPARSE time grid, evaluated anywhere with the
+    harmonic's EXACT carrier phase.
+
+    The channel signal of harmonic ``s`` is ``amp(t) exp(-i (Phi_s(t) + r(t)))``. ``Phi_s =
+    m Phi_phi + k Phi_theta + n Phi_r`` is the DOPR853 dense-output carrier, exact at any time
+    from the same coefficients the kernel uses (held at the trajectory end outside it, as the
+    kernel holds its reference phase). Everything else is slow -- the TDI amplitude and the
+    residual ``r = tdi_phase + phase_ref - Phi_s`` (the Doppler delay to spacecraft 1, the
+    polarisation and transfer-function phase, the mode amplitude's own phase) -- so only
+    ``amp`` and ``r`` are splined over the response grid. The response therefore needs only
+    the trajectory's own knots plus a spacing cap, not one sample per pixel.
+
+    Duck-types what :func:`tracer_from_tof_output` and the plunge tail read from a
+    ``TDTDIOutput``: ``x``, ``xp``, ``eval_spline_vals(t)`` (``(amp, r, Phi)``, so ``r + Phi``
+    is the channel phase) and ``eval_tdi(t)``.
+    """
+
+    def __init__(self, out, t_knots, coeffs, sub_mkn, sub_temp):
+        self.xp = out.xp
+        self.x = out.x
+        self._t_knots = [np.asarray(tk, dtype=float) for tk in t_knots]       # absolute, per template
+        self._coeffs = [np.asarray(c, dtype=float) for c in coeffs]
+        self._mkn = np.asarray(sub_mkn, dtype=float).reshape(-1, 3)
+        self._temp = np.asarray(sub_temp, dtype=np.int64).reshape(-1)
+        self.nch = int(out.tdi_amp.shape[1])
+        x_host = np.asarray(out.x.get() if hasattr(out.x, "get") else out.x)
+        carrier = self.xp.empty(out.phase_ref.shape)
+        for b in range(len(self._t_knots)):
+            subs = np.flatnonzero(self._temp == b)
+            if subs.size:
+                carrier[self.xp.asarray(subs)] = self._carrier_rows(b, subs, x_host[subs[0]])
+        resid = out.tdi_phase + (out.phase_ref - carrier)[:, None, :]
+        self._amp_spl = out.build_spline(out.x, out.tdi_amp)
+        self._res_spl = out.build_spline(out.x, resid)
+
+    def _carrier_rows(self, b, subs, t):
+        """``Phi_s(t)`` for template ``b``'s harmonics ``subs`` at times ``t`` (1-D)."""
+        tk = self._t_knots[b]
+        P3 = dense_phase_eval(tk, self._coeffs[b], np.clip(np.asarray(t, dtype=float), tk[0], tk[-1]))
+        return self.xp.asarray(self._mkn[subs]) @ self.xp.asarray(P3.T)
+
+    def carrier(self, t):
+        """``Phi_s(t)`` for every harmonic at the shared times ``t``: ``(S, len(t))``."""
+        t_host = np.asarray(t.get() if hasattr(t, "get") else t, dtype=float)
+        out = self.xp.empty((self._mkn.shape[0], t_host.size))
+        for b in range(len(self._t_knots)):
+            subs = np.flatnonzero(self._temp == b)
+            if subs.size:
+                out[self.xp.asarray(subs)] = self._carrier_rows(b, subs, t_host)
+        return out
+
+    def eval_spline_vals(self, t):
+        t = self.xp.asarray(t, dtype=float)
+        tt = self.xp.tile(t, (self._mkn.shape[0], self.nch, 1))
+        return self._amp_spl(tt), self._res_spl(tt), self.carrier(t)
+
+    def eval_tdi(self, t):
+        amp, res, car = self.eval_spline_vals(t)
+        return self.xp.real(amp * self.xp.exp(-1j * (res + car[:, None, :])))
+
+
 def feed_from_tracks(tracks, amp_factor):
     """Per-sub (amp, phase) with h = sum amp exp(-i phase) from harmonic tracks on the feed grid.
 
@@ -471,6 +565,11 @@ class EMRIDirectWDM:
         pixel_edge: pixels dropped at each grid end (response spline support).
         interp: table interpolation (``"spline"`` default: uniform cubic B-spline, CPU and GPU;
             ``"cubic"`` scipy-only; ``None`` keeps the table's).
+        response_grid: with ``response="dense"``, where the response is evaluated:
+            ``"sparse"`` (default; env ``EMRI_DIRECT_RESPONSE_GRID``) the integrator knots plus a
+            point every ``sparse_dt`` s at most (default 43200; env ``EMRI_DIRECT_SPARSE_DT``),
+            with the exact dense-output carrier added at the pixels (:class:`ExactPhaseTDIOutput`);
+            ``"pixels"`` one sample per ``fine_dt`` with the whole phase splined.
     """
 
     #: TDI delay margin [s]: a source time contributes to response times up to this much later
@@ -479,7 +578,7 @@ class EMRIDirectWDM:
     def __init__(self, few_gen, table, wdm_set, *, orbits, tdi_config, t_start, data_t0,
                  Nt_sub=128, n_fine=None, fine_dt=3600.0, fine_dt_plunge=80.0, mode_batch=None,
                  pixel_edge=8, num_m_layers=2, interp="spline", force_backend="cpu", feed="knots",
-                 response="spline"):
+                 response="spline", response_grid=None, sparse_dt=None):
         self.few_gen, self.table, self.wdm = few_gen, table, wdm_set
         self.orbits, self.tdi_config = orbits, tdi_config
         self.t_start, self.data_t0 = float(t_start), float(data_t0)
@@ -503,6 +602,19 @@ class EMRIDirectWDM:
         self.response = response
         if response == "dense" and feed != "knots":
             raise ValueError("response='dense' needs feed='knots'")
+        # response="dense" only: "sparse" evaluates the response on the integrator knots plus
+        # a spacing cap (sparse_dt) and adds the exact dense-output carrier at the pixels
+        # (ExactPhaseTDIOutput); "pixels" evaluates it on the fine_dt grid and splines the
+        # whole channel phase (the original construction)
+        # (explicit argument > env EMRI_DIRECT_RESPONSE_GRID / EMRI_DIRECT_SPARSE_DT > default)
+        if response_grid is None:
+            response_grid = os.environ.get("EMRI_DIRECT_RESPONSE_GRID", "sparse")
+        if response_grid not in ("sparse", "pixels"):
+            raise ValueError("response_grid must be 'sparse' or 'pixels'")
+        self.response_grid = response_grid if response == "dense" else "pixels"
+        if sparse_dt is None:
+            sparse_dt = os.environ.get("EMRI_DIRECT_SPARSE_DT", 43200.0)
+        self.sparse_dt = float(sparse_dt)
         self.n_fine_fixed = int(n_fine) if n_fine is not None else None
         self.fine_dt, self.fine_dt_plunge = float(fine_dt), float(fine_dt_plunge)
         self.n_fine = self.n_fine_fixed or max(64, int(span / self.fine_dt_plunge))   # set per call
@@ -633,6 +745,42 @@ class EMRIDirectWDM:
         dense = np.append(np.arange(d0, b, self.fine_dt_plunge), b)
         return np.union1d(coarse[coarse < d0], dense)
 
+    def _orbit_span(self):
+        """Absolute times ``(t_lo, t_hi)`` the orbit tables cover (spacecraft positions AND
+        light travel times: the C++ response zeroes any time outside either)."""
+        span = getattr(self, "_orbit_span_cache", None)
+        if span is None:
+            args = getattr(self.orbits, "pycppdetector_args", None) if self.orbits is not None else None
+            if args is None:
+                span = (-np.inf, np.inf)
+            else:
+                sc_t0, sc_dt, sc_N, ltt_t0, ltt_dt, ltt_N = (float(v) for v in args[:6])
+                span = (max(sc_t0, ltt_t0), min(sc_t0 + (sc_N - 1) * sc_dt, ltt_t0 + (ltt_N - 1) * ltt_dt))
+            self._orbit_span_cache = span
+        return span
+
+    def _sparse_grid(self, H, chunk_start):
+        """Response times (FEW clock) for ``response_grid="sparse"``: the holder's integrator
+        knots over the window (plus margins), every ``sparse_dt`` at most in between (the
+        Doppler residual turns by up to ~1.4 rad/day at 25 mHz), and the ``fine_dt_plunge``
+        grid from a chunk length before ``chunk_start`` (the plunge chunk reads the response at
+        the sample rate there)."""
+        lo = self.data_t0 - self.t_start
+        span = self.wdm.Nt * self.wdm.layer_dt
+        a = max(0.0, lo - (self.DELAY_MARGIN + 2.0 * self.sparse_dt))
+        b = lo + span + 2000.0                                # = the integration span (T_traj)
+        # ... and inside the orbit tables: before/after them the kernel ZEROES the channel, and
+        # a half-day spline across that edge rings into the window (measured: 4e-4 rad at the
+        # first pixels on a laptop-trimmed L1 table)
+        o_lo, o_hi = self._orbit_span()
+        a = max(a, o_lo - self.t_start + self.DELAY_MARGIN)
+        b = min(b, o_hi - self.t_start - self.DELAY_MARGIN)
+        grid = sparse_response_grid(H.t_arr, a, b, self.sparse_dt, self.DELAY_MARGIN)
+        if chunk_start is not None:
+            d0 = max(a, chunk_start - self.Nt_sub * self.wdm.layer_dt)
+            grid = np.union1d(grid, np.append(np.arange(d0, b, self.fine_dt_plunge), b))
+        return grid
+
     def _knots_feed(self, H, few_args, t_fine, fly):
         """Response feed on ``t_fine`` from the knots holder ``H``: amplitudes splined over the
         knots, phases from the integrator's dense output (call right after H's FEW call: the
@@ -648,8 +796,12 @@ class EMRIDirectWDM:
         amp, ph = feed_from_tracks(tr, EMRITDIonFly.AMP_FACTOR)
         return fly.prepare_feed_arrays(t_src, amp, ph)
 
-    def _dense_response(self, items, t_fine):
-        """ONE TDDenseTDIonTheFly call for ``items`` = [(dense inputs, (psi, lam, beta)), ...]."""
+    def _dense_response(self, items, t_grid):
+        """ONE TDDenseTDIonTheFly call for ``items`` = [(dense inputs, (psi, lam, beta)), ...].
+
+        ``t_grid`` (FEW clock): one array shared by every template, or one array per template
+        (padded to a common length inside its span, :func:`pad_grid`). With ``response_grid="sparse"`` the result is
+        an :class:`ExactPhaseTDIOutput`, else the kernel's splined ``TDTDIOutput``."""
         from ...response.tdionfly import TDDenseTDIonTheFly
         from .emritdionfly import EMRITDIonFly
 
@@ -658,7 +810,7 @@ class EMRIDirectWDM:
         t_k = np.empty((n_temp, K))
         C = np.zeros((n_temp, K - 1, 3, 8))
         n_k = np.zeros(n_temp, dtype=np.int32)
-        mkn, are, aim, offs, par = [], [], [], [0], []
+        mkn, are, aim, offs, par, tk_abs, Cs = [], [], [], [0], [], [], []
         for b, ((tk, Cb, mk, ar, ai), (psi, lam, beta)) in enumerate(items):
             nk = tk.size
             tk = self.t_start + tk                                 # FEW clock -> absolute (the response's clock)
@@ -671,12 +823,22 @@ class EMRIDirectWDM:
             aim.append(np.pad(ai, pad))
             offs.append(offs[-1] + mk.shape[0])
             par.append((0.0, psi, lam, beta))
+            tk_abs.append(tk)
+            Cs.append(Cb)
+        if isinstance(t_grid, (list, tuple)):
+            N = max(int(np.size(g)) for g in t_grid)
+            t_eval = np.stack([pad_grid(g, N) for g in t_grid])
+        else:
+            t_eval = np.tile(np.asarray(t_grid, dtype=float), (n_temp, 1))
         dense = TDDenseTDIonTheFly(
-            np.tile(self.t_start + np.asarray(t_fine), (n_temp, 1)), np.array(offs), np.concatenate(mkn),
+            self.t_start + t_eval, np.array(offs), np.concatenate(mkn),
             t_k, n_k, C, np.concatenate(are), np.concatenate(aim), amp_factor=EMRITDIonFly.AMP_FACTOR,
             tdi_config=self.tdi_config, orbits=self.orbits, force_backend=self.force_backend)
         # outside the trajectory the kernel holds the reference phase at the trajectory end (no jump)
-        return dense(np.array(par))
+        if self.response_grid != "sparse":
+            return dense(np.array(par))
+        out = dense(np.array(par), return_spline=False)
+        return ExactPhaseTDIOutput(out, tk_abs, Cs, np.concatenate(mkn), dense.sub_temp_host)
 
     def _call_knots(self, few_args, few_kwargs, modes):
         from ...domains import WDMSignal
@@ -712,12 +874,13 @@ class EMRIDirectWDM:
             integ = self.few_gen.inspiral_generator.inspiral_generator
             din = dense_inputs_from_holder(H, integ, a=few_args[2], xI0=few_args[5])
             t_end = float(np.asarray(H.t_arr)[-1])
-            t_resp = t_fine
-            if t_end < t_fine[-1] - 1.0:
+            t_resp = self._sparse_grid(H, chunk_start) if self.response_grid == "sparse" else t_fine
+            if t_end < t_resp[-1] - 1.0:
                 # stops in the window: end the response grid two delay margins after the stop
                 # (as the spline feed's zero-amplitude continuation does); beyond it the channel
                 # is exactly zero and its extracted phase meaningless, so it must not be splined
-                t_resp = t_fine[t_fine <= t_end + 2 * 600.0 + 2 * self.fine_dt_plunge]
+                t_resp = t_resp[t_resp <= t_end + 2 * 600.0 + 2 * self.fine_dt_plunge]
+            self.n_fine = int(t_resp.size)
             out = self._dense_response([(din, (psi, lam, beta))], t_resp)
         else:
             feed = self._knots_feed(H, few_args, t_fine, fly)
@@ -897,7 +1060,7 @@ class EMRIDirectWDM:
         t_fine = self._fine_grid(None)
         fly = EMRITDIonFly(self.few_gen, self.orbits, self.tdi_config, dt, T_traj, self.t_start,
                            frame="icrs_special", t_fine_window=(self.data_t0, self.data_t0 + span), t_fine=t_fine)
-        feeds, tracks, rows_in, n_trs, t_ends = [], [], [], [], []
+        feeds, tracks, rows_in, n_trs, t_ends, grids = [], [], [], [], [], []
         stats = dict(rows=len(rows), alone=0, subs=0, failed=0)
         for r, p in enumerate(rows):
             try:
@@ -918,6 +1081,8 @@ class EMRIDirectWDM:
             if self.response == "dense":
                 integ = self.few_gen.inspiral_generator.inspiral_generator
                 feeds.append((dense_inputs_from_holder(H, integ, a=p[2], xI0=p[5]), (psi, lam, beta)))
+                if self.response_grid == "sparse":
+                    grids.append(self._sparse_grid(H, None))
             else:
                 if self.feed == "knots":
                     t_in, amp, ph, t_tdi = self._knots_feed(H, p, t_fine, fly)
@@ -931,7 +1096,11 @@ class EMRIDirectWDM:
         if not feeds:
             self.last_stats = stats
             return out_arr
-        out = self._dense_response(feeds, t_fine) if self.response == "dense" else fly.run_response(feeds)
+        if self.response == "dense":
+            out = self._dense_response(feeds, grids if self.response_grid == "sparse" else t_fine)
+            stats["n_response"] = int(np.shape(out.x)[-1])
+        else:
+            out = fly.run_response(feeds)
         x = np.asarray(out.x.get() if hasattr(out.x, "get") else out.x)
         ok_t = (t_pix > x[:, 0].max()) & (t_pix < x[:, -1].min()) & (t_pix - self.t_start <= min(t_ends))
         n_ok, tt = n_all[ok_t], t_pix[ok_t]
