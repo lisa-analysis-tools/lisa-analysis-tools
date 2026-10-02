@@ -150,12 +150,15 @@ class PSDMove(GlobalFitMove, StretchMove):
         # those aliased pointers — exposing it to cupy memory-pool reuse
         # hazards while the kernel runs asynchronously. .copy() forces a
         # fresh, contiguous, owning allocation.
-        Soms_d_in_all = psd_pars[:, 0].copy()
-        Sa_a_in_all = psd_pars[:, 1].copy()
+        # Column layout (symmetric: 1+1 amplitudes, asymmetric: 6+6 per-MOSA) is
+        # owned by the sensitivity backend.
+        Soms_d_in_all, Sa_a_in_all, spline_pars = self.sensitivity_backend.split_psd_params(psd_pars)
+        Soms_d_in_all = Soms_d_in_all.copy()
+        Sa_a_in_all = Sa_a_in_all.copy()
 
         if self.sensitivity_backend.use_splines:
-            knots_positions = xp.asarray(psd_pars[:, 3::2])
-            knots_amplitudes = xp.asarray(psd_pars[:, 2:-1:2])
+            knots_positions = xp.asarray(spline_pars[:, 1::2])
+            knots_amplitudes = xp.asarray(spline_pars[:, 0:-1:2])
             half = knots_positions.shape[1] // 2  # Get the mid of the array
             # put the 2 noise levels on the batch axis
             spline_knots_amplitude = xp.stack(
