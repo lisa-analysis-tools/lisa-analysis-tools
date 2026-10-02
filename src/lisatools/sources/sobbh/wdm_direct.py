@@ -77,8 +77,9 @@ def sobbh_amp_phase_batch(params, times, reference_time, t_shift=0.0):
     # in x0; that error survives -- via incomplete cancellation, not via any
     # steepness in phase(x) itself -- in `-phase(x) + phase(x_ref)`
     # (phase(x_ref) ~ 2e7 rad here, so ~8 ULP ~ 6e-8 rad leaks through). The
-    # rtol=1e-12 row match is thus effectively a bit-parity check that both
-    # paths hit the same libm `pow` on CPU.
+    # row match against the jnp reference is therefore bit-tight only on a host
+    # where both paths hit the same libm `pow`; where JAX evaluates on a GPU the
+    # two differ by that ~1e-8 rad floor (tests allow 1e-6 rad absolute).
     v0 = (np.pi * M * f_low) ** (1.0 / 3.0)
     x0 = v0**2
 

@@ -60,7 +60,19 @@ class LookupSettingsTest(unittest.TestCase):
     def test_fields_and_env_knobs(self):
         from lisatools.globalfit.stock.erebor.source_runtime import SourceSOBBHSettings
 
-        s = SourceSOBBHSettings(likelihood="lookup")
+        # the hard defaults: evaluated with the knobs ABSENT from the environment (a cluster
+        # shell that exported SOBBH_LOOKUP_TABLE_PATH for a run would otherwise leak in here)
+        with mock.patch.dict(os.environ):
+            for key in (
+                "SOBBH_LIKELIHOOD",
+                "SOBBH_LOOKUP_TABLE_PATH",
+                "SOBBH_LOOKUP_EVAL_DT",
+                "SOBBH_LOOKUP_NUM_M_LAYERS",
+                "SOBBH_LOOKUP_INTERP",
+                "SOBBH_LOOKUP_ROW_BATCH",
+            ):
+                os.environ.pop(key, None)
+            s = SourceSOBBHSettings(likelihood="lookup")
         self.assertEqual(s.likelihood, "lookup")
         self.assertEqual(s.lookup_table_path, "")
         self.assertEqual(s.lookup_num_m_layers, 2)

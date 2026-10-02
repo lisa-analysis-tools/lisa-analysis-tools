@@ -33,6 +33,11 @@ N_GRID, BUFFER, EVAL_DT = 1024, 5000.0, 600.0
 EDGE = 24  # grid-end pixels of the dense transform dropped
 
 
+#: absolute phase tolerance [rad] against the jnp reference: the cancellation floor of the
+#: reference-epoch anchor (~1.5e-8 rad measured on a GPU-JAX host) with a 100x margin
+PHASE_ATOL = 1e-6
+
+
 class AmpPhaseBatchTest(unittest.TestCase):
     def test_rows_match_sobbhwaveform(self):
         from lisatools.sources.sobbh.waveform import SOBBHWaveform
@@ -50,7 +55,11 @@ class AmpPhaseBatchTest(unittest.TestCase):
             )
             k = t_live.size
             np.testing.assert_allclose(amp[i, :k], a_ref, rtol=1e-12)
-            np.testing.assert_allclose(ph[i, :k], p_ref, rtol=1e-12)
+            # phase: the reference evaluates the PN series through jnp (on the GPU where JAX
+            # finds one), the batch through numpy; their ~1e-8 rad difference is the
+            # cancellation floor of `-phase(x) + phase(x_ref)` (phase(x_ref) ~ 2e7 rad), not
+            # a convention error (the +phase(x_ref) sign mutation is off by ~1e7 rad)
+            np.testing.assert_allclose(ph[i, :k], p_ref, rtol=1e-12, atol=PHASE_ATOL)
             self.assertTrue(np.all(amp[i, k:] == 0.0))
             n_dead_total += N - k
             if k < N:
@@ -79,7 +88,7 @@ class AmpPhaseBatchTest(unittest.TestCase):
             )
             k = t_live.size
             np.testing.assert_allclose(amp[i, :k], a_ref, rtol=1e-12)
-            np.testing.assert_allclose(ph[i, :k], p_ref, rtol=1e-12)
+            np.testing.assert_allclose(ph[i, :k], p_ref, rtol=1e-12, atol=PHASE_ATOL)
             self.assertTrue(np.all(amp[i, k:] == 0.0))
             if k < N:
                 self.assertLess(gen.times[k - 1], tc[i])
@@ -515,21 +524,29 @@ class DirectWDMTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             scatter_add(tpl, strided, np.array([0]), np.array([1.0]), **kw)
 
-    def test_numpy_path_does_not_import_cupyx(self):
+    def test_numpy_path_does_not_use_cupyx(self):
+        """The numpy fill never routes through cupyx (which other modules may already have
+        imported on a CUDA host): a fake ``cupyx`` whose ``scatter_add`` would blow up is
+        installed for the call, and must not be touched."""
+        from unittest import mock
+
         from lisatools.sources.sobbh.wdm_direct import scatter_add
 
         tpl = self.direct.sparse(ROWS[:1])
         buf = np.zeros(3 * int(self.wdm.Nf_active) * int(self.wdm.Nt_active))
-        scatter_add(
-            tpl,
-            buf,
-            np.array([0]),
-            np.array([1.0]),
-            nchannels=3,
-            Nf_active=int(self.wdm.Nf_active),
-            Nt_active=int(self.wdm.Nt_active),
-        )
-        self.assertNotIn("cupyx", sys.modules)
+        fake_cupyx = mock.MagicMock()
+        fake_cupyx.scatter_add.side_effect = AssertionError("numpy path routed through cupyx")
+        with mock.patch.dict(sys.modules, {"cupyx": fake_cupyx}):
+            scatter_add(
+                tpl,
+                buf,
+                np.array([0]),
+                np.array([1.0]),
+                nchannels=3,
+                Nf_active=int(self.wdm.Nf_active),
+                Nt_active=int(self.wdm.Nt_active),
+            )
+        fake_cupyx.scatter_add.assert_not_called()
         self.assertGreater(float(np.abs(buf).max()), 0.0)
 
 
