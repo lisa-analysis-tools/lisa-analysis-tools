@@ -246,13 +246,14 @@ class RunBox:
     def score(self, full):
         """Template vs the mojito stream: ``mm = 1 - <d|h> / sqrt(<d|d><h|h>)`` (noise weighted, no
         time/phase maximisation), ``logL = -1/2 <d-h|d-h>`` (0 for a perfect template),
-        ``snr_ratio = sqrt(<h|h> / <d|d>)`` (the amplitude safeguard)."""
+        ``snr_ratio = sqrt(<h|h> / <d|d>)`` (the amplitude safeguard), ``snr = sqrt(<h|h>)`` (optimal,
+        as the record's top-level snr) and ``snr_det = <d|h> / sqrt(<h|h>)`` (detected)."""
         h = self.crop(full)
         hh = self.ip(h)
         rr = self.ip(self.d - h)
         dh = 0.5 * (self.dd + hh - rr)
-        return dict(mm=1.0 - dh / np.sqrt(self.dd * hh), logL=-0.5 * rr, snr_ratio=float(np.sqrt(hh / self.dd)),
-                    snr=float(np.sqrt(hh)))
+        return dict(mm=float(1.0 - dh / np.sqrt(self.dd * hh)), logL=float(-0.5 * rr), snr_ratio=float(np.sqrt(hh / self.dd)),
+                    snr=float(np.sqrt(hh)), snr_det=float(dh / np.sqrt(hh)))
 
     def match(self, full_a, full_b):
         """Noise-weighted mismatch of two templates on the box, ``1 - <a|b> / sqrt(<a|a><b|b>)``
