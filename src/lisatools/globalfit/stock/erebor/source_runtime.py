@@ -515,7 +515,9 @@ class SourceSOBBHSettings(SOBBHSettings):
     # A/B-gated 2026-07-30: identical cold-chain lnL, zero cross-check
     # warnings at tol 0.5, ~4x wall even with the check every leaf) =
     # SOBBHChunkedLikeMove over the chunked-heterodyne WDM kernel (one
-    # vectorized call per batch); "full" = the exact full-TD container path
+    # vectorized call per batch); "lookup" = SOBBHLookupComputations over a
+    # batched TDI-on-the-fly response + an n_ref WDM lookup table (see the
+    # lookup_* fields below); "full" = the exact full-TD container path
     # (the escape hatch — required for FD/STFT domains, multi-shard, DCGA).
     # The residual expose/fold stays on the exact generator either way, and
     # the built-in fast-vs-slow cross-check stays on (thin it with
@@ -573,6 +575,29 @@ class SourceSOBBHSettings(SOBBHSettings):
     # err wide (fill mismatch ~3e-4 at 6; scoring stays narrow and fast).
     fill_m_band_half_width: int = dataclasses.field(
         default_factory=env_default("SOBBH_FILL_M_BAND_HALF_WIDTH", 8, int)
+    )
+    # ---- "lookup" likelihood (SOBBHLookupComputations: batched TDI-on-the-fly + n_ref WDM
+    # lookup table; docs/sobbh-wdm-lookup.md). The table must have the run's layer duration
+    # (``Nf * dt``, 3600 s in production); any sampling with that product works.
+    lookup_table_path: str = dataclasses.field(
+        default_factory=env_default("SOBBH_LOOKUP_TABLE_PATH", "", str)
+    )
+    # layers each side of the carrier layer per pixel (5 layers for 2; SOBBH |fdot| < 0.01
+    # layer units everywhere realistic, so 2 is converged)
+    lookup_num_m_layers: int = dataclasses.field(
+        default_factory=env_default("SOBBH_LOOKUP_NUM_M_LAYERS", 2, int)
+    )
+    # response evaluation step [s] for the per-channel amplitude/phase splines
+    lookup_eval_dt: float = dataclasses.field(
+        default_factory=env_default("SOBBH_LOOKUP_EVAL_DT", 600.0, float)
+    )
+    # table interpolation: "cubic" (Keys) or "linear"
+    lookup_interp: str = dataclasses.field(
+        default_factory=env_default("SOBBH_LOOKUP_INTERP", "cubic", str)
+    )
+    # rows per batched response build (bounds the spline memory)
+    lookup_row_batch: int = dataclasses.field(
+        default_factory=env_default("SOBBH_LOOKUP_ROW_BATCH", 32, int)
     )
 
 
@@ -1036,6 +1061,11 @@ def source_signal_cfg(gs, mbh, sobbh, emri) -> dict:
         sobbh_n_pad=sobbh.n_pad,
         sobbh_m_band_half_width=sobbh.m_band_half_width,
         sobbh_fill_m_band_half_width=sobbh.fill_m_band_half_width,
+        sobbh_lookup_table_path=sobbh.lookup_table_path,
+        sobbh_lookup_num_m_layers=sobbh.lookup_num_m_layers,
+        sobbh_lookup_eval_dt=sobbh.lookup_eval_dt,
+        sobbh_lookup_interp=sobbh.lookup_interp,
+        sobbh_lookup_row_batch=sobbh.lookup_row_batch,
         mbh_phenom_kwargs=dict(
             waveform_duration=mbh.waveform_duration,
             higher_modes=mbh.higher_modes,
@@ -1337,7 +1367,7 @@ class SourceSignalGen:
                 # load-time rebuilds, and scoring are mutually consistent
                 # and all fast. The move's cross-check stays independent —
                 # it verifies against the slow tdionfly wrap explicitly.
-                if self.cfg.get("sobbh_likelihood", "full") == "chunked":
+                if self.cfg.get("sobbh_likelihood", "full") in SOBBH_FAST_LIKELIHOODS:
                     return get_sobbh_chunked_signal_gen(
                         self.general_info, self.cfg
                     )(*params_in, **kwargs)
@@ -1560,6 +1590,88 @@ def get_sobbh_chunked_comp(general_info, cfg):
     return comp
 
 
+#: The SOBBH likelihoods served by a vectorized comp with the ``get_ll_wdm`` /
+#: ``fill_global_wdm`` surface (``SOBBHChunkedLikeMove`` + the engine signal gen).
+SOBBH_FAST_LIKELIHOODS = ("chunked", "lookup")
+
+
+def get_sobbh_lookup_comp(general_info, cfg):
+    """Build (and cache per device) the ``SOBBHLookupComputations`` for
+    ``SOBBH_LIKELIHOOD=lookup``.
+
+    Same ``t_ref`` / ``t_obs_start`` resolution as :func:`get_sobbh_chunked_comp`; the table
+    (``SOBBH_LOOKUP_TABLE_PATH``) loads on the run's backend and must carry the run domain's
+    layer duration.
+    """
+    from lisatools.domains import WDMLookupTable, WDMSettings
+    from lisatools.sources.sobbh.wdm_direct import SOBBHLookupComputations
+
+    gpus = getattr(general_info, "gpus", None)
+    if gpus is not None and len(gpus) > 1:
+        raise ValueError(
+            "SOBBH_LIKELIHOOD=lookup is single-device: "
+            f"the run spans {len(gpus)} GPUs (multi-GPU walker shards route one shared comp "
+            "through every device). Use SOBBH_LIKELIHOOD=chunked, or run on one GPU."
+        )
+    xp, dev, orbits, domain_settings = _wrap_device_and_orbits(general_info)
+    key = ("sobbh_lookup", id(general_info), cfg["nchannels"], dev)
+    if key in _WAVE_WRAP_CACHE:
+        return _WAVE_WRAP_CACHE[key]
+    if not isinstance(domain_settings, WDMSettings):
+        raise ValueError(
+            "SOBBH_LIKELIHOOD=lookup needs a WDM run domain "
+            f"(general.domain_settings is {type(domain_settings).__name__}); "
+            "use SOBBH_LIKELIHOOD=full for FD/STFT runs."
+        )
+    path = str(cfg.get("sobbh_lookup_table_path") or "")
+    if not path or not os.path.exists(path):
+        nf, dt = int(domain_settings.Nf), float(domain_settings.data_dt)
+        raise ValueError(
+            "SOBBH_LIKELIHOOD=lookup needs SOBBH_LOOKUP_TABLE_PATH "
+            f"(got {path!r}): an n_ref lookup table with the run's layer duration "
+            f"layer_dt = {float(domain_settings.layer_dt):g} s, e.g.\n"
+            "  python scripts/wdm/build_wdm_lookup_gpu.py --build-kind n_ref_complex "
+            f"--Nf {nf} --Nt 1024 --dt {dt:g} "
+            f"--min-freq {float(domain_settings.min_freq or 1e-4):g} "
+            f"--max-freq {float(domain_settings.max_freq or 2.5e-2):g} --m-ref 21 --eps-freq 0.005 "
+            "--num-layers-diff 2 --eps-fdot 0.01 --fdot-max-factor 8 --time-layers 32 "
+            "--nchannels 1 --out wdm_lookup_sobbh.h5\n"
+            "(any (Nf, dt) with the same Nf * dt works: the table depends on the layer "
+            "duration only; the 3600-s laptop EMRI table serves the production grid)"
+        )
+    force_backend = general_info.force_backend
+    tdi_config = TDIConfig(cfg["tdi_gen_str"], force_backend=force_backend)
+    t_ref = cfg["sobbh_reference_time"]
+    if t_ref is None:
+        t_ref = general_info.data_t0
+    with device_context(xp, dev):
+        table = WDMLookupTable.from_file(path, force_backend=force_backend)
+        comp = SOBBHLookupComputations(
+            domain_settings, float(t_ref), table,
+            orbits=orbits, tdi_config=tdi_config, tdi_type=cfg["tdi_chan"],
+            t_obs_start=float(general_info.data_t0),
+            n_grid=cfg["sobbh_n_grid"], buffer_time=cfg["sobbh_buffer_time"],
+            eval_dt=float(cfg["sobbh_lookup_eval_dt"]),
+            num_m_layers=int(cfg["sobbh_lookup_num_m_layers"]),
+            interp=cfg["sobbh_lookup_interp"], row_batch=int(cfg["sobbh_lookup_row_batch"]),
+            force_backend=force_backend, d_d=0.0,
+        )
+    _WAVE_WRAP_CACHE[key] = comp
+    return comp
+
+
+def get_sobbh_fast_comp(general_info, cfg):
+    """The vectorized SOBBH comp ``cfg["sobbh_likelihood"]`` selects
+    (``"chunked"`` / ``"lookup"``)."""
+    kind = cfg.get("sobbh_likelihood", "full")
+    if kind == "chunked":
+        return get_sobbh_chunked_comp(general_info, cfg)
+    if kind == "lookup":
+        return get_sobbh_lookup_comp(general_info, cfg)
+    raise ValueError(f"no vectorized SOBBH comp for sobbh_likelihood={kind!r} "
+                     f"(expected one of {SOBBH_FAST_LIKELIHOODS})")
+
+
 def get_sobbh_chunked_signal_gen(general_info, cfg):
     """Engine-convention SOBBH template generator backed by the chunked fill.
 
@@ -1573,7 +1685,13 @@ def get_sobbh_chunked_signal_gen(general_info, cfg):
     against the slow tdionfly wrap.
     """
     xp, dev, orbits, domain_settings = _wrap_device_and_orbits(general_info)
-    key = ("sobbh_chunked_gen", id(general_info), cfg["nchannels"], dev)
+    key = (
+        "sobbh_chunked_gen",
+        cfg.get("sobbh_likelihood"),
+        id(general_info),
+        cfg["nchannels"],
+        dev,
+    )
     if key in _WAVE_WRAP_CACHE:
         return _WAVE_WRAP_CACHE[key]
 
@@ -1581,7 +1699,7 @@ def get_sobbh_chunked_signal_gen(general_info, cfg):
 
     from ...moves.sobbhspecialmove import SOBBHChunkedLikeMove
 
-    comp = get_sobbh_chunked_comp(general_info, cfg)
+    comp = get_sobbh_fast_comp(general_info, cfg)
     wdm = domain_settings
     nch = int(cfg["nchannels"])
     m_fill = int(cfg["sobbh_fill_m_band_half_width"])
@@ -1604,8 +1722,8 @@ def get_sobbh_chunked_signal_gen(general_info, cfg):
 
 def build_sobbh_move_runtime(curr, acs, priors, state, cfg):
     wave_gen = DeviceLocalWaveGen(get_sobbh_wave_wrap, curr.general_info, cfg)
-    if cfg.get("sobbh_likelihood", "full") == "chunked":
-        comp = get_sobbh_chunked_comp(curr.general_info, cfg)
+    if cfg.get("sobbh_likelihood", "full") in SOBBH_FAST_LIKELIHOODS:
+        comp = get_sobbh_fast_comp(curr.general_info, cfg)
         _, moves = SOBBHChunkedMoveBuilder(
             wave_gen=wave_gen,
             chunked_comp=comp,
