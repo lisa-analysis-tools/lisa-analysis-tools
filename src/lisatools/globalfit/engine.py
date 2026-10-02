@@ -42,7 +42,7 @@ from ..sensitivity import (
     XYZ2SensitivityMatrix,
     XYZSensitivityBackend,
 )
-from ..utils.utility import AET, detrend, windowfun
+from ..utils.utility import AET, detrend, windowfun, asnumpy
 from .preprocessing import BaseProcessingStep
 
 
@@ -413,6 +413,8 @@ class GeneralSetup(Setup, GeneralSettings):
             settings=domain_settings, window=window, return_orbits=True
         )
 
+        filters_response = self.data_processor.get_total_response(asnumpy(domain_settings.f_arr))
+
         if isinstance(domain_settings, FDSettings):
             # FD path: ``pour`` returns an FDSignal whose ``settings`` IS the
             # resolved ``domain_settings`` instance, so the active-band
@@ -498,6 +500,7 @@ class GeneralSetup(Setup, GeneralSettings):
                 settings=domain_settings,
                 force_backend=self.force_backend,
                 window_values=window if self.normalize_window else None,
+                filters_response=filters_response,
                 **sensitivity_init_kwargs,
             )
 

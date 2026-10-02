@@ -282,9 +282,11 @@ def get_general_erebor_settings() -> GeneralSetup:
 
     sensitivity_init_kwargs = dict(
         tdi_generation=2,
-        mask_percentage=0.02,
+        mask_percentage=0.0,
+        smoothing_sigma=0.0,
         average_transfer_functions=True,
         noise_symmetry=NOISE_SYMMETRY,
+        convolve_window=True,
     )
 
     general_settings = GeneralSettings(
