@@ -11,11 +11,16 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _wdm_lookup_toy import build_tiny_table  # noqa: E402
 
+#: Every fake general_info stays alive for the whole module: the stock wave-wrap cache is keyed on
+#: ``id(general_info)`` (a production object lives for the process), so a freed fixture whose id
+#: is reused by the next test would hand that test the previous test's cached comp.
+_KEEP_ALIVE = []
+
 
 def _general_info(domain):
     from lisatools.detector import EqualArmlengthOrbits
 
-    return SimpleNamespace(
+    gi = SimpleNamespace(
         gpus=None,
         orbits=EqualArmlengthOrbits(force_backend="cpu"),
         gpu_orbits=None,
@@ -23,6 +28,8 @@ def _general_info(domain):
         force_backend="cpu",
         data_t0=0.0,
     )
+    _KEEP_ALIVE.append(gi)
+    return gi
 
 
 def _cfg(path, likelihood="lookup"):
@@ -109,8 +116,15 @@ class LookupSettingsTest(unittest.TestCase):
             buffer_time=0.0,
         )
         emri = SimpleNamespace(response_order=40)
-        with mock.patch.object(sr, "apply_emri_mode_selection_threshold", return_value=1e-3):
-            cfg = sr.source_signal_cfg(gs, mbh, s, emri)
+        # the MBH scoring-path resolution (resolve_mbh_batched_cfg) reads the full MBH block
+        # and the run-domain spec; neither is this test's subject -> stub it out
+        with (
+            mock.patch.object(sr, "apply_emri_mode_selection_threshold", return_value=1e-3),
+            mock.patch.object(
+                sr, "resolve_mbh_batched_cfg", return_value={"mbh_waveform_duration": 0.0}
+            ),
+        ):
+            cfg = sr.source_signal_cfg(gs, mbh, s, emri, domain_settings=None)
         self.assertEqual(cfg["sobbh_likelihood"], "lookup")
         self.assertEqual(cfg["sobbh_lookup_table_path"], "/t.h5")
         self.assertEqual(cfg["sobbh_lookup_eval_dt"], 120.0)
