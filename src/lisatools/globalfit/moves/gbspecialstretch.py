@@ -29632,6 +29632,16 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
     epoch's rows. A prebuilt offline grid drops in as ``epoch_0000/``.
     """
 
+    #: When True the CADENCE refit is suspended: an installed grid is kept
+    #: until a FORCED refit (:meth:`arm_fstat_refit`) asks for a new epoch.
+    #: Set per iteration by the galfor ratchet's recipe step (user ruling
+    #: 2026-10-02: "let's run it only on the nudge step" -- job 675 refit
+    #: once per cycle, ~2 h each, with only the first forced by the nudge),
+    #: and cleared again when the ratchet finishes so the ordinary per-band
+    #: search phase gets its cadence back. Loading an epoch from disk into a
+    #: fresh process is unaffected.
+    fstat_refit_only_forced = False
+
     def __init__(self, *args, fstat_fit_dir: str = "",
                  fstat_refit_every: int = 0,
                  fstat_fit_kwargs: Optional[dict] = None, **kwargs):
@@ -29743,7 +29753,13 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             # refit uses, so the two cannot disagree about what "old"
             # means: if the cadence would have refit by now, refit.
             _age = None
-            if _floor_same and self.fstat_refit_every > 0:
+            # Under the galfor ratchet the cadence is suspended
+            # (fstat_refit_only_forced): then age must not turn a SOFT arm
+            # (a stage re-entry on resume) into a refit either, or the
+            # relaunch would pay a comb scan before its first release. The
+            # nudge's HARD arm never reaches this branch.
+            if (_floor_same and self.fstat_refit_every > 0
+                    and not getattr(self, "fstat_refit_only_forced", False)):
                 try:
                     _age = (self._fstat_clock()
                             - int(self._epoch_fit_clock(_k_latest)))
@@ -30171,6 +30187,10 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         """
         if self.rj_proposal_distribution is not None:
             if self.fstat_refit_every <= 0:
+                return "skip", self._fstat_epoch
+            if getattr(self, "fstat_refit_only_forced", False):
+                # the galfor ratchet owns the refit clock: only a nudge's
+                # HARD arm (consumed after this decision) opens an epoch
                 return "skip", self._fstat_epoch
             # Cadence on the SHARED, restart-persistent refit clock (see
             # _fstat_clock) -- the per-instance num_proposals counter never
