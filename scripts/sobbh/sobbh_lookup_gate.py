@@ -143,11 +143,32 @@ def main():
         t_a = time.perf_counter()
         out = direct.tof.build(src[None, :], float(grid_t[0]), float(grid_t[-1]))
         td = np.asarray(out.eval_tdi(grid_t))[0]
+        # a source that chirps out of the box (or merges) inside the window: on this grid the
+        # band top sits at Nyquist, so its later TD power ALIASES back into the box. Zero the TD
+        # reference from the exit on and compare only up to BAND_EXIT_MARGIN_LAYERS before it.
+        layer_dt = float(wdm.layer_dt)
+        t_exit = tb.band_exit_time(
+            direct.tof,
+            src,
+            float(grid_t[0]),
+            float(grid_t[-1]),
+            layer_dt,
+            GATE_MAX_FREQ - 2.0 * float(wdm.layer_df),
+        )
+        if t_exit is not None:
+            td[:, grid_t >= t_exit] = 0.0
         truth = np.asarray(TDSignal(td, tds).transform(wdm).arr)
         t_tof = time.perf_counter() - t_a
         t_a = time.perf_counter()
         got = np.asarray(direct.dense(src[None, :])[0].arr)
         t_look = time.perf_counter() - t_a
+        cut_days = None
+        if t_exit is not None:
+            t_cut = t_exit - tb.BAND_EXIT_MARGIN_LAYERS * layer_dt
+            drop = direct.t_pixels >= t_cut
+            truth[..., drop] = 0.0
+            got[..., drop] = 0.0
+            cut_days = (t_cut - float(grid_t[0])) / 86400.0
         sl = slice(EDGE, nt - EDGE)
         mms = [mm_flat(got[c, :, sl], truth[c, :, sl]) for c in range(3)]
         ac = AnalysisContainer(WDMSignal(truth, wdm), sens)
@@ -181,6 +202,7 @@ def main():
             mm_w=1.0 - dh / np.sqrt(hh_t * hh_l),
             mm_w_int=mm_w_int,
             dlogL=-0.5 * (hh_t + hh_l - 2.0 * dh),
+            band_exit_cut_days=cut_days,
             t_tof_dense_s=t_tof,
             t_lookup_s=t_look,
             stats=dict(direct.last_stats),
@@ -194,6 +216,11 @@ def main():
             f"{row['ratio'][0]:.5f}/{row['ratio'][1]:.5f}/{row['ratio'][2]:.5f}  mm_w "
             f"{row['mm_w']:.2e}  mm_w_int {row['mm_w_int']:.2e}  dlogL {row['dlogL']:.3e}  "
             f"tof-dense {t_tof:.1f}s lookup {t_look:.1f}s"
+            + (
+                ""
+                if cut_days is None
+                else f"  [compared up to day {cut_days:.0f}: leaves the band]"
+            )
         )
 
     days = nt * float(wdm.layer_dt) / 86400.0
