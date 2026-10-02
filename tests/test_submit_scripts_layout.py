@@ -723,7 +723,7 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # V9-26 (2026-10-02): the EMRI direct-to-WDM scoring path's knobs
             # (default full = the v8 path); SixMonthEMRIDirectTest pins the block.
             "EMRI_LIKELIHOOD", "EMRI_BATCH_MAX_SIZE", "EMRI_DIRECT_TABLE",
-            "EMRI_DIRECT_RESPONSE", "EMRI_TRAJ_WORKERS",
+            "EMRI_DIRECT_RESPONSE", "EMRI_TRAJ_WORKERS", "EMRI_DIRECT_LOOKUP",
         }
         drift = {
             k: (self.v8.get(k), self.v9.get(k))
@@ -907,7 +907,7 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
     the switch is one launch-line variable."""
 
     _KNOBS = ("EMRI_LIKELIHOOD", "EMRI_BATCH_MAX_SIZE", "EMRI_DIRECT_TABLE",
-              "EMRI_DIRECT_RESPONSE", "EMRI_TRAJ_WORKERS")
+              "EMRI_DIRECT_RESPONSE", "EMRI_TRAJ_WORKERS", "EMRI_DIRECT_LOOKUP")
 
     def setUp(self):
         self.v9 = _exports(SIX_MO_V9)
@@ -917,6 +917,10 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
         self.assertEqual(self.v9["EMRI_BATCH_MAX_SIZE"], "8")
         self.assertEqual(self.v9["EMRI_DIRECT_RESPONSE"], "dense")
         self.assertEqual(self.v9["EMRI_TRAJ_WORKERS"], "4")
+        self.assertEqual(self.v9["EMRI_DIRECT_LOOKUP"], "kernel")
+        # the preflight proves the fused kernel on the node's GPU (a module without it
+        # would silently fall back to the Python lookup)
+        self.assertIn('SyntheticEdgesTest("test_gpu_equals_cpu")', open(SIX_MO_V9).read())
         # unset: the canonical table in the run folder, found or built by the preflight
         self.assertEqual(self.v9["EMRI_DIRECT_TABLE"], "")
         self.assertIn("export FILE_STORE_DIR=${STORE_DIR}", open(SIX_MO_V9).read())
@@ -963,12 +967,13 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
         self.assertIn("--cpus-per-task=2",
                       self._dispatch(EMRI_LIKELIHOOD="direct", EMRI_TRAJ_WORKERS="0"))
 
-    def _run_preflight(self, table=("found",), parity=("ok",), **env):
+    def _run_preflight(self, table=("found",), parity=("ok",), kparity=("ok",), **env):
         """Exec the launcher's EMRI preflight in-process: (exit code, stdout).
 
         ``table`` stubs ``wdm_lookup_store.ensure_lookup_table``: ("found"|"built",) or
-        ("raise", message); the calls land in ``self.ensured``. ``parity`` stubs the GPU
-        parity run's outcome."""
+        ("raise", message); the calls land in ``self.ensured``. ``parity`` stubs the dense
+        TDI kernel's GPU parity run, ``kparity`` the fused lookup kernel's (``self.kruns``
+        counts those)."""
         import contextlib
         import io
         from unittest import mock
@@ -980,6 +985,7 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
         base["FILE_STORE_DIR"] = "/the/run/folder"
         base.update(env)
         self.ensured = []
+        self.kruns = 0
 
         def fake_ensure(path, **kw):
             self.ensured.append((path, kw))
@@ -990,9 +996,12 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
         def fake_run(runner, suite):
             res = unittest.TestResult()
             res.testsRun = 1
-            if parity[0] == "fail":
+            lookup = any(type(t).__name__ == "SyntheticEdgesTest" for t in suite)
+            self.kruns += lookup
+            outcome = (kparity if lookup else parity)[0]
+            if outcome == "fail":
                 res.failures.append((None, "boom"))
-            elif parity[0] == "skip":
+            elif outcome == "skip":
                 res.skipped.append((None, "no GPU backend"))
             return res
 
@@ -1018,7 +1027,8 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
     def test_direct_passes_with_a_matching_table_and_a_passing_gpu_parity(self):
         rc, out = self._run_preflight(EMRI_LIKELIHOOD="direct")
         self.assertEqual(rc, 0, out)
-        self.assertIn("emri_pe scoring=direct batch<=8 response=dense traj_workers=4", out)
+        self.assertIn("emri_pe scoring=direct batch<=8 response=dense lookup=kernel traj_workers=4", out)
+        self.assertEqual(self.kruns, 1)            # the fused kernel was proven on the GPU
         self.assertIn("edge_crop=60>=8", out)
         # unset EMRI_DIRECT_TABLE: the canonical table in the run folder, on this grid
         name = "/the/run/folder/wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5"
@@ -1045,6 +1055,9 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
             ({}, dict(parity=("skip",)), "skipped 1"),
             (dict(EDGE_CROP_WAVELETS="4"), {}, "EDGE_CROP_WAVELETS=4"),
             (dict(EMRI_DIRECT_RESPONSE="bogus"), {}, "EMRI_DIRECT_RESPONSE"),
+            ({}, dict(kparity=("fail",)), "fused lookup kernel"),
+            ({}, dict(kparity=("skip",)), "EMRI_DIRECT_LOOKUP=python"),
+            (dict(EMRI_DIRECT_LOOKUP="bogus"), {}, "EMRI_DIRECT_LOOKUP='bogus'"),
         ]
         for env, kw, needle in cases:
             with self.subTest(needle=needle):
@@ -1052,6 +1065,13 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
                 self.assertEqual(rc, 2, out)
                 self.assertIn("[EMRI-PREFLIGHT] REFUSING", out)
                 self.assertIn(needle, out)
+
+    def test_python_lookup_skips_the_kernel_parity_run(self):
+        rc, out = self._run_preflight(kparity=("fail",), EMRI_LIKELIHOOD="direct",
+                                      EMRI_DIRECT_LOOKUP="python")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.kruns, 0)
+        self.assertIn("lookup=python", out)
 
     def test_spline_response_skips_the_gpu_parity_run(self):
         rc, out = self._run_preflight(parity=("fail",), EMRI_LIKELIHOOD="direct",
@@ -1603,7 +1623,7 @@ class ThreeMonthV9TwinTest(unittest.TestCase):
             # EMRI branch is armed here, and its lookup table is built for the
             # 6-month grid's Nf and dt only.
             "EMRI_LIKELIHOOD", "EMRI_BATCH_MAX_SIZE", "EMRI_DIRECT_TABLE",
-            "EMRI_DIRECT_RESPONSE", "EMRI_TRAJ_WORKERS",
+            "EMRI_DIRECT_RESPONSE", "EMRI_TRAJ_WORKERS", "EMRI_DIRECT_LOOKUP",
         }
         keys = (set(self.three) | set(self.six)) - {"_", "SHLVL", "PWD"}
         diff = {k for k in keys

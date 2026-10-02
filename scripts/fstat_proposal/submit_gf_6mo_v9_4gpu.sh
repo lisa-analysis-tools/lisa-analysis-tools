@@ -3433,6 +3433,11 @@ export GALFOR_RATCHET_CYCLES=${GALFOR_RATCHET_CYCLES:-2}
 export GALFOR_RATCHET_DLOG10_AMP=${GALFOR_RATCHET_DLOG10_AMP:--0.05}
 export GALFOR_RATCHET_DLOG10_FK=${GALFOR_RATCHET_DLOG10_FK:--0.10}
 export GALFOR_RATCHET_DLOG10_F2=${GALFOR_RATCHET_DLOG10_F2:--0.15}
+# The gain rule (GALFOR_RATCHET_MIN_GAIN) may not stop the ratchet before this
+# many nudges have run in the process (user ruling 2026-10-02: "I generally
+# want it to do minimum 2 nudges total"). Counted per process: a relaunch
+# starts the count again. 0 = no floor.
+export GALFOR_RATCHET_MIN_NUDGES=${GALFOR_RATCHET_MIN_NUDGES:-2}
 # ---- search LEGS (user design 2026-09-30) ----------------------------------
 # GB_SEARCH_LEGS=1: the numbered search stages store one row per LEG of the
 # cycle -- after in_model, after in_model_fstat, after in_model_removal --
@@ -3443,6 +3448,14 @@ export GALFOR_RATCHET_DLOG10_F2=${GALFOR_RATCHET_DLOG10_F2:--0.15}
 # row per leg the mid-iteration checkpoint only guards part of one leg;
 # MIDIT_CHECKPOINT=0 is reasonable for a legged search. Off = today.
 export GB_SEARCH_LEGS=${GB_SEARCH_LEGS:-0}
+# While the ratchet is active the per-(walker, band) RJ shutoff valve leaves
+# every band below this frequency OPEN (reopening shut pairs with a fresh
+# streak) and shuts converged bands above it as usual; lifted at the
+# ratchet's stop so the stage can end on the full valve (user design
+# 2026-10-02: "maybe don't do RJ shutoff during the ratchet cycles ... you
+# can shut off bands above 7 mHz if their likelihoods converge as usual").
+# 0 = the valve acts at every frequency throughout.
+export GALFOR_RATCHET_SHUTOFF_MIN_FREQ=${GALFOR_RATCHET_SHUTOFF_MIN_FREQ:-7e-3}
 echo "[GALFOR-RATCHET] GALFOR_RATCHET=${GALFOR_RATCHET} hold=${GALFOR_RATCHET_HOLD} release=${GALFOR_RATCHET_RELEASE} cycles=${GALFOR_RATCHET_CYCLES} dlog10 amp/fk/f2=${GALFOR_RATCHET_DLOG10_AMP}/${GALFOR_RATCHET_DLOG10_FK}/${GALFOR_RATCHET_DLOG10_F2} (0 = off: rider + 4 interleaved noise slots as before)"
 # High-f barren-band birth shutoff (search scope): bands above FMIN with
 # AFTER consecutive zero-birth-accept proposes stop proposing births
@@ -4693,8 +4706,11 @@ export EMRI_EPS=1e-3
 # per row (trajectory + amplitudes at the integrator knots, modes kept at
 # EMRI_EPS), ONE dense TDI-on-the-fly response launch for the chunk
 # (TDDenseTDIWaveform: exact DOPR853 dense-output phases, link geometry shared
-# across harmonics) and one n_ref WDM lookup-table pass + scatter-add, cropped
-# to this run's WDM box and scored against each walker's own residual AND PSD.
+# across harmonics, on the trajectory knots + a 12 h cap) and ONE fused lookup-sum
+# kernel launch (wdm_lookup_sum: sparse response -> analytic f, fdot -> n_ref
+# table -> WDM sum, nothing per pixel in memory; EMRI_DIRECT_LOOKUP=python is the
+# Python reference path) on this run's active band, cropped to its time box and
+# scored against each walker's own residual AND PSD.
 # A harmonic that chirps off the table's fdot axis near a plunge hands off to
 # an even-start 128-layer TD chunk. In-model steps, eigen-table sweeps and the
 # inner-product record all score through it.
@@ -4739,12 +4755,14 @@ export EMRI_BATCH_MAX_SIZE=${EMRI_BATCH_MAX_SIZE:-8}
 export EMRI_DIRECT_TABLE=${EMRI_DIRECT_TABLE:-}
 export EMRI_DIRECT_RESPONSE=${EMRI_DIRECT_RESPONSE:-dense}
 export EMRI_TRAJ_WORKERS=${EMRI_TRAJ_WORKERS:-4}
+export EMRI_DIRECT_LOOKUP=${EMRI_DIRECT_LOOKUP:-kernel}
 #
 # EMRI PREFLIGHT. An unknown env var is SILENTLY IGNORED, so resolve the knobs
 # through the real settings class and the real consistency rule; for direct,
 # also check the edge crop clears the template's zeroed edge layers, run the dense
-# kernel's GPU-vs-CPU parity test on this node's GPU, and find -- or build and save
-# -- the lookup table (above). Refuses before mpiexec on any gap.
+# kernel's (and, with EMRI_DIRECT_LOOKUP=kernel, the fused lookup kernel's)
+# GPU-vs-CPU parity test on this node's GPU, and find -- or build and save -- the
+# lookup table (above). Refuses before mpiexec on any gap.
 python - <<'PYEOF' || exit 2
 import dataclasses
 import inspect
@@ -4814,6 +4832,27 @@ if cfg["emri_direct_response"] == "dense":
               "Rebuild lisatools (pip install -e . --no-build-isolation) or launch with "
               "EMRI_LIKELIHOOD=full / EMRI_DIRECT_RESPONSE=spline.")
         sys.exit(2)
+    if os.environ["EMRI_DIRECT_LOOKUP"] not in ("kernel", "python"):
+        print(f"[EMRI-PREFLIGHT] REFUSING: EMRI_DIRECT_LOOKUP={os.environ['EMRI_DIRECT_LOOKUP']!r} "
+              "(kernel or python).")
+        sys.exit(2)
+    if os.environ["EMRI_DIRECT_LOOKUP"] == "kernel":
+        # a module without the kernel would fall back to the Python lookup with only a
+        # warning: prove it is here and right on this GPU instead
+        try:
+            from tests import test_wdm_lookup_sum_kernel as tk
+        except ImportError as exc:
+            print(f"[EMRI-PREFLIGHT] REFUSING: cannot import tests/test_wdm_lookup_sum_kernel.py ({exc}).")
+            sys.exit(2)
+        suite = unittest.TestSuite([tk.SyntheticEdgesTest("test_gpu_equals_cpu")])
+        res = unittest.TextTestRunner(stream=sys.stdout, verbosity=1).run(suite)
+        if not res.wasSuccessful() or res.skipped or res.testsRun == 0:
+            print("[EMRI-PREFLIGHT] REFUSING: the fused lookup kernel's GPU-vs-CPU parity test "
+                  f"did not pass on this node (run {res.testsRun}, failures {len(res.failures)}, "
+                  f"errors {len(res.errors)}, skipped {len(res.skipped)}: {res.skipped}). Rebuild "
+                  "lisatools (pip install -e . --no-build-isolation) or launch with "
+                  "EMRI_DIRECT_LOOKUP=python.")
+            sys.exit(2)
 import time
 
 import lisatools
@@ -4841,7 +4880,8 @@ if cpus is not None and int(cpus) < 1 + cfg["emri_traj_workers"]:
           f"{cfg['emri_traj_workers']}: the trajectory workers will share cores (submit "
           "through the self-dispatch, which sizes it).")
 print(f"[EMRI-PREFLIGHT] emri_pe scoring=direct batch<={cfg['emri_batch_max_size']} "
-      f"response={cfg['emri_direct_response']} traj_workers={cfg['emri_traj_workers']} "
+      f"response={cfg['emri_direct_response']} lookup={os.environ['EMRI_DIRECT_LOOKUP']} "
+      f"traj_workers={cfg['emri_traj_workers']} "
       f"table={table_path} (Nf 1440, dt 2.5) edge_crop={crop}>={edge}")
 PYEOF
 

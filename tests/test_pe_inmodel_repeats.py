@@ -40,6 +40,14 @@ def env(**kw):
                 os.environ[k] = v
 
 
+def _clear_peak_floor_override():
+    """The PE step's entry sets a PROCESS-GLOBAL F-stat peak floor; clear it so
+    later test modules (the per-walker floor tests expect SNR 8) are not fed 6.25."""
+    from lisatools.sampling.fstat_proposal import set_peak_min_F_override
+
+    set_peak_min_F_override(None)
+
+
 def _tree():
     """A PE move tree: one move per family, with each family's own attribute."""
     sobbh = SimpleNamespace(name="sobbh_pe", branch_name="sobbh", num_repeats=10)
@@ -94,6 +102,9 @@ class ApplyInModelRepeatsTest(unittest.TestCase):
 
 class PEStepAppliesRepeatsTest(unittest.TestCase):
 
+    def tearDown(self):
+        _clear_peak_floor_override()
+
     def test_pe_step_applies_its_declaration_on_entry_once_per_step(self):
         from lisatools.globalfit.recipe import PERecipeStep
 
@@ -121,6 +132,9 @@ class PEStepAppliesRepeatsTest(unittest.TestCase):
 
 
 class CompositionTest(unittest.TestCase):
+
+    def tearDown(self):
+        _clear_peak_floor_override()
 
     _BASE = dict(
         GB_SEARCH_IN_MODEL="1", GB_SEARCH_RJ_REPLACE="0", GB_SEARCH_IN_MODEL_REPLACE="0",
@@ -161,6 +175,9 @@ class CompositionTest(unittest.TestCase):
 
 
 class RJFlipFractionTest(unittest.TestCase):
+
+    def tearDown(self):
+        _clear_peak_floor_override()
     """User ruling 2026-10-02: "make sure for GBs, during full PE all RJ moves
     sample 0.1 of the available slots. This is the FRAC env variable." In a
     search-mode run the recipe BUILDS the PE RJ moves with the search fraction

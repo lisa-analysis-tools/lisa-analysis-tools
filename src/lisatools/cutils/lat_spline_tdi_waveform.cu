@@ -744,3 +744,167 @@ void td_dense_run_wave_tdi_wrap(TDDenseTDIWaveform *w, cmplx *tdi_channels_arr,
     delete[] buffer;
 #endif
 }
+
+// ===========================================================================
+// wdm_lookup_sum: fused sparse-response -> WDM lookup (see lat_spline_tdi_waveform.hh)
+// ===========================================================================
+static CUDA_DEVICE inline void wdm_lookup_atomic_add(double *p, double v)
+{
+#ifdef __CUDA_ARCH__   // device pass only (atomicAdd is __device__)
+    atomicAdd(p, v);
+#else
+    *p += v;
+#endif
+}
+
+static CUDA_DEVICE void wdm_lookup_sum_point(const WDMLookupSumArgs &A, int s, int n,
+    unsigned long long *n_look, unsigned long long *n_drop)
+{
+    if (n >= A.n_stop[s]) return;
+    const double two_pi = 6.283185307179586476925286766559;
+    double t = A.t0 + (double)n * A.layer_dt;
+
+    // exact carrier (held -- derivatives zero -- outside the trajectory)
+    double car = 0.0;
+    double car1 = 0.0;
+    double car2 = 0.0;
+    if (A.carrier)
+    {
+        int b = A.sub_temp[s];
+        const double *tk = &A.t_knots[(size_t)b * A.K];
+        int nk = A.n_knots[b];
+        bool held = (t < tk[0]) || (t > tk[nk - 1]);
+        double tc = (t < tk[0]) ? tk[0] : ((t > tk[nk - 1]) ? tk[nk - 1] : t);
+        int seg = wdm_spline_segment(tk, nk, tc);
+        double h = tk[seg + 1] - tk[seg];
+        double sv = (tc - tk[seg]) / h;
+        const double *cb = &A.phase_coeffs[((size_t)b * (A.K - 1) + seg) * 24];
+        const int *mk = &A.sub_mkn[3 * s];
+        for (int p = 0; p < 3; p += 1)
+        {
+            double v, d1, d2;
+            wdm_dense_phase_derivs(&cb[8 * p], sv, &v, &d1, &d2);
+            car += mk[p] * v;
+            if (!held)
+            {
+                car1 += mk[p] * (d1 / h);
+                car2 += mk[p] * (d2 / (h * h));
+            }
+        }
+    }
+
+    const double *xs = &A.x[(size_t)s * A.nch * A.N];
+    int seg = wdm_spline_segment(xs, A.N, t);
+    double dx = t - xs[seg];
+    int n_m = A.m_hi - A.m_lo;
+    int row = A.sub_row[s];
+    for (int ch = 0; ch < A.nch; ch += 1)
+    {
+        size_t off = ((size_t)s * A.nch + ch) * A.N + seg;
+        double amp = A.amp_y[off] + dx * (A.amp_c1[off] + dx * (A.amp_c2[off] + dx * A.amp_c3[off]));
+        double r, r1, r2;
+        wdm_spline_derivs(&A.res_y[off - seg], &A.res_c1[off - seg], &A.res_c2[off - seg], &A.res_c3[off - seg],
+            seg, dx, &r, &r1, &r2);
+        double ph = r + car;
+        double f = (r1 + car1) / two_pi;
+        double fdot = (r2 + car2) / two_pi;
+        if (f < 0.0)            // a -m partner: cos is even
+        {
+            ph = -ph;
+            f = -f;
+            fdot = -fdot;
+        }
+        if (!(fabs(fdot) <= A.fdot_max) || !(f > A.f_min) || !isfinite(f))
+        {
+            *n_drop += 1;
+            continue;
+        }
+        *n_look += 1;
+        int td[4];
+        double wd[4];
+        if (!wdm_table_fdot_axis(A.tab, fdot, td, wd)) continue;   // off the fdot axis: every layer 0
+        double cph = cos(ph);
+        double sph = sin(ph);
+        int ms = (int)(f / A.layer_df);                  // truncation, as numpy .astype(int)
+        double *out_rc = &A.out[((size_t)row * A.nch + ch) * n_m * (size_t)A.Nt];
+        for (int dm = -A.num_m_layers; dm <= A.num_m_layers; dm += 1)
+        {
+            int m = ms + dm;
+            if ((m < 0) || (m >= A.Nf) || (m < A.m_lo) || (m >= A.m_hi)) continue;
+            double f_norm = f - (double)m * A.layer_df;
+            if ((f_norm < A.tab.f_lo) || (f_norm > A.tab.f_hi)) continue;   // out_of_support="zero"
+            double c, sn;
+            if (!wdm_table_cs_at(A.tab, td, wd, f_norm, &c, &sn)) continue;
+            double val = wdm_quarter_turn_value(c, sn, A.tab.ref_odd, (m + n) & 1, amp, cph, sph);
+            wdm_lookup_atomic_add(&out_rc[(size_t)(m - A.m_lo) * A.Nt + n], val);
+        }
+    }
+}
+
+#ifdef __CUDACC__
+CUDA_KERNEL
+void wdm_lookup_sum_kernel(WDMLookupSumArgs A)
+{
+    CUDA_SHARED unsigned long long blk[2];
+    if (threadIdx.x == 0)
+    {
+        blk[0] = 0;
+        blk[1] = 0;
+    }
+    CUDA_SYNC_THREADS;
+    unsigned long long n_look = 0;
+    unsigned long long n_drop = 0;
+    long long P = (long long)(A.n_hi - A.n_lo);
+    long long total = (long long)A.num_sub * P;
+    // adjacent threads = adjacent pixels of one harmonic: the same spline segment and
+    // neighbouring table cells
+    for (long long j = (long long)blockIdx.x * blockDim.x + threadIdx.x; j < total;
+         j += (long long)gridDim.x * blockDim.x)
+    {
+        int s = (int)(j / P);
+        int n = A.n_lo + (int)(j - (long long)s * P);
+        wdm_lookup_sum_point(A, s, n, &n_look, &n_drop);
+    }
+    if (A.counts != nullptr)
+    {
+        if (n_look) atomicAdd(&blk[0], n_look);
+        if (n_drop) atomicAdd(&blk[1], n_drop);
+        CUDA_SYNC_THREADS;
+        if (threadIdx.x == 0)
+        {
+            atomicAdd(&A.counts[0], blk[0]);
+            atomicAdd(&A.counts[1], blk[1]);
+        }
+    }
+}
+#endif
+
+void wdm_lookup_sum_wrap(WDMLookupSumArgs args)
+{
+    long long P = (long long)(args.n_hi - args.n_lo);
+    if ((P <= 0) || (args.num_sub <= 0)) return;
+#ifdef __CUDACC__
+    long long total = (long long)args.num_sub * P;
+    int threads = 256;
+    long long blocks = (total + threads - 1) / threads;
+    if (blocks > (1LL << 20)) blocks = 1LL << 20;
+    wdm_lookup_sum_kernel<<<(int)blocks, threads>>>(args);
+    cudaDeviceSynchronize();
+    gpuErrchk(cudaGetLastError());
+#else
+    unsigned long long n_look = 0;
+    unsigned long long n_drop = 0;
+    for (int s = 0; s < args.num_sub; s += 1)
+    {
+        for (int n = args.n_lo; n < args.n_hi; n += 1)
+        {
+            wdm_lookup_sum_point(args, s, n, &n_look, &n_drop);
+        }
+    }
+    if (args.counts != nullptr)
+    {
+        args.counts[0] += n_look;
+        args.counts[1] += n_drop;
+    }
+#endif
+}

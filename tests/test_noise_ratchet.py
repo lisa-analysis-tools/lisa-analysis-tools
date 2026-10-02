@@ -858,6 +858,38 @@ class StepDrivesRatchetTest(unittest.TestCase):
         self.assertTrue(st._ratchet_stopped)
         self.assertEqual(be.stamps, [("gb_search_3", "galfor_ratchet_done", 1)])
 
+    def test_min_nudges_holds_the_stop_until_enough_nudges_have_run(self):
+        """User ruling 2026-10-02: "I want to force at least 1 more nudge."
+        A gain below the threshold must not stop the ratchet before
+        ratchet_min_nudges nudges have run; after that it stops as usual."""
+        from lisatools.globalfit.recipe import SearchStageProfileStep
+
+        gate, grid = _FakeGate(), _FakeGrid()
+        tree = [SimpleNamespace(moves=[gate, grid])]
+        st = SearchStageProfileStep(
+            moves=tree, convergence_iter=2, plateau_branch="gb", profile={},
+            stage_name="gb_search_3",
+            ratchet=RatchetSchedule(hold=1, release=1, cycles=20, release_first=True),
+            ratchet_delta=np.zeros(5), ratchet_min_gain=200.0, ratchet_min_nudges=2)
+
+        def smp(mx):
+            return SimpleNamespace(log_like=np.array([[mx, mx - 1.0], [0.0, 0.0]]),
+                                   branches_coords={"galfor": np.zeros((2, 2, 1, 5))})
+
+        with env(GALFOR_RATCHET_HOLD_STAGE=None):
+            st.setup_run(47, smp(1000.0), _FakeSampler(47, tree))
+            st.note_recipe_step(3)                                   # k=0 release
+            st.stopping_function(48, smp(1000.0), _FakeSampler(48, tree))   # baseline; -> nudge 1
+            st.stopping_function(49, smp(-9000.0), _FakeSampler(49, tree))  # -> release
+            st.stopping_function(50, smp(1010.0), _FakeSampler(50, tree))   # +10 < 200, 1 of 2 nudges
+            self.assertFalse(st._ratchet_stopped)
+            self.assertEqual(gate.modes[-1], "nudge")                # nudge 2 forced
+            self.assertEqual(len(grid.armed), 2)
+            st.stopping_function(51, smp(-9000.0), _FakeSampler(51, tree))  # -> release
+            st.stopping_function(52, smp(1015.0), _FakeSampler(52, tree))   # +5 < 200, 2 of 2 -> stop
+            self.assertTrue(st._ratchet_stopped)
+            self.assertEqual(len(grid.armed), 2)
+
     def test_min_gain_zero_leaves_the_schedule_alone(self):
         from lisatools.globalfit.recipe import SearchStageProfileStep
 
@@ -1343,6 +1375,12 @@ class CompositionTest(unittest.TestCase):
         kw = {s.name: s for s in fit.recipe.stages}["gb_search_3"].step_kwargs
         self.assertEqual(kw["ratchet_min_gain"], 0.0)
         self.assertFalse(kw["ratchet"].release_first)
+        self.assertEqual(kw["ratchet_min_nudges"], 0)
+        fit = self._full(GALFOR_RATCHET="1", GALFOR_RATCHET_MIN_NUDGES="2")
+        kw = {s.name: s for s in fit.recipe.stages}["gb_search_3"].step_kwargs
+        self.assertEqual(kw["ratchet_min_nudges"], 2)
+        with self.assertRaises(ValueError):
+            self._full(GALFOR_RATCHET="1", GALFOR_RATCHET_MIN_NUDGES="-1")
 
     def test_unarmed_composition_is_unchanged(self):
         fit = self._full()

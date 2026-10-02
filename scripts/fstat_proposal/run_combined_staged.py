@@ -1681,6 +1681,14 @@ def build_fit():
                           if _ratchet is not None else None)
         # the data-driven stop (user design 2026-10-02): GALFOR_RATCHET_MIN_GAIN
         _ratchet_min_gain = min_gain_from_env() if _ratchet is not None else 0.0
+        # GALFOR_RATCHET_MIN_NUDGES: the stop may not fire before this many
+        # nudges have run in the process (user ruling 2026-10-02: "I want to
+        # force at least 1 more nudge"); 0 = no floor
+        _ratchet_min_nudges = 0
+        if _ratchet is not None:
+            _ratchet_min_nudges = int(os.environ.get("GALFOR_RATCHET_MIN_NUDGES", "0").strip() or 0)
+            if _ratchet_min_nudges < 0:
+                raise ValueError(f"GALFOR_RATCHET_MIN_NUDGES={_ratchet_min_nudges} must be >= 0.")
         if _ratchet is not None and not _env_flag("GB_SEARCH_IN_MODEL"):
             raise ValueError(
                 "GALFOR_RATCHET=1 needs GB_SEARCH_IN_MODEL=1: every noise change "
@@ -1907,6 +1915,7 @@ def build_fit():
                 ratchet=_ratchet,
                 ratchet_delta=_ratchet_delta,
                 ratchet_min_gain=_ratchet_min_gain,
+                ratchet_min_nudges=_ratchet_min_nudges,
                 legs=_legs,
             ),
             combine_kwargs=_combine_kwargs,

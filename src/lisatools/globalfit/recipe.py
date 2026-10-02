@@ -1588,7 +1588,8 @@ class SearchStageProfileStep(RJRecipeStep):
 
     def __init__(self, *args, profile: typing.Optional[dict] = None,
                  stage_name: str = "", ratchet=None, ratchet_delta=None,
-                 ratchet_min_gain: float = 0.0, legs: bool = False, **kwargs):
+                 ratchet_min_gain: float = 0.0, ratchet_min_nudges: int = 0,
+                 legs: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.profile = dict(profile or {})
         _unknown = sorted(set(self.profile) - {
@@ -1620,6 +1621,12 @@ class SearchStageProfileStep(RJRecipeStep):
         # release whose max cold lnL gained less than this over the previous
         # release, no more nudges (user design 2026-10-02; _ratchet_check_gain).
         self.ratchet_min_gain = float(ratchet_min_gain or 0.0)
+        # ``ratchet_min_nudges``: the gain rule may not stop the ratchet before
+        # this many nudges have run IN THIS PROCESS (user ruling 2026-10-02:
+        # "I want to force at least 1 more nudge"). 0 = no floor. Counted on
+        # ``_ratchet_nudges``, which _drive_ratchet increments per nudge; a
+        # relaunch starts the count again.
+        self.ratchet_min_nudges = int(ratchet_min_nudges or 0)
         self._ratchet_stopped = False
         self._ratchet_last_release_max = None
         self._ratchet_release_maxes = []
@@ -1931,13 +1938,24 @@ class SearchStageProfileStep(RJRecipeStep):
                 "(threshold %.0f); ratcheting continues.", tag, k_done, mx, mean,
                 gain, gain_min)
             return
+        _n_nudges = int(getattr(self, "_ratchet_nudges", 0) or 0)
+        _min_nudges = int(getattr(self, "ratchet_min_nudges", 0) or 0)
+        if _n_nudges < _min_nudges:
+            logger.info(
+                "[GALFOR_RATCHET %s] after RELEASE %d: max cold lnL %.3f (walker "
+                "mean %.3f), %+.1f over the previous release < %.0f -- but only %d "
+                "of the required %d nudge(s) have run in this process "
+                "(GALFOR_RATCHET_MIN_NUDGES); ratcheting continues.", tag, k_done,
+                mx, mean, gain, gain_min, _n_nudges, _min_nudges)
+            return
         self._ratchet_stopped = True
         gate = self._ratchet_gate(moves) if moves is not None else None
         if gate is not None and hasattr(gate, "finish_ratchet"):
             gate.finish_ratchet()
-        # the refit cadence comes back NOW, not at the next drive: if the
-        # stage ends in this same iteration there is no next drive
+        # the refit cadence and the valve floor come back NOW, not at the next
+        # drive: if the stage ends in this same iteration there is no next drive
         self._ratchet_refit_only_on_nudge(moves)
+        self._ratchet_shutoff_floor(moves)
         # PERSIST the decision: a relaunch re-enters this stage with a fresh
         # process and would otherwise resume the schedule (clock reset or
         # not) and nudge again. The stamp is read back by _ratchet_enter.
@@ -1960,6 +1978,39 @@ class SearchStageProfileStep(RJRecipeStep):
             if is_noise_ratchet_gate(m):
                 return m
         return None
+
+    def _ratchet_shutoff_floor(self, moves, k=None, force_off=False) -> None:
+        """Hold the RJ shutoff valve open below a frequency while the ratchet
+        is active (user design 2026-10-02: "maybe don't do RJ shutoff during
+        the ratchet cycles ... you can shut off bands above 7 mHz if their
+        likelihoods converge as usual"). Sets ``rj_shutoff_min_freq`` on
+        every GB band move to ``GALFOR_RATCHET_SHUTOFF_MIN_FREQ`` Hz (default
+        7e-3; 0 disables) while a nudge can still come, and back to 0 at the
+        stop, the cycle ceiling and stage end. The valve itself reopens and
+        re-streaks the exempt pairs at its next judgment.
+        """
+        if getattr(self, "ratchet", None) is None or moves is None:
+            return
+        raw = os.environ.get("GALFOR_RATCHET_SHUTOFF_MIN_FREQ", "7e-3").strip()
+        fmin = float(raw) if raw else 0.0
+        if fmin < 0:
+            raise ValueError(f"GALFOR_RATCHET_SHUTOFF_MIN_FREQ={fmin} must be >= 0 Hz.")
+        active = (fmin > 0 and not force_off
+                  and not getattr(self, "_ratchet_stopped", False)
+                  and (k is None or int(k) < self.ratchet.total_iterations))
+        want = fmin if active else 0.0
+        changed = []
+        for m in gb_moves_in_tree(moves):
+            if float(getattr(m, "rj_shutoff_min_freq", 0.0) or 0.0) != want:
+                m.rj_shutoff_min_freq = want
+                changed.append(getattr(m, "name", "?"))
+        if changed:
+            logger.info(
+                "[GALFOR_RATCHET %s] RJ shutoff floor %s on %s: %s.",
+                self.stage_name or "gb_search",
+                f"{1e3 * want:.3g} mHz" if want else "LIFTED", changed,
+                "bands below it stay open while the ratchet is active" if want
+                else "the valve may shut converged pairs at every frequency again")
 
     def _ratchet_refit_only_on_nudge(self, moves, k=None, force_off=False) -> None:
         """Hand the F-stat refit clock to the ratchet while it is active.
@@ -2015,9 +2066,11 @@ class SearchStageProfileStep(RJRecipeStep):
         if getattr(self, "ratchet", None) is None:
             return
         k = int(k)
-        # the refit clock belongs to the ratchet while nudges can still come
-        # (also on a mid-cycle resume, k < 0, before this cycle's legs run)
+        # the refit clock and the valve floor belong to the ratchet while
+        # nudges can still come (also on a mid-cycle resume, k < 0, before
+        # this cycle's legs run)
         self._ratchet_refit_only_on_nudge(moves, k=k)
+        self._ratchet_shutoff_floor(moves, k=k)
         if k < 0:
             return
         gate = self._ratchet_gate(moves)
@@ -2312,9 +2365,10 @@ class SearchStageProfileStep(RJRecipeStep):
             self._ratchet_capture_reference(_k_next, sample)
             self._drive_ratchet(_k_next, moves, sample=sample)
         if stop:
-            # the stage is ending: the shared grid move leaves with its
-            # ordinary cadence, whatever the ratchet did with it
+            # the stage is ending: the shared moves leave with their ordinary
+            # cadence and an unfloored valve, whatever the ratchet did with them
             self._ratchet_refit_only_on_nudge(moves, force_off=True)
+            self._ratchet_shutoff_floor(moves, force_off=True)
         return stop
 
     def _stopping_rules(self, i, sample, sampler) -> bool:

@@ -9,8 +9,10 @@ next to the production template's wall time on the same grid.
         --direct-table wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5 --thresh 1e-3,1e-5
 
 Sweeps in ONE process (FEW and the table load once): ``--response-grid sparse,pixels`` (the
-dense response's grid) and ``--chunk-rows 1,2,4,8,16,32`` (rows per response call, timed over
-``--batch-rows`` rows each). Each (threshold, grid, chunk) prints its stage split and, on a GPU,
+dense response's grid), ``--lookup kernel,python`` (the fused C++/CUDA lookup-sum kernel vs the
+Python tracer + table + scatter-add) and ``--chunk-rows 1,2,4,8,16,32`` (rows per response call,
+timed over ``--batch-rows`` rows each). ``--band-hz 2.5e-4,2.5e-2`` builds the batch on the
+run's active band only (as the fit's adapter does). Each (threshold, grid, chunk) prints its stage split and, on a GPU,
 the cupy memory-pool footprint of that batch; ``--out`` appends one JSON line per run and a
 summary table (ms per template vs rows per call) closes each threshold.
 """
@@ -48,7 +50,11 @@ def main():
                     help="rows per response call in the batch; a comma list sweeps them (e.g. 1,2,4,8,16,32)")
     ap.add_argument("--response-grid", default="sparse",
                     help="dense response grid(s): sparse, pixels, or a comma list of both")
-    ap.add_argument("--out", default=None, help="append one JSON line per (threshold, grid, chunk) here")
+    ap.add_argument("--lookup", default="kernel",
+                    help="lookup path(s): kernel, python, or a comma list of both")
+    ap.add_argument("--band-hz", default="",
+                    help="f_lo,f_hi [Hz]: batch output restricted to these layers (default: all)")
+    ap.add_argument("--out", default=None, help="append one JSON line per (threshold, grid, lookup, chunk) here")
     ap.add_argument("--response", choices=("spline", "dense"), default="dense",
                     help="TDI-on-the-fly response: 'dense' (TDDenseTDIonTheFly: exact phases, geometry shared "
                          "across harmonics; needs a backend built with it) or 'spline' (TDTDIonTheFly)")
@@ -111,10 +117,16 @@ def main():
     wdm = WDMSettings(nf, nt, args.dt, force_backend=args.backend)
     table = WDMLookupTable.from_file(args.direct_table, force_backend=args.backend)
     grids = [g.strip() for g in args.response_grid.split(",") if g.strip()]
+    lookups = [g.strip() for g in args.lookup.split(",") if g.strip()]
     chunks = [int(c) for c in str(args.chunk_rows).split(",") if c.strip()]
-    directs = {g: WD.EMRIDirectWDM(gen, table, wdm, orbits=orb, tdi_config=tdi, t_start=W.REF, data_t0=data_t0,
-                                   mode_batch=args.mode_batch, force_backend=args.backend, response=args.response,
-                                   response_grid=g) for g in grids}
+    band = None
+    if args.band_hz:
+        f_lo, f_hi = (float(v) for v in args.band_hz.split(","))
+        band = (max(0, int(np.floor(f_lo / wdm.layer_df))), min(nf, int(np.ceil(f_hi / wdm.layer_df)) + 1))
+    directs = {f"{g}/{lk}": WD.EMRIDirectWDM(gen, table, wdm, orbits=orb, tdi_config=tdi, t_start=W.REF,
+                                             data_t0=data_t0, mode_batch=args.mode_batch, force_backend=args.backend,
+                                             response=args.response, response_grid=g, lookup=lk, f_band=band)
+               for g in grids for lk in lookups}
     pool = cp.get_default_memory_pool() if gpu else None
 
     wrap(WD.EMRIDirectWDM, "_mode_list", "1 mode list (FEW call #1 + handoff check)")
@@ -125,10 +137,12 @@ def main():
     wrap(WD.EMRIDirectWDM, "_dense_response", "  DENSE response (kernel + output splines)")
     wrap(TF.TDTDIonTheFly, "__init__", "  TOF input splines")
     wrap(TF.TDTDIonTheFly, "__call__", "  TOF response kernel + output splines")
+    wrap(WD.EMRIDirectWDM, "_handoff_may_trip", "  handoff bound (3 fundamentals)")
     wrap(WD, "harmonic_tracks_from_holder", "3 harmonic tracks")
     wrap(WD, "tracer_from_tof_output", "4 tracer (output spline evals)")
     wrap(WD, "accumulate_harmonic_batch", "5 lookup + scatter-add")
     wrap(type(table), "get_wdm_coeffs", "  table get_wdm_coeffs")
+    wrap(WD, "lookup_sum_kernel", "  FUSED lookup-sum kernel")
     wrap(WH, "wdm_chunk_of_td", "6 plunge chunks")
 
     def prod(thr):
@@ -143,7 +157,7 @@ def main():
                 f.write(json.dumps(rec) + "\n")
 
     base = dict(src=args.src, days=args.days, dt=args.dt, nf=nf, nt=nt, backend=args.backend,
-                response=args.response)
+                response=args.response, band=band)
     for thr in [float(x) for x in args.thresh.split(",")]:
         prod(thr)                                                        # warm-up
         sync()
@@ -163,7 +177,7 @@ def main():
                 direct(*params, mode_selection_threshold=thr)
             sync()
             t_dir = (time.perf_counter() - t0) / args.reps
-            print(f"\n[stages] response={args.response} grid={grid} thr={thr:g} modes={direct.last_stats.get('modes')} "
+            print(f"\n[stages] response={args.response} grid/lookup={grid} thr={thr:g} modes={direct.last_stats.get('modes')} "
                   f"n_fine={direct.last_stats.get('n_fine')} backend={args.backend} grid Nf={nf} Nt={nt} dt={args.dt} "
                   f"({args.days:g} d): direct {t_dir * 1e3:.0f} ms, production {t_prod * 1e3:.0f} ms (per template)",
                   flush=True)
@@ -204,9 +218,9 @@ def main():
         cols = [0] + (chunks if args.batch_rows > 0 else [])
         head = "  ".join(f"{('single' if c == 0 else f'{c}/call'):>8s}" for c in cols)
         print(f"\n[summary] {args.days:g} d thr={thr:g}: ms per template (production {t_prod * 1e3:.0f})\n"
-              f"  {'grid':8s}{head}", flush=True)
+              f"  {'grid/lookup':16s}{head}", flush=True)
         for grid in directs:
-            print(f"  {grid:8s}" + "  ".join(f"{summary.get((grid, c), float('nan')):8.0f}" for c in cols), flush=True)
+            print(f"  {grid:16s}" + "  ".join(f"{summary.get((grid, c), float('nan')):8.0f}" for c in cols), flush=True)
 
 
 if __name__ == "__main__":

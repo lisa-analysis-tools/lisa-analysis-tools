@@ -167,4 +167,92 @@ class TDDenseTDIWaveformWrap : public LISATDIonTheFlyWrap {
     inline int get_buffer_size(int N){return waveform->get_td_dense_buffer_size(N);}
 };
 
+// wdm_lookup_sum (fused sparse-response -> WDM lookup; lat_spline_tdi_waveform.hh).
+// Optional arrays (counts; the carrier arrays when carrier == 0) may be size 0.
+template<typename T>
+static T* wdm_lookup_array(array_type<T> a, const char *name, size_t n, bool optional)
+{
+    if (optional && a.size() == 0) return nullptr;
+#if !(defined(__CUDA_COMPILATION__) || defined(__CUDACC__))
+    if (a.size() != n)
+    {
+        throw std::invalid_argument(std::string("wdm_lookup_sum: ") + name + " has length " +
+            std::to_string(a.size()) + ", expected " + std::to_string(n) + ".");
+    }
+#else
+    (void)name; (void)n;
+#endif
+    return a.data();
+}
+
+inline void wdm_lookup_sum_binding(
+    array_type<double> out, int n_rows, array_type<uint64_t> counts,
+    int carrier, int n_temp, int K, array_type<double> t_knots, array_type<int> n_knots,
+    array_type<double> phase_coeffs,
+    int num_sub, array_type<int> sub_temp, array_type<int> sub_row, array_type<int> sub_mkn,
+    array_type<int> n_stop,
+    int N, int nch, array_type<double> x,
+    array_type<double> amp_y, array_type<double> amp_c1, array_type<double> amp_c2, array_type<double> amp_c3,
+    array_type<double> res_y, array_type<double> res_c1, array_type<double> res_c2, array_type<double> res_c3,
+    int n_lo, int n_hi, double t0, double layer_dt, double layer_df, int Nf, int Nt, int m_lo, int m_hi,
+    int num_m_layers, double fdot_max, double f_min,
+    array_type<double> coeff_c, array_type<double> coeff_s, int FD, int FF, double fdot0, double dfdot,
+    double f0, double df, double f_lo, double f_hi, int ref_odd)
+{
+    if ((m_hi <= m_lo) || (n_lo < 0) || (n_hi > Nt) || (nch <= 0) || (N < 2) || (FF < 2) || (FD < 1))
+        throw std::invalid_argument("wdm_lookup_sum: inconsistent grid/band/table sizes");
+    if (carrier && (K < 2 || n_temp < 1))
+        throw std::invalid_argument("wdm_lookup_sum: carrier needs K >= 2 knots and n_temp >= 1");
+    size_t ns = (size_t)num_sub;
+    size_t spl = ns * nch * N;
+    WDMLookupSumArgs a;
+    a.out = wdm_lookup_array(out, "out", (size_t)n_rows * nch * (m_hi - m_lo) * Nt, false);
+    a.counts = reinterpret_cast<unsigned long long *>(wdm_lookup_array(counts, "counts", 2, true));
+    a.carrier = carrier;
+    a.K = K;
+    a.t_knots = wdm_lookup_array(t_knots, "t_knots", (size_t)n_temp * K, !carrier);
+    a.n_knots = wdm_lookup_array(n_knots, "n_knots", (size_t)n_temp, !carrier);
+    a.phase_coeffs = wdm_lookup_array(phase_coeffs, "phase_coeffs", (size_t)n_temp * (K - 1) * 24, !carrier);
+    a.num_sub = num_sub;
+    a.sub_temp = wdm_lookup_array(sub_temp, "sub_temp", ns, !carrier);
+    a.sub_row = wdm_lookup_array(sub_row, "sub_row", ns, false);
+    a.sub_mkn = wdm_lookup_array(sub_mkn, "sub_mkn", 3 * ns, !carrier);
+    a.n_stop = wdm_lookup_array(n_stop, "n_stop", ns, false);
+    a.N = N;
+    a.nch = nch;
+    a.x = wdm_lookup_array(x, "x", spl, false);
+    a.amp_y = wdm_lookup_array(amp_y, "amp_y", spl, false);
+    a.amp_c1 = wdm_lookup_array(amp_c1, "amp_c1", spl, false);
+    a.amp_c2 = wdm_lookup_array(amp_c2, "amp_c2", spl, false);
+    a.amp_c3 = wdm_lookup_array(amp_c3, "amp_c3", spl, false);
+    a.res_y = wdm_lookup_array(res_y, "res_y", spl, false);
+    a.res_c1 = wdm_lookup_array(res_c1, "res_c1", spl, false);
+    a.res_c2 = wdm_lookup_array(res_c2, "res_c2", spl, false);
+    a.res_c3 = wdm_lookup_array(res_c3, "res_c3", spl, false);
+    a.n_lo = n_lo;
+    a.n_hi = n_hi;
+    a.t0 = t0;
+    a.layer_dt = layer_dt;
+    a.layer_df = layer_df;
+    a.Nf = Nf;
+    a.Nt = Nt;
+    a.m_lo = m_lo;
+    a.m_hi = m_hi;
+    a.num_m_layers = num_m_layers;
+    a.fdot_max = fdot_max;
+    a.f_min = f_min;
+    a.tab.coeff_c = wdm_lookup_array(coeff_c, "coeff_c", (size_t)FD * FF, false);
+    a.tab.coeff_s = wdm_lookup_array(coeff_s, "coeff_s", (size_t)FD * FF, false);
+    a.tab.FD = FD;
+    a.tab.FF = FF;
+    a.tab.fdot0 = fdot0;
+    a.tab.dfdot = dfdot;
+    a.tab.f0 = f0;
+    a.tab.df = df;
+    a.tab.f_lo = f_lo;
+    a.tab.f_hi = f_hi;
+    a.tab.ref_odd = ref_odd;
+    wdm_lookup_sum_wrap(a);
+}
+
 #endif // __BINDING_LAT_SPLINE_TDI_HPP__

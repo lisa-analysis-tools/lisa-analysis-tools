@@ -193,7 +193,7 @@ both (`#ifdef __CUDACC__`).
 - `LISAResponse.{cu,hh}` + `binding_flr.{cxx,hpp}` — arm projection / TDI (`response_part()`, `LISAResponseWrap`, `TDIConfigWrap`).
 - `domains.{cu,hpp}` — STFT/FD/WDM domain descriptors + STFT machinery; TDI flavor ints `TDI_XYZ/AET/AE`.
 - `lat_tdi_on_the_fly.{cu,hh}` — `LISATDIonTheFly` base + `OrbitsSplineCache`.
-- `lat_spline_tdi_waveform.{cu,hh}` + `binding_lat_spline_tdi.hpp` — `FD/TDSplineTDIWaveform`.
+- `lat_spline_tdi_waveform.{cu,hh}` + `binding_lat_spline_tdi.hpp` — `FD/TDSplineTDIWaveform`, `TDDenseTDIWaveform` (EMRI dense-phase response), and `wdm_lookup_sum` (the fused sparse-response -> WDM n_ref lookup sum, EMRI direct-to-WDM); `wdm_lookup_kernels.hh` — its header-only device helpers (mirror-mode cubic B-spline table eval, spline value/derivatives, DOPR853 phase derivatives, quarter-turn rule) for other sources' kernels.
 - `lat_chunked_het_kernels.hh`, `lat_wdm_fft.hh` — templated chunked-het kernels + WDM FFT helpers (shared with GB/SOBBH downstream).
 - `galactic_response.{cu,hpp}` — galactic-grid transfer functions.
 - Public headers for downstream: `orbits_view.hpp` (`OrbitsView` POD), `lisatools_header_abi.hpp` (ABI version + `LISATOOLS_IS_WRAPPER_OWNER`), `Detector.hpp`, `PSD.hpp`, `LISAResponse.hh`, `binding_flr.hpp`.
