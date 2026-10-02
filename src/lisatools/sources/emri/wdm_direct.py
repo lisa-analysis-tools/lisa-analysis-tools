@@ -174,15 +174,19 @@ def _total_phase(out, t, subs=None):
     return xp.asarray(tph) + xp.asarray(pref)[:, None, :]
 
 
-def tracer_from_tof_output(out, t_pixels, h=30.0, h_fdot=None, max_elems=None, subs=None):
+def tracer_from_tof_output(out, t_pixels, h=30.0, h_fdot=None, max_elems=None, subs=None, method=None):
     """Per-sub, per-channel ``(amp, phase, f, fdot)`` at ``t_pixels`` [absolute s].
 
     The channel signal is ``Re[amp exp(-i phase)]`` with ``phase = tdi_phase + phase_ref``
     (``TDTDIOutput.eval_tdi``; an :class:`ExactPhaseTDIOutput` adds its exact carrier instead).
-    ``f`` and ``fdot`` are central differences (step ``h``, ``h_fdot``) of that CONTINUOUS
-    phase, so they carry the Doppler shift of the channel (the source-frame f is off by ~1e-4 f,
-    a ~1% pixel error). A negative-frequency sub (a -m partner) is mirrored to positive
-    frequency: cos is even, so ``phase -> -phase``, ``f -> -f``, ``fdot -> -fdot``.
+    ``f`` and ``fdot`` are the first two derivatives of that CONTINUOUS phase over 2 pi, so they
+    carry the Doppler shift of the channel (the source-frame f is off by ~1e-4 f, a ~1% pixel
+    error). ``method``: ``"analytic"`` (default for an output with ``eval_tracer``, i.e.
+    :class:`SplinedTDIOutput` / :class:`ExactPhaseTDIOutput`; env ``EMRI_TRACER``) differentiates
+    the splines and the dense-output carrier exactly, one evaluation per pixel; ``"stencil"``
+    takes central differences (steps ``h``, ``h_fdot``) of the phase (any output). A
+    negative-frequency sub (a -m partner) is mirrored to positive frequency: cos is even, so
+    ``phase -> -phase``, ``f -> -f``, ``fdot -> -fdot``.
 
     ``subs`` (host integer array, optional): only these harmonics (rows of the output), for a
     mode-batched caller (needs an output with subset evaluation, :class:`SplinedTDIOutput`).
@@ -202,9 +206,17 @@ def tracer_from_tof_output(out, t_pixels, h=30.0, h_fdot=None, max_elems=None, s
         S = nch = 1
     budget = float(os.environ.get("EMRI_TRACER_MAX_ELEMS", 6e7)) if max_elems is None else float(max_elems)
     block = max(1, int(budget // max(1, S * nch)))
+    if method is None:
+        method = os.environ.get("EMRI_TRACER", "analytic")
+    if method not in ("analytic", "stencil"):
+        raise ValueError("tracer method must be 'analytic' or 'stencil'")
+    analytic = method == "analytic" and hasattr(out, "eval_tracer")
     parts = []
     for p0 in range(0, P, block):
         tb = t[p0:p0 + block]
+        if analytic:
+            parts.append(out.eval_tracer(tb, subs=subs))
+            continue
         amp, tph, pref = _spline_vals(out, tb, subs)
         amp = xp.asarray(amp)
         ph0 = xp.asarray(tph) + xp.asarray(pref)[:, None, :]
@@ -231,50 +243,73 @@ def _scatter_add(xp, acc, idx, vals):
 
 def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, Nt, dt, layer_dt,
                               layer_df, t0, Nt_sub=128, num_m_layers=2, fdot_axis_max=np.inf,
-                              pixel_edge=8, backend="cpu", sub_row=None, lookup_chunk=None):
+                              pixel_edge=8, backend="cpu", sub_row=None, lookup_chunk=None, m_lo=0,
+                              num_sub=None, lookup_kernel=None):
     """Vectorised :func:`_accumulate_harmonic_batch_loop`: ONE table evaluation for every
     (sub, channel, pixel) of the batch and one scatter-add, on the array module of ``acc``
     (numpy or cupy). Same arguments, same result up to summation order.
 
+    ``tracks``: the subs' :class:`HarmonicTrack` (their handoff pixels), or ``None`` when no
+    sub hands off inside ``n_ok`` (then ``num_sub`` or the tracer gives the number of subs).
     ``sub_row`` (optional, length num_sub): the template each sub belongs to; ``acc`` is then
-    ``(n_templates, nch, Nf, Nt)`` and many templates accumulate in one call (no plunge
+    ``(n_templates, nch, n_m, Nt)`` and many templates accumulate in one call (no plunge
     chunks allowed in that mode).
+    ``m_lo``: ``acc`` holds layers ``m_lo .. m_lo + n_m - 1`` (``n_m = acc.shape[-2]``) only;
+    the rest is dropped.
     ``lookup_chunk``: max (sub, channel, pixel) entries per table call (bounds the lookup's
     temporaries: ~6 arrays of (entries, 2 num_m_layers + 1) doubles); default from env
-    EMRI_DIRECT_LOOKUP_CHUNK or 2,000,000."""
+    EMRI_DIRECT_LOOKUP_CHUNK or 2,000,000.
+    ``lookup_kernel``: ``n_stop -> stats`` doing the lookup in the fused kernel
+    (:func:`lookup_sum_kernel`; ``n_stop`` = each sub's first pixel past its handoff); the
+    tracer is then unused (pass None). The plunge chunks stay here."""
     from ...wdm_het import tail_chunk_plan, wdm_chunk_of_td
     from ...utils.utility import get_array_module
 
     xp = get_array_module(acc)
-    amp, phase, f, fdot = (xp.asarray(a) for a in tracer)
-    S, nch, P = amp.shape
-    n_ok_x = xp.asarray(n_ok)
-    stats = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
-    k_h = np.array([handoff_pixel(tr, layer_dt, layer_df, fdot_axis_max) for tr in tracks])
-    before = xp.arange(P)[None, :] < xp.asarray(k_h)[:, None]                       # (S, P)
-    sel = before[:, None, :] & (xp.abs(fdot) <= fdot_axis_max) & (f > 2 * layer_df)  # (S, C, P)
-    stats["dropped_pixels"] = int(nch * int(before.sum()) - int(sel.sum()))
-    s_all, c_all, p_all = xp.nonzero(sel)
-    chunk = int(lookup_chunk or os.environ.get("EMRI_DIRECT_LOOKUP_CHUNK", 2_000_000))
-    sub_row_x = None if sub_row is None else xp.asarray(sub_row)
-    for j0 in range(0, int(s_all.size), chunk):
-        s_i, c_i, p_i = s_all[j0:j0 + chunk], c_all[j0:j0 + chunk], p_all[j0:j0 + chunk]
-        co, mm = table.get_wdm_coeffs(amp[s_i, c_i, p_i], phase[s_i, c_i, p_i], f[s_i, c_i, p_i],
-                                      fdot[s_i, c_i, p_i], n_ok_x[p_i],
-                                      num_m_layers=num_m_layers, out_of_support="zero")
-        co, mm = xp.asarray(co), xp.asarray(mm)
-        n_e = n_ok_x[p_i]
-        r_i = None if sub_row_x is None else sub_row_x[s_i]
-        for c in range(co.shape[1]):
-            good = mm[:, c] >= 0
-            idx = (c_i[good], mm[good, c], n_e[good])
-            if r_i is not None:
-                idx = (r_i[good],) + idx
-            _scatter_add(xp, acc, idx, co[good, c])
-        del co, mm
-    stats["lookup_pixels"] = int(s_all.size)
-    windows = {}
     n_ok_h = np.asarray(n_ok.get() if hasattr(n_ok, "get") else n_ok)
+    P = int(n_ok_h.size)
+    if tracks is not None:
+        S = len(tracks)
+    elif num_sub is not None:
+        S = int(num_sub)
+    else:
+        S = int(np.shape(tracer[0])[0])
+    if tracks is None:
+        k_h = np.full(S, P)
+    else:
+        k_h = np.array([handoff_pixel(tr, layer_dt, layer_df, fdot_axis_max) for tr in tracks], dtype=int)
+    n_m = int(acc.shape[-2])
+    stats = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
+    if lookup_kernel is not None:
+        n_stop = np.where(k_h < P, n_ok_h[np.minimum(k_h, P - 1)], n_ok_h[-1] + 1) if P else np.zeros(S, int)
+        stats.update(lookup_kernel(n_stop))
+    else:
+        amp, phase, f, fdot = (xp.asarray(a) for a in tracer)
+        nch = amp.shape[1]
+        n_ok_x = xp.asarray(n_ok_h)
+        before = xp.arange(P)[None, :] < xp.asarray(k_h)[:, None]                       # (S, P)
+        sel = before[:, None, :] & (xp.abs(fdot) <= fdot_axis_max) & (f > 2 * layer_df)  # (S, C, P)
+        stats["dropped_pixels"] = int(nch * int(before.sum()) - int(sel.sum()))
+        s_all, c_all, p_all = xp.nonzero(sel)
+        chunk = int(lookup_chunk or os.environ.get("EMRI_DIRECT_LOOKUP_CHUNK", 2_000_000))
+        sub_row_x = None if sub_row is None else xp.asarray(sub_row)
+        for j0 in range(0, int(s_all.size), chunk):
+            s_i, c_i, p_i = s_all[j0:j0 + chunk], c_all[j0:j0 + chunk], p_all[j0:j0 + chunk]
+            co, mm = table.get_wdm_coeffs(amp[s_i, c_i, p_i], phase[s_i, c_i, p_i], f[s_i, c_i, p_i],
+                                          fdot[s_i, c_i, p_i], n_ok_x[p_i],
+                                          num_m_layers=num_m_layers, out_of_support="zero")
+            co, mm = xp.asarray(co), xp.asarray(mm)
+            n_e = n_ok_x[p_i]
+            r_i = None if sub_row_x is None else sub_row_x[s_i]
+            for c in range(co.shape[1]):
+                good = (mm[:, c] >= m_lo) & (mm[:, c] < m_lo + n_m)
+                idx = (c_i[good], mm[good, c] - m_lo, n_e[good])
+                if r_i is not None:
+                    idx = (r_i[good],) + idx
+                _scatter_add(xp, acc, idx, co[good, c])
+            del co, mm
+        stats["lookup_pixels"] = int(s_all.size)
+    windows = {}
     for s in range(S):
         if k_h[s] < n_ok_h.size:
             n_h = int(n_ok_h[k_h[s]])
@@ -288,9 +323,84 @@ def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, 
         td_all = xp.asarray(tail_td(ts))
         for s, klo, khi in items:
             chunk = xp.asarray(wdm_chunk_of_td(td_all[s], 0, Nf, Nt_sub, dt, backend=backend))
-            acc[:, :chunk.shape[-2], n0 + klo:n0 + khi] += chunk[:, :, klo:khi]
+            hi = min(m_lo + n_m, chunk.shape[-2])                     # chunk rows = global layers
+            acc[:, :hi - m_lo, n0 + klo:n0 + khi] += chunk[:, m_lo:hi, klo:khi]
             stats["chunk_pixels"] += khi - klo
     return stats
+
+
+def table_kernel_view(table):
+    """The lookup table as the fused kernel reads it (cached on the table), or ``None`` when the
+    kernel cannot reproduce its evaluation: needs ``INTERP_METHOD == "spline"`` (the prefiltered
+    uniform cubic B-spline, :class:`lisatools.domains._UniformCubicSpline`), an ``n_ref`` build
+    and the ``quarter_turn`` basis cycle. Coefficients: the cos table (``Re(table_cx)``) and the
+    sin table with the build's ``(-1)^block`` bake undone (``WDMLookupTable._sin_unbaked_coeffs``)."""
+    if (getattr(table, "INTERP_METHOD", None) != "spline"
+            or getattr(table, "build_kind", None) not in ("n_ref_only", "n_ref_complex")
+            or getattr(table, "BASIS_CYCLE", None) != "quarter_turn"):
+        return None
+    xp = table.xp
+    ci = table.table_cx_re_interpolate if table.build_kind == "n_ref_complex" else table.table_cos_interpolate
+    if getattr(table, "_sin_unbaked_interp", None) is None:
+        table._sin_unbaked_coeffs(xp.zeros(1), xp.zeros(1))          # builds it (lazily, once)
+    si = table._sin_unbaked_interp
+    key = (id(ci), id(si))
+    view = getattr(table, "_kernel_view", None)
+    if view is not None and view["key"] == key:
+        return view
+    if ci.two_d:
+        (fd0, dfd, FD), (f0, df, FF) = ci.axes
+    else:
+        (f0, df, FF), = ci.axes
+        fd0, dfd, FD = 0.0, 1.0, 1
+    fv = table.f_vals_norm
+    view = dict(key=key, coeff_c=xp.ascontiguousarray(ci.coeffs, dtype=xp.float64).reshape(-1),
+                coeff_s=xp.ascontiguousarray(si.coeffs, dtype=xp.float64).reshape(-1),
+                FD=int(FD), FF=int(FF), fdot0=float(fd0), dfdot=float(dfd), f0=float(f0), df=float(df),
+                f_lo=float(fv.min()), f_hi=float(fv.max()), ref_odd=int((table.m_ref + table.n_ref) % 2),
+                layer_df=float(table.layer_df))
+    table._kernel_view = view
+    return view
+
+
+def lookup_sum_kernel(backend, resp, acc, table, *, sub_row, n_stop, n_lo, n_hi, t0, layer_dt, Nf, m_lo,
+                      num_m_layers, fdot_axis_max, f_min):
+    """The fused lookup: ``acc[sub_row[s], ch, m - m_lo, n] +=`` every harmonic ``s``'s n_ref
+    lookup over pixels ``n_lo <= n < min(n_hi, n_stop[s])``, straight from the sparse response
+    ``resp`` (:class:`SplinedTDIOutput` / :class:`ExactPhaseTDIOutput`) -- the C++/CUDA
+    ``wdm_lookup_sum`` of the backend. Same result as :func:`tracer_from_tof_output` (analytic) +
+    :func:`accumulate_harmonic_batch`'s table lookup, up to summation order; nothing per pixel
+    is materialised. ``acc``: C-contiguous float64 ``(n_rows, nch, n_m, Nt)`` on the backend.
+    Returns ``dict(lookup_pixels, dropped_pixels)``."""
+    xp = backend.xp
+    if acc.ndim != 4 or acc.dtype != np.float64 or not acc.flags.c_contiguous:
+        raise ValueError("lookup_sum_kernel: acc must be a C-contiguous float64 (n_rows, nch, n_m, Nt) array")
+    n_rows, nch, n_m, Nt = (int(v) for v in acc.shape)
+    ki = resp.kernel_inputs()
+    tv = table_kernel_view(table)
+    if tv is None:
+        raise ValueError("lookup_sum_kernel: the table is not a spline-interpolated n_ref table")
+    if ki["nch"] != nch:
+        raise ValueError(f"lookup_sum_kernel: response has {ki['nch']} channels, acc {nch}")
+
+    def i32(a):
+        return xp.ascontiguousarray(xp.asarray(np.asarray(a, dtype=np.int32).reshape(-1)))
+
+    no_d = xp.zeros(0, dtype=xp.float64)
+    no_i = xp.zeros(0, dtype=xp.int32)
+    counts = xp.zeros(2, dtype=xp.uint64)
+    backend.wdm_lookup_sum(
+        acc.reshape(-1), n_rows, counts,
+        int(ki["carrier"]), int(ki.get("n_temp", 0)), int(ki.get("K", 0)), ki.get("t_knots", no_d),
+        ki.get("n_knots", no_i), ki.get("C", no_d),
+        int(ki["num_sub"]), ki.get("sub_temp", no_i), i32(sub_row), ki.get("sub_mkn", no_i), i32(n_stop),
+        int(ki["N"]), nch, ki["x"], *ki["amp"], *ki["res"],
+        int(n_lo), int(n_hi), float(t0), float(layer_dt), float(tv["layer_df"]), int(Nf), Nt, int(m_lo),
+        int(m_lo) + n_m, int(num_m_layers), float(fdot_axis_max), float(f_min),
+        tv["coeff_c"], tv["coeff_s"], tv["FD"], tv["FF"], tv["fdot0"], tv["dfdot"], tv["f0"], tv["df"],
+        tv["f_lo"], tv["f_hi"], tv["ref_odd"])
+    c = np.asarray(counts.get() if hasattr(counts, "get") else counts)
+    return dict(lookup_pixels=int(c[0]), dropped_pixels=int(c[1]))
 
 
 def _accumulate_harmonic_batch_loop(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, Nt, dt, layer_dt,
@@ -427,6 +537,27 @@ def _dense_on_grid(t_int, C, t_new):
     return out
 
 
+def dense_eval_derivs(c, s):
+    """The nested DOPR853 polynomial and its first two ``s``-derivatives.
+
+    ``c`` (..., 8) coefficients, ``s`` broadcastable to ``c[..., 0]``. Horner with forward-mode
+    derivatives through ``r1 + s(r2 + s1(r3 + s(r4 + s1(r5 + s(r6 + s1(r7 + s r8))))))``,
+    ``s1 = 1 - s``: a step ``q = c + s p`` gives ``q' = p + s p'``, ``q'' = 2 p' + s p''``; a step
+    ``q = c + s1 p`` gives ``q' = -p + s1 p'``, ``q'' = -2 p' + s1 p''``. Returns ``(P, dP/ds,
+    d2P/ds2)``; divide by ``h`` and ``h**2`` for time derivatives. The C++ lookup-sum kernel runs
+    the same recursion (cutils/wdm_lookup_kernels.hh: wdm_dense_phase_derivs)."""
+    s1 = 1.0 - s
+    v = c[..., 7]
+    d1 = 0.0 * v
+    d2 = 0.0 * v
+    for j, use_s in ((6, True), (5, False), (4, True), (3, False), (2, True), (1, False), (0, True)):
+        if use_s:
+            d2, d1, v = 2.0 * d1 + s * d2, v + s * d1, c[..., j] + s * v
+        else:
+            d2, d1, v = -2.0 * d1 + s1 * d2, -v + s1 * d1, c[..., j] + s1 * v
+    return v, d1, d2
+
+
 def dense_phase_eval(t_k, C, t):
     """Evaluate DOPR853 dense-output coefficients ``C`` (K-1, P, 8) at ``t`` (reference for tests)."""
     t = np.asarray(t, dtype=float)
@@ -501,13 +632,13 @@ class SplinedTDIOutput:
     def _subs(self, subs):
         return np.arange(self.num_sub) if subs is None else np.asarray(subs, dtype=np.int64).reshape(-1)
 
-    def _eval_chan(self, spl, t, subs):
+    def _eval_chan(self, spl, t, subs, derivative=0):
         """A per-(harmonic, channel) spline at the shared times ``t``: ``(len(subs), nch, M)``."""
         xp = self.xp
         t = xp.asarray(t, dtype=float)
         n = subs.size
         ind = xp.asarray(subs[:, None] * self.nch + np.arange(self.nch)[None, :])
-        return spl(xp.tile(t, (n, self.nch, 1)), ind_interps=ind)
+        return spl(xp.tile(t, (n, self.nch, 1)), ind_interps=ind, derivative=derivative)
 
     def carrier(self, t, subs=None):
         """Carrier phase ``(len(subs), len(t))``."""
@@ -515,6 +646,30 @@ class SplinedTDIOutput:
         subs = self._subs(subs)
         t = xp.asarray(t, dtype=float)
         return self._car_spl(xp.tile(t, (subs.size, 1)), ind_interps=xp.asarray(subs))
+
+    def carrier_derivs(self, t, subs=None):
+        """Carrier phase and its first two time derivatives, each ``(len(subs), len(t))``."""
+        xp = self.xp
+        subs = self._subs(subs)
+        tt = xp.tile(xp.asarray(t, dtype=float), (subs.size, 1))
+        ind = xp.asarray(subs)
+        return tuple(self._car_spl(tt, ind_interps=ind, derivative=d) for d in (0, 1, 2))
+
+    def eval_tracer(self, t, subs=None):
+        """``(amp, phase, f, fdot)`` at times ``t`` with ANALYTIC derivatives, one evaluation
+        per time: ``f = (carrier' + r') / 2 pi`` and ``fdot = (carrier'' + r'') / 2 pi`` (the
+        residual spline's own derivatives, the carrier's exact ones). A negative-frequency sub
+        (a -m partner) is mirrored as in :func:`tracer_from_tof_output`. Each ``(len(subs),
+        nch, len(t))``."""
+        xp = self.xp
+        subs = self._subs(subs)
+        car, car1, car2 = self.carrier_derivs(t, subs)
+        amp = self._eval_chan(self._amp_spl, t, subs)
+        ph = self._eval_chan(self._res_spl, t, subs) + car[:, None, :]
+        f = (self._eval_chan(self._res_spl, t, subs, derivative=1) + car1[:, None, :]) / (2 * np.pi)
+        fdot = (self._eval_chan(self._res_spl, t, subs, derivative=2) + car2[:, None, :]) / (2 * np.pi)
+        neg = f < 0
+        return amp, xp.where(neg, -ph, ph), xp.where(neg, -f, f), xp.where(neg, -fdot, fdot)
 
     def eval_spline_vals(self, t, subs=None):
         subs = self._subs(subs)
@@ -529,6 +684,29 @@ class SplinedTDIOutput:
     def eval_tdi(self, t, subs=None):
         amp, res, car = self.eval_spline_vals(t, subs)
         return self.xp.real(amp * self.xp.exp(-1j * (res + car[:, None, :])))
+
+    def kernel_inputs(self):
+        """Arrays of the fused lookup-sum kernel (:func:`lookup_sum_kernel`): the amplitude and
+        phase splines as GBT CubicSplineInterpolant flats (ninterps ``num_sub * nch``, row
+        ``s * nch + ch``) and the carrier. Here the carrier spline is folded into the phase
+        spline (a cubic spline is linear in its data on fixed knots: the spline of
+        ``tdi_phase + phase_ref`` has the summed coefficients) and the kernel runs without one."""
+        xp = self.xp
+        S, nch = self.num_sub, self.nch
+        res = []
+        for name in ("y_flat", "c1_flat", "c2_flat", "c3_flat"):
+            r = getattr(self._res_spl, name).reshape(S, nch, -1)
+            c = getattr(self._car_spl, name).reshape(S, 1, -1)
+            res.append(xp.ascontiguousarray(r + c).reshape(-1))
+        return self._kernel_common(dict(carrier=0, res=res))
+
+    def _kernel_common(self, d):
+        xp = self.xp
+        a = self._amp_spl
+        d.update(N=int(a.length), nch=self.nch, num_sub=self.num_sub,
+                 x=xp.ascontiguousarray(a.x_flat, dtype=xp.float64),
+                 amp=[xp.ascontiguousarray(getattr(a, k), dtype=xp.float64) for k in ("y_flat", "c1_flat", "c2_flat", "c3_flat")])
+        return d
 
 
 class ExactPhaseTDIOutput(SplinedTDIOutput):
@@ -576,6 +754,54 @@ class ExactPhaseTDIOutput(SplinedTDIOutput):
         c = C[seg]
         return c[..., 0] + s * (c[..., 1] + s1 * (c[..., 2] + s * (c[..., 3] + s1 * (c[..., 4] + s * (
             c[..., 5] + s1 * (c[..., 6] + s * c[..., 7]))))))
+
+    def _P3_derivs(self, b, t):
+        """``_P3`` and its first two time derivatives, each ``(len(t), 3)``; outside the
+        trajectory the phase is held at the nearest end, so both derivatives are zero there."""
+        xp = self.xp
+        tk, C = self._tk[b], self._C[b]
+        t_in = xp.asarray(t, dtype=float)
+        t = xp.clip(t_in, tk[0], tk[-1])
+        held = ((t_in < tk[0]) | (t_in > tk[-1]))[:, None]
+        seg = xp.clip(xp.searchsorted(tk, t, side="right") - 1, 0, tk.size - 2)
+        h = (tk[seg + 1] - tk[seg])[:, None]
+        v, d1, d2 = dense_eval_derivs(C[seg], ((t - tk[seg]) / (tk[seg + 1] - tk[seg]))[:, None])
+        return v, xp.where(held, 0.0, d1 / h), xp.where(held, 0.0, d2 / h ** 2)
+
+    def carrier_derivs(self, t, subs=None):
+        xp = self.xp
+        subs = self._subs(subs)
+        t = xp.asarray(t, dtype=float)
+        outs = [xp.empty((subs.size, t.size)) for _ in range(3)]
+        temp = self._temp[subs]
+        for b in np.unique(temp):
+            pos = np.flatnonzero(temp == b)
+            mk = self._mkn[xp.asarray(subs[pos])]
+            for o, P in zip(outs, self._P3_derivs(int(b), t)):
+                o[xp.asarray(pos)] = mk @ P.T
+        return tuple(outs)
+
+    def kernel_inputs(self):
+        """Kernel arrays (see :meth:`SplinedTDIOutput.kernel_inputs`) with the EXACT carrier: the
+        templates' knots padded to a common stride ``K`` (``(n_temp, K)``, the last knot
+        repeated), ``n_knots``, the DOPR853 coefficients ``(n_temp, K - 1, 3, 8)``, ``sub_temp``
+        and ``sub_mkn``; the phase spline is the residual."""
+        xp = self.xp
+        n_temp = len(self._tk)
+        K = max(int(tk.size) for tk in self._tk)
+        t_knots = xp.empty((n_temp, K))
+        C = xp.zeros((n_temp, K - 1, 3, 8))
+        for b, (tk, Cb) in enumerate(zip(self._tk, self._C)):
+            t_knots[b, :tk.size] = tk
+            t_knots[b, tk.size:] = tk[-1]
+            C[b, :tk.size - 1] = Cb
+        r = self._res_spl
+        return self._kernel_common(dict(
+            carrier=1, n_temp=n_temp, K=K, t_knots=t_knots.reshape(-1), C=C.reshape(-1),
+            n_knots=xp.asarray(np.array([int(tk.size) for tk in self._tk], dtype=np.int32)),
+            sub_temp=xp.asarray(self._temp.astype(np.int32)),
+            sub_mkn=xp.asarray(np.rint(self._mkn_host).astype(np.int32).reshape(-1)),
+            res=[xp.ascontiguousarray(getattr(r, k), dtype=xp.float64) for k in ("y_flat", "c1_flat", "c2_flat", "c3_flat")]))
 
     def carrier(self, t, subs=None):
         """``Phi_s(t)`` for harmonics ``subs`` at the shared times ``t``: ``(len(subs), len(t))``."""
@@ -671,7 +897,7 @@ class EMRIDirectWDM:
     def __init__(self, few_gen, table, wdm_set, *, orbits, tdi_config, t_start, data_t0,
                  Nt_sub=128, n_fine=None, fine_dt=3600.0, fine_dt_plunge=80.0, mode_batch=None,
                  pixel_edge=8, num_m_layers=2, interp="spline", force_backend="cpu", feed="knots",
-                 response="spline", response_grid=None, sparse_dt=None):
+                 response="spline", response_grid=None, sparse_dt=None, lookup=None, f_band=None):
         self.few_gen, self.table, self.wdm = few_gen, table, wdm_set
         self.orbits, self.tdi_config = orbits, tdi_config
         self.t_start, self.data_t0 = float(t_start), float(data_t0)
@@ -720,8 +946,70 @@ class EMRIDirectWDM:
         # NOTE: this switches the passed table's interpolators (set_interp_method).
         if interp is not None and getattr(table, "INTERP_METHOD", None) != interp:
             table.set_interp_method(interp)
+        # "kernel": the fused C++/CUDA lookup sum (lookup_sum_kernel) for a dense response,
+        # nothing per pixel materialised; "python": analytic tracer + get_wdm_coeffs +
+        # scatter-add in blocks of harmonics. A kernel request falls back to Python (warned
+        # once) when the backend module, the response or the table cannot run it.
+        if lookup is None:
+            lookup = os.environ.get("EMRI_DIRECT_LOOKUP", "kernel")
+        if lookup not in ("kernel", "python"):
+            raise ValueError("lookup must be 'kernel' or 'python'")
+        self.lookup = lookup
+        self._kernel_fallback_warned = False
+        # batch() returns layers [m_lo, m_hi) only (None: all Nf): the run's active band
+        # (EMRIDirectWDMSignalGen sets it); a 6-month template keeps ~1/8 of the grid
+        self.f_band = None if f_band is None else (int(f_band[0]), int(f_band[1]))
         self.last_stats = {}
         self.last_failed_rows = []
+
+    def _band(self):
+        if self.f_band is None:
+            return 0, int(self.wdm.Nf)
+        m_lo, m_hi = self.f_band
+        if not 0 <= m_lo < m_hi <= int(self.wdm.Nf):
+            raise ValueError(f"f_band {self.f_band} outside [0, {self.wdm.Nf}]")
+        return m_lo, m_hi
+
+    def _kernel_backend(self, out):
+        """The backend whose fused lookup kernel serves the response ``out``, or ``None`` (the
+        Python lookup runs)."""
+        if self.lookup != "kernel":
+            return None
+        from ... import get_backend
+
+        be = get_backend(self.force_backend)
+        why = None
+        if getattr(be, "wdm_lookup_sum", None) is None:
+            why = "the backend module was built without wdm_lookup_sum"
+        elif not hasattr(out, "kernel_inputs"):
+            why = "the response output has no kernel inputs (response='spline')"
+        elif table_kernel_view(self.table) is None:
+            why = "the table is not a spline-interpolated n_ref quarter_turn table"
+        if why is None:
+            return be
+        if not self._kernel_fallback_warned:
+            import warnings
+
+            warnings.warn(f"EMRIDirectWDM: lookup='kernel' unavailable ({why}); using the Python lookup")
+            self._kernel_fallback_warned = True
+        return None
+
+    def _lookup_fn(self, be, out, acc4, sub_row, n_ok, m_lo):
+        """``n_stop -> stats`` running the fused kernel into ``acc4`` (n_rows, nch, n_m, Nt; layers
+        from ``m_lo``) over the contiguous pixels ``n_ok``."""
+        n_ok = np.asarray(n_ok)
+        if n_ok.size and not np.all(np.diff(n_ok) == 1):
+            raise ValueError("the fused lookup needs a contiguous pixel range")
+
+        def run(n_stop):
+            if not n_ok.size:
+                return dict(lookup_pixels=0, dropped_pixels=0)
+            return lookup_sum_kernel(
+                be, out, acc4, self.table, sub_row=sub_row, n_stop=n_stop, n_lo=int(n_ok[0]),
+                n_hi=int(n_ok[-1]) + 1, t0=self.data_t0, layer_dt=self.wdm.layer_dt, Nf=self.wdm.Nf,
+                m_lo=m_lo, num_m_layers=self.num_m_layers, fdot_axis_max=self.fdot_axis_max,
+                f_min=2 * self.wdm.layer_df)
+        return run
 
     def _few_holder(self, few_args, few_kwargs, new_t, mode_selection=None):
         """ONE FEW call on the fine grid ``new_t`` (FEW clock) -> host sparse holder.
@@ -797,23 +1085,50 @@ class EMRIDirectWDM:
             H = self._few_holder(few_args, few_kwargs, self._fine_grid(None))
         modes = [(int(l), int(m), int(k), int(n)) for l, m, k, n in zip(H.ls, H.ms, H.ks, H.ns)]
         n_in, t_rel = self._pixel_times(H)
-        integ = self.few_gen.inspiral_generator.inspiral_generator
-        tracks = harmonic_tracks_from_holder(H, integ, t_rel, a=few_args[2], xI0=few_args[5]) if t_rel.size else []
+        tracks = self._maybe_tracks(H, few_args, t_rel)
         self._last_holder, self._last_tracks, self._last_track_n = H, tracks, n_in
         return modes, self._chunk_start(H, few_args, tracks=tracks, t_rel=t_rel)
 
-    def _chunk_start(self, H, few_args, tracks=None, t_rel=None):
+    def _handoff_may_trip(self, H, t_rel):
+        """Whether ANY harmonic of ``H`` can hand off to the plunge chunk at the times ``t_rel``
+        (FEW clock), from a bound over the three fundamentals: ``|fdot_s| <= sum_j M_j
+        |Omega'_j| / 2 pi`` and ``|fddot_s| <= sum_j M_j |Omega''_j| / 2 pi`` with ``M_j`` the
+        largest ``|(m, k, n)_j|`` of the holder's modes (the -m partners have the same). False
+        means :func:`handoff_pixel` cannot trip for any of them (no tracks needed); True means
+        it may (the exact per-harmonic tracks decide). Env ``EMRI_DIRECT_HANDOFF_BOUND=0``
+        always answers True (exact tracks every call)."""
+        if os.environ.get("EMRI_DIRECT_HANDOFF_BOUND", "1") == "0":
+            return True
+        integ = self.few_gen.inspiral_generator.inspiral_generator
+        M = np.max(np.abs(np.stack([np.asarray(H.ms), np.asarray(H.ks), np.asarray(H.ns)])), axis=1).astype(float)
+        fdot_b = np.abs(_phase_columns(integ, t_rel, 2)) @ M / (2 * np.pi)
+        fddot_b = np.abs(_phase_columns(integ, t_rel, 3)) @ M / (2 * np.pi)
+        tau = WDM_HALF_SUPPORT_LAYERS * self.wdm.layer_dt
+        return bool(np.any((np.pi / 3.0) * fddot_b * tau ** 3 > 0.1) or np.any(fdot_b > self.fdot_axis_max))
+
+    def _maybe_tracks(self, H, few_args, t_rel):
+        """Per-harmonic tracks at ``t_rel`` when a harmonic may hand off there, else ``None``
+        (no handoff: the bound of :meth:`_handoff_may_trip` -- the tracks are needed only to
+        find handoff pixels)."""
+        if not np.size(t_rel):
+            return []
+        if not self._handoff_may_trip(H, t_rel):
+            return None
+        integ = self.few_gen.inspiral_generator.inspiral_generator
+        return harmonic_tracks_from_holder(H, integ, t_rel, a=few_args[2], xI0=few_args[5])
+
+    def _chunk_start(self, H, few_args, tracks="compute", t_rel=None):
         """Earliest time (FEW clock) at which any harmonic of the holder ``H`` hands off to the
         plunge chunk inside the window, or ``None`` if none does. The chunk reads the dense
-        response, so the fine grid must be dense from there on."""
+        response, so the fine grid must be dense from there on. ``tracks``: the holder's tracks
+        at ``t_rel``, ``None`` (proved not to hand off) or ``"compute"``."""
         t_arr = np.asarray(H.t_arr)
         lo = self.data_t0 - self.t_start
-        if tracks is None:
+        if isinstance(tracks, str):
             _, t_rel = self._pixel_times(H)
-            integ = self.few_gen.inspiral_generator.inspiral_generator
-            tracks = harmonic_tracks_from_holder(H, integ, t_rel, a=few_args[2], xI0=few_args[5]) if t_rel.size else []
+            tracks = self._maybe_tracks(H, few_args, t_rel)
         first = np.inf
-        for tr in tracks:
+        for tr in tracks or []:
             k = handoff_pixel(tr, self.wdm.layer_dt, self.wdm.layer_df, self.fdot_axis_max)
             if k < t_rel.size:
                 first = min(first, float(t_rel[k]))
@@ -983,16 +1298,26 @@ class EMRIDirectWDM:
         ok_t = (t_pix > x[:, 0].max()) & (t_pix < x[:, -1].min()) & (t_pix - self.t_start <= t_traj_end)
         n_ok, tt = n_all[ok_t], t_pix[ok_t]
         totals = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
+        be = self._kernel_backend(out)
         if n_ok.size:
-            pos = np.searchsorted(n_tr, n_ok)
-            assert np.array_equal(n_tr[pos], n_ok)
-            tracks = [subset_track(t, pos) for t in tracks_pix]
-            tracer = tracer_from_tof_output(out, xp.asarray(tt))
-            assert tracer[0].shape[0] == len(tracks), (tracer[0].shape, len(tracks))
+            tracks = None
+            if tracks_pix is not None:                     # a harmonic may hand off (bound)
+                pos = np.searchsorted(n_tr, n_ok)
+                assert np.array_equal(n_tr[pos], n_ok)
+                tracks = [subset_track(t, pos) for t in tracks_pix]
+            nch = self.tdi_config.nchannels
+            num_sub = int(np.shape(x)[0])
+            if be is None:
+                tracer = tracer_from_tof_output(out, xp.asarray(tt))
+                assert tracks is None or tracer[0].shape[0] == len(tracks), (tracer[0].shape, len(tracks))
+                kern = None
+            else:
+                tracer = None
+                kern = self._lookup_fn(be, out, acc[None], np.zeros(num_sub, dtype=np.int32), n_ok, 0)
 
             def tail_td(ts, out=out, x_lo=float(x[:, 0].max()), x_hi=float(x[:, -1].min())):
                 live = (ts > x_lo) & (ts < x_hi)
-                td = xp.zeros((x.shape[0], tracer[0].shape[1], ts.size))
+                td = xp.zeros((x.shape[0], nch, ts.size))
                 if bool(xp.any(live)):
                     td[:, :, live] = xp.asarray(out.eval_tdi(ts[live]))
                 return td
@@ -1000,8 +1325,10 @@ class EMRIDirectWDM:
             totals = accumulate_harmonic_batch(
                 acc, self.table, tracks, tracer, n_ok, tail_td, Nf=Nf, Nt=Nt, dt=dt, layer_dt=ldt,
                 layer_df=ldf, t0=self.data_t0, Nt_sub=self.Nt_sub, num_m_layers=self.num_m_layers,
-                fdot_axis_max=self.fdot_axis_max, pixel_edge=self.pixel_edge, backend=self.force_backend)
-        self.last_stats = dict(modes=len(modes), n_fine=self.n_fine, feed="knots", chunk_start=chunk_start, **totals)
+                fdot_axis_max=self.fdot_axis_max, pixel_edge=self.pixel_edge, backend=self.force_backend,
+                num_sub=num_sub, lookup_kernel=kern)
+        self.last_stats = dict(modes=len(modes), n_fine=self.n_fine, feed="knots", chunk_start=chunk_start,
+                               lookup="python" if be is None else "kernel", **totals)
         return WDMSignal(acc, wdm)
 
     def __call__(self, *few_args, **few_kwargs):
@@ -1097,9 +1424,9 @@ class EMRIDirectWDM:
         """Templates for many parameter rows, ``chunk_rows`` per response call (bounds GPU memory:
         one 6-month production-grid template is ~150 MB of WDM coefficients).
 
-        ``consume(row_indices, arr)`` (optional) receives each chunk's ``(n, nch, Nf, Nt)`` array
-        and nothing is kept; otherwise the full ``(n_rows, nch, Nf, Nt)`` array is returned.
-        ``last_stats`` sums the chunks' stats.
+        ``consume(row_indices, arr)`` (optional) receives each chunk's ``(n, nch, n_m, Nt)`` array
+        and nothing is kept; otherwise the full ``(n_rows, nch, n_m, Nt)`` array is returned
+        (``n_m = m_hi - m_lo`` with ``f_band``, else ``Nf``). ``last_stats`` sums the chunks' stats.
 
         FEW's out-of-domain failures are raised as
         :class:`~lisatools.utils.exceptions.WaveformDomainError` (``few_domain_guard``). With
@@ -1133,8 +1460,9 @@ class EMRIDirectWDM:
 
         ``rows``: parameter rows (as for ``__call__``). FEW runs once per row (it is a
         single-template generator); every row whose harmonics stay on the lookup feeds one
-        response kernel launch (num_sub x n_rows blocks fill the GPU), one tracer evaluation
-        and one table call + scatter-add into ``(n_rows, nch, Nf, Nt)``. A row that hands off
+        response kernel launch (num_sub x n_rows blocks fill the GPU), then ONE fused lookup-sum
+        kernel (``lookup="kernel"``) or the Python tracer + table call + scatter-add in blocks of
+        harmonics, into ``(n_rows, nch, n_m, Nt)`` (layers ``f_band``). A row that hands off
         to the plunge chunk is built alone with ``__call__``. Returns the array (backend xp).
         A row FEW refuses (WaveformDomainError) is left zero and listed in ``last_failed_rows``
         when ``skip_domain_errors``; otherwise the error propagates.
@@ -1151,19 +1479,20 @@ class EMRIDirectWDM:
         n_all = np.arange(self.pixel_edge, Nt - self.pixel_edge)
         t_pix = self.data_t0 + n_all * ldt
         T_traj = self.data_t0 - self.t_start + span + 2000.0
-        out_arr = xp.zeros((len(rows), self.tdi_config.nchannels, Nf, Nt))
+        m_lo, m_hi = self._band()
+        out_arr = xp.zeros((len(rows), self.tdi_config.nchannels, m_hi - m_lo, Nt))
         few_kwargs = dict(few_kwargs)
         t_fine = self._fine_grid(None)
         fly = EMRITDIonFly(self.few_gen, self.orbits, self.tdi_config, dt, T_traj, self.t_start,
                            frame="icrs_special", t_fine_window=(self.data_t0, self.data_t0 + span), t_fine=t_fine)
-        feeds, tracks, rows_in, n_trs, t_ends, grids = [], [], [], [], [], []
+        feeds, n_subs, rows_in, t_ends, grids = [], [], [], [], []
         stats = dict(rows=len(rows), alone=0, subs=0, failed=0)
         for r, p in enumerate(rows):
             try:
                 with few_domain_guard():
                     modes, chunk_start = self._mode_list(p, few_kwargs)
                     if chunk_start is not None:              # plunge chunk: build this one alone
-                        out_arr[r] = xp.asarray(self(*p, **few_kwargs).arr)
+                        out_arr[r] = xp.asarray(self(*p, **few_kwargs).arr)[:, m_lo:m_hi]
                         stats["alone"] += 1
                         continue
             except WaveformDomainError:
@@ -1176,7 +1505,9 @@ class EMRIDirectWDM:
             _, _, psi, lam, beta = fly.sky(p[7], p[8], p[9], p[10])
             if self.response == "dense":
                 integ = self.few_gen.inspiral_generator.inspiral_generator
-                feeds.append((dense_inputs_from_holder(H, integ, a=p[2], xI0=p[5]), (psi, lam, beta)))
+                din = dense_inputs_from_holder(H, integ, a=p[2], xI0=p[5])
+                feeds.append((din, (psi, lam, beta)))
+                n_subs.append(int(din[2].shape[0]))
                 if self.response_grid == "sparse":
                     grids.append(self._sparse_grid(H, None))
             else:
@@ -1185,8 +1516,7 @@ class EMRIDirectWDM:
                 else:
                     t_in, amp, ph, t_tdi = fly.prepare_feed(H, True)
                 feeds.append((t_in, amp, ph, t_tdi, psi, lam, beta))
-            tracks.append(self._last_tracks)
-            n_trs.append(self._last_track_n)
+                n_subs.append(int(np.shape(amp)[0]))
             t_ends.append(float(np.asarray(H.t_arr)[-1]))
             rows_in.append(r)
         if not feeds:
@@ -1200,36 +1530,41 @@ class EMRIDirectWDM:
         x = np.asarray(out.x.get() if hasattr(out.x, "get") else out.x)
         ok_t = (t_pix > x[:, 0].max()) & (t_pix < x[:, -1].min()) & (t_pix - self.t_start <= min(t_ends))
         n_ok, tt = n_all[ok_t], t_pix[ok_t]
-        sub_row, trk = [], []
-        for k, r in enumerate(rows_in):
-            pos = np.searchsorted(n_trs[k], n_ok)
-            assert np.array_equal(n_trs[k][pos], n_ok)
-            trk += [subset_track(tr, pos) for tr in tracks[k]]
-            sub_row += [r] * len(tracks[k])
-        # tracer + lookup in blocks of harmonics (modes): every per-block array is (block, nch,
-        # pixels), whatever the number of rows and the duration (EMRI_DIRECT_MODE_BLOCK_ELEMS
-        # elements per such array, default 2e7 = 160 MB)
-        S, P = len(trk), int(tt.size)
+        # every row here has no harmonic handing off anywhere inside its trajectory's pixels
+        # (_chunk_start is None), so none does on n_ok: the whole range is looked up
+        sub_row = np.repeat(np.asarray(rows_in), n_subs)
+        S, P = int(sub_row.size), int(tt.size)
         nch = self.tdi_config.nchannels
+        kw = dict(Nf=Nf, Nt=Nt, dt=dt, layer_dt=ldt, layer_df=ldf, t0=self.data_t0, Nt_sub=self.Nt_sub,
+                  num_m_layers=self.num_m_layers, fdot_axis_max=self.fdot_axis_max,
+                  pixel_edge=self.pixel_edge, backend=self.force_backend, m_lo=m_lo)
+        tot = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
+        be = self._kernel_backend(out)
+        if be is not None:
+            # ONE fused kernel for every harmonic of every row: nothing per pixel materialised
+            st = accumulate_harmonic_batch(out_arr, self.table, None, None, n_ok, None, sub_row=sub_row,
+                                           num_sub=S, lookup_kernel=self._lookup_fn(be, out, out_arr, sub_row, n_ok, m_lo),
+                                           **kw)
+            tot.update({k: st[k] for k in tot})
+            stats.update(subs=S, mode_blocks=1, lookup="kernel", **tot)
+            self.last_stats = stats
+            return out_arr
+        # Python: tracer + lookup in blocks of harmonics (modes): every per-block array is (block,
+        # nch, pixels), whatever the number of rows and the duration
+        # (EMRI_DIRECT_MODE_BLOCK_ELEMS elements per such array, default 2e7 = 160 MB)
         if isinstance(out, SplinedTDIOutput):
             budget = float(os.environ.get("EMRI_DIRECT_MODE_BLOCK_ELEMS", 2e7))
             blk = max(1, int(budget // max(1, nch * P)))
         else:                                                # spline response: no subset evaluation
             blk = S
-        sub_row = np.asarray(sub_row)
-        tot = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
         for s0 in range(0, S, blk):
             subs = np.arange(s0, min(S, s0 + blk))
             tracer = tracer_from_tof_output(out, xp.asarray(tt), subs=subs if blk < S else None)
             assert tracer[0].shape[0] == subs.size, (tracer[0].shape, subs.size)
-            st = accumulate_harmonic_batch(
-                out_arr, self.table, trk[s0:s0 + subs.size], tracer, n_ok, None, Nf=Nf, Nt=Nt, dt=dt,
-                layer_dt=ldt, layer_df=ldf, t0=self.data_t0, Nt_sub=self.Nt_sub,
-                num_m_layers=self.num_m_layers, fdot_axis_max=self.fdot_axis_max,
-                pixel_edge=self.pixel_edge, backend=self.force_backend, sub_row=sub_row[subs])
+            st = accumulate_harmonic_batch(out_arr, self.table, None, tracer, n_ok, None, sub_row=sub_row[subs], **kw)
             for k in tot:
                 tot[k] += st[k]
             del tracer
-        stats.update(subs=S, mode_blocks=-(-S // blk), **tot)
+        stats.update(subs=S, mode_blocks=-(-S // blk), lookup="python", **tot)
         self.last_stats = stats
         return out_arr

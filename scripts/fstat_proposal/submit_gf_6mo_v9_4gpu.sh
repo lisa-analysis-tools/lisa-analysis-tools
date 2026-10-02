@@ -4675,8 +4675,11 @@ export EMRI_EPS=1e-3
 # per row (trajectory + amplitudes at the integrator knots, modes kept at
 # EMRI_EPS), ONE dense TDI-on-the-fly response launch for the chunk
 # (TDDenseTDIWaveform: exact DOPR853 dense-output phases, link geometry shared
-# across harmonics) and one n_ref WDM lookup-table pass + scatter-add, cropped
-# to this run's WDM box and scored against each walker's own residual AND PSD.
+# across harmonics, on the trajectory knots + a 12 h cap) and ONE fused lookup-sum
+# kernel launch (wdm_lookup_sum: sparse response -> analytic f, fdot -> n_ref
+# table -> WDM sum, nothing per pixel in memory; EMRI_DIRECT_LOOKUP=python is the
+# Python reference path) on this run's active band, cropped to its time box and
+# scored against each walker's own residual AND PSD.
 # A harmonic that chirps off the table's fdot axis near a plunge hands off to
 # an even-start 128-layer TD chunk. In-model steps, eigen-table sweeps and the
 # inner-product record all score through it.
@@ -4721,12 +4724,14 @@ export EMRI_BATCH_MAX_SIZE=${EMRI_BATCH_MAX_SIZE:-8}
 export EMRI_DIRECT_TABLE=${EMRI_DIRECT_TABLE:-}
 export EMRI_DIRECT_RESPONSE=${EMRI_DIRECT_RESPONSE:-dense}
 export EMRI_TRAJ_WORKERS=${EMRI_TRAJ_WORKERS:-4}
+export EMRI_DIRECT_LOOKUP=${EMRI_DIRECT_LOOKUP:-kernel}
 #
 # EMRI PREFLIGHT. An unknown env var is SILENTLY IGNORED, so resolve the knobs
 # through the real settings class and the real consistency rule; for direct,
 # also check the edge crop clears the template's zeroed edge layers, run the dense
-# kernel's GPU-vs-CPU parity test on this node's GPU, and find -- or build and save
-# -- the lookup table (above). Refuses before mpiexec on any gap.
+# kernel's (and, with EMRI_DIRECT_LOOKUP=kernel, the fused lookup kernel's)
+# GPU-vs-CPU parity test on this node's GPU, and find -- or build and save -- the
+# lookup table (above). Refuses before mpiexec on any gap.
 python - <<'PYEOF' || exit 2
 import dataclasses
 import inspect
@@ -4796,6 +4801,27 @@ if cfg["emri_direct_response"] == "dense":
               "Rebuild lisatools (pip install -e . --no-build-isolation) or launch with "
               "EMRI_LIKELIHOOD=full / EMRI_DIRECT_RESPONSE=spline.")
         sys.exit(2)
+    if os.environ["EMRI_DIRECT_LOOKUP"] not in ("kernel", "python"):
+        print(f"[EMRI-PREFLIGHT] REFUSING: EMRI_DIRECT_LOOKUP={os.environ['EMRI_DIRECT_LOOKUP']!r} "
+              "(kernel or python).")
+        sys.exit(2)
+    if os.environ["EMRI_DIRECT_LOOKUP"] == "kernel":
+        # a module without the kernel would fall back to the Python lookup with only a
+        # warning: prove it is here and right on this GPU instead
+        try:
+            from tests import test_wdm_lookup_sum_kernel as tk
+        except ImportError as exc:
+            print(f"[EMRI-PREFLIGHT] REFUSING: cannot import tests/test_wdm_lookup_sum_kernel.py ({exc}).")
+            sys.exit(2)
+        suite = unittest.TestSuite([tk.SyntheticEdgesTest("test_gpu_equals_cpu")])
+        res = unittest.TextTestRunner(stream=sys.stdout, verbosity=1).run(suite)
+        if not res.wasSuccessful() or res.skipped or res.testsRun == 0:
+            print("[EMRI-PREFLIGHT] REFUSING: the fused lookup kernel's GPU-vs-CPU parity test "
+                  f"did not pass on this node (run {res.testsRun}, failures {len(res.failures)}, "
+                  f"errors {len(res.errors)}, skipped {len(res.skipped)}: {res.skipped}). Rebuild "
+                  "lisatools (pip install -e . --no-build-isolation) or launch with "
+                  "EMRI_DIRECT_LOOKUP=python.")
+            sys.exit(2)
 import time
 
 import lisatools
@@ -4823,7 +4849,8 @@ if cpus is not None and int(cpus) < 1 + cfg["emri_traj_workers"]:
           f"{cfg['emri_traj_workers']}: the trajectory workers will share cores (submit "
           "through the self-dispatch, which sizes it).")
 print(f"[EMRI-PREFLIGHT] emri_pe scoring=direct batch<={cfg['emri_batch_max_size']} "
-      f"response={cfg['emri_direct_response']} traj_workers={cfg['emri_traj_workers']} "
+      f"response={cfg['emri_direct_response']} lookup={os.environ['EMRI_DIRECT_LOOKUP']} "
+      f"traj_workers={cfg['emri_traj_workers']} "
       f"table={table_path} (Nf 1440, dt 2.5) edge_crop={crop}>={edge}")
 PYEOF
 

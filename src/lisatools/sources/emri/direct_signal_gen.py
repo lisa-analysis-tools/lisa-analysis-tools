@@ -6,9 +6,10 @@ coefficients on the run's ACTIVE box, the same array a production template
 dense TD->WDM transform) lands on:
 
 * :class:`~lisatools.sources.emri.wdm_direct.EMRIDirectWDM` assembles every row on the
-  FULL wavelet grid of the run (same ``Nf``, ``Nt``, ``dt``; its own ``pixel_edge``
-  layers at each grid end stay zero, so they must lie outside the active time box);
-* the adapter crops that to the run domain's ``active_slice_f`` / ``active_slice_t``;
+  wavelet grid of the run (same ``Nf``, ``Nt``, ``dt``; its own ``pixel_edge`` layers at
+  each grid end stay zero, so they must lie outside the active time box), restricted to the
+  run's active frequency band (``f_band``, set here);
+* the adapter crops that to the run domain's ``active_slice_t``;
 * a row FEW refuses (out of its domain of validity) is reported in the returned ``ok``
   mask instead of failing the batch (the move scores it at the ``-1e300`` floor, as the
   container path does).
@@ -133,6 +134,11 @@ class EMRIDirectWDMSignalGen:
             )
         self.direct = direct
         self.domain_settings = dom
+        # the direct generator builds the run's active frequency band only (its batch arrays
+        # hold layers [m_lo, m_hi)); the time crop stays here
+        sl_f = dom.active_slice_f
+        if hasattr(direct, "f_band") and direct.f_band is None and int(sl_f.stop) <= int(full.Nf):
+            direct.f_band = (int(sl_f.start), int(sl_f.stop))
         self.nchannels = None if nchannels is None else int(nchannels)
         self.runtime_kwargs = dict(runtime_kwargs or {})
         self.traj_workers = max(0, int(traj_workers))
@@ -166,6 +172,11 @@ class EMRIDirectWDMSignalGen:
         ok[list(self.direct.last_failed_rows)] = False
         sl_f = self.domain_settings.active_slice_f
         sl_t = self.domain_settings.active_slice_t
+        band = getattr(self.direct, "f_band", None)
+        if band is not None:                                  # full holds layers [m_lo, m_hi) only
+            if int(full.shape[2]) != band[1] - band[0] or not band[0] <= sl_f.start <= sl_f.stop <= band[1]:
+                raise ValueError(f"direct template band {band} does not hold the active layers {sl_f}")
+            sl_f = slice(sl_f.start - band[0], sl_f.stop - band[0])
         nch = full.shape[1] if self.nchannels is None else self.nchannels
         arr = full[:, :nch, sl_f, sl_t].copy()
         del full

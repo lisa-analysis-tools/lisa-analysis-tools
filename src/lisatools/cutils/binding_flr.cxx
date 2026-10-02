@@ -301,6 +301,10 @@ void response_part(nb::module_ &m) {
     .def_rw("tdi_config", &TDDenseTDIWaveformWrap::tdi_config)
     ;
 
+    // fused sparse-response -> WDM lookup sum (EMRI direct-to-WDM)
+    m.def("wdm_lookup_sum", &wdm_lookup_sum_binding, nb::call_guard<nb::gil_scoped_release>(),
+          "Fused sparse-response -> WDM n_ref lookup sum (see lat_spline_tdi_waveform.hh).");
+
 #if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
     nb::class_<TDSplineTDIWaveform>(m, "TDSplineTDIWaveformGPU")
 #else

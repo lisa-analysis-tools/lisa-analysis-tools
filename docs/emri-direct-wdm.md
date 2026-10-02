@@ -184,6 +184,44 @@ own grids, padded to a common length by halving their widest intervals (`pad_gri
 | same, mismatch vs production (fit domain, sensitivity-weighted) | 2.386e-8, identical to the pixel grid; dlogL 1.8e-6 |
 | same, s/row (fit wiring check, CPU) | direct 0.66 vs production 1.33 |
 
+## Fused lookup-sum kernel (10-02, default `lookup="kernel"`)
+
+The response stays sparse until the WDM sum. `wdm_lookup_sum` (C++/CUDA,
+`cutils/lat_spline_tdi_waveform.cu`; device helpers in the header-only
+`cutils/wdm_lookup_kernels.hh`, shared with other sources' kernels) runs one thread per
+(harmonic, pixel): amplitude and residual phase from the response's cubic splines (GBT
+`CubicSplineInterpolant` coefficients), the exact DOPR853 carrier and its first two time
+derivatives, `f = phase' / 2 pi` and `fdot = phase'' / 2 pi` ANALYTICALLY, the `-m` mirror, the
+`|fdot| <= fdot_axis_max` and `f > 2 layer_df` filters, then the `2 num_m_layers + 1` layers of
+the n_ref lookup (the table's prefiltered cubic B-spline in ndimage mirror mode, zero outside;
+`get_wdm_coeffs`' quarter-turn rule) summed straight into `out[row, ch, m - m_lo, n]`
+(atomicAdd). Nothing per pixel lands in global memory except the output; the per-pixel
+tracer arrays, the table's temporaries and the mode blocks are gone. Python driver:
+`wdm_direct.lookup_sum_kernel`; `EMRIDirectWDM(lookup=...)`, env `EMRI_DIRECT_LOOKUP`
+(`kernel` default; `python` = the analytic tracer + `get_wdm_coeffs` + scatter-add, the reference).
+A kernel request on a module built without it, a `response="spline"` output or a table that is
+not spline-interpolated falls back to Python with one warning.
+
+Around it:
+
+* the Python tracer also differentiates analytically now (`eval_tracer` on
+  `SplinedTDIOutput`/`ExactPhaseTDIOutput`, one evaluation per pixel instead of five stencil
+  points; `EMRI_TRACER=stencil` keeps the central differences);
+* `f_band=(m_lo, m_hi)`: `batch()` returns those layers only; the fit's adapter asks for the
+  run's active band (6 months: 179 of 1440 layers, ~8x less memory per template);
+* the per-harmonic tracks (all modes at all pixels, ~7 ms per 6-month template on the GPU)
+  are only computed when a bound over the three fundamentals says a harmonic MAY hand off to
+  the plunge chunk in the window (`_handoff_may_trip`; `EMRI_DIRECT_HANDOFF_BOUND=0` always
+  computes them). The bound cannot hide a handoff, so the template is unchanged.
+
+| check | result |
+|---|---|
+| kernel vs Python, synthetic (f, fdot) sweeping the table's edges, 5 and 7 layers | 1.1e-12 max rel (phase ~2e4 rad round-off) |
+| kernel vs Python, dense response: sparse grid + exact carrier, 2 templates | 1.7e-12 |
+| kernel vs Python, dense response: pixel grid, carrier folded into the phase spline | 3.4e-12 |
+| analytic vs stencil tracer, synthetic sparse response | 1e-13 Hz in f, 9e-17 Hz/s in fdot |
+| CD1L EMRI 1, 16 d, 20 s, fit wiring check (box t[60:324]) | kernel = python: mismatch 2.109e-8, max dlogL 1.14e-6 |
+
 ## In the global fit: `EMRI_LIKELIHOOD=direct` (10-02)
 
 `emri_pe` becomes `EMRIDirectLikeMove` (`globalfit/moves/emridirectmove.py`), built by
