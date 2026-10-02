@@ -73,6 +73,87 @@ from .walkerfanout import WalkerFanoutMixin, pooled_ladder_step
 
 logger = logging.getLogger(__name__)
 
+
+def clip_shift_to_prior(coords, delta, prior_fn, max_iter=48):
+    """Shift every row of ``coords`` by ``delta``, pulling any row that would
+    leave the prior back to the box edge DIMENSION BY DIMENSION.
+
+    The galfor ratchet's forced step applies one fixed vector to every rung
+    and walker. After a release the ladder spreads, and a hot rung can sit
+    within one nudge of a prior bound (6mo job 675, 2026-10-01: rungs 3 and
+    6 were 0.07 / 0.002 dex above the ``fk`` floor and the second nudge was
+    refused outright, which killed the run). A row at the edge now takes
+    as much of each component as the box allows -- found by bisection on
+    the fraction of that component's shift, with the other components
+    unshifted -- and every other row takes the full vector.
+
+    Exact for a product (box) prior, which is every noise prior in the
+    stock recipes. For any other prior the combined shift is re-checked
+    and a row still outside raises rather than ships.
+
+    Args:
+        coords: ``(ntemps, nwalkers, 1, ndim)`` sampled-basis coordinates.
+        delta: ``(ndim,)`` shift.
+        prior_fn: ``prior_fn(arr) -> (ntemps, nwalkers)`` log-prior of a
+            trial coordinate array of the same shape, ``-inf`` outside.
+        max_iter: bisection depth (48 -> the edge to 1 part in 3e14 of the
+            shift).
+
+    Returns:
+        ``(shifted, clipped)``: the new coordinates and the ``(ntemps,
+        nwalkers)`` mask of rows that did not take the full shift.
+
+    Raises:
+        ValueError: a row is outside the prior BEFORE the shift (a store
+            resumed under a narrower prior, say) -- clipping recovers a
+            shift that would leave the box, it must not paper over a row
+            that was never inside it; or the prior is not separable and a
+            row is still outside after the per-component clip.
+    """
+    coords = np.asarray(coords, dtype=float)
+    delta = np.asarray(delta, dtype=float)
+    if delta.shape != (coords.shape[-1],):
+        raise ValueError(
+            f"clip_shift_to_prior: shift has shape {delta.shape}; expected "
+            f"({coords.shape[-1]},).")
+    shifted = coords + delta
+    bad = ~np.isfinite(np.asarray(prior_fn(shifted), dtype=float))
+    if not bad.any():
+        return shifted, bad
+    base_ok = np.isfinite(np.asarray(prior_fn(coords), dtype=float))
+    if not base_ok[bad].all():
+        rows = [tuple(int(i) for i in r) for r in np.argwhere(bad & ~base_ok)]
+        raise ValueError(
+            f"clip_shift_to_prior: {len(rows)} row(s) (rung, walker) "
+            f"{rows} are outside the prior BEFORE the shift; nothing was "
+            "changed.")
+    frac = np.ones(bad.shape + (delta.size,))
+    for d in np.flatnonzero(delta != 0.0):
+        unit = np.zeros_like(delta)
+        unit[d] = delta[d]
+        ok_full = np.isfinite(np.asarray(prior_fn(coords + unit), dtype=float))
+        need = bad & ~ok_full
+        if not need.any():
+            continue
+        lo = np.zeros(bad.shape)
+        hi = np.ones(bad.shape)
+        for _ in range(int(max_iter)):
+            mid = 0.5 * (lo + hi)
+            trial = coords + mid[..., None, None] * unit
+            ok = np.isfinite(np.asarray(prior_fn(trial), dtype=float))
+            lo = np.where(ok, mid, lo)
+            hi = np.where(ok, hi, mid)
+        frac[need, d] = lo[need]
+    shifted = coords + frac[:, :, None, :] * delta
+    still = ~np.isfinite(np.asarray(prior_fn(shifted), dtype=float))
+    if still.any():
+        rows = [tuple(int(i) for i in r) for r in np.argwhere(still)]
+        raise ValueError(
+            f"clip_shift_to_prior: rows (rung, walker) {rows} are still "
+            "outside the prior after clipping each component to its own "
+            "edge -- the prior is not a product box; nothing was changed.")
+    return shifted, bad
+
 DEBUG_MODE = False
 
 
@@ -3115,9 +3196,15 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         in the payload ``extra``, so every rank applies the same vector.
 
         Refuses (``ValueError``, ``state`` untouched, nothing shipped) a
-        branch this move does not sample, a malformed shift, or a shift that
-        leaves the prior box on any row: a silently clipped or half-applied
-        nudge would be a worse outcome than no nudge.
+        branch this move does not sample, a malformed shift, or a row that
+        is outside the prior BEFORE the shift. A row that the shift would
+        carry OUT of the prior box is CLIPPED to the edge, component by
+        component (:func:`clip_shift_to_prior`), and named in a WARNING
+        together with how many COLD rows were clipped -- the cold rows are
+        the measurement, a hot rung at the edge is not. (Until 2026-10-01
+        such a row refused the whole nudge; 6mo job 675 died on two hot
+        rungs within one nudge of the ``fk`` floor after the first release
+        had spread the ladder.)
 
         Returns:
             Tuple ``(new_state, accepted)`` with ``accepted`` all True at the
@@ -3136,18 +3223,30 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
                     f"forced_noise_step: shift for {key!r} has shape {d.shape}; "
                     f"expected ({ndim},).")
         # prior check on the FULL ensemble before anything is shipped: the
-        # prior needs no ACA, and a refusal must leave every rank untouched
-        shifted = {
-            key: np.asarray(self._work_branch(state, key).coords) + deltas.get(key, 0.0)
-            for key in noise_branches
-        }
-        logp = np.asarray(self.compute_log_prior(shifted))
-        if np.any(np.isinf(logp)):
-            raise ValueError(
-                "forced_noise_step: the shifted coordinates leave the prior on "
-                f"{int(np.sum(np.isinf(logp)))} of {logp.size} rows -- the nudge "
-                f"{ {k: v.tolist() for k, v in deltas.items()} } is too large "
-                "for the sampled box; nothing was changed.")
+        # prior needs no ACA, and a refusal must leave every rank untouched.
+        # Rows the shift would carry out of the box are clipped to its edge
+        # (the ranks repeat the same deterministic clip on their own slice
+        # in _apply_forced_step); the head's pass is what names them.
+        base = {key: np.asarray(self._work_branch(state, key).coords, dtype=float)
+                for key in noise_branches}
+        for key, d in deltas.items():
+            shifted, clipped = clip_shift_to_prior(
+                base[key], d,
+                lambda arr, _k=key: self.compute_log_prior({**base, _k: arr}))
+            if clipped.any():
+                rows = ", ".join(f"rung {int(t)} walker {int(w)}"
+                                 for t, w in np.argwhere(clipped))
+                took = shifted - base[key]
+                short = np.abs(took - d)
+                dims = [int(i) for i in np.flatnonzero(short.max(axis=(0, 1, 2)) > 1e-12)]
+                logger.warning(
+                    "[GALFOR_RATCHET %s] forced noise step CLIPPED to the prior box "
+                    "on %d of %d rows of %r (%s; dims %s; largest shortfall %.4g in "
+                    "the sampled basis; cold rows clipped: %d) -- every other row "
+                    "takes the full shift %s",
+                    getattr(self, "name", "psd"), int(clipped.sum()), clipped.size,
+                    key, rows, dims, float(short.max()), int(clipped[0].sum()),
+                    d.tolist())
         logger.info(
             "[GALFOR_RATCHET %s] forced noise step: %s on every rung and walker; "
             "cold lnL before (walker mean) %.1f",
@@ -3166,11 +3265,22 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         return new_state, accepted
 
     def _apply_forced_step(self, state, ctx, tmp_state, deltas):
-        """Body half of the forced step on THIS body's working state."""
+        """Body half of the forced step on THIS body's working state.
+
+        The same deterministic per-row clip the head ran on the full
+        ensemble (:func:`clip_shift_to_prior`), on this body's own rows: a
+        rank holds only its walkers, and the clip of a row depends on that
+        row alone, so head and ranks agree without shipping per-row shifts.
+        """
+        base = {key: np.asarray(v, dtype=float)
+                for key, v in tmp_state.branches_coords.items()}
         for key, d in deltas.items():
-            if key not in tmp_state.branches:
+            if key not in base:
                 continue
-            tmp_state.branches[key].coords[:] = tmp_state.branches[key].coords + np.asarray(d)
+            shifted, _ = clip_shift_to_prior(
+                base[key], np.asarray(d, dtype=float),
+                lambda arr, _k=key: self.compute_log_prior({**base, _k: arr}))
+            tmp_state.branches[key].coords[:] = shifted
         coords = tmp_state.branches_coords
         logp = np.asarray(self.compute_log_prior(coords))
         if np.any(np.isinf(logp)):

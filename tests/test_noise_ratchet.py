@@ -722,14 +722,90 @@ class ForcedStepTest(unittest.TestCase):
         # the input state is left alone (eryn contract: a NEW state)
         np.testing.assert_array_equal(state.branches["galfor"].coords, before_g)
 
-    def test_shift_outside_the_prior_is_refused_and_nothing_moves(self):
+    def test_a_row_at_the_box_edge_is_clipped_and_every_other_row_moves_fully(self):
+        """6mo job 675 (2026-10-01 21:53 UTC): the SECOND nudge died with
+        "the shifted coordinates leave the prior on 2 of 48 rows" -- two HOT
+        rungs (3 and 6) sat within 0.1 dex of the fk floor after the release
+        spread the ladder. A hot rung at the box edge must not kill the run:
+        that row takes as much of the shift as the box allows, dimension by
+        dimension, and the other 46 rows take the full nudge."""
         move, model, state, acs, built = self._fixture()
+        g = state.branches["galfor"].coords
+        g[1, 2, 0, 1] = -49.95          # 0.05 above the mock box floor (-50)
+        g[1, 2, 0, 4] = -49.99          # 0.01 above it
+        before_g = np.array(g, copy=True)
+        delta = np.array([-0.05, -0.10, 0.0, 0.0, -0.15])
+
+        with self.assertLogs("lisatools.globalfit.moves.psdmove", level="WARNING") as cm:
+            new_state, accepted = move.forced_noise_step(model, state, {"galfor": delta})
+
+        after = np.asarray(new_state.branches["galfor"].coords)
+        # the clipped row: dims 1 and 4 land just inside the floor, dim 0
+        # (room to spare) takes the full shift
+        self.assertGreater(after[1, 2, 0, 1], -50.0)
+        self.assertLess(after[1, 2, 0, 1], -49.95 - 0.049)
+        self.assertGreater(after[1, 2, 0, 4], -50.0)
+        self.assertLess(after[1, 2, 0, 4], -49.99 - 0.0099)
+        self.assertAlmostEqual(after[1, 2, 0, 0], before_g[1, 2, 0, 0] - 0.05)
+        # every other row: the full nudge
+        full = before_g + delta
+        mask = np.ones(before_g.shape[:2], dtype=bool); mask[1, 2] = False
+        np.testing.assert_allclose(after[mask], full[mask])
+        # nothing left outside the prior, and the step was published
+        self.assertTrue(np.all(np.isfinite(new_state.log_prior)))
+        self.assertTrue(np.all(accepted))
+        self.assertEqual(sorted(w for w, _ in built), list(range(self.NW)))
+        # the warning names the clipped row, its dims and that no COLD row was hit
+        msg = "\n".join(cm.output)
+        self.assertIn("clipped", msg)
+        self.assertIn("rung 1 walker 2", msg)
+        self.assertIn("cold rows clipped: 0", msg)
+        # the input state is left alone
+        np.testing.assert_array_equal(state.branches["galfor"].coords, before_g)
+
+    def test_a_clipped_cold_row_is_named_in_the_warning(self):
+        move, model, state, acs, built = self._fixture()
+        g = state.branches["galfor"].coords
+        g[0, 1, 0, 4] = -49.9
+        with self.assertLogs("lisatools.globalfit.moves.psdmove", level="WARNING") as cm:
+            move.forced_noise_step(model, state,
+                                   {"galfor": np.array([0.0, 0.0, 0.0, 0.0, -0.15])})
+        self.assertIn("cold rows clipped: 1", "\n".join(cm.output))
+
+    def test_a_row_already_outside_the_prior_is_refused_and_nothing_moves(self):
+        """Clipping recovers a shift that would LEAVE the box; it must not
+        paper over a row that was never inside it (a store resumed under a
+        narrower prior, say) -- that stays a loud stop with nothing moved."""
+        move, model, state, acs, built = self._fixture()
+        state.branches["galfor"].coords[1, 3, 0, 2] = 75.0      # outside |g| < 50
         before_g = np.array(state.branches["galfor"].coords, copy=True)
         with self.assertRaises(ValueError):
-            move.forced_noise_step(model, state, {"galfor": np.full(5, 100.0)})
+            move.forced_noise_step(model, state,
+                                   {"galfor": np.array([-0.05, -0.1, 0.0, 0.0, -0.15])})
         np.testing.assert_array_equal(state.branches["galfor"].coords, before_g)
         self.assertEqual(built, [])
         self.assertIsNone(move._forced_step_deltas)
+
+    def test_clip_helper_is_exact_on_a_box_and_leaves_in_box_rows_alone(self):
+        from lisatools.globalfit.moves.psdmove import clip_shift_to_prior
+
+        def box(c):
+            g = np.asarray(c["galfor"])[:, :, 0, :]
+            return np.where(np.all((g > -1.0) & (g < 1.0), axis=-1), 0.0, -np.inf)
+
+        coords = np.zeros((2, 3, 1, 5))
+        coords[0, 0, 0, 1] = -0.95           # 0.05 of room on dim 1
+        coords[1, 2, 0, 4] = -0.999          # 0.001 of room on dim 4
+        delta = np.array([-0.2, -0.1, 0.0, 0.0, -0.3])
+        shifted, clipped = clip_shift_to_prior(
+            coords, delta, lambda arr: box({"galfor": arr}))
+        self.assertEqual(sorted(map(tuple, np.argwhere(clipped))), [(0, 0), (1, 2)])
+        np.testing.assert_allclose(shifted[0, 1], coords[0, 1] + delta)
+        self.assertGreater(shifted[0, 0, 0, 1], -1.0)
+        self.assertLess(shifted[0, 0, 0, 1], -0.95 - 0.0499)
+        self.assertAlmostEqual(shifted[0, 0, 0, 0], -0.2)        # other dims: full shift
+        self.assertGreater(shifted[1, 2, 0, 4], -1.0)
+        self.assertAlmostEqual(shifted[1, 2, 0, 0], -0.2)
 
     def test_unsampled_branch_is_refused(self):
         move, model, state, acs, built = self._fixture()
