@@ -3443,6 +3443,14 @@ export GALFOR_RATCHET_DLOG10_F2=${GALFOR_RATCHET_DLOG10_F2:--0.15}
 # row per leg the mid-iteration checkpoint only guards part of one leg;
 # MIDIT_CHECKPOINT=0 is reasonable for a legged search. Off = today.
 export GB_SEARCH_LEGS=${GB_SEARCH_LEGS:-0}
+# While the ratchet is active the per-(walker, band) RJ shutoff valve leaves
+# every band below this frequency OPEN (reopening shut pairs with a fresh
+# streak) and shuts converged bands above it as usual; lifted at the
+# ratchet's stop so the stage can end on the full valve (user design
+# 2026-10-02: "maybe don't do RJ shutoff during the ratchet cycles ... you
+# can shut off bands above 7 mHz if their likelihoods converge as usual").
+# 0 = the valve acts at every frequency throughout.
+export GALFOR_RATCHET_SHUTOFF_MIN_FREQ=${GALFOR_RATCHET_SHUTOFF_MIN_FREQ:-7e-3}
 echo "[GALFOR-RATCHET] GALFOR_RATCHET=${GALFOR_RATCHET} hold=${GALFOR_RATCHET_HOLD} release=${GALFOR_RATCHET_RELEASE} cycles=${GALFOR_RATCHET_CYCLES} dlog10 amp/fk/f2=${GALFOR_RATCHET_DLOG10_AMP}/${GALFOR_RATCHET_DLOG10_FK}/${GALFOR_RATCHET_DLOG10_F2} (0 = off: rider + 4 interleaved noise slots as before)"
 # High-f barren-band birth shutoff (search scope): bands above FMIN with
 # AFTER consecutive zero-birth-accept proposes stop proposing births

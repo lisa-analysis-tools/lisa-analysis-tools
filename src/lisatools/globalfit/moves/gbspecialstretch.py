@@ -2033,6 +2033,23 @@ class _ColdBandLnL:
         self.resets[:] = 0
 
 
+def apply_shutoff_floor(converged, shut, streak, exempt):
+    """Keep the exempt bands open: clear their verdict, reopen their shut
+    pairs, zero their streaks. All arrays are ``(nwalkers, num_bands)``
+    except ``exempt`` ``(num_bands,)``; edited in place. Returns how many
+    shut pairs were reopened.
+    """
+    exempt = np.asarray(exempt, dtype=bool).reshape(-1)
+    if not exempt.any():
+        return 0
+    reopened = int(np.asarray(shut)[:, exempt].sum())
+    converged[:, exempt] = False
+    shut[:, exempt] = False
+    if streak is not None:
+        streak[:, exempt] = 0
+    return reopened
+
+
 def cold_band_lnl_from_band_info(bi, shape):
     """Ensure the six arrays exist in ``bi`` at ``shape``, return the view.
 
@@ -22343,6 +22360,27 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         np.maximum(_view.peak, _cur_obs, out=_view.peak)
         converged = _view.judge(tol, self.search_shutoff_conv_iter, occ,
                                 require_occ=self._shutoff_require_occ())
+        # ---- RATCHET FLOOR (user design 2026-10-02: "maybe don't do RJ
+        # shutoff during the ratchet cycles ... you can shut off bands above
+        # 7 mHz if their likelihoods converge as usual"). While the galfor
+        # ratchet is active the recipe step sets ``rj_shutoff_min_freq`` on
+        # the GB moves; bands below it -- where the foreground lives and the
+        # nudges act -- are never shut and any shut pair there is reopened
+        # with a fresh streak, so that when the floor is lifted at the
+        # ratchet's stop every such pair gets its full window again.
+        _fmin = float(getattr(self, "rj_shutoff_min_freq", 0.0) or 0.0)
+        if _fmin > 0.0:
+            _exempt = self._shutoff_exempt_bands(_fmin, shut.shape[1])
+            if _exempt is not None:
+                _reopened = apply_shutoff_floor(converged, shut, _view.streak, _exempt)
+                if _reopened or not getattr(self, "_shutoff_floor_announced", False):
+                    self._shutoff_floor_announced = True
+                    logger.info(
+                        "[GB_GATE %s] RJ shutoff floor %.3g mHz in force (galfor "
+                        "ratchet): %d of %d bands exempt from shutting; %d shut "
+                        "pair(s) below the floor reopened this judgment.",
+                        self.name, 1e3 * _fmin, int(_exempt.sum()), int(_exempt.size),
+                        int(_reopened))
         shut[converged] = True
         self._publish_shutoff_w_pending(shut, occ)
 
@@ -22427,6 +22465,28 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     float(_view.max[w, b]), float(_view.value[w, b]),
                     int(occ[w, b]), int(_view.streak[w, b]),
                 )
+
+    def _shutoff_exempt_bands(self, fmin_hz, num_bands):
+        """``(num_bands,)`` bool: bands whose CENTRE lies below ``fmin_hz``.
+
+        Built from this move's own ``band_edges``; ``None`` (with one
+        warning) when that grid does not match the valve's width, so a
+        mismatched grid can never exempt the wrong bands.
+        """
+        try:
+            edges = np.asarray(_to_numpy(self.band_edges), dtype=float).reshape(-1)
+        except Exception:  # noqa: BLE001
+            edges = None
+        if edges is None or edges.size != int(num_bands) + 1:
+            if not getattr(self, "_shutoff_floor_warned", False):
+                self._shutoff_floor_warned = True
+                logger.warning(
+                    "[GB_GATE %s] RJ shutoff floor requested but band_edges "
+                    "(%s) do not match the valve's %d bands; the floor is "
+                    "NOT applied.", self.name,
+                    None if edges is None else edges.size, int(num_bands))
+            return None
+        return (0.5 * (edges[:-1] + edges[1:])) < float(fmin_hz)
 
     def _shutoff_ll_tol(self) -> float:
         """lnL improvement a band must post to keep its valve open.
