@@ -3294,10 +3294,18 @@ try:
                 del _a
             return data_fd[0] - _t[0, 0] * _shift[0]
 
+        # TWO WALKERS, NOT THE MEAN OF ALL OF THEM (user request 2026-10-02):
+        # the max- and min-lnL cold walkers of the last stored row, each
+        # whitened by its own noise. A walker mean blends several noise models
+        # into a curve no walker holds; the best and the worst walker bracket
+        # what the cold chain actually carries. Index 0 = max lnL, 1 = min lnL
+        # in every array below.
+        WWORST = int(np.argmin(ll[-1]))
+        _WSHOW = ((WBEST, CYAN, "max lnL"), (WWORST, AMBER, "min lnL"))
         _gal_inj_curve = np.maximum(_Ssum_inj - _Sinst_inj, 0.0)
         _rat_tot, _rat_inst, _rat_est, _mm, _tail, _share = [], [], [], [], [], []
         _psd_b, _Stot_b, _Sinst_b = [], [], []
-        for _w in range(nwalk):
+        for _w, _wc, _wl in _WSHOW:
             _pmw = psd_cold[-1, _w]
             _gmw = gal_cold_phys[-1, _w]
             _lmw = lisa_models.LISAModel(_pmw[0] ** 2, _pmw[1] ** 2,
@@ -3336,56 +3344,51 @@ try:
                 stochastic_function=_HTGF), float))
         except Exception:
             _S0_b = None
-        _mean_tot = _run_mean(np.nanmean(_rat_tot, axis=0))
-        _mean_inst = _run_mean(np.nanmean(_rat_inst, axis=0))
-        _mean_est = _run_mean(np.nanmean(_rat_est, axis=0))
-        _mean_mm = _run_mean(np.nanmean(_mm, axis=0))
-        _mean_tail = _run_mean(np.nanmean(_tail, axis=0))
-        _mean_share = np.nanmean(_share, axis=0)
+        _wtitle = (f"cold walkers {WBEST} (max lnL, cyan) and {WWORST} (min lnL, amber) "
+                   f"of stored row {NIT - 1}")
 
         fig, ax = plt.subplots(4, 1, figsize=(11.6, 10.4), sharex=True,
                                gridspec_kw=dict(height_ratios=[2.4, 1.2, 1.2, 0.9],
                                                 hspace=0.08))
         for a_ in ax:
-            a_.axvspan(3.0, 5.0, color=AMBER, alpha=0.07, lw=0)
+            a_.axvspan(3.0, 5.0, color=FG, alpha=0.05, lw=0)
             a_.set_xscale("log")
-        ax[0].scatter(_bfc, _rat_tot[WBEST], s=5, color=VIOLET, alpha=0.45, lw=0,
-                      label=f"per band, walker {WBEST} (max lnL), its own noise")
-        for _w in range(nwalk):
-            ax[0].plot(_bfc, _run_mean(_rat_tot[_w]), color=CYAN, lw=0.7, alpha=0.35)
-        ax[0].plot(_bfc, _mean_tot, color=CYAN, lw=1.8,
-                   label=f"{nwalk}-walker mean, running mean over 15 bands "
-                         "(each walker whitened by its own fit)")
-        ax[0].plot(_bfc, _mean_inst, color=FG, lw=1.1, ls="--",
-                   label="same residual / instrument-only (what the foreground carries)")
-        ax[0].plot(_bfc, _mean_est, color=RED, lw=1.1, ls="-.", alpha=0.85,
-                   label="same residual / (instrument + FittedHT foreground estimate)")
+        for _k, (_w, _wc, _wl) in enumerate(_WSHOW):
+            ax[0].scatter(_bfc, _rat_tot[_k], s=5, color=_wc, alpha=0.3, lw=0)
+            ax[0].plot(_bfc, _run_mean(_rat_tot[_k]), color=_wc, lw=1.8,
+                       label=f"walker {_w} ({_wl}) against its own noise: per band (points), "
+                             "running mean over 15 bands")
+            ax[0].plot(_bfc, _run_mean(_rat_inst[_k]), color=_wc, lw=1.0, ls="--",
+                       label=("dashed: same residual / instrument-only (what the foreground "
+                              "carries)") if _k == 0 else None)
+            ax[0].plot(_bfc, _run_mean(_rat_est[_k]), color=_wc, lw=1.0, ls="-.",
+                       label=("dash-dot: same residual / (instrument + FittedHT foreground "
+                              "estimate)") if _k == 0 else None)
+            ax[1].scatter(_bfc, _mm[_k], s=5, color=_wc, alpha=0.3, lw=0)
+            ax[1].plot(_bfc, _run_mean(_mm[_k]), color=_wc, lw=1.6)
+            ax[2].scatter(_bfc, 100 * _tail[_k], s=5, color=_wc, alpha=0.3, lw=0)
+            ax[2].plot(_bfc, 100 * _run_mean(_tail[_k]), color=_wc, lw=1.6)
+            ax[3].plot(_bfc, 100 * _share[_k], color=_wc, lw=1.6)
         ax[0].axhline(1.0, color=FG, lw=1.0, ls=":")
         ax[0].set_yscale("log"); ax[0].set_ylim(0.3, 30)
         ax[0].set_ylabel("whitened residual power\nper GB band (1 = model)", fontsize=9)
         ax[0].legend(fontsize=7.5, loc="upper right")
-        ax[1].scatter(_bfc, _mm[WBEST], s=5, color=VIOLET, alpha=0.45, lw=0)
-        ax[1].plot(_bfc, _mean_mm, color=CYAN, lw=1.6)
         ax[1].axhline(1.0 / np.log(2.0), color=FG, lw=1.0, ls=":",
                       label="Gaussian: mean/median = 1/ln 2 = 1.443")
         ax[1].set_ylim(1.0, 4.0)
         ax[1].set_ylabel("mean / median\nof whitened power", fontsize=9)
         ax[1].legend(fontsize=7.5, loc="upper right")
-        ax[2].scatter(_bfc, 100 * _tail[WBEST], s=5, color=VIOLET, alpha=0.45, lw=0)
-        ax[2].plot(_bfc, 100 * _mean_tail, color=CYAN, lw=1.6)
         ax[2].axhline(1.0, color=FG, lw=1.0, ls=":", label="Gaussian: 1% of bins above 4.605")
         ax[2].set_ylim(0, 8)
         ax[2].set_ylabel("bins above 4.605\n[% per band]", fontsize=9)
         ax[2].legend(fontsize=7.5, loc="upper right")
-        ax[3].plot(_bfc, 100 * _mean_share, color=AMBER, lw=1.6)
         ax[3].set_ylim(0, 100)
         ax[3].set_ylabel("foreground share\nof model noise [%]", fontsize=9)
         ax[3].set_xlabel("frequency [mHz]  (shaded: 3-5 mHz)")
         ax[3].set_xlim(max(_bfc[0], 0.5), _bfc[-1])
         fig.suptitle(
-            f"whitened residual per GB band, stored iteration {NIT - 1}, all {nwalk} "
-            "cold walkers, TDI X -- 1 means the residual carries exactly the power the "
-            "fitted noise says", fontsize=10, color=FG)
+            f"whitened residual per GB band, {_wtitle}, TDI X -- 1 means the residual "
+            "carries exactly the power the fitted noise says", fontsize=10, color=FG)
         fig.tight_layout(rect=[0, 0, 1, 0.97])
         fig_b64(fig, "fg_whitened_bands")
 
@@ -3393,67 +3396,64 @@ try:
         _zm = (_bfc >= 2.5) & (_bfc <= 5.5)
         fig, ax = plt.subplots(3, 1, figsize=(11.6, 8.4), sharex=True,
                                gridspec_kw=dict(height_ratios=[2.0, 1.1, 1.1], hspace=0.08))
-        for _w in range(nwalk):
-            ax[0].scatter(_bfc[_zm], _rat_tot[_w][_zm], s=6, color=CYAN, alpha=0.3, lw=0)
-        ax[0].plot(_bfc[_zm], _run_mean(np.nanmean(_rat_tot, axis=0), half=2)[_zm],
-                   color=CYAN, lw=2.0,
-                   label=f"{nwalk}-walker mean per band, running mean over 5 bands "
-                         "(points: every walker, every band, its own noise)")
-        ax[0].plot(_bfc[_zm], _run_mean(np.nanmean(_rat_inst, axis=0), half=2)[_zm],
-                   color=FG, lw=1.1, ls="--", label="same residual / instrument-only")
-        ax[0].plot(_bfc[_zm], _run_mean(np.nanmean(_rat_est, axis=0), half=2)[_zm],
-                   color=RED, lw=1.1, ls="-.",
-                   label="same residual / (instrument + FittedHT foreground estimate)")
+        for _k, (_w, _wc, _wl) in enumerate(_WSHOW):
+            ax[0].scatter(_bfc[_zm], _rat_tot[_k][_zm], s=6, color=_wc, alpha=0.3, lw=0)
+            ax[0].plot(_bfc[_zm], _run_mean(_rat_tot[_k], half=2)[_zm], color=_wc, lw=2.0,
+                       label=f"walker {_w} ({_wl}) against its own noise: per band (points), "
+                             "running mean over 5 bands")
+            ax[0].plot(_bfc[_zm], _run_mean(_rat_inst[_k], half=2)[_zm], color=_wc, lw=1.0,
+                       ls="--", label="dashed: same residual / instrument-only"
+                       if _k == 0 else None)
+            ax[0].plot(_bfc[_zm], _run_mean(_rat_est[_k], half=2)[_zm], color=_wc, lw=1.0,
+                       ls="-.", label=("dash-dot: same residual / (instrument + FittedHT "
+                                       "foreground estimate)") if _k == 0 else None)
+            ax[1].scatter(_bfc[_zm], _mm[_k][_zm], s=6, color=_wc, alpha=0.3, lw=0)
+            ax[1].plot(_bfc[_zm], _run_mean(_mm[_k], half=2)[_zm], color=_wc, lw=1.8)
+            ax[2].scatter(_bfc[_zm], 100 * _tail[_k][_zm], s=6, color=_wc, alpha=0.3, lw=0)
+            ax[2].plot(_bfc[_zm], 100 * _run_mean(_tail[_k], half=2)[_zm], color=_wc, lw=1.8)
         ax[0].axhline(1.0, color=FG, lw=1.0, ls=":")
         ax[0].set_yscale("log"); ax[0].set_ylim(0.5, 20)
         ax[0].set_ylabel("whitened residual power\nper GB band (1 = model)", fontsize=9)
         ax[0].legend(fontsize=7.5, loc="upper right")
-        for _w in range(nwalk):
-            ax[1].scatter(_bfc[_zm], _mm[_w][_zm], s=6, color=CYAN, alpha=0.3, lw=0)
-        ax[1].plot(_bfc[_zm], _run_mean(np.nanmean(_mm, axis=0), half=2)[_zm], color=CYAN, lw=1.8)
         ax[1].axhline(1.0 / np.log(2.0), color=FG, lw=1.0, ls=":", label="Gaussian: 1.443")
         ax[1].set_ylim(1.0, 4.0)
         ax[1].set_ylabel("mean / median\nof whitened power", fontsize=9)
         ax[1].legend(fontsize=7.5, loc="upper right")
-        for _w in range(nwalk):
-            ax[2].scatter(_bfc[_zm], 100 * _tail[_w][_zm], s=6, color=CYAN, alpha=0.3, lw=0)
-        ax[2].plot(_bfc[_zm], 100 * _run_mean(np.nanmean(_tail, axis=0), half=2)[_zm],
-                   color=CYAN, lw=1.8)
         ax[2].axhline(1.0, color=FG, lw=1.0, ls=":", label="Gaussian: 1% above 4.605")
         ax[2].set_ylim(0, 10)
         ax[2].set_ylabel("bins above 4.605\n[% per band]", fontsize=9)
         ax[2].legend(fontsize=7.5, loc="upper right")
         ax[2].set_xlabel("frequency [mHz]"); ax[2].set_xlim(2.5, 5.5)
-        fig.suptitle("ZOOM 2.5-5.5 mHz: whitened residual per GB band, every cold walker "
+        fig.suptitle(f"ZOOM 2.5-5.5 mHz: whitened residual per GB band, {_wtitle}, each "
                      "against its own fitted noise (linear frequency)", fontsize=10, color=FG)
         fig.tight_layout(rect=[0, 0, 1, 0.97])
         fig_b64(fig, "fg_whitened_zoom")
 
         # ---- ZOOM 2.5-5.5 mHz: the UNWHITENED residual against the curves ----
+        # colour = walker; solid = its residual, dashed = its fitted noise,
+        # dotted = its fitted instrument alone
         fig, ax = plt.subplots(1, 1, figsize=(11.6, 5.4))
-        for _w in range(nwalk):
-            ax.plot(_bfc[_zm], _psd_b[_w][_zm], color=VIOLET, lw=0.6, alpha=0.35)
-        ax.plot(_bfc[_zm], np.nanmean(_psd_b, axis=0)[_zm], color=VIOLET, lw=1.6,
-                label=f"residual PSD per GB band, TDI X, {nwalk}-walker mean "
-                      "(thin: each walker's own residual)")
-        ax.plot(_bfc[_zm], np.nanmean(_Stot_b, axis=0)[_zm], color=CYAN, lw=1.8,
-                label=f"fitted noise, instrument + galfor, cold-walker mean, row {NIT - 1}")
-        ax.plot(_bfc[_zm], np.nanmean(_Sinst_b, axis=0)[_zm], color=FG, lw=1.1, ls="--",
-                label="fitted instrument only")
+        for _k, (_w, _wc, _wl) in enumerate(_WSHOW):
+            ax.plot(_bfc[_zm], _psd_b[_k][_zm], color=_wc, lw=1.5,
+                    label=f"walker {_w} ({_wl}): residual PSD per GB band, TDI X")
+            ax.plot(_bfc[_zm], _Stot_b[_k][_zm], color=_wc, lw=1.3, ls="--",
+                    label=f"walker {_w}: its fitted noise, instrument + galfor")
+            ax.plot(_bfc[_zm], _Sinst_b[_k][_zm], color=_wc, lw=0.9, ls=":",
+                    label=f"walker {_w}: its fitted instrument only")
         ax.plot(_bfc[_zm], _Sest_b[_zm], color=RED, lw=1.1, ls="-.",
                 label="injected instrument + FittedHT foreground estimate")
         if _S0_b is not None:
-            ax.plot(_bfc[_zm], _S0_b[_zm], color=AMBER, lw=1.3, ls=(0, (4, 2)),
+            ax.plot(_bfc[_zm], _S0_b[_zm], color=VIOLET, lw=1.3, ls=(0, (4, 2)),
                     label="stored row 0 noise, walker 0 (the curve the search ran against "
                           "before the first release)")
         ax.set_yscale("log"); ax.set_xlim(2.5, 5.5)
         ax.set_xlabel("frequency [mHz]")
         ax.set_ylabel("PSD of TDI X [1/Hz], mean per GB band", fontsize=9)
-        _zz = np.nanmean(_psd_b, axis=0)[_zm]; _zz = _zz[np.isfinite(_zz)]
-        _zi = np.nanmean(_Sinst_b, axis=0)[_zm]; _zi = _zi[np.isfinite(_zi)]
+        _zz = _psd_b[:, _zm]; _zz = _zz[np.isfinite(_zz)]
+        _zi = _Sinst_b[:, _zm]; _zi = _zi[np.isfinite(_zi)]
         if _zz.size and _zi.size:
             ax.set_ylim(0.5 * float(np.min(_zi)), 3.0 * float(np.max(_zz)))
-        ax.legend(fontsize=7.5, loc="upper right")
+        ax.legend(fontsize=7.5, loc="upper right", ncols=2)
         fig.suptitle("ZOOM 2.5-5.5 mHz: residual spectrum against the noise curves (unwhitened)",
                      fontsize=10, color=FG)
         fig.tight_layout(rect=[0, 0, 1, 0.96])
@@ -3467,24 +3467,27 @@ try:
         _m35 = (_bfc >= 3.0) & (_bfc <= 5.0)
         _m12 = (_bfc >= 1.0) & (_bfc <= 2.0)
         _m610 = (_bfc >= 6.0) & (_bfc <= 10.0)
-        FGW.update(
-            rat_at={f_: _at(_mean_tot, f_) for f_ in _probe_f},
-            inst_at={f_: _at(_mean_inst, f_) for f_ in _probe_f},
-            est_at={f_: _at(_mean_est, f_) for f_ in _probe_f},
-            share_at={f_: _at(_mean_share, f_) for f_ in _probe_f},
-            rat_35=float(np.nanmean(_rat_tot[:, _m35])),
-            rat_12=float(np.nanmean(_rat_tot[:, _m12])),
-            rat_610=float(np.nanmean(_rat_tot[:, _m610])),
-            mm_35=float(np.nanmedian(_mm[:, _m35])),
-            mm_12=float(np.nanmedian(_mm[:, _m12])),
-            mm_610=float(np.nanmedian(_mm[:, _m610])),
-            tail_35=float(np.nanmean(_tail[:, _m35])),
-            tail_12=float(np.nanmean(_tail[:, _m12])),
-            tail_610=float(np.nanmean(_tail[:, _m610])),
-            bands_nongauss_35=int(np.sum(np.nanmean(_tail, axis=0)[_m35] > 0.02)),
-            bands_35=int(_m35.sum()),
-            spread_35=float(np.nanmax(_mean_tot[_m35]) / np.nanmin(_mean_tot[_m35])),
-        )
+        # readouts per shown walker: bare keys = max lnL, "_min" = min lnL
+        FGW.update(walker=WBEST, walker_min=WWORST, bands_35=int(_m35.sum()))
+        for _k, _sfx in ((0, ""), (1, "_min")):
+            _rm = _run_mean(_rat_tot[_k])
+            FGW.update({
+                "rat_at" + _sfx: {f_: _at(_rm, f_) for f_ in _probe_f},
+                "inst_at" + _sfx: {f_: _at(_run_mean(_rat_inst[_k]), f_) for f_ in _probe_f},
+                "est_at" + _sfx: {f_: _at(_run_mean(_rat_est[_k]), f_) for f_ in _probe_f},
+                "share_at" + _sfx: {f_: _at(_share[_k], f_) for f_ in _probe_f},
+                "rat_35" + _sfx: float(np.nanmean(_rat_tot[_k][_m35])),
+                "rat_12" + _sfx: float(np.nanmean(_rat_tot[_k][_m12])),
+                "rat_610" + _sfx: float(np.nanmean(_rat_tot[_k][_m610])),
+                "mm_35" + _sfx: float(np.nanmedian(_mm[_k][_m35])),
+                "mm_12" + _sfx: float(np.nanmedian(_mm[_k][_m12])),
+                "mm_610" + _sfx: float(np.nanmedian(_mm[_k][_m610])),
+                "tail_35" + _sfx: float(np.nanmean(_tail[_k][_m35])),
+                "tail_12" + _sfx: float(np.nanmean(_tail[_k][_m12])),
+                "tail_610" + _sfx: float(np.nanmean(_tail[_k][_m610])),
+                "bands_nongauss_35" + _sfx: int(np.sum(_tail[_k][_m35] > 0.02)),
+                "spread_35" + _sfx: float(np.nanmax(_rm[_m35]) / np.nanmin(_rm[_m35])),
+            })
         del _rat_tot, _rat_inst, _rat_est, _mm, _tail, _share
     except Exception as _e:
         MISSING.append(f"whitened residual per band unavailable: {type(_e).__name__}: {_e}")
@@ -3775,28 +3778,37 @@ if RATCHET:
                if _R.get("dband_lnl") else ""))
 if FGW:
     _F = FGW
+    _fp = (1.0, 2.0, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 8.0)
     cap_fgB = (
-        "<strong>Is the residual what the noise model says it is?</strong> Top: the mean "
+        "<strong>Is the residual what the noise model says it is?</strong> Top: the "
         "whitened residual power per GB band (1 = the fitted instrument + foreground "
-        "exactly; each walker against its own fit). Running mean at 1 / 2 / 3 / 3.5 / 4 / "
-        "4.5 / 5 / 6 / 8 mHz: "
-        + " / ".join(f"{_F['rat_at'][f_]:.2f}" for f_ in (1.0, 2.0, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 8.0))
-        + f"; band means average {_F['rat_12']:.2f} over 1-2 mHz, {_F['rat_35']:.2f} over "
-        f"3-5 mHz, {_F['rat_610']:.2f} over 6-10 mHz, and the running mean spans a factor "
-        f"{_F['spread_35']:.2f} across 3-5 mHz. Against instrument-only the same residual "
-        "reads "
+        f"exactly) for two cold walkers of the last stored row, each against its own fit: "
+        f"walker {_F['walker']}, the highest log-likelihood (cyan), and walker "
+        f"{_F['walker_min']}, the lowest (amber). Running mean at 1 / 2 / 3 / 3.5 / 4 / "
+        "4.5 / 5 / 6 / 8 mHz: max lnL "
+        + " / ".join(f"{_F['rat_at'][f_]:.2f}" for f_ in _fp)
+        + ", min lnL "
+        + " / ".join(f"{_F['rat_at_min'][f_]:.2f}" for f_ in _fp)
+        + f"; band means over 1-2 / 3-5 / 6-10 mHz are {_F['rat_12']:.2f} / "
+        f"{_F['rat_35']:.2f} / {_F['rat_610']:.2f} (max lnL) and {_F['rat_12_min']:.2f} / "
+        f"{_F['rat_35_min']:.2f} / {_F['rat_610_min']:.2f} (min lnL), and the running mean "
+        f"spans a factor {_F['spread_35']:.2f} / {_F['spread_35_min']:.2f} across 3-5 mHz. "
+        "Against instrument-only the max-lnL residual reads "
         + " / ".join(f"{_F['inst_at'][f_]:.1f}" for f_ in (2.0, 3.0, 4.0, 5.0))
         + " at 2 / 3 / 4 / 5 mHz (dashed: that is what the foreground term carries), and "
         "against instrument + the FittedHT estimate "
         + " / ".join(f"{_F['est_at'][f_]:.2f}" for f_ in (2.0, 3.0, 4.0, 5.0))
         + " (dash-dot: the estimate, used as the noise, would leave that much excess). "
         "Second and third rows: Gaussianity per band. For Gaussian noise the mean/median of "
-        "the whitened power is 1.443 and 1% of bins exceed 4.605; medians of the per-band "
-        f"mean/median are {_F['mm_12']:.2f} (1-2 mHz), {_F['mm_35']:.2f} (3-5 mHz), "
-        f"{_F['mm_610']:.2f} (6-10 mHz), and the tail fractions {100 * _F['tail_12']:.1f}% / "
-        f"{100 * _F['tail_35']:.1f}% / {100 * _F['tail_610']:.1f}%; "
-        f"{_F['bands_nongauss_35']} of {_F['bands_35']} bands in 3-5 mHz have more than 2% of "
-        "their bins in the tail. A band at mean 1 with a heavy tail holds its power in a few "
+        "the whitened power is 1.443 and 1% of bins exceed 4.605; for the max / min lnL "
+        f"walker the medians of the per-band mean/median are {_F['mm_12']:.2f} / "
+        f"{_F['mm_12_min']:.2f} (1-2 mHz), {_F['mm_35']:.2f} / {_F['mm_35_min']:.2f} (3-5 mHz), "
+        f"{_F['mm_610']:.2f} / {_F['mm_610_min']:.2f} (6-10 mHz), and the tail fractions "
+        f"{100 * _F['tail_12']:.1f}% / {100 * _F['tail_35']:.1f}% / {100 * _F['tail_610']:.1f}% "
+        f"(max lnL) and {100 * _F['tail_12_min']:.1f}% / {100 * _F['tail_35_min']:.1f}% / "
+        f"{100 * _F['tail_610_min']:.1f}% (min lnL); {_F['bands_nongauss_35']} / "
+        f"{_F['bands_nongauss_35_min']} of {_F['bands_35']} bands in 3-5 mHz have more than "
+        "2% of their bins in the tail. A band at mean 1 with a heavy tail holds its power in a few "
         "loud bins (unresolved or missed lines) rather than a Gaussian floor; a smooth drift of "
         "the mean away from 1 that follows frequency is the rigid tanh x power-law failing to "
         "follow the residual's shape. Bottom: the share of the model noise that is foreground. "
@@ -3968,7 +3980,9 @@ try:
             _none_r[k].append(int(np.sum(m & (h == 0))))
             _one_r[k].append(int(np.sum(m & (h == 1))))
     _tot7_r = {k: int(np.sum(_det7 & (_tf0_m >= lo) & (_tf0_m < hi))) for k, lo, hi in _groups_r}
-    fig, ax = plt.subplots(2, 1, figsize=(11.6, 7.2), sharex=True)
+    # one y axis for both rows (user request 2026-10-02): "held by none" and
+    # "held by one" read against each other only on the same scale
+    fig, ax = plt.subplots(2, 1, figsize=(11.6, 7.2), sharex=True, sharey=True)
     for (k, lo, hi), c in zip(_groups_r, (FG, VIOLET, CYAN, AMBER)):
         ax[0].plot(_rows_r, _none_r[k], "o-", color=c, lw=1.4, ms=3.5,
                    label=f"{k} mHz (of {_tot7_r[k]} catalogue sources with SNR > 7)")
@@ -4006,16 +4020,18 @@ try:
     _ed_r = np.arange(2.0, 7.0 + 1e-9, 0.5)
     _fc_r = 0.5 * (_ed_r[:-1] + _ed_r[1:])
     _nbin_r = 0.5e-3 * SCI_TOBS
-    _share_r = np.zeros((nwalk, _fc_r.size))
-    for _w in range(nwalk):
+    # the max- and min-lnL cold walkers of the last stored row, not the mean
+    _WSH_R = (int(np.argmax(ll[-1])), int(np.argmin(ll[-1])))
+    _share_r = np.zeros((2, _fc_r.size))
+    for _k, _w in enumerate(_WSH_R):
         _pmw = psd_cold[-1, _w]; _gmw = gal_cold_phys[-1, _w]
         _lmw = _lm_r.LISAModel(float(_pmw[0]) ** 2, float(_pmw[1]) ** 2,
                                _lm_r.DefaultOrbits(), "sampled")
         _si = np.asarray(_gs_r(_fc_r * 1e-3, sens_fn=_X2_r, model=_lmw, stochastic_params=()), float)
         _st = np.asarray(_gs_r(_fc_r * 1e-3, sens_fn=_X2_r, model=_lmw,
                                stochastic_params=tuple(_gmw), stochastic_function=_HT_r), float)
-        _share_r[_w] = 1.0 - _si / np.maximum(_st, 1e-60)
-    _share_m = _share_r.mean(axis=0)
+        _share_r[_k] = 1.0 - _si / np.maximum(_st, 1e-60)
+    _share_m = _share_r[0]                              # max lnL: what the red labels read
     _un = _h_last < 2                                   # not held by >= 2 walkers
     _p7 = np.zeros(_fc_r.size); _p57 = np.zeros(_fc_r.size); _p5 = np.zeros(_fc_r.size)
     for i in range(_fc_r.size):
@@ -4024,18 +4040,20 @@ try:
         _p57[i] = np.sum(_tsnr_r[m & (_tsnr_r > 5) & (_tsnr_r <= 7)] ** 2) / (4 * _nbin_r)
         _p5[i] = np.sum(_tsnr_r[m & (_tsnr_r <= 5)] ** 2) / (4 * _nbin_r)
     fig, ax = plt.subplots(1, 1, figsize=(11.6, 5.2))
-    _wd = 0.42
-    ax.bar(_fc_r - 0.11, _p5, width=_wd / 2, color=DIM, label="unresolved catalogue sources, SNR <= 5")
-    ax.bar(_fc_r - 0.11, _p57, width=_wd / 2, bottom=_p5, color=VIOLET, label="unresolved, SNR 5-7")
-    ax.bar(_fc_r - 0.11, _p7, width=_wd / 2, bottom=_p5 + _p57, color=RED,
+    _wd = 0.14
+    ax.bar(_fc_r - 0.15, _p5, width=_wd, color=DIM, label="unresolved catalogue sources, SNR <= 5")
+    ax.bar(_fc_r - 0.15, _p57, width=_wd, bottom=_p5, color=VIOLET, label="unresolved, SNR 5-7")
+    ax.bar(_fc_r - 0.15, _p7, width=_wd, bottom=_p5 + _p57, color=RED,
            label="unresolved, SNR > 7 (the ratchet's targets)")
-    ax.bar(_fc_r + 0.11, _share_m, width=_wd / 2, color=CYAN, alpha=0.85,
-           label=f"fitted foreground share of the model noise, cold-walker mean, row {NIT - 1}")
-    for _w in range(nwalk):
-        ax.plot(_fc_r + 0.11, _share_r[_w], "_", color=FG, ms=9, mew=1.2)
+    for _k, (_w, _wc, _wl) in enumerate(((_WSH_R[0], CYAN, "max lnL"),
+                                         (_WSH_R[1], AMBER, "min lnL"))):
+        ax.bar(_fc_r + 0.15 * _k, _share_r[_k], width=_wd, color=_wc, alpha=0.85,
+               label=f"fitted foreground share of the model noise, walker {_w} ({_wl}), "
+                     f"row {NIT - 1}")
     for i in range(_fc_r.size):
         if _share_m[i] > 0.02:
-            ax.annotate(f"{100 * _p7[i] / _share_m[i]:.0f}%", xy=(_fc_r[i], max(_share_m[i], _p5[i] + _p57[i] + _p7[i]) + 0.02),
+            ax.annotate(f"{100 * _p7[i] / _share_m[i]:.0f}%",
+                        xy=(_fc_r[i], max(_share_r[:, i].max(), _p5[i] + _p57[i] + _p7[i]) + 0.02),
                         ha="center", fontsize=7, color=RED)
     ax.set_ylim(0, 1.0)
     ax.set_xlabel("frequency [mHz]  (red labels: the SNR > 7 misses' share of the fitted foreground)")
@@ -4046,7 +4064,9 @@ try:
                  fontsize=10, color=FG)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig_b64(fig, "fg_truth_decomp")
-    RSC.update(share={f"{_ed_r[i]:.1f}-{_ed_r[i + 1]:.1f}": float(_share_m[i]) for i in range(_fc_r.size)},
+    RSC.update(share_walkers=_WSH_R,
+               share={f"{_ed_r[i]:.1f}-{_ed_r[i + 1]:.1f}": float(_share_m[i]) for i in range(_fc_r.size)},
+               share_min={f"{_ed_r[i]:.1f}-{_ed_r[i + 1]:.1f}": float(_share_r[1, i]) for i in range(_fc_r.size)},
                unres={f"{_ed_r[i]:.1f}-{_ed_r[i + 1]:.1f}": float(_p5[i] + _p57[i] + _p7[i]) for i in range(_fc_r.size)},
                miss7_frac={f"{_ed_r[i]:.1f}-{_ed_r[i + 1]:.1f}": (float(_p7[i] / _share_m[i]) if _share_m[i] > 0.02 else float("nan"))
                            for i in range(_fc_r.size)})
@@ -4120,12 +4140,15 @@ if RSC:
         "coordinates only in its keep window, so earlier rows need an earlier snapshot.")
     cap_fgE = (
         "<strong>What the fitted foreground is made of.</strong> Per 0.5 mHz: the fitted "
-        "foreground's share of the model noise (cyan; ticks = each cold walker) against the "
+        "foreground's share of the model noise for the max-lnL (cyan, walker "
+        f"{_S['share_walkers'][0]}) and min-lnL (amber, walker {_S['share_walkers'][1]}) "
+        "cold walkers of the last stored row, against the "
         "X-channel periodogram power of the catalogue sources the model has not resolved "
-        "(stacked by SNR; a source in one FD bin carries SNR&sup2; S_X / 4). Fit vs unresolved "
-        "total: "
-        + ", ".join(f"{k}: {_S['share'][k]:.2f} vs {_S['unres'][k]:.2f}" for k in _S["share"])
-        + ". Share of the fitted foreground carried by the SNR &gt; 7 misses: "
+        "(stacked by SNR; a source in one FD bin carries SNR&sup2; S_X / 4). Fit (max lnL / "
+        "min lnL) vs unresolved total: "
+        + ", ".join(f"{k}: {_S['share'][k]:.2f} / {_S['share_min'][k]:.2f} vs {_S['unres'][k]:.2f}"
+                    for k in _S["share"])
+        + ". Share of the max-lnL walker's fitted foreground carried by the SNR &gt; 7 misses: "
         + ", ".join(f"{k}: {100 * v:.0f}%" for k, v in _S["miss7_frac"].items() if np.isfinite(v))
         + ". Where the two bars agree the fitted foreground IS the unresolved galaxy; the red "
         "fraction is the part a search could still remove.")
@@ -6946,13 +6969,16 @@ the residual by construction.</div>
 <div class="caption">{cap_fgB}</div></div>
 <div class="panel">{img("fg_whitened_zoom", "zoom 2.5-5.5 mHz: whitened residual per GB band")}
 <div class="caption">Zoom of the panel above on 2.5&ndash;5.5 mHz with a linear frequency
-axis. Points are every cold walker at every GB band against its own fitted noise; the
-running mean spans 5 bands (~85 &micro;Hz) instead of 15.</div></div>
+axis. Points are every GB band for the max-lnL (cyan) and min-lnL (amber) cold walkers
+of the last stored row, each against its own fitted noise; the running mean spans 5 bands
+(~85 &micro;Hz) instead of 15.</div></div>
 <div class="panel">{img("fg_resid_psd_zoom", "zoom 2.5-5.5 mHz: residual spectrum against the noise curves")}
-<div class="caption">The same residual unwhitened: its PSD per GB band against the fitted
-noise (instrument + galfor, cold-walker mean at the last row), the fitted instrument alone,
-the injected instrument + FittedHT estimate, and stored row 0&rsquo;s noise &mdash; under a
-pinned launch that is the start vector the search ran against until the first release.
+<div class="caption">The same residual unwhitened, for the max-lnL (cyan) and min-lnL
+(amber) cold walkers of the last stored row: each walker&rsquo;s residual PSD per GB band
+(solid) against its own fitted noise (instrument + galfor, dashed) and its fitted
+instrument alone (dotted), with the injected instrument + FittedHT estimate and stored row
+0&rsquo;s noise (violet) &mdash; under a pinned launch that is the start vector the search
+ran against until the first release.
 Where the residual sits above the fitted curve the model is under-estimating the power
 there; where the fitted curve sits above row 0 the release raised the foreground.</div></div>
 <div class="panel">{img("fg_leaf_delta", "where the leaves went across the ratchet")}

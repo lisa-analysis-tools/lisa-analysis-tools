@@ -60,12 +60,33 @@ class RatchetPanelsLayoutTest(unittest.TestCase):
         blk = self.src[self.src.index("FOREGROUND DIAGNOSIS: the whitened residual"):
                        self.src.index('fig_b64(fig, "fg_whitened_bands")')]
         # the loop over walkers builds THAT walker's instrument + foreground
-        self.assertRegex(blk, r"for _w in range\(nwalk\):")
+        self.assertRegex(blk, r"for _w, _wc, _wl in _WSHOW:")
         self.assertRegex(blk, r"psd_cold\[-1, _w\]")
         self.assertRegex(blk, r"gal_cold_phys\[-1, _w\]")
         # and the Gaussian reference marks are the Exp(1) ones
         self.assertIn("1.0 / np.log(2.0)", blk)
         self.assertIn("4.605", blk)
+
+    def test_the_noise_panels_show_the_max_and_min_lnl_walkers_not_a_mean(self):
+        # user request 2026-10-02: "rather than showing the mean of the 4, show the
+        # max logL and min logL from the cold chain last sample"
+        blk = self.src[self.src.index("FOREGROUND DIAGNOSIS: the whitened residual"):
+                       self.src.index('fig_b64(fig, "fg_resid_psd_zoom")')]
+        self.assertIn("WWORST = int(np.argmin(ll[-1]))", blk)
+        self.assertIn('_WSHOW = ((WBEST, CYAN, "max lnL"), (WWORST, AMBER, "min lnL"))', blk)
+        self.assertIn("WBEST = int(np.argmax(ll[-1]))", self.src)
+        for arr in ("_rat_tot", "_rat_inst", "_rat_est", "_mm", "_tail", "_share",
+                    "_psd_b", "_Stot_b", "_Sinst_b"):
+            self.assertNotIn(f"np.nanmean({arr}, axis=0)", blk, arr)
+        dec = self.src[self.src.index("(E) what the fitted foreground is made of"):
+                       self.src.index('fig_b64(fig, "fg_truth_decomp")')]
+        self.assertIn("_WSH_R = (int(np.argmax(ll[-1])), int(np.argmin(ll[-1])))", dec)
+        self.assertNotIn("_share_r.mean(axis=0)", dec)
+
+    def test_the_scorecard_rows_share_one_y_axis(self):
+        blk = self.src[self.src.index('_tot7_r = {'):
+                       self.src.index('fig_b64(fig, "fg_missed_vs_row")')]
+        self.assertIn("sharex=True, sharey=True", blk)
 
     def test_the_reference_row_is_the_one_before_the_first_nudge(self):
         blk = self.src[self.src.index("FOREGROUND RATCHET: the timeline"):
