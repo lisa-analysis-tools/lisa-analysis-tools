@@ -40,11 +40,22 @@ _ORBITS_CONFIGURED_CACHE: dict = {}
 
 
 def _orbits_cache_key(orbits) -> Optional[tuple]:
-    """Identity of everything ``Orbits._configure`` depends on, or None."""
+    """Identity of everything ``Orbits._configure`` depends on, or None.
+
+    Includes the BACKEND and the current DEVICE: the configured tables are arrays of the
+    orbits' own backend, allocated on the device current at configuration. Without them a
+    process that builds the same orbits on two backends (TDDenseGPUParityTest: cpu, then
+    gpu) handed the numpy tables to ``OrbitsWrapGPU``, and a multi-GPU process would serve
+    one device's tables to another."""
+    from ..utils.device import current_device
+
     try:
+        backend = getattr(orbits, "backend", None)
         parts = [
             type(orbits).__module__,
             type(orbits).__name__,
+            getattr(backend, "backend_name", None),
+            current_device(getattr(backend, "xp", None)),
             getattr(orbits, "frame", None),
             getattr(orbits, "armlength", None),
             getattr(orbits, "t0", None),
