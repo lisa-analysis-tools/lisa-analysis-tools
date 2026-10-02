@@ -3229,6 +3229,31 @@ def _local_nwalkers(acs) -> int:
     return int(len(acs) if n is None else n)
 
 
+def _body_nwalkers(curr, acs, move_class) -> int:
+    """Walker width of the state a single-source PE move's BODY runs on.
+
+    The local ACA width (:func:`_local_nwalkers`) everywhere except one
+    layout: replicas over SEVERAL walker blocks (``GF_GPU_ROUTING``, e.g.
+    2 walkers on 4 ranks = 2 blocks x R=2). There a flat-capable family
+    (``fanout_flat_body``; the addremove moves) runs ``propose_local`` on
+    the head over the WHOLE ensemble -- its rows are routed to the ranks
+    holding each walker -- while every rank's ACA holds only its block. A
+    move sized off the ACA would tile its ``data_index`` and size its
+    ladders for B walkers against an N-walker state. At one block (one-walker
+    replica mode, walker-block mode) the two widths are equal.
+    """
+    n_local = _local_nwalkers(acs)
+    layout = getattr(curr, "rank_layout", None)
+    if (
+        layout is not None
+        and getattr(layout, "replica_mode", False)
+        and int(getattr(layout, "n_blocks", 1)) > 1
+        and getattr(move_class, "fanout_flat_body", False)
+    ):
+        return int(layout.nwalkers)
+    return n_local
+
+
 def _local_walker_block(curr, acs):
     """(w0, w1) of the global walkers this rank's ACA rows correspond to."""
     layout = getattr(curr, "rank_layout", None)
@@ -5669,7 +5694,7 @@ class SingleSourcePEBuilder(SourceMoveBuilder):
     def build(self, engine_info, curr, acs, priors, state):
         info = curr.source_info[self.branch_name]
         gi = curr.general_info
-        nwalkers = _local_nwalkers(acs)
+        nwalkers = _body_nwalkers(curr, acs, self.move_class)
         # this branch's OWN per-leaf ladder size (the engine runs cold-chain
         # only); an explicit betas ladder wins over the ntemps knob
         _info_betas = getattr(info, "betas", None)
