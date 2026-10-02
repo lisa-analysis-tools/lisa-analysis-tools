@@ -159,6 +159,12 @@ act=$((nt - 2 * EDGE))
 echo "[mbh] backend ${BACKEND}; merger-centred grid ${WINDOW_DAYS} d (Nt ${nt}, Tobs $((NF * nt * 5 / 2)) s), merger" \
      "${MERGER_AT_DAYS} d in; Nf ${NF} dt ${DT} s; band ${FMIN}-${FMAX} Hz, active t [${EDGE}, $((nt - EDGE))) = ${act} layers;" \
      "foreground ${FOREGROUND}; orbits ${ORBITS}; MOJITO_LIGHT_PATH ${MOJITO_LIGHT_PATH:-unset}; -> ${OUT}/"
+# where ORBITS=auto and the data step look first (the campaign / benchmark then also search
+# MOJITO_DATA_PATH, MOJITO_INFO_PATH recursively): say up front whether any brick is there
+for d in ${L1_DIR:-"${MOJITO_LIGHT_PATH:-${MOJITO_DATA_PATH}}/data/MBHB/L1"}; do
+  nb=$(ls "${d}"/MBHB_*_L1_source*.h5 2>/dev/null | wc -l | tr -d ' ')
+  echo "[mbh] ${nb} MBHB L1 brick(s) in ${d}$([ "${nb}" = 0 ] && echo ' -- ORBITS=auto falls back to equal-arm unless one is found deeper; the data step needs them')"
+done
 grid=(--backend "${BACKEND}" --nf "${NF}" --dt "${DT}" --nt "${nt}" --merger-day "${MERGER_AT_DAYS}"
       --min-freq "${FMIN}" --max-freq "${FMAX}" --edge-crop "${EDGE}" --foreground "${FOREGROUND}"
       "${orb_args[@]}" ${l1_args[@]+"${l1_args[@]}"} ${cat_args[@]+"${cat_args[@]}"})
@@ -201,6 +207,7 @@ if step data; then
         [ "${ids}" != "-" ] || ids=""
       else
         fail "${dry}"
+        grep -v "${quiet}" "${dry}" | tail -5
         ids=""
       fi
     else
