@@ -87,6 +87,11 @@ class SparseResponseTest(unittest.TestCase):
         dense_e = TDDenseTDIonTheFly(np.append(t_sparse, cls.t_k[-1])[None], *args, **kw)
         cls.sparse_endpoint = ExactPhaseTDIOutput(dense_e(params, return_spline=False), [cls.t_k],
                                                   [cls.C], cls.mkn, dense_e.sub_temp_host)
+        from lisatools.sources.emri.wdm_direct import SplinedTDIOutput
+
+        # the pixel-grid construction (whole phase splined) on a 30 min grid
+        dense_p = TDDenseTDIonTheFly(np.arange(cls.t_k[0] + 600.0, cls.t_k[-1] - 599.0, 1800.0)[None], *args, **kw)
+        cls.pixels = SplinedTDIOutput(dense_p(params, return_spline=False), cls.mkn, dense_p.sub_temp_host)
         cls.t_pix = np.linspace(cls.t_k[0] + DAY, cls.t_k[-1] - DAY, 97)
 
     def _tracer(self, out):
@@ -152,6 +157,45 @@ class SparseResponseTest(unittest.TestCase):
         car = np.asarray(self.sparse.carrier(t))
         np.testing.assert_allclose(car[:, 1], car[:, 0], rtol=0, atol=0)
         np.testing.assert_allclose(car[:, 2], car[:, 3], rtol=0, atol=0)
+        _, d1, d2 = (np.asarray(a) for a in self.sparse.carrier_derivs(t))
+        self.assertTrue(np.all(d1[:, 1:3] == 0) and np.all(d2[:, 1:3] == 0))
+        self.assertTrue(np.all(d1[:, [0, 3]] != 0))
+
+    def test_carrier_derivatives_are_the_quadratic_phase(self):
+        """Phi_j = phi0 + 2 pi (f0 tau + fdot tau^2 / 2) exactly: analytic d/dt and d2/dt2."""
+        f0 = np.array([3.1e-3, 0.0, 0.47e-3])
+        fdot = np.array([2e-10, 0.0, 3e-11])
+        tau = self.t_pix - self.t_k[0]
+        _, d1, d2 = (np.asarray(a) for a in self.sparse.carrier_derivs(self.t_pix))
+        np.testing.assert_allclose(d1, 2 * np.pi * self.mkn @ (f0[:, None] + fdot[:, None] * tau[None]),
+                                   rtol=1e-10, atol=0)
+        np.testing.assert_allclose(d2, 2 * np.pi * (self.mkn @ fdot)[:, None] * np.ones_like(tau)[None],
+                                   rtol=1e-6, atol=0)
+
+    def test_analytic_tracer_equals_the_stencil(self):
+        """One evaluation per pixel with exact derivatives == the central-difference stencils,
+        on the sparse (exact carrier) and on the pixel-grid (whole phase splined) outputs."""
+        from lisatools.sources.emri.wdm_direct import tracer_from_tof_output
+
+        for name, out in (("sparse", self.sparse), ("pixels", self.pixels)):
+            an = [np.asarray(a) for a in tracer_from_tof_output(out, self.t_pix, method="analytic")]
+            st = [np.asarray(a) for a in tracer_from_tof_output(out, self.t_pix, method="stencil")]
+            df, dfd = np.abs(an[2] - st[2]).max(), np.abs(an[3] - st[3]).max()
+            print(f"[analytic tracer] {name}: |df| {df:.2e} Hz, |dfdot| {dfd:.2e} Hz/s")
+            np.testing.assert_array_equal(an[0], st[0])
+            np.testing.assert_allclose(an[1], st[1], rtol=1e-14, atol=0)
+            self.assertLess(df, 1e-12)                        # layer_df ~1.4e-4 Hz
+            self.assertLess(dfd, 1e-16)                       # fdot axis step ~4e-10 Hz/s
+
+    def test_analytic_tracer_mirrors_negative_frequency_subs(self):
+        from lisatools.sources.emri.wdm_direct import tracer_from_tof_output
+
+        amp, ph, f, fdot = (np.asarray(a) for a in tracer_from_tof_output(self.sparse, self.t_pix))
+        self.assertTrue(np.all(f > 0))
+        car, car1, _ = (np.asarray(a) for a in self.sparse.carrier_derivs(self.t_pix))
+        self.assertTrue(np.all(car1[2] < 0))                  # the (-2, 0, -1) sub runs backwards
+        res = np.asarray(self.sparse._eval_chan(self.sparse._res_spl, self.t_pix, np.array([2])))[0]
+        np.testing.assert_allclose(ph[2], -(res + car[2][None]), rtol=1e-14, atol=0)
 
 
 

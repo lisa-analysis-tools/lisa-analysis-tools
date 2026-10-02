@@ -56,6 +56,7 @@ def main():
     ap.add_argument("--nt", type=int, default=1024)
     ap.add_argument("--rows", type=int, default=8)
     ap.add_argument("--eval-dt", type=float, default=43200.0)
+    ap.add_argument("--interp", default="spline", choices=("spline", "cubic", "linear"))
     ap.add_argument(
         "--buffer-time",
         type=float,
@@ -94,7 +95,7 @@ def main():
         buffer_time=args.buffer_time,
         eval_dt=args.eval_dt,
         num_m_layers=2,
-        interp="cubic",
+        interp=args.interp,
         row_batch=args.rows,
         force_backend="cpu",
         d_d=0.0,
@@ -237,7 +238,7 @@ def main():
     with open(args.out, "a") as fp:
         for row in rows_out:
             fp.write(
-                json.dumps(dict(nt=nt, eval_dt=args.eval_dt, buffer_time=args.buffer_time, **row))
+                json.dumps(dict(nt=nt, eval_dt=args.eval_dt, buffer_time=args.buffer_time, interp=args.interp, **row))
                 + "\n"
             )
         fp.write(json.dumps(dict(timing=timing, tag=tag)) + "\n")

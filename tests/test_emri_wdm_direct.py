@@ -159,6 +159,72 @@ class HandoffTest(unittest.TestCase):
         self.assertEqual(self.wd.handoff_pixel(tr, self.layer_dt, self.layer_df, 3.086e-7), 100)
 
 
+class HandoffBoundTest(unittest.TestCase):
+    """The fast handoff path (EMRIDirectWDM._handoff_may_trip): a bound over the three
+    fundamentals skips the per-harmonic tracks when no harmonic can hand off, and never hides
+    a handoff the exact tracks find (the plunge-chunk start is the same with and without it)."""
+
+    FD_AX = 3.086e-7
+
+    def _direct(self, integ):
+        from lisatools.domains import WDMSettings
+        from lisatools.sources.emri.wdm_direct import EMRIDirectWDM
+
+        table = SimpleNamespace(fdot_vals=np.array([-self.FD_AX, self.FD_AX]), INTERP_METHOD="spline")
+        gen = SimpleNamespace(inspiral_generator=SimpleNamespace(inspiral_generator=integ))
+        return EMRIDirectWDM(gen, table, WDMSettings(32, 256, 112.5, force_backend="cpu"), orbits=None,
+                             tdi_config=None, t_start=0.0, data_t0=0.0)
+
+    def _case(self, wd, wdd):
+        import os
+        from unittest import mock
+
+        d = self._direct(_FakeIntegrator(w=1e-3, wd=wd, wdd=wdd))
+        H = _fake_holder(np.linspace(0.0, 1.2e6, 80))          # ends after the 256 h window
+        args = (1e6, 10.0, 0.9, 10.0, 0.3, 1.0)
+        n_in, t_rel = d._pixel_times(H)
+        fast = d._maybe_tracks(H, args, t_rel)
+        start_fast = d._chunk_start(H, args, tracks=fast, t_rel=t_rel)
+        with mock.patch.dict(os.environ, {"EMRI_DIRECT_HANDOFF_BOUND": "0"}):
+            exact = d._maybe_tracks(H, args, t_rel)
+        start_exact = d._chunk_start(H, args, tracks=exact, t_rel=t_rel)
+        trips = [self.__class__._k(d, tr) < t_rel.size for tr in exact]
+        return fast, start_fast, start_exact, any(trips)
+
+    @staticmethod
+    def _k(d, tr):
+        from lisatools.sources.emri.wdm_direct import handoff_pixel
+
+        return handoff_pixel(tr, d.wdm.layer_dt, d.wdm.layer_df, d.fdot_axis_max)
+
+    def test_slow_source_skips_the_tracks(self):
+        fast, s_fast, s_exact, trips = self._case(wd=2e-9, wdd=3e-15)
+        self.assertIsNone(fast)
+        self.assertFalse(trips)
+        self.assertIsNone(s_fast)
+        self.assertIsNone(s_exact)
+
+    def test_fdot_range_trip_is_kept(self):
+        fast, s_fast, s_exact, trips = self._case(wd=1e-6, wdd=0.0)
+        self.assertTrue(trips)
+        self.assertIsNotNone(fast)
+        self.assertEqual(s_fast, s_exact)
+
+    def test_curvature_trip_is_kept(self):
+        fast, s_fast, s_exact, trips = self._case(wd=0.0, wdd=5e-13)
+        self.assertTrue(trips)
+        self.assertIsNotNone(fast)
+        self.assertEqual(s_fast, s_exact)
+
+    def test_bound_never_hides_a_handoff(self):
+        for wd in (0.0, 1e-8, 9e-7, 1e-6):
+            for wdd in (0.0, 1e-14, 9e-14, 3e-13):
+                fast, s_fast, s_exact, trips = self._case(wd, wdd)
+                self.assertEqual(s_fast, s_exact, (wd, wdd))
+                if fast is None:
+                    self.assertFalse(trips, (wd, wdd))
+
+
 class AssemblyTest(unittest.TestCase):
     """A8: accumulate_harmonic_batch places the lookup before the handoff and the chunk
     after it, and the sum reproduces the TD->WDM truth of a linear chirp across both."""

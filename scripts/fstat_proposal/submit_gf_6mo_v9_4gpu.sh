@@ -4706,8 +4706,11 @@ export EMRI_EPS=1e-3
 # per row (trajectory + amplitudes at the integrator knots, modes kept at
 # EMRI_EPS), ONE dense TDI-on-the-fly response launch for the chunk
 # (TDDenseTDIWaveform: exact DOPR853 dense-output phases, link geometry shared
-# across harmonics) and one n_ref WDM lookup-table pass + scatter-add, cropped
-# to this run's WDM box and scored against each walker's own residual AND PSD.
+# across harmonics, on the trajectory knots + a 12 h cap) and ONE fused lookup-sum
+# kernel launch (wdm_lookup_sum: sparse response -> analytic f, fdot -> n_ref
+# table -> WDM sum, nothing per pixel in memory; EMRI_DIRECT_LOOKUP=python is the
+# Python reference path) on this run's active band, cropped to its time box and
+# scored against each walker's own residual AND PSD.
 # A harmonic that chirps off the table's fdot axis near a plunge hands off to
 # an even-start 128-layer TD chunk. In-model steps, eigen-table sweeps and the
 # inner-product record all score through it.
@@ -4752,12 +4755,14 @@ export EMRI_BATCH_MAX_SIZE=${EMRI_BATCH_MAX_SIZE:-8}
 export EMRI_DIRECT_TABLE=${EMRI_DIRECT_TABLE:-}
 export EMRI_DIRECT_RESPONSE=${EMRI_DIRECT_RESPONSE:-dense}
 export EMRI_TRAJ_WORKERS=${EMRI_TRAJ_WORKERS:-4}
+export EMRI_DIRECT_LOOKUP=${EMRI_DIRECT_LOOKUP:-kernel}
 #
 # EMRI PREFLIGHT. An unknown env var is SILENTLY IGNORED, so resolve the knobs
 # through the real settings class and the real consistency rule; for direct,
 # also check the edge crop clears the template's zeroed edge layers, run the dense
-# kernel's GPU-vs-CPU parity test on this node's GPU, and find -- or build and save
-# -- the lookup table (above). Refuses before mpiexec on any gap.
+# kernel's (and, with EMRI_DIRECT_LOOKUP=kernel, the fused lookup kernel's)
+# GPU-vs-CPU parity test on this node's GPU, and find -- or build and save -- the
+# lookup table (above). Refuses before mpiexec on any gap.
 python - <<'PYEOF' || exit 2
 import dataclasses
 import inspect
@@ -4827,6 +4832,27 @@ if cfg["emri_direct_response"] == "dense":
               "Rebuild lisatools (pip install -e . --no-build-isolation) or launch with "
               "EMRI_LIKELIHOOD=full / EMRI_DIRECT_RESPONSE=spline.")
         sys.exit(2)
+    if os.environ["EMRI_DIRECT_LOOKUP"] not in ("kernel", "python"):
+        print(f"[EMRI-PREFLIGHT] REFUSING: EMRI_DIRECT_LOOKUP={os.environ['EMRI_DIRECT_LOOKUP']!r} "
+              "(kernel or python).")
+        sys.exit(2)
+    if os.environ["EMRI_DIRECT_LOOKUP"] == "kernel":
+        # a module without the kernel would fall back to the Python lookup with only a
+        # warning: prove it is here and right on this GPU instead
+        try:
+            from tests import test_wdm_lookup_sum_kernel as tk
+        except ImportError as exc:
+            print(f"[EMRI-PREFLIGHT] REFUSING: cannot import tests/test_wdm_lookup_sum_kernel.py ({exc}).")
+            sys.exit(2)
+        suite = unittest.TestSuite([tk.SyntheticEdgesTest("test_gpu_equals_cpu")])
+        res = unittest.TextTestRunner(stream=sys.stdout, verbosity=1).run(suite)
+        if not res.wasSuccessful() or res.skipped or res.testsRun == 0:
+            print("[EMRI-PREFLIGHT] REFUSING: the fused lookup kernel's GPU-vs-CPU parity test "
+                  f"did not pass on this node (run {res.testsRun}, failures {len(res.failures)}, "
+                  f"errors {len(res.errors)}, skipped {len(res.skipped)}: {res.skipped}). Rebuild "
+                  "lisatools (pip install -e . --no-build-isolation) or launch with "
+                  "EMRI_DIRECT_LOOKUP=python.")
+            sys.exit(2)
 import time
 
 import lisatools
@@ -4854,7 +4880,8 @@ if cpus is not None and int(cpus) < 1 + cfg["emri_traj_workers"]:
           f"{cfg['emri_traj_workers']}: the trajectory workers will share cores (submit "
           "through the self-dispatch, which sizes it).")
 print(f"[EMRI-PREFLIGHT] emri_pe scoring=direct batch<={cfg['emri_batch_max_size']} "
-      f"response={cfg['emri_direct_response']} traj_workers={cfg['emri_traj_workers']} "
+      f"response={cfg['emri_direct_response']} lookup={os.environ['EMRI_DIRECT_LOOKUP']} "
+      f"traj_workers={cfg['emri_traj_workers']} "
       f"table={table_path} (Nf 1440, dt 2.5) edge_crop={crop}>={edge}")
 PYEOF
 
@@ -4880,12 +4907,16 @@ PYEOF
 # GPU before mpiexec (lisatools.wdm_lookup_store), so a restart never rebuilds.
 # SOBBH_M_BAND_HALF_WIDTH / SOBBH_FILL_M_BAND_HALF_WIDTH are ignored by it.
 # RESUME-SAFE: no stored shape changes.
+# KERNEL: SOBBH_LOOKUP_KERNEL=auto (default) scores and fills through the fused
+# C++/CUDA lookup (sobbh_lookup_kernel.cu) when this lisatools build has it, else
+# the Python lookup; =kernel refuses without it; =python forces the Python path.
 # WATCH: "[SOBBH_LOOKUP] lookup table ... (found|built|waited|explicit)" at
 # build, and the [SOBBH_LL_TIMING] leaf windows (ms/call should be ~100-400).
 export SOBBH_LIKELIHOOD=${SOBBH_LIKELIHOOD:-chunked}
 export SOBBH_LOOKUP_TABLE_PATH=${SOBBH_LOOKUP_TABLE_PATH:-}
 export SOBBH_LOOKUP_EVAL_DT=${SOBBH_LOOKUP_EVAL_DT:-43200}
 export SOBBH_LOOKUP_ROW_BATCH=${SOBBH_LOOKUP_ROW_BATCH:-32}
+export SOBBH_LOOKUP_KERNEL=${SOBBH_LOOKUP_KERNEL:-auto}
 #
 # SOBBH PREFLIGHT. An unknown env var is SILENTLY IGNORED, so resolve the knobs
 # through the real settings class; for lookup, refuse a lisatools without the
@@ -4909,11 +4940,12 @@ except ImportError as exc:
     sys.exit(2)
 sobbh = SourceSOBBHSettings()
 want = (os.environ["SOBBH_LIKELIHOOD"], os.environ["SOBBH_LOOKUP_TABLE_PATH"],
-        float(os.environ["SOBBH_LOOKUP_EVAL_DT"]), int(os.environ["SOBBH_LOOKUP_ROW_BATCH"]))
+        float(os.environ["SOBBH_LOOKUP_EVAL_DT"]), int(os.environ["SOBBH_LOOKUP_ROW_BATCH"]),
+        os.environ["SOBBH_LOOKUP_KERNEL"])
 got = (sobbh.likelihood, sobbh.lookup_table_path, float(sobbh.lookup_eval_dt),
-       int(sobbh.lookup_row_batch))
+       int(sobbh.lookup_row_batch), str(getattr(sobbh, "lookup_kernel", "MISSING")))
 if got != want:
-    print("[SOBBH-PREFLIGHT] REFUSING: exported (likelihood, table, eval_dt, row_batch) = "
+    print("[SOBBH-PREFLIGHT] REFUSING: exported (likelihood, table, eval_dt, row_batch, kernel) = "
           f"{want} but the settings resolve {got}.")
     sys.exit(2)
 if sobbh.likelihood != "lookup":
@@ -4956,7 +4988,39 @@ if abs(layer - 3600.0) > 1e-6:
     print(f"[SOBBH-PREFLIGHT] REFUSING: lookup table {path} has layer duration {layer:g} s; "
           "this run's is 3600 s.")
     sys.exit(2)
-print(f"[SOBBH-PREFLIGHT] sobbh scoring=lookup eval_dt={sobbh.lookup_eval_dt:g} "
+# the fused C++/CUDA lookup (sobbh_lookup_kernel.cu) on this node's backend
+have_kernel = getattr(lisatools.get_backend(table_backend), "sobbh_lookup", None) is not None
+if sobbh.lookup_kernel == "kernel" and not have_kernel:
+    print(f"[SOBBH-PREFLIGHT] REFUSING: SOBBH_LOOKUP_KERNEL=kernel but the {table_backend} "
+          "backend module has no sobbh_lookup. Rebuild lisatools (pip install -e . "
+          "--no-build-isolation) or launch with SOBBH_LOOKUP_KERNEL=auto / python.")
+    sys.exit(2)
+if sobbh.lookup_kernel == "auto" and not have_kernel:
+    print(f"[SOBBH-PREFLIGHT] WARNING: the {table_backend} backend module has no sobbh_lookup: "
+          "SOBBH_LOOKUP_KERNEL=auto falls back to the Python lookup (rebuild lisatools).")
+path_used = "kernel" if (have_kernel and sobbh.lookup_kernel != "python"
+                         and sobbh.lookup_interp == "spline") else "python"
+if path_used == "kernel" and table_backend == "gpu":
+    # prove the fused kernel's CUDA build on this node's GPU against its CPU build
+    import unittest
+
+    try:
+        from tests import test_sobbh_lookup_kernel
+    except ImportError as exc:
+        print("[SOBBH-PREFLIGHT] REFUSING: cannot import tests/test_sobbh_lookup_kernel.py "
+              f"({exc}) to prove the fused lookup kernel on this GPU.")
+        sys.exit(2)
+    suite = unittest.TestSuite(
+        [test_sobbh_lookup_kernel.GPUKernelParityTest("test_gpu_equals_cpu")])
+    res = unittest.TextTestRunner(stream=sys.stdout, verbosity=1).run(suite)
+    if not res.wasSuccessful() or res.skipped or res.testsRun == 0:
+        print("[SOBBH-PREFLIGHT] REFUSING: the fused SOBBH lookup kernel's GPU-vs-CPU parity "
+              f"test did not pass on this node (run {res.testsRun}, failures "
+              f"{len(res.failures)}, errors {len(res.errors)}, skipped {len(res.skipped)}). "
+              "Rebuild lisatools (pip install -e . --no-build-isolation) or launch with "
+              "SOBBH_LOOKUP_KERNEL=python.")
+        sys.exit(2)
+print(f"[SOBBH-PREFLIGHT] sobbh scoring=lookup ({path_used}) eval_dt={sobbh.lookup_eval_dt:g} "
       f"row_batch={sobbh.lookup_row_batch} table={path} ({status}, "
       f"{time.time() - t_table:.0f} s)")
 PYEOF

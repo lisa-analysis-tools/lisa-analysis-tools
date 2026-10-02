@@ -685,13 +685,21 @@ class SourceSOBBHSettings(SOBBHSettings):
     lookup_eval_dt: float = dataclasses.field(
         default_factory=env_default("SOBBH_LOOKUP_EVAL_DT", 43200.0, float)
     )
-    # table interpolation: "cubic" (Keys) or "linear"
+    # table interpolation: "spline" (the table's uniform cubic B-spline; the fused kernels'
+    # semantics), "cubic" (Keys) or "linear"
     lookup_interp: str = dataclasses.field(
-        default_factory=env_default("SOBBH_LOOKUP_INTERP", "cubic", str)
+        default_factory=env_default("SOBBH_LOOKUP_INTERP", "spline", str)
     )
-    # rows per batched response build (bounds the spline memory)
+    # rows per tracer / lookup block (bounds their temporaries, ~17 MB per row at 6 months);
+    # the response is built once per call for all rows
     lookup_row_batch: int = dataclasses.field(
         default_factory=env_default("SOBBH_LOOKUP_ROW_BATCH", 32, int)
+    )
+    # the fused C++/CUDA lookup (sobbh_lookup_kernel.cu: response splines -> <d|h>, <h|h> or the
+    # fill in one launch): "auto" = when the backend module has it, "kernel" = required,
+    # "python" = the Python lookup (tracer / lookup / inner in row blocks)
+    lookup_kernel: str = dataclasses.field(
+        default_factory=env_default("SOBBH_LOOKUP_KERNEL", "auto", str)
     )
 
 
@@ -1424,6 +1432,7 @@ def source_signal_cfg(gs, mbh, sobbh, emri, *, domain_settings) -> dict:
         sobbh_lookup_eval_dt=sobbh.lookup_eval_dt,
         sobbh_lookup_interp=sobbh.lookup_interp,
         sobbh_lookup_row_batch=sobbh.lookup_row_batch,
+        sobbh_lookup_kernel=str(getattr(sobbh, "lookup_kernel", "auto")),
         mbh_phenom_kwargs=dict(
             waveform_duration=_mbh_batched["mbh_waveform_duration"],
             higher_modes=mbh.higher_modes,
@@ -2285,6 +2294,7 @@ def get_sobbh_lookup_comp(general_info, cfg):
             eval_dt=float(cfg["sobbh_lookup_eval_dt"]),
             num_m_layers=int(cfg["sobbh_lookup_num_m_layers"]),
             interp=cfg["sobbh_lookup_interp"], row_batch=int(cfg["sobbh_lookup_row_batch"]),
+            kernel=str(cfg.get("sobbh_lookup_kernel", "auto")),
             force_backend=force_backend, d_d=0.0,
         )
     _WAVE_WRAP_CACHE[key] = comp

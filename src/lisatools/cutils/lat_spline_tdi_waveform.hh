@@ -121,6 +121,62 @@ class TDDenseTDIWaveform : public LISATDIonTheFly{
     double get_phase(double t, double *params, int spline_i){return 0.0;};
 };
 
+// ---------------------------------------------------------------------------
+// wdm_lookup_sum: the fused EMRI direct-to-WDM lookup. From a SPARSE dense-TDI
+// response (per harmonic and channel: amplitude and residual-phase cubic splines,
+// GBT CubicSplineInterpolant flats; optionally the template's exact DOPR853
+// carrier) straight to WDM pixel coefficients, nothing per pixel in global memory:
+// one thread per (harmonic s, pixel n) evaluates amp, phase = carrier + residual,
+// f = phase' / 2 pi, fdot = phase'' / 2 pi (analytic), mirrors f < 0, drops
+// |fdot| > fdot_max or f <= f_min, then sums the 2 num_m_layers + 1 layers of the
+// n_ref lookup (WDMLookupTable.get_wdm_coeffs, quarter_turn) into
+// out[sub_row[s], ch, m - m_lo, n] for m in the output band [m_lo, m_hi).
+// Pixels n_lo <= n < min(n_hi, n_stop[s]). Python reference:
+// wdm_direct.tracer_from_tof_output (analytic) + accumulate_harmonic_batch.
+// ---------------------------------------------------------------------------
+#include "wdm_lookup_kernels.hh"
+
+struct WDMLookupSumArgs {
+    double *out;                      // (n_rows, nch, m_hi - m_lo, Nt), accumulated (zero it first)
+    unsigned long long *counts;       // (2,): lookup entries, dropped entries (nullptr: not counted)
+    int carrier;                      // 0: no carrier (phase = residual spline alone)
+    int K;                            // knot stride per template
+    const double *t_knots;            // (n_temp, K) absolute times
+    const int *n_knots;               // (n_temp,)
+    const double *phase_coeffs;       // (n_temp, K - 1, 3, 8)
+    int num_sub;
+    const int *sub_temp;              // (num_sub,) carrier template of each harmonic
+    const int *sub_row;               // (num_sub,) output row of each harmonic
+    const int *sub_mkn;               // (num_sub, 3)
+    const int *n_stop;                // (num_sub,) first pixel NOT looked up (lookup -> plunge handoff)
+    int N;                            // response spline length
+    int nch;
+    const double *x;                  // (num_sub * nch, N) spline knots (row s * nch is read)
+    const double *amp_y;              // (num_sub * nch, N) each
+    const double *amp_c1;
+    const double *amp_c2;
+    const double *amp_c3;
+    const double *res_y;
+    const double *res_c1;
+    const double *res_c2;
+    const double *res_c3;
+    int n_lo;                         // pixel range [n_lo, n_hi)
+    int n_hi;
+    double t0;                        // absolute time of pixel 0
+    double layer_dt;
+    double layer_df;
+    int Nf;
+    int Nt;
+    int m_lo;                         // output band [m_lo, m_hi)
+    int m_hi;
+    int num_m_layers;
+    double fdot_max;
+    double f_min;
+    WDMLookupTableView tab;
+};
+
+void wdm_lookup_sum_wrap(WDMLookupSumArgs args);
+
 // Host launcher for TDDenseTDIWaveform. tdi_channels_arr/tdi_amp/tdi_phase are
 // (num_sub, nchannels, N), phi_ref (num_sub, N), params (n_temp, n_params) with
 // (inc, psi, lam, beta), t_arr (n_temp, N), sub_offsets (n_temp + 1): the subs

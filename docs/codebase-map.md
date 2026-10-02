@@ -40,6 +40,7 @@ package.
 | `chunked_het.py` | `WDMComputationsBase` — source-agnostic chunked-heterodyne WDM likelihood base (GB/SOBBH subclass it downstream). |
 | `wdm_lookup_eval.py` | `WDMLookupEvaluator` — vectorized (numpy/cupy) evaluation of an `n_ref` WDM lookup table with the quarter-turn rule (linear / Keys cubic). |
 | `sources/sobbh/wdm_direct.py` | SOBBH direct-to-WDM: batched 3.5PN, batched TDI-on-the-fly, tracer, sparse lookup template, sparse inner products / fill, and `SOBBHLookupComputations` (the `SOBBH_LIKELIHOOD=lookup` comp for `SOBBHChunkedLikeMove`). |
+| `cutils/sobbh_lookup_kernel.{hpp,cu}` | The fused SOBBH direct-to-WDM lookup (`sobbh_lookup`, bound in `binding_detector.cxx`, `backend.sobbh_lookup`): response splines -> per-row `<d|h>`, `<h|h>` (mode 0) or the fill (mode 1) in one launch, on the shared `wdm_lookup_kernels.hh` helpers (B-spline table, quarter turn, spline derivatives). Python driver `SOBBHDirectWDM.kernel_inner_products` / `kernel_fill`; `SOBBH_LOOKUP_KERNEL` (auto / kernel / python). Tests `tests/test_sobbh_lookup_kernel.py`. |
 | `wdm_het.py` / `signal_het.py` | WDM chunk geometry / window / layer-grouping helpers; sparse-time signal-heterodyne helpers. |
 | `response/` | LISA-response Python frontends (absorbed from `fastlisaresponse`): `parallelbase`, `tdiconfig`, `directresponse` (`pyResponseTDI`, `ResponseWrapper`), `tdionfly` (`TDIonTheFly` family + GB/SOBBH/FD variants). |
 | `jax/` | Pure-JAX backend (`backend.py`, `jaxbase.py`, `orbits.py`) + `response/` and `wdm/` JAX mirrors. |
@@ -192,7 +193,7 @@ both (`#ifdef __CUDACC__`).
 - `LISAResponse.{cu,hh}` + `binding_flr.{cxx,hpp}` — arm projection / TDI (`response_part()`, `LISAResponseWrap`, `TDIConfigWrap`).
 - `domains.{cu,hpp}` — STFT/FD/WDM domain descriptors + STFT machinery; TDI flavor ints `TDI_XYZ/AET/AE`.
 - `lat_tdi_on_the_fly.{cu,hh}` — `LISATDIonTheFly` base + `OrbitsSplineCache`.
-- `lat_spline_tdi_waveform.{cu,hh}` + `binding_lat_spline_tdi.hpp` — `FD/TDSplineTDIWaveform`.
+- `lat_spline_tdi_waveform.{cu,hh}` + `binding_lat_spline_tdi.hpp` — `FD/TDSplineTDIWaveform`, `TDDenseTDIWaveform` (EMRI dense-phase response), and `wdm_lookup_sum` (the fused sparse-response -> WDM n_ref lookup sum, EMRI direct-to-WDM); `wdm_lookup_kernels.hh` — its header-only device helpers (mirror-mode cubic B-spline table eval, spline value/derivatives, DOPR853 phase derivatives, quarter-turn rule) for other sources' kernels.
 - `lat_chunked_het_kernels.hh`, `lat_wdm_fft.hh` — templated chunked-het kernels + WDM FFT helpers (shared with GB/SOBBH downstream).
 - `galactic_response.{cu,hpp}` — galactic-grid transfer functions.
 - Public headers for downstream: `orbits_view.hpp` (`OrbitsView` POD), `lisatools_header_abi.hpp` (ABI version + `LISATOOLS_IS_WRAPPER_OWNER`), `Detector.hpp`, `PSD.hpp`, `LISAResponse.hh`, `binding_flr.hpp`.

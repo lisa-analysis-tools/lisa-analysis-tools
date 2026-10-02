@@ -153,6 +153,68 @@ class EvaluatorTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             WDMLookupEvaluator(self.table, interp="quintic")
 
+    # ---- "spline": the table's uniform cubic B-spline (WDMLookupTable INTERP_METHOD "spline",
+    # the EMRI direct path and the fused C++/CUDA lookup kernels' semantics)
+
+    def test_matches_get_wdm_coeffs_spline(self):
+        self.table.set_interp_method("spline")
+        try:
+            ev = self._evaluator("spline")
+            f0, fdot, n, f, phi = self._chirp(20.37, 0.23, 0.4)  # off the f AND fdot nodes
+            amp = np.linspace(0.5, 1.5, n.size)
+            ref, m_map = self.table.get_wdm_coeffs(
+                amp, phi, f, np.full_like(f, fdot), n, num_m_layers=2, out_of_support="zero"
+            )
+        finally:
+            self.table.set_interp_method("linear")
+        ref, m_map = np.asarray(ref), np.asarray(m_map)
+        m = ev.layers_for(f, 2)
+        w, ok = ev.coeffs(amp[:, None], phi[:, None], f[:, None], fdot, n[:, None], m)
+        w = np.asarray(w)
+        keep = m_map >= 0
+        np.testing.assert_array_equal(np.asarray(m)[keep], m_map[keep])
+        np.testing.assert_allclose(w[keep], ref[keep], rtol=1e-9, atol=1e-12 * np.abs(ref).max())
+        self.assertTrue(np.all(w[~keep] == 0.0))
+
+    def test_spline_matches_scipy_map_coordinates_including_the_edges(self):
+        # the kernel helpers are verified against the same scipy call (mirror boundary,
+        # prefilter=False on the prefiltered coefficients), so pin the Python twin to it
+        from scipy import ndimage
+
+        ev = self._evaluator("spline")
+        coeffs = np.asarray(ev.tab_cos)
+        rng = np.random.default_rng(3)
+        u = np.concatenate(
+            [rng.uniform(0, ev.nf - 1, 500), [0.0, 1e-12, 0.5, ev.nf - 1.5, ev.nf - 1.0]]
+        )
+        v = np.concatenate(
+            [rng.uniform(0, ev.nfdot - 1, 500), [ev.nfdot - 1.0, 0.0, 0.3, 0.0, ev.nfdot - 1.0]]
+        )
+        got = np.asarray(ev._interp(ev.tab_cos, u, v))
+        ref = ndimage.map_coordinates(
+            coeffs, np.stack([v, u]), order=3, mode="mirror", prefilter=False
+        )
+        np.testing.assert_allclose(got, ref, rtol=1e-12, atol=1e-14 * np.abs(ref).max())
+
+    def test_spline_interpolates_the_nodes(self):
+        ev = self._evaluator("spline")
+        raw = self._evaluator("linear")
+        j = np.array([0, 3, ev.nfdot // 2, ev.nfdot - 1])
+        i = np.array([0, 7, ev.nf // 2, ev.nf - 1])
+        jj, ii = np.meshgrid(j, i, indexing="ij")
+        got = np.asarray(ev._interp(ev.tab_cos, ii.astype(float), jj.astype(float)))
+        node = np.asarray(raw.tab_cos)[jj, ii]
+        np.testing.assert_allclose(got, node, rtol=1e-10, atol=1e-12 * np.abs(node).max())
+
+    def test_spline_matches_chirp_truth_and_control_fails(self):
+        ev = self._evaluator("spline")
+        for case in self.CASES:
+            e = self._rel_err(ev, *case)
+            self.assertLess(e, 1e-3, f"spline {case}: rel L2 {e:.3e}")
+        ev.basis_cycle = "no_parity_turn"
+        errs = [self._rel_err(ev, *case) for case in self.CASES]
+        self.assertGreater(max(errs), 1e-1, f"control errs {errs}")
+
 
 class TablePortabilityTest(unittest.TestCase):
     """The n_ref table depends on the layer duration only (measured 2026-09-30: 4e-9)."""

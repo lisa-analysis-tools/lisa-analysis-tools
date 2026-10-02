@@ -104,6 +104,13 @@ def main():
     ap.add_argument("--row-batch", type=int, default=32)
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--eval-dt", type=float, default=43200.0)
+    ap.add_argument("--interp", default="spline", choices=("spline", "cubic", "linear"))
+    ap.add_argument(
+        "--kernel",
+        default="auto",
+        choices=("auto", "kernel", "python"),
+        help="fused C++/CUDA lookup (auto: when the backend module has it)",
+    )
     ap.add_argument("--table", default=os.environ.get("SOBBH_LOOKUP_TABLE_PATH", TABLE_DEFAULT))
     ap.add_argument("--out", default="sobbh_lookup_speed_gpu.jsonl")
     ap.add_argument("--no-chunked", action="store_true")
@@ -150,7 +157,8 @@ def main():
         buffer_time=5000.0,
         eval_dt=args.eval_dt,
         num_m_layers=2,
-        interp="cubic",
+        interp=args.interp,
+        kernel=args.kernel,
         row_batch=args.row_batch,
         force_backend=backend,
         d_d=0.0,
@@ -160,7 +168,8 @@ def main():
     nch, nfa, nta = 3, int(wdm.Nf_active), int(wdm.Nt_active)
     print(
         f"backend {backend}  grid Nf={nf} Nt={nt} dt={dt} layer_dt={float(wdm.layer_dt):g} s  "
-        f"active {nfa} x {nta}  table {os.path.basename(args.table)}  comp build {t_build:.1f} s"
+        f"active {nfa} x {nta}  table {os.path.basename(args.table)}  comp build {t_build:.1f} s  "
+        f"lookup={'fused kernel' if comp.uses_kernel else 'python'} interp={args.interp}"
     )
 
     # one residual slab: the lookup fill of two sources (no dense transform on any backend)
@@ -203,7 +212,7 @@ def main():
     tag = time.strftime("%Y-%m-%dT%H:%M:%S")
     rows_list = [int(r) for r in args.rows.split(",") if r.strip()]
     header = (
-        f"{'rows':>5} {'look_first':>11} {'look_warm':>10} {'resp':>8} {'trac':>8} {'look':>8} {'inner':>8} "
+        f"{'rows':>5} {'look_first':>11} {'look_warm':>10} {'resp':>8} {'pn':>8} {'trac':>8} {'look':>8} {'inner':>8} "
         f"{'look_fill':>10} {'ch_first':>9} {'ch_warm':>9} {'ch_fill':>9} {'ch/look':>8} "
         f"{'max|dll|':>10} {'lk_pool':>8} {'ch_pool':>8}"
     )
@@ -227,6 +236,8 @@ def main():
                 fill_band=args.fill_band,
                 num_m_layers=2,
                 nt_sub=args.nt_sub,
+                interp=args.interp,
+                lookup="kernel" if comp.uses_kernel else "python",
                 tag=tag,
             )
             pool_reset(xp)
@@ -253,6 +264,7 @@ def main():
                 look_fill=look_fill,
                 look_template=float(spans.get("template", float("nan"))),
                 look_response=float(spans.get("response", float("nan"))),
+                look_pn=float(spans.get("pn", float("nan"))),
                 look_tracer=float(spans.get("tracer", float("nan"))),
                 look_lookup=float(spans.get("lookup", float("nan"))),
                 look_inner=float(spans.get("inner", float("nan"))),
@@ -302,7 +314,7 @@ def main():
             rec.update(ch_pool_used_gb=ch_used, ch_pool_total_gb=ch_total)
             ratio = ch_warm / look_warm if look_warm > 0 else float("nan")
             print(
-                f"{n:5d} {look_first:11.3f} {look_warm:10.3f} {rec['look_response']:8.3f} "
+                f"{n:5d} {look_first:11.3f} {look_warm:10.3f} {rec['look_response']:8.3f} {rec['look_pn']:8.3f} "
                 f"{rec['look_tracer']:8.3f} {rec['look_lookup']:8.3f} {rec['look_inner']:8.3f} {look_fill:10.3f} {ch_first:9.3f} {ch_warm:9.3f} "
                 f"{ch_fill:9.3f} {ratio:8.2f} {dll:10.3e} {lk_total:8.2f} {ch_total:8.2f}"
             )

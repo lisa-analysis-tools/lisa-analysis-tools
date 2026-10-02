@@ -388,6 +388,38 @@ class EMRIDirectAdapterTest(_AdapterBase, unittest.TestCase):
             self._gen()
 
 
+class _FakeBandDirect(_FakeBatchDirect):
+    """The same contract with ``f_band``: batch returns layers [m_lo, m_hi) only."""
+
+    f_band = None
+
+    def batch(self, rows, **kw):
+        arr = super().batch(rows, **kw)
+        return arr if self.f_band is None else arr[:, :, self.f_band[0]:self.f_band[1]]
+
+
+class AdapterBandTest(_AdapterBase, unittest.TestCase):
+    """The adapter asks the direct generator for the run's active frequency band only (the
+    template keeps ~1/8 of the 6-month grid) and crops time; same array as the full grid."""
+
+    def test_band_is_requested_and_the_crop_is_unchanged(self):
+        want, _ = self._gen().templates(np.array([[0.0] * 14, [2.0] * 14]))      # full-grid fake
+        self.direct = _FakeBandDirect(self.full)
+        gen = self._gen()
+        sl = self.dom.active_slice_f
+        self.assertEqual(self.direct.f_band, (sl.start, sl.stop))
+        got, ok = gen.templates(np.array([[0.0] * 14, [2.0] * 14]))
+        np.testing.assert_array_equal(got, want)
+        self.assertTrue(np.all(ok))
+
+    def test_a_generator_ignoring_the_band_is_caught(self):
+        self.direct = _FakeBandDirect(self.full)
+        gen = self._gen()
+        self.direct.batch = lambda rows, **kw: _FakeBatchDirect.batch(self.direct, rows, **kw)   # full grid
+        with self.assertRaisesRegex(ValueError, "band"):
+            gen.templates(np.zeros((1, 14)))
+
+
 class _FakeCache:
     """``TrajectoryCache`` stand-in: runs the capture fn per row, records clears."""
 
