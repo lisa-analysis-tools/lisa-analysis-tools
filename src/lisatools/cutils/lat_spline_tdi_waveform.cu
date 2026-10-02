@@ -526,31 +526,11 @@ void TDDenseTDIWaveform::channels_point(int b, int i, double t, double *params_b
     {
         Vec x1 = orbits->get_pos(t, 1);
         double t_sc = t - k.dot(x1) * C_inv;
-        double P3[3];
+        double P3[3] = {0.0, 0.0, 0.0};
         int seg = segment(b, t_sc, false);
-        if (seg >= 0)
-        {
-            phases(b, seg, t_sc, P3);
-        }
-        else
-        {
-            // outside the trajectory: continue each phase LINEARLY from the nearest end (a
-            // degree-7 dense polynomial must not be extrapolated; the reference phase only
-            // needs to stay smooth where the channel is zero). Nested form at s = 0:
-            // f = r1, f' = r2 + r3; at s = 1: f = r1 + r2, f' = r2 - r3 - r4 (per unit s).
-            int nk = n_knots[b];
-            double *tk = &t_knots[(size_t)b * K];
-            bool after = (t_sc > tk[nk - 1]);
-            int sg = after ? nk - 2 : 0;
-            double h = tk[sg + 1] - tk[sg];
-            for (int p = 0; p < 3; p += 1)
-            {
-                double *c = &phase_coeffs[(((size_t)b * (K - 1) + sg) * 3 + p) * 8];
-                double val = after ? (c[0] + c[1]) : c[0];
-                double slope = (after ? (c[1] - c[2] - c[3]) : (c[1] + c[2])) / h;
-                P3[p] = val + slope * (t_sc - (after ? tk[nk - 1] : tk[0]));
-            }
-        }
+        // outside the trajectory the phase is not evaluated: the reference phase is zero there
+        // (as is the signal: every delayed time beyond the trajectory contributes nothing)
+        if (seg >= 0) phases(b, seg, t_sc, P3);
         for (int s = sub_lo; s < sub_hi; s += 1)
         {
             phi_ref[(size_t)s * N + i] = sub_mkn[3 * s] * P3[0] + sub_mkn[3 * s + 1] * P3[1] + sub_mkn[3 * s + 2] * P3[2];
