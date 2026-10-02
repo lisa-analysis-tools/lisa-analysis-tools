@@ -247,6 +247,22 @@ def galfor_curve_ratio(v_new, v_old, f_hz) -> np.ndarray:
                       / HT.specific_Sh_function(f, *_to_physical(v_old)))
 
 
+def galfor_curves(v_rows, f_hz) -> np.ndarray:
+    """``(n_rows, n_f)`` of ``S_gal(f; v)`` for a stack of sampled-basis vectors.
+
+    The readout's per-WALKER form. The curve of the walkers' MEAN parameters
+    is not the mean of their curves once ``alpha``/``f1`` split across
+    walkers (6mo job 695, row 81: alpha 2.3/3.0/8.6/9.8 -- the curve of the
+    mean read +2..5 % at 3.5-5 mHz where the mean of the curves read -6..7 %),
+    so the log compares mean-of-curves to mean-of-curves.
+    """
+    from lisatools.stochastic import HyperbolicTangentGalacticForeground as HT
+
+    f = np.asarray(f_hz, dtype=float)
+    rows = np.atleast_2d(np.asarray(v_rows, dtype=float))
+    return np.asarray([HT.specific_Sh_function(f, *_to_physical(v)) for v in rows])
+
+
 def is_noise_ratchet_gate(obj) -> bool:
     return bool(getattr(obj, "is_noise_ratchet_gate", False))
 

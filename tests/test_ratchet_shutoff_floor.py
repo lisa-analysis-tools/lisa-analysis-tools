@@ -148,5 +148,77 @@ class StepSetsTheFloorTest(unittest.TestCase):
             self.assertEqual(removal.rj_shutoff_min_freq, 0.0)
 
 
+class FloorAppliedToTheLiveValveTest(unittest.TestCase):
+    """Setting the floor reopens the pairs below it on the LIVE state at once.
+
+    6mo job 695: relaunched with the floor onto a valve 82.9 % shut, the first
+    nudge's hard refit (epoch 37) skipped every band shut on all walkers and
+    found 5,701 peaks; the judgment forty minutes later reopened 1,010 pairs;
+    the next refit found 14,119. The step now applies the floor to the state
+    when it sets it, ahead of that refit.
+    """
+
+    @staticmethod
+    def _state(with_edges=True):
+        shut = np.array([[1, 0, 1, 1, 0, 1], [1, 1, 0, 1, 1, 0]], dtype=bool)
+        streak = np.array([[3, 0, 2, 3, 0, 1], [3, 3, 0, 2, 1, 0]])
+        bi = {"band_rj_shutoff_w": shut, "band_shutoff_streak_w": streak}
+        if with_edges:
+            # centres 5.5 6.5 | 7.5 8.5 9.5 10.5 mHz: bands 0-1 lie below 7 mHz
+            bi["band_edges"] = np.array([5, 6, 7, 8, 9, 10, 11]) * 1e-3
+        smp = SimpleNamespace(log_like=np.array([[1.0, 2.0], [0.0, 0.0]]),
+                              branches_coords={"galfor": np.zeros((2, 2, 1, 5))},
+                              sub_states={"gb": SimpleNamespace(band_info=bi)})
+        return smp, shut, streak
+
+    def test_entry_reopens_the_pairs_below_the_floor_only(self):
+        tree, grid, removal, _ = StepSetsTheFloorTest._tree(None)
+        st = StepSetsTheFloorTest._step(None, tree)
+        smp, shut, streak = self._state()
+        with env(GALFOR_RATCHET_SHUTOFF_MIN_FREQ=None, GALFOR_RATCHET_HOLD_STAGE=None):
+            with self.assertLogs("lisatools.globalfit.recipe", level="INFO") as cm:
+                st.setup_run(47, smp, StepSetsTheFloorTest._sampler(47, tree))
+                st.note_recipe_step(3)
+        self.assertEqual(grid.rj_shutoff_min_freq, 7e-3)
+        self.assertFalse(shut[:, :2].any())                       # (0,0) (1,0) (1,1) reopened
+        self.assertTrue((streak[:, :2] == 0).all())
+        np.testing.assert_array_equal(shut[:, 2:], [[1, 1, 0, 1], [0, 1, 1, 0]])   # above: untouched
+        np.testing.assert_array_equal(streak[:, 2:], [[2, 3, 0, 1], [0, 2, 1, 0]])
+        self.assertTrue(any("applied to the LIVE valve: 3 shut (walker, band) pair(s) in the "
+                            "2 band(s) below 7 mHz" in l for l in cm.output), cm.output)
+
+    def test_the_moves_band_edges_serve_when_band_info_has_none(self):
+        tree, grid, removal, _ = StepSetsTheFloorTest._tree(None)
+        grid.band_edges = np.array([5, 6, 7, 8, 9, 10, 11]) * 1e-3
+        st = StepSetsTheFloorTest._step(None, tree)
+        smp, shut, streak = self._state(with_edges=False)
+        with env(GALFOR_RATCHET_SHUTOFF_MIN_FREQ=None, GALFOR_RATCHET_HOLD_STAGE=None):
+            st.setup_run(47, smp, StepSetsTheFloorTest._sampler(47, tree))
+            st.note_recipe_step(3)
+        self.assertFalse(shut[:, :2].any())
+        np.testing.assert_array_equal(shut[:, 2:], [[1, 1, 0, 1], [0, 1, 1, 0]])
+
+    def test_no_floor_leaves_the_valve_alone(self):
+        tree, grid, removal, _ = StepSetsTheFloorTest._tree(None)
+        st = StepSetsTheFloorTest._step(None, tree)
+        smp, shut, streak = self._state()
+        before = shut.copy(), streak.copy()
+        with env(GALFOR_RATCHET_SHUTOFF_MIN_FREQ="0", GALFOR_RATCHET_HOLD_STAGE=None):
+            st.setup_run(47, smp, StepSetsTheFloorTest._sampler(47, tree))
+            st.note_recipe_step(3)
+        np.testing.assert_array_equal(shut, before[0])
+        np.testing.assert_array_equal(streak, before[1])
+
+    def test_helper_refuses_a_mismatched_grid(self):
+        from lisatools.globalfit.recipe import apply_shutoff_floor_to_state
+
+        smp, shut, streak = self._state()
+        with self.assertLogs("lisatools.globalfit.recipe", level="WARNING"):
+            self.assertEqual(apply_shutoff_floor_to_state(smp, 7e-3, np.arange(4) * 1e-3), (0, 0))
+        self.assertTrue(shut[0, 0])                                # nothing moved
+        self.assertEqual(apply_shutoff_floor_to_state(None, 7e-3), (0, 0))
+        self.assertEqual(apply_shutoff_floor_to_state(smp, 0.0), (0, 0))
+
+
 if __name__ == "__main__":
     unittest.main()
