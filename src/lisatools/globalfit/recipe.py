@@ -1824,6 +1824,9 @@ class SearchStageProfileStep(RJRecipeStep):
         gate = self._ratchet_gate(moves) if moves is not None else None
         if gate is not None and hasattr(gate, "finish_ratchet"):
             gate.finish_ratchet()
+        # the refit cadence comes back NOW, not at the next drive: if the
+        # stage ends in this same iteration there is no next drive
+        self._ratchet_refit_only_on_nudge(moves)
         # PERSIST the decision: a relaunch re-enters this stage with a fresh
         # process and would otherwise resume the schedule (clock reset or
         # not) and nudge again. The stamp is read back by _ratchet_enter.
@@ -1847,6 +1850,45 @@ class SearchStageProfileStep(RJRecipeStep):
                 return m
         return None
 
+    def _ratchet_refit_only_on_nudge(self, moves, k=None, force_off=False) -> None:
+        """Hand the F-stat refit clock to the ratchet while it is active.
+
+        User ruling 2026-10-02: "let's run it only on the nudge step." Job
+        675 refit the grid once per cycle (~2 h each); only the first was the
+        nudge's forced refit, the rest the stage cadence. While the ratchet
+        is active every grid move's cadence is suspended
+        (``fstat_refit_only_forced``), so an epoch opens only when a nudge
+        HARD-arms one; once the ratchet has finished the cadence is restored
+        for the ordinary per-band search phase. ``GALFOR_RATCHET_REFIT_ONLY_ON_NUDGE=0``
+        keeps the cadence throughout. Idempotent; logs on change.
+        """
+        if getattr(self, "ratchet", None) is None or moves is None:
+            return
+        knob = os.environ.get("GALFOR_RATCHET_REFIT_ONLY_ON_NUDGE", "1").strip()
+        # ACTIVE = a nudge can still come: not stopped, not past the schedule's
+        # last cycle, and the stage not ending. ⚠ The grid move object is
+        # SHARED with the stages after this one (ctx.stock_moves), so the
+        # flag must be False whenever the ratchet can no longer force a
+        # refit, or full_pe would inherit a grid that never refits.
+        want = (knob not in ("0", "false", "False", "no", "off")
+                and not force_off
+                and not getattr(self, "_ratchet_stopped", False)
+                and (k is None or int(k) < self.ratchet.total_iterations))
+        changed = []
+        for m in iter_move_tree(moves):
+            if not callable(getattr(m, "arm_fstat_refit", None)):
+                continue
+            if bool(getattr(m, "fstat_refit_only_forced", False)) != want:
+                m.fstat_refit_only_forced = want
+                changed.append(getattr(m, "name", "?"))
+        if changed:
+            logger.info(
+                "[GALFOR_RATCHET %s] F-stat refit cadence %s on %s: %s.",
+                self.stage_name or "gb_search",
+                "SUSPENDED" if want else "RESTORED", changed,
+                "the grid refits only when a nudge forces it" if want
+                else "the ordinary GB_FSTAT_REFIT_EVERY cadence is back")
+
     def _drive_ratchet(self, k, moves, sample=None) -> None:
         """Set the gate's mode for stage-local cycle ``k``.
 
@@ -1862,6 +1904,9 @@ class SearchStageProfileStep(RJRecipeStep):
         if getattr(self, "ratchet", None) is None:
             return
         k = int(k)
+        # the refit clock belongs to the ratchet while nudges can still come
+        # (also on a mid-cycle resume, k < 0, before this cycle's legs run)
+        self._ratchet_refit_only_on_nudge(moves, k=k)
         if k < 0:
             return
         gate = self._ratchet_gate(moves)
@@ -2122,6 +2167,10 @@ class SearchStageProfileStep(RJRecipeStep):
             self._ratchet_k = _k_next
             self._ratchet_capture_reference(_k_next, sample)
             self._drive_ratchet(_k_next, moves, sample=sample)
+        if stop:
+            # the stage is ending: the shared grid move leaves with its
+            # ordinary cadence, whatever the ratchet did with it
+            self._ratchet_refit_only_on_nudge(moves, force_off=True)
         return stop
 
     def _stopping_rules(self, i, sample, sampler) -> bool:
