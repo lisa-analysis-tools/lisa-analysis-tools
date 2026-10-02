@@ -103,7 +103,7 @@ def main():
     ap.add_argument("--rows", default="4,8,32,96")
     ap.add_argument("--row-batch", type=int, default=32)
     ap.add_argument("--repeats", type=int, default=3)
-    ap.add_argument("--eval-dt", type=float, default=600.0)
+    ap.add_argument("--eval-dt", type=float, default=43200.0)
     ap.add_argument("--table", default=os.environ.get("SOBBH_LOOKUP_TABLE_PATH", TABLE_DEFAULT))
     ap.add_argument("--out", default="sobbh_lookup_speed_gpu.jsonl")
     ap.add_argument("--no-chunked", action="store_true")

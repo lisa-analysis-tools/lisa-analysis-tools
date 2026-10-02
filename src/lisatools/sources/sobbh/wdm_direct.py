@@ -123,25 +123,38 @@ def sobbh_amp_phase_batch(params, times, reference_time, t_shift=0.0):
 class SOBBHBatchedTOF:
     """ONE TDI-on-the-fly response for a batch of SOBBH rows on a coarse evaluation grid.
 
-    Mirrors :class:`bbhx.sobbhtdionfly.SOBBHTDIonFly` (node grid ``linspace(t_lo - buffer_time,
-    t_hi + buffer_time, n_grid)``, feed ``phase = gw_phase + pi`` with the intrinsic amplitude,
+    Mirrors :class:`bbhx.sobbhtdionfly.SOBBHTDIonFly` (node grid ``linspace(lo - buffer_time,
+    hi + buffer_time, n_grid)``, feed ``phase = gw_phase + pi`` with the intrinsic amplitude,
     the real ``inc`` / ``psi``, ``(lam, beta)`` consumed in the orbits frame) but for ``N`` rows
-    at once (``num_sub = N``) and evaluated every ``eval_dt`` seconds instead of on the dense
-    data grid: the lookup only needs the per-channel amplitude / phase splines at the WDM pixel
-    centres. For a row merging inside the window the shared node grid continues past ``tc``
-    with zero amplitude (``SOBBHTDIonFly`` truncates its node grid at ``tc`` instead, and so
-    zeros the last ``buffer_time`` before merger).
+    at once (``num_sub = N``) and evaluated on a SPARSE grid -- at most every ``eval_dt``
+    seconds, ending exactly at the window -- instead of on the dense data grid: the lookup only
+    needs the per-channel amplitude / phase splines at the WDM pixel centres, and the whole
+    channel phase of an in-band SOBBH (the slow PN carrier plus the orbital Doppler term) has a
+    fourth derivative small enough that a cubic spline on 12-h nodes is ~3e-7 rad at worst
+    (the 6-month gate reproduced every digit of the 600-s result up to 1-day nodes). For a row
+    merging inside the window the shared node grid continues past ``tc`` with zero amplitude
+    (``SOBBHTDIonFly`` truncates its node grid at ``tc`` instead, and so zeros the last
+    ``buffer_time`` before merger).
+
+    The evaluation grid is kept ``DELAY_MARGIN`` inside the orbit tables' coverage
+    (``orbits.t_base``): the C++ response zeroes any time it cannot serve, and a half-day
+    spline across that zero edge rings back into the window.
 
     Args:
         orbits: :class:`~lisatools.detector.Orbits` (frame = the frame of ``lam``/``beta``).
         tdi_config: :class:`~lisatools.response.tdiconfig.TDIConfig`.
         reference_time: epoch [s] where ``f_low`` / ``phi_c`` are defined.
-        n_grid, buffer_time: node grid size / padding [s] (production: 2048 / 5000).
-        eval_dt: response evaluation step [s] (default 600; measured mismatch against
-            ``SOBBHTDIonFly`` on the module test grid is ~1e-16, i.e. machine precision, at
-            600 -- finer 300/150 grids were not needed).
+        n_grid, buffer_time: node grid size / padding [s] (production: 2048 / 5000);
+            ``buffer_time`` must cover the TDI delays (``>= DELAY_MARGIN``).
+        eval_dt: response evaluation step [s] (default 43200 = 12 h; 600 reproduces
+            ``SOBBHTDIonFly`` to ~1e-16 on the module test grid and 1800 .. 86400 reproduce the
+            600-s gate to every printed digit at 6 months).
         force_backend: backend name (``"cpu"``, ``"cuda12x"``, ...).
     """
+
+    #: TDI delay margin [s]: the response at ``t`` reads the source and the orbits up to this
+    #: much away from ``t`` (the SSB projection ``|k . x| / c`` is < 500 s, the arms ~8 s each)
+    DELAY_MARGIN = 600.0
 
     def __init__(
         self,
@@ -151,7 +164,7 @@ class SOBBHBatchedTOF:
         *,
         n_grid=2048,
         buffer_time=5000.0,
-        eval_dt=600.0,
+        eval_dt=43200.0,
         force_backend="cpu",
     ):
         self.orbits = orbits
@@ -162,15 +175,47 @@ class SOBBHBatchedTOF:
         self.eval_dt = float(eval_dt)
         if self.n_grid < 16 or self.eval_dt <= 0.0:
             raise ValueError("n_grid must be >= 16 and eval_dt > 0")
-        if self.eval_dt >= 0.5 * self.buffer_time:
+        if self.buffer_time < self.DELAY_MARGIN:
             raise ValueError(
-                f"eval_dt ({self.eval_dt}) must be < 0.5 * buffer_time ({self.buffer_time}): "
-                "an eval_dt close to buffer_time leaves no headroom inside the padded node "
-                "grid, and the response spline silently clamps/extrapolates out of range."
+                f"buffer_time ({self.buffer_time}) must be >= DELAY_MARGIN "
+                f"({self.DELAY_MARGIN}): the kernel reads the source spline up to the TDI "
+                "delays away from each evaluation time, and the padded node grid must cover "
+                "that."
             )
         self.force_backend = (
             force_backend if isinstance(force_backend, str) else force_backend.name.split("_")[-1]
         )
+        self._orbit_span_cache = None
+
+    def orbit_span(self):
+        """Absolute times ``(t_lo, t_hi)`` the orbit tables cover (``orbits.t_base``), or
+        ``(-inf, inf)`` for orbits without a base grid."""
+        if self._orbit_span_cache is None:
+            t_base = getattr(self.orbits, "t_base", None)
+            if t_base is None:
+                self._orbit_span_cache = (-np.inf, np.inf)
+            else:
+                t_base = np.asarray(t_base, dtype=float)
+                self._orbit_span_cache = (float(t_base[0]), float(t_base[-1]))
+        return self._orbit_span_cache
+
+    def eval_grid(self, t_lo, t_hi):
+        """The response evaluation times over ``[t_lo, t_hi]`` [absolute s]: uniform, at most
+        ``eval_dt`` apart, at least 4 points, ending exactly at the window ends after clipping
+        them ``DELAY_MARGIN`` inside the orbit span."""
+        t_lo, t_hi = float(t_lo), float(t_hi)
+        if t_hi <= t_lo:
+            raise ValueError(f"t_hi ({t_hi}) must be > t_lo ({t_lo})")
+        o_lo, o_hi = self.orbit_span()
+        lo = max(t_lo, o_lo + self.DELAY_MARGIN)
+        hi = min(t_hi, o_hi - self.DELAY_MARGIN)
+        if hi <= lo:
+            raise ValueError(
+                f"window [{t_lo}, {t_hi}] lies outside the orbit tables' coverage "
+                f"[{o_lo}, {o_hi}] (minus the {self.DELAY_MARGIN} s delay margin)"
+            )
+        n_eval = max(4, int(np.ceil((hi - lo) / self.eval_dt)) + 1)
+        return np.linspace(lo, hi, n_eval)
 
     @property
     def backend(self):
@@ -192,23 +237,21 @@ class SOBBHBatchedTOF:
         """
         from ...response.tdionfly import TDTDIonTheFly
 
-        t_lo, t_hi = float(t_lo), float(t_hi)
-        if t_hi <= t_lo:
-            raise ValueError(f"t_hi ({t_hi}) must be > t_lo ({t_lo})")
+        eval_t = self.eval_grid(t_lo, t_hi)
         p = np.atleast_2d(np.asarray(asnumpy(params), dtype=float))
         if p.shape[1] < 11:
             raise ValueError(f"params must be (N, 11) chunked-basis rows, got {p.shape}")
         N = p.shape[0]
-        node_t = np.linspace(t_lo - self.buffer_time, t_hi + self.buffer_time, self.n_grid)
+        n_eval = eval_t.size
+        lo, hi = float(eval_t[0]), float(eval_t[-1])
+        node_t = np.linspace(lo - self.buffer_time, hi + self.buffer_time, self.n_grid)
         amp, gw_phase, tc = sobbh_amp_phase_batch(p, node_t, self.reference_time)
-        n_eval = int(np.ceil((t_hi - t_lo) / self.eval_dt)) + 1
-        eval_t = t_lo + np.arange(n_eval) * self.eval_dt
         xp = self.xp
         gen = TDTDIonTheFly(
             xp.asarray(np.ascontiguousarray(np.broadcast_to(eval_t, (N, n_eval)))),
             xp.asarray(amp),
             xp.asarray(gw_phase + np.pi),
-            sampling_frequency=1.0 / self.eval_dt,
+            sampling_frequency=1.0 / float(eval_t[1] - eval_t[0]),
             num_sub=N,
             t_input=xp.asarray(np.ascontiguousarray(np.broadcast_to(node_t, (N, node_t.size)))),
             tdi_config=self.tdi_config,
@@ -354,7 +397,7 @@ class SOBBHDirectWDM:
         t_obs_start=None,
         n_grid=2048,
         buffer_time=5000.0,
-        eval_dt=600.0,
+        eval_dt=43200.0,
         num_m_layers=2,
         interp="cubic",
         force_backend="cpu",
@@ -611,7 +654,7 @@ class SOBBHLookupComputations:
         t_obs_start=None,
         n_grid=2048,
         buffer_time=5000.0,
-        eval_dt=600.0,
+        eval_dt=43200.0,
         num_m_layers=2,
         interp="cubic",
         row_batch=32,

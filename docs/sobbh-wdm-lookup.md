@@ -262,8 +262,260 @@ split. `--row-batch` bounds
 the response-spline memory (default 32); raise it on a large-memory device and watch the pool
 columns. `resp`/`trac`/`look`/`inner` are not the warm median but the spans of the last timed call.
 
-GPU results: NOT MEASURED here (the laptop has no CUDA backend); the GPU numbers come from the
-cluster run. The CPU smoke below (`--backend cpu --laptop --nt 256 --rows 2,4 --repeats 1`) has
+### Cluster result (2026-10-01, one GPU, cuda13x, production grid, 2nd-generation TDI, XYZ)
+
+Table `wdm_lookup_sobbh_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5` (built on the cluster with the
+production grid; the laptop EMRI table is equivalent at fixed `layer_dt`), comp build 0.6 s,
+chunked comp `Nt_sub=32 n_chunks=180`, `--rows 4,8,32,96,288`, default `--row-batch 32`,
+`--eval-dt 600`:
+
+    rows  look_first  look_warm     resp     trac     look    inner  look_fill  ch_first   ch_warm   ch_fill  ch/look   max|dll|  lk_pool  ch_pool
+       4       1.143      0.181    0.162    0.010    0.007    0.002      0.180     1.912     1.695     1.712     9.35  7.680e-04     2.05     1.99
+       8       1.172      0.196    0.176    0.011    0.007    0.002      0.193     1.702     1.700     1.717     8.69  3.287e-03     2.16     2.01
+      32       1.262      0.272    0.249    0.013    0.008    0.002      0.270     1.710     1.711     1.728     6.30  3.397e-03     2.70     2.01
+      96       0.824      0.816    0.747    0.039    0.024    0.005      0.810     1.706     1.707     1.723     2.09  3.531e-03     2.73     2.01
+     288       2.441      2.438    2.227    0.119    0.073    0.015      2.423     3.731     3.724     2.452     1.53  3.672e-03     2.71     2.01
+
+The run also printed, once, the response kernel's shared-memory warning:
+`lisatools td_spline TDI-on-the-fly: N=25919, scratch=544299 B exceeds device dynamic-shared
+ceiling (230256 B); global-memory scratch fallback (... slower)` — `N` is the per-row response
+evaluation count, 6 months / `eval_dt` = 15552000 / 600 ≈ 25919 points, about 21 B of scratch per
+point.
+
+Reading:
+
+- The lookup is 6-9x faster than the chunked comp at 4-32 rows and 1.5-2x at 96-288. The
+  chunked wall is flat (1.7 s) up to 96 rows and doubles at 288 (its one-block-per-row launch
+  exceeds one wave of blocks), as expected from the laptop memo.
+- The lookup wall IS the batched response build: `resp` is > 90 % of `look_warm` at every size;
+  tracer + lookup + inner together are <= 0.21 s even at 288 rows (so the table evaluation and the
+  inner products are solved; the response is the remaining cost).
+- `resp` scales per BATCH of `row_batch = 32` rows, ~0.25 s each (288 rows = 9 batches = 2.23 s).
+  A linear fit of the 4/8/32-row points gives ~0.15 s fixed per batch (the `TDTDIonTheFly`
+  construction: orbits / TDI wraps, input-spline setup, output-spline fit) plus ~3 ms per row
+  (the kernel on 25919 points per row under the global-memory scratch fallback, and the per-row
+  output-spline fits). Both parts are tunable without new code:
+  - `--eval-dt 1800` (`SOBBH_LOOKUP_EVAL_DT=1800`): 8641 points per row, ~181 kB scratch,
+    under the 230 kB shared-memory ceiling, 3x less kernel and spline work per row. Accuracy is
+    unchanged: the laptop gate at `--nt 1024` reproduces every `eval_dt = 600` column (per-source
+    `mm`, `ratio`, `mm_w_int`, `dlogL`) to 6-7 significant digits at `eval_dt = 1800` and 1200
+    (`/tmp/gate_evaldt_1800.jsonl`, `/tmp/gate_evaldt_1200.jsonl` vs the 17:45 entries of
+    `docs/sobbh_lookup_gate.jsonl`; e.g. source 0 `mm_w_int` 6.5914e-6 vs 6.5915e-6), and the
+    6-month gate (`--nt 4320 --rows 4 --eval-dt 1800`, 33 s on the laptop) reproduces every
+    printed digit of the 17:48 `eval_dt = 600` entries (all six sources: `mm`, `ratio`,
+    `mm_w_int`, `dlogL`). The response splines vary on orbital and chirp timescales, far slower
+    than 1800 s. The guard `eval_dt < buffer_time / 2 = 2500 s` is the hard ceiling at the
+    default buffer.
+  - A finer grid costs proportionally: Mike's `--eval-dt 300` run (51833 points, 1.09 MB scratch,
+    same fallback) gave `look_warm` 0.338 / 0.479 s at 8 / 32 rows (`resp` 0.317 / 0.457) vs
+    0.196 / 0.272 at 600 — both the per-batch and the per-row parts of `resp` scale with the
+    point count. Its `max|dll|` (8.4e-4 / 2.8e-3) is NOT an accuracy comparison across runs: the
+    script's residual is the lookup comp's own fill at that `eval_dt`, and its row batches come
+    from one seeded RNG consumed in `--rows` order, so a different `--rows` list scores different
+    rows. Only the gate (dense TD->WDM reference) measures `eval_dt` accuracy.
+  - `--row-batch 96` or `288` (`SOBBH_LOOKUP_ROW_BATCH`): pays the ~0.15 s fixed cost 3x or 1x
+    instead of 9x at 288 rows; the pool grows by the response output (N x 3 x n_eval x 16 B, ~0.1 GB
+    at 288 rows and `eval_dt = 600`) and the sparse template (~50 MB), both small next to the
+    2.7 GB pool.
+  - Hoisting the per-batch `TDTDIonTheFly` construction (one generator per comp, padded to the
+    batch size) removes the fixed cost; evaluating the response only at the pixel centres plus
+    derivative points, or the CUDA lookup kernel (follow-up 1), removes `resp` almost entirely.
+- `max|dll|` 8e-4 to 4e-3 between the two comps on the same residual: the chunked comp truncates
+  at `m_band_half_width = 3` (`--m-band`) and the lookup uses its 5-layer window; the gate's
+  move-level lookup-vs-exact numbers (above) are the accuracy statement, this column is only the
+  two fast paths' mutual spread.
+- Memory: 2.0-2.7 GB pool per comp, comparable between the two.
+- `look_first` at 4-32 rows (1.1-1.3 s) is the cupy kernel-cache warm-up of the first call;
+  irrelevant to a run.
+
+Suggested next cluster runs (seconds each; `--no-chunked` skips the 1.7 s chunked calls):
+
+    python scripts/sobbh/sobbh_lookup_speed_gpu.py --backend cuda13x --rows 8,32,96,288 --eval-dt 1800 --out speed_e1800_rb32.jsonl
+    python scripts/sobbh/sobbh_lookup_speed_gpu.py --backend cuda13x --rows 8,32,96,288 --eval-dt 600 --row-batch 288 --no-chunked --out speed_e600_rb288.jsonl
+    python scripts/sobbh/sobbh_lookup_speed_gpu.py --backend cuda13x --rows 8,32,96,288 --eval-dt 1800 --row-batch 288 --no-chunked --out speed_e1800_rb288.jsonl
+
+The first keeps the chunked comp on so `max|dll|` confirms the coarser response grid on the
+production grid; the warning line must be gone from its output.
+
+Result of the first run (`--eval-dt 1800`, row batch 32; the shared-memory warning is gone):
+
+    rows  look_first  look_warm     resp     trac     look    inner  look_fill  ch_first   ch_warm   ch_fill  ch/look   max|dll|  lk_pool  ch_pool
+       8       1.072      0.108    0.090    0.010    0.007    0.002      0.107     1.775     1.700     1.716    15.72  8.364e-04     2.10     1.99
+      32       1.140      0.137    0.116    0.010    0.008    0.002      0.135     1.711     1.711     1.728    12.50  2.841e-03     2.54     2.01
+      96       0.417      0.410    0.349    0.031    0.024    0.005      0.405     1.707     1.707     1.724     4.16  3.531e-03     2.57     2.01
+     288       1.232      1.224    1.041    0.093    0.073    0.015      1.212     3.754     3.663     2.444     2.99  3.672e-03     2.59     2.01
+
+Every size halves against `eval_dt = 600` (0.108 vs 0.196, 0.137 vs 0.272, 0.410 vs 0.816,
+1.224 vs 2.438); the lookup is 12-16x faster than the chunked comp at 8-32 rows and 3-4x at
+96-288. `resp` is now ~0.116 s per 32-row batch: ~0.08 s fixed per batch (generator
+construction) + ~1.1 ms per row, so the fixed part is 70 % of it and `--row-batch 288` is the
+next lever (expected ~0.4 s at 288 rows). `max|dll|` at 96 / 288 rows is identical to 4 digits
+across `eval_dt` 600 / 1800 (3.531e-3 / 3.672e-3): the chunked-vs-lookup spread is the m-band
+truncation, row-set independent once the batch samples the jitter densely, and the response grid
+does not move the lookup lnL at that level.
+
+Result of the second run (`--eval-dt 600 --row-batch 288 --no-chunked`; the `ch_*` columns are
+`nan` and `ch_pool` is meaningless without the chunked comp):
+
+    rows  look_first  look_warm     resp     trac     look    inner  look_fill  lk_pool
+       8       1.144      0.195    0.175    0.011    0.007    0.002      0.193     1.30
+      32       1.262      0.271    0.250    0.013    0.008    0.002      0.270     1.84
+      96       1.349      0.366    0.330    0.016    0.017    0.002      0.364     3.32
+     288       1.706      0.580    0.501    0.027    0.046    0.004      0.575     7.72
+
+One batch instead of nine at 288 rows: 0.580 s vs 2.438 (4.2x); 96 rows 0.366 vs 0.816. The
+marginal cost per row FALLS with the batch (3.1 ms/row from 8 to 32 rows, 1.25 from 32 to 96,
+0.89 from 96 to 288): the response kernel is one block per row and the device is still filling
+up, so the per-row part is sub-linear and the per-batch fixed part (~0.16 s at `eval_dt = 600`)
+is what the batch size amortises. The price is memory: the pool grows ~23 MB per row at
+`eval_dt = 600` (response outputs, their spline coefficients and the per-row intermediates all
+scale with the point count), 7.7 GB at 288 rows in one batch vs 2.6 GB with batches of 32;
+Pick `SOBBH_LOOKUP_ROW_BATCH` from the device memory, not from the speed alone (see the third
+run for the memory split).
+
+Result of the third run (`--eval-dt 1800 --row-batch 288 --no-chunked`):
+
+    rows  look_first  look_warm     resp     trac     look    inner  look_fill  lk_pool
+       8       1.066      0.108    0.089    0.010    0.007    0.002      0.106     1.27
+      32       1.112      0.135    0.115    0.010    0.008    0.002      0.134     1.71
+      96       1.178      0.183    0.152    0.011    0.017    0.002      0.181     2.83
+     288       1.451      0.389    0.326    0.016    0.046    0.004      0.388     6.00
+
+Against the chunked comp's 1.70 s (3.7 s at 288 rows) this is 15.7x / 12.6x / 9.3x / 9.6x at
+8 / 32 / 96 / 288 rows, and 6.3x over the original `eval_dt = 600`, row batch 32 call at 288
+rows (2.438 -> 0.389 s). What remains in `resp` is ~0.08 s of generator construction per call
+plus ~0.85 ms per row; tracer + lookup + inner are 0.07 s at 288 rows.
+
+Memory: the pool at 288 rows is 6.0 GB at `eval_dt = 1800` vs 7.7 GB at 600, so only ~1.7 GB of
+the one-batch peak is the response's point-count-dependent part (~9 MB per row at 600, ~3 at
+1800); the other ~5 GB (~17 MB per row, independent of `eval_dt`) is the lookup's own
+temporaries: the Keys cubic 16-neighbour gathers over `(rows, 3 channels, 5 layers, 4320 pixels)`
+for the cos and sin tables and the `(amp, phase, f, fdot)` tracer arrays. The cupy pool keeps
+that peak. Lowering it is a code change (chunk `coeffs` over pixels or rows inside `sparse`, or
+`interp="linear"` for a 4-neighbour gather at the linear-interpolation accuracy); until then the
+budget is ~1 GB + ~20 MB per row in one batch at `eval_dt = 1800`.
+
+### How sparse can the response grid go? (laptop gate sweep, 2026-10-01)
+
+Mike's question: evaluate the response sparsely (as the EMRI direct path does) and spline up to
+the pixel times. The lookup already never touches the data grid: it evaluates the batched
+TDI-on-the-fly response every `eval_dt` and splines (amp, whole phase) to the pixel centres
+(3600 s). The sweep below (6 months, `--nt 4320 --rows 4 --no-chunked`, `--buffer-time
+2.5 * eval_dt + 5000` so the guard passes and the eval grid stays inside the node grid; the gate
+script grew `--buffer-time` for it) reproduces EVERY printed digit of the `eval_dt = 600` baseline
+for all six catalogue-like sources (`mm`, `ratio`, `mm_w_int`, `dlogL`) at eval_dt 1800, 3600,
+7200, 21600, 43200 and 86400 s, i.e. one response point per DAY (181 points over 6 months
+instead of 25919 at 600 s). The per-source lookup time on the laptop CPU fell 0.22 s (1800) ->
+0.08 (21600) -> 0.06 (86400); the grid change is real. Why it works for SOBBH: the whole channel
+phase is the slow PN carrier plus the orbital Doppler term (~1 rad/day at 20 mHz), both with
+tiny fourth derivatives (cubic-spline error ~ h^4/384 * phi''''), so even 1-day nodes are
+~1e-6 rad on these sources.
+
+IMPLEMENTED (2026-10-02, `SOBBHBatchedTOF`, tests in `tests/test_sobbh_sparse_response.py`):
+
+- `eval_grid(t_lo, t_hi)`: uniform `linspace`, at most `eval_dt` apart, at least 4 points,
+  ending EXACTLY at the window ends (the old `t_lo + k * eval_dt` overshot `t_hi` by up to one
+  step), after clipping the window `DELAY_MARGIN = 600 s` inside the orbit tables' coverage
+  (`orbits.t_base`): the C++ response zeroes any time it cannot serve and a half-day spline
+  across that zero edge rings back into the window (the EMRI session measured 2 % in amplitude
+  two intervals in on a laptop-trimmed L1 table). A window entirely outside the coverage raises.
+- The guard `eval_dt < buffer_time / 2` is gone; `buffer_time >= DELAY_MARGIN` is the condition
+  (the node grid must cover the TDI delays), so the production buffer of 5000 s takes any step.
+- Default `eval_dt` 600 -> 43200 s (12 h) everywhere: `SOBBHBatchedTOF`, `SOBBHDirectWDM`,
+  `SOBBHLookupComputations`, `SOBBH_LOOKUP_EVAL_DT`, both scripts.
+- The whole-phase spline is kept (no exact-carrier residual): for an in-band SOBBH the
+  carrier is too slow to need it. Measured on the test grid (10.7 days, 23 nodes at 12 h), the
+  worst pixel against the 600-s tracer is the chirpiest in-band row (60 + 55 Msun at 24.5 mHz,
+  fdot 5e-10 Hz/s) at the grid's last pixels: 2.9e-6 rad, 6e-11 Hz, 1.8e-13 Hz/s, amplitude
+  4e-9 relative; catalogue rows < 1e-7 rad. The error scales as the step to the fourth
+  (6 h: 2.0e-7, 12 h: 2.9e-6, 24 h: 4.5e-5 rad), which is why 12 h and not 24 h is the default
+  (the test asserts both the 1e-5 rad bound at 12 h and that 24 h exceeds it). A source merging
+  inside the window leaves the band (f > 25 mHz) and the table's fdot axis long before the
+  spline degrades: a 110 Msun pair at 25 mHz still has 0.57 yr to merger and fdot 5e-10, 12x
+  under the production table's 6.2e-9 Hz/s axis. The EMRI form (exact analytic carrier at the
+  pixels + splined residual, `sobbh_amp_phase_batch` gives the carrier at any t, and
+  `LISATDIonTheFly::get_phase_ref` is the input phase at spacecraft-1 time so the residual is
+  slow) remains the fallback if the band or the mass range ever grows; it would cost a host-side
+  PN evaluation at every pixel on the GPU path.
+- 6-month gate at the new default (`--nt 4320 --rows 4`, buffer 5000): every printed digit of
+  the 600-s baseline again.
+- Laptop CPU, `--laptop` preset (Nf=180, dt=20), lookup only, `--repeats 2`, before -> after:
+  the 8-row 6-month `get_ll` was 9.3 s at 600 s (earlier in this doc), now 0.59 s. The response
+  is 20 % of the CPU call; the numpy table gathers (`look`) are the rest and are milliseconds on
+  the GPU.
+
+      months  rows  look_warm   resp   trac   look  inner  look_fill
+         5.9     4      0.285  0.056  0.035  0.177  0.012      0.275
+         5.9     8      0.588  0.094  0.064  0.399  0.025      0.549
+        11.8     4      1.097  0.146  0.089  0.824  0.039      0.742
+        11.8     8      1.400  0.163  0.138  1.035  0.066      1.178
+        23.7     4      1.183  0.159  0.143  0.904  0.061      1.148
+        23.7     8      2.378  0.267  0.246  1.695  0.115      2.262
+
+  (`--nt 4320 / 8640 / 17280`; every span scales with the pixel count, as it should.)
+
+Cost on the GPU after the sparse grid: the per-row part of `resp` (~0.85 ms per row at 1800 s)
+scales with the point count (8641 -> 361 at 6 months), so it becomes negligible; the ~0.08 s
+generator construction per call is then most of the response at <= 32 rows. The laptop stage
+profile (`MBHTDIONFLY_TIMING=1`) shows the configured-orbits cache working (one 8-s
+configuration per process, then hits), so that fixed cost is the kernel launch, the input-spline
+build, the wraps and the output-spline fits; the cluster profile decides what to hoist. The
+response part of the pool (~1.7 GB at 288 rows, 1800 s) shrinks ~25x; the lookup's own
+temporaries (~17 MB per row) are untouched.
+
+Cluster speed check at 6 / 12 / 24 months (one GPU, `SOBBH_LOOKUP_TABLE_PATH` exported as for
+the earlier runs; the stage profile prints at exit):
+
+    MBHTDIONFLY_TIMING=1 python scripts/sobbh/sobbh_lookup_speed_gpu.py --backend cuda13x --nt 4320  --rows 8,32,96,288 --out speed_sparse_6mo.jsonl
+    MBHTDIONFLY_TIMING=1 python scripts/sobbh/sobbh_lookup_speed_gpu.py --backend cuda13x --nt 8640  --rows 8,32,96,288 --out speed_sparse_12mo.jsonl
+    MBHTDIONFLY_TIMING=1 python scripts/sobbh/sobbh_lookup_speed_gpu.py --backend cuda13x --nt 17280 --rows 8,32,96,288 --out speed_sparse_24mo.jsonl
+
+(default `--eval-dt 43200`, `--row-batch 32`; the chunked comp runs too, so `ch/look` and
+`max|dll|` come out per duration. The 24-month residual slab and `invC` are 4x the 6-month
+ones, ~2.4 GB; the lookup's per-row temporaries scale with the pixel count, ~70 MB per row at
+24 months, so `--row-batch 32` is the safe default there.)
+
+### The table during a global-fit run (2026-10-02, the EMRI way)
+
+`SOBBH_LOOKUP_TABLE_PATH` is now OPTIONAL. `resolve_sobbh_lookup_table(general_info, cfg)`
+(`source_runtime.py`) returns `(path, status)`:
+
+- set: that file (`"explicit"`; must exist; the comp getter then checks its LAYER duration
+  against the run's, so any `(Nf, dt)` with the same `Nf * dt` serves, e.g. the laptop
+  `NF180_DT20` table on the `NF1440_DT2p5` grid);
+- unset: the canonical n_ref table of the run folder (`general_info.file_store_dir`),
+  `wdm_lookup_store.lookup_table_path(None, file_store_dir, Nf, dt)` -- the EMRI recipe, so it
+  is the SAME file `EMRI_LIKELIHOOD=direct` uses
+  (`wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5` in production; Mike's cluster SOBBH
+  table was built with exactly that recipe, only named differently) -- found there
+  (`"found"`) or built and saved there first (`"built"`; one builder under `<path>.lock`, the
+  other ranks `"waited"`), so a restart never rebuilds. Neither a path nor a run folder raises.
+
+The 6-month launcher (`scripts/fstat_proposal/submit_gf_6mo_v9_4gpu.sh`) grew the matching
+block after the EMRI one: `SOBBH_LIKELIHOOD` (default `chunked`), `SOBBH_LOOKUP_TABLE_PATH`
+(default unset = the run folder's canonical file), `SOBBH_LOOKUP_EVAL_DT` (43200),
+`SOBBH_LOOKUP_ROW_BATCH` (32), and a SOBBH PREFLIGHT that resolves the knobs through
+`SourceSOBBHSettings` (an unknown env var is silently ignored), refuses a lisatools without
+the lookup comp, refuses `GPUS_PER_RANK > 1`, and finds -- or builds and saves -- the table on
+the submitting node's GPU before `mpiexec`, checking its layer duration. Launch:
+
+    SOBBH_LIKELIHOOD=lookup NGPUS=4 ./scripts/fstat_proposal/submit_gf_6mo_v9_4gpu.sh
+
+Tests: `tests/test_sobbh_lookup_stock.py::LookupTableResolutionTest` (found / built-and-saved
+then found on restart / explicit wins / explicit must exist / explicit checked against the
+layer duration, same-layer other sampling accepted); the store's own tests cover the lock,
+the wait and the atomic build. The launcher preflight was dry-run on the laptop for the
+explicit-table, chunked, `GPUS_PER_RANK=2` and missing-table cases.
+
+Production settings from these runs: `SOBBH_LOOKUP_EVAL_DT=1800` (superseded by the 12-h
+default above); `SOBBH_LOOKUP_ROW_BATCH` =
+the move's row count when ~20 MB per row fits next to the other comps, else 96 (0.18 s per
+batch; 288 rows in three batches ~0.55 s vs 0.39 in one).
+
+### Pre-cluster CPU smoke (historical)
+
+GPU results were not measurable on the laptop (no CUDA backend). The CPU smoke below
+(`--backend cpu --laptop --nt 256 --rows 2,4 --repeats 1`) has
 the lookup SLOWER than the chunked comp, and it must not be read as a GPU result: the smoke grid
 is tiny (256 layers), so the lookup's fixed per-call template build (~4-7 s here, independent of
 rows and of the grid: it was also ~7 s on the production grid) dominates; another session's Python

@@ -559,9 +559,58 @@ def _source_ids_from_env() -> dict:
 #: would clear the override and hand the stage back to FSTAT_PEAK_MIN_SNR.
 _PE_PEAK_MIN_SNR = 6.25
 
+
+def _pe_rj_flip_fraction() -> float:
+    """The GB RJ flip fraction full_pe declares on entry: GB_PE_RJ_FLIP_FRACTION
+    (the launcher's 0.1) or the recipe's 0.2 code default.
+
+    Declared per stage because, with the GB branch in search mode, the
+    recipe builds the PE-named RJ moves with the SEARCH fraction
+    (``_rj_flip_default`` follows ``gb_info.mode``), so the PE knob would
+    otherwise reach nothing in a v9 run (user ruling 2026-10-02: "make sure
+    for GBs, during full PE all RJ moves sample 0.1 of the available slots").
+    """
+    from lisatools.globalfit.recipe import _pe_rj_flip_default
+
+    return float(_pe_rj_flip_default())
+
+
+def _pe_inmodel_repeats():
+    """``{branch: n}`` full_pe declares for its moves' in-model repeats, or None.
+
+    ``PE_INMODEL_REPEATS`` (int; unset = leave every move as built) applies to
+    the branches in ``PE_INMODEL_REPEATS_BRANCHES`` (comma list; default
+    ``gb,vgb,sobbh,mbh,psd,galfor`` -- user ruling 2026-10-02: "in-model
+    repeats of 25 for all sources except emris for right now for PE. This
+    includes VGBs and GBs ... that way we have a general 'thinning' factor
+    of 25", so the noise branches are in the set and EMRI is not). Per
+    STAGE, not process-global: the built moves are shared with the search
+    stages, whose repeat counts stay what their knobs say.
+    """
+    raw = os.environ.get("PE_INMODEL_REPEATS", "").strip()
+    if not raw:
+        return None
+    n = int(raw)
+    if n < 1:
+        raise ValueError(f"PE_INMODEL_REPEATS={n} must be >= 1.")
+    branches = [b.strip() for b in os.environ.get(
+        "PE_INMODEL_REPEATS_BRANCHES", "gb,vgb,sobbh,mbh,psd,galfor").split(",") if b.strip()]
+    if not branches:
+        raise ValueError("PE_INMODEL_REPEATS_BRANCHES is empty.")
+    return {b: n for b in branches}
+
 V9_SEARCH_STAGE_PROFILES = (
+    # prior_births (user ruling 2026-10-02: "set it specifically for gb search
+    # 3 ... prior removal only for gb search 1"): what rj_prior_removal
+    # proposes in the stage -- False = deaths only (the pruning move), True =
+    # births AND deaths from the prior container. Stated for EVERY stage
+    # because the move object is shared across them (a stage without the key
+    # would inherit whatever the previous stage left); GB_SEARCH_{N}_PRIOR_BIRTHS
+    # overrides a row. Applied move-scoped by SearchStageProfileStep, never
+    # broadcast (rj_removal_only on rj_fstat_search = no births).
     ("gb_search_1",
-     dict(phase_maximize=True, opt_snr=8.0, peak_min_snr=8.0), False),
+     dict(phase_maximize=True, opt_snr=8.0, peak_min_snr=8.0,
+          prior_births=False), False),
     # ⚠ STAGE 2 DOES NOT PHASE-MAXIMIZE, and the reason is the row itself.
     # It is the stage that DROPS the floors -- opt SNR 8 -> 5, F-stat peak
     # 8 -> 6.25 -- so it is already reaching for weaker, more marginal
@@ -573,7 +622,8 @@ V9_SEARCH_STAGE_PROFILES = (
     # "1 and 2" to stage 1 only). Only stage 1 -- the high-floor, high-
     # confidence pass -- maximizes.
     ("gb_search_2",
-     dict(phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25), False),
+     dict(phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25,
+          prior_births=True), False),
     # reset_band_max (user ruling 2026-09-30): stage 3 is the stage whose noise
     # MOVES, so the shutoff valve's per-(walker, band) cold-lnL max carried in
     # from the fixed-noise stages is re-learned from -inf at entry instead of
@@ -583,7 +633,7 @@ V9_SEARCH_STAGE_PROFILES = (
     # noise. The galfor ratchet resets it again at every nudge.
     ("gb_search_3",
      dict(phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25,
-          reset_band_max=True), True),
+          reset_band_max=True, prior_births=True), True),
 )
 
 #: Per-stage override of the profile's ``opt_snr`` -- the OPTIMAL-SNR
@@ -602,6 +652,15 @@ V9_SEARCH_STAGE_PROFILES = (
 _SEARCH_STAGE_OPT_SNR_KNOBS = {
     "gb_search_2": "GB_SEARCH_2_OPT_SNR",
     "gb_search_3": "GB_SEARCH_3_OPT_SNR",
+}
+
+#: Per-stage override of the profile's ``prior_births`` (1/0): what the
+#: shared ``rj_prior_removal`` move proposes in that stage. Resolved by
+#: :func:`search_stage_profiles` beside the opt-SNR knobs.
+_SEARCH_STAGE_PRIOR_BIRTHS_KNOBS = {
+    "gb_search_1": "GB_SEARCH_1_PRIOR_BIRTHS",
+    "gb_search_2": "GB_SEARCH_2_PRIOR_BIRTHS",
+    "gb_search_3": "GB_SEARCH_3_PRIOR_BIRTHS",
 }
 
 
@@ -643,6 +702,20 @@ def search_stage_profiles():
                   f"from {knob} (default {was}; the F-stat peak floor "
                   f"peak_min_snr={prof['peak_min_snr']} is NOT affected)",
                   flush=True)
+        pknob = _SEARCH_STAGE_PRIOR_BIRTHS_KNOBS.get(name)
+        praw = os.environ.get(pknob) if pknob else None
+        if praw is not None and praw.strip() != "":
+            _v = praw.strip().lower()
+            if _v in ("1", "true", "yes", "on"):
+                pb = True
+            elif _v in ("0", "false", "no", "off"):
+                pb = False
+            else:
+                raise ValueError(f"{pknob}={praw!r} must be 1/0 (prior births on/off).")
+            if pb != prof.get("prior_births"):
+                print(f"[V9-STAGE {name}] profile prior_births={pb} from {pknob} "
+                      f"(table default {prof.get('prior_births')})", flush=True)
+            prof = dict(prof, prior_births=pb)
         out.append((name, prof, sampled))
     return tuple(out)
 
@@ -1575,13 +1648,16 @@ def build_fit():
 
     def _search_stage(name, *, sample_noise, phase_maximize, opt_snr,
                       peak_min_snr, reset_band_max=False, warm_every=1,
-                      seed_only=False):
+                      seed_only=False, prior_births=None):
         # the stage profile as the step sees it; reset_band_max is only
         # written when set so the other stages' dicts stay byte-identical
         _profile = dict(phase_maximize=phase_maximize, opt_snr=opt_snr,
                         peak_min_snr=peak_min_snr)
         if reset_band_max:
             _profile["reset_band_max"] = True
+        if prior_births is not None:
+            # move-scoped: what the shared rj_prior_removal proposes HERE
+            _profile["prior_births"] = bool(prior_births)
         # SAMPLED noise: the legacy gb_search composition verbatim -- the
         # leading joint psd+galfor+vgb search plus the two extra re-tracking
         # rounds that bracket the F-stat birth move, so the grid is always
@@ -1605,6 +1681,14 @@ def build_fit():
                           if _ratchet is not None else None)
         # the data-driven stop (user design 2026-10-02): GALFOR_RATCHET_MIN_GAIN
         _ratchet_min_gain = min_gain_from_env() if _ratchet is not None else 0.0
+        # GALFOR_RATCHET_MIN_NUDGES: the stop may not fire before this many
+        # nudges have run in the process (user ruling 2026-10-02: "I want to
+        # force at least 1 more nudge"); 0 = no floor
+        _ratchet_min_nudges = 0
+        if _ratchet is not None:
+            _ratchet_min_nudges = int(os.environ.get("GALFOR_RATCHET_MIN_NUDGES", "0").strip() or 0)
+            if _ratchet_min_nudges < 0:
+                raise ValueError(f"GALFOR_RATCHET_MIN_NUDGES={_ratchet_min_nudges} must be >= 0.")
         if _ratchet is not None and not _env_flag("GB_SEARCH_IN_MODEL"):
             raise ValueError(
                 "GALFOR_RATCHET=1 needs GB_SEARCH_IN_MODEL=1: every noise change "
@@ -1831,6 +1915,7 @@ def build_fit():
                 ratchet=_ratchet,
                 ratchet_delta=_ratchet_delta,
                 ratchet_min_gain=_ratchet_min_gain,
+                ratchet_min_nudges=_ratchet_min_nudges,
                 legs=_legs,
             ),
             combine_kwargs=_combine_kwargs,
@@ -1884,7 +1969,13 @@ def build_fit():
                      if os.environ.get("GB_RIDGE_GIBBS", "1") == "1" else [])
                 + vgb + vgb_ridge(),
                 step_kwargs=dict(peak_min_snr=_PE_PEAK_MIN_SNR,
-                                 stage_name="full_pe"),
+                                 stage_name="full_pe",
+                                 # per-stage in-model repeats (PE_INMODEL_REPEATS)
+                                 pe_repeats=_pe_inmodel_repeats(),
+                                 # GB_PE_RJ_FLIP_FRACTION, applied on entry:
+                                 # in a search-mode run the PE RJ moves are
+                                 # BUILT with the search fraction (1.0)
+                                 pe_rj_flip_fraction=_pe_rj_flip_fraction()),
                 combine_kwargs=_pe_combine_kwargs(),
             ),
         ]

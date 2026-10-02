@@ -910,14 +910,36 @@ class PERecipeStep(BaseRecipeStep):
     """
 
     def __init__(self, *args, peak_min_snr=None, stage_name: str = "",
-                 **kwargs):
+                 pe_repeats=None, pe_rj_flip_fraction=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.peak_min_snr = peak_min_snr
         self.stage_name = stage_name
+        # ``pe_repeats``: {branch: in-model repeats} this stage DECLARES for
+        # its moves (user ruling 2026-10-02: "in-model repeats of 25 for all
+        # sources except emris for right now for PE. This includes VGBs and
+        # GBs"). Applied on entry to the built moves, which are shared with
+        # the search stages -- hence per stage, not a process-global knob.
+        self.pe_repeats = (None if not pe_repeats
+                           else {str(k): int(v) for k, v in dict(pe_repeats).items()})
+        # ``pe_rj_flip_fraction``: the fraction of AVAILABLE slots every GB RJ
+        # move proposes on per propose in this stage (user ruling 2026-10-02:
+        # "during full PE all RJ moves sample 0.1 of the available slots. This
+        # is the FRAC env variable"). Declared per stage because the recipe
+        # BUILDS the PE-named RJ moves with the SEARCH default whenever the GB
+        # branch runs in search mode (``_rj_flip_default`` follows
+        # ``gb_info.mode``, not the move's name), so in a v9 search run
+        # GB_PE_RJ_FLIP_FRACTION=0.1 reached nothing until this.
+        self.pe_rj_flip_fraction = (None if pe_rj_flip_fraction is None
+                                    else float(pe_rj_flip_fraction))
+        if self.pe_rj_flip_fraction is not None and not (
+                0.0 < self.pe_rj_flip_fraction <= 1.0):
+            raise ValueError(
+                f"pe_rj_flip_fraction={self.pe_rj_flip_fraction} must be in (0, 1].")
         self._profile_serial = None
 
     def note_recipe_step(self, serial) -> None:
-        """Apply this stage's declared peak floor (idempotent per step)."""
+        """Apply this stage's declared peak floor and in-model repeats
+        (idempotent per step)."""
         if serial is not None and serial == self._profile_serial:
             return
         self._profile_serial = serial
@@ -933,6 +955,82 @@ class PERecipeStep(BaseRecipeStep):
             "declared by this stage" if self.peak_min_snr is not None
             else "from the run's FSTAT_PEAK_MIN_SNR (any search-stage "
                  "override has been cleared)")
+        if self.pe_repeats:
+            apply_inmodel_repeats(self.moves, self.pe_repeats,
+                                  tag=self.stage_name or "pe")
+        if self.pe_rj_flip_fraction is not None:
+            apply_rj_flip_fraction(self.moves, self.pe_rj_flip_fraction,
+                                   tag=self.stage_name or "pe")
+
+
+def apply_rj_flip_fraction(moves, fraction, tag: str = "pe") -> dict:
+    """Set ``rj_flip_fraction`` on every GB RJ move of a built move tree.
+
+    The fraction of AVAILABLE (dead) slots a birth proposal draws per
+    propose; 1.0 = every candidate row. Applies to GB-branch moves that
+    carry the attribute and propose RJ (``is_rj_prop``); in-model GB moves
+    and the fixed-leaf VGB branch (no RJ, fraction pinned to 1.0 by its
+    resolver) are left alone. Returns ``{move name: (old, new)}``.
+    """
+    fraction = float(fraction)
+    if not (0.0 < fraction <= 1.0):
+        raise ValueError(f"rj_flip_fraction must be in (0, 1], got {fraction}.")
+    changed = {}
+    for m in iter_move_tree(moves):
+        if getattr(m, "branch_name", None) != "gb":
+            continue
+        if not hasattr(m, "rj_flip_fraction") or not getattr(m, "is_rj_prop", False):
+            continue
+        old = float(getattr(m, "rj_flip_fraction"))
+        if old != fraction:
+            m.rj_flip_fraction = fraction
+            changed[getattr(m, "name", type(m).__name__)] = (old, fraction)
+    if changed:
+        logger.info("[V9-STAGE %s] GB RJ flip fraction set on entry: %s.", tag,
+                    ", ".join(f"{k} {o:g} -> {n:g}" for k, (o, n) in changed.items()))
+    return changed
+
+
+def apply_inmodel_repeats(moves, repeats, tag: str = "pe") -> dict:
+    """Set the per-move in-model repeat count, per branch, on a built move tree.
+
+    ``repeats`` is ``{branch_name: n}``. The attribute differs by move family
+    and is detected per move: the add/remove source moves (sobbh / mbh /
+    emri) and the noise moves carry ``num_repeats``; the GB-family band moves
+    (gb, vgb) carry ``num_repeat_proposals``. A move of a listed branch with
+    neither attribute is reported and left alone -- never a silent no-op.
+    Returns ``{move name: (old, new)}`` for what changed.
+    """
+    want = {str(k): int(v) for k, v in dict(repeats or {}).items()}
+    for b, n in want.items():
+        if n < 1:
+            raise ValueError(f"in-model repeats for branch {b!r} must be >= 1 (got {n}).")
+    changed, untouched = {}, []
+    for m in iter_move_tree(moves):
+        b = getattr(m, "branch_name", None)
+        if b not in want:
+            continue
+        n = want[b]
+        if hasattr(m, "num_repeats"):
+            attr = "num_repeats"
+        elif hasattr(m, "num_repeat_proposals"):
+            attr = "num_repeat_proposals"
+        else:
+            untouched.append(getattr(m, "name", type(m).__name__))
+            continue
+        old = int(getattr(m, attr))
+        if old != n:
+            setattr(m, attr, int(n))
+            changed[getattr(m, "name", type(m).__name__)] = (old, n)
+    if changed:
+        logger.info("[V9-STAGE %s] in-model repeats set on entry: %s.", tag,
+                    ", ".join(f"{k} {o} -> {n}" for k, (o, n) in changed.items()))
+    if untouched:
+        logger.warning(
+            "[V9-STAGE %s] in-model repeats requested for %s but these moves of "
+            "a listed branch carry neither num_repeats nor num_repeat_proposals "
+            "and were left alone: %s.", tag, want, untouched)
+    return changed
 
     def stopping_function(self, *args, **kwargs):
         """Never stop on its own — relies on outer stopping logic."""
@@ -1490,11 +1588,13 @@ class SearchStageProfileStep(RJRecipeStep):
 
     def __init__(self, *args, profile: typing.Optional[dict] = None,
                  stage_name: str = "", ratchet=None, ratchet_delta=None,
-                 ratchet_min_gain: float = 0.0, legs: bool = False, **kwargs):
+                 ratchet_min_gain: float = 0.0, ratchet_min_nudges: int = 0,
+                 legs: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.profile = dict(profile or {})
         _unknown = sorted(set(self.profile) - {
-            "phase_maximize", "opt_snr", "peak_min_snr", "reset_band_max"})
+            "phase_maximize", "opt_snr", "peak_min_snr", "reset_band_max",
+            "prior_births"})
         if _unknown:
             raise ValueError(
                 f"SearchStageProfileStep({stage_name!r}): unknown profile "
@@ -1521,6 +1621,12 @@ class SearchStageProfileStep(RJRecipeStep):
         # release whose max cold lnL gained less than this over the previous
         # release, no more nudges (user design 2026-10-02; _ratchet_check_gain).
         self.ratchet_min_gain = float(ratchet_min_gain or 0.0)
+        # ``ratchet_min_nudges``: the gain rule may not stop the ratchet before
+        # this many nudges have run IN THIS PROCESS (user ruling 2026-10-02:
+        # "I want to force at least 1 more nudge"). 0 = no floor. Counted on
+        # ``_ratchet_nudges``, which _drive_ratchet increments per nudge; a
+        # relaunch starts the count again.
+        self.ratchet_min_nudges = int(ratchet_min_nudges or 0)
         self._ratchet_stopped = False
         self._ratchet_last_release_max = None
         self._ratchet_release_maxes = []
@@ -1711,14 +1817,25 @@ class SearchStageProfileStep(RJRecipeStep):
         if os.environ.get("GALFOR_RATCHET_CLOCK_RESET", "0").strip() in (
                 "1", "true", "True", "yes", "on"):
             _mid = bool(cm is not None and int(getattr(cm.gf_legs, "cursor", 0)) != 0)
-            self._ratchet_k0 = _raw_k + (1 if _mid else 0)
+            # GALFOR_RATCHET_CLOCK_START (default 0): the schedule k the gate
+            # runs at NEXT. 1 = "the release already happened in the cycle
+            # now in progress; continue with the nudge" (6mo job 685 was cut
+            # off after its first release, and a plain reset would have run
+            # a second release before the first nudge). Under legs the
+            # in-progress cycle then counts as schedule k = START - 1, so the
+            # wrap reads its gain as that iteration's.
+            _start = int(os.environ.get("GALFOR_RATCHET_CLOCK_START", "0").strip() or 0)
+            if _start < 0:
+                raise ValueError(f"GALFOR_RATCHET_CLOCK_START={_start} must be >= 0.")
+            self._ratchet_k0 = _raw_k + (1 if _mid else 0) - _start
             logger.info(
                 "[GALFOR_RATCHET %s] clock RESET at entry: stage-local %s %d "
-                "becomes schedule k = 0 (GALFOR_RATCHET_CLOCK_RESET=1); the "
-                "schedule's first action here is %s.",
+                "becomes schedule k = %d (GALFOR_RATCHET_CLOCK_RESET=1, "
+                "GALFOR_RATCHET_CLOCK_START=%d); the gate's next action is %s.",
                 self.stage_name or "gb_search",
-                "cycle" if cm is not None else "iteration", self._ratchet_k0,
-                self.ratchet.action(0).upper())
+                "cycle" if cm is not None else "iteration",
+                _raw_k + (1 if _mid else 0), _start, _start,
+                self.ratchet.action(_start).upper())
         self._ratchet_k = _raw_k - self._ratchet_k0
         # A ratchet that already finished in an earlier process stays finished:
         # the stop is stamped in the store (see _ratchet_check_gain).
@@ -1821,13 +1938,24 @@ class SearchStageProfileStep(RJRecipeStep):
                 "(threshold %.0f); ratcheting continues.", tag, k_done, mx, mean,
                 gain, gain_min)
             return
+        _n_nudges = int(getattr(self, "_ratchet_nudges", 0) or 0)
+        _min_nudges = int(getattr(self, "ratchet_min_nudges", 0) or 0)
+        if _n_nudges < _min_nudges:
+            logger.info(
+                "[GALFOR_RATCHET %s] after RELEASE %d: max cold lnL %.3f (walker "
+                "mean %.3f), %+.1f over the previous release < %.0f -- but only %d "
+                "of the required %d nudge(s) have run in this process "
+                "(GALFOR_RATCHET_MIN_NUDGES); ratcheting continues.", tag, k_done,
+                mx, mean, gain, gain_min, _n_nudges, _min_nudges)
+            return
         self._ratchet_stopped = True
         gate = self._ratchet_gate(moves) if moves is not None else None
         if gate is not None and hasattr(gate, "finish_ratchet"):
             gate.finish_ratchet()
-        # the refit cadence comes back NOW, not at the next drive: if the
-        # stage ends in this same iteration there is no next drive
+        # the refit cadence and the valve floor come back NOW, not at the next
+        # drive: if the stage ends in this same iteration there is no next drive
         self._ratchet_refit_only_on_nudge(moves)
+        self._ratchet_shutoff_floor(moves)
         # PERSIST the decision: a relaunch re-enters this stage with a fresh
         # process and would otherwise resume the schedule (clock reset or
         # not) and nudge again. The stamp is read back by _ratchet_enter.
@@ -1850,6 +1978,39 @@ class SearchStageProfileStep(RJRecipeStep):
             if is_noise_ratchet_gate(m):
                 return m
         return None
+
+    def _ratchet_shutoff_floor(self, moves, k=None, force_off=False) -> None:
+        """Hold the RJ shutoff valve open below a frequency while the ratchet
+        is active (user design 2026-10-02: "maybe don't do RJ shutoff during
+        the ratchet cycles ... you can shut off bands above 7 mHz if their
+        likelihoods converge as usual"). Sets ``rj_shutoff_min_freq`` on
+        every GB band move to ``GALFOR_RATCHET_SHUTOFF_MIN_FREQ`` Hz (default
+        7e-3; 0 disables) while a nudge can still come, and back to 0 at the
+        stop, the cycle ceiling and stage end. The valve itself reopens and
+        re-streaks the exempt pairs at its next judgment.
+        """
+        if getattr(self, "ratchet", None) is None or moves is None:
+            return
+        raw = os.environ.get("GALFOR_RATCHET_SHUTOFF_MIN_FREQ", "7e-3").strip()
+        fmin = float(raw) if raw else 0.0
+        if fmin < 0:
+            raise ValueError(f"GALFOR_RATCHET_SHUTOFF_MIN_FREQ={fmin} must be >= 0 Hz.")
+        active = (fmin > 0 and not force_off
+                  and not getattr(self, "_ratchet_stopped", False)
+                  and (k is None or int(k) < self.ratchet.total_iterations))
+        want = fmin if active else 0.0
+        changed = []
+        for m in gb_moves_in_tree(moves):
+            if float(getattr(m, "rj_shutoff_min_freq", 0.0) or 0.0) != want:
+                m.rj_shutoff_min_freq = want
+                changed.append(getattr(m, "name", "?"))
+        if changed:
+            logger.info(
+                "[GALFOR_RATCHET %s] RJ shutoff floor %s on %s: %s.",
+                self.stage_name or "gb_search",
+                f"{1e3 * want:.3g} mHz" if want else "LIFTED", changed,
+                "bands below it stay open while the ratchet is active" if want
+                else "the valve may shut converged pairs at every frequency again")
 
     def _ratchet_refit_only_on_nudge(self, moves, k=None, force_off=False) -> None:
         """Hand the F-stat refit clock to the ratchet while it is active.
@@ -1905,9 +2066,11 @@ class SearchStageProfileStep(RJRecipeStep):
         if getattr(self, "ratchet", None) is None:
             return
         k = int(k)
-        # the refit clock belongs to the ratchet while nudges can still come
-        # (also on a mid-cycle resume, k < 0, before this cycle's legs run)
+        # the refit clock and the valve floor belong to the ratchet while
+        # nudges can still come (also on a mid-cycle resume, k < 0, before
+        # this cycle's legs run)
         self._ratchet_refit_only_on_nudge(moves, k=k)
+        self._ratchet_shutoff_floor(moves, k=k)
         if k < 0:
             return
         gate = self._ratchet_gate(moves)
@@ -2031,6 +2194,39 @@ class SearchStageProfileStep(RJRecipeStep):
                         "SHADOWS the scalar just set. v9 expects that flag "
                         "OFF -- SNR floors move per recipe STAGE, not per "
                         "band.", tag, m.name)
+
+        # MOVE-SCOPED key (user ruling 2026-10-02: "set it specifically for gb
+        # search 3. gb search 1 should still be prior removal"): what the
+        # prior RJ move proposes in THIS stage. ``prior_births`` True = births
+        # AND deaths from the prior container; False = the original pruning
+        # move (deaths only). ⚠ Never broadcast: ``rj_removal_only`` on
+        # rj_fstat_search means alive rows only, i.e. NO BIRTHS (the 09-29
+        # hazard note), so this touches the prior move alone, found by
+        # name. The move object is shared by every search stage, which is
+        # exactly why each stage's profile states its own value.
+        pb = prof.get("prior_births")
+        if pb is not None:
+            _prior = [m for m in gb_moves
+                      if getattr(m, "name", None) == "rj_prior_removal"]
+            if not _prior:
+                logger.warning(
+                    "[V9-STAGE %s] profile asks prior_births=%s but the stage "
+                    "carries no 'rj_prior_removal' move -- nothing to set.",
+                    tag, bool(pb))
+            for m in _prior:
+                want_ro = not bool(pb)
+                if want_ro and bool(getattr(m, "rj_replace", False)):
+                    raise ValueError(
+                        f"[V9-STAGE {tag}] {m.name}: rj_removal_only and rj_replace "
+                        "are mutually exclusive; the profile cannot make a replace "
+                        "move deaths-only.")
+                old = bool(getattr(m, "rj_removal_only", False))
+                if old != want_ro:
+                    logger.info(
+                        "[V9-STAGE %s] %s.rj_removal_only %s -> %s (%s)", tag, m.name,
+                        old, want_ro,
+                        "deaths only" if want_ro else "prior BIRTHS and deaths")
+                m.rj_removal_only = want_ro
 
         pm = prof.get("phase_maximize")
         if pm is not None:
@@ -2169,9 +2365,10 @@ class SearchStageProfileStep(RJRecipeStep):
             self._ratchet_capture_reference(_k_next, sample)
             self._drive_ratchet(_k_next, moves, sample=sample)
         if stop:
-            # the stage is ending: the shared grid move leaves with its
-            # ordinary cadence, whatever the ratchet did with it
+            # the stage is ending: the shared moves leave with their ordinary
+            # cadence and an unfloored valve, whatever the ratchet did with them
             self._ratchet_refit_only_on_nudge(moves, force_off=True)
+            self._ratchet_shutoff_floor(moves, force_off=True)
         return stop
 
     def _stopping_rules(self, i, sample, sampler) -> bool:

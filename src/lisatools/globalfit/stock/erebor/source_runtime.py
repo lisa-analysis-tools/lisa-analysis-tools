@@ -677,9 +677,13 @@ class SourceSOBBHSettings(SOBBHSettings):
     lookup_num_m_layers: int = dataclasses.field(
         default_factory=env_default("SOBBH_LOOKUP_NUM_M_LAYERS", 2, int)
     )
-    # response evaluation step [s] for the per-channel amplitude/phase splines
+    # response evaluation step [s] for the per-channel amplitude/phase splines: a SPARSE grid
+    # (12 h; one point per 12 pixels), ending exactly at the window and kept inside the orbit
+    # tables. 1800 .. 86400 s reproduce the 600-s gate to every printed digit at 6 months; the
+    # spline error grows as the step to the fourth (24 h = 16x the 12-h error, still 5e-5 rad
+    # for the chirpiest in-band case), so 12 h keeps a margin. tests/test_sobbh_sparse_response.py
     lookup_eval_dt: float = dataclasses.field(
-        default_factory=env_default("SOBBH_LOOKUP_EVAL_DT", 600.0, float)
+        default_factory=env_default("SOBBH_LOOKUP_EVAL_DT", 43200.0, float)
     )
     # table interpolation: "cubic" (Keys) or "linear"
     lookup_interp: str = dataclasses.field(
@@ -2188,13 +2192,53 @@ def get_sobbh_chunked_comp(general_info, cfg):
 SOBBH_FAST_LIKELIHOODS = ("chunked", "lookup")
 
 
+def resolve_sobbh_lookup_table(general_info, cfg, *, force_backend=None):
+    """``(path, status)`` of the SOBBH lookup table for this run, the EMRI way.
+
+    ``SOBBH_LOOKUP_TABLE_PATH`` set: that file (``status = "explicit"``; it must exist, and
+    the caller checks its LAYER duration against the run's -- any ``(Nf, dt)`` with the same
+    ``Nf * dt`` serves, the table depends on the layer duration only). Unset: the canonical
+    n_ref table of the run folder (``general_info.file_store_dir``; the EMRI recipe, so it is
+    the SAME file ``EMRI_LIKELIHOOD=direct`` uses), found there (``"found"``) or built and
+    saved there first (``"built"``, one builder under a lock file while other ranks wait,
+    ``"waited"``; :mod:`lisatools.wdm_lookup_store`), so a restart never rebuilds it.
+    """
+    from lisatools import wdm_lookup_store
+
+    domain_settings = general_info.domain_settings
+    explicit = str(cfg.get("sobbh_lookup_table_path") or "")
+    if explicit:
+        path = os.path.abspath(os.path.expanduser(explicit))
+        if not os.path.exists(path):
+            raise ValueError(
+                f"SOBBH_LOOKUP_TABLE_PATH={explicit!r} does not exist. Point it at an n_ref "
+                f"lookup table with the run's layer duration ({float(domain_settings.layer_dt):g}"
+                " s), or unset it to find-or-build the run folder's own table."
+            )
+        return path, "explicit"
+    table_dir = getattr(general_info, "file_store_dir", None)
+    if not table_dir:
+        raise ValueError(
+            "SOBBH_LIKELIHOOD=lookup needs a lookup table: set SOBBH_LOOKUP_TABLE_PATH, or run "
+            "with a run folder (general_info.file_store_dir) where the canonical n_ref table is "
+            "found or built and saved (lisatools.wdm_lookup_store)."
+        )
+    Nf, dt = int(domain_settings.Nf), float(domain_settings.data_dt)
+    path = wdm_lookup_store.lookup_table_path(None, table_dir, Nf, dt)
+    status = wdm_lookup_store.ensure_lookup_table(
+        path, Nf=Nf, dt=dt, force_backend=force_backend or general_info.force_backend
+    )
+    return path, status
+
+
 def get_sobbh_lookup_comp(general_info, cfg):
     """Build (and cache per device) the ``SOBBHLookupComputations`` for
     ``SOBBH_LIKELIHOOD=lookup``.
 
     Same ``t_ref`` / ``t_obs_start`` resolution as :func:`get_sobbh_chunked_comp`; the table
-    (``SOBBH_LOOKUP_TABLE_PATH``) loads on the run's backend and must carry the run domain's
-    layer duration.
+    comes from :func:`resolve_sobbh_lookup_table` (``SOBBH_LOOKUP_TABLE_PATH`` or the run
+    folder's find-or-build canonical file), loads on the run's backend and must carry the run
+    domain's layer duration.
     """
     from lisatools.domains import WDMLookupTable, WDMSettings
     from lisatools.sources.sobbh.wdm_direct import SOBBHLookupComputations
@@ -2216,29 +2260,23 @@ def get_sobbh_lookup_comp(general_info, cfg):
             f"(general.domain_settings is {type(domain_settings).__name__}); "
             "use SOBBH_LIKELIHOOD=full for FD/STFT runs."
         )
-    path = str(cfg.get("sobbh_lookup_table_path") or "")
-    if not path or not os.path.exists(path):
-        nf, dt = int(domain_settings.Nf), float(domain_settings.data_dt)
-        raise ValueError(
-            "SOBBH_LIKELIHOOD=lookup needs SOBBH_LOOKUP_TABLE_PATH "
-            f"(got {path!r}): an n_ref lookup table with the run's layer duration "
-            f"layer_dt = {float(domain_settings.layer_dt):g} s, e.g.\n"
-            "  python scripts/wdm/build_wdm_lookup_gpu.py --build-kind n_ref_complex "
-            f"--Nf {nf} --Nt 1024 --dt {dt:g} "
-            f"--min-freq {float(domain_settings.min_freq or 1e-4):g} "
-            f"--max-freq {float(domain_settings.max_freq or 2.5e-2):g} --m-ref 21 --eps-freq 0.005 "
-            "--num-layers-diff 2 --eps-fdot 0.01 --fdot-max-factor 8 --time-layers 32 "
-            "--nchannels 1 --out wdm_lookup_sobbh.h5\n"
-            "(any (Nf, dt) with the same Nf * dt works: the table depends on the layer "
-            "duration only; the 3600-s laptop EMRI table serves the production grid)"
-        )
     force_backend = general_info.force_backend
     tdi_config = TDIConfig(cfg["tdi_gen_str"], force_backend=force_backend)
     t_ref = cfg["sobbh_reference_time"]
     if t_ref is None:
         t_ref = general_info.data_t0
     with device_context(xp, dev):
+        path, status = resolve_sobbh_lookup_table(general_info, cfg, force_backend=force_backend)
+        logger.info("[SOBBH_LOOKUP] lookup table %s (%s).", path, status)
         table = WDMLookupTable.from_file(path, force_backend=force_backend)
+        if abs(float(table.layer_dt) - float(domain_settings.layer_dt)) > 1e-6:
+            raise ValueError(
+                f"SOBBH lookup table {path} has layer duration {float(table.layer_dt):g} s "
+                f"(Nf={table.Nf}, dt={table.data_dt}); the run's layer duration is "
+                f"{float(domain_settings.layer_dt):g} s (Nf={domain_settings.Nf}, "
+                f"dt={domain_settings.data_dt}). Point SOBBH_LOOKUP_TABLE_PATH at a table "
+                "with the run's layer duration, or unset it to use the run folder's own."
+            )
         comp = SOBBHLookupComputations(
             domain_settings, float(t_ref), table,
             orbits=orbits, tdi_config=tdi_config, tdi_type=cfg["tdi_chan"],

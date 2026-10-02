@@ -723,30 +723,42 @@ class GFCombineMove(CombineMove, GlobalFitMove):
             ensure_fine_noise_covariance_current(acs, runtime)
 
     # ---- PE-only exclusive RJ draw (user ruling 2026-09-10) ----------------
-    #: The two PE RJ proposals that become mutually exclusive per iteration
-    #: under ``GB_PE_RJ_DRAW_ONE=1`` (matched on the declarative move name
-    #: the Stage stamps as ``gf_move_name``).
-    _PE_RJ_DRAW_ONE_MEMBERS = ("rj_fstat_pe", "rj_prior_pe")
+    #: The PE RJ proposals that become mutually exclusive per iteration under
+    #: ``GB_PE_RJ_DRAW_ONE=1`` (matched on the declarative move name the
+    #: Stage stamps as ``gf_move_name``). ``rj_warm_pe`` joined the draw on
+    #: 2026-10-02 (user ruling: "put the warm proposal in with the other two
+    #: rj moves. Draw them at 0.45 prior, 0.45 fstat, 0.1 warm start"); a
+    #: stage without it draws between the first two as before.
+    _PE_RJ_DRAW_ONE_MEMBERS = ("rj_fstat_pe", "rj_prior_pe", "rj_warm_pe")
 
     @staticmethod
     def _pe_rj_draw_one_config():
-        """``(enabled, p_fstat)`` from the env, read at CALL time.
+        """``(enabled, {member: P})`` from the env, read at CALL time.
 
         ``GB_PE_RJ_DRAW_ONE`` (default ``0``) switches the mode on;
-        ``GB_PE_RJ_FSTAT_FRACTION`` (default ``0.8``) is P(rj_fstat_pe) per
-        iteration, in [0, 1]. Read per call like ``GF_MOVE_TIMING`` so a
+        ``GB_PE_RJ_FSTAT_FRACTION`` (default ``0.8``) is P(rj_fstat_pe) and
+        ``GB_PE_RJ_WARM_FRACTION`` (default ``0``) P(rj_warm_pe) per
+        iteration; ``rj_prior_pe`` takes the remainder. Both in [0, 1] and
+        summing to at most 1. Read per call like ``GF_MOVE_TIMING`` so a
         resumed run takes the runbook's value with no code change.
         """
         if os.environ.get("GB_PE_RJ_DRAW_ONE", "0") != "1":
             return False, None
-        raw = os.environ.get("GB_PE_RJ_FSTAT_FRACTION", "0.8")
-        p = float(raw)
-        if not np.isfinite(p) or not (0.0 <= p <= 1.0):
+        raw_f = os.environ.get("GB_PE_RJ_FSTAT_FRACTION", "0.8")
+        raw_w = os.environ.get("GB_PE_RJ_WARM_FRACTION", "0")
+        p_f, p_w = float(raw_f), float(raw_w)
+        for name, raw, p in (("GB_PE_RJ_FSTAT_FRACTION", raw_f, p_f),
+                             ("GB_PE_RJ_WARM_FRACTION", raw_w, p_w)):
+            if not np.isfinite(p) or not (0.0 <= p <= 1.0):
+                raise ValueError(
+                    f"{name}={raw!r} must lie in [0, 1] (a per-PE-iteration "
+                    "draw probability).")
+        if p_f + p_w > 1.0 + 1e-12:
             raise ValueError(
-                f"GB_PE_RJ_FSTAT_FRACTION={raw!r} must lie in [0, 1] "
-                "(P(rj_fstat_pe) per PE iteration)."
-            )
-        return True, p
+                f"GB_PE_RJ_FSTAT_FRACTION={raw_f!r} + GB_PE_RJ_WARM_FRACTION="
+                f"{raw_w!r} exceed 1; rj_prior_pe takes the remainder.")
+        return True, {"rj_fstat_pe": p_f, "rj_prior_pe": 1.0 - p_f - p_w,
+                      "rj_warm_pe": p_w}
 
     def _pe_rj_draw_one_plan(self, model):
         """Sub-move sequence for THIS propose under the PE-only exclusive
@@ -771,15 +783,29 @@ class GFCombineMove(CombineMove, GlobalFitMove):
         tilts the birth mix toward the F-stat grid, without changing what
         either move does when it runs.
         """
-        enabled, p_fstat = self._pe_rj_draw_one_config()
+        enabled, probs = self._pe_rj_draw_one_config()
         if not enabled or getattr(self, "gf_stage_kind", None) != "pe":
             return None
         moves = [m[0] if isinstance(m, tuple) else m for m in self.moves]
         names = [getattr(m, "gf_move_name", type(m).__name__) for m in moves]
-        members = self._PE_RJ_DRAW_ONE_MEMBERS
-        if not all(n in names for n in members):
+        # the fstat/prior pair is required (as before). rj_warm_pe joins the
+        # draw only when it is given probability mass (GB_PE_RJ_WARM_FRACTION
+        # > 0) AND the stage carries it; at 0 it stays outside the draw and
+        # runs every iteration in its fixed slot exactly as before. A warm
+        # fraction set on a stage without rj_warm_pe is redistributed over
+        # the pair in their configured proportion.
+        if not all(n in names for n in self._PE_RJ_DRAW_ONE_MEMBERS[:2]):
             return None
-        pick = members[0] if float(model.random.uniform()) < p_fstat else members[1]
+        members = tuple(
+            n for n in self._PE_RJ_DRAW_ONE_MEMBERS
+            if n in names and (n != "rj_warm_pe" or probs.get(n, 0.0) > 0.0))
+        weights = np.array([probs[n] for n in members], dtype=float)
+        if weights.sum() <= 0:
+            weights = np.ones(len(members))
+        weights = weights / weights.sum()
+        u = float(model.random.uniform())
+        pick = members[int(min(np.searchsorted(np.cumsum(weights), u, side="right"),
+                               len(members) - 1))]
         plan = []
         placed = False
         for m, n in zip(moves, names):
@@ -792,11 +818,11 @@ class GFCombineMove(CombineMove, GlobalFitMove):
         stage = getattr(self, "gf_stage_name", "?")
         if not getattr(self, "_pe_rj_draw_one_announced", False):
             logger.info(
-                "[GB_PE_RJ_DRAW_ONE] stage=%s: ONE of %s per iteration, "
-                "P(rj_fstat_pe)=%.2f P(rj_prior_pe)=%.2f, drawn from the sampler "
-                "RNG; the other %d wrapped move(s) run once per iteration in "
-                "fixed order [GB_PE_RJ_DRAW_ONE=1]",
-                stage, "/".join(members), p_fstat, 1.0 - p_fstat,
+                "[GB_PE_RJ_DRAW_ONE] stage=%s: ONE of %s per iteration, %s, drawn "
+                "from the sampler RNG; the other %d wrapped move(s) run once per "
+                "iteration in fixed order [GB_PE_RJ_DRAW_ONE=1]",
+                stage, "/".join(members),
+                " ".join(f"P({n})={w:.2f}" for n, w in zip(members, weights)),
                 len(plan) - 1,
             )
             self._pe_rj_draw_one_announced = True

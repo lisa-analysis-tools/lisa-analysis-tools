@@ -1850,7 +1850,11 @@ export GB_SEARCH_NOISE_ITERS_PER_STEP=100
 export MAXLOGL_TOL=20
 # PE-only exclusive RJ draw (b9aae51f).
 export GB_PE_RJ_DRAW_ONE=1
-export GB_PE_RJ_FSTAT_FRACTION=0.5
+# ONE of rj_fstat_pe / rj_prior_pe / rj_warm_pe per PE iteration (user ruling
+# 2026-10-02: "put the warm proposal in with the other two rj moves. Draw them
+# at 0.45 prior, 0.45 fstat, 0.1 warm start"); prior takes the remainder.
+export GB_PE_RJ_FSTAT_FRACTION=0.45
+export GB_PE_RJ_WARM_FRACTION=0.1
 # Per-block EXACT info matrices through the sig-het fast route
 # (~2.4 ms/src vs ~29-46 chunked). The data_index misindex is FIXED and
 # multi-GPU slots now route by the BUFFER's slot shards. First
@@ -3429,6 +3433,11 @@ export GALFOR_RATCHET_CYCLES=${GALFOR_RATCHET_CYCLES:-2}
 export GALFOR_RATCHET_DLOG10_AMP=${GALFOR_RATCHET_DLOG10_AMP:--0.05}
 export GALFOR_RATCHET_DLOG10_FK=${GALFOR_RATCHET_DLOG10_FK:--0.10}
 export GALFOR_RATCHET_DLOG10_F2=${GALFOR_RATCHET_DLOG10_F2:--0.15}
+# The gain rule (GALFOR_RATCHET_MIN_GAIN) may not stop the ratchet before this
+# many nudges have run in the process (user ruling 2026-10-02: "I generally
+# want it to do minimum 2 nudges total"). Counted per process: a relaunch
+# starts the count again. 0 = no floor.
+export GALFOR_RATCHET_MIN_NUDGES=${GALFOR_RATCHET_MIN_NUDGES:-2}
 # ---- search LEGS (user design 2026-09-30) ----------------------------------
 # GB_SEARCH_LEGS=1: the numbered search stages store one row per LEG of the
 # cycle -- after in_model, after in_model_fstat, after in_model_removal --
@@ -3439,6 +3448,14 @@ export GALFOR_RATCHET_DLOG10_F2=${GALFOR_RATCHET_DLOG10_F2:--0.15}
 # row per leg the mid-iteration checkpoint only guards part of one leg;
 # MIDIT_CHECKPOINT=0 is reasonable for a legged search. Off = today.
 export GB_SEARCH_LEGS=${GB_SEARCH_LEGS:-0}
+# While the ratchet is active the per-(walker, band) RJ shutoff valve leaves
+# every band below this frequency OPEN (reopening shut pairs with a fresh
+# streak) and shuts converged bands above it as usual; lifted at the
+# ratchet's stop so the stage can end on the full valve (user design
+# 2026-10-02: "maybe don't do RJ shutoff during the ratchet cycles ... you
+# can shut off bands above 7 mHz if their likelihoods converge as usual").
+# 0 = the valve acts at every frequency throughout.
+export GALFOR_RATCHET_SHUTOFF_MIN_FREQ=${GALFOR_RATCHET_SHUTOFF_MIN_FREQ:-7e-3}
 echo "[GALFOR-RATCHET] GALFOR_RATCHET=${GALFOR_RATCHET} hold=${GALFOR_RATCHET_HOLD} release=${GALFOR_RATCHET_RELEASE} cycles=${GALFOR_RATCHET_CYCLES} dlog10 amp/fk/f2=${GALFOR_RATCHET_DLOG10_AMP}/${GALFOR_RATCHET_DLOG10_FK}/${GALFOR_RATCHET_DLOG10_F2} (0 = off: rider + 4 interleaved noise slots as before)"
 # High-f barren-band birth shutoff (search scope): bands above FMIN with
 # AFTER consecutive zero-birth-accept proposes stop proposing births
@@ -3562,7 +3579,11 @@ export GB_FSTAT_REFIT_EVERY=2      # SEARCH stages: every 2nd iteration
 # (gb_search) the two coincide exactly, so 40 above is unchanged in meaning;
 # in full_pe the old clock ticked ~1/N as fast and the knob silently meant N
 # times more iterations than it said.
-export GB_FSTAT_REFIT_EVERY_PE=250
+# refit the F-stat birth grid every 50 PE ITERATIONS (the clock counts
+# iterations; the decision runs when rj_fstat_pe proposes, so the actual
+# spacing is the first rj_fstat_pe draw at or after 50) -- user ruling
+# 2026-10-02: "during PE fstat should refit every 50 iterations" (was 250).
+export GB_FSTAT_REFIT_EVERY_PE=50
 export FSTAT_PEAKS_PER_BAND=200    # per-sub-band peak cap (code default; explicit)
 # STAGE-B STACK CHUNKING -- fixes the 2026-09-21 epoch-9 OOM.
 # StackedFStatProposal4D.__init__ corner-averages the ENTIRE K-box 4-D grid
@@ -4457,6 +4478,16 @@ export EMRI_NUM_PROP_REPEATS=2
 # 605 ms group launch: the in-code reference for this configuration is
 # 2.78 ms/row (sobbhspecialmove.py, job-373 note), ~58x away.
 export SOBBH_NUM_PROP_REPEATS=${SOBBH_NUM_PROP_REPEATS:-10}
+# full_pe ONLY (user ruling 2026-10-02: "in-model repeats of 25 for all
+# sources except emris for right now for PE. This includes VGBs and GBs
+# ... that way we have a general 'thinning' factor of 25"): the PE stage
+# declares the in-model repeat count for the listed branches on entry, on
+# the built moves it shares with the search stages, so the search stages
+# keep SOBBH 10 / MBH 2 / VGB 1 / GB 25 / PSD 10 / GALFOR 10 from the knobs
+# above. EMRI stays at its own knob. Unset PE_INMODEL_REPEATS = every move
+# as built.
+export PE_INMODEL_REPEATS=${PE_INMODEL_REPEATS:-25}
+export PE_INMODEL_REPEATS_BRANCHES=${PE_INMODEL_REPEATS_BRANCHES:-gb,vgb,sobbh,mbh,psd,galfor}
 export MBH_PERMUTE_EVERY=10
 export EMRI_PERMUTE_EVERY=10
 export SOBBH_PERMUTE_EVERY=10
@@ -4852,6 +4883,109 @@ print(f"[EMRI-PREFLIGHT] emri_pe scoring=direct batch<={cfg['emri_batch_max_size
       f"response={cfg['emri_direct_response']} lookup={os.environ['EMRI_DIRECT_LOOKUP']} "
       f"traj_workers={cfg['emri_traj_workers']} "
       f"table={table_path} (Nf 1440, dt 2.5) edge_crop={crop}>={edge}")
+PYEOF
+
+# ============================================================================
+# SOBBH LOOKUP SCORING (2026-10-02). SOBBH_LIKELIHOOD=lookup scores and fills
+# the SOBBH add/remove proposals (the existing SOBBHChunkedLikeMove; the comp
+# is a drop-in) with the direct-to-WDM n_ref lookup template
+# (docs/sobbh-wdm-lookup.md): one batched TDI-on-the-fly response per call on
+# a SPARSE 12-h grid splined to the pixel centres, the table evaluated at 5
+# layers per pixel. Cluster, one H100, production grid: 0.11 s per 8-row call
+# vs 1.70 s for the chunked comp (15x), 0.39 s at 288 rows (9.6x); accuracy
+# vs the dense transform mismatch 1e-7..1e-6, dlogL 1e-5..1e-3 (laptop gate).
+# To run it:
+#     SOBBH_LIKELIHOOD=lookup NGPUS=4 ./submit_gf_6mo_v9_4gpu.sh
+# SINGLE-DEVICE: the lookup comp lives on one GPU; the walker-block layout
+# (GPUS_PER_RANK unset = one device per compute rank) is fine, GPUS_PER_RANK>1
+# is refused (per-device replicas are a follow-up).
+# LOOKUP TABLE: SOBBH_LOOKUP_TABLE_PATH points to a specific table (any (Nf, dt)
+# with this run's 3600-s layer duration); unset (default) it is the canonical
+# file in this run's folder -- the SAME file EMRI_LIKELIHOOD=direct uses,
+#     ${STORE_DIR}/wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5
+# found there or built and saved there by the preflight below on this node's
+# GPU before mpiexec (lisatools.wdm_lookup_store), so a restart never rebuilds.
+# SOBBH_M_BAND_HALF_WIDTH / SOBBH_FILL_M_BAND_HALF_WIDTH are ignored by it.
+# RESUME-SAFE: no stored shape changes.
+# WATCH: "[SOBBH_LOOKUP] lookup table ... (found|built|waited|explicit)" at
+# build, and the [SOBBH_LL_TIMING] leaf windows (ms/call should be ~100-400).
+export SOBBH_LIKELIHOOD=${SOBBH_LIKELIHOOD:-chunked}
+export SOBBH_LOOKUP_TABLE_PATH=${SOBBH_LOOKUP_TABLE_PATH:-}
+export SOBBH_LOOKUP_EVAL_DT=${SOBBH_LOOKUP_EVAL_DT:-43200}
+export SOBBH_LOOKUP_ROW_BATCH=${SOBBH_LOOKUP_ROW_BATCH:-32}
+#
+# SOBBH PREFLIGHT. An unknown env var is SILENTLY IGNORED, so resolve the knobs
+# through the real settings class; for lookup, refuse a lisatools without the
+# lookup comp, refuse GPUS_PER_RANK>1, and find -- or build and save -- the
+# lookup table (above). Refuses before mpiexec on any gap.
+python - <<'PYEOF' || exit 2
+import os
+import sys
+
+try:
+    from lisatools.globalfit.stock.erebor.source_runtime import (
+        SOBBH_FAST_LIKELIHOODS, SourceSOBBHSettings, resolve_sobbh_lookup_table)
+except ImportError as exc:
+    if os.environ["SOBBH_LIKELIHOOD"] != "lookup":
+        print(f"[SOBBH-PREFLIGHT] sobbh scoring={os.environ['SOBBH_LIKELIHOOD']} (the "
+              "installed lisatools predates the lookup comp; not requested).")
+        sys.exit(0)
+    print("[SOBBH-PREFLIGHT] REFUSING: the installed lisatools has no SOBBH lookup "
+          f"likelihood ({exc}). SOBBH_LIKELIHOOD=lookup would be SILENTLY IGNORED. Pull dev "
+          "at/after the SOBBH lookup merge, or launch with SOBBH_LIKELIHOOD=chunked.")
+    sys.exit(2)
+sobbh = SourceSOBBHSettings()
+want = (os.environ["SOBBH_LIKELIHOOD"], os.environ["SOBBH_LOOKUP_TABLE_PATH"],
+        float(os.environ["SOBBH_LOOKUP_EVAL_DT"]), int(os.environ["SOBBH_LOOKUP_ROW_BATCH"]))
+got = (sobbh.likelihood, sobbh.lookup_table_path, float(sobbh.lookup_eval_dt),
+       int(sobbh.lookup_row_batch))
+if got != want:
+    print("[SOBBH-PREFLIGHT] REFUSING: exported (likelihood, table, eval_dt, row_batch) = "
+          f"{want} but the settings resolve {got}.")
+    sys.exit(2)
+if sobbh.likelihood != "lookup":
+    print(f"[SOBBH-PREFLIGHT] sobbh scoring={sobbh.likelihood}.")
+    sys.exit(0)
+if "lookup" not in SOBBH_FAST_LIKELIHOODS:
+    print(f"[SOBBH-PREFLIGHT] REFUSING: SOBBH_FAST_LIKELIHOODS={SOBBH_FAST_LIKELIHOODS}: the "
+          "installed lisatools has no lookup comp.")
+    sys.exit(2)
+gpr = os.environ.get("GPUS_PER_RANK", "")
+if gpr and int(gpr) > 1:
+    print(f"[SOBBH-PREFLIGHT] REFUSING: SOBBH_LIKELIHOOD=lookup is single-device and "
+          f"GPUS_PER_RANK={gpr} > 1 (the stock getter refuses it at build). Launch with "
+          "GPUS_PER_RANK unset (one device per compute rank) or SOBBH_LIKELIHOOD=chunked.")
+    sys.exit(2)
+import time
+from types import SimpleNamespace
+
+import lisatools
+from lisatools.domains import WDMLookupTable
+
+try:  # build on this node's GPU when there is one (has_backend("gpu") raises without)
+    lisatools.get_backend("gpu")
+    table_backend = "gpu"
+except Exception:
+    table_backend = "cpu"
+# this run's grid: Nf 1440 x Nt 4320 at dt 2.5 s, layer 3600 s (the resolver reads only
+# these three; the file is the same canonical table EMRI direct uses)
+gi = SimpleNamespace(domain_settings=SimpleNamespace(Nf=1440, data_dt=2.5, layer_dt=3600.0),
+                     file_store_dir=os.environ["FILE_STORE_DIR"], force_backend=table_backend)
+t_table = time.time()
+try:
+    path, status = resolve_sobbh_lookup_table(
+        gi, {"sobbh_lookup_table_path": sobbh.lookup_table_path}, force_backend=table_backend)
+    layer = float(WDMLookupTable.from_file(path, force_backend="cpu").layer_dt)
+except (ValueError, OSError, TimeoutError) as exc:
+    print(f"[SOBBH-PREFLIGHT] REFUSING: lookup table: {exc}")
+    sys.exit(2)
+if abs(layer - 3600.0) > 1e-6:
+    print(f"[SOBBH-PREFLIGHT] REFUSING: lookup table {path} has layer duration {layer:g} s; "
+          "this run's is 3600 s.")
+    sys.exit(2)
+print(f"[SOBBH-PREFLIGHT] sobbh scoring=lookup eval_dt={sobbh.lookup_eval_dt:g} "
+      f"row_batch={sobbh.lookup_row_batch} table={path} ({status}, "
+      f"{time.time() - t_table:.0f} s)")
 PYEOF
 
 # ============================================================================

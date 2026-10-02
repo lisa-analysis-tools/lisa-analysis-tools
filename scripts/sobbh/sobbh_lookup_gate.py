@@ -55,7 +55,13 @@ def main():
     )
     ap.add_argument("--nt", type=int, default=1024)
     ap.add_argument("--rows", type=int, default=8)
-    ap.add_argument("--eval-dt", type=float, default=600.0)
+    ap.add_argument("--eval-dt", type=float, default=43200.0)
+    ap.add_argument(
+        "--buffer-time",
+        type=float,
+        default=5000.0,
+        help="node-grid padding [s]; must exceed 2 * eval_dt (production 5000)",
+    )
     ap.add_argument("--out", default="sobbh_lookup_gate.jsonl")
     ap.add_argument("--no-chunked", action="store_true")
     args = ap.parse_args()
@@ -85,7 +91,7 @@ def main():
         tdi_config=tdi,
         tdi_type="XYZ",
         n_grid=2048,
-        buffer_time=5000.0,
+        buffer_time=args.buffer_time,
         eval_dt=args.eval_dt,
         num_m_layers=2,
         interp="cubic",
@@ -230,7 +236,10 @@ def main():
     print("timing:", json.dumps(timing, indent=1))
     with open(args.out, "a") as fp:
         for row in rows_out:
-            fp.write(json.dumps(dict(nt=nt, eval_dt=args.eval_dt, **row)) + "\n")
+            fp.write(
+                json.dumps(dict(nt=nt, eval_dt=args.eval_dt, buffer_time=args.buffer_time, **row))
+                + "\n"
+            )
         fp.write(json.dumps(dict(timing=timing, tag=tag)) + "\n")
 
 

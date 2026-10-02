@@ -76,7 +76,7 @@ class LookupSettingsTest(unittest.TestCase):
         self.assertEqual(s.likelihood, "lookup")
         self.assertEqual(s.lookup_table_path, "")
         self.assertEqual(s.lookup_num_m_layers, 2)
-        self.assertEqual(s.lookup_eval_dt, 600.0)
+        self.assertEqual(s.lookup_eval_dt, 43200.0)  # 12 h: one response point per 12 pixels
         self.assertEqual(s.lookup_interp, "cubic")
         self.assertEqual(s.lookup_row_batch, 32)
         env = {
@@ -156,14 +156,15 @@ class LookupCompBuildTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def test_missing_table_raises_with_builder_hint(self):
+    def test_no_path_and_no_run_folder_raises(self):
         from lisatools.globalfit.stock.erebor import source_runtime as sr
 
+        gi = _general_info(self.wdm)  # no file_store_dir: nowhere to keep a built table
         with self.assertRaises(ValueError) as cm:
-            sr.get_sobbh_lookup_comp(_general_info(self.wdm), _cfg(""))
+            sr.get_sobbh_lookup_comp(gi, _cfg(""))
         msg = str(cm.exception)
         self.assertIn("SOBBH_LOOKUP_TABLE_PATH", msg)
-        self.assertIn("build_wdm_lookup_gpu", msg)
+        self.assertIn("file_store_dir", msg)
 
     def test_builds_lookup_comp_and_caches_it(self):
         from lisatools.globalfit.stock.erebor import source_runtime as sr
@@ -192,6 +193,122 @@ class LookupCompBuildTest(unittest.TestCase):
         self.assertEqual(sr.SOBBH_FAST_LIKELIHOODS, ("chunked", "lookup"))
         with self.assertRaises(ValueError):
             sr.get_sobbh_fast_comp(_general_info(self.wdm), _cfg(self.path, likelihood="full"))
+
+
+class LookupTableResolutionTest(unittest.TestCase):
+    """The table during a run, the EMRI way: SOBBH_LOOKUP_TABLE_PATH when set (any sampling
+    with the run's layer duration), else the run folder's canonical n_ref table (the EMRI recipe,
+    one file shared with EMRI_LIKELIHOOD=direct), built and saved there when missing."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.wdm, cls.table = build_tiny_table(cls.tmp.name)  # Nf=64, dt=56.25: layer 3600 s
+        cls.path = cls.table.store_path
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def _run_folder(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        return d.name
+
+    def _canonical(self, folder):
+        from lisatools.wdm_lookup_store import lookup_table_name
+
+        return os.path.join(folder, lookup_table_name(int(self.wdm.Nf), float(self.wdm.data_dt)))
+
+    def _stub_build(self):
+        """A build that copies the tiny table into place (the store's own tests cover the real
+        build); records every call."""
+        import shutil
+
+        calls = []
+
+        def build(path, *, Nf, dt, force_backend="cpu", recipe=None, verbose=False):
+            calls.append((path, int(Nf), float(dt)))
+            shutil.copyfile(self.path, path)
+            return path
+
+        return calls, build
+
+    def test_run_folder_canonical_table_is_found(self):
+        import shutil
+
+        from lisatools.globalfit.stock.erebor import source_runtime as sr
+        from lisatools.sources.sobbh.wdm_direct import SOBBHLookupComputations
+
+        folder = self._run_folder()
+        canonical = self._canonical(folder)
+        shutil.copyfile(self.path, canonical)
+        gi = _general_info(self.wdm)
+        gi.file_store_dir = folder
+        calls, build = self._stub_build()
+        with mock.patch("lisatools.wdm_lookup_store.build_lookup_table", build):
+            path, status = sr.resolve_sobbh_lookup_table(gi, _cfg(""))
+            comp = sr.get_sobbh_lookup_comp(gi, _cfg(""))
+        self.assertEqual((path, status), (canonical, "found"))
+        self.assertEqual(calls, [])
+        self.assertIsInstance(comp, SOBBHLookupComputations)
+
+    def test_missing_canonical_table_is_built_and_saved_in_the_run_folder(self):
+        from lisatools.globalfit.stock.erebor import source_runtime as sr
+
+        folder = self._run_folder()
+        canonical = self._canonical(folder)
+        gi = _general_info(self.wdm)
+        gi.file_store_dir = folder
+        calls, build = self._stub_build()
+        with mock.patch("lisatools.wdm_lookup_store.build_lookup_table", build):
+            path, status = sr.resolve_sobbh_lookup_table(gi, _cfg(""))
+            self.assertEqual((path, status), (canonical, "built"))
+            self.assertEqual(calls, [(canonical, int(self.wdm.Nf), float(self.wdm.data_dt))])
+            self.assertTrue(os.path.exists(canonical))
+            # a restart (another general_info) finds it: no second build
+            gi2 = _general_info(self.wdm)
+            gi2.file_store_dir = folder
+            self.assertEqual(sr.resolve_sobbh_lookup_table(gi2, _cfg("")), (canonical, "found"))
+            self.assertEqual(len(calls), 1)
+            sr.get_sobbh_lookup_comp(gi2, _cfg(""))
+
+    def test_explicit_path_wins_over_the_run_folder(self):
+        from lisatools.globalfit.stock.erebor import source_runtime as sr
+
+        folder = self._run_folder()
+        gi = _general_info(self.wdm)
+        gi.file_store_dir = folder
+        calls, build = self._stub_build()
+        with mock.patch("lisatools.wdm_lookup_store.build_lookup_table", build):
+            path, status = sr.resolve_sobbh_lookup_table(gi, _cfg(self.path))
+            comp = sr.get_sobbh_lookup_comp(gi, _cfg(self.path))
+        self.assertEqual((path, status), (os.path.abspath(self.path), "explicit"))
+        self.assertEqual(calls, [])
+        self.assertFalse(os.path.exists(self._canonical(folder)))
+        self.assertEqual(comp.direct.ev.layer_dt, float(self.wdm.layer_dt))
+
+    def test_explicit_path_must_exist(self):
+        from lisatools.globalfit.stock.erebor import source_runtime as sr
+
+        gi = _general_info(self.wdm)
+        with self.assertRaises(ValueError) as cm:
+            sr.resolve_sobbh_lookup_table(gi, _cfg(os.path.join(self.tmp.name, "nope.h5")))
+        self.assertIn("SOBBH_LOOKUP_TABLE_PATH", str(cm.exception))
+
+    def test_explicit_table_is_checked_against_the_run_layer_duration(self):
+        from lisatools.domains import WDMSettings
+        from lisatools.globalfit.stock.erebor import source_runtime as sr
+
+        # another sampling with the SAME layer duration (Nf * dt = 3600 s) is served
+        same_layer = WDMSettings(128, 64, 28.125, force_backend="cpu")
+        self.assertAlmostEqual(float(same_layer.layer_dt), float(self.wdm.layer_dt))
+        sr.get_sobbh_lookup_comp(_general_info(same_layer), _cfg(self.path))
+        # a different layer duration is refused, naming the mismatch
+        other_layer = WDMSettings(64, 128, 50.0, force_backend="cpu")
+        with self.assertRaises(ValueError) as cm:
+            sr.get_sobbh_lookup_comp(_general_info(other_layer), _cfg(self.path))
+        self.assertIn("layer", str(cm.exception))
 
 
 if __name__ == "__main__":
