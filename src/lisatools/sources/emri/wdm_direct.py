@@ -1020,7 +1020,10 @@ class EMRIDirectWDM:
                                     **few_kwargs)
             failed += [idx[k] for k in self.last_failed_rows]
             for k, v in self.last_stats.items():
-                tot[k] = tot.get(k, 0) + v if isinstance(v, (int, float)) else v
+                if k == "n_response":                         # a per-call grid length, not a count
+                    tot[k] = max(tot.get(k, 0), v)
+                else:
+                    tot[k] = tot.get(k, 0) + v if isinstance(v, (int, float)) else v
             if consume is not None:
                 consume(idx, arr)
                 del arr
