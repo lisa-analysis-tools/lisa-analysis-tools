@@ -181,6 +181,68 @@ class KernelParityTest(unittest.TestCase):
             self._comp("fused")
 
 
+class OrbitCoverageTest(unittest.TestCase):
+    """A pixel window that runs past the orbit tables (the mojito L1 bricks carry orbits for
+    ~449 days from the data start): the response exists only inside the tables, so pixels
+    outside are a ZERO template on both lookup paths (the C++ response zeroes them too), never
+    an extrapolated spline or an out-of-bounds error."""
+
+    @classmethod
+    def setUpClass(cls):
+        from lisatools.detector import EqualArmlengthOrbits
+
+        cls.tmp = tempfile.TemporaryDirectory()
+        _, cls.table = build_tiny_table(cls.tmp.name)
+        cls.orbits = EqualArmlengthOrbits(force_backend="cpu")
+        cls.t_end = float(cls.orbits.t_base[-1])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def _direct(self, kernel):
+        from lisatools.domains import WDMSettings
+        from lisatools.sources.sobbh.wdm_direct import SOBBHLookupComputations
+
+        # the window starts 4 days before the orbit tables end and lasts 10.7 days
+        t0 = self.t_end - 4 * 86400.0
+        wdm = WDMSettings(NF, NT, DT, t0=t0, min_freq=2e-3, max_freq=2e-2, force_backend="cpu")
+        comp = SOBBHLookupComputations(
+            wdm,
+            t0,
+            self.table,
+            orbits=self.orbits,
+            tdi_config="2nd generation",
+            tdi_type="XYZ",
+            n_grid=1024,
+            kernel=kernel,
+            force_backend="cpu",
+        )
+        return comp
+
+    def test_pixels_past_the_orbits_are_zero_on_both_paths(self):
+        nch = 3
+        bufs = {}
+        for kind in ("python",) + (("kernel",) if _kernel_available() else ()):
+            comp = self._direct(kind)
+            ws = comp.wdm_settings
+            buf = np.zeros(nch * int(ws.Nf_active) * int(ws.Nt_active))
+            comp.fill_global_wdm(ROWS[:2], buf, data_index=np.zeros(2, dtype=int))
+            bufs[kind] = buf.reshape(nch, int(ws.Nf_active), int(ws.Nt_active))
+        ref = bufs["python"]
+        t_pix = comp.direct.t_pixels
+        past = t_pix > self.t_end
+        self.assertTrue(past.any() and (~past).any())
+        self.assertGreater(np.abs(ref[..., ~past]).max(), 0.0)  # signal while the orbits last
+        self.assertEqual(np.abs(ref[..., past]).max(), 0.0)  # nothing past them
+        if "kernel" in bufs:
+            # atol 1e-11 of the peak: a few pixels sit 1e-2 below the peak with 1e-10 relative
+            # roundoff (summation order)
+            np.testing.assert_allclose(
+                bufs["kernel"], ref, rtol=1e-10, atol=1e-11 * np.abs(ref).max()
+            )
+
+
 @unittest.skipUnless(_kernel_available(), "the CPU backend module has no sobbh_lookup (rebuild)")
 class GPUKernelParityTest(unittest.TestCase):
     """The CUDA build of the fused kernel == its CPU build (same source, sobbh_lookup_kernel.cu;

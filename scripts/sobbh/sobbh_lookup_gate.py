@@ -21,8 +21,15 @@ import time
 
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _sobbh_testbox as tb  # noqa: E402
+
 NF, DT = 180, 20.0
-EDGE = 24
+#: the run box already crops EDGE_CROP_WAVELETS layers at each end (the dense transform's grid
+#: ends included), so no further trim inside it
+EDGE = 0
+#: the gate grid's Nyquist is 25 mHz (dt 20 s): its band stops just below it
+GATE_MAX_FREQ = 2.4e-2
 
 SOURCES = np.array(
     [
@@ -70,6 +77,15 @@ def main():
         default=5000.0,
         help="node-grid padding [s]; must exceed 2 * eval_dt (production 5000)",
     )
+    ap.add_argument(
+        "--edge", type=int, default=tb.EDGE_CROP_WAVELETS, help="layers cropped per end"
+    )
+    ap.add_argument(
+        "--foreground",
+        default="on",
+        choices=("on", "off"),
+        help="scirdv1 + the fitted tanh galactic foreground at the window's Tobs",
+    )
     ap.add_argument("--out", default="sobbh_lookup_gate.jsonl")
     ap.add_argument("--no-chunked", action="store_true")
     args = ap.parse_args()
@@ -89,7 +105,8 @@ def main():
     ref = float(t0)
     orbits = EqualArmlengthOrbits(force_backend="cpu")
     tdi = TDIConfig("2nd generation", force_backend="cpu")
-    wdm = WDMSettings(NF, nt, DT, t0=t0, min_freq=2e-3, max_freq=2.4e-2, force_backend="cpu")
+    wdm = tb.run_box(NF, nt, DT, t0, edge=args.edge, max_freq=GATE_MAX_FREQ, force_backend="cpu")
+    tobs = nt * NF * DT
     table = WDMLookupTable.from_file(args.table, force_backend="cpu")
     comp = SOBBHLookupComputations(
         wdm,
@@ -112,11 +129,12 @@ def main():
     lookup = "kernel" if comp.uses_kernel else "python"
     grid_t = np.arange(nobs) * DT + t0
     tds = TDSettings(nobs, DT, force_backend="cpu")
-    sens = XYZ2SensitivityMatrix(wdm, model="scirdv1")
+    sens, noise_label = tb.noise(wdm, tobs, args.foreground)
 
     print(
         f"grid Nf={NF} Nt={nt} dt={DT} layer_dt={wdm.layer_dt} s; table "
-        f"{os.path.basename(args.table)}; scoring lookup={lookup}"
+        f"{os.path.basename(args.table)}; scoring lookup={lookup}; box edge {args.edge}, noise "
+        f"{noise_label}"
     )
     tag = time.strftime("%Y-%m-%dT%H:%M:%S")
     rows_out = []
@@ -180,13 +198,13 @@ def main():
 
     days = nt * float(wdm.layer_dt) / 86400.0
     print(
-        f"[gate] Nt {nt} ({days:.0f} d) SNR per source (scirdv1 instrument noise, XYZ): "
+        f"[gate] Nt {nt} ({days:.0f} d) SNR per source ({noise_label}, XYZ): "
         + " ".join(f"{r['snr']:.3g}" for r in rows_out)
     )
 
     # ---- scoring timings: both comps, one residual, the same batch of rows --------------
     data = h_tof[0] + 0.5 * h_tof[1]
-    ac = AnalysisContainer(WDMSignal(data.copy(), wdm), XYZ2SensitivityMatrix(wdm, model="scirdv1"))
+    ac = AnalysisContainer(WDMSignal(data.copy(), wdm), tb.noise(wdm, tobs, args.foreground)[0])
     aca = AnalysisContainerArray([ac])
     batch = np.tile(SOURCES[0], (args.rows, 1))
     rng = np.random.default_rng(1)
@@ -267,6 +285,9 @@ def main():
                         buffer_time=args.buffer_time,
                         interp=args.interp,
                         lookup=lookup,
+                        edge=args.edge,
+                        foreground=args.foreground,
+                        noise=noise_label,
                         **row,
                     )
                 )

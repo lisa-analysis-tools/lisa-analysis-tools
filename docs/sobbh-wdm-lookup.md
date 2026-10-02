@@ -561,6 +561,25 @@ With the kernel the speed table's `look` column is the fused kernel and `trac` /
 the `[gate]` line must agree between `lookup=kernel` and `lookup=python` (same semantics; on the
 laptop smoke both gave 1.178e-05).
 
+### Aligned test setup + mojito bricks (2026-10-02, evening)
+
+The three steps share `scripts/sobbh/_sobbh_testbox.py` with the EMRI / MBH setups: DAYS 180 360
+720; the run box 0.25-25 mHz with EDGE_CROP_WAVELETS = 60 layers cropped per end; every SNR and
+score against scirdv1 + the fitted tanh galactic foreground at the window's Tobs
+(`FOREGROUND=off`: instrument only). `sobbh_speed_durations.sh` gained step 3,
+`scripts/sobbh/sobbh_lookup_mojito.py` (MOJITO=auto): every SOBHB source with an L1 brick, the
+catalogue row through the stock mapping, the brick's L1Orbits (ICRS), MOJITO_REFERENCE_TIME,
+the window from brick start + 5e4 s; the lookup and the production template scored against the
+brick (snr, data_snr, mm, logL, snr_ratio, snr_det, mm_vs_production). Laptop, bricks 0 and 1,
+8-16 d with the foreground: production vs mojito mm 5e-12..2e-8, lookup vs production
+1e-7..3.3e-6 (the harness without the edge crop had read ~0.1: the window edges).
+
+Fixed on the way: the response coverage came from `orbits.t_base`, which for mojito L1Orbits
+ends at REF + 449 d although the configured sc / ltt tables run to REF + 730.5 d (24-month
+windows would have lost everything after day 449); it is now the configured span
+(`SOBBHBatchedTOF.orbit_span`), and pixels outside the response coverage are a zero template on
+both lookup paths (`SOBBHDirectWDM.covered_pixels`; `OrbitCoverageTest`).
+
 ### The table during a global-fit run (2026-10-02, the EMRI way)
 
 `SOBBH_LOOKUP_TABLE_PATH` is now OPTIONAL. `resolve_sobbh_lookup_table(general_info, cfg)`
