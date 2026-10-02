@@ -284,6 +284,23 @@ void response_part(nb::module_ &m) {
     .def_rw("phase_spline", &TDSplineTDIWaveformWrap::phase_spline)
     ;
 
+    // TDDenseTDIWaveformWrap (template-batched, exact dense-output phases)
+#if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
+    nb::class_<TDDenseTDIWaveformWrap>(m, "TDDenseTDIWaveformWrapGPU")
+#else
+    nb::class_<TDDenseTDIWaveformWrap>(m, "TDDenseTDIWaveformWrapCPU")
+#endif
+    .def(nb::init<OrbitsWrap *, TDIConfigWrap *, int, int, int, double, array_type<int>, array_type<int>,
+                  array_type<int>, array_type<double>, array_type<double>, array_type<double>, array_type<double>>(),
+         nb::arg("orbits"), nb::arg("tdi_config"), nb::arg("n_temp"), nb::arg("K"), nb::arg("num_sub"),
+         nb::arg("amp_factor"), nb::arg("sub_temp"), nb::arg("sub_mkn"), nb::arg("n_knots"), nb::arg("t_knots"),
+         nb::arg("phase_coeffs"), nb::arg("amp_re"), nb::arg("amp_im"))
+    .def("run_wave_tdi_wrap", &TDDenseTDIWaveformWrap::run_wave_tdi_wrap, "Template-batched TDI with dense-output phases.")
+    .def("get_buffer_size", &TDDenseTDIWaveformWrap::get_buffer_size, "Get needed buffer size.")
+    .def_rw("orbits", &TDDenseTDIWaveformWrap::orbits)
+    .def_rw("tdi_config", &TDDenseTDIWaveformWrap::tdi_config)
+    ;
+
 #if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
     nb::class_<TDSplineTDIWaveform>(m, "TDSplineTDIWaveformGPU")
 #else

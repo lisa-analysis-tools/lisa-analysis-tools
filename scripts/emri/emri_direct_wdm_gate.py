@@ -24,7 +24,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import emri_tof_xyz_threeway as W  # noqa: E402  (orbits/params loading, REF)
 
-NF, DT, NT = 180, 20.0, 1024
+DT = float(os.environ.get("GATE_DT", "20"))   # 20 s aliases the high harmonics near plunge: use 5 s for those
+NF, NT = int(round(3600.0 / DT)), 1024
 START_OFFSET_S = 5e4
 
 
@@ -89,7 +90,7 @@ def main():
         WD.WDM_HALF_SUPPORT_LAYERS = 0.0          # curvature never trips
     fdot_save = None
     direct = WD.EMRIDirectWDM(gen, table, wdm, orbits=orb, tdi_config=tdi, t_start=REF, data_t0=data_t0,
-                              mode_batch=16)
+                              mode_batch=16, response=os.environ.get("GATE_RESPONSE", "spline"))
     if args.no_handoff:
         fdot_save, direct.fdot_axis_max = direct.fdot_axis_max, np.inf
     t0 = time.perf_counter()
