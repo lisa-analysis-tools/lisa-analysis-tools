@@ -206,8 +206,8 @@ void XYZSensitivityMatrixWrap::psd_likelihood_wrap(
         reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(data, "data", num_psds * 3 * total_tf_pairs, 1)),
         return_pointer_and_check_length(data_index_all,     "data_index_all",     num_psds,                  1),
         return_pointer_and_check_length(time_index_all,     "time_index_all",     num_times,                 1),
-        return_pointer_and_check_length(Soms_d_in_all,      "Soms_d_in_all",      num_psds,                  1),
-        return_pointer_and_check_length(Sa_a_in_all,        "Sa_a_in_all",        num_psds,                  1),
+        return_pointer_and_check_length(Soms_d_in_all,      "Soms_d_in_all",      num_psds * sensitivity_matrix->n_noise_par, 1),
+        return_pointer_and_check_length(Sa_a_in_all,        "Sa_a_in_all",        num_psds * sensitivity_matrix->n_noise_par, 1),
         return_pointer_and_check_length(Amp_all,            "Amp_all",            num_psds,                  1),
         return_pointer_and_check_length(alpha_all,          "alpha_all",          num_psds,                  1),
         return_pointer_and_check_length(f_1_all,            "f_1_all",            num_psds,                  1),
@@ -240,8 +240,8 @@ void XYZSensitivityMatrixWrap::get_noise_covariance_wrap(
     sensitivity_matrix->get_noise_covariance_arr(
         return_pointer_and_check_length(freqs,        "freqs",        num_freqs, 1),
         return_pointer_and_check_length(time_indices, "time_indices", num_times, 1),
-        return_pointer_and_check_length(Soms_d_in_all, "Soms_d_in_all", num_psds, 1),
-        return_pointer_and_check_length(Sa_a_in_all,   "Sa_a_in_all",   num_psds, 1),
+        return_pointer_and_check_length(Soms_d_in_all, "Soms_d_in_all", num_psds * sensitivity_matrix->n_noise_par, 1),
+        return_pointer_and_check_length(Sa_a_in_all,   "Sa_a_in_all",   num_psds * sensitivity_matrix->n_noise_par, 1),
         return_pointer_and_check_length(Amp_all,       "Amp_all",       num_psds, 1),
         return_pointer_and_check_length(alpha_all,     "alpha_all",     num_psds, 1),
         return_pointer_and_check_length(f_1_all,       "f_1_all",       num_psds, 1),
@@ -282,6 +282,28 @@ void XYZSensitivityMatrixWrap::set_averaged_tfs_wrap(
 }
 
 void XYZSensitivityMatrixWrap::disable_averaged_tfs_wrap() { sensitivity_matrix->disable_averaged_tfs(); }
+
+void XYZSensitivityMatrixWrap::get_noise_tfs_mosa_wrap(
+    array_type<double> freqs, array_type<double> mosa_auto,
+    array_type<std::complex<double>> mosa_cross,
+    int num_freqs, int num_times, array_type<int> time_indices)
+{
+    sensitivity_matrix->get_noise_tfs_mosa_arr(
+        return_pointer_and_check_length(freqs, "freqs", num_freqs, 1),
+        return_pointer_and_check_length(mosa_auto, "mosa_auto", 24 * num_freqs * num_times, 1),
+        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(mosa_cross, "mosa_cross", 12 * num_freqs * num_times, 1)),
+        num_freqs, num_times,
+        return_pointer_and_check_length(time_indices, "time_indices", num_times, 1));
+}
+
+void XYZSensitivityMatrixWrap::set_averaged_mosa_tfs_wrap(
+    array_type<double> mosa_auto, array_type<std::complex<double>> mosa_cross, int nf)
+{
+    sensitivity_matrix->set_averaged_mosa_tfs(
+        return_pointer_and_check_length(mosa_auto, "mosa_auto_avg", 24 * nf, 1),
+        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(mosa_cross, "mosa_cross_avg", 12 * nf, 1)),
+        nf);
+}
 
 void XYZSensitivityMatrixWrap::get_inverse_det_wrap(
     array_type<double> c00_arr, array_type<std::complex<double>> c01_arr, array_type<std::complex<double>> c02_arr,
@@ -595,6 +617,18 @@ void detector_part(nb::module_ &m) {
          "Compute noise covariance matrices for num_psds noise-parameter sets.")
     .def("set_averaged_tfs_wrap",     &XYZSensitivityMatrixWrap::set_averaged_tfs_wrap, "Attach FD time-averaged transfer functions.")
     .def("disable_averaged_tfs_wrap", &XYZSensitivityMatrixWrap::disable_averaged_tfs_wrap, "Detach FD time-averaged transfer functions.")
+    .def("set_noise_symmetry_wrap", &XYZSensitivityMatrixWrap::set_noise_symmetry_wrap, nb::arg("asymmetric"),
+         "False: one OMS and one TM amplitude for all MOSAs. True: one amplitude per MOSA\n"
+         "(links 12, 23, 31, 13, 32, 21); noise-amplitude arrays become (num_psds, 6).")
+    .def_prop_ro("n_noise_par", &XYZSensitivityMatrixWrap::get_n_noise_par)
+    .def("get_noise_tfs_mosa_wrap", &XYZSensitivityMatrixWrap::get_noise_tfs_mosa_wrap,
+         nb::arg("freqs"), nb::arg("mosa_auto"), nb::arg("mosa_cross"),
+         nb::arg("num_freqs"), nb::arg("num_times"), nb::arg("time_indices"),
+         nb::call_guard<nb::gil_scoped_release>(),
+         "Per-MOSA basis TFs: mosa_auto (num_times, 24, num_freqs), mosa_cross (num_times, 12, num_freqs).")
+    .def("set_averaged_mosa_tfs_wrap", &XYZSensitivityMatrixWrap::set_averaged_mosa_tfs_wrap,
+         nb::arg("mosa_auto"), nb::arg("mosa_cross"), nb::arg("nf"),
+         "Attach FD time-averaged per-MOSA TFs, layouts (24, nf) and (12, nf).")
     .def("get_inverse_det_wrap",      &XYZSensitivityMatrixWrap::get_inverse_det_wrap,
          nb::call_guard<nb::gil_scoped_release>(), "Batch invert 3x3 Hermitian matrices and compute determinants.")
     .def_rw("sensitivity_matrix", &XYZSensitivityMatrixWrap::sensitivity_matrix)

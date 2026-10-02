@@ -333,6 +333,16 @@ public:
         array_type<double> tm_yy,  array_type<std::complex<double>> tm_yz,  array_type<double> tm_zz, int nf);
     void disable_averaged_tfs_wrap();
 
+    // unequal (per-MOSA) noise amplitudes
+    void set_noise_symmetry_wrap(bool asymmetric) { sensitivity_matrix->set_noise_symmetry(asymmetric); }
+    int get_n_noise_par() const { return sensitivity_matrix->n_noise_par; }
+    void get_noise_tfs_mosa_wrap(
+        array_type<double> freqs, array_type<double> mosa_auto,
+        array_type<std::complex<double>> mosa_cross,
+        int num_freqs, int num_times, array_type<int> time_indices);
+    void set_averaged_mosa_tfs_wrap(
+        array_type<double> mosa_auto, array_type<std::complex<double>> mosa_cross, int nf);
+
     void get_inverse_det_wrap(
         array_type<double> c00_arr, array_type<std::complex<double>> c01_arr, array_type<std::complex<double>> c02_arr,
         array_type<double> c11_arr, array_type<std::complex<double>> c12_arr, array_type<double> c22_arr,
