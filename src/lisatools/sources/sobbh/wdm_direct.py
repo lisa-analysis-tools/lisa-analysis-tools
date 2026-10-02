@@ -189,15 +189,26 @@ class SOBBHBatchedTOF:
         self.last_spans = {}
 
     def orbit_span(self):
-        """Absolute times ``(t_lo, t_hi)`` the orbit tables cover (``orbits.t_base``), or
-        ``(-inf, inf)`` for orbits without a base grid."""
+        """Absolute times ``(t_lo, t_hi)`` the response can be evaluated on: the overlap of the
+        CONFIGURED spacecraft and light-travel-time tables the C++ response reads
+        (``orbits.pycppdetector_args[:6]``; it zeroes any time outside either). NOT
+        ``orbits.t_base``: for mojito ``L1Orbits`` the base array runs 0 .. 1.365e8 s while the
+        tables cover the brick (REF + 0.01 .. REF + 730.5 d). Orbits without the tables fall back
+        to ``t_base``, else ``(-inf, inf)``."""
         if self._orbit_span_cache is None:
+            args = getattr(self.orbits, "pycppdetector_args", None)
             t_base = getattr(self.orbits, "t_base", None)
-            if t_base is None:
-                self._orbit_span_cache = (-np.inf, np.inf)
-            else:
+            if args is not None:
+                sc_t0, sc_dt, sc_N, ltt_t0, ltt_dt, ltt_N = (float(v) for v in tuple(args)[:6])
+                self._orbit_span_cache = (
+                    max(sc_t0, ltt_t0),
+                    min(sc_t0 + (sc_N - 1) * sc_dt, ltt_t0 + (ltt_N - 1) * ltt_dt),
+                )
+            elif t_base is not None:
                 t_base = np.asarray(t_base, dtype=float)
                 self._orbit_span_cache = (float(t_base[0]), float(t_base[-1]))
+            else:
+                self._orbit_span_cache = (-np.inf, np.inf)
         return self._orbit_span_cache
 
     def eval_grid(self, t_lo, t_hi):
@@ -269,6 +280,8 @@ class SOBBHBatchedTOF:
             return_spline=True,
         )
         out.tc = tc
+        # where the response exists (inside the orbit tables): pixels outside are a zero template
+        out.t_cover = (lo, hi)
         synchronize(xp)
         self.last_spans = {"pn": t_gen - t_pn, "generator": time.perf_counter() - t_gen}
         return out
@@ -485,14 +498,59 @@ class SOBBHDirectWDM:
         self.last_spans = {**spans, **self.last_spans}
         return tpl
 
+    def covered_pixels(self, out):
+        """``(a, b)``: the slice of :attr:`n_pixels` inside the response's time coverage
+        (``out.t_cover``, the evaluation grid kept inside the orbit tables). Pixels outside are a
+        ZERO template on both lookup paths (the C++ response zeroes them as well); warned once."""
+        P = int(self.n_pixels.size)
+        cover = getattr(out, "t_cover", None)
+        if cover is None:
+            return 0, P
+        inside = np.flatnonzero((self.t_pixels >= cover[0]) & (self.t_pixels <= cover[1]))
+        a, b = (int(inside[0]), int(inside[-1]) + 1) if inside.size else (0, 0)
+        if (a, b) != (0, P) and not getattr(self, "_cover_warned", False):
+            logger.warning(
+                "SOBBHDirectWDM: the response covers pixels %d..%d of %d (absolute times "
+                "%.0f..%.0f s, inside the orbit tables); the other pixels are a zero template.",
+                a,
+                b,
+                P,
+                cover[0],
+                cover[1],
+            )
+            self._cover_warned = True
+        return a, b
+
     def sparse_from(self, out, rows=None, *, warn=True):
         """Lookup templates of rows ``rows = (lo, hi)`` (default all) of a :meth:`response`
-        output -> :class:`SparseWDMTemplate`; spans ``tracer`` / ``lookup`` in ``last_spans``."""
+        output -> :class:`SparseWDMTemplate` on the pixels the response covers
+        (:meth:`covered_pixels`); spans ``tracer`` / ``lookup`` in ``last_spans``."""
         xp = self.ev.xp
         ws = self.wdm
         N = int(out.num_bin) if rows is None else int(rows[1]) - int(rows[0])
+        a, b = self.covered_pixels(out)
+        if b <= a:  # nothing covered: an empty template
+            L = 2 * self.num_m_layers + 1
+            z = xp.zeros((N, self.nchannels, L, 0))
+            stats = dict(
+                rows=N,
+                pixels=int(self.n_pixels.size),
+                lookup_pixels=0,
+                dropped_pixels=0,
+                merged_rows=0,
+                dropped_layers=0,
+            )
+            self.last_stats = stats
+            self.last_spans = {"tracer": 0.0, "lookup": 0.0}
+            return SparseWDMTemplate(
+                z,
+                xp.zeros((N, L, 0), dtype=xp.int64),
+                xp.zeros(0, dtype=xp.int64),
+                xp.zeros(z.shape, dtype=bool),
+                stats,
+            )
         t_b = time.perf_counter()
-        amp, phase, f, fdot = sobbh_tracer(out, self.t_pixels, rows=rows)  # (N, nch, P)
+        amp, phase, f, fdot = sobbh_tracer(out, self.t_pixels[a:b], rows=rows)  # (N, nch, P)
         synchronize(xp)
         t_c = time.perf_counter()
         # Amendment 1: the TDI-on-the-fly amplitude is SIGNED (measured negative on most
@@ -501,7 +559,7 @@ class SOBBHDirectWDM:
         n_live = xp.maximum(live.sum(axis=1), 1)
         f_ref = xp.where(live, f, 0.0).sum(axis=1) / n_live  # channel mean (N, P)
         m = xp.moveaxis(self.ev.layers_for(f_ref, self.num_m_layers), -1, 1)  # (N, L, P)
-        n = xp.asarray(self.n_pixels)
+        n = xp.asarray(self.n_pixels[a:b])
         w, ok = self.ev.coeffs(
             amp[:, :, None, :],
             phase[:, :, None, :],
@@ -572,9 +630,14 @@ class SOBBHDirectWDM:
         spl = [flat(amp.x_flat)]
         for s_ in (amp, ph, ref):
             spl += [flat(s_.y_flat), flat(s_.c1_flat), flat(s_.c2_flat), flat(s_.c3_flat)]
+        a, b = self.covered_pixels(out)
+        if b <= a:
+            a = b = 0
+        n_lo = int(self.n_pixels[a]) if b > a else int(ws.ind_min_t)
+        n_hi = int(self.n_pixels[b - 1]) + 1 if b > a else int(ws.ind_min_t)
         grid = [
-            int(ws.ind_min_t),
-            int(ws.ind_min_t) + int(ws.Nt_active),
+            n_lo,
+            n_hi,
             float(self.t_obs_start),
             float(ws.layer_dt),
             float(ws.layer_df),
