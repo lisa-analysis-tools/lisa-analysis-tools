@@ -171,12 +171,18 @@ def main():
         rows_out.append(row)
         h_tof.append(truth)
         print(
-            f"src {i} f_low {src[5]:.4f} snr {row['snr']:.1f}  mm X/Y/Z "
+            f"src {i} f_low {src[5]:.4f} snr {row['snr']:.3g}  mm X/Y/Z "
             f"{row['mm'][0]:.2e}/{row['mm'][1]:.2e}/{row['mm'][2]:.2e}  ratio "
             f"{row['ratio'][0]:.5f}/{row['ratio'][1]:.5f}/{row['ratio'][2]:.5f}  mm_w "
             f"{row['mm_w']:.2e}  mm_w_int {row['mm_w_int']:.2e}  dlogL {row['dlogL']:.3e}  "
             f"tof-dense {t_tof:.1f}s lookup {t_look:.1f}s"
         )
+
+    days = nt * float(wdm.layer_dt) / 86400.0
+    print(
+        f"[gate] Nt {nt} ({days:.0f} d) SNR per source (scirdv1 instrument noise, XYZ): "
+        + " ".join(f"{r['snr']:.3g}" for r in rows_out)
+    )
 
     # ---- scoring timings: both comps, one residual, the same batch of rows --------------
     data = h_tof[0] + 0.5 * h_tof[1]

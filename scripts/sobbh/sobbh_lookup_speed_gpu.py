@@ -214,7 +214,7 @@ def main():
     header = (
         f"{'rows':>5} {'look_first':>11} {'look_warm':>10} {'resp':>8} {'pn':>8} {'trac':>8} {'look':>8} {'inner':>8} "
         f"{'look_fill':>10} {'ch_first':>9} {'ch_warm':>9} {'ch_fill':>9} {'ch/look':>8} "
-        f"{'max|dll|':>10} {'lk_pool':>8} {'ch_pool':>8}"
+        f"{'max|dll|':>10} {'lk_pool':>8} {'ch_pool':>8} {'snr':>8}"
     )
     print(header)
     with open(args.out, "a") as fp:
@@ -250,6 +250,9 @@ def main():
 
             look_first, look_warm = timed(look_call, xp, args.repeats)
             ll_look = np.asarray(asnumpy(look_call()), dtype=float)
+            # the rows' optimal SNR against this grid's noise (scirdv1, instrument only):
+            # sqrt(<h|h>) of the lookup template
+            snr = float(np.median(np.sqrt(np.asarray(asnumpy(comp.h_h_out), dtype=float))))
             buf = xp.zeros(nch * nfa * nta)
             _, look_fill = timed(
                 lambda: comp.fill_global_wdm(batch, buf, data_index=idx, factors=fac),
@@ -262,6 +265,7 @@ def main():
                 look_first=look_first,
                 look_warm=look_warm,
                 look_fill=look_fill,
+                snr=snr,
                 look_template=float(spans.get("template", float("nan"))),
                 look_response=float(spans.get("response", float("nan"))),
                 look_pn=float(spans.get("pn", float("nan"))),
@@ -316,7 +320,7 @@ def main():
             print(
                 f"{n:5d} {look_first:11.3f} {look_warm:10.3f} {rec['look_response']:8.3f} {rec['look_pn']:8.3f} "
                 f"{rec['look_tracer']:8.3f} {rec['look_lookup']:8.3f} {rec['look_inner']:8.3f} {look_fill:10.3f} {ch_first:9.3f} {ch_warm:9.3f} "
-                f"{ch_fill:9.3f} {ratio:8.2f} {dll:10.3e} {lk_total:8.2f} {ch_total:8.2f}"
+                f"{ch_fill:9.3f} {ratio:8.2f} {dll:10.3e} {lk_total:8.2f} {ch_total:8.2f} {snr:8.3g}"
             )
             fp.write(json.dumps(clean(rec)) + "\n")
     print(f"wrote {args.out}")

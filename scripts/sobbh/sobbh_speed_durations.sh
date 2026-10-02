@@ -75,4 +75,23 @@ for days in ${DAYS}; do
     done
   fi
 done
+if [ "${GATE}" = 1 ] && [ -f "${OUT}/gate.jsonl" ]; then
+  # SNR of each catalogue-like source vs duration (sqrt(<h|h>) against scirdv1 instrument noise;
+  # the speed tables carry the scored rows' SNR in their last column)
+  python - "${OUT}/gate.jsonl" <<'PYEOF' || true
+import json, sys
+snr, f_low = {}, {}
+for line in open(sys.argv[1]):
+    d = json.loads(line)
+    if "src" not in d:
+        continue
+    snr.setdefault(d["nt"], {})[d["src"]] = d["snr"]
+    f_low[d["src"]] = d["f_low"]
+nts = sorted(snr)
+print("[durations] SNR (scirdv1, XYZ) per source vs duration:")
+print("  src  f_low[Hz]  " + "  ".join(f"{nt * 3600 / 86400:6.0f} d" for nt in nts))
+for i in sorted(f_low):
+    print(f"  {i:3d}  {f_low[i]:9.4f}  " + "  ".join(f"{snr[nt].get(i, float('nan')):8.3g}" for nt in nts))
+PYEOF
+fi
 echo "[durations] done: ${OUT}/"
