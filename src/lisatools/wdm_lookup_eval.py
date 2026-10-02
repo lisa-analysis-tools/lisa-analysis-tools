@@ -18,11 +18,15 @@ EMRI reference path, docs/emri-direct-wdm.md) -- with the same evaluation rule
 4. ``w[m, n] = amp * (c cos(phi) - s sin(phi))``, ``phi`` the carrier phase at the pixel centre
    ``t_n = n * layer_dt`` (signal ``amp * cos(phi)``, ``phi`` increasing in time).
 
-Interpolation on the uniform ``(fdot, f_norm)`` grid is bilinear (``"linear"``) or Keys cubic
-convolution (``"cubic"``, a = -1/2; interpolating; 16 gathers), both written with array-module
-gathers so the same code runs on numpy and cupy. Cubic is the default: linear interpolation
-across the table's peaked response left a 2.5e-4 amplitude deficit on the EMRI. Entries outside
-the table support are zero (and flagged).
+Interpolation on the uniform ``(fdot, f_norm)`` grid is the table's uniform cubic B-spline
+(``"spline"``, default: coefficients prefiltered once with mirror boundaries, then 16 gathers with
+B-spline weights == ``scipy.ndimage.map_coordinates(order=3, mode="mirror", prefilter=False)``,
+the semantics of ``WDMLookupTable`` ``INTERP_METHOD = "spline"`` and of the fused C++/CUDA lookup
+kernels), Keys cubic convolution (``"cubic"``, a = -1/2) or bilinear (``"linear"``), all written
+with array-module gathers so the same code runs on numpy and cupy. Linear interpolation across
+the table's peaked response left a 2.5e-4 amplitude deficit on the EMRI; on the SOBBH 6-month
+gate the B-spline is equal to or better than Keys (two of six sources halve their mismatch).
+Entries outside the table support are zero (and flagged).
 """
 
 from __future__ import annotations
@@ -30,6 +34,33 @@ from __future__ import annotations
 import numpy as np
 
 from .utils.utility import asnumpy
+
+
+def _bspline_weights(t):
+    """Uniform cubic B-spline weights for the coefficients at offsets -1, 0, 1, 2; ``t`` in
+    [0, 1)."""
+    t2 = t * t
+    t3 = t2 * t
+    s = 1.0 - t
+    return (
+        s * s * s / 6.0,
+        (3.0 * t3 - 6.0 * t2 + 4.0) / 6.0,
+        (-3.0 * t3 + 3.0 * t2 + 3.0 * t + 1.0) / 6.0,
+        t3 / 6.0,
+    )
+
+
+def _mirror_index(xp, i, n):
+    """``scipy.ndimage`` ``mode="mirror"`` index (whole-sample symmetric about 0 and ``n - 1``).
+
+    The taps of an in-support point lie in ``[-1, n + 1]``, so ONE reflection is exact for
+    ``n >= 3``; the final clip only keeps out-of-support points (masked by the caller) inside
+    the array."""
+    if n == 1:
+        return xp.zeros_like(i)
+    i = xp.where(i < 0, -i, i)
+    i = xp.where(i > n - 1, 2 * (n - 1) - i, i)
+    return xp.clip(i, 0, n - 1)
 
 
 def _keys_weights(t):
@@ -51,16 +82,18 @@ class WDMLookupEvaluator:
     Args:
         table: a built or loaded :class:`~lisatools.domains.WDMLookupTable` of build kind
             ``n_ref_only`` or ``n_ref_complex``.
-        interp: ``"cubic"`` (default, Keys cubic convolution) or ``"linear"`` (bilinear).
+        interp: ``"spline"`` (default: the table's uniform cubic B-spline, prefiltered with
+            mirror boundaries == ``WDMLookupTable`` ``INTERP_METHOD = "spline"``),
+            ``"cubic"`` (Keys cubic convolution) or ``"linear"`` (bilinear).
         force_backend: backend NAME the table arrays are placed on (``"cpu"``, ``"cuda12x"``,
             ...); ``None`` keeps the table's own backend. Chosen here, never per call.
     """
 
-    INTERPS = ("linear", "cubic")
+    INTERPS = ("linear", "cubic", "spline")
     #: ``"no_parity_turn"`` skips step 3 of the rule. NEGATIVE CONTROL ONLY (tests).
     BASIS_CYCLES = ("quarter_turn", "no_parity_turn")
 
-    def __init__(self, table, interp="cubic", force_backend=None):
+    def __init__(self, table, interp="spline", force_backend=None):
         kind = getattr(table, "build_kind", None)
         if kind not in ("n_ref_only", "n_ref_complex"):
             raise ValueError(
@@ -111,6 +144,19 @@ class WDMLookupEvaluator:
             dfd = 1.0
         self.fdot_min, self.fdot_max, self.dfdot = float(fdot[0]), float(fdot[-1]), dfd
 
+        if interp == "spline":
+            # the table's own uniform cubic B-spline (WDMLookupTable INTERP_METHOD "spline",
+            # _UniformCubicSpline): coefficients prefiltered ONCE with mirror boundaries, here
+            # on the host (scipy), then evaluated with explicit weights + mirrored indices,
+            # == ndimage.map_coordinates(order=3, mode="mirror", prefilter=False)
+            from scipy import ndimage
+
+            if self.nfdot > 1:
+                tab_cos = ndimage.spline_filter(tab_cos, order=3, mode="mirror")
+                tab_sin = ndimage.spline_filter(tab_sin, order=3, mode="mirror")
+            else:
+                tab_cos = ndimage.spline_filter1d(tab_cos, order=3, axis=1, mode="mirror")
+                tab_sin = ndimage.spline_filter1d(tab_sin, order=3, axis=1, mode="mirror")
         xp = self.xp
         self.tab_cos = xp.asarray(tab_cos)
         self.tab_sin = xp.asarray(tab_sin)
@@ -155,14 +201,32 @@ class WDMLookupEvaluator:
             z10 = tab[j1, i0c]
             z11 = tab[j1, i1]
             return (1.0 - tv) * ((1.0 - tu) * z00 + tu * z01) + tv * ((1.0 - tu) * z10 + tu * z11)
-        wu = _keys_weights(u - i0)
-        wv = _keys_weights(v - j0)
+        if self.interp == "spline":
+            wu = _bspline_weights(u - i0)
+            wv = _bspline_weights(v - j0)
+
+            def idx_u(off):
+                return _mirror_index(xp, i0 + off, nf)
+
+            def idx_v(off):
+                return _mirror_index(xp, j0 + off, nfd)
+
+        else:
+            wu = _keys_weights(u - i0)
+            wv = _keys_weights(v - j0)
+
+            def idx_u(off):
+                return xp.clip(i0 + off, 0, nf - 1)
+
+            def idx_v(off):
+                return xp.clip(j0 + off, 0, nfd - 1)
+
         out = None
         for a in range(4):
-            ja = xp.clip(j0 + (a - 1), 0, nfd - 1)
+            ja = idx_v(a - 1)
             row = None
             for b in range(4):
-                ib = xp.clip(i0 + (b - 1), 0, nf - 1)
+                ib = idx_u(b - 1)
                 term = wu[b] * tab[ja, ib]
                 row = term if row is None else row + term
             term = wv[a] * row

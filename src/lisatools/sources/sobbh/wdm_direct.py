@@ -186,6 +186,7 @@ class SOBBHBatchedTOF:
             force_backend if isinstance(force_backend, str) else force_backend.name.split("_")[-1]
         )
         self._orbit_span_cache = None
+        self.last_spans = {}
 
     def orbit_span(self):
         """Absolute times ``(t_lo, t_hi)`` the orbit tables cover (``orbits.t_base``), or
@@ -245,7 +246,9 @@ class SOBBHBatchedTOF:
         n_eval = eval_t.size
         lo, hi = float(eval_t[0]), float(eval_t[-1])
         node_t = np.linspace(lo - self.buffer_time, hi + self.buffer_time, self.n_grid)
+        t_pn = time.perf_counter()
         amp, gw_phase, tc = sobbh_amp_phase_batch(p, node_t, self.reference_time)
+        t_gen = time.perf_counter()
         xp = self.xp
         gen = TDTDIonTheFly(
             xp.asarray(np.ascontiguousarray(np.broadcast_to(eval_t, (N, n_eval)))),
@@ -266,10 +269,12 @@ class SOBBHBatchedTOF:
             return_spline=True,
         )
         out.tc = tc
+        synchronize(xp)
+        self.last_spans = {"pn": t_gen - t_pn, "generator": time.perf_counter() - t_gen}
         return out
 
 
-def sobbh_tracer(out, t_pixels):
+def sobbh_tracer(out, t_pixels, rows=None):
     """Per-row, per-channel ``(amp, phase, f, fdot)`` at ``t_pixels`` [absolute s].
 
     The channel signal is ``Re[amp exp(-i phase)] = amp cos(phase)`` with ``phase = tdi_phase +
@@ -289,28 +294,47 @@ def sobbh_tracer(out, t_pixels):
     downstream ``live = amp > 0``-style logic. Rows with a non-finite ``tc`` (degenerate
     params) are treated as never merging. ``out`` objects without a ``tc`` attribute (e.g. the
     test double in this module's tests) skip the masking entirely.
+
+    ``rows = (lo, hi)`` evaluates only rows ``lo:hi`` of ``out`` (the splines' ``ind_interps``
+    subset; the result equals the full tracer's ``[lo:hi]`` slice): one response serves a
+    whole call while the tracer / lookup run in row blocks.
     """
     xp = out.xp
     t = xp.asarray(t_pixels, dtype=float).reshape(-1)
     nb = int(out.num_bin)
     nch = int(out.tdi_amp.shape[1])
-    t3 = xp.ascontiguousarray(xp.broadcast_to(t, (nb, nch, t.size)))
-    t2 = xp.ascontiguousarray(xp.broadcast_to(t, (nb, t.size)))
-    amp = xp.asarray(out.tdi_amp_spl(t3))
+    lo, hi = (0, nb) if rows is None else (int(rows[0]), int(rows[1]))
+    if not 0 <= lo < hi <= nb:
+        raise ValueError(f"rows {rows} outside the output's {nb} rows")
+    k = hi - lo
+    t3 = xp.ascontiguousarray(xp.broadcast_to(t, (k, nch, t.size)))
+    t2 = xp.ascontiguousarray(xp.broadcast_to(t, (k, t.size)))
+    if rows is None:
+        ind3 = ind2 = None
+    else:
+        ind3 = xp.arange(lo * nch, hi * nch).reshape(k, nch)
+        ind2 = xp.arange(lo, hi)
+
+    def tdi(spl, **kw):
+        return xp.asarray(spl(t3, **kw) if ind3 is None else spl(t3, ind_interps=ind3, **kw))
+
+    def ref(spl, **kw):
+        return xp.asarray(spl(t2, **kw) if ind2 is None else spl(t2, ind_interps=ind2, **kw))
+
+    amp = tdi(out.tdi_amp_spl).reshape(k, nch, t.size)
     tc_attr = getattr(out, "tc", None)
     if tc_attr is not None:
-        tc = xp.asarray(np.asarray(tc_attr, dtype=float))
+        tc = xp.asarray(np.asarray(tc_attr, dtype=float)[lo:hi])
         tc = xp.where(xp.isfinite(tc), tc, xp.inf)
         amp = xp.where(t[None, None, :] >= tc[:, None, None], 0.0, amp)
-    ph = xp.asarray(out.tdi_phase_spl(t3)) + xp.asarray(out.phase_ref_spl(t2))[:, None, :]
-    d1 = (
-        xp.asarray(out.tdi_phase_spl(t3, derivative=1))
-        + xp.asarray(out.phase_ref_spl(t2, derivative=1))[:, None, :]
-    )
-    d2 = (
-        xp.asarray(out.tdi_phase_spl(t3, derivative=2))
-        + xp.asarray(out.phase_ref_spl(t2, derivative=2))[:, None, :]
-    )
+
+    def total(**kw):
+        a = tdi(out.tdi_phase_spl, **kw).reshape(k, nch, t.size)
+        return a + ref(out.phase_ref_spl, **kw).reshape(k, t.size)[:, None, :]
+
+    ph = total()
+    d1 = total(derivative=1)
+    d2 = total(derivative=2)
     f = d1 / (2.0 * np.pi)
     fdot = d2 / (2.0 * np.pi)
     neg = f < 0
@@ -383,7 +407,8 @@ class SOBBHDirectWDM:
         t_obs_start: absolute time [s] of grid pixel 0 (default ``wdm_settings.t0``; the stock
             domains carry an array-space ``t0 = 0`` while the data starts at ``data_t0``).
         num_m_layers: layers each side of the carrier layer per pixel (5 layers for 2).
-        interp: table interpolation (``"cubic"`` / ``"linear"``).
+        interp: table interpolation (``"spline"``, default: the table's uniform cubic B-spline,
+            the fused lookup kernels' semantics; ``"cubic"`` Keys; ``"linear"``).
     """
 
     def __init__(
@@ -399,7 +424,7 @@ class SOBBHDirectWDM:
         buffer_time=5000.0,
         eval_dt=43200.0,
         num_m_layers=2,
-        interp="cubic",
+        interp="spline",
         force_backend="cpu",
     ):
         from ...wdm_lookup_eval import WDMLookupEvaluator
@@ -432,22 +457,42 @@ class SOBBHDirectWDM:
         self.last_stats = {}
         self.last_spans = {}
 
+    def response(self, params):
+        """The batched response of ALL ``params`` rows over the pixel window (one build; its
+        spans land in ``last_spans``: ``response``, with its ``pn`` / ``generator`` parts)."""
+        xp = self.ev.xp
+        p = np.atleast_2d(np.asarray(asnumpy(params), dtype=float))
+        pad = 2.0 * self.tof.eval_dt
+        t_a = time.perf_counter()
+        out = self.tof.build(p, float(self.t_pixels[0]) - pad, float(self.t_pixels[-1]) + pad)
+        synchronize(xp)
+        self.last_spans = {
+            "response": time.perf_counter() - t_a,
+            "pn": float(self.tof.last_spans.get("pn", 0.0)),
+            "generator": float(self.tof.last_spans.get("generator", 0.0)),
+        }
+        return out
+
     def sparse(self, params, *, warn=True):
         """Lookup templates of the rows on their sparse support -> :class:`SparseWDMTemplate`.
 
         ``warn=False`` suppresses the per-call ``dropped_pixels`` warning (used by callers that
         batch many ``sparse`` calls and aggregate the stats themselves, e.g.
         :class:`SOBBHLookupComputations`, to avoid one warning per sub-batch)."""
+        out = self.response(params)
+        spans = dict(self.last_spans)
+        tpl = self.sparse_from(out, warn=warn)
+        self.last_spans = {**spans, **self.last_spans}
+        return tpl
+
+    def sparse_from(self, out, rows=None, *, warn=True):
+        """Lookup templates of rows ``rows = (lo, hi)`` (default all) of a :meth:`response`
+        output -> :class:`SparseWDMTemplate`; spans ``tracer`` / ``lookup`` in ``last_spans``."""
         xp = self.ev.xp
         ws = self.wdm
-        p = np.atleast_2d(np.asarray(asnumpy(params), dtype=float))
-        N = p.shape[0]
-        pad = 2.0 * self.tof.eval_dt
-        t_a = time.perf_counter()
-        out = self.tof.build(p, float(self.t_pixels[0]) - pad, float(self.t_pixels[-1]) + pad)
-        synchronize(xp)
+        N = int(out.num_bin) if rows is None else int(rows[1]) - int(rows[0])
         t_b = time.perf_counter()
-        amp, phase, f, fdot = sobbh_tracer(out, self.t_pixels)  # (N, nch, P)
+        amp, phase, f, fdot = sobbh_tracer(out, self.t_pixels, rows=rows)  # (N, nch, P)
         synchronize(xp)
         t_c = time.perf_counter()
         # Amendment 1: the TDI-on-the-fly amplitude is SIGNED (measured negative on most
@@ -497,12 +542,167 @@ class SOBBHDirectWDM:
             )
         self.last_stats = stats
         synchronize(xp)
-        self.last_spans = {
-            "response": t_b - t_a,
-            "tracer": t_c - t_b,
-            "lookup": time.perf_counter() - t_c,
-        }
+        self.last_spans = {"tracer": t_c - t_b, "lookup": time.perf_counter() - t_c}
         return SparseWDMTemplate(w, m_act, n_act, valid, stats)
+
+    # ---- the fused C++/CUDA lookup (sobbh_lookup_kernel.cu) ----------------------------
+
+    @property
+    def kernel_fn(self):
+        """The backend's compiled ``sobbh_lookup``, or ``None`` (a module built before it
+        landed, or a table interpolation other than the B-spline the kernel implements)."""
+        if self.ev.interp != "spline":
+            return None
+        return getattr(self.ev.backend, "sobbh_lookup", None)
+
+    def _kernel_args(self, out):
+        """The response-spline, grid and table arguments shared by both kernel modes."""
+        xp = self.ev.xp
+        ws = self.wdm
+        ev = self.ev
+
+        def flat(a, dtype=float):
+            return xp.ascontiguousarray(xp.asarray(a, dtype=dtype).reshape(-1))
+
+        amp, ph, ref = out.tdi_amp_spl, out.tdi_phase_spl, out.phase_ref_spl
+        tc = np.asarray(getattr(out, "tc", np.full(int(out.num_bin), np.inf)), dtype=float)
+        tc = np.where(np.isfinite(tc), tc, np.inf)
+        if int(ws.Nf_active) != int(ws.ind_max_f) - int(ws.ind_min_f) + 1:
+            raise ValueError("WDMSettings.Nf_active != ind_max_f - ind_min_f + 1")
+        spl = [flat(amp.x_flat)]
+        for s_ in (amp, ph, ref):
+            spl += [flat(s_.y_flat), flat(s_.c1_flat), flat(s_.c2_flat), flat(s_.c3_flat)]
+        grid = [
+            int(ws.ind_min_t),
+            int(ws.ind_min_t) + int(ws.Nt_active),
+            float(self.t_obs_start),
+            float(ws.layer_dt),
+            float(ws.layer_df),
+            int(ws.ind_min_f),
+            int(ws.Nf_active),
+            int(ws.ind_min_t),
+            int(ws.Nt_active),
+            int(self.num_m_layers),
+        ]
+        table = [
+            flat(ev.tab_cos),
+            flat(ev.tab_sin),
+            int(ev.nfdot),
+            int(ev.nf),
+            float(ev.fdot_min),
+            float(ev.dfdot),
+            float(ev.f_min),
+            float(ev.df),
+            float(ev.f_min),
+            float(ev.f_max),
+            int((ev.m_ref + ev.n_ref) % 2),
+            float(ev.fdot_min),
+            float(ev.fdot_max),
+        ]
+        return spl, flat(tc), grid, table, int(amp.length)
+
+    def _kernel_call(self, out, mode, *, d_h, h_h, buf, data, invC, full, di, ni, fac, n_d, n_c):
+        xp = self.ev.xp
+        fn = self.kernel_fn
+        if fn is None:
+            raise RuntimeError("the backend module has no sobbh_lookup kernel (rebuild lisatools)")
+        R = int(out.num_bin)
+        spl, tc, grid, table, N = self._kernel_args(out)
+        counts = xp.zeros(2, dtype=xp.uint64)
+        row_dead = xp.zeros(R, dtype=xp.int32)
+        empty_d = xp.zeros(0)
+        empty_i = xp.zeros(0, dtype=xp.int32)
+        fn(
+            int(mode),
+            empty_d if d_h is None else d_h,
+            empty_d if h_h is None else h_h,
+            empty_d if buf is None else buf,
+            counts,
+            row_dead,
+            empty_d if data is None else data,
+            empty_d if invC is None else invC,
+            int(full),
+            xp.ascontiguousarray(xp.asarray(di, dtype=xp.int32)),
+            empty_i if ni is None else xp.ascontiguousarray(xp.asarray(ni, dtype=xp.int32)),
+            empty_d if fac is None else xp.ascontiguousarray(xp.asarray(fac, dtype=float)),
+            int(n_d),
+            int(n_c),
+            R,
+            int(self.nchannels),
+            N,
+            *spl,
+            tc,
+            *grid,
+            *table,
+        )
+        c = asnumpy(counts)
+        self.last_stats = dict(
+            rows=R,
+            pixels=int(self.n_pixels.size),
+            lookup_pixels=int(c[1]),
+            dropped_pixels=int(c[0]),
+            merged_rows=int(asnumpy(row_dead).sum()),
+        )
+        return self.last_stats
+
+    def kernel_inner_products(
+        self, out, data_flat, invC_flat, data_index, noise_index, *, tdi_type="XYZ"
+    ):
+        """``(d_h, h_h, stats)`` of every row of a :meth:`response` output in ONE fused launch
+        (== :meth:`sparse_from` + :func:`sparse_inner_products`, the same slab layouts)."""
+        if tdi_type not in ("XYZ", "AET", "AE"):
+            raise ValueError(f"tdi_type must be one of ('XYZ', 'AET', 'AE'), got {tdi_type!r}")
+        xp = self.ev.xp
+        nch, nfa, nta = self.nchannels, int(self.wdm.Nf_active), int(self.wdm.Nt_active)
+        full = tdi_type == "XYZ"
+        data = xp.ascontiguousarray(xp.asarray(data_flat, dtype=float).reshape(-1))
+        inv = xp.ascontiguousarray(xp.asarray(invC_flat, dtype=float).reshape(-1))
+        per_d, per_c = nch * nfa * nta, (nch * nch if full else nch) * nfa * nta
+        if data.size % per_d or inv.size % per_c:
+            raise ValueError("data / invC buffers are not stacks of active-band slabs")
+        R = int(out.num_bin)
+        d_h, h_h = xp.zeros(R), xp.zeros(R)
+        stats = self._kernel_call(
+            out,
+            0,
+            d_h=d_h,
+            h_h=h_h,
+            buf=None,
+            data=data,
+            invC=inv,
+            full=full,
+            di=data_index,
+            ni=noise_index,
+            fac=None,
+            n_d=data.size // per_d,
+            n_c=inv.size // per_c,
+        )
+        return d_h, h_h, stats
+
+    def kernel_fill(self, out, buf_flat, data_index, factors):
+        """Add ``factors[row] * h`` of every row into the 1-D C-contiguous slab buffer in ONE
+        fused launch (== :meth:`sparse_from` + :func:`scatter_add`); returns the stats."""
+        nch, nfa, nta = self.nchannels, int(self.wdm.Nf_active), int(self.wdm.Nt_active)
+        if buf_flat.ndim != 1 or not buf_flat.flags.c_contiguous:
+            raise ValueError("fill target must be a 1-D C-contiguous buffer (writes go in place)")
+        per = nch * nfa * nta
+        if buf_flat.size % per:
+            raise ValueError(f"fill target size {buf_flat.size} is not a multiple of {per}")
+        return self._kernel_call(
+            out,
+            1,
+            d_h=None,
+            h_h=None,
+            buf=buf_flat,
+            data=None,
+            invC=None,
+            full=False,
+            di=data_index,
+            ni=None,
+            fac=factors,
+            n_d=buf_flat.size // per,
+            n_c=0,
+        )
 
     def dense(self, params):
         """Active-band :class:`~lisatools.domains.WDMSignal` per row (gates and tests)."""
@@ -635,12 +835,17 @@ class SOBBHLookupComputations:
         orbits, tdi_config, tdi_type, t_obs_start: as on ``WDMComputationsBase`` (``tdi_config``
             may be a string; ``None`` orbits -> ``EqualArmlengthOrbits``).
         n_grid, buffer_time, eval_dt, num_m_layers, interp: see :class:`SOBBHDirectWDM`.
-        row_batch: rows per response build (bounds the spline memory).
+        row_batch: rows per tracer / lookup block (bounds their temporaries, ~17 MB per row at
+            6 months); the response is built ONCE per call for all rows.
+        kernel: ``"auto"`` (default: the fused C++/CUDA lookup, ``sobbh_lookup_kernel.cu``, when
+            the backend module has it and ``interp == "spline"``, else the Python lookup),
+            ``"kernel"`` (required: raises otherwise) or ``"python"``.
         force_backend: backend name at construction (never per call).
         d_d: constant folded into the returned likelihood (default 0 = source-only).
     """
 
     _NPARAMS = 11
+    KERNELS = ("auto", "kernel", "python")
 
     def __init__(
         self,
@@ -656,8 +861,9 @@ class SOBBHLookupComputations:
         buffer_time=5000.0,
         eval_dt=43200.0,
         num_m_layers=2,
-        interp="cubic",
+        interp="spline",
         row_batch=32,
+        kernel="auto",
         force_backend="cpu",
         d_d=0.0,
     ):
@@ -681,6 +887,7 @@ class SOBBHLookupComputations:
             num_m_layers=num_m_layers,
             interp=interp,
             row_batch=row_batch,
+            kernel=kernel,
             force_backend=force_backend,
             d_d=d_d,
         )
@@ -718,6 +925,16 @@ class SOBBHLookupComputations:
             interp=interp,
             force_backend=self.force_backend,
         )
+        if kernel not in self.KERNELS:
+            raise ValueError(f"kernel must be one of {self.KERNELS}, got {kernel!r}")
+        have = self.direct.kernel_fn is not None
+        if kernel == "kernel" and not have:
+            raise ValueError(
+                "kernel='kernel' needs the backend's compiled sobbh_lookup and interp='spline' "
+                f"(interp={interp!r}; rebuild lisatools if the module predates the kernel)"
+            )
+        self.kernel = kernel
+        self.uses_kernel = have and kernel != "python"
         self.d_h_out = None
         self.h_h_out = None
         self.d_h_im_out = None
@@ -821,15 +1038,25 @@ class SOBBHLookupComputations:
         t_stage = time.perf_counter() - t_entry
         d_h = xp.zeros(N)
         h_h = xp.zeros(N)
+        if self.uses_kernel and N:
+            return self._get_ll_kernel(p, data_flat, invC_flat, di, ni, t_entry, t_stage)
         totals = dict(lookup_pixels=0, dropped_pixels=0, merged_rows=0)
         t_build = t_inner = 0.0
-        sp = dict(response=0.0, tracer=0.0, lookup=0.0)
+        sp = dict(response=0.0, pn=0.0, tracer=0.0, lookup=0.0)
+        # ONE response for every row of the call (on the sparse grid its outputs are tiny);
+        # row_batch only blocks the tracer / lookup temporaries
+        t0 = time.perf_counter()
+        out = self.direct.response(p) if N else None
+        t_build += time.perf_counter() - t0
+        if N:
+            sp["response"] = self.direct.last_spans["response"]
+            sp["pn"] = self.direct.last_spans["pn"]
         for lo in range(0, N, self.row_batch):
             hi = min(N, lo + self.row_batch)
             t0 = time.perf_counter()
-            tpl = self.direct.sparse(p[lo:hi], warn=False)
+            tpl = self.direct.sparse_from(out, (lo, hi), warn=False)
             t_build += time.perf_counter() - t0
-            for key in sp:
+            for key in ("tracer", "lookup"):
                 sp[key] += self.direct.last_spans[key]
             t0 = time.perf_counter()
             a, b = sparse_inner_products(
@@ -867,10 +1094,56 @@ class SOBBHLookupComputations:
             "wrap": 0.0,
             "launch": t_build + t_inner,
             "response": sp["response"],
+            "pn": sp["pn"],
             "tracer": sp["tracer"],
             "lookup": sp["lookup"],
             "template": t_build,
             "inner": t_inner,
+            "total": time.perf_counter() - t_entry,
+            "num_bin": int(N),
+            "n_groups": 0,
+        }
+        return -0.5 * (self.d_d + h_h - 2.0 * d_h)
+
+    def _get_ll_kernel(self, p, data_flat, invC_flat, di, ni, t_entry, t_stage):
+        """``get_ll_wdm`` through the fused kernel: one response, one launch for every row.
+        Spans: ``lookup`` is the fused kernel (tracer + lookup + inner products); ``tracer``
+        and ``inner`` are 0."""
+        N = p.shape[0]
+        t0 = time.perf_counter()
+        out = self.direct.response(p)
+        resp = dict(self.direct.last_spans)
+        t1 = time.perf_counter()
+        d_h, h_h, stats = self.direct.kernel_inner_products(
+            out, data_flat, invC_flat, di, ni, tdi_type=self.tdi_type
+        )
+        synchronize(self.xp)
+        t_kernel = time.perf_counter() - t1
+        totals = {k: int(stats[k]) for k in ("lookup_pixels", "dropped_pixels", "merged_rows")}
+        if totals["dropped_pixels"] > 0:
+            logger.warning(
+                "SOBBHDirectWDM: %d channel-pixels of %d rows have |fdot| beyond the table's "
+                "axis (%.3g Hz/s) and were dropped (sources near merger).",
+                totals["dropped_pixels"],
+                N,
+                self.direct.ev.fdot_max,
+            )
+        self.d_h_out = d_h
+        self.h_h_out = h_h
+        self.d_h_im_out = None
+        self.last_stats = totals
+        self.last_call_spans = {
+            "stage": t_stage,
+            "geom": 0.0,
+            "wrap": 0.0,
+            "launch": time.perf_counter() - t0,
+            "response": resp["response"],
+            "pn": resp["pn"],
+            "tracer": 0.0,
+            "lookup": t_kernel,
+            "template": time.perf_counter() - t0,
+            "inner": 0.0,
+            "kernel": t_kernel,
             "total": time.perf_counter() - t_entry,
             "num_bin": int(N),
             "n_groups": 0,
@@ -962,10 +1235,19 @@ class SOBBHLookupComputations:
         dropped_total = 0
         t_entry = time.perf_counter()
         sp = dict(response=0.0, tracer=0.0, lookup=0.0)
-        for lo in range(0, N, self.row_batch):
+        out = self.direct.response(p)  # one response for every row (see get_ll_wdm)
+        sp["response"] = self.direct.last_spans["response"]
+        pn = self.direct.last_spans["pn"]
+        if self.uses_kernel:
+            t1 = time.perf_counter()
+            stats = self.direct.kernel_fill(out, flat, di, fac)
+            synchronize(self.xp)
+            sp["lookup"] = time.perf_counter() - t1
+            dropped_total = int(stats["dropped_pixels"])
+        for lo in range(0, N if not self.uses_kernel else 0, self.row_batch):
             hi = min(N, lo + self.row_batch)
-            tpl = self.direct.sparse(p[lo:hi], warn=False)
-            for key in sp:
+            tpl = self.direct.sparse_from(out, (lo, hi), warn=False)
+            for key in ("tracer", "lookup"):
                 sp[key] += self.direct.last_spans[key]
             dropped_total += int(self.direct.last_stats.get("dropped_pixels", 0))
             scatter_add(
@@ -980,6 +1262,7 @@ class SOBBHLookupComputations:
             synchronize(self.xp)
         self.last_call_spans = {
             **sp,
+            "pn": pn,
             "template": sum(sp.values()),
             "total": time.perf_counter() - t_entry,
             "num_bin": int(N),

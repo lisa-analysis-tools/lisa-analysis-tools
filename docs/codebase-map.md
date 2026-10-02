@@ -40,6 +40,7 @@ package.
 | `chunked_het.py` | `WDMComputationsBase` — source-agnostic chunked-heterodyne WDM likelihood base (GB/SOBBH subclass it downstream). |
 | `wdm_lookup_eval.py` | `WDMLookupEvaluator` — vectorized (numpy/cupy) evaluation of an `n_ref` WDM lookup table with the quarter-turn rule (linear / Keys cubic). |
 | `sources/sobbh/wdm_direct.py` | SOBBH direct-to-WDM: batched 3.5PN, batched TDI-on-the-fly, tracer, sparse lookup template, sparse inner products / fill, and `SOBBHLookupComputations` (the `SOBBH_LIKELIHOOD=lookup` comp for `SOBBHChunkedLikeMove`). |
+| `cutils/sobbh_lookup_kernel.{hpp,cu}` | The fused SOBBH direct-to-WDM lookup (`sobbh_lookup`, bound in `binding_detector.cxx`, `backend.sobbh_lookup`): response splines -> per-row `<d|h>`, `<h|h>` (mode 0) or the fill (mode 1) in one launch, on the shared `wdm_lookup_kernels.hh` helpers (B-spline table, quarter turn, spline derivatives). Python driver `SOBBHDirectWDM.kernel_inner_products` / `kernel_fill`; `SOBBH_LOOKUP_KERNEL` (auto / kernel / python). Tests `tests/test_sobbh_lookup_kernel.py`. |
 | `wdm_het.py` / `signal_het.py` | WDM chunk geometry / window / layer-grouping helpers; sparse-time signal-heterodyne helpers. |
 | `response/` | LISA-response Python frontends (absorbed from `fastlisaresponse`): `parallelbase`, `tdiconfig`, `directresponse` (`pyResponseTDI`, `ResponseWrapper`), `tdionfly` (`TDIonTheFly` family + GB/SOBBH/FD variants). |
 | `jax/` | Pure-JAX backend (`backend.py`, `jaxbase.py`, `orbits.py`) + `response/` and `wdm/` JAX mirrors. |

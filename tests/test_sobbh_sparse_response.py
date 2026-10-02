@@ -101,6 +101,14 @@ class SparseGridTest(_Fixture):
         self.assertEqual(tof.eval_dt, SPARSE_DT)
         self.assertEqual(SOBBHDirectWDM.__init__.__kwdefaults__["eval_dt"], SPARSE_DT)
 
+    def test_default_interp_is_the_table_bspline(self):
+        from lisatools.sources.sobbh.wdm_direct import SOBBHDirectWDM, SOBBHLookupComputations
+        from lisatools.wdm_lookup_eval import WDMLookupEvaluator
+
+        self.assertEqual(SOBBHDirectWDM.__init__.__kwdefaults__["interp"], "spline")
+        self.assertEqual(SOBBHLookupComputations.__init__.__kwdefaults__["interp"], "spline")
+        self.assertEqual(WDMLookupEvaluator.__init__.__defaults__[0], "spline")
+
 
 class SparseGridAccuracyTest(_Fixture):
     def _production(self, row):

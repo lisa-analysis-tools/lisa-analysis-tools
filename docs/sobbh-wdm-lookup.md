@@ -475,6 +475,92 @@ the earlier runs; the stage profile prints at exit):
 ones, ~2.4 GB; the lookup's per-row temporaries scale with the pixel count, ~70 MB per row at
 24 months, so `--row-batch 32` is the safe default there.)
 
+### Cluster result, sparse 12-h grid (2026-10-02, dev df31fe86, one H100, cuda13x)
+
+Speed script defaults (`--eval-dt 43200 --row-batch 32`, Keys cubic at the time), chunked comp
+on, `MBHTDIONFLY_TIMING=1`:
+
+| months | rows | look_warm | resp | trac | look | inner | chunked | chunked / lookup |
+|---|---|---|---|---|---|---|---|---|
+| 6 | 8 | 0.051 | 0.033 | 0.010 | 0.007 | 0.002 | 1.697 | 33 |
+| 6 | 32 | 0.063 | 0.041 | 0.013 | 0.008 | 0.002 | 1.703 | 27 |
+| 6 | 96 | 0.191 | 0.122 | 0.040 | 0.025 | 0.005 | 1.706 | 9 |
+| 6 | 288 | 0.569 | 0.366 | 0.113 | 0.073 | 0.015 | 3.721 | 6.5 |
+| 12 | 8 | 0.053 | 0.034 | 0.010 | 0.007 | 0.002 | 3.396 | 65 |
+| 12 | 288 | 0.617 | 0.373 | 0.114 | 0.114 | 0.015 | 7.443 | 12 |
+| 24 | 8 | 0.059 | 0.040 | 0.010 | 0.007 | 0.002 | 6.828 | 116 |
+| 24 | 32 | 0.085 | 0.048 | 0.012 | 0.022 | 0.002 | 6.826 | 80 |
+| 24 | 96 | 0.256 | 0.146 | 0.037 | 0.065 | 0.007 | 6.814 | 27 |
+| 24 | 288 | 0.757 | 0.433 | 0.107 | 0.197 | 0.022 | 14.875 | 20 |
+
+- The sparse grid took the 8-row 6-month call from 0.194 to 0.051 s; the chunked comp scales
+  with the duration (1.7 / 3.4 / 6.8 s at 8 rows), the lookup barely (0.051 / 0.053 / 0.059).
+- Stage profile per response build: kernel 2.3 / 4.3 / 8.0 ms (6 / 12 / 24 months), output
+  splines 2.5-3.7 ms, input splines 2.7 ms; the orbits line is ONE configuration amortised.
+  The rest of the ~33-40 ms `resp` is outside those stages: the PN at the 2048 nodes, the
+  uploads, Python -- the speed script now prints a `pn` column to split it.
+- `resp` at 96 / 288 rows = 3 / 9 builds of the fixed cost (row batch 32): fixed below.
+- `max|dll|` vs chunked 8e-4 .. 7e-3 (the chunked comp's m-band truncation, growing with the
+  duration as its chunk count does); pools 2.0-4.5 GB.
+
+### EMRI-style cost reductions (2026-10-02)
+
+Following the EMRI direct-WDM session's path (sparse response, analytic derivatives, blocks,
+one fused kernel; `plans/emri-wdm-fused-lookup-kernel.md`):
+
+- Already in place for SOBBH: the sparse response grid, analytic spline derivatives (no
+  finite-difference stencils), amplitude read at the pixel centres only, output in the active
+  band only. The exact-carrier form is not needed in band (above).
+- NEW: ONE response build per call for all rows; `row_batch` (`SOBBH_LOOKUP_ROW_BATCH`) now
+  only blocks the tracer / lookup temporaries (`SOBBHDirectWDM.response` + `sparse_from(out,
+  rows)`, `sobbh_tracer(..., rows=(lo, hi))` through the splines' `ind_interps`). Expected at
+  288 rows / 6 months: `resp` 0.366 -> ~0.04-0.08 s, the call ~0.57 -> ~0.25 s.
+  `tests/test_sobbh_lookup_batching.py` pins: one build per get_ll / fill, results independent
+  of `row_batch` to 1e-12, the tracer's row range equals the full tracer's slice.
+- NEW: `pn` span (the PN amplitude / phase at the node grid) in `last_call_spans` and the speed
+  script. Laptop CPU (JAX CPU): 11 / 25 / 171 ms at 8 / 32 / 288 rows; on the cluster the next
+  speed run shows it.
+- NEW: the table interpolation is the table's own uniform cubic B-spline (`interp="spline"`,
+  default everywhere; `SOBBH_LOOKUP_INTERP`): the fused kernels' semantics, and on the 6-month
+  gate equal to or better than Keys (sources 3 / 5: mismatch 2.6e-7 / 7e-8 vs 4.0e-7 / 1.5e-7,
+  integrated weighted 2.3e-7 / 8.3e-8 vs 3.5e-7 / 1.7e-7; the other four unchanged).
+- PLANNED: the SOBBH fused lookup kernel (`docs/superpowers/plans/2026-10-02-sobbh-fused-lookup-kernel.md`),
+  response splines -> `(d_h, h_h)` per row (or the fill) in one launch, built on the EMRI
+  session's shared device helpers once those are pushed.
+
+### Fused lookup kernel (2026-10-02, night): built, CPU-tested, ready for the cluster
+
+`src/lisatools/cutils/sobbh_lookup_kernel.{hpp,cu}` (`backend.sobbh_lookup`): one launch from
+the response splines to `<d|h>`, `<h|h>` per row (scoring) or the fill, nothing per pixel in
+global memory, on the EMRI session's shared helpers (`wdm_lookup_kernels.hh`: B-spline table,
+quarter turn, spline derivatives). `SOBBH_LOOKUP_KERNEL` = `auto` (default: when the module has
+it and `SOBBH_LOOKUP_INTERP=spline`), `kernel` (required) or `python`. Plan + results:
+`docs/superpowers/plans/2026-10-02-sobbh-fused-lookup-kernel.md`. Kernel == Python lookup to
+1e-10 (scoring, routing, AET diagonal, fill, stats); four kernel mutations each caught. Laptop
+CPU at 6 months, the lookup step 0.54 -> 0.09 s at 8 rows (the serial CPU build); on the GPU
+the expectation is ~ms for the whole lookup at 288 rows, leaving the response build (`resp`,
+with its `pn` part) as the call.
+
+Cluster verification (mirrors the EMRI one: one unit-test line plus one speed/accuracy script):
+
+    git pull origin dev
+    pip install -e . --no-build-isolation          # REBUILDS the C++/CUDA modules (both kernels)
+    export SOBBH_LOOKUP_TABLE_PATH=/path/you/built/wdm_lookup_sobbh_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5
+    python -m unittest tests.test_sobbh_lookup_kernel tests.test_sobbh_lookup_batching tests.test_sobbh_sparse_response tests.test_sobbh_wdm_direct tests.test_wdm_lookup_eval -v
+    bash scripts/sobbh/sobbh_speed_durations.sh
+
+The unit line must show `test_gpu_equals_cpu ... ok` (a skip means the GPU module has no
+`sobbh_lookup`: the rebuild did not take). `scripts/sobbh/sobbh_speed_durations.sh` (the twin of
+`scripts/emri/emri_speed_durations.sh`; knobs BACKEND, DAYS "180 360 720", TABLE, ROWS, LOOKUPS
+"kernel,python", REPS, GATE_ROWS, GATE, SPEED_ARGS, OUT) runs per duration (Nt = days * 24):
+the speed script on the production grid once per lookup (the chunked comp alongside the first:
+ch/look and max|dll|; the `MBHTDIONFLY_TIMING` stage profile), then the accuracy gate per lookup
+(per-source mismatch / ratio / dlogL vs the dense transform, and `[gate] ... max|lnL lookup -
+exact|` for the comp's scoring path). Logs and JSON lines in `sobbh_speed_durations_<date>/`.
+With the kernel the speed table's `look` column is the fused kernel and `trac` / `inner` read 0;
+the `[gate]` line must agree between `lookup=kernel` and `lookup=python` (same semantics; on the
+laptop smoke both gave 1.178e-05).
+
 ### The table during a global-fit run (2026-10-02, the EMRI way)
 
 `SOBBH_LOOKUP_TABLE_PATH` is now OPTIONAL. `resolve_sobbh_lookup_table(general_info, cfg)`

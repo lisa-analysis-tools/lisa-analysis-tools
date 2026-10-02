@@ -56,6 +56,14 @@ def main():
     ap.add_argument("--nt", type=int, default=1024)
     ap.add_argument("--rows", type=int, default=8)
     ap.add_argument("--eval-dt", type=float, default=43200.0)
+    ap.add_argument("--interp", default="spline", choices=("spline", "cubic", "linear"))
+    ap.add_argument(
+        "--kernel",
+        default="auto",
+        choices=("auto", "kernel", "python"),
+        help="the comp's scoring path (fused C++/CUDA lookup or Python); the per-source "
+        "templates (direct.dense) are always the Python path, == the kernel to 1e-10",
+    )
     ap.add_argument(
         "--buffer-time",
         type=float,
@@ -94,19 +102,21 @@ def main():
         buffer_time=args.buffer_time,
         eval_dt=args.eval_dt,
         num_m_layers=2,
-        interp="cubic",
+        interp=args.interp,
         row_batch=args.rows,
+        kernel=args.kernel,
         force_backend="cpu",
         d_d=0.0,
     )
     direct = comp.direct
+    lookup = "kernel" if comp.uses_kernel else "python"
     grid_t = np.arange(nobs) * DT + t0
     tds = TDSettings(nobs, DT, force_backend="cpu")
     sens = XYZ2SensitivityMatrix(wdm, model="scirdv1")
 
     print(
         f"grid Nf={NF} Nt={nt} dt={DT} layer_dt={wdm.layer_dt} s; table "
-        f"{os.path.basename(args.table)}"
+        f"{os.path.basename(args.table)}; scoring lookup={lookup}"
     )
     tag = time.strftime("%Y-%m-%dT%H:%M:%S")
     rows_out = []
@@ -161,12 +171,18 @@ def main():
         rows_out.append(row)
         h_tof.append(truth)
         print(
-            f"src {i} f_low {src[5]:.4f} snr {row['snr']:.1f}  mm X/Y/Z "
+            f"src {i} f_low {src[5]:.4f} snr {row['snr']:.3g}  mm X/Y/Z "
             f"{row['mm'][0]:.2e}/{row['mm'][1]:.2e}/{row['mm'][2]:.2e}  ratio "
             f"{row['ratio'][0]:.5f}/{row['ratio'][1]:.5f}/{row['ratio'][2]:.5f}  mm_w "
             f"{row['mm_w']:.2e}  mm_w_int {row['mm_w_int']:.2e}  dlogL {row['dlogL']:.3e}  "
             f"tof-dense {t_tof:.1f}s lookup {t_look:.1f}s"
         )
+
+    days = nt * float(wdm.layer_dt) / 86400.0
+    print(
+        f"[gate] Nt {nt} ({days:.0f} d) SNR per source (scirdv1 instrument noise, XYZ): "
+        + " ".join(f"{r['snr']:.3g}" for r in rows_out)
+    )
 
     # ---- scoring timings: both comps, one residual, the same batch of rows --------------
     data = h_tof[0] + 0.5 * h_tof[1]
@@ -207,6 +223,13 @@ def main():
     comp.fill_global_wdm(batch, buf, data_index=idx, factors=np.ones(args.rows))
     timing["lookup_fill"] = time.perf_counter() - t_a
     timing["lookup_vs_exact_max_abs"] = float(np.abs(ll_look - exact).max())
+    timing["lookup"] = lookup
+    print(
+        f"[gate] Nt {nt} scoring lookup={lookup}: max|lnL lookup - exact| "
+        f"{timing['lookup_vs_exact_max_abs']:.3e} over {args.rows} rows "
+        f"(median |exact| {float(np.median(np.abs(exact))):.3e}); get_ll "
+        f"{timing['lookup_get_ll']:.3f} s, fill {timing['lookup_fill']:.3f} s"
+    )
     if not args.no_chunked:
         from bbhx.sobbhcomps import SOBBHWDMComputations
 
@@ -237,7 +260,16 @@ def main():
     with open(args.out, "a") as fp:
         for row in rows_out:
             fp.write(
-                json.dumps(dict(nt=nt, eval_dt=args.eval_dt, buffer_time=args.buffer_time, **row))
+                json.dumps(
+                    dict(
+                        nt=nt,
+                        eval_dt=args.eval_dt,
+                        buffer_time=args.buffer_time,
+                        interp=args.interp,
+                        lookup=lookup,
+                        **row,
+                    )
+                )
                 + "\n"
             )
         fp.write(json.dumps(dict(timing=timing, tag=tag)) + "\n")

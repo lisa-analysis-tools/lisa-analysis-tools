@@ -712,6 +712,10 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # these is new rather than changed.
             "GF_MONITOR_AFTER_SAVE", "GF_MONITOR_ITER",
             "GF_MONITOR_SNAPSHOT", "GF_MONITOR_TIMEOUT",
+            # V9-27 (2026-10-02): the SOBBH lookup scoring path's knobs (default
+            # chunked = the v8 path); SixMonthSOBBHLookupTest pins the block.
+            "SOBBH_LIKELIHOOD", "SOBBH_LOOKUP_TABLE_PATH", "SOBBH_LOOKUP_EVAL_DT",
+            "SOBBH_LOOKUP_ROW_BATCH", "SOBBH_LOOKUP_KERNEL",
             # V9-25 (2026-09-30): mbh_pe on the batched, windowed MBH
             # likelihood at B=8, response order 8 pinned. v8 predates the
             # knobs entirely; SixMonthMBHBatchedTest pins the block.
@@ -1213,6 +1217,31 @@ class V9RankLayoutTest(unittest.TestCase):
         self.assertIn("RANKS_PER_GPU=2 gives N_COMPUTE=8, not 5", self.src)
 
 
+class SixMonthSOBBHLookupTest(unittest.TestCase):
+    """The 6mo v9 SOBBH lookup block: ``SOBBH_LIKELIHOOD=lookup`` swaps the comp inside the
+    existing SOBBH add/remove move (docs/sobbh-wdm-lookup.md); default chunked = the v8 path."""
+
+    def setUp(self):
+        self.v9 = _exports(SIX_MO_V9)
+        self.text = open(SIX_MO_V9).read()
+
+    def test_the_block_defaults(self):
+        self.assertEqual(self.v9["SOBBH_LIKELIHOOD"], "chunked")
+        self.assertEqual(self.v9["SOBBH_LOOKUP_TABLE_PATH"], "")   # the run folder's table
+        self.assertEqual(self.v9["SOBBH_LOOKUP_EVAL_DT"], "43200")  # the sparse 12-h response
+        self.assertEqual(self.v9["SOBBH_LOOKUP_ROW_BATCH"], "32")
+        self.assertEqual(self.v9["SOBBH_LOOKUP_KERNEL"], "auto")
+
+    def test_the_preflight_guards(self):
+        for needle in (
+            "resolve_sobbh_lookup_table",          # find or build the table before mpiexec
+            "GPUS_PER_RANK",                        # the comp is single-device
+            "SOBBH_LOOKUP_KERNEL=kernel but",      # a missing compiled kernel is refused
+            "the settings resolve",                 # a silently ignored knob is refused
+        ):
+            self.assertIn(needle, self.text)
+
+
 class ThreeMonthTwinTest(unittest.TestCase):
     """``submit_gf_3mo_v8_4gpu.sh`` is the 6mo script at 3 months.
 
@@ -1580,6 +1609,10 @@ class ThreeMonthV9TwinTest(unittest.TestCase):
             "STAGE_SKIP_SOURCE_SEARCH",
             # 3MO-6 the unequal-arm reference fit
             "MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM",
+            # 3MO-9 (2026-10-02): nor the 6mo SOBBH lookup block (its preflight is
+            # written for the 6-month grid).
+            "SOBBH_LIKELIHOOD", "SOBBH_LOOKUP_TABLE_PATH", "SOBBH_LOOKUP_EVAL_DT",
+            "SOBBH_LOOKUP_ROW_BATCH", "SOBBH_LOOKUP_KERNEL",
             # 3MO-7 (2026-09-30): the 6mo batched-MBH block is NOT carried
             # across. No MBH branch is armed here, AND the batched default
             # window (90 + 10 + 2 x 1 d kept + 2 x 4 d pad) does not fit a

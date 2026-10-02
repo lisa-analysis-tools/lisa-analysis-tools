@@ -44,8 +44,9 @@ def _cfg(path, likelihood="lookup"):
         sobbh_lookup_table_path=path,
         sobbh_lookup_eval_dt=600.0,
         sobbh_lookup_num_m_layers=2,
-        sobbh_lookup_interp="cubic",
+        sobbh_lookup_interp="spline",
         sobbh_lookup_row_batch=32,
+        sobbh_lookup_kernel="auto",
         sobbh_nt_sub=32,
         sobbh_chirp_fdot_max=None,
         sobbh_sweep_max_layers=3.5,
@@ -70,6 +71,7 @@ class LookupSettingsTest(unittest.TestCase):
                 "SOBBH_LOOKUP_NUM_M_LAYERS",
                 "SOBBH_LOOKUP_INTERP",
                 "SOBBH_LOOKUP_ROW_BATCH",
+                "SOBBH_LOOKUP_KERNEL",
             ):
                 os.environ.pop(key, None)
             s = SourceSOBBHSettings(likelihood="lookup")
@@ -77,8 +79,12 @@ class LookupSettingsTest(unittest.TestCase):
         self.assertEqual(s.lookup_table_path, "")
         self.assertEqual(s.lookup_num_m_layers, 2)
         self.assertEqual(s.lookup_eval_dt, 43200.0)  # 12 h: one response point per 12 pixels
-        self.assertEqual(s.lookup_interp, "cubic")
+        # the table's uniform cubic B-spline: the fused lookup kernels' semantics, and equal
+        # or better than Keys cubic on the 6-month gate (sources 3 / 5: mm 2.6e-7 / 7e-8 vs
+        # 4.0e-7 / 1.5e-7)
+        self.assertEqual(s.lookup_interp, "spline")
         self.assertEqual(s.lookup_row_batch, 32)
+        self.assertEqual(s.lookup_kernel, "auto")
         env = {
             "SOBBH_LIKELIHOOD": "lookup",
             "SOBBH_LOOKUP_TABLE_PATH": "/x/y.h5",
@@ -86,6 +92,7 @@ class LookupSettingsTest(unittest.TestCase):
             "SOBBH_LOOKUP_NUM_M_LAYERS": "3",
             "SOBBH_LOOKUP_INTERP": "linear",
             "SOBBH_LOOKUP_ROW_BATCH": "8",
+            "SOBBH_LOOKUP_KERNEL": "python",
         }
         with mock.patch.dict(os.environ, env):
             s2 = SourceSOBBHSettings()
@@ -97,8 +104,9 @@ class LookupSettingsTest(unittest.TestCase):
                 s2.lookup_num_m_layers,
                 s2.lookup_interp,
                 s2.lookup_row_batch,
+                s2.lookup_kernel,
             ),
-            ("lookup", "/x/y.h5", 300.0, 3, "linear", 8),
+            ("lookup", "/x/y.h5", 300.0, 3, "linear", 8, "python"),
         )
 
     def test_cfg_carries_lookup_knobs(self):
@@ -141,8 +149,9 @@ class LookupSettingsTest(unittest.TestCase):
         self.assertEqual(cfg["sobbh_lookup_table_path"], "/t.h5")
         self.assertEqual(cfg["sobbh_lookup_eval_dt"], 120.0)
         self.assertEqual(cfg["sobbh_lookup_num_m_layers"], 2)
-        self.assertEqual(cfg["sobbh_lookup_interp"], "cubic")
+        self.assertEqual(cfg["sobbh_lookup_interp"], "spline")
         self.assertEqual(cfg["sobbh_lookup_row_batch"], 32)
+        self.assertEqual(cfg["sobbh_lookup_kernel"], "auto")
 
 
 class LookupCompBuildTest(unittest.TestCase):
@@ -177,6 +186,15 @@ class LookupCompBuildTest(unittest.TestCase):
         self.assertEqual(comp.direct.num_m_layers, 2)
         self.assertEqual(comp.direct.tof.eval_dt, 600.0)
         self.assertEqual(comp.d_d, 0.0)
+        self.assertEqual(comp.kernel, "auto")
+
+    def test_kernel_knob_reaches_the_comp(self):
+        from lisatools.globalfit.stock.erebor import source_runtime as sr
+
+        cfg = dict(_cfg(self.path), sobbh_lookup_kernel="python")
+        comp = sr.get_sobbh_lookup_comp(_general_info(self.wdm), cfg)
+        self.assertEqual(comp.kernel, "python")
+        self.assertFalse(comp.uses_kernel)
 
     def test_multi_gpu_run_is_refused(self):
         from lisatools.globalfit.stock.erebor import source_runtime as sr

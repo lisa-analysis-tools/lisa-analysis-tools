@@ -96,6 +96,24 @@ void gb_inmodel_accept_apply_binding(
     array_type<int32_t> dg_counts, array_type<int32_t> cur_cells,
     array_type<int32_t> new_cells, int num_cap_cells, int n_sub, int n_block);
 
+// fused SOBBH direct-to-WDM lookup (sobbh_lookup_kernel.cu): mode 0 accumulates
+// <d|h>, <h|h> per row; mode 1 fills factor * h into the slab buffer.
+void sobbh_lookup_binding(
+    int mode, array_type<double> d_h, array_type<double> h_h, array_type<double> buf,
+    array_type<uint64_t> counts, array_type<int32_t> row_dead,
+    array_type<double> data, array_type<double> invC, int full_invC,
+    array_type<int32_t> data_index, array_type<int32_t> noise_index, array_type<double> factors,
+    int n_slots_d, int n_slots_c,
+    int num_rows, int nch, int N, array_type<double> x,
+    array_type<double> amp_y, array_type<double> amp_c1, array_type<double> amp_c2, array_type<double> amp_c3,
+    array_type<double> ph_y, array_type<double> ph_c1, array_type<double> ph_c2, array_type<double> ph_c3,
+    array_type<double> ref_y, array_type<double> ref_c1, array_type<double> ref_c2, array_type<double> ref_c3,
+    array_type<double> tc,
+    int n_lo, int n_hi, double t0, double layer_dt, double layer_df,
+    int ind_min_f, int Nf_active, int ind_min_t, int Nt_active, int num_m_layers,
+    array_type<double> coeff_c, array_type<double> coeff_s, int FD, int FF, double fdot0, double dfdot,
+    double f0, double df, double f_lo, double f_hi, int ref_odd, double fdot_lo, double fdot_hi);
+
 template<typename T>
 T* return_pointer_and_check_length(array_type<T> input1, std::string name, int N, int multiplier)
 {
