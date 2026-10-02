@@ -98,6 +98,23 @@ _GALFOR_PARAM_INFO: Dict[str, ParameterInfo] = {
     "f_2": ParameterInfo("galactic_freq_2", r"$f_2\,[\mathrm{Hz}]$", "Hz"),
 }
 
+
+def _noise_param_info(sensitivity_backend) -> List[ParameterInfo]:
+    """PSD-branch parameter info matching the backend's amplitude layout.
+
+    Symmetric noise uses the two entries of ``_NOISE_PARAM_INFO``; the asymmetric
+    (per-MOSA) model has 6 OMS + 6 TM amplitudes named ``S_oms_<mosa>`` / ``S_tm_<mosa>``.
+    """
+    names = getattr(sensitivity_backend, "psd_param_names", ["S_oms", "S_tm"])
+    if names == ["S_oms", "S_tm"]:
+        return list(_NOISE_PARAM_INFO.values())
+    out = []
+    for name in names:
+        base, mosa = name.rsplit("_", 1)
+        info = _NOISE_PARAM_INFO[base]
+        out.append(ParameterInfo(name, info.latex_name.replace(r"}\,", r",%s}\," % mosa, 1), info.unit))
+    return out
+
 # todo add galactic foreground
 
 PARAMETER_INFO_REGISTRY: Dict[str, Dict[str, ParameterInfo]] = {
@@ -1597,7 +1614,10 @@ class SubmissionWriter(BackendConsumer):
         for branch in branches_here:
             _samples = self.samples[branch]
             _inds = self.inds[branch]
-            _parameter_info = list(PARAMETER_INFO_REGISTRY[branch].values())
+            if branch == "psd":
+                _parameter_info = _noise_param_info(self.curr.general_info.sensitivity_backend)
+            else:
+                _parameter_info = list(PARAMETER_INFO_REGISTRY[branch].values())
             _metadata = self.curr.source_metadata[branch]
 
             samples.append(_samples)

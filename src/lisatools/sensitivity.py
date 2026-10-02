@@ -2110,6 +2110,11 @@ def check_sensitivity(sensitivity: Any) -> Sensitivity:
 # full grid is infeasible to evaluate the transfer functions on.
 _N_AVERAGE_EPOCHS = 1024
 
+# Noise-amplitude layouts accepted by XYZSensitivityBackend(noise_symmetry=...).
+# "asymmetric" uses one OMS and one TM amplitude per MOSA, in orbits.LINKS order.
+NOISE_SYMMETRIES = {"symmetric": 1, "asymmetric": 6}
+MOSA_NAMES = ["12", "23", "31", "13", "32", "21"]
+
 
 class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
     """3x3 XYZ TDI sensitivity matrix backed by the C++/CUDA detector kernels.
@@ -2154,6 +2159,10 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             ``False``.
         smoothing_sigma: Sigma for smoothing the sensitivity matrix around the
             zero dips. Default is ``1.0``. If ``None``, no smoothing is applied.
+        noise_symmetry: ``"symmetric"`` (default) uses one OMS and one TM amplitude
+            for all MOSAs. ``"asymmetric"`` uses one amplitude per MOSA (6 OMS + 6 TM,
+            ordered as ``orbits.LINKS``: 12, 23, 31, 13, 32, 21) on the same
+            spectral shapes. See :meth:`split_psd_params` for the parameter layout.
     """
 
     def __init__(
@@ -2171,8 +2180,14 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         filters_response: Optional[NDArrayLike] = None,
         average_transfer_functions: bool = False,
         smoothing_sigma: Optional[float] = 1.0,
+        noise_symmetry: str = "symmetric",
     ):
         LISAToolsParallelModule.__init__(self, force_backend=force_backend)
+        if noise_symmetry not in NOISE_SYMMETRIES:
+            raise ValueError(
+                f"noise_symmetry must be one of {list(NOISE_SYMMETRIES)}, got {noise_symmetry!r}."
+            )
+        self.noise_symmetry = noise_symmetry
         SensitivityMatrixBase.__init__(self, settings)
 
         assert self.backend.xp == orbits.xp, "Orbits and Sensitivity backend mismatch."
@@ -2225,7 +2240,40 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             "convolve_window": self.convolve_window,
             "average_transfer_functions": self.average_transfer_functions,
             "smoothing_sigma": self.smoothing_sigma,
+            "noise_symmetry": self.noise_symmetry,
         }
+
+    @property
+    def n_noise_par(self) -> int:
+        """Amplitudes per noise type: 1 (symmetric) or 6 (asymmetric, one per MOSA)."""
+        return NOISE_SYMMETRIES[self.noise_symmetry]
+
+    @property
+    def psd_param_names(self) -> list:
+        """Names of the amplitude parameters, in the order :meth:`split_psd_params` expects."""
+        if self.n_noise_par == 1:
+            return ["S_oms", "S_tm"]
+        return [f"S_oms_{m}" for m in MOSA_NAMES] + [f"S_tm_{m}" for m in MOSA_NAMES]
+
+    def split_psd_params(self, psd_params):
+        """Split PSD parameters into OMS amplitudes, TM amplitudes and spline parameters.
+
+        Layout of the last axis: ``n`` OMS amplitudes, ``n`` TM amplitudes, then any
+        spline parameters, with ``n = n_noise_par``.
+
+        Args:
+            psd_params: Shape ``(ndim,)`` for one PSD or ``(num_psds, ndim)``.
+
+        Returns:
+            ``(Soms, Sa, spline_params)``. Soms and Sa have shape ``(..., n)`` for the
+            asymmetric model and ``(...)`` for the symmetric one. ``spline_params``
+            has shape ``(..., ndim - 2 n)``.
+        """
+        n = self.n_noise_par
+        Soms, Sa, spline_params = psd_params[..., :n], psd_params[..., n : 2 * n], psd_params[..., 2 * n :]
+        if n == 1:
+            Soms, Sa = Soms[..., 0], Sa[..., 0]
+        return Soms, Sa, spline_params
 
     @property
     def xp(self):
@@ -2389,11 +2437,14 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             self.pycpp_sensitivity_matrix = None
         else:
             self.pycpp_sensitivity_matrix = _SensitivityMatrixWrap(*self.pycppsensmat_args)
+            self.pycpp_sensitivity_matrix.set_noise_symmetry_wrap(self.n_noise_par > 1)
 
         self._init_basis_settings()
 
         if self._averaging_active:
             self._build_and_attach_averaged_tfs()
+            if self.n_noise_par > 1:
+                self._build_and_attach_averaged_mosa_tfs()
 
     def _build_and_attach_averaged_tfs(self):
         """Precompute epoch-averaged transfer functions and attach them to the
@@ -2428,6 +2479,33 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         self._avg_tf_arrays = [xp.ascontiguousarray(a / N) for a in acc]
         self.pycpp_sensitivity_matrix.set_averaged_tfs_wrap(*self._avg_tf_arrays, nf)
 
+    def _build_and_attach_averaged_mosa_tfs(self):
+        """Per-MOSA counterpart of :meth:`_build_and_attach_averaged_tfs` for the
+        asymmetric noise model: epoch-average the 24 auto + 12 cross basis TFs."""
+        xp = self.xp
+        nf = self.num_freqs
+        N = self.pycppsensmat_args[2]
+        f_arr = xp.asarray(self.f_arr)
+
+        acc_auto = xp.zeros((24, nf), dtype=xp.float64)
+        acc_cross = xp.zeros((12, nf), dtype=xp.complex128)
+        chunk = max(1, min(N, int(1e9 // (nf * 16 * 36))))
+        for start in range(0, N, chunk):
+            cs = int(min(chunk, N - start))
+            buf_auto = xp.empty(cs * 24 * nf, dtype=xp.float64)
+            buf_cross = xp.empty(cs * 12 * nf, dtype=xp.complex128)
+            self.pycpp_sensitivity_matrix.get_noise_tfs_mosa_wrap(
+                f_arr, buf_auto, buf_cross, nf, cs, xp.arange(start, start + cs, dtype=xp.int32))
+            acc_auto += buf_auto.reshape(cs, 24, nf).sum(axis=0)
+            acc_cross += buf_cross.reshape(cs, 12, nf).sum(axis=0)
+
+        # kept alive on self: the c++ object holds raw pointers to them
+        self._avg_mosa_tf_arrays = [
+            xp.ascontiguousarray(acc_auto / N).ravel(),
+            xp.ascontiguousarray(acc_cross / N).ravel(),
+        ]
+        self.pycpp_sensitivity_matrix.set_averaged_mosa_tfs_wrap(*self._avg_mosa_tf_arrays, nf)
+
     def __deepcopy__(self, memo):
         """Custom deepcopy to handle unpicklable backend objects."""
         from copy import copy
@@ -2441,7 +2519,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
         # Manually copy attributes
         for key, value in self.__dict__.items():
-            if key in ("_backend", "pycpp_sensitivity_matrix", "_galactic_grid", "_avg_tf_arrays", "noise_normalization"):
+            if key in ("_backend", "pycpp_sensitivity_matrix", "_galactic_grid", "_avg_tf_arrays", "_avg_mosa_tf_arrays", "noise_normalization"):
                 # Don't deepcopy backend objects - just reference.
                 # _avg_tf_arrays is referenced by raw pointers inside the (shared)
                 # pycpp_sensitivity_matrix, so copies MUST share these arrays.
@@ -2756,13 +2834,18 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         xp = self.xp
         total_terms = self.basis_settings.total_terms
         num_freqs = len(freqs)
+        n_par = self.n_noise_par
 
-        noise_params = (Soms_d_in, Sa_a_in, Amp, alpha, f_1, kn, f_2)
-        batched = any(xp.ndim(p) > 0 for p in noise_params)
-        noise_params = [xp.atleast_1d(xp.asarray(p, dtype=xp.float64)).ravel() for p in noise_params]
-        num_psds = max(len(p) for p in noise_params)
+        # amplitudes: (num_psds,) symmetric, (num_psds, 6) asymmetric; a single PSD
+        # may drop the leading axis
+        amps = [xp.asarray(p, dtype=xp.float64) for p in (Soms_d_in, Sa_a_in)]
+        amps = [a.reshape(-1, n_par) if n_par > 1 else xp.atleast_1d(a).ravel() for a in amps]
+        galfor = [xp.atleast_1d(xp.asarray(p, dtype=xp.float64)).ravel() for p in (Amp, alpha, f_1, kn, f_2)]
+        num_psds = max(len(p) for p in amps + galfor)
         # xp.array copies: broadcast views are read-only, which nanobind rejects
-        noise_params = [xp.array(xp.broadcast_to(p, (num_psds,))) for p in noise_params]
+        amps = [xp.array(xp.broadcast_to(a, (num_psds,) + a.shape[1:])).ravel() for a in amps]
+        galfor = [xp.array(xp.broadcast_to(p, (num_psds,))) for p in galfor]
+        noise_params = amps + galfor
 
         c00 = xp.empty(num_psds * total_terms, dtype=xp.float64)
         c11 = xp.empty(num_psds * total_terms, dtype=xp.float64)
@@ -2962,8 +3045,10 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             run_async=False,
             convolve_window=convolve_window
         )
-        matrix = self._fill_matrix(c00, c11, c22, c01, c02, c12)
-        
+        # batched inputs return (num_psds, total_terms) elements
+        num_psds = c00.shape[0] if c00.ndim == 2 else 1
+        matrix = self._fill_matrix(c00, c11, c22, c01, c02, c12, num_psds=num_psds)
+
         if smooth and self.smoothing_sigma > 0:
             matrix = self.smooth_sensitivity_matrix(matrix, sigma=self.smoothing_sigma)
 
@@ -3007,7 +3092,16 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         """
         # this method only sets the internal matrix, and therefore cannot accept batched inputs (num_psds > 1).  Use compute_sensitivity_matrix for one-off evaluations.
 
-        assert np.isscalar(Soms_d_in) and np.isscalar(Sa_a_in) and np.isscalar(Amp) and np.isscalar(alpha) and np.isscalar(f_1) and np.isscalar(kn) and np.isscalar(f_2), "set_sensitivity_matrix only accepts scalar inputs; use compute_sensitivity_matrix for batched evaluations."
+        n_par = self.n_noise_par
+        # np.ndim, not np.isscalar: 0-d numpy/cupy arrays (e.g. psd_params[..., 0],
+        # or elements of a cupy galfor vector) count as scalars here.
+        amps_ok = (
+            np.ndim(Soms_d_in) == 0 and np.ndim(Sa_a_in) == 0
+            if n_par == 1
+            else np.size(Soms_d_in) == n_par and np.size(Sa_a_in) == n_par
+        )
+        assert amps_ok, f"set_sensitivity_matrix takes {n_par} OMS and {n_par} TM amplitude(s) for a single PSD."
+        assert all(np.ndim(p) == 0 for p in (Amp, alpha, f_1, kn, f_2)), "set_sensitivity_matrix only accepts scalar inputs; use compute_sensitivity_matrix for batched evaluations."
 
         self.sens_mat = self.compute_sensitivity_matrix(
             Soms_d_in=Soms_d_in,
@@ -3195,8 +3289,9 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         Args:
             data_in_all: Input data array. Shape (num_psds * num_channels * num_freqs * num_times)
             data_index_all: Data indices array to keep track of which data corresponds to which PSD. Shape (num_psds)
-            Soms_in_all: Displacement noise levels for each walker. Shape (num_psds)
-            Sa_in_all: Acceleration noise levels for each walker. Shape (num_psds)
+            Soms_in_all: Displacement noise levels for each walker. Shape (num_psds), or
+                (num_psds, 6) per-MOSA amplitudes for ``noise_symmetry="asymmetric"``.
+            Sa_in_all: Acceleration noise levels for each walker, same shape as ``Soms_in_all``.
             Amp_in_all: Galactic foreground amplitude for each walker. Shape (num_psds)
             alpha_in_all: Galactic foreground alpha for each walker. Shape (num_psds)
             f_1_in_all: First galactic foreground scale-frequency parameter for each walker. Shape (num_psds)
@@ -3218,8 +3313,9 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         def _sanitize(p):
             return xp.ascontiguousarray(xp.atleast_1d(xp.asarray(p)), dtype=xp.float64)
 
-        Soms_in_all = _sanitize(Soms_in_all)
-        Sa_in_all = _sanitize(Sa_in_all)
+        # asymmetric noise: (num_psds, 6) amplitudes, flattened psd-major for the kernel
+        Soms_in_all = _sanitize(Soms_in_all).ravel()
+        Sa_in_all = _sanitize(Sa_in_all).ravel()
 
         Amp_in_all = _sanitize(Amp_in_all)
         alpha_in_all = _sanitize(alpha_in_all)
@@ -3229,7 +3325,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         
         # same for splines?
 
-        num_psds = len(Soms_in_all)
+        num_psds = len(Soms_in_all) // self.n_noise_par
 
         log_like_out = xp.zeros(shape=(num_psds,), dtype=xp.float64)
 
@@ -3415,7 +3511,9 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             name: Identifier label attached to the returned copy (``new_sens_mat.name``).
             psd_params: Noise parameters for this walker.
 
-                - Without splines: ``[Soms_d, Sa_a]`` — shape ``(2,)``.
+                - Without splines: ``[Soms_d, Sa_a]`` — shape ``(2,)``; for
+                  ``noise_symmetry="asymmetric"``, 6 OMS then 6 TM amplitudes,
+                  shape ``(12,)`` (see :meth:`split_psd_params`).
                 - With splines: ``[Soms_d, Sa_a, amp₀, pos₀, amp₁, pos₁, ...]``
                   where the remaining elements are interleaved OMS + TM knot
                   amplitudes and positions; see :meth:`build_spline_arrays`.
@@ -3448,10 +3546,9 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         new_sens_mat = copy(self)
         new_sens_mat.name = name
 
-        Soms_d = psd_params[0]
-        Sa_a = psd_params[1]
+        Soms_d, Sa_a, spline_params = self.split_psd_params(psd_params)
         if self.use_splines:  # assume transformed input.
-            spline_knots_position, spline_knots_amplitude = self.build_spline_arrays(psd_params[2:])
+            spline_knots_position, spline_knots_amplitude = self.build_spline_arrays(spline_params)
         else:
             spline_knots_position = None
             spline_knots_amplitude = None
