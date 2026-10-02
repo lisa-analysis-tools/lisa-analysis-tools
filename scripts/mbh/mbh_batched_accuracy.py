@@ -90,9 +90,10 @@ DAY = 86400.0
 #: per-mode defaults of the accuracy-only flags (CLI > preset), as the benchmark's PRESETS
 ACC_PRESETS = {
     "full": dict(near=2, prod_T_days="default"),
-    # the smoke stands a 6-h generation window in for the production 30.44 d: the
+    # the smoke stands a 1-d generation window in for the production 30.44 d: the
     # laptop's phentax runs un-jitted, where a 30-d waveform costs GBs and minutes
-    "smoke": dict(near=1, prod_T_days="0.25"),
+    # (a 6-h one is all zero after the generator's 15000-s onset warm-up zeroing)
+    "smoke": dict(near=1, prod_T_days="1"),
 }
 
 
@@ -208,6 +209,9 @@ def row_metrics(ac_data, dd, sens, h_ref, h_b, box):
         ref_power_outside_box=float(p_tot - p[..., box].sum()) / p_tot if p_tot > 0 else nan,
         ref_snr2_outside_box=1.0 - hh_ref_box / hh_ref if hh_ref > 0 else nan,
         delta_norm=dnorm, snr_ref=float(np.sqrt(max(hh_ref, 0.0))), snr_batched=snr_b,
+        # an all-zero reference (e.g. a generation window inside the onset zeroing): its
+        # ratios are meaningless; flagged instead of read
+        degenerate_reference=bool(hh_ref <= 0.0),
         vs_ref=dict(mm=1.0 - dh_b / (data_snr * snr_b) if data_snr > 0 and snr_b > 0 else nan,
                     logL=ll_b, snr_ratio=snr_b / data_snr if data_snr > 0 else nan, snr=snr_b),
     )
@@ -321,19 +325,24 @@ def main(argv=None):
                   f"| kept err {m['kept_layer_rel_err']:.2e} | outside box {m['ref_power_outside_box']:.2e} "
                   f"(SNR^2 {m['ref_snr2_outside_box']:.2e}) | ||delta|| {m['delta_norm']:.3e} | SNR ref/batched "
                   f"{m['snr_ref']:.2f}/{m['snr_batched']:.2f} | mm over the active box {m['vs_ref']['mm']:.3e} "
-                  f"| stock {t_ref[i]:.3g} s", flush=True)
+                  f"| stock {t_ref[i]:.3g} s"
+                  + (" | DEGENERATE reference (all zero)" if m["degenerate_reference"] else ""), flush=True)
         del data, ac_data, h_ref
         gc.collect()
 
     gate = [m for m in results["stock90"] if m["gating"]]
     worst_dll = max(abs(m["dlogL"]) for m in gate)
     worst_mm = max(m["mismatch"] for m in gate)
-    ok = bool(worst_dll <= float(args.acc_tol) and worst_mm < float(acc.mm_tol))
+    # an all-zero gating reference cannot pass: its mismatch is undefined
+    ok = bool(worst_dll <= float(args.acc_tol) and worst_mm < float(acc.mm_tol)
+              and not any(m["degenerate_reference"] for m in gate))
     info = ""
     if "prod" in results:
         info = (f"; vs production stock (T {refs[1][1]['T_days']:.4g} d, order {acc.prod_order}, information): "
                 f"max|dlogL| {max(abs(m['dlogL']) for m in results['prod']):.3e}, max mm "
                 f"{max(m['mismatch'] for m in results['prod']):.3e}")
+        if any(m["degenerate_reference"] for m in results["prod"]):
+            info += " [DEGENERATE: the production reference is all zero; ignore these numbers]"
     verdict = "PASS" if ok else "FAIL"
     snr = results["stock90"][0]["snr_ref"]           # the source's optimal SNR at this duration
     mm_prod = None if "prod" not in results else results["prod"][0]["vs_ref"]["mm"]
