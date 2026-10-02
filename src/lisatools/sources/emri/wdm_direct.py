@@ -159,31 +159,65 @@ def plunge_chunk_wdm(td_tail_fn, n_h, Nt, Nf, dt, Nt_sub=128, n_end=None, ind_ma
 # Per-channel tracer from the TDI-on-the-fly output, and the full assembly
 # ----------------------------------------------------------------------
 
-def tracer_from_tof_output(out, t_pixels, h=30.0, h_fdot=None):
+def _spline_vals(out, t, subs):
+    if subs is None:
+        return out.eval_spline_vals(t)
+    return out.eval_spline_vals(t, subs=subs)
+
+
+def _total_phase(out, t, subs=None):
+    """Channel phase ``(S, nch, len(t))`` of a response output at times ``t``."""
+    if hasattr(out, "eval_phase"):
+        return out.eval_phase(t) if subs is None else out.eval_phase(t, subs=subs)
+    _, tph, pref = _spline_vals(out, t, subs)
+    xp = getattr(out, "xp", np)
+    return xp.asarray(tph) + xp.asarray(pref)[:, None, :]
+
+
+def tracer_from_tof_output(out, t_pixels, h=30.0, h_fdot=None, max_elems=None, subs=None):
     """Per-sub, per-channel ``(amp, phase, f, fdot)`` at ``t_pixels`` [absolute s].
 
     The channel signal is ``Re[amp exp(-i phase)]`` with ``phase = tdi_phase + phase_ref``
-    (``TDTDIOutput.eval_tdi``). ``f`` and ``fdot`` are central differences (step ``h``)
-    of that CONTINUOUS spline phase, so they carry the Doppler shift of the channel
-    (the source-frame f is off by ~1e-4 f, a ~1% pixel error). A negative-frequency
-    sub (a -m partner) is mirrored to positive frequency: cos is even, so
-    ``phase -> -phase``, ``f -> -f``, ``fdot -> -fdot``.
-    Returns arrays of shape ``(num_sub, nch, P)``.
+    (``TDTDIOutput.eval_tdi``; an :class:`ExactPhaseTDIOutput` adds its exact carrier instead).
+    ``f`` and ``fdot`` are central differences (step ``h``, ``h_fdot``) of that CONTINUOUS
+    phase, so they carry the Doppler shift of the channel (the source-frame f is off by ~1e-4 f,
+    a ~1% pixel error). A negative-frequency sub (a -m partner) is mirrored to positive
+    frequency: cos is even, so ``phase -> -phase``, ``f -> -f``, ``fdot -> -fdot``.
+
+    ``subs`` (host integer array, optional): only these harmonics (rows of the output), for a
+    mode-batched caller (needs an output with subset evaluation, :class:`SplinedTDIOutput`).
+
+    Memory: evaluated in blocks of pixels so no temporary exceeds ``max_elems`` (env
+    ``EMRI_TRACER_MAX_ELEMS``, default 6e7) elements per ``(S, nch, block)`` array, and the
+    amplitude is read at the pixel centres only. Returns arrays of shape ``(num_sub, nch, P)``.
     """
     xp = getattr(out, "xp", np)
     t = xp.asarray(t_pixels, dtype=float)
     hd = float(os.environ.get("EMRI_TRACER_H_FDOT", "300")) if h_fdot is None else float(h_fdot)
-    P = t.size
-    # ONE spline evaluation at all five stencils (t, t +- h, t +- hd)
-    amp_all, tph, pref = out.eval_spline_vals(xp.concatenate([t, t + h, t - h, t + hd, t - hd]))
-    ph = xp.asarray(tph) + xp.asarray(pref)[:, None, :]
-    ph0, php, phm, phpd, phmd = (ph[..., k * P:(k + 1) * P] for k in range(5))
-    amp = xp.asarray(amp_all)[..., :P]
-    f = (php - phm) / (2 * h) / (2 * np.pi)
-    fdot = (phpd - 2 * ph0 + phmd) / hd ** 2 / (2 * np.pi)   # phase ~1e5 rad: a short
-    #                                                   step turns roundoff into fdot noise
-    neg = f < 0
-    return amp, xp.where(neg, -ph0, ph0), xp.where(neg, -f, f), xp.where(neg, -fdot, fdot)
+    P = int(t.size)
+    try:
+        S = int(np.size(subs)) if subs is not None else int(np.shape(out.x)[0])
+        nch = int(getattr(out, "nch", 0) or np.shape(out.tdi_amp)[1])
+    except AttributeError:                                  # a minimal output: one pass
+        S = nch = 1
+    budget = float(os.environ.get("EMRI_TRACER_MAX_ELEMS", 6e7)) if max_elems is None else float(max_elems)
+    block = max(1, int(budget // max(1, S * nch)))
+    parts = []
+    for p0 in range(0, P, block):
+        tb = t[p0:p0 + block]
+        amp, tph, pref = _spline_vals(out, tb, subs)
+        amp = xp.asarray(amp)
+        ph0 = xp.asarray(tph) + xp.asarray(pref)[:, None, :]
+        del tph, pref
+        f = (_total_phase(out, tb + h, subs) - _total_phase(out, tb - h, subs)) / (2 * h) / (2 * np.pi)
+        fdot = (_total_phase(out, tb + hd, subs) - 2 * ph0 + _total_phase(out, tb - hd, subs)) / hd ** 2 / (2 * np.pi)
+        #                                     phase ~1e5 rad: a short step turns roundoff into fdot noise
+        neg = f < 0
+        parts.append((amp, xp.where(neg, -ph0, ph0), xp.where(neg, -f, f), xp.where(neg, -fdot, fdot)))
+        del ph0, f, fdot, neg
+    if len(parts) == 1:
+        return parts[0]
+    return tuple(xp.concatenate([p[k] for p in parts], axis=-1) for k in range(4))
 
 
 def _scatter_add(xp, acc, idx, vals):
@@ -435,7 +469,69 @@ def pad_grid(g, N):
     return g
 
 
-class ExactPhaseTDIOutput:
+class SplinedTDIOutput:
+    """A dense TDI response's amplitude and phase splined over its output grid, evaluable for
+    any SUBSET of harmonics (a mode-batched caller keeps every temporary at a block's size).
+
+    The channel signal of harmonic ``s`` is ``amp(t) exp(-i (carrier_s(t) + r(t)))``; here the
+    carrier is the kernel's ``phase_ref`` and ``r`` its ``tdi_phase``, both splined (the
+    original construction: the grid must resolve the whole phase). Duck-types what
+    :func:`tracer_from_tof_output` and the plunge tail read from a ``TDTDIOutput``: ``x``,
+    ``xp``, ``nch``, ``eval_spline_vals(t, subs=None)`` (``(amp, r, carrier)``),
+    ``eval_phase(t, subs=None)`` and ``eval_tdi(t)``.
+    """
+
+    def __init__(self, out, sub_mkn, sub_temp):
+        self.xp = out.xp
+        self.x = out.x
+        self.nch = int(out.tdi_amp.shape[1])
+        self.num_sub = int(out.tdi_amp.shape[0])
+        self._temp = np.asarray(sub_temp, dtype=np.int64).reshape(-1)
+        self._mkn_host = np.asarray(sub_mkn, dtype=float).reshape(-1, 3)
+        self._amp_spl = out.build_spline(out.x, out.tdi_amp)
+        self._res_spl = out.build_spline(out.x, self._residual(out))
+        self._car_spl = self._carrier_spline(out)
+
+    def _residual(self, out):
+        return out.tdi_phase
+
+    def _carrier_spline(self, out):
+        return out.build_spline(out.x, out.phase_ref)
+
+    def _subs(self, subs):
+        return np.arange(self.num_sub) if subs is None else np.asarray(subs, dtype=np.int64).reshape(-1)
+
+    def _eval_chan(self, spl, t, subs):
+        """A per-(harmonic, channel) spline at the shared times ``t``: ``(len(subs), nch, M)``."""
+        xp = self.xp
+        t = xp.asarray(t, dtype=float)
+        n = subs.size
+        ind = xp.asarray(subs[:, None] * self.nch + np.arange(self.nch)[None, :])
+        return spl(xp.tile(t, (n, self.nch, 1)), ind_interps=ind)
+
+    def carrier(self, t, subs=None):
+        """Carrier phase ``(len(subs), len(t))``."""
+        xp = self.xp
+        subs = self._subs(subs)
+        t = xp.asarray(t, dtype=float)
+        return self._car_spl(xp.tile(t, (subs.size, 1)), ind_interps=xp.asarray(subs))
+
+    def eval_spline_vals(self, t, subs=None):
+        subs = self._subs(subs)
+        return (self._eval_chan(self._amp_spl, t, subs), self._eval_chan(self._res_spl, t, subs),
+                self.carrier(t, subs))
+
+    def eval_phase(self, t, subs=None):
+        """Channel phase ``r + carrier`` only (no amplitude): ``(len(subs), nch, len(t))``."""
+        subs = self._subs(subs)
+        return self._eval_chan(self._res_spl, t, subs) + self.carrier(t, subs)[:, None, :]
+
+    def eval_tdi(self, t, subs=None):
+        amp, res, car = self.eval_spline_vals(t, subs)
+        return self.xp.real(amp * self.xp.exp(-1j * (res + car[:, None, :])))
+
+
+class ExactPhaseTDIOutput(SplinedTDIOutput):
     """A dense TDI response computed on a SPARSE time grid, evaluated anywhere with the
     harmonic's EXACT carrier phase.
 
@@ -446,55 +542,52 @@ class ExactPhaseTDIOutput:
     residual ``r = tdi_phase + phase_ref - Phi_s`` (the Doppler delay to spacecraft 1, the
     polarisation and transfer-function phase, the mode amplitude's own phase) -- so only
     ``amp`` and ``r`` are splined over the response grid. The response therefore needs only
-    the trajectory's own knots plus a spacing cap, not one sample per pixel.
-
-    Duck-types what :func:`tracer_from_tof_output` and the plunge tail read from a
-    ``TDTDIOutput``: ``x``, ``xp``, ``eval_spline_vals(t)`` (``(amp, r, Phi)``, so ``r + Phi``
-    is the channel phase) and ``eval_tdi(t)``.
+    the trajectory's own knots plus a spacing cap, not one sample per pixel. The carrier is
+    evaluated on the output's array module (the GPU on a GPU run), per template.
     """
 
     def __init__(self, out, t_knots, coeffs, sub_mkn, sub_temp):
-        self.xp = out.xp
-        self.x = out.x
-        self._t_knots = [np.asarray(tk, dtype=float) for tk in t_knots]       # absolute, per template
-        self._coeffs = [np.asarray(c, dtype=float) for c in coeffs]
-        self._mkn = np.asarray(sub_mkn, dtype=float).reshape(-1, 3)
-        self._temp = np.asarray(sub_temp, dtype=np.int64).reshape(-1)
-        self.nch = int(out.tdi_amp.shape[1])
-        x_host = np.asarray(out.x.get() if hasattr(out.x, "get") else out.x)
-        carrier = self.xp.empty(out.phase_ref.shape)
-        for b in range(len(self._t_knots)):
-            subs = np.flatnonzero(self._temp == b)
-            if subs.size:
-                carrier[self.xp.asarray(subs)] = self._carrier_rows(b, subs, x_host[subs[0]])
-        resid = out.tdi_phase + (out.phase_ref - carrier)[:, None, :]
-        self._amp_spl = out.build_spline(out.x, out.tdi_amp)
-        self._res_spl = out.build_spline(out.x, resid)
+        xp = out.xp
+        self._tk = [xp.asarray(np.asarray(tk, dtype=float)) for tk in t_knots]   # absolute, per template
+        self._C = [xp.asarray(np.asarray(c, dtype=float)) for c in coeffs]
+        self._mkn = xp.asarray(np.asarray(sub_mkn, dtype=float).reshape(-1, 3))
+        super().__init__(out, sub_mkn, sub_temp)
 
-    def _carrier_rows(self, b, subs, t):
-        """``Phi_s(t)`` for template ``b``'s harmonics ``subs`` at times ``t`` (1-D)."""
-        tk = self._t_knots[b]
-        P3 = dense_phase_eval(tk, self._coeffs[b], np.clip(np.asarray(t, dtype=float), tk[0], tk[-1]))
-        return self.xp.asarray(self._mkn[subs]) @ self.xp.asarray(P3.T)
+    def _residual(self, out):
+        xp = self.xp
+        carrier = xp.empty(out.phase_ref.shape)
+        x = out.x
+        for b in np.unique(self._temp):
+            rows = np.flatnonzero(self._temp == b)
+            carrier[xp.asarray(rows)] = self._mkn[xp.asarray(rows)] @ self._P3(int(b), x[int(rows[0])]).T
+        return out.tdi_phase + (out.phase_ref - carrier)[:, None, :]
 
-    def carrier(self, t):
-        """``Phi_s(t)`` for every harmonic at the shared times ``t``: ``(S, len(t))``."""
-        t_host = np.asarray(t.get() if hasattr(t, "get") else t, dtype=float)
-        out = self.xp.empty((self._mkn.shape[0], t_host.size))
-        for b in range(len(self._t_knots)):
-            subs = np.flatnonzero(self._temp == b)
-            if subs.size:
-                out[self.xp.asarray(subs)] = self._carrier_rows(b, subs, t_host)
+    def _carrier_spline(self, out):
+        return None
+
+    def _P3(self, b, t):
+        """Template ``b``'s three fundamental phases at the 1-D times ``t``: ``(len(t), 3)``."""
+        xp = self.xp
+        tk, C = self._tk[b], self._C[b]
+        t = xp.clip(xp.asarray(t, dtype=float), tk[0], tk[-1])
+        seg = xp.clip(xp.searchsorted(tk, t, side="right") - 1, 0, tk.size - 2)
+        s = ((t - tk[seg]) / (tk[seg + 1] - tk[seg]))[:, None]
+        s1 = 1.0 - s
+        c = C[seg]
+        return c[..., 0] + s * (c[..., 1] + s1 * (c[..., 2] + s * (c[..., 3] + s1 * (c[..., 4] + s * (
+            c[..., 5] + s1 * (c[..., 6] + s * c[..., 7]))))))
+
+    def carrier(self, t, subs=None):
+        """``Phi_s(t)`` for harmonics ``subs`` at the shared times ``t``: ``(len(subs), len(t))``."""
+        xp = self.xp
+        subs = self._subs(subs)
+        t = xp.asarray(t, dtype=float)
+        out = xp.empty((subs.size, t.size))
+        temp = self._temp[subs]
+        for b in np.unique(temp):
+            pos = np.flatnonzero(temp == b)
+            out[xp.asarray(pos)] = self._mkn[xp.asarray(subs[pos])] @ self._P3(int(b), t).T
         return out
-
-    def eval_spline_vals(self, t):
-        t = self.xp.asarray(t, dtype=float)
-        tt = self.xp.tile(t, (self._mkn.shape[0], self.nch, 1))
-        return self._amp_spl(tt), self._res_spl(tt), self.carrier(t)
-
-    def eval_tdi(self, t):
-        amp, res, car = self.eval_spline_vals(t)
-        return self.xp.real(amp * self.xp.exp(-1j * (res + car[:, None, :])))
 
 
 def feed_from_tracks(tracks, amp_factor):
@@ -835,9 +928,9 @@ class EMRIDirectWDM:
             t_k, n_k, C, np.concatenate(are), np.concatenate(aim), amp_factor=EMRITDIonFly.AMP_FACTOR,
             tdi_config=self.tdi_config, orbits=self.orbits, force_backend=self.force_backend)
         # outside the trajectory the kernel holds the reference phase at the trajectory end (no jump)
-        if self.response_grid != "sparse":
-            return dense(np.array(par))
         out = dense(np.array(par), return_spline=False)
+        if self.response_grid != "sparse":
+            return SplinedTDIOutput(out, np.concatenate(mkn), dense.sub_temp_host)
         return ExactPhaseTDIOutput(out, tk_abs, Cs, np.concatenate(mkn), dense.sub_temp_host)
 
     def _call_knots(self, few_args, few_kwargs, modes):
@@ -1113,13 +1206,30 @@ class EMRIDirectWDM:
             assert np.array_equal(n_trs[k][pos], n_ok)
             trk += [subset_track(tr, pos) for tr in tracks[k]]
             sub_row += [r] * len(tracks[k])
-        tracer = tracer_from_tof_output(out, xp.asarray(tt))
-        assert tracer[0].shape[0] == len(trk), (tracer[0].shape, len(trk))
-        st = accumulate_harmonic_batch(
-            out_arr, self.table, trk, tracer, n_ok, None, Nf=Nf, Nt=Nt, dt=dt, layer_dt=ldt,
-            layer_df=ldf, t0=self.data_t0, Nt_sub=self.Nt_sub, num_m_layers=self.num_m_layers,
-            fdot_axis_max=self.fdot_axis_max, pixel_edge=self.pixel_edge, backend=self.force_backend,
-            sub_row=np.asarray(sub_row))
-        stats.update(subs=len(trk), **st)
+        # tracer + lookup in blocks of harmonics (modes): every per-block array is (block, nch,
+        # pixels), whatever the number of rows and the duration (EMRI_DIRECT_MODE_BLOCK_ELEMS
+        # elements per such array, default 2e7 = 160 MB)
+        S, P = len(trk), int(tt.size)
+        nch = self.tdi_config.nchannels
+        if isinstance(out, SplinedTDIOutput):
+            budget = float(os.environ.get("EMRI_DIRECT_MODE_BLOCK_ELEMS", 2e7))
+            blk = max(1, int(budget // max(1, nch * P)))
+        else:                                                # spline response: no subset evaluation
+            blk = S
+        sub_row = np.asarray(sub_row)
+        tot = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
+        for s0 in range(0, S, blk):
+            subs = np.arange(s0, min(S, s0 + blk))
+            tracer = tracer_from_tof_output(out, xp.asarray(tt), subs=subs if blk < S else None)
+            assert tracer[0].shape[0] == subs.size, (tracer[0].shape, subs.size)
+            st = accumulate_harmonic_batch(
+                out_arr, self.table, trk[s0:s0 + subs.size], tracer, n_ok, None, Nf=Nf, Nt=Nt, dt=dt,
+                layer_dt=ldt, layer_df=ldf, t0=self.data_t0, Nt_sub=self.Nt_sub,
+                num_m_layers=self.num_m_layers, fdot_axis_max=self.fdot_axis_max,
+                pixel_edge=self.pixel_edge, backend=self.force_backend, sub_row=sub_row[subs])
+            for k in tot:
+                tot[k] += st[k]
+            del tracer
+        stats.update(subs=S, mode_blocks=-(-S // blk), **tot)
         self.last_stats = stats
         return out_arr

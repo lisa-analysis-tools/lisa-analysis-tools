@@ -130,6 +130,23 @@ class SparseResponseTest(unittest.TestCase):
         self.assertEqual((p[0], p[-1]), (g[0], g[-1]))          # stays inside the span
         self.assertTrue(set(g.tolist()) <= set(p.tolist()) and np.all(np.diff(p) > 0))
 
+    def test_tracer_in_pixel_blocks_equals_one_pass(self):
+        """The memory-bounded tracer (many small pixel blocks) == one pass, on both outputs."""
+        from lisatools.sources.emri.wdm_direct import tracer_from_tof_output
+
+        for out in (self.sparse, self.fine):
+            one = tracer_from_tof_output(out, self.t_pix)
+            blocks = tracer_from_tof_output(out, self.t_pix, max_elems=3 * 3 * 7)   # 7 pixels per block
+            for a, b in zip(one, blocks):
+                np.testing.assert_allclose(np.asarray(b), np.asarray(a), rtol=1e-14, atol=0)
+
+    def test_carrier_equals_the_reference_evaluator(self):
+        from lisatools.sources.emri.wdm_direct import dense_phase_eval
+
+        car = np.asarray(self.sparse.carrier(self.t_pix))
+        want = self.mkn @ dense_phase_eval(self.t_k, self.C, self.t_pix).T
+        np.testing.assert_allclose(car, want, rtol=1e-13, atol=0)
+
     def test_carrier_is_held_outside_the_trajectory(self):
         t = np.array([self.t_k[-1], self.t_k[-1] + 5000.0, self.t_k[0] - 5000.0, self.t_k[0]])
         car = np.asarray(self.sparse.carrier(t))
@@ -223,12 +240,30 @@ class DirectWDMResponseGridTest(unittest.TestCase):
         self.assertEqual((x[2, 0], x[2, -1]), (1.0e7 + g2[0], 1.0e7 + g2[-1]))   # padded INSIDE
         self.assertTrue(set((1.0e7 + g2).tolist()) <= set(x[2].tolist()))
 
-    def test_pixels_keeps_the_splined_output(self):
-        from lisatools.response.tdionfly import TDTDIOutput
+    def test_pixels_keeps_the_whole_phase_spline(self):
+        from lisatools.sources.emri.wdm_direct import ExactPhaseTDIOutput, SplinedTDIOutput
 
         items, t_k = self._items()
         out = self._direct("pixels")._dense_response(items, np.linspace(t_k[0], t_k[-1], 50))
-        self.assertIsInstance(out, TDTDIOutput)
+        self.assertIsInstance(out, SplinedTDIOutput)
+        self.assertNotIsInstance(out, ExactPhaseTDIOutput)
+
+    def test_mode_blocks_equal_one_pass(self):
+        """The tracer over blocks of harmonics (the batch path's mode blocks) == all at once,
+        for both output kinds, across a template boundary."""
+        from lisatools.sources.emri.wdm_direct import tracer_from_tof_output
+
+        items, t_k = self._items()
+        t_pix = np.linspace(1.0e7 + t_k[0] + 3 * 3600, 1.0e7 + t_k[-1] - 3 * 3600, 23)
+        for grid, g in (("sparse", [np.linspace(t_k[0] + 600, t_k[-1] - 600, 11)] * 2),
+                        ("pixels", np.linspace(t_k[0], t_k[-1], 200))):
+            out = self._direct(grid)._dense_response(items, g)
+            full = tracer_from_tof_output(out, t_pix)
+            for blocks in ([[0, 1], [2, 3]], [[0], [1, 2], [3]]):
+                parts = [tracer_from_tof_output(out, t_pix, subs=np.array(b)) for b in blocks]
+                for k in range(4):
+                    got = np.concatenate([np.asarray(p[k]) for p in parts], axis=0)
+                    np.testing.assert_allclose(got, np.asarray(full[k]), rtol=1e-14, atol=0, err_msg=grid)
 
     def test_sparse_grid_stays_inside_the_orbit_tables(self):
         """Outside the orbit tables the kernel zeroes the channel; a half-day spline across that
