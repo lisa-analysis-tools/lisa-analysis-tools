@@ -541,22 +541,25 @@ CPU at 6 months, the lookup step 0.54 -> 0.09 s at 8 rows (the serial CPU build)
 the expectation is ~ms for the whole lookup at 288 rows, leaving the response build (`resp`,
 with its `pn` part) as the call.
 
-Morning runbook (after the merge to dev + push, on Mike's word):
+Cluster verification (mirrors the EMRI one: one unit-test line plus one speed/accuracy script):
 
-    # cluster, LAT checkout on dev
     git pull origin dev
     pip install -e . --no-build-isolation          # REBUILDS the C++/CUDA modules (both kernels)
     export SOBBH_LOOKUP_TABLE_PATH=/path/you/built/wdm_lookup_sobbh_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5
-    python -m unittest tests.test_sobbh_lookup_kernel -v          # GPUKernelParityTest must PASS (not skip)
-    python -m unittest tests.test_sobbh_lookup_batching tests.test_wdm_lookup_eval tests.test_sobbh_sparse_response tests.test_sobbh_lookup_stock tests.test_sobbh_wdm_direct tests.test_sobbh_lookup_move
-    for NT in 4320 17280; do for K in kernel python; do
-      MBHTDIONFLY_TIMING=1 python scripts/sobbh/sobbh_lookup_speed_gpu.py --backend cuda13x --nt $NT --rows 8,32,96,288 --kernel $K --out speed_${K}_${NT}.jsonl
-    done; done
-    python scripts/sobbh/sobbh_lookup_gate.py --nt 4320 --rows 4 --no-chunked --out gate_spline_6mo.jsonl
+    python -m unittest tests.test_sobbh_lookup_kernel tests.test_sobbh_lookup_batching tests.test_sobbh_sparse_response tests.test_sobbh_wdm_direct tests.test_wdm_lookup_eval -v
+    bash scripts/sobbh/sobbh_speed_durations.sh
 
-The speed header line names the path (`lookup=fused kernel` / `python`); with the kernel the
-`look` column is the fused kernel and `trac` / `inner` are 0. `max|dll|` vs the chunked comp must
-match between `--kernel kernel` and `--kernel python` to ~1e-10 (same lookup semantics).
+The unit line must show `test_gpu_equals_cpu ... ok` (a skip means the GPU module has no
+`sobbh_lookup`: the rebuild did not take). `scripts/sobbh/sobbh_speed_durations.sh` (the twin of
+`scripts/emri/emri_speed_durations.sh`; knobs BACKEND, DAYS "180 360 720", TABLE, ROWS, LOOKUPS
+"kernel,python", REPS, GATE_ROWS, GATE, SPEED_ARGS, OUT) runs per duration (Nt = days * 24):
+the speed script on the production grid once per lookup (the chunked comp alongside the first:
+ch/look and max|dll|; the `MBHTDIONFLY_TIMING` stage profile), then the accuracy gate per lookup
+(per-source mismatch / ratio / dlogL vs the dense transform, and `[gate] ... max|lnL lookup -
+exact|` for the comp's scoring path). Logs and JSON lines in `sobbh_speed_durations_<date>/`.
+With the kernel the speed table's `look` column is the fused kernel and `trac` / `inner` read 0;
+the `[gate]` line must agree between `lookup=kernel` and `lookup=python` (same semantics; on the
+laptop smoke both gave 1.178e-05).
 
 ### The table during a global-fit run (2026-10-02, the EMRI way)
 
