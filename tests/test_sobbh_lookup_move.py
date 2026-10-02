@@ -104,9 +104,9 @@ def _build_toy(tmpdir):
         tdi_type="XYZ",
         n_grid=1024,
         buffer_time=5000.0,
-        eval_dt=600.0,
+        # production defaults: 12-h response grid, the table's B-spline, the fused kernel
+        # when the backend module has it (else the Python lookup)
         num_m_layers=2,
-        interp="cubic",
         row_batch=4,
         force_backend=backend,
         d_d=0.0,
@@ -203,11 +203,17 @@ class SOBBHLookupParityTest(unittest.TestCase):
         rows, idx = self._rows()
         slow = move.compute_acs_like(rows, idx, **move.waveform_like_kwargs)
         snr2 = 2.0 * float(slow[0] - move._exposed_offset[idx[0]])
+        # the switch lives on the Python evaluator: route this call through the Python lookup
+        # (the fused kernel always applies the quarter turn; its own controls and mutations
+        # are in tests/test_sobbh_lookup_kernel.py)
+        uses_kernel = self.comp.uses_kernel
+        self.comp.uses_kernel = False
         self.comp.direct.ev.basis_cycle = "no_parity_turn"
         try:
             fast = move.compute_like(rows, idx)
         finally:
             self.comp.direct.ev.basis_cycle = "quarter_turn"
+            self.comp.uses_kernel = uses_kernel
         diff = np.abs(fast - slow)
         self.assertGreater(
             float(diff.max()),

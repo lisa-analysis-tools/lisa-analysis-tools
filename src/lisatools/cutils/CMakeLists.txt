@@ -139,6 +139,15 @@ if(LISATOOLS_WITH_CPU)
     DEPENDS "gf_routing_kernels.cu"
     VERBATIM
     )
+  # 2026-10-02: the fused SOBBH direct-to-WDM lookup (same single-source rule).
+  add_custom_command(
+    OUTPUT "sobbh_lookup_kernel.cxx"
+    COMMENT "Copy sobbh_lookup_kernel.cu to sobbh_lookup_kernel.cxx"
+    COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/sobbh_lookup_kernel.cu"
+            "${CMAKE_CURRENT_BINARY_DIR}/sobbh_lookup_kernel.cxx"
+    DEPENDS "sobbh_lookup_kernel.cu"
+    VERBATIM
+    )
 
   # Phase 3E adds LISAResponse.cxx to the detector static library so all
   # LISA-side C++ symbols live in one .so per backend wheel.
@@ -151,12 +160,12 @@ if(LISATOOLS_WITH_CPU)
   # matrix backend + STFT/FD domain likelihood kernels).
   # The 2026-08-27 orchestration audit adds gf_routing_kernels.cxx (fused GB
   # in-model gate/compaction + accept/bookkeeping kernels).
-  add_library(lisaanalysistools_cpu_detector_static STATIC Detector.cxx PSD.cxx LISAResponse.cxx lat_tdi_on_the_fly.cxx lat_spline_tdi_waveform.cxx galactic_response.cxx domains.cxx gf_routing_kernels.cxx)
+  add_library(lisaanalysistools_cpu_detector_static STATIC Detector.cxx PSD.cxx LISAResponse.cxx lat_tdi_on_the_fly.cxx lat_spline_tdi_waveform.cxx galactic_response.cxx domains.cxx gf_routing_kernels.cxx sobbh_lookup_kernel.cxx)
   apply_cpu_backend_common_options(detector lisatools lisaanalysistools true)
   target_include_directories(lisaanalysistools_cpu_detector_static PUBLIC ${GBT_CUTILS})
 
   target_sources(lisaanalysistools_cpu_detector_static PUBLIC FILE_SET HEADERS FILES
-                                        Detector.hpp  PSD.hpp  LISAResponse.hh domains.hpp galactic_response.hpp gf_routing_kernels.hpp)
+                                        Detector.hpp  PSD.hpp  LISAResponse.hh domains.hpp galactic_response.hpp gf_routing_kernels.hpp sobbh_lookup_kernel.hpp)
 
   # Phase 3E adds binding_flr.cxx to the nanobind module so response_part(m)
   # is linked in alongside detector_part(m). (binding.cxx renamed to
@@ -180,13 +189,13 @@ if(LISATOOLS_WITH_GPU)
   # The 2026-08-27 orchestration audit adds gf_routing_kernels.cu (fused GB
   # in-model gate/compaction + accept/bookkeeping kernels); no copy step on
   # this side -- the same .cu goes straight to nvcc.
-  add_library(lisaanalysistools_gpu_detector_gpu_static STATIC Detector.cu PSD.cu LISAResponse.cu lat_tdi_on_the_fly.cu lat_spline_tdi_waveform.cu galactic_response.cu domains.cu gf_routing_kernels.cu)
+  add_library(lisaanalysistools_gpu_detector_gpu_static STATIC Detector.cu PSD.cu LISAResponse.cu lat_tdi_on_the_fly.cu lat_spline_tdi_waveform.cu galactic_response.cu domains.cu gf_routing_kernels.cu sobbh_lookup_kernel.cu)
   apply_gpu_backend_common_options(detector_gpu lisatools lisaanalysistools true)
   target_include_directories(lisaanalysistools_gpu_detector_gpu_static PUBLIC ${GBT_CUTILS})
   target_include_directories(lisaanalysistools_gpu_detector_gpu_static SYSTEM PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
 
   target_sources(lisaanalysistools_gpu_detector_gpu_static PUBLIC FILE_SET HEADERS FILES
-                                        Detector.hpp PSD.hpp LISAResponse.hh domains.hpp galactic_response.hpp gf_routing_kernels.hpp)
+                                        Detector.hpp PSD.hpp LISAResponse.hh domains.hpp galactic_response.hpp gf_routing_kernels.hpp sobbh_lookup_kernel.hpp)
 
   nanobind_add_module(lisaanalysistools_gpu_pycppdetector binding_detector.cxx binding_flr.cxx)
   apply_gpu_backend_common_options(pycppdetector lisatools lisaanalysistools false)

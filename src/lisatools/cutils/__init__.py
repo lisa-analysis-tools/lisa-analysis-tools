@@ -115,6 +115,13 @@ class LISAToolsBackendMethods(BackendMethods):
     # --- KEYWORD-ONLY, DEFAULTED: fields added after downstream packages
     # --- started subclassing this dataclass. See the class docstring.
     #
+    # Fused SOBBH direct-to-WDM lookup (sobbh_lookup_kernel.cu, 2026-10-02): response
+    # splines -> <d|h>, <h|h> per row or the fill, one launch. ``None`` on a module built
+    # before it landed (SOBBHLookupComputations then uses its Python lookup path).
+    sobbh_lookup: typing.Optional[typing.Callable[(...), None]] = dataclasses.field(
+        default=None, kw_only=True
+    )
+    #
     # Global-fit routing kernels (gf_routing_kernels.cu, 2026-08-27): the
     # fused GB in-model pre-score gate/compaction and post-score
     # accept/bookkeeping chains. ``None`` when the backend module does not
@@ -169,6 +176,7 @@ class LISAToolsBackend:
     # Phase 3L.7k LISA-response Wraps (see LISAToolsBackendMethods).
     TDSplineTDIWaveformWrap: object
     FDSplineTDIWaveformWrap: object
+    sobbh_lookup: typing.Optional[typing.Callable[(...), None]]
     LISAResponseWrap: object
     LISAResponse: object
     TDIConfigWrap: object
@@ -205,6 +213,7 @@ class LISAToolsBackend:
         # fastlisaresponse cutils backend (which is being retired).
         self.TDSplineTDIWaveformWrap = lisatools_backend_methods.TDSplineTDIWaveformWrap
         self.FDSplineTDIWaveformWrap = lisatools_backend_methods.FDSplineTDIWaveformWrap
+        self.sobbh_lookup = lisatools_backend_methods.sobbh_lookup
         self.LISAResponseWrap = lisatools_backend_methods.LISAResponseWrap
         self.LISAResponse = lisatools_backend_methods.LISAResponse
         self.TDIConfigWrap = lisatools_backend_methods.TDIConfigWrap
@@ -267,6 +276,7 @@ class LISAToolsCpuBackend(CpuBackend, LISAToolsBackend):
             # Phase 3L.7k LISA-response wraps absorbed from fastlisaresponse.
             TDSplineTDIWaveformWrap=_lat_pd.TDSplineTDIWaveformWrapCPU,
             FDSplineTDIWaveformWrap=_lat_pd.FDSplineTDIWaveformWrapCPU,
+            sobbh_lookup=getattr(_lat_pd, "sobbh_lookup", None),
             LISAResponseWrap=_lat_pd.LISAResponseWrapCPU,
             LISAResponse=_lat_pd.LISAResponseCPU,
             TDIConfigWrap=_lat_pd.TDIConfigWrapCPU,
@@ -342,6 +352,7 @@ class LISAToolsCuda11xBackend(Cuda11xBackend, LISAToolsBackend):
             # Phase 3L.7k LISA-response wraps absorbed from fastlisaresponse.
             TDSplineTDIWaveformWrap=_lat_pd.TDSplineTDIWaveformWrapGPU,
             FDSplineTDIWaveformWrap=_lat_pd.FDSplineTDIWaveformWrapGPU,
+            sobbh_lookup=getattr(_lat_pd, "sobbh_lookup", None),
             LISAResponseWrap=_lat_pd.LISAResponseWrapGPU,
             LISAResponse=_lat_pd.LISAResponseGPU,
             TDIConfigWrap=_lat_pd.TDIConfigWrapGPU,
@@ -414,6 +425,7 @@ class LISAToolsCuda12xBackend(Cuda12xBackend, LISAToolsBackend):
             # Phase 3L.7k LISA-response wraps absorbed from fastlisaresponse.
             TDSplineTDIWaveformWrap=_lat_pd.TDSplineTDIWaveformWrapGPU,
             FDSplineTDIWaveformWrap=_lat_pd.FDSplineTDIWaveformWrapGPU,
+            sobbh_lookup=getattr(_lat_pd, "sobbh_lookup", None),
             LISAResponseWrap=_lat_pd.LISAResponseWrapGPU,
             LISAResponse=_lat_pd.LISAResponseGPU,
             TDIConfigWrap=_lat_pd.TDIConfigWrapGPU,
@@ -487,6 +499,7 @@ class LISAToolsCuda13xBackend(Cuda13xBackend, LISAToolsBackend):
             # Phase 3L.7k LISA-response wraps absorbed from fastlisaresponse.
             TDSplineTDIWaveformWrap=_lat_pd.TDSplineTDIWaveformWrapGPU,
             FDSplineTDIWaveformWrap=_lat_pd.FDSplineTDIWaveformWrapGPU,
+            sobbh_lookup=getattr(_lat_pd, "sobbh_lookup", None),
             LISAResponseWrap=_lat_pd.LISAResponseWrapGPU,
             LISAResponse=_lat_pd.LISAResponseGPU,
             TDIConfigWrap=_lat_pd.TDIConfigWrapGPU,

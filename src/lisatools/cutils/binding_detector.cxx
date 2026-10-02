@@ -9,6 +9,7 @@
 #include "Detector.hpp"
 #include "PSD.hpp"
 #include "gf_routing_kernels.hpp"    // fused global-fit in-model routing kernels
+#include "sobbh_lookup_kernel.hpp"   // fused SOBBH direct-to-WDM lookup
 #include "galactic_response.hpp"
 #include "domains.hpp"               // domain classes + TDI_XYZ / TDI_AET / TDI_AE macros
 #include <string>
@@ -460,6 +461,89 @@ static T* gf_opt(array_type<T> a, const char *name, int64_t n)
     return a.data();
 }
 
+// sobbh_lookup (sobbh_lookup_kernel.cu). Mode 0 needs d_h, h_h, data, invC,
+// noise_index; mode 1 needs buf, factors. Arrays a mode does not read may be size 0.
+void sobbh_lookup_binding(
+    int mode, array_type<double> d_h, array_type<double> h_h, array_type<double> buf,
+    array_type<uint64_t> counts, array_type<int32_t> row_dead,
+    array_type<double> data, array_type<double> invC, int full_invC,
+    array_type<int32_t> data_index, array_type<int32_t> noise_index, array_type<double> factors,
+    int n_slots_d, int n_slots_c,
+    int num_rows, int nch, int N, array_type<double> x,
+    array_type<double> amp_y, array_type<double> amp_c1, array_type<double> amp_c2, array_type<double> amp_c3,
+    array_type<double> ph_y, array_type<double> ph_c1, array_type<double> ph_c2, array_type<double> ph_c3,
+    array_type<double> ref_y, array_type<double> ref_c1, array_type<double> ref_c2, array_type<double> ref_c3,
+    array_type<double> tc,
+    int n_lo, int n_hi, double t0, double layer_dt, double layer_df,
+    int ind_min_f, int Nf_active, int ind_min_t, int Nt_active, int num_m_layers,
+    array_type<double> coeff_c, array_type<double> coeff_s, int FD, int FF, double fdot0, double dfdot,
+    double f0, double df, double f_lo, double f_hi, int ref_odd, double fdot_lo, double fdot_hi)
+{
+    if ((mode != 0) && (mode != 1))
+        throw std::invalid_argument("sobbh_lookup: mode must be 0 (accumulate) or 1 (fill)");
+    if ((nch < 1) || (nch > 3) || (N < 2) || (FF < 2) || (FD < 1) || (num_rows < 0) ||
+        (n_lo < ind_min_t) || (n_hi > ind_min_t + Nt_active) || (Nf_active < 1) || (num_m_layers < 0))
+        throw std::invalid_argument("sobbh_lookup: inconsistent grid / band / table sizes");
+    const int64_t nr = num_rows;
+    const int64_t spl = nr * nch * N;
+    const int64_t plane = static_cast<int64_t>(Nf_active) * Nt_active;
+    SOBBHLookupArgs a;
+    a.mode = mode;
+    a.d_h = (mode == 0) ? gf_req(d_h, "d_h", nr) : nullptr;
+    a.h_h = (mode == 0) ? gf_req(h_h, "h_h", nr) : nullptr;
+    a.buf = (mode == 1) ? gf_req(buf, "buf", static_cast<int64_t>(n_slots_d) * nch * plane) : nullptr;
+    a.counts = reinterpret_cast<unsigned long long *>(gf_opt(counts, "counts", 2));
+    a.row_dead = gf_opt(row_dead, "row_dead", nr);
+    a.data = (mode == 0) ? gf_req(data, "data", static_cast<int64_t>(n_slots_d) * nch * plane) : nullptr;
+    a.invC = (mode == 0) ? gf_req(invC, "invC", static_cast<int64_t>(n_slots_c) * (full_invC ? nch * nch : nch) * plane) : nullptr;
+    a.full_invC = full_invC;
+    a.data_index = gf_req(data_index, "data_index", nr);
+    a.noise_index = (mode == 0) ? gf_req(noise_index, "noise_index", nr) : nullptr;
+    a.factors = (mode == 1) ? gf_req(factors, "factors", nr) : nullptr;
+    a.num_rows = num_rows;
+    a.row0 = 0;
+    a.nch = nch;
+    a.N = N;
+    a.x = gf_req(x, "x", spl);
+    a.amp_y = gf_req(amp_y, "amp_y", spl);
+    a.amp_c1 = gf_req(amp_c1, "amp_c1", spl);
+    a.amp_c2 = gf_req(amp_c2, "amp_c2", spl);
+    a.amp_c3 = gf_req(amp_c3, "amp_c3", spl);
+    a.ph_y = gf_req(ph_y, "ph_y", spl);
+    a.ph_c1 = gf_req(ph_c1, "ph_c1", spl);
+    a.ph_c2 = gf_req(ph_c2, "ph_c2", spl);
+    a.ph_c3 = gf_req(ph_c3, "ph_c3", spl);
+    a.ref_y = gf_req(ref_y, "ref_y", nr * N);
+    a.ref_c1 = gf_req(ref_c1, "ref_c1", nr * N);
+    a.ref_c2 = gf_req(ref_c2, "ref_c2", nr * N);
+    a.ref_c3 = gf_req(ref_c3, "ref_c3", nr * N);
+    a.tc = gf_req(tc, "tc", nr);
+    a.n_lo = n_lo;
+    a.n_hi = n_hi;
+    a.t0 = t0;
+    a.layer_dt = layer_dt;
+    a.layer_df = layer_df;
+    a.ind_min_f = ind_min_f;
+    a.Nf_active = Nf_active;
+    a.ind_min_t = ind_min_t;
+    a.Nt_active = Nt_active;
+    a.num_m_layers = num_m_layers;
+    a.tab.coeff_c = gf_req(coeff_c, "coeff_c", static_cast<int64_t>(FD) * FF);
+    a.tab.coeff_s = gf_req(coeff_s, "coeff_s", static_cast<int64_t>(FD) * FF);
+    a.tab.FD = FD;
+    a.tab.FF = FF;
+    a.tab.fdot0 = fdot0;
+    a.tab.dfdot = dfdot;
+    a.tab.f0 = f0;
+    a.tab.df = df;
+    a.tab.f_lo = f_lo;
+    a.tab.f_hi = f_hi;
+    a.tab.ref_odd = ref_odd;
+    a.fdot_lo = fdot_lo;
+    a.fdot_hi = fdot_hi;
+    sobbh_lookup_wrap(a);
+}
+
 void gb_inmodel_gate_compact_binding(
     array_type<double> new_logp, array_type<uint8_t> keep_flag,
     array_type<int64_t> keep_idx, array_type<int64_t> n_keep_out,
@@ -771,6 +855,9 @@ void detector_part(nb::module_ &m) {
     m.def("gb_inmodel_accept_apply", &gb_inmodel_accept_apply_binding,
           nb::call_guard<nb::gil_scoped_release>(),
           "Fused GB in-model post-score MH accept + state bookkeeping");
+    // fused SOBBH direct-to-WDM lookup (sobbh_lookup_kernel.cu)
+    m.def("sobbh_lookup", &sobbh_lookup_binding, nb::call_guard<nb::gil_scoped_release>(),
+          "Fused SOBBH sparse response -> WDM lookup -> <d|h>, <h|h> per row (mode 0) or fill (mode 1)");
 }
 
 
