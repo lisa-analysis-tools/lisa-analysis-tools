@@ -5,18 +5,28 @@ timer stops, so GPU time lands on the stage that launched it) and prints per-tem
 next to the production template's wall time on the same grid.
 
     python scripts/emri/emri_direct_stage_timing.py --backend cuda13x --dt 2.5 --reps 5 \
-        --catalog /path/emri_cat_mojito_lite_processed_MT.hdf5 --orbits equal-arm \
+        --catalog /path/emri_cat_mojito_lite_processed_MT.hdf5 \
         --direct-table wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5 --thresh 1e-3,1e-5
 
 Sweeps in ONE process (FEW and the table load once): ``--response-grid sparse,pixels`` (the
 dense response's grid), ``--lookup kernel,python`` (the fused C++/CUDA lookup-sum kernel vs the
 Python tracer + table + scatter-add) and ``--chunk-rows 1,2,4,8,16,32`` (rows per response call,
 timed over ``--batch-rows`` rows each). ``--band-hz 2.5e-4,2.5e-2`` builds the batch on the
-run's active band only (as the fit's adapter does). Per threshold it prints the source's optimal
-SNR (production template, and each direct template) on the fit's run box -- 0.25-25 mHz, ``--edge``
-pixels cropped at each end -- against the scirdv1 XYZ sensitivity (no galactic foreground). Each (threshold, grid, chunk) prints its stage split and, on a GPU,
-the cupy memory-pool footprint of that batch; ``--out`` appends one JSON line per run and a
-summary table (ms per template vs rows per call) closes each threshold.
+run's active band only (as the fit's adapter does). Each (threshold, grid, chunk) prints its
+stage split and, on a GPU, the cupy memory-pool footprint of that batch; ``--out`` appends one JSON
+line per run and a summary table (ms per template vs rows per call) closes each threshold.
+
+SNR and the MOJITO DATA: per threshold it prints the source's optimal SNR (production and each
+direct template) on the fit's run box -- 0.25-25 mHz, ``--edge`` pixels cropped at each end --
+against the scirdv1 XYZ sensitivity plus the fitted hyperbolic-tangent galactic foreground at
+this window's Tobs (``--foreground on``, default; ``off`` = instrument only). When the source's mojito L1 brick
+is found (``--orbits auto``, the default, or ``l1``: ``--l1-dir``, MOJITO_LIGHT_PATH/data/EMRI/L1,
+or recursively under MOJITO_DATA_PATH / MOJITO_INFO_PATH / the catalogue's root), the templates
+are built on the injection's orbits and window and each is also scored against its source-only,
+noise-free stream (``--data auto``; ``off`` skips it): data SNR, mismatch (noise weighted, no
+time/phase maximisation), logL = -1/2 <d-h|d-h> and the opt/data SNR ratio. The data includes
+every mode, so a template's mismatch carries its mode truncation (EMRI 1, 6 months, eps 1e-3:
+residual SNR^2 ~3, docs/emri-direct-wdm.md).
 """
 import argparse
 import collections
@@ -56,6 +66,10 @@ def main():
                     help="lookup path(s): kernel, python, or a comma list of both")
     ap.add_argument("--band-hz", default="",
                     help="f_lo,f_hi [Hz]: batch output restricted to these layers (default: all)")
+    ap.add_argument("--data", choices=("auto", "off"), default="auto",
+                    help="score the templates against the source's mojito L1 stream when its brick is used")
+    ap.add_argument("--foreground", choices=("on", "off"), default="on",
+                    help="add the fitted tanh galactic foreground at this window's Tobs to the SNR/data sensitivity")
     ap.add_argument("--edge", type=int, default=60,
                     help="pixels cropped at each grid end for the SNR box (the launcher's EDGE_CROP_WAVELETS)")
     ap.add_argument("--out", default=None, help="append one JSON line per (threshold, grid, lookup, chunk) here")
@@ -108,6 +122,16 @@ def main():
     n = nf * nt
     params, data_t0, orb = B.load_source(args.src, args.backend, n * args.dt, catalog=args.catalog,
                                          l1_dir=args.l1_dir, orbits=args.orbits)
+    box = B.RunBox(nf, nt, args.dt, args.backend, edge=args.edge, foreground=args.foreground == "on")
+    if args.data == "auto" and B.LAST_BRICK is not None:
+        d_td = B.load_l1_data(B.LAST_BRICK, args.dt, n)
+        if d_td is not None:
+            box.set_data(d_td, B.LAST_BRICK)
+            del d_td
+            print(f"[data] {args.days:g} d: mojito L1 {box.brick} (source only, noise-free): data SNR "
+                  f"{box.data_snr:.3f} ({box.describe()})", flush=True)
+    elif args.data == "auto":
+        print("[data] no mojito L1 brick used (equal-arm orbits): no data comparison", flush=True)
     fit = erebor.get_stock("all_sources")
     off = data_t0 - W.REF
     oi = int(round(off / args.dt))
@@ -161,11 +185,28 @@ def main():
                 f.write(json.dumps(rec) + "\n")
 
     base = dict(src=args.src, days=args.days, dt=args.dt, nf=nf, nt=nt, backend=args.backend,
-                response=args.response, band=band)
+                response=args.response, band=band, brick=box.brick, tobs_s=box.tobs,
+                foreground=box.foreground, noise=box.describe(),
+                data_snr=None if box.d is None else box.data_snr)
+
+    def scored(label, full):
+        """Optimal SNR, the noise-weighted mismatch to production (a direct template) and the data
+        score of one full-grid template; prints the [data] line."""
+        snr[label] = box.snr(full)
+        if label != "production":
+            mmp[label] = box.match(full, h_prod)
+        if box.d is not None:
+            vs[label] = box.score(full)
+            v = vs[label]
+            print(f"[data] {args.days:g} d thr={thr:g} {label}: mm {v['mm']:.3e} logL {v['logL']:.4g} "
+                  f"opt/data SNR {v['snr_ratio']:.5f} (data SNR {box.data_snr:.3f})", flush=True)
+
     for thr in [float(x) for x in args.thresh.split(",")]:
-        snr = {"production": B.opt_snr(prod(thr), args.dt, args.backend, edge=args.edge)}   # + warm-up
+        snr, vs, mmp = {}, {}, {}
+        h_prod = prod(thr)                                               # + warm-up
+        scored("production", h_prod)
         print(f"\n[snr] {args.days:g} d thr={thr:g}: production optimal SNR {snr['production']:.3f} "
-              f"(scirdv1 XYZ, 0.25-25 mHz, {args.edge} px edges cropped)", flush=True)
+              f"({box.describe()})", flush=True)
         sync()
         t0 = time.perf_counter()
         for _ in range(args.reps):
@@ -174,8 +215,7 @@ def main():
         t_prod = (time.perf_counter() - t0) / args.reps
         summary = {}
         for grid, direct in directs.items():
-            snr[grid] = B.opt_snr(direct(*params, mode_selection_threshold=thr).arr, args.dt, args.backend,
-                                  edge=args.edge)                        # + warm-up
+            scored(grid, direct(*params, mode_selection_threshold=thr).arr)   # + warm-up
             sync()
             T.clear()
             C.clear()
@@ -187,14 +227,16 @@ def main():
             print(f"\n[stages] response={args.response} grid/lookup={grid} thr={thr:g} modes={direct.last_stats.get('modes')} "
                   f"n_fine={direct.last_stats.get('n_fine')} backend={args.backend} grid Nf={nf} Nt={nt} dt={args.dt} "
                   f"({args.days:g} d): direct {t_dir * 1e3:.0f} ms, production {t_prod * 1e3:.0f} ms (per template); "
-                  f"SNR direct {snr[grid]:.3f} production {snr['production']:.3f}", flush=True)
+                  f"SNR direct {snr[grid]:.3f} production {snr['production']:.3f}; mm vs production "
+                  f"{mmp[grid]:.3e}", flush=True)
             for k in [lab for lab in LABELS if lab in T]:
                 print(f"  {k:48s} {T[k] / args.reps * 1e3:8.1f} ms  ({C[k] // args.reps} calls)", flush=True)
             stages = {k.strip(): T[k] / args.reps * 1e3 for k in LABELS if k in T}
             record(**base, thr=thr, grid=grid, chunk=0, rows=1, modes=direct.last_stats.get("modes"),
                    n_response=direct.last_stats.get("n_fine"), ms_per_template=t_dir * 1e3,
                    production_ms=t_prod * 1e3, stages_ms=stages, snr_direct=snr[grid],
-                   snr_production=snr["production"], snr_edge=args.edge)
+                   snr_production=snr["production"], snr_edge=args.edge, mm_vs_production=mmp[grid],
+                   data_direct=vs.get(grid), data_production=vs.get("production"))
             summary[(grid, 0)] = t_dir * 1e3
             if args.batch_rows <= 0:
                 continue
@@ -221,7 +263,9 @@ def main():
                 record(**base, thr=thr, grid=grid, chunk=chunk, rows=len(rows),
                        modes=direct.last_stats.get("modes"), n_response=direct.last_stats.get("n_response"),
                        ms_per_template=t_b / len(rows) * 1e3, production_ms=t_prod * 1e3, gpu_pool_gb=mem,
-                       stages_ms=stages)
+                       stages_ms=stages, snr_direct=snr[grid], snr_production=snr["production"],
+                       snr_edge=args.edge, mm_vs_production=mmp[grid], data_direct=vs.get(grid),
+                       data_production=vs.get("production"))
                 summary[(grid, chunk)] = t_b / len(rows) * 1e3
         cols = [0] + (chunks if args.batch_rows > 0 else [])
         head = "  ".join(f"{('single' if c == 0 else f'{c}/call'):>8s}" for c in cols)
@@ -229,9 +273,13 @@ def main():
               f"  {'grid/lookup':16s}{head}", flush=True)
         for grid in directs:
             print(f"  {grid:16s}" + "  ".join(f"{summary.get((grid, c), float('nan')):8.0f}" for c in cols), flush=True)
-        print(f"  optimal SNR (scirdv1 XYZ, 0.25-25 mHz, {args.edge} px edges cropped): production "
-              f"{snr['production']:.3f}; " + ", ".join(f"{g} {snr[g]:.3f} (ratio {snr[g] / snr['production']:.6f})"
-                                                       for g in directs), flush=True)
+        print(f"  optimal SNR ({box.describe()}): production "
+              f"{snr['production']:.3f}; " + ", ".join(f"{g} {snr[g]:.3f} (ratio {snr[g] / snr['production']:.6f}, "
+                                                       f"mm vs production {mmp[g]:.2e})" for g in directs), flush=True)
+        if vs:
+            print(f"  vs mojito data {box.brick} (data SNR {box.data_snr:.3f}): "
+                  + "; ".join(f"{g} mm {v['mm']:.3e} logL {v['logL']:.4g} SNR ratio {v['snr_ratio']:.5f}"
+                              for g, v in vs.items()), flush=True)
 
 
 if __name__ == "__main__":
