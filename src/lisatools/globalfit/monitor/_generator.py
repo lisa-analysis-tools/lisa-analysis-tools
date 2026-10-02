@@ -2547,6 +2547,7 @@ except Exception as e:
 # brick); without the factor the same comparison reads 0.77 with a ~90 deg
 # phase.
 DTR = {}
+FGW = {}        # whitened-residual-per-band readout (filled inside the block below)
 try:
     import glob as _glob
     from lisatools.globalfit.recipe import MOJITO_REFERENCE_TIME
@@ -3138,10 +3139,603 @@ try:
         nbins=int(_ok.sum()),
         adp_bad=float(np.nanmean(_adp[np.isfinite(_adp)] < -3.0))
         if np.isfinite(_adp).any() else float("nan"))
+
+    # ======== FOREGROUND DIAGNOSIS: the whitened residual per GB band =========
+    # User request 2026-10-02 (6mo job 675, after the first ratchet cycle
+    # released and the foreground climbed back): "whitened (included
+    # foreground) residuals to visualize any excess power left over ... could
+    # the rigidity of the model have anything to do with somewhat averaging
+    # over sub-bands with a non-smooth, generally non-gaussian residual?"
+    #
+    # Per GB band (the run's OWN band_edges, ~17 uHz at 6 months => ~270 FD
+    # bins per band in X): u = |r_X(f)|^2 / (S_total(f) N dt <w^2> / 4) / 2 is
+    # Exp(1) when the noise model is right, so the band MEAN sits at 1, the
+    # band mean/median at 1/ln2 = 1.443 and the fraction of bins above 4.605
+    # at 1%. A smooth drift of the mean away from 1 that follows frequency is
+    # the 5-parameter tanh x power-law failing to follow the residual's shape
+    # (model rigidity); a band whose mean is 1 but whose mean/median and tail
+    # are high holds its power in a few loud bins (unresolved or missed lines),
+    # not in a Gaussian floor. Every cold walker is whitened by ITS OWN noise
+    # (the whitening its likelihood used); the two reference ratios whiten the
+    # same residual by instrument-only and by instrument + the FittedHT
+    # foreground estimate, so the reader sees what the fit added and what the
+    # estimate would have said.
+    try:
+        _nb = int(band_edges.size - 1)
+        _bix = np.searchsorted(band_edges, _fr, side="right") - 1
+        _inb = (_bix >= 0) & (_bix < _nb)
+        _bix_in = _bix[_inb]
+        _bfc = 0.5 * (band_edges[:-1] + band_edges[1:]) * 1e3          # mHz
+        _cnt_b = np.bincount(_bix_in, minlength=_nb).astype(float)
+        _okb = _cnt_b > 0
+        _norm_w = N_TD * W_DT * _W2 / 4.0
+
+        def _bmean_band(v):
+            out = np.full(_nb, np.nan)
+            out[_okb] = np.bincount(_bix_in, weights=v[_inb], minlength=_nb)[_okb] / _cnt_b[_okb]
+            return out
+
+        _ord_b = np.argsort(_bix_in, kind="stable")
+        _bnd_b = np.searchsorted(_bix_in[_ord_b], np.arange(_nb + 1))
+
+        def _bmedian_band(v):
+            vs = v[_inb][_ord_b]
+            out = np.full(_nb, np.nan)
+            for _b in range(_nb):
+                _lo, _hi = _bnd_b[_b], _bnd_b[_b + 1]
+                if _hi > _lo:
+                    out[_b] = np.median(vs[_lo:_hi])
+            return out
+
+        def _run_mean(y, half=7):
+            """uniform running mean over 2*half+1 bands, NaN-aware"""
+            w = np.ones(2 * half + 1)
+            m = np.isfinite(y).astype(float)
+            yz = np.where(np.isfinite(y), y, 0.0)
+            yc = np.convolve(yz, w, mode="same")
+            mc = np.convolve(m, w, mode="same")
+            return np.where(mc > 0, yc / np.maximum(mc, 1e-30), np.nan)
+
+        def _walker_resid_X(w):
+            """X-channel residual of cold walker w at the last stored row."""
+            if w == WBEST:
+                return resid_fd[0]
+            _g9 = gb_chain_cold[w][gb_alive_last[w]]
+            _v5w = vgb_c[-1, w]
+            if VGB_SAMPLED_CHIRP:
+                _vg9 = np.column_stack([_v5w[:, 0], _r9[:, 1], _v5w[:, 4],
+                                        _v5w[:, 1], _v5w[:, 2], _v5w[:, 3],
+                                        _r9[:, 6], _r9[:, 7], _v5w[:, 5]])
+            else:
+                _vg9 = np.column_stack([_v5w[:, 0], _r9[:, 1], _r9[:, 2],
+                                        _v5w[:, 1], _v5w[:, 2], _v5w[:, 3],
+                                        _r9[:, 6], _r9[:, 7], _v5w[:, 4]])
+            _t = np.zeros((1, 3, FDS.N), dtype=np.complex128)
+            for _rows in (_g9, _vg9):
+                _a = np.zeros((1, 3, FDS.N), dtype=np.complex128)
+                _comp.fill_global(_tf.both_transforms(_rows.copy()), _a,
+                                  convert_to_ra_dec=False)
+                _t += _a
+                del _a
+            return data_fd[0] - _t[0, 0] * _shift[0]
+
+        _gal_inj_curve = np.maximum(_Ssum_inj - _Sinst_inj, 0.0)
+        _rat_tot, _rat_inst, _rat_est, _mm, _tail, _share = [], [], [], [], [], []
+        _psd_b, _Stot_b, _Sinst_b = [], [], []
+        for _w in range(nwalk):
+            _pmw = psd_cold[-1, _w]
+            _gmw = gal_cold_phys[-1, _w]
+            _lmw = lisa_models.LISAModel(_pmw[0] ** 2, _pmw[1] ** 2,
+                                         lisa_models.DefaultOrbits(), "sampled")
+            _Si_w = np.asarray(get_sensitivity(_fpos, sens_fn=X2TDISens, model=_lmw,
+                                               stochastic_params=()), float)
+            _St_w = np.asarray(get_sensitivity(_fpos, sens_fn=X2TDISens, model=_lmw,
+                                               stochastic_params=tuple(_gmw),
+                                               stochastic_function=_HTGF), float)
+            _rX = _walker_resid_X(_w)
+            _p = np.abs(_rX) ** 2 / _norm_w / 2.0
+            _u = _p / np.maximum(_St_w, 1e-60)
+            _rat_tot.append(_bmean_band(_u))
+            _rat_inst.append(_bmean_band(_p / np.maximum(_Si_w, 1e-60)))
+            _rat_est.append(_bmean_band(_p / np.maximum(_Si_w + _gal_inj_curve, 1e-60)))
+            _mm.append(_rat_tot[-1] / _bmedian_band(_u))
+            _tail.append(_bmean_band((_u > 4.605).astype(float)))
+            _share.append(_bmean_band(np.maximum(_St_w - _Si_w, 0.0) / np.maximum(_St_w, 1e-60)))
+            _psd_b.append(_bmean_band(_p)); _Stot_b.append(_bmean_band(_St_w))
+            _Sinst_b.append(_bmean_band(_Si_w))
+            del _rX, _p, _u, _Si_w, _St_w
+        _rat_tot = np.array(_rat_tot); _rat_inst = np.array(_rat_inst)
+        _rat_est = np.array(_rat_est); _mm = np.array(_mm); _tail = np.array(_tail)
+        _share = np.array(_share)
+        _psd_b = np.array(_psd_b); _Stot_b = np.array(_Stot_b); _Sinst_b = np.array(_Sinst_b)
+        _Sest_b = _bmean_band(_Sinst_inj + _gal_inj_curve)
+        # stored row 0's noise (under a pinned launch that is the start vector
+        # the search ran against until the first release), for the PSD zoom
+        try:
+            _lm0 = lisa_models.LISAModel(float(psd_cold[0, 0, 0]) ** 2,
+                                         float(psd_cold[0, 0, 1]) ** 2,
+                                         lisa_models.DefaultOrbits(), "row0")
+            _S0_b = _bmean_band(np.asarray(get_sensitivity(
+                _fpos, sens_fn=X2TDISens, model=_lm0,
+                stochastic_params=tuple(gal_cold_phys[0, 0]),
+                stochastic_function=_HTGF), float))
+        except Exception:
+            _S0_b = None
+        _mean_tot = _run_mean(np.nanmean(_rat_tot, axis=0))
+        _mean_inst = _run_mean(np.nanmean(_rat_inst, axis=0))
+        _mean_est = _run_mean(np.nanmean(_rat_est, axis=0))
+        _mean_mm = _run_mean(np.nanmean(_mm, axis=0))
+        _mean_tail = _run_mean(np.nanmean(_tail, axis=0))
+        _mean_share = np.nanmean(_share, axis=0)
+
+        fig, ax = plt.subplots(4, 1, figsize=(11.6, 10.4), sharex=True,
+                               gridspec_kw=dict(height_ratios=[2.4, 1.2, 1.2, 0.9],
+                                                hspace=0.08))
+        for a_ in ax:
+            a_.axvspan(3.0, 5.0, color=AMBER, alpha=0.07, lw=0)
+            a_.set_xscale("log")
+        ax[0].scatter(_bfc, _rat_tot[WBEST], s=5, color=VIOLET, alpha=0.45, lw=0,
+                      label=f"per band, walker {WBEST} (max lnL), its own noise")
+        for _w in range(nwalk):
+            ax[0].plot(_bfc, _run_mean(_rat_tot[_w]), color=CYAN, lw=0.7, alpha=0.35)
+        ax[0].plot(_bfc, _mean_tot, color=CYAN, lw=1.8,
+                   label=f"{nwalk}-walker mean, running mean over 15 bands "
+                         "(each walker whitened by its own fit)")
+        ax[0].plot(_bfc, _mean_inst, color=FG, lw=1.1, ls="--",
+                   label="same residual / instrument-only (what the foreground carries)")
+        ax[0].plot(_bfc, _mean_est, color=RED, lw=1.1, ls="-.", alpha=0.85,
+                   label="same residual / (instrument + FittedHT foreground estimate)")
+        ax[0].axhline(1.0, color=FG, lw=1.0, ls=":")
+        ax[0].set_yscale("log"); ax[0].set_ylim(0.3, 30)
+        ax[0].set_ylabel("whitened residual power\nper GB band (1 = model)", fontsize=9)
+        ax[0].legend(fontsize=7.5, loc="upper right")
+        ax[1].scatter(_bfc, _mm[WBEST], s=5, color=VIOLET, alpha=0.45, lw=0)
+        ax[1].plot(_bfc, _mean_mm, color=CYAN, lw=1.6)
+        ax[1].axhline(1.0 / np.log(2.0), color=FG, lw=1.0, ls=":",
+                      label="Gaussian: mean/median = 1/ln 2 = 1.443")
+        ax[1].set_ylim(1.0, 4.0)
+        ax[1].set_ylabel("mean / median\nof whitened power", fontsize=9)
+        ax[1].legend(fontsize=7.5, loc="upper right")
+        ax[2].scatter(_bfc, 100 * _tail[WBEST], s=5, color=VIOLET, alpha=0.45, lw=0)
+        ax[2].plot(_bfc, 100 * _mean_tail, color=CYAN, lw=1.6)
+        ax[2].axhline(1.0, color=FG, lw=1.0, ls=":", label="Gaussian: 1% of bins above 4.605")
+        ax[2].set_ylim(0, 8)
+        ax[2].set_ylabel("bins above 4.605\n[% per band]", fontsize=9)
+        ax[2].legend(fontsize=7.5, loc="upper right")
+        ax[3].plot(_bfc, 100 * _mean_share, color=AMBER, lw=1.6)
+        ax[3].set_ylim(0, 100)
+        ax[3].set_ylabel("foreground share\nof model noise [%]", fontsize=9)
+        ax[3].set_xlabel("frequency [mHz]  (shaded: 3-5 mHz)")
+        ax[3].set_xlim(max(_bfc[0], 0.5), _bfc[-1])
+        fig.suptitle(
+            f"whitened residual per GB band, stored iteration {NIT - 1}, all {nwalk} "
+            "cold walkers, TDI X -- 1 means the residual carries exactly the power the "
+            "fitted noise says", fontsize=10, color=FG)
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        fig_b64(fig, "fg_whitened_bands")
+
+        # ---- ZOOM 2.5-5.5 mHz, linear frequency (user request 2026-10-02) ----
+        _zm = (_bfc >= 2.5) & (_bfc <= 5.5)
+        fig, ax = plt.subplots(3, 1, figsize=(11.6, 8.4), sharex=True,
+                               gridspec_kw=dict(height_ratios=[2.0, 1.1, 1.1], hspace=0.08))
+        for _w in range(nwalk):
+            ax[0].scatter(_bfc[_zm], _rat_tot[_w][_zm], s=6, color=CYAN, alpha=0.3, lw=0)
+        ax[0].plot(_bfc[_zm], _run_mean(np.nanmean(_rat_tot, axis=0), half=2)[_zm],
+                   color=CYAN, lw=2.0,
+                   label=f"{nwalk}-walker mean per band, running mean over 5 bands "
+                         "(points: every walker, every band, its own noise)")
+        ax[0].plot(_bfc[_zm], _run_mean(np.nanmean(_rat_inst, axis=0), half=2)[_zm],
+                   color=FG, lw=1.1, ls="--", label="same residual / instrument-only")
+        ax[0].plot(_bfc[_zm], _run_mean(np.nanmean(_rat_est, axis=0), half=2)[_zm],
+                   color=RED, lw=1.1, ls="-.",
+                   label="same residual / (instrument + FittedHT foreground estimate)")
+        ax[0].axhline(1.0, color=FG, lw=1.0, ls=":")
+        ax[0].set_yscale("log"); ax[0].set_ylim(0.5, 20)
+        ax[0].set_ylabel("whitened residual power\nper GB band (1 = model)", fontsize=9)
+        ax[0].legend(fontsize=7.5, loc="upper right")
+        for _w in range(nwalk):
+            ax[1].scatter(_bfc[_zm], _mm[_w][_zm], s=6, color=CYAN, alpha=0.3, lw=0)
+        ax[1].plot(_bfc[_zm], _run_mean(np.nanmean(_mm, axis=0), half=2)[_zm], color=CYAN, lw=1.8)
+        ax[1].axhline(1.0 / np.log(2.0), color=FG, lw=1.0, ls=":", label="Gaussian: 1.443")
+        ax[1].set_ylim(1.0, 4.0)
+        ax[1].set_ylabel("mean / median\nof whitened power", fontsize=9)
+        ax[1].legend(fontsize=7.5, loc="upper right")
+        for _w in range(nwalk):
+            ax[2].scatter(_bfc[_zm], 100 * _tail[_w][_zm], s=6, color=CYAN, alpha=0.3, lw=0)
+        ax[2].plot(_bfc[_zm], 100 * _run_mean(np.nanmean(_tail, axis=0), half=2)[_zm],
+                   color=CYAN, lw=1.8)
+        ax[2].axhline(1.0, color=FG, lw=1.0, ls=":", label="Gaussian: 1% above 4.605")
+        ax[2].set_ylim(0, 10)
+        ax[2].set_ylabel("bins above 4.605\n[% per band]", fontsize=9)
+        ax[2].legend(fontsize=7.5, loc="upper right")
+        ax[2].set_xlabel("frequency [mHz]"); ax[2].set_xlim(2.5, 5.5)
+        fig.suptitle("ZOOM 2.5-5.5 mHz: whitened residual per GB band, every cold walker "
+                     "against its own fitted noise (linear frequency)", fontsize=10, color=FG)
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        fig_b64(fig, "fg_whitened_zoom")
+
+        # ---- ZOOM 2.5-5.5 mHz: the UNWHITENED residual against the curves ----
+        fig, ax = plt.subplots(1, 1, figsize=(11.6, 5.4))
+        for _w in range(nwalk):
+            ax.plot(_bfc[_zm], _psd_b[_w][_zm], color=VIOLET, lw=0.6, alpha=0.35)
+        ax.plot(_bfc[_zm], np.nanmean(_psd_b, axis=0)[_zm], color=VIOLET, lw=1.6,
+                label=f"residual PSD per GB band, TDI X, {nwalk}-walker mean "
+                      "(thin: each walker's own residual)")
+        ax.plot(_bfc[_zm], np.nanmean(_Stot_b, axis=0)[_zm], color=CYAN, lw=1.8,
+                label=f"fitted noise, instrument + galfor, cold-walker mean, row {NIT - 1}")
+        ax.plot(_bfc[_zm], np.nanmean(_Sinst_b, axis=0)[_zm], color=FG, lw=1.1, ls="--",
+                label="fitted instrument only")
+        ax.plot(_bfc[_zm], _Sest_b[_zm], color=RED, lw=1.1, ls="-.",
+                label="injected instrument + FittedHT foreground estimate")
+        if _S0_b is not None:
+            ax.plot(_bfc[_zm], _S0_b[_zm], color=AMBER, lw=1.3, ls=(0, (4, 2)),
+                    label="stored row 0 noise, walker 0 (the curve the search ran against "
+                          "before the first release)")
+        ax.set_yscale("log"); ax.set_xlim(2.5, 5.5)
+        ax.set_xlabel("frequency [mHz]")
+        ax.set_ylabel("PSD of TDI X [1/Hz], mean per GB band", fontsize=9)
+        _zz = np.nanmean(_psd_b, axis=0)[_zm]; _zz = _zz[np.isfinite(_zz)]
+        _zi = np.nanmean(_Sinst_b, axis=0)[_zm]; _zi = _zi[np.isfinite(_zi)]
+        if _zz.size and _zi.size:
+            ax.set_ylim(0.5 * float(np.min(_zi)), 3.0 * float(np.max(_zz)))
+        ax.legend(fontsize=7.5, loc="upper right")
+        fig.suptitle("ZOOM 2.5-5.5 mHz: residual spectrum against the noise curves (unwhitened)",
+                     fontsize=10, color=FG)
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        fig_b64(fig, "fg_resid_psd_zoom")
+
+        def _at(arr, f_mhz):
+            _i = int(np.clip(np.searchsorted(_bfc, f_mhz), 0, _nb - 1))
+            return float(arr[_i]) if np.isfinite(arr[_i]) else float("nan")
+
+        _probe_f = (1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 8.0, 10.0)
+        _m35 = (_bfc >= 3.0) & (_bfc <= 5.0)
+        _m12 = (_bfc >= 1.0) & (_bfc <= 2.0)
+        _m610 = (_bfc >= 6.0) & (_bfc <= 10.0)
+        FGW.update(
+            rat_at={f_: _at(_mean_tot, f_) for f_ in _probe_f},
+            inst_at={f_: _at(_mean_inst, f_) for f_ in _probe_f},
+            est_at={f_: _at(_mean_est, f_) for f_ in _probe_f},
+            share_at={f_: _at(_mean_share, f_) for f_ in _probe_f},
+            rat_35=float(np.nanmean(_rat_tot[:, _m35])),
+            rat_12=float(np.nanmean(_rat_tot[:, _m12])),
+            rat_610=float(np.nanmean(_rat_tot[:, _m610])),
+            mm_35=float(np.nanmedian(_mm[:, _m35])),
+            mm_12=float(np.nanmedian(_mm[:, _m12])),
+            mm_610=float(np.nanmedian(_mm[:, _m610])),
+            tail_35=float(np.nanmean(_tail[:, _m35])),
+            tail_12=float(np.nanmean(_tail[:, _m12])),
+            tail_610=float(np.nanmean(_tail[:, _m610])),
+            bands_nongauss_35=int(np.sum(np.nanmean(_tail, axis=0)[_m35] > 0.02)),
+            bands_35=int(_m35.sum()),
+            spread_35=float(np.nanmax(_mean_tot[_m35]) / np.nanmin(_mean_tot[_m35])),
+        )
+        del _rat_tot, _rat_inst, _rat_est, _mm, _tail, _share
+    except Exception as _e:
+        MISSING.append(f"whitened residual per band unavailable: {type(_e).__name__}: {_e}")
     del data_fd, resid_fd, _tmpl, _orb, _comp
 except Exception as e:
     MISSING.append(
         f"data/template/residual panels unavailable: {type(e).__name__}: {e}")
+
+# ============ FOREGROUND RATCHET: the timeline and where the leaves went =====
+# (user request 2026-10-02.) Under GALFOR_RATCHET=1 + GB_SEARCH_LEGS=1 every
+# noise CHANGE (nudge or release) saves a row right after the gated noise
+# step, so the store carries the experiment itself: ``saved_after`` names the
+# gate rows, the galfor cold chain tells a nudge (alpha and f_1 untouched,
+# amplitude stepped) from a release (everything moves), and the lnL / leaf
+# trajectories around them are the readout. REF is the last row BEFORE the
+# first nudge; everything in this block is relative to it.
+RATCHET = {}
+cap_fgA = cap_fgB = cap_fgC = ""
+cap_fgD = cap_fgE = ""      # filled by the ratchet scorecard after the truth set loads
+try:
+    _sa = g.get("saved_after")
+    SAVED_AFTER = ([s.decode() if isinstance(s, bytes) else str(s) for s in _sa[:NIT]]
+                   if _sa is not None else [])
+    _gate_rows = [i for i, s in enumerate(SAVED_AFTER) if s == "noise_ratchet_search"]
+    if not _gate_rows or _gate_rows[0] < 1:
+        raise RuntimeError("no row saved after the gated noise step (ratchet or legs off)")
+    REF = _gate_rows[0] - 1
+    _gn = int(min(NIT, gal_cold_phys.shape[0]))
+    from lisatools.stochastic import HyperbolicTangentGalacticForeground as _HTr
+    _pf = np.array([2e-3, 3e-3, 4e-3, 5e-3])
+
+    def _gal_mean_curve(i, f_hz):
+        """cold-walker-mean S_gal(f) of stored row i (physical galfor params)"""
+        return np.mean([np.asarray(_HTr.specific_Sh_function(f_hz, *gal_cold_phys[i, w]))
+                        for w in range(nwalk)], axis=0)
+
+    _ref_curve = _gal_mean_curve(REF, _pf)
+    _ratio_rows = np.array([_gal_mean_curve(i, _pf) / _ref_curve for i in range(_gn)])
+    _kind = {}
+    for _r in _gate_rows:
+        if _r >= _gn:
+            continue
+        _a_same = np.allclose(gal_cold_phys[_r, :, 2], gal_cold_phys[_r - 1, :, 2],
+                              rtol=0.0, atol=1e-9)
+        _f1_same = np.allclose(gal_cold_phys[_r, :, 3], gal_cold_phys[_r - 1, :, 3],
+                               rtol=1e-9, atol=0.0)
+        _amp_moved = not np.allclose(gal_cold_phys[_r, :, 0], gal_cold_phys[_r - 1, :, 0],
+                                     rtol=1e-9, atol=0.0)
+        _kind[_r] = "nudge" if (_a_same and _f1_same and _amp_moved) else "release"
+    _nudges = [r for r, k in _kind.items() if k == "nudge"]
+    _releases = [r for r, k in _kind.items() if k == "release"]
+    leaves_w = gb_inds.sum(-1).astype(int)                     # (it, nw)
+    _dll = ll - ll[REF][None, :]                                 # (it, nw)
+    _x0 = max(REF - 3, 0)
+    fig, ax = plt.subplots(3, 1, figsize=(11.6, 8.8), sharex=True,
+                           gridspec_kw=dict(height_ratios=[1.6, 1.2, 1.2], hspace=0.08))
+    _bounds = sorted(_kind)
+    for _j, _r in enumerate(_bounds):
+        _r_next = _bounds[_j + 1] if _j + 1 < len(_bounds) else NIT
+        _col = AMBER if _kind[_r] == "nudge" else GREEN
+        for a_ in ax:
+            a_.axvspan(_r - 0.5, _r_next - 0.5, color=_col, alpha=0.08, lw=0)
+            a_.axvline(_r, color=_col, lw=0.9, ls=(0, (3, 2)))
+        ax[0].annotate(_kind[_r], xy=(_r, 1.0), xycoords=("data", "axes fraction"),
+                       xytext=(2, -2), textcoords="offset points", fontsize=7,
+                       color=_col, rotation=90, ha="left", va="top")
+    for _w in range(nwalk):
+        ax[0].plot(it[_x0:], _dll[_x0:, _w], color=CYAN, lw=0.7, alpha=0.4)
+    ax[0].plot(it[_x0:], _dll[_x0:].mean(axis=1), color=CYAN, lw=1.8,
+               label=f"walker mean (thin: each of {nwalk})")
+    ax[0].axhline(0.0, color=FG, lw=1.0, ls=":")
+    ax[0].set_ylabel(f"cold lnL minus row {REF}\n(the row before the first nudge)", fontsize=9)
+    ax[0].legend(fontsize=7.5, loc="lower right")
+    for _k, (_fm, _col) in enumerate(zip((2, 3, 4, 5), (FG, VIOLET, CYAN, AMBER))):
+        ax[1].plot(it[_x0:_gn], _ratio_rows[_x0:_gn, _k], color=_col, lw=1.4,
+                   label=f"{_fm} mHz")
+    ax[1].axhline(1.0, color=FG, lw=1.0, ls=":")
+    ax[1].set_yscale("log")
+    ax[1].set_ylabel(f"S_gal / S_gal at row {REF}\n(cold-walker mean)", fontsize=9)
+    ax[1].legend(fontsize=7.5, loc="lower right", ncols=4)
+    for _w in range(nwalk):
+        ax[2].plot(it[_x0:], leaves_w[_x0:, _w] - leaves_w[REF, _w], color=GREEN,
+                   lw=0.7, alpha=0.45)
+    ax[2].plot(it[_x0:], (leaves_w[_x0:] - leaves_w[REF][None, :]).mean(axis=1),
+               color=GREEN, lw=1.8)
+    ax[2].axhline(0.0, color=FG, lw=1.0, ls=":")
+    ax[2].set_ylabel(f"cold GB leaves minus row {REF}", fontsize=9)
+    ax[2].set_xlabel("stored row (one per search leg; amber = nudge + hold, "
+                     "green = release)")
+    for _i in range(_x0, NIT):
+        if _i < len(SAVED_AFTER) and SAVED_AFTER[_i]:
+            ax[2].annotate(SAVED_AFTER[_i].replace("noise_ratchet_search", "noise")
+                           .replace("in_model", "im"),
+                           xy=(_i, 0.0), xycoords=("data", "axes fraction"),
+                           xytext=(0, 2), textcoords="offset points", fontsize=5.5,
+                           color=DIM, rotation=90, ha="center", va="bottom")
+    fig.suptitle(f"galfor ratchet: stored rows {_x0}-{NIT - 1}, reference row {REF}",
+                 fontsize=10, color=FG)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig_b64(fig, "fg_ratchet_timeline")
+    _mean_dll = _dll[REF:].mean(axis=1)
+    RATCHET.update(
+        ref=REF, nudges=_nudges, releases=_releases,
+        dll_last=float(_dll[-1].mean()),
+        dll_min=float(_mean_dll.min()), dll_min_row=int(REF + np.argmin(_mean_dll)),
+        dll_first_release=(float(_dll[_releases[0]].mean()) if _releases else float("nan")),
+        dll_before_release=(float(_dll[_releases[0] - 1].mean()) if _releases else float("nan")),
+        leaves_ref=float(leaves_w[REF].mean()), leaves_last=float(leaves_w[-1].mean()),
+        leaves_before_release=(float(leaves_w[_releases[0] - 1].mean()) if _releases
+                               else float("nan")),
+        ratio_last={fm: float(_ratio_rows[_gn - 1, k]) for k, fm in enumerate((2, 3, 4, 5))},
+        ratio_held=({fm: float(_ratio_rows[_nudges[0], k]) for k, fm in enumerate((2, 3, 4, 5))}
+                    if _nudges else {}),
+        gal_ref=[float(v) for v in gal_cold[REF].mean(axis=0)],
+        gal_last=[float(v) for v in gal_cold[_gn - 1].mean(axis=0)],
+    )
+except Exception as _e:
+    MISSING.append(f"ratchet timeline unavailable: {type(_e).__name__}: {_e}")
+
+try:
+    if "REF" not in globals():
+        raise RuntimeError("no ratchet reference row")
+    _chg = g["chain/gb"]
+    _ing = g["inds/gb"]
+    _cref = None
+    for _i in range(REF, NIT - 1):
+        # an extract carries coordinates only in its keep window; the earliest
+        # row that has them is the honest reference, named in the caption
+        if np.any(_chg[_i, 0, 0, :, :, 1] != 0.0):
+            _cref = _i
+            break
+    if _cref is None:
+        raise RuntimeError("no coordinate-bearing row before the last one (extract keep window)")
+
+    def _f0s(i):
+        return [_chg[i, 0, 0, w][_ing[i, 0, 0, w].astype(bool)][:, 1] for w in range(nwalk)]
+
+    _f_ref = _f0s(_cref)
+    _f_last = _f0s(NIT - 1)
+    _lo_m, _hi_m = float(band_edges[0]) * 1e3, float(band_edges[-1]) * 1e3
+    _edges_m = np.arange(np.floor(_lo_m * 4) / 4, _hi_m + 0.25, 0.25)
+    _fc_m = 0.5 * (_edges_m[:-1] + _edges_m[1:])
+    _Href = np.array([np.histogram(_f_ref[w], bins=_edges_m)[0] for w in range(nwalk)])
+    _Hlast = np.array([np.histogram(_f_last[w], bins=_edges_m)[0] for w in range(nwalk)])
+    _H = _Hlast - _Href
+    _bl = sub.get("gb/band_cold_logl_w")
+    _dB = None
+    if _bl is not None and _bl.shape[0] >= NIT:
+        _d = _bl[NIT - 1].astype(float) - _bl[REF].astype(float)
+        _d = np.where(np.isfinite(_d), _d, 0.0)                     # (nw, nbands)
+        _bfc_m = 0.5 * (band_edges[:-1] + band_edges[1:]) * 1e3
+        _bb = np.clip(np.searchsorted(_edges_m, _bfc_m, side="right") - 1, 0, _fc_m.size - 1)
+        _dB = np.array([np.bincount(_bb, weights=_d[w], minlength=_fc_m.size)
+                        for w in range(nwalk)])
+    _rat_curve = (_gal_mean_curve(min(NIT - 1, _gn - 1), _fc_m * 1e-3)
+                  / _gal_mean_curve(REF, _fc_m * 1e-3))
+    _nrow = 2 if _dB is not None else 1
+    fig, ax = plt.subplots(_nrow, 1, figsize=(11.6, 7.2 if _nrow == 2 else 4.6),
+                           sharex=True, squeeze=False)
+    ax = ax[:, 0]
+    for _w in range(nwalk):
+        ax[0].step(_edges_m[:-1], _H[_w], where="post", color=GREEN, lw=0.7, alpha=0.4)
+    ax[0].step(_edges_m[:-1], _H.mean(axis=0), where="post", color=GREEN, lw=1.8,
+               label=f"leaves added per 0.25 mHz, walker mean (thin: each of {nwalk})")
+    ax[0].axhline(0, color=FG, lw=1.0, ls=":")
+    ax[0].axvspan(3.0, 5.0, color=AMBER, alpha=0.07, lw=0)
+    ax[0].set_ylabel(f"cold GB leaves, row {NIT - 1} minus row {_cref}", fontsize=9)
+    _ax0b = ax[0].twinx()
+    _ax0b.plot(_fc_m, _rat_curve, color=AMBER, lw=1.5,
+               label=f"foreground S_gal, row {min(NIT - 1, _gn - 1)} / row {REF}")
+    _ax0b.axhline(1.0, color=AMBER, lw=0.8, ls=":")
+    _ax0b.set_yscale("log"); _ax0b.set_ylim(0.3, 3.0)
+    _ax0b.set_ylabel("S_gal ratio (cold mean)", fontsize=9, color=AMBER)
+    _ax0b.tick_params(axis="y", colors=AMBER)
+    _ax0b.grid(False)
+    _h1, _l1 = ax[0].get_legend_handles_labels()
+    _h2, _l2 = _ax0b.get_legend_handles_labels()
+    ax[0].legend(_h1 + _h2, _l1 + _l2, fontsize=7.5, loc="upper right")
+    if _dB is not None:
+        ax[1].step(_edges_m[:-1], _dB.mean(axis=0), where="post", color=VIOLET, lw=1.6,
+                   label=f"per-band cold lnL, row {NIT - 1} minus row {REF} "
+                         "(walker mean, summed per 0.25 mHz; carries the noise-term "
+                         "change as well as the sources)")
+        ax[1].axhline(0, color=FG, lw=1.0, ls=":")
+        ax[1].axvspan(3.0, 5.0, color=AMBER, alpha=0.07, lw=0)
+        ax[1].set_ylabel("band lnL change", fontsize=9)
+        ax[1].legend(fontsize=7.5, loc="lower right")
+    ax[-1].set_xlabel("frequency [mHz]  (shaded: 3-5 mHz)")
+    ax[-1].set_xlim(max(_lo_m, 0.5), min(_hi_m, 12.0))
+    fig.suptitle("where the leaves went across the ratchet (cold chain, per walker)",
+                 fontsize=10, color=FG)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig_b64(fig, "fg_leaf_delta")
+
+    # ---- ZOOM 2.5-5.5 mHz at 0.05 mHz bins (user request 2026-10-02) ----
+    _ez = np.arange(2.5, 5.5 + 1e-9, 0.05)
+    _fz = 0.5 * (_ez[:-1] + _ez[1:])
+    _Hz_ref = np.array([np.histogram(_f_ref[w], bins=_ez)[0] for w in range(nwalk)])
+    _Hz = np.array([np.histogram(_f_last[w], bins=_ez)[0] for w in range(nwalk)]) - _Hz_ref
+    _nrz = 2 if _dB is not None else 1
+    fig, ax = plt.subplots(_nrz, 1, figsize=(11.6, 7.0 if _nrz == 2 else 4.4),
+                           sharex=True, squeeze=False)
+    ax = ax[:, 0]
+    ax[0].bar(_fz, _Hz_ref.mean(axis=0), width=0.05, color=DIM, alpha=0.35, lw=0,
+              label=f"leaves per 0.05 mHz at row {_cref} (walker mean)")
+    ax[0].bar(_fz, _Hz.mean(axis=0), width=0.05, color=GREEN, alpha=0.9, lw=0,
+              label=f"added since row {_cref} (walker mean; negative = removed)")
+    ax[0].axhline(0, color=FG, lw=1.0, ls=":")
+    ax[0].set_ylabel("cold GB leaves", fontsize=9)
+    _axz = ax[0].twinx()
+    _rz = (_gal_mean_curve(min(NIT - 1, _gn - 1), _fz * 1e-3)
+           / _gal_mean_curve(REF, _fz * 1e-3))
+    _axz.plot(_fz, _rz, color=AMBER, lw=1.5,
+              label=f"S_gal row {min(NIT - 1, _gn - 1)} / row {REF} (cold mean)")
+    _axz.axhline(1.0, color=AMBER, lw=0.8, ls=":")
+    _axz.set_ylim(0.5, 1.6); _axz.set_ylabel("S_gal ratio", color=AMBER, fontsize=9)
+    _axz.tick_params(axis="y", colors=AMBER); _axz.grid(False)
+    _h1, _l1 = ax[0].get_legend_handles_labels()
+    _h2, _l2 = _axz.get_legend_handles_labels()
+    ax[0].legend(_h1 + _h2, _l1 + _l2, fontsize=7.5, loc="upper right")
+    if _dB is not None:
+        _bbz = np.searchsorted(_ez, _bfc_m, side="right") - 1
+        _inz = (_bbz >= 0) & (_bbz < _fz.size)
+        _dBz = np.array([np.bincount(_bbz[_inz], weights=_d[w][_inz], minlength=_fz.size)
+                         for w in range(nwalk)])
+        ax[1].bar(_fz, _dBz.mean(axis=0), width=0.05, color=VIOLET, alpha=0.9, lw=0,
+                  label=f"per-band cold lnL, row {NIT - 1} minus row {REF}, summed per "
+                        "0.05 mHz (walker mean; sources added AND the noise-term change)")
+        ax[1].axhline(0, color=FG, lw=1.0, ls=":")
+        ax[1].set_ylabel("band lnL change", fontsize=9)
+        ax[1].legend(fontsize=7.5, loc="lower right")
+    ax[-1].set_xlabel("frequency [mHz]"); ax[-1].set_xlim(2.5, 5.5)
+    fig.suptitle("ZOOM 2.5-5.5 mHz: where the leaves went, 0.05 mHz bins", fontsize=10, color=FG)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig_b64(fig, "fg_leaf_delta_zoom")
+    _bins_m = {"1-2": (_fc_m >= 1.0) & (_fc_m < 2.0), "2-3": (_fc_m >= 2.0) & (_fc_m < 3.0),
+               "3-4": (_fc_m >= 3.0) & (_fc_m < 4.0), "4-5": (_fc_m >= 4.0) & (_fc_m < 5.0),
+               "5-7": (_fc_m >= 5.0) & (_fc_m < 7.0), "7+": _fc_m >= 7.0}
+    RATCHET.update(
+        cref=_cref, cref_name=(SAVED_AFTER[_cref] if _cref < len(SAVED_AFTER) else ""),
+        dleaves_total=float(_H.sum(axis=1).mean()),
+        dleaves={k: float(_H[:, m].sum(axis=1).mean()) for k, m in _bins_m.items()},
+        leaves_ref_bins={k: float(_Href[:, m].sum(axis=1).mean()) for k, m in _bins_m.items()},
+        dband_lnl=({k: float(_dB[:, m].sum(axis=1).mean()) for k, m in _bins_m.items()}
+                   if _dB is not None else {}),
+    )
+except Exception as _e:
+    MISSING.append(f"leaf-delta panel unavailable: {type(_e).__name__}: {_e}")
+
+if RATCHET:
+    _R = RATCHET
+    cap_fgA = (
+        f"<strong>The ratchet, read off the store.</strong> Row {_R['ref']} is the last "
+        f"row before the first nudge; nudge rows {_R['nudges']}, release rows "
+        f"{_R['releases']}. Cold log-likelihood (walker mean) relative to that row: "
+        f"minimum {_R['dll_min']:+,.0f} at row {_R['dll_min_row']}, "
+        f"{_R['dll_before_release']:+,.0f} on the last held row, "
+        f"{_R['dll_first_release']:+,.0f} right after the first release, "
+        f"{_R['dll_last']:+,.0f} at the last row. Cold leaves per walker: "
+        f"{_R['leaves_ref']:.0f} before the nudge, {_R['leaves_before_release']:.0f} on "
+        f"the last held row, {_R['leaves_last']:.0f} now. Foreground power relative to the "
+        f"pre-nudge fit at 2 / 3 / 4 / 5 mHz: held at "
+        + " / ".join(f"{v:.2f}" for v in _R.get("ratio_held", {}).values())
+        + ", now "
+        + " / ".join(f"{v:.2f}" for v in _R["ratio_last"].values())
+        + ". A release that climbs back to 1 says the model was honest there; one that stays "
+        "below says the fit had been carrying resolvable power; one that goes ABOVE 1 says "
+        "the released fit reshaped the curve rather than returning to it.")
+    if "cref" in _R:
+        cap_fgC = (
+            f"<strong>Where the leaves went.</strong> Cold-chain leaf histogram at the last row "
+            f"minus row {_R['cref']}"
+            + (f" (saved after {_R['cref_name']})" if _R.get("cref_name") else "")
+            + (" &mdash; the earliest row of this snapshot that still carries coordinates, "
+               "not the pre-nudge row itself" if _R["cref"] != _R["ref"] else "")
+            + f". Net leaves per walker: {_R['dleaves_total']:+.0f} in total; by band (mHz): "
+            + ", ".join(f"{k}: {v:+.0f} on {_R['leaves_ref_bins'][k]:.0f}"
+                        for k, v in _R["dleaves"].items())
+            + ". The amber curve is the cold-mean foreground of the last row over the pre-nudge "
+            "one."
+            + (" Lower panel: the per-band cold log-likelihood change over the same rows. This "
+               "is the DATA term of the band likelihood only (no log-determinant), so it tracks "
+               "the change in whitened residual power in each band: it goes down wherever the "
+               "noise curve was lowered or sources were removed and up wherever the curve was "
+               "raised or sources were added, and it does NOT by itself say whether the new "
+               "curve fits better: "
+               + ", ".join(f"{k}: {v:+,.0f}" for k, v in _R["dband_lnl"].items())
+               if _R.get("dband_lnl") else ""))
+if FGW:
+    _F = FGW
+    cap_fgB = (
+        "<strong>Is the residual what the noise model says it is?</strong> Top: the mean "
+        "whitened residual power per GB band (1 = the fitted instrument + foreground "
+        "exactly; each walker against its own fit). Running mean at 1 / 2 / 3 / 3.5 / 4 / "
+        "4.5 / 5 / 6 / 8 mHz: "
+        + " / ".join(f"{_F['rat_at'][f_]:.2f}" for f_ in (1.0, 2.0, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 8.0))
+        + f"; band means average {_F['rat_12']:.2f} over 1-2 mHz, {_F['rat_35']:.2f} over "
+        f"3-5 mHz, {_F['rat_610']:.2f} over 6-10 mHz, and the running mean spans a factor "
+        f"{_F['spread_35']:.2f} across 3-5 mHz. Against instrument-only the same residual "
+        "reads "
+        + " / ".join(f"{_F['inst_at'][f_]:.1f}" for f_ in (2.0, 3.0, 4.0, 5.0))
+        + " at 2 / 3 / 4 / 5 mHz (dashed: that is what the foreground term carries), and "
+        "against instrument + the FittedHT estimate "
+        + " / ".join(f"{_F['est_at'][f_]:.2f}" for f_ in (2.0, 3.0, 4.0, 5.0))
+        + " (dash-dot: the estimate, used as the noise, would leave that much excess). "
+        "Second and third rows: Gaussianity per band. For Gaussian noise the mean/median of "
+        "the whitened power is 1.443 and 1% of bins exceed 4.605; medians of the per-band "
+        f"mean/median are {_F['mm_12']:.2f} (1-2 mHz), {_F['mm_35']:.2f} (3-5 mHz), "
+        f"{_F['mm_610']:.2f} (6-10 mHz), and the tail fractions {100 * _F['tail_12']:.1f}% / "
+        f"{100 * _F['tail_35']:.1f}% / {100 * _F['tail_610']:.1f}%; "
+        f"{_F['bands_nongauss_35']} of {_F['bands_35']} bands in 3-5 mHz have more than 2% of "
+        "their bins in the tail. A band at mean 1 with a heavy tail holds its power in a few "
+        "loud bins (unresolved or missed lines) rather than a Gaussian floor; a smooth drift of "
+        "the mean away from 1 that follows frequency is the rigid tanh x power-law failing to "
+        "follow the residual's shape. Bottom: the share of the model noise that is foreground. "
+        "<em>Caveats.</em> (1) This page's residual removes the GB and VGB templates only, and "
+        "its data stream is ONE local brick per source type (" + (" + ".join(
+            os.path.basename(_p).split("_L1_")[-1].split("_")[0] + " " + _t
+            for _t, _p in globals().get("_files", {}).items()
+            if _t not in ("NOISE", "GB", "VGB")) or "none beyond NOISE + GB + VGB") +
+        ") rather than the run's full COMBINED stream, so the non-GB content differs from "
+        "what the sampler subtracted at start coordinates. (2) The noise curves here are the "
+        "static equal-arm model on each walker's parameters; the run multiplies the foreground "
+        "by a tabulated time modulation (GalForTimeModulation) that these curves do not carry, "
+        "so in foreground-dominated bands the page under-states the run's effective noise by "
+        "the window-mean of that table's XX element minus one, times the foreground share.")
 
 # ======================= GB RECOVERY (the science block) ====================
 # ONE FROZEN DENOMINATOR. ``gb_truth_3to21.npz`` holds every catalogue GB that
@@ -3246,6 +3840,220 @@ if TRU is not None and abs(SCI_TOBS - TRU_TOBS) > 1.0:
         f"{TRU_TOBS / 86400.0:.4g}-day observation and this run is "
         f"{SCI_TOBS / 86400.0:.4g} days.")
     TRU = None
+
+# ============ RATCHET SCORECARD (user request 2026-10-02) ====================
+# "the ratchet should have done this or shown something along these lines":
+# the number the ratchet exists to drive down is the count of DETECTABLE
+# catalogue sources (SNR > 7 in the frozen set) that no cold walker holds, per
+# band -- and the power those sources carry is what the fitted foreground is
+# made of. Two panels: (D) that count per band group against stored row, on
+# every row that still carries coordinates; (E) the fitted foreground share of
+# the model noise per 0.5 mHz against the periodogram power of the catalogue
+# sources the model has NOT resolved, split by their SNR. A source confined to
+# ~one FD bin carries SNR^2 S_X / 4 of X-channel power (optimal SNR is over
+# the two independent TDI combinations), so the unresolved set's mean PSD over
+# a band of N_bin bins is S_tot * sum(SNR^2) / (4 N_bin).
+RSC = {}
+try:
+    if TRU is None:
+        raise RuntimeError("no truth set in this snapshot")
+    _tf0_m = np.asarray(TRU["f0"], float).reshape(-1) * 1e3          # Hz -> mHz
+    _tsnr_r = np.asarray(TRU["snr"], float).reshape(-1)
+    _det7 = _tsnr_r > 7.0
+    _tol_m = 2.0 / SCI_TOBS * 1e3                                     # two FD bins
+    _chg_r = g["chain/gb"]; _ing_r = g["inds/gb"]
+    _rows_r = [i for i in range(NIT) if np.any(_chg_r[i, 0, 0, :, :, 1] != 0.0)]
+    if not _rows_r:
+        raise RuntimeError("no coordinate-bearing rows")
+
+    def _hits_r(i):
+        """how many cold walkers hold a leaf within two bins of each truth f0"""
+        h = np.zeros(_tf0_m.size, dtype=int)
+        for _w in range(nwalk):
+            lf = np.sort(_chg_r[i, 0, 0, _w][_ing_r[i, 0, 0, _w].astype(bool)][:, 1])
+            if lf.size == 0:
+                continue
+            j = np.searchsorted(lf, _tf0_m)
+            near = np.full(_tf0_m.size, np.inf)
+            for off in (-1, 0):
+                jj = np.clip(j + off, 0, lf.size - 1)
+                near = np.minimum(near, np.abs(lf[jj] - _tf0_m))
+            h += (near <= _tol_m)
+        return h
+
+    _groups_r = [("2-3", 2.0, 3.0), ("3-4", 3.0, 4.0), ("4-5", 4.0, 5.0), ("5-7", 5.0, 7.0)]
+    _none_r = {k: [] for k, *_ in _groups_r}
+    _one_r = {k: [] for k, *_ in _groups_r}
+    _h_last = None
+    for i in _rows_r:
+        h = _hits_r(i)
+        _h_last = h
+        for k, lo, hi in _groups_r:
+            m = _det7 & (_tf0_m >= lo) & (_tf0_m < hi)
+            _none_r[k].append(int(np.sum(m & (h == 0))))
+            _one_r[k].append(int(np.sum(m & (h == 1))))
+    _tot7_r = {k: int(np.sum(_det7 & (_tf0_m >= lo) & (_tf0_m < hi))) for k, lo, hi in _groups_r}
+    fig, ax = plt.subplots(2, 1, figsize=(11.6, 7.2), sharex=True)
+    for (k, lo, hi), c in zip(_groups_r, (FG, VIOLET, CYAN, AMBER)):
+        ax[0].plot(_rows_r, _none_r[k], "o-", color=c, lw=1.4, ms=3.5,
+                   label=f"{k} mHz (of {_tot7_r[k]} catalogue sources with SNR > 7)")
+        ax[1].plot(_rows_r, _one_r[k], "o-", color=c, lw=1.4, ms=3.5)
+    for _r in RATCHET.get("nudges", []):
+        for a_ in ax:
+            a_.axvline(_r, color=AMBER, lw=0.9, ls=(0, (3, 2)))
+    for _r in RATCHET.get("releases", []):
+        for a_ in ax:
+            a_.axvline(_r, color=GREEN, lw=0.9, ls=(0, (3, 2)))
+    ax[0].set_ylabel("SNR > 7 catalogue sources\nheld by NO cold walker", fontsize=9)
+    ax[1].set_ylabel("held by exactly\nONE cold walker", fontsize=9)
+    ax[1].set_xlabel("stored row (coordinate-bearing rows only; amber = nudge, green = release)")
+    ax[0].legend(fontsize=7.5, loc="upper right")
+    for a_ in ax:
+        a_.set_ylim(bottom=0)
+    fig.suptitle("ratchet scorecard: detectable catalogue sources still unresolved, per band "
+                 "(a leaf within two FD bins of the catalogue f0 counts as held)",
+                 fontsize=10, color=FG)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig_b64(fig, "fg_missed_vs_row")
+    RSC.update(rows=(int(_rows_r[0]), int(_rows_r[-1])),
+               none_first={k: v[0] for k, v in _none_r.items()},
+               none_last={k: v[-1] for k, v in _none_r.items()},
+               one_last={k: v[-1] for k, v in _one_r.items()}, tot7=_tot7_r)
+    _m35 = (_tf0_m >= 3.0) & (_tf0_m < 5.5) & _det7 & (_h_last == 0)
+    if np.any(_m35):
+        RSC["snr_pct_35"] = [float(x) for x in np.percentile(_tsnr_r[_m35], [10, 50, 90])]
+        RSC["n_none_35"] = int(_m35.sum())
+
+    # ---- (E) what the fitted foreground is made of, per 0.5 mHz --------------
+    from lisatools.sensitivity import get_sensitivity as _gs_r, X2TDISens as _X2_r
+    from lisatools import detector as _lm_r
+    from lisatools.stochastic import HyperbolicTangentGalacticForeground as _HT_r
+    _ed_r = np.arange(2.0, 7.0 + 1e-9, 0.5)
+    _fc_r = 0.5 * (_ed_r[:-1] + _ed_r[1:])
+    _nbin_r = 0.5e-3 * SCI_TOBS
+    _share_r = np.zeros((nwalk, _fc_r.size))
+    for _w in range(nwalk):
+        _pmw = psd_cold[-1, _w]; _gmw = gal_cold_phys[-1, _w]
+        _lmw = _lm_r.LISAModel(float(_pmw[0]) ** 2, float(_pmw[1]) ** 2,
+                               _lm_r.DefaultOrbits(), "sampled")
+        _si = np.asarray(_gs_r(_fc_r * 1e-3, sens_fn=_X2_r, model=_lmw, stochastic_params=()), float)
+        _st = np.asarray(_gs_r(_fc_r * 1e-3, sens_fn=_X2_r, model=_lmw,
+                               stochastic_params=tuple(_gmw), stochastic_function=_HT_r), float)
+        _share_r[_w] = 1.0 - _si / np.maximum(_st, 1e-60)
+    _share_m = _share_r.mean(axis=0)
+    _un = _h_last < 2                                   # not held by >= 2 walkers
+    _p7 = np.zeros(_fc_r.size); _p57 = np.zeros(_fc_r.size); _p5 = np.zeros(_fc_r.size)
+    for i in range(_fc_r.size):
+        m = (_tf0_m >= _ed_r[i]) & (_tf0_m < _ed_r[i + 1]) & _un
+        _p7[i] = np.sum(_tsnr_r[m & (_tsnr_r > 7)] ** 2) / (4 * _nbin_r)
+        _p57[i] = np.sum(_tsnr_r[m & (_tsnr_r > 5) & (_tsnr_r <= 7)] ** 2) / (4 * _nbin_r)
+        _p5[i] = np.sum(_tsnr_r[m & (_tsnr_r <= 5)] ** 2) / (4 * _nbin_r)
+    fig, ax = plt.subplots(1, 1, figsize=(11.6, 5.2))
+    _wd = 0.42
+    ax.bar(_fc_r - 0.11, _p5, width=_wd / 2, color=DIM, label="unresolved catalogue sources, SNR <= 5")
+    ax.bar(_fc_r - 0.11, _p57, width=_wd / 2, bottom=_p5, color=VIOLET, label="unresolved, SNR 5-7")
+    ax.bar(_fc_r - 0.11, _p7, width=_wd / 2, bottom=_p5 + _p57, color=RED,
+           label="unresolved, SNR > 7 (the ratchet's targets)")
+    ax.bar(_fc_r + 0.11, _share_m, width=_wd / 2, color=CYAN, alpha=0.85,
+           label=f"fitted foreground share of the model noise, cold-walker mean, row {NIT - 1}")
+    for _w in range(nwalk):
+        ax.plot(_fc_r + 0.11, _share_r[_w], "_", color=FG, ms=9, mew=1.2)
+    for i in range(_fc_r.size):
+        if _share_m[i] > 0.02:
+            ax.annotate(f"{100 * _p7[i] / _share_m[i]:.0f}%", xy=(_fc_r[i], max(_share_m[i], _p5[i] + _p57[i] + _p7[i]) + 0.02),
+                        ha="center", fontsize=7, color=RED)
+    ax.set_ylim(0, 1.0)
+    ax.set_xlabel("frequency [mHz]  (red labels: the SNR > 7 misses' share of the fitted foreground)")
+    ax.set_ylabel("fraction of the model noise S_tot (TDI X)", fontsize=9)
+    ax.legend(fontsize=7.5, loc="upper right")
+    fig.suptitle("what the fitted foreground is made of: unresolved catalogue power vs the fit, "
+                 "per 0.5 mHz (truth set is amplitude-prefiltered: a lower bound)",
+                 fontsize=10, color=FG)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig_b64(fig, "fg_truth_decomp")
+    RSC.update(share={f"{_ed_r[i]:.1f}-{_ed_r[i + 1]:.1f}": float(_share_m[i]) for i in range(_fc_r.size)},
+               unres={f"{_ed_r[i]:.1f}-{_ed_r[i + 1]:.1f}": float(_p5[i] + _p57[i] + _p7[i]) for i in range(_fc_r.size)},
+               miss7_frac={f"{_ed_r[i]:.1f}-{_ed_r[i + 1]:.1f}": (float(_p7[i] / _share_m[i]) if _share_m[i] > 0.02 else float("nan"))
+                           for i in range(_fc_r.size)})
+    del _chg_r, _ing_r
+except Exception as _e:
+    MISSING.append(f"ratchet scorecard unavailable: {type(_e).__name__}: {_e}")
+
+# ---- (G) where the RJ births actually landed, per leg and per 0.5 mHz --------
+# ``band_num_proposed_rj`` / ``band_num_accepted_rj`` are CUMULATIVE per
+# (row, band, rung) counters; the difference between consecutive stored rows
+# is that leg's traffic. Under search legs one row lands per leg, so this is
+# births (the in_model_fstat leg) and deaths (the in_model_removal leg) per
+# band, which is the direct test of "did the births go where the unresolved
+# detectable sources are". An extract carries the counters only in its keep
+# window, so a short snapshot shows the last few legs.
+RJB = {}
+try:
+    _pr = sub["gb/band_num_proposed_rj"]; _ac = sub["gb/band_num_accepted_rj"]
+    _rows_c = [i for i in range(1, NIT) if np.any(_pr[i, :, 0] > 0) and np.any(_pr[i - 1, :, 0] > 0)]
+    if not _rows_c:
+        raise RuntimeError("fewer than two rows carry the per-band RJ counters")
+    _ed_g = np.arange(2.0, 7.0 + 1e-9, 0.5)
+    _fc_g = 0.5 * (_ed_g[:-1] + _ed_g[1:])
+    _bcen = 0.5 * (band_edges[:-1] + band_edges[1:]) * 1e3
+    _gi = np.searchsorted(_ed_g, _bcen, side="right") - 1
+    _ing_g = (_gi >= 0) & (_gi < _fc_g.size)
+    _legs = []
+    for i in _rows_c:
+        dp = _pr[i, :, 0] - _pr[i - 1, :, 0]
+        da = _ac[i, :, 0] - _ac[i - 1, :, 0]
+        if not np.any(dp > 0):
+            continue
+        _legs.append((i, (SAVED_AFTER[i] if i < len(SAVED_AFTER) and SAVED_AFTER[i] else f"row {i}"),
+                      np.bincount(_gi[_ing_g], weights=dp[_ing_g], minlength=_fc_g.size),
+                      np.bincount(_gi[_ing_g], weights=da[_ing_g], minlength=_fc_g.size)))
+    if not _legs:
+        raise RuntimeError("no leg with RJ traffic in the counters' window")
+    fig, ax = plt.subplots(2, 1, figsize=(11.6, 7.0), sharex=True)
+    _nl = len(_legs); _wd = 0.44 / _nl
+    _pal = [CYAN, GREEN, AMBER, VIOLET, RED, FG, DIM] * 4
+    for k, (i, nm, dp, da) in enumerate(_legs):
+        _x = _fc_g - 0.22 + (k + 0.5) * _wd
+        ax[0].bar(_x, da, width=_wd, color=_pal[k], label=f"row {i} (after {nm})")
+        ax[1].bar(_x, 100 * da / np.maximum(dp, 1), width=_wd, color=_pal[k])
+    ax[0].set_ylabel("accepted RJ moves, cold rung,\nall walkers, per 0.5 mHz", fontsize=9)
+    ax[1].set_ylabel("acceptance [%]", fontsize=9)
+    ax[1].set_xlabel("frequency [mHz]")
+    ax[0].legend(fontsize=7.5, loc="upper right", ncols=2)
+    fig.suptitle("RJ traffic per leg (cumulative per-band counters differenced between stored rows)",
+                 fontsize=10, color=FG)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig_b64(fig, "fg_rj_per_band")
+    RJB.update(legs=[(int(i), nm, float(dp.sum()), float(da.sum())) for i, nm, dp, da in _legs])
+except Exception as _e:
+    MISSING.append(f"RJ-per-band panel unavailable: {type(_e).__name__}: {_e}")
+
+if RSC:
+    _S = RSC
+    cap_fgD = (
+        f"<strong>The ratchet's scorecard.</strong> Catalogue sources with SNR &gt; 7 (frozen set) "
+        f"that NO cold walker holds, rows {_S['rows'][0]} to {_S['rows'][1]}: "
+        + ", ".join(f"{k} mHz {_S['none_first'][k]} &rarr; {_S['none_last'][k]} of {_S['tot7'][k]}"
+                    for k in _S["tot7"])
+        + ". Held by exactly one walker at the last row: "
+        + ", ".join(f"{k}: {_S['one_last'][k]}" for k in _S["tot7"])
+        + " (those are a cross-walker exchange away from resolved)."
+        + (f" The {_S['n_none_35']} still unresolved at 3&ndash;5.5 mHz have SNR "
+           f"{_S['snr_pct_35'][0]:.1f} / {_S['snr_pct_35'][1]:.1f} / {_S['snr_pct_35'][2]:.1f} "
+           "at the 10th / 50th / 90th percentile: threshold sources." if "snr_pct_35" in _S else "")
+        + " SNRs are the frozen set's, under the noise it was built at; an extract carries "
+        "coordinates only in its keep window, so earlier rows need an earlier snapshot.")
+    cap_fgE = (
+        "<strong>What the fitted foreground is made of.</strong> Per 0.5 mHz: the fitted "
+        "foreground's share of the model noise (cyan; ticks = each cold walker) against the "
+        "X-channel periodogram power of the catalogue sources the model has not resolved "
+        "(stacked by SNR; a source in one FD bin carries SNR&sup2; S_X / 4). Fit vs unresolved "
+        "total: "
+        + ", ".join(f"{k}: {_S['share'][k]:.2f} vs {_S['unres'][k]:.2f}" for k in _S["share"])
+        + ". Share of the fitted foreground carried by the SNR &gt; 7 misses: "
+        + ", ".join(f"{k}: {100 * v:.0f}%" for k, v in _S["miss7_frac"].items() if np.isfinite(v))
+        + ". Where the two bars agree the fitted foreground IS the unresolved galaxy; the red "
+        "fraction is the part a search could still remove.")
 
 
 def _match_pairs(rf, tf, tol):
@@ -5971,7 +6779,7 @@ ul {{ color:var(--dim); font-size:13px; }}
   <span>{chips}</span>
 </header>
 <nav>
-  <a href="#status">status</a><a href="#resid">residual</a>
+  <a href="#status">status</a><a href="#resid">residual</a><a href="#ratchet">ratchet</a>
   <a href="#recovery">recovery</a><a href="#population">population</a>
   {NAV_PARAMS}<a href="#search">search &amp; cap cells</a>{NAV_GATES}
   <a href="#fstat">f-stat</a><a href="#noise">noise</a>
@@ -6032,6 +6840,42 @@ cold-chain coordinates of the highest-likelihood walker through the run&rsquo;s 
 transform and waveform generator. The noise branches shape the sensitivity the
 likelihood weights by and are never subtracted, so the unresolved galaxy stays in
 the residual by construction.</div>
+</section>
+
+<section id="ratchet"><h2>Foreground Ratchet Diagnosis</h2>
+<div class="panel">{img("fg_ratchet_timeline", "ratchet timeline (needs GALFOR_RATCHET + GB_SEARCH_LEGS rows)")}
+<div class="caption">{cap_fgA}</div></div>
+<div class="panel">{img("fg_whitened_bands", "whitened residual per GB band")}
+<div class="caption">{cap_fgB}</div></div>
+<div class="panel">{img("fg_whitened_zoom", "zoom 2.5-5.5 mHz: whitened residual per GB band")}
+<div class="caption">Zoom of the panel above on 2.5&ndash;5.5 mHz with a linear frequency
+axis. Points are every cold walker at every GB band against its own fitted noise; the
+running mean spans 5 bands (~85 &micro;Hz) instead of 15.</div></div>
+<div class="panel">{img("fg_resid_psd_zoom", "zoom 2.5-5.5 mHz: residual spectrum against the noise curves")}
+<div class="caption">The same residual unwhitened: its PSD per GB band against the fitted
+noise (instrument + galfor, cold-walker mean at the last row), the fitted instrument alone,
+the injected instrument + FittedHT estimate, and stored row 0&rsquo;s noise &mdash; under a
+pinned launch that is the start vector the search ran against until the first release.
+Where the residual sits above the fitted curve the model is under-estimating the power
+there; where the fitted curve sits above row 0 the release raised the foreground.</div></div>
+<div class="panel">{img("fg_leaf_delta", "where the leaves went across the ratchet")}
+<div class="caption">{cap_fgC}</div></div>
+<div class="panel">{img("fg_leaf_delta_zoom", "zoom 2.5-5.5 mHz: where the leaves went")}
+<div class="caption">Zoom on 2.5&ndash;5.5 mHz at 0.05 mHz bins (about three GB bands each):
+the grey bars are the leaves already there at the reference row, the green bars what was
+added or removed since, the amber curve the foreground ratio, and the lower panel the
+per-band cold log-likelihood change.</div></div>
+<div class="panel">{img("fg_missed_vs_row", "ratchet scorecard: unresolved detectable catalogue sources per band vs stored row")}
+<div class="caption">{cap_fgD}</div></div>
+<div class="panel">{img("fg_truth_decomp", "what the fitted foreground is made of: unresolved catalogue power vs the fit")}
+<div class="caption">{cap_fgE}</div></div>
+<div class="panel">{img("fg_rj_per_band", "RJ traffic per leg and per 0.5 mHz")}
+<div class="caption">Accepted RJ moves on the cold rung per 0.5 mHz for each stored leg the
+counters cover, and the acceptance fraction. The in_model_fstat legs carry the F-stat
+births, the in_model_removal legs the prior removals. The counters are cumulative per band
+and are differenced between consecutive stored rows; an extract keeps them only in its keep
+window, so a short snapshot shows the last few legs. Legs covered:
+{", ".join(f"row {i} ({nm}): {int(a):,} accepted of {int(p):,}" for i, nm, p, a in RJB.get("legs", [])) or "none"}.</div></div>
 </section>
 
 <section id="recovery"><h2>Recovery</h2>
