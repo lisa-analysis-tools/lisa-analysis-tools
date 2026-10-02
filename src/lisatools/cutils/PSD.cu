@@ -302,7 +302,9 @@ CUDA_KERNEL void psd_likelihood_xyz_kernel(
 #endif
 
     // Per-thread variables
-    double Soms_d_in, Sa_a_in, Amp, alpha, f_1, f_knee, f_2;
+    const double *Soms_d_in = nullptr, *Sa_a_in = nullptr;
+    double Amp, alpha, f_1, f_knee, f_2;
+    int n_noise_par = sensitivity_matrix.n_noise_par;
     double f;
     int data_index, time_index;
     cmplx d_X, d_Y, d_Z;
@@ -345,8 +347,8 @@ CUDA_KERNEL void psd_likelihood_xyz_kernel(
 
         // Noise parameters for this PSD
          if (use_external_matrix == false) {
-          Soms_d_in = Soms_d_in_all[psd_i];
-          Sa_a_in = Sa_a_in_all[psd_i];
+          Soms_d_in = &Soms_d_in_all[psd_i * n_noise_par];
+          Sa_a_in = &Sa_a_in_all[psd_i * n_noise_par];
           Amp = Amp_all[psd_i];
           alpha = alpha_all[psd_i];
           f_1 = f_1_all[psd_i];
@@ -734,10 +736,13 @@ void XYZSensitivityMatrix::get_noise_tfs(
   index3 = link_to_index(12);
   *oms_zz = oms_xx_unequal_armlength(f, avg_d[index1], avg_d[index2]);
   *tm_zz = tm_xx_unequal_armlength(f, avg_d[index1], avg_d[index2]);
+  // C_XZ = conj(C_ZX); with (d_ik, d_jk) swapped the arm-average phase is
+  // conjugated, so the asymmetry term needs delta_13 = -delta_31.
+  int index_13 = link_to_index(13);
   *oms_xz = oms_xy_unequal_armlength(f, avg_d[index1], avg_d[index3],
-                                     avg_d[index2], delta_d[index1]);
+                                     avg_d[index2], delta_d[index_13]);
   *tm_xz = tm_xy_unequal_armlength(f, avg_d[index1], avg_d[index3],
-                                   avg_d[index2], delta_d[index1]);
+                                   avg_d[index2], delta_d[index_13]);
 }
 
 // now, add a cuda kernel to compute all noise tfs at once for an array of
@@ -827,6 +832,148 @@ void XYZSensitivityMatrix::get_noise_tfs_arr(
 }
 
 // ============================================================================
+// Per-MOSA (unequal noise) transfer functions
+// ============================================================================
+// Taken from Hartwig et al. 2023 (2303.15929, eqs. 2.18-2.21)
+// all multiplied by G. The covariance is C_ab = sum_m S_m R_a,m conj(R_b,m).
+// With equal amplitudes this reduces exactly to the *_unequal_armlength TFs.
+// MOSA (link) indices in orbits.LINKS order [12, 23, 31, 13, 32, 21] seen by
+// each channel, ordered (ij, ji, ik, ki) for origin i: X = 1, Y = 2, Z = 3.
+static CUDA_DEVICE int mosa_channel_link(int ch, int q) {
+  const int table[3][4] = {{0, 5, 3, 2}, {1, 4, 5, 0}, {2, 3, 4, 1}};
+  return table[ch][q];
+}
+
+// Cross pairs XY, XZ, YZ share one arm (two MOSAs). For pair p and shared
+// MOSA qq: its link index, and its position q in the two channels' lists.
+static CUDA_DEVICE int mosa_cross_link(int p, int qq) {
+  const int table[3][2] = {{0, 5}, {3, 2}, {1, 4}};
+  return table[p][qq];
+}
+static CUDA_DEVICE int cross_channel(int p, int side) {
+  const int table[3][2] = {{0, 1}, {0, 2}, {1, 2}};
+  return table[p][side];
+}
+static CUDA_DEVICE int cross_q(int p, int qq, int side) {
+  const int table[3][2][2] = {{{0, 3}, {1, 2}}, {{2, 1}, {3, 0}}, {{0, 3}, {1, 2}}};
+  return table[p][qq][side];
+}
+
+static CUDA_DEVICE cmplx delay_phase(double d, double f) {
+  double ph = d_times_omega(d, f);
+  return cmplx(cos(ph), -sin(ph));
+}
+
+// R[q * 2 + type] for the 4 MOSAs of one channel; d holds one-way delays per link.
+static CUDA_DEVICE void channel_mosa_responses(double f, const double *d, int ch,
+                                               int generation, cmplx *R) {
+  int ij = mosa_channel_link(ch, 0), ji = mosa_channel_link(ch, 1);
+  int ik = mosa_channel_link(ch, 2), ki = mosa_channel_link(ch, 3);
+  cmplx one(1.0, 0.0);
+  cmplx A = delay_phase(d[ik] + d[ki], f);
+  cmplx B = delay_phase(d[ij] + d[ji], f);
+  cmplx e_ij = delay_phase(d[ij], f);
+  cmplx e_ik = delay_phase(d[ik], f);
+  cmplx G = (generation == 2) ? (one - A * B) : one;
+
+  R[0] = G * (one - A);                         // OMS ij
+  R[1] = G * (one - A) * (one + B);             // TM  ij
+  R[2] = G * e_ij * (one - A);                  // OMS ji
+  R[3] = G * 2.0 * e_ij * (one - A);            // TM  ji
+  R[4] = -G * (one - B);                        // OMS ik
+  R[5] = -G * (one - B) * (one + A);            // TM  ik
+  R[6] = -G * e_ik * (one - B);                 // OMS ki
+  R[7] = -G * 2.0 * e_ik * (one - B);           // TM  ki
+}
+
+CUDA_DEVICE
+void XYZSensitivityMatrix::get_noise_tfs_mosa(double f, double *mosa_auto,
+                                              cmplx *mosa_cross, int time_index) {
+  double d[6];
+  for (int i = 0; i < 6; i++) {
+    d[i] = averaged_ltts_arr[time_index * n_links + i] +
+           0.5 * delta_ltts_arr[time_index * n_links + i];
+  }
+
+  cmplx R[3][8];
+  for (int ch = 0; ch < 3; ch++) channel_mosa_responses(f, d, ch, generation, R[ch]);
+
+  for (int ch = 0; ch < 3; ch++) {
+    for (int k = 0; k < 8; k++) mosa_auto[ch * 8 + k] = gcmplx::norm(R[ch][k]);
+  }
+  for (int p = 0; p < 3; p++) {
+    int a = cross_channel(p, 0), b = cross_channel(p, 1);
+    for (int qq = 0; qq < 2; qq++) {
+      int qa = cross_q(p, qq, 0), qb = cross_q(p, qq, 1);
+      for (int type = 0; type < 2; type++) {
+        mosa_cross[p * 4 + qq * 2 + type] =
+            R[a][qa * 2 + type] * gcmplx::conj(R[b][qb * 2 + type]);
+      }
+    }
+  }
+}
+
+CUDA_KERNEL
+void get_noise_tfs_mosa_kernel(double *frequencies, int *time_indices,
+                               double *mosa_auto_arr, cmplx *mosa_cross_arr,
+                               int num_freqs, int num_times,
+                               XYZSensitivityMatrix *sensitivity_matrix) {
+  int start, increment;
+#ifdef __CUDACC__
+  start = blockIdx.x * blockDim.x + threadIdx.x;
+  increment = gridDim.x * blockDim.x;
+#else
+  start = 0;
+  increment = 1;
+#endif
+
+  for (int t_idx = 0; t_idx < num_times; t_idx++) {
+    int time_index = time_indices[t_idx];
+    for (int i = start; i < num_freqs; i += increment) {
+      double mosa_auto[24];
+      cmplx mosa_cross[12];
+      sensitivity_matrix->get_noise_tfs_mosa(frequencies[i], mosa_auto, mosa_cross, time_index);
+      for (int k = 0; k < 24; k++)
+        mosa_auto_arr[((long long)t_idx * 24 + k) * num_freqs + i] = mosa_auto[k];
+      for (int k = 0; k < 12; k++)
+        mosa_cross_arr[((long long)t_idx * 12 + k) * num_freqs + i] = mosa_cross[k];
+    }
+  }
+}
+
+void XYZSensitivityMatrix::get_noise_tfs_mosa_arr(double *freqs, double *mosa_auto,
+                                                  cmplx *mosa_cross, int num_freqs,
+                                                  int num_times, int *time_indices) {
+#ifdef __CUDACC__
+  int num_blocks = std::ceil((num_freqs + NUM_THREADS - 1) / NUM_THREADS);
+  XYZSensitivityMatrix *sensitivity_matrix_gpu;
+  gpuErrchk(cudaMalloc(&sensitivity_matrix_gpu, sizeof(XYZSensitivityMatrix)));
+  gpuErrchk(cudaMemcpy(sensitivity_matrix_gpu, this, sizeof(XYZSensitivityMatrix),
+                       cudaMemcpyHostToDevice));
+  get_noise_tfs_mosa_kernel<<<num_blocks, NUM_THREADS>>>(
+      freqs, time_indices, mosa_auto, mosa_cross, num_freqs, num_times,
+      sensitivity_matrix_gpu);
+  cudaDeviceSynchronize();
+  gpuErrchk(cudaGetLastError());
+  gpuErrchk(cudaFree(sensitivity_matrix_gpu));
+#else
+  get_noise_tfs_mosa_kernel(freqs, time_indices, mosa_auto, mosa_cross, num_freqs,
+                            num_times, this);
+#endif
+}
+
+void XYZSensitivityMatrix::set_noise_symmetry(bool asymmetric) {
+  n_noise_par = asymmetric ? 6 : 1;
+}
+
+void XYZSensitivityMatrix::set_averaged_mosa_tfs(double *mosa_auto, cmplx *mosa_cross, int nf) {
+  mosa_auto_avg = mosa_auto;
+  mosa_cross_avg = mosa_cross;
+  nf_avg = nf;
+  use_averaged_mosa_tfs = true;
+}
+
+// ============================================================================
 // Noise Covariance Matrix Computation
 // ============================================================================
 
@@ -849,12 +996,57 @@ void XYZSensitivityMatrix::disable_averaged_tfs() { use_averaged_tfs = false; }
 CUDA_DEVICE
 void XYZSensitivityMatrix::get_noise_covariance(
     double f, int time_index, int f_idx,
-    double Soms_d_in, double Sa_a_in,
+    const double *Soms_d_in, const double *Sa_a_in,
     double Amp, double alpha, double f_1, double f_knee, double f_2,
     double spline_in_isi_oms, double spline_in_testmass,
     double *c00, cmplx *c01, cmplx *c02,
     double *c11, cmplx *c12, double *c22)
 {
+  if (n_noise_par == 6)
+  {
+    // Unequal noises: per-MOSA amplitudes on a common spectral shape.
+    double mosa_auto[24];
+    cmplx mosa_cross[12];
+    if (use_averaged_mosa_tfs)
+    {
+        for (int k = 0; k < 24; k++) mosa_auto[k] = mosa_auto_avg[k * nf_avg + f_idx];
+        for (int k = 0; k < 12; k++) mosa_cross[k] = mosa_cross_avg[k * nf_avg + f_idx];
+    }
+    else
+    {
+        get_noise_tfs_mosa(f, mosa_auto, mosa_cross, time_index);
+    }
+
+    double shape[2];  // unit-amplitude PSDs: [OMS, TM]
+    noise_levels.get_isi_oms_noise(&shape[0], f, 1.0, spline_in_isi_oms);
+    noise_levels.get_testmass_noise(&shape[1], f, 1.0, spline_in_testmass);
+
+    double auto_c[3] = {0.0, 0.0, 0.0};
+    for (int ch = 0; ch < 3; ch++)
+    {
+        for (int q = 0; q < 4; q++)
+        {
+            int m = mosa_channel_link(ch, q);
+            auto_c[ch] += mosa_auto[ch * 8 + q * 2 + 0] * Soms_d_in[m] * Soms_d_in[m] * shape[0]
+                        + mosa_auto[ch * 8 + q * 2 + 1] * Sa_a_in[m] * Sa_a_in[m] * shape[1];
+        }
+    }
+    cmplx cross_c[3];
+    for (int p = 0; p < 3; p++)
+    {
+        cross_c[p] = cmplx(0.0, 0.0);
+        for (int qq = 0; qq < 2; qq++)
+        {
+            int m = mosa_cross_link(p, qq);
+            cross_c[p] += mosa_cross[p * 4 + qq * 2 + 0] * (Soms_d_in[m] * Soms_d_in[m] * shape[0])
+                        + mosa_cross[p * 4 + qq * 2 + 1] * (Sa_a_in[m] * Sa_a_in[m] * shape[1]);
+        }
+    }
+    *c00 = auto_c[0]; *c11 = auto_c[1]; *c22 = auto_c[2];
+    *c01 = cross_c[0]; *c02 = cross_c[1]; *c12 = cross_c[2];
+  }
+  else
+  {
     double oms_xx, oms_yy, oms_zz, tm_xx, tm_yy, tm_zz;
     cmplx oms_xy, oms_xz, oms_yz, tm_xy, tm_xz, tm_yz;
 
@@ -874,8 +1066,8 @@ void XYZSensitivityMatrix::get_noise_covariance(
     }
 
     double S_tm, S_isi_oms;
-    noise_levels.get_isi_oms_noise(&S_isi_oms, f, Soms_d_in, spline_in_isi_oms);
-    noise_levels.get_testmass_noise(&S_tm, f, Sa_a_in, spline_in_testmass);
+    noise_levels.get_isi_oms_noise(&S_isi_oms, f, Soms_d_in[0], spline_in_isi_oms);
+    noise_levels.get_testmass_noise(&S_tm, f, Sa_a_in[0], spline_in_testmass);
 
     *c00 = oms_xx * S_isi_oms + tm_xx * S_tm;
     *c11 = oms_yy * S_isi_oms + tm_yy * S_tm;
@@ -883,6 +1075,7 @@ void XYZSensitivityMatrix::get_noise_covariance(
     *c01 = oms_xy * S_isi_oms + tm_xy * S_tm;
     *c02 = oms_xz * S_isi_oms + tm_xz * S_tm;
     *c12 = oms_yz * S_isi_oms + tm_yz * S_tm;
+  }
 
     // Galactic foreground: R_avg[time_index * 6 + k] * S_gal(f)
     // R_avg is fixed (shared across walkers); S_gal computed inline per walker
@@ -930,7 +1123,9 @@ void get_noise_covariance_kernel(
     int start_time, end_time, increment_time;
     int start_psd, end_psd, increment_psd;
     double spline_in_isi_oms, spline_in_testmass;
-    double Soms_d_in, Sa_a_in, Amp, alpha, f_1, f_knee, f_2;
+    const double *Soms_d_in, *Sa_a_in;
+    double Amp, alpha, f_1, f_knee, f_2;
+    int n_noise_par = sensitivity_matrix->n_noise_par;
 
 #ifdef __CUDACC__
   // X dimension for frequencies (fast), Y dimension for times, Z dimension for PSDs (slow)
@@ -960,8 +1155,8 @@ void get_noise_covariance_kernel(
     for (int psd_i = start_psd; psd_i < end_psd; psd_i += increment_psd)
     {
         // Noise parameters for this PSD
-        Soms_d_in = Soms_d_in_all[psd_i];
-        Sa_a_in = Sa_a_in_all[psd_i];
+        Soms_d_in = &Soms_d_in_all[psd_i * n_noise_par];
+        Sa_a_in = &Sa_a_in_all[psd_i * n_noise_par];
         Amp = Amp_all[psd_i];
         alpha = alpha_all[psd_i];
         f_1 = f_1_all[psd_i];

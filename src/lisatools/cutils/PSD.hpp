@@ -86,6 +86,18 @@ public:
     double *tm_xx_avg  = nullptr, *tm_yy_avg  = nullptr, *tm_zz_avg  = nullptr;
     gcmplx::complex<double> *tm_xy_avg  = nullptr, *tm_xz_avg  = nullptr, *tm_yz_avg  = nullptr;
 
+    // --- unequal (per-MOSA) noise amplitudes ---
+    // n_noise_par = 1: one OMS and one TM amplitude shared by all MOSAs (symmetric).
+    // n_noise_par = 6: one amplitude per MOSA, ordered as the links 12,23,31,13,32,21.
+    // The amplitude arrays are then laid out [psd_i * n_noise_par + mosa].
+    int n_noise_par = 1;
+    // FD time-averaged per-MOSA basis TFs (non-owned). Layout [k * nf_avg + f_idx]:
+    //   auto  k = ch * 8 + q * 2 + type   (q indexes mosa_channel_link(ch, q) in PSD.cu, type 0 = OMS, 1 = TM)
+    //   cross k = p * 4 + q * 2 + type    (p = XY, XZ, YZ; q indexes mosa_cross_link(p, q))
+    bool   use_averaged_mosa_tfs = false;
+    double *mosa_auto_avg = nullptr;
+    gcmplx::complex<double> *mosa_cross_avg = nullptr;
+
     // ---- constructor ----
     XYZSensitivityMatrix(double *averaged_ltts_arr_, double *delta_ltts_arr_,
                          int n_times_, double armlength_,
@@ -118,6 +130,10 @@ public:
                           double* tm_yy,  gcmplx::complex<double>* tm_yz,  double* tm_zz, int nf);
     void disable_averaged_tfs();
 
+    // ---- unequal-noise switch and per-MOSA averaged TFs (host-only, defined in PSD.cu) ----
+    void set_noise_symmetry(bool asymmetric);
+    void set_averaged_mosa_tfs(double* mosa_auto, gcmplx::complex<double>* mosa_cross, int nf);
+
     // ---- device: noise transfer functions ----
     CUDA_DEVICE int get_adjacent_mosa(int mosa);
 
@@ -135,10 +151,15 @@ public:
         double *tm_yy,  gcmplx::complex<double> *tm_yz,  double *tm_zz,
         int time_index);
 
+    // per-MOSA basis TFs: 24 auto (double) + 12 cross (complex), layout as the *_avg arrays
+    CUDA_DEVICE void get_noise_tfs_mosa(
+        double f, double *mosa_auto, gcmplx::complex<double> *mosa_cross, int time_index);
+
     // ---- device: noise covariance ----
+    // Soms_d_in / Sa_a_in point to n_noise_par amplitudes for this PSD.
     CUDA_DEVICE void get_noise_covariance(
         double f, int time_index, int f_idx,
-        double Soms_d_in, double Sa_a_in,
+        const double *Soms_d_in, const double *Sa_a_in,
         double Amp, double alpha, double f_1, double f_knee, double f_2,
         double spline_in_isi_oms, double spline_in_testmass,
         double *c00, gcmplx::complex<double> *c01, gcmplx::complex<double> *c02,
@@ -153,6 +174,12 @@ public:
         double *tm_yy,  gcmplx::complex<double> *tm_yz,  double *tm_zz,
         int num_freqs, int num_times,
         int *time_indices);
+
+    // out layout [(t_idx * 24 + k) * num_freqs + f_idx] (auto) and
+    //            [(t_idx * 12 + k) * num_freqs + f_idx] (cross)
+    void get_noise_tfs_mosa_arr(
+        double *freqs, double *mosa_auto, gcmplx::complex<double> *mosa_cross,
+        int num_freqs, int num_times, int *time_indices);
 
     void psd_likelihood_wrap(
         double *like_contrib_final, double *f_arr, gcmplx::complex<double> *data,
