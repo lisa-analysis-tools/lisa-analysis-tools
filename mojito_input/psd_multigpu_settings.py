@@ -204,9 +204,10 @@ def get_general_erebor_settings() -> GeneralSetup:
     # base_file_name = "test_psd_processing7"
     # file_store_dir = head_dir
 
+    prefix = "preproc-bias"
     data_input_path = "/mnt/wd_hdd_6TB/nikos/DATA/global_fit/mojito_lite/"
-    base_file_name = "psd_unequal_noises"
-    file_store_dir = "/mnt/wd_hdd_6TB/nikos/DATA/global_fit/gf_output/unequal_noises/"
+    base_file_name = f"psd_unequal_noises_{prefix}"
+    file_store_dir = f"/mnt/wd_hdd_6TB/nikos/DATA/global_fit/gf_output/unequal_noises_{prefix}/"
 
     gpus = [0]
     cp.cuda.runtime.setDevice(gpus[0])

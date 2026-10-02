@@ -2163,6 +2163,10 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             for all MOSAs. ``"asymmetric"`` uses one amplitude per MOSA (6 OMS + 6 TM,
             ordered as ``orbits.LINKS``: 12, 23, 31, 13, 32, 21) on the same
             spectral shapes. See :meth:`split_psd_params` for the parameter layout.
+        fft_batch_size: Number of rows (one row = one PSD component in one time
+            segment) per FFT batch in the window convolution. Batches are padded to
+            this fixed size so a single cuFFT plan is reused. Default is ``512``.
+            If ``None``, all rows go through in one batch.
     """
 
     def __init__(
@@ -2181,6 +2185,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         average_transfer_functions: bool = False,
         smoothing_sigma: Optional[float] = 1.0,
         noise_symmetry: str = "symmetric",
+        fft_batch_size: Optional[int] = 512,
     ):
         LISAToolsParallelModule.__init__(self, force_backend=force_backend)
         if noise_symmetry not in NOISE_SYMMETRIES:
@@ -2207,6 +2212,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
         self.mask_percentage = mask_percentage if mask_percentage is not None else 0.05
         self._smoothing_sigma = smoothing_sigma
+        self._fft_batch_size = fft_batch_size
 
         self.window_values = window_values
         self.convolve_window = convolve_window
@@ -2241,6 +2247,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             "average_transfer_functions": self.average_transfer_functions,
             "smoothing_sigma": self.smoothing_sigma,
             "noise_symmetry": self.noise_symmetry,
+            "fft_batch_size": self._fft_batch_size,
         }
 
     @property
@@ -2320,6 +2327,19 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         """Set the window kernel for convolution with the sensitivity matrix."""
         self._window_kernel = x
         self._window_kernel_fft = self.xp.fft.fft(self._window_kernel)
+        # |W|^2 of a real window is real and even, so its FFT is real: the
+        # convolution can run on rfft/irfft (see _convolve_matrix_components)
+        self._window_kernel_fft_real = self.xp.ascontiguousarray(self._window_kernel_fft.real)
+        # convolution response to a unit imaginary entry at DC / Nyquist, the only
+        # bins where the one-sided input can break Hermitian symmetry
+        N = len(x)
+        self._window_kernel_dc = self.xp.ascontiguousarray(x[: N // 2 + 1])
+        self._window_kernel_nyq = self.xp.ascontiguousarray(x[N // 2 :: -1]) if N % 2 == 0 else None
+
+    @property
+    def fft_batch_size(self):
+        """Rows per FFT batch in the window convolution (``None``: all rows at once)."""
+        return self._fft_batch_size
 
     @property
     def active_slice(self):
@@ -2908,26 +2928,54 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         circle, and sliced back. Pass the full grid whenever you can.
         """
         xp = self.xp
-        entries = xp.array([c00, c11, c22, c01, c02, c12], dtype=xp.complex128).reshape(6, num_psds, *self.basis_settings.basis_shape_active)
+        entries = [c00, c11, c22, c01, c02, c12]
+        nf_active = self.basis_settings.basis_shape_active[-1]
+        # one row per (psd, time segment); the convolution runs along frequency
+        entries = [c.reshape(-1, nf_active) for c in entries]
 
         #guard the first entry to avoid NaN in the convolution. This would be the case if the first frequency point is zero.
-        if not xp.isfinite(entries[..., 0]).all():
-            entries[..., 0] = entries[..., 1] 
+        if not all(bool(xp.isfinite(c[:, 0]).all()) for c in entries):
+            entries = [c.copy() for c in entries]
+            for c in entries:
+                c[:, 0] = c[:, 1]
 
         N = len(self.window_values)
         nf_full = N // 2 + 1
-        fill_low = entries[..., 0:1]
-        fill_high = entries[..., -1:]
-        full = xp.ones(entries.shape[:-1] + (nf_full,), dtype=xp.complex128) * fill_low
-        full[..., self.active_slice] = entries
-        #  pad the low-frequency entries with the lowest frequency (DC) value
-        full[..., self.active_slice.stop:] = fill_high
+        sl = self.active_slice
+        lo, hi = sl.start or 0, nf_full if sl.stop is None else sl.stop
+        kernel_fft = self._window_kernel_fft_real
+        kernel_dc, kernel_nyq = self._window_kernel_dc, self._window_kernel_nyq
 
-        two_sided = xp.concatenate([full, xp.conj(full[..., 1:(N + 1) // 2][..., ::-1])], axis=-1)
-
-        conv = xp.fft.ifft(xp.fft.fft(two_sided, axis=-1) * self.window_kernel_fft, axis=-1)
-        conv = conv[..., :nf_full][..., self.active_slice]
-        return [xp.real(conv[i].reshape(num_psds, -1)) for i in range(3)] + [conv[i].reshape(num_psds, -1) for i in range(3, 6)]
+        # The two-sided input S(-f) = conj(S(f)) is Hermitian, so its FFT is real and
+        # convolving with the real, even |W|^2 reduces to rfft(irfft(S) * FFT(|W|^2)):
+        # half the memory/work of the full complex FFT and no two-sided copy. irfft
+        # drops Im at DC/Nyquist, so those parts are added back exactly.
+        # Rows go through a fixed-size buffer so every call reuses one cuFFT plan:
+        # a varying batch (walkers surviving the prior cut) would otherwise cache a
+        # new plan + workspace per size and exhaust the GPU memory pool.
+        n_rows = entries[0].shape[0]
+        rows = n_rows if self.fft_batch_size is None else self.fft_batch_size
+        full = xp.empty((min(rows, n_rows), nf_full), dtype=xp.complex128)
+        out = []
+        for i, c in enumerate(entries):
+            res = xp.empty((n_rows, nf_active), dtype=xp.complex128)
+            for s in range(0, n_rows, rows):
+                n = min(rows, n_rows - s)
+                blk = c[s : s + n]
+                # pad below / above the active band with the edge values
+                full[:n, :lo] = blk[:, 0:1]
+                full[:n, lo:hi] = blk
+                full[:n, hi:] = blk[:, -1:]
+                full[n:] = 0.0
+                conv = xp.fft.irfft(full, n=N, axis=-1)
+                conv *= kernel_fft
+                conv = xp.fft.rfft(conv, axis=-1)[:n]
+                conv += 1j * (full[:n, 0:1].imag * kernel_dc)
+                if kernel_nyq is not None:
+                    conv += 1j * (full[:n, N // 2 : N // 2 + 1].imag * kernel_nyq)
+                res[s : s + n] = conv[:, lo:hi]
+            out.append(xp.real(res).reshape(num_psds, -1) if i < 3 else res.reshape(num_psds, -1))
+        return out
 
     def _fill_matrix(self, c00, c11, c22, c01, c02, c12, num_psds: int = 1):
         """Fill the full 3x3 sensitivity matrix from its 6 unique elements."""
