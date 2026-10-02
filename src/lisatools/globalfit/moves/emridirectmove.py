@@ -23,8 +23,10 @@ other branch sees, and the engine's residual rebuilds would disagree with the fi
 Scoring is self-consistent either way: the leaf's ``prev_logl`` and every proposal are
 scored by the same direct generator against the same exposed residual.
 
-Two checks therefore carry a TOLERANCE here (``EMRI_CHECK_LL_TOL``, default 1 nat)
-instead of the base's exact-algebra gates, both on the COLD rung only:
+Two checks therefore carry a per-point TOLERANCE here instead of the base's exact-algebra
+gates (``EMRI_CHECK_LL_TOL`` 1 nat plus a template-mismatch term that grows with the point's
+``<h|h>``, ``EMRI_CHECK_LL_MM``; :meth:`EMRIDirectLikeMove._point_tolerance`), both on the
+COLD rung only:
 
 * :meth:`_verify_prev_logl` (every ``EMRI_CHECK_LL_EVERY``-th visit, default 10):
   direct ``prev_logl`` vs the production container path at the same points;
@@ -102,6 +104,8 @@ class EMRIDirectLikeMove(ResidualAddOneRemoveOneMove):
         self.last_batch_error = None
         self._warned_fallback_leaf = None
         self.check_ll_tol = float(os.environ.get(f"{self._dbg_prefix}_CHECK_LL_TOL", "1.0"))
+        # template-mismatch budget of the tolerance (see _point_tolerance)
+        self.check_ll_mm = float(os.environ.get(f"{self._dbg_prefix}_CHECK_LL_MM", "3e-4"))
         self._gen_kwargs = dict(self.waveform_gen_kwargs or {})
         self._stats = self._new_stats()
 
@@ -276,13 +280,34 @@ class EMRIDirectLikeMove(ResidualAddOneRemoveOneMove):
         _sub.d_h[:, leaf] = self._last_d_h[: self.nwalkers]
         _sub.h_h[:, leaf] = self._last_h_h[: self.nwalkers]
 
+    def _point_tolerance(self, shape):
+        """Per-point tolerance of the direct-vs-production checks, shaped ``shape``.
+
+        The two templates differ by ``delta = h_prod - h_direct`` with ``<delta|delta>
+        ~ 2 mm <h|h>`` (mismatch ``mm``), so their lnL differ by ``-<r|delta> - 1/2
+        <delta|delta>``: a bias ~ ``mm <h|h>`` plus a noise term of standard deviation
+        ~ ``sqrt(2 mm <h|h>)``. A fixed tolerance would fire on most visits at high SNR
+        (SNR 70, mm 1e-4: ~0.5 nat bias, ~1 nat scatter), so each point gets
+        ``EMRI_CHECK_LL_TOL + mm <h|h> + 3 sqrt(2 mm <h|h>)`` with ``mm =
+        EMRI_CHECK_LL_MM`` (3e-4: the measured direct-vs-production mismatch, plunges
+        included) and ``<h|h>`` the direct scorer's own value for that point (this
+        visit's ``prev_logl`` call). An expose-sign or frame bug moves lnL by ~SNR^2,
+        far above it. ``EMRI_CHECK_LL_MM=0`` restores the plain tolerance."""
+        tol = np.full(shape, self.check_ll_tol, dtype=float)
+        hh = getattr(self, "_last_h_h", None)
+        if self.check_ll_mm <= 0 or hh is None or np.size(hh) != int(np.prod(shape)):
+            return tol
+        hh = np.nan_to_num(np.clip(np.asarray(hh, dtype=float).reshape(shape), 0.0, None), nan=0.0)
+        return tol + self.check_ll_mm * hh + 3.0 * np.sqrt(2.0 * self.check_ll_mm * hh)
+
     def _verify_prev_logl(self, prev_logl, old_coords_in, data_index_in, leaf):
         """Direct ``prev_logl`` vs the production container path, COLD rung only.
 
-        The two templates differ (~1e-4 mismatch), so the gate is a tolerance
-        (``EMRI_CHECK_LL_TOL``) on the cold rung's max|diff|; hot rungs sit far from the
+        The two templates differ (~1e-4 mismatch), so the gate is a per-point tolerance
+        (:meth:`_point_tolerance`) on the cold rung; hot rungs sit far from the
         posterior, where any template difference is amplified through ``<r|delta h>``,
         and are reported in the same line without gating."""
+        tol = np.atleast_2d(self._point_tolerance(np.shape(prev_logl)))
         acs_like = (
             self.compute_check_like(old_coords_in, data_index_in)
             .reshape(prev_logl.shape)
@@ -299,8 +324,10 @@ class EMRIDirectLikeMove(ResidualAddOneRemoveOneMove):
             return
         diff = prev2[0][cold] - acs2[0][cold]
         max_abs = float(np.abs(diff).max())
-        if max_abs <= self.check_ll_tol:
+        excess = np.abs(diff) - tol[0][cold]
+        if float(excess.max()) <= 0.0:
             return
+        worst = int(np.argmax(excess))
         hot = both[1:]
         hot_txt = (
             f"{float(np.abs(prev2[1:][hot] - acs2[1:][hot]).max()):.6e} over "
@@ -308,8 +335,11 @@ class EMRIDirectLikeMove(ResidualAddOneRemoveOneMove):
         )
         msg = (
             f"{self.branch_name} leaf {leaf}: direct-to-WDM fast path vs production container "
-            f"path disagree beyond tol={self.check_ll_tol} on the COLD rung: "
-            f"max|diff|={max_abs:.6e}, spread={float(diff.max() - diff.min()):.6e} over "
+            f"path disagree beyond the template tolerance on the COLD rung: "
+            f"max|diff|={max_abs:.6e} (worst point |diff| {abs(float(diff[worst])):.6e} vs "
+            f"tolerance {float(tol[0][cold][worst]):.6e}; {self._dbg_prefix}_CHECK_LL_TOL="
+            f"{self.check_ll_tol}, {self._dbg_prefix}_CHECK_LL_MM={self.check_ll_mm}), "
+            f"spread={float(diff.max() - diff.min()):.6e} over "
             f"{int(cold.sum())} points (hot rungs, not gating: max|diff|={hot_txt}). A "
             "difference ~ mismatch x SNR^2 is the template accuracy (lookup table, plunge "
             "chunk, mode content); a large one means a time, frame or residual bug."
@@ -322,6 +352,7 @@ class EMRIDirectLikeMove(ResidualAddOneRemoveOneMove):
         """The expose invariant with the template tolerance (see the module docstring)."""
         if cold_ref is None:
             return
+        tol = np.atleast_2d(self._point_tolerance(np.shape(prev_logl)))[0]
         cold = np.asarray(prev_logl[0], dtype=float)
         ref = np.asarray(cold_ref, dtype=float).reshape(cold.shape)
         both = np.isfinite(cold) & np.isfinite(ref) & (cold > -1e299) & (ref > -1e299)
@@ -329,14 +360,18 @@ class EMRIDirectLikeMove(ResidualAddOneRemoveOneMove):
             return
         diff = cold[both] - ref[both]
         max_abs = float(np.abs(diff).max())
-        if max_abs <= self.check_ll_tol:
+        excess = np.abs(diff) - tol[both]
+        if float(excess.max()) <= 0.0:
             return
+        worst = int(np.argmax(excess))
         msg = (
             f"{self.branch_name} leaf {leaf}: EXPOSE INVARIANT VIOLATED -- cold direct "
             f"prev_logl vs pre-expose ACS lnL (production template in the residual): "
             f"max|diff| {max_abs:.6e}, median {float(np.median(diff)):.6e} over "
-            f"{int(both.sum())} walkers, tolerance {self.check_ll_tol} "
-            f"({self._dbg_prefix}_CHECK_LL_TOL). An expose-sign bug moves this by ~SNR^2."
+            f"{int(both.sum())} walkers; worst |diff| {abs(float(diff[worst])):.6e} vs its "
+            f"tolerance {float(tol[both][worst]):.6e} ({self._dbg_prefix}_CHECK_LL_TOL="
+            f"{self.check_ll_tol}, {self._dbg_prefix}_CHECK_LL_MM={self.check_ll_mm}). An "
+            "expose-sign bug moves this by ~SNR^2."
         )
         if self.check_ll_mode == "strict":
             raise ValueError(msg)

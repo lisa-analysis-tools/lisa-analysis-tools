@@ -4686,8 +4686,10 @@ export EMRI_EPS=1e-3
 # Accuracy vs production (docs/emri-direct-wdm.md): mismatch ~1e-4 (lookup
 # table) on inspirals, 1.3-2.5e-4 on in-window plunges at 5 s; 20 s grids alias
 # the high harmonics near plunge, this grid is 2.5 s. The cold-rung cross-check
-# warns past EMRI_CHECK_LL_TOL (default 1 nat; every 10th visit by default --
-# EMRI_CHECK_LL_EVERY=1 on the launch line for the first segment).
+# warns past a per-point tolerance EMRI_CHECK_LL_TOL + mm<h|h> + 3 sqrt(2 mm<h|h>)
+# (1 nat, mm = EMRI_CHECK_LL_MM = 3e-4: the template gap grows with SNR); every
+# 10th visit by default -- EMRI_CHECK_LL_EVERY=1 on the launch line for the first
+# segment.
 # DEFAULT: full (the per-row production path) until the dense kernel's GPU
 # timing beats production on this cluster: before the dense kernel the direct
 # template measured 157 ms/row batched vs production 94 ms at eps 1e-3 on an
@@ -4731,6 +4733,10 @@ try:
     from lisatools.globalfit.stock.erebor.source_runtime import (
         SourceEMRISettings, resolve_emri_direct_cfg)
 except ImportError as exc:
+    if os.environ["EMRI_LIKELIHOOD"] == "full":
+        print("[EMRI-PREFLIGHT] emri_pe scoring=full (the installed lisatools predates "
+              "EMRI_LIKELIHOOD; full is its only path).")
+        sys.exit(0)
     print("[EMRI-PREFLIGHT] REFUSING: the installed lisatools has no direct EMRI "
           f"likelihood ({exc}). EMRI_LIKELIHOOD would be SILENTLY IGNORED. Pull dev "
           "at/after the EMRI direct merge, or launch with EMRI_LIKELIHOOD=full.")

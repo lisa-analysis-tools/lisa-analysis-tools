@@ -174,8 +174,13 @@ choreography is untouched, only the scoring changes.
 * **Fill stays production.** Expose/fold, engine residual rebuilds and the cross-check use the
   production wrap (FEW + ResponseWrapper + dense TD->WDM). Filling with the direct template would
   leave `h_direct - h_production` of every visited state in the shared residual.
-* **Checks with a tolerance** (`EMRI_CHECK_LL_TOL`, 1 nat, cold rung only): the fast-vs-production
-  cross-check (every 10th visit, `EMRI_CHECK_LL_EVERY`) and the expose invariant.
+* **Checks with a tolerance** (cold rung only): the fast-vs-production cross-check (every 10th
+  visit, `EMRI_CHECK_LL_EVERY`) and the expose invariant. Per point the tolerance is
+  `EMRI_CHECK_LL_TOL + mm <h|h> + 3 sqrt(2 mm <h|h>)` (1 nat, `mm = EMRI_CHECK_LL_MM` = 3e-4):
+  the template difference grows with SNR (bias ~ mm SNR^2, scatter ~ sqrt(2 mm) SNR), so a fixed
+  1 nat would fire on most visits at 6-month SNRs; an expose-sign bug moves lnL by ~SNR^2.
+* **Inspirals ending before the window** (hot-rung rows that plunge before the data start) are an
+  exact zero template, no response call.
 * **Failures.** A FEW domain refusal scores that row `-1e300` (as on the container path); any other
   failure of a direct chunk (GPU OOM, a missing kernel, a table error) scores the chunk through the
   production container path, warned once per leaf, counted in `n_batch_fallbacks` and the
@@ -188,7 +193,9 @@ choreography is untouched, only the scoring changes.
 * **Trajectory pool** (`EMRI_TRAJ_WORKERS`, 0 in the library): spawn workers integrate a chunk's
   trajectories (`few.trajectory.pool`, FEW gpu_backend >= 68bcda54) for chunks of at least that many
   rows (eigen sweeps). Workers start eagerly with `__main__.__file__` hidden, or each spawned child
-  would re-import `run_combined_staged.py` (and MPI). Any pool failure disables it for the run.
+  would re-import `run_combined_staged.py` (and MPI); a warm-up that did not start every worker is
+  refused. Any pool failure disables it for the run. Counters (rows, trajectories computed, cache
+  hits/misses) are logged as `[EMRI_DIRECT] trajectory pool:` every 50 pooled batches.
 * **Launcher** (`submit_gf_6mo_v9_4gpu.sh`, EMRI block after `EMRI_EPS`): default `full`; the
   `# EMRI PREFLIGHT.` heredoc resolves the knobs through the settings class and, for direct, opens
   the table, checks `EDGE_CROP_WAVELETS >= pixel_edge` (8) and runs
@@ -206,6 +213,11 @@ Cluster check on the 6-month grid: `scripts/emri/emri_direct_fit_wiring_check.py
 Tests: `tests/test_emri_direct_move.py`, `test_emri_direct_wiring.py`,
 `test_emri_direct_fanout.py` (real proposes on FakeWorld ranks: one-walker replicas and the
 v9 1-walker-per-rank blocks), `test_submit_scripts_layout.py::SixMonthEMRIDirectTest`.
+
+Related fix (10-02): the TDI-on-the-fly configured-orbits cache (`_orbits_cache_key`,
+`response/tdionfly.py`) is keyed by backend and device; it handed the CPU tables to the GPU
+response when one process built both (`TDDenseGPUParityTest` on the cluster), and could hand one
+GPU's tables to another. `LISATOOLS_ORBITS_CACHE=0` bypasses the cache.
 
 ## Open items
 

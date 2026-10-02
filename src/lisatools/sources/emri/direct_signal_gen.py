@@ -42,6 +42,8 @@ __all__ = ["EMRIDirectWDMSignalGen", "spawn_executor_without_main"]
 
 #: seconds the eager worker start may take before the pool is abandoned
 POOL_START_TIMEOUT = 300.0
+#: the pool's [EMRI_DIRECT] counters are logged on the 1st, (1+N)th, ... pooled batch
+POOL_LOG_EVERY = 50
 
 
 @contextlib.contextmanager
@@ -77,6 +79,13 @@ def spawn_executor_without_main(n_workers, warm_fn, warm_args=(), timeout=POOL_S
             futs = [ex.submit(warm_fn, *warm_args) for _ in range(n_workers)]
             for f in futs:
                 f.result(timeout=timeout)
+        # every worker must exist now: one spawned later would import the main script
+        started = len(getattr(ex, "_processes", None) or {})
+        if started != n_workers:
+            raise RuntimeError(
+                f"pool warm-up started {started} of {n_workers} workers; a worker spawned "
+                "after the warm-up would import the parent's main script"
+            )
     except BaseException:
         _kill_executor(ex)
         raise
@@ -130,6 +139,7 @@ class EMRIDirectWDMSignalGen:
         self._executor = None
         self._traj_pool = None
         self._traj_cache = None
+        self.pool_totals = dict(batches=0, rows=0, computed=0, errors=0)
         self.last_stats = {}
 
     # ------------------------------------------------------------------
@@ -184,9 +194,22 @@ class EMRIDirectWDMSignalGen:
             if self._traj_pool is None:
                 self._start_pool()
             direct = self.direct
-            self.last_pool_stats = self._traj_cache.precompute(
+            self.last_pool_stats = st = self._traj_cache.precompute(
                 lambda *p: direct._mode_list(p, kw), rows, self._traj_pool
             )
+            tot = self.pool_totals
+            tot["batches"] += 1
+            for k in ("rows", "computed", "errors"):
+                tot[k] += int(st.get(k, 0))
+            if tot["batches"] % POOL_LOG_EVERY == 1:
+                # a pool whose captured calls stopped matching the real ones adds work
+                # without saving any: hits must track the rows computed
+                logger.info(
+                    "[EMRI_DIRECT] trajectory pool: %d batches, %d rows, %d trajectories "
+                    "computed, %d worker errors; cache hits %s, misses %s.", tot["batches"],
+                    tot["rows"], tot["computed"], tot["errors"],
+                    getattr(self._traj_cache, "hits", "?"), getattr(self._traj_cache, "misses", "?"),
+                )
         except Exception as exc:  # noqa: BLE001 - the pool is an accelerator only
             logger.warning(
                 "[EMRI_DIRECT] trajectory pool disabled (%s: %s); integrating serially.",

@@ -1044,9 +1044,13 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
         from lisatools.globalfit.stock.erebor import source_runtime  # noqa: F401
 
         with mock.patch.dict(sys.modules, {"lisatools.globalfit.moves.emridirectmove": None}):
+            rc, out = self._run_preflight(EMRI_LIKELIHOOD="direct")
+            self.assertEqual(rc, 2, out)
+            self.assertIn("SILENTLY IGNORED", out)
+            # the default full path is the old install's own path: no refusal
             rc, out = self._run_preflight()
-        self.assertEqual(rc, 2, out)
-        self.assertIn("SILENTLY IGNORED", out)
+            self.assertEqual(rc, 0, out)
+            self.assertIn("predates EMRI_LIKELIHOOD", out)
 
     def test_the_preflight_refuses_settings_that_ignore_the_env(self):
         import functools

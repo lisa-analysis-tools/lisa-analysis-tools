@@ -294,11 +294,12 @@ class EMRIDirectChecksTest(_Armed):
     def test_defaults_tolerance_one_nat_and_every_10th_visit(self):
         from lisatools.globalfit.moves.addremovemove import ResidualAddOneRemoveOneMove
 
-        self.assertEqual(self.move.check_ll_tol, 1.0)
+        self.assertEqual((self.move.check_ll_tol, self.move.check_ll_mm), (1.0, 3e-4))
         self.assertEqual(self.move.check_ll_every, 10)
-        with mock.patch.dict(os.environ, {"EMRI_CHECK_LL_TOL": "0.25", "EMRI_CHECK_LL_EVERY": "3"}):
+        with mock.patch.dict(os.environ, {"EMRI_CHECK_LL_TOL": "0.25", "EMRI_CHECK_LL_EVERY": "3",
+                                          "EMRI_CHECK_LL_MM": "0"}):
             m = _build_move(self.acs, self.direct)
-        self.assertEqual((m.check_ll_tol, m.check_ll_every), (0.25, 3))
+        self.assertEqual((m.check_ll_tol, m.check_ll_every, m.check_ll_mm), (0.25, 3, 0.0))
         self.assertEqual(ResidualAddOneRemoveOneMove._check_ll_every_default, "1")
 
     def test_verify_prev_logl_silent_when_templates_agree(self):
@@ -308,6 +309,7 @@ class EMRIDirectChecksTest(_Armed):
 
     def test_verify_prev_logl_gates_on_the_cold_rung_only(self):
         rows, idx, prev = self._prev()
+        self.move.check_ll_mm = 0.0            # the plain 1-nat tolerance
         hot_bad = prev.copy()
         hot_bad[1:] += 7.0
         self.move.check_ll_mode = "strict"
@@ -336,10 +338,39 @@ class EMRIDirectChecksTest(_Armed):
         prev = move.compute_like(cold, np.arange(NWALKERS)).reshape(1, NWALKERS)
         np.testing.assert_allclose(prev[0], cold_ref, rtol=1e-11, atol=0)
         move.check_ll_mode = "strict"
+        move.check_ll_mm = 0.0                 # the plain 1-nat tolerance
         move._verify_entry_vs_acs(prev, cold_ref, 0)                  # silent
         move._verify_entry_vs_acs(prev + 0.9, cold_ref, 0)            # inside the tolerance
         with self.assertRaisesRegex(ValueError, "EXPOSE INVARIANT"):
             move._verify_entry_vs_acs(prev + 2.0, cold_ref, 0)
+
+
+class EMRIDirectToleranceScalingTest(_Armed):
+    """The tolerance grows with each point's <h|h>: a 3-nat gap at SNR 70 is template
+    accuracy, the same gap at SNR 10 is not (paired with the plain tolerance)."""
+
+    def _gate(self, mm, diff, hh):
+        self.move.check_ll_tol, self.move.check_ll_mm = 1.0, mm
+        self.move.check_ll_mode = "strict"
+        self.move._last_h_h = np.asarray(hh, dtype=float)
+        prev = np.zeros((1, len(diff)))
+        self.move._verify_entry_vs_acs(prev, -np.asarray(diff, dtype=float), 0)
+
+    def test_point_tolerance_values(self):
+        self.move.check_ll_tol, self.move.check_ll_mm = 1.0, 1e-4
+        self.move._last_h_h = np.array([4900.0, 100.0, np.nan, -5.0])
+        tol = self.move._point_tolerance((1, 4))[0]
+        np.testing.assert_allclose(tol[:2], [1 + 0.49 + 3 * np.sqrt(0.98), 1 + 0.01 + 3 * np.sqrt(0.02)])
+        np.testing.assert_allclose(tol[2:], [1.0, 1.0])          # no usable <h|h>: the plain tolerance
+        self.move._last_h_h = np.ones(7)                          # another call's rows: never misapplied
+        np.testing.assert_allclose(self.move._point_tolerance((1, 4)), 1.0)
+
+    def test_high_snr_gap_passes_low_snr_gap_raises(self):
+        self._gate(1e-4, [3.0, 1.2], [4900.0, 100.0])            # inside 4.46 and 1.43
+        with self.assertRaisesRegex(ValueError, "EXPOSE INVARIANT"):
+            self._gate(1e-4, [3.0, 1.6], [4900.0, 100.0])        # 1.6 > 1.43 at SNR 10
+        with self.assertRaisesRegex(ValueError, "EXPOSE INVARIANT"):
+            self._gate(0.0, [3.0, 1.2], [4900.0, 100.0])         # plain 1-nat tolerance
 
 
 class EMRIDirectMismatchedTemplateTest(_Armed):
@@ -363,7 +394,8 @@ class EMRIDirectMismatchedTemplateTest(_Armed):
         want = self.move.compute_acs_like(rows, idx, signal_gen=scaled)
         np.testing.assert_allclose(fast, want, rtol=1e-11, atol=0)
         self.move.check_ll_mode = "strict"
-        with self.assertRaisesRegex(ValueError, "disagree beyond tol"):
+        self.move.check_ll_mm = 0.0
+        with self.assertRaisesRegex(ValueError, "disagree beyond the template tolerance"):
             self.move._verify_prev_logl(fast.reshape(NTEMPS, NWALKERS), rows, idx, 0)
 
 

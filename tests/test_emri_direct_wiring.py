@@ -407,7 +407,10 @@ class AdapterTrajectoryPoolTest(_AdapterBase, unittest.TestCase):
 
     def test_chunk_at_least_the_pool_is_precomputed_then_cleared(self):
         gen, cache = self._pooled(2)
-        arr, ok = gen.templates(np.array([[0.0] * 14, [2.0] * 14, [3.0] * 14]))
+        with self.assertLogs("lisatools.sources.emri.direct_signal_gen", "INFO") as cm:
+            arr, ok = gen.templates(np.array([[0.0] * 14, [2.0] * 14, [3.0] * 14]))
+        self.assertIn("trajectory pool: 1 batches, 3 rows", cm.output[0])
+        self.assertEqual(gen.pool_totals["rows"], 3)
         self.assertEqual(cache.precomputed, [3])
         self.assertEqual([m[0] for m in self.mode_list], [0.0, 2.0, 3.0])
         self.assertEqual(self.mode_list[0][1], {"mode_selection_threshold": 1e-3})
@@ -473,6 +476,41 @@ class BatchDomainRefusalTest(unittest.TestCase):
         with self.assertRaises(WaveformDomainError):
             d.batch([np.full(14, 0.0), np.full(14, 1.0)])
 
+    def test_inspiral_ending_before_the_window_is_an_exact_zero(self):
+        """A hot-rung row that plunges before the data start: zero template, no
+        response call (its response grid would be empty); one ending INSIDE the
+        window still reaches the response (paired control)."""
+        from lisatools.domains import WDMSettings
+        from lisatools.sources.emri.wdm_direct import EMRIDirectWDM
+
+        class _Reached(Exception):
+            pass
+
+        class _Ended(EMRIDirectWDM):
+            def _mode_list(self, few_args, few_kwargs):
+                t_end = float(few_args[0])
+                self._last_holder = SimpleNamespace(t_arr=np.array([0.0, t_end]))
+                self._last_tracks, self._last_track_n = [], np.zeros(0, int)
+                return [(2, 2, 0, 0)], t_end - 1.0      # stops in/before the window: built alone
+
+            def _dense_response(self, items, t_fine):
+                raise _Reached()
+
+        table = SimpleNamespace(fdot_vals=np.array([-1.0, 1.0]), INTERP_METHOD="spline")
+        wdm = WDMSettings(32, 64, 10.0, force_backend="cpu")
+        few = SimpleNamespace(inspiral_generator=SimpleNamespace(inspiral_generator=None))
+        d = _Ended(few, table, wdm, orbits=None, tdi_config=SimpleNamespace(nchannels=3),
+                   t_start=0.0, data_t0=5.0e4, fine_dt=100.0, response="dense")
+        out = d.batch([np.r_[5.0e4 - 700.0, np.zeros(13)]])          # ends 700 s before the start
+        self.assertTrue(np.all(out == 0.0))
+        self.assertEqual(d.last_failed_rows, [])
+        with mock.patch("lisatools.sources.emri.emritdionfly.EMRITDIonFly.sky",
+                        return_value=(0, 0, 0.1, 0.2, 0.3)), \
+                mock.patch("lisatools.sources.emri.wdm_direct.dense_inputs_from_holder",
+                           return_value=None):
+            with self.assertRaises(_Reached):
+                d.batch([np.r_[5.0e4 + 3600.0, np.zeros(13)]])       # ends inside the window
+
     def test_a_non_domain_error_always_propagates(self):
         d = self._direct()
         with self.assertRaisesRegex(RuntimeError, "not a domain error"):
@@ -510,6 +548,32 @@ class SpawnWithoutMainTest(unittest.TestCase):
                 main.__file__ = saved
             else:
                 del main.__file__
+
+    def test_a_short_warm_up_is_refused(self):
+        """A worker missing after the warm-up would be spawned later, outside the
+        hidden-main window: refuse the pool (the adapter then runs serially)."""
+        from lisatools.sources.emri import direct_signal_gen as mod
+
+        killed = []
+
+        class _Fut:
+            def result(self, timeout=None):
+                return None
+
+        class _Ex:
+            def __init__(self, max_workers, mp_context):
+                self._processes = {1: SimpleNamespace(kill=lambda: killed.append(1))}
+
+            def submit(self, fn, *a):
+                return _Fut()
+
+            def shutdown(self, wait=True, cancel_futures=False):
+                pass
+
+        with mock.patch.object(mod, "ProcessPoolExecutor", _Ex):
+            with self.assertRaisesRegex(RuntimeError, "started 1 of 2"):
+                mod.spawn_executor_without_main(2, len, ([],))
+        self.assertEqual(killed, [1])
 
     def test_every_worker_starts_without_importing_the_main_script(self):
         """A parent main script that would poison every child (it raises on import)

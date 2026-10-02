@@ -473,6 +473,9 @@ class EMRIDirectWDM:
             ``"cubic"`` scipy-only; ``None`` keeps the table's).
     """
 
+    #: TDI delay margin [s]: a source time contributes to response times up to this much later
+    DELAY_MARGIN = 600.0
+
     def __init__(self, few_gen, table, wdm_set, *, orbits, tdi_config, t_start, data_t0,
                  Nt_sub=128, n_fine=None, fine_dt=3600.0, fine_dt_plunge=80.0, mode_batch=None,
                  pixel_edge=8, num_m_layers=2, interp="spline", force_backend="cpu", feed="knots",
@@ -692,6 +695,14 @@ class EMRIDirectWDM:
             kw["mode_selection"] = modes
         modes, chunk_start = self._mode_list(few_args, kw)
         H, tracks_pix, n_tr = self._last_holder, self._last_tracks, self._last_track_n
+        if float(np.asarray(H.t_arr)[-1]) < self.data_t0 - self.t_start - self.DELAY_MARGIN:
+            # the inspiral ends before the window (plus the TDI delay margin): no pixel sees
+            # it, the production template is zero there too, and the response grid below
+            # would be empty
+            self.last_stats = dict(modes=len(modes), n_fine=0, feed="knots", chunk_start=chunk_start,
+                                   lookup_pixels=0, chunk_pixels=0, dropped_pixels=0,
+                                   ended_before_window=1)
+            return WDMSignal(acc, wdm)
         t_fine = self._fine_grid(chunk_start)
         self.n_fine, self.last_t_fine = int(t_fine.size), t_fine
         fly = EMRITDIonFly(self.few_gen, self.orbits, self.tdi_config, dt, T_traj, self.t_start,
