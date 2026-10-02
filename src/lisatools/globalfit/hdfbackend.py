@@ -1248,6 +1248,39 @@ class GFHDFBackend(eryn_HDFBackend):
                          step_name, exc)
             return None
 
+    def stage_flag(self, step_name, key):
+        """A per-stage attribute stamped by :meth:`stamp_stage_flag`, or ``None``.
+
+        The galfor ratchet's data-driven stop lives here
+        (``galfor_ratchet_done``): the decision that the last release gained
+        too little is made once, in process, and a relaunch must not ratchet
+        again because it forgot (user ruling 2026-10-02: no gate issues).
+        ``None`` for an old store, an unknown step or any read error.
+        """
+        try:
+            with self.open("r") as f:
+                grp = f[self.name].get("recipe")
+                if grp is None or step_name not in grp:
+                    return None
+                val = grp[step_name].attrs.get(str(key))
+                return None if val is None else val
+        except Exception as exc:  # noqa: BLE001 -- diagnostic, never fatal
+            logger.debug("recipe step %s: flag %s unreadable (%r)", step_name, key, exc)
+            return None
+
+    def stamp_stage_flag(self, step_name, key, value) -> bool:
+        """Write a per-stage attribute (best effort; True when it landed)."""
+        try:
+            with self.open("a") as f:
+                grp = f[self.name].get("recipe")
+                if grp is None or step_name not in grp:
+                    return False
+                grp[step_name].attrs[str(key)] = value
+                return True
+        except Exception as exc:  # noqa: BLE001 -- diagnostic, never fatal
+            logger.debug("recipe step %s: could not stamp %s (%r)", step_name, key, exc)
+            return False
+
     def stamp_stage_start(self, step_name, iteration):
         """Record the stored iteration ``step_name`` started at.
 

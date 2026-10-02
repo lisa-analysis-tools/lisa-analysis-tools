@@ -420,6 +420,22 @@ class JointMaxLogLSearch(Move):
         return mv
 
 
+def apply_release_tol(inner, tol):
+    """Give a built max-logL search ITS OWN plateau tolerance.
+
+    ``MaxLogLCombineMove.__init__`` reads ``MAXLOGL_TOL`` and lets it override
+    the ``tol`` it was constructed with, so a per-move tolerance has to be set
+    on the instance afterwards. ``tol`` None = keep whatever the move has.
+    """
+    if tol is None:
+        return inner
+    tol = float(tol)
+    if not tol > 0:
+        raise ValueError(f"release tol={tol} must be > 0 nats.")
+    inner.tol = tol
+    return inner
+
+
 class GatedNoiseSearch(JointMaxLogLSearch):
     """The ONE noise proposal of a ratcheted search stage (GALFOR_RATCHET=1).
 
@@ -439,10 +455,22 @@ class GatedNoiseSearch(JointMaxLogLSearch):
     """
 
     def __init__(self, name, inner_names, delta, in_model_name="in_model",
-                 **kwargs):
+                 release_to_convergence=True, release_tol=None, **kwargs):
         super().__init__(name, inner_names, **kwargs)
         self.delta = [float(x) for x in delta]
         self.in_model_name = in_model_name
+        # The release's own plateau tolerance in nats (user ruling 2026-10-02:
+        # "change tol = 20 to 5. I just want to see it converged"). Applied to
+        # the built MaxLogLCombineMove AFTER construction because its __init__
+        # lets the process-global MAXLOGL_TOL override the constructor value;
+        # None leaves the global in charge.
+        self.release_tol = None if release_tol is None else float(release_tol)
+        # User ruling 2026-10-02: on a release the psd and galfor branches run
+        # in SEARCH mode until the log-likelihood converges -- the wrapped
+        # max-logL search starts afresh on every release instead of taking
+        # the one round per call a plateaued rider takes (job 675's second
+        # release: one round, 2 s). See NoiseRatchetGate.release_to_convergence.
+        self.release_to_convergence = bool(release_to_convergence)
 
     def stock_dependencies(self):
         """The wrapped noise moves PLUS the in-model follow-up, so all are built."""
@@ -455,6 +483,7 @@ class GatedNoiseSearch(JointMaxLogLSearch):
         from lisatools.globalfit.noise_ratchet import NoiseRatchetGate
 
         inner = super().setup(ctx)
+        apply_release_tol(inner, self.release_tol)
         galfor = ctx.stock_moves.get("galfor_pe")
         if galfor is None:
             raise ValueError(
@@ -470,7 +499,8 @@ class GatedNoiseSearch(JointMaxLogLSearch):
                     f"{self.in_model_name!r} is not built (GB_SEARCH_IN_MODEL=0?). "
                     "The ratchet requires it: the GB sources must settle to a "
                     "changed noise before any RJ move scores against it.")
-        gate = NoiseRatchetGate(inner, galfor, self.delta, in_model_move=in_model)
+        gate = NoiseRatchetGate(inner, galfor, self.delta, in_model_move=in_model,
+                                release_to_convergence=self.release_to_convergence)
         gate.gf_move_name = self.name
         return gate
 
@@ -1568,11 +1598,13 @@ def build_fit():
         # iteration; see lisatools.globalfit.noise_ratchet. Unset, the
         # composition below is byte-identical to before.
         from lisatools.globalfit.noise_ratchet import (
-            nudge_delta_from_env, ratchet_from_env)
+            min_gain_from_env, nudge_delta_from_env, ratchet_from_env)
 
         _ratchet = ratchet_from_env() if sample_noise else None
         _ratchet_delta = ([float(x) for x in nudge_delta_from_env()]
                           if _ratchet is not None else None)
+        # the data-driven stop (user design 2026-10-02): GALFOR_RATCHET_MIN_GAIN
+        _ratchet_min_gain = min_gain_from_env() if _ratchet is not None else 0.0
         if _ratchet is not None and not _env_flag("GB_SEARCH_IN_MODEL"):
             raise ValueError(
                 "GALFOR_RATCHET=1 needs GB_SEARCH_IN_MODEL=1: every noise change "
@@ -1581,16 +1613,55 @@ def build_fit():
                 "against it, and that pass is the stock 'in_model' move.")
         _slots = sample_noise and _ratchet is None
         if _ratchet is not None:
+            # RELEASE = SEARCH MODE TO CONVERGENCE (user ruling 2026-10-02).
+            # The gate's inner is the same psd+galfor max-logL search, but
+            # with the STANDALONE stage's plateau rule, not the rider's:
+            # GB_SEARCH_NOISE_CHECKS=1 ends the search at the first round in
+            # which no walker gains more than MAXLOGL_TOL, which on job 675's
+            # first release fired after 17 rounds while the chain was still
+            # climbing 50-100 lnL per round (walker spread 656). The release
+            # criterion is GALFOR_RATCHET_RELEASE_CHECKS consecutive flat
+            # rounds per walker (default NOISE_SEARCH_CHECKS, 5), capped at
+            # GALFOR_RATCHET_RELEASE_ITERS rounds per release (200; a round
+            # is PSD_NUM_PROP_REPEATS + GALFOR_NUM_PROP_REPEATS proposals per
+            # walker, ~1-5 s). The search starts afresh on every release.
+            _rel_checks = int(os.environ.get(
+                "GALFOR_RATCHET_RELEASE_CHECKS",
+                os.environ.get("NOISE_SEARCH_CHECKS", "5")))
+            # the cap exists so a release cannot run unbounded on a broken
+            # likelihood; it must never be the thing that ENDS a healthy one
+            # (user ruling 2026-10-02: "make this higher. We do not want it
+            # to hit that"). 5000 rounds is 1.5-7 h at 1-5 s per round; job
+            # 675's release from the pinned start took 17.
+            _rel_cap = int(os.environ.get("GALFOR_RATCHET_RELEASE_ITERS", "5000"))
+            # the release's OWN tolerance (user ruling 2026-10-02: 5, not the
+            # global MAXLOGL_TOL=20 -- "I just want to see it converged")
+            _rel_tol = float(os.environ.get("GALFOR_RATCHET_RELEASE_TOL", "5"))
+            if _rel_checks < 1 or _rel_cap < 1 or not _rel_tol > 0:
+                raise ValueError(
+                    f"GALFOR_RATCHET_RELEASE_CHECKS={_rel_checks} and "
+                    f"GALFOR_RATCHET_RELEASE_ITERS={_rel_cap} must both be >= 1 and "
+                    f"GALFOR_RATCHET_RELEASE_TOL={_rel_tol} > 0.")
             _noise = [
                 GatedNoiseSearch(
                     "noise_ratchet_search", _noise_names, _ratchet_delta,
-                    branch="psd", num_checks=(_gb_noise_checks or None),
-                    iters_per_step=(_gb_noise_cap or None))
+                    branch="psd", num_checks=_rel_checks,
+                    iters_per_step=_rel_cap, release_to_convergence=True,
+                    release_tol=_rel_tol)
             ] + ([Move("vgb_pe", branch="vgb")] if _has_vgb else [])
             print(f"[combined] {name}: GALFOR_RATCHET {_ratchet} -- one gated "
                   f"noise proposal at the head of the iteration, nudge "
                   f"{list(_ratchet_delta)} in the sampled galfor basis; the "
-                  f"interleaved noise_joint_search_1..4 slots are OUT.",
+                  f"interleaved noise_joint_search_1..4 slots are OUT. A "
+                  f"RELEASE runs the psd+galfor search afresh to convergence: "
+                  f"{_rel_checks} consecutive flat round(s) per walker within "
+                  f"{_rel_tol:g} nats, at most {_rel_cap} rounds per release."
+                  + (" The schedule opens with a RELEASE before the first nudge."
+                     if _ratchet.release_first else "")
+                  + (f" Data-driven stop: after a release whose max cold lnL gains "
+                     f"less than {_ratchet_min_gain:.0f} over the previous release, "
+                     f"no more nudges (the {_ratchet.cycles}-cycle count is a ceiling)."
+                     if _ratchet_min_gain > 0 else ""),
                   flush=True)
         else:
             _noise = (_noise_rider() if sample_noise
@@ -1755,9 +1826,11 @@ def build_fit():
                 convergence_iter=int(os.environ.get("GB_PLATEAU_ITERS", "5")),
                 stage_name=name,
                 profile=dict(_profile),
-                # the galfor ratchet schedule (None = off) and its nudge
+                # the galfor ratchet schedule (None = off), its nudge and the
+                # data-driven stop (0 = schedule alone)
                 ratchet=_ratchet,
                 ratchet_delta=_ratchet_delta,
+                ratchet_min_gain=_ratchet_min_gain,
                 legs=_legs,
             ),
             combine_kwargs=_combine_kwargs,

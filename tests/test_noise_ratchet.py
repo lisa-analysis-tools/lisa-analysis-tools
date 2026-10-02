@@ -107,6 +107,39 @@ class ScheduleTest(unittest.TestCase):
             self.assertEqual(ratchet_from_env(),
                              RatchetSchedule(hold=4, release=1, cycles=3))
 
+    def test_release_first_opens_with_a_release_then_cycles(self):
+        """User design 2026-10-02: start where the noise search left off, in
+        convergence mode, THEN two-step cycles (nudge/hold, release)."""
+        s = RatchetSchedule(hold=1, release=1, cycles=3, release_first=True)
+        self.assertEqual([s.action(k) for k in range(9)],
+                         ["release", "nudge", "release", "nudge", "release",
+                          "nudge", "release", "release", "release"])
+        self.assertEqual(s.total_iterations, 7)
+        self.assertEqual([s.cycle_of(k) for k in range(8)], [0, 1, 1, 2, 2, 3, 3, 4])
+        # the plain schedule is untouched
+        p = RatchetSchedule(hold=1, release=1, cycles=3)
+        self.assertEqual([p.action(k) for k in range(7)],
+                         ["nudge", "release", "nudge", "release", "nudge", "release", "release"])
+        self.assertEqual(p.total_iterations, 6)
+        self.assertEqual(p.cycle_of(0), 1)
+
+    def test_release_first_and_min_gain_knobs(self):
+        from lisatools.globalfit.noise_ratchet import min_gain_from_env
+
+        with env(GALFOR_RATCHET="1", GALFOR_RATCHET_HOLD="1", GALFOR_RATCHET_RELEASE="1",
+                 GALFOR_RATCHET_CYCLES="20", GALFOR_RATCHET_RELEASE_FIRST="1",
+                 GALFOR_RATCHET_MIN_GAIN="200"):
+            s = ratchet_from_env()
+            self.assertEqual(s, RatchetSchedule(hold=1, release=1, cycles=20, release_first=True))
+            self.assertEqual(min_gain_from_env(), 200.0)
+        with env(GALFOR_RATCHET="1", GALFOR_RATCHET_RELEASE_FIRST=None,
+                 GALFOR_RATCHET_MIN_GAIN=None):
+            self.assertFalse(ratchet_from_env().release_first)
+            self.assertEqual(min_gain_from_env(), 0.0)          # off by default
+        with env(GALFOR_RATCHET_MIN_GAIN="-5"):
+            with self.assertRaises(ValueError):
+                min_gain_from_env()
+
     def test_env_bad_value_raises_not_silently_disables(self):
         with env(**{**_RATCHET_KNOBS, "GALFOR_RATCHET": "1",
                     "GALFOR_RATCHET_HOLD": "0"}):
@@ -174,6 +207,22 @@ class _FakeInner:
     def propose(self, model, state):
         self.log.calls.append("inner")
         return state, np.ones(np.shape(state.log_like), dtype=bool)
+
+
+class _FakePlateauedInner(_FakeInner):
+    """A max-logL search that has ALREADY declared a plateau: carries the
+    chunked loop's bookkeeping exactly as MaxLogLCombineMove leaves it."""
+
+    def __init__(self, log):
+        super().__init__(log)
+        self._ml_state = dict(num_so_far=np.array([1, 1]), n_iter=17)
+        self.maxlogl_plateau_done = True
+        self.seen = []
+
+    def propose(self, model, state):
+        # what the real loop would see on entry: fresh state or the old verdict
+        self.seen.append((hasattr(self, "_ml_state"), bool(self.maxlogl_plateau_done)))
+        return super().propose(model, state)
 
 
 class _FakeGalfor:
@@ -257,6 +306,51 @@ class GateTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             gate.set_mode("wobble")
 
+    def test_every_release_restarts_the_search_from_scratch(self):
+        """User ruling 2026-10-02: on a release the psd and galfor branches run
+        in SEARCH mode until the log-likelihood converges. A MaxLogLCombineMove
+        that has once declared a plateau takes ONE round per later call (6mo
+        job 675, second release: 1 round, 2 s), so the gate must forget that
+        verdict before every release -- and leave it alone on a hold."""
+        log = _Log()
+        inner = _FakePlateauedInner(log)
+        gate = NoiseRatchetGate(inner, _FakeGalfor(log),
+                                np.array([-0.05, -0.05, 0, 0, -0.1]),
+                                in_model_move=_FakeInModel(log))
+        self.assertTrue(gate.release_to_convergence)        # the default
+        gate.set_mode("hold"); gate.propose(None, _state())
+        self.assertTrue(hasattr(inner, "_ml_state"))       # a hold touches nothing
+        self.assertTrue(inner.maxlogl_plateau_done)
+        gate.set_mode("release"); gate.propose(None, _state())
+        self.assertEqual(inner.seen, [(False, False)])      # fresh on entry
+        self.assertEqual(gate.releases, 1)
+        # the loop re-creates its state during the propose; the NEXT release
+        # clears it again rather than inheriting the first release's verdict
+        inner._ml_state = dict(num_so_far=np.array([5, 5]), n_iter=40)
+        inner.maxlogl_plateau_done = True
+        gate.propose(None, _state())
+        self.assertEqual(inner.seen, [(False, False), (False, False)])
+        self.assertEqual(gate.releases, 2)
+
+    def test_release_to_convergence_off_keeps_the_rider_behaviour(self):
+        log = _Log()
+        inner = _FakePlateauedInner(log)
+        gate = NoiseRatchetGate(inner, _FakeGalfor(log),
+                                np.array([-0.05, -0.05, 0, 0, -0.1]),
+                                release_to_convergence=False)
+        gate.set_mode("release"); gate.propose(None, _state())
+        self.assertEqual(inner.seen, [(True, True)])        # verdict inherited
+
+    def test_reset_helper_clears_state_and_reports_whether_there_was_any(self):
+        from lisatools.globalfit.noise_ratchet import reset_maxlogl_search
+
+        mv = SimpleNamespace(_ml_state={"n_iter": 3}, maxlogl_plateau_done=True)
+        self.assertTrue(reset_maxlogl_search(mv))
+        self.assertFalse(hasattr(mv, "_ml_state"))
+        self.assertFalse(mv.maxlogl_plateau_done)
+        self.assertFalse(reset_maxlogl_search(mv))          # nothing left to clear
+        self.assertFalse(reset_maxlogl_search(object()))    # safe on anything
+
     def test_gate_flags_a_leg_end_only_when_the_noise_changed(self):
         """Search legs: a row right after the in-model noise step whenever it
         runs (user ruling 2026-09-30) -- nudge and release set the flag, a
@@ -331,10 +425,18 @@ class _FakeGate:
         self.moves = []
         self.modes = []
         self.mode = "release"
+        self.release_to_convergence = True
+        self.ratchet_finished = False
 
     def set_mode(self, mode):
         self.mode = mode
         self.modes.append(mode)
+
+    def finish_ratchet(self):
+        self.mode = "release"
+        self.release_to_convergence = False
+        self.ratchet_finished = True
+        self.modes.append("finished")
 
 
 class _FakeGrid:
@@ -491,6 +593,157 @@ class StepDrivesRatchetTest(unittest.TestCase):
             st2.setup_run(47, None, _FakeSampler(47, tree))
             st2.note_recipe_step(3)
             self.assertTrue(st2.stopping_function(48, None, _FakeSampler(48, tree)))
+
+    def test_release_first_two_step_cycles_stop_on_a_small_gain(self):
+        """User design 2026-10-02: release to convergence first, then
+        (nudge/hold, release) cycles until a release's max cold lnL gains
+        less than the threshold over the previous release; then no more
+        nudges, the gate drops to rider mode and the stage may end on its
+        ordinary rule."""
+        from lisatools.globalfit.recipe import SearchStageProfileStep
+
+        gate, grid = _FakeGate(), _FakeGrid()
+        grid._shutoff_w_pending = 0            # the shut-off rule says "done"
+        tree = [SimpleNamespace(moves=[gate, grid])]
+        st = SearchStageProfileStep(
+            moves=tree, convergence_iter=2, plateau_branch="gb", profile={},
+            stage_name="gb_search_3",
+            ratchet=RatchetSchedule(hold=1, release=1, cycles=20, release_first=True),
+            ratchet_delta=np.zeros(5), ratchet_min_gain=200.0)
+
+        def sample(mx):
+            # cold row 0 of (nt, nw): the max over walkers is the statistic
+            return SimpleNamespace(log_like=np.array([[mx - 300.0, mx, mx - 50.0, mx - 120.0],
+                                                      [0.0, 0.0, 0.0, 0.0]]),
+                                   branches_coords={"galfor": np.zeros((2, 4, 1, 5))})
+
+        with env(GALFOR_RATCHET_HOLD_STAGE=None, GB_SEARCH_STAGE_END_ON_SHUTOFF=None):
+            st.setup_run(47, sample(1000.0), _FakeSampler(47, tree))
+            st.note_recipe_step(3)
+            self.assertEqual(gate.modes, ["release"])                 # k=0: release first
+            # k=0 done: baseline 1000; stage held open; next = nudge
+            self.assertFalse(st.stopping_function(48, sample(1000.0), _FakeSampler(48, tree)))
+            self.assertEqual(gate.modes[-1], "nudge")
+            self.assertEqual(len(grid.armed), 1)
+            # k=1 (nudge) done: lnL dropped (held noise); next = release
+            self.assertFalse(st.stopping_function(49, sample(-9000.0), _FakeSampler(49, tree)))
+            self.assertEqual(gate.modes[-1], "release")
+            # k=2 (release) done: 1500 = +500 over the baseline -> a real step, nudge again
+            self.assertFalse(st.stopping_function(50, sample(1500.0), _FakeSampler(50, tree)))
+            self.assertEqual(gate.modes[-1], "nudge")
+            self.assertEqual(len(grid.armed), 2)
+            self.assertFalse(st._ratchet_stopped)
+            self.assertFalse(st.stopping_function(51, sample(-8000.0), _FakeSampler(51, tree)))
+            self.assertEqual(gate.modes[-1], "release")
+            # k=4 (release) done: 1600 = +100 < 200 -> RATCHET DONE: the gate is
+            # finished (rider mode), no nudge follows, and the shut-off rule may
+            # now end the stage
+            self.assertTrue(st.stopping_function(52, sample(1600.0), _FakeSampler(52, tree)))
+            self.assertTrue(st._ratchet_stopped)
+            self.assertTrue(gate.ratchet_finished)
+            self.assertFalse(gate.release_to_convergence)
+            self.assertEqual(gate.mode, "release")
+            self.assertNotIn("nudge", gate.modes[-2:])
+            self.assertEqual(len(grid.armed), 2)                      # no third refit
+            self.assertEqual([k for k, _ in st._ratchet_release_maxes], [0, 2, 4])
+
+    def test_clock_reset_picks_the_schedule_up_in_the_middle_of_the_run(self):
+        """User design 2026-10-02: no rewind -- resume where the run stopped
+        and let the release-first schedule start there. Without the reset the
+        stored stage start puts the resume at k = 17 (a nudge for this
+        schedule); with GALFOR_RATCHET_CLOCK_RESET=1 it is k = 0, a release."""
+        from lisatools.globalfit.recipe import SearchStageProfileStep
+
+        def mk():
+            gate, grid = _FakeGate(), _FakeGrid()
+            tree = [SimpleNamespace(moves=[gate, grid])]
+            st = SearchStageProfileStep(
+                moves=tree, convergence_iter=2, plateau_branch="gb", profile={},
+                stage_name="gb_search_3",
+                ratchet=RatchetSchedule(hold=1, release=1, cycles=20, release_first=True),
+                ratchet_delta=np.zeros(5), ratchet_min_gain=200.0)
+            return st, gate, grid, tree
+
+        with env(GALFOR_RATCHET_CLOCK_RESET=None):
+            st, gate, grid, tree = mk()
+            self._enter(st, tree, 63, stage_start=46)          # k = 17 -> ks = 16 -> nudge
+            self.assertEqual(gate.modes, ["nudge"])
+            self.assertEqual(len(grid.armed), 1)
+        with env(GALFOR_RATCHET_CLOCK_RESET="1"):
+            st, gate, grid, tree = mk()
+            self._enter(st, tree, 63, stage_start=46)
+            self.assertEqual(st._ratchet_k0, 17)
+            self.assertEqual(st._ratchet_k, 0)
+            self.assertEqual(gate.modes, ["release"])          # the release first
+            self.assertEqual(grid.armed, [])                   # no refit on a release
+            smp = SimpleNamespace(log_like=np.array([[5.0, 6.0], [0.0, 0.0]]),
+                                  branches_coords={"galfor": np.zeros((2, 2, 1, 5))})
+            st.stopping_function(64, smp, _FakeSampler(64, tree, stage_start=46))
+            self.assertEqual(gate.modes, ["release", "nudge"])
+            self.assertEqual(len(grid.armed), 1)
+            self.assertEqual([k for k, _ in st._ratchet_release_maxes], [0])
+
+    def test_the_stop_is_stamped_into_the_store(self):
+        """A relaunch must not forget that the ratchet finished."""
+        from lisatools.globalfit.recipe import SearchStageProfileStep
+
+        class _StampingBackend(_FakeBackend):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.stamps = []
+
+            def stage_flag(self, name, key):
+                return None
+
+            def stamp_stage_flag(self, name, key, value):
+                self.stamps.append((name, key, value))
+                return True
+
+        gate, grid = _FakeGate(), _FakeGrid()
+        tree = [SimpleNamespace(moves=[gate, grid])]
+        st = SearchStageProfileStep(
+            moves=tree, convergence_iter=2, plateau_branch="gb", profile={},
+            stage_name="gb_search_3",
+            ratchet=RatchetSchedule(hold=1, release=1, cycles=20, release_first=True),
+            ratchet_delta=np.zeros(5), ratchet_min_gain=200.0)
+        be = _StampingBackend(47)
+
+        def smp(mx):
+            return SimpleNamespace(log_like=np.array([[mx, mx - 1.0], [0.0, 0.0]]),
+                                   branches_coords={"galfor": np.zeros((2, 2, 1, 5))})
+
+        def sampler(it):
+            s = _FakeSampler(it, tree)
+            s.backend = be
+            return s
+
+        st.setup_run(47, smp(1000.0), sampler(47))
+        st.note_recipe_step(3)
+        st.stopping_function(48, smp(1000.0), sampler(48))      # baseline
+        st.stopping_function(49, smp(-5000.0), sampler(49))     # nudge done
+        st.stopping_function(50, smp(1050.0), sampler(50))      # +50 < 200 -> stop
+        self.assertTrue(st._ratchet_stopped)
+        self.assertEqual(be.stamps, [("gb_search_3", "galfor_ratchet_done", 1)])
+
+    def test_min_gain_zero_leaves_the_schedule_alone(self):
+        from lisatools.globalfit.recipe import SearchStageProfileStep
+
+        gate, grid = _FakeGate(), _FakeGrid()
+        tree = [SimpleNamespace(moves=[gate, grid])]
+        st = SearchStageProfileStep(
+            moves=tree, convergence_iter=2, plateau_branch="gb", profile={},
+            stage_name="gb_search_3",
+            ratchet=RatchetSchedule(hold=1, release=1, cycles=3, release_first=True),
+            ratchet_delta=np.zeros(5))                                # min_gain default 0
+        smp = SimpleNamespace(log_like=np.array([[1.0, 2.0], [0.0, 0.0]]),
+                              branches_coords={"galfor": np.zeros((2, 2, 1, 5))})
+        st.setup_run(47, smp, _FakeSampler(47, tree))
+        st.note_recipe_step(3)
+        for i in range(6):
+            st.stopping_function(48 + i, smp, _FakeSampler(48 + i, tree))
+        self.assertFalse(st._ratchet_stopped)
+        self.assertEqual(gate.modes, ["release", "nudge", "release", "nudge", "release",
+                                      "nudge", "release"])
 
     def test_resume_mid_hold_does_not_re_nudge(self):
         """A relaunch at stored iteration 49 whose recipe group says the
@@ -894,12 +1147,69 @@ class CompositionTest(unittest.TestCase):
         self.assertEqual(sorted(gate.inner_names), ["galfor_pe", "psd_pe"])
         # the in-model follow-up is a declared dependency so it gets BUILT
         self.assertIn("in_model", gate.stock_dependencies())
+        # RELEASE = search to convergence (user ruling 2026-10-02): the
+        # STANDALONE plateau rule (5 flat rounds), not the rider's 1, with a
+        # generous per-release cap, and a fresh search on every release
+        self.assertEqual(gate.num_checks, 5)
+        self.assertEqual(gate.iters_per_step, 5000)   # a safety ceiling, never the stop
+        self.assertTrue(gate.release_to_convergence)
+        self.assertEqual(gate.release_tol, 5.0)      # user ruling 2026-10-02: 5, not MAXLOGL_TOL
         kw = by["gb_search_3"].step_kwargs
         self.assertEqual(kw["ratchet"], RatchetSchedule(hold=3, release=2, cycles=2))
         np.testing.assert_allclose(kw["ratchet_delta"], GALFOR_RATCHET_DEFAULT_DELTA)
         for s in ("gb_search_1", "gb_search_2"):
             self.assertIsNone(by[s].step_kwargs.get("ratchet"))
             self.assertNotIn("noise_ratchet_search", self._names(by[s]))
+
+    def test_release_search_criterion_knobs(self):
+        fit = self._full(GALFOR_RATCHET="1", GALFOR_RATCHET_RELEASE_CHECKS="3",
+                         GALFOR_RATCHET_RELEASE_ITERS="50",
+                         GB_SEARCH_NOISE_CHECKS="1")
+        gate = {s.name: s for s in fit.recipe.stages}["gb_search_3"].moves[0]
+        self.assertEqual((gate.num_checks, gate.iters_per_step), (3, 50))
+        # NOISE_SEARCH_CHECKS is the fallback, GB_SEARCH_NOISE_CHECKS never is
+        fit = self._full(GALFOR_RATCHET="1", NOISE_SEARCH_CHECKS="7",
+                         GB_SEARCH_NOISE_CHECKS="1")
+        gate = {s.name: s for s in fit.recipe.stages}["gb_search_3"].moves[0]
+        self.assertEqual(gate.num_checks, 7)
+        with self.assertRaises(ValueError):
+            self._full(GALFOR_RATCHET="1", GALFOR_RATCHET_RELEASE_CHECKS="0")
+        fit = self._full(GALFOR_RATCHET="1", GALFOR_RATCHET_RELEASE_TOL="2.5", MAXLOGL_TOL="20")
+        gate = {s.name: s for s in fit.recipe.stages}["gb_search_3"].moves[0]
+        self.assertEqual(gate.release_tol, 2.5)
+        with self.assertRaises(ValueError):
+            self._full(GALFOR_RATCHET="1", GALFOR_RATCHET_RELEASE_TOL="0")
+
+    def test_release_tol_beats_the_global_MAXLOGL_TOL_on_the_built_move(self):
+        """MaxLogLCombineMove.__init__ lets MAXLOGL_TOL override its tol
+        argument, so the release tolerance has to land on the instance after
+        construction -- that is what the gate's setup does."""
+        import run_combined_staged as R
+        from lisatools.globalfit.moves.globalfitmove import MaxLogLCombineMove
+
+        with env(MAXLOGL_TOL="20"):
+            mv = MaxLogLCombineMove.__new__(MaxLogLCombineMove)
+            mv.tol = float(os.environ.get("MAXLOGL_TOL", 5.0))   # what __init__ leaves
+            self.assertEqual(mv.tol, 20.0)
+            R.apply_release_tol(mv, 5.0)
+            self.assertEqual(mv.tol, 5.0)
+            R.apply_release_tol(mv, None)                          # None keeps it
+            self.assertEqual(mv.tol, 5.0)
+            with self.assertRaises(ValueError):
+                R.apply_release_tol(mv, 0.0)
+
+    def test_release_first_and_min_gain_reach_the_stage_step(self):
+        fit = self._full(GALFOR_RATCHET="1", GALFOR_RATCHET_HOLD="1",
+                         GALFOR_RATCHET_RELEASE="1", GALFOR_RATCHET_CYCLES="20",
+                         GALFOR_RATCHET_RELEASE_FIRST="1", GALFOR_RATCHET_MIN_GAIN="200")
+        kw = {s.name: s for s in fit.recipe.stages}["gb_search_3"].step_kwargs
+        self.assertEqual(kw["ratchet"],
+                         RatchetSchedule(hold=1, release=1, cycles=20, release_first=True))
+        self.assertEqual(kw["ratchet_min_gain"], 200.0)
+        fit = self._full(GALFOR_RATCHET="1")
+        kw = {s.name: s for s in fit.recipe.stages}["gb_search_3"].step_kwargs
+        self.assertEqual(kw["ratchet_min_gain"], 0.0)
+        self.assertFalse(kw["ratchet"].release_first)
 
     def test_unarmed_composition_is_unchanged(self):
         fit = self._full()

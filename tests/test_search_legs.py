@@ -310,6 +310,24 @@ class BackendSavedAfterTest(unittest.TestCase):
             self.assertIsNone(be.saved_after(2))
             self.assertEqual(be.saved_after_history(0, 3), [None, None, None])
 
+    def test_stage_flag_round_trips_and_is_none_when_absent(self):
+        """The galfor ratchet's stop stamp (user ruling 2026-10-02: a relaunch
+        must not ratchet again because it forgot)."""
+        import tempfile
+
+        from lisatools.globalfit.hdfbackend import GFHDFBackend
+
+        with tempfile.TemporaryDirectory() as tmp:
+            be = GFHDFBackend(self._store(tmp))
+            self.assertIsNone(be.stage_flag("gb_search_3", "galfor_ratchet_done"))
+            self.assertTrue(be.stamp_stage_flag("gb_search_3", "galfor_ratchet_done", 1))
+            self.assertEqual(int(be.stage_flag("gb_search_3", "galfor_ratchet_done")), 1)
+            # an unknown stage: no write, no read, no exception
+            self.assertFalse(be.stamp_stage_flag("full_pe", "galfor_ratchet_done", 1))
+            self.assertIsNone(be.stage_flag("full_pe", "galfor_ratchet_done"))
+            # the stamp leaves the other stamps alone
+            self.assertIsNone(be.stage_start_iteration("gb_search_3"))
+
 
 # ======================================================================
 # 4. the step resumes by NAME and drives the ratchet in cycles
@@ -407,6 +425,129 @@ class StepResumesByNameTest(unittest.TestCase):
         self._enter(st, cm, _FakeBackend(47, [None] * 47, stage_start=47))
         self.assertEqual(cm.gf_legs.cursor, 0)
         self.assertEqual(cm.gf_legs.cycles, 0)
+
+    # ---- the ratchet's gain check and clock reset UNDER LEGS ---------------
+    # (user ruling 2026-10-02: "please double check those gates")
+
+    @staticmethod
+    def _sample(mx, nw=4):
+        return SimpleNamespace(
+            log_like=np.array([[mx - 300.0, mx, mx - 50.0, mx - 120.0][:nw],
+                               [0.0] * nw]),
+            branches_coords={"galfor": np.zeros((2, nw, 1, 5))})
+
+    def test_gain_check_runs_once_per_cycle_not_once_per_leg(self):
+        """Under legs stopping_function fires at EVERY leg end. The release
+        gain must be read once per completed cycle (at the wrap), or the
+        second leg of the first release cycle would be compared with its
+        first and stop the ratchet on a within-cycle wobble."""
+        from lisatools.globalfit.noise_ratchet import RatchetSchedule
+        from lisatools.globalfit.recipe import SearchStageProfileStep
+
+        cm, gate = _FakeCombine(), _FakeGate()
+        cm.moves = [gate]
+        st = SearchStageProfileStep(
+            moves=[cm], convergence_iter=2, plateau_branch="gb", profile={},
+            stage_name="gb_search_3", legs=True,
+            ratchet=RatchetSchedule(hold=1, release=1, cycles=20, release_first=True),
+            ratchet_delta=np.zeros(5), ratchet_min_gain=200.0)
+        be = _FakeBackend(47, [None] * 47, stage_start=47)
+        with env(GALFOR_RATCHET_HOLD_STAGE=None, GALFOR_RATCHET_CLOCK_RESET=None):
+            self._enter(st, cm, be)
+            self.assertEqual(gate.modes, ["release"])            # release first, k = 0
+            smp = _FakeSampler(be, [cm])
+            # three leg ends inside cycle 0 (the release cycle): no wrap yet
+            for mx in (1000.0, 1000.0, 1000.0):
+                st.stopping_function(48, self._sample(mx), smp)
+            self.assertEqual(st._ratchet_release_maxes, [])
+            self.assertEqual(gate.modes, ["release"])
+            cm.gf_legs.cycles = 1                                 # the wrap
+            st.stopping_function(49, self._sample(1000.0), smp)
+            self.assertEqual(st._ratchet_release_maxes, [(0, 1000.0)])
+            self.assertEqual(gate.modes[-1], "nudge")             # k = 1
+            cm.gf_legs.cycles = 2                                 # nudge cycle done
+            st.stopping_function(50, self._sample(-9000.0), smp)
+            self.assertEqual(gate.modes[-1], "release")           # k = 2
+            # within the release cycle the lnL wobbles: NOT a gain reading
+            for mx in (1100.0, 1050.0):
+                st.stopping_function(51, self._sample(mx), smp)
+            self.assertEqual(len(st._ratchet_release_maxes), 1)
+            self.assertFalse(st._ratchet_stopped)
+            cm.gf_legs.cycles = 3                                 # the wrap of k = 2
+            st.stopping_function(52, self._sample(1500.0), smp)
+            self.assertEqual(st._ratchet_release_maxes, [(0, 1000.0), (2, 1500.0)])
+            self.assertFalse(st._ratchet_stopped)                 # +500: a real step
+            self.assertEqual(gate.modes[-1], "nudge")
+
+    def test_clock_reset_mid_cycle_waits_for_the_next_head(self):
+        """A resume in the middle of a cycle has already passed that cycle's
+        noise head, so k0 is the NEXT cycle: nothing is driven at entry and
+        the first gate run after the wrap is the release (k = 0)."""
+        from lisatools.globalfit.noise_ratchet import RatchetSchedule
+        from lisatools.globalfit.recipe import SearchStageProfileStep
+
+        cm, gate = _FakeCombine(), _FakeGate()
+        cm.moves = [gate]
+        st = SearchStageProfileStep(
+            moves=[cm], convergence_iter=2, plateau_branch="gb", profile={},
+            stage_name="gb_search_3", legs=True,
+            ratchet=RatchetSchedule(hold=1, release=1, cycles=20, release_first=True),
+            ratchet_delta=np.zeros(5), ratchet_min_gain=200.0)
+        # rows 47, 48 saved after in_model, in_model_fstat: mid-cycle, 0 cycles done
+        hist = [None] * 47 + ["in_model", "in_model_fstat"]
+        be = _FakeBackend(49, hist, stage_start=47, order=ORDER)
+        with env(GALFOR_RATCHET_HOLD_STAGE=None, GALFOR_RATCHET_CLOCK_RESET="1"):
+            self._enter(st, cm, be)
+            self.assertEqual(ORDER[cm.gf_legs.cursor], "rj_prior_removal")
+            self.assertEqual(st._ratchet_k0, 1)
+            self.assertEqual(st._ratchet_k, -1)
+            self.assertEqual(gate.modes, [])                      # nothing driven
+            smp = _FakeSampler(be, [cm])
+            st.stopping_function(49, self._sample(900.0), smp)   # a leg end, no wrap
+            self.assertEqual(gate.modes, [])
+            self.assertEqual(st._ratchet_release_maxes, [])
+            cm.gf_legs.cycles = 1                                 # the wrap
+            st.stopping_function(50, self._sample(900.0), smp)
+            self.assertEqual(st._ratchet_k, 0)
+            self.assertEqual(gate.modes, ["release"])             # release first
+            self.assertEqual(st._ratchet_release_maxes, [])       # k = -1 never read
+
+    def test_a_stamped_stop_survives_a_relaunch(self):
+        """The data-driven stop is stamped in the store; a fresh process that
+        re-enters the stage must not nudge again."""
+        from lisatools.globalfit.noise_ratchet import RatchetSchedule
+        from lisatools.globalfit.recipe import SearchStageProfileStep
+
+        class _StampedBackend(_FakeBackend):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.flags = {"galfor_ratchet_done": 1}
+
+            def stage_flag(self, name, key):
+                return self.flags.get(key)
+
+            def stamp_stage_flag(self, name, key, value):
+                self.flags[key] = value
+                return True
+
+        cm, gate = _FakeCombine(), _FakeGate()
+        cm.moves = [gate]
+        st = SearchStageProfileStep(
+            moves=[cm], convergence_iter=2, plateau_branch="gb", profile={},
+            stage_name="gb_search_3", legs=True,
+            ratchet=RatchetSchedule(hold=1, release=1, cycles=20, release_first=True),
+            ratchet_delta=np.zeros(5), ratchet_min_gain=200.0)
+        be = _StampedBackend(60, [None] * 60, stage_start=47)
+        with env(GALFOR_RATCHET_HOLD_STAGE=None, GALFOR_RATCHET_CLOCK_RESET="1"):
+            self._enter(st, cm, be)
+            self.assertTrue(st._ratchet_stopped)
+            self.assertEqual(gate.modes, [])                      # no nudge, no release drive
+            self.assertFalse(st._ratchet_schedule_pending(0))     # the stage may end
+            smp = _FakeSampler(be, [cm])
+            cm.gf_legs.cycles = 1
+            st.stopping_function(61, self._sample(5.0), smp)
+            self.assertEqual(gate.modes, [])
+            self.assertEqual(st._ratchet_release_maxes, [])
 
     def test_changed_composition_starts_at_the_head(self):
         st, cm, _ = self._step()
