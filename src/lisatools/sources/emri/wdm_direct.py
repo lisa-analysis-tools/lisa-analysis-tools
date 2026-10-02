@@ -473,6 +473,9 @@ class EMRIDirectWDM:
             ``"cubic"`` scipy-only; ``None`` keeps the table's).
     """
 
+    #: TDI delay margin [s]: a source time contributes to response times up to this much later
+    DELAY_MARGIN = 600.0
+
     def __init__(self, few_gen, table, wdm_set, *, orbits, tdi_config, t_start, data_t0,
                  Nt_sub=128, n_fine=None, fine_dt=3600.0, fine_dt_plunge=80.0, mode_batch=None,
                  pixel_edge=8, num_m_layers=2, interp="spline", force_backend="cpu", feed="knots",
@@ -513,6 +516,7 @@ class EMRIDirectWDM:
         if interp is not None and getattr(table, "INTERP_METHOD", None) != interp:
             table.set_interp_method(interp)
         self.last_stats = {}
+        self.last_failed_rows = []
 
     def _few_holder(self, few_args, few_kwargs, new_t, mode_selection=None):
         """ONE FEW call on the fine grid ``new_t`` (FEW clock) -> host sparse holder.
@@ -691,6 +695,14 @@ class EMRIDirectWDM:
             kw["mode_selection"] = modes
         modes, chunk_start = self._mode_list(few_args, kw)
         H, tracks_pix, n_tr = self._last_holder, self._last_tracks, self._last_track_n
+        if float(np.asarray(H.t_arr)[-1]) < self.data_t0 - self.t_start - self.DELAY_MARGIN:
+            # the inspiral ends before the window (plus the TDI delay margin): no pixel sees
+            # it, the production template is zero there too, and the response grid below
+            # would be empty
+            self.last_stats = dict(modes=len(modes), n_fine=0, feed="knots", chunk_start=chunk_start,
+                                   lookup_pixels=0, chunk_pixels=0, dropped_pixels=0,
+                                   ended_before_window=1)
+            return WDMSignal(acc, wdm)
         t_fine = self._fine_grid(chunk_start)
         self.n_fine, self.last_t_fine = int(t_fine.size), t_fine
         fly = EMRITDIonFly(self.few_gen, self.orbits, self.tdi_config, dt, T_traj, self.t_start,
@@ -825,18 +837,25 @@ class EMRIDirectWDM:
                                chunk_start=None if chunk_start == "unknown" else chunk_start, **totals)
         return WDMSignal(acc, wdm)
 
-    def batch(self, rows, chunk_rows=16, consume=None, **few_kwargs):
+    def batch(self, rows, chunk_rows=16, consume=None, skip_domain_errors=False, **few_kwargs):
         """Templates for many parameter rows, ``chunk_rows`` per response call (bounds GPU memory:
         one 6-month production-grid template is ~150 MB of WDM coefficients).
 
         ``consume(row_indices, arr)`` (optional) receives each chunk's ``(n, nch, Nf, Nt)`` array
         and nothing is kept; otherwise the full ``(n_rows, nch, Nf, Nt)`` array is returned.
-        ``last_stats`` sums the chunks' stats."""
+        ``last_stats`` sums the chunks' stats.
+
+        FEW's out-of-domain failures are raised as
+        :class:`~lisatools.utils.exceptions.WaveformDomainError` (``few_domain_guard``). With
+        ``skip_domain_errors=True`` such a row is left all-zero instead, the others are built,
+        and its index (into ``rows``) is listed in ``last_failed_rows``."""
         rows = list(rows)
-        parts, tot = [], {}
+        parts, tot, failed = [], {}, []
         for i in range(0, len(rows), max(1, int(chunk_rows))):
             idx = list(range(i, min(i + int(chunk_rows), len(rows))))
-            arr = self._batch_chunk([rows[k] for k in idx], **few_kwargs)
+            arr = self._batch_chunk([rows[k] for k in idx], skip_domain_errors=skip_domain_errors,
+                                    **few_kwargs)
+            failed += [idx[k] for k in self.last_failed_rows]
             for k, v in self.last_stats.items():
                 tot[k] = tot.get(k, 0) + v if isinstance(v, (int, float)) else v
             if consume is not None:
@@ -845,11 +864,12 @@ class EMRIDirectWDM:
             else:
                 parts.append(arr)
         self.last_stats = tot
+        self.last_failed_rows = failed
         if consume is not None:
             return None
         return parts[0] if len(parts) == 1 else self.xp.concatenate(parts, axis=0)
 
-    def _batch_chunk(self, rows, **few_kwargs):
+    def _batch_chunk(self, rows, skip_domain_errors=False, **few_kwargs):
         """Many templates with ONE TDI-on-the-fly response call, ONE tracer and ONE lookup.
 
         ``rows``: parameter rows (as for ``__call__``). FEW runs once per row (it is a
@@ -857,9 +877,14 @@ class EMRIDirectWDM:
         response kernel launch (num_sub x n_rows blocks fill the GPU), one tracer evaluation
         and one table call + scatter-add into ``(n_rows, nch, Nf, Nt)``. A row that hands off
         to the plunge chunk is built alone with ``__call__``. Returns the array (backend xp).
+        A row FEW refuses (WaveformDomainError) is left zero and listed in ``last_failed_rows``
+        when ``skip_domain_errors``; otherwise the error propagates.
         """
+        from ...utils.exceptions import WaveformDomainError
+        from .domain import few_domain_guard
         from .emritdionfly import EMRITDIonFly
 
+        self.last_failed_rows = []
         wdm = self.wdm
         Nf, Nt, dt, ldt, ldf = wdm.Nf, wdm.Nt, wdm.data_dt, wdm.layer_dt, wdm.layer_df
         span = Nt * ldt
@@ -873,12 +898,20 @@ class EMRIDirectWDM:
         fly = EMRITDIonFly(self.few_gen, self.orbits, self.tdi_config, dt, T_traj, self.t_start,
                            frame="icrs_special", t_fine_window=(self.data_t0, self.data_t0 + span), t_fine=t_fine)
         feeds, tracks, rows_in, n_trs, t_ends = [], [], [], [], []
-        stats = dict(rows=len(rows), alone=0, subs=0)
+        stats = dict(rows=len(rows), alone=0, subs=0, failed=0)
         for r, p in enumerate(rows):
-            modes, chunk_start = self._mode_list(p, few_kwargs)
-            if chunk_start is not None:                      # plunge chunk: build this one alone
-                out_arr[r] = xp.asarray(self(*p, **few_kwargs).arr)
-                stats["alone"] += 1
+            try:
+                with few_domain_guard():
+                    modes, chunk_start = self._mode_list(p, few_kwargs)
+                    if chunk_start is not None:              # plunge chunk: build this one alone
+                        out_arr[r] = xp.asarray(self(*p, **few_kwargs).arr)
+                        stats["alone"] += 1
+                        continue
+            except WaveformDomainError:
+                if not skip_domain_errors:
+                    raise
+                self.last_failed_rows.append(r)
+                stats["failed"] += 1
                 continue
             H = self._last_holder
             _, _, psi, lam, beta = fly.sky(p[7], p[8], p[9], p[10])

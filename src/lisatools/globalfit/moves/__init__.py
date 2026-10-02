@@ -15,3 +15,4 @@ from .mbhspecialmove import MBHSpecialMove, TDMBHSpecialMove
 from .psdmove import PSDMove, MultiGPUPSDMove
 from .sobbhspecialmove import SOBBHChunkedLikeMove
 from .mbhbatchedmove import MBHBatchedLikeMove
+from .emridirectmove import EMRIDirectLikeMove

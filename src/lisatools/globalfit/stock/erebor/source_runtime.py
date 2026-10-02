@@ -44,6 +44,7 @@ from ...engine import GeneralSetup
 from ...preprocessing import normalize_source_ids
 from ...recipe import (
     MOJITO_REFERENCE_TIME,
+    EMRIDirectMoveBuilder,
     EMRIMoveBuilder,
     MBHBatchedMoveBuilder,
     MBHMoveBuilder,
@@ -542,13 +543,48 @@ class SourceMBHSettings(MBHSettings):
 
 @dataclasses.dataclass
 class SourceEMRISettings(EMRISettings):
-    """EMRI branch block (always the legacy ResponseWrapper path)."""
+    """EMRI branch block. Templates (engine residuals, fills, cross-checks) are the
+    legacy ResponseWrapper path; the add/remove SCORING path is ``likelihood``."""
 
     num_prop_repeats: int = dataclasses.field(
         default_factory=env_default("EMRI_NUM_PROP_REPEATS", 2, int)
     )
     ndim: int = 12
     response_order: int = 40
+    # Scoring path (2026-10-02): "full" (DEFAULT, the per-row production container
+    # path) or "direct" (EMRIDirectLikeMove: the direct-to-WDM template -- n_ref lookup
+    # table + dense-phase TDI-on-the-fly response + plunge chunk -- batched over
+    # batch_max_size rows, scored against each walker's own residual and PSD). The
+    # residual expose/fold and the cross-check stay on the production generator either
+    # way. resolve_emri_direct_cfg holds the consistency rules.
+    likelihood: str = dataclasses.field(
+        default_factory=env_default("EMRI_LIKELIHOOD", "full", str)
+    )
+    # Rows per direct generation: each row holds a full-grid (3, Nf, Nt) float64
+    # accumulator while it is built (~150 MB at Nf 1440 x Nt 4320).
+    batch_max_size: int = dataclasses.field(
+        default_factory=env_default("EMRI_BATCH_MAX_SIZE", 8, int)
+    )
+    # The n_ref WDM lookup table on the run's Nf and dt. None (default): the canonical
+    # file in the run's folder (general.file_store_dir; on the 6-month grid
+    # wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5); a path points to a specific
+    # table. Either way it is BUILT AND SAVED there when missing (once: restarts find it;
+    # lisatools.wdm_lookup_store.ensure_lookup_table).
+    direct_table: typing.Optional[str] = dataclasses.field(
+        default_factory=env_default("EMRI_DIRECT_TABLE", None, str)
+    )
+    # TDI-on-the-fly kernel of the direct template: "dense" (TDDenseTDIWaveform: exact
+    # dense-output phases, geometry shared across harmonics, all rows in one launch;
+    # needs a lisatools build with TDDenseTDIWaveformWrap) or "spline".
+    direct_response: str = dataclasses.field(
+        default_factory=env_default("EMRI_DIRECT_RESPONSE", "dense", str)
+    )
+    # Trajectory fan-out: worker PROCESSES integrating a direct batch's inspirals
+    # (few.trajectory.pool); 0 integrates serially. Each worker is one CPU core:
+    # the launcher's --cpus-per-task must cover them.
+    traj_workers: int = dataclasses.field(
+        default_factory=env_default("EMRI_TRAJ_WORKERS", 0, int)
+    )
 
 
 @dataclasses.dataclass
@@ -1275,16 +1311,79 @@ def snap_waveform_t0_to_lattice(waveform_t0: float, data_t0: float, dt: float):
     return snapped, snapped - float(waveform_t0)
 
 
+#: ``EMRI_LIKELIHOOD`` values.
+EMRI_LIKELIHOOD_MODES = ("full", "direct")
+#: ``EMRI_DIRECT_RESPONSE`` values (``EMRIDirectWDM(response=...)``).
+EMRI_DIRECT_RESPONSES = ("dense", "spline")
+
+
+def resolve_emri_direct_cfg(emri, *, domain_settings, tdi_chan) -> dict:
+    """Plain-value EMRI scoring-path config, with the direct-mode consistency rules.
+
+    ``domain_settings`` is the run-domain SPEC (as for :func:`resolve_mbh_batched_cfg`)
+    and ``tdi_chan`` the run's channel set. ``full`` passes through untouched.
+    ``direct`` RAISES when the run cannot serve it: a run domain that is known not to
+    be WDM (an unidentifiable factory is taken at its word; the getter checks the BUILT
+    domain), channels other than XYZ (the direct template is the X, Y, Z response), an
+    unknown ``EMRI_DIRECT_RESPONSE``, ``EMRI_BATCH_MAX_SIZE < 1`` or
+    ``EMRI_TRAJ_WORKERS < 0``. The lookup table is not required to exist: the getter finds
+    it (``EMRI_DIRECT_TABLE`` or the run folder's canonical file) or builds and saves it.
+    """
+    from lisatools.domains import WDMSettings
+
+    # getattr defaults: a plain EMRISettings block (no scoring-path fields) is "full"
+    mode = str(getattr(emri, "likelihood", "full"))
+    if mode not in EMRI_LIKELIHOOD_MODES:
+        raise ValueError(
+            f"EMRI_LIKELIHOOD must be one of {EMRI_LIKELIHOOD_MODES}; got {mode!r}"
+        )
+    table = getattr(emri, "direct_table", None)
+    out = dict(
+        emri_likelihood=mode,
+        emri_batch_max_size=int(getattr(emri, "batch_max_size", 8)),
+        emri_direct_table=table,
+        emri_direct_response=str(getattr(emri, "direct_response", "dense")),
+        emri_traj_workers=int(getattr(emri, "traj_workers", 0)),
+    )
+    if mode == "full":
+        return out
+    blockers = []
+    cls = run_domain_settings_class(domain_settings)
+    if cls is not None and not issubclass(cls, WDMSettings):
+        blockers.append(f"the run domain is {cls.__name__}, not WDM")
+    if str(tdi_chan).upper() != "XYZ":
+        blockers.append(f"the run's channels are {tdi_chan!r}; the direct template is XYZ")
+    if out["emri_direct_response"] not in EMRI_DIRECT_RESPONSES:
+        blockers.append(
+            f"EMRI_DIRECT_RESPONSE={out['emri_direct_response']!r} is not one of "
+            f"{EMRI_DIRECT_RESPONSES}"
+        )
+    if out["emri_batch_max_size"] < 1:
+        blockers.append(f"EMRI_BATCH_MAX_SIZE={out['emri_batch_max_size']} < 1")
+    if out["emri_traj_workers"] < 0:
+        blockers.append(f"EMRI_TRAJ_WORKERS={out['emri_traj_workers']} < 0")
+    if blockers:
+        raise ValueError(
+            "EMRI_LIKELIHOOD=direct cannot serve this run: " + "; ".join(blockers)
+            + ". Fix it or use EMRI_LIKELIHOOD=full."
+        )
+    return out
+
+
 def source_signal_cfg(gs, mbh, sobbh, emri, *, domain_settings) -> dict:
     """Plain-value config consumed by the wave-wrap getters below.
 
-    ``domain_settings``: the run-domain SPEC, for the MBH scoring-path
-    resolution (:func:`resolve_mbh_batched_cfg`); variants pass
-    ``run_domain_spec(self.general_info)`` so it matches the injection
+    ``domain_settings``: the run-domain SPEC, for the MBH and EMRI scoring-path
+    resolutions (:func:`resolve_mbh_batched_cfg`, :func:`resolve_emri_direct_cfg`);
+    variants pass ``run_domain_spec(self.general_info)`` so it matches the injection
     sites' (``general.domain_settings`` of the resolved general settings)."""
     _mbh_batched = resolve_mbh_batched_cfg(mbh, domain_settings=domain_settings)
+    _emri_direct = resolve_emri_direct_cfg(
+        emri, domain_settings=domain_settings, tdi_chan=gs.tdi_chan
+    )
     return dict(
         **_mbh_batched,
+        **_emri_direct,
         tdi_chan=gs.tdi_chan,
         tdi_gen_str=gs.tdi_gen_str,
         nchannels=gs.nchannels,
@@ -1905,8 +2004,92 @@ class DeviceLocalWaveGen:
         return attr
 
 
+def get_emri_direct_gen(general_info, cfg):
+    """Direct-to-WDM EMRI template adapter (``EMRI_LIKELIHOOD=direct``), per device.
+
+    Reuses the FEW generator inside THIS device's production wrap
+    (:func:`get_emri_wave_wrap`: one FEW construction per device, its amplitude tables
+    are GBs), the same orbits and the same REF epoch / data start, and the same
+    mode-selection threshold (``runtime_kwargs``). The template is assembled on the
+    run's FULL wavelet grid and cropped to the run domain's active box
+    (:class:`~lisatools.sources.emri.direct_signal_gen.EMRIDirectWDMSignalGen`).
+
+    The lookup table is ``EMRI_DIRECT_TABLE`` or, unset, the canonical file in the run's
+    folder (``general_info.file_store_dir``); when missing it is built and saved there
+    first (one builder under a lock file, the other ranks wait), so a restart finds it.
+    """
+    from lisatools import wdm_lookup_store
+    from lisatools.domains import WDMLookupTable, WDMSettings
+    from lisatools.sources.emri.direct_signal_gen import EMRIDirectWDMSignalGen
+    from lisatools.sources.emri.wdm_direct import EMRIDirectWDM
+
+    xp, dev, orbits, domain_settings = _wrap_device_and_orbits(general_info)
+    mode_threshold = cfg.get("emri_mode_selection_threshold")
+    key = (
+        "emri_direct", id(general_info), cfg["nchannels"], dev, mode_threshold,
+        cfg["emri_direct_table"], cfg["emri_direct_response"],
+    )
+    if key in _WAVE_WRAP_CACHE:
+        return _WAVE_WRAP_CACHE[key]
+    if not isinstance(domain_settings, WDMSettings):
+        raise ValueError(
+            "EMRI_LIKELIHOOD=direct needs a WDM run domain "
+            f"(general.domain_settings is {type(domain_settings).__name__})."
+        )
+    wrap = get_emri_wave_wrap(general_info, cfg)
+    few_gen = wrap.wave_gen.waveform_gen.waveform_generator
+    force_backend = general_info.force_backend
+    data_t0 = general_info.data_t0
+    # the production wrap's phase epoch: catalogue REF (mojito), else the data start
+    ref = MOJITO_REFERENCE_TIME if cfg["data_mode"] == "mojito" else data_t0
+    Nf, dt = int(domain_settings.Nf), float(domain_settings.data_dt)
+    table_path = wdm_lookup_store.lookup_table_path(
+        cfg["emri_direct_table"], getattr(general_info, "file_store_dir", None), Nf, dt)
+    with device_context(xp, dev):
+        status = wdm_lookup_store.ensure_lookup_table(
+            table_path, Nf=Nf, dt=dt, force_backend=force_backend)
+        logger.info("[EMRI_DIRECT] lookup table %s (%s).", table_path, status)
+        table = WDMLookupTable.from_file(table_path, force_backend=force_backend)
+        if int(table.Nf) != Nf or abs(float(table.data_dt) - dt) > 1e-9:
+            raise ValueError(
+                f"EMRI lookup table {table_path} is built for Nf={table.Nf}, "
+                f"dt={table.data_dt}; the run grid is Nf={Nf}, dt={dt}."
+            )
+        full = WDMSettings(
+            int(domain_settings.Nf), int(domain_settings.Nt), float(domain_settings.data_dt),
+            force_backend=force_backend,
+        )
+        direct = EMRIDirectWDM(
+            few_gen, table, full, orbits=orbits,
+            tdi_config=TDIConfig(cfg["tdi_gen_str"], force_backend=force_backend),
+            t_start=ref, data_t0=data_t0, force_backend=force_backend,
+            response=cfg["emri_direct_response"],
+        )
+        gen = EMRIDirectWDMSignalGen(
+            direct, domain_settings, nchannels=cfg["nchannels"],
+            runtime_kwargs=(
+                {EMRI_MODE_SELECTION_THRESHOLD_KEY: mode_threshold}
+                if mode_threshold is not None else None
+            ),
+            traj_workers=cfg.get("emri_traj_workers", 0),
+        )
+    _WAVE_WRAP_CACHE[key] = gen
+    return gen
+
+
 def build_emri_move_runtime(curr, acs, priors, state, cfg):
+    """EMRI PE move: :class:`~lisatools.globalfit.moves.EMRIDirectLikeMove` when
+    ``cfg["emri_likelihood"] == "direct"`` (scoring through the direct-to-WDM template,
+    fill and cross-check on the production wrap), else the stock per-row move."""
     wave_gen = DeviceLocalWaveGen(get_emri_wave_wrap, curr.general_info, cfg)
+    if cfg.get("emri_likelihood", "full") == "direct":
+        direct = DeviceLocalWaveGen(get_emri_direct_gen, curr.general_info, cfg)
+        _, moves = EMRIDirectMoveBuilder(
+            wave_gen=wave_gen,
+            direct_gen=direct,
+            batch_max_size=cfg["emri_batch_max_size"],
+        ).build(None, curr, acs, priors, state)
+        return moves[0]
     _, moves = EMRIMoveBuilder(wave_gen=wave_gen).build(None, curr, acs, priors, state)
     return moves[0]
 
@@ -2205,11 +2388,11 @@ def build_source_moves(curr, acs, priors, state, cfg) -> dict:
     ``ResidualAddOneRemoveOneMove`` path).
     ``sobbh_pe`` uses the batched chunked-heterodyne kernel.
 
-    EMRI batching remains DEFERRED BY DECISION (2026-08-28): ``emri_pe`` scores
-    per row (~1040 ms/row on the 6-mo probe, job 373). FEW's ODE is adaptive
-    per source, so EMRI has no batch axis today; its route is the parked
-    multimodal-heterodyne plan. Its expose/fold is already cheap (template
-    builds cache), so the win is in SCORING.
+    ``emri_pe`` (``cfg["emri_likelihood"]``): ``full`` (default) scores per row
+    through the production container path (~1040 ms/row on the 6-mo probe, job 373);
+    ``direct`` builds :class:`~lisatools.globalfit.moves.EMRIDirectLikeMove`, which
+    scores chunks of rows through the direct-to-WDM template (one FEW call per row,
+    one response launch per chunk); the expose/fold stays on the production path.
     """
     stock_moves = {}
     if "mbh" in curr.source_info:
