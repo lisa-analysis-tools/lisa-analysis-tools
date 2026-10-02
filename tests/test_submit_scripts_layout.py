@@ -716,6 +716,10 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # likelihood at B=8, response order 8 pinned. v8 predates the
             # knobs entirely; SixMonthMBHBatchedTest pins the block.
             "MBH_LIKELIHOOD", "MBH_BATCH_MAX_SIZE", "MBH_RESPONSE_ORDER",
+            # V9-26 (2026-10-02): the EMRI direct-to-WDM scoring path's knobs
+            # (default full = the v8 path); SixMonthEMRIDirectTest pins the block.
+            "EMRI_LIKELIHOOD", "EMRI_BATCH_MAX_SIZE", "EMRI_DIRECT_TABLE",
+            "EMRI_DIRECT_RESPONSE", "EMRI_TRAJ_WORKERS",
         }
         drift = {
             k: (self.v8.get(k), self.v9.get(k))
@@ -876,6 +880,185 @@ class SixMonthMBHBatchedTest(unittest.TestCase):
         self.assertGreaterEqual(clamped["n_start"], three.ind_min_t)
         self.assertLessEqual(clamped["n_start"] + clamped["Nt_keep"], three.ind_max_t + 1)
         self.assertLess(clamped["Nt_keep"], geom["Nt_keep"])
+
+
+def _emri_preflight_source(path):
+    """The python body of the launcher's EMRI preflight heredoc."""
+    with open(path) as fh:
+        lines = fh.read().split("\n")
+    start = next(i for i, l in enumerate(lines) if l.startswith("# EMRI PREFLIGHT."))
+    head = next(i for i in range(start, len(lines))
+                if lines[i] == "python - <<'PYEOF' || exit 2")
+    end = next(i for i in range(head + 1, len(lines)) if lines[i] == "PYEOF")
+    return "\n".join(lines[head + 1:end])
+
+
+class SixMonthEMRIDirectTest(unittest.TestCase):
+    """V9-26 (2026-10-02): emri_pe CAN score through the direct-to-WDM template.
+
+    ``EMRI_LIKELIHOOD=direct`` makes ``build_emri_move_runtime`` build
+    ``EMRIDirectLikeMove`` on every compute rank. The launcher default stays
+    ``full`` until the dense kernel's GPU timing beats production; the knobs,
+    the CPU reservation for the trajectory pool and the preflight are wired so
+    the switch is one launch-line variable."""
+
+    _KNOBS = ("EMRI_LIKELIHOOD", "EMRI_BATCH_MAX_SIZE", "EMRI_DIRECT_TABLE",
+              "EMRI_DIRECT_RESPONSE", "EMRI_TRAJ_WORKERS")
+
+    def setUp(self):
+        self.v9 = _exports(SIX_MO_V9)
+
+    def test_defaults(self):
+        self.assertEqual(self.v9["EMRI_LIKELIHOOD"], "full")
+        self.assertEqual(self.v9["EMRI_BATCH_MAX_SIZE"], "8")
+        self.assertEqual(self.v9["EMRI_DIRECT_RESPONSE"], "dense")
+        self.assertEqual(self.v9["EMRI_TRAJ_WORKERS"], "4")
+        self.assertTrue(self.v9["EMRI_DIRECT_TABLE"].endswith(
+            "/wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5"))
+        # the grid the table must match, and the edge crop that must clear its edges
+        self.assertEqual(self.v9["TOBS_TARGET"], "15552000")
+        self.assertEqual(self.v9["EDGE_CROP_WAVELETS"], "60")
+
+    def test_every_emri_knob_is_overridable_from_the_launch_line(self):
+        src = open(SIX_MO_V9).read()
+        for knob in self._KNOBS:
+            self.assertRegex(src, rf"(?m)^export {knob}=\$\{{{knob}:-", knob)
+
+    def test_dispatch_defaults_match_the_exports(self):
+        """The self-dispatch sizes --cpus-per-task BEFORE the job sees the EMRI
+        block, so it repeats two defaults; they must be the block's."""
+        src = open(SIX_MO_V9).read()
+        disp = src[: src.index('exec sbatch --partition="${_NGPU_PART}"')]
+        self.assertIn('"${EMRI_LIKELIHOOD:-%s}" = "direct"' % self.v9["EMRI_LIKELIHOOD"], disp)
+        self.assertIn("${EMRI_TRAJ_WORKERS:-%s}" % self.v9["EMRI_TRAJ_WORKERS"], disp)
+
+    def _dispatch(self, **env):
+        with tempfile.TemporaryDirectory() as stub_dir:
+            stub = os.path.join(stub_dir, "sbatch")
+            with open(stub, "w") as fh:
+                fh.write(_STUB_SBATCH)
+            os.chmod(stub, 0o755)
+            run_env = {k: v for k, v in os.environ.items()
+                       if k not in _DISPATCH_ENV_KEYS and k not in self._KNOBS}
+            run_env["PATH"] = stub_dir + os.pathsep + run_env.get("PATH", "")
+            run_env.update(NGPUS="4", **env)
+            res = subprocess.run(["bash", SIX_MO_V9], env=run_env, capture_output=True,
+                                 text=True, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return res.stdout.splitlines()
+
+    def test_direct_reserves_a_core_per_trajectory_worker(self):
+        # the extra cores feed ONLY the trajectory pool: ranks stay single-threaded
+        # (MPI-only policy), and the pool's spawned workers inherit OMP_NUM_THREADS=1
+        self.assertEqual(self.v9["OMP_NUM_THREADS"], "1")
+        self.assertIn("--cpus-per-task=2", self._dispatch())
+        self.assertIn("--cpus-per-task=6", self._dispatch(EMRI_LIKELIHOOD="direct"))
+        self.assertIn("--cpus-per-task=9",
+                      self._dispatch(EMRI_LIKELIHOOD="direct", EMRI_TRAJ_WORKERS="7"))
+        self.assertIn("--cpus-per-task=2",
+                      self._dispatch(EMRI_LIKELIHOOD="direct", EMRI_TRAJ_WORKERS="0"))
+
+    def _run_preflight(self, table_grid=(1440, 2.5), parity=("ok",), **env):
+        """Exec the launcher's EMRI preflight in-process: (exit code, stdout).
+
+        ``table_grid`` stubs ``WDMLookupTable.from_file`` ((Nf, dt) or None = the
+        real loader); ``parity`` stubs the GPU parity run's outcome."""
+        import contextlib
+        import io
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from lisatools.globalfit.stock.erebor import source_runtime  # noqa: F401
+
+        code = compile(_emri_preflight_source(SIX_MO_V9), "emri_preflight", "exec")
+        base = {k: self.v9[k] for k in self._KNOBS + ("EDGE_CROP_WAVELETS",)}
+        fd, table = tempfile.mkstemp(suffix=".h5")
+        os.close(fd)
+        self.addCleanup(os.remove, table)
+        base["EMRI_DIRECT_TABLE"] = table
+        base.update(env)
+
+        def fake_run(runner, suite):
+            res = unittest.TestResult()
+            res.testsRun = 1
+            if parity[0] == "fail":
+                res.failures.append((None, "boom"))
+            elif parity[0] == "skip":
+                res.skipped.append((None, "no GPU backend"))
+            return res
+
+        patches = [mock.patch.dict(os.environ, base),
+                   mock.patch("unittest.TextTestRunner.run", fake_run)]
+        if table_grid is not None:
+            patches.append(mock.patch(
+                "lisatools.domains.WDMLookupTable.from_file",
+                lambda path, force_backend=None: SimpleNamespace(Nf=table_grid[0],
+                                                                 data_dt=table_grid[1])))
+        out = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            with contextlib.redirect_stdout(out):
+                try:
+                    exec(code, {"__name__": "__main__"})
+                except SystemExit as exc:
+                    return exc.code, out.getvalue()
+        return 0, out.getvalue()
+
+    def test_the_shipped_block_passes_its_own_preflight(self):
+        rc, out = self._run_preflight()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("emri_pe scoring=full", out)
+
+    def test_direct_passes_with_a_matching_table_and_a_passing_gpu_parity(self):
+        rc, out = self._run_preflight(EMRI_LIKELIHOOD="direct")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("emri_pe scoring=direct batch<=8 response=dense traj_workers=4", out)
+        self.assertIn("edge_crop=60>=8", out)
+
+    def test_direct_refusals(self):
+        cases = [
+            (dict(EMRI_DIRECT_TABLE="/no/such/table.h5"), {}, "does not exist"),
+            ({}, dict(table_grid=(180, 20.0)), "built for Nf=180"),
+            ({}, dict(parity=("fail",)), "parity test"),
+            ({}, dict(parity=("skip",)), "skipped 1"),
+            (dict(EDGE_CROP_WAVELETS="4"), {}, "EDGE_CROP_WAVELETS=4"),
+            (dict(EMRI_DIRECT_RESPONSE="bogus"), {}, "EMRI_DIRECT_RESPONSE"),
+        ]
+        for env, kw, needle in cases:
+            with self.subTest(needle=needle):
+                rc, out = self._run_preflight(EMRI_LIKELIHOOD="direct", **kw, **env)
+                self.assertEqual(rc, 2, out)
+                self.assertIn("[EMRI-PREFLIGHT] REFUSING", out)
+                self.assertIn(needle, out)
+
+    def test_spline_response_skips_the_gpu_parity_run(self):
+        rc, out = self._run_preflight(parity=("fail",), EMRI_LIKELIHOOD="direct",
+                                      EMRI_DIRECT_RESPONSE="spline")
+        self.assertEqual(rc, 0, out)
+
+    def test_the_preflight_refuses_an_install_without_the_direct_move(self):
+        import sys
+        from unittest import mock
+
+        from lisatools.globalfit.stock.erebor import source_runtime  # noqa: F401
+
+        with mock.patch.dict(sys.modules, {"lisatools.globalfit.moves.emridirectmove": None}):
+            rc, out = self._run_preflight()
+        self.assertEqual(rc, 2, out)
+        self.assertIn("SILENTLY IGNORED", out)
+
+    def test_the_preflight_refuses_settings_that_ignore_the_env(self):
+        import functools
+        from unittest import mock
+
+        from lisatools.globalfit.stock.erebor import source_runtime as sr
+
+        stale = functools.partial(sr.SourceEMRISettings, likelihood="full")
+        with mock.patch.object(sr, "SourceEMRISettings", stale):
+            rc, out = self._run_preflight(EMRI_LIKELIHOOD="direct")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("but the settings resolve", out)
 
 
 class MpiPlacementTest(unittest.TestCase):
@@ -1362,6 +1545,11 @@ class ThreeMonthV9TwinTest(unittest.TestCase):
             # 90-day grid, so the documented MBHB_IDS=5 escape would die at
             # build. See SixMonthMBHBatchedTest.test_the_3mo_twin_does_not_inherit_it.
             "MBH_LIKELIHOOD", "MBH_BATCH_MAX_SIZE", "MBH_RESPONSE_ORDER",
+            # 3MO-8 (2026-10-02): nor is the 6mo EMRI direct-to-WDM block: no
+            # EMRI branch is armed here, and its lookup table is built for the
+            # 6-month grid's Nf and dt only.
+            "EMRI_LIKELIHOOD", "EMRI_BATCH_MAX_SIZE", "EMRI_DIRECT_TABLE",
+            "EMRI_DIRECT_RESPONSE", "EMRI_TRAJ_WORKERS",
         }
         keys = (set(self.three) | set(self.six)) - {"_", "SHLVL", "PWD"}
         diff = {k for k in keys

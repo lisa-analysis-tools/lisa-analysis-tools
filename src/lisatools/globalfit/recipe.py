@@ -53,6 +53,7 @@ from .moves import (
     ResidualAddOneRemoveOneMove,
     SOBBHChunkedLikeMove,
     MBHBatchedLikeMove,
+    EMRIDirectLikeMove,
     GBSpecialRJPriorMove,
     GBSpecialRJFStatGridMove,
     GBSpecialStretchMove,
@@ -5862,6 +5863,19 @@ class EMRIMoveBuilder(SingleSourcePEBuilder):
     #: ``emri.waveform_kwargs["mode_selection_threshold"]`` would otherwise
     #: ride this branch's like-kwargs into ``inner_product`` and TypeError.
     like_kwargs_strip_keys = frozenset({"mode_selection_threshold"})
+
+
+class EMRIDirectMoveBuilder(EMRIMoveBuilder):
+    """:class:`EMRIMoveBuilder` constructing :class:`EMRIDirectLikeMove`.
+
+    ``wave_gen`` stays the PRODUCTION generator (the residual expose/fold and the
+    fast-vs-slow cross-check); the direct-to-WDM adapter and the chunk size pass through
+    ``move_kwargs`` (``direct_gen=``, ``batch_max_size=``). The DCGA branch is skipped:
+    the move raises if handed one.
+    """
+
+    move_class = EMRIDirectLikeMove
+    use_dcga = False
 
 
 class SOBBHMoveBuilder(SingleSourcePEBuilder):

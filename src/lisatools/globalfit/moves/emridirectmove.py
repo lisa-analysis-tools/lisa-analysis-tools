@@ -1,0 +1,355 @@
+"""EMRI add/remove move scored by the direct-to-WDM template (``EMRI_LIKELIHOOD=direct``).
+
+:class:`EMRIDirectLikeMove` keeps ALL of :class:`ResidualAddOneRemoveOneMove`'s
+choreography (per-leaf expose/fold, in-model repeats, per-leaf tempering, eigen-table
+sweeps, replica replays) and swaps ONLY the scoring, as :class:`MBHBatchedLikeMove` and
+:class:`SOBBHChunkedLikeMove` do for their branches:
+
+* every chunk of ``batch_max_size`` rows is ONE
+  :meth:`~lisatools.sources.emri.direct_signal_gen.EMRIDirectWDMSignalGen.templates` call:
+  one FEW call per row, ONE dense TDI-on-the-fly response launch for the chunk, ONE
+  table lookup + scatter-add, cropped to the run's active WDM box;
+* every row is scored against ITS OWN container (per-walker residual and PSD), one
+  batched ``inner_product`` pair per walker in the chunk, one host pull per chunk;
+* the convention bridge is the SOBBH/MBH one: ``compute_like`` returns
+  ``offset[walker] + <r|h> - 1/2 <h|h>`` with ``offset = acs.likelihood()`` on the
+  freshly exposed residual, i.e. the container path's ``-1/2 <r-h|r-h>`` + noise term.
+
+The residual expose/fold STAYS on the production generator (the containers' installed
+``signal_gen``, the base class's per-row path): the direct template differs from the
+production one at the ~1e-4 mismatch level, so filling the shared residual with it would
+leave ``h_direct - h_production`` of every visited state behind in the residual every
+other branch sees, and the engine's residual rebuilds would disagree with the fills.
+Scoring is self-consistent either way: the leaf's ``prev_logl`` and every proposal are
+scored by the same direct generator against the same exposed residual.
+
+Two checks therefore carry a TOLERANCE here (``EMRI_CHECK_LL_TOL``, default 1 nat)
+instead of the base's exact-algebra gates, both on the COLD rung only:
+
+* :meth:`_verify_prev_logl` (every ``EMRI_CHECK_LL_EVERY``-th visit, default 10):
+  direct ``prev_logl`` vs the production container path at the same points;
+* :meth:`_verify_entry_vs_acs`: direct ``prev_logl`` on the exposed residual vs the
+  pre-expose full lnL (production template in the residual). The expose-sign class of
+  bug it exists for moves lnL by ~SNR^2, far above the tolerance.
+
+A chunk the direct path cannot build (any exception other than a per-row FEW domain
+refusal: GPU OOM, a table error, a missing compiled kernel) is scored through the
+per-row production container path, LOUDLY (warned once per leaf, counted in
+``n_batch_fallbacks`` and the ``[EMRI_DIRECT]`` telemetry). A row FEW refuses scores
+``-1e300``, as on the container path.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+
+import numpy as np
+
+from ...diagnostic import inner_product
+from ...domains import WDMSettings, WDMSignal
+from ...utils.device import device_context
+from ...utils.utility import asnumpy, get_array_module
+from .addremovemove import ResidualAddOneRemoveOneMove
+from .mbhbatchedmove import MBHBatchedLikeMove
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["EMRIDirectLikeMove"]
+
+
+class EMRIDirectLikeMove(ResidualAddOneRemoveOneMove):
+    """Add/remove move for the EMRI branch scored through the direct-to-WDM template.
+
+    Args:
+        *args: Positional arguments of :class:`ResidualAddOneRemoveOneMove`.
+            ``waveform_gen`` stays the production generator: it owns the cross-check.
+        direct_gen: the :class:`~lisatools.sources.emri.direct_signal_gen.EMRIDirectWDMSignalGen`,
+            or a ``DeviceLocalWaveGen`` resolving to one per device.
+        batch_max_size: rows per direct generation (``EMRI_BATCH_MAX_SIZE``). Each row
+            holds a full-grid ``(3, Nf, Nt)`` float64 accumulator while it is built
+            (~150 MB on the 6-month grid).
+        **kwargs: Keyword arguments of the base. ``dcga`` must be ``None``.
+    """
+
+    _record_dh_default = "1"
+    #: the cross-check re-scores the cold rung through the PRODUCTION generator
+    _check_ll_every_default = "10"
+
+    def __init__(self, *args, direct_gen=None, batch_max_size=8, **kwargs):
+        if kwargs.get("dcga") is not None:
+            raise ValueError(
+                "EMRIDirectLikeMove has no DCGA (replica) path: the direct generator scores "
+                "against the ACA containers directly, and multi-GPU walker shards are served "
+                "by per-shard routing inside compute_like_local. Build it without dcga= "
+                "(use_dcga=False)."
+            )
+        if direct_gen is None:
+            raise ValueError("EMRIDirectLikeMove requires direct_gen= (the direct-to-WDM adapter).")
+        super().__init__(*args, **kwargs)
+        self.direct_gen = direct_gen
+        self.batch_max_size = max(1, int(batch_max_size))
+        self._wdm = self.acs.acs.flatten()[0].data.settings
+        if not isinstance(self._wdm, WDMSettings):
+            raise ValueError(
+                "EMRI_LIKELIHOOD=direct needs a WDM run domain; the containers carry "
+                f"{type(self._wdm).__name__}."
+            )
+        self._exposed_offset = None
+        self._box_checked = False
+        self.n_batch_fallbacks = 0
+        self.last_batch_error = None
+        self._warned_fallback_leaf = None
+        self.check_ll_tol = float(os.environ.get(f"{self._dbg_prefix}_CHECK_LL_TOL", "1.0"))
+        self._gen_kwargs = dict(self.waveform_gen_kwargs or {})
+        self._stats = self._new_stats()
+
+    @staticmethod
+    def _new_stats():
+        return dict(leaf=None, rows=0, seconds=0.0, chunks=0, fallbacks=0, refused=0,
+                    gen_s=0.0, score_s=0.0)
+
+    # ------------------------------------------------------------------
+    # routing
+    # ------------------------------------------------------------------
+
+    def _adapter(self):
+        resolve = getattr(self.direct_gen, "_resolve", None)
+        return resolve() if callable(resolve) else self.direct_gen
+
+    def _split_rows(self, idx):
+        """``[(device, positions)]`` grouping ``idx`` rows by owning walker shard."""
+        return MBHBatchedLikeMove._split_rows_static(self.acs, idx)
+
+    def _device_context(self, device):
+        return device_context(getattr(self.acs, "xp", None), device)
+
+    # ------------------------------------------------------------------
+    # likelihood
+    # ------------------------------------------------------------------
+
+    def setup_likelihood_here(self, coords):
+        """Arm the per-walker exposed-residual offset."""
+        self._flush_stats()
+        self._exposed_offset = np.asarray(asnumpy(self.acs.likelihood()), dtype=float)
+        super().setup_likelihood_here(coords)
+
+    def compute_like_local(self, coords_in, data_index):
+        if self._dcga is not None:  # unreachable (ctor guard); keep loud
+            raise NotImplementedError("EMRIDirectLikeMove has no DCGA path.")
+        if self._exposed_offset is None:
+            raise RuntimeError(
+                "compute_like_local called before setup_likelihood_here armed the "
+                "exposed-residual offset (propose() choreography violated)."
+            )
+        t_start = time.perf_counter()
+        coords = np.atleast_2d(np.asarray(asnumpy(coords_in), dtype=np.float64))
+        idx = np.asarray(asnumpy(data_index)).astype(np.int64).reshape(-1)
+        n = int(coords.shape[0])
+        out = np.full(n, -1e300, dtype=float)
+        d_h = np.full(n, np.nan)
+        h_h = np.full(n, np.nan)
+        self._last_d_h = d_h
+        self._last_h_h = h_h
+        valid = np.all(np.isfinite(coords), axis=1)
+        if not np.any(valid):
+            return out
+        leaf = self._current_leaf
+        if self._stats["leaf"] is None:
+            self._stats["leaf"] = leaf
+        valid_pos = np.where(valid)[0]
+        for device, pos in self._split_rows(idx[valid_pos]):
+            rows = valid_pos[pos]
+            with self._device_context(device):
+                adapter = self._adapter()
+                for lo in range(0, rows.size, self.batch_max_size):
+                    sel = rows[lo: lo + self.batch_max_size]
+                    ll_c, dh_c, hh_c = self._score_chunk(adapter, coords[sel], idx[sel], leaf)
+                    out[sel] = ll_c
+                    d_h[sel] = dh_c
+                    h_h[sel] = hh_c
+                    self._stats["chunks"] += 1
+        self._stats["rows"] += n
+        self._stats["seconds"] += time.perf_counter() - t_start
+        return out
+
+    def _check_box(self, adapter):
+        """The adapter crops to ITS run-domain copy; scoring labels with the containers'
+        settings. They must be the same active box (``WDMSettings.__eq__`` ignores ``t0``)."""
+        if self._box_checked:
+            return
+        dom = getattr(adapter, "domain_settings", None)
+        if dom is not None and not (dom == self._wdm):
+            raise ValueError(
+                "EMRI direct generator crops to a different WDM active box than the "
+                f"containers hold: generator f[{dom.ind_min_f}:{dom.ind_max_f}] "
+                f"t[{dom.ind_min_t}:{dom.ind_max_t}] vs containers "
+                f"f[{self._wdm.ind_min_f}:{self._wdm.ind_max_f}] "
+                f"t[{self._wdm.ind_min_t}:{self._wdm.ind_max_t}]."
+            )
+        self._box_checked = True
+
+    def _score_chunk(self, adapter, coords, idx, leaf):
+        n = int(coords.shape[0])
+        self._check_box(adapter)                    # a configuration error: never masked
+        t_gen = time.perf_counter()
+        try:
+            arr, ok = adapter.templates(coords, **self._gen_kwargs)
+        except Exception as exc:  # noqa: BLE001 - scored exactly by the container path instead
+            return self._fallback(coords, idx, leaf, exc, t_gen)
+        t_score = time.perf_counter()
+        self._stats["gen_s"] += t_score - t_gen
+        ll = np.full(n, -1e300, dtype=float)
+        dh = np.full(n, np.nan)
+        hh = np.full(n, np.nan)
+        ok = np.asarray(ok, dtype=bool)
+        self._stats["refused"] += int((~ok).sum())
+        if np.any(ok):
+            pos = np.where(ok)[0]
+            xp = get_array_module(arr)
+            sub = arr if pos.size == n else arr[xp.asarray(pos)]
+            ll[pos], dh[pos], hh[pos] = self._score_templates(sub, idx[pos])
+        self._stats["score_s"] += time.perf_counter() - t_score
+        return ll, dh, hh
+
+    def _fallback(self, coords, idx, leaf, exc, t_gen):
+        self._stats["gen_s"] += time.perf_counter() - t_gen
+        self.n_batch_fallbacks += 1
+        self._stats["fallbacks"] += 1
+        self.last_batch_error = exc
+        if self._warned_fallback_leaf != leaf:
+            self._warned_fallback_leaf = leaf
+            logger.warning(
+                "[EMRI_DIRECT] leaf %s: direct batch failed (%s: %s); scoring %d rows through "
+                "the per-row production container path. Watch n_batch_fallbacks.",
+                leaf, type(exc).__name__, exc, int(coords.shape[0]),
+            )
+        t_score = time.perf_counter()
+        ll = np.real(np.asarray(
+            self.compute_acs_like(coords, idx, **self.waveform_like_kwargs), dtype=float
+        )).reshape(-1)
+        self._stats["score_s"] += time.perf_counter() - t_score
+        return ll, np.full(ll.shape, np.nan), np.full(ll.shape, np.nan)
+
+    def _score_templates(self, arr, idx):
+        """``(ll, <r|h>, <h|h>)`` for templates ``arr`` (n, nch, Nf_active, Nt_active)."""
+        like_kw = {
+            k: v for k, v in (self.waveform_like_kwargs or {}).items()
+            if k not in ("psd", "complex", "include_psd_info")
+        }
+        box = self._wdm
+        acs_flat = self.acs.acs.flatten()
+        xp = get_array_module(arr)
+        idx = np.asarray(idx, dtype=np.int64).reshape(-1)
+        n = int(idx.size)
+        order, dh_dev, hh_dev = [], [], []
+        for g in np.unique(idx):
+            rows_g = np.where(idx == g)[0]
+            h_g = WDMSignal(arr[xp.asarray(rows_g)], box)
+            r_box, _, s_box = acs_flat[int(g)]._slice_to_template(h_g)
+            dh_dev.append(xp.real(inner_product(r_box, h_g, psd=s_box, **like_kw)).reshape(-1))
+            hh_dev.append(xp.real(inner_product(h_g, h_g, psd=s_box, **like_kw)).reshape(-1))
+            order.append(rows_g)
+        both = asnumpy(xp.stack([xp.concatenate(dh_dev), xp.concatenate(hh_dev)]))
+        pos = np.concatenate(order)
+        dh = np.empty(n)
+        hh = np.empty(n)
+        dh[pos] = np.asarray(both[0], dtype=float)
+        hh[pos] = np.asarray(both[1], dtype=float)
+        ll = self._exposed_offset[idx] + dh - 0.5 * hh
+        return ll, dh, hh
+
+    # ------------------------------------------------------------------
+    # records, checks, telemetry
+    # ------------------------------------------------------------------
+
+    def _record_leaf_inner_products(self, new_state, add_coords_in, leaf):
+        """Record cold-chain ``<d|h>``, ``<h|h>`` from the direct scorer (one batch)."""
+        if not getattr(self, "record_inner_products", False):
+            return
+        _sub = (getattr(new_state, "sub_states", None) or {}).get(self.branch_name)
+        if _sub is None or getattr(_sub, "d_h", None) is None:
+            return
+        walker_idx = np.arange(self.nwalkers, dtype=np.int32)
+        self.compute_like(add_coords_in, walker_idx)
+        _sub.d_h[:, leaf] = self._last_d_h[: self.nwalkers]
+        _sub.h_h[:, leaf] = self._last_h_h[: self.nwalkers]
+
+    def _verify_prev_logl(self, prev_logl, old_coords_in, data_index_in, leaf):
+        """Direct ``prev_logl`` vs the production container path, COLD rung only.
+
+        The two templates differ (~1e-4 mismatch), so the gate is a tolerance
+        (``EMRI_CHECK_LL_TOL``) on the cold rung's max|diff|; hot rungs sit far from the
+        posterior, where any template difference is amplified through ``<r|delta h>``,
+        and are reported in the same line without gating."""
+        acs_like = (
+            self.compute_check_like(old_coords_in, data_index_in)
+            .reshape(prev_logl.shape)
+            .real
+        )
+        prev2 = np.atleast_2d(prev_logl)
+        acs2 = np.atleast_2d(acs_like)
+        both = (
+            np.isfinite(prev2) & np.isfinite(acs2)
+            & (prev2 > -1e299) & (acs2 > -1e299)
+        )
+        cold = both[0]
+        if not np.any(cold):
+            return
+        diff = prev2[0][cold] - acs2[0][cold]
+        max_abs = float(np.abs(diff).max())
+        if max_abs <= self.check_ll_tol:
+            return
+        hot = both[1:]
+        hot_txt = (
+            f"{float(np.abs(prev2[1:][hot] - acs2[1:][hot]).max()):.6e} over "
+            f"{int(hot.sum())} points" if np.any(hot) else "n/a"
+        )
+        msg = (
+            f"{self.branch_name} leaf {leaf}: direct-to-WDM fast path vs production container "
+            f"path disagree beyond tol={self.check_ll_tol} on the COLD rung: "
+            f"max|diff|={max_abs:.6e}, spread={float(diff.max() - diff.min()):.6e} over "
+            f"{int(cold.sum())} points (hot rungs, not gating: max|diff|={hot_txt}). A "
+            "difference ~ mismatch x SNR^2 is the template accuracy (lookup table, plunge "
+            "chunk, mode content); a large one means a time, frame or residual bug."
+        )
+        if self.check_ll_mode == "strict":
+            raise ValueError(msg)
+        logger.warning(msg)
+
+    def _verify_entry_vs_acs(self, prev_logl, cold_ref, leaf):
+        """The expose invariant with the template tolerance (see the module docstring)."""
+        if cold_ref is None:
+            return
+        cold = np.asarray(prev_logl[0], dtype=float)
+        ref = np.asarray(cold_ref, dtype=float).reshape(cold.shape)
+        both = np.isfinite(cold) & np.isfinite(ref) & (cold > -1e299) & (ref > -1e299)
+        if not np.any(both):
+            return
+        diff = cold[both] - ref[both]
+        max_abs = float(np.abs(diff).max())
+        if max_abs <= self.check_ll_tol:
+            return
+        msg = (
+            f"{self.branch_name} leaf {leaf}: EXPOSE INVARIANT VIOLATED -- cold direct "
+            f"prev_logl vs pre-expose ACS lnL (production template in the residual): "
+            f"max|diff| {max_abs:.6e}, median {float(np.median(diff)):.6e} over "
+            f"{int(both.sum())} walkers, tolerance {self.check_ll_tol} "
+            f"({self._dbg_prefix}_CHECK_LL_TOL). An expose-sign bug moves this by ~SNR^2."
+        )
+        if self.check_ll_mode == "strict":
+            raise ValueError(msg)
+        logger.warning(msg)
+
+    def _flush_stats(self):
+        st = self._stats
+        if st["rows"]:
+            logger.info(
+                "[EMRI_DIRECT] leaf %s: %d rows in %d chunks, %.1f s (%.3f s/row; "
+                "generate=%.2f s, score=%.2f s), %d fallbacks, %d rows refused by FEW",
+                st["leaf"], st["rows"], st["chunks"], st["seconds"],
+                st["seconds"] / st["rows"], st["gen_s"], st["score_s"],
+                st["fallbacks"], st["refused"],
+            )
+        self._stats = self._new_stats()

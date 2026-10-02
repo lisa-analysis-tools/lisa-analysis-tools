@@ -533,8 +533,17 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
   if [ "${_NODES}" -gt 1 ]; then
     _DIST_FLAG="--distribution=cyclic"
   fi
+  # CPUs per rank: 2, plus one core per EMRI trajectory-pool worker when emri_pe
+  # scores through the direct-to-WDM template (EMRI LIKELIHOOD block below; the
+  # two defaults here MUST match that block's exports -- pinned by
+  # tests/test_submit_scripts_layout.py::SixMonthEMRIDirectTest).
+  _CPT=2
+  if [ "${EMRI_LIKELIHOOD:-full}" = "direct" ]; then
+    _CPT=$(( 2 + ${EMRI_TRAJ_WORKERS:-4} ))
+  fi
+  echo "[SUBMIT] --cpus-per-task=${_CPT} (EMRI_LIKELIHOOD=${EMRI_LIKELIHOOD:-full}, EMRI_TRAJ_WORKERS=${EMRI_TRAJ_WORKERS:-4})"
   exec sbatch --partition="${_NGPU_PART}" --gres="${_GRES}" --nodes="${_NODES}" \
-       --ntasks="${NTASKS}" ${_DIST_FLAG} \
+       --ntasks="${NTASKS}" --cpus-per-task="${_CPT}" ${_DIST_FLAG} \
        --export=ALL,NGPUS="${NGPUS}",GPUS_PER_RANK="${GPUS_PER_RANK}",RANKS_PER_GPU="${RANKS_PER_GPU}",GF_LEGACY_RANK_LAYOUT="${GF_LEGACY_RANK_LAYOUT}" \
        "$0" "$@"
 fi
@@ -4656,6 +4665,142 @@ PYEOF
 # change, so it has to be recorded with the run.
 # Unset or empty reverts to the generator default (1e-5).
 export EMRI_EPS=1e-3
+
+# ============================================================================
+# EMRI LIKELIHOOD: DIRECT-TO-WDM (2026-10-02). Docs: docs/emri-direct-wdm.md
+# ============================================================================
+# EMRI_LIKELIHOOD=direct makes emri_pe an EMRIDirectLikeMove
+# (build_emri_move_runtime, stock/erebor/source_runtime.py; built on EVERY
+# compute rank). Each chunk of up to EMRI_BATCH_MAX_SIZE rows is one FEW call
+# per row (trajectory + amplitudes at the integrator knots, modes kept at
+# EMRI_EPS), ONE dense TDI-on-the-fly response launch for the chunk
+# (TDDenseTDIWaveform: exact DOPR853 dense-output phases, link geometry shared
+# across harmonics) and one n_ref WDM lookup-table pass + scatter-add, cropped
+# to this run's WDM box and scored against each walker's own residual AND PSD.
+# A harmonic that chirps off the table's fdot axis near a plunge hands off to
+# an even-start 128-layer TD chunk. In-model steps, eigen-table sweeps and the
+# inner-product record all score through it.
+# WHAT DOES NOT MOVE: the residual expose/fold, the engine residual rebuilds and
+# the cross-check stay on the production template (FEW + ResponseWrapper + dense
+# TD->WDM), so the shared residual every other branch sees is unchanged.
+# Accuracy vs production (docs/emri-direct-wdm.md): mismatch ~1e-4 (lookup
+# table) on inspirals, 1.3-2.5e-4 on in-window plunges at 5 s; 20 s grids alias
+# the high harmonics near plunge, this grid is 2.5 s. The cold-rung cross-check
+# warns past EMRI_CHECK_LL_TOL (default 1 nat; every 10th visit by default --
+# EMRI_CHECK_LL_EVERY=1 on the launch line for the first segment).
+# DEFAULT: full (the per-row production path) until the dense kernel's GPU
+# timing beats production on this cluster: before the dense kernel the direct
+# template measured 157 ms/row batched vs production 94 ms at eps 1e-3 on an
+# H100 (the TDI response dominated). To run it:
+#     EMRI_LIKELIHOOD=direct NGPUS=4 ./submit_gf_6mo_v9_4gpu.sh
+# with the lookup table at EMRI_DIRECT_TABLE (default: the repo root, where
+# scripts/wdm/build_wdm_lookup_gpu.py --out <name> writes it from here).
+# RESUME-SAFE: no stored shape changes; every leaf visit re-scores its
+# prev_logl, and the persisted EMRI eigen tables (built on the production
+# likelihood) are adopted until their next EMRI_EIGEN_REFRESH tick (MH-valid).
+# CPUs: with direct, EMRI_TRAJ_WORKERS spawn processes per compute rank integrate
+# a chunk's EMRI trajectories in parallel (few.trajectory.pool; only chunks of
+# >= EMRI_TRAJ_WORKERS rows -- the eigen sweeps -- since an in-model step here is
+# 2 rows); the self-dispatch above raises --cpus-per-task to
+# 2 + EMRI_TRAJ_WORKERS to give them cores. EMRI_TRAJ_WORKERS=0 = serial.
+# WATCH: [EMRI_DIRECT] "leaf N: R rows in C chunks ... s/row ..., F fallbacks,
+# K rows refused by FEW" (F must stay 0: a fallback is a chunk scored on the
+# slow path after a direct failure, warned once per leaf), "[EMRI_DIRECT]
+# trajectory pool: ... started (this process may run on N cores)", and the
+# warnings "direct-to-WDM fast path vs production container path disagree" and
+# "EXPOSE INVARIANT VIOLATED".
+export EMRI_LIKELIHOOD=${EMRI_LIKELIHOOD:-full}
+export EMRI_BATCH_MAX_SIZE=${EMRI_BATCH_MAX_SIZE:-8}
+export EMRI_DIRECT_TABLE=${EMRI_DIRECT_TABLE:-${PWD}/wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5}
+export EMRI_DIRECT_RESPONSE=${EMRI_DIRECT_RESPONSE:-dense}
+export EMRI_TRAJ_WORKERS=${EMRI_TRAJ_WORKERS:-4}
+#
+# EMRI PREFLIGHT. An unknown env var is SILENTLY IGNORED, so resolve the knobs
+# through the real settings class and the real consistency rule; for direct,
+# also open the table on this grid, check the edge crop clears the template's
+# zeroed edge layers, and run the dense kernel's GPU-vs-CPU parity test on this
+# node's GPU. Refuses before mpiexec on any gap.
+python - <<'PYEOF' || exit 2
+import dataclasses
+import inspect
+import os
+import sys
+
+try:
+    from lisatools.globalfit.moves.emridirectmove import EMRIDirectLikeMove  # noqa: F401
+    from lisatools.globalfit.stock.erebor.source_runtime import (
+        SourceEMRISettings, resolve_emri_direct_cfg)
+except ImportError as exc:
+    print("[EMRI-PREFLIGHT] REFUSING: the installed lisatools has no direct EMRI "
+          f"likelihood ({exc}). EMRI_LIKELIHOOD would be SILENTLY IGNORED. Pull dev "
+          "at/after the EMRI direct merge, or launch with EMRI_LIKELIHOOD=full.")
+    sys.exit(2)
+from lisatools.domains import WDMSettings
+from lisatools.globalfit.stock.erebor.variants.all_sources import AllSourcesGeneralSettings
+
+emri = SourceEMRISettings()
+want = (os.environ["EMRI_LIKELIHOOD"], int(os.environ["EMRI_BATCH_MAX_SIZE"]),
+        os.environ["EMRI_DIRECT_RESPONSE"], int(os.environ["EMRI_TRAJ_WORKERS"]))
+got = (emri.likelihood, int(emri.batch_max_size), emri.direct_response,
+       int(emri.traj_workers))
+if got != want:
+    print(f"[EMRI-PREFLIGHT] REFUSING: exported (likelihood, batch, response, "
+          f"traj_workers) = {want} but the settings resolve {got}.")
+    sys.exit(2)
+tdi_chan = {f.name: f for f in dataclasses.fields(AllSourcesGeneralSettings)}["tdi_chan"].default
+# this run's grid: Nf 1440 x Nt 4320 at dt 2.5 s
+try:
+    cfg = resolve_emri_direct_cfg(
+        emri, domain_settings=WDMSettings.make_factory(1440, 4320), tdi_chan=tdi_chan)
+except ValueError as exc:
+    print(f"[EMRI-PREFLIGHT] REFUSING: {exc}")
+    sys.exit(2)
+if cfg["emri_likelihood"] == "full":
+    print("[EMRI-PREFLIGHT] emri_pe scoring=full (per-row production path).")
+    sys.exit(0)
+
+from lisatools.domains import WDMLookupTable
+from lisatools.sources.emri.wdm_direct import EMRIDirectWDM
+
+table = WDMLookupTable.from_file(cfg["emri_direct_table"], force_backend="cpu")
+if int(table.Nf) != 1440 or abs(float(table.data_dt) - 2.5) > 1e-9:
+    print(f"[EMRI-PREFLIGHT] REFUSING: EMRI_DIRECT_TABLE={cfg['emri_direct_table']} is "
+          f"built for Nf={table.Nf}, dt={table.data_dt}; this grid is Nf=1440, dt=2.5.")
+    sys.exit(2)
+del table
+edge = inspect.signature(EMRIDirectWDM.__init__).parameters["pixel_edge"].default
+crop = int(os.environ.get("EDGE_CROP_WAVELETS", "20"))
+if crop < edge:
+    print(f"[EMRI-PREFLIGHT] REFUSING: EDGE_CROP_WAVELETS={crop} < the {edge} edge layers "
+          "the direct template leaves zero at each end of the grid.")
+    sys.exit(2)
+if cfg["emri_direct_response"] == "dense":
+    import unittest
+
+    try:
+        from tests import test_tdi_dense
+    except ImportError as exc:
+        print(f"[EMRI-PREFLIGHT] REFUSING: cannot import tests/test_tdi_dense.py ({exc}) "
+              "to prove the dense TDI kernel on this GPU.")
+        sys.exit(2)
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(test_tdi_dense.TDDenseGPUParityTest)
+    res = unittest.TextTestRunner(stream=sys.stdout, verbosity=1).run(suite)
+    if not res.wasSuccessful() or res.skipped or res.testsRun == 0:
+        print("[EMRI-PREFLIGHT] REFUSING: the dense TDI kernel's GPU-vs-CPU parity test "
+              f"did not pass on this node (run {res.testsRun}, failures "
+              f"{len(res.failures)}, errors {len(res.errors)}, skipped {len(res.skipped)}). "
+              "Rebuild lisatools (pip install -e . --no-build-isolation) or launch with "
+              "EMRI_LIKELIHOOD=full / EMRI_DIRECT_RESPONSE=spline.")
+        sys.exit(2)
+cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+if cpus is not None and int(cpus) < 1 + cfg["emri_traj_workers"]:
+    print(f"[EMRI-PREFLIGHT] WARNING: --cpus-per-task={cpus} < 1 + EMRI_TRAJ_WORKERS="
+          f"{cfg['emri_traj_workers']}: the trajectory workers will share cores (submit "
+          "through the self-dispatch, which sizes it).")
+print(f"[EMRI-PREFLIGHT] emri_pe scoring=direct batch<={cfg['emri_batch_max_size']} "
+      f"response={cfg['emri_direct_response']} traj_workers={cfg['emri_traj_workers']} "
+      f"table={cfg['emri_direct_table']} (Nf 1440, dt 2.5) edge_crop={crop}>={edge}")
+PYEOF
 
 # ============================================================================
 # FRESH-RUN GUARD (2026-08-15). This submission starts a NEW run in a NEW
