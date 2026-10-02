@@ -24,7 +24,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import emri_tof_xyz_threeway as W  # noqa: E402  (orbits/params loading, REF)
 
-NF, DT, NT = 180, 20.0, 1024
+DT = float(os.environ.get("GATE_DT", "20"))   # 20 s aliases the high harmonics near plunge: use 5 s for those
+NF, NT = int(round(3600.0 / DT)), 1024
 START_OFFSET_S = 5e4
 
 
@@ -89,22 +90,24 @@ def main():
         WD.WDM_HALF_SUPPORT_LAYERS = 0.0          # curvature never trips
     fdot_save = None
     direct = WD.EMRIDirectWDM(gen, table, wdm, orbits=orb, tdi_config=tdi, t_start=REF, data_t0=data_t0,
-                              mode_batch=16)
+                              mode_batch=16, response=os.environ.get("GATE_RESPONSE", "spline"))
     if args.no_handoff:
         fdot_save, direct.fdot_axis_max = direct.fdot_axis_max, np.inf
     t0 = time.perf_counter()
     h_dir = np.asarray(direct(*params, **kw).arr)
     t_dir = time.perf_counter() - t0
     print(f"EMRIDirectWDM: {direct.last_stats}, {t_dir:.1f} s", flush=True)
-    modes_used = modes if modes is not None else direct._mode_list(params, {"mode_selection_threshold": args.thresh})
+    modes_used = modes if modes is not None else direct._mode_list(params, {"mode_selection_threshold": args.thresh})[0]
 
     # tof reference: same response, dense TD -> WDM (modes in batches)
     t0 = time.perf_counter()
     tg = data_t0 + np.arange(NF * NT) * DT
     td = np.zeros((3, tg.size))
     for j in range(0, len(modes_used), 16):
+        tf = getattr(direct, "last_t_fine", None)          # the SAME fine grid as the direct template
         fly = EMRITDIonFly(gen, orb, tdi, DT, off + span + 2000.0, REF, frame="icrs_special",
-                           n_fine=direct.n_fine, t_fine_window=(data_t0, data_t0 + span))
+                           n_fine=None if tf is not None else direct.n_fine,
+                           t_fine_window=(data_t0, data_t0 + span), t_fine=tf)
         out = fly(*params, mode_selection=modes_used[j:j + 16])
         x = np.asarray(out.x)
         ins = np.flatnonzero((tg > x[:, 0].max()) & (tg < x[:, -1].min()))
@@ -123,6 +126,10 @@ def main():
     prod_kw = dict(mode_selection_threshold=args.thresh)
     if modes is not None:
         prod_kw["mode_selection"] = modes
+    elif os.environ.get("GATE_PROD_SAME_MODES"):
+        # production selects modes over ITS span (from the reference epoch), the direct
+        # template over the window: give production the direct template's modes
+        prod_kw["mode_selection"] = [tuple(m) for m in modes_used]
     hp = np.atleast_2d(np.asarray(wg(*params, **prod_kw)))[:3, offset_int:offset_int + tg.size]
     t_prod = time.perf_counter() - t0
     h_prod = np.asarray(TDSignal(hp, tds).transform(wdm).arr)

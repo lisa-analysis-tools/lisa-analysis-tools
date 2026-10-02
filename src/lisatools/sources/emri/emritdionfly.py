@@ -38,6 +38,29 @@ from lisatools.utils.constants import YRSID_SI
 from .domain import few_domain_guard
 
 
+class _SkipFew(Exception):
+    """Internal: a precomputed holder replaces the FEW call."""
+
+
+def host_holder(H):
+    """Host (numpy) copy of a FEW SparseInfoHolder.
+
+    On a GPU FEW generator the holder's arrays are cupy; the TOF feed, the harmonic tracks
+    and the mode bookkeeping are small host-side computations (the response itself runs on
+    the TOF backend), so everything downstream reads this copy.
+    """
+    import types
+
+    def _h(x):
+        return x.get() if hasattr(x, "get") else (np.asarray(x) if x is not None else None)
+
+    return types.SimpleNamespace(
+        t_arr=_h(H.t_arr), teuk_modes=_h(H.teuk_modes), phases=_h(getattr(H, "phases", None)),
+        freqs=_h(getattr(H, "freqs", None)), ylms=_h(H.ylms), ls=_h(H.ls), ms=_h(H.ms), ks=_h(H.ks),
+        ns=_h(H.ns), integrate_backwards=bool(getattr(H, "integrate_backwards", False)),
+    )
+
+
 class EMRITDIonFly:
     """Build the TDI response of a FEW EMRI waveform mode-by-mode on the fly.
 
@@ -79,7 +102,7 @@ class EMRITDIonFly:
     FRAMES = ("ecliptic", "icrs_special")
 
     def __init__(self, wave_gen, orbits, tdi_config, dt, Tobs, t0, delay_margin=600.0,
-                 frame="ecliptic", n_fine=None, t_fine_window=None):
+                 frame="ecliptic", n_fine=None, t_fine_window=None, t_fine=None):
         if frame not in self.FRAMES:
             raise ValueError(f"frame must be one of {self.FRAMES}, got {frame!r}")
         if n_fine is not None and int(n_fine) < 16:
@@ -94,6 +117,14 @@ class EMRITDIonFly:
         self.frame = frame
         self.n_fine = None if n_fine is None else int(n_fine)
         self.t_fine_window = t_fine_window
+        # explicit (possibly NON-uniform) fine times relative to t0: the input splines
+        # auto-detect general spacing and the response is evaluated point by point
+        self.t_fine = None
+        if t_fine is not None:
+            self.t_fine = np.unique(np.asarray(t_fine, dtype=float))
+            if self.t_fine.size < 16:
+                raise ValueError("t_fine needs >= 16 points")
+            self.n_fine = int(self.t_fine.size)
 
     # cancels the inc=0 kernel factor (1 + cos^2 0) = 2 of the TDI-on-the-fly response
     AMP_FACTOR = 1 / 2.0
@@ -136,6 +167,8 @@ class EMRITDIonFly:
 
     def _fine_times(self) -> np.ndarray:
         """Fine trajectory times, relative to ``t0`` (FEW's clock)."""
+        if self.t_fine is not None:
+            return self.t_fine
         if self.t_fine_window is None:
             lo, hi = 0.0, float(self.T)
         else:
@@ -173,6 +206,7 @@ class EMRITDIonFly:
         Phi_r0: float,
         *add_args: Optional[tuple],
         include_minus_mkn: bool = True,
+        holder=None,
         **kwargs: Optional[dict],
     ):
         # (qS, phiS, qK, phiK) are ECLIPTIC polar angles -> the FEW viewing
@@ -206,7 +240,15 @@ class EMRITDIonFly:
 
         # Out-of-domain (a, p0, e0) raises bare ValueError/AssertionError in
         # FEW; re-raise typed so the sampler can score the point at -1e300.
+        if holder is not None:
+            # a precomputed FEW sparse holder on THIS fine grid (EMRIDirectWDM's one FEW
+            # call): no second FEW call
+            if self.n_fine is None:
+                raise ValueError("EMRITDIonFly(holder=...) needs the fine grid it was made on (t_fine/n_fine)")
+            Kerr_wave = holder
         try:
+            if holder is not None:
+                raise _SkipFew()
             with few_domain_guard():
                 Kerr_wave = self.wave_gen(
                     m1,
@@ -227,17 +269,39 @@ class EMRITDIonFly:
                     include_minus_mkn=include_minus_mkn,
                     **kwargs,
                 )
+        except _SkipFew:
+            pass
         finally:
             if _ik_saved is not None:
                 _ik.clear()
                 _ik.update(_ik_saved)
 
+        t_arr_in, mode_amp, mode_phase, t_arr_tdi = self.prepare_feed(Kerr_wave, include_minus_mkn)
+        return self.run_response([(t_arr_in, mode_amp, mode_phase, t_arr_tdi, psi, lam, beta)])
+
+    def sky(self, qS, phiS, qK, phiK):
+        """(theta, phi) for FEW and (psi, lam, beta) for the response, in this instance's frame."""
+        theta, phi = get_viewing_angles(qS, phiS, qK, phiK)
+        psi = get_polarization_angle(qS, phiS, qK, phiK)
+        if self.frame == "icrs_special":
+            lam, beta = ecliptic_to_icrs(phiS, np.pi / 2 - qS)
+        else:
+            lam, beta = phiS, np.pi / 2 - qS
+        return theta, phi, psi, lam, beta
+
+    def prepare_feed(self, Kerr_wave, include_minus_mkn=True):
+        """Host holder -> (t_arr_in, mode_amp, mode_phase, t_arr_tdi) for the response."""
+        Kerr_wave = host_holder(Kerr_wave)   # GPU generator: cupy holder -> host copy
         self.last_holder = Kerr_wave   # consumers (EMRIDirectWDM) need the same trajectory's modes
         mode_amp, mode_phase = self.mode_amp_phase(
             Kerr_wave, include_minus_mkn=include_minus_mkn, amp_factor=self.AMP_FACTOR
         )
+        return self.prepare_feed_arrays(np.asarray(Kerr_wave.t_arr, dtype=float), mode_amp, mode_phase)
 
-        t_src = np.asarray(Kerr_wave.t_arr, dtype=float)
+    def prepare_feed_arrays(self, t_src, mode_amp, mode_phase):
+        """(t_src [FEW clock], amp (S, n), phase (S, n)) -> (t_arr_in, mode_amp, mode_phase, t_arr_tdi):
+        zero-amplitude continuation past an in-window stop and the delay-margin trim."""
+        t_src = np.asarray(t_src, dtype=float)
         if self.n_fine is not None and t_src.size > 2:
             # A plunge inside the requested window: FEW's fix_t cut the fine grid at the
             # trajectory end, and the delay trim below would then drop the last
@@ -259,30 +323,46 @@ class EMRITDIonFly:
         # Trim the TDI grid inside the waveform spline by the max response delay so
         # the delayed waveform queries (t - k.x) never fall outside the spline.
         dt_traj = float(t_arr_in[0, 1] - t_arr_in[0, 0]) if t_arr_in.shape[1] > 1 else self.dt
-        n_trim = max(1, int(np.ceil(self.delay_margin / dt_traj)) + 1)
-        t_arr_tdi = t_arr_in[:, n_trim:-n_trim]
+        steps = np.diff(t_src)
+        if steps.size and np.allclose(steps, steps[0], rtol=1e-9, atol=0.0):
+            n_trim = max(1, int(np.ceil(self.delay_margin / dt_traj)) + 1)
+            t_arr_tdi = t_arr_in[:, n_trim:-n_trim]
+        else:   # non-uniform feed: trim by TIME (one local step beyond the delay margin)
+            keep = ((t_src >= t_src[0] + self.delay_margin + steps[0])
+                    & (t_src <= t_src[-1] - self.delay_margin - steps[-1]))
+            t_arr_tdi = t_arr_in[:, keep]
         if t_arr_tdi.shape[1] < 4:
             raise ValueError(
                 f"EMRITDIonFly: only {t_arr_in.shape[1]} trajectory points; the {self.delay_margin:g} s "
                 "delay trim leaves too few for the response grid. Pass n_fine (e.g. span/80 s) "
                 "to feed a fine trajectory."
             )
-        num_sub = mode_amp.shape[0]
+        return t_arr_in, mode_amp, mode_phase, t_arr_tdi
 
+    def run_response(self, feeds):
+        """ONE TDI-on-the-fly response for every sub of every feed.
+
+        ``feeds``: list of ``(t_arr_in, mode_amp, mode_phase, t_arr_tdi, psi, lam, beta)`` (one per
+        template, e.g. from :meth:`prepare_feed`); all must share the fine-grid lengths. The
+        output's sub axis is the concatenation in feed order. Many templates in one call fill
+        the GPU (the kernel launches one block per sub)."""
+        t_in = np.concatenate([f[0] for f in feeds], axis=0)
+        amp = np.concatenate([f[1] for f in feeds], axis=0)
+        ph = np.concatenate([f[2] for f in feeds], axis=0)
+        t_tdi = np.concatenate([f[3] for f in feeds], axis=0)
+        num_sub = amp.shape[0]
         self.tdi_gen = TDTDIonTheFly(
-            t_arr_tdi,
-            mode_amp,
-            mode_phase,
+            t_tdi,
+            amp,
+            ph,
             self.dt,
             num_sub,
-            t_input=t_arr_in,
+            t_input=t_in,
             tdi_config=self.tdi_config,
             orbits=self.orbits,
         )
-
         inc = np.zeros(num_sub)
-        psi_in = np.full(num_sub, psi)
-        lam_in = np.full(num_sub, lam)
-        beta_in = np.full(num_sub, beta)
-        # sky + polarization in the ECLIPTIC frame, matching frame="ecliptic" orbits.
+        psi_in = np.concatenate([np.full(f[1].shape[0], f[4]) for f in feeds])
+        lam_in = np.concatenate([np.full(f[1].shape[0], f[5]) for f in feeds])
+        beta_in = np.concatenate([np.full(f[1].shape[0], f[6]) for f in feeds])
         return self.tdi_gen(inc, psi_in, lam_in, beta_in, return_spline=True)

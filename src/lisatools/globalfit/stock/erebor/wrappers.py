@@ -432,7 +432,7 @@ def get_mbh_phenom_wave_gen(
     higher_modes: Sequence[int] = (21, 33, 44),
     phenom_tol: float = 1e-12,
     start_freq: float = 7e-5,
-    response_order: int = 30,
+    response_order: int = 8,  # == MBH_PHENOM_DEFAULT_RESPONSE_ORDER (2026-09-29 ruling)
     buffer_time: float = 15_000.0,
     tdi_gen_str: str = "2nd generation",
     tdi_chan: str = "XYZ",

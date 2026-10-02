@@ -19,11 +19,83 @@ except (ImportError, ModuleNotFoundError) as e:
 from scipy.interpolate import CubicSpline as CubicSpline_scipy
 from gpubackendtools.interpolate import CubicSplineInterpolant
 
+
+# ---------------------------------------------------------------------------
+# Configured-orbits cache
+# ---------------------------------------------------------------------------
+# ``TDIonTheFly`` is constructed once per waveform evaluation, and its
+# ``orbits`` setter used to ``deepcopy`` the incoming (unconfigured) Orbits and
+# then trigger lazy configuration. ``Orbits._configure`` re-runs a scipy
+# CubicSpline over every orbit table component, which profiling (job 12930220)
+# measured at ~752 s of the 984 s spent in the MBH waveform call -- ~76% of the
+# whole run, redone identically on every call.
+#
+# ``_configure`` writes only plain numpy state (_ltt/_x/_n/_v, t, dt,
+# pycppdetector_args) and is backend-independent, so one configured instance is
+# reusable everywhere the configuration inputs match. Entries are shared, not
+# copied: copying a configured Orbits is itself GBs of memcpy. The response
+# path treats orbits as read-only; set ``LISATOOLS_ORBITS_CACHE=0`` to restore
+# the old per-instance deepcopy if you need to mutate them.
+_ORBITS_CONFIGURED_CACHE: dict = {}
+
+
+def _orbits_cache_key(orbits) -> Optional[tuple]:
+    """Identity of everything ``Orbits._configure`` depends on, or None."""
+    try:
+        parts = [
+            type(orbits).__module__,
+            type(orbits).__name__,
+            getattr(orbits, "frame", None),
+            getattr(orbits, "armlength", None),
+            getattr(orbits, "t0", None),
+            getattr(orbits, "filename", None),
+        ]
+        for name, val in sorted(getattr(orbits, "_configure_kwargs", {}).items()):
+            if isinstance(val, np.ndarray):
+                # hash contents: t_arr defines the output grid exactly
+                parts.append((name, val.shape, val.dtype.str, hash(val.tobytes())))
+            else:
+                parts.append((name, val))
+        return tuple(parts)
+    except Exception:
+        # Anything unhashable / unexpected -> no caching, old behaviour.
+        return None
+
+
+def _get_configured_orbits(orbits):
+    """Return a configured Orbits for ``orbits``, reusing an identical one."""
+    import os
+
+    if os.environ.get("LISATOOLS_ORBITS_CACHE", "1") == "0":
+        out = deepcopy(orbits)
+        out.pycppdetector_args
+        return out
+
+    if getattr(orbits, "configured", False):
+        # Already configured by the caller: honour it, don't re-spline.
+        return orbits
+
+    key = _orbits_cache_key(orbits)
+    if key is None:
+        out = deepcopy(orbits)
+        out.pycppdetector_args
+        return out
+
+    cached = _ORBITS_CONFIGURED_CACHE.get(key)
+    if cached is None:
+        cached = deepcopy(orbits)
+        # Force the (expensive) lazy configuration exactly once per key.
+        cached.pycppdetector_args
+        _ORBITS_CONFIGURED_CACHE[key] = cached
+    return cached
+
 from lisatools.detector import EqualArmlengthOrbits, Orbits
 from lisatools.utils.utility import AET
 from gpubackendtools import wrapper
             
 from ..utils.parallelbase import LISAToolsParallelModule
+from ..utils.stagetimer import TIMING, TIMERS, TIMER_COUNTS
+from ..utils.stagetimer import stage as _stage
 from .tdiconfig import TDIConfig
 
 # TODO: need to update constants setup
@@ -99,8 +171,10 @@ class TDIonTheFly(LISAToolsParallelModule):
         super().__init__(force_backend=force_backend)
 
         # setup orbits
-        self.orbits = orbits
-        self.tdi_config = tdi_config
+        with _stage("3a_orbits_setter", self.xp):
+            self.orbits = orbits
+        with _stage("3b_tdi_config_setter", self.xp):
+            self.tdi_config = tdi_config
         # setup TDI info
         
     @property
@@ -140,10 +214,14 @@ class TDIonTheFly(LISAToolsParallelModule):
         else:
             assert isinstance(orbits, Orbits)
 
-        self._orbits = deepcopy(orbits)
+        # Reuses an identically-configured Orbits instead of re-splining the
+        # orbit tables on every waveform call. See _get_configured_orbits.
+        with _stage("3a1_get_configured_orbits", self.xp):
+            self._orbits = _get_configured_orbits(orbits)
 
         # pycppdetector_args triggers lazy configuration if needed.
-        self.cpp_orbits = self.backend.OrbitsWrap(*self._orbits.pycppdetector_args)
+        with _stage("3a2_OrbitsWrap", self.xp):
+            self.cpp_orbits = self.backend.OrbitsWrap(*self._orbits.pycppdetector_args)
     
     @property
     def citation(self):
@@ -172,13 +250,15 @@ class TDIonTheFly(LISAToolsParallelModule):
         phase_ref = self.xp.zeros((self.N * self.num_sub), dtype=float)
         assert int(np.prod(self.t_arr.shape)) == self.N * self.num_sub
 
-        self.wave_gen.run_wave_tdi_wrap(
-            tdi_channels_arr,
-            tdi_amp, tdi_phase,
-            phase_ref,
-            params, self.t_arr.flatten().copy(),
-            self.N, self.num_sub, self.n_params, self.tdi_config.nchannels
-        )
+        _wg = self.wave_gen
+        with _stage("4b_run_wave_tdi_kernel", self.xp):
+            _wg.run_wave_tdi_wrap(
+                tdi_channels_arr,
+                tdi_amp, tdi_phase,
+                phase_ref,
+                params, self.t_arr.flatten().copy(),
+                self.N, self.num_sub, self.n_params, self.tdi_config.nchannels
+            )
         
         reshape_shape = (self.num_sub, self.tdi_config.nchannels, self.N)
         # Propagate THIS generator's backend to the output object (as the four
@@ -187,7 +267,7 @@ class TDIonTheFly(LISAToolsParallelModule):
         # to CUDA on any cupy-equipped box regardless of the generator's actual
         # backend -- so a CPU/numpy generator's arrays hit a cuda interpolant
         # in build_spline and raise the nanobind device mismatch.
-        return self.from_tdi_output(TDIOutput(
+        return self._timed_from_tdi_output(TDIOutput(
             self.t_arr,
             tdi_amp.reshape(reshape_shape),
             tdi_phase.reshape(reshape_shape),
@@ -195,6 +275,10 @@ class TDIonTheFly(LISAToolsParallelModule):
             force_backend=self.backend.name.split("_")[-1],
         ), fill_splines=return_spline)
     
+    def _timed_from_tdi_output(self, tdi_output, fill_splines=False):
+        with _stage("4c_from_tdi_output_splines", self.xp):
+            return self.from_tdi_output(tdi_output, fill_splines=fill_splines)
+
     def from_tdi_output(self, tdi_output: TDIOutput, fill_splines: Optional[bool] = False) -> FDTDIOutput:
         return tdi_output
 
@@ -236,8 +320,9 @@ class TDTDIonTheFly(TDIonTheFly):
             phase = self.xp.atleast_2d(self.xp.asarray(phase))
 
             # TODO: improve when gbt is fixed up
-            amp = CubicSplineInterpolant(t_input.copy(), amp, force_backend=self.backend.name.split("_")[-1])
-            phase = CubicSplineInterpolant(t_input.copy(), phase, force_backend=self.backend.name.split("_")[-1])
+            with _stage("3c_ampphase_spline_build", self.xp):
+                amp = CubicSplineInterpolant(t_input.copy(), amp, force_backend=self.backend.name.split("_")[-1])
+                phase = CubicSplineInterpolant(t_input.copy(), phase, force_backend=self.backend.name.split("_")[-1])
             
         elif isinstance(amp, CubicSpline_scipy):
             raise NotImplementedError
@@ -294,9 +379,10 @@ class TDTDIonTheFly(TDIonTheFly):
         # time.sleep(1.0)
     @property
     def wave_gen(self) -> callable:
-        self.cpp_amp = self.backend.CubicSplineWrap(*self.amp.cpp_class_args)
-        self.cpp_phase = self.backend.CubicSplineWrap(*self.phase.cpp_class_args)
-        self._wave_gen = self.backend.TDSplineTDIWaveformWrap(self.cpp_orbits, self.cpp_tdi_config, self.cpp_amp, self.cpp_phase)
+        with _stage("4a_wave_gen_wrap_build", self.xp):
+            self.cpp_amp = self.backend.CubicSplineWrap(*self.amp.cpp_class_args)
+            self.cpp_phase = self.backend.CubicSplineWrap(*self.phase.cpp_class_args)
+            self._wave_gen = self.backend.TDSplineTDIWaveformWrap(self.cpp_orbits, self.cpp_tdi_config, self.cpp_amp, self.cpp_phase)
         return self._wave_gen
     
     def from_tdi_output(self, tdi_output: TDIOutput, fill_splines: Optional[bool] = False) -> FDTDIOutput:
@@ -924,3 +1010,64 @@ class SOBBHTDIonTheFly(TDIonTheFly):
             phase_ref.reshape(self.t_arr.shape),
             force_backend=self.backend
         ), fill_splines=return_spline)
+
+class TDDenseTDIonTheFly(TDIonTheFly):
+    """Template-batched TD TDI-on-the-fly for multi-harmonic sources sharing one trajectory
+    (EMRIs), with EXACT phases from the integrator's 8th-order dense output.
+
+    Per template ``b``: the evaluation times ``t[b]`` (one common length ``N``), the
+    integrator knots ``t_knots[b, :n_knots[b]]`` and DOPR853 phase coefficients
+    ``phase_coeffs[b, K-1, 3, 8]`` (conventions -- massratio scaling, sign(xI0), the backwards
+    offset -- already applied). Per harmonic ``s`` (templates' harmonics contiguous,
+    ``sub_offsets``): integers ``sub_mkn[s] = (m, k, n)`` and a complex amplitude cubic spline
+    over its template's knots, ``amp_re/amp_im[s, K-1, 4]`` (monomial coefficients in
+    ``t - t_knot``). The strain term is ``amp_factor * c_s(t) * exp(-i Phi_s(t))``.
+
+    The kernel computes the link geometry once per (template, time) and reuses it for every
+    harmonic; the output is a :class:`TDTDIOutput` over all harmonics (``phase_ref`` = the pure
+    carrier ``Phi_s`` at spacecraft-1 time; the amplitude's phase lands in ``tdi_phase``).
+    """
+
+    def __init__(self, t, sub_offsets, sub_mkn, t_knots, n_knots, phase_coeffs, amp_re, amp_im,
+                 amp_factor=1.0, tdi_config=None, orbits=None, force_backend=None):
+        sub_offsets = np.asarray(sub_offsets.get() if hasattr(sub_offsets, "get") else sub_offsets, dtype=np.int32)
+        num_sub = int(sub_offsets[-1])
+        super().__init__(1.0, num_sub, n_params=4, tdi_config=tdi_config, orbits=orbits, force_backend=force_backend)
+        if self.backend.TDDenseTDIWaveformWrap is None:
+            raise RuntimeError("this lisatools backend module has no TDDenseTDIWaveformWrap; rebuild it")
+        xp = self.xp
+        self.t = xp.ascontiguousarray(xp.asarray(t, dtype=xp.float64))
+        self.n_temp, self.N = self.t.shape
+        self.sub_offsets = xp.asarray(sub_offsets, dtype=xp.int32)
+        sub_temp = np.repeat(np.arange(self.n_temp, dtype=np.int32), np.diff(sub_offsets))
+        self.sub_temp_host = sub_temp
+        self.sub_temp = xp.asarray(sub_temp, dtype=xp.int32)
+        self.sub_mkn = xp.ascontiguousarray(xp.asarray(sub_mkn, dtype=xp.int32).reshape(num_sub, 3))
+        self.K = int(np.asarray(t_knots.shape)[-1])
+        self.t_knots = xp.ascontiguousarray(xp.asarray(t_knots, dtype=xp.float64).reshape(self.n_temp, self.K))
+        self.n_knots = xp.asarray(n_knots, dtype=xp.int32)
+        self.phase_coeffs = xp.ascontiguousarray(xp.asarray(phase_coeffs, dtype=xp.float64).reshape(self.n_temp, self.K - 1, 3, 8))
+        self.amp_re = xp.ascontiguousarray(xp.asarray(amp_re, dtype=xp.float64).reshape(num_sub, self.K - 1, 4))
+        self.amp_im = xp.ascontiguousarray(xp.asarray(amp_im, dtype=xp.float64).reshape(num_sub, self.K - 1, 4))
+        self.amp_factor = float(amp_factor)
+        # the wrap keeps raw pointers: these arrays live on self
+        self.wave_gen = self.backend.TDDenseTDIWaveformWrap(
+            self.cpp_orbits, self.cpp_tdi_config, self.n_temp, self.K, num_sub, self.amp_factor,
+            self.sub_temp, self.sub_mkn.ravel(), self.n_knots, self.t_knots.ravel(),
+            self.phase_coeffs.ravel(), self.amp_re.ravel(), self.amp_im.ravel())
+
+    def __call__(self, params, return_spline: bool = True) -> "TDTDIOutput":
+        """``params``: (n_temp, 4) = (inc, psi, lam, beta) per template."""
+        xp = self.xp
+        params = xp.ascontiguousarray(xp.asarray(params, dtype=xp.float64).reshape(self.n_temp, 4))
+        nch = self.tdi_config.nchannels
+        S, N = self.num_sub, self.N
+        chans = xp.zeros(S * nch * N, dtype=complex)
+        amp = xp.zeros(S * nch * N, dtype=float)
+        phase = xp.zeros(S * nch * N, dtype=float)
+        phi_ref = xp.zeros(S * N, dtype=float)
+        self.wave_gen.run_wave_tdi_wrap(chans, amp, phase, phi_ref, params.ravel(), self.t.ravel(),
+                                        self.sub_offsets, N, 4, nch)
+        x = self.t[self.sub_temp]
+        return TDTDIOutput(x, amp.reshape(S, nch, N), phase.reshape(S, nch, N), phi_ref.reshape(S, N),
+                           fill_splines=return_spline, force_backend=self.backend.name.split("_")[-1])

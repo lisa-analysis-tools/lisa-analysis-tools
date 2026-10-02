@@ -759,8 +759,11 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
             os.environ.get(f"{p}_CHECK_LL")
             or os.environ.get("ADDREMOVE_CHECK_LL", "1")
         ).strip().lower()
+        # ``{BRANCH}_CHECK_LL_EVERY`` wins when set; otherwise the class
+        # default (every visit here; subclasses whose cross-check is a costly
+        # slow-path rebuild override ``_check_ll_every_default``).
         self.check_ll_every = max(
-            1, int(os.environ.get(f"{p}_CHECK_LL_EVERY", "1"))
+            1, int(os.environ.get(f"{p}_CHECK_LL_EVERY") or self._check_ll_every_default)
         )
         # Per-leaf cold-chain <d|h>/<h|h> sub-state record. On the slow
         # container path it costs one EXTRA nwalkers waveform batch per
@@ -1402,10 +1405,33 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
             return
         self.row_fanout.replay("ar_replay", payload, local_body=self._apply_cold_chain_replay)
 
+    def _replay_block_rows(self, coords):
+        """The rows of a replayed cold-chain batch that THIS rank's ACA holds.
+
+        A replay ships the flat body's cold-chain rows: one per walker of the
+        WHOLE ensemble, in global walker order. Under one walker block
+        (one-walker replica mode) every rank holds every walker, so that is
+        the whole batch. With several blocks AND replicas (the
+        ``GF_GPU_ROUTING`` both-axes layout) a rank's ACA holds only its
+        block ``[w0, w1)``: applying all N rows indexed ``0..N-1`` to a B-row
+        ACA fails the ``signal_operation`` bound (and with B > 1 would expose
+        another block's walkers into this one's rows). Expose, setup and fold
+        all go through here, so a rank's window/offset and the template it
+        later folds come from the same rows.
+        """
+        fanout = getattr(self, "fanout", None)
+        if self.row_fanout is None or fanout is None:
+            return coords
+        layout = fanout.layout
+        if int(getattr(layout, "n_blocks", 1)) <= 1:
+            return coords
+        w0, w1 = layout.block_of(fanout.rank)
+        return coords[int(w0):int(w1)]
+
     def _apply_cold_chain_replay(self, payload):
         kind = payload["kind"]
         self._current_leaf = int(payload["leaf"])
-        coords = np.asarray(payload["coords"], dtype=np.float64)
+        coords = self._replay_block_rows(np.asarray(payload["coords"], dtype=np.float64))
         if kind == "expose":
             self.remove_cold_chain_sources(coords)
         elif kind == "setup":
@@ -1432,6 +1458,8 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
     #: overrides): OFF on the slow container path (one extra nwalkers
     #: waveform batch per leaf); fast-kernel subclasses set "1".
     _record_dh_default = "0"
+    #: ``{BRANCH}_CHECK_LL_EVERY`` when the env var is unset (see _setup_debug)
+    _check_ll_every_default = "1"
 
     def _record_leaf_inner_products(self, new_state, add_coords_in, leaf):
         """Record this leaf's cold-chain ``<d|h>``, ``<h|h>`` on the sub-state.

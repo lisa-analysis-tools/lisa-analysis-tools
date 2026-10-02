@@ -4335,10 +4335,26 @@ export GB_SEARCH_3_WARM_EVERY=5
 # 0 writes at every boundary. Both pinned explicitly here rather than left
 # to the code defaults, because on a SPOT partition this is the knob that
 # decides how much a preemption costs.
-export MIDIT_CHECKPOINT=1
+# OVERRIDABLE from the command line since 2026-10-01 (it was a hard
+# `export MIDIT_CHECKPOINT=1`, so `MIDIT_CHECKPOINT=0 ./submit...` reached
+# nothing -- the documented knob-reaches-nothing failure). Mike's ruling for
+# the legged + ratcheted search: "MIDIT_CHECKPOINT=0 in the launch command
+# is good". Under GB_SEARCH_LEGS=1 a row lands after every leg, so the
+# checkpoint protects at most one leg of work, while its adoption rule
+# (checkpoint stored_iteration >= store iteration) cannot tell a harmless
+# startup copy from a half-nudged state: jobs 673/674 each ran the galfor
+# NUDGE and were stopped; ten more minutes and either would have written a
+# post-nudge checkpoint at stored iteration 47 that job 675 would have
+# adopted and nudged AGAIN (the job-672 double nudge by another door). The
+# default stays 1 for the unlegged runs.
+export MIDIT_CHECKPOINT=${MIDIT_CHECKPOINT:-1}
 export MIDIT_CHECKPOINT_MIN_INTERVAL=${MIDIT_CHECKPOINT_MIN_INTERVAL:-600}
-echo "[V9-CKPT] mid-iteration checkpoints ON, min interval ${MIDIT_CHECKPOINT_MIN_INTERVAL}s"
-echo "[V9-CKPT] watch: [MIDIT_CKPT] wrote ... at stored iteration N (boundary '...')"
+if [ "${MIDIT_CHECKPOINT}" = "1" ]; then
+  echo "[V9-CKPT] mid-iteration checkpoints ON, min interval ${MIDIT_CHECKPOINT_MIN_INTERVAL}s"
+  echo "[V9-CKPT] watch: [MIDIT_CKPT] wrote ... at stored iteration N (boundary '...')"
+else
+  echo "[V9-CKPT] mid-iteration checkpoints OFF (MIDIT_CHECKPOINT=${MIDIT_CHECKPOINT}); under GB_SEARCH_LEGS a row lands after every leg instead"
+fi
 
 # ============================================================================
 # CHANGE 3 OF 3 vs 3mo_v8 -- MBHB + EMRI + SOBHB (campaign S6). Non-empty
@@ -4499,6 +4515,114 @@ export EMRI_EIGEN_REFRESH=100
 # a table build failed and that leaf is sampling on identity/1%-width
 # tables (correct but slow -- MH corrects the shape); a steady stream of
 # them means arm the stretch escape and file the traceback.
+
+# ============================================================================
+# MBH LIKELIHOOD: BATCHED + WINDOWED (2026-09-30). Spec:
+#   docs/superpowers/specs/2026-09-29-mbh-batched-windowed-likelihood-design.md
+# ============================================================================
+# mbh_pe becomes MBHBatchedLikeMove (build_mbh_move_runtime,
+# stock/erebor/source_runtime.py; built on EVERY compute rank). Each chunk of
+# up to MBH_BATCH_MAX_SIZE rows is ONE grid-aligned phentax + response launch
+# on the leaf's own window -- 90 d before to 10 d after the median cold-chain
+# merger (+-1 d margin, 4 d discarded pad per side) -- transformed on its own
+# WDM segment and scored against each walker's own residual AND PSD. The
+# expose/fold, the in-model rows and the 243-row eigen-table sweep all go
+# through it. The per-row path it replaces measured 1.16-1.43 s/row (jobs
+# 373/487/558). GPU benchmark on THIS run's 6-month grid (H100):
+#     B= 8   0.037 s/row    +8.5 GB device memory per launch
+#     B=16   0.034 s/row   +18.5 GB
+#     B=24/32              ~+30 GB
+# B=8 IS PINNED (ruling 2026-09-30): 16 is only 8% faster per row for more than
+# twice the memory, and these cards also hold the GB buffers. In this layout
+# (NWALKERS=4 on 4 compute ranks = 1 walker/rank, MBH_NTEMPS=2) an in-model
+# step scores 2 rows and an expose/fold 1, so the cap binds only on the
+# eigen-table sweep -- that is where the +8.5 GB lands. The first call per
+# batch SHAPE pays ~25 s of JIT, once per shape per process.
+#
+# WHAT ELSE MOVES WITH IT (engine residual rebuild AND move, together):
+#   * waveform_duration = MBH_WINDOW_BEFORE_DAYS (90 d) instead of the per-row
+#     path's 1/12 yr (~30 d), for BOTH the windowed and the stock generator,
+#     so the residual rebuild, the scoring and the cross-check agree on the
+#     inspiral length. MBH_WAVEFORM_DURATION must stay UNSET and USE_TDIONFLY
+#     off: the build REFUSES either (resolve_mbh_batched_cfg; the preflight
+#     below runs that same rule before the allocation is spent).
+#   * the epoch snaps onto the data lattice (<= dt/2 = 1.25 s); t_plunge moves
+#     by the same amount, so absolute merger times do not change.
+# RESUME of a store sampled on the per-row path is SUPPORTED: no stored shape
+# changes. setup_acs rebuilds every residual with the 90 d snapped stock
+# generator and log_like is re-scored from it; MBH coords, nleaves (ids
+# 2,5,16,18) and the per-leaf ladder are untouched. The persisted MBH eigen
+# tables (<store>_eigen_tables.pkl, "mbh:<leaf>") were built on the OLD
+# likelihood and are ADOPTED until their next MBH_EIGEN_REFRESH tick --
+# MH-valid, just shaped for a 30 d template. A rebuild now costs ~10 s/leaf
+# rather than the 6.4 min quoted above; to force one, drop the "mbh:" entries
+# from that pickle before relaunching.
+# ESCAPE: MBH_LIKELIHOOD=full is the per-row container path the store ran so
+# far (add MBH_RESPONSE_ORDER=30 to match its response order as well).
+export MBH_LIKELIHOOD=${MBH_LIKELIHOOD:-batched}
+export MBH_BATCH_MAX_SIZE=${MBH_BATCH_MAX_SIZE:-8}
+# Response Lagrange order 8 = the code default since the batched merge (PR
+# #82: mismatch flat from order 30 down to 4; ~1.6x cheaper). The store ran
+# 30 until now, so it is pinned here for the run record.
+# MBH_RESPONSE_ORDER=30 on the launch line restores the old order.
+export MBH_RESPONSE_ORDER=${MBH_RESPONSE_ORDER:-8}
+# MBH_CHECK_LL_EVERY is deliberately NOT exported: the batched move defaults
+# it to 10 (every 10th leaf visit re-scores the cold rung through the stock
+# 90 d generator; warns past MBH_CHECK_LL_TOL = 0.5 nats). For the FIRST
+# segment on the new path, MBH_CHECK_LL_EVERY=1 on the launch line gives a
+# cross-check on every visit (one stock waveform per row on top).
+# WATCH: [MBH_BATCH] "leaf N: R rows ... s/row ..., F fallbacks,
+# outside_box=K" (F and K must stay 0 -- a steady K means the walkers' merger
+# times spread past MBH_WINDOW_MARGIN_DAYS); [MBH_FILL]; and the two warnings
+# "batched windowed fast path vs slow container path disagree" and
+# "EXPOSE INVARIANT VIOLATED". Device memory: gpu_util_*.csv around the first
+# mbh_pe eigen sweep (JAX's default allocator keeps what phentax took; if the
+# GB side gets tight, MBH_BATCH_MAX_SIZE=4 is the first lever).
+#
+# MBH PREFLIGHT. An unknown env var is SILENTLY IGNORED, so on an install that
+# predates the batched merge this block would quietly run the per-row path
+# while every line above says batched. Resolve the knobs through the real
+# settings class and the real consistency rule instead, and refuse on any gap.
+python - <<'PYEOF' || exit 2
+import os
+import sys
+
+try:
+    from lisatools.globalfit.moves.mbhbatchedmove import MBHBatchedLikeMove  # noqa: F401
+    from lisatools.globalfit.stock.erebor.source_runtime import (
+        SourceMBHSettings, resolve_mbh_batched_cfg)
+except ImportError as exc:
+    print("[MBH-PREFLIGHT] REFUSING: the installed lisatools has no batched MBH "
+          f"likelihood ({exc}). MBH_LIKELIHOOD would be SILENTLY IGNORED and "
+          "mbh_pe would run the per-row path. Pull dev at/after the batched MBH "
+          "merge, or launch with MBH_LIKELIHOOD=full.")
+    sys.exit(2)
+from lisatools.domains import WDMSettings
+
+mbh = SourceMBHSettings()
+# The resolver needs the run-domain spec (MBH_LIKELIHOOD=auto/batched check the
+# domain is WDM). This run's grid: Nf 1440 x Nt 4320 at dt 2.5 s.
+try:
+    cfg = resolve_mbh_batched_cfg(
+        mbh, domain_settings=WDMSettings.make_factory(1440, 4320))
+except ValueError as exc:
+    print(f"[MBH-PREFLIGHT] REFUSING: {exc}")
+    sys.exit(2)
+want = (os.environ["MBH_LIKELIHOOD"], int(os.environ["MBH_BATCH_MAX_SIZE"]),
+        int(os.environ["MBH_RESPONSE_ORDER"]))
+got = (cfg["mbh_likelihood"], int(cfg["mbh_batch_max_size"]),
+       int(mbh.response_order))
+if got != want:
+    print(f"[MBH-PREFLIGHT] REFUSING: exported (likelihood, batch, order) = "
+          f"{want} but the settings resolve {got}.")
+    sys.exit(2)
+dur = cfg["mbh_waveform_duration"]
+dur_txt = "full span" if dur is None else "%.1f d" % (float(dur) / 86400.0)
+print(f"[MBH-PREFLIGHT] mbh_pe scoring={got[0]} batch<={got[1]} "
+      f"response_order={got[2]} waveform_duration={dur_txt} window "
+      f"-{cfg['mbh_window_before'] / 86400.0:g}/+"
+      f"{cfg['mbh_window_after'] / 86400.0:g} d")
+PYEOF
 
 # EMRI MODE-SELECTION THRESHOLD (user ruling 2026-09-14). FEW's kwarg is
 # ``mode_selection_threshold``; ``eps`` is its FEW 1.x name and what we still

@@ -63,9 +63,11 @@ from ..source_runtime import (
     build_source_moves,
     default_source_ids,
     find_source_cfg,
+    mbh_injection_duration,
     prepare_emri_branch,
     prepare_mbh_branch,
     prepare_sobbh_branch,
+    run_domain_spec,
     source_signal_cfg,
 )
 
@@ -388,7 +390,9 @@ class FullYearCombinedGlobalFit(EreborFit):
                 tdi_gen_str=gs.tdi_gen_str,
                 sobbh_reference_time=gs.sobbh_reference_time,
                 mbh_phenom_kwargs=dict(
-                    waveform_duration=mbh.waveform_duration,
+                    waveform_duration=mbh_injection_duration(
+                        mbh, domain_settings=gs.domain_settings
+                    ),
                     higher_modes=mbh.higher_modes,
                     phenom_tol=mbh.phenom_tol,
                     start_freq=mbh.start_freq,
@@ -490,7 +494,11 @@ class FullYearCombinedGlobalFit(EreborFit):
         mbh = _prep("mbh", FullYearMBHSettings())
         sobbh = _prep("sobbh", FullYearSOBBHSettings())
         emri = _prep("emri", FullYearEMRISettings())
-        cfg = source_signal_cfg(gs, mbh, sobbh, emri)
+        # The run-domain SPEC the injection site resolved MBH_LIKELIHOOD=auto
+        # from (set_default_processor sees the resolved general settings).
+        cfg = source_signal_cfg(
+            gs, mbh, sobbh, emri, domain_settings=run_domain_spec(self.general_info)
+        )
         for branch in self.branch_names:
             info = self.source_info[branch]
             info.signal_gen = SourceSignalGen(branch, info.transform, self.general_info, cfg)

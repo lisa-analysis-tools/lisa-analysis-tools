@@ -25,7 +25,7 @@ mode thresholds 1e-3 and 1e-7; dlogL difference <= 4e-7. Signed off 2026-09-30.
 | mode threshold | table interp | modes | direct vs production | norm ratio vs production | direct vs data | production vs data |
 |---|---|---|---|---|---|---|
 | 1e-3 (production EMRI_EPS) | linear | 38 | 1.05e-6 | 0.99973-0.99976 | 0.10 | 0.10 |
-| 1e-3 (production EMRI_EPS) | **cubic (default)** | 38 | **3.5e-8** | **0.999995-0.999997** | 0.10 | 0.10 |
+| 1e-3 (production EMRI_EPS) | **cubic** (spline default since 09-30, same accuracy) | 38 | **3.5e-8** | **0.999995-0.999997** | 0.10 | 0.10 |
 | 1e-5 | linear | 111 | 1.11e-6 | not measured | 2.6e-3 | 2.6e-3 |
 
 The normalised mismatch alone hid a 2.5e-4 amplitude deficit with linear table interpolation
@@ -110,13 +110,66 @@ EMRI 1, 6 months (data SNR 21.8), production template:
 | 1e-4 | 67 | 0.37 | 0.27 | 1.0002 |
 | 1e-5 | 112 | 0.037 | 0.027 | 0.9998 |
 
+**Aliasing at 20 s (09-30).** On the plunging gate source, TDI-on-the-fly vs production per
+harmonic was 3e-3..0.8 for m >= 3 at dt = 20 s and drops to 3e-5..4e-4 at dt = 5 s ((4,4,0,1)
+5.3e-2 -> 2.5e-5, (6,6,0,2) 0.79 -> 4e-5): near the plunge the high harmonics exceed the 25 mHz
+Nyquist of the 20 s grid. The response is fine; 20 s grids (the laptop table, the CD1L campaign
+script) are unsafe for EMRIs plunging inside the window. Production (2.5 s) is not affected.
+
+**GPU timing (09-30, H100 cuda13x, 6 months, production grid, EMRI 1, batch of 64 in chunks of
+16):** direct 157 ms/template at eps 1e-3 (38 modes) and 418 ms at 1e-5 (112 modes) vs production
+94 / 101 ms. Per template: FEW 11 ms (knot feed), response kernel 79 / 223 ms, harmonic tracks
+(CPU) 21 / 53 ms, tracer 4 / 11 ms, lookup 6 / 16 ms. The response kernel recomputes the full
+geometry per (harmonic, time): the next step is a kernel that shares it across the harmonics of a
+template (plan: ~/.claude/plans/emri-tof-dense-phase-overnight.md).
+
+## Dense-phase response kernel (`TDDenseTDIonTheFly`, 10-01)
+
+`response="dense"` in `EMRIDirectWDM` feeds a new, opt-in TD TDI-on-the-fly kernel
+(`TDDenseTDIWaveform`, lat_spline_tdi_waveform.{hh,cu}; binding `TDDenseTDIWaveformWrap`):
+
+- per template: the integrator's knots and DOPR853 8th-order dense-output phase coefficients
+  (re-expressed exactly on FEW's holder knots, whose last knot FEW cuts at T); per harmonic: the
+  integers (m, k, n) and a complex amplitude cubic spline over the knots
+  (`dense_inputs_from_holder`). The phase is exact everywhere: no fine-grid phase splines.
+- kernel 1, one thread per (template, time): the link geometry and the three fundamental phases
+  are computed ONCE per TDI unit and reused by every harmonic (unit term
+  `sign * pre * (xi_p A_p + xi_c A_c) (z_em - z_rec)`, `z = amp_factor c exp(-i Phi)`); many
+  templates per launch. Delayed times outside the trajectory contribute zero (plunge without a
+  feed extension); the reference phase continues linearly outside the trajectory.
+- kernel 2, one block per harmonic: the existing amplitude/phase extraction + unwrap.
+
+CPU results (laptop): EMRI 1, 16 d: mismatch vs production 3.55e-8 (= spline response), whole
+template 1.6 s -> 0.8 s. Plunging single harmonic: direct vs production 1.5-1.7e-5 over the
+window, 7e-6 in the last 1% (spline response: 9e-6..1.2e-5). Tests: `tests/test_tdi_dense.py`
+(== the spline-fed kernel to 1e-9 on exactly representable input, 2 templates x 5 harmonics,
+inc != 0; polarisation and strain-sign mutations caught), `tests/test_emri_dense_inputs.py`.
+The CUDA build of the kernel has NOT been compiled or run yet.
+
+More CPU checks (10-01):
+
+| check | result |
+|---|---|
+| EMRI 1, eps 1e-5 (111-112 modes), dense vs spline response, wall | 16 d 1.6 vs 3.8 s; 60 d 5.4 vs 15.3 s; 180 d 16.0 vs 49.8 s |
+| same, dense vs spline template | mismatch <= 4e-13, norm ratio 1.0000000 |
+| plunging source, 69 modes, dt 5 s (table NF720_DT5), dense direct vs production | whole window 1.3-2.5e-4; < 0.9 t_p 7.5-9.2e-5 (table); 0.9-0.99 3.8-6.0e-6; last 1% 5.9e-4..1.2e-3 |
+| same at dt 20 s | 2.6-4.7e-2 (aliasing of m >= 3 near plunge) |
+| per mode, dense response vs production at 5 s | (2,2,0,0) 2.5e-6, (4,4,0,1) 2.0e-5, (3,3,0,2) 1.5e-4, (5,5,0,0) 1.8e-4; the last two entirely in the final 1% before plunge (production's interpolated strain across the abrupt stop) |
+
+Lookup memory: the table call is chunked (`EMRI_DIRECT_LOOKUP_CHUNK`, default 2e6 entries).
+
 ## Open items
 
 1. (resolved) TOF vs production at the abrupt plunge end.
 2. Table resolution (fdot direction; cubic fixed the f-direction bias): finer fdot rows near 0 (where most pixels sit) to reach the model's
    ~1e-4 per-pixel level; production-grid table (Nf 1440, dt 2.5) on the cluster GPU.
-3. Speed: EMRIDirectWDM is Python per harmonic and channel on CPU (88 s for 38 modes, 16 d).
-   The GPU work (FEW Part B) and a vectorised lookup are the path.
+3. Speed (09-30): EMRI 1, 16 d, 38 modes, laptop CPU: 27 s -> 2.75 s with the same mismatch vs
+   production (3.6e-8). Changes: the response is fed on a 1800 s grid when no harmonic hands off
+   inside the window (coarse + 80 s from the earliest handoff otherwise; TOF accepts non-uniform
+   times); one vectorised table call + one scatter-add per batch; interpolation `"spline"` (uniform
+   cubic B-spline via ndimage, same code on scipy/cupyx; default); one tracer spline call.
+   Remaining CPU cost: two FEW calls (~1.4 s) and the response (~0.9 s). Code is numpy/cupy
+   agnostic but has NOT run on a GPU yet: `scripts/emri/emri_batch_speed.py --direct-table`.
 4. Memory: every FEW EMRI generator reads the whole 5.1 GB amplitude file at construction
    (`few/amplitude/ampinterp2d.py:235`), a ~6 GB transient footprint. One per process.
 5. EMRIs 0, 2-7: their L1 bricks are not on the laptop; run

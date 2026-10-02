@@ -128,6 +128,9 @@ class LISAToolsBackendMethods(BackendMethods):
     gb_inmodel_accept_apply: typing.Optional[typing.Callable[(...), None]] = (
         dataclasses.field(default=None, kw_only=True)
     )
+    # Template-batched TD TDI-on-the-fly with exact dense-output phases (EMRI,
+    # 2026-09-30). ``None`` on a module built before it landed.
+    TDDenseTDIWaveformWrap: typing.Optional[object] = dataclasses.field(default=None, kw_only=True)
 
 
 class LISAToolsBackend:
@@ -162,6 +165,7 @@ class LISAToolsBackend:
     # the loaded backend module does not carry them.
     gb_inmodel_gate_compact: typing.Optional[typing.Callable[(...), None]]
     gb_inmodel_accept_apply: typing.Optional[typing.Callable[(...), None]]
+    TDDenseTDIWaveformWrap: typing.Optional[object]
     # Phase 3L.7k LISA-response Wraps (see LISAToolsBackendMethods).
     TDSplineTDIWaveformWrap: object
     FDSplineTDIWaveformWrap: object
@@ -196,6 +200,7 @@ class LISAToolsBackend:
         # Global-fit routing kernels (gf_routing_kernels.cu).
         self.gb_inmodel_gate_compact = lisatools_backend_methods.gb_inmodel_gate_compact
         self.gb_inmodel_accept_apply = lisatools_backend_methods.gb_inmodel_accept_apply
+        self.TDDenseTDIWaveformWrap = lisatools_backend_methods.TDDenseTDIWaveformWrap
         # Phase 3L.7k -- LISA-response wraps absorbed from
         # fastlisaresponse cutils backend (which is being retired).
         self.TDSplineTDIWaveformWrap = lisatools_backend_methods.TDSplineTDIWaveformWrap
@@ -258,6 +263,7 @@ class LISAToolsCpuBackend(CpuBackend, LISAToolsBackend):
             # imports; the GB_INMODEL_ACCEPT_KERNEL call site checks for None.
             gb_inmodel_gate_compact=getattr(_lat_pd, "gb_inmodel_gate_compact", None),
             gb_inmodel_accept_apply=getattr(_lat_pd, "gb_inmodel_accept_apply", None),
+            TDDenseTDIWaveformWrap=getattr(_lat_pd, "TDDenseTDIWaveformWrapCPU", None),
             # Phase 3L.7k LISA-response wraps absorbed from fastlisaresponse.
             TDSplineTDIWaveformWrap=_lat_pd.TDSplineTDIWaveformWrapCPU,
             FDSplineTDIWaveformWrap=_lat_pd.FDSplineTDIWaveformWrapCPU,
@@ -332,6 +338,7 @@ class LISAToolsCuda11xBackend(Cuda11xBackend, LISAToolsBackend):
             # imports; the GB_INMODEL_ACCEPT_KERNEL call site checks for None.
             gb_inmodel_gate_compact=getattr(_lat_pd, "gb_inmodel_gate_compact", None),
             gb_inmodel_accept_apply=getattr(_lat_pd, "gb_inmodel_accept_apply", None),
+            TDDenseTDIWaveformWrap=getattr(_lat_pd, "TDDenseTDIWaveformWrapGPU", None),
             # Phase 3L.7k LISA-response wraps absorbed from fastlisaresponse.
             TDSplineTDIWaveformWrap=_lat_pd.TDSplineTDIWaveformWrapGPU,
             FDSplineTDIWaveformWrap=_lat_pd.FDSplineTDIWaveformWrapGPU,
@@ -403,6 +410,7 @@ class LISAToolsCuda12xBackend(Cuda12xBackend, LISAToolsBackend):
             # imports; the GB_INMODEL_ACCEPT_KERNEL call site checks for None.
             gb_inmodel_gate_compact=getattr(_lat_pd, "gb_inmodel_gate_compact", None),
             gb_inmodel_accept_apply=getattr(_lat_pd, "gb_inmodel_accept_apply", None),
+            TDDenseTDIWaveformWrap=getattr(_lat_pd, "TDDenseTDIWaveformWrapGPU", None),
             # Phase 3L.7k LISA-response wraps absorbed from fastlisaresponse.
             TDSplineTDIWaveformWrap=_lat_pd.TDSplineTDIWaveformWrapGPU,
             FDSplineTDIWaveformWrap=_lat_pd.FDSplineTDIWaveformWrapGPU,
@@ -475,6 +483,7 @@ class LISAToolsCuda13xBackend(Cuda13xBackend, LISAToolsBackend):
             # imports; the GB_INMODEL_ACCEPT_KERNEL call site checks for None.
             gb_inmodel_gate_compact=getattr(_lat_pd, "gb_inmodel_gate_compact", None),
             gb_inmodel_accept_apply=getattr(_lat_pd, "gb_inmodel_accept_apply", None),
+            TDDenseTDIWaveformWrap=getattr(_lat_pd, "TDDenseTDIWaveformWrapGPU", None),
             # Phase 3L.7k LISA-response wraps absorbed from fastlisaresponse.
             TDSplineTDIWaveformWrap=_lat_pd.TDSplineTDIWaveformWrapGPU,
             FDSplineTDIWaveformWrap=_lat_pd.FDSplineTDIWaveformWrapGPU,

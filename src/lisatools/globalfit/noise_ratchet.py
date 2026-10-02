@@ -107,6 +107,12 @@ class RatchetSchedule:
     hold: int
     release: int
     cycles: int
+    #: User design 2026-10-02: start with a RELEASE (the noise search to
+    #: convergence) before the first nudge. On a store whose noise was pinned
+    #: through the earlier stages the first release IS the first fit of the
+    #: noise to the data; every nudge after it is then measured against a
+    #: converged baseline rather than against the pinned start vector.
+    release_first: bool = False
 
     def __post_init__(self):
         for name in ("hold", "release", "cycles"):
@@ -116,18 +122,36 @@ class RatchetSchedule:
                     f"RatchetSchedule.{name}={v!r} must be an integer >= 1 "
                     f"(hold counts the nudge iteration itself).")
             object.__setattr__(self, name, int(v))
+        object.__setattr__(self, "release_first", bool(self.release_first))
 
     @property
     def cycle_length(self) -> int:
         return self.hold + self.release
 
-    def action(self, k: int) -> str:
+    @property
+    def total_iterations(self) -> int:
+        """Stage-local iterations the schedule spans before "release forever"."""
+        return self.cycles * self.cycle_length + (1 if self.release_first else 0)
+
+    def _shift(self, k: int) -> int:
         k = int(k)
         if k < 0:
             raise ValueError(f"stage-local iteration {k} < 0")
-        if k // self.cycle_length >= self.cycles:
+        return k - 1 if self.release_first else k
+
+    def cycle_of(self, k: int) -> int:
+        """1-based cycle number of stage-local iteration ``k`` (0 = the
+        leading release of a release-first schedule)."""
+        ks = self._shift(k)
+        return 0 if ks < 0 else ks // self.cycle_length + 1
+
+    def action(self, k: int) -> str:
+        ks = self._shift(k)
+        if ks < 0:
             return "release"
-        p = k % self.cycle_length
+        if ks // self.cycle_length >= self.cycles:
+            return "release"
+        p = ks % self.cycle_length
         if p == 0:
             return "nudge"
         return "hold" if p < self.hold else "release"
@@ -166,9 +190,31 @@ def ratchet_from_env():
         release=_env_int("GALFOR_RATCHET_RELEASE", 2),
         # TWO nudges by default (user ruling 2026-09-30, "do at least 2
         # cycles for now"); see STEP SIZE in the module docstring for what the
-        # second one does to a fit that did not climb back.
+        # second one does to a fit that did not climb back. With
+        # GALFOR_RATCHET_MIN_GAIN set this is a CEILING: the data-driven stop
+        # (min_gain_from_env) ends the ratcheting earlier.
         cycles=_env_int("GALFOR_RATCHET_CYCLES", 2),
+        release_first=os.environ.get("GALFOR_RATCHET_RELEASE_FIRST", "0").strip() in _TRUE,
     )
+
+
+def min_gain_from_env() -> float:
+    """``GALFOR_RATCHET_MIN_GAIN``: the data-driven stop of the ratchet.
+
+    User design 2026-10-02: "do two step cycles (ratchet/hold, release) until
+    the max logL does not change by some threshold. Something that is a real
+    step. This first ratchet went up by ~1000s. If get a step that causes
+    less than ~200 logL, no more ratcheting." After every RELEASE iteration
+    the step records the maximum cold log-likelihood over the walkers; when
+    the gain over the previous release's maximum is below this many nats the
+    schedule stops nudging: the gate stays released (rider mode) and the
+    stage ends on its ordinary per-band shut-off rule. 0 (the default) keeps
+    the schedule alone in charge.
+    """
+    v = _env_float("GALFOR_RATCHET_MIN_GAIN", 0.0)
+    if v < 0:
+        raise ValueError(f"GALFOR_RATCHET_MIN_GAIN={v} must be >= 0 (0 = off).")
+    return v
 
 
 def nudge_delta_from_env() -> np.ndarray:
@@ -205,6 +251,35 @@ def is_noise_ratchet_gate(obj) -> bool:
     return bool(getattr(obj, "is_noise_ratchet_gate", False))
 
 
+def reset_maxlogl_search(move) -> bool:
+    """Forget a :class:`MaxLogLCombineMove`'s plateau bookkeeping.
+
+    The chunked plateau loop keeps its per-walker baselines, flat counters
+    and the ``maxlogl_plateau_done`` verdict ON THE INSTANCE across propose
+    calls, so that a killed stage resumes mid-search. Inside a held stage
+    that persistence has a second effect: once the loop has declared a
+    plateau, every later propose takes ONE inner round and returns ("a
+    plateaued instance keeps taking one inner iteration per call"). 6mo job
+    675's first release ran 17 rounds and declared done; its second release
+    ran one round in 2 s against a residual that had changed by a whole GB
+    cycle. User ruling 2026-10-02: the psd and galfor branches run in
+    SEARCH mode until the log-likelihood converges -- on every release.
+
+    Returns True when there was state to clear. Safe on any object.
+    """
+    had = hasattr(move, "_ml_state") or bool(getattr(move, "maxlogl_plateau_done", False))
+    if hasattr(move, "_ml_state"):
+        try:
+            del move._ml_state
+        except AttributeError:
+            pass
+    try:
+        move.maxlogl_plateau_done = False
+    except AttributeError:
+        pass
+    return had
+
+
 class NoiseRatchetGate(GFCombineMove):
     """The one noise proposal of a ratcheted search stage.
 
@@ -226,7 +301,8 @@ class NoiseRatchetGate(GFCombineMove):
     #: Consumed by the combine; False after a hold.
     gf_leg_end_now = False
 
-    def __init__(self, inner, galfor_move, delta, in_model_move=None, **kwargs):
+    def __init__(self, inner, galfor_move, delta, in_model_move=None,
+                 release_to_convergence=True, **kwargs):
         super().__init__([inner], share_temperature_control=False, **kwargs)
         self.inner = inner
         self.galfor_move = galfor_move
@@ -236,13 +312,33 @@ class NoiseRatchetGate(GFCombineMove):
                 f"galfor nudge delta must have 5 entries (sampled basis); got "
                 f"shape {self.delta.shape}.")
         self.in_model_move = in_model_move
+        #: Every RELEASE starts the inner max-logL search afresh
+        #: (:func:`reset_maxlogl_search`), so it runs to ITS plateau rule
+        #: against the current residual instead of inheriting the verdict
+        #: of an earlier release (user ruling 2026-10-02). False restores
+        #: the rider behaviour: one round per call once plateaued.
+        self.release_to_convergence = bool(release_to_convergence)
         self.mode = "release"
         self.nudges = 0
+        self.releases = 0
 
     def set_mode(self, mode: str) -> None:
         if mode not in _ACTIONS:
             raise ValueError(f"ratchet mode {mode!r} not in {_ACTIONS}")
         self.mode = mode
+
+    #: Set by :meth:`finish_ratchet`: no more nudges; the gate stays a plain
+    #: release in RIDER mode (one search round per iteration, tracking the
+    #: residual as sources are added and removed) while the stage runs to
+    #: its ordinary per-band shut-off.
+    ratchet_finished = False
+
+    def finish_ratchet(self) -> None:
+        """The data-driven stop (user design 2026-10-02): the last release
+        gained less than the threshold, so the ratcheting is over."""
+        self.mode = "release"
+        self.release_to_convergence = False
+        self.ratchet_finished = True
 
     def _propose_moves(self, model, state):
         self.gf_leg_end_now = False
@@ -257,8 +353,14 @@ class NoiseRatchetGate(GFCombineMove):
             # the step re-drives the mode before the next iteration anyway.
             self.mode = "hold"
         else:
+            if self.release_to_convergence:
+                # search mode, from scratch, every release: the plateau rule
+                # (num_checks flat rounds within tol) decides when the noise
+                # has converged on THIS iteration's residual
+                reset_maxlogl_search(self.inner)
             self._gf_precondition(self.inner, model)
             state, accepted = self.inner.propose(model, state)
+            self.releases += 1
         if self.in_model_move is not None:
             # the noise changed (forced or free): let the GB sources settle
             # to it before any RJ move scores against the new residual.
