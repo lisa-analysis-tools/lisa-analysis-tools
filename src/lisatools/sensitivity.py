@@ -2163,6 +2163,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             for all MOSAs. ``"asymmetric"`` uses one amplitude per MOSA (6 OMS + 6 TM,
             ordered as ``orbits.LINKS``: 12, 23, 31, 13, 32, 21) on the same
             spectral shapes. See :meth:`split_psd_params` for the parameter layout.
+        fft_batch_size: Batch size for FFTs in the convolution of the window with the sensitivity matrix. Default is 64.
     """
 
     def __init__(
@@ -2181,6 +2182,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         average_transfer_functions: bool = False,
         smoothing_sigma: Optional[float] = 1.0,
         noise_symmetry: str = "symmetric",
+        fft_batch_size: Optional[int] = 64
     ):
         LISAToolsParallelModule.__init__(self, force_backend=force_backend)
         if noise_symmetry not in NOISE_SYMMETRIES:
@@ -2207,6 +2209,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
         self.mask_percentage = mask_percentage if mask_percentage is not None else 0.05
         self._smoothing_sigma = smoothing_sigma
+        self._fft_batch_size = fft_batch_size
 
         self.window_values = window_values
         self.convolve_window = convolve_window
@@ -2241,6 +2244,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             "average_transfer_functions": self.average_transfer_functions,
             "smoothing_sigma": self.smoothing_sigma,
             "noise_symmetry": self.noise_symmetry,
+            "fft_batch_size": self._fft_batch_size,
         }
 
     @property
@@ -2320,6 +2324,13 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         """Set the window kernel for convolution with the sensitivity matrix."""
         self._window_kernel = x
         self._window_kernel_fft = self.xp.fft.fft(self._window_kernel)
+
+    @property
+    def fft_batch_size(self):
+        """
+        Batch size for FFTs in the sensitivity matrix convolution.
+        """
+        return self._fft_batch_size
 
     @property
     def active_slice(self):
@@ -2916,18 +2927,31 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
         N = len(self.window_values)
         nf_full = N // 2 + 1
-        fill_low = entries[..., 0:1]
-        fill_high = entries[..., -1:]
-        full = xp.ones(entries.shape[:-1] + (nf_full,), dtype=xp.complex128) * fill_low
-        full[..., self.active_slice] = entries
-        #  pad the low-frequency entries with the lowest frequency (DC) value
-        full[..., self.active_slice.stop:] = fill_high
 
-        two_sided = xp.concatenate([full, xp.conj(full[..., 1:(N + 1) // 2][..., ::-1])], axis=-1)
+        convolved_out = xp.empty(entries.shape, dtype=xp.complex128)
+        
+        for chunk_start in range(0, num_psds, self.fft_batch_size):
+            chunk_end = min(chunk_start + self.fft_batch_size, num_psds)
+            entries_chunk = entries[:, chunk_start:chunk_end]
+            
+            fill_low = entries_chunk[..., 0:1]
+            fill_high = entries_chunk[..., -1:]
 
-        conv = xp.fft.ifft(xp.fft.fft(two_sided, axis=-1) * self.window_kernel_fft, axis=-1)
-        conv = conv[..., :nf_full][..., self.active_slice]
-        return [xp.real(conv[i].reshape(num_psds, -1)) for i in range(3)] + [conv[i].reshape(num_psds, -1) for i in range(3, 6)]
+            full = xp.ones(entries_chunk.shape[:-1] + (nf_full,), dtype=xp.complex128) * fill_low
+            full[..., self.active_slice] = entries_chunk
+            #  pad the low-frequency entries with the lowest frequency (DC) value
+            full[..., self.active_slice.stop:] = fill_high
+
+            two_sided = xp.concatenate([full, xp.conj(full[..., 1:(N + 1) // 2][..., ::-1])], axis=-1)
+
+            conv = xp.fft.ifft(xp.fft.fft(two_sided, axis=-1) * self.window_kernel_fft, axis=-1)
+            conv = conv[..., :nf_full][..., self.active_slice]
+
+            convolved_out[:, chunk_start:chunk_end] = conv
+
+            del two_sided, full, conv
+
+        return [xp.real(convolved_out[i].reshape(num_psds, -1)) for i in range(3)] + [convolved_out[i].reshape(num_psds, -1) for i in range(3, 6)]
 
     def _fill_matrix(self, c00, c11, c22, c01, c02, c12, num_psds: int = 1):
         """Fill the full 3x3 sensitivity matrix from its 6 unique elements."""
