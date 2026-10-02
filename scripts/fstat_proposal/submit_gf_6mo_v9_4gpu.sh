@@ -4695,8 +4695,13 @@ export EMRI_EPS=1e-3
 # template measured 157 ms/row batched vs production 94 ms at eps 1e-3 on an
 # H100 (the TDI response dominated). To run it:
 #     EMRI_LIKELIHOOD=direct NGPUS=4 ./submit_gf_6mo_v9_4gpu.sh
-# with the lookup table at EMRI_DIRECT_TABLE (default: the repo root, where
-# scripts/wdm/build_wdm_lookup_gpu.py --out <name> writes it from here).
+# LOOKUP TABLE: EMRI_DIRECT_TABLE points to a specific table; unset (default) it is
+# the canonical file in this run's folder,
+#     ${STORE_DIR}/wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5
+# Either way, when the file is missing the preflight below BUILDS AND SAVES it there
+# on this node's GPU before mpiexec (lisatools.wdm_lookup_store), so a restart finds
+# it and never rebuilds; a found table is checked against the grid. To reuse a table
+# built elsewhere, copy it into ${STORE_DIR} or point EMRI_DIRECT_TABLE at it.
 # RESUME-SAFE: no stored shape changes; every leaf visit re-scores its
 # prev_logl, and the persisted EMRI eigen tables (built on the production
 # likelihood) are adopted until their next EMRI_EIGEN_REFRESH tick (MH-valid).
@@ -4713,15 +4718,15 @@ export EMRI_EPS=1e-3
 # "EXPOSE INVARIANT VIOLATED".
 export EMRI_LIKELIHOOD=${EMRI_LIKELIHOOD:-full}
 export EMRI_BATCH_MAX_SIZE=${EMRI_BATCH_MAX_SIZE:-8}
-export EMRI_DIRECT_TABLE=${EMRI_DIRECT_TABLE:-${PWD}/wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5}
+export EMRI_DIRECT_TABLE=${EMRI_DIRECT_TABLE:-}
 export EMRI_DIRECT_RESPONSE=${EMRI_DIRECT_RESPONSE:-dense}
 export EMRI_TRAJ_WORKERS=${EMRI_TRAJ_WORKERS:-4}
 #
 # EMRI PREFLIGHT. An unknown env var is SILENTLY IGNORED, so resolve the knobs
 # through the real settings class and the real consistency rule; for direct,
-# also open the table on this grid, check the edge crop clears the template's
-# zeroed edge layers, and run the dense kernel's GPU-vs-CPU parity test on this
-# node's GPU. Refuses before mpiexec on any gap.
+# also check the edge crop clears the template's zeroed edge layers, run the dense
+# kernel's GPU-vs-CPU parity test on this node's GPU, and find -- or build and save
+# -- the lookup table (above). Refuses before mpiexec on any gap.
 python - <<'PYEOF' || exit 2
 import dataclasses
 import inspect
@@ -4765,15 +4770,8 @@ if cfg["emri_likelihood"] == "full":
     print("[EMRI-PREFLIGHT] emri_pe scoring=full (per-row production path).")
     sys.exit(0)
 
-from lisatools.domains import WDMLookupTable
 from lisatools.sources.emri.wdm_direct import EMRIDirectWDM
 
-table = WDMLookupTable.from_file(cfg["emri_direct_table"], force_backend="cpu")
-if int(table.Nf) != 1440 or abs(float(table.data_dt) - 2.5) > 1e-9:
-    print(f"[EMRI-PREFLIGHT] REFUSING: EMRI_DIRECT_TABLE={cfg['emri_direct_table']} is "
-          f"built for Nf={table.Nf}, dt={table.data_dt}; this grid is Nf=1440, dt=2.5.")
-    sys.exit(2)
-del table
 edge = inspect.signature(EMRIDirectWDM.__init__).parameters["pixel_edge"].default
 crop = int(os.environ.get("EDGE_CROP_WAVELETS", "20"))
 if crop < edge:
@@ -4798,6 +4796,27 @@ if cfg["emri_direct_response"] == "dense":
               "Rebuild lisatools (pip install -e . --no-build-isolation) or launch with "
               "EMRI_LIKELIHOOD=full / EMRI_DIRECT_RESPONSE=spline.")
         sys.exit(2)
+import time
+
+import lisatools
+from lisatools import wdm_lookup_store
+
+try:  # build on this node's GPU when there is one (has_backend("gpu") raises without)
+    lisatools.get_backend("gpu")
+    table_backend = "gpu"
+except Exception:
+    table_backend = "cpu"
+table_path = wdm_lookup_store.lookup_table_path(
+    cfg["emri_direct_table"], os.environ["FILE_STORE_DIR"], 1440, 2.5)
+t_table = time.time()
+try:
+    status = wdm_lookup_store.ensure_lookup_table(
+        table_path, Nf=1440, dt=2.5, force_backend=table_backend)
+except (ValueError, OSError, TimeoutError) as exc:
+    print(f"[EMRI-PREFLIGHT] REFUSING: lookup table {table_path}: {exc}")
+    sys.exit(2)
+print(f"[EMRI-PREFLIGHT] lookup table {table_path}: {status} "
+      f"({time.time() - t_table:.0f} s)")
 cpus = os.environ.get("SLURM_CPUS_PER_TASK")
 if cpus is not None and int(cpus) < 1 + cfg["emri_traj_workers"]:
     print(f"[EMRI-PREFLIGHT] WARNING: --cpus-per-task={cpus} < 1 + EMRI_TRAJ_WORKERS="
@@ -4805,7 +4824,7 @@ if cpus is not None and int(cpus) < 1 + cfg["emri_traj_workers"]:
           "through the self-dispatch, which sizes it).")
 print(f"[EMRI-PREFLIGHT] emri_pe scoring=direct batch<={cfg['emri_batch_max_size']} "
       f"response={cfg['emri_direct_response']} traj_workers={cfg['emri_traj_workers']} "
-      f"table={cfg['emri_direct_table']} (Nf 1440, dt 2.5) edge_crop={crop}>={edge}")
+      f"table={table_path} (Nf 1440, dt 2.5) edge_crop={crop}>={edge}")
 PYEOF
 
 # ============================================================================

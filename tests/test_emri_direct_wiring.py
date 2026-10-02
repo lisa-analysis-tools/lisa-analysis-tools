@@ -101,6 +101,13 @@ class ResolveEMRIDirectCfgTest(_Table, unittest.TestCase):
                                    emri_direct_table=self.table, emri_direct_response="dense",
                                    emri_traj_workers=2))
 
+    def test_direct_needs_no_existing_table(self):
+        """The table is found or built by the getter: neither an unset table (the run
+        folder's canonical file) nor a pointer to a file not built yet blocks."""
+        for table in (None, "/not/built/yet.h5"):
+            cfg = self._resolve(likelihood="direct", direct_table=table)
+            self.assertEqual((cfg["emri_likelihood"], cfg["emri_direct_table"]), ("direct", table))
+
     def test_direct_takes_an_unidentifiable_domain_at_its_word(self):
         cfg = self._resolve(domain=object(), likelihood="direct", direct_table=self.table)
         self.assertEqual(cfg["emri_likelihood"], "direct")
@@ -109,8 +116,6 @@ class ResolveEMRIDirectCfgTest(_Table, unittest.TestCase):
         cases = [
             (dict(domain=_fd_spec()), "not WDM"),
             (dict(chan="AET"), "XYZ"),
-            (dict(direct_table=None), "EMRI_DIRECT_TABLE is not set"),
-            (dict(direct_table="/no/such/table.h5"), "does not exist"),
             (dict(direct_response="bogus"), "EMRI_DIRECT_RESPONSE"),
             (dict(batch_max_size=0), "EMRI_BATCH_MAX_SIZE"),
             (dict(traj_workers=-1), "EMRI_TRAJ_WORKERS"),
@@ -218,7 +223,7 @@ class DirectGetterTest(unittest.TestCase):
         self.few_gen = object()
         wrap = SimpleNamespace(wave_gen=SimpleNamespace(
             waveform_gen=SimpleNamespace(waveform_generator=self.few_gen)))
-        self.gi = SimpleNamespace(force_backend="cpu", data_t0=1.0e8)
+        self.gi = SimpleNamespace(force_backend="cpu", data_t0=1.0e8, file_store_dir="/run/folder")
         self.cfg = dict(nchannels=3, tdi_gen_str="2nd generation", data_mode="mojito",
                         emri_mode_selection_threshold=1e-3, emri_direct_table="/t.h5",
                         emri_direct_response="dense", emri_traj_workers=2)
@@ -230,7 +235,10 @@ class DirectGetterTest(unittest.TestCase):
                 inner.few_gen, inner.table, inner.wdm, inner.pixel_edge = few_gen, table, wdm, 8
                 self.direct_kw.update(kw, few_gen=few_gen, table=table, wdm=wdm)
 
+        self.ensured = []
         self.patches = [
+            mock.patch("lisatools.wdm_lookup_store.ensure_lookup_table",
+                       lambda path, **kw: self.ensured.append((path, kw)) or "found"),
             mock.patch.object(sr, "_wrap_device_and_orbits",
                               lambda gi: (np, None, "orbits", self.dom)),
             mock.patch.object(sr, "get_emri_wave_wrap", lambda gi, cfg: wrap),
@@ -261,6 +269,17 @@ class DirectGetterTest(unittest.TestCase):
         self.assertIs(self.sr.get_emri_direct_gen(self.gi, self.cfg), gen)
         other = self.sr.get_emri_direct_gen(self.gi, dict(self.cfg, emri_mode_selection_threshold=1e-5))
         self.assertIsNot(other, gen)
+
+    def test_table_is_ensured_at_the_pointer_or_in_the_run_folder(self):
+        """A pointer is found-or-built where it points; unset, the canonical file in the
+        run's folder -- the same path on every restart."""
+        self.sr.get_emri_direct_gen(self.gi, self.cfg)
+        self.assertEqual(self.ensured[-1][0], "/t.h5")
+        self.assertEqual((self.ensured[-1][1]["Nf"], self.ensured[-1][1]["dt"]), (32, 10.0))
+        self.sr._WAVE_WRAP_CACHE.clear()
+        self.sr.get_emri_direct_gen(self.gi, dict(self.cfg, emri_direct_table=None))
+        self.assertEqual(self.ensured[-1][0],
+                         "/run/folder/wdm_lookup_emri_cx_NF32_DT10_TL32_fd8x0p01_nld2.h5")
 
     def test_synthetic_epoch_is_the_data_start(self):
         self.sr.get_emri_direct_gen(self.gi, dict(self.cfg, data_mode="synthetic"))

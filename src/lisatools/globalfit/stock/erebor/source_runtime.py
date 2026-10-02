@@ -565,8 +565,11 @@ class SourceEMRISettings(EMRISettings):
     batch_max_size: int = dataclasses.field(
         default_factory=env_default("EMRI_BATCH_MAX_SIZE", 8, int)
     )
-    # The n_ref WDM lookup table (WDMLookupTable.to_file) built on the run's Nf and dt
-    # (the 6-month grid: wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5).
+    # The n_ref WDM lookup table on the run's Nf and dt. None (default): the canonical
+    # file in the run's folder (general.file_store_dir; on the 6-month grid
+    # wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5); a path points to a specific
+    # table. Either way it is BUILT AND SAVED there when missing (once: restarts find it;
+    # lisatools.wdm_lookup_store.ensure_lookup_table).
     direct_table: typing.Optional[str] = dataclasses.field(
         default_factory=env_default("EMRI_DIRECT_TABLE", None, str)
     )
@@ -1321,9 +1324,10 @@ def resolve_emri_direct_cfg(emri, *, domain_settings, tdi_chan) -> dict:
     and ``tdi_chan`` the run's channel set. ``full`` passes through untouched.
     ``direct`` RAISES when the run cannot serve it: a run domain that is known not to
     be WDM (an unidentifiable factory is taken at its word; the getter checks the BUILT
-    domain), channels other than XYZ (the direct template is the X, Y, Z response),
-    no ``EMRI_DIRECT_TABLE`` or a path that does not exist, an unknown
-    ``EMRI_DIRECT_RESPONSE``, ``EMRI_BATCH_MAX_SIZE < 1`` or ``EMRI_TRAJ_WORKERS < 0``.
+    domain), channels other than XYZ (the direct template is the X, Y, Z response), an
+    unknown ``EMRI_DIRECT_RESPONSE``, ``EMRI_BATCH_MAX_SIZE < 1`` or
+    ``EMRI_TRAJ_WORKERS < 0``. The lookup table is not required to exist: the getter finds
+    it (``EMRI_DIRECT_TABLE`` or the run folder's canonical file) or builds and saves it.
     """
     from lisatools.domains import WDMSettings
 
@@ -1349,10 +1353,6 @@ def resolve_emri_direct_cfg(emri, *, domain_settings, tdi_chan) -> dict:
         blockers.append(f"the run domain is {cls.__name__}, not WDM")
     if str(tdi_chan).upper() != "XYZ":
         blockers.append(f"the run's channels are {tdi_chan!r}; the direct template is XYZ")
-    if not table:
-        blockers.append("EMRI_DIRECT_TABLE is not set (the run grid's WDM lookup table)")
-    elif not os.path.isfile(str(table)):
-        blockers.append(f"EMRI_DIRECT_TABLE={table} does not exist")
     if out["emri_direct_response"] not in EMRI_DIRECT_RESPONSES:
         blockers.append(
             f"EMRI_DIRECT_RESPONSE={out['emri_direct_response']!r} is not one of "
@@ -2013,7 +2013,12 @@ def get_emri_direct_gen(general_info, cfg):
     mode-selection threshold (``runtime_kwargs``). The template is assembled on the
     run's FULL wavelet grid and cropped to the run domain's active box
     (:class:`~lisatools.sources.emri.direct_signal_gen.EMRIDirectWDMSignalGen`).
+
+    The lookup table is ``EMRI_DIRECT_TABLE`` or, unset, the canonical file in the run's
+    folder (``general_info.file_store_dir``); when missing it is built and saved there
+    first (one builder under a lock file, the other ranks wait), so a restart finds it.
     """
+    from lisatools import wdm_lookup_store
     from lisatools.domains import WDMLookupTable, WDMSettings
     from lisatools.sources.emri.direct_signal_gen import EMRIDirectWDMSignalGen
     from lisatools.sources.emri.wdm_direct import EMRIDirectWDM
@@ -2037,15 +2042,18 @@ def get_emri_direct_gen(general_info, cfg):
     data_t0 = general_info.data_t0
     # the production wrap's phase epoch: catalogue REF (mojito), else the data start
     ref = MOJITO_REFERENCE_TIME if cfg["data_mode"] == "mojito" else data_t0
+    Nf, dt = int(domain_settings.Nf), float(domain_settings.data_dt)
+    table_path = wdm_lookup_store.lookup_table_path(
+        cfg["emri_direct_table"], getattr(general_info, "file_store_dir", None), Nf, dt)
     with device_context(xp, dev):
-        table = WDMLookupTable.from_file(cfg["emri_direct_table"], force_backend=force_backend)
-        if int(table.Nf) != int(domain_settings.Nf) or abs(
-            float(table.data_dt) - float(domain_settings.data_dt)
-        ) > 1e-9:
+        status = wdm_lookup_store.ensure_lookup_table(
+            table_path, Nf=Nf, dt=dt, force_backend=force_backend)
+        logger.info("[EMRI_DIRECT] lookup table %s (%s).", table_path, status)
+        table = WDMLookupTable.from_file(table_path, force_backend=force_backend)
+        if int(table.Nf) != Nf or abs(float(table.data_dt) - dt) > 1e-9:
             raise ValueError(
-                f"EMRI_DIRECT_TABLE={cfg['emri_direct_table']} is built for Nf={table.Nf}, "
-                f"dt={table.data_dt}; the run grid is Nf={domain_settings.Nf}, "
-                f"dt={domain_settings.data_dt}."
+                f"EMRI lookup table {table_path} is built for Nf={table.Nf}, "
+                f"dt={table.data_dt}; the run grid is Nf={Nf}, dt={dt}."
             )
         full = WDMSettings(
             int(domain_settings.Nf), int(domain_settings.Nt), float(domain_settings.data_dt),

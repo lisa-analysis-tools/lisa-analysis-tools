@@ -19,7 +19,7 @@ laptop (CPU, the 20 s table, short window)::
 cluster (GPU, the 6-month grid)::
 
     python scripts/emri/emri_direct_fit_wiring_check.py --backend cuda12x --days 180 \
-        --table wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5 --rows 8 \
+        --table-dir /path/to/tables --rows 8 \
         --catalog /path/to/emri_cat_mojito_lite_processed_MT.hdf5 --l1-dir /path/to/EMRI/L1
 
 Prints one ``[fitwire]`` line per row and a JSON summary (``--out`` appends it).
@@ -42,7 +42,9 @@ import emri_batch_speed as S  # noqa: E402  (load_source, batch_rows)
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--table", required=True)
+    ap.add_argument("--table", default=None,
+                    help="lookup table; default: the canonical table in --table-dir (built if missing)")
+    ap.add_argument("--table-dir", default=os.getcwd())
     ap.add_argument("--src", type=int, default=1)
     ap.add_argument("--catalog", default=None)
     ap.add_argument("--l1-dir", default=None)
@@ -89,7 +91,7 @@ def main():
     tds = TDSettings(n, args.dt, t0=0.0, force_backend=args.backend)
     gi = SimpleNamespace(gpus=[0] if gpu else None, orbits=orb, gpu_orbits=orb,
                          force_backend=args.backend, dt=args.dt, data_t0=data_t0, Tobs=n * args.dt,
-                         data_td_settings=tds, domain_settings=dom)
+                         data_td_settings=tds, domain_settings=dom, file_store_dir=args.table_dir)
     gs = SimpleNamespace(tdi_chan="XYZ", tdi_gen_str="2nd generation", nchannels=3, data_mode="mojito",
                          sobbh_reference_time=None, mbh_waveform_t0=0.0, min_freq=2.5e-4, max_freq=2.5e-2)
     emri = sr.SourceEMRISettings(likelihood="direct", direct_table=args.table, eps=args.eps,

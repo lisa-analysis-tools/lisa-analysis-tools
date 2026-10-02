@@ -188,8 +188,17 @@ choreography is untouched, only the scoring changes.
 * **Getter** `get_emri_direct_gen`: per device, reuses the FEW generator inside that device's
   production wrap (one FEW construction per device), its orbits, the REF epoch (mojito) and the
   `EMRI_EPS` threshold; refuses a table built for another `Nf`/`dt`.
-* **Resolver** `resolve_emri_direct_cfg`: `direct` needs a WDM domain, XYZ channels, an existing
-  `EMRI_DIRECT_TABLE`, a known response, batch >= 1, workers >= 0.
+* **Lookup table: found or built once** (`lisatools/wdm_lookup_store.py`). `EMRI_DIRECT_TABLE`
+  points to a specific file; unset, it is the canonical file in the run's folder
+  (`general.file_store_dir` = the launcher's `STORE_DIR`), e.g.
+  `wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5` on the 6-month grid (the recipe of every
+  table so far, `EMRI_TABLE_RECIPE`). `ensure_lookup_table` returns it when present (checked
+  against the grid, never rebuilt over), else builds and saves it there: written to a temporary
+  file and renamed into place, under a `<path>.lock` that makes other callers (MPI ranks, the
+  launcher) wait for the one builder. A restart finds the file. The 6-month launcher's preflight
+  runs it on the node's GPU before mpiexec, so ranks never build.
+* **Resolver** `resolve_emri_direct_cfg`: `direct` needs a WDM domain, XYZ channels, a known
+  response, batch >= 1, workers >= 0 (the table need not exist yet).
 * **Trajectory pool** (`EMRI_TRAJ_WORKERS`, 0 in the library): spawn workers integrate a chunk's
   trajectories (`few.trajectory.pool`, FEW gpu_backend >= 68bcda54) for chunks of at least that many
   rows (eigen sweeps). Workers start eagerly with `__main__.__file__` hidden, or each spawned child
@@ -197,9 +206,9 @@ choreography is untouched, only the scoring changes.
   refused. Any pool failure disables it for the run. Counters (rows, trajectories computed, cache
   hits/misses) are logged as `[EMRI_DIRECT] trajectory pool:` every 50 pooled batches.
 * **Launcher** (`submit_gf_6mo_v9_4gpu.sh`, EMRI block after `EMRI_EPS`): default `full`; the
-  `# EMRI PREFLIGHT.` heredoc resolves the knobs through the settings class and, for direct, opens
-  the table, checks `EDGE_CROP_WAVELETS >= pixel_edge` (8) and runs
-  `tests.test_tdi_dense.TDDenseGPUParityTest` on the node's GPU (a skip refuses). The self-dispatch
+  `# EMRI PREFLIGHT.` heredoc resolves the knobs through the settings class and, for direct, checks
+  `EDGE_CROP_WAVELETS >= pixel_edge` (8), runs `tests.test_tdi_dense.TDDenseGPUParityTest` on the
+  node's GPU (a skip refuses) and finds or builds the lookup table. The self-dispatch
   passes `--cpus-per-task = 2 + EMRI_TRAJ_WORKERS` (4) when direct; `OMP_NUM_THREADS` stays 1.
 
 | check (laptop CPU, CD1L EMRI 1, 16 d, dt 20 s, dense, real getters + real move) | result |
@@ -209,7 +218,7 @@ choreography is untouched, only the scoring changes.
 | wall per row | direct 0.73 s, production 1.38 s; 0 fallbacks |
 
 Cluster check on the 6-month grid: `scripts/emri/emri_direct_fit_wiring_check.py --backend cuda12x
---days 180 --table wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5 --rows 8`.
+--days 180 --table-dir <dir holding or receiving the table> --rows 8`.
 Tests: `tests/test_emri_direct_move.py`, `test_emri_direct_wiring.py`,
 `test_emri_direct_fanout.py` (real proposes on FakeWorld ranks: one-walker replicas and the
 v9 1-walker-per-rank blocks), `test_submit_scripts_layout.py::SixMonthEMRIDirectTest`.

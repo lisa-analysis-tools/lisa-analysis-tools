@@ -913,8 +913,9 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
         self.assertEqual(self.v9["EMRI_BATCH_MAX_SIZE"], "8")
         self.assertEqual(self.v9["EMRI_DIRECT_RESPONSE"], "dense")
         self.assertEqual(self.v9["EMRI_TRAJ_WORKERS"], "4")
-        self.assertTrue(self.v9["EMRI_DIRECT_TABLE"].endswith(
-            "/wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5"))
+        # unset: the canonical table in the run folder, found or built by the preflight
+        self.assertEqual(self.v9["EMRI_DIRECT_TABLE"], "")
+        self.assertIn("export FILE_STORE_DIR=${STORE_DIR}", open(SIX_MO_V9).read())
         # the grid the table must match, and the edge crop that must clear its edges
         self.assertEqual(self.v9["TOBS_TARGET"], "15552000")
         self.assertEqual(self.v9["EDGE_CROP_WAVELETS"], "60")
@@ -958,25 +959,29 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
         self.assertIn("--cpus-per-task=2",
                       self._dispatch(EMRI_LIKELIHOOD="direct", EMRI_TRAJ_WORKERS="0"))
 
-    def _run_preflight(self, table_grid=(1440, 2.5), parity=("ok",), **env):
+    def _run_preflight(self, table=("found",), parity=("ok",), **env):
         """Exec the launcher's EMRI preflight in-process: (exit code, stdout).
 
-        ``table_grid`` stubs ``WDMLookupTable.from_file`` ((Nf, dt) or None = the
-        real loader); ``parity`` stubs the GPU parity run's outcome."""
+        ``table`` stubs ``wdm_lookup_store.ensure_lookup_table``: ("found"|"built",) or
+        ("raise", message); the calls land in ``self.ensured``. ``parity`` stubs the GPU
+        parity run's outcome."""
         import contextlib
         import io
-        from types import SimpleNamespace
         from unittest import mock
 
         from lisatools.globalfit.stock.erebor import source_runtime  # noqa: F401
 
         code = compile(_emri_preflight_source(SIX_MO_V9), "emri_preflight", "exec")
         base = {k: self.v9[k] for k in self._KNOBS + ("EDGE_CROP_WAVELETS",)}
-        fd, table = tempfile.mkstemp(suffix=".h5")
-        os.close(fd)
-        self.addCleanup(os.remove, table)
-        base["EMRI_DIRECT_TABLE"] = table
+        base["FILE_STORE_DIR"] = "/the/run/folder"
         base.update(env)
+        self.ensured = []
+
+        def fake_ensure(path, **kw):
+            self.ensured.append((path, kw))
+            if table[0] == "raise":
+                raise ValueError(table[1])
+            return table[0]
 
         def fake_run(runner, suite):
             res = unittest.TestResult()
@@ -988,12 +993,8 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
             return res
 
         patches = [mock.patch.dict(os.environ, base),
-                   mock.patch("unittest.TextTestRunner.run", fake_run)]
-        if table_grid is not None:
-            patches.append(mock.patch(
-                "lisatools.domains.WDMLookupTable.from_file",
-                lambda path, force_backend=None: SimpleNamespace(Nf=table_grid[0],
-                                                                 data_dt=table_grid[1])))
+                   mock.patch("unittest.TextTestRunner.run", fake_run),
+                   mock.patch("lisatools.wdm_lookup_store.ensure_lookup_table", fake_ensure)]
         out = io.StringIO()
         with contextlib.ExitStack() as stack:
             for p in patches:
@@ -1015,11 +1016,27 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("emri_pe scoring=direct batch<=8 response=dense traj_workers=4", out)
         self.assertIn("edge_crop=60>=8", out)
+        # unset EMRI_DIRECT_TABLE: the canonical table in the run folder, on this grid
+        name = "/the/run/folder/wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5"
+        self.assertEqual(self.ensured[0][0], name)
+        self.assertEqual((self.ensured[0][1]["Nf"], self.ensured[0][1]["dt"]), (1440, 2.5))
+        self.assertIn(f"lookup table {name}: found", out)
+
+    def test_a_missing_table_is_built_by_the_preflight_at_the_pointer(self):
+        rc, out = self._run_preflight(table=("built",), EMRI_LIKELIHOOD="direct",
+                                      EMRI_DIRECT_TABLE="/shared/tables/mine.h5")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.ensured[0][0], "/shared/tables/mine.h5")
+        self.assertIn("lookup table /shared/tables/mine.h5: built", out)
+
+    def test_full_never_touches_the_table(self):
+        rc, out = self._run_preflight()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.ensured, [])
 
     def test_direct_refusals(self):
         cases = [
-            (dict(EMRI_DIRECT_TABLE="/no/such/table.h5"), {}, "does not exist"),
-            ({}, dict(table_grid=(180, 20.0)), "built for Nf=180"),
+            ({}, dict(table=("raise", "built for Nf=180, dt=20.0")), "built for Nf=180"),
             ({}, dict(parity=("fail",)), "parity test"),
             ({}, dict(parity=("skip",)), "skipped 1"),
             (dict(EDGE_CROP_WAVELETS="4"), {}, "EDGE_CROP_WAVELETS=4"),
