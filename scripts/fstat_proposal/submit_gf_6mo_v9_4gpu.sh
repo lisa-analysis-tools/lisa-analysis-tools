@@ -3427,12 +3427,38 @@ echo "[GB-PRIOR-REMOVAL] GB_SEARCH_PRIOR_REMOVAL_ONLY=${GB_SEARCH_PRIOR_REMOVAL_
 # power share per band) before going further.
 # Overridable here, default OFF = today's composition byte-identical.
 export GALFOR_RATCHET=${GALFOR_RATCHET:-0}
-export GALFOR_RATCHET_HOLD=${GALFOR_RATCHET_HOLD:-3}
-export GALFOR_RATCHET_RELEASE=${GALFOR_RATCHET_RELEASE:-2}
-export GALFOR_RATCHET_CYCLES=${GALFOR_RATCHET_CYCLES:-2}
+# SCHEDULE DEFAULTS = THE PRODUCTION PLAN (user design 2026-10-02, jobs 685/695):
+# release-first two-step cycles (nudge, release) with no hold, the CYCLES count a
+# ceiling, the data-driven stop (MIN_GAIN) the real end. Until 2026-10-02 these
+# four lived only on the launch line (the launcher held the 09-30 3/2/2 trial
+# schedule), so a line that dropped one silently fell back to a different run:
+# RELEASE_CHECKS to the standalone noise search's 5 flat rounds, MIN_GAIN to
+# "never stop". Every value still yields to the environment.
+export GALFOR_RATCHET_HOLD=${GALFOR_RATCHET_HOLD:-1}
+export GALFOR_RATCHET_RELEASE=${GALFOR_RATCHET_RELEASE:-1}
+export GALFOR_RATCHET_CYCLES=${GALFOR_RATCHET_CYCLES:-20}
+export GALFOR_RATCHET_RELEASE_FIRST=${GALFOR_RATCHET_RELEASE_FIRST:-1}
 export GALFOR_RATCHET_DLOG10_AMP=${GALFOR_RATCHET_DLOG10_AMP:--0.05}
 export GALFOR_RATCHET_DLOG10_FK=${GALFOR_RATCHET_DLOG10_FK:--0.10}
 export GALFOR_RATCHET_DLOG10_F2=${GALFOR_RATCHET_DLOG10_F2:--0.15}
+# A RELEASE runs the psd+galfor search afresh to convergence: RELEASE_CHECKS
+# consecutive rounds per walker without a RELEASE_TOL-nat gain ("logL diff of 5
+# over a 50-round window"), RELEASE_ITERS the safety ceiling ("we do not want it
+# to hit that"). MIN_GAIN: a release whose max cold lnL gains less than this over
+# the previous release ends the ratchet (stamped in the store); 0 = never.
+export GALFOR_RATCHET_RELEASE_CHECKS=${GALFOR_RATCHET_RELEASE_CHECKS:-50}
+export GALFOR_RATCHET_RELEASE_TOL=${GALFOR_RATCHET_RELEASE_TOL:-5}
+export GALFOR_RATCHET_RELEASE_ITERS=${GALFOR_RATCHET_RELEASE_ITERS:-5000}
+export GALFOR_RATCHET_MIN_GAIN=${GALFOR_RATCHET_MIN_GAIN:-200}
+# THE CLOCK ON A RELAUNCH. CLOCK_RESET=1: the schedule restarts at k = 0 on
+# this (re-)entry instead of landing wherever the stage's stored start would
+# put it. CLOCK_START = the schedule k the gate runs at NEXT, i.e. what the
+# cycle in progress at the cut counts as (START - 1): the last
+# "[GALFOR_RATCHET gb_search_3] iteration N: ..." line of the cancelled log
+# says RELEASE -> START=1 (the next head is a nudge); NUDGE -> START=2 (the
+# next head is a release). 0 = the next head is a release regardless.
+export GALFOR_RATCHET_CLOCK_RESET=${GALFOR_RATCHET_CLOCK_RESET:-1}
+export GALFOR_RATCHET_CLOCK_START=${GALFOR_RATCHET_CLOCK_START:-0}
 # The gain rule (GALFOR_RATCHET_MIN_GAIN) may not stop the ratchet before this
 # many nudges have run in the process (user ruling 2026-10-02: "I generally
 # want it to do minimum 2 nudges total"). Counted per process: a relaunch
@@ -3446,8 +3472,10 @@ export GALFOR_RATCHET_MIN_NUDGES=${GALFOR_RATCHET_MIN_NUDGES:-2}
 # move that skipped a cycle cannot mis-align a relaunch; cadences
 # (GB_SEARCH_3_WARM_EVERY) and the galfor ratchet then count CYCLES. With a
 # row per leg the mid-iteration checkpoint only guards part of one leg;
-# MIDIT_CHECKPOINT=0 is reasonable for a legged search. Off = today.
-export GB_SEARCH_LEGS=${GB_SEARCH_LEGS:-0}
+# MIDIT_CHECKPOINT=0 is reasonable for a legged search. Default ON since
+# 2026-10-02: every 6mo production launch from 09-30 on (jobs 675-695) ran
+# legged, and a line that dropped it would resume a legged store un-legged.
+export GB_SEARCH_LEGS=${GB_SEARCH_LEGS:-1}
 # While the ratchet is active the per-(walker, band) RJ shutoff valve leaves
 # every band below this frequency OPEN (reopening shut pairs with a fresh
 # streak) and shuts converged bands above it as usual; lifted at the
@@ -3456,7 +3484,7 @@ export GB_SEARCH_LEGS=${GB_SEARCH_LEGS:-0}
 # can shut off bands above 7 mHz if their likelihoods converge as usual").
 # 0 = the valve acts at every frequency throughout.
 export GALFOR_RATCHET_SHUTOFF_MIN_FREQ=${GALFOR_RATCHET_SHUTOFF_MIN_FREQ:-7e-3}
-echo "[GALFOR-RATCHET] GALFOR_RATCHET=${GALFOR_RATCHET} hold=${GALFOR_RATCHET_HOLD} release=${GALFOR_RATCHET_RELEASE} cycles=${GALFOR_RATCHET_CYCLES} dlog10 amp/fk/f2=${GALFOR_RATCHET_DLOG10_AMP}/${GALFOR_RATCHET_DLOG10_FK}/${GALFOR_RATCHET_DLOG10_F2} (0 = off: rider + 4 interleaved noise slots as before)"
+echo "[GALFOR-RATCHET] GALFOR_RATCHET=${GALFOR_RATCHET} hold=${GALFOR_RATCHET_HOLD} release=${GALFOR_RATCHET_RELEASE} cycles=${GALFOR_RATCHET_CYCLES} release_first=${GALFOR_RATCHET_RELEASE_FIRST} dlog10 amp/fk/f2=${GALFOR_RATCHET_DLOG10_AMP}/${GALFOR_RATCHET_DLOG10_FK}/${GALFOR_RATCHET_DLOG10_F2} | release to convergence: checks=${GALFOR_RATCHET_RELEASE_CHECKS} tol=${GALFOR_RATCHET_RELEASE_TOL} cap=${GALFOR_RATCHET_RELEASE_ITERS} | stop: min_gain=${GALFOR_RATCHET_MIN_GAIN} min_nudges=${GALFOR_RATCHET_MIN_NUDGES} | clock: reset=${GALFOR_RATCHET_CLOCK_RESET} start=${GALFOR_RATCHET_CLOCK_START} | valve floor ${GALFOR_RATCHET_SHUTOFF_MIN_FREQ} Hz (0 = off: rider + 4 interleaved noise slots as before)"
 # High-f barren-band birth shutoff (search scope): bands above FMIN with
 # AFTER consecutive zero-birth-accept proposes stop proposing births
 # (deaths + in-model continue; [GB_BAND_SHUTOFF] log line per band).

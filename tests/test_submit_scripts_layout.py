@@ -247,8 +247,13 @@ class SixMonthV9DeltaTest(unittest.TestCase):
     # -- V9-10: refit cadence ---------------------------------------------
     def test_the_pe_refit_cadence_is_separate_and_longer(self):
         """full_pe is a random_choice stage; a search-tuned cadence there
-        refits far more often in wall-clock terms than the number says."""
-        self.assertEqual(self.v9["GB_FSTAT_REFIT_EVERY_PE"], "250")
+        refits far more often in wall-clock terms than the number says.
+
+        250 until 2026-10-02; user ruling that day: "during PE fstat should
+        refit every 50 iterations" (the clock counts iterations and the
+        decision runs when rj_fstat_pe is drawn, P = 0.45 per iteration).
+        """
+        self.assertEqual(self.v9["GB_FSTAT_REFIT_EVERY_PE"], "50")
         # SEARCH stages refit 4x more often (user, 2026-09-25): the grid
         # goes stale as the search subtracts what it finds, so an old grid
         # aims births at peaks already claimed. PE is deliberately NOT
@@ -614,6 +619,24 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             "GALFOR_RATCHET", "GALFOR_RATCHET_HOLD", "GALFOR_RATCHET_RELEASE",
             "GALFOR_RATCHET_CYCLES", "GALFOR_RATCHET_DLOG10_AMP",
             "GALFOR_RATCHET_DLOG10_FK", "GALFOR_RATCHET_DLOG10_F2",
+            # the ratchet's production plan (2026-10-02, jobs 685/695): release-
+            # first two-step cycles, release to convergence (50 flat rounds / 5
+            # nats / cap 5000), the min-gain stop (200) with a nudge floor (2),
+            # the relaunch clock, and the valve floor below 7 mHz. Until 10-02
+            # these lived on the launch line only; the launcher now carries
+            # them so a line that drops one cannot silently change the run.
+            "GALFOR_RATCHET_RELEASE_FIRST", "GALFOR_RATCHET_RELEASE_CHECKS",
+            "GALFOR_RATCHET_RELEASE_TOL", "GALFOR_RATCHET_RELEASE_ITERS",
+            "GALFOR_RATCHET_MIN_GAIN", "GALFOR_RATCHET_MIN_NUDGES",
+            "GALFOR_RATCHET_CLOCK_RESET", "GALFOR_RATCHET_CLOCK_START",
+            "GALFOR_RATCHET_SHUTOFF_MIN_FREQ",
+            # full_pe declarations (user rulings 2026-10-02): in-model repeats
+            # 25 on every branch but emri ("a general thinning factor of 25"),
+            # the GB RJ draw at 0.45 prior / 0.45 fstat / 0.1 warm, the PE flip
+            # fraction 0.1, the PE refit every 50 iterations.
+            "PE_INMODEL_REPEATS", "PE_INMODEL_REPEATS_BRANCHES",
+            "GB_PE_RJ_FSTAT_FRACTION", "GB_PE_RJ_WARM_FRACTION",
+            "GB_PE_RJ_FLIP_FRACTION",
             # match-criterion panels back on for the v9 pages (2026-09-30)
             "GF_MONITOR_MATCH_STATS",
             # search legs: one row per in-model leg (2026-09-30)
