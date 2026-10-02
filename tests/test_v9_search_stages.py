@@ -416,22 +416,24 @@ class ProfileDeclarationTest(unittest.TestCase):
     def test_profile_values_per_stage(self):
         fit = _build()
         got = {s.name: s.step_kwargs["profile"] for s in _numbered(fit)}
+        # prior_births (user ruling 2026-10-02: "prior removal only for gb
+        # search 1"; stages 2 and 3 let rj_prior_removal propose births too)
         self.assertEqual(got["gb_search_1"], dict(
-            phase_maximize=True, opt_snr=8.0, peak_min_snr=8.0))
+            phase_maximize=True, opt_snr=8.0, peak_min_snr=8.0, prior_births=False))
         # ⚠ ONLY stage 1 phase-maximizes. Stage 2 is the floor-dropping
         # stage (opt SNR 8->5, peak 8->6.25); a maximized delta is an upper
         # bound on what a source can pay, so stacking it on the weakest
         # population is the one place it is least affordable (user ruling
         # 2026-09-25, correcting the same day's "1 and 2").
         self.assertEqual(got["gb_search_2"], dict(
-            phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25))
+            phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25, prior_births=True))
         # stage 3 additionally re-learns the shutoff valve's per-band cold
         # lnL max from -inf (user ruling 2026-09-30): its noise MOVES, and a
         # max earned under the fixed-noise stages shut job 672's pairs after
         # three iterations.
         self.assertEqual(got["gb_search_3"], dict(
             phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25,
-            reset_band_max=True))
+            reset_band_max=True, prior_births=True))
 
     def test_phase_max_is_STAGE_1_ONLY_and_tracks_the_high_floor(self):
         """The rule in one place, stated as a relationship rather than as

@@ -512,6 +512,50 @@ class StepResumesByNameTest(unittest.TestCase):
             self.assertEqual(gate.modes, ["release"])             # release first
             self.assertEqual(st._ratchet_release_maxes, [])       # k = -1 never read
 
+    def test_clock_start_continues_with_the_nudge_after_an_interrupted_release_cycle(self):
+        """6mo job 685: the first release ran (row 65), its cycle was cut off
+        mid-way. GALFOR_RATCHET_CLOCK_START=1 makes the in-progress cycle
+        schedule k = 0, so the wrap records its lnL as the baseline and the
+        next gate run is the NUDGE, not a second release."""
+        from lisatools.globalfit.noise_ratchet import RatchetSchedule
+        from lisatools.globalfit.recipe import SearchStageProfileStep
+
+        cm, gate = _FakeCombine(), _FakeGate()
+        cm.moves = [gate]
+        st = SearchStageProfileStep(
+            moves=[cm], convergence_iter=2, plateau_branch="gb", profile={},
+            stage_name="gb_search_3", legs=True,
+            ratchet=RatchetSchedule(hold=1, release=1, cycles=20, release_first=True),
+            ratchet_delta=np.zeros(5), ratchet_min_gain=200.0)
+        # one full cycle, then a cycle whose noise head + in_model have run
+        hist = [None] * 47 + ["in_model", "in_model_fstat", "in_model_removal",
+                              "noise_ratchet_search", "in_model"]
+        be = _FakeBackend(52, hist, stage_start=47, order=ORDER)
+        with env(GALFOR_RATCHET_HOLD_STAGE=None, GALFOR_RATCHET_CLOCK_RESET="1",
+                 GALFOR_RATCHET_CLOCK_START="1"):
+            self._enter(st, cm, be)
+            self.assertEqual(ORDER[cm.gf_legs.cursor], "rj_fstat_search")
+            self.assertEqual(cm.gf_legs.cycles, 1)
+            self.assertEqual(st._ratchet_k0, 1)                 # (1 + 1 mid) - 1
+            self.assertEqual(st._ratchet_k, 0)                  # the cycle in progress IS k = 0
+            self.assertEqual(gate.modes, ["release"])           # harmless: the head already ran
+            smp = _FakeSampler(be, [cm])
+            st.stopping_function(52, self._sample(1000.0), smp)   # a leg end, no wrap
+            self.assertEqual(st._ratchet_release_maxes, [])
+            cm.gf_legs.cycles = 2                                 # the wrap of the release cycle
+            st.stopping_function(53, self._sample(1000.0), smp)
+            self.assertEqual(st._ratchet_release_maxes, [(0, 1000.0)])   # baseline from THIS cycle
+            self.assertEqual(st._ratchet_k, 1)
+            self.assertEqual(gate.modes[-1], "nudge")           # part 1 of 2 next
+        with env(GALFOR_RATCHET_CLOCK_START="-1", GALFOR_RATCHET_CLOCK_RESET="1"):
+            st2 = SearchStageProfileStep(
+                moves=[cm], convergence_iter=2, plateau_branch="gb", profile={},
+                stage_name="gb_search_3", legs=True,
+                ratchet=RatchetSchedule(hold=1, release=1, cycles=20, release_first=True),
+                ratchet_delta=np.zeros(5))
+            with self.assertRaises(ValueError):
+                self._enter(st2, cm, be)
+
     def test_a_stamped_stop_survives_a_relaunch(self):
         """The data-driven stop is stamped in the store; a fresh process that
         re-enters the stage must not nudge again."""

@@ -153,6 +153,66 @@ class PeRjDrawOneTest(unittest.TestCase):
         expected = list(mirror.choice(4, size=4, replace=True, p=np.full(4, 0.25)))
         self.assertEqual(log, [PE_NAMES[k] for k in expected])
 
+    # ---- rj_warm_pe in the draw (user ruling 2026-10-02: "put the warm proposal
+    # in with the other two rj moves. Draw them at 0.45 prior, 0.45 fstat,
+    # 0.1 warm start") -------------------------------------------------------
+
+    def test_warm_joins_the_draw_at_the_configured_weights(self):
+        log = []
+        _, comb = _make(PE_NAMES, log, weighted_cycle=True)
+        trio = ("rj_warm_pe", "rj_fstat_pe", "rj_prior_pe")
+        picks = []
+        with _env(GB_PE_RJ_DRAW_ONE=1, GB_PE_RJ_FSTAT_FRACTION=0.45,
+                  GB_PE_RJ_WARM_FRACTION=0.1):
+            model = _StubModel(seed=21)
+            for _ in range(4000):
+                log.clear()
+                comb.propose(model, _StubState())
+                rj = [n for n in log if n in trio]
+                self.assertEqual(len(rj), 1, log)               # exactly ONE of the three
+                self.assertEqual(log, [rj[0], "gb_ridge_gibbs"])  # in the first member's slot
+                picks.append(rj[0])
+        f = np.mean([p == "rj_fstat_pe" for p in picks])
+        pr = np.mean([p == "rj_prior_pe" for p in picks])
+        w = np.mean([p == "rj_warm_pe" for p in picks])
+        # 4000 draws: sigma ~0.008 for the 0.45s, ~0.005 for the 0.1 -> 5-sigma bands
+        self.assertTrue(0.41 < f < 0.49, f)
+        self.assertTrue(0.41 < pr < 0.49, pr)
+        self.assertTrue(0.075 < w < 0.125, w)
+
+    def test_warm_fraction_zero_keeps_warm_outside_the_draw(self):
+        """The pre-2026-10-02 behaviour: rj_warm_pe runs every iteration and
+        the draw is between fstat and prior only."""
+        log = []
+        _, comb = _make(PE_NAMES, log, weighted_cycle=True)
+        model = _StubModel(seed=4)
+        with _env(GB_PE_RJ_DRAW_ONE=1, GB_PE_RJ_FSTAT_FRACTION=0.5, GB_PE_RJ_WARM_FRACTION=0):
+            for _ in range(50):
+                log.clear()
+                comb.propose(model, _StubState())
+                self.assertEqual(log[0], "rj_warm_pe")
+                self.assertEqual(len([n for n in log if n in RJ]), 1)
+
+    def test_warm_fraction_on_a_stage_without_warm_is_redistributed(self):
+        log = []
+        _, comb = _make(("rj_fstat_pe", "rj_prior_pe", "gb_ridge_gibbs"), log, weighted_cycle=True)
+        picks = []
+        with _env(GB_PE_RJ_DRAW_ONE=1, GB_PE_RJ_FSTAT_FRACTION=0.45, GB_PE_RJ_WARM_FRACTION=0.1):
+            model = _StubModel(seed=8)
+            for _ in range(2000):
+                log.clear()
+                comb.propose(model, _StubState())
+                picks.append([n for n in log if n in RJ][0])
+        f = np.mean([p == "rj_fstat_pe" for p in picks])
+        self.assertTrue(0.45 < f < 0.55, f)                    # 0.45 / (0.45 + 0.45)
+
+    def test_fractions_summing_over_one_raise(self):
+        log = []
+        _, comb = _make(PE_NAMES, log, weighted_cycle=True)
+        with _env(GB_PE_RJ_DRAW_ONE=1, GB_PE_RJ_FSTAT_FRACTION=0.95, GB_PE_RJ_WARM_FRACTION=0.1):
+            with self.assertRaises(ValueError):
+                comb.propose(_StubModel(), _StubState())
+
     def test_pe_stage_without_the_pair_falls_through(self):
         log = []
         names = ("rj_warm_pe", "rj_fstat_pe", "gb_ridge_gibbs")
