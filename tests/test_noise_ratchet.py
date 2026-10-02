@@ -403,6 +403,31 @@ class HardRefitTest(unittest.TestCase):
         M.arm_fstat_refit(fake, ("stage", 4), "profile")
         self.assertIsNone(M._consume_forced_refit(fake))
 
+    def test_soft_arm_staleness_is_suspended_while_the_ratchet_owns_the_clock(self):
+        """A stage re-entry on resume SOFT-arms a refit; the stale-by-cadence
+        test would turn that into a comb scan before the first release. With
+        fstat_refit_only_forced the soft arm loads the epoch instead; a HARD
+        arm (the nudge) still refits."""
+        import tempfile
+
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            GBSpecialRJFStatGridMove as M)
+
+        with tempfile.TemporaryDirectory() as root:
+            fake = self._fake(root)
+            fake._fstat_clock = lambda: 40                 # 36 ticks old: stale at cadence 2
+            M.arm_fstat_refit(fake, ("stage", 7), "profile")
+            self.assertIsNotNone(M._consume_forced_refit(fake))   # stale -> refit
+        with tempfile.TemporaryDirectory() as root:
+            fake = self._fake(root)
+            fake._fstat_clock = lambda: 40
+            fake.fstat_refit_only_forced = True
+            M.arm_fstat_refit(fake, ("stage", 8), "profile")
+            self.assertIsNone(M._consume_forced_refit(fake))      # suspended -> load
+            # the nudge's HARD arm is not subject to the age rule at all
+            M.arm_fstat_refit(fake, ("stage", 9), "ratchet nudge", ignore_age=True)
+            self.assertIsNotNone(M._consume_forced_refit(fake))
+
     def test_force_helper_passes_hard_through(self):
         from lisatools.globalfit.recipe import force_fstat_refit
 
@@ -682,6 +707,114 @@ class StepDrivesRatchetTest(unittest.TestCase):
             self.assertEqual(gate.modes, ["release", "nudge"])
             self.assertEqual(len(grid.armed), 1)
             self.assertEqual([k for k, _ in st._ratchet_release_maxes], [0])
+
+    def test_refit_cadence_is_suspended_while_the_ratchet_is_active(self):
+        """User ruling 2026-10-02: "let's run it only on the nudge step." The
+        grid moves' cadence is off from stage entry until the stop, and back
+        on after it; the knob =0 keeps the cadence throughout."""
+        from lisatools.globalfit.recipe import SearchStageProfileStep
+
+        def mk():
+            gate, grid = _FakeGate(), _FakeGrid()
+            grid._shutoff_w_pending = 0
+            tree = [SimpleNamespace(moves=[gate, grid])]
+            st = SearchStageProfileStep(
+                moves=tree, convergence_iter=2, plateau_branch="gb", profile={},
+                stage_name="gb_search_3",
+                ratchet=RatchetSchedule(hold=1, release=1, cycles=20, release_first=True),
+                ratchet_delta=np.zeros(5), ratchet_min_gain=200.0)
+            return st, gate, grid, tree
+
+        def smp(mx):
+            return SimpleNamespace(log_like=np.array([[mx, mx - 1.0], [0.0, 0.0]]),
+                                   branches_coords={"galfor": np.zeros((2, 2, 1, 5))})
+
+        with env(GALFOR_RATCHET_REFIT_ONLY_ON_NUDGE=None, GALFOR_RATCHET_HOLD_STAGE=None,
+                 GB_SEARCH_STAGE_END_ON_SHUTOFF=None):
+            st, gate, grid, tree = mk()
+            self.assertFalse(getattr(grid, "fstat_refit_only_forced", False))
+            st.setup_run(47, smp(1000.0), _FakeSampler(47, tree))
+            st.note_recipe_step(3)
+            self.assertTrue(grid.fstat_refit_only_forced)          # from entry (release first)
+            st.stopping_function(48, smp(1000.0), _FakeSampler(48, tree))   # -> nudge
+            self.assertTrue(grid.fstat_refit_only_forced)
+            self.assertEqual(len(grid.armed), 1)                   # the nudge still HARD-arms
+            st.stopping_function(49, smp(-5000.0), _FakeSampler(49, tree))  # -> release
+            self.assertTrue(grid.fstat_refit_only_forced)
+            # +50 -> stop, AND the stage ends in this same call (valve all shut):
+            # the cadence must come back without a further drive
+            self.assertTrue(st.stopping_function(50, smp(1050.0), _FakeSampler(50, tree)))
+            self.assertTrue(st._ratchet_stopped)
+            self.assertFalse(grid.fstat_refit_only_forced)         # cadence handed back
+        with env(GALFOR_RATCHET_REFIT_ONLY_ON_NUDGE="0"):
+            st, gate, grid, tree = mk()
+            st.setup_run(47, smp(1000.0), _FakeSampler(47, tree))
+            st.note_recipe_step(3)
+            self.assertFalse(getattr(grid, "fstat_refit_only_forced", False))
+
+    def test_refit_cadence_comes_back_when_the_schedule_runs_out_or_the_stage_ends(self):
+        """The grid move is shared with later stages: the suspension must end
+        when no nudge can come -- the cycle ceiling reached ("release
+        forever") -- and when the stage ends for any reason."""
+        from lisatools.globalfit.recipe import SearchStageProfileStep
+
+        def smp():
+            return SimpleNamespace(log_like=np.array([[1.0, 2.0], [0.0, 0.0]]),
+                                   branches_coords={"galfor": np.zeros((2, 2, 1, 5))})
+
+        # ceiling: cycles=1, release_first -> total 3 iterations (release, nudge, release)
+        gate, grid = _FakeGate(), _FakeGrid()
+        tree = [SimpleNamespace(moves=[gate, grid])]
+        st = SearchStageProfileStep(
+            moves=tree, convergence_iter=2, plateau_branch="gb", profile={},
+            stage_name="gb_search_3",
+            ratchet=RatchetSchedule(hold=1, release=1, cycles=1, release_first=True),
+            ratchet_delta=np.zeros(5))                                # min_gain off
+        with env(GALFOR_RATCHET_REFIT_ONLY_ON_NUDGE=None, GALFOR_RATCHET_HOLD_STAGE=None):
+            st.setup_run(47, smp(), _FakeSampler(47, tree))
+            st.note_recipe_step(3)
+            self.assertTrue(grid.fstat_refit_only_forced)             # k=0
+            st.stopping_function(48, smp(), _FakeSampler(48, tree))  # -> k=1 nudge
+            self.assertTrue(grid.fstat_refit_only_forced)
+            st.stopping_function(49, smp(), _FakeSampler(49, tree))  # -> k=2 release
+            self.assertTrue(grid.fstat_refit_only_forced)
+            st.stopping_function(50, smp(), _FakeSampler(50, tree))  # -> k=3: release forever
+            self.assertFalse(grid.fstat_refit_only_forced)            # no nudge can come
+            self.assertEqual(gate.modes, ["release", "nudge", "release", "release"])
+        # stage end mid-ratchet (GALFOR_RATCHET_HOLD_STAGE=0 lets the valve end it)
+        gate, grid = _FakeGate(), _FakeGrid()
+        grid._shutoff_w_pending = 0
+        tree = [SimpleNamespace(moves=[gate, grid])]
+        st = SearchStageProfileStep(
+            moves=tree, convergence_iter=2, plateau_branch="gb", profile={},
+            stage_name="gb_search_3",
+            ratchet=RatchetSchedule(hold=1, release=1, cycles=20, release_first=True),
+            ratchet_delta=np.zeros(5))
+        with env(GALFOR_RATCHET_REFIT_ONLY_ON_NUDGE=None, GALFOR_RATCHET_HOLD_STAGE="0",
+                 GB_SEARCH_STAGE_END_ON_SHUTOFF=None):
+            st.setup_run(47, smp(), _FakeSampler(47, tree))
+            st.note_recipe_step(3)
+            self.assertTrue(grid.fstat_refit_only_forced)
+            self.assertTrue(st.stopping_function(48, smp(), _FakeSampler(48, tree)))
+            self.assertFalse(grid.fstat_refit_only_forced)            # handed back on exit
+
+    def test_grid_decision_skips_the_cadence_when_only_forced(self):
+        """The decision helper is table-testable: with a grid installed and
+        the cadence overdue it says "fit", unless the ratchet owns the clock;
+        a forced arm is consumed AFTER this decision and still refits."""
+        from lisatools.globalfit.moves import gbspecialstretch as M
+
+        mv = M.GBSpecialRJFStatGridMove.__new__(M.GBSpecialRJFStatGridMove)
+        mv.rj_proposal_distribution = object()
+        mv.fstat_refit_every = 2
+        mv._fstat_last_fit_hit = 0
+        mv._fstat_epoch = 7
+        mv._fstat_clock = lambda: 10
+        self.assertEqual(mv._fstat_fit_decision(), ("fit", 8))
+        mv.fstat_refit_only_forced = True
+        self.assertEqual(mv._fstat_fit_decision(), ("skip", 7))
+        mv.fstat_refit_only_forced = False
+        self.assertEqual(mv._fstat_fit_decision(), ("fit", 8))
 
     def test_the_stop_is_stamped_into_the_store(self):
         """A relaunch must not forget that the ratchet finished."""
