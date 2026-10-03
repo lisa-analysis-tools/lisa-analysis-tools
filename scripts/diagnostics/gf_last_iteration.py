@@ -192,10 +192,16 @@ def _tail_lines(path, nbytes=TAIL_BYTES):
 
 
 def find_run_log(run_dir):
+    """The head's run log, or (a short tar / a run dir without the artifacts
+    log) the newest job stdout, which is a superset of it."""
     for name in ("globalfit_run.log", "globalfit_run_tail.log"):
         hits = glob.glob(os.path.join(run_dir, "*_artifacts", name))
         if hits:
             return max(hits, key=os.path.getmtime)
+    hits = [p for p in glob.glob(os.path.join(run_dir, "slurm_stdout_*.log"))
+            if not p.endswith(("_filtered.log", "_tail.log"))]
+    if hits:
+        return max(hits, key=os.path.getmtime)
     return None
 
 
@@ -324,8 +330,12 @@ def _fmt(x):
 def _age(m):
     if m is None:
         return "n/a"
+    if m < -1.0:
+        # the log's clock is AHEAD of this host's (a laptop reading a tar from
+        # the cluster): the age is meaningless, say so instead of a negative
+        return f"{-m:.0f} min in the future (clock skew)"
     if m < 1.0:
-        return f"{m * 60:.0f} s ago"
+        return f"{max(m, 0.0) * 60:.0f} s ago"
     if m < 120:
         return f"{m:.0f} min ago"
     return f"{m / 60:.1f} h ago"
