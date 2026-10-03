@@ -593,6 +593,10 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             "GB_RUN_FANCY_TEMPERING",               # V9-7
             "GB_SEARCH_IN_MODEL",                   # V9-8
             "GB_NUM_REPEAT_PROPOSALS",              # V9-8
+            # source in-model repeats 25 in every stage, "same as pe" (user
+            # ruling 2026-10-03); v8 ran MBH 2 / EMRI 2 / SOBBH 10
+            "MBH_NUM_PROP_REPEATS", "EMRI_NUM_PROP_REPEATS",
+            "SOBBH_NUM_PROP_REPEATS",
             "GB_SEARCH_BAND_SHUTOFF_PER_WALKER",    # V9-9
             "GB_SEARCH_BAND_SHUTOFF_CONV_ITER",     # V9-9
             "GB_SEARCH_STAGE_PER_WALKER",           # V9-9
@@ -1770,14 +1774,38 @@ class SobbhKnobsSingleExportTest(unittest.TestCase):
         self.assertNotIn("per_walker", lines[0])
 
     def test_sobbh_repeats_is_env_overridable_and_defaults_to_10(self):
-        # User ruling 2026-09-18. Repeats are the ONLY knob that moves the
-        # SOBBH cost: [SOBBH_LL_TIMING] measured a flat 1.73 s per scoring
-        # call regardless of rows, and calls come from repeats, not walkers
-        # or rungs. 20 -> 10 halves the dominant per-iteration cost.
+        # User ruling 2026-09-18 (the v8 6mo script). Repeats are the ONLY
+        # knob that moves the SOBBH cost: [SOBBH_LL_TIMING] measured a flat
+        # 1.73 s per scoring call regardless of rows, and calls come from
+        # repeats, not walkers or rungs. 20 -> 10 halves the dominant
+        # per-iteration cost.
         lines = self._exports(SCRIPTS[0], "SOBBH_NUM_PROP_REPEATS")
         self.assertEqual(len(lines), 1, lines)
         self.assertEqual(
             lines[0], "export SOBBH_NUM_PROP_REPEATS=${SOBBH_NUM_PROP_REPEATS:-10}")
+
+    def test_v9_source_repeats_are_env_overridable_and_default_to_25(self):
+        # User ruling 2026-10-03 (the v9 6mo script): "adjust the in-model
+        # repeats during search for mbhs emris and sobhbs to 25. same as pe"
+        # -- the BUILT values, so every stage runs them (sources every 5
+        # iterations in gb_search_3 and replica_pe). Yielding exports:
+        # MBH/EMRI were hard `=2` lines a launch-line value could not reach.
+        # (SOBBH history: 25 -> 20 on 2026-09-16 -> 10 on 2026-09-18 -> 25.)
+        for knob in ("MBH_NUM_PROP_REPEATS", "EMRI_NUM_PROP_REPEATS",
+                     "SOBBH_NUM_PROP_REPEATS"):
+            lines = self._exports(SIX_MO_V9, knob)
+            self.assertEqual(len(lines), 1, (knob, lines))
+            self.assertEqual(lines[0], f"export {knob}=${{{knob}:-25}}", knob)
+
+    def test_v9_pe_inmodel_repeats_cover_emri(self):
+        # User ruling 2026-10-03 ("same as pe" for mbhs, emris and sobhbs):
+        # emri joined the PE declaration list (excluded on 2026-10-02).
+        lines = self._exports(SIX_MO_V9, "PE_INMODEL_REPEATS_BRANCHES")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertEqual(
+            lines[0],
+            "export PE_INMODEL_REPEATS_BRANCHES=${PE_INMODEL_REPEATS_BRANCHES:-"
+            "gb,vgb,sobbh,mbh,emri,psd,galfor}")
 
     def test_sobbh_ntemps_is_env_overridable_and_defaults_to_8(self):
         # User ruling 2026-09-17: 8 in the scripts (the 4-GPU store is an

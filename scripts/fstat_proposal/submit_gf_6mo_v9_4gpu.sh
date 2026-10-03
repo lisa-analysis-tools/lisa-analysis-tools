@@ -4527,9 +4527,19 @@ export SOBBH_NTEMPS=${SOBBH_NTEMPS:-8}
 # TABLE SCOPE block) silently overrode this line until 2026-09-17, so the
 # ruling never took effect. Escape: SOBBH_EIGEN_SCOPE=per_walker in the env.
 export SOBBH_EIGEN_SCOPE=${SOBBH_EIGEN_SCOPE:-walker_max}
-export MBH_NUM_PROP_REPEATS=2
-export EMRI_NUM_PROP_REPEATS=2
-# 25 -> 20 (user ruling 2026-09-16) -> 10 (user ruling 2026-09-18).
+# IN-MODEL REPEATS OF THE SOURCE MOVES = 25 IN EVERY STAGE (user ruling
+# 2026-10-03: "adjust the in-model repeats during search for mbhs emris and
+# sobhbs to 25. same as pe"). These are the BUILT values, so gb_search_3 and
+# replica_pe (sources every GB_SEARCH_SOURCE_EVERY=5 iterations) run them at
+# 25 too; the PE declaration below then finds them already at 25. Were 2 / 2
+# (hard exports: a value on the launch line could not reach them) / 10.
+# ⚠ COST under EMRI_LIKELIHOOD=full (the per-row production wrap): rows per
+# visit scale as repeats x rungs, so 25 repeats x 8 rungs is 50x the 2 x 2
+# rows job 706 ran. EMRI_NUM_PROP_REPEATS=2 on the line keeps the old count.
+export MBH_NUM_PROP_REPEATS=${MBH_NUM_PROP_REPEATS:-25}
+export EMRI_NUM_PROP_REPEATS=${EMRI_NUM_PROP_REPEATS:-25}
+# 25 -> 20 (user ruling 2026-09-16) -> 10 (user ruling 2026-09-18) -> 25
+# (user ruling 2026-10-03, above).
 # THE lever on the dominant per-iteration cost. [SOBBH_LL_TIMING] on the
 # 4-GPU run measured the chunked-het scorer at a FLAT 1.73 s per CALL,
 # independent of how many rows the call carries (windows of 138 and 404
@@ -4542,17 +4552,19 @@ export EMRI_NUM_PROP_REPEATS=2
 # ~130 s and the iteration drops to ~7.2 min. The underlying defect is the
 # 605 ms group launch: the in-code reference for this configuration is
 # 2.78 ms/row (sobbhspecialmove.py, job-373 note), ~58x away.
-export SOBBH_NUM_PROP_REPEATS=${SOBBH_NUM_PROP_REPEATS:-10}
-# full_pe ONLY (user ruling 2026-10-02: "in-model repeats of 25 for all
-# sources except emris for right now for PE. This includes VGBs and GBs
-# ... that way we have a general 'thinning' factor of 25"): the PE stage
-# declares the in-model repeat count for the listed branches on entry, on
-# the built moves it shares with the search stages, so the search stages
-# keep SOBBH 10 / MBH 2 / VGB 1 / GB 25 / PSD 10 / GALFOR 10 from the knobs
-# above. EMRI stays at its own knob. Unset PE_INMODEL_REPEATS = every move
-# as built.
+export SOBBH_NUM_PROP_REPEATS=${SOBBH_NUM_PROP_REPEATS:-25}
+# PE stages (replica_pe + full_pe; user ruling 2026-10-02: "in-model repeats
+# of 25 for all sources ... This includes VGBs and GBs ... that way we have a
+# general 'thinning' factor of 25"): the PE stage declares the in-model
+# repeat count for the listed branches on entry, on the built moves it shares
+# with the search stages. With the source knobs above at 25 the declaration
+# only changes VGB 1 / PSD 10 / GALFOR 10 -> 25. EMRI joined the list on
+# 2026-10-03 ("same as pe" for mbhs, emris and sobhbs); an
+# EMRI_NUM_PROP_REPEATS=2 on the line therefore needs
+# PE_INMODEL_REPEATS_BRANCHES=gb,vgb,sobbh,mbh,psd,galfor as well to keep EMRI
+# at 2 through PE. Unset PE_INMODEL_REPEATS = every move as built.
 export PE_INMODEL_REPEATS=${PE_INMODEL_REPEATS:-25}
-export PE_INMODEL_REPEATS_BRANCHES=${PE_INMODEL_REPEATS_BRANCHES:-gb,vgb,sobbh,mbh,psd,galfor}
+export PE_INMODEL_REPEATS_BRANCHES=${PE_INMODEL_REPEATS_BRANCHES:-gb,vgb,sobbh,mbh,emri,psd,galfor}
 export MBH_PERMUTE_EVERY=10
 export EMRI_PERMUTE_EVERY=10
 export SOBBH_PERMUTE_EVERY=10
