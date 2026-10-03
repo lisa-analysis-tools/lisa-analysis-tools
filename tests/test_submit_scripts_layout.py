@@ -38,12 +38,16 @@ SCRIPTS = [
     # inflated foreground reference, no warm start, 2 GPUs. See
     # ThreeMonthV9TwinTest for the declared delta list.
     os.path.join(ROOT, "scripts", "fstat_proposal", "submit_gf_3mo_v9_2gpu.sh"),
+    # the 1-year twin OF THE V9 SCRIPT (2026-10-03): byte-identical to the
+    # 6mo v9 script except the Tobs deltas. See OneYearV9TwinTest.
+    os.path.join(ROOT, "scripts", "fstat_proposal", "submit_gf_1yr_v9.sh"),
 ]
 
 THREE_MO = SCRIPTS[2]
 SIX_MO = SCRIPTS[0]
 SIX_MO_V9 = SCRIPTS[3]
 THREE_MO_V9 = SCRIPTS[4]
+ONE_YR_V9 = SCRIPTS[5]
 
 # Env knobs the dispatch block reads; stripped from the inherited environment
 # before each scenario applies its own overrides, so a stray value in the
@@ -2181,6 +2185,141 @@ class SubmitScriptsDispatchTest(unittest.TestCase):
                     },
                 )
                 self.assertIn("--ntasks=2", lines)
+
+
+class OneYearV9TwinTest(unittest.TestCase):
+    """``submit_gf_1yr_v9.sh`` IS ``submit_gf_6mo_v9_4gpu.sh`` at 12 months.
+
+    User ruling 2026-10-03: "identical runs with the exception of changing
+    the usual Tobs changes ... the most minimal amount of changes needed for
+    the waveforms and other areas due to 12 mo instead of 6". The guard is
+    byte-level: the 1yr file must equal the 6mo file with EXACTLY the
+    replacements below applied (plus its own comment header), so any fix that
+    lands in one script and not the other, or any extra knob, fails here.
+    The three waveform windows (MBH / EMRI / SOBBH, 2026-10-03) declared NO
+    export-line changes at 1 yr beyond MBHB_IDS and the preflights' grid.
+    """
+
+    # (6mo text, 1yr text, occurrences) -- the generator's table, verbatim
+    REPLACEMENTS = (
+        ("#SBATCH --job-name=gf6mo_v9_4gpu     # job name",
+         "#SBATCH --job-name=gf1yr_v9          # job name", 1),
+        ("/shared/data/global_fit_output/gf6mo_v9_4gpu_%j.log",
+         "/shared/data/global_fit_output/gf1yr_v9_%j.log", 1),
+        ("STORE_DIR=${STORE_DIR:-/shared/data/global_fit_output/gf_prod_6mo_v9_4gpu/}",
+         "STORE_DIR=${STORE_DIR:-/shared/data/global_fit_output/gf_prod_1yr_v9/}", 1),
+        ("export BASE_FILE_NAME=gf_prod_6mo\n", "export BASE_FILE_NAME=gf_prod_1yr\n", 1),
+        ("export TOBS_TARGET=15552000        # 180 d; grid resolves Nf 1440 x Nt 4320 x dt 2.5 (exact factor-2 of 3 mo in Nt)",
+         "export TOBS_TARGET=31104000        # 360 d; grid resolves Nf 1440 x Nt 8640 x dt 2.5 (exact factor-2 of 6 mo in Nt, as 6 mo was of 3 mo)", 1),
+        ("export SIGHET_NT_LAYER=120\n", "export SIGHET_NT_LAYER=240\n", 1),
+        ("export GB_NLEAVES_MAX=15000        # 6 mo: deeper confusion resolved; 3-mo ran 10000",
+         "export GB_NLEAVES_MAX=20000        # 1 yr: deeper confusion resolved again; 6-mo ran 15000, 3-mo 10000", 1),
+        ("export GB_N_SUBBANDS=8192   # PER GPU; total = x n_gpus. Slab ~0.5 MB/slot",
+         "export GB_N_SUBBANDS=4096   # PER GPU; total = x n_gpus. Slab ~1.0 MB/slot at 1 yr", 1),
+        ("export GB_RJ_INMODEL_CHUNK=32768  # byte-parity with the 3mo twin's 65536 (6mo cells ~2x bytes); floored to ntemps multiples by the column-atomic staging",
+         "export GB_RJ_INMODEL_CHUNK=16384  # byte-parity with the 6mo 32768 (1yr cells ~2x bytes); floored to ntemps multiples by the column-atomic staging", 1),
+        ("export MBHB_IDS=2,5,16,18          # t_c 173.3 / 104.7 / 111.4 / 92.0 d",
+         "export MBHB_IDS=0,2,3,4,5,7,9,12,15,16,18   # t_c 300.4/173.3/336.8/286.4/104.7/263.8/285.9/243.8/318.0/111.4/92.0 d (MBH session 2026-10-03). src 10 (2.8e6 Msun, SNR~1963) merges at 369.5 d, 9.5 d past the window, so the 7-d MBH_MERGER_TIME_BUFFER leaves it out; to model its in-window inspiral add 10 here and export MBH_MERGER_TIME_BUFFER=1209600", 1),
+        ("make_factory(1440, 4320)", "make_factory(1440, 8640)", 2),
+        ("Nf 1440 x Nt 4320 at dt 2.5 s", "Nf 1440 x Nt 8640 at dt 2.5 s", 3),
+        ("${STORE_DIR}/warmstart/gf_prod_3mo_v8_10w_refereed.npz}",
+         "${STORE_DIR}/warmstart/gf_prod_6mo_v9_4gpu_refereed.npz}", 1),
+        ("GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/global_fit_output/gf_prod_3mo_v8_10walkers/gf_prod_3mo_testing.h5}",
+         "GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/global_fit_output/gf_prod_6mo_v9_4gpu/gf_prod_6mo_testing.h5}", 1),
+        ("GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-7776000}",
+         "GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-15552000}   # the 6-month parent", 1),
+    )
+
+    def setUp(self):
+        self.six_text = open(SIX_MO_V9).read()
+        self.one_text = open(ONE_YR_V9).read()
+        self.six = _exports(SIX_MO_V9)
+        self.one = _exports(ONE_YR_V9)
+
+    def test_the_1yr_script_is_the_6mo_script_plus_exactly_these_replacements(self):
+        body = self.six_text
+        self.assertTrue(body.startswith("#!/bin/bash\n"))
+        body = body[len("#!/bin/bash\n"):]
+        for old, new, n in self.REPLACEMENTS:
+            self.assertEqual(body.count(old), n, old)
+            body = body.replace(old, new)
+        # the 1yr file = shebang + its own comment-only header + that body
+        self.assertTrue(self.one_text.startswith("#!/bin/bash\n"))
+        self.assertTrue(self.one_text.endswith(body),
+                        "the 1yr script drifted from the 6mo script beyond the "
+                        "declared Tobs replacements (diff the two files)")
+        header = self.one_text[:-len(body)]
+        for line in header.splitlines():
+            self.assertTrue(line.startswith("#") or line == "",
+                            f"non-comment line in the 1yr header: {line!r}")
+
+    def test_tobs_and_its_derived_settings_are_the_1yr_values(self):
+        self.assertEqual(self.one["TOBS_TARGET"], "31104000")
+        self.assertEqual(self.one["SIGHET_NT_LAYER"], "240")
+        self.assertEqual(self.one["GB_NLEAVES_MAX"], "20000")
+        self.assertEqual(self.one["GB_N_SUBBANDS"], "4096")
+        self.assertEqual(self.one["GB_RJ_INMODEL_CHUNK"], "16384")
+        self.assertEqual(self.one["BASE_FILE_NAME"], "gf_prod_1yr")
+        # STORE_DIR is a plain (non-export) assignment the resolver skips:
+        # pin the line itself
+        self.assertIn(
+            "\nSTORE_DIR=${STORE_DIR:-/shared/data/global_fit_output/gf_prod_1yr_v9/}\n",
+            self.one_text)
+        self.assertNotIn("gf_prod_6mo_v9_4gpu/}", self.one_text)
+        # the warm start + noise pin come from the 6mo v9 parent, together
+        self.assertEqual(
+            self.one["GF_SEED_STORE"],
+            "/shared/data/global_fit_output/gf_prod_6mo_v9_4gpu/gf_prod_6mo_testing.h5")
+        self.assertEqual(self.one["GB_WARM_START_SOURCE_STORE"], self.one["GF_SEED_STORE"])
+        self.assertEqual(self.one["GB_WARM_START_SOURCE_TOBS"], "15552000")
+        self.assertTrue(self.one["GB_WARM_START_COMPONENTS"].endswith(
+            "/warmstart/gf_prod_6mo_v9_4gpu_refereed.npz"),
+            self.one["GB_WARM_START_COMPONENTS"])
+
+    def test_the_sources_inside_360_days(self):
+        # MBH session 2026-10-03: 11 MBHBs merge inside 360 d + the 7 d buffer;
+        # src 10 (369.5 d) is left out. EMRI / SOBHB sets unchanged.
+        self.assertEqual(self.one["MBHB_IDS"], "0,2,3,4,5,7,9,12,15,16,18")
+        self.assertEqual(self.one["EMRI_IDS"], self.six["EMRI_IDS"])
+        self.assertEqual(self.one["SOBHB_IDS"], self.six["SOBHB_IDS"])
+        self.assertNotIn("MBH_MERGER_TIME_BUFFER", self.one)
+
+    def test_the_preflights_name_the_1yr_grid(self):
+        # the MBH + EMRI resolvers, plus the header's 1YR-4 note
+        self.assertEqual(self.one_text.count("make_factory(1440, 8640)"), 3)
+        self.assertNotIn("make_factory(1440, 4320)", self.one_text)
+        # the three "this run's grid" preflight comments follow the resolvers;
+        # the 6mo lineage comments (sig-het stride derivation etc.) keep their
+        # historical 4320 verbatim, as the byte-identity test requires
+        self.assertEqual(self.one_text.count("Nf 1440 x Nt 8640 at dt 2.5 s"), 3)
+        self.assertNotIn("Nf 1440 x Nt 4320 at dt 2.5 s", self.one_text)
+
+    def test_every_other_export_is_identical(self):
+        # (STORE_DIR is a plain assignment the resolver skips, and
+        # FILE_STORE_DIR=${STORE_DIR} therefore resolves empty in both files;
+        # the STORE_DIR line is pinned as text above.)
+        allowed = {
+            "TOBS_TARGET", "SIGHET_NT_LAYER", "GB_NLEAVES_MAX", "GB_N_SUBBANDS",
+            "GB_RJ_INMODEL_CHUNK", "BASE_FILE_NAME",
+            "MBHB_IDS", "GF_SEED_STORE", "GB_WARM_START_SOURCE_STORE",
+            "GB_WARM_START_SOURCE_TOBS", "GB_WARM_START_COMPONENTS",
+        }
+        keys = (set(self.one) | set(self.six)) - {"_", "SHLVL", "PWD"}
+        drift = {k: (self.six.get(k), self.one.get(k))
+                 for k in sorted(keys - allowed)
+                 if self.six.get(k) != self.one.get(k)}
+        self.assertEqual(drift, {}, f"undeclared 6mo -> 1yr drift: {drift}")
+        # and every declared knob really differs (a stale allowlist hides drift)
+        same = sorted(k for k in allowed if self.six.get(k) == self.one.get(k))
+        self.assertEqual(same, [], f"declared deltas that do not differ: {same}")
+
+    def test_the_name_carries_no_gpu_count(self):
+        # user ruling 2026-10-03: "I do not want to add '_4gpu' because ... I may
+        # use more later" -- NGPUS picks the layout at launch, as on the 6mo
+        self.assertEqual(os.path.basename(ONE_YR_V9), "submit_gf_1yr_v9.sh")
+        self.assertIn("#SBATCH --job-name=gf1yr_v9", self.one_text)
+        self.assertIn("/shared/data/global_fit_output/gf1yr_v9_%j.log", self.one_text)
+        self.assertNotIn("gf1yr_v9_4gpu", self.one_text)
 
 
 if __name__ == "__main__":
