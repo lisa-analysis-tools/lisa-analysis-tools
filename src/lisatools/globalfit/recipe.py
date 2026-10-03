@@ -1650,6 +1650,8 @@ class SearchStageProfileStep(RJRecipeStep):
     def __init__(self, *args, profile: typing.Optional[dict] = None,
                  stage_name: str = "", ratchet=None, ratchet_delta=None,
                  ratchet_min_gain: float = 0.0, ratchet_min_nudges: int = 0,
+                 ratchet_stop_rule: str = "gain", ratchet_min_drop: float = 0.0,
+                 ratchet_drop_band=None,
                  legs: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.profile = dict(profile or {})
@@ -1688,9 +1690,39 @@ class SearchStageProfileStep(RJRecipeStep):
         # ``_ratchet_nudges``, which _drive_ratchet increments per nudge; a
         # relaunch starts the count again.
         self.ratchet_min_nudges = int(ratchet_min_nudges or 0)
+        # ``ratchet_stop_rule`` (user ruling 2026-10-03, "adjust away from the
+        # raw lnL gain"): what ends the ratchet before the cycle ceiling --
+        # "galfor" = the released foreground must still FALL by
+        # ``ratchet_min_drop`` (fraction, median walker, over
+        # ``ratchet_drop_band`` Hz) between releases; "gain" = the 10-02 lnL
+        # rule above; "off" = the ceiling alone. The constructor default stays
+        # "gain" (every earlier caller passed ratchet_min_gain); the launcher's
+        # default is "galfor" (noise_ratchet.stop_rule_from_env).
+        from .noise_ratchet import STOP_RULES
+
+        rule = str(ratchet_stop_rule or "gain").strip().lower()
+        if rule not in STOP_RULES:
+            raise ValueError(
+                f"SearchStageProfileStep({stage_name!r}): ratchet_stop_rule={rule!r} "
+                f"is not one of {STOP_RULES}.")
+        self.ratchet_stop_rule = rule
+        self.ratchet_min_drop = float(ratchet_min_drop or 0.0)
+        if rule == "galfor" and ratchet is not None and not 0.0 < self.ratchet_min_drop < 1.0:
+            raise ValueError(
+                f"SearchStageProfileStep({stage_name!r}): ratchet_stop_rule='galfor' needs "
+                f"0 < ratchet_min_drop < 1 (a fraction), got {self.ratchet_min_drop}.")
+        band = (3e-3, 5e-3) if ratchet_drop_band is None else tuple(
+            float(x) for x in ratchet_drop_band)
+        if len(band) != 2 or not (0.0 < band[0] < band[1]):
+            raise ValueError(
+                f"SearchStageProfileStep({stage_name!r}): ratchet_drop_band must be "
+                f"(f_lo, f_hi) Hz with 0 < f_lo < f_hi, got {ratchet_drop_band!r}.")
+        self.ratchet_drop_band = band
         self._ratchet_stopped = False
         self._ratchet_last_release_max = None
         self._ratchet_release_maxes = []
+        self._ratchet_last_release_galfor = None
+        self._ratchet_release_drops = []
         self._ratchet_last_k = None
         self._ratchet_pre_nudge = None
         self._ratchet_pre_nudge_w = None
@@ -1960,22 +1992,42 @@ class SearchStageProfileStep(RJRecipeStep):
         return int(k_next) < self.ratchet.total_iterations
 
     def _ratchet_check_gain(self, k_done, sample, moves) -> None:
-        """The data-driven stop (user design 2026-10-02).
+        """The data-driven stop, decided after every completed RELEASE.
 
-        After every completed RELEASE iteration, record the maximum cold
-        log-likelihood over the walkers ("check the max logL achieved") and
-        compare it with the previous release's. A gain below
-        ``ratchet_min_gain`` nats means the last nudge bought nothing worth
-        another: ``_ratchet_stopped`` latches, the gate is told to finish
-        (:meth:`NoiseRatchetGate.finish_ratchet`) and the stage ends on its
-        ordinary rule. ``ratchet_min_gain`` 0 disables the check. The first
-        release only sets the baseline.
+        ``ratchet_stop_rule``:
+
+        * ``galfor`` (user ruling 2026-10-03, "adjust away from the raw lnL
+          gain"): the released per-walker galfor curve over
+          ``ratchet_drop_band`` is divided by the SAME walker's curve at the
+          previous release (:func:`noise_ratchet.galfor_band_drop`); when the
+          median walker's foreground fell by less than ``ratchet_min_drop``
+          (or rose) the last nudge bought nothing and the ratchet ends. The
+          lnL gain is still logged, informational. A sample without galfor
+          coordinates falls back to the gain rule for that release, with a
+          WARNING (never a silent no-op).
+        * ``gain`` (2026-10-02): the maximum cold log-likelihood over the
+          walkers ("check the max logL achieved") must gain at least
+          ``ratchet_min_gain`` nats over the previous release.
+        * ``off``: nothing here ends the ratchet; the cycle ceiling does.
+
+        On a stop ``_ratchet_stopped`` latches, the gate is told to finish
+        (:meth:`NoiseRatchetGate.finish_ratchet`), the refit cadence and the
+        valve floor come back, the decision is stamped in the store and the
+        stage ends on its ordinary rule. ``ratchet_min_nudges`` holds every
+        rule off until that many nudges have run in this process. The first
+        release only records the reference.
         """
         if getattr(self, "ratchet", None) is None or sample is None:
             return
+        rule = str(getattr(self, "ratchet_stop_rule", "gain") or "gain")
         gain_min = float(getattr(self, "ratchet_min_gain", 0.0) or 0.0)
-        if gain_min <= 0 or getattr(self, "_ratchet_stopped", False):
+        min_drop = float(getattr(self, "ratchet_min_drop", 0.0) or 0.0)
+        if getattr(self, "_ratchet_stopped", False) or rule == "off":
             return
+        if rule == "gain" and gain_min <= 0:
+            return                      # the 10-02 rule, disarmed
+        if rule == "galfor" and min_drop <= 0:
+            return                      # refused at construction; belt and braces
         if int(k_done) < 0 or self.ratchet.action(k_done) != "release":
             return                      # k < 0: a head that ran before a clock reset
         try:
@@ -1990,29 +2042,72 @@ class SearchStageProfileStep(RJRecipeStep):
             hist = self._ratchet_release_maxes = []
         hist.append((int(k_done), mx))
         self._ratchet_last_release_max = mx
+        # the RELEASED per-walker galfor vectors: the noise moves run only in
+        # the gated head under the ratchet, so the wrap's coordinates ARE the
+        # release's result (6mo rows 73-76 / 81-84: identical galfor per leg)
+        coords = self._ratchet_release_coords(sample)
+        prev_coords = getattr(self, "_ratchet_last_release_galfor", None)
+        self._ratchet_last_release_galfor = coords
+        lo, hi = getattr(self, "ratchet_drop_band", (3e-3, 5e-3))
         if prev is None:
-            logger.info(
-                "[GALFOR_RATCHET %s] after RELEASE %d: max cold lnL %.3f (walker "
-                "mean %.3f) -- the baseline for the ratchet's stop rule "
-                "(GALFOR_RATCHET_MIN_GAIN=%.0f).", tag, k_done, mx, mean, gain_min)
+            if rule == "galfor":
+                logger.info(
+                    "[GALFOR_RATCHET %s] after RELEASE %d: released galfor recorded as the "
+                    "reference for the stop rule (GALFOR_RATCHET_STOP_RULE=galfor: the next "
+                    "release must lower the median walker's foreground at %g-%g mHz by at "
+                    "least %g%% or the ratchet ends); max cold lnL %.3f (walker mean %.3f), "
+                    "informational.%s", tag, k_done, 1e3 * lo, 1e3 * hi, 100.0 * min_drop,
+                    mx, mean, "" if coords is not None else
+                    " WARNING: no galfor coordinates in the sample -- the lnL gain rule "
+                    "will decide the next release instead.")
+            else:
+                logger.info(
+                    "[GALFOR_RATCHET %s] after RELEASE %d: max cold lnL %.3f (walker "
+                    "mean %.3f) -- the baseline for the ratchet's stop rule "
+                    "(GALFOR_RATCHET_MIN_GAIN=%.0f).", tag, k_done, mx, mean, gain_min)
             return
         gain = mx - prev
-        if gain >= gain_min:
-            logger.info(
-                "[GALFOR_RATCHET %s] after RELEASE %d: max cold lnL %.3f (walker "
-                "mean %.3f), %+.1f over the previous release -- a real step "
-                "(threshold %.0f); ratcheting continues.", tag, k_done, mx, mean,
-                gain, gain_min)
+        # ---- the verdict ---------------------------------------------------
+        if rule == "galfor" and coords is not None and prev_coords is not None \
+                and np.shape(coords) == np.shape(prev_coords):
+            from .noise_ratchet import galfor_band_drop
+
+            stat = galfor_band_drop(coords, prev_coords, lo, hi)
+            drops = getattr(self, "_ratchet_release_drops", None)
+            if drops is None:
+                drops = self._ratchet_release_drops = []
+            drops.append((int(k_done), float(stat["drop"])))
+            keep_going = stat["drop"] >= min_drop
+            what = (f"released foreground at {1e3 * lo:g}-{1e3 * hi:g} mHz / previous release: "
+                    f"median walker ratio {stat['ratio_median']:.4f} = drop {100.0 * stat['drop']:+.2f}% "
+                    f"(threshold {100.0 * min_drop:g}%; walkers "
+                    f"{np.array2string(np.asarray(stat['ratio_walkers']), precision=3)}; "
+                    f"mean-of-curves {stat['ratio_mean_curves']:.4f}); max cold lnL {mx:.3f}, "
+                    f"{gain:+.1f} over the previous release (informational)")
+        else:
+            if rule == "galfor":
+                logger.warning(
+                    "[GALFOR_RATCHET %s] after RELEASE %d: the stop rule is 'galfor' but the "
+                    "released galfor coordinates are %s -- deciding this release on the lnL "
+                    "gain rule instead (GALFOR_RATCHET_MIN_GAIN=%.0f%s).", tag, k_done,
+                    "missing from the sample" if (coords is None or prev_coords is None)
+                    else f"shaped {np.shape(coords)} vs {np.shape(prev_coords)}",
+                    gain_min, "" if gain_min > 0 else " = no stop possible")
+            keep_going = (gain >= gain_min) if gain_min > 0 else True
+            what = (f"max cold lnL {mx:.3f} (walker mean {mean:.3f}), {gain:+.1f} over the "
+                    f"previous release (threshold {gain_min:.0f})")
+        if keep_going:
+            logger.info("[GALFOR_RATCHET %s] after RELEASE %d: %s -- a real step; ratcheting "
+                        "continues.", tag, k_done, what)
             return
         _n_nudges = int(getattr(self, "_ratchet_nudges", 0) or 0)
         _min_nudges = int(getattr(self, "ratchet_min_nudges", 0) or 0)
         if _n_nudges < _min_nudges:
             logger.info(
-                "[GALFOR_RATCHET %s] after RELEASE %d: max cold lnL %.3f (walker "
-                "mean %.3f), %+.1f over the previous release < %.0f -- but only %d "
+                "[GALFOR_RATCHET %s] after RELEASE %d: %s -- below the threshold, but only %d "
                 "of the required %d nudge(s) have run in this process "
-                "(GALFOR_RATCHET_MIN_NUDGES); ratcheting continues.", tag, k_done,
-                mx, mean, gain, gain_min, _n_nudges, _min_nudges)
+                "(GALFOR_RATCHET_MIN_NUDGES); ratcheting continues.", tag, k_done, what,
+                _n_nudges, _min_nudges)
             return
         self._ratchet_stopped = True
         gate = self._ratchet_gate(moves) if moves is not None else None
@@ -2030,12 +2125,25 @@ class SearchStageProfileStep(RJRecipeStep):
         _stamped = bool(_fn(self.stage_name, "galfor_ratchet_done", 1)) if (
             callable(_fn) and self.stage_name) else False
         logger.info(
-            "[GALFOR_RATCHET %s] after RELEASE %d: max cold lnL %.3f (walker "
-            "mean %.3f), %+.1f over the previous release < %.0f -- RATCHET DONE "
+            "[GALFOR_RATCHET %s] after RELEASE %d: %s -- below the threshold: RATCHET DONE "
             "after %d release(s): no more nudges; the gate stays released and "
             "the stage ends on its ordinary per-band shut-off rule. Stop %s "
-            "in the store's recipe group.", tag, k_done, mx, mean, gain, gain_min,
+            "in the store's recipe group.", tag, k_done, what,
             len(hist), "STAMPED" if _stamped else "NOT stamped (in-process only)")
+
+    @staticmethod
+    def _ratchet_release_coords(sample):
+        """The cold per-walker galfor vectors ``(nwalkers, 5)`` of ``sample``, or None."""
+        try:
+            bc = getattr(sample, "branches_coords", None)
+            if bc is None or "galfor" not in bc:
+                return None
+            arr = np.asarray(bc["galfor"], dtype=float)
+            if arr.ndim != 4 or arr.shape[2] < 1:
+                return None
+            return np.array(arr[0, :, 0, :], copy=True)
+        except Exception:  # noqa: BLE001 -- a readout, never fatal
+            return None
 
     def _ratchet_gate(self, moves):
         from .noise_ratchet import is_noise_ratchet_gate

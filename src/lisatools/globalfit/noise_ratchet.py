@@ -217,6 +217,89 @@ def min_gain_from_env() -> float:
     return v
 
 
+#: What may END the ratchet before its cycle ceiling (``GALFOR_RATCHET_STOP_RULE``).
+#:
+#: * ``galfor`` -- the released FOREGROUND itself (user ruling 2026-10-03,
+#:   "let's adjust away from the raw lnL gain"): after every release the
+#:   per-walker galfor curve is compared with the same walker's curve at the
+#:   previous release over a band (``GALFOR_RATCHET_DROP_BAND``, 3-5 mHz by
+#:   default); when the median walker's foreground has not fallen by at least
+#:   ``GALFOR_RATCHET_MIN_DROP`` (fraction), the last nudge bought nothing
+#:   and no more nudges follow. Each walker is compared with ITSELF, so the
+#:   posterior spread between walkers (3-9 % at 3-5 mHz on the 6mo store)
+#:   does not enter; the median over walkers is the ensemble statistic.
+#:   Why not the lnL: with the prior RJ move in births+deaths mode the cold
+#:   chain relaxes toward the typical set (job 706: -360..-920 per walker in
+#:   one prior-removal leg) and the max cold lnL at a release wrap can fall
+#:   between releases for reasons unrelated to the foreground.
+#: * ``gain`` -- the max cold lnL gain over the previous release
+#:   (``GALFOR_RATCHET_MIN_GAIN``), the 2026-10-02 rule.
+#: * ``off`` -- the cycle ceiling alone.
+STOP_RULES = ("galfor", "gain", "off")
+
+
+def stop_rule_from_env() -> str:
+    raw = (os.environ.get("GALFOR_RATCHET_STOP_RULE", "galfor").strip().lower() or "galfor")
+    if raw not in STOP_RULES:
+        raise ValueError(
+            f"GALFOR_RATCHET_STOP_RULE={raw!r}: expected one of {STOP_RULES}.")
+    return raw
+
+
+def min_drop_from_env() -> float:
+    """``GALFOR_RATCHET_MIN_DROP``: the 'galfor' rule's threshold, a fraction.
+
+    A release whose median-walker foreground over the band fell by less than
+    this (or rose) ends the ratchet. Default 0.01: on the 6mo store the first
+    nudge/release pair moved the released curve by 4-6 % at 3-5 mHz and the
+    second by ~2 % (walker-median 1.8 %), so 1 % is "no longer stepping".
+    """
+    v = _env_float("GALFOR_RATCHET_MIN_DROP", 0.01)
+    if not 0.0 < v < 1.0:
+        raise ValueError(f"GALFOR_RATCHET_MIN_DROP={v} must lie in (0, 1) (a fraction).")
+    return v
+
+
+def drop_band_from_env() -> tuple:
+    """``GALFOR_RATCHET_DROP_BAND``: ``f_lo,f_hi`` in Hz for the 'galfor' rule (3e-3,5e-3)."""
+    raw = os.environ.get("GALFOR_RATCHET_DROP_BAND", "").strip()
+    if not raw:
+        return (3e-3, 5e-3)
+    parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+    if len(parts) != 2:
+        raise ValueError(f"GALFOR_RATCHET_DROP_BAND={raw!r}: expected 'f_lo,f_hi' in Hz.")
+    try:
+        lo, hi = float(parts[0]), float(parts[1])
+    except ValueError:
+        raise ValueError(f"GALFOR_RATCHET_DROP_BAND={raw!r}: not numbers.") from None
+    if not (0.0 < lo < hi):
+        raise ValueError(f"GALFOR_RATCHET_DROP_BAND={raw!r}: need 0 < f_lo < f_hi.")
+    return (lo, hi)
+
+
+def galfor_band_drop(coords_new, coords_prev, f_lo, f_hi, n_grid: int = 9) -> dict:
+    """The 'galfor' stop rule's statistic between two releases.
+
+    ``coords_*`` are the per-walker cold galfor vectors ``(nwalkers, 5)`` in
+    the sampled basis. Over a log-spaced grid in ``[f_lo, f_hi]`` each
+    walker's released curve is divided by the SAME walker's curve at the
+    previous release and averaged over the grid; the median over walkers is
+    the ensemble ratio and ``drop = 1 - median`` the statistic (positive =
+    the foreground fell). Also returns the mean-of-curves ratio for the log.
+    """
+    new = np.atleast_2d(np.asarray(coords_new, dtype=float))
+    prev = np.atleast_2d(np.asarray(coords_prev, dtype=float))
+    if new.shape != prev.shape:
+        raise ValueError(f"galfor coordinate shapes differ: {new.shape} vs {prev.shape}")
+    f = np.geomspace(float(f_lo), float(f_hi), int(n_grid))
+    c_new, c_prev = galfor_curves(new, f), galfor_curves(prev, f)
+    ratio_w = np.mean(c_new / c_prev, axis=1)
+    med = float(np.median(ratio_w))
+    return dict(ratio_median=med, drop=1.0 - med, ratio_walkers=ratio_w,
+                ratio_mean_curves=float(np.mean(c_new.mean(axis=0) / c_prev.mean(axis=0))),
+                f_lo=float(f_lo), f_hi=float(f_hi))
+
+
 def nudge_delta_from_env() -> np.ndarray:
     """The per-nudge shift of the galfor coordinates, sampled (log10) basis."""
     d = np.array(GALFOR_RATCHET_DEFAULT_DELTA, copy=True)

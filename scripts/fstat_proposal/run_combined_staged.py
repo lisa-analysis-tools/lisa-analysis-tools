@@ -1674,13 +1674,22 @@ def build_fit():
         # iteration; see lisatools.globalfit.noise_ratchet. Unset, the
         # composition below is byte-identical to before.
         from lisatools.globalfit.noise_ratchet import (
-            min_gain_from_env, nudge_delta_from_env, ratchet_from_env)
+            drop_band_from_env, min_drop_from_env, min_gain_from_env,
+            nudge_delta_from_env, ratchet_from_env, stop_rule_from_env)
 
         _ratchet = ratchet_from_env() if sample_noise else None
         _ratchet_delta = ([float(x) for x in nudge_delta_from_env()]
                           if _ratchet is not None else None)
         # the data-driven stop (user design 2026-10-02): GALFOR_RATCHET_MIN_GAIN
         _ratchet_min_gain = min_gain_from_env() if _ratchet is not None else 0.0
+        # WHICH rule ends the ratchet (user ruling 2026-10-03, "adjust away from
+        # the raw lnL gain"): GALFOR_RATCHET_STOP_RULE galfor (default) /
+        # gain / off; the galfor rule's threshold GALFOR_RATCHET_MIN_DROP
+        # (fraction) over GALFOR_RATCHET_DROP_BAND (Hz). Resolved only when
+        # the ratchet is armed so an unratcheted launch reads no new knobs.
+        _ratchet_stop_rule = stop_rule_from_env() if _ratchet is not None else "gain"
+        _ratchet_min_drop = min_drop_from_env() if _ratchet is not None else 0.0
+        _ratchet_drop_band = drop_band_from_env() if _ratchet is not None else None
         # GALFOR_RATCHET_MIN_NUDGES: the stop may not fire before this many
         # nudges have run in the process (user ruling 2026-10-02: "I want to
         # force at least 1 more nudge"); 0 = no floor
@@ -1742,10 +1751,22 @@ def build_fit():
                   f"{_rel_tol:g} nats, at most {_rel_cap} rounds per release."
                   + (" The schedule opens with a RELEASE before the first nudge."
                      if _ratchet.release_first else "")
-                  + (f" Data-driven stop: after a release whose max cold lnL gains "
-                     f"less than {_ratchet_min_gain:.0f} over the previous release, "
-                     f"no more nudges (the {_ratchet.cycles}-cycle count is a ceiling)."
-                     if _ratchet_min_gain > 0 else ""),
+                  + (f" Data-driven stop (GALFOR_RATCHET_STOP_RULE=galfor): after a release "
+                     f"whose median-walker foreground at "
+                     f"{1e3 * _ratchet_drop_band[0]:g}-{1e3 * _ratchet_drop_band[1]:g} mHz "
+                     f"fell by less than {100.0 * _ratchet_min_drop:g}% of the previous "
+                     f"release's (each walker against itself), no more nudges (the "
+                     f"{_ratchet.cycles}-cycle count is a ceiling; the lnL gain is logged "
+                     f"but does not decide)."
+                     if _ratchet_stop_rule == "galfor" else
+                     f" Data-driven stop (GALFOR_RATCHET_STOP_RULE=gain): after a release "
+                     f"whose max cold lnL gains less than {_ratchet_min_gain:.0f} over the "
+                     f"previous release, no more nudges (the {_ratchet.cycles}-cycle count "
+                     f"is a ceiling)."
+                     if _ratchet_stop_rule == "gain" and _ratchet_min_gain > 0 else
+                     f" No data-driven stop (GALFOR_RATCHET_STOP_RULE={_ratchet_stop_rule}"
+                     f"{'' if _ratchet_stop_rule == 'off' else ', MIN_GAIN 0'}): the "
+                     f"{_ratchet.cycles}-cycle count ends the ratchet."),
                   flush=True)
         else:
             _noise = (_noise_rider() if sample_noise
@@ -1916,6 +1937,9 @@ def build_fit():
                 ratchet_delta=_ratchet_delta,
                 ratchet_min_gain=_ratchet_min_gain,
                 ratchet_min_nudges=_ratchet_min_nudges,
+                ratchet_stop_rule=_ratchet_stop_rule,
+                ratchet_min_drop=_ratchet_min_drop,
+                ratchet_drop_band=_ratchet_drop_band,
                 legs=_legs,
             ),
             combine_kwargs=_combine_kwargs,

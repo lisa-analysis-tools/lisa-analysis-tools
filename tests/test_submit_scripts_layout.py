@@ -628,6 +628,9 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             "GALFOR_RATCHET_RELEASE_FIRST", "GALFOR_RATCHET_RELEASE_CHECKS",
             "GALFOR_RATCHET_RELEASE_TOL", "GALFOR_RATCHET_RELEASE_ITERS",
             "GALFOR_RATCHET_MIN_GAIN", "GALFOR_RATCHET_MIN_NUDGES",
+            # 2026-10-03: the stop decides on the released FOREGROUND (median
+            # walker's drop over a band), not the raw lnL gain.
+            "GALFOR_RATCHET_STOP_RULE", "GALFOR_RATCHET_MIN_DROP", "GALFOR_RATCHET_DROP_BAND",
             "GALFOR_RATCHET_CLOCK_RESET", "GALFOR_RATCHET_CLOCK_START",
             "GALFOR_RATCHET_SHUTOFF_MIN_FREQ",
             # full_pe declarations (user rulings 2026-10-02): in-model repeats
