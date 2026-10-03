@@ -601,19 +601,21 @@ class SourceSOBBHSettings(SOBBHSettings):
     n_grid: int = 2048
     buffer_time: float = 5000.0
     response_order: int = 40
-    # Which likelihood scores the add/remove proposals: "chunked" (DEFAULT,
-    # A/B-gated 2026-07-30: identical cold-chain lnL, zero cross-check
-    # warnings at tol 0.5, ~4x wall even with the check every leaf) =
-    # SOBBHChunkedLikeMove over the chunked-heterodyne WDM kernel (one
-    # vectorized call per batch); "lookup" = SOBBHLookupComputations over a
-    # batched TDI-on-the-fly response + an n_ref WDM lookup table (see the
-    # lookup_* fields below); "full" = the exact full-TD container path
-    # (the escape hatch — required for FD/STFT domains, multi-shard, DCGA).
+    # Which likelihood scores the add/remove proposals: "lookup" (DEFAULT since
+    # 2026-10-03; docs/sobbh-wdm-lookup.md) = SOBBHLookupComputations (per-device
+    # replicas behind SOBBHLookupRouter) over a batched TDI-on-the-fly response
+    # on a sparse 12-h grid + an n_ref WDM lookup table, scored by the fused
+    # sobbh_lookup kernel (36-176x the chunked comp on one H100; lookup vs
+    # production template <= 1.2e-6 on the mojito bricks; see the lookup_*
+    # fields below); "chunked" = the chunked-heterodyne WDM kernel (the
+    # 2026-07-30 default); "full" = the exact full-TD container path (the
+    # escape hatch — required for FD/STFT domains, DCGA). All three drive the
+    # same SOBBHChunkedLikeMove except "full".
     # The residual expose/fold stays on the exact generator either way, and
     # the built-in fast-vs-slow cross-check stays on (thin it with
     # SOBBH_CHECK_LL_EVERY=10 in production; SOBBH_CHECK_LL=0 disables).
     likelihood: str = dataclasses.field(
-        default_factory=env_default("SOBBH_LIKELIHOOD", "chunked", str)
+        default_factory=env_default("SOBBH_LIKELIHOOD", "lookup", str)
     )
     # chunked-path knobs (see lisatools.chunked_het.WDMComputationsBase).
     # Nt_sub errs SMALL (short chunks): the per-chunk heterodyne collapses
@@ -2252,13 +2254,9 @@ def get_sobbh_lookup_comp(general_info, cfg):
     from lisatools.domains import WDMLookupTable, WDMSettings
     from lisatools.sources.sobbh.wdm_direct import SOBBHLookupComputations
 
-    gpus = getattr(general_info, "gpus", None)
-    if gpus is not None and len(gpus) > 1:
-        raise ValueError(
-            "SOBBH_LIKELIHOOD=lookup is single-device: "
-            f"the run spans {len(gpus)} GPUs (multi-GPU walker shards route one shared comp "
-            "through every device). Use SOBBH_LIKELIHOOD=chunked, or run on one GPU."
-        )
+    # one comp per device (the cache key below carries the CURRENT device and
+    # _wrap_device_and_orbits hands device-local orbits / domain settings);
+    # multi-GPU walker shards reach the right one through SOBBHLookupRouter
     xp, dev, orbits, domain_settings = _wrap_device_and_orbits(general_info)
     key = ("sobbh_lookup", id(general_info), cfg["nchannels"], dev)
     if key in _WAVE_WRAP_CACHE:
@@ -2301,14 +2299,29 @@ def get_sobbh_lookup_comp(general_info, cfg):
     return comp
 
 
+def get_sobbh_lookup_router(general_info, cfg):
+    """The (cached) :class:`~lisatools.sources.sobbh.wdm_direct.SOBBHLookupRouter` over
+    :func:`get_sobbh_lookup_comp`: one lookup comp per device, each built on first use under
+    that device's context, every call sent to the current device's (multi-GPU walker shards)."""
+    from lisatools.sources.sobbh.wdm_direct import SOBBHLookupRouter
+
+    key = ("sobbh_lookup_router", id(general_info), cfg["nchannels"])
+    if key not in _WAVE_WRAP_CACHE:
+        _WAVE_WRAP_CACHE[key] = SOBBHLookupRouter(
+            lambda _dev: get_sobbh_lookup_comp(general_info, cfg),
+            general_info.force_backend,
+        )
+    return _WAVE_WRAP_CACHE[key]
+
+
 def get_sobbh_fast_comp(general_info, cfg):
     """The vectorized SOBBH comp ``cfg["sobbh_likelihood"]`` selects
-    (``"chunked"`` / ``"lookup"``)."""
+    (``"lookup"``, the default: the per-device router; ``"chunked"``)."""
     kind = cfg.get("sobbh_likelihood", "full")
     if kind == "chunked":
         return get_sobbh_chunked_comp(general_info, cfg)
     if kind == "lookup":
-        return get_sobbh_lookup_comp(general_info, cfg)
+        return get_sobbh_lookup_router(general_info, cfg)
     raise ValueError(f"no vectorized SOBBH comp for sobbh_likelihood={kind!r} "
                      f"(expected one of {SOBBH_FAST_LIKELIHOODS})")
 

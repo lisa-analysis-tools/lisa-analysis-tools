@@ -175,7 +175,11 @@ def main():
     cfg = find_source_cfg(fit)
     if cfg is None:
         raise RuntimeError("no SourceSignalGen found post-build")
-    assert cfg.get("sobbh_likelihood") == "chunked", cfg.get("sobbh_likelihood")
+    # this null checks the CHUNKED comp's fill (since 2026-10-03 the stock default is the
+    # lookup comp: run it with SOBBH_LIKELIHOOD=chunked)
+    assert cfg.get("sobbh_likelihood") == "chunked", (
+        f"sobbh_likelihood={cfg.get('sobbh_likelihood')!r}: run with SOBBH_LIKELIHOOD=chunked"
+    )
 
     nch = int(cfg["nchannels"])
     Nfa, Nta = int(wdm.Nf_active), int(wdm.Nt_active)

@@ -1218,15 +1218,16 @@ class V9RankLayoutTest(unittest.TestCase):
 
 
 class SixMonthSOBBHLookupTest(unittest.TestCase):
-    """The 6mo v9 SOBBH lookup block: ``SOBBH_LIKELIHOOD=lookup`` swaps the comp inside the
-    existing SOBBH add/remove move (docs/sobbh-wdm-lookup.md); default chunked = the v8 path."""
+    """The 6mo v9 SOBBH lookup block: ``SOBBH_LIKELIHOOD=lookup`` (the default) puts the lookup
+    comp inside the existing SOBBH add/remove move (docs/sobbh-wdm-lookup.md); chunked = the v8
+    path."""
 
     def setUp(self):
         self.v9 = _exports(SIX_MO_V9)
         self.text = open(SIX_MO_V9).read()
 
     def test_the_block_defaults(self):
-        self.assertEqual(self.v9["SOBBH_LIKELIHOOD"], "chunked")
+        self.assertEqual(self.v9["SOBBH_LIKELIHOOD"], "lookup")  # the default (2026-10-03)
         self.assertEqual(self.v9["SOBBH_LOOKUP_TABLE_PATH"], "")   # the run folder's table
         self.assertEqual(self.v9["SOBBH_LOOKUP_EVAL_DT"], "43200")  # the sparse 12-h response
         self.assertEqual(self.v9["SOBBH_LOOKUP_ROW_BATCH"], "32")
@@ -1235,7 +1236,6 @@ class SixMonthSOBBHLookupTest(unittest.TestCase):
     def test_the_preflight_guards(self):
         for needle in (
             "resolve_sobbh_lookup_table",          # find or build the table before mpiexec
-            "GPUS_PER_RANK",                        # the comp is single-device
             "SOBBH_LOOKUP_KERNEL=kernel but",      # a missing compiled kernel is refused
             "the settings resolve",                 # a silently ignored knob is refused
         ):

@@ -260,16 +260,21 @@ class SOBBHChunkedParityTest(unittest.TestCase):
         setup = SOBBHSetup(s)
         self.assertEqual(len(setup.betas), s.ntemps)
 
-    def test_chunked_is_the_stock_default(self):
-        # A/B-gated default flip (2026-07-30); SOBBH_LIKELIHOOD=full is the
-        # escape hatch
+    def test_lookup_is_the_stock_default_chunked_selectable(self):
+        # 2026-10-03: the lookup comp (docs/sobbh-wdm-lookup.md) is the default;
+        # SOBBH_LIKELIHOOD=chunked keeps this move's chunked-het comp, =full the
+        # exact container path
         import os
+        from unittest import mock
 
         from lisatools.globalfit.stock.erebor.source_runtime import (
-            SourceSOBBHSettings)
+            SOBBH_FAST_LIKELIHOODS, SourceSOBBHSettings)
 
-        assert "SOBBH_LIKELIHOOD" not in os.environ
-        self.assertEqual(SourceSOBBHSettings().likelihood, "chunked")
+        with mock.patch.dict(os.environ):
+            os.environ.pop("SOBBH_LIKELIHOOD", None)
+            self.assertEqual(SourceSOBBHSettings().likelihood, "lookup")
+        self.assertIn("chunked", SOBBH_FAST_LIKELIHOODS)
+        self.assertEqual(SourceSOBBHSettings(likelihood="chunked").likelihood, "chunked")
 
 
 class SOBBHChunkedRoutingTest(unittest.TestCase):

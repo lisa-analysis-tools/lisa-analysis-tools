@@ -214,10 +214,11 @@ toy table, not a smaller- or larger-scale version of the gate's own 42.7 d / 6-m
   (production `SOBBHTDIonFly` zeros the last `buffer_time` before merger instead); its pixels past
   the table's fdot axis are dropped (counted in `last_stats["dropped_pixels"]`, one warning per
   call).
-- The lookup comp is SINGLE-DEVICE: the stock getter refuses a multi-GPU run (`ValueError`) and
-  the comp raises when called off its build device; per-device replicas (the GB
-  `_RoutedBandEngine` pattern) are a follow-up. Use `SOBBH_LIKELIHOOD=chunked` for multi-GPU
-  walker shards.
+- A lookup comp is single-device (it raises when called off its build device); the stock getter
+  returns `SOBBHLookupRouter` (2026-10-03), which builds one replica per device on first use under
+  each walker shard's device context and dispatches every call to the current device's, so
+  multi-GPU walker shards work (router unit-tested with mocked devices; not yet run on a real
+  multi-GPU rank).
 - cubic interpolation is Keys cubic convolution, not scipy's global cubic spline.
 
 ## Follow-ups
@@ -579,6 +580,16 @@ ends at REF + 449 d although the configured sc / ltt tables run to REF + 730.5 d
 windows would have lost everything after day 449); it is now the configured span
 (`SOBBHBatchedTOF.orbit_span`), and pixels outside the response coverage are a zero template on
 both lookup paths (`SOBBHDirectWDM.covered_pixels`; `OrbitCoverageTest`).
+
+### THE DEFAULT (2026-10-03)
+
+`SOBBH_LIKELIHOOD` now defaults to `lookup` everywhere (`SourceSOBBHSettings.likelihood`, the
+6-month launcher); `chunked` (the 2026-07-30 default) and `full` stay selectable. Multi-GPU
+walker shards go through `SOBBHLookupRouter` (one comp per device), so the launcher's
+`GPUS_PER_RANK > 1` refusal is gone. A run without `SOBBH_LOOKUP_TABLE_PATH` finds or builds the
+canonical n_ref table in its run folder (the EMRI recipe; one build per grid, minutes on a GPU,
+much longer on a CPU -- point CPU / laptop runs at an existing table with the run's 3600-s layer,
+e.g. `wdm_lookup_emri_cx_NF180_DT20_TL32_fd8x0p01_nld2.h5`).
 
 ### The table during a global-fit run (2026-10-02, the EMRI way)
 
