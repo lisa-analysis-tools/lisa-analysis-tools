@@ -543,22 +543,26 @@ class SourceMBHSettings(MBHSettings):
 
 @dataclasses.dataclass
 class SourceEMRISettings(EMRISettings):
-    """EMRI branch block. Templates (engine residuals, fills, cross-checks) are the
-    legacy ResponseWrapper path; the add/remove SCORING path is ``likelihood``."""
+    """EMRI branch block. ``likelihood`` picks the template family for BOTH the add/remove
+    scoring and the engine's templates (residual rebuilds, fills): the direct-to-WDM lookup
+    template by default (``auto`` on a WDM / XYZ run), the legacy ResponseWrapper path with
+    ``full``; the move's cross-check always uses the latter."""
 
     num_prop_repeats: int = dataclasses.field(
         default_factory=env_default("EMRI_NUM_PROP_REPEATS", 2, int)
     )
     ndim: int = 12
     response_order: int = 40
-    # Scoring path (2026-10-02): "full" (DEFAULT, the per-row production container
-    # path) or "direct" (EMRIDirectLikeMove: the direct-to-WDM template -- n_ref lookup
-    # table + dense-phase TDI-on-the-fly response + plunge chunk -- batched over
-    # batch_max_size rows, scored against each walker's own residual and PSD). The
-    # residual expose/fold and the cross-check stay on the production generator either
-    # way. resolve_emri_direct_cfg holds the consistency rules.
+    # Template path (2026-10-02; default auto since 10-03): "direct" (EMRIDirectLikeMove
+    # scoring + the engine templates: the direct-to-WDM template -- n_ref lookup table +
+    # dense-phase TDI-on-the-fly response + exact plunge chunk -- batched over
+    # batch_max_size rows, scored against each walker's own residual and PSD), "full" (the
+    # per-row production ResponseWrapper path for both), or "auto" (DEFAULT: direct
+    # unless the run cannot serve it -- a non-WDM or unidentifiable run domain, channels
+    # other than XYZ -- then full with one INFO line). resolve_emri_direct_cfg holds the
+    # rules; the cross-check stays on the production generator either way.
     likelihood: str = dataclasses.field(
-        default_factory=env_default("EMRI_LIKELIHOOD", "full", str)
+        default_factory=env_default("EMRI_LIKELIHOOD", "auto", str)
     )
     # Rows per direct generation: each row holds a full-grid (3, Nf, Nt) float64
     # accumulator while it is built (~150 MB at Nf 1440 x Nt 4320).
@@ -1326,7 +1330,7 @@ def snap_waveform_t0_to_lattice(waveform_t0: float, data_t0: float, dt: float):
 
 
 #: ``EMRI_LIKELIHOOD`` values.
-EMRI_LIKELIHOOD_MODES = ("full", "direct")
+EMRI_LIKELIHOOD_MODES = ("full", "direct", "auto")
 #: ``EMRI_DIRECT_RESPONSE`` values (``EMRIDirectWDM(response=...)``).
 EMRI_DIRECT_RESPONSES = ("dense", "spline")
 
@@ -1340,8 +1344,12 @@ def resolve_emri_direct_cfg(emri, *, domain_settings, tdi_chan) -> dict:
     be WDM (an unidentifiable factory is taken at its word; the getter checks the BUILT
     domain), channels other than XYZ (the direct template is the X, Y, Z response), an
     unknown ``EMRI_DIRECT_RESPONSE``, ``EMRI_BATCH_MAX_SIZE < 1`` or
-    ``EMRI_TRAJ_WORKERS < 0``. The lookup table is not required to exist: the getter finds
-    it (``EMRI_DIRECT_TABLE`` or the run folder's canonical file) or builds and saves it.
+    ``EMRI_TRAJ_WORKERS < 0``. ``auto`` (the default) becomes ``direct`` unless one of
+    those reasons -- or an unidentifiable run domain -- applies, then ``full`` with ONE
+    INFO line naming them (as ``MBH_LIKELIHOOD=auto``). The returned ``emri_likelihood``
+    is the RESOLVED mode, never ``auto``. The lookup table is not required to exist: the
+    getter finds it (``EMRI_DIRECT_TABLE`` or the run folder's canonical file) or builds
+    and saves it.
     """
     from lisatools.domains import WDMSettings
 
@@ -1365,6 +1373,8 @@ def resolve_emri_direct_cfg(emri, *, domain_settings, tdi_chan) -> dict:
     cls = run_domain_settings_class(domain_settings)
     if cls is not None and not issubclass(cls, WDMSettings):
         blockers.append(f"the run domain is {cls.__name__}, not WDM")
+    if cls is None and mode == "auto":
+        blockers.append("the run domain is not identifiable as WDM")
     if str(tdi_chan).upper() != "XYZ":
         blockers.append(f"the run's channels are {tdi_chan!r}; the direct template is XYZ")
     if out["emri_direct_response"] not in EMRI_DIRECT_RESPONSES:
@@ -1376,11 +1386,16 @@ def resolve_emri_direct_cfg(emri, *, domain_settings, tdi_chan) -> dict:
         blockers.append(f"EMRI_BATCH_MAX_SIZE={out['emri_batch_max_size']} < 1")
     if out["emri_traj_workers"] < 0:
         blockers.append(f"EMRI_TRAJ_WORKERS={out['emri_traj_workers']} < 0")
+    if blockers and mode == "auto":
+        logger.info("EMRI_LIKELIHOOD=auto -> full: %s.", "; ".join(blockers))
+        out["emri_likelihood"] = "full"
+        return out
     if blockers:
         raise ValueError(
             "EMRI_LIKELIHOOD=direct cannot serve this run: " + "; ".join(blockers)
             + ". Fix it or use EMRI_LIKELIHOOD=full."
         )
+    out["emri_likelihood"] = "direct"
     return out
 
 
@@ -2460,11 +2475,13 @@ def build_source_moves(curr, acs, priors, state, cfg) -> dict:
     ``ResidualAddOneRemoveOneMove`` path).
     ``sobbh_pe`` uses the batched chunked-heterodyne kernel.
 
-    ``emri_pe`` (``cfg["emri_likelihood"]``): ``full`` (default) scores per row
-    through the production container path (~1040 ms/row on the 6-mo probe, job 373);
-    ``direct`` builds :class:`~lisatools.globalfit.moves.EMRIDirectLikeMove`, which
-    scores chunks of rows through the direct-to-WDM template (one FEW call per row,
-    one response launch per chunk); the expose/fold stays on the production path.
+    ``emri_pe`` (``cfg["emri_likelihood"]``, the RESOLVED mode: ``auto`` -- the default --
+    is ``direct`` on a WDM / XYZ run): ``direct`` builds
+    :class:`~lisatools.globalfit.moves.EMRIDirectLikeMove`, which scores chunks of rows
+    through the direct-to-WDM template (one FEW call per row, one response launch per
+    chunk; the expose/fold through the installed generator, the direct template too);
+    ``full`` scores per row through the production container path (~1040 ms/row on the
+    6-mo probe, job 373).
     """
     stock_moves = {}
     if "mbh" in curr.source_info:

@@ -4764,6 +4764,9 @@ export EMRI_EPS=1e-3
 # segment.
 # DEFAULT: direct (2026-10-03). H100, 6 months, eps 1e-3: 25 ms single and
 # 15 ms/row at 16 rows per call vs production 88 ms (eps 1e-5: 38 / 18 vs 94).
+# The library default is EMRI_LIKELIHOOD=auto, which resolves to direct on this
+# WDM / XYZ grid; this launcher pins direct so a blocker REFUSES the launch instead
+# of falling back to full with one INFO line.
 # The per-row production path for both scoring and template generation:
 #     EMRI_LIKELIHOOD=full NGPUS=4 ./submit_gf_6mo_v9_4gpu.sh
 # LOOKUP TABLE: EMRI_DIRECT_TABLE points to a specific table; unset (default) it is

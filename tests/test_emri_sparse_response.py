@@ -372,6 +372,20 @@ class PlungeTailTest(unittest.TestCase):
         spl = np.asarray(out.eval_tdi(ts))
         self.assertLess(np.abs(exact - spl).max() / np.abs(spl).max(), 1e-5)
 
+    def test_summed_channels_equal_the_per_harmonic_sum(self):
+        """The kernel's own sum over harmonics (run_channels_wrap sum_subs) == summing the
+        per-harmonic channels; the channels-only path == the full call's channels."""
+        d = self._direct()
+        item = self._item(self.T_END)
+        ts = d.t_start + np.arange(0.0, 20480.0, 10.0)
+        per = np.asarray(d._dense_td(item, ts))
+        summed = np.asarray(d._dense_td(item, ts, sum_subs=True))
+        self.assertEqual(summed.shape, per.shape[1:])
+        np.testing.assert_allclose(summed, per.sum(axis=0), rtol=0, atol=1e-13 * np.abs(per).max())
+        dense, par = d._dense_kernel([item], ts[None, :])[:2]
+        full = np.asarray(dense._run(par)[0]).reshape(per.shape)
+        np.testing.assert_allclose(per, np.real(full), rtol=0, atol=0)
+
     def test_taper_shape(self):
         from lisatools.sources.emri.wdm_direct import plunge_stop_taper
 
@@ -391,13 +405,14 @@ class PlungeTailTest(unittest.TestCase):
         self.assertIsNotNone(tail.stop)
         ts = d.t_start + np.arange(0.0, 20480.0, 10.0)
         raw = np.asarray(d._dense_td(item, ts)).sum(axis=0)
-        tap = np.asarray(tail(ts)).sum(axis=0)
+        self.assertTrue(tail.summed)
+        tap = np.asarray(tail(ts))                     # (nch, n): summed in the kernel
         for c in range(3):                             # the stop = the raw channel's last nonzero sample
             self.assertEqual(tail.stop[c], ts[np.flatnonzero(raw[c])[-1]])
             self.assertLess(abs(tail.stop[c] - (d.t_start + self.T_END)), 600.0)
         np.testing.assert_array_equal(tap[:, ts > tail.stop.max()], 0.0)
         early = ts < tail.stop.min() - d.plunge_taper_s
-        np.testing.assert_array_equal(tap[:, early], raw[:, early])
+        np.testing.assert_allclose(tap[:, early], raw[:, early], rtol=0, atol=1e-13 * np.abs(raw).max())
         # the burst: X+Y+Z (T-like) power below 1 mHz, untapered vs tapered
         f = np.fft.rfftfreq(ts.size, 10.0)
         low = (f > 0) & (f < 1e-3)

@@ -209,7 +209,11 @@ starting point). Env vars resolve as field
 defaults (*explicit kwarg > env var > lite preset > hard default* — a set env
 var overrules a `*_lite` preset via each variant's `lite_env_vars()` map).
 Waveform-path defaults: SOBBH TDI-on-the-fly, MBH legacy phentax, EMRI legacy
-— per-branch `use_tdionfly` knobs; `USE_TDIONFLY` env flips both.
+— per-branch `use_tdionfly` knobs; `USE_TDIONFLY` env flips both. On a WDM / XYZ
+run the per-branch `likelihood` knobs default to the fast paths:
+`SOBBH_LIKELIHOOD=lookup`, `MBH_LIKELIHOOD=auto` (batched scoring),
+`EMRI_LIKELIHOOD=auto` (the direct-to-WDM lookup template for scoring AND the
+engine's templates; `full` restores the legacy wrap, see `docs/emri-direct-wdm.md`).
 
 Rules:
 

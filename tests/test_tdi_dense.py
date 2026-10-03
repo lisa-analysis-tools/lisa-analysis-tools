@@ -105,6 +105,36 @@ class TDDenseTest(unittest.TestCase):
         out = dense(self.params[:1], return_spline=False)
         np.testing.assert_array_equal(np.asarray(out.tdi_amp), 0.0)
 
+    def _random_dense(self, be, N=2000):
+        from lisatools.detector import EqualArmlengthOrbits
+        from lisatools.response.tdiconfig import TDIConfig
+        from lisatools.response.tdionfly import TDDenseTDIonTheFly
+
+        K = self.t_k.size
+        rng = np.random.default_rng(3)
+        S = 5
+        are = rng.normal(size=(S, K - 1, 4)) * np.array([1.0, 1e-6, 1e-12, 1e-18])
+        aim = rng.normal(size=(S, K - 1, 4)) * np.array([1.0, 1e-6, 1e-12, 1e-18])
+        mkn = np.array([[2, 0, 0], [3, 0, 1], [-2, 0, -1], [2, 0, 1], [1, 0, -2]])
+        t_eval = np.linspace(self.t_eval[0], self.t_eval[-1], N)
+        args = (np.tile(t_eval, (2, 1)), np.array([0, 3, 5]), mkn, np.tile(self.t_k, (2, 1)), np.full(2, K),
+                np.tile(_dense_linear(self.t_k, self._fund(self.t_k))[None], (2, 1, 1, 1)), are, aim)
+        return TDDenseTDIonTheFly(*args, amp_factor=0.5, tdi_config=TDIConfig("2nd generation", force_backend=be),
+                                  orbits=EqualArmlengthOrbits(force_backend=be), force_backend=be)
+
+    def test_channels_only_kernel_equals_full_call(self):
+        """channels() runs the channel kernel alone (run_channels_wrap): per harmonic it equals the
+        full call's channels exactly; sum_subs sums each template's harmonics in the kernel."""
+        dense = self._random_dense("cpu")
+        self.assertTrue(hasattr(dense.wave_gen, "run_channels_wrap"))
+        full = np.asarray(dense._run(self.params)[0]).reshape(5, 3, -1)
+        per = np.asarray(dense.channels(self.params))
+        np.testing.assert_array_equal(per, full)
+        summed = np.asarray(dense.channels(self.params, sum_subs=True))
+        self.assertEqual(summed.shape, (2, 3, full.shape[-1]))
+        want = np.stack([full[0:3].sum(axis=0), full[3:5].sum(axis=0)])
+        np.testing.assert_allclose(summed, want, rtol=0, atol=1e-13 * np.abs(want).max())
+
 
 class TDDenseGPUParityTest(TDDenseTest):
     """GPU build of the dense kernel == its CPU build (skips without a GPU backend)."""
@@ -140,6 +170,20 @@ class TDDenseGPUParityTest(TDDenseTest):
                 outs.append([np.asarray(x.get() if hasattr(x, "get") else x) for x in (o.tdi_amp, o.tdi_phase, o.phase_ref)])
             for a, b in zip(*outs):
                 np.testing.assert_allclose(b, a, rtol=1e-10, atol=1e-10 * np.max(np.abs(a)), err_msg=f"N={N}")
+
+    def test_gpu_channels_equal_cpu(self):
+        """The channels-only kernel (per harmonic and summed in the kernel) on the GPU == CPU."""
+        import lisatools
+
+        try:
+            lisatools.get_backend("gpu")
+        except Exception:
+            self.skipTest("no GPU backend")
+        for sum_subs in (False, True):
+            a, b = (self._random_dense(be).channels(self.params, sum_subs=sum_subs) for be in ("cpu", "gpu"))
+            a, b = np.asarray(a), np.asarray(b.get())
+            np.testing.assert_allclose(b, a, rtol=1e-10, atol=1e-10 * np.max(np.abs(a)),
+                                       err_msg=f"sum_subs={sum_subs}")
 
 
 if __name__ == "__main__":
