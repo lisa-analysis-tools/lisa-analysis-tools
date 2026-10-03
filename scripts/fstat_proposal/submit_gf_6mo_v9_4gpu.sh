@@ -4590,8 +4590,14 @@ export VGB_START_FACTOR=0.0
 # stress result -- cheap insurance on this 1-h-layer production grid too).
 export SOBBH_M_BAND_HALF_WIDTH=3
 # Thin the slow-path A/B re-score (per-row TDI-on-the-fly x all rungs);
-# it still fails loudly past tolerance when it fires.
-export SOBBH_CHECK_LL_EVERY=30
+# it still fails loudly past tolerance when it fires. The counter advances
+# once per SOBBH move VISIT (not per repeat); on a check visit every leaf
+# scores its rows once through the exact full-TD path (unmeasured on the
+# GPU; orders of magnitude above the ~31 ms fast call). Yielding since
+# 2026-10-03 (was a hard `=30` that silently overwrote a launch-line value):
+# the SOBBH session recommends 10 for the first lookup segment, back to 30
+# if the check costs more than ~10 % of the SOBBH leg.
+export SOBBH_CHECK_LL_EVERY=${SOBBH_CHECK_LL_EVERY:-30}
 
 # ---- EIGEN INNER MOVE (2026-09-05/08 work; code defaults, pinned) ----------
 # The addremove branches' in-model proposal is the eryn EigenAxisMove: a
@@ -5009,16 +5015,21 @@ PYEOF
 # GPU before mpiexec (lisatools.wdm_lookup_store), so a restart never rebuilds.
 # SOBBH_M_BAND_HALF_WIDTH / SOBBH_FILL_M_BAND_HALF_WIDTH are ignored by it.
 # RESUME-SAFE: no stored shape changes.
-# KERNEL: SOBBH_LOOKUP_KERNEL=auto (default) scores and fills through the fused
-# C++/CUDA lookup (sobbh_lookup_kernel.cu) when this lisatools build has it, else
-# the Python lookup; =kernel refuses without it; =python forces the Python path.
+# KERNEL: SOBBH_LOOKUP_KERNEL=kernel (default since 2026-10-03, SOBBH session's
+# production recommendation) scores and fills through the fused C++/CUDA lookup
+# (sobbh_lookup_kernel.cu) and REFUSES in the preflight below when this build
+# lacks it (0.031 s vs the Python lookup's 0.050 s per 8-row call at 6 months,
+# identical numbers); =auto falls back to the Python lookup with only a
+# warning; =python forces the Python path.
 # WATCH: "[SOBBH_LOOKUP] lookup table ... (found|built|waited|explicit)" at
-# build, and the [SOBBH_LL_TIMING] leaf windows (ms/call should be ~100-400).
+# build, and the [SOBBH_LL_TIMING] leaf windows: ~30-50 ms per 8-row call at
+# 6 months with the kernel; 100-400 ms means the Python fallback or a
+# regression.
 export SOBBH_LIKELIHOOD=${SOBBH_LIKELIHOOD:-lookup}
 export SOBBH_LOOKUP_TABLE_PATH=${SOBBH_LOOKUP_TABLE_PATH:-}
 export SOBBH_LOOKUP_EVAL_DT=${SOBBH_LOOKUP_EVAL_DT:-43200}
 export SOBBH_LOOKUP_ROW_BATCH=${SOBBH_LOOKUP_ROW_BATCH:-32}
-export SOBBH_LOOKUP_KERNEL=${SOBBH_LOOKUP_KERNEL:-auto}
+export SOBBH_LOOKUP_KERNEL=${SOBBH_LOOKUP_KERNEL:-kernel}
 #
 # SOBBH PREFLIGHT. An unknown env var is SILENTLY IGNORED, so resolve the knobs
 # through the real settings class; for lookup, refuse a lisatools without the

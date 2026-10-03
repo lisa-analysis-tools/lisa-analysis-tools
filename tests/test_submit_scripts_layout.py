@@ -1287,7 +1287,10 @@ class SixMonthSOBBHLookupTest(unittest.TestCase):
         self.assertEqual(self.v9["SOBBH_LOOKUP_TABLE_PATH"], "")   # the run folder's table
         self.assertEqual(self.v9["SOBBH_LOOKUP_EVAL_DT"], "43200")  # the sparse 12-h response
         self.assertEqual(self.v9["SOBBH_LOOKUP_ROW_BATCH"], "32")
-        self.assertEqual(self.v9["SOBBH_LOOKUP_KERNEL"], "auto")
+        # kernel, not auto (SOBBH session, 2026-10-03): a build without the
+        # fused kernel is REFUSED in the preflight instead of silently
+        # scoring through the Python lookup.
+        self.assertEqual(self.v9["SOBBH_LOOKUP_KERNEL"], "kernel")
 
     def test_the_preflight_guards(self):
         for needle in (
@@ -1796,6 +1799,15 @@ class SobbhKnobsSingleExportTest(unittest.TestCase):
             lines = self._exports(SIX_MO_V9, knob)
             self.assertEqual(len(lines), 1, (knob, lines))
             self.assertEqual(lines[0], f"export {knob}=${{{knob}:-25}}", knob)
+
+    def test_v9_sobbh_check_cadence_is_env_overridable(self):
+        # SOBBH session, 2026-10-03: the cadence was a hard `=30` export, so a
+        # SOBBH_CHECK_LL_EVERY on the launch line was silently overwritten
+        # (the first lookup segment wants 10, the long-run value stays 30).
+        lines = self._exports(SIX_MO_V9, "SOBBH_CHECK_LL_EVERY")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertEqual(
+            lines[0], "export SOBBH_CHECK_LL_EVERY=${SOBBH_CHECK_LL_EVERY:-30}")
 
     def test_v9_pe_inmodel_repeats_cover_emri(self):
         # User ruling 2026-10-03 ("same as pe" for mbhs, emris and sobhbs):
