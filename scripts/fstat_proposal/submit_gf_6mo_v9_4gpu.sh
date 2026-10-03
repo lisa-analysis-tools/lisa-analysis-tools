@@ -4925,19 +4925,17 @@ print(f"[EMRI-PREFLIGHT] emri_pe scoring=direct batch<={cfg['emri_batch_max_size
 PYEOF
 
 # ============================================================================
-# SOBBH LOOKUP SCORING (2026-10-02). SOBBH_LIKELIHOOD=lookup scores and fills
-# the SOBBH add/remove proposals (the existing SOBBHChunkedLikeMove; the comp
-# is a drop-in) with the direct-to-WDM n_ref lookup template
-# (docs/sobbh-wdm-lookup.md): one batched TDI-on-the-fly response per call on
-# a SPARSE 12-h grid splined to the pixel centres, the table evaluated at 5
-# layers per pixel. Cluster, one H100, production grid: 0.11 s per 8-row call
-# vs 1.70 s for the chunked comp (15x), 0.39 s at 288 rows (9.6x); accuracy
-# vs the dense transform mismatch 1e-7..1e-6, dlogL 1e-5..1e-3 (laptop gate).
-# To run it:
-#     SOBBH_LIKELIHOOD=lookup NGPUS=4 ./submit_gf_6mo_v9_4gpu.sh
-# SINGLE-DEVICE: the lookup comp lives on one GPU; the walker-block layout
-# (GPUS_PER_RANK unset = one device per compute rank) is fine, GPUS_PER_RANK>1
-# is refused (per-device replicas are a follow-up).
+# SOBBH LOOKUP SCORING (2026-10-02; the DEFAULT since 2026-10-03).
+# SOBBH_LIKELIHOOD=lookup scores and fills the SOBBH add/remove proposals (the
+# existing SOBBHChunkedLikeMove; the comp is a drop-in) with the direct-to-WDM
+# n_ref lookup template (docs/sobbh-wdm-lookup.md): one batched TDI-on-the-fly
+# response per call on a SPARSE 12-h grid, the fused sobbh_lookup kernel from
+# the response splines to <d|h>, <h|h>. Cluster, one H100, production grid,
+# foreground on: 0.031-0.117 s per call at 8-288 rows vs 1.7-14.9 s for the
+# chunked comp (36-176x); lookup vs production template <= 1.2e-6 on the
+# mojito SOBHB bricks. SOBBH_LIKELIHOOD=chunked restores the v8 path.
+# MULTI-GPU: one lookup comp per device behind SOBBHLookupRouter (built on
+# first use under each walker shard's device), so GPUS_PER_RANK>1 works too.
 # LOOKUP TABLE: SOBBH_LOOKUP_TABLE_PATH points to a specific table (any (Nf, dt)
 # with this run's 3600-s layer duration); unset (default) it is the canonical
 # file in this run's folder -- the SAME file EMRI_LIKELIHOOD=direct uses,
@@ -4951,7 +4949,7 @@ PYEOF
 # the Python lookup; =kernel refuses without it; =python forces the Python path.
 # WATCH: "[SOBBH_LOOKUP] lookup table ... (found|built|waited|explicit)" at
 # build, and the [SOBBH_LL_TIMING] leaf windows (ms/call should be ~100-400).
-export SOBBH_LIKELIHOOD=${SOBBH_LIKELIHOOD:-chunked}
+export SOBBH_LIKELIHOOD=${SOBBH_LIKELIHOOD:-lookup}
 export SOBBH_LOOKUP_TABLE_PATH=${SOBBH_LOOKUP_TABLE_PATH:-}
 export SOBBH_LOOKUP_EVAL_DT=${SOBBH_LOOKUP_EVAL_DT:-43200}
 export SOBBH_LOOKUP_ROW_BATCH=${SOBBH_LOOKUP_ROW_BATCH:-32}
@@ -4959,7 +4957,7 @@ export SOBBH_LOOKUP_KERNEL=${SOBBH_LOOKUP_KERNEL:-auto}
 #
 # SOBBH PREFLIGHT. An unknown env var is SILENTLY IGNORED, so resolve the knobs
 # through the real settings class; for lookup, refuse a lisatools without the
-# lookup comp, refuse GPUS_PER_RANK>1, and find -- or build and save -- the
+# lookup comp, and find -- or build and save -- the
 # lookup table (above). Refuses before mpiexec on any gap.
 python - <<'PYEOF' || exit 2
 import os
@@ -4993,12 +4991,6 @@ if sobbh.likelihood != "lookup":
 if "lookup" not in SOBBH_FAST_LIKELIHOODS:
     print(f"[SOBBH-PREFLIGHT] REFUSING: SOBBH_FAST_LIKELIHOODS={SOBBH_FAST_LIKELIHOODS}: the "
           "installed lisatools has no lookup comp.")
-    sys.exit(2)
-gpr = os.environ.get("GPUS_PER_RANK", "")
-if gpr and int(gpr) > 1:
-    print(f"[SOBBH-PREFLIGHT] REFUSING: SOBBH_LIKELIHOOD=lookup is single-device and "
-          f"GPUS_PER_RANK={gpr} > 1 (the stock getter refuses it at build). Launch with "
-          "GPUS_PER_RANK unset (one device per compute rank) or SOBBH_LIKELIHOOD=chunked.")
     sys.exit(2)
 import time
 from types import SimpleNamespace

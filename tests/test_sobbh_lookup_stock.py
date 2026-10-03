@@ -74,8 +74,8 @@ class LookupSettingsTest(unittest.TestCase):
                 "SOBBH_LOOKUP_KERNEL",
             ):
                 os.environ.pop(key, None)
-            s = SourceSOBBHSettings(likelihood="lookup")
-        self.assertEqual(s.likelihood, "lookup")
+            s = SourceSOBBHSettings()
+        self.assertEqual(s.likelihood, "lookup")  # the stock default (2026-10-03)
         self.assertEqual(s.lookup_table_path, "")
         self.assertEqual(s.lookup_num_m_layers, 2)
         self.assertEqual(s.lookup_eval_dt, 43200.0)  # 12 h: one response point per 12 pixels
@@ -181,7 +181,7 @@ class LookupCompBuildTest(unittest.TestCase):
 
         gi = _general_info(self.wdm)
         comp = sr.get_sobbh_fast_comp(gi, _cfg(self.path))
-        self.assertIsInstance(comp, SOBBHLookupComputations)
+        self.assertIsInstance(comp.primary, SOBBHLookupComputations)  # behind the device router
         self.assertIs(sr.get_sobbh_fast_comp(gi, _cfg(self.path)), comp)
         self.assertEqual(comp.direct.num_m_layers, 2)
         self.assertEqual(comp.direct.tof.eval_dt, 600.0)
@@ -195,15 +195,6 @@ class LookupCompBuildTest(unittest.TestCase):
         comp = sr.get_sobbh_lookup_comp(_general_info(self.wdm), cfg)
         self.assertEqual(comp.kernel, "python")
         self.assertFalse(comp.uses_kernel)
-
-    def test_multi_gpu_run_is_refused(self):
-        from lisatools.globalfit.stock.erebor import source_runtime as sr
-
-        gi = _general_info(self.wdm)
-        gi.gpus = [0, 1]
-        with self.assertRaises(ValueError) as cm:
-            sr.get_sobbh_lookup_comp(gi, _cfg(self.path))
-        self.assertIn("single-device", str(cm.exception))
 
     def test_dispatch_names(self):
         from lisatools.globalfit.stock.erebor import source_runtime as sr
