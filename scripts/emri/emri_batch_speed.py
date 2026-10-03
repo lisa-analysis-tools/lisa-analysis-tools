@@ -107,6 +107,17 @@ def check_window(orb, data_t0, span, kind):
             f"(production convention: 180 / 360 / 720 d) or, for equal-arm, use the source's L1 brick (--orbits auto/l1).")
 
 
+def catalogue_params(catalog, src):
+    """Catalogue row ``src`` in the FIT's waveform basis (``emri_catalogue_to_waveform_basis``: special
+    frame, and xI0 from the catalogue's InclinationAngle -- CD1L EMRIs 0 and 3 are retrograde)."""
+    from lisatools.sources.emri.waveform import emri_catalogue_to_waveform_basis
+
+    with h5py.File(catalog, "r") as f:
+        b = f["Binaries"]
+        row = {k: b[k][src] for k in b.keys()}
+    return [float(v) for v in emri_catalogue_to_waveform_basis(row)]
+
+
 def load_source(src, backend, span, catalog=None, l1_dir=None, orbits="auto"):
     """Params (FEW order, special frame), window start, and ICRS orbits.
 
@@ -118,22 +129,10 @@ def load_source(src, backend, span, catalog=None, l1_dir=None, orbits="auto"):
     """
     global LAST_BRICK
     from lisatools.detector import EqualArmlengthOrbits, L1Orbits
-    from lisatools.sources.utils import icrs_to_ecliptic
 
     root = os.environ.get("MOJITO_LIGHT_PATH", W.PATH)
     catalog = catalog or os.path.join(root, "catalogues", "emri_cat_mojito_lite_processed_MT.hdf5")
-    if catalog == "fixed":
-        params = list(FIXED_PARAMS)
-    else:
-        with h5py.File(catalog, "r") as f:
-            b = f["Binaries"]
-            g = lambda k: float(b[k][src])  # noqa: E731
-            lam, beta = icrs_to_ecliptic(g("RightAscension") % (2 * np.pi), g("Declination"))
-            params = [g("PrimaryMassSSBFrame"), g("SecondaryMassSSBFrame"), g("PrimarySpinParameter"),
-                      g("SemiLatusRectum"), g("Eccentricity"), 1.0, g("LuminosityDistance") / 1e3,
-                      float(np.pi / 2 - beta), float(lam) % (2 * np.pi),
-                      g("PolarAnglePrimarySpin"), g("AzimuthalAnglePrimarySpin"),
-                      g("AzimuthalPhase"), g("PolarPhase"), g("RadialPhase")]
+    params = list(FIXED_PARAMS) if catalog == "fixed" else catalogue_params(catalog, src)
     fp = None
     if orbits in ("auto", "l1"):
         fp = find_emri_brick(src, l1_dir=l1_dir, catalog=catalog)
