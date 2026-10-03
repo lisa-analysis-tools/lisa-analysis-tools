@@ -94,6 +94,27 @@ class SparseGridTest(_Fixture):
         self.assertEqual(lo, 97.8e6)  # max of the two starts
         self.assertEqual(hi, min(97.7e6 + 6_300_000 * 10.0, 97.8e6 + 6_000_000 * 10.0))
 
+    def test_backend_aliases_resolve_to_the_concrete_backend(self):
+        # "cuda" / "gpu" are lisatools.get_backend aliases, not names the response / orbits /
+        # domain classes accept as force_backend (the cluster run of the mojito script died with
+        # "'lisatools_cuda' not a valid backend"): the SOBBH lookup resolves them once
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import lisatools
+        from lisatools.sources.sobbh.wdm_direct import SOBBHBatchedTOF, concrete_backend_name
+
+        fake = SimpleNamespace(name="lisatools_cuda13x")
+        with mock.patch.object(lisatools, "get_backend", return_value=fake) as gb:
+            self.assertEqual(concrete_backend_name("cuda"), "cuda13x")
+            self.assertEqual(concrete_backend_name("gpu"), "cuda13x")
+            tof = SOBBHBatchedTOF(self.orbits, self.tdi, REF, force_backend="cuda")
+            self.assertEqual(tof.force_backend, "cuda13x")
+            self.assertEqual(gb.call_args_list[0].args, ("cuda",))
+        self.assertEqual(concrete_backend_name("cpu"), "cpu")
+        self.assertEqual(concrete_backend_name("cuda12x"), "cuda12x")
+        self.assertEqual(concrete_backend_name(SimpleNamespace(name="lisatools_cpu")), "cpu")
+
     def test_window_outside_the_orbit_span_is_refused(self):
         t_end = float(self.orbits.t_base[-1])
         tof = self._tof()  # constructed OUTSIDE the assertRaises: only build() may raise

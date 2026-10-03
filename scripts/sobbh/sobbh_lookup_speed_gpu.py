@@ -138,6 +138,9 @@ def main():
         backend = "cuda" if lisatools.has_backend("cuda") else "cpu"
     if not lisatools.has_backend(backend):
         raise SystemExit(f"backend {backend!r} unavailable on this host")
+    from lisatools.sources.sobbh.wdm_direct import concrete_backend_name
+
+    backend = concrete_backend_name(backend)  # "cuda" / "gpu" aliases -> e.g. "cuda13x"
     if args.laptop:
         args.nf, args.dt = 180, 20.0
     nf, nt, dt = int(args.nf), int(args.nt), float(args.dt)

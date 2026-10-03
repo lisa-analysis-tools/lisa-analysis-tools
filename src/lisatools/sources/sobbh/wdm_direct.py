@@ -40,6 +40,20 @@ from ...utils.utility import asnumpy, get_array_module
 logger = logging.getLogger(__name__)
 
 
+def concrete_backend_name(force_backend):
+    """The concrete backend name (``"cpu"``, ``"cuda12x"``, ``"cuda13x"``, ...) of a name or a
+    backend object. ``"cuda"`` / ``"gpu"`` are ``lisatools.get_backend`` ALIASES that the
+    response, orbits and domain classes do not accept as ``force_backend`` ("'lisatools_cuda' not a
+    valid backend"); they resolve here, once, to the first available CUDA backend."""
+    if not isinstance(force_backend, str):
+        return force_backend.name.split("_")[-1]
+    if force_backend in ("cuda", "gpu"):
+        import lisatools
+
+        return lisatools.get_backend(force_backend).name.split("_")[-1]
+    return force_backend
+
+
 def sobbh_amp_phase_batch(params, times, reference_time, t_shift=0.0):
     """3.5PN ``(amp, gw_phase, tc_abs)`` of ``N`` rows at absolute ``times`` [s].
 
@@ -182,9 +196,7 @@ class SOBBHBatchedTOF:
                 "delays away from each evaluation time, and the padded node grid must cover "
                 "that."
             )
-        self.force_backend = (
-            force_backend if isinstance(force_backend, str) else force_backend.name.split("_")[-1]
-        )
+        self.force_backend = concrete_backend_name(force_backend)
         self._orbit_span_cache = None
         self.last_spans = {}
 
@@ -442,6 +454,7 @@ class SOBBHDirectWDM:
     ):
         from ...wdm_lookup_eval import WDMLookupEvaluator
 
+        force_backend = concrete_backend_name(force_backend)
         if not np.isclose(float(table.layer_dt), float(wdm_settings.layer_dt), rtol=1e-9, atol=0):
             raise ValueError(
                 f"lookup table layer_dt = {float(table.layer_dt):g} s but the grid's layer_dt = "
@@ -954,9 +967,7 @@ class SOBBHLookupComputations:
             force_backend=force_backend,
             d_d=d_d,
         )
-        self.force_backend = (
-            force_backend if isinstance(force_backend, str) else force_backend.name.split("_")[-1]
-        )
+        self.force_backend = concrete_backend_name(force_backend)
         if orbits is None:
             orbits = EqualArmlengthOrbits(force_backend=self.force_backend)
         elif not isinstance(orbits, Orbits) and issubclass(orbits, Orbits):
@@ -1341,6 +1352,7 @@ class SOBBHLookupComputations:
 
 
 __all__ = [
+    "concrete_backend_name",
     "SOBBHBatchedTOF",
     "SOBBHDirectWDM",
     "SOBBHLookupComputations",

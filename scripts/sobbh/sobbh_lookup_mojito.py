@@ -70,9 +70,12 @@ def main():
 
     import lisatools
 
+    from lisatools.sources.sobbh.wdm_direct import concrete_backend_name
+
     backend = args.backend or ("cuda" if lisatools.has_backend("cuda") else "cpu")
     if not lisatools.has_backend(backend):
         raise SystemExit(f"backend {backend!r} unavailable on this host")
+    backend = concrete_backend_name(backend)  # "cuda" / "gpu" aliases -> e.g. "cuda13x"
     bricks = tb.find_sobhb_bricks(args.l1_dir)
     if not bricks:
         print(
