@@ -59,20 +59,13 @@ def load(src):
 
     from lisatools.detector import L1Orbits
     from lisatools.globalfit.preprocessing import find_file
-    from lisatools.sources.utils import icrs_to_ecliptic
+    from lisatools.sources.emri.waveform import emri_catalogue_to_waveform_basis
 
     cat = os.path.join(PATH, "catalogues", "emri_cat_mojito_lite_processed_MT.hdf5")
     with h5py.File(cat, "r") as f:
         b = f["Binaries"]
-        g = lambda k: float(b[k][src])
-        lam, beta = icrs_to_ecliptic(g("RightAscension") % (2 * np.pi), g("Declination"))
-        params = [
-            g("PrimaryMassSSBFrame"), g("SecondaryMassSSBFrame"), g("PrimarySpinParameter"),
-            g("SemiLatusRectum"), g("Eccentricity"), 1.0, g("LuminosityDistance") / 1e3,
-            float(np.pi / 2 - beta), float(lam) % (2 * np.pi),
-            g("PolarAnglePrimarySpin"), g("AzimuthalAnglePrimarySpin"),
-            g("AzimuthalPhase"), g("PolarPhase"), g("RadialPhase"),
-        ]
+        # the FIT's basis: xI0 from InclinationAngle (CD1L EMRIs 0 and 3 are retrograde)
+        params = [float(v) for v in emri_catalogue_to_waveform_basis({k: b[k][src] for k in b.keys()})]
     fp = find_file(os.path.join(PATH, "data", "EMRI", "L1"), "EMRI", src)
     ts = MojitoL1File(fp).tdis.time_sampling
     deci = int(round(DT / ts.dt))
