@@ -164,6 +164,22 @@ class TDDenseTDIWaveformWrap : public LISATDIonTheFlyWrap {
         );
     }
 
+    // the raw complex channels only: (num_sub, nch, N), or with sum_subs (n_temp, nch, N)
+    inline void run_channels_wrap(array_type<std::complex<double>> tdi_channels_arr,
+        array_type<double> params, array_type<double> t_arr, array_type<int> sub_offsets,
+        int N, int n_params, int nchannels, int sum_subs)
+    {
+        int rows = sum_subs ? waveform->n_temp : waveform->num_sub;
+        td_dense_run_channels_wrap(
+            waveform,
+            (cmplx*)return_pointer_and_check_length(tdi_channels_arr, "tdi_channels_arr", N, rows * nchannels),
+            return_pointer_and_check_length(params, "params", n_params, waveform->n_temp),
+            return_pointer_and_check_length(t_arr, "t_arr", N, waveform->n_temp),
+            return_pointer_and_check_length(sub_offsets, "sub_offsets", waveform->n_temp + 1, 1),
+            N, n_params, sum_subs
+        );
+    }
+
     inline int get_buffer_size(int N){return waveform->get_td_dense_buffer_size(N);}
 };
 

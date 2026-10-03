@@ -244,7 +244,7 @@ weights it enormously. Now:
 Laptop check (dt 20, 30 days around the plunge): direct SNR 18.36 vs data 18.25 (instrument),
 mismatch to the data 4.2e-3 (eps 1e-3 mode content), 3-25 mHz bands unchanged.
 
-## In the global fit: `EMRI_LIKELIHOOD=direct` (10-02; the 6-month launcher default since 10-03)
+## In the global fit: `EMRI_LIKELIHOOD=direct` (10-02; the 6-month launcher default and, through `auto`, the library default since 10-03)
 
 `emri_pe` becomes `EMRIDirectLikeMove` (`globalfit/moves/emridirectmove.py`), built by
 `build_emri_move_runtime` (`stock/erebor/source_runtime.py`) through `EMRIDirectMoveBuilder`
@@ -288,7 +288,12 @@ choreography is untouched, only the scoring changes.
   launcher) wait for the one builder. A restart finds the file. The 6-month launcher's preflight
   runs it on the node's GPU before mpiexec, so ranks never build.
 * **Resolver** `resolve_emri_direct_cfg`: `direct` needs a WDM domain, XYZ channels, a known
-  response, batch >= 1, workers >= 0 (the table need not exist yet).
+  response, batch >= 1, workers >= 0 (the table need not exist yet) and raises otherwise.
+  `auto` (the `SourceEMRISettings.likelihood` default since 10-03, as `MBH_LIKELIHOOD=auto`)
+  resolves to `direct` when those hold, else to `full` with ONE INFO line naming the reasons (a
+  run domain that cannot be identified as WDM counts as a reason for `auto`); the cfg carries the
+  resolved mode only. Every stock EMRI run on a WDM / XYZ grid therefore uses the lookup template
+  for scoring and template generation unless `EMRI_LIKELIHOOD=full`.
 * **Trajectory pool** (`EMRI_TRAJ_WORKERS`, 0 in the library): spawn workers integrate a chunk's
   trajectories (`few.trajectory.pool`, FEW gpu_backend >= 68bcda54) for chunks of at least that many
   rows (eigen sweeps). Workers start eagerly with `__main__.__file__` hidden, or each spawned child

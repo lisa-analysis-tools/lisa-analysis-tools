@@ -313,6 +313,46 @@ class AssemblyTest(unittest.TestCase):
         self.assertEqual(st2["chunk_pixels"], 2 * st1["chunk_pixels"])
         np.testing.assert_allclose(two, one, rtol=0, atol=1e-12 * np.abs(one).max())
 
+    def test_common_handoff_with_a_summed_tail(self):
+        """Two harmonics handing off at different pixels: with common_handoff both go at the
+        earlier one, and a summed tail (tail_td.summed, which implies the common handoff) == the
+        per-sub tail at that handoff."""
+        from lisatools.sources.emri import wdm_direct as wd
+
+        ldt, ldf = self.wdm.layer_dt, self.wdm.layer_df
+        n_ok = np.arange(40, self.NT - 8)
+        tn = n_ok * ldt
+        f = self.f0 + self.fdot * tn
+        phase = 2 * np.pi * (self.f0 * tn + 0.5 * self.fdot * tn ** 2) + self.phi0
+
+        def track(n_h):
+            return wd.HarmonicTrack((2, 2, 0, 0), tn, np.ones_like(tn), phase, f, np.full_like(tn, self.fdot),
+                                    np.where(n_ok >= n_h, 1.0, 0.0))
+
+        tracer = (np.full((2, 1, tn.size), 0.5), np.stack([phase[None]] * 2), np.stack([f[None]] * 2),
+                  np.full((2, 1, tn.size), self.fdot))
+        y = lambda ts: 0.5 * np.cos(2 * np.pi * (self.f0 * ts + 0.5 * self.fdot * ts ** 2) + self.phi0)
+        per_sub = lambda ts: np.repeat(y(ts)[None, None, :], 2, axis=0)
+
+        def summed(ts):
+            return 2 * y(ts)[None, :]
+        summed.summed = True
+        kw = dict(Nf=self.NF, Nt=self.NT, dt=self.DT, layer_dt=ldt, layer_df=ldf, t0=0.0, Nt_sub=128,
+                  num_m_layers=2, fdot_axis_max=float(np.max(np.abs(self.table.fdot_vals))), pixel_edge=8)
+        want = np.zeros((1, self.NF, self.NT))
+        wd.accumulate_harmonic_batch(want, self.table, [track(90), track(90)], tracer, n_ok, per_sub, **kw)
+        got = np.zeros_like(want)
+        st = wd.accumulate_harmonic_batch(got, self.table, [track(90), track(100)], tracer, n_ok, summed,
+                                          common_handoff=True, **kw)
+        np.testing.assert_allclose(got, want, rtol=0, atol=1e-12 * np.abs(want).max())
+        self.assertGreater(st["chunk_pixels"], 0)
+        implied = np.zeros_like(want)                     # summed tail, no explicit common_handoff
+        wd.accumulate_harmonic_batch(implied, self.table, [track(90), track(100)], tracer, n_ok, summed, **kw)
+        np.testing.assert_allclose(implied, want, rtol=0, atol=1e-12 * np.abs(want).max())
+        apart = np.zeros_like(want)                       # per-sub tail: each harmonic at its own pixel
+        wd.accumulate_harmonic_batch(apart, self.table, [track(90), track(100)], tracer, n_ok, per_sub, **kw)
+        self.assertGreater(np.abs(apart - want).max(), 1e-6 * np.abs(want).max())
+
     def test_all_lookup_matches_truth_too(self):
         acc, stats, n_ok = self._run(10 ** 6)          # never hands off
         self.assertEqual(stats["chunk_pixels"], 0)

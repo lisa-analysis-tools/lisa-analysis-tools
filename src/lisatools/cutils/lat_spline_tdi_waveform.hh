@@ -110,9 +110,11 @@ class TDDenseTDIWaveform : public LISATDIonTheFly{
     void phases(int b, int seg, double t, double *Phi3);
     CUDA_DEVICE
     cmplx strain_term(int s, int b, int seg, double t, double *Phi3);
+    // sum_subs: write the SUM over the template's harmonics into (n_temp, nch, N) instead of
+    // one row per harmonic; phi_ref may be nullptr (not written)
     CUDA_DEVICE
     void channels_point(int b, int i, double t, double *params_b, int sub_lo, int sub_hi,
-        cmplx *tdi_channels_arr, double *phi_ref, int N, int *link_rec, int *link_em);
+        cmplx *tdi_channels_arr, double *phi_ref, int N, int *link_rec, int *link_em, int sum_subs);
     CUDA_DEVICE
     void postprocess_sub(void *buffer, cmplx *chan, double *amp, double *phase, double *phi_ref, int N);
     CUDA_DEVICE
@@ -185,6 +187,11 @@ void wdm_lookup_sum_wrap(WDMLookupSumArgs args);
 void td_dense_run_wave_tdi_wrap(TDDenseTDIWaveform *tdi_on_fly, cmplx *tdi_channels_arr,
     double *tdi_amp, double *tdi_phase, double *phi_ref,
     double *params, double *t_arr, int *sub_offsets, int N, int n_params, int nchannels);
+
+// The raw complex channels only (no amplitude/phase extraction): (num_sub, nch, N), or with
+// sum_subs the sum over each template's harmonics, (n_temp, nch, N). Zero on entry.
+void td_dense_run_channels_wrap(TDDenseTDIWaveform *tdi_on_fly, cmplx *tdi_channels_arr,
+    double *params, double *t_arr, int *sub_offsets, int N, int n_params, int sum_subs);
 
 // Host launcher: pulls Orbits/TDIConfig/CubicSpline structs onto the
 // device, configures the device-side TDSplineTDIWaveform, runs the

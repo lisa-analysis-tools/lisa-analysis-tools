@@ -52,7 +52,7 @@ class EMRIDirectKnobsTest(unittest.TestCase):
     def test_defaults(self):
         s = _emri()
         self.assertEqual((s.likelihood, s.batch_max_size, s.direct_table, s.direct_response,
-                          s.traj_workers), ("full", 8, None, "dense", 0))
+                          s.traj_workers), ("auto", 8, None, "dense", 0))
 
     def test_env_knobs(self):
         from lisatools.globalfit.stock.erebor.source_runtime import SourceEMRISettings
@@ -89,7 +89,7 @@ class ResolveEMRIDirectCfgTest(_Table, unittest.TestCase):
                                        tdi_chan=chan)
 
     def test_full_passes_through_every_blocker(self):
-        cfg = self._resolve(domain=_fd_spec(), chan="AET", direct_table=None,
+        cfg = self._resolve(domain=_fd_spec(), chan="AET", direct_table=None, likelihood="full",
                             direct_response="bogus", batch_max_size=0)
         self.assertEqual(cfg["emri_likelihood"], "full")
         self.assertEqual(cfg["emri_batch_max_size"], 0)
@@ -107,6 +107,22 @@ class ResolveEMRIDirectCfgTest(_Table, unittest.TestCase):
         for table in (None, "/not/built/yet.h5"):
             cfg = self._resolve(likelihood="direct", direct_table=table)
             self.assertEqual((cfg["emri_likelihood"], cfg["emri_direct_table"]), ("direct", table))
+
+    def test_auto_is_the_lookup_template_on_a_wdm_xyz_run(self):
+        cfg = self._resolve(direct_table=self.table)                       # the default: auto
+        self.assertEqual(cfg["emri_likelihood"], "direct")
+
+    def test_auto_falls_back_to_full_with_one_info_line(self):
+        import logging
+
+        for extra, needle in ((dict(domain=_fd_spec()), "not WDM"), (dict(chan="AET"), "XYZ"),
+                              (dict(domain=object()), "not identifiable")):
+            with self.subTest(needle=needle), self.assertLogs(
+                    "lisatools.globalfit.stock.erebor.source_runtime", logging.INFO) as cm:
+                cfg = self._resolve(likelihood="auto", direct_table=self.table, **extra)
+            self.assertEqual(cfg["emri_likelihood"], "full")
+            self.assertEqual(len(cm.output), 1)
+            self.assertIn(needle, cm.output[0])
 
     def test_direct_takes_an_unidentifiable_domain_at_its_word(self):
         cfg = self._resolve(domain=object(), likelihood="direct", direct_table=self.table)
@@ -522,7 +538,11 @@ class BatchDomainRefusalTest(unittest.TestCase):
         class _Stub(EMRIDirectWDM):
             # column 0 tags the row: 1 -> FEW out-of-domain, 2 -> a real bug,
             # anything else -> built "alone" (plunge-chunk path) as a constant
+            mode_calls = 0
+            reused = []
+
             def _mode_list(self, few_args, few_kwargs):
+                type(self).mode_calls += 1
                 tag = int(few_args[0])
                 if tag == 1:
                     raise ValueError("p0 is outside of our domain of validity.")
@@ -530,8 +550,14 @@ class BatchDomainRefusalTest(unittest.TestCase):
                     raise RuntimeError("not a domain error")
                 return [], 0.0
 
+            def _call_knots(self, few_args, few_kwargs, modes, reuse=None):
+                if reuse is None:                       # the second FEW call of the old path
+                    self._mode_list(few_args, few_kwargs)
+                type(self).reused.append(reuse)
+                return SimpleNamespace(arr=np.full((3, self.wdm.Nf, self.wdm.Nt), few_args[0] + 10.0))
+
             def __call__(self, *p, **kw):
-                return SimpleNamespace(arr=np.full((3, self.wdm.Nf, self.wdm.Nt), p[0] + 10.0))
+                return self._call_knots(p, kw, None)
 
         table = SimpleNamespace(fdot_vals=np.array([-1.0, 1.0]), INTERP_METHOD="spline")
         wdm = WDMSettings(32, 64, 10.0, force_backend="cpu")
@@ -547,6 +573,15 @@ class BatchDomainRefusalTest(unittest.TestCase):
             want = 0.0 if v == 1.0 else v + 10.0
             self.assertTrue(np.all(out[r] == want), r)
         self.assertEqual(d.last_stats["failed"], 2)
+
+    def test_alone_rows_reuse_the_first_few_call(self):
+        """A row built alone (plunge) reuses the batch's own _mode_list: one FEW call per row,
+        not two (the 720-day speed test paid ~80 ms per row for the second one)."""
+        d = self._direct()
+        type(d).mode_calls, type(d).reused = 0, []
+        d.batch([np.full(14, v) for v in (0.0, 3.0, 4.0)], chunk_rows=3)
+        self.assertEqual(type(d).mode_calls, 3)
+        self.assertEqual(type(d).reused, [([], 0.0)] * 3)
 
     def test_without_skip_the_refusal_is_typed(self):
         from lisatools.utils.exceptions import WaveformDomainError
