@@ -83,7 +83,9 @@ class TestBatchedResponse(unittest.TestCase):
         ]
         cls.all_pols = np.asarray(pols)  # (nsky, num_time_samples)
 
-        orbits = EqualArmlengthOrbits()
+        # the CPU backend explicitly: a bare EqualArmlengthOrbits() picks CUDA on a GPU node,
+        # which the CPU responses below refuse (orbits/response backend assertion)
+        orbits = EqualArmlengthOrbits(force_backend="cpu")
         # configuration is lazy (first use); no explicit configure() needed
         cls.orbits = orbits
 
