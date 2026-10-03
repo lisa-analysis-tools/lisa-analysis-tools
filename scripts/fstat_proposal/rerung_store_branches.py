@@ -301,15 +301,32 @@ def _transform(arr, dplan, bplan):
     raise ValueError(dplan.family)
 
 
-def _recreate(grp, name, src_ds, new_shape, data):
+def _maxshape_like(src_ds, new_shape):
+    """The backend's maxshape convention at ``new_shape``: the ITERATION axis 0
+    is UNLIMITED (``None``), every other axis fixed at its extent. Any other
+    ``None`` the source carries is kept too."""
+    src_max = tuple(src_ds.maxshape) if src_ds.maxshape is not None else tuple(src_ds.shape)
+    return tuple(None if (i == 0 or m is None) else int(s)
+                 for i, (m, s) in enumerate(zip(src_max, new_shape)))
+
+
+def _recreate(grp, name, src_ds, new_shape, data, maxshape=None):
     """Replace ``grp[name]`` with a dataset of ``new_shape`` carrying ``data``.
 
     A temperature axis has a FIXED maxshape equal to its extent, so the
     dataset cannot be resized: it is deleted and created again with the
     source's dtype, compression, shuffle and fill value. Chunks follow the
     source with the temperature axis's chunk clamped to the new extent
-    (HDF5 refuses a chunk longer than a fixed dimension). maxshape stays
-    the shape itself (fixed), as the backend created it.
+    (HDF5 refuses a chunk longer than a fixed dimension).
+
+    ⚠ maxshape (2026-10-03 production failure): the iteration axis 0 is
+    UNLIMITED in every backend dataset (``maxshape[0] is None``) -- that is
+    what lets eryn ``grow`` the store each run. The first version of this
+    tool wrote ``maxshape = new_shape`` (every axis fixed), so the re-rung
+    6mo store refused its first ``grow`` ("dimension cannot exceed the
+    existing maximal size (new: 2085 max: 2084)") and the relaunch aborted
+    before writing anything. Axis 0 now stays ``None`` (``_maxshape_like``);
+    ``repair_unlimited`` mends a store written by the old version.
     """
     chunks = None
     if src_ds.chunks is not None:
@@ -317,10 +334,10 @@ def _recreate(grp, name, src_ds, new_shape, data):
     kwargs = dict(shape=tuple(int(s) for s in new_shape), dtype=src_ds.dtype,
                   compression=src_ds.compression, compression_opts=src_ds.compression_opts,
                   shuffle=src_ds.shuffle, fletcher32=src_ds.fletcher32,
-                  fillvalue=src_ds.fillvalue)
+                  fillvalue=src_ds.fillvalue,
+                  maxshape=_maxshape_like(src_ds, new_shape) if maxshape is None else maxshape)
     if chunks is not None:
         kwargs["chunks"] = chunks
-        kwargs["maxshape"] = tuple(int(s) for s in new_shape)
     attrs = dict(src_ds.attrs)
     del grp[name]
     ds = grp.create_dataset(name, **kwargs)
@@ -349,13 +366,59 @@ def apply_plan(path, plans, group="global_fit", log=print):
         f.flush()
 
 
+def fixed_axis0(path, branches, group="global_fit"):
+    """``["branch/dataset", ...]`` whose ITERATION axis is NOT unlimited.
+
+    Every backend dataset has ``maxshape[0] is None``; a finite axis 0 means
+    the store cannot grow and the next run aborts at its first ``grow``.
+    """
+    out = []
+    with h5py.File(path, "r") as f:
+        root = f[group]
+        for b in branches:
+            grp = root["sub_backend"][b]
+            for name in sorted(grp.keys()):
+                ds = grp[name]
+                if isinstance(ds, h5py.Dataset) and ds.maxshape[0] is not None:
+                    out.append(f"{b}/{name}")
+    return out
+
+
+def repair_unlimited(path, branches, group="global_fit", log=print):
+    """Re-create every dataset of ``branches`` whose iteration axis is finite
+    with ``maxshape = (None, *shape[1:])``, data / attrs / chunks / filters
+    kept. Returns the repaired names. Mends a store the 2026-10-02 version of
+    this tool re-rung (it fixed axis 0 at the allocated row count)."""
+    done = []
+    with h5py.File(path, "r+") as f:
+        root = f[group]
+        for b in branches:
+            grp = root["sub_backend"][b]
+            for name in sorted(grp.keys()):
+                ds = grp[name]
+                if not isinstance(ds, h5py.Dataset) or ds.maxshape[0] is None:
+                    continue
+                shape = tuple(int(s) for s in ds.shape)
+                _recreate(grp, name, ds, shape, ds[...], maxshape=(None,) + shape[1:])
+                done.append(f"{b}/{name}")
+                log(f"    {b}/{name:<20} iteration axis {shape[0]} (fixed) -> unlimited; "
+                    f"shape {shape} kept")
+        f.flush()
+    return done
+
+
 def verify(path, targets, group="global_fit"):
-    """Re-plan at the new counts: every selected branch must read as unchanged."""
+    """Re-plan at the new counts: every selected branch must read as unchanged,
+    and every dataset of the selected branches must still be growable."""
     again = plan(path, targets, group=group)
     bad = [bp.branch for bp in again if not bp.unchanged]
     if bad:
         raise RuntimeError(f"after the rewrite these branches still do not read at the "
                            f"requested count: {bad}")
+    stuck = fixed_axis0(path, sorted(targets), group=group)
+    if stuck:
+        raise RuntimeError(f"these datasets have a FINITE iteration axis (the store could "
+                           f"not grow; the next run would abort at its first grow): {stuck}")
     try:
         from lisatools.globalfit.hdfbackend import _validate_resume_readable
     except Exception as exc:  # noqa: BLE001 -- lisatools absent in a bare env
@@ -441,11 +504,12 @@ def main(argv=None):
                     help="move <base>_running_backup_copy.h5 aside (it has the OLD rung count)")
     ap.add_argument("--reset-midit", action="store_true",
                     help="move <base>_midit_checkpoint.pkl aside")
+    ap.add_argument("--repair-unlimited", metavar="BRANCHES", default=None,
+                    help="comma-separated branches: re-create every dataset whose ITERATION "
+                         "axis is finite with an unlimited one (a store re-rung by the "
+                         "2026-10-02 version cannot grow); dry run without --apply")
     args = ap.parse_args(argv)
 
-    targets = _parse_targets(args.set)
-    betas = None if args.betas is None else [float(x) for x in args.betas.split(",")]
-    ladder_mode = args.ladder
     if not os.path.exists(args.store):
         print(f"no such store: {args.store}")
         return 2
@@ -453,6 +517,49 @@ def main(argv=None):
     if holders:
         print(f"REFUSING: {args.store} is held open by PID(s) {holders}; stop the run first.")
         return 2
+
+    if args.repair_unlimited:
+        branches = [b.strip() for b in args.repair_unlimited.split(",") if b.strip()]
+        try:
+            stuck = fixed_axis0(args.store, branches, group=args.group)
+        except KeyError as exc:
+            print(f"REFUSING: no such branch group in the store: {exc}")
+            return 2
+        print(f"{args.store}")
+        if not stuck:
+            print(f"  every dataset of {branches} already has an unlimited iteration axis. "
+                  "nothing to do.")
+            return 0
+        print(f"  {len(stuck)} dataset(s) with a FINITE iteration axis (the store cannot grow):")
+        for s in stuck:
+            print(f"     {s}")
+        if not args.apply:
+            print("\n  DRY RUN -- nothing written. Re-run with --apply to repair in place.")
+            return 0
+        ts = _timestamp()
+        base, _ = os.path.splitext(args.store)
+        if not args.no_backup:
+            bak = _free_name(f"{base}.pre_repair-{ts}.h5")
+            print(f"\n  copying the store to {bak} ...")
+            shutil.copyfile(args.store, bak)
+        print("  repairing:")
+        repair_unlimited(args.store, branches, group=args.group)
+        left = fixed_axis0(args.store, branches, group=args.group)
+        if left:
+            print(f"  FAILED: still finite: {left}")
+            return 1
+        try:
+            from lisatools.globalfit.hdfbackend import _validate_resume_readable
+            _validate_resume_readable(args.store)
+            print("  lisatools _validate_resume_readable: OK")
+        except ImportError:
+            pass
+        print(f"  DONE. file on disk: {os.path.getsize(args.store) / MB:.1f} MB")
+        return 0
+
+    targets = _parse_targets(args.set)
+    betas = None if args.betas is None else [float(x) for x in args.betas.split(",")]
+    ladder_mode = args.ladder
     try:
         plans = plan(args.store, targets, group=args.group, fill=args.fill,
                      ladder_mode=ladder_mode, ratio=args.ratio, betas=betas)

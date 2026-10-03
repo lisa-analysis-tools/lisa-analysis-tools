@@ -24,6 +24,12 @@ sys.path.insert(
 
 import rerung_store_branches as R  # noqa: E402
 
+
+def _ms(shape):
+    """The backend's maxshape: the ITERATION axis 0 unlimited, the rest fixed
+    (the 2026-10-03 production abort came from a fixture that pinned axis 0)."""
+    return (None,) + tuple(int(x) for x in shape[1:])
+
 ROWS, NW = 6, 4
 
 
@@ -36,27 +42,27 @@ def _per_leaf_group(root, name, nt, nl, nd, leaf_count_name):
     chain = (1000.0 * t[None, :, None, None, None] + 100.0 * np.arange(NW)[None, None, :, None, None]
              + 10.0 * np.arange(nl)[None, None, None, :, None] + np.arange(nd)[None, None, None, None, :]
              + 1e4 * np.arange(ROWS)[:, None, None, None, None])
-    g.create_dataset("chain", data=chain, chunks=(3, 1, 1, 2, nd), maxshape=chain.shape, **kw)
+    g.create_dataset("chain", data=chain, chunks=(3, 1, 1, 2, nd), maxshape=_ms(chain.shape), **kw)
     inds = np.ones((ROWS, nt, NW, nl), dtype=bool)
     inds[:, :, :, -1] = False
-    g.create_dataset("inds", data=inds, chunks=(3, 1, 2, nl), maxshape=inds.shape, **kw)
+    g.create_dataset("inds", data=inds, chunks=(3, 1, 2, nl), maxshape=_ms(inds.shape), **kw)
     ll = (-1000.0 * t[None, None, :, None] - 10.0 * np.arange(nl)[None, :, None, None]
           - np.arange(NW)[None, None, None, :] - 1e4 * np.arange(ROWS)[:, None, None, None])
-    g.create_dataset("log_like", data=ll, chunks=(3, 2, 1, 2), maxshape=ll.shape, **kw)
-    g.create_dataset("log_prior", data=0.5 * ll, chunks=(3, 2, 1, 2), maxshape=ll.shape, **kw)
+    g.create_dataset("log_like", data=ll, chunks=(3, 2, 1, 2), maxshape=_ms(ll.shape), **kw)
+    g.create_dataset("log_prior", data=0.5 * ll, chunks=(3, 2, 1, 2), maxshape=_ms(ll.shape), **kw)
     betas = np.tile((1.0 / 1.5 ** t)[None, None, :], (ROWS, nl, 1))
-    g.create_dataset("betas_all", data=betas, chunks=(3, 2, 1), maxshape=betas.shape, **kw)
+    g.create_dataset("betas_all", data=betas, chunks=(3, 2, 1), maxshape=_ms(betas.shape), **kw)
     for cname in ("in_model_accepted", "in_model_proposed", "rj_accepted", "rj_proposed"):
         c = (7 + t[None, None, :] + 100 * np.arange(nl)[None, :, None]
              + 0 * np.arange(ROWS)[:, None, None]).astype(np.int64)
-        g.create_dataset(cname, data=c, chunks=(3, 2, 1), maxshape=c.shape, **kw)
+        g.create_dataset(cname, data=c, chunks=(3, 2, 1), maxshape=_ms(c.shape), **kw)
     for cname in ("swaps_accepted", "swaps_proposed"):
         s = (3 + np.arange(nt - 1)[None, None, :] + 100 * np.arange(nl)[None, :, None]
              + 0 * np.arange(ROWS)[:, None, None]).astype(np.int64)
-        g.create_dataset(cname, data=s, chunks=(3, 2, 1), maxshape=s.shape, **kw)
+        g.create_dataset(cname, data=s, chunks=(3, 2, 1), maxshape=_ms(s.shape), **kw)
     for dname in ("d_h", "h_h"):
         d = np.arange(ROWS * NW * nl, dtype=float).reshape(ROWS, NW, nl)
-        g.create_dataset(dname, data=d, chunks=(3, 1, nl), maxshape=d.shape, **kw)
+        g.create_dataset(dname, data=d, chunks=(3, 1, nl), maxshape=_ms(d.shape), **kw)
     return g
 
 
@@ -67,23 +73,23 @@ def _flat_group(root, name, nt, nd):
     t = np.arange(nt)
     chain = (1000.0 * t[None, :, None, None, None] + 100.0 * np.arange(NW)[None, None, :, None, None]
              + np.arange(nd)[None, None, None, None, :] + 0 * np.arange(ROWS)[:, None, None, None, None])
-    g.create_dataset("chain", data=chain, chunks=(3, 2, 2, 1, 1), maxshape=chain.shape, **kw)
+    g.create_dataset("chain", data=chain, chunks=(3, 2, 2, 1, 1), maxshape=_ms(chain.shape), **kw)
     inds = np.ones((ROWS, nt, NW, 1), dtype=bool)
-    g.create_dataset("inds", data=inds, chunks=(3, 2, 2, 1), maxshape=inds.shape, **kw)
+    g.create_dataset("inds", data=inds, chunks=(3, 2, 2, 1), maxshape=_ms(inds.shape), **kw)
     ll = -1000.0 * t[None, :, None] - np.arange(NW)[None, None, :] + 0 * np.arange(ROWS)[:, None, None]
-    g.create_dataset("log_like", data=ll, chunks=(3, 2, 1), maxshape=ll.shape, **kw)
-    g.create_dataset("log_prior", data=0.5 * ll, chunks=(3, 2, 1), maxshape=ll.shape, **kw)
+    g.create_dataset("log_like", data=ll, chunks=(3, 2, 1), maxshape=_ms(ll.shape), **kw)
+    g.create_dataset("log_prior", data=0.5 * ll, chunks=(3, 2, 1), maxshape=_ms(ll.shape), **kw)
     betas = np.tile((1.0 / 2.0 ** t)[None, :], (ROWS, 1))
-    g.create_dataset("betas", data=betas, chunks=(3, 2), maxshape=betas.shape, **kw)
+    g.create_dataset("betas", data=betas, chunks=(3, 2), maxshape=_ms(betas.shape), **kw)
     for cname in ("in_model_accepted", "in_model_proposed", "rj_accepted", "rj_proposed"):
         c = (5 + t[None, :] + 0 * np.arange(ROWS)[:, None]).astype(np.int64)
-        g.create_dataset(cname, data=c, chunks=(3, 2), maxshape=c.shape, **kw)
+        g.create_dataset(cname, data=c, chunks=(3, 2), maxshape=_ms(c.shape), **kw)
     for cname in ("swaps_accepted", "swaps_proposed"):
         s = (2 + np.arange(nt - 1)[None, :] + 0 * np.arange(ROWS)[:, None]).astype(np.int64)
-        g.create_dataset(cname, data=s, chunks=(3, 2), maxshape=s.shape, **kw)
+        g.create_dataset(cname, data=s, chunks=(3, 2), maxshape=_ms(s.shape), **kw)
     for dname in ("d_h", "h_h"):
         d = np.ones((ROWS, NW, 1))
-        g.create_dataset(dname, data=d, chunks=(3, 1, 1), maxshape=d.shape, **kw)
+        g.create_dataset(dname, data=d, chunks=(3, 1, 1), maxshape=_ms(d.shape), **kw)
     return g
 
 
@@ -219,7 +225,60 @@ class GrowPerLeafTest(_Base):
             ds = f["global_fit/sub_backend/mbh/chain"]
             self.assertEqual(ds.compression, "gzip")
             self.assertEqual(ds.chunks[0], 3)
-            self.assertEqual(ds.maxshape, ds.shape)
+            # the temperature (and every other) axis fixed, the ITERATION axis
+            # unlimited -- the backend's convention
+            self.assertEqual(ds.maxshape, (None,) + ds.shape[1:])
+
+    def test_the_rewritten_store_can_still_grow(self):
+        # 2026-10-03 production abort: the re-rung 6mo store refused eryn's
+        # first grow ("dimension cannot exceed the existing maximal size (new:
+        # 2085 max: 2084)") because every rewritten dataset had its iteration
+        # axis pinned at the allocated row count. Every dataset of a re-rung
+        # branch must resize along axis 0, and verify() must say so.
+        R.apply_plan(self.path, R.plan(self.path, {"mbh": 6, "sobbh": 3}), log=lambda *_: None)
+        self.assertEqual(R.fixed_axis0(self.path, ["mbh", "sobbh"]), [])
+        self.assertIn("OK", R.verify(self.path, {"mbh": 6, "sobbh": 3}))
+        with h5py.File(self.path, "r+") as f:
+            for b in ("mbh", "sobbh"):
+                g = f["global_fit/sub_backend"][b]
+                for name in g:
+                    ds = g[name]
+                    self.assertIsNone(ds.maxshape[0], f"{b}/{name}")
+                    ds.resize(ds.shape[0] + 1, axis=0)       # eryn's grow
+
+    def test_repair_unlimited_mends_a_store_written_by_the_old_tool(self):
+        # reproduce the old tool: fixed iteration axis on a rewritten dataset
+        with h5py.File(self.path, "r+") as f:
+            g = f["global_fit/sub_backend/mbh"]
+            for name in ("chain", "log_like"):
+                ds = g[name]
+                R._recreate(g, name, ds, ds.shape, ds[...], maxshape=tuple(ds.shape))
+            before = {name: g[name][...].copy() for name in g}
+        self.assertEqual(R.fixed_axis0(self.path, ["mbh"]), ["mbh/chain", "mbh/log_like"])
+        with self.assertRaises(RuntimeError):
+            R.verify(self.path, {"mbh": 2})
+        done = R.repair_unlimited(self.path, ["mbh"], log=lambda *_: None)
+        self.assertEqual(done, ["mbh/chain", "mbh/log_like"])
+        self.assertEqual(R.fixed_axis0(self.path, ["mbh"]), [])
+        with h5py.File(self.path, "r+") as f:
+            g = f["global_fit/sub_backend/mbh"]
+            for name in g:
+                np.testing.assert_array_equal(g[name][...], before[name], name)
+                self.assertIsNone(g[name].maxshape[0], name)
+            g["chain"].resize(g["chain"].shape[0] + 1, axis=0)
+        # idempotent
+        self.assertEqual(R.repair_unlimited(self.path, ["mbh"], log=lambda *_: None), [])
+
+    def test_repair_cli_dry_run_then_apply(self):
+        with h5py.File(self.path, "r+") as f:
+            g = f["global_fit/sub_backend/sobbh"]
+            ds = g["inds"]
+            R._recreate(g, "inds", ds, ds.shape, ds[...], maxshape=tuple(ds.shape))
+        self.assertEqual(R.main([self.path, "--repair-unlimited", "sobbh"]), 0)      # dry run
+        self.assertEqual(R.fixed_axis0(self.path, ["sobbh"]), ["sobbh/inds"])
+        self.assertEqual(R.main([self.path, "--repair-unlimited", "sobbh", "--apply",
+                                 "--no-backup"]), 0)
+        self.assertEqual(R.fixed_axis0(self.path, ["sobbh"]), [])
 
 
 class ShrinkTest(_Base):
