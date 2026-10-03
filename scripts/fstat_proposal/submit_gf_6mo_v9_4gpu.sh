@@ -4451,8 +4451,14 @@ echo "[DATA] SOURCE_TYPES=${SOURCE_TYPES} (COMBINED = pre-summed stream; classes
 # Ladders / repeats / swap cadence / start scatter: the probe's latest
 # rulings (submit_gf_6mo_sources_probe.sh, 2026-08-26..28 -- see its
 # comment blocks for the measured cost arithmetic).
-export MBH_NTEMPS=2
-export EMRI_NTEMPS=2
+# Yielding since 2026-10-02: the stored ladder wins on a resume anyway
+# (recipe.resume_ladder_wins, with a warning naming both counts), and a store
+# re-rung with scripts/fstat_proposal/rerung_store_branches.py is relaunched
+# with the matching count on the line (MBH_NTEMPS=12 EMRI_NTEMPS=12) so the
+# configured and stored ladders agree and the warning stays quiet. A hard
+# export here swallowed that line value.
+export MBH_NTEMPS=${MBH_NTEMPS:-2}
+export EMRI_NTEMPS=${EMRI_NTEMPS:-2}
 # 12 -> 8 (user ruling 2026-09-16, with repeats 25 -> 20: sobbh cost
 # trim now that the single-call fix landed). NOTE: SOBHB's ladder lives
 # in the stored PerLeafLadderState (betas_all per leaf), so on a RESUME
