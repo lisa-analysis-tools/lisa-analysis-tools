@@ -30,6 +30,9 @@ def main(path):
                 rows[(r["window"], r["src"])] = r
     keys = sorted(rows)
     ok = [k for k in keys if rows[k].get("status") == "ok"]
+    # rows before 2026-10-02 carry no noise record: they were SciRD v1 XYZ alone
+    noise = sorted({rows[k].get("noise", "scirdv1 XYZ, no galactic foreground (unrecorded)") for k in ok})
+    print("Noise weighting: " + ("; ".join(noise) or "-") + "\n")
 
     print("## Windows (data; band SNR over WDM layers <1 / 1-5 / 5-15 / 15-25 mHz)\n")
     print("| window | src | merger d in window | snr_data | data band SNR | batched kept box d "
