@@ -37,7 +37,14 @@ COLD_KEEP=${COLD_KEEP:-12}
 PYTHON=${PYTHON:-python}
 N_JOB_LOGS=${N_JOB_LOGS:-8}
 
-DIRS=("$@")
+# --add-fstat (user ruling 2026-10-03: "make it default to leaving them out.
+# If you want them, you add --add-fstat") = INCLUDE_FSTAT=1: ship the fstat
+# epoch caches under gb_fstat_fit/ (GBs at 1 yr). Default: only DONE.json.
+DIRS=()
+for _a in "$@"; do
+  if [ "$_a" = "--add-fstat" ]; then INCLUDE_FSTAT=1; else DIRS+=("$_a"); fi
+done
+unset _a
 if [ ${#DIRS[@]} -eq 0 ]; then
   DIRS=(gf_prod_3mo_v8)
 fi

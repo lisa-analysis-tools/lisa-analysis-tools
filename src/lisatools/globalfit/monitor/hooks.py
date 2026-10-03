@@ -219,7 +219,12 @@ def after_save(gb_reader, comm, main_rank, i, watchdog, *,
             # is a SEPARATE file from the full snapshot, so turning it
             # on does not overwrite or invalidate whatever full tar the
             # run has already produced.
-            build_snapshot(run_dir, short=_flag("GF_MONITOR_SNAPSHOT_SHORT"))
+            # GF_MONITOR_SNAPSHOT_FSTAT=1 -> the F-stat fit's epoch caches
+            # (gb_fstat_fit/**, GBs at 1 yr) ride along; default OUT, only
+            # their DONE.json markers ship (user ruling 2026-10-03: "default
+            # to leaving them out"). The CLI spelling is --add-fstat.
+            build_snapshot(run_dir, short=_flag("GF_MONITOR_SNAPSHOT_SHORT"),
+                           include_fstat=_flag("GF_MONITOR_SNAPSHOT_FSTAT"))
         elapsed = time.perf_counter() - st
 
         watchdog.report(

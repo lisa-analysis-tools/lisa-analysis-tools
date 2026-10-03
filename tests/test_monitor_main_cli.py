@@ -44,7 +44,22 @@ class SnapshotFlagTest(unittest.TestCase):
             rc = m.main(["--snapshot", self.run])
         self.assertEqual(rc, 0)
         bm.assert_called_once()
-        bs.assert_called_once_with(self.run, short=False)
+        bs.assert_called_once_with(self.run, short=False, include_fstat=False)
+
+    def test_the_fstat_caches_are_OUT_unless_add_fstat(self):
+        # User ruling 2026-10-03: "make it default to leaving them out. If
+        # you want them, you add --add-fstat". The CLI passes the choice
+        # through as build_snapshot(include_fstat=...).
+        with mock.patch.object(m, "build_monitor"), \
+                mock.patch.object(m, "build_snapshot",
+                                  return_value="/x/y_snapshot.tar.gz") as bs:
+            self.assertEqual(m.main(["--snapshot", self.run]), 0)
+            self.assertIs(bs.call_args.kwargs.get("include_fstat"), False)
+        with mock.patch.object(m, "build_monitor"), \
+                mock.patch.object(m, "build_snapshot",
+                                  return_value="/x/y_snapshot.tar.gz") as bs:
+            self.assertEqual(m.main(["--snapshot", "--add-fstat", self.run]), 0)
+            self.assertIs(bs.call_args.kwargs.get("include_fstat"), True)
 
     def test_snapshot_only_builds_the_TAR_and_NOT_the_page(self):
         with mock.patch.object(m, "build_monitor") as bm, \
@@ -53,7 +68,7 @@ class SnapshotFlagTest(unittest.TestCase):
             rc = m.main(["--snapshot-only", self.run])
         self.assertEqual(rc, 0)
         bm.assert_not_called()
-        bs.assert_called_once_with(self.run, short=False)
+        bs.assert_called_once_with(self.run, short=False, include_fstat=False)
 
     def test_snapshot_only_failure_does_not_claim_a_page_was_written(self):
         """The old message reassured the operator about a page that, in
@@ -371,7 +386,7 @@ class ShortFlagTest(unittest.TestCase):
                                   return_value="/t_short.tar.gz") as bs:
             rc = m.main(["--short", self.run])
         self.assertEqual(rc, 0)
-        bs.assert_called_once_with(self.run, short=True)
+        bs.assert_called_once_with(self.run, short=True, include_fstat=False)
 
     def test_short_with_snapshot_only_skips_the_page(self):
         with mock.patch.object(m, "build_monitor") as bm, \
@@ -380,11 +395,11 @@ class ShortFlagTest(unittest.TestCase):
             rc = m.main(["--snapshot-only", "--short", self.run])
         self.assertEqual(rc, 0)
         bm.assert_not_called()
-        bs.assert_called_once_with(self.run, short=True)
+        bs.assert_called_once_with(self.run, short=True, include_fstat=False)
 
     def test_plain_snapshot_is_still_the_FULL_one(self):
         with mock.patch.object(m, "build_monitor"), \
                 mock.patch.object(m, "build_snapshot",
                                   return_value="/t.tar.gz") as bs:
             m.main(["--snapshot", self.run])
-        bs.assert_called_once_with(self.run, short=False)
+        bs.assert_called_once_with(self.run, short=False, include_fstat=False)

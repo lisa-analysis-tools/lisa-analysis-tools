@@ -77,6 +77,17 @@ def _parser():
                          "then be rendered offline from it with "
                          "`python -m lisatools.globalfit.monitor.from_tar "
                          "SNAP.tar.gz`. In-run equivalent: GF_MONITOR_PAGE=0.")
+    # The F-stat fit's epoch caches (gb_fstat_fit/**: the comb and the
+    # stacked grid peaks, GBs at 1 yr) are OUT of every tar by default and
+    # have been since the shell recipe; only their DONE.json markers ride
+    # along. User ruling 2026-10-03: "make it default to leaving them out.
+    # If you want them, you add --add-fstat". In-run equivalent:
+    # GF_MONITOR_SNAPSHOT_FSTAT=1. A --short tar never carries them.
+    ap.add_argument("--add-fstat", action="store_true",
+                    help="ALSO ship the F-stat fit's epoch caches under "
+                         "gb_fstat_fit/ (large; off by default, only their "
+                         "DONE.json markers are kept). Ignored by --short. "
+                         "In-run equivalent: GF_MONITOR_SNAPSHOT_FSTAT=1.")
     ap.add_argument("--build-truth", action="store_true",
                     help="generate the detectability truth set into the run "
                          "directory first when it is missing or was built "
@@ -150,7 +161,7 @@ def main(argv=None):
 
     if a.snapshot or a.snapshot_only or a.short:
         st = time.perf_counter()
-        tar = build_snapshot(run_dir, short=a.short)
+        tar = build_snapshot(run_dir, short=a.short, include_fstat=a.add_fstat)
         if tar:
             print(f"[monitor] wrote {tar} in {time.perf_counter() - st:.1f} s")
         else:
