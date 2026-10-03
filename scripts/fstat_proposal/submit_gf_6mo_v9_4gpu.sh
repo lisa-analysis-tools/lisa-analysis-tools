@@ -4640,6 +4640,14 @@ export MBH_BATCH_MAX_SIZE=${MBH_BATCH_MAX_SIZE:-8}
 # 30 until now, so it is pinned here for the run record.
 # MBH_RESPONSE_ORDER=30 on the launch line restores the old order.
 export MBH_RESPONSE_ORDER=${MBH_RESPONSE_ORDER:-8}
+# Window lattice decimation q (2026-10-02, OFF by default until the cluster
+# speed/accuracy run): the batched template is generated, responded and
+# WDM-transformed at q*dt on Nf/q layers (same 1-h pixels), ~q x less phentax +
+# response + transform per row. Laptop: q=2 mismatch <= 1.5e-9 vs q=1 at 6e5 and
+# 6e6 Msun; q=4 fails the lightest (ringdown above the 50 mHz coarse Nyquist).
+# The epoch snaps onto the q*dt lattice for BOTH generators (no stored coordinate
+# changes; a resume may switch q).
+export MBH_WINDOW_DECIMATE=${MBH_WINDOW_DECIMATE:-1}
 # MBH_CHECK_LL_EVERY is deliberately NOT exported: the batched move defaults
 # it to 10 (every 10th leaf visit re-scores the cold rung through the stock
 # 90 d generator; warns past MBH_CHECK_LL_TOL = 0.5 nats). For the FIRST
@@ -4692,10 +4700,19 @@ if got != want:
     sys.exit(2)
 dur = cfg["mbh_waveform_duration"]
 dur_txt = "full span" if dur is None else "%.1f d" % (float(dur) / 86400.0)
+q_want = int(os.environ["MBH_WINDOW_DECIMATE"])
+q_got = int(cfg.get("mbh_window_decimate", 1))
+if got[0] == "batched" and q_got != q_want:
+    print(f"[MBH-PREFLIGHT] REFUSING: exported MBH_WINDOW_DECIMATE={q_want} but the "
+          f"settings resolve {q_got} (an install that predates the knob ignores it).")
+    sys.exit(2)
+if q_got > 1 and 1440 % q_got:
+    print(f"[MBH-PREFLIGHT] REFUSING: MBH_WINDOW_DECIMATE={q_got} does not divide Nf=1440.")
+    sys.exit(2)
 print(f"[MBH-PREFLIGHT] mbh_pe scoring={got[0]} batch<={got[1]} "
       f"response_order={got[2]} waveform_duration={dur_txt} window "
       f"-{cfg['mbh_window_before'] / 86400.0:g}/+"
-      f"{cfg['mbh_window_after'] / 86400.0:g} d")
+      f"{cfg['mbh_window_after'] / 86400.0:g} d decimate={q_got}")
 PYEOF
 
 # EMRI MODE-SELECTION THRESHOLD (user ruling 2026-09-14). FEW's kwarg is

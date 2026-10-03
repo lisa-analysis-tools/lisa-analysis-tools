@@ -178,6 +178,10 @@ def parse_args(argv=None):
     w.add_argument("--window-margin-days", type=float)
     w.add_argument("--buffer-time", type=float, default=15000.0)
     w.add_argument("--order", type=int, default=8, help="batched response order (MBH_RESPONSE_ORDER)")
+    w.add_argument("--window-decimate", type=int, default=int(os.environ.get("MBH_WINDOW_DECIMATE", "1")),
+                   help="batched window lattice decimation q (MBH_WINDOW_DECIMATE): generator, response and "
+                        "segment transform at q*dt on Nf/q layers; the epoch snaps onto the q*dt lattice "
+                        "(the stock references too, as in the run)")
     s = p.add_argument_group("sweep")
     s.add_argument("--batch-sizes", help="comma list of batch_max_size B (run ascending)")
     s.add_argument("--min-rows", type=int, help="N = max(2B, min_rows), rounded up to a multiple of B")
@@ -780,7 +784,9 @@ def build_context(args):
         k = int(np.rint((ctx.truth[10] - merger_s) / ctx.dt))
         ctx.data_t0 = ctx.epoch + k * ctx.dt + float(args.snap_frac) * ctx.dt
     ctx.t_merge_abs = ctx.epoch + ctx.truth[10]
-    ctx.t0_snapped, ctx.snap = snap_waveform_t0_to_lattice(ctx.epoch, ctx.data_t0, ctx.dt)
+    # the run's rule (get_mbh_phenom_gen / get_mbh_windowed_gen): snap onto the q*dt lattice
+    ctx.decimate = int(args.window_decimate)
+    ctx.t0_snapped, ctx.snap = snap_waveform_t0_to_lattice(ctx.epoch, ctx.data_t0, ctx.dt * ctx.decimate)
 
     crop = int(args.edge_crop)
     ctx.td = TDSettings(ctx.N, ctx.dt, t0=ctx.data_t0, force_backend=ctx.backend)
@@ -857,14 +863,16 @@ def evict_stock_gen(gen):
 
 def build_windowed_adapter(ctx):
     """Mirror of ``source_runtime.get_mbh_windowed_gen`` (same generator kwargs)."""
+    q = int(getattr(ctx, "decimate", 1))
+    gen_td = ctx.td if q == 1 else TDSettings(ctx.N // q, ctx.dt * q, t0=ctx.data_t0, force_backend=ctx.backend)
     gen = WindowedGridAlignedMBHWaveform(
         waveform_kwargs=dict(
             higher_modes=list(HIGHER_MODES), include_negative_modes=True,
             t_low_fit=True, coarse_grain=False, atol=1e-12, rtol=1e-12,
         ),
         Tobs=ctx.W_before, start_freq=7e-5, use_reference_time=True,
-        waveform_t0=ctx.t0_snapped, data_td_settings=ctx.td,
-        tdi_generation="2nd generation", tdi_channels="XYZ", sampling_frequency=1.0 / ctx.dt,
+        waveform_t0=ctx.t0_snapped, data_td_settings=gen_td,
+        tdi_generation="2nd generation", tdi_channels="XYZ", sampling_frequency=1.0 / gen_td.dt,
         orbits=ctx.orbits, order=int(ctx.args.order), tukey_alpha=ctx.window_alpha, stft_dt=None,
         freq_min=ctx.min_freq, freq_max=ctx.max_freq, fft_batch_size=1,
         buffer_time=ctx.buffer_time, output_domain_settings=ctx.wdm, force_backend=ctx.backend,
@@ -876,6 +884,8 @@ def build_windowed_adapter(ctx):
     extra = {}
     if "t0_abs" in inspect.signature(MBHWindowedWDMSignalGen.__init__).parameters:
         extra["t0_abs"] = float(ctx.data_t0)
+    if q != 1:
+        extra["decimate"] = q
     adapter = MBHWindowedWDMSignalGen(
         gen, ctx.wdm, nchannels=3, tukey_alpha=ctx.window_alpha, **extra
     )
@@ -1030,9 +1040,10 @@ def run_batched(ctx, acs, windowed, adapter, ref_gen, rows, idx, cold, mem, stat
     ll_first = None
     for B in Bs:
         N = rows_for(B, args.min_rows)
-        label = f"batched o{args.order} T{ctx.W_before / DAY:.4g}d"
+        label = f"batched o{args.order} T{ctx.W_before / DAY:.4g}d" + (
+            f" q{ctx.decimate}" if ctx.decimate != 1 else "")
         rec = dict(kind="batched", label=label, B=B, rows=N, order=int(args.order),
-                   T_days=ctx.W_before / DAY, oom=False, error=None)
+                   T_days=ctx.W_before / DAY, decimate=int(ctx.decimate), oom=False, error=None)
         if stop:
             rec["skipped"] = "a smaller B ran out of memory"
             out.append(rec)

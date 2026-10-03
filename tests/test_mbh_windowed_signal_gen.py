@@ -261,6 +261,93 @@ class _XpSegmentGen(_SegmentGen):
         return cp.asarray(t), cp.asarray(ch)
 
 
+class _DecimatedSegmentGen(_SegmentGen):
+    """:class:`_SegmentGen` sampling every ``q``-th lattice point (``q * DT``), as a
+    generator built on the decimated TD settings does; records ``set_window``."""
+
+    def __init__(self, td_full, q):
+        super().__init__(td_full[..., ::q].copy())
+        self.q = int(q)
+        self.windows = []
+
+    def set_window(self, t_seg_abs, n_seg):
+        self.windows.append((float(t_seg_abs), int(n_seg)))
+
+    def compute_tdi_channels(self, amp, **kwargs):
+        self.n_calls += 1
+        t = np.arange(N // self.q) * DT * self.q
+        if np.ndim(amp) == 0:
+            return t, float(amp) * self.td_full
+        a = np.asarray(amp, dtype=float)
+        return np.broadcast_to(t, (a.size, t.size)).copy(), a[:, None, None] * self.td_full[None]
+
+
+def _smooth_chirp(c_layer=60, width_layers=5.0, f0=2e-3, fdot=4e-7):
+    """A Gaussian-enveloped chirp centred on layer ``c_layer``: no taper edges, so
+    no broadband leakage to alias (its spectrum ends ~1e-4 Hz past its sweep)."""
+    t = np.arange(N) * DT
+    tc = c_layer * NF * DT
+    sig = width_layers * NF * DT
+    x = np.exp(-0.5 * ((t - tc) / sig) ** 2) * np.sin(
+        2 * np.pi * (f0 * (t - tc) + 0.5 * fdot * (t - tc) ** 2) + 0.4)
+    return np.stack([x, 0.5 * x, 0.25 * x])
+
+
+class WindowedDecimateTest(unittest.TestCase):
+    """MBH_WINDOW_DECIMATE: the segment sampled at ``q * DT`` and transformed on
+    ``NF / q`` layers (same layer_dt, so the same pixels) gives the kept layers of
+    the ``DT`` segment for content below the coarse Nyquist. Grid: layer 320 s, band
+    to layer 7 (10.9 mHz), a Gaussian-enveloped chirp ~2 -> 6 mHz; q = 2 puts the
+    coarse Nyquist at 25 mHz. The error is aliasing of whatever the signal has above
+    the coarse Nyquist: the tukey-tapered 4 -> 20 mHz ``_chirp`` (band to 21.9 mHz)
+    measured 1.6e-5 at q = 2, a tapered 2 -> 8 mHz one 3.2e-7, this smooth one below
+    the bound (production q = 2 has a 100 mHz coarse Nyquist over a 25 mHz band)."""
+
+    BAND = dict(min_freq=1.5e-3, max_freq=1.09e-2)
+
+    def setUp(self):
+        self.wdm = WDMSettings(NF, NT, DT, force_backend="cpu", **self.BAND)
+        self.h_td = _smooth_chirp()
+
+    def _adapter(self, q, tukey_alpha=0.0):
+        from lisatools.sources.batching import MBHWindowedWDMSignalGen
+
+        gen = _DecimatedSegmentGen(self.h_td, q)
+        sg = MBHWindowedWDMSignalGen(gen, self.wdm, nchannels=3, tukey_alpha=tukey_alpha, decimate=q)
+        sg.set_window(n_start=40, Nt_keep=40, n_pad=8)
+        return sg, gen
+
+    def test_kept_layers_equal_the_full_rate_ones(self):
+        for alpha in (0.0, 0.3):
+            ref = np.asarray(self._adapter(1, alpha)[0](1.0).arr)
+            sg, gen = self._adapter(2, alpha)
+            out = np.asarray(sg(1.0).arr)
+            self.assertEqual(out.shape, ref.shape)
+            err = float(np.abs(out - ref).max() / np.abs(ref).max())
+            print(f"[windowed decimate q=2, tukey {alpha}] kept-layer max rel diff vs q=1 {err:.2e}")
+            self.assertLess(err, 1e-9)
+            # the generator was told the DECIMATED segment length
+            g = sg.geometry
+            self.assertEqual(gen.windows[-1][1], NF // 2 * g["Nt_seg"])
+            self.assertEqual(g["decimate"], 2)
+
+    def test_q_must_divide_nf(self):
+        from lisatools.sources.batching import MBHWindowedWDMSignalGen
+
+        with self.assertRaises(ValueError):
+            MBHWindowedWDMSignalGen(_SegmentGen(self.h_td), self.wdm, decimate=3)
+        with self.assertRaises(ValueError):
+            MBHWindowedWDMSignalGen(_SegmentGen(self.h_td), self.wdm, decimate=0)
+
+    def test_a_band_the_coarse_grid_cannot_hold_is_refused(self):
+        """q = 8: NF / 8 = 4 layers (Nyquist 6.25 mHz) cannot hold layers up to 7."""
+        from lisatools.sources.batching import MBHWindowedWDMSignalGen
+
+        sg = MBHWindowedWDMSignalGen(_DecimatedSegmentGen(self.h_td, 8), self.wdm, decimate=8)
+        with self.assertRaisesRegex(RuntimeError, "decimate=8"):
+            sg.set_window(n_start=40, Nt_keep=40, n_pad=8)
+
+
 class WindowedSignalGenGPUParityTest(unittest.TestCase):
     """GPU build of the windowed sub-transform == its CPU build (skips without a GPU).
 
@@ -779,6 +866,78 @@ class WindowedGridAlignedPhentaxTest(unittest.TestCase):
 
 
 @unittest.skipUnless(_phentax_available(), "needs jax + phentax")
+class WindowedGridAlignedPhentaxDecimateTest(unittest.TestCase):
+    """MBH_WINDOW_DECIMATE on real phentax + pyResponseTDI (GPU when available,
+    else CPU): the windowed template generated, responded and transformed at
+    2 dt on Nf/2 layers equals the dt one on the kept layers. Grid: dt 5 s, Nf
+    192 (layer 960 s), 2 days, band 0.25-25 mHz; the WindowedGridAlignedPhentax
+    source (6e6 Msun, merger at day 1, T 12 h). Laptop measurement of the same
+    comparison at dt 2.5 -> 5 / 10 s (scratchpad decimate_mbh_check.py,
+    2026-10-02): 6e6 Msun mismatch <= 8e-10 (q=2) / 4.7e-9 (q=4), norm ratio
+    within 5e-7; a 6e5 Msun source 1.5e-9 at q=2 but 5.7e-5 and a 0.7 % norm loss
+    at q=4 (its higher-mode ringdown passes the 50 mHz coarse Nyquist).
+    Paired control: phi_ref + 1e-3 rad must exceed the bound."""
+
+    DT, NF, NT = 5.0, 192, 180
+    T_GEN = 43200.0
+    ROW = WindowedGridAlignedPhentaxTest.ROW
+    MM_MAX, RATIO_TOL = 2e-8, 1e-5
+
+    @classmethod
+    def setUpClass(cls):
+        from lisatools.detector import EqualArmlengthOrbits
+        from lisatools.sources.batching import MBHWindowedWDMSignalGen
+        from lisatools.sources.bbh.gridaligned import WindowedGridAlignedMBHWaveform
+
+        backend = _gpu_backend_name() or "cpu"
+        cls.backend = backend
+        cls.wdm = WDMSettings(cls.NF, cls.NT, cls.DT, t0=0.0, min_freq=2.5e-4, max_freq=2.5e-2,
+                              force_backend=backend)
+        orbits = EqualArmlengthOrbits(force_backend=backend)
+        layer = cls.NF * cls.DT
+        n_start = int(np.floor((86400.0 - cls.T_GEN - 3600.0) / layer))
+        Nt_keep = int(np.ceil((cls.T_GEN + 6 * 3600.0) / layer)) + 1
+        if (Nt_keep + 8) % 2:
+            Nt_keep += 1
+        cls.out = {}
+        for q in (1, 2):
+            dt = cls.DT * q
+            gen = WindowedGridAlignedMBHWaveform(
+                waveform_kwargs=dict(higher_modes=[21, 33, 44], include_negative_modes=True,
+                                     t_low_fit=True, coarse_grain=False, atol=1e-12, rtol=1e-12),
+                Tobs=cls.T_GEN, start_freq=7e-5, use_reference_time=True, waveform_t0=0.0,
+                data_td_settings=TDSettings(cls.NF // q * cls.NT, dt, t0=0.0, force_backend=backend),
+                tdi_generation="2nd generation", tdi_channels="XYZ", sampling_frequency=1.0 / dt,
+                orbits=orbits, order=8, tukey_alpha=0.0, stft_dt=None, freq_min=2.5e-4, freq_max=2.5e-2,
+                fft_batch_size=1, buffer_time=15000.0, output_domain_settings=cls.wdm,
+                force_backend=backend,
+            )
+            ad = MBHWindowedWDMSignalGen(gen, cls.wdm, nchannels=3, tukey_alpha=0.0, decimate=q)
+            ad.set_window(n_start=n_start, Nt_keep=Nt_keep, n_pad=4)
+            rows = np.stack([cls.ROW, cls.ROW])
+            rows[1, 5] += 1e-3                     # the paired control: phi_ref + 1e-3 rad
+            cls.out[q] = np.real(np.asarray(asnumpy(ad(*rows.T).arr)))
+
+    @staticmethod
+    def _cmp(a, r):
+        mm = 1 - np.vdot(r.ravel(), a.ravel()).real / (np.linalg.norm(r) * np.linalg.norm(a))
+        return float(mm), float(np.linalg.norm(a) / np.linalg.norm(r))
+
+    def test_decimated_kept_layers_equal_the_full_rate_ones(self):
+        ref, dec = self.out[1][0], self.out[2][0]
+        self.assertEqual(dec.shape, ref.shape)
+        for c in range(3):
+            mm, ratio = self._cmp(dec[c], ref[c])
+            print(f"[phentax decimate q=2, {self.backend}] ch {c}: mismatch {mm:.3e}, norm ratio {ratio:.9f}")
+            self.assertLess(mm, self.MM_MAX, c)
+            self.assertLess(abs(ratio - 1.0), self.RATIO_TOL, c)
+
+    def test_the_control_exceeds_the_bound(self):
+        mm, _ = self._cmp(self.out[2][1][0], self.out[1][0][0])
+        print(f"[phentax decimate control phi_ref + 1e-3] mismatch {mm:.3e}")
+        self.assertGreater(mm, 10 * self.MM_MAX)
+
+
 class WindowedGridAlignedPhentaxGPUParityTest(unittest.TestCase):
     """CUDA build of the grid-aligned windowed MBH template == its CPU build (real
     phentax; skips without a GPU backend).

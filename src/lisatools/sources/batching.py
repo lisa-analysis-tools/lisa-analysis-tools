@@ -171,17 +171,30 @@ class MBHWindowedWDMSignalGen(BatchedDomainSignalGen):
             start. A stock erebor build's settings do NOT (the WDM factory
             builds ``t0 = 0``; a GB comp build later sets it to the data start
             in place), so the global fit passes it explicitly.
+        decimate: lattice decimation ``q`` (``MBH_WINDOW_DECIMATE``). The
+            segment is sampled at ``q * dt`` and transformed on ``Nf / q``
+            layers -- the same ``layer_dt``, hence the same pixels: for content
+            below the coarse Nyquist the WDM coefficients equal the ``dt`` ones
+            (measured 7e-12 at q=2, 4e-10 at q=4 on a synthetic chirp sum). The
+            generator must then produce its channels at ``q * dt`` too (it is
+            told ``Nf / q * Nt_seg`` samples). ``Nf`` must be divisible by ``q``
+            and the coarse grid must still hold the run's active band.
     """
 
     def __init__(
         self, wave_gen, wdm_settings, nchannels: int = 3, tukey_alpha: float = 0.0,
-        t0_abs: float | None = None,
+        t0_abs: float | None = None, decimate: int = 1,
     ):
         super().__init__(wave_gen)
         self.wdm = wdm_settings
         self.nchannels = int(nchannels)
         self.tukey_alpha = float(tukey_alpha or 0.0)
         self._t0_abs = None if t0_abs is None else float(t0_abs)
+        self.decimate = int(decimate)
+        if self.decimate < 1 or int(self.wdm.Nf) % self.decimate:
+            raise ValueError(
+                f"decimate={decimate}: must be a positive divisor of the grid's Nf={self.wdm.Nf}"
+            )
         self.geometry = None
         self._seg_td = None
         self._seg_wdm = None
@@ -238,14 +251,16 @@ class MBHWindowedWDMSignalGen(BatchedDomainSignalGen):
                 f"kept layers [{n_start}, {n_start + Nt_keep}) fall outside the data's "
                 f"active box [{self.wdm.ind_min_t}, {self.wdm.ind_max_t + 1})"
             )
+        q = self.decimate
         Nf = int(self.wdm.Nf)
-        dt = float(self.wdm.data_dt)
+        Nf_seg = Nf // q
+        dt = float(self.wdm.data_dt) * q
         layer_dt = float(self.wdm.layer_dt)
         t_seg = self.t0_abs + s0 * layer_dt
         backend = self.wdm.backend
-        self._seg_td = TDSettings(Nf * Nt_seg, dt, t0=t_seg, force_backend=backend)
+        self._seg_td = TDSettings(Nf_seg * Nt_seg, dt, t0=t_seg, force_backend=backend)
         self._seg_wdm = WDMSettings(
-            Nf, Nt_seg, dt, t0=t_seg, oversample=self.wdm.oversample,
+            Nf_seg, Nt_seg, dt, t0=t_seg, oversample=self.wdm.oversample,
             min_freq=self.wdm.min_freq, max_freq=self.wdm.max_freq,
             is_complex=self.wdm.is_complex, force_backend=backend,
         )
@@ -255,22 +270,24 @@ class MBHWindowedWDMSignalGen(BatchedDomainSignalGen):
         ):
             raise RuntimeError(
                 "segment WDM settings do not reproduce the run's active frequency layers"
+                + (f" (decimate={q}: Nf/q = {Nf_seg} layers cannot hold the run's band "
+                   f"up to {self.wdm.max_freq} Hz)" if q > 1 else "")
             )
         self._box = self.wdm.get_slice(
             (slice(0, int(self.wdm.Nf_active)), slice(rel_t0, rel_t0 + Nt_keep))
         )
         if self.tukey_alpha > 0.0:
             w = tukey(int(self.wdm.N), self.tukey_alpha, xp=np)
-            self._win_seg = self.wdm.xp.asarray(w[s0 * Nf:(s0 + Nt_seg) * Nf])
+            self._win_seg = self.wdm.xp.asarray(w[s0 * Nf:(s0 + Nt_seg) * Nf:q])
         else:
             self._win_seg = None
         self.geometry = dict(
             n_start=n_start, Nt_keep=Nt_keep, n_pad=n_pad, n_pad_lo=n_pad_lo,
             n_pad_hi=n_pad_hi, n_pad_hi_req=n_pad_hi_req,
-            s0=s0, Nt_seg=Nt_seg, t_seg=t_seg,
+            s0=s0, Nt_seg=Nt_seg, t_seg=t_seg, decimate=q,
         )
         if hasattr(self.wave_gen, "set_window"):
-            self.wave_gen.set_window(t_seg, Nf * Nt_seg)
+            self.wave_gen.set_window(t_seg, Nf_seg * Nt_seg)
 
     def _to_domain(self, times, channels):
         # No guard here: this is an internal helper, only ever reached via

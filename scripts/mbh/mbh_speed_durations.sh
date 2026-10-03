@@ -64,6 +64,11 @@
 #   BENCH_ARGS (extra flags to the benchmark AND the accuracy script, e.g. "--window-pad-days
 #   8"; the accuracy script ignores the speed-sweep ones), ACC_ARGS (accuracy only, e.g.
 #   "--near 0"), DATA_ARGS (data step only), OUT (mbh_speed_durations_<date>).
+#   MBH_WINDOW_DECIMATE (the run's knob, read by all three steps; default 1): the batched
+#   window generated / responded / transformed at q*dt on Nf/q layers, the epoch snapped
+#   onto the q*dt lattice for the batched AND the 90-d stock reference, as in the run. The
+#   accuracy step then measures the decimation error against the full-rate stock
+#   (e.g. MBH_WINDOW_DECIMATE=2 bash scripts/mbh/mbh_speed_durations.sh).
 #
 # SAME as the EMRI / SOBBH harnesses: Nf, dt; the noise everywhere (the EMRI RunBox's
 # XYZ2SensitivityMatrix(dom, model="scirdv1", stochastic_params=(Tobs,)) at the grid's Tobs,
@@ -156,6 +161,7 @@ step() { case ",${STEPS}," in *,"$1",*) return 0 ;; *) return 1 ;; esac; }
 
 nt=$((WINDOW_DAYS * 24))
 act=$((nt - 2 * EDGE))
+echo "[mbh] MBH_WINDOW_DECIMATE=${MBH_WINDOW_DECIMATE:-1} (batched window lattice decimation, all steps)"
 echo "[mbh] backend ${BACKEND}; merger-centred grid ${WINDOW_DAYS} d (Nt ${nt}, Tobs $((NF * nt * 5 / 2)) s), merger" \
      "${MERGER_AT_DAYS} d in; Nf ${NF} dt ${DT} s; band ${FMIN}-${FMAX} Hz, active t [${EDGE}, $((nt - EDGE))) = ${act} layers;" \
      "foreground ${FOREGROUND}; orbits ${ORBITS}; MOJITO_LIGHT_PATH ${MOJITO_LIGHT_PATH:-unset}; -> ${OUT}/"

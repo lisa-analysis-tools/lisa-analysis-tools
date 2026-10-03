@@ -516,6 +516,17 @@ class SourceMBHSettings(MBHSettings):
     window_margin_days: float = dataclasses.field(
         default_factory=env_default("MBH_WINDOW_MARGIN_DAYS", 1.0, float)
     )
+    # Batched window lattice decimation q (2026-10-02): the windowed template is
+    # generated, responded and WDM-transformed at q*dt on Nf/q layers -- the same
+    # layer_dt, so the same pixels -- for a ~q-fold cut of phentax + response +
+    # transform. The epoch snaps onto the q*dt lattice (both generators). Laptop
+    # check (2 days, layer 960 s, band 0.25-25 mHz; kept layers vs q=1): q=2
+    # mismatch <= 1.5e-9 at 6e5 and 6e6 Msun; q=4 4.7e-9 at 6e6 but 5.7e-5 with a
+    # 0.7 % norm loss at 6e5 Msun (its higher-mode ringdown passes the 50 mHz
+    # coarse Nyquist). 1 = the data lattice.
+    window_decimate: int = dataclasses.field(
+        default_factory=env_default("MBH_WINDOW_DECIMATE", 1, int)
+    )
     buffer_time: float = 15_000.0
     # phentax generation window (None -> full data span).
     waveform_duration: typing.Optional[float] = dataclasses.field(
@@ -1246,6 +1257,9 @@ def resolve_mbh_batched_cfg(mbh, *, domain_settings) -> dict:
     pad = float(mbh.window_pad_days) * 86400.0
     margin = float(mbh.window_margin_days) * 86400.0
     duration = mbh.waveform_duration
+    decimate = int(getattr(mbh, "window_decimate", 1))
+    if decimate < 1:
+        raise ValueError(f"MBH_WINDOW_DECIMATE must be >= 1; got {decimate}")
     if mode != "full":
         blockers = _mbh_batched_blockers(
             mbh, domain_settings, explicit_batched=(mode == "batched")
@@ -1295,6 +1309,8 @@ def resolve_mbh_batched_cfg(mbh, *, domain_settings) -> dict:
         mbh_window_pad=pad,
         mbh_window_margin=margin,
         mbh_waveform_duration=duration,
+        # the batched path only; 1 on the full path (nothing decimates there)
+        mbh_window_decimate=decimate if mode == "batched" else 1,
     )
 
 
@@ -1665,9 +1681,12 @@ def get_mbh_phenom_gen(general_info, cfg):
         # move's cross-check) the SAME epoch, t_plunge shifted by the snap.
         # Measured (mojito id 17, SNR 1420, 2026-09-30): against the
         # UNSNAPPED stock the near-truth rows differ by up to 0.59 nats; the
-        # snapped stock agrees to 1.5e-3.
+        # snapped stock agrees to 1.5e-3. A decimated window snaps onto the
+        # q*dt lattice (a subset of the data lattice); the same q here keeps
+        # the two epochs identical.
         waveform_t0, snap = snap_waveform_t0_to_lattice(
-            waveform_t0, general_info.data_t0, general_info.dt
+            waveform_t0, general_info.data_t0,
+            general_info.dt * int(cfg.get("mbh_window_decimate", 1)),
         )
     gen = get_mbh_phenom_wave_gen(
         data_td_settings=general_info.data_td_settings,
@@ -1752,7 +1771,7 @@ def get_mbh_windowed_gen(general_info, cfg):
     ``t_plunge_snap`` and ``t0_abs = general_info.data_t0`` (the absolute time
     of WDM layer 0) for the move.
     """
-    from lisatools.domains import WDMSettings
+    from lisatools.domains import TDSettings, WDMSettings
     from lisatools.sources.batching import MBHWindowedWDMSignalGen
     from lisatools.sources.bbh.gridaligned import WindowedGridAlignedMBHWaveform
 
@@ -1764,13 +1783,15 @@ def get_mbh_windowed_gen(general_info, cfg):
     orbits = _device_local_orbits(base_orbits, xp, primary)
     wdm = _device_local_domain_settings(general_info.domain_settings, xp, primary)
     pk = cfg["mbh_phenom_kwargs"]
+    q = int(cfg.get("mbh_window_decimate", 1))
     # Device-local orbits/settings key the device; the cfg values that shape
     # the generator key the configuration (a cfg change must not be served a
     # stale generator).
     key = (
         "mbh_windowed", id(general_info), id(orbits), id(wdm), cfg["nchannels"],
-        cfg["mbh_waveform_t0"], tuple(sorted((k, tuple(v) if isinstance(v, (list, tuple)) else v)
-                                             for k, v in pk.items())),
+        cfg["mbh_waveform_t0"], q,
+        tuple(sorted((k, tuple(v) if isinstance(v, (list, tuple)) else v)
+                     for k, v in pk.items())),
     )
     if key in _WAVE_WRAP_CACHE:
         return _WAVE_WRAP_CACHE[key]
@@ -1779,13 +1800,29 @@ def get_mbh_windowed_gen(general_info, cfg):
             "MBH_LIKELIHOOD=batched needs a WDM run domain "
             f"(general.domain_settings is {type(wdm).__name__})."
         )
+    # MBH_WINDOW_DECIMATE = q: the windowed generator samples at q*dt (its own
+    # TD settings), its epoch snapped onto the q*dt lattice -- the stock
+    # generator (get_mbh_phenom_gen) snaps with the same q, so both share it.
+    lattice_dt = float(general_info.dt) * q
     t0_snapped, snap = snap_waveform_t0_to_lattice(
-        cfg["mbh_waveform_t0"], general_info.data_t0, general_info.dt
+        cfg["mbh_waveform_t0"], general_info.data_t0, lattice_dt
     )
     if snap != 0.0:
         logger.info(
             "[MBH_BATCH] waveform_t0 snapped onto the data lattice by %+.6f s "
             "(t_plunge rows are shifted by the same amount inside the move)", snap,
+        )
+    if q == 1:
+        gen_td = general_info.data_td_settings
+    else:
+        td = general_info.data_td_settings
+        if int(td.N) % q:
+            raise ValueError(f"MBH_WINDOW_DECIMATE={q} does not divide the data length N={td.N}")
+        gen_td = TDSettings(int(td.N) // q, lattice_dt, t0=float(td.t0),
+                            force_backend=general_info.force_backend)
+        logger.info(
+            "[MBH_BATCH] window lattice decimated %dx: generator, response and segment "
+            "transform at %.3g s on Nf/%d layers (MBH_WINDOW_DECIMATE)", q, lattice_dt, q,
         )
     gen = WindowedGridAlignedMBHWaveform(
         waveform_kwargs=dict(
@@ -1796,10 +1833,10 @@ def get_mbh_windowed_gen(general_info, cfg):
         start_freq=pk["start_freq"],
         use_reference_time=True,
         waveform_t0=t0_snapped,
-        data_td_settings=general_info.data_td_settings,
+        data_td_settings=gen_td,
         tdi_generation=cfg["tdi_gen_str"],
         tdi_channels=cfg["tdi_chan"],
-        sampling_frequency=1.0 / general_info.dt,
+        sampling_frequency=1.0 / lattice_dt,
         orbits=orbits,
         order=pk["response_order"],
         tukey_alpha=general_info.window_alpha,
@@ -1820,7 +1857,7 @@ def get_mbh_windowed_gen(general_info, cfg):
     # vgb setup), so that t0 depends on build order.
     adapter = MBHWindowedWDMSignalGen(
         gen, wdm, nchannels=cfg["nchannels"], tukey_alpha=general_info.window_alpha,
-        t0_abs=float(general_info.data_t0),
+        t0_abs=float(general_info.data_t0), decimate=q,
     )
     adapter.waveform_t0 = t0_snapped
     adapter.t_plunge_snap = snap

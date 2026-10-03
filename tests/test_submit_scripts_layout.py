@@ -797,7 +797,8 @@ class SixMonthMBHBatchedTest(unittest.TestCase):
         src = open(SIX_MO_V9).read()
         for knob, default in (("MBH_LIKELIHOOD", "batched"),
                               ("MBH_BATCH_MAX_SIZE", "8"),
-                              ("MBH_RESPONSE_ORDER", "8")):
+                              ("MBH_RESPONSE_ORDER", "8"),
+                              ("MBH_WINDOW_DECIMATE", "1")):
             self.assertRegex(
                 src, rf"(?m)^export {knob}=\$\{{{knob}:-{default}\}}$", knob)
 
@@ -822,7 +823,8 @@ class SixMonthMBHBatchedTest(unittest.TestCase):
 
         code = compile(_mbh_preflight_source(SIX_MO_V9), "mbh_preflight", "exec")
         base = {k: self.v9[k] for k in
-                ("MBH_LIKELIHOOD", "MBH_BATCH_MAX_SIZE", "MBH_RESPONSE_ORDER")}
+                ("MBH_LIKELIHOOD", "MBH_BATCH_MAX_SIZE", "MBH_RESPONSE_ORDER",
+                 "MBH_WINDOW_DECIMATE")}
         base.update(env)
         out = io.StringIO()
         with mock.patch.dict(os.environ, base):
@@ -841,6 +843,17 @@ class SixMonthMBHBatchedTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("mbh_pe scoring=batched batch<=8 response_order=8", out)
         self.assertIn("waveform_duration=90.0 d", out)
+        self.assertIn("decimate=1", out)
+
+    def test_the_preflight_resolves_and_bounds_the_window_decimation(self):
+        """MBH_WINDOW_DECIMATE on the launch line reaches the settings (printed);
+        a q that does not divide Nf=1440 is refused before the allocation."""
+        rc, out = self._run_preflight(MBH_WINDOW_DECIMATE="2")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("decimate=2", out)
+        rc, out = self._run_preflight(MBH_WINDOW_DECIMATE="7")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("does not divide Nf=1440", out)
 
     def test_the_preflight_refuses_what_the_build_would_refuse(self):
         for env in ({"MBH_WAVEFORM_DURATION": "2592000"},
