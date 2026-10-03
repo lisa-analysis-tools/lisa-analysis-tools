@@ -3816,6 +3816,43 @@ GB_OPS = ("gb_run_proposal", "gb_run_tempering", "gb_finish", "gb_sync",
           "gb_fstat_ref_row", "gb_fstat_comb", "gb_fstat_stage_b",
           "gb_fstat_release")
 
+#: Head-set knobs every compute rank must follow PER PROPOSE.
+#:
+#: A recipe step applies its stage profile and its PE declarations to the
+#: HEAD's move objects (``SearchStageProfileStep._apply_profile``,
+#: ``apply_inmodel_repeats``, ``apply_rj_flip_fraction`` run from the
+#: recipe's announce path, which only the head executes). The compute ranks
+#: hold their OWN move objects, built from the same env at construction, and
+#: never saw those writes. 6mo jobs 675/685/695 (4 walkers on 4 compute
+#: ranks): the log shows ONE ``[V9-STAGE gb_search_3] entering`` line against
+#: FOUR construction lines, and the ``[GB_ACCEPT rj-split rj_prior_removal]``
+#: lines show births on exactly one block (the head's walker 0) and
+#: ``births 0`` on the other three -- the stage-3 ``prior_births`` reached
+#: one walker in four, and so did ``opt_snr`` 8 -> 5 and ``phase_maximize``
+#: True -> False. Shipped in ``clock_vals`` on every ``gb_run_proposal``,
+#: installed by :meth:`GBSpecialStretchMove._enter_rank_block` and restored
+#: by :meth:`GBSpecialStretchMove._exit_rank_block`, so the ranks' bodies
+#: run under the head's live values and the rank object keeps its own
+#: between commands.
+GB_RANK_LIVE_ATTRS = (
+    "opt_snr_rej_samp_limit",   # stage profile opt_snr (the birth SNR floor)
+    "phase_maximize",           # stage profile phase_maximize
+    "rj_removal_only",          # stage profile prior_births (rj_prior_removal)
+    "rj_flip_fraction",         # PE declaration (GB_PE_RJ_FLIP_FRACTION)
+    "num_repeat_proposals",     # PE declaration (in-model repeats)
+)
+
+
+def gb_rank_live_attrs(move) -> dict:
+    """``{name: value}`` of :data:`GB_RANK_LIVE_ATTRS` the move carries (host scalars)."""
+    out = {}
+    for k in GB_RANK_LIVE_ATTRS:
+        if hasattr(move, k):
+            v = getattr(move, k)
+            out[k] = v if isinstance(v, (bool, int, float, str)) or v is None else (
+                v.item() if hasattr(v, "item") else v)
+    return out
+
 #: F-stat op -> the ``GBSpecialRJFStatGridMove`` attribute its served body
 #: needs. ``gf_serve`` checks this before dispatching, so a command addressed
 #: to a GB move that cannot run an F-stat fit fails with a named error on
@@ -24383,6 +24420,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # would stand still and they would disagree with the head about
             # which epoch is current.
             self.gf_iteration = int(cv["gf_iteration"])
+        # The head's stage-profile / PE-declaration knobs (GB_RANK_LIVE_ATTRS):
+        # installed for this command's body, put back by _exit_rank_block, so
+        # a rank proposes under the head's live values instead of its own
+        # construction-time ones (jobs 675-695: one walker in four did).
+        saved["_live_attrs"] = self._install_rank_live_attrs(cv.get("live_attrs"))
 
         tables = (payload or {}).get("tables") or {}
         # READ-ONLY on a rank: the head arms, advances and persists them.
@@ -24433,6 +24475,26 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             type(self)._branch_propose_counts.pop(self.branch_name, None)
         else:
             type(self)._branch_propose_counts[self.branch_name] = count
+        self._restore_rank_live_attrs(saved.get("_live_attrs"))
+
+    def _install_rank_live_attrs(self, live) -> dict:
+        """Install the head's per-propose knobs; return what they replaced.
+
+        Only names in :data:`GB_RANK_LIVE_ATTRS` that this move already
+        carries are written (a stale or foreign key never invents an
+        attribute). On the head the shipped values are its own, so this is
+        a no-op there.
+        """
+        saved = {}
+        for k, v in dict(live or {}).items():
+            if k in GB_RANK_LIVE_ATTRS and hasattr(self, k):
+                saved[k] = getattr(self, k)
+                setattr(self, k, v)
+        return saved
+
+    def _restore_rank_live_attrs(self, saved) -> None:
+        for k, v in dict(saved or {}).items():
+            setattr(self, k, v)
 
     def _check_block_aca_width(self, acs):
         """Refuse an ``AnalysisContainerArray`` that is not this rank's block.
@@ -27647,6 +27709,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # does, rather than trusting a pre-counted total.
             "gf_iteration": (None if getattr(self, "gf_iteration", None) is None
                              else int(self.gf_iteration)),
+            # The stage profile / PE declarations live on the HEAD's move
+            # object only; the ranks run their bodies under these values
+            # (see GB_RANK_LIVE_ATTRS -- jobs 675-695 ran stage 3's
+            # opt_snr 5 and prior births on one walker in four).
+            "live_attrs": gb_rank_live_attrs(self),
         }
         # READ-ONLY copies: the head arms, advances and persists these, and
         # a rank must never see them move under it mid-propose.

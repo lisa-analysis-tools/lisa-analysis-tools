@@ -1325,6 +1325,67 @@ def release_band_shutoff_window(state, serial, branch: str = "gb"):
     return n, True
 
 
+def apply_shutoff_floor_to_state(state, fmin_hz, band_edges=None, branch: str = "gb"):
+    """Reopen the live valve below ``fmin_hz`` NOW, on the state the moves bind.
+
+    Returns ``(n_reopened, n_exempt_bands)``; ``(0, 0)`` when there is nothing
+    to do or not enough to do it with.
+
+    The recipe-step side of the ratchet's RJ shutoff floor. The move side
+    (``_update_search_band_shutoff``) applies the floor at every JUDGMENT,
+    which is the END of an rj_fstat_search propose -- after that propose's
+    F-stat refit. 6mo job 695 (relaunched with the floor onto a valve 82.9 %
+    shut): the first nudge's hard refit (epoch 37) skipped every band shut on
+    all four walkers (``fstat_band_skip_for``) and produced 5,701 peaks over
+    the bands some walker still had open; the floor then reopened 1,010
+    pairs at the judgment forty minutes later, and the next refit (epoch 38)
+    found 14,119. The first nudge/release pair ran its F-stat births on a
+    sixth of the bands. Same arrays and same in-place rule as
+    :func:`release_band_shutoff_window`, so the saver persists it and the
+    move's own judgment then finds nothing left to reopen.
+    """
+    if state is None or fmin_hz is None or float(fmin_hz) <= 0.0:
+        return 0, 0
+    try:
+        bi = state.sub_states[branch].band_info
+    except (AttributeError, KeyError, TypeError):
+        return 0, 0
+    if not isinstance(bi, dict):
+        return 0, 0
+    shut = bi.get("band_rj_shutoff_w")
+    if shut is None:
+        return 0, 0
+    shut = np.asarray(shut)
+    if shut.ndim != 2:
+        return 0, 0
+    edges = band_edges if band_edges is not None else bi.get("band_edges")
+    if edges is None:
+        logger.warning(
+            "[GALFOR_RATCHET] RJ shutoff floor: no band_edges on the GB moves or in "
+            "band_info -- the live valve is NOT reopened now; the move's next "
+            "judgment will do it (after that propose's refit).")
+        return 0, 0
+    _get = getattr(edges, "get", None)           # cupy -> host
+    edges = np.asarray(_get() if callable(_get) else edges, dtype=float).reshape(-1)
+    if edges.size != shut.shape[1] + 1:
+        logger.warning(
+            "[GALFOR_RATCHET] RJ shutoff floor: band_edges (%d) do not match the "
+            "valve's %d bands -- the live valve is NOT reopened now.",
+            edges.size, shut.shape[1])
+        return 0, 0
+    exempt = (0.5 * (edges[:-1] + edges[1:])) < float(fmin_hz)
+    streak = bi.get("band_shutoff_streak_w")
+    if streak is not None:
+        streak = np.asarray(streak)
+        if streak.shape != shut.shape:
+            streak = None
+    from .moves.gbspecialstretch import apply_shutoff_floor
+
+    converged = np.zeros(shut.shape, dtype=bool)     # the judgment recomputes it
+    n = apply_shutoff_floor(converged, shut, streak, exempt)
+    return int(n), int(exempt.sum())
+
+
 def _arm_cap_headroom_grant(moves) -> None:
     """Set the one-shot ``_grant_cap_headroom`` flag on every move in the tree
     that publishes a headroom deficit, so the next cap update grants +1 slot to
@@ -1632,6 +1693,7 @@ class SearchStageProfileStep(RJRecipeStep):
         self._ratchet_release_maxes = []
         self._ratchet_last_k = None
         self._ratchet_pre_nudge = None
+        self._ratchet_pre_nudge_w = None
         # ---- search LEGS (user design 2026-09-30) -------------------------
         # One stored row per leg of the cycle; the stage combine carries the
         # cursor (``gf_legs``), this step positions it at entry from the last
@@ -1871,7 +1933,11 @@ class SearchStageProfileStep(RJRecipeStep):
         try:
             bc = getattr(sample, "branches_coords", None)
             if bc is not None and "galfor" in bc:
-                self._ratchet_pre_nudge = np.asarray(bc["galfor"])[0, :, 0, :].mean(axis=0).copy()
+                _w = np.asarray(bc["galfor"])[0, :, 0, :]
+                self._ratchet_pre_nudge = _w.mean(axis=0).copy()
+                # per walker too: the readout compares the MEAN OF THE CURVES
+                # (the curve of the mean parameters misreads a split alpha)
+                self._ratchet_pre_nudge_w = _w.copy()
         except Exception as e:  # noqa: BLE001 -- a readout reference, never fatal
             logger.debug("[GALFOR_RATCHET] reference capture skipped: %r", e)
 
@@ -2011,6 +2077,23 @@ class SearchStageProfileStep(RJRecipeStep):
                 f"{1e3 * want:.3g} mHz" if want else "LIFTED", changed,
                 "bands below it stay open while the ratchet is active" if want
                 else "the valve may shut converged pairs at every frequency again")
+        if want:
+            # Reopen the LIVE valve now, not at the next judgment: the nudge's
+            # hard refit runs BEFORE that judgment and skips bands shut on
+            # every walker (job 695 epoch 37: 5,701 peaks vs 14,119).
+            _edges = None
+            for m in gb_moves_in_tree(moves):
+                _edges = getattr(m, "band_edges", None)
+                if _edges is not None:
+                    break
+            n_open, n_ex = apply_shutoff_floor_to_state(
+                getattr(self, "_ratchet_last_sample", None), want, _edges)
+            if n_open:
+                logger.info(
+                    "[GALFOR_RATCHET %s] RJ shutoff floor applied to the LIVE valve: "
+                    "%d shut (walker, band) pair(s) in the %d band(s) below %.3g mHz "
+                    "reopened now (streaks zeroed), ahead of the next F-stat refit.",
+                    self.stage_name or "gb_search", n_open, n_ex, 1e3 * want)
 
     def _ratchet_refit_only_on_nudge(self, moves, k=None, force_off=False) -> None:
         """Hand the F-stat refit clock to the ratchet while it is active.
@@ -2132,13 +2215,15 @@ class SearchStageProfileStep(RJRecipeStep):
         if int(k_done) < 0:
             return                      # a head that ran before a clock reset
         try:
-            from .noise_ratchet import galfor_curve_ratio
+            from .noise_ratchet import galfor_curve_ratio, galfor_curves
 
             bc = getattr(sample, "branches_coords", None)
             if bc is None or "galfor" not in bc:
                 return
-            mean = np.asarray(bc["galfor"])[0, :, 0, :].mean(axis=0)
+            cur_w = np.asarray(bc["galfor"])[0, :, 0, :]
+            mean = cur_w.mean(axis=0)
             ref = getattr(self, "_ratchet_pre_nudge", None)
+            ref_w = getattr(self, "_ratchet_pre_nudge_w", None)
             f = np.array([1.0, 2.0, 3.0, 3.5, 4.0, 4.5, 5.0]) * 1e-3
             if ref is None:
                 logger.info(
@@ -2147,6 +2232,24 @@ class SearchStageProfileStep(RJRecipeStep):
                     self.stage_name or "gb_search", k_done,
                     self.ratchet.action(k_done).upper(),
                     np.array2string(mean, precision=4))
+                return
+            if ref_w is not None and np.shape(ref_w) == np.shape(cur_w):
+                # MEAN OF THE WALKERS' CURVES over mean of the reference
+                # curves -- not the curve of the mean parameters, which
+                # misreads a split alpha/f1 (job 695 row 81: +2..5 % where
+                # the walkers' curves averaged -6..7 % at 3.5-5 mHz).
+                _cur = galfor_curves(cur_w, f)
+                r = _cur.mean(axis=0) / galfor_curves(ref_w, f).mean(axis=0)
+                spread = _cur.max(axis=0) / _cur.min(axis=0)
+                logger.info(
+                    "[GALFOR_RATCHET %s] after iteration %d (%s): cold-mean galfor "
+                    "%s; curve (mean over walkers) / pre-nudge at 1,2,3,3.5,4,4.5,5 "
+                    "mHz = %s; walker max/min of the curve = %s",
+                    self.stage_name or "gb_search", k_done,
+                    self.ratchet.action(k_done).upper(),
+                    np.array2string(mean, precision=4),
+                    np.array2string(r, precision=3),
+                    np.array2string(spread, precision=2))
                 return
             r = galfor_curve_ratio(mean, ref, f)
             logger.info(

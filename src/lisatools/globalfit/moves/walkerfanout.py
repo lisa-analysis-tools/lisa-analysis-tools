@@ -100,6 +100,17 @@ class WalkerFanoutMixin:
     fanout_assigns_counters = False  # body ASSIGNS sub-state delta counters -> zero, then sum
     _fanout_body = False  # True while propose_local runs as a rank body
     gf_clock = None  # the command clock of the propose being served (rank side)
+    #: Head-set knobs the rank's body must follow PER PROPOSE. A recipe step
+    #: applies its PE declarations (``apply_inmodel_repeats`` -> ``num_repeats``)
+    #: to the HEAD's move objects only -- ``note_recipe_step`` runs on the
+    #: recipe's announce path, which the compute ranks never execute -- while
+    #: each rank holds its own move object built from the env at construction.
+    #: Without this, full_pe's 25 repeats would run on the head's walker block
+    #: and the construction-time 10 (psd/galfor) or 2 (MBH/EMRI) everywhere
+    #: else. Shipped in the propose payload, installed around ``propose_local``
+    #: and restored after it (:meth:`fanout_install_live`). Subclasses extend
+    #: the tuple for any other knob a step rewrites after construction.
+    fanout_live_attrs = ("num_repeats",)
 
     # ---- one-walker replica mode (row scatter) ---------------------------
     row_fanout = None  # RowFanout when the layout is in replica mode
@@ -156,6 +167,29 @@ class WalkerFanoutMixin:
 
     def fanout_apply_extra(self, extra):
         """Rank side: install the shipped clock values before the body runs."""
+
+    def fanout_live_payload(self) -> dict:
+        """Head: ``{name: value}`` of :attr:`fanout_live_attrs` this move carries."""
+        return {k: getattr(self, k) for k in (self.fanout_live_attrs or ())
+                if hasattr(self, k)}
+
+    def fanout_install_live(self, live) -> dict:
+        """Rank: install the head's live knobs; return what they replaced.
+
+        Only names in :attr:`fanout_live_attrs` that this move already carries
+        are written. On the head the shipped values are its own (a no-op).
+        """
+        allowed = set(self.fanout_live_attrs or ())
+        saved = {}
+        for k, v in dict(live or {}).items():
+            if k in allowed and hasattr(self, k):
+                saved[k] = getattr(self, k)
+                setattr(self, k, v)
+        return saved
+
+    def fanout_restore_live(self, saved) -> None:
+        for k, v in dict(saved or {}).items():
+            setattr(self, k, v)
 
     def fanout_reply_extra(self, part):
         """Rank -> head: swap tallies and anything the body left rank-local."""
@@ -296,7 +330,12 @@ class WalkerFanoutMixin:
         fanout = self.fanout
         layout = fanout.layout
         branches = list(self.fanout_branches or [])
-        extra = self.fanout_payload_extra()
+        extra = dict(self.fanout_payload_extra() or {})
+        _live = self.fanout_live_payload()
+        if _live:
+            # the head's live knobs ride under a reserved key; gf_serve pops
+            # it before the subclass sees ``extra``
+            extra["_live_attrs"] = _live
 
         # the head's ACA must be its own walker block, not the ensemble: the
         # body scores this block's rows against it (spec, ACA-width rule)
@@ -389,12 +428,15 @@ class WalkerFanoutMixin:
             self.gf_clock = dict(clock or {})
             return handler(payload, clock, model)
         self.gf_clock = dict(clock or {})  # WP8 seeds its synced swap RNG from this
-        self.fanout_apply_extra(payload.get("extra") or {})
+        _extra = dict(payload.get("extra") or {})
+        _saved_live = self.fanout_install_live(_extra.pop("_live_attrs", None))
+        self.fanout_apply_extra(_extra)
         self._fanout_body = True
         try:
             part, accepted = self.propose_local(model, payload["state"])
         finally:
             self._fanout_body = False
+            self.fanout_restore_live(_saved_live)
         # `propose_local` commonly re-wraps its input as ``GFState(state, copy=True)``;
         # that constructor instantiates a BARE (non-None, not tempered_initialized)
         # sub-state for every branch in ``sub_state_bases``, even ones ``slice_state``
