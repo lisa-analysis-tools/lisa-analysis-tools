@@ -1879,6 +1879,15 @@ class SourceSignalGen:
         dev = current_device(xp)
         with device_context(xp, dev):
             if self.branch == "emri":
+                # direct mode: the ENGINE-side template generator is the direct-to-WDM
+                # template too, so residual rebuilds, the move's expose/fold and its
+                # scoring all use one template family (as SOBBH's chunked mode does); the
+                # move's cross-check and its fallback stay on the production wrap, which
+                # it carries as its own ``waveform_gen``.
+                if self.cfg.get("emri_likelihood", "full") == "direct":
+                    return get_emri_direct_gen(self.general_info, self.cfg)(
+                        *params_in, **kwargs
+                    )
                 return get_emri_wave_wrap(self.general_info, self.cfg)(
                     *params_in, **kwargs
                 )
@@ -2092,8 +2101,10 @@ def get_emri_direct_gen(general_info, cfg):
 
 def build_emri_move_runtime(curr, acs, priors, state, cfg):
     """EMRI PE move: :class:`~lisatools.globalfit.moves.EMRIDirectLikeMove` when
-    ``cfg["emri_likelihood"] == "direct"`` (scoring through the direct-to-WDM template,
-    fill and cross-check on the production wrap), else the stock per-row move."""
+    ``cfg["emri_likelihood"] == "direct"`` (scoring through the direct-to-WDM template; the
+    residual expose/fold through the containers' installed generator, which in that mode is
+    the direct template as well -- :class:`SourceSignalGen`; the cross-check and the fallback
+    on the production wrap), else the stock per-row move."""
     wave_gen = DeviceLocalWaveGen(get_emri_wave_wrap, curr.general_info, cfg)
     if cfg.get("emri_likelihood", "full") == "direct":
         direct = DeviceLocalWaveGen(get_emri_direct_gen, curr.general_info, cfg)

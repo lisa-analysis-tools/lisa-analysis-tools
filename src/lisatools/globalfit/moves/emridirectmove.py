@@ -15,13 +15,15 @@ sweeps, replica replays) and swaps ONLY the scoring, as :class:`MBHBatchedLikeMo
   ``offset[walker] + <r|h> - 1/2 <h|h>`` with ``offset = acs.likelihood()`` on the
   freshly exposed residual, i.e. the container path's ``-1/2 <r-h|r-h>`` + noise term.
 
-The residual expose/fold STAYS on the production generator (the containers' installed
-``signal_gen``, the base class's per-row path): the direct template differs from the
-production one at the ~1e-4 mismatch level, so filling the shared residual with it would
-leave ``h_direct - h_production`` of every visited state behind in the residual every
-other branch sees, and the engine's residual rebuilds would disagree with the fills.
-Scoring is self-consistent either way: the leaf's ``prev_logl`` and every proposal are
-scored by the same direct generator against the same exposed residual.
+The residual expose/fold runs through the containers' installed ``signal_gen`` (the base
+class's per-row path). In the global fit with ``EMRI_LIKELIHOOD=direct`` that generator is
+the direct-to-WDM template too (``stock.erebor.source_runtime.SourceSignalGen``), so the
+engine's residual rebuilds, the fills and the scoring use one template family and the
+residual every other branch sees holds exactly what the sampler scored. (With a production
+generator installed instead, as in ``scripts/emri/emri_direct_fit_wiring_check.py``, scoring
+is still self-consistent: the leaf's ``prev_logl`` and every proposal are scored by the same
+direct generator against the same exposed residual.) The move's own ``waveform_gen`` stays
+the PRODUCTION wrap: it owns the cross-check and the fallback.
 
 Two checks therefore carry a per-point TOLERANCE here instead of the base's exact-algebra
 gates (``EMRI_CHECK_LL_TOL`` 1 nat plus a template-mismatch term that grows with the point's
@@ -31,12 +33,14 @@ COLD rung only:
 * :meth:`_verify_prev_logl` (every ``EMRI_CHECK_LL_EVERY``-th visit, default 10):
   direct ``prev_logl`` vs the production container path at the same points;
 * :meth:`_verify_entry_vs_acs`: direct ``prev_logl`` on the exposed residual vs the
-  pre-expose full lnL (production template in the residual). The expose-sign class of
-  bug it exists for moves lnL by ~SNR^2, far above the tolerance.
+  pre-expose full lnL (the installed generator's template in the residual: the direct one
+  in the fit, so this is then exact up to round-off). The expose-sign class of bug it
+  exists for moves lnL by ~SNR^2, far above the tolerance.
 
 A chunk the direct path cannot build (any exception other than a per-row FEW domain
 refusal: GPU OOM, a table error, a missing compiled kernel) is scored through the
-per-row production container path, LOUDLY (warned once per leaf, counted in
+per-row container path with the production generator (``waveform_gen``), LOUDLY
+(warned once per leaf, counted in
 ``n_batch_fallbacks`` and the ``[EMRI_DIRECT]`` telemetry). A row FEW refuses scores
 ``-1e300``, as on the container path.
 """
@@ -230,8 +234,10 @@ class EMRIDirectLikeMove(ResidualAddOneRemoveOneMove):
                 leaf, type(exc).__name__, exc, int(coords.shape[0]),
             )
         t_score = time.perf_counter()
+        # the PRODUCTION generator: the installed one may be the direct template that just failed
         ll = np.real(np.asarray(
-            self.compute_acs_like(coords, idx, **self.waveform_like_kwargs), dtype=float
+            self.compute_acs_like(coords, idx, signal_gen=self.waveform_gen, **self.waveform_like_kwargs),
+            dtype=float,
         )).reshape(-1)
         self._stats["score_s"] += time.perf_counter() - t_score
         return ll, np.full(ll.shape, np.nan), np.full(ll.shape, np.nan)
@@ -366,7 +372,7 @@ class EMRIDirectLikeMove(ResidualAddOneRemoveOneMove):
         worst = int(np.argmax(excess))
         msg = (
             f"{self.branch_name} leaf {leaf}: EXPOSE INVARIANT VIOLATED -- cold direct "
-            f"prev_logl vs pre-expose ACS lnL (production template in the residual): "
+            f"prev_logl vs pre-expose ACS lnL (the installed generator's template in the residual): "
             f"max|diff| {max_abs:.6e}, median {float(np.median(diff)):.6e} over "
             f"{int(both.sum())} walkers; worst |diff| {abs(float(diff[worst])):.6e} vs its "
             f"tolerance {float(tol[both][worst]):.6e} ({self._dbg_prefix}_CHECK_LL_TOL="

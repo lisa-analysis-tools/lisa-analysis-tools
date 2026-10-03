@@ -2,14 +2,17 @@
 
 Builds the production EMRI wrap (``get_emri_wave_wrap``) and the direct-to-WDM adapter
 (``get_emri_direct_gen``) exactly as the global fit does (cfg from ``source_signal_cfg``
-with the EMRI direct resolver), puts ``production(truth) - production(cold)`` in one
-container per walker on a fit-style WDM run domain (active band + edge crop), then:
+with the EMRI direct resolver), installs the fit's engine template generator
+(``SourceSignalGen``: with ``--fill direct``, the default and the fit's setup since 10-03, the
+direct template; ``--fill production`` the production wrap) on one container per walker
+holding ``production(truth) - fill(cold)`` on a fit-style WDM run domain (active band + edge
+crop), then:
 
-* template mismatch, direct vs production, at the truth and at every scored row;
-* ``EMRIDirectLikeMove.compute_like`` (direct) vs ``compute_acs_like`` (the production
-  container path, i.e. the move's own cross-check) row by row: ``dlogL`` is what the
-  sampler sees;
-* wall time per row of both paths (``--backend`` GPU: synchronised).
+* template mismatch, direct vs production, at the truth;
+* ``EMRIDirectLikeMove.compute_like`` (direct, batched) vs ``compute_acs_like`` (the per-row
+  container path with the INSTALLED generator) and vs ``compute_check_like`` (the move's
+  cross-check: the production generator), row by row;
+* wall time per row of the paths (``--backend`` GPU: synchronised).
 
 laptop (CPU, the 20 s table, short window)::
 
@@ -56,6 +59,8 @@ def main():
     ap.add_argument("--eps", type=float, default=1e-3, help="EMRI_EPS")
     ap.add_argument("--response", default="dense", choices=("dense", "spline"))
     ap.add_argument("--rows", type=int, default=6)
+    ap.add_argument("--fill", choices=("direct", "production"), default="direct",
+                    help="the containers' installed (engine) generator; direct = the fit's setup")
     ap.add_argument("--walkers", type=int, default=2)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
@@ -111,12 +116,15 @@ def main():
     cold, rows = rows[: args.walkers], rows[args.walkers:]
     truth = np.asarray(asnumpy(prod(*params).arr))
 
-    def gen(*p, apply_transform=False, leaf_inds=None, **kw):
-        return prod(*p, **kw)
+    if args.fill == "direct":
+        fill_cfg = dict(cfg)
+    else:
+        fill_cfg = dict(cfg, emri_likelihood="full")
+    gen = sr.SourceSignalGen("emri", None, gi, fill_cfg)            # the fit's engine generator
 
     acs_list = []
     for w in range(args.walkers):
-        res = truth - np.asarray(asnumpy(prod(*cold[w]).arr))
+        res = truth - np.asarray(asnumpy(gen(*cold[w], apply_transform=False).arr))
         xp_res = cp.asarray(res) if gpu else res
         ac = AnalysisContainer(WDMSignal(xp_res, dom), sens)
         ac.signal_gen = {"emri": gen}
@@ -141,6 +149,7 @@ def main():
     slow = move.compute_acs_like(rows, idx)
     sync()
     slow_s = time.perf_counter() - t0
+    check = np.real(np.asarray(move.compute_check_like(rows, idx), dtype=float))
 
     def mm(a, b):
         ac = AnalysisContainer(WDMSignal(b, dom), sens)
@@ -154,17 +163,20 @@ def main():
     print(f"[fitwire] truth: mismatch(direct, production)={mm_truth:.3e} amp ratio={amp_truth:.6f} "
           f"ok={bool(ok[0])} stats={direct.last_stats}", flush=True)
     for k in range(rows.shape[0]):
-        print(f"[fitwire] row {k} walker {idx[k]}: lnL direct={fast[k]:.6f} production={slow[k]:.6f} "
-              f"dlogL={fast[k] - slow[k]:+.4e}", flush=True)
+        print(f"[fitwire] row {k} walker {idx[k]}: lnL direct={fast[k]:.6f} container({args.fill})="
+              f"{slow[k]:.6f} dlogL={fast[k] - slow[k]:+.4e}; production check={check[k]:.6f} "
+              f"dlogL={fast[k] - check[k]:+.4e}", flush=True)
     summary = dict(
         src=args.src, nf=nf, nt=nt, dt=args.dt, days=args.days, eps=args.eps, response=args.response,
         backend=args.backend, mm_truth=mm_truth, amp_truth=amp_truth,
-        dlogL=[float(x) for x in fast - slow], max_abs_dlogL=float(np.abs(fast - slow).max()),
+        fill=args.fill, dlogL=[float(x) for x in fast - slow], max_abs_dlogL=float(np.abs(fast - slow).max()),
+        max_abs_dlogL_vs_production=float(np.abs(fast - check).max()),
         direct_s_per_row=fast_s / rows.shape[0], production_s_per_row=slow_s / rows.shape[0],
         fallbacks=int(move.n_batch_fallbacks), build_s=build_s,
     )
-    print(f"[fitwire] max|dlogL|={summary['max_abs_dlogL']:.4e} direct {summary['direct_s_per_row']:.3f} s/row "
-          f"vs production {summary['production_s_per_row']:.3f} s/row, fallbacks={summary['fallbacks']}",
+    print(f"[fitwire] fill={args.fill}: max|dlogL| vs the container path {summary['max_abs_dlogL']:.4e}, vs "
+          f"production {summary['max_abs_dlogL_vs_production']:.4e}; direct {summary['direct_s_per_row']:.3f} "
+          f"s/row vs container {summary['production_s_per_row']:.3f} s/row, fallbacks={summary['fallbacks']}",
           flush=True)
     print(json.dumps(summary), flush=True)
     if args.out:

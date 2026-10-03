@@ -194,6 +194,34 @@ class RuntimeSelectionTest(unittest.TestCase):
         self.assertIsInstance(built["wave_gen"], sr.DeviceLocalWaveGen)
         self.assertIs(built["wave_gen"]._getter, sr.get_emri_wave_wrap)
 
+    def _engine_gen_calls(self, mode):
+        from types import SimpleNamespace
+
+        from lisatools.globalfit.stock.erebor import source_runtime as sr
+
+        calls = []
+
+        def getter(name):
+            def get(general_info, cfg):
+                return lambda *p, **kw: calls.append((name, p, kw)) or name
+            return get
+
+        gi = SimpleNamespace(force_backend="cpu", gpus=None, orbits=SimpleNamespace(xp=np))
+        with mock.patch.object(sr, "get_emri_direct_gen", getter("direct")), \
+                mock.patch.object(sr, "get_emri_wave_wrap", getter("production")):
+            gen = sr.SourceSignalGen("emri", None, gi, dict(emri_likelihood=mode))
+            out = gen(1.0, 2.0, apply_transform=False, mode_selection_threshold=1e-3)
+        return out, calls
+
+    def test_engine_template_generator_follows_the_likelihood(self):
+        """direct: residual rebuilds and the move's expose/fold (the containers' installed
+        generator) use the direct template, the same family the move scores with."""
+        out, calls = self._engine_gen_calls("direct")
+        self.assertEqual(out, "direct")
+        self.assertEqual(calls, [("direct", (1.0, 2.0), {"mode_selection_threshold": 1e-3})])
+        out, calls = self._engine_gen_calls("full")
+        self.assertEqual(out, "production")
+
     def test_full_keeps_the_stock_builder(self):
         from lisatools.globalfit.stock.erebor import source_runtime as sr
 

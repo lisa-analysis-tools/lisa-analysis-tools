@@ -921,13 +921,14 @@ def _emri_preflight_source(path):
 
 
 class SixMonthEMRIDirectTest(unittest.TestCase):
-    """V9-26 (2026-10-02): emri_pe CAN score through the direct-to-WDM template.
+    """V9-26 (2026-10-02) / V9-27 (2026-10-03): emri_pe scores through the direct-to-WDM
+    template BY DEFAULT.
 
-    ``EMRI_LIKELIHOOD=direct`` makes ``build_emri_move_runtime`` build
-    ``EMRIDirectLikeMove`` on every compute rank. The launcher default stays
-    ``full`` until the dense kernel's GPU timing beats production; the knobs,
-    the CPU reservation for the trajectory pool and the preflight are wired so
-    the switch is one launch-line variable."""
+    ``EMRI_LIKELIHOOD=direct`` (the launcher default since the H100 speed tests: 25 ms
+    single, 15 ms/row batched vs production 88 at 6 months) makes
+    ``build_emri_move_runtime`` build ``EMRIDirectLikeMove`` on every compute rank and the
+    engine's EMRI template generator the direct template too; ``EMRI_LIKELIHOOD=full`` on
+    the launch line restores the per-row production path for both."""
 
     _KNOBS = ("EMRI_LIKELIHOOD", "EMRI_BATCH_MAX_SIZE", "EMRI_DIRECT_TABLE",
               "EMRI_DIRECT_RESPONSE", "EMRI_TRAJ_WORKERS", "EMRI_DIRECT_LOOKUP")
@@ -936,7 +937,7 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
         self.v9 = _exports(SIX_MO_V9)
 
     def test_defaults(self):
-        self.assertEqual(self.v9["EMRI_LIKELIHOOD"], "full")
+        self.assertEqual(self.v9["EMRI_LIKELIHOOD"], "direct")
         self.assertEqual(self.v9["EMRI_BATCH_MAX_SIZE"], "8")
         self.assertEqual(self.v9["EMRI_DIRECT_RESPONSE"], "dense")
         self.assertEqual(self.v9["EMRI_TRAJ_WORKERS"], "4")
@@ -983,7 +984,8 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
         # the extra cores feed ONLY the trajectory pool: ranks stay single-threaded
         # (MPI-only policy), and the pool's spawned workers inherit OMP_NUM_THREADS=1
         self.assertEqual(self.v9["OMP_NUM_THREADS"], "1")
-        self.assertIn("--cpus-per-task=2", self._dispatch())
+        self.assertIn("--cpus-per-task=6", self._dispatch())                  # direct: the default
+        self.assertIn("--cpus-per-task=2", self._dispatch(EMRI_LIKELIHOOD="full"))
         self.assertIn("--cpus-per-task=6", self._dispatch(EMRI_LIKELIHOOD="direct"))
         self.assertIn("--cpus-per-task=9",
                       self._dispatch(EMRI_LIKELIHOOD="direct", EMRI_TRAJ_WORKERS="7"))
@@ -1045,6 +1047,9 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
     def test_the_shipped_block_passes_its_own_preflight(self):
         rc, out = self._run_preflight()
         self.assertEqual(rc, 0, out)
+        self.assertIn("emri_pe scoring=direct", out)
+        rc, out = self._run_preflight(EMRI_LIKELIHOOD="full")
+        self.assertEqual(rc, 0, out)
         self.assertIn("emri_pe scoring=full", out)
 
     def test_direct_passes_with_a_matching_table_and_a_passing_gpu_parity(self):
@@ -1067,7 +1072,7 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
         self.assertIn("lookup table /shared/tables/mine.h5: built", out)
 
     def test_full_never_touches_the_table(self):
-        rc, out = self._run_preflight()
+        rc, out = self._run_preflight(EMRI_LIKELIHOOD="full")
         self.assertEqual(rc, 0, out)
         self.assertEqual(self.ensured, [])
 
@@ -1111,8 +1116,8 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
             rc, out = self._run_preflight(EMRI_LIKELIHOOD="direct")
             self.assertEqual(rc, 2, out)
             self.assertIn("SILENTLY IGNORED", out)
-            # the default full path is the old install's own path: no refusal
-            rc, out = self._run_preflight()
+            # full is the old install's own path: no refusal
+            rc, out = self._run_preflight(EMRI_LIKELIHOOD="full")
             self.assertEqual(rc, 0, out)
             self.assertIn("predates EMRI_LIKELIHOOD", out)
 

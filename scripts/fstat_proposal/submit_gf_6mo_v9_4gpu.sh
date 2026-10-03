@@ -538,10 +538,10 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
   # two defaults here MUST match that block's exports -- pinned by
   # tests/test_submit_scripts_layout.py::SixMonthEMRIDirectTest).
   _CPT=2
-  if [ "${EMRI_LIKELIHOOD:-full}" = "direct" ]; then
+  if [ "${EMRI_LIKELIHOOD:-direct}" = "direct" ]; then
     _CPT=$(( 2 + ${EMRI_TRAJ_WORKERS:-4} ))
   fi
-  echo "[SUBMIT] --cpus-per-task=${_CPT} (EMRI_LIKELIHOOD=${EMRI_LIKELIHOOD:-full}, EMRI_TRAJ_WORKERS=${EMRI_TRAJ_WORKERS:-4})"
+  echo "[SUBMIT] --cpus-per-task=${_CPT} (EMRI_LIKELIHOOD=${EMRI_LIKELIHOOD:-direct}, EMRI_TRAJ_WORKERS=${EMRI_TRAJ_WORKERS:-4})"
   exec sbatch --partition="${_NGPU_PART}" --gres="${_GRES}" --nodes="${_NODES}" \
        --ntasks="${NTASKS}" --cpus-per-task="${_CPT}" ${_DIST_FLAG} \
        --export=ALL,NGPUS="${NGPUS}",GPUS_PER_RANK="${GPUS_PER_RANK}",RANKS_PER_GPU="${RANKS_PER_GPU}",GF_LEGACY_RANK_LAYOUT="${GF_LEGACY_RANK_LAYOUT}" \
@@ -4746,23 +4746,26 @@ export EMRI_EPS=1e-3
 # Python reference path) on this run's active band, cropped to its time box and
 # scored against each walker's own residual AND PSD.
 # A harmonic that chirps off the table's fdot axis near a plunge hands off to
-# an even-start 128-layer TD chunk. In-model steps, eigen-table sweeps and the
-# inner-product record all score through it.
-# WHAT DOES NOT MOVE: the residual expose/fold, the engine residual rebuilds and
-# the cross-check stay on the production template (FEW + ResponseWrapper + dense
-# TD->WDM), so the shared residual every other branch sees is unchanged.
-# Accuracy vs production (docs/emri-direct-wdm.md): mismatch ~1e-4 (lookup
-# table) on inspirals, 1.3-2.5e-4 on in-window plunges at 5 s; 20 s grids alias
-# the high harmonics near plunge, this grid is 2.5 s. The cold-rung cross-check
+# even-start 128-layer chunks of the EXACT dense-kernel time series, tapered over
+# the last EMRI_DIRECT_PLUNGE_TAPER_S (300 s) before the stop. In-model steps,
+# eigen-table sweeps and the inner-product record all score through it.
+# TEMPLATE GENERATION follows: with direct, the engine's EMRI template generator
+# (SourceSignalGen: residual rebuilds at load, the move's expose/fold) is the
+# direct template too, so the residual every other branch sees holds exactly what
+# the sampler scores. Only the cold-rung cross-check and the (loud) fallback
+# stay on the production template (FEW + ResponseWrapper + dense TD->WDM).
+# Accuracy vs production (H100 speed tests, CD1L EMRI 1, foreground-weighted
+# noise, docs/emri-direct-wdm.md): mismatch 1.6e-5 at 6 months, 7e-6 at 12;
+# lnL against the mojito stream -1.308 vs production -1.305 (6 months, eps
+# 1e-3); an in-window plunge (720 d) 1.5e-5. The cold-rung cross-check
 # warns past a per-point tolerance EMRI_CHECK_LL_TOL + mm<h|h> + 3 sqrt(2 mm<h|h>)
 # (1 nat, mm = EMRI_CHECK_LL_MM = 3e-4: the template gap grows with SNR); every
 # 10th visit by default -- EMRI_CHECK_LL_EVERY=1 on the launch line for the first
 # segment.
-# DEFAULT: full (the per-row production path) until the dense kernel's GPU
-# timing beats production on this cluster: before the dense kernel the direct
-# template measured 157 ms/row batched vs production 94 ms at eps 1e-3 on an
-# H100 (the TDI response dominated). To run it:
-#     EMRI_LIKELIHOOD=direct NGPUS=4 ./submit_gf_6mo_v9_4gpu.sh
+# DEFAULT: direct (2026-10-03). H100, 6 months, eps 1e-3: 25 ms single and
+# 15 ms/row at 16 rows per call vs production 88 ms (eps 1e-5: 38 / 18 vs 94).
+# The per-row production path for both scoring and template generation:
+#     EMRI_LIKELIHOOD=full NGPUS=4 ./submit_gf_6mo_v9_4gpu.sh
 # LOOKUP TABLE: EMRI_DIRECT_TABLE points to a specific table; unset (default) it is
 # the canonical file in this run's folder,
 #     ${STORE_DIR}/wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5
@@ -4770,9 +4773,11 @@ export EMRI_EPS=1e-3
 # on this node's GPU before mpiexec (lisatools.wdm_lookup_store), so a restart finds
 # it and never rebuilds; a found table is checked against the grid. To reuse a table
 # built elsewhere, copy it into ${STORE_DIR} or point EMRI_DIRECT_TABLE at it.
-# RESUME-SAFE: no stored shape changes; every leaf visit re-scores its
-# prev_logl, and the persisted EMRI eigen tables (built on the production
-# likelihood) are adopted until their next EMRI_EIGEN_REFRESH tick (MH-valid).
+# RESUME-SAFE: no stored shape changes; the load rebuilds the residual with the
+# active template generator, every leaf visit re-scores its prev_logl, and the
+# persisted EMRI eigen tables (built on the production likelihood) are adopted
+# until their next EMRI_EIGEN_REFRESH tick (MH-valid). Switching a store between
+# full and direct moves its EMRI lnL by ~mismatch x SNR^2 (~0.003 nat at SNR 14).
 # CPUs: with direct, EMRI_TRAJ_WORKERS spawn processes per compute rank integrate
 # a chunk's EMRI trajectories in parallel (few.trajectory.pool; only chunks of
 # >= EMRI_TRAJ_WORKERS rows -- the eigen sweeps -- since an in-model step here is
@@ -4784,7 +4789,7 @@ export EMRI_EPS=1e-3
 # trajectory pool: ... started (this process may run on N cores)", and the
 # warnings "direct-to-WDM fast path vs production container path disagree" and
 # "EXPOSE INVARIANT VIOLATED".
-export EMRI_LIKELIHOOD=${EMRI_LIKELIHOOD:-full}
+export EMRI_LIKELIHOOD=${EMRI_LIKELIHOOD:-direct}
 export EMRI_BATCH_MAX_SIZE=${EMRI_BATCH_MAX_SIZE:-8}
 export EMRI_DIRECT_TABLE=${EMRI_DIRECT_TABLE:-}
 export EMRI_DIRECT_RESPONSE=${EMRI_DIRECT_RESPONSE:-dense}
