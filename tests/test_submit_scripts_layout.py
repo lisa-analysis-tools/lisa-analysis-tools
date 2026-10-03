@@ -743,6 +743,9 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # likelihood at B=8, response order 8 pinned. v8 predates the
             # knobs entirely; SixMonthMBHBatchedTest pins the block.
             "MBH_LIKELIHOOD", "MBH_BATCH_MAX_SIZE", "MBH_RESPONSE_ORDER",
+            # V9-28 (2026-10-02, MBH session): the batched window generated at
+            # q*dt; default 1 = what job 695 ran. The MBH suites pin the block.
+            "MBH_WINDOW_DECIMATE",
             # V9-26 (2026-10-02): the EMRI direct-to-WDM scoring path's knobs
             # (default full = the v8 path); SixMonthEMRIDirectTest pins the block.
             "EMRI_LIKELIHOOD", "EMRI_BATCH_MAX_SIZE", "EMRI_DIRECT_TABLE",
@@ -1660,6 +1663,9 @@ class ThreeMonthV9TwinTest(unittest.TestCase):
             # 90-day grid, so the documented MBHB_IDS=5 escape would die at
             # build. See SixMonthMBHBatchedTest.test_the_3mo_twin_does_not_inherit_it.
             "MBH_LIKELIHOOD", "MBH_BATCH_MAX_SIZE", "MBH_RESPONSE_ORDER",
+            # V9-28 (2026-10-02, MBH session): the batched window generated at
+            # q*dt; default 1 = what job 695 ran. The MBH suites pin the block.
+            "MBH_WINDOW_DECIMATE",
             # 3MO-8 (2026-10-02): nor is the 6mo EMRI direct-to-WDM block: no
             # EMRI branch is armed here, and its lookup table is built for the
             # 6-month grid's Nf and dt only.
