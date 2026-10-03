@@ -631,6 +631,11 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # 2026-10-03: the stop decides on the released FOREGROUND (median
             # walker's drop over a band), not the raw lnL gain.
             "GALFOR_RATCHET_STOP_RULE", "GALFOR_RATCHET_MIN_DROP", "GALFOR_RATCHET_DROP_BAND",
+            # 2026-10-03: gb_search_3 ends at the ratchet stop; replica_pe runs
+            # full_pe's composition (sources on the gb_search cadence) until the
+            # large-scale metrics converge; then full_pe = sample taking.
+            "GALFOR_RATCHET_END_STAGE_ON_STOP", "STAGE_REPLICA_PE", "REPLICA_PE_WINDOW",
+            "REPLICA_PE_LEAF_TOL", "REPLICA_PE_LNL_TOL",
             "GALFOR_RATCHET_CLOCK_RESET", "GALFOR_RATCHET_CLOCK_START",
             "GALFOR_RATCHET_SHUTOFF_MIN_FREQ",
             # full_pe declarations (user rulings 2026-10-02): in-model repeats

@@ -1063,18 +1063,37 @@ class GFHDFBackend(eryn_HDFBackend):
         return recipe
 
     def add_recipe(self, recipe):
-        """Persist a :class:`Recipe` into this backend's HDF5 metadata."""
+        """Persist a :class:`Recipe` into this backend's HDF5 metadata.
+
+        On a store that already carries a recipe the stored statuses are
+        read back into ``recipe``. The stored steps must all be present in
+        the new recipe, in their stored relative order; a recipe that drops
+        or reorders a stored step cannot resume the store and is refused.
+        NEW steps are accepted when every one of them comes AFTER the stage
+        the store is in (its first incomplete stored step) -- user design
+        2026-10-03: "gb search 4 will be called replica pe", inserted between
+        gb_search_3 and full_pe of a store already in gb_search_3. Each new
+        step gets its group (status False), the order numbers are rewritten
+        to the new positions, and any incomplete step after the active one
+        loses a stale ``start_iteration`` stamp (a rewind had left full_pe
+        reading 55 on the 6mo store) so the handover stamps it afresh.
+        """
         if self.has_recipe:
-            with self.open() as f:
+            with self.open("a") as f:
                 recipe_group = f[self.name]["recipe"]
-                for i, recipe_step in enumerate(recipe.recipe):
-                    key = recipe_step["name"]
-                    assert key in recipe_group
+                new_names = [step["name"] for step in recipe.recipe]
+                # the stored step names: the group's keys when it has them (an
+                # h5py group does; the damaged-store test doubles do not, and
+                # for those the recipe's own names are the only list)
+                _keys = getattr(recipe_group, "keys", None)
+                stored_names = (list(_keys()) if callable(_keys)
+                                else [n for n in new_names if n in recipe_group])
+                stored = {}
+                for key in stored_names:
                     # ⚠ THE LINK EXISTING DOES NOT MEAN THE OBJECT READS.
-                    # The assert above tests the LINK; opening the group
-                    # reads its object header, and a header torn by a kill
-                    # mid-attr-write fails here with HDF5's own wording
-                    # wrapped in a KeyError:
+                    # Opening the group reads its object header, and a
+                    # header torn by a kill mid-attr-write fails here with
+                    # HDF5's own wording wrapped in a KeyError:
                     #
                     #   KeyError: 'Unable to synchronously open object
                     #              (message not aligned)'
@@ -1091,9 +1110,8 @@ class GFHDFBackend(eryn_HDFBackend):
                     # there is exactly how it tears. Say so, and name the
                     # recovery point, rather than raising the raw KeyError.
                     try:
-                        recipe_step_group = recipe_group[key]
-                        _status = recipe_step_group.attrs["status"]
-                        order_i_in_file = recipe_step_group.attrs["order num"]
+                        grp = recipe_group[key]
+                        stored[key] = (bool(grp.attrs["status"]), int(grp.attrs["order num"]))
                     except (KeyError, OSError) as e:
                         _bak = self.filename[:-3] + "_running_backup_copy.h5"
                         raise RuntimeError(
@@ -1112,8 +1130,62 @@ class GFHDFBackend(eryn_HDFBackend):
                             f"PRIMARY ASIDE BEFORE EITHER -- never repair the "
                             f"only copy."
                         ) from e
-                    recipe.recipe[i]["status"] = _status
-                    assert order_i_in_file == i + 1
+                missing = [k for k in stored if k not in new_names]
+                if missing:
+                    raise ValueError(
+                        f"the store {self.filename} carries recipe step(s) {missing} that this "
+                        f"run's recipe {new_names} does not: a recipe that DROPS or renames a "
+                        "stored step cannot resume the store. Restore the step name or start "
+                        "a fresh backend.")
+                stored_order = [k for k, _ in sorted(stored.items(), key=lambda kv: kv[1][1])]
+                in_new = [n for n in new_names if n in stored]
+                if stored_order != in_new:
+                    raise ValueError(
+                        f"the stored recipe steps are ordered {stored_order} but this run's "
+                        f"recipe orders them {in_new}: reordering stored steps cannot resume "
+                        "the store.")
+                added = [n for n in new_names if n not in stored]
+                if added:
+                    # the stage the store is IN: its first incomplete stored step
+                    # (every stored step complete -> the recipe had finished; new
+                    # steps then extend it from the end)
+                    _active = next((i for i, n in enumerate(new_names)
+                                    if n in stored and not stored[n][0]), None)
+                    bound = (_active if _active is not None
+                             else max(new_names.index(n) for n in stored))
+                    bad = [n for n in added if new_names.index(n) <= bound]
+                    if bad:
+                        raise ValueError(
+                            f"recipe step(s) {bad} would be inserted at or before the stage "
+                            f"the store is in ({new_names[bound]!r}); stages can only be ADDED "
+                            "after the active stage. Reorder the recipe or start a fresh "
+                            "backend.")
+                    for n in added:
+                        grp = recipe_group.create_group(n)
+                        grp.attrs["status"] = False
+                    cleared = []
+                    for n in new_names[bound + 1:]:
+                        grp = recipe_group[n]
+                        if (not bool(grp.attrs.get("status", False))
+                                and "start_iteration" in grp.attrs):
+                            del grp.attrs["start_iteration"]
+                            cleared.append(n)
+                    logger.info(
+                        "[RECIPE] the store's recipe is EXTENDED: step(s) %s added after the "
+                        "active stage %r (status False; the run resumes in %r as before); "
+                        "order renumbered to %s%s.", added, new_names[bound], new_names[bound],
+                        new_names, (f"; stale start_iteration cleared on {cleared}"
+                                    if cleared else ""))
+                for i, recipe_step in enumerate(recipe.recipe):
+                    grp = recipe_group[recipe_step["name"]]
+                    recipe_step["status"] = bool(grp.attrs["status"])
+                    _order = grp.attrs.get("order num")      # a just-added group has none yet
+                    if _order is None or int(_order) != i + 1:
+                        if not added:
+                            raise ValueError(
+                                f"recipe step {recipe_step['name']!r} is stored at order "
+                                f"{_order} but sits at position {i + 1} in this run's recipe.")
+                        grp.attrs["order num"] = i + 1
 
         else:
             _tmp = recipe.to_file()

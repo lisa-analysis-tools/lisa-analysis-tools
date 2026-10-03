@@ -46,7 +46,9 @@ class _TornGroup:
 
 
 class _HealthyGroup(dict):
-    pass
+    def create_group(self, name):
+        self[name] = SimpleNamespace(attrs={})
+        return self[name]
 
 
 def _backend(group):
@@ -96,16 +98,32 @@ class AddRecipeOnADamagedStoreTest(unittest.TestCase):
             be.add_recipe(_recipe("noise_search"))
         self.assertIn("DAMAGE", str(cm.exception))
 
-    def test_a_GENUINELY_missing_step_still_trips_the_assert(self):
+    def test_a_GENUINELY_missing_step_is_not_mistaken_for_damage(self):
         """Do not swallow the real 'this store predates that stage' case:
-        a missing LINK is a different problem with a different fix."""
+        a missing LINK is a different problem with a different fix. Since
+        2026-10-03 a step missing from the store is ADDED when it comes
+        after the stage the store is in (tests/test_replica_pe_stage.py),
+        and REFUSED with a plain ValueError -- never a DAMAGE report -- when
+        it would land at or before it."""
         steps = _HealthyGroup({
             "noise_search": SimpleNamespace(
                 attrs={"status": True, "order num": 1}),
+            "gb_search_1": SimpleNamespace(
+                attrs={"status": False, "order num": 2}),
         })                                    # no gb_search_9 LINK at all
         be = _backend(steps)
-        with self.assertRaises(AssertionError):
-            be.add_recipe(_recipe("noise_search", "gb_search_9"))
+        with self.assertRaises(ValueError) as cm:
+            be.add_recipe(_recipe("noise_search", "gb_search_9", "gb_search_1"))
+        self.assertNotIn("DAMAGE", str(cm.exception))
+        self.assertIn("gb_search_9", str(cm.exception))
+        self.assertNotIn("gb_search_9", steps)                       # nothing was created
+        # after the active stage it is added, status False, orders renumbered
+        rec = _recipe("noise_search", "gb_search_1", "gb_search_9")
+        be.add_recipe(rec)
+        self.assertIn("gb_search_9", steps)
+        self.assertFalse(steps["gb_search_9"].attrs["status"])
+        self.assertEqual(steps["gb_search_9"].attrs["order num"], 3)
+        self.assertEqual([s["status"] for s in rec.recipe], [True, False, False])
 
     def test_a_healthy_store_is_untouched(self):
         steps = _HealthyGroup({

@@ -1037,6 +1037,126 @@ def apply_inmodel_repeats(moves, repeats, tag: str = "pe") -> dict:
         return False
 
 
+class ReplicaPERecipeStep(PERecipeStep):
+    """full_pe's twin that ENDS when the large-scale metrics converge.
+
+    User design 2026-10-03: after the ratchet stops (a criterion "focused
+    entirely on the foreground convergence"), run "an exact replica of pe
+    mode (and I mean exact) until the mean leaf count converges over say 10
+    replica pe iterations. Then you switch to full PE and mark that as the
+    start of sample taking. ... The only difference between replica pe and
+    full pe is that the other sources (emris, mbhs, sobhbs) are still only run
+    every five iterations to give priority to the gbs."
+
+    This class owns only the STOP. Everything else -- the moves, the PE
+    declarations (peak floor, in-model repeats, RJ flip fraction), the
+    combine -- is :class:`PERecipeStep`, inherited unchanged; the source
+    cadence lives in the stage's move list (``Move(every=N)``), not here.
+
+    THE RULE. Over the last ``window`` stored rows of this stage six series
+    are read from the store: the cold leaf count's min / mean / max over
+    walkers and the cold log-likelihood's min / mean / max over walkers. Each
+    gets a least-squares line; the stage ends when every line's total change
+    over the window (slope x (window - 1)) is within ``leaf_tol`` leaves (the
+    leaf series) or ``lnl_tol`` nats (the lnL series). A TREND, not a range:
+    the per-iteration scatter (band swaps move 20-50 leaves between rungs,
+    the in-model moves +-150 nats) is what a window average removes; a drift
+    is what the typical-set relaxation shows. At least ``min_iters`` rows
+    must be stored in the stage first (default: the window). One log line per
+    iteration carries all six values and trends, so the log reads the same
+    numbers the stop reads.
+    """
+
+    def __init__(self, *args, window: int = 10, leaf_tol: float = 10.0,
+                 lnl_tol: float = 100.0, min_iters=None, plateau_branch: str = "gb",
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+        self.window = int(window)
+        if self.window < 3:
+            raise ValueError(f"ReplicaPERecipeStep: window={window} must be >= 3 rows.")
+        self.leaf_tol = float(leaf_tol)
+        self.lnl_tol = float(lnl_tol)
+        if not (self.leaf_tol > 0.0 and self.lnl_tol > 0.0):
+            raise ValueError(
+                f"ReplicaPERecipeStep: leaf_tol={leaf_tol} and lnl_tol={lnl_tol} must be > 0.")
+        self.min_iters = max(self.window, int(min_iters or 0))
+        self.plateau_branch = str(plateau_branch)
+        self._stage_start_iter = 0
+
+    def setup_run(self, iteration, last_sample, sampler):
+        super().setup_run(iteration, last_sample, sampler)
+        self._stage_start_iter = int(iteration)
+
+    @staticmethod
+    def _cold_rows(arr):
+        """``(rows, nwalkers)`` from whatever leading axes the store adds."""
+        a = np.asarray(arr, dtype=float)
+        while a.ndim > 2:
+            a = a[:, 0]
+        return a
+
+    @staticmethod
+    def trend(y) -> float:
+        """Least-squares total change over the series: slope x (n - 1)."""
+        y = np.asarray(y, dtype=float)
+        n = int(y.size)
+        if n < 2:
+            return 0.0
+        slope = np.polyfit(np.arange(n, dtype=float), y, 1)[0]
+        return float(slope * (n - 1))
+
+    def metrics(self, sampler):
+        """``(leaves, lnl)``, each ``(rows_in_stage, nwalkers)`` on the cold rung."""
+        be = sampler.backend
+        start = int(self._stage_start_iter)
+        nl = self._cold_rows(
+            be.get_nleaves(branch_names=[self.plateau_branch], temp_index=0)[
+                self.plateau_branch])[start:]
+        ll = self._cold_rows(be.get_log_like())[start:]
+        n = min(nl.shape[0], ll.shape[0])
+        return nl[:n], ll[:n]
+
+    def stopping_function(self, i, sample, sampler) -> bool:
+        tag = self.stage_name or "replica_pe"
+        try:
+            nl, ll = self.metrics(sampler)
+        except Exception as exc:  # noqa: BLE001 -- a stop rule must never kill the run
+            logger.warning(
+                "[REPLICA_PE %s] metrics unreadable from the store (%r); holding the "
+                "stage open.", tag, exc)
+            return False
+        n = int(nl.shape[0])
+        start = int(self._stage_start_iter)
+        if n < self.min_iters:
+            logger.info("[REPLICA_PE %s] %d row(s) in-stage; the convergence check needs %d.",
+                        tag, n, self.min_iters)
+            return False
+        W = self.window
+        nlw, llw = nl[-W:], ll[-W:]
+        series = [("leaves min", nlw.min(axis=1), self.leaf_tol),
+                  ("leaves mean", nlw.mean(axis=1), self.leaf_tol),
+                  ("leaves max", nlw.max(axis=1), self.leaf_tol),
+                  ("lnL min", llw.min(axis=1), self.lnl_tol),
+                  ("lnL mean", llw.mean(axis=1), self.lnl_tol),
+                  ("lnL max", llw.max(axis=1), self.lnl_tol)]
+        trends = [self.trend(y) for _, y, _ in series]
+        ok = [abs(t) <= tol for t, (_, _, tol) in zip(trends, series)]
+        logger.info(
+            "[REPLICA_PE %s] stored row %d (%d in-stage): leaves min/mean/max %.0f / %.1f / "
+            "%.0f, lnL min/mean/max %.1f / %.1f / %.1f | trend over the last %d rows: leaves "
+            "%+.1f / %+.1f / %+.1f (tol %g), lnL %+.1f / %+.1f / %+.1f (tol %g) | converged "
+            "%d of 6.", tag, start + n - 1, n, nlw[-1].min(), nlw[-1].mean(), nlw[-1].max(),
+            llw[-1].min(), llw[-1].mean(), llw[-1].max(), W, trends[0], trends[1], trends[2],
+            self.leaf_tol, trends[3], trends[4], trends[5], self.lnl_tol, sum(ok))
+        if all(ok):
+            logger.info(
+                "[REPLICA_PE %s] CONVERGED: every large-scale metric is flat over the last %d "
+                "rows -- the stage ends; the next stage begins at stored row %d, THE START OF "
+                "SAMPLE TAKING.", tag, W, start + n)
+            return True
+        return False
+
+
 def _cap_ramp_pending_total(moves) -> int:
     """Sum of ``_cap_ramp_pending`` over a move tree (GFCombineMove nests).
 
@@ -1651,7 +1771,7 @@ class SearchStageProfileStep(RJRecipeStep):
                  stage_name: str = "", ratchet=None, ratchet_delta=None,
                  ratchet_min_gain: float = 0.0, ratchet_min_nudges: int = 0,
                  ratchet_stop_rule: str = "gain", ratchet_min_drop: float = 0.0,
-                 ratchet_drop_band=None,
+                 ratchet_drop_band=None, ratchet_end_stage_on_stop: bool = False,
                  legs: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.profile = dict(profile or {})
@@ -1718,6 +1838,12 @@ class SearchStageProfileStep(RJRecipeStep):
                 f"SearchStageProfileStep({stage_name!r}): ratchet_drop_band must be "
                 f"(f_lo, f_hi) Hz with 0 < f_lo < f_hi, got {ratchet_drop_band!r}.")
         self.ratchet_drop_band = band
+        # ``ratchet_end_stage_on_stop`` (user design 2026-10-03: "make gb search
+        # 3 only the ratcheting and foreground convergence"): when the stop
+        # rule ends the ratchet, the STAGE ends with it instead of waiting for
+        # the per-(walker, band) valve; the replica-PE stage follows.
+        self.ratchet_end_stage_on_stop = bool(ratchet_end_stage_on_stop)
+        self._ratchet_end_stage = False
         self._ratchet_stopped = False
         self._ratchet_last_release_max = None
         self._ratchet_release_maxes = []
@@ -1942,11 +2068,16 @@ class SearchStageProfileStep(RJRecipeStep):
                 _done = None
             if _done is not None and int(_done) != 0:
                 self._ratchet_stopped = True
+                if getattr(self, "ratchet_end_stage_on_stop", False):
+                    self._ratchet_end_stage = True
                 logger.info(
                     "[GALFOR_RATCHET %s] the store says this stage's ratchet already "
                     "FINISHED (galfor_ratchet_done stamp): no nudges on this "
-                    "relaunch; the gate stays released and the stage ends on its "
-                    "ordinary rule.", self.stage_name)
+                    "relaunch; the gate stays released and the stage ends %s.",
+                    self.stage_name,
+                    "at its first check (GALFOR_RATCHET_END_STAGE_ON_STOP)"
+                    if getattr(self, "ratchet_end_stage_on_stop", False)
+                    else "on its ordinary rule")
         _sample = getattr(self, "_ratchet_last_sample", None)
         # a resume mid-cycle (legs) after the gate already ran keeps the
         # reference captured before that nudge; only a cycle head recaptures
@@ -2110,6 +2241,8 @@ class SearchStageProfileStep(RJRecipeStep):
                 _n_nudges, _min_nudges)
             return
         self._ratchet_stopped = True
+        if getattr(self, "ratchet_end_stage_on_stop", False):
+            self._ratchet_end_stage = True       # read by stopping_function this same call
         gate = self._ratchet_gate(moves) if moves is not None else None
         if gate is not None and hasattr(gate, "finish_ratchet"):
             gate.finish_ratchet()
@@ -2562,6 +2695,16 @@ class SearchStageProfileStep(RJRecipeStep):
         # user asked to read ("the full iteration following that").
         if _advanced:
             self._ratchet_check_gain(_k_done, sample, moves)
+        if getattr(self, "_ratchet_end_stage", False) and not stop:
+            # user design 2026-10-03: this stage IS the ratchet; the
+            # foreground has converged, so the stage ends here and the
+            # replica-PE stage takes over (the valve is not consulted)
+            logger.info(
+                "[GALFOR_RATCHET %s] STAGE COMPLETE at the ratchet's stop "
+                "(GALFOR_RATCHET_END_STAGE_ON_STOP=1): the foreground rule ended the "
+                "ratcheting after iteration %d; the per-band valve is not consulted.",
+                self.stage_name or "gb_search", _k_done)
+            stop = True
         if stop and self._ratchet_schedule_pending(_k_next):
             logger.info(
                 "[GALFOR_RATCHET %s] stage would complete after iteration "
@@ -2689,6 +2832,9 @@ _STEP_CLASSES = {
     # v9: an ``rj`` step that additionally owns a per-stage GB search profile
     # and composes the per-(walker, band) shutoff valve into its stopping rule.
     "gb_search": SearchStageProfileStep,
+    # 2026-10-03: a ``pe`` step that ENDS when the large-scale metrics converge
+    # (the replica-PE stage between the GB search and full_pe).
+    "replica_pe": ReplicaPERecipeStep,
 }
 
 
@@ -2726,7 +2872,7 @@ class Stage:
             carry its own ``Move.debug`` (same value semantics).
     """
 
-    _KINDS = ("search", "pe", "rj", "gb_search")
+    _KINDS = ("search", "pe", "rj", "gb_search", "replica_pe")
 
     #: Kinds that are a SPECIALIZATION of another kind, mapped to the kind
     #: they BEHAVE as. ``Stage.kind`` picks the step class and is what the
@@ -2744,7 +2890,7 @@ class Stage:
     #: find them all. (v9 runs COARSE_GPU_MODE=off, so that particular
     #: resolution was inert -- which is exactly why it would not have been
     #: noticed.)
-    _RUNTIME_KIND = {"gb_search": "rj"}
+    _RUNTIME_KIND = {"gb_search": "rj", "replica_pe": "pe"}
 
     def __init__(
         self,
