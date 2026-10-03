@@ -675,11 +675,11 @@ def main():
     row["truth_waveform_basis"] = truth.tolist()
     assert abs(truth[10] - p["t_merge_rel"]) < 1e-6, (truth[10], p["t_merge_rel"])
 
-    # the run's rule: with MBH_WINDOW_DECIMATE = q both prod90 and batched snap onto q*DT
-    q = int(k["window_decimate"])
-    t0s, snap = snap_waveform_t0_to_lattice(REF, window_t0, DT * q)
+    # the run's rule: with MBH_WINDOW_DECIMATE both prod90 and batched snap onto decimation*DT
+    decimation = int(k["window_decimate"])
+    t0s, snap = snap_waveform_t0_to_lattice(REF, window_t0, DT * decimation)
     geom = batched_geometry(wdm, t_merge_abs, k)
-    row.update(snap=snap, window_decimate=q, ltt_slice=[ltt_lo, ltt_hi], batched_geometry=geom,
+    row.update(snap=snap, window_decimate=decimation, ltt_slice=[ltt_lo, ltt_hi], batched_geometry=geom,
                load_wall_s=time.perf_counter() - t_start, load_peak_rss_gb=peak_rss_gb())
     print(f"[campaign] snap {snap:+.6f} s; batched geometry {json.dumps(geom, default=jsonable)}; "
           f"load {row['load_wall_s']:.0f} s, rss {row['load_peak_rss_gb']:.2f} GB", flush=True)
@@ -714,15 +714,15 @@ def main():
                                          t_low_fit=True, coarse_grain=False, atol=k["phenom_tol"],
                                          rtol=k["phenom_tol"]),
                     Tobs=k["window_before"], start_freq=k["start_freq"], use_reference_time=True,
-                    waveform_t0=t0s, data_td_settings=(tds if q == 1 else TDSettings(
-                        int(tds.N) // q, DT * q, t0=float(tds.t0), force_backend=backend)),
+                    waveform_t0=t0s, data_td_settings=(tds if decimation == 1 else TDSettings(
+                        int(tds.N) // decimation, DT * decimation, t0=float(tds.t0), force_backend=backend)),
                     tdi_generation="2nd generation",
-                    tdi_channels="XYZ", sampling_frequency=1.0 / (DT * q), orbits=orb, order=k["order"],
+                    tdi_channels="XYZ", sampling_frequency=1.0 / (DT * decimation), orbits=orb, order=k["order"],
                     tukey_alpha=0.0, stft_dt=None, freq_min=args.min_freq, freq_max=args.max_freq,
                     fft_batch_size=1, buffer_time=k["buffer_time"], output_domain_settings=wdm,
                     force_backend=backend)
                 adapter = MBHWindowedWDMSignalGen(wgen, wdm, nchannels=3, tukey_alpha=0.0,
-                                                  **({"decimate": q} if q != 1 else {}))
+                                                  **({"decimate": decimation} if decimation != 1 else {}))
                 adapter.set_window(geom["n_start"], geom["Nt_keep"], geom["n_pad_lo"], geom["n_pad_hi"])
                 prow = truth.copy()
                 prow[10] -= snap                  # the move's t_plunge_snap

@@ -850,7 +850,7 @@ class SixMonthMBHBatchedTest(unittest.TestCase):
 
     def test_the_preflight_resolves_and_bounds_the_window_decimation(self):
         """MBH_WINDOW_DECIMATE on the launch line reaches the settings (printed);
-        a q that does not divide Nf=1440 is refused before the allocation."""
+        a factor that does not divide Nf=1440 is refused before the allocation."""
         rc, out = self._run_preflight(MBH_WINDOW_DECIMATE="2")
         self.assertEqual(rc, 0, out)
         self.assertIn("decimate=2", out)

@@ -132,7 +132,7 @@ class ResolveBatchedCfgTest(_NoDurationEnv, unittest.TestCase):
 
     def test_window_decimate_reaches_the_batched_cfg_only(self):
         """MBH_WINDOW_DECIMATE (``window_decimate``) rides the batched cfg; the full
-        path has nothing to decimate (1); q < 1 is refused."""
+        path has nothing to decimate (1); a factor < 1 is refused."""
         cfg = self._resolve(self._mbh(likelihood="batched", window_decimate=2))
         self.assertEqual(cfg["mbh_window_decimate"], 2)
         cfg = self._resolve(self._mbh(likelihood="full", window_decimate=2))
@@ -639,7 +639,7 @@ class WindowedGetterTest(unittest.TestCase):
     def test_decimated_window_runs_the_generator_on_the_coarse_lattice(self):
         """MBH_WINDOW_DECIMATE=2: the windowed generator gets TD settings at 2 dt
         (N / 2 samples from the data start), the response's sampling frequency
-        1 / (2 dt), the epoch snapped onto the 5-s lattice, and the adapter q."""
+        1 / (2 dt), the epoch snapped onto the 5-s lattice, and the adapter's factor."""
         from types import SimpleNamespace
 
         from lisatools.domains import WDMSettings
@@ -654,8 +654,8 @@ class WindowedGetterTest(unittest.TestCase):
                 mock.patch("lisatools.sources.batching.MBHWindowedWDMSignalGen") as A:
             A.side_effect = lambda gen, *a, **k: mock.MagicMock(spec=["wave_gen"], wave_gen=gen)
             adapter = sr.get_mbh_windowed_gen(gi, cfg)
-            q1 = sr.get_mbh_windowed_gen(gi, self._cfg())
-        self.assertIsNot(q1, adapter)        # q keys the cache
+            undecimated = sr.get_mbh_windowed_gen(gi, self._cfg())
+        self.assertIsNot(undecimated, adapter)        # the decimation keys the cache
         kw = W.call_args_list[0].kwargs
         td = kw["data_td_settings"]
         self.assertEqual((td.N, td.dt, td.t0), (1440 * 4320 // 2, 5.0, 97729089.0))
