@@ -274,9 +274,11 @@ class WindowedSignalGenGPUParityTest(unittest.TestCase):
     that floor and sits six orders below the pad-truncation error the CPU tests pin
     (1.2e-5), while the defects it exists to catch -- an odd-parity segment start
     (measured 1.36), a mis-sliced data window, a mis-placed segment -- are O(1e-2..1).
+    Cluster GPU, 2026-10-02: measured 1.7e-16 (interior, odd start) and 3.5e-16 (tukey),
+    so the bound is 1e-13 (~300x margin).
     """
 
-    TOL = 1e-11
+    TOL = 1e-13
     CASES = (  # name, chirp layers, tukey alpha, n_start, Nt_keep, n_pad
         ("interior", (45, 75), 0.0, 40, 40, 8),
         ("odd start layer", (45, 75), 0.0, 41, 34, 8),
@@ -799,9 +801,11 @@ class WindowedGridAlignedPhentaxGPUParityTest(unittest.TestCase):
     wavelet's support spans several layers' samples). Paired negative control in the
     same call: row 1 is row 0 with phi_ref + 1e-6 rad, a ~1e-6-of-peak template change;
     GPU row 1 vs CPU row 0 must exceed 1e-7, i.e. the bounds catch a defect two to
-    three orders smaller than that control."""
+    three orders smaller than that control. Cluster GPU, 2026-10-02: TDI channels 1.1e-12,
+    kept WDM layers 1.6e-13, control 2.4e-6 (WDM) / 2.9e-6 (TDI), so both bounds are 1e-10
+    (~100x margin) and the control clears them by four orders."""
 
-    TDI_TOL, WDM_TOL, CONTROL_MIN = 1e-9, 1e-8, 1e-7
+    TDI_TOL, WDM_TOL, CONTROL_MIN = 1e-10, 1e-10, 1e-7
 
     @classmethod
     def setUpClass(cls):

@@ -1098,9 +1098,11 @@ class MBHBatchedGPUParityTest(unittest.TestCase):
     between rows), <d|h> / <h|h> and the residual arrays to 1e-9 / 1e-11 of their
     maxima. A defect this targets -- a template scored against the wrong walker's PSD
     or residual slice, a mis-labelled box, a lost row -- moves logL by O(1) or more
-    (MBHBatchedParityTest pins the walker-0 vs walker-1 PSD difference)."""
+    (MBHBatchedParityTest pins the walker-0 vs walker-1 PSD difference). Cluster GPU,
+    2026-10-02: max |logL gpu - cpu| = 2.3e-10 on |logL| ~ 2e5 (1e-15 relative), so the logL
+    bound is 1e-12 relative (~2e-7 nats here, ~900x margin)."""
 
-    LL_RTOL, IP_RTOL, ARR_RTOL = 1e-9, 1e-9, 1e-11
+    LL_RTOL, IP_RTOL, ARR_RTOL = 1e-12, 1e-9, 1e-11
 
     def _run(self, backend):
         acs, adapter, fast, wdm = _build(backend=backend)
