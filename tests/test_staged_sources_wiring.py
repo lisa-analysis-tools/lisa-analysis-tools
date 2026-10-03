@@ -133,7 +133,7 @@ class StagedSourcesWiringTest(unittest.TestCase):
         self.assertEqual(
             [st.name for st in fit.recipe.stages],
             ["noise_search", "noise_vgb_search", *V9_ALL_SEARCH_STAGES,
-             "full_pe"])
+             "replica_pe", "full_pe"])
         for b in ("mbh", "emri", "sobbh"):
             self.assertNotIn(b, fit.branches)
         for names in self._stages(fit).values():
@@ -162,7 +162,7 @@ class StagedSourcesWiringTest(unittest.TestCase):
         self.assertEqual(
             [st.name for st in fit.recipe.stages],
             ["source_search", "noise_search", "noise_vgb_search",
-             *V9_ALL_SEARCH_STAGES, "full_pe"])
+             *V9_ALL_SEARCH_STAGES, "replica_pe", "full_pe"])
         st0 = fit.recipe.stages[0]
         self.assertEqual(st0.kind, "search")
         self.assertEqual([m.name for m in st0.moves],
@@ -230,7 +230,7 @@ class StagedSourcesWiringTest(unittest.TestCase):
         stages = self._stages(fit)
         self.assertEqual(list(stages),
                          ["noise_search", "noise_vgb_search",
-                          *V9_ALL_SEARCH_STAGES, "full_pe"])
+                          *V9_ALL_SEARCH_STAGES, "replica_pe", "full_pe"])
         # user ruling 2026-09-18 (superseding 09-15's mbh/emri-only
         # 1-in-10): all three ride the GB search stages at a 1-in-5
         # cadence; all three in full_pe uncadenced.
@@ -412,14 +412,14 @@ class VGBChirpRidgeWiringTest(unittest.TestCase):
     def test_present_in_gb_search_and_full_pe_under_the_chirp_basis(self):
         os.environ["VGB_CHIRP_MASS_BASIS"] = "1"
         stages = self._stages(_build_fit())
-        # exactly where gb_ridge_gibbs rides
-        for stage_name in (*V9_SEARCH_STAGES, "full_pe"):
+        # exactly where gb_ridge_gibbs rides (replica_pe is full_pe's twin, 2026-10-03)
+        for stage_name in (*V9_SEARCH_STAGES, "replica_pe", "full_pe"):
             self.assertIn("vgb_ridge_gibbs", stages[stage_name],
                           f"{stage_name}: {stages[stage_name]}")
             self.assertIn("gb_ridge_gibbs", stages[stage_name])
         # ... and nowhere else (search stages carry the joint criterion only)
         for name, names in stages.items():
-            if name in (*V9_SEARCH_STAGES, "full_pe"):
+            if name in (*V9_SEARCH_STAGES, "replica_pe", "full_pe"):
                 continue
             self.assertNotIn("vgb_ridge_gibbs", names, f"{name}: {names}")
 

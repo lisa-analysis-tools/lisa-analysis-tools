@@ -375,50 +375,65 @@ class WarmStartWiringTest(unittest.TestCase):
         spec.loader.exec_module(mod)
         return mod.build_fit()
 
+    # v9 staging (2026-09-26 seed stage; 2026-10-03 replica_pe): the search
+    # ruling applies to every stage that carries rj_fstat_search, the PE
+    # ruling to every stage that carries rj_fstat_pe.
+    SEARCH_STAGES = ("gb_search_1", "gb_search_2", "gb_search_3")
+    PE_STAGES = ("replica_pe", "full_pe")
+
     def test_stage_order_with_and_without_knob(self):
-        # WITHOUT the knob: no rj_warm_search anywhere.
+        # WITHOUT the knob: no rj_warm_search / rj_warm_pe anywhere.
         fit = self._build_fit()
         stages = {st.name: [m.name for m in st.moves]
                   for st in fit.recipe.stages}
-        self.assertIn("gb_search", stages)
-        baseline = stages["gb_search"]
-        self.assertNotIn("rj_warm_search", baseline)
-        self.assertIn("rj_fstat_search", baseline)
-        baseline_pe = stages["full_pe"]
-        self.assertNotIn("rj_warm_search", baseline_pe)
+        self.assertEqual(
+            list(stages),
+            ["gb_search_seed", *self.SEARCH_STAGES, *self.PE_STAGES])
+        for name, moves in stages.items():
+            self.assertNotIn("rj_warm_search", moves, name)
+            self.assertNotIn("rj_warm_pe", moves, name)
+        for name in self.SEARCH_STAGES:
+            self.assertIn("rj_fstat_search", stages[name], name)
+        for name in self.PE_STAGES:
+            self.assertIn("rj_fstat_pe", stages[name], name)
+        # the seed stage has no F-stat fit (it is the warm seed's own stage)
+        self.assertEqual(stages["gb_search_seed"], [])
 
         # WITH the knob: rj_warm_search IMMEDIATELY BEFORE rj_fstat_search
-        # in gb_search; full_pe untouched (the ruling names search).
+        # in every search stage; the seed stage carries the warm seed alone.
         os.environ["GB_WARM_START_COMPONENTS"] = "/tmp/does_not_matter.npz"
         fit2 = self._build_fit()
         stages2 = {st.name: [m.name for m in st.moves]
                    for st in fit2.recipe.stages}
-        armed = stages2["gb_search"]
-        self.assertIn("rj_warm_search", armed)
-        i_warm = armed.index("rj_warm_search")
-        i_fstat = armed.index("rj_fstat_search")
-        self.assertEqual(i_fstat, i_warm + 1,
-                         f"rj_warm_search must be IMMEDIATELY BEFORE "
-                         f"rj_fstat_search; stage is {armed}")
-        # removing the warm move recovers the baseline exactly
-        self.assertEqual([m for m in armed if m != "rj_warm_search"],
-                         baseline)
+        self.assertEqual(list(stages2), list(stages))
+        self.assertEqual(stages2["gb_search_seed"], ["rj_warm_search"])
+        for name in self.SEARCH_STAGES:
+            armed = stages2[name]
+            self.assertIn("rj_warm_search", armed, name)
+            self.assertNotIn("rj_warm_pe", armed, name)
+            i_warm = armed.index("rj_warm_search")
+            i_fstat = armed.index("rj_fstat_search")
+            self.assertEqual(i_fstat, i_warm + 1,
+                             f"rj_warm_search must be IMMEDIATELY BEFORE "
+                             f"rj_fstat_search; {name} is {armed}")
+            # removing the warm move recovers the baseline exactly
+            self.assertEqual([m for m in armed if m != "rj_warm_search"],
+                             stages[name], name)
 
         # PE TWIN (user ruling 2026-09-07): rj_warm_pe IMMEDIATELY BEFORE
-        # rj_fstat_pe in full_pe; the search twin never leaks into full_pe
-        # and the pe twin never leaks into gb_search.
-        armed_pe = stages2["full_pe"]
-        self.assertIn("rj_warm_pe", armed_pe)
-        self.assertNotIn("rj_warm_search", armed_pe)
-        self.assertNotIn("rj_warm_pe", armed)
-        i_warm_pe = armed_pe.index("rj_warm_pe")
-        i_fstat_pe = armed_pe.index("rj_fstat_pe")
-        self.assertEqual(i_fstat_pe, i_warm_pe + 1,
-                         f"rj_warm_pe must be IMMEDIATELY BEFORE "
-                         f"rj_fstat_pe; stage is {armed_pe}")
-        self.assertEqual([m for m in armed_pe if m != "rj_warm_pe"],
-                         baseline_pe)
-        self.assertNotIn("rj_warm_pe", baseline_pe)
+        # rj_fstat_pe in every PE stage; the search twin never leaks into
+        # PE and the pe twin never leaks into search.
+        for name in self.PE_STAGES:
+            armed_pe = stages2[name]
+            self.assertIn("rj_warm_pe", armed_pe, name)
+            self.assertNotIn("rj_warm_search", armed_pe, name)
+            i_warm_pe = armed_pe.index("rj_warm_pe")
+            i_fstat_pe = armed_pe.index("rj_fstat_pe")
+            self.assertEqual(i_fstat_pe, i_warm_pe + 1,
+                             f"rj_warm_pe must be IMMEDIATELY BEFORE "
+                             f"rj_fstat_pe; {name} is {armed_pe}")
+            self.assertEqual([m for m in armed_pe if m != "rj_warm_pe"],
+                             stages[name], name)
 
 
 class CircImagesTest(unittest.TestCase):

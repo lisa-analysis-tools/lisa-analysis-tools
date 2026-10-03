@@ -36,7 +36,9 @@ class LagrangePrefactorTest(unittest.TestCase):
     def setUpClass(cls):
         from lisatools.detector import EqualArmlengthOrbits
 
-        cls.orbits = EqualArmlengthOrbits()
+        # the CPU backend explicitly: a bare EqualArmlengthOrbits() picks CUDA on a GPU node,
+        # which pyResponseTDI(force_backend="cpu") refuses (orbits/response backend assertion)
+        cls.orbits = EqualArmlengthOrbits(force_backend="cpu")
 
     def test_low_frequency_tdi_does_not_depend_on_the_sampling_step(self):
         for f, bound in ((1e-4, 1e-5), (3e-4, 1e-6), (1e-3, 1e-7)):
