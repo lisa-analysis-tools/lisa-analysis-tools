@@ -110,11 +110,17 @@ class TDDenseTDIWaveform : public LISATDIonTheFly{
     void phases(int b, int seg, double t, double *Phi3);
     CUDA_DEVICE
     cmplx strain_term(int s, int b, int seg, double t, double *Phi3);
+    // source-frame stop weight of an emission time s: 1 until stop_taper before the last knot,
+    // sin^2 down to 0 at it (C1 at both ends); stop_taper <= 0: 1
+    CUDA_DEVICE
+    double stop_weight(int b, double s, double stop_taper);
     // sum_subs: write the SUM over the template's harmonics into (n_temp, nch, N) instead of
-    // one row per harmonic; phi_ref may be nullptr (not written)
+    // one row per harmonic; phi_ref may be nullptr (not written); stop_taper > 0 weights every
+    // delay term by stop_weight of its emission time
     CUDA_DEVICE
     void channels_point(int b, int i, double t, double *params_b, int sub_lo, int sub_hi,
-        cmplx *tdi_channels_arr, double *phi_ref, int N, int *link_rec, int *link_em, int sum_subs);
+        cmplx *tdi_channels_arr, double *phi_ref, int N, int *link_rec, int *link_em, int sum_subs,
+        double stop_taper);
     CUDA_DEVICE
     void postprocess_sub(void *buffer, cmplx *chan, double *amp, double *phase, double *phi_ref, int N);
     CUDA_DEVICE
@@ -190,8 +196,10 @@ void td_dense_run_wave_tdi_wrap(TDDenseTDIWaveform *tdi_on_fly, cmplx *tdi_chann
 
 // The raw complex channels only (no amplitude/phase extraction): (num_sub, nch, N), or with
 // sum_subs the sum over each template's harmonics, (n_temp, nch, N). Zero on entry.
+// stop_taper [s] > 0: the source-frame stop taper (TDDenseTDIWaveform::stop_weight).
 void td_dense_run_channels_wrap(TDDenseTDIWaveform *tdi_on_fly, cmplx *tdi_channels_arr,
-    double *params, double *t_arr, int *sub_offsets, int N, int n_params, int sum_subs);
+    double *params, double *t_arr, int *sub_offsets, int N, int n_params, int sum_subs,
+    double stop_taper);
 
 // Host launcher: pulls Orbits/TDIConfig/CubicSpline structs onto the
 // device, configures the device-side TDSplineTDIWaveform, runs the

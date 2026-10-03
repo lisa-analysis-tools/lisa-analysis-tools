@@ -122,6 +122,48 @@ class TDDenseTest(unittest.TestCase):
         return TDDenseTDIonTheFly(*args, amp_factor=0.5, tdi_config=TDIConfig("2nd generation", force_backend=be),
                                   orbits=EqualArmlengthOrbits(force_backend=be), force_backend=be)
 
+    def _stopping_sinusoid(self, step, stop_taper):
+        """X, Y, Z of a constant-amplitude m=2 harmonic that stops at the last knot, sampled every
+        ``step`` s across the stop; the running integral of X+Y+Z and the knot end."""
+        from lisatools.response.tdionfly import TDDenseTDIonTheFly
+
+        K = 41
+        t_k = self.t_k[0] + np.linspace(0.0, 2 * 86400.0, K)
+        Phi_k = 0.3 + (t_k - t_k[0])[:, None] * np.array([2 * np.pi * 5.5e-3, 0.0, 0.0])[None, :]
+        are = np.zeros((1, K - 1, 4))
+        are[0, :, 0] = 1.0
+        t = t_k[-1] + np.arange(-6000.0, 3000.0, step)
+        dense = TDDenseTDIonTheFly(t[None], np.array([0, 1]), np.array([[2, 0, 0]]), t_k[None], np.array([K]),
+                                   _dense_linear(t_k, Phi_k)[None], are, np.zeros_like(are), tdi_config=self.tdi,
+                                   orbits=self.orbits, force_backend="cpu")
+        ch = np.real(np.asarray(dense.channels(self.params[1:], sum_subs=True, stop_taper=stop_taper))[0])
+        return t, ch, np.cumsum(ch.sum(axis=0)) * step, t_k[-1]
+
+    def test_stop_taper_removes_the_sampled_stop_area(self):
+        """A source that stops abruptly has no net T-like area (every delay term is the same truncated
+        function), but SAMPLED, each term's cut falls at its own place between samples and the
+        sum keeps an area that aliases into the lowest frequencies (EMRI 1's plunge: SNR 2.7 in
+        0.25-1 mHz where production, which band-limits the stop, has 2e-4). The source-frame
+        taper (stop_taper, on the emission time) makes every term smooth at its end: no area."""
+        net = {}
+        for taper in (0.0, 120.0):
+            t, ch, I, t_last = self._stopping_sinusoid(1.0, taper)
+            pre = t < t_last - 1500.0
+            swing = float(np.ptp(I[pre]))
+            net[taper] = abs(float(I[t > t_last + 1500.0].mean() - I[pre].mean())) / swing
+        print(f"[stop taper] net X+Y+Z area / pre-stop swing: hard stop {net[0.0]:.3g}, 120 s taper {net[120.0]:.3g}")
+        self.assertGreater(net[0.0], 3.0)
+        self.assertLess(net[120.0], 0.1)
+
+    def test_stop_taper_leaves_the_signal_before_it_and_ends_it(self):
+        t, hard, _, t_last = self._stopping_sinusoid(1.0, 0.0)
+        _, tap, _, _ = self._stopping_sinusoid(1.0, 120.0)
+        early = t < t_last - 120.0 - 1000.0          # every emission time before the taper (|delay| < 600 s)
+        np.testing.assert_array_equal(tap[:, early], hard[:, early])
+        np.testing.assert_array_equal(tap[:, t > t_last + 1000.0], 0.0)
+        mid = (t > t_last - 120.0 - 400.0) & (t < t_last - 120.0 + 400.0)
+        self.assertGreater(np.abs(tap[:, mid] - hard[:, mid]).max(), 0.0)
+
     def test_channels_only_kernel_equals_full_call(self):
         """channels() runs the channel kernel alone (run_channels_wrap): per harmonic it equals the
         full call's channels exactly; sum_subs sums each template's harmonics in the kernel."""
@@ -134,6 +176,12 @@ class TDDenseTest(unittest.TestCase):
         self.assertEqual(summed.shape, (2, 3, full.shape[-1]))
         want = np.stack([full[0:3].sum(axis=0), full[3:5].sum(axis=0)])
         np.testing.assert_allclose(summed, want, rtol=0, atol=1e-13 * np.abs(want).max())
+        # the stop taper is the same per harmonic and summed (a taper reaching this window)
+        per_t = np.asarray(dense.channels(self.params, stop_taper=5000.0))
+        sum_t = np.asarray(dense.channels(self.params, sum_subs=True, stop_taper=5000.0))
+        self.assertGreater(np.abs(per_t - per).max(), 1e-3 * np.abs(per).max())
+        np.testing.assert_allclose(sum_t, np.stack([per_t[0:3].sum(axis=0), per_t[3:5].sum(axis=0)]), rtol=0,
+                                   atol=1e-13 * np.abs(want).max())
 
 
 class TDDenseGPUParityTest(TDDenseTest):
@@ -172,18 +220,20 @@ class TDDenseGPUParityTest(TDDenseTest):
                 np.testing.assert_allclose(b, a, rtol=1e-10, atol=1e-10 * np.max(np.abs(a)), err_msg=f"N={N}")
 
     def test_gpu_channels_equal_cpu(self):
-        """The channels-only kernel (per harmonic and summed in the kernel) on the GPU == CPU."""
+        """The channels-only kernel (per harmonic, summed in the kernel, source-frame stop taper) on the
+        GPU == CPU (the taper is wide enough to reach this window)."""
         import lisatools
 
         try:
             lisatools.get_backend("gpu")
         except Exception:
             self.skipTest("no GPU backend")
-        for sum_subs in (False, True):
-            a, b = (self._random_dense(be).channels(self.params, sum_subs=sum_subs) for be in ("cpu", "gpu"))
+        for sum_subs, taper in ((False, 0.0), (True, 0.0), (True, 5000.0)):
+            a, b = (self._random_dense(be).channels(self.params, sum_subs=sum_subs, stop_taper=taper)
+                    for be in ("cpu", "gpu"))
             a, b = np.asarray(a), np.asarray(b.get())
             np.testing.assert_allclose(b, a, rtol=1e-10, atol=1e-10 * np.max(np.abs(a)),
-                                       err_msg=f"sum_subs={sum_subs}")
+                                       err_msg=f"sum_subs={sum_subs} stop_taper={taper}")
 
 
 if __name__ == "__main__":

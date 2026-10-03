@@ -1080,15 +1080,24 @@ class TDDenseTDIonTheFly(TDIonTheFly):
                                         self.sub_offsets, N, 4, nch)
         return chans, amp, phase, phi_ref
 
-    def channels(self, params, sum_subs=False):
+    def channels(self, params, sum_subs=False, stop_taper=0.0):
         """The raw complex TDI channels at the evaluation times, ``(num_sub, nch, N)`` or, with
         ``sum_subs``, summed over each template's harmonics ``(n_temp, nch, N)``: the exact
         channel is the real part (no amplitude/phase representation, so a signal that stops --
         an in-window plunge -- keeps the TDI combination's own structure). Runs the channel
-        kernel only (no amplitude/phase extraction) on a module with ``run_channels_wrap``."""
+        kernel only (no amplitude/phase extraction).
+
+        ``stop_taper`` [s] > 0 weights every delay term by a sin^2 window on its EMISSION time that
+        falls to 0 at the last knot over that span: the same window for every term, so the TDI
+        cancellation holds through the stop, and each term is smooth there. Without it, a sampled
+        channel keeps a net area from the terms' abrupt cuts falling between samples, which
+        aliases into the lowest frequencies (``tests/test_tdi_dense.py``)."""
         xp = self.xp
         nch = self.tdi_config.nchannels
         if not hasattr(self.wave_gen, "run_channels_wrap"):          # an older module
+            if stop_taper > 0:
+                raise RuntimeError("TDDenseTDIonTheFly.channels(stop_taper>0) needs the compiled "
+                                   "run_channels_wrap: rebuild lisatools (pip install -e . --no-build-isolation)")
             chans = self._run(params)[0].reshape(self.num_sub, nch, self.N)
             if not sum_subs:
                 return chans
@@ -1097,8 +1106,12 @@ class TDDenseTDIonTheFly(TDIonTheFly):
         params = xp.ascontiguousarray(xp.asarray(params, dtype=xp.float64).reshape(self.n_temp, 4))
         rows = self.n_temp if sum_subs else self.num_sub
         chans = xp.zeros(rows * nch * self.N, dtype=complex)
-        self.wave_gen.run_channels_wrap(chans, params.ravel(), self.t.ravel(), self.sub_offsets,
-                                        self.N, 4, nch, int(bool(sum_subs)))
+        try:
+            self.wave_gen.run_channels_wrap(chans, params.ravel(), self.t.ravel(), self.sub_offsets,
+                                            self.N, 4, nch, int(bool(sum_subs)), float(stop_taper))
+        except TypeError as exc:                                     # a module without stop_taper
+            raise RuntimeError("the compiled run_channels_wrap predates stop_taper: rebuild lisatools "
+                               f"(pip install -e . --no-build-isolation) ({exc})") from exc
         return chans.reshape(rows, nch, self.N)
 
     def __call__(self, params, return_spline: bool = True) -> "TDTDIOutput":

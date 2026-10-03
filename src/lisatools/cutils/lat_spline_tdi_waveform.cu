@@ -500,10 +500,25 @@ cmplx TDDenseTDIWaveform::strain_term(int s, int b, int seg, double t, double *P
     return cmplx(amp_factor * (cr * cph + ci * sph), amp_factor * (ci * cph - cr * sph));
 }
 
+// A source that stops abruptly has no net T-like area (every delay term of a channel is the same
+// truncated function), but SAMPLED, each term's cut falls at its own place between samples and the
+// sum keeps an area that aliases into the lowest frequencies. A weight on the EMISSION time is the
+// same for every term, so tapering there keeps the cancellation and makes each term smooth.
+CUDA_DEVICE
+double TDDenseTDIWaveform::stop_weight(int b, double s, double stop_taper)
+{
+    if (stop_taper <= 0.0) return 1.0;
+    double x = (t_knots[(size_t)b * K + n_knots[b] - 1] - s) / stop_taper;
+    if (x >= 1.0) return 1.0;
+    if (x <= 0.0) return 0.0;
+    double w = sin(0.5 * M_PI * x);
+    return w * w;
+}
+
 CUDA_DEVICE
 void TDDenseTDIWaveform::channels_point(int b, int i, double t, double *params_b, int sub_lo, int sub_hi,
     cmplx *tdi_channels_arr, double *phi_ref, int N, int *link_Space_craft_rec, int *link_Space_craft_em,
-    int sum_subs)
+    int sum_subs, double stop_taper)
 {
     Vec k(0.0, 0.0, 0.0);
     Vec u(0.0, 0.0, 0.0);
@@ -604,6 +619,8 @@ void TDDenseTDIWaveform::channels_point(int b, int i, double t, double *params_b
         double P3e[3] = {0.0, 0.0, 0.0};
         if (seg_r >= 0) phases(b, seg_r, delay_rec, P3r);
         if (seg_e >= 0) phases(b, seg_e, delay_em, P3e);
+        double w_r = stop_weight(b, delay_rec, stop_taper);
+        double w_e = stop_weight(b, delay_em, stop_taper);
         if (sum_subs)
         {
             cmplx acc(0.0, 0.0);
@@ -611,7 +628,7 @@ void TDDenseTDIWaveform::channels_point(int b, int i, double t, double *params_b
             {
                 cmplx zr = (seg_r >= 0) ? strain_term(s, b, seg_r, delay_rec, P3r) : cmplx(0.0, 0.0);
                 cmplx ze = (seg_e >= 0) ? strain_term(s, b, seg_e, delay_em, P3e) : cmplx(0.0, 0.0);
-                acc += ze - zr;
+                acc += w_e * ze - w_r * zr;
             }
             tdi_channels_arr[((size_t)b * nch + channel) * N + i] += G * acc;
         }
@@ -621,7 +638,7 @@ void TDDenseTDIWaveform::channels_point(int b, int i, double t, double *params_b
             {
                 cmplx zr = (seg_r >= 0) ? strain_term(s, b, seg_r, delay_rec, P3r) : cmplx(0.0, 0.0);
                 cmplx ze = (seg_e >= 0) ? strain_term(s, b, seg_e, delay_em, P3e) : cmplx(0.0, 0.0);
-                tdi_channels_arr[((size_t)s * nch + channel) * N + i] += G * (ze - zr);
+                tdi_channels_arr[((size_t)s * nch + channel) * N + i] += G * (w_e * ze - w_r * zr);
             }
         }
     }
@@ -670,7 +687,7 @@ void TDDenseTDIWaveform::postprocess_sub(void *buffer, cmplx *chan, double *amp,
 #ifdef __CUDACC__
 CUDA_KERNEL
 void td_dense_channels_kernel(TDDenseTDIWaveform *w, cmplx *tdi_channels_arr, double *phi_ref,
-    double *params, double *t_arr, int *sub_offsets, int N, int n_params, int sum_subs)
+    double *params, double *t_arr, int *sub_offsets, int N, int n_params, int sum_subs, double stop_taper)
 {
     CUDA_SHARED int link_rec[NLINKS];
     CUDA_SHARED int link_em[NLINKS];
@@ -681,7 +698,8 @@ void td_dense_channels_kernel(TDDenseTDIWaveform *w, cmplx *tdi_channels_arr, do
         for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += gridDim.x * blockDim.x)
         {
             w->channels_point(b, i, t_arr[(size_t)b * N + i], &params[(size_t)b * n_params],
-                sub_offsets[b], sub_offsets[b + 1], tdi_channels_arr, phi_ref, N, link_rec, link_em, sum_subs);
+                sub_offsets[b], sub_offsets[b + 1], tdi_channels_arr, phi_ref, N, link_rec, link_em, sum_subs,
+                stop_taper);
         }
     }
 }
@@ -734,7 +752,8 @@ void td_dense_run_wave_tdi_wrap(TDDenseTDIWaveform *w, cmplx *tdi_channels_arr,
 
     int n_temp_grid = (w->n_temp < 65535) ? w->n_temp : 65535;
     dim3 grid1((N + 127) / 128, n_temp_grid);
-    td_dense_channels_kernel<<<grid1, 128>>>(d_wave, tdi_channels_arr, phi_ref, params, t_arr, sub_offsets, N, n_params, 0);
+    td_dense_channels_kernel<<<grid1, 128>>>(d_wave, tdi_channels_arr, phi_ref, params, t_arr, sub_offsets, N, n_params, 0,
+        0.0);
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
 
@@ -759,7 +778,7 @@ void td_dense_run_wave_tdi_wrap(TDDenseTDIWaveform *w, cmplx *tdi_channels_arr,
         for (int i = 0; i < N; i += 1)
         {
             w->channels_point(b, i, t_arr[(size_t)b * N + i], &params[(size_t)b * n_params],
-                sub_offsets[b], sub_offsets[b + 1], tdi_channels_arr, phi_ref, N, link_rec, link_em, 0);
+                sub_offsets[b], sub_offsets[b + 1], tdi_channels_arr, phi_ref, N, link_rec, link_em, 0, 0.0);
         }
     }
     int buffer_length = w->get_td_dense_buffer_size(N);
@@ -774,7 +793,7 @@ void td_dense_run_wave_tdi_wrap(TDDenseTDIWaveform *w, cmplx *tdi_channels_arr,
 }
 
 void td_dense_run_channels_wrap(TDDenseTDIWaveform *w, cmplx *tdi_channels_arr,
-    double *params, double *t_arr, int *sub_offsets, int N, int n_params, int sum_subs)
+    double *params, double *t_arr, int *sub_offsets, int N, int n_params, int sum_subs, double stop_taper)
 {
 #ifdef __CUDACC__
     Orbits *d_orbits;
@@ -792,7 +811,7 @@ void td_dense_run_channels_wrap(TDDenseTDIWaveform *w, cmplx *tdi_channels_arr,
     int n_temp_grid = (w->n_temp < 65535) ? w->n_temp : 65535;
     dim3 grid1((N + 127) / 128, n_temp_grid);
     td_dense_channels_kernel<<<grid1, 128>>>(d_wave, tdi_channels_arr, nullptr, params, t_arr, sub_offsets, N,
-        n_params, sum_subs);
+        n_params, sum_subs, stop_taper);
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
     gpuErrchk(cudaFree(d_orbits));
@@ -807,7 +826,8 @@ void td_dense_run_channels_wrap(TDDenseTDIWaveform *w, cmplx *tdi_channels_arr,
         for (int i = 0; i < N; i += 1)
         {
             w->channels_point(b, i, t_arr[(size_t)b * N + i], &params[(size_t)b * n_params],
-                sub_offsets[b], sub_offsets[b + 1], tdi_channels_arr, nullptr, N, link_rec, link_em, sum_subs);
+                sub_offsets[b], sub_offsets[b + 1], tdi_channels_arr, nullptr, N, link_rec, link_em, sum_subs,
+                stop_taper);
         }
     }
 #endif

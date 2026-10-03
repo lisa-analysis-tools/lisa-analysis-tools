@@ -222,7 +222,7 @@ Around it:
 | analytic vs stencil tracer, synthetic sparse response | 1e-13 Hz in f, 9e-17 Hz/s in fdot |
 | CD1L EMRI 1, 16 d, 20 s, fit wiring check (box t[60:324]) | kernel = python: mismatch 2.109e-8, max dlogL 1.14e-6 |
 
-### In-window plunge: exact, tapered tail (10-02)
+### In-window plunge: exact tail, source-frame stop taper (10-02, taper 10-03)
 
 The first 720-day speed test put EMRI 1's plunge 518 d into the window and scored the direct
 template at SNR 3920 against production's 56 (foreground noise; the 180/360 d windows were fine).
@@ -232,17 +232,35 @@ power has a low-frequency, X+Y+Z-like part the TDI combination would suppress, a
 weights it enormously. Now:
 
 * the chunk's time series comes from the dense kernel at the sample times
-  (`EMRIDirectWDM._dense_td`: the raw complex channels' real part, `TDDenseTDIonTheFly.channels`);
-* when the trajectory stops inside the window, each channel is tapered to zero over the last
-  `EMRI_DIRECT_PLUNGE_TAPER_S` (300 s) before its stop (`plunge_stop_taper`): the exact stop
-  still leaves a ~minute-long burst (0.25-1 mHz SNR 91 vs the data's 0.7 under instrument noise,
-  30-day window around the plunge); production's order-40 Lagrange interpolation of the sampled
-  strain smooths it away, and the taper does the same (0.48);
-* subs that share a chunk keep range are summed before ONE transform per range;
-* the sparse response grid no longer adds an 80 s segment before the stop (11000 points at 720 d).
+  (`EMRIDirectWDM._dense_td`: the raw complex channels' real part, `TDDenseTDIonTheFly.channels`,
+  the channel kernel alone, summed over the template's harmonics in the kernel);
+* the SOURCE is tapered over the last `EMRI_DIRECT_PLUNGE_TAPER_S` (120 s) of emission time before
+  the trajectory's end: `stop_taper` weights every delay term by sin^2 of its emission time
+  (`TDDenseTDIWaveform::stop_weight`). Why: the stop itself has no net T-like area (every delay
+  term is the same truncated function), but SAMPLED, each term's cut falls at its own place
+  between samples, and the channel keeps an area that aliases into the lowest frequencies
+  (`tests/test_tdi_dense.py`: the net X+Y+Z area of a stopping sinusoid is 8x its pre-stop swing
+  at 1 s sampling and shrinks with the step). Production's Lagrange interpolation band-limits the
+  stop. A weight on the emission time is the same for every term, so the cancellation holds and
+  each term is smooth. (10-02 to 10-03 tapered each CHANNEL over 300 s before its stop instead;
+  the cuts stayed inside that window and their aliased area did not go away.)
+* every harmonic of a template hands off to the chunk at the earliest harmonic's pixel (the
+  summed tail implies the common handoff): one transform per chunk window.
 
-Laptop check (dt 20, 30 days around the plunge): direct SNR 18.36 vs data 18.25 (instrument),
-mismatch to the data 4.2e-3 (eps 1e-3 mode content), 3-25 mHz bands unchanged.
+Laptop check (dt 5 s, equal-arm orbits, 60 days around EMRI 1's plunge, against production with the
+exact Lagrange prefactor, scirdv1 + foreground):
+
+| stop | mm vs production | 0.25-1 mHz SNR (production 1.6e-4) | 3-10 / 10-25 mHz mm |
+|---|---|---|---|
+| hard stop | 0.62 | 50 | 1.1e-4 / 2.7e-6 |
+| per-channel 300 s taper (10-02) | 8.0e-3 | 2.7 | |
+| source taper 60 s | 2.2e-6 | 0.011 | 1.6e-6 / 3.9e-6 |
+| **source taper 120 s (default)** | **2.4e-6** | **0.0016** | 2.0e-6 / 4.3e-6 |
+| source taper 300 s | 5.1e-6 | 0.0018 | 4.3e-6 / 8.2e-6 |
+
+Against the direct model's own exact time series transformed whole, the common-handoff template
+is at mm 1.6e-6 (the per-harmonic handoff of 10-02 was at 3.9e-3: its lookup ran into the last
+hours before the plunge).
 
 ## In the global fit: `EMRI_LIKELIHOOD=direct` (10-02; the 6-month launcher default and, through `auto`, the library default since 10-03)
 
@@ -326,7 +344,10 @@ mojito stream under scirdv1 + the fitted galactic foreground at each Tobs; spars
 | 360 d | 1e-5 | 45 / 24 | 175 | 7.3e-6 | -0.050 / -0.043 |
 | 720 d (plunge at 518 d) | 1e-3 | 551 / 630 | 398 | 1.5e-5 | -5.557 / -5.522 |
 
-At 720 d every row hands off to the plunge chunk and is built alone (open item: the tail).
+At 720 d every row hands off to the plunge chunk and is built alone. 10-03 H100 rerun with the
+channels-only kernel, the common handoff and one FEW call per row: 175 ms per template
+(production 396), but mm vs production 6.8e-5 / lnL -5.732: the per-channel taper's aliased
+stop area, now on every harmonic; fixed by the source-frame taper above (rerun pending).
 
 Cluster check on the 6-month grid: `scripts/emri/emri_direct_fit_wiring_check.py --backend cuda12x
 --days 180 --table-dir <dir holding or receiving the table> --rows 8`.

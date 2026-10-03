@@ -4795,8 +4795,9 @@ export EMRI_EPS=1e-3
 # Python reference path) on this run's active band, cropped to its time box and
 # scored against each walker's own residual AND PSD.
 # A harmonic that chirps off the table's fdot axis near a plunge hands off to
-# even-start 128-layer chunks of the EXACT dense-kernel time series, tapered over
-# the last EMRI_DIRECT_PLUNGE_TAPER_S (300 s) before the stop. In-model steps,
+# even-start 128-layer chunks of the EXACT dense-kernel time series, the source
+# tapered over the last EMRI_DIRECT_PLUNGE_TAPER_S (120 s) of emission time
+# before the stop (so the sampled stop leaves no low-frequency area). In-model steps,
 # eigen-table sweeps and the inner-product record all score through it.
 # TEMPLATE GENERATION follows: with direct, the engine's EMRI template generator
 # (SourceSignalGen: residual rebuilds at load, the move's expose/fold) is the
