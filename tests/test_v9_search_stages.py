@@ -109,14 +109,23 @@ def _numbered(fit):
 class StageCompositionTest(unittest.TestCase):
     """Three search stages, the sanctioned cycle, then full_pe."""
 
-    def test_three_search_stages_then_full_pe(self):
+    def test_three_search_stages_then_replica_pe_then_full_pe(self):
+        """2026-10-03: replica_pe sits between gb_search_3 and full_pe by
+        default (STAGE_REPLICA_PE=1); =0 restores the direct handover."""
         fit = _build()
         self.assertEqual(
             [s.name for s in fit.recipe.stages],
             ["gb_search_seed", "gb_search_1", "gb_search_2",
-             "gb_search_3", "full_pe"])
+             "gb_search_3", "replica_pe", "full_pe"])
         self.assertEqual([s.kind for s in fit.recipe.stages],
-                         ["gb_search", "gb_search", "gb_search", "gb_search", "pe"])
+                         ["gb_search", "gb_search", "gb_search", "gb_search",
+                          "replica_pe", "pe"])
+        self.assertEqual([s.runtime_kind for s in fit.recipe.stages][-2:], ["pe", "pe"])
+        fit = _build(STAGE_REPLICA_PE="0")
+        self.assertEqual(
+            [s.name for s in fit.recipe.stages],
+            ["gb_search_seed", "gb_search_1", "gb_search_2",
+             "gb_search_3", "full_pe"])
 
     def test_the_seven_slot_cycle_in_order(self):
         """The user's ordering, 2026-09-24, verbatim:
@@ -160,7 +169,7 @@ class StageCompositionTest(unittest.TestCase):
         recurs in all three. If this ever became global the whole restructure
         would fail at composition."""
         fit = _build()  # Recipe() runs _check_unique in its ctor
-        self.assertEqual(len(fit.recipe.stages), 5)   # + gb_search_seed
+        self.assertEqual(len(fit.recipe.stages), 6)   # + gb_search_seed + replica_pe
 
     def test_warm_start_cadence_is_stage_3_only(self):
         fit = _build(GB_SEARCH_3_WARM_EVERY="7")
@@ -359,7 +368,7 @@ class FullCompositionTest(unittest.TestCase):
                          GALFOR_START_PARAMS="1e-44,1e-3,1.5,5e-4,5e-4")
         self.assertEqual([s.name for s in fit.recipe.stages],
                          ["gb_search_seed", "gb_search_1", "gb_search_2",
-                          "gb_search_3", "full_pe"])
+                          "gb_search_3", "replica_pe", "full_pe"])
 
     def test_noise_stages_are_KEPT_when_no_pin_is_supplied(self):
         fit = self._full(PSD_START_PARAMS=None, GALFOR_START_PARAMS=None)
@@ -1507,7 +1516,7 @@ class SeedStageTest(unittest.TestCase):
         self.assertNotIn("gb_search_seed", names)
         self.assertEqual(names,
                          ["gb_search_1", "gb_search_2", "gb_search_3",
-                          "full_pe"])
+                          "replica_pe", "full_pe"])         # replica_pe since 2026-10-03
 
     def test_the_length_is_configurable(self):
         fn = self._seed(_build(GB_SEARCH_SEED_ITERS="3")

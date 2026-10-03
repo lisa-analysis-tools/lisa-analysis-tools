@@ -3489,6 +3489,24 @@ export GALFOR_RATCHET_MIN_NUDGES=${GALFOR_RATCHET_MIN_NUDGES:-2}
 # 2026-10-02: every 6mo production launch from 09-30 on (jobs 675-695) ran
 # legged, and a line that dropped it would resume a legged store un-legged.
 export GB_SEARCH_LEGS=${GB_SEARCH_LEGS:-1}
+# ---- gb_search_3 ends at the ratchet's stop; then REPLICA PE (user design
+# 2026-10-03) --------------------------------------------------------------
+# "make gb search 3 only the ratcheting and foreground convergence? And then gb
+# search 4 will actually be called 'replica pe' which will wait until we start
+# seeing the main large-scale metrics (min, max, mean leaf count; min, max,
+# mean logL) reaching a reasonable convergence. The only difference between
+# replica pe and full pe is that the other sources (emris, mbhs, sobhbs) are
+# still only run every five iterations." full_pe's start_iteration stamp is
+# then the start of sample taking. The replica's stop: each of the six series
+# must trend by less than LEAF_TOL leaves / LNL_TOL nats over the last WINDOW
+# stored rows (a least-squares line, not a range). STAGE_REPLICA_PE=0 restores
+# the direct gb_search_3 -> full_pe handover.
+export GALFOR_RATCHET_END_STAGE_ON_STOP=${GALFOR_RATCHET_END_STAGE_ON_STOP:-1}
+export STAGE_REPLICA_PE=${STAGE_REPLICA_PE:-1}
+export REPLICA_PE_WINDOW=${REPLICA_PE_WINDOW:-10}
+export REPLICA_PE_LEAF_TOL=${REPLICA_PE_LEAF_TOL:-10}
+export REPLICA_PE_LNL_TOL=${REPLICA_PE_LNL_TOL:-100}
+echo "[REPLICA-PE] STAGE_REPLICA_PE=${STAGE_REPLICA_PE} window=${REPLICA_PE_WINDOW} leaf_tol=${REPLICA_PE_LEAF_TOL} lnl_tol=${REPLICA_PE_LNL_TOL} | gb_search_3 ends at the ratchet stop: ${GALFOR_RATCHET_END_STAGE_ON_STOP}"
 # While the ratchet is active the per-(walker, band) RJ shutoff valve leaves
 # every band below this frequency OPEN (reopening shut pairs with a fresh
 # streak) and shuts converged bands above it as usual; lifted at the

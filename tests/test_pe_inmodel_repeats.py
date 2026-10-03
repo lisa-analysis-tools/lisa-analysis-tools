@@ -170,7 +170,8 @@ class CompositionTest(unittest.TestCase):
         with env(**{**self._BASE, "PE_INMODEL_REPEATS": "25"}):
             fit = R.build_fit()
         for s in fit.recipe.stages:
-            if s.name != "full_pe":
+            # replica_pe (2026-10-03) is full_pe's twin and carries the same declarations
+            if s.name not in ("full_pe", "replica_pe"):
                 self.assertNotIn("pe_repeats", s.step_kwargs or {})
 
 

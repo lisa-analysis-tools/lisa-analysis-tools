@@ -575,6 +575,26 @@ def _pe_rj_flip_fraction() -> float:
     return float(_pe_rj_flip_default())
 
 
+def _replica_pe_knobs() -> dict:
+    """The replica-PE stage's convergence knobs (user design 2026-10-03).
+
+    REPLICA_PE_WINDOW (10): rows the trends are fitted over ("over say 10
+    replica pe iterations"); REPLICA_PE_LEAF_TOL (10): the largest total
+    change over the window any of min/mean/max cold leaves may show;
+    REPLICA_PE_LNL_TOL (100): the same for min/mean/max cold lnL, nats;
+    REPLICA_PE_MIN_ITERS (= window): rows in-stage before the check runs.
+    """
+    window = int(os.environ.get("REPLICA_PE_WINDOW", "10").strip() or 10)
+    leaf_tol = float(os.environ.get("REPLICA_PE_LEAF_TOL", "10").strip() or 10)
+    lnl_tol = float(os.environ.get("REPLICA_PE_LNL_TOL", "100").strip() or 100)
+    min_iters = int(os.environ.get("REPLICA_PE_MIN_ITERS", "").strip() or window)
+    if window < 3 or leaf_tol <= 0 or lnl_tol <= 0 or min_iters < window:
+        raise ValueError(
+            f"REPLICA_PE_WINDOW={window} must be >= 3, REPLICA_PE_LEAF_TOL={leaf_tol} and "
+            f"REPLICA_PE_LNL_TOL={lnl_tol} > 0, REPLICA_PE_MIN_ITERS={min_iters} >= the window.")
+    return dict(window=window, leaf_tol=leaf_tol, lnl_tol=lnl_tol, min_iters=min_iters)
+
+
 def _pe_inmodel_repeats():
     """``{branch: n}`` full_pe declares for its moves' in-model repeats, or None.
 
@@ -1095,16 +1115,32 @@ def build_fit():
             # GB-only variant is what the probe scripts and the search-test
             # runbook drive, so a divergence here would mean the probes stop
             # testing the production cycle.
-            _pe_stage = Stage(
-                name="full_pe", kind="pe",
-                moves=warm_pe() + [
+            def _gb_only_pe_moves():
+                return warm_pe() + [
                     Move("rj_fstat_pe", branch="gb"),
                     Move("rj_prior_pe", branch="gb"),
-                ] + ridge(),
+                ] + ridge()
+
+            _pe_stage = Stage(
+                name="full_pe", kind="pe",
+                moves=_gb_only_pe_moves(),
                 step_kwargs=dict(peak_min_snr=_PE_PEAK_MIN_SNR,
                                  stage_name="full_pe"),
                 combine_kwargs=_pe_combine_kwargs(),
             )
+            # replica_pe here TOO (2026-10-03; the two-assemblies rule above):
+            # no source moves in the GB-only variant, so the replica is
+            # full_pe's moves plus the convergence stop, nothing else.
+            _gb_only_replica = []
+            if _env_flag("STAGE_REPLICA_PE", "1"):
+                _rk = _replica_pe_knobs()
+                _gb_only_replica = [Stage(
+                    name="replica_pe", kind="replica_pe",
+                    moves=_gb_only_pe_moves(),
+                    step_kwargs=dict(peak_min_snr=_PE_PEAK_MIN_SNR,
+                                     stage_name="replica_pe", **_rk),
+                    combine_kwargs={**_pe_combine_kwargs(), "weighted_cycle": False},
+                )]
             _warm3 = int(os.environ.get("GB_SEARCH_3_WARM_EVERY", "5"))
             if _warm3 < 1:
                 raise ValueError(
@@ -1156,7 +1192,7 @@ def build_fit():
                     ),
                     combine_kwargs=dict(share_temperature_control=False),
                 ))
-            fit.recipe = Recipe(_gb_only_stages + [_pe_stage])
+            fit.recipe = Recipe(_gb_only_stages + _gb_only_replica + [_pe_stage])
             return fit
 
         fit.recipe = Recipe([
@@ -1690,6 +1726,11 @@ def build_fit():
         _ratchet_stop_rule = stop_rule_from_env() if _ratchet is not None else "gain"
         _ratchet_min_drop = min_drop_from_env() if _ratchet is not None else 0.0
         _ratchet_drop_band = drop_band_from_env() if _ratchet is not None else None
+        # GALFOR_RATCHET_END_STAGE_ON_STOP (user design 2026-10-03: "make gb
+        # search 3 only the ratcheting and foreground convergence"): the stage
+        # ends when the stop rule ends the ratchet; the replica-PE stage follows.
+        _ratchet_end_stage = (_env_flag("GALFOR_RATCHET_END_STAGE_ON_STOP", "1")
+                              if _ratchet is not None else False)
         # GALFOR_RATCHET_MIN_NUDGES: the stop may not fire before this many
         # nudges have run in the process (user ruling 2026-10-02: "I want to
         # force at least 1 more nudge"); 0 = no floor
@@ -1940,6 +1981,7 @@ def build_fit():
                 ratchet_stop_rule=_ratchet_stop_rule,
                 ratchet_min_drop=_ratchet_min_drop,
                 ratchet_drop_band=_ratchet_drop_band,
+                ratchet_end_stage_on_stop=_ratchet_end_stage,
                 legs=_legs,
             ),
             combine_kwargs=_combine_kwargs,
@@ -1973,33 +2015,69 @@ def build_fit():
             _seed_prof = dict(_profiles[0][1])
             _seed = [_search_stage("gb_search_seed", sample_noise=False,
                                    seed_only=True, **_seed_prof)]
+        # ONE PE composition, used twice (user design 2026-10-03: "an exact
+        # replica of pe mode (and I mean exact) ... The only difference between
+        # replica pe and full pe is that the other sources (emris, mbhs,
+        # sobhbs) are still only run every five iterations"). The move list,
+        # the PE declarations and the peak floor are built by these two helpers
+        # for BOTH stages, so the replica cannot drift from full_pe except in
+        # the one argument that names the difference.
+        def _pe_moves(source_cadence: bool):
+            # The peak floor is DECLARED rather than inherited: the search
+            # stages install a process-global override of it, and the PE
+            # stages want the loose 6.25 (an assembled model's faint tail must
+            # stay reachable) -- but getting it by accident from gb_search_3 is
+            # not the same as choosing it.
+            return (noise_pe + source_pe(gb_search_cadence=source_cadence) + warm_pe() + [
+                Move("rj_fstat_pe", branch="gb"),
+                Move("rj_prior_pe", branch="gb"),
+            ] + ([Move("gb_ridge_gibbs", branch="gb")]
+                 if os.environ.get("GB_RIDGE_GIBBS", "1") == "1" else [])
+                + vgb + vgb_ridge())
+
+        def _pe_step_kwargs(stage_name: str):
+            return dict(peak_min_snr=_PE_PEAK_MIN_SNR,
+                        stage_name=stage_name,
+                        # per-stage in-model repeats (PE_INMODEL_REPEATS)
+                        pe_repeats=_pe_inmodel_repeats(),
+                        # GB_PE_RJ_FLIP_FRACTION, applied on entry: in a
+                        # search-mode run the PE RJ moves are BUILT with the
+                        # search fraction (1.0)
+                        pe_rj_flip_fraction=_pe_rj_flip_fraction())
+
+        _replica = []
+        if _env_flag("STAGE_REPLICA_PE", "1"):
+            _rk = _replica_pe_knobs()
+            # ⚠ weighted_cycle OFF for the replica: the combine refuses a
+            # per-move cadence on its drawn-cycle fallback. Under the PE RJ
+            # draw-one plan (GB_PE_RJ_DRAW_ONE, the production setting) that
+            # fallback is never reached -- full_pe and the replica run the
+            # same plan -> cadence filter -> sequential propose -- so the
+            # stages are identical there; only with the draw turned off would
+            # full_pe draw a weighted cycle while the replica runs the fixed
+            # sequence.
+            _replica = [Stage(
+                name="replica_pe", kind="replica_pe",
+                moves=_pe_moves(True),
+                step_kwargs=dict(**_pe_step_kwargs("replica_pe"), **_rk),
+                combine_kwargs={**_pe_combine_kwargs(), "weighted_cycle": False},
+            )]
+            print(f"[combined] replica_pe: full_pe's moves and declarations with the "
+                  f"source PE moves on the gb_search cadence (every "
+                  f"{_gb_search_src_every}); ENDS when min/mean/max cold leaves and "
+                  f"min/mean/max cold lnL each trend by less than {_rk['leaf_tol']:g} "
+                  f"leaves / {_rk['lnl_tol']:g} nats over the last {_rk['window']} rows "
+                  f"(at least {_rk['min_iters']} rows in-stage); full_pe then begins = "
+                  f"the start of sample taking (its start_iteration stamp).", flush=True)
         stages += _seed + [
             _search_stage(_name, sample_noise=(_sampled or _noise_all_stages),
                           warm_every=(_warm3 if _sampled else 1), **_prof)
             for _name, _prof, _sampled in _profiles
-        ] + [
+        ] + _replica + [
             Stage(
                 name="full_pe", kind="pe",
-                # Move list unchanged from the legacy composition below. The
-                # peak floor is DECLARED rather than inherited: the search
-                # stages install a process-global override of it, and
-                # full_pe wants the loose 6.25 (an assembled model's faint
-                # tail must stay reachable) -- but getting it by accident
-                # from gb_search_3 is not the same as choosing it.
-                moves=noise_pe + source_pe() + warm_pe() + [
-                    Move("rj_fstat_pe", branch="gb"),
-                    Move("rj_prior_pe", branch="gb"),
-                ] + ([Move("gb_ridge_gibbs", branch="gb")]
-                     if os.environ.get("GB_RIDGE_GIBBS", "1") == "1" else [])
-                + vgb + vgb_ridge(),
-                step_kwargs=dict(peak_min_snr=_PE_PEAK_MIN_SNR,
-                                 stage_name="full_pe",
-                                 # per-stage in-model repeats (PE_INMODEL_REPEATS)
-                                 pe_repeats=_pe_inmodel_repeats(),
-                                 # GB_PE_RJ_FLIP_FRACTION, applied on entry:
-                                 # in a search-mode run the PE RJ moves are
-                                 # BUILT with the search fraction (1.0)
-                                 pe_rj_flip_fraction=_pe_rj_flip_fraction()),
+                moves=_pe_moves(False),
+                step_kwargs=_pe_step_kwargs("full_pe"),
                 combine_kwargs=_pe_combine_kwargs(),
             ),
         ]
