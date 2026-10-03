@@ -61,7 +61,9 @@ logger = getLogger(__name__)
 
 __all__ = [
     "build_monitor",
+    "build_short_monitor",
     "default_out_path",
+    "default_short_out_path",
     "generator_path",
     "resolve_mojito_path",
 ]
@@ -593,3 +595,12 @@ def build_monitor(run_dir: str, out_path: Optional[str] = None, *,
     logger.info("monitor page built in %.1f s -> %s",
                 time.perf_counter() - st, out_path)
     return out_path
+
+
+# THE SHORT PAGE (user request 2026-10-03; see _short.py): the topline plus
+# the lnL, leaf-count, phase-maximised-overlap and current-noise panels, in
+# well under a minute, written to RUN_DIR + "_monitor_short.html" -- a
+# separate file, so the full page above and its default name are unchanged.
+# Imported last: _short reaches back into this module (generator_path,
+# check_truth, resolve_mojito_path) only inside its functions.
+from ._short import build_short_monitor, default_short_out_path  # noqa: E402

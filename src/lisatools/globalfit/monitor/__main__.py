@@ -21,6 +21,14 @@ inside it::
 because the page was written inside the directory being archived. It no
 longer does. Copy both if the report has to travel with the data.
 
+``--short-page`` (2026-10-03) builds the SHORT page INSTEAD of the full
+one: the topline, likelihood and leaf count over time, the phase-maximised
+overlap and the current noise measurement, in well under a minute, written
+to ``RUN_DIR_monitor_short.html`` beside the run folder (a separate file; the
+full page's name is untouched). The user's request and the page's contents
+are in ``_short.py``. It composes with ``--snapshot`` and ``--build-truth``,
+not with ``--snapshot-only``. In-run equivalent: ``GF_MONITOR_PAGE_SHORT=1``.
+
 ``--build-truth`` generates the detectability truth set into the run
 directory first. Anything after ``--`` goes straight to ``build_truth``
 (``--catalogue``, ``--l1-brick``, ``--flo`` ...), though normally none of
@@ -34,13 +42,17 @@ import argparse
 import sys
 import time
 
-from . import (build_monitor, build_truth_set, check_truth,
-               default_out_path, describe_run)
+from . import (build_monitor, build_short_monitor, build_truth_set,
+               check_truth, default_out_path, default_short_out_path,
+               describe_run)
 from .snapshot import build_snapshot
 
 USAGE = ("usage: python -m lisatools.globalfit.monitor [--snapshot] "
-         "[--build-truth] RUN_DIR [OUT.html] [-- BUILD_TRUTH_ARGS...]\n"
+         "[--short-page] [--build-truth] RUN_DIR [OUT.html] "
+         "[-- BUILD_TRUTH_ARGS...]\n"
          "       --snapshot     also build <RUN_DIR>_snapshot.tar.gz\n"
+         "       --short-page   the SHORT page <RUN_DIR>_monitor_short.html "
+         "instead of the full one\n"
          "       --build-truth  generate the truth set into RUN_DIR first\n"
          "       (a downloaded tarball goes the other way: python -m "
          "lisatools.globalfit.monitor.from_tar SNAP.tar.gz)")
@@ -63,7 +75,18 @@ def _parser():
     ap.add_argument("run_dir")
     ap.add_argument("out", nargs="?", default=None,
                     help="output .html (default: <RUN_DIR>_monitor.html, "
+                         "or <RUN_DIR>_monitor_short.html with --short-page, "
                          "beside the run folder)")
+    # A DIFFERENT FLAG FROM --short, which is the short TAR. This one is the
+    # short PAGE, and it REPLACES the full page for this command rather than
+    # adding to it: the point is a page that is cheap to make, and building
+    # the full one as well would spend the minutes it exists to save.
+    ap.add_argument("--short-page", action="store_true",
+                    help="build the SHORT page <RUN_DIR>_monitor_short.html "
+                         "INSTEAD of the full page: topline, lnL and leaf "
+                         "count over time, phase-maximised overlap, current "
+                         "noise; under a minute. In-run equivalent: "
+                         "GF_MONITOR_PAGE_SHORT=1.")
     ap.add_argument("--snapshot", action="store_true",
                     help="also build <RUN_DIR>_snapshot.tar.gz beside it")
     ap.add_argument("--short", action="store_true",
@@ -121,13 +144,18 @@ def main(argv=None):
         argv, extra = argv[:_i], argv[_i + 1:]
     else:
         extra = []
-    a = _parser().parse_args(argv)
+    ap = _parser()
+    a = ap.parse_args(argv)
+    if a.short_page and a.snapshot_only:
+        ap.error("--short-page builds a page and --snapshot-only builds none; "
+                 "use --short-page --snapshot for both")
     for _flag, _val in (("--catalogue", a.catalogue),
                         ("--l1-brick", a.l1_brick)):
         if _val:
             extra += [_flag, _val]
     run_dir = a.run_dir
-    out = a.out or default_out_path(run_dir)
+    out = a.out or (default_short_out_path(run_dir) if a.short_page
+                    else default_out_path(run_dir))
 
     _truth, _tnote = check_truth(run_dir)
     if _truth:
@@ -156,7 +184,10 @@ def main(argv=None):
 
     if not a.snapshot_only:
         st = time.perf_counter()
-        build_monitor(run_dir, out, in_process=not a.subprocess)
+        if a.short_page:
+            build_short_monitor(run_dir, out)
+        else:
+            build_monitor(run_dir, out, in_process=not a.subprocess)
         print(f"[monitor] wrote {out} in {time.perf_counter() - st:.1f} s")
 
     if a.snapshot or a.snapshot_only or a.short:

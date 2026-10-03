@@ -24,6 +24,11 @@ Defaults chosen so the common case is zero flags:
   SILENTLY, so the chosen tree is always printed and a failure to find
   one is warned before the slow work starts.
 
+``--short-page`` (2026-10-03) renders the SHORT page instead of the full
+one (``_short.py``), named ``RUN_monitor_short.html`` beside the tar unless
+a second argument says otherwise. A short tar (``--short`` /
+``GF_MONITOR_SNAPSHOT_SHORT=1``) carries everything it reads.
+
 ONE PYTHON PROCESS. The page renders in THIS interpreter; ``--subprocess``
 opts into a child if you would rather keep the ~2.5 GB peak and any
 matplotlib fault out of it. Both produce byte-identical output -- see
@@ -138,6 +143,11 @@ def main(argv=None) -> int:
                          "a different Tobs. Tens of minutes, CPU-only. "
                          "Without it the page still renders, just with no "
                          "detectability overlays.")
+    ap.add_argument("--short-page", action="store_true",
+                    help="render the SHORT page (topline, lnL and leaf count "
+                         "over time, phase-maximised overlap, current noise) "
+                         "INSTEAD of the full one; default name "
+                         "<run>_monitor_short.html beside the tar")
     ap.add_argument("--subprocess", action="store_true",
                     help="render in a CHILD interpreter instead of this one. "
                          "Output is identical; use it to keep the ~2.5 GB "
@@ -238,15 +248,19 @@ extra_argv=_passthru)
 
     out = a.out or os.path.join(
         os.path.dirname(os.path.abspath(a.tar)),
-        f"{os.path.basename(run_dir.rstrip('/'))}_monitor.html")
+        f"{os.path.basename(run_dir.rstrip('/'))}_monitor"
+        f"{'_short' if a.short_page else ''}.html")
 
-    from . import build_monitor
+    from . import build_monitor, build_short_monitor
 
     st = time.perf_counter()
     try:
-        # ONE PYTHON: no child interpreter. See build_monitor_in_process.
-        build_monitor(run_dir, out, timeout=a.timeout, mojito=_moj,
-                      in_process=not a.subprocess)
+        if a.short_page:
+            build_short_monitor(run_dir, out, mojito=_moj)
+        else:
+            # ONE PYTHON: no child interpreter. See build_monitor_in_process.
+            build_monitor(run_dir, out, timeout=a.timeout, mojito=_moj,
+                          in_process=not a.subprocess)
     except Exception as e:                       # noqa: BLE001
         print(f"[from_tar] page build FAILED ({type(e).__name__}: {e})",
               file=sys.stderr)

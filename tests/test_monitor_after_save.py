@@ -134,7 +134,7 @@ class HookGateTest(unittest.TestCase):
         with mock.patch.object(mon, "build_monitor"), \
                 mock.patch.object(snap, "build_snapshot") as bs:
             _run_loop(_Comm(_payloads()), _Reader())
-        bs.assert_called_once_with("/run/dir", short=False)
+        bs.assert_called_once_with("/run/dir", short=False, include_fstat=False)
 
     def test_GF_MONITOR_PAGE_0_builds_the_TAR_ONLY(self):
         """The asymmetry this knob removes.
@@ -153,7 +153,7 @@ class HookGateTest(unittest.TestCase):
                 mock.patch.object(snap, "build_snapshot") as bs:
             _run_loop(_Comm(_payloads()), _Reader())
         bm.assert_not_called()
-        bs.assert_called_once_with("/run/dir", short=False)
+        bs.assert_called_once_with("/run/dir", short=False, include_fstat=False)
 
     def test_the_page_is_still_the_DEFAULT(self):
         """Absent the knob nothing changes -- no silent behaviour flip."""

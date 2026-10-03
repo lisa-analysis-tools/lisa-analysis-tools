@@ -33,6 +33,15 @@ of the run. Losing stored iterations to a diagnostic is never a trade
 worth making silently, and an operator who wants it back can restart
 with a longer ``GF_MONITOR_ITER``.
 
+``GF_MONITOR_PAGE_SHORT=1`` (2026-10-03) builds the SHORT page
+(``_short.py``: topline, lnL and leaf count over time, phase-maximised
+overlap, current noise; under a minute) INSTEAD of the full one, at
+``RUN_DIR_monitor_short.html``
+beside the run folder. The full page stays the default. ``GF_MONITOR_OUT``
+names the FULL page only; the short page always takes its default name, so
+the two can never overwrite each other. ``GF_MONITOR_PAGE=0`` still turns
+the page off whichever kind is selected.
+
 Nothing here can raise into the saver loop.
 """
 
@@ -207,7 +216,14 @@ def after_save(gb_reader, comm, main_rank, i, watchdog, *,
             return
 
         st = time.perf_counter()
-        if _want_page:
+        if _want_page and _flag("GF_MONITOR_PAGE_SHORT"):
+            # The short page, in place of the full one (seconds, not
+            # minutes, on this rank). Its own default name, never
+            # GF_MONITOR_OUT, which names the full page.
+            from . import build_short_monitor
+
+            build_short_monitor(run_dir, check=False)
+        elif _want_page:
             from . import build_monitor
 
             build_monitor(run_dir, out, timeout=timeout, check=False)
