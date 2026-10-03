@@ -290,6 +290,7 @@ def main(argv=None):
         catalogue_source=ctx.cat_src, orbits=ctx.orbits_desc, placement=ctx.placement_note,
         brick=None if ctx.brick is None else os.path.basename(ctx.brick), start_offset_s=ctx.start_offset_s,
         merger_day=(ctx.t_merge_abs - ctx.data_t0) / DAY, order=int(args.order),
+        decimate=int(ctx.decimate),
         window_days=dict(before=ctx.W_before / DAY, after=ctx.W_after / DAY, pad=ctx.W_pad / DAY,
                          margin=ctx.W_margin / DAY),
         Nt_keep=int(geom["Nt_keep"]), n_start=int(geom["n_start"]), **ctx.noise,
@@ -347,7 +348,8 @@ def main(argv=None):
     verdict = "PASS" if ok else "FAIL"
     snr = results["stock90"][0]["snr_ref"]           # the source's optimal SNR at this duration
     mm_prod = None if "prod" not in results else results["prod"][0]["vs_ref"]["mm"]
-    print(f"[accuracy] src {args.source_id} {ctx.Tobs / DAY:g} d (Nt {ctx.Nt}, SNR {snr:.1f}): {verdict} -- "
+    print(f"[accuracy] src {args.source_id} {ctx.Tobs / DAY:g} d (Nt {ctx.Nt}, SNR {snr:.1f}"
+          + (f", window decimated {ctx.decimate}x" if ctx.decimate != 1 else "") + f"): {verdict} -- "
           f"vs stock90 (snapped, T {ctx.W_before / DAY:g} d) on {len(gate)} truth+near rows: max|dlogL| "
           f"{worst_dll:.3e} (tol {float(args.acc_tol):g}), max mm {worst_mm:.3e} (tol {float(acc.mm_tol):g})"
           f"{info}" + ("" if mm_prod is None else f"; mm_vs_production {mm_prod:.3e}"), flush=True)

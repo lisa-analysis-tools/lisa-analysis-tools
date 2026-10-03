@@ -538,10 +538,10 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
   # two defaults here MUST match that block's exports -- pinned by
   # tests/test_submit_scripts_layout.py::SixMonthEMRIDirectTest).
   _CPT=2
-  if [ "${EMRI_LIKELIHOOD:-full}" = "direct" ]; then
+  if [ "${EMRI_LIKELIHOOD:-direct}" = "direct" ]; then
     _CPT=$(( 2 + ${EMRI_TRAJ_WORKERS:-4} ))
   fi
-  echo "[SUBMIT] --cpus-per-task=${_CPT} (EMRI_LIKELIHOOD=${EMRI_LIKELIHOOD:-full}, EMRI_TRAJ_WORKERS=${EMRI_TRAJ_WORKERS:-4})"
+  echo "[SUBMIT] --cpus-per-task=${_CPT} (EMRI_LIKELIHOOD=${EMRI_LIKELIHOOD:-direct}, EMRI_TRAJ_WORKERS=${EMRI_TRAJ_WORKERS:-4})"
   exec sbatch --partition="${_NGPU_PART}" --gres="${_GRES}" --nodes="${_NODES}" \
        --ntasks="${NTASKS}" --cpus-per-task="${_CPT}" ${_DIST_FLAG} \
        --export=ALL,NGPUS="${NGPUS}",GPUS_PER_RANK="${GPUS_PER_RANK}",RANKS_PER_GPU="${RANKS_PER_GPU}",GF_LEGACY_RANK_LAYOUT="${GF_LEGACY_RANK_LAYOUT}" \
@@ -4640,6 +4640,14 @@ export MBH_BATCH_MAX_SIZE=${MBH_BATCH_MAX_SIZE:-8}
 # 30 until now, so it is pinned here for the run record.
 # MBH_RESPONSE_ORDER=30 on the launch line restores the old order.
 export MBH_RESPONSE_ORDER=${MBH_RESPONSE_ORDER:-8}
+# Window lattice decimation q (2026-10-02, OFF by default until the cluster
+# speed/accuracy run): the batched template is generated, responded and
+# WDM-transformed at q*dt on Nf/q layers (same 1-h pixels), ~q x less phentax +
+# response + transform per row. Laptop: q=2 mismatch <= 1.5e-9 vs q=1 at 6e5 and
+# 6e6 Msun; q=4 fails the lightest (ringdown above the 50 mHz coarse Nyquist).
+# The epoch snaps onto the q*dt lattice for BOTH generators (no stored coordinate
+# changes; a resume may switch q).
+export MBH_WINDOW_DECIMATE=${MBH_WINDOW_DECIMATE:-1}
 # MBH_CHECK_LL_EVERY is deliberately NOT exported: the batched move defaults
 # it to 10 (every 10th leaf visit re-scores the cold rung through the stock
 # 90 d generator; warns past MBH_CHECK_LL_TOL = 0.5 nats). For the FIRST
@@ -4692,10 +4700,19 @@ if got != want:
     sys.exit(2)
 dur = cfg["mbh_waveform_duration"]
 dur_txt = "full span" if dur is None else "%.1f d" % (float(dur) / 86400.0)
+q_want = int(os.environ["MBH_WINDOW_DECIMATE"])
+q_got = int(cfg.get("mbh_window_decimate", 1))
+if got[0] == "batched" and q_got != q_want:
+    print(f"[MBH-PREFLIGHT] REFUSING: exported MBH_WINDOW_DECIMATE={q_want} but the "
+          f"settings resolve {q_got} (an install that predates the knob ignores it).")
+    sys.exit(2)
+if q_got > 1 and 1440 % q_got:
+    print(f"[MBH-PREFLIGHT] REFUSING: MBH_WINDOW_DECIMATE={q_got} does not divide Nf=1440.")
+    sys.exit(2)
 print(f"[MBH-PREFLIGHT] mbh_pe scoring={got[0]} batch<={got[1]} "
       f"response_order={got[2]} waveform_duration={dur_txt} window "
       f"-{cfg['mbh_window_before'] / 86400.0:g}/+"
-      f"{cfg['mbh_window_after'] / 86400.0:g} d")
+      f"{cfg['mbh_window_after'] / 86400.0:g} d decimate={q_got}")
 PYEOF
 
 # EMRI MODE-SELECTION THRESHOLD (user ruling 2026-09-14). FEW's kwarg is
@@ -4746,23 +4763,29 @@ export EMRI_EPS=1e-3
 # Python reference path) on this run's active band, cropped to its time box and
 # scored against each walker's own residual AND PSD.
 # A harmonic that chirps off the table's fdot axis near a plunge hands off to
-# an even-start 128-layer TD chunk. In-model steps, eigen-table sweeps and the
-# inner-product record all score through it.
-# WHAT DOES NOT MOVE: the residual expose/fold, the engine residual rebuilds and
-# the cross-check stay on the production template (FEW + ResponseWrapper + dense
-# TD->WDM), so the shared residual every other branch sees is unchanged.
-# Accuracy vs production (docs/emri-direct-wdm.md): mismatch ~1e-4 (lookup
-# table) on inspirals, 1.3-2.5e-4 on in-window plunges at 5 s; 20 s grids alias
-# the high harmonics near plunge, this grid is 2.5 s. The cold-rung cross-check
+# even-start 128-layer chunks of the EXACT dense-kernel time series, tapered over
+# the last EMRI_DIRECT_PLUNGE_TAPER_S (300 s) before the stop. In-model steps,
+# eigen-table sweeps and the inner-product record all score through it.
+# TEMPLATE GENERATION follows: with direct, the engine's EMRI template generator
+# (SourceSignalGen: residual rebuilds at load, the move's expose/fold) is the
+# direct template too, so the residual every other branch sees holds exactly what
+# the sampler scores. Only the cold-rung cross-check and the (loud) fallback
+# stay on the production template (FEW + ResponseWrapper + dense TD->WDM).
+# Accuracy vs production (H100 speed tests, CD1L EMRI 1, foreground-weighted
+# noise, docs/emri-direct-wdm.md): mismatch 1.6e-5 at 6 months, 7e-6 at 12;
+# lnL against the mojito stream -1.308 vs production -1.305 (6 months, eps
+# 1e-3); an in-window plunge (720 d) 1.5e-5. The cold-rung cross-check
 # warns past a per-point tolerance EMRI_CHECK_LL_TOL + mm<h|h> + 3 sqrt(2 mm<h|h>)
 # (1 nat, mm = EMRI_CHECK_LL_MM = 3e-4: the template gap grows with SNR); every
 # 10th visit by default -- EMRI_CHECK_LL_EVERY=1 on the launch line for the first
 # segment.
-# DEFAULT: full (the per-row production path) until the dense kernel's GPU
-# timing beats production on this cluster: before the dense kernel the direct
-# template measured 157 ms/row batched vs production 94 ms at eps 1e-3 on an
-# H100 (the TDI response dominated). To run it:
-#     EMRI_LIKELIHOOD=direct NGPUS=4 ./submit_gf_6mo_v9_4gpu.sh
+# DEFAULT: direct (2026-10-03). H100, 6 months, eps 1e-3: 25 ms single and
+# 15 ms/row at 16 rows per call vs production 88 ms (eps 1e-5: 38 / 18 vs 94).
+# The library default is EMRI_LIKELIHOOD=auto, which resolves to direct on this
+# WDM / XYZ grid; this launcher pins direct so a blocker REFUSES the launch instead
+# of falling back to full with one INFO line.
+# The per-row production path for both scoring and template generation:
+#     EMRI_LIKELIHOOD=full NGPUS=4 ./submit_gf_6mo_v9_4gpu.sh
 # LOOKUP TABLE: EMRI_DIRECT_TABLE points to a specific table; unset (default) it is
 # the canonical file in this run's folder,
 #     ${STORE_DIR}/wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5
@@ -4770,9 +4793,11 @@ export EMRI_EPS=1e-3
 # on this node's GPU before mpiexec (lisatools.wdm_lookup_store), so a restart finds
 # it and never rebuilds; a found table is checked against the grid. To reuse a table
 # built elsewhere, copy it into ${STORE_DIR} or point EMRI_DIRECT_TABLE at it.
-# RESUME-SAFE: no stored shape changes; every leaf visit re-scores its
-# prev_logl, and the persisted EMRI eigen tables (built on the production
-# likelihood) are adopted until their next EMRI_EIGEN_REFRESH tick (MH-valid).
+# RESUME-SAFE: no stored shape changes; the load rebuilds the residual with the
+# active template generator, every leaf visit re-scores its prev_logl, and the
+# persisted EMRI eigen tables (built on the production likelihood) are adopted
+# until their next EMRI_EIGEN_REFRESH tick (MH-valid). Switching a store between
+# full and direct moves its EMRI lnL by ~mismatch x SNR^2 (~0.003 nat at SNR 14).
 # CPUs: with direct, EMRI_TRAJ_WORKERS spawn processes per compute rank integrate
 # a chunk's EMRI trajectories in parallel (few.trajectory.pool; only chunks of
 # >= EMRI_TRAJ_WORKERS rows -- the eigen sweeps -- since an in-model step here is
@@ -4784,7 +4809,7 @@ export EMRI_EPS=1e-3
 # trajectory pool: ... started (this process may run on N cores)", and the
 # warnings "direct-to-WDM fast path vs production container path disagree" and
 # "EXPOSE INVARIANT VIOLATED".
-export EMRI_LIKELIHOOD=${EMRI_LIKELIHOOD:-full}
+export EMRI_LIKELIHOOD=${EMRI_LIKELIHOOD:-direct}
 export EMRI_BATCH_MAX_SIZE=${EMRI_BATCH_MAX_SIZE:-8}
 export EMRI_DIRECT_TABLE=${EMRI_DIRECT_TABLE:-}
 export EMRI_DIRECT_RESPONSE=${EMRI_DIRECT_RESPONSE:-dense}
@@ -4920,19 +4945,17 @@ print(f"[EMRI-PREFLIGHT] emri_pe scoring=direct batch<={cfg['emri_batch_max_size
 PYEOF
 
 # ============================================================================
-# SOBBH LOOKUP SCORING (2026-10-02). SOBBH_LIKELIHOOD=lookup scores and fills
-# the SOBBH add/remove proposals (the existing SOBBHChunkedLikeMove; the comp
-# is a drop-in) with the direct-to-WDM n_ref lookup template
-# (docs/sobbh-wdm-lookup.md): one batched TDI-on-the-fly response per call on
-# a SPARSE 12-h grid splined to the pixel centres, the table evaluated at 5
-# layers per pixel. Cluster, one H100, production grid: 0.11 s per 8-row call
-# vs 1.70 s for the chunked comp (15x), 0.39 s at 288 rows (9.6x); accuracy
-# vs the dense transform mismatch 1e-7..1e-6, dlogL 1e-5..1e-3 (laptop gate).
-# To run it:
-#     SOBBH_LIKELIHOOD=lookup NGPUS=4 ./submit_gf_6mo_v9_4gpu.sh
-# SINGLE-DEVICE: the lookup comp lives on one GPU; the walker-block layout
-# (GPUS_PER_RANK unset = one device per compute rank) is fine, GPUS_PER_RANK>1
-# is refused (per-device replicas are a follow-up).
+# SOBBH LOOKUP SCORING (2026-10-02; the DEFAULT since 2026-10-03).
+# SOBBH_LIKELIHOOD=lookup scores and fills the SOBBH add/remove proposals (the
+# existing SOBBHChunkedLikeMove; the comp is a drop-in) with the direct-to-WDM
+# n_ref lookup template (docs/sobbh-wdm-lookup.md): one batched TDI-on-the-fly
+# response per call on a SPARSE 12-h grid, the fused sobbh_lookup kernel from
+# the response splines to <d|h>, <h|h>. Cluster, one H100, production grid,
+# foreground on: 0.031-0.117 s per call at 8-288 rows vs 1.7-14.9 s for the
+# chunked comp (36-176x); lookup vs production template <= 1.2e-6 on the
+# mojito SOBHB bricks. SOBBH_LIKELIHOOD=chunked restores the v8 path.
+# MULTI-GPU: one lookup comp per device behind SOBBHLookupRouter (built on
+# first use under each walker shard's device), so GPUS_PER_RANK>1 works too.
 # LOOKUP TABLE: SOBBH_LOOKUP_TABLE_PATH points to a specific table (any (Nf, dt)
 # with this run's 3600-s layer duration); unset (default) it is the canonical
 # file in this run's folder -- the SAME file EMRI_LIKELIHOOD=direct uses,
@@ -4946,7 +4969,7 @@ PYEOF
 # the Python lookup; =kernel refuses without it; =python forces the Python path.
 # WATCH: "[SOBBH_LOOKUP] lookup table ... (found|built|waited|explicit)" at
 # build, and the [SOBBH_LL_TIMING] leaf windows (ms/call should be ~100-400).
-export SOBBH_LIKELIHOOD=${SOBBH_LIKELIHOOD:-chunked}
+export SOBBH_LIKELIHOOD=${SOBBH_LIKELIHOOD:-lookup}
 export SOBBH_LOOKUP_TABLE_PATH=${SOBBH_LOOKUP_TABLE_PATH:-}
 export SOBBH_LOOKUP_EVAL_DT=${SOBBH_LOOKUP_EVAL_DT:-43200}
 export SOBBH_LOOKUP_ROW_BATCH=${SOBBH_LOOKUP_ROW_BATCH:-32}
@@ -4954,7 +4977,7 @@ export SOBBH_LOOKUP_KERNEL=${SOBBH_LOOKUP_KERNEL:-auto}
 #
 # SOBBH PREFLIGHT. An unknown env var is SILENTLY IGNORED, so resolve the knobs
 # through the real settings class; for lookup, refuse a lisatools without the
-# lookup comp, refuse GPUS_PER_RANK>1, and find -- or build and save -- the
+# lookup comp, and find -- or build and save -- the
 # lookup table (above). Refuses before mpiexec on any gap.
 python - <<'PYEOF' || exit 2
 import os
@@ -4988,12 +5011,6 @@ if sobbh.likelihood != "lookup":
 if "lookup" not in SOBBH_FAST_LIKELIHOODS:
     print(f"[SOBBH-PREFLIGHT] REFUSING: SOBBH_FAST_LIKELIHOODS={SOBBH_FAST_LIKELIHOODS}: the "
           "installed lisatools has no lookup comp.")
-    sys.exit(2)
-gpr = os.environ.get("GPUS_PER_RANK", "")
-if gpr and int(gpr) > 1:
-    print(f"[SOBBH-PREFLIGHT] REFUSING: SOBBH_LIKELIHOOD=lookup is single-device and "
-          f"GPUS_PER_RANK={gpr} > 1 (the stock getter refuses it at build). Launch with "
-          "GPUS_PER_RANK unset (one device per compute rank) or SOBBH_LIKELIHOOD=chunked.")
     sys.exit(2)
 import time
 from types import SimpleNamespace

@@ -516,6 +516,17 @@ class SourceMBHSettings(MBHSettings):
     window_margin_days: float = dataclasses.field(
         default_factory=env_default("MBH_WINDOW_MARGIN_DAYS", 1.0, float)
     )
+    # Batched window lattice decimation q (2026-10-02): the windowed template is
+    # generated, responded and WDM-transformed at q*dt on Nf/q layers -- the same
+    # layer_dt, so the same pixels -- for a ~q-fold cut of phentax + response +
+    # transform. The epoch snaps onto the q*dt lattice (both generators). Laptop
+    # check (2 days, layer 960 s, band 0.25-25 mHz; kept layers vs q=1): q=2
+    # mismatch <= 1.5e-9 at 6e5 and 6e6 Msun; q=4 4.7e-9 at 6e6 but 5.7e-5 with a
+    # 0.7 % norm loss at 6e5 Msun (its higher-mode ringdown passes the 50 mHz
+    # coarse Nyquist). 1 = the data lattice.
+    window_decimate: int = dataclasses.field(
+        default_factory=env_default("MBH_WINDOW_DECIMATE", 1, int)
+    )
     buffer_time: float = 15_000.0
     # phentax generation window (None -> full data span).
     waveform_duration: typing.Optional[float] = dataclasses.field(
@@ -543,22 +554,26 @@ class SourceMBHSettings(MBHSettings):
 
 @dataclasses.dataclass
 class SourceEMRISettings(EMRISettings):
-    """EMRI branch block. Templates (engine residuals, fills, cross-checks) are the
-    legacy ResponseWrapper path; the add/remove SCORING path is ``likelihood``."""
+    """EMRI branch block. ``likelihood`` picks the template family for BOTH the add/remove
+    scoring and the engine's templates (residual rebuilds, fills): the direct-to-WDM lookup
+    template by default (``auto`` on a WDM / XYZ run), the legacy ResponseWrapper path with
+    ``full``; the move's cross-check always uses the latter."""
 
     num_prop_repeats: int = dataclasses.field(
         default_factory=env_default("EMRI_NUM_PROP_REPEATS", 2, int)
     )
     ndim: int = 12
     response_order: int = 40
-    # Scoring path (2026-10-02): "full" (DEFAULT, the per-row production container
-    # path) or "direct" (EMRIDirectLikeMove: the direct-to-WDM template -- n_ref lookup
-    # table + dense-phase TDI-on-the-fly response + plunge chunk -- batched over
-    # batch_max_size rows, scored against each walker's own residual and PSD). The
-    # residual expose/fold and the cross-check stay on the production generator either
-    # way. resolve_emri_direct_cfg holds the consistency rules.
+    # Template path (2026-10-02; default auto since 10-03): "direct" (EMRIDirectLikeMove
+    # scoring + the engine templates: the direct-to-WDM template -- n_ref lookup table +
+    # dense-phase TDI-on-the-fly response + exact plunge chunk -- batched over
+    # batch_max_size rows, scored against each walker's own residual and PSD), "full" (the
+    # per-row production ResponseWrapper path for both), or "auto" (DEFAULT: direct
+    # unless the run cannot serve it -- a non-WDM or unidentifiable run domain, channels
+    # other than XYZ -- then full with one INFO line). resolve_emri_direct_cfg holds the
+    # rules; the cross-check stays on the production generator either way.
     likelihood: str = dataclasses.field(
-        default_factory=env_default("EMRI_LIKELIHOOD", "full", str)
+        default_factory=env_default("EMRI_LIKELIHOOD", "auto", str)
     )
     # Rows per direct generation: each row holds a full-grid (3, Nf, Nt) float64
     # accumulator while it is built (~150 MB at Nf 1440 x Nt 4320).
@@ -601,19 +616,21 @@ class SourceSOBBHSettings(SOBBHSettings):
     n_grid: int = 2048
     buffer_time: float = 5000.0
     response_order: int = 40
-    # Which likelihood scores the add/remove proposals: "chunked" (DEFAULT,
-    # A/B-gated 2026-07-30: identical cold-chain lnL, zero cross-check
-    # warnings at tol 0.5, ~4x wall even with the check every leaf) =
-    # SOBBHChunkedLikeMove over the chunked-heterodyne WDM kernel (one
-    # vectorized call per batch); "lookup" = SOBBHLookupComputations over a
-    # batched TDI-on-the-fly response + an n_ref WDM lookup table (see the
-    # lookup_* fields below); "full" = the exact full-TD container path
-    # (the escape hatch — required for FD/STFT domains, multi-shard, DCGA).
+    # Which likelihood scores the add/remove proposals: "lookup" (DEFAULT since
+    # 2026-10-03; docs/sobbh-wdm-lookup.md) = SOBBHLookupComputations (per-device
+    # replicas behind SOBBHLookupRouter) over a batched TDI-on-the-fly response
+    # on a sparse 12-h grid + an n_ref WDM lookup table, scored by the fused
+    # sobbh_lookup kernel (36-176x the chunked comp on one H100; lookup vs
+    # production template <= 1.2e-6 on the mojito bricks; see the lookup_*
+    # fields below); "chunked" = the chunked-heterodyne WDM kernel (the
+    # 2026-07-30 default); "full" = the exact full-TD container path (the
+    # escape hatch — required for FD/STFT domains, DCGA). All three drive the
+    # same SOBBHChunkedLikeMove except "full".
     # The residual expose/fold stays on the exact generator either way, and
     # the built-in fast-vs-slow cross-check stays on (thin it with
     # SOBBH_CHECK_LL_EVERY=10 in production; SOBBH_CHECK_LL=0 disables).
     likelihood: str = dataclasses.field(
-        default_factory=env_default("SOBBH_LIKELIHOOD", "chunked", str)
+        default_factory=env_default("SOBBH_LIKELIHOOD", "lookup", str)
     )
     # chunked-path knobs (see lisatools.chunked_het.WDMComputationsBase).
     # Nt_sub errs SMALL (short chunks): the per-chunk heterodyne collapses
@@ -1244,6 +1261,9 @@ def resolve_mbh_batched_cfg(mbh, *, domain_settings) -> dict:
     pad = float(mbh.window_pad_days) * 86400.0
     margin = float(mbh.window_margin_days) * 86400.0
     duration = mbh.waveform_duration
+    decimate = int(getattr(mbh, "window_decimate", 1))
+    if decimate < 1:
+        raise ValueError(f"MBH_WINDOW_DECIMATE must be >= 1; got {decimate}")
     if mode != "full":
         blockers = _mbh_batched_blockers(
             mbh, domain_settings, explicit_batched=(mode == "batched")
@@ -1293,6 +1313,8 @@ def resolve_mbh_batched_cfg(mbh, *, domain_settings) -> dict:
         mbh_window_pad=pad,
         mbh_window_margin=margin,
         mbh_waveform_duration=duration,
+        # the batched path only; 1 on the full path (nothing decimates there)
+        mbh_window_decimate=decimate if mode == "batched" else 1,
     )
 
 
@@ -1324,7 +1346,7 @@ def snap_waveform_t0_to_lattice(waveform_t0: float, data_t0: float, dt: float):
 
 
 #: ``EMRI_LIKELIHOOD`` values.
-EMRI_LIKELIHOOD_MODES = ("full", "direct")
+EMRI_LIKELIHOOD_MODES = ("full", "direct", "auto")
 #: ``EMRI_DIRECT_RESPONSE`` values (``EMRIDirectWDM(response=...)``).
 EMRI_DIRECT_RESPONSES = ("dense", "spline")
 
@@ -1338,8 +1360,12 @@ def resolve_emri_direct_cfg(emri, *, domain_settings, tdi_chan) -> dict:
     be WDM (an unidentifiable factory is taken at its word; the getter checks the BUILT
     domain), channels other than XYZ (the direct template is the X, Y, Z response), an
     unknown ``EMRI_DIRECT_RESPONSE``, ``EMRI_BATCH_MAX_SIZE < 1`` or
-    ``EMRI_TRAJ_WORKERS < 0``. The lookup table is not required to exist: the getter finds
-    it (``EMRI_DIRECT_TABLE`` or the run folder's canonical file) or builds and saves it.
+    ``EMRI_TRAJ_WORKERS < 0``. ``auto`` (the default) becomes ``direct`` unless one of
+    those reasons -- or an unidentifiable run domain -- applies, then ``full`` with ONE
+    INFO line naming them (as ``MBH_LIKELIHOOD=auto``). The returned ``emri_likelihood``
+    is the RESOLVED mode, never ``auto``. The lookup table is not required to exist: the
+    getter finds it (``EMRI_DIRECT_TABLE`` or the run folder's canonical file) or builds
+    and saves it.
     """
     from lisatools.domains import WDMSettings
 
@@ -1363,6 +1389,8 @@ def resolve_emri_direct_cfg(emri, *, domain_settings, tdi_chan) -> dict:
     cls = run_domain_settings_class(domain_settings)
     if cls is not None and not issubclass(cls, WDMSettings):
         blockers.append(f"the run domain is {cls.__name__}, not WDM")
+    if cls is None and mode == "auto":
+        blockers.append("the run domain is not identifiable as WDM")
     if str(tdi_chan).upper() != "XYZ":
         blockers.append(f"the run's channels are {tdi_chan!r}; the direct template is XYZ")
     if out["emri_direct_response"] not in EMRI_DIRECT_RESPONSES:
@@ -1374,11 +1402,16 @@ def resolve_emri_direct_cfg(emri, *, domain_settings, tdi_chan) -> dict:
         blockers.append(f"EMRI_BATCH_MAX_SIZE={out['emri_batch_max_size']} < 1")
     if out["emri_traj_workers"] < 0:
         blockers.append(f"EMRI_TRAJ_WORKERS={out['emri_traj_workers']} < 0")
+    if blockers and mode == "auto":
+        logger.info("EMRI_LIKELIHOOD=auto -> full: %s.", "; ".join(blockers))
+        out["emri_likelihood"] = "full"
+        return out
     if blockers:
         raise ValueError(
             "EMRI_LIKELIHOOD=direct cannot serve this run: " + "; ".join(blockers)
             + ". Fix it or use EMRI_LIKELIHOOD=full."
         )
+    out["emri_likelihood"] = "direct"
     return out
 
 
@@ -1663,9 +1696,12 @@ def get_mbh_phenom_gen(general_info, cfg):
         # move's cross-check) the SAME epoch, t_plunge shifted by the snap.
         # Measured (mojito id 17, SNR 1420, 2026-09-30): against the
         # UNSNAPPED stock the near-truth rows differ by up to 0.59 nats; the
-        # snapped stock agrees to 1.5e-3.
+        # snapped stock agrees to 1.5e-3. A decimated window snaps onto the
+        # q*dt lattice (a subset of the data lattice); the same q here keeps
+        # the two epochs identical.
         waveform_t0, snap = snap_waveform_t0_to_lattice(
-            waveform_t0, general_info.data_t0, general_info.dt
+            waveform_t0, general_info.data_t0,
+            general_info.dt * int(cfg.get("mbh_window_decimate", 1)),
         )
     gen = get_mbh_phenom_wave_gen(
         data_td_settings=general_info.data_td_settings,
@@ -1750,7 +1786,7 @@ def get_mbh_windowed_gen(general_info, cfg):
     ``t_plunge_snap`` and ``t0_abs = general_info.data_t0`` (the absolute time
     of WDM layer 0) for the move.
     """
-    from lisatools.domains import WDMSettings
+    from lisatools.domains import TDSettings, WDMSettings
     from lisatools.sources.batching import MBHWindowedWDMSignalGen
     from lisatools.sources.bbh.gridaligned import WindowedGridAlignedMBHWaveform
 
@@ -1762,13 +1798,15 @@ def get_mbh_windowed_gen(general_info, cfg):
     orbits = _device_local_orbits(base_orbits, xp, primary)
     wdm = _device_local_domain_settings(general_info.domain_settings, xp, primary)
     pk = cfg["mbh_phenom_kwargs"]
+    q = int(cfg.get("mbh_window_decimate", 1))
     # Device-local orbits/settings key the device; the cfg values that shape
     # the generator key the configuration (a cfg change must not be served a
     # stale generator).
     key = (
         "mbh_windowed", id(general_info), id(orbits), id(wdm), cfg["nchannels"],
-        cfg["mbh_waveform_t0"], tuple(sorted((k, tuple(v) if isinstance(v, (list, tuple)) else v)
-                                             for k, v in pk.items())),
+        cfg["mbh_waveform_t0"], q,
+        tuple(sorted((k, tuple(v) if isinstance(v, (list, tuple)) else v)
+                     for k, v in pk.items())),
     )
     if key in _WAVE_WRAP_CACHE:
         return _WAVE_WRAP_CACHE[key]
@@ -1777,13 +1815,29 @@ def get_mbh_windowed_gen(general_info, cfg):
             "MBH_LIKELIHOOD=batched needs a WDM run domain "
             f"(general.domain_settings is {type(wdm).__name__})."
         )
+    # MBH_WINDOW_DECIMATE = q: the windowed generator samples at q*dt (its own
+    # TD settings), its epoch snapped onto the q*dt lattice -- the stock
+    # generator (get_mbh_phenom_gen) snaps with the same q, so both share it.
+    lattice_dt = float(general_info.dt) * q
     t0_snapped, snap = snap_waveform_t0_to_lattice(
-        cfg["mbh_waveform_t0"], general_info.data_t0, general_info.dt
+        cfg["mbh_waveform_t0"], general_info.data_t0, lattice_dt
     )
     if snap != 0.0:
         logger.info(
             "[MBH_BATCH] waveform_t0 snapped onto the data lattice by %+.6f s "
             "(t_plunge rows are shifted by the same amount inside the move)", snap,
+        )
+    if q == 1:
+        gen_td = general_info.data_td_settings
+    else:
+        td = general_info.data_td_settings
+        if int(td.N) % q:
+            raise ValueError(f"MBH_WINDOW_DECIMATE={q} does not divide the data length N={td.N}")
+        gen_td = TDSettings(int(td.N) // q, lattice_dt, t0=float(td.t0),
+                            force_backend=general_info.force_backend)
+        logger.info(
+            "[MBH_BATCH] window lattice decimated %dx: generator, response and segment "
+            "transform at %.3g s on Nf/%d layers (MBH_WINDOW_DECIMATE)", q, lattice_dt, q,
         )
     gen = WindowedGridAlignedMBHWaveform(
         waveform_kwargs=dict(
@@ -1794,10 +1848,10 @@ def get_mbh_windowed_gen(general_info, cfg):
         start_freq=pk["start_freq"],
         use_reference_time=True,
         waveform_t0=t0_snapped,
-        data_td_settings=general_info.data_td_settings,
+        data_td_settings=gen_td,
         tdi_generation=cfg["tdi_gen_str"],
         tdi_channels=cfg["tdi_chan"],
-        sampling_frequency=1.0 / general_info.dt,
+        sampling_frequency=1.0 / lattice_dt,
         orbits=orbits,
         order=pk["response_order"],
         tukey_alpha=general_info.window_alpha,
@@ -1818,7 +1872,7 @@ def get_mbh_windowed_gen(general_info, cfg):
     # vgb setup), so that t0 depends on build order.
     adapter = MBHWindowedWDMSignalGen(
         gen, wdm, nchannels=cfg["nchannels"], tukey_alpha=general_info.window_alpha,
-        t0_abs=float(general_info.data_t0),
+        t0_abs=float(general_info.data_t0), decimate=q,
     )
     adapter.waveform_t0 = t0_snapped
     adapter.t_plunge_snap = snap
@@ -1879,6 +1933,15 @@ class SourceSignalGen:
         dev = current_device(xp)
         with device_context(xp, dev):
             if self.branch == "emri":
+                # direct mode: the ENGINE-side template generator is the direct-to-WDM
+                # template too, so residual rebuilds, the move's expose/fold and its
+                # scoring all use one template family (as SOBBH's chunked mode does); the
+                # move's cross-check and its fallback stay on the production wrap, which
+                # it carries as its own ``waveform_gen``.
+                if self.cfg.get("emri_likelihood", "full") == "direct":
+                    return get_emri_direct_gen(self.general_info, self.cfg)(
+                        *params_in, **kwargs
+                    )
                 return get_emri_wave_wrap(self.general_info, self.cfg)(
                     *params_in, **kwargs
                 )
@@ -2092,8 +2155,10 @@ def get_emri_direct_gen(general_info, cfg):
 
 def build_emri_move_runtime(curr, acs, priors, state, cfg):
     """EMRI PE move: :class:`~lisatools.globalfit.moves.EMRIDirectLikeMove` when
-    ``cfg["emri_likelihood"] == "direct"`` (scoring through the direct-to-WDM template,
-    fill and cross-check on the production wrap), else the stock per-row move."""
+    ``cfg["emri_likelihood"] == "direct"`` (scoring through the direct-to-WDM template; the
+    residual expose/fold through the containers' installed generator, which in that mode is
+    the direct template as well -- :class:`SourceSignalGen`; the cross-check and the fallback
+    on the production wrap), else the stock per-row move."""
     wave_gen = DeviceLocalWaveGen(get_emri_wave_wrap, curr.general_info, cfg)
     if cfg.get("emri_likelihood", "full") == "direct":
         direct = DeviceLocalWaveGen(get_emri_direct_gen, curr.general_info, cfg)
@@ -2252,13 +2317,9 @@ def get_sobbh_lookup_comp(general_info, cfg):
     from lisatools.domains import WDMLookupTable, WDMSettings
     from lisatools.sources.sobbh.wdm_direct import SOBBHLookupComputations
 
-    gpus = getattr(general_info, "gpus", None)
-    if gpus is not None and len(gpus) > 1:
-        raise ValueError(
-            "SOBBH_LIKELIHOOD=lookup is single-device: "
-            f"the run spans {len(gpus)} GPUs (multi-GPU walker shards route one shared comp "
-            "through every device). Use SOBBH_LIKELIHOOD=chunked, or run on one GPU."
-        )
+    # one comp per device (the cache key below carries the CURRENT device and
+    # _wrap_device_and_orbits hands device-local orbits / domain settings);
+    # multi-GPU walker shards reach the right one through SOBBHLookupRouter
     xp, dev, orbits, domain_settings = _wrap_device_and_orbits(general_info)
     key = ("sobbh_lookup", id(general_info), cfg["nchannels"], dev)
     if key in _WAVE_WRAP_CACHE:
@@ -2301,14 +2362,29 @@ def get_sobbh_lookup_comp(general_info, cfg):
     return comp
 
 
+def get_sobbh_lookup_router(general_info, cfg):
+    """The (cached) :class:`~lisatools.sources.sobbh.wdm_direct.SOBBHLookupRouter` over
+    :func:`get_sobbh_lookup_comp`: one lookup comp per device, each built on first use under
+    that device's context, every call sent to the current device's (multi-GPU walker shards)."""
+    from lisatools.sources.sobbh.wdm_direct import SOBBHLookupRouter
+
+    key = ("sobbh_lookup_router", id(general_info), cfg["nchannels"])
+    if key not in _WAVE_WRAP_CACHE:
+        _WAVE_WRAP_CACHE[key] = SOBBHLookupRouter(
+            lambda _dev: get_sobbh_lookup_comp(general_info, cfg),
+            general_info.force_backend,
+        )
+    return _WAVE_WRAP_CACHE[key]
+
+
 def get_sobbh_fast_comp(general_info, cfg):
     """The vectorized SOBBH comp ``cfg["sobbh_likelihood"]`` selects
-    (``"chunked"`` / ``"lookup"``)."""
+    (``"lookup"``, the default: the per-device router; ``"chunked"``)."""
     kind = cfg.get("sobbh_likelihood", "full")
     if kind == "chunked":
         return get_sobbh_chunked_comp(general_info, cfg)
     if kind == "lookup":
-        return get_sobbh_lookup_comp(general_info, cfg)
+        return get_sobbh_lookup_router(general_info, cfg)
     raise ValueError(f"no vectorized SOBBH comp for sobbh_likelihood={kind!r} "
                      f"(expected one of {SOBBH_FAST_LIKELIHOODS})")
 
@@ -2436,11 +2512,13 @@ def build_source_moves(curr, acs, priors, state, cfg) -> dict:
     ``ResidualAddOneRemoveOneMove`` path).
     ``sobbh_pe`` uses the batched chunked-heterodyne kernel.
 
-    ``emri_pe`` (``cfg["emri_likelihood"]``): ``full`` (default) scores per row
-    through the production container path (~1040 ms/row on the 6-mo probe, job 373);
-    ``direct`` builds :class:`~lisatools.globalfit.moves.EMRIDirectLikeMove`, which
-    scores chunks of rows through the direct-to-WDM template (one FEW call per row,
-    one response launch per chunk); the expose/fold stays on the production path.
+    ``emri_pe`` (``cfg["emri_likelihood"]``, the RESOLVED mode: ``auto`` -- the default --
+    is ``direct`` on a WDM / XYZ run): ``direct`` builds
+    :class:`~lisatools.globalfit.moves.EMRIDirectLikeMove`, which scores chunks of rows
+    through the direct-to-WDM template (one FEW call per row, one response launch per
+    chunk; the expose/fold through the installed generator, the direct template too);
+    ``full`` scores per row through the production container path (~1040 ms/row on the
+    6-mo probe, job 373).
     """
     stock_moves = {}
     if "mbh" in curr.source_info:

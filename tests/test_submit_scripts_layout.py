@@ -797,7 +797,8 @@ class SixMonthMBHBatchedTest(unittest.TestCase):
         src = open(SIX_MO_V9).read()
         for knob, default in (("MBH_LIKELIHOOD", "batched"),
                               ("MBH_BATCH_MAX_SIZE", "8"),
-                              ("MBH_RESPONSE_ORDER", "8")):
+                              ("MBH_RESPONSE_ORDER", "8"),
+                              ("MBH_WINDOW_DECIMATE", "1")):
             self.assertRegex(
                 src, rf"(?m)^export {knob}=\$\{{{knob}:-{default}\}}$", knob)
 
@@ -822,7 +823,8 @@ class SixMonthMBHBatchedTest(unittest.TestCase):
 
         code = compile(_mbh_preflight_source(SIX_MO_V9), "mbh_preflight", "exec")
         base = {k: self.v9[k] for k in
-                ("MBH_LIKELIHOOD", "MBH_BATCH_MAX_SIZE", "MBH_RESPONSE_ORDER")}
+                ("MBH_LIKELIHOOD", "MBH_BATCH_MAX_SIZE", "MBH_RESPONSE_ORDER",
+                 "MBH_WINDOW_DECIMATE")}
         base.update(env)
         out = io.StringIO()
         with mock.patch.dict(os.environ, base):
@@ -841,6 +843,17 @@ class SixMonthMBHBatchedTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("mbh_pe scoring=batched batch<=8 response_order=8", out)
         self.assertIn("waveform_duration=90.0 d", out)
+        self.assertIn("decimate=1", out)
+
+    def test_the_preflight_resolves_and_bounds_the_window_decimation(self):
+        """MBH_WINDOW_DECIMATE on the launch line reaches the settings (printed);
+        a q that does not divide Nf=1440 is refused before the allocation."""
+        rc, out = self._run_preflight(MBH_WINDOW_DECIMATE="2")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("decimate=2", out)
+        rc, out = self._run_preflight(MBH_WINDOW_DECIMATE="7")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("does not divide Nf=1440", out)
 
     def test_the_preflight_refuses_what_the_build_would_refuse(self):
         for env in ({"MBH_WAVEFORM_DURATION": "2592000"},
@@ -921,13 +934,14 @@ def _emri_preflight_source(path):
 
 
 class SixMonthEMRIDirectTest(unittest.TestCase):
-    """V9-26 (2026-10-02): emri_pe CAN score through the direct-to-WDM template.
+    """V9-26 (2026-10-02) / V9-27 (2026-10-03): emri_pe scores through the direct-to-WDM
+    template BY DEFAULT.
 
-    ``EMRI_LIKELIHOOD=direct`` makes ``build_emri_move_runtime`` build
-    ``EMRIDirectLikeMove`` on every compute rank. The launcher default stays
-    ``full`` until the dense kernel's GPU timing beats production; the knobs,
-    the CPU reservation for the trajectory pool and the preflight are wired so
-    the switch is one launch-line variable."""
+    ``EMRI_LIKELIHOOD=direct`` (the launcher default since the H100 speed tests: 25 ms
+    single, 15 ms/row batched vs production 88 at 6 months) makes
+    ``build_emri_move_runtime`` build ``EMRIDirectLikeMove`` on every compute rank and the
+    engine's EMRI template generator the direct template too; ``EMRI_LIKELIHOOD=full`` on
+    the launch line restores the per-row production path for both."""
 
     _KNOBS = ("EMRI_LIKELIHOOD", "EMRI_BATCH_MAX_SIZE", "EMRI_DIRECT_TABLE",
               "EMRI_DIRECT_RESPONSE", "EMRI_TRAJ_WORKERS", "EMRI_DIRECT_LOOKUP")
@@ -936,7 +950,7 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
         self.v9 = _exports(SIX_MO_V9)
 
     def test_defaults(self):
-        self.assertEqual(self.v9["EMRI_LIKELIHOOD"], "full")
+        self.assertEqual(self.v9["EMRI_LIKELIHOOD"], "direct")
         self.assertEqual(self.v9["EMRI_BATCH_MAX_SIZE"], "8")
         self.assertEqual(self.v9["EMRI_DIRECT_RESPONSE"], "dense")
         self.assertEqual(self.v9["EMRI_TRAJ_WORKERS"], "4")
@@ -983,7 +997,8 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
         # the extra cores feed ONLY the trajectory pool: ranks stay single-threaded
         # (MPI-only policy), and the pool's spawned workers inherit OMP_NUM_THREADS=1
         self.assertEqual(self.v9["OMP_NUM_THREADS"], "1")
-        self.assertIn("--cpus-per-task=2", self._dispatch())
+        self.assertIn("--cpus-per-task=6", self._dispatch())                  # direct: the default
+        self.assertIn("--cpus-per-task=2", self._dispatch(EMRI_LIKELIHOOD="full"))
         self.assertIn("--cpus-per-task=6", self._dispatch(EMRI_LIKELIHOOD="direct"))
         self.assertIn("--cpus-per-task=9",
                       self._dispatch(EMRI_LIKELIHOOD="direct", EMRI_TRAJ_WORKERS="7"))
@@ -1045,6 +1060,9 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
     def test_the_shipped_block_passes_its_own_preflight(self):
         rc, out = self._run_preflight()
         self.assertEqual(rc, 0, out)
+        self.assertIn("emri_pe scoring=direct", out)
+        rc, out = self._run_preflight(EMRI_LIKELIHOOD="full")
+        self.assertEqual(rc, 0, out)
         self.assertIn("emri_pe scoring=full", out)
 
     def test_direct_passes_with_a_matching_table_and_a_passing_gpu_parity(self):
@@ -1067,7 +1085,7 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
         self.assertIn("lookup table /shared/tables/mine.h5: built", out)
 
     def test_full_never_touches_the_table(self):
-        rc, out = self._run_preflight()
+        rc, out = self._run_preflight(EMRI_LIKELIHOOD="full")
         self.assertEqual(rc, 0, out)
         self.assertEqual(self.ensured, [])
 
@@ -1111,8 +1129,8 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
             rc, out = self._run_preflight(EMRI_LIKELIHOOD="direct")
             self.assertEqual(rc, 2, out)
             self.assertIn("SILENTLY IGNORED", out)
-            # the default full path is the old install's own path: no refusal
-            rc, out = self._run_preflight()
+            # full is the old install's own path: no refusal
+            rc, out = self._run_preflight(EMRI_LIKELIHOOD="full")
             self.assertEqual(rc, 0, out)
             self.assertIn("predates EMRI_LIKELIHOOD", out)
 
@@ -1241,15 +1259,16 @@ class V9RankLayoutTest(unittest.TestCase):
 
 
 class SixMonthSOBBHLookupTest(unittest.TestCase):
-    """The 6mo v9 SOBBH lookup block: ``SOBBH_LIKELIHOOD=lookup`` swaps the comp inside the
-    existing SOBBH add/remove move (docs/sobbh-wdm-lookup.md); default chunked = the v8 path."""
+    """The 6mo v9 SOBBH lookup block: ``SOBBH_LIKELIHOOD=lookup`` (the default) puts the lookup
+    comp inside the existing SOBBH add/remove move (docs/sobbh-wdm-lookup.md); chunked = the v8
+    path."""
 
     def setUp(self):
         self.v9 = _exports(SIX_MO_V9)
         self.text = open(SIX_MO_V9).read()
 
     def test_the_block_defaults(self):
-        self.assertEqual(self.v9["SOBBH_LIKELIHOOD"], "chunked")
+        self.assertEqual(self.v9["SOBBH_LIKELIHOOD"], "lookup")  # the default (2026-10-03)
         self.assertEqual(self.v9["SOBBH_LOOKUP_TABLE_PATH"], "")   # the run folder's table
         self.assertEqual(self.v9["SOBBH_LOOKUP_EVAL_DT"], "43200")  # the sparse 12-h response
         self.assertEqual(self.v9["SOBBH_LOOKUP_ROW_BATCH"], "32")
@@ -1258,7 +1277,6 @@ class SixMonthSOBBHLookupTest(unittest.TestCase):
     def test_the_preflight_guards(self):
         for needle in (
             "resolve_sobbh_lookup_table",          # find or build the table before mpiexec
-            "GPUS_PER_RANK",                        # the comp is single-device
             "SOBBH_LOOKUP_KERNEL=kernel but",      # a missing compiled kernel is refused
             "the settings resolve",                 # a silently ignored knob is refused
         ):

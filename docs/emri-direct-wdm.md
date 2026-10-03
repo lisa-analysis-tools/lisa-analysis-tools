@@ -244,7 +244,7 @@ weights it enormously. Now:
 Laptop check (dt 20, 30 days around the plunge): direct SNR 18.36 vs data 18.25 (instrument),
 mismatch to the data 4.2e-3 (eps 1e-3 mode content), 3-25 mHz bands unchanged.
 
-## In the global fit: `EMRI_LIKELIHOOD=direct` (10-02)
+## In the global fit: `EMRI_LIKELIHOOD=direct` (10-02; the 6-month launcher default and, through `auto`, the library default since 10-03)
 
 `emri_pe` becomes `EMRIDirectLikeMove` (`globalfit/moves/emridirectmove.py`), built by
 `build_emri_move_runtime` (`stock/erebor/source_runtime.py`) through `EMRIDirectMoveBuilder`
@@ -257,9 +257,12 @@ choreography is untouched, only the scoring changes.
   run's FULL wavelet grid and cropped to its active box. Rows are scored against their own walker's
   residual and PSD, `offset + <r|h> - 1/2 <h|h>` with `offset = acs.likelihood()` on the exposed
   residual; one batched inner-product pair per walker, one host pull per chunk.
-* **Fill stays production.** Expose/fold, engine residual rebuilds and the cross-check use the
-  production wrap (FEW + ResponseWrapper + dense TD->WDM). Filling with the direct template would
-  leave `h_direct - h_production` of every visited state in the shared residual.
+* **Template generation follows (10-03).** In direct mode the engine's EMRI template generator
+  (`SourceSignalGen`: residual rebuilds at load, the move's expose/fold through the containers'
+  installed generator) is the direct template too, so fills, rebuilds and scoring use one template
+  family and the shared residual holds exactly what the sampler scored. Only the cross-check and
+  the fallback use the production wrap (FEW + ResponseWrapper + dense TD->WDM), which the move
+  carries as its own `waveform_gen`. (Until 10-03 the fill stayed on production.)
 * **Checks with a tolerance** (cold rung only): the fast-vs-production cross-check (every 10th
   visit, `EMRI_CHECK_LL_EVERY`) and the expose invariant. Per point the tolerance is
   `EMRI_CHECK_LL_TOL + mm <h|h> + 3 sqrt(2 mm <h|h>)` (1 nat, `mm = EMRI_CHECK_LL_MM` = 3e-4):
@@ -269,7 +272,8 @@ choreography is untouched, only the scoring changes.
   exact zero template, no response call.
 * **Failures.** A FEW domain refusal scores that row `-1e300` (as on the container path); any other
   failure of a direct chunk (GPU OOM, a missing kernel, a table error) scores the chunk through the
-  production container path, warned once per leaf, counted in `n_batch_fallbacks` and the
+  container path with the production generator (not the installed one, which is the direct
+  template), warned once per leaf, counted in `n_batch_fallbacks` and the
   `[EMRI_DIRECT]` telemetry.
 * **Getter** `get_emri_direct_gen`: per device, reuses the FEW generator inside that device's
   production wrap (one FEW construction per device), its orbits, the REF epoch (mojito) and the
@@ -284,24 +288,45 @@ choreography is untouched, only the scoring changes.
   launcher) wait for the one builder. A restart finds the file. The 6-month launcher's preflight
   runs it on the node's GPU before mpiexec, so ranks never build.
 * **Resolver** `resolve_emri_direct_cfg`: `direct` needs a WDM domain, XYZ channels, a known
-  response, batch >= 1, workers >= 0 (the table need not exist yet).
+  response, batch >= 1, workers >= 0 (the table need not exist yet) and raises otherwise.
+  `auto` (the `SourceEMRISettings.likelihood` default since 10-03, as `MBH_LIKELIHOOD=auto`)
+  resolves to `direct` when those hold, else to `full` with ONE INFO line naming the reasons (a
+  run domain that cannot be identified as WDM counts as a reason for `auto`); the cfg carries the
+  resolved mode only. Every stock EMRI run on a WDM / XYZ grid therefore uses the lookup template
+  for scoring and template generation unless `EMRI_LIKELIHOOD=full`.
 * **Trajectory pool** (`EMRI_TRAJ_WORKERS`, 0 in the library): spawn workers integrate a chunk's
   trajectories (`few.trajectory.pool`, FEW gpu_backend >= 68bcda54) for chunks of at least that many
   rows (eigen sweeps). Workers start eagerly with `__main__.__file__` hidden, or each spawned child
   would re-import `run_combined_staged.py` (and MPI); a warm-up that did not start every worker is
   refused. Any pool failure disables it for the run. Counters (rows, trajectories computed, cache
   hits/misses) are logged as `[EMRI_DIRECT] trajectory pool:` every 50 pooled batches.
-* **Launcher** (`submit_gf_6mo_v9_4gpu.sh`, EMRI block after `EMRI_EPS`): default `full`; the
+* **Launcher** (`submit_gf_6mo_v9_4gpu.sh`, EMRI block after `EMRI_EPS`): default `direct` since
+  10-03 (`EMRI_LIKELIHOOD=full` restores production for scoring and template generation); the
   `# EMRI PREFLIGHT.` heredoc resolves the knobs through the settings class and, for direct, checks
-  `EDGE_CROP_WAVELETS >= pixel_edge` (8), runs `tests.test_tdi_dense.TDDenseGPUParityTest` on the
-  node's GPU (a skip refuses) and finds or builds the lookup table. The self-dispatch
+  `EDGE_CROP_WAVELETS >= pixel_edge` (8), runs `tests.test_tdi_dense.TDDenseGPUParityTest` and
+  (`EMRI_DIRECT_LOOKUP=kernel`) the fused kernel's GPU-vs-CPU test on the node's GPU (a skip
+  refuses) and finds or builds the lookup table. The self-dispatch
   passes `--cpus-per-task = 2 + EMRI_TRAJ_WORKERS` (4) when direct; `OMP_NUM_THREADS` stays 1.
 
 | check (laptop CPU, CD1L EMRI 1, 16 d, dt 20 s, dense, real getters + real move) | result |
 |---|---|
 | direct vs production template at truth | mismatch 2.4e-8, amplitude ratio 1.000000 |
 | move lnL, direct vs production container path, 6 rows | max \|dlogL\| 1.8e-6 |
+| `--fill direct` (10-03, the fit's setup): direct batched vs the per-row container path / vs production check | 9.3e-10 / 1.1e-6 |
 | wall per row | direct 0.73 s, production 1.38 s; 0 fallbacks |
+
+H100 speed tests (`scripts/emri/emri_speed_durations.sh`, CD1L EMRI 1, L1 orbits, scored against the
+mojito stream under scirdv1 + the fitted galactic foreground at each Tobs; sparse grid, fused kernel):
+
+| window | eps | ms/template single / 16 per call | production ms | mm vs production | lnL vs data: direct / production |
+|---|---|---|---|---|---|
+| 180 d | 1e-3 | 25 / 15 | 88 | 1.6e-5 | -1.308 / -1.305 |
+| 180 d | 1e-5 | 38 / 18 | 94 | 1.7e-5 | -0.020 / -0.017 |
+| 360 d | 1e-3 | 32 / 21 | 163 | 7.2e-6 | -2.892 / -2.886 |
+| 360 d | 1e-5 | 45 / 24 | 175 | 7.3e-6 | -0.050 / -0.043 |
+| 720 d (plunge at 518 d) | 1e-3 | 551 / 630 | 398 | 1.5e-5 | -5.557 / -5.522 |
+
+At 720 d every row hands off to the plunge chunk and is built alone (open item: the tail).
 
 Cluster check on the 6-month grid: `scripts/emri/emri_direct_fit_wiring_check.py --backend cuda12x
 --days 180 --table-dir <dir holding or receiving the table> --rows 8`.

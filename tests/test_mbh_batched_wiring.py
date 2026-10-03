@@ -79,7 +79,7 @@ def _mbh(**kw):
 
     with mock.patch.dict(os.environ, {}, clear=False):
         for k in ("MBH_WAVEFORM_DURATION", "MBH_LIKELIHOOD", "USE_TDIONFLY",
-                  "MBH_BATCH_MAX_SIZE"):
+                  "MBH_BATCH_MAX_SIZE", "MBH_WINDOW_DECIMATE"):
             os.environ.pop(k, None)
         s = SourceMBHSettings()
     for k, v in kw.items():
@@ -128,6 +128,21 @@ class ResolveBatchedCfgTest(_NoDurationEnv, unittest.TestCase):
         self.assertEqual(cfg["mbh_window_pad"], 4 * 86400.0)
         self.assertEqual(cfg["mbh_window_margin"], 86400.0)
         self.assertEqual(cfg["mbh_batch_max_size"], 8)
+        self.assertEqual(cfg["mbh_window_decimate"], 1)
+
+    def test_window_decimate_reaches_the_batched_cfg_only(self):
+        """MBH_WINDOW_DECIMATE (``window_decimate``) rides the batched cfg; the full
+        path has nothing to decimate (1); q < 1 is refused."""
+        cfg = self._resolve(self._mbh(likelihood="batched", window_decimate=2))
+        self.assertEqual(cfg["mbh_window_decimate"], 2)
+        cfg = self._resolve(self._mbh(likelihood="full", window_decimate=2))
+        self.assertEqual(cfg["mbh_window_decimate"], 1)
+        with self.assertRaisesRegex(ValueError, "MBH_WINDOW_DECIMATE"):
+            self._resolve(self._mbh(likelihood="batched", window_decimate=0))
+        with mock.patch.dict(os.environ, {"MBH_WINDOW_DECIMATE": "4"}):
+            from lisatools.globalfit.stock.erebor.source_runtime import SourceMBHSettings
+
+            self.assertEqual(SourceMBHSettings().window_decimate, 4)
 
     def test_domain_spec_is_required(self):
         # every site must say which domain it resolves for (injections and
@@ -621,6 +636,36 @@ class WindowedGetterTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             sr.get_mbh_windowed_gen(self._gi(object()), self._cfg())
 
+    def test_decimated_window_runs_the_generator_on_the_coarse_lattice(self):
+        """MBH_WINDOW_DECIMATE=2: the windowed generator gets TD settings at 2 dt
+        (N / 2 samples from the data start), the response's sampling frequency
+        1 / (2 dt), the epoch snapped onto the 5-s lattice, and the adapter q."""
+        from types import SimpleNamespace
+
+        from lisatools.domains import WDMSettings
+        from lisatools.globalfit.stock.erebor import source_runtime as sr
+
+        wdm = mock.MagicMock(spec=WDMSettings)
+        gi = self._gi(wdm)
+        gi.data_td_settings = SimpleNamespace(N=1440 * 4320, dt=2.5, t0=97729089.0)
+        cfg = self._cfg()
+        cfg["mbh_window_decimate"] = 2
+        with mock.patch("lisatools.sources.bbh.gridaligned.WindowedGridAlignedMBHWaveform") as W, \
+                mock.patch("lisatools.sources.batching.MBHWindowedWDMSignalGen") as A:
+            A.side_effect = lambda gen, *a, **k: mock.MagicMock(spec=["wave_gen"], wave_gen=gen)
+            adapter = sr.get_mbh_windowed_gen(gi, cfg)
+            q1 = sr.get_mbh_windowed_gen(gi, self._cfg())
+        self.assertIsNot(q1, adapter)        # q keys the cache
+        kw = W.call_args_list[0].kwargs
+        td = kw["data_td_settings"]
+        self.assertEqual((td.N, td.dt, td.t0), (1440 * 4320 // 2, 5.0, 97729089.0))
+        self.assertEqual(kw["sampling_frequency"], 0.2)
+        # offset 1.5 s = 0.3 coarse samples -> k = 0: snapped ONTO the data start
+        self.assertAlmostEqual(kw["waveform_t0"], 97729089.0, places=6)
+        self.assertAlmostEqual(adapter.t_plunge_snap, -1.5, places=6)
+        self.assertEqual(A.call_args_list[0].kwargs["decimate"], 2)
+        self.assertEqual(A.call_args_list[1].kwargs["decimate"], 1)
+
 
 class SnappedStockGenTest(unittest.TestCase):
     """MBH_LIKELIHOOD=batched: the STOCK generator (engine residual rebuilds
@@ -643,7 +688,7 @@ class SnappedStockGenTest(unittest.TestCase):
         _drop()
         self.addCleanup(_drop)
 
-    def _call(self, mode):
+    def _call(self, mode, decimate=None):
         from lisatools.globalfit.stock.erebor import source_runtime as sr
 
         class _Gen:
@@ -670,6 +715,8 @@ class SnappedStockGenTest(unittest.TestCase):
 
         cfg = self.CFG()
         cfg["mbh_likelihood"] = mode
+        if decimate is not None:
+            cfg["mbh_window_decimate"] = decimate
         gi = self.GI(object())
         gi.Tobs = 120 * 86400.0
         with mock.patch.object(sr, "get_mbh_phenom_wave_gen", side_effect=fake_getter):
@@ -696,6 +743,14 @@ class SnappedStockGenTest(unittest.TestCase):
         self.assertAlmostEqual(t0_built + args[10], 97729090.5 + row[10], places=6)
         gen.compute_tdi_channels(*row[:8], ra=1.0, dec=0.2, merger_time=np.array([5.0, 6.0]))
         np.testing.assert_array_equal(inner.seen[-1][2]["merger_time"], [4.0, 5.0])
+
+    def test_decimated_window_snaps_the_stock_onto_the_same_coarse_lattice(self):
+        """The stock generator (residual rebuild + cross-check) must share the
+        windowed one's epoch: with MBH_WINDOW_DECIMATE=2 both snap on 2 dt."""
+        gen, _, built = self._call("batched", decimate=2)
+        (t0_built,) = built
+        self.assertAlmostEqual(t0_built, 97729089.0, places=6)
+        self.assertAlmostEqual(gen.t_plunge_snap, -1.5, places=9)
 
     def test_full_path_keeps_the_unsnapped_stock(self):
         gen, _, built = self._call("full")

@@ -308,6 +308,20 @@ class SlowWaveformEquivalenceTest(unittest.TestCase):
             offset_int=0,
         )
         out = wrap(*params_in)
+        if cfg["emri_likelihood"] == "direct":
+            # 2026-10-03: the default EMRI_LIKELIHOOD=auto resolves to the
+            # direct-to-WDM lookup template on this WDM / XYZ run, so the branch
+            # signal_gen is no longer the production wrap. The aligned class must
+            # still equal the production wrap (the move's cross-check), and the
+            # branch template must match it at the direct template's accuracy.
+            from lisatools.globalfit.stock.erebor.source_runtime import get_emri_wave_wrap
+
+            self._assert_equiv(get_emri_wave_wrap(gi, cfg)(*params_in), out, "emri")
+            a, b = self._arr(ref), self._arr(out)
+            mm = 1.0 - float(np.sum(a * b) / np.sqrt(np.sum(a * a) * np.sum(b * b)))
+            print(f"[emri direct] mm vs production = {mm:.3e}")
+            self.assertLess(mm, 1e-4, f"emri direct: mm {mm:.3e} vs production")
+            return
         self._assert_equiv(ref, out, "emri")
 
     def test_sobbh_equivalence(self):

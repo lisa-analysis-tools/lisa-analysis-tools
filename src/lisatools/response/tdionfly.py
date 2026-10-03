@@ -1080,12 +1080,26 @@ class TDDenseTDIonTheFly(TDIonTheFly):
                                         self.sub_offsets, N, 4, nch)
         return chans, amp, phase, phi_ref
 
-    def channels(self, params):
-        """The raw complex TDI channels ``(num_sub, nch, N)`` at the evaluation times: the exact
-        channel of each harmonic is their real part (no amplitude/phase representation, so a
-        signal that stops -- an in-window plunge -- keeps the TDI combination's own structure)."""
-        chans = self._run(params)[0]
-        return chans.reshape(self.num_sub, self.tdi_config.nchannels, self.N)
+    def channels(self, params, sum_subs=False):
+        """The raw complex TDI channels at the evaluation times, ``(num_sub, nch, N)`` or, with
+        ``sum_subs``, summed over each template's harmonics ``(n_temp, nch, N)``: the exact
+        channel is the real part (no amplitude/phase representation, so a signal that stops --
+        an in-window plunge -- keeps the TDI combination's own structure). Runs the channel
+        kernel only (no amplitude/phase extraction) on a module with ``run_channels_wrap``."""
+        xp = self.xp
+        nch = self.tdi_config.nchannels
+        if not hasattr(self.wave_gen, "run_channels_wrap"):          # an older module
+            chans = self._run(params)[0].reshape(self.num_sub, nch, self.N)
+            if not sum_subs:
+                return chans
+            return xp.stack([chans[int(a):int(b)].sum(axis=0) for a, b in
+                             zip(self.sub_offsets[:-1].tolist(), self.sub_offsets[1:].tolist())])
+        params = xp.ascontiguousarray(xp.asarray(params, dtype=xp.float64).reshape(self.n_temp, 4))
+        rows = self.n_temp if sum_subs else self.num_sub
+        chans = xp.zeros(rows * nch * self.N, dtype=complex)
+        self.wave_gen.run_channels_wrap(chans, params.ravel(), self.t.ravel(), self.sub_offsets,
+                                        self.N, 4, nch, int(bool(sum_subs)))
+        return chans.reshape(rows, nch, self.N)
 
     def __call__(self, params, return_spline: bool = True) -> "TDTDIOutput":
         """``params``: (n_temp, 4) = (inc, psi, lam, beta) per template."""

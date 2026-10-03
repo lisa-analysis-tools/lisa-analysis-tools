@@ -1099,7 +1099,7 @@ class SOBBHLookupComputations:
             raise RuntimeError(
                 f"SOBBHLookupComputations was built on device {self._build_device} but is being "
                 f"called on device {dev}: the lookup comp is single-device (per-device replicas "
-                "are a follow-up; use SOBBH_LIKELIHOOD=chunked for multi-GPU walker shards)"
+                "come from SOBBHLookupRouter, which the stock getter returns)"
             )
         self._note_band(m_band_half_width)
         holder = as_single_shard_holder(wdm_holder)
@@ -1290,7 +1290,7 @@ class SOBBHLookupComputations:
             raise RuntimeError(
                 f"SOBBHLookupComputations was built on device {self._build_device} but is being "
                 f"called on device {dev}: the lookup comp is single-device (per-device replicas "
-                "are a follow-up; use SOBBH_LIKELIHOOD=chunked for multi-GPU walker shards)"
+                "come from SOBBHLookupRouter, which the stock getter returns)"
             )
         self._note_band(m_band_half_width)
         if band_slab_Nf is not None or slab_min_f is not None:
@@ -1351,8 +1351,80 @@ class SOBBHLookupComputations:
             )
 
 
+class SOBBHLookupRouter:
+    """Per-device replicas of :class:`SOBBHLookupComputations` behind ONE comp object.
+
+    The SOBBH add/remove move drives a single comp under each walker shard's device context
+    (multi-GPU walker shards); a lookup comp holds device arrays (the table coefficients, the
+    orbits) and refuses calls off its build device. This router builds one replica per device on
+    first use there -- ``build(device)`` is called under that device's context (the stock builder
+    keys its cache on the current device and uses device-local orbits / domain settings) -- and
+    sends every ``get_ll_wdm`` / ``fill_global_wdm`` to the replica of the CURRENT device. The
+    per-call stashes (``d_h_out``, ``h_h_out``, ``last_call_spans``, ``last_stats``) and every other
+    attribute (``wdm_settings``, ``d_d``, ``xp``, ...) read from the replica of the last call (the
+    primary before any call). The primary replica is built at construction.
+    """
+
+    _OWN = ("_build", "_backend_name", "_replicas", "_last", "_primary")
+
+    def __init__(self, build, force_backend):
+        self._build = build
+        self._backend_name = concrete_backend_name(force_backend)
+        self._replicas = {}
+        self._last = None
+        self._primary = self._for_current_device()
+
+    @property
+    def backend(self):
+        import lisatools
+
+        return lisatools.get_backend(self._backend_name)
+
+    @property
+    def xp(self):
+        return self.backend.xp
+
+    @property
+    def primary(self):
+        return self._primary
+
+    @property
+    def replicas(self):
+        """``{device: comp}`` built so far (``None`` = CPU / single device)."""
+        return dict(self._replicas)
+
+    def _for_current_device(self):
+        dev = current_device(self.xp)
+        comp = self._replicas.get(dev)
+        if comp is None:
+            comp = self._replicas[dev] = self._build(dev)
+        return comp
+
+    def get_ll_wdm(self, *args, **kwargs):
+        comp = self._for_current_device()
+        self._last = comp
+        return comp.get_ll_wdm(*args, **kwargs)
+
+    def fill_global_wdm(self, *args, **kwargs):
+        comp = self._for_current_device()
+        self._last = comp
+        return comp.fill_global_wdm(*args, **kwargs)
+
+    def __getattr__(self, name):
+        # only reached for names not on the router itself; guard dunder / pre-__init__ probing
+        # (copy / pickle look up __deepcopy__, __setstate__, ... on a bare instance)
+        if name.startswith("__") or name in SOBBHLookupRouter._OWN:
+            raise AttributeError(name)
+        d = self.__dict__
+        target = d.get("_last") or d.get("_primary")
+        if target is None:
+            raise AttributeError(name)
+        return getattr(target, name)
+
+
 __all__ = [
     "concrete_backend_name",
+    "SOBBHLookupRouter",
     "SOBBHBatchedTOF",
     "SOBBHDirectWDM",
     "SOBBHLookupComputations",

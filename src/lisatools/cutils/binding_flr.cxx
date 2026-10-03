@@ -296,6 +296,8 @@ void response_part(nb::module_ &m) {
          nb::arg("amp_factor"), nb::arg("sub_temp"), nb::arg("sub_mkn"), nb::arg("n_knots"), nb::arg("t_knots"),
          nb::arg("phase_coeffs"), nb::arg("amp_re"), nb::arg("amp_im"))
     .def("run_wave_tdi_wrap", &TDDenseTDIWaveformWrap::run_wave_tdi_wrap, "Template-batched TDI with dense-output phases.")
+    .def("run_channels_wrap", &TDDenseTDIWaveformWrap::run_channels_wrap,
+         "Raw complex channels only (optionally summed over each template's harmonics).")
     .def("get_buffer_size", &TDDenseTDIWaveformWrap::get_buffer_size, "Get needed buffer size.")
     .def_rw("orbits", &TDDenseTDIWaveformWrap::orbits)
     .def_rw("tdi_config", &TDDenseTDIWaveformWrap::tdi_config)

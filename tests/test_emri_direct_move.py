@@ -1,6 +1,7 @@
 """EMRIDirectLikeMove: direct-template scoring against per-walker residuals AND
-per-walker PSDs equals the container path; the fill stays on the production
-generator; refusals, fallbacks, chunking, routing and the tolerance checks.
+per-walker PSDs equals the container path; the fill runs through the containers' installed
+generator; refusals, fallbacks (on the move's production generator), chunking, routing and
+the tolerance checks.
 
 The direct adapter is faked by the containers' own toy generator (the MBH toy of
 ``tests/test_mbh_batched_move.py``), so "direct == production" holds exactly and
@@ -213,6 +214,30 @@ class EMRIDirectParityTest(_Armed):
         self.assertEqual(len(cm.output), 1)                      # warned once per leaf
         self.assertIn("OutOfMemoryError", cm.output[0])
         self.assertIsInstance(self.move.last_batch_error, RuntimeError)
+
+    def test_fallback_scores_with_the_production_generator(self):
+        """In the fit the containers' installed generator IS the direct template (the one that
+        just failed); the fallback must use the move's own production ``waveform_gen``."""
+        from lisatools.domains import WDMSignal
+
+        def production(*p, **kw):                      # differs from the installed generator
+            h = _slow_gen(*p, **kw)
+            return WDMSignal(1.01 * np.asarray(h.arr), _slow_gen.wdm)
+
+        move = _build_move(self.acs, self.direct)
+        move.waveform_gen = production
+        move.remove_cold_chain_sources(self.cold)
+        move.setup_likelihood_here(self.cold)
+        rows = _proposal_rows(3)
+        idx = np.array([0, 1, 2])
+        want = move.compute_acs_like(rows, idx, signal_gen=production)
+        installed = move.compute_acs_like(rows, idx)
+        self.assertGreater(np.abs(want - installed).max(), 1e-6 * np.abs(installed).max())
+        self.direct.fail_with = RuntimeError("kernel missing")
+        with self.assertLogs(_MOD, logging.WARNING):
+            out = move.compute_like(rows, idx)
+        np.testing.assert_allclose(out, want, rtol=1e-12, atol=0)
+        move.add_back_in_cold_chain_sources(self.cold)
 
     def test_compute_like_requires_armed_offset(self):
         move = _build_move(self.acs, self.direct)
