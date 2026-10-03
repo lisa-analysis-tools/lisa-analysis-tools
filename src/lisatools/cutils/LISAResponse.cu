@@ -110,14 +110,29 @@ void find_start_inds(int start_inds[], int unit_length[], double *t_arr, double 
     *length = i + 1;
 }
 
+// Lagrange fractional-delay prefactor A(e) = prod_{i=1}^{h-1} (i + e)(i + 1 - e) / (i (i + 1))
+// (A(0) = 1), evaluated EXACTLY. It used to be linearly interpolated from a 1001-entry table
+// (A_arr, deps): a fractional-delay-dependent relative GAIN error up to 1.7e-7 on every
+// delayed term, which TDI does not cancel while it cancels the signal at low frequency --
+// measured (2026-10-02, TDI-2 XYZ, equal-arm, order 8) as a relative TDI error of ~3-7e-2 at
+// 0.1 mHz, 1-2.5e-3 at 0.3 mHz, 3-7e-5 at 1 mHz, ~1e-6 at 3 mHz, and different at every
+// sampling step (it follows the fractional delays). The table arguments stay in the
+// signatures (unused) so the bindings do not change.
+CUDA_CALLABLE_MEMBER
+double lagrange_prefactor(int h, double e)
+{
+    double A = 1.0;
+    for (int i = 1; i < h; i += 1)
+    {
+        A *= (i + e) * (i + 1 - e) / ((double)i * (double)(i + 1));
+    }
+    return A;
+}
+
 CUDA_CALLABLE_MEMBER
 void interp_single(double *result, double *input, int h, int d, double e, double *A_arr, double deps, double *E_arr, int start_input_ind)
 {
-
-    int ind = (int)(e / deps);
-
-    double frac = (e - ind * deps) / deps;
-    double A = A_arr[ind] * (1. - frac) + A_arr[ind + 1] * frac;
+    double A = lagrange_prefactor(h, e);
 
     double B = 1.0 - e;
     double C = e;
@@ -161,10 +176,7 @@ void interp(double *result_hp, double *result_hc, cmplx *input, int h, int d, do
     A /= denominator;
     */
 
-    int ind = (int)(e / deps);
-
-    double frac = (e - ind * deps) / deps;
-    double A = A_arr[ind] * (1. - frac) + A_arr[ind + 1] * frac;
+    double A = lagrange_prefactor(h, e);
 
     double B = 1.0 - e;
     double C = e;
