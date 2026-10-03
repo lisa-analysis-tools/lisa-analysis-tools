@@ -1,7 +1,24 @@
 # tests/test_mbh_windowed_signal_gen.py
 """MBH windowed sub-transform adapter: kept layers equal the full-grid
 transform to a pinned tolerance, the pad is load-bearing, rows stack.
-Stub generator (no phentax) so the transform is what is under test."""
+Stub generator (no phentax) so the transform is what is under test; the
+real-phentax classes are named ``...Phentax...``.
+
+The MBH twin of the EMRI pair (``python -m unittest tests.test_wdm_lookup_sum_kernel
+tests.test_tdi_dense -v``): the generator / sub-transform half. Run on a GPU node::
+
+    python -m unittest tests.test_mbh_windowed_signal_gen tests.test_mbh_batched_move \\
+        tests.test_mbh_harness_noise -v
+
+GPU == CPU (skip without a GPU backend): ``WindowedSignalGenGPUParityTest`` (stub
+generator: the segment placement + WDM transform, cupy vs numpy) and
+``WindowedGridAlignedPhentaxGPUParityTest`` (real phentax: the
+WindowedGridAlignedMBHWaveform TDI channels and the adapter's kept layers on the
+CUDA vs the CPU build of the response). Time on a GPU node is the phentax JIT
+(~25 s per batch shape on an H100, job 677): the ``...Phentax...`` classes;
+everything else is stub-based and runs in seconds. Laptop: never run the
+``...Phentax...`` classes casually (WindowedGridAlignedPhentaxTest is ~6.5 min of
+un-jitted CPU phentax); name the stub classes instead."""
 from __future__ import annotations
 
 import unittest
@@ -9,6 +26,7 @@ import unittest
 import numpy as np
 
 from lisatools.domains import TDSettings, TDSignal, WDMSettings
+from lisatools.utils.utility import asnumpy
 from lisatools.utils.utility import tukey as lat_tukey
 
 NF, NT, DT = 32, 128, 10.0
@@ -50,6 +68,16 @@ class _SegmentGen:
 
 def _wdm():
     return WDMSettings(NF, NT, DT, force_backend="cpu")
+
+
+def _gpu_backend_name():
+    """The concrete GPU backend (``"cuda12x"`` / ``"cuda13x"``), or None without one."""
+    import lisatools
+
+    try:
+        return lisatools.get_backend("gpu").name.split("_")[-1]
+    except Exception:
+        return None
 
 
 class WindowedSignalGenTest(unittest.TestCase):
@@ -214,6 +242,76 @@ class WindowedSignalGenTest(unittest.TestCase):
         # measured 2026-09-29: 0.45 -- the taper is ~63% attenuation at the
         # kept box's first layer, nowhere near the 5e-5 floor.
         self.assertGreater(diff, 5e-5)
+
+
+class _XpSegmentGen(_SegmentGen):
+    """:class:`_SegmentGen` whose output lives on the GPU when ``gpu``: the adapter's
+    array module follows its input, as with the real generator's cupy output."""
+
+    def __init__(self, td_full, gpu):
+        super().__init__(td_full)
+        self.gpu = bool(gpu)
+
+    def compute_tdi_channels(self, amp, **kwargs):
+        t, ch = super().compute_tdi_channels(amp, **kwargs)
+        if not self.gpu:
+            return t, ch
+        import cupy as cp
+
+        return cp.asarray(t), cp.asarray(ch)
+
+
+class WindowedSignalGenGPUParityTest(unittest.TestCase):
+    """GPU build of the windowed sub-transform == its CPU build (skips without a GPU).
+
+    The same stub signal and window, three rows in one call, on WDMSettings of each
+    backend: the segment placement, the data-window slice and the segment WDM
+    transform (cupy + cuFFT vs numpy + pocketfft) are the only differences.
+
+    TOL = 1e-11 of the kept layers' maximum. Both are float64 FFT pipelines whose
+    rounding is ~eps * log2(n) ~ 1e-15 of the transform's norm (n = 1792-sample
+    segment), <~1e-13 of the largest coefficient here: the bound leaves two orders over
+    that floor and sits six orders below the pad-truncation error the CPU tests pin
+    (1.2e-5), while the defects it exists to catch -- an odd-parity segment start
+    (measured 1.36), a mis-sliced data window, a mis-placed segment -- are O(1e-2..1).
+    """
+
+    TOL = 1e-11
+    CASES = (  # name, chirp layers, tukey alpha, n_start, Nt_keep, n_pad
+        ("interior", (45, 75), 0.0, 40, 40, 8),
+        ("odd start layer", (45, 75), 0.0, 41, 34, 8),
+        ("tukey 0.3 over the onset ramp", (3, 40), 0.3, 8, 40, 8),
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gpu = _gpu_backend_name()
+        if cls.gpu is None:
+            raise unittest.SkipTest("no GPU backend")
+
+    def _kept(self, backend, h_td, alpha, n_start, Nt_keep, n_pad):
+        from lisatools.sources.batching import MBHWindowedWDMSignalGen
+
+        wdm = WDMSettings(NF, NT, DT, force_backend=backend)
+        sg = MBHWindowedWDMSignalGen(_XpSegmentGen(h_td, backend != "cpu"), wdm, nchannels=3,
+                                     tukey_alpha=alpha)
+        sg.set_window(n_start=n_start, Nt_keep=Nt_keep, n_pad=n_pad)
+        out = sg(np.array([1.0, 2.0, 0.5]))
+        return np.asarray(asnumpy(out.arr)), dict(sg.geometry), (int(out.ind_min_t), int(out.ind_max_t))
+
+    def test_gpu_equals_cpu(self):
+        for name, layers, alpha, n_start, Nt_keep, n_pad in self.CASES:
+            with self.subTest(name):
+                h = _chirp(*layers)
+                c, geo_c, box_c = self._kept("cpu", h, alpha, n_start, Nt_keep, n_pad)
+                g, geo_g, box_g = self._kept(self.gpu, h, alpha, n_start, Nt_keep, n_pad)
+                self.assertEqual(g.shape, (3, 3, NF, Nt_keep))
+                self.assertEqual((geo_g, box_g), (geo_c, box_c))
+                scale = float(np.abs(c).max())
+                self.assertGreater(scale, 0.0)
+                err = float(np.abs(g - c).max()) / scale
+                print(f"[windowed GPU vs CPU, {name}] kept-layer max rel diff {err:.2e}")
+                self.assertLess(err, self.TOL)
 
 
 class WindowedEdgeClampTest(unittest.TestCase):
@@ -676,6 +774,97 @@ class WindowedGridAlignedPhentaxTest(unittest.TestCase):
         print(f"[windowed vs stock] kept-box max rel diff {rel:.3e}; stock power outside box {outside:.3e}")
         self.assertLess(rel, 1e-2)
         self.assertLess(outside, 1e-2)
+
+
+@unittest.skipUnless(_phentax_available(), "needs jax + phentax")
+class WindowedGridAlignedPhentaxGPUParityTest(unittest.TestCase):
+    """CUDA build of the grid-aligned windowed MBH template == its CPU build (real
+    phentax; skips without a GPU backend).
+
+    WindowedGridAlignedPhentaxTest's geometry (2 d at dt = 10 s, T = 12 h, its kept box
+    and 4-layer pad -- the phentax JIT shapes are shared), built once per backend.
+    phentax runs in JAX on JAX's DEFAULT device for both builds (the generator's
+    backend selects the response and transform build, not JAX's device), so the
+    polarizations are one computation and the comparison isolates LAT's CUDA vs CPU
+    build of the response kernel (LISAResponse.cu) plus the cupy vs numpy placement
+    and segment transform.
+
+    Tolerances. TDI channels: 1e-9 of each channel's peak. The two builds compile one
+    source (CUDA leads, the CPU build mirrors it) and differ by FMA contraction and
+    libm ulps, ~1e-16 relative per operation in the projections; the TDI-2 combination
+    differences eight delayed copies and amplifies relative rounding (measured in
+    WindowedGridAlignedPhentaxTest.test_single_equals_batched_row: a 1e-14 polarization
+    difference becomes 6e-13 of peak), so the floor is <~1e-12 and the bound sits three
+    orders above it. Kept WDM layers: 1e-8 of their maximum (one order looser: a
+    wavelet's support spans several layers' samples). Paired negative control in the
+    same call: row 1 is row 0 with phi_ref + 1e-6 rad, a ~1e-6-of-peak template change;
+    GPU row 1 vs CPU row 0 must exceed 1e-7, i.e. the bounds catch a defect two to
+    three orders smaller than that control."""
+
+    TDI_TOL, WDM_TOL, CONTROL_MIN = 1e-9, 1e-8, 1e-7
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gpu = _gpu_backend_name()
+        if cls.gpu is None:
+            raise unittest.SkipTest("no GPU backend")
+        G = WindowedGridAlignedPhentaxTest
+        cls.rows = np.stack([G.ROW, G.ROW])
+        cls.rows[1, 5] += 1e-6               # the paired control (phi_ref)
+        cls.out = {be: cls._run(be) for be in ("cpu", cls.gpu)}
+
+    @classmethod
+    def _run(cls, backend):
+        from lisatools.detector import EqualArmlengthOrbits
+        from lisatools.sources.batching import MBHWindowedWDMSignalGen
+        from lisatools.sources.bbh.gridaligned import WindowedGridAlignedMBHWaveform
+
+        G = WindowedGridAlignedPhentaxTest
+        layer = G.NF * G.DT
+        wdm = WDMSettings(G.NF, G.NT, G.DT, t0=0.0, min_freq=1e-4, max_freq=2.5e-2, force_backend=backend)
+        gen = WindowedGridAlignedMBHWaveform(   # WindowedGridAlignedPhentaxTest's generator kwargs
+            waveform_kwargs=dict(higher_modes=[21, 33, 44], include_negative_modes=True,
+                                 t_low_fit=True, coarse_grain=False, atol=1e-12, rtol=1e-12),
+            Tobs=G.T_GEN, start_freq=7e-5, use_reference_time=True, waveform_t0=0.0,
+            data_td_settings=TDSettings(G.NF * G.NT, G.DT, t0=0.0, force_backend=backend),
+            tdi_generation="2nd generation", tdi_channels="XYZ", sampling_frequency=1.0 / G.DT,
+            # a 600-s orbit grid (the benchmark smoke's): the default 50-s grid over the 5-yr
+            # file costs ~2 GB per build, and both builds read identical tables either way
+            orbits=EqualArmlengthOrbits(force_backend=backend, linear_interp_setup=False, dt=600.0),
+            order=8, tukey_alpha=0.0, stft_dt=None, freq_min=1e-4, freq_max=2.5e-2,
+            fft_batch_size=1, buffer_time=15000.0, output_domain_settings=wdm, force_backend=backend,
+        )
+        adapter = MBHWindowedWDMSignalGen(gen, wdm, nchannels=3, tukey_alpha=0.0)
+        n_start = int(np.floor((86400.0 - G.T_GEN - 3600.0) / layer))
+        Nt_keep = int(np.ceil((G.T_GEN + 4 * 3600.0 + 2 * 3600.0) / layer)) + 1
+        if (Nt_keep + 8) % 2:
+            Nt_keep += 1
+        adapter.set_window(n_start=n_start, Nt_keep=Nt_keep, n_pad=4)   # also sets gen's window
+        t, ch = gen.compute_tdi_channels(*cls.rows.T)
+        kept = adapter(*cls.rows.T).arr
+        return tuple(np.asarray(asnumpy(a)) for a in (t, ch, kept))
+
+    def _compare(self, idx, tol, what):
+        c = self.out["cpu"][idx]
+        g = self.out[self.gpu][idx]
+        self.assertEqual(g.shape, c.shape)
+        for b in range(c.shape[0]):
+            for ch in range(3):
+                peak = float(np.abs(c[b, ch]).max())
+                self.assertGreater(peak, 0.0, (what, b, ch))
+                err = float(np.abs(g[b, ch] - c[b, ch]).max()) / peak
+                print(f"[phentax GPU vs CPU, {what}] row {b} channel {ch}: max rel diff {err:.2e}")
+                self.assertLess(err, tol, (what, b, ch))
+        control = float(np.abs(g[1] - c[0]).max() / np.abs(c[0]).max())
+        print(f"[phentax GPU vs CPU, {what}] control (phi_ref + 1e-6 rad): {control:.2e}")
+        self.assertGreater(control, self.CONTROL_MIN)
+
+    def test_tdi_channels_gpu_equals_cpu(self):
+        np.testing.assert_allclose(self.out[self.gpu][0], self.out["cpu"][0], rtol=0, atol=1e-6)
+        self._compare(1, self.TDI_TOL, "TDI channels")
+
+    def test_kept_layers_gpu_equals_cpu(self):
+        self._compare(2, self.WDM_TOL, "kept WDM layers")
 
 
 if __name__ == "__main__":

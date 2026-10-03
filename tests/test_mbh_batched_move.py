@@ -1,6 +1,18 @@
 """MBHBatchedLikeMove: batched windowed scoring against per-walker residuals
 AND per-walker PSDs equals the base container path; batched expose/fold
-restores the residual; chunking, hysteresis, routing, fallback."""
+restores the residual; chunking, hysteresis, routing, fallback.
+
+The MBH twin of the EMRI pair (``python -m unittest tests.test_wdm_lookup_sum_kernel
+tests.test_tdi_dense -v``): the batched-scorer half. Run on a GPU node::
+
+    python -m unittest tests.test_mbh_windowed_signal_gen tests.test_mbh_batched_move \\
+        tests.test_mbh_harness_noise -v
+
+GPU == CPU (skips without a GPU backend): ``MBHBatchedGPUParityTest`` -- the same toy
+(three walkers, walker 1 on another PSD, the same noise draws) on each backend:
+batched fill, per-walker offsets, the batched scorer's logL, <d|h> / <h|h>, the
+container path and the fold-back. Every class here is stub-based (no phentax):
+seconds on a GPU node, ~a minute on the laptop."""
 from __future__ import annotations
 
 import unittest
@@ -10,6 +22,7 @@ import numpy as np
 from lisatools.analysiscontainer import AnalysisContainer, AnalysisContainerArray
 from lisatools.domains import TDSettings, TDSignal, WDMSettings, WDMSignal
 from lisatools.sensitivity import XYZ2SensitivityMatrix
+from lisatools.utils.utility import asnumpy
 
 NF, NT, DT = 32, 128, 10.0
 N = NF * NT
@@ -58,11 +71,12 @@ class _FastGen:
     supports_batch = True
     t_plunge_snap = 0.0
 
-    def __init__(self, data_t0=T0):
+    def __init__(self, data_t0=T0, gpu=False):
         self.n_calls = 0
         self.fail_with = None
         self.data_t0 = float(data_t0)
         self.waveform_t0 = float(data_t0)   # snapped epoch == data start
+        self.gpu = bool(gpu)                # output on the GPU, as the real generator's
 
     def compute_tdi_channels(self, *cols, **kwargs):
         self.n_calls += 1
@@ -72,26 +86,37 @@ class _FastGen:
         t = np.arange(N) * DT + self.data_t0
         ch = np.stack([_model_td(r, self.waveform_t0, self.data_t0) for r in rows])
         if np.ndim(cols[0]) == 0:
-            return t, ch[0]
-        return np.broadcast_to(t, (rows.shape[0], N)).copy(), ch
+            return self._out(t, ch[0])
+        return self._out(np.broadcast_to(t, (rows.shape[0], N)).copy(), ch)
+
+    def _out(self, t, ch):
+        if not self.gpu:
+            return t, ch
+        import cupy as cp
+
+        return cp.asarray(t), cp.asarray(ch)
 
 
 def _slow_gen(*params, apply_transform=False, leaf_inds=None, **kwargs):
     """The containers' installed (slow, full-grid) generator: same model, on
     the STOCK (possibly off-lattice) epoch the rows' t_plunge is relative to.
     Like the stock generator it places on the ABSOLUTE data lattice and
-    transforms onto the containers' own settings (whatever their ``t0``)."""
+    transforms onto the containers' own settings (whatever their ``t0``), on
+    their backend (``_slow_gen.backend``, set by :func:`_build`)."""
     return TDSignal(
-        _model_td(params, _slow_gen.t0_stock, _slow_gen.data_t0),
-        TDSettings(N, DT, t0=_slow_gen.data_t0, force_backend="cpu"),
+        _slow_gen.wdm.xp.asarray(_model_td(params, _slow_gen.t0_stock, _slow_gen.data_t0)),
+        TDSettings(N, DT, t0=_slow_gen.data_t0, force_backend=_slow_gen.backend),
     ).transform(_slow_gen.wdm)
 
 
-def _toy_wdm(t0):
-    return WDMSettings(NF, NT, DT, t0=t0, min_freq=2e-3, max_freq=2e-2, force_backend="cpu")
+_slow_gen.backend = "cpu"
 
 
-def _build(t0_stock=None, data_t0=T0, container_t0=None, adapter_t0=None, t0_abs=None):
+def _toy_wdm(t0, backend="cpu"):
+    return WDMSettings(NF, NT, DT, t0=t0, min_freq=2e-3, max_freq=2e-2, force_backend=backend)
+
+
+def _build(t0_stock=None, data_t0=T0, container_t0=None, adapter_t0=None, t0_abs=None, backend="cpu"):
     """``t0_stock != data_t0``: the stock epoch sits OFF the data lattice. The
     fast generator is built on the snapped epoch ``data_t0`` and, as in the
     Task 5 wiring, the adapter itself carries ``waveform_t0 = data_t0``
@@ -103,25 +128,31 @@ def _build(t0_stock=None, data_t0=T0, container_t0=None, adapter_t0=None, t0_abs
     adapter is built on (default: the containers' settings object itself);
     ``t0_abs`` is passed to the adapter when given. A stock erebor mojito
     build has ``container_t0 = 0`` and the adapter settings' ``t0`` equal to
-    0 or ``data_t0`` depending on build order."""
+    0 or ``data_t0`` depending on build order.
+
+    ``backend`` (default ``"cpu"``): every settings object, the containers'
+    data and PSDs, the stub generators' output and the container array
+    (``gpus=[0]`` on a GPU backend, as the benchmark builds it) live there; the
+    noise draws are the same on every backend."""
     from lisatools.sources.batching import MBHWindowedWDMSignalGen
 
     t0_stock = data_t0 if t0_stock is None else float(t0_stock)
-    wdm = _toy_wdm(data_t0 if container_t0 is None else container_t0)
+    wdm = _toy_wdm(data_t0 if container_t0 is None else container_t0, backend)
     _slow_gen.wdm = wdm
     _slow_gen.t0_stock = float(t0_stock)
     _slow_gen.data_t0 = float(data_t0)
+    _slow_gen.backend = backend
     rng = np.random.default_rng(7)
     acs_list = []
     models = ["scirdv1", "mrdv1", "scirdv1"]      # walker 1 has a DIFFERENT PSD
     for w in range(NWALKERS):
         noise = 1e-23 * rng.normal(size=(3, wdm.Nf_active, NT))
-        ac = AnalysisContainer(WDMSignal(noise, wdm), XYZ2SensitivityMatrix(wdm, model=models[w]))
+        ac = AnalysisContainer(WDMSignal(wdm.xp.asarray(noise), wdm), XYZ2SensitivityMatrix(wdm, model=models[w]))
         ac.signal_gen = {"mbh": _slow_gen}
         acs_list.append(ac)
-    acs = AnalysisContainerArray(acs_list)
-    fast = _FastGen(data_t0)
-    ad_wdm = wdm if adapter_t0 is None else _toy_wdm(adapter_t0)
+    acs = AnalysisContainerArray(acs_list, gpus=None if backend == "cpu" else [0])
+    fast = _FastGen(data_t0, gpu=backend != "cpu")
+    ad_wdm = wdm if adapter_t0 is None else _toy_wdm(adapter_t0, backend)
     kw = {} if t0_abs is None else dict(t0_abs=t0_abs)
     adapter = MBHWindowedWDMSignalGen(fast, ad_wdm, nchannels=3, tukey_alpha=0.0, **kw)
     if t0_stock != data_t0:
@@ -1036,6 +1067,90 @@ class MBHBatchedRoutingTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             MBHBatchedLikeMove("mbh", (NTEMPS, NWALKERS, 1, 11), None, {}, {}, acs, 1, None, priors,
                                [(StretchMove(), 1.0)], batched_gen=adapter, dcga=object(), **WINDOW)
+
+
+def _gpu_backend_name():
+    """The concrete GPU backend (``"cuda12x"`` / ``"cuda13x"``), or None without one."""
+    import lisatools
+
+    try:
+        return lisatools.get_backend("gpu").name.split("_")[-1]
+    except Exception:
+        return None
+
+
+class MBHBatchedGPUParityTest(unittest.TestCase):
+    """GPU build of the batched scorer == its CPU build (skips without a GPU backend).
+
+    The same toy on each backend -- three walkers, walker 1 on another PSD model, the
+    same noise draws, the stub generator's output on that backend, the container array
+    on ``gpus=[0]`` as the benchmark builds it -- through the full choreography:
+    batched expose (fill), the per-walker offsets (``acs.likelihood()``),
+    ``compute_like`` (the batched scorer) with its <d|h> / <h|h>, the container path,
+    and the fold-back.
+
+    Tolerances: the arithmetic is the same float64 sequence; only reduction order
+    (cupy's vs numpy's sums over ~7e3 pixels), cuFFT vs pocketfft and the PSD model's
+    transcendental ulps differ, each ~1e-16..1e-15 relative to the magnitudes summed.
+    So logL / offsets agree to 1e-9 of max(1, |logL|) (the offsets carry the
+    noise-normalisation term, |logL| ~ 1e5-1e6 here: the bound is ~1e-4..1e-3 nats,
+    five orders under the 0.5-nat check tolerance and far under the O(1-100) nats
+    between rows), <d|h> / <h|h> and the residual arrays to 1e-9 / 1e-11 of their
+    maxima. A defect this targets -- a template scored against the wrong walker's PSD
+    or residual slice, a mis-labelled box, a lost row -- moves logL by O(1) or more
+    (MBHBatchedParityTest pins the walker-0 vs walker-1 PSD difference)."""
+
+    LL_RTOL, IP_RTOL, ARR_RTOL = 1e-9, 1e-9, 1e-11
+
+    def _run(self, backend):
+        acs, adapter, fast, wdm = _build(backend=backend)
+        move = _build_move(acs, adapter)
+        host = lambda a: np.real(np.asarray(asnumpy(a)))  # noqa: E731
+        before = [host(ac.data.arr).copy() for ac in acs.acs.flatten()]
+        cold = _cold_rows()
+        move.remove_cold_chain_sources(cold)                 # batched fill (expose)
+        exposed = [host(ac.data.arr).copy() for ac in acs.acs.flatten()]
+        move.setup_likelihood_here(cold)
+        rows = _proposal_rows(6)
+        idx = np.array([0, 1, 2, 1, 0, 1])
+        out = dict(
+            fast=host(move.compute_like(rows, idx)).reshape(-1),
+            d_h=host(move._last_d_h).copy(), h_h=host(move._last_h_h).copy(),
+            offset=host(move._exposed_offset).copy(),
+        )
+        out.update(
+            slow=host(move.compute_acs_like(rows, idx)).reshape(-1),
+            fallbacks=int(move.n_batch_fallbacks), before=before, exposed=exposed,
+        )
+        move.add_back_in_cold_chain_sources(cold)            # fold-back
+        out["after"] = [host(ac.data.arr).copy() for ac in acs.acs.flatten()]
+        return out
+
+    def test_gpu_equals_cpu(self):
+        gpu = _gpu_backend_name()
+        if gpu is None:
+            self.skipTest("no GPU backend")
+        c = self._run("cpu")
+        g = self._run(gpu)
+        tol = self.LL_RTOL * max(1.0, float(np.abs(c["fast"]).max()))
+        d = float(np.abs(g["fast"] - c["fast"]).max())
+        print(f"[mbh batched GPU vs CPU] max |logL gpu - cpu| = {d:.3e} on |logL| ~ "
+              f"{np.abs(c['fast']).max():.3e} (bound {tol:.1e}); rows span {np.ptp(c['fast']):.3e}")
+        self.assertGreater(np.ptp(c["fast"]), 1e3 * tol)     # the rows are distinguishable
+        np.testing.assert_allclose(g["fast"], c["fast"], rtol=0, atol=tol)
+        np.testing.assert_allclose(g["offset"], c["offset"], rtol=0, atol=tol)
+        for key in ("d_h", "h_h"):
+            np.testing.assert_allclose(g[key], c[key], rtol=0,
+                                       atol=self.IP_RTOL * float(np.abs(c[key]).max()), err_msg=key)
+        for key in ("exposed", "after"):
+            for w, (a, b) in enumerate(zip(g[key], c[key])):
+                np.testing.assert_allclose(a, b, rtol=0, atol=self.ARR_RTOL * float(np.abs(b).max()),
+                                           err_msg=f"{key} walker {w}")
+        # on the GPU itself: batched == container path (the CPU tests' windowing bound)
+        np.testing.assert_allclose(g["fast"], g["slow"], rtol=0, atol=5e-2)
+        self.assertEqual(g["fallbacks"], 0)
+        for a, b in zip(g["after"], g["before"]):           # fold-back restores the residual
+            np.testing.assert_allclose(a, b, rtol=0, atol=1e-12 * np.abs(b).max())
 
 
 if __name__ == "__main__":
