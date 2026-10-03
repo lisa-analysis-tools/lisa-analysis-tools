@@ -65,8 +65,8 @@
 #   8"; the accuracy script ignores the speed-sweep ones), ACC_ARGS (accuracy only, e.g.
 #   "--near 0"), DATA_ARGS (data step only), OUT (mbh_speed_durations_<date>).
 #   MBH_WINDOW_DECIMATE (the run's knob, read by all three steps; default 1): the batched
-#   window generated / responded / transformed at q*dt on Nf/q layers, the epoch snapped
-#   onto the q*dt lattice for the batched AND the 90-d stock reference, as in the run. The
+#   window generated / responded / transformed at decimation*dt on Nf/decimation layers, the
+#   epoch snapped onto that lattice for the batched AND the 90-d stock reference, as in the run. The
 #   accuracy step then measures the decimation error against the full-rate stock
 #   (e.g. MBH_WINDOW_DECIMATE=2 bash scripts/mbh/mbh_speed_durations.sh).
 #

@@ -171,13 +171,14 @@ class MBHWindowedWDMSignalGen(BatchedDomainSignalGen):
             start. A stock erebor build's settings do NOT (the WDM factory
             builds ``t0 = 0``; a GB comp build later sets it to the data start
             in place), so the global fit passes it explicitly.
-        decimate: lattice decimation ``q`` (``MBH_WINDOW_DECIMATE``). The
-            segment is sampled at ``q * dt`` and transformed on ``Nf / q``
+        decimate: lattice decimation factor (``MBH_WINDOW_DECIMATE``). The
+            segment is sampled at ``decimate * dt`` and transformed on ``Nf / decimate``
             layers -- the same ``layer_dt``, hence the same pixels: for content
             below the coarse Nyquist the WDM coefficients equal the ``dt`` ones
-            (measured 7e-12 at q=2, 4e-10 at q=4 on a synthetic chirp sum). The
-            generator must then produce its channels at ``q * dt`` too (it is
-            told ``Nf / q * Nt_seg`` samples). ``Nf`` must be divisible by ``q``
+            (measured 7e-12 at decimation 2, 4e-10 at 4 on a synthetic chirp sum).
+            The generator must then produce its channels at ``decimate * dt`` too
+            (it is told ``Nf / decimate * Nt_seg`` samples). ``Nf`` must be
+            divisible by ``decimate``
             and the coarse grid must still hold the run's active band.
     """
 
@@ -251,10 +252,10 @@ class MBHWindowedWDMSignalGen(BatchedDomainSignalGen):
                 f"kept layers [{n_start}, {n_start + Nt_keep}) fall outside the data's "
                 f"active box [{self.wdm.ind_min_t}, {self.wdm.ind_max_t + 1})"
             )
-        q = self.decimate
+        decimation = self.decimate
         Nf = int(self.wdm.Nf)
-        Nf_seg = Nf // q
-        dt = float(self.wdm.data_dt) * q
+        Nf_seg = Nf // decimation
+        dt = float(self.wdm.data_dt) * decimation
         layer_dt = float(self.wdm.layer_dt)
         t_seg = self.t0_abs + s0 * layer_dt
         backend = self.wdm.backend
@@ -270,21 +271,21 @@ class MBHWindowedWDMSignalGen(BatchedDomainSignalGen):
         ):
             raise RuntimeError(
                 "segment WDM settings do not reproduce the run's active frequency layers"
-                + (f" (decimate={q}: Nf/q = {Nf_seg} layers cannot hold the run's band "
-                   f"up to {self.wdm.max_freq} Hz)" if q > 1 else "")
+                + (f" (decimate={decimation}: Nf/{decimation} = {Nf_seg} layers cannot hold "
+                   f"the run's band up to {self.wdm.max_freq} Hz)" if decimation > 1 else "")
             )
         self._box = self.wdm.get_slice(
             (slice(0, int(self.wdm.Nf_active)), slice(rel_t0, rel_t0 + Nt_keep))
         )
         if self.tukey_alpha > 0.0:
             w = tukey(int(self.wdm.N), self.tukey_alpha, xp=np)
-            self._win_seg = self.wdm.xp.asarray(w[s0 * Nf:(s0 + Nt_seg) * Nf:q])
+            self._win_seg = self.wdm.xp.asarray(w[s0 * Nf:(s0 + Nt_seg) * Nf:decimation])
         else:
             self._win_seg = None
         self.geometry = dict(
             n_start=n_start, Nt_keep=Nt_keep, n_pad=n_pad, n_pad_lo=n_pad_lo,
             n_pad_hi=n_pad_hi, n_pad_hi_req=n_pad_hi_req,
-            s0=s0, Nt_seg=Nt_seg, t_seg=t_seg, decimate=q,
+            s0=s0, Nt_seg=Nt_seg, t_seg=t_seg, decimate=decimation,
         )
         if hasattr(self.wave_gen, "set_window"):
             self.wave_gen.set_window(t_seg, Nf_seg * Nt_seg)
