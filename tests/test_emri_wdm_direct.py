@@ -288,6 +288,31 @@ class AssemblyTest(unittest.TestCase):
         # nothing written before the first tracked pixel
         self.assertTrue(np.all(acc[..., :32] == 0.0))
 
+    def test_subs_sharing_a_chunk_range_are_transformed_together(self):
+        """Two half-amplitude copies of the harmonic (same handoff, so one keep range per chunk:
+        their tails are summed and transformed once) == the single harmonic."""
+        from lisatools.sources.emri import wdm_direct as wd
+
+        n_h = 90
+        one, st1, n_ok = self._run(n_h)
+        ldt, ldf = self.wdm.layer_dt, self.wdm.layer_df
+        tn = n_ok * ldt
+        f = self.f0 + self.fdot * tn
+        phase = 2 * np.pi * (self.f0 * tn + 0.5 * self.fdot * tn ** 2) + self.phi0
+        fddot = np.where(n_ok >= n_h, 1.0, 0.0)
+        track = wd.HarmonicTrack((2, 2, 0, 0), tn, np.ones_like(tn), phase, f, np.full_like(tn, self.fdot), fddot)
+        tracer = (np.full((2, 1, tn.size), 0.5), np.stack([phase[None]] * 2), np.stack([f[None]] * 2),
+                  np.full((2, 1, tn.size), self.fdot))
+        tail_td = lambda ts: 0.5 * np.repeat(np.cos(2 * np.pi * (self.f0 * ts + 0.5 * self.fdot * ts ** 2)
+                                                    + self.phi0)[None, None, :], 2, axis=0)
+        two = np.zeros((1, self.NF, self.NT))
+        st2 = wd.accumulate_harmonic_batch(
+            two, self.table, [track, track], tracer, n_ok, tail_td, Nf=self.NF, Nt=self.NT, dt=self.DT,
+            layer_dt=ldt, layer_df=ldf, t0=0.0, Nt_sub=128, num_m_layers=2,
+            fdot_axis_max=float(np.max(np.abs(self.table.fdot_vals))), pixel_edge=8)
+        self.assertEqual(st2["chunk_pixels"], 2 * st1["chunk_pixels"])
+        np.testing.assert_allclose(two, one, rtol=0, atol=1e-12 * np.abs(one).max())
+
     def test_all_lookup_matches_truth_too(self):
         acc, stats, n_ok = self._run(10 ** 6)          # never hands off
         self.assertEqual(stats["chunk_pixels"], 0)

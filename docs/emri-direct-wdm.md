@@ -222,6 +222,28 @@ Around it:
 | analytic vs stencil tracer, synthetic sparse response | 1e-13 Hz in f, 9e-17 Hz/s in fdot |
 | CD1L EMRI 1, 16 d, 20 s, fit wiring check (box t[60:324]) | kernel = python: mismatch 2.109e-8, max dlogL 1.14e-6 |
 
+### In-window plunge: exact, tapered tail (10-02)
+
+The first 720-day speed test put EMRI 1's plunge 518 d into the window and scored the direct
+template at SNR 3920 against production's 56 (foreground noise; the 180/360 d windows were fine).
+The plunge chunk read its time series from the response's amplitude/phase splines, which cannot
+follow a channel that stops (each TDI delay term drops out at its own time); the leaked broadband
+power has a low-frequency, X+Y+Z-like part the TDI combination would suppress, and the noise
+weights it enormously. Now:
+
+* the chunk's time series comes from the dense kernel at the sample times
+  (`EMRIDirectWDM._dense_td`: the raw complex channels' real part, `TDDenseTDIonTheFly.channels`);
+* when the trajectory stops inside the window, each channel is tapered to zero over the last
+  `EMRI_DIRECT_PLUNGE_TAPER_S` (300 s) before its stop (`plunge_stop_taper`): the exact stop
+  still leaves a ~minute-long burst (0.25-1 mHz SNR 91 vs the data's 0.7 under instrument noise,
+  30-day window around the plunge); production's order-40 Lagrange interpolation of the sampled
+  strain smooths it away, and the taper does the same (0.48);
+* subs that share a chunk keep range are summed before ONE transform per range;
+* the sparse response grid no longer adds an 80 s segment before the stop (11000 points at 720 d).
+
+Laptop check (dt 20, 30 days around the plunge): direct SNR 18.36 vs data 18.25 (instrument),
+mismatch to the data 4.2e-3 (eps 1e-3 mode content), 3-25 mHz bands unchanged.
+
 ## In the global fit: `EMRI_LIKELIHOOD=direct` (10-02)
 
 `emri_pe` becomes `EMRIDirectLikeMove` (`globalfit/moves/emridirectmove.py`), built by

@@ -1067,8 +1067,7 @@ class TDDenseTDIonTheFly(TDIonTheFly):
             self.sub_temp, self.sub_mkn.ravel(), self.n_knots, self.t_knots.ravel(),
             self.phase_coeffs.ravel(), self.amp_re.ravel(), self.amp_im.ravel())
 
-    def __call__(self, params, return_spline: bool = True) -> "TDTDIOutput":
-        """``params``: (n_temp, 4) = (inc, psi, lam, beta) per template."""
+    def _run(self, params):
         xp = self.xp
         params = xp.ascontiguousarray(xp.asarray(params, dtype=xp.float64).reshape(self.n_temp, 4))
         nch = self.tdi_config.nchannels
@@ -1079,6 +1078,20 @@ class TDDenseTDIonTheFly(TDIonTheFly):
         phi_ref = xp.zeros(S * N, dtype=float)
         self.wave_gen.run_wave_tdi_wrap(chans, amp, phase, phi_ref, params.ravel(), self.t.ravel(),
                                         self.sub_offsets, N, 4, nch)
+        return chans, amp, phase, phi_ref
+
+    def channels(self, params):
+        """The raw complex TDI channels ``(num_sub, nch, N)`` at the evaluation times: the exact
+        channel of each harmonic is their real part (no amplitude/phase representation, so a
+        signal that stops -- an in-window plunge -- keeps the TDI combination's own structure)."""
+        chans = self._run(params)[0]
+        return chans.reshape(self.num_sub, self.tdi_config.nchannels, self.N)
+
+    def __call__(self, params, return_spline: bool = True) -> "TDTDIOutput":
+        """``params``: (n_temp, 4) = (inc, psi, lam, beta) per template."""
+        nch = self.tdi_config.nchannels
+        S, N = self.num_sub, self.N
+        chans, amp, phase, phi_ref = self._run(params)
         x = self.t[self.sub_temp]
         return TDTDIOutput(x, amp.reshape(S, nch, N), phase.reshape(S, nch, N), phi_ref.reshape(S, N),
                            fill_splines=return_spline, force_backend=self.backend.name.split("_")[-1])
