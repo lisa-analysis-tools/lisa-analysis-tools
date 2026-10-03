@@ -114,6 +114,10 @@ def parse_acc_args(argv):
                         "YRSID/12 = 30.44 d) or days (smoke: 0.25)")
     p.add_argument("--prod-order", type=int, default=8,
                    help="production reference response order (MBH_RESPONSE_ORDER default 8)")
+    p.add_argument("--ref-order", type=int,
+                   help="response order of the GATING 90-d stock reference (default: --order, the "
+                        "batched order). With --order 4 --ref-order 8 the gate measures a lower batched "
+                        "response order against the production order-8 stock.")
     p.add_argument("--skip-prod", action="store_true", help="only the gating stock90 reference")
     p.add_argument("--mm-tol", type=float, default=1e-6, help="acceptance: mismatch vs stock90 below this")
     p.add_argument("--jsonl", help="APPEND one JSON line per (row, reference) + one per source here")
@@ -275,7 +279,8 @@ def main(argv=None):
     B.mark(f"batched: {rows.shape[0]} rows in one call, {t_b:.3g} s (first call: JIT included)")
 
     # ---- references: the gating stock90, then (information) the production default
-    refs = [("stock90", dict(T_days=ctx.W_before / DAY, order=int(args.order), epoch="snapped", gating=True))]
+    ref_order = int(args.order if acc.ref_order is None else acc.ref_order)
+    refs = [("stock90", dict(T_days=ctx.W_before / DAY, order=ref_order, epoch="snapped", gating=True))]
     if not acc.skip_prod:
         T_prod = (float(B.MBH_DEFAULT_WAVEFORM_DURATION) if acc.prod_T_days == "default"
                   else float(acc.prod_T_days) * DAY)
@@ -350,12 +355,14 @@ def main(argv=None):
     mm_prod = None if "prod" not in results else results["prod"][0]["vs_ref"]["mm"]
     print(f"[accuracy] src {args.source_id} {ctx.Tobs / DAY:g} d (Nt {ctx.Nt}, SNR {snr:.1f}"
           + (f", window decimated {ctx.decimate}x" if ctx.decimate != 1 else "") + f"): {verdict} -- "
-          f"vs stock90 (snapped, T {ctx.W_before / DAY:g} d) on {len(gate)} truth+near rows: max|dlogL| "
+          f"vs stock90 (snapped, T {ctx.W_before / DAY:g} d, order {ref_order}; batched order {args.order}) "
+          f"on {len(gate)} truth+near rows: max|dlogL| "
           f"{worst_dll:.3e} (tol {float(args.acc_tol):g}), max mm {worst_mm:.3e} (tol {float(acc.mm_tol):g})"
           f"{info}" + ("" if mm_prod is None else f"; mm_vs_production {mm_prod:.3e}"), flush=True)
     lines.append(dict(
         base, kind="accuracy_source", status="ok", passed=ok,
-        gate=dict(dlogL_tol=float(args.acc_tol), mm_tol=float(acc.mm_tol)), snr_stock90=snr,
+        gate=dict(dlogL_tol=float(args.acc_tol), mm_tol=float(acc.mm_tol), ref_order=ref_order),
+        snr_stock90=snr,
         max_abs_dlogL_stock90=worst_dll, max_mismatch_stock90=worst_mm,
         max_abs_dlogL_prod=None if "prod" not in results else max(abs(m["dlogL"]) for m in results["prod"]),
         max_mismatch_prod=None if "prod" not in results else max(m["mismatch"] for m in results["prod"]),
