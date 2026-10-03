@@ -321,11 +321,15 @@ def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, 
     for n0, items in windows.items():
         ts = t0 + (n0 * Nf + xp.arange(Nf * Nt_sub)) * dt
         td_all = xp.asarray(tail_td(ts))
-        for s, klo, khi in items:
-            chunk = xp.asarray(wdm_chunk_of_td(td_all[s], 0, Nf, Nt_sub, dt, backend=backend))
+        groups = {}
+        for s, klo, khi in items:                  # the transform is linear: one per keep range
+            groups.setdefault((klo, khi), []).append(s)
+        for (klo, khi), subs in groups.items():
+            td = td_all[subs[0]] if len(subs) == 1 else td_all[xp.asarray(np.asarray(subs))].sum(axis=0)
+            chunk = xp.asarray(wdm_chunk_of_td(td, 0, Nf, Nt_sub, dt, backend=backend))
             hi = min(m_lo + n_m, chunk.shape[-2])                     # chunk rows = global layers
             acc[:, :hi - m_lo, n0 + klo:n0 + khi] += chunk[:, m_lo:hi, klo:khi]
-            stats["chunk_pixels"] += khi - klo
+            stats["chunk_pixels"] += (khi - klo) * len(subs)
     return stats
 
 
@@ -585,6 +589,26 @@ def sparse_response_grid(knots, a, b, sparse_dt, margin):
         return np.array([lo, lo + 1.0])
     inner = knots[(knots > lo) & (knots < hi)]
     return np.union1d(np.append(np.arange(lo, hi, sparse_dt), hi), inner)
+
+
+def plunge_stop_taper(t, t_stop, tau, xp=np):
+    """Per-channel window ``(nch, len(t))`` that is 1 up to ``t_stop[ch] - tau``, falls as a half
+    cosine to 0 at ``t_stop[ch]`` (the channel's last nonzero sample) and stays 0 after.
+
+    Why: a FEW trajectory stops abruptly at the plunge. In the exact TDI response each delayed
+    term of a channel drops out at its own time, so for the ~minute after the stop the terms no
+    longer cancel and the channel carries a burst whose low-frequency part -- and its X+Y+Z
+    (T-like) part -- the TDI combination would otherwise suppress; under the instrument noise a
+    720-day window holding EMRI 1's plunge scored a template SNR of ~90 in 0.25-1 mHz where the
+    data (and production, whose order-40 Lagrange interpolation of the sampled strain smooths
+    the stop) hold < 1. A ``tau`` = 300 s taper removes it (0.3) and leaves 3-25 mHz unchanged
+    (1e-4 relative). ``tau <= 0``: no taper."""
+    t = xp.asarray(t, dtype=float)[None, :]
+    stop = xp.asarray(np.asarray(t_stop, dtype=float))[:, None]
+    if tau <= 0:
+        return xp.where(t <= stop, 1.0, 0.0)
+    x = xp.clip((t - (stop - tau)) / tau, 0.0, 1.0)
+    return xp.where(t <= stop, 0.5 * (1.0 + xp.cos(np.pi * x)), 0.0)
 
 
 def pad_grid(g, N):
@@ -959,6 +983,9 @@ class EMRIDirectWDM:
         # batch() returns layers [m_lo, m_hi) only (None: all Nf): the run's active band
         # (EMRIDirectWDMSignalGen sets it); a 6-month template keeps ~1/8 of the grid
         self.f_band = None if f_band is None else (int(f_band[0]), int(f_band[1]))
+        # half-cosine taper [s] ending at each channel's stop when the trajectory ends in the
+        # window (plunge_stop_taper; env EMRI_DIRECT_PLUNGE_TAPER_S, 0 = none)
+        self.plunge_taper_s = float(os.environ.get("EMRI_DIRECT_PLUNGE_TAPER_S", 300.0))
         self.last_stats = {}
         self.last_failed_rows = []
 
@@ -1169,10 +1196,12 @@ class EMRIDirectWDM:
 
     def _sparse_grid(self, H, chunk_start):
         """Response times (FEW clock) for ``response_grid="sparse"``: the holder's integrator
-        knots over the window (plus margins), every ``sparse_dt`` at most in between (the
-        Doppler residual turns by up to ~1.4 rad/day at 25 mHz), and the ``fine_dt_plunge``
-        grid from a chunk length before ``chunk_start`` (the plunge chunk reads the response at
-        the sample rate there)."""
+        knots over the window (plus margins) and every ``sparse_dt`` at most in between (the
+        Doppler residual turns by up to ~1.4 rad/day at 25 mHz), ending a delay margin inside the
+        trajectory. ``chunk_start`` adds nothing: the plunge chunk reads its time series from
+        the dense kernel at the sample times (:meth:`_dense_td`), not from these splines (an
+        80 s segment from there to past the stop used to be added, 11000 response points for a
+        720-day window ending in a plunge)."""
         lo = self.data_t0 - self.t_start
         span = self.wdm.Nt * self.wdm.layer_dt
         a = max(0.0, lo - (self.DELAY_MARGIN + 2.0 * self.sparse_dt))
@@ -1183,11 +1212,7 @@ class EMRIDirectWDM:
         o_lo, o_hi = self._orbit_span()
         a = max(a, o_lo - self.t_start + self.DELAY_MARGIN)
         b = min(b, o_hi - self.t_start - self.DELAY_MARGIN)
-        grid = sparse_response_grid(H.t_arr, a, b, self.sparse_dt, self.DELAY_MARGIN)
-        if chunk_start is not None:
-            d0 = max(a, chunk_start - self.Nt_sub * self.wdm.layer_dt)
-            grid = np.union1d(grid, np.append(np.arange(d0, b, self.fine_dt_plunge), b))
-        return grid
+        return sparse_response_grid(H.t_arr, a, b, self.sparse_dt, self.DELAY_MARGIN)
 
     def _knots_feed(self, H, few_args, t_fine, fly):
         """Response feed on ``t_fine`` from the knots holder ``H``: amplitudes splined over the
@@ -1204,12 +1229,10 @@ class EMRIDirectWDM:
         amp, ph = feed_from_tracks(tr, EMRITDIonFly.AMP_FACTOR)
         return fly.prepare_feed_arrays(t_src, amp, ph)
 
-    def _dense_response(self, items, t_grid):
-        """ONE TDDenseTDIonTheFly call for ``items`` = [(dense inputs, (psi, lam, beta)), ...].
-
-        ``t_grid`` (FEW clock): one array shared by every template, or one array per template
-        (padded to a common length inside its span, :func:`pad_grid`). With ``response_grid="sparse"`` the result is
-        an :class:`ExactPhaseTDIOutput`, else the kernel's splined ``TDTDIOutput``."""
+    def _dense_kernel(self, items, t_abs):
+        """The TDDenseTDIonTheFly of ``items`` = [(dense inputs, (psi, lam, beta)), ...] at the
+        absolute times ``t_abs`` ``(n_temp, N)``; returns ``(dense, params, sub_mkn, t_knots_abs,
+        coeffs)``."""
         from ...response.tdionfly import TDDenseTDIonTheFly
         from .emritdionfly import EMRITDIonFly
 
@@ -1233,20 +1256,84 @@ class EMRIDirectWDM:
             par.append((0.0, psi, lam, beta))
             tk_abs.append(tk)
             Cs.append(Cb)
+        dense = TDDenseTDIonTheFly(
+            t_abs, np.array(offs), np.concatenate(mkn),
+            t_k, n_k, C, np.concatenate(are), np.concatenate(aim), amp_factor=EMRITDIonFly.AMP_FACTOR,
+            tdi_config=self.tdi_config, orbits=self.orbits, force_backend=self.force_backend)
+        return dense, np.array(par), np.concatenate(mkn), tk_abs, Cs
+
+    def _dense_response(self, items, t_grid):
+        """ONE TDDenseTDIonTheFly call for ``items`` = [(dense inputs, (psi, lam, beta)), ...].
+
+        ``t_grid`` (FEW clock): one array shared by every template, or one array per template
+        (padded to a common length inside its span, :func:`pad_grid`). With ``response_grid="sparse"`` the result is
+        an :class:`ExactPhaseTDIOutput`, else the kernel's splined ``TDTDIOutput``."""
+        n_temp = len(items)
         if isinstance(t_grid, (list, tuple)):
             N = max(int(np.size(g)) for g in t_grid)
             t_eval = np.stack([pad_grid(g, N) for g in t_grid])
         else:
             t_eval = np.tile(np.asarray(t_grid, dtype=float), (n_temp, 1))
-        dense = TDDenseTDIonTheFly(
-            self.t_start + t_eval, np.array(offs), np.concatenate(mkn),
-            t_k, n_k, C, np.concatenate(are), np.concatenate(aim), amp_factor=EMRITDIonFly.AMP_FACTOR,
-            tdi_config=self.tdi_config, orbits=self.orbits, force_backend=self.force_backend)
+        dense, par, mkn, tk_abs, Cs = self._dense_kernel(items, self.t_start + t_eval)
         # outside the trajectory the kernel holds the reference phase at the trajectory end (no jump)
-        out = dense(np.array(par), return_spline=False)
+        out = dense(par, return_spline=False)
         if self.response_grid != "sparse":
-            return SplinedTDIOutput(out, np.concatenate(mkn), dense.sub_temp_host)
-        return ExactPhaseTDIOutput(out, tk_abs, Cs, np.concatenate(mkn), dense.sub_temp_host)
+            return SplinedTDIOutput(out, mkn, dense.sub_temp_host)
+        return ExactPhaseTDIOutput(out, tk_abs, Cs, mkn, dense.sub_temp_host)
+
+    def _dense_td(self, item, ts):
+        """The EXACT channel time series of one template's harmonics at the absolute sample times
+        ``ts``: ``(num_sub, nch, ts.size)``, the real part of the dense kernel's raw TDI channels.
+
+        The plunge chunk's input. An amplitude/phase spline cannot represent the channel where the
+        signal stops (an in-window plunge: each TDI delay term drops out at its own time, a
+        staircase over ~4 arm lengths); splined, it leaks broadband power whose low-frequency part
+        the TDI combination would have suppressed -- under the instrument noise that was a
+        template SNR of ~3900 against 56 for a 720-day window holding EMRI 1's plunge. Evaluated in
+        blocks of at most EMRI_DIRECT_TAIL_BLOCK_ELEMS (sub, channel, sample) entries (2e7)."""
+        xp = self.xp
+        nch = self.tdi_config.nchannels
+        S = int(item[0][2].shape[0])
+        ts = xp.asarray(ts, dtype=float)
+        out = xp.empty((S, nch, int(ts.size)))
+        blk = max(1, int(float(os.environ.get("EMRI_DIRECT_TAIL_BLOCK_ELEMS", 2e7)) // (S * nch)))
+        for b0 in range(0, int(ts.size), blk):
+            tb = ts[b0:b0 + blk]
+            dense, par = self._dense_kernel([item], tb[None, :])[:2]
+            out[:, :, b0:b0 + tb.size] = xp.real(dense.channels(par))
+        return out
+
+    def _dense_tail_fn(self, item, t_end_abs):
+        """``tail_td(ts) -> (num_sub, nch, ts.size)`` for the plunge chunk: the exact channels
+        (:meth:`_dense_td`) times :func:`plunge_stop_taper` when the trajectory (ending at
+        ``t_end_abs``) stops inside the window."""
+        xp = self.xp
+        stop = None
+        if t_end_abs < self.data_t0 + self.wdm.Nt * self.wdm.layer_dt:
+            stop = self._channel_stop(item, t_end_abs)
+
+        def tail_td(ts):
+            td = self._dense_td(item, ts)
+            if stop is not None:
+                td *= plunge_stop_taper(xp.asarray(ts), stop, self.plunge_taper_s, xp)[None]
+            return td
+        tail_td.stop = stop
+        return tail_td
+
+    def _channel_stop(self, item, t_end_abs):
+        """Per channel, the last time the template's channel is nonzero after a trajectory that
+        ends at ``t_end_abs`` (the detector sees the stop up to ~500 s either side of it, by sky
+        position): the sum over harmonics on the sample grid within 1500 s of it."""
+        dt = self.wdm.data_dt
+        k0 = np.floor((t_end_abs - 1500.0 - self.data_t0) / dt)
+        ts = self.data_t0 + (k0 + np.arange(int(np.ceil(3000.0 / dt)) + 1)) * dt
+        td = self._dense_td(item, ts).sum(axis=0)
+        td = np.asarray(td.get() if hasattr(td, "get") else td)
+        stop = np.empty(td.shape[0])
+        for c in range(td.shape[0]):
+            nz = np.flatnonzero(td[c] != 0.0)
+            stop[c] = ts[nz[-1]] if nz.size else t_end_abs
+        return stop
 
     def _call_knots(self, few_args, few_kwargs, modes):
         from ...domains import WDMSignal
@@ -1315,12 +1402,18 @@ class EMRIDirectWDM:
                 tracer = None
                 kern = self._lookup_fn(be, out, acc[None], np.zeros(num_sub, dtype=np.int32), n_ok, 0)
 
-            def tail_td(ts, out=out, x_lo=float(x[:, 0].max()), x_hi=float(x[:, -1].min())):
-                live = (ts > x_lo) & (ts < x_hi)
-                td = xp.zeros((x.shape[0], nch, ts.size))
-                if bool(xp.any(live)):
-                    td[:, :, live] = xp.asarray(out.eval_tdi(ts[live]))
-                return td
+            if self.response == "dense":
+                # the plunge chunk's TD straight from the dense kernel at the sample times: exact
+                # through the stop (_dense_td), not the amplitude/phase splines; its end tapered
+                # (plunge_stop_taper) when the trajectory stops inside the window
+                tail_td = self._dense_tail_fn((din, (psi, lam, beta)), self.t_start + t_traj_end)
+            else:
+                def tail_td(ts, out=out, x_lo=float(x[:, 0].max()), x_hi=float(x[:, -1].min())):
+                    live = (ts > x_lo) & (ts < x_hi)
+                    td = xp.zeros((x.shape[0], nch, ts.size))
+                    if bool(xp.any(live)):
+                        td[:, :, live] = xp.asarray(out.eval_tdi(ts[live]))
+                    return td
 
             totals = accumulate_harmonic_batch(
                 acc, self.table, tracks, tracer, n_ok, tail_td, Nf=Nf, Nt=Nt, dt=dt, layer_dt=ldt,

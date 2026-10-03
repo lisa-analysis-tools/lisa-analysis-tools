@@ -3,7 +3,13 @@ dense-output carrier at the pixels) vs the response on the PIXEL grid (one sampl
 whole phase splined) vs production, on a CD1L source.
 
 Reports per channel the mismatch sparse-vs-pixels and both vs production (active box), the
-response points, and the wall time per template single and batched.
+response points, the wall time per template single and batched, and the optimal SNR of the
+production and both direct templates on the fit's run box (0.25-25 mHz, ``--edge`` pixels
+cropped at each end; scirdv1 XYZ sensitivity + the fitted tanh galactic foreground at this
+window's Tobs, ``--foreground on``/``off``). When the source's mojito
+L1 brick is found (``--orbits auto``/``l1``; see ``emri_batch_speed.find_emri_brick``) every
+template is also scored against its source-only stream (``--data auto``): data SNR, mismatch,
+logL = -1/2 <d-h|d-h>, opt/data SNR ratio.
 
 laptop (CPU, the 20 s table)::
 
@@ -14,7 +20,7 @@ cluster (GPU, 6-month grid)::
 
     python scripts/emri/emri_direct_sparse_check.py --backend cuda13x --days 180 --rows 16 \
         --direct-table wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5 \
-        --catalog /shared/data/mojito_cache/catalogues/emri_cat_mojito_lite_processed_MT.hdf5 --orbits equal-arm
+        --catalog /shared/data/mojito_cache/catalogues/emri_cat_mojito_lite_processed_MT.hdf5
 """
 import argparse
 import json
@@ -42,6 +48,12 @@ def main():
     ap.add_argument("--thresh", default="1e-3")
     ap.add_argument("--rows", type=int, default=4, help="templates timed (batched in one call)")
     ap.add_argument("--sparse-dt", type=float, default=43200.0)
+    ap.add_argument("--data", choices=("auto", "off"), default="auto",
+                    help="score the templates against the source's mojito L1 stream when its brick is used")
+    ap.add_argument("--foreground", choices=("on", "off"), default="on",
+                    help="add the fitted tanh galactic foreground at this window's Tobs to the SNR/data sensitivity")
+    ap.add_argument("--edge", type=int, default=60,
+                    help="pixels cropped at each grid end for the SNR box (the launcher's EDGE_CROP_WAVELETS)")
     args = ap.parse_args()
 
     from lisatools.domains import TDSettings, TDSignal, WDMLookupTable, WDMSettings
@@ -56,6 +68,12 @@ def main():
     n = nf * nt
     params, data_t0, orb = S.load_source(args.src, args.backend, n * args.dt, catalog=args.catalog,
                                          l1_dir=args.l1_dir, orbits=args.orbits)
+    box = S.RunBox(nf, nt, args.dt, args.backend, edge=args.edge, foreground=args.foreground == "on")
+    if args.data == "auto" and S.LAST_BRICK is not None:
+        d_td = S.load_l1_data(S.LAST_BRICK, args.dt, n)
+        if d_td is not None:
+            box.set_data(d_td, S.LAST_BRICK)
+            del d_td
     fit = erebor.get_stock("all_sources")
     off = data_t0 - W.REF
     oi = int(round(off / args.dt))
@@ -98,7 +116,12 @@ def main():
         xp = cp if gpu else np
         h = xp.stack([xp.asarray(c) for c in h]) if isinstance(h, (list, tuple)) else xp.atleast_2d(h)
         h_prod = host(TDSignal(h[:3, oi:oi + n], tds).transform(wdm).arr)
-        rec = dict(src=args.src, days=args.days, dt=args.dt, thr=thr, backend=args.backend)
+        rec = dict(src=args.src, days=args.days, dt=args.dt, thr=thr, backend=args.backend,
+                   snr_production=box.snr(h_prod), snr_edge=args.edge, brick=box.brick, tobs_s=box.tobs,
+                   foreground=box.foreground, noise=box.describe(),
+                   data_snr=None if box.d is None else box.data_snr)
+        if box.d is not None:
+            rec["production_vs_data"] = box.score(h_prod)
         tmpl = {}
         for g, d in gens.items():
             d(*params, mode_selection_threshold=thr)                     # warm-up
@@ -109,6 +132,10 @@ def main():
             rec[f"{g}_single_ms"] = 1e3 * (time.perf_counter() - t0)
             rec[f"{g}_n_response"] = int(d.n_fine)
             rec[f"{g}_mm_vs_prod"] = mm(tmpl[g], h_prod)
+            rec[f"{g}_snr"] = box.snr(tmpl[g])
+            rec[f"{g}_mm_vs_production"] = box.match(tmpl[g], h_prod)        # noise weighted, on the box
+            if box.d is not None:
+                rec[f"{g}_vs_data"] = box.score(tmpl[g])
             sync()
             t0 = time.perf_counter()
             d.batch(rows, chunk_rows=len(rows), mode_selection_threshold=thr)
@@ -125,6 +152,16 @@ def main():
               f"{rec['sparse_single_ms']:.0f} | batch of {len(rows)}: pixels "
               f"{rec['pixels_batch_ms_per_template']:.0f}, sparse {rec['sparse_batch_ms_per_template']:.0f}",
               flush=True)
+        print(f"[sparse] thr={thr:g} optimal SNR ({args.days:g} d; {box.describe()}): production "
+              f"{rec['snr_production']:.3f}, pixels {rec['pixels_snr']:.3f}, sparse {rec['sparse_snr']:.3f}; "
+              f"noise-weighted mm vs production: pixels {rec['pixels_mm_vs_production']:.2e}, sparse "
+              f"{rec['sparse_mm_vs_production']:.2e}", flush=True)
+        if box.d is not None:
+            print(f"[sparse] thr={thr:g} vs mojito data {box.brick} (data SNR {box.data_snr:.3f}): " + "; ".join(
+                f"{k} mm {rec[k + '_vs_data']['mm']:.3e} logL {rec[k + '_vs_data']['logL']:.4g} SNR ratio "
+                f"{rec[k + '_vs_data']['snr_ratio']:.5f}" for k in ("production", "pixels", "sparse")), flush=True)
+        else:
+            print(f"[sparse] thr={thr:g} no mojito data comparison (no L1 brick used, or --data off)", flush=True)
         print(json.dumps(rec), flush=True)
 
 

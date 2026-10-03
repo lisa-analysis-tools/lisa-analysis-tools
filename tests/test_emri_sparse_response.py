@@ -340,3 +340,68 @@ class DirectWDMResponseGridTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlungeTailTest(unittest.TestCase):
+    """The plunge chunk's time series: the dense kernel's exact channels (EMRIDirectWDM._dense_td),
+    equal to the splined response away from a stop, and, when the trajectory stops inside the
+    window, tapered to zero at each channel's stop (plunge_stop_taper). The 720-day speed test
+    (EMRI 1 plunges 518 d in) scored a direct template at SNR 3920 against production's 56 from
+    the splined tail; the exact tail without the taper still left SNR ~90 in 0.25-1 mHz."""
+
+    T_END = 12000.0                                       # FEW clock: inside the 20480 s window
+
+    def _direct(self):
+        return DirectWDMResponseGridTest._direct(self, "sparse")
+
+    def _item(self, t_end):
+        t_k = np.linspace(0.0, t_end, 9)
+        C = _quadratic_coeffs(t_k, np.array([0.1, 0.0, 0.2]), np.array([2e-3, 0.0, 4e-4]),
+                              np.array([1e-10, 0.0, 0.0]))
+        are = np.zeros((2, t_k.size - 1, 4))
+        are[:, :, 0] = 1.0
+        return (t_k, C, np.array([[2, 0, 0], [3, 0, 1]]), are, np.zeros_like(are)), (0.3, 1.0, 0.2)
+
+    def test_exact_tail_equals_the_splined_channel_away_from_stops(self):
+        d = self._direct()
+        item = self._item(6 * 3600.0 * 8)                  # stops long after the window
+        t_k = item[0][0]
+        out = d._dense_response([item], np.linspace(t_k[0] + 600, 30000.0, 400))
+        ts = d.t_start + np.linspace(2000.0, 20000.0, 300)
+        exact = np.asarray(d._dense_td(item, ts))
+        spl = np.asarray(out.eval_tdi(ts))
+        self.assertLess(np.abs(exact - spl).max() / np.abs(spl).max(), 1e-5)
+
+    def test_taper_shape(self):
+        from lisatools.sources.emri.wdm_direct import plunge_stop_taper
+
+        t = np.linspace(0.0, 400.0, 401)
+        w = plunge_stop_taper(t, [200.0, 300.0], 100.0)
+        self.assertEqual(w.shape, (2, t.size))
+        np.testing.assert_array_equal(w[0, t <= 100.0], 1.0)
+        np.testing.assert_array_equal(w[0, t > 200.0], 0.0)
+        np.testing.assert_allclose(w[0, t == 150.0], 0.5, atol=1e-15)
+        self.assertTrue(np.all(np.diff(w[1]) <= 0))
+        np.testing.assert_array_equal(plunge_stop_taper(t, [200.0], 0.0)[0], (t <= 200.0).astype(float))
+
+    def test_stopping_tail_is_tapered_and_quiet_at_low_frequency(self):
+        d = self._direct()
+        item = self._item(self.T_END)
+        tail = d._dense_tail_fn(item, d.t_start + self.T_END)
+        self.assertIsNotNone(tail.stop)
+        ts = d.t_start + np.arange(0.0, 20480.0, 10.0)
+        raw = np.asarray(d._dense_td(item, ts)).sum(axis=0)
+        tap = np.asarray(tail(ts)).sum(axis=0)
+        for c in range(3):                             # the stop = the raw channel's last nonzero sample
+            self.assertEqual(tail.stop[c], ts[np.flatnonzero(raw[c])[-1]])
+            self.assertLess(abs(tail.stop[c] - (d.t_start + self.T_END)), 600.0)
+        np.testing.assert_array_equal(tap[:, ts > tail.stop.max()], 0.0)
+        early = ts < tail.stop.min() - d.plunge_taper_s
+        np.testing.assert_array_equal(tap[:, early], raw[:, early])
+        # the burst: X+Y+Z (T-like) power below 1 mHz, untapered vs tapered
+        f = np.fft.rfftfreq(ts.size, 10.0)
+        low = (f > 0) & (f < 1e-3)
+        p_raw = np.sum(np.abs(np.fft.rfft(raw.sum(axis=0))[low]) ** 2)
+        p_tap = np.sum(np.abs(np.fft.rfft(tap.sum(axis=0))[low]) ** 2)
+        print(f"[plunge tail] T-like power < 1 mHz: untapered / tapered = {p_raw / p_tap:.3g}")
+        self.assertGreater(p_raw / p_tap, 10.0)

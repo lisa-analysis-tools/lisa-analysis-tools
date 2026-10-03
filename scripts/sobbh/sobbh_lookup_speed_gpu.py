@@ -30,6 +30,9 @@ import time
 
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _sobbh_testbox as tb  # noqa: E402
+
 TABLE_DEFAULT = (
     "/Users/mkatz/Research/lisa_sprint_2026/wdm_lookup_emri_cx_NF180_DT20_TL32_fd8x0p01_nld2.h5"
 )
@@ -97,6 +100,15 @@ def main():
         help="cpu / cuda12x / ... (default: the first CUDA backend, else cpu)",
     )
     ap.add_argument("--laptop", action="store_true", help="Nf=180, dt=20 (layer 3600 s) preset")
+    ap.add_argument(
+        "--edge", type=int, default=tb.EDGE_CROP_WAVELETS, help="layers cropped per end"
+    )
+    ap.add_argument(
+        "--foreground",
+        default="on",
+        choices=("on", "off"),
+        help="scirdv1 + the fitted tanh galactic foreground at the window's Tobs",
+    )
     ap.add_argument("--nf", type=int, default=1440)
     ap.add_argument("--nt", type=int, default=4320)
     ap.add_argument("--dt", type=float, default=2.5)
@@ -126,6 +138,9 @@ def main():
         backend = "cuda" if lisatools.has_backend("cuda") else "cpu"
     if not lisatools.has_backend(backend):
         raise SystemExit(f"backend {backend!r} unavailable on this host")
+    from lisatools.sources.sobbh.wdm_direct import concrete_backend_name
+
+    backend = concrete_backend_name(backend)  # "cuda" / "gpu" aliases -> e.g. "cuda13x"
     if args.laptop:
         args.nf, args.dt = 180, 20.0
     nf, nt, dt = int(args.nf), int(args.nt), float(args.dt)
@@ -143,7 +158,7 @@ def main():
     ref = float(t0)
     orbits = EqualArmlengthOrbits(force_backend=backend)
     tdi = TDIConfig("2nd generation", force_backend=backend)
-    wdm = WDMSettings(nf, nt, dt, t0=t0, min_freq=2.5e-4, max_freq=2.5e-2, force_backend=backend)
+    wdm = tb.run_box(nf, nt, dt, t0, edge=args.edge, force_backend=backend)
     t_build = time.perf_counter()
     table = WDMLookupTable.from_file(args.table, force_backend=backend)
     comp = SOBBHLookupComputations(
@@ -169,7 +184,8 @@ def main():
     print(
         f"backend {backend}  grid Nf={nf} Nt={nt} dt={dt} layer_dt={float(wdm.layer_dt):g} s  "
         f"active {nfa} x {nta}  table {os.path.basename(args.table)}  comp build {t_build:.1f} s  "
-        f"lookup={'fused kernel' if comp.uses_kernel else 'python'} interp={args.interp}"
+        f"lookup={'fused kernel' if comp.uses_kernel else 'python'} interp={args.interp}  "
+        f"box edge {args.edge}, noise {tb.noise(wdm, nt * nf * dt, args.foreground)[1]}"
     )
 
     # one residual slab: the lookup fill of two sources (no dense transform on any backend)
@@ -179,7 +195,7 @@ def main():
     )
     sync(xp)
     ac = AnalysisContainer(
-        WDMSignal(data.reshape(nch, nfa, nta), wdm), XYZ2SensitivityMatrix(wdm, model="scirdv1")
+        WDMSignal(data.reshape(nch, nfa, nta), wdm), tb.noise(wdm, nt * nf * dt, args.foreground)[0]
     )
     dev = getattr(getattr(data, "device", None), "id", None)
     aca = AnalysisContainerArray([ac], gpus=None if dev is None else [int(dev)])
@@ -214,7 +230,7 @@ def main():
     header = (
         f"{'rows':>5} {'look_first':>11} {'look_warm':>10} {'resp':>8} {'pn':>8} {'trac':>8} {'look':>8} {'inner':>8} "
         f"{'look_fill':>10} {'ch_first':>9} {'ch_warm':>9} {'ch_fill':>9} {'ch/look':>8} "
-        f"{'max|dll|':>10} {'lk_pool':>8} {'ch_pool':>8}"
+        f"{'max|dll|':>10} {'lk_pool':>8} {'ch_pool':>8} {'snr':>8}"
     )
     print(header)
     with open(args.out, "a") as fp:
@@ -238,6 +254,9 @@ def main():
                 nt_sub=args.nt_sub,
                 interp=args.interp,
                 lookup="kernel" if comp.uses_kernel else "python",
+                edge=args.edge,
+                foreground=args.foreground,
+                tobs_s=nt * nf * dt,
                 tag=tag,
             )
             pool_reset(xp)
@@ -250,6 +269,9 @@ def main():
 
             look_first, look_warm = timed(look_call, xp, args.repeats)
             ll_look = np.asarray(asnumpy(look_call()), dtype=float)
+            # the rows' optimal SNR against this grid's noise (scirdv1, instrument only):
+            # sqrt(<h|h>) of the lookup template
+            snr = float(np.median(np.sqrt(np.asarray(asnumpy(comp.h_h_out), dtype=float))))
             buf = xp.zeros(nch * nfa * nta)
             _, look_fill = timed(
                 lambda: comp.fill_global_wdm(batch, buf, data_index=idx, factors=fac),
@@ -262,6 +284,7 @@ def main():
                 look_first=look_first,
                 look_warm=look_warm,
                 look_fill=look_fill,
+                snr=snr,
                 look_template=float(spans.get("template", float("nan"))),
                 look_response=float(spans.get("response", float("nan"))),
                 look_pn=float(spans.get("pn", float("nan"))),
@@ -316,7 +339,7 @@ def main():
             print(
                 f"{n:5d} {look_first:11.3f} {look_warm:10.3f} {rec['look_response']:8.3f} {rec['look_pn']:8.3f} "
                 f"{rec['look_tracer']:8.3f} {rec['look_lookup']:8.3f} {rec['look_inner']:8.3f} {look_fill:10.3f} {ch_first:9.3f} {ch_warm:9.3f} "
-                f"{ch_fill:9.3f} {ratio:8.2f} {dll:10.3e} {lk_total:8.2f} {ch_total:8.2f}"
+                f"{ch_fill:9.3f} {ratio:8.2f} {dll:10.3e} {lk_total:8.2f} {ch_total:8.2f} {snr:8.3g}"
             )
             fp.write(json.dumps(clean(rec)) + "\n")
     print(f"wrote {args.out}")
