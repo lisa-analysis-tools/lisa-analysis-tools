@@ -70,9 +70,12 @@ def main():
 
     import lisatools
 
+    from lisatools.sources.sobbh.wdm_direct import concrete_backend_name
+
     backend = args.backend or ("cuda" if lisatools.has_backend("cuda") else "cpu")
     if not lisatools.has_backend(backend):
         raise SystemExit(f"backend {backend!r} unavailable on this host")
+    backend = concrete_backend_name(backend)  # "cuda" / "gpu" aliases -> e.g. "cuda13x"
     bricks = tb.find_sobhb_bricks(args.l1_dir)
     if not bricks:
         print(
@@ -150,11 +153,34 @@ def main():
                     f"({(o_hi - t0) / 86400.0:.1f} d from the window start); skipping"
                 )
                 continue
+            # a source chirping out of the box (or merging) inside the window: stop the box
+            # BAND_EXIT_MARGIN_LAYERS layers before it leaves (power above the band is not scored)
+            from lisatools.sources.sobbh.wdm_direct import SOBBHBatchedTOF
+
+            t_exit = tb.band_exit_time(
+                SOBBHBatchedTOF(orbits, tdi, MOJITO_REFERENCE_TIME, force_backend=backend),
+                p,
+                t0,
+                t_end,
+                layer_dt,
+                tb.MAX_FREQ - 2.0 / (2.0 * layer_dt),
+            )
+            max_time = None
+            if t_exit is not None:
+                max_time = t_exit - t0 - tb.BAND_EXIT_MARGIN_LAYERS * layer_dt
             try:
-                wdm = tb.run_box(nf, nt, dt, t0, edge=args.edge, force_backend=backend)
+                wdm = tb.run_box(
+                    nf, nt, dt, t0, edge=args.edge, force_backend=backend, max_time=max_time
+                )
             except ValueError as exc:
                 print(f"[mojito] src {src} {days} d: {exc}; skipping")
                 continue
+            if max_time is not None and max_time < (nt - args.edge) * layer_dt:
+                print(
+                    f"[mojito] src {src} {days} d: the source leaves the {tb.MAX_FREQ * 1e3:g}-mHz "
+                    f"box (or merges) {(t_exit - t0) / 86400.0:.0f} d into the window; box stops "
+                    f"{tb.BAND_EXIT_MARGIN_LAYERS} layers before"
+                )
             box_days = (float(wdm.ind_max_t) - float(wdm.ind_min_t) + 1) * layer_dt / 86400.0
             tobs = nobs * dt
             sens, noise_label = tb.noise(wdm, tobs, args.foreground)
@@ -210,6 +236,7 @@ def main():
                 start_offset=args.start_offset,
                 foreground=args.foreground,
                 noise=noise_label,
+                band_exit_days=None if t_exit is None else (t_exit - t0) / 86400.0,
                 backend=backend,
                 tag=tag,
                 data_snr=float(np.sqrt(d_d)),

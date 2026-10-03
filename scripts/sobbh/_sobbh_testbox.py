@@ -49,6 +49,8 @@ def run_box(
     hi = (nt - edge) * layer_dt
     if max_time is not None:
         hi = min(hi, float(max_time))
+    if hi <= (edge + 1) * layer_dt:
+        raise ValueError("nothing of the box is left before its end (source out of band early?)")
     return WDMSettings(
         nf,
         nt,
@@ -158,3 +160,32 @@ def load_l1_window(brick, nobs, dt, *, start_offset=START_OFFSET_S):
     if xyz.shape[1] < nobs:
         raise ValueError(f"brick {os.path.basename(brick)} is shorter than the window")
     return xyz[:, :nobs], t_first + i0 * dt_b, dt_b
+
+
+#: layers kept clear of a source's band exit (WDM wavelet support + the cut's own leakage)
+BAND_EXIT_MARGIN_LAYERS = 8
+
+
+def band_exit_time(tof, row, t_lo, t_hi, step, f_top):
+    """Absolute time [s] at which the source (one chunked-basis ``row``) leaves the box: its
+    channel-mean frequency reaches ``f_top`` or every channel's amplitude is zero (merged);
+    ``None`` if it stays in band over ``[t_lo, t_hi]``. Evaluated every ``step`` seconds on the
+    batched response's splines (``tof`` = a ``SOBBHBatchedTOF``).
+
+    Why: a source chirping out of the box -- or merging -- inside the window puts power above the
+    band (and, on a grid whose Nyquist sits at the band top, aliases it back in); the box
+    comparisons stop ``BAND_EXIT_MARGIN_LAYERS`` layers before the exit."""
+    import numpy as np
+
+    from lisatools.sources.sobbh.wdm_direct import sobbh_tracer
+    from lisatools.utils.utility import asnumpy
+
+    out = tof.build(np.atleast_2d(np.asarray(row, dtype=float)), t_lo, t_hi)
+    lo, hi = out.t_cover
+    t = np.arange(lo, hi, float(step))
+    amp, _, f, _ = (np.asarray(asnumpy(a)) for a in sobbh_tracer(out, t))
+    live = amp[0] != 0.0
+    fm = np.where(live, f[0], 0.0).sum(axis=0) / np.maximum(live.sum(axis=0), 1)
+    gone = (fm >= f_top) | ~live.any(axis=0)
+    k = np.flatnonzero(gone)
+    return float(t[k[0]]) if k.size else None
