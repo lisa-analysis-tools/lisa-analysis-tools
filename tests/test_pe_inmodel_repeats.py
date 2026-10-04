@@ -83,6 +83,37 @@ class ApplyInModelRepeatsTest(unittest.TestCase):
         # idempotent
         self.assertEqual(apply_inmodel_repeats(tree, {"gb": 25, "vgb": 25, "sobbh": 25, "mbh": 25}), {})
 
+    def test_gb_rj_moves_get_newborn_and_survivor_budgets_too(self):
+        """User ruling 2026-10-04: "make all the pe repeats 25 (for both
+        newborns and survivors)". The RJ band move polishes from its
+        per-class budgets, not num_repeat_proposals; the 6mo replica_pe ran
+        them at 100 / 50 while the declaration reported nothing."""
+        from lisatools.globalfit.recipe import apply_inmodel_repeats
+
+        rj = SimpleNamespace(name="rj_prior_pe", branch_name="gb",
+                             num_repeat_proposals=25, inmodel_repeats_newborn=100,
+                             inmodel_repeats_survivor=50)
+        sob = SimpleNamespace(name="sobbh_pe", branch_name="sobbh", num_repeats=25)
+        tree = [SimpleNamespace(moves=[rj, sob])]
+        changed = apply_inmodel_repeats(tree, {"gb": 25, "sobbh": 25})
+        self.assertEqual((rj.num_repeat_proposals, rj.inmodel_repeats_newborn,
+                          rj.inmodel_repeats_survivor), (25, 25, 25))
+        self.assertEqual(changed, {"rj_prior_pe.newborn": (100, 25),
+                                   "rj_prior_pe.survivor": (50, 25)})
+        self.assertEqual(apply_inmodel_repeats(tree, {"gb": 25, "sobbh": 25}), {})
+
+    def test_the_per_class_budgets_ride_to_the_compute_ranks(self):
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            GB_RANK_LIVE_ATTRS, gb_rank_live_attrs)
+
+        self.assertIn("inmodel_repeats_newborn", GB_RANK_LIVE_ATTRS)
+        self.assertIn("inmodel_repeats_survivor", GB_RANK_LIVE_ATTRS)
+        mv = SimpleNamespace(name="rj_fstat_pe", inmodel_repeats_newborn=25,
+                             inmodel_repeats_survivor=25, num_repeat_proposals=25)
+        got = gb_rank_live_attrs(mv)
+        self.assertEqual((got["inmodel_repeats_newborn"],
+                          got["inmodel_repeats_survivor"]), (25, 25))
+
     def test_a_listed_move_without_a_repeat_attribute_is_reported_not_skipped_silently(self):
         from lisatools.globalfit.recipe import apply_inmodel_repeats
 

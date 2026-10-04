@@ -999,7 +999,17 @@ def apply_inmodel_repeats(moves, repeats, tag: str = "pe") -> dict:
     emri) and the noise moves carry ``num_repeats``; the GB-family band moves
     (gb, vgb) carry ``num_repeat_proposals``. A move of a listed branch with
     neither attribute is reported and left alone -- never a silent no-op.
-    Returns ``{move name: (old, new)}`` for what changed.
+
+    GB RJ MOVES ALSO GET THEIR PER-CLASS BUDGETS (user ruling 2026-10-04:
+    "make all the pe repeats 25 (for both newborns and survivors)"). An RJ
+    band move runs its in-model polish from ``inmodel_repeats_newborn`` /
+    ``inmodel_repeats_survivor`` (GB_INMODEL_REPEATS_NEWBORN / _SURVIVOR,
+    100 / 50 on the 6mo launcher), NOT from ``num_repeat_proposals`` -- so
+    until now the PE declaration left the GB PE moves at 100 / 50 while
+    reporting nothing. Both are set to the declared count too; they reach
+    the compute ranks through ``GB_RANK_LIVE_ATTRS``.
+    Returns ``{move name: (old, new)}`` for what changed (a per-class change
+    is keyed ``"<move>.newborn"`` / ``"<move>.survivor"``).
     """
     want = {str(k): int(v) for k, v in dict(repeats or {}).items()}
     for b, n in want.items():
@@ -1011,17 +1021,26 @@ def apply_inmodel_repeats(moves, repeats, tag: str = "pe") -> dict:
         if b not in want:
             continue
         n = want[b]
+        name = getattr(m, "name", type(m).__name__)
         if hasattr(m, "num_repeats"):
             attr = "num_repeats"
         elif hasattr(m, "num_repeat_proposals"):
             attr = "num_repeat_proposals"
         else:
-            untouched.append(getattr(m, "name", type(m).__name__))
+            untouched.append(name)
             continue
         old = int(getattr(m, attr))
         if old != n:
             setattr(m, attr, int(n))
-            changed[getattr(m, "name", type(m).__name__)] = (old, n)
+            changed[name] = (old, n)
+        for cls in ("newborn", "survivor"):
+            cattr = f"inmodel_repeats_{cls}"
+            if not hasattr(m, cattr):
+                continue
+            cold = int(getattr(m, cattr))
+            if cold != n:
+                setattr(m, cattr, int(n))
+                changed[f"{name}.{cls}"] = (cold, n)
     if changed:
         logger.info("[V9-STAGE %s] in-model repeats set on entry: %s.", tag,
                     ", ".join(f"{k} {o} -> {n}" for k, (o, n) in changed.items()))

@@ -4626,7 +4626,10 @@ export SOBBH_NUM_PROP_REPEATS=${SOBBH_NUM_PROP_REPEATS:-25}
 # general 'thinning' factor of 25"): the PE stage declares the in-model
 # repeat count for the listed branches on entry, on the built moves it shares
 # with the search stages. With the source knobs above at 25 the declaration
-# only changes VGB 1 / PSD 10 / GALFOR 10 -> 25. EMRI joined the list on
+# changes VGB 1 / PSD 10 / GALFOR 10 -> 25 and, since 2026-10-04 ("make all
+# the pe repeats 25 (for both newborns and survivors)"), the GB RJ moves'
+# in-model polish budgets GB_INMODEL_REPEATS_NEWBORN 100 / _SURVIVOR 50 -> 25
+# (search stages keep 100 / 50). EMRI joined the list on
 # 2026-10-03 ("same as pe" for mbhs, emris and sobhbs); an
 # EMRI_NUM_PROP_REPEATS=2 on the line therefore needs
 # PE_INMODEL_REPEATS_BRANCHES=gb,vgb,sobbh,mbh,psd,galfor as well to keep EMRI

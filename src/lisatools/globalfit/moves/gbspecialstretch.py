@@ -3943,6 +3943,11 @@ GB_RANK_LIVE_ATTRS = (
     "rj_removal_only",          # stage profile prior_births (rj_prior_removal)
     "rj_flip_fraction",         # PE declaration (GB_PE_RJ_FLIP_FRACTION)
     "num_repeat_proposals",     # PE declaration (in-model repeats)
+    # PE declaration, per provenance class (user ruling 2026-10-04: 25 for
+    # newborns AND survivors in PE). The RJ moves' in-model polish budgets;
+    # without shipping them the head's 25 / 25 would reach one walker in four.
+    "inmodel_repeats_newborn",
+    "inmodel_repeats_survivor",
 )
 
 

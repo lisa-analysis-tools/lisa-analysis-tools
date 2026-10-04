@@ -34,7 +34,9 @@ class GbRankLiveAttrsTest(unittest.TestCase):
 
         self.assertEqual(set(GB_RANK_LIVE_ATTRS),
                          {"opt_snr_rej_samp_limit", "phase_maximize", "rj_removal_only",
-                          "rj_flip_fraction", "num_repeat_proposals"})
+                          "rj_flip_fraction", "num_repeat_proposals",
+                          # PE per-class budgets (user ruling 2026-10-04)
+                          "inmodel_repeats_newborn", "inmodel_repeats_survivor"})
         mv = SimpleNamespace(name="rj_prior_removal", opt_snr_rej_samp_limit=5.0,
                              phase_maximize=False, rj_removal_only=False,
                              rj_flip_fraction=np.float64(0.1), num_repeat_proposals=25,
