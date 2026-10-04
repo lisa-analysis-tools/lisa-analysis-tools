@@ -2551,6 +2551,36 @@ def _column_atomic_newborn(pool, xp, num_bands):
     return out
 
 
+def _grouped_flush_classes(merged, xp, num_bands, column_atomic):
+    """``[(class_name, class_dict), ...]`` for the GROUPED path's flush.
+
+    THE BUG THIS CLOSES (2026-10-04, 6mo replica_pe relaunch). The grouped
+    path (production: ``GB_RJ_DIRECT_BATCH=0``) split its pooled survivors
+    by provenance PER ROW, so one (walker, band) column could put its
+    newborn rungs in the first block and its mature rungs in the second.
+    Every pooled row carries its PICK-TIME ``temp_inds``. With all-rungs
+    swaps the first block swaps its carriers with RESIDENT NON-CARRIER
+    rungs of the same column -- exactly the cells whose rows wait in the
+    second class -- so those rows reach their block with a label the sorter
+    no longer gives them. That block then priced and credited the wrong
+    rung, and its all-rung table named one slot twice; the 2026-10-04
+    re-base guard refused it ("the all-rung table and the block rows
+    disagree"). Before that guard it ran silently, and births are what
+    create the two-class columns: the prior-RJ sawtooth.
+
+    With vertical swaps on, the pool is ordered by column and the newborn
+    flag is lifted to whole columns -- the rule the RJ direct path has had
+    since 2026-09-10 (:func:`_column_atomic_newborn`) -- so the classes are
+    column-disjoint and no block can relabel a cell another block's rows
+    still name. A mature rung in a newborn column takes the newborn budget
+    (equal in PE, 25/25).
+    """
+    if column_atomic:
+        merged = _order_pool_by_column(merged, xp, num_bands)
+        merged = _column_atomic_newborn(merged, xp, num_bands)
+    return _split_by_newborn(merged, xp)
+
+
 def _vert_all_rung_pairs(carrier, occupied, parity, ntemps, xp):
     """Cell-level vertical swap pairs over EVERY rung of a column.
 
@@ -9769,7 +9799,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         "newborn": self.inmodel_repeats_newborn,
                         "mature": self.inmodel_repeats_survivor,
                     }
-                    for _cls_name, _cls in _split_by_newborn(merged, self.xp):
+                    # COLUMN-DISJOINT classes under vertical swaps -- see
+                    # _grouped_flush_classes (2026-10-04).
+                    _col_atomic = (
+                        bool(getattr(self, "temper_vertical", False))
+                        and self.ntemps > 1
+                    )
+                    for _cls_name, _cls in _grouped_flush_classes(
+                            merged, self.xp, self.num_bands, _col_atomic):
                         _cv = self._converge_state_for(_cls_name)
                         _reps = (
                             _cls_reps[_cls_name] if _cv is None or _cv.observe
@@ -18071,6 +18108,35 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         t_i = picked["temp_inds"][alive]
         w_i = picked["walker_inds"][alive]
         b_i = picked["band_inds"][alive]
+        # STALE POOL TEMPERATURES (2026-10-04). ``temp_inds`` is a PICK-TIME
+        # copy; a vertical swap in an earlier block on this residency can
+        # have moved the row's cell to another rung since (the grouped
+        # flush's per-row class split did exactly that -- see
+        # _grouped_flush_classes). The SORTER is authoritative for the label
+        # and the slot is physical (cells keep their slots; the block-end
+        # re-base moved the slot's label with the model), so the block runs
+        # on the sorter's rung. A stale row would otherwise be scored at the
+        # wrong beta, credited to the wrong cell, and name one slot twice in
+        # the all-rung table. One gather + one sync per block. (A harness
+        # sorter stub without ``temp_inds`` has no labels to compare; the
+        # real BandSorter always carries them.)
+        _ts_all = getattr(band_sorter, "temp_inds", None)
+        _t_now = _ts_all[ids] if _ts_all is not None else t_i
+        _stale = _t_now != t_i
+        if _ts_all is not None and bool(_stale.any()):
+            _n_st = int(_stale.sum())
+            _hits = getattr(self, "_stale_pool_hits", 0) + 1
+            self._stale_pool_hits = _hits
+            if _hits == 1 or _hits % 1000 == 0:
+                logger.warning(
+                    "[GB_STALE_POOL %s] %d of %d pooled row(s) reached their "
+                    "in-model block with a pick-time rung the sorter no "
+                    "longer gives them (a vertical swap in an earlier block "
+                    "moved their cell); running them on the sorter's rung. "
+                    "[block hit %d] Expected NEVER after 2026-10-04: some "
+                    "path still splits a column across blocks.",
+                    self.name, _n_st, int(t_i.shape[0]), _hits)
+            t_i = _t_now.astype(t_i.dtype)
         # Original eryn leaf index of each picked source: threads per-leaf
         # transform fills (Eryn per-leaf fill_dict) through every buffer
         # likelihood/fill call below. Scalar-fill containers ignore it.

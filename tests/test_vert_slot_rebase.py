@@ -255,5 +255,136 @@ class BlockEndRebaseIntegrationTest(unittest.TestCase):
                              int(sorter.special_band_inds[r]))
 
 
+# --------------------------------------------------------------------------
+# the GROUPED flush's newborn / mature split (2026-10-04, relaunch crash)
+# --------------------------------------------------------------------------
+def _pool(t, w, b, newborn):
+    t = np.asarray(t); w = np.asarray(w); b = np.asarray(b)
+    n = len(t)
+    return {
+        "ids": np.arange(n),
+        "specials": _spec(t, w, b),
+        "slot_index": np.arange(n, dtype=np.int32),
+        "temp_inds": t.copy(), "walker_inds": w.copy(), "band_inds": b.copy(),
+        "N_vals": np.full(n, 64),
+        "newborn": np.asarray(newborn, dtype=bool),
+    }
+
+
+class GroupedFlushClassesTest(unittest.TestCase):
+    """Column A = (w0, b1): cold MATURE survivor + hot NEWBORN. Column B =
+    (w1, b2): two mature rungs."""
+
+    def _merged(self):
+        return _pool(t=[0, 1, 0, 2], w=[0, 0, 1, 1], b=[1, 1, 2, 2],
+                     newborn=[False, True, False, False])
+
+    @staticmethod
+    def _cols(cls):
+        return set((cls["walker_inds"] * NB + cls["band_inds"]).tolist())
+
+    def test_vertical_on_classes_are_column_disjoint(self):
+        out = dict(g._grouped_flush_classes(self._merged(), np, NB, True))
+        self.assertEqual(sorted(out), ["mature", "newborn"])
+        self.assertEqual(self._cols(out["newborn"]), {0 * NB + 1})
+        self.assertEqual(self._cols(out["mature"]), {1 * NB + 2})
+        # the cold mature rung of column A rides with its newborn
+        self.assertEqual(sorted(out["newborn"]["temp_inds"].tolist()), [0, 1])
+        self.assertNotIn("newborn", out["newborn"])
+
+    def test_NEGATIVE_CONTROL_per_row_split_strands_a_column(self):
+        """What the grouped path did before: column A in BOTH classes."""
+        out = dict(g._grouped_flush_classes(self._merged(), np, NB, False))
+        self.assertTrue(self._cols(out["newborn"]) & self._cols(out["mature"]))
+
+    def test_the_grouped_branch_uses_the_column_atomic_split(self):
+        import inspect
+        src = inspect.getsource(g.GBSpecialStretchMove._run_band_unit)
+        self.assertIn("_grouped_flush_classes(\n", src)
+        self.assertIn("merged, self.xp, self.num_bands, _col_atomic)", src)
+        self.assertNotIn("_split_by_newborn(merged, self.xp)", src)
+
+
+class GroupedFlushSequenceTest(unittest.TestCase):
+    """The REAL _run_in_model_repeats run once per flush class, in order, on
+    ONE residency (sorter, scheduler, buffer) -- the grouped flush. Column
+    (w0, b1), sources 0..3 on rungs 0..3 in slots 0..3. Source 0 is the cold
+    MATURE survivor and its slab is terrible, so the newborn block (rows 1,
+    2, 3) swaps it up with certainty while it is a RESIDENT NON-CARRIER.
+    Its pooled row still says rung 0: the 6mo relaunch's RuntimeError."""
+
+    def _state(self):
+        h, v = _harness()
+        t = np.arange(NT); w = np.zeros(NT, int); b = np.ones(NT, int)
+        rng = np.random.RandomState(3)
+        coords = np.zeros((NT, 4))
+        coords[:, 0] = rng.uniform(-0.5, 0.5, NT)
+        coords[:, 1] = rng.uniform(2.95, 3.05, NT)
+        coords[:, 2] = rng.uniform(-1, 1, NT)
+        coords[:, 3] = rng.uniform(-1, 1, NT)
+        sorter = v._FakeSorter(t, w, b, NW)
+        sorter.inds = np.ones(NT, dtype=bool)
+        sorter.coords = coords.copy()
+        sorter.leaf_inds = np.arange(NT)
+        sched = BandScheduler(sorter.special_band_inds.copy(), 16, xp=np,
+                              cell_order="band", nwalkers=NW)
+
+        class _Buf(h._FakeBuffer):
+            def band_likelihoods(self, source_only=False, slots=None):
+                vals = np.zeros(NT)
+                vals[0] = -1.0e6            # slot 0's cell is terrible
+                return vals if slots is None else vals[np.asarray(slots)]
+
+            def update_special_indices(self, new, inds_fill=None):
+                pass
+
+        mv = h._make_move(2)
+        mv.ntemps, mv.nwalkers, mv.num_bands = NT, NW, NB
+        mv.temper_vertical = True
+        mv._temper_rng = np.random.default_rng(5)
+        mv.sequential_parity_repeats = False
+        merged = _pool(t, w, b, newborn=[False, True, True, True])
+        return v, sorter, sched, _Buf(NT), mv, merged
+
+    def _flush(self, column_atomic):
+        v, sorter, sched, buf, mv, merged = self._state()
+        ll_change = np.zeros((NT, NW, NB))
+        prop = np.zeros((2, NT, NW, NB), dtype=int)
+        acc = np.zeros_like(prop)
+        env = {"GB_TEMPER_ALL_RUNGS": "1", "GB_TEMPER_VERTICAL_AT_REFIT": "0",
+               "GB_VERT_EXACT_PRICE": "0"}
+        np.random.seed(7)
+        classes = g._grouped_flush_classes(merged, np, NB, column_atomic)
+        with mock.patch.dict(os.environ, env):
+            for _name, cls in classes:
+                mv._run_in_model_repeats(
+                    None, sorter, buf, v._ladder(), cls, ll_change, prop, acc,
+                    num_repeats=2, scheduler=sched)
+        return sorter, sched, classes
+
+    def _assert_slots_follow_the_model(self, sorter, sched):
+        self.assertNotEqual(int(sorter.temp_inds[0]), 0, "no swap was accepted")
+        for r in range(NT):                         # slot == source here
+            self.assertEqual(int(sched.slot_specials[r]),
+                             int(sorter.special_band_inds[r]),
+                             f"slot {r} claims a label its sources do not carry")
+        g._assert_active_slot_labels_unique(sched, "test", np)
+
+    def test_column_atomic_flush_is_one_block_and_consistent(self):
+        sorter, sched, classes = self._flush(column_atomic=True)
+        self.assertEqual([c for c, _ in classes], ["newborn"])
+        self._assert_slots_follow_the_model(sorter, sched)
+
+    def test_a_stale_pooled_rung_is_run_on_the_sorters_rung(self):
+        """Per-row split (the pre-fix grouped path): the mature block's row
+        arrives stale. Without the block-start check this raised the
+        relaunch's RuntimeError at the block-end re-base."""
+        with self.assertLogs(g.logger, level="WARNING") as cm:
+            sorter, sched, classes = self._flush(column_atomic=False)
+        self.assertEqual([c for c, _ in classes], ["newborn", "mature"])
+        self.assertTrue(any("[GB_STALE_POOL" in m for m in cm.output))
+        self._assert_slots_follow_the_model(sorter, sched)
+
+
 if __name__ == "__main__":
     unittest.main()

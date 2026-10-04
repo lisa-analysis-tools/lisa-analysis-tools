@@ -1846,8 +1846,15 @@ class StagedFlushConvergesTest(unittest.TestCase):
 
     def test_the_flush_splits_by_class_and_passes_converge(self):
         src = self._staged_src()
-        self.assertIn("for _cls_name, _cls in _split_by_newborn(merged, self.xp)",
-                      src)
+        # 2026-10-04: the grouped flush splits through the COLUMN-DISJOINT
+        # helper (tests/test_vert_slot_rebase.py), which ends in the same
+        # provenance split.
+        self.assertIn("for _cls_name, _cls in _grouped_flush_classes(", src)
+        import inspect
+
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        self.assertIn("return _split_by_newborn(merged, xp)",
+                      inspect.getsource(g._grouped_flush_classes))
         self.assertIn("converge=_cv,", src)
 
     def test_the_pool_carries_pick_time_provenance(self):
@@ -2091,8 +2098,11 @@ class UngroupedPathHasNoConvergenceAndSaysSoTest(unittest.TestCase):
         wrong and must go."""
         src = self._src()
         self.assertIn("self.inmodel_repeats_survivor\n", src)
-        # the provenance split belongs to the pooled paths only
-        self.assertEqual(src.count("_split_by_newborn"), 2)
+        # the provenance split belongs to the pooled paths only: the direct
+        # path calls it, the grouped flush goes through
+        # _grouped_flush_classes (2026-10-04)
+        self.assertEqual(src.count("_split_by_newborn"), 1)
+        self.assertEqual(src.count("_grouped_flush_classes("), 1)
 
     def test_it_warns_once_when_convergence_is_armed(self):
         src = self._src()
