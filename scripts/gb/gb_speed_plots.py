@@ -22,11 +22,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-ENGINES = ("chunked", "sighet_reim", "sighet_ampph", "lookup")
-#: categorical slots 1-4 (reference palette, light), fixed order per engine
-COLOR = {"chunked": "#2a78d6", "sighet_reim": "#eb6834", "sighet_ampph": "#1baf7a",
-         "lookup": "#eda100"}
-MARK = {"chunked": "o", "sighet_reim": "s", "sighet_ampph": "^", "lookup": "D"}
+ENGINES = ("chunked", "sighet_carrier", "sighet_reim", "sighet_ampph", "lookup")
+#: categorical slots 1-5 (reference palette, light), fixed order per engine
+COLOR = {"chunked": "#2a78d6", "sighet_carrier": "#8f5bd6", "sighet_reim": "#eb6834",
+         "sighet_ampph": "#1baf7a", "lookup": "#eda100"}
+MARK = {"chunked": "o", "sighet_carrier": "v", "sighet_reim": "s", "sighet_ampph": "^",
+        "lookup": "D"}
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
 
 
@@ -115,15 +116,43 @@ def speed(out, recs):
         plt.close(fig)
 
 
+def _groups(d):
+    """Gate group of one delta record: catalogue class, or synthetic by |cos i| bin and SNR."""
+    if d.get("source", "synthetic") != "synthetic":
+        return f"{d['source']} (catalogue)"
+    c = abs(d["cosi"])
+    b = ("|cos i|<0.03" if c < 0.03 else "0.03-0.2" if c < 0.2 else "0.2-0.5" if c < 0.5
+         else ">=0.5")
+    return f"syn {b} SNR{d['snr']:.0f}"
+
+
 def gate(out, recs):
     deltas = [r for r in recs if r.get("kind") == "delta"]
     for r in recs:
         if r.get("kind") == "summary":
-            print(f"\n== GATE {r['days']:.0f} d (SNR {r['rho']:.0f}): tier pass fraction / "
-                  f"max eps / max eps/T / max |anchor|")
+            print(f"\n== GATE {r['days']:.0f} d ({r.get('n_sources', '?')} sources): "
+                  f"tier pass / median eps / p90 eps / max eps / max |anchor|")
             for e, s in r["engines"].items():
-                print(f"{e:>13}: {s['tier_pass_frac']:6.1%}  {s['max_eps']:9.3g}  "
-                      f"{s['max_eps_over_T']:9.3g}  {s['max_abs_anchor']:9.3g}")
+                print(f"{e:>13}: {s['tier_pass_frac']:6.1%}  {s.get('median_eps', float('nan')):9.3g}"
+                      f"  {s.get('p90_eps', float('nan')):9.3g}  {s['max_eps']:9.3g}"
+                      f"  {s['max_abs_anchor']:9.3g}")
+    if deltas:
+        engs = [e for e in ENGINES if e in deltas[0]]
+        print("\n== GATE by group: tier pass / median eps (ln L)")
+        print(f"{'group':>28} {'n':>4} " + " ".join(f"{e:>20}" for e in engs))
+        for d_ in sorted({r["days"] for r in deltas}):
+            groups = defaultdict(list)
+            for r in deltas:
+                if r["days"] == d_:
+                    groups[_groups(r)].append(r)
+            for g in sorted(groups):
+                rr = groups[g]
+                cells = []
+                for e in engs:
+                    eps = np.array([x[e]["eps"] for x in rr])
+                    ok = np.mean([x[e]["tier_pass"] for x in rr])
+                    cells.append(f"{ok:5.0%} {np.median(eps):9.2e}   ")
+                print(f"{g:>28} {len(rr):4d} " + " ".join(f"{c:>20}" for c in cells))
     tmpl = [r for r in recs if r.get("kind") == "template"]
     if tmpl:
         print("\n== GATE template level vs dense truth: worst mm / worst |ratio-1|")
@@ -177,10 +206,10 @@ def mojito(out, recs):
         if e not in recs[0]:
             continue
         mm = [max(r[e]["data"]["mm"], 1e-14) for r in recs]
-        a1.bar(x + (k - 1.5) * w, mm, width=w * 0.9, color=COLOR[e], label=e, log=True)
+        a1.bar(x + (k - (len(ENGINES) - 1) / 2) * w, mm, width=w * 0.9, color=COLOR[e], label=e, log=True)
         if e != "chunked":
             dl = [max(abs(r[e].get("dlogL_vs_production", 0.0)), 1e-12) for r in recs]
-            a2.bar(x + (k - 1.5) * w, dl, width=w * 0.9, color=COLOR[e], label=e, log=True)
+            a2.bar(x + (k - (len(ENGINES) - 1) / 2) * w, dl, width=w * 0.9, color=COLOR[e], label=e, log=True)
     a1.set_ylabel("mismatch vs data")
     a2.set_ylabel("|dlogL vs chunked|")
     a2.set_xticks(x)

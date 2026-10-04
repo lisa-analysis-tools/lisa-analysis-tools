@@ -180,6 +180,49 @@ def step_speed(a):
 
 
 # ===================================================================== gate
+def _gate_cases(a, rng, wdm):
+    """``(params (n, 9) at unit-ish amplitude, rho (n,) target SNR or nan = keep, labels)``.
+
+    synthetic: ``--gate-f0`` x ``--gate-cosi`` x ``--gate-skies`` random skies / phases, each at
+    every SNR of ``--rho-list``; catalogue: the ``--gate-catalogue-top`` highest-SNR galaxy GBs and
+    ``--gate-vgb-top`` VGBs (exact SNR on this run's box) at their catalogue amplitude."""
+    rows, rho, lab = [], [], []
+    if "synthetic" in a.gate_sources:
+        for f in np.array(a.gate_f0) * 1e-3:
+            for c in a.gate_cosi:
+                for _ in range(a.gate_skies):
+                    base = [1e-22, f, 1e-18 * (f / 1e-3) ** (11 / 3), 0.0,
+                            rng.uniform(0, 2 * np.pi), np.arccos(c), rng.uniform(0, np.pi),
+                            rng.uniform(0, 2 * np.pi), np.arcsin(rng.uniform(-1, 1))]
+                    for r in a.rho_list:
+                        rows.append(list(base))
+                        rho.append(float(r))
+                        lab.append(dict(kind="synthetic", id=f"syn_{f*1e3:.2f}mHz_c{c:+.2f}"))
+    if "catalogue" in a.gate_sources:
+        import gb_catalogue_snr as cs
+
+        for kind, top in (("GB", a.gate_catalogue_top), ("VGB", a.gate_vgb_top)):
+            if top <= 0:
+                continue
+            cat = a.catalogue if kind == "GB" else a.vgb_catalogue
+            if cat is None:
+                brick = tb.find_brick(kind, a.l1_dir)
+                if brick is None:
+                    print(f"[gate] no {kind} catalogue -- skipped", flush=True)
+                    continue
+                cat = tb.find_catalogue(kind, brick)
+            snr_p, _, _ = cs.proxy_snr(cat, wdm.Tobs)
+            order = np.argsort(snr_p)[::-1][: max(5 * top, 50)]
+            params, ids, _ = tb.catalogue_params(cat, idx=order)
+            snr_e = cs.exact_snr(params, a.days)
+            best = np.argsort(snr_e)[::-1][:top]
+            for k in best:
+                rows.append(list(params[k]))
+                rho.append(np.nan)
+                lab.append(dict(kind=kind.lower(), id=ids[k]))
+    return np.array(rows), np.array(rho), lab
+
+
 def step_gate(a):
     from scipy.signal.windows import tukey
     from lisatools.domains import TDSettings, TDSignal, WDMSettings
@@ -189,18 +232,14 @@ def step_gate(a):
     nf, nt, dt = 180, int(round(a.days * 24)), 20.0
     t0 = 0.5 * 365.25 * 86400.0 + tb.REF
     wdm = tb.run_box(nf, nt, dt, t0, edge=a.edge)
-    wdm_full = WDMSettings(nf, nt, dt, t0=t0, min_freq=tb.MIN_FREQ, max_freq=0.5 / dt,
+    wdm_full = WDMSettings(nf, nt, dt, t0=t0, min_freq=1e-4, max_freq=0.5 / dt,
                            force_backend="cpu")
     orbits = _orbits("cpu")
     engines = tb.build_engines(wdm, orbits, names=a.engines, backend="cpu", table=a.table)
     sens, noise_label = tb.noise(wdm, wdm.Tobs, a.foreground)
     T = int(wdm.ind_max_t - wdm.ind_min_t + 1)
     n_lo = int(wdm.ind_min_t)
-    f0s = np.array(a.gate_f0) * 1e-3
-    cosis = np.array(a.gate_cosi)
-    p0 = np.array([[1e-22, f, 1e-18 * (f / 1e-3) ** (11 / 3), 0.0, rng.uniform(0, 2 * np.pi),
-                    np.arccos(c), rng.uniform(0, np.pi), rng.uniform(0, 2 * np.pi),
-                    np.arcsin(rng.uniform(-1, 1))] for f in f0s for c in cosis])
+    p0, rho, lab = _gate_cases(a, rng, wdm)
     n = len(p0)
     slab_lo = tb.slab_lo_for(p0[:, 1], wdm)
     invc = tb.slab_invc(sens, wdm, slab_lo)
@@ -221,17 +260,36 @@ def step_gate(a):
     def ip(i, x, y):
         return float(np.einsum("cwt,cdwt,dwt->", x, invc[i], y))
 
-    d0 = []
+    # references: dense truth once per distinct base row, amplitude set to the target SNR
+    d0, cache = [], {}
+    snr0 = np.zeros(n)
     for i in range(n):
-        s = dense(i, p0[i])
-        sc = a.rho / np.sqrt(ip(i, s, s))
-        p0[i, 0] *= sc
-        d0.append(s * sc)
+        key = tuple(np.round(p0[i, 1:], 12))
+        if key not in cache:
+            cache[key] = (p0[i, 0], dense(i, p0[i]))
+        a_ref, s = cache[key]
+        s = s * (p0[i, 0] / a_ref)
+        snr_i = np.sqrt(ip(i, s, s))
+        if np.isfinite(rho[i]):
+            sc = rho[i] / snr_i
+            p0[i, 0] *= sc
+            s = s * sc
+            snr_i = rho[i]
+        snr0[i] = snr_i
+        d0.append(s)
     d0 = np.array(d0)
     holder = tb.SlabHolder(d0, invc, slab_lo)
     idx = np.arange(n)
     NV = np.full(n, 1024)
-    cands = [(s, _jitter(p0, rng, s)) for s in a.step_scales for _ in range(a.n_cand)]
+    # posterior-scale steps shrink as 1/SNR: scale x 100 / snr keeps T comparable across SNR
+    stepk = 100.0 / snr0
+    cands = []
+    for s in a.step_scales:
+        for _ in range(a.n_cand):
+            q = p0.copy()
+            for i in range(n):
+                q[i] = _jitter(p0[i:i + 1], rng, s * stepk[i])[0]
+            cands.append((s, q))
 
     def ll_engine(name, eng, P):
         if name == "lookup":
@@ -242,10 +300,7 @@ def step_gate(a):
                          waveform_kwargs={})
         return np.asarray(out, dtype=float).ravel()[:n], None
 
-    D = {}
-    anchor = {}
-    tmpl = {}
-    t_tr = {}
+    D, anchor, tmpl, t_tr = {}, {}, {}, {}
     for name, eng in engines.items():
         t = time.perf_counter()
         if name.startswith("sighet_"):
@@ -254,48 +309,51 @@ def step_gate(a):
         D[name] = [ll_engine(name, eng, p1)[0] - l0 for _, p1 in cands]
         if name.startswith("sighet_"):
             eng.clear_in_model()
-        anchor[name] = l0
-        tmpl[name] = tpl0
-        t_tr[name] = time.perf_counter() - t
+        anchor[name], tmpl[name], t_tr[name] = l0, tpl0, time.perf_counter() - t
     if "chunked" in engines:
         z = tb.SlabHolder(np.zeros_like(d0), invc, slab_lo)
         engines["chunked"].fill_template(z, p0, idx, NV, factor=+1, waveform_kwargs={},
                                          band_slab_Nf=tb.SLAB_W, slab_min_f=slab_lo)
         tmpl["chunked"] = z.linear_data_arr[0].reshape(n, 3, tb.SLAB_W, T)
-    ll_true0 = np.array([ip(i, d0[i], d0[i]) * 0.5 for i in range(n)])
-    summ = {name: dict(n=0, tier_pass=0, max_eps=0.0, max_eps_over_T=0.0) for name in engines}
+    ll_true0 = np.array([0.5 * ip(i, d0[i], d0[i]) for i in range(n)])
+    head = dict(days=float(a.days), nf=nf, nt=nt, dt=dt, edge=a.edge, foreground=a.foreground,
+                noise=noise_label)
+    rec_rows = []
     for k, (s, p1) in enumerate(cands):
         for i in range(n):
             h1 = dense(i, p1[i])
             Dt = ip(i, d0[i], h1) - 0.5 * ip(i, h1, h1) - ll_true0[i]
-            rec = dict(kind="delta", days=float(a.days), nf=nf, nt=nt, dt=dt, edge=a.edge,
-                       foreground=a.foreground, noise=noise_label, rho=a.rho, scale=float(s),
-                       f0=float(p0[i, 1]), cosi=float(np.cos(p0[i, 5])), T=float(abs(Dt)))
+            rec = dict(head, kind="delta", source=lab[i]["kind"], id=lab[i]["id"],
+                       snr=float(snr0[i]), scale=float(s), f0=float(p0[i, 1]),
+                       cosi=float(np.cos(p0[i, 5])), T=float(abs(Dt)))
             for name in engines:
                 e = float(abs(D[name][k][i] - Dt))
-                ok = e <= max(0.1, abs(Dt) / 100.0)
-                rec[name] = dict(eps=e, eps_over_T=e / max(abs(Dt), 1e-30), tier_pass=bool(ok),
+                rec[name] = dict(eps=e, eps_over_T=e / max(abs(Dt), 1e-30),
+                                 tier_pass=bool(e <= max(0.1, abs(Dt) / 100.0)),
                                  anchor=float(anchor[name][i] - ll_true0[i]))
-                sm = summ[name]
-                sm["n"] += 1
-                sm["tier_pass"] += int(ok)
-                sm["max_eps"] = max(sm["max_eps"], e)
-                sm["max_eps_over_T"] = max(sm["max_eps_over_T"], e / max(abs(Dt), 1e-30))
+            rec_rows.append(rec)
             _write(a.out, rec)
     for i in range(n):
-        rec = dict(kind="template", days=float(a.days), f0=float(p0[i, 1]),
-                   cosi=float(np.cos(p0[i, 5])), rho=a.rho)
+        rec = dict(head, kind="template", source=lab[i]["kind"], id=lab[i]["id"],
+                   f0=float(p0[i, 1]), cosi=float(np.cos(p0[i, 5])), snr=float(snr0[i]))
         for name, s_ in tmpl.items():
             if s_ is None:
                 continue
             ab, aa, bb = ip(i, s_[i], d0[i]), ip(i, s_[i], s_[i]), ip(i, d0[i], d0[i])
             rec[name] = dict(mm=1 - ab / np.sqrt(aa * bb), ratio=float(np.sqrt(aa / bb)))
         _write(a.out, rec)
-    for name, sm in summ.items():
-        sm["tier_pass_frac"] = sm["tier_pass"] / max(sm["n"], 1)
-        sm["max_abs_anchor"] = float(np.abs(anchor[name] - ll_true0).max())
-        sm["t_total_s"] = t_tr[name]
-    _write(a.out, dict(kind="summary", days=float(a.days), rho=a.rho, engines=summ))
+    summ = {}
+    for name in engines:
+        e = np.array([r[name]["eps"] for r in rec_rows])
+        Tt = np.array([r["T"] for r in rec_rows])
+        ok = np.array([r[name]["tier_pass"] for r in rec_rows])
+        summ[name] = dict(n=int(e.size), tier_pass_frac=float(ok.mean()),
+                          median_eps=float(np.median(e)), p90_eps=float(np.percentile(e, 90)),
+                          max_eps=float(e.max()), max_eps_over_T=float((e / Tt).max()),
+                          max_abs_anchor=float(np.abs(anchor[name] - ll_true0).max()),
+                          t_total_s=t_tr[name])
+    _write(a.out, dict(head, kind="summary", engines=summ, n_sources=int(n),
+                       sources=sorted({l["kind"] for l in lab})))
 
 
 # ===================================================================== mojito
@@ -396,11 +454,15 @@ def main():
     ap.add_argument("--edge", type=int, default=tb.EDGE_CROP_WAVELETS)
     ap.add_argument("--foreground", choices=("on", "off"), default="on")
     ap.add_argument("--table", default=None)
-    ap.add_argument("--rho", type=float, default=100.0)
-    ap.add_argument("--gate-f0", default="0.6,1.0,2.0,4.0,8.0,16.0", help="mHz")
-    ap.add_argument("--gate-cosi", default="0.02,0.3,0.8")
-    ap.add_argument("--step-scales", default="0.1,1")
-    ap.add_argument("--n-cand", type=int, default=2)
+    ap.add_argument("--gate-sources", default="synthetic,catalogue")
+    ap.add_argument("--gate-f0", default="0.3,0.6,1.0,2.0,4.0,8.0,16.0", help="mHz")
+    ap.add_argument("--gate-cosi", default="0.0,0.02,0.05,0.1,0.3,0.8")
+    ap.add_argument("--gate-skies", type=int, default=1)
+    ap.add_argument("--rho-list", default="100,1000", help="synthetic SNR ladder")
+    ap.add_argument("--gate-catalogue-top", type=int, default=20)
+    ap.add_argument("--gate-vgb-top", type=int, default=10)
+    ap.add_argument("--step-scales", default="0.1,1,3", help="x 100/SNR posterior-scale steps")
+    ap.add_argument("--n-cand", type=int, default=1)
     ap.add_argument("--vgb-top", type=int, default=6)
     ap.add_argument("--gb-top", type=int, default=6)
     ap.add_argument("--l1-dir", default=None)
@@ -416,6 +478,8 @@ def main():
     a.gate_f0 = [float(x) for x in a.gate_f0.split(",")]
     a.gate_cosi = [float(x) for x in a.gate_cosi.split(",")]
     a.step_scales = [float(x) for x in a.step_scales.split(",")]
+    a.gate_sources = [x for x in a.gate_sources.split(",") if x]
+    a.rho_list = [float(x) for x in a.rho_list.split(",")]
     {"speed": step_speed, "gate": step_gate, "mojito": step_mojito}[a.step](a)
 
 

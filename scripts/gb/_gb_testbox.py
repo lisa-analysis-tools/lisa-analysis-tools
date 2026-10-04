@@ -16,8 +16,10 @@ Mirrors ``scripts/sobbh/_sobbh_testbox.py`` (EMRI / MBH / SOBBH test setups, 202
 Engines (the arms of every step):
 
 * ``chunked``       -- chunked-het (the production exact scorer and filler);
-* ``sighet_reim``   -- sig-het v5, Re/Im control points + Re/Im node ratio (GBGPU dev c81d8bb+,
-                       the default);
+* ``sighet_carrier`` -- sig-het v5 against the carrier-only reference (GBGPU dev d12576f+, the
+                       default; 85dc650+ folds with the collapsed (a, b) stash and the second
+                       moment; ``SIGHET_CARRIER_COLLAPSE=0`` = the full layout for the A/B);
+* ``sighet_reim``   -- sig-het v5, Re/Im control points + Re/Im node ratio (c81d8bb);
 * ``sighet_ampph``  -- sig-het v5, amplitude/phase control points + log-polar node ratio (the
                        pre-c81d8bb behaviour, ``SIGHET_CP_REPR=ampph``);
 * ``lookup``        -- the reference-free direct-to-WDM lookup (``gb_lookup_scorer.py``, Python
@@ -42,14 +44,39 @@ CATALOGUES = {"GB": "wdwd_cat_mojito_lite_processed.hdf5",
 #: catalogue field -> UCB param column (fddot = 0 inserted at index 3)
 FIELDS = ["Amplitude", "GW22FrequencySSBFrame", "GW22FrequencyDerivativeSourceFrame",
           "TrueAnomaly", "InclinationAngle", "PolarisationAngle", "RightAscension", "Declination"]
-ENGINES = ("chunked", "sighet_reim", "sighet_ampph", "lookup")
+ENGINES = ("chunked", "sighet_carrier", "sighet_reim", "sighet_ampph", "lookup")
 #: chunked-het settings of the production GB engine (gb_sighet_bfold_gpu_probe.py)
 CHUNKED_KW = dict(Nt_sub=256, n_pad=32, N_sparse=256, N_cp_sig=48, N_cp_orbit=32)
 SIGHET_KW = dict(n_sparse_fd=1024, m_active_half_width=2, max_r=0.0, n_cp_build=256,
                  v3_n_nodes=64, v4_knots=128, v4_band=16, v5=1)
-TABLE_DEFAULT = os.environ.get(
-    "TABLE", "/Users/mkatz/Research/lisa_sprint_2026/"
-    "wdm_lookup_emri_cx_NF180_DT20_TL32_fd8x0p01_nld2.h5")
+#: The GB lookup table recipe: the shared EMRI recipe (n_ref_complex, m_ref 21, eps_freq 0.005,
+#: 2 layers each side, eps_fdot 0.01) but built over a 128-layer record instead of 32 and with
+#: a narrow fdot axis (+-0.1 layer_df / layer_dt -- GB |fdot| is <~1e-6 of that, fdot = 0 is a
+#: node). Measured on a pure tone at the table nodes (Nf 180 / dt 20): the 32-layer build
+#: carries an in-layer-offset-dependent NORM bias up to 2.5e-5 (mm 3e-8) from the short build
+#: record; 64 layers -> 2e-7 (mm 1e-10); 128 -> 5e-9 (mm 8e-14). Built once on the cheap
+#: Nf 180 / dt 20 grid: the table depends only on the layer duration (3600 s), so it serves the
+#: Nf 1440 / dt 2.5 production grid too.
+GB_TABLE_RECIPE = dict(prefix="wdm_lookup_gb_cx", fdot_max_factor=0.1, time_layers=128,
+                       max_freq=2.5e-2)
+GB_TABLE_GRID = (180, 20.0)
+
+
+def gb_table(table=None, table_dir=None):
+    """Path of the lookup table: ``table`` when given, else the GB recipe table in
+    ``table_dir`` (default env GB_LOOKUP_TABLE_DIR or ~/.cache/gb_lookup_tables), built there
+    first (atomic, lock-protected) when missing."""
+    if table:
+        return table
+    from lisatools.wdm_lookup_store import ensure_lookup_table, lookup_table_path
+
+    d = table_dir or os.environ.get("GB_LOOKUP_TABLE_DIR",
+                                    os.path.expanduser("~/.cache/gb_lookup_tables"))
+    nf, dt = GB_TABLE_GRID
+    path = lookup_table_path(None, d, nf, dt, recipe=GB_TABLE_RECIPE)
+    status = ensure_lookup_table(path, Nf=nf, dt=dt, recipe=GB_TABLE_RECIPE)
+    print(f"[gb_table] {status}: {path}", flush=True)
+    return path
 
 
 def grid_args(days, laptop=False):
@@ -142,7 +169,9 @@ def build_engines(wdm, orbits, *, names=ENGINES, backend="cpu", nt_layer=-1, tab
             from lisatools.response.tdiconfig import TDIConfig
             from lisatools.wdm_lookup_eval import WDMLookupEvaluator
 
-            tab = WDMLookupTable.from_file(table or TABLE_DEFAULT, force_backend="cpu")
+            tab = WDMLookupTable.from_file(gb_table(table), force_backend="cpu")
+            if abs(float(tab.layer_dt) - float(wdm.layer_dt)) > 1e-6:
+                raise ValueError(f"lookup table layer_dt {tab.layer_dt} != grid {wdm.layer_dt}")
             ev = WDMLookupEvaluator(tab, interp="spline", force_backend=backend)
             out[name] = GBLookupTemplate(
                 ev, wdm, orbits=orbits, tdi_config=TDIConfig("2nd generation", force_backend="cpu"),

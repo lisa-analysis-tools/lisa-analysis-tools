@@ -17,12 +17,15 @@
 #                 production. -> mojito.jsonl
 # Then: summary tables + scaling / accuracy plots (gb_speed_plots.py).
 #
-# Engines: chunked (production exact), sighet_reim (v5, GBGPU >= c81d8bb
-# default), sighet_ampph (v5 pre-c81d8bb), lookup (reference-free direct WDM,
-# Python prototype -- its speed is a Python number, not a kernel's).
+# Engines: chunked (production exact), sighet_carrier (v5 default, GBGPU >=
+# d12576f; collapsed stash + second fold moment from 85dc650 -- rerun with
+# SIGHET_CARRIER_COLLAPSE=0 for the full-layout A/B), sighet_reim (c81d8bb),
+# sighet_ampph (pre-c81d8bb), lookup (reference-free direct WDM, Python
+# prototype -- its speed is a Python number, not a kernel's).
+# GPU occupancy of the v5 kernel: GB_SIGHET_V5_VERBOSE=1 (regs, blocks/SM).
 #
-# Cluster:  BACKEND=cuda12x TABLE=$PWD/wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5 \
-#             MOJITO_LIGHT_PATH=/shared/data/mojito_cache bash scripts/gb/gb_speed_durations.sh
+# Cluster:  BACKEND=cuda12x MOJITO_LIGHT_PATH=/shared/data/mojito_cache \
+#             bash scripts/gb/gb_speed_durations.sh
 # Laptop:   DAYS=90 ROWS=4,16 SPEED_ARGS=--laptop GATE_ARGS="--gate-f0 2,16 \
 #             --gate-cosi 0.02,0.8 --n-cand 1" VGB_TOP=2 GB_TOP=2 \
 #             bash scripts/gb/gb_speed_durations.sh
@@ -34,7 +37,7 @@ BACKEND=${BACKEND:-cpu}
 DAYS=${DAYS:-"180 360 720"}
 ROWS=${ROWS:-8,64,512,4096}
 MAX_SLOTS=${MAX_SLOTS:-256}
-ENGINES=${ENGINES:-chunked,sighet_reim,sighet_ampph,lookup}
+ENGINES=${ENGINES:-chunked,sighet_carrier,sighet_reim,sighet_ampph,lookup}
 REPS=${REPS:-3}
 EDGE=${EDGE:-60}
 FOREGROUND=${FOREGROUND:-on}
@@ -45,23 +48,16 @@ MOJITO=${MOJITO:-auto}          # auto: run if bricks are found; 0: skip; 1: req
 VGB_TOP=${VGB_TOP:-6}
 GB_TOP=${GB_TOP:-6}
 MOJITO_ARGS=${MOJITO_ARGS:-}
-# lookup table (any n_ref table at the 3600-s layer; the EMRI / SOBBH run tables serve):
-TABLE=${TABLE:-${GB_LOOKUP_TABLE_PATH:-${SOBBH_LOOKUP_TABLE_PATH:-${EMRI_DIRECT_TABLE:-}}}}
+# lookup table: empty = the GB recipe table (128-layer build record, narrow fdot axis; the
+# shared 32-layer EMRI/SOBBH table carries a ~2e-5 norm bias), built once into
+# GB_LOOKUP_TABLE_DIR (default ~/.cache/gb_lookup_tables) on first use. TABLE= overrides.
+TABLE=${TABLE:-${GB_LOOKUP_TABLE_PATH:-}}
 OUT=${OUT:-gb_speed_durations_$(date +%Y%m%d_%H%M)}
 
 mkdir -p "$OUT"
-LAPTOP_TABLE=/Users/mkatz/Research/lisa_sprint_2026/wdm_lookup_emri_cx_NF180_DT20_TL32_fd8x0p01_nld2.h5
-case ",$ENGINES," in
-  *,lookup,*)
-    if [ -z "$TABLE" ] && [ ! -f "$LAPTOP_TABLE" ]; then
-      echo "[gb_speed_durations] ENGINES has lookup but no table: set TABLE= (e.g. the run's"
-      echo "  wdm_lookup_emri_cx_NF1440_DT2p5_TL32_fd8x0p01_nld2.h5) or drop lookup from ENGINES"
-      exit 2
-    fi
-    if [ -n "$TABLE" ] && [ ! -f "$TABLE" ]; then
-      echo "[gb_speed_durations] TABLE=$TABLE does not exist"; exit 2
-    fi ;;
-esac
+if [ -n "$TABLE" ] && [ ! -f "$TABLE" ]; then
+  echo "[gb_speed_durations] TABLE=$TABLE does not exist"; exit 2
+fi
 TABLE_ARG=()
 if [ -n "$TABLE" ]; then TABLE_ARG=(--table "$TABLE"); fi
 echo "[gb_speed_durations] OUT=$OUT BACKEND=$BACKEND DAYS='$DAYS' ROWS=$ROWS ENGINES=$ENGINES"
