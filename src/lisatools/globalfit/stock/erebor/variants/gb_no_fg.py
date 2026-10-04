@@ -388,6 +388,12 @@ class GBNoFgGBSettings(GBSettings):
     lookup_k_coarse: bool = dataclasses.field(
         default_factory=env_default("GB_LOOKUP_K_COARSE", True, bool)
     )
+    # likelihood="lookup" only: also WRITE the lookup template on fills (adds /
+    # removals / the engine's templates), so every GB template is the model the
+    # likelihood scores. Default off (fills stay chunked-het). GBGPU >= f97aadc.
+    lookup_fill: bool = dataclasses.field(
+        default_factory=env_default("GB_LOOKUP_FILL", False, bool)
+    )
     # NOTE: no __post_init__ here — Setup.__init__ re-runs this dataclass's
     # __init__ on the (non-dataclass) GBSetup instance, which cannot resolve
     # dataclass hooks. Value validation happens in prepare_branch_settings.
@@ -1038,6 +1044,7 @@ def setup_gb_moves(engine_info, curr, acs, priors, state) -> dict:
                     getattr(gb_info, "lookup_table_dir", "") or None),
                 lookup_n_nodes=int(getattr(gb_info, "lookup_n_nodes", 64)),
                 lookup_k_coarse=bool(getattr(gb_info, "lookup_k_coarse", True)),
+                lookup_fill=bool(getattr(gb_info, "lookup_fill", False)),
             )
         gb_info.gb_wdm_comp = _comp_cls(
             _wdm,
@@ -1056,9 +1063,10 @@ def setup_gb_moves(engine_info, curr, acs, priors, state) -> dict:
         if _gb_like == "lookup":
             logger.info(
                 "GB per-row likelihood: LOOKUP (GBLookupWDMComputations; table %s, "
-                "n_nodes=%d, k_coarse=%s) -- fills / swaps / F-stat stay chunked-het",
+                "n_nodes=%d, k_coarse=%s, fills %s) -- swaps / F-stat stay chunked-het",
                 _lookup_kw["lookup_table"], _lookup_kw["lookup_n_nodes"],
-                _lookup_kw["lookup_k_coarse"])
+                _lookup_kw["lookup_k_coarse"],
+                "LOOKUP" if _lookup_kw["lookup_fill"] else "chunked-het")
         logger.info(
             "Chunked-het GB likelihood: Nf=%d Nt=%d Nt_sub=%d N_sparse=%d "
             "N_cp_sig=%d N_cp_orbit=%d (domain t0 %.6e -> het t_obs_start=%.6e, "
