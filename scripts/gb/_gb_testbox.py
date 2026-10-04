@@ -25,7 +25,9 @@ Engines (the arms of every step):
 * ``sighet_ampph``  -- sig-het v5, amplitude/phase control points + log-polar node ratio (the
                        pre-c81d8bb behaviour, ``SIGHET_CP_REPR=ampph``);
 * ``lookup``        -- the reference-free direct-to-WDM lookup (``gb_lookup_scorer.py``, Python
-                       prototype: common carrier + amplitude-slope term).
+                       prototype: common carrier + amplitude-slope term);
+* ``lookup_kernel`` -- the same lookup as GBGPU's fused kernel (``GBLookupComputations``,
+                       GBGPU dev >= the lookup-kernel commit): the speed number that counts.
 """
 
 from __future__ import annotations
@@ -46,7 +48,7 @@ CATALOGUES = {"GB": "wdwd_cat_mojito_lite_processed.hdf5",
 #: catalogue field -> UCB param column (fddot = 0 inserted at index 3)
 FIELDS = ["Amplitude", "GW22FrequencySSBFrame", "GW22FrequencyDerivativeSourceFrame",
           "TrueAnomaly", "InclinationAngle", "PolarisationAngle", "RightAscension", "Declination"]
-ENGINES = ("chunked", "sighet_carrier", "sighet_reim", "sighet_ampph", "lookup")
+ENGINES = ("chunked", "sighet_carrier", "sighet_reim", "sighet_ampph", "lookup", "lookup_kernel")
 #: chunked-het settings of the production GB engine (gb_sighet_bfold_gpu_probe.py)
 CHUNKED_KW = dict(Nt_sub=256, n_pad=32, N_sparse=256, N_cp_sig=48, N_cp_orbit=32)
 SIGHET_KW = dict(n_sparse_fd=1024, m_active_half_width=2, max_r=0.0, n_cp_build=256,
@@ -203,6 +205,12 @@ def build_engines(wdm, orbits, *, names=ENGINES, backend="cpu", nt_layer=-1, tab
                 chunked, nt_layer=nt_layer, tukey_alpha=tukey_for(int(wdm.Nt)),
                 cp_repr=name.split("_", 1)[1], **SIGHET_KW)
             out[name] = make_band_likelihood_engine(wdm, gb_wdm_comp=sig, nchannels=3,
+                                                    tdi_channel_setup="XYZ")
+        elif name == "lookup_kernel":
+            from gbgpu.gblookupcomputations import GBLookupComputations
+
+            lk = GBLookupComputations(chunked, gb_table(table))
+            out[name] = make_band_likelihood_engine(wdm, gb_wdm_comp=lk, nchannels=3,
                                                     tdi_channel_setup="XYZ")
         elif name == "lookup":
             import sys

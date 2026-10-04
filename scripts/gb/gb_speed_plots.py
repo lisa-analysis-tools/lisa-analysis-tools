@@ -22,12 +22,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-ENGINES = ("chunked", "sighet_carrier", "sighet_reim", "sighet_ampph", "lookup")
-#: categorical slots 1-5 (reference palette, light), fixed order per engine
+ENGINES = ("chunked", "sighet_carrier", "sighet_reim", "sighet_ampph", "lookup",
+           "lookup_kernel")
+#: categorical slots 1-6 (reference palette, light), fixed order per engine
 COLOR = {"chunked": "#2a78d6", "sighet_carrier": "#8f5bd6", "sighet_reim": "#eb6834",
-         "sighet_ampph": "#1baf7a", "lookup": "#eda100"}
+         "sighet_ampph": "#1baf7a", "lookup": "#eda100", "lookup_kernel": "#e2427e"}
 MARK = {"chunked": "o", "sighet_carrier": "v", "sighet_reim": "s", "sighet_ampph": "^",
-        "lookup": "D"}
+        "lookup": "D", "lookup_kernel": "P"}
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
 
 

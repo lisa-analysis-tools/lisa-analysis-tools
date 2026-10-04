@@ -21,7 +21,8 @@
 # d12576f; collapsed stash + second fold moment from 85dc650 -- rerun with
 # SIGHET_CARRIER_COLLAPSE=0 for the full-layout A/B), sighet_reim (c81d8bb),
 # sighet_ampph (pre-c81d8bb), lookup (reference-free direct WDM, Python
-# prototype -- its speed is a Python number, not a kernel's).
+# prototype -- its speed is a Python number), lookup_kernel (the same lookup as
+# GBGPU's fused kernel, GBLookupComputations: the speed number that counts).
 # GPU occupancy of the v5 kernel: GB_SIGHET_V5_VERBOSE=1 (regs, blocks/SM).
 #
 # Cluster:  BACKEND=cuda12x MOJITO_LIGHT_PATH=/shared/data/mojito_cache \
@@ -37,7 +38,7 @@ BACKEND=${BACKEND:-cpu}
 DAYS=${DAYS:-"180 360 720"}
 ROWS=${ROWS:-8,64,512,4096}
 MAX_SLOTS=${MAX_SLOTS:-256}
-ENGINES=${ENGINES:-chunked,sighet_carrier,sighet_reim,sighet_ampph,lookup}
+ENGINES=${ENGINES:-chunked,sighet_carrier,sighet_reim,sighet_ampph,lookup,lookup_kernel}
 REPS=${REPS:-3}
 EDGE=${EDGE:-60}
 FOREGROUND=${FOREGROUND:-on}
