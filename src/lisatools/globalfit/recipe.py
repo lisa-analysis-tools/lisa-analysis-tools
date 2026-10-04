@@ -962,6 +962,19 @@ class PERecipeStep(BaseRecipeStep):
             apply_rj_flip_fraction(self.moves, self.pe_rj_flip_fraction,
                                    tag=self.stage_name or "pe")
 
+    def stopping_function(self, *args, **kwargs):
+        """Never stop on its own -- relies on outer stopping logic.
+
+        ⚠ MUST STAY A METHOD OF THIS CLASS. 3ac014a6 (2026-10-02) inserted
+        the module-level ``apply_rj_flip_fraction`` / ``apply_inmodel_repeats``
+        above this def, which left it indented INSIDE
+        ``apply_inmodel_repeats`` after its ``return`` -- dead code -- so
+        full_pe inherited ``RecipeStep.stopping_function`` and raised
+        NotImplementedError on its first iteration (6mo, 2026-10-04, right
+        after replica_pe converged). Pinned by tests/test_pe_stopping.py.
+        """
+        return False
+
 
 def apply_rj_flip_fraction(moves, fraction, tag: str = "pe") -> dict:
     """Set ``rj_flip_fraction`` on every GB RJ move of a built move tree.
@@ -1050,10 +1063,6 @@ def apply_inmodel_repeats(moves, repeats, tag: str = "pe") -> dict:
             "a listed branch carry neither num_repeats nor num_repeat_proposals "
             "and were left alone: %s.", tag, want, untouched)
     return changed
-
-    def stopping_function(self, *args, **kwargs):
-        """Never stop on its own — relies on outer stopping logic."""
-        return False
 
 
 class ReplicaPERecipeStep(PERecipeStep):
