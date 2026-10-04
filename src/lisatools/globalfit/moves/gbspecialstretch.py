@@ -2717,6 +2717,86 @@ def _ar_slot_of_rung(carrier_col, ar_slot_col, slots, xp):
     return xp.where(have, slots[xp.maximum(rows, 0)], xp.asarray(ar_slot_col))
 
 
+def _ar_rebase_slot_labels(ar, slots, spec_final, get_special, num_bands, xp):
+    """``(slots, specials)``: the label EVERY resident rung's slot must claim
+    after a block's vertical sweeps -- carriers AND resident non-carriers.
+
+    THE BUG THIS CLOSES (2026-10-04, 6mo replica_pe job 715). The block-end
+    slot-map re-base (2026-09-10) re-labelled the buffer's special -> slot
+    map and the scheduler from the CARRIER rows only (``slots`` +
+    ``spec_final``). That was complete for the picked-row sweep, where only
+    carriers swap. The all-rungs sweep (2026-09-26) also swaps a carrier
+    with a RESIDENT NON-CARRIER cell (a cell whose pick this round was a
+    rejected birth, an empty dead-row cell, an unpicked occupied cell):
+    the sorter re-labels both cells, the carrier's slot was re-based, the
+    non-carrier's was not. Afterwards two slots claim the carrier's new
+    label and none claims the non-carrier's, so the next RJ round on this
+    residency resolves picks through ``get_index`` (searchsorted over a
+    duplicated map) into the WRONG slab: hot births were scored on, and
+    written into, a cold cell's slab. The ledger then credits slab changes
+    the parent never sees (per-propose drift -1,400..-1,900 per walker on
+    prior-RJ iterations, tiny on deaths-only ones) and the cold chain's
+    later moves are scored against a corrupted residual.
+
+    ``ar`` is the block's all-rung state ``(cols, carrier, occupied, cached,
+    scorable, frozen, ar_slot)`` AFTER its sweeps (``carrier`` / ``ar_slot``
+    permute with every accepted swap, so ``(ci, t)`` names the cell now
+    labelled rung ``t``). The slot of each resident rung comes from
+    :func:`_ar_slot_of_rung` (the carrier row's slot, else the map); its
+    label is ``get_special(t, w, b)``. The carrier entries are merged with
+    ``(slots, spec_final)`` and must AGREE where both name a slot -- a
+    disagreement means the table and the rows diverged, and is refused.
+    """
+    cols, carrier, _occ, _cached, _scor, _frozen, ar_slot = ar
+    slots = xp.asarray(slots)
+    spec_final = xp.asarray(spec_final)
+    n_cols, ntemps = int(carrier.shape[0]), int(carrier.shape[1])
+    if n_cols == 0:
+        return slots, spec_final
+    s_rung = _ar_slot_of_rung(carrier, ar_slot, slots, xp)
+    t_grid = xp.broadcast_to(xp.arange(ntemps)[None, :], (n_cols, ntemps))
+    w_grid = xp.broadcast_to((xp.asarray(cols) // int(num_bands))[:, None],
+                             (n_cols, ntemps))
+    b_grid = xp.broadcast_to((xp.asarray(cols) % int(num_bands))[:, None],
+                             (n_cols, ntemps))
+    res = s_rung >= 0
+    s_tab = s_rung[res].astype(slots.dtype)
+    sp_tab = xp.asarray(get_special(t_grid[res], w_grid[res], b_grid[res]))
+    s_all = xp.concatenate([slots, s_tab])
+    sp_all = xp.concatenate([spec_final.astype(sp_tab.dtype), sp_tab])
+    order = xp.argsort(s_all, kind="stable")
+    s_sorted, sp_sorted = s_all[order], sp_all[order]
+    first = xp.ones(int(s_sorted.shape[0]), dtype=bool)
+    first[1:] = s_sorted[1:] != s_sorted[:-1]
+    # every entry must carry the label of the FIRST entry for its slot
+    grp = xp.cumsum(first) - 1
+    if not bool(xp.all(sp_sorted == sp_sorted[first][grp])):
+        raise RuntimeError(
+            "vertical sweep: the all-rung table and the block rows disagree "
+            "on a slot's final label; refusing to re-base the slot maps.")
+    return s_sorted[first], sp_sorted[first]
+
+
+def _assert_active_slot_labels_unique(scheduler, name, xp):
+    """Raise if two ACTIVE scheduler slots claim one cell label.
+
+    Every active slot holds a distinct cell, and a cell label packs
+    ``(temp, walker, band)``, so a duplicate is always a stale slot map --
+    exactly the state that routes later picks into the wrong slab (see
+    :func:`_ar_rebase_slot_labels`). Checked once per block after the
+    re-base; a few thousand labels."""
+    if scheduler is None or not hasattr(scheduler, "active_slot_specials"):
+        return
+    act = xp.asarray(scheduler.active_slot_specials)
+    n = int(act.shape[0])
+    if n and int(xp.unique(act).shape[0]) != n:
+        raise AssertionError(
+            f"{name}: after the vertical sweep {n - int(xp.unique(act).shape[0])} "
+            "active buffer slot(s) share a cell label with another slot -- the "
+            "slot -> cell map is stale, and the next pick would read the wrong "
+            "slab.")
+
+
 def _ar_trade_cell_ll(st, s_a, s_b, xp):
     """Trade the WHOLE cell-ll bracket between two slots, as the
     picked-row sweep does.
@@ -19409,10 +19489,22 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # per block, slot metadata unchanged (walker and band of
                 # every slot are the same, only the temperature moved).
                 _spec_final = band_sorter.get_special_band_index(t_i, w_i, b_i)
+                _rb_slots, _rb_specs = slots, _spec_final
+                if _ar_state is not None:
+                    # ALL-RUNGS: resident NON-CARRIER cells swap too, and
+                    # their slots must follow the model as well -- see
+                    # _ar_rebase_slot_labels (2026-10-04). The scheduler's
+                    # relabel is a permutation and needs BOTH sides of
+                    # every swap in one call.
+                    _rb_slots, _rb_specs = _ar_rebase_slot_labels(
+                        _ar_state, slots, _spec_final,
+                        band_sorter.get_special_band_index,
+                        int(self.num_bands), xp)
                 if hasattr(buffer_obj, "update_special_indices"):
-                    buffer_obj.update_special_indices(_spec_final, inds_fill=slots)
+                    buffer_obj.update_special_indices(_rb_specs, inds_fill=_rb_slots)
                 if scheduler is not None and hasattr(scheduler, "relabel_slots"):
-                    scheduler.relabel_slots(slots, _spec_final)
+                    scheduler.relabel_slots(_rb_slots, _rb_specs)
+                _assert_active_slot_labels_unique(scheduler, self.name, xp)
             _cn = _vert_census
             self._vertical_census_flush(_cn)
             # Bank this block's per-(band, rung) counts. The banked total is
