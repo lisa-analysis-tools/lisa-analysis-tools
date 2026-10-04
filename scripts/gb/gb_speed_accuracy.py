@@ -232,7 +232,8 @@ def step_gate(a):
 
     rng = np.random.default_rng(a.seed)
     nf, nt, dt = 180, int(round(a.days * 24)), 20.0
-    t0 = 0.5 * 365.25 * 86400.0 + tb.REF
+    # same window start as the speed / mojito steps (NOISE-brick delay coverage)
+    t0 = tb.REF + tb.START_OFFSET_S
     wdm = tb.run_box(nf, nt, dt, t0, edge=a.edge)
     wdm_full = WDMSettings(nf, nt, dt, t0=t0, min_freq=1e-4, max_freq=0.5 / dt,
                            force_backend="cpu")
@@ -247,8 +248,13 @@ def step_gate(a):
     invc = tb.slab_invc(sens, wdm, slab_lo)
     N2 = nf * nt
     win = tukey(N2, 2.0 * min(20, a.edge - 10) / nt)
+    # an explicit CPU TDIConfig: GBTDIonTheFly builds a string tdi_config on the DEFAULT
+    # backend (the GPU on a cluster node), whose arrays the CPU wrap then rejects
+    from lisatools.response.tdiconfig import TDIConfig
+
     gen_d = GBTDIonTheFly(t0 + np.arange(N2) * dt, nt * wdm.layer_dt, tb.REF, 1.0, 1,
-                          tdi_config="2nd generation", orbits=orbits, force_backend="cpu")
+                          tdi_config=TDIConfig("2nd generation", force_backend="cpu"),
+                          orbits=orbits, force_backend="cpu")
 
     def dense(i, p):
         out = gen_d(*[np.array([v]) for v in p], convert_to_ra_dec=False)
