@@ -112,7 +112,9 @@ def step_speed(a):
     xp = _xp(a.backend)
     rng = np.random.default_rng(a.seed)
     nf, nt, dt = tb.grid_args(a.days, a.laptop)
-    t0 = 0.5 * 365.25 * 86400.0 + tb.REF
+    # same window start as the gate / mojito steps: the unequal-arm noise's per-link
+    # delay table (the NOISE brick) must cover the whole window
+    t0 = tb.REF + tb.START_OFFSET_S
     wdm = tb.run_box(nf, nt, dt, t0, edge=a.edge, force_backend=a.backend)
     orbits = _orbits(a.backend)
     engines = tb.build_engines(wdm, orbits, names=a.engines, backend=a.backend, table=a.table)

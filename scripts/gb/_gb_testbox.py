@@ -142,6 +142,12 @@ def noise(wdm, tobs, foreground="on", arms="unequal", l1_dir=None):
                                 "(data/INSTRUMENT/L1/NOISE_*.h5); pass --noise-arms equal "
                                 "for the analytic equal-arm model")
     table = LinkDelayTable.from_l1_file(brick, stride=200, data_t0=float(wdm.t0))
+    t_tab = np.asarray(table.t)
+    step = float(t_tab[1] - t_tab[0]) if t_tab.size > 1 else 0.0
+    if t_tab[0] - step > float(wdm.t0) or t_tab[-1] + step < float(wdm.t0) + float(wdm.Tobs):
+        raise ValueError(f"the NOISE brick's delay table [{t_tab[0]:.6e}, {t_tab[-1]:.6e}] s does "
+                         f"not cover the window [{float(wdm.t0):.6e}, "
+                         f"{float(wdm.t0) + float(wdm.Tobs):.6e}] s (shorten --days or the offset)")
     be = CompositeSensitivityBackend(
         wdm, tdi_generation=2, wdm_psd_method="layer_calibrated",
         galfor_stochastic_fn=FittedHyperbolicTangentGalacticForeground,
