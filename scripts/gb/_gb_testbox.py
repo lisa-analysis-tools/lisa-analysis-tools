@@ -5,8 +5,10 @@ Mirrors ``scripts/sobbh/_sobbh_testbox.py`` (EMRI / MBH / SOBBH test setups, 202
 * box: the 6-month launcher's band (MIN_FREQ 2.5e-4, MAX_FREQ 2.5e-2 Hz) and edge crop
   (EDGE_CROP_WAVELETS = 60 layers each end), Nf 1440 at dt 2.5 s (3600-s layers), Nt = days*24
   (``--laptop``: Nf 180 at dt 20 s, the same layer);
-* noise for every SNR and data score: scirdv1 + the fitted tanh galactic foreground at the
-  window's Tobs (``foreground="off"``: instrument only), full XYZ 3x3 per pixel;
+* noise for every SNR and data score: the PRODUCTION unequal-arm instrument noise (mojito
+  NOISE brick per-link delays, ``wdm_psd_method="layer_calibrated"``) + the fitted tanh
+  galactic foreground at the window's Tobs (``foreground="off"``: instrument only;
+  ``arms="equal"``: the analytic equal-arm scirdv1 model), full XYZ 3x3 per pixel;
 * data: the class brick (GB = the whole galaxy, VGB = the 55 verification binaries; one brick
   per class, ``*_source0_*``) read through ``MojitoL1File(...).tdis.xyz_doppler``, window starting
   ``START_OFFSET_S`` after the brick start; catalogue parameters at REF in the validated injection
@@ -97,13 +99,55 @@ def run_box(nf, nt, dt, t0, *, edge=EDGE_CROP_WAVELETS, min_freq=MIN_FREQ,
                        force_backend=force_backend)
 
 
-def noise(wdm, tobs, foreground="on"):
+#: instrument noise levels [Soms_d, Sa_a] (sqrt units) of the unequal-arm build -- the
+#: 6-month fit's values
+PSD_LEVELS = (1.52274518e-11, 2.74762992e-15)
+
+
+def find_noise_brick(l1_dir=None):
+    """The mojito instrument NOISE brick (carries the per-link delays ``/ltts``) or None."""
+    for d in _brick_dirs("INSTRUMENT", l1_dir):
+        for name in sorted(os.listdir(d)):
+            if name.startswith("NOISE_") and name.endswith(".h5"):
+                return os.path.join(d, name)
+    return None
+
+
+def noise(wdm, tobs, foreground="on", arms="unequal", l1_dir=None):
+    """``(sens, label)``: the XYZ sensitivity on the run grid.
+
+    ``arms="unequal"`` (default) is the PRODUCTION noise of the 6-month run (UNEQUAL_ARM=1):
+    :class:`UnequalArmInstrumentNoise` with the mojito NOISE brick's per-link delays
+    (stride 200), ``wdm_psd_method="layer_calibrated"``, plus the fitted tanh foreground at
+    ``tobs`` (stationary: the run's foreground modulation table is not applied). Its
+    inverse covariance is channel-symmetric but NOT a I + b J. ``arms="equal"``: the
+    equal-arm scirdv1 analytic model (diagnostics only)."""
     from lisatools.sensitivity import XYZ2SensitivityMatrix
 
-    if foreground == "off":
-        return XYZ2SensitivityMatrix(wdm, model="scirdv1"), "scirdv1"
-    sens = XYZ2SensitivityMatrix(wdm, model="scirdv1", stochastic_params=(float(tobs),))
-    return sens, f"scirdv1+tanh-foreground(Tobs={float(tobs) / 86400.0:.0f} d)"
+    fg = "" if foreground == "off" else f"+tanh-foreground(Tobs={float(tobs) / 86400.0:.0f} d)"
+    if arms == "equal":
+        if foreground == "off":
+            return XYZ2SensitivityMatrix(wdm, model="scirdv1"), "equal-arm scirdv1"
+        sens = XYZ2SensitivityMatrix(wdm, model="scirdv1", stochastic_params=(float(tobs),))
+        return sens, "equal-arm scirdv1" + fg
+    from lisatools.sensitivity import (CompositeSensitivityBackend, LinkDelayTable,
+                                       UnequalArmInstrumentNoise)
+    from lisatools.stochastic import FittedHyperbolicTangentGalacticForeground
+
+    brick = find_noise_brick(l1_dir)
+    if brick is None:
+        raise FileNotFoundError("unequal-arm noise needs the mojito NOISE brick "
+                                "(data/INSTRUMENT/L1/NOISE_*.h5); pass --noise-arms equal "
+                                "for the analytic equal-arm model")
+    table = LinkDelayTable.from_l1_file(brick, stride=200, data_t0=float(wdm.t0))
+    be = CompositeSensitivityBackend(
+        wdm, tdi_generation=2, wdm_psd_method="layer_calibrated",
+        galfor_stochastic_fn=FittedHyperbolicTangentGalacticForeground,
+        instrument_component_cls=UnequalArmInstrumentNoise,
+        instrument_component_kwargs=dict(ltts=table))
+    sens = be("gb-speed", np.asarray(PSD_LEVELS),
+              galfor_params=None if foreground == "off" else np.asarray([float(tobs)]))
+    return sens, f"unequal-arm layer_calibrated ({os.path.basename(brick)})" + fg
 
 
 def slab_invc(sens, wdm, slab_lo, W=SLAB_W):

@@ -116,7 +116,7 @@ def step_speed(a):
     wdm = tb.run_box(nf, nt, dt, t0, edge=a.edge, force_backend=a.backend)
     orbits = _orbits(a.backend)
     engines = tb.build_engines(wdm, orbits, names=a.engines, backend=a.backend, table=a.table)
-    sens, noise_label = tb.noise(wdm, wdm.Tobs, a.foreground)
+    sens, noise_label = tb.noise(wdm, wdm.Tobs, a.foreground, arms=a.noise_arms)
     T = int(wdm.ind_max_t - wdm.ind_min_t + 1)
     for rows in a.rows:
         n_slots = min(rows, a.max_slots)
@@ -236,7 +236,7 @@ def step_gate(a):
                            force_backend="cpu")
     orbits = _orbits("cpu")
     engines = tb.build_engines(wdm, orbits, names=a.engines, backend="cpu", table=a.table)
-    sens, noise_label = tb.noise(wdm, wdm.Tobs, a.foreground)
+    sens, noise_label = tb.noise(wdm, wdm.Tobs, a.foreground, arms=a.noise_arms)
     T = int(wdm.ind_max_t - wdm.ind_min_t + 1)
     n_lo = int(wdm.ind_min_t)
     p0, rho, lab = _gate_cases(a, rng, wdm)
@@ -374,7 +374,7 @@ def step_mojito(a):
         wdm = tb.run_box(nf, nt, dt, t0w, edge=a.edge, force_backend="cpu")
         orbits = tb.l1_orbits(brick, t0w, t0w + nf * nt * dt)
         engines = tb.build_engines(wdm, orbits, names=a.engines, backend="cpu", table=a.table)
-        sens, noise_label = tb.noise(wdm, wdm.Tobs, a.foreground)
+        sens, noise_label = tb.noise(wdm, wdm.Tobs, a.foreground, arms=a.noise_arms)
         win_alpha = 2.0 * min(20, a.edge - 10) / nt
         from scipy.signal.windows import tukey
 
@@ -453,6 +453,8 @@ def main():
     ap.add_argument("--scale", type=float, default=1.0, help="speed-step candidate jitter")
     ap.add_argument("--edge", type=int, default=tb.EDGE_CROP_WAVELETS)
     ap.add_argument("--foreground", choices=("on", "off"), default="on")
+    ap.add_argument("--noise-arms", choices=("unequal", "equal"), default="unequal",
+                    help="unequal = the production unequal-arm layer_calibrated noise")
     ap.add_argument("--table", default=None)
     ap.add_argument("--gate-sources", default="synthetic,catalogue")
     ap.add_argument("--gate-f0", default="0.3,0.6,1.0,2.0,4.0,8.0,16.0", help="mHz")
