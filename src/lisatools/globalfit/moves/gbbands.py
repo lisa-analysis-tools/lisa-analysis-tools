@@ -23,7 +23,7 @@ import logging
 import os
 import time
 import warnings
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from types import ModuleType
 from typing import Optional, Tuple, Union
@@ -1287,6 +1287,49 @@ def snapshot_ref_rows(holder, view, intra_data, intra_noise, *, xp,
     return data_row_host, psd_row_host
 
 
+@contextmanager
+def exact_scoring_context(engines):
+    """Route ``get_ll`` through the EXACT engine while sig-het references stay built.
+
+    A sig-het computation (``GBSignalHetComputations``) answers
+    ``get_ll_wdm`` from its heterodyne reference while ``_in_model`` is set
+    and from its ``chunked`` delegate -- the exact engine, the same one
+    ``fill_global_wdm`` writes the residual with -- otherwise. Clearing the
+    in-model state would throw the reference away (a rebuild is the
+    dominant sig-het cost), so this only parks the ROUTING flag for the
+    duration of the block and restores it on exit, leaving the reference
+    stash and the slot->reference map untouched.
+
+    WHY (2026-10-04, 6mo replica_pe job 715): the vertical swap prices each
+    rung with ``L_free + ll_ref`` and ``ll_ref`` is the sig-het running
+    value. Within one rung the MH ratio differences two sig-het values
+    against the SAME reference, so the anchor-level offset cancels; between
+    two cells it does not, and against an exactly-measured (cached) rung it
+    is the whole error. End-of-block audit: block-max |sig-het - exact|
+    p90 40-77 nats, max 43,000 (hot rungs), and the cold chain lost
+    ~1,400 lnL per walker per prior-RJ iteration.
+
+    ``engines``: band likelihood engines (anything with ``gb_comps``);
+    duplicates and engines without a sig-het comp are ignored, so the
+    context is a no-op on chunked-het / FD configurations.
+    """
+    saved = []
+    seen = set()
+    for eng in engines:
+        comp = getattr(eng, "gb_comps", None)
+        if comp is None or id(comp) in seen:
+            continue
+        seen.add(id(comp))
+        if hasattr(comp, "_in_model") and hasattr(comp, "chunked"):
+            saved.append((comp, comp._in_model))
+            comp._in_model = None
+    try:
+        yield
+    finally:
+        for comp, val in saved:
+            comp._in_model = val
+
+
 class _RoutedBandEngine:
     """Multi-shard router in front of a single-shard band likelihood engine.
 
@@ -2040,6 +2083,17 @@ class _RoutedBandEngine:
         for engine in self._engine_by_device.values():
             engine.clear_in_model()
         return self._engine.clear_in_model()
+
+    def exact_scoring(self):
+        """Context: score through the EXACT (chunked) engine on EVERY
+        per-device engine while their sig-het in-model references stay built.
+
+        See :func:`exact_scoring_context` -- this is its fan-out form, over
+        the wrapped engine and every per-device replica, the same set
+        :meth:`clear_in_model` clears.
+        """
+        return exact_scoring_context(
+            [self._engine, *self._engine_by_device.values()])
 
     def _route_matrix(self, method_name, holder, params_phys, *, data_index,
                       noise_index, N_vals, **kwargs):
@@ -5118,6 +5172,30 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         delta = self.d_h_out.real - 0.5 * self.h_h_out.real
         delta[~self.kept_out] = -1e300
         return delta
+
+    def get_add_ll_exact(self, params, data_index, noise_index, N_vals,
+                         leaf_inds=None):
+        """:meth:`get_add_ll` through the EXACT engine, mid-block.
+
+        While a sig-het in-model reference is active, ``get_add_ll`` answers
+        from the heterodyne expansion. This scores the same rows through the
+        chunked delegate instead (:func:`exact_scoring_context`) without
+        tearing the reference down, then RESTORES the buffer's output stash
+        (``d_h_out`` / ``h_h_out`` / ``phase_angle`` / ``kept_out``) so code
+        that reads the last in-model call's outputs sees them unchanged. On
+        an engine with no sig-het comp this is plain ``get_add_ll``.
+        """
+        eng = self._likelihood_engine
+        ctx = getattr(eng, "exact_scoring", None)
+        stash = {k: getattr(self, k, None)
+                 for k in ("d_h_out", "h_h_out", "phase_angle", "kept_out")}
+        try:
+            with (ctx() if callable(ctx) else exact_scoring_context([eng])):
+                return self.get_add_ll(params, data_index, noise_index, N_vals,
+                                       leaf_inds=leaf_inds)
+        finally:
+            for k, v in stash.items():
+                setattr(self, k, v)
 
     def get_removal_ll(self, params, data_index, noise_index, N_vals, leaf_inds=None):
         """Log-likelihood delta of REMOVING a source that is in the residual.

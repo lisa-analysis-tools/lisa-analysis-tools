@@ -2606,6 +2606,29 @@ def _vert_all_rungs_on() -> bool:
         "1", "true", "True", "yes", "on")
 
 
+def _vert_exact_price_on() -> bool:
+    """``GB_VERT_EXACT_PRICE`` -- price vertical swaps with EXACT cell totals.
+
+    The vertical swap compares whole-cell likelihoods ``L_free + ll_ref``
+    across rungs. ``L_free`` is measured from the slab (exact); ``ll_ref``
+    is the sig-het RUNNING value. Inside one rung's MH ratio the sig-het
+    anchor offset cancels (two values against the same reference); between
+    cells it does not -- and against an exactly measured (cached,
+    non-resident) rung it is the entire error. Measured on the 6mo
+    replica_pe (job 715, 2026-10-04): end-of-block |sig-het - exact| has a
+    block-max p90 of 40-77 nats and a max of 43,000 on the hot rungs, while
+    the cold chain lost ~1,400 lnL per walker on every prior-RJ iteration
+    and won it back on the F-stat ones -- the signature of swaps carrying
+    over-valued hot states down the ladder. With the knob on, every sweep
+    (and the all-rungs frozen-row cache) prices the picked rows with an
+    exact ``get_add_ll`` through the chunked engine, one batched call per
+    sweep; ``ll_ref`` itself, and so every in-rung MH ratio, is untouched.
+    DEFAULT OFF until the cluster comparison confirms it (2026-10-04).
+    """
+    return os.environ.get("GB_VERT_EXACT_PRICE", "0").strip() in (
+        "1", "true", "True", "yes", "on")
+
+
 def _drop_shut_specials(specials, shut_w, nwalkers, xp):
     """Remove cells whose (walker, band) is level-3 SHUT. ``(kept, n)``.
 
@@ -18322,6 +18345,39 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         if _vert_on and getattr(self, "_temper_rng", None) is None:
             self._temper_rng = self._make_temper_rng(self)
 
+        # EXACT SWAP PRICING (GB_VERT_EXACT_PRICE; see _vert_exact_price_on).
+        # The swap ratio's ``L_free + ll_ref`` mixes an exact slab term with
+        # the sig-het RUNNING add-delta, whose anchor-level error does not
+        # cancel between two cells. With the knob on, the price is the
+        # exact add-delta at the rows' CURRENT coordinates, scored through
+        # the chunked engine with the sig-het references left built
+        # (SubBandBuffer.get_add_ll_exact). Only the price changes: ``ll_ref``
+        # keeps feeding every in-rung MH ratio. Inactive when sig-het is
+        # not the engine (then ``ll_ref`` already IS exact).
+        _vert_exact = bool(_vert_on and sighet_active and _vert_exact_price_on())
+        if _vert_exact and tm is not None:
+            tm.count("inmodel_vertical_exact_blocks")
+
+        def _vert_price(rows=None):
+            """Per-row add-delta the swap prices a cell with (len = block rows).
+
+            ``ll_ref`` itself when exact pricing is off; otherwise a copy of
+            it with the exact value at ``rows`` (every row when ``None``).
+            Late-bound on ``curr`` / ``ll_ref``, so it always prices the
+            coordinates the block holds at the moment of the call.
+            """
+            if not _vert_exact:
+                return ll_ref
+            out = ll_ref.copy()
+            sel = slice(None) if rows is None else rows
+            if rows is not None and int(rows.shape[0]) == 0:
+                return out
+            with _tspan(tm, "inmodel_vertical_exact_price"):
+                out[sel] = buffer_obj.get_add_ll_exact(
+                    curr[sel], slots[sel], slots[sel], N_vals[sel],
+                    leaf_inds=l_i[sel])
+            return out
+
         # Device-resident accept-chain state (flushed ONCE per block in
         # ``imr_accept_flush`` below): per-proposal-kind counters
         # [proposed, accepted(dev), cold-proposed, cold-accepted(dev)] and
@@ -18452,10 +18508,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # cache from the first repeat, not from arrays nothing
                 # will move again.
                 if _ar_state is not None:
+                    _fz_rows = xp.where(~_cv_active)[0]
                     _fz_n = _ar_freeze_rows(
-                        _ar_state, xp.where(~_cv_active)[0], t_i, w_i, b_i,
-                        _vert_base, ll_ref, int(self.num_bands), xp,
-                        name=self.name)
+                        _ar_state, _fz_rows, t_i, w_i, b_i,
+                        _vert_base, _vert_price(_fz_rows),
+                        int(self.num_bands), xp, name=self.name)
                     if _fz_n and _vert_census is not None:
                         _vert_census["frozen_cached"] = (
                             _vert_census.get("frozen_cached", 0) + _fz_n)
@@ -18483,18 +18540,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # final repeat, which would also buy a refit nothing then uses.
         if _vert_on and _vert_at_refit and sighet_active and _half_pre:
             _vert_sweeps += 1
+            _px = _vert_price()
             with _tspan(tm, "inmodel_vertical_swap"):
                 if _ar_state is not None:
                     _n0 = self._vertical_swap_sweep_all_rungs(
                         band_sorter, band_temps, t_i, w_i, b_i, slots,
-                        beta, ll_ref, ll_change_log, prop_counts,
+                        beta, _px, ll_change_log, prop_counts,
                         acc_counts, cell_ll_state, 0, _ar_state,
                         census=_vert_census, cell_ll_base=_vert_base,
                     )
                 else:
                     _n0 = self._vertical_swap_sweep(
                         band_sorter, band_temps, t_i, w_i, b_i, slots,
-                        beta, ll_ref, ll_change_log, prop_counts,
+                        beta, _px, ll_change_log, prop_counts,
                         acc_counts, cell_ll_state, 0,
                         census=_vert_census, swap_census=_swap_cens,
                         cell_ll_base=_vert_base,
@@ -19067,18 +19125,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
               _vert_at_refit and sighet_active and not _refit_this_repeat)
           if _vert_now:
               _vert_sweeps += 1
+              _px = _vert_price()
               with _tspan(tm, "inmodel_vertical_swap"):
                   if _ar_state is not None:
                       _n = self._vertical_swap_sweep_all_rungs(
                           band_sorter, band_temps, t_i, w_i, b_i, slots,
-                          beta, ll_ref, ll_change_log, prop_counts,
+                          beta, _px, ll_change_log, prop_counts,
                           acc_counts, cell_ll_state, move_i % 2, _ar_state,
                           census=_vert_census, cell_ll_base=_vert_base,
                       )
                   else:
                       _n = self._vertical_swap_sweep(
                           band_sorter, band_temps, t_i, w_i, b_i, slots,
-                          beta, ll_ref, ll_change_log, prop_counts,
+                          beta, _px, ll_change_log, prop_counts,
                           acc_counts, cell_ll_state, move_i % 2,
                           census=_vert_census, swap_census=_swap_cens,
                           cell_ll_base=_vert_base,
@@ -19236,9 +19295,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                       # tail -- so a phase-B hot row is cached too, not
                       # just the rule half.
                       if _ar_state is not None:
+                          _fz_rows = xp.where(xp.asarray(_frozen))[0]
                           _fz_n = _ar_freeze_rows(
-                              _ar_state, xp.where(xp.asarray(_frozen))[0],
-                              t_i, w_i, b_i, _vert_base, ll_ref,
+                              _ar_state, _fz_rows,
+                              t_i, w_i, b_i, _vert_base,
+                              _vert_price(_fz_rows),
                               int(self.num_bands), xp, name=self.name)
                           if _fz_n and _vert_census is not None:
                               _vert_census["frozen_cached"] = (

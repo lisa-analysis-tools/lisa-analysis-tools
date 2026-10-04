@@ -696,6 +696,10 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # a per-block constant and never made resident, so buffer
             # residency is unchanged.
             "GB_TEMPER_ALL_RUNGS",
+            # 2026-10-04: GB_VERT_EXACT_PRICE -- price the vertical swap
+            # with exact add-deltas instead of the sig-het running value
+            # (default 0 until the copy-store comparison; v8 predates it).
+            "GB_VERT_EXACT_PRICE",
             # V9-21 (2026-09-28): GB_TEMPER_VERTICAL_AT_REFIT -- the
             # vertical sweep now runs ONLY on repeats that re-anchored
             # the sig-het references, so the swap and the refit land in

@@ -737,7 +737,7 @@ export MOJITO_INFO_PATH=/shared/data/mojito_cache
 # completeness / purity curves still key off the 2-df-bin f0 proxy so they can
 # run on every stored row. Overridable; =0 restores the 2026-08-19 default.
 export GF_MONITOR_MATCH_STATS=${GF_MONITOR_MATCH_STATS:-1}
-export GF_MONITOR_AFTER_SAVE=1
+export GF_MONITOR_AFTER_SAVE=${GF_MONITOR_AFTER_SAVE:-1}
 # EVERY THIRD save (1 -> 3, 2026-09-28). ⚠ The old comment's premise
 # -- "~2 h/iteration against a page build of order minutes" -- stopped
 # being true: on job 663 the page+tar build took 443 s while the
@@ -997,7 +997,7 @@ elif [ "${GF_LEGACY_RANK_LAYOUT}" = "0" ] && [ "${N_COMPUTE_EFF}" -gt 0 ] \
   echo "[SUBMIT] NWALKERS=${NWALKERS} is not a multiple of N_COMPUTE=${N_COMPUTE_EFF}; using NWALKERS=$(( (NWALKERS / N_COMPUTE_EFF + 1) * N_COMPUTE_EFF )) (user decision at the first 4-GPU launch)"
   export NWALKERS=$(( (NWALKERS / N_COMPUTE_EFF + 1) * N_COMPUTE_EFF ))
 fi
-export NUM_ITERATIONS=2000         # total engine iterations (resume-safe; NITER was a dead name)
+export NUM_ITERATIONS=${NUM_ITERATIONS:-2000}         # total engine iterations (resume-safe; NITER was a dead name)
 
 # ---- band + domain ---------------------------------------------------------
 # EXPLICIT Tobs (2026-08-13): sbatch propagates the submitting shell's env,
@@ -1821,7 +1821,7 @@ export GB_RUN_FANCY_TEMPERING=0
 # in-model convergence work depends on -- killing the fancy swaps must not
 # silently take them too. They stay ON.
 # ===========================================================================
-export GB_TEMPER_VERTICAL=1
+export GB_TEMPER_VERTICAL=${GB_TEMPER_VERTICAL:-1}
 
 # ---- ALL-RUNGS VERTICAL SWAP (user ruling 2026-09-26: turn it on) --------
 # Swap EVERY rung of a (walker, band) column, not just the rungs that
@@ -1849,6 +1849,17 @@ export GB_TEMPER_VERTICAL=1
 # why those pairs are dropped.
 # GB_TEMPER_ALL_RUNGS=0 restores the picked-row-only sweep exactly.
 export GB_TEMPER_ALL_RUNGS=1
+# EXACT SWAP PRICING (2026-10-04, 6mo replica_pe job 715): the vertical
+# swap prices each rung with L_free + ll_ref, and ll_ref is the sig-het
+# RUNNING value -- its anchor-level error cancels inside one rung's MH
+# ratio but not between two cells (end-of-block audit: block-max
+# |sig-het - exact| p90 40-77 nats, max 43,000 on hot rungs; the cold
+# chain lost ~1,400 lnL per walker on every prior-RJ iteration and won it
+# back on the F-stat ones). =1 prices every sweep with an exact add-delta
+# through the chunked engine (one batched call per sweep); ll_ref and every
+# in-rung MH ratio are untouched. DEFAULT 0 until the copy-store comparison
+# confirms it. Watch [GB_TIMING] inmodel_vertical_exact_price.
+export GB_VERT_EXACT_PRICE=${GB_VERT_EXACT_PRICE:-0}
 
 # PERMUTED-SWAP CADENCE 3 -> 1 (user ruling 2026-08-26): fire the
 # permuted band swaps after EVERY GB propose -- 3x/iteration in search
@@ -1910,8 +1921,8 @@ export GB_PE_RJ_DRAW_ONE=1
 # ONE of rj_fstat_pe / rj_prior_pe / rj_warm_pe per PE iteration (user ruling
 # 2026-10-02: "put the warm proposal in with the other two rj moves. Draw them
 # at 0.45 prior, 0.45 fstat, 0.1 warm start"); prior takes the remainder.
-export GB_PE_RJ_FSTAT_FRACTION=0.45
-export GB_PE_RJ_WARM_FRACTION=0.1
+export GB_PE_RJ_FSTAT_FRACTION=${GB_PE_RJ_FSTAT_FRACTION:-0.45}
+export GB_PE_RJ_WARM_FRACTION=${GB_PE_RJ_WARM_FRACTION:-0.1}
 # Per-block EXACT info matrices through the sig-het fast route
 # (~2.4 ms/src vs ~29-46 chunked). The data_index misindex is FIXED and
 # multi-GPU slots now route by the BUFFER's slot shards. First
@@ -2107,7 +2118,7 @@ export GB_SIGHET_TRUST_PHASE_C=49
 # all-rung delta-vs-delta p50 0.054, cold max 5.48, well inside tolerance
 # over the whole run; ~18 s/iter while armed). Re-arm (=1) if a sig-het
 # accuracy question reopens. Ported from the 3mo 10-walker arm.
-export GB_SIGHET_ANCHOR_CHECK=0
+export GB_SIGHET_ANCHOR_CHECK=${GB_SIGHET_ANCHOR_CHECK:-0}
 export GB_SIGHET_DRIFT_CHECK=1
 # TIER SCAN RETIRED FOR THE CLEAN RESTART (2026-08-19). It has NO iteration
 # cap (the "first-few-iterations" note above it was wrong): it ran 13 extra
