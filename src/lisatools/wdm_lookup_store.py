@@ -72,6 +72,30 @@ def lookup_table_name(Nf: int, dt: float, recipe: Optional[dict] = None) -> str:
             f"_fd{_tag(r['fdot_max_factor'])}x{_tag(r['eps_fdot'])}_nld{int(r['num_layers_diff'])}.h5")
 
 
+#: The GB table: the shared recipe with a 128-layer build record (the 32-layer record
+#: carries an in-layer-offset norm bias up to 2.5e-5; 128 -> 5e-9) and a narrow fdot axis
+#: (+-0.1 layer_df / layer_dt; GB |fdot| is <~1e-6 of that, fdot = 0 is a node). Built on
+#: the cheap Nf 180 / dt 20 grid: it depends only on the 3600-s layer duration, so it serves
+#: the Nf 1440 / dt 2.5 production grid too.
+GB_TABLE_RECIPE = dict(prefix="wdm_lookup_gb_cx", fdot_max_factor=0.1, time_layers=128,
+                       max_freq=2.5e-2)
+GB_TABLE_GRID = (180, 20.0)
+
+
+def resolve_gb_lookup_table(table: Optional[str] = None,
+                            table_dir: Optional[str] = None) -> str:
+    """Path of the GB lookup table: ``table`` when given, else the :data:`GB_TABLE_RECIPE`
+    table in ``table_dir`` (default ``~/.cache/gb_lookup_tables``), built there first
+    (atomic, lock-protected) when missing."""
+    if table:
+        return os.path.abspath(os.path.expanduser(str(table)))
+    d = table_dir or os.path.expanduser("~/.cache/gb_lookup_tables")
+    nf, dt = GB_TABLE_GRID
+    path = lookup_table_path(None, d, nf, dt, recipe=GB_TABLE_RECIPE)
+    ensure_lookup_table(path, Nf=nf, dt=dt, recipe=GB_TABLE_RECIPE)
+    return path
+
+
 def lookup_table_path(table: Optional[str], table_dir: Optional[str], Nf: int, dt: float,
                       recipe: Optional[dict] = None) -> str:
     """``table`` when given (a pointer to a specific file), else ``table_dir/<canonical name>``."""
