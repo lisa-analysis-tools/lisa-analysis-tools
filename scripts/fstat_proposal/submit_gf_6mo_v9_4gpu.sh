@@ -519,6 +519,18 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
   else
     NTASKS=$(( N_COMPUTE + 1 ))
   fi
+  # DEDICATED MONITOR RANK (user ruling 2026-10-04: "have a separate rank run
+  # the html"). ONE extra task, the HIGHEST world rank, which the driver
+  # splits off before the layout is built -- the run's ranks, placement and
+  # roles are exactly what they were without it (cyclic over 2 nodes: run
+  # ranks A:{0,2,4} B:{1,3} as before, the monitor lands on B). It builds
+  # the page + snapshot tar from disk, so the saver never stops receiving
+  # (job 717: the save after every in-place build stalled ~400 s with every
+  # GPU idle). GF_MONITOR_RANK=0 restores the in-place hook on the saver.
+  export GF_MONITOR_RANK=${GF_MONITOR_RANK:-1}
+  if [ "${GF_MONITOR_RANK}" = "1" ]; then
+    NTASKS=$(( NTASKS + 1 ))
+  fi
   if [ "${GF_LEGACY_RANK_LAYOUT}" = "1" ]; then
     echo "[SUBMIT] GF_LEGACY_RANK_LAYOUT=1: TODAY's roles (one sampling rank"
     echo "[SUBMIT]   drives all local GPUs; rank 1 stopped spare; rank 2"
@@ -528,7 +540,7 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
     echo "[SUBMIT] GF_LEGACY_RANK_LAYOUT=0: walker-block layout: ${N_COMPUTE}"
     echo "[SUBMIT]   compute ranks + 1 saver."
   fi
-  echo "[SUBMIT] NGPUS=${NGPUS} -> sbatch --partition=${_NGPU_PART} --gres=${_GRES} --nodes=${_NODES} --ntasks=${NTASKS} (N_COMPUTE=${N_COMPUTE} compute ranks + 1 saver)"
+  echo "[SUBMIT] NGPUS=${NGPUS} -> sbatch --partition=${_NGPU_PART} --gres=${_GRES} --nodes=${_NODES} --ntasks=${NTASKS} (N_COMPUTE=${N_COMPUTE} compute ranks + 1 saver + GF_MONITOR_RANK=${GF_MONITOR_RANK} monitor)"
   _DIST_FLAG=""
   if [ "${_NODES}" -gt 1 ]; then
     _DIST_FLAG="--distribution=cyclic"
@@ -544,7 +556,7 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
   echo "[SUBMIT] --cpus-per-task=${_CPT} (EMRI_LIKELIHOOD=${EMRI_LIKELIHOOD:-direct}, EMRI_TRAJ_WORKERS=${EMRI_TRAJ_WORKERS:-4})"
   exec sbatch --partition="${_NGPU_PART}" --gres="${_GRES}" --nodes="${_NODES}" \
        --ntasks="${NTASKS}" --cpus-per-task="${_CPT}" ${_DIST_FLAG} \
-       --export=ALL,NGPUS="${NGPUS}",GPUS_PER_RANK="${GPUS_PER_RANK}",RANKS_PER_GPU="${RANKS_PER_GPU}",GF_LEGACY_RANK_LAYOUT="${GF_LEGACY_RANK_LAYOUT}" \
+       --export=ALL,NGPUS="${NGPUS}",GPUS_PER_RANK="${GPUS_PER_RANK}",RANKS_PER_GPU="${RANKS_PER_GPU}",GF_LEGACY_RANK_LAYOUT="${GF_LEGACY_RANK_LAYOUT}",GF_MONITOR_RANK="${GF_MONITOR_RANK}" \
        "$0" "$@"
 fi
 
@@ -681,15 +693,14 @@ export MOJITO_INFO_PATH=/shared/data/mojito_cache
 # run on every stored row. Overridable; =0 restores the 2026-08-19 default.
 export GF_MONITOR_MATCH_STATS=${GF_MONITOR_MATCH_STATS:-1}
 export GF_MONITOR_AFTER_SAVE=${GF_MONITOR_AFTER_SAVE:-1}
-# EVERY THIRD save (1 -> 3, 2026-09-28). ⚠ The old comment's premise
-# -- "~2 h/iteration against a page build of order minutes" -- stopped
-# being true: on job 663 the page+tar build took 443 s while the
-# iteration itself fell to ~500 s once the level-3 mask started
-# skipping shut pairs, and it delayed a save. At 1-in-3 the artifacts
-# keep flowing at under a quarter of the writer's time, which is the
-# watchdog's own warn fraction. Raise it further if iterations get
-# faster again; the watchdog is still the backstop.
-export GF_MONITOR_ITER=3
+# EVERY 10th save (3 -> 10, user 2026-10-04: "every 10 or 20 ... whatever is
+# sufficient"). At 1-in-3 the page (~575-600 s) + tar (~175 s) built on the
+# SAVER held the next save ~400 s every third iteration (job 717, ~25-30 %
+# of the wall). With the dedicated monitor rank (GF_MONITOR_RANK above) no
+# save waits on the build at all; 10 saves (~1 h at replica_pe pace) keeps
+# the page current without re-reading the 1+ GB live store back to back.
+# YIELDING: GF_MONITOR_ITER=20 on the launch line overrides it.
+export GF_MONITOR_ITER=${GF_MONITOR_ITER:-10}
 # The tar as well as the page -- it is what actually gets downloaded.
 # Set to 0 if the watchdog starts complaining; the page alone is much
 # cheaper than the multi-GB archive.
@@ -757,6 +768,24 @@ else
     echo "[SUBMIT]   than the granted pool?). Leaving NWALKERS alone; build_layout"
     echo "[SUBMIT]   will raise with the exact reason."
   fi
+fi
+# DEDICATED MONITOR RANK, checked against the GRANTED task count. The driver
+# takes the highest world rank out of the run whenever GF_MONITOR_RANK=1, so
+# an allocation WITHOUT the extra task (a manual `sbatch --ntasks=5`, an
+# interactive allocation) would silently lose a compute rank to it. Only
+# arm it when the allocation has exactly one task beyond the run's.
+export GF_MONITOR_RANK=${GF_MONITOR_RANK:-1}
+if [ "${GF_LEGACY_RANK_LAYOUT}" = "1" ]; then
+  _RUN_TASKS=3
+else
+  _RUN_TASKS=$(( N_COMPUTE_EFF + 1 ))
+fi
+if [ "${GF_MONITOR_RANK}" = "1" ] && [ -n "${SLURM_NTASKS:-}" ] \
+    && [ "${SLURM_NTASKS}" -ne $(( _RUN_TASKS + 1 )) ]; then
+  echo "[SUBMIT] GF_MONITOR_RANK=1 but SLURM_NTASKS=${SLURM_NTASKS} != ${_RUN_TASKS} run"
+  echo "[SUBMIT]   ranks + 1 monitor: DISARMING it (GF_MONITOR_RANK=0) so no run"
+  echo "[SUBMIT]   rank is taken; the page/tar are built on the saver as before."
+  export GF_MONITOR_RANK=0
 fi
 
 # ---- output ----------------------------------------------------------------

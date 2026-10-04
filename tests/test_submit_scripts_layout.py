@@ -59,7 +59,18 @@ _DISPATCH_ENV_KEYS = (
     "GPUS_PER_RANK",
     "RANKS_PER_GPU",
     "GF_LEGACY_RANK_LAYOUT",
+    "GF_MONITOR_RANK",
 )
+
+# The v9 6mo/1yr launchers add ONE task for the dedicated monitor rank
+# (GF_MONITOR_RANK, default 1, 2026-10-04): the run's own task count is
+# unchanged, the allocation is one larger. tests/test_monitor_rank.py pins
+# the block itself.
+_MONITOR_RANK_SCRIPTS = (SIX_MO_V9, ONE_YR_V9)
+
+
+def _ntasks(script, run_tasks):
+    return f"--ntasks={run_tasks + (1 if script in _MONITOR_RANK_SCRIPTS else 0)}"
 
 _STUB_SBATCH = """#!/usr/bin/env bash
 for a in "$@"; do printf '%s\\n' "$a"; done
@@ -755,6 +766,9 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # these is new rather than changed.
             "GF_MONITOR_AFTER_SAVE", "GF_MONITOR_ITER",
             "GF_MONITOR_SNAPSHOT", "GF_MONITOR_TIMEOUT",
+            # 2026-10-04: the page + tar on a DEDICATED rank (one extra
+            # task); tests/test_monitor_rank.py pins the block.
+            "GF_MONITOR_RANK",
             # V9-27 (2026-10-02): the SOBBH lookup scoring path's knobs (default
             # chunked = the v8 path); SixMonthSOBBHLookupTest pins the block.
             "SOBBH_LIKELIHOOD", "SOBBH_LOOKUP_TABLE_PATH", "SOBBH_LOOKUP_EVAL_DT",
@@ -1657,6 +1671,10 @@ class ThreeMonthV9TwinTest(unittest.TestCase):
             # (TWO twin tests, TWO allowed lists -- authorising only one
             # leaves the other failing.)
             "GF_MONITOR_PAGE",
+            # 2026-10-04: the dedicated monitor rank and its 10-save
+            # cadence went into the 6mo/1yr v9 launchers only (one extra
+            # task); the 3mo v9 twin keeps the saver-rank hook at 3.
+            "GF_MONITOR_RANK", "GF_MONITOR_ITER",
             "TOBS_TARGET", "GB_NLEAVES_MAX", "GB_N_SUBBANDS",
             "GB_RJ_INMODEL_CHUNK", "SIGHET_NT_LAYER", "EDGE_CROP_WAVELETS",
             "BASE_FILE_NAME", "STORE_DIR", "SLURM_LOG",
@@ -2087,7 +2105,7 @@ class SubmitScriptsDispatchTest(unittest.TestCase):
                 lines = self._run_dispatch(
                     script, {"NGPUS": "2", "GF_LEGACY_RANK_LAYOUT": "1"}
                 )
-                self.assertIn("--ntasks=3", lines)
+                self.assertIn(_ntasks(script, 3), lines)
                 self.assertIn("--nodes=1", lines)
                 self._assert_export_contains(lines, "GF_LEGACY_RANK_LAYOUT=1")
 
@@ -2098,7 +2116,7 @@ class SubmitScriptsDispatchTest(unittest.TestCase):
         for script in SCRIPTS:
             with self.subTest(script=script):
                 lines = self._run_dispatch(script, {"NGPUS": "2"})
-                self.assertIn("--ntasks=3", lines)
+                self.assertIn(_ntasks(script, 3), lines)
                 self.assertIn("--nodes=1", lines)
                 # The 3mo v9 run goes ON-DEMAND at every GPU count
                 # (user ruling 2026-09-26): its job 633 lost 43 min of
@@ -2114,7 +2132,7 @@ class SubmitScriptsDispatchTest(unittest.TestCase):
         for script in SCRIPTS:
             with self.subTest(script=script):
                 lines = self._run_dispatch(script, {"NGPUS": "4"})
-                self.assertIn("--ntasks=5", lines)
+                self.assertIn(_ntasks(script, 5), lines)
                 self.assertIn("--nodes=2", lines)
                 self.assertIn("--gres=gpu:2", lines)
                 # NGPUS=4 is 2 nodes, so a spot preemption of EITHER node
@@ -2141,14 +2159,14 @@ class SubmitScriptsDispatchTest(unittest.TestCase):
                 lines = self._run_dispatch(script, {"NGPUS": "2", "NODES": "2"})
                 self.assertIn("--nodes=2", lines)
                 self.assertIn("--gres=gpu:1", lines)
-                self.assertIn("--ntasks=3", lines)
+                self.assertIn(_ntasks(script, 3), lines)
                 self.assertIn("--distribution=cyclic", lines)
                 self._assert_export_contains(lines, "GF_LEGACY_RANK_LAYOUT=0")
             with self.subTest(script=script, nodes=4):
                 lines = self._run_dispatch(script, {"NGPUS": "4", "NODES": "4"})
                 self.assertIn("--nodes=4", lines)
                 self.assertIn("--gres=gpu:1", lines)
-                self.assertIn("--ntasks=5", lines)
+                self.assertIn(_ntasks(script, 5), lines)
                 self.assertIn("--distribution=cyclic", lines)
             with self.subTest(script=script, nodes="unset"):
                 # unset NODES = the NGPUS table, unchanged
@@ -2168,13 +2186,24 @@ class SubmitScriptsDispatchTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn("must be >= 1 and divide NGPUS=2", result.stdout)
 
+    def test_the_monitor_rank_task_is_dropped_with_the_knob_off(self):
+        for script in _MONITOR_RANK_SCRIPTS:
+            with self.subTest(script=script):
+                on = self._run_dispatch(script, {"NGPUS": "4"})
+                self.assertIn("--ntasks=6", on)
+                self._assert_export_contains(on, "GF_MONITOR_RANK=1")
+                off = self._run_dispatch(
+                    script, {"NGPUS": "4", "GF_MONITOR_RANK": "0"})
+                self.assertIn("--ntasks=5", off)
+                self._assert_export_contains(off, "GF_MONITOR_RANK=0")
+
     def test_ngpus_2_explicit_walker_block(self):
         for script in SCRIPTS:
             with self.subTest(script=script):
                 lines = self._run_dispatch(
                     script, {"NGPUS": "2", "GF_LEGACY_RANK_LAYOUT": "0"}
                 )
-                self.assertIn("--ntasks=3", lines)
+                self.assertIn(_ntasks(script, 3), lines)
                 self._assert_export_contains(lines, "GF_LEGACY_RANK_LAYOUT=0")
 
     def test_ngpus_2_gpus_per_rank_2_walker_block(self):
@@ -2188,7 +2217,7 @@ class SubmitScriptsDispatchTest(unittest.TestCase):
                         "GF_LEGACY_RANK_LAYOUT": "0",
                     },
                 )
-                self.assertIn("--ntasks=2", lines)
+                self.assertIn(_ntasks(script, 2), lines)
 
 
 class OneYearV9TwinTest(unittest.TestCase):

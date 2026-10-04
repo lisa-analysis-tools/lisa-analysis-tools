@@ -54,7 +54,7 @@ from typing import Optional
 
 logger = getLogger(__name__)
 
-__all__ = ["after_save", "MonitorWatchdog"]
+__all__ = ["after_save", "build_products", "MonitorWatchdog"]
 
 
 def _flag(name: str, default: str = "0") -> bool:
@@ -190,58 +190,9 @@ def after_save(gb_reader, comm, main_rank, i, watchdog, *,
             return
 
         run_dir = os.path.dirname(os.path.abspath(gb_reader.filename))
-        out = os.environ.get("GF_MONITOR_OUT")
-        timeout = _num("GF_MONITOR_TIMEOUT", 1800.0)
-
-        # TAR-ONLY MODE (GF_MONITOR_PAGE=0). The two products cost very
-        # different amounts on the saver rank: the tar is an extract plus
-        # a gzip, the page is a whole child interpreter rendering every
-        # panel. Building only the tar and rendering the page offline
-        # with `python -m lisatools.globalfit.monitor.from_tar SNAP.tar.gz`
-        # is the cheap way to keep per-iteration snapshots, and it was
-        # unreachable until now: GF_MONITOR_SNAPSHOT could turn the tar
-        # OFF but nothing could turn the page off while keeping the tar.
-        _want_page = _flag("GF_MONITOR_PAGE", "1")
-        _want_snap = _flag("GF_MONITOR_SNAPSHOT", "1")
-        if not _want_page and not _want_snap:
-            # Not an error, but it is certainly not what anyone meant:
-            # the hook is armed and would produce nothing at all.
-            if not getattr(watchdog, "_warned_no_products", False):
-                watchdog._warned_no_products = True
-                logger.warning(
-                    "[GF_MONITOR] GF_MONITOR_AFTER_SAVE is on but both "
-                    "GF_MONITOR_PAGE and GF_MONITOR_SNAPSHOT are 0, so "
-                    "the hook produces nothing. Unset "
-                    "GF_MONITOR_AFTER_SAVE to disable it properly.")
+        elapsed = build_products(run_dir, watchdog)
+        if elapsed is None:
             return
-
-        st = time.perf_counter()
-        if _want_page and _flag("GF_MONITOR_PAGE_SHORT"):
-            # The short page, in place of the full one (seconds, not
-            # minutes, on this rank). Its own default name, never
-            # GF_MONITOR_OUT, which names the full page.
-            from . import build_short_monitor
-
-            build_short_monitor(run_dir, check=False)
-        elif _want_page:
-            from . import build_monitor
-
-            build_monitor(run_dir, out, timeout=timeout, check=False)
-        if _want_snap:
-            from .snapshot import build_snapshot
-
-            # GF_MONITOR_SNAPSHOT_SHORT=1 -> <run>_short.tar.gz: log
-            # information and the most recent state, nothing large. It
-            # is a SEPARATE file from the full snapshot, so turning it
-            # on does not overwrite or invalidate whatever full tar the
-            # run has already produced.
-            # GF_MONITOR_SNAPSHOT_FSTAT=1 -> the F-stat fit's epoch caches
-            # (gb_fstat_fit/**, GBs at 1 yr) ride along; default OUT, only
-            # their DONE.json markers ship (user ruling 2026-10-03: "default
-            # to leaving them out"). The CLI spelling is --add-fstat.
-            build_snapshot(run_dir, short=_flag("GF_MONITOR_SNAPSHOT_SHORT"),
-                           include_fstat=_flag("GF_MONITOR_SNAPSHOT_FSTAT"))
-        elapsed = time.perf_counter() - st
 
         watchdog.report(
             elapsed,
@@ -254,3 +205,65 @@ def after_save(gb_reader, comm, main_rank, i, watchdog, *,
         logger.warning(
             "[GF_MONITOR] after-save hook failed (%s: %s). Saves are "
             "unaffected.", type(e).__name__, e)
+
+
+def build_products(run_dir, watchdog=None):
+    """Build the page and/or the snapshot tar for ``run_dir``; seconds taken.
+
+    ``None`` when both products are switched off (nothing was built). The
+    one implementation behind both callers: the saver-rank hook above and
+    the DEDICATED MONITOR RANK (:mod:`.rank`, 2026-10-04). May raise; both
+    callers catch.
+    """
+    out = os.environ.get("GF_MONITOR_OUT")
+    timeout = _num("GF_MONITOR_TIMEOUT", 1800.0)
+
+    # TAR-ONLY MODE (GF_MONITOR_PAGE=0). The two products cost very
+    # different amounts: the tar is an extract plus a gzip, the page is a
+    # whole interpreter's worth of rendering every panel. Building only
+    # the tar and rendering the page offline with
+    # `python -m lisatools.globalfit.monitor.from_tar SNAP.tar.gz` is the
+    # cheap way to keep per-iteration snapshots; GF_MONITOR_SNAPSHOT can
+    # likewise turn the tar off while keeping the page.
+    _want_page = _flag("GF_MONITOR_PAGE", "1")
+    _want_snap = _flag("GF_MONITOR_SNAPSHOT", "1")
+    if not _want_page and not _want_snap:
+        # Not an error, but it is certainly not what anyone meant: the
+        # hook is armed and would produce nothing at all.
+        if not getattr(watchdog, "_warned_no_products", False):
+            if watchdog is not None:
+                watchdog._warned_no_products = True
+            logger.warning(
+                "[GF_MONITOR] GF_MONITOR_AFTER_SAVE is on but both "
+                "GF_MONITOR_PAGE and GF_MONITOR_SNAPSHOT are 0, so "
+                "the hook produces nothing. Unset "
+                "GF_MONITOR_AFTER_SAVE to disable it properly.")
+        return None
+
+    st = time.perf_counter()
+    if _want_page and _flag("GF_MONITOR_PAGE_SHORT"):
+        # The short page, in place of the full one (seconds, not minutes).
+        # Its own default name, never GF_MONITOR_OUT, which names the full
+        # page.
+        from . import build_short_monitor
+
+        build_short_monitor(run_dir, check=False)
+    elif _want_page:
+        from . import build_monitor
+
+        build_monitor(run_dir, out, timeout=timeout, check=False)
+    if _want_snap:
+        from .snapshot import build_snapshot
+
+        # GF_MONITOR_SNAPSHOT_SHORT=1 -> <run>_short.tar.gz: log
+        # information and the most recent state, nothing large. It is a
+        # SEPARATE file from the full snapshot, so turning it on does not
+        # overwrite or invalidate whatever full tar the run has already
+        # produced.
+        # GF_MONITOR_SNAPSHOT_FSTAT=1 -> the F-stat fit's epoch caches
+        # (gb_fstat_fit/**, GBs at 1 yr) ride along; default OUT, only
+        # their DONE.json markers ship (user ruling 2026-10-03: "default to
+        # leaving them out"). The CLI spelling is --add-fstat.
+        build_snapshot(run_dir, short=_flag("GF_MONITOR_SNAPSHOT_SHORT"),
+                       include_fstat=_flag("GF_MONITOR_SNAPSHOT_FSTAT"))
+    return time.perf_counter() - st

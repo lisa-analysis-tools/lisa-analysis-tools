@@ -2159,6 +2159,28 @@ def main() -> int:
         print("[combined] SMOKE mode: shrunk axes, GB_DEBUG + VGB_DEBUG on.",
               flush=True)
 
+    # DEDICATED MONITOR RANK (GF_MONITOR_RANK=1, 2026-10-04). FIRST, before
+    # anything else touches MPI: the highest world rank leaves the run and
+    # builds the page + snapshot tar from disk, so the saver never stops
+    # receiving for it. The run gets a communicator of the size it always
+    # had (world order kept), so layout, placement and roles are unchanged.
+    # Every run rank joins the closing barrier in __main__
+    # (finish_run_ranks); the monitor rank leaves when it completes.
+    from mpi4py import MPI
+    from lisatools.globalfit.monitor import rank as _monitor_rank
+
+    _run_comm, _mon = _monitor_rank.split_monitor_rank(MPI.COMM_WORLD)
+    if _run_comm is None:
+        print(f"[combined] rank {MPI.COMM_WORLD.Get_rank()} is the dedicated "
+              f"MONITOR rank (GF_MONITOR_RANK=1): page + snapshot tar off the "
+              f"saver.", flush=True)
+        _monitor_rank.run_monitor_rank(MPI.COMM_WORLD)
+        return 0
+    if _mon is not None:
+        print(f"[combined] GF_MONITOR_RANK=1: world rank {_mon} builds the "
+              f"monitor; the run uses {_run_comm.Get_size()} ranks.",
+              flush=True)
+
     fit = build_fit()
     print(f"[combined] branches: {list(fit.branches)}", flush=True)
     for st in fit.recipe.stages:
@@ -2172,18 +2194,19 @@ def main() -> int:
         return 0
 
     print("[combined] fit.build() ...", flush=True)
-    from mpi4py import MPI
     from lisatools.globalfit.communication.ranks import layout_dry_run, prepare_rank, RankRole
 
-    layout = prepare_rank(fit, MPI.COMM_WORLD)
+    # The RUN communicator from here on (== COMM_WORLD unless a monitor rank
+    # was split off above).
+    layout = prepare_rank(fit, _run_comm)
     # GF_LAYOUT_DRY_RUN=1: print every rank's placement and stop before the
     # build allocates anything (a bad layout still raises inside prepare_rank).
-    if layout_dry_run(layout, MPI.COMM_WORLD):
+    if layout_dry_run(layout, _run_comm):
         print("[combined] GF_LAYOUT_DRY_RUN=1 -- layout only, not built.", flush=True)
         return 0
     fit.build()
     print("[combined] running", flush=True)
-    fit.run()
+    fit.run(comm=_run_comm)
     # LOUD completion marker on stdout: "Residuals saved" goes to the
     # logger FILE only, so a finished run used to look exactly like a
     # silent death on the console.
@@ -2196,7 +2219,7 @@ def main() -> int:
     # run was still starting its first stage. Alarming and completely
     # false, so say which rank is talking and only claim completion from
     # the rank that actually sampled.
-    _rank = MPI.COMM_WORLD.Get_rank()
+    _rank = _run_comm.Get_rank()
     role = layout.role_of(_rank)
     if role == RankRole.HEAD:
         if _env_flag("NULL_CHECK_ONLY"):
@@ -2243,6 +2266,12 @@ if __name__ == "__main__":
     _comm = install_mpi_abort_on_error(MPI.COMM_WORLD)
     try:
         _rc = main()
+        # Every RUN rank joins the closing barrier the dedicated monitor
+        # rank waits on (a no-op without GF_MONITOR_RANK=1).
+        if not _rc:
+            from lisatools.globalfit.monitor import rank as _monitor_rank
+
+            _monitor_rank.finish_run_ranks()
     except SystemExit:
         raise
     except BaseException:

@@ -599,6 +599,20 @@ def save_to_backend_asynchronously_and_plot(
         # slowdown (recoverable, warn) from lost stored iterations
         # (unrecoverable, stop building). Re-checking iprobe is inside
         # the hook: the plot build above may have taken minutes.
+        #
+        # DEDICATED MONITOR RANK (GF_MONITOR_RANK=1, 2026-10-04): when the
+        # driver split one off, this loop only POSTS a non-blocking notice
+        # and goes straight back to recv -- the build happens on that rank,
+        # so it can never hold a save (job 717: the save after every
+        # in-place build stalled ~400 s with every GPU idle). See
+        # monitor/rank.py.
+        from .monitor import rank as _monitor_rank
+
+        if _monitor_rank.active():
+            if states:
+                _monitor_rank.notify_saved(gb_reader.filename, i, total_dropped)
+            continue
+
         from .monitor.hooks import after_save as _monitor_after_save
 
         _monitor_after_save(gb_reader, comm, main_rank, i, _monitor_watchdog,
