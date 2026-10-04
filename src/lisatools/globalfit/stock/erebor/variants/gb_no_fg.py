@@ -364,6 +364,30 @@ class GBNoFgGBSettings(GBSettings):
         # 16 = banded-gate default (1e-11 vs PCR, never slower).
         default_factory=env_default("SIGHET_V4_BAND", 16, int)
     )
+    # Per-row GB likelihood of the chunked delegate (RJ, removals, swaps' scoring
+    # and every non-in-model get_ll): "chunked" (default) or "lookup" -- GBGPU's
+    # fused direct-to-WDM lookup scorer (gbgpu.gblookupcomputations.
+    # GBLookupWDMComputations: the chunked comp with only get_ll_wdm swapped, so
+    # fills / swaps / F-stat / sig-het's delegate are unchanged). Needs a GBGPU
+    # wheel with gb_lookup_get_ll (dev >= 8a6762c). Env: GB_LIKELIHOOD.
+    likelihood: str = dataclasses.field(
+        default_factory=env_default("GB_LIKELIHOOD", "chunked", str)
+    )
+    # The lookup table: an explicit file, else the GB recipe table
+    # (lisatools.wdm_lookup_store.GB_TABLE_RECIPE) in lookup_table_dir, built
+    # once there (lock-protected) on first use.
+    lookup_table_path: str = dataclasses.field(
+        default_factory=env_default("GB_LOOKUP_TABLE_PATH", "", str)
+    )
+    lookup_table_dir: str = dataclasses.field(
+        default_factory=env_default("GB_LOOKUP_TABLE_DIR", "", str)
+    )
+    lookup_n_nodes: int = dataclasses.field(
+        default_factory=env_default("GB_LOOKUP_N_NODES", 64, int)
+    )
+    lookup_k_coarse: bool = dataclasses.field(
+        default_factory=env_default("GB_LOOKUP_K_COARSE", True, bool)
+    )
     # NOTE: no __post_init__ here — Setup.__init__ re-runs this dataclass's
     # __init__ on the (non-dataclass) GBSetup instance, which cannot resolve
     # dataclass hooks. Value validation happens in prepare_branch_settings.
@@ -999,7 +1023,23 @@ def setup_gb_moves(engine_info, curr, acs, priors, state) -> dict:
         _t_obs_start = float(getattr(general_info, "data_t0", 0.0))
         _orig_wdm_t0 = float(_wdm.t0)
         _wdm.t0 = _t_obs_start
-        gb_info.gb_wdm_comp = GBWDMComputations(
+        _gb_like = str(getattr(gb_info, "likelihood", "chunked") or "chunked").lower()
+        if _gb_like not in ("chunked", "lookup"):
+            raise ValueError(f"GB_LIKELIHOOD={_gb_like!r}: 'chunked' or 'lookup'.")
+        _comp_cls, _lookup_kw = GBWDMComputations, {}
+        if _gb_like == "lookup":
+            from gbgpu.gblookupcomputations import GBLookupWDMComputations
+            from lisatools.wdm_lookup_store import resolve_gb_lookup_table
+
+            _comp_cls = GBLookupWDMComputations
+            _lookup_kw = dict(
+                lookup_table=resolve_gb_lookup_table(
+                    getattr(gb_info, "lookup_table_path", "") or None,
+                    getattr(gb_info, "lookup_table_dir", "") or None),
+                lookup_n_nodes=int(getattr(gb_info, "lookup_n_nodes", 64)),
+                lookup_k_coarse=bool(getattr(gb_info, "lookup_k_coarse", True)),
+            )
+        gb_info.gb_wdm_comp = _comp_cls(
             _wdm,
             t_ref=gb_info.t0,
             Nt_sub=int(gb_info.nt_sub),
@@ -1011,7 +1051,14 @@ def setup_gb_moves(engine_info, curr, acs, priors, state) -> dict:
             tdi_config=tdi_gen_str,
             force_backend=general_info.force_backend,
             tdi_type="XYZ",
+            **_lookup_kw,
         )
+        if _gb_like == "lookup":
+            logger.info(
+                "GB per-row likelihood: LOOKUP (GBLookupWDMComputations; table %s, "
+                "n_nodes=%d, k_coarse=%s) -- fills / swaps / F-stat stay chunked-het",
+                _lookup_kw["lookup_table"], _lookup_kw["lookup_n_nodes"],
+                _lookup_kw["lookup_k_coarse"])
         logger.info(
             "Chunked-het GB likelihood: Nf=%d Nt=%d Nt_sub=%d N_sparse=%d "
             "N_cp_sig=%d N_cp_orbit=%d (domain t0 %.6e -> het t_obs_start=%.6e, "
