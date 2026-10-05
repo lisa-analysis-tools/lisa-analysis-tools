@@ -31493,6 +31493,17 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             self._install(k)
             self._install_ctr_table(k, model=model, branches=branches)
             return
+        # RELEASE THE INSTALLED GRID BEFORE BUILDING THE NEXT (2026-10-05).
+        # 6mo job 730, PE refit epoch 2: the stacked proposal build OOMed on
+        # rank 0 at 88.4 GB allocated -- epoch 1's resident grid, the run's
+        # buffers and the new build's temporaries on one card. The fit never
+        # reads the old proposal (_install replaces it), so drop it and
+        # return the cached pool blocks first.
+        self.rj_proposal_distribution = None
+        self._stacked_census_obj = "unset"
+        import gc as _gc
+        _gc.collect()
+        self._free_inmodel_batch_pools(model, "before the F-stat refit")
         stacked, n_peaks = self._run_fstat_fit(model, k, branches=branches)
         self._install(k, stacked=stacked, n_peaks=n_peaks)
         # Belt for a failed DONE.json write (then _epoch_fit_clock read 0 in
