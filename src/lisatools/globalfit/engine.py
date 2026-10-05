@@ -326,6 +326,33 @@ class GeneralSetup(Setup, GeneralSettings):
             f"factory callable; got {type(spec).__name__}."
         )
 
+    def _get_alias_response(self, f_arr):
+        """Alias terms of the downsampling step for the sensitivity backend, or ``None``.
+
+        Controlled by ``preprocess_kwargs["alias_correction"]`` (default ``True``): decimation
+        folds the power the anti-aliasing filters leave above the new Nyquist back into the
+        band, which the filter response alone does not model. Logs and prints the choice.
+        """
+        get_alias = getattr(self.data_processor, "get_alias_response", None)
+        alias_response = get_alias(f_arr) if get_alias is not None else None
+        down = getattr(self.data_processor, "resample_down", None)
+        if alias_response is not None:
+            msg = (
+                f"Downsampling alias correction: ON ({alias_response[0].shape[0]} alias term(s), "
+                f"decimation by {down}). The noise model includes the power folded back from "
+                "above the new Nyquist."
+            )
+        elif down is not None and down > 1:
+            msg = (
+                "Downsampling alias correction: OFF. The power folded back by the decimation is NOT "
+                "modelled; the noise model is biased near the new Nyquist and in the TDI notches. "
+                "Keep the analysis band well below the new Nyquist."
+            )
+        else:
+            msg = "Downsampling alias correction: not needed (no downsampling applied)."
+        self.logger.info(msg)
+        print(msg)
+        return alias_response
     def init_data_information(self):
         """Run preprocessing, build the basis domain, and configure the sensitivity backend."""
         if self.data_processor_class is None:
@@ -414,6 +441,7 @@ class GeneralSetup(Setup, GeneralSettings):
         )
 
         filters_response = self.data_processor.get_total_response(asnumpy(domain_settings.f_arr))
+        alias_response = self._get_alias_response(asnumpy(domain_settings.f_arr))
 
         if isinstance(domain_settings, FDSettings):
             # FD path: ``pour`` returns an FDSignal whose ``settings`` IS the
@@ -501,6 +529,8 @@ class GeneralSetup(Setup, GeneralSettings):
                 force_backend=self.force_backend,
                 window_values=window if self.normalize_window else None,
                 filters_response=filters_response,
+                alias_frequencies=None if alias_response is None else alias_response[0],
+                alias_filters_response=None if alias_response is None else alias_response[1],
                 **sensitivity_init_kwargs,
             )
 

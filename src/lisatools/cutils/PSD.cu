@@ -993,9 +993,23 @@ void XYZSensitivityMatrix::set_averaged_tfs(
 
 void XYZSensitivityMatrix::disable_averaged_tfs() { use_averaged_tfs = false; }
 
+void XYZSensitivityMatrix::set_aliasing(double *alias_freqs_, int n_alias_, int n_grid_)
+{
+    alias_freqs = alias_freqs_;
+    n_alias = n_alias_;
+    n_grid = n_grid_;
+}
+
+void XYZSensitivityMatrix::disable_aliasing()
+{
+    alias_freqs = nullptr;
+    n_alias = 0;
+    n_grid = 0;
+}
+
 CUDA_DEVICE
-void XYZSensitivityMatrix::get_noise_covariance(
-    double f, int time_index, int f_idx,
+void XYZSensitivityMatrix::get_noise_covariance_single(
+    double f, int time_index, int grid_idx,
     const double *Soms_d_in, const double *Sa_a_in,
     double Amp, double alpha, double f_1, double f_knee, double f_2,
     double spline_in_isi_oms, double spline_in_testmass,
@@ -1009,8 +1023,8 @@ void XYZSensitivityMatrix::get_noise_covariance(
     cmplx mosa_cross[12];
     if (use_averaged_mosa_tfs)
     {
-        for (int k = 0; k < 24; k++) mosa_auto[k] = mosa_auto_avg[k * nf_avg + f_idx];
-        for (int k = 0; k < 12; k++) mosa_cross[k] = mosa_cross_avg[k * nf_avg + f_idx];
+        for (int k = 0; k < 24; k++) mosa_auto[k] = mosa_auto_avg[k * nf_avg + grid_idx];
+        for (int k = 0; k < 12; k++) mosa_cross[k] = mosa_cross_avg[k * nf_avg + grid_idx];
     }
     else
     {
@@ -1052,10 +1066,10 @@ void XYZSensitivityMatrix::get_noise_covariance(
 
     if (use_averaged_tfs)
     {
-        oms_xx = oms_xx_avg[f_idx]; oms_yy = oms_yy_avg[f_idx]; oms_zz = oms_zz_avg[f_idx];
-        oms_xy = oms_xy_avg[f_idx]; oms_xz = oms_xz_avg[f_idx]; oms_yz = oms_yz_avg[f_idx];
-        tm_xx  = tm_xx_avg[f_idx];  tm_yy  = tm_yy_avg[f_idx];  tm_zz  = tm_zz_avg[f_idx];
-        tm_xy  = tm_xy_avg[f_idx];  tm_xz  = tm_xz_avg[f_idx];  tm_yz  = tm_yz_avg[f_idx];
+        oms_xx = oms_xx_avg[grid_idx]; oms_yy = oms_yy_avg[grid_idx]; oms_zz = oms_zz_avg[grid_idx];
+        oms_xy = oms_xy_avg[grid_idx]; oms_xz = oms_xz_avg[grid_idx]; oms_yz = oms_yz_avg[grid_idx];
+        tm_xx  = tm_xx_avg[grid_idx];  tm_yy  = tm_yy_avg[grid_idx];  tm_zz  = tm_zz_avg[grid_idx];
+        tm_xy  = tm_xy_avg[grid_idx];  tm_xz  = tm_xz_avg[grid_idx];  tm_yz  = tm_yz_avg[grid_idx];
     }
     else
     {
@@ -1097,12 +1111,50 @@ void XYZSensitivityMatrix::get_noise_covariance(
       
     }
   
-  *c00 *= noise_normalization[f_idx];
-  *c11 *= noise_normalization[f_idx];
-  *c22 *= noise_normalization[f_idx];
-  *c01 *= noise_normalization[f_idx];
-  *c02 *= noise_normalization[f_idx];
-  *c12 *= noise_normalization[f_idx];
+  *c00 *= noise_normalization[grid_idx];
+  *c11 *= noise_normalization[grid_idx];
+  *c22 *= noise_normalization[grid_idx];
+  *c01 *= noise_normalization[grid_idx];
+  *c02 *= noise_normalization[grid_idx];
+  *c12 *= noise_normalization[grid_idx];
+}
+
+CUDA_DEVICE
+void XYZSensitivityMatrix::get_noise_covariance(
+    double f, int time_index, int f_idx,
+    const double *Soms_d_in, const double *Sa_a_in,
+    double Amp, double alpha, double f_1, double f_knee, double f_2,
+    double spline_in_isi_oms, double spline_in_testmass,
+    double *c00, cmplx *c01, cmplx *c02,
+    double *c11, cmplx *c12, double *c22)
+{
+  get_noise_covariance_single(f, time_index, f_idx, Soms_d_in, Sa_a_in,
+                              Amp, alpha, f_1, f_knee, f_2,
+                              spline_in_isi_oms, spline_in_testmass,
+                              c00, c01, c02, c11, c12, c22);
+
+  // Downsampling aliasing: decimation folds the power left (after the anti-aliasing
+  // filters) at each alias frequency onto f. The alias filter response is already in
+  // noise_normalization on the alias grid. A term folding from a negative frequency
+  // enters as the two-sided value S(-|f_a|) = conj(S(|f_a|)).
+  for (int a = 1; a <= n_alias; a++)
+  {
+    double f_a = alias_freqs[(a - 1) * n_grid + f_idx];
+    double a00, a11, a22;
+    cmplx a01, a02, a12;
+    get_noise_covariance_single(fabs(f_a), time_index, a * n_grid + f_idx, Soms_d_in, Sa_a_in,
+                                Amp, alpha, f_1, f_knee, f_2,
+                                spline_in_isi_oms, spline_in_testmass,
+                                &a00, &a01, &a02, &a11, &a12, &a22);
+    if (f_a < 0.0)
+    {
+      a01 = gcmplx::conj(a01);
+      a02 = gcmplx::conj(a02);
+      a12 = gcmplx::conj(a12);
+    }
+    *c00 += a00; *c11 += a11; *c22 += a22;
+    *c01 += a01; *c02 += a02; *c12 += a12;
+  }
 }
 
 CUDA_KERNEL

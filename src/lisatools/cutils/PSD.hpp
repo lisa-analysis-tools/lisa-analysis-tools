@@ -98,6 +98,18 @@ public:
     double *mosa_auto_avg = nullptr;
     gcmplx::complex<double> *mosa_cross_avg = nullptr;
 
+    // --- downsampling aliasing (non-owned) ---
+    // Decimating by D folds the residual power at the D - 1 alias frequencies of f
+    // (k fs' +- f, below the pre-decimation Nyquist) back onto f. With n_alias > 0,
+    // get_noise_covariance adds those terms. Grid index g = a * n_grid + f_idx (a = 0
+    // is f itself, a >= 1 the alias grids) addresses noise_normalization and the
+    // averaged TFs, which are then laid out on that extended grid of
+    // (1 + n_alias) * n_grid points. alias_freqs[(a - 1) * n_grid + f_idx] is signed:
+    // a negative value folds from a negative frequency, so its cross terms are conjugated.
+    int    n_alias = 0;
+    int    n_grid = 0;
+    double *alias_freqs = nullptr;
+
     // ---- constructor ----
     XYZSensitivityMatrix(double *averaged_ltts_arr_, double *delta_ltts_arr_,
                          int n_times_, double armlength_,
@@ -134,6 +146,10 @@ public:
     void set_noise_symmetry(bool asymmetric);
     void set_averaged_mosa_tfs(double* mosa_auto, gcmplx::complex<double>* mosa_cross, int nf);
 
+    // ---- downsampling aliasing (host-only, defined in PSD.cu) ----
+    void set_aliasing(double* alias_freqs_, int n_alias_, int n_grid_);
+    void disable_aliasing();
+
     // ---- device: noise transfer functions ----
     CUDA_DEVICE int get_adjacent_mosa(int mosa);
 
@@ -156,6 +172,18 @@ public:
         double f, double *mosa_auto, gcmplx::complex<double> *mosa_cross, int time_index);
 
     // ---- device: noise covariance ----
+    // Covariance at one frequency; grid_idx addresses noise_normalization and the
+    // averaged TFs (see the aliasing note above).
+    CUDA_DEVICE void get_noise_covariance_single(
+        double f, int time_index, int grid_idx,
+        const double *Soms_d_in, const double *Sa_a_in,
+        double Amp, double alpha, double f_1, double f_knee, double f_2,
+        double spline_in_isi_oms, double spline_in_testmass,
+        double *c00, gcmplx::complex<double> *c01, gcmplx::complex<double> *c02,
+        double *c11, gcmplx::complex<double> *c12, double *c22);
+
+    // Covariance of the (possibly decimated) data at grid frequency f_idx: the direct
+    // term plus, when aliasing is set, the folded alias terms.
     // Soms_d_in / Sa_a_in point to n_noise_par amplitudes for this PSD.
     CUDA_DEVICE void get_noise_covariance(
         double f, int time_index, int f_idx,

@@ -305,6 +305,13 @@ void XYZSensitivityMatrixWrap::set_averaged_mosa_tfs_wrap(
         nf);
 }
 
+void XYZSensitivityMatrixWrap::set_aliasing_wrap(array_type<double> alias_freqs, int n_alias, int n_grid)
+{
+    sensitivity_matrix->set_aliasing(
+        return_pointer_and_check_length(alias_freqs, "alias_freqs", n_alias * n_grid, 1),
+        n_alias, n_grid);
+}
+
 void XYZSensitivityMatrixWrap::get_inverse_det_wrap(
     array_type<double> c00_arr, array_type<std::complex<double>> c01_arr, array_type<std::complex<double>> c02_arr,
     array_type<double> c11_arr, array_type<std::complex<double>> c12_arr, array_type<double> c22_arr,
@@ -629,6 +636,13 @@ void detector_part(nb::module_ &m) {
     .def("set_averaged_mosa_tfs_wrap", &XYZSensitivityMatrixWrap::set_averaged_mosa_tfs_wrap,
          nb::arg("mosa_auto"), nb::arg("mosa_cross"), nb::arg("nf"),
          "Attach FD time-averaged per-MOSA TFs, layouts (24, nf) and (12, nf).")
+    .def("set_aliasing_wrap", &XYZSensitivityMatrixWrap::set_aliasing_wrap,
+         nb::arg("alias_freqs"), nb::arg("n_alias"), nb::arg("n_grid"),
+         "Add the downsampling alias terms to the covariance. alias_freqs (n_alias, n_grid) are\n"
+         "signed (negative: folded from a negative frequency, cross terms conjugated);\n"
+         "noise_normalization and averaged TFs must cover the extended (1 + n_alias) * n_grid grid.")
+    .def("disable_aliasing_wrap", &XYZSensitivityMatrixWrap::disable_aliasing_wrap, "Drop the alias terms.")
+    .def_prop_ro("n_alias", &XYZSensitivityMatrixWrap::get_n_alias)
     .def("get_inverse_det_wrap",      &XYZSensitivityMatrixWrap::get_inverse_det_wrap,
          nb::call_guard<nb::gil_scoped_release>(), "Batch invert 3x3 Hermitian matrices and compute determinants.")
     .def_rw("sensitivity_matrix", &XYZSensitivityMatrixWrap::sensitivity_matrix)

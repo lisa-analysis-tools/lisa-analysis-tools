@@ -57,7 +57,7 @@ MOJITO_REFERENCE_TIME = 97729089.327664
 #   "parametric-symmetric":  one OMS + one TM amplitude for all MOSAs (2 parameters)
 #   "parametric-asymmetric": one OMS + one TM amplitude per MOSA (12 parameters,
 #                            links 12, 23, 31, 13, 32, 21; expect degeneracies)
-NOISE_MODEL = "parametric-asymmetric" # "parametric-symmetric"
+NOISE_MODEL = "parametric-symmetric" # "parametric-symmetric" "parametric-asymmetric"
 NOISE_SYMMETRY = {
     "parametric-symmetric": "symmetric",
     "parametric-asymmetric": "asymmetric",
@@ -197,7 +197,7 @@ def get_general_erebor_settings() -> GeneralSetup:
     Tobs = 7.0 * 24 * 3600.0  # seconds
     dt = 5.0
     start_freq = 1e-4
-    end_freq = 1e-1
+    end_freq = 1e-1 # 4e-2 # 1e-1 # 2e-2 
 
     # head_dir = "/data/asantini/globalfit/erebor_org_setup/mojito_runs/"
     # data_input_path = "/data/asantini/globalfit/MOJITO_DATA/mojito_light_2p5s/"
@@ -206,8 +206,9 @@ def get_general_erebor_settings() -> GeneralSetup:
 
     prefix = "preproc-bias"
     data_input_path = "/mnt/wd_hdd_6TB/nikos/DATA/global_fit/mojito_lite/"
-    base_file_name = f"psd_unequal_noises_{prefix}"
-    file_store_dir = f"/mnt/wd_hdd_6TB/nikos/DATA/global_fit/gf_output/unequal_noises_{prefix}/"
+    base_file_name = f"equal_noises_{prefix}_lowpasshighercutoff"
+    # file_store_dir = f"/mnt/wd_hdd_6TB/nikos/DATA/global_fit/gf_output/unequal_noises_{prefix}/"
+    file_store_dir = f"/mnt/wd_hdd_6TB/nikos/DATA/global_fit/gf_output/{base_file_name}_fmax:{end_freq:.1e}/"
 
     gpus = [0]
     cp.cuda.runtime.setDevice(gpus[0])
@@ -223,6 +224,7 @@ def get_general_erebor_settings() -> GeneralSetup:
     window_type = "tukey"
     window_taper_duration = 1 / start_freq
     normalize_window = True
+    target_fs = 1 / dt
 
     basis_domain = "stft"
     stft_dt = 1 * 24 * 3600.0 if basis_domain == "stft" else None  # hours
@@ -248,7 +250,7 @@ def get_general_erebor_settings() -> GeneralSetup:
     )
 
     downsample_kwargs = {
-        "target_fs": 1 / dt,  # Hz — target sampling rate (None = no downsampling).
+        "target_fs": target_fs,  # Hz — target sampling rate (None = no downsampling).
         "window": (
             "kaiser",
             5.0,
@@ -262,7 +264,7 @@ def get_general_erebor_settings() -> GeneralSetup:
     }
 
     lowpass_kwargs = {
-        "cutoff": 0.101,  # Hz — lowpass cutoff frequency
+        "cutoff": 0.8 * target_fs, # 0.101,  # Hz — lowpass cutoff frequency
         "order": 2,  # Butterworth filter order
         "zero_phase": True,
     }
@@ -279,6 +281,9 @@ def get_general_erebor_settings() -> GeneralSetup:
         trim_kwargs=trim_kwargs,
         downsample_kwargs=downsample_kwargs,
         Tobs=Tobs,
+        # model the power folded back by the downsampling (see BaseProcessingStep.process);
+        # False only for fast runs whose band stays well below the new Nyquist
+        alias_correction=True,
     )
 
     sensitivity_init_kwargs = dict(

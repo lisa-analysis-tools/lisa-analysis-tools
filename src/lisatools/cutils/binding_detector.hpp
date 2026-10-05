@@ -343,6 +343,11 @@ public:
     void set_averaged_mosa_tfs_wrap(
         array_type<double> mosa_auto, array_type<std::complex<double>> mosa_cross, int nf);
 
+    // downsampling aliasing: signed alias frequencies, layout (n_alias, n_grid)
+    void set_aliasing_wrap(array_type<double> alias_freqs, int n_alias, int n_grid);
+    void disable_aliasing_wrap() { sensitivity_matrix->disable_aliasing(); }
+    int get_n_alias() const { return sensitivity_matrix->n_alias; }
+
     void get_inverse_det_wrap(
         array_type<double> c00_arr, array_type<std::complex<double>> c01_arr, array_type<std::complex<double>> c02_arr,
         array_type<double> c11_arr, array_type<std::complex<double>> c12_arr, array_type<double> c22_arr,

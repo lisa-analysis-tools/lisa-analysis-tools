@@ -875,6 +875,7 @@ class BaseProcessingStep(SignalProcessor):
         downsample_kwargs: Optional[dict] = None,
         trim_kwargs: Optional[dict] = None,
         Tobs: Optional[float] = None,
+        alias_correction: bool = True,
         **kwargs,
     ) -> tuple:
         """
@@ -888,6 +889,15 @@ class BaseProcessingStep(SignalProcessor):
                 Applied after filtering and before trimming. Example: dict(target_fs=1.0).
             trim_kwargs (dict, optional): Keyword arguments for trim method.
             Tobs (float, optional): Observation time in seconds. If provided, applies trimming to keep only the first `Tobs` duration of data.
+            alias_correction (bool, optional): Model the aliasing of the downsampling step in the
+                noise covariance (default ``True``). Decimation folds the power that the
+                anti-aliasing filters leave above the new Nyquist back into the band; the filter
+                response alone does not describe it, and the data PSD is then underestimated near
+                the new Nyquist and in the TDI notches (up to factors of a few). With ``True``,
+                :meth:`get_alias_response` provides the alias terms for the sensitivity backend
+                (about one extra covariance evaluation per alias). Set ``False`` only for runs
+                whose band stays well below the new Nyquist, where the effect is negligible.
+                Has no effect without downsampling.
             **kwargs: Additional keyword arguments for the eventual plots.
 
         Returns:
@@ -946,12 +956,15 @@ class BaseProcessingStep(SignalProcessor):
             self.downsample(**downsample_kwargs)
             
             ratio = Fraction(downsample_kwargs["target_fs"] / self.original_fs).limit_denominator(10000)
-            _, down = ratio.numerator, ratio.denominator
+            up, down = ratio.numerator, ratio.denominator
+            self.resample_up, self.resample_down = up, down
             self.fir = signal.firwin(
                 numtaps= 2 * 10 * down + 1,
                 cutoff=1.0 / down, 
                 window=downsample_kwargs.get("window", ("kaiser", 31.0))
                 )
+
+        self.alias_correction = alias_correction
 
         if trim_kwargs is not None:
             if self.verbose:
@@ -1108,6 +1121,49 @@ class BaseProcessingStep(SignalProcessor):
             return np.ones_like(freqs, dtype=np.float64)  # No FIR filter applied
 
         return np.abs(signal.freqz(self.fir, worN=np.abs(freqs), fs=self.original_fs)[1]) ** 2
+
+    def get_alias_response(self, freqs: np.ndarray) -> Optional[tuple]:
+        """Alias frequencies and filter responses of the downsampling step.
+
+        Decimating by ``D`` (``resample_poly`` with ``up=1``) from ``fs = D fs'`` to ``fs'``
+        folds the power at every ``k fs' +- f`` below the original Nyquist ``fs / 2`` onto
+        ``f``. The anti-aliasing filters only attenuate that power, so the decimated PSD is
+
+        ``S'(f) = |H(f)|^2 S(f) + sum_a |H(|f_a|)|^2 S(f_a)``,
+
+        with ``D - 1`` aliases ``f_a = -(k fs' - f)`` (``k = 1..floor(D/2)``, folded from a
+        negative frequency: the two-sided cross-spectrum is conjugated) and
+        ``f_a = +(k fs' + f)`` (``k = 1..floor((D-1)/2)``). For ``D = 2`` the only alias
+        is ``-(fs' - f)``.
+
+        Args:
+            freqs: Frequencies of the decimated data, in ``[0, fs'/2]``.
+
+        Returns:
+            ``(alias_frequencies, alias_filters_response)``, both of shape
+            ``(D - 1, len(freqs))``, to pass to the sensitivity backend; ``None`` when no
+            downsampling was applied or ``alias_correction`` is ``False``.
+        """
+        if not getattr(self, "alias_correction", True) or not hasattr(self, "resample_down"):
+            return None
+        if self.resample_up != 1:
+            logger.warning(
+                f"Alias correction is only implemented for integer decimation (up=1); got "
+                f"up={self.resample_up}, down={self.resample_down}. Aliasing is NOT modelled."
+            )
+            return None
+        D = self.resample_down
+        if D < 2:
+            return None
+        fs_new = self.original_fs / D
+        freqs = np.abs(np.asarray(freqs, dtype=np.float64))
+        alias = [-(k * fs_new - freqs) for k in range(1, D // 2 + 1)]
+        alias += [k * fs_new + freqs for k in range(1, (D - 1) // 2 + 1)]
+        alias_frequencies = np.array(alias)
+        alias_filters_response = self.get_total_response(np.abs(alias_frequencies).ravel()).reshape(
+            alias_frequencies.shape
+        )
+        return alias_frequencies, alias_filters_response
 
     def get_total_response(self, freqs: float | np.ndarray) -> np.ndarray:
         """

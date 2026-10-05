@@ -2153,6 +2153,19 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             matrix components along the main frequency diagonal. Default is ``False``.
             If ``True``, the backend likelihood computation will be split in two steps, with the convolution applied in python.
         filters_response: Optional array of filter responses to apply to the sensitivity matrix. If provided, it should be of shape (n_freqs).
+        alias_frequencies: Optional signed alias frequencies, shape ``(n_alias, n_freqs)``,
+            to model the aliasing of the downsampling step. Decimating by ``D`` to the
+            rate ``fs'`` folds whatever power the anti-aliasing filters leave at
+            ``k fs' +- f`` (below the original Nyquist) onto ``f``; the filter response
+            ``|H(f)|^2`` alone only accounts for the attenuation, not for this extra
+            power, which biases the model near the new Nyquist and in the TDI notches.
+            Each row is one alias, ``-(k fs' - f)`` (folded from a negative frequency,
+            cross-spectra conjugated) or ``+(k fs' + f)``. The covariance then becomes
+            ``C(f) = |H(f)|^2 S(f) + sum_a |H(|f_a|)|^2 S(f_a)``. Build both arrays with
+            :meth:`~lisatools.globalfit.preprocessing.BaseProcessingStep.get_alias_response`.
+            Requires ``alias_filters_response``; not supported with ``use_splines``.
+        alias_filters_response: Filter power response ``|H(|f_a|)|^2`` at
+            ``alias_frequencies``, same shape.
         average_transfer_functions: Whether to average the TDI transfer functions
             over the orbit (``True``) or use the values at a single average epoch
             (``False``), in the case of a frequency-domain basis. Default is
@@ -2186,6 +2199,8 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         smoothing_sigma: Optional[float] = 1.0,
         noise_symmetry: str = "symmetric",
         fft_batch_size: Optional[int] = 512,
+        alias_frequencies: Optional[NDArrayLike] = None,
+        alias_filters_response: Optional[NDArrayLike] = None,
     ):
         LISAToolsParallelModule.__init__(self, force_backend=force_backend)
         if noise_symmetry not in NOISE_SYMMETRIES:
@@ -2217,6 +2232,12 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         self.window_values = window_values
         self.convolve_window = convolve_window
         self.filters_response = filters_response
+        if (alias_frequencies is None) != (alias_filters_response is None):
+            raise ValueError("alias_frequencies and alias_filters_response must be given together.")
+        if alias_frequencies is not None and use_splines:
+            raise NotImplementedError("Downsampling aliasing is not supported with use_splines.")
+        self.alias_frequencies = alias_frequencies
+        self.alias_filters_response = alias_filters_response
 
         self.average_transfer_functions = average_transfer_functions
         self._averaging_active = False   # set True by get_averaged_ltts() in FD averaged mode
@@ -2248,6 +2269,8 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             "smoothing_sigma": self.smoothing_sigma,
             "noise_symmetry": self.noise_symmetry,
             "fft_batch_size": self._fft_batch_size,
+            "alias_frequencies": self.alias_frequencies,
+            "alias_filters_response": self.alias_filters_response,
         }
 
     @property
@@ -2465,6 +2488,13 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         else:
             self.pycpp_sensitivity_matrix = _SensitivityMatrixWrap(*self.pycppsensmat_args)
             self.pycpp_sensitivity_matrix.set_noise_symmetry_wrap(self.n_noise_par > 1)
+            if self.n_alias > 0:
+                n_grid = len(self.basis_settings.f_arr)
+                # kept alive on self: the c++ object holds a raw pointer to it
+                self._alias_freqs_flat = self.xp.ascontiguousarray(
+                    self.xp.asarray(self.alias_frequencies, dtype=self.xp.float64).ravel()
+                )
+                self.pycpp_sensitivity_matrix.set_aliasing_wrap(self._alias_freqs_flat, self.n_alias, n_grid)
 
         self._init_basis_settings()
 
@@ -2479,11 +2509,11 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         use E_t[C(f;L(t))].  Parameter-free -> computed once; arrays kept alive on
         self and shared across walker copies (like gal_R_avg)."""
         xp = self.xp
-        nf = self.num_freqs
         # the epochs to average the transfer functions over (NOT likelihood time
         # points; the likelihood uses time_indices=[0]). See get_averaged_ltts docstring.
         N = self.pycppsensmat_args[2]
-        f_arr = xp.asarray(self.f_arr)
+        f_arr = self._tf_frequency_grid()   # data grid + alias grids
+        nf = len(f_arr)
 
         # order MUST match get_noise_tfs_wrap: oms_xx,xy,xz,yy,yz,zz, tm_xx,xy,xz,yy,yz,zz
         real_flags = (True, False, False, True, False, True,
@@ -2510,9 +2540,9 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         """Per-MOSA counterpart of :meth:`_build_and_attach_averaged_tfs` for the
         asymmetric noise model: epoch-average the 24 auto + 12 cross basis TFs."""
         xp = self.xp
-        nf = self.num_freqs
         N = self.pycppsensmat_args[2]
-        f_arr = xp.asarray(self.f_arr)
+        f_arr = self._tf_frequency_grid()   # data grid + alias grids
+        nf = len(f_arr)
 
         acc_auto = xp.zeros((24, nf), dtype=xp.float64)
         acc_cross = xp.zeros((12, nf), dtype=xp.complex128)
@@ -2546,7 +2576,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
         # Manually copy attributes
         for key, value in self.__dict__.items():
-            if key in ("_backend", "pycpp_sensitivity_matrix", "_galactic_grid", "_avg_tf_arrays", "_avg_mosa_tf_arrays", "noise_normalization"):
+            if key in ("_backend", "pycpp_sensitivity_matrix", "_galactic_grid", "_avg_tf_arrays", "_avg_mosa_tf_arrays", "noise_normalization", "_alias_freqs_flat"):
                 # Don't deepcopy backend objects - just reference.
                 # _avg_tf_arrays is referenced by raw pointers inside the (shared)
                 # pycpp_sensitivity_matrix, so copies MUST share these arrays.
@@ -2590,6 +2620,28 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             self.noise_normalization = window_normalization * self.xp.ascontiguousarray(self.xp.asarray(self.filters_response))
         else:
             self.noise_normalization = window_normalization * self.xp.ones(len(self.basis_settings.f_arr), dtype=self.xp.float64)
+
+        if self.n_alias > 0:
+            # the C++ covariance reads the alias grids at index a * n_freqs + f_idx
+            alias_resp = self.xp.asarray(self.alias_filters_response, dtype=self.xp.float64).reshape(self.n_alias, -1)
+            self.noise_normalization = self.xp.ascontiguousarray(
+                self.xp.concatenate([self.noise_normalization, window_normalization * alias_resp.ravel()])
+            )
+
+    @property
+    def n_alias(self) -> int:
+        """Number of downsampling alias terms in the covariance (0: aliasing not modelled)."""
+        if self.alias_frequencies is None:
+            return 0
+        return int(np.prod(np.shape(self.alias_frequencies))) // len(self.basis_settings.f_arr)
+
+    def _tf_frequency_grid(self):
+        """Frequencies of the (extended) grid the averaged TFs live on: the data grid,
+        then the alias grids (|f_a|), matching the C++ grid index a * n_freqs + f_idx."""
+        f_arr = self.xp.asarray(self.f_arr)
+        if self.n_alias == 0:
+            return f_arr
+        return self.xp.concatenate([f_arr, self.xp.abs(self._alias_freqs_flat)])
                 
     def _init_basis_settings(self):
         """Initialize basis settings from domain settings."""
