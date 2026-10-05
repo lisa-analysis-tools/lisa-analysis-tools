@@ -383,7 +383,7 @@ class GBNoFgGBSettings(GBSettings):
         default_factory=env_default("GB_LOOKUP_TABLE_DIR", "", str)
     )
     lookup_n_nodes: int = dataclasses.field(
-        default_factory=env_default("GB_LOOKUP_N_NODES", 64, int)
+        default_factory=env_default("GB_LOOKUP_N_NODES", -1, int)   # <= 0: auto (constant spacing)
     )
     lookup_k_coarse: bool = dataclasses.field(
         default_factory=env_default("GB_LOOKUP_K_COARSE", True, bool)
@@ -1042,7 +1042,7 @@ def setup_gb_moves(engine_info, curr, acs, priors, state) -> dict:
                 lookup_table=resolve_gb_lookup_table(
                     getattr(gb_info, "lookup_table_path", "") or None,
                     getattr(gb_info, "lookup_table_dir", "") or None),
-                lookup_n_nodes=int(getattr(gb_info, "lookup_n_nodes", 64)),
+                lookup_n_nodes=int(getattr(gb_info, "lookup_n_nodes", -1)),
                 lookup_k_coarse=bool(getattr(gb_info, "lookup_k_coarse", True)),
                 lookup_fill=bool(getattr(gb_info, "lookup_fill", False)),
             )
