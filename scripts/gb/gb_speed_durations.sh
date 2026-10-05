@@ -22,8 +22,12 @@
 # SIGHET_CARRIER_COLLAPSE=0 for the full-layout A/B), sighet_reim (c81d8bb),
 # sighet_ampph (pre-c81d8bb), lookup (reference-free direct WDM, Python
 # prototype -- its speed is a Python number), lookup_kernel (the same lookup as
-# GBGPU's fused kernel, GBLookupComputations: the speed number that counts).
-# GPU occupancy of the v5 kernel: GB_SIGHET_V5_VERBOSE=1 (regs, blocks/SM).
+# GBGPU's fused kernel, GBLookupComputations: the speed number that counts),
+# sighet_lookupref (sighet_carrier with the reference c0 / c1 read from the lookup
+# table instead of the FD transform, and the anchor offset from the lookup scorer;
+# SIGHET_ANCHOR_ENGINE=chunked restores the chunked anchor for the A/B).
+# GPU occupancy of the v5 kernel: GB_SIGHET_V5_VERBOSE=1 (regs, blocks/SM); of the
+# lookup kernel: GB_LOOKUP_VERBOSE=1.
 #
 # Cluster:  BACKEND=cuda12x MOJITO_LIGHT_PATH=/shared/data/mojito_cache \
 #             bash scripts/gb/gb_speed_durations.sh
