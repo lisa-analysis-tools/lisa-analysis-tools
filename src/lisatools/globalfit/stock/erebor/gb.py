@@ -259,6 +259,27 @@ def sighet_engine_kwargs(info) -> dict:
     )
     if v5:
         kw["v5"] = v5
+    # Carrier reference from the GB lookup table (GBGPU >= 84f06bf) and the anchor
+    # engine. Only passed when asked for, so an older GBGPU keeps building.
+    ref = str(getattr(info, "sighet_ref_build", "fd") or "fd").lower()
+    anchor = str(getattr(info, "sighet_anchor_engine", "chunked") or "chunked").lower()
+    if ref not in ("fd", "lookup"):
+        raise ValueError(f"SIGHET_REF_BUILD={ref!r}: 'fd' or 'lookup'.")
+    if anchor not in ("chunked", "lookup"):
+        raise ValueError(f"SIGHET_ANCHOR_ENGINE={anchor!r}: 'chunked' or 'lookup'.")
+    if anchor == "lookup" and ref != "lookup":
+        raise ValueError("SIGHET_ANCHOR_ENGINE=lookup needs SIGHET_REF_BUILD=lookup "
+                         "(the anchor reads the same attached table).")
+    if ref == "lookup":
+        from lisatools.wdm_lookup_store import resolve_gb_lookup_table
+
+        kw["lookup_table"] = resolve_gb_lookup_table(
+            getattr(info, "lookup_table_path", "") or None,
+            getattr(info, "lookup_table_dir", "") or None)
+        kw["lookup_n_nodes"] = int(getattr(info, "lookup_n_nodes", -1))
+        kw["lookup_k_coarse"] = bool(getattr(info, "lookup_k_coarse", True))
+    if anchor == "lookup":
+        kw["anchor_engine"] = "lookup"
     return kw
 
 
@@ -331,9 +352,12 @@ def build_sighet_engine(info, comp, *, branch: str):
     from gbgpu.gbsignalhetcomputations import GBSignalHetComputations
 
     check_sighet_build_config(info, comp, branch=branch)
-    return GBSignalHetComputations.for_band_engine(
-        comp, **sighet_engine_kwargs(info)
-    )
+    kw = sighet_engine_kwargs(info)
+    if "lookup_table" in kw:
+        logging.getLogger(__name__).info(
+            "[%s] sig-het carrier reference from the LOOKUP table %s (anchor: %s)",
+            branch, kw["lookup_table"], kw.get("anchor_engine", "chunked"))
+    return GBSignalHetComputations.for_band_engine(comp, **kw)
 
 
 @dataclasses.dataclass

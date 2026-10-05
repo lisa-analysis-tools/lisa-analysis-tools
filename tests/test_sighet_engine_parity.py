@@ -16,7 +16,9 @@ These tests pin the parity structurally, without a GPU or a data build:
 * the ``for_band_engine`` kwargs derived from the two blocks are IDENTICAL
   under the same environment, and always carry an explicit ``tukey_alpha``;
 * the shared build-time checks refuse the silently-degrading configurations
-  (v5 without v4 knots / band; a taper the time crop does not exclude).
+  (v5 without v4 knots / band; a taper the time crop does not exclude);
+* the lookup-built carrier reference (SIGHET_REF_BUILD / SIGHET_ANCHOR_ENGINE) is off
+  by default and reaches both branches identically when asked for.
 """
 
 import dataclasses
@@ -99,6 +101,36 @@ class SigHetEngineKwargsTest(unittest.TestCase):
         self.assertEqual(vgb_kw["nt_layer"], 120)
         self.assertEqual(vgb_kw["n_cp_build"], 256)
         self.assertEqual(vgb_kw["n_sparse_fd"], 512)
+
+    def test_lookup_reference_off_by_default(self):
+        with _sighet_env_cleared():
+            for info in (GBNoFgGBSettings(), VGBSettings()):
+                kw = sighet_engine_kwargs(info)
+                self.assertNotIn("lookup_table", kw)
+                self.assertNotIn("anchor_engine", kw)
+
+    def test_lookup_reference_env_reaches_both_branches_identically(self):
+        env = {"SIGHET_REF_BUILD": "lookup", "SIGHET_ANCHOR_ENGINE": "lookup",
+               "GB_LOOKUP_TABLE_PATH": "/tmp/gb_table_for_the_test.h5",
+               "GB_LOOKUP_N_NODES": "96"}
+        with _sighet_env_cleared(), mock.patch.dict(os.environ, env):
+            gb_kw = sighet_engine_kwargs(GBNoFgGBSettings())
+            vgb_kw = sighet_engine_kwargs(VGBSettings())
+        self.assertEqual(gb_kw, vgb_kw)
+        self.assertEqual(vgb_kw["lookup_table"], "/tmp/gb_table_for_the_test.h5")
+        self.assertEqual(vgb_kw["lookup_n_nodes"], 96)
+        self.assertEqual(vgb_kw["anchor_engine"], "lookup")
+
+    def test_lookup_anchor_needs_the_lookup_reference(self):
+        with _sighet_env_cleared(), mock.patch.dict(
+                os.environ, {"SIGHET_ANCHOR_ENGINE": "lookup"}):
+            info = GBNoFgGBSettings()
+        with self.assertRaises(ValueError):
+            sighet_engine_kwargs(info)
+        with _sighet_env_cleared(), mock.patch.dict(os.environ, {"SIGHET_REF_BUILD": "maybe"}):
+            info = VGBSettings()
+        with self.assertRaises(ValueError):
+            sighet_engine_kwargs(info)
 
     def test_v5_off_drops_the_kwarg(self):
         with _sighet_env_cleared(), mock.patch.dict(os.environ, {"SIGHET_V5": "0"}):

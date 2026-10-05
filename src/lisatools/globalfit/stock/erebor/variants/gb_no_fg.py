@@ -364,6 +364,22 @@ class GBNoFgGBSettings(GBSettings):
         # 16 = banded-gate default (1e-11 vs PCR, never slower).
         default_factory=env_default("SIGHET_V4_BAND", 16, int)
     )
+    # Sig-het v5 carrier REFERENCE source: "fd" (the FD transform, default) or
+    # "lookup" -- read the reference c0 / c1 from the GB WDM lookup table instead
+    # (GBGPU >= 84f06bf, ``attach_lookup_reference``: the carrier-only reference is
+    # the unit-envelope tone the table stores; ~55x cheaper per reference, scores
+    # equal to the FD build to the table's ~1e-6). Table: ``lookup_table_path``, else
+    # the GB recipe table in ``lookup_table_dir`` (default ~/.cache/gb_lookup_tables).
+    # Shared env, like every sighet_* field: SIGHET_REF_BUILD.
+    sighet_ref_build: str = dataclasses.field(
+        default_factory=env_default("SIGHET_REF_BUILD", "fd", str)
+    )
+    # Exact ln L behind the carrier anchor offset (SIGHET_ANCHOR_CORRECT): "chunked"
+    # (default) or "lookup" (needs sighet_ref_build="lookup"; ~10x cheaper per
+    # reference, exact to the table). Env: SIGHET_ANCHOR_ENGINE.
+    sighet_anchor_engine: str = dataclasses.field(
+        default_factory=env_default("SIGHET_ANCHOR_ENGINE", "chunked", str)
+    )
     # Per-row GB likelihood of the chunked delegate (RJ, removals, swaps' scoring
     # and every non-in-model get_ll): "chunked" (default) or "lookup" -- GBGPU's
     # fused direct-to-WDM lookup scorer (gbgpu.gblookupcomputations.

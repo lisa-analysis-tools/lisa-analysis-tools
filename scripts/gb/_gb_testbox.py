@@ -66,9 +66,8 @@ SIGHET_KW = dict(n_sparse_fd=1024, m_active_half_width=2, max_r=0.0, n_cp_build=
 #: record; 64 layers -> 2e-7 (mm 1e-10); 128 -> 5e-9 (mm 8e-14). Built once on the cheap
 #: Nf 180 / dt 20 grid: the table depends only on the layer duration (3600 s), so it serves the
 #: Nf 1440 / dt 2.5 production grid too.
-GB_TABLE_RECIPE = dict(prefix="wdm_lookup_gb_cx", fdot_max_factor=0.1, time_layers=128,
-                       max_freq=2.5e-2)
-GB_TABLE_GRID = (180, 20.0)
+# (one definition, shared with the fit's GB_LIKELIHOOD=lookup / SIGHET_REF_BUILD=lookup)
+from lisatools.wdm_lookup_store import GB_TABLE_GRID, GB_TABLE_RECIPE  # noqa: E402
 
 
 def gb_table(table=None, table_dir=None):
