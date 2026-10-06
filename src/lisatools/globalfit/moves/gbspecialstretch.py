@@ -32387,6 +32387,11 @@ def get_param_limits(array): # can be used for debugging of coordinate values
 _CHOL_CACHES = {}
 
 
+def _ix(a, idx):
+    """``a[idx]`` for a host index ``idx`` whether ``a`` is numpy or cupy."""
+    return a[idx] if isinstance(a, np.ndarray) else a[get_array_module(a).asarray(idx)]
+
+
 class _CholCache:
     """Host-resident in-model proposal factors, mapped to living sources.
 
@@ -32553,10 +32558,11 @@ class _CholCache:
                 # births / unmatched: one batch through the block's own route,
                 # BEFORE the hit scatter below (the stash may reallocate)
                 mi = xp.asarray(miss)
-                ids_m = ids[mi]
+                ids_m = _ix(ids, miss)
                 B_m = move._compute_proposal_cholesky(
                     model, band_sorter, ids_m,
-                    slots=None if slots is None else slots[mi], buffer_obj=buffer_obj)
+                    slots=None if slots is None else _ix(slots, miss),
+                    buffer_obj=buffer_obj)
                 self._insert(move, band_sorter, ids_m, B_m)
                 chol[mi] = B_m
             else:
@@ -32571,8 +32577,7 @@ class _CholCache:
                 if (store is None or int(store.shape[0]) != n_src
                         or int(store.shape[-1]) != nz):
                     store = xp.full((n_src, nz, nz), xp.nan)
-                hi = xp.asarray(np.nonzero(hit)[0])
-                store[ids[hi]] = xp.asarray(Go[hit])
+                store[xp.asarray(_ix(ids, np.nonzero(hit)[0]))] = xp.asarray(Go[hit])
                 move._obs_gamma_z = store
         except Exception as exc:  # noqa: BLE001 -- overnight safety valve
             self._fail(move, "take", exc)
