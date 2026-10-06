@@ -19818,6 +19818,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         # Final coordinates back into the residual and the sorter.
         band_sorter.coords[ids] = curr
+        if self.use_info_mat_proposal:
+            _cc = self._chol_cache()
+            if _cc is not None:
+                _cc.retrack(ids, curr)
         if seq is not None:
             seq["snaps"]["before_addback"] = self._debug_slab_snapshot(
                 buffer_obj, seq["slot"])
@@ -32507,6 +32511,7 @@ class _CholCache:
         # marginal widths in the coords' own units: B is in y = x / s
         S = np.sqrt((Bh[:, self._COLS, :] ** 2).sum(-1)) * s[None, :]
         key = self._keys(band_sorter, ids)
+        ent = np.empty(len(key), dtype=np.int64)
         for k in np.unique(key):
             m = key == k
             new = {"C": C[m], "B": Bh[m], "S": S[m], "G": None if G is None else G[m]}
@@ -32530,8 +32535,10 @@ class _CholCache:
                 if g[f] is not None:
                     g[f][n:n + nm] = new[f]
             g["n"] = n + nm
+            ent[m] = np.arange(n, n + nm)
             self._index(g)
             self.groups[int(k)] = g
+        return key, ent
 
     def match(self, band_sorter, ids):
         """``(hit, B, G)`` host arrays for ``ids``; moves hit keys to the sources."""
@@ -32541,6 +32548,7 @@ class _CholCache:
         Bo = np.zeros((n, ndim, ndim))
         Go = None
         key = self._keys(band_sorter, ids)
+        ent = np.full(n, -1, dtype=np.int64)
         off = np.arange(-self.window, self.window)
         for k in np.unique(key):
             g = self.groups.get(int(k))
@@ -32561,6 +32569,7 @@ class _CholCache:
             if not ok.any():
                 continue
             hit[rows[ok]] = True
+            ent[rows[ok]] = e[ok]
             Bo[rows[ok]] = g["B"][e[ok]]
             if g["G"] is not None:
                 if Go is None:
@@ -32568,7 +32577,32 @@ class _CholCache:
                 Go[rows[ok]] = g["G"][e[ok]]
             g["C"][e[ok]] = q[ok]
             self._index(g)
+        self._block = (_to_numpy(ids).copy(), key, ent)
         return hit, Bo, Go
+
+    def retrack(self, ids, coords):
+        """End of block: move each row's entry key to its FINAL coordinates.
+
+        The key is set at the block's start; the 25 repeats then move the
+        source (Gram steps are large), and the next block would miss it.
+        Rows are the ones :meth:`take` just served (entries recorded there).
+        """
+        blk = getattr(self, "_block", None)
+        self._block = None
+        if blk is None or self.disabled:
+            return
+        ids_h, key, ent = blk
+        ids_now = _to_numpy(ids)
+        if ids_now.shape != ids_h.shape or not np.array_equal(ids_now, ids_h):
+            return
+        C = _to_numpy(coords)
+        for k in np.unique(key):
+            g = self.groups.get(int(k))
+            m = (key == k) & (ent >= 0)
+            if g is None or not m.any():
+                continue
+            g["C"][ent[m]] = C[m]
+            self._index(g)
 
     def take(self, move, model, band_sorter, ids, slots, buffer_obj):
         if self.disabled or self.epoch is None:
@@ -32588,7 +32622,9 @@ class _CholCache:
                     model, band_sorter, ids_m,
                     slots=None if slots is None else _ix(slots, miss),
                     buffer_obj=buffer_obj)
-                self._insert(move, band_sorter, ids_m, B_m)
+                _, ent_m = self._insert(move, band_sorter, ids_m, B_m)
+                if getattr(self, "_block", None) is not None:
+                    self._block[2][miss] = ent_m
                 chol[mi] = B_m
             else:
                 s = xp.ones(band_sorter.coords.shape[1])

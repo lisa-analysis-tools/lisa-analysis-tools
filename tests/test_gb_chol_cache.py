@@ -149,6 +149,36 @@ class CholCacheTest(unittest.TestCase):
         self.assertEqual(self.m.calls, [])
         np.testing.assert_array_equal(self._marker(chol), c[perm, 3])
 
+    def test_end_of_block_retrack_keeps_a_far_mover(self):
+        """A block moves its sources 3 x tol (big Gram steps, 25 repeats):
+        without the end-of-block retrack every one misses at its next block."""
+        ids = np.arange(len(self.c))
+        self.cache.take(self.m, None, self.bs, ids, ids, None)
+        c = self.c.copy()
+        c[:, 1] += 3 * self.cache.tol * SIG[1]
+        self.cache.retrack(ids, c)
+        chol = self.cache.take(self.m, None, _Sorter(c, self.w, self.t), ids, ids, None)
+        self.assertEqual(self.m.calls, [])
+        np.testing.assert_array_equal(self._marker(chol), c[:, 3])
+
+    def test_retrack_ignores_rows_it_did_not_serve(self):
+        ids = np.arange(len(self.c))
+        self.cache.take(self.m, None, self.bs, ids, ids, None)
+        c = self.c.copy()
+        c[:, 1] += 3 * self.cache.tol * SIG[1]
+        self.cache.retrack(ids[::-1], c)              # not the block take served
+        self.cache.take(self.m, None, _Sorter(c, self.w, self.t), ids, ids, None)
+        self.assertEqual(len(self.m.calls), 1)        # all missed: keys unmoved
+
+    def test_the_repeat_loop_retracks_with_the_final_coordinates(self):
+        """Wiring guard (the loop needs a live engine): after the final
+        write-back, ``_run_in_model_repeats`` hands ``curr`` to retrack."""
+        import inspect
+        src = inspect.getsource(G.GBSpecialBase._run_in_model_repeats)
+        i = src.index("# Final coordinates back into the residual and the sorter.")
+        j = src.index("inmodel_addback", i)
+        self.assertIn(".retrack(ids, curr)", src[i:j])
+
     def test_global_ticker(self):
         self.assertFalse(self.cache.due(39))
         self.assertFalse(self.cache.due(5))          # a slower move never rewinds it
