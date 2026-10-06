@@ -137,6 +137,28 @@ class EMRIDirectLikeMove(ResidualAddOneRemoveOneMove):
     # likelihood
     # ------------------------------------------------------------------
 
+    def _gram_context(self, walker):
+        """``EMRI_EIGEN_INFO=gram``: the walker's shard device."""
+        (device, _), = self._split_rows(np.array([int(walker)]))
+        return self._device_context(device)
+
+    def _gram_templates(self, coords, walker):
+        """``EMRI_EIGEN_INFO=gram`` hook: the direct templates for the Gram rows
+        on the active box (the scorer's own templates); a refused row raises
+        (the refresh then falls back to the likelihood route)."""
+        adapter = self._adapter()
+        self._check_box(adapter)
+        coords = np.atleast_2d(np.asarray(asnumpy(coords), dtype=np.float64))
+        parts = []
+        for lo in range(0, coords.shape[0], self.batch_max_size):
+            arr, ok = adapter.templates(coords[lo: lo + self.batch_max_size],
+                                        **self._gen_kwargs)
+            if not np.all(np.asarray(asnumpy(ok), dtype=bool)):
+                raise ValueError("EMRI Gram rows refused by the direct generator")
+            parts.append(arr)
+        xp = get_array_module(parts[0])
+        return xp.concatenate(parts), self._wdm
+
     def setup_likelihood_here(self, coords):
         """Arm the per-walker exposed-residual offset."""
         self._flush_stats()

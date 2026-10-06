@@ -408,6 +408,32 @@ class MBHBatchedLikeMove(ResidualAddOneRemoveOneMove):
     # likelihood
     # ------------------------------------------------------------------
 
+    def _gram_context(self, walker):
+        """``MBH_EIGEN_INFO=gram``: the walker's shard device(s)."""
+        (device, _), = self._split_rows(np.array([int(walker)]))
+        return self._device_contexts(device)
+
+    def _gram_templates(self, coords, walker):
+        """``MBH_EIGEN_INFO=gram`` hook: the batched windowed templates for the
+        Gram rows, in the leaf's window, relabelled onto the containers' box
+        (exactly what the scorer differences against). A refused batch raises
+        (the refresh then falls back to the likelihood route)."""
+        leaf = int(self._current_leaf)
+        geom = self._leaf_windows.get(leaf)
+        if geom is None:
+            raise RuntimeError(f"MBHBatchedLikeMove: leaf {leaf} window not set.")
+        adapter = self._adapter()
+        self._apply_window(adapter, geom)
+        coords = np.atleast_2d(np.asarray(asnumpy(coords), dtype=np.float64))
+        parts, box = [], None
+        for lo in range(0, coords.shape[0], self.batch_max_size):
+            tmpl = self._on_container_box(
+                self._generate(adapter, coords[lo: lo + self.batch_max_size]))
+            parts.append(tmpl.arr if tmpl.is_batched else tmpl.arr[None])
+            box = tmpl.settings if box is None else box
+        xp = get_array_module(parts[0])
+        return xp.concatenate(parts), box
+
     def setup_likelihood_here(self, coords):
         """Arm the per-walker exposed-residual offset and the leaf window."""
         self._flush_stats()
