@@ -953,16 +953,28 @@ class BaseProcessingStep(SignalProcessor):
         if downsample_kwargs is not None:
             if self.verbose:
                 logger.info("Downsampling data...")
+            fs_before = self.fs
             self.downsample(**downsample_kwargs)
-            
-            ratio = Fraction(downsample_kwargs["target_fs"] / self.original_fs).limit_denominator(10000)
-            up, down = ratio.numerator, ratio.denominator
-            self.resample_up, self.resample_down = up, down
-            self.fir = signal.firwin(
-                numtaps= 2 * 10 * down + 1,
-                cutoff=1.0 / down, 
-                window=downsample_kwargs.get("window", ("kaiser", 31.0))
+
+            if self.fs == fs_before:
+                # target_fs equals the current rate: downsample() did nothing, so there is
+                # no anti-aliasing FIR and no alias terms (get_fir_response -> 1,
+                # get_alias_response -> None).
+                if self.verbose:
+                    logger.info("No downsampling applied: FIR response and alias terms skipped.")
+            else:
+                ratio = Fraction(downsample_kwargs["target_fs"] / fs_before).limit_denominator(10000)
+                up, down = ratio.numerator, ratio.denominator
+                self.resample_up, self.resample_down = up, down
+                # Same FIR as scipy.signal.resample_poly, which runs it at the upsampled
+                # rate up * fs with cutoff 1 / max(up, down) (relative to that Nyquist).
+                max_rate = max(up, down)
+                self.fir = signal.firwin(
+                    numtaps=2 * 10 * max_rate + 1,
+                    cutoff=1.0 / max_rate,
+                    window=downsample_kwargs.get("window", ("kaiser", 31.0)),
                 )
+                self.fir_fs = up * fs_before
 
         self.alias_correction = alias_correction
 
@@ -1120,7 +1132,10 @@ class BaseProcessingStep(SignalProcessor):
         if not hasattr(self, "fir"):
             return np.ones_like(freqs, dtype=np.float64)  # No FIR filter applied
 
-        return np.abs(signal.freqz(self.fir, worN=np.abs(freqs), fs=self.original_fs)[1]) ** 2
+        # resample_poly scales the taps by ``up`` to undo the zero-stuffing loss, so the
+        # unscaled taps at the upsampled rate give the response on the input signal.
+        fir_fs = getattr(self, "fir_fs", self.original_fs)
+        return np.abs(signal.freqz(self.fir, worN=np.abs(freqs), fs=fir_fs)[1]) ** 2
 
     def get_alias_response(self, freqs: np.ndarray) -> Optional[tuple]:
         """Alias frequencies and filter responses of the downsampling step.

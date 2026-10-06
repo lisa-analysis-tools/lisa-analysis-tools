@@ -28,7 +28,13 @@ from eryn.moves import StretchMove, TemperatureControl
 from eryn.moves.tempering import make_ladder
 
 from lisatools.domains import STFTSettings, FDSettings
-from lisatools.sensitivity import XYZSensitivityBackend, MOSA_NAMES
+from lisatools.sensitivity import (
+    XYZSensitivityBackend,
+    MOSA_NAMES,
+    TM_PROXY_ARMS,
+    make_tm_proxy_transform,
+    tm_mosa_to_proxy,
+)
 from lisatools.globalfit.moves import GFCombineMove, MultiGPUPSDMove, TDMBHSpecialMove
 from lisatools.globalfit.engine import GlobalFitSettings, GeneralSetup, GeneralSettings, RankInfo
 from lisatools.globalfit.recipe import subtract_initial_signal
@@ -62,6 +68,17 @@ NOISE_SYMMETRY = {
     "parametric-symmetric": "symmetric",
     "parametric-asymmetric": "asymmetric",
 }[NOISE_MODEL]
+
+# TM parametrization for the asymmetric model (scripts/notes/TM_PROXY_PARAMS.md):
+#   "proxy": sample per-arm ASDs A_k = sqrt((P_ij + P_ji) / 2) and asymmetries
+#            d_k = (P_ij - P_ji) / (P_ij + P_ji) (arms 12, 23, 31); a TransformContainer
+#            maps them to the per-MOSA amplitudes for the covariance.
+#   "mosa":  sample the 6 per-MOSA TM amplitudes directly (strongly degenerate).
+TM_PARAMETRIZATION = "proxy" # "proxy" "mosa"
+
+# Injected noise ASDs per MOSA (MOSA_NAMES order); mojito simulates equal noises.
+OMS_INJECTION = np.full(len(MOSA_NAMES), 15e-12)
+TM_INJECTION = np.full(len(MOSA_NAMES), 3e-15)
 
 def setup_recipe(recipe, engine_info, curr, acs, priors, state):
 
@@ -117,6 +134,8 @@ def get_psd_erebor_settings(general_set: GeneralSetup) -> PSDSetup:
     frequency_ranges = [(general_set.start_freq, general_set.end_freq)]
     prior_model = "uniform"
     model_config = dict(use_splines=False, noise_symmetry=NOISE_SYMMETRY, num_params=2 if NOISE_SYMMETRY == "symmetric" else 2 * len(MOSA_NAMES))
+    if NOISE_SYMMETRY == "asymmetric":
+        model_config["tm_parametrization"] = TM_PARAMETRIZATION
 
     if prior_model == "uniform":
         logger.info("Using uniform prior for PSD parameters.")
@@ -143,13 +162,28 @@ def get_psd_erebor_settings(general_set: GeneralSetup) -> PSDSetup:
             r"$S_{\rm oms}$": prior_fn(*prior_model_config["S_oms"]),  # Soms_d
             r"$S_{\rm tm}$": prior_fn(*prior_model_config["S_tm"]),  # Sa_a
         }
-        injection = np.array([15e-12, 3e-15])  # for diagnostic plots
-    else:
+        injection = np.array([OMS_INJECTION[0], TM_INJECTION[0]])  # for diagnostic plots
+        transform = None
+    elif TM_PARAMETRIZATION == "mosa":
         priors_psd = {
             **{rf"$S_{{\rm oms, {m}}}$": prior_fn(*prior_model_config["S_oms"]) for m in MOSA_NAMES},
             **{rf"$S_{{\rm tm, {m}}}$": prior_fn(*prior_model_config["S_tm"]) for m in MOSA_NAMES},
         }
-        injection = np.repeat([15e-12, 3e-15], len(MOSA_NAMES))
+        injection = np.concatenate([OMS_INJECTION, TM_INJECTION])
+        transform = None
+    elif TM_PARAMETRIZATION == "proxy":
+        # TM slots hold (A_12, A_23, A_31, d_12, d_23, d_31); the transform maps them to the
+        # per-MOSA amplitudes. The injection is given in this sampling basis, so the corner
+        # plots show the true proxies.
+        priors_psd = {
+            **{rf"$S_{{\rm oms, {m}}}$": prior_fn(*prior_model_config["S_oms"]) for m in MOSA_NAMES},
+            **{rf"$A_{{\rm tm, {k}}}$": prior_fn(*prior_model_config["S_tm"]) for k in TM_PROXY_ARMS},
+            **{rf"$\delta_{{\rm tm, {k}}}$": uniform_dist(-1.0, 1.0) for k in TM_PROXY_ARMS},
+        }
+        injection = np.concatenate([OMS_INJECTION, tm_mosa_to_proxy(*TM_INJECTION)])
+        transform = make_tm_proxy_transform()
+    else:
+        raise ValueError(f"Unsupported TM_PARAMETRIZATION: {TM_PARAMETRIZATION}")
 
     priors = {"psd": ProbDistContainer(priors_psd)}
 
@@ -161,6 +195,7 @@ def get_psd_erebor_settings(general_set: GeneralSetup) -> PSDSetup:
         priors=priors,
         ndim=len(priors_psd),
         injection=injection,
+        transform=transform,
         num_prop_repeats=500,
     )
 
@@ -204,7 +239,7 @@ def get_general_erebor_settings() -> GeneralSetup:
     # base_file_name = "test_psd_processing7"
     # file_store_dir = head_dir
 
-    prefix = "preproc-bias_inv"
+    prefix = "proxy-params"
     data_input_path = "/mnt/wd_hdd_6TB/nikos/DATA/global_fit/mojito_lite/"
     base_file_name = f"unequal_noises_{prefix}"
     # file_store_dir = f"/mnt/wd_hdd_6TB/nikos/DATA/global_fit/gf_output/unequal_noises_{prefix}/"

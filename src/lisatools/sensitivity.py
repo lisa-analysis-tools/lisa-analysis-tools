@@ -2115,6 +2115,56 @@ _N_AVERAGE_EPOCHS = 1024
 NOISE_SYMMETRIES = {"symmetric": 1, "asymmetric": 6}
 MOSA_NAMES = ["12", "23", "31", "13", "32", "21"]
 
+# TM proxy parameters for the asymmetric model (scripts/notes/TM_PROXY_PARAMS.md).
+# The per-MOSA TM PSDs P = b^2 are degenerate: the data constrain the arm sums P_ij + P_ji
+# well, two arm asymmetries weakly, and the shift P_cw += t, P_ccw -= t of the clockwise
+# MOSAs (12, 23, 31) against the counter-clockwise ones (13, 32, 21) not at all. Per arm
+# k = 12, 23, 31 (ij the clockwise MOSA) the proxies are the arm ASD
+# A_k = sqrt((P_ij + P_ji) / 2) and the asymmetry d_k = (P_ij - P_ji) / (P_ij + P_ji) in (-1, 1).
+TM_PROXY_ARMS = ["12", "23", "31"]
+TM_PROXY_NAMES = [f"A_tm_{k}" for k in TM_PROXY_ARMS] + [f"d_tm_{k}" for k in TM_PROXY_ARMS]
+
+
+def tm_proxy_to_mosa(A_12, A_23, A_31, d_12, d_23, d_31):
+    """Arm ASDs and asymmetries -> per-MOSA TM amplitudes, in ``MOSA_NAMES`` order.
+
+    ``P_ij = A_k^2 (1 + d_k)`` and ``P_ji = A_k^2 (1 - d_k)``, ``b = sqrt(P)``. Inverse of
+    :func:`tm_mosa_to_proxy`. Works elementwise on scalars or numpy/cupy arrays.
+    """
+    return (
+        A_12 * (1 + d_12) ** 0.5,  # 12
+        A_23 * (1 + d_23) ** 0.5,  # 23
+        A_31 * (1 + d_31) ** 0.5,  # 31
+        A_31 * (1 - d_31) ** 0.5,  # 13
+        A_23 * (1 - d_23) ** 0.5,  # 32
+        A_12 * (1 - d_12) ** 0.5,  # 21
+    )
+
+
+def tm_mosa_to_proxy(b_12, b_23, b_31, b_13, b_32, b_21):
+    """Per-MOSA TM amplitudes (``MOSA_NAMES`` order) -> ``(A_12, A_23, A_31, d_12, d_23, d_31)``."""
+    arms = [(b_12**2, b_21**2), (b_23**2, b_32**2), (b_31**2, b_13**2)]
+    A = [((p + q) / 2) ** 0.5 for p, q in arms]
+    d = [(p - q) / (p + q) for p, q in arms]
+    return (*A, *d)
+
+
+def make_tm_proxy_transform(ndim: int = 2 * len(MOSA_NAMES), tm_start: int = len(MOSA_NAMES)):
+    """``TransformContainer`` mapping the TM proxies to per-MOSA TM amplitudes.
+
+    The sampling vector keeps the asymmetric layout (6 OMS, then 6 TM slots, then any
+    spline parameters); the TM slots hold ``TM_PROXY_NAMES`` and are mapped in place to
+    the per-MOSA amplitudes that :meth:`XYZSensitivityBackend.split_psd_params` expects.
+    """
+    from eryn.utils import TransformContainer
+
+    basis = list(range(ndim))
+    return TransformContainer(
+        input_basis=basis,
+        output_basis=basis,
+        parameter_transforms={tuple(range(tm_start, tm_start + len(MOSA_NAMES))): tm_proxy_to_mosa},
+    )
+
 
 class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
     """3x3 XYZ TDI sensitivity matrix backed by the C++/CUDA detector kernels.
@@ -3603,7 +3653,11 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         return spline_knots_position, spline_knots_amplitude
 
     def __call__(
-        self, name: str, psd_params: np.ndarray, galfor_params: np.ndarray = None
+        self,
+        name: str,
+        psd_params: np.ndarray,
+        galfor_params: np.ndarray = None,
+        transform_fn: Optional[TransformContainer] = None,
     ) -> "XYZSensitivityBackend":
         """Create a configured copy of this backend with updated noise parameters.
 
@@ -3629,6 +3683,9 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             galfor_params: Galactic foreground parameters ``[Amp, alpha, f_1, kn, f_2]``
                 in physical (not log) units.  If ``None``, the foreground contribution
                 is zeroed out.
+            transform_fn: Optional :class:`TransformContainer` mapping ``psd_params``
+                from the sampling basis (e.g. the TM proxies of
+                :func:`make_tm_proxy_transform`) to the layout above.
 
         Returns:
             A new :class:`XYZSensitivityBackend` instance with the sensitivity matrix,
@@ -3654,6 +3711,8 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         new_sens_mat = copy(self)
         new_sens_mat.name = name
 
+        if transform_fn is not None:
+            psd_params = transform_fn.both_transforms(psd_params)
         Soms_d, Sa_a, spline_params = self.split_psd_params(psd_params)
         if self.use_splines:  # assume transformed input.
             spline_knots_position, spline_knots_amplitude = self.build_spline_arrays(spline_params)
