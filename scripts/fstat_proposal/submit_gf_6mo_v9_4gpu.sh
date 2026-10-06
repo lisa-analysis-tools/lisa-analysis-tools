@@ -2219,6 +2219,27 @@ export GB_SIGHET_SWEEP_MAX_SRC=512
 
 export SIGHET_INFOMAT=1
 export GB_INFOMAT_PER_BLOCK=1
+# ---- CACHED PROPOSAL FACTORS + LOOKUP GRAM (2026-10-05) ----------------
+# GB_CHOL_CACHE=1: in-model proposal factors (and the observable-eigen
+# Gamma_z) live in HOST memory per rank, matched to their living source
+# (same walker + rung, nearest f0, amplitude/f0/Mc within
+# GB_CHOL_CACHE_TOL marginal widths). ALL alive sources are rebuilt together
+# every GB_CHOL_CACHE_EVERY proposes on a global ticker (40 x 25 repeats =
+# ~1000 steps); births / unmatched sources are computed per block, in one
+# batch before the repeats. Watch "[GB_CHOL_CACHE] refreshed ..." (time per
+# refresh) and "... hits / ... misses" lines; a "DISABLED" warning means it
+# fell back to the old per-block factors (run continues).
+# SIGHET_INFOMAT_ENGINE=lookup: the factor is the Gram/Fisher <dh_a|dh_b>
+# from lookup-table fills (GBGPU lookup information_matrix, Tobs-scaled f0 /
+# fdot steps) instead of second differences of lnL; needs the lookup table
+# attached (SIGHET_REF_BUILD=lookup). Set GB_CHOL_CACHE=0 /
+# SIGHET_INFOMAT_ENGINE= on the launch line to go back.
+export SIGHET_REF_BUILD=${SIGHET_REF_BUILD:-lookup}
+export SIGHET_ANCHOR_ENGINE=${SIGHET_ANCHOR_ENGINE:-lookup}
+export SIGHET_INFOMAT_ENGINE=${SIGHET_INFOMAT_ENGINE-lookup}
+export GB_CHOL_CACHE=${GB_CHOL_CACHE:-1}
+export GB_CHOL_CACHE_EVERY=${GB_CHOL_CACHE_EVERY:-40}
+export GB_CHOL_CACHE_TOL=${GB_CHOL_CACHE_TOL:-5}
 # Countable-only F-stat center precompute + lookup-miss fallback rides
 # the pull (no knob beyond the existing GB_RJ_FSTAT_CTR_HOIST=1); the
 # new [FSTAT_CTR] census line diagnoses the job-195 5x centers blowup.

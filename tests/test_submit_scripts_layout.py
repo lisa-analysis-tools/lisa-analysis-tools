@@ -769,6 +769,10 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # 2026-10-04: the page + tar on a DEDICATED rank (one extra
             # task); tests/test_monitor_rank.py pins the block.
             "GF_MONITOR_RANK",
+            # 2026-10-05: host-cached in-model proposal factors + the lookup
+            # Gram info matrix + the lookup-built sig-het reference / anchor.
+            "GB_CHOL_CACHE", "GB_CHOL_CACHE_EVERY", "GB_CHOL_CACHE_TOL",
+            "SIGHET_REF_BUILD", "SIGHET_ANCHOR_ENGINE", "SIGHET_INFOMAT_ENGINE",
             # V9-27 (2026-10-02): the SOBBH lookup scoring path's knobs (default
             # chunked = the v8 path); SixMonthSOBBHLookupTest pins the block.
             "SOBBH_LIKELIHOOD", "SOBBH_LOOKUP_TABLE_PATH", "SOBBH_LOOKUP_EVAL_DT",

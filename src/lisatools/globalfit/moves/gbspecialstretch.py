@@ -14013,6 +14013,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     logger.info(
                         "%s: per-block EXACT info matrices (borrow retired)",
                         self.name)
+                    cache = self._chol_cache()
+                    if cache is not None and cache.due(int(getattr(self, "time", 0))):
+                        with _tspan(tm, "chol_cache_refresh"):
+                            cache.refresh(self, model, band_sorter)
                 else:
                     self._refresh_infomat_table(model, band_sorter)
                     band_sorter.build_infomat_index(
@@ -14093,6 +14097,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         ``setup_in_model`` actually stashed references under.
         """
         if getattr(band_sorter, "infomat_take_inds", None) is None:
+            cache = self._chol_cache()
+            if cache is not None:
+                return cache.take(self, model, band_sorter, ids, slots, buffer_obj)
             return self._compute_proposal_cholesky(
                 model, band_sorter, ids, slots=slots, buffer_obj=buffer_obj)
         # The direct path sets these as a side effect; the table path must
@@ -14102,6 +14109,23 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             s[self._fdot_col] = self._fdot_scale
         self._proposal_param_scales = s
         return band_sorter.draw_infomat(ids)
+
+    def _chol_cache(self):
+        """The rank's :class:`_CholCache` for this branch, or ``None``.
+
+        ``GB_CHOL_CACHE=1`` (default off). GB only: a per-leaf-fill branch
+        (VGB) keeps ``coords[:, 1]`` for something other than f0.
+        """
+        if (os.environ.get("GB_CHOL_CACHE", "0") != "1"
+                or not self.use_info_mat_proposal
+                or getattr(self, "_per_leaf_fill", False)):
+            return None
+        key = (self.branch_name, self._obs_eigen_mode(),
+               bool(self._eigen_axis_ready()))
+        cache = _CHOL_CACHES.get(key)
+        if cache is None:
+            cache = _CHOL_CACHES[key] = _CholCache(key)
+        return cache
 
     def _infomat_phys_inds(self):
         """PHYSICAL output slots the information matrix is taken over.
@@ -32355,3 +32379,211 @@ def get_param_limits(array): # can be used for debugging of coordinate values
         min_array_i = param_values.min()
         max_array_i = param_values.max()
         logger.info(f"For parameter {param_label}, the minimun value is {min_array_i}, the maximum value is {max_array_i}")
+
+# ---------------------------------------------------------------------------
+# GB_CHOL_CACHE (2026-10-05): in-model proposal factors held on the HOST and
+# mapped to living sources, refreshed together on a global ticker.
+# ---------------------------------------------------------------------------
+_CHOL_CACHES = {}
+
+
+class _CholCache:
+    """Host-resident in-model proposal factors, mapped to living sources.
+
+    One per rank and ``(branch, observable-eigen mode, eigen-axis flag)``,
+    shared by every GB move of the rank. Off unless ``GB_CHOL_CACHE=1``.
+
+    REFRESH: on a GLOBAL ticker -- the largest ``move.time`` seen -- every
+    ``GB_CHOL_CACHE_EVERY`` (default 40) proposes, the whole cache is
+    rebuilt in ``GB_CHOL_CACHE_BATCH`` chunks from every alive source of the
+    sorter (all rungs) at the first in-model block of that propose. With no
+    buffer slots the factor comes from the comp's slot-free route:
+    ``SIGHET_INFOMAT_ENGINE=lookup`` (the lookup Gram ``<dh_a|dh_b>``), else
+    the chunked delegate (slow; logged).
+
+    MAP: a source is matched in its own (walker, rung) group to the
+    nearest-f0 entry, accepted when amplitude, f0 and Mc (sampling columns
+    0-2) are within ``GB_CHOL_CACHE_TOL`` (default 5) of the entry's own
+    marginal widths; a hit moves the entry's key to the source's current
+    coordinates so the map follows the source. A MISS (an accepted birth, a
+    source moved out of tolerance, a swap partner too different) is computed
+    with the block's own route, in one batch per block before the repeats,
+    and inserted. The factor is frozen across each block exactly as before,
+    so the proposal stays symmetric; a poor match costs acceptance only.
+
+    The observable-eigen Gamma_z (``GB_INMODEL_OBSERVABLE_EIGEN``) is cached
+    beside the factor and scattered back into ``move._obs_gamma_z`` on hits.
+    Any exception disables the cache for the rest of the run (logged) and
+    the move falls back to the direct per-block factors.
+    """
+
+    _COLS = [0, 1, 2]
+
+    def __init__(self, key):
+        self.key = key
+        self.every = max(int(os.environ.get("GB_CHOL_CACHE_EVERY", "40") or 40), 1)
+        self.tol = float(os.environ.get("GB_CHOL_CACHE_TOL", "5.0") or 5.0)
+        self.batch = max(int(os.environ.get("GB_CHOL_CACHE_BATCH", "4096") or 4096), 1)
+        self.tick = -1
+        self.epoch = None
+        self.groups = {}
+        self.hits = self.misses = self.takes = 0
+        self.disabled = False
+
+    def due(self, t):
+        self.tick = max(self.tick, int(t))
+        return (not self.disabled
+                and (self.epoch is None or self.tick // self.every != self.epoch))
+
+    def _fail(self, move, where, exc):
+        self.disabled = True
+        # The lookup Gram engine is the new piece: drop it with the cache so
+        # the direct per-block factors take the validated route again.
+        eng = os.environ.pop("SIGHET_INFOMAT_ENGINE", None)
+        logger.warning("%s: [GB_CHOL_CACHE] DISABLED after an error in %s (%r); "
+                       "direct per-block factors from here on (SIGHET_INFOMAT_ENGINE "
+                       "%r -> unset).", move.name, where, exc, eng)
+
+    def refresh(self, move, model, band_sorter):
+        if self.disabled:
+            return
+        t0 = time.perf_counter()
+        try:
+            alive = move.xp.where(band_sorter.inds)[0]
+            self.groups = {}
+            n = int(alive.shape[0])
+            for i in range(0, n, self.batch):
+                ids = alive[i:i + self.batch]
+                B = move._compute_proposal_cholesky(model, band_sorter, ids)
+                self._insert(move, band_sorter, ids, B)
+        except Exception as exc:  # noqa: BLE001 -- overnight safety valve
+            self._fail(move, "refresh", exc)
+            return
+        self.epoch = self.tick // self.every
+        logger.info(
+            "%s: [GB_CHOL_CACHE] refreshed %d sources in %.1f s (tick %d, every %d, "
+            "SIGHET_INFOMAT_ENGINE=%s, %.1f MB host)", move.name, n,
+            time.perf_counter() - t0, self.tick, self.every,
+            os.environ.get("SIGHET_INFOMAT_ENGINE", "") or "default", self.nbytes() / 2**20)
+
+    def nbytes(self):
+        return sum(v.nbytes for g in self.groups.values() for v in g.values()
+                   if v is not None)
+
+    @staticmethod
+    def _keys(band_sorter, ids):
+        w = _to_numpy(band_sorter.walker_inds[ids]).astype(np.int64)
+        t = _to_numpy(band_sorter.temp_inds[ids]).astype(np.int64)
+        return w * 100000 + t
+
+    def _gz(self, move, ids):
+        gz = getattr(move, "_obs_gamma_z", None)
+        if gz is None or move._obs_eigen_mode() == "off":
+            return None
+        return _to_numpy(gz[ids])
+
+    def _insert(self, move, band_sorter, ids, B):
+        C = _to_numpy(band_sorter.coords[ids])
+        Bh = _to_numpy(B)
+        G = self._gz(move, ids)
+        s = _to_numpy(move._proposal_param_scales)[self._COLS]
+        # marginal widths in the coords' own units: B is in y = x / s
+        S = np.sqrt((Bh[:, self._COLS, :] ** 2).sum(-1)) * s[None, :]
+        key = self._keys(band_sorter, ids)
+        for k in np.unique(key):
+            m = key == k
+            new = {"C": C[m], "B": Bh[m], "S": S[m], "G": None if G is None else G[m]}
+            g = self.groups.get(int(k))
+            if g is not None:
+                new = {f: (None if (v is None or g[f] is None)
+                           else np.concatenate([g[f], v])) for f, v in new.items()}
+            self._store(int(k), new)
+
+    def _store(self, k, g):
+        o = np.argsort(g["C"][:, 1], kind="stable")
+        self.groups[k] = {f: (None if v is None else v[o]) for f, v in g.items()}
+
+    def match(self, band_sorter, ids):
+        """``(hit, B, G)`` host arrays for ``ids``; moves hit keys to the sources."""
+        C = _to_numpy(band_sorter.coords[ids])
+        n, ndim = C.shape
+        hit = np.zeros(n, dtype=bool)
+        Bo = np.zeros((n, ndim, ndim))
+        Go = None
+        key = self._keys(band_sorter, ids)
+        for k in np.unique(key):
+            g = self.groups.get(int(k))
+            if g is None or len(g["C"]) == 0:
+                continue
+            rows = np.nonzero(key == k)[0]
+            q = C[rows]
+            f = g["C"][:, 1]
+            j = np.searchsorted(f, q[:, 1])
+            cand = np.stack([np.clip(j - 1, 0, len(f) - 1), np.clip(j, 0, len(f) - 1)], 1)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                d = (np.abs(q[:, None, self._COLS] - g["C"][cand][:, :, self._COLS])
+                     / g["S"][cand])
+            score = np.nan_to_num(d.max(-1), nan=np.inf)
+            pick = score.argmin(1)
+            r = np.arange(len(rows))
+            e = cand[r, pick]
+            ok = score[r, pick] <= self.tol
+            if not ok.any():
+                continue
+            hit[rows[ok]] = True
+            Bo[rows[ok]] = g["B"][e[ok]]
+            if g["G"] is not None:
+                if Go is None:
+                    Go = np.full((n,) + g["G"].shape[1:], np.nan)
+                Go[rows[ok]] = g["G"][e[ok]]
+            g["C"][e[ok]] = q[ok]
+            self._store(int(k), g)
+        return hit, Bo, Go
+
+    def take(self, move, model, band_sorter, ids, slots, buffer_obj):
+        if self.disabled or self.epoch is None:
+            return move._compute_proposal_cholesky(
+                model, band_sorter, ids, slots=slots, buffer_obj=buffer_obj)
+        xp = move.xp
+        try:
+            hit, Bo, Go = self.match(band_sorter, ids)
+            chol = xp.asarray(Bo)
+            miss = np.nonzero(~hit)[0]
+            if miss.size:
+                # births / unmatched: one batch through the block's own route,
+                # BEFORE the hit scatter below (the stash may reallocate)
+                mi = xp.asarray(miss)
+                ids_m = ids[mi]
+                B_m = move._compute_proposal_cholesky(
+                    model, band_sorter, ids_m,
+                    slots=None if slots is None else slots[mi], buffer_obj=buffer_obj)
+                self._insert(move, band_sorter, ids_m, B_m)
+                chol[mi] = B_m
+            else:
+                s = xp.ones(band_sorter.coords.shape[1])
+                if move._fdot_col is not None:
+                    s[move._fdot_col] = move._fdot_scale
+                move._proposal_param_scales = s
+            if Go is not None and hit.any():
+                n_src = int(band_sorter.inds.shape[0])
+                nz = int(Go.shape[-1])
+                store = getattr(move, "_obs_gamma_z", None)
+                if (store is None or int(store.shape[0]) != n_src
+                        or int(store.shape[-1]) != nz):
+                    store = xp.full((n_src, nz, nz), xp.nan)
+                hi = xp.asarray(np.nonzero(hit)[0])
+                store[ids[hi]] = xp.asarray(Go[hit])
+                move._obs_gamma_z = store
+        except Exception as exc:  # noqa: BLE001 -- overnight safety valve
+            self._fail(move, "take", exc)
+            return move._compute_proposal_cholesky(
+                model, band_sorter, ids, slots=slots, buffer_obj=buffer_obj)
+        self.hits += int(hit.sum())
+        self.misses += int(miss.size)
+        self.takes += 1
+        if self.takes % 500 == 0:
+            logger.info("%s: [GB_CHOL_CACHE] %d hits / %d misses over the last 500 "
+                        "blocks (%.1f MB host)", move.name, self.hits, self.misses,
+                        self.nbytes() / 2**20)
+            self.hits = self.misses = 0
+        return chol
