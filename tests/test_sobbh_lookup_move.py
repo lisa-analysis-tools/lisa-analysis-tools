@@ -330,6 +330,68 @@ class SOBBHLookupParityTest(unittest.TestCase):
         self.assertEqual(comp.kwargs["row_batch"], 4)
 
 
+class SOBBHLookupGramTest(unittest.TestCase):
+    """``SOBBH_EIGEN_INFO=gram`` with the LOOKUP comp (production:
+    ``SOBBH_LIKELIHOOD=lookup`` hands the lookup router to the move as its
+    ``comp``, so the Gram templates are lookup fills like every other SOBBH
+    template). Against an independent Gram of the dense stock templates at the
+    move's own steps. Spins barely move the template: judged apart."""
+
+    KEEP = [0, 1, 4, 5, 6, 7, 8, 9, 10]
+    WIDTHS = np.array([40.0, 40.0, 1.0, 1.0, 0.1, 1.0, 1e-3, 1.0, 1.0, 1.0, 1.0])
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        try:
+            cls.acs, cls.gen, cls.comp, cls.wdm, cls.td_set = _build_toy(cls.tmp.name)
+        except Exception as exc:  # missing compiled deps etc.
+            raise unittest.SkipTest(f"toy setup unavailable: {exc}")
+        cls.move = _build_move(cls.acs, cls.comp)
+        cls.move._to_phys = lambda x: np.atleast_2d(np.asarray(x, dtype=float))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def _dense(self, steps, walker):
+        from lisatools.diagnostic import inner_product
+
+        gen = type(self).__dict__["gen"]
+        dh = []
+        for i in self.KEEP:
+            e = np.zeros(11)
+            e[i] = steps[i]
+            hp, hm = gen(*(REF_STOCK + e)), gen(*(REF_STOCK - e))
+            dh.append(type(hp)((np.asarray(hp.arr) - np.asarray(hm.arr)) / (2 * steps[i]),
+                               hp.settings))
+        _, _, psd = self.acs.acs.flatten()[walker]._slice_to_template(dh[0])
+        k = len(self.KEEP)
+        G = np.zeros((k, k))
+        for a in range(k):
+            for b in range(a, k):
+                G[a, b] = G[b, a] = float(np.real(inner_product(dh[a], dh[b], psd=psd)))
+        return G
+
+    def test_lookup_gram_matches_the_dense_template_gram(self):
+        from unittest import mock
+
+        with mock.patch.object(self.comp, "fill_global_wdm",
+                               wraps=self.comp.fill_global_wdm) as fill:
+            G, steps = self.move._gram_info(REF_STOCK.copy(), 0, self.WIDTHS,
+                                            return_steps=True)
+        self.assertGreater(fill.call_count, 0)        # the lookup comp made the templates
+        G = G[np.ix_(self.KEEP, self.KEEP)]
+        T = self._dense(steps, 0)
+        d = np.sqrt(np.abs(np.diag(T)))
+        rel = np.abs(G - T) / np.outer(d, d)
+        print(f"[sobbh lookup gram] max correlation-normalized diff {rel.max():.3e}, "
+              f"diag ratio {np.round(np.diag(G) / np.diag(T), 4)}")
+        self.assertLess(rel.max(), self.TOL)
+
+    TOL = 3e-2  # measured 1.5e-2 (lookup tiny table vs dense)
+
+
 class SOBBHLookupParityTestHelper:
     @staticmethod
     def chunked(row):
