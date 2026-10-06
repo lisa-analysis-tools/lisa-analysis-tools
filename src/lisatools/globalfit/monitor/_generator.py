@@ -3839,6 +3839,12 @@ if FGW:
 # on, which were three times smaller in model size.
 SCI = {}
 TRU = None
+# Fallbacks for the live-noise SNR rescale (populated inside the TRU-truthy
+# branch below). Keeping module-level defaults means the F4 caption and
+# the zoomable-canvas tier code can reference them unconditionally.
+T_SNR_LIVE = None
+_T_SNR_LIVE_FULL = None
+_LIVE_SNR_NOTE = ""
 for _tp in (os.path.join(RUN_DIR, "gb_truth_3to21.npz"), "gb_truth_3to21.npz"):
     if os.path.exists(_tp):
         try:
@@ -4282,6 +4288,82 @@ if TRU is not None:
                completeness=MI.size / NDET,
                purity=MI.size / max(REC9.shape[0], 1))
 
+    # ---- live-noise rescale of catalogue SNR (user ruling 2026-10-05) ----
+    # The missed-detection X markers in the F4 right panel and the
+    # zoomable canvas are TIERED by injected SNR (yellow 7-10, orange
+    # 10-20, red >20). The frozen ``gb_truth_3to21.npz`` carries the
+    # SNR evaluated under the TRUTH-BUILD iteration's PSD + foreground
+    # (``psd_params``, ``galfor_params`` fields of the npz), and that
+    # noise is NOT the noise of the last stored iteration -- a run that
+    # has pulled the foreground down keeps classifying its loudest misses
+    # with the old PSD unless the SNR is rescaled.
+    #
+    # For a quasi-monochromatic GB source the catalogue SNR scales as
+    # SNR = h(f0) / sqrt(S(f0)) up to a weak f-derivative term that
+    # cancels in a ratio, so rescaling by sqrt(S_truth(f0) / S_live(f0))
+    # at the catalogue f0 is the right one-liner (O(N) in catalogue
+    # size, no waveform recomputation). The frozen ``TRU["det"]`` set is
+    # LEFT ALONE -- the headline denominator and completeness numbers
+    # are deliberately pinned to one iteration (CLAUDE.md: "frozen
+    # denominator, stated once"), so this rescale touches ONLY the X
+    # marker tiering, not which sources count as detectable.
+    T_SNR_LIVE = T_SNR               # fallback: frozen SNR
+    _T_SNR_LIVE_FULL = None          # for the zoomable canvas (full cat)
+    _LIVE_SNR_NOTE = ""
+    try:
+        from lisatools import detector as _lisa_models_lsnr
+        from lisatools.sensitivity import (get_sensitivity as _gs_lsnr,
+                                            A2TDISens as _A2_lsnr)
+        from lisatools.stochastic import (
+            HyperbolicTangentGalacticForeground as _HTGF_lsnr)
+        _wb_last = int(np.argmax(ll[-1]))
+        _psd_live = np.asarray(psd_cold[-1, _wb_last], float)
+        _gal_live = np.asarray(gal_cold_phys[-1, _wb_last], float)
+        _psd_tru = (np.asarray(TRU["psd_params"], float)
+                    if "psd_params" in TRU.files else None)
+        _gal_tru = (np.asarray(TRU["galfor_params"], float)
+                    if "galfor_params" in TRU.files else None)
+        if (_psd_tru is None or _gal_tru is None or _psd_tru.size != 2
+                or _gal_tru.size != 5):
+            _LIVE_SNR_NOTE = (" (fallback: frozen SNR -- the truth npz was "
+                              "built before psd_params/galfor_params were "
+                              "stamped)")
+            raise RuntimeError("truth npz missing psd/galfor stamps")
+        _f0_hz_full = np.asarray(TRU["f0"], float)
+        _mdl_live = _lisa_models_lsnr.LISAModel(
+            _psd_live[0] ** 2, _psd_live[1] ** 2,
+            _lisa_models_lsnr.DefaultOrbits(), "live-last-maxLL")
+        _mdl_tru = _lisa_models_lsnr.LISAModel(
+            _psd_tru[0] ** 2, _psd_tru[1] ** 2,
+            _lisa_models_lsnr.DefaultOrbits(), "truth-build")
+        _nk_live = dict(model=_mdl_live, stochastic_params=tuple(_gal_live),
+                        stochastic_function=_HTGF_lsnr)
+        _nk_tru = dict(model=_mdl_tru, stochastic_params=tuple(_gal_tru),
+                       stochastic_function=_HTGF_lsnr)
+        _S_live = np.asarray(_gs_lsnr(_f0_hz_full, sens_fn=_A2_lsnr,
+                                       **_nk_live), float)
+        _S_tru = np.asarray(_gs_lsnr(_f0_hz_full, sens_fn=_A2_lsnr,
+                                      **_nk_tru), float)
+        _ratio = np.sqrt(np.maximum(_S_tru, 1e-60)
+                         / np.maximum(_S_live, 1e-60))
+        _T_SNR_LIVE_FULL = np.asarray(TRU["snr"], float) * _ratio
+        T_SNR_LIVE = _T_SNR_LIVE_FULL[_sel]
+        # one-line summary: how many tier swaps did the rescale cause?
+        _old_tier = np.where(T_SNR >= 20, 2, np.where(T_SNR >= 10, 1, 0))
+        _new_tier = np.where(T_SNR_LIVE >= 20, 2,
+                              np.where(T_SNR_LIVE >= 10, 1, 0))
+        _n_tier_swap = int((_old_tier != _new_tier).sum())
+        _LIVE_SNR_NOTE = (
+            f" (live rescale: {_n_tier_swap} of {int(_sel.sum())} "
+            f"catalogue sources changed SNR tier vs the truth-build noise; "
+            f"iter {NIT - 1} walker {_wb_last})")
+    except Exception as _e:
+        if not _LIVE_SNR_NOTE:
+            MISSING.append(
+                "live-noise SNR rescale for the X marker tiers unavailable "
+                f"({type(_e).__name__}: {_e}); tiers fall back to the "
+                "truth-build frozen SNR.")
+
     # ---- waveform-level quantities ---------------------------------------
     # Optimal SNRs and template overlaps come from GBGPU's OWN run_wave and a
     # noise-weighted inner product against lisatools A2TDISens/E2TDISens fed
@@ -4557,9 +4639,37 @@ if TRU is not None:
         _cb.ax.tick_params(labelsize=7)
         b_ = ax[1]
         if SHOW_MATCH_STATS:
-            b_.scatter(T_F0[~FOUND_MM], T_AMP[~FOUND_MM], s=17, marker="x",
-                       color=RED, lw=0.8, alpha=0.7,
-                       label=f"detectable, not recovered ({int((~FOUND_MM).sum())})")
+            # MISSED-SOURCE TIER COLORS (2026-10-05, user rulings):
+            #   loud misses have to pop against quiet ones because a
+            #   missed SNR 50 source is a worse story than a missed SNR
+            #   7.5 one, and this panel is where that story has to land.
+            #   Three tiers (yellow 7-10, orange 10-20, red >20); the
+            #   colored X's are drawn loudest-last so the red overwrites
+            #   nothing it needs to show.  The SNR itself is the
+            #   LIVE-NOISE rescale (``T_SNR_LIVE``) rather than the
+            #   frozen catalogue number -- a run that pulled the
+            #   foreground down should re-tier its misses accordingly.
+            #   Fallback to the frozen SNR when the rescale is
+            #   unavailable (``T_SNR_LIVE`` is just ``T_SNR`` then).
+            _mis_mask = ~FOUND_MM
+            _mis_snr = np.asarray(T_SNR_LIVE)[_mis_mask]
+            _mis_f0 = np.asarray(T_F0)[_mis_mask]
+            _mis_amp = np.asarray(T_AMP)[_mis_mask]
+            _TIERS = (
+                ("#F7D33C", _mis_snr < 10,
+                 "missed SNR 7-10"),
+                ("#FF8A1A", (_mis_snr >= 10) & (_mis_snr < 20),
+                 "missed SNR 10-20"),
+                ("#FF2E3E", _mis_snr >= 20,
+                 "missed SNR > 20"),
+            )
+            for _col, _mk, _lbl in _TIERS:
+                _n = int(_mk.sum())
+                if _n == 0:
+                    continue
+                b_.scatter(_mis_f0[_mk], _mis_amp[_mk], s=17, marker="x",
+                           color=_col, lw=0.8, alpha=0.85,
+                           label=f"{_lbl} ({_n})")
             b_.scatter(_rf[~MATCHED_MM], _ra_[~MATCHED_MM], s=22,
                        facecolors="none", edgecolors=VIOLET, lw=0.8, alpha=0.85,
                        label=f"recovered, no match ({int((~MATCHED_MM).sum())})")
@@ -5339,11 +5449,34 @@ try:
             _mis_f = np.asarray(T_F0, float)[~_found_arr]
             _mis_a = np.log10(np.maximum(
                 np.asarray(T_AMP, float)[~_found_arr], 1e-40))
+            # SNR tier per missed source (user ruling 2026-10-05):
+            # 0 = SNR 7-10 (yellow), 1 = SNR 10-20 (orange), 2 = SNR > 20 (red).
+            # Carrying ONE int per point in the JSON blob (3 bytes vs the
+            # ~22 the pair already costs) is what lets the canvas color
+            # tier by tier without a second lookup table.
+            #
+            # SNR is the LIVE-NOISE rescale (``T_SNR_LIVE``, max-lnL cold
+            # walker of the last stored iteration) rather than the frozen
+            # catalogue number -- the three tiers reflect what the
+            # current run is missing, not what the truth-build iteration
+            # was. ``T_SNR_LIVE`` is already filtered to the detectable
+            # subset (same ``_sel`` mask as ``T_SNR``), so the per-source
+            # indexing matches ``~_found_arr`` directly. Falls back to
+            # ``T_SNR`` when the rescale was unavailable (that assignment
+            # is already done above).
+            _mis_s = np.asarray(T_SNR_LIVE, float)[~_found_arr]
+            _mis_tier = np.where(_mis_s >= 20, 2,
+                                 np.where(_mis_s >= 10, 1, 0)).astype(int)
             gb_truth_pts_red = [
-                [float(f"{f * 1e3:.7g}"), round(float(a), 4)]
-                for f, a in zip(_mis_f, _mis_a)]
+                [float(f"{f * 1e3:.7g}"), round(float(a), 4), int(t)]
+                for f, a, t in zip(_mis_f, _mis_a, _mis_tier)]
             gb_truth_meta["shown_grey"] = len(gb_truth_pts_grey)
             gb_truth_meta["shown_red"] = len(gb_truth_pts_red)
+            gb_truth_meta["red_tier_counts"] = {
+                "7-10 (yellow)":   int((_mis_tier == 0).sum()),
+                "10-20 (orange)":  int((_mis_tier == 1).sum()),
+                ">20 (red)":       int((_mis_tier == 2).sum()),
+            }
         _tm = gb_truth_meta
         _detbit = (
             f"{_tm.get('shown_det', _tm['shown']):,} of them RED (detectable, "
@@ -6442,6 +6575,607 @@ if RJ_BREAK:
         f"{RJ_BREAK[n][2][0][1]:,.1f} s "
         f"({100 * RJ_BREAK[n][2][0][1] / max(RJ_BREAK[n][1], 1e-9):.0f}%)"
         for n in RJ_ORDER) + "<br>"
+
+# ======================= SOURCE BRANCH DROPDOWNS ============================
+# Per-leaf chain-trace + marginal-posterior PNGs for the mbh / emri / sobbh
+# branches (user ruling 2026-10-05: "chain plots and posterior estimates for
+# all those new sources ... same style with parameter chains and estimated
+# posteriors"). The PNGs are pre-rendered server-side and swapped in by the
+# same ``cornerPanel(px, blob)`` JS helper the VGB and GB top-3 dropdowns
+# use, so the HTML only carries one <img> per branch regardless of how many
+# leaves the run holds.
+#
+# Truth lines come from the mojito catalogues under MOJITO_CAT_DIR, keyed by
+# the per-branch ``source_ids`` list parsed out of
+# ``processor_init_kwargs`` in run_settings.log (the ``source_ids`` entry is
+# the mojito-loader 0-based dict key, i.e. the positional row in the
+# ID-sorted catalogue). A branch with an unreadable chain, unreadable
+# catalogue, or no run_settings source_ids degrades to an empty blob and a
+# MISSING line -- nothing on the page raises.
+_SRC_BRANCH_SPECS = {
+    "mbh": dict(
+        cls="MBHB",
+        param_defs=[
+            ("logM",      r"$\log M_{\rm tot}$"),
+            ("Q",         r"$Q=m_1/m_2$"),
+            ("s1z",       r"$\chi_1$"),
+            ("s2z",       r"$\chi_2$"),
+            ("dist",      r"$d_L$ [Gpc]"),
+            ("phi_ref",   r"$\phi_{\rm ref}$"),
+            ("cos_iota",  r"$\cos\iota$"),
+            ("psi",       r"$\psi$"),
+            ("alpha",     r"$\alpha$ (RA)"),
+            ("sin_delta", r"$\sin\delta$"),
+            ("t_plunge",  r"$t_c$ [s]"),
+        ],
+        key_idx=[0, 1, 2, 3, 10, 4, 8, 9],   # M, Q, chi1, chi2, tc, dist, RA, sin_dec
+        cat_files=(
+            "mbhb_cat_mojito_lite_processed_MT_rounding_fixed.hdf5",
+            "mbhb_cat_mojito_lite_processed_MT.hdf5",
+        ),
+    ),
+    "emri": dict(
+        cls="EMRI",
+        param_defs=[
+            ("logm1",    r"$\log m_1$"),
+            ("m2",       r"$m_2$"),
+            ("a",        r"$a$"),
+            ("p0",       r"$p_0$"),
+            ("e0",       r"$e_0$"),
+            ("dist",     r"$d_L$"),
+            ("qS",       r"$q_S$"),
+            ("phiS",     r"$\phi_S$"),
+            ("qK",       r"$q_K$"),
+            ("phiK",     r"$\phi_K$"),
+            ("Phi_phi0", r"$\Phi_{\phi,0}$"),
+            ("Phi_r0",   r"$\Phi_{r,0}$"),
+        ],
+        key_idx=[0, 2, 3, 4, 5],   # logm1 (M), a, p0, e0, dist
+        cat_files=("emri_cat_mojito_lite_processed_MT.hdf5",),
+    ),
+    "sobbh": dict(
+        cls="SOBHB",
+        param_defs=[
+            ("logm1",  r"$\log m_1$"),
+            ("logm2",  r"$\log m_2$"),
+            ("s1",     r"$\chi_1$"),
+            ("s2",     r"$\chi_2$"),
+            ("dist",   r"$d_L$"),
+            ("cosinc", r"$\cos\iota$"),
+            ("f_low",  r"$f_{\rm low}$ [Hz]"),
+            ("phiS",   r"$\phi_S$"),
+            ("cosqS",  r"$\cos q_S$"),
+            ("psi",    r"$\psi$"),
+            ("phi0",   r"$\phi_0$"),
+        ],
+        key_idx=[0, 1, 6, 4, 7, 8],   # logm1, logm2, f_low, dist, phiS, cosqS
+        cat_files=("sobhb_cat_mojito_lite_processed_MT.hdf5",),
+    ),
+}
+
+
+def _parse_src_ids_from_settings(txt):
+    """Dict {cls: [source_ids]} from processor_init_kwargs in run_settings.log.
+
+    These are mojito-loader 0-based dict keys, i.e. positional rows in the
+    ID-sorted catalogue -- the same thing the engine iterates when it builds
+    per-leaf injections (``sorted(cat.keys())``).  Returns ``{}`` on parse
+    failure so the branch panels degrade to no-truth without raising.
+    """
+    m = re.search(r"'source_ids':\s*\{([^}]*)\}", txt, re.S)
+    if not m:
+        return {}
+    blob = m.group(1)
+    out = {}
+    for mm in re.finditer(r"'(MBHB|EMRI|SOBHB)':\s*\[([^\]]*)\]", blob):
+        try:
+            out[mm.group(1)] = [int(x) for x in mm.group(2).replace(" ", "").split(",") if x]
+        except ValueError:
+            continue
+    return out
+
+
+_SRC_IDS = _parse_src_ids_from_settings(SETTINGS_TXT)
+
+
+def _src_cat_to_sampling_mbh(row):
+    """MBHB catalogue entry -> MBH sampling basis (direct ICRS)."""
+    m1 = float(row["PrimaryMassSSBFrame"])
+    m2 = float(row["SecondaryMassSSBFrame"])
+    if m2 > m1:
+        m1, m2 = m2, m1
+    logM = np.log(m1 + m2)
+    Q = m1 / m2
+    s1z = float(row["PrimarySpinCompZ"])
+    s2z = float(row["SecondarySpinCompZ"])
+    dist = float(row["LuminosityDistance"]) / 1e3        # Mpc -> Gpc
+    phi_ref = float(row["PhaseReferenceSourceFrame"]) % (2 * np.pi)
+    cos_iota = float(np.cos(float(row["InclinationAngle"])))
+    ra = float(row["RightAscension"]) % (2 * np.pi)
+    sin_dec = float(np.sin(float(row["Declination"])))
+    psi = float(row["PolarisationAngle"]) % np.pi
+    tphenom = float(row.get("TimeCoalescencePhenomTPHMSSBFrame",
+                            row.get("TimeCoalescenceSSBFrame", np.nan)))
+    return np.array([logM, Q, s1z, s2z, dist, phi_ref, cos_iota,
+                     psi, ra, sin_dec, tphenom])
+
+
+def _src_cat_to_sampling_emri(row):
+    """EMRI catalogue entry -> EMRI sampling basis (ecliptic colat sky)."""
+    logm1 = np.log(float(row["PrimaryMassSSBFrame"]))
+    m2 = float(row["SecondaryMassSSBFrame"])
+    a = float(row["PrimarySpinParameter"])
+    p0 = float(row["SemiLatusRectum"])
+    e0 = float(row["Eccentricity"])
+    dist = float(row["LuminosityDistance"]) / 1e3
+    qS = np.pi / 2 - float(row["Declination"])            # ecliptic colatitude
+    phiS = float(row["RightAscension"]) % (2 * np.pi)
+    qK = float(row["PolarAnglePrimarySpin"])
+    phiK = float(row["AzimuthalAnglePrimarySpin"]) % (2 * np.pi)
+    Phi_phi0 = float(row["AzimuthalPhase"]) % (2 * np.pi)
+    Phi_r0 = float(row["RadialPhase"]) % (2 * np.pi)
+    return np.array([logm1, m2, a, p0, e0, dist, qS, phiS, qK, phiK,
+                     Phi_phi0, Phi_r0])
+
+
+def _src_cat_to_sampling_sobbh(row):
+    """SOBHB catalogue entry -> SOBBH sampling basis."""
+    m1 = float(row["PrimaryMassSSBFrame"])
+    m2 = float(row["SecondaryMassSSBFrame"])
+    logm1 = np.log(m1)
+    logm2 = np.log(m2)
+    s1 = float(row["PrimarySpinCompZ"])
+    s2 = float(row["SecondarySpinCompZ"])
+    dist = float(row["LuminosityDistance"]) / 1e3
+    cosinc = float(np.cos(float(row["InclinationAngle"])))
+    f_low = float(row["GW22FrequencySSBFrame"])
+    phiS = float(row["RightAscension"]) % (2 * np.pi)
+    cosqS = float(np.cos(np.pi / 2 - float(row["Declination"])))
+    psi = float(row["PolarisationAngle"]) % np.pi
+    phi0 = float(row["TrueAnomaly"]) % (2 * np.pi)
+    return np.array([logm1, logm2, s1, s2, dist, cosinc, f_low,
+                     phiS, cosqS, psi, phi0])
+
+
+_SRC_CAT_FNS = {
+    "mbh": _src_cat_to_sampling_mbh,
+    "emri": _src_cat_to_sampling_emri,
+    "sobbh": _src_cat_to_sampling_sobbh,
+}
+
+
+def _src_load_catalogue(cat_file_candidates):
+    """Open the first catalogue file that exists -> ``{col: ndarray}`` or None."""
+    for fn in cat_file_candidates:
+        p = os.path.join(MOJITO_CAT_DIR, "catalogues", fn)
+        if os.path.exists(p):
+            try:
+                with h5py.File(p, "r") as _fh:
+                    B = _fh["Binaries"]
+                    return {k: np.asarray(B[k][:]) for k in B.keys()}
+            except Exception as e:
+                MISSING.append(f"source catalogue {fn} unreadable: {e!r}")
+    return None
+
+
+def _src_cat_row(cat, loader_key):
+    """Row at position ``loader_key`` of the ID-sorted catalogue, as a dict.
+
+    The mojito loader's dict key is the 0-based positional index into
+    sorted(IDs), not the ID column itself (EMRI's ID column is 1-indexed;
+    MBHB / SOBHB use 0-indexed dense IDs).  Positional lookup absorbs all
+    three conventions and matches ``[sorted(cat.keys())][leaf]``.
+    """
+    if cat is None:
+        return None
+    ids = np.asarray(cat["ID"]).astype(int)
+    order = np.argsort(ids)
+    if not (0 <= int(loader_key) < order.size):
+        return None
+    i = int(order[int(loader_key)])
+    return {k: v[i] for k, v in cat.items()}
+
+
+# full_pe start iteration -- the recipe stamp written by the engine when the
+# full_pe stage begins. Panels mark it as a vertical line on the trace and
+# use ``samples[start_iteration:]`` as the posterior window. ``None`` when
+# full_pe has not started: the posterior panel then says so, and the trace
+# simply has no mark.
+_SRC_FULL_PE_START = None
+if rg is not None and "full_pe" in rg:
+    _si = rg["full_pe"].attrs.get("start_iteration", None)
+    if _si is not None and 0 <= int(_si) < NIT:
+        _SRC_FULL_PE_START = int(_si)
+
+
+def _src_pool_window(nit):
+    """Trailing iterations the corner-plot pool draws from.
+
+    User ruling 2026-10-05: last 50 iterations (x 4 walkers = 200 pooled
+    samples) when the branch has < 500 rows; last 250 (x 4 = 1000) once
+    it is past that mark.  The step is a BURN-IN GATE, not a threshold:
+    at <500 iterations the trailing 50 is where the branch currently sits
+    and anything older is adaptation; once there are >=500 rows, the
+    first 250 are the burn-in to drop and the second half is the
+    posterior.  Clamped to the available rows so very young stores still
+    show something -- an empty window would make the corner panel claim
+    "no samples" at a time when the user is actively watching the
+    sampler fire.
+    """
+    pool = 250 if nit > 500 else 50
+    return min(pool, max(1, int(nit)))
+
+
+def _src_make_leaf_png(
+    *,
+    branch,
+    leaf_idx,
+    label,
+    chain,          # (nit, nwalkers, ndim) cold-chain
+    inds,           # (nit, nwalkers) bool
+    truth,          # (ndim,) or None
+    param_defs,
+    key_idx,
+    dh=None,        # (nit, nwalkers) or None
+    hh=None,
+    dpi=90,
+    tally=None,
+):
+    """Render one trace + corner-posterior PNG for one leaf.
+
+    Layout: ``(1 + npar) x (npar + 1)`` grid.
+
+      row 0:        chain traces per key param (full iteration range),
+                    right-column pane = <d|h> / <h|h> diagnostic.
+      rows 1..npar: corner panel.  Diagonal cell (i, i) is a 1-D histogram
+                    of pooled samples for key param i; cell (i, j) with
+                    j < i is a scatter of those samples (x = param j,
+                    y = param i).  Upper triangle (j > i) is hidden
+                    except for the right-column summary table that spans
+                    all corner rows.
+
+    Pooled samples come from ``_src_pool_window(nit)`` trailing
+    iterations x all cold walkers (user ruling 2026-10-05: last 50 iters
+    when < 500 stored, last 250 once past that; the step is the burn-in
+    gate for the full_pe stage).  Dead rows (``inds == False``) are
+    dropped per iteration so a trans-dimensional branch cannot draw a
+    phantom source at coordinate zero.
+
+    Returns a base64-encoded PNG string.
+    """
+    full_pe_start = _SRC_FULL_PE_START
+    nit, nwalkers, ndim = chain.shape
+    it_axis = np.arange(nit)
+    npar = len(key_idx)
+    _walker_colors = [CYAN, AMBER, GREEN, VIOLET]
+    # ---- pool: last W iterations, mask dead rows per iteration -----------
+    pool_W = _src_pool_window(nit)
+    pool_start = max(0, nit - pool_W)
+    pool_chain = chain[pool_start:nit]        # (W, nwalkers, ndim)
+    pool_inds = inds[pool_start:nit].astype(bool)
+    pool_mask_flat = pool_inds.reshape(-1)    # (W * nwalkers,)
+    pool_flat = pool_chain.reshape(-1, ndim)[pool_mask_flat]
+    n_pooled = int(pool_flat.shape[0])
+
+    # Figure geometry: traces row (fat) + npar corner rows (square-ish).
+    # Width per column: 1.75" param + 2.0" diagnostic.
+    _col_w = 1.75
+    _diag_w = 2.1
+    _trace_h = 1.5
+    _corner_h = 0.75
+    w_total = max(_col_w * npar + _diag_w, 8.0)
+    h_total = _trace_h + _corner_h * npar + 0.6     # +0.6 for suptitle margin
+    fig = plt.figure(figsize=(w_total, h_total), dpi=dpi)
+    width_ratios = [1.0] * npar + [_diag_w / _col_w]
+    height_ratios = [_trace_h] + [_corner_h] * npar
+    gs = fig.add_gridspec(
+        1 + npar, npar + 1,
+        width_ratios=width_ratios, height_ratios=height_ratios,
+        hspace=0.18, wspace=0.18,
+        left=0.055, right=0.985,
+        top=1.0 - 0.55 / max(h_total, 1.0),
+        bottom=0.55 / max(h_total, 1.0),
+    )
+
+    # ---- row 0: chain traces per key param ------------------------------
+    for col, pcol in enumerate(key_idx):
+        _, lbl = param_defs[pcol]
+        ax = fig.add_subplot(gs[0, col])
+        for w in range(nwalkers):
+            vals = chain[:, w, pcol].astype(float)
+            mask = inds[:, w].astype(bool)
+            if mask.any():
+                ax.plot(it_axis[mask], vals[mask],
+                        color=_walker_colors[w % 4], lw=0.6, alpha=0.85)
+        if truth is not None and np.isfinite(truth[pcol]):
+            ax.axhline(float(truth[pcol]), color=RED, ls=":",
+                       lw=1.0, alpha=0.95)
+        # mark the pool window start (burn-in cut-off that feeds the corner)
+        ax.axvline(pool_start, color=CYAN, ls="-", lw=0.6, alpha=0.6)
+        if full_pe_start is not None and full_pe_start < nit:
+            ax.axvline(full_pe_start, color=DIM, ls="--", lw=0.6, alpha=0.6)
+        ax.set_title(lbl, fontsize=9, pad=2)
+        ax.tick_params(axis="both", labelsize=7)
+        ax.ticklabel_format(axis="y", style="sci", scilimits=(-3, 4),
+                             useOffset=False, useMathText=True)
+        if col == 0:
+            ax.set_ylabel("value", fontsize=8)
+
+    # Row 0 right-column: d|h / h|h diagnostic trace
+    ax = fig.add_subplot(gs[0, -1])
+    if dh is not None or hh is not None:
+        for w in range(nwalkers):
+            if dh is not None:
+                ax.plot(it_axis, dh[:, w], color=_walker_colors[w % 4],
+                        lw=0.6, alpha=0.85)
+            if hh is not None:
+                ax.plot(it_axis, hh[:, w], color=_walker_colors[w % 4],
+                        lw=0.6, alpha=0.4, ls="--")
+        ax.axvline(pool_start, color=CYAN, ls="-", lw=0.6, alpha=0.6)
+        if full_pe_start is not None and full_pe_start < nit:
+            ax.axvline(full_pe_start, color=DIM, ls="--", lw=0.6, alpha=0.6)
+        ax.set_title(r"$\langle d|h\rangle$ solid, $\langle h|h\rangle$ dashed",
+                     fontsize=8, pad=2)
+        ax.tick_params(axis="both", labelsize=7)
+    else:
+        ax.axis("off")
+
+    # ---- rows 1..npar: corner panel -------------------------------------
+    # Compute per-param axis extents from pooled samples (padded by 5%).
+    extents = []
+    for pcol in key_idx:
+        vals = pool_flat[:, pcol] if n_pooled else np.array([])
+        vals = vals[np.isfinite(vals)]
+        if vals.size:
+            lo, hi = float(np.min(vals)), float(np.max(vals))
+        else:
+            lo, hi = 0.0, 1.0
+        if truth is not None and np.isfinite(truth[pcol]):
+            tv = float(truth[pcol])
+            lo = min(lo, tv); hi = max(hi, tv)
+        if not hi > lo:
+            hi = lo + max(abs(lo) * 1e-6, 1e-9)
+        pad = (hi - lo) * 0.06
+        extents.append((lo - pad, hi + pad))
+
+    for i, pcol_y in enumerate(key_idx):
+        for j, pcol_x in enumerate(key_idx):
+            ax = fig.add_subplot(gs[1 + i, j])
+            if j > i:
+                ax.axis("off")
+                continue
+            if j == i:
+                # Diagonal: 1-D histogram of pooled samples
+                vals = (pool_flat[:, pcol_x] if n_pooled else np.array([]))
+                vals = vals[np.isfinite(vals)] if vals.size else vals
+                if vals.size >= 3:
+                    ax.hist(vals, bins=24, color=VIOLET, alpha=0.75,
+                            edgecolor=DIM, lw=0.3)
+                else:
+                    ax.text(0.5, 0.5, "n=%d" % n_pooled,
+                            transform=ax.transAxes, ha="center", va="center",
+                            fontsize=7, color=DIM)
+                if truth is not None and np.isfinite(truth[pcol_x]):
+                    ax.axvline(float(truth[pcol_x]), color=RED, ls=":", lw=1.0)
+                ax.set_xlim(*extents[j])
+                ax.set_yticks([])
+            else:
+                # Lower triangle: 2-D scatter dots
+                if n_pooled:
+                    xv = pool_flat[:, pcol_x]
+                    yv = pool_flat[:, pcol_y]
+                    ok = np.isfinite(xv) & np.isfinite(yv)
+                    xv, yv = xv[ok], yv[ok]
+                    if xv.size:
+                        ax.scatter(xv, yv, s=3.2, color=VIOLET, alpha=0.55,
+                                   lw=0)
+                if truth is not None and np.isfinite(truth[pcol_x]) and \
+                        np.isfinite(truth[pcol_y]):
+                    ax.plot(float(truth[pcol_x]), float(truth[pcol_y]),
+                            "+", color=RED, mew=1.2, ms=8)
+                ax.set_xlim(*extents[j]); ax.set_ylim(*extents[i])
+
+            # Axis labels: left column -> y-axis param label; bottom row ->
+            # x-axis param label.  Hide ticks elsewhere so the N x N grid
+            # does not drown in numbers.
+            if j == 0:
+                ax.set_ylabel(param_defs[pcol_y][1], fontsize=7.5)
+                ax.tick_params(axis="y", labelsize=6)
+                ax.ticklabel_format(axis="y", style="sci", scilimits=(-3, 4),
+                                     useOffset=False, useMathText=True)
+            else:
+                ax.set_yticklabels([])
+            if i == npar - 1:
+                ax.set_xlabel(param_defs[pcol_x][1], fontsize=7.5)
+                ax.tick_params(axis="x", labelsize=6, rotation=0)
+                ax.ticklabel_format(axis="x", style="sci", scilimits=(-3, 4),
+                                     useOffset=False, useMathText=True)
+            else:
+                ax.set_xticklabels([])
+            ax.grid(True, alpha=0.3, lw=0.4)
+
+    # ---- summary / diagnostic column (spans corner rows) -----------------
+    ax = fig.add_subplot(gs[1:, -1])
+    ax.axis("off")
+    lines = [
+        f"iter range: 0 .. {nit - 1}",
+        f"pool window: last {pool_W} iters (start {pool_start}, "
+        f"cutoff at <500 -> 50, >=500 -> 250)",
+        f"pooled samples: {n_pooled} ({pool_W} x {nwalkers} nominal, "
+        f"minus dead-leaf rows)",
+    ]
+    if full_pe_start is not None:
+        lines.append(f"full_pe: {max(0, nit - full_pe_start)} iters "
+                     f"(start {full_pe_start})")
+    if dh is not None and hh is not None:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            snr = dh[-1] / np.sqrt(np.maximum(hh[-1], 1e-30))
+        lines.append(f"SNR  last: {np.round(snr, 1).tolist()}")
+        lines.append(f"d|h  last: {np.round(dh[-1], 0).tolist()}")
+        lines.append(f"h|h  last: {np.round(hh[-1], 0).tolist()}")
+    if truth is not None:
+        lines.append("")
+        lines.append(" param    median    truth   (m-t)/sig")
+        for pcol in key_idx:
+            name = param_defs[pcol][0]
+            vals_p = (pool_flat[:, pcol] if n_pooled else np.array([]))
+            vals_p = vals_p[np.isfinite(vals_p)] if vals_p.size else vals_p
+            if vals_p.size:
+                med = float(np.median(vals_p))
+                sd = float(np.std(vals_p)) or np.nan
+                tv = (float(truth[pcol])
+                      if np.isfinite(truth[pcol]) else np.nan)
+                diff_sigma = ((med - tv) / sd
+                              if (sd and np.isfinite(sd)) else np.nan)
+                lines.append(
+                    f" {name:<8} {med: .3g}  {tv: .3g}  {diff_sigma: .2f}")
+    ax.text(0.0, 1.0, "\n".join(lines),
+            transform=ax.transAxes, ha="left", va="top",
+            fontsize=7, color=FG, family="monospace")
+
+    fig.suptitle(f"{branch.upper()} leaf {leaf_idx} — {label}",
+                 fontsize=10, color=FG, y=0.995)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    raw = buf.getvalue()
+    if tally is not None:
+        tally.append(len(raw))
+    return base64.b64encode(raw).decode()
+
+
+SRC_PANEL_JSON = {"mbh": '{"src":[]}', "emri": '{"src":[]}',
+                  "sobbh": '{"src":[]}'}
+SRC_PANEL_META = {}
+_SRC_PNG_BYTES = []
+_src_t0 = time.perf_counter() if False else None  # time tracked below via `time`
+import time as _src_time_mod  # local import, keep page-build time clean
+_src_build_start = _src_time_mod.perf_counter()
+for _branch, _spec in _SRC_BRANCH_SPECS.items():
+    _cls = _spec["cls"]
+    _chain_ds = _safe(g, f"chain/{_branch}", label=f"chain/{_branch}")
+    _inds_ds = _safe(g, f"inds/{_branch}", label=f"inds/{_branch}")
+    if _chain_ds is None or _inds_ds is None:
+        SRC_PANEL_META[_branch] = {"status": "chain or inds unreadable"}
+        continue
+    try:
+        _chain_all = _chain_ds[:, 0, 0]   # (nit, nwalkers, nleaves, ndim)
+        _inds_all = _inds_ds[:, 0, 0]
+    except Exception as e:
+        MISSING.append(f"{_branch} chain reshape failed: {e!r}")
+        SRC_PANEL_META[_branch] = {"status": f"shape error: {e!r}"}
+        continue
+    if _chain_all.ndim != 4 or _inds_all.ndim != 3:
+        MISSING.append(
+            f"{_branch} chain/inds shape unexpected: chain={_chain_all.shape} "
+            f"inds={_inds_all.shape}; dropdown skipped")
+        continue
+    _nwalkers = _chain_all.shape[1]
+    _nleaves = _chain_all.shape[2]
+    _sub_dh = _safe(g, f"sub_backend/{_branch}/d_h",
+                     label=f"sub_backend/{_branch}/d_h")
+    _sub_hh = _safe(g, f"sub_backend/{_branch}/h_h",
+                     label=f"sub_backend/{_branch}/h_h")
+    _dh_all = _sub_dh if _sub_dh is not None else None
+    _hh_all = _sub_hh if _sub_hh is not None else None
+    _cat = _src_load_catalogue(_spec["cat_files"])
+    _ids = _SRC_IDS.get(_cls, list(range(_nleaves)))
+    if _cat is None:
+        MISSING.append(
+            f"{_branch} truth lines unavailable: no catalogue under "
+            f"{MOJITO_CAT_DIR}/catalogues matching {_spec['cat_files']!r}")
+    _truths = []
+    for _leaf in range(_nleaves):
+        if _cat is None or _leaf >= len(_ids):
+            _truths.append(None); continue
+        _row = _src_cat_row(_cat, _ids[_leaf])
+        if _row is None:
+            _truths.append(None); continue
+        try:
+            _truths.append(_SRC_CAT_FNS[_branch](_row))
+        except Exception as e:
+            MISSING.append(
+                f"{_branch} leaf {_leaf} truth build failed: {e!r}")
+            _truths.append(None)
+    _blob = {"src": [], "nleaves": int(_nleaves), "nwalkers": int(_nwalkers)}
+    _n_fail = 0
+    _per_branch_bytes = []
+    for _leaf in range(_nleaves):
+        _chain = _chain_all[:, :, _leaf, :]
+        _inds = _inds_all[:, :, _leaf]
+        _dh = _dh_all[:, :, _leaf] if _dh_all is not None else None
+        _hh = _hh_all[:, :, _leaf] if _hh_all is not None else None
+        _src_id = _ids[_leaf] if _leaf < len(_ids) else _leaf
+        _label = (f"src id {_src_id}" if _cat is not None
+                  else f"src idx {_leaf}")
+        if _dh is not None and _hh is not None and _dh.size and _hh.size:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                _snr = float(np.median(
+                    _dh[-1] / np.sqrt(np.maximum(_hh[-1], 1e-30))))
+            if np.isfinite(_snr):
+                _label += f" · SNR~{_snr:.1f}"
+        try:
+            _png = _src_make_leaf_png(
+                branch=_branch, leaf_idx=_leaf, label=_label,
+                chain=_chain, inds=_inds, truth=_truths[_leaf],
+                param_defs=_spec["param_defs"], key_idx=_spec["key_idx"],
+                dh=_dh, hh=_hh, tally=_per_branch_bytes,
+            )
+        except Exception as e:
+            _n_fail += 1
+            MISSING.append(
+                f"{_branch} leaf {_leaf} PNG render failed: {e!r}")
+            continue
+        _pool_W = _src_pool_window(int(_chain.shape[0]))
+        _n_pe = (max(0, NIT - _SRC_FULL_PE_START)
+                 if _SRC_FULL_PE_START is not None else 0)
+        _sub = (f"leaf {int(_leaf)} · {int(_chain.shape[0])} iterations · "
+                f"corner pool: last {_pool_W} iters x {int(_nwalkers)} cold "
+                f"walkers (burn-in gate: <500 -> 50, &ge;500 -> 250) · "
+                f"full_pe {_n_pe} rows (start "
+                f"{_SRC_FULL_PE_START if _SRC_FULL_PE_START is not None else 'n/a'}) · "
+                f"dotted red = catalogue truth")
+        _blob["src"].append({"label": _label, "sub": _sub, "png": _png})
+    SRC_PANEL_JSON[_branch] = json.dumps(_blob)
+    SRC_PANEL_META[_branch] = {
+        "nleaves": int(_nleaves),
+        "n_rendered": len(_blob["src"]),
+        "n_fail": _n_fail,
+        "png_total_mb": sum(_per_branch_bytes) / 1024 ** 2,
+    }
+    _SRC_PNG_BYTES += _per_branch_bytes
+_src_build_sec = _src_time_mod.perf_counter() - _src_build_start
+if _SRC_PNG_BYTES:
+    print(f"[source-dropdown] built {len(_SRC_PNG_BYTES)} leaf PNGs across "
+          f"mbh/emri/sobbh in {_src_build_sec:.1f} s, "
+          f"total {sum(_SRC_PNG_BYTES) / 1024**2:.2f} MB "
+          f"(base64 ~{sum(_SRC_PNG_BYTES) * 4 / 3 / 1024**2:.2f} MB)")
+
+# Captions / counts for the HTML side (used in the three new <section> blocks).
+SRC_PANEL_COUNT_TXT = {}
+for _b in ("mbh", "emri", "sobbh"):
+    _m = SRC_PANEL_META.get(_b, {})
+    _n = _m.get("n_rendered", 0)
+    _nl = _m.get("nleaves", 0)
+    _fail = _m.get("n_fail", 0)
+    if _nl == 0:
+        SRC_PANEL_COUNT_TXT[_b] = (
+            "no chain found in this snapshot (branch not sampled yet, or "
+            "chain/inds unreadable); dropdown is empty.")
+    else:
+        _fp = (f"the last {NIT - _SRC_FULL_PE_START} full_pe iteration(s)"
+               if _SRC_FULL_PE_START is not None else "no full_pe rows yet")
+        SRC_PANEL_COUNT_TXT[_b] = (
+            f"{_n} of {_nl} leaves rendered; marginals are over {_fp}."
+            + (f" {_fail} leaf render(s) failed." if _fail else ""))
+
+MBH_PANEL_JSON = SRC_PANEL_JSON["mbh"]
+EMRI_PANEL_JSON = SRC_PANEL_JSON["emri"]
+SOBBH_PANEL_JSON = SRC_PANEL_JSON["sobbh"]
+MBH_PANEL_COUNT = SRC_PANEL_COUNT_TXT.get("mbh", "")
+EMRI_PANEL_COUNT = SRC_PANEL_COUNT_TXT.get("emri", "")
+SOBBH_PANEL_COUNT = SRC_PANEL_COUNT_TXT.get("sobbh", "")
+
 # ============================ HTML ==========================================
 stage_now = "?"
 for k, (o, s_) in sorted(recipe.items(), key=lambda kv: kv[1][0]):
@@ -6514,9 +7248,17 @@ if SCI:
         f"{pct(SCI.get('mm_hi', 0))} exceed 0.9.")
     cap_f4 = (
         f"Left: every model source in the amplitude-frequency plane, coloured "
-        f"by optimal SNR. Right: the same plane split three ways. Recovery "
-        f"tracks amplitude, and the misses concentrate along the faint edge "
-        f"rather than anywhere structural. {MATCH_CRIT_HTML}")
+        f"by optimal SNR. Right: the same plane split three ways; the "
+        f"missed-detection X&apos;s are tiered by the injected source&rsquo;s "
+        f"SNR re-evaluated under the LAST stored iteration&rsquo;s "
+        f"max-ln L cold-walker PSD + foreground "
+        f"(<span style='color:var(--truthyellow)'>yellow</span> 7&ndash;10, "
+        f"<span style='color:var(--truthorange)'>orange</span> 10&ndash;20, "
+        f"<span style='color:var(--truthred)'>red</span> &gt; 20) so the loud "
+        f"misses pop first on a crowded plane AND the tiering tracks the "
+        f"run as its foreground fit evolves{_LIVE_SNR_NOTE}. Recovery tracks "
+        f"amplitude, and the misses concentrate along the faint edge rather "
+        f"than anywhere structural. {MATCH_CRIT_HTML}")
     cap_f5 = (
         f"Where the sources are and where they are being found. The lower "
         f"panel is the per-bin recovery fraction with 68% Wilson intervals. "
@@ -6837,6 +7579,12 @@ html = f"""<title>LISA Global Fit {RUN_LABEL}</title>
      against the green recovery circles. Legibility of the overlay wins --
      the haze worry is handled by the per-cross alpha instead. */
   --truthred:#FF2E3E;
+  /* Missed-detection SNR tier colors (2026-10-05, user ruling): yellow
+     for 7-10, orange for 10-20, red for >20. The idea is that a loud
+     missed source is a worse story than a quiet one, and the eye should
+     see the loud ones FIRST on a crowded panel. */
+  --truthorange:#FF8A1A;
+  --truthyellow:#F7D33C;
   /* Sub-threshold catalogue sources on the zoom canvas. Light enough to
      read as a population against --bg, dark enough that the red
      detectable crosses stay the thing the eye lands on. */
@@ -6845,6 +7593,8 @@ html = f"""<title>LISA Global Fit {RUN_LABEL}</title>
 :root[data-theme="light"] {{
   --bg:#EEF1F5; --panel:#FFFFFF; --line:#D4DBE3; --fg:#25313D; --dim:#5D6B7A;
   --truthred:#E00016;
+  --truthorange:#D16500;
+  --truthyellow:#B38F00;
   --truthgrey:#9AA7B4;
 }}
 * {{ box-sizing:border-box; }}
@@ -6903,7 +7653,9 @@ ul {{ color:var(--dim); font-size:13px; }}
   <a href="#recovery">recovery</a><a href="#population">population</a>
   {NAV_PARAMS}<a href="#search">search &amp; cap cells</a>{NAV_GATES}
   <a href="#fstat">f-stat</a><a href="#noise">noise</a>
-  <a href="#vgb">verification binaries</a><a href="#detect">detectability</a>
+  <a href="#vgb">verification binaries</a>
+  <a href="#mbh">MBHB</a><a href="#emri">EMRI</a><a href="#sobbh">SOBHB</a>
+  <a href="#detect">detectability</a>
   <a href="#appendix">appendix</a>
 </nav>
 <main>
@@ -7035,11 +7787,14 @@ window, so a short snapshot shows the last few legs. Legs covered:
 <div class="caption" id="expl_cap"></div>
 <div class="caption">Zoomable version of the amplitude-frequency plane, with
 four classification layers on top of the posterior cloud:
-<span style="color:var(--amber)">amber</span> = pooled posterior samples of
+<span style="color:var(--cyan)">cyan</span> = pooled posterior samples of
 the current model,
 <span style="color:var(--dim)">grey X</span> = undetectable catalogue rows,
-<span style="color:var(--truthred)">red X</span> = detectable but not
-recovered under the current match criterion,
+missed-detection X&apos;s tiered by injected SNR
+(<span style="color:var(--truthyellow)">yellow</span> 7&ndash;10,
+<span style="color:var(--truthorange)">orange</span> 10&ndash;20,
+<span style="color:var(--truthred)">red</span> &gt; 20) &mdash;
+loud misses pop before quiet ones,
 <span style="color:var(--green)">closed green circle</span> = recovered and
 matched,
 <span style="color:var(--violet)">open violet circle</span> = recovered with
@@ -7047,7 +7802,7 @@ no matching injection. Drag to pan and use the wheel to zoom, or set the
 view numerically with the centre and width/height controls above &mdash;
 those hold the window size fixed and slide it across the band, which is the
 steadier way to walk through frequency.
-<strong>Amber is pooled over the last {EXPL_ITS} stored iterations</strong>
+<strong>The cyan posterior cloud is pooled over the last {EXPL_ITS} stored iterations</strong>
 &times; {nwalk} cold walkers ({EXPL_RAW:,} alive-leaf rows{EXPL_DEC_NOTE}),
 with each iteration&rsquo;s own alive mask applied, so a single source draws a
 cloud whose width is the sampler&rsquo;s spread rather than one snapshot of
@@ -7200,6 +7955,64 @@ the truth, so a truth line outside the posterior stays visible.</div>
 </div>
 </section>
 
+<section id="mbh"><h2>Massive Black-Hole Binaries</h2>
+<div class="panel">
+<div class="btnrow viewctl">
+  <label>source <select id="mbh1_sel"></select></label>
+  <span class="caption" style="align-self:center">cold-chain trace (top) and
+  posterior over full_pe rows (bottom) per injected MBHB, one source at a
+  time; dotted red is the catalogue value</span>
+</div>
+<img id="mbh1_img" alt="MBHB chain + posterior">
+<div class="caption" id="mbh1_cap"></div>
+<div class="caption">{MBH_PANEL_COUNT} Key parameters shown: total mass
+M<sub>tot</sub>, mass ratio Q = m<sub>1</sub>/m<sub>2</sub> &ge; 1, aligned
+spins &chi;<sub>1</sub> / &chi;<sub>2</sub>, coalescence time t<sub>c</sub>,
+distance d<sub>L</sub>, sky (&alpha;, sin&delta;). The right-hand diagnostic
+pane is the per-walker &lang;d|h&rang; / &lang;h|h&rang; from
+<code>sub_backend/mbh</code>; the summary table at the bottom quotes median,
+truth, and (median &minus; truth) / &sigma; per parameter over the
+cold-walker-pooled full_pe window.</div>
+</div>
+</section>
+
+<section id="emri"><h2>Extreme Mass-Ratio Inspirals</h2>
+<div class="panel">
+<div class="btnrow viewctl">
+  <label>source <select id="emri1_sel"></select></label>
+  <span class="caption" style="align-self:center">cold-chain trace (top) and
+  posterior over full_pe rows (bottom) per injected EMRI; dotted red is the
+  catalogue value</span>
+</div>
+<img id="emri1_img" alt="EMRI chain + posterior">
+<div class="caption" id="emri1_cap"></div>
+<div class="caption">{EMRI_PANEL_COUNT} Key parameters shown: primary mass
+log&nbsp;m<sub>1</sub>, spin a, semi-latus rectum p<sub>0</sub>, eccentricity
+e<sub>0</sub>, distance d<sub>L</sub>. The sky is kept in each sampling
+frame &mdash; the EMRI stock basis uses ecliptic colatitude q<sub>S</sub>
+and &phi;<sub>S</sub>, so the truth sky line comes from &pi;/2 &minus; Dec
+and RA.</div>
+</div>
+</section>
+
+<section id="sobbh"><h2>Stellar-Origin Black-Hole Binaries</h2>
+<div class="panel">
+<div class="btnrow viewctl">
+  <label>source <select id="sobbh1_sel"></select></label>
+  <span class="caption" style="align-self:center">cold-chain trace (top) and
+  posterior over full_pe rows (bottom) per injected SOBHB; dotted red is the
+  catalogue value</span>
+</div>
+<img id="sobbh1_img" alt="SOBHB chain + posterior">
+<div class="caption" id="sobbh1_cap"></div>
+<div class="caption">{SOBBH_PANEL_COUNT} Key parameters shown: component
+log-masses log&nbsp;m<sub>1</sub>, log&nbsp;m<sub>2</sub>, starting GW
+frequency f<sub>low</sub>, distance d<sub>L</sub>, and sky (&phi;<sub>S</sub>,
+cos&nbsp;q<sub>S</sub>). SOBHB uses eight tempering rungs per leaf
+(<code>SOBBH_NTEMPS</code>); only the cold rung is shown here.</div>
+</div>
+</section>
+
 <section id="detect"><h2>How Many Are Detectable At All</h2>
 <div class="panel">
 <div class="caption" style="margin:0 0 10px 0">Optimal SNR of the injected
@@ -7279,6 +8092,9 @@ const DATA = {EXPL_JSON};
 const VPOST = {VGB_POST_JSON};
 const VGBC = {VGB_CORNER_JSON};
 const GB1 = {GB1_JSON};
+const MBHP = {MBH_PANEL_JSON};
+const EMRIP = {EMRI_PANEL_JSON};
+const SOBBHP = {SOBBH_PANEL_JSON};
 // Single-VGB corner panel: the <select> swaps the src of ONE <img> between
 // 55 pre-rendered ChainConsumer PNGs (base64 data URIs held in JS, so only
 // the selected corner is ever in the document's visible flow).
@@ -7312,6 +8128,9 @@ function cornerPanel(px, blob) {{
 }}
 cornerPanel("vgb1", VGBC);
 cornerPanel("gb1", GB1);
+cornerPanel("mbh1", MBHP);
+cornerPanel("emri1", EMRIP);
+cornerPanel("sobbh1", SOBBHP);
 // Shared view controls: numeric center (cx, cy) + log-scale width/height
 // sliders, all around a FIXED center -- plus a click-to-set-center mode.
 // api: get() -> [X0,X1,Y0,Y1]; set(x0,x1,y0,y1) (must redraw); fullW/fullH
@@ -7412,7 +8231,7 @@ function viewCtl(px, cv, api) {{
   // catalogue completeness cannot be read off the recovered cloud alone.
   let showT = N_OVERLAY > 0;
   const baseCap = (hasGB
-    ? `GB samples: ${{DATA.gb.length}} alive-source rows pooled over the last ${{DATA.gb_its}} stored iterations x all cold walkers${{DATA.gb_stride > 1 ? ` (1-in-${{DATA.gb_stride}} of ${{DATA.gb_raw}} for page weight)` : ""}}; y = log10 amplitude from (dist, f0, Mc). Posterior cloud = amber; catalogue: grey X undetectable, red X detectable-not-recovered; recovered source markers: closed green circle (matched) or open violet circle (not matched). ${{MATCH_NOTE}}`
+    ? `GB samples: ${{DATA.gb.length}} alive-source rows pooled over the last ${{DATA.gb_its}} stored iterations x all cold walkers${{DATA.gb_stride > 1 ? ` (1-in-${{DATA.gb_stride}} of ${{DATA.gb_raw}} for page weight)` : ""}}; y = log10 amplitude from (dist, f0, Mc). Posterior cloud = cyan; catalogue: grey X undetectable, missed-detection X tiered by injected SNR (yellow 7-10, orange 10-20, red >20); recovered source markers: closed green circle (matched) or open violet circle (not matched). ${{MATCH_NOTE}}`
     : `No GB sources alive yet - showing the 55 VGBs (${{DATA.vgb_its}} stored iterations x ${{DATA.nwalk}} walker samples each) as 1/dist vs leaf index. GB samples take over automatically once births land.`);
   const setCap = () => {{
     cap.textContent = baseCap + (N_OVERLAY
@@ -7461,8 +8280,8 @@ function viewCtl(px, cv, api) {{
     g.fillText(hasGB ? "log10 A" : "1 / dist [1/kpc]", -30, 0); g.restore();
     // LAYERING (2026-09-20). Draw order, bottom to top:
     //   1. grey X's for undetectable catalogue rows        (--dim)
-    //   2. amber posterior cloud                          (--amber)
-    //   3. red X's for detectable-not-recovered           (--truthred)
+    //   2. cyan posterior cloud                           (--cyan)
+    //   3. SNR-tiered X's for detectable-not-recovered    (--truthyellow/orange/red)
     //   4. green filled / violet open circles for recovered sources
     // Steps 1, 3, 4 are gated by `showT`. Step 2 always draws (that's the
     // "posterior of the current model" and reads even without an overlay).
@@ -7491,7 +8310,11 @@ function viewCtl(px, cv, api) {{
     // AMBER for the GB posterior cloud (2026-09-20): green now belongs to
     // the "recovered + matched" source markers layered on top. VGB fallback
     // keeps violet.
-    g.fillStyle = hasGB ? C("--amber") : C("--violet");
+    // Posterior sample cloud: cyan (2026-10-05, user ruling) -- the earlier
+    // amber clashed with the SNR-tiered yellow / orange missed-detection
+    // X's; cyan sits far from every X tier and keeps the cloud readable
+    // on top of the grey undetectable layer.
+    g.fillStyle = hasGB ? C("--cyan") : C("--violet");
     g.beginPath();
     for (const p of pts) {{
       const x = sx(p[0]), y = sy(p[1]);
@@ -7501,18 +8324,27 @@ function viewCtl(px, cv, api) {{
     g.fill();
     g.globalAlpha = 1;
     if (showT) {{
-      // red X: detectable but not recovered under the current criterion.
-      g.strokeStyle = C("--truthred"); g.globalAlpha = 0.95;
-      g.lineWidth = 1.6; g.lineCap = "round";
+      // Missed-detection X's, tiered by SNR (2026-10-05): yellow 7-10,
+      // orange 10-20, red >20. Three passes so each tier's strokeStyle
+      // is set once; loud tier last so it overdraws nothing it needs to
+      // show. Legacy T_RED rows have no tier byte -- treated as >20 so
+      // an old blob still reads as the original "all red" page.
+      const TIER_COLOR = ["--truthyellow", "--truthorange", "--truthred"];
+      g.globalAlpha = 0.95; g.lineWidth = 1.6; g.lineCap = "round";
       const rr = 3.6;
-      g.beginPath();
-      for (const p of T_RED) {{
-        const x = sx(p[0]), y = sy(p[1]);
-        if (x < ml || x > w - mr || y < mt || y > h - mb) continue;
-        g.moveTo(x - rr, y - rr); g.lineTo(x + rr, y + rr);
-        g.moveTo(x - rr, y + rr); g.lineTo(x + rr, y - rr);
+      for (let tier = 0; tier < 3; tier++) {{
+        g.strokeStyle = C(TIER_COLOR[tier]);
+        g.beginPath();
+        for (const p of T_RED) {{
+          const _t = (p.length > 2 ? p[2] : 2);
+          if (_t !== tier) continue;
+          const x = sx(p[0]), y = sy(p[1]);
+          if (x < ml || x > w - mr || y < mt || y > h - mb) continue;
+          g.moveTo(x - rr, y - rr); g.lineTo(x + rr, y + rr);
+          g.moveTo(x - rr, y + rr); g.lineTo(x + rr, y - rr);
+        }}
+        g.stroke();
       }}
-      g.stroke();
       // recovered-source markers: filled green (matched) then open violet
       // (unmatched). Two passes so fill / stroke styles need not toggle
       // inside the loop.
