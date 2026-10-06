@@ -535,5 +535,113 @@ class SOBBHEigenInnerMoveTest(unittest.TestCase):
         self.assertEqual(spy.call_count, 2)
 
 
+
+#: spins barely move the chunked toy template (Gram ~1e-10): judged apart
+_NO_SPIN = [0, 1, 4, 5, 6, 7, 8, 9, 10]
+
+
+def _corr_rel(a, b, keep):
+    a, b = a[np.ix_(keep, keep)], b[np.ix_(keep, keep)]
+    d = np.sqrt(np.abs(np.diag(b)))
+    return np.abs(a - b) / np.outer(d, d)
+
+
+class SOBBHGramInfoTest(SOBBHEigenInnerMoveTest):
+    """``SOBBH_EIGEN_INFO=gram``: the Gram matrix of the move's own chunked
+    templates against an independent EXACT one (the dense stock template
+    path, central differences at the same steps, the container's inner
+    product). Measured on this toy: diagonal within 1-3 %, marginal widths
+    within 3.3 %; across the step target 3e-3 vs 1e-3, 5e-3.
+    """
+
+    # the parent's tests run once, in SOBBHEigenInnerMoveTest
+    test_refresh_and_proposal_chain_on_real_kernel = None
+    test_per_walker_tables_on_real_kernel_through_the_split_seam = None
+    test_cadence_respected_on_real_move = None
+
+    def _setup(self):
+        from lisatools.globalfit.moves import eigen_refresh
+
+        move, tc = self._eigen_move()
+        move.setup_likelihood_here(None)
+        move._current_leaf = 0
+        x0 = np.asarray(tc.both_inverse_transforms(REF_STOCK.copy()), dtype=float)
+        widths = eigen_refresh.prior_box_widths(move.priors["sobbh"], 11)
+        return move, x0, widths
+
+    def _dense_gram(self, move, x0, steps):
+        from lisatools.diagnostic import inner_product
+
+        gen = type(self).__dict__.get("gen") or SOBBHEigenInnerMoveTest.__dict__["gen"]
+        ac = move.acs.acs.flatten()[0]
+        dh = []
+        for i in range(11):
+            e = np.zeros(11)
+            e[i] = steps[i]
+            hp, hm = (gen(*row) for row in move._to_phys(np.stack([x0 + e, x0 - e])))
+            dh.append(type(hp)((np.asarray(hp.arr) - np.asarray(hm.arr)) / (2 * steps[i]),
+                               hp.settings))
+        _, _, psd = ac._slice_to_template(dh[0])
+        G = np.zeros((11, 11))
+        for a in range(11):
+            for b in range(a, 11):
+                G[a, b] = G[b, a] = float(np.real(inner_product(dh[a], dh[b], psd=psd)))
+        return G
+
+    def test_gram_matches_the_dense_template_gram(self):
+        move, x0, widths = self._setup()
+        G, steps = move._gram_info(x0, 0, widths, return_steps=True)
+        Gd = self._dense_gram(move, x0, steps)
+        np.testing.assert_allclose(np.diag(G)[_NO_SPIN], np.diag(Gd)[_NO_SPIN], rtol=5e-2)
+        self.assertLess(_corr_rel(G, Gd, _NO_SPIN).max(), 0.1)
+        inv = lambda M: np.sqrt(np.abs(np.diag(np.linalg.pinv(M[np.ix_(_NO_SPIN, _NO_SPIN)]))))
+        np.testing.assert_allclose(inv(G), inv(Gd), rtol=0.1)
+
+    def test_step_tuning_converges_and_the_fixed_step_does_not(self):
+        move, x0, widths = self._setup()
+        move.eigen_gram_target = 1e-3
+        G1 = move._gram_info(x0, 0, widths)
+        move.eigen_gram_target = 3e-3
+        G3 = move._gram_info(x0, 0, widths)
+        self.assertLess(_corr_rel(G3, G1, _NO_SPIN).max(), 2e-2)
+        # NEGATIVE CONTROL: the likelihood route's fixed 1e-4-of-box steps
+        # (no tuning) are nonlinear in f_low and noise-floored elsewhere
+        move.eigen_gram_target = 0.0
+        G0 = move._gram_info(x0, 0, widths)
+        self.assertGreater(_corr_rel(G0, G1, _NO_SPIN).max(), 0.1)
+
+    def test_refresh_routes_through_the_gram_and_installs_a_table(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from lisatools.globalfit.moves import eigen_refresh
+
+        move, x0, widths = self._setup()
+        move.eigen_info = "gram"
+        work = SimpleNamespace(coords=np.tile(x0, (NTEMPS, NWALKERS, 1, 1)))
+        with mock.patch.object(eigen_refresh, "eigen_table_from_ll") as ll_route, \
+                self.assertNoLogs(eigen_refresh.logger, level="WARNING"):
+            move.refresh_inner_move_tables(0, work)
+        ll_route.assert_not_called()
+        axes, sigmas = move.moves[0]._tables["sobbh"]
+        self.assertTrue(np.all(np.isfinite(axes)) and np.all(sigmas > 0))
+        self.assertFalse(np.array_equal(axes, np.eye(11)))
+
+    def test_a_gram_failure_falls_back_to_the_likelihood_route(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from lisatools.globalfit.moves import eigen_refresh
+
+        move, x0, widths = self._setup()
+        move.eigen_info = "gram"
+        move._gram_templates = mock.Mock(side_effect=RuntimeError("boom"))
+        work = SimpleNamespace(coords=np.tile(x0, (NTEMPS, NWALKERS, 1, 1)))
+        with mock.patch.object(eigen_refresh, "eigen_table_from_ll",
+                               wraps=eigen_refresh.eigen_table_from_ll) as ll_route:
+            move.refresh_inner_move_tables(0, work)
+        ll_route.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

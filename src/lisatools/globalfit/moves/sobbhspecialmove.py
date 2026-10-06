@@ -522,6 +522,35 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
         _sub.d_h[:, leaf] = self._last_d_h[: self.nwalkers]
         _sub.h_h[:, leaf] = self._last_h_h[: self.nwalkers]
 
+    def _gram_templates(self, coords, walker):
+        """``SOBBH_EIGEN_INFO=gram`` hook: chunked templates for the Gram rows.
+
+        ``coords`` are waveform-basis rows; each is filled into its OWN
+        zeroed slab (``data_index = row``) of a scratch buffer shaped like
+        walker ``walker``'s data -- the same chunked fill the move uses to
+        expose / fold sources, so the Gram matrix differentiates the
+        templates the residual actually carries. Single-shard only (the fill
+        is single-shard by contract); anything else raises and the refresh
+        falls back to the likelihood route.
+        """
+        if len(self.acs.linear_data_arr) != 1:
+            raise NotImplementedError("SOBBH Gram templates: single-shard ACA only")
+        params = self.to_chunked_basis(np.asarray(asnumpy(coords), dtype=np.float64))
+        f_low = params[:, 5]
+        if not (np.all(np.isfinite(params)) and np.all(f_low >= self._f_band_lo)
+                and np.all(f_low < self._f_band_hi)):
+            raise ValueError("SOBBH Gram rows outside the comp's band")
+        data = self.acs.acs.flatten()[int(walker)].data
+        n = int(params.shape[0])
+        buf = self.acs.xp.zeros((n,) + tuple(data.arr.shape))
+        self.comp.fill_global_wdm(
+            params, buf,
+            data_index=np.arange(n, dtype=np.int32),
+            factors=np.ones(n, dtype=np.float64),
+            m_band_half_width=self.m_band_half_width,
+        )
+        return buf, data.settings
+
     def _apply_cold_chain_sources(self, coords, sign):
         """Fold the leaf's cold-chain sources in/out through the CHUNKED fill.
 

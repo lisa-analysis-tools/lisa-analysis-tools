@@ -239,6 +239,22 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
             val = 1e-4
         return float(val)
 
+    def _eigen_info(self):
+        """kwarg > ``{BRANCH}_EIGEN_INFO`` env > ``"ll"``.
+
+        ``"ll"``: the information matrix from likelihood second differences
+        (the scope routes below). ``"gram"``: the Gram/Fisher matrix
+        ``<dh_a|dh_b>`` of the move's OWN batched templates
+        (:meth:`_build_eigen_table_gram`) -- the expected information, no
+        residual term, one template batch per refresh. Moves without a
+        ``_gram_templates`` hook stay on ``"ll"``.
+        """
+        val = getattr(self, "eigen_info", None)
+        if val is None:
+            val = os.environ.get(
+                f"{str(self.branch_name).upper()}_EIGEN_INFO", "ll")
+        return str(val).strip().lower()
+
     def _eigen_scope(self):
         """kwarg > ``{BRANCH}_EIGEN_SCOPE`` env > ``"walker_max"``.
 
@@ -482,17 +498,23 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
                 )
                 return eigen_refresh._fallback_table(widths)
 
+        if (self._eigen_info() == "gram"
+                and callable(getattr(self, "_gram_templates", None))):
+            try:
+                return self._build_eigen_table_gram(leaf, work, widths)
+            except Exception as exc:  # degrade to the likelihood route
+                eigen_refresh.logger.warning(
+                    "[eigen_refresh] %s leaf %d Gram build failed (%r); "
+                    "using the likelihood second-difference route",
+                    self.branch_name, leaf, exc,
+                )
         if self._eigen_scope() == "per_walker":
             return self._build_eigen_tables_per_walker(leaf, work, widths)
         return self._build_eigen_table_walker_max(leaf, work, widths)
 
-    def _build_eigen_table_walker_max(self, leaf, work, widths):
-        """ONE shared table, built at the max-lnL COLD-chain walker.
-
-        The corner sweep scores against that walker's own data/noise
-        (``data_index``). Selection failure degrades to walker 0 with a
-        warning — never to a crash.
-        """
+    def _eigen_best_walker(self, leaf, work):
+        """``(walker, cold_rows)``: the max-lnL COLD walker for ``leaf``
+        (walker 0, with a warning, if the scoring fails)."""
         cold = np.asarray(asnumpy(work.coords[0, :, leaf]), dtype=np.float64)
         best = 0
         try:
@@ -507,6 +529,121 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
                 "[eigen_refresh] %s leaf %d max-lnL walker selection failed "
                 "(%r); using walker 0", self.branch_name, leaf, exc,
             )
+        return best, cold
+
+    def _gram_context(self, walker):
+        """Device context for walker ``walker``'s templates (default none)."""
+        from contextlib import nullcontext
+        return nullcontext()
+
+    def _build_eigen_table_gram(self, leaf, work, widths):
+        """ONE shared table from the Gram matrix at the max-lnL cold walker.
+
+        Central differences of the move's own batched templates
+        (``_gram_templates(phys_rows, walker) -> (arr, box)``, one template
+        per row on ``box``) in the SAMPLING coordinates, per-column steps
+        tuned by :meth:`_gram_info`, and
+        ``<dh_a|dh_b>`` through the walker's container: the same
+        ``_slice_to_template`` + ``inner_product`` (and PSD) the batched
+        scorers use, so the normalization is the likelihood's.
+        """
+        best, cold = self._eigen_best_walker(leaf, work)
+        x0 = cold[best]
+        self._note_eigen_expansion_point(leaf, x0)
+        t0 = time.perf_counter()
+        info = self._gram_info(x0, best, widths)
+        eigen_refresh.logger.info(
+            "[eigen_refresh] %s leaf %d Gram info matrix at walker %d in %.2f s",
+            self.branch_name, leaf, best, time.perf_counter() - t0,
+        )
+        return eigen_refresh._table_from_info(info, widths)
+
+    def _gram_eps_rel(self):
+        """kwarg > ``{BRANCH}_EIGEN_GRAM_EPS_REL`` env > the likelihood
+        route's ``_eigen_eps_rel``. Template differences have no
+        second-difference cancellation, so they can (and for chirping
+        sources must) step far smaller than the likelihood route."""
+        val = getattr(self, "eigen_gram_eps_rel", None)
+        if val is None:
+            val = os.environ.get(
+                f"{str(self.branch_name).upper()}_EIGEN_GRAM_EPS_REL", None)
+        return float(val) if val is not None else float(self._eigen_eps_rel())
+
+    def _gram_target(self):
+        """kwarg > ``{BRANCH}_EIGEN_GRAM_TARGET`` env > 1e-3: the template
+        change ``||h(x + s e_i) - h(x - s e_i)|| / 2`` each step ``s_i`` is
+        tuned to, as a fraction of ``||h||`` (~1e-3 rad of phase). One
+        rescale pass from the ``_gram_eps_rel`` start; ``0`` keeps the fixed
+        steps. Needed because no single relative step works for every
+        column: a chirping source's f0 goes nonlinear at 1e-6 of its box
+        while masses / spins hit the template's float noise floor at 1e-7
+        (SOBBH chunked toy, 2026-10-06)."""
+        val = getattr(self, "eigen_gram_target", None)
+        if val is None:
+            val = os.environ.get(
+                f"{str(self.branch_name).upper()}_EIGEN_GRAM_TARGET", "1e-3")
+        return float(val)
+
+    def _gram_info(self, x0, walker, widths, return_steps=False):
+        """``<dh_a|dh_b>`` at sampling point ``x0`` against walker ``walker``.
+
+        Rows: the centre plus ``x0 +- s_i e_i``; ``s_i`` starts at
+        ``_gram_eps_rel`` of the prior box and is rescaled ONCE so each
+        column moves the template by ``_gram_target`` of ``||h||``
+        (capped to [1e-12, 1e-2] of the box).
+        """
+        from ...diagnostic import inner_product
+        from ...domains import WDMSignal
+
+        best = int(walker)
+        x0 = np.asarray(x0, dtype=float)
+        widths = np.asarray(widths, dtype=float)
+        nd = int(x0.size)
+        steps = self._gram_eps_rel() * widths
+        target = self._gram_target()
+        like_kw = {
+            k: v for k, v in (getattr(self, "waveform_like_kwargs", None) or {}).items()
+            if k not in ("psd", "complex", "include_psd_info")
+        }
+        ac = self.acs.acs.flatten()[best]
+
+        def ip(x, y, psd):
+            v = inner_product(x, y, psd=psd, **like_kw)
+            return float(np.real(v.get() if hasattr(v, "get") else v))
+
+        with self._gram_context(best):
+            for _pass in range(2 if target > 0 else 1):
+                X = np.repeat(x0[None, :], 2 * nd + 1, axis=0)
+                for i in range(nd):
+                    X[2 * i, i] += steps[i]
+                    X[2 * i + 1, i] -= steps[i]
+                arr, box = self._gram_templates(self._to_phys(X), best)
+                h0 = WDMSignal(arr[2 * nd], box)
+                _, _, s_box = ac._slice_to_template(h0)
+                half = [WDMSignal(0.5 * (arr[2 * i] - arr[2 * i + 1]), box)
+                        for i in range(nd)]
+                del arr
+                if _pass == 0 and target > 0:
+                    hn = np.sqrt(max(ip(h0, h0, s_box), 0.0))
+                    dn = np.array([np.sqrt(max(ip(d, d, s_box), 0.0)) for d in half])
+                    scale = np.where(dn > 0, target * hn / np.where(dn > 0, dn, 1.0), 1e3)
+                    steps = np.clip(steps * np.clip(scale, 1e-3, 1e3),
+                                    1e-12 * widths, 1e-2 * widths)
+                    continue
+            info = np.zeros((nd, nd))
+            for a in range(nd):
+                for b in range(a, nd):
+                    info[a, b] = info[b, a] = ip(half[a], half[b], s_box) / (steps[a] * steps[b])
+        return (info, steps) if return_steps else info
+
+    def _build_eigen_table_walker_max(self, leaf, work, widths):
+        """ONE shared table, built at the max-lnL COLD-chain walker.
+
+        The corner sweep scores against that walker's own data/noise
+        (``data_index``). Selection failure degrades to walker 0 with a
+        warning — never to a crash.
+        """
+        best, cold = self._eigen_best_walker(leaf, work)
         x0 = cold[best]
         self._note_eigen_expansion_point(leaf, x0)
 
