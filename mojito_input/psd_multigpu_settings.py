@@ -57,7 +57,7 @@ MOJITO_REFERENCE_TIME = 97729089.327664
 #   "parametric-symmetric":  one OMS + one TM amplitude for all MOSAs (2 parameters)
 #   "parametric-asymmetric": one OMS + one TM amplitude per MOSA (12 parameters,
 #                            links 12, 23, 31, 13, 32, 21; expect degeneracies)
-NOISE_MODEL = "parametric-symmetric" # "parametric-symmetric" "parametric-asymmetric"
+NOISE_MODEL = "parametric-asymmetric" # "parametric-symmetric" "parametric-asymmetric"
 NOISE_SYMMETRY = {
     "parametric-symmetric": "symmetric",
     "parametric-asymmetric": "asymmetric",
@@ -204,9 +204,9 @@ def get_general_erebor_settings() -> GeneralSetup:
     # base_file_name = "test_psd_processing7"
     # file_store_dir = head_dir
 
-    prefix = "preproc-bias"
+    prefix = "preproc-bias_inv"
     data_input_path = "/mnt/wd_hdd_6TB/nikos/DATA/global_fit/mojito_lite/"
-    base_file_name = f"equal_noises_{prefix}_lowpasshighercutoff"
+    base_file_name = f"unequal_noises_{prefix}"
     # file_store_dir = f"/mnt/wd_hdd_6TB/nikos/DATA/global_fit/gf_output/unequal_noises_{prefix}/"
     file_store_dir = f"/mnt/wd_hdd_6TB/nikos/DATA/global_fit/gf_output/{base_file_name}_fmax:{end_freq:.1e}/"
 
