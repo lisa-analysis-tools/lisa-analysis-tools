@@ -477,6 +477,127 @@ class BatchedMoveStockParityTest(unittest.TestCase):
         np.testing.assert_allclose(b["logl"], p["logl"], rtol=1e-10)
 
 
+class NoiseFisherTest(unittest.TestCase):
+    """``{PSD,GALFOR}_EIGEN_INFO=fisher``: the expected noise Fisher
+    ``kappa * sum_pix Tr(C^-1 dC_i C^-1 dC_j)`` on the real synthetic
+    noise_only fit (PSD_BATCH route).
+
+    Truth: the observed information of the PRODUCTION likelihood function on
+    a residual DRAWN from C(x0) (60k WDM pixels, so the observed curvature
+    sits within a percent of its expectation for well-measured directions).
+    Measured: psd diag within 0.6 %; galfor (a loud foreground) alpha / f_1
+    within 4 %, while the observed curvature of the weakly measured fk / f_2
+    comes out NEGATIVE on one draw -- the indefiniteness the Fisher removes.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        BatchedMoveStockParityTest.setUpClass.__func__(cls)
+        try:
+            fx = BatchedMoveStockParityTest._fixture(cls(), "noise_only", ("psd", "galfor"))
+        except unittest.SkipTest:
+            raise
+        cls.curr, cls.state, cls.acs, cls.make_move, cls.sampled = fx
+        cls.mv = cls.make_move(True)
+        coords = {k: np.array(cls.mv._work_branch(cls.state, k).coords) for k in cls.sampled}
+        cls.pt = {k: coords[k][0, :, 0, :] for k in cls.sampled}
+
+    tearDownClass = classmethod(BatchedMoveStockParityTest.tearDownClass.__func__)
+
+    def _setup_draw(self, x0, seed=0):
+        from lisatools.diagnostic import batched_residual_full_source_and_noise_likelihoods as lik
+        from lisatools.sensitivity import _mat3x3_det_inv
+
+        mv = self.mv
+        rt = mv._batch_device_runtime(None)
+        st = rt["settings"]
+        kappa = float(getattr(st, "logdet_factor", 1.0))
+        a = 4 * st.differential_component
+        tfs = {"psd": mv.psd_transform_fn, "galfor": mv.galfor_transform_fn}
+
+        def crows(rows):
+            ph = {k: np.stack([np.asarray(mv._to_physical(tfs[k], r), float) for r in rows[k]])
+                  for k in rows}
+            return mv._batched_covariance(rt, ph["psd"], ph.get("galfor"), None, np)
+
+        C0 = crows(x0)[:, :, 0]
+        pix = C0.reshape(3, 3, -1).transpose(2, 0, 1)
+        ok = np.all(np.isfinite(pix), axis=(1, 2)) & (np.linalg.det(pix) > 0)
+        L = np.zeros_like(pix)
+        L[ok] = np.linalg.cholesky(pix[ok])
+        rng = np.random.default_rng(seed)
+        d = (L @ rng.normal(size=(pix.shape[0], 3, 1)))[..., 0] * np.sqrt(2 * kappa / a)
+        d = d.T.reshape((1, 3) + C0.shape[2:])
+
+        def lnl(branch, X):
+            rows = {k: (X if k == branch else np.tile(x0[k][0], (X.shape[0], 1)))
+                    for k in self.sampled}
+            C = crows(rows)
+            detC, invC = _mat3x3_det_inv(C, np)
+            invC = np.where(np.isfinite(invC), invC, 0.0)
+            detC = np.where(np.isfinite(detC), detC, 1.0)
+            return np.array([lik(d, None, invC[:, :, [r]], detC[[r]], st)[0]
+                             for r in range(X.shape[0])])
+        return lnl
+
+    def _fisher(self, branch, x0):
+        from lisatools.globalfit.moves.eigen_refresh import prior_box_widths
+
+        widths = prior_box_widths(self.mv.priors[branch], x0[branch].shape[1])
+        other = {k: x0.get(k) for k in self.mv.NOISE_BRANCHES if k != branch}
+        return self.mv._noise_fisher(branch, x0[branch], np.array([0]), other, widths)[0]
+
+    @staticmethod
+    def _curv(lnl, branch, x, i, rel=1e-3):
+        s = rel * abs(x[i])
+        X = np.tile(x, (3, 1))
+        X[0, i] -= s
+        X[2, i] += s
+        v = lnl(branch, X)
+        return -(v[0] + v[2] - 2 * v[1]) / s ** 2
+
+    def test_psd_fisher_matches_the_observed_information_of_a_draw(self):
+        x0 = {k: self.pt[k][[0]].copy() for k in self.sampled}
+        lnl = self._setup_draw(x0)
+        F = self._fisher("psd", x0)
+        for i in range(2):
+            self.assertAlmostEqual(self._curv(lnl, "psd", x0["psd"][0], i) / F[i, i], 1.0,
+                                   delta=0.02)
+        self.assertTrue(np.all(np.linalg.eigvalsh(F) > 0))
+
+    def test_galfor_fisher_is_definite_and_matches_measured_directions(self):
+        x0 = {k: self.pt[k][[0]].copy() for k in self.sampled}
+        x0["galfor"][0, 0] *= 1e8            # a loud foreground
+        lnl = self._setup_draw(x0)
+        F = self._fisher("galfor", x0)
+        self.assertTrue(np.all(np.linalg.eigvalsh(F) > 0))
+        for i in (2, 3):                    # alpha, f_1
+            self.assertAlmostEqual(self._curv(lnl, "galfor", x0["galfor"][0], i) / F[i, i],
+                                   1.0, delta=0.05)
+
+    def test_refresh_routes_through_the_fisher(self):
+        from unittest import mock
+
+        from lisatools.globalfit.moves import eigen_refresh
+
+        mv = self.mv
+        got = {}
+        inner = mock.Mock()
+        inner.set_axes.side_effect = lambda b, ax, sg: got.__setitem__(b, (ax, sg))
+        coords = {k: np.array(mv._work_branch(self.state, k).coords) for k in self.sampled}
+        mv.eigen_info = "fisher"
+        try:
+            with mock.patch.object(mv, "_eigen_inner_move", return_value=inner), \
+                    mock.patch.object(eigen_refresh, "eigen_tables_from_ll_batch") as ll_route:
+                mv._refresh_eigen_tables(coords)
+        finally:
+            mv.eigen_info = None
+        ll_route.assert_not_called()
+        for b in self.sampled:
+            ax, sg = got[b]
+            self.assertTrue(np.all(np.isfinite(ax)) and np.all(sg > 0), b)
+
+
 class PSDDebugChecksGateTest(unittest.TestCase):
     """``PSD_DEBUG_CHECKS`` gates the batched likelihood's non-finite
     covariance validation: on = validates (raises on a violating stack),

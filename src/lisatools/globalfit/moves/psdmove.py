@@ -1791,21 +1791,13 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
             return
         raise ValueError("modulation must be 2D (nch,nch) or 3D (nch,nch,Ntime).")
 
-    def _score_split_batch(
-        self, split, device, walkers, psd_phys, galfor_phys, sgwb_phys
-    ) -> np.ndarray:
-        """Score one shard's walker batch: batched build + batched likelihood.
-
-        Must be called inside ``device``'s context. ``walkers`` are the
-        (unique) physical walker indices owned by ``split``; params are
-        physical-basis host rows."""
-        acs = self.acs
-        xp = acs.xp
-        rt = self._batch_device_runtime(device)
+    def _batched_covariance(self, rt, psd_phys, galfor_phys, sgwb_phys, xp):
+        """``C[3, 3, nb, ...]`` for ``nb`` physical-basis rows on one device
+        (``rt`` = :meth:`_batch_device_runtime`): the PSD_BATCH model the
+        scorer and the noise Fisher both use."""
         settings = rt["settings"]
-        nb = len(walkers)
+        nb = int(np.shape(psd_phys)[0])
         basis_nd = rt["B_oms"].ndim - 2
-
         # instrument: C[..] = Soms_d^2 * B_oms + Sa_a^2 * B_acc, walker axis
         # broadcast (the exact per-walker InstrumentNoise.base_covariance
         # fast path, LISAModel stores the squared levels)
@@ -1828,6 +1820,86 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
             self._add_modulated_mag(C, mag, rt["sgwb_mod"], settings, xp)
         for cov in rt["extra_covs"]:
             C += cov[:, :, None]
+        return C
+
+    def _noise_fisher(self, branch, points, pt_walker, other, widths):
+        """Expected Fisher of the noise likelihood in ``branch``'s SAMPLING
+        basis, one ``(d, d)`` matrix per expansion point:
+
+            F_ij = kappa * sum_pix Tr(C^-1 dC/dx_i C^-1 dC/dx_j)
+
+        with ``kappa = settings.logdet_factor`` (the likelihood's own
+        log-det weight; this is the expected Hessian of
+        ``-1/2 * 4 diff * d^T C^-1 d - kappa * log det C`` when that
+        likelihood is self-consistent). Needs only the MODEL covariance --
+        no residual, so it is positive semi-definite everywhere, unlike the
+        observed information (34 of 55 galfor builds non-positive on the 3mo
+        run). ``dC/dx`` by central differences of :meth:`_batched_covariance`
+        (smooth, noise-free) at ``eigen_eps_rel`` of the prior box; pixels
+        the likelihood drops (non-finite / zero det) are dropped here too.
+
+        ``other[key]`` are the per-point rows of the other noise branches
+        (sampling basis), held fixed. PSD_BATCH route only.
+        """
+        if not self._batched_route_ready():
+            raise RuntimeError("noise Fisher needs the PSD_BATCH route")
+        acs = self.acs
+        xp = acs.xp
+        tfs = {"psd": self.psd_transform_fn, "galfor": self.galfor_transform_fn,
+               "sgwb": self.sgwb_transform_fn}
+        points = np.atleast_2d(np.asarray(points, dtype=np.float64))
+        n_pts, nd = points.shape
+        steps = float(self.eigen_eps_rel) * np.asarray(widths, dtype=float)
+        out = np.zeros((n_pts, nd, nd))
+        for p in range(n_pts):
+            X = np.repeat(points[p][None, :], 2 * nd + 1, axis=0)
+            for i in range(nd):
+                X[2 * i, i] += steps[i]
+                X[2 * i + 1, i] -= steps[i]
+            phys = {}
+            for key in self.NOISE_BRANCHES:
+                rows = X if key == branch else (
+                    None if other.get(key) is None
+                    else np.tile(np.asarray(other[key][p], dtype=float), (X.shape[0], 1)))
+                phys[key] = None if rows is None else np.stack(
+                    [np.asarray(self._to_physical(tfs[key], r), dtype=float) for r in rows])
+            w = int(pt_walker[p])
+            split = int(next(iter(acs._split_rows(np.array([w])))))
+            device = None if acs.gpus is None else int(acs.gpus[split])
+            with device_context(xp, device):
+                rt = self._batch_device_runtime(device)
+                kappa = float(getattr(rt["settings"], "logdet_factor", 1.0))
+                C = self._batched_covariance(
+                    rt, phys["psd"], phys.get("galfor"), phys.get("sgwb"), xp)
+                detC, invC = _mat3x3_det_inv(C[:, :, -1:], xp)
+                keep = (xp.isfinite(detC) & (detC != 0.0))[0]
+                invC = xp.where(xp.isfinite(invC), invC, 0.0)[:, :, 0]
+                A = []
+                for i in range(nd):
+                    dC = (C[:, :, 2 * i] - C[:, :, 2 * i + 1]) / (2.0 * steps[i])
+                    A.append(xp.einsum("ab...,bc...->ac...", invC, dC))
+                del C
+                for i in range(nd):
+                    for j in range(i, nd):
+                        tr = xp.einsum("ab...,ba...->...", A[i], A[j])
+                        v = float(asnumpy(xp.sum(xp.where(keep, tr, 0.0))))
+                        out[p, i, j] = out[p, j, i] = kappa * v
+        return out
+
+    def _score_split_batch(
+        self, split, device, walkers, psd_phys, galfor_phys, sgwb_phys
+    ) -> np.ndarray:
+        """Score one shard's walker batch: batched build + batched likelihood.
+
+        Must be called inside ``device``'s context. ``walkers`` are the
+        (unique) physical walker indices owned by ``split``; params are
+        physical-basis host rows."""
+        acs = self.acs
+        xp = acs.xp
+        rt = self._batch_device_runtime(device)
+        settings = rt["settings"]
+        nb = len(walkers)
+        C = self._batched_covariance(rt, psd_phys, galfor_phys, sgwb_phys, xp)
 
         # batched det/inv + the same sanitization as _setup_det_and_inv
         detC, invC = _mat3x3_det_inv(C, xp)
@@ -2927,6 +2999,14 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
             return True
         return str(raw).strip().lower() not in ("0", "false", "no", "")
 
+    def _eigen_info(self, branch):
+        """``eigen_info`` attribute > ``{BRANCH}_EIGEN_INFO`` env > ``"ll"``.
+        ``"fisher"``: the expected noise Fisher (:meth:`_noise_fisher`)."""
+        val = getattr(self, "eigen_info", None)
+        if val is None:
+            val = os.environ.get(f"{str(branch).upper()}_EIGEN_INFO", "ll")
+        return str(val).strip().lower()
+
     def _refresh_eigen_tables(self, tmp_branches_coords):
         """Per-branch, per-rung eigen tables from likelihood second differences at walker 0.
 
@@ -2987,9 +3067,28 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
                     rows.get("psd"), rows.get("galfor"), rows.get("sgwb"),
                 )
 
-            axes, sigmas = eigen_tables_from_ll_batch(
-                call_ll, point[b], widths, eps_rel=self.eigen_eps_rel
-            )
+            axes = None
+            if self._eigen_info(b) == "fisher":
+                try:
+                    from .eigen_refresh import _tables_from_info_batch
+                    _t0 = time.perf_counter()
+                    info = self._noise_fisher(
+                        b, point[b], pt_walker,
+                        {k: (point[k] if k in point else
+                             (None if k not in fixed else np.tile(fixed[k], (n_pts, 1))))
+                         for k in self.NOISE_BRANCHES if k != b},
+                        widths)
+                    axes, sigmas = _tables_from_info_batch(info, widths)
+                    logger.info("[eigen_refresh] %s: noise Fisher tables at %d point(s) "
+                                "in %.2f s", b, n_pts, time.perf_counter() - _t0)
+                except Exception as exc:  # degrade to the likelihood route
+                    logger.warning("[eigen_refresh] %s noise Fisher failed (%r); using "
+                                   "likelihood second differences", b, exc)
+                    axes = None
+            if axes is None:
+                axes, sigmas = eigen_tables_from_ll_batch(
+                    call_ll, point[b], widths, eps_rel=self.eigen_eps_rel
+                )
             if cold_only:
                 # one table per walker, shared up the ladder; the sigmas are
                 # widened per rung because EigenAxisMove applies no beta
