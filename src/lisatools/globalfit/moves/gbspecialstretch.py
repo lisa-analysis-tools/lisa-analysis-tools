@@ -32406,12 +32406,15 @@ class _CholCache:
     ``SIGHET_INFOMAT_ENGINE=lookup`` (the lookup Gram ``<dh_a|dh_b>``), else
     the chunked delegate (slow; logged).
 
-    MAP: a source is matched in its own (walker, rung) group to the
-    nearest-f0 entry, accepted when amplitude, f0 and Mc (sampling columns
-    0-2) are within ``GB_CHOL_CACHE_TOL`` (default 5) of the entry's own
-    marginal widths; a hit moves the entry's key to the source's current
-    coordinates so the map follows the source. A MISS (an accepted birth, a
-    source moved out of tolerance, a swap partner too different) is computed
+    MAP: a source is matched within its own WALKER (never its rung: a
+    vertical swap only relabels the rung, so the source must keep its entry)
+    to the best of the ``GB_CHOL_CACHE_WINDOW`` (default 32) entries on each
+    side in f0 -- wide enough to span every rung's copy of the same source --
+    accepted when amplitude, f0 and Mc (sampling columns 0-2) are within
+    ``GB_CHOL_CACHE_TOL`` (default 5) of the entry's own marginal widths; a
+    hit moves the entry's key to the source's current coordinates so the map
+    follows the source. A MISS (an accepted birth, a source moved out of
+    tolerance) is computed
     with the block's own route, in one batch per block before the repeats,
     and inserted. The factor is frozen across each block exactly as before,
     so the proposal stays symmetric; a poor match costs acceptance only.
@@ -32429,6 +32432,7 @@ class _CholCache:
         self.every = max(int(os.environ.get("GB_CHOL_CACHE_EVERY", "40") or 40), 1)
         self.tol = float(os.environ.get("GB_CHOL_CACHE_TOL", "5.0") or 5.0)
         self.batch = max(int(os.environ.get("GB_CHOL_CACHE_BATCH", "4096") or 4096), 1)
+        self.window = max(int(os.environ.get("GB_CHOL_CACHE_WINDOW", "32") or 32), 1)
         self.tick = -1
         self.epoch = None
         self.groups = {}
@@ -32471,21 +32475,29 @@ class _CholCache:
             time.perf_counter() - t0, self.tick, self.every,
             os.environ.get("SIGHET_INFOMAT_ENGINE", "") or "default", self.nbytes() / 2**20)
 
+    _FIELDS = ("C", "B", "S", "G")
+
     def nbytes(self):
-        return sum(v.nbytes for g in self.groups.values() for v in g.values()
-                   if v is not None)
+        return sum(g[f].nbytes for g in self.groups.values() for f in self._FIELDS
+                   if g[f] is not None)
 
     @staticmethod
     def _keys(band_sorter, ids):
-        w = _to_numpy(band_sorter.walker_inds[ids]).astype(np.int64)
-        t = _to_numpy(band_sorter.temp_inds[ids]).astype(np.int64)
-        return w * 100000 + t
+        # walker only: the rung is a LABEL that vertical swaps change
+        return _to_numpy(band_sorter.walker_inds[ids]).astype(np.int64)
 
     def _gz(self, move, ids):
         gz = getattr(move, "_obs_gamma_z", None)
         if gz is None or move._obs_eigen_mode() == "off":
             return None
         return _to_numpy(gz[ids])
+
+    @staticmethod
+    def _index(g):
+        # f0 sort order over the filled rows; the stored arrays never move
+        n = g["n"]
+        g["o"] = np.argsort(g["C"][:n, 1], kind="stable")
+        g["f"] = g["C"][:n, 1][g["o"]]
 
     def _insert(self, move, band_sorter, ids, B):
         C = _to_numpy(band_sorter.coords[ids])
@@ -32498,15 +32510,28 @@ class _CholCache:
         for k in np.unique(key):
             m = key == k
             new = {"C": C[m], "B": Bh[m], "S": S[m], "G": None if G is None else G[m]}
+            nm = int(m.sum())
             g = self.groups.get(int(k))
-            if g is not None:
-                new = {f: (None if (v is None or g[f] is None)
-                           else np.concatenate([g[f], v])) for f, v in new.items()}
-            self._store(int(k), new)
-
-    def _store(self, k, g):
-        o = np.argsort(g["C"][:, 1], kind="stable")
-        self.groups[k] = {f: (None if v is None else v[o]) for f, v in g.items()}
+            if g is None:
+                g = {f: (None if v is None else v[:0]) for f, v in new.items()}
+                g["n"] = 0
+            n = g["n"]
+            if n + nm > len(g["C"]):
+                # amortized growth: rows are appended, never copied per block
+                cap = max(2 * (n + nm), 1024)
+                for f in self._FIELDS:
+                    if g[f] is None or new[f] is None:
+                        g[f] = None
+                        continue
+                    buf = np.empty((cap,) + g[f].shape[1:], dtype=g[f].dtype)
+                    buf[:n] = g[f][:n]
+                    g[f] = buf
+            for f in self._FIELDS:
+                if g[f] is not None:
+                    g[f][n:n + nm] = new[f]
+            g["n"] = n + nm
+            self._index(g)
+            self.groups[int(k)] = g
 
     def match(self, band_sorter, ids):
         """``(hit, B, G)`` host arrays for ``ids``; moves hit keys to the sources."""
@@ -32516,15 +32541,15 @@ class _CholCache:
         Bo = np.zeros((n, ndim, ndim))
         Go = None
         key = self._keys(band_sorter, ids)
+        off = np.arange(-self.window, self.window)
         for k in np.unique(key):
             g = self.groups.get(int(k))
-            if g is None or len(g["C"]) == 0:
+            if g is None or g["n"] == 0:
                 continue
             rows = np.nonzero(key == k)[0]
             q = C[rows]
-            f = g["C"][:, 1]
-            j = np.searchsorted(f, q[:, 1])
-            cand = np.stack([np.clip(j - 1, 0, len(f) - 1), np.clip(j, 0, len(f) - 1)], 1)
+            j = np.searchsorted(g["f"], q[:, 1])
+            cand = g["o"][np.clip(j[:, None] + off[None, :], 0, g["n"] - 1)]
             with np.errstate(divide="ignore", invalid="ignore"):
                 d = (np.abs(q[:, None, self._COLS] - g["C"][cand][:, :, self._COLS])
                      / g["S"][cand])
@@ -32542,7 +32567,7 @@ class _CholCache:
                     Go = np.full((n,) + g["G"].shape[1:], np.nan)
                 Go[rows[ok]] = g["G"][e[ok]]
             g["C"][e[ok]] = q[ok]
-            self._store(int(k), g)
+            self._index(g)
         return hit, Bo, Go
 
     def take(self, move, model, band_sorter, ids, slots, buffer_obj):

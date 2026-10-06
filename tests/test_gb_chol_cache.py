@@ -117,15 +117,37 @@ class CholCacheTest(unittest.TestCase):
         self.cache.take(self.m, None, bs, ids, ids, None)
         self.assertEqual(len(self.m.calls), 1)
 
-    def test_out_of_tolerance_and_other_group_are_misses(self):
+    def test_out_of_tolerance_and_other_walker_are_misses(self):
         c = self.c.copy()
         c[0, 0] += 2 * self.cache.tol * SIG[0]       # amplitude jump
-        t = self.t.copy()
-        t[1] = 7                                     # a rung with no entries
-        bs = _Sorter(c, self.w, t)
+        w = self.w.copy()
+        w[1] = 7                                     # a walker with no entries
+        bs = _Sorter(c, w, self.t)
         ids = np.arange(len(c))
         self.cache.take(self.m, None, bs, ids, ids, None)
         self.assertEqual(sorted(self.m.calls[0][0].tolist()), [0, 1])
+
+    def test_a_vertical_swap_relabel_keeps_the_sources_own_factor(self):
+        """Every source of the population gets a NEW rung label (and a copy of
+        each sits on every rung at nearly the same f0): each must still get
+        its OWN factor, with no compute."""
+        reps = 24
+        c = np.repeat(self.c, reps, axis=0)
+        c[:, 1] += 1e-9 * np.tile(np.arange(reps), len(self.c))   # rung copies
+        c[:, 3] = 1000.0 + np.arange(len(c))                      # own markers
+        w = np.repeat(self.w, reps)
+        t = np.tile(np.arange(reps), len(self.c))
+        cache = G._CholCache(("gb", "off", False))
+        cache.due(0)
+        cache.refresh(self.m, None, _Sorter(c, w, t))
+        self.m.calls.clear()
+        perm = np.random.default_rng(3).permutation(len(c))
+        t2 = np.roll(np.arange(reps), 5)[t]                       # relabel every rung
+        bs = _Sorter(c[perm], w[perm], t2[perm])
+        ids = np.arange(len(c))
+        chol = cache.take(self.m, None, bs, ids, ids, None)
+        self.assertEqual(self.m.calls, [])
+        np.testing.assert_array_equal(self._marker(chol), c[perm, 3])
 
     def test_global_ticker(self):
         self.assertFalse(self.cache.due(39))
