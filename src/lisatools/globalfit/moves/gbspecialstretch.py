@@ -7106,13 +7106,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         min-lnL walker is a systematically atypical one, so fitting it every
         epoch shapes the birth grid around the ensemble's worst state. A
         random cold walker per epoch spreads the fits over the posterior.
+
+        ``GB_FSTAT_PE_REF=max`` fits the max-lnL cold walker instead -- a
+        manual one-relaunch override (Mike 2026-10-07: pair it with
+        ``GB_FSTAT_FORCE_REFIT=1`` to refit the PE grid on a walker other
+        than the min-lnL one the earlier epochs used).
         """
         if self.fstat_search_residual:
             return "min"
         rule = os.environ.get("GB_FSTAT_PE_REF", "random").strip().lower()
-        if rule not in ("random", "min"):
+        if rule not in ("random", "min", "max"):
             raise ValueError(
-                f"GB_FSTAT_PE_REF must be 'random' or 'min'; got {rule!r}")
+                f"GB_FSTAT_PE_REF must be 'random', 'min' or 'max'; got {rule!r}")
         return rule
 
     def _fstat_fit_ref_from(self, lls, epoch=None):
@@ -7162,7 +7167,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         the argmin.
         """
         lls = np.asarray(lls, dtype=float).reshape(-1)
-        if epoch is not None and self._fstat_fit_ref_rule() == "random":
+        rule = self._fstat_fit_ref_rule() if epoch is not None else "min"
+        if rule == "max":
+            finite = np.where(np.isfinite(lls), lls, -np.inf)
+            return int(np.argmax(finite))
+        if rule == "random":
             pool = np.flatnonzero(np.isfinite(lls))
             if pool.size == 0:
                 pool = np.arange(lls.size)
@@ -7234,10 +7243,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # DELEGATE, do not re-derive: ``_fstat_reference_walker`` is the
             # local-ranking entry point (subclasses and tests override it)
             # and it now carries the same min/max mode switch this method
-            # applies to the gathered vector below. The PE random rule is the
-            # exception: it needs the epoch, which the local entry point does
-            # not take, so it ranks this process's ACA (every walker) here.
-            if epoch is not None and self._fstat_fit_ref_rule() == "random":
+            # applies to the gathered vector below. The PE random / max rules
+            # are the exception: they need the epoch, which the local entry
+            # point does not take, so they rank this process's ACA (every
+            # walker) here.
+            if epoch is not None and self._fstat_fit_ref_rule() != "min":
                 w = self._fstat_fit_ref_from(
                     _to_numpy(model.analysis_container_arr.likelihood()),
                     epoch)
@@ -30021,6 +30031,23 @@ _FSTAT_GRID_REGISTRY: dict = {}
 _FSTAT_CTR_TABLE_REGISTRY: dict = {}
 
 
+#: Fit dirs this process has already force-refitted under
+#: ``GB_FSTAT_FORCE_REFIT=1`` (one forced epoch per dir per process).
+_FSTAT_ENV_FORCED_ROOTS: set = set()
+
+
+def _claim_env_forced_refit(root) -> bool:
+    """True exactly once per process and fit dir while
+    ``GB_FSTAT_FORCE_REFIT=1``."""
+    if os.environ.get("GB_FSTAT_FORCE_REFIT", "0").strip() != "1":
+        return False
+    key = os.path.abspath(str(root))
+    if key in _FSTAT_ENV_FORCED_ROOTS:
+        return False
+    _FSTAT_ENV_FORCED_ROOTS.add(key)
+    return True
+
+
 def _evict_fstat_epochs(root, keep):
     """Drop every entry of both F-stat registries under fit dir ``root``
     except the epoch dir ``keep``.
@@ -30518,6 +30545,17 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
                 return int(json.load(f).get("clock", 0))
         except (OSError, ValueError, TypeError):
             return 0
+
+    def _epoch_manifest_walker(self, k: int):
+        """The GLOBAL walker epoch ``k``'s grid was fitted to (its DONE.json
+        ``walker_ref``), or ``None`` when the manifest is missing, unreadable
+        or records none (the ``_already_fitted`` short circuit writes None)."""
+        try:
+            with open(os.path.join(self._epoch_dir(k), "DONE.json")) as f:
+                w = json.load(f).get("walker_ref")
+            return None if w is None else int(w)
+        except (OSError, ValueError, TypeError):
+            return None
 
     @staticmethod
     def _epoch_complete(d: str) -> bool:
@@ -31334,6 +31372,16 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
                 _cached = getattr(self, "_fstat_epoch_reference", None)
                 if _cached is not None and int(_cached[0]) == int(k):
                     _k0, w_global, owner_rank, local_index = _cached
+                elif self._epoch_manifest_walker(k) is not None:
+                    # A loaded epoch: score the centres through the walker
+                    # its DONE.json says the grid was fitted to, whatever
+                    # rule (random / min / a one-off GB_FSTAT_PE_REF=max)
+                    # picked it then.
+                    w_global = self._epoch_manifest_walker(k)
+                    fan = getattr(self, "fanout", None)
+                    owner_rank, local_index = (
+                        fan.layout.owner_of(w_global)
+                        if fan is not None and fan.is_head else (0, w_global))
                 else:
                     # epoch=k: under the PE random rule this re-derives the
                     # walker the epoch was fitted to (the draw is per epoch).
@@ -31545,6 +31593,20 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         _forced = self._consume_forced_refit()
         if _forced is not None:
             action, k = "fit", _forced
+        # GB_FSTAT_FORCE_REFIT=1 (manual, 2026-10-07): refit as a NEW epoch
+        # at the first setup of this process, instead of loading the latest
+        # one -- once per fit dir, so the other moves sharing the dir then
+        # load/reuse the new epoch. Leave it off the next launch line, or
+        # every restart refits again.
+        if (action != "fit"
+                and os.environ.get("GB_FSTAT_FORCE_REFIT", "0").strip() == "1"
+                and _claim_env_forced_refit(self._fstat_root)):
+            k_latest = self._latest_epoch()
+            action, k = "fit", (0 if k_latest is None else int(k_latest) + 1)
+            logger.info(
+                "%s: GB_FSTAT_FORCE_REFIT=1 -- fitting F-stat epoch %d now "
+                "instead of loading the latest (once per process; reference "
+                "rule %r).", self.name, k, self._fstat_fit_ref_rule())
         if action == "skip":
             return
 

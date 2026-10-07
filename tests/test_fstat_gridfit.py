@@ -1163,6 +1163,9 @@ class CtrTableGBFreeTest(unittest.TestCase):
             self.events.append("global_reference")
             return 6, 3, 2, np.arange(8, dtype=float)
 
+        def _epoch_manifest_walker(self, k):
+            return None          # no DONE.json walker: gather the reference
+
         def _fstat_ref_row_fanout(self, model, branches, w, owner, local):
             self.events.append("ref_row")
             self._fstat_ref_holder = object()

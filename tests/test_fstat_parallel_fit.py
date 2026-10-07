@@ -822,12 +822,75 @@ class PERandomReferenceTest(unittest.TestCase):
         self.assertEqual(w, want)
         self.assertEqual((owner, local), layout.owner_of(want))
 
+    def test_max_rule_takes_the_highest_finite_lnl_and_only_with_an_epoch(self):
+        lls = [5.0, np.nan, 9.0, np.inf * -1, 7.0]
+        with self._env(GB_FSTAT_PE_REF="max"):
+            self.assertEqual(self._move()._fstat_fit_ref_from(lls, 4), 2)
+            self.assertEqual(self._move()._fstat_fit_ref_from(self.LLS, 4), 0)
+            self.assertEqual(self._move()._fstat_fit_ref_from(self.LLS), 6)
+            self.assertEqual(self._move(search=True)._fstat_fit_ref_from(self.LLS, 4), 6)
+
     def test_the_fit_and_the_centre_table_pass_the_epoch(self):
         from lisatools.globalfit.moves import gbspecialstretch as gbs
 
         src = inspect.getsource(gbs.GBSpecialRJFStatGridMove)
         self.assertEqual(src.count("self._fstat_global_reference(model, epoch=k)"), 2)
         self.assertNotIn("self._fstat_global_reference(model))", src)
+
+
+class EnvForcedRefitTest(unittest.TestCase):
+    """``GB_FSTAT_FORCE_REFIT=1`` (manual, 2026-10-07): the first setup of a
+    process fits a NEW epoch instead of loading the latest, once per fit
+    dir; a loaded epoch's centre table scores through its DONE.json walker."""
+
+    def setUp(self):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        self.gbs = gbs
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.addCleanup(gbs._FSTAT_ENV_FORCED_ROOTS.clear)
+        gbs._FSTAT_ENV_FORCED_ROOTS.clear()
+        root = self.tmp
+
+        class _Move(gbs.GBSpecialRJFStatGridMove):
+            _fstat_root = root
+
+        self.move = _Move.__new__(_Move)
+        self.move.name = "gb_test"
+        self.calls = []
+        self.move._fstat_fit_decision = lambda: ("load", 3)
+        self.move._consume_forced_refit = lambda: None
+        self.move._latest_epoch = lambda: 3
+        self.move._setup_epoch = lambda model, br, action, k: self.calls.append((action, k))
+        self.move._fstat_release_ref_row = lambda: None
+
+    def _setup_twice(self, env):
+        with mock.patch.dict(os.environ, env):
+            self.move.setup(None, {})
+            self.move.setup(None, {})
+        return self.calls
+
+    def test_forces_one_new_epoch_per_process(self):
+        self.assertEqual(self._setup_twice({"GB_FSTAT_FORCE_REFIT": "1"}),
+                         [("fit", 4), ("load", 3)])
+
+    def test_off_by_default(self):
+        env = {k: v for k, v in os.environ.items() if k != "GB_FSTAT_FORCE_REFIT"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.move.setup(None, {})
+        self.assertEqual(self.calls, [("load", 3)])
+
+    def test_manifest_walker_and_the_centre_table_wiring(self):
+        d = os.path.join(self.tmp, "epoch_0003")
+        os.makedirs(d)
+        with open(os.path.join(d, "DONE.json"), "w") as f:
+            json.dump({"epoch": 3, "walker_ref": 2}, f)
+        self.move._epoch_dir = lambda k: os.path.join(self.tmp, f"epoch_{k:04d}")
+        self.assertEqual(self.move._epoch_manifest_walker(3), 2)
+        self.assertIsNone(self.move._epoch_manifest_walker(4))     # no manifest
+        src = inspect.getsource(self.gbs.GBSpecialRJFStatGridMove._install_ctr_table)
+        self.assertIn("self._epoch_manifest_walker(k)", src)
 
 
 class FakeCommBcastTest(unittest.TestCase):
