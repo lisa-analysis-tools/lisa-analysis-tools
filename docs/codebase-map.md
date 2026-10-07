@@ -1,6 +1,9 @@
 # LISAanalysistools (`lisatools`) — Codebase Map
 
 _Last mapped: 6e7739e · 2026-07-10 · regenerate when structure changes_
+_(targeted additions since: the eigen / information-matrix routes,
+`GB_CHOL_CACHE`, the PSD_BATCH method rule, the F-stat refit memory
+fixes and the PE refit reference walker, 2026-10-06)_
 
 Central LISA-physics library for LISA Analysis Tools. All structural claims below were
 verified against current source under `src/lisatools/` (imports, class defs,
@@ -46,8 +49,11 @@ package.
 | `jax/` | Pure-JAX backend (`backend.py`, `jaxbase.py`, `orbits.py`) + `response/` and `wdm/` JAX mirrors. |
 | `cutils/` | All C++/CUDA sources + nanobind bindings + public headers (see §5). |
 | `sources/` | Per-source waveform generators: `bbh/`, `emri/`, `gb/`, `sobbh/`, plus `waveformbase.py`, `defaultresponse.py`, `utils.py`. `bbh/gridaligned.py` (`GridAlignedPhenomTHMTDIWaveform`, the only generator with `supports_batch`) evaluates every walker on one shared absolute data lattice so `pyResponseTDI` can batch them; `batching.py` (`BatchedDomainSignalGen`) adapts it to a `signal_gen` returning one `DomainBase` with a leading source axis. Batching is opt-in via `supports_batch` (default-deny at the read site) and refusals raise `BatchNotLaunchable` (PR #81/#82, 2026-09). |
-| `sampling/` | Eryn-based MCMC pieces: `prior.py`, `likelihood.py`, `gmm.py`, `stopping.py`, `fstat_proposal.py` (`FStatProposal4D` grid+inverse-CDF proposal over GB intrinsics + RJ-birth container helpers), `f0_mchirp_prior.py` (`F0McGMMSampling` astrophysical joint (f0, Mc) GB prior from the population heatmap GMM, box-truncated + renormalized), `moves/`. |
+| `sampling/` | Eryn-based MCMC pieces: `prior.py`, `likelihood.py`, `gmm.py`, `stopping.py`, `fstat_proposal.py` (`FStatProposal4D` grid+inverse-CDF proposal over GB intrinsics + RJ-birth container helpers; `StackedFStatProposal4D` keeps its cell log-weights on the grid's device but its flattened sampling CDF on the HOST since 2026-10-06 -- only `rvs` searchsorts it, same draws), `f0_mchirp_prior.py` (`F0McGMMSampling` astrophysical joint (f0, Mc) GB prior from the population heatmap GMM, box-truncated + renormalized), `moves/`. |
 | `globalfit/` | The global-fit pipeline (engine, run, recipe, per-branch modules, `moves/`, `priors/`, `stock/`). See §3–4. `globalfit/communication/` (`ranks.py`, `fanout.py`, `fakecomm.py`, `walkerslice.py`, `rowfanout.py`) is the multi-rank walker-block layer — rank roles, layout, device pinning, and the head↔compute fan-out; `rowfanout.py` (`RowFanout`) is the one-walker-replica row-scatter primitive (`run(op, rows, *, local_body)` splits row batches across compute ranks and concatenates in row order, `replay(op, payload, *, local_body)` broadcasts to every rank) used by the addremove/PSD scoring seams; see [`docs/global-fit-launch.md`](global-fit-launch.md) (roles/knobs) and [`docs/multirank-cluster-gates.md`](multirank-cluster-gates.md) (cluster validation runbook). `moves/mbhbatchedmove.py` (`MBHBatchedLikeMove`): MBH add/remove move scored through one batched grid-aligned response launch per chunk on a per-leaf 90 d / 10 d window with a segment WDM transform, per-walker residual+PSD; the DEFAULT MBH scoring path since 2026-09-30 (`MBH_LIKELIHOOD=auto` -> batched on WDM legacy-response runs, `full` with one INFO reason line for `USE_TDIONFLY=1` / a non-WDM domain / a conflicting `MBH_WAVEFORM_DURATION`; `MBH_BATCH_MAX_SIZE` 8; a data span shorter than the window is clamped by `mbh_window_layers`, not refused; `MBH_WINDOW_DECIMATE` = the window's lattice decimation factor (default 1) generates / responds / WDM-transforms the window at decimation*dt on Nf/decimation layers -- same pixels -- with the epoch snapped onto that lattice for both generators, `sources/batching.py` `MBHWindowedWDMSignalGen(decimate=...)`). `moves/emridirectmove.py` (`EMRIDirectLikeMove`): EMRI add/remove move scored through the direct-to-WDM template (`sources/emri/direct_signal_gen.py` `EMRIDirectWDMSignalGen` around `sources/emri/wdm_direct.py` `EMRIDirectWDM`), chunks of `EMRI_BATCH_MAX_SIZE` rows, per-walker residual+PSD; the engine's EMRI templates (fills, residual rebuilds) are the direct template too, the cross-check stays on the production wrap; the default since 10-03 (`EMRI_LIKELIHOOD=auto` -> direct on WDM / XYZ runs, `full` with one INFO reason line otherwise), see [`docs/emri-direct-wdm.md`](emri-direct-wdm.md); its n_ref table is found or built once by `wdm_lookup_store.py` (`ensure_lookup_table`: pointer or run-folder canonical name, lock + atomic rename). |
+| `globalfit/moves/eigen_refresh.py`, `eigen_table_persist.py` + the information-matrix routes | Eigen inner-move tables `(axes, sigmas)` from an information matrix (`_tables_from_info_batch`: whiten, eigen axes, prior cap) and their run sidecar. Which matrix: `addremovemove.py` `ResidualAddOneRemoveOneMove._build_eigen_table` -- default `"ll"` (likelihood second differences, `{BRANCH}_EIGEN_SCOPE`), opt-in `{BRANCH}_EIGEN_INFO=gram` (`_build_eigen_table_gram` / `_gram_info`: `<dh_a\|dh_b>` of the move's own templates through per-move `_gram_templates` hooks in `sobbhspecialmove.py`, `emridirectmove.py`, `mbhbatchedmove.py`; step tuning `{BRANCH}_EIGEN_GRAM_TARGET`); `psdmove.py` -- opt-in `{PSD,GALFOR}_EIGEN_INFO=fisher` (`_noise_fisher`, the expected Fisher of `_batched_covariance`). Both opt-ins fall back to `"ll"` on any error. Full map, numbers, knobs and status: [`docs/eigen-info-routes.md`](eigen-info-routes.md). |
+| `globalfit/moves/gb_chol_cache.py` | `GB_CHOL_CACHE` (default off; on in the 6mo / 1yr v9 launchers): host-resident GB in-model proposal factors (+ observable-eigen `Gamma_z`), one cache per rank and branch shared by every GB move, entries keyed by walker + coordinates and moved with their source; all alive sources rebuilt every `GB_CHOL_CACHE_EVERY` proposes through the slot-free lookup Gram (GBGPU `SIGHET_INFOMAT_ENGINE=lookup`, which needs `SIGHET_REF_BUILD=lookup`); any error disables it and unsets the engine switch. Hooks in `gbspecialstretch.py` (`_chol_cache`, `_ensure_proposal_tables`, `_proposal_cholesky`). Tests `tests/test_gb_chol_cache.py`. |
+| `globalfit/moves/psdmove.py` (PSD_BATCH) | The walker-batched noise scorer (`PSD_BATCH`, default 1) builds one covariance stack per shard (`_batched_covariance`, shared with the noise Fisher). Since 290c1902 (2026-10-06) its galfor / SGWB magnitudes follow the backend's `WDM_PSD_METHOD` (`_batched_stochastic_mag`: `fold` = the batched exact fold, anything else -- production `layer_calibrated` -- per row through the per-walker components' `_wdm_stationary_psd_column`), so the noise moves score the same model as every other move. Parity `tests/test_psd_move_batched.py` (rtol 1e-12, fold and layer_calibrated). |
 | `utils/` | `parallelbase.py` (`LISAToolsParallelModule`), `constants.py`, `utility.py` (`get_array_module`, `AET`, `asnumpy`), `typing.py`, `exceptions.py` (`LISAToolsException`, `WaveformDomainError`, `BatchNotLaunchable`), `stagetimer.py` (device-synced stage timers for the MBH TDI-on-the-fly path, inert unless `MBHTDIONFLY_TIMING=1`). |
 | `orbit_files/` | Packaged orbit data. |
 
@@ -283,7 +289,19 @@ templated kernels.
   the global reference walker's residual + inverse-PSD row to every rank,
   split each Mc group's stage-B sweep by contiguous box range, then drop the
   row, the scorer and its comp-side reference blocks everywhere. Runbook:
-  `docs/multirank-cluster-gates.md` Step 5.
+  `docs/multirank-cluster-gates.md` Step 5. F-stat refit memory (6mo jobs
+  730 / 738 OOMs): before a refit builds epoch k, the move drops its
+  installed proposal and centre table, `_evict_fstat_epochs` removes every
+  other epoch of its fit dir from the process-wide `_FSTAT_GRID_REGISTRY` /
+  `_FSTAT_CTR_TABLE_REGISTRY` (keyed by epoch dir, never evicted before), and
+  the memory pool is freed (`tests/test_fstat_refit_releases_grid.py`).
+  F-stat epoch reference walker (`_fstat_fit_ref_rule` /
+  `_fstat_fit_ref_from`): search refits always fit the MIN-lnL cold walker;
+  PE refits default to a uniformly RANDOM cold walker per epoch
+  (`GB_FSTAT_PE_REF=random`, 2026-10-06), seeded by
+  (`GB_FSTAT_PE_REF_SEED`, default 0; epoch) so restarts and every rank
+  re-derive the same walker; `GB_FSTAT_PE_REF=min` restores the min-lnL
+  rule in PE. The per-propose distance-birth centre keeps the min.
 - **Backend implementation hierarchy**: GPU C++ leads → CPU C++ mirrors via
   `#ifdef` → JAX diverges internally but must match C++ inner products
   (reldiff ≲ 1e-12). Narrowband WDM validation via `mm5`/`mm2`.
@@ -308,6 +326,7 @@ templated kernels.
 | Global-fit run config / stock variants | `globalfit/stock/base.py`, `globalfit/stock/erebor/`, `.../variants/` |
 | Global-fit engine / run loop / recipe | `globalfit/engine.py`, `globalfit/run.py`, `globalfit/recipe.py`, `globalfit/hdfbackend.py` |
 | MCMC moves (GB/MBH/PSD special moves) | `globalfit/moves/`, `sampling/moves/`, `sampling/prior.py` |
+| Proposal information matrices / eigen tables (which route, which knob) | [`docs/eigen-info-routes.md`](eigen-info-routes.md); `globalfit/moves/eigen_refresh.py`, `addremovemove.py`, `psdmove.py`, `gb_chol_cache.py` |
 | Downstream C++ header consumption (GBGPU/BBHx) | `cutils/orbits_view.hpp`, `cutils/lisatools_header_abi.hpp`, `get_include()` in `__init__.py` |
 | JAX response / WDM implementations | `jax/response/`, `jax/wdm/` |
 | Tests for a subsystem | `tests/` (`test_detector`, `test_sensitivity`, `test_wdm_domain_cpp`, `test_stock_globalfit`, `test_gb_likelihood_engine`, …) |

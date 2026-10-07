@@ -1464,6 +1464,25 @@ class ThreeMonthTwinTest(unittest.TestCase):
             "GF_MONITOR_PAGE",
             "GB_INMODEL_SETUP_BATCH", "GB_SIGHET_FOLD_MAX_BYTES",
             "GB_INFOMAT_MEMPOOL_FREE", "GB_INMODEL_BATCH_MEMPOOL_FREE",
+            # 6mo-v8 RUN tuning, 2026-09-20..23, after this 3mo v8 arm's last
+            # sync (09-19) and never carried back: both v8 scripts were then
+            # superseded by the v9 pair (submit_gf_3mo_v9_2gpu.sh 09-26,
+            # ThreeMonthV9TwinTest). Recorded here, not ported, because the
+            # 3mo v8 arm is retired and porting would change what it runs.
+            #   2c815dd6 09-20  GB_OPT_SNR_LIMIT_SEARCH 5.0, GB_SEARCH_SOURCE_EVERY 10
+            #   17d0b1dc 09-20  GB_RJ_PHASE_MAXIMIZE 1 -> 0 (6mo test)
+            #   369f4904 09-21  GB_FSTAT_REFIT_EVERY 40, FSTAT_GRID_MEM_MB 512
+            #   b73a6ab4 09-22  GB_SEARCH_NOISE_ITERS_PER_STEP 100,
+            #                   GB_PE_RJ_FSTAT_FRACTION 0.5
+            #   52eb1e38 09-23  GB_SEARCH_PRIOR_REMOVAL_ONLY (new knob)
+            #   a456fa27 09-23  MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM=0 (pins the
+            #                   6mo v8-lineage store's arm model)
+            #   129d8b78 09-23  FSTAT_PEAK_MIN_SNR 6.25
+            "GB_OPT_SNR_LIMIT_SEARCH", "GB_SEARCH_SOURCE_EVERY",
+            "GB_RJ_PHASE_MAXIMIZE", "GB_FSTAT_REFIT_EVERY", "FSTAT_GRID_MEM_MB",
+            "GB_SEARCH_NOISE_ITERS_PER_STEP", "GB_PE_RJ_FSTAT_FRACTION",
+            "GB_SEARCH_PRIOR_REMOVAL_ONLY", "MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM",
+            "FSTAT_PEAK_MIN_SNR",
         }
         keys = (set(self.three) | set(self.six)) - {"_", "SHLVL", "PWD"}
         diff = {k for k in keys
@@ -1479,7 +1498,10 @@ class ThreeMonthTwinTest(unittest.TestCase):
         for knob, value in (("VGB_CHIRP_MASS_BASIS", "1"),
                             ("VGB_SIGHET_INMODEL", "1"),
                             ("VGB_INMODEL_PROPOSAL", "observable"),
-                            ("GB_INMODEL_OBSERVABLE_EIGEN", "full"),
+                            # full -> axis in BOTH v8 scripts (f8ab2f33,
+                            # 2026-09-19: "full" let one ill-conditioned
+                            # eigen axis contaminate every joint step)
+                            ("GB_INMODEL_OBSERVABLE_EIGEN", "axis"),
                             ("GB_LEAF_CAP_MIN_ITERS", "3"),
                             ("NWALKERS", "4"),
                             ("SIGHET_TUKEY_ALPHA", "0.01"),

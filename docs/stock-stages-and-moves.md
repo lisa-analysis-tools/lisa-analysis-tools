@@ -271,6 +271,11 @@ plain-function path, see "The simplest entrances first" above.
   stage's moves are bundled.
 - **In-model updates ride inside the GB RJ moves** (`num_repeat_proposals`), so
   you rarely add a separate "in-model" move for GB.
+- **The in-model proposals of `mbh_pe` / `emri_pe` / `sobbh_pe` / `psd_pe` /
+  `galfor_pe` (and GB's in-model blocks) are shaped by an information matrix**
+  whose route is a knob, not a move: `{BRANCH}_EIGEN_INFO` for the eigen
+  tables, `SIGHET_INFOMAT_ENGINE` / `GB_CHOL_CACHE` for GB. See
+  [`docs/eigen-info-routes.md`](eigen-info-routes.md).
 - **Edit freely, validate early.** Duplicate names, empty stages, bad `kind`,
   and conflicting placement all raise at edit/materialize time with actionable
   messages.

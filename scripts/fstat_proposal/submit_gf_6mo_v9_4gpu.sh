@@ -795,6 +795,11 @@ export BASE_FILE_NAME=gf_prod_6mo
 # ---- v8 noise model (the whole v8-vs-v7 diff) -------------------------------
 export UNEQUAL_ARM=1
 export UNEQUAL_ARM_STRIDE=200
+# Since LAT 290c1902 (2026-10-06) the walker-batched noise scorer (PSD_BATCH,
+# code default 1) folds galfor with THIS method too; before, it always used
+# the exact fold while every other move scored the quadrature (synthetic
+# check on the 6-month grid: 4e-4 lnL at the galfor estimate, up to 0.3 lnL
+# across wide prior draws).
 export WDM_PSD_METHOD=layer_calibrated
 export GALFOR_MODULATION_PATH="$PWD/scripts/noise/modulation_unequal.dat"
 export GALFOR_MODULATION_T0=data
@@ -2219,21 +2224,57 @@ export GB_SIGHET_SWEEP_MAX_SRC=512
 
 export SIGHET_INFOMAT=1
 export GB_INFOMAT_PER_BLOCK=1
-# ---- CACHED PROPOSAL FACTORS + LOOKUP GRAM (2026-10-05) ----------------
-# GB_CHOL_CACHE=1: in-model proposal factors (and the observable-eigen
-# Gamma_z) live in HOST memory per rank, matched to their living source
-# (same walker + rung, nearest f0, amplitude/f0/Mc within
-# GB_CHOL_CACHE_TOL marginal widths). ALL alive sources are rebuilt together
-# every GB_CHOL_CACHE_EVERY proposes on a global ticker (40 x 25 repeats =
-# ~1000 steps); births / unmatched sources are computed per block, in one
-# batch before the repeats. Watch "[GB_CHOL_CACHE] refreshed ..." (time per
-# refresh) and "... hits / ... misses" lines; a "DISABLED" warning means it
-# fell back to the old per-block factors (run continues).
-# SIGHET_INFOMAT_ENGINE=lookup: the factor is the Gram/Fisher <dh_a|dh_b>
-# from lookup-table fills (GBGPU lookup information_matrix, Tobs-scaled f0 /
-# fdot steps) instead of second differences of lnL; needs the lookup table
-# attached (SIGHET_REF_BUILD=lookup). Set GB_CHOL_CACHE=0 /
-# SIGHET_INFOMAT_ENGINE= on the launch line to go back.
+# ---- LOOKUP-BUILT SIG-HET + CACHED PROPOSAL FACTORS (2026-10-05) --------
+# Six knobs; the first four differ from the CODE defaults (fd / chunked /
+# unset / 0), EVERY and TOL pin the code defaults. All six yield to the
+# launch line. Map of every eigen / information-matrix route:
+# docs/eigen-info-routes.md.
+#
+# SIGHET_REF_BUILD=lookup (Settings field sighet_ref_build; code default
+#   "fd"). The sig-het v5 carrier reference (c0 / c1) is read from the GB
+#   WDM lookup table instead of an FD transform per source: ~55x cheaper per
+#   reference on CPU, scores equal to the FD build to the table's ~1e-6.
+#   Attaches the lookup table to the sig-het engine
+#   (GB_LOOKUP_TABLE_PATH / GB_LOOKUP_TABLE_DIR, built once under a lock),
+#   which the two knobs below need. Needs GBGPU >= 84f06bf.
+# SIGHET_ANCHOR_ENGINE=lookup (Settings field sighet_anchor_engine; code
+#   default "chunked"). The sig-het anchor from the same table, ~10x cheaper
+#   per reference. REFUSES at build without SIGHET_REF_BUILD=lookup.
+# SIGHET_INFOMAT_ENGINE=lookup (GBGPU env, read per call; code default
+#   unset). The GB in-model proposal factor becomes the Gram / expected
+#   Fisher <dh_a|dh_b> from 2 lookup fills per parameter (GBGPU
+#   GBLookupComputations.information_matrix; f0 / fdot steps 1e-4/Tobs and
+#   1e-4/Tobs^2) instead of the sig-het second differences of lnL
+#   (SIGHET_INFOMAT=1 above). No in-model block or buffer slot needed, which
+#   is what lets GB_CHOL_CACHE build every alive source in one batch. Needs
+#   the attached table; GBGPU >= 376c94f on GPU (with f8073ce alone the
+#   first cache refresh raised on cupy and the cache disabled itself, job
+#   735). NOTE the `-` (not `:-`) expansion: a set-EMPTY
+#   SIGHET_INFOMAT_ENGINE= on the launch line is how to turn it OFF.
+# GB_CHOL_CACHE=1 (code default 0). In-model proposal factors (and the
+#   observable-eigen Gamma_z) live in HOST memory, one cache per rank and
+#   branch shared by every GB move (src/lisatools/globalfit/moves/
+#   gb_chol_cache.py), each entry mapped to its living source: same WALKER
+#   (never rung -- a vertical swap only relabels it), best of the
+#   GB_CHOL_CACHE_WINDOW (default 32) f0-neighbours each side, sampling
+#   columns 0-2 (amplitude / f0 / Mc) within GB_CHOL_CACHE_TOL of the entry's
+#   own marginal widths; a hit moves the entry's key with the source, and
+#   keys are re-tracked at each block's end. Births and unmatched sources
+#   are computed per block, in one batch before the repeats. The factor is
+#   still frozen across each block (symmetric proposal). GB only (VGB keeps
+#   the per-block factors).
+# GB_CHOL_CACHE_EVERY=40. ALL alive sources are rebuilt together (in
+#   GB_CHOL_CACHE_BATCH, default 4096, chunks) every 40 proposes on a
+#   global ticker -- the largest move.time -- i.e. ~1000 in-model steps at
+#   25 repeats.
+# GB_CHOL_CACHE_TOL=5. Match tolerance, in marginal widths.
+# Job 738 (all of it on): misses ~1.5-2 %, inmodel_cholesky 53 -> ~5 s per
+# propose, iteration 6.6 -> 5.5 min.
+# WATCH: "[GB_CHOL_CACHE] refreshed N sources in X s" (per refresh), the
+# "... hits / ... misses" lines, and "DISABLED" -- any error disables the
+# cache AND unsets SIGHET_INFOMAT_ENGINE, so the run continues on the old
+# direct per-block factors. Back out on the launch line with
+# GB_CHOL_CACHE=0 SIGHET_INFOMAT_ENGINE=
 export SIGHET_REF_BUILD=${SIGHET_REF_BUILD:-lookup}
 export SIGHET_ANCHOR_ENGINE=${SIGHET_ANCHOR_ENGINE:-lookup}
 export SIGHET_INFOMAT_ENGINE=${SIGHET_INFOMAT_ENGINE-lookup}
@@ -3704,6 +3745,16 @@ export GB_FSTAT_REFIT_EVERY=2      # SEARCH stages: every 2nd iteration
 # spacing is the first rj_fstat_pe draw at or after 50) -- user ruling
 # 2026-10-02: "during PE fstat should refit every 50 iterations" (was 250).
 export GB_FSTAT_REFIT_EVERY_PE=50
+# WHICH WALKER A PE REFIT FITS (code default, NOT exported; user ruling
+# 2026-10-06): GB_FSTAT_PE_REF=random (default) fits each PE epoch to a
+# uniformly RANDOM cold walker with a finite lnL instead of the min-lnL one --
+# in PE every walker is a posterior sample, and refitting the min-lnL walker
+# every epoch shaped the birth grid around the ensemble's worst state. The
+# draw is seeded by (GB_FSTAT_PE_REF_SEED, default 0, epoch), so a restart
+# or another rank re-derives the SAME walker for an epoch (checkpoint
+# fingerprint, centre table on a load). GB_FSTAT_PE_REF=min restores the
+# min-lnL rule in PE. Search refits always take the min-lnL walker, and the
+# per-propose distance-birth centre keeps the min in both.
 export FSTAT_PEAKS_PER_BAND=200    # per-sub-band peak cap (code default; explicit)
 # STAGE-B STACK CHUNKING -- fixes the 2026-09-21 epoch-9 OOM.
 # StackedFStatProposal4D.__init__ corner-averages the ENTIRE K-box 4-D grid
@@ -3864,6 +3915,9 @@ export GB_USE_GALAXY_PRIOR=1
 # sanitization, same-device repack), which cuts the cost of EACH call.
 export PSD_NUM_PROP_REPEATS=10
 export GALFOR_NUM_PROP_REPEATS=10
+# The noise eigen tables' opt-in {PSD,GALFOR}_EIGEN_INFO=fisher route is
+# documented with the source branches' gram route (search "OPT-IN: EIGEN
+# TABLES" below); default unchanged (ll).
 
 # ---- VGB in-model scorer: sig-het ON (user ruling 2026-09-17), same engine
 #      and the SAME knobs as the GB branch by construction (VGBSettings reads
@@ -4702,6 +4756,43 @@ export EMRI_EIGEN_REFRESH=100
 # a table build failed and that leaf is sampling on identity/1%-width
 # tables (correct but slow -- MH corrects the shape); a steady stream of
 # them means arm the stretch escape and file the traceback.
+#
+# ---- OPT-IN: EIGEN TABLES FROM THE EXPECTED INFORMATION (2026-10-06) -------
+# NOT exported here -- the default stays "ll" (the tables above, from
+# second differences of the likelihood). Opt in per branch ON THE LAUNCH
+# LINE. All CPU-validated only; none has run on a GPU yet (2026-10-06).
+# Route map, numbers and tests: docs/eigen-info-routes.md.
+#
+# {SOBBH,EMRI,MBH}_EIGEN_INFO=gram (move attribute eigen_info). The table is
+#   built from the Gram matrix <dh_a|dh_b> of the move's OWN batched
+#   templates (SOBBH: the lookup fill under SOBBH_LIKELIHOOD=lookup; EMRI:
+#   the direct template; MBH: the batched windowed template) at the max-lnL
+#   cold walker, through that walker's PSD -- the expected information, no
+#   residual noise, positive semi-definite. ONE shared table per leaf (the
+#   {BRANCH}_EIGEN_SCOPE knob does not apply). Any failure WARNS
+#   ("[eigen_refresh] ... Gram build failed") and builds the ll table.
+#   Why: on the SOBBH toy the ll route's 1e-4-of-box step gives an f_low
+#   curvature ~250x too small, noise-dominated spin entries, and masses
+#   ~1.5x off the Gram. Companion knobs:
+#   {BRANCH}_EIGEN_GRAM_TARGET (default 1e-3): each column's step is
+#     rescaled once so the template moves by this fraction of ||h||;
+#     0 = fixed steps.
+#   {BRANCH}_EIGEN_GRAM_EPS_REL (default {BRANCH}_EIGEN_EPS_REL, 1e-4): the
+#     starting step, fraction of the prior box.
+#   SOBBH holds 23 data-shaped WDM slabs during a build (~0.6 GB at 6
+#   months, ~1.2 GB at 1 year).
+# {PSD,GALFOR}_EIGEN_INFO=fisher (PSDMove attribute eigen_info). The noise
+#   tables come from the expected Fisher kappa * sum Tr(C^-1 dC_i C^-1 dC_j)
+#   of the SAME PSD_BATCH covariance the noise scorer builds -- positive
+#   semi-definite everywhere, which the observed curvature is not (34 of 55
+#   galfor builds non-positive on the 3mo run). PSD_BATCH route only; any
+#   failure WARNS ("[eigen_refresh] ... noise Fisher failed") and builds the
+#   ll table.
+#
+# e.g.  SOBBH_EIGEN_INFO=gram GALFOR_EIGEN_INFO=fisher NGPUS=4 ./submit...
+# WATCH: "[eigen_refresh] <branch> leaf N Gram info matrix at walker W in
+# X s" / "[eigen_refresh] galfor: noise Fisher tables at N point(s) in X s"
+# lines (one per refresh), and no "failed" warnings.
 
 # ============================================================================
 # MBH LIKELIHOOD: BATCHED + WINDOWED (2026-09-30). Spec:

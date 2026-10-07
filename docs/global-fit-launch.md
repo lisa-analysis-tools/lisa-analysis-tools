@@ -87,6 +87,7 @@ error, not a rounding fallback, when driven directly through `build_layout`
 | `{P}_INNER_MOVE_KIND` (`PSD_`, `GALFOR_`, `SGWB_`) | `eigen` when the rank's walker BLOCK holds fewer than 3 walkers (one-walker replica mode, and any walker-block layout with 1-2 walkers per rank, e.g. `NGPUS=4 NWALKERS=4`), `stretch` otherwise | the PSDMove inner proposal. The stretch's complement is the rank's LOCAL block (cross-rank pooling is WP8), so `stretch` with a 1-walker block is a hard error and a 2-walker block would only move along a line; an explicit value always wins. |
 | `{P}_EIGEN_REFRESH` | `10` | proposes between per-rung eigen table refreshes (eigen kind). |
 | `{P}_EIGEN_EPS_REL` | `1e-4` | finite-difference step for the eigen tables, fraction of the prior box. |
+| `{BRANCH}_EIGEN_INFO` (`SOBBH_`, `EMRI_`, `MBH_`: `ll` / `gram`; `PSD_`, `GALFOR_`, `SGWB_`: `ll` / `fisher`) | `ll` | which information matrix the eigen tables are built from: likelihood second differences (default), the Gram matrix of the move's own templates (`gram`, tuned by `{BRANCH}_EIGEN_GRAM_TARGET`, default `1e-3`), or the expected noise Fisher (`fisher`). Opt-in, CPU-validated, not yet run on a GPU (2026-10-06); any failure falls back to `ll`. Rank-local like every eigen table. See [`docs/eigen-info-routes.md`](eigen-info-routes.md). |
 
 - **`FSTAT_SIGHET_MULTIDEV=1` is inert under the walker-block layout.** It
   fans the F-stat scorer out over a rank's OWN devices, and the current
@@ -261,7 +262,10 @@ Plan 3/4 fan-out mixins' module docstrings for the code-level detail.
 - **Eigen, info-matrix and F-stat reference tables are rank-local
   proposal-shaped tables** (still valid MH); the eigen sidecar is written by
   the head only. `GB_INFOMAT_PER_BLOCK=1` (`infomat_per_block`) retires the
-  old cross-device info-matrix borrow. GB's frequency-window friend table
+  old cross-device info-matrix borrow, and `GB_CHOL_CACHE=1` keeps each
+  rank's GB in-model factors in that rank's host memory (one cache per rank
+  and branch; route map in [`docs/eigen-info-routes.md`](eigen-info-routes.md)).
+  GB's frequency-window friend table
   (`BandSorter.build_friend_table`) is likewise rank-local, built from the
   rank's own walker block only.
 - **Stretch complements are the rank's local block.** PSD `RedBlue` splits,
