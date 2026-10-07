@@ -1695,7 +1695,29 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         window-square / sum for the whole batch. Returns ``(nb, Nf_active)``
         columns (broadcast along time downstream, mirroring the stationary
         ``repeat``). FD: per-row :func:`get_sensitivity` (1-D, cheap),
-        stacked to ``(nb, Nf)``."""
+        stacked to ``(nb, Nf)``.
+
+        Any other ``wdm_psd_method`` (production: ``layer_calibrated``, the
+        64-node window quadrature) goes per row through the SAME column
+        helper the per-walker components use. Until 2026-10-06 this always
+        folded, so under ``layer_calibrated`` the noise moves scored galfor
+        exactly while the installed per-walker sensitivity used the
+        quadrature."""
+        method = getattr(self.sensitivity_backend, "wdm_psd_method", "fold")
+        if isinstance(settings, WDMSettings) and method != "fold":
+            from ...sensitivity import _wdm_stationary_psd_column
+
+            rows = []
+            for p in param_rows:
+                col = xp.asarray(_wdm_stationary_psd_column(
+                    settings, Xsens, (),
+                    dict(stochastic_params=tuple(np.asarray(p, dtype=float)),
+                         stochastic_function=stoch_fn, include_instrument=False),
+                    method,
+                ))
+                col[xp.isnan(col)] = 0.0
+                rows.append(col)
+            return xp.stack(rows)
         if isinstance(settings, WDMSettings):
             f_full = xp.fft.rfftfreq(settings.N, settings.data_dt)
             df = float(f_full[1] - f_full[0])

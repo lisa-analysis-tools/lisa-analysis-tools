@@ -441,6 +441,16 @@ class BatchedMoveStockParityTest(unittest.TestCase):
     def test_compute_log_like_parity(self):
         self._log_like_parity("noise_only", ("psd", "galfor"))
 
+    def test_compute_log_like_parity_layer_calibrated(self):
+        """Production WDM_PSD_METHOD: the per-walker galfor column is the
+        64-node quadrature, so the batched route must use it too (until
+        2026-10-06 it always folded exactly)."""
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"WDM_PSD_METHOD": "layer_calibrated"}):
+            self._log_like_parity("noise_only", ("psd", "galfor"))
+
     def test_compute_log_like_parity_sgwb(self):
         # covers the batched SGWB magnitude branch (kernel fast path is
         # gated off whenever the model carries an sgwb branch)
