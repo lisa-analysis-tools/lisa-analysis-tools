@@ -1308,9 +1308,17 @@ class StackedFStatProposal4D:
     (trapezoid) cell weights, so per-box ``rvs``/``logpdf`` are mutually
     exact; the mixture weighting is exact on top of that.
 
+    Memory: the per-chunk cell log-weights (and, with ``keep_nodes``, the
+    node grids) stay on the input's array module -- the device for a cupy
+    stack. The flattened sampling CDF is built and kept on the HOST: it is
+    only ever ``searchsorted`` by :meth:`rvs`, and a device copy cost about
+    a third of the resident grid (6mo job 738 OOM in the device cumsum,
+    2026-10-06). Same values, same draws.
+
     Args:
         logp_grids: ``(K, n0, n1, n2, n3)`` node grids of ``beta * F``
-            (numpy or cupy; computation stays on the input's module).
+            (numpy or cupy; computation stays on the input's module, except
+            the host-resident CDF).
         f0_los: ``(K,)`` per-box f0 axis start [mHz].
         f0_dxs: ``(K,)`` per-box f0 node spacing [mHz].
         mc_ax, alpha_ax, sin_delta_ax: shared node axes (uniform spacing).
@@ -1396,7 +1404,8 @@ class StackedFStatProposal4D:
         assert w.shape == (K,) and np.all(w >= 0) and w.sum() > 0
         self.weights = w / w.sum()
 
-        # K-chunking: per-box cell working set ~ log_wcell + cdf.
+        # K-chunking: per-box cell working set ~ log_wcell (device) + cdf
+        # (host since 2026-10-06; the budget still counts both).
         per_box_bytes = 2 * self._ncells * 8
         if mem_budget_mb:
             k_chunk = max(1, int(float(mem_budget_mb) * 1e6 / per_box_bytes))

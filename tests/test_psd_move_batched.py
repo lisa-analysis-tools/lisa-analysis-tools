@@ -494,7 +494,9 @@ class NoiseFisherTest(unittest.TestCase):
 
     Truth: the observed information of the PRODUCTION likelihood function on
     a residual DRAWN from C(x0) (60k WDM pixels, so the observed curvature
-    sits within a percent of its expectation for well-measured directions).
+    sits within a percent of its expectation for well-measured directions),
+    taken as 1-D second differences along each axis (``_curv``; the
+    ``information_matrix_from_ll`` sweep was unusable for galfor here).
     Measured: psd diag within 0.6 %; galfor (a loud foreground) alpha / f_1
     within 4 %, while the observed curvature of the weakly measured fk / f_2
     comes out NEGATIVE on one draw -- the indefiniteness the Fisher removes.
@@ -502,11 +504,10 @@ class NoiseFisherTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # the parity suite's synthetic noise_only fit (raises SkipTest when
+        # the stack is unavailable)
         BatchedMoveStockParityTest.setUpClass.__func__(cls)
-        try:
-            fx = BatchedMoveStockParityTest._fixture(cls(), "noise_only", ("psd", "galfor"))
-        except unittest.SkipTest:
-            raise
+        fx = BatchedMoveStockParityTest._fixture(cls(), "noise_only", ("psd", "galfor"))
         cls.curr, cls.state, cls.acs, cls.make_move, cls.sampled = fx
         cls.mv = cls.make_move(True)
         coords = {k: np.array(cls.mv._work_branch(cls.state, k).coords) for k in cls.sampled}

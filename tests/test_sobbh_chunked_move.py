@@ -535,23 +535,26 @@ class SOBBHEigenInnerMoveTest(unittest.TestCase):
         self.assertEqual(spy.call_count, 2)
 
 
-
 #: spins barely move the chunked toy template (Gram ~1e-10): judged apart
 _NO_SPIN = [0, 1, 4, 5, 6, 7, 8, 9, 10]
 
 
 def _corr_rel(a, b, keep):
+    """``|a - b|`` over the ``keep`` block, in units of ``sqrt(b_ii b_jj)``
+    (the correlation-normalized difference the Gram tests bound)."""
     a, b = a[np.ix_(keep, keep)], b[np.ix_(keep, keep)]
     d = np.sqrt(np.abs(np.diag(b)))
     return np.abs(a - b) / np.outer(d, d)
 
 
 class SOBBHGramInfoTest(SOBBHEigenInnerMoveTest):
-    """``SOBBH_EIGEN_INFO=gram``: the Gram matrix of the move's own chunked
-    templates against an independent EXACT one (the dense stock template
-    path, central differences at the same steps, the container's inner
-    product). Measured on this toy: diagonal within 1-3 %, marginal widths
-    within 3.3 %; across the step target 3e-3 vs 1e-3, 5e-3.
+    """``SOBBH_EIGEN_INFO=gram`` on the chunked comp.
+
+    The Gram matrix of the move's own chunked templates against an
+    independent EXACT one (the dense stock template path, central differences
+    at the same steps, the container's inner product). Measured on this toy:
+    diagonal within 1-3 %, marginal widths within 3.3 %; step target 3e-3 vs
+    1e-3 moves it by 5e-3 (correlation-normalized).
     """
 
     # the parent's tests run once, in SOBBHEigenInnerMoveTest
@@ -572,6 +575,8 @@ class SOBBHGramInfoTest(SOBBHEigenInnerMoveTest):
     def _dense_gram(self, move, x0, steps):
         from lisatools.diagnostic import inner_product
 
+        # the class dict, not ``self.gen``: a plain function stored on the
+        # class would bind as a method through the instance
         gen = type(self).__dict__.get("gen") or SOBBHEigenInnerMoveTest.__dict__["gen"]
         ac = move.acs.acs.flatten()[0]
         dh = []

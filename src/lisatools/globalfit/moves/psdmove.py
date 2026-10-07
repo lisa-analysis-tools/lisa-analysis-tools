@@ -192,6 +192,25 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
             untransformed on the ACA route, matching historical behavior).
         permute_every: number of repeats after which to permute the walkers during a temperature swap. This helps with the mixing of the chains.
         tolerance: minimum allowed distance between spline knot positions in the sensitivity model.
+        inner_move_kind: the in-model proposal, ``"eigen"`` (eryn
+            ``EigenAxisMove`` on per-rung information-matrix tables) or
+            ``"stretch"``; ``None`` resolves from the walker count (see
+            :meth:`_resolve_inner_kind`). Settings field ``inner_move_kind``,
+            env ``{PSD,GALFOR,SGWB}_INNER_MOVE_KIND``.
+        eigen_refresh_every: proposes between eigen table refreshes (Settings
+            field, env ``{P}_EIGEN_REFRESH``).
+        eigen_eps_rel: finite-difference step of both information-matrix
+            routes (likelihood second differences, and the covariance
+            differences of the ``"fisher"`` route), as a fraction of each
+            prior-box width (Settings field, env ``{P}_EIGEN_EPS_REL``).
+        eigen_info: information-matrix route of the eigen tables, ``"ll"``
+            (likelihood second differences, the default) or ``"fisher"``
+            (the expected noise Fisher, :meth:`_noise_fisher`; PSD_BATCH
+            route only, falls back to ``"ll"`` on any error). Applies to
+            every branch this move samples; ``None`` reads
+            ``{BRANCH}_EIGEN_INFO`` per branch (``PSD_EIGEN_INFO``,
+            ``GALFOR_EIGEN_INFO``, ``SGWB_EIGEN_INFO``), then ``"ll"``. See
+            ``docs/eigen-info-routes.md``.
         **kwargs: additional keyword arguments for the Move class.
 
     Env knobs:
@@ -199,15 +218,20 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         (composite / WDM) route, score each walker batch through ONE batched
         covariance build + ONE batched likelihood per shard instead of the
         per-walker Python loop — same numbers (parity asserted at
-        rtol <= 1e-12 in ``tests/test_psd_move_batched.py``), O(1) kernel
+        rtol <= 1e-12 in ``tests/test_psd_move_batched.py``, for the
+        ``fold`` and ``layer_calibrated`` WDM PSD methods), O(1) kernel
         launches per scoring batch per device instead of O(nwalkers), and no
         per-batch sens-mat install/restore or ``linear_psd_arr`` repack.
+        The galfor / SGWB magnitudes follow the backend's
+        ``wdm_psd_method`` (``WDM_PSD_METHOD``) exactly as the per-walker
+        components do (see :meth:`_batched_stochastic_mag`).
         ``PSD_BATCH=0`` restores the historical per-walker path (the
         ``_force_parent_path``-style escape hatch). The batched route
         engages only when supported (CompositeSensitivityBackend with the
         instrument basis cache, a linear-in-noise-levels instrument model,
         3x3 channel structure, no frequency-layer mask, full-likelihood
         containers); anything else silently keeps the per-walker path.
+        ``{BRANCH}_EIGEN_INFO``: see ``eigen_info`` above.
     """
     fanout_flat_body = False  # see the mixin: PSD reads walker count/devices off the LOCAL ACA
 
@@ -264,6 +288,7 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         inner_move_kind: str = None,
         eigen_refresh_every: int = 10,
         eigen_eps_rel: float = 1e-4,
+        eigen_info: str = None,
         # tiled per-walker ensemble search -- SEARCH stages only, see
         # _ensemble_search_active / run_move_ensemble_search
         ensemble_search: bool = False,
@@ -306,6 +331,8 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         self.inner_move_kind = inner_move_kind
         self.eigen_refresh_every = max(1, int(eigen_refresh_every or 10))
         self.eigen_eps_rel = float(eigen_eps_rel or 1e-4)
+        # None defers to {BRANCH}_EIGEN_INFO at refresh time (_eigen_info)
+        self.eigen_info = eigen_info
         self._inner_kind = None
         self._inner_kind_logged = False
         self._eigen_inner = None
@@ -1702,7 +1729,9 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         helper the per-walker components use. Until 2026-10-06 this always
         folded, so under ``layer_calibrated`` the noise moves scored galfor
         exactly while the installed per-walker sensitivity used the
-        quadrature."""
+        quadrature (on the 6-month grid: 4e-4 lnL at the production galfor
+        estimate, up to 0.3 lnL across wide prior draws). Parity:
+        ``test_compute_log_like_parity_layer_calibrated``."""
         method = getattr(self.sensitivity_backend, "wdm_psd_method", "fold")
         if isinstance(settings, WDMSettings) and method != "fold":
             from ...sensitivity import _wdm_stationary_psd_column
@@ -1814,9 +1843,18 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         raise ValueError("modulation must be 2D (nch,nch) or 3D (nch,nch,Ntime).")
 
     def _batched_covariance(self, rt, psd_phys, galfor_phys, sgwb_phys, xp):
-        """``C[3, 3, nb, ...]`` for ``nb`` physical-basis rows on one device
-        (``rt`` = :meth:`_batch_device_runtime`): the PSD_BATCH model the
-        scorer and the noise Fisher both use."""
+        """The PSD_BATCH noise covariance ``C[3, 3, nb, *basis]``, one slice
+        per physical-basis row, on the device of ``rt``.
+
+        ``rt`` is :meth:`_batch_device_runtime` (the cached instrument bases,
+        stochastic models and modulations of one device). ``psd_phys`` is
+        ``(nb, >=2)``, columns 0 / 1 the ``Soms_d`` / ``Sa_a`` levels (squared
+        here); ``galfor_phys`` / ``sgwb_phys`` are ``(nb, ndim)`` rows or
+        ``None`` for an absent branch. The ONE model both
+        :meth:`_score_split_batch` (the scorer) and
+        :meth:`_noise_fisher` (the ``"fisher"`` eigen route) evaluate, so the
+        Fisher is the curvature of exactly the likelihood being sampled.
+        """
         settings = rt["settings"]
         nb = int(np.shape(psd_phys)[0])
         basis_nd = rt["B_oms"].ndim - 2
@@ -1858,10 +1896,25 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         observed information (34 of 55 galfor builds non-positive on the 3mo
         run). ``dC/dx`` by central differences of :meth:`_batched_covariance`
         (smooth, noise-free) at ``eigen_eps_rel`` of the prior box; pixels
-        the likelihood drops (non-finite / zero det) are dropped here too.
+        the likelihood drops (non-finite / zero det at the expansion point)
+        are dropped here too.
 
-        ``other[key]`` are the per-point rows of the other noise branches
-        (sampling basis), held fixed. PSD_BATCH route only.
+        Args:
+            branch: the noise branch the matrix is taken over.
+            points: ``(n_pts, d)`` expansion points in ``branch``'s sampling
+                basis.
+            pt_walker: ``(n_pts,)`` walker of each point; selects the device
+                (shard) the covariance is built on.
+            other: ``{key: (n_pts, d_key) rows or None}`` for the OTHER noise
+                branches (sampling basis), held fixed at each point; ``None``
+                (or a missing key) = branch absent from the model.
+            widths: ``(d,)`` prior-box widths of ``branch`` (the step unit).
+
+        Returns:
+            ``(n_pts, d, d)`` host array.
+
+        Raises when the PSD_BATCH route is not engaged (the caller then
+        falls back to the likelihood route).
         """
         if not self._batched_route_ready():
             raise RuntimeError("noise Fisher needs the PSD_BATCH route")
@@ -1874,15 +1927,22 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         steps = float(self.eigen_eps_rel) * np.asarray(widths, dtype=float)
         out = np.zeros((n_pts, nd, nd))
         for p in range(n_pts):
+            # rows 2i / 2i+1 = x +/- steps[i] e_i; the last row is x itself
             X = np.repeat(points[p][None, :], 2 * nd + 1, axis=0)
             for i in range(nd):
                 X[2 * i, i] += steps[i]
                 X[2 * i + 1, i] -= steps[i]
+            # physical-basis rows of every noise branch: ``branch`` varies,
+            # the others repeat their fixed row at this point
             phys = {}
             for key in self.NOISE_BRANCHES:
-                rows = X if key == branch else (
-                    None if other.get(key) is None
-                    else np.tile(np.asarray(other[key][p], dtype=float), (X.shape[0], 1)))
+                if key == branch:
+                    rows = X
+                elif other.get(key) is None:
+                    rows = None
+                else:
+                    rows = np.tile(np.asarray(other[key][p], dtype=float),
+                                   (X.shape[0], 1))
                 phys[key] = None if rows is None else np.stack(
                     [np.asarray(self._to_physical(tfs[key], r), dtype=float) for r in rows])
             w = int(pt_walker[p])
@@ -1893,9 +1953,11 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
                 kappa = float(getattr(rt["settings"], "logdet_factor", 1.0))
                 C = self._batched_covariance(
                     rt, phys["psd"], phys.get("galfor"), phys.get("sgwb"), xp)
+                # C^-1 and the kept-pixel mask at the expansion point (last row)
                 detC, invC = _mat3x3_det_inv(C[:, :, -1:], xp)
                 keep = (xp.isfinite(detC) & (detC != 0.0))[0]
                 invC = xp.where(xp.isfinite(invC), invC, 0.0)[:, :, 0]
+                # A_i = C^-1 dC/dx_i per pixel (channel axes first)
                 A = []
                 for i in range(nd):
                     dC = (C[:, :, 2 * i] - C[:, :, 2 * i + 1]) / (2.0 * steps[i])
@@ -1903,7 +1965,7 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
                 del C
                 for i in range(nd):
                     for j in range(i, nd):
-                        tr = xp.einsum("ab...,ba...->...", A[i], A[j])
+                        tr = xp.einsum("ab...,ba...->...", A[i], A[j])  # Tr(A_i A_j)
                         v = float(asnumpy(xp.sum(xp.where(keep, tr, 0.0))))
                         out[p, i, j] = out[p, j, i] = kappa * v
         return out
@@ -3022,23 +3084,40 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         return str(raw).strip().lower() not in ("0", "false", "no", "")
 
     def _eigen_info(self, branch):
-        """``eigen_info`` attribute > ``{BRANCH}_EIGEN_INFO`` env > ``"ll"``.
-        ``"fisher"``: the expected noise Fisher (:meth:`_noise_fisher`)."""
+        """Information-matrix route for ``branch``'s eigen tables
+        (lower-cased): ``eigen_info`` attribute > ``{BRANCH}_EIGEN_INFO`` env
+        > ``"ll"``.
+
+        ``"fisher"``: the expected noise Fisher (:meth:`_noise_fisher`);
+        anything else: likelihood second differences. The attribute applies
+        to every branch this move samples; the env is read per branch
+        (``PSD_EIGEN_INFO``, ``GALFOR_EIGEN_INFO``, ``SGWB_EIGEN_INFO``).
+        """
         val = getattr(self, "eigen_info", None)
         if val is None:
             val = os.environ.get(f"{str(branch).upper()}_EIGEN_INFO", "ll")
         return str(val).strip().lower()
 
     def _refresh_eigen_tables(self, tmp_branches_coords):
-        """Per-branch, per-rung eigen tables from likelihood second differences at walker 0.
+        """Per-branch eigen tables, installed on the eigen inner move.
 
-        ``call_ll`` for branch ``b`` varies only ``b``'s parameters; the other
-        sampled branches sit at their own rung values (rows arrive as whole
-        ``ntemps``-point blocks, the batching invariant of
-        ``information_matrix_from_ll``) and the fixed branches at the cold row.
-        Scoring goes through :meth:`compute_psd_rows`, so it scatters too.
+        Expansion points follow :meth:`_eigen_scope`: ``cold_per_walker``
+        (each walker's cold row, shared up its ladder with tempered sigmas)
+        or the legacy ``per_temp`` (every rung at walker 0).
+
+        Information matrix per point, by :meth:`_eigen_info` per branch:
+        ``"ll"`` (default) -- likelihood second differences; ``call_ll`` for
+        branch ``b`` varies only ``b``'s parameters, the other sampled
+        branches sit at their own point values (rows arrive as whole
+        ``n_pts``-point blocks, the batching invariant of
+        ``information_matrix_from_ll``) and the fixed branches at the cold
+        row; scoring goes through :meth:`compute_psd_rows`, so it scatters
+        too. ``"fisher"`` -- the expected Fisher (:meth:`_noise_fisher`) at
+        the same points with the same held branches; on any error it warns
+        and takes the ll route.
         """
         from .eigen_refresh import (
+            _tables_from_info_batch,
             eigen_tables_from_ll_batch,
             prior_box_widths,
             temper_sigmas,
@@ -3091,15 +3170,23 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
 
             axes = None
             if self._eigen_info(b) == "fisher":
+                # {BRANCH}_EIGEN_INFO=fisher: the expected Fisher at the SAME
+                # expansion points, the other noise branches held where
+                # call_ll holds them (sampled: their own point rows; fixed:
+                # the cold row; absent: None). Any failure -> the ll route.
                 try:
-                    from .eigen_refresh import _tables_from_info_batch
                     _t0 = time.perf_counter()
-                    info = self._noise_fisher(
-                        b, point[b], pt_walker,
-                        {k: (point[k] if k in point else
-                             (None if k not in fixed else np.tile(fixed[k], (n_pts, 1))))
-                         for k in self.NOISE_BRANCHES if k != b},
-                        widths)
+                    other = {}
+                    for k in self.NOISE_BRANCHES:
+                        if k == b:
+                            continue
+                        if k in point:
+                            other[k] = point[k]
+                        elif k in fixed:
+                            other[k] = np.tile(fixed[k], (n_pts, 1))
+                        else:
+                            other[k] = None
+                    info = self._noise_fisher(b, point[b], pt_walker, other, widths)
                     axes, sigmas = _tables_from_info_batch(info, widths)
                     logger.info("[eigen_refresh] %s: noise Fisher tables at %d point(s) "
                                 "in %.2f s", b, n_pts, time.perf_counter() - _t0)

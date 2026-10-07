@@ -405,19 +405,29 @@ class MBHBatchedLikeMove(ResidualAddOneRemoveOneMove):
         return self._split_rows_static(self.acs, idx)
 
     # ------------------------------------------------------------------
-    # likelihood
+    # Gram information matrix (MBH_EIGEN_INFO=gram; the route itself is
+    # ResidualAddOneRemoveOneMove._gram_info -- these are its two hooks)
     # ------------------------------------------------------------------
 
     def _gram_context(self, walker):
-        """``MBH_EIGEN_INFO=gram``: the walker's shard device(s)."""
+        """Enter the device(s) that own walker ``walker``'s shard."""
         (device, _), = self._split_rows(np.array([int(walker)]))
         return self._device_contexts(device)
 
     def _gram_templates(self, coords, walker):
-        """``MBH_EIGEN_INFO=gram`` hook: the batched windowed templates for the
-        Gram rows, in the leaf's window, relabelled onto the containers' box
-        (exactly what the scorer differences against). A refused batch raises
-        (the refresh then falls back to the likelihood route)."""
+        """The batched windowed templates for the Gram rows: ``(arr, box)``
+        with one row of ``arr`` per waveform-basis row of ``coords``.
+
+        Generated in the CURRENT leaf's window (set by
+        ``setup_likelihood_here`` / the expose) and relabelled onto the
+        containers' box -- exactly what the scorer differences against.
+        Built in ``batch_max_size`` chunks and concatenated (every chunk
+        shares the one window, hence one ``box``). ``walker`` is unused: the
+        template does not depend on the walker (its noise enters through the
+        caller's inner products). No window for the leaf, or a batch the
+        generator refuses, raises, and the refresh falls back to the
+        likelihood route.
+        """
         leaf = int(self._current_leaf)
         geom = self._leaf_windows.get(leaf)
         if geom is None:
@@ -433,6 +443,10 @@ class MBHBatchedLikeMove(ResidualAddOneRemoveOneMove):
             box = tmpl.settings if box is None else box
         xp = get_array_module(parts[0])
         return xp.concatenate(parts), box
+
+    # ------------------------------------------------------------------
+    # likelihood
+    # ------------------------------------------------------------------
 
     def setup_likelihood_here(self, coords):
         """Arm the per-walker exposed-residual offset and the leaf window."""

@@ -30009,9 +30009,8 @@ class GBSpecialRJPriorMove(GBSpecialBase):
 #: Process-local cache of fitted F-stat birth grids, keyed by epoch cache
 #: directory -> ``(container, epoch, n_peaks)``. Lets every move sharing a
 #: fit dir reuse the FIRST one's result with no refit and no npz reload.
-#: Older epochs of a fit dir are evicted when it refits (_evict_fstat_epochs);
-#: the on-disk epoch caches are the
-#: cross-process equivalent.
+#: A refit evicts every older epoch of its fit dir (:func:`_evict_fstat_epochs`);
+#: the on-disk epoch caches are the cross-process equivalent.
 _FSTAT_GRID_REGISTRY: dict = {}
 
 #: Process-local cache of epoch F-stat CENTER tables, keyed by epoch cache
@@ -30023,11 +30022,22 @@ _FSTAT_CTR_TABLE_REGISTRY: dict = {}
 
 
 def _evict_fstat_epochs(root, keep):
-    """Drop both registries' entries under fit dir ``root`` except ``keep``."""
+    """Drop every entry of both F-stat registries under fit dir ``root``
+    except the epoch dir ``keep``.
+
+    Both registries are keyed by epoch cache directory (``<root>/<epoch>``),
+    so the prefix match removes exactly ``root``'s other epochs and leaves
+    other fit dirs alone. Called right before a refit (6mo job 738 OOM,
+    2026-10-06): without it every earlier epoch's grid and centre table
+    stayed resident on the device for the life of the process. A move still
+    holding an older epoch keeps its own reference until it installs the
+    new one.
+    """
     prefix = os.path.join(root, "")
     for reg in (_FSTAT_GRID_REGISTRY, _FSTAT_CTR_TABLE_REGISTRY):
         for key in [k for k in reg if k.startswith(prefix) and k != keep]:
             del reg[key]
+
 
 #: Process-local map ``(fstat_root, stage serial) -> epoch number`` for the
 #: FORCED refits the v9 per-stage profile arms (see

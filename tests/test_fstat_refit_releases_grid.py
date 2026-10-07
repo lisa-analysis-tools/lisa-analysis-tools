@@ -1,7 +1,10 @@
 """A PE F-stat refit releases the installed grid before building the next.
 
 6mo job 730 (2026-10-05): epoch 2's stacked-proposal build OOMed on rank 0
-at 88.4 GB allocated while epoch 1's grid was still resident.
+at 88.4 GB allocated while epoch 1's grid was still resident (the move's own
+reference: ``RefitReleaseTest``). 6mo job 738 (2026-10-06): the same at 88.7
+GB, from the process-wide epoch registries (evicted now) and the stacked
+proposal's device CDF (host-resident now: ``HostCdfTest``).
 """
 import inspect
 import unittest

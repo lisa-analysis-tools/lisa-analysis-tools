@@ -523,15 +523,27 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
         _sub.h_h[:, leaf] = self._last_h_h[: self.nwalkers]
 
     def _gram_templates(self, coords, walker):
-        """``SOBBH_EIGEN_INFO=gram`` hook: chunked templates for the Gram rows.
+        """``SOBBH_EIGEN_INFO=gram`` hook: the move's own templates for the
+        Gram rows (see :meth:`ResidualAddOneRemoveOneMove._gram_info`).
 
         ``coords`` are waveform-basis rows; each is filled into its OWN
         zeroed slab (``data_index = row``) of a scratch buffer shaped like
-        walker ``walker``'s data -- the same chunked fill the move uses to
-        expose / fold sources, so the Gram matrix differentiates the
-        templates the residual actually carries. Single-shard only (the fill
-        is single-shard by contract); anything else raises and the refresh
-        falls back to the likelihood route.
+        walker ``walker``'s data, through ``self.comp.fill_global_wdm`` --
+        the same fill the move uses to expose / fold sources, so the Gram
+        matrix differentiates the templates the residual actually carries.
+        With ``SOBBH_LIKELIHOOD=lookup`` (the stock default) ``comp`` is the
+        lookup router, so these are lookup fills; with ``chunked`` they are
+        chunked-heterodyne fills.
+
+        Memory: the buffer holds ``2 * ndim + 1`` (23) data-shaped
+        active-band slabs at once, plus ``ndim`` half-differences in the
+        caller -- ~0.6 GB peak on the 6-month grid (3 x ~177 x ~4200
+        float64 per slab), twice that at 1 yr. Not yet run on a GPU
+        (2026-10-06).
+
+        Raises (the refresh then falls back to the likelihood route): a
+        multi-shard ACA (the fill is single-shard by contract), or a row
+        that is non-finite or whose f_low lies outside the comp's band.
         """
         if len(self.acs.linear_data_arr) != 1:
             raise NotImplementedError("SOBBH Gram templates: single-shard ACA only")

@@ -134,18 +134,27 @@ class EMRIDirectLikeMove(ResidualAddOneRemoveOneMove):
         return device_context(getattr(self.acs, "xp", None), device)
 
     # ------------------------------------------------------------------
-    # likelihood
+    # Gram information matrix (EMRI_EIGEN_INFO=gram; the route itself is
+    # ResidualAddOneRemoveOneMove._gram_info -- these are its two hooks)
     # ------------------------------------------------------------------
 
     def _gram_context(self, walker):
-        """``EMRI_EIGEN_INFO=gram``: the walker's shard device."""
+        """Enter the device that owns walker ``walker``'s shard."""
         (device, _), = self._split_rows(np.array([int(walker)]))
         return self._device_context(device)
 
     def _gram_templates(self, coords, walker):
-        """``EMRI_EIGEN_INFO=gram`` hook: the direct templates for the Gram rows
-        on the active box (the scorer's own templates); a refused row raises
-        (the refresh then falls back to the likelihood route)."""
+        """The direct templates for the Gram rows: ``(arr, box)`` with one
+        row of ``arr`` per waveform-basis row of ``coords``, on the run's
+        active WDM box -- the templates the scorer differences against.
+
+        Built in ``batch_max_size`` chunks (the scorer's chunking) and
+        concatenated, so the whole ``2 * ndim + 1`` stack is resident at
+        once. ``walker`` is unused: the direct template does not depend on
+        the walker (its noise enters through the caller's inner products).
+        A row the generator refuses raises, and the refresh falls back to
+        the likelihood route.
+        """
         adapter = self._adapter()
         self._check_box(adapter)
         coords = np.atleast_2d(np.asarray(asnumpy(coords), dtype=np.float64))
@@ -158,6 +167,10 @@ class EMRIDirectLikeMove(ResidualAddOneRemoveOneMove):
             parts.append(arr)
         xp = get_array_module(parts[0])
         return xp.concatenate(parts), self._wdm
+
+    # ------------------------------------------------------------------
+    # likelihood
+    # ------------------------------------------------------------------
 
     def setup_likelihood_here(self, coords):
         """Arm the per-walker exposed-residual offset."""

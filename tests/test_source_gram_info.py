@@ -10,7 +10,6 @@ SOBBH (the chunked fill) is covered in ``tests/test_sobbh_chunked_move.py``.
 """
 from __future__ import annotations
 
-import os
 import unittest
 from unittest import mock
 
@@ -26,11 +25,16 @@ except ImportError:  # pragma: no cover - run from tests/
     import test_emri_direct_move as E
     import test_mbh_batched_move as M
 
+#: the columns the toy template depends on (m1, dist, phi_ref, inc, psi, t_plunge)
 COLS = [0, 4, 5, 6, 7, 10]
+#: stand-in prior-box widths (the step unit)
 WIDTHS = 0.2 * np.abs(M.BASE_ROW) + 0.2
 
 
 def _truth(acs, x0, steps, walker):
+    """Independent ``<dh_a|dh_b>`` over ``COLS``: central differences of the
+    full-grid generator at ``steps``, through walker ``walker``'s container
+    PSD and ``inner_product``."""
     ac = acs.acs.flatten()[walker]
     dh = []
     for i in COLS:
@@ -52,6 +56,9 @@ def _corr_rel(a, b):
 
 
 class _GramCase:
+    """Shared Gram checks; a concrete case sets ``self.move`` / ``self.acs``
+    in ``setUp`` and the agreement bound ``TOL``."""
+
     TOL = None
 
     def _info(self, walker):

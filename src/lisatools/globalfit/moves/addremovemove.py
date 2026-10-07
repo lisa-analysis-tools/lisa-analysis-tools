@@ -7,6 +7,7 @@ import logging
 import os
 import time
 import warnings
+from contextlib import nullcontext
 from copy import deepcopy
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
@@ -35,7 +36,7 @@ from tqdm import tqdm
 
 from ...analysiscontainer import AnalysisContainerArray
 from ...domaincomputation import DomainComputationGroupArray
-from ...domains import DomainBase, DomainBaseArray
+from ...domains import DomainBase, DomainBaseArray, WDMSignal
 from ...utils.utility import asnumpy, get_array_module
 from .. import midit_checkpoint
 from . import eigen_refresh, eigen_table_persist
@@ -106,7 +107,31 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         Tmax: maximum temperature for the temperature control.
         betas_all: array of betas for all leaves and temperatures. Shape is (nleaves_max, ntemps). If None, betas will be initialized as in TemperatureControl.
         permute_every: cadence (in proposes / engine iterations) for the walker-permuting (fancy) temperature swap: it fires at most once per leaf visit, on the final in-model repeat, on proposes ``permute_every, 2*permute_every, ...`` (1 = every propose; the first propose after a restart never fires for cadence > 1); <= 0 disables it entirely (``{BRANCH}_PERMUTE_EVERY`` env override).
-        pad_out_of_prior: whether to pad proposed sources that are out of the prior bounds to avoid JIT compilation issues. If True, proposed sources that are out of the prior bounds will be replaced with the first in-prior point. 
+        pad_out_of_prior: whether to pad proposed sources that are out of the prior bounds to avoid JIT compilation issues. If True, proposed sources that are out of the prior bounds will be replaced with the first in-prior point.
+        eigen_refresh_every: leaf-visit cadence of the eigen inner-move table
+            refresh (:meth:`refresh_inner_move_tables`). ``None`` reads
+            ``{BRANCH}_EIGEN_REFRESH``, then 10.
+        eigen_eps_rel: finite-difference step of the likelihood ("ll")
+            information-matrix route, as a fraction of each prior-box width.
+            ``None`` reads ``{BRANCH}_EIGEN_EPS_REL``, then 1e-4.
+        eigen_table_scope: ``"walker_max"`` (one table at the max-lnL cold
+            walker) or ``"per_walker"`` (one per (temperature, walker) point);
+            ll route only. ``None`` reads ``{BRANCH}_EIGEN_SCOPE``, then
+            ``"walker_max"``. See :meth:`_eigen_scope`.
+        eigen_info: information-matrix route of the eigen tables: ``"ll"``
+            (likelihood second differences, the default) or ``"gram"`` (the
+            Gram matrix ``<dh_a|dh_b>`` of the move's own batched templates;
+            only on moves that implement ``_gram_templates``). ``None`` reads
+            ``{BRANCH}_EIGEN_INFO``, then ``"ll"``. See :meth:`_eigen_info` and
+            ``docs/eigen-info-routes.md``.
+        eigen_gram_target: Gram route only: the template change each
+            column's step is tuned to, as a fraction of ``||h||``; ``0`` keeps
+            the fixed starting steps. ``None`` reads
+            ``{BRANCH}_EIGEN_GRAM_TARGET``, then 1e-3. See :meth:`_gram_target`.
+        eigen_gram_eps_rel: Gram route only: the starting step as a fraction
+            of each prior-box width. ``None`` reads
+            ``{BRANCH}_EIGEN_GRAM_EPS_REL``, then the ll route's
+            :meth:`_eigen_eps_rel`.
         **kwargs: additional keyword arguments for the Move class.
     """
 
@@ -134,6 +159,9 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         eigen_refresh_every: int = None,
         eigen_eps_rel: float = None,
         eigen_table_scope: str = None,
+        eigen_info: str = None,
+        eigen_gram_target: float = None,
+        eigen_gram_eps_rel: float = None,
         **kwargs,
     ):
 
@@ -197,12 +225,17 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         self.permute_every = permute_every
         self.pad_out_of_prior = pad_out_of_prior
 
-        # eigen inner-move table refresh (see refresh_inner_move_tables):
-        # kwarg > {BRANCH}_EIGEN_REFRESH / {BRANCH}_EIGEN_EPS_REL /
-        # {BRANCH}_EIGEN_SCOPE env > default
+        # eigen inner-move table refresh (see refresh_inner_move_tables). Each
+        # knob resolves kwarg > {BRANCH}_<NAME> env > default at USE time
+        # (None defers to the env), so an attribute set after construction
+        # wins too: _eigen_refresh_cadence / _eigen_eps_rel / _eigen_scope /
+        # _eigen_info / _gram_target / _gram_eps_rel.
         self.eigen_refresh_every = eigen_refresh_every
         self.eigen_eps_rel = eigen_eps_rel
         self.eigen_table_scope = eigen_table_scope
+        self.eigen_info = eigen_info
+        self.eigen_gram_target = eigen_gram_target
+        self.eigen_gram_eps_rel = eigen_gram_eps_rel
 
         self._setup_debug()
 
@@ -240,14 +273,21 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         return float(val)
 
     def _eigen_info(self):
-        """kwarg > ``{BRANCH}_EIGEN_INFO`` env > ``"ll"``.
+        """kwarg > ``{BRANCH}_EIGEN_INFO`` env > ``"ll"`` (lower-cased).
 
         ``"ll"``: the information matrix from likelihood second differences
-        (the scope routes below). ``"gram"``: the Gram/Fisher matrix
-        ``<dh_a|dh_b>`` of the move's OWN batched templates
-        (:meth:`_build_eigen_table_gram`) -- the expected information, no
-        residual term, one template batch per refresh. Moves without a
-        ``_gram_templates`` hook stay on ``"ll"``.
+        (the scope routes of :meth:`_eigen_scope`). ``"gram"``: the Gram
+        (expected Fisher) matrix ``<dh_a|dh_b>`` of the move's OWN batched
+        templates (:meth:`_build_eigen_table_gram`) -- no residual term, so
+        positive semi-definite, one template batch per refresh. Any other
+        value means ``"ll"``. Moves without a ``_gram_templates`` hook stay
+        on ``"ll"``; a failed Gram build warns and falls back to it.
+
+        Why a second route (SOBBH chunked toy, 2026-10-06): at its production
+        step (1e-4 of the prior box) the ll route gave an f_low curvature
+        ~250x too small (that step is far into f_low's nonlinear range; the
+        resulting f_low step ~16x too wide), spin entries dominated by lnL
+        noise, and mass entries ~1.5x off the Gram.
         """
         val = getattr(self, "eigen_info", None)
         if val is None:
@@ -290,8 +330,9 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         is set (per-leaf transform fills resolve). No-op unless one of
         ``self.moves`` is an :class:`eryn.moves.EigenAxisMove`.
 
-        ONE table per leaf, built at the COLD-CHAIN walker-0 row and shared
-        across walkers/temperatures, recomputed every
+        One table product per leaf (:meth:`_build_eigen_table`: a shared
+        table at the max-lnL cold walker, or per-(temperature, walker) tables
+        under the per_walker scope), recomputed every
         :meth:`_eigen_refresh_cadence` visits. Between refreshes the table
         is frozen, which is what keeps the inner move's ``factors == 0``
         honest (the same adaptive-kernel status the GB in-model tables
@@ -304,7 +345,10 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         build per leaf; every build is written back through. That changes
         NOTHING about detailed balance — the table was already frozen
         between refreshes, and a frozen symmetric proposal is correct MH
-        whatever point its curvature came from.
+        whatever point its curvature came from. (The sidecar does not record
+        the ``{BRANCH}_EIGEN_INFO`` route, for the same reason: after a
+        restart that switches routes, the adopted table serves until the
+        leaf's next refresh.)
         """
         eigen_moves = [m for m in self.moves if isinstance(m, EigenAxisMove)]
         if not eigen_moves:
@@ -481,7 +525,10 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         ``builder(move, leaf, widths) -> (axes, sigmas)`` (any shape
         :meth:`eryn.moves.EigenAxisMove.set_axes` accepts, or the stashed
         ``(ntemps, nwalkers, ndim[, ndim])`` per-walker form).
-        Otherwise :meth:`_eigen_scope` picks the route.
+        Otherwise ``{BRANCH}_EIGEN_INFO=gram`` (:meth:`_eigen_info`, on a move
+        with a ``_gram_templates`` hook) builds from the Gram matrix, falling
+        back with a warning to the likelihood route on any error; the
+        likelihood route's shape is picked by :meth:`_eigen_scope`.
         """
         widths = eigen_refresh.prior_box_widths(
             self.priors[self.branch_name], self.ndim
@@ -513,8 +560,12 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         return self._build_eigen_table_walker_max(leaf, work, widths)
 
     def _eigen_best_walker(self, leaf, work):
-        """``(walker, cold_rows)``: the max-lnL COLD walker for ``leaf``
-        (walker 0, with a warning, if the scoring fails)."""
+        """``(walker, cold_rows)`` for ``leaf``: the max-lnL COLD walker and
+        the cold-chain sampling rows ``(nwalkers, ndim)`` it was picked from.
+
+        Shared by the walker_max ll route and the Gram route. Scoring failure
+        degrades to walker 0 with a warning -- never to a crash.
+        """
         cold = np.asarray(asnumpy(work.coords[0, :, leaf]), dtype=np.float64)
         best = 0
         try:
@@ -531,21 +582,36 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
             )
         return best, cold
 
+    # ------------------------------------------------------------------
+    # Gram information matrix ({BRANCH}_EIGEN_INFO=gram). A subclass opts
+    # in by implementing
+    #     _gram_templates(phys_rows, walker) -> (arr, box)
+    # -- one WDM template per waveform-basis row, stacked on axis 0 of
+    # ``arr``, all on the WDM settings ``box`` -- built with the SAME
+    # generator its scorer differences against (SOBBH: the chunked / lookup
+    # fill; EMRI: the direct adapter; MBH: the batched windowed generator).
+    # Anything it raises sends the refresh back to the ll route. Overriding
+    # _gram_context puts the build on the walker's shard device.
+    # ------------------------------------------------------------------
+
     def _gram_context(self, walker):
-        """Device context for walker ``walker``'s templates (default none)."""
-        from contextlib import nullcontext
+        """Device context for walker ``walker``'s Gram templates.
+
+        The base move has no device routing, so this is a no-op context;
+        sharded subclasses (EMRI direct, MBH batched) enter the device that
+        owns ``walker``.
+        """
         return nullcontext()
 
     def _build_eigen_table_gram(self, leaf, work, widths):
-        """ONE shared table from the Gram matrix at the max-lnL cold walker.
+        """ONE shared ``(axes, sigmas)`` table for ``leaf`` from the Gram
+        matrix at the max-lnL cold walker (:meth:`_eigen_best_walker`).
 
-        Central differences of the move's own batched templates
-        (``_gram_templates(phys_rows, walker) -> (arr, box)``, one template
-        per row on ``box``) in the SAMPLING coordinates, per-column steps
-        tuned by :meth:`_gram_info`, and
-        ``<dh_a|dh_b>`` through the walker's container: the same
-        ``_slice_to_template`` + ``inner_product`` (and PSD) the batched
-        scorers use, so the normalization is the likelihood's.
+        The matrix is :meth:`_gram_info` at that walker's cold row; the
+        table is the same eigen decomposition the ll route's walker_max
+        scope produces (:func:`eigen_refresh._table_from_info`), so the
+        inner move sees an identically shaped product. ``{BRANCH}_EIGEN_SCOPE``
+        does not apply: the Gram route always builds one shared table.
         """
         best, cold = self._eigen_best_walker(leaf, work)
         x0 = cold[best]
@@ -559,10 +625,15 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         return eigen_refresh._table_from_info(info, widths)
 
     def _gram_eps_rel(self):
-        """kwarg > ``{BRANCH}_EIGEN_GRAM_EPS_REL`` env > the likelihood
-        route's ``_eigen_eps_rel``. Template differences have no
-        second-difference cancellation, so they can (and for chirping
-        sources must) step far smaller than the likelihood route."""
+        """kwarg > ``{BRANCH}_EIGEN_GRAM_EPS_REL`` env > the ll route's
+        :meth:`_eigen_eps_rel`: the Gram route's STARTING step, as a
+        fraction of each prior-box width.
+
+        Template differences have no second-difference cancellation, so they
+        can (and for chirping sources must) step far smaller than the ll
+        route; with the default target the start only seeds the one rescale
+        pass of :meth:`_gram_info`.
+        """
         val = getattr(self, "eigen_gram_eps_rel", None)
         if val is None:
             val = os.environ.get(
@@ -570,14 +641,18 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         return float(val) if val is not None else float(self._eigen_eps_rel())
 
     def _gram_target(self):
-        """kwarg > ``{BRANCH}_EIGEN_GRAM_TARGET`` env > 1e-3: the template
-        change ``||h(x + s e_i) - h(x - s e_i)|| / 2`` each step ``s_i`` is
-        tuned to, as a fraction of ``||h||`` (~1e-3 rad of phase). One
-        rescale pass from the ``_gram_eps_rel`` start; ``0`` keeps the fixed
-        steps. Needed because no single relative step works for every
-        column: a chirping source's f0 goes nonlinear at 1e-6 of its box
-        while masses / spins hit the template's float noise floor at 1e-7
-        (SOBBH chunked toy, 2026-10-06)."""
+        """kwarg > ``{BRANCH}_EIGEN_GRAM_TARGET`` env > 1e-3.
+
+        The template change ``||h(x + s e_i) - h(x - s e_i)|| / 2`` each
+        column's step ``s_i`` is tuned to, as a fraction of ``||h||`` (~1e-3
+        rad of phase); see :meth:`_gram_info`. ``0`` keeps the fixed
+        :meth:`_gram_eps_rel` steps. Needed because no single relative step
+        works for every column of a chirping source: on the SOBBH chunked toy
+        (2026-10-06) f_low goes nonlinear above ~1e-6 of its box while the
+        mass columns hit the template's float noise floor below ~1e-7. With
+        the tuning the Gram converges (target 3e-3 vs 1e-3: 5e-3
+        correlation-normalized; 1e-4 vs 1e-3: 4e-4).
+        """
         val = getattr(self, "eigen_gram_target", None)
         if val is None:
             val = os.environ.get(
@@ -585,15 +660,36 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         return float(val)
 
     def _gram_info(self, x0, walker, widths, return_steps=False):
-        """``<dh_a|dh_b>`` at sampling point ``x0`` against walker ``walker``.
+        """Gram matrix ``<dh_a|dh_b>`` at sampling point ``x0``, scored with
+        walker ``walker``'s noise.
 
-        Rows: the centre plus ``x0 +- s_i e_i``; ``s_i`` starts at
-        ``_gram_eps_rel`` of the prior box and is rescaled ONCE so each
-        column moves the template by ``_gram_target`` of ``||h||``
-        (capped to [1e-12, 1e-2] of the box).
+        ``dh_i = (h(x0 + s_i e_i) - h(x0 - s_i e_i)) / (2 s_i)``: central
+        differences in the SAMPLING basis of the move's own batched templates
+        (:meth:`_gram_templates`, one batch of ``2 * ndim + 1`` rows per
+        pass). The inner products go through walker ``walker``'s container
+        -- the same ``_slice_to_template`` PSD slice and
+        :func:`~lisatools.diagnostic.inner_product` normalization the batched
+        scorers use -- so the matrix is the likelihood's expected curvature.
+        WDM templates only.
+
+        Steps: ``s_i`` starts at :meth:`_gram_eps_rel` of the prior box; with
+        :meth:`_gram_target` ``> 0`` ONE rescale pass sets each ``s_i`` so the
+        half-difference ``||h(x0 + s_i e_i) - h(x0 - s_i e_i)|| / 2`` equals
+        target x ``||h(x0)||`` (each factor clipped to [1e-3, 1e3], each step
+        to [1e-12, 1e-2] of the box; a column whose template does not move
+        at all takes the 1e3 factor). The templates are then rebuilt at the
+        tuned steps.
+
+        Args:
+            x0: ``(ndim,)`` sampling-basis expansion point.
+            walker: walker whose container (data, PSD, device) scores it.
+            widths: ``(ndim,)`` prior-box widths (the step unit).
+            return_steps: also return the final steps (tests).
+
+        Returns:
+            ``(ndim, ndim)`` matrix, or ``(matrix, steps)``.
         """
         from ...diagnostic import inner_product
-        from ...domains import WDMSignal
 
         best = int(walker)
         x0 = np.asarray(x0, dtype=float)
@@ -601,6 +697,8 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         nd = int(x0.size)
         steps = self._gram_eps_rel() * widths
         target = self._gram_target()
+        # the scorers' inner-product kwargs, minus the PSD (passed explicitly
+        # below) and the flags that change inner_product's return form
         like_kw = {
             k: v for k, v in (getattr(self, "waveform_like_kwargs", None) or {}).items()
             if k not in ("psd", "complex", "include_psd_info")
@@ -611,29 +709,36 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
             v = inner_product(x, y, psd=psd, **like_kw)
             return float(np.real(v.get() if hasattr(v, "get") else v))
 
+        def half_differences(s):
+            """``(h0, [half_i], psd)`` at steps ``s``;
+            ``half_i = (h(x0 + s_i e_i) - h(x0 - s_i e_i)) / 2``."""
+            # rows 2i / 2i+1 = x0 +/- s[i] e_i; the last row is x0 itself
+            X = np.repeat(x0[None, :], 2 * nd + 1, axis=0)
+            for i in range(nd):
+                X[2 * i, i] += s[i]
+                X[2 * i + 1, i] -= s[i]
+            arr, box = self._gram_templates(self._to_phys(X), best)
+            h0 = WDMSignal(arr[2 * nd], box)
+            _, _, psd = ac._slice_to_template(h0)
+            half = [WDMSignal(0.5 * (arr[2 * i] - arr[2 * i + 1]), box)
+                    for i in range(nd)]
+            return h0, half, psd
+
         with self._gram_context(best):
-            for _pass in range(2 if target > 0 else 1):
-                X = np.repeat(x0[None, :], 2 * nd + 1, axis=0)
-                for i in range(nd):
-                    X[2 * i, i] += steps[i]
-                    X[2 * i + 1, i] -= steps[i]
-                arr, box = self._gram_templates(self._to_phys(X), best)
-                h0 = WDMSignal(arr[2 * nd], box)
-                _, _, s_box = ac._slice_to_template(h0)
-                half = [WDMSignal(0.5 * (arr[2 * i] - arr[2 * i + 1]), box)
-                        for i in range(nd)]
-                del arr
-                if _pass == 0 and target > 0:
-                    hn = np.sqrt(max(ip(h0, h0, s_box), 0.0))
-                    dn = np.array([np.sqrt(max(ip(d, d, s_box), 0.0)) for d in half])
-                    scale = np.where(dn > 0, target * hn / np.where(dn > 0, dn, 1.0), 1e3)
-                    steps = np.clip(steps * np.clip(scale, 1e-3, 1e3),
-                                    1e-12 * widths, 1e-2 * widths)
-                    continue
+            h0, half, psd = half_differences(steps)
+            if target > 0:
+                hn = np.sqrt(max(ip(h0, h0, psd), 0.0))
+                dn = np.array([np.sqrt(max(ip(d, d, psd), 0.0)) for d in half])
+                scale = np.where(dn > 0, target * hn / np.where(dn > 0, dn, 1.0), 1e3)
+                steps = np.clip(steps * np.clip(scale, 1e-3, 1e3),
+                                1e-12 * widths, 1e-2 * widths)
+                h0 = half = None  # release the first pass before the second
+                h0, half, psd = half_differences(steps)
             info = np.zeros((nd, nd))
             for a in range(nd):
                 for b in range(a, nd):
-                    info[a, b] = info[b, a] = ip(half[a], half[b], s_box) / (steps[a] * steps[b])
+                    info[a, b] = info[b, a] = (
+                        ip(half[a], half[b], psd) / (steps[a] * steps[b]))
         return (info, steps) if return_steps else info
 
     def _build_eigen_table_walker_max(self, leaf, work, widths):

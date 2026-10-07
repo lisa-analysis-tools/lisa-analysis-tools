@@ -331,14 +331,19 @@ class SOBBHLookupParityTest(unittest.TestCase):
 
 
 class SOBBHLookupGramTest(unittest.TestCase):
-    """``SOBBH_EIGEN_INFO=gram`` with the LOOKUP comp (production:
-    ``SOBBH_LIKELIHOOD=lookup`` hands the lookup router to the move as its
-    ``comp``, so the Gram templates are lookup fills like every other SOBBH
-    template). Against an independent Gram of the dense stock templates at the
-    move's own steps. Spins barely move the template: judged apart."""
+    """``SOBBH_EIGEN_INFO=gram`` on the LOOKUP comp.
 
-    KEEP = [0, 1, 4, 5, 6, 7, 8, 9, 10]
+    Production ``SOBBH_LIKELIHOOD=lookup`` hands the lookup router to the move
+    as its ``comp``, so the Gram templates are lookup fills like every other
+    SOBBH template (no code of its own). Checked against an independent Gram
+    of the dense stock templates at the move's own steps. Spins barely move
+    the template, so they are left out of the comparison (``KEEP``). The
+    move's transform is replaced by the identity: rows are waveform basis.
+    """
+
+    KEEP = [0, 1, 4, 5, 6, 7, 8, 9, 10]   # every column but the two spins
     WIDTHS = np.array([40.0, 40.0, 1.0, 1.0, 0.1, 1.0, 1e-3, 1.0, 1.0, 1.0, 1.0])
+    TOL = 3e-2  # measured 1.5e-2 (the tiny test table vs dense templates)
 
     @classmethod
     def setUpClass(cls):
@@ -388,8 +393,6 @@ class SOBBHLookupGramTest(unittest.TestCase):
         print(f"[sobbh lookup gram] max correlation-normalized diff {rel.max():.3e}, "
               f"diag ratio {np.round(np.diag(G) / np.diag(T), 4)}")
         self.assertLess(rel.max(), self.TOL)
-
-    TOL = 3e-2  # measured 1.5e-2 (lookup tiny table vs dense)
 
 
 class SOBBHLookupParityTestHelper:
