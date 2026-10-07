@@ -3740,11 +3740,13 @@ export GB_FSTAT_REFIT_EVERY=2      # SEARCH stages: every 2nd iteration
 # (gb_search) the two coincide exactly, so 40 above is unchanged in meaning;
 # in full_pe the old clock ticked ~1/N as fast and the knob silently meant N
 # times more iterations than it said.
-# refit the F-stat birth grid every 50 PE ITERATIONS (the clock counts
+# refit the F-stat birth grid every 250 PE ITERATIONS (the clock counts
 # iterations; the decision runs when rj_fstat_pe proposes, so the actual
-# spacing is the first rj_fstat_pe draw at or after 50) -- user ruling
-# 2026-10-02: "during PE fstat should refit every 50 iterations" (was 250).
-export GB_FSTAT_REFIT_EVERY_PE=50
+# spacing is the first rj_fstat_pe draw at or after 250) -- user ruling
+# 2026-10-02: "during PE fstat should refit every 50 iterations" (was 250);
+# back to 250 on 2026-10-07 (Mike: "make it default during pe to updating
+# fstat every 250 iterations").
+export GB_FSTAT_REFIT_EVERY_PE=250
 # WHICH WALKER A PE REFIT FITS (code default, NOT exported; user ruling
 # 2026-10-06): GB_FSTAT_PE_REF=random (default) fits each PE epoch to a
 # uniformly RANDOM cold walker with a finite lnL instead of the min-lnL one --

@@ -267,8 +267,10 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         250 until 2026-10-02; user ruling that day: "during PE fstat should
         refit every 50 iterations" (the clock counts iterations and the
         decision runs when rj_fstat_pe is drawn, P = 0.45 per iteration).
+        Back to 250 on 2026-10-07 (Mike: "make it default during pe to
+        updating fstat every 250 iterations").
         """
-        self.assertEqual(self.v9["GB_FSTAT_REFIT_EVERY_PE"], "50")
+        self.assertEqual(self.v9["GB_FSTAT_REFIT_EVERY_PE"], "250")
         # SEARCH stages refit 4x more often (user, 2026-09-25): the grid
         # goes stale as the search subtracts what it finds, so an old grid
         # aims births at peaks already claimed. PE is deliberately NOT
