@@ -331,5 +331,138 @@ class BuildTest(unittest.TestCase):
             rsw.build_rescaled(self.src, self.dst, "global_fit", 2, "tile")
 
 
+def _add_current_gb_tables(path, nw=NW):
+    """The per-(walker, band) search tables and ``saved_after`` of a v9
+    store (the 6mo production store refused on these until 2026-10-07)."""
+    with h5py.File(path, "a") as f:
+        g = f["global_fit"]
+        gb = g["sub_backend/gb"]
+        for i, name in enumerate(rsw.PER_WALKER_BAND_TABLES):
+            _fill(gb.create_dataset(name, (NSTEPS, nw, GB_NB), dtype="f8"),
+                  60 + i)
+        _fill(gb.create_dataset("band_shutoff_w_step", (NSTEPS, 1),
+                                dtype="i8"), 80)
+        _fill(gb.create_dataset("band_stage", (NSTEPS, GB_NB), dtype="i8"), 81)
+        ds = g.create_dataset("saved_after", (IT,), maxshape=(None,),
+                              dtype=h5py.string_dtype(encoding="utf-8"))
+        ds[:] = [f"leg{i}" for i in range(IT)]
+
+
+class CurrentLayoutTest(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.src = make_store(os.path.join(self.tmp, "s_testing.h5"))
+        _add_current_gb_tables(self.src)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_v9_per_walker_tables_and_saved_after_are_classified(self):
+        with h5py.File(self.src, "r") as f:
+            entries, refusals, _, _ = rsw.plan_rescale(f, "global_fit", 2)
+        self.assertEqual(refusals, [])
+        axes = {e.path: e.axis for e in entries}
+        for name in rsw.PER_WALKER_BAND_TABLES:
+            self.assertEqual(axes[f"sub_backend/gb/{name}"], 1, name)
+        for name in ("band_shutoff_w_step", "band_stage"):
+            self.assertIsNone(axes[f"sub_backend/gb/{name}"], name)
+        self.assertIsNone(axes["saved_after"])
+
+    def test_the_table_list_matches_the_state_module(self):
+        from lisatools.globalfit import state as S
+
+        want = (set(S.SEARCH_STAGE_FIELDS) | set(S.SEARCH_SHUTOFF_WINDOW_FIELDS)
+                | {S.SEARCH_SHUTOFF_FIELDS[0]})
+        self.assertEqual(set(rsw.PER_WALKER_BAND_TABLES), want)
+
+
+class LagBuildTest(unittest.TestCase):
+    """PE scale-up from the chain (Mike 2026-10-07): new walker
+    ``k = j * nw + i`` is source walker ``(i + j) % nw`` taken ``j`` saved
+    rows earlier, for every row-wise walker-axis dataset."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.src = make_store(os.path.join(self.tmp, "s_testing.h5"))
+        _add_current_gb_tables(self.src)
+        self.dst = os.path.join(self.tmp, "out.h5")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _check(self, factor, **kw):
+        rsw.build_rescaled(self.src, self.dst, "global_fit", factor, "lag", **kw)
+        n_lagged = 0
+        with h5py.File(self.src, "r") as a, h5py.File(self.dst, "r") as b:
+            entries, _, _, it = rsw.plan_rescale(a, "global_fit", factor)
+            for e in entries:
+                p = f"global_fit/{e.path}"
+                da, db = a[p], b[p]
+                if e.axis is None:
+                    if da.dtype.kind == "O":
+                        self.assertEqual(list(da[:]), list(db[:]), e.path)
+                    continue
+                nw = da.shape[e.axis]
+                for k in range(nw * factor):
+                    j, i = divmod(k, nw)
+                    for r in (range(it) if e.rowwise else [None]):
+                        sa = [slice(None)] * da.ndim
+                        sb = [slice(None)] * da.ndim
+                        if r is not None:
+                            sa[0], sb[0] = max(r - j, 0), r
+                        sa[e.axis], sb[e.axis] = (i + j) % nw, k
+                        self.assertTrue(
+                            _eq(da[tuple(sa)], db[tuple(sb)]),
+                            f"{e.path}: new walker {k}, row {r}")
+                n_lagged += e.rowwise
+        self.assertGreater(n_lagged, 15)
+
+    def test_two_copies_take_the_last_two_rows(self):
+        self._check(2)
+
+    def test_three_copies_rotate_and_lag_by_one_more_each(self):
+        self._check(3)
+
+    def test_four_walkers_rotate_the_right_way(self):
+        """nw = 4 (production): with 2 walkers a rotation by +k and -k
+        coincide, so only nw >= 3 pins the direction."""
+        os.remove(self.src)
+        self.src = make_store(self.src, nw=4)
+        _add_current_gb_tables(self.src, nw=4)
+        self._check(3)
+
+    def test_blocks_that_split_the_walker_axis(self):
+        """A tiny buffer splits every block along the walker axis: the
+        per-slot path, not the in-memory rotation."""
+        os.remove(self.src)
+        self.src = make_store(self.src, nw=4)
+        _add_current_gb_tables(self.src, nw=4)
+        self._check(2, cap_bytes=64)
+
+    def test_too_few_rows_refuses(self):
+        with self.assertRaises(RuntimeError):
+            rsw.build_rescaled(self.src, self.dst, "global_fit", IT + 1, "lag")
+
+    def test_cli_wants_a_multiple_of_four(self):
+        import contextlib
+        import io
+
+        run = os.path.join(self.tmp, "run")
+        os.makedirs(run)
+        os.replace(self.src, os.path.join(run, "s_testing.h5"))
+        out = os.path.join(self.tmp, "run8")
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(rsw.main([run, out, "--nwalkers", "6"]), 2)
+            self.assertEqual(rsw.main([run, out, "--nwalkers", "8"]), 0)  # dry run
+            # 2 -> 16 walkers needs 8 rows; the store has IT = 4
+            self.assertEqual(rsw.main([run, out, "--nwalkers", "16"]), 3)
+        self.assertFalse(os.path.exists(out))
+
+
 if __name__ == "__main__":
     unittest.main()

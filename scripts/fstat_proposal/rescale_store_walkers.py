@@ -1,5 +1,27 @@
 """Clone a run store into a copy with ``factor`` x as many walkers.
 
+PE scale-up from the chain (``--mode lag``, the default since 2026-10-07)
+-------------------------------------------------------------------------
+``--nwalkers N`` (a multiple of 4 and of the store's walker count ``nw``)
+builds the new walkers from SAMPLES IN THE CHAIN: with ``m = N / nw``, new
+walker ``k = j * nw + i`` is source walker ``(i + j) % nw`` lagged by ``j``
+saved rows, for ``j = 0 .. m-1``. So at the last row (the state a resume
+starts from) 4 -> 8 walkers takes the last 2 rows of the 4 chains, 4 -> 32
+the last 8, and each block of ``nw`` walkers is rotated by one more slot
+(8 walkers: 0 1 2 3 | 1 2 3 0) so the same source chain sits at a different
+index in every block -- the layout that mixes best should the permuted
+("fancy") swaps be turned on later (Mike 2026-10-07; they stay OFF,
+GB_RUN_FANCY_TEMPERING=0). Every row-wise dataset (main chain/inds/
+log_like/log_prior, every sub_backend chain, ladder, d_h/h_h and per-walker
+band table) is mapped the same way, so each new walker is ONE consistent
+past state of the whole model, and over the whole history walker ``k``
+reads as its source chain delayed by ``j`` rows (rows before the start
+repeat row 0). Walkers ``0 .. nw-1`` are the source chains unchanged.
+Walker-free per-row data (betas, band temperatures, counters) is the row's
+own; the walker-axis datasets with no step axis (``accepted``) take the
+same rotation without a lag. Run the copy with the PE settings and
+``NWALKERS=N``.
+
 Why this exists: the walker-block layout gives each rank ``B = nwalkers /
 n_compute`` walkers, and several things are only measurable (or only
 CORRECT) at ``B > 1`` -- above all the GB/VGB permuted tempering swap,
@@ -87,6 +109,19 @@ from compact_gf_store import (  # noqa: E402  (path shim above)
 
 MB = 1024 ** 2
 
+#: Per-(walker, band) GB search tables, ``(nwalkers, num_bands or
+#: num_cap_cells)`` per row: the search-stage record and the per-walker RJ
+#: shutoff valve with its window. Mirrors lisatools.globalfit.state's
+#: SEARCH_STAGE_FIELDS, SEARCH_SHUTOFF_FIELDS[0] and
+#: SEARCH_SHUTOFF_WINDOW_FIELDS (a test keeps the two in step; this script
+#: stays importable without the package).
+PER_WALKER_BAND_TABLES = (
+    "band_stage_w", "band_stage_occ_last_w", "band_stage_streak_w",
+    "band_rj_shutoff_w",
+    "band_shutoff_best_w", "band_shutoff_streak_w", "band_cold_logl_max_w",
+    "band_cold_logl_w", "band_shutoff_reset_w", "band_cold_logl_peak_w",
+)
+
 
 # --------------------------------------------------------------------------
 # walker-axis classification
@@ -107,6 +142,8 @@ def _main_signatures(attrs, branch_shapes):
         "accepted": (2, (ns, nt, nw)),
         "samplers_running": (None, (ns,)),
         "swaps_accepted": (None, None),
+        # per-row leg-ender names (hdfbackend.SAVED_AFTER_DS), walker-free
+        "saved_after": (None, None),
     }
     for branch, (nleaves, ndim) in branch_shapes.items():
         sig[f"chain/{branch}"] = (3, (ns, nt, nw, nleaves, ndim))
@@ -180,6 +217,12 @@ def _sub_signatures(a):
                      "cap_cell_best_ll_w"):
             sig[name] = ((1, (nw, nc)), (1, (nw, nb)))
         sig["band_best_ll_w"] = (1, (nw, nb))
+        for name in PER_WALKER_BAND_TABLES:
+            sig[name] = ((1, (nw, nb)), (1, (nw, nc)))
+        # the valve's recipe-step stamp and the min-over-walkers stage
+        # mirror: walker-free despite the names
+        sig["band_shutoff_w_step"] = (None, (1,))
+        sig["band_stage"] = (None, (nb,))
         # per-band and per-(band, temp) state: the leaf caps, the shutoff
         # ladder and the swap census. All walker-free, which is exactly why
         # a walker rescale can carry the whole GB search state forward.
@@ -283,7 +326,7 @@ def plan_rescale(f, group, factor):
         entries.append(Entry(path, dset, full_axis, rowwise, "ok"))
 
     for name in ("log_like", "log_prior", "betas", "accepted",
-                 "samplers_running", "swaps_accepted"):
+                 "samplers_running", "swaps_accepted", "saved_after"):
         if name in g:
             classify(name, g[name], main_sig, nw_main, name)
     for fam in ("chain", "inds", "blobs"):
@@ -374,7 +417,23 @@ def _expand(block, axis, factor, mode):
     return np.tile(block, reps)
 
 
-def _copy_dataset(src, dst, axis, factor, mode, n_rows, cap_bytes):
+def _lagged_rows(src, sl, lag):
+    """Source rows ``r - lag`` for the destination rows of block ``sl``
+    (rows before the start repeat row 0)."""
+    a, b = int(sl[0].start or 0), int(sl[0].stop)
+    rest = tuple(sl[1:])
+    lo, hi = a - lag, b - lag
+    if hi <= 0:
+        return np.repeat(src[(slice(0, 1),) + rest], b - a, axis=0)
+    part = src[(slice(max(lo, 0), hi),) + rest]
+    if lo < 0:
+        part = np.concatenate(
+            [np.repeat(src[(slice(0, 1),) + rest], -lo, axis=0), part], axis=0)
+    return part
+
+
+def _copy_dataset(src, dst, axis, factor, mode, n_rows, cap_bytes,
+                  rowwise=False):
     """Copy ``src`` into ``dst``, duplicating the walker axis.
 
     Blocks may split the walker axis, so tiling inside a block would be
@@ -383,7 +442,10 @@ def _copy_dataset(src, dst, axis, factor, mode, n_rows, cap_bytes):
     is correct for any block split because tile maps destination walker
     ``w`` to source walker ``w % nwalkers``. ``repeat`` mode cannot be
     written that way (its destination walkers interleave), so there the
-    block is expanded in memory and written to a stretched slice.
+    block is expanded in memory and written to a stretched slice. ``lag``
+    writes slot ``i`` of copy ``k`` from source walker ``(i + k) % nw``,
+    taken ``k`` rows earlier for a ROW-WISE dataset (:func:`_lagged_rows`)
+    and at the same index for a walker-axis dataset with no step axis.
     """
     if not src.shape:
         dst[()] = src[()]
@@ -401,6 +463,26 @@ def _copy_dataset(src, dst, axis, factor, mode, n_rows, cap_bytes):
         if mode == "repeat":
             s[axis] = slice(w0 * factor, w1 * factor)
             dst[tuple(s)] = _expand(block, axis, factor, mode)
+        elif mode == "lag":
+            # destination slot i of copy k <- source walker (i + k) % nw,
+            # k rows earlier (row-wise datasets only). Copy 0 is the block.
+            s[axis] = slice(w0, w1)
+            dst[tuple(s)] = block
+            for k in range(1, factor):
+                if (w0, w1) == (0, nw):
+                    # the block spans every walker: one (lagged) read per
+                    # copy, rotated in memory -- slot i <- walker (i+k) % nw
+                    s[axis] = slice(k * nw, (k + 1) * nw)
+                    part = _lagged_rows(src, sl, k) if rowwise else block
+                    dst[tuple(s)] = np.roll(part, -k, axis=axis)
+                    continue
+                for i in range(w0, w1):
+                    src_sl = list(sl)
+                    src_sl[axis] = slice((i + k) % nw, (i + k) % nw + 1)
+                    src_sl = tuple(src_sl)
+                    s[axis] = slice(k * nw + i, k * nw + i + 1)
+                    dst[tuple(s)] = (_lagged_rows(src, src_sl, k) if rowwise
+                                     else src[src_sl])
         else:
             for k in range(factor):
                 s[axis] = slice(k * nw + w0, k * nw + w1)
@@ -415,6 +497,10 @@ def build_rescaled(src_path, dst_path, group, factor, mode,
         if refusals:
             raise RuntimeError("refusing to rescale:\n  "
                                + "\n  ".join(refusals))
+        if mode == "lag" and iteration < factor:
+            raise RuntimeError(
+                f"lag mode needs at least factor={factor} saved rows; the "
+                f"store has iteration={iteration}")
         with h5py.File(dst_path, "w") as fd:
             _copy_attrs(fs, fd)
             # groups + attrs first, so attribute fixups below have a home
@@ -439,7 +525,7 @@ def build_rescaled(src_path, dst_path, group, factor, mode,
                     e.dset.shape[0] if e.dset.shape else 0)
                 t0 = time.time()
                 _copy_dataset(e.dset, new, e.axis, factor, mode, rows,
-                              cap_bytes)
+                              cap_bytes, rowwise=e.rowwise)
                 if verbose:
                     print(f"    {e.path:52s} axis={e.axis} rows={rows} "
                           f"{time.time() - t0:6.1f}s")
@@ -541,13 +627,19 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("src_dir", help="the run directory to clone")
     ap.add_argument("dst_dir", help="the new run directory (must not exist)")
-    ap.add_argument("--factor", type=int, default=2,
-                    help="walker multiplier (default 2: 4 -> 8)")
-    ap.add_argument("--mode", default="tile", choices=("tile", "repeat"),
-                    help="tile (default): new walker w copies w %% nwalkers, "
-                         "so each RANK gets distinct states. repeat: each "
-                         "source walker is duplicated in place, so a rank "
-                         "holds one state twice")
+    ap.add_argument("--nwalkers", type=int, default=None,
+                    help="target walker count: a multiple of 4 and of the "
+                         "store's walker count (4 -> 8 uses the last 2 rows "
+                         "of the chain, 4 -> 32 the last 8)")
+    ap.add_argument("--factor", type=int, default=None,
+                    help="walker multiplier instead of --nwalkers")
+    ap.add_argument("--mode", default="lag", choices=("lag", "tile", "repeat"),
+                    help="lag (default): new walker j*nw + w is walker w "
+                         "lagged by j saved rows, i.e. the new walkers come "
+                         "from the last nwalkers/nw samples of each chain. "
+                         "tile: new walker w is a copy of w %% nwalkers at "
+                         "the same row. repeat: each source walker is "
+                         "duplicated in place")
     ap.add_argument("--group", default="global_fit")
     ap.add_argument("--base-name", default=None,
                     help="restrict the store search to this filename prefix")
@@ -571,27 +663,47 @@ def main(argv=None):
     if os.path.exists(dst_dir) and args.apply:
         print(f"REFUSING: {dst_dir} already exists", file=sys.stderr)
         return 3
-    if args.factor < 2:
-        print("--factor must be >= 2", file=sys.stderr)
+    if (args.nwalkers is None) == (args.factor is None):
+        print("give exactly one of --nwalkers / --factor", file=sys.stderr)
         return 2
 
     store = find_store(src_dir, args.base_name)
     print(f"\n  store           : {store}")
+    with h5py.File(store, "r") as f:
+        nw = int(f[args.group].attrs["nwalkers"])
+    if args.nwalkers is not None:
+        if args.nwalkers % 4 or args.nwalkers % nw or args.nwalkers <= nw:
+            print(f"--nwalkers {args.nwalkers} must be a multiple of 4 and of "
+                  f"the store's {nw} walkers, and larger than {nw}",
+                  file=sys.stderr)
+            return 2
+        args.factor = args.nwalkers // nw
+    if args.factor < 2 or (nw * args.factor) % 4:
+        print(f"--factor {args.factor}: need >= 2 and {nw} x factor a "
+              f"multiple of 4", file=sys.stderr)
+        return 2
 
     with h5py.File(store, "r") as f:
         entries, refusals, n_alloc, iteration = plan_rescale(
             f, args.group, args.factor)
-        nw = int(f[args.group].attrs["nwalkers"])
 
     print(f"  allocated rows  : {n_alloc}")
     print(f"  stored iteration: {iteration}  (rows 0..{iteration - 1} copied)")
     print(f"  walkers         : {nw} -> {nw * args.factor}  "
           f"(mode={args.mode})")
-    if args.mode == "tile":
-        lay = [w % nw for w in range(nw * args.factor)]
+    if args.mode == "lag":
+        if iteration < args.factor:
+            print(f"REFUSING: lag mode needs {args.factor} saved rows, the "
+                  f"store has {iteration}", file=sys.stderr)
+            return 3
+        print(f"  resume state of each new walker (row, source walker): "
+              f"{[(iteration - 1 - w // nw, (w % nw + w // nw) % nw) for w in range(nw * args.factor)]}")
+    elif args.mode == "tile":
+        print(f"  source walker of each new walker: "
+              f"{[w % nw for w in range(nw * args.factor)]}")
     else:
-        lay = [w // args.factor for w in range(nw * args.factor)]
-    print(f"  source walker of each new walker: {lay}")
+        print(f"  source walker of each new walker: "
+              f"{[w // args.factor for w in range(nw * args.factor)]}")
 
     scaled = [e for e in entries if e.axis is not None]
     print(f"\n  datasets: {len(entries)} total, {len(scaled)} carry a "
@@ -692,9 +804,9 @@ def main(argv=None):
     print(f"  wrote {dst_store} "
           f"({os.path.getsize(dst_store) / MB:.1f} MB) in "
           f"{time.time() - t0:.1f}s")
-    print(f"\n  relaunch with:\n"
-          f"    STORE_DIR={dst_dir} NGPUS=4 NWALKERS={nw * args.factor} "
-          f"GF_FANOUT_DIGEST=1 ./scripts/fstat_proposal/submit_gf_6mo_v8.sh")
+    print(f"\n  relaunch: your usual launch line with\n"
+          f"    STORE_DIR={dst_dir}/ NWALKERS={nw * args.factor}\n"
+          f"  prepended (e.g. ./scripts/fstat_proposal/submit_gf_6mo_v9_4gpu.sh)")
     return 0
 
 
