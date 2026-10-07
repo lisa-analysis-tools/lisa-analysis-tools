@@ -5151,9 +5151,21 @@ if nz.size:
         from lisatools.globalfit.stock.erebor.transforms import gb_amp_from_dist
     except Exception:
         gb_amp_from_dist = None
-    _gbstack = []
-    for _it_, _al_, _ch_ in _pool_gb_iter(POOL_ITS_SAMPLES, cols=(0, 1, 2)):
+    # SPLIT POOLED SAMPLES INTO (older iterations, LATEST iteration)
+    # (2026-10-05, user ruling). The canvas overlays an amber ring on the
+    # most-recent-iteration rows so the reader can see where the sampler
+    # just WAS versus where it has been. Two stacks here, concatenated
+    # after decimation, so the latest-iteration rows are NEVER decimated
+    # out even on a dense store: the stride is applied only to the older
+    # pool.
+    _pool_rows_cache = list(_pool_gb_iter(POOL_ITS_SAMPLES, cols=(0, 1, 2)))
+    _latest_it_in_pool = max((it_ for it_, _, _ in _pool_rows_cache),
+                              default=-1)
+    _gbstack_old = []
+    _gbstack_latest = []
+    for _it_, _al_, _ch_ in _pool_rows_cache:
         EXPL_ITS += 1
+        _is_latest = (_it_ == _latest_it_in_pool)
         for w in range(nwalk):
             al = np.nonzero(_al_[w])[0]
             if not al.size:
@@ -5167,30 +5179,53 @@ if nz.size:
                 _y = np.log10(np.maximum(_amp, 1e-30))
             else:
                 _y = 1.0 / _d
-            _gbstack.append(np.column_stack(
-                [_f, _y, np.full(al.size, float(w))]))
-    _R = (np.concatenate(_gbstack) if _gbstack
-          else np.zeros((0, 3), dtype=float))
-    EXPL_RAW = int(_R.shape[0])
+            _rows = np.column_stack([
+                _f, _y,
+                np.full(al.size, float(w)),
+                np.full(al.size, 1.0 if _is_latest else 0.0),
+            ])
+            (_gbstack_latest if _is_latest else _gbstack_old).append(_rows)
+    _R_old = (np.concatenate(_gbstack_old) if _gbstack_old
+              else np.zeros((0, 4), dtype=float))
+    _R_latest = (np.concatenate(_gbstack_latest) if _gbstack_latest
+                  else np.zeros((0, 4), dtype=float))
+    EXPL_RAW = int(_R_old.shape[0] + _R_latest.shape[0])
+    N_LATEST = int(_R_latest.shape[0])
     # PAGE-WEIGHT GUARD. Pooling multiplies this array by the window, and
     # every row is JSON text in the page. On the 3-month store the pooled
     # cloud is ~47k rows (~1 MB of JSON) and needs no decimation at all; a
     # denser store would, so the budget is enforced here -- AFTER pooling,
     # exactly like the truth-cross decimation below, and by striding whole
-    # rows so the f0 coverage stays uniform. The truth-cross rules
-    # (recovery-proximity protection + per-window floor) are untouched.
+    # rows so the f0 coverage stays uniform. The latest-iteration rows are
+    # EXEMPT from the stride so the "where is the sampler right now?"
+    # overlay cannot degrade on a dense store; the budget is spent against
+    # the older rows alone. The truth-cross rules (recovery-proximity
+    # protection + per-window floor) are untouched.
     EXPL_CAP = 150000
     if EXPL_RAW > EXPL_CAP:
-        EXPL_STRIDE = int(np.ceil(EXPL_RAW / EXPL_CAP))
-        _R = _R[::EXPL_STRIDE]
+        _budget_old = max(1, EXPL_CAP - N_LATEST)
+        if _R_old.shape[0] > _budget_old:
+            EXPL_STRIDE = int(np.ceil(_R_old.shape[0] / _budget_old))
+            _R_old = _R_old[::EXPL_STRIDE]
+    # Older rows first, latest rows last -- the canvas draws the base
+    # cyan layer in order and then overlays rings on p[3] == 1, so the
+    # order here does not affect the overlay pass, but keeping the
+    # latest at the tail matches the "latest = most recent" reading
+    # convention and makes the row-slice easier to inspect.
+    _R = (np.concatenate([_R_old, _R_latest])
+          if (_R_old.size or _R_latest.size)
+          else np.zeros((0, 4), dtype=float))
     # Coordinates are ROUNDED before serialization: f0 to 1e-7 mHz (about
     # 1e-3 of an FD bin at three months) and log10 A to 1e-4 dex. Both are
     # far below anything the canvas or the match tolerance can resolve, and
     # they cut the JSON from ~40 to ~23 bytes a row, which is what keeps the
     # pooled cloud from ballooning the page.
-    expl["gb"] = [[round(float(_a), 7), round(float(_b), 4), int(_c)]
-                  for _a, _b, _c in _R]
-    del _gbstack, _R
+    expl["gb"] = [[round(float(_a), 7), round(float(_b), 4),
+                   int(_c), int(_d_flag)]
+                  for _a, _b, _c, _d_flag in _R]
+    del _gbstack_old, _gbstack_latest, _R_old, _R_latest, _R
+    expl["gb_latest_iter"] = int(_latest_it_in_pool)
+    expl["gb_n_latest"] = N_LATEST
 expl["gb_its"] = int(EXPL_ITS)
 expl["gb_raw"] = int(EXPL_RAW)
 expl["gb_stride"] = int(EXPL_STRIDE)
@@ -7585,6 +7620,12 @@ html = f"""<title>LISA Global Fit {RUN_LABEL}</title>
      see the loud ones FIRST on a crowded panel. */
   --truthorange:#FF8A1A;
   --truthyellow:#F7D33C;
+  /* Zoom-canvas latest-iteration overlay ring (2026-10-05, user ruling).
+     MAGENTA, held far from --cyan (base cloud), --amber, and the
+     three missed-detection tiers so it reads as "where the sampler
+     IS RIGHT NOW" without blending into the orange X's that sit
+     elsewhere on the plane. */
+  --latest-ring:#FF5CEC;
   /* Sub-threshold catalogue sources on the zoom canvas. Light enough to
      read as a population against --bg, dark enough that the red
      detectable crosses stay the thing the eye lands on. */
@@ -7595,6 +7636,7 @@ html = f"""<title>LISA Global Fit {RUN_LABEL}</title>
   --truthred:#E00016;
   --truthorange:#D16500;
   --truthyellow:#B38F00;
+  --latest-ring:#C300A8;
   --truthgrey:#9AA7B4;
 }}
 * {{ box-sizing:border-box; }}
@@ -7789,6 +7831,9 @@ window, so a short snapshot shows the last few legs. Legs covered:
 four classification layers on top of the posterior cloud:
 <span style="color:var(--cyan)">cyan</span> = pooled posterior samples of
 the current model,
+<span style="color:var(--latest-ring)">faint magenta rings</span> = samples from
+the MOST RECENT stored iteration (visible on close inspection; deliberately
+subdued so the recovery markers stay the thing the eye lands on),
 <span style="color:var(--dim)">grey X</span> = undetectable catalogue rows,
 missed-detection X&apos;s tiered by injected SNR
 (<span style="color:var(--truthyellow)">yellow</span> 7&ndash;10,
@@ -8231,7 +8276,7 @@ function viewCtl(px, cv, api) {{
   // catalogue completeness cannot be read off the recovered cloud alone.
   let showT = N_OVERLAY > 0;
   const baseCap = (hasGB
-    ? `GB samples: ${{DATA.gb.length}} alive-source rows pooled over the last ${{DATA.gb_its}} stored iterations x all cold walkers${{DATA.gb_stride > 1 ? ` (1-in-${{DATA.gb_stride}} of ${{DATA.gb_raw}} for page weight)` : ""}}; y = log10 amplitude from (dist, f0, Mc). Posterior cloud = cyan; catalogue: grey X undetectable, missed-detection X tiered by injected SNR (yellow 7-10, orange 10-20, red >20); recovered source markers: closed green circle (matched) or open violet circle (not matched). ${{MATCH_NOTE}}`
+    ? `GB samples: ${{DATA.gb.length}} alive-source rows pooled over the last ${{DATA.gb_its}} stored iterations x all cold walkers${{DATA.gb_stride > 1 ? ` (1-in-${{DATA.gb_stride}} of ${{DATA.gb_raw}} for the OLDER pool; the ${{DATA.gb_n_latest || 0}} latest-iteration rows are never decimated)` : ""}}; y = log10 amplitude from (dist, f0, Mc). Posterior cloud = cyan, with faint magenta rings on the ${{DATA.gb_n_latest || 0}} samples from the MOST RECENT iteration (${{DATA.gb_latest_iter >= 0 ? "iter " + DATA.gb_latest_iter : "n/a"}}); catalogue: grey X undetectable, missed-detection X tiered by injected SNR (yellow 7-10, orange 10-20, red >20); recovered source markers: closed green circle (matched) or open violet circle (not matched). ${{MATCH_NOTE}}`
     : `No GB sources alive yet - showing the 55 VGBs (${{DATA.vgb_its}} stored iterations x ${{DATA.nwalk}} walker samples each) as 1/dist vs leaf index. GB samples take over automatically once births land.`);
   const setCap = () => {{
     cap.textContent = baseCap + (N_OVERLAY
@@ -8278,11 +8323,15 @@ function viewCtl(px, cv, api) {{
     g.fillText(xlab, w / 2 - 40, h - 2);
     g.save(); g.translate(10, h / 2); g.rotate(-Math.PI / 2);
     g.fillText(hasGB ? "log10 A" : "1 / dist [1/kpc]", -30, 0); g.restore();
-    // LAYERING (2026-09-20). Draw order, bottom to top:
-    //   1. grey X's for undetectable catalogue rows        (--dim)
-    //   2. cyan posterior cloud                           (--cyan)
-    //   3. SNR-tiered X's for detectable-not-recovered    (--truthyellow/orange/red)
-    //   4. green filled / violet open circles for recovered sources
+    // LAYERING (2026-09-20, updated 2026-10-05). Draw order, bottom to top:
+    //   1. grey X's for undetectable catalogue rows            (--dim)
+    //   2. cyan posterior cloud                                (--cyan)
+    //   3. FAINT magenta rings on the most recent iteration    (--latest-ring, alpha 0.35)
+    //   4. SNR-tiered X's for detectable-not-recovered         (--truthyellow/orange/red)
+    //   5. green filled / violet open circles for recovered sources
+    // Order (3) sits above the cyan cloud so the latest-iter rows can be
+    // picked out among older samples, but UNDER (4) and (5) so the
+    // recovery markers stay the thing the eye lands on.
     // Steps 1, 3, 4 are gated by `showT`. Step 2 always draws (that's the
     // "posterior of the current model" and reads even without an overlay).
     // The cloud sits between the two truth layers so the red misses stay
@@ -8323,6 +8372,30 @@ function viewCtl(px, cv, api) {{
     }}
     g.fill();
     g.globalAlpha = 1;
+    // LATEST-ITER RING (2026-10-05, user ruling): a FAINT magenta ring
+    // sits just over the cyan cloud so the eye can tell where the
+    // sampler is right now versus where it has been.  Deliberately
+    // UNDER the X markers and the recovered-source circles so the
+    // recovery markers stay prominent -- the earlier top-layer
+    // placement at full alpha drowned the green dots and read as the
+    // headline, which it is not.  Alpha 0.35 + 0.9 px line + 2.6 px
+    // radius: visible on close inspection, invisible from across the
+    // panel.
+    if (hasGB) {{
+      g.strokeStyle = C("--latest-ring");
+      g.lineWidth = 0.9; g.lineCap = "round";
+      g.globalAlpha = 0.35;
+      const rl = 2.6;
+      g.beginPath();
+      for (const p of pts) {{
+        if (p.length < 4 || p[3] !== 1) continue;
+        const x = sx(p[0]), y = sy(p[1]);
+        if (x < ml || x > w - mr || y < mt || y > h - mb) continue;
+        g.moveTo(x + rl, y); g.arc(x, y, rl, 0, 6.29);
+      }}
+      g.stroke();
+      g.globalAlpha = 1;
+    }}
     if (showT) {{
       // Missed-detection X's, tiered by SNR (2026-10-05): yellow 7-10,
       // orange 10-20, red >20. Three passes so each tier's strokeStyle
