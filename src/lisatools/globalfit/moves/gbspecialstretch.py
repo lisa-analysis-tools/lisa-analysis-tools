@@ -7092,11 +7092,45 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             return False
         return os.environ.get("GB_FSTAT_GB_FREE", "1") == "1"
 
-    def _fstat_fit_ref_from(self, lls):
+    def _fstat_fit_ref_rule(self) -> str:
+        """How this move picks the walker an F-stat EPOCH is fitted to.
+
+        ``"min"`` in search (always) and ``"random"`` in PE by default
+        (user ruling 2026-10-06): a PE refit fits a UNIFORMLY RANDOM cold
+        walker instead of the min-lnL one. ``GB_FSTAT_PE_REF=min`` restores
+        the min-lnL rule in PE; it has no effect on search moves
+        (:attr:`fstat_search_residual`).
+
+        Why random in PE: in PE every walker is a posterior sample, and the
+        min-lnL walker is a systematically atypical one, so fitting it every
+        epoch shapes the birth grid around the ensemble's worst state. A
+        random cold walker per epoch spreads the fits over the posterior.
+        """
+        if self.fstat_search_residual:
+            return "min"
+        rule = os.environ.get("GB_FSTAT_PE_REF", "random").strip().lower()
+        if rule not in ("random", "min"):
+            raise ValueError(
+                f"GB_FSTAT_PE_REF must be 'random' or 'min'; got {rule!r}")
+        return rule
+
+    def _fstat_fit_ref_from(self, lls, epoch=None):
         """Index of the walker whose residual an F-stat EPOCH is fitted to.
 
-        ``argmin`` -- the MIN-lnL cold walker -- in BOTH search and PE
-        (user ruling 2026-09-21 for search, extended to PE 2026-09-26).
+        With ``epoch`` given and :meth:`_fstat_fit_ref_rule` ``"random"``
+        (PE, the default there since 2026-10-06): a uniformly random cold
+        walker among those with a finite lnL. The draw is seeded by
+        ``(GB_FSTAT_PE_REF_SEED, epoch)`` (seed default 0), so it is random
+        across epochs but the SAME walker for a given epoch on every
+        process and after a restart: the in-flight checkpoint fingerprint
+        (``wref=``) and the centre table on a load path both re-derive the
+        fit's walker instead of drawing a new one.
+
+        Otherwise (search; PE under ``GB_FSTAT_PE_REF=min``; any caller that
+        passes no epoch, e.g. the per-propose distance-birth centre
+        :meth:`_fstat_reference_walker`): ``argmin`` -- the MIN-lnL cold
+        walker (user ruling 2026-09-21 for search, extended to PE
+        2026-09-26, superseded for the PE fit by the random rule above).
 
         **Why the min in search.** The search fit no longer opens the
         GB-free window, so it sweeps a walker's residual exactly as it
@@ -7121,10 +7155,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         standing trap: ``fstat_search_residual`` now selects ONLY whether
         the GB-free window opens, not who is ranked.
 
-        Only the FIT path routes through here. The F-stat distance-birth
-        proposal CENTER (``_fstat_walker_ref``, set once per propose) keeps
-        :meth:`_fstat_reference_walker` and its argmax unchanged.
+        The F-stat distance-birth proposal CENTER (``_fstat_walker_ref``,
+        set once per propose) also routes here through
+        :meth:`_fstat_reference_walker`, but without an epoch, so it keeps
+        the argmin.
         """
+        lls = np.asarray(lls, dtype=float).reshape(-1)
+        if epoch is not None and self._fstat_fit_ref_rule() == "random":
+            pool = np.flatnonzero(np.isfinite(lls))
+            if pool.size == 0:
+                pool = np.arange(lls.size)
+            seed = int(os.environ.get("GB_FSTAT_PE_REF_SEED", "0"))
+            rng = np.random.default_rng([seed, int(epoch)])
+            return int(pool[rng.integers(pool.size)])
         return int(np.argmin(lls))
 
     def _fstat_fit_refs_from(self, lls, n):
@@ -7155,12 +7198,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         order = np.argsort(lls, kind="stable")
         return [int(w) for w in order[:n]]
 
-    def _fstat_global_reference(self, model):
+    def _fstat_global_reference(self, model, *, epoch=None):
         """``(w_global, owner_rank, local_index, lls)`` for the F-stat fit.
 
-        The GLOBAL max-likelihood walker, not this rank's local one (or the
-        global MIN-likelihood one under :attr:`fstat_search_residual` -- see
-        :meth:`_fstat_fit_ref_from`). Under
+        The GLOBAL reference walker chosen by :meth:`_fstat_fit_ref_from`
+        over ALL cold walkers -- min-lnL in search, a random one per
+        ``epoch`` in PE (``epoch=None`` keeps the min) -- not a pick over
+        this rank's local block. Under
         the walker-block layout ``_fstat_reference_walker`` ranks only the
         HEAD'S OWN block, so the epoch would be fitted against the best of B
         walkers instead of the best of N -- and the index it returns is used
@@ -7189,13 +7233,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # DELEGATE, do not re-derive: ``_fstat_reference_walker`` is the
             # local-ranking entry point (subclasses and tests override it)
             # and it now carries the same min/max mode switch this method
-            # applies to the gathered vector below.
-            w = self._fstat_reference_walker(model)
+            # applies to the gathered vector below. The PE random rule is the
+            # exception: it needs the epoch, which the local entry point does
+            # not take, so it ranks this process's ACA (every walker) here.
+            if epoch is not None and self._fstat_fit_ref_rule() == "random":
+                w = self._fstat_fit_ref_from(
+                    _to_numpy(model.analysis_container_arr.likelihood()),
+                    epoch)
+            else:
+                w = self._fstat_reference_walker(model)
             return int(w), 0, int(w), np.full(1, np.nan)
         try:
             lls = np.asarray(_to_numpy(fanout.gather_likelihood(
                 model.analysis_container_arr)), dtype=float)
-            w_global = self._fstat_fit_ref_from(lls)
+            w_global = self._fstat_fit_ref_from(lls, epoch)
         except Exception as exc:
             # Never silent: a broken ranking here quietly pins every F-stat
             # reference to walker 0 for the whole run. The owner of walker 0
@@ -30253,8 +30304,8 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
 
         ``GB_FSTAT_FIT_WALKERS``, **default 1 in BOTH modes** (user ruling
         2026-09-23): the epoch keeps being fitted to the single reference
-        walker -- the MIN-lnL cold chain in search, the max in PE -- exactly
-        as it is today. The multi-walker union is entirely opt-in, and at
+        walker of :meth:`_fstat_fit_ref_from` -- the MIN-lnL cold chain in
+        search, a random cold walker per epoch in PE (2026-10-06). The multi-walker union is entirely opt-in, and at
         the default this whole path is dormant and bit-identical.
 
         ``1`` -- the reference walker only, today's behaviour.
@@ -30968,7 +31019,7 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
                 self.name, k, n_compute, cache_dir)
         else:
             w_global, owner_rank, local_index, lls = (
-                self._fstat_global_reference(model))
+                self._fstat_global_reference(model, epoch=k))
             # PUBLISHED FOR THE CENTRE TABLE, keyed by the epoch: it must
             # score through the SAME global reference this fit used (decision
             # 6), and re-deriving it there would be a second, independently
@@ -31263,8 +31314,10 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
                 if _cached is not None and int(_cached[0]) == int(k):
                     _k0, w_global, owner_rank, local_index = _cached
                 else:
+                    # epoch=k: under the PE random rule this re-derives the
+                    # walker the epoch was fitted to (the draw is per epoch).
                     w_global, owner_rank, local_index, _lls = (
-                        self._fstat_global_reference(model))
+                        self._fstat_global_reference(model, epoch=k))
                 self._fstat_ref_row_fanout(model, branches, w_global,
                                            owner_rank, local_index)
                 _release_after = True

@@ -13,6 +13,7 @@ the parallel split existed. They are the single-process regression gate:
 import contextlib
 import dataclasses
 import hashlib
+import inspect
 import json
 import os
 import shutil
@@ -762,6 +763,71 @@ class GlobalReferenceTest(unittest.TestCase):
         self.assertEqual(lls.size, 1)
         self.assertTrue(np.isnan(lls).all())
         self.assertTrue(any("could not rank walkers" in line for line in captured.output))
+
+
+class PERandomReferenceTest(unittest.TestCase):
+    """PE fits each F-stat epoch to a RANDOM cold walker (2026-10-06):
+    seeded per epoch (restarts re-derive it), finite-lnL walkers only;
+    search, ``GB_FSTAT_PE_REF=min`` and epoch-less callers keep the min."""
+
+    LLS = [50.0, 49.0, 48.0, 47.0, 46.0, 45.0, 1.0, 43.0]   # min at 6
+
+    def _move(self, search=False):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        move = gbs.GBSpecialBase.__new__(gbs.GBSpecialBase)
+        move.name = "gb_test"
+        move.fstat_search_residual = search
+        return move
+
+    def _env(self, **kw):
+        keys = ("GB_FSTAT_PE_REF", "GB_FSTAT_PE_REF_SEED")
+        env = {k: v for k, v in os.environ.items() if k not in keys}
+        env.update(kw)
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    def test_pe_epochs_spread_over_every_walker_and_repeat_per_epoch(self):
+        move = self._move()
+        with self._env():
+            picks = [move._fstat_fit_ref_from(self.LLS, k) for k in range(400)]
+            again = [move._fstat_fit_ref_from(self.LLS, k) for k in range(400)]
+        self.assertEqual(picks, again)                      # per-epoch seed
+        counts = np.bincount(picks, minlength=len(self.LLS))
+        self.assertTrue(np.all(counts > 25), counts)        # ~50 each
+        self.assertLess(counts[6], 100)                     # not pinned to the min
+
+    def test_pe_skips_walkers_without_a_finite_lnl(self):
+        lls = [np.nan, -np.inf, 3.0, np.nan]
+        with self._env():
+            picks = {self._move()._fstat_fit_ref_from(lls, k) for k in range(50)}
+        self.assertEqual(picks, {2})
+
+    def test_search_min_knob_and_epochless_callers_keep_the_min(self):
+        with self._env():
+            self.assertEqual(self._move(search=True)._fstat_fit_ref_from(self.LLS, 3), 6)
+            self.assertEqual(self._move()._fstat_fit_ref_from(self.LLS), 6)
+        with self._env(GB_FSTAT_PE_REF="min"):
+            self.assertEqual(self._move()._fstat_fit_ref_from(self.LLS, 3), 6)
+        with self._env(GB_FSTAT_PE_REF="best"):
+            with self.assertRaises(ValueError):
+                self._move()._fstat_fit_ref_from(self.LLS, 3)
+
+    def test_global_reference_maps_the_random_walker_to_its_owner(self):
+        layout = _build_fake_layout(8, 2)
+        move = self._move()
+        move.fanout = _StubFanout(layout, self.LLS)
+        with self._env():
+            want = move._fstat_fit_ref_from(self.LLS, 5)
+            w, owner, local, _ = move._fstat_global_reference(_DummyModel(), epoch=5)
+        self.assertEqual(w, want)
+        self.assertEqual((owner, local), layout.owner_of(want))
+
+    def test_the_fit_and_the_centre_table_pass_the_epoch(self):
+        from lisatools.globalfit.moves import gbspecialstretch as gbs
+
+        src = inspect.getsource(gbs.GBSpecialRJFStatGridMove)
+        self.assertEqual(src.count("self._fstat_global_reference(model, epoch=k)"), 2)
+        self.assertNotIn("self._fstat_global_reference(model))", src)
 
 
 class FakeCommBcastTest(unittest.TestCase):
@@ -1836,7 +1902,7 @@ class RunFstatFitWiringTest(unittest.TestCase):
         self.seen = {"ref_row": [], "release": [], "runner": 0, "window": 0,
                      "global_reference": 0}
 
-        def global_reference(model):
+        def global_reference(model, **_kw):
             # COUNTED: it is a fan-out collective, and the ``_already_fitted``
             # path must not pay one (final review M-2).
             self.seen["global_reference"] += 1
@@ -1978,7 +2044,7 @@ class RunFstatFitWiringTest(unittest.TestCase):
             with self.subTest(w_global=w_global):
                 move = self._move(n_compute=1, w_global=w_global)
                 move.fanout = None
-                move._fstat_global_reference = lambda model, w=w_global: (
+                move._fstat_global_reference = lambda model, w=w_global, **_kw: (
                     w, 0, w, np.full(1, np.nan))
                 with self._patched_fit(), \
                         self.assertLogs(gbs.logger, "INFO") as cap:
@@ -2630,7 +2696,7 @@ class CentreTableScoringTest(unittest.TestCase):
         def release_fanout(model):
             events.append("release_fanout")
 
-        def global_reference(model):
+        def global_reference(model, **_kw):
             events.append("global_reference")
             if self.moved_reference:
                 return 0, 0, 0, np.arange(8, dtype=float)
@@ -3466,6 +3532,7 @@ class _EpochFitRankStub:
     fstat_search_residual = _B.fstat_search_residual
     _fstat_gb_free_on = _B._fstat_gb_free_on
     _fstat_fit_ref_from = _B._fstat_fit_ref_from
+    _fstat_fit_ref_rule = _B._fstat_fit_ref_rule
     _fstat_ref_row_payload = staticmethod(_B._fstat_ref_row_payload)
     _fstat_ref_shard = staticmethod(_B._fstat_ref_shard)
     _fstat_ref_branch_slice = _B._fstat_ref_branch_slice
@@ -3743,8 +3810,8 @@ class EpochFitGateTest(unittest.TestCase):
 
         real_ref = gbs.GBSpecialBase._fstat_global_reference
 
-        def moved(self_, model):
-            _w, _o, _l, lls = real_ref(self_, model)
+        def moved(self_, model, **kw):
+            _w, _o, _l, lls = real_ref(self_, model, **kw)
             fan = getattr(self_, "fanout", None)
             owner, local = (0, 0) if fan is None else fan.layout.owner_of(0)
             return 0, int(owner), int(local), lls

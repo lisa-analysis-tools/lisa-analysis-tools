@@ -1159,7 +1159,7 @@ class CtrTableGBFreeTest(unittest.TestCase):
             self.events.append("LOCAL_ARGMAX")   # the route that must be dead
             return 0
 
-        def _fstat_global_reference(self, model):
+        def _fstat_global_reference(self, model, *, epoch=None):
             self.events.append("global_reference")
             return 6, 3, 2, np.arange(8, dtype=float)
 
