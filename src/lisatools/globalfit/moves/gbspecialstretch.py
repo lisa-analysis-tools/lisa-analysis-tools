@@ -29947,7 +29947,8 @@ class GBSpecialRJPriorMove(GBSpecialBase):
 #: Process-local cache of fitted F-stat birth grids, keyed by epoch cache
 #: directory -> ``(container, epoch, n_peaks)``. Lets every move sharing a
 #: fit dir reuse the FIRST one's result with no refit and no npz reload.
-#: Cleared only by process exit; the on-disk epoch caches are the
+#: Older epochs of a fit dir are evicted when it refits (_evict_fstat_epochs);
+#: the on-disk epoch caches are the
 #: cross-process equivalent.
 _FSTAT_GRID_REGISTRY: dict = {}
 
@@ -29957,6 +29958,14 @@ _FSTAT_GRID_REGISTRY: dict = {}
 #: :data:`_FSTAT_GRID_REGISTRY`: whichever move installs the epoch first pays
 #: the sweep, the rest take the identical table.
 _FSTAT_CTR_TABLE_REGISTRY: dict = {}
+
+
+def _evict_fstat_epochs(root, keep):
+    """Drop both registries' entries under fit dir ``root`` except ``keep``."""
+    prefix = os.path.join(root, "")
+    for reg in (_FSTAT_GRID_REGISTRY, _FSTAT_CTR_TABLE_REGISTRY):
+        for key in [k for k in reg if k.startswith(prefix) and k != keep]:
+            del reg[key]
 
 #: Process-local map ``(fstat_root, stage serial) -> epoch number`` for the
 #: FORCED refits the v9 per-stage profile arms (see
@@ -31529,6 +31538,14 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         # return the cached pool blocks first.
         self.rj_proposal_distribution = None
         self._stacked_census_obj = "unset"
+        # ...and the process-wide registries' copies (2026-10-06, job 738
+        # OOM at 88.7 GB): they are keyed by epoch dir and were never
+        # evicted, so EVERY earlier epoch's grid and centre table stayed
+        # resident and the release above freed nothing. Only epoch k can
+        # be reused from here on; a sibling still on an older epoch keeps
+        # its own reference until it installs k.
+        self._fstat_ctr_table = None
+        _evict_fstat_epochs(self._fstat_root, keep=self._epoch_dir(k))
         import gc as _gc
         _gc.collect()
         self._free_inmodel_batch_pools(model, "before the F-stat refit")

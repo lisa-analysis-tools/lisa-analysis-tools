@@ -1421,7 +1421,8 @@ class StackedFStatProposal4D:
                 p = 0.5 * (p[tuple(lo_sl)] + p[tuple(hi_sl)])
             # p: (Kc,) + cell_shape corner-averaged relative cell weights
             with np.errstate(divide="ignore"):
-                log_wcell = xp.log(p) + gmax[:, None, None, None, None]
+                log_wcell = xp.log(p)
+            log_wcell += gmax[:, None, None, None, None]   # in place: no 2nd cell array
             total = p.reshape(p.shape[0], -1).sum(axis=1)  # (Kc,)
             total_h = _host(total)
             cell_vol = self._f0_dx[k0:k1] * float(np.prod(self._dx3))
@@ -1431,8 +1432,15 @@ class StackedFStatProposal4D:
             # sampling mass per cell: w_k * (cell weight / box total)
             scale = xp.asarray(self.weights[k0:k1] / np.clip(total_h, 1e-300, None))
             mass = (p.reshape(p.shape[0], -1) * scale[:, None]).ravel()
-            cdf = xp.cumsum(mass) + running_mass
-            running_mass = float(_host(cdf[-1]))
+            del p
+            # The CDF lives on the HOST (2026-10-06, 6mo job 738 PE refit
+            # OOM at 88.7 GB in this cumsum): it is only ever searchsorted
+            # by ``rvs``, so a GPU copy was a third of the resident grid for
+            # nothing. Same values, same draws.
+            cdf = np.cumsum(np.asarray(_host(mass), dtype=np.float64))
+            del mass
+            cdf += running_mass
+            running_mass = float(cdf[-1])
             # ``log_node`` retains the raw node grids for the trilinear
             # in-cell mode. On numpy/cupy alike the slice-asarray above is
             # a view into the caller's stack, so keeping it costs no new
@@ -1449,10 +1457,8 @@ class StackedFStatProposal4D:
                 "(every F-stat grid cell was -inf?)"
             )
         for ch in self._chunks:
-            ch["cdf"] = ch["cdf"] / running_mass
-        self._chunk_cum = np.array(
-            [float(_host(ch["cdf"][-1])) for ch in self._chunks]
-        )
+            ch["cdf"] /= running_mass
+        self._chunk_cum = np.array([float(ch["cdf"][-1]) for ch in self._chunks])
         self._log_norm = log_norm  # per-box log Z (host)
 
         # f0-interval overlap structure for logpdf: boxes sorted by lo, plus
@@ -1637,9 +1643,8 @@ class StackedFStatProposal4D:
             m = chunk_of == ci
             if not m.any():
                 continue
-            uu = xp.asarray(u[m])
-            flat = xp.searchsorted(ch["cdf"], uu, side="right")
-            flat = xp.clip(flat, 0, ch["cdf"].shape[0] - 1)
+            flat = np.searchsorted(ch["cdf"], u[m], side="right")   # host cdf
+            flat = xp.asarray(np.clip(flat, 0, ch["cdf"].shape[0] - 1))
             k_local = flat // self._ncells
             cell = flat - k_local * self._ncells
             kk = k_local + ch["k0"]
