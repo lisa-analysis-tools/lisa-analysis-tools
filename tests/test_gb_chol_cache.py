@@ -1,17 +1,23 @@
-"""GB_CHOL_CACHE (``_CholCache`` in gbspecialstretch): host-resident in-model
-proposal factors mapped to living sources, refreshed on a global ticker.
+"""GB_CHOL_CACHE (``_CholCache`` in ``globalfit.moves.gb_chol_cache``):
+host-resident in-model proposal factors mapped to living sources, refreshed on
+a global ticker. The move-side hooks live in ``gbspecialstretch``.
 
 A stub move stands in for the info-matrix engine: its factor for a source is
 diag(widths) with a per-source MARKER in an off-identity diagonal slot, so a
 test can tell exactly whose factor a row received.
 """
 
+import copy
 import os
+import pickle
 import unittest
 
 import numpy as np
 
+from lisatools.globalfit.moves import gb_chol_cache as CC
 from lisatools.globalfit.moves import gbspecialstretch as G
+
+_CACHE_LOGGER = "lisatools.globalfit.moves.gb_chol_cache"
 
 NDIM = 9
 SIG = np.array([0.01, 1e-6, 1e-3, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1])
@@ -76,7 +82,7 @@ class CholCacheTest(unittest.TestCase):
         self.c, self.w, self.t = _population()
         self.bs = _Sorter(self.c, self.w, self.t)
         self.m = _Move()
-        self.cache = G._CholCache(("gb", "off", False))
+        self.cache = CC._CholCache(("gb", "off", False))
         self.cache.every = 40
         self.assertTrue(self.cache.due(0))
         self.cache.refresh(self.m, None, self.bs)
@@ -137,7 +143,7 @@ class CholCacheTest(unittest.TestCase):
         c[:, 3] = 1000.0 + np.arange(len(c))                      # own markers
         w = np.repeat(self.w, reps)
         t = np.tile(np.arange(reps), len(self.c))
-        cache = G._CholCache(("gb", "off", False))
+        cache = CC._CholCache(("gb", "off", False))
         cache.due(0)
         cache.refresh(self.m, None, _Sorter(c, w, t))
         self.m.calls.clear()
@@ -198,7 +204,7 @@ class CholCacheTest(unittest.TestCase):
 
     def test_observable_gamma_z_is_scattered_on_hits(self):
         m = _Move(obs="axis")
-        cache = G._CholCache(("gb", "axis", False))
+        cache = CC._CholCache(("gb", "axis", False))
         cache.due(0)
         cache.refresh(m, None, self.bs)
         m._obs_gamma_z = None                        # a new propose: no stash yet
@@ -228,7 +234,8 @@ class CholCacheTest(unittest.TestCase):
         old = os.environ.get("SIGHET_INFOMAT_ENGINE")
         os.environ["SIGHET_INFOMAT_ENGINE"] = "lookup"
         try:
-            chol = self.cache.take(self.m, None, self.bs, ids, ids, None)
+            with self.assertLogs(_CACHE_LOGGER, "WARNING") as logs:
+                chol = self.cache.take(self.m, None, self.bs, ids, ids, None)
             self.assertNotIn("SIGHET_INFOMAT_ENGINE", os.environ)
         finally:
             os.environ.pop("SIGHET_INFOMAT_ENGINE", None)
@@ -236,6 +243,72 @@ class CholCacheTest(unittest.TestCase):
                 os.environ["SIGHET_INFOMAT_ENGINE"] = old
         self.assertTrue(self.cache.disabled)
         np.testing.assert_array_equal(self._marker(chol), self.c[:, 3])
+        text = "\n".join(logs.output)
+        self.assertIn("[GB_CHOL_CACHE] DISABLED after an error in take", text)
+        self.assertIn("unset SIGHET_INFOMAT_ENGINE='lookup'", text)
+
+    def test_a_retrack_error_disables_instead_of_raising(self):
+        """retrack runs outside take's guard; a fault there must cost the
+        cache, never the run."""
+        ids = np.arange(len(self.c))
+        self.cache.take(self.m, None, self.bs, ids, ids, None)
+        old = os.environ.pop("SIGHET_INFOMAT_ENGINE", None)
+        try:
+            with self.assertLogs(_CACHE_LOGGER, "WARNING"):
+                self.cache.retrack(ids, np.zeros((len(ids), 2)))   # wrong width
+        finally:
+            if old is not None:
+                os.environ["SIGHET_INFOMAT_ENGINE"] = old
+        self.assertTrue(self.cache.disabled)
+
+    def test_rows_stored_without_gamma_z_serve_nan_not_stale_memory(self):
+        """A table that carries Gamma_z can receive rows without one (a move
+        with no stash sharing the cache): those rows must serve NaN (the
+        eigen prepare's "no table" signal), never uninitialised memory."""
+        min_capacity = CC._MIN_CAPACITY
+        CC._MIN_CAPACITY = 1          # walker 0's table: 6 rows, capacity 12
+        try:
+            m = _Move(obs="axis")
+            cache = CC._CholCache(("gb", "axis", False))
+            cache.due(0)
+            cache.refresh(m, None, self.bs)
+            n0 = len(self.c)
+            # 1 bare birth fits the table; 6 more force a regrow
+            for n_births in (1, 7):
+                c = np.vstack([self.c, np.repeat(self.c[:1], n_births, axis=0)])
+                c[n0:, 1] = 9.0 + 0.1 * np.arange(n_births)
+                c[n0:, 3] = 700.0 + np.arange(n_births)
+                bs = _Sorter(c, np.r_[self.w, np.zeros(n_births, int)],
+                             np.r_[self.t, np.zeros(n_births, int)])
+                ids = np.arange(len(c))
+                cache.take(_Move(obs="off"), None, bs, ids, ids, None)  # stored bare
+                m._obs_gamma_z = None
+                cache.take(m, None, bs, ids, ids, None)
+                self.assertTrue(np.isnan(m._obs_gamma_z[n0:]).all(), n_births)
+                np.testing.assert_array_equal(m._obs_gamma_z[:n0, 0, 0], self.c[:, 3])
+            self.assertGreater(len(cache.tables[0].coords), 12)   # it did regrow
+        finally:
+            CC._MIN_CAPACITY = min_capacity
+
+    def test_cache_and_its_move_survive_deepcopy_and_pickle(self):
+        """Deepcopy/pickle rule: the cache holds no array module, and the
+        move never holds the cache (the registry is module-level)."""
+        ids = np.arange(len(self.c))
+        self.cache.take(self.m, None, self.bs, ids, ids, None)
+        clone = pickle.loads(pickle.dumps(copy.deepcopy(self.cache)))
+        chol = clone.take(self.m, None, self.bs, ids[::-1], ids, None)
+        self.assertEqual(self.m.calls, [])
+        np.testing.assert_array_equal(self._marker(chol), self.c[ids[::-1], 3])
+        old = os.environ.get("GB_CHOL_CACHE")
+        os.environ["GB_CHOL_CACHE"] = "1"
+        try:
+            before = set(vars(self.m))
+            self.assertIsNotNone(G.GBSpecialBase._chol_cache(self.m))
+            self.assertEqual(set(vars(self.m)), before)
+        finally:
+            os.environ.pop("GB_CHOL_CACHE", None)
+            if old is not None:
+                os.environ["GB_CHOL_CACHE"] = old
 
 
 if __name__ == "__main__":

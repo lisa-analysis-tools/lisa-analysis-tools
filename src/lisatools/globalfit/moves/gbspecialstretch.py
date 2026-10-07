@@ -48,6 +48,7 @@ from gbgpu.gb_likelihood import (
     SwapLLResult,
     WDMBandLikelihoodEngine,
 )
+from .gb_chol_cache import chol_cache_enabled, get_chol_cache
 from .globalfitmove import GFCombineMove, GlobalFitMove
 from ..communication.fanout import residual_hash
 from ..communication.ranks import derive_rank_seed
@@ -14064,6 +14065,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     logger.info(
                         "%s: per-block EXACT info matrices (borrow retired)",
                         self.name)
+                    # GB_CHOL_CACHE: per-block factors are served from the
+                    # host cache (_proposal_cholesky); rebuild it here, once
+                    # per proposal at most, when its propose ticker says so.
                     cache = self._chol_cache()
                     if cache is not None and cache.due(int(getattr(self, "time", 0))):
                         with _tspan(tm, "chol_cache_refresh"):
@@ -14136,7 +14140,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         Falls back to the direct per-block computation whenever the table is
         unavailable -- a cold chain with no live sources, or a caller that
-        reaches the in-model step without ``_ensure_proposal_tables``.
+        reaches the in-model step without ``_ensure_proposal_tables``. On
+        that direct path, ``GB_CHOL_CACHE=1`` serves the factors from the
+        host cache instead (:mod:`.gb_chol_cache`; misses are computed
+        directly with these ``slots``).
 
         ``slots`` are the per-source buffer slots, aligned row-for-row with
         ``ids`` (both are ``picked[...][alive]``). They are what the sig-het
@@ -14162,21 +14169,23 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         return band_sorter.draw_infomat(ids)
 
     def _chol_cache(self):
-        """The rank's :class:`_CholCache` for this branch, or ``None``.
+        """This process's proposal-factor cache for the move, or ``None``.
 
-        ``GB_CHOL_CACHE=1`` (default off). GB only: a per-leaf-fill branch
-        (VGB) keeps ``coords[:, 1]`` for something other than f0.
+        ``GB_CHOL_CACHE=1`` (default off) and an info-matrix proposal. GB
+        only: a per-leaf-fill branch (VGB) keeps ``coords[:, 1]`` for
+        something other than f0, which the cache's lookup sorts on.
+
+        The cache is shared by every move with the same ``(branch,
+        observable eigen mode, eigen-axis flag)`` and lives in the module
+        registry of :mod:`.gb_chol_cache`, never on the move, so the move
+        deep-copies and pickles without it.
         """
-        if (os.environ.get("GB_CHOL_CACHE", "0") != "1"
+        if (not chol_cache_enabled()
                 or not self.use_info_mat_proposal
                 or getattr(self, "_per_leaf_fill", False)):
             return None
-        key = (self.branch_name, self._obs_eigen_mode(),
-               bool(self._eigen_axis_ready()))
-        cache = _CHOL_CACHES.get(key)
-        if cache is None:
-            cache = _CHOL_CACHES[key] = _CholCache(key)
-        return cache
+        return get_chol_cache((self.branch_name, self._obs_eigen_mode(),
+                               bool(self._eigen_axis_ready())))
 
     def _infomat_phys_inds(self):
         """PHYSICAL output slots the information matrix is taken over.
@@ -19870,9 +19879,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # Final coordinates back into the residual and the sorter.
         band_sorter.coords[ids] = curr
         if self.use_info_mat_proposal:
-            _cc = self._chol_cache()
-            if _cc is not None:
-                _cc.retrack(ids, curr)
+            # GB_CHOL_CACHE: the repeats moved the sources; key their cache
+            # entries at these final coordinates for the next block.
+            cache = self._chol_cache()
+            if cache is not None:
+                cache.retrack(ids, curr)
         if seq is not None:
             seq["snaps"]["before_addback"] = self._debug_slab_snapshot(
                 buffer_obj, seq["slot"])
@@ -32453,273 +32464,3 @@ def get_param_limits(array): # can be used for debugging of coordinate values
         min_array_i = param_values.min()
         max_array_i = param_values.max()
         logger.info(f"For parameter {param_label}, the minimun value is {min_array_i}, the maximum value is {max_array_i}")
-
-# ---------------------------------------------------------------------------
-# GB_CHOL_CACHE (2026-10-05): in-model proposal factors held on the HOST and
-# mapped to living sources, refreshed together on a global ticker.
-# ---------------------------------------------------------------------------
-_CHOL_CACHES = {}
-
-
-def _ix(a, idx):
-    """``a[idx]`` for a host index ``idx`` whether ``a`` is numpy or cupy."""
-    return a[idx] if isinstance(a, np.ndarray) else a[get_array_module(a).asarray(idx)]
-
-
-class _CholCache:
-    """Host-resident in-model proposal factors, mapped to living sources.
-
-    One per rank and ``(branch, observable-eigen mode, eigen-axis flag)``,
-    shared by every GB move of the rank. Off unless ``GB_CHOL_CACHE=1``.
-
-    REFRESH: on a GLOBAL ticker -- the largest ``move.time`` seen -- every
-    ``GB_CHOL_CACHE_EVERY`` (default 40) proposes, the whole cache is
-    rebuilt in ``GB_CHOL_CACHE_BATCH`` chunks from every alive source of the
-    sorter (all rungs) at the first in-model block of that propose. With no
-    buffer slots the factor comes from the comp's slot-free route:
-    ``SIGHET_INFOMAT_ENGINE=lookup`` (the lookup Gram ``<dh_a|dh_b>``), else
-    the chunked delegate (slow; logged).
-
-    MAP: a source is matched within its own WALKER (never its rung: a
-    vertical swap only relabels the rung, so the source must keep its entry)
-    to the best of the ``GB_CHOL_CACHE_WINDOW`` (default 32) entries on each
-    side in f0 -- wide enough to span every rung's copy of the same source --
-    accepted when amplitude, f0 and Mc (sampling columns 0-2) are within
-    ``GB_CHOL_CACHE_TOL`` (default 5) of the entry's own marginal widths; a
-    hit moves the entry's key to the source's current coordinates so the map
-    follows the source. A MISS (an accepted birth, a source moved out of
-    tolerance) is computed
-    with the block's own route, in one batch per block before the repeats,
-    and inserted. The factor is frozen across each block exactly as before,
-    so the proposal stays symmetric; a poor match costs acceptance only.
-
-    The observable-eigen Gamma_z (``GB_INMODEL_OBSERVABLE_EIGEN``) is cached
-    beside the factor and scattered back into ``move._obs_gamma_z`` on hits.
-    Any exception disables the cache for the rest of the run (logged) and
-    the move falls back to the direct per-block factors.
-    """
-
-    _COLS = [0, 1, 2]
-
-    def __init__(self, key):
-        self.key = key
-        self.every = max(int(os.environ.get("GB_CHOL_CACHE_EVERY", "40") or 40), 1)
-        self.tol = float(os.environ.get("GB_CHOL_CACHE_TOL", "5.0") or 5.0)
-        self.batch = max(int(os.environ.get("GB_CHOL_CACHE_BATCH", "4096") or 4096), 1)
-        self.window = max(int(os.environ.get("GB_CHOL_CACHE_WINDOW", "32") or 32), 1)
-        self.tick = -1
-        self.epoch = None
-        self.groups = {}
-        self.hits = self.misses = self.takes = 0
-        self.disabled = False
-
-    def due(self, t):
-        self.tick = max(self.tick, int(t))
-        return (not self.disabled
-                and (self.epoch is None or self.tick // self.every != self.epoch))
-
-    def _fail(self, move, where, exc):
-        self.disabled = True
-        # The lookup Gram engine is the new piece: drop it with the cache so
-        # the direct per-block factors take the validated route again.
-        eng = os.environ.pop("SIGHET_INFOMAT_ENGINE", None)
-        logger.warning("%s: [GB_CHOL_CACHE] DISABLED after an error in %s (%r); "
-                       "direct per-block factors from here on (SIGHET_INFOMAT_ENGINE "
-                       "%r -> unset).", move.name, where, exc, eng)
-
-    def refresh(self, move, model, band_sorter):
-        if self.disabled:
-            return
-        t0 = time.perf_counter()
-        try:
-            alive = move.xp.where(band_sorter.inds)[0]
-            self.groups = {}
-            n = int(alive.shape[0])
-            for i in range(0, n, self.batch):
-                ids = alive[i:i + self.batch]
-                B = move._compute_proposal_cholesky(model, band_sorter, ids)
-                self._insert(move, band_sorter, ids, B)
-        except Exception as exc:  # noqa: BLE001 -- overnight safety valve
-            self._fail(move, "refresh", exc)
-            return
-        self.epoch = self.tick // self.every
-        logger.info(
-            "%s: [GB_CHOL_CACHE] refreshed %d sources in %.1f s (tick %d, every %d, "
-            "SIGHET_INFOMAT_ENGINE=%s, %.1f MB host)", move.name, n,
-            time.perf_counter() - t0, self.tick, self.every,
-            os.environ.get("SIGHET_INFOMAT_ENGINE", "") or "default", self.nbytes() / 2**20)
-
-    _FIELDS = ("C", "B", "S", "G")
-
-    def nbytes(self):
-        return sum(g[f].nbytes for g in self.groups.values() for f in self._FIELDS
-                   if g[f] is not None)
-
-    @staticmethod
-    def _keys(band_sorter, ids):
-        # walker only: the rung is a LABEL that vertical swaps change
-        return _to_numpy(band_sorter.walker_inds[ids]).astype(np.int64)
-
-    def _gz(self, move, ids):
-        gz = getattr(move, "_obs_gamma_z", None)
-        if gz is None or move._obs_eigen_mode() == "off":
-            return None
-        return _to_numpy(gz[ids])
-
-    @staticmethod
-    def _index(g):
-        # f0 sort order over the filled rows; the stored arrays never move
-        n = g["n"]
-        g["o"] = np.argsort(g["C"][:n, 1], kind="stable")
-        g["f"] = g["C"][:n, 1][g["o"]]
-
-    def _insert(self, move, band_sorter, ids, B):
-        C = _to_numpy(band_sorter.coords[ids])
-        Bh = _to_numpy(B)
-        G = self._gz(move, ids)
-        s = _to_numpy(move._proposal_param_scales)[self._COLS]
-        # marginal widths in the coords' own units: B is in y = x / s
-        S = np.sqrt((Bh[:, self._COLS, :] ** 2).sum(-1)) * s[None, :]
-        key = self._keys(band_sorter, ids)
-        ent = np.empty(len(key), dtype=np.int64)
-        for k in np.unique(key):
-            m = key == k
-            new = {"C": C[m], "B": Bh[m], "S": S[m], "G": None if G is None else G[m]}
-            nm = int(m.sum())
-            g = self.groups.get(int(k))
-            if g is None:
-                g = {f: (None if v is None else v[:0]) for f, v in new.items()}
-                g["n"] = 0
-            n = g["n"]
-            if n + nm > len(g["C"]):
-                # amortized growth: rows are appended, never copied per block
-                cap = max(2 * (n + nm), 1024)
-                for f in self._FIELDS:
-                    if g[f] is None or new[f] is None:
-                        g[f] = None
-                        continue
-                    buf = np.empty((cap,) + g[f].shape[1:], dtype=g[f].dtype)
-                    buf[:n] = g[f][:n]
-                    g[f] = buf
-            for f in self._FIELDS:
-                if g[f] is not None:
-                    g[f][n:n + nm] = new[f]
-            g["n"] = n + nm
-            ent[m] = np.arange(n, n + nm)
-            self._index(g)
-            self.groups[int(k)] = g
-        return key, ent
-
-    def match(self, band_sorter, ids):
-        """``(hit, B, G)`` host arrays for ``ids``; moves hit keys to the sources."""
-        C = _to_numpy(band_sorter.coords[ids])
-        n, ndim = C.shape
-        hit = np.zeros(n, dtype=bool)
-        Bo = np.zeros((n, ndim, ndim))
-        Go = None
-        key = self._keys(band_sorter, ids)
-        ent = np.full(n, -1, dtype=np.int64)
-        off = np.arange(-self.window, self.window)
-        for k in np.unique(key):
-            g = self.groups.get(int(k))
-            if g is None or g["n"] == 0:
-                continue
-            rows = np.nonzero(key == k)[0]
-            q = C[rows]
-            j = np.searchsorted(g["f"], q[:, 1])
-            cand = g["o"][np.clip(j[:, None] + off[None, :], 0, g["n"] - 1)]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                d = (np.abs(q[:, None, self._COLS] - g["C"][cand][:, :, self._COLS])
-                     / g["S"][cand])
-            score = np.nan_to_num(d.max(-1), nan=np.inf)
-            pick = score.argmin(1)
-            r = np.arange(len(rows))
-            e = cand[r, pick]
-            ok = score[r, pick] <= self.tol
-            if not ok.any():
-                continue
-            hit[rows[ok]] = True
-            ent[rows[ok]] = e[ok]
-            Bo[rows[ok]] = g["B"][e[ok]]
-            if g["G"] is not None:
-                if Go is None:
-                    Go = np.full((n,) + g["G"].shape[1:], np.nan)
-                Go[rows[ok]] = g["G"][e[ok]]
-            g["C"][e[ok]] = q[ok]
-            self._index(g)
-        self._block = (_to_numpy(ids).copy(), key, ent)
-        return hit, Bo, Go
-
-    def retrack(self, ids, coords):
-        """End of block: move each row's entry key to its FINAL coordinates.
-
-        The key is set at the block's start; the 25 repeats then move the
-        source (Gram steps are large), and the next block would miss it.
-        Rows are the ones :meth:`take` just served (entries recorded there).
-        """
-        blk = getattr(self, "_block", None)
-        self._block = None
-        if blk is None or self.disabled:
-            return
-        ids_h, key, ent = blk
-        ids_now = _to_numpy(ids)
-        if ids_now.shape != ids_h.shape or not np.array_equal(ids_now, ids_h):
-            return
-        C = _to_numpy(coords)
-        for k in np.unique(key):
-            g = self.groups.get(int(k))
-            m = (key == k) & (ent >= 0)
-            if g is None or not m.any():
-                continue
-            g["C"][ent[m]] = C[m]
-            self._index(g)
-
-    def take(self, move, model, band_sorter, ids, slots, buffer_obj):
-        if self.disabled or self.epoch is None:
-            return move._compute_proposal_cholesky(
-                model, band_sorter, ids, slots=slots, buffer_obj=buffer_obj)
-        xp = move.xp
-        try:
-            hit, Bo, Go = self.match(band_sorter, ids)
-            chol = xp.asarray(Bo)
-            miss = np.nonzero(~hit)[0]
-            if miss.size:
-                # births / unmatched: one batch through the block's own route,
-                # BEFORE the hit scatter below (the stash may reallocate)
-                mi = xp.asarray(miss)
-                ids_m = _ix(ids, miss)
-                B_m = move._compute_proposal_cholesky(
-                    model, band_sorter, ids_m,
-                    slots=None if slots is None else _ix(slots, miss),
-                    buffer_obj=buffer_obj)
-                _, ent_m = self._insert(move, band_sorter, ids_m, B_m)
-                if getattr(self, "_block", None) is not None:
-                    self._block[2][miss] = ent_m
-                chol[mi] = B_m
-            else:
-                s = xp.ones(band_sorter.coords.shape[1])
-                if move._fdot_col is not None:
-                    s[move._fdot_col] = move._fdot_scale
-                move._proposal_param_scales = s
-            if Go is not None and hit.any():
-                n_src = int(band_sorter.inds.shape[0])
-                nz = int(Go.shape[-1])
-                store = getattr(move, "_obs_gamma_z", None)
-                if (store is None or int(store.shape[0]) != n_src
-                        or int(store.shape[-1]) != nz):
-                    store = xp.full((n_src, nz, nz), xp.nan)
-                store[xp.asarray(_ix(ids, np.nonzero(hit)[0]))] = xp.asarray(Go[hit])
-                move._obs_gamma_z = store
-        except Exception as exc:  # noqa: BLE001 -- overnight safety valve
-            self._fail(move, "take", exc)
-            return move._compute_proposal_cholesky(
-                model, band_sorter, ids, slots=slots, buffer_obj=buffer_obj)
-        self.hits += int(hit.sum())
-        self.misses += int(miss.size)
-        self.takes += 1
-        if self.takes % 500 == 0:
-            logger.info("%s: [GB_CHOL_CACHE] %d hits / %d misses over the last 500 "
-                        "blocks (%.1f MB host)", move.name, self.hits, self.misses,
-                        self.nbytes() / 2**20)
-            self.hits = self.misses = 0
-        return chol
