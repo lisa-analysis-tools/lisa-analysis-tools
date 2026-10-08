@@ -9,12 +9,14 @@ script with ``bash``, and inspect what the (never-actually-submitted) job
 would have looked like.
 
 Covers the layout invariants (user ruling 2026-09-16, after the WP7
-transport gates passed on the cluster): at the ``NGPUS=2`` default the
-scripts pin the walker-block layout (``GF_LEGACY_RANK_LAYOUT=0``: head +
-1 compute + saver, still ``--ntasks=3``); ``GF_LEGACY_RANK_LAYOUT=1`` remains
-the rollback knob and must still launch today's single-compute-rank shape;
-``NGPUS=4`` must force the walker-block layout across 2 nodes of 2 GPUs each,
-since the legacy layout cannot span nodes.
+transport gates passed on the cluster): at ``NGPUS=2`` the scripts pin the
+walker-block layout (``GF_LEGACY_RANK_LAYOUT=0``: head + 1 compute + saver,
+still ``--ntasks=3``); ``GF_LEGACY_RANK_LAYOUT=1`` remains the rollback knob
+and must still launch today's single-compute-rank shape; ``NGPUS=4`` must
+force the walker-block layout across 2 nodes of 2 GPUs each, since the
+legacy layout cannot span nodes. Since V9-30 (2026-10-07) ``NGPUS=4`` is
+the DEFAULT of the v9 production launchers (6mo / 1yr / 9mo); the v8 and
+3mo scripts keep ``NGPUS=2``.
 """
 
 import os
@@ -41,6 +43,9 @@ SCRIPTS = [
     # the 1-year twin OF THE V9 SCRIPT (2026-10-03): byte-identical to the
     # 6mo v9 script except the Tobs deltas. See OneYearV9TwinTest.
     os.path.join(ROOT, "scripts", "fstat_proposal", "submit_gf_1yr_v9.sh"),
+    # the 9-month twin OF THE V9 SCRIPT (2026-10-07): the 1yr settings at
+    # Tobs = 270 d. See NineMonthV9TwinTest.
+    os.path.join(ROOT, "scripts", "fstat_proposal", "submit_gf_9mo_v9.sh"),
 ]
 
 THREE_MO = SCRIPTS[2]
@@ -48,6 +53,9 @@ SIX_MO = SCRIPTS[0]
 SIX_MO_V9 = SCRIPTS[3]
 THREE_MO_V9 = SCRIPTS[4]
 ONE_YR_V9 = SCRIPTS[5]
+NINE_MO_V9 = SCRIPTS[6]
+# the v9 production launchers: the 6mo script and its two derived twins
+V9_PRODUCTION = (SIX_MO_V9, ONE_YR_V9, NINE_MO_V9)
 
 # Env knobs the dispatch block reads; stripped from the inherited environment
 # before each scenario applies its own overrides, so a stray value in the
@@ -62,11 +70,11 @@ _DISPATCH_ENV_KEYS = (
     "GF_MONITOR_RANK",
 )
 
-# The v9 6mo/1yr launchers add ONE task for the dedicated monitor rank
+# The v9 6mo/1yr/9mo launchers add ONE task for the dedicated monitor rank
 # (GF_MONITOR_RANK, default 1, 2026-10-04): the run's own task count is
 # unchanged, the allocation is one larger. tests/test_monitor_rank.py pins
 # the block itself.
-_MONITOR_RANK_SCRIPTS = (SIX_MO_V9, ONE_YR_V9)
+_MONITOR_RANK_SCRIPTS = V9_PRODUCTION
 
 
 def _ntasks(script, run_tasks):
@@ -509,31 +517,33 @@ class SixMonthV9DeltaTest(unittest.TestCase):
         self.assertIn("there is one problem here, not two", src)
         self.assertIn("that path came from GF_SEED_STORE", src)
 
-    def test_mid_iteration_checkpoints_are_pinned_on(self):
+    def test_mid_iteration_checkpoints_are_pinned_off(self):
         """User ask 2026-09-24: "checkpoints between all the GB moves for
-        resume". The HOOKS are unconditional (GFCombineMove writes after
-        every sub-move); what this pins is that the feature is ARMED and
-        that its throttle -- the thing that actually decides how much a spot
-        preemption costs -- is on the run record rather than a silent
-        default."""
-        self.assertEqual(self.v9["MIDIT_CHECKPOINT"], "1")
+        resume"; user ruling 2026-10-07 (V9-30): the production line's
+        MIDIT_CHECKPOINT=0 is the launcher default. The HOOKS are
+        unconditional (GFCombineMove writes after every sub-move); what this
+        pins is that the feature is DISARMED by default and that its throttle
+        -- the thing that decides how much a spot preemption costs once it is
+        re-armed -- stays on the run record rather than a silent default."""
+        self.assertEqual(self.v9["MIDIT_CHECKPOINT"], "0")
         self.assertIn("MIDIT_CHECKPOINT_MIN_INTERVAL", self.v9)
         self.assertGreaterEqual(
             int(self.v9["MIDIT_CHECKPOINT_MIN_INTERVAL"]), 0)
 
-    def test_mid_iteration_checkpoints_can_be_switched_off_from_the_command_line(self):
+    def test_mid_iteration_checkpoints_can_be_switched_from_the_command_line(self):
         """User ruling 2026-10-01: "MIDIT_CHECKPOINT=0 in the launch command
         is good" (a legged search lands a row after every leg, and the
         checkpoint's adoption rule cannot tell a startup copy from a
         half-nudged state -- jobs 673/674/675). The export was a hard
         ``=1`` until then, so the command-line knob reached NOTHING; pin the
-        ``${K:-1}`` form in both launchers, default still 1."""
-        for path in (SIX_MO_V9, THREE_MO_V9):
+        ``${K:-default}`` form in both launchers. The 6mo default became 0
+        on 2026-10-07 (V9-30); the 3mo v9 script keeps 1."""
+        for path, default in ((SIX_MO_V9, "0"), (THREE_MO_V9, "1")):
             src = open(path).read()
             self.assertRegex(
-                src, r"(?m)^export MIDIT_CHECKPOINT=\$\{MIDIT_CHECKPOINT:-1\}$",
+                src, rf"(?m)^export MIDIT_CHECKPOINT=\$\{{MIDIT_CHECKPOINT:-{default}\}}$",
                 f"{path}: MIDIT_CHECKPOINT must be exported as "
-                f"${{MIDIT_CHECKPOINT:-1}} so the launch command can turn it off")
+                f"${{MIDIT_CHECKPOINT:-{default}}} so the launch command can flip it")
 
     def test_the_galfor_start_is_the_offline_3mo_estimate(self):
         """User ruling 2026-09-24, chosen explicitly over the 6mo
@@ -632,6 +642,20 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             "GF_SEED_STORE", "GB_WARM_START_SOURCE_STORE",
             # mid-iteration checkpoints, pinned explicitly for v9
             "MIDIT_CHECKPOINT", "MIDIT_CHECKPOINT_MIN_INTERVAL",
+            # V9-30 (2026-10-07): Mike's production line IS the launcher
+            # default -- 8-rung MBH / EMRI ladders (v8 ran 2), the expected-
+            # information eigen tables (gram / fisher; v8 predates the knob)
+            # and the source cross-checks off (v8 predates the knob).
+            "MBH_NTEMPS", "EMRI_NTEMPS",
+            "SOBBH_EIGEN_INFO", "EMRI_EIGEN_INFO", "MBH_EIGEN_INFO",
+            "PSD_EIGEN_INFO", "GALFOR_EIGEN_INFO",
+            "SOBBH_CHECK_LL", "MBH_CHECK_LL", "EMRI_CHECK_LL",
+            # 2026-10-07: stage clocks survive a resume, reset at each
+            # boundary (v8 predates the knob)
+            "GF_PERSIST_STAGE_START",
+            # 2026-10-07: the GB ladder re-spacing (hot half at 1.35 from
+            # T10, top rung unpinned); fresh stores only, v8 predates it
+            "GB_LADDER_HOT_RATIO", "GB_LADDER_HOT_FROM", "GB_LADDER_PIN_LAST",
             # the offline 3mo galfor start point
             "GALFOR_START_PARAMS",
             # the galfor RATCHET (2026-09-30): one gated noise proposal at
@@ -841,17 +865,22 @@ class SixMonthMBHBatchedTest(unittest.TestCase):
         for knob, default in (("MBH_LIKELIHOOD", "batched"),
                               ("MBH_BATCH_MAX_SIZE", "8"),
                               ("MBH_RESPONSE_ORDER", "8"),
-                              ("MBH_WINDOW_DECIMATE", "1")):
+                              ("MBH_WINDOW_DECIMATE", "2")):   # 2 since V9-30 (2026-10-07)
             self.assertRegex(
                 src, rf"(?m)^export {knob}=\$\{{{knob}:-{default}\}}$", knob)
 
     def test_nothing_in_the_launcher_conflicts_with_batched(self):
         """Batched pins BOTH generators to the 90 d window and refuses an
         explicit MBH_WAVEFORM_DURATION or USE_TDIONFLY; the cross-check
-        cadence stays at the batched move's own default (every 10th visit)."""
+        cadence stays at the batched move's own default (every 10th visit),
+        and the check itself is OFF by default since V9-30 (2026-10-07:
+        MBH_CHECK_LL=0 on the production line), re-armed from the line."""
         for knob in ("MBH_WAVEFORM_DURATION", "USE_TDIONFLY",
-                     "MBH_CHECK_LL_EVERY", "MBH_CHECK_LL"):
+                     "MBH_CHECK_LL_EVERY"):
             self.assertNotIn(knob, self.v9, knob)
+        self.assertEqual(self.v9["MBH_CHECK_LL"], "0")
+        self.assertRegex(open(SIX_MO_V9).read(),
+                         r"(?m)^export MBH_CHECK_LL=\$\{MBH_CHECK_LL:-0\}$")
 
     def _run_preflight(self, **env):
         """Exec the launcher's MBH preflight in-process: (exit code, stdout)."""
@@ -886,7 +915,7 @@ class SixMonthMBHBatchedTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("mbh_pe scoring=batched batch<=8 response_order=8", out)
         self.assertIn("waveform_duration=90.0 d", out)
-        self.assertIn("decimate=1", out)
+        self.assertIn("decimate=2", out)   # the V9-30 default (2026-10-07)
 
     def test_the_preflight_resolves_and_bounds_the_window_decimation(self):
         """MBH_WINDOW_DECIMATE on the launch line reaches the settings (printed);
@@ -996,7 +1025,7 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
         self.assertEqual(self.v9["EMRI_LIKELIHOOD"], "direct")
         self.assertEqual(self.v9["EMRI_BATCH_MAX_SIZE"], "8")
         self.assertEqual(self.v9["EMRI_DIRECT_RESPONSE"], "dense")
-        self.assertEqual(self.v9["EMRI_TRAJ_WORKERS"], "4")
+        self.assertEqual(self.v9["EMRI_TRAJ_WORKERS"], "8")   # 8 since V9-30 (2026-10-07)
         self.assertEqual(self.v9["EMRI_DIRECT_LOOKUP"], "kernel")
         # the preflight proves the fused kernel on the node's GPU (a module without it
         # would silently fall back to the Python lookup)
@@ -1040,9 +1069,10 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
         # the extra cores feed ONLY the trajectory pool: ranks stay single-threaded
         # (MPI-only policy), and the pool's spawned workers inherit OMP_NUM_THREADS=1
         self.assertEqual(self.v9["OMP_NUM_THREADS"], "1")
-        self.assertIn("--cpus-per-task=6", self._dispatch())                  # direct: the default
+        # direct with 8 workers (V9-30, 2026-10-07) = 2 + 8 cores
+        self.assertIn("--cpus-per-task=10", self._dispatch())                 # direct: the default
         self.assertIn("--cpus-per-task=2", self._dispatch(EMRI_LIKELIHOOD="full"))
-        self.assertIn("--cpus-per-task=6", self._dispatch(EMRI_LIKELIHOOD="direct"))
+        self.assertIn("--cpus-per-task=10", self._dispatch(EMRI_LIKELIHOOD="direct"))
         self.assertIn("--cpus-per-task=9",
                       self._dispatch(EMRI_LIKELIHOOD="direct", EMRI_TRAJ_WORKERS="7"))
         self.assertIn("--cpus-per-task=2",
@@ -1111,7 +1141,7 @@ class SixMonthEMRIDirectTest(unittest.TestCase):
     def test_direct_passes_with_a_matching_table_and_a_passing_gpu_parity(self):
         rc, out = self._run_preflight(EMRI_LIKELIHOOD="direct")
         self.assertEqual(rc, 0, out)
-        self.assertIn("emri_pe scoring=direct batch<=8 response=dense lookup=kernel traj_workers=4", out)
+        self.assertIn("emri_pe scoring=direct batch<=8 response=dense lookup=kernel traj_workers=8", out)
         self.assertEqual(self.kruns, 1)            # the fused kernel was proven on the GPU
         self.assertIn("edge_crop=60>=8", out)
         # unset EMRI_DIRECT_TABLE: the canonical table in the run folder, on this grid
@@ -1740,6 +1770,21 @@ class ThreeMonthV9TwinTest(unittest.TestCase):
             # 6-month grid's Nf and dt only.
             "EMRI_LIKELIHOOD", "EMRI_BATCH_MAX_SIZE", "EMRI_DIRECT_TABLE",
             "EMRI_DIRECT_RESPONSE", "EMRI_TRAJ_WORKERS", "EMRI_DIRECT_LOOKUP",
+            # V9-30 (2026-10-07): Mike's 6mo production line became the
+            # 6mo / 1yr / 9mo launcher DEFAULT (MIDIT_CHECKPOINT 0, 8-rung
+            # MBH / EMRI ladders, gram / fisher eigen tables, source
+            # cross-checks off). The 3mo v9 twin was not on that line and
+            # keeps its own values (no source branch is armed there).
+            "MIDIT_CHECKPOINT", "MBH_NTEMPS", "EMRI_NTEMPS",
+            "SOBBH_EIGEN_INFO", "EMRI_EIGEN_INFO", "MBH_EIGEN_INFO",
+            "PSD_EIGEN_INFO", "GALFOR_EIGEN_INFO",
+            "SOBBH_CHECK_LL", "MBH_CHECK_LL", "EMRI_CHECK_LL",
+            # 2026-10-07: stage clocks survive a resume (reset at each
+            # boundary); the 3mo v9 script does not export it
+            "GF_PERSIST_STAGE_START",
+            # 2026-10-07: the GB ladder re-spacing (fresh stores only); the
+            # 3mo v9 script keeps the stock ladder
+            "GB_LADDER_HOT_RATIO", "GB_LADDER_HOT_FROM", "GB_LADDER_PIN_LAST",
         }
         keys = (set(self.three) | set(self.six)) - {"_", "SHLVL", "PWD"}
         diff = {k for k in keys
@@ -2172,6 +2217,24 @@ class SubmitScriptsDispatchTest(unittest.TestCase):
                 self.assertIn("--distribution=cyclic", lines)
                 self._assert_export_contains(lines, "GF_LEGACY_RANK_LAYOUT=0")
 
+    def test_the_v9_production_launchers_default_to_four_gpus(self):
+        # V9-30 (user ruling 2026-10-07): `./submit...` with NO NGPUS on the
+        # line IS the production shape -- NGPUS=4: 2 nodes x 2 GPUs,
+        # on-demand, 4 compute + saver + monitor. The 3mo v9 twin keeps its
+        # 1-node NGPUS=2 default.
+        for script in V9_PRODUCTION:
+            with self.subTest(script=script):
+                lines = self._run_dispatch(script, {})
+                self.assertIn("--nodes=2", lines)
+                self.assertIn("--gres=gpu:2", lines)
+                self.assertIn(_ntasks(script, 5), lines)
+                self.assertIn("--partition=gpu-80-ondemand", lines)
+                self.assertIn("--distribution=cyclic", lines)
+                self._assert_export_contains(lines, "NGPUS=4")
+        lines = self._run_dispatch(THREE_MO_V9, {})
+        self.assertIn("--nodes=1", lines)
+        self.assertIn(_ntasks(THREE_MO_V9, 3), lines)
+
     def test_the_4gpu_partition_is_overridable_without_editing(self):
         for script in SCRIPTS:
             with self.subTest(script=script):
@@ -2381,6 +2444,222 @@ class OneYearV9TwinTest(unittest.TestCase):
         self.assertIn("#SBATCH --job-name=gf1yr_v9", self.one_text)
         self.assertIn("/shared/data/global_fit_output/gf1yr_v9_%j.log", self.one_text)
         self.assertNotIn("gf1yr_v9_4gpu", self.one_text)
+
+
+class NineMonthV9TwinTest(unittest.TestCase):
+    """``submit_gf_9mo_v9.sh`` IS ``submit_gf_1yr_v9.sh`` at 9 months.
+
+    User ruling 2026-10-07: "run a 9mo run instead of 1yr ... keep all the
+    accuracy settings for the 1yr run the same ... keep everything the same
+    as the 1 yr run except for any specific necessary changes due to the
+    observation". Two guards. Byte-level against the 6mo script: the 9mo
+    file must equal the 6mo file with EXACTLY the replacements below applied
+    (plus its own comment-only header), so any fix that lands in one script
+    and not the other fails here. Export-level against the 1yr script: only
+    the Tobs-driven knobs (TOBS_TARGET, SIGHET_NT_LAYER, BASE_FILE_NAME,
+    MBHB_IDS, MBH_MERGER_TIME_BUFFER) may resolve differently -- the 1yr
+    capacity sizing (GB_NLEAVES_MAX, GB_N_SUBBANDS, GB_RJ_INMODEL_CHUNK) is
+    taken verbatim, as ruled, not re-derived for 270 d.
+    """
+
+    # (6mo text, 9mo text, occurrences) -- the generator's table, verbatim
+    REPLACEMENTS = (
+        ("#SBATCH --job-name=gf6mo_v9_4gpu     # job name",
+         "#SBATCH --job-name=gf9mo_v9          # job name", 1),
+        ("/shared/data/global_fit_output/gf6mo_v9_4gpu_%j.log",
+         "/shared/data/global_fit_output/gf9mo_v9_%j.log", 1),
+        ("STORE_DIR=${STORE_DIR:-/shared/data/global_fit_output/gf_prod_6mo_v9_4gpu/}",
+         "STORE_DIR=${STORE_DIR:-/shared/data/global_fit_output/gf_prod_9mo_v9/}", 1),
+        ("export BASE_FILE_NAME=gf_prod_6mo\n", "export BASE_FILE_NAME=gf_prod_9mo\n", 1),
+        ("export TOBS_TARGET=15552000        # 180 d; grid resolves Nf 1440 x Nt 4320 x dt 2.5 (exact factor-2 of 3 mo in Nt)",
+         "export TOBS_TARGET=23328000        # 270 d; grid resolves Nf 1440 x Nt 6480 x dt 2.5 (1.5x the 6 mo Nt; the 1yr runs Nt 8640)", 1),
+        ("export SIGHET_NT_LAYER=120\n", "export SIGHET_NT_LAYER=180\n", 1),
+        ("export GB_NLEAVES_MAX=15000        # 6 mo: deeper confusion resolved; 3-mo ran 10000",
+         "export GB_NLEAVES_MAX=20000        # 9 mo: the 1yr value (user ruling 2026-10-07, 1yr settings); 6-mo ran 15000, 3-mo 10000", 1),
+        ("export GB_N_SUBBANDS=8192   # PER GPU; total = x n_gpus. Slab ~0.5 MB/slot",
+         "export GB_N_SUBBANDS=4096   # PER GPU; total = x n_gpus. Slab ~0.75 MB/slot at 9 mo (the 1yr value, user ruling 2026-10-07)", 1),
+        ("export GB_RJ_INMODEL_CHUNK=32768  # byte-parity with the 3mo twin's 65536 (6mo cells ~2x bytes); floored to ntemps multiples by the column-atomic staging",
+         "export GB_RJ_INMODEL_CHUNK=16384  # the 1yr value (user ruling 2026-10-07, 1yr settings; 9mo cells ~1.5x the 6mo bytes); floored to ntemps multiples by the column-atomic staging", 1),
+        ("export MBHB_IDS=2,5,16,18          # t_c 173.3 / 104.7 / 111.4 / 92.0 d",
+         "export MBHB_IDS=2,5,7,12,16,18     # t_c 173.3/104.7/263.8/243.8/111.4/92.0 d (MBH session 2026-10-03 table): every catalogue MBHB merging inside 270 d + the 14-d MBH_MERGER_TIME_BUFFER below. None merges in (270, 284] d; the next are srcs 9 (285.9 d) and 4 (286.4 d), 15.9 / 16.4 d past the end, then 0 (300.4), 15 (318.0), 3 (336.8), 10 (369.5)\n"
+         "# User rule 2026-10-07: keep any MBHB merging within 2 weeks of the end of the\n"
+         "# observation (its in-window inspiral is modelled, cut at the data end by the\n"
+         "# batched window's active-box clamp and the stock generator's data lattice).\n"
+         "# 14 d replaces the code default of 7 d; the t_plunge prior's upper edge\n"
+         "# follows it (obs_end + buffer + t_plunge_pad).\n"
+         "export MBH_MERGER_TIME_BUFFER=1209600   # 14 d", 1),
+        ("make_factory(1440, 4320)", "make_factory(1440, 6480)", 2),
+        ("Nf 1440 x Nt 4320 at dt 2.5 s", "Nf 1440 x Nt 6480 at dt 2.5 s", 3),
+        ("${STORE_DIR}/warmstart/gf_prod_3mo_v8_10w_refereed.npz}",
+         "${STORE_DIR}/warmstart/gf_prod_6mo_v9_4gpu_refereed.npz}", 1),
+        ("GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/global_fit_output/gf_prod_3mo_v8_10walkers/gf_prod_3mo_testing.h5}",
+         "GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/global_fit_output/gf_prod_6mo_v9_4gpu/gf_prod_6mo_testing.h5}", 1),
+        ("GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-7776000}",
+         "GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-15552000}   # the 6-month parent", 1),
+    )
+
+    # the only exports that may resolve differently from the 1yr script
+    TOBS_DRIVEN = {"TOBS_TARGET", "SIGHET_NT_LAYER", "BASE_FILE_NAME",
+                   "MBHB_IDS", "MBH_MERGER_TIME_BUFFER"}
+
+    def setUp(self):
+        self.six_text = open(SIX_MO_V9).read()
+        self.nine_text = open(NINE_MO_V9).read()
+        self.six = _exports(SIX_MO_V9)
+        self.one = _exports(ONE_YR_V9)
+        self.nine = _exports(NINE_MO_V9)
+
+    def test_the_9mo_script_is_the_6mo_script_plus_exactly_these_replacements(self):
+        body = self.six_text
+        self.assertTrue(body.startswith("#!/bin/bash\n"))
+        body = body[len("#!/bin/bash\n"):]
+        for old, new, n in self.REPLACEMENTS:
+            self.assertEqual(body.count(old), n, old)
+            body = body.replace(old, new)
+        self.assertTrue(self.nine_text.startswith("#!/bin/bash\n"))
+        self.assertTrue(self.nine_text.endswith(body),
+                        "the 9mo script drifted from the 6mo script beyond the "
+                        "declared Tobs replacements (diff the two files, or "
+                        "re-run derive_9mo_v9_launcher.py after a 6mo edit)")
+        header = self.nine_text[:-len(body)]
+        for line in header.splitlines():
+            self.assertTrue(line.startswith("#") or line == "",
+                            f"non-comment line in the 9mo header: {line!r}")
+
+    def test_tobs_and_its_derived_settings_are_the_9mo_values(self):
+        # 270 d: WDMSettings.adjust_to_even_bins -> Nf 1440 x Nt 6480 x dt 2.5
+        # exactly (checked 2026-10-07); the sig-het stride keeps the 36-h
+        # parity (23328000 / 180 = 129600 s) and 180 divides 6480.
+        self.assertEqual(self.nine["TOBS_TARGET"], "23328000")
+        self.assertEqual(int(self.nine["TOBS_TARGET"]), 1440 * 6480 * 25 // 10)
+        self.assertEqual(self.nine["SIGHET_NT_LAYER"], "180")
+        self.assertEqual(int(self.nine["TOBS_TARGET"]) // int(self.nine["SIGHET_NT_LAYER"]),
+                         36 * 3600)
+        self.assertEqual(6480 % int(self.nine["SIGHET_NT_LAYER"]), 0)
+        self.assertEqual(self.nine["BASE_FILE_NAME"], "gf_prod_9mo")
+        self.assertIn(
+            "\nSTORE_DIR=${STORE_DIR:-/shared/data/global_fit_output/gf_prod_9mo_v9/}\n",
+            self.nine_text)
+        self.assertNotIn("gf_prod_6mo_v9_4gpu/}", self.nine_text)
+        self.assertNotIn("gf_prod_1yr_v9", self.nine_text)
+        # the warm start + noise pin come from the 6mo v9 parent, as the 1yr's
+        self.assertEqual(
+            self.nine["GF_SEED_STORE"],
+            "/shared/data/global_fit_output/gf_prod_6mo_v9_4gpu/gf_prod_6mo_testing.h5")
+        self.assertEqual(self.nine["GB_WARM_START_SOURCE_STORE"], self.nine["GF_SEED_STORE"])
+        self.assertEqual(self.nine["GB_WARM_START_SOURCE_TOBS"], "15552000")
+        self.assertTrue(self.nine["GB_WARM_START_COMPONENTS"].endswith(
+            "/warmstart/gf_prod_6mo_v9_4gpu_refereed.npz"),
+            self.nine["GB_WARM_START_COMPONENTS"])
+
+    def test_the_1yr_capacity_knobs_are_taken_verbatim(self):
+        # the ruling: the 1yr values, not a 270-d re-derivation (and not the
+        # 6mo values either)
+        for knob in ("GB_NLEAVES_MAX", "GB_N_SUBBANDS", "GB_RJ_INMODEL_CHUNK"):
+            self.assertEqual(self.nine[knob], self.one[knob], knob)
+            self.assertNotEqual(self.nine[knob], self.six[knob], knob)
+        self.assertEqual(self.nine["GB_NLEAVES_MAX"], "20000")
+        self.assertEqual(self.nine["GB_N_SUBBANDS"], "4096")
+        self.assertEqual(self.nine["GB_RJ_INMODEL_CHUNK"], "16384")
+
+    def test_the_sources_inside_270_days_plus_two_weeks(self):
+        # MBH session table 2026-10-03: the catalogue MBHBs merging before
+        # 367 d are the 1yr eleven; the 9mo set is those with t_c < 284 d.
+        # Srcs 9 (285.9 d) and 4 (286.4 d) are the next and stay out.
+        self.assertEqual(self.nine["MBHB_IDS"], "2,5,7,12,16,18")
+        nine_ids = set(self.nine["MBHB_IDS"].split(","))
+        one_ids = set(self.one["MBHB_IDS"].split(","))
+        self.assertTrue(nine_ids <= one_ids, nine_ids - one_ids)
+        self.assertTrue({"9", "4"} <= one_ids - nine_ids)
+        # user rule 2026-10-07: a merger up to two weeks past the end is kept
+        self.assertEqual(self.nine["MBH_MERGER_TIME_BUFFER"], str(14 * 86400))
+        self.assertNotIn("MBH_MERGER_TIME_BUFFER", self.one)
+        self.assertNotIn("MBH_MERGER_TIME_BUFFER", self.six)
+        self.assertEqual(self.nine["EMRI_IDS"], self.six["EMRI_IDS"])
+        self.assertEqual(self.nine["SOBHB_IDS"], self.six["SOBHB_IDS"])
+
+    def test_the_preflights_name_the_9mo_grid(self):
+        # the MBH + EMRI resolvers, plus the header's 9MO-4 note
+        self.assertEqual(self.nine_text.count("make_factory(1440, 6480)"), 3)
+        self.assertNotIn("make_factory(1440, 4320)", self.nine_text)
+        self.assertNotIn("make_factory(1440, 8640)", self.nine_text)
+        self.assertEqual(self.nine_text.count("Nf 1440 x Nt 6480 at dt 2.5 s"), 3)
+        self.assertNotIn("Nf 1440 x Nt 4320 at dt 2.5 s", self.nine_text)
+
+    def test_every_other_export_matches_the_1yr_script(self):
+        # "keep everything the same as the 1 yr run except ... the
+        # observation": every resolved export outside TOBS_DRIVEN is the
+        # 1yr value (so the V9-30 defaults, the GB knobs, the waveform
+        # knobs, the seed/warm start all agree)
+        keys = (set(self.one) | set(self.nine)) - {"_", "SHLVL", "PWD"}
+        drift = {k: (self.one.get(k), self.nine.get(k))
+                 for k in sorted(keys - self.TOBS_DRIVEN)
+                 if self.one.get(k) != self.nine.get(k)}
+        self.assertEqual(drift, {}, f"undeclared 1yr -> 9mo drift: {drift}")
+        same = sorted(k for k in self.TOBS_DRIVEN if self.one.get(k) == self.nine.get(k))
+        self.assertEqual(same, [], f"declared deltas that do not differ: {same}")
+
+    def test_the_name_carries_no_gpu_count(self):
+        self.assertEqual(os.path.basename(NINE_MO_V9), "submit_gf_9mo_v9.sh")
+        self.assertIn("#SBATCH --job-name=gf9mo_v9", self.nine_text)
+        self.assertIn("/shared/data/global_fit_output/gf9mo_v9_%j.log", self.nine_text)
+        self.assertNotIn("gf9mo_v9_4gpu", self.nine_text)
+
+
+class V930ProductionDefaultsTest(unittest.TestCase):
+    """V9-30 (user ruling 2026-10-07): Mike's 6mo production line
+
+        GB_FSTAT_FORCE_REFIT=1 GB_FSTAT_PE_REF=max PSD_EIGEN_INFO=fisher
+        GALFOR_EIGEN_INFO=fisher SOBBH_EIGEN_INFO=gram EMRI_EIGEN_INFO=gram
+        MBH_EIGEN_INFO=gram SOBBH_CHECK_LL=0 MBH_CHECK_LL=0 EMRI_CHECK_LL=0
+        MIDIT_CHECKPOINT=0 MBH_NTEMPS=8 EMRI_NTEMPS=8 EMRI_TRAJ_WORKERS=8
+        MBH_WINDOW_DECIMATE=2 NGPUS=4 ./submit_gf_6mo_v9_4gpu.sh
+
+    is the launcher DEFAULT in the 6mo script and its 1yr / 9mo twins --
+    every knob still in the ``${K:-v}`` form so the line can flip it back --
+    EXCEPT the two F-stat refit knobs: GB_FSTAT_FORCE_REFIT and
+    GB_FSTAT_PE_REF stay one-off line knobs (the PE refit walker keeps the
+    code default, random). NGPUS=4 is pinned by the dispatch test
+    ``test_the_v9_production_launchers_default_to_four_gpus``.
+    """
+
+    LINE = {
+        "MIDIT_CHECKPOINT": "0",
+        "MBH_NTEMPS": "8", "EMRI_NTEMPS": "8",
+        "EMRI_TRAJ_WORKERS": "8",
+        "MBH_WINDOW_DECIMATE": "2",
+        "SOBBH_EIGEN_INFO": "gram", "EMRI_EIGEN_INFO": "gram", "MBH_EIGEN_INFO": "gram",
+        "PSD_EIGEN_INFO": "fisher", "GALFOR_EIGEN_INFO": "fisher",
+        "SOBBH_CHECK_LL": "0", "MBH_CHECK_LL": "0", "EMRI_CHECK_LL": "0",
+        # not on the line; added the same day by ruling ("keep
+        # GF_PERSIST_STAGE_START, but it should reset at the end of a stage")
+        "GF_PERSIST_STAGE_START": "1",
+        # not on the line; ruling 2026-10-07 "Set these values in the v9
+        # script" -- the GB ladder re-spacing, effective on a fresh store
+        "GB_LADDER_HOT_RATIO": "1.35", "GB_LADDER_HOT_FROM": "10",
+        "GB_LADDER_PIN_LAST": "0",
+    }
+
+    def test_the_line_is_the_default_in_every_v9_production_launcher(self):
+        for path in V9_PRODUCTION:
+            exports = _exports(path)
+            src = open(path).read()
+            for knob, want in self.LINE.items():
+                with self.subTest(script=os.path.basename(path), knob=knob):
+                    self.assertEqual(exports.get(knob), want)
+                    # overridable: a hard `export K=v` would make the line
+                    # reach nothing (the MIDIT_CHECKPOINT lesson)
+                    self.assertRegex(
+                        src, rf"(?m)^export {knob}=\$\{{{knob}:-{want}\}}")
+
+    def test_the_fstat_refit_knobs_are_not_defaults(self):
+        for path in V9_PRODUCTION:
+            exports = _exports(path)
+            src = open(path).read()
+            with self.subTest(script=os.path.basename(path)):
+                for knob in ("GB_FSTAT_FORCE_REFIT", "GB_FSTAT_PE_REF"):
+                    self.assertNotIn(knob, exports, knob)
+                    self.assertNotRegex(src, rf"(?m)^export {knob}=", knob)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,154 @@
+"""Derive scripts/fstat_proposal/submit_gf_9mo_v9.sh from submit_gf_6mo_v9_4gpu.sh.
+
+The 9-month run (user ruling 2026-10-07): the 1yr run's settings, exactly,
+except what Tobs = 270 d itself changes. So the table below is the 1yr
+table (derive_1yr_v9_launcher.py) with the Tobs-derived values at 270 d
+and the 1yr values everywhere else (GB_NLEAVES_MAX, GB_N_SUBBANDS,
+GB_RJ_INMODEL_CHUNK, the 6mo v9 parent for the warm start + noise pin).
+
+Run from the LAT root after ANY edit to the 6mo script (with
+derive_1yr_v9_launcher.py), then run
+tests/test_submit_scripts_layout.py::NineMonthV9TwinTest (it holds the same
+table and cross-checks every export against the 1yr script).
+
+Every replacement is an exact string with an expected match count; anything
+else in the file is byte-identical. Re-runnable."""
+import os, sys
+src = "scripts/fstat_proposal/submit_gf_6mo_v9_4gpu.sh"
+dst = "scripts/fstat_proposal/submit_gf_9mo_v9.sh"
+text = open(src).read()
+
+REPL = [
+    # ---- naming (store, file names, SLURM) ---------------------------------
+    ("#SBATCH --job-name=gf6mo_v9_4gpu     # job name",
+     "#SBATCH --job-name=gf9mo_v9          # job name", 1),
+    ("/shared/data/global_fit_output/gf6mo_v9_4gpu_%j.log",
+     "/shared/data/global_fit_output/gf9mo_v9_%j.log", 1),
+    ("STORE_DIR=${STORE_DIR:-/shared/data/global_fit_output/gf_prod_6mo_v9_4gpu/}",
+     "STORE_DIR=${STORE_DIR:-/shared/data/global_fit_output/gf_prod_9mo_v9/}", 1),
+    ("export BASE_FILE_NAME=gf_prod_6mo\n", "export BASE_FILE_NAME=gf_prod_9mo\n", 1),
+    # ---- Tobs and the knobs that follow it ---------------------------------
+    # 270 d = 23328000 s: WDMSettings.adjust_to_even_bins resolves it to
+    # Nf 1440 x Nt 6480 x dt 2.5 exactly (checked 2026-10-07 with the stock
+    # wavelet-duration bounds), 1.5x the 6mo Nt; the 1yr grid is Nt 8640.
+    ("export TOBS_TARGET=15552000        # 180 d; grid resolves Nf 1440 x Nt 4320 x dt 2.5 (exact factor-2 of 3 mo in Nt)",
+     "export TOBS_TARGET=23328000        # 270 d; grid resolves Nf 1440 x Nt 6480 x dt 2.5 (1.5x the 6 mo Nt; the 1yr runs Nt 8640)", 1),
+    # the sig-het layer stride keeps the validated 36-h parity: Tobs / 36 h =
+    # 60 (3mo) / 120 (6mo) / 180 (9mo) / 240 (1yr); 180 divides Nt = 6480.
+    ("export SIGHET_NT_LAYER=120\n", "export SIGHET_NT_LAYER=180\n", 1),
+    # ---- the 1yr values, verbatim (user ruling 2026-10-07: "keep all the
+    #      accuracy settings for the 1yr run the same") ----------------------
+    ("export GB_NLEAVES_MAX=15000        # 6 mo: deeper confusion resolved; 3-mo ran 10000",
+     "export GB_NLEAVES_MAX=20000        # 9 mo: the 1yr value (user ruling 2026-10-07, 1yr settings); 6-mo ran 15000, 3-mo 10000", 1),
+    ("export GB_N_SUBBANDS=8192   # PER GPU; total = x n_gpus. Slab ~0.5 MB/slot",
+     "export GB_N_SUBBANDS=4096   # PER GPU; total = x n_gpus. Slab ~0.75 MB/slot at 9 mo (the 1yr value, user ruling 2026-10-07)", 1),
+    ("export GB_RJ_INMODEL_CHUNK=32768  # byte-parity with the 3mo twin's 65536 (6mo cells ~2x bytes); floored to ntemps multiples by the column-atomic staging",
+     "export GB_RJ_INMODEL_CHUNK=16384  # the 1yr value (user ruling 2026-10-07, 1yr settings; 9mo cells ~1.5x the 6mo bytes); floored to ntemps multiples by the column-atomic staging", 1),
+    # ---- the MBHBs inside a 270 d window + 14 d (user rule 2026-10-07) ----
+    # The MBH session's catalogue table (2026-10-03): every catalogue MBHB
+    # merging before 367 d is one of the 1yr eleven, so the 9mo set is the
+    # subset with t_c < 270 d + 14 d = 284 d. Nothing lands in (270, 284] d:
+    # the next mergers are srcs 9 (285.9 d) and 4 (286.4 d), 15.9 / 16.4 d
+    # past the end. The 14-d buffer is exported so the rule is on the run
+    # record and the t_plunge prior's upper edge follows it; a merger past the
+    # data end is modelled by its in-window inspiral, cut at the data end
+    # (mbh_window_layers clamps the kept box at the active box; the stock
+    # generator lives on the data lattice; tests/test_mbh_batched_move.py::
+    # test_telemetry_merger_past_the_data_end).
+    ("export MBHB_IDS=2,5,16,18          # t_c 173.3 / 104.7 / 111.4 / 92.0 d",
+     "export MBHB_IDS=2,5,7,12,16,18     # t_c 173.3/104.7/263.8/243.8/111.4/92.0 d (MBH session 2026-10-03 table): every catalogue MBHB merging inside 270 d + the 14-d MBH_MERGER_TIME_BUFFER below. None merges in (270, 284] d; the next are srcs 9 (285.9 d) and 4 (286.4 d), 15.9 / 16.4 d past the end, then 0 (300.4), 15 (318.0), 3 (336.8), 10 (369.5)\n"
+     "# User rule 2026-10-07: keep any MBHB merging within 2 weeks of the end of the\n"
+     "# observation (its in-window inspiral is modelled, cut at the data end by the\n"
+     "# batched window's active-box clamp and the stock generator's data lattice).\n"
+     "# 14 d replaces the code default of 7 d; the t_plunge prior's upper edge\n"
+     "# follows it (obs_end + buffer + t_plunge_pad).\n"
+     "export MBH_MERGER_TIME_BUFFER=1209600   # 14 d", 1),
+    # ---- the three preflight resolvers name the run's grid -----------------
+    ("make_factory(1440, 4320)", "make_factory(1440, 6480)", 2),
+    ("Nf 1440 x Nt 4320 at dt 2.5 s", "Nf 1440 x Nt 6480 at dt 2.5 s", 3),
+    # ---- the warm-start / noise-pin parent is the 6mo v9 run (as the 1yr's) ----
+    ("${STORE_DIR}/warmstart/gf_prod_3mo_v8_10w_refereed.npz}",
+     "${STORE_DIR}/warmstart/gf_prod_6mo_v9_4gpu_refereed.npz}", 1),
+    ("GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/global_fit_output/gf_prod_3mo_v8_10walkers/gf_prod_3mo_testing.h5}",
+     "GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/global_fit_output/gf_prod_6mo_v9_4gpu/gf_prod_6mo_testing.h5}", 1),
+    ("GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-7776000}",
+     "GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-15552000}   # the 6-month parent", 1),
+]
+for old, new, n in REPL:
+    c = text.count(old)
+    if c != n:
+        sys.exit(f"REFUSING: {old!r} matches {c} times, expected {n}")
+    text = text.replace(old, new)
+
+HEADER = """#!/bin/bash
+# ============================================================================
+# PRODUCTION global fit -- 9mo_v9 (Tobs = 270 d). DERIVED 2026-10-07 FROM
+# submit_gf_6mo_v9_4gpu.sh (dev, the 6mo production launcher on the V9-30
+# defaults) BY scripts/fstat_proposal/derive_9mo_v9_launcher.py (exact-string
+# replacement, re-run it after every 6mo edit): everything not listed here is
+# BYTE-IDENTICAL to the 6mo script, and tests/test_submit_scripts_layout.py::
+# NineMonthV9TwinTest refuses any other drift AND checks every export against
+# submit_gf_1yr_v9.sh. User ruling 2026-10-07: "run a 9mo run instead of
+# 1yr ... keep all the accuracy settings for the 1yr run the same ... keep
+# everything the same as the 1 yr run except for any specific necessary
+# changes due to the observation". No "_4gpu" in the name: NGPUS picks the
+# layout (default 4 since V9-30).
+#
+#   9MO-1. NAMING: --job-name gf9mo_v9, --output gf9mo_v9_%j.log,
+#          STORE_DIR gf_prod_9mo_v9/, BASE_FILE_NAME gf_prod_9mo.
+#   9MO-2. TOBS_TARGET 15552000 -> 23328000 (270 d; Nf 1440 x Nt 6480 x dt
+#          2.5, 1.5x the 6mo Nt) and the ONE knob that follows Tobs itself:
+#          SIGHET_NT_LAYER 120 -> 180 (the 36-h stride parity; 180 divides
+#          6480). GB_NLEAVES_MAX 20000, GB_N_SUBBANDS 4096 per GPU and
+#          GB_RJ_INMODEL_CHUNK 16384 are the 1YR VALUES, verbatim (the
+#          ruling), not re-derived for 270 d: all three are capacity /
+#          memory knobs, and the 1yr sizing has more headroom at 9 mo
+#          (slab ~0.75 MB/slot, sig-het stash product 4096 x 178 = 0.73e6
+#          against the 6mo-safe 0.97e6).
+#   9MO-3. MBHB_IDS: the catalogue MBHBs merging inside 270 d + 14 d
+#          (2,5,7,12,16,18 -- all merge BEFORE the end; none lands in
+#          (270, 284] d, the next are srcs 9 / 4 at 285.9 / 286.4 d) and
+#          MBH_MERGER_TIME_BUFFER=1209600 (14 d, user rule 2026-10-07: keep
+#          a merger up to two weeks past the end, modelled by its in-window
+#          inspiral cut at the data end -- supported: the batched window
+#          clamps its kept box at the data's active box and the stock
+#          generator lives on the data lattice). EMRI_IDS / SOBHB_IDS
+#          unchanged; EMRI 3 (plunge 256 d) takes the plunge path inside
+#          this window, EMRI 0 (347 d) does not.
+#   9MO-4. The MBH / EMRI / SOBBH preflight resolvers name the 9mo grid
+#          (make_factory(1440, 6480); comments). The lookup tables are the
+#          SAME canonical files (Nf and dt only), built once in the new
+#          STORE_DIR on the first launch.
+#   9MO-5. Warm start + noise pin parent = the 6mo v9 run, exactly as the
+#          1yr (GF_SEED_STORE gf_prod_6mo_v9_4gpu/gf_prod_6mo_testing.h5,
+#          GB_WARM_START_SOURCE_TOBS 15552000, refereed npz
+#          gf_prod_6mo_v9_4gpu_refereed.npz -- auto-built from the parent
+#          store on the first launch when missing).
+#
+# EVERYTHING ELSE = the 1yr script = the 6mo script (NineMonthV9TwinTest
+# diffs the resolved exports against submit_gf_1yr_v9.sh: only TOBS_TARGET,
+# SIGHET_NT_LAYER, BASE_FILE_NAME, MBHB_IDS and MBH_MERGER_TIME_BUFFER may
+# differ). The waveform knobs are the 1yr answers (no export changes): EMRI
+# direct, SOBBH lookup (EVAL_DT 43200), MBH batched (decimation 2, 90 d
+# window), EDGE_CROP_WAVELETS 60 -- verified at Nt 6480 (2026-10-07, by
+# running the build guard): sig-het taper ceil(0.005 x 6480) = 33 + 8
+# margin = 41 <= 60 (19 layers spare; the 1yr has 8), the data taper is 2
+# fixed wavelets (auto crop 20, subsumed), EMRI pixel_edge 8 <= 60; the
+# crop costs 1.85 % of the data.
+#
+# LAUNCH (from the LAT root; the V9-30 defaults ARE the production line --
+# NGPUS=4, MIDIT_CHECKPOINT=0, MBH_NTEMPS=8, EMRI_NTEMPS=8,
+# EMRI_TRAJ_WORKERS=8, MBH_WINDOW_DECIMATE=2, gram / fisher eigen tables,
+# source cross-checks off):
+#   ./scripts/fstat_proposal/submit_gf_9mo_v9.sh
+# (a FRESH store: no CLOCK_START, no re-rung. Requires the 6mo v9 store for
+#  the seed + warm start. GB_FSTAT_FORCE_REFIT=1 / GB_FSTAT_PE_REF=max stay
+#  one-off line knobs, never defaults.)
+#
+# ---- the 6mo v9 header follows verbatim ------------------------------------
+"""
+assert text.startswith("#!/bin/bash\n")
+text = HEADER + text[len("#!/bin/bash\n"):]
+open(dst, "w").write(text)
+os.chmod(dst, os.stat(src).st_mode)
+print("wrote", dst, len(text.splitlines()), "lines")

@@ -52,7 +52,8 @@ for old, new, n in REPL:
 HEADER = """#!/bin/bash
 # ============================================================================
 # PRODUCTION global fit -- 1yr_v9 (Tobs = 360 d). DERIVED 2026-10-03 FROM
-# submit_gf_6mo_v9_4gpu.sh (dev 93f22bce, the 6mo production relaunch) BY
+# submit_gf_6mo_v9_4gpu.sh (dev 93f22bce, the 6mo production relaunch; last
+# re-derived 2026-10-07 on the V9-30 defaults) BY
 # scripts/fstat_proposal/derive_1yr_v9_launcher.py (exact-string replacement,
 # re-run it after every 6mo edit): everything not listed here is
 # BYTE-IDENTICAL to the 6mo script, and tests/test_submit_scripts_layout.py::
@@ -99,12 +100,14 @@ HEADER = """#!/bin/bash
 # or dev0 memory says so. GALFOR_START_PARAMS stays the offline 3mo estimate
 # (6mo ruling 2026-09-24 "just for now").
 #
-# LAUNCH (from the LAT root; the 6mo production line with the 1yr script):
-#   GALFOR_RATCHET=1 MIDIT_CHECKPOINT=0 EMRI_TRAJ_WORKERS=8 \\
-#     MBH_WINDOW_DECIMATE=2 NGPUS=4 ./scripts/fstat_proposal/submit_gf_1yr_v9.sh
+# LAUNCH (from the LAT root). Since 2026-10-07 (V9-30) the 6mo production
+# line's knobs are the launcher DEFAULTS -- NGPUS=4, MIDIT_CHECKPOINT=0,
+# MBH_NTEMPS=8, EMRI_NTEMPS=8, EMRI_TRAJ_WORKERS=8, MBH_WINDOW_DECIMATE=2, the
+# gram / fisher eigen tables, the source cross-checks off -- so the line is:
+#   ./scripts/fstat_proposal/submit_gf_1yr_v9.sh
 # (a FRESH store: no CLOCK_START, no re-rung -- MBH_NTEMPS / EMRI_NTEMPS build
-#  the ladders; the 6mo store was re-rung to 8, so pass MBH_NTEMPS=8
-#  EMRI_NTEMPS=8 to match it.)
+#  the 8-rung ladders the 6mo store was re-rung to. GB_FSTAT_FORCE_REFIT=1 /
+#  GB_FSTAT_PE_REF=max stay one-off line knobs, never defaults.)
 #
 # ---- the 6mo v9 header follows verbatim ------------------------------------
 """

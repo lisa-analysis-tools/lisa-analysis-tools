@@ -20,10 +20,20 @@
 #         exact likelihood (COARSE_GPU_MODE=off). Both target the SAME
 #         distribution -- delayed acceptance is exact -- so this is a cost
 #         and complexity change, not a bias change.
-#   V9-3. 4-GPU SHAPE is the intended invocation (`NGPUS=4 ./submit...`).
-#         The machinery is v8's, unchanged; only the naming and the store
-#         say 4gpu. As in every other *_4gpu script the DEFAULT stays
-#         NGPUS=2 so the dispatch block and its layout tests are uniform.
+#   V9-3. 4-GPU SHAPE is the intended invocation and, since 2026-10-07, the
+#         DEFAULT (`./submit...` = `NGPUS=4 ./submit...`; NGPUS=2 on the
+#         line is still the 1-node spot flow). The machinery is v8's,
+#         unchanged; only the naming and the store say 4gpu.
+#   V9-30 (2026-10-07). MIKE'S PRODUCTION LINE IS THE DEFAULT. The knobs
+#         every 6mo relaunch since job 715 carried on the command line are
+#         now the launcher defaults, each still `${K:-v}` overridable:
+#         NGPUS=4, MIDIT_CHECKPOINT=0, MBH_NTEMPS=8, EMRI_NTEMPS=8,
+#         EMRI_TRAJ_WORKERS=8, MBH_WINDOW_DECIMATE=2, the expected-information
+#         eigen tables ({SOBBH,EMRI,MBH}_EIGEN_INFO=gram,
+#         {PSD,GALFOR}_EIGEN_INFO=fisher) and the source cross-checks off
+#         ({SOBBH,MBH,EMRI}_CHECK_LL=0). NOT defaults, by the same ruling:
+#         GB_FSTAT_FORCE_REFIT=1 and GB_FSTAT_PE_REF=max are one-off line
+#         knobs (the PE refit walker stays the code default, random).
 #
 # ⚠ FRESH STORE IS MANDATORY, and the script will refuse otherwise. The
 # coarse mode is part of `noise_model_identity`, so v8's store cannot be
@@ -451,16 +461,17 @@ set -euo pipefail
 
 # ---- GPU-count self-dispatch + rank-layout knobs (2026-09-16: rank count
 # ---- now derives from the GPU count) ---------------------------------
-# NGPUS=2 -> gpu-80-spot, 1 node x 2 GPUs (default, unchanged partition);
-# NGPUS=4 -> gpu-80-spot, 2 NODES x 2 GPUs each -- the cluster's real 4-GPU
+# NGPUS=2 -> gpu-80-spot, 1 node x 2 GPUs (the unchanged partition);
+# NGPUS=4 -> gpu-80-ondemand, 2 NODES x 2 GPUs each (THE DEFAULT since
+# 2026-10-07, Mike's production line) -- the cluster's real 4-GPU
 # allocation shape (there is no single 4-GPU node; see the design spec's
 # "Context" section). #SBATCH lines are static comments, so neither the
 # partition/node/task count can follow an env var through a plain
 # `sbatch <script>`. Instead, run this script DIRECTLY to pick the GPU
 # count and it submits itself with the matching flags:
 #
-#     NGPUS=4 ./submit_gf_6mo_v9_4gpu.sh # THE INTENDED INVOCATION
-#     NGPUS=2 ./submit_gf_6mo_v9_4gpu.sh # gpu-80-spot, 1 node x gpu:2 (default)
+#     ./submit_gf_6mo_v9_4gpu.sh         # THE INTENDED INVOCATION (= NGPUS=4)
+#     NGPUS=2 ./submit_gf_6mo_v9_4gpu.sh # gpu-80-spot, 1 node x gpu:2
 #     sbatch  ./submit_gf_6mo_v9_4gpu.sh # legacy flow: header defaults above
 #                                        # (2 GPUs, gpu-80-spot, --ntasks=3)
 #
@@ -482,7 +493,7 @@ set -euo pipefail
 # `sbatch --partition=gpu-80-spot --gres=gpu:2 --nodes=2 <script>` also
 # works.
 if [ -z "${SLURM_JOB_ID:-}" ]; then
-  NGPUS=${NGPUS:-2}
+  NGPUS=${NGPUS:-4}                # 4 since 2026-10-07 (was 2): the 2-node on-demand shape
   GPUS_PER_RANK=${GPUS_PER_RANK:-}
   RANKS_PER_GPU=${RANKS_PER_GPU:-1}
   _k=${GPUS_PER_RANK:-1}
@@ -551,9 +562,9 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
   # tests/test_submit_scripts_layout.py::SixMonthEMRIDirectTest).
   _CPT=2
   if [ "${EMRI_LIKELIHOOD:-direct}" = "direct" ]; then
-    _CPT=$(( 2 + ${EMRI_TRAJ_WORKERS:-4} ))
+    _CPT=$(( 2 + ${EMRI_TRAJ_WORKERS:-8} ))
   fi
-  echo "[SUBMIT] --cpus-per-task=${_CPT} (EMRI_LIKELIHOOD=${EMRI_LIKELIHOOD:-direct}, EMRI_TRAJ_WORKERS=${EMRI_TRAJ_WORKERS:-4})"
+  echo "[SUBMIT] --cpus-per-task=${_CPT} (EMRI_LIKELIHOOD=${EMRI_LIKELIHOOD:-direct}, EMRI_TRAJ_WORKERS=${EMRI_TRAJ_WORKERS:-8})"
   exec sbatch --partition="${_NGPU_PART}" --gres="${_GRES}" --nodes="${_NODES}" \
        --ntasks="${NTASKS}" --cpus-per-task="${_CPT}" ${_DIST_FLAG} \
        --export=ALL,NGPUS="${NGPUS}",GPUS_PER_RANK="${GPUS_PER_RANK}",RANKS_PER_GPU="${RANKS_PER_GPU}",GF_LEGACY_RANK_LAYOUT="${GF_LEGACY_RANK_LAYOUT}",GF_MONITOR_RANK="${GF_MONITOR_RANK}" \
@@ -736,7 +747,7 @@ RANKS_PER_GPU=${RANKS_PER_GPU:-1}
 # `sbatch <script>` never ran the --export=ALL,... dispatch line.
 export GPUS_PER_RANK RANKS_PER_GPU
 _k=${GPUS_PER_RANK:-1}
-if [ "${NGPUS:-2}" = "4" ]; then
+if [ "${NGPUS:-4}" = "4" ]; then
   GF_LEGACY_RANK_LAYOUT=${GF_LEGACY_RANK_LAYOUT:-0}
 else
   # walker-block layout by default at NGPUS=2 too (user ruling 2026-09-16;
@@ -3609,6 +3620,20 @@ export REPLICA_PE_WINDOW=${REPLICA_PE_WINDOW:-10}
 export REPLICA_PE_LEAF_TOL=${REPLICA_PE_LEAF_TOL:-10}
 export REPLICA_PE_LNL_TOL=${REPLICA_PE_LNL_TOL:-100}
 echo "[REPLICA-PE] STAGE_REPLICA_PE=${STAGE_REPLICA_PE} window=${REPLICA_PE_WINDOW} leaf_tol=${REPLICA_PE_LEAF_TOL} lnl_tol=${REPLICA_PE_LNL_TOL} | gb_search_3 ends at the ratchet stop: ${GALFOR_RATCHET_END_STAGE_ON_STOP}"
+# ---- STAGE CLOCKS SURVIVE A RESUME (user ask 2026-09-26; ruling 2026-10-07:
+# "keep GF_PERSIST_STAGE_START, but it should reset at the end of a stage") --
+# A stage's start iteration is stamped in the store (start_iteration on its
+# recipe group) and restored on a relaunch, so the plateau / shutoff / replica
+# windows count IN-STAGE iterations across restarts instead of restarting the
+# clock at every launch (3mo job 640 -> 644: gb_search_1's earliest possible
+# end moved 66 -> 71; a run bounced every few hours never reaches the 41
+# in-stage iterations the plateau needs). The stamp is RESET at every stage
+# boundary: completed_recipe_step rewrites the next stage's start in the same
+# open as the completion, and a stored start past the live iteration (a
+# rewound store) is ignored and re-stamped. Code default 0; =0 on the line
+# restores the per-launch clock. Compute ranks never touch the store for this
+# (their shell engine carries eryn's in-memory backend).
+export GF_PERSIST_STAGE_START=${GF_PERSIST_STAGE_START:-1}
 # While the ratchet is active the per-(walker, band) RJ shutoff valve leaves
 # every band below this frequency OPEN (reopening shut pairs with a fresh
 # streak) and shuts converged bands above it as usual; lifted at the
@@ -3757,6 +3782,9 @@ export GB_FSTAT_REFIT_EVERY_PE=250
 # fingerprint, centre table on a load). GB_FSTAT_PE_REF=min restores the
 # min-lnL rule in PE. Search refits always take the min-lnL walker, and the
 # per-propose distance-birth centre keeps the min in both.
+# GB_FSTAT_PE_REF=max and GB_FSTAT_FORCE_REFIT=1 (refit on a restart) are
+# ONE-OFF launch-line knobs (user ruling 2026-10-07, V9-30): never defaults
+# here -- the PE refit walker stays the code default, random.
 export FSTAT_PEAKS_PER_BAND=200    # per-sub-band peak cap (code default; explicit)
 # STAGE-B STACK CHUNKING -- fixes the 2026-09-21 epoch-9 OOM.
 # StackedFStatProposal4D.__init__ corner-averages the ENTIRE K-box 4-D grid
@@ -4091,6 +4119,29 @@ echo "[VGB-OBS-EIGEN] VGB_INMODEL_OBSERVABLE_EIGEN='${VGB_INMODEL_OBSERVABLE_EIG
 # probes ran a degenerate [1.0, 1e-4] ladder for days on exactly that. The
 # LADDER PREFLIGHT below turns the silent case into a refusal to start.
 export GB_NTEMPS=24
+# ---- GB LADDER RE-SPACING (user ruling 2026-10-07: "Set these values in the
+# v9 script") ----------------------------------------------------------------
+# Measured on 6mo job 650 (and the 3mo run): the stock ladder is geometric at
+# 1.20 from T0 to T22 (beta 1.765e-2, T 56.7), then T23 is PINNED at beta
+# 1e-4 (T 10,000) -- a 176x gap that holds 258 sources against T22's 3,731
+# and couples at 15.4 %, while every other adjacent pair couples at 31-71 %
+# (the hot half is spaced far too finely; replica exchange wants ~20-30 %).
+# Sources/walker against ln(T) over T0..T22 reaches zero near T ~ 1,460, so
+# ~a factor of 26 of usable temperature is skipped before the pinned rung
+# overshoots it 7x. First step of the two-step plan (1.35, measure the
+# acceptance profile, then ~1.5): T0-T10 stay at 1.20 (T10 = 6.19), T11-T23
+# at 1.35 -> T23 ~ 306 (beta 3.3e-3), and the top rung is no longer pinned
+# (GB_LADDER_PIN_LAST=0 leaves it on the progression; 1.5 would land ~1,205).
+# ⚠ TAKES EFFECT ON A FRESH STORE ONLY (the 9mo run): band_temps lives in the
+# store and initialize_band_information restores it, and the LADDER PREFLIGHT
+# below compares the rung COUNT (24, unchanged), not the values -- so on the
+# resumed 6mo store these three are a silent no-op by design (no migration).
+# Watch on the 9mo's first tar: [GB_VERT] adjacent swap acceptance per rung
+# pair (want 20-30 % across the hot half, no 15 % cliff at the top) and the
+# sources-per-walker profile over the ladder.
+export GB_LADDER_HOT_RATIO=${GB_LADDER_HOT_RATIO:-1.35}
+export GB_LADDER_HOT_FROM=${GB_LADDER_HOT_FROM:-10}
+export GB_LADDER_PIN_LAST=${GB_LADDER_PIN_LAST:-0}
 # Concurrent per-device shard dispatch (code default since 2026-08-13;
 # explicit here for the run record). =0 restores serial dispatch if the
 # drift/[GB_CELL_LL] checks ever implicate concurrency.
@@ -4551,9 +4602,11 @@ export GB_SEARCH_3_WARM_EVERY=5
 # startup copy from a half-nudged state: jobs 673/674 each ran the galfor
 # NUDGE and were stopped; ten more minutes and either would have written a
 # post-nudge checkpoint at stored iteration 47 that job 675 would have
-# adopted and nudged AGAIN (the job-672 double nudge by another door). The
-# default stays 1 for the unlegged runs.
-export MIDIT_CHECKPOINT=${MIDIT_CHECKPOINT:-1}
+# adopted and nudged AGAIN (the job-672 double nudge by another door).
+# DEFAULT 0 since 2026-10-07 (V9-30: every production relaunch since job 715
+# carried MIDIT_CHECKPOINT=0 on the line); MIDIT_CHECKPOINT=1 on the line
+# re-arms it for an unlegged run.
+export MIDIT_CHECKPOINT=${MIDIT_CHECKPOINT:-0}
 export MIDIT_CHECKPOINT_MIN_INTERVAL=${MIDIT_CHECKPOINT_MIN_INTERVAL:-600}
 if [ "${MIDIT_CHECKPOINT}" = "1" ]; then
   echo "[V9-CKPT] mid-iteration checkpoints ON, min interval ${MIDIT_CHECKPOINT_MIN_INTERVAL}s"
@@ -4605,8 +4658,11 @@ echo "[DATA] SOURCE_TYPES=${SOURCE_TYPES} (COMBINED = pre-summed stream; classes
 # with the matching count on the line (MBH_NTEMPS=12 EMRI_NTEMPS=12) so the
 # configured and stored ladders agree and the warning stays quiet. A hard
 # export here swallowed that line value.
-export MBH_NTEMPS=${MBH_NTEMPS:-2}
-export EMRI_NTEMPS=${EMRI_NTEMPS:-2}
+# DEFAULT 8 since 2026-10-07 (V9-30): the 6mo store was re-rung to 8 on 10-02
+# and every relaunch line since carried MBH_NTEMPS=8 EMRI_NTEMPS=8; a FRESH
+# store (1yr, 9mo) builds its MBH / EMRI ladders from these.
+export MBH_NTEMPS=${MBH_NTEMPS:-8}
+export EMRI_NTEMPS=${EMRI_NTEMPS:-8}
 # 12 -> 8 (user ruling 2026-09-16, with repeats 25 -> 20: sobbh cost
 # trim now that the single-call fix landed). NOTE: SOBHB's ladder lives
 # in the stored PerLeafLadderState (betas_all per leaf), so on a RESUME
@@ -4718,6 +4774,11 @@ export SOBBH_M_BAND_HALF_WIDTH=3
 # the SOBBH session recommends 10 for the first lookup segment, back to 30
 # if the check costs more than ~10 % of the SOBBH leg.
 export SOBBH_CHECK_LL_EVERY=${SOBBH_CHECK_LL_EVERY:-30}
+# The check itself is OFF by default since 2026-10-07 (V9-30: SOBBH_CHECK_LL=0
+# on Mike's production line -- on job 727 the per-container slow-path
+# re-score took ~525 s x 3 rounds = 26 min and it never warned in 715-738);
+# SOBBH_CHECK_LL=1 on the line re-arms it at the SOBBH_CHECK_LL_EVERY cadence.
+export SOBBH_CHECK_LL=${SOBBH_CHECK_LL:-0}
 
 # ---- EIGEN INNER MOVE (2026-09-05/08 work; code defaults, pinned) ----------
 # The addremove branches' in-model proposal is the eryn EigenAxisMove: a
@@ -4759,11 +4820,13 @@ export EMRI_EIGEN_REFRESH=100
 # tables (correct but slow -- MH corrects the shape); a steady stream of
 # them means arm the stretch escape and file the traceback.
 #
-# ---- OPT-IN: EIGEN TABLES FROM THE EXPECTED INFORMATION (2026-10-06) -------
-# NOT exported here -- the default stays "ll" (the tables above, from
-# second differences of the likelihood). Opt in per branch ON THE LAUNCH
-# LINE. All CPU-validated only; none has run on a GPU yet (2026-10-06).
-# Route map, numbers and tests: docs/eigen-info-routes.md.
+# ---- EIGEN TABLES FROM THE EXPECTED INFORMATION (2026-10-06; DEFAULT ON
+# ---- since 2026-10-07, V9-30) -------------------------------------------
+# Exported at the end of this block with Mike's production-line values:
+# gram for the three source branches, fisher for the two noise branches.
+# {BRANCH}_EIGEN_INFO=ll on the launch line restores the second-difference
+# tables above. CPU-validated (2026-10-06); the first GPU run is the launch
+# that follows. Route map, numbers and tests: docs/eigen-info-routes.md.
 #
 # {SOBBH,EMRI,MBH}_EIGEN_INFO=gram (move attribute eigen_info). The table is
 #   built from the Gram matrix <dh_a|dh_b> of the move's OWN batched
@@ -4791,10 +4854,15 @@ export EMRI_EIGEN_REFRESH=100
 #   failure WARNS ("[eigen_refresh] ... noise Fisher failed") and builds the
 #   ll table.
 #
-# e.g.  SOBBH_EIGEN_INFO=gram GALFOR_EIGEN_INFO=fisher NGPUS=4 ./submit...
+# e.g.  SOBBH_EIGEN_INFO=ll GALFOR_EIGEN_INFO=ll ./submit...   (back to ll)
 # WATCH: "[eigen_refresh] <branch> leaf N Gram info matrix at walker W in
 # X s" / "[eigen_refresh] galfor: noise Fisher tables at N point(s) in X s"
 # lines (one per refresh), and no "failed" warnings.
+export SOBBH_EIGEN_INFO=${SOBBH_EIGEN_INFO:-gram}
+export EMRI_EIGEN_INFO=${EMRI_EIGEN_INFO:-gram}
+export MBH_EIGEN_INFO=${MBH_EIGEN_INFO:-gram}
+export PSD_EIGEN_INFO=${PSD_EIGEN_INFO:-fisher}
+export GALFOR_EIGEN_INFO=${GALFOR_EIGEN_INFO:-fisher}
 
 # ============================================================================
 # MBH LIKELIHOOD: BATCHED + WINDOWED (2026-09-30). Spec:
@@ -4846,20 +4914,25 @@ export MBH_BATCH_MAX_SIZE=${MBH_BATCH_MAX_SIZE:-8}
 # 30 until now, so it is pinned here for the run record.
 # MBH_RESPONSE_ORDER=30 on the launch line restores the old order.
 export MBH_RESPONSE_ORDER=${MBH_RESPONSE_ORDER:-8}
-# Window lattice DECIMATION FACTOR (2026-10-02, OFF by default until the cluster
-# speed/accuracy run; not the mass ratio): the batched template is generated,
+# Window lattice DECIMATION FACTOR (2026-10-02; DEFAULT 2 since 2026-10-07, V9-30:
+# the cluster speed/accuracy run passed and every production job since 715 ran
+# MBH_WINDOW_DECIMATE=2 on the line; not the mass ratio): the batched template is generated,
 # responded and WDM-transformed at decimation*dt on Nf/decimation layers (same
 # 1-h pixels), ~decimation x less phentax + response + transform per row.
 # Laptop: decimation 2 mismatch <= 1.5e-9 vs none at 6e5 and 6e6 Msun;
 # decimation 4 fails the lightest (ringdown above the 50 mHz coarse Nyquist).
 # The epoch snaps onto that lattice for BOTH generators (no stored coordinate
 # changes; a resume may switch the factor).
-export MBH_WINDOW_DECIMATE=${MBH_WINDOW_DECIMATE:-1}
+export MBH_WINDOW_DECIMATE=${MBH_WINDOW_DECIMATE:-2}
 # MBH_CHECK_LL_EVERY is deliberately NOT exported: the batched move defaults
 # it to 10 (every 10th leaf visit re-scores the cold rung through the stock
 # 90 d generator; warns past MBH_CHECK_LL_TOL = 0.5 nats). For the FIRST
 # segment on the new path, MBH_CHECK_LL_EVERY=1 on the launch line gives a
 # cross-check on every visit (one stock waveform per row on top).
+# The check itself is OFF by default since 2026-10-07 (V9-30: MBH_CHECK_LL=0
+# on Mike's production line; it never warned in jobs 715-738); MBH_CHECK_LL=1
+# on the line re-arms it at the cadence above.
+export MBH_CHECK_LL=${MBH_CHECK_LL:-0}
 # WATCH: [MBH_BATCH] "leaf N: R rows ... s/row ..., F fallbacks,
 # outside_box=K" (F and K must stay 0 -- a steady K means the walkers' merger
 # times spread past MBH_WINDOW_MARGIN_DAYS); [MBH_FILL]; and the two warnings
@@ -5021,8 +5094,12 @@ export EMRI_LIKELIHOOD=${EMRI_LIKELIHOOD:-direct}
 export EMRI_BATCH_MAX_SIZE=${EMRI_BATCH_MAX_SIZE:-8}
 export EMRI_DIRECT_TABLE=${EMRI_DIRECT_TABLE:-}
 export EMRI_DIRECT_RESPONSE=${EMRI_DIRECT_RESPONSE:-dense}
-export EMRI_TRAJ_WORKERS=${EMRI_TRAJ_WORKERS:-4}
+export EMRI_TRAJ_WORKERS=${EMRI_TRAJ_WORKERS:-8}   # 8 since 2026-10-07 (V9-30; was 4)
 export EMRI_DIRECT_LOOKUP=${EMRI_DIRECT_LOOKUP:-kernel}
+# The cold-rung cross-check is OFF by default since 2026-10-07 (V9-30:
+# EMRI_CHECK_LL=0 on Mike's production line; it never warned in 715-738);
+# EMRI_CHECK_LL=1 on the line re-arms it (every 10th visit, see above).
+export EMRI_CHECK_LL=${EMRI_CHECK_LL:-0}
 #
 # EMRI PREFLIGHT. An unknown env var is SILENTLY IGNORED, so resolve the knobs
 # through the real settings class and the real consistency rule; for direct,

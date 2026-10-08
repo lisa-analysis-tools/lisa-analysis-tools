@@ -1,62 +1,67 @@
 #!/bin/bash
 # ============================================================================
-# PRODUCTION global fit -- 1yr_v9 (Tobs = 360 d). DERIVED 2026-10-03 FROM
-# submit_gf_6mo_v9_4gpu.sh (dev 93f22bce, the 6mo production relaunch; last
-# re-derived 2026-10-07 on the V9-30 defaults) BY
-# scripts/fstat_proposal/derive_1yr_v9_launcher.py (exact-string replacement,
-# re-run it after every 6mo edit): everything not listed here is
+# PRODUCTION global fit -- 9mo_v9 (Tobs = 270 d). DERIVED 2026-10-07 FROM
+# submit_gf_6mo_v9_4gpu.sh (dev, the 6mo production launcher on the V9-30
+# defaults) BY scripts/fstat_proposal/derive_9mo_v9_launcher.py (exact-string
+# replacement, re-run it after every 6mo edit): everything not listed here is
 # BYTE-IDENTICAL to the 6mo script, and tests/test_submit_scripts_layout.py::
-# OneYearV9TwinTest refuses any other drift. User ruling 2026-10-03: "identical
-# runs with the exception of changing the usual Tobs changes ... the most
-# minimal amount of changes needed for the waveforms and other areas due to
-# 12 mo instead of 6". No "_4gpu" in the name: NGPUS picks the layout.
+# NineMonthV9TwinTest refuses any other drift AND checks every export against
+# submit_gf_1yr_v9.sh. User ruling 2026-10-07: "run a 9mo run instead of
+# 1yr ... keep all the accuracy settings for the 1yr run the same ... keep
+# everything the same as the 1 yr run except for any specific necessary
+# changes due to the observation". No "_4gpu" in the name: NGPUS picks the
+# layout (default 4 since V9-30).
 #
-#   1YR-1. NAMING: --job-name gf1yr_v9, --output gf1yr_v9_%j.log,
-#          STORE_DIR gf_prod_1yr_v9/, BASE_FILE_NAME gf_prod_1yr.
-#   1YR-2. TOBS_TARGET 15552000 -> 31104000 (Nf 1440 x Nt 8640 x dt 2.5) and
-#          the knobs that scale with it, exactly as 6mo-v8 -> 1yr-v8 did:
-#          SIGHET_NT_LAYER 120 -> 240, GB_NLEAVES_MAX 15000 -> 20000,
-#          GB_N_SUBBANDS 8192 -> 4096 per GPU (slot bytes double),
-#          GB_RJ_INMODEL_CHUNK 32768 -> 16384 (byte parity).
-#   1YR-3. MBHB_IDS: the 11 catalogue MBHBs merging inside 360 d + 7 d
-#          (MBH session 2026-10-03); src 10 merges 9.5 d past the window and
-#          is left out (see the MBHB_IDS line). EMRI_IDS / SOBHB_IDS unchanged.
-#   1YR-4. The MBH / EMRI / SOBBH preflight resolvers name the 1yr grid
-#          (make_factory(1440, 8640); comments). The lookup table is the SAME
-#          canonical file (it depends on Nf and dt only), built once in the
-#          new STORE_DIR on the first launch.
-#   1YR-5. Warm start + noise pin parent = the 6mo v9 run
-#          (GF_SEED_STORE gf_prod_6mo_v9_4gpu/gf_prod_6mo_testing.h5,
+#   9MO-1. NAMING: --job-name gf9mo_v9, --output gf9mo_v9_%j.log,
+#          STORE_DIR gf_prod_9mo_v9/, BASE_FILE_NAME gf_prod_9mo.
+#   9MO-2. TOBS_TARGET 15552000 -> 23328000 (270 d; Nf 1440 x Nt 6480 x dt
+#          2.5, 1.5x the 6mo Nt) and the ONE knob that follows Tobs itself:
+#          SIGHET_NT_LAYER 120 -> 180 (the 36-h stride parity; 180 divides
+#          6480). GB_NLEAVES_MAX 20000, GB_N_SUBBANDS 4096 per GPU and
+#          GB_RJ_INMODEL_CHUNK 16384 are the 1YR VALUES, verbatim (the
+#          ruling), not re-derived for 270 d: all three are capacity /
+#          memory knobs, and the 1yr sizing has more headroom at 9 mo
+#          (slab ~0.75 MB/slot, sig-het stash product 4096 x 178 = 0.73e6
+#          against the 6mo-safe 0.97e6).
+#   9MO-3. MBHB_IDS: the catalogue MBHBs merging inside 270 d + 14 d
+#          (2,5,7,12,16,18 -- all merge BEFORE the end; none lands in
+#          (270, 284] d, the next are srcs 9 / 4 at 285.9 / 286.4 d) and
+#          MBH_MERGER_TIME_BUFFER=1209600 (14 d, user rule 2026-10-07: keep
+#          a merger up to two weeks past the end, modelled by its in-window
+#          inspiral cut at the data end -- supported: the batched window
+#          clamps its kept box at the data's active box and the stock
+#          generator lives on the data lattice). EMRI_IDS / SOBHB_IDS
+#          unchanged; EMRI 3 (plunge 256 d) takes the plunge path inside
+#          this window, EMRI 0 (347 d) does not.
+#   9MO-4. The MBH / EMRI / SOBBH preflight resolvers name the 9mo grid
+#          (make_factory(1440, 6480); comments). The lookup tables are the
+#          SAME canonical files (Nf and dt only), built once in the new
+#          STORE_DIR on the first launch.
+#   9MO-5. Warm start + noise pin parent = the 6mo v9 run, exactly as the
+#          1yr (GF_SEED_STORE gf_prod_6mo_v9_4gpu/gf_prod_6mo_testing.h5,
 #          GB_WARM_START_SOURCE_TOBS 15552000, refereed npz
-#          gf_prod_6mo_v9_4gpu_refereed.npz -- auto-built from the parent store
-#          on the first launch when missing, as the 6mo's was from the 3mo).
+#          gf_prod_6mo_v9_4gpu_refereed.npz -- auto-built from the parent
+#          store on the first launch when missing).
 #
-# WAVEFORM SETTINGS AT 1 YR (all three windows, 2026-10-03): NO export line
-# changes. EMRI direct: same table; EMRIs 0 (347 d) and 3 (256 d) plunge INSIDE
-# the window and take the plunge path (fdot handoff + dense plunge chunk +
-# 120 s stop taper, built alone, ~100-175 ms/row vs ~21 ms batched), validated
-# on the laptop only -- watch "[EMRI_DIRECT] F fallbacks" = 0 and the
-# every-10th cross-check. SOBBH lookup: same table, EVAL_DT 43200 holds
-# (phase-tracer error is local), 0.036 s per 8-row call at 360 d (chunked
-# 3.40 s). MBH batched: window knobs unchanged, decimation 2 safe for all 11,
-# ~45 s per mbh_pe per rank (11 leaves). The exact SOBBH cross-check costs ~2x
-# the 6mo one: put SOBBH_CHECK_LL_EVERY=10 on the line only if the 6mo run's
-# first check stayed under ~10 % of its SOBBH leg when doubled.
+# EVERYTHING ELSE = the 1yr script = the 6mo script (NineMonthV9TwinTest
+# diffs the resolved exports against submit_gf_1yr_v9.sh: only TOBS_TARGET,
+# SIGHET_NT_LAYER, BASE_FILE_NAME, MBHB_IDS and MBH_MERGER_TIME_BUFFER may
+# differ). The waveform knobs are the 1yr answers (no export changes): EMRI
+# direct, SOBBH lookup (EVAL_DT 43200), MBH batched (decimation 2, 90 d
+# window), EDGE_CROP_WAVELETS 60 -- verified at Nt 6480 (2026-10-07, by
+# running the build guard): sig-het taper ceil(0.005 x 6480) = 33 + 8
+# margin = 41 <= 60 (19 layers spare; the 1yr has 8), the data taper is 2
+# fixed wavelets (auto crop 20, subsumed), EMRI pixel_edge 8 <= 60; the
+# crop costs 1.85 % of the data.
 #
-# NOT carried (deliberately, "identical runs"): the 2026-09-08 1yr F-stat grid
-# reduction (FSTAT_COMB_NSKY_MAX 256, FSTAT_N_ALPHA/N_SINDELTA 4) -- the 1yr v8
-# 4-GPU script did not carry it either; revisit if the first F-stat fit's wall
-# or dev0 memory says so. GALFOR_START_PARAMS stays the offline 3mo estimate
-# (6mo ruling 2026-09-24 "just for now").
-#
-# LAUNCH (from the LAT root). Since 2026-10-07 (V9-30) the 6mo production
-# line's knobs are the launcher DEFAULTS -- NGPUS=4, MIDIT_CHECKPOINT=0,
-# MBH_NTEMPS=8, EMRI_NTEMPS=8, EMRI_TRAJ_WORKERS=8, MBH_WINDOW_DECIMATE=2, the
-# gram / fisher eigen tables, the source cross-checks off -- so the line is:
-#   ./scripts/fstat_proposal/submit_gf_1yr_v9.sh
-# (a FRESH store: no CLOCK_START, no re-rung -- MBH_NTEMPS / EMRI_NTEMPS build
-#  the 8-rung ladders the 6mo store was re-rung to. GB_FSTAT_FORCE_REFIT=1 /
-#  GB_FSTAT_PE_REF=max stay one-off line knobs, never defaults.)
+# LAUNCH (from the LAT root; the V9-30 defaults ARE the production line --
+# NGPUS=4, MIDIT_CHECKPOINT=0, MBH_NTEMPS=8, EMRI_NTEMPS=8,
+# EMRI_TRAJ_WORKERS=8, MBH_WINDOW_DECIMATE=2, gram / fisher eigen tables,
+# source cross-checks off):
+#   ./scripts/fstat_proposal/submit_gf_9mo_v9.sh
+# (a FRESH store: no CLOCK_START, no re-rung. Requires the 6mo v9 store for
+#  the seed + warm start. GB_FSTAT_FORCE_REFIT=1 / GB_FSTAT_PE_REF=max stay
+#  one-off line knobs, never defaults.)
 #
 # ---- the 6mo v9 header follows verbatim ------------------------------------
 # ============================================================================
@@ -500,7 +505,7 @@
 # ############################################################################
 
 # ---- fill these in ---------------------------------------------------------
-#SBATCH --job-name=gf1yr_v9          # job name
+#SBATCH --job-name=gf9mo_v9          # job name
 #SBATCH --partition=gpu-80-spot   # DEFAULT partition (2-GPU flow); the
                                   # NGPUS self-dispatch below overrides it
 #SBATCH --gres=gpu:2              # DEFAULT 2 GPUs (GPUS below are LOCAL indices)
@@ -514,7 +519,7 @@
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=0                   # whole-node memory
 #SBATCH --time=24:00:00
-#SBATCH --output=/shared/data/global_fit_output/gf1yr_v9_%j.log     # combined stdout+stderr (captures [MAXLOGL]/[BENCH])
+#SBATCH --output=/shared/data/global_fit_output/gf9mo_v9_%j.log     # combined stdout+stderr (captures [MAXLOGL]/[BENCH])
 # ----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -643,7 +648,7 @@ cd /shared/home/mlkatz1/lisa-analysis-tools
 # unchanged -- they take the DIRECTORY as their argument.
 # env-overridable (2026-09-16) so a COPY of a live run's folder can be continued
 # under new code/layout without touching the original (STORE_DIR=<copy> ...).
-STORE_DIR=${STORE_DIR:-/shared/data/global_fit_output/gf_prod_1yr_v9/}
+STORE_DIR=${STORE_DIR:-/shared/data/global_fit_output/gf_prod_9mo_v9/}
 
 # ---- GPU telemetry ---------------------------------------------------------
 # Background nvidia-smi sampler: one CSV row per GPU into the run store
@@ -861,7 +866,7 @@ fi
 
 # ---- output ----------------------------------------------------------------
 export FILE_STORE_DIR=${STORE_DIR}
-export BASE_FILE_NAME=gf_prod_1yr
+export BASE_FILE_NAME=gf_prod_9mo
 
 # ---- v8 noise model (the whole v8-vs-v7 diff) -------------------------------
 export UNEQUAL_ARM=1
@@ -1051,10 +1056,10 @@ export NUM_ITERATIONS=${NUM_ITERATIONS:-2000}         # total engine iterations 
 # EXPLICIT Tobs (2026-08-13): sbatch propagates the submitting shell's env,
 # and a stale TOBS_TARGET export (a 3-day one was found live in the shell)
 # would silently re-grid this run. Pin the 90-d production value.
-export TOBS_TARGET=31104000        # 360 d; grid resolves Nf 1440 x Nt 8640 x dt 2.5 (exact factor-2 of 6 mo in Nt, as 6 mo was of 3 mo)
+export TOBS_TARGET=23328000        # 270 d; grid resolves Nf 1440 x Nt 6480 x dt 2.5 (1.5x the 6 mo Nt; the 1yr runs Nt 8640)
 # 6-mo sig-het layer stride (6mo_v1 derivation): 120 divides Nt=4320 and
 # keeps the validated 36-h stride parity the 3-mo default gave.
-export SIGHET_NT_LAYER=240
+export SIGHET_NT_LAYER=180
 # ⚠ MIN_FREQ 4e-4 -> 2.5e-4 (2026-09-06). This is the LAYER-1 FIX, and the
 # value is set by the VGBs, not by taste.
 #
@@ -1092,7 +1097,7 @@ export GB_MAX_FREQ=2.2e-2
 #      fstat-fit-in-move + sig-het fstat, D/2 leaf-cap gate w/ min-iters 5,
 #      at-cap RJ skip, cell-lifecycle ll credit, GB_MODE=search +
 #      GB_PE_MOVES_STRICT=1 + GB_SEARCH_PRIOR_REMOVAL=1 seeded by the script) --
-export GB_NLEAVES_MAX=20000        # 1 yr: deeper confusion resolved again; 6-mo ran 15000, 3-mo 10000
+export GB_NLEAVES_MAX=20000        # 9 mo: the 1yr value (user ruling 2026-10-07, 1yr settings); 6-mo ran 15000, 3-mo 10000
 # FULL parity-unit residency (grouped RJ->in-model scheduling, 2026-08-13):
 # one unit = 77 bands x 24 temps x 24 walkers = 44,352 cells; the scheduler
 # clamps n_slots to min(GB_N_SUBBANDS, cells), so 50000 means every cell is
@@ -1116,7 +1121,7 @@ export GB_NLEAVES_MAX=20000        # 1 yr: deeper confusion resolved again; 6-mo
 # long uninterrupted stretch. 8192 -> product 0.97e6, under the 23-mo
 # 1.1e6 OK precedent; back off to 4096 (the calibrated-safe value) if
 # dev0 max memory trends past ~70 GB in gpu_util_*.csv again.
-export GB_N_SUBBANDS=4096   # PER GPU; total = x n_gpus. Slab ~1.0 MB/slot at 1 yr
+export GB_N_SUBBANDS=4096   # PER GPU; total = x n_gpus. Slab ~0.75 MB/slot at 9 mo (the 1yr value, user ruling 2026-10-07)
                             # @6mo (mirror) ~ 4.2 GB/GPU; the binding
                             # constraint is the SIG-HET STASH product above,
                             # not slab bytes. (History: pre-mirror 4096 at
@@ -2485,7 +2490,7 @@ export GB_SIGHET_INMODEL_WINDOWED=1
 # ######################################################################### #
 export GB_INMODEL_SETUP_BATCH=${GB_INMODEL_SETUP_BATCH:-2048}
 export GB_SIGHET_FOLD_MAX_BYTES=${GB_SIGHET_FOLD_MAX_BYTES:-1073741824}
-export GB_RJ_INMODEL_CHUNK=16384  # byte-parity with the 6mo 32768 (1yr cells ~2x bytes); floored to ntemps multiples by the column-atomic staging
+export GB_RJ_INMODEL_CHUNK=16384  # the 1yr value (user ruling 2026-10-07, 1yr settings; 9mo cells ~1.5x the 6mo bytes); floored to ntemps multiples by the column-atomic staging
 export GB_INFOMAT_MEMPOOL_FREE=${GB_INFOMAT_MEMPOOL_FREE:-1}
 export GB_INMODEL_BATCH_MEMPOOL_FREE=${GB_INMODEL_BATCH_MEMPOOL_FREE:-1}
 # ######################################################################### #
@@ -4684,7 +4689,13 @@ fi
 # order). Ids = the 2026-08-24 census (user "yes in general",
 # 2026-09-02): MBHB only the 4 systems with t_merge <= 6 mo; EMRI/SOBHB
 # full census pending the S4 readout.
-export MBHB_IDS=0,2,3,4,5,7,9,12,15,16,18   # t_c 300.4/173.3/336.8/286.4/104.7/263.8/285.9/243.8/318.0/111.4/92.0 d (MBH session 2026-10-03). src 10 (2.8e6 Msun, SNR~1963) merges at 369.5 d, 9.5 d past the window, so the 7-d MBH_MERGER_TIME_BUFFER leaves it out; to model its in-window inspiral add 10 here and export MBH_MERGER_TIME_BUFFER=1209600
+export MBHB_IDS=2,5,7,12,16,18     # t_c 173.3/104.7/263.8/243.8/111.4/92.0 d (MBH session 2026-10-03 table): every catalogue MBHB merging inside 270 d + the 14-d MBH_MERGER_TIME_BUFFER below. None merges in (270, 284] d; the next are srcs 9 (285.9 d) and 4 (286.4 d), 15.9 / 16.4 d past the end, then 0 (300.4), 15 (318.0), 3 (336.8), 10 (369.5)
+# User rule 2026-10-07: keep any MBHB merging within 2 weeks of the end of the
+# observation (its in-window inspiral is modelled, cut at the data end by the
+# batched window's active-box clamp and the stock generator's data lattice).
+# 14 d replaces the code default of 7 d; the t_plunge prior's upper edge
+# follows it (obs_end + buffer + t_plunge_pad).
+export MBH_MERGER_TIME_BUFFER=1209600   # 14 d
 export EMRI_IDS=0,1,2,3,4,5,6,7    # all 8 -- S4 census may trim
 export SOBHB_IDS=0,1,2,3,4,5       # all 6 -- expected mostly sub-threshold
 # ---- THE COMBINED DATA SET (user ruling 2026-09-14: the 6mo testing
@@ -5023,10 +5034,10 @@ from lisatools.domains import WDMSettings
 
 mbh = SourceMBHSettings()
 # The resolver needs the run-domain spec (MBH_LIKELIHOOD=auto/batched check the
-# domain is WDM). This run's grid: Nf 1440 x Nt 8640 at dt 2.5 s.
+# domain is WDM). This run's grid: Nf 1440 x Nt 6480 at dt 2.5 s.
 try:
     cfg = resolve_mbh_batched_cfg(
-        mbh, domain_settings=WDMSettings.make_factory(1440, 8640))
+        mbh, domain_settings=WDMSettings.make_factory(1440, 6480))
 except ValueError as exc:
     print(f"[MBH-PREFLIGHT] REFUSING: {exc}")
     sys.exit(2)
@@ -5199,10 +5210,10 @@ if got != want:
           f"traj_workers) = {want} but the settings resolve {got}.")
     sys.exit(2)
 tdi_chan = {f.name: f for f in dataclasses.fields(AllSourcesGeneralSettings)}["tdi_chan"].default
-# this run's grid: Nf 1440 x Nt 8640 at dt 2.5 s
+# this run's grid: Nf 1440 x Nt 6480 at dt 2.5 s
 try:
     cfg = resolve_emri_direct_cfg(
-        emri, domain_settings=WDMSettings.make_factory(1440, 8640), tdi_chan=tdi_chan)
+        emri, domain_settings=WDMSettings.make_factory(1440, 6480), tdi_chan=tdi_chan)
 except ValueError as exc:
     print(f"[EMRI-PREFLIGHT] REFUSING: {exc}")
     sys.exit(2)
@@ -5373,7 +5384,7 @@ try:  # build on this node's GPU when there is one (has_backend("gpu") raises wi
     table_backend = "gpu"
 except Exception:
     table_backend = "cpu"
-# this run's grid: Nf 1440 x Nt 8640 at dt 2.5 s, layer 3600 s (the resolver reads only
+# this run's grid: Nf 1440 x Nt 6480 at dt 2.5 s, layer 3600 s (the resolver reads only
 # these three; the file is the same canonical table EMRI direct uses)
 gi = SimpleNamespace(domain_settings=SimpleNamespace(Nf=1440, data_dt=2.5, layer_dt=3600.0),
                      file_store_dir=os.environ["FILE_STORE_DIR"], force_backend=table_backend)

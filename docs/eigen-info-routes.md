@@ -31,8 +31,8 @@ without an attached lookup table GBGPU raises, so it always goes with
 | Family | Default (code) | Other route | How to select | Fallback | Status 2026-10-06 |
 |---|---|---|---|---|---|
 | GB in-model factor | the chunked delegate's matrix; with `SIGHET_INFOMAT=1` + `GB_INFOMAT_PER_BLOCK=1` (set in the v9 launchers) sig-het second differences of lnL per block | **lookup Gram** `<dh_a\|dh_b>` (GBGPU) + **host factor cache** | `SIGHET_INFOMAT_ENGINE=lookup` (needs `SIGHET_REF_BUILD=lookup`), `GB_CHOL_CACHE=1` | cache error: cache disabled AND `SIGHET_INFOMAT_ENGINE` unset, direct per-block factors resume | **Production**: on in the 6mo / 1yr v9 launchers; healthy on the cluster since 6mo job 738 |
-| SOBBH / EMRI / MBH eigen tables | `"ll"`: likelihood second differences | `"gram"`: Gram matrix of the move's own templates | `{BRANCH}_EIGEN_INFO=gram` | Gram error: the ll route | **Opt-in**, not in any launcher; CPU-validated, never run on a GPU |
-| PSD / galfor (/ sgwb) eigen tables | `"ll"`: likelihood second differences | `"fisher"`: expected Fisher of the noise covariance | `{PSD,GALFOR,SGWB}_EIGEN_INFO=fisher` | Fisher error: the ll route | **Opt-in**, not in any launcher; CPU-validated, never run on a GPU |
+| SOBBH / EMRI / MBH eigen tables | `"ll"`: likelihood second differences | `"gram"`: Gram matrix of the move's own templates | `{BRANCH}_EIGEN_INFO=gram` | Gram error: the ll route | **Launcher default** (`gram`) in the 6mo / 1yr / 9mo v9 launchers since 2026-10-07 (V9-30, Mike's production line; `ll` on the line restores the second differences); CPU-validated, first GPU run = the first launch on those defaults |
+| PSD / galfor (/ sgwb) eigen tables | `"ll"`: likelihood second differences | `"fisher"`: expected Fisher of the noise covariance | `{PSD,GALFOR,SGWB}_EIGEN_INFO=fisher` | Fisher error: the ll route | **Launcher default** (`fisher` for PSD and GALFOR) in the 6mo / 1yr / 9mo v9 launchers since 2026-10-07 (V9-30); CPU-validated, first GPU run = the first launch on those defaults |
 
 ## GB in-model factors: the lookup Gram and `GB_CHOL_CACHE`
 
@@ -202,7 +202,7 @@ attribute). Two older ones do not and are kept because production launch
 lines use them: `{BRANCH}_EIGEN_REFRESH` seeds `eigen_refresh_every` and
 `{BRANCH}_EIGEN_SCOPE` seeds `eigen_table_scope`.
 
-| Env knob | Attribute | Code default | 6mo / 1yr v9 launchers |
+| Env knob | Attribute | Code default | 6mo / 1yr / 9mo v9 launchers |
 |---|---|---|---|
 | `SIGHET_INFOMAT` | (GBGPU env) | off | `1` |
 | `GB_INFOMAT_PER_BLOCK` | move `infomat_per_block` | `0` (VGB: always on) | `1` |
@@ -211,11 +211,11 @@ lines use them: `{BRANCH}_EIGEN_REFRESH` seeds `eigen_refresh_every` and
 | `SIGHET_INFOMAT_ENGINE` | (GBGPU env) | unset | `lookup` (set-empty on the launch line turns it off) |
 | `GB_CHOL_CACHE` | (env, `gb_chol_cache.py`) | `0` | `1` |
 | `GB_CHOL_CACHE_EVERY` / `_TOL` / `_WINDOW` / `_BATCH` | (env) | `40` / `5` / `32` / `4096` | `40` / `5` / default / default |
-| `{SOBBH,EMRI,MBH}_EIGEN_INFO` | move `eigen_info` | `ll` | not set (opt-in) |
+| `{SOBBH,EMRI,MBH}_EIGEN_INFO` | move `eigen_info` | `ll` | `gram` (default since 2026-10-07, V9-30; `${K:-gram}`) |
 | `{SOBBH,EMRI,MBH}_EIGEN_GRAM_TARGET` | move `eigen_gram_target` | `1e-3` | not set |
 | `{SOBBH,EMRI,MBH}_EIGEN_GRAM_EPS_REL` | move `eigen_gram_eps_rel` | `{BRANCH}_EIGEN_EPS_REL` | not set |
 | `{SOBBH,EMRI,MBH}_EIGEN_EPS_REL` | move `eigen_eps_rel` | `1e-4` | not set |
-| `{PSD,GALFOR,SGWB}_EIGEN_INFO` | PSDMove `eigen_info` | `ll` | not set (opt-in) |
+| `{PSD,GALFOR,SGWB}_EIGEN_INFO` | PSDMove `eigen_info` | `ll` | `fisher` for PSD and GALFOR (default since 2026-10-07, V9-30; `${K:-fisher}`); SGWB not set |
 | `{PSD,GALFOR,SGWB}_EIGEN_EPS_REL` | Settings / PSDMove `eigen_eps_rel` | `1e-4` | not set |
 
 The `eigen_info` / `eigen_gram_*` move attributes are constructor kwargs too;

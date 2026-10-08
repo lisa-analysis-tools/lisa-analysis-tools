@@ -308,7 +308,8 @@ class WiringTest(unittest.TestCase):
 
     def test_both_v9_launchers_add_the_task_and_check_the_allocation(self):
         for rel in ("scripts/fstat_proposal/submit_gf_6mo_v9_4gpu.sh",
-                    "scripts/fstat_proposal/submit_gf_1yr_v9.sh"):
+                    "scripts/fstat_proposal/submit_gf_1yr_v9.sh",
+                    "scripts/fstat_proposal/submit_gf_9mo_v9.sh"):
             s = self._read(rel)
             self.assertIn("export GF_MONITOR_RANK=${GF_MONITOR_RANK:-1}", s)
             self.assertIn("NTASKS=$(( NTASKS + 1 ))", s)
