@@ -439,6 +439,69 @@ def _atomic_backup_copy(src: str) -> None:
             pass
 
 
+# ---- store writes routed to the saver rank ---------------------------------
+# USER RULING 2026-10-07: "In general, let's make sure all file saves go
+# through the saver rank." The rows always did; the recipe-group stamps
+# (stage completion + the next stage's start, GF_PERSIST_STAGE_START's start,
+# the galfor ratchet's stop flag) were written by the HEAD opening the store
+# in append mode itself, and when one coincided with the saver writing a row
+# two processes wrote one HDF5 file and the recipe group tore (3mo 2026-09-28;
+# 6mo replica_pe -> full_pe 2026-10-04). With a saver rank the head now sends
+# them as a ``{STORE_WRITE_KEY: method, "args", "kwargs"}`` request on the SAME
+# channel as the rows (default tag, so MPI's non-overtaking order puts it after
+# the row it closes and before the next), the saver runs the SAME backend
+# method in arrival order, and acknowledges on STORE_WRITE_ACK_TAG.
+
+#: Payload key of a routed store write (head -> saver, on the row channel).
+STORE_WRITE_KEY = "store_write"
+
+#: Tag of the saver's acknowledgement (saver -> head). Only acks use it, so an
+#: ack can never be mistaken for anything else the head receives on the run
+#: communicator. (The monitor rank's notices are on the WORLD communicator.)
+STORE_WRITE_ACK_TAG = 7802
+
+#: The backend methods the saver runs for the head. Anything else is refused.
+ROUTED_STORE_WRITES = ("completed_recipe_step", "stamp_stage_start", "stamp_stage_flag")
+
+
+def _is_store_write(payload) -> bool:
+    return isinstance(payload, dict) and STORE_WRITE_KEY in payload
+
+
+def _run_routed_store_write(gb_reader, comm, main_rank, payload) -> None:
+    """Saver side: run one routed store write, then acknowledge it to the head.
+
+    Never raises into the loop. A failure is logged HERE with the method name
+    and its arguments, and travels back in the acknowledgement; the head
+    re-raises it, i.e. exactly where the direct write would have raised.
+    """
+    method = payload.get(STORE_WRITE_KEY)
+    args = tuple(payload.get("args", ()) or ())
+    kwargs = dict(payload.get("kwargs", {}) or {})
+    t0 = time.perf_counter()
+    try:
+        if method not in ROUTED_STORE_WRITES:
+            raise ValueError(
+                f"{method!r} is not a routed store write (allowed: "
+                f"{ROUTED_STORE_WRITES})")
+        ack = {"ok": True, "result": getattr(gb_reader, method)(*args, **kwargs)}
+    except Exception as exc:  # noqa: BLE001 -- reported to the head, never fatal here
+        logger.exception(
+            "[STORE-WRITE] saver rank FAILED %s(args=%r, kwargs=%r): %s: %s",
+            method, args, kwargs, type(exc).__name__, exc)
+        ack = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    else:
+        try:
+            _rows = int(gb_reader.iteration)
+        except Exception:  # noqa: BLE001 -- a log detail
+            _rows = None
+        logger.info(
+            "[STORE-WRITE] saver rank ran %s(args=%r, kwargs=%r) with %s row(s) "
+            "stored, in %.3f s", method, args, kwargs, _rows,
+            time.perf_counter() - t0)
+    comm.send(ack, dest=main_rank, tag=STORE_WRITE_ACK_TAG)
+
+
 # THE MONITOR HOOK MOVED INTO THE PACKAGE (2026-09-26). This file used to
 # carry the script lookup and the subprocess call inline; both now live in
 # lisatools.globalfit.monitor, which ships the generator itself, so there
@@ -461,7 +524,11 @@ def save_to_backend_asynchronously_and_plot(
     ``{save_args, save_kwargs}`` payloads, calls
     :meth:`GFHDFBackend.save_step_main`, periodically copies the file to a
     running backup, regenerates the diagnostic plots, and exits when sent
-    ``{"finish_run": True}``.
+    ``{"finish_run": True}``. Also runs the head's routed store writes
+    (``{STORE_WRITE_KEY: method, ...}``, one of :data:`ROUTED_STORE_WRITES`)
+    in arrival order with the rows and acknowledges each on
+    :data:`STORE_WRITE_ACK_TAG`, so this rank is the only process that
+    writes the store while the run samples (user ruling 2026-10-07).
 
     Saves always take priority over plots (parallel-resources plan P2):
 
@@ -530,9 +597,20 @@ def save_to_backend_asynchronously_and_plot(
         finish = any(
             isinstance(p, dict) and p.get("finish_run", False) for p in payloads
         )
-        states = [p for p in payloads if isinstance(p, dict) and "save_args" in p]
-        if len(states) > coalesce_threshold:
-            dropped = len(states) - 1
+        _rows = [k for k, p in enumerate(payloads)
+                 if isinstance(p, dict) and "save_args" in p]
+        keep = set(_rows)
+        if len(_rows) > coalesce_threshold:
+            # the newest row, plus the row right before each routed store
+            # write: a stage stamp must land AFTER the row it closes
+            keep = {_rows[-1]}
+            _last = None
+            for k, p in enumerate(payloads):
+                if k in _rows:
+                    _last = k
+                elif _is_store_write(p) and _last is not None:
+                    keep.add(_last)
+            dropped = len(_rows) - len(keep)
             total_dropped += dropped
             logger.warning(
                 "results rank fell behind: dropping %d intermediate save "
@@ -540,9 +618,16 @@ def save_to_backend_asynchronously_and_plot(
                 dropped,
                 total_dropped,
             )
-            states = states[-1:]
+        states = [payloads[k] for k in sorted(keep)]
 
-        for save_dict in states:
+        # IN ARRIVAL ORDER: rows and routed store writes interleave exactly as
+        # the head sent them (see STORE_WRITE_KEY).
+        for k, save_dict in enumerate(payloads):
+            if _is_store_write(save_dict):
+                _run_routed_store_write(gb_reader, comm, main_rank, save_dict)
+                continue
+            if k not in keep:
+                continue
             st = time.perf_counter()
             gb_reader.save_step_main(
                 *save_dict["save_args"], **save_dict["save_kwargs"]
@@ -562,6 +647,12 @@ def save_to_backend_asynchronously_and_plot(
 
         if finish:
             run = False
+            continue
+
+        # A batch that saved no row (a routed store write alone) has nothing
+        # new for the plots or the page; re-running them for the same save
+        # count would only build them twice.
+        if not states:
             continue
 
         # Plots only in a quiet gap: a queued save always wins.
@@ -646,7 +737,8 @@ class GFHDFBackend(eryn_HDFBackend):
         sub_state_bases: Mapping ``{branch_name: state_class}`` to wrap
             states pulled from the file with the right :class:`GFState`
             subclass.
-        save_plot_rank: Rank to forward save jobs to.
+        save_plot_rank: Rank to forward save jobs to, and the recipe-group
+            stamps (:data:`ROUTED_STORE_WRITES`) with them.
         **kwargs: Forwarded to :class:`eryn.backends.HDFBackend`.
 
     Raises:
@@ -986,7 +1078,7 @@ class GFHDFBackend(eryn_HDFBackend):
         # REMAINS on the sampler under mpiexec >= 3) -- both numbers are
         # needed to judge the trade.
         t0 = time.perf_counter()
-        if self.comm is None or self.comm.Get_size() < 3:
+        if not self._has_saver_rank():
             self.save_step_main(*args, **kwargs)
             mode = "sync write"
         else:
@@ -1003,6 +1095,53 @@ class GFHDFBackend(eryn_HDFBackend):
         # write, or handed to the saver rank), so checkpoints written from
         # here on belong to the NEXT iteration; earlier ones go stale.
         midit_checkpoint.note_saved()
+
+    def _has_saver_rank(self) -> bool:
+        """Whether this process hands its store writes to a dedicated saver rank.
+
+        THE ONE TEST for both the rows (:meth:`save_step`) and the routed
+        store writes (:meth:`_write_on_saver`), so the two always share one
+        writer. A communicator of 3+ ranks: below that the saver is aliased
+        to the head (``communication.ranks.resolve_roles``), and the size-2
+        dedicated-saver fallback still saves its rows synchronously here.
+        The saver's own backend is built without ``comm``, so a write it
+        runs for the head lands directly.
+        """
+        return self.comm is not None and self.comm.Get_size() >= 3
+
+    def _write_on_saver(self, method, *args, **kwargs):
+        """Run the store write ``method(*args, **kwargs)`` on the saver rank.
+
+        Returns ``(True, result)`` once the saver has ACKNOWLEDGED it, or
+        ``(False, None)`` when there is no saver rank and the caller must
+        write directly (single process, ``fit.sample()``, size < 3, the
+        saver's own backend, offline tools).
+
+        The request travels on the row channel, so it lands after every row
+        already handed off and before the next one. Waiting for the
+        acknowledgement is what keeps a read straight after the write
+        correct (the next stage's ``setup_run`` reads
+        ``stage_start_iteration`` and ``iteration`` right after the boundary
+        stamp); it costs one wait for the saver's queue at each stage
+        boundary. A write that failed on the saver raises here.
+        """
+        if not self._has_saver_rank():
+            return False, None
+        t0 = time.perf_counter()
+        self.comm.send({STORE_WRITE_KEY: method, "args": args, "kwargs": kwargs},
+                       dest=self.save_plot_rank)
+        ack = self.comm.recv(source=self.save_plot_rank, tag=STORE_WRITE_ACK_TAG)
+        if not (isinstance(ack, dict) and ack.get("ok")):
+            err = ack.get("error") if isinstance(ack, dict) else repr(ack)
+            raise RuntimeError(
+                f"store write {method}(args={args!r}, kwargs={kwargs!r}) FAILED "
+                f"on the saver rank {self.save_plot_rank}: {err} (the saver "
+                "logged the traceback)")
+        logger.info(
+            "[STORE-WRITE] %s(args=%r, kwargs=%r) routed to saver rank %d, "
+            "acknowledged in %.2f s", method, args, kwargs, self.save_plot_rank,
+            time.perf_counter() - t0)
+        return True, ack.get("result")
 
     def get_a_sample(self, it):
         """Access a sample in the chain
@@ -1228,7 +1367,16 @@ class GFHDFBackend(eryn_HDFBackend):
         because one could not be written would be absurd; a missing stamp
         just means the monitor draws no boundary (every store written before
         this existed is in that state).
+
+        With a saver rank this runs THERE (:meth:`_write_on_saver`), after the
+        row it closes, and returns once it has landed: the head writing this
+        group while the saver wrote a row is how the recipe group tore at
+        the 2026-09-28 and 2026-10-04 stage transitions.
         """
+        routed, _ = self._write_on_saver(
+            "completed_recipe_step", step_name, next_step_name=next_step_name)
+        if routed:
+            return
         # ⚠ READ THE ITERATION FIRST. ``self.iteration`` OPENS THE FILE in
         # "r", and doing that from inside the ``with self.open("a")`` below
         # is a same-file reopen with incompatible flags. On this stack it
@@ -1370,7 +1518,13 @@ class GFHDFBackend(eryn_HDFBackend):
             return None
 
     def stamp_stage_flag(self, step_name, key, value) -> bool:
-        """Write a per-stage attribute (best effort; True when it landed)."""
+        """Write a per-stage attribute (best effort; True when it landed).
+
+        Runs on the saver rank when there is one (:meth:`_write_on_saver`).
+        """
+        routed, landed = self._write_on_saver("stamp_stage_flag", step_name, key, value)
+        if routed:
+            return bool(landed)
         try:
             with self.open("a") as f:
                 grp = f[self.name].get("recipe")
@@ -1388,7 +1542,12 @@ class GFHDFBackend(eryn_HDFBackend):
         Best-effort and idempotent-by-caller: :meth:`stage_start_iteration`
         is consulted first, so an existing stamp is never overwritten and a
         resume keeps the ORIGINAL start rather than the restart's.
+
+        Runs on the saver rank when there is one (:meth:`_write_on_saver`).
         """
+        routed, _ = self._write_on_saver("stamp_stage_start", step_name, iteration)
+        if routed:
+            return
         try:
             with self.open("a") as f:
                 grp = f[self.name].get("recipe")

@@ -732,6 +732,13 @@ class Recipe:
             # the next INCOMPLETE step, so its start_iteration can be stamped
             # in the same write as this step's completion (see
             # GFHDFBackend.completed_recipe_step)
+            #
+            # ORDERING (user ruling 2026-10-07, every store write on the saver
+            # rank): with a saver rank this write RUNS THERE, after the row
+            # this iteration just handed off, and the call returns only once
+            # the saver has acknowledged it -- so the next stage's setup_run
+            # below reads the stamped start_iteration and the stored
+            # iteration (the row is on disk) rather than racing them.
             _next_name = None
             for _j in range(self._current_iter + 1, len(self.recipe)):
                 if not self.recipe[_j]["status"]:
