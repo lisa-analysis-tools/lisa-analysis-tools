@@ -141,6 +141,9 @@ class _MoveStub:
     _band_shutoff_band_info = GBSpecialBase._band_shutoff_band_info
     _band_shutoff_restore = GBSpecialBase._band_shutoff_restore
     _band_shutoff_store = GBSpecialBase._band_shutoff_store
+    # the adopt-once helper the tick shares with the propose-start adopt
+    # (2026-10-07, tests/test_valve_first_propose.py)
+    _band_shutoff_adopt = GBSpecialBase._band_shutoff_adopt
     # noise-gated periodic revival (2026-09-27). The stub drives
     # ``_update_band_shutoff`` with ``state=None``, so the fingerprint is
     # unavailable and ``_band_shutoff_noise_changed`` returns True -- the

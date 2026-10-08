@@ -5736,6 +5736,7 @@ class BandSorter(LISAToolsParallelModule):
         psd_shared_mirror: bool = False,
         psd_mirror_parity_proposes: int = 0,
         psd_mirror_parity_rows: int = 64,
+        source_uid: Optional[np.ndarray] = None,
     ):
 
         LISAToolsParallelModule.__init__(self, force_backend=force_backend)
@@ -5891,6 +5892,24 @@ class BandSorter(LISAToolsParallelModule):
             self.inds = self.xp.ones(self.coords.shape[:-1], dtype=bool)
             self.factors = self.xp.ones_like(self.inds)
             tmp_inds_shaped = self.orig_inds.copy()
+
+        # GB_CHOL_CACHE per-source IDs ``(ntemps, nwalkers, nleaves_max)``
+        # (``GBState.source_uid``, -1 = none), gathered row-for-row exactly
+        # like ``coords``; ``None`` when not given. A ROW keeps its ID through
+        # every label exchange (vertical / tempering swaps relabel the row),
+        # and a dead row never carries one. Always a COPY, never a view of
+        # the state's array: the write-back resets that array before
+        # scattering this column into it.
+        self.source_uid = None
+        if source_uid is not None:
+            # ``astype`` copies (its default), so neither branch is a view
+            uid = self.xp.asarray(source_uid).astype(self.xp.int64)
+            if rj_prop is not None and keep_all_inds:
+                uid = uid.reshape(-1)
+            else:
+                uid = uid[self.orig_inds]
+            uid[~self.inds] = -1
+            self.source_uid = uid
 
         self.has_run_rj = self.xp.zeros_like(self.inds)
         self.num_sources = self.coords.shape[0]

@@ -24,11 +24,18 @@ SIG = np.array([0.01, 1e-6, 1e-3, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1])
 
 
 class _Sorter:
-    def __init__(self, coords, walkers, temps, alive=None):
+    """Stub sorter. ``uids`` (optional) is the per-source ID column the real
+    ``BandSorter`` carries as ``source_uid``; without it every row takes the
+    coordinate-matching fallback, which is what the tests of
+    :class:`CholCacheTest` exercise."""
+
+    def __init__(self, coords, walkers, temps, alive=None, uids=None):
         self.coords = np.asarray(coords, float)
         self.walker_inds = np.asarray(walkers)
         self.temp_inds = np.asarray(temps)
         self.inds = np.ones(len(coords), bool) if alive is None else np.asarray(alive)
+        if uids is not None:
+            self.source_uid = np.asarray(uids, dtype=np.int64)
 
 
 class _Move:
@@ -309,6 +316,140 @@ class CholCacheTest(unittest.TestCase):
             os.environ.pop("GB_CHOL_CACHE", None)
             if old is not None:
                 os.environ["GB_CHOL_CACHE"] = old
+
+
+class SourceUidKeyTest(unittest.TestCase):
+    """Rows that carry a per-source ID (``band_sorter.source_uid >= 0``) are
+    found by ``(walker, ID)``: no f0 window, no tolerance, no retrack. The two
+    failure modes of coordinate matching become impossible for them."""
+
+    def setUp(self):
+        self.c, self.w, self.t = _population()
+        self.uid = 5000 + np.arange(len(self.c))
+        self.bs = _Sorter(self.c, self.w, self.t, uids=self.uid)
+        self.m = _Move()
+        self.cache = CC._CholCache(("gb", "off", False))
+        self.cache.due(0)
+        self.cache.refresh(self.m, None, self.bs)
+        self.m.calls.clear()
+
+    @staticmethod
+    def _marker(chol):
+        return chol[:, 3, 3]
+
+    def test_refresh_keys_by_uid_so_any_coordinate_change_still_hits(self):
+        """Every source jumps 10 tolerances in amplitude, f0 and fdot and the
+        rows are permuted: coordinates find nothing, the IDs find everyone."""
+        c = self.c.copy()
+        c[:, :3] += 10 * self.cache.tol * SIG[:3]
+        perm = np.random.default_rng(5).permutation(len(c))
+        bs = _Sorter(c[perm], self.w[perm], self.t[perm], uids=self.uid[perm])
+        ids = np.arange(len(c))
+        chol = self.cache.take(self.m, None, bs, ids, ids, None)
+        self.assertEqual(self.m.calls, [])
+        np.testing.assert_array_equal(self._marker(chol), c[perm, 3])
+
+    def test_two_close_sources_keep_their_own_factors(self):
+        """Old failure mode 1: two sources of one walker within 5 sigma trade
+        places between blocks -- coordinate matching hands each the other's
+        factor. By ID each keeps its own."""
+        c = np.zeros((2, NDIM))
+        c[:, 0] = 1.0
+        c[:, 1] = 3.0 + np.array([0.0, 0.1]) * SIG[1]     # 0.1 sigma apart
+        c[:, 2] = 0.3
+        c[:, 3] = [1.0, 2.0]                               # own markers
+        w, t, uid = np.zeros(2, int), np.zeros(2, int), np.array([11, 22])
+        cache = CC._CholCache(("gb", "off", False))
+        cache.due(0)
+        cache.refresh(self.m, None, _Sorter(c, w, t, uids=uid))
+        self.m.calls.clear()
+        moved = c.copy()
+        moved[:, :3] = c[::-1, :3]                         # each at the other's spot
+        ids = np.arange(2)
+        chol = cache.take(self.m, None, _Sorter(moved, w, t, uids=uid), ids, ids, None)
+        self.assertEqual(self.m.calls, [])
+        np.testing.assert_array_equal(self._marker(chol), [1.0, 2.0])
+
+    def test_a_source_moved_by_another_move_between_blocks_still_hits(self):
+        """Old failure mode 2: a move other than the in-model move (no
+        retrack) carries a source far from its key; by ID it still hits."""
+        c = self.c.copy()
+        c[0, [0, 2]] += 20 * self.cache.tol * SIG[[0, 2]]   # e.g. a fiber jump
+        ids = np.arange(len(c))
+        chol = self.cache.take(self.m, None, _Sorter(c, self.w, self.t, uids=self.uid),
+                               ids, ids, None)
+        self.assertEqual(self.m.calls, [])
+        self.assertEqual(chol[0, 3, 3], c[0, 3])
+
+    def test_a_new_uid_is_computed_even_on_top_of_a_cached_source(self):
+        """A birth (fresh ID) sitting exactly on a cached source of its walker
+        must get its own factor, not borrow the neighbour's; once stored it
+        hits."""
+        c = np.vstack([self.c, self.c[:1]])
+        c[-1, 3] = 777.0
+        bs = _Sorter(c, np.r_[self.w, self.w[0]], np.r_[self.t, 0],
+                     uids=np.r_[self.uid, 9999])
+        ids = np.arange(len(c))
+        chol = self.cache.take(self.m, None, bs, ids, ids + 50, None)
+        self.assertEqual(len(self.m.calls), 1)
+        np.testing.assert_array_equal(self.m.calls[0][0], [len(c) - 1])
+        np.testing.assert_array_equal(self.m.calls[0][1], [len(c) - 1 + 50])
+        self.assertEqual(chol[-1, 3, 3], 777.0)
+        self.assertEqual(chol[0, 3, 3], self.c[0, 3])
+        self.cache.take(self.m, None, bs, ids, ids, None)
+        self.assertEqual(len(self.m.calls), 1)
+
+    def test_the_key_is_walker_and_uid(self):
+        """The same ID in another walker is another key: computed once there
+        (the factor depends on the walker's noise), then cached."""
+        w = self.w.copy()
+        w[0] = 1 - w[0]
+        bs = _Sorter(self.c, w, self.t, uids=self.uid)
+        ids = np.arange(len(self.c))
+        self.cache.take(self.m, None, bs, ids, ids, None)
+        self.assertEqual([r.tolist() for r, _ in self.m.calls], [[0]])
+        self.cache.take(self.m, None, bs, ids, ids, None)
+        self.assertEqual(len(self.m.calls), 1)
+
+    def test_rows_without_a_uid_fall_back_to_coordinate_matching(self):
+        """uid -1 rows keep the old path: within tolerance hits, beyond misses
+        -- in the same block as uid rows that hit by ID."""
+        c = self.c.copy()
+        c[:, 0] += 3 * self.cache.tol * SIG[0]        # beyond tolerance for all
+        c[1, 0] = self.c[1, 0] + 0.5 * self.cache.tol * SIG[0]   # row 1 within
+        uid = self.uid.copy()
+        uid[[1, 2]] = -1                               # rows 1, 2: no ID
+        ids = np.arange(len(c))
+        chol = self.cache.take(self.m, None, _Sorter(c, self.w, self.t, uids=uid),
+                               ids, ids, None)
+        self.assertEqual([r.tolist() for r, _ in self.m.calls], [[2]])
+        np.testing.assert_array_equal(self._marker(chol), c[:, 3])
+
+    def test_retrack_moves_only_coordinate_keyed_entries(self):
+        """The end-of-block retrack is kept for rows without an ID only; an
+        ID row's entry keeps the key it was stored with."""
+        uid = self.uid.copy()
+        uid[1] = -1
+        ids = np.arange(len(self.c))
+        bs = _Sorter(self.c, self.w, self.t, uids=uid)
+        self.cache.take(self.m, None, bs, ids, ids, None)
+        final = self.c.copy()
+        final[:, 1] += 3 * self.cache.tol * SIG[1]
+        self.cache.retrack(ids, final)
+        table = self.cache.tables[int(self.w[0])]
+        f0_keys = table.coords[:table.n, 1]
+        self.assertIn(final[1, 1], f0_keys)            # the no-ID row moved
+        self.assertIn(self.c[0, 1], f0_keys)           # the ID row did not
+        self.assertNotIn(final[0, 1], f0_keys)
+
+    def test_new_source_uids_are_unique_and_non_negative(self):
+        a = CC.new_source_uids(1000)
+        b = CC.new_source_uids(5)
+        both = np.concatenate([a, b])
+        self.assertEqual(both.dtype, np.int64)
+        self.assertTrue((both >= 0).all())
+        self.assertEqual(len(np.unique(both)), len(both))
+        self.assertEqual(len(CC.new_source_uids(0)), 0)
 
 
 if __name__ == "__main__":

@@ -70,13 +70,35 @@ only, off by default) keeps the factors and `Gamma_z` in HOST memory, one
 cache per rank and branch shared by every GB move, each entry mapped to its
 living source:
 
-- **Map.** A source matches within its own **walker** (never its rung: a
-  vertical swap only relabels the rung) against the best of the
+- **Map: per-source IDs (2026-10-07).** Every living GB source carries a
+  persistent int64 ID (`GBState.source_uid`, one per leaf slot beside
+  `d_h`/`h_h`; `BandSorter.source_uid` per sorter row), and an entry is keyed
+  by **(walker, ID)** -- within the source's own walker, never its rung. No
+  f0 window, no tolerance, no end-of-block retrack. The ID follows its source
+  through the sorter build, RJ birth (new ID) / death (retired), replace (new
+  ID), in-model moves, vertical and tempering swaps (a swap relabels the row
+  that carries the ID), the write-back repack, GFState copies, the
+  multi-rank walker slices and block merges (`block_source_uid` in the
+  `gb_finish` reply), the one-walker replica merge, and the cold->hot reseed
+  (reseeded sources get new IDs). Alive leaves without an ID (the first
+  propose after a load or relaunch) get one at the sorter build, once,
+  before any lookup. IDs are per-process (random per-process prefix over a
+  counter, unique across ranks and restarts in practice) and are NOT in the
+  HDF5 store; a mid-iteration checkpoint pickle keeps them, harmlessly. A
+  source moved to another walker (a tempering walker permutation) is a new
+  key there, computed once.
+- **Fallback: coordinate matching**, for a row without an ID (and for every
+  row with the rollback switch `GB_CHOL_CACHE_UID=0`, which makes the GB moves
+  build their sorters without the ID column -- bitwise the pre-ID cache). A
+  source matches within its own walker against the best of the
   `GB_CHOL_CACHE_WINDOW` (32) f0-neighbours on each side, accepted when
   sampling columns 0-2 (amplitude, f0, Mc in the production basis) are all
-  within `GB_CHOL_CACHE_TOL` (5) of the entry's own marginal widths. A hit
-  moves the entry's key with the source, and every entry is re-keyed to its
-  source's final coordinates at the end of each block.
+  within `GB_CHOL_CACHE_TOL` (5) of the entry's own marginal widths; a hit
+  moves the entry's key with the source, and coordinate-keyed entries are
+  re-keyed to their source's final coordinates at the end of each block. Its
+  two failure modes (two sources of one walker within 5 sigma trading
+  factors; a source moved between blocks by another move missing) cannot
+  happen to a row with an ID.
 - **Refresh.** Every `GB_CHOL_CACHE_EVERY` (40) proposes on a global ticker
   (the largest `move.time`), ALL alive sources are rebuilt together, in
   `GB_CHOL_CACHE_BATCH` (4096) chunks, at the first in-model block. Births and
@@ -84,7 +106,10 @@ living source:
 - **Fallback.** Any exception disables the cache for the rest of the run,
   unsets `SIGHET_INFOMAT_ENGINE` (process-wide: every move and cache on the
   rank leaves the lookup Gram), and logs `[GB_CHOL_CACHE] DISABLED`; the move
-  continues on the direct per-block factors.
+  continues on the direct per-block factors. The ID bookkeeping (sorter
+  build, RJ / replace accepts, write-back, fan-out) runs outside that net, in
+  the GB moves themselves; `GB_CHOL_CACHE_UID=0` on the launch line switches
+  it off entirely.
 
 Cluster record: job 735 (GBGPU f8073ce alone) disabled itself on the first
 refresh (`np.asarray` of a cupy step array; fixed in GBGPU 376c94f); job 738
@@ -97,8 +122,12 @@ Tests: `tests/test_gb_chol_cache.py` (LAT, CPU); GBGPU
 `tests/test_lookup_information_matrix.py` (lookup Gram vs the exact-template
 Gram: elements 7.6e-3, marginal widths within 30 %; CPU);
 `tests/test_sighet_engine_parity.py` (the `SIGHET_REF_BUILD` /
-`SIGHET_ANCHOR_ENGINE` wiring). Open (1yr TODO list): a GPU unit test of the
-lookup Gram; keying entries by a per-source ID instead of f0 matching.
+`SIGHET_ANCHOR_ENGINE` wiring); the per-source IDs:
+`tests/test_gb_source_uid.py` (continuity through every path above, CPU
+`BandSorter`) and `tests/test_gb_orchestrator_merge.py` (the head's block
+merge). Open (1yr TODO list): a GPU unit test of the lookup Gram; the ID
+path has not run on a GPU yet (1yr TODO #9 implemented 2026-10-07, CPU-tested
+only).
 
 ## Add/remove source branches: `{BRANCH}_EIGEN_INFO=gram`
 
@@ -211,6 +240,7 @@ lines use them: `{BRANCH}_EIGEN_REFRESH` seeds `eigen_refresh_every` and
 | `SIGHET_INFOMAT_ENGINE` | (GBGPU env) | unset | `lookup` (set-empty on the launch line turns it off) |
 | `GB_CHOL_CACHE` | (env, `gb_chol_cache.py`) | `0` | `1` |
 | `GB_CHOL_CACHE_EVERY` / `_TOL` / `_WINDOW` / `_BATCH` | (env) | `40` / `5` / `32` / `4096` | `40` / `5` / default / default |
+| `GB_CHOL_CACHE_UID` | (env, `gb_chol_cache.py`; rollback switch) | `1` (per-source IDs) | not set (`0` = coordinate matching for every source, the pre-ID cache) |
 | `{SOBBH,EMRI,MBH}_EIGEN_INFO` | move `eigen_info` | `ll` | `gram` (default since 2026-10-07, V9-30; `${K:-gram}`) |
 | `{SOBBH,EMRI,MBH}_EIGEN_GRAM_TARGET` | move `eigen_gram_target` | `1e-3` | not set |
 | `{SOBBH,EMRI,MBH}_EIGEN_GRAM_EPS_REL` | move `eigen_gram_eps_rel` | `{BRANCH}_EIGEN_EPS_REL` | not set |

@@ -1357,6 +1357,49 @@ class GBState(ModuleSubState):
         elif band_info is not None:
             self.band_info = band_info
 
+    # ------------------------------------------------------------------
+    # Per-source IDs (GB_CHOL_CACHE keys; see globalfit/moves/gb_chol_cache.py)
+    #
+    # ``source_uid`` (ntemps, nwalkers, nleaves_max) int64, -1 = no ID: one
+    # per leaf slot, beside the per-leaf ``d_h``/``h_h``. It rides the
+    # tempered block (copied with it, walker-sliced and merged with it) and
+    # the GB moves keep it attached to its source (sorter build, RJ, replace,
+    # write-back repack). It is per-process state and deliberately NOT in
+    # ``storage_arrays``: the cache it keys is empty after a relaunch, and a
+    # loaded block starts with no IDs (issued at its first sorter build).
+    # ------------------------------------------------------------------
+    tempered_array_names = ModuleSubState.tempered_array_names + ("source_uid",)
+    walker_axes = {**ModuleSubState.walker_axes, "source_uid": 1}
+
+    def initialize_tempered(self, ntemps, nwalkers, nleaves_max, ndim, coords=None, inds=None):
+        """The base allocation plus ``source_uid`` (all ``-1``).
+
+        A refill of an existing block (``coords`` / ``inds`` given) replaces
+        the leaves wholesale, so no ID survives it.
+        """
+        fresh = not self.tempered_initialized
+        super().initialize_tempered(ntemps, nwalkers, nleaves_max, ndim, coords=coords, inds=inds)
+        if fresh or coords is not None or inds is not None:
+            self.source_uid = np.full(self.inds.shape, -1, dtype=np.int64)
+
+    def ensure_source_uid(self) -> np.ndarray:
+        """The per-leaf source IDs, allocated (all ``-1``) on an instance that
+        predates them (e.g. an older mid-iteration checkpoint pickle)."""
+        uid = getattr(self, "source_uid", None)
+        if uid is None or uid.shape != self.inds.shape:
+            uid = self.source_uid = np.full(self.inds.shape, -1, dtype=np.int64)
+        return uid
+
+    def reseed_cold_into_hottest(self, perm=None, rng=None, *, cold_rung: int = 0, hot_rung=None):
+        """The base reseed; the reseeded rung's sources are NEW sources, so
+        they carry no ID (fresh ones are issued at the next sorter build)."""
+        super().reseed_cold_into_hottest(perm=perm, rng=rng, cold_rung=cold_rung, hot_rung=hot_rung)
+        if not self.tempered_initialized:
+            return
+        hot = int(self.ntemps) - 1 if hot_rung is None else int(hot_rung)
+        if hot != int(cold_rung):
+            self.ensure_source_uid()[hot] = -1
+
     @property
     def band_info_keys(self):
         """List of required keys for the :attr:`band_info` dict."""

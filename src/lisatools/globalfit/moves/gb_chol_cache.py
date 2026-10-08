@@ -25,20 +25,54 @@ Entries live in HOST (numpy) memory, one append-only table per walker
 single ``(n, ndim, ndim)`` array to the move's device (``move.xp``); nothing
 is held on the GPU between blocks.
 
-Keying
-------
+Keying: per-source IDs
+----------------------
 Sorter positions are rebuilt every propose, so an entry is found by what the
-source is: its walker and its coordinates. A source is matched only within
-its own walker and never by its temperature rung -- a vertical (all-rungs)
-swap only relabels the rung a source sits on, so the source must keep its
-entry. The candidates are the ``GB_CHOL_CACHE_WINDOW`` entries on each side
-of the source in f0 (wide enough to span every rung's copy of the same
-source); the best candidate is the one with the smallest worst-column
-distance over sampling columns 0-2 (amplitude or distance, f0, fdot or Mc),
-each column measured in that entry's own marginal width
-``sqrt(diag(B B^T))``. It is a hit when that distance is at most
-``GB_CHOL_CACHE_TOL``. A hit moves the entry's key to the source's current
-coordinates, so the key follows the source as it random-walks.
+source is. Every living GB source carries a persistent integer ID (int64,
+``-1`` = none): ``GBState.source_uid`` on the GB sub-state, one per leaf slot
+next to ``d_h``/``h_h``, and ``BandSorter.source_uid`` per sorter row,
+gathered exactly like ``coords``. An entry is keyed by ``(walker, ID)``:
+looked up within the source's own walker (the factor depends on that
+walker's noise) and never by its temperature rung. The ID stays attached to
+its source through every path that moves or relabels a GB leaf:
+
+* sorter build: alive rows take the sub-state's IDs; an alive row without
+  one (the first use after a load or relaunch, the reseeded hot rung) gets a
+  fresh ID there, before any lookup (``GBSpecialBase._issue_missing_uids``);
+* RJ birth: a new ID; death: the ID is retired (``_rj_flip_uids``);
+  replace: a new ID (``_replace_uids``) -- it is a different source;
+* in-model moves change coords, not rows: the ID stays;
+* vertical (all-rungs) and tempering swaps relabel a ROW's rung/walker
+  (``BandSorter.exchange_cell_labels*``): the ID is a column of that row, so
+  it moves with the source by construction;
+* the write-back repack places each row's ID where its coords land
+  (``GBSpecialBase._write_back_uids``);
+* GFState copies, the multi-rank walker slices and merges, the head's block
+  merge and the one-walker replica merge carry the column like ``inds``;
+* the cold->hot reseed gives the reseeded rung no ID (they are new sources).
+
+IDs are unique for the lifetime of the process and, with overwhelming
+probability, across ranks and restarts (:func:`new_source_uids`: a random
+per-process prefix over a counter). They are NOT stored in the HDF5 store
+(``GBState.storage_arrays`` does not list them); a mid-iteration checkpoint
+pickles the state and so keeps them, which is harmless. The ID of a source
+that changes walker (a tempering walker permutation) is a new key in the new
+walker: computed once there.
+
+Fallback: coordinate matching. A row WITHOUT an ID (a sorter built without
+the column: ``GB_CHOL_CACHE_UID=0``, or any caller that passes none) takes
+the pre-ID path. A source is matched only within its own walker; the
+candidates are the ``GB_CHOL_CACHE_WINDOW`` entries on each side of the
+source in f0 (wide enough to span every rung's copy of the same source); the
+best candidate is the one with the smallest worst-column distance over
+sampling columns 0-2 (amplitude or distance, f0, fdot or Mc), each column
+measured in that entry's own marginal width ``sqrt(diag(B B^T))``. It is a
+hit when that distance is at most ``GB_CHOL_CACHE_TOL``. A hit moves the
+entry's key to the source's current coordinates, so the key follows the
+source as it random-walks. Its two failure modes -- two sources of one
+walker within the tolerance can trade factors, and a source carried beyond
+the tolerance between blocks by another move misses -- do not exist for a
+row with an ID.
 
 Refresh (global ticker)
 -----------------------
@@ -54,20 +88,22 @@ the chunked delegate (slow; ``_infomat_route_check`` reports the cost).
 
 Births and misses
 -----------------
-Rows of a block that find no entry (accepted births, sources that moved
-beyond tolerance, a walker with no entries) are computed in one call per
+Rows of a block that find no entry (accepted births and replacements -- a new
+ID --, a source that changed walker, a walker with no entries; without an ID
+also sources that moved beyond tolerance) are computed in one call per
 block, before the repeats, through the block's own route -- with their
-buffer slots, so the sig-het fast route applies -- and appended to the cache.
-The factor is fixed for the whole block exactly as with direct factors, so
-the proposal stays symmetric: a borrowed or slightly stale factor costs
-acceptance rate, never detailed balance.
+buffer slots, so the sig-het fast route applies -- and appended to the cache
+under their IDs. The factor is fixed for the whole block exactly as with
+direct factors, so the proposal stays symmetric: a borrowed or slightly
+stale factor costs acceptance rate, never detailed balance.
 
-End-of-block retrack
---------------------
+End-of-block retrack (rows without an ID only)
+----------------------------------------------
 The ~25 repeats of a block can carry a source several tolerances away from
 where the block found it (Gram steps are large). After the final write-back,
 ``GBSpecialBase._run_in_model_repeats`` calls :meth:`_CholCache.retrack` with
-the final coordinates, so the next block finds the entry.
+the final coordinates, so the next block finds a coordinate-keyed entry. An
+ID-keyed entry needs no retrack and keeps the key it was stored with.
 
 Failure
 -------
@@ -93,14 +129,21 @@ Knobs (environment)
     Refresh period in proposes (40 proposes x ~25 repeats is ~1000 in-model
     steps). Minimum 1.
 ``GB_CHOL_CACHE_TOL`` (default ``5``)
-    Match tolerance, in the entry's marginal widths.
+    Coordinate-fallback match tolerance, in the entry's marginal widths.
 ``GB_CHOL_CACHE_BATCH`` (default ``4096``)
     Sources per factor call during a refresh (bounds peak device memory).
     Minimum 1.
 ``GB_CHOL_CACHE_WINDOW`` (default ``32``)
-    Candidate entries examined on each side of a source in f0. Minimum 1.
+    Coordinate fallback: candidate entries examined on each side of a source
+    in f0. Minimum 1.
+``GB_CHOL_CACHE_UID`` (default ``1``)
+    ``0`` is the rollback switch: no sorter carries IDs (the GB moves skip
+    every ID step and write ``-1`` back), so every row takes the coordinate
+    path, exactly as before the IDs. Read at every sorter build
+    (:func:`source_uid_enabled`), like ``GB_CHOL_CACHE``.
 
-All but ``GB_CHOL_CACHE`` are read once, when a cache is created.
+``GB_CHOL_CACHE_TOL``, ``_BATCH`` and ``_WINDOW`` are read once, when a cache
+is created.
 
 Logging
 -------
@@ -149,7 +192,8 @@ from ...utils.utility import asnumpy, get_array_module
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["chol_cache_enabled", "get_chol_cache"]
+__all__ = ["chol_cache_enabled", "get_chol_cache", "new_source_uids",
+           "source_uid_enabled"]
 
 #: Defaults of the ``GB_CHOL_CACHE_*`` knobs (see the module docstring).
 DEFAULT_EVERY = 40
@@ -173,10 +217,41 @@ _INFOMAT_ENGINE_ENV = "SIGHET_INFOMAT_ENGINE"
 #: docstring for why this is module-level rather than on the move).
 _CHOL_CACHES: dict = {}
 
+#: Source IDs are ``prefix << _UID_COUNTER_BITS | counter``: the prefix is
+#: drawn once per process (31 random bits from ``os.urandom``, never from a
+#: sampler RNG stream), the counter counts the IDs that process issued.
+_UID_COUNTER_BITS = 32
+_UID_STATE = {"pid": None, "prefix": 0, "next": 0}
+
 
 def chol_cache_enabled() -> bool:
     """True when ``GB_CHOL_CACHE=1`` (default off)."""
     return os.environ.get("GB_CHOL_CACHE", "0") == "1"
+
+
+def source_uid_enabled() -> bool:
+    """True unless ``GB_CHOL_CACHE_UID=0`` (the rollback switch)."""
+    return os.environ.get("GB_CHOL_CACHE_UID", "1") != "0"
+
+
+def new_source_uids(n: int) -> np.ndarray:
+    """``n`` fresh per-source IDs (host int64, all ``>= 0``).
+
+    Unique for the lifetime of the process. Across the ranks of a run (each
+    issues its own births) and across restarts (a mid-iteration checkpoint
+    brings the previous process's IDs back) they differ by their random
+    prefix: two processes collide only if they drew the same 31-bit prefix.
+    The prefix is redrawn in a forked child and when the counter runs out.
+    """
+    n = int(n)
+    st = _UID_STATE
+    if st["pid"] != os.getpid() or st["next"] + n > (1 << _UID_COUNTER_BITS):
+        st["pid"] = os.getpid()
+        st["prefix"] = int.from_bytes(os.urandom(4), "little") & 0x7FFFFFFF
+        st["next"] = 0
+    start = (st["prefix"] << _UID_COUNTER_BITS) + st["next"]
+    st["next"] += n
+    return np.arange(start, start + n, dtype=np.int64)
 
 
 def get_chol_cache(key) -> "_CholCache":
@@ -226,13 +301,14 @@ def _regrow(old, n_filled: int, capacity: int, template, fill=None):
 
 
 class _WalkerTable:
-    """One walker's cache entries: append-only host arrays plus an f0 index.
+    """One walker's cache entries: append-only host arrays plus an ID index
+    and an f0 index.
 
     Rows ``[0, n)`` are filled. They are appended with amortized doubling and
     never move, so an entry number recorded for a block stays valid until a
-    refresh replaces the table. ``coords`` holds each entry's key (the
-    coordinates it was last matched or retracked at) and is the only array
-    rewritten in place.
+    refresh replaces the table. ``coords`` holds each entry's coordinate key
+    (the coordinates it was last matched or retracked at) and is the only
+    array rewritten in place; ``uids`` is fixed at append.
 
     Attributes:
         n: Number of filled rows.
@@ -240,9 +316,13 @@ class _WalkerTable:
         factors: ``(capacity, ndim, ndim)`` proposal factors ``B``.
         widths: ``(capacity, 3)`` marginal widths of columns ``_MATCH_COLS``
             in coordinate units.
+        uids: ``(capacity,)`` source ID each entry was stored under, ``-1``
+            for a coordinate-keyed entry.
         gamma_z: ``(capacity, nz, nz)`` observable information matrices, or
             ``None`` while no row carries one. Rows stored without one are NaN
             (the move treats a non-finite ``Gamma_z`` as "no eigen table").
+        uid_order: Filled rows sorted by ID.
+        uid_sorted: The IDs in that order.
         f0_order: Filled rows sorted by key f0.
         f0_sorted: The key f0 values in that order.
     """
@@ -252,11 +332,14 @@ class _WalkerTable:
         self.coords = None
         self.factors = None
         self.widths = None
+        self.uids = None
         self.gamma_z = None
+        self.uid_order = None
+        self.uid_sorted = None
         self.f0_order = None
         self.f0_sorted = None
 
-    def append(self, coords, factors, widths, gamma_z) -> np.ndarray:
+    def append(self, coords, factors, widths, gamma_z, uids=None) -> np.ndarray:
         """Append rows and return their entry numbers.
 
         Args:
@@ -265,18 +348,23 @@ class _WalkerTable:
             widths: ``(k, 3)`` marginal widths.
             gamma_z: ``(k, nz, nz)`` observable information matrices, or
                 ``None`` (stored as NaN if the table carries ``Gamma_z``).
+            uids: ``(k,)`` source IDs (``-1`` = none), or ``None`` (all none).
         """
         n, k = self.n, len(coords)
+        uids = (np.full(k, -1, dtype=np.int64) if uids is None
+                else np.asarray(uids, dtype=np.int64))
         if self.coords is None or n + k > len(self.coords):
             capacity = max(2 * (n + k), _MIN_CAPACITY)
             self.coords = _regrow(self.coords, n, capacity, coords)
             self.factors = _regrow(self.factors, n, capacity, factors)
             self.widths = _regrow(self.widths, n, capacity, widths)
+            self.uids = _regrow(self.uids, n, capacity, uids)
             if self.gamma_z is not None:
                 self.gamma_z = _regrow(self.gamma_z, n, capacity, None, fill=np.nan)
         self.coords[n:n + k] = coords
         self.factors[n:n + k] = factors
         self.widths[n:n + k] = widths
+        self.uids[n:n + k] = uids
         if gamma_z is not None:
             if self.gamma_z is None:
                 # the first rows with Gamma_z: every earlier row reads as NaN
@@ -285,7 +373,17 @@ class _WalkerTable:
         # rows appended without Gamma_z keep the NaN fill
         self.n = n + k
         self.reindex()
+        self.uid_order = np.argsort(self.uids[:self.n], kind="stable")
+        self.uid_sorted = self.uids[:self.n][self.uid_order]
         return np.arange(n, n + k)
+
+    def find(self, uids) -> np.ndarray:
+        """Entry number stored under each ID, ``-1`` where there is none."""
+        uids = np.asarray(uids, dtype=np.int64)
+        if self.n == 0 or uids.size == 0:
+            return np.full(uids.shape, -1, dtype=np.int64)
+        pos = np.minimum(np.searchsorted(self.uid_sorted, uids), self.n - 1)
+        return np.where(self.uid_sorted[pos] == uids, self.uid_order[pos], -1)
 
     def reindex(self):
         """Rebuild the f0 sort index after keys were added or moved."""
@@ -296,7 +394,7 @@ class _WalkerTable:
     def nbytes(self) -> int:
         """Host bytes allocated by the table's arrays (capacity, not fill)."""
         return sum(a.nbytes for a in (self.coords, self.factors, self.widths,
-                                      self.gamma_z) if a is not None)
+                                      self.uids, self.gamma_z) if a is not None)
 
 
 class _Lookup(NamedTuple):
@@ -438,7 +536,11 @@ class _CholCache:
                 move._proposal_param_scales = self._param_scales(move, band_sorter)
             if found.gamma_z is not None and found.hit.any():
                 self._write_gamma_z(move, band_sorter, ids, found)
-            self._served = (asnumpy(ids).copy(), found.walkers, found.entries)
+            # retrack only the coordinate-keyed rows: an ID entry keeps its key
+            coord_entries = np.where(
+                self._uids(band_sorter, ids, len(found.hit)) >= 0, -1,
+                found.entries)
+            self._served = (asnumpy(ids).copy(), found.walkers, coord_entries)
         except Exception as exc:  # noqa: BLE001 -- see _fail
             self._fail(move, "take", exc)
             return move._compute_proposal_cholesky(
@@ -447,16 +549,19 @@ class _CholCache:
         return chol
 
     def match(self, band_sorter, ids) -> _Lookup:
-        """Find each source's entry; move the keys of hits to the sources.
+        """Find each source's entry in the table of its walker.
 
-        For every row, looks in the table of the row's walker at the
-        ``2 * window`` entries nearest in f0 and picks the one with the
-        smallest worst-column distance over ``_MATCH_COLS`` in that entry's
-        marginal widths; a hit is a distance ``<= tol``. Each hit entry's key
-        is set to the row's current coordinates.
+        A row with a source ID takes the entry stored under that ID, if any
+        (a miss otherwise -- never a neighbour's entry). A row without one
+        takes the coordinate fallback: of the ``2 * window`` entries nearest
+        in f0, the one with the smallest worst-column distance over
+        ``_MATCH_COLS`` in that entry's marginal widths; a hit is a distance
+        ``<= tol``, and the hit entry's key is set to the row's current
+        coordinates.
         """
         coords = asnumpy(band_sorter.coords[ids])
         n_rows, ndim = coords.shape
+        uids = self._uids(band_sorter, ids, n_rows)
         hit = np.zeros(n_rows, dtype=bool)
         entries = np.full(n_rows, -1, dtype=np.int64)
         factors = np.zeros((n_rows, ndim, ndim))
@@ -467,26 +572,39 @@ class _CholCache:
             table = self.tables.get(int(walker))
             if table is None or table.n == 0:
                 continue
-            rows = np.nonzero(walkers == walker)[0]
-            query = coords[rows]
-            # the 2 * window table positions around each row's f0 insertion
-            # point, clipped to the filled range
-            pos = np.searchsorted(table.f0_sorted, query[:, _F0_COL])
-            cand = table.f0_order[
-                np.clip(pos[:, None] + offsets[None, :], 0, table.n - 1)]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                dist = (np.abs(query[:, None, _MATCH_COLS]
-                               - table.coords[cand][:, :, _MATCH_COLS])
-                        / table.widths[cand])
-            # a zero width gives inf or NaN: never a match
-            score = np.nan_to_num(dist.max(-1), nan=np.inf)
-            best = score.argmin(1)
-            r = np.arange(len(rows))
-            best_entry = cand[r, best]
-            ok = score[r, best] <= self.tol
-            if not ok.any():
+            in_walker = np.nonzero(walkers == walker)[0]
+            # rows with an ID: the entry stored under it, nothing else
+            keyed = in_walker[uids[in_walker] >= 0]
+            found = table.find(uids[keyed])
+            hit_rows, hit_entries = [keyed[found >= 0]], [found[found >= 0]]
+            # rows without one: the coordinate fallback (the pre-ID path)
+            rows = in_walker[uids[in_walker] < 0]
+            if rows.size:
+                query = coords[rows]
+                # the 2 * window table positions around each row's f0
+                # insertion point, clipped to the filled range
+                pos = np.searchsorted(table.f0_sorted, query[:, _F0_COL])
+                cand = table.f0_order[
+                    np.clip(pos[:, None] + offsets[None, :], 0, table.n - 1)]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    dist = (np.abs(query[:, None, _MATCH_COLS]
+                                   - table.coords[cand][:, :, _MATCH_COLS])
+                            / table.widths[cand])
+                # a zero width gives inf or NaN: never a match
+                score = np.nan_to_num(dist.max(-1), nan=np.inf)
+                best = score.argmin(1)
+                r = np.arange(len(rows))
+                best_entry = cand[r, best]
+                ok = score[r, best] <= self.tol
+                if ok.any():
+                    hit_rows.append(rows[ok])
+                    hit_entries.append(best_entry[ok])
+                    table.coords[best_entry[ok]] = query[ok]
+                    table.reindex()
+            hit_rows = np.concatenate(hit_rows)
+            hit_entries = np.concatenate(hit_entries)
+            if not hit_rows.size:
                 continue
-            hit_rows, hit_entries = rows[ok], best_entry[ok]
             hit[hit_rows] = True
             entries[hit_rows] = hit_entries
             factors[hit_rows] = table.factors[hit_entries]
@@ -494,15 +612,15 @@ class _CholCache:
                 if gamma_z is None:
                     gamma_z = np.full((n_rows,) + table.gamma_z.shape[1:], np.nan)
                 gamma_z[hit_rows] = table.gamma_z[hit_entries]
-            table.coords[hit_entries] = query[ok]
-            table.reindex()
         return _Lookup(hit, walkers, entries, factors, gamma_z)
 
     def retrack(self, ids, coords):
         """End of block: move the served entries' keys to the final coordinates.
 
-        The key is set when the block starts (:meth:`match`); the block's
-        repeats then move the source, often beyond tolerance. Applies only
+        Coordinate-keyed entries only (rows served without a source ID); an
+        ID entry keeps its key. The key is set when the block starts
+        (:meth:`match`); the block's repeats then move the source, often
+        beyond tolerance. Applies only
         to the block the last :meth:`take` served: ``ids`` must be that
         block's ids in the same order, else nothing changes. ``coords`` are
         the final sampling coordinates, row-aligned with ``ids``. On error
@@ -541,6 +659,7 @@ class _CholCache:
         gamma_z = self._gamma_z_of(move, ids)
         widths = self._marginal_widths(move, factors)
         walkers = self._walkers(band_sorter, ids)
+        uids = self._uids(band_sorter, ids, len(walkers))
         entries = np.empty(len(walkers), dtype=np.int64)
         for walker in np.unique(walkers):
             rows = walkers == walker
@@ -549,8 +668,17 @@ class _CholCache:
                 table = self.tables[int(walker)] = _WalkerTable()
             entries[rows] = table.append(
                 coords[rows], factors[rows], widths[rows],
-                None if gamma_z is None else gamma_z[rows])
+                None if gamma_z is None else gamma_z[rows], uids[rows])
         return entries
+
+    @staticmethod
+    def _uids(band_sorter, ids, n_rows) -> np.ndarray:
+        """Host source ID of each row; ``-1`` where it has none, and for
+        every row of a sorter that carries no ID column."""
+        col = getattr(band_sorter, "source_uid", None)
+        if col is None:
+            return np.full(n_rows, -1, dtype=np.int64)
+        return asnumpy(col[ids]).astype(np.int64)
 
     @staticmethod
     def _walkers(band_sorter, ids) -> np.ndarray:

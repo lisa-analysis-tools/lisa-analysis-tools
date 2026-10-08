@@ -48,7 +48,12 @@ from gbgpu.gb_likelihood import (
     SwapLLResult,
     WDMBandLikelihoodEngine,
 )
-from .gb_chol_cache import chol_cache_enabled, get_chol_cache
+from .gb_chol_cache import (
+    chol_cache_enabled,
+    get_chol_cache,
+    new_source_uids,
+    source_uid_enabled,
+)
 from .globalfitmove import GFCombineMove, GlobalFitMove
 from ..communication.fanout import residual_hash
 from ..communication.ranks import derive_rank_seed
@@ -4029,7 +4034,7 @@ def _gb_host(obj):
 
 def merge_owned_sources(work_coords, work_inds, replies, ranks, band_ranges,
                         f0_col, d_h=None, h_h=None,
-                        preserve_leaf_identity=False):
+                        preserve_leaf_identity=False, source_uid=None):
     """Replica-mode finish merge: each rank contributes the sources IT owns.
 
     ONE walker, several replicas of it, each owning a static band range. Every
@@ -4054,6 +4059,11 @@ def merge_owned_sources(work_coords, work_inds, replies, ranks, band_ranges,
     ``d_h`` / ``h_h`` (optional, ``(nwalkers, nleaves_max)`` cold-only) follow
     their sources through the same sort for rung 0; the freed slots go NaN,
     the sub-state's own "nothing recorded" sentinel.
+
+    ``source_uid`` (optional, the head's ``(ntemps, nw, nleaves_max)``
+    GB_CHOL_CACHE ID column) follows its sources the same way on EVERY rung,
+    from each reply's ``block_source_uid`` (absent = no IDs); freed slots
+    go ``-1``.
 
     ``preserve_leaf_identity`` (VGB and any fixed-dimensional branch, where
     leaf *i* IS a specific physical source and per-leaf transform fills are
@@ -4103,6 +4113,15 @@ def merge_owned_sources(work_coords, work_inds, replies, ranks, band_ranges,
 
     if not contributors:
         return
+
+    def _uid_of(r):
+        """Rank ``r``'s shipped ID column, or all ``-1``."""
+        u = replies[r].get("block_source_uid") if hasattr(replies[r], "get") else None
+        return (np.full((ntemps, nw, nleaves_max), -1, dtype=np.int64)
+                if u is None else np.asarray(u, dtype=np.int64))
+
+    uid_r = ({r: _uid_of(r) for r, *_rest in contributors}
+             if source_uid is not None else None)
     # The ranges partition the whole band grid, so an ALIVE source whose
     # frozen band label falls outside their union belongs to no rank and
     # would be dropped silently by the per-range selection below (``-1`` is
@@ -4146,6 +4165,8 @@ def merge_owned_sources(work_coords, work_inds, replies, ranks, band_ranges,
         if cold:
             d_h[w][:] = np.nan
             h_h[w][:] = np.nan
+        if uid_r is not None:
+            source_uid[t, w, :] = -1
         if preserve_leaf_identity:
             # fixed-dimensional branch: leaves never move, so write each owned
             # source back AT ITS OWN SLOT and union the alive masks
@@ -4154,6 +4175,8 @@ def merge_owned_sources(work_coords, work_inds, replies, ranks, band_ranges,
                     continue
                 work_coords[t, w][sel] = coords[t, w][sel]
                 work_inds[t, w][sel] = True
+                if uid_r is not None:
+                    source_uid[t, w][sel] = uid_r[r][t, w][sel]
                 if cold:
                     d_h[w][sel] = np.asarray(replies[r]["d_h"])[w][sel]
                     h_h[w][sel] = np.asarray(replies[r]["h_h"])[w][sel]
@@ -4170,6 +4193,12 @@ def merge_owned_sources(work_coords, work_inds, replies, ranks, band_ranges,
         order = np.argsort(merged[:, int(f0_col)], kind="stable")
         work_coords[t, w, :n] = merged[order]
         work_inds[t, w, :n] = True
+        if uid_r is not None:
+            source_uid[t, w, :n] = np.concatenate(
+                [uid_r[r][t, w][sel]
+                 for (r, *_rest), sel in zip(contributors, picks) if sel.size],
+                axis=0,
+            )[order]
         if cold:
             d_h[w][:n] = np.concatenate(
                 [np.asarray(replies[r]["d_h"])[w][sel]
@@ -11337,6 +11366,65 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             d["_band_shutoff_epoch"] = ep
         return origin
 
+    def _band_shutoff_adopt(self, state) -> bool:
+        """Adopt the persisted valve record ONCE per process; True if this
+        call did.
+
+        The once-per-process guard (``_band_shutoff_loaded``) is shared by
+        both call sites, whichever runs first: the designated move's
+        propose-START adopt (:meth:`_band_shutoff_adopt_early`) and the
+        propose-END tick (:meth:`_update_band_shutoff`). A ``state`` with no
+        GB ``band_info`` (no persistence channel) adopts nothing and leaves
+        the guard unset.
+        """
+        bi = self._band_shutoff_band_info(state)
+        if bi is None or getattr(self, "_band_shutoff_loaded", False):
+            return False
+        self._band_shutoff_loaded = True
+        origin = self._band_shutoff_restore(bi)
+        self._band_shutoff_origin = origin
+        if origin.startswith("reset"):
+            logger.warning(
+                "[GB_BAND_SHUTOFF %s] persisted valve state NOT restored "
+                "(%s); the clock restarts from zero. Bands must re-earn "
+                "their shutoff over a full window.", self.name, origin)
+        elif origin == "restored":
+            logger.info(
+                "[GB_BAND_SHUTOFF %s] valve state restored from the "
+                "store: %d band(s) already off, %d mid-streak, %d "
+                "iters since the last revival", self.name,
+                int(self._rj_band_shutoff.sum()),
+                int((self._band_occ_streak > 0).sum()),
+                int(self.__dict__.get("_band_shutoff_since_revive", 0)))
+        return True
+
+    def _band_shutoff_adopt_early(self, state) -> bool:
+        """Adopt the persisted valve at propose START; True if this call did.
+
+        WHY. The record was adopted only by the propose-END tick, so the
+        first propose of every process read no valve: the RJ subset filter
+        froze nothing and the orchestrator head shipped that empty table to
+        every compute rank -- one full-width RJ propose per relaunch in the
+        search stages (the 6mo log: 648 bands off / 743 mid-streak, restored
+        only at propose end).
+
+        Gated like the valve itself. Only the move whose filter and tick are
+        live (:meth:`_band_shutoff_enabled`, the designated one) adopts, so
+        no other move adopts or ships a valve it does not own. Not with the
+        valve disabled (``GB_RJ_BAND_SHUTOFF_ITERS <= 0``): the first
+        propose then freezes nothing, as before, and the tick adopts the
+        record only to persist its release.
+
+        Both propose bodies call it BEFORE ``setup()``: an F-stat epoch
+        installed there runs :meth:`_band_shutoff_epoch_sync` against the
+        ADOPTED epoch, so (with the epoch trigger armed) an epoch that
+        advanced while the process was down revives the stale valve before
+        the first RJ step, not after it.
+        """
+        if not self._band_shutoff_enabled() or self._band_shutoff_iters() <= 0:
+            return False
+        return self._band_shutoff_adopt(state)
+
     def _band_shutoff_store(self, bi) -> None:
         """Write the valve record back to ``band_info`` (-> sub_backend/gb).
 
@@ -11400,24 +11488,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # clock meant the valve would barely work even with the call site
         # fixed. Adopt the stored record ONCE per process, then write it
         # back every tick so the clock counts GB proposes across the run.
+        # Normally a no-op here: the designated move already adopted at
+        # propose START (_band_shutoff_adopt_early). Kept for the paths that
+        # do not -- the disabled valve, which adopts here only to persist
+        # its release, and a direct call.
         bi = self._band_shutoff_band_info(state)
-        if bi is not None and not getattr(self, "_band_shutoff_loaded", False):
-            self._band_shutoff_loaded = True
-            origin = self._band_shutoff_restore(bi)
-            self._band_shutoff_origin = origin
-            if origin.startswith("reset"):
-                logger.warning(
-                    "[GB_BAND_SHUTOFF %s] persisted valve state NOT restored "
-                    "(%s); the clock restarts from zero. Bands must re-earn "
-                    "their shutoff over a full window.", self.name, origin)
-            elif origin == "restored":
-                logger.info(
-                    "[GB_BAND_SHUTOFF %s] valve state restored from the "
-                    "store: %d band(s) already off, %d mid-streak, %d "
-                    "iters since the last revival", self.name,
-                    int(self._rj_band_shutoff.sum()),
-                    int((self._band_occ_streak > 0).sum()),
-                    int(self.__dict__.get("_band_shutoff_since_revive", 0)))
+        self._band_shutoff_adopt(state)
         if not hasattr(self, "_band_occ_streak"):
             self._band_occ_streak = np.zeros(self.num_bands, dtype=np.int64)
             self._band_occ_last = np.full(self.num_bands, -1, dtype=np.int64)
@@ -12935,6 +13011,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         if bool(accept.any()):
             acc_ids = ids[accept]
             band_sorter.inds[acc_ids] = ~band_sorter.inds[acc_ids]
+            # GB_CHOL_CACHE IDs: a birth is a new source, a death retires one
+            self._rj_flip_uids(band_sorter, acc_ids)
             # Phase-maximised births carry the rotated phi0 forward.
             band_sorter.coords[acc_ids] = self.periodic.wrap(
                 {self.branch_name: params[accept][:, None, :]}, xp=xp
@@ -13758,6 +13836,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 leaf_inds=l_i[accept],
             )
             band_sorter.coords[acc_ids] = wrapped_new
+            # GB_CHOL_CACHE IDs: the replacement is a different source
+            self._replace_uids(band_sorter, acc_ids)
             # inds untouched: the dimension never changes.
 
             if _replace_debug:
@@ -14206,6 +14286,83 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             return None
         return get_chol_cache((self.branch_name, self._obs_eigen_mode(),
                                bool(self._eigen_axis_ready())))
+
+    # ---- GB_CHOL_CACHE per-source IDs (see gb_chol_cache's docstring) ------
+    #
+    # The ID column lives on the GB sub-state (``GBState.source_uid``) and on
+    # each propose's sorter (``BandSorter.source_uid``, per ROW). These four
+    # hooks are the only places a row's ID changes; a swap relabels the row,
+    # so it needs none. Gated per PROCESS (``GB_CHOL_CACHE=1`` and not
+    # ``GB_CHOL_CACHE_UID=0``), never per move: every GB move of a branch
+    # repacks the same sub-state, so one that dropped the column would strip
+    # every source of its ID.
+
+    def _state_source_uid(self, state):
+        """The sub-state's ID column for this propose's sorter, or ``None``
+        (cache off, rollback switch, or no tempered GB sub-state)."""
+        if not (chol_cache_enabled() and source_uid_enabled()):
+            return None
+        sub = (getattr(state, "sub_states", None) or {}).get(self.branch_name)
+        if (getattr(sub, "ensure_source_uid", None) is None
+                or not getattr(sub, "tempered_initialized", False)):
+            return None
+        return sub.ensure_source_uid()
+
+    def _issue_missing_uids(self, band_sorter) -> int:
+        """Give every alive row without an ID a fresh one; return the count.
+
+        Called right after the sorter build, before any cache lookup. In
+        steady state it issues nothing: only the first use after a load or
+        relaunch (every alive leaf, once -- the repack writes them back), a
+        reseeded rung, or an older pickle have alive rows without an ID.
+        """
+        uid = getattr(band_sorter, "source_uid", None)
+        if uid is None:
+            return 0
+        need = band_sorter.inds & (uid < 0)
+        n = int(need.sum())
+        if n:
+            uid[need] = get_array_module(uid).asarray(new_source_uids(n))
+            logger.info("%s: [GB_CHOL_CACHE] issued %d source IDs to alive "
+                        "rows without one.", self.name, n)
+        return n
+
+    @staticmethod
+    def _rj_flip_uids(band_sorter, acc_ids):
+        """After the RJ accept flip of ``acc_ids``: a birth gets a new ID, a
+        death's ID is retired."""
+        uid = getattr(band_sorter, "source_uid", None)
+        if uid is None:
+            return
+        born = band_sorter.inds[acc_ids]
+        uid[acc_ids] = -1
+        n = int(born.sum())
+        if n:
+            uid[acc_ids[born]] = get_array_module(uid).asarray(new_source_uids(n))
+
+    @staticmethod
+    def _replace_uids(band_sorter, acc_ids):
+        """An accepted replacement is a different source: a new ID."""
+        uid = getattr(band_sorter, "source_uid", None)
+        n = int(acc_ids.shape[0])
+        if uid is None or not n:
+            return
+        uid[acc_ids] = get_array_module(uid).asarray(new_source_uids(n))
+
+    def _write_back_uids(self, new_state, band_sorter, alive, inds_new) -> None:
+        """Repack: each alive row's ID lands at its source's new leaf slot,
+        every other slot carries none (a sorter without the column leaves
+        the state without IDs -- nothing stale survives)."""
+        sub = (getattr(new_state, "sub_states", None) or {}).get(self.branch_name)
+        if (getattr(sub, "ensure_source_uid", None) is None
+                or not getattr(sub, "tempered_initialized", False)):
+            return
+        uid = getattr(band_sorter, "source_uid", None)
+        vals = None if uid is None else _to_numpy(uid[alive])
+        state_uid = sub.ensure_source_uid()
+        state_uid[:] = -1
+        if vals is not None:
+            state_uid[inds_new] = vals
 
     def _infomat_phys_inds(self):
         """PHYSICAL output slots the information matrix is taken over.
@@ -20957,8 +21114,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         (all ``False``, then ``True`` at the repacked leaves), so RJ
         births/deaths and tempering walker reassignments all land here.
 
-        TODO: NEED TO PROPERLY MOVE SUPPLEMENTAL INFO BASED ON OLD LEAVES
-        (``inds_old`` below is the source-side index for that move).
+        Per-leaf info moves with its source: the GB_CHOL_CACHE source IDs
+        (``_write_back_uids``) and the cold-chain ``d_h``/``h_h``
+        (``_scatter_leaf_products``, from ``inds_old``). The GB branch carries
+        no eryn ``branch_supplemental``.
 
         With ``preserve_leaf_identity`` (fixed-dimensional branches whose
         leaf i IS a specific physical source, e.g. VGBs), sources go back
@@ -20984,6 +21143,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             work.coords[inds_new] = _to_numpy(band_sorter.coords[alive])
             work.inds[:] = False
             work.inds[inds_new] = True
+            self._write_back_uids(new_state, band_sorter, alive, inds_new)
             # identity preserved: old positions == new positions
             self._scatter_leaf_products(new_state, alive, inds_new, inds_new)
             self._sync_cold_row(new_state)
@@ -21023,7 +21183,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         work.inds[:] = False
         # turn on all the ones that are there
         work.inds[inds_new] = True
-        # work.branch_supplemental[inds_new] = state.branches[self.branch_name].branch_supplemental[inds_old]
+        # Per-leaf info follows its source here: the GB_CHOL_CACHE source IDs
+        # (the sorter's row column, placed at the row's CURRENT -- post-swap --
+        # labels) and the cold-chain d_h/h_h (gathered from ``inds_old``).
+        self._write_back_uids(new_state, band_sorter, alive, inds_new)
         self._scatter_leaf_products(new_state, alive, inds_new, inds_old)
         self._sync_cold_row(new_state)
         return inds_new, alive
@@ -25291,7 +25454,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     keep_all_inds=sess.keep_all_inds,
                     opt_snr_rej_samp_limit=self._live_snr_lim(),
                     snr_rej_detected=self.snr_rej_detected,
+                    source_uid=self._state_source_uid(new_part),
                 )
+                self._issue_missing_uids(band_sorter)
             sess.band_sorter = band_sorter
             self._infomat_wdm_logged = False
             self._tables_indexed = False
@@ -25711,6 +25876,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             sub = new_part.sub_states[self.branch_name]
             d_h = np.array(_to_numpy(sub.d_h), copy=True)
             h_h = np.array(_to_numpy(sub.h_h), copy=True)
+            # GB_CHOL_CACHE source IDs of the whole block, as repacked above
+            _uid = getattr(sub, "source_uid", None)
+            block_source_uid = (None if _uid is None
+                                else np.array(_to_numpy(_uid), copy=True))
 
             num_active_leaves = work.inds[0].sum(axis=-1)
             logger.info(
@@ -25789,6 +25958,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # for the merge-by-source (``None`` otherwise, where the head
                 # writes the whole walker column back as it always has)
                 "block_band_inds": block_band_inds,
+                # ``(ntemps, B, nleaves_max)`` per-source IDs (-1 = none);
+                # the head writes them back with the block like ``inds``
+                "block_source_uid": block_source_uid,
                 "d_h": d_h,
                 "h_h": h_h,
                 "band_counts": (None if band_info is None
@@ -25866,6 +26038,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             "block_coords": None,
             "block_inds": None,
             "block_band_inds": None,
+            "block_source_uid": None,
             "d_h": d_h,
             "h_h": h_h,
             "band_counts": np.zeros((ntemps, B, nb), dtype=int),
@@ -27555,6 +27728,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             h_h=getattr(sub, "h_h", None),
             preserve_leaf_identity=bool(
                 getattr(self, "preserve_leaf_identity", False)),
+            source_uid=getattr(sub, "source_uid", None),
         )
 
     def _replica_apply_sync(self, replies_s, layout, log_like_final, band_counts):
@@ -27942,6 +28116,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # the feature off, which is exactly what keeps the scalar path
         # bit-identical.
         self._arm_search_stage(state)
+
+        # The persisted barren-band valve, adopted BEFORE anything reads it
+        # (the RJ subset filter, the head's table ship) and before setup()'s
+        # epoch install syncs against it. Designated move only; a no-op
+        # after the first propose of the process.
+        self._band_shutoff_adopt_early(state)
 
         # Run any move-specific setup.
         self.setup(model, state.branches)
@@ -28508,6 +28688,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             if not _replica:
                 work.coords[:, w0:w1] = np.asarray(rep["block_coords"])
                 work.inds[:, w0:w1] = np.asarray(rep["block_inds"])
+                # GB_CHOL_CACHE source IDs ride with the block; a reply
+                # without them leaves the block without IDs, never stale ones
+                if getattr(sub, "source_uid", None) is not None:
+                    _uid = rep.get("block_source_uid")
+                    sub.source_uid[:, w0:w1] = (
+                        -1 if _uid is None else np.asarray(_uid))
                 if getattr(sub, "d_h", None) is not None:
                     sub.d_h[w0:w1] = np.asarray(rep["d_h"])
                     sub.h_h[w0:w1] = np.asarray(rep["h_h"])
@@ -29082,6 +29268,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # bit-identical.
         self._arm_search_stage(state)
 
+        # The persisted barren-band valve, adopted BEFORE anything reads it
+        # (the RJ subset filter, the head's table ship) and before setup()'s
+        # epoch install syncs against it. Designated move only; a no-op
+        # after the first propose of the process.
+        self._band_shutoff_adopt_early(state)
+
         # Run any move-specific setup.
         self.setup(model, state.branches)
         self.num_proposals += 1
@@ -29153,7 +29345,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 keep_all_inds=keep_all_inds,
                 opt_snr_rej_samp_limit=self._live_snr_lim(),
                 snr_rej_detected=self.snr_rej_detected,
+                source_uid=self._state_source_uid(new_state),
             )
+            self._issue_missing_uids(band_sorter)
 
         # Cold-chain friend table for the group-stretch half of the in-model
         # mix (rebuilt every proposal; cheap sort of the cold-chain f0s).

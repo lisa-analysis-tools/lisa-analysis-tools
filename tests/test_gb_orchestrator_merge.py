@@ -62,6 +62,10 @@ ORCHESTRATOR_REPLY_KEYS = {
         # outside replica mode -- but the KEY must always be there, because
         # the head reads it unconditionally on the replica path.
         "block_band_inds",
+        # GB_CHOL_CACHE per-source IDs of the block's whole branch
+        # (``(ntemps, B, nleaves_max)``, -1 = none); ``None`` from a neutral
+        # block, which ran nothing.
+        "block_source_uid",
     }),
 }
 
@@ -190,6 +194,7 @@ def _stub_gf_serve(move, op, payload, clock, model):
                 "block_coords": None,
                 "block_inds": None,
                 "block_band_inds": None,
+                "block_source_uid": None,
                 "d_h": np.full((B, NLEAVES), np.nan),
                 "h_h": np.full((B, NLEAVES), np.nan),
                 "band_counts": np.zeros((ntemps, B, nb), dtype=int),
@@ -208,11 +213,15 @@ def _stub_gf_serve(move, op, payload, clock, model):
         block_coords[0, 0, 0] = float(rank)
         block_inds = np.zeros((ntemps, B, NLEAVES), dtype=bool)
         block_inds[0, 0, 0] = True
+        # the alive source's ID is rank-tagged; every dead slot carries none
+        block_uid = np.full((ntemps, B, NLEAVES), -1, dtype=np.int64)
+        block_uid[0, 0, 0] = 1000 + rank
         return _checked(op, {
             "block_coords": block_coords,
             "block_inds": block_inds,
             # multi-walker blocks: no band-ownership key (replica mode only)
             "block_band_inds": None,
+            "block_source_uid": block_uid,
             "d_h": np.full((B, NLEAVES), 10.0 + rank),
             "h_h": np.full((B, NLEAVES), 20.0 + rank),
             "band_counts": np.full((ntemps, B, nb), rank + 1, dtype=int),
@@ -291,6 +300,9 @@ def make_move(rank, block, *, use_prior_removal=False, leaf_cap_update=True,
     move.mempool = gbs._NoOpMempool()
     move._reseed_firing = False
     move.temper_vertical = False
+    # set by ``__init__`` (d11f008c); the skeleton skips ``__init__``, and
+    # ``_log_stage_arm`` reads it on every propose
+    move._stage_armed_logged = True
     move._cap_leaf_cap = None
     move._band_leaf_cap = None
     move._rj_band_shutoff = np.zeros(NUM_BANDS, dtype=bool)
@@ -450,6 +462,30 @@ class GBOrchestratorMergeTest(unittest.TestCase):
         np.testing.assert_allclose(sub.d_h[0:2], 10.0)
         np.testing.assert_allclose(sub.d_h[2:4], 11.0)
         np.testing.assert_allclose(sub.h_h[2:4], 21.0)
+
+    def test_block_source_ids_land_with_the_block(self):
+        """GB_CHOL_CACHE: each block's per-source IDs come back with its
+        coords -- the alive leaf carries its rank-tagged ID, every other slot
+        of the block none."""
+        self.state.sub_states["gb"].source_uid[:] = 55     # pre-propose IDs
+        (new_state, _acc), _moves = run_propose(self.state)
+        uid = new_state.sub_states["gb"].source_uid
+        for rank, (w0, w1) in BLOCKS.items():
+            self.assertEqual(int(uid[0, w0, 0]), 1000 + rank)
+            block = uid[:, w0:w1].copy()
+            block[0, 0, 0] = -1
+            self.assertTrue((block == -1).all())
+
+    def test_a_neutral_block_keeps_the_ids_the_head_sliced(self):
+        sub = self.state.sub_states["gb"]
+        sub.branch.inds[:, 2:4] = False
+        sub.sync_cold_row(self.state, "gb")
+        sub.source_uid[:] = 55
+        (new_state, _acc), moves = run_propose(self.state, use_prior_removal=True)
+        self.assertTrue(moves[1].payloads[0]["neutral"])
+        uid = new_state.sub_states["gb"].source_uid
+        self.assertTrue((uid[:, 2:4] == 55).all())
+        self.assertEqual(int(uid[0, 0, 0]), 1000)
 
     def test_band_counts_and_pooled_counters(self):
         (new_state, _acc), _moves = run_propose(self.state)
