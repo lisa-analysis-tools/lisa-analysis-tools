@@ -189,7 +189,8 @@ def _short_members(run_dir: str, store: str, young_bytes: int):
       saved iteration, so the tar always spans at least one.
     * the reduced extract (keep=1), the page if present, the newest
       job's gpu_util csv, run_settings.log, the *_setup.log files, the
-      eigen pkl, and gb_fstat_fit/*/DONE.json.
+      eigen pkl, the run's residual snapshot npz, and
+      gb_fstat_fit/*/DONE.json.
 
     DROPPED: every globalfit_run* product (duplicated by the stdout),
     every dead-job stdout, gpu_procs (per-process noise), and the truth
@@ -227,6 +228,10 @@ def _short_members(run_dir: str, store: str, young_bytes: int):
             elif fn == "run_settings.log" or fn.endswith("_setup.log"):
                 keep.append(p)
             elif fn.endswith("_eigen_tables.pkl"):
+                keep.append(p)
+            elif fn.endswith("_residual_snapshot.npz"):
+                # the run's own residual for the data/template/residual
+                # panels (GF_RESIDUAL_SNAPSHOT_EVERY, ~20 MB)
                 keep.append(p)
             elif fn == "DONE.json" and "gb_fstat_fit" in rel:
                 keep.append(p)

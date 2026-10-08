@@ -296,6 +296,8 @@ class Recipe:
             # the fan-out owns an MPI communicator: a runtime product that
             # must never travel with the (picklable, deepcopy-able) config.
             "fanout",
+            # the residual-snapshot context holds the live ACA + data arrays
+            "snapshot_context",
         ):
             state.pop(attr, None)
         return state
@@ -715,6 +717,14 @@ class Recipe:
                     logger.warning("[FANOUT_DIGEST] residual hash gather failed: %r", exc)
                     hashes = None
             logger.info(fanout_digest_line(iteration, last_sample, residual_hashes=hashes))
+        # GF_RESIDUAL_SNAPSHOT_EVERY: the max-lnL walker's residual + the data
+        # beside the store for the monitor page (never raises; see the module).
+        _snap = getattr(self, "snapshot_context", None)
+        if _snap is not None:
+            from .residual_snapshot import maybe_snapshot
+
+            maybe_snapshot(iteration=iteration, fanout=getattr(self, "fanout", None),
+                           **_snap)
         stop_here = self._current_recipe_step["adjust"].stopping_function(
             iteration, last_sample, sampler
         )

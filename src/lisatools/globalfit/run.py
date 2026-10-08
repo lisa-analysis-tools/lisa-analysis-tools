@@ -2705,6 +2705,15 @@ class GlobalFit:
         # stage/iteration clock to the fan-out. Both are None in single mode.
         self.curr.fanout = self.fanout
         self.recipe.fanout = self.fanout
+        # GF_RESIDUAL_SNAPSHOT_EVERY (head only; the recipe's per-iteration
+        # hook is the head's): what lisatools.globalfit.residual_snapshot
+        # needs to write the max-lnL walker's residual beside the store.
+        self.recipe.snapshot_context = dict(
+            acs=acs,
+            data_holder=getattr(self.curr.general_info,
+                                "input_data_residual_array", None),
+            store_path=self.curr.general_info.main_file_path,
+        )
         setup_info_all = self.curr.settings_dict.setup_function(
             self.recipe, self.engine_info, self.curr, acs, priors, state
         )
@@ -3239,6 +3248,7 @@ class GlobalFit:
             ComputeService,
             residual_hash,
         )
+        from .residual_snapshot import RESIDUAL_SNAPSHOT_OP, walker_residual
 
         self.compute_service = ComputeService(
             self.fanout_comm,
@@ -3256,6 +3266,11 @@ class GlobalFit:
                 # replica-mode agreement check on the [FANOUT_DIGEST] line)
                 RESIDUAL_HASH_OP: lambda payload, clock, model: residual_hash(
                     model.analysis_container_arr
+                ),
+                # answers residual_snapshot.take_snapshot: the owning rank
+                # returns one walker's residual (GF_RESIDUAL_SNAPSHOT_EVERY)
+                RESIDUAL_SNAPSHOT_OP: lambda payload, clock, model: walker_residual(
+                    model, payload
                 ),
             },
             logger=self.logger,

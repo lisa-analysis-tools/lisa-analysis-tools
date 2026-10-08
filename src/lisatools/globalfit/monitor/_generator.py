@@ -2628,7 +2628,7 @@ try:
     from lisatools.globalfit.recipe import MOJITO_REFERENCE_TIME
     from lisatools.detector import L1Orbits
     from lisatools.domains import (FDSettings, FDSignal, TDSettings, TDSignal,
-                                   WDMSettings)
+                                   WDMSettings, WDMSignal)
     from lisatools.utils.utility import windowfun
     from lisatools.globalfit.stock.erebor.transforms import (
         make_gb_transform_container)
@@ -2705,13 +2705,42 @@ try:
     if not _types:
         _types = ["NOISE", "GB", "VGB"]
     _SUBDIR = {"NOISE": "INSTRUMENT"}
+    # THE RUN'S OWN DATA STREAM (2026-10-07). A run that lists COMBINED in
+    # its source_types read mojito's pre-summed brick (noise + every source
+    # class) and nothing else, so that is the data here too. Otherwise the
+    # bricks of the run's own source_ids are summed. Until 2026-10-07 this
+    # summed the FIRST local brick of each type instead -- an arbitrary
+    # source (on the laptop cache MBHB 16, merging at 111 d), so the page
+    # showed a "residual" MBH merger the run had in fact fitted.
+    from lisatools.globalfit.preprocessing import find_combined_file, find_file
+    _stypes = re.search(r"'source_types':\s*\[([^\]]*)\]", _pk)
+    _stypes = re.findall(r"'(\w+)'", _stypes.group(1)) if _stypes else []
     _files = {}
-    for _t in _types:
-        _hits = sorted(_glob.glob(os.path.join(
-            MOJITO_CAT_DIR, "data", _SUBDIR.get(_t, _t), "L1", f"{_t}_*.h5")))
-        if not _hits:
-            raise FileNotFoundError(f"no local mojito {_t} L1 brick")
-        _files[_t] = _hits[0]
+    if "COMBINED" in _stypes:
+        try:
+            _files["COMBINED"] = find_combined_file(
+                os.path.join(MOJITO_CAT_DIR, "data", "COMBINED", "L1"))
+            _types = ["COMBINED"]
+        except (FileNotFoundError, OSError) as _exc:
+            MISSING.append(
+                f"the run read mojito's COMBINED stream, which is not in this "
+                f"machine's cache ({_exc}); the data here is the sum of the "
+                f"run's own per-type bricks that ARE cached instead.")
+    if not _files:
+        for _t in _types:
+            _folder = os.path.join(MOJITO_CAT_DIR, "data", _SUBDIR.get(_t, _t), "L1")
+            _ids = re.search(rf"'{_t}':\s*\[([^\]]*)\]", _pk)
+            _ids = ([int(x) for x in re.findall(r"\d+", _ids.group(1))]
+                    if _ids else [0])
+            for _sid in _ids:
+                try:
+                    _files[f"{_t}{_sid}" if len(_ids) > 1 else _t] = find_file(
+                        _folder, _t, _sid)
+                except (FileNotFoundError, OSError):
+                    MISSING.append(f"mojito {_t} source {_sid} brick not in this "
+                                   f"machine's cache; left out of the data.")
+        if not _files:
+            raise FileNotFoundError("no local mojito L1 brick for this run")
 
     # --- orbits: the run's L1Orbits, but only the window's light-travel times
     class _WindowedL1Orbits(L1Orbits):
@@ -2741,7 +2770,7 @@ try:
                 self.ltt_t0 = float(self.ltt_t[0])
                 self.sc_t0 = float(self.sc_t_base[0])
 
-    _orb = _WindowedL1Orbits(_files[_types[0]], force_backend="cpu",
+    _orb = _WindowedL1Orbits(next(iter(_files.values())), force_backend="cpu",
                              frame="icrs", linear_interp_dt=500.0)
     _orb._ensure_configured()
     # stash for the SNR machinery below: the analytic DefaultOrbits ephemeris
@@ -2818,6 +2847,62 @@ try:
         _tmpl[_nm] = _arr[0] * _shift
         del _arr
     resid_fd = data_fd - _tmpl["gb"] - _tmpl["vgb"]
+
+    # --- THE RUN'S OWN RESIDUAL, when the run wrote one (2026-10-07) -------
+    # GF_RESIDUAL_SNAPSHOT_EVERY makes the head write the max-lnL walker's
+    # residual -- the data minus EVERY fitted signal (GB, VGB, MBH, EMRI,
+    # SOBBH), on the run's WDM grid -- next to the store
+    # (lisatools.globalfit.residual_snapshot). When it is here, the data,
+    # template and residual on this page are the run's: data and residual
+    # come back to the frequency domain through WDMSignal.wdm_to_fd
+    # (band-limited to the analysed band and edge-cropped span, which is all
+    # the likelihood sees), and "template" is data - residual, i.e. every
+    # signal class. Without it the page falls back to its own GB + VGB
+    # subtraction and says so.
+    _wdm = WDMSettings(W_NF, W_NT, W_DT, t0=float(_k["t0"]),
+                       oversample=int(_k["oversample"]),
+                       min_freq=float(_k["min_freq"]),
+                       max_freq=float(_k["max_freq"]),
+                       min_time=float(_k["min_time"]),
+                       max_time=float(_k["max_time"]),
+                       is_complex=bool(_k["is_complex"]),
+                       force_backend="cpu")
+    SNAP = None
+    _snaps = sorted(_glob.glob(os.path.join(RUN_DIR, "*_residual_snapshot.npz")),
+                    key=os.path.getmtime, reverse=True)
+    if _snaps:
+        try:
+            with np.load(_snaps[0]) as _z:
+                SNAP = {k: _z[k] for k in ("data", "residual", "iteration",
+                                           "walker")}
+            _want = (3, int(_wdm.Nf_active), int(_wdm.Nt_active))
+            if tuple(SNAP["data"].shape) != _want:
+                raise ValueError(f"snapshot shape {SNAP['data'].shape} != the "
+                                 f"store's WDM grid {_want}")
+            _full = WDMSettings(W_NF, W_NT, W_DT, oversample=int(_k["oversample"]),
+                                force_backend="cpu")
+
+            def _snap_fd(arr):
+                pad = np.zeros((3, W_NF, W_NT))
+                pad[:, _wdm.active_slice_f, _wdm.active_slice_t] = arr
+                return np.asarray(WDMSignal(pad, _full).wdm_to_fd(settings=FDS).arr)
+
+            data_fd = _snap_fd(SNAP["data"].astype(float))
+            resid_fd = _snap_fd(SNAP["residual"].astype(float))
+            DTR.update(snap=True, snap_it=int(SNAP["iteration"]),
+                       snap_walker=int(SNAP["walker"]),
+                       snap_file=os.path.basename(_snaps[0]))
+        except Exception as _exc:  # noqa: BLE001 - fall back, never fail the page
+            MISSING.append(f"residual snapshot {os.path.basename(_snaps[0])} "
+                           f"unusable ({_exc!r}); data/template/residual fall "
+                           f"back to this page's own GB + VGB subtraction.")
+            SNAP = None
+    if SNAP is None:
+        MISSING.append(
+            "no run residual snapshot beside the store (GF_RESIDUAL_SNAPSHOT_EVERY): "
+            "the data/template/residual panels subtract only the GB + VGB templates "
+            "this page rebuilds, so every MBH / EMRI / SOBBH in the data shows in "
+            "the residual.")
     DTR.update(n_gb=int(_gb9.shape[0]), n_vgb=int(_vgb9.shape[0]),
                walker=WBEST, lnl=float(ll[-1, WBEST]),
                dt_shift=float(_t0_data - T_REF))
@@ -2881,6 +2966,16 @@ try:
          [("data", data_fd, DIM, 0.55, 1.1),
           ("residual", resid_fd, CYAN, 1.0, 0.7)]),
     ]
+    if SNAP is not None:
+        _cols = [
+            ("data (as the run loaded it)", [("data", data_fd, DIM, 1.0, 0.9)]),
+            ("all fitted signals (data - residual)",
+             [("data", data_fd, DIM, 0.35, 0.9),
+              ("all signals", data_fd - resid_fd, GREEN, 1.0, 0.7)]),
+            ("residual (the run's own)",
+             [("data", data_fd, DIM, 0.55, 1.1),
+              ("residual", resid_fd, CYAN, 1.0, 0.7)]),
+        ]
     fig, ax = plt.subplots(3, 3, figsize=(13.5, 8.2), sharex=True, sharey=True)
     for r in range(3):
         for c, (ttl, series) in enumerate(_cols):
@@ -2921,19 +3016,19 @@ try:
     fig_b64(fig, "dtr_fd")
 
     # ===================== WDM figure =====================================
-    _wdm = WDMSettings(W_NF, W_NT, W_DT, t0=float(_k["t0"]),
-                       oversample=int(_k["oversample"]),
-                       min_freq=float(_k["min_freq"]),
-                       max_freq=float(_k["max_freq"]),
-                       min_time=float(_k["min_time"]),
-                       max_time=float(_k["max_time"]),
-                       is_complex=bool(_k["is_complex"]),
-                       force_backend="cpu")
+    # (``_wdm`` is built above, beside the residual-snapshot read.)
     DEC = 5                       # WDM time pixels pooled per plotted column
     _wp = {}
-    for _nm, _arr in (("data", data_fd), ("tmpl", _tmpl["gb"] + _tmpl["vgb"]),
-                      ("res", resid_fd)):
-        _m = np.abs(np.asarray(FDSignal(_arr.copy(), FDS).transform(_wdm).arr))
+    if SNAP is not None:
+        # the run's own arrays, on its own grid: no transform at all
+        _wdm_src = (("data", SNAP["data"]), ("tmpl", SNAP["data"] - SNAP["residual"]),
+                    ("res", SNAP["residual"]))
+    else:
+        _wdm_src = (("data", data_fd), ("tmpl", _tmpl["gb"] + _tmpl["vgb"]),
+                    ("res", resid_fd))
+    for _nm, _arr in _wdm_src:
+        _m = (np.abs(np.asarray(_arr, dtype=float)) if SNAP is not None else
+              np.abs(np.asarray(FDSignal(_arr.copy(), FDS).transform(_wdm).arr)))
         _n = (_m.shape[-1] // DEC) * DEC
         # MAX-pool the time axis down to plot resolution immediately; the
         # full-resolution map is never carried past this line.
@@ -2945,7 +3040,12 @@ try:
     DTR.update(wdm_shape=tuple(int(s) for s in _wp["data"].shape), wdm_dec=DEC,
                layer_df=float(_wdm.layer_df), layer_dt=float(_wdm.layer_dt))
     fig, ax = plt.subplots(3, 3, figsize=(13.5, 8.0), sharex=True, sharey=True)
-    _tt = ["data", "template sum (GB + VGB)", "residual = data - templates"]
+    _tt = (["data (as the run loaded it)",
+            "all fitted signals (data - residual)",
+            f"residual (the run's own, walker {int(SNAP['walker'])}, "
+            f"iteration {int(SNAP['iteration'])})"]
+           if SNAP is not None else
+           ["data", "template sum (GB + VGB)", "residual = data - templates"])
     for r in range(3):
         # ONE linear scale per channel row, keyed to that row's DATA panel
         # (the addremove debug convention: norm from the total-data column,
@@ -3812,13 +3912,16 @@ if FGW:
         "loud bins (unresolved or missed lines) rather than a Gaussian floor; a smooth drift of "
         "the mean away from 1 that follows frequency is the rigid tanh x power-law failing to "
         "follow the residual's shape. Bottom: the share of the model noise that is foreground. "
-        "<em>Caveats.</em> (1) This page's residual removes the GB and VGB templates only, and "
-        "its data stream is ONE local brick per source type (" + (" + ".join(
-            os.path.basename(_p).split("_L1_")[-1].split("_")[0] + " " + _t
-            for _t, _p in globals().get("_files", {}).items()
-            if _t not in ("NOISE", "GB", "VGB")) or "none beyond NOISE + GB + VGB") +
-        ") rather than the run's full COMBINED stream, so the non-GB content differs from "
-        "what the sampler subtracted at start coordinates. (2) The noise curves here are the "
+        "<em>Caveats.</em> (1) " + (
+            f"This page's residual is the run's own (snapshot at iteration "
+            f"{DTR.get('snap_it')}, walker {DTR.get('snap_walker')}): the data the run "
+            f"loaded minus every fitted signal class, band-limited to the analysed band. "
+            if DTR.get("snap") else
+            "This page's residual removes the GB and VGB templates only (the run wrote no "
+            "residual snapshot; GF_RESIDUAL_SNAPSHOT_EVERY), so every MBH / EMRI / SOBBH in "
+            "its data (" + (" + ".join(sorted(globals().get("_files", {}))) or "?") +
+            ") is still in it. ") +
+        "(2) The noise curves here are the "
         "static equal-arm model on each walker's parameters; the run multiplies the foreground "
         "by a tabulated time modulation (GalForTimeModulation) that these curves do not carry, "
         "so in foreground-dominated bands the page under-states the run's effective noise by "
