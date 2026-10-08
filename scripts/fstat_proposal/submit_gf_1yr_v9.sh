@@ -49,6 +49,26 @@
 #          replica pe"). GALFOR_RATCHET stays 0 ("no ratcheting"). full_pe's
 #          declarations (peak floor 6.25, PE repeats, RJ flip 0.1) unchanged.
 #          `run_combined_staged.py --print-recipe` under these exports prints it.
+#   1YR-7. THE FIXED-DIM SOURCE SEED (user ruling 2026-10-08, shared with the
+#          9mo's 9MO-7): the existing source_search stage runs, AFTER the seed
+#          (main-session placement, same day): gb_search_seed x3 ->
+#          source_search -> gb_search_1 -> gb_search_2 -> full_pe.
+#          STAGE_SKIP_SOURCE_SEARCH 1 -> 0; SOURCE_SEARCH_POSITION=after_seed
+#          (the sources' maxima found against a residual with the warm-started
+#          galaxy already subtracted); sobbh_pe / mbh_pe / emri_pe ONLY at their
+#          in-model repeats (25), from exact truth, psd + galfor FIXED at the
+#          pin, GB leaves and VGBs held. Stop: every walker's cold lnL gains <=
+#          SOURCE_SEARCH_TOL=10 nats over SOURCE_SEARCH_CHECKS=10 consecutive
+#          rounds (the laggard walker decides), ceiling SOURCE_SEARCH_MAX_ROUNDS
+#          =200; 10 rounds (MAXLOGL_ITERS_PER_STEP) per stored row. The globals
+#          MAXLOGL_TOL=20 / NOISE_SEARCH_CHECKS=5 stay the cycle-end noise
+#          slot's.
+#   1YR-8. GALFOR FREQUENCY PRIOR (user ruling 2026-10-08, shared by the 9mo and
+#          1yr): fk, f_1 and f_2 share one prior box 1e-4..1e-2 Hz
+#          (GALFOR_FREQ_PRIOR=1e-4,1e-2; stock: fk 0.8e-3..1e-2, f_1 / f_2
+#          1e-5..1e-2). One resolver feeds the prior, the start-pin window
+#          and the noise-pin refusal; the GALFOR_START_PARAMS pin is inside
+#          the box. The 6mo relaunch keeps the stock box.
 #
 # WAVEFORM SETTINGS AT 1 YR (all three windows, 2026-10-03): NO export line
 # changes. EMRI direct: same table; EMRIs 0 (347 d) and 3 (256 d) plunge INSIDE
@@ -1010,6 +1030,15 @@ export COARSE_FIDUCIAL=injection
 # that commit before running this, or the refusal is not there to catch you.
 export GALFOR_LOG_SAMPLING=${GALFOR_LOG_SAMPLING:-1}
 export GALFOR_ALPHA_MAX=20.0
+# ---- 9MO / 1YR: GALFOR FREQUENCY PRIOR (user ruling 2026-10-08) -----------
+# "adjust the frequency parameters (fk, f1, f2) in the foreground model ...
+# in its prior ... to go from 1e-4 to 1e-2": the three frequency columns
+# share one box, 0.1-10 mHz (stock: fk 0.8-10 mHz, f_1 / f_2 10 uHz-10 mHz).
+# One resolver (galfor_prior_ranges) feeds the prior, the start-pin window
+# and the noise-pin refusal, so the GALFOR_START_PARAMS pin (fk 2.53 mHz,
+# f_1 10 mHz, f_2 1.41 mHz) is inside the box. Fresh store only: a chain
+# outside the box would price at log_prior = -inf on resume.
+export GALFOR_FREQ_PRIOR=${GALFOR_FREQ_PRIOR:-1e-4,1e-2}
 echo "[V8-NOISE] coarse: Q=${COARSE_Q} mode=${COARSE_GPU_MODE} \
 use_ws=${COARSE_USE_WS} fiducial=${COARSE_FIDUCIAL}"
 
@@ -4855,7 +4884,29 @@ export SOBBH_PERMUTE_EVERY=10
 # VGB pairs with VGB_INMODEL_PROPOSAL=eigen (block below, 09-15 ruling):
 # the eigen draw samples fine from identical starts, so VGB is NOT
 # frozen at truth -- it PE-samples around it from the first propose.
-export STAGE_SKIP_SOURCE_SEARCH=1
+# ---- 9MO / 1YR: THE FIXED-DIM SOURCE SEED (user ruling 2026-10-08) ---------
+# "since we are seeing the MBHs move quite a bit towards a better likelihood
+# ... 'fixed-dim source seed' ... the galfor and psd will be fixed just like in
+# gb search seed and gb search 1. However, it will only run MBHBs, SOBHBs, and
+# EMRIs, until the maximum likelihood of each walker converges." The existing
+# source_search stage, RUN here (STAGE_SKIP_SOURCE_SEARCH 1 -> 0) and placed
+# AFTER gb_search_seed (SOURCE_SEARCH_POSITION=after_seed, main session
+# 2026-10-08: the source maxima are found against a residual with the
+# warm-started galaxy already subtracted; =first puts it before the seed).
+# Moves: sobbh_pe / mbh_pe / emri_pe ONLY, from the exact-truth starts below;
+# psd + galfor FIXED at the start pin, the GB leaves held at the seed's
+# warm-start births, the VGBs held. Stop: every walker's cold lnL gains no
+# more than SOURCE_SEARCH_TOL nats over SOURCE_SEARCH_CHECKS consecutive
+# rounds (a round = one pass of the three moves at their in-model repeats;
+# MAXLOGL_PER_WALKER=1, the laggard walker decides), at most
+# SOURCE_SEARCH_MAX_ROUNDS rounds, MAXLOGL_ITERS_PER_STEP (10) rounds per
+# stored row. MAXLOGL_TOL=20 / NOISE_SEARCH_CHECKS stay the gb_search_2
+# cycle-end noise slot's.
+export STAGE_SKIP_SOURCE_SEARCH=${STAGE_SKIP_SOURCE_SEARCH:-0}
+export SOURCE_SEARCH_POSITION=${SOURCE_SEARCH_POSITION:-after_seed}
+export SOURCE_SEARCH_CHECKS=${SOURCE_SEARCH_CHECKS:-10}
+export SOURCE_SEARCH_TOL=${SOURCE_SEARCH_TOL:-10}
+export SOURCE_SEARCH_MAX_ROUNDS=${SOURCE_SEARCH_MAX_ROUNDS:-200}
 export MBH_START_FACTOR=0.0
 export EMRI_START_FACTOR=0.0
 export SOBBH_START_FACTOR=0.0

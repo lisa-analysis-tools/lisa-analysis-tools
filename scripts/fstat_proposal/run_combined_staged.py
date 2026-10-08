@@ -131,6 +131,17 @@ Key env knobs
                          start (and stay subtracted) at their seeded
                          coords; source proposals only in gb_search +
                          full_pe (exact-truth-start flow, 2026-09-14)
+    SOURCE_SEARCH_POSITION   first (default: before the noise and GB
+                         stages) | after_seed (between gb_search_seed and
+                         gb_search_1; the 9mo / 1yr "fixed-dim source seed",
+                         2026-10-08; refused when no seed stage composes)
+    SOURCE_SEARCH_CHECKS / SOURCE_SEARCH_TOL / SOURCE_SEARCH_MAX_ROUNDS
+                         source_search's OWN per-walker plateau rule: flat
+                         rounds, nats, round ceiling over the stage. Unset =
+                         NOISE_SEARCH_CHECKS / MAXLOGL_TOL / MAXLOGL_MAX_ITER
+                         (the globals, as before). A round = one pass of the
+                         armed source PE moves at their in-model repeats;
+                         MAXLOGL_ITERS_PER_STEP rounds per stored row
     GB_SEARCH_SAMPLE_NOISE_ALL_STAGES=1  every v9 GB search stage samples
                          the noise, not just gb_search_3: the leading joint
                          psd+galfor+vgb rider plus a noise convergence after
@@ -398,7 +409,8 @@ class JointMaxLogLSearch(Move):
     """
 
     def __init__(self, name, inner_names, iters_per_step=None,
-                 num_checks=None, restart_each_propose=False, **kwargs):
+                 num_checks=None, restart_each_propose=False, tol=None,
+                 max_rounds=None, **kwargs):
         super().__init__(name, **kwargs)
         self.inner_names = list(inner_names)
         # Per-propose inner-iteration cap and plateau length handed to
@@ -411,6 +423,14 @@ class JointMaxLogLSearch(Move):
         # noise convergence, GB_SEARCH_{N}_NOISE_MODE=cycle_end): without it a
         # plateaued instance takes one round per call, the rider behaviour.
         self.restart_each_propose = bool(restart_each_propose)
+        # This instance's OWN plateau tolerance (nats) and round ceiling (rounds
+        # over the instance's life, MaxLogLCombineMove.max_iter). None = the
+        # globals MAXLOGL_TOL / MAXLOGL_MAX_ITER, as before. Set on the built
+        # move AFTER construction, because its __init__ lets those globals
+        # override its constructor arguments (the source_search stage's
+        # SOURCE_SEARCH_TOL / SOURCE_SEARCH_MAX_ROUNDS, 2026-10-08).
+        self.tol = None if tol is None else float(tol)
+        self.max_rounds = None if max_rounds is None else int(max_rounds)
 
     def stock_dependencies(self):
         """The stock moves this wraps -- without this they are never BUILT.
@@ -445,6 +465,11 @@ class JointMaxLogLSearch(Move):
             iters_per_step=self.iters_per_step,
             **_restart,
         )
+        # per-instance tolerance / ceiling, only when set (getattr: a descriptor
+        # pickled before these existed builds exactly as before)
+        apply_release_tol(mv, getattr(self, "tol", None))
+        if getattr(self, "max_rounds", None) is not None:
+            mv.max_iter = int(self.max_rounds)
         mv.gf_move_name = self.name
         return mv
 
@@ -833,6 +858,68 @@ def search_stage_noise_max_rounds(name: str) -> int:
     if n < 1:
         raise ValueError(f"{knob}={n} must be >= 1.")
     return n
+
+
+# ---- THE FIXED-DIM SOURCE SEED (user ruling 2026-10-08) ----------------------
+# "since we are seeing the MBHs move quite a bit towards a better likelihood, I
+# want to add a new stage to the 9mo run ... 'fixed-dim source seed'. In this
+# stage, the galfor and psd will be fixed just like in gb search seed and gb
+# search 1. However, it will only run MBHBs, SOBHBs, and EMRIs, until the
+# maximum likelihood of each walker converges ... Over say 10 iterations, make
+# sure the logL has not changed by more than 10." That stage is ``source_search``
+# (the joint max-lnL search over the armed source PE moves); these give it ITS
+# OWN plateau rule and a position. Read only when the stage composes (the 6mo
+# exports STAGE_SKIP_SOURCE_SEARCH=1); each unset = today's composition.
+
+#: ``SOURCE_SEARCH_POSITION`` values. ``first`` = before the noise and GB stages
+#: (the historical place, the default); ``after_seed`` = between gb_search_seed
+#: and gb_search_1 (the 9mo / 1yr, main-session placement decision 2026-10-08:
+#: the source maxima are found against a residual with the warm-started galaxy
+#: already subtracted, rather than one still holding the whole galaxy that the
+#: pinned noise model does not account for).
+SOURCE_SEARCH_POSITIONS = ("first", "after_seed")
+
+
+def source_search_position() -> str:
+    """``SOURCE_SEARCH_POSITION`` (first | after_seed; unset = first)."""
+    raw = (os.environ.get("SOURCE_SEARCH_POSITION") or "").strip().lower()
+    if not raw:
+        return "first"
+    if raw not in SOURCE_SEARCH_POSITIONS:
+        raise ValueError(f"SOURCE_SEARCH_POSITION={raw!r} must be one of "
+                         f"{SOURCE_SEARCH_POSITIONS}.")
+    return raw
+
+
+def source_search_rule():
+    """``(checks, tol, max_rounds)`` of the source_search stage's plateau rule.
+
+    ``SOURCE_SEARCH_CHECKS`` (flat rounds per walker), ``SOURCE_SEARCH_TOL``
+    (nats), ``SOURCE_SEARCH_MAX_ROUNDS`` (rounds over the whole stage, a safety
+    ceiling). Each unset = None = the global knob the stage has always used
+    (NOISE_SEARCH_CHECKS / MAXLOGL_TOL / MAXLOGL_MAX_ITER), so the globals stay
+    the gb_search_2 cycle-end noise slot's.
+    """
+    def _read(knob, cast, ok, what):
+        raw = (os.environ.get(knob) or "").strip()
+        if not raw:
+            return None
+        try:
+            val = cast(raw)
+        except ValueError:
+            raise ValueError(f"{knob}={raw!r} must be {what}.") from None
+        if not ok(val):
+            raise ValueError(f"{knob}={raw!r} must be {what}.")
+        return val
+
+    checks = _read("SOURCE_SEARCH_CHECKS", int, lambda v: v >= 1,
+                   "an integer >= 1 (consecutive flat rounds per walker)")
+    # v == v rejects nan; a finite positive number of nats
+    tol = _read("SOURCE_SEARCH_TOL", float,
+                lambda v: v == v and 0.0 < v < float("inf"), "a number of nats > 0")
+    cap = _read("SOURCE_SEARCH_MAX_ROUNDS", int, lambda v: v >= 1,
+                "an integer >= 1 (rounds)")
+    return checks, tol, cap
 
 
 def _seed_profile(profiles):
@@ -1692,17 +1779,59 @@ def build_fit():
         # a refinement loop, not a blind search. Afterwards they keep
         # PE-sampling through gb_search and full_pe (live residual); they
         # sit converged-and-subtracted during the noise stages.
+        #
+        # THE FIXED-DIM SOURCE SEED (user ruling 2026-10-08) is this stage, with
+        # its OWN plateau rule (SOURCE_SEARCH_CHECKS / _TOL / _MAX_ROUNDS; each
+        # unset = the global knob, as before) and a position: ``first`` (here,
+        # the default) or ``after_seed`` (between gb_search_seed and
+        # gb_search_1, inserted below). A round = ONE pass of the armed source
+        # PE moves, each at its in-model repeats ({BRANCH}_NUM_PROP_REPEATS);
+        # MAXLOGL_ITERS_PER_STEP rounds per sampler iteration (stored row), the
+        # per-walker plateau count carried across iterations (no
+        # restart_each_propose); the stage ends when every walker's cold lnL
+        # has gained no more than tol over its baseline for ``checks``
+        # consecutive rounds (MAXLOGL_PER_WALKER=1: the laggard decides), or
+        # at the ceiling.
         _src_branch = next(br for br, _e, _c in _SOURCE_BRANCH_ENVS
                            if br in armed_sources)
-        stages.append(Stage(
+        _src_checks, _src_tol, _src_cap = source_search_rule()
+        _src_position = source_search_position()
+        if _src_position == "after_seed":
+            # refuse up front rather than drop or move the stage silently
+            _why = ("STAGE_NOISE_ONLY=1" if _env_flag("STAGE_NOISE_ONLY")
+                    else "STAGE_NOISE_VGB_PE=1" if _env_flag("STAGE_NOISE_VGB_PE")
+                    else "no gb branch (REMOVE_BRANCHES)" if "gb" not in fit.branches
+                    else "STAGE_V9_SEARCH=0" if not _v9_search_enabled()
+                    else "GB_SEARCH_SEED_ITERS=0" if _seed_iters() == 0
+                    else None)
+            if _why is not None:
+                raise ValueError(
+                    f"SOURCE_SEARCH_POSITION=after_seed but this composition has no "
+                    f"gb_search_seed stage ({_why}). Use SOURCE_SEARCH_POSITION=first "
+                    "or compose the seed.")
+        _src_stage = Stage(
             name="source_search", kind="search",
             moves=[JointMaxLogLSearch(
                 "source_joint_search",
                 [f"{br}_pe" for br, _e, _c in _SOURCE_BRANCH_ENVS
                  if br in armed_sources],
-                branch=_src_branch)],
+                branch=_src_branch, num_checks=_src_checks, tol=_src_tol,
+                max_rounds=_src_cap)],
             combine_kwargs=dict(share_temperature_control=False),
-        ))
+        )
+        if _src_position == "first":
+            stages.append(_src_stage)
+        print(f"[combined] source_search ({_src_position}): "
+              f"{'+'.join(_src_stage.moves[0].inner_names)} ONLY (psd/galfor fixed), "
+              f"to a per-walker max-lnL plateau: "
+              f"{_src_checks if _src_checks is not None else 'NOISE_SEARCH_CHECKS'} "
+              f"consecutive flat round(s) within "
+              f"{f'{_src_tol:g} nats' if _src_tol is not None else 'MAXLOGL_TOL'}, "
+              f"ceiling "
+              f"{f'{_src_cap} rounds' if _src_cap is not None else 'MAXLOGL_MAX_ITER'}.",
+              flush=True)
+    else:
+        _src_position, _src_stage = None, None
     # CONDITIONAL NOISE STAGES (v9, user spec 2026-09-24): "noise_search /
     # noise_vgb_search run ONLY when there is no psd/foreground estimate from
     # a previous run." The estimate IS the start pin -- {PSD,GALFOR}_START_
@@ -2337,10 +2466,18 @@ def build_fit():
                   f"leaves / {_rk['lnl_tol']:g} nats over the last {_rk['window']} rows "
                   f"(at least {_rk['min_iters']} rows in-stage); full_pe then begins = "
                   f"the start of sample taking (its start_iteration stamp).", flush=True)
+        # SOURCE_SEARCH_POSITION=after_seed (2026-10-08): the fixed-dim source
+        # seed between gb_search_seed and gb_search_1 (refused above when no
+        # seed composes, so it can never land anywhere else).
+        _src_after_seed = []
+        if _src_position == "after_seed":
+            if not _seed:
+                raise AssertionError("after_seed with no gb_search_seed composed")
+            _src_after_seed = [_src_stage]
         # Per-stage noise mode / source cadence (2026-10-07). ``_sampled`` is
         # the TABLE's flag: it still keys the warm cadence (a stage-3 property,
         # GB_SEARCH_3_WARM_EVERY), whatever GB_SEARCH_{N}_NOISE_MODE says.
-        stages += _seed + [
+        stages += _seed + _src_after_seed + [
             _search_stage(_name,
                           noise_mode=search_stage_noise_mode(_name, _sampled),
                           warm_every=(_warm3 if _sampled else 1),
@@ -2445,13 +2582,22 @@ def _describe_move(m) -> str:
         cap = (m.iters_per_step if m.iters_per_step is not None
                else int(os.environ.get("MAXLOGL_ITERS_PER_STEP", "10")))
         tol = os.environ.get("MAXLOGL_TOL", "5 (code default)")
+        # the instance's OWN tolerance / ceiling when it carries one (the
+        # source_search stage); otherwise the globals, worded as before
+        own_tol = getattr(m, "tol", None)
+        own_cap = getattr(m, "max_rounds", None)
         if getattr(m, "restart_each_propose", False):
+            within = (f"{own_tol:g} nats" if own_tol is not None
+                      else f"MAXLOGL_TOL={tol} nats")
             label += (f"  [{inner}: TO CONVERGENCE, afresh every cycle -- {checks} "
-                      f"flat round(s) per walker within MAXLOGL_TOL={tol} nats "
+                      f"flat round(s) per walker within {within} "
                       f"({_envv('MAXLOGL_PER_WALKER', '1')}), ceiling {cap} rounds]")
         else:
+            within = f"{own_tol:g} nats" if own_tol is not None else f"MAXLOGL_TOL={tol}"
             label += (f"  [{inner}: joint max-lnL plateau, {checks} flat round(s) "
-                      f"within MAXLOGL_TOL={tol}, at most {cap} round(s) per propose]")
+                      f"within {within}, at most {cap} round(s) per propose"
+                      + (f", ceiling {own_cap} rounds" if own_cap is not None else "")
+                      + "]")
     ev = int(getattr(m, "every", 1) or 1)
     if ev != 1:
         label += f"  (every {ev} iterations)"
@@ -2493,6 +2639,39 @@ def _describe_sources(st) -> str:
     return ", ".join(f"{n} every {e}" for n, e in ev.items())
 
 
+def _describe_source_search_stop(st) -> str:
+    """The fixed-dim source seed's plateau rule, resolved, with its knobs."""
+    m = next(mv for mv in st.moves if isinstance(mv, JointMaxLogLSearch))
+    if m.num_checks is not None:
+        checks, ck = m.num_checks, f"SOURCE_SEARCH_CHECKS={m.num_checks}"
+    else:
+        checks = int(os.environ.get("NOISE_SEARCH_CHECKS", "5"))
+        ck = f"SOURCE_SEARCH_CHECKS unset -> NOISE_SEARCH_CHECKS={checks}"
+    if m.tol is not None:
+        tol, tk = f"{m.tol:g}", f"SOURCE_SEARCH_TOL={m.tol:g}"
+    else:
+        tol = os.environ.get("MAXLOGL_TOL", "5 (code default)")
+        tk = f"SOURCE_SEARCH_TOL unset -> MAXLOGL_TOL={tol}"
+    _mi = int(os.environ.get("MAXLOGL_MAX_ITER", "0") or 0)
+    if m.max_rounds is not None:
+        cap = f"{m.max_rounds} rounds (SOURCE_SEARCH_MAX_ROUNDS={m.max_rounds})"
+    elif _mi:
+        cap = f"{_mi} rounds (SOURCE_SEARCH_MAX_ROUNDS unset -> MAXLOGL_MAX_ITER={_mi})"
+    else:
+        cap = "none (SOURCE_SEARCH_MAX_ROUNDS and MAXLOGL_MAX_ITER unset: unbounded)"
+    per_walker = os.environ.get("MAXLOGL_PER_WALKER", "1").strip() not in (
+        "0", "false", "False", "no", "off", "")
+    chunk = (m.iters_per_step if m.iters_per_step is not None
+             else int(os.environ.get("MAXLOGL_ITERS_PER_STEP", "10")))
+    return (f"every walker's cold lnL gains no more than {tol} nats over its baseline "
+            f"for {checks} consecutive round(s) ({ck}; {tk}; "
+            f"{_envv('MAXLOGL_PER_WALKER', '1')}: "
+            + ("the laggard walker decides" if per_walker else "the BEST walker decides")
+            + f"), ceiling {cap}; a round = one pass of {'+'.join(m.inner_names)} "
+            f"at their in-model repeats, at most {chunk} round(s) per stored row "
+            f"(MAXLOGL_ITERS_PER_STEP), the count carried across rows")
+
+
 def _describe_stop(st) -> str:
     kw = st.step_kwargs or {}
     fn = kw.get("convergence_fn")
@@ -2516,6 +2695,8 @@ def _describe_stop(st) -> str:
                 f"(>= {kw.get('min_iters')} rows in-stage)")
     if st.kind == "pe":
         return "none: PE never stops on its own (NUM_ITERATIONS bounds the run)"
+    if st.kind == "search" and st.name == "source_search":
+        return _describe_source_search_stop(st)
     if st.kind == "search":
         return "the joint max-lnL plateau inside the stage's move (done on its first check)"
     if st.kind == "rj":
@@ -2562,6 +2743,18 @@ def describe_recipe(fit) -> str:
         if st.kind in ("gb_search", "rj", "pe", "replica_pe"):
             lines.append(f"  noise:    {_describe_noise(st)}")
             lines.append(f"  sources:  {_describe_sources(st)}")
+        elif st.kind == "search":
+            # a joint max-lnL search stage: read what its search WRAPS
+            inner = {n for m in st.moves for n in (getattr(m, "inner_names", ()) or ())}
+            lines.append("  noise:    " + (
+                "SAMPLED inside the stage's joint max-lnL search"
+                if inner & {"psd_pe", "galfor_pe"} else
+                "FIXED (no psd/galfor move: held at the start pin "
+                "PSD_START_PARAMS/GALFOR_START_PARAMS or where the last noise stage left it)"))
+            src = [n for n in _SOURCE_MOVES if n in inner]
+            lines.append("  sources:  " + (
+                f"{'/'.join(src)} inside the joint max-lnL search, EVERY round"
+                if src else "none (no sobbh/mbh/emri move in this stage)"))
         if kw.get("ratchet") is not None:
             lines.append(f"  ratchet:  {kw['ratchet']}")
         if st.kind in ("pe", "replica_pe"):

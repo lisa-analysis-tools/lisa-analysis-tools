@@ -25,6 +25,21 @@ launchers only through their derive tables):
   GB_SEARCH_{N}_NOISE_MAX_ROUNDS the cycle-end convergence's round ceiling
   GB_SEARCH_{N}_RESET_VALVES     1 = reset the RJ valves at a FRESH stage entry
 
+The "fixed-dim source seed" (user ruling 2026-10-08: "I want the first stage,
+even before gb search seed, to be 'fixed-dim source seed' ... it will only run
+MBHBs, SOBHBs, and EMRIs, until the maximum likelihood of each walker
+converges ... Over say 10 iterations, make sure the logL has not changed by
+more than 10") is the existing ``source_search`` stage, switched on in the
+9mo / 1yr launchers (STAGE_SKIP_SOURCE_SEARCH 1 -> 0) with its OWN plateau
+rule; each knob unset = the global one (today's rule):
+
+  SOURCE_SEARCH_CHECKS           flat rounds per walker (else NOISE_SEARCH_CHECKS)
+  SOURCE_SEARCH_TOL              nats (else MAXLOGL_TOL)
+  SOURCE_SEARCH_MAX_ROUNDS       round ceiling over the stage (else MAXLOGL_MAX_ITER)
+  SOURCE_SEARCH_POSITION         first (default: before the noise and GB stages,
+                                 today's composition) | after_seed (between
+                                 gb_search_seed and gb_search_1, the 9mo / 1yr)
+
 Construction level (build_fit: no data, no backend) except the step tests,
 which drive SearchStageProfileStep with fake states.
 """
@@ -75,6 +90,8 @@ _KNOBS = {k: None for k in (
     "GB_SEARCH_STAGES", "GB_SEARCH_SAMPLE_NOISE_ALL_STAGES", "GALFOR_RATCHET",
     "STAGE_REPLICA_PE", "GB_SEARCH_SOURCE_EVERY", "GB_SEARCH_SEED_ITERS",
     "NOISE_SEARCH_CHECKS", "GB_SEARCH_LEGS",
+    "SOURCE_SEARCH_CHECKS", "SOURCE_SEARCH_TOL", "SOURCE_SEARCH_MAX_ROUNDS",
+    "SOURCE_SEARCH_POSITION",
     *(f"GB_SEARCH_{n}_{s}" for n in (1, 2, 3)
       for s in ("SOURCE_EVERY", "NOISE_MODE", "NOISE_MAX_ROUNDS", "RESET_VALVES")))}
 
@@ -89,11 +106,21 @@ _FULL = dict(_GB_ONLY, GB_ONLY=None, MBHB_IDS="2,5", EMRI_IDS="0", SOBHB_IDS="0"
              PSD_START_PARAMS="1.5e-11,3e-15",
              GALFOR_START_PARAMS="1e-44,1e-3,1.5,5e-4,5e-4")
 
+#: the fixed-dim source seed as the 9mo / 1yr derive tables export it (2026-10-08)
+_SOURCE_SEED = dict(STAGE_SKIP_SOURCE_SEARCH="0", SOURCE_SEARCH_POSITION="after_seed",
+                    SOURCE_SEARCH_CHECKS="10", SOURCE_SEARCH_TOL="10",
+                    SOURCE_SEARCH_MAX_ROUNDS="200")
+
 #: the 9mo / 1yr recipe, as the derive tables export it
 _RECIPE_9MO = dict(GB_SEARCH_SEED_ITERS="3", GB_SEARCH_STAGES="1,2",
                    GB_SEARCH_1_SOURCE_EVERY="0", GB_SEARCH_2_SOURCE_EVERY="1",
                    GB_SEARCH_2_NOISE_MODE="cycle_end", GB_SEARCH_2_RESET_VALVES="1",
-                   STAGE_REPLICA_PE="0")
+                   STAGE_REPLICA_PE="0", **_SOURCE_SEED)
+
+#: the 9mo / 1yr stage list: the source seed AFTER gb_search_seed (main-session
+#: placement decision 2026-10-08: the sources' maxima are found against a residual
+#: with the warm-started galaxy already subtracted)
+_STAGES_9MO = ["gb_search_seed", "source_search", "gb_search_1", "gb_search_2", "full_pe"]
 
 
 def _R():
@@ -515,6 +542,151 @@ class ResetValvesTest(unittest.TestCase):
 
 
 # ======================================================================
+# 4b. the fixed-dim source seed: source_search's own rule and position
+# ======================================================================
+def _source_stage(fit):
+    return _stage(fit, "source_search")
+
+
+def _built_rule(desc, **globals_):
+    """``desc.setup(ctx)`` through the REAL MaxLogLCombineMove under the given
+    global knobs (whose ``__init__`` lets MAXLOGL_TOL / MAXLOGL_MAX_ITER override
+    its constructor arguments -- the reason per-stage values are applied after)."""
+    ctx = types.SimpleNamespace(
+        stock_moves={n: types.SimpleNamespace() for n in desc.inner_names})
+    with env(**globals_):
+        return desc.setup(ctx)
+
+
+_GLOBALS = dict(NOISE_SEARCH_CHECKS="5", MAXLOGL_TOL="20", MAXLOGL_MAX_ITER="7")
+
+
+class SourceSeedStageTest(unittest.TestCase):
+    """User ruling 2026-10-08 ("fixed-dim source seed ... the galfor and psd will
+    be fixed ... it will only run MBHBs, SOBHBs, and EMRIs, until the maximum
+    likelihood of each walker converges ... Over say 10 iterations, make sure the
+    logL has not changed by more than 10"), placed AFTER gb_search_seed by the
+    main session's decision the same day."""
+
+    def tearDown(self):
+        _clear_peak_floor()
+
+    def test_unset_position_is_todays_composition(self):
+        """SOURCE_SEARCH_POSITION unset = first (before the noise / GB stages),
+        exactly what STAGE_SKIP_SOURCE_SEARCH=0 composed before the knob."""
+        fit = _build(_FULL, STAGE_SKIP_SOURCE_SEARCH="0")
+        self.assertEqual([s.name for s in fit.recipe.stages],
+                         ["source_search", "gb_search_seed", "gb_search_1", "gb_search_2",
+                          "gb_search_3", "replica_pe", "full_pe"])
+        sig = DefaultsAreTodayTest._sig
+        self.assertEqual(sig(fit), sig(_build(_FULL, STAGE_SKIP_SOURCE_SEARCH="0",
+                                              SOURCE_SEARCH_POSITION="first")))
+
+    def test_after_seed_sits_between_the_seed_and_gb_search_1(self):
+        first = _build(_FULL, STAGE_SKIP_SOURCE_SEARCH="0")
+        fit = _build(_FULL, STAGE_SKIP_SOURCE_SEARCH="0", SOURCE_SEARCH_POSITION="after_seed")
+        self.assertEqual([s.name for s in fit.recipe.stages],
+                         ["gb_search_seed", "source_search", "gb_search_1", "gb_search_2",
+                          "gb_search_3", "replica_pe", "full_pe"])
+        # the SAME stage, only moved; every other stage composes as before
+        sig = DefaultsAreTodayTest._sig
+        self.assertEqual({s[0]: s for s in sig(fit)}, {s[0]: s for s in sig(first)})
+        # the seed keeps gb_search_1's profile and carries no source moves
+        seed, s1 = _stage(fit, "gb_search_seed"), _stage(fit, "gb_search_1")
+        self.assertEqual(seed.step_kwargs["profile"], s1.step_kwargs["profile"])
+        self.assertEqual([n for n in _names(seed) if n in SRC], [])
+
+    def test_after_seed_needs_a_seed_stage(self):
+        """No gb_search_seed composed -> refused, never silently moved elsewhere."""
+        for over in (dict(GB_SEARCH_SEED_ITERS="0"), dict(STAGE_V9_SEARCH="0")):
+            with self.assertRaises(ValueError, msg=over):
+                _build(_FULL, STAGE_SKIP_SOURCE_SEARCH="0",
+                       SOURCE_SEARCH_POSITION="after_seed", **over)
+
+    def test_bad_position_is_refused(self):
+        for bad in ("last", "seed", "1"):
+            with self.assertRaises(ValueError, msg=bad):
+                _build(_FULL, STAGE_SKIP_SOURCE_SEARCH="0", SOURCE_SEARCH_POSITION=bad)
+
+    def test_only_the_three_source_moves(self):
+        st = _source_stage(_build(_FULL, **_SOURCE_SEED))
+        self.assertEqual(st.kind, "search")
+        self.assertEqual(_names(st), ["source_joint_search"])
+        (m,) = st.moves
+        self.assertIsInstance(m, _R().JointMaxLogLSearch)
+        self.assertEqual(list(m.inner_names), list(SRC))      # sobbh -> mbh -> emri
+        self.assertEqual(_noise_moves(st), [])                 # psd / galfor FIXED
+        self.assertFalse(m.restart_each_propose)               # ONE convergence per stage
+
+    def test_the_per_stage_rule_wins_over_the_globals(self):
+        m = _source_stage(_build(_FULL, **_SOURCE_SEED)).moves[0]
+        self.assertEqual((m.num_checks, m.tol, m.max_rounds), (10, 10.0, 200))
+        mv = _built_rule(m, **_GLOBALS)
+        self.assertEqual((mv.num_checks, mv.tol, mv.max_iter), (10, 10.0, 200))
+        self.assertFalse(mv.restart_each_propose)
+        self.assertEqual(mv.gf_move_name, "source_joint_search")
+        # the descriptor still pickles (pre-build fit rule)
+        back = pickle.loads(pickle.dumps(m))
+        self.assertEqual((back.num_checks, back.tol, back.max_rounds), (10, 10.0, 200))
+
+    def test_unset_is_the_globals(self):
+        m = _source_stage(_build(_FULL, STAGE_SKIP_SOURCE_SEARCH="0")).moves[0]
+        self.assertEqual((m.num_checks, m.tol, m.max_rounds), (None, None, None))
+        mv = _built_rule(m, **_GLOBALS)
+        self.assertEqual((mv.num_checks, mv.tol, mv.max_iter), (5, 20.0, 7))
+
+    def test_bad_values_are_refused(self):
+        for knob, bad in (("SOURCE_SEARCH_CHECKS", "0"), ("SOURCE_SEARCH_CHECKS", "x"),
+                          ("SOURCE_SEARCH_TOL", "0"), ("SOURCE_SEARCH_TOL", "-1"),
+                          ("SOURCE_SEARCH_TOL", "nan"), ("SOURCE_SEARCH_TOL", "x"),
+                          ("SOURCE_SEARCH_MAX_ROUNDS", "0"), ("SOURCE_SEARCH_MAX_ROUNDS", "x")):
+            with self.assertRaises(ValueError, msg=(knob, bad)):
+                _build(_FULL, **{**_SOURCE_SEED, knob: bad})
+
+    def test_skipped_the_knobs_change_nothing(self):
+        """STAGE_SKIP_SOURCE_SEARCH=1 (the 6mo): the stage's knobs are inert."""
+        sig = DefaultsAreTodayTest._sig
+        self.assertEqual(sig(_build(_FULL)),
+                         sig(_build(_FULL, **{**_SOURCE_SEED, "STAGE_SKIP_SOURCE_SEARCH": "1"})))
+
+    def test_a_round_is_one_pass_and_the_stage_rule_decides(self):
+        """The built move under the 9mo rule, driven round by round.
+
+        Every walker gains 12 nats a round for 8 rounds, then twitches by 0.5:
+        under tol 10 each 12-nat round is progress, so the stage ends after the
+        9 climbing rounds + 10 flat ones = 19 rounds, in two sampler iterations
+        (MAXLOGL_ITERS_PER_STEP=10 rounds per propose; the plateau count carries
+        across). Under the globals (5 checks, tol 20, MAXLOGL_MAX_ITER 7) it
+        would end at 7 (and at 14 without that ceiling)."""
+        m = _source_stage(_build(_FULL, **_SOURCE_SEED)).moves[0]
+        mv = _built_rule(m, **_GLOBALS)
+        rounds = []
+
+        def once(model, state):
+            k = len(rounds)
+            rounds.append(k)
+            base = 100.0 + 12.0 * min(k, 8) + (0.5 * (k % 2) if k >= 9 else 0.0)
+            state.log_like = np.array([[base, base - 3.0]])
+            return state, np.ones((1, 2), dtype=bool)
+        mv._propose_moves_once = once
+        state = types.SimpleNamespace(log_like=np.zeros((1, 2)))
+        per_propose, done = [], []
+        with env(MAXLOGL_PER_WALKER="1", MAXLOGL_LOG_EVERY="0", MAXLOGL_ITERS_PER_STEP=None,
+                 MAXLOGL_FREEZE_CONVERGED=None, **_GLOBALS), \
+                contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(3):
+                before = len(rounds)
+                mv._propose_moves(None, state)
+                per_propose.append(len(rounds) - before)
+                done.append(mv.maxlogl_plateau_done)
+                if mv.maxlogl_plateau_done:
+                    break
+        self.assertEqual(len(rounds), 19)
+        self.assertEqual(per_propose, [10, 9])
+        self.assertEqual(done, [False, True])
+
+
+# ======================================================================
 # 5. the 1yr / 9mo launchers compose the ruled recipe; the 6mo is unchanged
 # ======================================================================
 class LauncherRecipeTest(unittest.TestCase):
@@ -539,10 +711,11 @@ class LauncherRecipeTest(unittest.TestCase):
             pass
         system = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "USER")
                   if k in os.environ}
-        cls.fits = {}
+        cls.fits, cls.exports = {}, {}
         for tag, path in (("6mo", SIX_MO_V9), ("1yr", ONE_YR_V9), ("9mo", NINE_MO_V9)):
             ex = {k: v for k, v in _exports(path).items()
                   if k not in ("_", "SHLVL", "PWD", "OLDPWD", "PATH", "HOME")}
+            cls.exports[tag] = dict(ex)
             ex["PSD_START_PARAMS"] = "1.5e-11,3e-15"
             ex.update(system)
             with mock.patch.dict(os.environ, ex, clear=True), \
@@ -552,11 +725,11 @@ class LauncherRecipeTest(unittest.TestCase):
 
     def test_the_9mo_recipe(self):
         fit = self.fits["9mo"]
-        self.assertEqual([s.name for s in fit.recipe.stages],
-                         ["gb_search_seed", "gb_search_1", "gb_search_2", "full_pe"])
+        self.assertEqual([s.name for s in fit.recipe.stages], _STAGES_9MO)
         seed, s1, s2 = (_stage(fit, n) for n in ("gb_search_seed", "gb_search_1", "gb_search_2"))
         self.assertEqual(seed.step_kwargs["convergence_fn"].n, 3)
         self.assertEqual([n for n in _names(seed) if n in SRC], [])
+        self.assertEqual(seed.step_kwargs["profile"], s1.step_kwargs["profile"])
         self.assertEqual(s1.step_kwargs["profile"], dict(
             phase_maximize=True, opt_snr=8.0, peak_min_snr=8.0, prior_births=False))
         self.assertEqual([n for n in _names(s1) if n in SRC], [])
@@ -576,13 +749,84 @@ class LauncherRecipeTest(unittest.TestCase):
             self.assertEqual(_names(s2).index(b), _names(s2).index(a) + 1, (a, b))
         self.assertIsNone(s2.step_kwargs.get("ratchet"))
 
+    def test_the_fixed_dim_source_seed(self):
+        """User ruling 2026-10-08: sobbh/mbh/emri ONLY, noise fixed at the pin,
+        until every walker's lnL gains no more than 10 nats over 10 rounds."""
+        st = _stage(self.fits["9mo"], "source_search")
+        self.assertEqual(st.kind, "search")
+        self.assertEqual(_names(st), ["source_joint_search"])
+        (m,) = st.moves
+        self.assertIsInstance(m, _R().JointMaxLogLSearch)
+        self.assertEqual(list(m.inner_names), list(SRC))
+        inner = set(m.inner_names)
+        self.assertFalse(inner & NOISE)                                       # no psd / galfor
+        self.assertFalse({n for n in inner if n.startswith(("rj_", "in_model", "gb_"))})
+        self.assertFalse({n for n in inner if n.startswith("vgb")})           # no vgb
+        # the per-walker max-lnL plateau at the stage's OWN rule, not the globals
+        # (the launcher exports MAXLOGL_TOL=20 for the cycle-end noise slot)
+        self.assertEqual((m.num_checks, m.tol, m.max_rounds), (10, 10.0, 200))
+        self.assertFalse(m.restart_each_propose)
+        self.assertEqual(self.exports["9mo"]["MAXLOGL_TOL"], "20")
+        self.assertEqual(self.exports["9mo"].get("MAXLOGL_PER_WALKER", "1"), "1")
+        # the 6mo composes no such stage
+        self.assertNotIn("source_search", [s.name for s in self.fits["6mo"].recipe.stages])
+
     def test_the_1yr_composes_the_SAME_recipe(self):
         def sig(fit):
-            return [(s.name, s.kind, [(m.name, getattr(m, "every", 1)) for m in s.moves],
+            return [(s.name, s.kind, [(m.name, getattr(m, "every", 1),
+                                       list(getattr(m, "inner_names", ()) or ()),
+                                       getattr(m, "num_checks", None), getattr(m, "tol", None),
+                                       getattr(m, "max_rounds", None)) for m in s.moves],
                      repr(s.step_kwargs.get("profile")),
                      getattr(s.step_kwargs.get("convergence_fn"), "n", None))
                     for s in fit.recipe.stages]
+        self.assertEqual([s.name for s in self.fits["1yr"].recipe.stages], _STAGES_9MO)
         self.assertEqual(sig(self.fits["1yr"]), sig(self.fits["9mo"]))
+
+    def test_a_fresh_store_takes_the_9mo_order(self):
+        """The 9mo / 1yr launch on a FRESH store: add_recipe writes the composed
+        order as is, and a relaunch with the same recipe resumes it."""
+        import shutil
+        import tempfile
+
+        import h5py
+
+        from lisatools.globalfit.hdfbackend import GFHDFBackend
+        from lisatools.globalfit.recipe import Recipe
+
+        names = [s.name for s in self.fits["9mo"].recipe.stages]
+        tmp = tempfile.mkdtemp(prefix="src_seed_store_")
+        try:
+            path = os.path.join(tmp, "fresh_testing.h5")
+            with h5py.File(path, "w") as f:
+                f.create_group("global_fit").attrs["has_recipe"] = False
+
+            class _Store:      # the slice of GFHDFBackend add_recipe touches
+                name, filename = "global_fit", path
+
+                def open(self, mode="r"):
+                    return h5py.File(path, mode)
+
+                @property
+                def has_recipe(self):
+                    with h5py.File(path, "r") as f:
+                        return bool(f["global_fit"].attrs["has_recipe"])
+
+            def _runtime():
+                rec = Recipe()
+                for n in names:
+                    rec.add_recipe_component(None, name=n)
+                return rec
+            GFHDFBackend.add_recipe(_Store(), _runtime())
+            with h5py.File(path, "r") as f:
+                r = f["global_fit/recipe"]
+                order = sorted(r, key=lambda k: int(r[k].attrs["order num"]))
+            self.assertEqual(order, _STAGES_9MO)
+            again = _runtime()
+            GFHDFBackend.add_recipe(_Store(), again)                    # the relaunch
+            self.assertEqual([s["status"] for s in again.recipe], [False] * len(names))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_full_pe_declarations_are_todays(self):
         new, old = _stage(self.fits["9mo"], "full_pe"), _stage(self.fits["6mo"], "full_pe")
@@ -649,12 +893,35 @@ class DescribeRecipeTest(unittest.TestCase):
 
     def test_the_cycle_end_slot_is_shown_last_and_to_convergence(self):
         text = _R().describe_recipe(_build(_FULL, **_RECIPE_9MO))
-        block = text.split("stage 3/4 ")[1].split("stage 4/4 ")[0]
+        block = text.split("stage 4/5 ")[1].split("stage 5/5 ")[0]
+        self.assertEqual(block.split()[0], "gb_search_2")
         moves = [ln for ln in block.splitlines() if ln.startswith("      ")]
         self.assertIn("noise_cycle_end_search", moves[-1])
         self.assertIn("TO CONVERGENCE", moves[-1])
         self.assertIn("reset_valves=True", block)
         self.assertIn("every iteration", block.lower())
+
+    def test_the_source_seed_is_shown_after_the_seed_with_its_own_rule(self):
+        with env(MAXLOGL_TOL="20"):
+            text = _R().describe_recipe(_build(_FULL, **_RECIPE_9MO))
+        self.assertEqual(text.split("stage 1/5 ")[1].split()[0], "gb_search_seed")
+        block = text.split("stage 2/5 ")[1].split("stage 3/5 ")[0]
+        self.assertEqual(block.split()[0], "source_search")
+        stop = next(ln for ln in block.splitlines() if ln.startswith("  stop:"))
+        # the stage's OWN rule, resolved -- not the global MAXLOGL_TOL=20
+        for want in ("10 consecutive round(s)", "10 nats", "SOURCE_SEARCH_CHECKS=10",
+                     "SOURCE_SEARCH_TOL=10", "200 rounds", "SOURCE_SEARCH_MAX_ROUNDS=200",
+                     "laggard"):
+            self.assertIn(want, stop)
+        self.assertNotIn("MAXLOGL_TOL", stop)
+        noise = next(ln for ln in block.splitlines() if ln.startswith("  noise:"))
+        self.assertIn("FIXED", noise)
+        sources = next(ln for ln in block.splitlines() if ln.startswith("  sources:"))
+        self.assertIn("sobbh_pe/mbh_pe/emri_pe", sources)
+        moves = [ln for ln in block.splitlines() if ln.startswith("      ")]
+        self.assertEqual(len(moves), 1)
+        self.assertIn("source_joint_search", moves[0])
+        self.assertIn("within 10 nats", moves[0])
 
     def test_print_recipe_needs_no_mpi(self):
         out = io.StringIO()
