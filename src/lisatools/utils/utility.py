@@ -194,9 +194,9 @@ def tukey(N, alpha, xp=None):
 
     assert 0.0 < alpha < 1.0
     n = xp.arange(int(xp.ceil(N / 2.0)))
-    in_window_edge = n < alpha * N / 2
+    in_window_edge = n < alpha * (N-1) / 2
 
-    tmp = (in_window_edge) * 1.0 / 2.0 * (1.0 - xp.cos(2.0 * np.pi * n / (alpha * N))) + (
+    tmp = (in_window_edge) * 1.0 / 2.0 * (1.0 - xp.cos(2.0 * np.pi * n / (alpha * (N-1)))) + (
         ~in_window_edge
     ) * 1.0
     tukey_out = xp.zeros(N, dtype=float)
