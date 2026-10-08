@@ -5,7 +5,8 @@
 #include "Detector.hpp"
 #include "gbt_global.h"
 
-#define C_inv 3.3356409519815204e-09
+#include "lisaconstants_values.h"
+#define C_inv (1.0 / LISACONSTANTS_SPEED_OF_LIGHT)
 #define NUM_THREADS_RESPONSE 256
 #define NLINKS 6
 

@@ -13,7 +13,8 @@
 #define Orbits OrbitsCPU
 #endif
 
-#define Clight 299792458.
+#include "lisaconstants_values.h"
+#define Clight LISACONSTANTS_SPEED_OF_LIGHT
 
 class Vec {
  public:

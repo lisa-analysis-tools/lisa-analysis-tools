@@ -24,9 +24,11 @@ from .base import JaxAmpPhaseSource
 from lisatools.jax.orbits import OrbitsWrapJAX
 from .tdi_config import TDIConfigWrapJAX
 
-# Mirrors ``C_inv = 3.3356409519815204e-09`` in TDIonTheFly.cu (the
-# reciprocal of the speed of light in s/m).
-C_INV = 3.3356409519815204e-09
+from lisatools.utils.constants import C_SI as _C_SI
+
+# Mirrors ``C_inv`` in LISAResponse.hh (the reciprocal of the speed of light
+# in s/m, lisaconstants' SPEED_OF_LIGHT).
+C_INV = 1.0 / _C_SI
 
 
 # --------------------------------------------------------------------

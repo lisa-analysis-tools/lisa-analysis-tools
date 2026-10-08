@@ -17,7 +17,8 @@
 #define CUDA_SYNCTHREADS CUDA_SYNC_THREADS
 #endif
 
-#define Clight 299792458.
+#include "lisaconstants_values.h"
+#define Clight LISACONSTANTS_SPEED_OF_LIGHT
 
 #ifdef __CUDACC__
 

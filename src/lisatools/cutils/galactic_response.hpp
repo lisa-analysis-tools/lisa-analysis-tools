@@ -23,7 +23,8 @@
 
 #define SQRT3_GAL  1.7320508075688772935
 #define PI2_GAL    (M_PI / 2.0)
-#define OMEGA_LISA (2.0 * M_PI / 3.154e7)   // rad/s — matches galaxy_transfer.py
+#include "lisaconstants_values.h"
+#define OMEGA_LISA (2.0 * M_PI / LISACONSTANTS_ASTRONOMICAL_YEAR)   // rad/s (was 3.154e7 s, 2026-10-08)
 
 
 // ============================================================================

@@ -21,6 +21,8 @@ import dataclasses
 import os
 
 import numpy as np
+
+from ...utils.constants import YRSID_SI
 from scipy.interpolate import CubicSpline
 
 
@@ -1049,7 +1051,7 @@ class EMRIDirectWDM:
         saved = dict(self.few_gen.inspiral_kwargs)
         try:
             H = self.few_gen(m1, m2, a, p0, e0, x0, th, ph, dist=dist, Phi_phi0=Pp, Phi_theta0=Pt,
-                             Phi_r0=Pr, T=float(new_t[-1]) / 3.15581497635456e7, dt=self.wdm.data_dt,
+                             Phi_r0=Pr, T=float(new_t[-1]) / YRSID_SI, dt=self.wdm.data_dt,
                              return_sparse_holder=True, include_minus_mkn=True,
                              inspiral_kwargs={"upsample": True, "fix_t": True, "new_t": new_t}, **kw)
         finally:
@@ -1072,7 +1074,7 @@ class EMRIDirectWDM:
             kw.pop("mode_selection_threshold", None)
             kw["mode_selection"] = [tuple(int(v) for v in md) for md in mode_selection]
         span = self.wdm.Nt * self.wdm.layer_dt
-        T = (self.data_t0 - self.t_start + span + 2000.0) / 3.15581497635456e7
+        T = (self.data_t0 - self.t_start + span + 2000.0) / YRSID_SI
         saved = dict(self.few_gen.inspiral_kwargs)
         try:
             H = self.few_gen(m1, m2, a, p0, e0, x0, th, ph, dist=dist, Phi_phi0=Pp, Phi_theta0=Pt,

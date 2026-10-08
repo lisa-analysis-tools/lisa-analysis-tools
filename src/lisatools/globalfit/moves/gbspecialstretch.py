@@ -15477,7 +15477,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 cen = v.mean(axis=1) if v.ndim == 3 else v       # (N,3) center
                 N = t.shape[0]
                 idx = np.unique(np.linspace(0, N - 1, min(N, 240)).astype(int))
-                vc = self.xp.asarray(cen[idx] / 299792458.0)
+                from ...utils.constants import C_SI as _C_SI
+                vc = self.xp.asarray(cen[idx] / _C_SI)
                 tt = self.xp.asarray(t[idx] - float(t[idx][0]))
         except Exception as exc:
             logger.warning("%s: Doppler-jump orbit window unavailable (%s); "

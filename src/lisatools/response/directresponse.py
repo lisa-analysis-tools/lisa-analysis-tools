@@ -16,8 +16,7 @@ from lisatools.utils.utility import AET, asnumpy
 from ..utils.parallelbase import LISAToolsParallelModule
 from .tdiconfig import TDIConfig
 
-# TODO: need to update constants setup
-YRSID_SI = 31558149.763545603
+from ..utils.constants import YRSID_SI  # lisaconstants ASTRONOMICAL_YEAR
 
 
 def get_factorial(n):
@@ -33,7 +32,9 @@ from math import factorial
 
 factorials = np.array([factorial(i) for i in range(30)])
 
-C_inv = 3.3356409519815204e-09
+from ..utils.constants import C_SI as _C_SI
+
+C_inv = 1.0 / _C_SI  # 3.3356409519815204e-09, the C side's C_inv
 
 
 from astropy.coordinates import SkyCoord

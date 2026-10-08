@@ -205,7 +205,10 @@ class FittedHyperbolicTangentGalacticForeground(HyperbolicTangentGalacticForegro
     # Tobs should be in sec.
     day = 86400.0
     month = day * 30.5
-    year = 365.25 * 24.0 * 3600.0  # hard coded for initial fits
+    # the FIT's own year unit (Julian, 365.25 d), not a physical constant --
+    # deliberately not lisaconstants' ASTRONOMICAL_YEAR (the fit coefficients
+    # below were derived with it)
+    year = 365.25 * 24.0 * 3600.0
 
     Xobs = [
         1.0 * day,

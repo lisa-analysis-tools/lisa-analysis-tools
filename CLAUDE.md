@@ -52,6 +52,9 @@ rule — **full detail: [`docs/conventions.md`](docs/conventions.md).**
   than link against upstream's compiled archive; prefer POD `*View` structs
   as the cross-wheel interface; bump `LISATOOLS_HEADER_ABI_VERSION` on any
   struct-layout change.
+- **Physical constants come from `lisaconstants`** (pinned 2.0.2). Python imports it;
+  C/C++/CUDA includes the generated `lisaconstants_values.h`
+  (`python -m lisatools.utils.lisaconstants_header`); never hard-code a value.
 - **Tutorials live in LATW; branch policy.** LATW `main` must run on the
   latest pip releases (never dev-only APIs); LATW `dev` must run on the
   install.sh development stack — if you change a dev API in any stack

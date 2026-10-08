@@ -2176,10 +2176,10 @@ def make_gb_rj_birth_container(intrinsic_dist, A_lims, use_cupy: bool = False,
 
 
 # GR chirp constant: fdot_gr = _FDOT_K * Mc[Msun]^{5/3} * f[Hz]^{11/3}
-# (96/5) * pi^{8/3} * (G*MSUN/c^3)^{5/3}; matches gbgpu.utils.utility.get_fdot.
-_G_SI, _C_SI, _MSUN_SI = 6.674080e-11, 299792458.0, 1.988546954961461e30
-_FDOT_K = (96.0 / 5.0) * np.pi ** (8.0 / 3.0) * (
-    _G_SI * _MSUN_SI / _C_SI ** 3) ** (5.0 / 3.0)
+# (96/5) * pi^{8/3} * (GM_sun/c^3)^{5/3} with lisaconstants' GM_sun (2026-10-08;
+# was G * an old M_sun, 3.6e-5 off); matches gbgpu.utils.utility.get_fdot.
+from ..utils.constants import MTSUN_SI as _MTSUN_SI  # noqa: E402
+_FDOT_K = (96.0 / 5.0) * np.pi ** (8.0 / 3.0) * _MTSUN_SI ** (5.0 / 3.0)
 
 
 class RatioTightenedBirth:

@@ -504,6 +504,30 @@ doesn't fit, copy the `.cu` into the downstream build (with a comment pointing
 back to the canonical LAT/GBT source) and bump the ABI version whenever that
 canonical source changes.
 
+## Physical constants come from `lisaconstants` (LISA Analysis Tools–wide rule)
+
+Every physical constant (c, G, GM_sun, M_sun, pc, AU, the year, ...) comes from
+`lisaconstants`, pinned `==2.0.2` in LAT, GBGPU, BBHx and FEW (ruling
+2026-10-08: "update all the hard-coded places to use the lisaconstants import").
+
+- **Python:** import from `lisaconstants` or `lisatools.utils.constants` (which
+  imports it); never write the number out.
+- **C / C++ / CUDA:** include the generated `lisaconstants_values.h`
+  (`LISACONSTANTS_<NAME>` macros, plus the derived `MTSUN`, `MRSUN`,
+  `AU_LIGHT_TIME`, `GPC_LIGHT_TIME`), committed next to the sources that use it
+  in each repo (`LAT src/lisatools/cutils`, `GBGPU src/gbgpu/cutils`, `BBHx
+  src/bbhx/cutils`, `FEW src/few/cutils`). Regenerate all four with
+  `python -m lisatools.utils.lisaconstants_header PATH...` after a
+  `lisaconstants` bump. (`python -m lisaconstants cpp` is not used: its 2.0.2
+  output does not compile.) Repo-local names (`C_SI`, `MTSUN_SI`, `Clight`, ...)
+  stay, defined as these macros.
+- **Guards:** each repo's `tests/test_lisaconstants_values.py` checks its header
+  against the installed package; LAT's also fails on any old hard-coded literal
+  in the package source.
+- **Not lisaconstants:** the nominal arm length `2.5e9` m (lisaconstants has
+  none; production arms come from the orbit file) and fit-convention units such
+  as the Julian year in `stochastic.py`'s fitted-foreground coefficients.
+
 ## Tutorials: the LATW branch policy (LISA Analysis Tools–wide rule)
 
 Tutorials live in the **LATW** repo

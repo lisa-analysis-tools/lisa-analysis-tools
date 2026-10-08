@@ -111,8 +111,7 @@ __all__ = [
 try:                                        # pragma: no cover - import shape
     from gbgpu.utils.utility import MSUN_SI as _MSUN_SI, G_SI as _G_SI, C_SI as _C_SI
 except ImportError:                         # pragma: no cover
-    from lisaconstants import GM_SUN, c as _C_SI
-    _G_SI, _MSUN_SI = 6.674e-11, GM_SUN / 6.674e-11
+    from ..utils.constants import MSUN_SI as _MSUN_SI, G_SI as _G_SI, C_SI as _C_SI
 
 #: ``fdot_gr = FDOT_K * Mc[Msol]**(5/3) * f0[Hz]**(11/3)``. Absorbs the two
 #: duplicate definitions in ``sampling/fstat_proposal.py``.

@@ -109,8 +109,7 @@ from ..utils.stagetimer import TIMING, TIMERS, TIMER_COUNTS
 from ..utils.stagetimer import stage as _stage
 from .tdiconfig import TDIConfig
 
-# TODO: need to update constants setup
-YRSID_SI = 31558149.763545603
+from ..utils.constants import YRSID_SI  # lisaconstants ASTRONOMICAL_YEAR
 
 
 def get_factorial(n):
@@ -126,7 +125,9 @@ from math import factorial
 
 factorials = np.array([factorial(i) for i in range(30)])
 
-C_inv = 3.3356409519815204e-09
+from ..utils.constants import C_SI as _C_SI
+
+C_inv = 1.0 / _C_SI  # 3.3356409519815204e-09, the C side's C_inv
 
 
 class CubicSpline:
