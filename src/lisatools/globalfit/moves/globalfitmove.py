@@ -1087,10 +1087,16 @@ class MaxLogLCombineMove(GFCombineMove):
 
     def __init__(
         self, *args, num_checks: int = 5, max_iter: int = 0, tol: float = 5.0,
-        iters_per_step=None, **kwargs
+        iters_per_step=None, restart_each_propose: bool = False, **kwargs
     ):
         super().__init__(*args, **kwargs)
         self.num_checks = int(num_checks)
+        # True = EVERY propose runs the plateau rule from scratch (user ruling
+        # 2026-10-07, the cycle-end noise convergence of a search stage: "the
+        # galfor and psd sampling should be required to converge before moving
+        # on"). Default False keeps the chunked semantics below: bookkeeping
+        # persists across calls, so a plateaued instance takes one round.
+        self.restart_each_propose = bool(restart_each_propose)
         # Per-instance cap on inner iterations per propose() call. ``None``
         # defers to MAXLOGL_ITERS_PER_STEP (10). The joint noise move that
         # rides along inside gb_search never reaches a lasting plateau (the
@@ -1128,6 +1134,11 @@ class MaxLogLCombineMove(GFCombineMove):
         # instance keeps taking one inner iteration per call, so the noise
         # model keeps sampling underneath.
         # getattr: test harnesses build this move without __init__.
+        if getattr(self, "restart_each_propose", False):
+            # forget the previous call's verdict: converge on THIS residual
+            # (same effect as noise_ratchet.reset_maxlogl_search)
+            self.__dict__.pop("_ml_state", None)
+            self.maxlogl_plateau_done = False
         _cap = getattr(self, "iters_per_step", None)
         max_inner = (
             int(os.environ.get("MAXLOGL_ITERS_PER_STEP", "10"))

@@ -2311,6 +2311,66 @@ class SubmitScriptsDispatchTest(unittest.TestCase):
                 self.assertIn(_ntasks(script, 2), lines)
 
 
+#: THE 9MO / 1YR RECIPE (user ruling 2026-10-07): the two Tobs-independent
+#: entries BOTH generators (derive_1yr_v9_launcher.py, derive_9mo_v9_launcher.py)
+#: append to their tables, verbatim. The running 6mo store's recipe is fixed
+#: (GFHDFBackend.add_recipe refuses a dropped or reordered stage), so the recipe
+#: reaches the 1yr / 9mo launchers only here.
+_RECIPE_REPLACEMENTS = (
+    ("export GB_SEARCH_SEED_ITERS=5\n",
+     "# ---- THE 9MO / 1YR RECIPE (user ruling 2026-10-07) -------------------------\n"
+     "# gb_search_seed (3 iterations) -> gb_search_1 -> gb_search_2 -> full_pe. No\n"
+     "# gb_search_3, no replica_pe (STAGE_REPLICA_PE above), no galfor ratchet\n"
+     "# (GALFOR_RATCHET stays 0). The seed: the 6mo's, 3 iterations not 5, no\n"
+     "# source moves. gb_search_1: its table row (opt SNR 8, phase max, F-stat peak\n"
+     "# 8, prior removal only), noise FIXED, NO sobbh/mbh/emri moves. gb_search_2:\n"
+     "# its table row (opt SNR 5, no phase max, peak 6.25, prior births AND\n"
+     "# deaths), the valves reset at its fresh entry, the sources EVERY iteration,\n"
+     "# and ONE psd+galfor search to CONVERGENCE at the END of every cycle (\"only\n"
+     "# one noise/galfor proposal ... at the end of the cycle\"): the standalone\n"
+     "# noise stage's plateau rule (NOISE_SEARCH_CHECKS flat rounds per walker\n"
+     "# within MAXLOGL_TOL), afresh each cycle. Then full_pe, declared as today.\n"
+     "# The resolved recipe, no data / no MPI, under this script's exports:\n"
+     "#   python scripts/fstat_proposal/run_combined_staged.py --print-recipe\n"
+     "export GB_SEARCH_SEED_ITERS=3\n"
+     "export GB_SEARCH_STAGES=${GB_SEARCH_STAGES:-1,2}\n"
+     "export GB_SEARCH_1_SOURCE_EVERY=${GB_SEARCH_1_SOURCE_EVERY:-0}\n"
+     "export GB_SEARCH_2_SOURCE_EVERY=${GB_SEARCH_2_SOURCE_EVERY:-1}\n"
+     "export GB_SEARCH_2_NOISE_MODE=${GB_SEARCH_2_NOISE_MODE:-cycle_end}\n"
+     "export GB_SEARCH_2_RESET_VALVES=${GB_SEARCH_2_RESET_VALVES:-1}\n", 1),
+    ("export STAGE_REPLICA_PE=${STAGE_REPLICA_PE:-1}\n",
+     "export STAGE_REPLICA_PE=${STAGE_REPLICA_PE:-0}   # 9mo/1yr recipe (ruling 2026-10-07): \"No replica pe\" -- gb_search_2 hands over to full_pe\n", 1),
+)
+
+#: the recipe as the 1yr / 9mo launchers resolve it (and the 6mo's values)
+_RECIPE_EXPORTS = {
+    "GB_SEARCH_SEED_ITERS": ("3", "5"),
+    "GB_SEARCH_STAGES": ("1,2", None),
+    "GB_SEARCH_1_SOURCE_EVERY": ("0", None),
+    "GB_SEARCH_2_SOURCE_EVERY": ("1", None),
+    "GB_SEARCH_2_NOISE_MODE": ("cycle_end", None),
+    "GB_SEARCH_2_RESET_VALVES": ("1", None),
+    "STAGE_REPLICA_PE": ("0", "1"),
+}
+
+
+def _assert_the_recipe(test, exports, six, text):
+    """The 2026-10-07 recipe, resolved; the 6mo keeps today's; no ratchet; and
+    every new knob yields to the launch line (``${K:-v}``) except the seed
+    count, which keeps the 6mo line's hard form."""
+    for knob, (want, six_want) in _RECIPE_EXPORTS.items():
+        test.assertEqual(exports.get(knob), want, knob)
+        test.assertEqual(six.get(knob), six_want, knob)
+        if knob != "GB_SEARCH_SEED_ITERS":
+            test.assertRegex(text, rf"(?m)^export {knob}=\$\{{{knob}:-{want}\}}", knob)
+    test.assertEqual(exports["GALFOR_RATCHET"], "0")
+    test.assertEqual(exports["GB_SEARCH_SOURCE_EVERY"], six["GB_SEARCH_SOURCE_EVERY"])
+    for knob in exports:
+        if knob.startswith("GB_SEARCH_3_") or knob == "GB_SEARCH_SAMPLE_NOISE_ALL_STAGES":
+            # inherited from the 6mo and inert without stage 3 -- but never NEW
+            test.assertEqual(exports[knob], six.get(knob), knob)
+
+
 class OneYearV9TwinTest(unittest.TestCase):
     """``submit_gf_1yr_v9.sh`` IS ``submit_gf_6mo_v9_4gpu.sh`` at 12 months.
 
@@ -2322,6 +2382,9 @@ class OneYearV9TwinTest(unittest.TestCase):
     lands in one script and not the other, or any extra knob, fails here.
     The three waveform windows (MBH / EMRI / SOBBH, 2026-10-03) declared NO
     export-line changes at 1 yr beyond MBHB_IDS and the preflights' grid.
+    Since 2026-10-07 the table also carries the 9mo / 1yr RECIPE
+    (``_RECIPE_REPLACEMENTS``: seed x3 -> gb_search_1 -> gb_search_2 ->
+    full_pe), the one declared delta that is not a Tobs change.
     """
 
     # (6mo text, 1yr text, occurrences) -- the generator's table, verbatim
@@ -2352,7 +2415,7 @@ class OneYearV9TwinTest(unittest.TestCase):
          "GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/global_fit_output/gf_prod_6mo_v9_4gpu/gf_prod_6mo_testing.h5}", 1),
         ("GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-7776000}",
          "GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-15552000}   # the 6-month parent", 1),
-    )
+    ) + _RECIPE_REPLACEMENTS
 
     def setUp(self):
         self.six_text = open(SIX_MO_V9).read()
@@ -2427,7 +2490,7 @@ class OneYearV9TwinTest(unittest.TestCase):
             "GB_RJ_INMODEL_CHUNK", "BASE_FILE_NAME",
             "MBHB_IDS", "GF_SEED_STORE", "GB_WARM_START_SOURCE_STORE",
             "GB_WARM_START_SOURCE_TOBS", "GB_WARM_START_COMPONENTS",
-        }
+        } | set(_RECIPE_EXPORTS)          # the 2026-10-07 recipe (1YR-6)
         keys = (set(self.one) | set(self.six)) - {"_", "SHLVL", "PWD"}
         drift = {k: (self.six.get(k), self.one.get(k))
                  for k in sorted(keys - allowed)
@@ -2436,6 +2499,9 @@ class OneYearV9TwinTest(unittest.TestCase):
         # and every declared knob really differs (a stale allowlist hides drift)
         same = sorted(k for k in allowed if self.six.get(k) == self.one.get(k))
         self.assertEqual(same, [], f"declared deltas that do not differ: {same}")
+
+    def test_the_recipe_is_the_2026_10_07_ruling(self):
+        _assert_the_recipe(self, self.one, self.six, self.one_text)
 
     def test_the_name_carries_no_gpu_count(self):
         # user ruling 2026-10-03: "I do not want to add '_4gpu' because ... I may
@@ -2496,7 +2562,7 @@ class NineMonthV9TwinTest(unittest.TestCase):
          "GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/global_fit_output/gf_prod_6mo_v9_4gpu/gf_prod_6mo_testing.h5}", 1),
         ("GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-7776000}",
          "GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-15552000}   # the 6-month parent", 1),
-    )
+    ) + _RECIPE_REPLACEMENTS
 
     # the only exports that may resolve differently from the 1yr script
     TOBS_DRIVEN = {"TOBS_TARGET", "SIGHET_NT_LAYER", "BASE_FILE_NAME",
@@ -2598,6 +2664,11 @@ class NineMonthV9TwinTest(unittest.TestCase):
         self.assertEqual(drift, {}, f"undeclared 1yr -> 9mo drift: {drift}")
         same = sorted(k for k in self.TOBS_DRIVEN if self.one.get(k) == self.nine.get(k))
         self.assertEqual(same, [], f"declared deltas that do not differ: {same}")
+
+    def test_the_recipe_is_the_2026_10_07_ruling(self):
+        # the SAME recipe as the 1yr (the export-level 1yr identity above
+        # already holds it; this names it)
+        _assert_the_recipe(self, self.nine, self.six, self.nine_text)
 
     def test_the_name_carries_no_gpu_count(self):
         self.assertEqual(os.path.basename(NINE_MO_V9), "submit_gf_9mo_v9.sh")

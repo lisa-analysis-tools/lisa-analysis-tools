@@ -1434,6 +1434,33 @@ def reset_band_logl_max(state, branch: str = "gb") -> int:
     return int(arr.size)
 
 
+def revive_band_shutoff_on_state(state, branch: str = "gb") -> int:
+    """Revive the per-band BARREN valve's persisted record on the state.
+
+    The state-side twin of ``GBSpecialBase._band_shutoff_revive`` (same
+    effect on the same fields: shut set cleared, streaks 0, previous
+    occupancy -1, iterations-since-revive 0; the F-stat epoch is untouched),
+    for ``reset_valves`` at a fresh stage entry: a process that has not yet
+    adopted the record adopts it from ``band_info`` at its first propose, and
+    would otherwise re-install the previous stage's shut set. Returns how many
+    bands were off; 0 when the state carries no record.
+    """
+    try:
+        bi = state.sub_states[branch].band_info
+    except (AttributeError, KeyError, TypeError):
+        return 0
+    if not isinstance(bi, dict) or bi.get("band_rj_shutoff") is None:
+        return 0
+    shut = np.asarray(bi["band_rj_shutoff"])
+    n = int(np.count_nonzero(shut))
+    bi["band_rj_shutoff"] = np.zeros(shut.shape, dtype=bool)
+    for key, fill in (("band_occ_streak", 0), ("band_occ_last", -1),
+                      ("band_shutoff_since_revive", 0)):
+        if bi.get(key) is not None:
+            bi[key] = np.full(np.shape(bi[key]), fill, dtype=np.int64)
+    return n
+
+
 def release_band_shutoff_window(state, serial, branch: str = "gb"):
     """Release the level-3 valve ON THE STATE at recipe-step entry.
 
@@ -1826,6 +1853,9 @@ class SearchStageProfileStep(RJRecipeStep):
         profile: ``{"phase_maximize": bool|None, "opt_snr": float|None,
             "peak_min_snr": float|None}``. ``None`` for a key means "leave
             it alone", which is how a stage opts out of owning a knob.
+            Entry-time keys: ``reset_band_max`` (every entry),
+            ``prior_births`` (move-scoped), ``reset_valves`` (fresh entry
+            only; :meth:`_reset_valves_at_entry`).
         stage_name: label for the log lines.
     """
 
@@ -1839,7 +1869,7 @@ class SearchStageProfileStep(RJRecipeStep):
         self.profile = dict(profile or {})
         _unknown = sorted(set(self.profile) - {
             "phase_maximize", "opt_snr", "peak_min_snr", "reset_band_max",
-            "prior_births"})
+            "prior_births", "reset_valves"})
         if _unknown:
             raise ValueError(
                 f"SearchStageProfileStep({stage_name!r}): unknown profile "
@@ -1958,8 +1988,76 @@ class SearchStageProfileStep(RJRecipeStep):
                 "the shutoff valve re-learns each (walker, band)'s best cold lnL "
                 "under this stage's noise instead of the stored value.",
                 self.stage_name or "gb_search", _n)
+        if self.profile.get("reset_valves"):
+            self._reset_valves_at_entry()
         self._legs_enter()
         self._ratchet_enter()
+
+    def _fresh_stage_entry(self) -> bool:
+        """True when this stage has stored no row of its own yet.
+
+        Rows on the store vs the stage's start: the start stamp
+        ``completed_recipe_step`` writes at the boundary (independent of
+        GF_PERSIST_STAGE_START), else ``_stage_start_iter``. A stamp past the
+        live rows (a rewound store) is ignored. Unreadable = fresh: resetting
+        a valve costs a few iterations, keeping a stale one can cost sources.
+        """
+        be = getattr(self, "_ratchet_backend", None)
+        try:
+            rows = int(getattr(be, "iteration"))
+        except Exception:  # noqa: BLE001 -- no store to read: treat as fresh
+            return True
+        origin = None
+        fn = getattr(be, "stage_start_iteration", None)
+        if callable(fn) and self.stage_name:
+            try:
+                origin = fn(self.stage_name)
+            except Exception:  # noqa: BLE001 -- a stamp, never fatal
+                origin = None
+        if origin is None or int(origin) > rows:
+            origin = int(getattr(self, "_stage_start_iter", rows))
+        return rows <= int(origin)
+
+    def _reset_valves_at_entry(self) -> None:
+        """``reset_valves`` (user ruling 2026-10-07, the 9mo / 1yr gb_search_2:
+        "GB search 2 with valves reset"), at a FRESH stage entry only.
+
+        * the per-(walker, band) valve's cold-lnL max -> -inf (as
+          ``reset_band_max``); its shut set and window are released by the
+          step-serial rule above anyway;
+        * the per-band BARREN valve: the moves' own
+          ``_band_shutoff_revive`` (the in-memory set of a move that already
+          adopted it this process) AND the persisted ``band_info`` record (what
+          a fresh process adopts at its first propose) -- both, or the other
+          copy re-installs the stale set.
+
+        A RESUME inside the stage resets nothing: the stage ends on these
+        valves, and restarting their clocks on every relaunch could hold it
+        open indefinitely.
+        """
+        tag = self.stage_name or "gb_search"
+        if not self._fresh_stage_entry():
+            logger.info(
+                "[V9-STAGE %s] reset_valves: a RESUME inside the stage (it already "
+                "has rows of its own) -- the valves were reset at the stage's "
+                "entry; nothing is reset now.", tag)
+            return
+        state = getattr(self, "_ratchet_last_sample", None)
+        n_max = reset_band_logl_max(state)
+        n_moves, n_mem, seen = 0, 0, set()
+        for m in gb_moves_in_tree(self.moves):
+            fn = getattr(m, "_band_shutoff_revive", None)
+            if id(m) in seen or not callable(fn):
+                continue
+            seen.add(id(m))
+            n_mem += int(fn(f"{tag} entry: reset_valves") or 0)
+            n_moves += 1
+        n_store = revive_band_shutoff_on_state(state)
+        logger.info(
+            "[V9-STAGE %s] reset_valves at the stage's FRESH entry: "
+            "band_cold_logl_max_w -> -inf (%d entries); barren-band valve revived "
+            "on %d GB move(s) (%d band(s) were off in memory) and in the stored "
+            "record (%d band(s) were off).", tag, n_max, n_moves, n_mem, n_store)
 
     # ---- search legs --------------------------------------------------------
 

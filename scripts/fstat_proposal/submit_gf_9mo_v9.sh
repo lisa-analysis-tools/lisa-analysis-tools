@@ -42,6 +42,19 @@
 #          GB_WARM_START_SOURCE_TOBS 15552000, refereed npz
 #          gf_prod_6mo_v9_4gpu_refereed.npz -- auto-built from the parent
 #          store on the first launch when missing).
+#   9MO-6. THE RECIPE (user ruling 2026-10-07, the SAME as the 1yr's 1YR-6;
+#          not a Tobs change -- the running 6mo store's recipe is fixed, so
+#          it lands in the 9mo/1yr only): gb_search_seed x3 -> gb_search_1 ->
+#          gb_search_2 -> full_pe. GB_SEARCH_SEED_ITERS 5 -> 3;
+#          GB_SEARCH_STAGES=1,2 (no gb_search_3); GB_SEARCH_1_SOURCE_EVERY=0
+#          (no sobbh/mbh/emri moves in gb_search_1); GB_SEARCH_2_SOURCE_EVERY=1
+#          (every iteration); GB_SEARCH_2_NOISE_MODE=cycle_end (ONE psd+galfor
+#          search to convergence at the END of each gb_search_2 cycle);
+#          GB_SEARCH_2_RESET_VALVES=1 (fresh entry: per-(walker, band) lnL max
+#          re-learned + per-band barren valve revived); STAGE_REPLICA_PE 1 -> 0
+#          ("No replica pe"). GALFOR_RATCHET stays 0 ("no ratcheting").
+#          full_pe's declarations unchanged. `run_combined_staged.py
+#          --print-recipe` under these exports prints the resolved recipe.
 #
 # EVERYTHING ELSE = the 1yr script = the 6mo script (NineMonthV9TwinTest
 # diffs the resolved exports against submit_gf_1yr_v9.sh: only TOBS_TARGET,
@@ -3680,7 +3693,7 @@ export GB_SEARCH_LEGS=${GB_SEARCH_LEGS:-1}
 # stored rows (a least-squares line, not a range). STAGE_REPLICA_PE=0 restores
 # the direct gb_search_3 -> full_pe handover.
 export GALFOR_RATCHET_END_STAGE_ON_STOP=${GALFOR_RATCHET_END_STAGE_ON_STOP:-1}
-export STAGE_REPLICA_PE=${STAGE_REPLICA_PE:-1}
+export STAGE_REPLICA_PE=${STAGE_REPLICA_PE:-0}   # 9mo/1yr recipe (ruling 2026-10-07): "No replica pe" -- gb_search_2 hands over to full_pe
 export REPLICA_PE_WINDOW=${REPLICA_PE_WINDOW:-10}
 export REPLICA_PE_LEAF_TOL=${REPLICA_PE_LEAF_TOL:-10}
 export REPLICA_PE_LNL_TOL=${REPLICA_PE_LNL_TOL:-100}
@@ -4631,7 +4644,26 @@ export STAGE_V9_SEARCH=1
 # pay off. Stages 1-3 keep it.
 #
 # 0 disables the stage entirely, restoring the pre-2026-09-26 recipe.
-export GB_SEARCH_SEED_ITERS=5
+# ---- THE 9MO / 1YR RECIPE (user ruling 2026-10-07) -------------------------
+# gb_search_seed (3 iterations) -> gb_search_1 -> gb_search_2 -> full_pe. No
+# gb_search_3, no replica_pe (STAGE_REPLICA_PE above), no galfor ratchet
+# (GALFOR_RATCHET stays 0). The seed: the 6mo's, 3 iterations not 5, no
+# source moves. gb_search_1: its table row (opt SNR 8, phase max, F-stat peak
+# 8, prior removal only), noise FIXED, NO sobbh/mbh/emri moves. gb_search_2:
+# its table row (opt SNR 5, no phase max, peak 6.25, prior births AND
+# deaths), the valves reset at its fresh entry, the sources EVERY iteration,
+# and ONE psd+galfor search to CONVERGENCE at the END of every cycle ("only
+# one noise/galfor proposal ... at the end of the cycle"): the standalone
+# noise stage's plateau rule (NOISE_SEARCH_CHECKS flat rounds per walker
+# within MAXLOGL_TOL), afresh each cycle. Then full_pe, declared as today.
+# The resolved recipe, no data / no MPI, under this script's exports:
+#   python scripts/fstat_proposal/run_combined_staged.py --print-recipe
+export GB_SEARCH_SEED_ITERS=3
+export GB_SEARCH_STAGES=${GB_SEARCH_STAGES:-1,2}
+export GB_SEARCH_1_SOURCE_EVERY=${GB_SEARCH_1_SOURCE_EVERY:-0}
+export GB_SEARCH_2_SOURCE_EVERY=${GB_SEARCH_2_SOURCE_EVERY:-1}
+export GB_SEARCH_2_NOISE_MODE=${GB_SEARCH_2_NOISE_MODE:-cycle_end}
+export GB_SEARCH_2_RESET_VALVES=${GB_SEARCH_2_RESET_VALVES:-1}
 export GB_SEARCH_3_WARM_EVERY=5
 
 # ---- MID-ITERATION CHECKPOINTS (user ask 2026-09-24: "make sure there are

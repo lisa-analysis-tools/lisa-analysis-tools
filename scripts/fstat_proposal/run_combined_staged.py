@@ -138,6 +138,27 @@ Key env knobs
                          foreground adjust as the GB model fills in. Default
                          OFF -- the 6mo v9 run keeps noise FIXED in
                          gb_search_1/2 (2026-09-26, the 3mo v9 run)
+    PER-STAGE RECIPE KNOBS (user ruling 2026-10-07, the 9mo / 1yr recipe:
+    seed x3 -> gb_search_1 -> gb_search_2 -> full_pe). Unset = today:
+    GB_SEARCH_STAGES     numbered search stages composed, ascending comma
+                         list (default 1,2,3); the kept ones keep their names
+    GB_SEARCH_{N}_SOURCE_EVERY  sobbh/mbh/emri cadence in stage N: 0 = no
+                         source moves there (vgb + warm start stay), 1 =
+                         every iteration; unset = GB_SEARCH_SOURCE_EVERY
+    GB_SEARCH_{N}_NOISE_MODE  fixed | interleaved | cycle_end. interleaved =
+                         the leading rider + 4 noise slots (the table's stage
+                         3); cycle_end = ONE psd+galfor max-lnL search run TO
+                         CONVERGENCE at the END of every cycle (plateau rule
+                         NOISE_SEARCH_CHECKS / MAXLOGL_TOL / MAXLOGL_PER_WALKER,
+                         afresh each cycle, at most GB_SEARCH_{N}_NOISE_MAX_ROUNDS
+                         rounds, default 5000)
+    GB_SEARCH_{N}_RESET_VALVES=1  at a FRESH stage entry (not a resume): the
+                         per-(walker, band) cold-lnL max re-learned AND the
+                         per-band barren valve revived (the per-walker window
+                         is released at every new step anyway)
+    --print-recipe / GF_PRINT_RECIPE=1  print the resolved recipe (stages,
+                         stop rules, profiles, noise, source cadence, moves)
+                         and exit: no data, no MPI
     STAGE_NOISE_PSD_ONLY=1  the STANDALONE noise stage samples psd ALONE;
                          galfor stays frozen at GALFOR_START_PARAMS (which it
                          REFUSES to run without) until gb_search_3 releases
@@ -377,7 +398,7 @@ class JointMaxLogLSearch(Move):
     """
 
     def __init__(self, name, inner_names, iters_per_step=None,
-                 num_checks=None, **kwargs):
+                 num_checks=None, restart_each_propose=False, **kwargs):
         super().__init__(name, **kwargs)
         self.inner_names = list(inner_names)
         # Per-propose inner-iteration cap and plateau length handed to
@@ -386,6 +407,10 @@ class JointMaxLogLSearch(Move):
         # rider overrides both (2026-09-11).
         self.iters_per_step = iters_per_step
         self.num_checks = num_checks
+        # True = every propose runs the plateau rule AFRESH (the cycle-end
+        # noise convergence, GB_SEARCH_{N}_NOISE_MODE=cycle_end): without it a
+        # plateaued instance takes one round per call, the rider behaviour.
+        self.restart_each_propose = bool(restart_each_propose)
 
     def stock_dependencies(self):
         """The stock moves this wraps -- without this they are never BUILT.
@@ -407,6 +432,9 @@ class JointMaxLogLSearch(Move):
                 f"{self.name}: no stock move(s) {missing} (available: "
                 f"{sorted(ctx.stock_moves)})."
             )
+        # only passed when set, so every other instance is built exactly as before
+        _restart = ({"restart_each_propose": True}
+                    if getattr(self, "restart_each_propose", False) else {})
         mv = MaxLogLCombineMove(
             [ctx.stock_moves[n] for n in self.inner_names],
             num_checks=(
@@ -415,6 +443,7 @@ class JointMaxLogLSearch(Move):
             ),
             share_temperature_control=False,
             iters_per_step=self.iters_per_step,
+            **_restart,
         )
         mv.gf_move_name = self.name
         return mv
@@ -683,6 +712,144 @@ _SEARCH_STAGE_PRIOR_BIRTHS_KNOBS = {
     "gb_search_3": "GB_SEARCH_3_PRIOR_BIRTHS",
 }
 
+# ---- PER-STAGE RECIPE KNOBS (user ruling 2026-10-07, the 9mo / 1yr recipe) --
+# "I want to start with 3 iterations of gb search seed ... Then I want to have
+# gb search 1 as is currently but with no other source moves ... Then GB search
+# 2 with valves reset ... Gb search 2 should include the other sources every
+# iteration. And it should allow the PSD and galfor to vary ... After GB search
+# 2 will be full pe. No replica pe and no ratcheting." Refined the same day:
+# "during gb search 2 the galfor and psd sampling should be required to
+# converge before moving on to the other proposals. There should only be one
+# noise/galfor proposal though ... at the end of the cycle."
+#
+# Every knob below unset = today's composition, byte-identical: the running 6mo
+# store's recipe is fixed (GFHDFBackend.add_recipe refuses a dropped or
+# reordered stage), so the new recipe reaches the 1yr / 9mo launchers only
+# through their derive tables.
+
+#: ``GB_SEARCH_{N}_NOISE_MODE`` values. ``interleaved`` = the table's sampled
+#: composition (leading psd+galfor+vgb rider + the four noise slots, or the
+#: galfor ratchet gate under GALFOR_RATCHET=1); ``cycle_end`` = ONE psd+galfor
+#: max-lnL search to convergence at the END of the cycle.
+SEARCH_NOISE_MODES = ("fixed", "interleaved", "cycle_end")
+
+#: The cycle-end convergence's round ceiling per propose (``GB_SEARCH_{N}_
+#: NOISE_MAX_ROUNDS``). A safety cap, never the stop: the plateau rule ends it.
+#: The ratchet release's ceiling, same ruling ("we do not want it to hit that").
+_CYCLE_END_MAX_ROUNDS = 5000
+
+
+def _stage_knob(name: str, suffix: str):
+    """``GB_SEARCH_{N}_{suffix}`` for a numbered search stage, else None."""
+    head, _, num = name.rpartition("_")
+    if head != "gb_search" or not num.isdigit():
+        return None
+    return f"GB_SEARCH_{num}_{suffix}"
+
+
+def _env_bool(knob: str):
+    """1/0-style env bool; None when unset or empty; raises on anything else."""
+    raw = os.environ.get(knob)
+    if raw is None or raw.strip() == "":
+        return None
+    v = raw.strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{knob}={raw!r} must be 1/0.")
+
+
+def _search_stage_numbers():
+    """``GB_SEARCH_STAGES`` -> the numbered stages to compose (None = all).
+
+    An ascending comma list of table numbers; refused rather than reordered or
+    deduplicated, because a stage list that silently differs from the one typed
+    is the failure this whole file guards against.
+    """
+    raw = os.environ.get("GB_SEARCH_STAGES", "").strip()
+    if not raw:
+        return None
+    table = [int(n.rpartition("_")[2]) for n, _, _ in V9_SEARCH_STAGE_PROFILES]
+    try:
+        want = [int(p) for p in raw.split(",")]
+    except ValueError:
+        raise ValueError(f"GB_SEARCH_STAGES={raw!r} must be a comma list of "
+                         f"stage numbers from {table}.") from None
+    if (not want or any(w not in table for w in want)
+            or want != sorted(set(want))):
+        raise ValueError(
+            f"GB_SEARCH_STAGES={raw!r} must be an ASCENDING list of distinct "
+            f"stage numbers from {table} (e.g. 1,2).")
+    return tuple(want)
+
+
+def search_stage_noise_mode(name: str, table_sampled: bool) -> str:
+    """The noise composition of one numbered search stage.
+
+    ``GB_SEARCH_{N}_NOISE_MODE`` wins; unset = the table (``interleaved`` for a
+    sampled row or under GB_SEARCH_SAMPLE_NOISE_ALL_STAGES=1, else ``fixed``).
+    """
+    knob = _stage_knob(name, "NOISE_MODE")
+    raw = (os.environ.get(knob) or "").strip().lower() if knob else ""
+    if not raw:
+        return ("interleaved"
+                if (table_sampled or _env_flag("GB_SEARCH_SAMPLE_NOISE_ALL_STAGES"))
+                else "fixed")
+    if raw not in SEARCH_NOISE_MODES:
+        raise ValueError(f"{knob}={raw!r} must be one of {SEARCH_NOISE_MODES}.")
+    return raw
+
+
+def search_stage_source_every(name: str):
+    """``GB_SEARCH_{N}_SOURCE_EVERY``: the stage's sobbh/mbh/emri cadence.
+
+    None = unset (the global GB_SEARCH_SOURCE_EVERY); 0 = no source moves in
+    the stage; N >= 1 = every Nth iteration of the stage (1 = every one).
+    """
+    knob = _stage_knob(name, "SOURCE_EVERY")
+    raw = (os.environ.get(knob) or "").strip() if knob else ""
+    if not raw:
+        return None
+    try:
+        n = int(raw)
+    except ValueError:
+        raise ValueError(f"{knob}={raw!r} must be an integer >= 0.") from None
+    if n < 0:
+        raise ValueError(f"{knob}={n} must be >= 0 (0 = no source moves).")
+    return n
+
+
+def search_stage_noise_max_rounds(name: str) -> int:
+    """``GB_SEARCH_{N}_NOISE_MAX_ROUNDS``: the cycle-end convergence's ceiling."""
+    knob = _stage_knob(name, "NOISE_MAX_ROUNDS")
+    raw = (os.environ.get(knob) or "").strip() if knob else ""
+    if not raw:
+        return _CYCLE_END_MAX_ROUNDS
+    try:
+        n = int(raw)
+    except ValueError:
+        raise ValueError(f"{knob}={raw!r} must be an integer >= 1.") from None
+    if n < 1:
+        raise ValueError(f"{knob}={n} must be >= 1.")
+    return n
+
+
+def _seed_profile(profiles):
+    """gb_search_seed's profile = gb_search_1's, verbatim (ruling 2026-09-26).
+
+    Looked up by NAME: with GB_SEARCH_STAGES dropping stage 1 the first row is
+    another stage's, and seeding under gb_search_2's floors would be a silent
+    change of the seed stage. Refused instead.
+    """
+    for n, p, _ in profiles:
+        if n == "gb_search_1":
+            return dict(p)
+    raise ValueError(
+        "gb_search_seed takes gb_search_1's profile, but GB_SEARCH_STAGES="
+        f"{os.environ.get('GB_SEARCH_STAGES')!r} drops stage 1. Keep 1 in the "
+        "list or export GB_SEARCH_SEED_ITERS=0.")
+
 
 def search_stage_profiles():
     """:data:`V9_SEARCH_STAGE_PROFILES` with the env overrides applied.
@@ -699,9 +866,25 @@ def search_stage_profiles():
     boundary: ``opt_snr_rej_samp_limit = 0`` is a legal "off" elsewhere
     in the tree, so a fat-fingered 0 here would read as a deliberate
     choice and silently admit every birth.
+
+    Also resolved here, for the same two-call-site reason (2026-10-07):
+    ``GB_SEARCH_STAGES`` (which rows compose; the third element stays the
+    TABLE's sampled flag, which keys the stage-3 warm cadence) and
+    ``GB_SEARCH_{N}_RESET_VALVES`` (the ``reset_valves`` profile key).
     """
+    keep = _search_stage_numbers()
+    if keep is not None:
+        _dropped = [n for n, _, _ in V9_SEARCH_STAGE_PROFILES
+                    if int(n.rpartition("_")[2]) not in keep]
+        _inert = sorted(k for k in os.environ
+                        for n in _dropped if k.startswith(_stage_knob(n, "")))
+        print(f"[V9-STAGE] GB_SEARCH_STAGES={','.join(map(str, keep))}: "
+              f"{_dropped} NOT composed" + (f"; their knobs {_inert} are inert"
+                                            if _inert else ""), flush=True)
     out = []
     for name, prof, sampled in V9_SEARCH_STAGE_PROFILES:
+        if keep is not None and int(name.rpartition("_")[2]) not in keep:
+            continue
         knob = _SEARCH_STAGE_OPT_SNR_KNOBS.get(name)
         raw = os.environ.get(knob) if knob else None
         if raw is not None and raw.strip() != "":
@@ -736,6 +919,15 @@ def search_stage_profiles():
                 print(f"[V9-STAGE {name}] profile prior_births={pb} from {pknob} "
                       f"(table default {prof.get('prior_births')})", flush=True)
             prof = dict(prof, prior_births=pb)
+        # reset_valves (2026-10-07): written only when ON, so every other
+        # profile dict stays byte-identical; applied by SearchStageProfileStep
+        # at a FRESH stage entry (never on a resume inside the stage).
+        vknob = _stage_knob(name, "RESET_VALVES")
+        if _env_bool(vknob):
+            print(f"[V9-STAGE {name}] profile reset_valves=True from {vknob}: "
+                  f"at the stage's fresh entry the per-(walker, band) cold-lnL max "
+                  f"is re-learned and the per-band barren valve revived", flush=True)
+            prof = dict(prof, reset_valves=True)
         out.append((name, prof, sampled))
     return tuple(out)
 
@@ -1148,6 +1340,17 @@ def build_fit():
             # Resolved ONCE per assembly so the override logs once and
             # the seed row and the loop cannot disagree.
             _profiles = search_stage_profiles()
+            # No psd/galfor branch here: a per-stage noise mode that asks for
+            # noise sampling would reach nothing, so refuse it (the table's
+            # stage-3 default, like GB_SEARCH_SAMPLE_NOISE_ALL_STAGES, is
+            # simply moot under GB_ONLY, as before).
+            for _name, _p, _s in _profiles:
+                _k = _stage_knob(_name, "NOISE_MODE")
+                if (os.environ.get(_k) or "").strip() and \
+                        search_stage_noise_mode(_name, _s) != "fixed":
+                    raise ValueError(
+                        f"{_k}={os.environ[_k]!r} under GB_ONLY=1: the gb-only "
+                        "composition has no psd/galfor branch to sample.")
             _gb_only_stages = []
             # gb_search_seed leads here TOO. There are two v9 stage
             # assemblies in this file -- this GB_ONLY one and the full
@@ -1156,7 +1359,7 @@ def build_fit():
             # has produced several defects in this run. Same profile
             # (gb_search_1's), same fixed length, same disarmed valve.
             if _seed_iters() > 0:
-                _sp = dict(_profiles[0][1])
+                _sp = _seed_profile(_profiles)
                 _seed_warm = ([Move("rj_warm_search", branch="gb")]
                               if warm() else [])
                 _gb_only_stages.append(Stage(
@@ -1446,13 +1649,15 @@ def build_fit():
     #: 09-15 behaviour (mbh/emri only) is one edit away.
     _GB_SEARCH_CADENCED = ("sobbh", "mbh", "emri")
 
-    def source_pe(gb_search_cadence=False):
+    def source_pe(gb_search_cadence=False, every=None):
         # Fresh Move descriptors per stage (never share one instance):
         # the armed source PE moves, sobbh -> mbh -> emri (banking order).
-        # ``gb_search_cadence`` puts them on the 1-in-N schedule.
+        # ``gb_search_cadence`` puts them on the 1-in-N schedule; ``every``
+        # (a stage's GB_SEARCH_{N}_SOURCE_EVERY >= 1) replaces the global N.
         def _every(br):
-            return (_gb_search_src_every
-                    if gb_search_cadence and br in _GB_SEARCH_CADENCED else 1)
+            if not (gb_search_cadence and br in _GB_SEARCH_CADENCED):
+                return 1
+            return _gb_search_src_every if every is None else int(every)
         return [Move(f"{br}_pe", branch=br, every=_every(br))
                 for br, _env, _cls in _SOURCE_BRANCH_ENVS
                 if br in armed_sources]
@@ -1520,8 +1725,10 @@ def build_fit():
             "noise model is PINNED at a previous run's estimate "
             "(PSD_START_PARAMS"
             + (" + GALFOR_START_PARAMS" if _has_galfor else "")
-            + "). Stages gb_search_1/2 hold it there; gb_search_3 releases "
-              "it. Export STAGE_FORCE_NOISE_SEARCH=1 to run them anyway.",
+            + "). Search stages without noise moves hold it there; the first "
+              "noise-sampling stage releases it (gb_search_3 by default; "
+              "GB_SEARCH_{N}_NOISE_MODE). Export STAGE_FORCE_NOISE_SEARCH=1 to "
+              "run them anyway.",
             flush=True,
         )
     elif _has_psd and not _env_flag("STAGE_SKIP_NOISE"):
@@ -1682,9 +1889,10 @@ def build_fit():
         return ([Move(slot, branch="gb")]
                 if _env_flag("GB_SEARCH_IN_MODEL") else [])
 
-    def _search_stage(name, *, sample_noise, phase_maximize, opt_snr,
+    def _search_stage(name, *, noise_mode, phase_maximize, opt_snr,
                       peak_min_snr, reset_band_max=False, warm_every=1,
-                      seed_only=False, prior_births=None):
+                      seed_only=False, prior_births=None, reset_valves=False,
+                      source_every=None, noise_max_rounds=_CYCLE_END_MAX_ROUNDS):
         # the stage profile as the step sees it; reset_band_max is only
         # written when set so the other stages' dicts stay byte-identical
         _profile = dict(phase_maximize=phase_maximize, opt_snr=opt_snr,
@@ -1694,6 +1902,31 @@ def build_fit():
         if prior_births is not None:
             # move-scoped: what the shared rj_prior_removal proposes HERE
             _profile["prior_births"] = bool(prior_births)
+        if reset_valves:
+            # GB_SEARCH_{N}_RESET_VALVES (2026-10-07): applied by the step at
+            # a FRESH stage entry; written only when set (byte-identical else)
+            _profile["reset_valves"] = True
+        if noise_mode not in SEARCH_NOISE_MODES:
+            raise ValueError(f"{name}: noise_mode={noise_mode!r} is not one of "
+                             f"{SEARCH_NOISE_MODES}.")
+        if noise_mode != "fixed" and not (_has_psd or _has_galfor):
+            raise ValueError(
+                f"{name}: noise mode {noise_mode!r} but neither a psd nor a galfor "
+                "branch is present (REMOVE_BRANCHES?) -- there is no noise to sample.")
+        # "interleaved" is the table's sampled composition (the rider + four
+        # slots, or the ratchet gate); everything keyed on ``sample_noise``
+        # below is exactly that path. "cycle_end" builds its ONE slot after
+        # the source moves (see _noise_end below) and is otherwise "fixed".
+        sample_noise = noise_mode == "interleaved"
+        if noise_mode == "cycle_end":
+            from lisatools.globalfit.noise_ratchet import ratchet_from_env as _rfe
+
+            if _rfe() is not None:
+                raise ValueError(
+                    f"{name}: GALFOR_RATCHET=1 with the cycle-end noise convergence "
+                    f"({_stage_knob(name, 'NOISE_MODE')}=cycle_end): two different "
+                    "noise designs for one stage. The ruled 9mo/1yr recipe has no "
+                    "ratchet; drop one of the two.")
         # SAMPLED noise: the legacy gb_search composition verbatim -- the
         # leading joint psd+galfor+vgb search plus the two extra re-tracking
         # rounds that bracket the F-stat birth move, so the grid is always
@@ -1857,6 +2090,40 @@ def build_fit():
         # one of these lists is empty there.
         _noise_rep = _noise_slot("noise_joint_search_3") if _slots else []
         _noise_rem = _noise_slot("noise_joint_search_4") if _slots else []
+        # ---- THE CYCLE-END NOISE CONVERGENCE (user ruling 2026-10-07) -------
+        # GB_SEARCH_{N}_NOISE_MODE=cycle_end: "during gb search 2 the galfor and
+        # psd sampling should be required to converge before moving on to the
+        # other proposals. There should only be one noise/galfor proposal
+        # though. Not multiple times during the cycle. Just have the galfor/psd
+        # convergence proposal at the end of the cycle." ONE psd+galfor joint
+        # max-lnL search, LAST in the cycle (after the source moves), run TO
+        # CONVERGENCE on every cycle: the standalone noise stage's plateau rule
+        # (NOISE_SEARCH_CHECKS flat rounds per walker within MAXLOGL_TOL,
+        # MAXLOGL_PER_WALKER), started afresh each propose
+        # (restart_each_propose -- a plateaued instance would otherwise take one
+        # round per call, the rider behaviour), with a round CEILING that is a
+        # safety cap only. vgb_pe keeps leading the cycle as in a fixed-noise
+        # stage: the VGBs are 55 known sources, not noise. Under search legs the
+        # tail belongs to the last leg, so the row saved after the cycle holds
+        # the converged noise.
+        _noise_end = []
+        if noise_mode == "cycle_end":
+            _noise_end = [JointMaxLogLSearch(
+                "noise_cycle_end_search", list(_noise_names), branch="psd",
+                num_checks=int(os.environ.get("NOISE_SEARCH_CHECKS", "5")),
+                iters_per_step=int(noise_max_rounds),
+                restart_each_propose=True)]
+            print(f"[combined] {name}: noise sampled by ONE {'+'.join(_noise_names)} "
+                  f"search TO CONVERGENCE at the END of every cycle "
+                  f"({_noise_end[0].num_checks} flat round(s) per walker within "
+                  f"MAXLOGL_TOL={os.environ.get('MAXLOGL_TOL', '5.0 (code default)')} "
+                  f"nats, afresh each cycle, ceiling {int(noise_max_rounds)} rounds); "
+                  f"no leading rider, no interleaved slots.", flush=True)
+        # GB_SEARCH_{N}_SOURCE_EVERY: 0 = no sobbh/mbh/emri moves in this stage
+        # (vgb, the warm start and the ridge moves stay); N = their cadence;
+        # None = the global GB_SEARCH_SOURCE_EVERY, as before
+        _sources = ([] if source_every == 0
+                    else source_pe(gb_search_cadence=True, every=source_every))
         _warm = ([Move("rj_warm_search", branch="gb", every=warm_every)]
                  if warm() else [])
         if seed_only:
@@ -1965,7 +2232,8 @@ def build_fit():
                 + ([Move("gb_ridge_gibbs", branch="gb")]
                    if os.environ.get("GB_RIDGE_GIBBS", "1") == "1" else [])
                 + vgb_ridge()
-                + source_pe(gb_search_cadence=True)
+                + _sources
+                + _noise_end
             ),
             step_kwargs=dict(
                 plateau_branch="gb",
@@ -2012,8 +2280,8 @@ def build_fit():
         _profiles = search_stage_profiles()
         _seed = []
         if _seed_iters() > 0:
-            _seed_prof = dict(_profiles[0][1])
-            _seed = [_search_stage("gb_search_seed", sample_noise=False,
+            _seed_prof = _seed_profile(_profiles)
+            _seed = [_search_stage("gb_search_seed", noise_mode="fixed",
                                    seed_only=True, **_seed_prof)]
         # ONE PE composition, used twice (user design 2026-10-03: "an exact
         # replica of pe mode (and I mean exact) ... The only difference between
@@ -2069,9 +2337,16 @@ def build_fit():
                   f"leaves / {_rk['lnl_tol']:g} nats over the last {_rk['window']} rows "
                   f"(at least {_rk['min_iters']} rows in-stage); full_pe then begins = "
                   f"the start of sample taking (its start_iteration stamp).", flush=True)
+        # Per-stage noise mode / source cadence (2026-10-07). ``_sampled`` is
+        # the TABLE's flag: it still keys the warm cadence (a stage-3 property,
+        # GB_SEARCH_3_WARM_EVERY), whatever GB_SEARCH_{N}_NOISE_MODE says.
         stages += _seed + [
-            _search_stage(_name, sample_noise=(_sampled or _noise_all_stages),
-                          warm_every=(_warm3 if _sampled else 1), **_prof)
+            _search_stage(_name,
+                          noise_mode=search_stage_noise_mode(_name, _sampled),
+                          warm_every=(_warm3 if _sampled else 1),
+                          source_every=search_stage_source_every(_name),
+                          noise_max_rounds=search_stage_noise_max_rounds(_name),
+                          **_prof)
             for _name, _prof, _sampled in _profiles
         ] + _replica + [
             Stage(
@@ -2143,6 +2418,175 @@ def build_fit():
     ]
     fit.recipe = Recipe(stages)
     return fit
+
+
+# ---- THE RECIPE PRINTOUT (2026-10-07) ---------------------------------------
+# ``--print-recipe`` / ``GF_PRINT_RECIPE=1``: compose the fit exactly as a run
+# would (build_fit -- construction only: no data, no backend, no MPI) and print
+# what it composed. ONE resolver, two consumers: the description is read off the
+# built Recipe, so it cannot disagree with what the run would execute.
+
+_SOURCE_MOVES = ("sobbh_pe", "mbh_pe", "emri_pe")
+
+
+def _envv(knob, default="unset"):
+    v = os.environ.get(knob)
+    return f"{knob}={v if v not in (None, '') else default}"
+
+
+def _describe_move(m) -> str:
+    label = m.name
+    inner = "+".join(getattr(m, "inner_names", ()) or ())
+    if isinstance(m, GatedNoiseSearch):
+        label += f"  [galfor RATCHET gate over {inner}]"
+    elif isinstance(m, JointMaxLogLSearch):
+        checks = (m.num_checks if m.num_checks is not None
+                  else int(os.environ.get("NOISE_SEARCH_CHECKS", "5")))
+        cap = (m.iters_per_step if m.iters_per_step is not None
+               else int(os.environ.get("MAXLOGL_ITERS_PER_STEP", "10")))
+        tol = os.environ.get("MAXLOGL_TOL", "5 (code default)")
+        if getattr(m, "restart_each_propose", False):
+            label += (f"  [{inner}: TO CONVERGENCE, afresh every cycle -- {checks} "
+                      f"flat round(s) per walker within MAXLOGL_TOL={tol} nats "
+                      f"({_envv('MAXLOGL_PER_WALKER', '1')}), ceiling {cap} rounds]")
+        else:
+            label += (f"  [{inner}: joint max-lnL plateau, {checks} flat round(s) "
+                      f"within MAXLOGL_TOL={tol}, at most {cap} round(s) per propose]")
+    ev = int(getattr(m, "every", 1) or 1)
+    if ev != 1:
+        label += f"  (every {ev} iterations)"
+    return label
+
+
+def _describe_noise(st) -> str:
+    names = [m.name for m in st.moves]
+    gate = [m for m in st.moves if isinstance(m, GatedNoiseSearch)]
+    end = [m for m in st.moves if isinstance(m, JointMaxLogLSearch)
+           and getattr(m, "restart_each_propose", False)]
+    slots = [n for n in names if n.startswith("noise_joint_search_")]
+    if gate:
+        return "SAMPLED: ONE galfor-ratchet gate at the head of the cycle (GALFOR_RATCHET=1)"
+    if end:
+        where = "LAST" if st.moves[-1] is end[-1] else "NOT last (!)"
+        return (f"SAMPLED at the END of the cycle: ONE {'+'.join(end[0].inner_names)} "
+                f"search to convergence ({where} in the move list); no rider, no slots")
+    if "noise_vgb_joint_search" in names or slots:
+        return (f"SAMPLED, interleaved: leading psd+galfor+vgb rider + {len(slots)} "
+                f"noise convergence slot(s) after the in-model moves")
+    pe = [n for n in names if n in ("psd_pe", "galfor_pe")]
+    if pe:
+        return f"SAMPLED by the PE moves {pe}"
+    if st.kind == "search":
+        return "the stage's own joint max-lnL search (see moves)"
+    return "FIXED (no psd/galfor move: held where the last noise stage / start pin left it)"
+
+
+def _describe_sources(st) -> str:
+    ev = {m.name: int(getattr(m, "every", 1) or 1) for m in st.moves
+          if m.name in _SOURCE_MOVES}
+    if not ev:
+        return "none (no sobbh/mbh/emri move in this stage)"
+    if len(set(ev.values())) == 1:
+        e = next(iter(ev.values()))
+        return (f"{'/'.join(ev)} " + ("EVERY iteration" if e == 1
+                                      else f"every {e} iterations"))
+    return ", ".join(f"{n} every {e}" for n, e in ev.items())
+
+
+def _describe_stop(st) -> str:
+    kw = st.step_kwargs or {}
+    fn = kw.get("convergence_fn")
+    if isinstance(fn, FixedIterationStop):
+        return f"FIXED {fn.n} sampler iterations (GB_SEARCH_SEED_ITERS)"
+    if st.kind == "gb_search":
+        ci = kw.get("convergence_iter")
+        out = (f"every OCCUPIED (walker, band) pair shut off "
+               f"({_envv('GB_SEARCH_STAGE_END_ON_SHUTOFF', '1 (code default)')}; valve "
+               f"{_envv('GB_SEARCH_BAND_SHUTOFF_PER_WALKER')}, "
+               f"{_envv('GB_SEARCH_BAND_SHUTOFF_CONV_ITER', '5 (code default)')}, "
+               f"{_envv('GB_SEARCH_BAND_SHUTOFF_LL_TOL')}), or the nleaves plateau "
+               f"(GB_PLATEAU_ITERS={ci}: window {2 * int(ci or 0) + 1} in-stage rows) "
+               f"AND every occupied pair shut")
+        if kw.get("ratchet") is not None and kw.get("ratchet_end_stage_on_stop"):
+            out += "; OR the galfor ratchet's stop (GALFOR_RATCHET_END_STAGE_ON_STOP)"
+        return out
+    if st.kind == "replica_pe":
+        return (f"min/mean/max cold leaves and lnL each trend < {kw.get('leaf_tol'):g} "
+                f"leaves / {kw.get('lnl_tol'):g} nats over {kw.get('window')} rows "
+                f"(>= {kw.get('min_iters')} rows in-stage)")
+    if st.kind == "pe":
+        return "none: PE never stops on its own (NUM_ITERATIONS bounds the run)"
+    if st.kind == "search":
+        return "the joint max-lnL plateau inside the stage's move (done on its first check)"
+    if st.kind == "rj":
+        return f"nleaves plateau (convergence_iter={kw.get('convergence_iter')})"
+    return "?"
+
+
+def describe_recipe(fit) -> str:
+    """The resolved recipe of a BUILT-but-not-run fit, as text.
+
+    Per stage, in order: name, kind, stop rule, the search profile (opt_snr,
+    peak_min_snr, phase_maximize, prior_births, reset flags), the valves,
+    whether the noise is sampled and how, the sobbh/mbh/emri cadence, the PE
+    declarations, and the move list in execution order. Read off
+    ``fit.recipe`` itself, never re-derived from the knobs.
+    """
+    stages = list(fit.recipe.stages)
+    armed = _source_ids_from_env()
+    lines = [
+        "==== RESOLVED RECIPE (run_combined_staged.build_fit; no data, no MPI) ====",
+        f"branches: {list(fit.branches)}",
+        f"source_types: {tuple(fit.general.source_types)}",
+        "armed sources: " + (", ".join(f"{b}={ids}" for b, ids in armed.items())
+                             if armed else "none"),
+        f"{_envv('NUM_ITERATIONS')}  {_envv('NWALKERS', '16 (driver default)')}",
+    ]
+    for i, st in enumerate(stages, 1):
+        kw = st.step_kwargs or {}
+        lines.append(f"stage {i}/{len(stages)}  {st.name}  kind={st.kind}")
+        lines.append(f"  stop:     {_describe_stop(st)}")
+        prof = kw.get("profile")
+        if prof is not None:
+            lines.append("  profile:  " + " ".join(f"{k}={v}" for k, v in prof.items()))
+        if st.kind == "gb_search":
+            v = ("per-(walker, band) RJ valve DISARMED in this stage"
+                 if kw.get("search_shutoff_per_walker") is False else
+                 "per-(walker, band) RJ valve released at step entry (new step serial)")
+            if (prof or {}).get("reset_valves"):
+                v += ("; reset_valves: at a FRESH entry the per-band cold-lnL max is "
+                      "re-learned and the per-band barren valve revived")
+            if (prof or {}).get("reset_band_max"):
+                v += "; reset_band_max: cold-lnL max re-learned at every entry"
+            lines.append(f"  valves:   {v}")
+        if st.kind in ("gb_search", "rj", "pe", "replica_pe"):
+            lines.append(f"  noise:    {_describe_noise(st)}")
+            lines.append(f"  sources:  {_describe_sources(st)}")
+        if kw.get("ratchet") is not None:
+            lines.append(f"  ratchet:  {kw['ratchet']}")
+        if st.kind in ("pe", "replica_pe"):
+            lines.append(
+                f"  declares: peak_min_snr={kw.get('peak_min_snr')} "
+                f"pe_repeats={kw.get('pe_repeats')} "
+                f"pe_rj_flip_fraction={kw.get('pe_rj_flip_fraction')}")
+        ck = st.combine_kwargs or {}
+        lines.append(
+            "  combine:  " + (" ".join(f"{k}={ck[k]}" for k in sorted(ck))
+                              or "(GFCombineMove defaults)"))
+        lines.append(f"  moves ({len(st.moves)}):")
+        for j, m in enumerate(st.moves, 1):
+            lines.append(f"      {j:2d}. {_describe_move(m)}")
+    return "\n".join(lines)
+
+
+def print_recipe() -> int:
+    """``--print-recipe``: compose (no data, no MPI) and print the recipe."""
+    if _env_flag("COMBINED_SMOKE"):
+        _apply_smoke_defaults()
+    # (one expression: tests/test_monitor_rank.py locates main()'s
+    # build_fit assignment by its text, so this must not repeat it)
+    print(describe_recipe(build_fit()), flush=True)
+    return 0
 
 
 def main() -> int:
@@ -2260,6 +2704,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # The resolved recipe and exit, BEFORE mpi4py is imported: no MPI, no data.
+    if "--print-recipe" in sys.argv[1:] or _env_flag("GF_PRINT_RECIPE"):
+        sys.exit(print_recipe())
     from mpi4py import MPI
     from lisatools.globalfit.communication.ranks import install_mpi_abort_on_error
 
