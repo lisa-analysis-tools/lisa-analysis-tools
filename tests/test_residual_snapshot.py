@@ -86,11 +86,15 @@ class TakeSnapshotTest(unittest.TestCase):
         arrs = _arrs(4)
         acs = _ACA(arrs, [3.0, 9.0, 1.0, np.nan])
         path = rs.take_snapshot(acs=acs, data_holder=self.holder,
-                                store_path=self.store, iteration=41)
+                                store_path=self.store, iteration=41,
+                                store_iteration0=707)
         self.assertEqual(path, os.path.join(self.tmp, "run_testing_residual_snapshot.npz"))
         with np.load(path) as z:
             self.assertEqual(int(z["walker"]), 1)
             self.assertEqual(int(z["iteration"]), 41)
+            # the store row, not the job's own count (which restarts at 0
+            # on every resume: a page read "iteration 161" at row ~870)
+            self.assertEqual(int(z["store_row"]), 748)
             np.testing.assert_allclose(z["residual"], arrs[1].astype(np.float32))
             np.testing.assert_array_equal(z["data"], self.data.astype(np.float32))
             self.assertEqual(z["residual"].dtype, np.float32)
@@ -159,6 +163,8 @@ class WiringTest(unittest.TestCase):
         src = inspect.getsource(run)
         self.assertIn("RESIDUAL_SNAPSHOT_OP: lambda payload, clock, model: walker_residual(", src)
         self.assertIn("self.recipe.snapshot_context = dict(", src)
+        self.assertIn('store_iteration0=int(getattr(self, "_resume_store_iteration", 0))', src)
+        self.assertIn("self._resume_store_iteration = int(backend.iteration)", src)
 
     def test_short_tar_ships_the_snapshot(self):
         from lisatools.globalfit.monitor import snapshot as snap

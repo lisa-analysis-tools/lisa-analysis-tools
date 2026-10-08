@@ -11,8 +11,11 @@ analysis domain (active band and time span only):
 * ``residual`` -- the max-lnL cold walker's residual, i.e. that data minus
   EVERY fitted signal (GB, VGB, MBH, EMRI, SOBBH): the array its likelihood
   is computed from;
-* ``f_edges`` / ``t_edges`` (Hz / s, active band), ``iteration``,
-  ``walker``, ``lnl`` (every cold walker), ``nf`` / ``nt`` / ``dt``.
+* ``f_edges`` / ``t_edges`` (Hz / s, active band), ``store_row`` (the
+  store row this state was saved as: the resume point plus this job's
+  iteration), ``iteration`` (this JOB's iteration count, which restarts at 0
+  on every resume), ``walker``, ``lnl`` (every cold walker), ``nf`` / ``nt``
+  / ``dt``.
 
 Why the run writes it rather than the monitor rebuilding it (Mike
 2026-10-07): the monitor's data / template / residual panel used to subtract
@@ -82,12 +85,14 @@ def walker_residual(model, payload):
     return _plot_array(ac.data.arr)
 
 
-def take_snapshot(*, acs, data_holder, store_path, iteration, fanout=None):
+def take_snapshot(*, acs, data_holder, store_path, iteration, fanout=None,
+                  store_iteration0=0):
     """Write the sidecar for the max-lnL cold walker; returns its path.
 
     ``acs`` is the head's AnalysisContainerArray (its own block under the
     walker-block layout), ``data_holder`` the run's
-    ``general_info.input_data_residual_array``.
+    ``general_info.input_data_residual_array``, ``store_iteration0`` the
+    store's iteration when this job resumed (0 for a fresh store).
     """
     if fanout is None:
         _ll = acs.likelihood(complex=False)
@@ -132,14 +137,16 @@ def take_snapshot(*, acs, data_holder, store_path, iteration, fanout=None):
         tmp, data=data, residual=residual,
         f_edges=np.asarray(_plot_array(s.f_arr_edges), float),
         t_edges=np.asarray(_plot_array(s.t_arr_edges), float),
-        iteration=int(iteration), walker=w, lnl=lls,
+        iteration=int(iteration), store_row=int(store_iteration0) + int(iteration),
+        walker=w, lnl=lls,
         nf=int(s.Nf), nt=int(s.Nt), dt=float(s.data_dt),
         written_at=time.time())
     os.replace(tmp, path)   # a reader never sees a partial file
     return path
 
 
-def maybe_snapshot(*, iteration, acs, data_holder, store_path, fanout=None):
+def maybe_snapshot(*, iteration, acs, data_holder, store_path, fanout=None,
+                   store_iteration0=0):
     """Cadence gate + never-raise wrapper around :func:`take_snapshot`.
 
     ``iteration`` is the index of the iteration that just ran; a snapshot is
@@ -154,8 +161,9 @@ def maybe_snapshot(*, iteration, acs, data_holder, store_path, fanout=None):
         t0 = time.perf_counter()
         path = take_snapshot(acs=acs, data_holder=data_holder,
                              store_path=store_path, iteration=iteration,
-                             fanout=fanout)
-        logger.info("[RESIDUAL_SNAPSHOT] iteration %d -> %s (%.1f s)",
+                             fanout=fanout, store_iteration0=store_iteration0)
+        logger.info("[RESIDUAL_SNAPSHOT] store row %d (job iteration %d) -> %s "
+                    "(%.1f s)", int(store_iteration0) + int(iteration),
                     int(iteration), os.path.basename(path),
                     time.perf_counter() - t0)
         return path

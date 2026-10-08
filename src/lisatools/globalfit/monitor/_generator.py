@@ -2845,6 +2845,10 @@ try:
             with np.load(_snaps[0]) as _z:
                 SNAP = {k: _z[k] for k in ("data", "residual", "iteration",
                                            "walker")}
+                # the STORE row (snapshots before 2026-10-08 carry only the
+                # job's own iteration count, which restarts on every resume)
+                SNAP["row"] = (int(_z["store_row"]) if "store_row" in _z.files
+                               else None)
             _want = (3, int(_wdm.Nf_active), int(_wdm.Nt_active))
             if tuple(SNAP["data"].shape) != _want:
                 raise ValueError(f"snapshot shape {SNAP['data'].shape} != the "
@@ -2859,7 +2863,9 @@ try:
 
             data_fd = _snap_fd(SNAP["data"].astype(float))
             resid_fd = _snap_fd(SNAP["residual"].astype(float))
-            DTR.update(snap=True, snap_it=int(SNAP["iteration"]),
+            DTR.update(snap=True, snap_it=(f"store row {SNAP['row']}"
+                                           if SNAP["row"] is not None else
+                                           f"job iteration {int(SNAP['iteration'])}"),
                        snap_walker=int(SNAP["walker"]),
                        snap_file=os.path.basename(_snaps[0]))
         except Exception as _exc:  # noqa: BLE001 - fall back, never fail the page
@@ -3013,7 +3019,8 @@ try:
     _tt = (["data (as the run loaded it)",
             "all fitted signals (data - residual)",
             f"residual (the run's own, walker {int(SNAP['walker'])}, "
-            f"iteration {int(SNAP['iteration'])})"]
+            + (f"store row {SNAP['row']})" if SNAP["row"] is not None else
+               f"job iteration {int(SNAP['iteration'])})")]
            if SNAP is not None else
            ["data", "template sum (GB + VGB)", "residual = data - templates"])
     for r in range(3):
@@ -3883,7 +3890,7 @@ if FGW:
         "the mean away from 1 that follows frequency is the rigid tanh x power-law failing to "
         "follow the residual's shape. Bottom: the share of the model noise that is foreground. "
         "<em>Caveats.</em> (1) " + (
-            f"This page's residual is the run's own (snapshot at iteration "
+            f"This page's residual is the run's own (snapshot at "
             f"{DTR.get('snap_it')}, walker {DTR.get('snap_walker')}): the data the run "
             f"loaded minus every fitted signal class, band-limited to the analysed band. "
             if DTR.get("snap") else

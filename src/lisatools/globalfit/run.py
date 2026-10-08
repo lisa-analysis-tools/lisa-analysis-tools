@@ -1137,6 +1137,9 @@ class GlobalFit:
                     "fresh start; new iterations append).",
                     backend_path, int(backend.iteration),
                 )
+                # rows this job appends start here (the residual snapshot
+                # labels itself with the store row, not the job's count)
+                self._resume_store_iteration = int(backend.iteration)
                 # Guard against resuming a backend whose per-branch sampled
                 # dimensionality no longer matches the run config -- the most
                 # likely cause is toggling GB_USE_ASTROPHYSICAL_F0_MC_PRIOR /
@@ -2713,6 +2716,7 @@ class GlobalFit:
             data_holder=getattr(self.curr.general_info,
                                 "input_data_residual_array", None),
             store_path=self.curr.general_info.main_file_path,
+            store_iteration0=int(getattr(self, "_resume_store_iteration", 0)),
         )
         setup_info_all = self.curr.settings_dict.setup_function(
             self.recipe, self.engine_info, self.curr, acs, priors, state
