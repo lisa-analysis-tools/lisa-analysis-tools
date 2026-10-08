@@ -2356,7 +2356,7 @@ _RECIPE_REPLACEMENTS = (
      "# AFTER gb_search_seed (SOURCE_SEARCH_POSITION=after_seed, main session\n"
      "# 2026-10-08: the source maxima are found against a residual with the\n"
      "# warm-started galaxy already subtracted; =first puts it before the seed).\n"
-     "# Moves: sobbh_pe / mbh_pe / emri_pe ONLY, from the exact-truth starts below;\n"
+     "# Moves: sobbh_pe / mbh_pe / emri_pe ONLY, from their start points (the 6mo cold chain for SNR > 10 sources, exact truth otherwise: the SOURCE WARM START block below);\n"
      "# psd + galfor FIXED at the start pin, the GB leaves held at the seed's\n"
      "# warm-start births, the VGBs held. Stop: every walker's cold lnL gains no\n"
      "# more than SOURCE_SEARCH_TOL nats over SOURCE_SEARCH_CHECKS consecutive\n"
@@ -2383,6 +2383,35 @@ _RECIPE_REPLACEMENTS = (
      "# f_1 10 mHz, f_2 1.41 mHz) is inside the box. Fresh store only: a chain\n"
      "# outside the box would price at log_prior = -inf on resume.\n"
      "export GALFOR_FREQ_PRIOR=${GALFOR_FREQ_PRIOR:-1e-4,1e-2}\n", 1),
+    # the source warm start from the 6mo cold chain (user ruling 2026-10-08;
+    # the same entry in both derive tables)
+    ("export MBH_START_FACTOR=0.0\nexport EMRI_START_FACTOR=0.0\nexport SOBBH_START_FACTOR=0.0\nexport VGB_START_FACTOR=0.0\n",
+     "export MBH_START_FACTOR=0.0\nexport EMRI_START_FACTOR=0.0\nexport SOBBH_START_FACTOR=0.0\nexport VGB_START_FACTOR=0.0\n"
+     "# ---- 9MO / 1YR: SOURCE WARM START from the 6mo cold chain (user ruling\n"
+     "# 2026-10-08) -------------------------------------------------------------\n"
+     "# \"start the 9mo sources from the 6mo cold chain's final positions instead of\n"
+     "# catalogue truth ... for any source over SNR 10 at 6 mo. Otherwise start how\n"
+     "# we did at 6mo [exact truth] for sources under SNR 10 (computed at six\n"
+     "# months)\". lisatools.globalfit.warmstart.sources reads the seed store's last\n"
+     "# written cold-chain row (sub_backend/<branch>/chain + h_h; the running backup\n"
+     "# copy if the primary is torn), maps leaves by CATALOGUE ID (the seed's own id\n"
+     "# lists below, NOT this run's: MBHB 7 and 12 were never fitted at 6mo and\n"
+     "# start at truth), takes SNR_6mo = median over the cold walkers of sqrt(h_h),\n"
+     "# and for SNR > SOURCE_WARM_START_SNR_MIN copies walker w -> w and the whole\n"
+     "# 8-rung ladder (the rung counts match). Below the threshold, or absent from\n"
+     "# the seed: exact truth as above. A NaN record REFUSES the launch\n"
+     "# (SOURCE_WARM_START_SNR_UNKNOWN=truth|warm overrides); a start outside this\n"
+     "# run's prior refuses it. Fresh start only (a resume keeps its chain). DRY RUN\n"
+     "# on the cluster BEFORE launching, once per branch (prints each id's 6mo SNR\n"
+     "# and the warm / truth decision):\n"
+     "#   python -m lisatools.globalfit.warmstart.sources --store $GF_SEED_STORE \\\n"
+     "#       --branch mbh --ids 2,5,16,18\n"
+     "# SOURCE_WARM_START_STORE= (explicitly empty) turns it off.\n"
+     "export SOURCE_WARM_START_STORE=${SOURCE_WARM_START_STORE-${GF_SEED_STORE}}\n"
+     "export SOURCE_WARM_START_SNR_MIN=${SOURCE_WARM_START_SNR_MIN:-10}\n"
+     "export MBH_SOURCE_WARM_START_IDS=${MBH_SOURCE_WARM_START_IDS:-2,5,16,18}\n"
+     "export EMRI_SOURCE_WARM_START_IDS=${EMRI_SOURCE_WARM_START_IDS:-0,1,2,3,4,5,6,7}\n"
+     "export SOBBH_SOURCE_WARM_START_IDS=${SOBBH_SOURCE_WARM_START_IDS:-0,1,2,3,4,5}\n", 1),
 )
 
 #: the recipe as the 1yr / 9mo launchers resolve it (and the 6mo's values)
@@ -2402,6 +2431,12 @@ _RECIPE_EXPORTS = {
     "SOURCE_SEARCH_MAX_ROUNDS": ("200", None),
     # the galfor frequency prior (2026-10-08): fk / f_1 / f_2 in one 0.1-10 mHz box
     "GALFOR_FREQ_PRIOR": ("1e-4,1e-2", None),
+    # the source warm start from the 6mo cold chain (2026-10-08); the STORE
+    # export is ${K-${GF_SEED_STORE}} and is asserted separately
+    "SOURCE_WARM_START_SNR_MIN": ("10", None),
+    "MBH_SOURCE_WARM_START_IDS": ("2,5,16,18", None),
+    "EMRI_SOURCE_WARM_START_IDS": ("0,1,2,3,4,5,6,7", None),
+    "SOBBH_SOURCE_WARM_START_IDS": ("0,1,2,3,4,5", None),
 }
 
 
@@ -2415,6 +2450,9 @@ def _assert_the_recipe(test, exports, six, text):
         if knob != "GB_SEARCH_SEED_ITERS":
             test.assertRegex(text, rf"(?m)^export {knob}=\$\{{{knob}:-{want}\}}", knob)
     test.assertEqual(exports["GALFOR_RATCHET"], "0")
+    # the source warm start reads the SAME store the GB warm start + noise pin do
+    test.assertEqual(exports["SOURCE_WARM_START_STORE"], exports["GF_SEED_STORE"])
+    test.assertNotIn("SOURCE_WARM_START_STORE", six)
     test.assertEqual(exports["GB_SEARCH_SOURCE_EVERY"], six["GB_SEARCH_SOURCE_EVERY"])
     for knob in exports:
         if knob.startswith("GB_SEARCH_3_") or knob == "GB_SEARCH_SAMPLE_NOISE_ALL_STAGES":
@@ -2548,6 +2586,7 @@ class OneYearV9TwinTest(unittest.TestCase):
             # 2026-10-08: the warm-start fit takes the last 300 rows x 4
             # walkers = 1,200 samples of the 6mo (the 6mo took 10 rows of the 3mo)
             "GB_WARM_START_LAST_K",
+            "SOURCE_WARM_START_STORE",      # 2026-10-08: the source warm start (= GF_SEED_STORE)
         } | set(_RECIPE_EXPORTS)          # the 2026-10-07 recipe (1YR-6)
         keys = (set(self.one) | set(self.six)) - {"_", "SHLVL", "PWD"}
         drift = {k: (self.six.get(k), self.one.get(k))

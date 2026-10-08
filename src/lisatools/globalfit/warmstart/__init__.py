@@ -17,6 +17,11 @@ stage scripts and ``lisatools.sampling.warmstart_proposal`` now live here
   check-then-build orchestrator (fit -> referee -> apply, in-process,
   MPI-safe lock) recipe build calls when the npz is missing.
 
+Not GB: :mod:`.sources` is the MBH / EMRI / SOBBH SOURCE warm start (a
+fresh run's leaves over a seed-SNR threshold start at a previous store's
+last cold-chain ladder; ``SOURCE_WARM_START_STORE``), called by
+``run.py``'s fresh-start path.
+
 Each stage module is runnable directly too:
 ``python -m lisatools.globalfit.warmstart.fit_from_store --help``.
 """

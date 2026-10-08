@@ -1832,6 +1832,25 @@ def build_fit():
               flush=True)
     else:
         _src_position, _src_stage = None, None
+    # SOURCE WARM START (user ruling 2026-10-08): with SOURCE_WARM_START_STORE
+    # set, every mbh/emri/sobbh leaf whose catalogue id the seed store holds at
+    # SNR_6mo > SOURCE_WARM_START_SNR_MIN starts at the seed's last cold-chain
+    # row (lisatools.globalfit.warmstart.sources, applied by run.py load_info on
+    # a FRESH start); every other leaf at *_START_FACTOR. Reported here so the
+    # recipe printout and the launch log carry it; the decision itself is
+    # logged per branch at load ("[SOURCE-WARM] ...").
+    if armed_sources:
+        _sws = os.environ.get("SOURCE_WARM_START_STORE", "").strip()
+        if _sws:
+            print(f"[combined] source warm start: {_sws} (seed SNR > "
+                  f"{os.environ.get('SOURCE_WARM_START_SNR_MIN', '10')}; seed ids "
+                  f"mbh={os.environ.get('MBH_SOURCE_WARM_START_IDS', '?')} "
+                  f"emri={os.environ.get('EMRI_SOURCE_WARM_START_IDS', '?')} "
+                  f"sobbh={os.environ.get('SOBBH_SOURCE_WARM_START_IDS', '?')}); "
+                  "other leaves at *_START_FACTOR", flush=True)
+        else:
+            print("[combined] source warm start: OFF (every source leaf at "
+                  "*_START_FACTOR)", flush=True)
     # CONDITIONAL NOISE STAGES (v9, user spec 2026-09-24): "noise_search /
     # noise_vgb_search run ONLY when there is no psd/foreground estimate from
     # a previous run." The estimate IS the start pin -- {PSD,GALFOR}_START_

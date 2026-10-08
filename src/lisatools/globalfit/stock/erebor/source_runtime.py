@@ -53,6 +53,7 @@ from ...recipe import (
     build_mbh_moves_phenom,
     mbh_catalogue_to_sampling_basis,
 )
+from ...warmstart.sources import parse_id_list
 from ..base import env_default
 from .common import resolve_inner_moves
 from .emri import EMRISettings
@@ -551,6 +552,34 @@ class SourceMBHSettings(MBHSettings):
     mbh_merger_time_buffer: float = dataclasses.field(
         default_factory=env_default("MBH_MERGER_TIME_BUFFER", 7 * 86400.0, float)
     )
+    # ---- SOURCE WARM START (user 2026-10-08; lisatools.globalfit.warmstart.sources).
+    # On a FRESH store, each leaf whose catalogue id is in the seed store with
+    # seed-run optimal SNR (median over cold walkers of sqrt(h_h)) STRICTLY above
+    # source_warm_start_snr_min starts at that store's last cold-chain positions
+    # (walker w <- w; the whole ladder when the rung counts match, else the cold
+    # point on every rung); every other leaf starts as before (MBH_START_FACTOR).
+    # Unset store = off (today's start, byte-identical). Inert on a resume. The
+    # store / SNR knobs are SHARED by mbh, emri and sobbh (like USE_TDIONFLY);
+    # the id list is per branch because the store does not record it.
+    source_warm_start_store: typing.Optional[str] = dataclasses.field(
+        default_factory=env_default("SOURCE_WARM_START_STORE", None, str)
+    )
+    source_warm_start_snr_min: float = dataclasses.field(
+        default_factory=env_default("SOURCE_WARM_START_SNR_MIN", 10.0, float)
+    )
+    # NaN seed record (the seed run had MBH_RECORD_DH off): "refuse" (default),
+    # "truth" (injection start) or "warm" (seed start regardless of SNR).
+    source_warm_start_snr_unknown: str = dataclasses.field(
+        default_factory=env_default("SOURCE_WARM_START_SNR_UNKNOWN", "refuse", str)
+    )
+    # The SEED run's catalogue ids for this branch (its MBHB_IDS after its own
+    # merger-window filter), any order; "none" disables this branch.
+    source_warm_start_ids: typing.Optional[tuple] = dataclasses.field(
+        default_factory=env_default("MBH_SOURCE_WARM_START_IDS", None, parse_id_list)
+    )
+    # THIS run's catalogue ids in leaf order; COMPUTED by prepare_mbh_branch
+    # (never an env knob).
+    injection_ids: typing.Optional[tuple] = None
 
 
 @dataclasses.dataclass
@@ -601,6 +630,21 @@ class SourceEMRISettings(EMRISettings):
     traj_workers: int = dataclasses.field(
         default_factory=env_default("EMRI_TRAJ_WORKERS", 0, int)
     )
+    # SOURCE WARM START: see SourceMBHSettings (shared store / SNR knobs).
+    source_warm_start_store: typing.Optional[str] = dataclasses.field(
+        default_factory=env_default("SOURCE_WARM_START_STORE", None, str)
+    )
+    source_warm_start_snr_min: float = dataclasses.field(
+        default_factory=env_default("SOURCE_WARM_START_SNR_MIN", 10.0, float)
+    )
+    source_warm_start_snr_unknown: str = dataclasses.field(
+        default_factory=env_default("SOURCE_WARM_START_SNR_UNKNOWN", "refuse", str)
+    )
+    source_warm_start_ids: typing.Optional[tuple] = dataclasses.field(
+        default_factory=env_default("EMRI_SOURCE_WARM_START_IDS", None, parse_id_list)
+    )
+    # computed by prepare_emri_branch
+    injection_ids: typing.Optional[tuple] = None
 
 
 @dataclasses.dataclass
@@ -719,6 +763,21 @@ class SourceSOBBHSettings(SOBBHSettings):
     lookup_kernel: str = dataclasses.field(
         default_factory=env_default("SOBBH_LOOKUP_KERNEL", "auto", str)
     )
+    # SOURCE WARM START: see SourceMBHSettings (shared store / SNR knobs).
+    source_warm_start_store: typing.Optional[str] = dataclasses.field(
+        default_factory=env_default("SOURCE_WARM_START_STORE", None, str)
+    )
+    source_warm_start_snr_min: float = dataclasses.field(
+        default_factory=env_default("SOURCE_WARM_START_SNR_MIN", 10.0, float)
+    )
+    source_warm_start_snr_unknown: str = dataclasses.field(
+        default_factory=env_default("SOURCE_WARM_START_SNR_UNKNOWN", "refuse", str)
+    )
+    source_warm_start_ids: typing.Optional[tuple] = dataclasses.field(
+        default_factory=env_default("SOBBH_SOURCE_WARM_START_IDS", None, parse_id_list)
+    )
+    # computed by prepare_sobbh_branch
+    injection_ids: typing.Optional[tuple] = None
 
 
 # ============================================================
@@ -937,10 +996,12 @@ def prepare_emri_branch(emri, general_setup: GeneralSetup, gs):
         # SPECIAL EMRI frame (validated 2026-06-19): ecliptic-polar sky +
         # raw file spin angles; row construction lives in the stock
         # lisatools.sources.emri.emri_catalogue_to_waveform_basis.
+        inj_ids = sorted(cat.keys())
         full_basis = np.asarray(
-            [emri_catalogue_to_waveform_basis(cat[i]) for i in sorted(cat.keys())]
+            [emri_catalogue_to_waveform_basis(cat[i]) for i in inj_ids]
         )
     else:
+        inj_ids = list(range(n))
         inj_mode, inj_seed = synthetic_injection_mode(gs)
         full_basis = make_emri_injections(n, mode=inj_mode, seed=inj_seed)
     # PER-LEAF transform fills: [xI0, Phi_theta0] per source (xI0 is the
@@ -951,6 +1012,8 @@ def prepare_emri_branch(emri, general_setup: GeneralSetup, gs):
     tc = make_emri_transform_container(leaf_fill_values)
     if emri.injection is None:
         emri.injection = tc.both_inverse_transforms(full_basis)
+        # leaf j carries catalogue id inj_ids[j] (source warm start maps by id)
+        emri.injection_ids = tuple(int(i) for i in inj_ids)
     if getattr(emri, "fill_values", None) is None or not np.asarray(
         emri.fill_values
     ).size:
@@ -998,10 +1061,12 @@ def prepare_sobbh_branch(sobbh, general_setup: GeneralSetup, gs):
     if cat is not None:
         from .injections import sobbh_catalogue_to_waveform_basis
 
+        inj_ids = sorted(cat.keys())
         full_basis = np.asarray(
-            [sobbh_catalogue_to_waveform_basis(cat[i]) for i in sorted(cat.keys())]
+            [sobbh_catalogue_to_waveform_basis(cat[i]) for i in inj_ids]
         )
     else:
+        inj_ids = list(range(n))
         inj_mode, inj_seed = synthetic_injection_mode(gs)
         full_basis = make_sobbh_injections(n, mode=inj_mode, seed=inj_seed)
     if sobbh.injection is None:
@@ -1009,6 +1074,8 @@ def prepare_sobbh_branch(sobbh, general_setup: GeneralSetup, gs):
         sobbh.injection = np.stack(
             [tc.both_inverse_transforms(row) for row in full_basis], axis=0
         )
+        # leaf j carries catalogue id inj_ids[j] (source warm start maps by id)
+        sobbh.injection_ids = tuple(int(i) for i in inj_ids)
     # Worst end-of-window chirp over THIS branch's sources -- feeds the
     # chunked-het Nt_sub auto/criterion at comp build (band-capped so a
     # source chirping out of band bounds at the run's max_freq).
@@ -1079,6 +1146,7 @@ def prepare_mbh_branch(mbh, general_setup: GeneralSetup, gs):
             len(dropped), len(inj_ids), dropped, obs_start, obs_end, buffer,
         )
         injection = injection[keep]
+        inj_ids = [inj_ids[k] for k in range(len(inj_ids)) if keep[k]]
     if injection.shape[0] == 0:
         logger.warning(
             "MBH merger-window filter removed every requested MBHB source; the "
@@ -1088,6 +1156,9 @@ def prepare_mbh_branch(mbh, general_setup: GeneralSetup, gs):
         )
     if mbh.injection is None:
         mbh.injection = injection
+        # leaf j carries catalogue id inj_ids[j] AFTER the merger-window filter
+        # (source warm start maps by id, never by leaf index)
+        mbh.injection_ids = tuple(int(i) for i in inj_ids)
     # nleaves follow the (possibly filtered) injection, not the requested count.
     n = int(np.asarray(mbh.injection).shape[0])
     if mbh.transform is None:

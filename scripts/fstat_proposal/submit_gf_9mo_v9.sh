@@ -4901,7 +4901,7 @@ export SOBBH_PERMUTE_EVERY=10
 # AFTER gb_search_seed (SOURCE_SEARCH_POSITION=after_seed, main session
 # 2026-10-08: the source maxima are found against a residual with the
 # warm-started galaxy already subtracted; =first puts it before the seed).
-# Moves: sobbh_pe / mbh_pe / emri_pe ONLY, from the exact-truth starts below;
+# Moves: sobbh_pe / mbh_pe / emri_pe ONLY, from their start points (the 6mo cold chain for SNR > 10 sources, exact truth otherwise: the SOURCE WARM START block below);
 # psd + galfor FIXED at the start pin, the GB leaves held at the seed's
 # warm-start births, the VGBs held. Stop: every walker's cold lnL gains no
 # more than SOURCE_SEARCH_TOL nats over SOURCE_SEARCH_CHECKS consecutive
@@ -4919,6 +4919,31 @@ export MBH_START_FACTOR=0.0
 export EMRI_START_FACTOR=0.0
 export SOBBH_START_FACTOR=0.0
 export VGB_START_FACTOR=0.0
+# ---- 9MO / 1YR: SOURCE WARM START from the 6mo cold chain (user ruling
+# 2026-10-08) -------------------------------------------------------------
+# "start the 9mo sources from the 6mo cold chain's final positions instead of
+# catalogue truth ... for any source over SNR 10 at 6 mo. Otherwise start how
+# we did at 6mo [exact truth] for sources under SNR 10 (computed at six
+# months)". lisatools.globalfit.warmstart.sources reads the seed store's last
+# written cold-chain row (sub_backend/<branch>/chain + h_h; the running backup
+# copy if the primary is torn), maps leaves by CATALOGUE ID (the seed's own id
+# lists below, NOT this run's: MBHB 7 and 12 were never fitted at 6mo and
+# start at truth), takes SNR_6mo = median over the cold walkers of sqrt(h_h),
+# and for SNR > SOURCE_WARM_START_SNR_MIN copies walker w -> w and the whole
+# 8-rung ladder (the rung counts match). Below the threshold, or absent from
+# the seed: exact truth as above. A NaN record REFUSES the launch
+# (SOURCE_WARM_START_SNR_UNKNOWN=truth|warm overrides); a start outside this
+# run's prior refuses it. Fresh start only (a resume keeps its chain). DRY RUN
+# on the cluster BEFORE launching, once per branch (prints each id's 6mo SNR
+# and the warm / truth decision):
+#   python -m lisatools.globalfit.warmstart.sources --store $GF_SEED_STORE \
+#       --branch mbh --ids 2,5,16,18
+# SOURCE_WARM_START_STORE= (explicitly empty) turns it off.
+export SOURCE_WARM_START_STORE=${SOURCE_WARM_START_STORE-${GF_SEED_STORE}}
+export SOURCE_WARM_START_SNR_MIN=${SOURCE_WARM_START_SNR_MIN:-10}
+export MBH_SOURCE_WARM_START_IDS=${MBH_SOURCE_WARM_START_IDS:-2,5,16,18}
+export EMRI_SOURCE_WARM_START_IDS=${EMRI_SOURCE_WARM_START_IDS:-0,1,2,3,4,5,6,7}
+export SOBBH_SOURCE_WARM_START_IDS=${SOBBH_SOURCE_WARM_START_IDS:-0,1,2,3,4,5}
 # SOBBH chunked scoring width: converged value (S3 ruling; the 11-h-layer
 # stress result -- cheap insurance on this 1-h-layer production grid too).
 export SOBBH_M_BAND_HALF_WIDTH=3

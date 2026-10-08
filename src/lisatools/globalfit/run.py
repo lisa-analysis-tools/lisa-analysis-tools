@@ -1022,6 +1022,38 @@ class GlobalFit:
         )
         return out
 
+    def _source_warm_start(self, branch: str, coords, prior):
+        """SOURCE WARM START for one fixed-leaf source branch (fresh start only).
+
+        User request 2026-10-08: a leaf whose catalogue id is in the seed
+        store (``SOURCE_WARM_START_STORE``) with seed-run optimal SNR above
+        ``SOURCE_WARM_START_SNR_MIN`` starts at that store's last cold-chain
+        positions; every other leaf keeps the ``*_START_FACTOR`` start already
+        in ``coords``. Store unset -> ``coords`` is returned AS IS (same object,
+        no file touched). Logs one ``[SOURCE-WARM]`` line per armed branch.
+        See :mod:`lisatools.globalfit.warmstart.sources`.
+        """
+        info = self.curr.source_info.get(branch)
+        store = getattr(info, "source_warm_start_store", None)
+        if not store:
+            return coords
+        from .warmstart.sources import warm_start_branch
+
+        out, line = warm_start_branch(
+            branch,
+            coords,
+            store=str(store),
+            seed_ids=getattr(info, "source_warm_start_ids", None),
+            new_ids=getattr(info, "injection_ids", None),
+            snr_min=float(getattr(info, "source_warm_start_snr_min", 10.0)),
+            snr_unknown=str(getattr(info, "source_warm_start_snr_unknown", "refuse")),
+            ntemps_branch=self._branch_ntemps(branch),
+            prior=prior,
+            data_t0=getattr(self.curr.general_info, "data_t0", None),
+        )
+        self.logger.info(line)
+        return out
+
     def load_info(self, priors: typing.Dict[str, typing.Any]) -> GFState:
         """
         Load or initialize the MCMC state from backend or priors.
@@ -1513,6 +1545,14 @@ class GlobalFit:
                         None,
                     ),
                 )
+
+            # SOURCE WARM START (user 2026-10-08): leaves over the seed SNR
+            # threshold start at the seed store's last cold-chain ladder
+            # instead of the injection; off (store unset) returns the block
+            # untouched. Must run before the per-branch ladder slice below.
+            for _sb in ("mbh", "emri", "sobbh"):
+                if _sb in coords:
+                    coords[_sb] = self._source_warm_start(_sb, coords[_sb], priors.get(_sb))
 
             # the main state keeps only the engine's ladder (cold chain for
             # stock variants); each sub-state takes its branch's full ladder
