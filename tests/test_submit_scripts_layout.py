@@ -2418,6 +2418,8 @@ class OneYearV9TwinTest(unittest.TestCase):
          "GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/global_fit_output/gf_prod_6mo_v9_4gpu/gf_prod_6mo_testing.h5}", 1),
         ("GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-7776000}",
          "GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-15552000}   # the 6-month parent", 1),
+        ("export GB_WARM_START_LAST_K=${GB_WARM_START_LAST_K:-10}\n",
+         "export GB_WARM_START_LAST_K=${GB_WARM_START_LAST_K:-300}   # 9mo/1yr (Mike 2026-10-08): the last 300 stored cold-chain rows x 4 walkers = 1,200 samples of the 6mo full_pe (~2.9M leaf rows into the fit; build the npz by hand on a login node if the in-job build is slow)\n", 1),
     ) + _RECIPE_REPLACEMENTS
 
     def setUp(self):
@@ -2462,6 +2464,8 @@ class OneYearV9TwinTest(unittest.TestCase):
             "/shared/data/global_fit_output/gf_prod_6mo_v9_4gpu/gf_prod_6mo_testing.h5")
         self.assertEqual(self.one["GB_WARM_START_SOURCE_STORE"], self.one["GF_SEED_STORE"])
         self.assertEqual(self.one["GB_WARM_START_SOURCE_TOBS"], "15552000")
+        self.assertEqual(self.one["GB_WARM_START_LAST_K"], "300")   # 1,200 samples (2026-10-08)
+        self.assertEqual(self.six["GB_WARM_START_LAST_K"], "10")
         self.assertTrue(self.one["GB_WARM_START_COMPONENTS"].endswith(
             "/warmstart/gf_prod_6mo_v9_4gpu_refereed.npz"),
             self.one["GB_WARM_START_COMPONENTS"])
@@ -2493,6 +2497,9 @@ class OneYearV9TwinTest(unittest.TestCase):
             "GB_RJ_INMODEL_CHUNK", "BASE_FILE_NAME",
             "MBHB_IDS", "GF_SEED_STORE", "GB_WARM_START_SOURCE_STORE",
             "GB_WARM_START_SOURCE_TOBS", "GB_WARM_START_COMPONENTS",
+            # 2026-10-08: the warm-start fit takes the last 300 rows x 4
+            # walkers = 1,200 samples of the 6mo (the 6mo took 10 rows of the 3mo)
+            "GB_WARM_START_LAST_K",
         } | set(_RECIPE_EXPORTS)          # the 2026-10-07 recipe (1YR-6)
         keys = (set(self.one) | set(self.six)) - {"_", "SHLVL", "PWD"}
         drift = {k: (self.six.get(k), self.one.get(k))
@@ -2565,6 +2572,8 @@ class NineMonthV9TwinTest(unittest.TestCase):
          "GF_SEED_STORE=${GF_SEED_STORE:-/shared/data/global_fit_output/gf_prod_6mo_v9_4gpu/gf_prod_6mo_testing.h5}", 1),
         ("GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-7776000}",
          "GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-15552000}   # the 6-month parent", 1),
+        ("export GB_WARM_START_LAST_K=${GB_WARM_START_LAST_K:-10}\n",
+         "export GB_WARM_START_LAST_K=${GB_WARM_START_LAST_K:-300}   # 9mo/1yr (Mike 2026-10-08): the last 300 stored cold-chain rows x 4 walkers = 1,200 samples of the 6mo full_pe (~2.9M leaf rows into the fit; build the npz by hand on a login node if the in-job build is slow)\n", 1),
     ) + _RECIPE_REPLACEMENTS
 
     # the only exports that may resolve differently from the 1yr script
@@ -2617,6 +2626,10 @@ class NineMonthV9TwinTest(unittest.TestCase):
             "/shared/data/global_fit_output/gf_prod_6mo_v9_4gpu/gf_prod_6mo_testing.h5")
         self.assertEqual(self.nine["GB_WARM_START_SOURCE_STORE"], self.nine["GF_SEED_STORE"])
         self.assertEqual(self.nine["GB_WARM_START_SOURCE_TOBS"], "15552000")
+        # user ruling 2026-10-08: "the last 300 samples ... so 1200 total" =
+        # 300 stored cold-chain rows x the 6mo's 4 walkers
+        self.assertEqual(self.nine["GB_WARM_START_LAST_K"], "300")
+        self.assertEqual(self.nine["GB_WARM_START_LAST_K"], self.one["GB_WARM_START_LAST_K"])
         self.assertTrue(self.nine["GB_WARM_START_COMPONENTS"].endswith(
             "/warmstart/gf_prod_6mo_v9_4gpu_refereed.npz"),
             self.nine["GB_WARM_START_COMPONENTS"])

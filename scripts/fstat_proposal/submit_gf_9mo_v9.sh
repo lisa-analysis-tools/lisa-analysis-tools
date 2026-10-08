@@ -41,7 +41,10 @@
 #          1yr (GF_SEED_STORE gf_prod_6mo_v9_4gpu/gf_prod_6mo_testing.h5,
 #          GB_WARM_START_SOURCE_TOBS 15552000, refereed npz
 #          gf_prod_6mo_v9_4gpu_refereed.npz -- auto-built from the parent
-#          store on the first launch when missing).
+#          store on the first launch when missing). GB_WARM_START_LAST_K
+#          10 -> 300 (user ruling 2026-10-08): the fit takes the last 300
+#          written cold-chain rows x 4 walkers = 1,200 samples of the 6mo
+#          full_pe (the 6mo itself took 10 rows x 10 walkers of the 3mo).
 #   9MO-6. THE RECIPE (user ruling 2026-10-07, the SAME as the 1yr's 1YR-6;
 #          not a Tobs change -- the running 6mo store's recipe is fixed, so
 #          it lands in the 9mo/1yr only): gb_search_seed x3 -> gb_search_1 ->
@@ -4369,7 +4372,7 @@ if [ "${GB_WARM_START_SOURCE_STORE}" != "${GF_SEED_STORE}" ]; then
   echo "[V9-SEED]   noise pin : ${GF_SEED_STORE}"
 fi
 export GB_WARM_START_SOURCE_TOBS=${GB_WARM_START_SOURCE_TOBS:-15552000}   # the 6-month parent
-export GB_WARM_START_LAST_K=${GB_WARM_START_LAST_K:-10}
+export GB_WARM_START_LAST_K=${GB_WARM_START_LAST_K:-300}   # 9mo/1yr (Mike 2026-10-08): the last 300 stored cold-chain rows x 4 walkers = 1,200 samples of the 6mo full_pe (~2.9M leaf rows into the fit; build the npz by hand on a login node if the in-job build is slow)
 if [ -n "${GB_WARM_START_COMPONENTS}" ] && [ ! -f "${GB_WARM_START_COMPONENTS}" ]; then
   if [ -f "${GB_WARM_START_SOURCE_STORE}" ]; then
     echo "[WARMSTART] ${GB_WARM_START_COMPONENTS} missing -- it will be BUILT"
