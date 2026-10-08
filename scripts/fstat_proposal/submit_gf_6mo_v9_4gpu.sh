@@ -4805,16 +4805,25 @@ export EMRI_INNER_MOVE_KIND=eigen
 # the refresh cadence either way. Do NOT re-add an export here: a second
 # export silently overrode the ruling above until 2026-09-17.
 export SOBBH_EIGEN_REFRESH=10
-# MBH/EMRI: ONE table per leaf, built at the max-lnL COLD walker (their
-# likelihood rows are per-row dense, ~1.4 / ~1.0 s). A refresh is
-# (nwalkers selection + ~245 build) rows ~ 6.4 min/leaf (MBH) /
-# ~4.6 min/leaf (EMRI) -- paid on the FIRST visit per leaf (~26 min MBH,
-# ~37 min EMRI, one-time) and then every 100th visit. Escape:
+# MBH/EMRI: ONE table per leaf, built at the max-lnL COLD walker and shared
+# by every walker and rung. REFRESH EVERY 10 VISITS since 2026-10-08 (Mike:
+# "update them now with fast waveforms to do the same thing as the sobhbs psd
+# and galfor"; was 100). The 100 dates from the likelihood ("ll") route,
+# whose ~245 dense likelihood rows cost ~6.4 min/leaf (MBH) / ~4.6 min/leaf
+# (EMRI). Under {MBH,EMRI}_EIGEN_INFO=gram (the V9-30 default below) a build
+# is ~2 x (2 ndim + 1) of the move's own FAST templates -- the batched
+# windowed MBH generator (~0.02 s/row) and the EMRI direct-to-WDM adapter --
+# so an expected few seconds per leaf (SOBBH's lookup Gram measures ~0.6 s;
+# the MBH/EMRI builds were not yet timed on the cluster -- read the
+# "[eigen_refresh] <branch> leaf N Gram info matrix ... in X s" lines). The
+# first Gram rebuild (job 744,
+# store row ~690) widened the chains from 30-50x inside the Fisher width
+# toward it: the ll tables' steps were 10-900x too small. Escape:
 # {BRANCH}_INNER_MOVE_KIND=stretch above.
 export MBH_EIGEN_SCOPE=walker_max
 export EMRI_EIGEN_SCOPE=walker_max
-export MBH_EIGEN_REFRESH=100
-export EMRI_EIGEN_REFRESH=100
+export MBH_EIGEN_REFRESH=${MBH_EIGEN_REFRESH:-10}
+export EMRI_EIGEN_REFRESH=${EMRI_EIGEN_REFRESH:-10}
 # WATCH ON FIRST LAUNCH: any "[eigen_refresh] ... fallback" WARNING means
 # a table build failed and that leaf is sampling on identity/1%-width
 # tables (correct but slow -- MH corrects the shape); a steady stream of

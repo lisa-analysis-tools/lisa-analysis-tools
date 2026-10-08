@@ -656,6 +656,9 @@ class SixMonthV9DeltaTest(unittest.TestCase):
             # 2026-10-07: the GB ladder re-spacing (hot half at 1.35 from
             # T10, top rung unpinned); fresh stores only, v8 predates it
             "GB_LADDER_HOT_RATIO", "GB_LADDER_HOT_FROM", "GB_LADDER_PIN_LAST",
+            # 2026-10-08: MBH / EMRI eigen tables refresh every 10 visits
+            # (Gram from the fast templates; v8 refreshed its ll tables at 100)
+            "MBH_EIGEN_REFRESH", "EMRI_EIGEN_REFRESH",
             # the offline 3mo galfor start point
             "GALFOR_START_PARAMS",
             # the galfor RATCHET (2026-09-30): one gated noise proposal at
@@ -2709,6 +2712,9 @@ class V930ProductionDefaultsTest(unittest.TestCase):
         # script" -- the GB ladder re-spacing, effective on a fresh store
         "GB_LADDER_HOT_RATIO": "1.35", "GB_LADDER_HOT_FROM": "10",
         "GB_LADDER_PIN_LAST": "0",
+        # ruling 2026-10-08: "update them now with fast waveforms to do the
+        # same thing as the sobhbs psd and galfor" (was 100)
+        "MBH_EIGEN_REFRESH": "10", "EMRI_EIGEN_REFRESH": "10",
     }
 
     def test_the_line_is_the_default_in_every_v9_production_launcher(self):
