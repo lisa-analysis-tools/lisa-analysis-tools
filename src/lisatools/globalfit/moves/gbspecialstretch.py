@@ -4894,6 +4894,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # that pin. NOTE: the (N,M)->F path is validated (the proposal grid
         # finds the real source), but the A_max inversion on those pieces is
         # new -- verify births land at sane distances on the first GPU run.
+        # TODO (user ruling 2026-10-07, LATER NOT NOW): the distance-birth
+        # path is not used and will not be ("we are not using the
+        # RJ_FSTAT_DIST_BIRTH and we will not be in the future"; every v8/v9
+        # production launcher exports GB_RJ_FSTAT_DIST_BIRTH=0). Consider
+        # REMOVING it together with every ``rj_fstat_dist_birth`` gate in this
+        # file (grep the attribute; ~11 sites incl. the per-round centers
+        # block) and the knob. Nothing load-bearing may sit behind the flag
+        # in the meantime (ruling 2026-09-26: "anything important should not
+        # be behind that flag" -- it once silently disabled the band-shutoff
+        # valve).
         _fdb_env = os.environ.get("GB_RJ_FSTAT_DIST_BIRTH")
         self.rj_fstat_dist_birth = (
             bool(int(_fdb_env)) if _fdb_env is not None
