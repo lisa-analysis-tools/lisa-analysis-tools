@@ -935,22 +935,17 @@ class GlobalFit:
         so a looser window that merely caught order-of-magnitude basis
         mistakes would wave through a point that kills the run.
 
-        ``GALFOR_ALPHA_MAX`` widens alpha exactly as ``galfor_prior_dict``
-        does. Returns ``()`` for an unknown branch (no check).
+        ``GALFOR_ALPHA_MAX`` and ``GALFOR_FREQ_PRIOR`` move the box exactly as
+        ``galfor_prior_dict`` does (one resolver, ``galfor_prior_ranges``).
+        Returns ``()`` for an unknown branch (no check).
         """
-        from .stock.erebor.noise import (
-            GALFOR_BASIS, GALFOR_PRIOR_RANGE, PSD_PRIOR_RANGE)
+        from .stock.erebor.noise import PSD_PRIOR_RANGE, galfor_prior_ranges
 
         if branch == "psd":
             return tuple(tuple(map(float, r)) for r in PSD_PRIOR_RANGE)
         if branch != "galfor":
             return ()
-        rngs = [tuple(map(float, r)) for r in GALFOR_PRIOR_RANGE]
-        _am = os.environ.get("GALFOR_ALPHA_MAX", "").strip()
-        if _am:
-            ia = GALFOR_BASIS.index("alpha")
-            rngs[ia] = (rngs[ia][0], float(_am))
-        return tuple(rngs)
+        return galfor_prior_ranges()
 
     def _seed_noise_start_coords(self, branch: str, raw: str, drawn):
         """``{PSD,GALFOR}_START_PARAMS`` -> start coords for a noise branch.

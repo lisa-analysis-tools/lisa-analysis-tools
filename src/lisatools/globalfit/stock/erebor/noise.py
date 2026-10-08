@@ -320,9 +320,69 @@ GALFOR_BASIS = ("amp", "fk", "alpha", "f_1", "f_2")
 # Everything except the power-law index spans decades and is strictly
 # positive, so those four are the ones a log basis helps.
 GALFOR_LOG_PARAMS = ("amp", "fk", "f_1", "f_2")
+#: The three FREQUENCY columns (Hz) that ``GALFOR_FREQ_PRIOR`` moves together.
+GALFOR_FREQ_PARAMS = ("fk", "f_1", "f_2")
 
 
-def galfor_prior_dict(log_sampling: bool = False, *, alpha_max=None) -> dict:
+def _freq_range_from_env():
+    """``GALFOR_FREQ_PRIOR="lo,hi"`` (Hz) -> ``(lo, hi)``, or ``None`` when unset."""
+    raw = os.environ.get("GALFOR_FREQ_PRIOR", "").strip()
+    if not raw:
+        return None
+    parts = [p.strip() for p in raw.split(",")]
+    if len(parts) != 2:
+        raise ValueError(
+            f"GALFOR_FREQ_PRIOR={raw!r}: expected 'lo,hi' in Hz (two comma-separated numbers).")
+    try:
+        return (float(parts[0]), float(parts[1]))
+    except ValueError as exc:
+        raise ValueError(f"GALFOR_FREQ_PRIOR={raw!r}: not two numbers ({exc}).") from None
+
+
+def galfor_prior_ranges(*, alpha_max=None, freq_range=None) -> tuple:
+    """The PHYSICAL (linear) support of the 5 galfor columns, knobs applied.
+
+    THE ONE RESOLVER. :func:`galfor_prior_dict` builds the prior from it, and
+    the two places that need the support without the prior object -- the
+    ``{PSD,GALFOR}_START_PARAMS`` window in ``run.py`` and the
+    ``warmstart.noise_pin`` refusal -- read it from here, so a knob can never
+    move the prior without moving the checks (a pin inside the new prior would
+    otherwise be refused by the old box).
+
+    ``alpha_max`` (env ``GALFOR_ALPHA_MAX``) raises ONLY the alpha upper cap.
+    ``freq_range`` (env ``GALFOR_FREQ_PRIOR="lo,hi"`` in Hz) moves the THREE
+    frequency columns :data:`GALFOR_FREQ_PARAMS` (fk, f_1, f_2) to one shared
+    box -- user ruling 2026-10-08 for the 9mo / 1yr runs: "(fk, f1, f2) ...
+    from 1e-4 to 1e-2" (the stock box is fk 0.8-10 mHz, f_1 / f_2 10 uHz-10
+    mHz). Unset, both leave every bound bit-identical. A kwarg beats its env.
+
+    ⚠ RESUME HAZARD, as for the stock box: a chain whose fk / f_1 / f_2 sits
+    outside the new support prices at ``log_prior = -inf`` on the next launch,
+    and nothing in the noise-model identity covers prior ranges. The 9mo / 1yr
+    stores start fresh; the 6mo relaunch keeps the stock box.
+    """
+    if alpha_max is None:
+        _env = os.environ.get("GALFOR_ALPHA_MAX")
+        alpha_max = float(_env) if _env else None
+    if freq_range is None:
+        freq_range = _freq_range_from_env()
+    ranges = [tuple(map(float, r)) for r in GALFOR_PRIOR_RANGE]
+    if alpha_max is not None:
+        ia = GALFOR_BASIS.index("alpha")
+        lo_a, _hi_a = ranges[ia]
+        ranges[ia] = (lo_a, float(alpha_max))
+    if freq_range is not None:
+        lo_f, hi_f = (float(freq_range[0]), float(freq_range[1]))
+        if not (0.0 < lo_f < hi_f):
+            raise ValueError(
+                f"galfor frequency prior ({lo_f:g}, {hi_f:g}) Hz must satisfy 0 < lo < hi.")
+        for name in GALFOR_FREQ_PARAMS:
+            ranges[GALFOR_BASIS.index(name)] = (lo_f, hi_f)
+    return tuple(ranges)
+
+
+def galfor_prior_dict(log_sampling: bool = False, *, alpha_max=None,
+                      freq_range=None) -> dict:
     """``{index: uniform_dist}`` for the 5-param galactic-foreground branch.
 
     ``log_sampling`` switches ``amp, fk, f_1, f_2`` (:data:`GALFOR_LOG_PARAMS`)
@@ -348,14 +408,9 @@ def galfor_prior_dict(log_sampling: bool = False, *, alpha_max=None) -> dict:
     to the constant ``ln 10``, so the posterior is unchanged; only the stored
     numbers and the step scale differ.
     """
-    if alpha_max is None:
-        _env = os.environ.get("GALFOR_ALPHA_MAX")
-        alpha_max = float(_env) if _env else None
-    ranges = list(GALFOR_PRIOR_RANGE)
-    if alpha_max is not None:
-        ia = GALFOR_BASIS.index("alpha")
-        lo_a, _hi_a = ranges[ia]
-        ranges[ia] = (lo_a, float(alpha_max))
+    # ``freq_range`` (env ``GALFOR_FREQ_PRIOR``): the fk / f_1 / f_2 box, see
+    # :func:`galfor_prior_ranges` (the one resolver, shared with the pin checks).
+    ranges = galfor_prior_ranges(alpha_max=alpha_max, freq_range=freq_range)
     priors = {}
     for i, (name, (lo, hi)) in enumerate(zip(GALFOR_BASIS, ranges)):
         if log_sampling and name in GALFOR_LOG_PARAMS:

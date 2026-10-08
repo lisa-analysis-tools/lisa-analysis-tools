@@ -59,8 +59,9 @@ def _windows(kind):
 
     Read from the module that DEFINES the prior rather than duplicated here
     (a hand-rolled window drifts, and this one has to be exactly the box the
-    chain is allowed to live in). ``GALFOR_ALPHA_MAX`` widens alpha the same
-    way ``galfor_prior_dict`` does.
+    chain is allowed to live in). ``GALFOR_ALPHA_MAX`` and ``GALFOR_FREQ_PRIOR``
+    move the box the same way ``galfor_prior_dict`` does (one resolver,
+    ``galfor_prior_ranges``).
 
     ⚠ WHY THE PRIOR AND NOT A LOOSER "SANITY" WINDOW. A pin outside the
     branch's support puts EVERY walker and EVERY rung at ``log_prior =
@@ -68,17 +69,11 @@ def _windows(kind):
     basis mistakes would pass such a point and the run would die -- or
     worse, sit there. The prior is the real constraint, so it is the test.
     """
-    from ...globalfit.stock.erebor.noise import (
-        GALFOR_BASIS, GALFOR_PRIOR_RANGE, PSD_PRIOR_RANGE)
+    from ...globalfit.stock.erebor.noise import PSD_PRIOR_RANGE, galfor_prior_ranges
 
     if kind == "psd":
         return tuple(tuple(map(float, r)) for r in PSD_PRIOR_RANGE)
-    rngs = [tuple(map(float, r)) for r in GALFOR_PRIOR_RANGE]
-    _am = os.environ.get("GALFOR_ALPHA_MAX", "").strip()
-    if _am:
-        ia = GALFOR_BASIS.index("alpha")
-        rngs[ia] = (rngs[ia][0], float(_am))
-    return tuple(rngs)
+    return galfor_prior_ranges()
 
 
 def _looks_log(vals, log_cols) -> bool:
