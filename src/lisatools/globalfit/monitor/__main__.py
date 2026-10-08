@@ -48,12 +48,14 @@ from . import (build_monitor, build_short_monitor, build_truth_set,
 from .snapshot import build_snapshot
 
 USAGE = ("usage: python -m lisatools.globalfit.monitor [--snapshot] "
-         "[--short-page] [--build-truth] RUN_DIR [OUT.html] "
+         "[--short-page] [--build-truth] [--keep N] RUN_DIR [OUT.html] "
          "[-- BUILD_TRUTH_ARGS...]\n"
          "       --snapshot     also build <RUN_DIR>_snapshot.tar.gz\n"
          "       --short-page   the SHORT page <RUN_DIR>_monitor_short.html "
          "instead of the full one\n"
          "       --build-truth  generate the truth set into RUN_DIR first\n"
+         "       --keep N       keep N warm-chain iterations (default: 5, or 1 with --short)\n"
+         "       --cold-keep N  keep N cold-chain iterations (default: 12, or 1 with --short)\n"
          "       (a downloaded tarball goes the other way: python -m "
          "lisatools.globalfit.monitor.from_tar SNAP.tar.gz)")
 
@@ -111,6 +113,14 @@ def _parser():
                          "gb_fstat_fit/ (large; off by default, only their "
                          "DONE.json markers are kept). Ignored by --short. "
                          "In-run equivalent: GF_MONITOR_SNAPSHOT_FSTAT=1.")
+    ap.add_argument("--keep", type=int, default=None,
+                    help="number of warm-chain iterations to keep in the "
+                         "snapshot extract (default: 5 for normal, 1 for "
+                         "--short). Explicit value overrides --short default.")
+    ap.add_argument("--cold-keep", type=int, default=None,
+                    help="number of cold-chain iterations to keep in the "
+                         "snapshot extract (default: 12 for normal, 1 for "
+                         "--short). Explicit value overrides --short default.")
     ap.add_argument("--build-truth", action="store_true",
                     help="generate the detectability truth set into the run "
                          "directory first when it is missing or was built "
@@ -192,7 +202,8 @@ def main(argv=None):
 
     if a.snapshot or a.snapshot_only or a.short:
         st = time.perf_counter()
-        tar = build_snapshot(run_dir, short=a.short, include_fstat=a.add_fstat)
+        tar = build_snapshot(run_dir, short=a.short, include_fstat=a.add_fstat,
+                             keep=a.keep, cold_keep=a.cold_keep)
         if tar:
             print(f"[monitor] wrote {tar} in {time.perf_counter() - st:.1f} s")
         else:
