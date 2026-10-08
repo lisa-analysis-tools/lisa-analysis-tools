@@ -436,48 +436,18 @@ except Exception:
 # RUN IDENTITY (2026-08-15): one generator now serves several runs (3-mo
 # production, 23-mo scaling). Derive the label from the store rather than
 # hard-coding it, so a 23-mo page can never be mislabelled as the 3-mo one.
+# 2026-10-07: the name ladder lives in ``_identity.run_identity`` (shared
+# with the lean generator), every historical branch verbatim plus ONE
+# generic ``<N>mo_v<K>`` / ``<N>yr_v<K>`` rule -- so the 9mo v9 store gets
+# its own banner and arm cache instead of the 3-Month / v2 fall-through that
+# clobbered gf_arm_v2.npz four times. ``_arm_tag`` is the cache-name map.
+from lisatools.globalfit.monitor._identity import (  # noqa: E402
+    arm_tag as _arm_tag,
+    run_identity as _run_identity,
+)
+
 _base = os.path.basename(os.path.normpath(RUN_DIR))
-if "23mo" in _base:
-    RUN_LABEL, RUN_KIND = "23-Month", "23mo"
-elif "6mo" in _base:
-    RUN_LABEL, RUN_KIND = "6-Month", "6mo"
-elif _base.endswith("_v4") or "3mo_v4" in _base:
-    RUN_LABEL, RUN_KIND = "3-Month v4", "3mo_v4"
-elif _base.endswith("_v3") or "3mo_v3" in _base:
-    # The v3 A/B carries the same Tobs as v2, so the label has to come from
-    # the VARIANT or the two pages are indistinguishable in a browser tab --
-    # which is the whole point of running them side by side.
-    RUN_LABEL, RUN_KIND = "3-Month v3", "3mo_v3"
-elif "1yr_v8" in _base or (_base.endswith("_v8") and "1yr" in _base):
-    # 2026-09-03: the v8 lineage 1-yr run (submit_gf_1yr_v8.sh). Its own
-    # arm cache + banner so it never collides with the v5 1-yr page.
-    RUN_LABEL, RUN_KIND = "1-Year v8", "1yr_v8"
-elif "1yr" in _base:
-    # 2026-08-22: without this branch the 1-yr page fell through to the
-    # 3-Month banner AND (worse) the v2 ARM_TAG, clobbering the shared
-    # gf_arm_v2.npz cache with 1-yr data.
-    RUN_LABEL, RUN_KIND = "1-Year v5", "1yr_v5"
-elif _base.endswith("_v5") or "3mo_v5" in _base:
-    RUN_LABEL, RUN_KIND = "3-Month v5", "3mo_v5"
-elif _base.endswith("_v6") or "3mo_v6" in _base:
-    RUN_LABEL, RUN_KIND = "3-Month v6", "3mo_v6"
-elif _base.endswith("_v7") or "3mo_v7" in _base:
-    # 2026-08-26: same trap as the 1-yr branch above -- without this the
-    # v7 page fell through to the plain 3-Month banner AND the v2
-    # ARM_TAG, clobbering gf_arm_v2.npz on its first generation.
-    RUN_LABEL, RUN_KIND = "3-Month v7", "3mo_v7"
-elif "10walker" in _base and ("3mo_v8" in _base or _base.endswith("_v8")):
-    # 2026-09-05: the v8 3-month 10-WALKER twin (gf_prod_3mo_v8_10walkers).
-    # Own arm tag + banner so its overlay curve reads "3mo_v8_10w", distinct
-    # from the 24-walker "3mo_v8_24w" arm -- both otherwise collide on the
-    # plain "3mo_v8" tag and clobber each other's gf_arm_3mo_v8.npz cache.
-    RUN_LABEL, RUN_KIND = "3-Month v8 · 10 Walkers", "3mo_v8_10w"
-elif _base.endswith("_v8") or "3mo_v8" in _base:
-    # 2026-09-02: hit for the THIRD time (1yr, v7, now v8) -- the fall-through
-    # clobbers gf_arm_v2.npz. If a v9 ever exists, generalize this ladder.
-    RUN_LABEL, RUN_KIND = "3-Month v8", "3mo_v8"
-else:
-    RUN_LABEL, RUN_KIND = "3-Month", "3mo"
+RUN_LABEL, RUN_KIND = _run_identity(_base)
 
 # ---- persistent commentary sidecar (2026-08-27) --------------------------
 # Hand-written notes must survive page regeneration (the page is rebuilt
@@ -4615,9 +4585,9 @@ if TRU is not None:
     # subtracts it.
     # Every run kind gets its OWN arm cache (2026-08-22): the old
     # {v3, v4}-else-v2 map sent v5, v6 AND the 1-yr run all to
-    # gf_arm_v2.npz, silently clobbering the shared v2 arm.
-    ARM_TAG = {"3mo_v3": "v3", "3mo_v4": "v4", "3mo": "v2"}.get(
-        RUN_KIND, RUN_KIND)
+    # gf_arm_v2.npz, silently clobbering the shared v2 arm. The map is
+    # ``_identity.arm_tag`` since 2026-10-07 (shared with the lean twin).
+    ARM_TAG = _arm_tag(RUN_KIND)
     try:
         # ``ti`` = the truth indices FOUND at the last row under the page's
         # headline criterion (overlap-refined when available): F6's
