@@ -1704,9 +1704,19 @@ class RJRecipeStep(BaseRecipeStep):
         # 30 and reset the clock there, pushing the earliest possible stage end
         # from iteration 66 to 71.
         #
-        # ⚠ DEFAULT OFF (user ruling, same day: "add that tracking as an option
-        # default off for now so it does not mess up the current runs"). Unset,
-        # this block is a no-op and the clock restarts exactly as before.
+        # CODE DEFAULT OFF (user ruling, same day: "add that tracking as an
+        # option default off for now so it does not mess up the current
+        # runs"). Unset, this block is a no-op and the clock restarts exactly
+        # as before. The v9 production launchers export it ON since
+        # 2026-10-07 (user ruling: "keep GF_PERSIST_STAGE_START, but it should
+        # reset at the end of a stage" -- the reset is
+        # ``GFHDFBackend.completed_recipe_step``, which rewrites the next
+        # step's start_iteration at every boundary; here a stored start PAST
+        # the live iteration, i.e. a rewound store, is ignored and re-stamped).
+        # Compute ranks run this method too (run.py stamps every step against
+        # the shell engine), but their engine carries eryn's in-memory Backend
+        # (no stage_start_iteration / stamp_stage_start), so the block is
+        # inert there and the store is never touched off the head.
         if os.environ.get("GF_PERSIST_STAGE_START", "0").strip() in (
                 "1", "true", "True", "yes", "on"):
             _name = getattr(self, "stage_name", None) or getattr(
@@ -1715,6 +1725,13 @@ class RJRecipeStep(BaseRecipeStep):
                 _stored = None
                 if hasattr(sampler.backend, "stage_start_iteration"):
                     _stored = sampler.backend.stage_start_iteration(_name)
+                if _stored is not None and int(_stored) > self._stage_start_iter:
+                    logger.warning(
+                        "[STAGE-START] %s: stored start iteration %d is PAST "
+                        "the live iteration %d (a rewound store?) -- ignoring "
+                        "it and re-stamping the live iteration.",
+                        _name, int(_stored), self._stage_start_iter)
+                    _stored = None
                 if _stored is not None:
                     self._stage_start_iter = int(_stored)
                     logger.info(

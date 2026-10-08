@@ -1254,11 +1254,26 @@ class GFHDFBackend(eryn_HDFBackend):
                 # the galfor ratchet's schedule is keyed on the stage-local
                 # iteration and would otherwise nudge again on every
                 # relaunch. Companion to ``stage_start_iteration`` /
-                # ``stamp_stage_start``; an existing stamp is kept.
+                # ``stamp_stage_start``.
+                #
+                # THE STAMP IS RESET HERE (user ruling 2026-10-07: "keep
+                # GF_PERSIST_STAGE_START, but it should reset at the end of a
+                # stage"). Until then an existing stamp was kept, so a stale
+                # start on the next step -- a rewound, migrated or hand-reset
+                # store -- would have been restored on the next launch and the
+                # stage's convergence clock would have read as already
+                # elapsed. The boundary is the one place the start is known
+                # exactly, and a plain resume never reaches this line, so the
+                # origin a resume restores is still the one the boundary wrote.
                 if next_step_name is not None and next_step_name in recipe_group:
                     _nxt = recipe_group[next_step_name]
-                    if _nxt.attrs.get("start_iteration") is None:
-                        _nxt.attrs["start_iteration"] = _it
+                    _old = _nxt.attrs.get("start_iteration")
+                    if _old is not None and int(_old) != _it:
+                        logger.info(
+                            "recipe step %s: start_iteration %d -> %d, reset at "
+                            "the end of %s.", next_step_name, int(_old), _it,
+                            step_name)
+                    _nxt.attrs["start_iteration"] = _it
 
     # ---- search legs: the row's leg-ender name + the stage's move order ----
     def saved_after(self, it):

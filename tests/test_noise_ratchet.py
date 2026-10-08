@@ -959,7 +959,14 @@ class NextStepStartStampTest(unittest.TestCase):
                 s.attrs["order num"] = i
         return path
 
-    def test_backend_stamps_next_start_once(self):
+    def test_backend_stamps_next_start_and_resets_a_stale_one(self):
+        """User ruling 2026-10-07: "keep GF_PERSIST_STAGE_START, but it should
+        reset at the end of a stage". The boundary REWRITES the next step's
+        start_iteration (until then an existing stamp was kept, so a stale
+        start on a rewound / migrated / hand-reset store would have been
+        restored on the next launch and the stage clock would have read as
+        already elapsed). A plain resume never reaches completed_recipe_step,
+        so the origin a resume restores is still the one the boundary wrote."""
         import tempfile
 
         import h5py
@@ -968,20 +975,25 @@ class NextStepStartStampTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             path = self._store(tmp)
+            # a stale stamp on the next step, as a rewound store would carry
+            with h5py.File(path, "a") as f:
+                f["global_fit/recipe/gb_search_3"].attrs["start_iteration"] = 12
             be = GFHDFBackend(path)
             be.completed_recipe_step("gb_search_2", next_step_name="gb_search_3")
             with h5py.File(path, "r") as f:
                 r = f["global_fit/recipe"]
                 self.assertTrue(bool(r["gb_search_2"].attrs["status"]))
                 self.assertEqual(int(r["gb_search_2"].attrs["completed_iteration"]), 47)
-                self.assertEqual(int(r["gb_search_3"].attrs["start_iteration"]), 47)
+                self.assertEqual(int(r["gb_search_3"].attrs["start_iteration"]), 47)   # 12 reset
                 self.assertIsNone(r["full_pe"].attrs.get("start_iteration"))
             self.assertEqual(be.stage_start_iteration("gb_search_3"), 47)
-            # an existing stamp is KEPT (a resume never rewrites the origin)
+            # a second boundary write (the stage re-run and completed again at
+            # 60) resets the next stage's start again -- the stamp follows the
+            # LAST completion, never the first
             with h5py.File(path, "a") as f:
                 f["global_fit"].attrs["iteration"] = 60
             be.completed_recipe_step("gb_search_2", next_step_name="gb_search_3")
-            self.assertEqual(be.stage_start_iteration("gb_search_3"), 47)
+            self.assertEqual(be.stage_start_iteration("gb_search_3"), 60)
 
     def test_recipe_passes_the_next_incomplete_step(self):
         from lisatools.globalfit.recipe import Recipe

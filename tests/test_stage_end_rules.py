@@ -10,7 +10,12 @@ logL per (band, walker)"). =0 restores the composed rule.
 by stamping its start iteration in the backend, instead of resetting it to
 the live iteration on every launch.
 
-``GF_PERSIST_STAGE_START`` stays DEFAULT OFF.
+``GF_PERSIST_STAGE_START`` stays DEFAULT OFF in the code; the v9 production
+launchers export it ON since 2026-10-07 (user ruling: "keep
+GF_PERSIST_STAGE_START, but it should reset at the end of a stage" -- the
+boundary reset is ``GFHDFBackend.completed_recipe_step``, pinned in
+tests/test_noise_ratchet.py::NextStepStartStampTest; here: a stored start
+PAST the live iteration, a rewound store, is ignored and re-stamped).
 """
 import os
 import unittest
@@ -147,6 +152,19 @@ class PersistStageStartTest(unittest.TestCase):
         # job 640 -> 644 resumed at 30; the clock must NOT restart there
         self.assertEqual(self._setup_run(be, 30), 25)
         self.assertEqual(be.stamped["gb_search_1"], 25)
+
+    def test_armed_ignores_a_stored_start_past_the_live_iteration(self):
+        """A rewound store (rows dropped below the stamp) carries a start the
+        stage cannot have had; restoring it would make the clock read as
+        already elapsed. Ignore it and re-stamp the live iteration (user ruling
+        2026-10-07: the stamp resets, it is never trusted blindly)."""
+        os.environ["GF_PERSIST_STAGE_START"] = "1"
+        be = _FakeBackend(30, np.zeros(1))
+        be.stamped["gb_search_1"] = 50
+        self.assertEqual(self._setup_run(be, 30), 30)
+        self.assertEqual(be.stamped["gb_search_1"], 30)
+        # and from then on it is the ordinary resume case
+        self.assertEqual(self._setup_run(be, 35), 30)
 
     def test_a_backend_without_the_api_falls_back_silently(self):
         """A backend predating the two methods must not raise -- it just
