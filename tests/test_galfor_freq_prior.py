@@ -24,7 +24,8 @@ OTHER_COLS = [i for i in range(len(GALFOR_BASIS)) if i not in FREQ_COLS]
 
 
 class _EnvMixin:
-    KNOBS = ("GALFOR_FREQ_PRIOR", "GALFOR_ALPHA_MAX")
+    KNOBS = ("GALFOR_FREQ_PRIOR", "GALFOR_ALPHA_MAX", "GALFOR_FK_PRIOR",
+             "GALFOR_F1_PRIOR", "GALFOR_F2_PRIOR")
 
     def setUp(self):
         self._saved = {k: os.environ.pop(k, None) for k in self.KNOBS}
@@ -97,6 +98,68 @@ class GalforFreqPriorTest(_EnvMixin, unittest.TestCase):
         rngs = galfor_prior_ranges(freq_range=(1e-4, 1e-2))
         for i, (lo, hi) in enumerate(rngs):
             self.assertTrue(lo <= pin[i] <= hi, (GALFOR_BASIS[i], pin[i], lo, hi))
+
+
+class GalforPerColumnPriorTest(_EnvMixin, unittest.TestCase):
+    """User ruling 2026-10-09: "adjust the foreground prior for f_k and f_2 to go
+    from 0.8 mHz to 10 mHz. Keep f_1 as is." -- per-column knobs that override
+    the shared box for ONE column each."""
+
+    FK, F1, F2 = (GALFOR_BASIS.index(n) for n in ("fk", "f_1", "f_2"))
+
+    def test_the_9mo_box(self):
+        # the 9mo / 1yr launchers: f_1 keeps the 10-08 box, fk and f_2 take 0.8-10 mHz
+        os.environ["GALFOR_FK_PRIOR"] = "0.8e-3,1e-2"
+        os.environ["GALFOR_F1_PRIOR"] = "1e-4,1e-2"
+        os.environ["GALFOR_F2_PRIOR"] = "0.8e-3,1e-2"
+        r = galfor_prior_ranges()
+        self.assertEqual(r[self.FK], (0.8e-3, 1e-2))
+        self.assertEqual(r[self.F1], (1e-4, 1e-2))
+        self.assertEqual(r[self.F2], (0.8e-3, 1e-2))
+        base = tuple(tuple(map(float, x)) for x in GALFOR_PRIOR_RANGE)
+        for i in OTHER_COLS:
+            self.assertEqual(r[i], base[i], GALFOR_BASIS[i])
+
+    def test_a_column_knob_beats_the_shared_box_for_its_column_only(self):
+        os.environ["GALFOR_FREQ_PRIOR"] = "1e-4,1e-2"
+        os.environ["GALFOR_F2_PRIOR"] = "0.8e-3,1e-2"
+        r = galfor_prior_ranges()
+        self.assertEqual(r[self.FK], (1e-4, 1e-2))
+        self.assertEqual(r[self.F1], (1e-4, 1e-2))
+        self.assertEqual(r[self.F2], (0.8e-3, 1e-2))
+
+    def test_kwargs_beat_env_and_reach_the_prior_dict(self):
+        os.environ["GALFOR_FK_PRIOR"] = "2e-4,5e-3"
+        self.assertEqual(galfor_prior_ranges(fk_range=(0.8e-3, 1e-2))[self.FK], (0.8e-3, 1e-2))
+        d = galfor_prior_dict(f2_range=(0.8e-3, 1e-2))
+        self.assertEqual((d[self.F2].minimum, d[self.F2].maximum), (0.8e-3, 1e-2))
+        d = galfor_prior_dict(log_sampling=True, f2_range=(0.8e-3, 1e-2))
+        self.assertAlmostEqual(d[self.F2].minimum, np.log10(0.8e-3), places=12)
+
+    def test_bad_column_values_are_refused(self):
+        for bad in ("1e-2,0.8e-3", "0,1e-2", "1e-3"):
+            os.environ["GALFOR_F2_PRIOR"] = bad
+            with self.assertRaises(ValueError):
+                galfor_prior_ranges()
+        os.environ.pop("GALFOR_F2_PRIOR", None)
+        with self.assertRaises(ValueError):
+            galfor_prior_ranges(fk_range=(1e-2, 0.8e-3))
+
+    def test_the_9mo_start_pin_sits_inside_the_column_box(self):
+        # fk 2.53 mHz, f_1 10 mHz, f_2 1.41 mHz (physical) vs fk/f_2 0.8-10 mHz, f_1 0.1-10 mHz
+        pin = [1.436180605904e-44, 2.533915614978e-03, 5.0, 1.0e-02, 1.405721657329e-03]
+        r = galfor_prior_ranges(fk_range=(0.8e-3, 1e-2), f1_range=(1e-4, 1e-2), f2_range=(0.8e-3, 1e-2))
+        for i, (lo, hi) in enumerate(r):
+            self.assertTrue(lo <= pin[i] <= hi, (GALFOR_BASIS[i], pin[i], lo, hi))
+
+    def test_both_pin_windows_follow_the_column_knobs(self):
+        from lisatools.globalfit.run import GlobalFit
+        from lisatools.globalfit.warmstart.noise_pin import _windows
+
+        os.environ["GALFOR_F2_PRIOR"] = "0.8e-3,1e-2"
+        self.assertEqual(_windows("galfor"), galfor_prior_ranges())
+        self.assertEqual(GlobalFit._noise_pin_window("galfor"), galfor_prior_ranges())
+        self.assertEqual(_windows("galfor")[self.F2], (0.8e-3, 1e-2))
 
 
 class SupportWindowsShareTheKnobTest(_EnvMixin, unittest.TestCase):

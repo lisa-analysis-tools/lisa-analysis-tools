@@ -324,22 +324,43 @@ GALFOR_LOG_PARAMS = ("amp", "fk", "f_1", "f_2")
 GALFOR_FREQ_PARAMS = ("fk", "f_1", "f_2")
 
 
-def _freq_range_from_env():
-    """``GALFOR_FREQ_PRIOR="lo,hi"`` (Hz) -> ``(lo, hi)``, or ``None`` when unset."""
-    raw = os.environ.get("GALFOR_FREQ_PRIOR", "").strip()
+#: Per-column overrides of the frequency box: ``GALFOR_FK_PRIOR``,
+#: ``GALFOR_F1_PRIOR``, ``GALFOR_F2_PRIOR`` (each ``"lo,hi"`` in Hz); they win
+#: over the shared ``GALFOR_FREQ_PRIOR`` for their column.
+GALFOR_FREQ_PRIOR_ENV = {"fk": "GALFOR_FK_PRIOR", "f_1": "GALFOR_F1_PRIOR",
+                         "f_2": "GALFOR_F2_PRIOR"}
+
+
+def _range_from_env(name: str):
+    """``<name>="lo,hi"`` (Hz) -> ``(lo, hi)``, or ``None`` when unset."""
+    raw = os.environ.get(name, "").strip()
     if not raw:
         return None
     parts = [p.strip() for p in raw.split(",")]
     if len(parts) != 2:
         raise ValueError(
-            f"GALFOR_FREQ_PRIOR={raw!r}: expected 'lo,hi' in Hz (two comma-separated numbers).")
+            f"{name}={raw!r}: expected 'lo,hi' in Hz (two comma-separated numbers).")
     try:
         return (float(parts[0]), float(parts[1]))
     except ValueError as exc:
-        raise ValueError(f"GALFOR_FREQ_PRIOR={raw!r}: not two numbers ({exc}).") from None
+        raise ValueError(f"{name}={raw!r}: not two numbers ({exc}).") from None
 
 
-def galfor_prior_ranges(*, alpha_max=None, freq_range=None) -> tuple:
+def _freq_range_from_env():
+    """``GALFOR_FREQ_PRIOR="lo,hi"`` (Hz) -> ``(lo, hi)``, or ``None`` when unset."""
+    return _range_from_env("GALFOR_FREQ_PRIOR")
+
+
+def _checked_range(label: str, rng) -> tuple:
+    lo_f, hi_f = (float(rng[0]), float(rng[1]))
+    if not (0.0 < lo_f < hi_f):
+        raise ValueError(
+            f"galfor {label} prior ({lo_f:g}, {hi_f:g}) Hz must satisfy 0 < lo < hi.")
+    return (lo_f, hi_f)
+
+
+def galfor_prior_ranges(*, alpha_max=None, freq_range=None, fk_range=None,
+                        f1_range=None, f2_range=None) -> tuple:
     """The PHYSICAL (linear) support of the 5 galfor columns, knobs applied.
 
     THE ONE RESOLVER. :func:`galfor_prior_dict` builds the prior from it, and
@@ -354,7 +375,11 @@ def galfor_prior_ranges(*, alpha_max=None, freq_range=None) -> tuple:
     frequency columns :data:`GALFOR_FREQ_PARAMS` (fk, f_1, f_2) to one shared
     box -- user ruling 2026-10-08 for the 9mo / 1yr runs: "(fk, f1, f2) ...
     from 1e-4 to 1e-2" (the stock box is fk 0.8-10 mHz, f_1 / f_2 10 uHz-10
-    mHz). Unset, both leave every bound bit-identical. A kwarg beats its env.
+    mHz). ``fk_range`` / ``f1_range`` / ``f2_range`` (env ``GALFOR_FK_PRIOR`` /
+    ``GALFOR_F1_PRIOR`` / ``GALFOR_F2_PRIOR``) then override ONE column each
+    -- user ruling 2026-10-09: "adjust the foreground prior for f_k and f_2 to
+    go from 0.8 mHz to 10 mHz. Keep f_1 as is." Unset, every knob leaves the
+    bound bit-identical. A kwarg beats its env.
 
     ⚠ RESUME HAZARD, as for the stock box: a chain whose fk / f_1 / f_2 sits
     outside the new support prices at ``log_prior = -inf`` on the next launch,
@@ -372,17 +397,21 @@ def galfor_prior_ranges(*, alpha_max=None, freq_range=None) -> tuple:
         lo_a, _hi_a = ranges[ia]
         ranges[ia] = (lo_a, float(alpha_max))
     if freq_range is not None:
-        lo_f, hi_f = (float(freq_range[0]), float(freq_range[1]))
-        if not (0.0 < lo_f < hi_f):
-            raise ValueError(
-                f"galfor frequency prior ({lo_f:g}, {hi_f:g}) Hz must satisfy 0 < lo < hi.")
+        box = _checked_range("frequency", freq_range)
         for name in GALFOR_FREQ_PARAMS:
-            ranges[GALFOR_BASIS.index(name)] = (lo_f, hi_f)
+            ranges[GALFOR_BASIS.index(name)] = box
+    per_column = {"fk": fk_range, "f_1": f1_range, "f_2": f2_range}
+    for name, rng in per_column.items():
+        if rng is None:
+            rng = _range_from_env(GALFOR_FREQ_PRIOR_ENV[name])
+        if rng is not None:
+            ranges[GALFOR_BASIS.index(name)] = _checked_range(name, rng)
     return tuple(ranges)
 
 
 def galfor_prior_dict(log_sampling: bool = False, *, alpha_max=None,
-                      freq_range=None) -> dict:
+                      freq_range=None, fk_range=None, f1_range=None,
+                      f2_range=None) -> dict:
     """``{index: uniform_dist}`` for the 5-param galactic-foreground branch.
 
     ``log_sampling`` switches ``amp, fk, f_1, f_2`` (:data:`GALFOR_LOG_PARAMS`)
@@ -410,7 +439,9 @@ def galfor_prior_dict(log_sampling: bool = False, *, alpha_max=None,
     """
     # ``freq_range`` (env ``GALFOR_FREQ_PRIOR``): the fk / f_1 / f_2 box, see
     # :func:`galfor_prior_ranges` (the one resolver, shared with the pin checks).
-    ranges = galfor_prior_ranges(alpha_max=alpha_max, freq_range=freq_range)
+    ranges = galfor_prior_ranges(alpha_max=alpha_max, freq_range=freq_range,
+                                 fk_range=fk_range, f1_range=f1_range,
+                                 f2_range=f2_range)
     priors = {}
     for i, (name, (lo, hi)) in enumerate(zip(GALFOR_BASIS, ranges)):
         if log_sampling and name in GALFOR_LOG_PARAMS:

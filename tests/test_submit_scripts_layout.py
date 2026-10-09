@@ -2382,7 +2382,12 @@ _RECIPE_REPLACEMENTS = (
      "# and the noise-pin refusal, so the GALFOR_START_PARAMS pin (fk 2.53 mHz,\n"
      "# f_1 10 mHz, f_2 1.41 mHz) is inside the box. Fresh store only: a chain\n"
      "# outside the box would price at log_prior = -inf on resume.\n"
-     "export GALFOR_FREQ_PRIOR=${GALFOR_FREQ_PRIOR:-1e-4,1e-2}\n", 1),
+     "# 2026-10-09 (Mike): \"adjust the foreground prior for f_k and f_2 to go from\n"
+     "# 0.8 mHz to 10 mHz. Keep f_1 as is.\" -- per-column boxes, in Hz; f_1 keeps the\n"
+     "# 2026-10-08 box. The start pin (fk 2.53 mHz, f_1 10 mHz, f_2 1.41 mHz) is inside.\n"
+     "export GALFOR_FK_PRIOR=${GALFOR_FK_PRIOR:-0.8e-3,1e-2}\n"
+     "export GALFOR_F1_PRIOR=${GALFOR_F1_PRIOR:-1e-4,1e-2}\n"
+     "export GALFOR_F2_PRIOR=${GALFOR_F2_PRIOR:-0.8e-3,1e-2}\n", 1),
     # the source warm start from the 6mo cold chain (user ruling 2026-10-08;
     # the same entry in both derive tables)
     ("export MBH_START_FACTOR=0.0\nexport EMRI_START_FACTOR=0.0\nexport SOBBH_START_FACTOR=0.0\nexport VGB_START_FACTOR=0.0\n",
@@ -2462,7 +2467,9 @@ _RECIPE_EXPORTS = {
     "SOURCE_SEARCH_TOL": ("10", None),
     "SOURCE_SEARCH_MAX_ROUNDS": ("200", None),
     # the galfor frequency prior (2026-10-08): fk / f_1 / f_2 in one 0.1-10 mHz box
-    "GALFOR_FREQ_PRIOR": ("1e-4,1e-2", None),
+    "GALFOR_FK_PRIOR": ("0.8e-3,1e-2", None),
+    "GALFOR_F1_PRIOR": ("1e-4,1e-2", None),
+    "GALFOR_F2_PRIOR": ("0.8e-3,1e-2", None),
     # the source warm start from the 6mo cold chain (2026-10-08); the STORE
     # export is ${K-${GF_SEED_STORE}} and is asserted separately
     "SOURCE_WARM_START_SNR_MIN": ("10", None),

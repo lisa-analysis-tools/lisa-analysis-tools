@@ -115,7 +115,12 @@ REPL = [
      "# and the noise-pin refusal, so the GALFOR_START_PARAMS pin (fk 2.53 mHz,\n"
      "# f_1 10 mHz, f_2 1.41 mHz) is inside the box. Fresh store only: a chain\n"
      "# outside the box would price at log_prior = -inf on resume.\n"
-     "export GALFOR_FREQ_PRIOR=${GALFOR_FREQ_PRIOR:-1e-4,1e-2}\n", 1),
+     "# 2026-10-09 (Mike): \"adjust the foreground prior for f_k and f_2 to go from\n"
+     "# 0.8 mHz to 10 mHz. Keep f_1 as is.\" -- per-column boxes, in Hz; f_1 keeps the\n"
+     "# 2026-10-08 box. The start pin (fk 2.53 mHz, f_1 10 mHz, f_2 1.41 mHz) is inside.\n"
+     "export GALFOR_FK_PRIOR=${GALFOR_FK_PRIOR:-0.8e-3,1e-2}\n"
+     "export GALFOR_F1_PRIOR=${GALFOR_F1_PRIOR:-1e-4,1e-2}\n"
+     "export GALFOR_F2_PRIOR=${GALFOR_F2_PRIOR:-0.8e-3,1e-2}\n", 1),
     # the source warm start from the 6mo cold chain (user ruling 2026-10-08;
     # the same entry in both derive tables)
     ("export MBH_START_FACTOR=0.0\nexport EMRI_START_FACTOR=0.0\nexport SOBBH_START_FACTOR=0.0\nexport VGB_START_FACTOR=0.0\n",
@@ -250,9 +255,9 @@ HEADER = """#!/bin/bash
 #          MAXLOGL_TOL=20 / NOISE_SEARCH_CHECKS=5 stay the cycle-end noise
 #          slot's.
 #   1YR-8. GALFOR FREQUENCY PRIOR (user ruling 2026-10-08, shared by the 9mo and
-#          1yr): fk, f_1 and f_2 share one prior box 1e-4..1e-2 Hz
-#          (GALFOR_FREQ_PRIOR=1e-4,1e-2; stock: fk 0.8e-3..1e-2, f_1 / f_2
-#          1e-5..1e-2). One resolver feeds the prior, the start-pin window
+#          1yr), revised 2026-10-09: fk and f_2 0.8e-3..1e-2 Hz, f_1 1e-4..1e-2 Hz
+#          (GALFOR_FK_PRIOR / GALFOR_F1_PRIOR / GALFOR_F2_PRIOR; stock: fk
+#          0.8e-3..1e-2, f_1 / f_2 1e-5..1e-2). One resolver feeds the prior, the start-pin window
 #          and the noise-pin refusal; the GALFOR_START_PARAMS pin is inside
 #          the box. The 6mo relaunch keeps the stock box.
 #   1YR-9. MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM 0 -> 1 (2026-10-08): the reference
