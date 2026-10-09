@@ -574,8 +574,8 @@ VGB_NIT = SUB_NIT
 #      coordinates are actually populated. (The full production store this
 #      was validated on is NOT an extract, so the clamp is a no-op there;
 #      it exists because the same generator is pointed at extracts.)
-POOL_ITS_SAMPLES = 100
-POOL_ITS_POSTERIOR = 300
+POOL_ITS_SAMPLES = 30
+POOL_ITS_POSTERIOR = 30
 
 
 def _zoom_its(n_avail):
@@ -1100,7 +1100,7 @@ _NOISE_PANEL_FONT = 16.0
 plt.rcParams["font.size"] = _NOISE_PANEL_FONT
 plt.rcParams["text.usetex"] = _USETEX
 
-_nsh = min(100, SUB_NIT)
+_nsh = min(3, SUB_NIT)
 fig, ax = plt.subplots(1, 2, figsize=(11, 3.0))
 for j, (name, inj, unit) in enumerate(
         [("Soms_d", SOMS_INJ, "m"), ("Sa_a", SA_INJ, "m/s$^2$")]):
@@ -1285,12 +1285,11 @@ for j, (name, inj) in enumerate([("Soms_d", SOMS_INJ), ("Sa_a", SA_INJ)]):
 fig_b64(fig, "psd_trace")
 
 fig, ax = plt.subplots(1, 2, figsize=(11, 2.9))
-_psd_hist_its = min(100, SUB_NIT)
 for j, (name, inj) in enumerate([("Soms_d", SOMS_INJ), ("Sa_a", SA_INJ)]):
-    v = psd_cold[-_psd_hist_its:, :, j].ravel()
-    ax[j].hist(v, bins=50, color=CYAN, alpha=0.85)
+    v = psd_cold[-min(3, SUB_NIT):, :, j].ravel()
+    ax[j].hist(v, bins=min(30, nwalk), color=CYAN, alpha=0.85)
     ax[j].axvline(inj, color=RED, lw=1.4, ls=":")
-    ax[j].set_title(f"{name} posterior (last {_psd_hist_its} iters x {nwalk} walkers)")
+    ax[j].set_title(f"{name} posterior (last {min(3,NIT)} iters x {nwalk} walkers)")
 fig_b64(fig, "psd_hist")
 
 fig, ax = plt.subplots(1, 5, figsize=(14, 2.7))
@@ -1300,9 +1299,8 @@ for j in range(5):
     ax[j].set_title(GAL_NAMES[j], fontsize=9); ax[j].set_xlabel("iter")
 fig_b64(fig, "gal_trace")
 fig, ax = plt.subplots(1, 5, figsize=(14, 2.5))
-_gal_hist_its = min(100, SUB_NIT)
 for j in range(5):
-    ax[j].hist(gal_cold[-_gal_hist_its:, :, j].ravel(), bins=50, color=AMBER, alpha=0.85)
+    ax[j].hist(gal_cold[-min(3, SUB_NIT):, :, j].ravel(), bins=20, color=AMBER, alpha=0.85)
     ax[j].set_title(GAL_NAMES[j], fontsize=9)
 fig_b64(fig, "gal_hist")
 
@@ -1575,6 +1573,143 @@ mark_stages(ax[0], max_it=int(it[-1]) if len(it) else None)
 mark_stages(ax[1], label=False, max_it=int(it[-1]) if len(it) else None)
 
 fig_b64(fig, "gb_leaves")
+
+# ---- 5a-0. GB LOG-LIKELIHOOD PER SUB-BAND, PER WALKER (2026-10-09) --------
+# User request: "the logl per subband per walker over time", all walkers
+# drawn alike, each sub-band told apart by frequency, plus the last 100
+# iterations. Per stored row, cold walker and GB band: the sum over the
+# band's live leaves of d_h - h_h/2, i.e. the log-likelihood the band's
+# sources buy against the residual with them taken out -- the
+# source-attributed statistic the cap-cell gate already uses
+# (GBSpecial*._cap_cell_source_lls). On the 6mo store it spans 6 to 4e4
+# nats across bands, hence the log axis.
+# NOT the residual -1/2<r|r> per band: on the WDM grid a GB band is
+# narrower than a layer, so most bands own no residual window
+# (band_cold_logl_w is 0 in 3/4 of its cells) and that array stops moving
+# once the search valve retires.
+BAND_LL_ZOOM = 100            # the right-hand column's window, in rows
+BAND_LL_MAX_ROWS = 300        # strided rows before that window (I/O bound)
+BAND_LL_F_EDGES_MHZ = (1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.0)   # colour classes
+GB_BAND_LL_CAP = ""
+
+
+def gb_band_ll_rows(nit, zoom=100, max_rows=300):
+    """Stored rows the per-band panel reads: every row of the last ``zoom``,
+    and at most ``max_rows`` evenly strided rows before them."""
+    z0 = max(0, nit - zoom)
+    stride = max(1, int(np.ceil(z0 / max_rows))) if z0 else 1
+    return list(range(0, z0, stride)) + list(range(z0, nit))
+
+
+def gb_band_ll(d_h, h_h, f0_hz, alive, edges):
+    """``(nwalkers, nbands)`` sum of ``d_h - h_h/2`` over each band's live
+    leaves; NaN where a walker holds no live leaf in the band."""
+    nb = len(edges) - 1
+    contrib = np.asarray(d_h, float) - 0.5 * np.asarray(h_h, float)
+    ok = np.asarray(alive, bool) & np.isfinite(contrib) & np.isfinite(f0_hz)
+    band = np.clip(np.searchsorted(edges, f0_hz, side="right") - 1, 0, nb - 1)
+    out = np.zeros((contrib.shape[0], nb))
+    cnt = np.zeros((contrib.shape[0], nb), dtype=int)
+    for w in range(contrib.shape[0]):
+        m = ok[w]
+        np.add.at(out[w], band[w][m], contrib[w][m])
+        np.add.at(cnt[w], band[w][m], 1)
+    out[cnt == 0] = np.nan
+    return out
+
+
+try:
+    if _opt(sub, "gb/d_h") is None or _opt(sub, "gb/h_h") is None:
+        raise ValueError("the store carries no gb d_h / h_h")
+    _bl_rows = gb_band_ll_rows(NIT, BAND_LL_ZOOM, BAND_LL_MAX_ROWS)
+    _bl = np.full((len(_bl_rows), gb_inds.shape[1], len(band_edges) - 1), np.nan)
+    for _k, _i in enumerate(_bl_rows):
+        _dh = _row("sub_backend/gb/d_h", (_i,))
+        _hh = _row("sub_backend/gb/h_h", (_i,))
+        _f0 = _row("chain/gb", (_i, 0, 0, slice(None), slice(None), 1))
+        if _dh is None or _hh is None or _f0 is None or not np.any(_dh):
+            continue                     # unreadable or unwritten: a gap
+        _bl[_k] = gb_band_ll(_dh, _hh, _f0 * 1e-3, gb_inds[_i], band_edges)
+    _bl_have = np.isfinite(_bl).any(axis=(1, 2))
+    if _bl_have.sum() < 2:
+        raise ValueError(
+            f"d_h / h_h are written in only {int(_bl_have.sum())} of the "
+            f"{len(_bl_rows)} rows read (a short snapshot keeps the last row only)")
+    _bl_x = np.asarray(_bl_rows)
+    _fc = 0.5 * (band_edges[:-1] + band_edges[1:]) * 1e3          # mHz
+    import matplotlib.colors as _blc
+    from matplotlib.collections import LineCollection
+
+    # DISCRETE frequency classes, not a continuous ramp: ~490 occupied bands
+    # sit mostly at 2-10 mHz, and on a continuous log ramp they all come out
+    # orange. Fixed edges keep a colour meaning the same thing on every page.
+    _bl_edges = np.array([b for b in BAND_LL_F_EDGES_MHZ
+                          if _fc.min() < b < _fc.max()], float)
+    _bl_edges = np.concatenate([[_fc.min()], _bl_edges, [_fc.max()]])
+    _bl_cmap = _blc.ListedColormap(
+        plt.get_cmap("turbo")(np.linspace(0.10, 0.95, len(_bl_edges) - 1)))
+    _bl_norm = _blc.BoundaryNorm(_bl_edges, _bl_cmap.N)
+    _pos = np.where(_bl > 0, _bl, np.nan)       # log axis: positive gains only
+
+    fig, ax = plt.subplots(1, 2, figsize=(14.5, 4.8), sharey=True,
+                           gridspec_kw=dict(width_ratios=[1.7, 1.0], wspace=0.06))
+    _z0 = max(0, NIT - BAND_LL_ZOOM)
+    for _a, _sel in ((ax[0], slice(None)), (ax[1], _bl_x >= _z0)):
+        _xs = _bl_x[_sel]
+        _ys = _pos[_sel]                                  # (rows, walker, band)
+        _segs, _cols = [], []
+        for _b in np.nonzero(np.isfinite(_ys).any(axis=(0, 1)))[0]:
+            for _w in range(_ys.shape[1]):
+                _yb = _ys[:, _w, _b]
+                if np.isfinite(_yb).sum() >= 1:
+                    _segs.append(np.column_stack([_xs, _yb]))
+                    _cols.append(_bl_cmap(_bl_norm(_fc[_b])))
+        # shuffled draw order: band order would paint the high-f classes over
+        # everything below them
+        _ord = np.random.default_rng(0).permutation(len(_segs))
+        _lc = LineCollection([_segs[j] for j in _ord], colors=[_cols[j] for j in _ord],
+                             linewidths=0.6, alpha=0.45)
+        _a.add_collection(_lc)
+        _a.set_yscale("log")
+        _a.set_xlim(float(_xs.min()), float(max(_xs.max(), _xs.min() + 1)))
+        _a.set_xlabel("iteration")
+    _fin = _pos[np.isfinite(_pos)]
+    ax[0].set_ylim(max(float(_fin.min()) * 0.7, 1e-1), float(_fin.max()) * 1.5)
+    ax[0].set_ylabel(r"band $\sum\,(\langle d|h\rangle - \langle h|h\rangle/2)$  [nats]")
+    ax[0].set_title(f"GB log-likelihood per sub-band, {gb_inds.shape[1]} cold walkers")
+    ax[1].set_title(f"last {min(BAND_LL_ZOOM, NIT)} iterations")
+    mark_stages(ax[0], max_it=int(NIT - 1))
+    _sm = plt.cm.ScalarMappable(norm=_bl_norm, cmap=_bl_cmap)
+    _cb = fig.colorbar(_sm, ax=ax, pad=0.01, fraction=0.035,
+                       ticks=_bl_edges, spacing="uniform")
+    _cb.ax.set_yticklabels([f"{v:.3g}" for v in _bl_edges])
+    _cb.set_label("sub-band centre frequency [mHz]")
+    fig_b64(fig, "gb_band_ll")
+
+    _last = _bl[np.nonzero(_bl_have)[0][-1]]                  # (walker, band)
+    _occ = np.isfinite(_last).sum(axis=1)
+    _neg = int((np.nan_to_num(_last, nan=1.0) <= 0).sum())
+    _bmax = int(np.nanargmax(np.nanmax(_last, axis=0)))
+    GB_BAND_LL_CAP = (
+        f"One line per (cold walker, sub-band), all {gb_inds.shape[1]} walkers drawn "
+        "alike and coloured by the sub-band's centre frequency in fixed classes "
+        "(colour bar, mHz). "
+        "The value is the log-likelihood the band's live GB leaves buy: the sum over "
+        "them of &lang;d|h&rang; &minus; &lang;h|h&rang;/2, with d the residual plus "
+        "that leaf's own template, so roughly half the band's summed SNR&sup2;. "
+        f"At the last row {int(np.median(_occ))} of {_last.shape[1]} sub-bands are "
+        f"occupied (median over walkers); the largest is "
+        f"{np.nanmax(_last):,.0f} nats at {_fc[_bmax]:.2f} mHz. A band appears when "
+        "it gains its first leaf and drops out when it loses its last. Left: "
+        f"{len(_bl_rows) - min(BAND_LL_ZOOM, NIT)} strided rows plus the last "
+        f"{min(BAND_LL_ZOOM, NIT)}; right: every one of the last "
+        f"{min(BAND_LL_ZOOM, NIT)}. Flat lines in the right column are converged "
+        "bands; steps are births, deaths or a source moving between bands."
+        + (f" {_neg} (walker, band) value(s) are &le; 0 and fall off the log axis."
+           if _neg else ""))
+    del _bl, _pos, _segs, _cols
+except Exception as _exc:  # noqa: BLE001 - a missing panel, never a dead page
+    MISSING.append(f"GB log-likelihood per sub-band unavailable: {_exc}")
 
 # ---- 5a. CAP-CELL OCCUPANCY ----------------------------------------------
 # THE QUESTION THIS PANEL EXISTS TO ANSWER (user, 2026-08-16): "how many of
@@ -4667,9 +4802,7 @@ if TRU is not None:
         # ---- F2: completeness AND purity vs GB-search iteration -------------
         fig, ax = plt.subplots(figsize=(11, 3.8))
         axr = ax.twinx(); axr.grid(False)
-        # Plot only THIS run's data, not v2 comparisons
-        _tag = ARM_TAG
-        if _tag in ARMS:
+        for _tag in sorted(ARMS):
             _D = ARMS[_tag]; _c = ARM_COL.get(_tag, GREEN)
             _x = np.arange(_D["n_match"].size) - int(_D["it0"])
             _k = _x >= 0
@@ -4691,16 +4824,15 @@ if TRU is not None:
         # ---- F3: match CDF + survival COUNT ---------------------------------
         fig, ax = plt.subplots(2, 1, figsize=(9.6, 6.0), sharex=True,
                                gridspec_kw=dict(hspace=0.08))
-        # Plot only THIS run's data, not v2 comparisons
-        _tag = ARM_TAG
-        if _tag in ARMS:
+        for _tag in sorted(ARMS):
             _D = ARMS[_tag]; _c = ARM_COL.get(_tag, GREEN)
             _m = np.sort(np.asarray(_D["mm"], float))
-            if _m.size:
-                ax[0].plot(_m, np.arange(1, _m.size + 1) / _m.size, color=_c, lw=1.8,
-                           label=f"{_tag}  ({_m.size} matched)")
-                _s, _n = _survival(_m)
-                ax[1].plot(_s, _n, color=_c, lw=1.8)
+            if not _m.size:
+                continue
+            ax[0].plot(_m, np.arange(1, _m.size + 1) / _m.size, color=_c, lw=1.8,
+                       label=f"{_tag}  ({_m.size} matched)")
+            _s, _n = _survival(_m)
+            ax[1].plot(_s, _n, color=_c, lw=1.8)
         ax[0].set_ylabel("cumulative fraction"); ax[0].set_ylim(0, 1)
         ax[0].legend(fontsize=8, loc="upper left")
         ax[1].axhline(NDET, color=FG, ls="--", lw=1.0)
@@ -4959,9 +5091,8 @@ if TRU is not None:
         _seds = np.array([7, 10, 15, 25, 1e9])
         _lab = ["7-10", "10-15", "15-25", "25+"]
         fig, ax = plt.subplots(figsize=(9.0, 3.7))
-        # Plot only THIS run's data, not v2 comparisons
-        _tag = ARM_TAG
-        if _tag in ARMS:
+        _tags = sorted(ARMS)
+        for _q, _tag in enumerate(_tags):
             _D = ARMS[_tag]; _c = ARM_COL.get(_tag, GREEN)
             _fnd = np.zeros(NDET, bool); _fnd[np.asarray(_D["ti"], int)] = True
             _x, _y, _el, _eh = [], [], [], []
@@ -4971,18 +5102,19 @@ if TRU is not None:
                     continue
                 _p = _fnd[_m].mean()
                 _l, _h = _wilson(_fnd[_m].sum(), _m.sum())
-                _x.append(_j)
+                _x.append(_j + (_q - (len(_tags) - 1) / 2) * 0.10)
                 _y.append(100 * _p); _el.append(100 * (_p - _l))
                 _eh.append(100 * (_h - _p))
-            if _x:
-                _n = int(_D["n_match"][-1])
-                _g = int(_D["n_match"].size) - 1 - int(_D["it0"])
-                # An arm from a zero-match store (young run) can produce
-                # degenerate Wilson bounds; matplotlib refuses negative yerr.
-                _el = np.clip(_el, 0.0, None)
-                _eh = np.clip(_eh, 0.0, None)
-                ax.errorbar(_x, _y, yerr=[_el, _eh], fmt="o-", ms=5, color=_c, lw=1.6,
-                            capsize=3, label=f"{_tag}, {_g} GB-search iterations")
+            if not _x:
+                continue
+            _n = int(_D["n_match"][-1])
+            _g = int(_D["n_match"].size) - 1 - int(_D["it0"])
+            # An arm from a zero-match store (young run) can produce
+            # degenerate Wilson bounds; matplotlib refuses negative yerr.
+            _el = np.clip(_el, 0.0, None)
+            _eh = np.clip(_eh, 0.0, None)
+            ax.errorbar(_x, _y, yerr=[_el, _eh], fmt="o-", ms=5, color=_c, lw=1.6,
+                        capsize=3, label=f"{_tag}, {_g} GB-search iterations")
         for _j, (_a2, _b2) in enumerate(zip(_seds[:-1], _seds[1:])):
             _m = (T_SNR >= _a2) & (T_SNR < _b2)
             ax.text(_j, 3, f"n={int(_m.sum())}", ha="center", color=DIM, fontsize=8)
@@ -4994,9 +5126,7 @@ if TRU is not None:
 
     # ---- F10: nearest-neighbour separation survival ----------------------
     fig, ax = plt.subplots(figsize=(9.8, 4.0))
-    # Plot only THIS run's data, not v2 comparisons
-    _tag = ARM_TAG
-    if _tag in ARMS:
+    for _tag in sorted(ARMS):
         _D = ARMS[_tag]; _c = ARM_COL.get(_tag, GREEN)
         _s, _n = _survival(_nn_bins(np.asarray(_D["rec_f0"], float)))
         ax.plot(np.maximum(_s, 1e-2), _n, color=_c, lw=1.8,
@@ -6929,13 +7059,18 @@ if rg is not None and "full_pe" in rg:
 def _src_pool_window(nit):
     """Trailing iterations the corner-plot pool draws from.
 
-    User ruling 2026-10-08: last 300 iterations (x 4 walkers = 1200 pooled
-    samples). Clamped to the available rows so very young stores still
+    User ruling 2026-10-05: last 50 iterations (x 4 walkers = 200 pooled
+    samples) when the branch has < 500 rows; last 250 (x 4 = 1000) once
+    it is past that mark.  The step is a BURN-IN GATE, not a threshold:
+    at <500 iterations the trailing 50 is where the branch currently sits
+    and anything older is adaptation; once there are >=500 rows, the
+    first 250 are the burn-in to drop and the second half is the
+    posterior.  Clamped to the available rows so very young stores still
     show something -- an empty window would make the corner panel claim
     "no samples" at a time when the user is actively watching the
     sampler fire.
     """
-    pool = 300
+    pool = 250 if nit > 500 else 50
     return min(pool, max(1, int(nit)))
 
 
@@ -7334,8 +7469,32 @@ ARM_TABLE = ""
 # ARMS is built inside the GB-analysis section, which a very young store
 # (too few GB iterations for the match machinery) skips entirely -- the
 # cross-arm table then simply has no data to show.
-# DISABLED: removed v2 comparison table
-ARM_TABLE = ""
+if len(globals().get("ARMS", {})) >= 2 and SCI and SHOW_MATCH_STATS:
+    _K = min(int(D["n_match"].size) - 1 - int(D["it0"]) for D in ARMS.values())
+    _rows = []
+    for _t in sorted(ARMS):
+        _D = ARMS[_t]
+        _i = int(_D["it0"]) + _K
+        _rows.append((_t, int(_D["n_all"][_i]), int(_D["n_match"][_i]),
+                      int(_D["n_match"][_i]) / SCI["ndet"],
+                      int(_D["n_match"][_i]) / max(int(_D["n_band"][_i]), 1),
+                      int(_D["n_match"].size) - 1 - int(_D["it0"])))
+    _hdr = "".join(f'<th style="text-align:right;padding:4px 0 4px 20px">{r[0]}'
+                   f'</th>' for r in _rows)
+    def _row(lbl, fn):
+        return ("<tr><td style='padding:3px 0'>" + lbl + "</td>"
+                + "".join("<td style='text-align:right;padding:3px 0 3px 20px'>"
+                          + fn(r) + "</td>" for r in _rows) + "</tr>")
+    ARM_TABLE = f"""
+<table style="border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums;margin-top:10px">
+<tr style="border-bottom:1px solid var(--line)"><th style="text-align:left;padding:4px 0">
+at {_K} galactic-binary search iterations</th>{_hdr}</tr>
+{_row("model sources", lambda r: f"{r[1]:,}")}
+{_row("matched to a detectable injection (2-df proxy, per iteration)", lambda r: f"{r[2]:,}")}
+{_row("completeness (proxy)", lambda r: pct(r[3]))}
+{_row("purity (proxy)", lambda r: pct(r[4]))}
+{_row("search iterations completed in total", lambda r: f"{r[5]}")}
+</table>"""
 
 # ---- captions, every number read off the arrays that made the figure ------
 if SCI:
@@ -7515,18 +7674,19 @@ NOISE_TXT = " and ".join(f"{100 * b:+.1f}%" for b in NOISE_BIAS)
 # tracker, not in the first thing a collaborator reads. What a reader needs
 # from the top of a status page is how far each arm got and whether to trust it
 # as converged.
+_arm_bits = []
+for _t in sorted(globals().get("ARMS", {})):
+    _D = ARMS[_t]
+    _arm_bits.append(f"{_t} has completed "
+                     f"{int(_D['n_match'].size) - 1 - int(_D['it0'])} "
+                     f"galactic-binary search iterations")
 _ended = ("ended at iteration 80 on a GPU memory limit"
           if RUN_KIND == "3mo" and NIT >= 80 else
           f"has stored {NIT} iterations")
-# Get this run's GB search iterations
-_this_arm_iters = ""
-if ARM_TAG in ARMS:
-    _D = ARMS[ARM_TAG]
-    _n_iters = int(_D['n_match'].size) - 1 - int(_D['it0'])
-    _this_arm_iters = f" Completed {_n_iters} galactic-binary search iterations."
 RUN_HEALTH = (
-    f"<strong>Run health.</strong> This run {_ended}.{_this_arm_iters} "
-    + "This run has not converged, so every number here is a progress readout "
+    f"<strong>Run health.</strong> This arm {_ended}. "
+    + ("; ".join(_arm_bits) + ". " if _arm_bits else "")
+    + "Neither arm has converged, so every number here is a progress readout "
       "rather than a result.")
 
 if _TORN_ROWS:
@@ -7811,6 +7971,8 @@ cap over time. Rows marked in red have had their births shut off by the barren-b
 <div class="caption">Cold-chain total log-likelihood across the {nwalk} walkers, and
 the max-minus-min spread. At equilibrium the spread sits at a few units.</div></div>
 </div>
+<div class="panel">{img("gb_band_ll", "GB log-likelihood per sub-band")}
+<div class="caption">{GB_BAND_LL_CAP}</div></div>
 </section>
 
 <section id="resid"><h2>Residual Spectrum</h2>
