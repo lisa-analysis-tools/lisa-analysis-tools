@@ -574,8 +574,8 @@ VGB_NIT = SUB_NIT
 #      coordinates are actually populated. (The full production store this
 #      was validated on is NOT an extract, so the clamp is a no-op there;
 #      it exists because the same generator is pointed at extracts.)
-POOL_ITS_SAMPLES = 30
-POOL_ITS_POSTERIOR = 30
+POOL_ITS_SAMPLES = 100
+POOL_ITS_POSTERIOR = 300
 
 
 def _zoom_its(n_avail):
@@ -1100,7 +1100,7 @@ _NOISE_PANEL_FONT = 16.0
 plt.rcParams["font.size"] = _NOISE_PANEL_FONT
 plt.rcParams["text.usetex"] = _USETEX
 
-_nsh = min(3, SUB_NIT)
+_nsh = min(100, SUB_NIT)
 fig, ax = plt.subplots(1, 2, figsize=(11, 3.0))
 for j, (name, inj, unit) in enumerate(
         [("Soms_d", SOMS_INJ, "m"), ("Sa_a", SA_INJ, "m/s$^2$")]):
@@ -1285,11 +1285,12 @@ for j, (name, inj) in enumerate([("Soms_d", SOMS_INJ), ("Sa_a", SA_INJ)]):
 fig_b64(fig, "psd_trace")
 
 fig, ax = plt.subplots(1, 2, figsize=(11, 2.9))
+_psd_hist_its = min(100, SUB_NIT)
 for j, (name, inj) in enumerate([("Soms_d", SOMS_INJ), ("Sa_a", SA_INJ)]):
-    v = psd_cold[-min(3, SUB_NIT):, :, j].ravel()
-    ax[j].hist(v, bins=min(30, nwalk), color=CYAN, alpha=0.85)
+    v = psd_cold[-_psd_hist_its:, :, j].ravel()
+    ax[j].hist(v, bins=50, color=CYAN, alpha=0.85)
     ax[j].axvline(inj, color=RED, lw=1.4, ls=":")
-    ax[j].set_title(f"{name} posterior (last {min(3,NIT)} iters x {nwalk} walkers)")
+    ax[j].set_title(f"{name} posterior (last {_psd_hist_its} iters x {nwalk} walkers)")
 fig_b64(fig, "psd_hist")
 
 fig, ax = plt.subplots(1, 5, figsize=(14, 2.7))
@@ -1299,8 +1300,9 @@ for j in range(5):
     ax[j].set_title(GAL_NAMES[j], fontsize=9); ax[j].set_xlabel("iter")
 fig_b64(fig, "gal_trace")
 fig, ax = plt.subplots(1, 5, figsize=(14, 2.5))
+_gal_hist_its = min(100, SUB_NIT)
 for j in range(5):
-    ax[j].hist(gal_cold[-min(3, SUB_NIT):, :, j].ravel(), bins=20, color=AMBER, alpha=0.85)
+    ax[j].hist(gal_cold[-_gal_hist_its:, :, j].ravel(), bins=50, color=AMBER, alpha=0.85)
     ax[j].set_title(GAL_NAMES[j], fontsize=9)
 fig_b64(fig, "gal_hist")
 
@@ -4665,7 +4667,9 @@ if TRU is not None:
         # ---- F2: completeness AND purity vs GB-search iteration -------------
         fig, ax = plt.subplots(figsize=(11, 3.8))
         axr = ax.twinx(); axr.grid(False)
-        for _tag in sorted(ARMS):
+        # Plot only THIS run's data, not v2 comparisons
+        _tag = ARM_TAG
+        if _tag in ARMS:
             _D = ARMS[_tag]; _c = ARM_COL.get(_tag, GREEN)
             _x = np.arange(_D["n_match"].size) - int(_D["it0"])
             _k = _x >= 0
@@ -4687,15 +4691,16 @@ if TRU is not None:
         # ---- F3: match CDF + survival COUNT ---------------------------------
         fig, ax = plt.subplots(2, 1, figsize=(9.6, 6.0), sharex=True,
                                gridspec_kw=dict(hspace=0.08))
-        for _tag in sorted(ARMS):
+        # Plot only THIS run's data, not v2 comparisons
+        _tag = ARM_TAG
+        if _tag in ARMS:
             _D = ARMS[_tag]; _c = ARM_COL.get(_tag, GREEN)
             _m = np.sort(np.asarray(_D["mm"], float))
-            if not _m.size:
-                continue
-            ax[0].plot(_m, np.arange(1, _m.size + 1) / _m.size, color=_c, lw=1.8,
-                       label=f"{_tag}  ({_m.size} matched)")
-            _s, _n = _survival(_m)
-            ax[1].plot(_s, _n, color=_c, lw=1.8)
+            if _m.size:
+                ax[0].plot(_m, np.arange(1, _m.size + 1) / _m.size, color=_c, lw=1.8,
+                           label=f"{_tag}  ({_m.size} matched)")
+                _s, _n = _survival(_m)
+                ax[1].plot(_s, _n, color=_c, lw=1.8)
         ax[0].set_ylabel("cumulative fraction"); ax[0].set_ylim(0, 1)
         ax[0].legend(fontsize=8, loc="upper left")
         ax[1].axhline(NDET, color=FG, ls="--", lw=1.0)
@@ -4954,8 +4959,9 @@ if TRU is not None:
         _seds = np.array([7, 10, 15, 25, 1e9])
         _lab = ["7-10", "10-15", "15-25", "25+"]
         fig, ax = plt.subplots(figsize=(9.0, 3.7))
-        _tags = sorted(ARMS)
-        for _q, _tag in enumerate(_tags):
+        # Plot only THIS run's data, not v2 comparisons
+        _tag = ARM_TAG
+        if _tag in ARMS:
             _D = ARMS[_tag]; _c = ARM_COL.get(_tag, GREEN)
             _fnd = np.zeros(NDET, bool); _fnd[np.asarray(_D["ti"], int)] = True
             _x, _y, _el, _eh = [], [], [], []
@@ -4965,19 +4971,18 @@ if TRU is not None:
                     continue
                 _p = _fnd[_m].mean()
                 _l, _h = _wilson(_fnd[_m].sum(), _m.sum())
-                _x.append(_j + (_q - (len(_tags) - 1) / 2) * 0.10)
+                _x.append(_j)
                 _y.append(100 * _p); _el.append(100 * (_p - _l))
                 _eh.append(100 * (_h - _p))
-            if not _x:
-                continue
-            _n = int(_D["n_match"][-1])
-            _g = int(_D["n_match"].size) - 1 - int(_D["it0"])
-            # An arm from a zero-match store (young run) can produce
-            # degenerate Wilson bounds; matplotlib refuses negative yerr.
-            _el = np.clip(_el, 0.0, None)
-            _eh = np.clip(_eh, 0.0, None)
-            ax.errorbar(_x, _y, yerr=[_el, _eh], fmt="o-", ms=5, color=_c, lw=1.6,
-                        capsize=3, label=f"{_tag}, {_g} GB-search iterations")
+            if _x:
+                _n = int(_D["n_match"][-1])
+                _g = int(_D["n_match"].size) - 1 - int(_D["it0"])
+                # An arm from a zero-match store (young run) can produce
+                # degenerate Wilson bounds; matplotlib refuses negative yerr.
+                _el = np.clip(_el, 0.0, None)
+                _eh = np.clip(_eh, 0.0, None)
+                ax.errorbar(_x, _y, yerr=[_el, _eh], fmt="o-", ms=5, color=_c, lw=1.6,
+                            capsize=3, label=f"{_tag}, {_g} GB-search iterations")
         for _j, (_a2, _b2) in enumerate(zip(_seds[:-1], _seds[1:])):
             _m = (T_SNR >= _a2) & (T_SNR < _b2)
             ax.text(_j, 3, f"n={int(_m.sum())}", ha="center", color=DIM, fontsize=8)
@@ -4989,7 +4994,9 @@ if TRU is not None:
 
     # ---- F10: nearest-neighbour separation survival ----------------------
     fig, ax = plt.subplots(figsize=(9.8, 4.0))
-    for _tag in sorted(ARMS):
+    # Plot only THIS run's data, not v2 comparisons
+    _tag = ARM_TAG
+    if _tag in ARMS:
         _D = ARMS[_tag]; _c = ARM_COL.get(_tag, GREEN)
         _s, _n = _survival(_nn_bins(np.asarray(_D["rec_f0"], float)))
         ax.plot(np.maximum(_s, 1e-2), _n, color=_c, lw=1.8,
@@ -6922,18 +6929,13 @@ if rg is not None and "full_pe" in rg:
 def _src_pool_window(nit):
     """Trailing iterations the corner-plot pool draws from.
 
-    User ruling 2026-10-05: last 50 iterations (x 4 walkers = 200 pooled
-    samples) when the branch has < 500 rows; last 250 (x 4 = 1000) once
-    it is past that mark.  The step is a BURN-IN GATE, not a threshold:
-    at <500 iterations the trailing 50 is where the branch currently sits
-    and anything older is adaptation; once there are >=500 rows, the
-    first 250 are the burn-in to drop and the second half is the
-    posterior.  Clamped to the available rows so very young stores still
+    User ruling 2026-10-08: last 300 iterations (x 4 walkers = 1200 pooled
+    samples). Clamped to the available rows so very young stores still
     show something -- an empty window would make the corner panel claim
     "no samples" at a time when the user is actively watching the
     sampler fire.
     """
-    pool = 250 if nit > 500 else 50
+    pool = 300
     return min(pool, max(1, int(nit)))
 
 
@@ -7332,32 +7334,8 @@ ARM_TABLE = ""
 # ARMS is built inside the GB-analysis section, which a very young store
 # (too few GB iterations for the match machinery) skips entirely -- the
 # cross-arm table then simply has no data to show.
-if len(globals().get("ARMS", {})) >= 2 and SCI and SHOW_MATCH_STATS:
-    _K = min(int(D["n_match"].size) - 1 - int(D["it0"]) for D in ARMS.values())
-    _rows = []
-    for _t in sorted(ARMS):
-        _D = ARMS[_t]
-        _i = int(_D["it0"]) + _K
-        _rows.append((_t, int(_D["n_all"][_i]), int(_D["n_match"][_i]),
-                      int(_D["n_match"][_i]) / SCI["ndet"],
-                      int(_D["n_match"][_i]) / max(int(_D["n_band"][_i]), 1),
-                      int(_D["n_match"].size) - 1 - int(_D["it0"])))
-    _hdr = "".join(f'<th style="text-align:right;padding:4px 0 4px 20px">{r[0]}'
-                   f'</th>' for r in _rows)
-    def _row(lbl, fn):
-        return ("<tr><td style='padding:3px 0'>" + lbl + "</td>"
-                + "".join("<td style='text-align:right;padding:3px 0 3px 20px'>"
-                          + fn(r) + "</td>" for r in _rows) + "</tr>")
-    ARM_TABLE = f"""
-<table style="border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums;margin-top:10px">
-<tr style="border-bottom:1px solid var(--line)"><th style="text-align:left;padding:4px 0">
-at {_K} galactic-binary search iterations</th>{_hdr}</tr>
-{_row("model sources", lambda r: f"{r[1]:,}")}
-{_row("matched to a detectable injection (2-df proxy, per iteration)", lambda r: f"{r[2]:,}")}
-{_row("completeness (proxy)", lambda r: pct(r[3]))}
-{_row("purity (proxy)", lambda r: pct(r[4]))}
-{_row("search iterations completed in total", lambda r: f"{r[5]}")}
-</table>"""
+# DISABLED: removed v2 comparison table
+ARM_TABLE = ""
 
 # ---- captions, every number read off the arrays that made the figure ------
 if SCI:
@@ -7537,19 +7515,18 @@ NOISE_TXT = " and ".join(f"{100 * b:+.1f}%" for b in NOISE_BIAS)
 # tracker, not in the first thing a collaborator reads. What a reader needs
 # from the top of a status page is how far each arm got and whether to trust it
 # as converged.
-_arm_bits = []
-for _t in sorted(globals().get("ARMS", {})):
-    _D = ARMS[_t]
-    _arm_bits.append(f"{_t} has completed "
-                     f"{int(_D['n_match'].size) - 1 - int(_D['it0'])} "
-                     f"galactic-binary search iterations")
 _ended = ("ended at iteration 80 on a GPU memory limit"
           if RUN_KIND == "3mo" and NIT >= 80 else
           f"has stored {NIT} iterations")
+# Get this run's GB search iterations
+_this_arm_iters = ""
+if ARM_TAG in ARMS:
+    _D = ARMS[ARM_TAG]
+    _n_iters = int(_D['n_match'].size) - 1 - int(_D['it0'])
+    _this_arm_iters = f" Completed {_n_iters} galactic-binary search iterations."
 RUN_HEALTH = (
-    f"<strong>Run health.</strong> This arm {_ended}. "
-    + ("; ".join(_arm_bits) + ". " if _arm_bits else "")
-    + "Neither arm has converged, so every number here is a progress readout "
+    f"<strong>Run health.</strong> This run {_ended}.{_this_arm_iters} "
+    + "This run has not converged, so every number here is a progress readout "
       "rather than a result.")
 
 if _TORN_ROWS:
