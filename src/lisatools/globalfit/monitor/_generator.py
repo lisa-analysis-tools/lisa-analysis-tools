@@ -349,19 +349,35 @@ if REWOUND:
 # content and say so, rather than publishing a page that reads as if the
 # search had lost every source.
 _gb_inds_ds = g.get("inds/gb")
+
+
+def _gb_alive(j):
+    """Live GB leaves in stored row ``j``; 0 when the row cannot be read.
+
+    An unreadable row is the same torn save caught one step earlier: the
+    saver is rewriting that chunk under this reader ("filter returned
+    failure during read", 6mo job 748 2026-10-09, which cost the whole
+    page because this check ran outside any try).
+    """
+    try:
+        return int(np.count_nonzero(_gb_inds_ds[j, 0, 0]))
+    except OSError:
+        return 0
+
+
 if NIT > 0 and _gb_inds_ds is not None:
-    _alive_last = int(np.count_nonzero(_gb_inds_ds[NIT - 1, 0, 0]))
+    _alive_last = _gb_alive(NIT - 1)
     if _alive_last == 0:
         _back = 0
         for _j in range(NIT - 2, max(NIT - 40, -1), -1):
-            if np.count_nonzero(_gb_inds_ds[_j, 0, 0]):
+            if _gb_alive(_j):
                 _back = NIT - 1 - _j
                 break
         if _back:
             MISSING.append(
-                f"stored row {NIT - 1} carries NO GB leaves while row "
-                f"{NIT - 1 - _back} carries "
-                f"{int(np.count_nonzero(_gb_inds_ds[NIT - 1 - _back, 0, 0]))}"
+                f"stored row {NIT - 1} carries NO GB leaves (or is unreadable "
+                f"mid-save) while row {NIT - 1 - _back} carries "
+                f"{_gb_alive(NIT - 1 - _back)}"
                 f" -- a torn save, not a lost model. Rendering through row "
                 f"{NIT - 1 - _back} ({_back} row(s) dropped); re-run once the "
                 "save completes to pick them up.")

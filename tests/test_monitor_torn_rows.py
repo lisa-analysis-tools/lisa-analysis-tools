@@ -156,6 +156,48 @@ class TornRowReaderTest(unittest.TestCase):
         self.assertIsNone(got)
 
 
+class TornLastRowTest(unittest.TestCase):
+    """The torn-LAST-row check (before ``_row`` exists) tolerates an
+    unreadable ``inds/gb`` row: 6mo job 748, 2026-10-09, the monitor page
+    died on ``_gb_inds_ds[NIT - 1, 0, 0]`` with "filter returned failure"."""
+
+    @classmethod
+    def setUpClass(cls):
+        src = _read_src()
+        cls.block = src[src.index('_gb_inds_ds = g.get("inds/gb")'):
+                        src.index("it = np.arange(NIT)")]
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = os.path.join(self.tmp, "gf_prod_testing.h5")
+        rng = np.random.default_rng(5)
+        inds = rng.random((NIT, 1, 1, NW, NLEAF)) < 0.6
+        inds[:, 0, 0, 0, 0] = True                     # every row has leaves
+        with h5py.File(self.store, "w") as f:
+            f.create_group("global_fit").create_dataset(
+                "inds/gb", data=inds, chunks=(1, 1, 1, NW, NLEAF),
+                compression="gzip", compression_opts=4)
+        with h5py.File(self.store, "r") as f:
+            info = f["global_fit/inds/gb"].id.get_chunk_info_by_coord(
+                (NIT - 1, 0, 0, 0, 0))
+        with open(self.store, "r+b") as fh:            # tear the LAST row
+            fh.seek(info.byte_offset)
+            fh.write(b"\xa5" * info.size)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_an_unreadable_last_row_steps_back_instead_of_raising(self):
+        with h5py.File(self.store, "r") as f:
+            with self.assertRaisesRegex(OSError, "filter returned failure"):
+                f["global_fit/inds/gb"][NIT - 1, 0, 0]
+            ns = {"np": np, "g": f["global_fit"], "NIT": NIT, "MISSING": []}
+            exec(self.block, ns)                       # noqa: S102
+        self.assertEqual(ns["NIT"], NIT - 1)
+        self.assertEqual(len(ns["MISSING"]), 1)
+        self.assertIn("torn save", ns["MISSING"][0])
+
+
 class CallSitesTest(unittest.TestCase):
     """Every unguarded GB row read goes through ``_row``."""
 
