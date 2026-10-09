@@ -1332,7 +1332,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 logger.warning(
                     "RJTRACE %s t=%d w=%d b=%d slot=%d f0=%.9e mHz N=%s "
                     "d_h=%.6e h_h=%.6e delta=%.6e beta=%.3e lnp=%.6e "
-                    "factors=%.4e curr_lp=%.4e prev_lp=%.4e accept=%d",
+                    "factors=%.4e curr_lp=%.4e prev_lp=%.4e accept=%d opt_snr=%.3f",
                     "DEATH" if alive[_k] else "BIRTH",
                     int(t_i[_k]), int(w_i[_k]), int(b_i[_k]), int(slots[_k]),
                     float(params[_k, 1]),
@@ -1340,6 +1340,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     float(d_h[_k]), float(h_h[_k]), float(delta_ll[_k]),
                     float(beta[_k]), float(lnpdiff[_k]), float(factors[_k]),
                     float(curr_logp[_k]), float(prev_logp[_k]), int(_acc),
+                    float(np.sqrt(max(float(h_h[_k]), 0.0))),
                 )
 
         if bool(accept.any()):
@@ -2718,10 +2719,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
             (rj_c, rj_cn), (rj_a, rj_an) = _rate(0, True), _rate(0, False)
             (im_c, im_cn), (im_a, im_an) = _rate(1, True), _rate(1, False)
+
+            swap_acc_cold = int(asnumpy(band_swaps_accepted[:, :1]).sum())
+            swap_prop_cold = int(asnumpy(band_swaps_proposed[:, :1]).sum())
+
             logger.info(
                 "[GB_ACCEPT %s] rj cold %.4f (n=%.0f) all %.4f (n=%.0f) | "
-                "in-model cold %.4f (n=%.0f) all %.4f (n=%.0f)",
+                "in-model cold %.4f (n=%.0f) all %.4f (n=%.0f) | "
+                "swap cold %d/%d",
                 self.name, rj_c, rj_cn, rj_a, rj_an, im_c, im_cn, im_a, im_an,
+                swap_acc_cold, swap_prop_cold,
             )
         except Exception as exc:  # never break a propose for a log line
             logger.debug("[GB_ACCEPT %s] skipped: %r", self.name, exc)

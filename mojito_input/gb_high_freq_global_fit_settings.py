@@ -344,9 +344,6 @@ def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMe
         # tdi_setup="XYZ", degenerate with waveform_kwargs, skipped if provided
         # use_tdi2=True,
         waveform_kwargs=waveform_kwargs,
-        # Run domain + chunked-het GB likelihood. ``gb_wdm_comp`` is built
-        # lazily in ``setup_recipe`` (the C++ orbit wrap is not picklable, and
-        # CurrentInfoGlobalFit deepcopies the settings tree).
         domain_settings=domain_settings,
         gb_wdm_comp=None,
         gb_stft_comp=STFTGBComputations,
