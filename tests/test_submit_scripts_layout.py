@@ -2424,6 +2424,26 @@ _RECIPE_REPLACEMENTS = (
      "# is UNEQUAL_ARM=1 either way -- the unequal-arm fit 1.500004e-11 /\n"
      "# 3.000107e-15. Ruling 2026-10-04: no default may rely on an equal-arm path.\n"
      "export MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM=${MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM:-1}\n", 1),
+    # the stage-B F-stat sky cap (pre-launch check 2026-10-09; Mike: "if you think
+    # ... for the 1yr run, then yes do that")
+    ("export FSTAT_STAGEB_NSKY_MAX=0       # 0 = no node cap (user ruling)\n",
+     "# ---- 9MO / 1YR: cap the stage-B sky grid at the 6mo's 8-mHz node count ------\n"
+     "# The adaptive sky grid asks for ~(f0 Tobs v/c)^2 nodes per peak: at 6 mo that\n"
+     "# is 64 (< 4 mHz) / 256 (8 mHz) / 1024 (15 mHz); at 9 mo 128 / 512 / 2048 and\n"
+     "# at 1 yr 256 / 1024 / 4096, on top of the fdot axis (13 -> 28 -> 48 nodes at\n"
+     "# 8 mHz) and the f0 axis (79 -> 96). The 6mo stacked grid was ~12 GB raw and\n"
+     "# 24-35 GB resident per GPU, so uncapped the 9mo grid lands at 2-3x that and\n"
+     "# the 1yr at ~8x (the 1yr v8 OOMed on its first F-stat search). 512 never\n"
+     "# touches a peak below 8 mHz at 9 mo (their natural counts are <= 512) and\n"
+     "# bounds the > 8 mHz tail; the host-mapped float32 grid (TODO) is the real\n"
+     "# fix, and at 1 yr the fdot axis alone needs it. FSTAT_STAGEB_NSKY_MAX=0 on\n"
+     "# the line restores the uncapped grid.\n"
+     "export FSTAT_STAGEB_NSKY_MAX=${FSTAT_STAGEB_NSKY_MAX:-512}\n", 1),
+    # the stage-B fit's per-group transient (pre-launch check 2026-10-09; Mike:
+    # "adjust the FSTAT a little bit if you can for memory ... no changes that
+    # sacrifice needed accuracy"): the grouping only batches the evaluation
+    ("export FSTAT_STAGEB_GROUP_MAX_GB=2.0\n",
+     "export FSTAT_STAGEB_GROUP_MAX_GB=${FSTAT_STAGEB_GROUP_MAX_GB:-1.0}   # 9mo/1yr: halve the stage-B per-group transient (batching only, no grid change; 2.0 at 6mo)\n", 1),
 )
 
 #: the recipe as the 1yr / 9mo launchers resolve it (and the 6mo's values)
@@ -2451,6 +2471,9 @@ _RECIPE_EXPORTS = {
     "SOBBH_SOURCE_WARM_START_IDS": ("0,1,2,3,4,5", None),
     # the PSD reference fit: the unequal-arm pair on a fresh store (2026-10-08)
     "MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM": ("1", "0"),
+    # the stage-B F-stat sky cap (2026-10-09): bounds the > 8 mHz tail at 9 mo / 1 yr
+    "FSTAT_STAGEB_NSKY_MAX": ("512", "0"),
+    "FSTAT_STAGEB_GROUP_MAX_GB": ("1.0", "2.0"),
 }
 
 

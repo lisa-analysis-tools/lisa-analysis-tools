@@ -3985,8 +3985,19 @@ export FSTAT_GRID_MEM_MB=512
 #   FSTAT_N_ALPHA / FSTAT_N_SINDELTA   setting EITHER also pins the sky
 export FSTAT_STAGEB_SKY_ADAPT=1
 export FSTAT_STAGEB_NSKY_MIN=64      # never coarser than the old fixed 8x8
-export FSTAT_STAGEB_NSKY_MAX=0       # 0 = no node cap (user ruling)
-export FSTAT_STAGEB_GROUP_MAX_GB=2.0
+# ---- 9MO / 1YR: cap the stage-B sky grid at the 6mo's 8-mHz node count ------
+# The adaptive sky grid asks for ~(f0 Tobs v/c)^2 nodes per peak: at 6 mo that
+# is 64 (< 4 mHz) / 256 (8 mHz) / 1024 (15 mHz); at 9 mo 128 / 512 / 2048 and
+# at 1 yr 256 / 1024 / 4096, on top of the fdot axis (13 -> 28 -> 48 nodes at
+# 8 mHz) and the f0 axis (79 -> 96). The 6mo stacked grid was ~12 GB raw and
+# 24-35 GB resident per GPU, so uncapped the 9mo grid lands at 2-3x that and
+# the 1yr at ~8x (the 1yr v8 OOMed on its first F-stat search). 512 never
+# touches a peak below 8 mHz at 9 mo (their natural counts are <= 512) and
+# bounds the > 8 mHz tail; the host-mapped float32 grid (TODO) is the real
+# fix, and at 1 yr the fdot axis alone needs it. FSTAT_STAGEB_NSKY_MAX=0 on
+# the line restores the uncapped grid.
+export FSTAT_STAGEB_NSKY_MAX=${FSTAT_STAGEB_NSKY_MAX:-512}
+export FSTAT_STAGEB_GROUP_MAX_GB=${FSTAT_STAGEB_GROUP_MAX_GB:-1.0}   # 9mo/1yr: halve the stage-B per-group transient (batching only, no grid change; 2.0 at 6mo)
 # BIRTH-DRAW ALLOCATION (2026-08-16). Peak boxes are weighted w ~ F**alpha,
 # and the F-statistic goes like SNR^2 -- so the historical alpha=1 hands an
 # SNR-10 source 9x FEWER birth attempts than an SNR-30 one, exactly
