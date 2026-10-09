@@ -867,16 +867,20 @@ def noise_params_from_file(
     noise_file: str,
     band: typing.Optional[typing.Tuple[float, float]] = None,
     tdi_generation: int = 2,
+    honor_resume_pin: bool = True,
 ) -> typing.Optional[typing.List[float]]:
     """``[Soms_d, Sa_a]`` fit to the NOISE brick's tabulated estimates.
 
     Wraps :func:`lisatools.sensitivity.estimate_noise_params_from_file`; the
     fit band is clipped to the tabulated grid. Returns ``None`` (with a
     warning) if the fit fails, so callers can fall back to the stock levels.
+    ``honor_resume_pin=False`` ignores ``MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM``
+    (diagnostics only; a run's ``general.psd_injection`` keeps honouring it).
     """
     from lisatools.sensitivity import estimate_noise_params_from_file
 
-    kwargs = {"tdi_generation": tdi_generation}
+    kwargs = {"tdi_generation": tdi_generation,
+              "honor_resume_pin": bool(honor_resume_pin)}
     if band is not None:
         kwargs["band"] = (float(band[0]), float(band[1]))
     try:
@@ -913,7 +917,11 @@ def psd_truth_levels(
        override for a run against a non-stock brick;
     2. the NOISE brick's own tabulated estimates via
        :func:`noise_params_from_file`, i.e. the unequal-arm fit at the brick's
-       ``/ltts``;
+       ``/ltts`` -- ALWAYS unequal-arm: ``MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM=0``
+       pins a run's own ``general.psd_injection`` to the equal-arm pair so an
+       old store can resume, and the monitor rank inherits that environment;
+       it used to draw the equal-arm pair as "injected" and report a correct
+       fit as +0.2% high (2026-10-09). The pin is ignored here;
     3. ``default``.
 
     WHY THIS EXISTS. The pair used to be copy-pasted as a literal into every
@@ -949,7 +957,7 @@ def psd_truth_levels(
     if path is None and mojito_data_path is not None:
         path = resolve_noise_file(mojito_data_path, None)
     if path is not None:
-        params = noise_params_from_file(path)
+        params = noise_params_from_file(path, honor_resume_pin=False)
         if params is not None:
             return (float(params[0]), float(params[1]))
     return (float(default[0]), float(default[1]))

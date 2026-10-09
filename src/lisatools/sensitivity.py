@@ -6114,7 +6114,7 @@ class MojitoNoiseEstimates(NoiseComponent):
         ratio = np.moveaxis(ratio, (0, 1, 2, 3), (3, 2, 0, 1))
         return xp.asarray(folded[..., None] * ratio)
 
-    def _resolve_fit_ltts(self, ltts, tdi_generation: int):
+    def _resolve_fit_ltts(self, ltts, tdi_generation: int, honor_resume_pin: bool = True):
         """Six link delays for :meth:`fit_scalar_params`, or ``None``.
 
         An explicit ``ltts`` always wins. Otherwise the brick's own ``/ltts``
@@ -6148,9 +6148,18 @@ class MojitoNoiseEstimates(NoiseComponent):
         A store written before 2026-09-23 carries the second pair. Set the
         knob to 0 for that store; leave it alone for anything new, where the
         arm model is simply the better answer.
+
+        ``honor_resume_pin=False`` ignores the knob: for the diagnostic truth
+        line (:func:`~lisatools.globalfit.stock.erebor.noise.psd_truth_levels`),
+        which must be the unequal-arm fit even inside a pinned run's
+        environment -- the monitor rank inherits the launcher's ``=0`` and
+        used to draw the equal-arm pair as "injected" (2026-10-09).
         """
-        _ref_fit = os.environ.get("MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM")
-        if _ref_fit is None:
+        if not honor_resume_pin:
+            _ref_fit = None
+        else:
+            _ref_fit = os.environ.get("MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM")
+        if _ref_fit is None and honor_resume_pin:
             # Legacy spelling, shipped 2026-09-23 in 1ec78bda and renamed the
             # same day. Honoured rather than ignored: an unrecognised env var
             # is SILENT, so a hard rename would quietly hand a runbook the
@@ -6200,6 +6209,7 @@ class MojitoNoiseEstimates(NoiseComponent):
         band: Tuple[float, float] = (1e-4, 2.5e-2),
         tdi_generation: int = 2,
         ltts=None,
+        honor_resume_pin: bool = True,
     ) -> Tuple[float, float]:
         """Estimate scalar ``(Soms_d, Sa_a)`` from the tabulated estimates.
 
@@ -6235,6 +6245,10 @@ class MojitoNoiseEstimates(NoiseComponent):
                 path -- the unequal-arm closed forms are TDI-2 only.
             ltts: Optional ``(6,)`` link delays in :data:`UNEQUAL_ARM_LINKS`
                 order, overriding the brick's own table.
+            honor_resume_pin: ``False`` ignores
+                ``MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM`` (see
+                :meth:`_resolve_fit_ltts`); for diagnostics, never for a
+                run's ``general.psd_injection``.
 
         Returns:
             ``(Soms_d, Sa_a)`` in linear (square-root) units, the convention
@@ -6251,7 +6265,7 @@ class MojitoNoiseEstimates(NoiseComponent):
             raise ValueError(f"band {band} has no overlap with the tabulated grid.")
         fb = est_f[mask]
 
-        delays = self._resolve_fit_ltts(ltts, tdi_generation)
+        delays = self._resolve_fit_ltts(ltts, tdi_generation, honor_resume_pin)
         if delays is None:
             Xsens = _XYZ_ELEMENT_SENS[tdi_generation][0]
             orbits = lisa_models.DefaultOrbits()
@@ -6295,15 +6309,18 @@ def estimate_noise_params_from_file(
     band: Tuple[float, float] = (1e-4, 2.5e-2),
     tdi_generation: int = 2,
     ltts=None,
+    honor_resume_pin: bool = True,
 ) -> Tuple[float, float]:
     """``(Soms_d, Sa_a)`` fit to a mojito NOISE brick's tabulated estimates.
 
     Thin wrapper over :meth:`MojitoNoiseEstimates.fit_scalar_params`, which
     uses the brick's own ``/ltts`` (unequal arms) whenever they are there --
-    see that method for why the arm model is worth 0.26% / 0.59%.
+    see that method for why the arm model is worth 0.26% / 0.59%, and
+    :meth:`MojitoNoiseEstimates._resolve_fit_ltts` for ``honor_resume_pin``.
     """
     return MojitoNoiseEstimates(path).fit_scalar_params(
-        band=band, tdi_generation=tdi_generation, ltts=ltts
+        band=band, tdi_generation=tdi_generation, ltts=ltts,
+        honor_resume_pin=honor_resume_pin,
     )
 
 

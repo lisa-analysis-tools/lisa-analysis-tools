@@ -79,6 +79,49 @@ class PsdTruthLevelsTest(unittest.TestCase):
             if old is not None:
                 os.environ["PSD_TRUTH"] = old
 
+    def test_the_truth_line_ignores_the_runs_resume_pin(self):
+        # the monitor rank inherits the launcher's
+        # MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM=0 (a RESUME pin for the run's
+        # own psd_injection); the truth line must still be the unequal-arm
+        # fit (2026-10-09: the 6mo page drew the equal-arm pair as injected)
+        from unittest import mock
+
+        from lisatools.globalfit.stock.erebor import noise
+
+        with mock.patch.dict(os.environ, {"MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM": "0"}), \
+                mock.patch.object(noise, "noise_params_from_file",
+                                  return_value=[1.0, 2.0]) as fit:
+            os.environ.pop("PSD_TRUTH", None)
+            self.assertEqual(noise.psd_truth_levels(noise_file="brick.h5"), (1.0, 2.0))
+        self.assertIs(fit.call_args.kwargs.get("honor_resume_pin"), False)
+
+
+class ResumePinTest(unittest.TestCase):
+    """``MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM=0`` pins the run's reference
+    fit to equal arms; ``honor_resume_pin=False`` (diagnostics) ignores it."""
+
+    LTTS = np.array([8.3, 8.31, 8.32, 8.33, 8.34, 8.35])
+
+    def _resolve(self, env, **kw):
+        from unittest import mock
+
+        est = object.__new__(MojitoNoiseEstimates)   # explicit ltts: no file read
+        with mock.patch.dict(os.environ, env):
+            for k in ("MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM", "MOJITO_PSD_FIT_UNEQUAL_ARM"):
+                if k not in env:
+                    os.environ.pop(k, None)
+            return est._resolve_fit_ltts(self.LTTS, 2, **kw)
+
+    def test_the_pin_forces_equal_arms_for_the_run(self):
+        self.assertIsNone(self._resolve({"MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM": "0"}))
+        self.assertIsNone(self._resolve({"MOJITO_PSD_FIT_UNEQUAL_ARM": "0"}))
+
+    def test_diagnostics_ignore_the_pin(self):
+        for env in ({"MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM": "0"},
+                    {"MOJITO_PSD_FIT_UNEQUAL_ARM": "0"}, {}):
+            got = self._resolve(env, honor_resume_pin=False)
+            np.testing.assert_array_equal(got, self.LTTS)
+
 
 class ComponentTest(unittest.TestCase):
     def _comp(self, drift=0.0, **kwargs):
@@ -283,6 +326,24 @@ class RealBrickTest(unittest.TestCase):
         soms, sa = psd_truth_levels(noise_file=_find_brick())
         self.assertLess(abs(soms / 1.5e-11 - 1), 5e-4)
         self.assertLess(abs(sa / 3.0e-15 - 1), 1e-3)
+
+    def test_a_pinned_run_keeps_its_equal_arm_pair_but_the_truth_does_not(self):
+        from unittest import mock
+
+        from lisatools.globalfit.stock.erebor.noise import psd_truth_levels
+        from lisatools.sensitivity import estimate_noise_params_from_file
+
+        with mock.patch.dict(os.environ, {"MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM": "0"}):
+            os.environ.pop("PSD_TRUTH", None)
+            run_pair = estimate_noise_params_from_file(_find_brick())
+            truth = psd_truth_levels(noise_file=_find_brick())
+        # the run's pinned reference: the equal-arm fit, bit-for-bit what
+        # the 6mo store was started with (submit_gf_6mo_v9_4gpu.sh)
+        self.assertAlmostEqual(run_pair[0] / 1.496182116469e-11, 1.0, places=9)
+        self.assertAlmostEqual(run_pair[1] / 2.982411739286e-15, 1.0, places=9)
+        # the page's truth line: the unequal-arm fit
+        self.assertLess(abs(truth[0] / 1.5e-11 - 1), 5e-4)
+        self.assertLess(abs(truth[1] / 3.0e-15 - 1), 1e-3)
 
     def test_matrix_from_file(self):
         wdm = WDMSettings(
