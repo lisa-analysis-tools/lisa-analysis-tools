@@ -78,6 +78,10 @@
 #          1e-5..1e-2). One resolver feeds the prior, the start-pin window
 #          and the noise-pin refusal; the GALFOR_START_PARAMS pin is inside
 #          the box. The 6mo relaunch keeps the stock box.
+#   9MO-9. MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM 0 -> 1 (2026-10-08): the reference
+#          / 'truth' PSD pair is the unequal-arm fit on this fresh store (the
+#          6mo's =0 pin only keeps its own resumable identity; the 3mo v9 dropped
+#          it on 2026-09-26; ruling 2026-10-04: unequal arm only).
 #
 # EVERYTHING ELSE = the 1yr script = the 6mo script (NineMonthV9TwinTest
 # diffs the resolved exports against submit_gf_1yr_v9.sh: only TOBS_TARGET,
@@ -932,7 +936,15 @@ export GALFOR_MODULATION_T0=data
 # NOT the noise model: UNEQUAL_ARM=1 above still selects
 # UnequalArmInstrumentNoise for the likelihood. This is only the REFERENCE
 # fit that produces general.psd_injection.
-export MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM=0
+# ---- 9MO / 1YR: the reference fit is the UNEQUAL-ARM fit (2026-10-08) --------
+# The =0 pin above exists ONLY so the resumed 6mo store keeps the equal-arm
+# pair its chain was started with (coarse_fiducial_digest). A fresh store has
+# no such debt: =1 (the code default when unset; the 3mo v9 dropped the line,
+# ruling 2026-09-26) makes general.psd_injection -- the reference / 'truth'
+# pair the pages and diagnostics compare against, NOT the noise model, which
+# is UNEQUAL_ARM=1 either way -- the unequal-arm fit 1.500004e-11 /
+# 3.000107e-15. Ruling 2026-10-04: no default may rely on an equal-arm path.
+export MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM=${MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM:-1}
 echo "[V8-NOISE] UNEQUAL_ARM=${UNEQUAL_ARM} stride=${UNEQUAL_ARM_STRIDE} wdm_psd_method=${WDM_PSD_METHOD} psd_reference_fit_unequal_arm=${MOJITO_PSD_REFERENCE_FIT_UNEQUAL_ARM}"
 echo "[V8-NOISE] modulation=${GALFOR_MODULATION_PATH} t0=${GALFOR_MODULATION_T0}"
 
