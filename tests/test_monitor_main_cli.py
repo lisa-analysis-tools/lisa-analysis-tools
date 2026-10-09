@@ -44,7 +44,8 @@ class SnapshotFlagTest(unittest.TestCase):
             rc = m.main(["--snapshot", self.run])
         self.assertEqual(rc, 0)
         bm.assert_called_once()
-        bs.assert_called_once_with(self.run, short=False, include_fstat=False)
+        bs.assert_called_once_with(self.run, short=False, include_fstat=False,
+                                   keep=None, cold_keep=None)
 
     def test_the_fstat_caches_are_OUT_unless_add_fstat(self):
         # User ruling 2026-10-03: "make it default to leaving them out. If
@@ -68,7 +69,8 @@ class SnapshotFlagTest(unittest.TestCase):
             rc = m.main(["--snapshot-only", self.run])
         self.assertEqual(rc, 0)
         bm.assert_not_called()
-        bs.assert_called_once_with(self.run, short=False, include_fstat=False)
+        bs.assert_called_once_with(self.run, short=False, include_fstat=False,
+                                   keep=None, cold_keep=None)
 
     def test_snapshot_only_failure_does_not_claim_a_page_was_written(self):
         """The old message reassured the operator about a page that, in
@@ -386,7 +388,8 @@ class ShortFlagTest(unittest.TestCase):
                                   return_value="/t_short.tar.gz") as bs:
             rc = m.main(["--short", self.run])
         self.assertEqual(rc, 0)
-        bs.assert_called_once_with(self.run, short=True, include_fstat=False)
+        bs.assert_called_once_with(self.run, short=True, include_fstat=False,
+                                   keep=None, cold_keep=None)
 
     def test_short_with_snapshot_only_skips_the_page(self):
         with mock.patch.object(m, "build_monitor") as bm, \
@@ -395,11 +398,23 @@ class ShortFlagTest(unittest.TestCase):
             rc = m.main(["--snapshot-only", "--short", self.run])
         self.assertEqual(rc, 0)
         bm.assert_not_called()
-        bs.assert_called_once_with(self.run, short=True, include_fstat=False)
+        bs.assert_called_once_with(self.run, short=True, include_fstat=False,
+                                   keep=None, cold_keep=None)
+
+    def test_keep_and_cold_keep_reach_the_snapshot(self):
+        # 189f7207 (10-08): --keep / --cold-keep size the extract's warm and
+        # cold row windows; None leaves build_snapshot's own defaults
+        with mock.patch.object(m, "build_monitor"), \
+                mock.patch.object(m, "build_snapshot",
+                                  return_value="/t.tar.gz") as bs:
+            m.main(["--snapshot", "--keep", "3", "--cold-keep", "7", self.run])
+        bs.assert_called_once_with(self.run, short=False, include_fstat=False,
+                                   keep=3, cold_keep=7)
 
     def test_plain_snapshot_is_still_the_FULL_one(self):
         with mock.patch.object(m, "build_monitor"), \
                 mock.patch.object(m, "build_snapshot",
                                   return_value="/t.tar.gz") as bs:
             m.main(["--snapshot", self.run])
-        bs.assert_called_once_with(self.run, short=False, include_fstat=False)
+        bs.assert_called_once_with(self.run, short=False, include_fstat=False,
+                                   keep=None, cold_keep=None)
