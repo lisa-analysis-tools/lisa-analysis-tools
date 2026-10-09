@@ -731,7 +731,7 @@ GPU_PROC_PID=$!
 # rather than an EXIT trap it survives a spot preemption (SIGKILL runs no
 # traps). Also note slurm stdout only FLUSHES at job end, so the mirror is
 # the only way to see these lines while the job is still running.
-SLURM_LOG=/shared/data/global_fit_output/gf6mo_v9_4gpu_${SLURM_JOB_ID:-manual}.log
+SLURM_LOG=/shared/data/global_fit_output/gf1yr_v9_${SLURM_JOB_ID:-manual}.log
 LOG_MIRROR_PID=""
 if [ -n "${SLURM_JOB_ID:-}" ]; then
   ( while true; do

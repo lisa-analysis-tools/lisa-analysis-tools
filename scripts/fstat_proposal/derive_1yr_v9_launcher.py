@@ -16,6 +16,10 @@ REPL = [
      "#SBATCH --job-name=gf1yr_v9          # job name", 1),
     ("/shared/data/global_fit_output/gf6mo_v9_4gpu_%j.log",
      "/shared/data/global_fit_output/gf1yr_v9_%j.log", 1),
+    # the in-job LOG MIRROR (cp of the SLURM stdout into the store every 30 s)
+    # must name THIS run's log, not the 6mo's (pre-launch check 2026-10-09)
+    ("SLURM_LOG=/shared/data/global_fit_output/gf6mo_v9_4gpu_${SLURM_JOB_ID:-manual}.log",
+     "SLURM_LOG=/shared/data/global_fit_output/gf1yr_v9_${SLURM_JOB_ID:-manual}.log", 1),
     ("STORE_DIR=${STORE_DIR:-/shared/data/global_fit_output/gf_prod_6mo_v9_4gpu/}",
      "STORE_DIR=${STORE_DIR:-/shared/data/global_fit_output/gf_prod_1yr_v9/}", 1),
     ("export BASE_FILE_NAME=gf_prod_6mo\n", "export BASE_FILE_NAME=gf_prod_1yr\n", 1),
