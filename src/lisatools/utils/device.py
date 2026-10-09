@@ -174,26 +174,38 @@ def to_current_device_cached(xp, owner, tag, arrays):
 
 def sensitivity_to_current_device(xp, sm):
     """``sm`` itself, or a shallow clone (same class) whose ``invC`` / ``detC``
-    are on the current device, copied once via the host, when ``sm`` lives on
-    another GPU.
+    are on the current device, copied once via the host, when either lives
+    on another GPU.
 
     For an inner product whose signals were built on one device against a
     walker container on another (2026-10-09: the SOBBH Gram eigen table,
     templates on the comp's device, PSD on the walker's). ``inner_product``
-    reads only ``invC`` as an array (``detC`` too in a likelihood); the
-    clone shares every other attribute, ``sens_mat`` included (only its shape
-    is read). A dirty (lazily inverted) matrix is inverted on ITS device
-    first. The clone is built with ``object.__new__`` + the instance dict,
-    not ``copy.copy``, so no ``__getstate__`` / ``__deepcopy__`` hook runs.
-    A no-op on CPU and for same-device input.
+    reads only ``invC`` as an array (``detC`` too in a likelihood), so the
+    decision is made on THOSE arrays: a production walker matrix can hold
+    ``sens_mat`` on the settings' home device while its ``invC`` / ``detC``
+    are refreshed on the walker's device (the first version keyed on
+    ``sens_mat`` and let exactly that case through, 6mo job 748). The clone
+    shares every other attribute, ``sens_mat`` included (only its shape is
+    read). A dirty (lazily inverted) matrix is inverted on its ``sens_mat``'s
+    device first. The clone is built with ``object.__new__`` + the instance
+    dict, not ``copy.copy``, so no ``__getstate__`` / ``__deepcopy__`` hook
+    runs. A no-op on CPU and when both arrays are already local.
     """
     if not hasattr(xp, "cuda"):
         return sm
-    dev = getattr(getattr(getattr(sm, "sens_mat", None), "device", None), "id", None)
-    if dev is None or int(dev) == int(xp.cuda.runtime.getDevice()):
+
+    def _dev(a):
+        return getattr(getattr(a, "device", None), "id", None)
+
+    cur = int(xp.cuda.runtime.getDevice())
+    if getattr(sm, "_inv_det_dirty", False) and getattr(sm, "do_inv_det", True):
+        home = _dev(getattr(sm, "sens_mat", None))
+        with device_context(xp, home):
+            invC, detC = sm.invC, sm.detC
+    else:
+        invC, detC = sm.invC, sm.detC          # plain reads, nothing computed
+    if all(_dev(a) is None or int(_dev(a)) == cur for a in (invC, detC)):
         return sm
-    with device_context(xp, int(dev)):
-        invC, detC = sm.invC, sm.detC
     out = object.__new__(type(sm))
     out.__dict__.update(sm.__dict__)
     out.invC = to_current_device(xp, invC)   # setters clear the dirty flag

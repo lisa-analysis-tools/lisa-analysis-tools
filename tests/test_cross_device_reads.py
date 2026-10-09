@@ -151,6 +151,20 @@ class SensitivityToCurrentDeviceTest(unittest.TestCase):
         np.testing.assert_array_equal(out.invC, 0.25)
         self.assertFalse(out._inv_det_dirty)
 
+    def test_the_decision_follows_invC_not_sens_mat(self):
+        # 6mo job 748: the walker matrix held sens_mat on the home device
+        # (== current) while invC / detC lived on the walker's GPU; keying on
+        # sens_mat let that through and diagnostic.py read invC across devices
+        sm = _sens(1)
+        sm._sens_mat = _on(np.asarray(sm._sens_mat), 0)
+        out = D.sensitivity_to_current_device(self.xp, sm)
+        self.assertIsNot(out, sm)
+        self.assertEqual((out.invC.device.id, out.detC.device.id), (0, 0))
+        # and the reverse: everything inner_product reads is already local
+        sm2 = _sens(0)
+        sm2._sens_mat = _on(np.asarray(sm2._sens_mat), 1)
+        self.assertIs(D.sensitivity_to_current_device(self.xp, sm2), sm2)
+
     def test_same_device_and_numpy_return_the_object_itself(self):
         sm = _sens(0)
         self.assertIs(D.sensitivity_to_current_device(self.xp, sm), sm)
