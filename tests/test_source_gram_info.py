@@ -80,6 +80,26 @@ class _GramCase:
         flat = [i for i in range(11) if i not in COLS]
         np.testing.assert_array_equal(G[np.ix_(flat, flat)], 0.0)
 
+    def test_the_walker_psd_goes_through_the_device_guard(self):
+        # multi-GPU (2026-10-09): the walker's PSD can live on another GPU
+        # than the templates; the products must use what the guard returns.
+        # A guard that hands back 4 x invC must give 4 x the Gram.
+        from lisatools.globalfit.moves import addremovemove as arm
+
+        G, _ = self.move._gram_info(M.BASE_ROW.copy(), 0, WIDTHS, return_steps=True)
+
+        def scaled(xp, sm):
+            out = object.__new__(type(sm))
+            out.__dict__.update(sm.__dict__)
+            out.invC = 4.0 * sm.invC
+            return out
+
+        with mock.patch.object(arm, "sensitivity_to_current_device",
+                               side_effect=scaled) as guard:
+            G4, _ = self.move._gram_info(M.BASE_ROW.copy(), 0, WIDTHS, return_steps=True)
+        self.assertGreater(guard.call_count, 0)
+        np.testing.assert_allclose(G4, 4.0 * G, rtol=1e-10, atol=1e-300)
+
     def test_refresh_routes_through_the_gram(self):
         from types import SimpleNamespace
 

@@ -37,6 +37,7 @@ from tqdm import tqdm
 from ...analysiscontainer import AnalysisContainerArray
 from ...domaincomputation import DomainComputationGroupArray
 from ...domains import DomainBase, DomainBaseArray, WDMSignal
+from ...utils.device import sensitivity_to_current_device
 from ...utils.utility import asnumpy, get_array_module
 from .. import midit_checkpoint
 from . import eigen_refresh, eigen_table_persist
@@ -720,6 +721,9 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
             arr, box = self._gram_templates(self._to_phys(X), best)
             h0 = WDMSignal(arr[2 * nd], box)
             _, _, psd = ac._slice_to_template(h0)
+            # the walker's PSD may live on another GPU than the templates
+            # (SOBBH: comp device vs walker shard) -- keep the products local
+            psd = sensitivity_to_current_device(self.xp, psd)
             half = [WDMSignal(0.5 * (arr[2 * i] - arr[2 * i + 1]), box)
                     for i in range(nd)]
             return h0, half, psd

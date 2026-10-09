@@ -1470,6 +1470,26 @@ class FDSignal(FDSettings, DomainBase):
         if settings is None:
             raise ValueError("Must provide WDMSettings for WDM transform.")
         assert isinstance(settings, WDMSettings)
+        # MULTI-GPU (2026-10-09): run the whole transform on the device that
+        # OWNS this signal, with the settings' cached arrays (window, fold
+        # map) brought there through the host. They live on the settings
+        # object's home device (GPU 0), and a GPU-1 rank transforming a GPU-1
+        # signal used to read them across devices by peer access
+        # ("PerformanceWarning: The device where the array resides (0) is
+        # different from the current device (1)"): GPU work on two devices is
+        # unordered, a race behind the 6mo relaunch's illegal-memory-access
+        # crash that CUDA_LAUNCH_BLOCKING=1 made disappear. A strict no-op on
+        # CPU / one GPU / an already-local signal.
+        from .utils.device import device_context
+
+        dev = getattr(getattr(self.arr, "device", None), "id", None)
+        with device_context(self.xp, dev):
+            return self._wdmtransform_on_device(
+                settings, return_transpose_time_axis_first, is_psd)
+
+    def _wdmtransform_on_device(self, settings, return_transpose_time_axis_first, is_psd):
+        """:meth:`wdmtransform`'s body, run inside the signal's device context."""
+        from .utils.device import to_current_device_cached
 
         # Layer selection + rFFT gather map: shared with the PSD-fold fast
         # path in sensitivity.get_sensitivity, and cached on the settings
@@ -1478,8 +1498,11 @@ class FDSignal(FDSettings, DomainBase):
         Nf_act = settings.Nf_active
         include_top = (settings.ind_min_f == 0)
         n_special = Nf_act + (1 if include_top else 0)
-        m_special_1d, k, herm, _ = settings.fold_shift_map()
-        base_window = (settings.window[:])
+        m_special_1d, k, herm, _ = to_current_device_cached(
+            self.xp, settings, "fold_shift_map", settings.fold_shift_map())
+        (base_window,) = to_current_device_cached(
+            self.xp, settings, "window", (settings.window,))
+        base_window = base_window[:]
 
         # No .copy(): every use below is a READ. The gather ``arr_in[..., k]``
         # produces a new array and all arithmetic happens on that, so nothing
@@ -2391,6 +2414,8 @@ class WDMSettings(DomainSettingsBase):
         # device; a copy on another device must rebuild them.
         state.pop("_freq_layer_mask_cache", None)
         state.pop("_time_layer_mask_cache", None)
+        # per-device copies of the window / fold map (wdmtransform)
+        state.pop("_device_copy_cache", None)
         return state
 
     def __eq__(self, value):

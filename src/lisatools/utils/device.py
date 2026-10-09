@@ -27,6 +27,8 @@ __all__ = [
     "pin_main_device",
     "current_device",
     "to_current_device",
+    "sensitivity_to_current_device",
+    "to_current_device_cached",
     "synchronize",
     "jax_device_context",
 ]
@@ -142,6 +144,61 @@ def to_current_device(xp, arr):
     if int(dev_id) == int(xp.cuda.runtime.getDevice()):
         return arr
     return xp.asarray(xp.asnumpy(arr))
+
+
+def to_current_device_cached(xp, owner, tag, arrays):
+    """``arrays`` (a tuple) resident on the current device, the copies cached
+    on ``owner`` per ``(tag, device)``.
+
+    For arrays a shared object caches on its HOME device and every GPU of a
+    multi-device run reads (the WDM settings' window and fold map): the
+    first read on another device pays one :func:`to_current_device` host
+    hop, later reads reuse it for as long as ``owner`` hands out the SAME
+    source objects (an ``is`` check, so a rebuilt source re-copies). The
+    cache lives in ``owner._device_copy_cache``; an owner that is pickled
+    or deep-copied must drop that key in ``__getstate__``. A no-op on CPU.
+    """
+    arrays = tuple(arrays)
+    if not hasattr(xp, "cuda"):
+        return arrays
+    dev = int(xp.cuda.runtime.getDevice())
+    cache = owner.__dict__.setdefault("_device_copy_cache", {})
+    hit = cache.get((tag, dev))
+    if hit is not None and len(hit[0]) == len(arrays) and all(
+            a is b for a, b in zip(hit[0], arrays)):
+        return hit[1]
+    moved = tuple(to_current_device(xp, a) for a in arrays)
+    cache[(tag, dev)] = (arrays, moved)
+    return moved
+
+
+def sensitivity_to_current_device(xp, sm):
+    """``sm`` itself, or a shallow clone (same class) whose ``invC`` / ``detC``
+    are on the current device, copied once via the host, when ``sm`` lives on
+    another GPU.
+
+    For an inner product whose signals were built on one device against a
+    walker container on another (2026-10-09: the SOBBH Gram eigen table,
+    templates on the comp's device, PSD on the walker's). ``inner_product``
+    reads only ``invC`` as an array (``detC`` too in a likelihood); the
+    clone shares every other attribute, ``sens_mat`` included (only its shape
+    is read). A dirty (lazily inverted) matrix is inverted on ITS device
+    first. The clone is built with ``object.__new__`` + the instance dict,
+    not ``copy.copy``, so no ``__getstate__`` / ``__deepcopy__`` hook runs.
+    A no-op on CPU and for same-device input.
+    """
+    if not hasattr(xp, "cuda"):
+        return sm
+    dev = getattr(getattr(getattr(sm, "sens_mat", None), "device", None), "id", None)
+    if dev is None or int(dev) == int(xp.cuda.runtime.getDevice()):
+        return sm
+    with device_context(xp, int(dev)):
+        invC, detC = sm.invC, sm.detC
+    out = object.__new__(type(sm))
+    out.__dict__.update(sm.__dict__)
+    out.invC = to_current_device(xp, invC)   # setters clear the dirty flag
+    out.detC = to_current_device(xp, detC)
+    return out
 
 
 def synchronize(xp) -> None:
