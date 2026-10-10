@@ -613,6 +613,13 @@ SEARCH_SHUTOFF_WINDOW_FIELDS = (
 #: With this, the three arrays together tell the whole story per cell:
 #: the value now, the all-time max it is judged against, and how many
 #: consecutive iterations it has failed to beat that max.
+#:
+#: UNITS (user ruling 2026-10-10): the statistic -- and so
+#: ``band_cold_logl_w`` / ``_max_w`` / ``_peak_w`` -- is the band's GAIN
+#: ``1/2 <d|d> - 1/2 <r|r>`` under the walker's current noise, no longer the
+#: residual term ``-1/2 <r|r>``. Rows written before hold residual units
+#: (~-1,400 per band against a gain >= ~0); the first judge after the change
+#: resets each streak once (``GBSpecialBase._update_search_band_shutoff``).
 
 #: ``band_cold_logl_max_w`` is DIFFERENT IN KIND from the two above and is
 #: the reference the valve actually judges against (user ruling

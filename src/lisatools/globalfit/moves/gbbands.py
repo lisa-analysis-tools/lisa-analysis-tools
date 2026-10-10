@@ -4783,7 +4783,8 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         return buf
 
     def likelihood(
-        self, source_only: bool = False, noise_only: bool = False, slots=None
+        self, source_only: bool = False, noise_only: bool = False, slots=None,
+        windows=None,
     ) -> float:
         """Band-level log-likelihood over all cells in the buffer.
 
@@ -4801,6 +4802,13 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         needs two columns of a temperature pair, not the whole ladder
         (``run_tempering``'s "add indices because not every likelihood is
         needed" TODO), and skips cells that hold no sources at all.
+
+        ``windows`` (optional, with ``slots`` ONLY): ``(lo, hi)`` host int
+        arrays aligned with ``slots`` -- reduce only frequency rows
+        ``[lo, hi)`` of each slot's slab (WDM layers / FD bins along the
+        slot's own axis) instead of the whole slab. The GB per-walker RJ
+        valve observes the band's OWN window this way (user ruling
+        2026-10-10): the slab also carries its neighbours' pixels.
         """
         assert not (source_only and noise_only)
         if slots is not None and not source_only:
@@ -4809,6 +4817,10 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                 "the PSD log-determinant term is a whole-buffer sum and has no "
                 "per-slot restriction."
             )
+        if windows is not None and slots is None:
+            raise ValueError(
+                "SubBandBuffer.likelihood(windows=...) requires slots=...: the "
+                "windows are per slot.")
 
         # band_buffer / template_buffer / psd_buffer are either ndarrays
         # (single-GPU; in-place mutation rolls back into the underlying
@@ -4840,8 +4852,10 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             chunk = min(chunk, _PSD_MIRROR_LL_CHUNK)
         xyz = self.tdi_channel_setup == "XYZ"
 
-        def _reduce(num, psd):
+        def _reduce(num, psd, win=None):
             k = num.shape[0]
+            if win is not None:
+                return _reduce_window(num, psd, win)
             nf = num.reshape(k, nc, -1)
             if xyz:
                 pf = psd.reshape(k, nc, nc, -1)
@@ -4851,12 +4865,32 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             return (-(1.0 / 2.0) * 4.0 * dc
                     * cp.sum((nf.conj() * nf) * pf, axis=(1, 2)).real)
 
+        def _reduce_window(num, psd, win):
+            # the same per-row contraction kept per frequency row (the
+            # slot's first data axis after the channels), then summed over
+            # the row's own [lo, hi) only
+            xpw = get_array_module(num)
+            k = num.shape[0]
+            n_f = int(self._per_band_data_shape[1])
+            nf = num.reshape(k, nc, n_f, -1)
+            if xyz:
+                pf = psd.reshape(k, nc, nc, n_f, -1)
+                per_f = xpw.einsum("bifk,bijfk,bjfk->bf", nf.conj(), pf, nf).real
+            else:
+                pf = psd.reshape(k, nc, n_f, -1)
+                per_f = xpw.sum((nf.conj() * nf) * pf, axis=(1, 3)).real
+            lo, hi = (xpw.asarray(w)[:, None] for w in win)
+            f = xpw.arange(n_f)[None, :]
+            return (-(1.0 / 2.0) * 4.0 * dc
+                    * xpw.sum(xpw.where((f >= lo) & (f < hi), per_f, 0.0), axis=1))
+
         band = self.band_buffer
         psd_b = self.psd_buffer
         tmpl = self.template_buffer if self.use_template_arr else None
 
         if slots is not None:
-            return self._likelihood_slots(slots, band, psd_b, tmpl, _reduce, chunk)
+            return self._likelihood_slots(slots, band, psd_b, tmpl, _reduce, chunk,
+                                          windows=windows)
 
         if isinstance(band, BandView):
             aca = band._aca
@@ -4924,7 +4958,8 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
 
         return source_term + psd_log_acc
 
-    def _likelihood_slots(self, slots, band, psd_b, tmpl, _reduce, chunk):
+    def _likelihood_slots(self, slots, band, psd_b, tmpl, _reduce, chunk,
+                          windows=None):
         """``likelihood(source_only=True, slots=...)`` -- the subset path.
 
         Gathers only the requested slot rows (bounded at ``chunk`` rows per
@@ -4934,10 +4969,21 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         Multi-GPU: slots are routed to their owning shard through
         ``gpu_splits`` and reduced on that shard's device -- no extra cross
         device traffic, and the shard/split bookkeeping is read-only here.
+        ``windows`` (``(lo, hi)``, host, aligned with ``slots``) restricts
+        each slot to its own frequency rows (see :meth:`likelihood`).
         """
         n_sl = int(slots.shape[0])
         if n_sl == 0:
             return self.xp.zeros(0, dtype=cp.float64)
+        if windows is not None:
+            w_lo, w_hi = (np.asarray(asnumpy(w), dtype=np.int64).reshape(-1)
+                          for w in windows)
+
+        def _red(num, psd, sel):
+            # the 2-argument reduction unless a window was asked for
+            if windows is None:
+                return _reduce(num, psd)
+            return _reduce(num, psd, (w_lo[sel], w_hi[sel]))
 
         if isinstance(band, BandView):
             aca = band._aca
@@ -4970,7 +5016,8 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                         c1 = min(c0 + chunk, pos.shape[0])
                         r = rows[c0:c1]
                         num = (d_sh[r] - t_sh[r]) if t_sh is not None else d_sh[r]
-                        out_host[pos[c0:c1]] = asnumpy(_reduce(num, p_sh[r]))
+                        out_host[pos[c0:c1]] = asnumpy(
+                            _red(num, p_sh[r], pos[c0:c1]))
             finally:
                 if uses_dev:
                     cp.cuda.runtime.setDevice(main_dev)
@@ -4982,7 +5029,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             c1 = min(c0 + chunk, n_sl)
             idx = sl[c0:c1]
             num = (band[idx] - tmpl[idx]) if tmpl is not None else band[idx]
-            source_term[c0:c1] = _reduce(num, psd_b[idx])
+            source_term[c0:c1] = _red(num, psd_b[idx], slice(c0, c1))
         return source_term
 
     # Explicit alias while callers migrate off the ``likelihood`` name (which

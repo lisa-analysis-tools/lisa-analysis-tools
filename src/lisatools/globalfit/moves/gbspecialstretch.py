@@ -2175,6 +2175,21 @@ def cold_band_lnl(state, branch_name="gb"):
     return _ColdBandLnL(bi)
 
 
+def _valve_data_array(acs):
+    """The run's DATA array off ``acs``, or None.
+
+    ``acs.input_data_residual_array`` is ``general_info.input_data_residual_array``
+    (set by ``setup_acs``): a DataResidualArray -> ``.data_res_arr`` (a
+    DomainBase, whose own ``data_res_arr`` is itself) -> ``.arr``, the chain
+    ``residual_snapshot`` reads. A bare array is taken as is.
+    """
+    holder = getattr(acs, "input_data_residual_array", None)
+    if holder is None:
+        return None
+    dom = getattr(holder, "data_res_arr", holder)
+    return getattr(dom, "arr", dom)
+
+
 def _env_int(name, default):
     """``int`` from the environment, falling back loudly-enough on junk."""
     v = os.environ.get(name)
@@ -5206,6 +5221,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         #: data. Class-level default below covers moves that never bind.
         self._shutoff_band_info = None
         self._stage_band_lls = None
+        #: the per-walker valve's statistic, the band GAIN (user ruling
+        #: 2026-10-10), stashed with ``_stage_band_lls`` under one stamp
+        self._stage_band_gain = None
         self._stage_band_lls_stamp = None
         self._shutoff_w_warned_lls = False
         #: the recipe-step serial this move is running under. ``None`` until
@@ -20163,12 +20181,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # source's entire contribution. Here the slab is the complete
         # cold-chain residual for these sub-bands.
         #
-        # ``band_likelihoods(source_only=True)`` is -1/2 <r|r> per cell --
-        # the SAME unit as the gate's ``_window_residual_lls``, and exact
-        # (no sig-het anywhere in it). ``slots=`` restricts it to the cold
-        # rows; per the method's own docstring "the subset only removes
-        # work", so this costs a per-row reduction over a few dozen
-        # resident slots, not a global pass.
+        # THE GAIN, NOT -1/2 <r|r> (user ruling 2026-10-10): what is folded
+        # is ``1/2 <d|d> - 1/2 <r|r>`` over each cell's own BAND window
+        # (``_observed_band_gain``), the statistic the judge reads from
+        # ``_cap_stats_local`` -- one unit on every rank and on the head.
+        # Exact (no sig-het anywhere in it), restricted to the cold slots:
+        # a per-row reduction over a few dozen resident slots plus the data
+        # term, computed once per propose.
         #
         # ``t_i`` is read AFTER the repeats on purpose: a vertical swap
         # rewrites it, so this asks which rows are cold NOW, not which
@@ -20184,11 +20203,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     _cold = _to_numpy(t_i) == 0
                     if bool(np.any(_cold)):
                         _cs = slots[_cold]
-                        _lls = buffer_obj.band_likelihoods(
-                            source_only=True, slots=_cs)
                         _wl = _to_numpy(w_i)[_cold].astype(np.int64)
                         _bl = _to_numpy(b_i)[_cold].astype(np.int64)
-                        _vl = np.asarray(_to_numpy(_lls), dtype=np.float64)
+                        _vl = self._observed_band_gain(
+                            model, buffer_obj, _cs, _wl, _bl)
                         _ok = (np.isfinite(_vl)
                                & (_wl >= 0) & (_wl < _cold_peak.shape[0])
                                & (_bl >= 0) & (_bl < _cold_peak.shape[1]))
@@ -21329,39 +21347,152 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self._band_dof = dof
         return lls
 
-    def _window_residual_lls(self, acs, edges):
-        """Cold-walker residual ll ``-1/2 <r|r>`` per frequency window.
+    def _window_data_lls(self, acs, edges):
+        """Per-window DATA term ``+1/2 <d|d>`` under each walker's inverse PSD.
 
-        Returns ``(lls, dof)`` with ``lls`` a host
-        ``(nwalkers, len(edges) - 1)`` array and ``dof`` the real-dof count
-        per window. The parent ACA holds one AC per COLD-chain walker, so
-        this is exactly the per-window null the leaf-cap convergence test
-        needs. Shard-aware: each per-GPU (or per-CPU-split) slab is reduced
-        on its owning device via a per-bin ll followed by a cumulative-sum
-        window reduction (no per-window kernel loop).
-
-        THE WINDOW GRID IS A PARAMETER (2026-08-15). It is called on the
-        band grid for the legacy per-band diagnostics AND on the cap-cell
-        grid when the cap cells are wide enough to resolve
-        (:meth:`_cap_cells_resolvable`). NOTE the domain's frequency
-        resolution is the hard floor: in WDM the smallest resolvable window
-        is one ``layer_df`` wide, so sub-layer cap cells come back with
-        EMPTY (``k1 == k0``) windows and zero dof -- which is precisely what
-        :meth:`_cap_cells_resolvable` detects and what pushes the cap gate
-        onto the source-attributed statistic instead.
+        ``d`` is the data the residuals were built from -- every source class
+        still in it -- which the ACA carries as ``input_data_residual_array``
+        (``setup_acs``); the ACA's own buffers hold only residuals. Same
+        windows, dof, shard and device handling as the residual term (it IS
+        :meth:`_window_residual_lls`, reducing ``d`` in place of ``r``), so
+        the gain ``1/2 <d|d> - 1/2 <r|r>`` is formed pixel for pixel.
+        Returns a host ``(nwalkers, len(edges) - 1)`` array, or None when the
+        ACA does not carry the data.
         """
-        xp = self.xp
+        data = _valve_data_array(acs)
+        if data is None:
+            return None
+        lls, _ = self._window_residual_lls(acs, edges, data=data)
+        return -lls
+
+    def _band_data_term(self, acs):
+        """:meth:`_window_data_lls` on the BAND grid, once per propose.
+
+        It changes only when the noise does, and the noise never moves
+        inside a GB propose: cached per (ACA, inverse-PSD version) and
+        dropped at every propose start (next to the block-peak allocation),
+        so the observation site and the judge-time statistic of one propose
+        read the SAME data term. None (warned once) when it cannot be formed;
+        the valve is then inert, never judged on the residual term.
+        """
+        key = (id(acs), getattr(acs, "psd_version", None))
+        hit = getattr(self, "_valve_dd", None)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        try:
+            dd = self._window_data_lls(acs, self.band_edges)
+            why = "the ACA carries no input_data_residual_array"
+        except Exception as exc:  # noqa: BLE001 -- never break a propose
+            dd, why = None, repr(exc)
+        if dd is None and not getattr(self, "_valve_dd_warned", False):
+            self._valve_dd_warned = True
+            logger.warning(
+                "[GB_GATE %s] the band DATA term 1/2<d|d> cannot be formed "
+                "(%s): the per-(walker, band) valve's gain is unavailable, so "
+                "the valve is INERT and the in-model sites observe nothing. It "
+                "is never judged on the residual term instead (user ruling "
+                "2026-10-10).", self.name, why)
+        self._valve_dd = (key, dd)
+        return dd
+
+    def _band_gain(self, acs, band_lls):
+        """The per-walker valve's statistic, ``1/2 <d|d> - 1/2 <r|r>``.
+
+        ``band_lls`` is the band-grid residual term of the same ACA
+        (:meth:`_band_residual_lls`). Positive when the templates explain
+        power; exactly 0 for a band no template touches (``r = d`` there),
+        under any noise. None when the data term is unavailable.
+        """
+        dd = self._band_data_term(acs)
+        if dd is None or np.shape(dd) != np.shape(band_lls):
+            return None
+        return dd + np.asarray(band_lls, dtype=float)
+
+    def _slot_band_windows(self, acs, buffer_obj, slots, band_inds):
+        """Each slot's own band window ``[lo, hi)`` along ITS frequency axis.
+
+        The band's window comes from :meth:`_window_bins` -- the geometry the
+        residual and data terms use -- shifted by the slot's origin in the
+        parent (WDM: ``slab_min_f - ind_min_f``, 0 without narrow slabs; FD:
+        ``buffer_start_index - start_freq_ind``). Returns ``(lo, hi, ok)``,
+        host int arrays aligned with ``slots``; ``ok`` is False where the
+        window does not lie whole inside the slot (a slab clamped at the
+        active-band edge): the data term covers the whole window, so such a
+        row is not observed.
+        """
+        k0, k1, _, _ = self._window_bins(acs, self.band_edges)
+        sl = np.asarray(_to_numpy(slots), dtype=np.int64).reshape(-1)
+        b = np.asarray(_to_numpy(band_inds), dtype=np.int64).reshape(-1)
+        n_freq = int(buffer_obj._per_band_data_shape[1])
+        bs = self._basis_settings
+        if isinstance(bs, WDMSettings):
+            smf = getattr(buffer_obj, "slab_min_f", None)
+            origin = (np.zeros(sl.size, dtype=np.int64) if smf is None
+                      else np.asarray(_to_numpy(smf), dtype=np.int64)[sl]
+                      - int(bs.ind_min_f))
+        else:
+            origin = (np.asarray(_to_numpy(buffer_obj.buffer_start_index),
+                                 dtype=np.int64)[sl]
+                      - int(np.asarray(_to_numpy(acs.start_freq_ind)).reshape(-1)[0]))
+        bb = np.clip(b, 0, k0.shape[0] - 1)
+        lo, hi = k0[bb] - origin, k1[bb] - origin
+        ok = (b >= 0) & (b < k0.shape[0]) & (lo >= 0) & (hi <= n_freq)
+        return np.clip(lo, 0, n_freq), np.clip(hi, 0, n_freq), ok
+
+    def _observed_band_gain(self, model, buffer_obj, slots, w_loc, b_loc):
+        """The valve's gain for cold cells, read straight off the buffer.
+
+        The in-model observation site's statistic (user ruling 2026-10-10):
+        ``1/2 <d|d> - 1/2 <r|r>`` over the band's OWN window -- the residual
+        term from each slot's current slab restricted to that window
+        (``band_likelihoods(..., windows=...)``), the data term from this
+        process's ACA (:meth:`_band_data_term`). The same number
+        :meth:`_cap_stats_local` hands the judge for the same residual, so a
+        rank's block peak and the head's judge-time statistic are one unit.
+
+        ⚠ THE WINDOW, NOT THE SLAB. The whole-slot reading this replaces
+        covered the slab (the band plus its support margins: 5 layers
+        against the band's 2 on the 9mo grid), so its ``-1/2 <r|r>`` sat
+        thousands of nats below the band's and never won the peak's
+        maximum. As a gain the slab would carry its NEIGHBOURS' explained
+        power instead, and win every time.
+
+        Returns a host float64 array aligned with ``slots``; NaN where the
+        gain cannot be formed (no data term, a row outside its rows, a
+        clipped window) -- the caller folds only finite entries.
+        """
+        w = np.asarray(_to_numpy(w_loc), dtype=np.int64).reshape(-1)
+        b = np.asarray(_to_numpy(b_loc), dtype=np.int64).reshape(-1)
+        out = np.full(w.shape[0], np.nan)
+        acs = model.analysis_container_arr
+        dd = self._band_data_term(acs)
+        if dd is None or w.size == 0:
+            return out
+        lo, hi, ok = self._slot_band_windows(acs, buffer_obj, slots, b)
+        ok &= (w >= 0) & (w < dd.shape[0]) & (b < dd.shape[1])
+        if not ok.any():
+            return out
+        idx = np.where(ok)[0]
+        lls = buffer_obj.band_likelihoods(
+            source_only=True,
+            slots=slots[get_array_module(slots).asarray(idx)],
+            windows=(lo[idx], hi[idx]))
+        out[idx] = dd[w[idx], b[idx]] + np.asarray(_to_numpy(lls),
+                                                    dtype=np.float64)
+        return out
+
+    def _window_bins(self, acs, edges):
+        """``(k0, k1, n_bins, window_dof)``: each window's ``[k0, k1)``.
+
+        Indices along the ACA's frequency axis (WDM: active layers; FD:
+        stored bins). The ONE place this geometry lives: the residual term,
+        the data term and the valve's per-slot window all read it, so the
+        three cannot cover different pixels.
+        """
         bs = self._basis_settings
         be = _to_numpy(edges)
-        num_bands = len(be) - 1
-        norm = 4.0 * float(bs.differential_component)
-        is_wdm = isinstance(bs, WDMSettings)
         nchannels = int(acs.nchannels)
-        # XYZ runs carry the full cross-channel inverse covariance
-        # (shape_sens == (nc, nc)); AET/AE runs a per-channel diagonal.
-        is_xyz = len(acs.shape_sens) == 2
-
-        if is_wdm:
+        if isinstance(bs, WDMSettings):
             layer_df = float(bs.layer_df)
             ind_min_f = int(bs.ind_min_f)
             Nf = int(bs.Nf_active)
@@ -21384,20 +21515,72 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # complex FD bins: 2 real dof per (channel, bin)
             dof_per_bin = 2 * nchannels
         k1 = np.maximum(k1, k0)
-        window_dof = (k1 - k0) * dof_per_bin
+        return k0, k1, Nf, (k1 - k0) * dof_per_bin
+
+    def _window_residual_lls(self, acs, edges, data=None):
+        """Cold-walker residual ll ``-1/2 <r|r>`` per frequency window.
+
+        Returns ``(lls, dof)`` with ``lls`` a host
+        ``(nwalkers, len(edges) - 1)`` array and ``dof`` the real-dof count
+        per window. The parent ACA holds one AC per COLD-chain walker, so
+        this is exactly the per-window null the leaf-cap convergence test
+        needs. Shard-aware: each per-GPU (or per-CPU-split) slab is reduced
+        on its owning device via a per-bin ll followed by a cumulative-sum
+        window reduction (no per-window kernel loop).
+
+        THE WINDOW GRID IS A PARAMETER (2026-08-15). It is called on the
+        band grid for the legacy per-band diagnostics AND on the cap-cell
+        grid when the cap cells are wide enough to resolve
+        (:meth:`_cap_cells_resolvable`). NOTE the domain's frequency
+        resolution is the hard floor: in WDM the smallest resolvable window
+        is one ``layer_df`` wide, so sub-layer cap cells come back with
+        EMPTY (``k1 == k0``) windows and zero dof -- which is precisely what
+        :meth:`_cap_cells_resolvable` detects and what pushes the cap gate
+        onto the source-attributed statistic instead.
+
+        ``data`` (default None): reduce THIS array -- the run's data, one
+        ``(nchannels, *end_shape)`` plane shared by every walker -- in place
+        of each walker's residual, still under that walker's own inverse PSD.
+        That is the ``-1/2 <d|d>`` :meth:`_window_data_lls` negates. The
+        plane is placed on each shard's device once and cached on the ACA
+        (shared by every GB move; the ACA is never pickled).
+        """
+        xp = self.xp
+        bs = self._basis_settings
+        num_bands = len(_to_numpy(edges)) - 1
+        norm = 4.0 * float(bs.differential_component)
+        is_wdm = isinstance(bs, WDMSettings)
+        # XYZ runs carry the full cross-channel inverse covariance
+        # (shape_sens == (nc, nc)); AET/AE runs a per-channel diagonal.
+        is_xyz = len(acs.shape_sens) == 2
+        k0, k1, Nf, window_dof = self._window_bins(acs, edges)
+
+        # ``w`` labels the reduced array's walker axis: the residual has a row
+        # per walker, the DATA is one plane they all share -- contracted as
+        # such, so no walker-fold broadcast copy and the transients stay the
+        # residual pass's.
+        w = "w" if data is None else ""
+
+        def _rows(r):
+            # the shard's residual rows, or the data plane on this device
+            if data is None:
+                return r
+            (d,) = to_current_device_cached(xp, acs, "valve_data", (data,))
+            return xp.asarray(d).reshape(r.shape[1:])
 
         def _shard_band_lls(r, ic):
-            # r: (nw, nc, Nf[, Nt]); ic: (nw, nc[, nc], Nf[, Nt]) -> (nw, Nf)
+            # r: (nw, nc, Nf[, Nt]), or ONE shared (nc, Nf[, Nt]) data plane;
+            # ic: (nw, nc[, nc], Nf[, Nt]) -> (nw, Nf)
             if is_xyz:
                 if is_wdm:
-                    per_bin = xp.einsum("wifk,wijfk,wjfk->wf", r, ic.real, r)
+                    per_bin = xp.einsum(f"{w}ifk,wijfk,{w}jfk->wf", r, ic.real, r)
                 else:
                     per_bin = xp.einsum(
-                        "wif,wijf,wjf->wf", r.conj(), ic, r
+                        f"{w}if,wijf,{w}jf->wf", r.conj(), ic, r
                     ).real
             else:
                 if is_wdm:
-                    per_bin = xp.einsum("wifk,wifk,wifk->wf", r, ic.real, r)
+                    per_bin = xp.einsum(f"{w}ifk,wifk,{w}ifk->wf", r, ic.real, r)
                 else:
                     per_bin = ((r.conj() * r).real * ic.real).sum(axis=1)
             cs = xp.zeros((per_bin.shape[0], Nf + 1))
@@ -21411,11 +21594,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             if acs.gpus is not None:
                 with xp.cuda.Device(acs.gpus[i]):
                     out[np.asarray(split)] = _to_numpy(
-                        _shard_band_lls(data_shaped[i], psd_shaped[i])
+                        _shard_band_lls(_rows(data_shaped[i]), psd_shaped[i])
                     )
             else:
                 out[np.asarray(split)] = _to_numpy(
-                    _shard_band_lls(data_shaped[i], psd_shaped[i])
+                    _shard_band_lls(_rows(data_shaped[i]), psd_shaped[i])
                 )
         return out, window_dof
 
@@ -22846,7 +23029,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
     def _update_search_band_shutoff(self, model, new_state,
                                     band_counts) -> None:
-        """Freeze a (walker, band) whose cold-chain lnL has converged.
+        """Freeze a (walker, band) whose cold-chain lnL GAIN has converged.
 
         USER RULING 2026-09-24, superseding the source-count criterion this
         started as: the quantity that has to converge is the **lnL of the
@@ -22856,12 +23039,29 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         confused pair -- and freezing RJ there would end the search in a
         band that was still paying.
 
+        THE STATISTIC (user ruling 2026-10-10) is the band's likelihood GAIN
+        over the empty model under the walker's CURRENT noise,
+
+            G = 1/2 <d|d> - 1/2 <r|r>   over the band's window,
+
+        positive when the templates explain power and exactly 0 in a band no
+        template touches. It replaced the residual term ``-1/2 <r|r>``,
+        which a band of ~2,780 pixels puts at ~-1,400 nats: a relative noise
+        change ``eps`` moved it by ~-1,400 * eps with no GB change, so when
+        the cycle-end noise block LOWERED the foreground (9mo gb_search_2)
+        every pair fell below its stale best and shut as "converged" within
+        three cycles whatever the GB moves did. At a fixed noise the data
+        term is a constant and G has the residual term's increments exactly
+        (same decisions); when the noise drops G rises by ``eps * G`` and sets
+        a fresh best by itself, no re-baseline needed; when it rises G falls
+        and the band may shut, which is accepted. The leaf-cap gate and the
+        per-band empty-band valve keep the residual term.
+
         THE CRITERION is the cap gate's own lnL-plateau test, per
         (walker, band) and scoped to the current recipe step: the band's
-        cold-chain residual lnL must fail to beat its running best within
-        the step by more than ``_shutoff_ll_tol`` for
-        ``search_shutoff_conv_iter`` CONSECUTIVE iterations. Any
-        qualifying improvement zeroes the counter.
+        cold-chain gain must fail to beat its running best by more than
+        ``_shutoff_ll_tol`` for ``search_shutoff_conv_iter`` CONSECUTIVE
+        iterations. Any qualifying improvement zeroes the counter.
 
         The tolerance defaults to ``leaf_cap_ndim / 2`` -- D/2 = 4.0 for
         GBs, the lnL a genuinely new D-parameter source has to buy. That is
@@ -22870,15 +23070,16 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         waiting for. ``GB_SEARCH_BAND_SHUTOFF_LL_TOL`` overrides it.
 
         OCCUPANCY GUARD (``GB_SEARCH_BAND_SHUTOFF_REQUIRE_OCC``, default
-        on): an EMPTY band's residual lnL does not improve either, so
+        on): an EMPTY band's gain does not improve either (it is 0), so
         without this every empty band would freeze itself after one
         patience window -- and an empty band is exactly where an
         undiscovered source lives. This is the ghost-increment failure the
         cap gate's engagement latch exists to stop, in its valve form.
 
-        THE LNL comes from the cap gate's stash, computed once per
-        iteration for both features (see ``_update_band_leaf_caps``). If
-        that gate did not run this iteration the statistic is recomputed
+        THE GAIN comes from the cap gate's stash (``_stage_band_gain``, next
+        to the residual term ``_stage_band_lls`` it is formed from), computed
+        once per iteration for both features (see ``_update_band_leaf_caps``).
+        If that gate did not run this iteration the statistic is recomputed
         here rather than replayed stale; if it cannot be obtained at all
         the valve does nothing, which is the permissive direction.
 
@@ -22990,6 +23191,17 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     "so no stage can end on a counter that was never "
                     "measured.", self.name)
             return
+        # ``lls`` is the GAIN (``_shutoff_band_lls``), and so is everything
+        # the in-model sites folded into the peak (``_observed_band_gain``),
+        # so value / max / peak are all in gain units from here on.
+        #
+        # ⚠ UNITS TRANSITION (2026-10-10, no migration): a store written
+        # before the ruling holds ``band_cold_logl_max_w`` in RESIDUAL units
+        # (~-1,400 per band, where the gain is >= ~0). The first judge after
+        # the change therefore sees every pair "improve" and resets each
+        # streak ONCE (one count in ``band_shutoff_reset_w``); judging is
+        # normal from the next iteration. gb_search_2's fresh entry resets
+        # the max anyway (``reset_valves``).
         _cur_obs = np.where(np.isnan(lls), -np.inf, lls)
         np.maximum(_view.peak, _cur_obs, out=_view.peak)
         converged = _view.judge(tol, self.search_shutoff_conv_iter, occ,
@@ -23046,7 +23258,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     "[GB_GATE %s] occupied %d | shut %d (%.1f%%) | active %d "
                     "-- streak p50 %.0f p90 %.0f of %d; resets/pair mean "
                     "%.2f max %d; chronic %d young %d fresh %d | "
-                    "max-minus-now lnL p50 %.2f p90 %.2f (tol %.2f) | "
+                    "max-minus-now gain p50 %.2f p90 %.2f (tol %.2f) | "
                     "peak: %d of %d occupied cells observed this cycle "
                     "(%d walker(s) reporting)",
                     self.name, _n_occ, int((_occ & shut).sum()),
@@ -23082,7 +23294,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         ws, bs = np.where(converged)
         logger.info(
             "[GB_STAGE %s] per-walker RJ shutoff: %d (walker, band) pairs "
-            "converged in lnL within this recipe step (no improvement > "
+            "converged in lnL gain within this recipe step (no improvement > "
             "%.2f for %d consecutive iterations) -- births AND deaths "
             "frozen there until the next step; %d of %d pairs now shut.",
             self.name, int(ws.size), tol, self.search_shutoff_conv_iter,
@@ -23141,13 +23353,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             "GB_SEARCH_BAND_SHUTOFF_REQUIRE_OCC", "1") == "1"
 
     def _shutoff_band_lls(self, model, new_state):
-        """This iteration's ``(nwalkers, nbands)`` cold-chain per-band lnL.
+        """This iteration's ``(nwalkers, nbands)`` cold-chain per-band GAIN.
 
-        Prefers the cap gate's stash (computed once per iteration and
-        stamped with the propose counter, so a stale one is detectable);
-        recomputes when the cap gate did not run this iteration; returns
-        ``None`` -- valve inert, the permissive direction -- when neither
-        is available.
+        ``1/2 <d|d> - 1/2 <r|r>`` (user ruling 2026-10-10; see
+        :meth:`_update_search_band_shutoff`), never the residual term.
+        Prefers the cap gate's stash (``_stage_band_gain``, computed once per
+        iteration and stamped with the propose counter, so a stale one is
+        detectable); recomputes when the cap gate did not run this
+        iteration; returns ``None`` -- valve inert, the permissive direction
+        -- when neither is available. A stash stamped THIS propose without a
+        gain (no data term on some block) is not recomputed: under the
+        fan-out the head alone holds one walker block, so a head-local
+        statistic would be the wrong shape.
 
         Never reads ``band_info['band_cold_ll']`` as a fallback: on a
         sub-layer cap grid that array is the CELL statistic the gate wrote
@@ -23156,21 +23373,31 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         band.
         """
         stamp = getattr(self, "_stage_band_lls_stamp", None)
-        stash = getattr(self, "_stage_band_lls", None)
-        if stash is not None and stamp == int(getattr(self, "num_proposals", 0)):
-            return np.asarray(stash, dtype=float)
-        try:
-            stats = self._cap_stats_local(model, new_state)
-            return np.asarray(stats["band_lls"], dtype=float)
-        except Exception as exc:  # never break a propose on the valve
-            if not self._shutoff_w_warned_lls:
-                self._shutoff_w_warned_lls = True
+        gain = getattr(self, "_stage_band_gain", None)
+        stashed = (gain is not None
+                   or getattr(self, "_stage_band_lls", None) is not None)
+        if not (stashed and stamp == int(getattr(self, "num_proposals", 0))):
+            try:
+                gain = self._cap_stats_local(model, new_state).get("band_gain")
+            except Exception as exc:  # never break a propose on the valve
+                if not self._shutoff_w_warned_lls:
+                    self._shutoff_w_warned_lls = True
+                    logger.warning(
+                        "[GB_STAGE %s] the per-walker RJ valve could not "
+                        "obtain this iteration's per-band cold gain (%r); the "
+                        "valve is inert until it can. Nothing is frozen on a "
+                        "statistic that was not measured.", self.name, exc)
+                return None
+        if gain is None:
+            if not getattr(self, "_shutoff_w_warned_gain", False):
+                self._shutoff_w_warned_gain = True
                 logger.warning(
-                    "[GB_STAGE %s] the per-walker RJ valve could not obtain "
-                    "this iteration's per-band cold lnL (%r); the valve is "
-                    "inert until it can. Nothing is frozen on a statistic "
-                    "that was not measured.", self.name, exc)
+                    "[GB_STAGE %s] no per-band GAIN this iteration (the data "
+                    "term 1/2<d|d> is unavailable); the per-walker RJ valve is "
+                    "inert rather than judged on the residual term.",
+                    self.name)
             return None
+        return np.asarray(gain, dtype=float)
 
 
     def _publish_shutoff_w_pending(self, shut, occ) -> None:
@@ -24101,7 +24328,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         Returns the dict :meth:`_update_band_leaf_caps` consumes:
         ``band_lls`` (nwalkers, num_bands), ``lls``/``dof`` (whatever grid
         drives the gate), ``band_dof`` (set as a side effect of
-        :meth:`_band_residual_lls`) and ``is_cells``.
+        :meth:`_band_residual_lls`) and ``is_cells`` -- plus ``band_gain``
+        (nwalkers, num_bands), ``1/2 <d|d> + band_lls``, the per-walker RJ
+        valve's statistic (user ruling 2026-10-10; None without the data
+        term). The leaf-cap gate keeps reading ``band_lls`` / ``lls``.
 
         NO ``band_info`` writes happen here -- the head owns those, in the
         order :meth:`_update_band_leaf_caps` has always written them.
@@ -24127,6 +24357,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             lls, dof = band_lls, self._band_dof
         return {
             "band_lls": band_lls,
+            "band_gain": self._band_gain(model.analysis_container_arr,
+                                         band_lls),
             "lls": lls,
             "dof": dof,
             "band_dof": getattr(self, "_band_dof", None),
@@ -24280,8 +24512,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # statistic keeps one residual pass per iteration and guarantees
         # the two features can never disagree about what this iteration's
         # lnL was. Stamped so a stale stash (this gate skipped) is
-        # detectable rather than silently replayed.
+        # detectable rather than silently replayed. The valve judges the
+        # GAIN formed from it (user ruling 2026-10-10); this gate keeps
+        # ``band_lls``.
         self._stage_band_lls = np.array(band_lls, copy=True)
+        _gain = stats.get("band_gain")
+        self._stage_band_gain = (None if _gain is None
+                                 else np.array(_gain, dtype=float, copy=True))
         self._stage_band_lls_stamp = int(getattr(self, "num_proposals", 0))
         # Cell grids: the gate below never touches the band-level running
         # best, so track it here (no-op on the band grid, where the gate
@@ -25497,6 +25734,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             self._cold_lnl_block_peak = (
                 np.full((_B_pk, int(self.num_bands)), -np.inf,
                         dtype=np.float64) if _B_pk > 0 else None)
+            # the valve's data term is recomputed once in every propose
+            # (``_band_data_term``) -- for this rank's block, under its noise
+            self._valve_dd = None
             if neutral:
                 B, ntemps, nb = self._gb_neutral_shapes(sess)
                 return {
@@ -27720,6 +27960,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             if fanned:
                 self._stage_band_lls = np.full(
                     (int(nwalkers), int(self.num_bands)), np.nan)
+                self._stage_band_gain = np.array(self._stage_band_lls)
                 self._stage_band_lls_stamp = int(
                     getattr(self, "num_proposals", 0))
             self._update_search_stages(state, band_counts)
@@ -28104,6 +28345,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # first assigned further down this method and does not exist on a
         # first propose (the 2026-09-27 VGB relaunch crash).
         self._cold_lnl_block_peak = self._alloc_cold_peak_from_state(state)
+        # the valve's data term is recomputed once in every propose
+        self._valve_dd = None
         # Tempering-cadence census: every propose of this branch ticks the
         # shared counter (see _temper_cadence_fire).
         GBSpecialBase._branch_propose_counts[self.branch_name] = (
@@ -29031,6 +29274,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             cap_stats = {
                 "band_lls": np.concatenate(
                     [np.asarray(s["band_lls"]) for s in cap_rows], axis=0),
+                # the per-walker valve's GAIN (user ruling 2026-10-10): each
+                # block formed it from ITS OWN data term and residual, so the
+                # rows concatenate like ``band_lls``; one block without it
+                # (no data term there) leaves no N-walker gain -> valve inert
+                "band_gain": (
+                    np.concatenate(
+                        [np.asarray(s["band_gain"]) for s in cap_rows], axis=0)
+                    if all(s.get("band_gain") is not None for s in cap_rows)
+                    else None),
                 "lls": np.concatenate(
                     [np.asarray(s["lls"]) for s in cap_rows], axis=0),
                 "dof": cap_rows[0]["dof"],
@@ -29112,6 +29364,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             # itself stays OFF -- this only hands over a number that was
             # already computed and shipped.
             self._stage_band_lls = np.array(cap_stats["band_lls"], copy=True)
+            self._stage_band_gain = (
+                None if cap_stats["band_gain"] is None
+                else np.array(cap_stats["band_gain"], copy=True))
             self._stage_band_lls_stamp = int(
                 getattr(self, "num_proposals", 0))
 
@@ -29263,6 +29518,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # first assigned further down this method and does not exist on a
         # first propose (the 2026-09-27 VGB relaunch crash).
         self._cold_lnl_block_peak = self._alloc_cold_peak_from_state(state)
+        # the valve's data term is recomputed once in every propose
+        self._valve_dd = None
         # Tempering-cadence census: every propose of this branch ticks the
         # shared counter (see _temper_cadence_fire).
         GBSpecialBase._branch_propose_counts[self.branch_name] = (

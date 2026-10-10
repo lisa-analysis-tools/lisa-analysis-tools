@@ -2169,6 +2169,11 @@ class GlobalFit:
             # across devices; single-GPU/CPU runs stay serial.
             run_threaded=gpus is not None and len(gpus) > 1,
         )
+        # The DATA the residuals are built from (a reference, not a copy):
+        # the GB per-(walker, band) RJ valve judges the band gain
+        # 1/2<d|d> - 1/2<r|r> (user ruling 2026-10-10), and the ACA's own
+        # buffers hold only residuals.
+        acs.input_data_residual_array = general_info.input_data_residual_array
 
         if rebuild_residuals:
             # Residual rebuild, replicating the stft_tof ``get_templates``

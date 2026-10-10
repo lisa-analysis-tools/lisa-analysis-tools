@@ -90,6 +90,9 @@ def _stage_move(nwalkers=NWALKERS, min_iters=3, coarse=8.0, fine=5.0,
     m._snr_lim_table = None
     m._rj_band_shutoff_w = None
     m._stage_band_lls = None
+    # the valve's statistic since 2026-10-10: the band GAIN, stashed next to
+    # the residual term under the same stamp (see tests/test_gb_valve_gain.py)
+    m._stage_band_gain = None
     m._stage_band_lls_stamp = None
     m._shutoff_w_warned_lls = False
     m.leaf_cap_ndim = 8.0           # -> D/2 = 4.0 improvement threshold
@@ -203,7 +206,7 @@ class FeatureIndependenceTest(unittest.TestCase):
         st = _state(bi)
         for _ in range(6):
             m.num_proposals += 1
-            m._stage_band_lls = np.zeros((NWALKERS, NUM_BANDS))
+            m._stage_band_gain = np.zeros((NWALKERS, NUM_BANDS))
             m._stage_band_lls_stamp = m.num_proposals
             m._update_search_band_shutoff(
                 None, st, _counts(np.ones((NWALKERS, NUM_BANDS))))
@@ -577,8 +580,9 @@ class RjShutoffValveTest(unittest.TestCase):
             occ = np.ones((m.nwalkers, NUM_BANDS), dtype=np.int64)
         for lls in ll_series:
             m.num_proposals += 1
-            # the stash the cap gate hands over each iteration
-            m._stage_band_lls = np.asarray(lls, dtype=float)
+            # the stash the cap gate hands over each iteration (the valve
+            # judges the GAIN stash; these series are statistic-agnostic)
+            m._stage_band_gain = np.asarray(lls, dtype=float)
             m._stage_band_lls_stamp = m.num_proposals
             m._update_search_band_shutoff(None, st, _counts(occ))
 
@@ -845,7 +849,7 @@ class RjShutoffValveTest(unittest.TestCase):
         m, bi = self._armed(conv_iter=1)
         st = _state(bi)
         m.num_proposals = 5
-        m._stage_band_lls = self._flat()
+        m._stage_band_gain = self._flat()
         m._stage_band_lls_stamp = 4          # LAST iteration's
         m._cap_stats_local = lambda *a, **k: (_ for _ in ()).throw(
             RuntimeError("no residual here"))
@@ -880,7 +884,7 @@ class RjShutoffValveTest(unittest.TestCase):
     def test_row_mismatch_raises_rather_than_broadcasting(self):
         m, bi = self._armed(conv_iter=2)
         m.num_proposals = 1
-        m._stage_band_lls = np.zeros((NWALKERS * 2, NUM_BANDS))
+        m._stage_band_gain = np.zeros((NWALKERS * 2, NUM_BANDS))
         m._stage_band_lls_stamp = 1
         with self.assertRaises(RuntimeError):
             m._update_search_band_shutoff(
@@ -903,7 +907,7 @@ class StageConvergenceInterfaceTest(unittest.TestCase):
         if occ is None:
             occ = np.ones((NWALKERS, NUM_BANDS), dtype=np.int64)
         m.num_proposals += 1
-        m._stage_band_lls = np.full((NWALKERS, NUM_BANDS), float(value))
+        m._stage_band_gain = np.full((NWALKERS, NUM_BANDS), float(value))
         m._stage_band_lls_stamp = m.num_proposals
         m._update_search_band_shutoff(None, _state(bi), _counts(occ))
 

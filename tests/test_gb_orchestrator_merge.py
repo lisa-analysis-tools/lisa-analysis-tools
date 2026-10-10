@@ -180,6 +180,9 @@ def _stub_gf_serve(move, op, payload, clock, model):
             rows = np.repeat(walker_tag[:, None], nb, axis=1)
             cap = {
                 "band_lls": rows,
+                # the valve's gain, formed on the rank from ITS data term
+                # (user ruling 2026-10-10): a distinct, walker-tagged value
+                "band_gain": 1000.0 + rows,
                 "lls": rows,
                 "dof": 7.0,
                 "band_dof": np.full(nb, 5.0),
@@ -531,6 +534,94 @@ class GBOrchestratorMergeTest(unittest.TestCase):
         np.testing.assert_allclose(stats["band_lls"][:, 0], np.arange(NWALKERS))
         # the pooled [FSTAT_CTR] census is the sum over the blocks
         self.assertEqual(head._fstat_ctr_fallback_rows, 1 + 2)
+
+    def test_the_valve_gain_is_the_blocks_gains_in_walker_order(self):
+        """USER RULING 2026-10-10: the per-walker valve judges the band GAIN.
+
+        Each rank forms it from its own block's data term and residual; the
+        head must concatenate THOSE rows (never re-derive it from its own
+        block, never substitute the residual term) so a rank's units are
+        the head's units.
+        """
+        (_new_state, _acc), moves = run_propose(self.state)
+        stats = moves[0].cap_calls[0]
+        self.assertEqual(stats["band_gain"].shape, (NWALKERS, NUM_BANDS))
+        np.testing.assert_allclose(stats["band_gain"][:, 0],
+                                   1000.0 + np.arange(NWALKERS))
+        # the leaf caps keep the residual term
+        np.testing.assert_allclose(stats["band_lls"][:, 0], np.arange(NWALKERS))
+
+    def test_one_block_without_a_gain_leaves_no_gain(self):
+        """A block that could not form the gain (no data term) must not be
+        papered over: no N-walker gain, so the valve stays inert."""
+        real = _stub_gf_serve
+
+        def stub(move, op, payload, clock, model):
+            rep = real(move, op, payload, clock, model)
+            if op == "gb_finish" and move._test_rank == 1 and rep["cap_stats"]:
+                rep["cap_stats"] = dict(rep["cap_stats"], band_gain=None)
+            return rep
+
+        with mock.patch.dict(globals(), {"_stub_gf_serve": stub}):
+            (_new_state, _acc), moves = run_propose(self.state)
+        self.assertIsNone(moves[0].cap_calls[0]["band_gain"])
+
+    def test_the_head_judges_the_ranks_gain_and_gain_unit_peaks(self):
+        """END TO END over the fan-out, caps OFF and the per-walker valve ON
+        (the 9mo gb_search_2 configuration). Each rank ships its block's gain
+        in ``cap_stats`` and its in-model block peak in ``cold_lnl_peak``;
+        the head folds the peaks at their offsets, stashes the concatenated
+        gain and judges ``max(peak, gain)``. Rank 1's band-0 peak sits ABOVE
+        its judge-time gain, so the judged value proves both arrive in one
+        unit -- with the residual term on either side the max would be
+        meaningless."""
+        from lisatools.globalfit.state import ensure_search_shutoff_fields
+
+        bi0 = self.state.sub_states["gb"].band_info
+        bi0.setdefault("nwalkers", NWALKERS)
+        ensure_search_shutoff_fields(bi0, NUM_BANDS, per_walker=True)
+        real_make, real_stub = make_move, _stub_gf_serve
+
+        def stub(move, op, payload, clock, model):
+            # the valve's shut table rides along now; the base stub pins the
+            # caps-era table set, so hand it the payload without it
+            tabs = {k: v for k, v in payload["tables"].items()
+                    if k != "rj_band_shutoff_w"}
+            rep = real_stub(move, op, dict(payload, tables=tabs), clock, model)
+            if op == "gb_finish":
+                w0, w1 = move._test_block
+                pk = np.full((w1 - w0, NUM_BANDS), -np.inf)
+                if move._test_rank == 1:
+                    pk[:, 0] = 1050.0 + np.arange(w0, w1)
+                rep["cold_lnl_peak"] = pk
+            return rep
+
+        def wrapped(*a, **k):
+            m = real_make(*a, **k)
+            m._leaf_cap_enabled = False          # caps OFF
+            m.search_shutoff_per_walker = True   # the per-walker valve ON
+            m.search_mode = True
+            m.search_shutoff_conv_iter = 3
+            m.search_stage_per_walker = False
+            m.leaf_cap_ndim = 8.0
+            m._recipe_step_serial = None
+            m._shutoff_w_warned_mode = True
+            m._shutoff_w_warned_lls = False
+            return m
+
+        with mock.patch.dict(globals(), {"_stub_gf_serve": stub,
+                                         "make_move": wrapped}):
+            (new_state, _acc), moves = run_propose(self.state)
+        head = moves[0]
+        self.assertEqual(head.cap_calls, [], "the leaf caps must be off here")
+        bi = new_state.sub_states["gb"].band_info
+        want = 1000.0 + np.repeat(
+            np.arange(NWALKERS, dtype=float)[:, None], NUM_BANDS, axis=1)
+        want[2:4, 0] = 1050.0 + np.arange(2, 4)
+        np.testing.assert_allclose(bi["band_cold_logl_w"], want)
+        np.testing.assert_allclose(bi["band_cold_logl_max_w"], want)
+        np.testing.assert_allclose(head._stage_band_gain[:, 0],
+                                   1000.0 + np.arange(NWALKERS))
 
     def test_the_head_body_runs_against_the_propose_model(self):
         """The head's own block is served with ``propose``'s ``model``.

@@ -2425,6 +2425,11 @@ class AnalysisContainerArray:
         # per-device replica (``psd_mirror_for_device``) can tell it is stale.
         self._psd_version = 0
         self._psd_mirror = {}
+        # The DATA the residual buffers were built from, when the owner sets
+        # it (the global fit's ``setup_acs``: ``general_info.
+        # input_data_residual_array``, a reference). The buffers above hold
+        # residuals only; the GB per-walker RJ valve's gain needs 1/2<d|d>.
+        self.input_data_residual_array = None
 
         if isinstance(analysis_containers, AnalysisContainer):
             acs = np.array([analysis_containers], dtype=object)
