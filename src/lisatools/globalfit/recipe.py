@@ -4619,6 +4619,37 @@ def _stamp_temper_seed_base(moves, random_seed):
     return base
 
 
+#: domain tags for the two warm-start containers' private Generators
+#: (search twin / PE twin), spawned off the PER-RANK ``GBSettings.build_seed``
+_WARM_SEED_TAG_SEARCH = 0x3A12
+_WARM_SEED_TAG_PE = 0x3A13
+
+
+def _warm_start_seed(gb_info, tag):
+    """Per-rank, domain-separated seed for a warm-start container.
+
+    ``WarmStartComponents.rvs`` draws every birth candidate (floor coin,
+    mixture component, normals) from ONE private ``np.random.Generator``.
+    Until 2026-10-10 both containers were built with the BARE run seed
+    (``general_info.random_seed``), identical on every compute rank, so the
+    four walkers of the 9mo run proposed the SAME candidate sequence: the
+    first warm propose of job 751 logged identical viable / prior-gated /
+    SNR-dropped counts (367392 / 38531 / 74077) on all four ranks, with only
+    the device-RNG acceptance differing. Every other GB stream was already
+    per rank (priors and the F-stat birth seed off ``build_seed``, the
+    vertical swaps off ``_rank_rng_seed``); this is the same rule applied
+    here: ``SeedSequence([build_seed, tag])``, ``build_seed`` being
+    :func:`~lisatools.globalfit.communication.ranks.rank_build_seed`'s
+    per-rank value. ``None`` (no run seed) keeps the container on OS
+    entropy, which is independent per rank as before.
+    """
+    base = getattr(gb_info, "build_seed", None)
+    if base is None:
+        return None
+    return int(np.random.SeedSequence([int(base), int(tag)])
+               .generate_state(1, dtype=np.uint32)[0])
+
+
 def build_gb_moves(
     engine_info: Setup,
     curr: CurrentInfoGlobalFit,
@@ -5636,7 +5667,9 @@ def build_gb_moves(
             floor_box=(_warm_floor_lo, _warm_floor_hi),
             floor_eps=float(os.environ.get("GB_WARM_START_FLOOR_EPS", "0.05")),
             p_floor=float(os.environ.get("GB_WARM_START_P_FLOOR", "0")),
-            seed=general_info.random_seed,
+            # PER-RANK seed (see _warm_start_seed): the bare run seed here
+            # gave every walker the identical candidate sequence (job 751)
+            seed=_warm_start_seed(gb_info, _WARM_SEED_TAG_SEARCH),
         )
         gb_warm_move = GBSpecialRJPriorMove(
             *gb_move_args,
@@ -5837,7 +5870,8 @@ def build_gb_moves(
             floor_eps=float(os.environ.get("GB_WARM_START_FLOOR_EPS", "0.05")),
             p_floor=float(os.environ.get("GB_WARM_START_P_FLOOR", "0")),
             circ_images=int(os.environ.get("GB_WARM_START_CIRC_IMAGES", "3")),
-            seed=general_info.random_seed,
+            # PER-RANK seed, its own domain tag (see _warm_start_seed)
+            seed=_warm_start_seed(gb_info, _WARM_SEED_TAG_PE),
         )
         gb_warm_pe_move = GBSpecialRJPriorMove(
             *gb_move_args,

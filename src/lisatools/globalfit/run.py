@@ -2419,7 +2419,15 @@ class GlobalFit:
         seed = derive_rank_seed(int(self._seed_base), self.layout, self.rank)
         np.random.seed(seed)
         if _xp_is_cupy and self.curr.general_info.gpus:
-            xp.random.seed(seed)
+            # cupy keeps ONE RandomState PER DEVICE and ``seed()`` touches
+            # only the current one. Seeded with device 0 current, a rank
+            # whose walker lives on GPU 1 (ranks 2/3 of the 9mo layout) drew
+            # its acceptance uniforms from a lazily created, entropy-seeded
+            # device-1 state -- independent, but not reproducible from the
+            # run seed. Seed the state of every device this rank owns.
+            for _dev in self.curr.general_info.gpus:
+                with device_context(xp, _dev):
+                    xp.random.seed(seed)
         self.logger.info("rank %d RNG streams seeded with %d", self.rank, seed)
         return seed
 
