@@ -1238,8 +1238,10 @@ class FstatSkipsShutBandsTest(unittest.TestCase):
     so a band may only be skipped when the level-3 valve is shut on
     EVERY walker. ``any`` would starve the walkers still open there.
 
-    Job 662 split: stage A 720 s, stage B 409 s of a 1129 s epoch. This
-    masks the stage-B third; the stage-A node-range skip is separate.
+    Job 662 split: stage A 720 s, stage B 409 s of a 1129 s epoch. The
+    2026-10-10 ruling extends this to stage A's SWEEP (pinned in
+    test_fstat_parallel_fit.CombBandSkipSweepTest) and ORs the per-band
+    empty-band valve into the skip set (the per-band tests below).
     """
 
     NB = 4
@@ -1323,7 +1325,153 @@ class FstatSkipsShutBandsTest(unittest.TestCase):
         self.assertIn("band_skip=fstat_band_skip_for(self)",
                       inspect.getsource(g.GBSpecialRJFStatGridMove._run_fstat_fit))
         src = inspect.getsource(gf.run_fstat_grid_fit)
-        self.assertIn("bands skipped as shut on ", src)
+        self.assertIn("f0 nodes dropped from the sweep", src)
+
+    # -- the per-BAND empty-band valve joins the skip set (2026-10-10) ---
+    @staticmethod
+    def _mv(shut_w=None, shut_b=None, live=True, nb=4, name="rj_fstat_search"):
+        """Duck-typed move: the per-walker table, the per-band valve's
+        ``_rj_band_shutoff`` and its liveness gate ``_band_shutoff_enabled``
+        (the SAME gate run_proposal's RJ freeze uses)."""
+        kw = dict(num_bands=nb, name=name)
+        if shut_w is not None:
+            kw["_rj_band_shutoff_w"] = np.asarray(shut_w, dtype=bool)
+        if shut_b is not None:
+            kw["_rj_band_shutoff"] = np.asarray(shut_b, dtype=bool)
+            kw["_band_shutoff_enabled"] = (lambda: bool(live))
+        return SimpleNamespace(**kw)
+
+    def test_per_walker_only_is_unchanged(self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        from lisatools.sampling.fstat_proposal import fstat_band_skip
+        shut = np.array([[True, False, False, False],
+                         [True, False, True, False]])
+        got = g.fstat_band_skip_for(self._mv(shut_w=shut))
+        np.testing.assert_array_equal(got, fstat_band_skip(shut, self.NB))
+
+    def test_the_per_band_valve_JOINS_the_skip_set(self):
+        """A band whose births are off cannot use a peak either -- and the
+        648 bands above 10 mHz it shut on job 753 are the dense, nsky=512
+        end of the comb, i.e. most of stage A."""
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        # 6 bands: interior 1..4, so the union {1, 3} is a real skip set
+        # (with 4 bands {1, 2} would be every interior band -> refused).
+        shut_w = np.zeros((2, 6), dtype=bool)
+        shut_w[:, 1] = True
+        shut_w[0, 2] = True                   # one walker only: not skipped
+        got = g.fstat_band_skip_for(self._mv(
+            shut_w=shut_w, shut_b=[False, False, False, True, False, False],
+            nb=6))
+        self.assertEqual([bool(v) for v in got],
+                         [False, True, False, True, False, False])
+
+    def test_the_per_band_valve_alone_still_skips(self):
+        """Per-walker valve unbound (feature off): the per-band one is the
+        whole skip set, not ignored."""
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        got = g.fstat_band_skip_for(self._mv(shut_b=[False, True, False,
+                                                      False]))
+        self.assertIsNotNone(got)
+        self.assertEqual([bool(v) for v in got], [False, True, False, False])
+
+    def test_a_per_band_valve_that_is_NOT_live_is_ignored(self):
+        """Not live on this move (wrong scope, not the designated move): its
+        stale array must not shrink the sweep."""
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        shut_w = np.zeros((2, self.NB), dtype=bool)
+        shut_w[:, 1] = True
+        got = g.fstat_band_skip_for(self._mv(
+            shut_w=shut_w, shut_b=[False, False, True, False], live=False))
+        self.assertEqual([bool(v) for v in got], [False, True, False, False])
+        self.assertIsNone(g.fstat_band_skip_for(self._mv(
+            shut_b=[True, True, False, False], live=False)))
+
+    def test_the_all_shut_guard_applies_to_the_UNION(self):
+        import logging
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        shut_w = np.zeros((2, self.NB), dtype=bool)
+        shut_w[:, :2] = True
+        with self.assertLogs(g.logger, level=logging.WARNING) as cap:
+            self.assertIsNone(g.fstat_band_skip_for(self._mv(
+                shut_w=shut_w, shut_b=[False, False, True, True])))
+        self.assertTrue(any("every band is shut" in m for m in cap.output))
+
+    def test_every_INTERIOR_band_skipped_also_refuses(self):
+        """Peaks are selected in interior bands only and the comb spans
+        only them, so skipping every INTERIOR band is already the empty
+        catalog the guard exists to refuse -- the edge bands do not count."""
+        import logging
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        with self.assertLogs(g.logger, level=logging.WARNING):
+            self.assertIsNone(g.fstat_band_skip_for(self._mv(
+                shut_b=[False, True, True, False])))
+
+    def test_a_mismatched_per_band_valve_raises(self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        with self.assertRaises(ValueError) as cm:
+            g.fstat_band_skip_for(self._mv(shut_b=[True, False]))
+        self.assertIn("WRONG", str(cm.exception))
+
+    def test_the_per_band_valve_is_part_of_the_EPOCH_FINGERPRINT(self):
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        shut_w = np.zeros((2, 6), dtype=bool)
+        shut_w[:, 1] = True
+        a = g.fstat_stage_fingerprint_for(self._mv(shut_w=shut_w, nb=6))
+        b = g.fstat_stage_fingerprint_for(self._mv(
+            shut_w=shut_w, shut_b=[False, False, False, True, False, False],
+            nb=6))
+        self.assertIn("bandskip=", a)
+        self.assertIn("bandskip=", b)
+        self.assertNotEqual(a, b)
+
+    def _rj_grid_move(self, *, search):
+        """A real GBSpecialRJFStatGridMove shell with the valve attributes
+        the recipe sets, in SEARCH or PE configuration (rj_fstat_search vs
+        rj_fstat_pe: same class, name, ``search_mode``)."""
+        from lisatools.globalfit.moves.gbspecialstretch import (
+            GBSpecialRJFStatGridMove,
+        )
+        mv = GBSpecialRJFStatGridMove.__new__(GBSpecialRJFStatGridMove)
+        mv.name = "rj_fstat_search" if search else "rj_fstat_pe"
+        mv.branch_name = "gb"
+        mv.num_bands = self.NB
+        mv.is_rj_prop = True
+        mv.rj_removal_only = False
+        mv.rj_replace = False
+        mv.leaf_cap_update = True      # the worst case: designated
+        mv.search_mode = bool(search)
+        mv.search_shutoff_per_walker = True
+        mv.search_stage_per_walker = False
+        mv._stage_armed_logged = True
+        # Valve state left over from the search stage: the per-band set
+        # (restored from the store) and the per-walker table in band_info.
+        mv._rj_band_shutoff = np.array([False, True, False, False])
+        return mv
+
+    def test_a_PE_move_skips_NOTHING(self):
+        """FULL_PE: both valves are search-scoped, so the fit must keep
+        sweeping every band (None -> the complete comb) and the epoch key
+        must carry no skip term, even with stale shut state on board."""
+        import lisatools.globalfit.moves.gbspecialstretch as g
+        env = {k: v for k, v in os.environ.items()
+               if k != "GB_RJ_BAND_SHUTOFF_SCOPE"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            pe = self._rj_grid_move(search=False)
+            shut_w = np.zeros((2, self.NB), dtype=bool)
+            shut_w[:, 2] = True
+            state = SimpleNamespace(sub_states={"gb": SimpleNamespace(
+                band_info={"band_rj_shutoff_w": shut_w})})
+            pe._arm_search_stage(state)       # what propose runs in PE
+            self.assertIsNone(pe._rj_band_shutoff_w)
+            self.assertIsNone(g.fstat_band_skip_for(pe))
+            self.assertEqual(g.fstat_stage_fingerprint_for(pe), "")
+            # ... and the SAME shell in search configuration does skip, so
+            # the None above is the scope gate and not a dead code path.
+            se = self._rj_grid_move(search=True)
+            got = g.fstat_band_skip_for(se)
+            self.assertIsNotNone(got)
+            self.assertEqual([bool(v) for v in got],
+                             [False, True, False, False])
 
     # -- the BEHAVIOUR, not the wiring ---------------------------------
     def _comb(self):

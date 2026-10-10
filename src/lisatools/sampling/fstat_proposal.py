@@ -322,6 +322,11 @@ def fstat_band_skip(shut_w, num_bands: int):
 
     ``shut_w`` of ``None`` (valve off, or a move that never bound the
     table) returns ``None``, and the fit scans everything as before.
+
+    This is the PER-WALKER half of the skip set only. The fit's caller,
+    ``gbspecialstretch.fstat_band_skip_for``, ORs in the per-band
+    empty-band valve (births OFF there on every walker by construction)
+    and applies the empty-catalog guard to the union.
     """
     if shut_w is None:
         return None

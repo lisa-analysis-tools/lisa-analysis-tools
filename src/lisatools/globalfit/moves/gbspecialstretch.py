@@ -1357,9 +1357,12 @@ def fstat_stage_fingerprint_for(move) -> str:
     # catalog selected while 88% of bands were shut would otherwise keep
     # being handed back AFTER the recipe step released them -- a catalog
     # missing most of the spectrum, silently, for the rest of the run.
-    # A changed skip set is a new epoch; the comb npz is keyed
-    # separately and is reused, so the cost is a re-selection plus
-    # stage B, never a re-sweep.
+    # A changed skip set is a new epoch AND a new comb: this string is
+    # part of ``fingerprint_extra``, which the comb npz is stamped with
+    # (``comb_cache_usable`` refuses a mismatch), and since 2026-10-10 a
+    # skipped band is not even SWEPT (F_max = 0 there), so re-selecting
+    # from the old comb after a release would find nothing in the
+    # released bands. The re-sweep is the price of the faster stage A.
     bs = fstat_band_skip_for(move)
     if bs is not None:
         hs = hashlib.sha1(
@@ -1411,11 +1414,67 @@ def _obs_axis_mult_for(move, source_ids, n_z):
     return None if fn is None else fn(source_ids, n_z)
 
 
+def _rj_band_shutoff_live_for(move):
+    """The per-BAND empty-band valve's shut set, if it is LIVE on ``move``.
+
+    Returns a host ``(num_bands,)`` bool array, or ``None`` when the move
+    holds no valve state or the valve is not live on it.
+
+    LIVE is exactly the condition ``run_proposal``'s RJ freeze tests before
+    it freezes a band: the move holds ``_rj_band_shutoff`` AND
+    ``_band_shutoff_enabled()`` -- the designated (``leaf_cap_update``) RJ
+    move, inside ``GB_RJ_BAND_SHUTOFF_SCOPE`` (default ``search``:
+    search-named moves only, so never ``rj_fstat_pe``). A stale array on a
+    move whose valve is not live freezes nothing, so it must skip nothing
+    either. getattr-only, for the duck-typed-stub reason of
+    :func:`fstat_band_skip_for`.
+    """
+    shut = getattr(move, "_rj_band_shutoff", None)
+    if shut is None:
+        return None
+    enabled = getattr(move, "_band_shutoff_enabled", None)
+    if not callable(enabled) or not enabled():
+        return None
+    shut = np.asarray(_to_numpy(shut), dtype=bool).reshape(-1)
+    nb = int(getattr(move, "num_bands", 0))
+    if shut.shape[0] != nb:
+        raise ValueError(
+            f"per-band RJ shutoff valve covers {shut.shape[0]} bands but "
+            f"the peak grid has {nb}. A mismatched valve would skip the "
+            f"WRONG bands in the F-stat fit -- silently, and the symptom "
+            f"would be missing sources.")
+    return shut
+
+
 def fstat_band_skip_for(move):
     """Bands ``move``'s next fit may SKIP, or ``None``.
 
     ``None`` -- the valve-off answer, and the answer for any object that
     never bound the table -- scans everything, exactly as before.
+
+    TWO valves qualify a band, OR-ed (user ruling 2026-10-10), because the
+    test is the same for both: could ANY walker still use a peak there?
+    There is ONE peak catalog for every walker, so
+
+    * the per-(walker, band) valve qualifies a band only where it is shut
+      on EVERY walker (:func:`~lisatools.sampling.fstat_proposal.fstat_band_skip`
+      -- ``any`` would starve the walkers still open there);
+    * the per-BAND empty-band valve (``_rj_band_shutoff``, births OFF in
+      bands above ``GB_RJ_BAND_SHUTOFF_FMIN_MHZ`` that held nothing for
+      ``GB_RJ_BAND_SHUTOFF_ITERS``) freezes RJ in that band on EVERY walker
+      by construction, so a peak there feeds no birth either. On 9mo job
+      753 it held 648 bands -- the dense nsky=512 top of the comb, i.e.
+      most of stage A -- and was not in the set.
+
+    Both are SEARCH valves: the per-walker one is bound only in search
+    mode (``_arm_search_stage``), the per-band one is live only inside its
+    scope (:func:`_rj_band_shutoff_live_for`). A PE move therefore returns
+    ``None`` and its fit sweeps every band.
+
+    The skipped bands leave stage A's SWEEP (``run_comb_scan``), not only
+    peak selection, so a skip set that covered every INTERIOR band (the
+    only bands peaks come from, and the only ones the comb spans) would be
+    an empty catalog -- refused, as is the all-bands case.
 
     MODULE-LEVEL and taking the move, for the same reason
     :func:`fstat_band_min_F_for` is: ``_run_fstat_fit`` runs on
@@ -1424,20 +1483,31 @@ def fstat_band_skip_for(move):
     """
     from lisatools.sampling.fstat_proposal import fstat_band_skip
 
-    shut = getattr(move, "_rj_band_shutoff_w", None)
-    if shut is None:
+    nb = int(getattr(move, "num_bands", 0))
+    shut_w = getattr(move, "_rj_band_shutoff_w", None)
+    per_walker = None if shut_w is None else fstat_band_skip(shut_w, nb)
+    per_band = _rj_band_shutoff_live_for(move)
+    if per_band is None:
+        out = per_walker
+    elif per_walker is None:
+        out = per_band.copy()
+    else:
+        out = np.asarray(per_walker, dtype=bool) | per_band
+    if out is None:
         return None
-    out = fstat_band_skip(shut, int(getattr(move, "num_bands", 0)))
-    if out is not None and bool(out.all()):
-        # EVERY band shut on every walker. Skipping all of them would
-        # produce an empty catalog and no births anywhere -- and the
+    _interior = out[1:-1] if out.shape[0] > 2 else out
+    if bool(out.all()) or bool(_interior.all()):
+        # EVERY band (or every interior one) shut. Skipping all of them
+        # would produce an empty catalog and no births anywhere -- and the
         # stage is about to end anyway. Refuse rather than ship a fit
         # that cannot help.
         logger.warning(
-            "[GB_STAGE %s] every band is shut on every walker; NOT "
-            "skipping any in the F-stat fit (an empty catalog would "
-            "leave the grid with nothing to propose).",
-            getattr(move, "name", "?"))
+            "[GB_STAGE %s] every band is shut for the F-stat fit (%d of %d "
+            "skippable: shut on every walker, or births OFF under the "
+            "per-band valve; every interior band included); NOT skipping "
+            "any (an empty catalog would leave the grid with nothing to "
+            "propose).", getattr(move, "name", "?"), int(out.sum()),
+            int(out.shape[0]))
         return None
     return out
 
@@ -31602,10 +31672,13 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             # LEVEL-3 SHUT BANDS ARE SKIPPED (user ruling 2026-09-28,
             # "no fstat refit for shutdown bands"). Shut on EVERY walker
             # only: one shared catalog, so a band a single open walker
-            # could still use must keep its peaks. Measured split on job
-            # 662 -- stage A 720 s, stage B 409 s of a 1129 s epoch --
-            # so this masks the stage-B third; the stage-A node-range
-            # skip is a separate change.
+            # could still use must keep its peaks -- OR births OFF under
+            # the per-band empty-band valve (ruling 2026-10-10). Since
+            # 2026-10-10 the skip covers stage A's SWEEP as well as peak
+            # selection (run_comb_scan / comb_sweep_mask): on 9mo job 753
+            # stage A was 22.1 of the 23 fit minutes, every node swept.
+            # SEARCH only -- both valves are search-scoped, so PE gets
+            # None and sweeps everything.
             band_skip=fstat_band_skip_for(self),
             cache_dir=cache_dir,
             # THE REFERENCE WALKER IS PART OF THE FINGERPRINT TOO, for the

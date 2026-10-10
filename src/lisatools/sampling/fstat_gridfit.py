@@ -46,6 +46,8 @@ __all__ = [
     "ckpt_clear",
     "ckpt_secs",
     "chunked_fstat_sweep",
+    "comb_peak_window",
+    "comb_sweep_mask",
     "select_comb_peaks",
     "CombLevelSpec",
     "run_comb_level",
@@ -598,6 +600,66 @@ def chunked_fstat_sweep(call_fstat: Callable, params, *, xp, label: str = "",
     return F
 
 
+def comb_peak_window(spacing) -> int:
+    """Half-width, in comb nodes, of :func:`select_comb_peaks`' tier-1 window.
+
+    The Doppler envelope (~3e-3 mHz) over the node spacing [mHz], at least
+    one node. ONE function because :func:`comb_sweep_mask` has to widen the
+    swept set by exactly the window peak selection reads -- two spellings
+    could drift and the edge of every kept band would grow spurious peaks.
+    """
+    return max(1, int(round(3e-3 / spacing)))
+
+
+def comb_sweep_mask(f0_nodes, band_edges_hz, band_skip, spacing):
+    """Which comb nodes stage A must SWEEP when ``band_skip`` bands are shut.
+
+    Returns ``None`` for ``band_skip=None`` (sweep everything, the
+    historical path), else a host ``(n_nodes,)`` bool array.
+
+    A node is swept when its band is NOT skipped (user ruling 2026-10-10:
+    the shut bands leave the stage-A sweep itself, not only peak selection)
+    -- PLUS the nodes of skipped bands that sit within
+    :func:`comb_peak_window` of a kept node. That margin is what keeps every
+    kept band's peaks exactly what a full sweep would select: tier 1 asks
+    whether a node is the max over ``+-window`` nodes and the 3-point test
+    reads both neighbours, so a kept node beside a zero-filled skipped one
+    would turn into a peak wherever F rises into the skipped band. At the
+    9-month spacing the window is ~140 nodes, paid once per kept/skipped
+    boundary.
+
+    Band membership is the SAME ``searchsorted`` expression
+    :func:`select_comb_peaks` uses, so the sweep and the peak mask can never
+    disagree about which band a node belongs to. A node outside the band
+    grid is never skipped.
+    """
+    keep = _comb_keep_mask(f0_nodes, band_edges_hz, band_skip)
+    if keep is None or keep.all() or not keep.any():
+        return keep
+    w = comb_peak_window(spacing)
+    return _windowed_max(keep.astype(np.float64), w, np) > 0.0
+
+
+def _comb_keep_mask(f0_nodes, band_edges_hz, band_skip):
+    """Nodes whose OWN band is not skipped (``None`` for no skip set):
+    :func:`comb_sweep_mask` before the peak-window margin is added."""
+    if band_skip is None:
+        return None
+    f0 = np.asarray(f0_nodes, dtype=float)
+    edges_mHz = np.asarray(band_edges_hz, dtype=float) * 1e3
+    nb = int(len(edges_mHz) - 1)
+    bs = np.asarray(band_skip, dtype=bool).reshape(-1)
+    if bs.shape[0] != nb:
+        raise ValueError(
+            f"comb_sweep_mask got a band_skip covering {bs.shape[0]} bands "
+            f"but the grid has {nb} sub-bands.")
+    b = np.searchsorted(edges_mHz, f0, side="right") - 1
+    keep = np.ones(f0.shape, dtype=bool)
+    inb = (b >= 0) & (b < nb)
+    keep[inb] = ~bs[b[inb]]
+    return keep
+
+
 def select_comb_peaks(f0_nodes, F_max, band_edges_hz, spacing, xp,
                       min_F=None, band_skip=None):
     """Vectorized per-sub-band peak selection from the comb's ``F_max(f0)``.
@@ -634,7 +696,7 @@ def select_comb_peaks(f0_nodes, F_max, band_edges_hz, spacing, xp,
     num_sub_bands = int(len(band_edges_hz) - 1)
     band_of_node = xp.searchsorted(band_edges_mHz, f0_nodes, side="right") - 1
 
-    min_sep = max(1, int(round(3e-3 / spacing)))
+    min_sep = comb_peak_window(spacing)
     wmax = _windowed_max(F_max, min_sep, xp)
     tier1 = F_max >= wmax
     local3 = xp.zeros(F_max.shape, dtype=bool)
@@ -661,13 +723,20 @@ def select_comb_peaks(f0_nodes, F_max, band_edges_hz, spacing, xp,
     interior = (band_of_node >= 1) & (band_of_node <= num_sub_bands - 2)
     # LEVEL-3 SHUT BANDS PRODUCE NO PEAKS (user ruling 2026-09-28: "no
     # fstat refit for shutdown bands"). ``band_skip`` is
-    # ``(num_sub_bands,)`` bool, True only where the valve is shut on
-    # EVERY walker -- see fstat_proposal.fstat_band_skip for why ``all``
-    # and not ``any``: there is ONE peak catalog shared by every walker,
-    # so a band may only be skipped when no walker could still use a
-    # peak there. Applied through the SAME ``band_of_node`` lookup the
-    # per-band ``min_F`` uses, so the two can never disagree about which
-    # band a node belongs to.
+    # ``(num_sub_bands,)`` bool, True only where NO walker could still use
+    # a peak: the per-walker valve shut on EVERY walker (see
+    # fstat_proposal.fstat_band_skip for why ``all`` and not ``any`` --
+    # there is ONE peak catalog shared by every walker), or births OFF
+    # under the per-band empty-band valve (gbspecialstretch's
+    # ``fstat_band_skip_for`` builds the union). Applied through the SAME
+    # ``band_of_node`` lookup the per-band ``min_F`` uses, so the two can
+    # never disagree about which band a node belongs to.
+    #
+    # Since 2026-10-10 stage A does not SWEEP those bands either
+    # (:func:`comb_sweep_mask`); their nodes arrive here as F = 0. This
+    # mask stays all the same: the sweep does score the nodes of a skipped
+    # band that sit within the peak window of a kept one, and those real
+    # values must not become peaks.
     _skip_row = None
     if band_skip is not None:
         _bs = np.asarray(band_skip, dtype=bool).reshape(-1)
@@ -912,7 +981,10 @@ class CombLevelSpec:
     form of f0 alone -- see ``nsky_per_node`` in :func:`run_comb_scan` --
     so every rank derives the identical list with no communication, and a
     sub-range is addressed in the same coordinates the head concatenates the
-    partials in).
+    partials in). With a ``band_skip`` that list is the level's SWEPT nodes
+    only (:func:`comb_sweep_mask`): still f0-ordered, so contiguous ranges
+    over it keep the sig-het block locality, and the head ships each rank
+    its slice of it, so no rank has to know the skip set.
 
     The SKY GRID IS NEVER SLICED. ``alpha`` / ``sin_delta`` / ``lv`` /
     ``mc_fix`` define what a ROW MEANS (:class:`_CombRows` lays rows out
@@ -1124,6 +1196,17 @@ def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
     reduction reads only that node's own sky block), so rank-ordered
     concatenation reproduces the whole-level sweep exactly.
 
+    ``band_skip`` (``(num_sub_bands,)`` bool, or ``None``) takes the shut
+    bands out of the SWEEP, not only out of peak selection (user ruling
+    2026-10-10; on 9mo job 753 stage A was 22 of the 23 fit minutes and
+    swept every one of 996,301 nodes while 471 of 1232 bands were skipped).
+    Each level sweeps only its :func:`comb_sweep_mask` nodes; the rest of
+    the node grid keeps its place with ``F_max`` / ``best_alpha`` /
+    ``best_sin_delta`` = 0, so ``f0_nodes``, the uniform spacing and every
+    output shape are exactly what a full sweep returns. A level with no
+    swept node is never dispatched. ``None`` -- and an all-False set --
+    sweeps every node through the identical calls.
+
     Returns ``(f0_nodes_mHz, F_max, peaks, extras)``.
     """
     f0_lo = float(f0_lims_hz[0]) * 1e3
@@ -1155,18 +1238,43 @@ def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
                 int(nsky_per_node.min()), int(nsky_per_node.max()),
                 len(levels), spacing, spacing / (1e3 / Tobs), mc_fix)
 
+    # THE SHUT BANDS LEAVE THE SWEEP (user ruling 2026-10-10). ``None``
+    # with no band_skip, and then every expression below is the historical
+    # one. The LEVELS stay those of the full node grid, so a level's index
+    # ``li`` -- its partial-file name -- never depends on the skip set.
+    swept = comb_sweep_mask(f0_nodes, band_edges_hz, band_skip, spacing)
+    n_dropped = 0 if swept is None else int(n_nodes - int(swept.sum()))
+    if swept is not None:
+        _full_evals = int(nsky_per_node.sum())
+        logger.info(
+            "[comb] band_skip: %d of %d bands skipped -> %d of %d f0 nodes "
+            "dropped from the sweep (%d swept nodes lie in skipped bands, "
+            "inside the +-%d-node peak window of a kept band); %d of the "
+            "full sweep's %d evals remain",
+            int(np.asarray(band_skip, dtype=bool).sum()),
+            int(len(band_edges_hz) - 1), n_dropped, n_nodes,
+            int((swept & ~_comb_keep_mask(f0_nodes, band_edges_hz,
+                                          band_skip)).sum()),
+            comb_peak_window(spacing),
+            int(nsky_per_node[swept].sum()), _full_evals)
+
     parts_dir = cache_path.replace(".npz", "_parts") if cache_path else None
     F_max_host = np.zeros(n_nodes)
     best_al_host = np.zeros(n_nodes)
     best_sd_host = np.zeros(n_nodes)
+    _lv_idx = {
+        int(lv): np.where((nsky_per_node == lv) if swept is None
+                          else ((nsky_per_node == lv) & swept))[0]
+        for lv in levels}
     # Per-level eval counts upfront so each level header carries the OVERALL
-    # comb fraction (the per-sweep lines only know their own level).
-    _lv_evals = {int(lv): int(lv) * int((nsky_per_node == lv).sum())
+    # comb fraction (the per-sweep lines only know their own level). Counted
+    # over the SWEPT nodes, so the percentages track the real work.
+    _lv_evals = {int(lv): int(lv) * int(_lv_idx[int(lv)].size)
                  for lv in levels}
     _grand_total = sum(_lv_evals.values())
     total_evals = 0
     for _li, lv in enumerate(levels):
-        idx = np.where(nsky_per_node == lv)[0]
+        idx = _lv_idx[int(lv)]
         nodes = f0_nodes[idx]
         nn = len(nodes)
         logger.info(
@@ -1175,6 +1283,16 @@ def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
             _li + 1, len(levels), int(lv), nn, int(lv), _lv_evals[int(lv)],
             100.0 * total_evals / max(_grand_total, 1),
             100.0 * (total_evals + _lv_evals[int(lv)]) / max(_grand_total, 1))
+        if nn == 0:
+            # Only reachable with a band_skip: every node of this level is
+            # in a skipped band. NOT dispatched -- a multi-rank runner would
+            # fan out an empty level, every rank would write an empty
+            # partial, and the head would assemble nothing. Its nodes keep
+            # F_max = 0 like every other unswept node.
+            logger.info("[comb] level %d/%d (nsky=%d): every node is in a "
+                        "skipped band -- not swept", _li + 1, len(levels),
+                        int(lv))
+            continue
         al, sd = _sky_grid(int(lv))
         al = np.asarray(al)
         sd = np.asarray(sd)
@@ -1203,8 +1321,11 @@ def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
         best_al_host[idx] = al_lv
         best_sd_host[idx] = sd_lv
         total_evals += int(lv) * nn
-    logger.info("[comb] total %d F-stat evals across %d sky level(s)",
-                total_evals, len(levels))
+    logger.info("[comb] total %d F-stat evals across %d sky level(s)%s",
+                total_evals, len(levels),
+                "" if swept is None else
+                f" ({n_dropped} of {n_nodes} f0 nodes dropped from the "
+                f"sweep in skipped bands; F_max = 0 there)")
 
     peaks = select_comb_peaks(f0_nodes, xp.asarray(F_max_host), band_edges_hz,
                               spacing, xp, min_F=band_min_F,
@@ -1228,7 +1349,14 @@ def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
                  # reference walker. A FINISHED comb is not a checkpoint, so
                  # nothing used to test it: it was reloaded on file
                  # existence alone. See :func:`comb_cache_usable`.
-                 fingerprint_extra=fingerprint_extra)
+                 fingerprint_extra=fingerprint_extra,
+                 # WHICH NODES WERE SCORED, written only when the sweep
+                 # dropped some (so a complete sweep's npz is unchanged,
+                 # key set included). The zeros elsewhere are "not
+                 # swept", not "no signal": comb_cache_usable refuses to
+                 # re-select peaks from this file for a skip set that
+                 # needs a node it never scored.
+                 **({"node_swept": swept} if n_dropped else {}))
         logger.info("[cache] wrote %s", comb_cache)
         # The comb npz is now the durable artifact; drop the per-level
         # progress files so a later knob change can't resurrect stale rows.
@@ -1237,7 +1365,8 @@ def run_comb_scan(call_fstat: Callable, *, xp, Tobs: float, band_edges_hz,
     extras = dict(sky_alpha=_al_top, sky_sin_delta=_sd_top,
                   F_all=F_max_host[None, :], best_alpha=best_al_host,
                   best_sin_delta=best_sd_host, mc_fix=mc_fix,
-                  spacing=spacing, nsky_per_node=nsky_per_node)
+                  spacing=spacing, nsky_per_node=nsky_per_node,
+                  n_nodes_dropped=n_dropped)
     return f0_nodes, F_max_host, peaks, extras
 
 
@@ -2242,7 +2371,8 @@ def run_stacked_stage_b(call_fstat: Callable, peaks, *, xp, Tobs: float,
 # orchestrator
 # --------------------------------------------------------------------------
 
-def comb_cache_usable(comb_cache: str, fingerprint_extra: str) -> bool:
+def comb_cache_usable(comb_cache: str, fingerprint_extra: str, *,
+                      band_edges_hz=None, band_skip=None) -> bool:
     """Is this FINISHED comb scan the one THIS fit would have run?
 
     ``fingerprint_extra`` salts :func:`ckpt_fingerprint`, i.e. the in-flight
@@ -2265,15 +2395,45 @@ def comb_cache_usable(comb_cache: str, fingerprint_extra: str) -> bool:
     the first restart of every fit currently in flight, which is the exact
     cost this is meant to avoid -- and it is no worse than the behavior that
     wrote it. An UNREADABLE one is refused (there is nothing to reuse).
+
+    A comb whose sweep SKIPPED bands (2026-10-10; it carries ``node_swept``)
+    holds F_max = 0 at every node it never scored. It is reused only if it
+    scored every node THIS fit's ``band_skip`` needs
+    (:func:`comb_sweep_mask` over ``band_edges_hz``, default the cached
+    edges): a band shut then and live now would otherwise re-select from
+    zeros and lose its peaks without a word. In the GB move a changed skip
+    set also changes the stamp (``fingerprint_extra`` carries
+    ``|bandskip=``), so either test refuses it there; this one is what
+    guards a caller whose fingerprint does not carry the skip set.
     """
+    uncovered = 0
     try:
         with np.load(comb_cache, allow_pickle=False) as d:
             stamp = (str(d["fingerprint_extra"])
                      if "fingerprint_extra" in d else None)
+            if "node_swept" in d:
+                swept = np.asarray(d["node_swept"], dtype=bool)
+                f0c = np.asarray(d["f0_nodes_mHz"], dtype=float)
+                edges = (d["band_edges"] if band_edges_hz is None
+                         else band_edges_hz)
+                need = comb_sweep_mask(
+                    f0c, edges, band_skip,
+                    float(f0c[1] - f0c[0]) if len(f0c) > 1 else 1.0)
+                if need is None:
+                    need = np.ones(f0c.shape, dtype=bool)
+                uncovered = (int(need.size) if swept.shape != need.shape
+                             else int((need & ~swept).sum()))
     except (OSError, ValueError) as exc:
         logger.warning("[fit] comb cache %s could not be read (%s: %s); "
                        "re-running the comb scan.", comb_cache,
                        exc.__class__.__name__, exc)
+        return False
+    if uncovered:
+        logger.info(
+            "[fit] comb cache %s did not sweep %d f0 node(s) this fit needs "
+            "(bands skipped when it was scanned are live now) -- re-running "
+            "the comb scan rather than selecting peaks from zero-filled "
+            "nodes.", comb_cache, uncovered)
         return False
     if stamp is None:
         logger.warning(
@@ -2393,7 +2553,8 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
     # stage B's 3068 s on four, i.e. 48% of the epoch.
     _t_stage_a = time.time()
     if os.path.exists(comb_cache) and comb_cache_usable(
-            comb_cache, fingerprint_extra):
+            comb_cache, fingerprint_extra, band_edges_hz=band_edges_hz,
+            band_skip=band_skip):
         d = np.load(comb_cache, allow_pickle=False)
         logger.info("[fit] reusing comb cache %s; re-selecting peaks",
                     comb_cache)
@@ -2406,6 +2567,11 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
         peaks = select_comb_peaks(f0_nodes, xp.asarray(d["F_max"]),
                                   band_edges_hz, spacing, xp,
                                   min_F=band_min_F, band_skip=band_skip)
+        # What THAT sweep dropped (it covers this fit's needs, or
+        # comb_cache_usable would have refused it).
+        _n_nodes = int(len(f0_nodes))
+        _n_dropped = (int((~np.asarray(d["node_swept"], dtype=bool)).sum())
+                      if "node_swept" in d.files else 0)
     else:
         _f0, _F, peaks, _x = run_comb_scan(
             call_fstat, xp=xp, Tobs=Tobs, band_edges_hz=band_edges_hz,
@@ -2413,16 +2579,22 @@ def run_fstat_grid_fit(call_fstat: Callable, *, xp, Tobs: float,
             fingerprint_extra=fingerprint_extra, comb_runner=comb_runner,
             band_min_F=band_min_F, band_skip=band_skip,
         )
+        _n_nodes = int(len(_f0))
+        _n_dropped = int(_x.get("n_nodes_dropped", 0))
     _n_skip = (0 if band_skip is None
                else int(np.asarray(band_skip, dtype=bool).sum()))
     _n_band = int(len(band_edges_hz) - 1)
+    # The skip set is the union of the per-walker valve (shut on EVERY
+    # walker) and the per-band empty-band valve -- see
+    # gbspecialstretch.fstat_band_skip_for -- so the line no longer says
+    # which; the [comb] band_skip line above it carries the window split.
     logger.info("[stageA] comb + peak selection: %d peaks in %s (%s)%s",
                 int(len(peaks)), _fmt_secs(time.time() - _t_stage_a),
                 "split by node range over the compute ranks"
                 if comb_runner is not None else "serial, this process",
                 ("" if band_skip is None else
-                 f"; {_n_skip} of {_n_band} bands skipped as shut on "
-                 f"every walker"))
+                 f"; {_n_skip} of {_n_band} bands skipped ({_n_dropped} of "
+                 f"{_n_nodes} f0 nodes dropped from the sweep)"))
 
     stacked = run_stacked_stage_b(
         call_fstat, peaks, xp=xp, Tobs=Tobs, band_edges_hz=band_edges_hz,

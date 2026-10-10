@@ -4162,14 +4162,18 @@ def comb_env(**overrides):
 
 
 def run_comb(tmpdir, *, call_fstat=None, comb_runner=None,
-             fingerprint_extra="|epoch=0|gbfree=1|wref=0"):
+             fingerprint_extra="|epoch=0|gbfree=1|wref=0", band_skip=None):
     """Run the fixture comb scan into ``tmpdir``; return the ``*_comb.npz``.
 
     ``comb_runner=None`` is the serial path -- the byte-identity reference
-    every parallel arm below is compared against.
+    every parallel arm below is compared against. ``band_skip`` is passed
+    through only when given, so every pre-existing caller runs the exact
+    call it always ran.
     """
     cache_path = os.path.join(tmpdir, G.GRID_BASENAME)
     kw = {} if comb_runner is None else {"comb_runner": comb_runner}
+    if band_skip is not None:
+        kw["band_skip"] = band_skip
     G.run_comb_scan(
         call_fstat if call_fstat is not None else _fake_call_fstat(),
         xp=np, Tobs=TOBS, band_edges_hz=COMB_BAND_EDGES,
@@ -4747,7 +4751,7 @@ class ParallelCombGateTest(unittest.TestCase):
         for d in (self.a, self.b):
             shutil.rmtree(d, ignore_errors=True)
 
-    def _fanout_run(self, n_compute, tmpdir):
+    def _fanout_run(self, n_compute, tmpdir, band_skip=None):
         """Run the fixture comb over ``n_compute`` FakeWorld ranks."""
         from lisatools.globalfit.communication import ranks as R
         from lisatools.globalfit.communication.fakecomm import FakeWorld
@@ -4774,11 +4778,29 @@ class ParallelCombGateTest(unittest.TestCase):
             call_fstat = stub._fstat_holder_call(None)
             try:
                 return run_comb(tmpdir, call_fstat=call_fstat,
-                                comb_runner=stub._fstat_comb_runner(None))
+                                comb_runner=stub._fstat_comb_runner(None),
+                                band_skip=band_skip)
             finally:
                 fanout.stop()
 
         return next(v for v in world.run(body).values() if v is not None)
+
+    def test_a_band_skipped_sweep_over_two_ranks_is_the_serial_one(self):
+        """The node-range split runs over the SWEPT subset of each level
+        (ruling 2026-10-10: shut bands leave the stage-A sweep), and the
+        rank-ordered concatenation of that subset must still reproduce the
+        serial skipped sweep byte for byte -- npz key set included."""
+        skip = np.zeros(len(COMB_BAND_EDGES) - 1, dtype=bool)
+        skip[2] = True
+        with comb_env():
+            want = run_comb(self.a, band_skip=skip)
+            got = self._fanout_run(2, self.b, band_skip=skip)
+        assert_npz_identical(self, got, want)
+        with np.load(want, allow_pickle=False) as d:
+            self.assertIn("node_swept", d.files)
+            self.assertLess(int(np.asarray(d["node_swept"]).sum()),
+                            len(np.asarray(d["f0_nodes_mHz"])),
+                            "the fixture must actually drop nodes")
 
     def test_the_fixture_exercises_several_sky_levels(self):
         """Otherwise the per-level fan-out is gated exactly once and the
@@ -4922,6 +4944,297 @@ class CombCacheFingerprintTest(unittest.TestCase):
                 self._fit(5)
         self.assertTrue(any("carries no reference-walker stamp" in m
                             for m in cap.output), cap.output)
+
+
+# =========================================================================
+# STAGE A SKIPS SHUT BANDS IN THE SWEEP (user ruling 2026-10-10).
+#
+# 9mo job 753: every epoch's stage A swept all 996,301 f0 nodes (360M evals
+# at nsky=512 alone, 22.1 of the 23 fit minutes) while the skip set grew to
+# 471 of 1232 bands -- the skip only masked PEAK SELECTION. These pin the
+# sweep itself: a skipped band's nodes are never scored, except the ones
+# inside select_comb_peaks' tier-1 window of a KEPT band (so a kept band's
+# peaks cannot change), and band_skip=None is the historical sweep.
+# =========================================================================
+
+
+def _expected_swept(f0_mHz, band_edges_hz, skip, spacing):
+    """The stage-A sweep set, spelled out by hand.
+
+    ``keep``: nodes whose band is not skipped (a node outside the band grid
+    is never skipped). ``swept``: ``keep`` widened by select_comb_peaks'
+    window ``w = max(1, round(3e-3 mHz / spacing))`` on each side -- the
+    neighbours a kept node's tier-1 max and 3-point test read.
+    """
+    f0_mHz = np.asarray(f0_mHz, dtype=float)
+    edges_mHz = np.asarray(band_edges_hz, dtype=float) * 1e3
+    nb = len(edges_mHz) - 1
+    b = np.searchsorted(edges_mHz, f0_mHz, side="right") - 1
+    keep = np.ones(f0_mHz.shape, dtype=bool)
+    inb = (b >= 0) & (b < nb)
+    keep[inb] = ~np.asarray(skip, dtype=bool)[b[inb]]
+    w = max(1, int(round(3e-3 / float(spacing))))
+    swept = keep.copy()
+    for i in np.flatnonzero(keep):
+        swept[max(0, i - w):i + w + 1] = True
+    return keep, swept
+
+
+def _recording_call_fstat(counter=None):
+    """The analytic fake, plus the f0 [Hz] column of every row it scored."""
+    inner = _fake_call_fstat(counter)
+    seen = []
+
+    def call(params):
+        p = np.asarray(params.get() if hasattr(params, "get") else params)
+        seen.append(p[:, 1].copy())
+        return inner(params)
+
+    return call, seen
+
+
+class CombBandSkipSweepTest(unittest.TestCase):
+    """``run_comb_scan(band_skip=...)`` drops shut bands from the SWEEP."""
+
+    NB = len(COMB_BAND_EDGES) - 1
+
+    def setUp(self):
+        self.dirs = []
+
+    def tearDown(self):
+        for d in self.dirs:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def _tmp(self):
+        d = tempfile.mkdtemp()
+        self.dirs.append(d)
+        return d
+
+    def _skip(self, *bands):
+        s = np.zeros(self.NB, dtype=bool)
+        s[list(bands)] = True
+        return s
+
+    def _scan(self, band_skip, *, comb_runner=None, counter=None):
+        call, seen = _recording_call_fstat(counter)
+        f0, F, peaks, ex = G.run_comb_scan(
+            call, xp=np, Tobs=TOBS, band_edges_hz=COMB_BAND_EDGES,
+            f0_lims_hz=COMB_F0_LIMS, mc_lims=[0.01, 1.0],
+            cache_path=os.path.join(self._tmp(), G.GRID_BASENAME),
+            fingerprint_extra="|epoch=0", comb_runner=comb_runner,
+            band_skip=band_skip)
+        return f0, F, peaks, ex, seen
+
+    def _fit(self, cache_dir, band_skip):
+        return G.run_fstat_grid_fit(
+            _fake_call_fstat(), xp=np, Tobs=TOBS,
+            band_edges_hz=COMB_BAND_EDGES, f0_lims_hz=COMB_F0_LIMS,
+            mc_lims=[0.01, 1.0], cache_dir=cache_dir,
+            fingerprint_extra="|epoch=0", epoch=0, band_skip=band_skip)
+
+    # -- what the kernel is asked to score --------------------------------
+    def test_the_sweep_scores_only_kept_bands_and_their_peak_window(self):
+        skip = self._skip(2)
+        with comb_env():
+            f0, _F, _pk, ex, seen = self._scan(skip)
+        keep, swept = _expected_swept(f0, COMB_BAND_EDGES, skip,
+                                      ex["spacing"])
+        self.assertGreater(int((~swept).sum()), 0,
+                           "fixture: the skip must drop nodes")
+        self.assertGreater(int((swept & ~keep).sum()), 0,
+                           "fixture: the peak window must be exercised")
+        rows = np.concatenate(seen)
+        np.testing.assert_array_equal(np.unique(rows),
+                                      np.unique(f0[swept] * 1e-3))
+        self.assertEqual(rows.size,
+                         int(np.asarray(ex["nsky_per_node"])[swept].sum()))
+
+    def test_unswept_nodes_are_zero_and_swept_ones_are_the_full_sweeps(self):
+        skip = self._skip(2)
+        with comb_env():
+            f0_a, F_a, _pa, ex_a, _sa = self._scan(None)
+            f0_b, F_b, _pb, ex_b, _sb = self._scan(skip)
+        # FULL node set, uniform spacing, every shape as before: consumers
+        # read f0_nodes_mHz and take spacing = f0[1] - f0[0].
+        np.testing.assert_array_equal(f0_b, f0_a)
+        self.assertEqual(ex_b["spacing"], ex_a["spacing"])
+        np.testing.assert_array_equal(ex_b["nsky_per_node"],
+                                      ex_a["nsky_per_node"])
+        self.assertEqual(F_b.shape, F_a.shape)
+        _keep, swept = _expected_swept(f0_b, COMB_BAND_EDGES, skip,
+                                       ex_b["spacing"])
+        self.assertTrue(np.all(F_b[~swept] == 0.0), "unswept F_max not 0")
+        self.assertTrue(np.all(np.isfinite(F_b)))
+        self.assertTrue(np.all(F_b[swept] > 0.0))
+        np.testing.assert_array_equal(F_b[swept], F_a[swept])
+        for key in ("best_alpha", "best_sin_delta"):
+            self.assertTrue(np.all(ex_b[key][~swept] == 0.0), key)
+            np.testing.assert_array_equal(ex_b[key][swept], ex_a[key][swept])
+
+    def test_no_peak_in_a_skipped_band_and_kept_peaks_are_the_full_sweeps(self):
+        """The window around each kept run is what makes this hold: without
+        it the last kept node next to a zeroed neighbour reads as a 3-point
+        local max and a tier-1 champion -- a spurious peak at the edge of
+        every kept band whose F rises into a skipped one."""
+        skip = self._skip(2)
+        with comb_env():
+            f0, F_full, _p, ex, _s = self._scan(None)
+            _f, _F, peaks, _x, _s2 = self._scan(skip)
+            want = G.select_comb_peaks(f0, F_full, COMB_BAND_EDGES,
+                                       ex["spacing"], np, band_skip=skip)
+        self.assertGreater(len(peaks), 0)
+        self.assertNotIn(2, {int(b) for b in peaks[:, 3]})
+        np.testing.assert_array_equal(peaks, want)
+
+    def test_a_node_range_split_reproduces_the_serial_skipped_sweep(self):
+        """The multi-rank runner splits each level's SWEPT node list by
+        contiguous range; rank-ordered concatenation must be the serial
+        sweep, and the runner must only ever be handed swept nodes."""
+        skip = self._skip(2)
+        specs = []
+
+        def split_runner(spec, call_fstat, *, xp):
+            specs.append(spec)
+            parts = [
+                G.run_comb_level(
+                    spec.sub_range(a, b, ckpt_name=f"{spec.ckpt_name}_r{r}"),
+                    call_fstat, xp=xp)
+                for r, (a, b) in enumerate(
+                    G.split_box_range(spec.a, spec.b, 3))]
+            return tuple(np.concatenate([p[i] for p in parts])
+                         for i in range(3))
+
+        with comb_env():
+            f0, F_s, pk_s, ex_s, _s = self._scan(skip)
+            _f, F_p, pk_p, ex_p, _p = self._scan(skip,
+                                                 comb_runner=split_runner)
+        np.testing.assert_array_equal(F_p, F_s)
+        np.testing.assert_array_equal(pk_p, pk_s)
+        for key in ("best_alpha", "best_sin_delta"):
+            np.testing.assert_array_equal(ex_p[key], ex_s[key])
+        _keep, swept = _expected_swept(f0, COMB_BAND_EDGES, skip,
+                                       ex_s["spacing"])
+        self.assertEqual(sum(s.n_nodes for s in specs), int(swept.sum()))
+        np.testing.assert_array_equal(
+            np.sort(np.concatenate([s.f0_nodes for s in specs])), f0[swept])
+
+    def test_a_sky_level_wholly_inside_skipped_bands_is_not_dispatched(self):
+        """Bands 4 and 5 hold every nsky=32 node: that level must not reach
+        the runner at all (a multi-rank runner would otherwise fan out an
+        empty level), and its nodes stay zero."""
+        skip = self._skip(4, 5)
+        levels = []
+
+        def rec_runner(spec, call_fstat, *, xp):
+            levels.append(int(spec.lv))
+            return G.run_comb_level(spec, call_fstat, xp=xp)
+
+        with comb_env():
+            with self.assertLogs(G.logger, level="INFO") as cap:
+                _f0, F, _pk, ex, _s = self._scan(skip, comb_runner=rec_runner)
+        nsky = np.asarray(ex["nsky_per_node"])
+        self.assertIn(32, set(nsky.tolist()), "fixture: needs the 32 level")
+        self.assertEqual(sorted(levels), [8, 16])
+        self.assertTrue(np.all(F[nsky == 32] == 0.0))
+        self.assertTrue(any("(nsky=32): 0 nodes" in m for m in cap.output),
+                        cap.output)
+
+    # -- logs ------------------------------------------------------------
+    def test_level_lines_report_the_swept_counts(self):
+        skip = self._skip(2)
+        with comb_env():
+            with self.assertLogs(G.logger, level="INFO") as cap:
+                f0, _F, _pk, ex, _s = self._scan(skip)
+        _keep, swept = _expected_swept(f0, COMB_BAND_EDGES, skip,
+                                       ex["spacing"])
+        nsky = np.asarray(ex["nsky_per_node"])
+        for lv in np.unique(nsky):
+            n = int((swept & (nsky == lv)).sum())
+            want = f"(nsky={int(lv)}): {n} nodes x {int(lv)} sky = " \
+                   f"{n * int(lv)} evals"
+            self.assertTrue(any(want in m for m in cap.output),
+                            f"missing {want!r} in {cap.output}")
+
+    def test_the_stage_A_line_reports_the_dropped_node_count(self):
+        skip = self._skip(2)
+        d = self._tmp()
+        with comb_env(), stage_b_env(FSTAT_N_MC="2",
+                                     FSTAT_PEAK_HALF_MHZ="0.05"):
+            with self.assertLogs(G.logger, level="INFO") as cap:
+                self._fit(d, skip)
+            f0, _F, _pk, ex, _s = self._scan(skip)
+        _keep, swept = _expected_swept(f0, COMB_BAND_EDGES, skip,
+                                       ex["spacing"])
+        want = (f"1 of {self.NB} bands skipped "
+                f"({int((~swept).sum())} of {len(f0)} f0 nodes dropped "
+                f"from the sweep)")
+        self.assertTrue(any("[stageA]" in m and want in m
+                            for m in cap.output), cap.output)
+
+    # -- band_skip=None: the historical sweep, pinned --------------------
+    def test_band_skip_None_is_the_pinned_pre_change_sweep(self):
+        """Captured from the pre-2026-10-10 code on this fixture: 134 nodes
+        over 3 sky levels (35/86/13 nodes at nsky 8/16/32), 34 FSTAT_BATCH
+        calls, 2072 rows, sum(F_max) = 9721.527695218410."""
+        counter = {"calls": 0, "rows": 0}
+        with comb_env():
+            f0, F, _pk, ex, _s = self._scan(None, counter=counter)
+        self.assertEqual(len(f0), 134)
+        self.assertEqual((counter["calls"], counter["rows"]), (34, 2072))
+        self.assertEqual(
+            np.unique(np.asarray(ex["nsky_per_node"]),
+                      return_counts=True)[1].tolist(), [35, 86, 13])
+        self.assertAlmostEqual(float(F.sum()), 9721.527695218410, delta=1e-6)
+
+    def test_skipping_nothing_is_byte_identical_to_None(self):
+        """An all-False skip set sweeps every node, makes the same calls and
+        writes the SAME npz -- key set included (no ``node_swept``)."""
+        c_none = {"calls": 0, "rows": 0}
+        c_zero = {"calls": 0, "rows": 0}
+        a, b = self._tmp(), self._tmp()
+        with comb_env():
+            pa = run_comb(a, call_fstat=_fake_call_fstat(c_none))
+            pb = run_comb(b, call_fstat=_fake_call_fstat(c_zero),
+                          band_skip=np.zeros(self.NB, dtype=bool))
+        self.assertEqual(c_none, c_zero)
+        assert_npz_identical(self, pa, pb)
+        with np.load(pa, allow_pickle=False) as d:
+            self.assertNotIn("node_swept", d.files)
+
+    # -- the comb cache ----------------------------------------------------
+    def test_a_cached_comb_that_skipped_a_now_live_band_is_rescanned(self):
+        """Re-selecting peaks from a comb whose sweep skipped a band that is
+        live NOW would read zeros there and silently lose its peaks."""
+        d = self._tmp()
+        with comb_env(), stage_b_env(FSTAT_N_MC="2",
+                                     FSTAT_PEAK_HALF_MHZ="0.05"):
+            self._fit(d, self._skip(2))
+            os.remove(G.stacked_grid_path(d))
+            with self.assertLogs(G.logger, level="INFO") as cap:
+                self._fit(d, None)
+        self.assertFalse(any("reusing comb cache" in m for m in cap.output),
+                         "a comb that never swept band 2 was reused")
+        self.assertTrue(any("did not sweep" in m for m in cap.output),
+                        cap.output)
+        comb = os.path.join(d, G.GRID_BASENAME).replace(".npz", "_comb.npz")
+        with np.load(comb, allow_pickle=False) as z:
+            self.assertNotIn("node_swept", z.files)
+            self.assertTrue(np.all(np.asarray(z["F_max"]) > 0.0))
+
+    def test_a_cached_comb_that_covers_the_current_skip_is_reused(self):
+        """A LARGER skip set needs a subset of what was swept: reuse it, and
+        select exactly the peaks a fresh skipped sweep would."""
+        d, fresh = self._tmp(), self._tmp()
+        with comb_env(), stage_b_env(FSTAT_N_MC="2",
+                                     FSTAT_PEAK_HALF_MHZ="0.05"):
+            self._fit(d, self._skip(2))
+            os.remove(G.stacked_grid_path(d))
+            with self.assertLogs(G.logger, level="INFO") as cap:
+                _st, n_reused = self._fit(d, self._skip(2, 3))
+            _st2, n_fresh = self._fit(fresh, self._skip(2, 3))
+        self.assertTrue(any("reusing comb cache" in m for m in cap.output),
+                        cap.output)
+        self.assertEqual(n_reused, n_fresh)
 
 
 if __name__ == "__main__":
