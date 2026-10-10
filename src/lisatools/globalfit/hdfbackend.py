@@ -1559,6 +1559,25 @@ class GFHDFBackend(eryn_HDFBackend):
                          "(%r)", step_name, exc)
 
 
+def _uniform_value(arr, dtype):
+    """The one value every element of ``arr`` holds, as a ``dtype`` scalar.
+
+    ``None`` when the elements differ (or ``arr`` is empty): an HDF5 fill
+    value is a single scalar. NaN counts as one value.
+    """
+    a = np.asarray(arr)
+    if a.size == 0:
+        return None
+    first = a.reshape(-1)[0]
+    if a.dtype.kind in "fc" and np.isnan(first):
+        same = bool(np.all(np.isnan(a)))
+    else:
+        same = bool(np.all(a == first))
+    if not same:
+        return None
+    return np.asarray(first).astype(dtype)[()]
+
+
 class ModuleSubBackend(eryn_HDFBackend):
     """Generic per-branch sub-backend writing under ``sub_backend/<branch>``.
 
@@ -1566,8 +1585,10 @@ class ModuleSubBackend(eryn_HDFBackend):
     own. ``reset`` derives every dataset from a zeroed template built by
     ``state_class.make_template`` (statics written once, everything else a
     growable per-iteration dataset shaped ``(0, *arr.shape)``); ``save_step``
-    writes ``state.sub_states[self.sub_name].storage_arrays()`` by name and
-    then zeroes the sub-state's delta counters; ``get_a_sample`` rebuilds a
+    writes ``state.sub_states[self.sub_name].storage_arrays()`` by name
+    (creating the dataset of any array the store lacks, earlier rows at the
+    array's fresh-state value) and then zeroes the sub-state's delta
+    counters; ``get_a_sample`` rebuilds a
     sub-state via ``state_class.from_stored``. Subclasses set
     :attr:`state_class`; :class:`GFHDFBackend` stamps :attr:`sub_name` with
     the branch name at construction.
@@ -1663,14 +1684,116 @@ class ModuleSubBackend(eryn_HDFBackend):
                 chain[~np.asarray(arrays["inds"], dtype=bool)] = self.store_missing_leaves
                 arrays = {**arrays, "chain": chain}
 
+            # An array with no dataset (a store created before the array
+            # existed, or created from a template that did not allocate it)
+            # gets its dataset NOW. Until 2026-10-10 it was skipped, silently,
+            # at every save: the 9mo store (jobs 751-753) never held the
+            # per-(walker, band) RJ shutoff valve, so every resume restarted
+            # it from scratch.
+            missing = [name for name in arrays if name not in grp]
+            if missing:
+                self._create_missing_datasets(
+                    grp, state.sub_states[self.sub_name], arrays, missing, iteration
+                )
+
             for name, arr in arrays.items():
-                if name not in grp:
-                    # e.g. arrays added on an HDF file created before they
-                    # existed: skip rather than corrupt the resume.
-                    continue
                 grp[name][iteration] = arr
 
         state.sub_states[self.sub_name].reset_delta_counters()
+
+    def _create_missing_datasets(self, grp, sub_state, arrays, names, iteration):
+        """Create per-iteration datasets for ``names`` inside ``grp``.
+
+        Same layout as :meth:`reset` (step axis growable, same dtype rule and
+        compression) and the same length as the group's existing
+        per-iteration datasets, so :meth:`grow` and every row read stay
+        aligned. The earlier rows read back as the FRESH-state value of the
+        array (``-inf`` for a running max, ``-1`` for an unset step stamp,
+        ...), taken from a template built like ``reset``'s, i.e. what the
+        dataset would have started with -- never a fabricated 0, which as the
+        valve's all-time cold-lnL max could never be beaten (the band lnL is
+        ``-1/2 <r|r>``, never positive) and would shut every pair of a walker
+        that loaded such a row. Zeros only where there is no single fresh
+        value or no template can be built.
+        """
+        static = set(self.state_class.static_names)
+        lengths = [
+            int(grp[key].shape[0])
+            for key in grp
+            if key not in static and len(getattr(grp[key], "shape", ())) > 0
+        ]
+        nrows = max(lengths + [int(iteration) + 1])
+        legacy_dtype = set(getattr(sub_state, "legacy_dtype_names", ()))
+        fresh = self._fresh_storage_arrays(sub_state, names)
+
+        for name in names:
+            arr = np.asarray(arrays[name])
+            dtype = self.dtype if name in legacy_dtype else arr.dtype
+            fill = None
+            if name in fresh and np.shape(fresh[name]) == arr.shape:
+                fill = _uniform_value(fresh[name], dtype)
+            if fill is not None and fill == 0:
+                fill = None  # h5py's own default fill is already zero (NaN != 0)
+            grp.create_dataset(
+                name,
+                (nrows,) + arr.shape,
+                maxshape=(None,) + arr.shape,
+                dtype=dtype,
+                compression=self.compression,
+                compression_opts=self.compression_opts,
+                fillvalue=fill,
+            )
+            logger.info(
+                "[STORE] created missing per-iteration dataset sub_backend/%s/%s "
+                "(shape %s, %s; %d earlier rows %s)",
+                self.sub_name,
+                name,
+                (nrows,) + arr.shape,
+                np.dtype(dtype).name,
+                int(iteration),
+                "zero-filled"
+                if fill is None
+                else f"filled with the fresh-state value {fill.item()!r}",
+            )
+
+    def _fresh_storage_arrays(self, sub_state, names) -> dict:
+        """``{name: fresh-state array}`` for ``names``, from a template.
+
+        Built as :meth:`reset` builds its template: ``make_template`` on the
+        live sub-state's ``reset_kwargs``. Tried first without the tempered
+        dimensions, which skips allocating a whole zeroed ensemble when only
+        band arrays are missing. Names no template allocates are left out
+        (the caller zero-fills those) and named in a warning.
+        """
+        try:
+            kw = dict(sub_state.reset_kwargs)
+            nwalkers = kw.pop("nwalkers")
+            ntemps = kw.pop("ntemps")
+        except Exception as exc:  # noqa: BLE001 -- the fill is not worth a failed save
+            logger.warning(
+                "[STORE] no fresh-state template for sub_backend/%s (%s: %s); "
+                "the new datasets' earlier rows are zero-filled.",
+                self.sub_name, type(exc).__name__, exc)
+            return {}
+        best = {}
+        for drop in (("nleaves_max", "ndim"), ()):
+            try:
+                template = type(sub_state).make_template(
+                    nwalkers, ntemps, **{k: v for k, v in kw.items() if k not in drop}
+                )
+                out = template.storage_arrays()
+            except Exception:  # noqa: BLE001 -- try the next form
+                continue
+            got = {name: out[name] for name in names if name in out}
+            if len(got) > len(best):
+                best = got
+            if len(best) == len(names):
+                return best
+        logger.warning(
+            "[STORE] the fresh-state template for sub_backend/%s does not "
+            "allocate %s; their earlier rows are zero-filled.",
+            self.sub_name, [name for name in names if name not in best])
+        return best
 
     def get_value(self, name, thin=1, discard=0, slice_vals=None):
         """Read one of this branch's datasets (statics returned whole).

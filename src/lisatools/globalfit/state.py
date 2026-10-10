@@ -1977,6 +1977,36 @@ class GBState(ModuleSubState):
         out["num_cap_cells"] = len(self.static_arrays()["cap_edges"]) - 1
         return out
 
+    #: The per-walker band families, keyed by the
+    #: :meth:`initialize_band_information` flag that allocates each one. A
+    #: flag reads ON in :attr:`reset_kwargs` when ANY of its arrays is in the
+    #: live band info, so the backend's ``reset`` builds its template -- and
+    #: with it the store's dataset set -- with exactly the families the live
+    #: state will save. (2026-10-10, 9mo jobs 751-753: ``make_template`` ran
+    #: with every flag at its default False, the store never got these
+    #: datasets, ``save_step`` skipped them, and every resume restarted the
+    #: per-(walker, band) RJ shutoff valve from scratch.)
+    _per_walker_family_markers = {
+        "leaf_cap_per_walker": ("band_best_ll_w",)
+        + tuple(name for name, _ in CAP_CELL_PER_WALKER_FIELDS),
+        "search_stage_per_walker": SEARCH_STAGE_FIELDS,
+        "search_shutoff_per_walker": SEARCH_SHUTOFF_FIELDS,
+    }
+
+    @property
+    def reset_kwargs(self):
+        """The base reset kwargs plus the three per-walker family flags.
+
+        The flags are read off the live band info rather than the settings:
+        what the backend must create is what :meth:`storage_arrays` will
+        hand it, whichever path allocated it.
+        """
+        out = dict(super().reset_kwargs)
+        bi = self.band_info if self.band_initialized else {}
+        for flag, names in self._per_walker_family_markers.items():
+            out[flag] = any(bi.get(name) is not None for name in names)
+        return out
+
     @classmethod
     def make_template(
         cls,
@@ -1988,14 +2018,31 @@ class GBState(ModuleSubState):
         num_cap_cells=None,
         nleaves_max=None,
         ndim=None,
+        branch_name=None,
+        leaf_caps=True,
+        leaf_cap_per_walker=False,
+        search_stage_per_walker=False,
+        search_shutoff_per_walker=False,
         **kwargs,
     ):
+        """Allocate a zeroed GB sub-state from the backend's reset kwargs.
+
+        ``branch_name``, ``leaf_caps`` and the three per-walker flags are
+        forwarded to :meth:`initialize_band_information`, so a store created
+        with a per-walker knob on gets that family's datasets from the start.
+        All default to the flag-off layout (a store that never had them).
+        """
         if num_bands is None or band_edges is None:
             raise ValueError("Must provide num_bands and band_edges kwargs.")
         template = cls(None)
         template.initialize_band_information(
             nwalkers, ntemps, band_edges, np.zeros((num_bands, ntemps)),
             cap_edges=cap_edges,
+            branch_name=branch_name,
+            leaf_caps=bool(leaf_caps),
+            leaf_cap_per_walker=bool(leaf_cap_per_walker),
+            search_stage_per_walker=bool(search_stage_per_walker),
+            search_shutoff_per_walker=bool(search_shutoff_per_walker),
         )
         if _scalar_or_none(nleaves_max) is not None and _scalar_or_none(ndim) is not None:
             template.initialize_tempered(ntemps, nwalkers, nleaves_max, ndim)

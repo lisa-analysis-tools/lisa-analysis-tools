@@ -12,6 +12,7 @@ import os
 import tempfile
 import unittest
 
+import h5py
 import numpy as np
 
 from lisatools.globalfit.hdfbackend import (
@@ -22,13 +23,19 @@ from lisatools.globalfit.hdfbackend import (
     ModuleSubBackend,
     SOBBHHDFBackend,
 )
+from lisatools.globalfit.recipe import release_band_shutoff_window
 from lisatools.globalfit.state import (
+    CAP_CELL_PER_WALKER_FIELDS,
+    SEARCH_SHUTOFF_FIELDS,
+    SEARCH_SHUTOFF_WINDOW_FIELDS,
+    SEARCH_STAGE_FIELDS,
     EMRIState,
     GBState,
     GFState,
     MBHState,
     ModuleSubState,
     SOBBHState,
+    ensure_search_shutoff_fields,
 )
 
 NTEMPS = 3
@@ -395,6 +402,328 @@ class GFSubStateRoundTripTest(unittest.TestCase):
             sub.check_cold_row(state, "gb")
         sub.sync_cold_row(state, "gb")
         sub.check_cold_row(state, "gb")
+
+
+# ---------------------------------------------------------------------------
+# The GB per-walker families must reach the store (2026-10-10).
+#
+# 9mo production store, jobs 751/752/753: the per-(walker, band) RJ shutoff
+# valve (GB_SEARCH_BAND_SHUTOFF_PER_WALKER=1) was never written to disk. The
+# GB sub-backend built its datasets from GBState.make_template with every
+# per-walker flag at its default False, and save_step SKIPPED each live array
+# that had no dataset. So every resume found no stored valve, restarted it
+# "fresh" with the unset step stamp, and released it at step entry: job 751
+# was down to 232 active (walker, band) pairs, and after the resume job 752
+# reported 1942. The search-stage record and the per-walker cap family were
+# dropped the same way.
+# ---------------------------------------------------------------------------
+
+#: every per-walker array the three GB flags allocate (``band_stage`` is the
+#: stage record's 1-D mirror and rides with it; the 1-D ``cap_cell_*`` twins
+#: ride with the per-walker cap family, which disables the divisor-1 short
+#: circuit)
+PER_WALKER_FAMILY = (
+    tuple(SEARCH_SHUTOFF_FIELDS)
+    + tuple(SEARCH_SHUTOFF_WINDOW_FIELDS)
+    + tuple(SEARCH_STAGE_FIELDS)
+    + ("band_stage", "band_best_ll_w")
+    + tuple(name for name, _ in CAP_CELL_PER_WALKER_FIELDS)
+)
+
+#: the recipe step serial the test valve is earned in
+VALVE_SERIAL = 2
+
+_PER_WALKER_FLAGS = (
+    "leaf_cap_per_walker",
+    "search_stage_per_walker",
+    "search_shutoff_per_walker",
+)
+
+
+def make_gb_state(rng, per_walker):
+    """A GB-only GFState whose band info carries (or not) the per-walker families."""
+    nleaves, ndim = BRANCH_SHAPES["gb"]
+    state = GFState(
+        {"gb": rng.standard_normal((NTEMPS, NWALKERS, nleaves, ndim))},
+        inds={"gb": np.ones((NTEMPS, NWALKERS, nleaves), dtype=bool)},
+        log_like=rng.standard_normal((NTEMPS, NWALKERS)),
+        log_prior=rng.standard_normal((NTEMPS, NWALKERS)),
+        betas=np.linspace(1.0, 0.1, NTEMPS),
+        random_state=np.random.get_state(),
+        sub_state_bases={"gb": GBState},
+    )
+    state.sub_states["gb"].initialize_band_information(
+        NWALKERS,
+        NTEMPS,
+        BAND_EDGES,
+        np.tile(np.linspace(1.0, 0.1, NTEMPS), (NUM_BANDS, 1)),
+        **{flag: per_walker for flag in _PER_WALKER_FLAGS},
+    )
+    state.sub_states["gb"].pull_from_main(state, "gb")
+    return state
+
+
+def earn_valve(state):
+    """Give the live record non-trivial values; return a copy of what was set.
+
+    Some shut pairs (a whole walker, plus two singles), the CURRENT step's
+    stamp, mid-window streaks, a finite all-time cold-lnL max, one FINE
+    stage, and an armed per-walker cap.
+    """
+    bi = state.sub_states["gb"].band_info
+    bi["band_rj_shutoff_w"][0, 1] = True
+    bi["band_rj_shutoff_w"][2, 4] = True
+    bi["band_rj_shutoff_w"][3, :] = True
+    bi["band_shutoff_w_step"][:] = VALVE_SERIAL
+    bi["band_shutoff_streak_w"][:] = 2
+    bi["band_shutoff_best_w"][:] = -5.0
+    bi["band_cold_logl_max_w"][:] = (
+        np.arange(NWALKERS * NUM_BANDS, dtype=float).reshape(NWALKERS, NUM_BANDS)
+        - 100.0
+    )
+    bi["band_stage_w"][1, 2] = 1
+    bi["cap_cell_leaf_cap_w"][:] = 4
+    return {name: np.array(bi[name], copy=True) for name in PER_WALKER_FAMILY}
+
+
+class PerWalkerFamilyStoreTest(unittest.TestCase):
+    """save_step persists the per-walker families; a resume restores them."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.fp = os.path.join(self.tmpdir.name, "per_walker_test.h5")
+        self.rng = np.random.default_rng(20261010)
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def _backend(self, gb_reset_kwargs):
+        nleaves, ndim = BRANCH_SHAPES["gb"]
+        backend = GFHDFBackend(
+            self.fp,
+            sub_backend={"gb": GBHDFBackend},
+            sub_state_bases={"gb": GBState},
+        )
+        backend.reset(
+            NWALKERS,
+            {"gb": ndim},
+            nleaves_max={"gb": nleaves},
+            ntemps=NTEMPS,
+            branch_names=["gb"],
+            nbranches=1,
+            rj=False,
+            moves=None,
+            sub_reset_kwargs={"gb": dict(gb_reset_kwargs)},
+        )
+        return backend
+
+    def _legacy_backend(self):
+        """The production store's layout: the default GB template, no flags."""
+        nleaves, ndim = BRANCH_SHAPES["gb"]
+        backend = self._backend(
+            dict(
+                nleaves_max=nleaves,
+                ndim=ndim,
+                num_bands=NUM_BANDS,
+                band_edges=BAND_EDGES,
+            )
+        )
+        with h5py.File(self.fp, "r") as f:
+            grp = f["global_fit"]["sub_backend"]["gb"]
+            missing = [name for name in PER_WALKER_FAMILY if name not in grp]
+        # precondition: this IS the layout the 9mo store was written with
+        self.assertEqual(missing, list(PER_WALKER_FAMILY))
+        return backend
+
+    def _save(self, backend, state):
+        backend.grow(1, None)
+        backend.save_step(state, np.ones((NTEMPS, NWALKERS)))
+
+    def test_save_creates_the_missing_datasets_on_a_legacy_store(self):
+        backend = self._legacy_backend()
+        # two rows written while the run had the flags OFF
+        for _ in range(2):
+            self._save(backend, make_gb_state(self.rng, per_walker=False))
+
+        state = make_gb_state(self.rng, per_walker=True)
+        saved = earn_valve(state)
+        with self.assertLogs("lisatools.globalfit.hdfbackend", level="INFO") as logs:
+            self._save(backend, state)
+
+        with h5py.File(self.fp, "r") as f:
+            grp = f["global_fit"]["sub_backend"]["gb"]
+            nrows = grp["band_num_binaries"].shape[0]
+            self.assertEqual(nrows, 3)
+            for name in PER_WALKER_FAMILY:
+                self.assertIn(name, grp, f"{name} never reached the store")
+                self.assertEqual(grp[name].shape, (nrows,) + saved[name].shape, name)
+                self.assertIsNone(grp[name].maxshape[0], name)
+                np.testing.assert_array_equal(grp[name][2], saved[name], err_msg=name)
+            # The rows written before the dataset existed read back as the
+            # FRESH state, never as a fabricated zero: a 0 all-time max would
+            # out-rank every negative band lnL and shut any walker that ever
+            # loaded such a row (rescale_store_walkers --mode lag reads them).
+            self.assertTrue(np.all(np.isneginf(grp["band_cold_logl_max_w"][:2])))
+            self.assertTrue(np.all(np.isneginf(grp["band_shutoff_best_w"][:2])))
+            np.testing.assert_array_equal(grp["band_shutoff_w_step"][:2], -1)
+            self.assertFalse(np.any(grp["band_rj_shutoff_w"][:2]))
+            np.testing.assert_array_equal(grp["band_shutoff_streak_w"][:2], 0)
+            np.testing.assert_array_equal(grp["band_stage_occ_last_w"][:2], -1)
+            np.testing.assert_array_equal(grp["cap_cell_leaf_cap_w"][:2], -1)
+            # dtypes follow reset's rule: in-memory dtype, except the
+            # legacy_dtype_names (the cap family) at the backend float dtype
+            self.assertEqual(grp["band_rj_shutoff_w"].dtype, np.dtype(bool))
+            self.assertEqual(grp["band_shutoff_w_step"].dtype, np.dtype(np.int64))
+            self.assertEqual(grp["band_stage_w"].dtype, np.dtype(np.int8))
+            self.assertEqual(grp["cap_cell_leaf_cap_w"].dtype, np.dtype(float))
+
+        # one INFO line per created dataset, naming branch and key
+        for name in PER_WALKER_FAMILY:
+            hits = [m for m in logs.output if f"sub_backend/gb/{name} " in m]
+            self.assertEqual(len(hits), 1, f"{name}: {hits}")
+            self.assertIn("2 earlier row", hits[0])
+
+        # the band-info reader returns them
+        bi = backend.sub_backend["gb"].get_band_info()
+        for name in SEARCH_SHUTOFF_FIELDS + SEARCH_SHUTOFF_WINDOW_FIELDS:
+            np.testing.assert_array_equal(bi[name][-1], saved[name], err_msg=name)
+
+        # a following grow + save works and the new datasets grow with the rest
+        state.sub_states["gb"].band_info["band_rj_shutoff_w"][1, 0] = True
+        with self.assertLogs("lisatools.globalfit.hdfbackend", level="INFO") as logs2:
+            self._save(backend, state)
+        self.assertFalse(any("[STORE] created" in m for m in logs2.output))
+        with h5py.File(self.fp, "r") as f:
+            grp = f["global_fit"]["sub_backend"]["gb"]
+            for name in PER_WALKER_FAMILY:
+                self.assertEqual(grp[name].shape[0], 4, name)
+            self.assertTrue(grp["band_rj_shutoff_w"][3][1, 0])
+            self.assertFalse(grp["band_rj_shutoff_w"][2][1, 0])
+
+    def _assert_resume_keeps_the_valve(self, backend):
+        state = make_gb_state(self.rng, per_walker=True)
+        saved = earn_valve(state)
+        self._save(backend, state)
+
+        # (1) the stored record validates as RESTORED, not "fresh"
+        bi = backend.sub_backend["gb"].get_band_info()
+        last = {
+            name: np.asarray(bi[name])[-1]
+            for name in SEARCH_SHUTOFF_FIELDS + SEARCH_SHUTOFF_WINDOW_FIELDS
+        }
+        last["nwalkers"] = NWALKERS
+        self.assertEqual(
+            ensure_search_shutoff_fields(last, NUM_BANDS, per_walker=True), "restored"
+        )
+
+        # (2) the real resume path: the last row -> GBState band info with
+        # the flags ON (as the run passes them) -> the step-entry release
+        # under the SAME recipe step serial must release nothing
+        resumed = backend.get_a_sample(backend.iteration - 1)
+        sub = resumed.sub_states["gb"]
+        sub.initialize_band_information(
+            NWALKERS,
+            NTEMPS,
+            BAND_EDGES,
+            np.zeros((NUM_BANDS, NTEMPS)),
+            **{flag: True for flag in _PER_WALKER_FLAGS},
+        )
+        for name in PER_WALKER_FAMILY:
+            np.testing.assert_array_equal(sub.band_info[name], saved[name], err_msg=name)
+        self.assertEqual(release_band_shutoff_window(resumed, VALVE_SERIAL), (0, False))
+        self.assertEqual(
+            int(np.count_nonzero(sub.band_info["band_rj_shutoff_w"])),
+            int(np.count_nonzero(saved["band_rj_shutoff_w"])),
+        )
+
+    def test_resume_of_a_legacy_store_keeps_the_valve(self):
+        """The production failure: same step, resumed -> the valve stays shut."""
+        backend = self._legacy_backend()
+        self._save(backend, make_gb_state(self.rng, per_walker=False))
+        self._assert_resume_keeps_the_valve(backend)
+
+    def test_fresh_store_gets_the_datasets_at_reset(self):
+        """A store created from the LIVE state's reset_kwargs (the run.py
+        route) has the per-walker datasets before the first save, so no save
+        ever has to create one."""
+        live = make_gb_state(self.rng, per_walker=True)
+        backend = self._backend(live.sub_states["gb"].reset_kwargs)
+        with h5py.File(self.fp, "r") as f:
+            grp = f["global_fit"]["sub_backend"]["gb"]
+            for name in PER_WALKER_FAMILY:
+                self.assertIn(name, grp, name)
+        with self.assertLogs("lisatools.globalfit.hdfbackend", level="INFO") as logs:
+            self._assert_resume_keeps_the_valve(backend)
+        self.assertFalse(any("[STORE] created" in m for m in logs.output))
+
+    def test_flags_off_store_is_unchanged(self):
+        """With the flags off the live reset_kwargs build the old layout."""
+        live = make_gb_state(self.rng, per_walker=False)
+        self._backend(live.sub_states["gb"].reset_kwargs)
+        with h5py.File(self.fp, "r") as f:
+            grp = f["global_fit"]["sub_backend"]["gb"]
+            self.assertEqual(set(grp.keys()), set(EXPECTED_SUB_SCHEMA["gb"]))
+
+
+class PerWalkerTemplateTest(unittest.TestCase):
+    """GBState.make_template allocates exactly what the live state will save."""
+
+    def _template(self, **flags):
+        nleaves, ndim = BRANCH_SHAPES["gb"]
+        return GBState.make_template(
+            NWALKERS,
+            NTEMPS,
+            num_bands=NUM_BANDS,
+            band_edges=BAND_EDGES,
+            nleaves_max=nleaves,
+            ndim=ndim,
+            **flags,
+        )
+
+    def test_flags_on_allocate_the_per_walker_arrays(self):
+        names = set(
+            self._template(**{flag: True for flag in _PER_WALKER_FLAGS}).storage_arrays()
+        )
+        for name in PER_WALKER_FAMILY:
+            self.assertIn(name, names, name)
+
+    def test_flags_off_keep_the_old_layout(self):
+        names = set(self._template().storage_arrays())
+        for name in PER_WALKER_FAMILY:
+            self.assertNotIn(name, names, name)
+        self.assertEqual(
+            names, set(EXPECTED_SUB_SCHEMA["gb"]) - STATIC_DATASETS["gb"]
+        )
+
+    def test_each_flag_allocates_its_own_family(self):
+        shutoff = set(SEARCH_SHUTOFF_FIELDS) | set(SEARCH_SHUTOFF_WINDOW_FIELDS)
+        stage = set(SEARCH_STAGE_FIELDS) | {"band_stage"}
+        cap = {"band_best_ll_w"} | {name for name, _ in CAP_CELL_PER_WALKER_FIELDS}
+        for flag, own in (
+            ("search_shutoff_per_walker", shutoff),
+            ("search_stage_per_walker", stage),
+            ("leaf_cap_per_walker", cap),
+        ):
+            names = set(self._template(**{flag: True}).storage_arrays())
+            self.assertTrue(own <= names, f"{flag}: missing {own - names}")
+            others = (shutoff | stage | cap) - own
+            self.assertFalse(others & names, f"{flag}: also allocated {others & names}")
+
+    def test_reset_kwargs_rebuild_exactly_the_live_storage(self):
+        """reset_kwargs -> make_template gives the live state's datasets."""
+        rng = np.random.default_rng(7)
+        for per_walker in (False, True):
+            live = make_gb_state(rng, per_walker).sub_states["gb"]
+            rk = dict(live.reset_kwargs)
+            for flag in _PER_WALKER_FLAGS:
+                self.assertIs(rk[flag], per_walker, flag)
+            tmpl = GBState.make_template(rk.pop("nwalkers"), rk.pop("ntemps"), **rk)
+            want = live.storage_arrays()
+            got = tmpl.storage_arrays()
+            self.assertEqual(set(got), set(want), f"per_walker={per_walker}")
+            for name, arr in want.items():
+                self.assertEqual(np.shape(got[name]), np.shape(arr), name)
+                self.assertEqual(np.asarray(got[name]).dtype, np.asarray(arr).dtype, name)
 
 
 if __name__ == "__main__":
