@@ -732,7 +732,13 @@ class LauncherRecipeTest(unittest.TestCase):
         self.assertEqual(seed.step_kwargs["profile"], s1.step_kwargs["profile"])
         self.assertEqual(s1.step_kwargs["profile"], dict(
             phase_maximize=True, opt_snr=8.0, peak_min_snr=8.0, prior_births=False))
-        self.assertEqual([n for n in _names(s1) if n in SRC], [])
+        # 2026-10-10 ruling: the source moves run every cycle in gb_search_1
+        # too (GB_SEARCH_1_SOURCE_EVERY=1), as the tail of the cycle, with
+        # the noise still fixed (no noise slot in search 1)
+        self.assertEqual({m.name: m.every for m in s1.moves if m.name in SRC},
+                         dict.fromkeys(SRC, 1))
+        self.assertEqual([n for n in _names(s1) if n in SRC], list(SRC))
+        self.assertEqual(_names(s1)[-len(SRC):], list(SRC))
         self.assertEqual(_noise_moves(s1), [])
         self.assertEqual(s2.step_kwargs["profile"], dict(
             phase_maximize=False, opt_snr=5.0, peak_min_snr=6.25, prior_births=True,

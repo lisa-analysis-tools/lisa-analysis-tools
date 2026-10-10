@@ -49,8 +49,9 @@
 #          not a Tobs change -- the running 6mo store's recipe is fixed, so
 #          it lands in the 9mo/1yr only): gb_search_seed x3 -> gb_search_1 ->
 #          gb_search_2 -> full_pe. GB_SEARCH_SEED_ITERS 5 -> 3;
-#          GB_SEARCH_STAGES=1,2 (no gb_search_3); GB_SEARCH_1_SOURCE_EVERY=0
-#          (no sobbh/mbh/emri moves in gb_search_1); GB_SEARCH_2_SOURCE_EVERY=1
+#          GB_SEARCH_STAGES=1,2 (no gb_search_3); GB_SEARCH_1_SOURCE_EVERY=1
+#          (sobbh/mbh/emri every cycle in gb_search_1 -- user ruling
+#          2026-10-10, was 0 at the 9mo's first launch); GB_SEARCH_2_SOURCE_EVERY=1
 #          (every iteration); GB_SEARCH_2_NOISE_MODE=cycle_end (ONE psd+galfor
 #          search to convergence at the END of each gb_search_2 cycle);
 #          GB_SEARCH_2_RESET_VALVES=1 (fresh entry: per-(walker, band) lnL max
@@ -4720,7 +4721,7 @@ export STAGE_V9_SEARCH=1
 #   python scripts/fstat_proposal/run_combined_staged.py --print-recipe
 export GB_SEARCH_SEED_ITERS=3
 export GB_SEARCH_STAGES=${GB_SEARCH_STAGES:-1,2}
-export GB_SEARCH_1_SOURCE_EVERY=${GB_SEARCH_1_SOURCE_EVERY:-0}
+export GB_SEARCH_1_SOURCE_EVERY=${GB_SEARCH_1_SOURCE_EVERY:-1}   # 2026-10-10 ruling: sobbh/mbh/emri every cycle in gb_search_1 too (was 0)
 export GB_SEARCH_2_SOURCE_EVERY=${GB_SEARCH_2_SOURCE_EVERY:-1}
 export GB_SEARCH_2_NOISE_MODE=${GB_SEARCH_2_NOISE_MODE:-cycle_end}
 export GB_SEARCH_2_RESET_VALVES=${GB_SEARCH_2_RESET_VALVES:-1}

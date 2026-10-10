@@ -2338,7 +2338,7 @@ _RECIPE_REPLACEMENTS = (
      "#   python scripts/fstat_proposal/run_combined_staged.py --print-recipe\n"
      "export GB_SEARCH_SEED_ITERS=3\n"
      "export GB_SEARCH_STAGES=${GB_SEARCH_STAGES:-1,2}\n"
-     "export GB_SEARCH_1_SOURCE_EVERY=${GB_SEARCH_1_SOURCE_EVERY:-0}\n"
+     "export GB_SEARCH_1_SOURCE_EVERY=${GB_SEARCH_1_SOURCE_EVERY:-1}   # 2026-10-10 ruling: sobbh/mbh/emri every cycle in gb_search_1 too (was 0)\n"
      "export GB_SEARCH_2_SOURCE_EVERY=${GB_SEARCH_2_SOURCE_EVERY:-1}\n"
      "export GB_SEARCH_2_NOISE_MODE=${GB_SEARCH_2_NOISE_MODE:-cycle_end}\n"
      "export GB_SEARCH_2_RESET_VALVES=${GB_SEARCH_2_RESET_VALVES:-1}\n", 1),
@@ -2455,7 +2455,7 @@ _RECIPE_REPLACEMENTS = (
 _RECIPE_EXPORTS = {
     "GB_SEARCH_SEED_ITERS": ("3", "5"),
     "GB_SEARCH_STAGES": ("1,2", None),
-    "GB_SEARCH_1_SOURCE_EVERY": ("0", None),
+    "GB_SEARCH_1_SOURCE_EVERY": ("1", None),   # 2026-10-10 ruling (was 0)
     "GB_SEARCH_2_SOURCE_EVERY": ("1", None),
     "GB_SEARCH_2_NOISE_MODE": ("cycle_end", None),
     "GB_SEARCH_2_RESET_VALVES": ("1", None),
