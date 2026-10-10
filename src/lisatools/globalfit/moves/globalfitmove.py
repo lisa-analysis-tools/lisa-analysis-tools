@@ -963,14 +963,42 @@ class GFCombineMove(CombineMove, GlobalFitMove):
         # it runs") ends the leg right there; the row is saved after ITS
         # name and the rest of the leg runs in the next propose. On a hold
         # the flag stays False and the leg runs on to its static ender.
+        #
+        # ZERO-PEAK F-STAT SKIP (user ruling 2026-10-10). An F-stat RJ move
+        # whose adopted epoch has zero peaks does bookkeeping only and sets
+        # ``gf_skip_partner_once``: the NEXT move of this leg is then skipped
+        # when it is that move's in-model partner (rj_fstat_search ->
+        # in_model_fstat), and nothing else is. The flag is consumed here, so
+        # it covers one cycle. The leg still ENDS at the partner's name when
+        # the partner is the leg-ender, so the saved-after row, the cursor
+        # and the resume path are exactly what they are on a normal cycle.
         accepted = None
         ran = []
+        partner_skipped = []
+        skip_partner_of = None
         ended_early = False
         for k_due, mm in enumerate(due):
+            name = getattr(mm, "gf_move_name", type(mm).__name__)
+            if skip_partner_of is not None:
+                owner, skip_partner_of = skip_partner_of, None
+                owner_name = getattr(owner, "gf_move_name", type(owner).__name__)
+                if self._gf_is_inmodel_partner(owner, mm):
+                    partner_skipped.append(name)
+                    logger.info(
+                        "[LEG %s] %r skipped this cycle: the in-model partner "
+                        "of %r, whose F-stat epoch has 0 peaks", stage, name,
+                        owner_name)
+                    continue
+                logger.warning(
+                    "[LEG %s] %r asked to skip its in-model partner, but the "
+                    "next move %r is not one; nothing skipped", stage,
+                    owner_name, name)
             state, acc = self._run_sequence(model, state, [mm])
             accepted = acc.copy() if accepted is None else accepted + acc
-            name = getattr(mm, "gf_move_name", type(mm).__name__)
             ran.append(name)
+            if bool(getattr(mm, "gf_skip_partner_once", False)):
+                mm.gf_skip_partner_once = False   # consumed: one cycle only
+                skip_partner_of = mm
             flag = bool(getattr(mm, "gf_leg_end_now", False))
             if flag:
                 mm.gf_leg_end_now = False        # consumed: never ends a later leg
@@ -979,6 +1007,12 @@ class GFCombineMove(CombineMove, GlobalFitMove):
                 cur.end_early_at(cur.order.index(name))
                 ended_early = True
                 break
+        if skip_partner_of is not None:
+            logger.warning(
+                "[LEG %s] %r asked to skip its in-model partner, but no move "
+                "follows it in this leg; nothing skipped", stage,
+                getattr(skip_partner_of, "gf_move_name",
+                        type(skip_partner_of).__name__))
         if not ended_early:
             cur.advance()
         # tag the state eryn is about to save: the row's saved-after NAME
@@ -987,11 +1021,31 @@ class GFCombineMove(CombineMove, GlobalFitMove):
         state.gf_move_order = list(cur.order)
         state.gf_stage_name = stage
         logger.info(
-            "[LEG %s] cycle %d leg %d/%d: ran %s -> row saved after %r%s%s",
+            "[LEG %s] cycle %d leg %d/%d: ran %s -> row saved after %r%s%s%s",
             stage, cycles0, leg_i + 1, cur.nlegs, ran, end_name,
             " (the noise changed: leg ended early)" if ended_early else "",
-            f" (cadence skipped {skipped})" if skipped else "")
+            f" (cadence skipped {skipped})" if skipped else "",
+            (f" (zero-peak F-stat: in-model partner skipped {partner_skipped})"
+             if partner_skipped else ""))
         return state, accepted
+
+    @staticmethod
+    def _gf_is_inmodel_partner(owner, move) -> bool:
+        """Is ``move`` the in-model partner of the RJ move ``owner``?
+
+        The pure in-model GB slot that follows an RJ move in its leg and is
+        named for the RJ move it polishes (``recipe.GB_IN_MODEL_SLOTS``:
+        ``in_model_fstat`` polishes ``rj_fstat_search``'s births): an
+        ``in_model*`` name (the leg-ender prefix), not itself an RJ move, on
+        the owner's branch.
+        """
+        from ..legs import DEFAULT_LEG_END_PREFIX
+
+        name = str(getattr(move, "gf_move_name", type(move).__name__))
+        return (name.startswith(DEFAULT_LEG_END_PREFIX)
+                and not bool(getattr(move, "is_rj_prop", False))
+                and getattr(move, "branch_name", None)
+                == getattr(owner, "branch_name", None))
 
     def _run_sequence(self, model, state, moves):
         """Run ``moves`` in order -- eryn CombineMove.propose semantics plus

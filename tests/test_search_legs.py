@@ -258,6 +258,114 @@ class CombineLegsTest(unittest.TestCase):
         self.assertFalse(hasattr(st, "gf_saved_after"))
 
 
+class _ZeroPeakRJ(_Move):
+    """An RJ move whose F-stat epoch has zero peaks: like the real
+    ``GBSpecialBase._propose_zero_peak_skip`` it arms
+    ``gf_skip_partner_once`` on itself when ``zero_peaks`` is True."""
+
+    is_rj_prop = True
+    zero_peaks = True
+
+    def propose(self, model, state):
+        self.gf_skip_partner_once = bool(self.zero_peaks)
+        return super().propose(model, state)
+
+
+class ZeroPeakPartnerSkipTest(unittest.TestCase):
+    """User ruling 2026-10-10: "when the F-stat literally has zero peaks, skip
+    the F-stat RJ proposal and its in-model partner." The RJ move does its
+    bookkeeping and sets ``gf_skip_partner_once``; ``_propose_leg`` then skips
+    the NEXT move of the leg when it is that move's in-model partner
+    (rj_fstat_search -> in_model_fstat) and nothing else. The leg still ENDS
+    at the partner's name, so the row, the cursor and the resume are those of
+    a normal cycle, and the flag is consumed (one cycle)."""
+
+    LOGGER = "lisatools.globalfit.moves.globalfitmove"
+
+    def _combine(self, order=ORDER, rj="rj_fstat_search"):
+        from lisatools.globalfit.moves.globalfitmove import GFCombineMove
+
+        log = []
+        moves = [(_ZeroPeakRJ if n == rj else _Move)(n, log) for n in order]
+        cm = GFCombineMove(moves=moves, share_temperature_control=False,
+                           leg_ends="auto")
+        cm.gf_stage_name = "gb_search_1"
+        return cm, {m.gf_move_name: m for m in moves}, log
+
+    def test_the_partner_is_skipped_and_the_leg_still_ends_at_its_name(self):
+        cm, mv, log = self._combine()
+        cm.propose(None, _state())                       # leg 1: the head
+        log.clear()
+        with self.assertLogs(self.LOGGER, "INFO") as logs:
+            st, acc = cm.propose(None, _state())         # leg 2
+        self.assertEqual(log, ["rj_fstat_search"])       # in_model_fstat NOT run
+        self.assertEqual(st.gf_saved_after, "in_model_fstat")
+        self.assertEqual(np.shape(acc), (1, 4))
+        text = "\n".join(logs.output)
+        self.assertIn("'in_model_fstat' skipped this cycle: the in-model "
+                      "partner of 'rj_fstat_search'", text)
+        self.assertIn("in-model partner skipped ['in_model_fstat']", text)
+        # consumed: a stale flag can never skip a later partner
+        self.assertFalse(mv["rj_fstat_search"].gf_skip_partner_once)
+        # the cursor moved on exactly as after a normal leg 2
+        self.assertEqual(ORDER[cm.gf_legs.cursor], "rj_prior_removal")
+        log.clear()
+        st, _ = cm.propose(None, _state())               # leg 3 is untouched
+        self.assertEqual(log, ["rj_prior_removal", "in_model_removal",
+                               "gb_ridge_gibbs", "mbh_pe"])
+        self.assertEqual(st.gf_saved_after, "in_model_removal")
+        self.assertEqual(cm.gf_legs.cycles, 1)
+
+    def test_without_the_flag_the_partner_runs(self):
+        cm, mv, log = self._combine()
+        mv["rj_fstat_search"].zero_peaks = False
+        cm.propose(None, _state())
+        log.clear()
+        st, _ = cm.propose(None, _state())
+        self.assertEqual(log, ["rj_fstat_search", "in_model_fstat"])
+        self.assertEqual(st.gf_saved_after, "in_model_fstat")
+
+    def test_one_cycle_only_and_a_later_epoch_with_peaks_restores_the_partner(self):
+        cm, mv, log = self._combine()
+        for _ in range(3):
+            cm.propose(None, _state())                   # cycle 0: skipped
+        self.assertNotIn("in_model_fstat", log)
+        mv["rj_fstat_search"].zero_peaks = False         # the refit found peaks
+        log.clear()
+        for _ in range(3):
+            cm.propose(None, _state())                   # cycle 1: normal
+        self.assertEqual(log, ORDER)
+        self.assertEqual(cm.gf_legs.cycles, 2)
+
+    def test_nothing_else_in_the_leg_is_skipped(self):
+        """The partner of a move in the LAST leg: the tail still runs."""
+        cm, mv, log = self._combine(rj="rj_prior_removal")
+        cm.propose(None, _state()); cm.propose(None, _state())
+        log.clear()
+        st, _ = cm.propose(None, _state())
+        self.assertEqual(log, ["rj_prior_removal", "gb_ridge_gibbs", "mbh_pe"])
+        self.assertEqual(st.gf_saved_after, "in_model_removal")
+        self.assertEqual(cm.gf_legs.cycles, 1)
+
+    def test_a_next_move_that_is_not_the_in_model_partner_runs(self):
+        order = ["rj_fstat_search", "rj_replace", "in_model_fstat"]
+        cm, mv, log = self._combine(order=order)
+        with self.assertLogs(self.LOGGER, "WARNING") as logs:
+            st, _ = cm.propose(None, _state())
+        self.assertEqual(log, order)
+        self.assertIn("nothing skipped", "\n".join(logs.output))
+        # ... nor an in_model*-named RJ move, nor another branch's move
+        cm, mv, log = self._combine(order=["rj_fstat_search", "in_model_fstat"])
+        mv["in_model_fstat"].is_rj_prop = True
+        cm.propose(None, _state())
+        self.assertEqual(log, ["rj_fstat_search", "in_model_fstat"])
+        cm, mv, log = self._combine(order=["rj_fstat_search", "in_model_fstat"])
+        mv["rj_fstat_search"].branch_name = "gb"
+        mv["in_model_fstat"].branch_name = "vgb"
+        cm.propose(None, _state())
+        self.assertEqual(log, ["rj_fstat_search", "in_model_fstat"])
+
+
 # ======================================================================
 # 3. the saver writes the name and the order; the readers read them
 # ======================================================================

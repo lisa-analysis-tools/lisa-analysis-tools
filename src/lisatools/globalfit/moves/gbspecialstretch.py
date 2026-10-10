@@ -25121,7 +25121,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 "in this process (epoch %d, %s peaks).",
                 self._rank_tag(), self.name, epoch, n_peaks,
             )
-            self.rj_proposal_distribution = container
+            # the registry stores None for "no distribution"; the head's own
+            # rule decides what that means for this move (2026-10-10)
+            self._adopt_epoch_container(container, epoch, n_peaks)
             self._fstat_epoch = epoch
             self._fstat_last_fit_hit = self._epoch_fit_clock(epoch)
         else:
@@ -27491,6 +27493,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     # reference and the only path a single-process run takes.
     # ==================================================================
 
+    #: ZERO-PEAK F-stat skip (user ruling 2026-10-10). The epoch an F-stat
+    #: birth move adopted with zero peaks
+    #: (:meth:`GBSpecialRJFStatGridMove._adopt_epoch_container`); None on
+    #: every other move and epoch. Class-level so a move that never fits a
+    #: grid -- or a skeleton built without ``__init__`` -- reads None.
+    _fstat_zero_peak_epoch = None
+    #: Set by a zero-peak skip for ``GFCombineMove._propose_leg``, which skips
+    #: the in-model partner that follows this move in the leg and clears it.
+    #: Reset at every ``propose`` entry, so it never outlives the propose
+    #: that armed it by more than the leg it was armed for.
+    gf_skip_partner_once = False
+
     def propose(self, model, state):
         """Generate a proposal: orchestrate the walker blocks, or run locally.
 
@@ -27509,6 +27523,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             :class:`GFState`: GFState of sampler after proposal is complete.
 
         """
+        # only THIS propose's zero-peak skip may ask the leg runner to skip
+        # the in-model partner; an earlier one's request is stale
+        self.gf_skip_partner_once = False
         passes = self._replace_passes()
         if len(passes) > 1:
             return self._propose_replace_passes(model, state, passes)
@@ -27522,6 +27539,123 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         ):
             return self._propose_orchestrated(model, state)
         return self._propose_legacy(model, state)
+
+    # ---- zero-peak F-stat epoch: bookkeeping only (ruling 2026-10-10) ------
+
+    def _band_counts_from_state(self, state) -> np.ndarray:
+        """``(ntemps, nwalkers, num_bands)`` source census of ``state``.
+
+        What ``BandSorter.get_band_info()["band_counts"]`` reports at the end
+        of a normal propose -- alive leaves of the working branch, binned by
+        their own f0 (coords column 1, mHz) with the sorter's
+        ``searchsorted(..., side="right") - 1`` convention -- for a propose
+        that builds no sorter. Leaves outside the band grid are not counted.
+        """
+        work_b = self._work_branch(state)
+        inds = np.asarray(_to_numpy(work_b.inds), dtype=bool)
+        f0_hz = np.asarray(_to_numpy(work_b.coords[..., 1]), dtype=float) / 1e3
+        edges = np.asarray(_to_numpy(self.band_edges), dtype=float)
+        nb = int(self.num_bands)
+        b = np.searchsorted(edges, f0_hz, side="right") - 1
+        valid = inds & (b >= 0) & (b < nb)
+        out = np.zeros(inds.shape[:2] + (nb,), dtype=int)
+        t_idx, w_idx, _l = np.nonzero(valid)
+        np.add.at(out, (t_idx, w_idx, b[valid]), 1)
+        return out
+
+    def _propose_zero_peak_skip(self, model, state, engine_ntemps, nwalkers):
+        """An F-stat RJ propose on a ZERO-PEAK epoch: bookkeeping only.
+
+        USER RULING 2026-10-10: "when the F-stat literally has zero peaks,
+        skip the F-stat RJ proposal and its in-model partner." 9mo job 753,
+        gb_search_1: epochs 10-14 found 0 peaks, ``rj_fstat_search`` spent
+        ~10 min a cycle proposing PRIOR births that accepted nothing and
+        ``in_model_fstat`` then polished nothing new.
+
+        Both propose bodies call this right after ``setup()``, so everything
+        before it has run exactly as on a normal propose: the tempering-census
+        tick, the leaf-cap arming, the per-walker valve bind
+        (``_arm_search_stage``), the early valve adopt, and ``setup()``
+        itself -- which ADVANCES THE REFIT CLOCK and FITS when the cadence is
+        due (an epoch with peaks clears the skip there, and the same propose
+        then runs normally).
+
+        SKIPPED: births and deaths, the in-model repeats, the tempering
+        swaps, the residual open/close, every fan-out command -- and, through
+        ``gf_skip_partner_once``, the in-model partner that follows this move
+        in its leg (``GFCombineMove._propose_leg``).
+
+        KEPT, in the order the normal propose END runs them:
+
+        * the per-band empty-band valve tick (``_update_band_shutoff``, the
+          ``[GB_BAND_SHUTOFF status ...]`` line) on the designated move;
+        * the designated updater's block (``leaf_cap_update``): the leaf
+          caps, the per-(walker, band) search stage, the block-peak fold and
+          the per-walker valve JUDGE (``_update_search_band_shutoff``) --
+          gb_search_1 ends on that judge's ``_shutoff_w_pending``, so a skip
+          that silenced it would hang the stage.
+
+        Nothing changed the GB model, so ``state`` IS the post-propose state:
+        it is judged and returned as it is.
+
+        ⚠ FAN-OUT. A normal propose hands the judge the N-walker per-band
+        cold lnL its ranks computed in ``gb_finish``; the head alone holds one
+        walker block of the residual, so a head-local statistic would be the
+        wrong shape (the RuntimeError ``_update_search_band_shutoff`` raises
+        for it). No rank runs here, so there is no new measurement and the
+        judge is told exactly that -- an all-NaN stash, i.e. this move
+        observed nothing -- and judges on the peak the rest of the cycle
+        accumulated, its own rule for an unobserved cell. The leaf caps need
+        the real statistic, so under the fan-out they are NOT advanced on a
+        skipped propose (warned once; caps are off in the v9 launchers).
+        """
+        k = getattr(self, "_fstat_zero_peak_epoch", None)
+        if getattr(self, "gf_stage_kind", None) == "pe":
+            logger.info(
+                "[GB_FSTAT %s] epoch %s has 0 peaks: F-stat RJ births/deaths "
+                "skipped this propose (bookkeeping only; a PE stage has no "
+                "in-model partner to skip)", self.name, k)
+        else:
+            logger.info(
+                "[GB_FSTAT %s] epoch %s has 0 peaks: F-stat RJ births/deaths "
+                "and the in_model_fstat partner skipped this cycle "
+                "(bookkeeping only)", self.name, k)
+        self.gf_skip_partner_once = True
+        fanned = bool(self.fanout_active)
+        if fanned:
+            # setup() may have just written this epoch; keep the head's
+            # flush-before-the-ranks-read contract for the next directive
+            self._flush_epoch_artifacts(getattr(self, "_fstat_epoch", None))
+        try:
+            if self._band_shutoff_enabled():
+                self._update_band_shutoff(
+                    self._band_occupancy_cold_max(state), state)
+        except Exception:
+            logger.warning(
+                "%s: band-shutoff tick failed this propose; the valve is "
+                "NOT running (streaks are frozen wherever they stood)",
+                self.name, exc_info=True)
+        if self.leaf_cap_update:
+            band_counts = self._band_counts_from_state(state)
+            if self._band_leaf_cap is not None:
+                if not fanned:
+                    self._update_band_leaf_caps(model, state, band_counts)
+                elif not getattr(self, "_zero_peak_caps_warned", False):
+                    self._zero_peak_caps_warned = True
+                    logger.warning(
+                        "[GB_FSTAT %s] zero-peak skip under the multi-rank "
+                        "fan-out: the leaf caps are NOT advanced on a skipped "
+                        "propose (their statistic needs the ranks' residual "
+                        "blocks).", self.name)
+            if fanned:
+                self._stage_band_lls = np.full(
+                    (int(nwalkers), int(self.num_bands)), np.nan)
+                self._stage_band_lls_stamp = int(
+                    getattr(self, "num_proposals", 0))
+            self._update_search_stages(state, band_counts)
+            self._fold_local_cold_peak(state)
+            self._update_search_band_shutoff(model, state, band_counts)
+        return state, np.zeros((engine_ntemps, nwalkers), dtype=bool)
 
     # ---- rj_replace: multiple candidate SOURCES per propose ----------------
 
@@ -28156,6 +28290,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # Run any move-specific setup.
         self.setup(model, state.branches)
         self.num_proposals += 1
+
+        # ZERO-PEAK F-stat epoch (user ruling 2026-10-10): bookkeeping only.
+        # AFTER setup() (the refit clock has advanced and a due fit has run --
+        # one that found peaks clears this) and BEFORE the no-distribution
+        # return below, which would silence the valve judge.
+        if getattr(self, "_fstat_zero_peak_epoch", None) is not None:
+            return self._propose_zero_peak_skip(
+                model, state, engine_ntemps, nwalkers)
 
         # An RJ move without a proposal distribution (e.g. search/refit
         # variants whose setup() has not produced one yet) cannot run. Pure
@@ -29308,6 +29450,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self.setup(model, state.branches)
         self.num_proposals += 1
 
+        # ZERO-PEAK F-stat epoch (user ruling 2026-10-10): bookkeeping only.
+        # AFTER setup() (the refit clock has advanced and a due fit has run --
+        # one that found peaks clears this) and BEFORE the no-distribution
+        # return below, which would silence the valve judge.
+        if getattr(self, "_fstat_zero_peak_epoch", None) is not None:
+            return self._propose_zero_peak_skip(
+                model, state, engine_ntemps, nwalkers)
+
         # An RJ move without a proposal distribution (e.g. search/refit
         # variants whose setup() has not produced one yet) cannot run. Pure
         # in-model moves don't need one.
@@ -30377,6 +30527,9 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         self.fstat_fit_kwargs = dict(fstat_fit_kwargs or {})
         self._fstat_epoch = None
         self._fstat_last_fit_hit = -1
+        # The ZERO-PEAK epoch this move is skipping on (user ruling
+        # 2026-10-10), or None. See :meth:`_adopt_epoch_container`.
+        self._fstat_zero_peak_epoch = None
         # Epoch F-stat center table (GB_FSTAT_CTR_MODE=epoch); installed
         # alongside the birth grids, see _install_ctr_table.
         self._fstat_ctr_table = None
@@ -30791,6 +30944,91 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         except (OSError, ValueError, TypeError):
             return None
 
+    def _epoch_n_peaks(self, k: int):
+        """How many peaks epoch ``k``'s fit selected (its DONE.json
+        ``n_peaks``), or ``None`` when the manifest is missing, unreadable or
+        records none. ``None`` is "cannot tell", never "zero"."""
+        try:
+            with open(os.path.join(self._epoch_dir(k), "DONE.json")) as f:
+                n = json.load(f).get("n_peaks")
+            return None if n is None else int(n)
+        except (OSError, ValueError, TypeError):
+            return None
+
+    # ---- zero-peak epochs (user ruling 2026-10-10) -------------------------
+
+    def _fstat_zero_peak_skips(self) -> bool:
+        """Does a ZERO-PEAK epoch put this move on bookkeeping only?
+
+        User ruling 2026-10-10: "when the F-stat literally has zero peaks,
+        skip the F-stat RJ proposal and its in-model partner." Measured on the
+        9mo job 753: gb_search_1 epochs 10-14 found 0 peaks, and
+        ``rj_fstat_search`` then spent ~10 min a cycle proposing PRIOR births
+        that accepted nothing, followed by an ``in_model_fstat`` pass that had
+        nothing new to polish.
+
+        The F-stat BIRTH moves only (``rj_fstat_search`` and its PE twin
+        ``rj_fstat_pe``, which share this code path). ``rj_replace`` /
+        ``rj_replace_pe`` share the fit dir but are not the F-stat RJ proposal
+        the ruling names: they keep the historical prior fallback, unchanged.
+        """
+        return (bool(getattr(self, "is_rj_prop", False))
+                and not bool(getattr(self, "rj_replace", False))
+                and not bool(getattr(self, "rj_removal_only", False)))
+
+    def _adopt_epoch_container(self, dist, k, n_peaks=None) -> None:
+        """Install epoch ``k``'s birth distribution -- or the lack of one.
+
+        ``dist`` is the branch-keyed ``{branch: container}`` an epoch install
+        assembles (what :data:`_FSTAT_GRID_REGISTRY` stores), or ``None`` when
+        the epoch produced no birth distribution. The ONE place all three
+        adoption paths decide what a missing distribution means -- the
+        install, the head's cross-move reuse and the rank's directive reuse --
+        so they cannot disagree.
+
+        * a distribution: installed; any zero-peak skip is cleared, so an
+          epoch WITH peaks restores normal behaviour with no residue;
+        * none, and the epoch has LITERALLY zero peaks (``n_peaks`` from the
+          fit, else the epoch's DONE.json) on an F-stat birth move
+          (:meth:`_fstat_zero_peak_skips`): ``rj_proposal_distribution`` stays
+          ``None`` -- NOT the prior -- and ``_fstat_zero_peak_epoch`` arms the
+          bookkeeping-only propose (:meth:`GBSpecialBase._propose_zero_peak_skip`);
+        * none otherwise (a peak count that cannot be read, or a replace
+          move): the historical PRIOR fallback, so births still happen and
+          the epoch stays complete rather than turning into a refit loop.
+          ``priors`` / ``gpu_priors`` are ALREADY branch-keyed dicts
+          (recipe.py builds them as ``{"gb": ...}`` and hands them to the
+          removal move unwrapped), so they are assigned straight through --
+          re-wrapping them would nest a dict where a distribution is expected.
+        """
+        if dist is not None:
+            self.rj_proposal_distribution = dist
+            self._fstat_zero_peak_epoch = None
+            return
+        if n_peaks is None:
+            n_peaks = self._epoch_n_peaks(k)
+        if (n_peaks is not None and int(n_peaks) == 0
+                and self._fstat_zero_peak_skips()):
+            logger.warning(
+                "%s: F-stat fit epoch %d has 0 peaks, so there is no birth "
+                "distribution; F-stat RJ births/deaths and the in-model "
+                "partner are SKIPPED (bookkeeping only) until an epoch with "
+                "peaks is installed. NOT falling back to the prior.",
+                self.name, k,
+            )
+            self.rj_proposal_distribution = None
+            self._fstat_zero_peak_epoch = int(k)
+            return
+        logger.warning(
+            "%s: F-stat fit epoch %d produced no birth distribution "
+            "(%s peaks); falling back to the prior for births.",
+            self.name, k, n_peaks,
+        )
+        self.rj_proposal_distribution = (
+            self.priors if not self.backend.uses_cuda else self.gpu_priors
+        )
+        self._fstat_zero_peak_epoch = None
+
     @staticmethod
     def _epoch_complete(d: str) -> bool:
         """An epoch is done when its stage-B npz OR its manifest exists.
@@ -30916,8 +31154,17 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         ``"load"`` (a complete epoch exists on disk) or ``"fit"``.
         Factored out so the state machine is table-testable without a
         sampler.
+
+        A ZERO-PEAK epoch (``_fstat_zero_peak_epoch``, ruling 2026-10-10)
+        counts as INSTALLED although ``rj_proposal_distribution`` is None:
+        the refit clock must keep advancing and the cadence must still open
+        the next epoch (which may find new peaks). Without the second term
+        such an epoch would read as "nothing installed" and be re-LOADED on
+        every propose, the clock would never be consulted and the move could
+        never refit out of it.
         """
-        if self.rj_proposal_distribution is not None:
+        if (self.rj_proposal_distribution is not None
+                or getattr(self, "_fstat_zero_peak_epoch", None) is not None):
             if self.fstat_refit_every <= 0:
                 return "skip", self._fstat_epoch
             if getattr(self, "fstat_refit_only_forced", False):
@@ -31775,24 +32022,12 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
             # Per-rank, per-epoch RJ birth stream (None -> entropy, as before).
             seed=self._birth_seed(k),
         )
-        if container is None:
-            # Zero peaks (or a stage that produced nothing): fall back to the
-            # prior so births still happen, and leave the epoch COMPLETE so
-            # this does not turn into a refit loop. ``priors`` / ``gpu_priors``
-            # are ALREADY branch-keyed dicts (recipe.py builds them as
-            # ``{"gb": ...}`` and hands them to the removal move unwrapped),
-            # so they are assigned straight through -- re-wrapping them would
-            # nest a dict where a distribution is expected.
-            logger.warning(
-                "%s: F-stat fit epoch %d produced no birth distribution "
-                "(%s peaks); falling back to the prior for births.",
-                self.name, k, n_peaks,
-            )
-            self.rj_proposal_distribution = (
-                self.priors if not self.backend.uses_cuda else self.gpu_priors
-            )
-        else:
-            self.rj_proposal_distribution = {self.branch_name: container}
+        # Zero peaks (or a stage that produced nothing): the epoch stays
+        # COMPLETE so this does not turn into a refit loop, and
+        # _adopt_epoch_container decides between the zero-peak skip (F-stat
+        # birth moves, ruling 2026-10-10) and the prior fallback.
+        dist = None if container is None else {self.branch_name: container}
+        self._adopt_epoch_container(dist, k, n_peaks)
         self._fstat_epoch = k
         # A new epoch means a new proposal grid AND a new noise/foreground
         # profile, so the high-f barren-band evidence is stale: revive here,
@@ -31810,12 +32045,14 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         # restarts.
         self._fstat_last_fit_hit = self._epoch_fit_clock(k)
         # Publish for the other moves sharing this fit dir (see
-        # :data:`_FSTAT_GRID_REGISTRY`). Store the assembled
-        # rj_proposal_distribution, so the prior-fallback case is shared too
-        # and a second move cannot re-run a fit that legitimately found
-        # nothing.
+        # :data:`_FSTAT_GRID_REGISTRY`), so a second move cannot re-run a fit
+        # that legitimately found nothing. The ASSEMBLED distribution, or
+        # None when there is none: each adopter then applies its OWN rule
+        # (_adopt_epoch_container) -- a birth move skips a zero-peak epoch
+        # while a replace move sharing the dir takes the prior -- instead of
+        # inheriting whichever answer the first installer happened to give.
         _FSTAT_GRID_REGISTRY[self._epoch_dir(k)] = (
-            self.rj_proposal_distribution, k, n_peaks,
+            dist, k, n_peaks,
         )
 
     def setup(self, model, branches):
@@ -31884,7 +32121,9 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
                     "process (epoch %d, %s peaks) -- no refit.",
                     self.name, epoch, n_peaks,
                 )
-                self.rj_proposal_distribution = container
+                # None (no distribution) is re-decided by THIS move's own
+                # rule: a zero-peak skip or the prior fallback (2026-10-10).
+                self._adopt_epoch_container(container, epoch, n_peaks)
                 self._fstat_epoch = epoch
                 # Same revival rule on the cross-move reuse path: this move
                 # adopts an epoch it did not fit itself, and the grid it is
@@ -31907,6 +32146,7 @@ class GBSpecialRJFStatGridMove(GBSpecialRJPriorMove):
         # reads the old proposal (_install replaces it), so drop it and
         # return the cached pool blocks first.
         self.rj_proposal_distribution = None
+        self._fstat_zero_peak_epoch = None  # nothing installed until _install
         self._stacked_census_obj = "unset"
         # ...and the process-wide registries' copies (2026-10-06, job 738
         # OOM at 88.7 GB): they are keyed by epoch dir and were never
