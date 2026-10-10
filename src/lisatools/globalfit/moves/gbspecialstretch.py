@@ -40,7 +40,7 @@ from ...analysiscontainer import (
 from ...domains import DomainSettingsBase, FDSettings, WDMSettings
 from ...sensitivity import SensitivityMatrixBase
 from ...utils.parallelbase import LISAToolsParallelModule
-from ...utils.device import device_context, pin_main_device
+from ...utils.device import device_context, pin_main_device, to_current_device_cached
 from ...utils.utility import asnumpy
 from gbgpu.gb_likelihood import (
     BandLikelihoodEngine,
@@ -4462,6 +4462,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     def xp(self) -> Union[ModuleType, numpy , cupy]:
         """Active array module (NumPy or CuPy) for this move."""
         return self.backend.xp
+
+    def __getstate__(self):
+        # the per-device copies of the cap-cell tables (_cap_table) never
+        # pickle: a copy restored on another device would sit under the
+        # wrong device key
+        state = self.__dict__.copy()
+        state.pop("_device_copy_cache", None)
+        return state
 
     def __init__(
         self,
@@ -17513,7 +17521,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             a = getattr(self, name, None)
             if a is None or not dg_on:
                 return empty["f64"]
-            return xp.ascontiguousarray(xp.asarray(a), dtype=xp.float64)
+            # raw kernel pointers: the copy on the launching device
+            return xp.ascontiguousarray(
+                xp.asarray(self._cap_table(xp, name)), dtype=xp.float64)
 
         buffers = []
         for entry in half_pre:
@@ -21345,6 +21355,23 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     # Every helper here short-circuits at ``cap_divisor == 1`` so the whole
     # cap machinery collapses back onto the band grid bit-identically.
 
+    def _cap_table(self, xp, name):
+        """``getattr(self, name)`` resident on the CURRENT device.
+
+        MULTI-GPU (2026-10-09, 9mo job 751): the cap-cell tables
+        (``_cap_band_lo`` / ``_cap_band_step`` / ``cap_edges`` /
+        ``_cap_edge_ext``) and ``band_edges`` are built ONCE, on the device
+        current at construction (GPU 0), and indexed with ``band_inds`` that
+        live on the rank's own device: a peer read on every cap lookup from
+        GPU 1 (cupy "array resides (0) ... current device (1)" at the
+        ``_cap_cell_index`` gather). The attribute stays the master; another
+        device reads a one-host-hop copy cached per device on
+        ``_device_copy_cache`` (dropped by ``__getstate__``), re-copied when
+        the master is rebuilt. A no-op on CPU and on the home device.
+        """
+        (arr,) = to_current_device_cached(xp, self, name, (getattr(self, name),))
+        return arr
+
     def _cap_cell_index(self, band_inds, freqs_hz, resolve_band=False):
         """Cap-cell index of sources at ``freqs_hz`` inside ``band_inds``.
 
@@ -21379,7 +21406,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """
         if resolve_band and freqs_hz is not None:
             xp = get_array_module(band_inds)
-            _be = xp.asarray(self.band_edges)
+            _be = xp.asarray(self._cap_table(xp, "band_edges"))
             band_inds = xp.clip(
                 xp.searchsorted(_be, freqs_hz, side="right") - 1,
                 0, int(self.num_bands) - 1,
@@ -21388,8 +21415,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             return band_inds
         xp = get_array_module(band_inds)
         sub = xp.floor(
-            (freqs_hz - self._cap_band_lo[band_inds])
-            / self._cap_band_step[band_inds]
+            (freqs_hz - self._cap_table(xp, "_cap_band_lo")[band_inds])
+            / self._cap_table(xp, "_cap_band_step")[band_inds]
             + (0.5 if self.cap_stagger else 0.0)
         )
         if self.cap_stagger:
@@ -21657,10 +21684,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         if self.cap_overlap_frac <= 0.0 or freqs_hz is None:
             return primary, None, None
         xp = get_array_module(primary)
-        e_lo = self.cap_edges[primary]
-        e_hi = self.cap_edges[primary + 1]
-        x_lo = self._cap_edge_ext[primary]
-        x_hi = self._cap_edge_ext[primary + 1]
+        cap_edges = self._cap_table(xp, "cap_edges")
+        edge_ext = self._cap_table(xp, "_cap_edge_ext")
+        e_lo = cap_edges[primary]
+        e_hi = cap_edges[primary + 1]
+        x_lo = edge_ext[primary]
+        x_hi = edge_ext[primary + 1]
         low = freqs_hz < (e_lo + x_lo)
         high = freqs_hz > (e_hi - x_hi)
         has_nb = low | high

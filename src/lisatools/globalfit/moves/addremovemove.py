@@ -616,9 +616,14 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         """
         best, cold = self._eigen_best_walker(leaf, work)
         x0 = cold[best]
-        self._note_eigen_expansion_point(leaf, x0)
         t0 = time.perf_counter()
-        info = self._gram_info(x0, best, widths)
+        info, steps = self._gram_info(x0, best, widths, return_steps=True)
+        # record the centre the final stencil used: x0 nudged inside the
+        # prior box by the final steps (_gram_info)
+        lo, hi = eigen_refresh.prior_box_bounds(
+            self.priors[self.branch_name], x0.size)
+        self._note_eigen_expansion_point(
+            leaf, eigen_refresh.nudge_inside(x0, steps, lo, hi))
         eigen_refresh.logger.info(
             "[eigen_refresh] %s leaf %d Gram info matrix at walker %d in %.2f s",
             self.branch_name, leaf, best, time.perf_counter() - t0,
@@ -681,6 +686,13 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         at all takes the 1e3 factor). The templates are then rebuilt at the
         tuned steps.
 
+        Each pass centres its stencil on ``x0`` nudged inside the prior box
+        by that pass's steps (:func:`eigen_refresh.nudge_inside`), so no row
+        leaves the prior (9mo job 751: an EMRI walker 1.3e-5 inside its
+        ``cos(qK)`` bound got a NaN template from the ``-`` row on every
+        refresh). A non-finite matrix raises a ``ValueError`` naming the
+        columns whose half-differences were non-finite.
+
         Args:
             x0: ``(ndim,)`` sampling-basis expansion point.
             walker: walker whose container (data, PSD, device) scores it.
@@ -696,6 +708,7 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         x0 = np.asarray(x0, dtype=float)
         widths = np.asarray(widths, dtype=float)
         nd = int(x0.size)
+        lo, hi = eigen_refresh.prior_box_bounds(self.priors[self.branch_name], nd)
         steps = self._gram_eps_rel() * widths
         target = self._gram_target()
         # the scorers' inner-product kwargs, minus the PSD (passed explicitly
@@ -711,10 +724,12 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
             return float(np.real(v.get() if hasattr(v, "get") else v))
 
         def half_differences(s):
-            """``(h0, [half_i], psd)`` at steps ``s``;
-            ``half_i = (h(x0 + s_i e_i) - h(x0 - s_i e_i)) / 2``."""
-            # rows 2i / 2i+1 = x0 +/- s[i] e_i; the last row is x0 itself
-            X = np.repeat(x0[None, :], 2 * nd + 1, axis=0)
+            """``(h0, [half_i], psd, xc)`` at steps ``s`` around ``xc`` =
+            ``x0`` nudged inside the prior box by ``s``;
+            ``half_i = (h(xc + s_i e_i) - h(xc - s_i e_i)) / 2``."""
+            xc = eigen_refresh.nudge_inside(x0, s, lo, hi)
+            # rows 2i / 2i+1 = xc +/- s[i] e_i; the last row is xc itself
+            X = np.repeat(xc[None, :], 2 * nd + 1, axis=0)
             for i in range(nd):
                 X[2 * i, i] += s[i]
                 X[2 * i + 1, i] -= s[i]
@@ -722,14 +737,18 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
             h0 = WDMSignal(arr[2 * nd], box)
             _, _, psd = ac._slice_to_template(h0)
             # the walker's PSD may live on another GPU than the templates
-            # (SOBBH: comp device vs walker shard) -- keep the products local
-            psd = sensitivity_to_current_device(self.xp, psd)
+            # (SOBBH: comp device vs walker shard) -- keep the products local.
+            # The module is the TEMPLATES' one, not ``self.xp``: that is
+            # eryn's use_gpu-derived module, and the source-move builders
+            # never pass use_gpu, so it is numpy on GPU runs and made this
+            # guard a no-op (9mo job 751: diagnostic.py:248/294 on 2 ranks)
+            psd = sensitivity_to_current_device(get_array_module(arr), psd)
             half = [WDMSignal(0.5 * (arr[2 * i] - arr[2 * i + 1]), box)
                     for i in range(nd)]
-            return h0, half, psd
+            return h0, half, psd, xc
 
         with self._gram_context(best):
-            h0, half, psd = half_differences(steps)
+            h0, half, psd, xc = half_differences(steps)
             if target > 0:
                 hn = np.sqrt(max(ip(h0, h0, psd), 0.0))
                 dn = np.array([np.sqrt(max(ip(d, d, psd), 0.0)) for d in half])
@@ -737,12 +756,27 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
                 steps = np.clip(steps * np.clip(scale, 1e-3, 1e3),
                                 1e-12 * widths, 1e-2 * widths)
                 h0 = half = None  # release the first pass before the second
-                h0, half, psd = half_differences(steps)
+                h0, half, psd, xc = half_differences(steps)
             info = np.zeros((nd, nd))
             for a in range(nd):
                 for b in range(a, nd):
                     info[a, b] = info[b, a] = (
                         ip(half[a], half[b], psd) / (steps[a] * steps[b]))
+        if not np.all(np.isfinite(info)):
+            # name the culprit for the fallback's log line: the columns whose
+            # half-difference norm dn_i = ||half_i|| = s_i sqrt(G_ii) is
+            # non-finite (rows with a non-finite entry if none is)
+            with np.errstate(invalid="ignore"):
+                dn = np.sqrt(np.abs(np.diag(info))) * steps
+            bad = np.flatnonzero(~np.isfinite(dn))
+            if bad.size == 0:
+                bad = np.flatnonzero(~np.all(np.isfinite(info), axis=1))
+            raise ValueError(
+                f"non-finite information matrix: non-finite template "
+                f"half-differences in columns {bad.tolist()} (centre "
+                f"{xc[bad].tolist()}, steps {steps[bad].tolist()}, prior box "
+                f"{lo[bad].tolist()} .. {hi[bad].tolist()})"
+            )
         return (info, steps) if return_steps else info
 
     def _build_eigen_table_walker_max(self, leaf, work, widths):
@@ -754,7 +788,13 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
         """
         best, cold = self._eigen_best_walker(leaf, work)
         x0 = cold[best]
-        self._note_eigen_expansion_point(leaf, x0)
+        eps_rel = self._eigen_eps_rel()
+        bounds = eigen_refresh.prior_box_bounds(
+            self.priors[self.branch_name], self.ndim)
+        # the corners sit around x0 nudged inside the prior box (the
+        # builder's bounds=); record that point, not the raw cold row
+        self._note_eigen_expansion_point(leaf, eigen_refresh.nudge_inside(
+            x0, eps_rel * np.asarray(widths, dtype=float), *bounds))
 
         def call_ll(x):
             x = np.atleast_2d(x)
@@ -764,7 +804,7 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
             )
 
         return eigen_refresh.eigen_table_from_ll(
-            call_ll, x0, widths, eps_rel=self._eigen_eps_rel()
+            call_ll, x0, widths, eps_rel=eps_rel, bounds=bounds
         )
 
     def _build_eigen_tables_per_walker(self, leaf, work, widths):
@@ -783,7 +823,13 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
             asnumpy(work.coords[:nt, :, leaf]), dtype=np.float64
         ).reshape(nt * nw, -1)
         point_walker = np.tile(np.arange(nw, dtype=np.int32), nt)
-        self._note_eigen_expansion_point(leaf, pts.reshape(nt, nw, -1))
+        eps_rel = self._eigen_eps_rel()
+        bounds = eigen_refresh.prior_box_bounds(
+            self.priors[self.branch_name], self.ndim)
+        # each point's corners sit around it nudged inside the prior box
+        self._note_eigen_expansion_point(leaf, eigen_refresh.nudge_inside(
+            pts, eps_rel * np.asarray(widths, dtype=float), *bounds
+        ).reshape(nt, nw, -1))
 
         def call_ll(x):
             x = np.atleast_2d(x)
@@ -794,7 +840,7 @@ class ResidualAddOneRemoveOneMove(WalkerFanoutMixin, GlobalFitMove, StretchMove,
             )
 
         axes, sigmas = eigen_refresh.eigen_tables_from_ll_batch(
-            call_ll, pts, widths, eps_rel=self._eigen_eps_rel()
+            call_ll, pts, widths, eps_rel=eps_rel, bounds=bounds
         )
         ndim = axes.shape[-1]
         return (axes.reshape(nt, nw, ndim, ndim),

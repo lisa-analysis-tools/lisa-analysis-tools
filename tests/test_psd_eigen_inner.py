@@ -119,6 +119,35 @@ class EigenTablesTest(unittest.TestCase):
         axes, _ = m._eigen_inner._tables["psd"]
         self.assertEqual(axes.shape, (NT, 3, 1, 2, 2))
 
+    def test_tables_at_the_prior_edge_stay_inside_the_box(self):
+        """A cold point within one second-difference step of its prior bound
+        (the 9mo job-751 EMRI 3 defect, 2026-10-10: cos(qK) 1.3e-5 inside a
+        bound whose step was 2e-4) must NOT be differenced outside the box.
+        Here the scorer returns NaN outside [-10, 10]; without the bounds
+        pass-through the sweep's corners leave the box, the information
+        matrix degrades to identity rows and the table is the identity
+        fallback instead of the quadratic's axes."""
+        m, _ = _move()
+        quad = m._score_rows
+
+        def score_or_nan(w, p, g, s):
+            p = np.atleast_2d(np.asarray(p, dtype=float))
+            out = np.asarray(quad(w, p, g, s), dtype=float).copy()
+            out[np.any((p < -10.0) | (p > 10.0), axis=1)] = np.nan
+            return out
+
+        m._score_rows = score_or_nan
+        pt = np.zeros((NT, 1, 1, 2))
+        pt[..., 0] = -10.0 + 1e-6   # one millionth inside the lower bound
+        m._refresh_eigen_tables({"psd": pt})
+        axes, sigmas = m._eigen_inner._tables["psd"]
+        self.assertTrue(np.all(np.isfinite(axes)) and np.all(np.isfinite(sigmas)))
+        np.testing.assert_allclose(
+            np.sort(sigmas[0, 0, 0]), np.array([0.5, 1.0]), rtol=1e-3
+        )
+        A = np.abs(axes[0, 0, 0])
+        np.testing.assert_allclose(A @ A.T, np.eye(2), atol=1e-3)
+
 
 class EigenStepTest(unittest.TestCase):
     def test_run_move_takes_an_eigen_mh_step_with_one_walker(self):

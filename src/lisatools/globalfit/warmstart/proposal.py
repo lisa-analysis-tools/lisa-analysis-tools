@@ -73,8 +73,8 @@ Metropolis-Hastings factors require. Key design points:
   which varies across a component and therefore biases the RJ birth/death
   factors rather than cancelling as a constant would.
 
-Pickle/deepcopy safe (sprint rule): master tables are numpy; the cupy
-device cache is dropped on ``__getstate__``.
+Pickle/deepcopy safe (sprint rule): master tables are numpy; the per-device
+cupy cache is dropped on ``__getstate__``.
 """
 
 from __future__ import annotations
@@ -86,6 +86,8 @@ import typing
 import warnings
 
 import numpy as np
+
+from ...utils.device import current_device, device_context
 
 logger = logging.getLogger(__name__)
 
@@ -455,14 +457,27 @@ class WarmStartComponents:
         return np
 
     def _t(self, xp):
-        """The tables on ``xp`` (device copies cached; numpy = the masters)."""
+        """The tables on ``xp`` (numpy = the masters; device copies cached
+        PER DEVICE).
+
+        MULTI-GPU (2026-10-09, 9mo job 751): the cache used to be keyed by
+        the literal ``"dev"``, so the device current on the FIRST call (GPU 0:
+        ``__init__`` builds it up-front) owned the tables for good and a rank
+        on GPU 1 read them across devices on every warm-start proposal (cupy
+        "array resides (0) ... current device (1)" at the searchsorted and
+        the gathers of :meth:`_mixture_logpdf`). Keyed by the current device
+        id now, each copy uploaded from the host masters with that device
+        current.
+        """
         if xp is np:
             return self._tables
-        if "dev" not in self._dev_cache:
-            self._dev_cache["dev"] = {
-                k: xp.asarray(v) for k, v in self._tables.items()
-            }
-        return self._dev_cache["dev"]
+        dev = current_device(xp)
+        tables = self._dev_cache.get(dev)
+        if tables is None:
+            with device_context(xp, dev):
+                tables = {k: xp.asarray(v) for k, v in self._tables.items()}
+            self._dev_cache[dev] = tables
+        return tables
 
     def __getstate__(self):
         state = self.__dict__.copy()

@@ -407,22 +407,26 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
 
         if len(self.acs.linear_data_arr) == 1:
             xp = getattr(self.acs, "xp", None)
-            _t = time.perf_counter()
-            ll = self.comp.get_ll_wdm(
-                params, self.acs,
-                data_index=idx, noise_index=idx,
-                m_band_half_width=self.m_band_half_width,
-            )
-            _t_call = time.perf_counter() - _t
-            _t = time.perf_counter()
-            synchronize(xp)
-            _t_sync = time.perf_counter() - _t
-            _t = time.perf_counter()
-            out = (
-                np.asarray(asnumpy(ll), dtype=float),
-                np.real(np.asarray(asnumpy(self.comp.d_h_out))),
-                np.real(np.asarray(asnumpy(self.comp.h_h_out))),
-            )
+            # on the device that owns the (single) shard: the comp resolves
+            # on the CURRENT device, so this is not left to whatever device
+            # happens to be current (see _shard_context)
+            with self._shard_context():
+                _t = time.perf_counter()
+                ll = self.comp.get_ll_wdm(
+                    params, self.acs,
+                    data_index=idx, noise_index=idx,
+                    m_band_half_width=self.m_band_half_width,
+                )
+                _t_call = time.perf_counter() - _t
+                _t = time.perf_counter()
+                synchronize(xp)
+                _t_sync = time.perf_counter() - _t
+                _t = time.perf_counter()
+                out = (
+                    np.asarray(asnumpy(ll), dtype=float),
+                    np.real(np.asarray(asnumpy(self.comp.d_h_out))),
+                    np.real(np.asarray(asnumpy(self.comp.h_h_out))),
+                )
             self._ll_spans_add(
                 self._shard_spans(_t_call, _t_sync,
                                   time.perf_counter() - _t, 0.0)
@@ -521,6 +525,42 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
         self.compute_like(add_coords_in, walker_idx)
         _sub.d_h[:, leaf] = self._last_d_h[: self.nwalkers]
         _sub.h_h[:, leaf] = self._last_h_h[: self.nwalkers]
+
+    # ------------------------------------------------------------------
+    # Device ownership (2026-10-10, 9mo job 751). Every SOBBH pass enters
+    # the device that owns the walker's shard, as the MBH/EMRI moves do
+    # (MBHBatchedLikeMove._split_rows_static), instead of running on
+    # whatever device happens to be current. The chunked / lookup comp
+    # resolves on the CURRENT device, so a rank whose walker lived on GPU 1
+    # built a second lookup comp on GPU 0 for its first Gram refresh and
+    # read the GPU-1 residual / PSD across the link (cupy PerformanceWarning
+    # at diagnostic.py:248/294 on two ranks -- the family behind the 10-08
+    # illegal-memory-access race). The multi-shard branches of _kernel_ll
+    # and _apply_cold_chain_sources already entered each view's device;
+    # these hooks give the single-shard branches and the Gram the same rule.
+    # ------------------------------------------------------------------
+
+    def _split_rows(self, idx):
+        """``[(device, positions)]`` grouping ``idx`` rows by owning walker shard."""
+        from .mbhbatchedmove import MBHBatchedLikeMove
+
+        return MBHBatchedLikeMove._split_rows_static(self.acs, idx)
+
+    def _device_context(self, device):
+        from ...utils.device import device_context
+
+        return device_context(getattr(self.acs, "xp", None), device)
+
+    def _shard_context(self, walker=0):
+        """Context on the device that owns walker ``walker``'s shard
+        (``gpus[0]`` on a single-shard ACA); a null context on numpy or
+        without GPUs."""
+        (device, _), = self._split_rows(np.array([int(walker)]))
+        return self._device_context(device)
+
+    def _gram_context(self, walker):
+        """Enter the device that owns walker ``walker``'s shard."""
+        return self._shard_context(walker)
 
     def _gram_templates(self, coords, walker):
         """``SOBBH_EIGEN_INFO=gram`` hook: the move's own templates for the
@@ -635,12 +675,14 @@ class SOBBHChunkedLikeMove(ResidualAddOneRemoveOneMove):
         t0 = time.perf_counter()
 
         if n_shards == 1:
-            self.comp.fill_global_wdm(
-                p, self.acs,
-                data_index=idx,
-                factors=factors,
-                m_band_half_width=self.m_band_half_width,
-            )
+            # on the device that owns the (single) shard (see _shard_context)
+            with self._shard_context():
+                self.comp.fill_global_wdm(
+                    p, self.acs,
+                    data_index=idx,
+                    factors=factors,
+                    m_band_half_width=self.m_band_half_width,
+                )
             logger.info(
                 "[SOBBH_FILL] %s via CHUNKED fill_global_wdm: %d rows "
                 "(%d skipped) in %.2f s, 1 shard",

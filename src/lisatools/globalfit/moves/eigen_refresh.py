@@ -42,6 +42,8 @@ from ...info_matrix_ll import information_matrix_from_ll
 
 __all__ = [
     "prior_box_widths",
+    "prior_box_bounds",
+    "nudge_inside",
     "eigen_table_from_ll",
     "eigen_tables_from_ll_batch",
     "eigen_table_from_waveform",
@@ -138,10 +140,99 @@ def prior_box_widths(prob_dist_container, ndim):
     parameters) keep width 1.0 quietly, as before. A reader failure keeps
     the columns read up to that point (unit widths elsewhere) and warns.
     """
+    lo_r, hi_r, covered, unread, exc = _read_prior_box(prob_dist_container, ndim)
+    if exc is not None:
+        logger.warning(
+            "[eigen_refresh] prior box unavailable (%r); keeping the columns "
+            "read so far, unit widths elsewhere", exc,
+        )
     lo = np.zeros(ndim)
     hi = np.ones(ndim)
+    lo[covered] = lo_r[covered]
+    hi[covered] = hi_r[covered]
+    width = hi - lo
+    unread.extend(c for c in covered if not np.isfinite(width[c]) or width[c] <= 0)
+    if unread:
+        _warn_unread(ndim, tuple(sorted(set(unread))))
+    return prior_box_scales(lo, hi)
+
+
+def prior_box_bounds(prob_dist_container, ndim):
+    """Per-column ``(lo, hi)`` prior box, ``(-inf, +inf)`` where unknown.
+
+    The same one-pass reader as :func:`prior_box_widths` (columns through
+    :func:`_prior_entries`, so label-keyed dicts resolve). A column gets its
+    distribution's ``(minimum, maximum)`` only when both are finite and
+    ``maximum > minimum``; uncovered, unreadable, unbounded and degenerate
+    columns get ``(-inf, +inf)``, which :func:`nudge_inside` leaves alone.
+
+    Quiet by design: the refresh reads :func:`prior_box_widths` off the same
+    container first, and that reports unread columns and reader failures.
+    """
+    lo_r, hi_r, covered, _, _ = _read_prior_box(prob_dist_container, ndim)
+    lo = np.full(ndim, -np.inf)
+    hi = np.full(ndim, np.inf)
+    ok = np.zeros(ndim, dtype=bool)
+    ok[covered] = True
+    with np.errstate(invalid="ignore"):
+        ok &= np.isfinite(lo_r) & np.isfinite(hi_r) & (hi_r - lo_r > 0)
+    lo[ok] = lo_r[ok]
+    hi[ok] = hi_r[ok]
+    return lo, hi
+
+
+def nudge_inside(x0, steps, lo, hi):
+    """``x0`` moved so the ``x0 +/- steps`` stencil stays in ``[lo, hi]``.
+
+    Per column with a positive step, clip to ``[lo + step, hi - step]``; a
+    box narrower than ``2 * step`` takes the box centre instead. Infinite
+    bounds and steps ``<= 0`` (a frozen column in
+    :func:`~lisatools.info_matrix_ll.information_matrix_from_ll`) leave the
+    column alone. ``x0`` is ``(ndim,)`` or ``(n, ndim)``; ``steps`` / ``lo``
+    / ``hi`` broadcast against it. Returns a new array; ``x0`` is not
+    mutated.
+
+    Why (9mo job 751, 2026-10-09): an EMRI walker at ``cos(qK) =
+    -0.9999770663`` in a ``uniform(-0.99999, 0.99999)`` box, 1.3e-5 from the
+    bound, with central-difference steps of 2e-4 and up. The ``-`` row left
+    the box, the cos -> arccos transform gave a NaN template, the Gram build
+    failed every refresh and the likelihood fallback scored a "no signal"
+    corner -- finite, so its table was silently wrong.
+    """
+    x = np.array(x0, dtype=float)
+    s = np.broadcast_to(np.asarray(steps, dtype=float), x.shape)
+    lo = np.broadcast_to(np.asarray(lo, dtype=float), x.shape)
+    hi = np.broadcast_to(np.asarray(hi, dtype=float), x.shape)
+    live = s > 0
+    a = lo + s
+    b = hi - s
+    # fl(fl(lo + s) - s) can land one ulp below lo (and fl(fl(hi - s) + s)
+    # one above hi); pull the limit in by that ulp so the stencil row, built
+    # the same way, is inside
+    a = np.where(a - s < lo, np.nextafter(a, np.inf), a)
+    b = np.where(b + s > hi, np.nextafter(b, -np.inf), b)
+    out = np.where(live, np.minimum(np.maximum(x, a), b), x)
+    narrow = live & (a > b)
+    out[narrow] = 0.5 * (lo[narrow] + hi[narrow])
+    return out
+
+
+def _read_prior_box(prob_dist_container, ndim):
+    """One pass over :func:`_prior_entries`: the per-column box as read.
+
+    Returns ``(lo, hi, covered, unread, exc)``: ``lo`` / ``hi`` carry the
+    distributions' ``minimum`` / ``maximum`` on the ``covered`` columns (NaN
+    elsewhere; a column covered twice keeps the later entry), ``unread``
+    lists covered-but-unreadable columns, ``exc`` is the reader failure
+    (``None`` if the pass completed; the columns read before it are kept).
+    Shared by :func:`prior_box_widths` and :func:`prior_box_bounds` so the
+    two never disagree on a column.
+    """
+    lo = np.full(ndim, np.nan)
+    hi = np.full(ndim, np.nan)
     covered = []
     unread = []
+    exc = None
     try:
         for cols, dist in _prior_entries(prob_dist_container):
             cols_all = [int(c) for c in cols.ravel()]
@@ -168,16 +259,9 @@ def prior_box_widths(prob_dist_container, ndim):
             lo[cols_in] = mn
             hi[cols_in] = mx
             covered.extend(cols_in)
-    except Exception as exc:  # never break the sampler on an exotic prior
-        logger.warning(
-            "[eigen_refresh] prior box unavailable (%r); keeping the columns "
-            "read so far, unit widths elsewhere", exc,
-        )
-    width = hi - lo
-    unread.extend(c for c in covered if not np.isfinite(width[c]) or width[c] <= 0)
-    if unread:
-        _warn_unread(ndim, tuple(sorted(set(unread))))
-    return prior_box_scales(lo, hi)
+    except Exception as err:  # never break the sampler on an exotic prior
+        exc = err
+    return lo, hi, covered, unread, exc
 
 
 # (ndim, columns) already reported by _warn_unread: addremove calls
@@ -249,18 +333,22 @@ def _table_from_info(info, widths, sigma_max_frac=1.0):
 
 
 def eigen_table_from_ll(call_ll, x0, widths, *, eps_rel=1e-4,
-                        sigma_max_frac=1.0, xp=np):
+                        sigma_max_frac=1.0, xp=np, bounds=None):
     """``(axes, sigmas)`` from likelihood second differences at ``x0``.
 
     ``call_ll(params_2d) -> ll_1d`` scores rows in the SAMPLING basis (wrap
     any transform inside it) and must not mutate the residual. The
-    per-parameter step is ``eps_rel`` of the prior box width, so the
-    corners stay well inside the prior for any reasonable ``x0``.
+    per-parameter step is ``eps_rel`` of the prior box width; a point within
+    one step of a bound would still put a corner outside the prior, so
+    ``bounds=(lo, hi)`` (:func:`prior_box_bounds`) first moves ``x0`` that
+    step inside (:func:`nudge_inside`). ``None`` uses ``x0`` as given.
     """
     widths = np.asarray(widths, dtype=float)
     try:
         x0 = np.asarray(x0, dtype=float)
         param_eps = float(eps_rel) * widths
+        if bounds is not None:
+            x0 = nudge_inside(x0, param_eps, *bounds)
         info = information_matrix_from_ll(
             call_ll, x0[None, :], xp=xp, param_eps=param_eps
         )
@@ -275,7 +363,7 @@ def eigen_table_from_ll(call_ll, x0, widths, *, eps_rel=1e-4,
 
 
 def eigen_tables_from_ll_batch(call_ll, x0s, widths, *, eps_rel=1e-4,
-                               sigma_max_frac=1.0, xp=np):
+                               sigma_max_frac=1.0, xp=np, bounds=None):
     """One ``(axes, sigmas)`` table per row of ``x0s``, ONE batched sweep.
 
     ``x0s`` is ``(n, ndim)`` — e.g. every (temperature, walker) point of a
@@ -284,7 +372,8 @@ def eigen_tables_from_ll_batch(call_ll, x0s, widths, *, eps_rel=1e-4,
     n-point blocks in the ``x0s`` row order (the
     :func:`~lisatools.info_matrix_ll.information_matrix_from_ll` batching
     invariant), so per-point metadata — a per-walker ``data_index`` —
-    must be TILED by ``rows // n``.
+    must be TILED by ``rows // n``. ``bounds=(lo, hi)`` nudges each row
+    inside the prior box first, as in :func:`eigen_table_from_ll`.
 
     Returns ``axes (n, ndim, ndim)``, ``sigmas (n, ndim)``; any failure
     degrades to identity tables for every point with a logged warning.
@@ -292,8 +381,11 @@ def eigen_tables_from_ll_batch(call_ll, x0s, widths, *, eps_rel=1e-4,
     widths = np.asarray(widths, dtype=float)
     x0s = np.atleast_2d(np.asarray(x0s, dtype=float))
     try:
+        param_eps = float(eps_rel) * widths
+        if bounds is not None:
+            x0s = nudge_inside(x0s, param_eps, *bounds)
         info = information_matrix_from_ll(
-            call_ll, x0s, xp=xp, param_eps=float(eps_rel) * widths
+            call_ll, x0s, xp=xp, param_eps=param_eps
         )
         return _tables_from_info_batch(
             np.asarray(info), widths, sigma_max_frac=sigma_max_frac

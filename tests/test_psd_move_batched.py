@@ -576,6 +576,44 @@ class NoiseFisherTest(unittest.TestCase):
                                    delta=0.02)
         self.assertTrue(np.all(np.linalg.eigvalsh(F) > 0))
 
+    def test_fisher_stencil_stays_inside_the_prior_box(self):
+        """A galfor point within one step of a prior bound is expanded one
+        step in (eigen_refresh.nudge_inside), so no x +/- step row of the
+        covariance differences leaves the box (2026-10-10, after the 9mo
+        job-751 EMRI 3 Gram defect). The sampling-basis rows the Fisher
+        hands to ``_to_physical`` for galfor are recorded and checked."""
+        from lisatools.globalfit.moves.eigen_refresh import prior_box_bounds
+
+        mv = self.mv
+        x0 = {k: self.pt[k][[0]].copy() for k in self.sampled}
+        nd = x0["galfor"].shape[1]
+        lo, hi = prior_box_bounds(mv.priors["galfor"], nd)
+        col = int(np.where(np.isfinite(lo) & np.isfinite(hi))[0][0])
+        x0["galfor"][0, col] = lo[col] + 1e-9 * (hi[col] - lo[col])
+        seen = []
+        orig = mv._to_physical
+
+        def recording(tf, r):
+            # the galfor rows by WIDTH (the psd and galfor transforms can be
+            # the same object -- both None -- so identity cannot tell them)
+            if np.size(r) == nd:
+                seen.append(np.array(r, dtype=float).ravel())
+            return orig(tf, r)
+
+        mv._to_physical = recording
+        try:
+            F = self._fisher("galfor", x0)
+        finally:
+            mv._to_physical = orig
+        self.assertTrue(np.all(np.isfinite(F)))
+        rows = np.stack(seen)
+        self.assertEqual(rows.shape[0], 2 * nd + 1)
+        fin = np.isfinite(lo) & np.isfinite(hi)
+        self.assertTrue(np.all(rows[:, fin] >= lo[fin]) and np.all(rows[:, fin] <= hi[fin]),
+                        msg=f"stencil rows left the box: min {rows.min(axis=0)} lo {lo}")
+        # the centre row (last) sits one step inside the bound, not at x0
+        self.assertGreater(rows[-1, col], x0["galfor"][0, col])
+
     def test_galfor_fisher_is_definite_and_matches_measured_directions(self):
         x0 = {k: self.pt[k][[0]].copy() for k in self.sampled}
         x0["galfor"][0, 0] *= 1e8            # a loud foreground

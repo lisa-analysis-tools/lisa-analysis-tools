@@ -1916,6 +1916,8 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         Raises when the PSD_BATCH route is not engaged (the caller then
         falls back to the likelihood route).
         """
+        from .eigen_refresh import nudge_inside, prior_box_bounds
+
         if not self._batched_route_ready():
             raise RuntimeError("noise Fisher needs the PSD_BATCH route")
         acs = self.acs
@@ -1925,6 +1927,19 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         points = np.atleast_2d(np.asarray(points, dtype=np.float64))
         n_pts, nd = points.shape
         steps = float(self.eigen_eps_rel) * np.asarray(widths, dtype=float)
+        # keep every x +/- step row inside the prior box: a point within one
+        # step of a bound (galfor alpha at GALFOR_ALPHA_MAX, fk at the
+        # 0.8 mHz floor) is expanded one step in from that bound instead of
+        # differencing the model outside its prior (same rule as the source
+        # Gram route after the 9mo job-751 EMRI 3 defect, 2026-10-10). Only
+        # points INSIDE the box are nudged: a live walker always is, and an
+        # expansion point handed in from outside it (synthetic tests) is
+        # expanded where it stands, as before.
+        lo, hi = prior_box_bounds(self.priors[branch], nd)
+        in_box = np.all((points >= lo) & (points <= hi), axis=1)
+        if np.any(in_box):
+            points = points.copy()
+            points[in_box] = nudge_inside(points[in_box], steps, lo, hi)
         out = np.zeros((n_pts, nd, nd))
         for p in range(n_pts):
             # rows 2i / 2i+1 = x +/- steps[i] e_i; the last row is x itself
@@ -3119,6 +3134,7 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
         from .eigen_refresh import (
             _tables_from_info_batch,
             eigen_tables_from_ll_batch,
+            prior_box_bounds,
             prior_box_widths,
             temper_sigmas,
         )
@@ -3195,8 +3211,12 @@ class PSDMove(WalkerFanoutMixin, GlobalFitMove, StretchMove):
                                    "likelihood second differences", b, exc)
                     axes = None
             if axes is None:
+                # bounds: the second-difference corners stay inside the
+                # prior box (a point within eps of a bound is expanded one
+                # step in), as on the source branches' routes
                 axes, sigmas = eigen_tables_from_ll_batch(
-                    call_ll, point[b], widths, eps_rel=self.eigen_eps_rel
+                    call_ll, point[b], widths, eps_rel=self.eigen_eps_rel,
+                    bounds=prior_box_bounds(self.priors[b], ndim_b),
                 )
             if cold_only:
                 # one table per walker, shared up the ladder; the sigmas are
