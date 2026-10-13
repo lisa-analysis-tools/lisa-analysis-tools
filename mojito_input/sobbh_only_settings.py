@@ -135,7 +135,6 @@ def setup_recipe(recipe, engine_info, curr, acs, priors, state):
 
     # We dont have the normalising flow for what we are doing 
     # burnin_inner_moves_sobhb = attach_flow_trainers(sobhb_info, "sobbh")
-
     sobhb_move_kwargs = dict(
         dcga=acs,
         waveform_gen=sobhb_wave_gen,
@@ -148,7 +147,7 @@ def setup_recipe(recipe, engine_info, curr, acs, priors, state):
         priors=priors,
         inner_moves=sobhb_info.inner_moves,
         betas_all=betas_all,# *starting* inverse temperatures
-        permute_every=25,# swaps between temperatures. any value <= turns it off
+        permute_every=0,# swaps between temperatures. any value <= turns it off
         pad_out_of_prior=True, # Out of prior points are replaced by a copy of a random in-prior point.
         run_async=True, #unused in sobbh block. 
         run_threaded=True, # threaded allowing for threaded execution of the likelihoods over GPUs. 
@@ -253,7 +252,7 @@ def get_general_erebor_settings() -> GeneralSetup:
 
     submission_folder = None #"/work/asantini/globalfit/erebor_org_setup/mojito_runs/"
 
-    num_iterations = 250
+    num_iterations = 500
 
     source_ids = dict(
         sobhb=[0, 1, 2, 3, 4, 5]
@@ -268,10 +267,10 @@ def get_general_erebor_settings() -> GeneralSetup:
 
     head_dir = "/data/diganta/Mojito_Search/Integration_GF/Run/"  # trailing slash: paths are built by string concatenation
     data_input_path = "/data/asantini/globalfit/MOJITO_DATA/mojito_light_2p5s/"
-    base_file_name = "SOBBH_only_MOJITO_light_2p5s_GF_setup_tc_prior"
+    base_file_name = "SOBBH_only_MOJITO_light_2p5s_GF_correct_priors_13th_oct"
     file_store_dir = head_dir
 
-    gpus = [1]
+    gpus = [0]
     cp.cuda.runtime.setDevice(gpus[0])
     # Restrict JAX to only see the target GPU — must be set before JAX backend init
     import jax

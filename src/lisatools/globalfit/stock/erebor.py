@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import typing
+from functools import partial
 from typing import Any, Optional
 
 import h5py
@@ -19,7 +20,7 @@ import logging
 
 from eryn.backends import HDFBackend as eryn_Backend
 from eryn.moves.tempering import make_ladder
-from eryn.prior import ProbDistContainer, uniform_dist, log_uniform
+from eryn.prior import ProbDistContainer, uniform_dist, log_uniform, GenericFunctionalDistribution
 from eryn.state import State as ErynState
 from eryn.state import Branch as ErynBranch
 from eryn.utils import TransformContainer
@@ -29,6 +30,7 @@ from gbgpu.gbcomps import STFTGBComputations
 from lisatools.sources.utils import ecliptic_to_icrs
 from lisatools.utils.utility import AET, detrend, tukey
 from lisatools.utils.constants import YRSID_SI, PC_SI
+from lisatools.utils.utility import ErynEtaMcPrior
 
 from ...domains import DomainSettingsBase, FDSettings, WDMSettings, STFTSettings
 from ..engine import Settings, Setup, GeneralSetup
@@ -1287,6 +1289,61 @@ SOBBHTF_BASIS = [
     "dec",       # declination (ICRS)
 ]
 
+# Default prior range for each sampling parameter; ``<name>_lims`` in
+# :class:`SOBBHTFSettings` overrides it. The prior *shape* is fixed per
+# parameter (see ``SOBBHTFSetup.setup_priors``): joint (Mc, eta) uniform in
+# component masses, volumetric in dist, cos(dec) in dec, uniform otherwise.
+SOBBHTF_DEFAULT_LIMS = {
+    "Mc": (5.0, 100.0),
+    "eta": (0.1, 0.2499999),
+    "cosinc": (-1.0, 1.0),
+    "dist": (10.0, 1000.0),
+    "f0": (1.0e-3, 0.08),
+    "s1": (-0.99, 0.99),
+    "s2": (-0.99, 0.99),
+    "phi_coal": (0.0, 2 * np.pi),
+    "psi": (0.0, np.pi),
+    "ra": (0.0, 2 * np.pi),
+    "dec": (-np.pi / 2, np.pi / 2),
+}
+
+
+# Analytic pdf / inverse-cdf pairs for GenericFunctionalDistribution. Module
+# level (bound with functools.partial) so the priors stay picklable.
+def _volumetric_pdf(x, lo, hi):
+    """p(x) = 3 x^2 / (hi^3 - lo^3) on [lo, hi]."""
+    return 3.0 * x**2 / (hi**3 - lo**3)
+
+
+def _volumetric_inv_cdf(u, lo, hi):
+    ''''
+    Inverse CDF of the volumetric distribution on [lo, hi].
+    
+    '''
+    return np.cbrt(lo**3 + u * (hi**3 - lo**3))
+
+
+def _cos_dec_pdf(x, lo, hi):
+    """p(x) = cos(x) / (sin(hi) - sin(lo)) on [lo, hi] (uniform on the sphere)."""
+    return np.cos(x) / (np.sin(hi) - np.sin(lo))
+
+
+def _cos_dec_inv_cdf(u, lo, hi):
+    '''
+    Inverse CDF of the cos(dec) distribution on [lo, hi].
+    '''
+    return np.arcsin(np.sin(lo) + u * (np.sin(hi) - np.sin(lo)))
+
+
+def _functional_prior(pdf, inv_cdf, lo, hi):
+    '''
+    Partial function fixes the lower and upper bounds of the distribution for use in GenericFunctionalDistribution.
+    So the pdf and inv_cdf are just functions of one variable each. 
+    '''
+    return GenericFunctionalDistribution(
+        partial(pdf, lo=lo, hi=hi), partial(inv_cdf, lo=lo, hi=hi), lo, hi
+    )
+
 
 def make_sobbhtf_transform_container():
     """Identity :class:`TransformContainer` for the gwtf SOBBH branch.
@@ -1328,6 +1385,8 @@ class SOBBHTFSettings(Settings):
     psi_lims: typing.List[float] = dataclasses.field(default_factory=list)
     ra_lims: typing.List[float] = dataclasses.field(default_factory=list)
     dec_lims: typing.List[float] = dataclasses.field(default_factory=list)
+    # Component-mass box [m_min, m_max] (Msun) cutting the joint (Mc, eta) prior.
+    component_mass_lims: typing.List[float] = dataclasses.field(default_factory=lambda: [5.0, 130.0])
     # GWTF_generator.get_signal_for_residuals takes no kwargs, and
     # subtract_initial_signal splats these into it -> must stay a (empty) dict.
     waveform_kwargs: dict = dataclasses.field(default_factory=dict)
@@ -1347,6 +1406,7 @@ class SOBBHTFSetup(Setup):
     """
 
     def __init__(self, sobbhtf_settings: SOBBHTFSettings):
+
         super().__init__(sobbhtf_settings)
 
         level = logging.DEBUG
@@ -1403,32 +1463,43 @@ class SOBBHTFSetup(Setup):
             self.inner_moves = [(StretchMove(), 1.0)]
 
     def setup_priors(self, input_basis):
-        """Build the gwtf SOBBH prior dictionary, overriding ranges from settings."""
-        priors_sobbhtf = {
-            "Mc": uniform_dist(1.0, 100.0),              # chirp mass (Msun)
-            "eta": uniform_dist(0.01, 0.2499999),             # symmetric mass ratio
-            "cosinc": uniform_dist(-1.0, 1.0),           # cos(inclination)
-            "dist": uniform_dist(10.0, 1000.0),           # luminosity distance (Mpc)
-            "f0": uniform_dist(1.0e-3, 0.08),          # f0 at data start (Hz)
-            "s1": uniform_dist(-0.99, 0.99),             # primary aligned spin
-            "s2": uniform_dist(-0.99, 0.99),             # secondary aligned spin
-            "phi_coal": uniform_dist(0.0, 2 * np.pi),    # coalescence phase
-            "psi": uniform_dist(0.0, np.pi),             # polarisation (ICRS)
-            "ra": uniform_dist(0.0, 2 * np.pi),          # right ascension (ICRS)
-            "dec": uniform_dist(-np.pi / 2, np.pi / 2),  # declination (ICRS)
-        }
+        """Build the gwtf SOBBH prior.
 
-        # Every sampling parameter has a ``<name>_lims`` settings field.
+        Ranges come from ``SOBBHTF_DEFAULT_LIMS``, overridden by any non-empty
+        ``<name>_lims`` setting. Shapes are fixed per parameter: (Mc, eta)
+        jointly uniform in component masses (cut by ``component_mass_lims``),
+        dist volumetric, dec uniform on the sphere, the rest uniform.
+        """
+        # ProbDistContainer assigns columns by insertion order, not by name, so
+        # the joint (Mc, eta) entry must come first to land on columns 0, 1.
+        assert list(input_basis[:2]) == ["Mc", "eta"], input_basis
+
+        lims = {}
         for key in input_basis:
             cfg = getattr(self, f"{key}_lims")
             if cfg is not None and len(cfg) == 2:
-                self.logger.info(f"Setting prior for parameter {key} using limits {cfg}")
-                priors_sobbhtf[key] = uniform_dist(*cfg)
+                self.logger.info(f"Setting prior limits for parameter {key} to {cfg}")
+                lims[key] = tuple(cfg)
+            else:
+                lims[key] = SOBBHTF_DEFAULT_LIMS[key]
 
-        # ProbDistContainer is positional: keep the sampling-basis order.
-        self.priors = {
-            self.branch_name: ProbDistContainer({k: priors_sobbhtf[k] for k in input_basis})
+        priors_sobbhtf = {
+            ("Mc", "eta"): ErynEtaMcPrior(*lims["Mc"], *lims["eta"], *self.component_mass_lims),
         }
+
+        # If key is "dist" or "dec", use the functional prior defined for that parameter; otherwise uniform.
+        for key in input_basis[2:]:
+            if key == "dist":
+                priors_sobbhtf[key] = _functional_prior(_volumetric_pdf, _volumetric_inv_cdf, *lims[key])
+            elif key == "dec":
+                priors_sobbhtf[key] = _functional_prior(_cos_dec_pdf, _cos_dec_inv_cdf, *lims[key])
+            else:
+                priors_sobbhtf[key] = uniform_dist(*lims[key])
+
+        prior_container = ProbDistContainer(priors_sobbhtf)
+        assert prior_container.key_order == list(input_basis), prior_container.key_order
+
+        self.priors = {self.branch_name: prior_container}
 
     def init_setup(self):
         self.init_sampling_info()

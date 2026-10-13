@@ -23,7 +23,7 @@ M_AET = np.array([[-1, 0, 1] / np.sqrt(2),
                   [1, 1, 1] / np.sqrt(3)])
 
 # Same bands as SC_Search's DEFAULT_PSD_CLIP_BANDS (TDI transfer-function nulls).
-DEFAULT_PSD_DROP_BANDS = [(0.029, 0.031), (0.059, 0.061), (0.0897, 0.0902)]
+DEFAULT_PSD_DROP_BANDS = [(0.029, 0.031), (0.059, 0.061), (0.089, 0.091)]
 
 
 

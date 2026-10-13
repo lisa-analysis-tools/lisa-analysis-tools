@@ -540,6 +540,13 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         tic = time.time()
         self._dbg_step += 1
 
+        # snapshot the cold-chain counters so the end-of-step log reports this
+        # step's acceptance rather than the cumulative fraction since launch
+        acc_start = {
+            id(m): (np.array(m.accepted[0], copy=True), m.num_proposals) for m in self.moves
+        }
+        self_acc_start = (np.array(self.accepted[0], copy=True), self.num_proposals)
+
         if not np.any(state.branches[self.branch_name].inds):
             ntemps, nwalkers = state.branches[self.branch_name].shape[:2]
             _accepted = np.zeros((ntemps, nwalkers), dtype=bool)
@@ -944,12 +951,25 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
 
         self.free_gpu_memory()
 
-        logger.debug(
-            "inner moves acceptance fractions: "
-            f"{ {m.__class__.__name__: (float(np.mean(m.acceptance_fraction[0])) if m.num_proposals else -1.0) for m in self.moves} }. "
-            f"elapsed: {time.time() - tic}"
+        def _step_fraction(accepted, num_proposals, start):
+            acc0, n0 = start
+            if num_proposals < n0 or np.shape(acc0) != np.shape(accepted[0]):  # re-seeded mid-step
+                acc0, n0 = 0.0, 0
+            n = num_proposals - n0
+            return float(np.mean((accepted[0] - acc0) / n)) if n > 0 else -1.0
+
+        step_fractions = {
+            m.__class__.__name__: _step_fraction(m.accepted, m.num_proposals, acc_start[id(m)])
+            for m in self.moves
+        }
+        logger.info(
+            f"{self.branch_name} inner moves acceptance fractions (this step, cold chain): "
+            f"{step_fractions}. elapsed: {time.time() - tic:.1f}s"
         )
-        logger.debug(f"mean accepted fraction: {np.mean(self.accepted[0] / self.num_proposals)}. elapsed: {time.time() - tic}")
+        logger.info(
+            f"{self.branch_name} mean accepted fraction (this step, cold chain): "
+            f"{_step_fraction(self.accepted, self.num_proposals, self_acc_start):.4f}"
+        )
 
 
 
