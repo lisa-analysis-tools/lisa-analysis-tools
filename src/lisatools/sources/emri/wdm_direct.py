@@ -1913,10 +1913,12 @@ class EMRIDirectWDM:
         to the plunge chunk is built alone with ``__call__``. Returns the array (backend xp).
         A row FEW refuses (WaveformDomainError) is left zero and listed in ``last_failed_rows``
         when ``skip_domain_errors``; otherwise the error propagates. ``last_stats``:
-        ``rows``, ``alone``, ``subs``, ``failed``, the pixel counters ``lookup_pixels`` /
-        ``chunk_pixels`` / ``dropped_pixels`` of every row (the alone rows' added to the batched
-        rows'), ``windows`` (the alone rows' chunk windows) and ``tail_layers`` (one entry per
-        alone row: the pixels its plunge chunk filled).
+        ``rows``, ``alone`` (rows built through the plunge chunk), ``subs``, ``failed``,
+        ``ended_before_window`` (rows whose inspiral ends before the window: an exact zero, not
+        counted as ``alone``), the pixel counters ``lookup_pixels`` / ``chunk_pixels`` /
+        ``dropped_pixels`` of every row (the alone rows' added to the batched rows'), ``windows``
+        (the alone rows' chunk windows) and ``tail_layers`` (one entry per alone row: the pixels
+        its plunge chunk filled).
         """
         from ...utils.exceptions import WaveformDomainError
         from .domain import few_domain_guard
@@ -1938,7 +1940,7 @@ class EMRIDirectWDM:
                            frame="icrs_special", t_fine_window=(self.data_t0, self.data_t0 + span), t_fine=t_fine)
         feeds, n_subs, rows_in, t_ends, grids = [], [], [], [], []
         stats = dict(rows=len(rows), alone=0, subs=0, failed=0, lookup_pixels=0, chunk_pixels=0,
-                     dropped_pixels=0, windows=0, tail_layers=[])
+                     dropped_pixels=0, windows=0, tail_layers=[], ended_before_window=0)
         # the alone rows' pixel counters: ADDED at the end, after the batched rows' (tot) are set
         alone_tot = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
 
@@ -1963,6 +1965,10 @@ class EMRIDirectWDM:
                             one = self(*p, **few_kwargs)
                         out_arr[r] = xp.asarray(one.arr)[:, m_lo:m_hi]
                         one_st = self.last_stats             # that single call's counters
+                        if one_st.get("ended_before_window"):
+                            # an exact zero that never touches the chunk: not a chunk row
+                            stats["ended_before_window"] += 1
+                            continue
                         for k in alone_tot:
                             alone_tot[k] += int(one_st.get(k, 0))
                         stats["windows"] += int(one_st.get("windows", 0))

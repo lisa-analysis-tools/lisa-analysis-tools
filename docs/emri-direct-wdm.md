@@ -298,7 +298,8 @@ choreography is untouched, only the scoring changes.
   `[EMRI_DIRECT]` telemetry. The `[EMRI_DIRECT] leaf N:` line ends with the lookup /
   plunge-chunk split, `| chunk rows A (tail median L px, W windows) lookup px P chunk px C
   dropped px D`: `chunk rows` are the rows built through the plunge chunk (for now each is
-  built alone, outside the batch), `tail median` the median over them of the pixels their chunk
+  built alone, outside the batch; rows whose inspiral ends before the window are an exact zero
+  and are not counted as chunk rows), `tail median` the median over them of the pixels their chunk
   filled, `windows` the chunk windows transformed, and `lookup px` / `chunk px` / `dropped px`
   the template pixels served by the lookup, by the chunk, and dropped (`fdot` off the table axis
   or `f` below 2 layers), summed over the leaf's direct batches.

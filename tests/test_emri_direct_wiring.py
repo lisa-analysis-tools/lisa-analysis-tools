@@ -588,19 +588,26 @@ class BatchDomainRefusalTest(unittest.TestCase):
         accumulate_harmonic_batch (one harmonic tripping the curvature trigger at pixel 80 of a
         128-pixel grid, a fused-kernel stand-in counting the lookup pixels before it); tag-5 rows
         stay on the lookup and are batched (response and kernel stubbed: 1000 lookup and 3
-        dropped pixels per batch)."""
+        dropped pixels per batch); tag-7 rows end before the window (the real _call_knots's
+        early exact-zero return)."""
         from lisatools.domains import WDMSettings
         from lisatools.sources.emri import wdm_direct as wd
 
         class _Plunge(wd.EMRIDirectWDM):
             def _mode_list(self, few_args, few_kwargs):
                 self._last_holder = SimpleNamespace(t_arr=np.array([0.0, 1.0e12]))
-                return [], (0.0 if int(few_args[0]) == 0 else None)
+                return [], (0.0 if int(few_args[0]) in (0, 7) else None)
 
             def _call_knots(self, few_args, few_kwargs, modes, reuse=None):
                 # the real _call_knots without FEW and the response; its last_stats as there
                 modes, chunk_start = reuse
                 wdm = self.wdm
+                if int(few_args[0]) == 7:
+                    self.last_stats = dict(modes=len(modes), n_fine=0, feed="knots",
+                                           chunk_start=chunk_start, lookup_pixels=0,
+                                           chunk_pixels=0, dropped_pixels=0,
+                                           ended_before_window=1)
+                    return SimpleNamespace(arr=np.zeros((3, wdm.Nf, wdm.Nt)))
                 n_ok = np.arange(self.pixel_edge, wdm.Nt - self.pixel_edge)
                 tn = n_ok * wdm.layer_dt
                 f = np.full_like(tn, 8.2 * wdm.layer_df)
@@ -665,6 +672,29 @@ class BatchDomainRefusalTest(unittest.TestCase):
         self.assertEqual((st["windows"], st["tail_layers"]),
                          (alone["windows"], alone["tail_layers"]))
 
+    def test_rows_ending_before_the_window_are_not_chunk_rows(self):
+        """A row whose inspiral ends before the window takes the alone branch but is an exact
+        zero that never touches the plunge chunk: counted in ended_before_window, not as a chunk
+        row, no tail entry, nothing added to the pixel counters."""
+        gen = self._gen_with_one_chunk_row()
+        gen.batch([np.full(14, 0.0)])
+        chunk = dict(gen.last_stats)
+        with mock.patch("lisatools.sources.emri.emritdionfly.EMRITDIonFly.sky",
+                        return_value=(0, 0, 0.1, 0.2, 0.3)), \
+                mock.patch("lisatools.sources.emri.emritdionfly.EMRITDIonFly.run_response",
+                           return_value=SimpleNamespace(x=np.array([[-1.0, 1.0e12]]))):
+            gen.batch([np.full(14, 5.0)])
+            look = dict(gen.last_stats)
+            gen.batch([np.full(14, 5.0), np.full(14, 0.0), np.full(14, 7.0)], chunk_rows=4)
+        st = gen.last_stats
+        self.assertEqual(st["alone"], 1)
+        self.assertEqual(len(st["tail_layers"]), 1)
+        self.assertEqual(st["ended_before_window"], 1)
+        for k in ("lookup_pixels", "chunk_pixels", "dropped_pixels"):
+            self.assertEqual(st[k], look[k] + chunk[k], k)
+        self.assertEqual((st["windows"], st["tail_layers"]),
+                         (chunk["windows"], chunk["tail_layers"]))
+
     def test_tail_layers_concatenate_across_chunks(self):
         """batch() sums the chunks' counters; the per-row tail list is concatenated."""
         gen = self._gen_with_one_chunk_row()
@@ -709,6 +739,8 @@ class BatchDomainRefusalTest(unittest.TestCase):
         out = d.batch([np.r_[5.0e4 - 700.0, np.zeros(13)]])          # ends 700 s before the start
         self.assertTrue(np.all(out == 0.0))
         self.assertEqual(d.last_failed_rows, [])
+        st = d.last_stats                                   # not a plunge-chunk row
+        self.assertEqual((st["alone"], st["ended_before_window"], st["tail_layers"]), (0, 1, []))
         with mock.patch("lisatools.sources.emri.emritdionfly.EMRITDIonFly.sky",
                         return_value=(0, 0, 0.1, 0.2, 0.3)), \
                 mock.patch("lisatools.sources.emri.wdm_direct.dense_inputs_from_holder",
