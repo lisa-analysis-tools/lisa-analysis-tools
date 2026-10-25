@@ -226,6 +226,38 @@ class HandoffBoundTest(unittest.TestCase):
                     self.assertFalse(trips, (wd, wdd))
 
 
+class NtSubKnobTest(unittest.TestCase):
+    """The plunge-chunk length: explicit ``Nt_sub`` > env ``EMRI_DIRECT_NT_SUB`` > 128, refused
+    unless it tiles (even, >= 8 so ``n_pad = Nt_sub // 4`` leaves an interior, <= Nt)."""
+
+    def _make_gen(self, **kw):
+        # the cheap construction of HandoffBoundTest._direct (grid Nt = 256)
+        from lisatools.domains import WDMSettings
+        from lisatools.sources.emri.wdm_direct import EMRIDirectWDM
+
+        table = SimpleNamespace(fdot_vals=np.array([-3.086e-7, 3.086e-7]), INTERP_METHOD="spline")
+        gen = SimpleNamespace(inspiral_generator=SimpleNamespace(inspiral_generator=_FakeIntegrator()))
+        return EMRIDirectWDM(gen, table, WDMSettings(32, 256, 112.5, force_backend="cpu"), orbits=None,
+                             tdi_config=None, t_start=0.0, data_t0=0.0, **kw)
+
+    def test_nt_sub_knob_reads_the_env(self):
+        import os
+
+        with mock.patch.dict(os.environ, {"EMRI_DIRECT_NT_SUB": "64"}):
+            self.assertEqual(self._make_gen().Nt_sub, 64)
+        with mock.patch.dict(os.environ, {"EMRI_DIRECT_NT_SUB": "64"}):
+            self.assertEqual(self._make_gen(Nt_sub=96).Nt_sub, 96)     # explicit wins
+        self.assertEqual(self._make_gen().Nt_sub, 128)
+
+    def test_nt_sub_knob_refuses_untileable_values(self):
+        import os
+
+        for bad in ("7", "6", "0", "-128", "100000"):
+            with mock.patch.dict(os.environ, {"EMRI_DIRECT_NT_SUB": bad}):
+                with self.assertRaisesRegex(ValueError, "EMRI_DIRECT_NT_SUB"):
+                    self._make_gen()
+
+
 class AssemblyTest(unittest.TestCase):
     """A8: accumulate_harmonic_batch places the lookup before the handoff and the chunk
     after it, and the sum reproduces the TD->WDM truth of a linear chirp across both."""

@@ -16,6 +16,14 @@ run's active band only (as the fit's adapter does). Each (threshold, grid, chunk
 stage split and, on a GPU, the cupy memory-pool footprint of that batch; ``--out`` appends one JSON
 line per run and a summary table (ms per template vs rows per call) closes each threshold.
 
+The lookup / plunge-chunk split: ``--nt-sub`` sets the plunge-chunk length in time layers
+(``EMRIDirectWDM(Nt_sub=...)``; default: ``EMRI_DIRECT_NT_SUB``, else 128). After every timed
+call (single template and each batch) a ``[split]`` line gives the generator's ``last_stats`` in
+the ``[EMRI_DIRECT] leaf N:`` line's wording, ``chunk rows A (tail median L px, W windows) lookup
+px P chunk px C dropped px D``, and the JSON line carries ``nt_sub``, ``chunk_rows``,
+``windows``, ``tail_median_px``, ``lookup_pixels``, ``chunk_pixels`` and ``dropped_pixels``: the
+speed test shows the split without a global-fit run.
+
 SNR and the MOJITO DATA: per threshold it prints the source's optimal SNR (production and each
 direct template) on the fit's run box -- 0.25-25 mHz, ``--edge`` pixels cropped at each end --
 against the scirdv1 XYZ sensitivity plus the fitted hyperbolic-tangent galactic foreground at
@@ -76,6 +84,9 @@ def main():
     ap.add_argument("--response", choices=("spline", "dense"), default="dense",
                     help="TDI-on-the-fly response: 'dense' (TDDenseTDIonTheFly: exact phases, geometry shared "
                          "across harmonics; needs a backend built with it) or 'spline' (TDTDIonTheFly)")
+    ap.add_argument("--nt-sub", type=int, default=None,
+                    help="plunge-chunk length in time layers (EMRIDirectWDM Nt_sub; default: "
+                         "EMRI_DIRECT_NT_SUB, else 128)")
     args = ap.parse_args()
 
     from lisatools.domains import TDSettings, TDSignal, WDMLookupTable, WDMSettings
@@ -153,8 +164,10 @@ def main():
         band = (max(0, int(np.floor(f_lo / wdm.layer_df))), min(nf, int(np.ceil(f_hi / wdm.layer_df)) + 1))
     directs = {f"{g}/{lk}": WD.EMRIDirectWDM(gen, table, wdm, orbits=orb, tdi_config=tdi, t_start=W.REF,
                                              data_t0=data_t0, mode_batch=args.mode_batch, force_backend=args.backend,
-                                             response=args.response, response_grid=g, lookup=lk, f_band=band)
+                                             response=args.response, response_grid=g, lookup=lk, f_band=band,
+                                             Nt_sub=args.nt_sub)
                for g in grids for lk in lookups}
+    nt_sub = next(iter(directs.values())).Nt_sub                       # resolved (argument > env > 128)
     pool = cp.get_default_memory_pool() if gpu else None
 
     wrap(WD.EMRIDirectWDM, "_mode_list", "1 mode list (FEW call #1 + handoff check)")
@@ -184,8 +197,26 @@ def main():
             with open(args.out, "a") as f:
                 f.write(json.dumps(rec) + "\n")
 
+    def chunk_split(st):
+        """The lookup / plunge-chunk split of a call's ``last_stats``: the ``[EMRI_DIRECT] leaf N:``
+        line's wording and the JSON fields. A single call is one row (a chunk row when it
+        transformed windows); a batch counts its batched chunk rows plus any built alone."""
+        tail = st.get("tail_layers", [])
+        if isinstance(tail, (int, np.integer)):
+            rows = 1 if st.get("windows", 0) else 0
+            tail = [int(tail)] if rows else []
+        else:
+            rows = int(st.get("chunk_rows", 0)) + int(st.get("alone", 0))
+        med = int(np.median(tail)) if len(tail) else 0
+        f = dict(chunk_rows=rows, windows=int(st.get("windows", 0)), tail_median_px=med,
+                 lookup_pixels=int(st.get("lookup_pixels", 0)), chunk_pixels=int(st.get("chunk_pixels", 0)),
+                 dropped_pixels=int(st.get("dropped_pixels", 0)))
+        txt = (f"chunk rows {rows} (tail median {med} px, {f['windows']} windows) lookup px "
+               f"{f['lookup_pixels']} chunk px {f['chunk_pixels']} dropped px {f['dropped_pixels']}")
+        return txt, f
+
     base = dict(src=args.src, days=args.days, dt=args.dt, nf=nf, nt=nt, backend=args.backend,
-                response=args.response, band=band, brick=box.brick, tobs_s=box.tobs,
+                response=args.response, nt_sub=nt_sub, band=band, brick=box.brick, tobs_s=box.tobs,
                 foreground=box.foreground, noise=box.describe(),
                 data_snr=None if box.d is None else box.data_snr)
 
@@ -224,15 +255,18 @@ def main():
                 direct(*params, mode_selection_threshold=thr)
             sync()
             t_dir = (time.perf_counter() - t0) / args.reps
-            print(f"\n[stages] response={args.response} grid/lookup={grid} thr={thr:g} modes={direct.last_stats.get('modes')} "
+            print(f"\n[stages] response={args.response} grid/lookup={grid} nt_sub={nt_sub} thr={thr:g} "
+                  f"modes={direct.last_stats.get('modes')} "
                   f"n_fine={direct.last_stats.get('n_fine')} backend={args.backend} grid Nf={nf} Nt={nt} dt={args.dt} "
                   f"({args.days:g} d): direct {t_dir * 1e3:.0f} ms, production {t_prod * 1e3:.0f} ms (per template); "
                   f"SNR direct {snr[grid]:.3f} production {snr['production']:.3f}; mm vs production "
                   f"{mmp[grid]:.3e}", flush=True)
+            split_txt, split = chunk_split(direct.last_stats)
+            print(f"[split] grid={grid} thr={thr:g} nt_sub={nt_sub} single: {split_txt}", flush=True)
             for k in [lab for lab in LABELS if lab in T]:
                 print(f"  {k:48s} {T[k] / args.reps * 1e3:8.1f} ms  ({C[k] // args.reps} calls)", flush=True)
             stages = {k.strip(): T[k] / args.reps * 1e3 for k in LABELS if k in T}
-            record(**base, thr=thr, grid=grid, chunk=0, rows=1, modes=direct.last_stats.get("modes"),
+            record(**base, **split, thr=thr, grid=grid, chunk=0, rows=1, modes=direct.last_stats.get("modes"),
                    n_response=direct.last_stats.get("n_fine"), ms_per_template=t_dir * 1e3,
                    production_ms=t_prod * 1e3, stages_ms=stages, snr_direct=snr[grid],
                    snr_production=snr["production"], snr_edge=args.edge, mm_vs_production=mmp[grid],
@@ -257,10 +291,13 @@ def main():
                 print(f"[stages] grid={grid} thr={thr:g} BATCH of {len(rows)} ({chunk} per call): {t_b * 1e3:.0f} ms "
                       f"total = {t_b / len(rows) * 1e3:.0f} ms per template (production {t_prod * 1e3:.0f}); "
                       f"gpu pool {mem:.1f} GB {direct.last_stats}", flush=True)
+                split_txt, split = chunk_split(direct.last_stats)
+                print(f"[split] grid={grid} thr={thr:g} nt_sub={nt_sub} BATCH of {len(rows)} ({chunk} per call): "
+                      f"{split_txt}", flush=True)
                 for k in [lab for lab in LABELS if lab in T]:
                     print(f"  {k:48s} {T[k] / len(rows) * 1e3:8.1f} ms per template  ({C[k]} calls)", flush=True)
                 stages = {k.strip(): T[k] / len(rows) * 1e3 for k in LABELS if k in T}
-                record(**base, thr=thr, grid=grid, chunk=chunk, rows=len(rows),
+                record(**base, **split, thr=thr, grid=grid, chunk=chunk, rows=len(rows),
                        modes=direct.last_stats.get("modes"), n_response=direct.last_stats.get("n_response"),
                        ms_per_template=t_b / len(rows) * 1e3, production_ms=t_prod * 1e3, gpu_pool_gb=mem,
                        stages_ms=stages, snr_direct=snr[grid], snr_production=snr["production"],

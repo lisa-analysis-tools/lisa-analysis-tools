@@ -14,7 +14,7 @@ mismatch is `1 - Re(O)` with no time or phase maximisation, per TDI channel X, Y
 | TDI-on-the-fly X, Y, Z matching the production response | `sources/emri/emritdionfly.py` (`frame="icrs_special"`, `n_fine`, `t_fine_window`) |
 | Restored n_ref lookup table + exact evaluation rule | `domains.py` `WDMLookupTable` (`BASIS_CYCLE="quarter_turn"`) |
 | Harmonic tracks from the FEW holder | `sources/emri/wdm_direct.py` `harmonic_tracks_from_holder` |
-| Plunge chunk (even-start 128-px chunks) | `wdm_het.py` `wdm_chunk_of_td`, `tail_chunk_plan`, `splice_chunk` |
+| Plunge chunk (even-start chunks of `Nt_sub` = 128 px, `EMRI_DIRECT_NT_SUB`) | `wdm_het.py` `wdm_chunk_of_td`, `tail_chunk_plan`, `splice_chunk` |
 | The fast template | `sources/emri/wdm_direct.py` `EMRIDirectWDM` |
 | Laptop table (layer 3600 s, Nf 180, dt 20 s) | `wdm_lookup_emri_cx_NF180_DT20_TL32_fd8x0p01_nld2.h5` (sprint root) |
 
@@ -247,6 +247,12 @@ weights it enormously. Now:
   stop. A weight on the emission time is the same for every term, so the cancellation holds and
   each term is smooth. (10-02 to 10-03 tapered each CHANNEL over 300 s before its stop instead;
   the cuts stayed inside that window and their aliased area did not go away.)
+* the chunk is `Nt_sub` time layers long (`EMRIDirectWDM(Nt_sub=...)`, env `EMRI_DIRECT_NT_SUB`,
+  default 128; the explicit argument wins; a chosen value must be even, >= 8 and <= Nt, else
+  `ValueError`): each chunk keeps its interior and discards `Nt_sub // 4` layers on each side
+  (the edge contamination, defect 7 above), so every plunging template's tail costs at least one
+  window of `Nt_sub` layers (128 = 5.3 d at 24 months) however short it is. The sweep below
+  measures shorter chunks.
 * every harmonic of a template hands off to the chunk at the earliest harmonic's pixel (the
   summed tail implies the common handoff), taken per template, never across a batch.
 * (10-25) the chunk rows of a batch are built TOGETHER (`EMRIDirectWDM._chunk_rows_batch`, also
@@ -276,6 +282,92 @@ exact Lagrange prefactor, scirdv1 + foreground):
 Against the direct model's own exact time series transformed whole, the common-handoff template
 is at mm 1.6e-6 (the per-harmonic handoff of 10-02 was at 3.9e-3: its lookup ran into the last
 hours before the plunge).
+
+#### Plunge-chunk length (`EMRI_DIRECT_NT_SUB`, 10-25)
+
+What the length changes. A template's tail starts at its common handoff (the earliest
+harmonic's curvature / `fdot` trip, from the harmonic tracks) and ends `Nt_sub // 4` pixels past
+its last pixel; it is tiled with windows of `Nt_sub` layers that each keep their interior half
+(stride `Nt_sub / 2 - 2`). Every tail pixel is therefore transformed about twice whatever
+`Nt_sub`, and the chunk cost of a row, `windows x Nt_sub` layers of dense samples, drops with a
+shorter chunk only through the end pad and the rounding of the window count (a tail of up to 62
+px is one 128-layer window). The "`Nt_sub` layers before the end" of `_chunk_start` places only
+the spline path's 80 s fine-grid segment and marks the row as a chunk row; it does not move the
+tail's start.
+
+Laptop sweep (`scripts/emri/emri_direct_wdm_gate.py --nt-sub 128,96,64,48,32 --fixed-fine-grid`,
+`GATE_DT=5`, table NF720_DT5, the synthetic plunging gate source: 42.7 d, local L1 orbits, plunge
+33.8 d into the window). **Spline response** (`GATE_RESPONSE` default: the laptop's compiled
+module has no dense kernel), Python lookup. Mismatch: worst channel of 1 - Re(O), direct vs the
+same response's dense TD transformed whole, per region of t / t_plunge, 32 px edges cropped.
+0.25-1 mHz SNR: scirdv1 XYZ + the fitted tanh foreground at Tobs 42.7 d. Leak vs 128: the
+0.25-1 mHz SNR of direct(nt_sub) - direct(128). `--modes all` did not fit the laptop on this path
+(25.8 GB peak footprint, stopped after 11 min before its first template was done), so the second
+block runs four harmonics.
+
+| harmonics | nt_sub | < 0.9 | 0.9-0.99 | >= 0.99 | 0.25-1 mHz SNR | leak vs 128 | kept interior px | windows (layers) |
+|---|---|---|---|---|---|---|---|---|
+| (2,2,0,0) | 128 | 1.0e-4 | 1.4e-5 | 8.4e-12 | 5.328 | - | 64 | 2 (256) |
+| | 96 | 1.0e-4 | 1.4e-5 | 9.2e-12 | 5.328 | 1.9e-4 | 48 | 3 (288) |
+| | 64 | 1.0e-4 | 1.4e-5 | 5.9e-10 | 5.328 | 2.1e-3 | 32 | 3 (192) |
+| | 48 | 1.0e-4 | 1.4e-5 | 1.6e-8 | 5.328 | 8.8e-3 | 24 | 4 (192) |
+| | 32 | 1.0e-4 | 1.5e-5 | 1.5e-6 | 5.349 | 0.15 | 16 | 6 (192) |
+| (2,2,0,0) (3,3,0,2) (4,4,0,1) (5,5,0,0) | 128 | 4.3e-5 | 8.1e-12 | 1.9e-11 | 4.049 | - | 64 | 3 (384) |
+| | 96 | 4.3e-5 | 1.8e-11 | 1.9e-11 | 4.049 | 4.2e-4 | 48 | 3 (288) |
+| | 64 | 4.3e-5 | 6.6e-10 | 7.9e-10 | 4.049 | 1.5e-2 | 32 | 5 (320) |
+| | 48 | 4.3e-5 | 8.5e-9 | 1.8e-8 | 4.050 | 2.4e-2 | 24 | 6 (288) |
+| | 32 | 4.3e-5 | 7.9e-7 | 1.9e-6 | 4.060 | 0.42 | 16 | 9 (288) |
+
+Reading. The `< 0.9` column is the lookup (identical for every length); the one-harmonic handoff
+is at 0.915 t_plunge, the four-harmonic one at 0.86 (its 0.9-0.99 region is all chunk). The
+0.25-1 mHz SNR of the template is the spline response's own stop (production: 5.7e-4 / 8.0e-4;
+the dense path's 120 s source taper is what removes it, above) and cannot see the chunk; the leak
+column can. The chunk's own error follows its edge contamination at `n_pad = Nt_sub // 4`
+(synthetic chirp, worst kept pixel / peak: 2.1e-6 at 128, 6.7e-6 at 96, 7.5e-5 at 64, 2.6e-4 at
+48, 2.6e-3 at 32).
+
+* **96** is the 128 template (whole-window difference 2e-11, `>= 0.99` within 1.1x, leak
+  2-4e-4): passes.
+* **64** leaves the template's band SNR unchanged, but its `>= 0.99` mismatch is 40-70x the 128
+  value (below 1e-9, four to five decades under the lookup's error) and its own leak 2e-3 to 1.5e-2
+  (production's whole 0.25-1 mHz content here: 6-8e-4): fails the within-2x criterion, acceptable
+  in absolute terms only if the dense-path gate below agrees.
+* **48, 32**: fail (`>= 0.99` 2e-8 / 2e-6; 32 also moves the 0.9-0.99 region and leaks 0.15-0.4).
+* Cost: here 96 changes the tail's dense samples by +12 % / -25 % and 64 by -25 % / -17 %
+  (one / four harmonics); the H100 `[split]` lines give EMRI 1's tail at 720 d (tail median,
+  windows) for the same arithmetic. (A fixed pad on longer chunks would cut the 2x overlap
+  itself: 24 px is enough, as 96 shows; 256-layer windows would keep 208.)
+
+Without `--fixed-fine-grid` the 80 s segment's points fall differently relative to the
+trajectory's end for 64 / 48 / 32 (one harmonic): their segment starts a whole number of layers
+before the handoff pixel, while for 128 / 96 it starts a whole number of 80 s steps before the
+end. The spline response at the stop changes (the TOF reference's 0.25-1 mHz SNR 5.3 -> 0.95) and
+the knots-fed direct template and the fine-fed TOF reference no longer agree there (`>= 0.99`
+1.3e-4, band SNR 86, identical for all three lengths). That is the
+spline path's stop, not the chunk length; production's chunk is the exact dense kernel and its
+sparse grid ignores the chunk start.
+
+**The default stays 128 until the H100 timing below is in.** On one H100, from the repo root
+(`git pull` first): the speed tests (ms per template at 8 per call and mm vs production in each
+`[summary]` / `stages.jsonl`, the lookup / chunk split in the `[split]` lines), then the gate on the
+production response (CPU on the node; `MOJITO_LIGHT_PATH` must hold `catalogues/` and
+`data/EMRI/L1/` with source 1's brick, whose orbits the gate reads; the table is the laptop's 30 MB
+file copied over, or built at that path on first use):
+
+```bash
+BACKEND=cuda13x DAYS="720" CHUNKS="8" ROWS=32 NT_SUB=128 bash scripts/emri/emri_speed_durations.sh
+BACKEND=cuda13x DAYS="720" CHUNKS="8" ROWS=32 NT_SUB=96 bash scripts/emri/emri_speed_durations.sh
+BACKEND=cuda13x DAYS="720" CHUNKS="8" ROWS=32 NT_SUB=64 bash scripts/emri/emri_speed_durations.sh
+GATE_DT=5 GATE_RESPONSE=dense python scripts/emri/emri_direct_wdm_gate.py \
+    --table wdm_lookup_emri_cx_NF720_DT5_TL32_fd8x0p01_nld2.h5 --modes all --thresh 1e-5 \
+    --nt-sub 128,96,64,48,32 --fixed-fine-grid
+```
+
+On the dense path read `direct-prod` and `res d1st` (the dense tail carries the 120 s taper the
+spline TOF reference does not, so `direct-tof` at `>= 0.99` is not the chunk's error there). A
+length passes if those stay within 2x of the 128 values; the default then changes only on Mike's
+word (`EMRI_DIRECT_NT_SUB` exported in `scripts/flagship/launcher.sh.in`, then
+`python scripts/flagship/build.py`).
 
 ## In the global fit: `EMRI_LIKELIHOOD=direct` (10-02; the 6-month launcher default and, through `auto`, the library default since 10-03)
 

@@ -35,6 +35,7 @@ Environment knobs read here (explicit arguments win unless stated): ``EMRI_DIREC
 ``pixels``, default ``sparse``), ``EMRI_DIRECT_SPARSE_DT`` (43200 s),
 ``EMRI_DIRECT_NUM_M_LAYERS`` (2; this one OVERRIDES the ``num_m_layers`` argument),
 ``EMRI_DIRECT_PLUNGE_TAPER_S`` (120 s; no argument, always read),
+``EMRI_DIRECT_NT_SUB`` (128 time layers per plunge chunk; even, >= 8, <= Nt),
 ``EMRI_DIRECT_HANDOFF_BOUND`` (``1``), ``EMRI_DIRECT_TAIL_BLOCK_ELEMS`` and
 ``EMRI_DIRECT_MODE_BLOCK_ELEMS`` (2e7), ``EMRI_DIRECT_LOOKUP_CHUNK`` (2e6), ``EMRI_TRACER``
 (``analytic``), ``EMRI_TRACER_H_FDOT`` (300 s), ``EMRI_TRACER_MAX_ELEMS`` (6e7). The response
@@ -1250,7 +1251,10 @@ class EMRIDirectWDM:
         t_start (float): FEW reference epoch (trajectory clock origin), e.g.
             ``MOJITO_REFERENCE_TIME``.
         data_t0 (float): absolute time of WDM pixel 0.
-        Nt_sub (int, optional): time layers per plunge chunk. Default ``128``.
+        Nt_sub (int, optional): time layers per plunge chunk (each chunk keeps its interior,
+            ``Nt_sub // 4`` discarded on each side). ``None`` reads ``EMRI_DIRECT_NT_SUB``
+            (default ``128``); an explicit value wins. A chosen value (argument or env) must be
+            even, ``>= 8`` and ``<= Nt``.
         n_fine (int, optional): fixed number of fine trajectory points over the window.
             Default ``None``: one per ``fine_dt`` (3600 s: direct-vs-production unchanged from
             80 s to 3600 s; 6 months: 1800 and 3600 s identical, mm 1e-7..4e-7 on CD1L EMRI 1,
@@ -1297,8 +1301,9 @@ class EMRIDirectWDM:
         last_failed_rows (list[int]): Rows of the last :meth:`batch` FEW refused.
 
     Raises:
-        ValueError: For an unknown ``feed``, ``response``, ``response_grid`` or ``lookup``, or
-            ``response="dense"`` with ``feed="fine"``.
+        ValueError: For an unknown ``feed``, ``response``, ``response_grid`` or ``lookup``,
+            ``response="dense"`` with ``feed="fine"``, or an ``Nt_sub`` (``EMRI_DIRECT_NT_SUB``)
+            that is odd, below 8 or above ``Nt``.
 
     Example:
         .. code-block:: python
@@ -1323,13 +1328,28 @@ class EMRIDirectWDM:
     DELAY_MARGIN = 600.0
 
     def __init__(self, few_gen, table, wdm_set, *, orbits, tdi_config, t_start, data_t0,
-                 Nt_sub=128, n_fine=None, fine_dt=3600.0, fine_dt_plunge=80.0, mode_batch=None,
+                 Nt_sub=None, n_fine=None, fine_dt=3600.0, fine_dt_plunge=80.0, mode_batch=None,
                  pixel_edge=8, num_m_layers=2, interp="spline", force_backend="cpu", feed="knots",
                  response="spline", response_grid=None, sparse_dt=None, lookup=None, f_band=None):
         self.few_gen, self.table, self.wdm = few_gen, table, wdm_set
         self.orbits, self.tdi_config = orbits, tdi_config
         self.t_start, self.data_t0 = float(t_start), float(data_t0)
-        self.Nt_sub, self.pixel_edge = int(Nt_sub), int(pixel_edge)
+        # plunge-chunk length [time layers] (explicit argument > env EMRI_DIRECT_NT_SUB > 128):
+        # every chunk discards n_pad = Nt_sub // 4 on each side (tail_chunk_plan needs an interior
+        # left), starts on an even pixel and fits in the grid; a tail costs at least one window.
+        # A CHOSEN value is refused unless it tiles; the built-in 128 is not checked against Nt
+        # (fixtures build the generator on 64-layer grids that never plan a chunk, as before the
+        # knob).
+        if Nt_sub is None:
+            Nt_sub = os.environ.get("EMRI_DIRECT_NT_SUB")
+        if Nt_sub is None:
+            Nt_sub = 128
+        else:
+            Nt_sub = int(Nt_sub)
+            if Nt_sub % 2 or Nt_sub < 8 or Nt_sub > int(wdm_set.Nt):
+                raise ValueError("EMRI_DIRECT_NT_SUB=%d: the plunge chunk must be an even number of layers "
+                                 ">= 8 (n_pad = Nt_sub // 4 on each side) and <= Nt" % Nt_sub)
+        self.Nt_sub, self.pixel_edge = Nt_sub, int(pixel_edge)
         self.mode_batch = None if mode_batch is None else int(mode_batch)   # None: all modes in one batch
         # layers m-num_m_layers..m+num_m_layers per pixel: a chirping carrier near a layer edge
         # puts ~2.5e-4 of its energy two layers away (A8 gate); needs table support [-2, 3) df
