@@ -1636,7 +1636,8 @@ inline void stft_get_fstat_ll_impl(
 // each param k with eps_k > 0 we perturb the shared params[k] by +-eps_k,
 // re-evaluate (d|h),(h|h) via stft_eval_block_ll (so the forward model is
 // byte-identical to get_ll), form q_+- = Re(d|h) - 0.5*Re(h|h), and write
-// grad[k] = (q_+ - q_-) / (2*eps_k). eps_k <= 0 freezes parameter k (grad 0).
+// grad[k] = (q_+ - q_-) / (p_+ - p_-), with p_+- the shifted values as they were
+// rounded (not the nominal 2*eps_k). eps_k <= 0 freezes parameter k (grad 0).
 // The constant -0.5*(d|d) term cancels in the difference, so the data
 // self-term is never needed. grad_out layout: grad_out[bin*nparams + k].
 // (Mirrors the FD/signal-het central-difference gradients.)
@@ -1687,8 +1688,11 @@ void stft_get_ll_grad_kernel(
             // Only tid 0 mutates / restores the shared params slot; the eval
             // reads it after the sync below, so no read-before-write race.
             double saved = (tid == 0) ? params[kk] : 0.0;
+            // * Exact 2 eps term to divide by, including the floating-point error of the shifts.
+            double shifted_up = saved + eps_k;
+            double shifted_down = saved - eps_k;
 
-            if (tid == 0) params[kk] = saved + eps_k;
+            if (tid == 0) params[kk] = shifted_up;
             CUDA_SYNC_THREADS;
             cmplx d_h_p, h_h_p;
             stft_eval_block_ll<TileT>(
@@ -1697,7 +1701,7 @@ void stft_get_ll_grad_kernel(
                 d_h_tmp, h_h_tmp, tid, &d_h_p, &h_h_p);
             double q_p = d_h_p.real() - 0.5 * h_h_p.real();
 
-            if (tid == 0) params[kk] = saved - eps_k;
+            if (tid == 0) params[kk] = shifted_down;
             CUDA_SYNC_THREADS;
             cmplx d_h_m, h_h_m;
             stft_eval_block_ll<TileT>(
@@ -1709,7 +1713,7 @@ void stft_get_ll_grad_kernel(
             if (tid == 0) params[kk] = saved;
             CUDA_SYNC_THREADS;
             if (tid == 0)
-                grad_out[bin_i * nparams + kk] = (q_p - q_m) / (2.0 * eps_k);
+                grad_out[bin_i * nparams + kk] = (q_p - q_m) / (shifted_up - shifted_down);
             CUDA_SYNC_THREADS;
         }
     }
@@ -1824,8 +1828,11 @@ void stft_swap_ll_grad_kernel(
                 continue;
             }
             double saved = (tid == 0) ? params_add[kk] : 0.0;
+            // * Exact 2 eps term to divide by, including the floating-point error of the shifts.
+            double shifted_up = saved + eps_k;
+            double shifted_down = saved - eps_k;
 
-            if (tid == 0) params_add[kk] = saved + eps_k;
+            if (tid == 0) params_add[kk] = shifted_up;
             CUDA_SYNC_THREADS;
             cmplx dha_p, dhr_p, aa_p, rr_p, ar_p;
             stft_eval_block_swap<TileT>(
@@ -1836,7 +1843,7 @@ void stft_swap_ll_grad_kernel(
             double S_p = dha_p.real() - dhr_p.real()
                          - 0.5 * aa_p.real() - 0.5 * rr_p.real() + ar_p.real();
 
-            if (tid == 0) params_add[kk] = saved - eps_k;
+            if (tid == 0) params_add[kk] = shifted_down;
             CUDA_SYNC_THREADS;
             cmplx dha_m, dhr_m, aa_m, rr_m, ar_m;
             stft_eval_block_swap<TileT>(
@@ -1850,7 +1857,7 @@ void stft_swap_ll_grad_kernel(
             if (tid == 0) params_add[kk] = saved;
             CUDA_SYNC_THREADS;
             if (tid == 0)
-                grad_add_out[bin_i * nparams + kk] = (S_p - S_m) / (2.0 * eps_k);
+                grad_add_out[bin_i * nparams + kk] = (S_p - S_m) / (shifted_up - shifted_down);
             CUDA_SYNC_THREADS;
         }
 
@@ -1865,8 +1872,11 @@ void stft_swap_ll_grad_kernel(
                 continue;
             }
             double saved = (tid == 0) ? params_remove[kk] : 0.0;
+            // * Exact 2 eps term to divide by, including the floating-point error of the shifts.
+            double shifted_up = saved + eps_k;
+            double shifted_down = saved - eps_k;
 
-            if (tid == 0) params_remove[kk] = saved + eps_k;
+            if (tid == 0) params_remove[kk] = shifted_up;
             CUDA_SYNC_THREADS;
             cmplx dha_p, dhr_p, aa_p, rr_p, ar_p;
             stft_eval_block_swap<TileT>(
@@ -1877,7 +1887,7 @@ void stft_swap_ll_grad_kernel(
             double S_p = dha_p.real() - dhr_p.real()
                          - 0.5 * aa_p.real() - 0.5 * rr_p.real() + ar_p.real();
 
-            if (tid == 0) params_remove[kk] = saved - eps_k;
+            if (tid == 0) params_remove[kk] = shifted_down;
             CUDA_SYNC_THREADS;
             cmplx dha_m, dhr_m, aa_m, rr_m, ar_m;
             stft_eval_block_swap<TileT>(
@@ -1891,7 +1901,7 @@ void stft_swap_ll_grad_kernel(
             if (tid == 0) params_remove[kk] = saved;
             CUDA_SYNC_THREADS;
             if (tid == 0)
-                grad_remove_out[bin_i * nparams + kk] = (S_p - S_m) / (2.0 * eps_k);
+                grad_remove_out[bin_i * nparams + kk] = (S_p - S_m) / (shifted_up - shifted_down);
             CUDA_SYNC_THREADS;
         }
     }

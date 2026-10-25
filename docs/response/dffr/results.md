@@ -18,10 +18,12 @@ Conventions:
 - The integration started from `l2d-dev` (LAT 7c12a36d, GBGPU ed22789) and ends at LAT 8f56f00e
   and GBGPU 11d5159 on `feat-dffr`. The standalone package is direct-fast-fresnel-response at
   01530a5, plus a CUDA 13 backend (2b61cdd) added for the GPU comparison.
-- Every DFFR number below was taken with `first_order_delays=True`, the default of the comp during
-  the effort. Since the review that closed it, the default is `False`, which holds each light
-  travel time constant across a segment; the scripts pass `True` explicitly, so they reproduce
-  the numbers recorded here. The accuracy with `False` is not measured.
+- Every DFFR number below was taken with `first_order_delays=True`, the default of the comp.
+  The review that closed the effort set the default to `False`, which holds each light travel
+  time constant across a segment; on 2026-10-24 the derivative checks
+  (`global_fit_dev/plans/gradients/dffr_derivative_checks.md`) measured its mismatch against the
+  truth at 0.5 mHz, 3.3e-5 to 4.1e-5 against 1.3e-7, and the default went back to `True`. The
+  scripts pass `True` explicitly, so they reproduce the numbers recorded here either way.
 - Outputs (`.npz`, `.json`, logs, figures) are kept outside git, in the author's work folder,
   `$OUT`. The full record of every step, with each intermediate capture and the steps' own
   drivers, is in the git history of this folder up to 8f56f00e (`plan.md`, `tests.md`).
@@ -266,6 +268,34 @@ waveform gives 0 at the truth.
   against 132 with the transfer functions averaged over the orbit. Recorded for the owners of
   these codes.
 
+## Derivatives at the default steps
+
+The finite-difference gradient (`get_ll_grad_stft`) and Fisher matrix (`information_matrix`)
+of the DFFR response were checked at their default steps on the same eight sources and the
+same truth at SNR 100, on the CPU and the A100, with 12 and 60 side bins (2026-10-24; script,
+results and the write-up with every number and its threshold in
+`global_fit_dev/plans/gradients/dffr_derivative_checks.md` and `global_fit_dev/scripts/gradients/`
+of the Erebor tree, outside this repository). The checks: the exact A and φ0 derivatives
+against the finite differences, a sweep of the steps over five decades, the first-order Taylor
+remainder and the even and odd parts of ln L along 24 directions, the Hessian of ln L against
+minus the Fisher matrix, and the score identity over 4096 noise draws per source. Every
+criterion holds: gradient errors at most 7.1e-5 of the 1σ score (f0 at 20 mHz) and Fisher
+entries within 2.0e-5 of sqrt(F_ii F_jj) of their tenfold-step values, the defaults at least a
+decade inside their plateaus, the Hessian within 2.2e-4 of minus the Fisher matrix per entry,
+and the covariance of the score equal to the Fisher matrix within its statistical error. The
+f0 error was the rounding of the shifted parameter f0 ± 2e-14 Hz to the nearest double (3.5e-18
+Hz apart at 20 mHz), which the kernels divided out at the nominal step. Two changes followed on
+2026-10-24: the gradient kernels of both responses (`lat_stft_kernels.hh`) divide by the distance
+of the two shifted values they used, and the DFFR gradients take the shared step table with f0
+and ḟ times 10 and the other steps times 3 (`_DFFR_GRADIENT_STEP_FACTORS` in `gbcomps.py`), which
+leaves at most 4.3e-6 of the 1σ score per component and 5.2e-5 in the Fisher metric against
+7.1e-5 and 2.3e-3 before (every check rerun with both changes, all criteria pass). The golden captures of both responses changed only in their gradient
+arrays: the kernel change moves the f0 component by the rounding of the fixtures' f0 values
+(1e-5 to 4e-5 of its scale) and the other components by at most 1.4e-10; the step table moves
+the DFFR gradients by the noise the old steps carried on the fixtures. The phase step of φ0 is
+realised to about 1e-5. Two unit tests of GBGPU (`tests/test_stft_gb_dffr.py`) keep the exact A
+and φ0 derivatives and the order of the Taylor remainder under test.
+
 ## Six waveforms on the Mojito-light data
 
 The galaxy and the instrument noise of Mojito light, read and preprocessed as the global fit does
@@ -483,10 +513,11 @@ At the review that closed the effort (2026-10-23), after every number above was 
 - The floor on the local chirp rate of a reception state is `STFT_FDOT_FLOOR` (1e-22 Hz/s), the
   floor of the TDI-on-the-fly response, instead of a setting that every caller passed with that
   value; `GBDFFRSource` moved from `gb_dffr_source.hh` into `gb_dffr.hh`.
-- `STFTGBComputations` defaults to `response="dffr"`, `first_order_delays=False`,
-  `linear_envelope=True` and `n_side_bins=12`, and `STFTComputationGroup` to
-  `linear_envelope=True`. The tests and scripts of the TDI-on-the-fly response name it, and the
-  DFFR scripts pass `first_order_delays=True`, the value of the validation.
+- `STFTGBComputations` defaults to `response="dffr"`, `linear_envelope=True` and
+  `n_side_bins=12`, and `STFTComputationGroup` to `linear_envelope=True`. The tests and scripts
+  of the TDI-on-the-fly response name it, and the DFFR scripts pass `first_order_delays=True`,
+  the value of the validation, which is the default again since 2026-10-24 (it was `False`
+  from this review to then; see the next two entries).
 
 Checks of the rebuilt environment against the captures of the removal of the diagnostics
 (`run_dffr.sh` parts `golden` and `against_existing`, both suites, the outcome of every test by
@@ -506,7 +537,10 @@ name):
 - The effect of `first_order_delays=False`, measured when the fixtures first ran with the new
   default: on the production fixtures the DFFR templates change by up to 1.0e-4 of their peak,
   (d|h) by up to 8.5e-5 and (h|h) by up to 8.0e-6 relative, and the swap cross terms by up to
-  6.5e-4. Against a time-domain truth it is not measured.
+  6.5e-4. Against the time-domain truth of the eight validation sources (60 side bins, SNR 100,
+  2026-10-24, `global_fit_dev/plans/gradients/dffr_derivative_checks.md`) it raises the mismatch
+  at 0.5 mHz from 1.3e-7 to 3.3e-5 to 4.1e-5, about 0.35 in ln L at the truth, and leaves
+  20 mHz at 3e-8. The author therefore set the default back to `True` on 2026-10-24.
 - Speed with `first_order_delays=False` against `True` (2026-10-24; the A100, the ESA production
   fixture, a year of one-day segments, 1000 and 10 000 sources, three runs of each setting in
   turn; `stft_benchmarks.py --response dffr --dffr-first-order-delays 0|1`, files in

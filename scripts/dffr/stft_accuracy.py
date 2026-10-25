@@ -398,7 +398,7 @@ def build_comp(group, orbits, t_ref, num_segments, n_side_bins, window_alpha, re
         use_midpoint=True,
         linear_envelope=True,
         response=response,
-        # * The value of every validation run; the comp defaults to False since the review.
+        # * The value of every validation run, and the comp's default again since 2026-10-24.
         first_order_delays=True,
     )
 

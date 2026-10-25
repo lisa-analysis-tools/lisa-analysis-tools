@@ -454,7 +454,7 @@ def build_production_fixture(
         use_midpoint=True,
         linear_envelope=config["linear_envelope"],
         response=response,
-        # * The value of every capture of the effort; the comp defaults to False since the review.
+        # * The value of every capture of the effort, and the comp's default again since 2026-10-24.
         first_order_delays=True,
     )
     params, cells = make_production_params(rng, band_settings, num_sources)
