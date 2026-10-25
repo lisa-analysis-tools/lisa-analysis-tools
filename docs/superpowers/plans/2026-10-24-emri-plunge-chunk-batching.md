@@ -26,6 +26,7 @@
 - The `[EMRI_DIRECT] leaf N:` line keeps its existing fields and order; new fields are APPENDED (the monitor's log parsers grep its prefix).
 - No new settings file; a new knob is an env var named for the attribute it seeds (`EMRI_DIRECT_NT_SUB`), read where the sibling knobs are read (`EMRIDirectWDM.__init__`), explicit argument > env > default.
 - Accuracy gates come from the existing scripts (`scripts/emri/emri_direct_wdm_gate.py`, `scripts/emri/emri_direct_stage_timing.py`); extend them with options, do not write new harnesses. Never hand-roll a likelihood or inner product.
+- Verification is by SPEED TESTS, not by relaunching a global fit (Mike 2026-10-24: "we should verify these changes with speed tests rather than relaunching the global fit ideally"): on the laptop the CPU timing of the synthetic plunging gate source before/after each change; on the cluster Mike runs `scripts/emri/emri_speed_durations.sh` at `DAYS=720` (one H100). The log line of Task 1 is telemetry for production; the speed scripts must show the same split (Task 3 Step 5) so nothing needs a relaunch to be read.
 
 ## Review Focus
 
@@ -112,7 +113,7 @@ git fetch origin && git rebase origin/dev   # other sessions push to dev; resolv
 git push origin HEAD:dev
 ```
 
-Report the commit hash and the exact new line format to Mike (he relaunches the 24mo to read it).
+Report the commit hash and the exact new line format to Mike. The split is read from the speed scripts (Task 3 Step 5 prints it from `emri_direct_stage_timing.py`), not from a relaunched global fit; the 24mo picks the line up whenever it is next relaunched for its own reasons.
 
 ---
 
@@ -268,7 +269,7 @@ def test_nt_sub_knob_refuses_untileable_values(self):
 
 - [ ] **Step 4: Run** `python -m unittest tests.test_emri_wdm_direct tests.test_wdm_chunk_splice` -> PASS.
 
-- [ ] **Step 5: Add `--nt-sub` to the two scripts**: `emri_direct_wdm_gate.py` (`ap.add_argument("--nt-sub", default="128", help="comma list of plunge-chunk lengths in layers")`, loop over the values, build the direct generator with `Nt_sub=v`, print the per-region table once per value with a `nt_sub=` column, plus the direct template's 0.25-1 mHz SNR under the script's noise) and `emri_direct_stage_timing.py` (`--nt-sub` int, passed to the generator, written into the JSON line). `emri_speed_durations.sh`: `NT_SUB=${NT_SUB:-128}` exported and passed as `--nt-sub "$NT_SUB"` to the stage-timing call.
+- [ ] **Step 5: Add `--nt-sub` to the two scripts**: `emri_direct_wdm_gate.py` (`ap.add_argument("--nt-sub", default="128", help="comma list of plunge-chunk lengths in layers")`, loop over the values, build the direct generator with `Nt_sub=v`, print the per-region table once per value with a `nt_sub=` column, plus the direct template's 0.25-1 mHz SNR under the script's noise) and `emri_direct_stage_timing.py` (`--nt-sub` int, passed to the generator, written into the JSON line; AND after each timed batch call print the generator's `last_stats` split in the log line's wording -- `chunk rows A (tail median L px, W windows) lookup px P chunk px C dropped px D` -- and write `chunk_rows, windows, lookup_pixels, chunk_pixels, dropped_pixels` into the JSON line, so the speed test shows the lookup / chunk split without a global-fit run). `emri_speed_durations.sh`: `NT_SUB=${NT_SUB:-128}` exported and passed as `--nt-sub "$NT_SUB"` to the stage-timing call.
 
 - [ ] **Step 6: Run the accuracy sweep on the laptop** (one python at a time; the gate source is synthetic and fits in memory; the 60-day dt 5 s equal-arm window is the proven laptop configuration):
 
@@ -296,6 +297,6 @@ git commit -m "EMRI direct: EMRI_DIRECT_NT_SUB knob + the plunge-chunk length sw
 
 ## What Mike runs on the cluster (summary)
 
-1. After Task 1's push: `git pull` on the cluster, relaunch the 24mo with its usual line; the next tar's `[EMRI_DIRECT] leaf N:` lines give the real split per leaf.
-2. After Task 2: the 720-d `emri_speed_durations.sh` before/after (also closes the "rerun pending" item of 10-03) and the fit wiring check.
-3. After Task 3: the `NT_SUB` timing pair.
+1. After Task 1's push: nothing is required; the 24mo prints the new `[EMRI_DIRECT] leaf N:` fields whenever it is next relaunched for its own reasons (`git pull` first).
+2. After Task 2: the 720-d `emri_speed_durations.sh` before/after on one H100 (`BACKEND=cuda13x DAYS="720" CHUNKS="1,8" ROWS=32`; also closes the "rerun pending" item of 10-03) and the fit wiring check -- this is the verification, no global-fit relaunch.
+3. After Task 3: the `NT_SUB` timing pair with the same script; its stage-timing output now carries the lookup / chunk split per call.
