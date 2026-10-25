@@ -7,6 +7,7 @@ exact -m partner (-1)^l Y_{l,-m} conj(A) e^{+i Phi}.
 """
 
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest import mock
 
@@ -601,10 +602,13 @@ class TracerTest(unittest.TestCase):
 
 class DenseTailBatchTest(unittest.TestCase):
     """EMRIDirectWDM._dense_td over a LIST of items, one time grid each: one kernel per block of
-    whole items (EMRI_DIRECT_TAIL_BLOCK_ELEMS bounds items x channels x samples; an item's samples
-    are never split), the channels split per item on the kernel's template axis; and
-    _dense_tail_fn mapping the (row, n0, klo, khi) pairs to their rows' items and window grids in
-    ONE _dense_td call. The kernel is a stand-in here (the compiled one: tests/test_tdi_dense.py)."""
+    whole items of one grid length (EMRI_DIRECT_TAIL_BLOCK_ELEMS bounds the block's output entries
+    -- items x channels x samples -- PLUS its items' dense amplitude inputs, 8 x harmonics x the
+    block's largest knot count; an item's samples are never split), the channels split per item on
+    the kernel's template axis; and _dense_tail_fn mapping the (row, n0, klo, khi) pairs in ONE
+    _dense_td call to ONE item per ROW, its windows' grids concatenated (a row's inputs are never
+    repeated per window), cut back into the pairs' series. The kernel is a stand-in here (the
+    compiled one: tests/test_tdi_dense.py)."""
 
     NCH = 3
 
@@ -617,9 +621,10 @@ class DenseTailBatchTest(unittest.TestCase):
                              tdi_config=SimpleNamespace(nchannels=self.NCH), t_start=0.0, data_t0=100.0)
 
     @staticmethod
-    def _item(tag, n_sub):
-        """A dense-kernel item carrying ``tag`` (as psi) and ``n_sub`` harmonics."""
-        return ((np.zeros(3), None, np.zeros((n_sub, 3), dtype=np.int32), None, None), (float(tag), 0.0, 0.0))
+    def _item(tag, n_sub, n_knots=3):
+        """A dense-kernel item carrying ``tag`` (as psi), ``n_sub`` harmonics and ``n_knots`` knots."""
+        return ((np.zeros(n_knots), None, np.zeros((n_sub, 3), dtype=np.int32), None, None),
+                (float(tag), 0.0, 0.0))
 
     @staticmethod
     def _value(tag, t, sub=None, taper=0.0):
@@ -628,10 +633,12 @@ class DenseTailBatchTest(unittest.TestCase):
         v = tag * 1e6 + np.arange(DenseTailBatchTest.NCH)[:, None] * 1e3 + np.asarray(t)[None, :] + 1e-3 * taper
         return v if sub is None else v + 0.1 * sub
 
-    def _kernel(self, calls):
+    def _kernel(self, calls, tags=None):
         def kernel(items, t_abs):
             t_abs = np.asarray(t_abs)
             calls.append(t_abs.shape)
+            if tags is not None:
+                tags.append([it[1][0] for it in items])
 
             class _Dense:
                 def channels(inner, par, sum_subs=False, stop_taper=0.0):
@@ -651,9 +658,12 @@ class DenseTailBatchTest(unittest.TestCase):
 
         d = self._direct()
         N = 40
-        items = [self._item(k + 1, 2 + k) for k in range(5)]
+        items = [self._item(k + 1, 2 + k) for k in range(5)]          # 2..6 harmonics, 3 knots each
         t_abs = np.stack([1000.0 * k + np.arange(N) for k in range(5)])
-        for budget, n_calls in ((2 * self.NCH * N, 3), (2e7, 1), (1, 5)):   # 2 items, all, 1 (at least one)
+        # the largest two-item block: items 3 and 4, outputs 2 x nch x N plus 8 x (5 + 6) x 3 inputs;
+        # no three consecutive items fit under it
+        two = 2 * self.NCH * N + 8 * (5 + 6) * 3
+        for budget, n_calls in ((two, 3), (2e7, 1), (1, 5)):          # 2 items, all, 1 (at least one)
             calls = []
             with mock.patch.dict(os.environ, {"EMRI_DIRECT_TAIL_BLOCK_ELEMS": str(budget)}), \
                     mock.patch.object(d, "_dense_kernel", side_effect=self._kernel(calls)):
@@ -677,37 +687,109 @@ class DenseTailBatchTest(unittest.TestCase):
             np.testing.assert_array_equal(per[s], self._value(4, ts, s))
         np.testing.assert_array_equal(summed, self._value(4, ts))
 
-    def test_tail_fn_maps_pairs_to_their_rows_and_window_grids(self):
+    def test_dense_inputs_count_in_the_block(self):
+        """The block budget counts each item's dense amplitude inputs (8 x harmonics x the BLOCK's
+        largest knot count) next to the outputs: with large S x K fewer items share a block."""
+        import os
+
         d = self._direct()
-        seen = []
+        N = 40
+        t_abs = np.stack([1000.0 * k + np.arange(N) for k in range(4)])
+        out_all = 4 * self.NCH * N
+        cases = (
+            ([3, 3, 3, 3], out_all + 8 * 8 * 3, [4]),         # small inputs: all four in one block
+            ([100, 100, 100, 100], out_all + 8 * 8 * 3, [1, 1, 1, 1]),   # 1600 inputs each: one per block
+            # item 1's 50 knots pad its neighbours too (K of the block), so 0 and 1 cannot pair up;
+            # 2 and 3 (3 knots) still do
+            ([3, 50, 3, 3], 1000, [1, 1, 2]),
+        )
+        for knots, budget, per_call in cases:
+            items = [self._item(k + 1, 2, n_knots=nk) for k, nk in enumerate(knots)]
+            calls = []
+            with mock.patch.dict(os.environ, {"EMRI_DIRECT_TAIL_BLOCK_ELEMS": str(budget)}), \
+                    mock.patch.object(d, "_dense_kernel", side_effect=self._kernel(calls)):
+                out = np.asarray(d._dense_td(items, t_abs, sum_subs=True))
+            self.assertEqual([c[0] for c in calls], per_call, knots)
+            for k in range(4):
+                np.testing.assert_array_equal(out[k], self._value(k + 1, t_abs[k]))
 
-        def dense_td(items, t_abs, sum_subs=False, stop_taper=0.0):
-            seen.append((items, np.asarray(t_abs), sum_subs, stop_taper))
-            return np.zeros((len(items), self.NCH, np.shape(t_abs)[-1]))
+    def test_grids_of_their_own_lengths_go_to_blocks_of_one_length(self):
+        """A list of grids of different lengths (the tail's per-row items): blocks hold items of
+        one length, each item's channels come back on its own grid (a list, or through emit)."""
+        d = self._direct()
+        items = [self._item(k + 1, 2) for k in range(4)]
+        grids = [100.0 * k + np.arange(n) for k, n in enumerate((20, 40, 20, 40))]
+        calls, tags = [], []
+        with mock.patch.object(d, "_dense_kernel", side_effect=self._kernel(calls, tags)):
+            out = d._dense_td(items, grids, sum_subs=True, stop_taper=120.0)
+            got = {}
+            res = d._dense_td(items, grids, sum_subs=True, stop_taper=120.0,
+                              emit=lambda b, arr: got.__setitem__(b, np.array(arr)))
+        self.assertIsNone(res)
+        self.assertEqual(calls[:2], [(2, 20), (2, 40)])               # one kernel per length
+        self.assertEqual(tags[:2], [[1.0, 3.0], [2.0, 4.0]])
+        for k in range(4):
+            np.testing.assert_array_equal(np.asarray(out[k]), self._value(k + 1, grids[k], taper=120.0))
+            np.testing.assert_array_equal(got[k], self._value(k + 1, grids[k], taper=120.0))
 
-        chunk_items = {3: self._item(30, 2), 5: self._item(50, 4)}
+    def _tail_values(self, d, pairs, tags):
+        """What the tail must return: each pair's row value on that pair's own window grid."""
+        return np.stack([self._value(tags[r], 100.0 + (n0 * 16 + np.arange(16 * 8)) * 5.0, taper=d.plunge_taper_s)
+                         for r, n0, _, _ in pairs])
+
+    def test_tail_fn_gives_each_row_one_item_with_its_windows_concatenated(self):
+        d = self._direct()
+        chunk_items = {3: self._item(30, 2), 5: self._item(50, 4), 6: self._item(60, 1)}
         tail = d._dense_tail_fn(chunk_items, 100.0, 16, 8, 5.0)
         self.assertTrue(tail.summed)
         self.assertEqual(tail.taper, d.plunge_taper_s)
-        pairs = [(3, 10, 2, 6), (5, 10, 2, 6), (5, 16, 2, 8)]
-        with mock.patch.object(d, "_dense_td", side_effect=dense_td):
-            out = tail(pairs)
-        self.assertEqual((len(seen), tail.calls), (1, 1))            # ONE dense call for every pair
-        items, t_abs, summed, taper = seen[0]
-        self.assertEqual([it[1][0] for it in items], [30.0, 50.0, 50.0])
-        want = np.stack([100.0 + (n0 * 16 + np.arange(16 * 8)) * 5.0 for _, n0, _, _ in pairs])
-        np.testing.assert_array_equal(t_abs, want)
-        self.assertEqual((summed, taper), (True, d.plunge_taper_s))
-        self.assertEqual(np.shape(out), (3, self.NCH, 128))
+        # row 3: one window; rows 5 and 6: two windows each
+        pairs = [(3, 10, 2, 6), (5, 10, 2, 6), (5, 16, 2, 8), (6, 12, 2, 6), (6, 18, 2, 8)]
+        calls, tags = [], []
+        with mock.patch.object(d, "_dense_td", wraps=d._dense_td) as spy, \
+                mock.patch.object(d, "_dense_kernel", side_effect=self._kernel(calls, tags)):
+            out = np.asarray(tail(pairs))
+        self.assertEqual((spy.call_count, tail.calls), (1, 1))       # ONE dense call for every pair
+        items, grids = spy.call_args[0][:2]
+        self.assertEqual([it[1][0] for it in items], [30.0, 50.0, 60.0])   # one item per ROW
+        want_grid = {r: np.concatenate([100.0 + (n0 * 16 + np.arange(128)) * 5.0 for rr, n0, _, _ in pairs if rr == r])
+                     for r in (3, 5, 6)}
+        for it, g in zip(items, grids):
+            np.testing.assert_array_equal(np.asarray(g), want_grid[int(it[1][0]) // 10])
+        # blocks by grid length: row 3 (128 samples) alone, rows 5 and 6 (256 each) together; no
+        # row's item is ever repeated per window
+        self.assertEqual(sorted(calls), [(1, 128), (2, 256)])
+        self.assertEqual(sorted(t for blk in tags for t in blk), [30.0, 50.0, 60.0])
+        self.assertEqual(out.shape, (5, self.NCH, 128))
+        np.testing.assert_array_equal(out, self._tail_values(d, pairs, {3: 30, 5: 50, 6: 60}))
+
+    def test_tail_fn_cuts_a_row_into_runs_only_when_its_windows_exceed_the_budget(self):
+        import os
+
+        d = self._direct()
+        chunk_items = {2: self._item(20, 4), 4: self._item(40, 1)}
+        tail = d._dense_tail_fn(chunk_items, 100.0, 16, 8, 5.0)
+        pairs = [(2, 10, 2, 6), (2, 16, 2, 6), (2, 22, 2, 8), (4, 30, 2, 8)]
+        # two windows of row 2 (4 harmonics, 3 knots) fit, three do not
+        budget = 2 * self.NCH * 128 + 8 * 4 * 3
+        calls, tags = [], []
+        with mock.patch.dict(os.environ, {"EMRI_DIRECT_TAIL_BLOCK_ELEMS": str(budget)}), \
+                mock.patch.object(d, "_dense_kernel", side_effect=self._kernel(calls, tags)):
+            out = np.asarray(tail(pairs))
+        self.assertEqual(sorted(calls), [(1, 128), (1, 128), (1, 256)])   # row 2: runs of 2 + 1 windows
+        self.assertEqual(sorted(t for blk in tags for t in blk), [20.0, 20.0, 40.0])
+        np.testing.assert_array_equal(out, self._tail_values(d, pairs, {2: 20, 4: 40}))
 
 
 class DenseChunkRowsTest(unittest.TestCase):
     """The production branch of EMRIDirectWDM._chunk_rows_batch (response="dense") with the
     compiled pieces stood in (response, fused lookup, dense kernel): ONE response for every chunk
     row (each on its own grid), ONE lookup over the common pixels with each harmonic stopping at
-    its ROW's handoff, ONE dense evaluation for every (row, window) pair (the row's item on the
-    pair's window grid) and ONE transform; each row's tail runs from its own handoff to a quarter
-    chunk past its own last pixel; the other rows of the batch array are untouched."""
+    its ROW's handoff, ONE dense evaluation for every (row, window) pair (one kernel item per row,
+    its windows' grids end to end) and ONE transform over the pairs; the response is released once
+    the lookup has run, before the tail; each row's tail runs from its own handoff to a quarter
+    chunk past its own last pixel; the other rows of the batch array are untouched. The stand-ins
+    are plain functions (a Mock would keep the response alive in its call records)."""
 
     NF, NT, DT, T_START, T0_OFF = 16, 128, 10.0, 1.0e6, 5000.0     # layer_dt 160 s
 
@@ -734,20 +816,27 @@ class DenseChunkRowsTest(unittest.TestCase):
             chunk_items[r] = dict(t_end=t_end, tracks=tracks, track_n=n_tr, sky=(0.1 * r, 1.0, 0.2),
                                   din=(None, None, np.zeros((len(n_hs), 3)), None, None), grid=grids[r])
         x_all = np.concatenate([np.tile(self.T_START + grids[r], (len(spec[r][1]), 1)) for r in (1, 3)])
-        seen = dict(resp=[], lookup=[], kernel=[])
+        seen = dict(resp=[], lookup=[], kernel=[], resp_alive=[])
+
+        class _Resp:                                         # weakref-able, like the real output
+            def __init__(self, x):
+                self.x = x
 
         def response(items, t_grid):
             seen["resp"].append((items, t_grid))
-            return SimpleNamespace(x=x_all)
+            resp = _Resp(x_all)
+            seen["resp_ref"] = weakref.ref(resp)
+            return resp
 
         def lookup_fn(be, out, acc4, sub_row, n_ok, m_lo):
-            def run(n_stop):
-                seen["lookup"].append((np.asarray(sub_row), np.asarray(n_ok), np.asarray(n_stop)))
+            def run(n_stop):                                 # holds the response, as the real closure
+                seen["lookup"].append((np.asarray(sub_row), np.asarray(n_ok), np.asarray(n_stop), out.x.shape))
                 return dict(lookup_pixels=1, dropped_pixels=0)
             return run
 
         def kernel(items, t_abs):
             seen["kernel"].append(([it[1][0] for it in items], np.asarray(t_abs)))
+            seen["resp_alive"].append(seen["resp_ref"]() is not None)
             vals = np.stack([np.cos(1e-3 * (k + 1) * np.asarray(t_abs[k]))[None, :].repeat(3, 0)
                              for k in range(len(items))])
 
@@ -757,10 +846,10 @@ class DenseChunkRowsTest(unittest.TestCase):
             return _Dense(), np.zeros((len(items), 4)), None, None, None
 
         out_arr = np.zeros((4, 3, self.NF, self.NT))
-        with mock.patch.object(d, "_dense_response", side_effect=response), \
-                mock.patch.object(d, "_kernel_backend", return_value="be"), \
-                mock.patch.object(d, "_lookup_fn", side_effect=lookup_fn), \
-                mock.patch.object(d, "_dense_kernel", side_effect=kernel), \
+        with mock.patch.object(d, "_dense_response", new=response), \
+                mock.patch.object(d, "_kernel_backend", new=lambda out: "be"), \
+                mock.patch.object(d, "_lookup_fn", new=lookup_fn), \
+                mock.patch.object(d, "_dense_kernel", new=kernel), \
                 mock.patch("lisatools.wdm_het.wdm_chunk_of_td", wraps=wdm_het.wdm_chunk_of_td) as tr:
             st = d._chunk_rows_batch(out_arr, chunk_items, 0, self.NF, {})
         # ONE response: every row's item and own grid, in row order
@@ -771,21 +860,27 @@ class DenseChunkRowsTest(unittest.TestCase):
         np.testing.assert_array_equal(t_grid[1], grids[3])
         # ONE lookup: the common pixels (to the later row's own end), each harmonic at its row's handoff
         self.assertEqual(len(seen["lookup"]), 1)
-        sub_row, n_ok, n_stop = seen["lookup"][0]
+        sub_row, n_ok, n_stop, _ = seen["lookup"][0]
         np.testing.assert_array_equal(sub_row, [1, 1, 3, 3, 3])
         last = {1: 96, 3: 108}                               # last pixel before each row's response end
         np.testing.assert_array_equal(n_ok, np.arange(8, last[3] + 1))
         np.testing.assert_array_equal(n_stop, [80, 80, 95, 95, 95])
-        # ONE dense evaluation for every (row, window) pair on the pair's own window grid, ONE transform
+        # ONE dense evaluation for every (row, window) pair -- one kernel item per ROW, its two
+        # windows' grids end to end -- and ONE transform over the four pairs
         self.assertEqual(len(seen["kernel"]), 1)
         psis, t_abs = seen["kernel"][0]
+        self.assertEqual(psis, [0.1, 0.1 * 3])                        # one item per row, row order
         self.assertEqual(tr.call_count, 1)
-        self.assertEqual(tr.call_args[0][0].shape[0], len(psis))
-        self.assertEqual(st["windows"], len(psis))
+        self.assertEqual(tr.call_args[0][0].shape[0], 4)
+        self.assertEqual(st["windows"], 4)
         N = self.NF * 32
-        n0s = np.rint((t_abs[:, 0] - d.data_t0) / (self.NF * self.DT)).astype(int)
-        np.testing.assert_array_equal(t_abs, d.data_t0 + (n0s[:, None] * self.NF + np.arange(N)[None, :]) * self.DT)
-        self.assertEqual(psis, [0.1, 0.1, 0.1 * 3, 0.1 * 3])          # two windows per row, row order
+        self.assertEqual(t_abs.shape, (2, 2 * N))
+        win = t_abs.reshape(2, 2, N)                                  # (row, window, sample)
+        n0s = np.rint((win[:, :, 0] - d.data_t0) / (self.NF * self.DT)).astype(int)
+        np.testing.assert_array_equal(win, d.data_t0 + (n0s[:, :, None] * self.NF + np.arange(N)) * self.DT)
+        self.assertTrue(np.all(np.diff(n0s, axis=1) > 0))
+        # the response was released before the tail ran (its only reader, the lookup, had run)
+        self.assertEqual(seen["resp_alive"], [False])
         # each row's tail: from its own handoff to a quarter chunk past its own last pixel
         self.assertEqual(st["tail_layers"], [last[1] + 1 + 8 - 80, last[3] + 1 + 8 - 95])
         self.assertEqual((st["rows"], st["lookup"], st["n_response"]), (2, "kernel", 30))

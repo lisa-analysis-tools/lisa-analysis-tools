@@ -143,6 +143,23 @@ class TDDenseTest(unittest.TestCase):
         np.testing.assert_allclose(asnumpy(ab[0]), asnumpy(a[0]), rtol=1e-12, atol=1e-15)
         np.testing.assert_allclose(asnumpy(ab[1]), asnumpy(b[0]), rtol=1e-12, atol=1e-15)
 
+    @unittest.skipUnless(_has_dense_wrap(), "the compiled backend has no TDDenseTDIWaveformWrap")
+    def test_dense_tail_batches_a_rows_windows_into_one_item(self):
+        """The plunge tail gives each row ONE kernel item, the grids of its windows end to end
+        (overlapping windows: the times are not monotonic): each pair's series == that window
+        evaluated as its own item (the per-(row, window) form it replaced), to 1e-12."""
+        from lisatools.utils.utility import asnumpy
+
+        gen, item0, item1 = self._gen_and_two_items()
+        t0 = self.t_k[0] + 3000.0
+        tail = gen._dense_tail_fn({0: item0, 1: item1}, t0, self.NF_W, self.NT_SUB_W, self.DT_W)
+        pairs = [(0, 0, 16, 46), (0, 30, 16, 46), (1, 64, 16, 48)]
+        got = asnumpy(tail(pairs))
+        per = asnumpy(gen._dense_td([item0, item0, item1], np.stack([self._window_grid(n0) for _, n0, _, _ in pairs]),
+                                    sum_subs=True, stop_taper=tail.taper))
+        self.assertEqual(got.shape, per.shape)
+        np.testing.assert_allclose(got, per, rtol=1e-12, atol=1e-15 * np.abs(per).max())
+
     def test_zero_outside_trajectory(self):
         """Delayed times past the last knot contribute nothing (plunge handled without a feed extension)."""
         from lisatools.response.tdionfly import TDDenseTDIonTheFly

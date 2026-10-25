@@ -378,6 +378,17 @@ def _lookup_python(acc, table, tracer, n_ok_h, k_h, sub_row, *, layer_df, num_m_
     return dict(lookup_pixels=int(s_all.size), dropped_pixels=dropped)
 
 
+def _run_once(fn):
+    """``fn`` callable exactly once: the call drops the reference to ``fn`` -- and so whatever its
+    closure holds (a response output) -- as it returns, while the caller still holds the
+    wrapper."""
+    box = [fn]
+
+    def run(*args, **kwargs):
+        return box.pop()(*args, **kwargs)
+    return run
+
+
 def _tail_series_of_pairs(tail_td, pairs, subs_of, summed, xp, t0, Nf, Nt_sub, dt):
     """``(len(pairs), nch, Nf * Nt_sub)``: one time series per ``(row, n0, klo, khi)`` pair.
 
@@ -1719,7 +1730,7 @@ class EMRIDirectWDM:
             return SplinedTDIOutput(out, mkn, dense.sub_temp_host)
         return ExactPhaseTDIOutput(out, tk_abs, Cs, mkn, dense.sub_temp_host)
 
-    def _dense_td(self, items, t_abs, sum_subs=False, stop_taper=0.0):
+    def _dense_td(self, items, t_abs, sum_subs=False, stop_taper=0.0, emit=None):
         """The EXACT channel time series of templates' harmonics, each item at its OWN absolute
         sample times: the real part of the dense kernel's raw TDI channels.
 
@@ -1729,51 +1740,96 @@ class EMRIDirectWDM:
         the TDI combination would have suppressed -- under the instrument noise that was a
         template SNR of ~3900 against 56 for a 720-day window holding EMRI 1's plunge.
 
-        ``items``: a list of ``n`` ``(dense inputs, (psi, lam, beta))`` (the same template may
-        appear several times: one item per (row, chunk window) pair), ``t_abs`` ``(n, N)``, one
-        grid per item. ONE :meth:`_dense_kernel` call and ONE ``channels`` call per block of
-        items; the kernel's output has a leading template axis (row ``b`` = item ``b`` of the
-        block, at times ``t_abs[b]``; with ``sum_subs`` the sum over that item's harmonics,
-        ``tdi_channels_arr[(b * nch + ch) * N + i]`` in ``lat_spline_tdi_waveform.cu``), so the
-        split per item is a slice. Blocks hold whole items -- never part of an item's samples --
-        with at most EMRI_DIRECT_TAIL_BLOCK_ELEMS (2e7) (row, channel, sample) entries, at least
-        one item (24 months, ``N = 1440 * 128``, 3 channels: 36 pairs per block).
+        ``items``: a list of ``n`` ``(dense inputs, (psi, lam, beta))``; ``t_abs``: one grid per
+        item, ``(n, N)``, or a list of ``n`` 1-D grids of any lengths (the plunge tail gives each
+        template ROW one item holding the grids of all its chunk windows concatenated,
+        :meth:`_dense_tail_fn`). The kernel evaluates every sample on its own --
+        ``channels_point(b, i, t[b * N + i])`` in ``lat_spline_tdi_waveform.cu``: a fresh knot
+        bisection per time, the stop weight from that template's own last knot -- so an item's
+        times need not be uniform, ordered or contiguous. ONE :meth:`_dense_kernel` call and ONE
+        ``channels`` call per block of items; the kernel's output has a leading template axis (row
+        ``b`` = item ``b`` of the block, at times ``t[b]``; with ``sum_subs`` the sum over that
+        item's harmonics, ``tdi_channels_arr[(b * nch + ch) * N + i]``), so the split per item is
+        a slice. Blocks hold whole items of one grid length (items of other lengths go to other
+        blocks) -- never part of an item's samples -- with at most EMRI_DIRECT_TAIL_BLOCK_ELEMS
+        (2e7) entries counting the block's output (row, channel, sample) entries AND its items'
+        dense amplitude inputs (``amp_re`` / ``amp_im``, ``(S, K - 1, 4)`` each per item, padded
+        to the block's largest ``K``: ``8 * S * K_block`` per item), at least one item.
 
         Args:
             items (list | tuple): The items; a bare ``(dense inputs, sky)`` tuple is one item.
-            t_abs (array-like): ``(n, N)`` absolute times [s]; a 1-D grid is shared by every item.
+            t_abs (array-like | list): ``(n, N)`` absolute times [s] (a 1-D grid is shared by
+                every item), or a list of ``n`` 1-D grids of their own lengths.
             sum_subs (bool, optional): Sum each item's harmonics inside the kernel. Default
                 ``False``.
             stop_taper (float, optional): Source-frame stop taper [s]
                 (``TDDenseTDIonTheFly.channels``). Default ``0``.
+            emit (callable, optional): ``emit(b, arr)`` receives item ``b``'s channels (a view
+                into its block's output: ``(nch, N_b)`` with ``sum_subs``, else ``(num_sub_b,
+                nch, N_b)``) as each block finishes, and nothing is kept (the caller copies what
+                it needs: one block's output is alive at a time). Default ``None``.
 
         Returns:
-            xp.ndarray: ``(n, nch, N)`` with ``sum_subs``, else ``(num_sub_total, nch, N)`` (the
-            items' harmonics in order); for a bare item ``(nch, N)`` / ``(num_sub, nch, N)``.
+            xp.ndarray | list | None: ``(n, nch, N)`` with ``sum_subs``, else ``(num_sub_total,
+            nch, N)`` (the items' harmonics in order); for a bare item ``(nch, N)`` /
+            ``(num_sub, nch, N)``; with a list of grids, a list of the per-item arrays; with
+            ``emit``, ``None``.
         """
         xp = self.xp
         bare = isinstance(items, tuple)
         if bare:
             items = [items]
         n = len(items)
-        t_abs = xp.asarray(t_abs, dtype=float)
-        if t_abs.ndim == 1:
-            t_abs = xp.broadcast_to(t_abs[None, :], (n, int(t_abs.size)))
-        N = int(t_abs.shape[-1])
+        ragged = isinstance(t_abs, (list, tuple))
+        if ragged:
+            grids = [xp.asarray(g, dtype=float).reshape(-1) for g in t_abs]
+            lengths = [int(g.size) for g in grids]
+        else:
+            t_abs = xp.asarray(t_abs, dtype=float)
+            if t_abs.ndim == 1:
+                t_abs = xp.broadcast_to(t_abs[None, :], (n, int(t_abs.size)))
+            lengths = [int(t_abs.shape[-1])] * n
         nch = self.tdi_config.nchannels
-        rows = np.array([1 if sum_subs else int(it[0][2].shape[0]) for it in items], dtype=np.int64)
-        offs = np.concatenate([[0], np.cumsum(rows)])
-        out = xp.empty((int(offs[-1]), nch, N))
+        n_sub = [int(it[0][2].shape[0]) for it in items]
+        n_knot = [int(np.size(it[0][0])) for it in items]
+        rows = [1 if sum_subs else s for s in n_sub]
+        offs = np.concatenate([[0], np.cumsum(rows, dtype=np.int64)])
+        out = None
+        if emit is None:
+            out = [None] * n if ragged else xp.empty((int(offs[-1]), nch, lengths[0] if n else 0))
         budget = float(os.environ.get("EMRI_DIRECT_TAIL_BLOCK_ELEMS", 2e7))
-        b0 = 0
-        while b0 < n:
-            b1 = b0 + 1                                # whole items, at least one, within the budget
-            while b1 < n and (offs[b1 + 1] - offs[b0]) * nch * N <= budget:
-                b1 += 1
-            dense, par = self._dense_kernel(items[b0:b1], t_abs[b0:b1])[:2]
-            out[int(offs[b0]):int(offs[b1])] = xp.real(dense.channels(par, sum_subs=sum_subs, stop_taper=stop_taper))
-            del dense
-            b0 = b1
+        order = sorted(range(n), key=lambda b: lengths[b])    # stable: equal lengths keep their order
+        i = 0
+        while i < n:
+            blk = [order[i]]                           # whole items of one length, at least one
+            N = lengths[blk[0]]
+            j = i + 1
+            while j < n and lengths[order[j]] == N:
+                cand = blk + [order[j]]
+                cost = (sum(rows[b] for b in cand) * nch * N
+                        + 8 * sum(n_sub[b] for b in cand) * max(n_knot[b] for b in cand))
+                if cost > budget:
+                    break
+                blk = cand
+                j += 1
+            t_blk = xp.stack([grids[b] for b in blk]) if ragged else t_abs[blk[0]:blk[-1] + 1]
+            dense, par = self._dense_kernel([items[b] for b in blk], t_blk)[:2]
+            ch = xp.real(dense.channels(par, sum_subs=sum_subs, stop_taper=stop_taper))
+            del dense, t_blk
+            o = 0
+            for b in blk:
+                piece = ch[o] if sum_subs else ch[o:o + rows[b]]
+                o += rows[b]
+                if emit is not None:
+                    emit(b, piece)
+                elif ragged:
+                    out[b] = piece
+                else:
+                    out[int(offs[b]):int(offs[b + 1])] = piece
+            del ch, piece
+            i = j
+        if emit is not None:
+            return None
         if bare and sum_subs:
             return out[0]
         return out
@@ -1783,10 +1839,16 @@ class EMRIDirectWDM:
         ``tail_td(pairs) -> (len(pairs), nch, Nf * Nt_sub)``, the exact channels of
         ``chunk_items[row]`` (``(dense inputs, (psi, lam, beta))``; a dict keyed by the
         accumulator row, or a sequence) summed over its harmonics on the window grid ``t0 + (n0 *
-        Nf + arange(Nf * Nt_sub)) * dt`` of each ``(row, n0, klo, khi)`` pair: the grids stacked,
-        ONE :meth:`_dense_td` call (every harmonic of every pair in the same kernel launch, summed
-        there; ``tail_td.summed`` makes a row's harmonics hand off together). The source amplitude
-        is tapered over the last ``plunge_taper_s`` of EMISSION time before the trajectory's end
+        Nf + arange(Nf * Nt_sub)) * dt`` of each ``(row, n0, klo, khi)`` pair, in ONE
+        :meth:`_dense_td` call (every harmonic of every pair in the same kernel launch per block,
+        summed there; ``tail_td.summed`` makes a row's harmonics hand off together). Each ROW is
+        ONE kernel item whose time array is the grids of all its pairs' windows concatenated (the
+        kernel evaluates every sample on its own), so a row's dense inputs are held once per
+        block, never once per window; each row's ``(nch, W * N)`` output is cut back into its
+        ``W`` pairs' ``(nch, N)`` series of the returned array as its block finishes. Only a row
+        whose windows alone would exceed ``EMRI_DIRECT_TAIL_BLOCK_ELEMS`` (with its inputs) is
+        split into runs of consecutive windows, one item each. The source amplitude is tapered
+        over the last ``plunge_taper_s`` of EMISSION time before the trajectory's end
         (``tail_td.taper``; ``stop_taper`` of ``TDDenseTDIonTheFly.channels``). ``tail_td.calls``
         counts the calls.
 
@@ -1800,14 +1862,36 @@ class EMRIDirectWDM:
         tapered past its end, where no pixel of the window looks."""
         taper = float(self.plunge_taper_s)
         xp = self.xp
+        nch = self.tdi_config.nchannels
         Nf, N = int(Nf), int(Nf) * int(Nt_sub)
 
         def tail_td(pairs):
             tail_td.calls += 1
-            items = [chunk_items[row] for (row, _, _, _) in pairs]
-            n0s = xp.asarray(np.array([n0 for (_, n0, _, _) in pairs], dtype=np.int64))
-            t_abs = t0 + (n0s[:, None] * Nf + xp.arange(N)[None, :]) * dt
-            return self._dense_td(items, t_abs, sum_subs=True, stop_taper=taper)
+            budget = float(os.environ.get("EMRI_DIRECT_TAIL_BLOCK_ELEMS", 2e7))
+            by_row = {}
+            for i, (row, _, _, _) in enumerate(pairs):
+                by_row.setdefault(row, []).append(i)
+            items, grids, slots = [], [], []
+            ar = xp.arange(N)
+            for row, idx in by_row.items():
+                it = chunk_items[row]
+                S, K = int(it[0][2].shape[0]), int(np.size(it[0][0]))
+                w_max = max(1, int((budget - 8 * S * K) // (nch * N)))   # windows per item within the budget
+                for j in range(0, len(idx), w_max):
+                    run = idx[j:j + w_max]
+                    n0s = xp.asarray(np.array([pairs[i][1] for i in run], dtype=np.int64))
+                    # the same per-sample arithmetic as one grid per pair, the windows end to end
+                    grids.append((t0 + (n0s[:, None] * Nf + ar[None, :]) * dt).reshape(-1))
+                    items.append(it)
+                    slots.append(run)
+            td = xp.empty((len(pairs), nch, N))
+
+            def put(b, series):                        # item b's (nch, W * N) -> its W pairs' (nch, N)
+                run = slots[b]
+                tgt = slice(run[0], run[-1] + 1) if run[-1] - run[0] + 1 == len(run) else xp.asarray(run)
+                td[tgt] = series.reshape(nch, len(run), N).transpose(1, 0, 2)
+            self._dense_td(items, grids, sum_subs=True, stop_taper=taper, emit=put)
+            return td
         tail_td.calls = 0
         tail_td.taper = taper
         tail_td.summed = True
@@ -2021,6 +2105,11 @@ class EMRIDirectWDM:
             # over the last plunge_taper_s of emission time (_dense_tail_fn)
             tail_td = self._dense_tail_fn({r: (it["din"], it["sky"]) for r, it in zip(rows, items)},
                                           self.data_t0, Nf, self.Nt_sub, dt)
+            # the tail reads only the dense inputs: the response (out, srcs and the lookup
+            # closure's references to them) is released as soon as the lookup has run, before
+            # the tail is evaluated
+            del out, srcs
+            lookup = _run_once(lookup)
         else:
             tail_td = self._spline_tail_fn({r: srcs[r][0] for r in rows}, self.data_t0, Nf, self.Nt_sub, dt)
         st = accumulate_harmonic_batch(
