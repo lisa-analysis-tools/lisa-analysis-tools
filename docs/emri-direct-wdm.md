@@ -260,13 +260,21 @@ weights it enormously. Now:
   one fused lookup kernel with every harmonic stopping at its own template's handoff, then the
   tail as `(row, window)` pairs (`accumulate_harmonic_batch`, `row_t_end`: each template's tail
   runs from its handoff to a quarter chunk past its own last pixel) -- ONE dense evaluation for
-  every pair (`_dense_tail_fn` -> `_dense_td`: one kernel launch per block of
-  `EMRI_DIRECT_TAIL_BLOCK_ELEMS`, each pair its own window grid, each template's harmonics summed
-  in the kernel -- the transform is linear, so never one transform per harmonic) and ONE
-  `wdm_chunk_of_td` over all pairs, then a pure index splice per pair. Memory of the tail: the
-  stacked pairs, `pairs x 3 x Nf Nt_sub` doubles (24 months: 4.4 MB per pair) plus the
-  transform's temporaries. A chunk row whose own response grid is too short is refused on its
-  own when it is captured, before it can join the batch's padded response.
+  every pair (`_dense_tail_fn` -> `_dense_td`: one kernel launch per block, each template ROW one
+  kernel item whose time array is the grids of all its windows end to end -- the kernel evaluates
+  every sample on its own, `channels_point` -- each row's harmonics summed in the kernel; the
+  transform is linear, so never one transform per harmonic) and ONE `wdm_chunk_of_td` over all
+  pairs, then a pure index splice per pair. Memory of the tail (10-25 fix wave): a row's dense
+  inputs (its amplitude splines, `amp_re` / `amp_im`, `8 S K` doubles for S harmonics on K knots)
+  are held once per block, not once per window; a block of rows is bounded by
+  `EMRI_DIRECT_TAIL_BLOCK_ELEMS` (2e7) counting its output entries (`rows x 3 x windows x Nf
+  Nt_sub`) PLUS those inputs (`8 x its harmonics x its largest K`), at least one row, and only a
+  row whose windows alone exceed it is cut into runs of windows; the batch's response is
+  released as soon as the lookup has run, before the tail. On top of one block: the stacked pairs
+  the transform reads, `pairs x 3 x Nf Nt_sub` doubles (24 months: 4.4 MB per pair), and the
+  transform's temporaries (`TDSignal.fft`: an all-ones window and the windowed product, each that
+  size, then the rfft). A chunk row whose own response grid is too short is refused on its own
+  when it is captured, before it can join the batch's padded response.
 
 Laptop check (dt 5 s, equal-arm orbits, 60 days around EMRI 1's plunge, against production with the
 exact Lagrange prefactor, scirdv1 + foreground):
@@ -338,6 +346,10 @@ column can. The chunk's own error follows its edge contamination at `n_pad = Nt_
   windows) for the same arithmetic. (A fixed pad on longer chunks would cut the 2x overlap
   itself: 24 px is enough, as 96 shows; 256-layer windows would keep 208.)
 
+**Recommendation:** 96 is the only accuracy-safe shorter candidate, and its speed gain is small
+(-25 % to +12 % of the tail's dense samples here); the real lever is a fixed ~24 px pad on
+longer windows (a follow-up, not this branch).
+
 Without `--fixed-fine-grid` the 80 s segment's points fall differently relative to the
 trajectory's end for 64 / 48 / 32 (one harmonic): their segment starts a whole number of layers
 before the handoff pixel, while for 128 / 96 it starts a whole number of 80 s steps before the
@@ -349,7 +361,10 @@ sparse grid ignores the chunk start.
 
 **The default stays 128 until the H100 timing below is in.** On one H100, from the repo root
 (`git pull` first): the speed tests (ms per template at 8 per call and mm vs production in each
-`[summary]` / `stages.jsonl`, the lookup / chunk split in the `[split]` lines), then the gate on the
+`[summary]` / `stages.jsonl` -- read the production row, `sparse/kernel` (sparse response grid,
+fused-kernel lookup); the other rows are the alternatives the script sweeps -- the lookup / chunk
+split in the `[split]` lines, and in the `[parity]` lines each batched row against the same row
+built alone, which must stay at the ~1e-6 relative spline-padding level), then the gate on the
 production response (CPU on the node; `MOJITO_LIGHT_PATH` must hold `catalogues/` and
 `data/EMRI/L1/` with source 1's brick, whose orbits the gate reads; the table is the laptop's 30 MB
 file copied over, or built at that path on first use):
@@ -472,8 +487,10 @@ stop area, now on every harmonic; fixed by the source-frame taper above. Pending
 both the taper and the batching): `BACKEND=cuda13x DAYS="720" CHUNKS="1,8" ROWS=32 bash
 scripts/emri/emri_speed_durations.sh` on one H100, before and after the batching commit; pass =
 mm vs production unchanged, ms per template at 8 per call below the single-template number, no
-`direct batch failed` fallback. (Laptop, CPU, `response="spline"` -- the laptop's compiled module
-has no dense kernel: synthetic plunging rows, dt 5 s, 8 rows per call: 0.58 s per chunk row
+`direct batch failed` fallback, and every `[parity]` line (after commit only: each batched row,
+two of them with the plunge moved by hours, against the same row built alone -- mm vs production
+checks only the single template) at the ~1e-6 relative spline-padding level. (Laptop, CPU,
+`response="spline"` -- the laptop's compiled module has no dense kernel: synthetic plunging rows, dt 5 s, 8 rows per call: 0.58 s per chunk row
 before, 0.56 after, 0.02 per lookup row; 76 % of it is the spline path's per-row response, which
 the dense path replaces by one sparse-grid response for all rows. The spline path now hands every
 harmonic of a row off together too: mismatch to its own response's TD->WDM transform 3.5e-4,

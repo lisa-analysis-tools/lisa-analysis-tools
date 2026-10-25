@@ -32,10 +32,13 @@
 #   TABLE, CATALOG, ORBITS (auto; equal-arm skips the data), L1_DIR (""), MOJITO_DATA_PATH
 #   (/shared/data/mojito_cache), CHUNKS ("1,2,4,8,16,32"), ROWS (32), GRIDS
 #   ("sparse,pixels"), LOOKUPS ("kernel,python"), BAND ("2.5e-4,2.5e-2"; "" = all layers), EDGE (60),
-#   FOREGROUND (on), NT_SUB (EMRI_DIRECT_NT_SUB, else 128: the plunge-chunk length in time layers,
-#   passed to the stage timing as --nt-sub and exported as EMRI_DIRECT_NT_SUB for the accuracy
-#   step; the stage timing's [split] lines -- printed below -- give the lookup / chunk split of
-#   every timed call), REPS (3), OUT (emri_speed_durations_<date>).
+#   FOREGROUND (on), NT_SUB (the plunge-chunk length in time layers; only when NT_SUB or
+#   EMRI_DIRECT_NT_SUB is set is it passed to the stage timing as --nt-sub and exported as
+#   EMRI_DIRECT_NT_SUB for the accuracy step -- unset, the generators keep their own default, 128,
+#   which a short window (Nt < 128, DAYS <= 5) may run with, while a chosen value must be <= Nt;
+#   the stage timing's [split] lines -- printed below -- give the lookup / chunk split of every
+#   timed call, its [parity] lines each batched row against the same row built alone), REPS (3),
+#   OUT (emri_speed_durations_<date>).
 #
 # Memory: a direct template holds a (3, n_m, Nt) float64 accumulator while it is built: on the
 # full grid (BAND="") 150 MB at 6 months, 300 MB at 12, 605 MB at 24; the 2.5e-4..2.5e-2 Hz
@@ -59,8 +62,12 @@ LOOKUPS=${LOOKUPS:-kernel,python}
 BAND=${BAND-2.5e-4,2.5e-2}
 EDGE=${EDGE:-60}
 FOREGROUND=${FOREGROUND:-on}
-export NT_SUB=${NT_SUB:-${EMRI_DIRECT_NT_SUB:-128}}
-export EMRI_DIRECT_NT_SUB=${NT_SUB}        # the accuracy step's generators read the same length
+NT_SUB=${NT_SUB:-${EMRI_DIRECT_NT_SUB:-}}  # unset: the generator's own default (128), never a chosen value
+nt_sub_args=()
+if [ -n "${NT_SUB}" ]; then
+  export EMRI_DIRECT_NT_SUB=${NT_SUB}      # the accuracy step's generators read the same length
+  nt_sub_args=(--nt-sub "${NT_SUB}")
+fi
 REPS=${REPS:-3}
 OUT=${OUT:-emri_speed_durations_$(date +%Y%m%d_%H%M)}
 mkdir -p "${OUT}"
@@ -71,13 +78,13 @@ common=(--backend "${BACKEND}" --dt 2.5 --src "${SRC}" --direct-table "${TABLE}"
 if [ -n "${L1_DIR}" ]; then common+=(--l1-dir "${L1_DIR}"); fi
 for days in ${DAYS}; do
   log="${OUT}/stages_${days}d.log"
-  echo "[durations] ${days} d: grids ${GRIDS}, lookups ${LOOKUPS}, band ${BAND:-all}, rows per call ${CHUNKS} over ${ROWS} rows, nt_sub ${NT_SUB} -> ${log}"
+  echo "[durations] ${days} d: grids ${GRIDS}, lookups ${LOOKUPS}, band ${BAND:-all}, rows per call ${CHUNKS} over ${ROWS} rows, nt_sub ${NT_SUB:-default} -> ${log}"
   python scripts/emri/emri_direct_stage_timing.py "${common[@]}" --days "${days}" --thresh "${THRESH}" \
     --response dense --response-grid "${GRIDS}" --lookup "${LOOKUPS}" --band-hz "${BAND}" \
-    --batch-rows "${ROWS}" --chunk-rows "${CHUNKS}" --nt-sub "${NT_SUB}" \
+    --batch-rows "${ROWS}" --chunk-rows "${CHUNKS}" ${nt_sub_args[@]+"${nt_sub_args[@]}"} \
     --reps "${REPS}" --out "${OUT}/stages.jsonl" 2>&1 | grep -v "ModeSelector\|lisaconstants\|warnings.warn" \
     > "${log}" || { echo "[durations] FAILED: ${log}"; tail -4 "${log}"; }
-  grep "^\[snr\]\|^\[data\]\|^\[speed\] orbits\|^\[split\]" "${log}" || true
+  grep "^\[snr\]\|^\[data\]\|^\[speed\] orbits\|^\[split\]\|^\[parity\]" "${log}" || true
   sed -n '/^\[summary\]/,/^$/p' "${log}" || true
   log="${OUT}/accuracy_${days}d.log"
   echo "[durations] ${days} d accuracy sparse vs pixels vs production -> ${log}"

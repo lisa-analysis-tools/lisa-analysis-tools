@@ -22,7 +22,29 @@ call (single template and each batch) a ``[split]`` line gives the generator's `
 the ``[EMRI_DIRECT] leaf N:`` line's wording, ``chunk rows A (tail median L px, W windows) lookup
 px P chunk px C dropped px D``, and the JSON line carries ``nt_sub``, ``chunk_rows``,
 ``windows``, ``tail_median_px``, ``lookup_pixels``, ``chunk_pixels`` and ``dropped_pixels``: the
-speed test shows the split without a global-fit run.
+speed test shows the split without a global-fit run. The stage list has the dense plunge tail
+(``_dense_td``: the dense channels of every (row, window) pair) as its own line inside stage 5.
+
+Batch parity (the NUMBERS of the batched path; "mm vs production" covers only the single template,
+which is a one-row batch): after every timed batch, one UNTIMED ``direct.batch(rows[:chunk],
+chunk_rows=chunk)`` (no ``consume``) is compared with each of those rows built alone, one line per
+row (laptop, 2026-10-25: ``--response spline --lookup python --dt 20 --days 16``, CD1L EMRI 1's
+plunge 10 d into the window, ``START_OFFSET_S=43891200``)::
+
+    [parity] grid=sparse/python thr=0.01 nt_sub=128 batch of 3 (3 per call) row 1: max|batch -
+    single| / max|single| 0.00e+00, mm 0.00e+00 (single: tail 60 px, 1 windows, trajectory end
+    +2.98 h vs row 0) -- pass: ~1e-6 relative, ...
+
+``max|batch[k] - single[:, m_lo:m_hi]| / max|single[:, m_lo:m_hi]|`` and the noise-weighted
+mismatch of the two on the run box (the ``mm vs production`` helper). Pass: ~1e-6 relative, the
+spline-padding level (the dense batch pads every row's response grid to the common length), not
+1e-12; the spline response gives each row its own response, so there the batch is bitwise the
+single template.
+The JSON line carries the worst row as ``parity_max_rel`` and ``parity_mm_max``. So that the batch's
+rows do not all hand off and end on one pixel (the information-matrix rows move the source by
+~1e-6 relative), batch rows 1 and 2 are copies of the source with p0 shifted to move its plunge
+by +3 and -5 WDM layers (hours; from a secant through one trial FEW call), the rest are the
+original rows.
 
 SNR and the MOJITO DATA: per threshold it prints the source's optimal SNR (production and each
 direct template) on the fit's run box -- 0.25-25 mHz, ``--edge`` pixels cropped at each end --
@@ -169,6 +191,81 @@ def main():
                for g in grids for lk in lookups}
     nt_sub = next(iter(directs.values())).Nt_sub                       # resolved (argument > env > 128)
     pool = cp.get_default_memory_pool() if gpu else None
+    m_lo, m_hi = band if band is not None else (0, nf)
+    xp = cp if gpu else np
+
+    def plunge_shifted_rows(direct, p, layers=(3.0, -5.0)):
+        """Rows of ``p`` with p0 shifted so the trajectory ends ``layers`` WDM layers later /
+        earlier (a secant through one trial FEW call on the knots: d t_end / d p0), so a batch's
+        rows hand off and end on DIFFERENT pixels; a trajectory that outlasts the FEW span (no
+        plunge to move) gets a fixed 3e-5 relative p0 step per layer instead."""
+        kw = dict(mode_selection_threshold=float(args.thresh.split(",")[0]))
+
+        def t_end(q):
+            return float(np.asarray(direct._few_knots(q, kw).t_arr)[-1])
+        e0, dp = t_end(p), 1e-5 * p[3]
+        q = list(p)
+        q[3] += dp
+        slope = (t_end(q) - e0) / dp
+        moves = abs(slope * dp) > 1.0
+        out = []
+        for L in layers:
+            q = list(p)
+            q[3] += L * wdm.layer_dt / slope if moves else L * 3e-5 * p[3]
+            out.append([float(v) for v in q])
+        how = (f"plunge moved by {', '.join(f'{L:+g}' for L in layers)} layers (d t_end / d p0 {slope:.4g} s)"
+               if moves else "no plunge inside the FEW span: fixed 3e-5 relative p0 steps per layer")
+        return out, how
+
+    def embed(band_arr):
+        """A ``(nch, n_m, Nt)`` band template on the full grid (zeros outside ``[m_lo, m_hi)``)."""
+        band_arr = xp.asarray(band_arr)
+        full = xp.zeros((band_arr.shape[0], nf, nt))
+        full[:, m_lo:m_hi] = band_arr
+        return full
+
+    def parity(direct, label, sub, chunk, thr):
+        """UNTIMED: ONE ``direct.batch(sub, chunk_rows=chunk)`` (no ``consume``) against each row
+        built alone (``direct(*row)``, the single-template path), one ``[parity]`` line per row:
+        ``max|batch[k] - single[:, m_lo:m_hi]| / max|single[:, m_lo:m_hi]|`` and the noise-weighted
+        mismatch of the two on the box (``box.match``, the mm vs production metric). Returns
+        ``(max rel, max mm)`` over the rows that are not zero."""
+        arr = direct.batch(sub, chunk_rows=chunk, mode_selection_threshold=thr)
+        rels, mms, e_ref = [], [], None
+        for k, p in enumerate(sub):
+            one = direct(*p, mode_selection_threshold=thr)
+            st1 = direct.last_stats
+            e_k = float(np.asarray(direct._last_holder.t_arr)[-1])
+            e_ref = e_k if e_ref is None else e_ref
+            s_band = xp.asarray(one.arr)[:, m_lo:m_hi]
+            del one
+            b = xp.asarray(arr[k])
+            peak = float(xp.max(xp.abs(s_band)))
+            if peak > 0:
+                rel = float(xp.max(xp.abs(b - s_band))) / peak
+                mm = box.match(embed(b), embed(s_band))
+                rels.append(rel)
+                mms.append(mm)
+                res = f"max|batch - single| / max|single| {rel:.2e}, mm {mm:.2e}"
+            else:
+                res = "single template is zero (ends before the window): " + (
+                    "batch row zero too" if float(xp.max(xp.abs(b))) == 0 else "BATCH ROW NOT ZERO")
+            print(f"[parity] grid={label} thr={thr:g} nt_sub={nt_sub} batch of {len(sub)} ({chunk} per call) "
+                  f"row {k}: {res} (single: tail {st1.get('tail_layers', 0)} px, {st1.get('windows', 0)} "
+                  f"windows, trajectory end {(e_k - e_ref) / 3600.0:+.2f} h vs row 0) -- pass: ~1e-6 "
+                  f"relative, the spline-padding level (the dense batch pads each row's response grid to "
+                  f"the common length), not 1e-12", flush=True)
+            del s_band, b
+        del arr
+        if pool is not None:
+            pool.free_all_blocks()
+        return (max(rels) if rels else float("nan")), (max(mms) if mms else float("nan"))
+
+    shifted, shift_how = [], ""
+    if args.batch_rows > 0:
+        shifted, shift_how = plunge_shifted_rows(next(iter(directs.values())), list(params))
+        print(f"[parity] batch rows 1-{len(shifted)}: p0-shifted copies of the source ({shift_how}); the "
+              f"other rows are the +/- 1e-6 information-matrix steps and jittered walkers", flush=True)
 
     wrap(WD.EMRIDirectWDM, "_mode_list", "1 mode list (FEW call #1 + handoff check)")
     wrap(type(gen), "__call__", "  FEW generator calls (both)")
@@ -181,9 +278,10 @@ def main():
     wrap(WD.EMRIDirectWDM, "_handoff_may_trip", "  handoff bound (3 fundamentals)")
     wrap(WD, "harmonic_tracks_from_holder", "3 harmonic tracks")
     wrap(WD, "tracer_from_tof_output", "4 tracer (output spline evals)")
-    wrap(WD, "accumulate_harmonic_batch", "5 lookup + scatter-add")
+    wrap(WD, "accumulate_harmonic_batch", "5 lookup + plunge tail (accumulate_harmonic_batch)")
     wrap(type(table), "get_wdm_coeffs", "  table get_wdm_coeffs")
     wrap(WD, "lookup_sum_kernel", "  FUSED lookup-sum kernel")
+    wrap(WD.EMRIDirectWDM, "_dense_td", "  dense TD tail")
     wrap(WH, "wdm_chunk_of_td", "6 plunge chunks")
 
     def prod(thr):
@@ -274,7 +372,10 @@ def main():
             summary[(grid, 0)] = t_dir * 1e3
             if args.batch_rows <= 0:
                 continue
-            rows = B.batch_rows(params, max(args.batch_rows, max(chunks)))
+            n_rows = max(args.batch_rows, max(chunks))
+            base_rows = B.batch_rows(params, n_rows)
+            # rows 1.. : the p0-shifted copies (their plunge, handoff and tail end differ by hours)
+            rows = (base_rows[:1] + shifted + base_rows[1:])[:n_rows]
             sink = lambda idx, arr: None                                 # noqa: E731 (timing only)
             for chunk in chunks:
                 direct.batch(rows[:min(2, chunk)], chunk_rows=chunk, consume=sink, mode_selection_threshold=thr)
@@ -287,22 +388,25 @@ def main():
                 direct.batch(rows, chunk_rows=chunk, consume=sink, mode_selection_threshold=thr)
                 sync()
                 t_b = time.perf_counter() - t0
+                st_b = dict(direct.last_stats)                           # before the parity run replaces it
                 mem = pool.total_bytes() / 1e9 if pool is not None else float("nan")
                 print(f"[stages] grid={grid} thr={thr:g} BATCH of {len(rows)} ({chunk} per call): {t_b * 1e3:.0f} ms "
                       f"total = {t_b / len(rows) * 1e3:.0f} ms per template (production {t_prod * 1e3:.0f}); "
-                      f"gpu pool {mem:.1f} GB {direct.last_stats}", flush=True)
-                split_txt, split = chunk_split(direct.last_stats)
+                      f"gpu pool {mem:.1f} GB {st_b}", flush=True)
+                split_txt, split = chunk_split(st_b)
                 print(f"[split] grid={grid} thr={thr:g} nt_sub={nt_sub} BATCH of {len(rows)} ({chunk} per call): "
                       f"{split_txt}", flush=True)
                 for k in [lab for lab in LABELS if lab in T]:
                     print(f"  {k:48s} {T[k] / len(rows) * 1e3:8.1f} ms per template  ({C[k]} calls)", flush=True)
                 stages = {k.strip(): T[k] / len(rows) * 1e3 for k in LABELS if k in T}
+                # the batched path's NUMBERS, untimed: the first `chunk` rows batched vs each alone
+                p_rel, p_mm = parity(direct, grid, rows[:chunk], chunk, thr)
                 record(**base, **split, thr=thr, grid=grid, chunk=chunk, rows=len(rows),
-                       modes=direct.last_stats.get("modes"), n_response=direct.last_stats.get("n_response"),
+                       modes=st_b.get("modes"), n_response=st_b.get("n_response"),
                        ms_per_template=t_b / len(rows) * 1e3, production_ms=t_prod * 1e3, gpu_pool_gb=mem,
                        stages_ms=stages, snr_direct=snr[grid], snr_production=snr["production"],
                        snr_edge=args.edge, mm_vs_production=mmp[grid], data_direct=vs.get(grid),
-                       data_production=vs.get("production"))
+                       data_production=vs.get("production"), parity_max_rel=p_rel, parity_mm_max=p_mm)
                 summary[(grid, chunk)] = t_b / len(rows) * 1e3
         cols = [0] + (chunks if args.batch_rows > 0 else [])
         head = "  ".join(f"{('single' if c == 0 else f'{c}/call'):>8s}" for c in cols)
