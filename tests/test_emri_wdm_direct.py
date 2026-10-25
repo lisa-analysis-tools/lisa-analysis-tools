@@ -311,6 +311,9 @@ class AssemblyTest(unittest.TestCase):
             layer_dt=ldt, layer_df=ldf, t0=0.0, Nt_sub=128, num_m_layers=2,
             fdot_axis_max=float(np.max(np.abs(self.table.fdot_vals))), pixel_edge=8)
         self.assertEqual(st2["chunk_pixels"], 2 * st1["chunk_pixels"])
+        # the pixels the chunk filled: once per keep range, not per sub
+        self.assertEqual(st1["tail_layers"], st1["chunk_pixels"])
+        self.assertEqual((st2["windows"], st2["tail_layers"]), (st1["windows"], st1["tail_layers"]))
         np.testing.assert_allclose(two, one, rtol=0, atol=1e-12 * np.abs(one).max())
 
     def test_common_handoff_with_a_summed_tail(self):

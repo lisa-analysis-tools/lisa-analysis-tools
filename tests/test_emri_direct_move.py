@@ -41,6 +41,7 @@ class _FakeDirect:
         self.fail_with = None
         self.refuse_dist = None
         self.calls = []
+        self.last_stats = {}           # the generator's counters of the last templates() call
 
     def templates(self, rows, **kwargs):
         rows = np.atleast_2d(np.asarray(rows, dtype=float))
@@ -214,6 +215,27 @@ class EMRIDirectParityTest(_Armed):
         self.assertEqual(len(cm.output), 1)                      # warned once per leaf
         self.assertIn("OutOfMemoryError", cm.output[0])
         self.assertIsInstance(self.move.last_batch_error, RuntimeError)
+
+    def test_stats_line_reports_the_chunk_split(self):
+        move, adapter = self.move, self.direct
+        adapter.last_stats = dict(alone=2, lookup_pixels=1000, chunk_pixels=50, dropped_pixels=3,
+                                  windows=2, tail_layers=[20, 30])
+        move.compute_like_local(_proposal_rows(2), np.array([0, 1]))    # one chunk of 2
+        with self.assertLogs(_MOD, level="INFO") as cm:
+            move._flush_stats()
+        line = [l for l in cm.output if "[EMRI_DIRECT] leaf" in l][0]
+        self.assertIn("chunk rows 2 (tail median 25 px, 2 windows)", line)
+        self.assertIn("lookup px 1000 chunk px 50 dropped px 3", line)
+
+    def test_stats_line_with_no_chunk_rows(self):
+        move, adapter = self.move, self.direct
+        adapter.last_stats = dict(alone=0, lookup_pixels=1000, chunk_pixels=0, dropped_pixels=0,
+                                  windows=0, tail_layers=[])
+        move.compute_like_local(_proposal_rows(2), np.array([0, 1]))
+        with self.assertLogs(_MOD, level="INFO") as cm:
+            move._flush_stats()
+        line = [l for l in cm.output if "[EMRI_DIRECT] leaf" in l][0]
+        self.assertIn("chunk rows 0 (tail median 0 px, 0 windows)", line)
 
     def test_fallback_scores_with_the_production_generator(self):
         """In the fit the containers' installed generator IS the direct template (the one that

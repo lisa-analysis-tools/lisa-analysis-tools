@@ -375,7 +375,9 @@ def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, 
 
     Returns:
         dict: ``lookup_pixels``, ``chunk_pixels``, ``dropped_pixels`` (plus the kernel's
-        counters with ``lookup_kernel``).
+        counters with ``lookup_kernel``), ``windows`` (plunge-chunk windows transformed) and
+        ``tail_layers`` (the pixels the chunks filled: ``khi - klo`` summed over the windows,
+        once per keep range, not per sub).
 
     Raises:
         NotImplementedError: If a plunge chunk is needed with ``sub_row`` (many templates).
@@ -400,7 +402,7 @@ def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, 
         if (common_handoff or summed) and k_h.size:
             k_h[:] = k_h.min()
     n_m = int(acc.shape[-2])
-    stats = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
+    stats = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0, windows=0, tail_layers=0)
     if lookup_kernel is not None:
         n_stop = np.where(k_h < P, n_ok_h[np.minimum(k_h, P - 1)], n_ok_h[-1] + 1) if P else np.zeros(S, int)
         stats.update(lookup_kernel(n_stop))
@@ -454,6 +456,8 @@ def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, 
             hi = min(m_lo + n_m, chunk.shape[-2])                     # chunk rows = global layers
             acc[:, :hi - m_lo, n0 + klo:n0 + khi] += chunk[:, m_lo:hi, klo:khi]
             stats["chunk_pixels"] += (khi - klo) * len(subs)
+            stats["tail_layers"] += khi - klo
+    stats["windows"] = len(windows)
     return stats
 
 
@@ -588,14 +592,16 @@ def _accumulate_harmonic_batch_loop(acc, table, tracks, tracer, n_ok, tail_td, *
         n_ok: pixel indices of the tracer/track samples (ascending).
         t0: absolute time of pixel 0.
     Returns a stats dict (lookup pixels, chunk pixels, pixels dropped before the handoff
-    because the channel fdot left the table or f was below 2 layers).
+    because the channel fdot left the table or f was below 2 layers, chunk windows, and the
+    pixels the chunks filled counted once per keep range: :func:`accumulate_harmonic_batch`'s
+    ``windows`` / ``tail_layers``).
     """
     from ...wdm_het import tail_chunk_plan, wdm_chunk_of_td
 
     amp, phase, f, fdot = tracer
     nch = amp.shape[1]
     n_ok = np.asarray(n_ok)
-    stats = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
+    stats = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0, windows=0, tail_layers=0)
     windows = {}
     for s, tr in enumerate(tracks):
         k_h = handoff_pixel(tr, layer_dt, layer_df, fdot_axis_max)
@@ -624,6 +630,8 @@ def _accumulate_harmonic_batch_loop(acc, table, tracks, tracer, n_ok, tail_td, *
             chunk = np.asarray(wdm_chunk_of_td(td_all[s], 0, Nf, Nt_sub, dt, backend=backend))
             acc[:, :chunk.shape[-2], n0 + klo:n0 + khi] += chunk[:, :, klo:khi]   # chunk rows = global layers
             stats["chunk_pixels"] += khi - klo
+        stats["tail_layers"] += sum(khi - klo for klo, khi in {(klo, khi) for _, klo, khi in items})
+    stats["windows"] = len(windows)
     return stats
 
 
@@ -1879,6 +1887,8 @@ class EMRIDirectWDM:
             for k, v in self.last_stats.items():
                 if k == "n_response":                         # a per-call grid length, not a count
                     tot[k] = max(tot.get(k, 0), v)
+                elif isinstance(v, list):                     # one entry per row (tail_layers)
+                    tot[k] = tot.get(k, []) + v
                 else:
                     tot[k] = tot.get(k, 0) + v if isinstance(v, (int, float)) else v
             if consume is not None:
@@ -1902,7 +1912,11 @@ class EMRIDirectWDM:
         harmonics, into ``(n_rows, nch, n_m, Nt)`` (layers ``f_band``). A row that hands off
         to the plunge chunk is built alone with ``__call__``. Returns the array (backend xp).
         A row FEW refuses (WaveformDomainError) is left zero and listed in ``last_failed_rows``
-        when ``skip_domain_errors``; otherwise the error propagates.
+        when ``skip_domain_errors``; otherwise the error propagates. ``last_stats``:
+        ``rows``, ``alone``, ``subs``, ``failed``, the pixel counters ``lookup_pixels`` /
+        ``chunk_pixels`` / ``dropped_pixels`` of every row (the alone rows' added to the batched
+        rows'), ``windows`` (the alone rows' chunk windows) and ``tail_layers`` (one entry per
+        alone row: the pixels its plunge chunk filled).
         """
         from ...utils.exceptions import WaveformDomainError
         from .domain import few_domain_guard
@@ -1923,12 +1937,23 @@ class EMRIDirectWDM:
         fly = EMRITDIonFly(self.few_gen, self.orbits, self.tdi_config, dt, T_traj, self.t_start,
                            frame="icrs_special", t_fine_window=(self.data_t0, self.data_t0 + span), t_fine=t_fine)
         feeds, n_subs, rows_in, t_ends, grids = [], [], [], [], []
-        stats = dict(rows=len(rows), alone=0, subs=0, failed=0)
+        stats = dict(rows=len(rows), alone=0, subs=0, failed=0, lookup_pixels=0, chunk_pixels=0,
+                     dropped_pixels=0, windows=0, tail_layers=[])
+        # the alone rows' pixel counters: ADDED at the end, after the batched rows' (tot) are set
+        alone_tot = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
+
+        def finish():
+            for k, v in alone_tot.items():
+                stats[k] += v
+            self.last_stats = stats
+            return out_arr
+
         for r, p in enumerate(rows):
             try:
                 with few_domain_guard():
                     modes, chunk_start = self._mode_list(p, few_kwargs)
                     if chunk_start is not None:              # plunge chunk: build this one alone
+                        self.last_stats = {}                 # read back below: never a stale one
                         if self.feed == "knots" and self.n_fine_fixed is None:
                             # the _mode_list above was the last FEW call: reuse it
                             kw = dict(few_kwargs)                    # as __call__ passes them
@@ -1937,6 +1962,11 @@ class EMRIDirectWDM:
                         else:
                             one = self(*p, **few_kwargs)
                         out_arr[r] = xp.asarray(one.arr)[:, m_lo:m_hi]
+                        one_st = self.last_stats             # that single call's counters
+                        for k in alone_tot:
+                            alone_tot[k] += int(one_st.get(k, 0))
+                        stats["windows"] += int(one_st.get("windows", 0))
+                        stats["tail_layers"].append(int(one_st.get("tail_layers", 0)))
                         stats["alone"] += 1
                         continue
             except WaveformDomainError:
@@ -1964,8 +1994,7 @@ class EMRIDirectWDM:
             t_ends.append(float(np.asarray(H.t_arr)[-1]))
             rows_in.append(r)
         if not feeds:
-            self.last_stats = stats
-            return out_arr
+            return finish()
         if self.response == "dense":
             out = self._dense_response(feeds, grids if self.response_grid == "sparse" else t_fine)
             stats["n_response"] = int(np.shape(out.x)[-1])
@@ -1991,8 +2020,7 @@ class EMRIDirectWDM:
                                            **kw)
             tot.update({k: st[k] for k in tot})
             stats.update(subs=S, mode_blocks=1, lookup="kernel", **tot)
-            self.last_stats = stats
-            return out_arr
+            return finish()
         # Python: tracer + lookup in blocks of harmonics (modes): every per-block array is (block,
         # nch, pixels), whatever the number of rows and the duration
         # (EMRI_DIRECT_MODE_BLOCK_ELEMS elements per such array, default 2e7 = 160 MB)
@@ -2010,5 +2038,4 @@ class EMRIDirectWDM:
                 tot[k] += st[k]
             del tracer
         stats.update(subs=S, mode_blocks=-(-S // blk), lookup="python", **tot)
-        self.last_stats = stats
-        return out_arr
+        return finish()

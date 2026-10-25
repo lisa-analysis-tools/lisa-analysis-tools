@@ -170,7 +170,8 @@ class EMRIDirectLikeMove(ResidualAddOneRemoveOneMove):
     def _new_stats():
         """Fresh per-leaf telemetry dict for the ``[EMRI_DIRECT]`` line (:meth:`_flush_stats`)."""
         return dict(leaf=None, rows=0, seconds=0.0, chunks=0, fallbacks=0, refused=0,
-                    gen_s=0.0, score_s=0.0)
+                    gen_s=0.0, score_s=0.0, chunk_rows=0, lookup_px=0, chunk_px=0, dropped_px=0,
+                    windows=0, tail_layers=[])
 
     # ------------------------------------------------------------------
     # routing
@@ -326,6 +327,14 @@ class EMRIDirectLikeMove(ResidualAddOneRemoveOneMove):
             return self._fallback(coords, idx, leaf, exc, t_gen)
         t_score = time.perf_counter()
         self._stats["gen_s"] += t_score - t_gen
+        # the lookup / plunge-chunk split of this batch (the generator's counters)
+        st = getattr(adapter, "last_stats", {}) or {}
+        self._stats["chunk_rows"] += st.get("alone", 0)
+        self._stats["lookup_px"] += st.get("lookup_pixels", 0)
+        self._stats["chunk_px"] += st.get("chunk_pixels", 0)
+        self._stats["dropped_px"] += st.get("dropped_pixels", 0)
+        self._stats["windows"] += st.get("windows", 0)
+        self._stats["tail_layers"].extend(st.get("tail_layers", []))
         ll = np.full(n, -1e300, dtype=float)
         dh = np.full(n, np.nan)
         hh = np.full(n, np.nan)
@@ -508,14 +517,25 @@ class EMRIDirectLikeMove(ResidualAddOneRemoveOneMove):
         logger.warning(msg)
 
     def _flush_stats(self):
-        """Log the finished leaf's ``[EMRI_DIRECT]`` line (if it scored rows) and reset."""
+        """Log the finished leaf's ``[EMRI_DIRECT]`` line (if it scored rows) and reset.
+
+        After ``|``: the rows built through the plunge chunk (``chunk rows``), the median of
+        their tails (the pixels each row's chunk filled), the chunk windows transformed, and the
+        template pixels served by the lookup, by the chunk and dropped (fdot off the table or
+        ``f`` below 2 layers), summed over the leaf's direct batches.
+        """
         st = self._stats
         if st["rows"]:
+            tail = st["tail_layers"]
             logger.info(
                 "[EMRI_DIRECT] leaf %s: %d rows in %d chunks, %.1f s (%.3f s/row; "
-                "generate=%.2f s, score=%.2f s), %d fallbacks, %d rows refused by FEW",
+                "generate=%.2f s, score=%.2f s), %d fallbacks, %d rows refused by FEW"
+                " | chunk rows %d (tail median %d px, %d windows)"
+                " lookup px %d chunk px %d dropped px %d",
                 st["leaf"], st["rows"], st["chunks"], st["seconds"],
                 st["seconds"] / st["rows"], st["gen_s"], st["score_s"],
                 st["fallbacks"], st["refused"],
+                st["chunk_rows"], int(np.median(tail)) if tail else 0, st["windows"],
+                st["lookup_px"], st["chunk_px"], st["dropped_px"],
             )
         self._stats = self._new_stats()

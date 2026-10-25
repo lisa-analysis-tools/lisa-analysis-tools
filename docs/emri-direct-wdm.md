@@ -295,7 +295,13 @@ choreography is untouched, only the scoring changes.
   failure of a direct chunk (GPU OOM, a missing kernel, a table error) scores the chunk through the
   container path with the production generator (not the installed one, which is the direct
   template), warned once per leaf, counted in `n_batch_fallbacks` and the
-  `[EMRI_DIRECT]` telemetry.
+  `[EMRI_DIRECT]` telemetry. The `[EMRI_DIRECT] leaf N:` line ends with the lookup /
+  plunge-chunk split, `| chunk rows A (tail median L px, W windows) lookup px P chunk px C
+  dropped px D`: `chunk rows` are the rows built through the plunge chunk (for now each is
+  built alone, outside the batch), `tail median` the median over them of the pixels their chunk
+  filled, `windows` the chunk windows transformed, and `lookup px` / `chunk px` / `dropped px`
+  the template pixels served by the lookup, by the chunk, and dropped (`fdot` off the table axis
+  or `f` below 2 layers), summed over the leaf's direct batches.
 * **Getter** `get_emri_direct_gen`: per device, reuses the FEW generator inside that device's
   production wrap (one FEW construction per device), its orbits, the REF epoch (mojito) and the
   `EMRI_EPS` threshold; refuses a table built for another `Nf`/`dt`.

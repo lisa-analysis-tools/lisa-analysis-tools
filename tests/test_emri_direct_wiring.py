@@ -583,6 +583,97 @@ class BatchDomainRefusalTest(unittest.TestCase):
         self.assertEqual(type(d).mode_calls, 3)
         self.assertEqual(type(d).reused, [([], 0.0)] * 3)
 
+    def _gen_with_one_chunk_row(self):
+        """Tag-0 rows hand off to the plunge chunk and are built alone through the REAL
+        accumulate_harmonic_batch (one harmonic tripping the curvature trigger at pixel 80 of a
+        128-pixel grid, a fused-kernel stand-in counting the lookup pixels before it); tag-5 rows
+        stay on the lookup and are batched (response and kernel stubbed: 1000 lookup and 3
+        dropped pixels per batch)."""
+        from lisatools.domains import WDMSettings
+        from lisatools.sources.emri import wdm_direct as wd
+
+        class _Plunge(wd.EMRIDirectWDM):
+            def _mode_list(self, few_args, few_kwargs):
+                self._last_holder = SimpleNamespace(t_arr=np.array([0.0, 1.0e12]))
+                return [], (0.0 if int(few_args[0]) == 0 else None)
+
+            def _call_knots(self, few_args, few_kwargs, modes, reuse=None):
+                # the real _call_knots without FEW and the response; its last_stats as there
+                modes, chunk_start = reuse
+                wdm = self.wdm
+                n_ok = np.arange(self.pixel_edge, wdm.Nt - self.pixel_edge)
+                tn = n_ok * wdm.layer_dt
+                f = np.full_like(tn, 8.2 * wdm.layer_df)
+                track = wd.HarmonicTrack((2, 2, 0, 0), tn, np.ones_like(tn), 2 * np.pi * f * tn, f,
+                                         np.zeros_like(tn), np.where(n_ok >= 80, 1.0, 0.0))
+
+                def tail_td(ts):
+                    return np.repeat(np.cos(2 * np.pi * f[0] * ts)[None, None, :], 3, axis=1)
+
+                acc = np.zeros((3, wdm.Nf, wdm.Nt))
+                totals = wd.accumulate_harmonic_batch(
+                    acc, self.table, [track], None, n_ok, tail_td, Nf=wdm.Nf, Nt=wdm.Nt,
+                    dt=wdm.data_dt, layer_dt=wdm.layer_dt, layer_df=wdm.layer_df, t0=self.data_t0,
+                    Nt_sub=self.Nt_sub, fdot_axis_max=self.fdot_axis_max,
+                    pixel_edge=self.pixel_edge,
+                    lookup_kernel=lambda n_stop: dict(lookup_pixels=3 * int(n_stop[0] - n_ok[0])))
+                self.last_stats = dict(modes=len(modes), n_fine=0, feed="knots",
+                                       chunk_start=chunk_start, lookup="kernel", **totals)
+                return SimpleNamespace(arr=acc)
+
+            def _knots_feed(self, H, p, t_fine, fly):
+                return None, np.zeros((2, 1)), None, None          # two harmonics
+
+            def _kernel_backend(self, out):
+                return "kernel"
+
+            def _lookup_fn(self, be, out, acc, sub_row, n_ok, m_lo):
+                return lambda n_stop: dict(lookup_pixels=1000, dropped_pixels=3)
+
+        table = SimpleNamespace(fdot_vals=np.array([-1.0, 1.0]), INTERP_METHOD="spline")
+        wdm = WDMSettings(32, 128, 10.0, force_backend="cpu")
+        return _Plunge(None, table, wdm, orbits=None, tdi_config=SimpleNamespace(nchannels=3),
+                       t_start=0.0, data_t0=0.0, fine_dt=100.0, Nt_sub=32)
+
+    def test_batch_stats_carry_the_alone_rows_chunk_counters(self):
+        gen = self._gen_with_one_chunk_row()
+        gen.batch([np.full(14, 0.0)], chunk_rows=4)
+        st = gen.last_stats
+        self.assertEqual(st["alone"], 1)
+        self.assertGreater(st["chunk_pixels"], 0)      # the alone row's chunk pixels are counted
+        self.assertEqual(len(st["tail_layers"]), 1)
+        self.assertGreaterEqual(st["tail_layers"][0], gen.Nt_sub // 2)  # at least one kept interior
+        self.assertGreaterEqual(st["windows"], 1)
+
+    def test_alone_rows_chunk_counters_add_to_the_batched_rows(self):
+        """On the kernel path the batched rows' counters are set by stats.update(**tot): the
+        alone row's are ADDED to them, not overwritten."""
+        gen = self._gen_with_one_chunk_row()
+        gen.batch([np.full(14, 0.0)])
+        alone = dict(gen.last_stats)
+        with mock.patch("lisatools.sources.emri.emritdionfly.EMRITDIonFly.sky",
+                        return_value=(0, 0, 0.1, 0.2, 0.3)), \
+                mock.patch("lisatools.sources.emri.emritdionfly.EMRITDIonFly.run_response",
+                           return_value=SimpleNamespace(x=np.array([[-1.0, 1.0e12]]))):
+            gen.batch([np.full(14, 5.0), np.full(14, 0.0)], chunk_rows=4)
+        st = gen.last_stats
+        self.assertEqual((st["alone"], st["subs"], st["lookup"]), (1, 2, "kernel"))
+        self.assertGreater(alone["lookup_pixels"], 0)
+        self.assertEqual(st["lookup_pixels"], 1000 + alone["lookup_pixels"])
+        self.assertEqual(st["dropped_pixels"], 3 + alone["dropped_pixels"])
+        self.assertEqual(st["chunk_pixels"], alone["chunk_pixels"])
+        self.assertEqual((st["windows"], st["tail_layers"]),
+                         (alone["windows"], alone["tail_layers"]))
+
+    def test_tail_layers_concatenate_across_chunks(self):
+        """batch() sums the chunks' counters; the per-row tail list is concatenated."""
+        gen = self._gen_with_one_chunk_row()
+        gen.batch([np.full(14, 0.0)] * 2, chunk_rows=1)
+        st = gen.last_stats
+        self.assertEqual(st["alone"], 2)
+        self.assertEqual(len(st["tail_layers"]), 2)
+        self.assertEqual(st["tail_layers"][0], st["tail_layers"][1])
+
     def test_without_skip_the_refusal_is_typed(self):
         from lisatools.utils.exceptions import WaveformDomainError
 
