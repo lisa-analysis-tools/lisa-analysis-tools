@@ -19,7 +19,9 @@ wavelet grid without any dense time-domain transform:
 4. A harmonic whose local-quadratic model fails (curvature or ``|fdot|`` beyond the table
    axis, :func:`handoff_pixel`) hands off to the plunge chunk: the exact dense TD of the
    channels over even-start chunks of ``Nt_sub`` time layers, transformed with
-   :func:`lisatools.wdm_het.wdm_chunk_of_td`.
+   :func:`lisatools.wdm_het.wdm_chunk_of_td`. In a batch every template's chunks are built
+   together: one dense evaluation for all (template, chunk window) pairs, each template's
+   harmonics summed in the kernel, and one transform (:func:`accumulate_harmonic_batch`).
 
 Indexing conventions: pixel (time layer) ``n`` of the full grid is centred at the absolute time
 ``data_t0 + n * layer_dt``; frequency layer ``m`` is the global layer index ``0 .. Nf - 1``
@@ -335,52 +337,148 @@ def _scatter_add(xp, acc, idx, vals):
         cupyx.scatter_add(acc, idx, vals)
 
 
+def _lookup_python(acc, table, tracer, n_ok_h, k_h, sub_row, *, layer_df, num_m_layers, fdot_axis_max, m_lo,
+                   lookup_chunk=None):
+    """The Python n_ref lookup of :func:`accumulate_harmonic_batch`: ONE table evaluation for
+    every (sub, channel, pixel) before each sub's handoff index ``k_h[s]`` into ``n_ok_h``
+    (skipping pixels whose channel ``|fdot|`` leaves the table or whose ``f <= 2 layer_df``) and
+    one scatter-add into ``acc`` (``(nch, n_m, Nt)``, or ``(n_rows, nch, n_m, Nt)`` with
+    ``sub_row``), in blocks of ``lookup_chunk`` entries (env ``EMRI_DIRECT_LOOKUP_CHUNK``,
+    2,000,000). Returns ``dict(lookup_pixels, dropped_pixels)``."""
+    from ...utils.utility import get_array_module
+
+    xp = get_array_module(acc)
+    n_m = int(acc.shape[-2])
+    amp, phase, f, fdot = (xp.asarray(a) for a in tracer)
+    nch = amp.shape[1]
+    P = int(np.size(n_ok_h))
+    n_ok_x = xp.asarray(n_ok_h)
+    before = xp.arange(P)[None, :] < xp.asarray(k_h)[:, None]                       # (S, P)
+    sel = before[:, None, :] & (xp.abs(fdot) <= fdot_axis_max) & (f > 2 * layer_df)  # (S, C, P)
+    dropped = int(nch * int(before.sum()) - int(sel.sum()))
+    s_all, c_all, p_all = xp.nonzero(sel)
+    chunk = int(lookup_chunk or os.environ.get("EMRI_DIRECT_LOOKUP_CHUNK", 2_000_000))
+    sub_row_x = None if sub_row is None else xp.asarray(sub_row)
+    for j0 in range(0, int(s_all.size), chunk):
+        s_i, c_i, p_i = s_all[j0:j0 + chunk], c_all[j0:j0 + chunk], p_all[j0:j0 + chunk]
+        co, mm = table.get_wdm_coeffs(amp[s_i, c_i, p_i], phase[s_i, c_i, p_i], f[s_i, c_i, p_i],
+                                      fdot[s_i, c_i, p_i], n_ok_x[p_i],
+                                      num_m_layers=num_m_layers, out_of_support="zero")
+        co, mm = xp.asarray(co), xp.asarray(mm)
+        n_e = n_ok_x[p_i]
+        r_i = None if sub_row_x is None else sub_row_x[s_i]
+        for c in range(co.shape[1]):
+            good = (mm[:, c] >= m_lo) & (mm[:, c] < m_lo + n_m)
+            idx = (c_i[good], mm[good, c] - m_lo, n_e[good])
+            if r_i is not None:
+                idx = (r_i[good],) + idx
+            _scatter_add(xp, acc, idx, co[good, c])
+        del co, mm
+    return dict(lookup_pixels=int(s_all.size), dropped_pixels=dropped)
+
+
+def _tail_series_of_pairs(tail_td, pairs, subs_of, summed, xp, t0, Nf, Nt_sub, dt):
+    """``(len(pairs), nch, Nf * Nt_sub)``: one time series per ``(row, n0, klo, khi)`` pair.
+
+    A pairs-form ``tail_td`` (``tail_td.by_pairs``, production: :meth:`EMRIDirectWDM._dense_tail_fn`)
+    is called ONCE with every pair and returns them summed over each pair's row harmonics. A
+    single-template ``tail_td(ts)`` (``(num_sub, nch, n)``, or ``(nch, n)`` when summed; the
+    reference loop and the synthetic tests use it) is evaluated once per window ``n0`` and each
+    pair takes its subs' sum (``subs_of[pair]``)."""
+    if getattr(tail_td, "by_pairs", False):
+        if not summed:
+            raise ValueError("a pairs-form tail_td must return each pair summed over its row's harmonics "
+                             "(tail_td.summed)")
+        return xp.asarray(tail_td(pairs))
+    if summed and len({r for r, _, _, _ in pairs}) > 1:
+        raise ValueError("a summed tail_td(ts) sums every sub of the call: it cannot serve several "
+                         "templates (give it the pairs form, tail_td.by_pairs)")
+    out, td_n0, n0_now = None, None, None
+    for i, key in enumerate(pairs):
+        n0 = key[1]
+        if n0 != n0_now:                                  # pairs are ordered by (row, n0): one evaluation per window
+            td_n0 = xp.asarray(tail_td(t0 + (n0 * Nf + xp.arange(Nf * Nt_sub)) * dt))
+            n0_now = n0
+        if summed:
+            series = td_n0
+        else:
+            subs = subs_of[key]
+            series = td_n0[subs[0]] if len(subs) == 1 else td_n0[xp.asarray(np.asarray(subs))].sum(axis=0)
+        if out is None:
+            out = xp.empty((len(pairs),) + tuple(series.shape))
+        out[i] = series
+    return out
+
+
 def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, Nt, dt, layer_dt,
                               layer_df, t0, Nt_sub=128, num_m_layers=2, fdot_axis_max=np.inf,
                               pixel_edge=8, backend="cpu", sub_row=None, lookup_chunk=None, m_lo=0,
-                              num_sub=None, lookup_kernel=None, common_handoff=False):
+                              num_sub=None, lookup_kernel=None, common_handoff=False, row_t_end=None):
     """Vectorised :func:`_accumulate_harmonic_batch_loop`: ONE table evaluation for every
     (sub, channel, pixel) of the batch and one scatter-add, on the array module of ``acc``
-    (numpy or cupy). Same arguments, same result up to summation order. Adds in place into
-    ``acc``: the lookup part over the pixels before each sub's handoff (skipping pixels whose
-    channel ``|fdot|`` leaves the table or whose ``f <= 2 layer_df``), then the plunge chunks
-    (``tail_chunk_plan`` windows ending a quarter chunk past the last tracked pixel, capped at
-    ``Nt - pixel_edge``; ``wdm_chunk_of_td`` of ``tail_td`` per window and keep range).
+    (numpy or cupy), then every plunge chunk of every template in ONE tail evaluation and ONE
+    transform. Same arguments, same result up to summation order. Adds in place into ``acc``:
+    the lookup part over the pixels before each sub's handoff (skipping pixels whose channel
+    ``|fdot|`` leaves the table or whose ``f <= 2 layer_df``), then the plunge chunks
+    (``tail_chunk_plan`` windows from the handoff to a quarter chunk past the template's last
+    tracked pixel, capped at ``Nt - pixel_edge``).
+
+    The plunge tail is built as ``pairs = [(row, n0, klo, khi), ...]`` -- one per template row,
+    chunk window ``n0`` and keep range ``[klo, khi)`` (subs of a row sharing a window and a keep
+    range are one pair: the transform is linear) -- then ONE ``tail_td`` call for every pair
+    (:func:`_tail_series_of_pairs`; production: every harmonic of every pair in one dense kernel
+    launch, summed there), ONE ``wdm_chunk_of_td`` over all pairs (it takes leading axes), and a
+    pure index splice per pair ``acc[row, :, :, n0 + klo:n0 + khi] += chunk[i, :, m_lo:..,
+    klo:khi]``. A single template (``sub_row=None``) goes through the same code with ``row = 0``.
 
     The common arguments are those of :func:`_accumulate_harmonic_batch_loop`: ``acc``
-    (``(nch, n_m, Nt)``, or ``(n_templates, nch, n_m, Nt)`` with ``sub_row``), ``table``
+    (``(nch, n_m, Nt)``, or ``(n_rows, nch, n_m, Nt)`` with ``sub_row``), ``table``
     (:class:`~lisatools.domains.WDMLookupTable`), ``tracer``, ``n_ok`` (ascending absolute
-    pixel indices of the tracer samples), ``tail_td`` (``ts -> (num_sub, nch, ts.size)``, or
-    ``(nch, ts.size)`` when ``tail_td.summed``), the grid ``Nf``, ``Nt``, ``dt``,
-    ``layer_dt``, ``layer_df``, ``t0`` (absolute time of pixel 0), ``Nt_sub``,
-    ``num_m_layers``, ``fdot_axis_max``, ``pixel_edge`` and ``backend``.
+    pixel indices of the tracer samples), the grid ``Nf``, ``Nt``, ``dt``, ``layer_dt``,
+    ``layer_df``, ``t0`` (absolute time of pixel 0), ``Nt_sub``, ``num_m_layers``,
+    ``fdot_axis_max``, ``pixel_edge`` and ``backend``.
 
-    ``tracks``: the subs' :class:`HarmonicTrack` (their handoff pixels), or ``None`` when no
-    sub hands off inside ``n_ok`` (then ``num_sub`` or the tracer gives the number of subs).
-    ``sub_row`` (optional, length num_sub): the template each sub belongs to; ``acc`` is then
-    ``(n_templates, nch, n_m, Nt)`` and many templates accumulate in one call (no plunge
-    chunks allowed in that mode).
+    ``tail_td``: the plunge chunk's dense time series. The pairs form (``tail_td.by_pairs``):
+    ``pairs -> (len(pairs), nch, Nf * Nt_sub)``, each pair summed over its row's harmonics on the
+    window grid ``t0 + (n0 * Nf + arange(Nf * Nt_sub)) * dt`` (needs ``tail_td.summed``). The
+    single-template form: ``ts -> (num_sub, nch, ts.size)``, or ``(nch, ts.size)`` when
+    ``tail_td.summed`` (one template only).
+    ``tracks``: the subs' :class:`HarmonicTrack` (their handoff pixels; a ``None`` entry never
+    hands off), or ``None`` when no sub hands off inside ``n_ok`` (then ``num_sub`` or the
+    tracer gives the number of subs).
+    ``sub_row`` (optional, length num_sub): the template row of ``acc`` each sub belongs to;
+    ``acc`` is then ``(n_rows, nch, n_m, Nt)`` and many templates accumulate in one call.
+    ``row_t_end`` (optional, ``(n_rows,)``, absolute clock): each row's last tracked time; its
+    pixels are those of ``n_ok`` with ``t0 + n * layer_dt <= row_t_end[row]`` (a prefix of
+    ``n_ok``: its tracks need cover only that prefix, and its tracer values past it never
+    contribute), its lookup stops there and its tail ends a quarter chunk past its own last
+    pixel. ``None``: every row has all of ``n_ok``.
     ``m_lo``: ``acc`` holds layers ``m_lo .. m_lo + n_m - 1`` (``n_m = acc.shape[-2]``) only;
     the rest is dropped.
     ``lookup_chunk``: max (sub, channel, pixel) entries per table call (bounds the lookup's
     temporaries: ~6 arrays of (entries, 2 num_m_layers + 1) doubles); default from env
     EMRI_DIRECT_LOOKUP_CHUNK or 2,000,000.
-    ``lookup_kernel``: ``n_stop -> stats`` doing the lookup in the fused kernel
-    (:func:`lookup_sum_kernel`; ``n_stop`` = each sub's first pixel past its handoff); the
-    tracer is then unused (pass None). The plunge chunks stay here.
-    ``common_handoff``: every sub hands off at the EARLIEST sub's handoff pixel (the chunk's
-    time series is exact, so earlier is never worse), so each chunk window has one keep range
-    and one transform. Implied by a summed ``tail_td`` (``tail_td.summed``: it returns the sum
-    over all subs, ``(nch, n)``, which only one shared keep range can use).
+    ``lookup_kernel``: ``n_stop -> stats`` doing the lookup (the fused kernel,
+    :func:`lookup_sum_kernel`, or a mode-blocked Python equivalent; ``n_stop`` = each sub's
+    first pixel NOT looked up); the tracer is then unused (pass None). The plunge chunks stay
+    here.
+    ``common_handoff``: every sub of a row hands off at that ROW's earliest sub handoff pixel
+    (the chunk's time series is exact, so earlier is never worse; never the batch's minimum),
+    so each (row, window) has one keep range. Implied by a summed ``tail_td``.
 
     Returns:
         dict: ``lookup_pixels``, ``chunk_pixels``, ``dropped_pixels`` (plus the kernel's
-        counters with ``lookup_kernel``), ``windows`` (plunge-chunk windows transformed) and
-        ``tail_layers`` (the pixels the chunks filled: ``khi - klo`` summed over the windows,
-        once per keep range, not per sub).
+        counters with ``lookup_kernel``), ``windows`` (the (row, window) chunk series built:
+        ``len(pairs)`` for a summed tail) and ``tail_layers`` (the pixels the chunks filled:
+        ``khi - klo`` summed over the pairs, once per keep range, not per sub); an int for one
+        template, with ``sub_row`` a list with one entry per row of ``acc``, plus ``pairs`` (the
+        ``(row, n0, klo, khi)`` list) and ``handoff_pixel_per_row`` (per row of ``acc``, the
+        first pixel its earliest sub hands to the chunk, ``None`` without a handoff).
 
     Raises:
-        NotImplementedError: If a plunge chunk is needed with ``sub_row`` (many templates).
+        ValueError: For a track shorter than its row's pixels, a pairs-form ``tail_td`` that is
+            not summed, or a summed single-template ``tail_td(ts)`` asked for the chunks of
+            several templates.
     """
     from ...wdm_het import tail_chunk_plan, wdm_chunk_of_td
     from ...utils.utility import get_array_module
@@ -395,69 +493,71 @@ def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, 
     else:
         S = int(np.shape(tracer[0])[0])
     summed = bool(getattr(tail_td, "summed", False))
-    if tracks is None:
-        k_h = np.full(S, P)
+    batched = sub_row is not None
+    n_rows = int(acc.shape[0]) if batched else 1
+    rows_h = (np.asarray(sub_row.get() if hasattr(sub_row, "get") else sub_row, dtype=np.int64).reshape(-1)
+              if batched else np.zeros(S, dtype=np.int64))
+    # each row's pixels: a prefix n_ok[:P_row[r]] (its own trajectory end), or all of n_ok
+    if row_t_end is None:
+        P_row = np.full(n_rows, P, dtype=np.int64)
     else:
-        k_h = np.array([handoff_pixel(tr, layer_dt, layer_df, fdot_axis_max) for tr in tracks], dtype=int)
-        if (common_handoff or summed) and k_h.size:
-            k_h[:] = k_h.min()
+        P_row = np.searchsorted(t0 + n_ok_h * layer_dt, np.asarray(row_t_end, dtype=float).reshape(-1),
+                                side="right").astype(np.int64)
+    P_sub = P_row[rows_h]
+    if tracks is None:
+        k_h = P_sub.copy()
+    else:
+        short = [s for s, tr in enumerate(tracks) if tr is not None and np.size(tr.t) < P_sub[s]]
+        if short:   # its "never trips" index would read as a handoff inside the row
+            raise ValueError(f"tracks of subs {short} are shorter than their rows' pixels (pass row_t_end)")
+        k_h = np.array([P if tr is None else handoff_pixel(tr, layer_dt, layer_df, fdot_axis_max) for tr in tracks],
+                       dtype=np.int64).reshape(-1)
+        k_h = np.minimum(k_h, P_sub)
+    k_row = np.full(n_rows, P, dtype=np.int64)          # each row's earliest sub handoff
+    if S:
+        np.minimum.at(k_row, rows_h, k_h)
+    if (common_handoff or summed) and S:
+        k_h = k_row[rows_h]
     n_m = int(acc.shape[-2])
     stats = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0, windows=0, tail_layers=0)
     if lookup_kernel is not None:
         n_stop = np.where(k_h < P, n_ok_h[np.minimum(k_h, P - 1)], n_ok_h[-1] + 1) if P else np.zeros(S, int)
         stats.update(lookup_kernel(n_stop))
     else:
-        amp, phase, f, fdot = (xp.asarray(a) for a in tracer)
-        nch = amp.shape[1]
-        n_ok_x = xp.asarray(n_ok_h)
-        before = xp.arange(P)[None, :] < xp.asarray(k_h)[:, None]                       # (S, P)
-        sel = before[:, None, :] & (xp.abs(fdot) <= fdot_axis_max) & (f > 2 * layer_df)  # (S, C, P)
-        stats["dropped_pixels"] = int(nch * int(before.sum()) - int(sel.sum()))
-        s_all, c_all, p_all = xp.nonzero(sel)
-        chunk = int(lookup_chunk or os.environ.get("EMRI_DIRECT_LOOKUP_CHUNK", 2_000_000))
-        sub_row_x = None if sub_row is None else xp.asarray(sub_row)
-        for j0 in range(0, int(s_all.size), chunk):
-            s_i, c_i, p_i = s_all[j0:j0 + chunk], c_all[j0:j0 + chunk], p_all[j0:j0 + chunk]
-            co, mm = table.get_wdm_coeffs(amp[s_i, c_i, p_i], phase[s_i, c_i, p_i], f[s_i, c_i, p_i],
-                                          fdot[s_i, c_i, p_i], n_ok_x[p_i],
-                                          num_m_layers=num_m_layers, out_of_support="zero")
-            co, mm = xp.asarray(co), xp.asarray(mm)
-            n_e = n_ok_x[p_i]
-            r_i = None if sub_row_x is None else sub_row_x[s_i]
-            for c in range(co.shape[1]):
-                good = (mm[:, c] >= m_lo) & (mm[:, c] < m_lo + n_m)
-                idx = (c_i[good], mm[good, c] - m_lo, n_e[good])
-                if r_i is not None:
-                    idx = (r_i[good],) + idx
-                _scatter_add(xp, acc, idx, co[good, c])
-            del co, mm
-        stats["lookup_pixels"] = int(s_all.size)
-    windows = {}
+        stats.update(_lookup_python(acc, table, tracer, n_ok_h, k_h, sub_row, layer_df=layer_df,
+                                    num_m_layers=num_m_layers, fdot_axis_max=fdot_axis_max, m_lo=m_lo,
+                                    lookup_chunk=lookup_chunk))
+    # the plunge tail: (row, n0, klo, khi) pairs from every row's own handoff and end
+    subs_of, plans = {}, {}
     for s in range(S):
-        if k_h[s] < n_ok_h.size:
+        r = int(rows_h[s])
+        if k_h[s] < P_row[r]:
             n_h = int(n_ok_h[k_h[s]])
-            n_end = min(int(n_ok_h[-1]) + 1 + Nt_sub // 4, Nt - pixel_edge)
-            for n0, klo, khi in tail_chunk_plan(n_h, n_end, Nt, Nt_sub):
-                windows.setdefault(n0, []).append((s, klo, khi))
-    if windows and sub_row is not None:
-        raise NotImplementedError("plunge chunks are not batched across templates; build that template alone")
-    for n0, items in windows.items():
-        ts = t0 + (n0 * Nf + xp.arange(Nf * Nt_sub)) * dt
-        td_all = xp.asarray(tail_td(ts))
-        groups = {}
-        for s, klo, khi in items:                  # the transform is linear: one per keep range
-            groups.setdefault((klo, khi), []).append(s)
-        for (klo, khi), subs in groups.items():
-            if summed:
-                td = td_all
-            else:
-                td = td_all[subs[0]] if len(subs) == 1 else td_all[xp.asarray(np.asarray(subs))].sum(axis=0)
-            chunk = xp.asarray(wdm_chunk_of_td(td, 0, Nf, Nt_sub, dt, backend=backend))
-            hi = min(m_lo + n_m, chunk.shape[-2])                     # chunk rows = global layers
-            acc[:, :hi - m_lo, n0 + klo:n0 + khi] += chunk[:, m_lo:hi, klo:khi]
-            stats["chunk_pixels"] += (khi - klo) * len(subs)
-            stats["tail_layers"] += khi - klo
-    stats["windows"] = len(windows)
+            n_end = min(int(n_ok_h[P_row[r] - 1]) + 1 + Nt_sub // 4, Nt - pixel_edge)
+            if (n_h, n_end) not in plans:
+                plans[(n_h, n_end)] = tail_chunk_plan(n_h, n_end, Nt, Nt_sub)
+            for n0, klo, khi in plans[(n_h, n_end)]:
+                subs_of.setdefault((r, int(n0), int(klo), int(khi)), []).append(s)
+    pairs = sorted(subs_of)
+    tail_per_row = [0] * n_rows
+    if pairs:
+        td_all = _tail_series_of_pairs(tail_td, pairs, subs_of, summed, xp, t0, Nf, Nt_sub, dt)
+        chunks = xp.asarray(wdm_chunk_of_td(td_all, 0, Nf, Nt_sub, dt, backend=backend))   # (pairs, nch, Nf, Nt_sub)
+        hi = min(m_lo + n_m, chunks.shape[-2])                     # chunk rows = global layers
+        for i, key in enumerate(pairs):                            # pure index splices
+            r, n0, klo, khi = key
+            tgt = acc[r] if batched else acc
+            tgt[:, :hi - m_lo, n0 + klo:n0 + khi] += chunks[i, :, m_lo:hi, klo:khi]
+            stats["chunk_pixels"] += (khi - klo) * len(subs_of[key])
+            tail_per_row[r] += khi - klo
+        del td_all, chunks
+    stats["windows"] = len({(r, n0) for r, n0, _, _ in pairs})
+    if not batched:
+        stats["tail_layers"] = tail_per_row[0]
+        return stats
+    stats["tail_layers"] = tail_per_row
+    stats["pairs"] = pairs
+    stats["handoff_pixel_per_row"] = [int(n_ok_h[k]) if k < P_row[r] else None for r, k in enumerate(k_row)]
     return stats
 
 
@@ -764,6 +864,18 @@ def dense_phase_eval(t_k, C, t):
 #: whose trajectory ended within the delay margins of its start, so
 #: :func:`sparse_response_grid` returned its 2-point fallback).
 MIN_RESPONSE_POINTS = 4
+
+
+def _check_response_points(N):
+    """Raise :class:`~lisatools.utils.exceptions.WaveformDomainError` for a response grid of
+    fewer than :data:`MIN_RESPONSE_POINTS` points (before any kernel or spline runs)."""
+    if N < MIN_RESPONSE_POINTS:
+        from ...utils.exceptions import WaveformDomainError
+
+        raise WaveformDomainError(
+            f"EMRI direct response grid of {N} point(s) (fewer than {MIN_RESPONSE_POINTS}): "
+            "the trajectory is too short against the TDI delay margin for the response "
+            "splines")
 
 
 def sparse_response_grid(knots, a, b, sparse_dt, margin):
@@ -1575,13 +1687,7 @@ class EMRIDirectWDM:
             N = max(int(np.size(g)) for g in t_grid)
         else:
             N = int(np.size(t_grid))
-        if N < MIN_RESPONSE_POINTS:
-            from ...utils.exceptions import WaveformDomainError
-
-            raise WaveformDomainError(
-                f"EMRI direct response grid of {N} point(s) (fewer than {MIN_RESPONSE_POINTS}): "
-                "the trajectory is too short against the TDI delay margin for the response "
-                "splines")
+        _check_response_points(N)
         if isinstance(t_grid, (list, tuple)):
             t_eval = np.stack([pad_grid(g, N) for g in t_grid])
         else:
@@ -1593,38 +1699,78 @@ class EMRIDirectWDM:
             return SplinedTDIOutput(out, mkn, dense.sub_temp_host)
         return ExactPhaseTDIOutput(out, tk_abs, Cs, mkn, dense.sub_temp_host)
 
-    def _dense_td(self, item, ts, sum_subs=False, stop_taper=0.0):
-        """The EXACT channel time series of one template's harmonics at the absolute sample times
-        ``ts``: ``(num_sub, nch, ts.size)``, the real part of the dense kernel's raw TDI channels.
+    def _dense_td(self, items, t_abs, sum_subs=False, stop_taper=0.0):
+        """The EXACT channel time series of templates' harmonics, each item at its OWN absolute
+        sample times: the real part of the dense kernel's raw TDI channels.
 
         The plunge chunk's input. An amplitude/phase spline cannot represent the channel where the
         signal stops (an in-window plunge: each TDI delay term drops out at its own time, a
         staircase over ~4 arm lengths); splined, it leaks broadband power whose low-frequency part
         the TDI combination would have suppressed -- under the instrument noise that was a
-        template SNR of ~3900 against 56 for a 720-day window holding EMRI 1's plunge. Evaluated in
-        blocks of at most EMRI_DIRECT_TAIL_BLOCK_ELEMS (sub, channel, sample) entries (2e7).
-        ``sum_subs``: the sum over the harmonics, ``(nch, ts.size)``, summed inside the kernel.
-        ``stop_taper``: the source-frame stop taper [s] (``TDDenseTDIonTheFly.channels``)."""
+        template SNR of ~3900 against 56 for a 720-day window holding EMRI 1's plunge.
+
+        ``items``: a list of ``n`` ``(dense inputs, (psi, lam, beta))`` (the same template may
+        appear several times: one item per (row, chunk window) pair), ``t_abs`` ``(n, N)``, one
+        grid per item. ONE :meth:`_dense_kernel` call and ONE ``channels`` call per block of
+        items; the kernel's output has a leading template axis (row ``b`` = item ``b`` of the
+        block, at times ``t_abs[b]``; with ``sum_subs`` the sum over that item's harmonics,
+        ``tdi_channels_arr[(b * nch + ch) * N + i]`` in ``lat_spline_tdi_waveform.cu``), so the
+        split per item is a slice. Blocks hold whole items -- never part of an item's samples --
+        with at most EMRI_DIRECT_TAIL_BLOCK_ELEMS (2e7) (row, channel, sample) entries, at least
+        one item (24 months, ``N = 1440 * 128``, 3 channels: 36 pairs per block).
+
+        Args:
+            items (list | tuple): The items; a bare ``(dense inputs, sky)`` tuple is one item.
+            t_abs (array-like): ``(n, N)`` absolute times [s]; a 1-D grid is shared by every item.
+            sum_subs (bool, optional): Sum each item's harmonics inside the kernel. Default
+                ``False``.
+            stop_taper (float, optional): Source-frame stop taper [s]
+                (``TDDenseTDIonTheFly.channels``). Default ``0``.
+
+        Returns:
+            xp.ndarray: ``(n, nch, N)`` with ``sum_subs``, else ``(num_sub_total, nch, N)`` (the
+            items' harmonics in order); for a bare item ``(nch, N)`` / ``(num_sub, nch, N)``.
+        """
         xp = self.xp
+        bare = isinstance(items, tuple)
+        if bare:
+            items = [items]
+        n = len(items)
+        t_abs = xp.asarray(t_abs, dtype=float)
+        if t_abs.ndim == 1:
+            t_abs = xp.broadcast_to(t_abs[None, :], (n, int(t_abs.size)))
+        N = int(t_abs.shape[-1])
         nch = self.tdi_config.nchannels
-        S = 1 if sum_subs else int(item[0][2].shape[0])
-        ts = xp.asarray(ts, dtype=float)
-        out = xp.empty((S, nch, int(ts.size)))
-        blk = max(1, int(float(os.environ.get("EMRI_DIRECT_TAIL_BLOCK_ELEMS", 2e7)) // (S * nch)))
-        for b0 in range(0, int(ts.size), blk):
-            tb = ts[b0:b0 + blk]
-            dense, par = self._dense_kernel([item], tb[None, :])[:2]
-            out[:, :, b0:b0 + tb.size] = xp.real(dense.channels(par, sum_subs=sum_subs, stop_taper=stop_taper))
-        return out[0] if sum_subs else out
+        rows = np.array([1 if sum_subs else int(it[0][2].shape[0]) for it in items], dtype=np.int64)
+        offs = np.concatenate([[0], np.cumsum(rows)])
+        out = xp.empty((int(offs[-1]), nch, N))
+        budget = float(os.environ.get("EMRI_DIRECT_TAIL_BLOCK_ELEMS", 2e7))
+        b0 = 0
+        while b0 < n:
+            b1 = b0 + 1                                # whole items, at least one, within the budget
+            while b1 < n and (offs[b1 + 1] - offs[b0]) * nch * N <= budget:
+                b1 += 1
+            dense, par = self._dense_kernel(items[b0:b1], t_abs[b0:b1])[:2]
+            out[int(offs[b0]):int(offs[b1])] = xp.real(dense.channels(par, sum_subs=sum_subs, stop_taper=stop_taper))
+            del dense
+            b0 = b1
+        if bare and sum_subs:
+            return out[0]
+        return out
 
-    def _dense_tail_fn(self, item, t_end_abs):
-        """``tail_td(ts) -> (nch, ts.size)`` for the plunge chunk: the exact channels summed over
-        the template's harmonics (:meth:`_dense_td`, ``sum_subs``; ``tail_td.summed`` makes every
-        harmonic hand off at the same pixel, :func:`accumulate_harmonic_batch`), with the source
-        amplitude tapered over the last ``plunge_taper_s`` of EMISSION time before the trajectory's
-        end ``t_end_abs`` (``tail_td.taper``; ``stop_taper`` of ``TDDenseTDIonTheFly.channels``).
+    def _dense_tail_fn(self, chunk_items, t0, Nf, Nt_sub, dt):
+        """The pairs-form plunge tail of :func:`accumulate_harmonic_batch`:
+        ``tail_td(pairs) -> (len(pairs), nch, Nf * Nt_sub)``, the exact channels of
+        ``chunk_items[row]`` (``(dense inputs, (psi, lam, beta))``; a dict keyed by the
+        accumulator row, or a sequence) summed over its harmonics on the window grid ``t0 + (n0 *
+        Nf + arange(Nf * Nt_sub)) * dt`` of each ``(row, n0, klo, khi)`` pair: the grids stacked,
+        ONE :meth:`_dense_td` call (every harmonic of every pair in the same kernel launch, summed
+        there; ``tail_td.summed`` makes a row's harmonics hand off together). The source amplitude
+        is tapered over the last ``plunge_taper_s`` of EMISSION time before the trajectory's end
+        (``tail_td.taper``; ``stop_taper`` of ``TDDenseTDIonTheFly.channels``). ``tail_td.calls``
+        counts the calls.
 
-        Why: the trajectory stops abruptly at the plunge. Every delay term of a channel is the same
+        Why the taper: the trajectory stops abruptly at the plunge. Every delay term of a channel is the same
         truncated function, so the stop has no net T-like area, but SAMPLED, each term's cut falls
         at its own place between samples and the channel keeps an area that aliases into the
         lowest frequencies: EMRI 1's plunge scored SNR 2.7 in 0.25-1 mHz (dt 5 s; 90 at 20 s
@@ -1633,28 +1779,249 @@ class EMRIDirectWDM:
         holds) and makes each term smooth at its end. A trajectory that outlasts the window is
         tapered past its end, where no pixel of the window looks."""
         taper = float(self.plunge_taper_s)
+        xp = self.xp
+        Nf, N = int(Nf), int(Nf) * int(Nt_sub)
 
-        def tail_td(ts):
-            return self._dense_td(item, ts, sum_subs=True, stop_taper=taper)
+        def tail_td(pairs):
+            tail_td.calls += 1
+            items = [chunk_items[row] for (row, _, _, _) in pairs]
+            n0s = xp.asarray(np.array([n0 for (_, n0, _, _) in pairs], dtype=np.int64))
+            t_abs = t0 + (n0s[:, None] * Nf + xp.arange(N)[None, :]) * dt
+            return self._dense_td(items, t_abs, sum_subs=True, stop_taper=taper)
+        tail_td.calls = 0
         tail_td.taper = taper
         tail_td.summed = True
+        tail_td.by_pairs = True
         return tail_td
 
-    def _call_knots(self, few_args, few_kwargs, modes, reuse=None):
-        """One template on the knots feed. ``reuse=(modes, chunk_start)``: the caller's
-        :meth:`_mode_list` for these parameters was the LAST FEW call (its holder, tracks and
-        the integrator's trajectory are current) -- skip the second FEW call."""
-        from ...domains import WDMSignal
+    def _spline_tail_fn(self, outs, t0, Nf, Nt_sub, dt):
+        """The pairs-form plunge tail on the spline response (``response="spline"``): for each
+        ``(row, n0, klo, khi)`` pair, ``outs[row]`` (that row's own response output, its
+        harmonics only) evaluated with ``eval_tdi`` on the pair's window grid where the output is
+        defined (zero outside) and summed over its harmonics; stacked, ``(len(pairs), nch, Nf *
+        Nt_sub)``. Same interface as :meth:`_dense_tail_fn` (``summed``, ``by_pairs``, ``calls``;
+        ``taper`` 0: no stop taper on this path). Not production."""
+        xp = self.xp
+        nch = self.tdi_config.nchannels
+        Nf, N = int(Nf), int(Nf) * int(Nt_sub)
+        span = {}
+        for row, out in outs.items():
+            x = np.asarray(out.x.get() if hasattr(out.x, "get") else out.x)
+            span[row] = (float(x[:, 0].max()), float(x[:, -1].min()))
+
+        def tail_td(pairs):
+            tail_td.calls += 1
+            td = xp.zeros((len(pairs), nch, N))
+            for i, (row, n0, _, _) in enumerate(pairs):
+                ts = t0 + (n0 * Nf + xp.arange(N)) * dt
+                live = (ts > span[row][0]) & (ts < span[row][1])
+                if bool(xp.any(live)):
+                    td[i][:, live] = xp.asarray(outs[row].eval_tdi(ts[live])).sum(axis=0)
+            return td
+        tail_td.calls = 0
+        tail_td.taper = 0.0
+        tail_td.summed = True
+        tail_td.by_pairs = True
+        return tail_td
+
+    def _ended_before_window(self, H):
+        """Whether the holder's inspiral ends before the window (plus the TDI delay margin): no
+        pixel sees it, the production template is zero there too, and its response grid would be
+        empty -- an exact-zero template, never a plunge-chunk row."""
+        return float(np.asarray(H.t_arr)[-1]) < self.data_t0 - self.t_start - self.DELAY_MARGIN
+
+    def _chunk_item(self, few_args, modes, chunk_start):
+        """Capture one knots-feed template's inputs right after its :meth:`_mode_list` (its
+        holder, tracks and the integrator's trajectory are current; the next row's FEW call
+        overwrites them), for :meth:`_chunk_rows_batch`.
+
+        Returns a dict: ``params``, ``modes``, ``chunk_start``, ``t_end`` (trajectory end, FEW
+        clock), ``sky`` ``(psi, lam, beta)``, ``tracks`` / ``track_n`` (the harmonic tracks at
+        their pixels, ``None`` when no harmonic can hand off), ``t_fine`` and ``n_fine`` (the
+        response grid's length), plus ``din`` (dense inputs) and ``grid`` (its response grid, FEW
+        clock) with ``response="dense"``, or ``feed`` (the spline response feed) and ``fly``.
+
+        Raises:
+            WaveformDomainError: When the template's own dense response grid has fewer than
+                :data:`MIN_RESPONSE_POINTS` points (a trajectory too short against the TDI delay
+                margins): the row is refused on its own, before it can join a batched response
+                (which pads every grid to the batch's common length).
+        """
         from .emritdionfly import EMRITDIonFly
 
         wdm = self.wdm
-        Nf, Nt, dt, ldt, ldf = wdm.Nf, wdm.Nt, wdm.data_dt, wdm.layer_dt, wdm.layer_df
-        span = Nt * ldt
+        span = wdm.Nt * wdm.layer_dt
+        H, tracks, n_tr = self._last_holder, self._last_tracks, self._last_track_n
+        t_end = float(np.asarray(H.t_arr)[-1])
+        t_fine = self._fine_grid(chunk_start)
+        item = dict(params=few_args, modes=modes, chunk_start=chunk_start, t_end=t_end, tracks=tracks,
+                    track_n=n_tr, t_fine=t_fine, n_fine=int(t_fine.size))
+        if self.response == "dense":
+            t_resp = self._sparse_grid(H, chunk_start) if self.response_grid == "sparse" else t_fine
+            if t_end < t_resp[-1] - 1.0:
+                # stops in the window: end the response grid two delay margins after the stop
+                # (as the spline feed's zero-amplitude continuation does); beyond it the channel
+                # is exactly zero and its extracted phase meaningless, so it must not be splined
+                t_resp = t_resp[t_resp <= t_end + 2 * 600.0 + 2 * self.fine_dt_plunge]
+            _check_response_points(int(t_resp.size))
+            item.update(grid=t_resp, n_fine=int(t_resp.size))
+        T_traj = self.data_t0 - self.t_start + span + 2000.0
+        fly = EMRITDIonFly(self.few_gen, self.orbits, self.tdi_config, wdm.data_dt, T_traj, self.t_start,
+                           frame="icrs_special", t_fine_window=(self.data_t0, self.data_t0 + span), t_fine=t_fine)
+        _, _, psi, lam, beta = fly.sky(few_args[7], few_args[8], few_args[9], few_args[10])
+        item["sky"] = (psi, lam, beta)
+        if self.response == "dense":
+            integ = self.few_gen.inspiral_generator.inspiral_generator
+            item["din"] = dense_inputs_from_holder(H, integ, a=few_args[2], xI0=few_args[5])
+        else:
+            item.update(feed=self._knots_feed(H, few_args, t_fine, fly), fly=fly)
+        return item
+
+    def _python_lookup_fn(self, srcs, acc4, sub_row, n_ok, P_row, m_lo):
+        """``n_stop -> stats``: the Python lookup of the chunk rows (the fused kernel's stand-in
+        when it is unavailable), row by row over each row's OWN pixels ``n_ok[:P_row[row]]`` (a
+        response spline is never read past its row's span): the analytic tracer and
+        :func:`_lookup_python` in blocks of harmonics (``EMRI_DIRECT_MODE_BLOCK_ELEMS`` per
+        ``(block, nch, pixels)`` array; a spline-response output has no subset evaluation and is
+        one block). ``srcs[row] = (out, local)``: the row's response output and its harmonics'
+        rows in it (``None``: all of ``out``)."""
+        xp = self.xp
+        nch = self.tdi_config.nchannels
+        n_ok = np.asarray(n_ok)
+        sub_row = np.asarray(sub_row)
+        budget = float(os.environ.get("EMRI_DIRECT_MODE_BLOCK_ELEMS", 2e7))
+
+        def run(n_stop):
+            n_stop = np.asarray(n_stop)
+            tot = dict(lookup_pixels=0, dropped_pixels=0)
+            for row, (out, local) in srcs.items():
+                P_r = int(P_row[row])
+                g = np.flatnonzero(sub_row == row)             # the row's harmonics (global order)
+                if not P_r or not g.size:
+                    continue
+                n_r = n_ok[:P_r]
+                t_r = xp.asarray(self.data_t0 + n_r * self.wdm.layer_dt)
+                num_out = int(np.shape(out.x)[0])
+                blk = max(1, int(budget // max(1, nch * P_r))) if isinstance(out, SplinedTDIOutput) else g.size
+                for j0 in range(0, g.size, blk):
+                    gj = g[j0:j0 + blk]
+                    loc = np.arange(gj.size) + j0 if local is None else np.asarray(local)[j0:j0 + blk]
+                    tracer = tracer_from_tof_output(out, t_r, subs=None if loc.size == num_out else loc)
+                    st = _lookup_python(acc4, self.table, tracer, n_r, np.searchsorted(n_r, n_stop[gj]),
+                                        sub_row[gj], layer_df=self.wdm.layer_df, num_m_layers=self.num_m_layers,
+                                        fdot_axis_max=self.fdot_axis_max, m_lo=m_lo)
+                    for k in tot:
+                        tot[k] += st[k]
+                    del tracer
+            return tot
+        return run
+
+    def _chunk_rows_batch(self, out_arr, chunk_items, m_lo, m_hi, few_kwargs):
+        """Build every plunge-chunk row of a :meth:`batch` call (or the one template of
+        :meth:`_call_knots`) together, into ``out_arr[row]`` (layers ``[m_lo, m_hi)``).
+
+        ``chunk_items``: ``{row of out_arr: item}`` from :meth:`_chunk_item`. With
+        ``response="dense"`` (production): ONE :meth:`_dense_response` for every row (each on its
+        own response grid), ONE fused lookup kernel (or its Python stand-in) over the common pixel
+        range with each harmonic stopping at its ROW's handoff, and ONE batched plunge tail
+        (:func:`accumulate_harmonic_batch` with ``row_t_end``: each row's handoff and end are its
+        own, never the batch's minimum; :meth:`_dense_tail_fn`: one dense evaluation for every
+        (row, window) pair with each row's harmonics summed in the kernel, one transform). With
+        ``response="spline"`` (not production) each row has its own response (the rows' feeds
+        differ in length) and :meth:`_spline_tail_fn`; the lookup and the tail are batched the
+        same way. ``few_kwargs`` (the batch's FEW kwargs) is not read: every FEW-derived input was
+        captured per row by :meth:`_chunk_item`.
+
+        Returns:
+            dict: ``rows``, ``windows`` and ``tail_layers`` (one entry per row, in row order) of
+            the plunge chunks, ``lookup_pixels`` / ``chunk_pixels`` / ``dropped_pixels``,
+            ``lookup`` (``kernel`` / ``python``) and ``n_response`` (the response grid length).
+        """
+        xp = self.xp
+        wdm = self.wdm
+        Nf, Nt, dt, ldt = wdm.Nf, wdm.Nt, wdm.data_dt, wdm.layer_dt
+        nch = self.tdi_config.nchannels
+        rows = sorted(chunk_items)
+        items = [chunk_items[r] for r in rows]
+        if self.response == "dense":
+            out = self._dense_response([(it["din"], it["sky"]) for it in items], [it["grid"] for it in items])
+            x_all = np.asarray(out.x.get() if hasattr(out.x, "get") else out.x)
+            offs = np.concatenate([[0], np.cumsum([int(it["din"][2].shape[0]) for it in items])])
+            srcs = {r: (out, np.arange(offs[b], offs[b + 1])) for b, r in enumerate(rows)}
+            x_row = {r: x_all[offs[b]:offs[b + 1]] for b, r in enumerate(rows)}
+            n_response = int(x_all.shape[-1])
+            be = self._kernel_backend(out)
+        else:
+            srcs, x_row = {}, {}
+            for r, it in zip(rows, items):                 # the rows' feeds differ in length
+                o = it["fly"].run_response([tuple(it["feed"]) + tuple(it["sky"])])
+                srcs[r] = (o, None)
+                x_row[r] = np.asarray(o.x.get() if hasattr(o.x, "get") else o.x)
+            n_response = max(int(x.shape[-1]) for x in x_row.values())
+            be = self._kernel_backend(srcs[rows[0]][0])
+        n_sub = [int(x_row[r].shape[0]) for r in rows]
+        sub_row = np.repeat(np.asarray(rows, dtype=np.int64), n_sub)
+        # pixels: from the common response start; each row up to its OWN end (response span and
+        # trajectory end) -- a prefix of the common range, passed as row_t_end
         n_all = np.arange(self.pixel_edge, Nt - self.pixel_edge)
         t_pix = self.data_t0 + n_all * ldt
-        T_traj = self.data_t0 - self.t_start + span + 2000.0
-        xp = self.xp
-        acc = xp.zeros((self.tdi_config.nchannels, Nf, Nt))
+        x0 = max(float(x_row[r][:, 0].max()) for r in rows)
+        n_last = {}
+        for r, it in zip(rows, items):
+            own = (t_pix > x0) & (t_pix < float(x_row[r][:, -1].min())) & (t_pix - self.t_start <= it["t_end"])
+            if np.any(own):
+                n_last[r] = int(n_all[own][-1])
+        stats = dict(rows=len(rows), windows=0, tail_layers=[0] * len(rows), lookup_pixels=0, chunk_pixels=0,
+                     dropped_pixels=0, lookup="python" if be is None else "kernel", n_response=n_response)
+        if not n_last:
+            return stats
+        n_ok = n_all[(t_pix > x0) & (n_all <= max(n_last.values()))]
+        row_t_end = np.full(int(out_arr.shape[0]), -np.inf)
+        for r, n in n_last.items():
+            row_t_end[r] = self.data_t0 + n * ldt
+        P_row = np.searchsorted(self.data_t0 + n_ok * ldt, row_t_end, side="right")
+        tracks = []
+        for r, it, ns in zip(rows, items, n_sub):
+            tp, n_tr = it["tracks"], it["track_n"]
+            if tp is None or not len(tp) or not P_row[r]:  # no harmonic can hand off (bound) / no pixel
+                tracks += [None] * ns
+                continue
+            n_r = n_ok[:P_row[r]]
+            pos = np.searchsorted(n_tr, n_r)
+            assert np.array_equal(n_tr[pos], n_r)
+            assert len(tp) == ns, (len(tp), ns)
+            tracks += [subset_track(t, pos) for t in tp]
+        if be is not None:
+            lookup = self._lookup_fn(be, srcs[rows[0]][0], out_arr, sub_row.astype(np.int32), n_ok, m_lo)
+        else:
+            lookup = self._python_lookup_fn(srcs, out_arr, sub_row, n_ok, P_row, m_lo)
+        if self.response == "dense":
+            # the plunge chunk's TD straight from the dense kernel at the sample times: exact
+            # through the stop (_dense_td), not the amplitude/phase splines; the source tapered
+            # over the last plunge_taper_s of emission time (_dense_tail_fn)
+            tail_td = self._dense_tail_fn({r: (it["din"], it["sky"]) for r, it in zip(rows, items)},
+                                          self.data_t0, Nf, self.Nt_sub, dt)
+        else:
+            tail_td = self._spline_tail_fn({r: srcs[r][0] for r in rows}, self.data_t0, Nf, self.Nt_sub, dt)
+        st = accumulate_harmonic_batch(
+            out_arr, self.table, tracks, None, n_ok, tail_td, Nf=Nf, Nt=Nt, dt=dt, layer_dt=ldt,
+            layer_df=wdm.layer_df, t0=self.data_t0, Nt_sub=self.Nt_sub, num_m_layers=self.num_m_layers,
+            fdot_axis_max=self.fdot_axis_max, pixel_edge=self.pixel_edge, backend=self.force_backend,
+            sub_row=sub_row, num_sub=int(sub_row.size), m_lo=m_lo, lookup_kernel=lookup, row_t_end=row_t_end)
+        stats.update({k: st[k] for k in ("windows", "lookup_pixels", "chunk_pixels", "dropped_pixels")},
+                     tail_layers=[int(st["tail_layers"][r]) for r in rows])
+        return stats
+
+    def _call_knots(self, few_args, few_kwargs, modes, reuse=None):
+        """One template on the knots feed: :meth:`_chunk_item` + :meth:`_chunk_rows_batch` with
+        one row (the code every plunge-chunk row of :meth:`batch` goes through). ``reuse=(modes,
+        chunk_start)``: the caller's :meth:`_mode_list` for these parameters was the LAST FEW call
+        (its holder, tracks and the integrator's trajectory are current) -- skip the second FEW
+        call."""
+        from ...domains import WDMSignal
+
+        wdm = self.wdm
+        acc = self.xp.zeros((1, self.tdi_config.nchannels, wdm.Nf, wdm.Nt))
         kw = dict(few_kwargs)
         if modes is not None:
             kw["mode_selection"] = modes
@@ -1662,78 +2029,19 @@ class EMRIDirectWDM:
             modes, chunk_start = self._mode_list(few_args, kw)
         else:
             modes, chunk_start = reuse
-        H, tracks_pix, n_tr = self._last_holder, self._last_tracks, self._last_track_n
-        if float(np.asarray(H.t_arr)[-1]) < self.data_t0 - self.t_start - self.DELAY_MARGIN:
-            # the inspiral ends before the window (plus the TDI delay margin): no pixel sees
-            # it, the production template is zero there too, and the response grid below
-            # would be empty
+        if self._ended_before_window(self._last_holder):
             self.last_stats = dict(modes=len(modes), n_fine=0, feed="knots", chunk_start=chunk_start,
                                    lookup_pixels=0, chunk_pixels=0, dropped_pixels=0,
                                    ended_before_window=1)
-            return WDMSignal(acc, wdm)
-        t_fine = self._fine_grid(chunk_start)
-        self.n_fine, self.last_t_fine = int(t_fine.size), t_fine
-        fly = EMRITDIonFly(self.few_gen, self.orbits, self.tdi_config, dt, T_traj, self.t_start,
-                           frame="icrs_special", t_fine_window=(self.data_t0, self.data_t0 + span), t_fine=t_fine)
-        _, _, psi, lam, beta = fly.sky(few_args[7], few_args[8], few_args[9], few_args[10])
-        if self.response == "dense":
-            integ = self.few_gen.inspiral_generator.inspiral_generator
-            din = dense_inputs_from_holder(H, integ, a=few_args[2], xI0=few_args[5])
-            t_end = float(np.asarray(H.t_arr)[-1])
-            t_resp = self._sparse_grid(H, chunk_start) if self.response_grid == "sparse" else t_fine
-            if t_end < t_resp[-1] - 1.0:
-                # stops in the window: end the response grid two delay margins after the stop
-                # (as the spline feed's zero-amplitude continuation does); beyond it the channel
-                # is exactly zero and its extracted phase meaningless, so it must not be splined
-                t_resp = t_resp[t_resp <= t_end + 2 * 600.0 + 2 * self.fine_dt_plunge]
-            self.n_fine = int(t_resp.size)
-            out = self._dense_response([(din, (psi, lam, beta))], t_resp)
-        else:
-            feed = self._knots_feed(H, few_args, t_fine, fly)
-            out = fly.run_response([tuple(feed) + (psi, lam, beta)])
-        x = np.asarray(out.x.get() if hasattr(out.x, "get") else out.x)
-        t_traj_end = float(np.asarray(H.t_arr)[-1])
-        ok_t = (t_pix > x[:, 0].max()) & (t_pix < x[:, -1].min()) & (t_pix - self.t_start <= t_traj_end)
-        n_ok, tt = n_all[ok_t], t_pix[ok_t]
-        totals = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
-        be = self._kernel_backend(out)
-        if n_ok.size:
-            tracks = None
-            if tracks_pix is not None:                     # a harmonic may hand off (bound)
-                pos = np.searchsorted(n_tr, n_ok)
-                assert np.array_equal(n_tr[pos], n_ok)
-                tracks = [subset_track(t, pos) for t in tracks_pix]
-            nch = self.tdi_config.nchannels
-            num_sub = int(np.shape(x)[0])
-            if be is None:
-                tracer = tracer_from_tof_output(out, xp.asarray(tt))
-                assert tracks is None or tracer[0].shape[0] == len(tracks), (tracer[0].shape, len(tracks))
-                kern = None
-            else:
-                tracer = None
-                kern = self._lookup_fn(be, out, acc[None], np.zeros(num_sub, dtype=np.int32), n_ok, 0)
-
-            if self.response == "dense":
-                # the plunge chunk's TD straight from the dense kernel at the sample times: exact
-                # through the stop (_dense_td), not the amplitude/phase splines; the source
-                # tapered over the last plunge_taper_s of emission time (_dense_tail_fn)
-                tail_td = self._dense_tail_fn((din, (psi, lam, beta)), self.t_start + t_traj_end)
-            else:
-                def tail_td(ts, out=out, x_lo=float(x[:, 0].max()), x_hi=float(x[:, -1].min())):
-                    live = (ts > x_lo) & (ts < x_hi)
-                    td = xp.zeros((x.shape[0], nch, ts.size))
-                    if bool(xp.any(live)):
-                        td[:, :, live] = xp.asarray(out.eval_tdi(ts[live]))
-                    return td
-
-            totals = accumulate_harmonic_batch(
-                acc, self.table, tracks, tracer, n_ok, tail_td, Nf=Nf, Nt=Nt, dt=dt, layer_dt=ldt,
-                layer_df=ldf, t0=self.data_t0, Nt_sub=self.Nt_sub, num_m_layers=self.num_m_layers,
-                fdot_axis_max=self.fdot_axis_max, pixel_edge=self.pixel_edge, backend=self.force_backend,
-                num_sub=num_sub, lookup_kernel=kern)
+            return WDMSignal(acc[0], wdm)
+        item = self._chunk_item(few_args, modes, chunk_start)
+        self.n_fine, self.last_t_fine = item["n_fine"], item["t_fine"]
+        st = self._chunk_rows_batch(acc, {0: item}, 0, wdm.Nf, kw)
         self.last_stats = dict(modes=len(modes), n_fine=self.n_fine, feed="knots", chunk_start=chunk_start,
-                               lookup="python" if be is None else "kernel", **totals)
-        return WDMSignal(acc, wdm)
+                               lookup=st["lookup"], lookup_pixels=st["lookup_pixels"],
+                               chunk_pixels=st["chunk_pixels"], dropped_pixels=st["dropped_pixels"],
+                               windows=st["windows"], tail_layers=st["tail_layers"][0])
+        return WDMSignal(acc[0], wdm)
 
     def __call__(self, *few_args, **few_kwargs):
         """ONE template on the full WDM grid.
@@ -1903,22 +2211,29 @@ class EMRIDirectWDM:
         return parts[0] if len(parts) == 1 else self.xp.concatenate(parts, axis=0)
 
     def _batch_chunk(self, rows, skip_domain_errors=False, **few_kwargs):
-        """Many templates with ONE TDI-on-the-fly response call, ONE tracer and ONE lookup.
+        """Many templates with ONE TDI-on-the-fly response call, ONE tracer and ONE lookup per
+        group of rows.
 
         ``rows``: parameter rows (as for ``__call__``). FEW runs once per row (it is a
         single-template generator); every row whose harmonics stay on the lookup feeds one
         response kernel launch (num_sub x n_rows blocks fill the GPU), then ONE fused lookup-sum
         kernel (``lookup="kernel"``) or the Python tracer + table call + scatter-add in blocks of
-        harmonics, into ``(n_rows, nch, n_m, Nt)`` (layers ``f_band``). A row that hands off
-        to the plunge chunk is built alone with ``__call__``. Returns the array (backend xp).
-        A row FEW refuses (WaveformDomainError) is left zero and listed in ``last_failed_rows``
-        when ``skip_domain_errors``; otherwise the error propagates. ``last_stats``:
-        ``rows``, ``alone`` (rows built through the plunge chunk), ``subs``, ``failed``,
-        ``ended_before_window`` (rows whose inspiral ends before the window: an exact zero, not
-        counted as ``alone``), the pixel counters ``lookup_pixels`` / ``chunk_pixels`` /
-        ``dropped_pixels`` of every row (the alone rows' added to the batched rows'), ``windows``
-        (the alone rows' chunk windows) and ``tail_layers`` (one entry per alone row: the pixels
-        its plunge chunk filled).
+        harmonics, into ``(n_rows, nch, n_m, Nt)`` (layers ``f_band``). The rows that hand off to
+        the plunge chunk are captured in the row loop (:meth:`_chunk_item`, right after their FEW
+        call) and built TOGETHER after the lookup rows by :meth:`_chunk_rows_batch` (one
+        response, one lookup, one dense tail evaluation and one transform for all of their
+        (row, window) pairs); only on the ``feed="fine"`` / fixed-``n_fine`` path is such a row
+        still built alone with ``__call__``. Returns the array (backend xp). A row FEW refuses
+        (WaveformDomainError, also a chunk row whose own response grid is too short) is left
+        zero and listed in ``last_failed_rows`` when ``skip_domain_errors``; otherwise the error
+        propagates. ``last_stats``: ``rows``, ``chunk_rows`` (rows built through the batched
+        plunge chunk), ``alone`` (rows built one at a time through ``__call__``), ``subs`` (the
+        lookup rows' harmonics), ``failed``, ``ended_before_window`` (rows whose inspiral ends
+        before the window: an exact zero, neither a chunk row nor alone), the pixel counters
+        ``lookup_pixels`` / ``chunk_pixels`` / ``dropped_pixels`` of every row (the chunk and
+        alone rows' added to the lookup rows'), ``windows`` (the chunk and alone rows' chunk
+        windows) and ``tail_layers`` (one entry per chunk / alone row: the pixels its plunge
+        chunk filled).
         """
         from ...utils.exceptions import WaveformDomainError
         from .domain import few_domain_guard
@@ -1936,15 +2251,26 @@ class EMRIDirectWDM:
         out_arr = xp.zeros((len(rows), self.tdi_config.nchannels, m_hi - m_lo, Nt))
         few_kwargs = dict(few_kwargs)
         t_fine = self._fine_grid(None)
-        fly = EMRITDIonFly(self.few_gen, self.orbits, self.tdi_config, dt, T_traj, self.t_start,
-                           frame="icrs_special", t_fine_window=(self.data_t0, self.data_t0 + span), t_fine=t_fine)
+        fly = None                                         # the lookup rows' feed (built on the first one)
         feeds, n_subs, rows_in, t_ends, grids = [], [], [], [], []
-        stats = dict(rows=len(rows), alone=0, subs=0, failed=0, lookup_pixels=0, chunk_pixels=0,
-                     dropped_pixels=0, windows=0, tail_layers=[], ended_before_window=0)
-        # the alone rows' pixel counters: ADDED at the end, after the batched rows' (tot) are set
+        chunk_items = {}                                   # row -> _chunk_item: the batched plunge-chunk rows
+        stats = dict(rows=len(rows), chunk_rows=0, alone=0, subs=0, failed=0, lookup_pixels=0,
+                     chunk_pixels=0, dropped_pixels=0, windows=0, tail_layers=[], ended_before_window=0)
+        # the chunk and alone rows' pixel counters: ADDED at the end, after the lookup rows' (tot)
+        # are set
         alone_tot = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
 
         def finish():
+            """The single exit: the chunk rows (after the lookup rows), then every counter."""
+            if chunk_items:
+                cst = self._chunk_rows_batch(out_arr, chunk_items, m_lo, m_hi, few_kwargs)
+                for k in alone_tot:
+                    alone_tot[k] += int(cst[k])
+                stats["windows"] += int(cst["windows"])
+                stats["tail_layers"] += [int(v) for v in cst["tail_layers"]]
+                stats["chunk_rows"] = len(chunk_items)
+                stats.setdefault("lookup", cst["lookup"])
+                stats["n_response"] = max(int(stats.get("n_response", 0)), int(cst.get("n_response", 0)))
             for k, v in alone_tot.items():
                 stats[k] += v
             self.last_stats = stats
@@ -1954,15 +2280,17 @@ class EMRIDirectWDM:
             try:
                 with few_domain_guard():
                     modes, chunk_start = self._mode_list(p, few_kwargs)
-                    if chunk_start is not None:              # plunge chunk: build this one alone
+                    if chunk_start is not None and self.feed == "knots" and self.n_fine_fixed is None:
+                        if self._ended_before_window(self._last_holder):
+                            # an exact zero that never touches the chunk: not a chunk row
+                            stats["ended_before_window"] += 1
+                            continue
+                        # the _mode_list above was the last FEW call: capture this row now
+                        chunk_items[r] = self._chunk_item(p, modes, chunk_start)
+                        continue
+                    if chunk_start is not None:              # fine feed / fixed n_fine: alone
                         self.last_stats = {}                 # read back below: never a stale one
-                        if self.feed == "knots" and self.n_fine_fixed is None:
-                            # the _mode_list above was the last FEW call: reuse it
-                            kw = dict(few_kwargs)                    # as __call__ passes them
-                            one = self._call_knots(p, kw, kw.pop("mode_selection", None),
-                                                   reuse=(modes, chunk_start))
-                        else:
-                            one = self(*p, **few_kwargs)
+                        one = self(*p, **few_kwargs)
                         out_arr[r] = xp.asarray(one.arr)[:, m_lo:m_hi]
                         one_st = self.last_stats             # that single call's counters
                         if one_st.get("ended_before_window"):
@@ -1982,6 +2310,10 @@ class EMRIDirectWDM:
                 stats["failed"] += 1
                 continue
             H = self._last_holder
+            if fly is None:
+                fly = EMRITDIonFly(self.few_gen, self.orbits, self.tdi_config, dt, T_traj, self.t_start,
+                                   frame="icrs_special", t_fine_window=(self.data_t0, self.data_t0 + span),
+                                   t_fine=t_fine)
             _, _, psi, lam, beta = fly.sky(p[7], p[8], p[9], p[10])
             if self.response == "dense":
                 integ = self.few_gen.inspiral_generator.inspiral_generator
@@ -2026,6 +2358,7 @@ class EMRIDirectWDM:
                                            **kw)
             tot.update({k: st[k] for k in tot})
             stats.update(subs=S, mode_blocks=1, lookup="kernel", **tot)
+            del out                                          # free the lookup rows' response first
             return finish()
         # Python: tracer + lookup in blocks of harmonics (modes): every per-block array is (block,
         # nch, pixels), whatever the number of rows and the duration
@@ -2044,4 +2377,5 @@ class EMRIDirectWDM:
                 tot[k] += st[k]
             del tracer
         stats.update(subs=S, mode_blocks=-(-S // blk), lookup="python", **tot)
+        del out                                              # free the lookup rows' response first
         return finish()

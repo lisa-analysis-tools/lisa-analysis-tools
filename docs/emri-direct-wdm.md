@@ -248,7 +248,19 @@ weights it enormously. Now:
   each term is smooth. (10-02 to 10-03 tapered each CHANNEL over 300 s before its stop instead;
   the cuts stayed inside that window and their aliased area did not go away.)
 * every harmonic of a template hands off to the chunk at the earliest harmonic's pixel (the
-  summed tail implies the common handoff): one transform per chunk window.
+  summed tail implies the common handoff), taken per template, never across a batch.
+* (10-25) the chunk rows of a batch are built TOGETHER (`EMRIDirectWDM._chunk_rows_batch`, also
+  the single-template path): one dense response for all of them (each on its own sparse grid),
+  one fused lookup kernel with every harmonic stopping at its own template's handoff, then the
+  tail as `(row, window)` pairs (`accumulate_harmonic_batch`, `row_t_end`: each template's tail
+  runs from its handoff to a quarter chunk past its own last pixel) -- ONE dense evaluation for
+  every pair (`_dense_tail_fn` -> `_dense_td`: one kernel launch per block of
+  `EMRI_DIRECT_TAIL_BLOCK_ELEMS`, each pair its own window grid, each template's harmonics summed
+  in the kernel -- the transform is linear, so never one transform per harmonic) and ONE
+  `wdm_chunk_of_td` over all pairs, then a pure index splice per pair. Memory of the tail: the
+  stacked pairs, `pairs x 3 x Nf Nt_sub` doubles (24 months: 4.4 MB per pair) plus the
+  transform's temporaries. A chunk row whose own response grid is too short is refused on its
+  own when it is captured, before it can join the batch's padded response.
 
 Laptop check (dt 5 s, equal-arm orbits, 60 days around EMRI 1's plunge, against production with the
 exact Lagrange prefactor, scirdv1 + foreground):
@@ -297,10 +309,13 @@ choreography is untouched, only the scoring changes.
   template), warned once per leaf, counted in `n_batch_fallbacks` and the
   `[EMRI_DIRECT]` telemetry. The `[EMRI_DIRECT] leaf N:` line ends with the lookup /
   plunge-chunk split, `| chunk rows A (tail median L px, W windows) lookup px P chunk px C
-  dropped px D`: `chunk rows` are the rows built through the plunge chunk (for now each is
-  built alone, outside the batch; rows whose inspiral ends before the window are an exact zero
-  and are not counted as chunk rows), `tail median` the median over them of the pixels their chunk
-  filled, `windows` the chunk windows transformed, and `lookup px` / `chunk px` / `dropped px`
+  dropped px D`: `chunk rows` are the rows built through the plunge chunk -- since 10-25 batched
+  per `templates` call (one dense response, one lookup kernel, one tail evaluation for all of
+  their (row, window) pairs and one transform; the generator's `last_stats["chunk_rows"]`), plus
+  any built one at a time on the non-production `feed="fine"` / fixed-`n_fine` path
+  (`last_stats["alone"]`); rows whose inspiral ends before the window are an exact zero and are
+  not counted as chunk rows. `tail median` is the median over them of the pixels their chunk
+  filled, `windows` the (row, window) chunk series transformed, and `lookup px` / `chunk px` / `dropped px`
   the template pixels served by the lookup, by the chunk, and dropped (`fdot` off the table axis
   or `f` below 2 layers), summed over the leaf's direct batches.
 * **Getter** `get_emri_direct_gen`: per device, reuses the FEW generator inside that device's
@@ -356,10 +371,21 @@ mojito stream under scirdv1 + the fitted galactic foreground at each Tobs; spars
 | 360 d | 1e-5 | 45 / 24 | 175 | 7.3e-6 | -0.050 / -0.043 |
 | 720 d (plunge at 518 d) | 1e-3 | 551 / 630 | 398 | 1.5e-5 | -5.557 / -5.522 |
 
-At 720 d every row hands off to the plunge chunk and is built alone. 10-03 H100 rerun with the
+At 720 d every row hands off to the plunge chunk; until 10-25 each such row was built alone (one
+response, one lookup, one tail evaluation and one transform per window, per row), since 10-25 the
+chunk rows of a `templates` call are batched (above). 10-03 H100 rerun with the
 channels-only kernel, the common handoff and one FEW call per row: 175 ms per template
 (production 396), but mm vs production 6.8e-5 / lnL -5.732: the per-channel taper's aliased
-stop area, now on every harmonic; fixed by the source-frame taper above (rerun pending).
+stop area, now on every harmonic; fixed by the source-frame taper above. Pending (one run checks
+both the taper and the batching): `BACKEND=cuda13x DAYS="720" CHUNKS="1,8" ROWS=32 bash
+scripts/emri/emri_speed_durations.sh` on one H100, before and after the batching commit; pass =
+mm vs production unchanged, ms per template at 8 per call below the single-template number, no
+`direct batch failed` fallback. (Laptop, CPU, `response="spline"` -- the laptop's compiled module
+has no dense kernel: synthetic plunging rows, dt 5 s, 8 rows per call: 0.58 s per chunk row
+before, 0.56 after, 0.02 per lookup row; 76 % of it is the spline path's per-row response, which
+the dense path replaces by one sparse-grid response for all rows. The spline path now hands every
+harmonic of a row off together too: mismatch to its own response's TD->WDM transform 3.5e-4,
+from 1.2e-2.)
 
 Cluster check on the 6-month grid: `scripts/emri/emri_direct_fit_wiring_check.py --backend cuda12x
 --days 180 --table-dir <dir holding or receiving the table> --rows 8`.

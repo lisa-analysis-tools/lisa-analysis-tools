@@ -528,18 +528,114 @@ class AdapterTrajectoryPoolTest(_AdapterBase, unittest.TestCase):
         self.assertEqual(arr.shape[0], 2)
 
 
+class _ChirpIntegrator:
+    """A synthetic trajectory integrator: Phi_phi = w t + wddd t^4 / 24, Phi_theta = 0,
+    Phi_r = 0.3 w t (FEW clock), with exact derivatives (the curvature trigger fires once
+    (pi/3) |fddot| tau^3 passes 0.1 rad, fddot growing linearly in t)."""
+
+    def __init__(self, w, wddd):
+        self.w, self.wddd = w, wddd
+        self.generating_trajectory = False
+        self.massratio = 1.0
+
+    def eval_integrator_spline(self, t):
+        t = np.asarray(t, dtype=float)
+        out = np.zeros((t.size, 6))
+        out[:, 3] = self.w * t + self.wddd * t ** 4 / 24.0
+        out[:, 5] = 0.3 * self.w * t
+        return out
+
+    def eval_integrator_derivative_spline(self, t, order=1):
+        t = np.asarray(t, dtype=float)
+        out = np.zeros((t.size, 6))
+        if order == 1:
+            out[:, 3] = self.w + self.wddd * t ** 3 / 6.0
+            out[:, 5] = 0.3 * self.w
+        elif order == 2:
+            out[:, 3] = self.wddd * t ** 2 / 2.0
+        elif order == 3:
+            out[:, 3] = self.wddd * t
+        return out
+
+
+def _synthetic_holder(t_end, K=60):
+    """A FEW-like knots holder ending at ``t_end``: modes (2,2,0,0) and (3,3,0,1) with smooth
+    Teukolsky amplitudes, Ylms for the m >= 0 modes then their -m partners."""
+    t = np.linspace(0.0, t_end, K)
+    x = t / t_end
+    teuk = np.stack([(1.0 + 0.2 * x) * np.exp(0.3j * x), (0.5 - 0.1 * x) * np.exp(-0.2j * x)], axis=1)
+    return SimpleNamespace(t_arr=t, teuk_modes=teuk,
+                           ylms=np.array([0.5 + 0.2j, 0.3 - 0.1j, 0.4 - 0.25j, -0.2 + 0.15j]),
+                           ls=np.array([2, 3]), ms=np.array([2, 3]), ks=np.array([0, 0]), ns=np.array([0, 1]),
+                           phases=None, freqs=None, integrate_backwards=False)
+
+
+#: Synthetic rows (column 0 tags the row) -> (w, wddd, t_end) on the FEW clock of the
+#: real-generator fixture (window from 2e4 s, 128 pixels of 3600 s): two rows hand off inside the
+#: window (m = 3 harmonics, near pixels 88 and 98) and plunge at pixels 100 and 112; the third is
+#: slow and outlasts the window (lookup only).
+_SYNTH_ROWS = {1e6: (2 * np.pi * 1.5e-3, 2.0e-19, 2.0e4 + 100 * 3600.0),
+               2e6: (2 * np.pi * 1.3e-3, 1.8e-19, 2.0e4 + 112 * 3600.0),
+               3e6: (2 * np.pi * 1.2e-3, 0.0, 2.0e6)}
+
+
+def _synthetic_direct():
+    """The REAL EMRIDirectWDM on CPU (spline response, Python lookup, a real n_ref table, the real
+    batch / chunk-row / single-template code) with only FEW replaced: ``_few_knots`` returns the
+    synthetic holder of the row's tag and installs its integrator. Returns ``(gen, rows,
+    refusing_row, tmpdir)``."""
+    from lisatools.domains import WDMLookupTable, WDMSettings
+    from lisatools.response.tdiconfig import TDIConfig
+    from lisatools.sources.emri import wdm_direct as wd
+
+    wdm = WDMSettings(Nf=64, Nt=128, dt=56.25, force_backend="cpu")
+    nf, md, mr = WDMLookupTable.apply_eps_frequency(0.005, wdm, m_ref=20, num_layers_diff=2)
+    tmp = tempfile.TemporaryDirectory()
+    table = WDMLookupTable(wdm, 1, m_ref=mr, norm_freq_single_layer=nf, m_diffs=md,
+                           fdot_vals=WDMLookupTable.apply_eps_fdot(0.05, wdm, fdot_max_factor=0.5),
+                           store_path=os.path.join(tmp.name, "t.h5"), batch_size_gen=32,
+                           build_kind="n_ref_complex", time_layers=32)
+
+    class _Synthetic(wd.EMRIDirectWDM):
+        def _few_knots(self, few_args, few_kwargs, mode_selection=None):
+            if float(few_args[0]) not in _SYNTH_ROWS:
+                raise ValueError("p0 is outside of our domain of validity.")
+            w, wddd, t_end = _SYNTH_ROWS[float(few_args[0])]
+            self.few_gen.inspiral_generator.inspiral_generator = _ChirpIntegrator(w, wddd)
+            return _synthetic_holder(t_end)
+
+    few = SimpleNamespace(inspiral_generator=SimpleNamespace(inspiral_generator=None), inspiral_kwargs={})
+    t_start = 1.0e7
+    gen = _Synthetic(few, table, wdm, orbits=None, tdi_config=TDIConfig("2nd generation", force_backend="cpu"),
+                     t_start=t_start, data_t0=t_start + 2.0e4, Nt_sub=32, fine_dt_plunge=240.0,
+                     response="spline", lookup="python")
+    rows = [np.array([m, 10.0, 0.9, 10.0, 0.3, 1.0, 1.0, qs, phis, 0.7, 4.0, 0.2, 0.0, 0.7])
+            for m, qs, phis in ((1e6, 1.1, 2.3), (2e6, 0.6, 4.1), (3e6, 2.0, 0.5))]
+    refuses = np.array([9e6, 10.0, 0.9, 10.0, 0.3, 1.0, 1.0, 1.4, 1.0, 0.7, 4.0, 0.2, 0.0, 0.7])
+    return gen, rows, refuses, tmp
+
+
 class BatchDomainRefusalTest(unittest.TestCase):
-    """``EMRIDirectWDM.batch(skip_domain_errors=)``: a FEW domain refusal of one row."""
+    """``EMRIDirectWDM.batch(skip_domain_errors=)``: a FEW domain refusal of one row; the
+    plunge-chunk rows batched (``_chunk_rows_batch``) next to the lookup rows."""
+
+    _synth = None
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._synth is not None:
+            cls._synth[3].cleanup()
+            cls._synth = None
 
     def _direct(self):
         from lisatools.domains import WDMSettings
         from lisatools.sources.emri.wdm_direct import EMRIDirectWDM
 
         class _Stub(EMRIDirectWDM):
-            # column 0 tags the row: 1 -> FEW out-of-domain, 2 -> a real bug,
-            # anything else -> built "alone" (plunge-chunk path) as a constant
+            # column 0 tags the row: 1 -> FEW out-of-domain, 2 -> a real bug, anything else ->
+            # a plunge-chunk row, batched through _chunk_rows_batch (filled with a constant)
             mode_calls = 0
-            reused = []
+            captured = []
 
             def _mode_list(self, few_args, few_kwargs):
                 type(self).mode_calls += 1
@@ -548,21 +644,61 @@ class BatchDomainRefusalTest(unittest.TestCase):
                     raise ValueError("p0 is outside of our domain of validity.")
                 if tag == 2:
                     raise RuntimeError("not a domain error")
+                self._last_holder = SimpleNamespace(t_arr=np.array([0.0, 1.0e12]))
                 return [], 0.0
 
-            def _call_knots(self, few_args, few_kwargs, modes, reuse=None):
-                if reuse is None:                       # the second FEW call of the old path
-                    self._mode_list(few_args, few_kwargs)
-                type(self).reused.append(reuse)
-                return SimpleNamespace(arr=np.full((3, self.wdm.Nf, self.wdm.Nt), few_args[0] + 10.0))
+            def _chunk_item(self, few_args, modes, chunk_start):
+                type(self).captured.append((modes, chunk_start))     # the batch's own FEW call
+                return float(few_args[0])
 
-            def __call__(self, *p, **kw):
-                return self._call_knots(p, kw, None)
+            def _chunk_rows_batch(self, out_arr, chunk_items, m_lo, m_hi, few_kwargs):
+                for r, v in chunk_items.items():
+                    out_arr[r] = v + 10.0
+                n = len(chunk_items)
+                return dict(rows=n, windows=0, tail_layers=[0] * n, lookup_pixels=0, chunk_pixels=0,
+                            dropped_pixels=0, lookup="kernel")
+
+            def _call_knots(self, few_args, few_kwargs, modes, reuse=None):
+                raise AssertionError("a plunge-chunk row went through the single-template path")
 
         table = SimpleNamespace(fdot_vals=np.array([-1.0, 1.0]), INTERP_METHOD="spline")
         wdm = WDMSettings(32, 64, 10.0, force_backend="cpu")
         return _Stub(None, table, wdm, orbits=None, tdi_config=SimpleNamespace(nchannels=3),
                      t_start=0.0, data_t0=0.0, fine_dt=100.0)
+
+    def _gen_with_two_chunk_rows_and_one_lookup_row(self):
+        """The real generator (:func:`_synthetic_direct`, built once per class): ``self.rows`` =
+        two plunge-chunk rows then one lookup-only row; ``self.row_few_refuses`` is out of FEW's
+        domain."""
+        cls = type(self)
+        if cls._synth is None:
+            cls._synth = _synthetic_direct()
+        gen, self.rows, self.row_few_refuses, _ = cls._synth
+        return gen
+
+    def test_mixed_batch_matches_single_calls(self):
+        from lisatools.utils.utility import asnumpy
+
+        gen = self._gen_with_two_chunk_rows_and_one_lookup_row()
+        arr = gen.batch(self.rows, chunk_rows=4)
+        # read before the single calls below replace last_stats
+        self.assertEqual(gen.last_stats["chunk_rows"], 2)
+        self.assertEqual(gen.last_stats["alone"], 0)
+        self.assertEqual(len(gen.last_stats["tail_layers"]), 2)
+        self.assertTrue(all(n > 0 for n in gen.last_stats["tail_layers"]))   # both reach the chunk
+        for r, p in enumerate(self.rows):
+            one = gen(*p).arr[:, gen._band()[0]:gen._band()[1]]
+            np.testing.assert_allclose(asnumpy(arr[r]), asnumpy(one), rtol=1e-10, atol=1e-13)
+
+    def test_refused_chunk_row_stays_zero(self):
+        from lisatools.utils.utility import asnumpy
+
+        gen = self._gen_with_two_chunk_rows_and_one_lookup_row()
+        rows = list(self.rows); rows[1] = self.row_few_refuses      # a row inside the chunk group
+        arr = gen.batch(rows, chunk_rows=4, skip_domain_errors=True)
+        self.assertEqual(gen.last_failed_rows, [1])
+        self.assertTrue(np.all(asnumpy(arr[1]) == 0))
+        np.testing.assert_allclose(asnumpy(arr[0]), asnumpy(gen(*rows[0]).arr[:, gen._band()[0]:gen._band()[1]]), rtol=1e-10, atol=1e-13)
 
     def test_refused_row_is_zero_and_listed_across_chunks(self):
         d = self._direct()
@@ -574,59 +710,64 @@ class BatchDomainRefusalTest(unittest.TestCase):
             self.assertTrue(np.all(out[r] == want), r)
         self.assertEqual(d.last_stats["failed"], 2)
 
-    def test_alone_rows_reuse_the_first_few_call(self):
-        """A row built alone (plunge) reuses the batch's own _mode_list: one FEW call per row,
-        not two (the 720-day speed test paid ~80 ms per row for the second one)."""
+    def test_chunk_rows_reuse_the_first_few_call(self):
+        """A plunge-chunk row is captured from the batch's own _mode_list: one FEW call per row,
+        not two (the 720-day speed test paid ~80 ms per row for the second one), and the chunk
+        rows are batched, never built through the single-template path."""
         d = self._direct()
-        type(d).mode_calls, type(d).reused = 0, []
+        type(d).mode_calls, type(d).captured = 0, []
         d.batch([np.full(14, v) for v in (0.0, 3.0, 4.0)], chunk_rows=3)
         self.assertEqual(type(d).mode_calls, 3)
-        self.assertEqual(type(d).reused, [([], 0.0)] * 3)
+        self.assertEqual(type(d).captured, [([], 0.0)] * 3)
+        self.assertEqual((d.last_stats["chunk_rows"], d.last_stats["alone"]), (3, 0))
 
     def _gen_with_one_chunk_row(self):
-        """Tag-0 rows hand off to the plunge chunk and are built alone through the REAL
-        accumulate_harmonic_batch (one harmonic tripping the curvature trigger at pixel 80 of a
-        128-pixel grid, a fused-kernel stand-in counting the lookup pixels before it); tag-5 rows
-        stay on the lookup and are batched (response and kernel stubbed: 1000 lookup and 3
-        dropped pixels per batch); tag-7 rows end before the window (the real _call_knots's
-        early exact-zero return)."""
+        """Tag-0 rows hand off to the plunge chunk and are batched through the REAL
+        accumulate_harmonic_batch (each one harmonic tripping the curvature trigger at pixel 80
+        of a 128-pixel grid, a fused-kernel stand-in counting the lookup pixels before it; the
+        response stubbed out of _chunk_rows_batch); tag-5 rows stay on the lookup and are batched
+        (response and kernel stubbed: 1000 lookup and 3 dropped pixels per batch); tag-7 rows end
+        before the window (an exact zero, never a chunk row)."""
         from lisatools.domains import WDMSettings
         from lisatools.sources.emri import wdm_direct as wd
 
         class _Plunge(wd.EMRIDirectWDM):
             def _mode_list(self, few_args, few_kwargs):
-                self._last_holder = SimpleNamespace(t_arr=np.array([0.0, 1.0e12]))
+                t_end = -1000.0 if int(few_args[0]) == 7 else 1.0e12      # tag 7: before the window
+                self._last_holder = SimpleNamespace(t_arr=np.array([t_end - 1.0e4, t_end]))
                 return [], (0.0 if int(few_args[0]) in (0, 7) else None)
 
-            def _call_knots(self, few_args, few_kwargs, modes, reuse=None):
-                # the real _call_knots without FEW and the response; its last_stats as there
-                modes, chunk_start = reuse
+            def _chunk_item(self, few_args, modes, chunk_start):
+                return dict(modes=modes, chunk_start=chunk_start)
+
+            def _chunk_rows_batch(self, out_arr, chunk_items, m_lo, m_hi, few_kwargs):
+                # the real _chunk_rows_batch without FEW and the response: every chunk row one
+                # harmonic, the batched tail in the pairs form, its counters as there
                 wdm = self.wdm
-                if int(few_args[0]) == 7:
-                    self.last_stats = dict(modes=len(modes), n_fine=0, feed="knots",
-                                           chunk_start=chunk_start, lookup_pixels=0,
-                                           chunk_pixels=0, dropped_pixels=0,
-                                           ended_before_window=1)
-                    return SimpleNamespace(arr=np.zeros((3, wdm.Nf, wdm.Nt)))
+                rows = sorted(chunk_items)
                 n_ok = np.arange(self.pixel_edge, wdm.Nt - self.pixel_edge)
                 tn = n_ok * wdm.layer_dt
                 f = np.full_like(tn, 8.2 * wdm.layer_df)
                 track = wd.HarmonicTrack((2, 2, 0, 0), tn, np.ones_like(tn), 2 * np.pi * f * tn, f,
                                          np.zeros_like(tn), np.where(n_ok >= 80, 1.0, 0.0))
+                N = wdm.Nf * self.Nt_sub
 
-                def tail_td(ts):
-                    return np.repeat(np.cos(2 * np.pi * f[0] * ts)[None, None, :], 3, axis=1)
+                def tail_td(pairs):
+                    ts = np.stack([self.data_t0 + (n0 * wdm.Nf + np.arange(N)) * wdm.data_dt
+                                   for _, n0, _, _ in pairs])
+                    return np.repeat(np.cos(2 * np.pi * f[0] * ts)[:, None, :], 3, axis=1)
+                tail_td.summed, tail_td.by_pairs = True, True
 
-                acc = np.zeros((3, wdm.Nf, wdm.Nt))
-                totals = wd.accumulate_harmonic_batch(
-                    acc, self.table, [track], None, n_ok, tail_td, Nf=wdm.Nf, Nt=wdm.Nt,
+                st = wd.accumulate_harmonic_batch(
+                    out_arr, self.table, [track] * len(rows), None, n_ok, tail_td, Nf=wdm.Nf, Nt=wdm.Nt,
                     dt=wdm.data_dt, layer_dt=wdm.layer_dt, layer_df=wdm.layer_df, t0=self.data_t0,
-                    Nt_sub=self.Nt_sub, fdot_axis_max=self.fdot_axis_max,
-                    pixel_edge=self.pixel_edge,
-                    lookup_kernel=lambda n_stop: dict(lookup_pixels=3 * int(n_stop[0] - n_ok[0])))
-                self.last_stats = dict(modes=len(modes), n_fine=0, feed="knots",
-                                       chunk_start=chunk_start, lookup="kernel", **totals)
-                return SimpleNamespace(arr=acc)
+                    Nt_sub=self.Nt_sub, fdot_axis_max=self.fdot_axis_max, pixel_edge=self.pixel_edge,
+                    sub_row=np.asarray(rows), num_sub=len(rows), m_lo=m_lo,
+                    lookup_kernel=lambda n_stop: dict(lookup_pixels=int(np.sum(3 * (n_stop - n_ok[0])))))
+                return dict(rows=len(rows), windows=st["windows"],
+                            tail_layers=[st["tail_layers"][r] for r in rows],
+                            lookup_pixels=st["lookup_pixels"], chunk_pixels=st["chunk_pixels"],
+                            dropped_pixels=st["dropped_pixels"], lookup="kernel")
 
             def _knots_feed(self, H, p, t_fine, fly):
                 return None, np.zeros((2, 1)), None, None          # two harmonics
@@ -642,40 +783,40 @@ class BatchDomainRefusalTest(unittest.TestCase):
         return _Plunge(None, table, wdm, orbits=None, tdi_config=SimpleNamespace(nchannels=3),
                        t_start=0.0, data_t0=0.0, fine_dt=100.0, Nt_sub=32)
 
-    def test_batch_stats_carry_the_alone_rows_chunk_counters(self):
+    def test_batch_stats_carry_the_chunk_rows_counters(self):
         gen = self._gen_with_one_chunk_row()
         gen.batch([np.full(14, 0.0)], chunk_rows=4)
         st = gen.last_stats
-        self.assertEqual(st["alone"], 1)
-        self.assertGreater(st["chunk_pixels"], 0)      # the alone row's chunk pixels are counted
+        self.assertEqual((st["chunk_rows"], st["alone"]), (1, 0))
+        self.assertGreater(st["chunk_pixels"], 0)      # the chunk row's chunk pixels are counted
         self.assertEqual(len(st["tail_layers"]), 1)
         self.assertGreaterEqual(st["tail_layers"][0], gen.Nt_sub // 2)  # at least one kept interior
         self.assertGreaterEqual(st["windows"], 1)
 
-    def test_alone_rows_chunk_counters_add_to_the_batched_rows(self):
-        """On the kernel path the batched rows' counters are set by stats.update(**tot): the
-        alone row's are ADDED to them, not overwritten."""
+    def test_chunk_rows_counters_add_to_the_lookup_rows(self):
+        """On the kernel path the lookup rows' counters are set by stats.update(**tot): the
+        chunk rows' are ADDED to them, not overwritten."""
         gen = self._gen_with_one_chunk_row()
         gen.batch([np.full(14, 0.0)])
-        alone = dict(gen.last_stats)
+        chunk = dict(gen.last_stats)
         with mock.patch("lisatools.sources.emri.emritdionfly.EMRITDIonFly.sky",
                         return_value=(0, 0, 0.1, 0.2, 0.3)), \
                 mock.patch("lisatools.sources.emri.emritdionfly.EMRITDIonFly.run_response",
                            return_value=SimpleNamespace(x=np.array([[-1.0, 1.0e12]]))):
             gen.batch([np.full(14, 5.0), np.full(14, 0.0)], chunk_rows=4)
         st = gen.last_stats
-        self.assertEqual((st["alone"], st["subs"], st["lookup"]), (1, 2, "kernel"))
-        self.assertGreater(alone["lookup_pixels"], 0)
-        self.assertEqual(st["lookup_pixels"], 1000 + alone["lookup_pixels"])
-        self.assertEqual(st["dropped_pixels"], 3 + alone["dropped_pixels"])
-        self.assertEqual(st["chunk_pixels"], alone["chunk_pixels"])
+        self.assertEqual((st["chunk_rows"], st["subs"], st["lookup"]), (1, 2, "kernel"))
+        self.assertGreater(chunk["lookup_pixels"], 0)
+        self.assertEqual(st["lookup_pixels"], 1000 + chunk["lookup_pixels"])
+        self.assertEqual(st["dropped_pixels"], 3 + chunk["dropped_pixels"])
+        self.assertEqual(st["chunk_pixels"], chunk["chunk_pixels"])
         self.assertEqual((st["windows"], st["tail_layers"]),
-                         (alone["windows"], alone["tail_layers"]))
+                         (chunk["windows"], chunk["tail_layers"]))
 
     def test_rows_ending_before_the_window_are_not_chunk_rows(self):
-        """A row whose inspiral ends before the window takes the alone branch but is an exact
-        zero that never touches the plunge chunk: counted in ended_before_window, not as a chunk
-        row, no tail entry, nothing added to the pixel counters."""
+        """A row whose inspiral ends before the window hands off (its chunk start is set) but is
+        an exact zero that never touches the plunge chunk: counted in ended_before_window, not as
+        a chunk row, no tail entry, nothing added to the pixel counters."""
         gen = self._gen_with_one_chunk_row()
         gen.batch([np.full(14, 0.0)])
         chunk = dict(gen.last_stats)
@@ -687,7 +828,7 @@ class BatchDomainRefusalTest(unittest.TestCase):
             look = dict(gen.last_stats)
             gen.batch([np.full(14, 5.0), np.full(14, 0.0), np.full(14, 7.0)], chunk_rows=4)
         st = gen.last_stats
-        self.assertEqual(st["alone"], 1)
+        self.assertEqual((st["chunk_rows"], st["alone"]), (1, 0))
         self.assertEqual(len(st["tail_layers"]), 1)
         self.assertEqual(st["ended_before_window"], 1)
         for k in ("lookup_pixels", "chunk_pixels", "dropped_pixels"):
@@ -700,7 +841,7 @@ class BatchDomainRefusalTest(unittest.TestCase):
         gen = self._gen_with_one_chunk_row()
         gen.batch([np.full(14, 0.0)] * 2, chunk_rows=1)
         st = gen.last_stats
-        self.assertEqual(st["alone"], 2)
+        self.assertEqual(st["chunk_rows"], 2)
         self.assertEqual(len(st["tail_layers"]), 2)
         self.assertEqual(st["tail_layers"][0], st["tail_layers"][1])
 
@@ -724,9 +865,10 @@ class BatchDomainRefusalTest(unittest.TestCase):
         class _Ended(EMRIDirectWDM):
             def _mode_list(self, few_args, few_kwargs):
                 t_end = float(few_args[0])
-                self._last_holder = SimpleNamespace(t_arr=np.array([0.0, t_end]))
+                # knots every ~1 h: the in-window row's own response grid has enough points
+                self._last_holder = SimpleNamespace(t_arr=np.linspace(0.0, t_end, 16))
                 self._last_tracks, self._last_track_n = [], np.zeros(0, int)
-                return [(2, 2, 0, 0)], t_end - 1.0      # stops in/before the window: built alone
+                return [(2, 2, 0, 0)], t_end - 1.0      # stops in/before the window: a chunk row
 
             def _dense_response(self, items, t_fine):
                 raise _Reached()

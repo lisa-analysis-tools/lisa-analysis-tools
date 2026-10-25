@@ -21,6 +21,17 @@ def _dense_linear(t_k, Phi_k):
     return C
 
 
+def _has_dense_wrap():
+    """Whether the compiled CPU backend carries ``TDDenseTDIWaveformWrap`` (TDDenseTDIonTheFly
+    refuses to build without it)."""
+    try:
+        import lisatools
+
+        return lisatools.get_backend("cpu").TDDenseTDIWaveformWrap is not None
+    except Exception:
+        return False
+
+
 class TDDenseTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -89,6 +100,48 @@ class TDDenseTest(unittest.TestCase):
             for ch in range(3):
                 rel = np.max(np.abs(sig_d[s, ch] - sig_o[s, ch])) / np.max(np.abs(sig_o[s, ch]))
                 self.assertLess(rel, 1e-9, f"sub {s} ch {ch}: rel {rel:.2e}")
+
+    # the plunge chunk's window grid of EMRIDirectWDM._dense_td: Nf x Nt_sub samples of dt
+    NF_W, NT_SUB_W, DT_W = 32, 64, 10.0
+
+    def _gen_and_two_items(self):
+        """An EMRIDirectWDM on the dense response and the fixture's two templates as its items,
+        ``(dense inputs, (psi, lam, beta))`` (knots on the FEW clock, origin ``t_k[0]``)."""
+        from types import SimpleNamespace
+
+        from lisatools.domains import WDMSettings
+        from lisatools.sources.emri.wdm_direct import EMRIDirectWDM
+
+        table = SimpleNamespace(fdot_vals=np.array([-1.0, 1.0]), INTERP_METHOD="spline")
+        gen = EMRIDirectWDM(None, table, WDMSettings(self.NF_W, 256, self.DT_W, force_backend="cpu"),
+                            orbits=self.orbits, tdi_config=self.tdi, t_start=self.t_k[0],
+                            data_t0=self.t_k[0] + 3000.0, response="dense")
+        K = self.t_k.size
+        C = _dense_linear(self.t_k, self._fund(self.t_k))
+        items = []
+        for b, hs in enumerate(self.harm):
+            mkn = np.array([h[0] for h in hs], dtype=np.int32)
+            are, aim = np.zeros((len(hs), K - 1, 4)), np.zeros((len(hs), K - 1, 4))
+            for s, (_, c) in enumerate(hs):
+                are[s, :, 0], aim[s, :, 0] = c.real, c.imag
+            items.append(((self.t_k - self.t_k[0], C, mkn, are, aim), tuple(self.params[b, 1:])))
+        return gen, items[0], items[1]
+
+    def _window_grid(self, n0):
+        """Absolute sample times of the plunge-chunk window that starts at layer ``n0``."""
+        return self.t_k[0] + 3000.0 + (n0 * self.NF_W + np.arange(self.NF_W * self.NT_SUB_W)) * self.DT_W
+
+    @unittest.skipUnless(_has_dense_wrap(), "the compiled backend has no TDDenseTDIWaveformWrap")
+    def test_dense_td_batches_items_with_their_own_grids(self):
+        from lisatools.utils.utility import asnumpy
+
+        gen, item0, item1 = self._gen_and_two_items()           # two templates of the fixture's source
+        ts0, ts1 = self._window_grid(n0=0), self._window_grid(n0=64)
+        a = gen._dense_td([item0], ts0[None, :], sum_subs=True, stop_taper=120.0)
+        b = gen._dense_td([item1], ts1[None, :], sum_subs=True, stop_taper=120.0)
+        ab = gen._dense_td([item0, item1], np.stack([ts0, ts1]), sum_subs=True, stop_taper=120.0)
+        np.testing.assert_allclose(asnumpy(ab[0]), asnumpy(a[0]), rtol=1e-12, atol=1e-15)
+        np.testing.assert_allclose(asnumpy(ab[1]), asnumpy(b[0]), rtol=1e-12, atol=1e-15)
 
     def test_zero_outside_trajectory(self):
         """Delayed times past the last knot contribute nothing (plunge handled without a feed extension)."""

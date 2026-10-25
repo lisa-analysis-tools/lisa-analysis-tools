@@ -218,8 +218,9 @@ class EMRIDirectParityTest(_Armed):
 
     def test_stats_line_reports_the_chunk_split(self):
         move, adapter = self.move, self.direct
-        adapter.last_stats = dict(alone=2, lookup_pixels=1000, chunk_pixels=50, dropped_pixels=3,
-                                  windows=2, tail_layers=[20, 30])
+        # one row built through the single-template fallback (alone), one batched chunk row
+        adapter.last_stats = dict(alone=1, chunk_rows=1, lookup_pixels=1000, chunk_pixels=50,
+                                  dropped_pixels=3, windows=2, tail_layers=[20, 30])
         move.compute_like_local(_proposal_rows(2), np.array([0, 1]))    # one chunk of 2
         with self.assertLogs(_MOD, level="INFO") as cm:
             move._flush_stats()

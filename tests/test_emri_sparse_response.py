@@ -400,25 +400,31 @@ class ShortResponseGridTest(unittest.TestCase):
         self.assertEqual((t[1, 0], t[1, -1]), (1.0e7 + 600.0, 1.0e7 + 601.0))
 
     def test_batch_turns_it_into_a_refused_row(self):
+        """A plunge-chunk row whose own sparse grid is the 2-point fallback is refused when the
+        row is captured (before any kernel, and before the batched response could pad it to the
+        batch's common length)."""
+        from types import SimpleNamespace
         from unittest import mock
 
         from lisatools.utils.exceptions import WaveformDomainError
 
         d = self._direct("sparse")
-        items, _ = self._items()
 
         def mode_list(p, kw):
-            return [(2, 2, 0, 0)], 0.0                      # hands off: built alone
+            # ends within the delay margins of its start (and inside the window): a chunk row
+            d._last_holder = SimpleNamespace(t_arr=np.array([0.0, 400.0, 1000.0]))
+            d._last_tracks, d._last_track_n = None, np.zeros(0, int)
+            return [(2, 2, 0, 0)], 0.0
 
-        def call_knots(p, kw, modes, reuse=None):
-            return d._dense_response(items[:1], np.array([600.0, 601.0]))
-
-        with mock.patch("lisatools.sources.emri.emritdionfly.EMRITDIonFly"), \
+        with mock.patch("lisatools.sources.emri.emritdionfly.EMRITDIonFly.sky",
+                        return_value=(0, 0, 0.1, 0.2, 0.3)), \
+                mock.patch("lisatools.sources.emri.wdm_direct.dense_inputs_from_holder", return_value=None), \
                 mock.patch.object(d, "_mode_list", side_effect=mode_list), \
-                mock.patch.object(d, "_call_knots", side_effect=call_knots):
+                mock.patch.object(d, "_dense_kernel", side_effect=AssertionError("kernel ran")):
             arr = d.batch([np.zeros(14)], skip_domain_errors=True)
             self.assertEqual(d.last_failed_rows, [0])
             self.assertFalse(np.any(np.asarray(arr)))
+            self.assertEqual((d.last_stats["failed"], d.last_stats["chunk_rows"]), (1, 0))
             with self.assertRaises(WaveformDomainError):
                 d.batch([np.zeros(14)])
 
@@ -478,13 +484,15 @@ class PlungeTailTest(unittest.TestCase):
         d = self._direct()
         item = self._item(self.T_END)
         t_end = d.t_start + self.T_END
-        tail = d._dense_tail_fn(item, t_end)
+        # the tail of row 0 over the window n0 = 0 of Nt_sub = 64 layers (Nf 32 x 64 samples of 10 s)
+        tail = d._dense_tail_fn({0: item}, d.t_start, d.wdm.Nf, 64, d.wdm.data_dt)
         self.assertTrue(tail.summed)
         self.assertEqual(tail.taper, d.plunge_taper_s)
         self.assertGreater(tail.taper, 0.0)
         ts = d.t_start + np.arange(0.0, 20480.0, 10.0)
         raw = np.asarray(d._dense_td(item, ts, sum_subs=True))       # the hard stop
-        tap = np.asarray(tail(ts))                                   # (nch, n): summed in the kernel
+        tap = np.asarray(tail([(0, 0, 0, 64)]))[0]                   # (nch, n): summed in the kernel
+        self.assertEqual(tail.calls, 1)
         early = ts < t_end - tail.taper - 1000.0                     # every emission time before the taper
         np.testing.assert_array_equal(tap[:, early], raw[:, early])
         np.testing.assert_array_equal(tap[:, ts > t_end + 1000.0], 0.0)

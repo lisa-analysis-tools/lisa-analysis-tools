@@ -329,7 +329,8 @@ class EMRIDirectLikeMove(ResidualAddOneRemoveOneMove):
         self._stats["gen_s"] += t_score - t_gen
         # the lookup / plunge-chunk split of this batch (the generator's counters)
         st = getattr(adapter, "last_stats", {}) or {}
-        self._stats["chunk_rows"] += st.get("alone", 0)
+        # plunge-chunk rows: batched (chunk_rows) plus any built one at a time (alone)
+        self._stats["chunk_rows"] += st.get("alone", 0) + st.get("chunk_rows", 0)
         self._stats["lookup_px"] += st.get("lookup_pixels", 0)
         self._stats["chunk_px"] += st.get("chunk_pixels", 0)
         self._stats["dropped_px"] += st.get("dropped_pixels", 0)
