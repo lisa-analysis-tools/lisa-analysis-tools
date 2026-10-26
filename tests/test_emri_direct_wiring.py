@@ -679,11 +679,8 @@ class BatchDomainRefusalTest(unittest.TestCase):
     def _gen_in_mode(self, chunk_batch):
         """The fixture's REAL generator rebuilt (the same synthetic FEW stand-in, table and grid)
         with ``EMRI_DIRECT_CHUNK_BATCH`` set to ``chunk_batch`` (read at construction)."""
-        gen = self._gen_with_two_chunk_rows_and_one_lookup_row()
         with mock.patch.dict(os.environ, {"EMRI_DIRECT_CHUNK_BATCH": "1" if chunk_batch else "0"}):
-            return type(gen)(gen.few_gen, gen.table, gen.wdm, orbits=None, tdi_config=gen.tdi_config,
-                             t_start=gen.t_start, data_t0=gen.data_t0, Nt_sub=32, fine_dt_plunge=240.0,
-                             response="spline", lookup="python")
+            return self._sibling()
 
     def test_mixed_batch_matches_single_calls(self):
         """Both chunk-row modes (one call for all chunk rows, and one per row, the default): each
@@ -758,55 +755,62 @@ class BatchDomainRefusalTest(unittest.TestCase):
         return type(gen)(gen.few_gen, gen.table, gen.wdm, **args)
 
     def test_auto_window_reaches_the_generator(self):
-        """EMRI_DIRECT_NT_SUB=auto[:floor] on the real batch: the chunk rows' windows are planned at
-        ONE length for the call, each row's tail in one window; with a floor that holds every tail
-        the template is the fixed-length one, number for number."""
+        """EMRI_DIRECT_NT_SUB=auto[:floor] on the real batch, in both chunk-row modes: each chunk
+        row's tail in one window (one length per _chunk_rows_batch call: the batch's, or each
+        row's own by default); with a floor that holds every tail the template is the fixed-length
+        one, number for number."""
         from lisatools.utils.utility import asnumpy
 
-        with mock.patch.dict(os.environ, {"EMRI_DIRECT_NT_SUB": "auto:96"}):
-            auto = self._sibling(Nt_sub=None)
-        self.assertEqual((auto.Nt_sub, auto.nt_sub_floor), ("auto", 96))
-        got = asnumpy(auto.batch(self.rows, chunk_rows=4))
-        st = dict(auto.last_stats)
-        fixed = self._sibling(Nt_sub=96)
-        want = asnumpy(fixed.batch(self.rows, chunk_rows=4))
-        self.assertEqual((st["nt_sub_eff"], fixed.last_stats["nt_sub_eff"]), (96, 96))
-        self.assertEqual((st["chunk_rows"], st["windows"]), (2, 2))       # one window per chunk row
-        np.testing.assert_allclose(got, want, rtol=1e-12, atol=1e-15)
-        # a floor below the tails: the call's length grows past it, still one window per row
-        lean = self._sibling(Nt_sub="auto:32")
-        lean.batch(self.rows, chunk_rows=4)
-        st = dict(lean.last_stats)
-        self.assertGreater(st["nt_sub_eff"], 32)
-        self.assertEqual((st["chunk_rows"], st["windows"]), (2, 2))
-        lean(*self.rows[0])                                  # the single-template path reports it too
-        self.assertGreaterEqual(lean.last_stats["nt_sub_eff"], 32)
+        for chunk_batch in (False, True):
+            with self.subTest(chunk_batch=chunk_batch):
+                with mock.patch.dict(os.environ, {"EMRI_DIRECT_NT_SUB": "auto:96"}):
+                    auto = self._sibling(Nt_sub=None, chunk_batch=chunk_batch)
+                self.assertEqual((auto.Nt_sub, auto.nt_sub_floor), ("auto", 96))
+                got = asnumpy(auto.batch(self.rows, chunk_rows=4))
+                st = dict(auto.last_stats)
+                fixed = self._sibling(Nt_sub=96, chunk_batch=chunk_batch)
+                want = asnumpy(fixed.batch(self.rows, chunk_rows=4))
+                self.assertEqual((st["nt_sub_eff"], fixed.last_stats["nt_sub_eff"]), (96, 96))
+                self.assertEqual((st["chunk_rows"], st["windows"]), (2, 2))       # one window per chunk row
+                np.testing.assert_allclose(got, want, rtol=1e-12, atol=1e-15)
+                # a floor below the tails: the length grows past it, still one window per row
+                lean = self._sibling(Nt_sub="auto:32", chunk_batch=chunk_batch)
+                lean.batch(self.rows, chunk_rows=4)
+                st = dict(lean.last_stats)
+                self.assertGreater(st["nt_sub_eff"], 32)
+                self.assertEqual((st["chunk_rows"], st["windows"]), (2, 2))
+                lean(*self.rows[0])                          # the single-template path reports it too
+                self.assertGreaterEqual(lean.last_stats["nt_sub_eff"], 32)
 
     def test_tail_skip_knob_reaches_the_generator(self):
-        """EMRI_DIRECT_TAIL_SKIP_PX above the fixture's tails: both chunk rows keep the lookup
-        through their last pixel (no pairs, no chunk pixels, no tail entry; counted in
-        tail_skipped); each batch row is the single template built with the same knob; the chunk
-        rows differ from the default, tail-keeping template, the lookup-only row does not."""
+        """EMRI_DIRECT_TAIL_SKIP_PX above the fixture's tails, in both chunk-row modes: both chunk
+        rows keep the lookup through their last pixel (no pairs, no chunk pixels, no tail entry;
+        counted in tail_skipped); each batch row is the single template built with the same knob;
+        the chunk rows differ from the default, tail-keeping template, the lookup-only row does
+        not."""
         from lisatools.utils.utility import asnumpy
 
         default = self._gen_with_two_chunk_rows_and_one_lookup_row()
         want = asnumpy(default.batch(self.rows, chunk_rows=4))
         self.assertEqual(default.last_stats["tail_skipped"], 0)
-        with mock.patch.dict(os.environ, {"EMRI_DIRECT_TAIL_SKIP_PX": "200"}):
-            skip = self._sibling()
-        self.assertEqual(skip.tail_skip_px, 200)
-        got = asnumpy(skip.batch(self.rows, chunk_rows=4))
-        st = dict(skip.last_stats)
-        self.assertEqual((st["chunk_rows"], st["tail_skipped"], st["chunk_pixels"], st["windows"]), (2, 2, 0, 0))
-        self.assertEqual(st["tail_layers"], [])
-        m_lo, m_hi = skip._band()
-        for r, p in enumerate(self.rows):
-            np.testing.assert_allclose(got[r], asnumpy(skip(*p).arr[:, m_lo:m_hi]), rtol=1e-10, atol=1e-13)
-        skip(*self.rows[0])                                  # a chunk row alone: skipped too
-        self.assertEqual((skip.last_stats["tail_skipped"], skip.last_stats["chunk_pixels"]), (1, 0))
-        for r in (0, 1):
-            self.assertGreater(np.abs(got[r] - want[r]).max(), 1e-6 * np.abs(want[r]).max())
-        np.testing.assert_allclose(got[2], want[2], rtol=1e-12, atol=1e-15)
+        for chunk_batch in (False, True):
+            with self.subTest(chunk_batch=chunk_batch):
+                with mock.patch.dict(os.environ, {"EMRI_DIRECT_TAIL_SKIP_PX": "200"}):
+                    skip = self._sibling(chunk_batch=chunk_batch)
+                self.assertEqual(skip.tail_skip_px, 200)
+                got = asnumpy(skip.batch(self.rows, chunk_rows=4))
+                st = dict(skip.last_stats)
+                self.assertEqual((st["chunk_rows"], st["tail_skipped"], st["chunk_pixels"], st["windows"]),
+                                 (2, 2, 0, 0))
+                self.assertEqual(st["tail_layers"], [])
+                m_lo, m_hi = skip._band()
+                for r, p in enumerate(self.rows):
+                    np.testing.assert_allclose(got[r], asnumpy(skip(*p).arr[:, m_lo:m_hi]), rtol=1e-10, atol=1e-13)
+                skip(*self.rows[0])                          # a chunk row alone: skipped too
+                self.assertEqual((skip.last_stats["tail_skipped"], skip.last_stats["chunk_pixels"]), (1, 0))
+                for r in (0, 1):
+                    self.assertGreater(np.abs(got[r] - want[r]).max(), 1e-6 * np.abs(want[r]).max())
+                np.testing.assert_allclose(got[2], want[2], rtol=1e-12, atol=1e-15)
 
     def test_refused_chunk_row_stays_zero(self):
         from lisatools.utils.utility import asnumpy

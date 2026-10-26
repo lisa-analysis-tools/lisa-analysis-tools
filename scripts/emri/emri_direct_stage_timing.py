@@ -353,8 +353,7 @@ def main():
 
     base = dict(src=args.src, days=args.days, dt=args.dt, nf=nf, nt=nt, backend=args.backend,
                 response=args.response, nt_sub=nt_sub, nt_sub_floor=nt_floor, tail_skip_px=tail_skip_px,
-                chunk_batch=args.chunk_batch,
-                band=band, brick=box.brick, tobs_s=box.tobs,
+                chunk_batch=args.chunk_batch, band=band, brick=box.brick, tobs_s=box.tobs,
                 foreground=box.foreground, noise=box.describe(),
                 data_snr=None if box.d is None else box.data_snr)
 

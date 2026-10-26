@@ -1375,9 +1375,9 @@ class EMRIDirectWDM:
         Nt_sub (int | str): The fixed plunge-chunk length, or ``"auto"``.
         nt_sub_floor (int): The auto mode's smallest window length (the fixed length itself in
             fixed mode; the fine-grid and chunk-start rules read it).
+        tail_skip_px (int): The conditional-tail threshold [pixels] (0: never skip).
         chunk_batch (bool): Whether :meth:`batch` builds its plunge-chunk rows in one call
             (``EMRI_DIRECT_CHUNK_BATCH``; default ``False``: one per call).
-        tail_skip_px (int): The conditional-tail threshold [pixels] (0: never skip).
         fdot_axis_max (float): Largest ``|fdot|`` of the table's axis [Hz/s].
         plunge_taper_s (float): Source-frame stop taper [s] (``EMRI_DIRECT_PLUNGE_TAPER_S``,
             default 120).
@@ -2520,9 +2520,9 @@ class EMRIDirectWDM:
         alone rows' added to the lookup rows'), ``windows`` (the chunk and alone rows' chunk
         windows) and ``tail_layers`` (one entry per chunk / alone row: the pixels its plunge
         chunk filled; none for a row whose tail ``tail_skip_px`` skipped), ``tail_skipped`` (those
-        rows: looked up through their last pixel instead), plus ``nt_sub_eff`` (the batched chunk
-        rows' plunge window length: ``Nt_sub``, or the call's auto choice) when chunk rows were
-        built.
+        rows: looked up through their last pixel instead), plus ``nt_sub_eff`` (the chunk rows'
+        plunge window length: ``Nt_sub``, or the auto choice -- of the one batched call, or the
+        largest over the per-row calls) when chunk rows were built.
         """
         from ...utils.exceptions import WaveformDomainError
         from .domain import few_domain_guard
