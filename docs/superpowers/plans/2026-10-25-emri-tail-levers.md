@@ -134,3 +134,56 @@ GATE_DT=5 GATE_RESPONSE=dense python scripts/emri/emri_direct_wdm_gate.py --tabl
 ```
 
 Read: `[summary]` sparse/kernel single vs 8/call and "mm vs production"; `[split]` windows / nt_sub_eff / skipped; `[walls]` per phase for the single vs the 8-per-call batch (the phase whose per-row cost grows from single to batch is the regression).
+
+---
+
+## Handoff status (2026-10-25, end of day)
+
+**Where the code is.** `dev` was returned to the pre-change EMRI code: commit
+`18cbd285` reverts `c3116473..e05eec17`, so dev's tree is byte-identical to
+`37ea50cd` and the global fits launched from dev have none of this work.  Both
+plans (this one and `2026-10-24-emri-plunge-chunk-batching.md`) live on the
+`emri-plunge-batch` branch, rebuilt on top of that revert, so
+`git diff dev...emri-plunge-batch` is the whole change and a later merge into
+dev is a fast-forward.  Work on the branch in its own worktree
+(`git worktree add ../LAT-emri-batch emri-plunge-batch`) and run its tests and
+scripts with `PYTHONPATH=$PWD/tools/wtenv LAT_WORKTREE_SRC=$PWD/src` so the
+production checkout stays on dev.
+
+**Every knob keeps the previous behaviour by default**, on this branch too:
+`EMRI_DIRECT_CHUNK_BATCH=0` (one chunk row per call), `EMRI_DIRECT_NT_SUB`
+unset (128 layers), `EMRI_DIRECT_TAIL_SKIP_PX=0` (never), `EMRI_DIRECT_WALLS=0`
+(no device syncs).  The speed script opts in to batching and walls
+(`CHUNK_BATCH=1`, `WALLS=1`); nothing in the launchers sets any of them.
+
+**Verified on the H100 so far** (`emri_wave_test_new.log`, code at
+`e5906c90`, batching always on at that commit): batched tail accuracy
+unchanged (noise-weighted mm vs production 3.52e-6 at thr 1e-3, 3.71e-6 at
+1e-5), single-row vs batched-row parity ≤ 1.4e-10, sparse/kernel 720 d at
+thr 1e-3: single 162 ms, 1-per-call 160 ms, 8-per-call 178 ms (production
+spline path 362 ms); NT_SUB 128 / 96 / 64 give identical mismatch (the window
+length is a weak lever: the tail starts at the first harmonic trip, so a
+shorter window only moves the fine-grid segment).
+
+**The 2026-10-25 run (`emri_first.log`) ran a stale checkout** (its header
+line and argparse behaviour match ~`e5906c90`: batching unconditional, no
+`--chunk-batch` / `--walls`, integer-only `--nt-sub`).  Consequences: the
+`lever_prod` and `lever_batch` runs executed the same batched code (there is
+still NO production-vs-batched comparison at the branch head), no `[walls]`
+lines were possible, and `NT_SUB=auto` was rejected by argparse.  The
+durations script now prints `[durations] code: <rev> on <branch>` first; read
+that before the numbers.  Still to run at the branch head: `CHUNK_BATCH=0` vs
+`CHUNK_BATCH=1` on the same rows, the `[walls]` split of the 8-per-call loss
+(the leading hypothesis is the warm-up: the 2-row warm-up then the pool free
+puts first-use cudaMalloc / cuFFT plan creation inside the timed region),
+`NT_SUB=auto`, and `TAIL_SKIP_PX=100` with the gate's mismatch.
+
+**Unexplained once:** the first python of that session failed with
+`BackendUnavailableException: 'cuda13x' backend could not be imported`
+(`src/lisatools/cutils/__init__.py`, `cuda13x_module_loader`); the next
+processes imported it fine.  The script's failure handler now prints 40 lines
+of the failing log so the chained ImportError is visible next time.
+
+**Laptop:** the compiled backend here predates `TDDenseTDIWaveformWrap`; the
+dense tests skip on this branch and error on dev.  Run the GPU checks on the
+cluster.

@@ -93,6 +93,8 @@ mkdir -p "${OUT}"
 common=(--backend "${BACKEND}" --dt 2.5 --src "${SRC}" --direct-table "${TABLE}"
         --catalog "${CATALOG}" --orbits "${ORBITS}" --edge "${EDGE}" --foreground "${FOREGROUND}")
 if [ -n "${L1_DIR}" ]; then common+=(--l1-dir "${L1_DIR}"); fi
+_repo=$(cd "$(dirname "$0")/../.." && pwd)
+echo "[durations] code: $(git -C "${_repo}" rev-parse --short HEAD 2>/dev/null || echo unknown)$(git -C "${_repo}" diff --quiet 2>/dev/null || echo '+dirty') on $(git -C "${_repo}" branch --show-current 2>/dev/null || echo '?') (${_repo})"
 for days in ${DAYS}; do
   log="${OUT}/stages_${days}d.log"
   echo "[durations] ${days} d: grids ${GRIDS}, lookups ${LOOKUPS}, band ${BAND:-all}, rows per call ${CHUNKS} over ${ROWS} rows, nt_sub ${NT_SUB:-default}, tail skip px ${TAIL_SKIP_PX:-default}, chunk_batch ${CHUNK_BATCH} -> ${log}"
@@ -100,14 +102,14 @@ for days in ${DAYS}; do
     --response dense --response-grid "${GRIDS}" --lookup "${LOOKUPS}" --band-hz "${BAND}" \
     --batch-rows "${ROWS}" --chunk-rows "${CHUNKS}" --chunk-batch "${CHUNK_BATCH}" --walls "${WALLS}" ${tail_args[@]+"${tail_args[@]}"} \
     --reps "${REPS}" --out "${OUT}/stages.jsonl" 2>&1 | grep -v "ModeSelector\|lisaconstants\|warnings.warn" \
-    > "${log}" || { echo "[durations] FAILED: ${log}"; tail -4 "${log}"; }
+    > "${log}" || { echo "[durations] FAILED: ${log}"; tail -40 "${log}"; }
   grep "^\[snr\]\|^\[data\]\|^\[speed\] orbits\|^\[split\]\|^\[walls\]\|^\[parity\]" "${log}" || true
   sed -n '/^\[summary\]/,/^$/p' "${log}" || true
   log="${OUT}/accuracy_${days}d.log"
   echo "[durations] ${days} d accuracy sparse vs pixels vs production -> ${log}"
   python scripts/emri/emri_direct_sparse_check.py "${common[@]}" --days "${days}" --thresh "${THRESH}" \
     --rows 16 2>&1 | grep -v "ModeSelector\|lisaconstants\|warnings.warn" > "${log}" \
-    || { echo "[durations] FAILED: ${log}"; tail -4 "${log}"; }
+    || { echo "[durations] FAILED: ${log}"; tail -40 "${log}"; }
   grep "^\[sparse\]" "${log}" || true
 done
 echo "[durations] done: ${OUT}/"
