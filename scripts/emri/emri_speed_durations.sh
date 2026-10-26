@@ -38,7 +38,8 @@
 #   EMRI_DIRECT_NT_SUB for the accuracy step -- unset, the generators keep their own default, 128,
 #   which a short window (Nt < 128, DAYS <= 5) may run with, while a chosen value must be <= Nt;
 #   the stage timing's [split] lines -- printed below -- give the lookup / chunk split of every
-#   timed call, its [parity] lines each batched row against the same row built alone),
+#   timed call, its [walls] lines the phase walls of the batched chunk path per row, its
+#   [parity] lines each batched row against the same row built alone),
 #   TAIL_SKIP_PX (rows whose plunge tail spans at most this many pixels are looked up through
 #   their end instead; same pattern: only when TAIL_SKIP_PX or EMRI_DIRECT_TAIL_SKIP_PX is set is
 #   it passed as --tail-skip-px and exported as EMRI_DIRECT_TAIL_SKIP_PX -- unset, the generators'
@@ -97,7 +98,7 @@ for days in ${DAYS}; do
     --batch-rows "${ROWS}" --chunk-rows "${CHUNKS}" --chunk-batch "${CHUNK_BATCH}" ${tail_args[@]+"${tail_args[@]}"} \
     --reps "${REPS}" --out "${OUT}/stages.jsonl" 2>&1 | grep -v "ModeSelector\|lisaconstants\|warnings.warn" \
     > "${log}" || { echo "[durations] FAILED: ${log}"; tail -4 "${log}"; }
-  grep "^\[snr\]\|^\[data\]\|^\[speed\] orbits\|^\[split\]\|^\[parity\]" "${log}" || true
+  grep "^\[snr\]\|^\[data\]\|^\[speed\] orbits\|^\[split\]\|^\[walls\]\|^\[parity\]" "${log}" || true
   sed -n '/^\[summary\]/,/^$/p' "${log}" || true
   log="${OUT}/accuracy_${days}d.log"
   echo "[durations] ${days} d accuracy sparse vs pixels vs production -> ${log}"

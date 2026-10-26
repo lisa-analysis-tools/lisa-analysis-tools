@@ -478,6 +478,25 @@ choreography is untouched, only the scoring changes.
   and stays the speed test's default (`emri_speed_durations.sh` `CHUNK_BATCH=1`, `--chunk-batch`)
   until it is shown faster. The lookup-only rows are batched in both modes; the stats are the
   same (`last_stats["chunk_batch"]` says which ran).
+* **Phase walls (10-25).** Every `batch` / single call records `last_stats["walls"]`: exclusive
+  wall seconds per phase -- `capture` (the row loop: FEW, tracks, grids, `_chunk_item`),
+  `response` (`_dense_response` / `run_response`), `lookup` (fused kernel or Python tracer +
+  table), `tail_dense` (`tail_td(pairs)`), `transform` (`wdm_chunk_of_td`), `splice`, `plan`
+  (handoffs, pixel ranges, track subsets, the pair plan), `alloc` (the output array) -- and
+  `total`; on cupy every boundary synchronises the stream first, so GPU time lands in the phase
+  that launched it (a few synchronisations per call). `walls_detail` splits the response (the
+  padding to the common grid, the kernel object's construction and uploads, the kernel, the
+  output splines) and the tail (kernel objects, channels kernel); `n_response_points` /
+  `n_response_points_rows` give the chunk rows' padded common response length and their own
+  lengths; `walls_per_call` (batch) each `_batch_chunk` call's wall time. Not in the move's
+  `[EMRI_DIRECT]` line. The speed script prints them per row after the single call and after
+  every timed batch: `[walls] grid=G thr=T nt_sub=N chunk_batch=1 batch of B (C per call): capture
+  a ms/row, response b (pad, setup, kernel, splines), lookup c, tail d (setup, kernel), transform
+  e, splice f, plan p, alloc x, total g (unattributed u); response points padded P (rows
+  p_min..p_max); per call: first c1 ms, rest median c2 ms`. The phase whose per-row cost grows from
+  the single call to the 8-per-call batch is where the batch loses (the 10-25 H100 run: 181 vs 161
+  ms per template at 1e-3, 327 vs 279 at 1e-5). Laptop, spline path, the wiring fixture (2 chunk
+  rows + 1 lookup row): the phases add up to 99.8-99.9 % of the total.
 * **Template generation follows (10-03).** In direct mode the engine's EMRI template generator
   (`SourceSignalGen`: residual rebuilds at load, the move's expose/fold through the containers'
   installed generator) is the direct template too, so fills, rebuilds and scoring use one template

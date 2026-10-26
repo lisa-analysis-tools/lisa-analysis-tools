@@ -666,8 +666,22 @@ class AssemblyTest(unittest.TestCase):
             a0, s0 = self._accumulate_spans((10, 48), **kw, **self.AUTO_GEOM)
             a1, s1 = self._accumulate_spans((10, 48), tail_skip_px=0, **kw, **self.AUTO_GEOM)
             np.testing.assert_array_equal(a1, a0)
-            self.assertEqual(s1, s0)
+            self.assertEqual(*({k: v for k, v in st.items() if k != "walls"} for st in (s1, s0)))   # walls: timing
             self.assertEqual((s1["tail_skipped"], s1["tail_skipped_rows"]), (0, []))
+
+    def test_accumulate_records_its_phases(self):
+        """``walls``: the call's phases go into the caller's clock and come back as ``stats["walls"]``
+        (this call only)."""
+        from lisatools.sources.emri.wdm_direct import _PhaseWalls
+
+        clock = _PhaseWalls()
+        with clock.phase("outer"):
+            _, st = self._accumulate_spans((10, 48), walls=clock, **self.AUTO_GEOM)
+        self.assertEqual(set(st["walls"]), {"plan", "lookup", "tail_dense", "transform", "splice"})
+        self.assertTrue(all(v >= 0 for v in st["walls"].values()))
+        for k, v in st["walls"].items():
+            self.assertAlmostEqual(clock.walls[k], v, places=9)    # one call: the clock holds exactly these
+        self.assertIn("outer", clock.walls)                         # the enclosing phase keeps the rest
 
     def test_auto_window_excludes_skipped_rows(self):
         """Ruling R1: the auto length comes from the rows that KEEP a tail (the skip acts first)."""
@@ -678,6 +692,30 @@ class AssemblyTest(unittest.TestCase):
         _, st = self._accumulate_spans((10, 48), nt_sub_auto=True, nt_sub_floor=8, tail_skip_px=16,
                                        **self.AUTO_GEOM)
         self.assertEqual((st["nt_sub_eff"], st["windows"]), (104, 1))   # row 1 alone: 2 * (48 + 2) + 4
+
+
+class PhaseWallsTest(unittest.TestCase):
+    """_PhaseWalls: a nested phase pauses the enclosing one (the phases partition the covered time),
+    a detail timer does not."""
+
+    def test_nested_phases_are_exclusive(self):
+        import time
+
+        from lisatools.sources.emri.wdm_direct import _PhaseWalls
+
+        c = _PhaseWalls()
+        with c.phase("a") as ra:
+            time.sleep(0.02)
+            with c.phase("b") as rb:
+                time.sleep(0.03)
+            with c.detail("d"):
+                time.sleep(0.01)
+        self.assertAlmostEqual(c.walls["a"] + c.walls["b"], ra["s"], places=9)
+        self.assertAlmostEqual(c.walls["b"], rb["s"], places=9)
+        self.assertGreater(c.walls["b"], 0.025)
+        self.assertGreater(c.walls["a"], 0.025)                    # 0.02 + the 0.01 detail
+        self.assertGreater(c.detail_walls["d"], 0.005)
+        self.assertEqual(set(c.walls), {"a", "b"})
 
 
 class HolderSliceTest(unittest.TestCase):

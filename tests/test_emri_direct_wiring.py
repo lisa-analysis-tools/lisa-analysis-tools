@@ -812,6 +812,29 @@ class BatchDomainRefusalTest(unittest.TestCase):
                     self.assertGreater(np.abs(got[r] - want[r]).max(), 1e-6 * np.abs(want[r]).max())
                 np.testing.assert_allclose(got[2], want[2], rtol=1e-12, atol=1e-15)
 
+    def test_chunk_rows_batch_records_phase_walls(self):
+        """``last_stats["walls"]`` of one batch call: exclusive seconds per phase (capture,
+        response, lookup, tail_dense, transform, splice, ...) that add up to the call's total, and
+        the response grid lengths (padded common length, per-row lengths); a single call records
+        its own."""
+        gen = self._gen_with_two_chunk_rows_and_one_lookup_row()
+        gen.batch(self.rows, chunk_rows=4)
+        st = dict(gen.last_stats)
+        walls = st["walls"]
+        phases = {"capture", "response", "lookup", "tail_dense", "transform", "splice"}
+        self.assertGreaterEqual(set(walls), phases | {"total"})
+        self.assertTrue(all(v >= 0 for v in walls.values()), walls)
+        parts = sum(v for k, v in walls.items() if k != "total")
+        self.assertLessEqual(abs(parts - walls["total"]), 0.1 * walls["total"], walls)
+        self.assertEqual(len(st["n_response_points_rows"]), 2)                # the two chunk rows
+        self.assertEqual(st["n_response_points"], max(st["n_response_points_rows"]))
+        self.assertTrue(all(isinstance(v, float) for v in st["walls_detail"].values()))
+        gen(*self.rows[0])
+        walls = gen.last_stats["walls"]
+        self.assertGreaterEqual(set(walls), phases | {"total"})
+        parts = sum(v for k, v in walls.items() if k != "total")
+        self.assertLessEqual(abs(parts - walls["total"]), 0.1 * walls["total"], walls)
+
     def test_refused_chunk_row_stays_zero(self):
         from lisatools.utils.utility import asnumpy
 
