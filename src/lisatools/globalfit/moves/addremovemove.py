@@ -93,7 +93,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         acs: AnalysisContainerArray,
         num_repeats: int,
         transform_fn: TransformContainer,
-        priors: ProbDistContainer,
+        priors: dict[str, ProbDistContainer | list[ProbDistContainer]],
         inner_moves: list,
         Tmax: float = np.inf,
         betas_all: np.ndarray = None,
@@ -113,6 +113,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         self.waveform_gen = waveform_gen
         self.num_repeats = num_repeats
         self.transform_fn = transform_fn
+        self._validate_prior(priors)
         self.priors = priors
         self.waveform_gen_kwargs = waveform_gen_kwargs
         self.waveform_like_kwargs = waveform_like_kwargs
@@ -173,7 +174,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         if 'periodic' in kwargs:
             self.periodic = kwargs['periodic']
 
-        self.flow_wait = 20 # do not use flow move until at least 10 proposals have been made. This is to make sure that the flow move has enough data to train on.
+        self.flow_wait = 20 # do not use flow move until at least N proposals have been made. This is to make sure that the flow move has enough data to train on.
 
     @property
     def periodic(self):
@@ -187,6 +188,53 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             for tmp_move in self.moves:
                 if tmp_move.periodic is None:
                     tmp_move.periodic = periodic
+
+    def _validate_prior(self, prior: ProbDistContainer | list[ProbDistContainer]):
+        """Check that the prior is compatible with the branch's coordinates.
+
+        Args:
+            prior: Prior distribution container for the branch.
+
+        Raises:
+            ValueError: If the prior is not compatible with the branch's coordinates.
+        """
+        if isinstance(prior[self.branch_name], list):
+            if len(prior[self.branch_name]) != self.nleaves_max:
+                raise ValueError(
+                    f"Prior list length {len(prior[self.branch_name])} does not match nleaves_max {self.nleaves_max}."
+                )
+            for i, p in enumerate(prior[self.branch_name]):
+                if p.ndim != self.ndim:
+                    raise ValueError(
+                        f"Prior at index {i} has ndim {p.ndim} which does not match branch ndim {self.ndim}."
+                    )
+        else:
+            if prior[self.branch_name].ndim != self.ndim:
+                raise ValueError(
+                    f"Prior has ndim {prior[self.branch_name].ndim} which does not match branch ndim {self.ndim}."
+                )
+
+    def get_prior_for_leaf(self, leaf_index: int) -> ProbDistContainer:
+        """Get the prior distribution for a specific leaf.
+
+        Args:
+            leaf_index: Index of the leaf.
+        
+        Returns:
+            Prior distribution container for the specified leaf.
+        Raises:
+            IndexError: If the leaf_index is out of bounds.
+        """
+        prior_branch = self.priors[self.branch_name]
+
+        if isinstance(prior_branch, list):
+            if leaf_index < 0 or leaf_index >= len(prior_branch):
+                raise IndexError(
+                    f"Leaf index {leaf_index} is out of bounds for prior list of length {len(prior_branch)}."
+                )
+            return prior_branch[leaf_index]
+        else:
+            return prior_branch
     
     @property
     def sub_moves(self):
@@ -576,6 +624,8 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             ][
                 : self.ntemps
             ]  # as: make sure only local ntemps are used
+
+            prior_here = self.get_prior_for_leaf(leaf)
             # ntemps_full = new_state.sub_states[self.branch_name].betas_all[leaf].shape[0]
 
             ntemps_full, _, _, ndim = new_state.branches[self.branch_name].coords.shape
@@ -648,7 +698,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
                     breakpoint()
 
             prev_logp = (
-                self.priors[self.branch_name]
+                prior_here
                 .logpdf(old_coords)
                 .reshape((self.ntemps, self.nwalkers))
             )
@@ -719,7 +769,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
 
                     # Compute prior of the proposed position
                     # new_inds_prior is adjusted if product-space is used
-                    logp = self.priors[self.branch_name].logpdf(new_points.reshape(-1, ndim))
+                    logp = prior_here.logpdf(new_points.reshape(-1, ndim))
                     in_prior = ~np.isinf(logp)
                     logl = np.full_like(logp, -1e300)
 
@@ -910,7 +960,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         # TODO: add check with last used logl
 
         current_lp = (
-            self.priors[self.branch_name]
+            prior_here
             .logpdf(new_state.branches[self.branch_name].coords[0, :, :].reshape(-1, ndim))
             .reshape(new_state.branches[self.branch_name].shape[1:-1])
             .sum(axis=-1)
