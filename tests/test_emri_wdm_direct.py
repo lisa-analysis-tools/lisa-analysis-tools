@@ -258,6 +258,29 @@ class NtSubKnobTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "EMRI_DIRECT_NT_SUB"):
                     self._make_gen()
 
+    def test_nt_sub_knob_auto_reads_its_floor(self):
+        """``auto`` / ``auto:<floor>``: one window length per call from the tails (``Nt_sub ==
+        "auto"``), never below ``nt_sub_floor`` (128 unless given); the floor tiles like a fixed
+        length (even, >= 8, <= Nt). A fixed length is its own floor."""
+        import os
+
+        with mock.patch.dict(os.environ, {"EMRI_DIRECT_NT_SUB": "auto"}):
+            g = self._make_gen()
+            self.assertEqual((g.Nt_sub, g.nt_sub_floor), ("auto", 128))
+        with mock.patch.dict(os.environ, {"EMRI_DIRECT_NT_SUB": "auto:96"}):
+            g = self._make_gen()
+            self.assertEqual((g.Nt_sub, g.nt_sub_floor), ("auto", 96))
+        with mock.patch.dict(os.environ, {"EMRI_DIRECT_NT_SUB": "64"}):
+            self.assertEqual(self._make_gen(Nt_sub="auto:48").nt_sub_floor, 48)   # explicit wins
+        g = self._make_gen(Nt_sub=96)
+        self.assertEqual((g.Nt_sub, g.nt_sub_floor), (96, 96))
+        g = self._make_gen()
+        self.assertEqual((g.Nt_sub, g.nt_sub_floor), (128, 128))
+        for bad in ("auto:7", "auto:x", "auto:6", "auto:100000", "auto:", "autox", "auto:96:2", "x"):
+            with mock.patch.dict(os.environ, {"EMRI_DIRECT_NT_SUB": bad}):
+                with self.assertRaisesRegex(ValueError, "EMRI_DIRECT_NT_SUB"):
+                    self._make_gen()
+
 
 class AssemblyTest(unittest.TestCase):
     """A8: accumulate_harmonic_batch places the lookup before the handoff and the chunk
@@ -494,6 +517,107 @@ class AssemblyTest(unittest.TestCase):
         sl = slice(40, self.NT - 32)   # the (non-stopping) truth carries grid-end contamination
         rel = np.linalg.norm(acc[..., sl] - self.truth[..., sl]) / np.linalg.norm(self.truth[..., sl])
         self.assertLess(rel, 2e-3, f"rel L2 {rel:.2e}")
+
+    # -- the window length per call (EMRI_DIRECT_NT_SUB=auto) and the conditional tail
+    # (EMRI_DIRECT_TAIL_SKIP_PX): rows of the two-row fixture above with chosen handoff-to-end
+    # spans (the pixels from a row's common handoff to its last tracked pixel, inclusive) on
+    # grids long enough for 164- to 392-layer windows (the table is grid-length agnostic)
+
+    def _span_rows(self, spans, n_last):
+        """One row per span: two half-amplitude subs of the chirp (row r's carrier offset by 0.7 r
+        rad, as :meth:`_row_signal`) handing off ``spans[r] - 1`` pixels before the last tracked
+        pixel ``n_last`` and 3 pixels later (the row's common handoff is the first). Returns
+        ``(tracks, tracer, n_ok, sub_row)``."""
+        from lisatools.sources.emri import wdm_direct as wd
+
+        n_ok = np.arange(40, n_last + 1)
+        tn = n_ok * self.wdm.layer_dt
+        f = self.f0 + self.fdot * tn
+        tracks, parts = [], []
+        for r, s in enumerate(spans):
+            n_h = n_last - s + 1
+            phase = 2 * np.pi * (self.f0 * tn + 0.5 * self.fdot * tn ** 2) + self.phi0 + 0.7 * r
+            tracks += [wd.HarmonicTrack((2, 2, 0, 0), tn, np.ones_like(tn), phase, f, np.full_like(tn, self.fdot),
+                                        np.where(n_ok >= k, 1.0, 0.0)) for k in (n_h, n_h + 3)]
+            parts.append((np.full((2, 1, tn.size), 0.5), np.stack([phase[None]] * 2), np.stack([f[None]] * 2),
+                          np.full((2, 1, tn.size), self.fdot)))
+        tracer = tuple(np.concatenate(x) for x in zip(*parts))
+        return tracks, tracer, n_ok, np.repeat(np.arange(len(spans)), 2)
+
+    def _tail_rows(self, nt_sub):
+        """The pairs-form tail of :meth:`_span_rows`' rows: windows of ``nt_sub`` layers unless the
+        call passes its own ``Nt_sub`` (the auto window length); records its calls and lengths."""
+        def tail(pairs, Nt_sub=None):
+            tail.calls += 1
+            tail.lengths.append(Nt_sub)
+            N = self.NF * (nt_sub if Nt_sub is None else Nt_sub)
+            return np.stack([self._row_signal((n0 * self.NF + np.arange(N)) * self.DT, r)[None, :]
+                             for r, n0, _, _ in pairs])
+        tail.calls, tail.lengths, tail.summed, tail.by_pairs = 0, [], True, True
+        return tail
+
+    def _accumulate_spans(self, spans, n_last, Nt, pixel_edge, Nt_sub=128, **kw):
+        """:func:`accumulate_harmonic_batch` over :meth:`_span_rows`' rows on an ``Nt``-layer grid;
+        ``self.transform_calls`` / ``self.tail_calls`` / ``self.tail_lengths`` count the
+        ``wdm_chunk_of_td`` and tail calls. Returns ``(acc, stats)``."""
+        from lisatools import wdm_het
+        from lisatools.sources.emri import wdm_direct as wd
+
+        tracks, tracer, n_ok, sub_row = self._span_rows(spans, n_last)
+        tail = self._tail_rows(Nt_sub)
+        acc = np.zeros((len(spans), 1, self.NF, Nt))
+        with mock.patch("lisatools.wdm_het.wdm_chunk_of_td", wraps=wdm_het.wdm_chunk_of_td) as tr:
+            stats = wd.accumulate_harmonic_batch(
+                acc, self.table, tracks, tracer, n_ok, tail, Nf=self.NF, Nt=Nt, dt=self.DT,
+                layer_dt=self.wdm.layer_dt, layer_df=self.wdm.layer_df, t0=0.0, Nt_sub=Nt_sub, num_m_layers=2,
+                fdot_axis_max=float(np.max(np.abs(self.table.fdot_vals))), pixel_edge=pixel_edge,
+                sub_row=sub_row, **kw)
+        self.transform_calls, self.tail_calls, self.tail_lengths = tr.call_count, tail.calls, tail.lengths
+        return acc, stats
+
+    # both modes clip the tail end at Nt - pixel_edge here (pixel_edge 64 on a 320-layer grid, last
+    # tracked pixel 223: every row's tail ends at pixel 256), so a FIXED run at the auto length
+    # plans exactly the auto windows -- otherwise its past-end extent, Nt_sub // 4, would differ
+    # from auto's nt_sub_floor // 4 -- and the windows stay clear of the grid-end chunk
+    AUTO_GEOM = dict(n_last=223, Nt=320, pixel_edge=64)
+
+    def test_auto_window_fits_every_row_in_one_window(self):
+        acc, stats = self._accumulate_spans((37, 48), nt_sub_auto=True, nt_sub_floor=128, **self.AUTO_GEOM)
+        self.assertEqual(stats["nt_sub_eff"], 164)          # 2 * (48 + 32) + 4 = 164, a multiple of 4, >= 128
+        self.assertEqual(stats["windows"], 2)               # one per row
+        self.assertEqual(sorted(r for (r, *_) in stats["pairs"]), [0, 1])
+        self.assertEqual((self.transform_calls, self.tail_calls), (1, 1))
+        self.assertEqual(self.tail_lengths, [164])          # the pairs form is told the call's length
+        acc_fixed, stats_fixed = self._accumulate_spans((37, 48), Nt_sub=164, **self.AUTO_GEOM)
+        self.assertEqual(stats_fixed["pairs"], stats["pairs"])
+        self.assertEqual(self.tail_lengths, [None])         # fixed mode: the call is unchanged
+        np.testing.assert_allclose(acc, acc_fixed, rtol=1e-12, atol=1e-14)   # auto == the same fixed length
+        # ... and the template of the default 128-layer windows (two per row here) up to their
+        # edge contamination (measured 3.1e-6 of the peak; 128's worst kept pixel ~2e-6)
+        acc_128, st_128 = self._accumulate_spans((37, 48), Nt_sub=128, **self.AUTO_GEOM)
+        self.assertEqual((st_128["windows"], st_128["nt_sub_eff"]), (4, 128))
+        rel = np.abs(acc - acc_128).max() / np.abs(acc_128).max()
+        self.assertLess(rel, 1e-5, f"auto vs fixed 128: max rel {rel:.2e}")
+
+    def test_auto_window_respects_floor_and_grid(self):
+        _, stats = self._accumulate_spans((5, 7), nt_sub_auto=True, nt_sub_floor=128, **self.AUTO_GEOM)
+        self.assertEqual((stats["nt_sub_eff"], stats["windows"]), (128, 2))   # tiny tails: the floor
+        _, stats = self._accumulate_spans((5, 7), nt_sub_auto=True, nt_sub_floor=96, **self.AUTO_GEOM)
+        self.assertEqual(stats["nt_sub_eff"], 96)           # 2 * (7 + 24) + 4 = 66 -> 68 < 96
+        # tails too long for one window on the grid: capped at the largest even length <= Nt -
+        # pixel_edge, tiled (still one transform), and the fixed result at that length
+        geom = dict(n_last=359, Nt=400, pixel_edge=8)
+        acc, stats = self._accumulate_spans((300, 310), nt_sub_auto=True, nt_sub_floor=128, **geom)
+        self.assertEqual(stats["nt_sub_eff"], 392)          # 2 * (310 + 32) + 4 = 688 > 392
+        self.assertLessEqual(stats["nt_sub_eff"], 392)
+        self.assertEqual(stats["nt_sub_eff"] % 2, 0)
+        self.assertGreaterEqual(stats["windows"], 2)        # a tail that cannot fit is tiled
+        self.assertEqual(self.transform_calls, 1)
+        acc_fixed, _ = self._accumulate_spans((300, 310), Nt_sub=392, **geom)
+        np.testing.assert_allclose(acc, acc_fixed, rtol=1e-12, atol=1e-14)
+        _, stats = self._accumulate_spans((300, 310), nt_sub_auto=True, nt_sub_floor=128,
+                                          **dict(geom, pixel_edge=9))
+        self.assertEqual(stats["nt_sub_eff"], 390)          # Nt - pixel_edge = 391: the even 390
 
 
 class HolderSliceTest(unittest.TestCase):

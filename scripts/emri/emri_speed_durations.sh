@@ -32,7 +32,8 @@
 #   TABLE, CATALOG, ORBITS (auto; equal-arm skips the data), L1_DIR (""), MOJITO_DATA_PATH
 #   (/shared/data/mojito_cache), CHUNKS ("1,2,4,8,16,32"), ROWS (32), GRIDS
 #   ("sparse,pixels"), LOOKUPS ("kernel,python"), BAND ("2.5e-4,2.5e-2"; "" = all layers), EDGE (60),
-#   FOREGROUND (on), NT_SUB (the plunge-chunk length in time layers; only when NT_SUB or
+#   FOREGROUND (on), NT_SUB (the plunge-chunk length in time layers, or auto / auto:<floor>: one
+#   length per call holding its longest tail in one window; only when NT_SUB or
 #   EMRI_DIRECT_NT_SUB is set is it passed to the stage timing as --nt-sub and exported as
 #   EMRI_DIRECT_NT_SUB for the accuracy step -- unset, the generators keep their own default, 128,
 #   which a short window (Nt < 128, DAYS <= 5) may run with, while a chosen value must be <= Nt;

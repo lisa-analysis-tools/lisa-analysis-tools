@@ -748,6 +748,40 @@ class BatchDomainRefusalTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "EMRI_DIRECT_CHUNK_BATCH"):
                     self._direct()
 
+    def _sibling(self, **kw):
+        """A second REAL generator like the fixture's (the same synthetic FEW stand-in, table and
+        grid; the env is read at this call) with the constructor overrides ``kw``."""
+        gen = self._gen_with_two_chunk_rows_and_one_lookup_row()
+        args = dict(orbits=None, tdi_config=gen.tdi_config, t_start=gen.t_start, data_t0=gen.data_t0,
+                    Nt_sub=32, fine_dt_plunge=240.0, response="spline", lookup="python")
+        args.update(kw)
+        return type(gen)(gen.few_gen, gen.table, gen.wdm, **args)
+
+    def test_auto_window_reaches_the_generator(self):
+        """EMRI_DIRECT_NT_SUB=auto[:floor] on the real batch: the chunk rows' windows are planned at
+        ONE length for the call, each row's tail in one window; with a floor that holds every tail
+        the template is the fixed-length one, number for number."""
+        from lisatools.utils.utility import asnumpy
+
+        with mock.patch.dict(os.environ, {"EMRI_DIRECT_NT_SUB": "auto:96"}):
+            auto = self._sibling(Nt_sub=None)
+        self.assertEqual((auto.Nt_sub, auto.nt_sub_floor), ("auto", 96))
+        got = asnumpy(auto.batch(self.rows, chunk_rows=4))
+        st = dict(auto.last_stats)
+        fixed = self._sibling(Nt_sub=96)
+        want = asnumpy(fixed.batch(self.rows, chunk_rows=4))
+        self.assertEqual((st["nt_sub_eff"], fixed.last_stats["nt_sub_eff"]), (96, 96))
+        self.assertEqual((st["chunk_rows"], st["windows"]), (2, 2))       # one window per chunk row
+        np.testing.assert_allclose(got, want, rtol=1e-12, atol=1e-15)
+        # a floor below the tails: the call's length grows past it, still one window per row
+        lean = self._sibling(Nt_sub="auto:32")
+        lean.batch(self.rows, chunk_rows=4)
+        st = dict(lean.last_stats)
+        self.assertGreater(st["nt_sub_eff"], 32)
+        self.assertEqual((st["chunk_rows"], st["windows"]), (2, 2))
+        lean(*self.rows[0])                                  # the single-template path reports it too
+        self.assertGreaterEqual(lean.last_stats["nt_sub_eff"], 32)
+
     def test_refused_chunk_row_stays_zero(self):
         from lisatools.utils.utility import asnumpy
 

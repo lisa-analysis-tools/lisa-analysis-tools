@@ -14,7 +14,7 @@ mismatch is `1 - Re(O)` with no time or phase maximisation, per TDI channel X, Y
 | TDI-on-the-fly X, Y, Z matching the production response | `sources/emri/emritdionfly.py` (`frame="icrs_special"`, `n_fine`, `t_fine_window`) |
 | Restored n_ref lookup table + exact evaluation rule | `domains.py` `WDMLookupTable` (`BASIS_CYCLE="quarter_turn"`) |
 | Harmonic tracks from the FEW holder | `sources/emri/wdm_direct.py` `harmonic_tracks_from_holder` |
-| Plunge chunk (even-start chunks of `Nt_sub` = 128 px, `EMRI_DIRECT_NT_SUB`) | `wdm_het.py` `wdm_chunk_of_td`, `tail_chunk_plan`, `splice_chunk` |
+| Plunge chunk (even-start chunks of `Nt_sub` = 128 px, `EMRI_DIRECT_NT_SUB`; `auto`: one length per call) | `wdm_het.py` `wdm_chunk_of_td`, `tail_chunk_plan`, `splice_chunk` |
 | The fast template | `sources/emri/wdm_direct.py` `EMRIDirectWDM` |
 | Laptop table (layer 3600 s, Nf 180, dt 20 s) | `wdm_lookup_emri_cx_NF180_DT20_TL32_fd8x0p01_nld2.h5` (sprint root) |
 
@@ -252,7 +252,9 @@ weights it enormously. Now:
   `ValueError`): each chunk keeps its interior and discards `Nt_sub // 4` layers on each side
   (the edge contamination, defect 7 above), so every plunging template's tail costs at least one
   window of `Nt_sub` layers (128 = 5.3 d at 24 months) however short it is. The sweep below
-  measures shorter chunks.
+  measures shorter chunks. `EMRI_DIRECT_NT_SUB=auto` (or `auto:<floor>`, floor validated like a
+  fixed length; 10-25) picks ONE length per call so that the call's longest tail fits one window
+  (below: "Auto window length"); unset, the fixed 128 exactly as before.
 * every harmonic of a template hands off to the chunk at the earliest harmonic's pixel (the
   summed tail implies the common handoff), taken per template, never across a batch.
 * (10-25) the chunk rows of a batch are built TOGETHER with `EMRI_DIRECT_CHUNK_BATCH=1` (by
@@ -350,6 +352,37 @@ column can. The chunk's own error follows its edge contamination at `n_pad = Nt_
 **Recommendation:** 96 is the only accuracy-safe shorter candidate, and its speed gain is small
 (-25 % to +12 % of the tail's dense samples here); the real lever is a fixed ~24 px pad on
 longer windows (a follow-up, not this branch).
+
+**Auto window length (`EMRI_DIRECT_NT_SUB=auto`, 10-25).** The 10-25 H100 run put EMRI 1's tail at
+720 d at 69 px (threshold 1e-3) and 80 px (1e-5) -- the handoff-to-end span of 37 / 48 px plus the
+32-px past-end extent -- and a 128-layer window keeps only `128 / 2 - 2 = 62` of them, so every
+plunging row paid TWO windows, 256 layers of dense samples. With `auto` each
+`accumulate_harmonic_batch` call (one batch of chunk rows, or the single template) computes ONE
+length: with `s_max` the largest span `last_px - n_h + 1` over the rows that keep a tail,
+`Nt_sub_eff = max(floor, 4 ceil((2 (s_max + floor // 4) + 4) / 4))`, capped at the largest even
+length `<= Nt - pixel_edge` (a longer tail is tiled as before; no tail: the floor). A multiple of 4
+keeps an interior of `Nt_sub_eff / 2 - 2 >= s_max + floor // 4`, the whole tail with its past-end
+extent, so every row is one window. What stays: the past-end extent `floor // 4` (32 at the
+default floor 128, not `Nt_sub_eff // 4`), the edge discard `Nt_sub_eff // 4` of each window (more
+than 128's 32, so never worse), one dense tail call and one transform per call, and the fine-grid
+/ chunk-start rules (`_fine_grid`, `_chunk_start`) at the floor. EMRI 1 at 720 d: 1e-5 -> 164
+layers in one window (36 % fewer dense samples than 256), 1e-3 -> `2 (37 + 32) + 4 = 142` -> 144
+(44 % fewer). The window length is per CALL: by default (`EMRI_DIRECT_CHUNK_BATCH=0`, the global
+fits) every chunk row is its own call and takes its own tail's length; with
+`EMRI_DIRECT_CHUNK_BATCH=1` a batch row takes the batch's longest tail's length and the same row
+built alone its own, so the two differ by that length's edge contamination (synthetic chirp,
+`tests/test_emri_wdm_direct.py`: auto 164 vs fixed 128, 3.1e-6 of the peak); a fixed length has no
+such dependence. `last_stats["nt_sub_eff"]` reports the length; the speed script's `[split]`
+lines print `nt_sub=auto(eff N)`. Default unchanged (fixed 128) until the H100 numbers are read:
+
+```bash
+BACKEND=cuda13x DAYS="720" CHUNKS="1,8" ROWS=32 NT_SUB=auto bash scripts/emri/emri_speed_durations.sh
+```
+
+(the shell script passes any `NT_SUB` string through `--nt-sub` and exports it as
+`EMRI_DIRECT_NT_SUB` for the accuracy step). Read the `[summary]` ms per template (single and 8 per
+call) and mm vs production against the run without `NT_SUB`, the `[split]` lines' windows (one per
+chunk row) and `eff`, and the `[parity]` lines.
 
 Without `--fixed-fine-grid` the 80 s segment's points fall differently relative to the
 trajectory's end for 64 / 48 / 32 (one harmonic): their segment starts a whole number of layers

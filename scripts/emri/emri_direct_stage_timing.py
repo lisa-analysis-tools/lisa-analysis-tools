@@ -22,13 +22,20 @@ default (``EMRIDirectWDM(chunk_batch=...)``, ``EMRI_DIRECT_CHUNK_BATCH``); the `
 and the JSON line carry ``chunk_batch``.
 
 The lookup / plunge-chunk split: ``--nt-sub`` sets the plunge-chunk length in time layers
-(``EMRIDirectWDM(Nt_sub=...)``; default: ``EMRI_DIRECT_NT_SUB``, else 128). After every timed
-call (single template and each batch) a ``[split]`` line gives the generator's ``last_stats`` in
-the ``[EMRI_DIRECT] leaf N:`` line's wording, ``chunk rows A (tail median L px, W windows) lookup
-px P chunk px C dropped px D``, and the JSON line carries ``nt_sub``, ``chunk_rows``,
-``windows``, ``tail_median_px``, ``lookup_pixels``, ``chunk_pixels`` and ``dropped_pixels``: the
-speed test shows the split without a global-fit run. The stage list has the dense plunge tail
-(``_dense_td``: the dense channels of every (row, window) pair) as its own line inside stage 5.
+(``EMRIDirectWDM(Nt_sub=...)``; default: ``EMRI_DIRECT_NT_SUB``, else 128), or ``auto`` /
+``auto:<floor>`` (one length per call, the shortest holding the call's longest tail in one
+window, never below the floor). After every timed call (single template and each batch) a
+``[split]`` line gives the generator's ``last_stats`` in the ``[EMRI_DIRECT] leaf N:`` line's
+wording, ``chunk rows A (tail median L px, W windows) lookup px P chunk px C dropped px D``, its
+``nt_sub=`` the length (``auto(eff N)``: the call's choice, ``last_stats["nt_sub_eff"]``), and the
+JSON line carries ``nt_sub`` (``"auto"`` in auto mode), ``nt_sub_floor``, ``nt_sub_eff``,
+``chunk_rows``, ``windows``, ``tail_median_px``, ``lookup_pixels``, ``chunk_pixels`` and
+``dropped_pixels``: the speed test shows the split without a global-fit run. The stage list has
+the dense plunge tail (``_dense_td``: the dense channels of every (row, window) pair) as its own
+line inside stage 5. In auto mode with ``--chunk-batch 1`` a batch's window length is that of its
+longest tail, the single template's its own, so the ``[parity]`` lines (which name both) also carry
+that length's edge contamination difference (128-layer windows: ~2e-6 of the peak); with
+``--chunk-batch 0`` every chunk row is its own call.
 
 Batch parity (the NUMBERS of the batched path; "mm vs production" covers only the single template,
 which is a one-row batch): after every timed batch, one UNTIMED ``direct.batch(rows[:chunk],
@@ -111,8 +118,9 @@ def main():
     ap.add_argument("--response", choices=("spline", "dense"), default="dense",
                     help="TDI-on-the-fly response: 'dense' (TDDenseTDIonTheFly: exact phases, geometry shared "
                          "across harmonics; needs a backend built with it) or 'spline' (TDTDIonTheFly)")
-    ap.add_argument("--nt-sub", type=int, default=None,
-                    help="plunge-chunk length in time layers (EMRIDirectWDM Nt_sub; default: "
+    ap.add_argument("--nt-sub", default=None,
+                    help="plunge-chunk length in time layers, or 'auto' / 'auto:<floor>' (one length per "
+                         "call holding its longest tail in one window; EMRIDirectWDM Nt_sub; default: "
                          "EMRI_DIRECT_NT_SUB, else 128)")
     ap.add_argument("--chunk-batch", type=int, choices=(0, 1), default=1,
                     help="1 (default here): a batch's plunge-chunk rows built in ONE call (the batched "
@@ -198,7 +206,16 @@ def main():
                                              response=args.response, response_grid=g, lookup=lk, f_band=band,
                                              Nt_sub=args.nt_sub, chunk_batch=bool(args.chunk_batch))
                for g in grids for lk in lookups}
-    nt_sub = next(iter(directs.values())).Nt_sub                       # resolved (argument > env > 128)
+    nt_sub = next(iter(directs.values())).Nt_sub                       # resolved (argument > env > 128), or "auto"
+    nt_floor = next(iter(directs.values())).nt_sub_floor
+
+    def nt_label(st):
+        """The plunge window length of a call for the [split] / [walls] lines: the fixed length, or
+        ``auto(eff N)`` with the call's choice (``stats["nt_sub_eff"]``; ``auto:F(eff N)`` for a
+        floor F other than 128)."""
+        if nt_sub != "auto":
+            return str(nt_sub)
+        return f"{'auto' if nt_floor == 128 else f'auto:{nt_floor}'}(eff {st.get('nt_sub_eff', '-')})"
     pool = cp.get_default_memory_pool() if gpu else None
     m_lo, m_hi = band if band is not None else (0, nf)
     xp = cp if gpu else np
@@ -240,6 +257,7 @@ def main():
         mismatch of the two on the box (``box.match``, the mm vs production metric). Returns
         ``(max rel, max mm)`` over the rows that are not zero."""
         arr = direct.batch(sub, chunk_rows=chunk, mode_selection_threshold=thr)
+        st_par = dict(direct.last_stats)
         rels, mms, e_ref = [], [], None
         for k, p in enumerate(sub):
             one = direct(*p, mode_selection_threshold=thr)
@@ -259,9 +277,10 @@ def main():
             else:
                 res = "single template is zero (ends before the window): " + (
                     "batch row zero too" if float(xp.max(xp.abs(b))) == 0 else "BATCH ROW NOT ZERO")
-            print(f"[parity] grid={label} thr={thr:g} nt_sub={nt_sub} batch of {len(sub)} ({chunk} per call) "
-                  f"row {k}: {res} (single: tail {st1.get('tail_layers', 0)} px, {st1.get('windows', 0)} "
-                  f"windows, trajectory end {(e_k - e_ref) / 3600.0:+.2f} h vs row 0) -- pass: ~1e-6 "
+            single_nt = f", nt_sub {nt_label(st1)}" if nt_sub == "auto" else ""
+            print(f"[parity] grid={label} thr={thr:g} nt_sub={nt_label(st_par)} batch of {len(sub)} ({chunk} per "
+                  f"call) row {k}: {res} (single: tail {st1.get('tail_layers', 0)} px, {st1.get('windows', 0)} "
+                  f"windows{single_nt}, trajectory end {(e_k - e_ref) / 3600.0:+.2f} h vs row 0) -- pass: ~1e-6 "
                   f"relative, the spline-padding level (the dense batch pads each row's response grid to "
                   f"the common length), not 1e-12", flush=True)
             del s_band, b
@@ -317,13 +336,14 @@ def main():
         med = int(np.median(tail)) if len(tail) else 0
         f = dict(chunk_rows=rows, windows=int(st.get("windows", 0)), tail_median_px=med,
                  lookup_pixels=int(st.get("lookup_pixels", 0)), chunk_pixels=int(st.get("chunk_pixels", 0)),
-                 dropped_pixels=int(st.get("dropped_pixels", 0)))
+                 dropped_pixels=int(st.get("dropped_pixels", 0)), nt_sub_eff=st.get("nt_sub_eff"))
         txt = (f"chunk rows {rows} (tail median {med} px, {f['windows']} windows) lookup px "
                f"{f['lookup_pixels']} chunk px {f['chunk_pixels']} dropped px {f['dropped_pixels']}")
         return txt, f
 
     base = dict(src=args.src, days=args.days, dt=args.dt, nf=nf, nt=nt, backend=args.backend,
-                response=args.response, nt_sub=nt_sub, chunk_batch=args.chunk_batch, band=band, brick=box.brick, tobs_s=box.tobs,
+                response=args.response, nt_sub=nt_sub, nt_sub_floor=nt_floor, chunk_batch=args.chunk_batch,
+                band=band, brick=box.brick, tobs_s=box.tobs,
                 foreground=box.foreground, noise=box.describe(),
                 data_snr=None if box.d is None else box.data_snr)
 
@@ -369,8 +389,8 @@ def main():
                   f"SNR direct {snr[grid]:.3f} production {snr['production']:.3f}; mm vs production "
                   f"{mmp[grid]:.3e}", flush=True)
             split_txt, split = chunk_split(direct.last_stats)
-            print(f"[split] grid={grid} thr={thr:g} nt_sub={nt_sub} chunk_batch={args.chunk_batch} single: "
-                  f"{split_txt}", flush=True)
+            print(f"[split] grid={grid} thr={thr:g} nt_sub={nt_label(direct.last_stats)} "
+                  f"chunk_batch={args.chunk_batch} single: {split_txt}", flush=True)
             for k in [lab for lab in LABELS if lab in T]:
                 print(f"  {k:48s} {T[k] / args.reps * 1e3:8.1f} ms  ({C[k] // args.reps} calls)", flush=True)
             stages = {k.strip(): T[k] / args.reps * 1e3 for k in LABELS if k in T}
@@ -404,9 +424,8 @@ def main():
                       f"total = {t_b / len(rows) * 1e3:.0f} ms per template (production {t_prod * 1e3:.0f}); "
                       f"gpu pool {mem:.1f} GB {st_b}", flush=True)
                 split_txt, split = chunk_split(st_b)
-                print(f"[split] grid={grid} thr={thr:g} nt_sub={nt_sub} chunk_batch={args.chunk_batch} BATCH of "
-                      f"{len(rows)} ({chunk} per call): "
-                      f"{split_txt}", flush=True)
+                print(f"[split] grid={grid} thr={thr:g} nt_sub={nt_label(st_b)} chunk_batch={args.chunk_batch} "
+                      f"BATCH of {len(rows)} ({chunk} per call): {split_txt}", flush=True)
                 for k in [lab for lab in LABELS if lab in T]:
                     print(f"  {k:48s} {T[k] / len(rows) * 1e3:8.1f} ms per template  ({C[k]} calls)", flush=True)
                 stages = {k.strip(): T[k] / len(rows) * 1e3 for k in LABELS if k in T}
