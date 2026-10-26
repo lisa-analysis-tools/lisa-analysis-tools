@@ -1215,6 +1215,7 @@ class SourceMetadata(MetadataBase):
 
     prior_model: str = ""
     prior_model_code_link: str = ""
+    prior_model_config_file: str = ""
     prior_model_config: dict = dataclasses.field(default_factory=dict)
 
     posterior_files: list[str] = dataclasses.field(
@@ -1232,6 +1233,7 @@ class StochasticMetadata(MetadataBase):
 
     prior_model: str = ""
     prior_model_code_link: str = ""
+    prior_model_config_file: str = ""
     prior_model_config: dict = dataclasses.field(default_factory=dict)
 
     posterior_files: list[str] = dataclasses.field(
@@ -1700,16 +1702,14 @@ class SubmissionWriter(BackendConsumer):
     def write_submission(self, acs: AnalysisContainerArray):
         """Run the full submission writing pipeline."""
         self.create_folders()
-        self.prepare_samples_for_submission(acs)
-        self.save_posteriors()
+        self.save_data_and_residuals(acs)
 
-        # finally save the overall run metadata
         run_metadata_filepath = os.path.join(self.submission_folder, "global_metadata.json")
         self.run_metadata.to_json(run_metadata_filepath)
         logger.info(f"Saved overall run metadata to {run_metadata_filepath}")
 
-        self.save_data_and_residuals(acs)
-
+        self.prepare_samples_for_submission(acs)
+        self.save_posteriors()
 
 
 # === Save residuals ====
