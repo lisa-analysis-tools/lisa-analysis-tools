@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Sky-mode hopping Metropolis-Hastings move for LISA samplers."""
 
+from typing import Optional
+
 import numpy as np
 from eryn.moves import MHMove
 
@@ -64,7 +66,7 @@ class SkyMove(MHMove):
 
     _ALLOWED_FRAMES = ("lisa", "ssb_ecliptic", "icrs")
 
-    def __init__(self, ind_map=None, which="both", coord_frame="lisa", frame_t0=0.0, **kwargs):
+    def __init__(self, ind_map=None, which="both", coord_frame="lisa", frame_t0=0.0, to_lisa_frame: Optional[callable] = None, from_lisa_frame: Optional[callable] = None, **kwargs):
 
         if ind_map is None:
             ind_map = dict(cosinc=6, lam=7, sinbeta=8, psi=9, t_ref=10)
@@ -92,6 +94,9 @@ class SkyMove(MHMove):
         self.coord_frame = coord_frame
         self.frame_t0 = frame_t0
         self.transform = getattr(self, f"{which}_transform")
+
+        self.to_lisa_frame = to_lisa_frame if to_lisa_frame is not None else self._to_lisa_frame
+        self.from_lisa_frame = from_lisa_frame if from_lisa_frame is not None else self._from_lisa_frame
         super(SkyMove, self).__init__(**kwargs)
 
     # ------------------------------------------------------------------
@@ -288,9 +293,9 @@ class SkyMove(MHMove):
             inds_here = np.where(inds == True)
 
             q[name] = coords.copy()
-            new_coords = self._to_lisa_frame(coords[inds_here])
+            new_coords = self.to_lisa_frame(coords[inds_here])
             new_coords = self.transform(new_coords, random)
-            new_coords = self._from_lisa_frame(new_coords)
+            new_coords = self.from_lisa_frame(new_coords)
             q[name][inds_here] = new_coords.copy()
 
         return q, np.zeros((ntemps, nwalkers))
