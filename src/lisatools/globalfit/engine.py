@@ -494,7 +494,7 @@ class GeneralSetup(Setup, GeneralSettings):
             )
         else:
             self.sensitivity_backend = backend_cls(
-                orbits=self.gpu_orbits,
+                orbits=self.gpu_orbits if self.force_backend == self.gpu_backend else self.orbits,
                 settings=domain_settings,
                 force_backend=self.force_backend,
                 window_values=window if self.normalize_window else None,
