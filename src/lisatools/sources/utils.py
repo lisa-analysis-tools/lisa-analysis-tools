@@ -968,7 +968,7 @@ def to_lisa_frame(t: float | np.ndarray,
     z_lisa_cross_k = np.cross(z_lisa, k)
     u_lisa = _unit(z_lisa_cross_k)
     v_lisa = np.cross(k, u_lisa)
-    psi_lisa = np.arctan2(_dot(p, v_lisa), _dot(p, u_lisa)) % np.pi
+    psi_lisa = np.arctan2(_dot(p, v_lisa), _dot(p, u_lisa)) % (2 * np.pi)
 
     return output_fun(t_lisa - t_ref), output_fun(lambd_lisa), output_fun(beta_lisa), output_fun(psi_lisa)
 
@@ -1055,6 +1055,6 @@ def from_lisa_frame(t_lisa: float | np.ndarray,
     z_cross_k = np.cross(e_z, k)
     u = _unit(z_cross_k)
     v = np.cross(k, u)
-    psi = np.arctan2(_dot(p, v), _dot(p, u)) % np.pi
+    psi = np.arctan2(_dot(p, v), _dot(p, u)) % (2 * np.pi)
 
     return output_fun(t), output_fun(ra_or_lambda), output_fun(dec_or_beta), output_fun(psi)
