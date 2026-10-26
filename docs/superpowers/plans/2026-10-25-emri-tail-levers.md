@@ -187,3 +187,61 @@ of the failing log so the chained ImportError is visible next time.
 **Laptop:** the compiled backend here predates `TDDenseTDIWaveformWrap`; the
 dense tests skip on this branch and error on dev.  Run the GPU checks on the
 cluster.
+
+### Notes for the finisher (2026-10-26)
+
+**Install / rebuild: none needed.**  This branch, and the revert on dev, are
+pure Python, shell and markdown (ten `.py`, one `.sh`, three `.md`): nothing
+under `src/lisatools/cutils/`, no CMake or `pyproject.toml` change, and no
+other repository (FEW, GBGPU, BBHx, Eryn, GBT untouched).  After `git pull` on
+dev, or after checking this branch out, no `pip install` or rebuild is needed:
+the editable install picks the Python up at the next process start.  The one
+rebuild item is pre-existing and unrelated: the cluster's CPU backend module
+predates the dense kernel's `stop_taper` argument (three `PlungeTailTest`
+errors on the cluster); the GPU module is current and the global fits use it;
+`pip install -e . --no-build-isolation` on the cluster refreshes the CPU
+module whenever convenient.
+
+**Which code a job ran.**  The pre-change `[EMRI_DIRECT] leaf N:` line ends
+at `... F fallbacks, ...`; this branch's line continues with
+`| chunk rows A (tail median L px, W windows ...) lookup px P chunk px C
+dropped px D`.  A job log with that continuation ran this work.  A job
+(re)launched from a dev checkout between e5906c90 and bd9a3433 (2026-10-25
+03:06 to 20:30 PDT) ran the batched tail unconditionally, because the knob
+did not exist yet; from bd9a3433 to e05eec17 the default was the old one-row
+path; from 18cbd285 dev has none of it.  A running process keeps the code it
+loaded at launch.
+
+**Equivalence at the defaults.**  An Opus audit of 37ea50cd vs bd9a3433 in
+the production configuration found the same operations on bit-identical
+inputs for every EMRI template; only the tail transform's cuFFT batch size
+differs (<= 1e-16), and atomicAdd ordering is run-to-run noise at both
+commits.  Both-mode tests (`tests/test_emri_direct_wiring.py`,
+`tests/test_emri_wdm_direct.py`) pin the knob defaults.
+
+**Follow-ups not started.**  (1) A fixed ~24 px pad on longer windows is the
+real tail lever (`docs/emri-direct-wdm.md`, chunk-length sweep); the window
+length itself is not.  (2) Pre-existing gap: a row ending inside the data
+window with no harmonic handoff trip gets no tail.  (3) Consolidate the three
+tail forms and the two Python lookups in `wdm_direct.py` (reviewer minors).
+(4) The 8-per-call loss: test the warm-up hypothesis first (time a second
+pass, or allocate before the pool free) before hunting inside the kernel.
+(5) Batch the FEW trajectory calls across rows (one call per row today).
+
+**Cluster commands.**
+
+```
+# production checkout: the previous EMRI configuration
+git checkout dev && git pull && git rev-parse --short HEAD        # 18cbd285 or later
+# this branch, in its own worktree, without touching the production checkout
+git fetch origin && git worktree add ../LAT-emri-batch emri-plunge-batch
+cd ../LAT-emri-batch && export PYTHONPATH=$PWD/tools/wtenv LAT_WORKTREE_SRC=$PWD/src
+BACKEND=cuda13x DAYS="720" CHUNKS="1,8" ROWS=32 CHUNK_BATCH=0 OUT=lever_prod  bash scripts/emri/emri_speed_durations.sh
+BACKEND=cuda13x DAYS="720" CHUNKS="1,8" ROWS=32 CHUNK_BATCH=1 OUT=lever_batch bash scripts/emri/emri_speed_durations.sh
+BACKEND=cuda13x DAYS="720" CHUNKS="1,8" ROWS=32 NT_SUB=auto    OUT=lever_auto  bash scripts/emri/emri_speed_durations.sh
+BACKEND=cuda13x DAYS="720" CHUNKS="1,8" ROWS=32 TAIL_SKIP_PX=100 OUT=lever_skip bash scripts/emri/emri_speed_durations.sh
+```
+
+Read the `[durations] code:` line first: it must name a commit on this branch
+(af9b0046 or later).  The 2026-10-25 run did not, and its numbers were not
+what their directory names said.
