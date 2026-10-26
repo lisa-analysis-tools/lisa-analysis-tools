@@ -255,7 +255,8 @@ weights it enormously. Now:
   measures shorter chunks.
 * every harmonic of a template hands off to the chunk at the earliest harmonic's pixel (the
   summed tail implies the common handoff), taken per template, never across a batch.
-* (10-25) the chunk rows of a batch are built TOGETHER (`EMRIDirectWDM._chunk_rows_batch`, also
+* (10-25) the chunk rows of a batch are built TOGETHER with `EMRI_DIRECT_CHUNK_BATCH=1` (by
+  default one per call: "In the global fit" below) (`EMRIDirectWDM._chunk_rows_batch`, also
   the single-template path): one dense response for all of them (each on its own sparse grid),
   one fused lookup kernel with every harmonic stopping at its own template's handoff, then the
   tail as `(row, window)` pairs (`accumulate_harmonic_batch`, `row_t_end`: each template's tail
@@ -397,6 +398,15 @@ choreography is untouched, only the scoring changes.
   run's FULL wavelet grid and cropped to its active box. Rows are scored against their own walker's
   residual and PSD, `offset + <r|h> - 1/2 <h|h>` with `offset = acs.likelihood()` on the exposed
   residual; one batched inner-product pair per walker, one host pull per chunk.
+* **Plunge-chunk rows one per call (10-25, `EMRI_DIRECT_CHUNK_BATCH`, default `0`).** The rows of
+  a `templates` call that hand off to the plunge chunk are built one per `_chunk_rows_batch`
+  call (`EMRIDirectWDM(chunk_batch=False)`: each row through the single-template path, 161 ms per
+  template on the H100 at 720 d, threshold 1e-3), so the global fits build them one per call;
+  `EMRI_DIRECT_CHUNK_BATCH=1` builds all of a call's chunk rows together (one response, one
+  lookup, one tail evaluation, one transform; 181 ms per template at 8 per call on the same run)
+  and stays the speed test's default (`emri_speed_durations.sh` `CHUNK_BATCH=1`, `--chunk-batch`)
+  until it is shown faster. The lookup-only rows are batched in both modes; the stats are the
+  same (`last_stats["chunk_batch"]` says which ran).
 * **Template generation follows (10-03).** In direct mode the engine's EMRI template generator
   (`SourceSignalGen`: residual rebuilds at load, the move's expose/fold through the containers'
   installed generator) is the direct template too, so fills, rebuilds and scoring use one template

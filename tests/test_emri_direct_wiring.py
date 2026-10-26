@@ -627,7 +627,7 @@ class BatchDomainRefusalTest(unittest.TestCase):
             cls._synth[3].cleanup()
             cls._synth = None
 
-    def _direct(self):
+    def _direct(self, **kw):
         from lisatools.domains import WDMSettings
         from lisatools.sources.emri.wdm_direct import EMRIDirectWDM
 
@@ -664,7 +664,7 @@ class BatchDomainRefusalTest(unittest.TestCase):
         table = SimpleNamespace(fdot_vals=np.array([-1.0, 1.0]), INTERP_METHOD="spline")
         wdm = WDMSettings(32, 64, 10.0, force_backend="cpu")
         return _Stub(None, table, wdm, orbits=None, tdi_config=SimpleNamespace(nchannels=3),
-                     t_start=0.0, data_t0=0.0, fine_dt=100.0)
+                     t_start=0.0, data_t0=0.0, fine_dt=100.0, **kw)
 
     def _gen_with_two_chunk_rows_and_one_lookup_row(self):
         """The real generator (:func:`_synthetic_direct`, built once per class): ``self.rows`` =
@@ -676,19 +676,77 @@ class BatchDomainRefusalTest(unittest.TestCase):
         gen, self.rows, self.row_few_refuses, _ = cls._synth
         return gen
 
+    def _gen_in_mode(self, chunk_batch):
+        """The fixture's REAL generator rebuilt (the same synthetic FEW stand-in, table and grid)
+        with ``EMRI_DIRECT_CHUNK_BATCH`` set to ``chunk_batch`` (read at construction)."""
+        gen = self._gen_with_two_chunk_rows_and_one_lookup_row()
+        with mock.patch.dict(os.environ, {"EMRI_DIRECT_CHUNK_BATCH": "1" if chunk_batch else "0"}):
+            return type(gen)(gen.few_gen, gen.table, gen.wdm, orbits=None, tdi_config=gen.tdi_config,
+                             t_start=gen.t_start, data_t0=gen.data_t0, Nt_sub=32, fine_dt_plunge=240.0,
+                             response="spline", lookup="python")
+
     def test_mixed_batch_matches_single_calls(self):
+        """Both chunk-row modes (one call for all chunk rows, and one per row, the default): each
+        batch row is the single template."""
         from lisatools.utils.utility import asnumpy
 
-        gen = self._gen_with_two_chunk_rows_and_one_lookup_row()
-        arr = gen.batch(self.rows, chunk_rows=4)
-        # read before the single calls below replace last_stats
-        self.assertEqual(gen.last_stats["chunk_rows"], 2)
-        self.assertEqual(gen.last_stats["alone"], 0)
-        self.assertEqual(len(gen.last_stats["tail_layers"]), 2)
-        self.assertTrue(all(n > 0 for n in gen.last_stats["tail_layers"]))   # both reach the chunk
-        for r, p in enumerate(self.rows):
-            one = gen(*p).arr[:, gen._band()[0]:gen._band()[1]]
-            np.testing.assert_allclose(asnumpy(arr[r]), asnumpy(one), rtol=1e-10, atol=1e-13)
+        for chunk_batch in (False, True):
+            with self.subTest(chunk_batch=chunk_batch):
+                gen = self._gen_in_mode(chunk_batch)
+                self.assertEqual(gen.chunk_batch, chunk_batch)
+                arr = gen.batch(self.rows, chunk_rows=4)
+                # read before the single calls below replace last_stats
+                self.assertEqual(gen.last_stats["chunk_rows"], 2)
+                self.assertEqual(gen.last_stats["chunk_batch"], int(chunk_batch))
+                self.assertEqual(gen.last_stats["alone"], 0)
+                self.assertEqual(len(gen.last_stats["tail_layers"]), 2)
+                self.assertTrue(all(n > 0 for n in gen.last_stats["tail_layers"]))   # both reach the chunk
+                for r, p in enumerate(self.rows):
+                    one = gen(*p).arr[:, gen._band()[0]:gen._band()[1]]
+                    np.testing.assert_allclose(asnumpy(arr[r]), asnumpy(one), rtol=1e-10, atol=1e-13)
+
+    def test_chunk_batch_off_builds_chunk_rows_one_per_call(self):
+        """EMRI_DIRECT_CHUNK_BATCH off (the default, what the global fits run): every plunge-chunk
+        row goes through its own _chunk_rows_batch call (a one-row {row: item}, in row order); the
+        merged stats are the batched call's and the rows its numbers."""
+        from lisatools.utils.utility import asnumpy
+
+        on = self._gen_in_mode(True)
+        want = asnumpy(on.batch(self.rows, chunk_rows=4))
+        st_on = dict(on.last_stats)
+        off = self._gen_in_mode(False)
+        self.assertFalse(off.chunk_batch)
+        with mock.patch.object(off, "_chunk_rows_batch", wraps=off._chunk_rows_batch) as spy:
+            got = asnumpy(off.batch(self.rows, chunk_rows=4))
+        st_off = dict(off.last_stats)
+        self.assertEqual(spy.call_count, 2)                                   # one per chunk row
+        self.assertEqual([sorted(c.args[1]) for c in spy.call_args_list], [[0], [1]])
+        for k in ("chunk_rows", "windows", "lookup_pixels", "chunk_pixels", "dropped_pixels"):
+            self.assertEqual(st_off[k], st_on[k], k)
+        self.assertEqual(len(st_off["tail_layers"]), len(st_on["tail_layers"]))
+        self.assertEqual(st_off["tail_layers"], st_on["tail_layers"])
+        self.assertEqual((st_off["chunk_batch"], st_on["chunk_batch"]), (0, 1))
+        np.testing.assert_allclose(got, want, rtol=1e-10, atol=1e-13)
+        with mock.patch.object(on, "_chunk_rows_batch", wraps=on._chunk_rows_batch) as spy:
+            on.batch(self.rows, chunk_rows=4)
+        self.assertEqual(spy.call_count, 1)                                   # paired control
+        self.assertEqual(sorted(spy.call_args.args[1]), [0, 1])
+
+    def test_chunk_batch_knob_reads_the_env(self):
+        """``chunk_batch``: explicit > env ``EMRI_DIRECT_CHUNK_BATCH`` (0 / 1, false / true, any
+        case) > False; anything else raises naming the knob."""
+        with mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if k != "EMRI_DIRECT_CHUNK_BATCH"},
+                             clear=True):
+            self.assertFalse(self._direct().chunk_batch)
+        for val, want in (("1", True), ("true", True), ("TRUE", True), ("0", False), ("False", False)):
+            with mock.patch.dict(os.environ, {"EMRI_DIRECT_CHUNK_BATCH": val}):
+                self.assertIs(self._direct().chunk_batch, want, val)
+        with mock.patch.dict(os.environ, {"EMRI_DIRECT_CHUNK_BATCH": "1"}):
+            self.assertFalse(self._direct(chunk_batch=False).chunk_batch)     # explicit wins
+        for bad in ("no", "2", "", "yes"):
+            with mock.patch.dict(os.environ, {"EMRI_DIRECT_CHUNK_BATCH": bad}):
+                with self.assertRaisesRegex(ValueError, "EMRI_DIRECT_CHUNK_BATCH"):
+                    self._direct()
 
     def test_refused_chunk_row_stays_zero(self):
         from lisatools.utils.utility import asnumpy

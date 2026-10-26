@@ -16,6 +16,11 @@ run's active band only (as the fit's adapter does). Each (threshold, grid, chunk
 stage split and, on a GPU, the cupy memory-pool footprint of that batch; ``--out`` appends one JSON
 line per run and a summary table (ms per template vs rows per call) closes each threshold.
 
+``--chunk-batch 1`` (the default HERE) builds a batch's plunge-chunk rows in one call (the
+batched path the speed test measures); ``0`` builds them one per call, the library and global-fit
+default (``EMRIDirectWDM(chunk_batch=...)``, ``EMRI_DIRECT_CHUNK_BATCH``); the ``[split]`` lines
+and the JSON line carry ``chunk_batch``.
+
 The lookup / plunge-chunk split: ``--nt-sub`` sets the plunge-chunk length in time layers
 (``EMRIDirectWDM(Nt_sub=...)``; default: ``EMRI_DIRECT_NT_SUB``, else 128). After every timed
 call (single template and each batch) a ``[split]`` line gives the generator's ``last_stats`` in
@@ -109,6 +114,10 @@ def main():
     ap.add_argument("--nt-sub", type=int, default=None,
                     help="plunge-chunk length in time layers (EMRIDirectWDM Nt_sub; default: "
                          "EMRI_DIRECT_NT_SUB, else 128)")
+    ap.add_argument("--chunk-batch", type=int, choices=(0, 1), default=1,
+                    help="1 (default here): a batch's plunge-chunk rows built in ONE call (the batched "
+                         "path); 0: one per call, the library and global-fit default "
+                         "(EMRIDirectWDM chunk_batch / EMRI_DIRECT_CHUNK_BATCH)")
     args = ap.parse_args()
 
     from lisatools.domains import TDSettings, TDSignal, WDMLookupTable, WDMSettings
@@ -187,7 +196,7 @@ def main():
     directs = {f"{g}/{lk}": WD.EMRIDirectWDM(gen, table, wdm, orbits=orb, tdi_config=tdi, t_start=W.REF,
                                              data_t0=data_t0, mode_batch=args.mode_batch, force_backend=args.backend,
                                              response=args.response, response_grid=g, lookup=lk, f_band=band,
-                                             Nt_sub=args.nt_sub)
+                                             Nt_sub=args.nt_sub, chunk_batch=bool(args.chunk_batch))
                for g in grids for lk in lookups}
     nt_sub = next(iter(directs.values())).Nt_sub                       # resolved (argument > env > 128)
     pool = cp.get_default_memory_pool() if gpu else None
@@ -314,7 +323,7 @@ def main():
         return txt, f
 
     base = dict(src=args.src, days=args.days, dt=args.dt, nf=nf, nt=nt, backend=args.backend,
-                response=args.response, nt_sub=nt_sub, band=band, brick=box.brick, tobs_s=box.tobs,
+                response=args.response, nt_sub=nt_sub, chunk_batch=args.chunk_batch, band=band, brick=box.brick, tobs_s=box.tobs,
                 foreground=box.foreground, noise=box.describe(),
                 data_snr=None if box.d is None else box.data_snr)
 
@@ -360,7 +369,8 @@ def main():
                   f"SNR direct {snr[grid]:.3f} production {snr['production']:.3f}; mm vs production "
                   f"{mmp[grid]:.3e}", flush=True)
             split_txt, split = chunk_split(direct.last_stats)
-            print(f"[split] grid={grid} thr={thr:g} nt_sub={nt_sub} single: {split_txt}", flush=True)
+            print(f"[split] grid={grid} thr={thr:g} nt_sub={nt_sub} chunk_batch={args.chunk_batch} single: "
+                  f"{split_txt}", flush=True)
             for k in [lab for lab in LABELS if lab in T]:
                 print(f"  {k:48s} {T[k] / args.reps * 1e3:8.1f} ms  ({C[k] // args.reps} calls)", flush=True)
             stages = {k.strip(): T[k] / args.reps * 1e3 for k in LABELS if k in T}
@@ -394,7 +404,8 @@ def main():
                       f"total = {t_b / len(rows) * 1e3:.0f} ms per template (production {t_prod * 1e3:.0f}); "
                       f"gpu pool {mem:.1f} GB {st_b}", flush=True)
                 split_txt, split = chunk_split(st_b)
-                print(f"[split] grid={grid} thr={thr:g} nt_sub={nt_sub} BATCH of {len(rows)} ({chunk} per call): "
+                print(f"[split] grid={grid} thr={thr:g} nt_sub={nt_sub} chunk_batch={args.chunk_batch} BATCH of "
+                      f"{len(rows)} ({chunk} per call): "
                       f"{split_txt}", flush=True)
                 for k in [lab for lab in LABELS if lab in T]:
                     print(f"  {k:48s} {T[k] / len(rows) * 1e3:8.1f} ms per template  ({C[k]} calls)", flush=True)

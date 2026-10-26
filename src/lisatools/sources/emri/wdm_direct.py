@@ -36,6 +36,8 @@ Environment knobs read here (explicit arguments win unless stated): ``EMRI_DIREC
 ``EMRI_DIRECT_NUM_M_LAYERS`` (2; this one OVERRIDES the ``num_m_layers`` argument),
 ``EMRI_DIRECT_PLUNGE_TAPER_S`` (120 s; no argument, always read),
 ``EMRI_DIRECT_NT_SUB`` (128 time layers per plunge chunk; even, >= 8, <= Nt),
+``EMRI_DIRECT_CHUNK_BATCH`` (``0`` / ``1`` or ``false`` / ``true``, default ``0``: the plunge-chunk
+rows of a :meth:`~EMRIDirectWDM.batch` call are built one per call; ``1`` builds them all in one),
 ``EMRI_DIRECT_HANDOFF_BOUND`` (``1``), ``EMRI_DIRECT_TAIL_BLOCK_ELEMS`` and
 ``EMRI_DIRECT_MODE_BLOCK_ELEMS`` (2e7), ``EMRI_DIRECT_LOOKUP_CHUNK`` (2e6), ``EMRI_TRACER``
 (``analytic``), ``EMRI_TRACER_H_FDOT`` (300 s), ``EMRI_TRACER_MAX_ELEMS`` (6e7). The response
@@ -1266,6 +1268,12 @@ class EMRIDirectWDM:
             ``Nt_sub // 4`` discarded on each side). ``None`` reads ``EMRI_DIRECT_NT_SUB``
             (default ``128``); an explicit value wins. A chosen value (argument or env) must be
             even, ``>= 8`` and ``<= Nt``.
+        chunk_batch (bool, optional): build the plunge-chunk rows of a :meth:`batch` call all
+            together (``True``: one response, one lookup, one tail evaluation and one transform
+            for all of them) or one per :meth:`_chunk_rows_batch` call (``False``, the default:
+            the single-template path, what the global fits run until the all-rows batch is shown
+            faster). ``None`` reads ``EMRI_DIRECT_CHUNK_BATCH`` (``0`` / ``1``, ``false`` /
+            ``true``, any case; default ``False``); an explicit value wins.
         n_fine (int, optional): fixed number of fine trajectory points over the window.
             Default ``None``: one per ``fine_dt`` (3600 s: direct-vs-production unchanged from
             80 s to 3600 s; 6 months: 1800 and 3600 s identical, mm 1e-7..4e-7 on CD1L EMRI 1,
@@ -1304,6 +1312,8 @@ class EMRIDirectWDM:
             ``None`` = all ``Nf``.
 
     Attributes:
+        chunk_batch (bool): Whether :meth:`batch` builds its plunge-chunk rows in one call
+            (``EMRI_DIRECT_CHUNK_BATCH``; default ``False``: one per call).
         fdot_axis_max (float): Largest ``|fdot|`` of the table's axis [Hz/s].
         plunge_taper_s (float): Source-frame stop taper [s] (``EMRI_DIRECT_PLUNGE_TAPER_S``,
             default 120).
@@ -1314,7 +1324,8 @@ class EMRIDirectWDM:
     Raises:
         ValueError: For an unknown ``feed``, ``response``, ``response_grid`` or ``lookup``,
             ``response="dense"`` with ``feed="fine"``, or an ``Nt_sub`` (``EMRI_DIRECT_NT_SUB``)
-            that is odd, below 8 or above ``Nt``.
+            that is odd, below 8 or above ``Nt``, or a ``chunk_batch``
+            (``EMRI_DIRECT_CHUNK_BATCH``) other than ``0`` / ``1`` / ``false`` / ``true``.
 
     Example:
         .. code-block:: python
@@ -1341,7 +1352,8 @@ class EMRIDirectWDM:
     def __init__(self, few_gen, table, wdm_set, *, orbits, tdi_config, t_start, data_t0,
                  Nt_sub=None, n_fine=None, fine_dt=3600.0, fine_dt_plunge=80.0, mode_batch=None,
                  pixel_edge=8, num_m_layers=2, interp="spline", force_backend="cpu", feed="knots",
-                 response="spline", response_grid=None, sparse_dt=None, lookup=None, f_band=None):
+                 response="spline", response_grid=None, sparse_dt=None, lookup=None, f_band=None,
+                 chunk_batch=None):
         self.few_gen, self.table, self.wdm = few_gen, table, wdm_set
         self.orbits, self.tdi_config = orbits, tdi_config
         self.t_start, self.data_t0 = float(t_start), float(data_t0)
@@ -1361,6 +1373,20 @@ class EMRIDirectWDM:
                 raise ValueError("EMRI_DIRECT_NT_SUB=%d: the plunge chunk must be an even number of layers "
                                  ">= 8 (n_pad = Nt_sub // 4 on each side) and <= Nt" % Nt_sub)
         self.Nt_sub, self.pixel_edge = Nt_sub, int(pixel_edge)
+        # plunge-chunk rows of a batch: all in one _chunk_rows_batch call (True) or one per call
+        # (False, the default: the single-template path the global fits run)
+        # (explicit argument > env EMRI_DIRECT_CHUNK_BATCH > False)
+        if chunk_batch is None:
+            chunk_batch = os.environ.get("EMRI_DIRECT_CHUNK_BATCH")
+        if chunk_batch is None:
+            self.chunk_batch = False
+        elif isinstance(chunk_batch, (bool, np.bool_)):
+            self.chunk_batch = bool(chunk_batch)
+        else:
+            flag = str(chunk_batch).strip().lower()
+            if flag not in ("0", "1", "false", "true"):
+                raise ValueError("EMRI_DIRECT_CHUNK_BATCH=%s: expected 0 / 1 or false / true" % (chunk_batch,))
+            self.chunk_batch = flag in ("1", "true")
         self.mode_batch = None if mode_batch is None else int(mode_batch)   # None: all modes in one batch
         # layers m-num_m_layers..m+num_m_layers per pixel: a chirping carrier near a layer edge
         # puts ~2.5e-4 of its energy two layers away (A8 gate); needs table support [-2, 3) df
@@ -2121,6 +2147,30 @@ class EMRIDirectWDM:
                      tail_layers=[int(st["tail_layers"][r]) for r in rows])
         return stats
 
+    #: per-call lengths among the plunge-chunk stats: merged by their largest value, not summed
+    _CHUNK_STATS_MAX = ("n_response",)
+
+    def _chunk_rows_each(self, out_arr, chunk_items, m_lo, m_hi, few_kwargs):
+        """The plunge-chunk rows of a :meth:`batch` call ONE PER :meth:`_chunk_rows_batch` call
+        (``chunk_batch=False``, the default: each row through the single-template path, in row
+        order, as a one-row ``{row: item}``), the stats merged as one batched call reports them:
+        counts summed, per-row lists (``tail_layers``, and any other list) concatenated in row
+        order, per-call lengths (:attr:`_CHUNK_STATS_MAX`) the largest, anything else (``lookup``)
+        the first row's. Same arguments and return as :meth:`_chunk_rows_batch`."""
+        tot = {}
+        for r in sorted(chunk_items):
+            st = self._chunk_rows_batch(out_arr, {r: chunk_items[r]}, m_lo, m_hi, few_kwargs)
+            for k, v in st.items():
+                if k in self._CHUNK_STATS_MAX:
+                    tot[k] = max(tot[k], v) if k in tot else v
+                elif isinstance(v, list):
+                    tot[k] = tot.get(k, []) + list(v)
+                elif isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool):
+                    tot[k] = tot.get(k, 0) + v
+                else:
+                    tot.setdefault(k, v)
+        return tot
+
     def _call_knots(self, few_args, few_kwargs, modes, reuse=None):
         """One template on the knots feed: :meth:`_chunk_item` + :meth:`_chunk_rows_batch` with
         one row (the code every plunge-chunk row of :meth:`batch` goes through). ``reuse=(modes,
@@ -2302,7 +2352,7 @@ class EMRIDirectWDM:
                                     **few_kwargs)
             failed += [idx[k] for k in self.last_failed_rows]
             for k, v in self.last_stats.items():
-                if k == "n_response":                         # a per-call grid length, not a count
+                if k in ("n_response", "chunk_batch"):        # a per-call grid length / flag, not a count
                     tot[k] = max(tot.get(k, 0), v)
                 elif isinstance(v, list):                     # one entry per row (tail_layers)
                     tot[k] = tot.get(k, []) + v
@@ -2329,14 +2379,17 @@ class EMRIDirectWDM:
         kernel (``lookup="kernel"``) or the Python tracer + table call + scatter-add in blocks of
         harmonics, into ``(n_rows, nch, n_m, Nt)`` (layers ``f_band``). The rows that hand off to
         the plunge chunk are captured in the row loop (:meth:`_chunk_item`, right after their FEW
-        call) and built TOGETHER after the lookup rows by :meth:`_chunk_rows_batch` (one
-        response, one lookup, one dense tail evaluation and one transform for all of their
-        (row, window) pairs); only on the ``feed="fine"`` / fixed-``n_fine`` path is such a row
-        still built alone with ``__call__``. Returns the array (backend xp). A row FEW refuses
+        call) and built after the lookup rows by :meth:`_chunk_rows_batch`: with ``chunk_batch``
+        (``EMRI_DIRECT_CHUNK_BATCH=1``) all TOGETHER (one response, one lookup, one dense tail
+        evaluation and one transform for all of their (row, window) pairs), by default one per
+        call in row order (:meth:`_chunk_rows_each`: the single-template path); only on the
+        ``feed="fine"`` / fixed-``n_fine`` path is such a row still built alone with
+        ``__call__``. Returns the array (backend xp). A row FEW refuses
         (WaveformDomainError, also a chunk row whose own response grid is too short) is left
         zero and listed in ``last_failed_rows`` when ``skip_domain_errors``; otherwise the error
-        propagates. ``last_stats``: ``rows``, ``chunk_rows`` (rows built through the batched
-        plunge chunk), ``alone`` (rows built one at a time through ``__call__``), ``subs`` (the
+        propagates. ``last_stats``: ``rows``, ``chunk_rows`` (rows built through the plunge-chunk
+        path, batched or one per call), ``chunk_batch`` (1 when they were built in one call),
+        ``alone`` (rows built one at a time through ``__call__``), ``subs`` (the
         lookup rows' harmonics), ``failed``, ``ended_before_window`` (rows whose inspiral ends
         before the window: an exact zero, neither a chunk row nor alone), the pixel counters
         ``lookup_pixels`` / ``chunk_pixels`` / ``dropped_pixels`` of every row (the chunk and
@@ -2364,15 +2417,18 @@ class EMRIDirectWDM:
         feeds, n_subs, rows_in, t_ends, grids = [], [], [], [], []
         chunk_items = {}                                   # row -> _chunk_item: the batched plunge-chunk rows
         stats = dict(rows=len(rows), chunk_rows=0, alone=0, subs=0, failed=0, lookup_pixels=0,
-                     chunk_pixels=0, dropped_pixels=0, windows=0, tail_layers=[], ended_before_window=0)
+                     chunk_pixels=0, dropped_pixels=0, windows=0, tail_layers=[], ended_before_window=0,
+                     chunk_batch=int(self.chunk_batch))
         # the chunk and alone rows' pixel counters: ADDED at the end, after the lookup rows' (tot)
         # are set
         alone_tot = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
 
         def finish():
-            """The single exit: the chunk rows (after the lookup rows), then every counter."""
+            """The single exit: the chunk rows (after the lookup rows; all in one call with
+            ``chunk_batch``, else one per call), then every counter."""
             if chunk_items:
-                cst = self._chunk_rows_batch(out_arr, chunk_items, m_lo, m_hi, few_kwargs)
+                build = self._chunk_rows_batch if self.chunk_batch else self._chunk_rows_each
+                cst = build(out_arr, chunk_items, m_lo, m_hi, few_kwargs)
                 for k in alone_tot:
                     alone_tot[k] += int(cst[k])
                 stats["windows"] += int(cst["windows"])
