@@ -676,11 +676,12 @@ class BatchDomainRefusalTest(unittest.TestCase):
         gen, self.rows, self.row_few_refuses, _ = cls._synth
         return gen
 
-    def _gen_in_mode(self, chunk_batch):
+    def _gen_in_mode(self, chunk_batch, **kw):
         """The fixture's REAL generator rebuilt (the same synthetic FEW stand-in, table and grid)
-        with ``EMRI_DIRECT_CHUNK_BATCH`` set to ``chunk_batch`` (read at construction)."""
+        with ``EMRI_DIRECT_CHUNK_BATCH`` set to ``chunk_batch`` (read at construction) and the
+        constructor overrides ``kw``."""
         with mock.patch.dict(os.environ, {"EMRI_DIRECT_CHUNK_BATCH": "1" if chunk_batch else "0"}):
-            return self._sibling()
+            return self._sibling(**kw)
 
     def test_mixed_batch_matches_single_calls(self):
         """Both chunk-row modes (one call for all chunk rows, and one per row, the default): each
@@ -774,13 +775,17 @@ class BatchDomainRefusalTest(unittest.TestCase):
                 self.assertEqual((st["chunk_rows"], st["windows"]), (2, 2))       # one window per chunk row
                 np.testing.assert_allclose(got, want, rtol=1e-12, atol=1e-15)
                 # a floor below the tails: the length grows past it, still one window per row
+                # the fixture's tails: row 0 hands off at pixel 88 and ends at 100 (span 13), row 1
+                # at 98 and 112 (span 15): ceil4(2 (13 + 8) + 4) = 48, ceil4(2 (15 + 8) + 4) = 52
                 lean = self._sibling(Nt_sub="auto:32", chunk_batch=chunk_batch)
                 lean.batch(self.rows, chunk_rows=4)
                 st = dict(lean.last_stats)
-                self.assertGreater(st["nt_sub_eff"], 32)
+                self.assertEqual(st["nt_sub_eff"], 52)       # the batch's / the largest per-row length
                 self.assertEqual((st["chunk_rows"], st["windows"]), (2, 2))
-                lean(*self.rows[0])                          # the single-template path reports it too
-                self.assertGreaterEqual(lean.last_stats["nt_sub_eff"], 32)
+                lean(*self.rows[0])                          # the single-template path: its own length
+                self.assertEqual(lean.last_stats["nt_sub_eff"], 48)
+                lean(*self.rows[1])
+                self.assertEqual(lean.last_stats["nt_sub_eff"], 52)
 
     def test_tail_skip_knob_reaches_the_generator(self):
         """EMRI_DIRECT_TAIL_SKIP_PX above the fixture's tails, in both chunk-row modes: both chunk
@@ -813,27 +818,91 @@ class BatchDomainRefusalTest(unittest.TestCase):
                 np.testing.assert_allclose(got[2], want[2], rtol=1e-12, atol=1e-15)
 
     def test_chunk_rows_batch_records_phase_walls(self):
-        """``last_stats["walls"]`` of one batch call: exclusive seconds per phase (capture,
-        response, lookup, tail_dense, transform, splice, ...) that add up to the call's total, and
-        the response grid lengths (padded common length, per-row lengths); a single call records
-        its own."""
-        gen = self._gen_with_two_chunk_rows_and_one_lookup_row()
-        gen.batch(self.rows, chunk_rows=4)
-        st = dict(gen.last_stats)
-        walls = st["walls"]
+        """With EMRI_DIRECT_WALLS on, in BOTH chunk-row modes: ``last_stats["walls"]`` of one batch
+        call, exclusive seconds per phase (capture, response, lookup, tail_dense, transform,
+        splice, ...) that add up to the call's total; ``walls_per_call`` one entry per
+        _batch_chunk call (one per ``chunk_rows`` group, whatever the mode; the mode shows in the
+        _chunk_rows_batch calls: one per chunk row, or one for both); the response grid lengths
+        (padded common length, per-row lengths); a single call records its own."""
         phases = {"capture", "response", "lookup", "tail_dense", "transform", "splice"}
-        self.assertGreaterEqual(set(walls), phases | {"total"})
-        self.assertTrue(all(v >= 0 for v in walls.values()), walls)
-        parts = sum(v for k, v in walls.items() if k != "total")
-        self.assertLessEqual(abs(parts - walls["total"]), 0.1 * walls["total"], walls)
-        self.assertEqual(len(st["n_response_points_rows"]), 2)                # the two chunk rows
-        self.assertEqual(st["n_response_points"], max(st["n_response_points_rows"]))
-        self.assertTrue(all(isinstance(v, float) for v in st["walls_detail"].values()))
-        gen(*self.rows[0])
-        walls = gen.last_stats["walls"]
-        self.assertGreaterEqual(set(walls), phases | {"total"})
-        parts = sum(v for k, v in walls.items() if k != "total")
-        self.assertLessEqual(abs(parts - walls["total"]), 0.1 * walls["total"], walls)
+        for chunk_batch in (False, True):
+            with self.subTest(chunk_batch=chunk_batch):
+                gen = self._gen_in_mode(chunk_batch, walls=True)
+                self.assertTrue(gen.walls)
+                with mock.patch.object(gen, "_chunk_rows_batch", wraps=gen._chunk_rows_batch) as spy:
+                    gen.batch(self.rows, chunk_rows=4)
+                self.assertEqual(spy.call_count, 1 if chunk_batch else 2)
+                st = dict(gen.last_stats)
+                walls = st["walls"]
+                self.assertGreaterEqual(set(walls), phases | {"total"})
+                self.assertTrue(all(v >= 0 for v in walls.values()), walls)
+                parts = sum(v for k, v in walls.items() if k != "total")
+                self.assertLessEqual(abs(parts - walls["total"]), 0.1 * walls["total"], walls)
+                self.assertEqual(len(st["walls_per_call"]), 1)                 # 3 rows, 4 per call
+                self.assertLessEqual(sum(st["walls_per_call"]), walls["total"])
+                self.assertEqual(len(st["n_response_points_rows"]), 2)        # the two chunk rows
+                self.assertEqual(st["n_response_points"], max(st["n_response_points_rows"]))
+                self.assertTrue(all(isinstance(v, float) for v in st["walls_detail"].values()))
+                gen.batch(self.rows, chunk_rows=2)
+                self.assertEqual(len(gen.last_stats["walls_per_call"]), 2)    # rows 0-1, then row 2
+                parts = sum(v for k, v in gen.last_stats["walls"].items() if k != "total")
+                self.assertLessEqual(abs(parts - gen.last_stats["walls"]["total"]),
+                                     0.1 * gen.last_stats["walls"]["total"])
+                gen(*self.rows[0])
+                walls = gen.last_stats["walls"]
+                self.assertGreaterEqual(set(walls), phases | {"total"})
+                parts = sum(v for k, v in walls.items() if k != "total")
+                self.assertLessEqual(abs(parts - walls["total"]), 0.1 * walls["total"], walls)
+
+    def test_walls_are_off_by_default_and_time_nothing(self):
+        """EMRI_DIRECT_WALLS unset (the library and global-fit default): no phase clock is ever
+        built, nothing is timed or synchronised, and ``last_stats`` has no walls keys -- batch
+        (both chunk-row modes) and single call."""
+        from lisatools.sources.emri import wdm_direct as wd
+
+        for chunk_batch in (False, True):
+            with self.subTest(chunk_batch=chunk_batch):
+                with mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if k != "EMRI_DIRECT_WALLS"},
+                                     clear=True):
+                    gen = self._gen_in_mode(chunk_batch)
+                self.assertFalse(gen.walls)
+                with mock.patch.object(wd, "_PhaseWalls", side_effect=AssertionError("a clock was built")) as pw:
+                    gen.batch(self.rows, chunk_rows=4)
+                    st = dict(gen.last_stats)
+                    gen(*self.rows[0])
+                    one = dict(gen.last_stats)
+                self.assertEqual(pw.call_count, 0)
+                for k in ("walls", "walls_detail", "walls_per_call"):
+                    self.assertNotIn(k, st)
+                    self.assertNotIn(k, one)
+                self.assertEqual(st["chunk_rows"], 2)                         # the batch itself ran
+
+    def test_alone_row_with_a_skipped_tail_has_no_entry_and_is_counted(self):
+        """An ``alone`` row (feed="fine" / fixed n_fine: built through __call__) whose tail the skip
+        replaced: counted in tail_skipped with no tail_layers entry, as a batched chunk row; one
+        that kept its tail gets its entry (the single call's counters are stood in)."""
+        from lisatools.domains import WDMSettings
+        from lisatools.sources.emri.wdm_direct import EMRIDirectWDM
+
+        class _Alone(EMRIDirectWDM):
+            def _mode_list(self, few_args, few_kwargs):
+                self._last_holder = SimpleNamespace(t_arr=np.array([0.0, 1.0e12]))
+                return [], 0.0                                   # hands off: an alone row on feed="fine"
+
+            def _call(self, *few_args, **few_kwargs):
+                skipped = int(few_args[0]) == 1
+                self.last_stats = dict(lookup_pixels=10, chunk_pixels=0 if skipped else 5, dropped_pixels=0,
+                                       windows=0 if skipped else 1, tail_layers=0 if skipped else 7,
+                                       tail_skipped=int(skipped), nt_sub_eff=128)
+                return SimpleNamespace(arr=np.zeros((3, self.wdm.Nf, self.wdm.Nt)))
+
+        table = SimpleNamespace(fdot_vals=np.array([-1.0, 1.0]), INTERP_METHOD="spline")
+        d = _Alone(None, table, WDMSettings(32, 64, 10.0, force_backend="cpu"), orbits=None,
+                   tdi_config=SimpleNamespace(nchannels=3), t_start=0.0, data_t0=0.0, fine_dt=100.0, feed="fine")
+        d.batch([np.full(14, 1.0), np.full(14, 0.0)], chunk_rows=4)
+        st = d.last_stats
+        self.assertEqual((st["alone"], st["tail_skipped"], st["tail_layers"], st["windows"]), (2, 1, [7], 1))
+        self.assertEqual((st["lookup_pixels"], st["chunk_pixels"]), (20, 5))
 
     def test_refused_chunk_row_stays_zero(self):
         from lisatools.utils.utility import asnumpy

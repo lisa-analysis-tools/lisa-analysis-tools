@@ -478,13 +478,17 @@ choreography is untouched, only the scoring changes.
   and stays the speed test's default (`emri_speed_durations.sh` `CHUNK_BATCH=1`, `--chunk-batch`)
   until it is shown faster. The lookup-only rows are batched in both modes; the stats are the
   same (`last_stats["chunk_batch"]` says which ran).
-* **Phase walls (10-25).** Every `batch` / single call records `last_stats["walls"]`: exclusive
-  wall seconds per phase -- `capture` (the row loop: FEW, tracks, grids, `_chunk_item`),
-  `response` (`_dense_response` / `run_response`), `lookup` (fused kernel or Python tracer +
-  table), `tail_dense` (`tail_td(pairs)`), `transform` (`wdm_chunk_of_td`), `splice`, `plan`
-  (handoffs, pixel ranges, track subsets, the pair plan), `alloc` (the output array) -- and
-  `total`; on cupy every boundary synchronises the stream first, so GPU time lands in the phase
-  that launched it (a few synchronisations per call). `walls_detail` splits the response (the
+* **Phase walls (10-25, opt-in: `EMRI_DIRECT_WALLS`, default `0`).** With the knob
+  (`EMRIDirectWDM(walls=True)`; `0` / `1`, `false` / `true`) every `batch` / single call records
+  `last_stats["walls"]`: exclusive wall seconds per phase -- `capture` (the row loop: FEW, tracks,
+  grids, `_chunk_item`), `response` (`_dense_response` / `run_response`), `lookup` (fused kernel
+  or Python tracer + table), `tail_dense` (`tail_td(pairs)`), `transform` (`wdm_chunk_of_td`),
+  `splice`, `plan` (handoffs, pixel ranges, track subsets, the pair plan), `alloc` (the output
+  array) -- and `total`. On cupy every phase and every detail boundary synchronises the stream
+  (two synchronisations each, so GPU time lands in the phase that launched it): about 28 per chunk
+  row on the default one-row-per-call path, which is why the library (and so the global fits)
+  leaves them off -- then nothing is timed or synchronised and `last_stats` has no `walls` keys;
+  the speed script turns them on (`--walls 1`, `WALLS=1`; `0` for an A/B of their cost). `walls_detail` splits the response (the
   padding to the common grid, the kernel object's construction and uploads, the kernel, the
   output splines) and the tail (kernel objects, channels kernel); `n_response_points` /
   `n_response_points_rows` give the chunk rows' padded common response length and their own

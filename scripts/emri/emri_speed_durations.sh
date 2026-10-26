@@ -46,6 +46,8 @@
 #   default 0 = never skip; the [split] lines count the skipped rows),
 #   CHUNK_BATCH (1: a batch's plunge-chunk rows built in one call, the batched path this test
 #   measures; 0: one per call, the library and global-fit default; passed as --chunk-batch),
+#   WALLS (1: the [walls] phase walls, two device synchronisations per phase; 0: off, to A/B
+#   their cost; passed as --walls),
 #   REPS (3), OUT (emri_speed_durations_<date>).
 #
 # Memory: a direct template holds a (3, n_m, Nt) float64 accumulator while it is built: on the
@@ -82,6 +84,7 @@ if [ -n "${TAIL_SKIP_PX}" ]; then
   tail_args+=(--tail-skip-px "${TAIL_SKIP_PX}")
 fi
 CHUNK_BATCH=${CHUNK_BATCH:-1}               # 1: chunk rows batched (the speed test); 0: one per call (production)
+WALLS=${WALLS:-1}                           # 1: [walls] phase walls (device syncs per phase); 0: off (A/B)
 REPS=${REPS:-3}
 OUT=${OUT:-emri_speed_durations_$(date +%Y%m%d_%H%M)}
 mkdir -p "${OUT}"
@@ -95,7 +98,7 @@ for days in ${DAYS}; do
   echo "[durations] ${days} d: grids ${GRIDS}, lookups ${LOOKUPS}, band ${BAND:-all}, rows per call ${CHUNKS} over ${ROWS} rows, nt_sub ${NT_SUB:-default}, tail skip px ${TAIL_SKIP_PX:-default}, chunk_batch ${CHUNK_BATCH} -> ${log}"
   python scripts/emri/emri_direct_stage_timing.py "${common[@]}" --days "${days}" --thresh "${THRESH}" \
     --response dense --response-grid "${GRIDS}" --lookup "${LOOKUPS}" --band-hz "${BAND}" \
-    --batch-rows "${ROWS}" --chunk-rows "${CHUNKS}" --chunk-batch "${CHUNK_BATCH}" ${tail_args[@]+"${tail_args[@]}"} \
+    --batch-rows "${ROWS}" --chunk-rows "${CHUNKS}" --chunk-batch "${CHUNK_BATCH}" --walls "${WALLS}" ${tail_args[@]+"${tail_args[@]}"} \
     --reps "${REPS}" --out "${OUT}/stages.jsonl" 2>&1 | grep -v "ModeSelector\|lisaconstants\|warnings.warn" \
     > "${log}" || { echo "[durations] FAILED: ${log}"; tail -4 "${log}"; }
   grep "^\[snr\]\|^\[data\]\|^\[speed\] orbits\|^\[split\]\|^\[walls\]\|^\[parity\]" "${log}" || true

@@ -41,7 +41,8 @@ below the floor, 128 by default),
 ``EMRI_DIRECT_CHUNK_BATCH`` (``0`` / ``1`` or ``false`` / ``true``, default ``0``: the plunge-chunk
 rows of a :meth:`~EMRIDirectWDM.batch` call are built one per call; ``1`` builds them all in one),
 ``EMRI_DIRECT_TAIL_SKIP_PX`` (0 = never; a row whose tail spans at most this many pixels is
-looked up through its end instead),
+looked up through its end instead), ``EMRI_DIRECT_WALLS`` (``0`` / ``1`` or ``false`` / ``true``,
+default ``0``: the per-phase walls of every batch / call, two device synchronisations per phase),
 ``EMRI_DIRECT_HANDOFF_BOUND`` (``1``), ``EMRI_DIRECT_TAIL_BLOCK_ELEMS`` and
 ``EMRI_DIRECT_MODE_BLOCK_ELEMS`` (2e7), ``EMRI_DIRECT_LOOKUP_CHUNK`` (2e6), ``EMRI_TRACER``
 (``analytic``), ``EMRI_TRACER_H_FDOT`` (300 s), ``EMRI_TRACER_MAX_ELEMS`` (6e7). The response
@@ -397,27 +398,50 @@ def _run_once(fn):
     return run
 
 
+def _knob_flag(value, knob):
+    """A boolean generator knob: an explicit ``value`` (bool, or the env strings) wins, else env
+    ``knob``, else ``False``; the strings are ``0`` / ``1`` / ``false`` / ``true`` (any case).
+
+    Raises:
+        ValueError: For any other value, naming ``knob``.
+    """
+    if value is None:
+        value = os.environ.get(knob)
+    if value is None:
+        return False
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    flag = str(value).strip().lower()
+    if flag not in ("0", "1", "false", "true"):
+        raise ValueError("%s=%s: expected 0 / 1 or false / true" % (knob, value))
+    return flag in ("1", "true")
+
+
 class _PhaseWalls:
     """Wall seconds per named phase, EXCLUSIVE: a phase entered inside another pauses the outer
     one, so the phases partition the time they cover (their sum is the covered wall time).
     ``detail(name)`` times a sub-part of the enclosing phase without pausing it (into
-    ``detail``, not ``walls``). With cupy as ``xp`` every boundary first synchronises the current
-    stream, so GPU work lands in the phase that launched it.
+    ``detail_walls``, not ``walls``). With cupy as ``xp`` every boundary first synchronises the
+    current stream (two synchronisations per phase or detail), so GPU work lands in the phase
+    that launched it. Only the generator's ``EMRI_DIRECT_WALLS`` knob creates one.
 
     Args:
-        xp: The array module (numpy or cupy).
+        xp: The array module (numpy or cupy); only whether it is cupy is kept (never the module
+            itself: the clock stays picklable).
     """
 
     def __init__(self, xp=np):
-        self.xp = xp
+        self._sync_device = getattr(xp, "__name__", "") == "cupy"
         self.walls = {}
         self.detail_walls = {}
         self._stack = []
 
     def sync(self):
         """Wait for the device (cupy only)."""
-        if getattr(self.xp, "__name__", "") == "cupy":
-            self.xp.cuda.get_current_stream().synchronize()
+        if self._sync_device:
+            import cupy
+
+            cupy.cuda.get_current_stream().synchronize()
 
     @contextlib.contextmanager
     def phase(self, name):
@@ -563,17 +587,21 @@ def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, 
     ``walls`` (optional, :class:`_PhaseWalls`): the caller's phase clock; the call's phases
     (``plan``: handoffs, skip, window length, pairs; ``lookup``; ``tail_dense``: the ``tail_td``
     call; ``transform``: ``wdm_chunk_of_td``; ``splice``) are timed into it (device-synchronised
-    on cupy), and returned for this call as ``walls`` (batched only). ``None``: a private clock.
+    on cupy), and returned for this call as ``walls`` (batched only). ``None`` (default):
+    nothing is timed or synchronised and there is no ``walls`` key.
+
+    Returns:
         dict: ``lookup_pixels``, ``chunk_pixels``, ``dropped_pixels`` (plus the kernel's
         counters with ``lookup_kernel``), ``windows`` (the (row, window) chunk series built:
         ``len(pairs)`` for a summed tail) and ``tail_layers`` (the pixels the chunks filled:
         ``khi - klo`` summed over the pairs, once per keep range, not per sub); an int for one
-        template, with ``sub_row`` a list with one entry per row of ``acc``, plus ``pairs`` (the
-        ``(row, n0, klo, khi)`` list), ``handoff_pixel_per_row`` (per row of ``acc``, the
-        first pixel its earliest sub hands to the chunk, ``None`` without a handoff -- a skipped
-        row included), ``nt_sub_eff`` (the window length the call used: ``Nt_sub``, or the auto
-        choice), ``tail_skipped`` (the rows ``tail_skip_px`` skipped), ``tail_skipped_rows``
-        (those rows of ``acc``) and ``walls`` (this call's seconds per phase).
+        template, with ``sub_row`` a list with one entry per row of ``acc``; ``nt_sub_eff`` (the
+        window length the call used: ``Nt_sub``, or the auto choice) and ``tail_skipped`` (the
+        rows ``tail_skip_px`` skipped); with ``sub_row`` also ``pairs`` (the ``(row, n0, klo,
+        khi)`` list), ``handoff_pixel_per_row`` (per row of ``acc``, the first pixel its earliest
+        sub hands to the chunk, ``None`` without a handoff -- a skipped row included),
+        ``tail_skipped_rows`` (the skipped rows of ``acc``) and, with a ``walls`` clock,
+        ``walls`` (this call's seconds per phase).
 
     Raises:
         ValueError: For a track shorter than its row's pixels, a pairs-form ``tail_td`` that is
@@ -584,12 +612,16 @@ def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, 
     from ...utils.utility import get_array_module
 
     xp = get_array_module(acc)
-    clock = walls if walls is not None else _PhaseWalls(xp)
+    clock = walls                                  # None: nothing is timed or synchronised
     own = {}                                       # this call's phases [s]
 
     @contextlib.contextmanager
     def ph(name):
-        """Phase ``name`` on ``clock``, also summed into this call's ``own``."""
+        """Phase ``name`` on ``clock``, also summed into this call's ``own`` (a no-op without a
+        clock)."""
+        if clock is None:
+            yield
+            return
         with clock.phase(name) as rec:
             yield
         own[name] = own.get(name, 0.0) + rec["s"]
@@ -693,16 +725,17 @@ def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, 
                 tail_per_row[r] += khi - klo
             del chunks
     stats["windows"] = len({(r, n0) for r, n0, _, _ in pairs})
+    stats["nt_sub_eff"] = int(nt_eff)
+    stats["tail_skipped"] = len(skipped_rows)
     if not batched:
         stats["tail_layers"] = tail_per_row[0]
         return stats
     stats["tail_layers"] = tail_per_row
     stats["pairs"] = pairs
     stats["handoff_pixel_per_row"] = [int(n_ok_h[k]) if k < P_row[r] else None for r, k in enumerate(k_row)]
-    stats["nt_sub_eff"] = int(nt_eff)
-    stats["tail_skipped"] = len(skipped_rows)
     stats["tail_skipped_rows"] = skipped_rows
-    stats["walls"] = own                           # this call's phases [s]
+    if clock is not None:
+        stats["walls"] = own                       # this call's phases [s]
     return stats
 
 
@@ -839,14 +872,18 @@ def _accumulate_harmonic_batch_loop(acc, table, tracks, tracer, n_ok, tail_td, *
     Returns a stats dict (lookup pixels, chunk pixels, pixels dropped before the handoff
     because the channel fdot left the table or f was below 2 layers, chunk windows, and the
     pixels the chunks filled counted once per keep range: :func:`accumulate_harmonic_batch`'s
-    ``windows`` / ``tail_layers``).
+    ``windows`` / ``tail_layers``; ``nt_sub_eff`` = ``Nt_sub`` and ``tail_skipped`` = 0).
+    It is NOT extended for the auto window length or the tail skip (``nt_sub_auto`` /
+    ``tail_skip_px`` of :func:`accumulate_harmonic_batch`): it is the fixed-length reference the
+    equivalence tests compare against, nothing more.
     """
     from ...wdm_het import tail_chunk_plan, wdm_chunk_of_td
 
     amp, phase, f, fdot = tracer
     nch = amp.shape[1]
     n_ok = np.asarray(n_ok)
-    stats = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0, windows=0, tail_layers=0)
+    stats = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0, windows=0, tail_layers=0,
+                 nt_sub_eff=int(Nt_sub), tail_skipped=0)
     windows = {}
     for s, tr in enumerate(tracks):
         k_h = handoff_pixel(tr, layer_dt, layer_df, fdot_axis_max)
@@ -1448,20 +1485,27 @@ class EMRIDirectWDM:
             (from its common handoff to its last tracked pixel) is looked up through its last
             pixel instead, no tail (:func:`accumulate_harmonic_batch`). ``None`` reads
             ``EMRI_DIRECT_TAIL_SKIP_PX`` (default ``0``: never skip); an integer ``>= 0``.
+        walls (bool, optional): record the per-phase wall times of every :meth:`batch` /
+            single call in ``last_stats["walls"]`` (:meth:`_timed_call`; two device
+            synchronisations per phase and per detail, about 28 per chunk row on the default
+            path). ``None`` reads ``EMRI_DIRECT_WALLS`` (``0`` / ``1``, ``false`` / ``true``;
+            default ``False``: nothing timed or synchronised); an explicit value wins.
 
     Attributes:
         Nt_sub (int | str): The fixed plunge-chunk length, or ``"auto"``.
         nt_sub_floor (int): The auto mode's smallest window length (the fixed length itself in
             fixed mode; the fine-grid and chunk-start rules read it).
         tail_skip_px (int): The conditional-tail threshold [pixels] (0: never skip).
+        walls (bool): Whether every call records its phase walls (``EMRI_DIRECT_WALLS``).
         chunk_batch (bool): Whether :meth:`batch` builds its plunge-chunk rows in one call
             (``EMRI_DIRECT_CHUNK_BATCH``; default ``False``: one per call).
         fdot_axis_max (float): Largest ``|fdot|`` of the table's axis [Hz/s].
         plunge_taper_s (float): Source-frame stop taper [s] (``EMRI_DIRECT_PLUNGE_TAPER_S``,
             default 120).
         last_stats (dict): Counters of the last call (``modes``, ``lookup_pixels``,
-            ``chunk_pixels``, ``dropped_pixels``, ...), its phase walls (``walls``: exclusive
-            seconds per phase plus ``total``; ``walls_detail``; :meth:`_timed_call`) and the chunk
+            ``chunk_pixels``, ``dropped_pixels``, ...), with :attr:`walls` its phase walls
+            (``walls``: exclusive seconds per phase plus ``total``; ``walls_detail``;
+            :meth:`_timed_call`), and the chunk
             rows' response grid lengths (``n_response_points``, ``n_response_points_rows``).
         last_failed_rows (list[int]): Rows of the last :meth:`batch` FEW refused.
 
@@ -1470,8 +1514,9 @@ class EMRIDirectWDM:
             ``response="dense"`` with ``feed="fine"``, or an ``Nt_sub`` (``EMRI_DIRECT_NT_SUB``)
             that is odd, below 8 or above ``Nt`` (an ``auto:<floor>`` floor alike), or neither a
             number nor ``auto`` / ``auto:<floor>``, a ``chunk_batch`` (``EMRI_DIRECT_CHUNK_BATCH``)
-            other than ``0`` / ``1`` / ``false`` / ``true``, or a ``tail_skip_px``
-            (``EMRI_DIRECT_TAIL_SKIP_PX``) that is not an integer ``>= 0``.
+            or a ``walls`` (``EMRI_DIRECT_WALLS``) other than ``0`` / ``1`` / ``false`` /
+            ``true``, or a ``tail_skip_px`` (``EMRI_DIRECT_TAIL_SKIP_PX``) that is not an integer
+            ``>= 0``.
 
     Example:
         .. code-block:: python
@@ -1499,7 +1544,7 @@ class EMRIDirectWDM:
                  Nt_sub=None, n_fine=None, fine_dt=3600.0, fine_dt_plunge=80.0, mode_batch=None,
                  pixel_edge=8, num_m_layers=2, interp="spline", force_backend="cpu", feed="knots",
                  response="spline", response_grid=None, sparse_dt=None, lookup=None, f_band=None,
-                 chunk_batch=None, tail_skip_px=None):
+                 chunk_batch=None, tail_skip_px=None, walls=None):
         self.few_gen, self.table, self.wdm = few_gen, table, wdm_set
         self.orbits, self.tdi_config = orbits, tdi_config
         self.t_start, self.data_t0 = float(t_start), float(data_t0)
@@ -1536,17 +1581,10 @@ class EMRIDirectWDM:
         # plunge-chunk rows of a batch: all in one _chunk_rows_batch call (True) or one per call
         # (False, the default: the single-template path the global fits run)
         # (explicit argument > env EMRI_DIRECT_CHUNK_BATCH > False)
-        if chunk_batch is None:
-            chunk_batch = os.environ.get("EMRI_DIRECT_CHUNK_BATCH")
-        if chunk_batch is None:
-            self.chunk_batch = False
-        elif isinstance(chunk_batch, (bool, np.bool_)):
-            self.chunk_batch = bool(chunk_batch)
-        else:
-            flag = str(chunk_batch).strip().lower()
-            if flag not in ("0", "1", "false", "true"):
-                raise ValueError("EMRI_DIRECT_CHUNK_BATCH=%s: expected 0 / 1 or false / true" % (chunk_batch,))
-            self.chunk_batch = flag in ("1", "true")
+        self.chunk_batch = _knob_flag(chunk_batch, "EMRI_DIRECT_CHUNK_BATCH")
+        # the phase walls of every batch / call (explicit argument > env EMRI_DIRECT_WALLS > False):
+        # opt-in, since each phase boundary synchronises the device (_timed_call)
+        self.walls = _knob_flag(walls, "EMRI_DIRECT_WALLS")
         # the conditional tail (explicit argument > env EMRI_DIRECT_TAIL_SKIP_PX > 0 = never): a
         # row whose plunge tail spans at most this many pixels from its handoff to its last pixel
         # keeps the lookup through the end instead (accumulate_harmonic_batch)
@@ -1555,9 +1593,15 @@ class EMRIDirectWDM:
         if tail_skip_px is None:
             self.tail_skip_px = 0
         else:
-            try:
-                skip_px = int(str(tail_skip_px).strip()) if isinstance(tail_skip_px, str) else int(tail_skip_px)
-            except (TypeError, ValueError):
+            # the env string and an explicit value alike: an integer (never a truncated float)
+            if isinstance(tail_skip_px, str):
+                try:
+                    skip_px = int(tail_skip_px.strip())
+                except ValueError:
+                    skip_px = -1
+            elif isinstance(tail_skip_px, (int, np.integer)) and not isinstance(tail_skip_px, (bool, np.bool_)):
+                skip_px = int(tail_skip_px)
+            else:
                 skip_px = -1
             if skip_px < 0:
                 raise ValueError("EMRI_DIRECT_TAIL_SKIP_PX=%s: expected an integer >= 0 (pixels; 0 = never skip "
@@ -1630,12 +1674,15 @@ class EMRIDirectWDM:
 
     @contextlib.contextmanager
     def _timed_call(self):
-        """The phase clock (:class:`_PhaseWalls`) of one top-level :meth:`batch` / ``__call__``:
-        a call nested inside another (an ``alone`` row's ``__call__`` inside :meth:`batch`)
-        shares the outer clock. On a successful top-level exit ``last_stats`` gains ``walls``
-        (seconds per phase, exclusive, plus ``total``, the call's wall time) and ``walls_detail``
-        (sub-parts of phases, inclusive)."""
-        if self._clock is not None:
+        """The phase clock (:class:`_PhaseWalls`) of one top-level :meth:`batch` / ``__call__``,
+        only with :attr:`walls` (``EMRI_DIRECT_WALLS``; off by default: then nothing is timed or
+        synchronised and ``last_stats`` has no ``walls`` keys). A call nested inside another (an
+        ``alone`` row's ``__call__`` inside :meth:`batch`) shares the outer clock. On a successful
+        top-level exit ``last_stats`` gains ``walls`` (seconds per phase, exclusive, plus
+        ``total``, the call's wall time) and ``walls_detail`` (sub-parts of phases, inclusive).
+        Each phase and each detail costs two device synchronisations on cupy (about 28 per chunk
+        row on the default one-row-per-call path)."""
+        if self._clock is not None or not self.walls:
             yield
             return
         clock = self._clock = _PhaseWalls(self.xp)
@@ -2489,8 +2536,8 @@ class EMRIDirectWDM:
             :class:`~lisatools.sources.emri.direct_signal_gen.EMRIDirectWDMSignalGen`) wraps
             them into ``WaveformDomainError``.
 
-        ``last_stats["walls"]`` / ``["walls_detail"]``: the call's phase walls
-        (:meth:`_timed_call`).
+        ``last_stats["walls"]`` / ``["walls_detail"]``: the call's phase walls, with
+        ``EMRI_DIRECT_WALLS`` (:meth:`_timed_call`).
         """
         with self._timed_call():
             return self._call(*few_args, **few_kwargs)
@@ -2515,6 +2562,7 @@ class EMRIDirectWDM:
         few_kwargs = dict(few_kwargs)
         modes = few_kwargs.pop("mode_selection", None)      # explicit (l, m, k, n) list, e.g. gates
         totals = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
+        windows_tot, skipped_any, nt_eff = 0, False, int(self.nt_sub_floor)
         H = tracks_all = n_tr = None
         t_fine, chunk_start = None, "unknown"
         if modes is None and self.n_fine_fixed is None:
@@ -2581,9 +2629,15 @@ class EMRIDirectWDM:
                 walls=self._clock, **self._tail_kw())
             for key in totals:
                 totals[key] += st[key]
+            windows_tot += int(st["windows"])
+            skipped_any = skipped_any or bool(st["tail_skipped"])
+            nt_eff = max(nt_eff, int(st["nt_sub_eff"])) if st["windows"] else nt_eff
             del out, fly
+        # tail_skipped: 1 when the skip applied and the template built no tail at all (its mode
+        # batches decide each on its own subs); nt_sub_eff: the longest window length used
         self.last_stats = dict(modes=nm, n_fine=self.n_fine,
-                               chunk_start=None if chunk_start == "unknown" else chunk_start, **totals)
+                               chunk_start=None if chunk_start == "unknown" else chunk_start, **totals,
+                               nt_sub_eff=nt_eff, tail_skipped=int(skipped_any and not windows_tot))
         return WDMSignal(acc, wdm)
 
     def batch(self, rows, chunk_rows=16, consume=None, skip_domain_errors=False, **few_kwargs):
@@ -2593,8 +2647,8 @@ class EMRIDirectWDM:
         ``consume(row_indices, arr)`` (optional) receives each chunk's ``(n, nch, n_m, Nt)`` array
         and nothing is kept; otherwise the full ``(n_rows, nch, n_m, Nt)`` array is returned
         (``n_m = m_hi - m_lo`` with ``f_band``, else ``Nf``). ``last_stats`` sums the chunks' stats
-        and carries the whole call's phase walls (``walls``, ``walls_detail``, and
-        ``walls_per_call``: each chunk's wall seconds).
+        and, with ``EMRI_DIRECT_WALLS``, the whole call's phase walls (``walls``, ``walls_detail``,
+        and ``walls_per_call``: each chunk's wall seconds).
 
         FEW's out-of-domain failures are raised as
         :class:`~lisatools.utils.exceptions.WaveformDomainError` (``few_domain_guard``). With
@@ -2625,20 +2679,22 @@ class EMRIDirectWDM:
     def _batch_rows(self, rows, chunk_rows, consume, skip_domain_errors, few_kwargs):
         """The body of :meth:`batch` (inside its phase clock): :meth:`_batch_chunk` per
         ``chunk_rows`` rows, their stats summed (lists concatenated, :attr:`_BATCH_STATS_MAX` the
-        largest), plus ``walls_per_call`` (each :meth:`_batch_chunk` call's wall seconds, device
-        synchronised: a first call slower than the rest is first-use cost, not the batch)."""
+        largest), plus, with ``EMRI_DIRECT_WALLS``, ``walls_per_call`` (each :meth:`_batch_chunk`
+        call's wall seconds, device synchronised: a first call slower than the rest is first-use
+        cost, not the batch)."""
         rows = list(rows)
         parts, tot, failed, per_call = [], {}, [], []
         for i in range(0, len(rows), max(1, int(chunk_rows))):
             idx = list(range(i, min(i + int(chunk_rows), len(rows))))
-            if self._clock is not None:
-                self._clock.sync()
-            t_call = time.perf_counter()
+            clock = self._clock                              # None unless EMRI_DIRECT_WALLS
+            if clock is not None:
+                clock.sync()
+                t_call = time.perf_counter()
             arr = self._batch_chunk([rows[k] for k in idx], skip_domain_errors=skip_domain_errors,
                                     **few_kwargs)
-            if self._clock is not None:
-                self._clock.sync()
-            per_call.append(time.perf_counter() - t_call)
+            if clock is not None:
+                clock.sync()
+                per_call.append(time.perf_counter() - t_call)
             failed += [idx[k] for k in self.last_failed_rows]
             for k, v in self.last_stats.items():
                 if k in self._BATCH_STATS_MAX:                # per-call lengths / flag: the largest
@@ -2652,7 +2708,8 @@ class EMRIDirectWDM:
                 del arr
             else:
                 parts.append(arr)
-        tot["walls_per_call"] = per_call
+        if self._clock is not None:
+            tot["walls_per_call"] = per_call
         self.last_stats = tot
         self.last_failed_rows = failed
         if consume is not None:
@@ -2767,7 +2824,10 @@ class EMRIDirectWDM:
                             for k in alone_tot:
                                 alone_tot[k] += int(one_st.get(k, 0))
                             stats["windows"] += int(one_st.get("windows", 0))
-                            stats["tail_layers"].append(int(one_st.get("tail_layers", 0)))
+                            if one_st.get("tail_skipped"):       # looked up through its end: no tail entry
+                                stats["tail_skipped"] += 1
+                            else:
+                                stats["tail_layers"].append(int(one_st.get("tail_layers", 0)))
                             stats["alone"] += 1
                             continue
                 except WaveformDomainError:

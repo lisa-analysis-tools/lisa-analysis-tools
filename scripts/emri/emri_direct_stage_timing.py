@@ -40,8 +40,9 @@ longest tail, the single template's its own, so the ``[parity]`` lines (which na
 that length's edge contamination difference (128-layer windows: ~2e-6 of the peak); with
 ``--chunk-batch 0`` every chunk row is its own call.
 
-Phase walls: after the single call and after every timed batch a ``[walls]`` line gives the
-generator's ``last_stats["walls"]`` of that call (exclusive wall seconds per phase, each boundary
+Phase walls (``--walls 1``, the default here; the library default ``EMRI_DIRECT_WALLS=0`` leaves
+them off, ``--walls 0`` measures without their synchronisations): after the single call and after
+every timed batch a ``[walls]`` line gives the generator's ``last_stats["walls"]`` of that call (exclusive wall seconds per phase, each boundary
 device-synchronised, so GPU time lands in the phase that launched it; the batch's summed over its
 ``_batch_chunk`` calls) in ms per row::
 
@@ -157,6 +158,10 @@ def main():
                     help="1 (default here): a batch's plunge-chunk rows built in ONE call (the batched "
                          "path); 0: one per call, the library and global-fit default "
                          "(EMRIDirectWDM chunk_batch / EMRI_DIRECT_CHUNK_BATCH)")
+    ap.add_argument("--walls", type=int, choices=(0, 1), default=1,
+                    help="1 (default here): record the per-phase walls of every call ([walls] lines; "
+                         "EMRIDirectWDM walls / EMRI_DIRECT_WALLS, which the library leaves off: two device "
+                         "synchronisations per phase); 0: off, for an A/B of their cost")
     args = ap.parse_args()
 
     from lisatools.domains import TDSettings, TDSignal, WDMLookupTable, WDMSettings
@@ -236,7 +241,7 @@ def main():
                                              data_t0=data_t0, mode_batch=args.mode_batch, force_backend=args.backend,
                                              response=args.response, response_grid=g, lookup=lk, f_band=band,
                                              Nt_sub=args.nt_sub, tail_skip_px=args.tail_skip_px,
-                                             chunk_batch=bool(args.chunk_batch))
+                                             chunk_batch=bool(args.chunk_batch), walls=bool(args.walls))
                for g in grids for lk in lookups}
     tail_skip_px = next(iter(directs.values())).tail_skip_px            # resolved (argument > env > 0)
     nt_sub = next(iter(directs.values())).Nt_sub                       # resolved (argument > env > 128), or "auto"
@@ -381,6 +386,8 @@ def main():
         """The phase walls of a call's ``last_stats`` (``walls``: exclusive seconds per phase of the
         whole batch / single call, device-synchronised; ``walls_detail``: sub-parts) in ms per row:
         the ``[walls]`` line's text and the JSON fields."""
+        if "walls" not in st:                                             # --walls 0
+            return "off (--walls 0)", dict(walls_ms_per_row=None)
         w, d = st.get("walls") or {}, st.get("walls_detail") or {}
         ms = {k: 1e3 * w.get(k, 0.0) / n_rows for k in WALLS}
         total = 1e3 * w.get("total", 0.0) / n_rows
@@ -406,7 +413,7 @@ def main():
 
     base = dict(src=args.src, days=args.days, dt=args.dt, nf=nf, nt=nt, backend=args.backend,
                 response=args.response, nt_sub=nt_sub, nt_sub_floor=nt_floor, tail_skip_px=tail_skip_px,
-                chunk_batch=args.chunk_batch, band=band, brick=box.brick, tobs_s=box.tobs,
+                chunk_batch=args.chunk_batch, walls=args.walls, band=band, brick=box.brick, tobs_s=box.tobs,
                 foreground=box.foreground, noise=box.describe(),
                 data_snr=None if box.d is None else box.data_snr)
 

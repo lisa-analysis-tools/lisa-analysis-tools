@@ -297,6 +297,28 @@ class NtSubKnobTest(unittest.TestCase):
                     self._make_gen()
         with self.assertRaisesRegex(ValueError, "EMRI_DIRECT_TAIL_SKIP_PX"):
             self._make_gen(tail_skip_px=-3)
+        for bad in (1.5, 2.0, True):                    # an explicit value is checked as the env one is
+            with self.assertRaisesRegex(ValueError, "EMRI_DIRECT_TAIL_SKIP_PX"):
+                self._make_gen(tail_skip_px=bad)
+        self.assertEqual(self._make_gen(tail_skip_px=np.int64(4)).tail_skip_px, 4)
+
+    def test_walls_knob(self):
+        """``walls``: explicit > env ``EMRI_DIRECT_WALLS`` (0 / 1, false / true) > False (off);
+        anything else raises naming the knob."""
+        import os
+
+        with mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if k != "EMRI_DIRECT_WALLS"},
+                             clear=True):
+            self.assertFalse(self._make_gen().walls)
+        for val, want in (("1", True), ("TRUE", True), ("0", False), ("false", False)):
+            with mock.patch.dict(os.environ, {"EMRI_DIRECT_WALLS": val}):
+                self.assertIs(self._make_gen().walls, want, val)
+        with mock.patch.dict(os.environ, {"EMRI_DIRECT_WALLS": "1"}):
+            self.assertFalse(self._make_gen(walls=False).walls)                # explicit wins
+        for bad in ("no", "2", ""):
+            with mock.patch.dict(os.environ, {"EMRI_DIRECT_WALLS": bad}):
+                with self.assertRaisesRegex(ValueError, "EMRI_DIRECT_WALLS"):
+                    self._make_gen()
 
 
 class AssemblyTest(unittest.TestCase):
@@ -535,10 +557,20 @@ class AssemblyTest(unittest.TestCase):
         rel = np.linalg.norm(acc[..., sl] - self.truth[..., sl]) / np.linalg.norm(self.truth[..., sl])
         self.assertLess(rel, 2e-3, f"rel L2 {rel:.2e}")
 
-    # -- the window length per call (EMRI_DIRECT_NT_SUB=auto) and the conditional tail
-    # (EMRI_DIRECT_TAIL_SKIP_PX): rows of the two-row fixture above with chosen handoff-to-end
-    # spans (the pixels from a row's common handoff to its last tracked pixel, inclusive) on
-    # grids long enough for 164- to 392-layer windows (the table is grid-length agnostic)
+class TailLeverTest(unittest.TestCase):
+    """The window length per call (EMRI_DIRECT_NT_SUB=auto), the conditional tail
+    (EMRI_DIRECT_TAIL_SKIP_PX) and the phase walls of accumulate_harmonic_batch, on rows of
+    AssemblyTest's two-row fixture with chosen handoff-to-end spans (the pixels from a row's common
+    handoff to its last tracked pixel, inclusive) on grids long enough for 164- to 392-layer
+    windows (the table is grid-length agnostic). AssemblyTest's fixture is reused, but this class
+    does not derive from it: VectorisedAccumulateTest(AssemblyTest) re-runs every AssemblyTest
+    test."""
+
+    NF, NT, DT = AssemblyTest.NF, AssemblyTest.NT, AssemblyTest.DT
+    setUpClass = classmethod(AssemblyTest.setUpClass.__func__)
+    tearDownClass = classmethod(AssemblyTest.tearDownClass.__func__)
+    _row_signal = AssemblyTest._row_signal
+
 
     def _span_rows(self, spans, n_last):
         """One row per span: two half-amplitude subs of the chirp (row r's carrier offset by 0.7 r
@@ -694,6 +726,29 @@ class AssemblyTest(unittest.TestCase):
         self.assertEqual((st["nt_sub_eff"], st["windows"]), (104, 1))   # row 1 alone: 2 * (48 + 2) + 4
 
 
+    def test_non_batched_return_reports_window_and_skip(self):
+        """One template (``sub_row=None``, a summed single-template tail): the stats carry
+        ``nt_sub_eff`` (the fixed length here) and ``tail_skipped``, as the batched ones do; no
+        clock, no ``walls``."""
+        from lisatools.sources.emri import wdm_direct as wd
+
+        def one(span, **kw):
+            tracks, tracer, n_ok, _ = self._span_rows((span,), 223)
+            tail = lambda ts: self._row_signal(ts, 0)[None, :]                   # noqa: E731
+            tail.summed = True
+            acc = np.zeros((1, self.NF, 320))
+            return wd.accumulate_harmonic_batch(
+                acc, self.table, tracks[:1], tuple(a[:1] for a in tracer), n_ok, tail, Nf=self.NF, Nt=320,
+                dt=self.DT, layer_dt=self.wdm.layer_dt, layer_df=self.wdm.layer_df, t0=0.0, Nt_sub=128,
+                num_m_layers=2, fdot_axis_max=float(np.max(np.abs(self.table.fdot_vals))), pixel_edge=64, **kw)
+        st = one(48)
+        self.assertEqual((st["nt_sub_eff"], st["tail_skipped"]), (128, 0))
+        self.assertGreater(st["windows"], 0)
+        self.assertNotIn("walls", st)
+        st = one(10, tail_skip_px=16)
+        self.assertEqual((st["tail_skipped"], st["windows"], st["chunk_pixels"]), (1, 0, 0))
+
+
 class PhaseWallsTest(unittest.TestCase):
     """_PhaseWalls: a nested phase pauses the enclosing one (the phases partition the covered time),
     a detail timer does not."""
@@ -716,6 +771,22 @@ class PhaseWallsTest(unittest.TestCase):
         self.assertGreater(c.walls["a"], 0.025)                    # 0.02 + the 0.01 detail
         self.assertGreater(c.detail_walls["d"], 0.005)
         self.assertEqual(set(c.walls), {"a", "b"})
+
+    def test_the_clock_holds_no_array_module_and_pickles(self):
+        """LAT rule: never an array module as an attribute -- only whether to synchronise."""
+        import copy
+        import pickle
+        import types
+
+        from lisatools.sources.emri.wdm_direct import _PhaseWalls
+
+        c = _PhaseWalls(np)
+        with c.phase("a"):
+            pass
+        self.assertFalse(any(isinstance(v, types.ModuleType) for v in vars(c).values()))
+        self.assertFalse(c._sync_device)
+        back = pickle.loads(pickle.dumps(copy.deepcopy(c)))
+        self.assertEqual(set(back.walls), {"a"})
 
 
 class HolderSliceTest(unittest.TestCase):
