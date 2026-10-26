@@ -39,6 +39,10 @@
 #   which a short window (Nt < 128, DAYS <= 5) may run with, while a chosen value must be <= Nt;
 #   the stage timing's [split] lines -- printed below -- give the lookup / chunk split of every
 #   timed call, its [parity] lines each batched row against the same row built alone),
+#   TAIL_SKIP_PX (rows whose plunge tail spans at most this many pixels are looked up through
+#   their end instead; same pattern: only when TAIL_SKIP_PX or EMRI_DIRECT_TAIL_SKIP_PX is set is
+#   it passed as --tail-skip-px and exported as EMRI_DIRECT_TAIL_SKIP_PX -- unset, the generators'
+#   default 0 = never skip; the [split] lines count the skipped rows),
 #   CHUNK_BATCH (1: a batch's plunge-chunk rows built in one call, the batched path this test
 #   measures; 0: one per call, the library and global-fit default; passed as --chunk-batch),
 #   REPS (3), OUT (emri_speed_durations_<date>).
@@ -66,10 +70,15 @@ BAND=${BAND-2.5e-4,2.5e-2}
 EDGE=${EDGE:-60}
 FOREGROUND=${FOREGROUND:-on}
 NT_SUB=${NT_SUB:-${EMRI_DIRECT_NT_SUB:-}}  # unset: the generator's own default (128), never a chosen value
-nt_sub_args=()
+tail_args=()
 if [ -n "${NT_SUB}" ]; then
   export EMRI_DIRECT_NT_SUB=${NT_SUB}      # the accuracy step's generators read the same length
-  nt_sub_args=(--nt-sub "${NT_SUB}")
+  tail_args=(--nt-sub "${NT_SUB}")
+fi
+TAIL_SKIP_PX=${TAIL_SKIP_PX:-${EMRI_DIRECT_TAIL_SKIP_PX:-}}  # unset: the generator's own default (0, never skip)
+if [ -n "${TAIL_SKIP_PX}" ]; then
+  export EMRI_DIRECT_TAIL_SKIP_PX=${TAIL_SKIP_PX}   # the accuracy step's generators read the same threshold
+  tail_args+=(--tail-skip-px "${TAIL_SKIP_PX}")
 fi
 CHUNK_BATCH=${CHUNK_BATCH:-1}               # 1: chunk rows batched (the speed test); 0: one per call (production)
 REPS=${REPS:-3}
@@ -82,10 +91,10 @@ common=(--backend "${BACKEND}" --dt 2.5 --src "${SRC}" --direct-table "${TABLE}"
 if [ -n "${L1_DIR}" ]; then common+=(--l1-dir "${L1_DIR}"); fi
 for days in ${DAYS}; do
   log="${OUT}/stages_${days}d.log"
-  echo "[durations] ${days} d: grids ${GRIDS}, lookups ${LOOKUPS}, band ${BAND:-all}, rows per call ${CHUNKS} over ${ROWS} rows, nt_sub ${NT_SUB:-default}, chunk_batch ${CHUNK_BATCH} -> ${log}"
+  echo "[durations] ${days} d: grids ${GRIDS}, lookups ${LOOKUPS}, band ${BAND:-all}, rows per call ${CHUNKS} over ${ROWS} rows, nt_sub ${NT_SUB:-default}, tail skip px ${TAIL_SKIP_PX:-default}, chunk_batch ${CHUNK_BATCH} -> ${log}"
   python scripts/emri/emri_direct_stage_timing.py "${common[@]}" --days "${days}" --thresh "${THRESH}" \
     --response dense --response-grid "${GRIDS}" --lookup "${LOOKUPS}" --band-hz "${BAND}" \
-    --batch-rows "${ROWS}" --chunk-rows "${CHUNKS}" --chunk-batch "${CHUNK_BATCH}" ${nt_sub_args[@]+"${nt_sub_args[@]}"} \
+    --batch-rows "${ROWS}" --chunk-rows "${CHUNKS}" --chunk-batch "${CHUNK_BATCH}" ${tail_args[@]+"${tail_args[@]}"} \
     --reps "${REPS}" --out "${OUT}/stages.jsonl" 2>&1 | grep -v "ModeSelector\|lisaconstants\|warnings.warn" \
     > "${log}" || { echo "[durations] FAILED: ${log}"; tail -4 "${log}"; }
   grep "^\[snr\]\|^\[data\]\|^\[speed\] orbits\|^\[split\]\|^\[parity\]" "${log}" || true

@@ -24,13 +24,16 @@ and the JSON line carry ``chunk_batch``.
 The lookup / plunge-chunk split: ``--nt-sub`` sets the plunge-chunk length in time layers
 (``EMRIDirectWDM(Nt_sub=...)``; default: ``EMRI_DIRECT_NT_SUB``, else 128), or ``auto`` /
 ``auto:<floor>`` (one length per call, the shortest holding the call's longest tail in one
-window, never below the floor). After every timed call (single template and each batch) a
-``[split]`` line gives the generator's ``last_stats`` in the ``[EMRI_DIRECT] leaf N:`` line's
-wording, ``chunk rows A (tail median L px, W windows) lookup px P chunk px C dropped px D``, its
-``nt_sub=`` the length (``auto(eff N)``: the call's choice, ``last_stats["nt_sub_eff"]``), and the
-JSON line carries ``nt_sub`` (``"auto"`` in auto mode), ``nt_sub_floor``, ``nt_sub_eff``,
-``chunk_rows``, ``windows``, ``tail_median_px``, ``lookup_pixels``, ``chunk_pixels`` and
-``dropped_pixels``: the speed test shows the split without a global-fit run. The stage list has
+window, never below the floor); ``--tail-skip-px S`` looks a row whose tail spans at most S pixels
+up through its end instead (``EMRIDirectWDM(tail_skip_px=...)``; default:
+``EMRI_DIRECT_TAIL_SKIP_PX``, else 0 = never). After every timed call (single template and each
+batch) a ``[split]`` line gives the generator's ``last_stats`` in the ``[EMRI_DIRECT] leaf N:``
+line's wording plus the skipped tails, ``chunk rows A (tail median L px, W windows skipped S)
+lookup px P chunk px C dropped px D`` (a skipped row has no tail entry), its ``nt_sub=`` the length
+(``auto(eff N)``: the call's choice, ``last_stats["nt_sub_eff"]``), and the JSON line carries
+``nt_sub`` (``"auto"`` in auto mode), ``nt_sub_floor``, ``nt_sub_eff``, ``tail_skip_px``,
+``tail_skipped``, ``chunk_rows``, ``windows``, ``tail_median_px``, ``lookup_pixels``,
+``chunk_pixels`` and ``dropped_pixels``: the speed test shows the split without a global-fit run. The stage list has
 the dense plunge tail (``_dense_td``: the dense channels of every (row, window) pair) as its own
 line inside stage 5. In auto mode with ``--chunk-batch 1`` a batch's window length is that of its
 longest tail, the single template's its own, so the ``[parity]`` lines (which name both) also carry
@@ -122,6 +125,10 @@ def main():
                     help="plunge-chunk length in time layers, or 'auto' / 'auto:<floor>' (one length per "
                          "call holding its longest tail in one window; EMRIDirectWDM Nt_sub; default: "
                          "EMRI_DIRECT_NT_SUB, else 128)")
+    ap.add_argument("--tail-skip-px", type=int, default=None,
+                    help="rows whose plunge tail spans at most this many pixels (handoff to last pixel) are "
+                         "looked up through their end instead (EMRIDirectWDM tail_skip_px; default: "
+                         "EMRI_DIRECT_TAIL_SKIP_PX, else 0 = never)")
     ap.add_argument("--chunk-batch", type=int, choices=(0, 1), default=1,
                     help="1 (default here): a batch's plunge-chunk rows built in ONE call (the batched "
                          "path); 0: one per call, the library and global-fit default "
@@ -204,8 +211,10 @@ def main():
     directs = {f"{g}/{lk}": WD.EMRIDirectWDM(gen, table, wdm, orbits=orb, tdi_config=tdi, t_start=W.REF,
                                              data_t0=data_t0, mode_batch=args.mode_batch, force_backend=args.backend,
                                              response=args.response, response_grid=g, lookup=lk, f_band=band,
-                                             Nt_sub=args.nt_sub, chunk_batch=bool(args.chunk_batch))
+                                             Nt_sub=args.nt_sub, tail_skip_px=args.tail_skip_px,
+                                             chunk_batch=bool(args.chunk_batch))
                for g in grids for lk in lookups}
+    tail_skip_px = next(iter(directs.values())).tail_skip_px            # resolved (argument > env > 0)
     nt_sub = next(iter(directs.values())).Nt_sub                       # resolved (argument > env > 128), or "auto"
     nt_floor = next(iter(directs.values())).nt_sub_floor
 
@@ -336,13 +345,15 @@ def main():
         med = int(np.median(tail)) if len(tail) else 0
         f = dict(chunk_rows=rows, windows=int(st.get("windows", 0)), tail_median_px=med,
                  lookup_pixels=int(st.get("lookup_pixels", 0)), chunk_pixels=int(st.get("chunk_pixels", 0)),
-                 dropped_pixels=int(st.get("dropped_pixels", 0)), nt_sub_eff=st.get("nt_sub_eff"))
-        txt = (f"chunk rows {rows} (tail median {med} px, {f['windows']} windows) lookup px "
-               f"{f['lookup_pixels']} chunk px {f['chunk_pixels']} dropped px {f['dropped_pixels']}")
+                 dropped_pixels=int(st.get("dropped_pixels", 0)), nt_sub_eff=st.get("nt_sub_eff"),
+                 tail_skipped=int(st.get("tail_skipped", 0)))
+        txt = (f"chunk rows {rows} (tail median {med} px, {f['windows']} windows skipped {f['tail_skipped']}) "
+               f"lookup px {f['lookup_pixels']} chunk px {f['chunk_pixels']} dropped px {f['dropped_pixels']}")
         return txt, f
 
     base = dict(src=args.src, days=args.days, dt=args.dt, nf=nf, nt=nt, backend=args.backend,
-                response=args.response, nt_sub=nt_sub, nt_sub_floor=nt_floor, chunk_batch=args.chunk_batch,
+                response=args.response, nt_sub=nt_sub, nt_sub_floor=nt_floor, tail_skip_px=tail_skip_px,
+                chunk_batch=args.chunk_batch,
                 band=band, brick=box.brick, tobs_s=box.tobs,
                 foreground=box.foreground, noise=box.describe(),
                 data_snr=None if box.d is None else box.data_snr)

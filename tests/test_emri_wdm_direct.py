@@ -281,6 +281,23 @@ class NtSubKnobTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "EMRI_DIRECT_NT_SUB"):
                     self._make_gen()
 
+    def test_tail_skip_knob(self):
+        """``tail_skip_px``: explicit > env ``EMRI_DIRECT_TAIL_SKIP_PX`` > 0 (never skip); an
+        integer >= 0, else ``ValueError`` naming the knob."""
+        import os
+
+        self.assertEqual(self._make_gen().tail_skip_px, 0)
+        with mock.patch.dict(os.environ, {"EMRI_DIRECT_TAIL_SKIP_PX": "100"}):
+            self.assertEqual(self._make_gen().tail_skip_px, 100)
+            self.assertEqual(self._make_gen(tail_skip_px=16).tail_skip_px, 16)      # explicit wins
+            self.assertEqual(self._make_gen(tail_skip_px=0).tail_skip_px, 0)
+        for bad in ("-1", "x", "1.5", ""):
+            with mock.patch.dict(os.environ, {"EMRI_DIRECT_TAIL_SKIP_PX": bad}):
+                with self.assertRaisesRegex(ValueError, "EMRI_DIRECT_TAIL_SKIP_PX"):
+                    self._make_gen()
+        with self.assertRaisesRegex(ValueError, "EMRI_DIRECT_TAIL_SKIP_PX"):
+            self._make_gen(tail_skip_px=-3)
+
 
 class AssemblyTest(unittest.TestCase):
     """A8: accumulate_harmonic_batch places the lookup before the handoff and the chunk
@@ -618,6 +635,49 @@ class AssemblyTest(unittest.TestCase):
         _, stats = self._accumulate_spans((300, 310), nt_sub_auto=True, nt_sub_floor=128,
                                           **dict(geom, pixel_edge=9))
         self.assertEqual(stats["nt_sub_eff"], 390)          # Nt - pixel_edge = 391: the even 390
+
+    def test_tail_skip_is_per_row(self):
+        """``tail_skip_px``: a row whose span is at most the knob keeps the lookup through its last
+        pixel -- exactly the row that never trips -- and no pairs; the other row of the same call
+        keeps its tail."""
+        acc, stats = self._accumulate_spans((10, 48), tail_skip_px=16, **self.AUTO_GEOM)
+        self.assertEqual((self.transform_calls, self.tail_calls), (1, 1))
+        self.assertEqual((stats["tail_skipped"], stats["tail_skipped_rows"]), (1, [0]))
+        self.assertEqual(sorted({r for r, *_ in stats["pairs"]}), [1])        # row 0: no pairs
+        self.assertEqual(stats["windows"], len({(r, n0) for r, n0, _, _ in stats["pairs"]}))   # row 1 only
+        self.assertEqual(stats["tail_layers"][0], 0)
+        self.assertIsNone(stats["handoff_pixel_per_row"][0])                  # no handoff, as no trip
+        # the lookup ran through row 0's last pixel: 2 subs x all 184 pixels, row 1's 2 subs up to
+        # its handoff (pixel 176 = index 136)
+        self.assertEqual((stats["lookup_pixels"], stats["dropped_pixels"]), (2 * 184 + 2 * 136, 0))
+        never, st_never = self._accumulate_spans((0, 48), **self.AUTO_GEOM)   # span 0: row 0 never trips
+        np.testing.assert_array_equal(acc[0], never[0])
+        self.assertEqual(stats["lookup_pixels"], st_never["lookup_pixels"])
+        full, st_full = self._accumulate_spans((10, 48), **self.AUTO_GEOM)   # no skip: both tails
+        self.assertEqual(st_full["tail_skipped"], 0)
+        self.assertEqual(stats["pairs"], [p for p in st_full["pairs"] if p[0] == 1])
+        self.assertEqual(stats["handoff_pixel_per_row"][1], st_full["handoff_pixel_per_row"][1])
+        self.assertEqual(stats["tail_layers"][1], st_full["tail_layers"][1])
+        np.testing.assert_allclose(acc[1], full[1], rtol=1e-12, atol=1e-14)
+        self.assertGreater(np.abs(acc[0] - full[0]).max(), 1e-6 * np.abs(full[0]).max())   # paired control
+
+    def test_tail_skip_zero_is_todays_behaviour(self):
+        for kw in (dict(), dict(nt_sub_auto=True, nt_sub_floor=128)):
+            a0, s0 = self._accumulate_spans((10, 48), **kw, **self.AUTO_GEOM)
+            a1, s1 = self._accumulate_spans((10, 48), tail_skip_px=0, **kw, **self.AUTO_GEOM)
+            np.testing.assert_array_equal(a1, a0)
+            self.assertEqual(s1, s0)
+            self.assertEqual((s1["tail_skipped"], s1["tail_skipped_rows"]), (0, []))
+
+    def test_auto_window_excludes_skipped_rows(self):
+        """Ruling R1: the auto length comes from the rows that KEEP a tail (the skip acts first)."""
+        _, st = self._accumulate_spans((5, 7), nt_sub_auto=True, nt_sub_floor=8, **self.AUTO_GEOM)
+        self.assertEqual(st["nt_sub_eff"], 24)                # 2 * (7 + 2) + 4 = 22 -> 24
+        _, st = self._accumulate_spans((5, 7), nt_sub_auto=True, nt_sub_floor=8, tail_skip_px=16, **self.AUTO_GEOM)
+        self.assertEqual((st["nt_sub_eff"], st["windows"], st["tail_skipped"]), (8, 0, 2))   # no tail: the floor
+        _, st = self._accumulate_spans((10, 48), nt_sub_auto=True, nt_sub_floor=8, tail_skip_px=16,
+                                       **self.AUTO_GEOM)
+        self.assertEqual((st["nt_sub_eff"], st["windows"]), (104, 1))   # row 1 alone: 2 * (48 + 2) + 4
 
 
 class HolderSliceTest(unittest.TestCase):

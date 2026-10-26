@@ -40,6 +40,8 @@ Environment knobs read here (explicit arguments win unless stated): ``EMRI_DIREC
 below the floor, 128 by default),
 ``EMRI_DIRECT_CHUNK_BATCH`` (``0`` / ``1`` or ``false`` / ``true``, default ``0``: the plunge-chunk
 rows of a :meth:`~EMRIDirectWDM.batch` call are built one per call; ``1`` builds them all in one),
+``EMRI_DIRECT_TAIL_SKIP_PX`` (0 = never; a row whose tail spans at most this many pixels is
+looked up through its end instead),
 ``EMRI_DIRECT_HANDOFF_BOUND`` (``1``), ``EMRI_DIRECT_TAIL_BLOCK_ELEMS`` and
 ``EMRI_DIRECT_MODE_BLOCK_ELEMS`` (2e7), ``EMRI_DIRECT_LOOKUP_CHUNK`` (2e6), ``EMRI_TRACER``
 (``analytic``), ``EMRI_TRACER_H_FDOT`` (300 s), ``EMRI_TRACER_MAX_ELEMS`` (6e7). The response
@@ -431,7 +433,7 @@ def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, 
                               layer_df, t0, Nt_sub=128, num_m_layers=2, fdot_axis_max=np.inf,
                               pixel_edge=8, backend="cpu", sub_row=None, lookup_chunk=None, m_lo=0,
                               num_sub=None, lookup_kernel=None, common_handoff=False, row_t_end=None,
-                              nt_sub_auto=False, nt_sub_floor=128):
+                              nt_sub_auto=False, nt_sub_floor=128, tail_skip_px=0):
     """Vectorised :func:`_accumulate_harmonic_batch_loop`: ONE table evaluation for every
     (sub, channel, pixel) of the batch and one scatter-add, on the array module of ``acc``
     (numpy or cupy), then every plunge chunk of every template in ONE tail evaluation and ONE
@@ -494,6 +496,12 @@ def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, 
     ``nt_sub_floor // 4``; every row is tiled with ``tail_chunk_plan(n_h, n_end, Nt,
     Nt_sub_eff)``; a pairs-form ``tail_td`` is called as ``tail_td(pairs, Nt_sub=Nt_sub_eff)``.
     Off (default): ``Nt_sub`` exactly as before (``Nt_sub // 4`` past the end).
+    ``tail_skip_px`` (``EMRI_DIRECT_TAIL_SKIP_PX``; default 0 = never): after the per-row common
+    handoff, a row whose span ``s_r = last_px_r - n_h_r + 1`` (its earliest handoff pixel to its
+    last tracked pixel) satisfies ``0 < s_r <= tail_skip_px`` keeps the lookup through its last
+    pixel -- every sub of it stops where a row with no trip stops -- and contributes no pairs;
+    it acts before the lookup and before the auto window length (which therefore comes from the
+    rows that keep a tail).
 
     Returns:
         dict: ``lookup_pixels``, ``chunk_pixels``, ``dropped_pixels`` (plus the kernel's
@@ -502,8 +510,10 @@ def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, 
         ``khi - klo`` summed over the pairs, once per keep range, not per sub); an int for one
         template, with ``sub_row`` a list with one entry per row of ``acc``, plus ``pairs`` (the
         ``(row, n0, klo, khi)`` list), ``handoff_pixel_per_row`` (per row of ``acc``, the
-        first pixel its earliest sub hands to the chunk, ``None`` without a handoff) and
-        ``nt_sub_eff`` (the window length the call used: ``Nt_sub``, or the auto choice).
+        first pixel its earliest sub hands to the chunk, ``None`` without a handoff -- a skipped
+        row included), ``nt_sub_eff`` (the window length the call used: ``Nt_sub``, or the auto
+        choice), ``tail_skipped`` (the rows ``tail_skip_px`` skipped) and ``tail_skipped_rows``
+        (those rows of ``acc``).
 
     Raises:
         ValueError: For a track shorter than its row's pixels, a pairs-form ``tail_td`` that is
@@ -548,6 +558,18 @@ def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, 
         np.minimum.at(k_row, rows_h, k_h)
     if (common_handoff or summed) and S:
         k_h = k_row[rows_h]
+    # the conditional tail: a row whose span from its handoff to its last pixel is at most
+    # tail_skip_px is looked up through its last pixel (as a row with no trip) and has no tail
+    skipped_rows = []
+    if tail_skip_px and S:
+        has = k_row < P_row
+        span_row = np.zeros(n_rows, dtype=np.int64)
+        span_row[has] = n_ok_h[P_row[has] - 1] - n_ok_h[k_row[has]] + 1
+        skip = has & (span_row > 0) & (span_row <= int(tail_skip_px))
+        if np.any(skip):
+            skipped_rows = [int(r) for r in np.flatnonzero(skip)]
+            k_h = np.where(skip[rows_h], P_sub, k_h)
+            k_row = np.where(skip, P_row, k_row)
     n_m = int(acc.shape[-2])
     stats = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0, windows=0, tail_layers=0)
     if lookup_kernel is not None:
@@ -601,6 +623,8 @@ def accumulate_harmonic_batch(acc, table, tracks, tracer, n_ok, tail_td, *, Nf, 
     stats["pairs"] = pairs
     stats["handoff_pixel_per_row"] = [int(n_ok_h[k]) if k < P_row[r] else None for r, k in enumerate(k_row)]
     stats["nt_sub_eff"] = int(nt_eff)
+    stats["tail_skipped"] = len(skipped_rows)
+    stats["tail_skipped_rows"] = skipped_rows
     return stats
 
 
@@ -1342,6 +1366,10 @@ class EMRIDirectWDM:
             ``EMRI_DIRECT_LOOKUP`` (``"kernel"``).
         f_band (tuple[int, int], optional): layers ``[m_lo, m_hi)`` :meth:`batch` returns;
             ``None`` = all ``Nf``.
+        tail_skip_px (int, optional): a row whose plunge tail spans at most this many pixels
+            (from its common handoff to its last tracked pixel) is looked up through its last
+            pixel instead, no tail (:func:`accumulate_harmonic_batch`). ``None`` reads
+            ``EMRI_DIRECT_TAIL_SKIP_PX`` (default ``0``: never skip); an integer ``>= 0``.
 
     Attributes:
         Nt_sub (int | str): The fixed plunge-chunk length, or ``"auto"``.
@@ -1349,6 +1377,7 @@ class EMRIDirectWDM:
             fixed mode; the fine-grid and chunk-start rules read it).
         chunk_batch (bool): Whether :meth:`batch` builds its plunge-chunk rows in one call
             (``EMRI_DIRECT_CHUNK_BATCH``; default ``False``: one per call).
+        tail_skip_px (int): The conditional-tail threshold [pixels] (0: never skip).
         fdot_axis_max (float): Largest ``|fdot|`` of the table's axis [Hz/s].
         plunge_taper_s (float): Source-frame stop taper [s] (``EMRI_DIRECT_PLUNGE_TAPER_S``,
             default 120).
@@ -1360,8 +1389,9 @@ class EMRIDirectWDM:
         ValueError: For an unknown ``feed``, ``response``, ``response_grid`` or ``lookup``,
             ``response="dense"`` with ``feed="fine"``, or an ``Nt_sub`` (``EMRI_DIRECT_NT_SUB``)
             that is odd, below 8 or above ``Nt`` (an ``auto:<floor>`` floor alike), or neither a
-            number nor ``auto`` / ``auto:<floor>``, or a ``chunk_batch`` (``EMRI_DIRECT_CHUNK_BATCH``)
-            other than ``0`` / ``1`` / ``false`` / ``true``.
+            number nor ``auto`` / ``auto:<floor>``, a ``chunk_batch`` (``EMRI_DIRECT_CHUNK_BATCH``)
+            other than ``0`` / ``1`` / ``false`` / ``true``, or a ``tail_skip_px``
+            (``EMRI_DIRECT_TAIL_SKIP_PX``) that is not an integer ``>= 0``.
 
     Example:
         .. code-block:: python
@@ -1389,7 +1419,7 @@ class EMRIDirectWDM:
                  Nt_sub=None, n_fine=None, fine_dt=3600.0, fine_dt_plunge=80.0, mode_batch=None,
                  pixel_edge=8, num_m_layers=2, interp="spline", force_backend="cpu", feed="knots",
                  response="spline", response_grid=None, sparse_dt=None, lookup=None, f_band=None,
-                 chunk_batch=None):
+                 chunk_batch=None, tail_skip_px=None):
         self.few_gen, self.table, self.wdm = few_gen, table, wdm_set
         self.orbits, self.tdi_config = orbits, tdi_config
         self.t_start, self.data_t0 = float(t_start), float(data_t0)
@@ -1437,6 +1467,22 @@ class EMRIDirectWDM:
             if flag not in ("0", "1", "false", "true"):
                 raise ValueError("EMRI_DIRECT_CHUNK_BATCH=%s: expected 0 / 1 or false / true" % (chunk_batch,))
             self.chunk_batch = flag in ("1", "true")
+        # the conditional tail (explicit argument > env EMRI_DIRECT_TAIL_SKIP_PX > 0 = never): a
+        # row whose plunge tail spans at most this many pixels from its handoff to its last pixel
+        # keeps the lookup through the end instead (accumulate_harmonic_batch)
+        if tail_skip_px is None:
+            tail_skip_px = os.environ.get("EMRI_DIRECT_TAIL_SKIP_PX")
+        if tail_skip_px is None:
+            self.tail_skip_px = 0
+        else:
+            try:
+                skip_px = int(str(tail_skip_px).strip()) if isinstance(tail_skip_px, str) else int(tail_skip_px)
+            except (TypeError, ValueError):
+                skip_px = -1
+            if skip_px < 0:
+                raise ValueError("EMRI_DIRECT_TAIL_SKIP_PX=%s: expected an integer >= 0 (pixels; 0 = never skip "
+                                 "the plunge tail)" % (tail_skip_px,))
+            self.tail_skip_px = skip_px
         self.mode_batch = None if mode_batch is None else int(mode_batch)   # None: all modes in one batch
         # layers m-num_m_layers..m+num_m_layers per pixel: a chirping carrier near a layer edge
         # puts ~2.5e-4 of its energy two layers away (A8 gate); needs table support [-2, 3) df
@@ -1501,13 +1547,14 @@ class EMRIDirectWDM:
         self.last_stats = {}
         self.last_failed_rows = []
 
-    def _nt_sub_kw(self):
-        """The window-length arguments of :func:`accumulate_harmonic_batch`: the fixed
-        ``Nt_sub``, or with ``Nt_sub == "auto"`` the floor as the base length plus
-        ``nt_sub_auto=True`` (one length per call from the longest kept tail)."""
+    def _tail_kw(self):
+        """The plunge-tail arguments of :func:`accumulate_harmonic_batch`: the window length (the
+        fixed ``Nt_sub``, or with ``Nt_sub == "auto"`` the floor as the base length plus
+        ``nt_sub_auto=True``: one length per call from the longest kept tail) and
+        ``tail_skip_px``."""
         auto = self.Nt_sub == "auto"
         return dict(Nt_sub=self.nt_sub_floor if auto else self.Nt_sub, nt_sub_auto=auto,
-                    nt_sub_floor=self.nt_sub_floor)
+                    nt_sub_floor=self.nt_sub_floor, tail_skip_px=self.tail_skip_px)
 
     def _band(self):
         """``(m_lo, m_hi)`` of ``f_band`` (``(0, Nf)`` when unset); raises ``ValueError`` if it
@@ -2129,10 +2176,12 @@ class EMRIDirectWDM:
         captured per row by :meth:`_chunk_item`.
 
         Returns:
-            dict: ``rows``, ``windows`` and ``tail_layers`` (one entry per row, in row order) of
-            the plunge chunks, ``lookup_pixels`` / ``chunk_pixels`` / ``dropped_pixels``,
-            ``lookup`` (``kernel`` / ``python``), ``n_response`` (the response grid length) and
-            ``nt_sub_eff`` (the plunge window length used: ``Nt_sub``, or the call's auto choice).
+            dict: ``rows``, ``windows`` and ``tail_layers`` (one entry per row, in row order,
+            except the rows whose tail ``tail_skip_px`` skipped) of the plunge chunks,
+            ``lookup_pixels`` / ``chunk_pixels`` / ``dropped_pixels``, ``lookup`` (``kernel`` /
+            ``python``), ``n_response`` (the response grid length), ``nt_sub_eff`` (the plunge
+            window length used: ``Nt_sub``, or the call's auto choice) and ``tail_skipped`` (the
+            rows looked up through their end instead of a short tail).
         """
         xp = self.xp
         wdm = self.wdm
@@ -2168,10 +2217,10 @@ class EMRIDirectWDM:
             own = (t_pix > x0) & (t_pix < float(x_row[r][:, -1].min())) & (t_pix - self.t_start <= it["t_end"])
             if np.any(own):
                 n_last[r] = int(n_all[own][-1])
-        nt_kw = self._nt_sub_kw()
+        tail_kw = self._tail_kw()
         stats = dict(rows=len(rows), windows=0, tail_layers=[0] * len(rows), lookup_pixels=0, chunk_pixels=0,
                      dropped_pixels=0, lookup="python" if be is None else "kernel", n_response=n_response,
-                     nt_sub_eff=int(self.nt_sub_floor))
+                     nt_sub_eff=int(self.nt_sub_floor), tail_skipped=0)
         if not n_last:
             return stats
         n_ok = n_all[(t_pix > x0) & (n_all <= max(n_last.values()))]
@@ -2199,22 +2248,24 @@ class EMRIDirectWDM:
             # through the stop (_dense_td), not the amplitude/phase splines; the source tapered
             # over the last plunge_taper_s of emission time (_dense_tail_fn)
             tail_td = self._dense_tail_fn({r: (it["din"], it["sky"]) for r, it in zip(rows, items)},
-                                          self.data_t0, Nf, nt_kw["Nt_sub"], dt)
+                                          self.data_t0, Nf, tail_kw["Nt_sub"], dt)
             # the tail reads only the dense inputs: the response (out, srcs and the lookup
             # closure's references to them) is released as soon as the lookup has run, before
             # the tail is evaluated
             del out, srcs
             lookup = _run_once(lookup)
         else:
-            tail_td = self._spline_tail_fn({r: srcs[r][0] for r in rows}, self.data_t0, Nf, nt_kw["Nt_sub"], dt)
+            tail_td = self._spline_tail_fn({r: srcs[r][0] for r in rows}, self.data_t0, Nf, tail_kw["Nt_sub"], dt)
         st = accumulate_harmonic_batch(
             out_arr, self.table, tracks, None, n_ok, tail_td, Nf=Nf, Nt=Nt, dt=dt, layer_dt=ldt,
             layer_df=wdm.layer_df, t0=self.data_t0, num_m_layers=self.num_m_layers,
             fdot_axis_max=self.fdot_axis_max, pixel_edge=self.pixel_edge, backend=self.force_backend,
             sub_row=sub_row, num_sub=int(sub_row.size), m_lo=m_lo, lookup_kernel=lookup, row_t_end=row_t_end,
-            **nt_kw)
-        stats.update({k: st[k] for k in ("windows", "lookup_pixels", "chunk_pixels", "dropped_pixels", "nt_sub_eff")},
-                     tail_layers=[int(st["tail_layers"][r]) for r in rows])
+            **tail_kw)
+        # a row whose tail was skipped (tail_skip_px) has no tail entry
+        stats.update({k: st[k] for k in ("windows", "lookup_pixels", "chunk_pixels", "dropped_pixels", "nt_sub_eff",
+                                         "tail_skipped")},
+                     tail_layers=[int(st["tail_layers"][r]) for r in rows if r not in st["tail_skipped_rows"]])
         return stats
 
     #: per-call lengths among the plunge-chunk stats: merged by their largest value, not summed
@@ -2269,8 +2320,9 @@ class EMRIDirectWDM:
         self.last_stats = dict(modes=len(modes), n_fine=self.n_fine, feed="knots", chunk_start=chunk_start,
                                lookup=st["lookup"], lookup_pixels=st["lookup_pixels"],
                                chunk_pixels=st["chunk_pixels"], dropped_pixels=st["dropped_pixels"],
-                               windows=st["windows"], tail_layers=st["tail_layers"][0],
-                               nt_sub_eff=st["nt_sub_eff"])
+                               windows=st["windows"],
+                               tail_layers=st["tail_layers"][0] if st["tail_layers"] else 0,   # [] if skipped
+                               nt_sub_eff=st["nt_sub_eff"], tail_skipped=st["tail_skipped"])
         return WDMSignal(acc[0], wdm)
 
     def __call__(self, *few_args, **few_kwargs):
@@ -2380,7 +2432,7 @@ class EMRIDirectWDM:
                 acc, self.table, tracks, tracer, n_ok, tail_td, Nf=Nf, Nt=Nt, dt=dt, layer_dt=ldt,
                 layer_df=ldf, t0=self.data_t0, num_m_layers=self.num_m_layers,
                 fdot_axis_max=self.fdot_axis_max, pixel_edge=self.pixel_edge, backend=self.force_backend,
-                **self._nt_sub_kw())
+                **self._tail_kw())
             for key in totals:
                 totals[key] += st[key]
             del out, fly
@@ -2467,8 +2519,10 @@ class EMRIDirectWDM:
         ``lookup_pixels`` / ``chunk_pixels`` / ``dropped_pixels`` of every row (the chunk and
         alone rows' added to the lookup rows'), ``windows`` (the chunk and alone rows' chunk
         windows) and ``tail_layers`` (one entry per chunk / alone row: the pixels its plunge
-        chunk filled), plus ``nt_sub_eff`` (the batched chunk rows' plunge window length:
-        ``Nt_sub``, or the call's auto choice) when chunk rows were built.
+        chunk filled; none for a row whose tail ``tail_skip_px`` skipped), ``tail_skipped`` (those
+        rows: looked up through their last pixel instead), plus ``nt_sub_eff`` (the batched chunk
+        rows' plunge window length: ``Nt_sub``, or the call's auto choice) when chunk rows were
+        built.
         """
         from ...utils.exceptions import WaveformDomainError
         from .domain import few_domain_guard
@@ -2491,7 +2545,7 @@ class EMRIDirectWDM:
         chunk_items = {}                                   # row -> _chunk_item: the batched plunge-chunk rows
         stats = dict(rows=len(rows), chunk_rows=0, alone=0, subs=0, failed=0, lookup_pixels=0,
                      chunk_pixels=0, dropped_pixels=0, windows=0, tail_layers=[], ended_before_window=0,
-                     chunk_batch=int(self.chunk_batch))
+                     tail_skipped=0, chunk_batch=int(self.chunk_batch))
         # the chunk and alone rows' pixel counters: ADDED at the end, after the lookup rows' (tot)
         # are set
         alone_tot = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
@@ -2506,6 +2560,7 @@ class EMRIDirectWDM:
                     alone_tot[k] += int(cst[k])
                 stats["windows"] += int(cst["windows"])
                 stats["tail_layers"] += [int(v) for v in cst["tail_layers"]]
+                stats["tail_skipped"] += int(cst.get("tail_skipped", 0))
                 stats["chunk_rows"] = len(chunk_items)
                 stats.setdefault("lookup", cst["lookup"])
                 stats["n_response"] = max(int(stats.get("n_response", 0)), int(cst.get("n_response", 0)))
@@ -2588,7 +2643,7 @@ class EMRIDirectWDM:
         nch = self.tdi_config.nchannels
         kw = dict(Nf=Nf, Nt=Nt, dt=dt, layer_dt=ldt, layer_df=ldf, t0=self.data_t0,
                   num_m_layers=self.num_m_layers, fdot_axis_max=self.fdot_axis_max,
-                  pixel_edge=self.pixel_edge, backend=self.force_backend, m_lo=m_lo, **self._nt_sub_kw())
+                  pixel_edge=self.pixel_edge, backend=self.force_backend, m_lo=m_lo, **self._tail_kw())
         tot = dict(lookup_pixels=0, chunk_pixels=0, dropped_pixels=0)
         be = self._kernel_backend(out)
         if be is not None:

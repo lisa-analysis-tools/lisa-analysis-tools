@@ -782,6 +782,32 @@ class BatchDomainRefusalTest(unittest.TestCase):
         lean(*self.rows[0])                                  # the single-template path reports it too
         self.assertGreaterEqual(lean.last_stats["nt_sub_eff"], 32)
 
+    def test_tail_skip_knob_reaches_the_generator(self):
+        """EMRI_DIRECT_TAIL_SKIP_PX above the fixture's tails: both chunk rows keep the lookup
+        through their last pixel (no pairs, no chunk pixels, no tail entry; counted in
+        tail_skipped); each batch row is the single template built with the same knob; the chunk
+        rows differ from the default, tail-keeping template, the lookup-only row does not."""
+        from lisatools.utils.utility import asnumpy
+
+        default = self._gen_with_two_chunk_rows_and_one_lookup_row()
+        want = asnumpy(default.batch(self.rows, chunk_rows=4))
+        self.assertEqual(default.last_stats["tail_skipped"], 0)
+        with mock.patch.dict(os.environ, {"EMRI_DIRECT_TAIL_SKIP_PX": "200"}):
+            skip = self._sibling()
+        self.assertEqual(skip.tail_skip_px, 200)
+        got = asnumpy(skip.batch(self.rows, chunk_rows=4))
+        st = dict(skip.last_stats)
+        self.assertEqual((st["chunk_rows"], st["tail_skipped"], st["chunk_pixels"], st["windows"]), (2, 2, 0, 0))
+        self.assertEqual(st["tail_layers"], [])
+        m_lo, m_hi = skip._band()
+        for r, p in enumerate(self.rows):
+            np.testing.assert_allclose(got[r], asnumpy(skip(*p).arr[:, m_lo:m_hi]), rtol=1e-10, atol=1e-13)
+        skip(*self.rows[0])                                  # a chunk row alone: skipped too
+        self.assertEqual((skip.last_stats["tail_skipped"], skip.last_stats["chunk_pixels"]), (1, 0))
+        for r in (0, 1):
+            self.assertGreater(np.abs(got[r] - want[r]).max(), 1e-6 * np.abs(want[r]).max())
+        np.testing.assert_allclose(got[2], want[2], rtol=1e-12, atol=1e-15)
+
     def test_refused_chunk_row_stays_zero(self):
         from lisatools.utils.utility import asnumpy
 

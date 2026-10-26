@@ -255,6 +255,10 @@ weights it enormously. Now:
   measures shorter chunks. `EMRI_DIRECT_NT_SUB=auto` (or `auto:<floor>`, floor validated like a
   fixed length; 10-25) picks ONE length per call so that the call's longest tail fits one window
   (below: "Auto window length"); unset, the fixed 128 exactly as before.
+* (10-25) `EMRI_DIRECT_TAIL_SKIP_PX` (`EMRIDirectWDM(tail_skip_px=...)`, default 0 = never; an
+  integer >= 0, else `ValueError`): a row whose tail spans at most that many pixels from its
+  common handoff to its last tracked pixel is looked up through its last pixel instead, as a row
+  that never trips, and builds no tail (below: "Conditional tail").
 * every harmonic of a template hands off to the chunk at the earliest harmonic's pixel (the
   summed tail implies the common handoff), taken per template, never across a batch.
 * (10-25) the chunk rows of a batch are built TOGETHER with `EMRI_DIRECT_CHUNK_BATCH=1` (by
@@ -383,6 +387,40 @@ BACKEND=cuda13x DAYS="720" CHUNKS="1,8" ROWS=32 NT_SUB=auto bash scripts/emri/em
 `EMRI_DIRECT_NT_SUB` for the accuracy step). Read the `[summary]` ms per template (single and 8 per
 call) and mm vs production against the run without `NT_SUB`, the `[split]` lines' windows (one per
 chunk row) and `eff`, and the `[parity]` lines.
+
+**Conditional tail (`EMRI_DIRECT_TAIL_SKIP_PX`, 10-25).** After the per-row common handoff, a row
+whose span `s_r = last_px_r - n_h_r + 1` satisfies `0 < s_r <= EMRI_DIRECT_TAIL_SKIP_PX` gets
+every harmonic's lookup stop at the row's end (the lookup runs through its last pixel, exactly as
+for a row that never trips) and contributes no `(row, window)` pair; the other rows of the same
+call keep their tails, and with `auto` the window length comes from the rows that keep one. It is
+the per-row version of the gate's `--no-handoff` (lookup everywhere). Counters:
+`last_stats["tail_skipped"]` (the move's `[EMRI_DIRECT]` line is unchanged; a skipped row has no
+`tail_layers` entry, so the line's tail median is over the rows that kept a tail), and the speed
+script's `[split]` lines print `W windows skipped S` (JSON `tail_skipped`). At 720 d EMRI 1's span
+is 37 px at threshold 1e-3 and 48 px at 1e-5 (layers of 3600 s: the last 1.5-2 days before the
+plunge), so 100 skips both. Whether the lookup holds up there, where the curvature / `fdot` trigger
+said it stops being valid, is exactly what has to be measured -- accuracy first, with the gate
+on the production response, the same run with and without `--no-handoff` (the `>= 0.99` and
+`direct-prod` columns: with `--no-handoff` they are the lookup's error where the tail would have
+been):
+
+```bash
+GATE_DT=5 GATE_RESPONSE=dense python scripts/emri/emri_direct_wdm_gate.py \
+    --table wdm_lookup_emri_cx_NF720_DT5_TL32_fd8x0p01_nld2.h5 --modes all --thresh 1e-5 --no-handoff
+GATE_DT=5 GATE_RESPONSE=dense python scripts/emri/emri_direct_wdm_gate.py \
+    --table wdm_lookup_emri_cx_NF720_DT5_TL32_fd8x0p01_nld2.h5 --modes all --thresh 1e-5
+```
+
+then speed and mismatch in one go (the `[summary]` "mm vs production" is the skipped template's
+accuracy; compare with the baseline run without `TAIL_SKIP_PX`):
+
+```bash
+BACKEND=cuda13x DAYS="720" CHUNKS="1,8" ROWS=32 TAIL_SKIP_PX=100 bash scripts/emri/emri_speed_durations.sh
+```
+
+**The default stays 0 (never skip) until Mike reads those numbers**; it changes only on his word
+(`EMRI_DIRECT_TAIL_SKIP_PX` exported in `scripts/flagship/launcher.sh.in`, then
+`python scripts/flagship/build.py`).
 
 Without `--fixed-fine-grid` the 80 s segment's points fall differently relative to the
 trajectory's end for 64 / 48 / 32 (one harmonic): their segment starts a whole number of layers
