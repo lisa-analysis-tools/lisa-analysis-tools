@@ -37,6 +37,18 @@ class BaseSearchInterface(ABC):
         """
         Parameters
         ----------
+        search_type : str
+            Type of search to perform. Must be one of ``["prior", "distribution", "samples", "point_estimate", "catalog"]``.
+        transform : TransformContainer, optional
+            TransformContainer for the source type, used to transform between physical and sampling bases.
+        parameters_searched : list[str], optional
+            List of parameter names in the sampling basis that are being searched. If None, all parameters in the sampling basis are searched.
+        search_path : str, optional
+            Path to the file or directory containing the search results. Required for ``search_type`` in ``["distribution", "samples", "point_estimate", "catalog"]``.
+        spread : float or np.ndarray, optional
+            Spread to use for scattering walkers around the starting points. Can be a scalar, 1-D array (diagonal covariance), 2-D array (full covariance), or 3-D array (one covariance per leaf). Required for ``search_type`` in ``["point_estimate", "catalog"]``.
+        is_eryn_backend : bool, optional
+            Whether the search results are from an Eryn backend. If True, the search results are assumed to be in the sampling basis and no inverse transform is applied.
         periodic : dict, optional
             Periodic parameters in the settings format ``{branch_name: {sampling-basis name: period}}``
             (e.g. ``curr.source_info["mbh"].periodic``). Starting points are wrapped into ``[0, period)``
@@ -633,7 +645,7 @@ class MBHBSearchInterface(BaseSearchInterface):
         # Sky coordinates: catalogue is ICRS
         ra = float(catalog_entry["RightAscension"]) % (2 * np.pi)
         dec = float(catalog_entry["Declination"])
-        psi = float(catalog_entry["PolarisationAngle"]) % np.pi  # ensure polarization is within [0, pi]
+        psi = float(catalog_entry["PolarisationAngle"]) % (2 * np.pi)  # ensure polarization is within [0, 2*pi]
         t_ssb = float(catalog_entry["TimeCoalescencePhenomTPHMSSBFrame"])
 
         return np.array([m1, m2, s1z, s2z, dist, phi_ref, iota, psi, ra, dec, t_ssb])
@@ -752,7 +764,7 @@ class GBSearchInterface(BaseSearchInterface):
         fdot = float(catalog_entry["GW22FrequencyDerivativeSourceFrame"])
         phi0 = float(catalog_entry["TrueAnomaly"]) % (2 * np.pi)
         iota = float(catalog_entry["InclinationAngle"])
-        psi = float(catalog_entry["PolarisationAngle"]) % np.pi  # ensure polarization is within [0, pi]
+        psi = float(catalog_entry["PolarisationAngle"]) % (2 * np.pi)  # ensure polarization is within [0, 2*pi]
         ra = float(catalog_entry["RightAscension"]) % (2 * np.pi)
         dec = float(catalog_entry["Declination"])
 
@@ -860,7 +872,7 @@ class SOBHBSearchInterface(BaseSearchInterface):
         iota = float(catalog_entry['InclinationAngle'])
         dist = float(catalog_entry['LuminosityDistance'])
         f0 = float(catalog_entry['GW22FrequencySSBFrame'])
-        psi = float(catalog_entry['PolarisationAngle']) % np.pi  # ensure polarization is within [0, pi]
+        psi = float(catalog_entry['PolarisationAngle']) % (2 * np.pi)  # ensure polarization is within [0, 2*pi]
         ra = float(catalog_entry['RightAscension']) % (2 * np.pi)
         dec = float(catalog_entry['Declination'])
 
@@ -874,3 +886,52 @@ class SOBHBSearchInterface(BaseSearchInterface):
             f0 = evolve_sobhb(t_start, t_end, m1, m2, s1, s2, f0)
 
         return np.array([m1, m2, iota, dist, f0, s1, s2, phi_coal, psi, ra, dec])
+
+    class NoiseSearchInterface(BaseSearchInterface):
+        """
+        Search interface for noise-only searches.
+        """
+
+        @property
+        def branch_name(self):
+            return "psd"
+
+        @property
+        def catalog_source_name(self) -> str:
+            """
+            Returns the catalog source name for the specific source type.
+            """
+            return "NOISE"
+
+        @property
+        def physical_parameters(self) -> list[str]:
+            """
+            Returns the list of physical parameters for the noise-only source type.
+            """
+            return ["S_oms", "S_tm"]
+
+        def unpack_catalog_entries(self, catalog_entry: dict, curr: CurrentInfoGlobalFit) -> np.ndarray:
+            raise NotImplementedError("NoiseSearchInterface does not support catalog entries.")
+
+    class GalacticForegroundSearchInterface(NoiseSearchInterface):
+        """
+        Search interface for galactic foreground searches.
+        """
+
+        @property
+        def branch_name(self):
+            return "galfor"
+
+        @property
+        def catalog_source_name(self) -> str:
+            """
+            Returns the catalog source name for the specific source type.
+            """
+            raise ValueError("GalacticForegroundSearchInterface does not support catalog entries.")
+
+        @property
+        def physical_parameters(self) -> list[str]:
+            """
+            Returns the list of physical parameters for the galactic foreground source type.
+            """
+            return ["A", "alpha_gal", "f1", "fknee", "f2"]
