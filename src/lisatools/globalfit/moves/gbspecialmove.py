@@ -19,6 +19,7 @@ from eryn.state import BranchSupplemental
 from gbgpu.gbgpu import GBGPU
 from gbgpu.utils.utility import get_N, get_fdot
 from scipy import stats
+from scipy.special import gammaln
 
 from ... import sensitivity
 from ...detector import sangria
@@ -940,8 +941,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                                     -> compute delta_ll = - < r| h > - 0.5 < h | h > 
                                 else (outside freq limits):
                                     -> curr_logp = -inf (fast rejection)
-                            -> compute acceptance ratio:
-                               accept = beta * delta_ll + delta_logp + factors >= log(rand)
+                            -> compute acceptance ratio (the picks of one walker in turn):
+                               accept = beta * delta_ll + delta_logp + factors + k_term >= log(rand)
                             if accept:
                                 kill/birth source and update residual
                             else (rejected):
@@ -977,6 +978,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         ll_change_log = self.xp.zeros((self.ntemps, self.nwalkers, self.num_bands))
         prop_counts = self.xp.zeros((2, self.ntemps, self.nwalkers, self.num_bands), dtype=int)
         acc_counts = self.xp.zeros_like(prop_counts)
+
+        # * Alive sources per (temp, walker) for the k prior term; _run_rj_step keeps it current
+        # * (it is the only step that flips ``inds`` in this pass).
+        if self.is_rj_prop:
+            walker_cell_all = band_sorter.temp_inds * self.nwalkers + band_sorter.walker_inds
+            alive_cells = walker_cell_all[band_sorter.inds]
+            # ! CuPy's bincount raises on an empty array (zero-leaf start)
+            self._k_walker = (
+                self.xp.bincount(alive_cells, minlength=self.ntemps * self.nwalkers)
+                if alive_cells.shape[0] > 0
+                else self.xp.zeros(self.ntemps * self.nwalkers, dtype=self.xp.int64)
+            )
 
         # Reset per-step debug state
         self.debugger.start_proposal_step()
@@ -1187,12 +1200,23 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         the pre-computed ±logpdf of the RJ proposal distribution. On accept,
         ``inds`` flips and the cell residual is updated through
         ``fill_template`` with the appropriate sign.
+
+        The prior on the number of sources k of a walker is uniform on
+        [0, N], N = nleaves_max. The slot flip alone (one birth proposal per
+        dead slot, one death per source) would weigh k by C(N, k), so a birth
+        adds ln((k + 1) / (N - k)) and a death ln((N - k + 1) / k), with k the
+        walker's count just before the flip. A round holds picks in several
+        bands of one walker, so those are decided in turn (random order) with
+        k updated after each accepted flip; the likelihood terms stay
+        vectorized, since a band's delta does not depend on flips in the other
+        bands of the unit.
         """
         xp = self.xp
         ids = picked["ids"]
         slots = picked["slot_index"]
         N_vals = picked["N_vals"]
         alive = band_sorter.inds[ids].copy()   # True -> death proposal
+        temp_idx, walker_idx, band_idx = picked["temp_inds"], picked["walker_inds"], picked["band_inds"]
 
         params = band_sorter.coords[ids].copy()
         params[:] = self.periodic.wrap({"gb": params[:, None, :]}, xp=xp)["gb"][:, 0]
@@ -1297,11 +1321,34 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         beta = band_temps[picked["band_inds"], picked["temp_inds"]]
         factors = band_sorter.factors[ids]
         lnpdiff = beta * delta_ll + (curr_logp - prev_logp) + factors
-        accept = lnpdiff >= self.xp.log(self.xp.random.rand(*lnpdiff.shape))
+        log_u = xp.log(xp.random.rand(*lnpdiff.shape))
 
         # Coordinates outside the prior can only be accepted at beta == 0;
         # everything else is a bug -> warn and reject.
         bad_mask = (delta_ll <= -1e299) | (curr_logp <= -1e229)
+
+        # * Uniform prior on k: each flip carries C(N, k) / C(N, k +- 1) at the walker's current k, so the
+        # * picks of one walker are decided in turn (rank = position within the walker, random order).
+        n_slots = band_sorter.nleaves_max
+        walker_cell = temp_idx * self.nwalkers + walker_idx
+        order = xp.lexsort(xp.stack([xp.random.rand(len(ids)), walker_cell]))
+        _, first, group = xp.unique(walker_cell[order], return_index=True, return_inverse=True)
+        rank = xp.empty(len(ids), dtype=xp.int64)
+        rank[order] = xp.arange(len(ids)) - first[group]
+        accept = xp.zeros(len(ids), dtype=bool)
+        for position in range(int(rank.max()) + 1):
+            rows = xp.flatnonzero(rank == position)
+            k_now = self._k_walker[walker_cell[rows]].astype(xp.float64)
+            # a birth has N - k >= 1 and a death k >= 1; the clamps only touch the unused branch
+            lnpdiff[rows] += xp.where(
+                alive[rows],
+                xp.log((n_slots - k_now + 1) / xp.maximum(k_now, 1)),
+                xp.log((k_now + 1) / xp.maximum(n_slots - k_now, 1)),
+            )
+            accept[rows] = lnpdiff[rows] >= log_u[rows]
+            flips = rows[accept[rows] & ~bad_mask[rows]]
+            self._k_walker[walker_cell[flips]] += xp.where(alive[flips], -1, 1)
+
         bad_accepts = accept & bad_mask
         if bool(xp.any(bad_accepts)):
             if bool(xp.any(beta[bad_accepts] != 0.0)) and not (
@@ -1991,10 +2038,43 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         band_temps += self.xp.asarray(dbetas.T)
 
     def run_tempering(self, model, state, band_sorter, band_temps):
+        """Band-wise swaps between adjacent temperatures.
+
+        A swap exchanges the sources of one band between a walker at
+        temperature t and one at t - 1, so the number of sources k of both
+        walkers changes. Under the uniform prior on k a walker with k sources
+        carries the weight k! against its set of sources (the write-back
+        repacks the leaves, so the slot labels carry no information), so a
+        swap adds the change of ln k! of both walkers, and a swap that would
+        give a walker more than nleaves_max sources is rejected. The bands of
+        a chunk are decided in turn, so that the totals stay current.
+        """
         ll_change_log_temp = self.xp.zeros((self.ntemps, self.nwalkers, self.num_bands))
 
         band_swaps_accepted = self.xp.zeros((len(self.band_edges) - 1, self.ntemps - 1), dtype=int)
         band_swaps_proposed = self.xp.zeros((len(self.band_edges) - 1, self.ntemps - 1), dtype=int)
+
+        # * Alive sources per (temp, walker, band) cell and per walker, kept current through the swaps.
+        # * Sources outside the band range count for their walker but sit in no cell.
+        n_slots = band_sorter.nleaves_max
+        num_walker_cells = self.ntemps * self.nwalkers
+        walker_cell_all = band_sorter.temp_inds * self.nwalkers + band_sorter.walker_inds
+        in_band = (
+            band_sorter.inds & (band_sorter.band_inds >= 0) & (band_sorter.band_inds < self.num_bands)
+        )
+        band_cell_all = walker_cell_all * self.num_bands + band_sorter.band_inds
+        # ! CuPy's bincount raises on an empty array
+        cell_alive = (
+            self.xp.bincount(band_cell_all[in_band], minlength=num_walker_cells * self.num_bands)
+            if bool(in_band.any())
+            else self.xp.zeros(num_walker_cells * self.num_bands, dtype=self.xp.int64)
+        ).reshape(self.ntemps, self.nwalkers, self.num_bands)
+        walker_alive = (
+            self.xp.bincount(walker_cell_all[band_sorter.inds], minlength=num_walker_cells)
+            if bool(band_sorter.inds.any())
+            else self.xp.zeros(num_walker_cells, dtype=self.xp.int64)
+        ).reshape(self.ntemps, self.nwalkers)
+        log_factorial = self.xp.asarray(gammaln(np.arange(n_slots + 1) + 1.0))   # ln k!
 
         units = 2
         tmp_start = np.random.randint(units)
@@ -2070,7 +2150,34 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     # paccept = bi * (band_here_i1->swapped_like - band_here_i->current_like) + bi1 * (band_here_i->swapped_like - band_here_i1->current_like);
 
                     raccept = self.xp.log(self.xp.random.uniform(size=paccept.shape))
-                    sel = paccept > raccept
+
+                    # * Uniform prior on k: add the change of ln k! of both walkers, reject swaps past
+                    # * nleaves_max. Rows of one band pair distinct walkers; bands go in turn.
+                    hot_walkers, cold_walkers = walker_inds_now[:, i1], walker_inds_now[:, i2]
+                    row_bands = band_inds_now[:, i1]
+                    n_hot = cell_alive[i1, hot_walkers, row_bands]
+                    n_cold = cell_alive[i2, cold_walkers, row_bands]
+                    sel = self.xp.zeros(paccept.shape, dtype=bool)
+                    for band in self.xp.unique(row_bands).tolist():
+                        rows = self.xp.flatnonzero(row_bands == band)
+                        k_hot = walker_alive[i1, hot_walkers[rows]]
+                        k_cold = walker_alive[i2, cold_walkers[rows]]
+                        k_hot_new = k_hot - n_hot[rows] + n_cold[rows]
+                        k_cold_new = k_cold - n_cold[rows] + n_hot[rows]
+                        fits = (k_hot_new <= n_slots) & (k_cold_new <= n_slots)
+                        log_weight_change = (
+                            log_factorial[self.xp.minimum(k_hot_new, n_slots)]
+                            + log_factorial[self.xp.minimum(k_cold_new, n_slots)]
+                            - log_factorial[k_hot]
+                            - log_factorial[k_cold]
+                        )
+                        sel[rows] = fits & (paccept[rows] + log_weight_change > raccept[rows])
+                        taken = rows[sel[rows]]
+                        walker_alive[i1, hot_walkers[taken]] = k_hot_new[sel[rows]]
+                        walker_alive[i2, cold_walkers[taken]] = k_cold_new[sel[rows]]
+                    # * the accepted cells now hold each other's sources
+                    cell_alive[i1, hot_walkers[sel], row_bands[sel]] = n_cold[sel]
+                    cell_alive[i2, cold_walkers[sel], row_bands[sel]] = n_hot[sel]
 
                     current_lls[sel, i2 : i1 + 1] = new_lls[sel]
 
