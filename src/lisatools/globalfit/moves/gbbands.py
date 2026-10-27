@@ -2786,11 +2786,10 @@ class BandSorter(LISAToolsParallelModule):
             proposal_logpdf = self.xp.zeros(self.coords.shape[0])
 
             batch_here = int(1e6)
-            inds_splitting = np.arange(0, self.coords.shape[0], batch_here)
-            if inds_splitting[-1] != self.coords.shape[0] - 1:
-                inds_splitting = np.concatenate(
-                    [inds_splitting, np.array([self.coords.shape[0] - 1])]
-                )
+            # * batch starts plus the row count, so the exclusive slices below cover every row
+            inds_splitting = np.append(
+                np.arange(0, self.coords.shape[0], batch_here), self.coords.shape[0]
+            )
 
             for stind, eind in zip(inds_splitting[:-1], inds_splitting[1:]):
                 proposal_logpdf[stind:eind] = self.xp.asarray(
