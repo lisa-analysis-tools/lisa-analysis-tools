@@ -33,8 +33,6 @@ from lisatools.response.tdiconfig import TDIConfig
 
 from bbhx.utils.transform import SSB_to_LISA
 from gbgpu.gbgpu import GBGPU
-from gbgpu.gbcomps import STFTGBComputations
-from gbgpu.gb_likelihood import make_band_likelihood_engine
 from eryn.moves.tempering import TemperatureControl, make_ladder
 from eryn.prior import ProbDistContainer
 
@@ -1318,6 +1316,7 @@ def build_gb_moves(
     #* Setting up gbgpu on the correct backend and (if any) gpu(s).
     #* CPU path keeps numpy and avoids the cupy-only setDevice call.
     from gbgpu.gbgpu import GBGPU
+    from gbgpu.gbcomps import STFTGBComputations
     import gbgpu
 
     gb_force_backend = general_info.force_backend
@@ -1509,6 +1508,8 @@ def build_gb_moves(
             )
             
             xp = gb_info.gb_stft_comp.xp
+
+            from gbgpu.gb_likelihood import make_band_likelihood_engine
 
             make_band_likelihood_engine(
                 domain_settings,

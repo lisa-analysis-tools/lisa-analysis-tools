@@ -24,7 +24,6 @@ from eryn.state import State as ErynState
 from eryn.state import Branch as ErynBranch
 from eryn.utils import TransformContainer
 from gbgpu.utils.utility import get_fdot, get_N
-from gbgpu.gbcomps import STFTGBComputations
 
 from lisatools.sources.utils import ecliptic_to_icrs
 from lisatools.utils.utility import AET, detrend, tukey
@@ -38,6 +37,7 @@ from ..priors.gbpriors import get_fdot_mojito
 from ..searches import MBHBSearchInterface, GBSearchInterface, EMRISearchInterface, SOBHBSearchInterface, NoiseSearchInterface, GalacticForegroundSearchInterface
 
 if typing.TYPE_CHECKING:
+    from gbgpu.gbcomps import STFTGBComputations
     from ..moves.gbdebug import GBDebugSettings
     from ..moves.gbspecialmove import GBLeafCapSettings, GBSigHetSettings
 
