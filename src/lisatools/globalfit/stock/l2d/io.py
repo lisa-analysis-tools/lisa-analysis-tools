@@ -1,0 +1,351 @@
+"""Read an L2D run folder (``global.yaml`` + ``blocks/*.yaml``) into a validated config."""
+
+from __future__ import annotations
+
+import inspect
+import os
+
+import re
+from pathlib import Path
+from typing import Any, Literal
+
+import yaml
+from pydantic import BaseModel, ConfigDict,PositiveInt, PositiveFloat, Field, field_validator, model_validator
+
+from typing import Annotated
+from pydantic import BeforeValidator, AfterValidator, ValidationInfo
+
+from lisatools.utils.constants import YRSID_SI
+
+from .blocks import BlockSpec
+from .blocks.base import SourceBlock
+from .typing import Duration, RunPath
+
+SCHEMA_VERSION = 1
+
+
+class _Loader(yaml.SafeLoader):
+    """SafeLoader that also reads ``1e-4`` as a float (YAML 1.2 rule; PyYAML gives a str)."""
+
+    def construct_mapping(self, node, deep=False):
+        seen = set()
+        for key_node, _ in node.value:
+            if key_node.tag == "tag:yaml.org,2002:merge":  # `<<: *anchor`, expanded by SafeLoader
+                continue
+            key = self.construct_object(key_node, deep=deep)
+            if key in seen:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping", node.start_mark,
+                    f"found duplicate key {key!r}", key_node.start_mark,
+                )
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+_Loader.add_implicit_resolver(
+    "tag:yaml.org,2002:float",
+    re.compile(r"^[-+]?[0-9][0-9_]*(?:\.[0-9_]*)?[eE][-+]?[0-9]+$"),
+    list("-+0123456789"),
+)
+
+
+def read_yaml(path: Path) -> dict[str, Any]:
+    """Load one YAML file; an empty file is an empty mapping."""
+    with open(path) as f:
+        data = yaml.load(f, Loader=_Loader)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: top level must be a mapping, got {type(data).__name__}.")
+    return data
+
+
+class _Section(BaseModel):
+    """Base for config sections: unknown keys are errors, never silently ignored."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class RunSection(_Section):
+    name: str
+    output_dir: RunPath
+    seed: int | None = None
+    num_iterations: PositiveInt = 500
+    backup_iter: PositiveInt = 5
+    submission_dir: RunPath | None = None
+
+
+class SamplerSection(_Section):
+    nwalkers: PositiveInt
+    ntemps: PositiveInt
+
+
+class ComputeSection(_Section):
+    gpus: list[int] | None = None  # None -> CPU run
+    backend: Literal["cpu", "cuda11x", "cuda12x", "cuda13x"] = "cpu"
+    head_rank: int = 1
+    main_rank: int = 0
+
+    @model_validator(mode="after")
+    def _cpu_means_no_gpus(self):
+        if (self.backend == "cpu") != (self.gpus is None):
+            raise ValueError("use backend: cpu with no gpus, or a cuda backend with gpus: [...]")
+        return self
+
+
+class BlockConfig(BaseModel):
+    """One source/noise block. Type-specific fields are validated in a later step."""
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str
+    enabled: bool = True
+
+# --- Data section --- #
+
+class FilterSpec(_Section):
+    cutoff: PositiveFloat  # Hz
+    order: PositiveInt = 2
+    zero_phase: bool = True
+
+class TrimSpec(_Section):
+    duration: Duration  # seconds, or a fraction when is_percent
+    is_percent: bool = False
+    trimming_type: Literal["from_each_end", "keep_from_start", "discard_from_start"] = "from_each_end"
+
+class DownsampleSpec(_Section):
+    """Resample to fs=1/dt with dt taken from the data section."""
+
+    window: tuple[str, float] = ("kaiser", 31.0)
+
+class L1OrbitsSpec(_Section):
+    """Orbits read from the mojito L1 data folder (``lisatools.detector.L1Orbits``)."""
+
+    type: Literal["l1"]
+    frame: Literal["icrs", "ecliptic"] = "icrs"
+    armlength: PositiveFloat | None = None  # None -> L1Orbits' own default
+
+
+class EqualArmlengthOrbitsSpec(_Section):
+    """Packaged equal-armlength orbit file (``EqualArmlengthOrbits``)."""
+
+    type: Literal["equal_armlength"]
+
+
+class ESAOrbitsSpec(_Section):
+    """Packaged ESA trailing orbit file (``ESAOrbits``)."""
+
+    type: Literal["esa"]
+
+
+OrbitsSpec = Annotated[
+    L1OrbitsSpec | EqualArmlengthOrbitsSpec | ESAOrbitsSpec, Field(discriminator="type")
+]
+
+# Which orbit types each loader can build (L1DataLoader passes the L1 orbit file to the class).
+_ORBITS_PER_LOADER = {"mojito_l1": ("l1",)}
+
+class DataSection(_Section):
+    loader: Literal["mojito_l1"] = "mojito_l1"
+    path: RunPath
+    source_types: list[str]
+    source_ids: dict[str, list[int]] = Field(default_factory=dict)
+    orbits: OrbitsSpec = Field(default_factory=lambda: L1OrbitsSpec(type="l1"))
+    reference_time: float | None = None  # absolute SSB time (s) the source waveforms are referenced to
+    Tobs: Duration
+    dt: Duration                      # seconds: `dt: 5.0` or `dt: 5 s`
+    highpass: FilterSpec | None = None
+    lowpass: FilterSpec | None = None
+    downsample: DownsampleSpec | None = None
+    trim: TrimSpec | None = None
+
+    @model_validator(mode="after")
+    def _orbits_match_loader(self):
+        allowed = _ORBITS_PER_LOADER[self.loader]
+        if self.orbits.type not in allowed:
+            raise ValueError(
+                f"loader {self.loader!r} can build orbits of type {allowed}, got {self.orbits.type!r}."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _filters_need_explicit_trim(self):
+        if (self.highpass is not None or self.lowpass is not None) and self.trim is None:
+            raise ValueError(
+                "filtering without data.trim makes process() trim 100 h from each end; set data.trim."
+            )
+        return self
+
+# --- Domain section --- #
+
+class _Band(_Section):
+    min_freq: PositiveFloat
+    max_freq: PositiveFloat
+
+    @model_validator(mode="after")
+    def _ordered(self):
+        if self.min_freq >= self.max_freq:
+            raise ValueError(f"min_freq ({self.min_freq}) must be below max_freq ({self.max_freq}).")
+        return self
+
+
+class FDDomain(_Band):
+    type: Literal["fd"]
+
+
+class STFTDomain(_Band):
+    type: Literal["stft"]
+    segment_duration: Duration  # -> STFTSettings.make_factory(big_dt=...)
+
+
+Domain = Annotated[FDDomain | STFTDomain, Field(discriminator="type")]
+
+# --- Window section --- #
+
+WindowType = Literal[
+    "tukey", "planck", "kaiser", "hamming", "hanning", "welch", "rectangular",
+    "blackman-harris", "bh92", "nuttall", "nuttall3", "nuttall3a", "nuttall3b",
+    "nuttall4", "nuttall4a", "nuttall4b", "nuttall4c",
+]
+
+
+class WindowSection(_Section):
+    type: WindowType = "tukey"
+    taper_duration: Literal["auto"] | Duration = "auto"  # auto -> 1/domain.min_freq (builder)
+    normalize: bool = False  # pass the window to the sensitivity backend (window_values)
+
+# --- Sensitivity section --- #
+
+# Constructor arguments GeneralSetup fills in itself; never given in the YAML.
+_ENGINE_FILLED = frozenset({"settings", "orbits", "force_backend", "window_values"})
+
+
+def _sensitivity_class(name: str) -> type:
+    from lisatools import sensitivity  # local: only needed to check this section
+
+    cls = getattr(sensitivity, name, None)
+    if not isinstance(cls, type):
+        raise ValueError(f"lisatools.sensitivity has no class {name!r}.")
+    return cls
+
+def _init_params(cls: type) -> set[str] | None:
+    """Names ``cls.__init__`` accepts; ``None`` if it takes ``**kwargs`` (anything goes)."""
+    params = inspect.signature(cls.__init__).parameters
+    if any(p.kind is p.VAR_KEYWORD for p in params.values()):
+        return None
+    return set(params) - {"self"}
+
+class SensitivitySection(_Section):
+    """A class from ``lisatools.sensitivity`` and the kwargs for its ``__init__``."""
+
+    class_name: str = Field(alias="class")
+    kwargs: dict[str, Any] = Field(default_factory=dict)
+    fixed_psd_kwargs: dict[str, Any] | None = None  # call kwargs; used only without a psd block
+
+    @model_validator(mode="after")
+    def _kwargs_match_class(self):
+        given = set(self.kwargs)
+        if given & _ENGINE_FILLED:
+            raise ValueError(f"{sorted(given & _ENGINE_FILLED)} are filled in by the engine; remove them.")
+        accepted = _init_params(_sensitivity_class(self.class_name))
+        if accepted is not None and given - accepted:
+            raise ValueError(
+                f"{self.class_name} does not accept {sorted(given - accepted)}; "
+                f"it takes {sorted(accepted - _ENGINE_FILLED)}."
+            )
+        return self
+
+#--- Global metadata section ---#
+
+class MetadataSection(_Section):
+    codename: str | None = "Erebor"
+    version: str | None = Field(default=None, pattern=r"^[^_]+_.+$")  # "<run_type>_<run_id>"
+    contact: str | None = None
+    code_link: str | None = None
+    input_data_link: str | None = None
+    input_reference: str | None = None
+    noise_model: str | None = None
+    noise_model_code_link: str | None = None
+    comment: str | None = None
+
+
+class RunConfig(_Section):
+    schema_version: int
+    run: RunSection
+    sampler: SamplerSection
+    compute: ComputeSection = Field(default_factory=ComputeSection)
+    blocks: dict[str, BlockSpec] = Field(default_factory=dict)
+    data: DataSection
+    domain: Domain
+    metadata: MetadataSection = Field(default_factory=MetadataSection)
+    window: WindowSection = Field(default_factory=WindowSection)
+    sensitivity: SensitivitySection
+
+    @field_validator("schema_version")
+    @classmethod
+    def _known_version(cls, v: int) -> int:
+        if v != SCHEMA_VERSION:
+            raise ValueError(f"unsupported schema_version {v}; this code reads {SCHEMA_VERSION}.")
+        return v
+
+    @model_validator(mode="after")
+    def _normalize_needs_window_values(self):
+        if self.window.normalize:
+            accepted = _init_params(_sensitivity_class(self.sensitivity.class_name))
+            if accepted is not None and "window_values" not in accepted:
+                raise ValueError(
+                    f"window.normalize has no effect: {self.sensitivity.class_name} takes no window_values."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _blocks_fit_the_run(self):
+        """Check the blocks against the data section (reference time, source ids and types)."""
+        data = self.data
+        source_types = {s.lower() for s in data.source_types}
+        for name, block in self.blocks.items():
+            if name != block.type:
+                raise ValueError(f"blocks/{name} has type {block.type!r}; name the file {block.type}.yaml.")
+            if not block.enabled:
+                continue
+            # a ladder may use a subset of the sampler's temperatures, never more
+            ntemps = None if block.tempering is None else block.tempering.ntemps
+            if ntemps is not None and ntemps > self.sampler.ntemps:
+                raise ValueError(
+                    f"block {name!r}: tempering.ntemps ({ntemps}) is above sampler.ntemps ({self.sampler.ntemps})."
+                )
+            if block.NEEDS_REFERENCE_TIME and data.reference_time is None:
+                raise ValueError(f"block {name!r} needs data.reference_time (absolute SSB time, in seconds).")
+            if isinstance(block, SourceBlock):
+                key = block.SOURCE_IDS_KEY
+                if key not in source_types:
+                    raise ValueError(f"block {name!r} needs {key!r} in data.source_types.")
+                if block.nleaves == "auto" and not data.source_ids.get(key):
+                    raise ValueError(f"block {name!r}: nleaves: auto needs data.source_ids[{key!r}].")
+        return self
+
+
+def load_run(path: str | Path) -> RunConfig:
+    """Load a run folder (``global.yaml`` + ``blocks/*.yaml``) or a single resolved config file.
+
+    Relative paths inside are relative to that folder (for a file: the folder it sits in).
+    """
+    path = Path(path).absolute()
+    if path.is_dir():
+        raw = read_yaml(path / "global.yaml")
+        if "blocks" in raw:
+            raise ValueError("global.yaml must not define 'blocks'; use one file per block in blocks/.")
+        raw["blocks"] = {p.stem: read_yaml(p) for p in sorted((path / "blocks").glob("*.yaml"))}
+        run_dir = path
+    else:
+        raw = read_yaml(path)
+        run_dir = path.parent
+    return RunConfig.model_validate(raw, context={"run_dir": run_dir})
+
+
+def dump_run(cfg: RunConfig, path: str | Path) -> Path:
+    """Write ``cfg`` fully resolved (defaults filled, paths absolute) as one reloadable YAML file."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        yaml.safe_dump(cfg.model_dump(mode="json", by_alias=True), f, sort_keys=False)
+    return path

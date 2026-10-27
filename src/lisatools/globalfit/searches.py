@@ -887,51 +887,51 @@ class SOBHBSearchInterface(BaseSearchInterface):
 
         return np.array([m1, m2, iota, dist, f0, s1, s2, phi_coal, psi, ra, dec])
 
-    class NoiseSearchInterface(BaseSearchInterface):
+class NoiseSearchInterface(BaseSearchInterface):
+    """
+    Search interface for noise-only searches.
+    """
+
+    @property
+    def branch_name(self):
+        return "psd"
+
+    @property
+    def catalog_source_name(self) -> str:
         """
-        Search interface for noise-only searches.
+        Returns the catalog source name for the specific source type.
         """
+        return "NOISE"
 
-        @property
-        def branch_name(self):
-            return "psd"
-
-        @property
-        def catalog_source_name(self) -> str:
-            """
-            Returns the catalog source name for the specific source type.
-            """
-            return "NOISE"
-
-        @property
-        def physical_parameters(self) -> list[str]:
-            """
-            Returns the list of physical parameters for the noise-only source type.
-            """
-            return ["S_oms", "S_tm"]
-
-        def unpack_catalog_entries(self, catalog_entry: dict, curr: CurrentInfoGlobalFit) -> np.ndarray:
-            raise NotImplementedError("NoiseSearchInterface does not support catalog entries.")
-
-    class GalacticForegroundSearchInterface(NoiseSearchInterface):
+    @property
+    def physical_parameters(self) -> list[str]:
         """
-        Search interface for galactic foreground searches.
+        Returns the list of physical parameters for the noise-only source type.
         """
+        return ["S_oms", "S_tm"]
 
-        @property
-        def branch_name(self):
-            return "galfor"
+    def unpack_catalog_entries(self, catalog_entry: dict, curr: CurrentInfoGlobalFit) -> np.ndarray:
+        raise NotImplementedError("NoiseSearchInterface does not support catalog entries.")
 
-        @property
-        def catalog_source_name(self) -> str:
-            """
-            Returns the catalog source name for the specific source type.
-            """
-            raise ValueError("GalacticForegroundSearchInterface does not support catalog entries.")
+class GalacticForegroundSearchInterface(NoiseSearchInterface):
+    """
+    Search interface for galactic foreground searches.
+    """
 
-        @property
-        def physical_parameters(self) -> list[str]:
-            """
-            Returns the list of physical parameters for the galactic foreground source type.
-            """
-            return ["A", "alpha_gal", "f1", "fknee", "f2"]
+    @property
+    def branch_name(self):
+        return "galfor"
+
+    @property
+    def catalog_source_name(self) -> str:
+        """
+        Returns the catalog source name for the specific source type.
+        """
+        raise ValueError("GalacticForegroundSearchInterface does not support catalog entries.")
+
+    @property
+    def physical_parameters(self) -> list[str]:
+        """
+        Returns the list of physical parameters for the galactic foreground source type.
+        """
+        return ["A", "alpha_gal", "f1", "fknee", "f2"]
