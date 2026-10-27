@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import os
 import warnings
 from copy import deepcopy
 from pathlib import Path
@@ -430,7 +431,11 @@ def make_priors(block: BlockBase, general) -> GFBasePrior:
         prior_cls = factory(**kwargs)
 
     if block.priors.output_file is not None:
-        prior_cls.to_yaml(str(block.priors.output_file))
+        # every MPI rank builds the blocks: write aside, then rename (atomic), so ranks never see a half file
+        out = Path(block.priors.output_file)
+        tmp = out.with_name(f".{out.name}.{os.getpid()}.tmp")
+        prior_cls.to_yaml(str(tmp))
+        os.replace(tmp, out)
 
         if hasattr(block, "links") and isinstance(block.links, Links):
             block.links.prior_model_config_file = str(block.priors.output_file)

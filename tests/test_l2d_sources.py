@@ -608,7 +608,8 @@ class EMRIBuildTest(_Built):
 class EMRIPriorContractTest(unittest.TestCase):
     """What the emri block expects from ``ereborpriors.stock.mojitolight.EMRIPrior``."""
 
-    INPUT_BASIS = ["log_m1", "m2", "a", "p0", "e0", "dist", "cosqK", "phiK", "Phi_phi0", "Phi_r0", "alpha", "sin_delta"]
+    # same order as recipe.emri_catalogue_to_sampling_basis, which seeds the walkers by position
+    INPUT_BASIS = ["log_m1", "m2", "a", "p0", "e0", "d_L", "cos_qK", "phiK", "Phi_phi0", "Phi_r0", "alpha", "sin_delta"]
 
     def prior(self):
         try:
@@ -626,8 +627,11 @@ class EMRIPriorContractTest(unittest.TestCase):
 
     def test_transform_reaches_the_waveform_basis(self):
         prior = self.prior()
-        out = prior.get_transforms().transform_base_parameters(prior.rvs(size=(50,)))
+        x = prior.rvs(size=(50,))
+        transform = prior.get_transforms()
+        out = transform.both_transforms(x)
         self.assertEqual(out.shape, (50, 14))  # adds the filled xI0 and Phi_theta0
+        np.testing.assert_allclose(transform.unfill_values(transform.inverse_transform_base_parameters(out)), x)
 
 
 if __name__ == "__main__":

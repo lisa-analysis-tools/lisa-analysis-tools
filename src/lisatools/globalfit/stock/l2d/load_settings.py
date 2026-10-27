@@ -10,14 +10,17 @@ from __future__ import annotations
 
 import os
 from copy import deepcopy
+from pathlib import Path
 
 from lisatools.detector import EqualArmlengthOrbits, ESAOrbits, L1Orbits
 from lisatools.domains import FDSettings, STFTSettings
 from lisatools.globalfit.preprocessing import L1ProcessingStep
-from lisatools.globalfit.engine import GeneralSettings, GeneralSetup, RankInfo
+from lisatools.globalfit.engine import GeneralSettings, GeneralSetup, GlobalFitSettings, RankInfo
 
 from .blocks import BUILDERS, BlockBuild, BuildContext
-from .io import FDDomain, RunConfig, STFTDomain, _sensitivity_class
+from .io import FDDomain, RunConfig, STFTDomain, _sensitivity_class, dump_run
+
+SNAPSHOT_NAME = "run_config.yaml"  # the resolved config, next to the run's other artifacts
 
 # YAML tags -> engine classes.
 LOADERS = {"mojito_l1": L1ProcessingStep}
@@ -118,3 +121,26 @@ def load_blocks(cfg: RunConfig, general: GeneralSetup) -> dict[str, BlockBuild]:
     """Build every enabled block against the built GeneralSetup (derived values are read from it)."""
     ctx = BuildContext(cfg, general)
     return {name: BUILDERS[block.type](block, ctx) for name, block in cfg.blocks.items() if block.enabled}
+
+
+def build_curr_info(cfg: RunConfig):
+    """The engine's ``CurrentInfoGlobalFit`` for a run: general setup, every enabled block, the recipe."""
+    from lisatools.globalfit.run import CurrentInfoGlobalFit  # local: run.py imports mpi4py
+
+    from .build_recipe import make_setup_function
+
+    general = load_general_setup(cfg)
+    builds = load_blocks(cfg, general)
+    settings = GlobalFitSettings(
+        source_info={name: build.setup for name, build in builds.items()},
+        general_info=general,
+        rank_info=make_rank_info(cfg),
+        setup_function=make_setup_function(cfg, builds),
+        source_metadata={name: build.metadata for name, build in builds.items()},
+    )
+    return CurrentInfoGlobalFit(settings)
+
+
+def write_snapshot(cfg: RunConfig, general: GeneralSetup) -> Path:
+    """Write the resolved config into the run's artifacts folder (call it on one rank only)."""
+    return dump_run(cfg, Path(general.artifacts_file_dir) / SNAPSHOT_NAME)
