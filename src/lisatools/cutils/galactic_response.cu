@@ -210,637 +210,596 @@ double gal_spectral_model(double f, double Amp, double alpha,
     return psd_gal * transfer;
 }
 
-// ============================================================================
-// TDI response device functions (unchanged from original)
+
 // ============================================================================
 CUDA_DEVICE
 double galaxy_XX(double alpha0, double beta0, double theta_N, double phi_N, double delta_t)
 {
-    double ot  = OMEGA_LISA * delta_t;
-    double a0t = alpha0 + ot;           // alpha0 + omega*(t - t0)
-    double pi2 = PI2_GAL;
-    double s3  = SQRT3_GAL;
-
-    double result = (-105.0 * (
-        -12484.0
-        + 1840.0  * cos(2*theta_N - pi2)
-        + 148.0   * cos(4*theta_N - pi2)
-        + 486.0   * cos(4*beta0 - 4*phi_N)
-        + 81.0    * cos(4*beta0 - 4*theta_N - pi2 - 4*phi_N)
-        - 324.0   * cos(4*beta0 - 2*theta_N - pi2 - 4*phi_N)
-        - 324.0   * cos(4*beta0 + 2*theta_N - pi2 - 4*phi_N)
-        + 81.0    * cos(4*(beta0 + theta_N - pi2 - phi_N))
-        + 324.0   * cos(4*(a0t - beta0))
-        + 630.0   * cos(4*(a0t - beta0 - theta_N - pi2))
-        + 630.0   * cos(4*(a0t - beta0 + theta_N - pi2))
-        - 5328.0  * cos(2*(a0t - phi_N))
-        - 108.0   * cos(4*(a0t - phi_N))
-        + 72.0    * cos(2*(a0t - 2*theta_N - pi2 - phi_N))
-        + 2592.0  * cos(2*(a0t - theta_N - pi2 - phi_N))
-        - 18.0    * cos(4*(a0t - theta_N - pi2 - phi_N))
-        + 2592.0  * cos(2*(a0t + theta_N - pi2 - phi_N))
-        - 18.0    * cos(4*(a0t + theta_N - pi2 - phi_N))
-        + 72.0    * cos(2*(a0t + 2*theta_N - pi2 - phi_N))
-        + 648.0   * cos(2*(a0t - 2*beta0 + phi_N))
-        - 756.0   * cos(2*(a0t - 2*beta0 - 2*theta_N - pi2 + phi_N))
-        + 432.0   * cos(2*(a0t - 2*beta0 - theta_N - pi2 + phi_N))
-        + 432.0   * cos(2*(a0t - 2*beta0 + theta_N - pi2 + phi_N))
-        - 756.0   * cos(2*(a0t - 2*beta0 + 2*theta_N - pi2 + phi_N))
-        + 360.0   * cos(4*alpha0 - 4*beta0 - 2*theta_N - pi2 + 4*ot)
-        + 360.0   * cos(4*alpha0 - 4*beta0 + 2*theta_N - pi2 + 4*ot)
-        + 72.0    * cos(4*alpha0 - 2*theta_N - pi2 - 4*phi_N + 4*ot)
-        + 72.0    * cos(4*alpha0 + 2*theta_N - pi2 - 4*phi_N + 4*ot)
-        + 72.0    * cos(6*alpha0 - 4*beta0 - 2*phi_N + 6*ot)
-        - 84.0    * cos(6*alpha0 - 4*beta0 - 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        + 48.0    * cos(6*alpha0 - 4*beta0 + 2*theta_N - pi2 - 2*phi_N + 6*ot)
-        - 84.0    * cos(6*alpha0 - 4*beta0 + 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        - 4.0     * cos(8*alpha0 - 4*beta0 - 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        - 4.0     * cos(8*alpha0 - 4*beta0 + 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        + 1.0     * cos(8*alpha0 - 4*beta0 + 4*theta_N - pi2 - 4*phi_N + 8*ot)
-        + 48.0    * cos(6*alpha0 - 2*(2*beta0 + theta_N - pi2 + phi_N - 3*ot))
-        + 6.0     * cos(8*alpha0 - 4*(beta0 + phi_N - 2*ot))
-        + 1.0     * cos(8*alpha0 - 4*(beta0 + theta_N - pi2 + phi_N - 2*ot))
-        + 80.0    * s3 * sin(a0t - 4*theta_N - pi2 - phi_N)
-        - 3488.0  * s3 * sin(a0t - 2*theta_N - pi2 - phi_N)
-        + 3488.0  * s3 * sin(a0t + 2*theta_N - pi2 - phi_N)
-        - 80.0    * s3 * sin(a0t + 4*theta_N - pi2 - phi_N)
-        + 216.0   * s3 * sin(a0t - 4*beta0 - 4*theta_N - pi2 + 3*phi_N)
-        - 432.0   * s3 * sin(a0t - 4*beta0 - 2*theta_N - pi2 + 3*phi_N)
-        + 432.0   * s3 * sin(a0t - 4*beta0 + 2*theta_N - pi2 + 3*phi_N)
-        - 216.0   * s3 * sin(a0t - 4*beta0 + 4*theta_N - pi2 + 3*phi_N)
-        + 48.0    * s3 * sin(3*a0t - 4*theta_N - pi2 - 3*phi_N - 2*ot)
-        - 96.0    * s3 * sin(3*a0t - 2*theta_N - pi2 - 3*phi_N - 2*ot)
-        + 96.0    * s3 * sin(3*a0t + 2*theta_N - pi2 - 3*phi_N - 2*ot)
-        - 48.0    * s3 * sin(3*a0t + 4*theta_N - pi2 - 3*phi_N - 2*ot)
-        - 504.0   * s3 * sin(3*a0t - 4*beta0 - 4*theta_N - pi2 + phi_N - 2*ot)
-        - 144.0   * s3 * sin(3*a0t - 4*beta0 - 2*theta_N - pi2 + phi_N - 2*ot)
-        + 144.0   * s3 * sin(3*a0t - 4*beta0 + 2*theta_N - pi2 + phi_N - 2*ot)
-        + 504.0   * s3 * sin(3*a0t - 4*beta0 + 4*theta_N - pi2 + phi_N - 2*ot)
-        + 168.0   * s3 * sin(5*a0t - 4*beta0 - 4*theta_N - pi2 - phi_N - 4*ot)
-        + 48.0    * s3 * sin(5*a0t - 4*beta0 - 2*theta_N - pi2 - phi_N - 4*ot)
-        - 48.0    * s3 * sin(5*a0t - 4*beta0 + 2*theta_N - pi2 - phi_N - 4*ot)
-        - 168.0   * s3 * sin(5*a0t - 4*beta0 + 4*theta_N - pi2 - phi_N - 4*ot)
-        - 8.0     * s3 * sin(7*a0t - 4*beta0 - 4*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 16.0    * s3 * sin(7*a0t - 4*beta0 - 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        - 16.0    * s3 * sin(7*a0t - 4*beta0 + 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 8.0     * s3 * sin(7*a0t - 4*beta0 + 4*theta_N - pi2 - 3*phi_N - 6*ot)
-    )) / 262144.0;
-
-    return result;
+    double a = alpha0 + OMEGA_LISA * delta_t;
+    double b = beta0, th = theta_N, ph = phi_N;
+    double r = 0.0;
+    r += (9363.0 / 8192.0);
+    r += (-345.0 / 2048.0) * cos(2*th);
+    r += (-111.0 / 8192.0) * cos(4*th);
+    r += (-243.0 / 32768.0) * cos(4*b - 4*th - 4*ph);
+    r += (243.0 / 8192.0) * cos(4*b - 2*th - 4*ph);
+    r += (-729.0 / 16384.0) * cos(4*b - 4*ph);
+    r += (243.0 / 8192.0) * cos(4*b + 2*th - 4*ph);
+    r += (-243.0 / 32768.0) * cos(4*b + 4*th - 4*ph);
+    r += SQRT3_GAL * (-81.0 / 4096.0) * sin(a - 4*b - 4*th + 3*ph);
+    r += SQRT3_GAL * (81.0 / 2048.0) * sin(a - 4*b - 2*th + 3*ph);
+    r += SQRT3_GAL * (-81.0 / 2048.0) * sin(a - 4*b + 2*th + 3*ph);
+    r += SQRT3_GAL * (81.0 / 4096.0) * sin(a - 4*b + 4*th + 3*ph);
+    r += SQRT3_GAL * (-15.0 / 2048.0) * sin(a - 4*th - ph);
+    r += SQRT3_GAL * (327.0 / 1024.0) * sin(a - 2*th - ph);
+    r += SQRT3_GAL * (-327.0 / 1024.0) * sin(a + 2*th - ph);
+    r += SQRT3_GAL * (15.0 / 2048.0) * sin(a + 4*th - ph);
+    r += (567.0 / 8192.0) * cos(2*a - 4*b - 4*th + 2*ph);
+    r += (-81.0 / 2048.0) * cos(2*a - 4*b - 2*th + 2*ph);
+    r += (-243.0 / 4096.0) * cos(2*a - 4*b + 2*ph);
+    r += (-81.0 / 2048.0) * cos(2*a - 4*b + 2*th + 2*ph);
+    r += (567.0 / 8192.0) * cos(2*a - 4*b + 4*th + 2*ph);
+    r += (-27.0 / 4096.0) * cos(2*a - 4*th - 2*ph);
+    r += (-243.0 / 1024.0) * cos(2*a - 2*th - 2*ph);
+    r += (999.0 / 2048.0) * cos(2*a - 2*ph);
+    r += (-243.0 / 1024.0) * cos(2*a + 2*th - 2*ph);
+    r += (-27.0 / 4096.0) * cos(2*a + 4*th - 2*ph);
+    r += SQRT3_GAL * (189.0 / 4096.0) * sin(3*a - 4*b - 4*th + ph);
+    r += SQRT3_GAL * (27.0 / 2048.0) * sin(3*a - 4*b - 2*th + ph);
+    r += SQRT3_GAL * (-27.0 / 2048.0) * sin(3*a - 4*b + 2*th + ph);
+    r += SQRT3_GAL * (-189.0 / 4096.0) * sin(3*a - 4*b + 4*th + ph);
+    r += SQRT3_GAL * (-9.0 / 2048.0) * sin(3*a - 4*th - 3*ph);
+    r += SQRT3_GAL * (9.0 / 1024.0) * sin(3*a - 2*th - 3*ph);
+    r += SQRT3_GAL * (-9.0 / 1024.0) * sin(3*a + 2*th - 3*ph);
+    r += SQRT3_GAL * (9.0 / 2048.0) * sin(3*a + 4*th - 3*ph);
+    r += (-945.0 / 16384.0) * cos(4*a - 4*b - 4*th);
+    r += (-135.0 / 4096.0) * cos(4*a - 4*b - 2*th);
+    r += (-243.0 / 8192.0) * cos(4*a - 4*b);
+    r += (-135.0 / 4096.0) * cos(4*a - 4*b + 2*th);
+    r += (-945.0 / 16384.0) * cos(4*a - 4*b + 4*th);
+    r += (27.0 / 16384.0) * cos(4*a - 4*th - 4*ph);
+    r += (-27.0 / 4096.0) * cos(4*a - 2*th - 4*ph);
+    r += (81.0 / 8192.0) * cos(4*a - 4*ph);
+    r += (-27.0 / 4096.0) * cos(4*a + 2*th - 4*ph);
+    r += (27.0 / 16384.0) * cos(4*a + 4*th - 4*ph);
+    r += SQRT3_GAL * (-63.0 / 4096.0) * sin(5*a - 4*b - 4*th - ph);
+    r += SQRT3_GAL * (-9.0 / 2048.0) * sin(5*a - 4*b - 2*th - ph);
+    r += SQRT3_GAL * (9.0 / 2048.0) * sin(5*a - 4*b + 2*th - ph);
+    r += SQRT3_GAL * (63.0 / 4096.0) * sin(5*a - 4*b + 4*th - ph);
+    r += (63.0 / 8192.0) * cos(6*a - 4*b - 4*th - 2*ph);
+    r += (-9.0 / 2048.0) * cos(6*a - 4*b - 2*th - 2*ph);
+    r += (-27.0 / 4096.0) * cos(6*a - 4*b - 2*ph);
+    r += (-9.0 / 2048.0) * cos(6*a - 4*b + 2*th - 2*ph);
+    r += (63.0 / 8192.0) * cos(6*a - 4*b + 4*th - 2*ph);
+    r += SQRT3_GAL * (3.0 / 4096.0) * sin(7*a - 4*b - 4*th - 3*ph);
+    r += SQRT3_GAL * (-3.0 / 2048.0) * sin(7*a - 4*b - 2*th - 3*ph);
+    r += SQRT3_GAL * (3.0 / 2048.0) * sin(7*a - 4*b + 2*th - 3*ph);
+    r += SQRT3_GAL * (-3.0 / 4096.0) * sin(7*a - 4*b + 4*th - 3*ph);
+    r += (-3.0 / 32768.0) * cos(8*a - 4*b - 4*th - 4*ph);
+    r += (3.0 / 8192.0) * cos(8*a - 4*b - 2*th - 4*ph);
+    r += (-9.0 / 16384.0) * cos(8*a - 4*b - 4*ph);
+    r += (3.0 / 8192.0) * cos(8*a - 4*b + 2*th - 4*ph);
+    r += (-3.0 / 32768.0) * cos(8*a - 4*b + 4*th - 4*ph);
+    return GAL_RESPONSE_K * r;
 }
-
-// ----------------------------------------------------------------------------
 
 CUDA_DEVICE
 double galaxy_XY(double alpha0, double beta0, double theta_N, double phi_N, double delta_t)
 {
-    double ot  = OMEGA_LISA * delta_t;
-    double a0t = alpha0 + ot; // alpha0 + omega*(t - t0)
-    double pi2 = PI2_GAL;
-    double s3  = SQRT3_GAL;
-
-    double result = (105.0 * (
-        -12484.0
-        + 1840.0  * cos(2*theta_N - pi2)
-        + 148.0   * cos(4*theta_N - pi2)
-        + 486.0   * cos(4*beta0 - 4*phi_N)
-        + 81.0    * cos(4*beta0 - 4*theta_N - pi2 - 4*phi_N)
-        - 324.0   * cos(4*beta0 - 2*theta_N - pi2 - 4*phi_N)
-        - 324.0   * cos(4*beta0 + 2*theta_N - pi2 - 4*phi_N)
-        + 81.0    * cos(4*(beta0 + theta_N - pi2 - phi_N))
-        + 324.0   * cos(4*(a0t - beta0))
-        + 630.0   * cos(4*(a0t - beta0 - theta_N - pi2))
-        + 630.0   * cos(4*(a0t - beta0 + theta_N - pi2))
-        - 5328.0  * cos(2*(a0t - phi_N))
-        - 108.0   * cos(4*(a0t - phi_N))
-        + 72.0    * cos(2*(a0t - 2*theta_N - pi2 - phi_N))
-        + 2592.0  * cos(2*(a0t - theta_N - pi2 - phi_N))
-        - 18.0    * cos(4*(a0t - theta_N - pi2 - phi_N))
-        + 2592.0  * cos(2*(a0t + theta_N - pi2 - phi_N))
-        - 18.0    * cos(4*(a0t + theta_N - pi2 - phi_N))
-        + 72.0    * cos(2*(a0t + 2*theta_N - pi2 - phi_N))
-        + 648.0   * cos(2*(a0t - 2*beta0 + phi_N))
-        - 756.0   * cos(2*(a0t - 2*beta0 - 2*theta_N - pi2 + phi_N))
-        + 432.0   * cos(2*(a0t - 2*beta0 - theta_N - pi2 + phi_N))
-        + 432.0   * cos(2*(a0t - 2*beta0 + theta_N - pi2 + phi_N))
-        - 756.0   * cos(2*(a0t - 2*beta0 + 2*theta_N - pi2 + phi_N))
-        - 648.0   * cos(a0t - 4*beta0 - 4*theta_N - pi2 + 3*phi_N)
-        + 1296.0  * cos(a0t - 4*beta0 - 2*theta_N - pi2 + 3*phi_N)
-        - 1296.0  * cos(a0t - 4*beta0 + 2*theta_N - pi2 + 3*phi_N)
-        + 648.0   * cos(a0t - 4*beta0 + 4*theta_N - pi2 + 3*phi_N)
-        + 1512.0  * cos(3*a0t - 4*beta0 - 4*theta_N - pi2 + phi_N - 2*ot)
-        + 432.0   * cos(3*a0t - 4*beta0 - 2*theta_N - pi2 + phi_N - 2*ot)
-        - 432.0   * cos(3*a0t - 4*beta0 + 2*theta_N - pi2 + phi_N - 2*ot)
-        - 1512.0  * cos(3*a0t - 4*beta0 + 4*theta_N - pi2 + phi_N - 2*ot)
-        + 360.0   * cos(4*alpha0 - 4*beta0 - 2*theta_N - pi2 + 4*ot)
-        + 360.0   * cos(4*alpha0 - 4*beta0 + 2*theta_N - pi2 + 4*ot)
-        + 72.0    * cos(4*alpha0 - 2*theta_N - pi2 - 4*phi_N + 4*ot)
-        + 72.0    * cos(4*alpha0 + 2*theta_N - pi2 - 4*phi_N + 4*ot)
-        - 504.0   * cos(5*a0t - 4*beta0 - 4*theta_N - pi2 - phi_N - 4*ot)
-        - 144.0   * cos(5*a0t - 4*beta0 - 2*theta_N - pi2 - phi_N - 4*ot)
-        + 144.0   * cos(5*a0t - 4*beta0 + 2*theta_N - pi2 - phi_N - 4*ot)
-        + 504.0   * cos(5*a0t - 4*beta0 + 4*theta_N - pi2 - phi_N - 4*ot)
-        + 72.0    * cos(6*alpha0 - 4*beta0 - 2*phi_N + 6*ot)
-        - 84.0    * cos(6*alpha0 - 4*beta0 - 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        + 48.0    * cos(6*alpha0 - 4*beta0 + 2*theta_N - pi2 - 2*phi_N + 6*ot)
-        - 84.0    * cos(6*alpha0 - 4*beta0 + 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        + 24.0    * cos(7*a0t - 4*beta0 - 4*theta_N - pi2 - 3*phi_N - 6*ot)
-        - 48.0    * cos(7*a0t - 4*beta0 - 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 48.0    * cos(7*a0t - 4*beta0 + 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        - 24.0    * cos(7*a0t - 4*beta0 + 4*theta_N - pi2 - 3*phi_N - 6*ot)
-        - 4.0     * cos(8*alpha0 - 4*beta0 - 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        - 4.0     * cos(8*alpha0 - 4*beta0 + 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        + 1.0     * cos(8*alpha0 - 4*beta0 + 4*theta_N - pi2 - 4*phi_N + 8*ot)
-        + 48.0    * cos(6*alpha0 - 2*(2*beta0 + theta_N - pi2 + phi_N - 3*ot))
-        + 6.0     * cos(8*alpha0 - 4*(beta0 + phi_N - 2*ot))
-        + 1.0     * cos(8*alpha0 - 4*(beta0 + theta_N - pi2 + phi_N - 2*ot))
-        - 486.0   * s3 * sin(4*beta0 - 4*phi_N)
-        - 81.0    * s3 * sin(4*beta0 - 4*theta_N - pi2 - 4*phi_N)
-        + 324.0   * s3 * sin(4*beta0 - 2*theta_N - pi2 - 4*phi_N)
-        + 324.0   * s3 * sin(4*beta0 + 2*theta_N - pi2 - 4*phi_N)
-        - 81.0    * s3 * sin(4*(beta0 + theta_N - pi2 - phi_N))
-        + 324.0   * s3 * sin(4*(a0t - beta0))
-        + 630.0   * s3 * sin(4*(a0t - beta0 - theta_N - pi2))
-        + 630.0   * s3 * sin(4*(a0t - beta0 + theta_N - pi2))
-        + 80.0    * s3 * sin(a0t - 4*theta_N - pi2 - phi_N)
-        - 3488.0  * s3 * sin(a0t - 2*theta_N - pi2 - phi_N)
-        + 3488.0  * s3 * sin(a0t + 2*theta_N - pi2 - phi_N)
-        - 80.0    * s3 * sin(a0t + 4*theta_N - pi2 - phi_N)
-        + 648.0   * s3 * sin(2*(a0t - 2*beta0 + phi_N))
-        - 756.0   * s3 * sin(2*(a0t - 2*beta0 - 2*theta_N - pi2 + phi_N))
-        + 432.0   * s3 * sin(2*(a0t - 2*beta0 - theta_N - pi2 + phi_N))
-        + 432.0   * s3 * sin(2*(a0t - 2*beta0 + theta_N - pi2 + phi_N))
-        - 756.0   * s3 * sin(2*(a0t - 2*beta0 + 2*theta_N - pi2 + phi_N))
-        + 216.0   * s3 * sin(a0t - 4*beta0 - 4*theta_N - pi2 + 3*phi_N)
-        - 432.0   * s3 * sin(a0t - 4*beta0 - 2*theta_N - pi2 + 3*phi_N)
-        + 432.0   * s3 * sin(a0t - 4*beta0 + 2*theta_N - pi2 + 3*phi_N)
-        - 216.0   * s3 * sin(a0t - 4*beta0 + 4*theta_N - pi2 + 3*phi_N)
-        + 48.0    * s3 * sin(3*a0t - 4*theta_N - pi2 - 3*phi_N - 2*ot)
-        - 96.0    * s3 * sin(3*a0t - 2*theta_N - pi2 - 3*phi_N - 2*ot)
-        + 96.0    * s3 * sin(3*a0t + 2*theta_N - pi2 - 3*phi_N - 2*ot)
-        - 48.0    * s3 * sin(3*a0t + 4*theta_N - pi2 - 3*phi_N - 2*ot)
-        - 504.0   * s3 * sin(3*a0t - 4*beta0 - 4*theta_N - pi2 + phi_N - 2*ot)
-        - 144.0   * s3 * sin(3*a0t - 4*beta0 - 2*theta_N - pi2 + phi_N - 2*ot)
-        + 144.0   * s3 * sin(3*a0t - 4*beta0 + 2*theta_N - pi2 + phi_N - 2*ot)
-        + 504.0   * s3 * sin(3*a0t - 4*beta0 + 4*theta_N - pi2 + phi_N - 2*ot)
-        + 360.0   * s3 * sin(4*alpha0 - 4*beta0 - 2*theta_N - pi2 + 4*ot)
-        + 360.0   * s3 * sin(4*alpha0 - 4*beta0 + 2*theta_N - pi2 + 4*ot)
-        + 168.0   * s3 * sin(5*a0t - 4*beta0 - 4*theta_N - pi2 - phi_N - 4*ot)
-        + 48.0    * s3 * sin(5*a0t - 4*beta0 - 2*theta_N - pi2 - phi_N - 4*ot)
-        - 48.0    * s3 * sin(5*a0t - 4*beta0 + 2*theta_N - pi2 - phi_N - 4*ot)
-        - 168.0   * s3 * sin(5*a0t - 4*beta0 + 4*theta_N - pi2 - phi_N - 4*ot)
-        + 72.0    * s3 * sin(6*alpha0 - 4*beta0 - 2*phi_N + 6*ot)
-        - 84.0    * s3 * sin(6*alpha0 - 4*beta0 - 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        + 48.0    * s3 * sin(6*alpha0 - 4*beta0 + 2*theta_N - pi2 - 2*phi_N + 6*ot)
-        - 84.0    * s3 * sin(6*alpha0 - 4*beta0 + 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        - 8.0     * s3 * sin(7*a0t - 4*beta0 - 4*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 16.0    * s3 * sin(7*a0t - 4*beta0 - 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        - 16.0    * s3 * sin(7*a0t - 4*beta0 + 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 8.0     * s3 * sin(7*a0t - 4*beta0 + 4*theta_N - pi2 - 3*phi_N - 6*ot)
-        - 4.0     * s3 * sin(8*alpha0 - 4*beta0 - 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        - 4.0     * s3 * sin(8*alpha0 - 4*beta0 + 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        + 1.0     * s3 * sin(8*alpha0 - 4*beta0 + 4*theta_N - pi2 - 4*phi_N + 8*ot)
-        + 48.0    * s3 * sin(6*alpha0 - 2*(2*beta0 + theta_N - pi2 + phi_N - 3*ot))
-        + 6.0     * s3 * sin(8*alpha0 - 4*(beta0 + phi_N - 2*ot))
-        + 1.0     * s3 * sin(8*alpha0 - 4*(beta0 + theta_N - pi2 + phi_N - 2*ot))
-    )) / 524288.0;
-
-    return result;
+    double a = alpha0 + OMEGA_LISA * delta_t;
+    double b = beta0, th = theta_N, ph = phi_N;
+    double r = 0.0;
+    r += (-9363.0 / 16384.0);
+    r += (345.0 / 4096.0) * cos(2*th);
+    r += (111.0 / 16384.0) * cos(4*th);
+    r += (243.0 / 65536.0) * cos(4*b - 4*th - 4*ph);
+    r += SQRT3_GAL * (-243.0 / 65536.0) * sin(4*b - 4*th - 4*ph);
+    r += (-243.0 / 16384.0) * cos(4*b - 2*th - 4*ph);
+    r += SQRT3_GAL * (243.0 / 16384.0) * sin(4*b - 2*th - 4*ph);
+    r += (729.0 / 32768.0) * cos(4*b - 4*ph);
+    r += SQRT3_GAL * (-729.0 / 32768.0) * sin(4*b - 4*ph);
+    r += (-243.0 / 16384.0) * cos(4*b + 2*th - 4*ph);
+    r += SQRT3_GAL * (243.0 / 16384.0) * sin(4*b + 2*th - 4*ph);
+    r += (243.0 / 65536.0) * cos(4*b + 4*th - 4*ph);
+    r += SQRT3_GAL * (-243.0 / 65536.0) * sin(4*b + 4*th - 4*ph);
+    r += (-243.0 / 8192.0) * cos(a - 4*b - 4*th + 3*ph);
+    r += SQRT3_GAL * (81.0 / 8192.0) * sin(a - 4*b - 4*th + 3*ph);
+    r += (243.0 / 4096.0) * cos(a - 4*b - 2*th + 3*ph);
+    r += SQRT3_GAL * (-81.0 / 4096.0) * sin(a - 4*b - 2*th + 3*ph);
+    r += (-243.0 / 4096.0) * cos(a - 4*b + 2*th + 3*ph);
+    r += SQRT3_GAL * (81.0 / 4096.0) * sin(a - 4*b + 2*th + 3*ph);
+    r += (243.0 / 8192.0) * cos(a - 4*b + 4*th + 3*ph);
+    r += SQRT3_GAL * (-81.0 / 8192.0) * sin(a - 4*b + 4*th + 3*ph);
+    r += SQRT3_GAL * (15.0 / 4096.0) * sin(a - 4*th - ph);
+    r += SQRT3_GAL * (-327.0 / 2048.0) * sin(a - 2*th - ph);
+    r += SQRT3_GAL * (327.0 / 2048.0) * sin(a + 2*th - ph);
+    r += SQRT3_GAL * (-15.0 / 4096.0) * sin(a + 4*th - ph);
+    r += (-567.0 / 16384.0) * cos(2*a - 4*b - 4*th + 2*ph);
+    r += SQRT3_GAL * (-567.0 / 16384.0) * sin(2*a - 4*b - 4*th + 2*ph);
+    r += (81.0 / 4096.0) * cos(2*a - 4*b - 2*th + 2*ph);
+    r += SQRT3_GAL * (81.0 / 4096.0) * sin(2*a - 4*b - 2*th + 2*ph);
+    r += (243.0 / 8192.0) * cos(2*a - 4*b + 2*ph);
+    r += SQRT3_GAL * (243.0 / 8192.0) * sin(2*a - 4*b + 2*ph);
+    r += (81.0 / 4096.0) * cos(2*a - 4*b + 2*th + 2*ph);
+    r += SQRT3_GAL * (81.0 / 4096.0) * sin(2*a - 4*b + 2*th + 2*ph);
+    r += (-567.0 / 16384.0) * cos(2*a - 4*b + 4*th + 2*ph);
+    r += SQRT3_GAL * (-567.0 / 16384.0) * sin(2*a - 4*b + 4*th + 2*ph);
+    r += (27.0 / 8192.0) * cos(2*a - 4*th - 2*ph);
+    r += (243.0 / 2048.0) * cos(2*a - 2*th - 2*ph);
+    r += (-999.0 / 4096.0) * cos(2*a - 2*ph);
+    r += (243.0 / 2048.0) * cos(2*a + 2*th - 2*ph);
+    r += (27.0 / 8192.0) * cos(2*a + 4*th - 2*ph);
+    r += (567.0 / 8192.0) * cos(3*a - 4*b - 4*th + ph);
+    r += SQRT3_GAL * (-189.0 / 8192.0) * sin(3*a - 4*b - 4*th + ph);
+    r += (81.0 / 4096.0) * cos(3*a - 4*b - 2*th + ph);
+    r += SQRT3_GAL * (-27.0 / 4096.0) * sin(3*a - 4*b - 2*th + ph);
+    r += (-81.0 / 4096.0) * cos(3*a - 4*b + 2*th + ph);
+    r += SQRT3_GAL * (27.0 / 4096.0) * sin(3*a - 4*b + 2*th + ph);
+    r += (-567.0 / 8192.0) * cos(3*a - 4*b + 4*th + ph);
+    r += SQRT3_GAL * (189.0 / 8192.0) * sin(3*a - 4*b + 4*th + ph);
+    r += SQRT3_GAL * (9.0 / 4096.0) * sin(3*a - 4*th - 3*ph);
+    r += SQRT3_GAL * (-9.0 / 2048.0) * sin(3*a - 2*th - 3*ph);
+    r += SQRT3_GAL * (9.0 / 2048.0) * sin(3*a + 2*th - 3*ph);
+    r += SQRT3_GAL * (-9.0 / 4096.0) * sin(3*a + 4*th - 3*ph);
+    r += (945.0 / 32768.0) * cos(4*a - 4*b - 4*th);
+    r += SQRT3_GAL * (945.0 / 32768.0) * sin(4*a - 4*b - 4*th);
+    r += (135.0 / 8192.0) * cos(4*a - 4*b - 2*th);
+    r += SQRT3_GAL * (135.0 / 8192.0) * sin(4*a - 4*b - 2*th);
+    r += (243.0 / 16384.0) * cos(4*a - 4*b);
+    r += SQRT3_GAL * (243.0 / 16384.0) * sin(4*a - 4*b);
+    r += (135.0 / 8192.0) * cos(4*a - 4*b + 2*th);
+    r += SQRT3_GAL * (135.0 / 8192.0) * sin(4*a - 4*b + 2*th);
+    r += (945.0 / 32768.0) * cos(4*a - 4*b + 4*th);
+    r += SQRT3_GAL * (945.0 / 32768.0) * sin(4*a - 4*b + 4*th);
+    r += (-27.0 / 32768.0) * cos(4*a - 4*th - 4*ph);
+    r += (27.0 / 8192.0) * cos(4*a - 2*th - 4*ph);
+    r += (-81.0 / 16384.0) * cos(4*a - 4*ph);
+    r += (27.0 / 8192.0) * cos(4*a + 2*th - 4*ph);
+    r += (-27.0 / 32768.0) * cos(4*a + 4*th - 4*ph);
+    r += (-189.0 / 8192.0) * cos(5*a - 4*b - 4*th - ph);
+    r += SQRT3_GAL * (63.0 / 8192.0) * sin(5*a - 4*b - 4*th - ph);
+    r += (-27.0 / 4096.0) * cos(5*a - 4*b - 2*th - ph);
+    r += SQRT3_GAL * (9.0 / 4096.0) * sin(5*a - 4*b - 2*th - ph);
+    r += (27.0 / 4096.0) * cos(5*a - 4*b + 2*th - ph);
+    r += SQRT3_GAL * (-9.0 / 4096.0) * sin(5*a - 4*b + 2*th - ph);
+    r += (189.0 / 8192.0) * cos(5*a - 4*b + 4*th - ph);
+    r += SQRT3_GAL * (-63.0 / 8192.0) * sin(5*a - 4*b + 4*th - ph);
+    r += (-63.0 / 16384.0) * cos(6*a - 4*b - 4*th - 2*ph);
+    r += SQRT3_GAL * (-63.0 / 16384.0) * sin(6*a - 4*b - 4*th - 2*ph);
+    r += (9.0 / 4096.0) * cos(6*a - 4*b - 2*th - 2*ph);
+    r += SQRT3_GAL * (9.0 / 4096.0) * sin(6*a - 4*b - 2*th - 2*ph);
+    r += (27.0 / 8192.0) * cos(6*a - 4*b - 2*ph);
+    r += SQRT3_GAL * (27.0 / 8192.0) * sin(6*a - 4*b - 2*ph);
+    r += (9.0 / 4096.0) * cos(6*a - 4*b + 2*th - 2*ph);
+    r += SQRT3_GAL * (9.0 / 4096.0) * sin(6*a - 4*b + 2*th - 2*ph);
+    r += (-63.0 / 16384.0) * cos(6*a - 4*b + 4*th - 2*ph);
+    r += SQRT3_GAL * (-63.0 / 16384.0) * sin(6*a - 4*b + 4*th - 2*ph);
+    r += (9.0 / 8192.0) * cos(7*a - 4*b - 4*th - 3*ph);
+    r += SQRT3_GAL * (-3.0 / 8192.0) * sin(7*a - 4*b - 4*th - 3*ph);
+    r += (-9.0 / 4096.0) * cos(7*a - 4*b - 2*th - 3*ph);
+    r += SQRT3_GAL * (3.0 / 4096.0) * sin(7*a - 4*b - 2*th - 3*ph);
+    r += (9.0 / 4096.0) * cos(7*a - 4*b + 2*th - 3*ph);
+    r += SQRT3_GAL * (-3.0 / 4096.0) * sin(7*a - 4*b + 2*th - 3*ph);
+    r += (-9.0 / 8192.0) * cos(7*a - 4*b + 4*th - 3*ph);
+    r += SQRT3_GAL * (3.0 / 8192.0) * sin(7*a - 4*b + 4*th - 3*ph);
+    r += (3.0 / 65536.0) * cos(8*a - 4*b - 4*th - 4*ph);
+    r += SQRT3_GAL * (3.0 / 65536.0) * sin(8*a - 4*b - 4*th - 4*ph);
+    r += (-3.0 / 16384.0) * cos(8*a - 4*b - 2*th - 4*ph);
+    r += SQRT3_GAL * (-3.0 / 16384.0) * sin(8*a - 4*b - 2*th - 4*ph);
+    r += (9.0 / 32768.0) * cos(8*a - 4*b - 4*ph);
+    r += SQRT3_GAL * (9.0 / 32768.0) * sin(8*a - 4*b - 4*ph);
+    r += (-3.0 / 16384.0) * cos(8*a - 4*b + 2*th - 4*ph);
+    r += SQRT3_GAL * (-3.0 / 16384.0) * sin(8*a - 4*b + 2*th - 4*ph);
+    r += (3.0 / 65536.0) * cos(8*a - 4*b + 4*th - 4*ph);
+    r += SQRT3_GAL * (3.0 / 65536.0) * sin(8*a - 4*b + 4*th - 4*ph);
+    return GAL_RESPONSE_K * r;
 }
-
-// ----------------------------------------------------------------------------
-
-CUDA_DEVICE
-double galaxy_YY(double alpha0, double beta0, double theta_N, double phi_N, double delta_t)
-{
-    double ot  = OMEGA_LISA * delta_t;
-    double a0t = alpha0 + ot; // alpha0 + omega*(t - t0)
-    double pi2 = PI2_GAL;
-    double s3  = SQRT3_GAL;
-
-    double result = (105.0 * (
-        24968.0
-        - 3680.0  * cos(2*theta_N - pi2)
-        - 296.0   * cos(4*theta_N - pi2)
-        + 486.0   * cos(4*beta0 - 4*phi_N)
-        + 81.0    * cos(4*beta0 - 4*theta_N - pi2 - 4*phi_N)
-        - 324.0   * cos(4*beta0 - 2*theta_N - pi2 - 4*phi_N)
-        - 324.0   * cos(4*beta0 + 2*theta_N - pi2 - 4*phi_N)
-        + 81.0    * cos(4*(beta0 + theta_N - pi2 - phi_N))
-        + 324.0   * cos(4*(a0t - beta0))
-        + 630.0   * cos(4*(a0t - beta0 - theta_N - pi2))
-        + 630.0   * cos(4*(a0t - beta0 + theta_N - pi2))
-        + 10656.0 * cos(2*(a0t - phi_N))
-        + 216.0   * cos(4*(a0t - phi_N))
-        - 144.0   * cos(2*(a0t - 2*theta_N - pi2 - phi_N))
-        - 5184.0  * cos(2*(a0t - theta_N - pi2 - phi_N))
-        + 36.0    * cos(4*(a0t - theta_N - pi2 - phi_N))
-        - 5184.0  * cos(2*(a0t + theta_N - pi2 - phi_N))
-        + 36.0    * cos(4*(a0t + theta_N - pi2 - phi_N))
-        - 144.0   * cos(2*(a0t + 2*theta_N - pi2 - phi_N))
-        + 648.0   * cos(2*(a0t - 2*beta0 + phi_N))
-        - 756.0   * cos(2*(a0t - 2*beta0 - 2*theta_N - pi2 + phi_N))
-        + 432.0   * cos(2*(a0t - 2*beta0 - theta_N - pi2 + phi_N))
-        + 432.0   * cos(2*(a0t - 2*beta0 + theta_N - pi2 + phi_N))
-        - 756.0   * cos(2*(a0t - 2*beta0 + 2*theta_N - pi2 + phi_N))
-        + 648.0   * cos(a0t - 4*beta0 - 4*theta_N - pi2 + 3*phi_N)
-        - 1296.0  * cos(a0t - 4*beta0 - 2*theta_N - pi2 + 3*phi_N)
-        + 1296.0  * cos(a0t - 4*beta0 + 2*theta_N - pi2 + 3*phi_N)
-        - 648.0   * cos(a0t - 4*beta0 + 4*theta_N - pi2 + 3*phi_N)
-        - 1512.0  * cos(3*a0t - 4*beta0 - 4*theta_N - pi2 + phi_N - 2*ot)
-        - 432.0   * cos(3*a0t - 4*beta0 - 2*theta_N - pi2 + phi_N - 2*ot)
-        + 432.0   * cos(3*a0t - 4*beta0 + 2*theta_N - pi2 + phi_N - 2*ot)
-        + 1512.0  * cos(3*a0t - 4*beta0 + 4*theta_N - pi2 + phi_N - 2*ot)
-        + 360.0   * cos(4*alpha0 - 4*beta0 - 2*theta_N - pi2 + 4*ot)
-        + 360.0   * cos(4*alpha0 - 4*beta0 + 2*theta_N - pi2 + 4*ot)
-        - 144.0   * cos(4*alpha0 - 2*theta_N - pi2 - 4*phi_N + 4*ot)
-        - 144.0   * cos(4*alpha0 + 2*theta_N - pi2 - 4*phi_N + 4*ot)
-        + 504.0   * cos(5*a0t - 4*beta0 - 4*theta_N - pi2 - phi_N - 4*ot)
-        + 144.0   * cos(5*a0t - 4*beta0 - 2*theta_N - pi2 - phi_N - 4*ot)
-        - 144.0   * cos(5*a0t - 4*beta0 + 2*theta_N - pi2 - phi_N - 4*ot)
-        - 504.0   * cos(5*a0t - 4*beta0 + 4*theta_N - pi2 - phi_N - 4*ot)
-        + 72.0    * cos(6*alpha0 - 4*beta0 - 2*phi_N + 6*ot)
-        - 84.0    * cos(6*alpha0 - 4*beta0 - 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        + 48.0    * cos(6*alpha0 - 4*beta0 + 2*theta_N - pi2 - 2*phi_N + 6*ot)
-        - 84.0    * cos(6*alpha0 - 4*beta0 + 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        - 24.0    * cos(7*a0t - 4*beta0 - 4*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 48.0    * cos(7*a0t - 4*beta0 - 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        - 48.0    * cos(7*a0t - 4*beta0 + 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 24.0    * cos(7*a0t - 4*beta0 + 4*theta_N - pi2 - 3*phi_N - 6*ot)
-        - 4.0     * cos(8*alpha0 - 4*beta0 - 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        - 4.0     * cos(8*alpha0 - 4*beta0 + 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        + 1.0     * cos(8*alpha0 - 4*beta0 + 4*theta_N - pi2 - 4*phi_N + 8*ot)
-        + 48.0    * cos(6*alpha0 - 2*(2*beta0 + theta_N - pi2 + phi_N - 3*ot))
-        + 6.0     * cos(8*alpha0 - 4*(beta0 + phi_N - 2*ot))
-        + 1.0     * cos(8*alpha0 - 4*(beta0 + theta_N - pi2 + phi_N - 2*ot))
-        + 486.0   * s3 * sin(4*beta0 - 4*phi_N)
-        + 81.0    * s3 * sin(4*beta0 - 4*theta_N - pi2 - 4*phi_N)
-        - 324.0   * s3 * sin(4*beta0 - 2*theta_N - pi2 - 4*phi_N)
-        - 324.0   * s3 * sin(4*beta0 + 2*theta_N - pi2 - 4*phi_N)
-        + 81.0    * s3 * sin(4*(beta0 + theta_N - pi2 - phi_N))
-        - 324.0   * s3 * sin(4*(a0t - beta0))
-        - 630.0   * s3 * sin(4*(a0t - beta0 - theta_N - pi2))
-        - 630.0   * s3 * sin(4*(a0t - beta0 + theta_N - pi2))
-        - 160.0   * s3 * sin(a0t - 4*theta_N - pi2 - phi_N)
-        + 6976.0  * s3 * sin(a0t - 2*theta_N - pi2 - phi_N)
-        - 6976.0  * s3 * sin(a0t + 2*theta_N - pi2 - phi_N)
-        + 160.0   * s3 * sin(a0t + 4*theta_N - pi2 - phi_N)
-        - 648.0   * s3 * sin(2*(a0t - 2*beta0 + phi_N))
-        + 756.0   * s3 * sin(2*(a0t - 2*beta0 - 2*theta_N - pi2 + phi_N))
-        - 432.0   * s3 * sin(2*(a0t - 2*beta0 - theta_N - pi2 + phi_N))
-        - 432.0   * s3 * sin(2*(a0t - 2*beta0 + theta_N - pi2 + phi_N))
-        + 756.0   * s3 * sin(2*(a0t - 2*beta0 + 2*theta_N - pi2 + phi_N))
-        + 216.0   * s3 * sin(a0t - 4*beta0 - 4*theta_N - pi2 + 3*phi_N)
-        - 432.0   * s3 * sin(a0t - 4*beta0 - 2*theta_N - pi2 + 3*phi_N)
-        + 432.0   * s3 * sin(a0t - 4*beta0 + 2*theta_N - pi2 + 3*phi_N)
-        - 216.0   * s3 * sin(a0t - 4*beta0 + 4*theta_N - pi2 + 3*phi_N)
-        - 96.0    * s3 * sin(3*a0t - 4*theta_N - pi2 - 3*phi_N - 2*ot)
-        + 192.0   * s3 * sin(3*a0t - 2*theta_N - pi2 - 3*phi_N - 2*ot)
-        - 192.0   * s3 * sin(3*a0t + 2*theta_N - pi2 - 3*phi_N - 2*ot)
-        + 96.0    * s3 * sin(3*a0t + 4*theta_N - pi2 - 3*phi_N - 2*ot)
-        - 504.0   * s3 * sin(3*a0t - 4*beta0 - 4*theta_N - pi2 + phi_N - 2*ot)
-        - 144.0   * s3 * sin(3*a0t - 4*beta0 - 2*theta_N - pi2 + phi_N - 2*ot)
-        + 144.0   * s3 * sin(3*a0t - 4*beta0 + 2*theta_N - pi2 + phi_N - 2*ot)
-        + 504.0   * s3 * sin(3*a0t - 4*beta0 + 4*theta_N - pi2 + phi_N - 2*ot)
-        - 360.0   * s3 * sin(4*alpha0 - 4*beta0 - 2*theta_N - pi2 + 4*ot)
-        - 360.0   * s3 * sin(4*alpha0 - 4*beta0 + 2*theta_N - pi2 + 4*ot)
-        + 168.0   * s3 * sin(5*a0t - 4*beta0 - 4*theta_N - pi2 - phi_N - 4*ot)
-        + 48.0    * s3 * sin(5*a0t - 4*beta0 - 2*theta_N - pi2 - phi_N - 4*ot)
-        - 48.0    * s3 * sin(5*a0t - 4*beta0 + 2*theta_N - pi2 - phi_N - 4*ot)
-        - 168.0   * s3 * sin(5*a0t - 4*beta0 + 4*theta_N - pi2 - phi_N - 4*ot)
-        - 72.0    * s3 * sin(6*alpha0 - 4*beta0 - 2*phi_N + 6*ot)
-        + 84.0    * s3 * sin(6*alpha0 - 4*beta0 - 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        - 48.0    * s3 * sin(6*alpha0 - 4*beta0 + 2*theta_N - pi2 - 2*phi_N + 6*ot)
-        + 84.0    * s3 * sin(6*alpha0 - 4*beta0 + 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        - 8.0     * s3 * sin(7*a0t - 4*beta0 - 4*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 16.0    * s3 * sin(7*a0t - 4*beta0 - 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        - 16.0    * s3 * sin(7*a0t - 4*beta0 + 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 8.0     * s3 * sin(7*a0t - 4*beta0 + 4*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 4.0     * s3 * sin(8*alpha0 - 4*beta0 - 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        + 4.0     * s3 * sin(8*alpha0 - 4*beta0 + 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        - 1.0     * s3 * sin(8*alpha0 - 4*beta0 + 4*theta_N - pi2 - 4*phi_N + 8*ot)
-        - 48.0    * s3 * sin(6*alpha0 - 2*(2*beta0 + theta_N - pi2 + phi_N - 3*ot))
-        - 6.0     * s3 * sin(8*alpha0 - 4*(beta0 + phi_N - 2*ot))
-        - 1.0     * s3 * sin(8*alpha0 - 4*(beta0 + theta_N - pi2 + phi_N - 2*ot))
-    )) / 524288.0;
-
-    return result;
-}
-
-// ----------------------------------------------------------------------------
 
 CUDA_DEVICE
 double galaxy_XZ(double alpha0, double beta0, double theta_N, double phi_N, double delta_t)
 {
-    double ot  = OMEGA_LISA * delta_t;
-    double a0t = alpha0 + ot; // alpha0 + omega*(t - t0)
-    double pi2 = PI2_GAL;
-    double s3  = SQRT3_GAL;
-
-    double result = (105.0 * (
-        -12484.0
-        + 1840.0  * cos(2*theta_N - pi2)
-        + 148.0   * cos(4*theta_N - pi2)
-        + 486.0   * cos(4*beta0 - 4*phi_N)
-        + 81.0    * cos(4*beta0 - 4*theta_N - pi2 - 4*phi_N)
-        - 324.0   * cos(4*beta0 - 2*theta_N - pi2 - 4*phi_N)
-        - 324.0   * cos(4*beta0 + 2*theta_N - pi2 - 4*phi_N)
-        + 81.0    * cos(4*(beta0 + theta_N - pi2 - phi_N))
-        + 324.0   * cos(4*(a0t - beta0))
-        + 630.0   * cos(4*(a0t - beta0 - theta_N - pi2))
-        + 630.0   * cos(4*(a0t - beta0 + theta_N - pi2))
-        - 5328.0  * cos(2*(a0t - phi_N))
-        - 108.0   * cos(4*(a0t - phi_N))
-        + 72.0    * cos(2*(a0t - 2*theta_N - pi2 - phi_N))
-        + 2592.0  * cos(2*(a0t - theta_N - pi2 - phi_N))
-        - 18.0    * cos(4*(a0t - theta_N - pi2 - phi_N))
-        + 2592.0  * cos(2*(a0t + theta_N - pi2 - phi_N))
-        - 18.0    * cos(4*(a0t + theta_N - pi2 - phi_N))
-        + 72.0    * cos(2*(a0t + 2*theta_N - pi2 - phi_N))
-        + 648.0   * cos(2*(a0t - 2*beta0 + phi_N))
-        - 756.0   * cos(2*(a0t - 2*beta0 - 2*theta_N - pi2 + phi_N))
-        + 432.0   * cos(2*(a0t - 2*beta0 - theta_N - pi2 + phi_N))
-        + 432.0   * cos(2*(a0t - 2*beta0 + theta_N - pi2 + phi_N))
-        - 756.0   * cos(2*(a0t - 2*beta0 + 2*theta_N - pi2 + phi_N))
-        + 648.0   * cos(a0t - 4*beta0 - 4*theta_N - pi2 + 3*phi_N)
-        - 1296.0  * cos(a0t - 4*beta0 - 2*theta_N - pi2 + 3*phi_N)
-        + 1296.0  * cos(a0t - 4*beta0 + 2*theta_N - pi2 + 3*phi_N)
-        - 648.0   * cos(a0t - 4*beta0 + 4*theta_N - pi2 + 3*phi_N)
-        - 1512.0  * cos(3*a0t - 4*beta0 - 4*theta_N - pi2 + phi_N - 2*ot)
-        - 432.0   * cos(3*a0t - 4*beta0 - 2*theta_N - pi2 + phi_N - 2*ot)
-        + 432.0   * cos(3*a0t - 4*beta0 + 2*theta_N - pi2 + phi_N - 2*ot)
-        + 1512.0  * cos(3*a0t - 4*beta0 + 4*theta_N - pi2 + phi_N - 2*ot)
-        + 360.0   * cos(4*alpha0 - 4*beta0 - 2*theta_N - pi2 + 4*ot)
-        + 360.0   * cos(4*alpha0 - 4*beta0 + 2*theta_N - pi2 + 4*ot)
-        + 72.0    * cos(4*alpha0 - 2*theta_N - pi2 - 4*phi_N + 4*ot)
-        + 72.0    * cos(4*alpha0 + 2*theta_N - pi2 - 4*phi_N + 4*ot)
-        + 504.0   * cos(5*a0t - 4*beta0 - 4*theta_N - pi2 - phi_N - 4*ot)
-        + 144.0   * cos(5*a0t - 4*beta0 - 2*theta_N - pi2 - phi_N - 4*ot)
-        - 144.0   * cos(5*a0t - 4*beta0 + 2*theta_N - pi2 - phi_N - 4*ot)
-        - 504.0   * cos(5*a0t - 4*beta0 + 4*theta_N - pi2 - phi_N - 4*ot)
-        + 72.0    * cos(6*alpha0 - 4*beta0 - 2*phi_N + 6*ot)
-        - 84.0    * cos(6*alpha0 - 4*beta0 - 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        + 48.0    * cos(6*alpha0 - 4*beta0 + 2*theta_N - pi2 - 2*phi_N + 6*ot)
-        - 84.0    * cos(6*alpha0 - 4*beta0 + 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        - 24.0    * cos(7*a0t - 4*beta0 - 4*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 48.0    * cos(7*a0t - 4*beta0 - 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        - 48.0    * cos(7*a0t - 4*beta0 + 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 24.0    * cos(7*a0t - 4*beta0 + 4*theta_N - pi2 - 3*phi_N - 6*ot)
-        - 4.0     * cos(8*alpha0 - 4*beta0 - 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        - 4.0     * cos(8*alpha0 - 4*beta0 + 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        + 1.0     * cos(8*alpha0 - 4*beta0 + 4*theta_N - pi2 - 4*phi_N + 8*ot)
-        + 48.0    * cos(6*alpha0 - 2*(2*beta0 + theta_N - pi2 + phi_N - 3*ot))
-        + 6.0     * cos(8*alpha0 - 4*(beta0 + phi_N - 2*ot))
-        + 1.0     * cos(8*alpha0 - 4*(beta0 + theta_N - pi2 + phi_N - 2*ot))
-        + 486.0   * s3 * sin(4*beta0 - 4*phi_N)
-        + 81.0    * s3 * sin(4*beta0 - 4*theta_N - pi2 - 4*phi_N)
-        - 324.0   * s3 * sin(4*beta0 - 2*theta_N - pi2 - 4*phi_N)
-        - 324.0   * s3 * sin(4*beta0 + 2*theta_N - pi2 - 4*phi_N)
-        + 81.0    * s3 * sin(4*(beta0 + theta_N - pi2 - phi_N))
-        - 324.0   * s3 * sin(4*(a0t - beta0))
-        - 630.0   * s3 * sin(4*(a0t - beta0 - theta_N - pi2))
-        - 630.0   * s3 * sin(4*(a0t - beta0 + theta_N - pi2))
-        + 80.0    * s3 * sin(a0t - 4*theta_N - pi2 - phi_N)
-        - 3488.0  * s3 * sin(a0t - 2*theta_N - pi2 - phi_N)
-        + 3488.0  * s3 * sin(a0t + 2*theta_N - pi2 - phi_N)
-        - 80.0    * s3 * sin(a0t + 4*theta_N - pi2 - phi_N)
-        - 648.0   * s3 * sin(2*(a0t - 2*beta0 + phi_N))
-        + 756.0   * s3 * sin(2*(a0t - 2*beta0 - 2*theta_N - pi2 + phi_N))
-        - 432.0   * s3 * sin(2*(a0t - 2*beta0 - theta_N - pi2 + phi_N))
-        - 432.0   * s3 * sin(2*(a0t - 2*beta0 + theta_N - pi2 + phi_N))
-        + 756.0   * s3 * sin(2*(a0t - 2*beta0 + 2*theta_N - pi2 + phi_N))
-        + 216.0   * s3 * sin(a0t - 4*beta0 - 4*theta_N - pi2 + 3*phi_N)
-        - 432.0   * s3 * sin(a0t - 4*beta0 - 2*theta_N - pi2 + 3*phi_N)
-        + 432.0   * s3 * sin(a0t - 4*beta0 + 2*theta_N - pi2 + 3*phi_N)
-        - 216.0   * s3 * sin(a0t - 4*beta0 + 4*theta_N - pi2 + 3*phi_N)
-        + 48.0    * s3 * sin(3*a0t - 4*theta_N - pi2 - 3*phi_N - 2*ot)
-        - 96.0    * s3 * sin(3*a0t - 2*theta_N - pi2 - 3*phi_N - 2*ot)
-        + 96.0    * s3 * sin(3*a0t + 2*theta_N - pi2 - 3*phi_N - 2*ot)
-        - 48.0    * s3 * sin(3*a0t + 4*theta_N - pi2 - 3*phi_N - 2*ot)
-        - 504.0   * s3 * sin(3*a0t - 4*beta0 - 4*theta_N - pi2 + phi_N - 2*ot)
-        - 144.0   * s3 * sin(3*a0t - 4*beta0 - 2*theta_N - pi2 + phi_N - 2*ot)
-        + 144.0   * s3 * sin(3*a0t - 4*beta0 + 2*theta_N - pi2 + phi_N - 2*ot)
-        + 504.0   * s3 * sin(3*a0t - 4*beta0 + 4*theta_N - pi2 + phi_N - 2*ot)
-        - 360.0   * s3 * sin(4*alpha0 - 4*beta0 - 2*theta_N - pi2 + 4*ot)
-        - 360.0   * s3 * sin(4*alpha0 - 4*beta0 + 2*theta_N - pi2 + 4*ot)
-        + 168.0   * s3 * sin(5*a0t - 4*beta0 - 4*theta_N - pi2 - phi_N - 4*ot)
-        + 48.0    * s3 * sin(5*a0t - 4*beta0 - 2*theta_N - pi2 - phi_N - 4*ot)
-        - 48.0    * s3 * sin(5*a0t - 4*beta0 + 2*theta_N - pi2 - phi_N - 4*ot)
-        - 168.0   * s3 * sin(5*a0t - 4*beta0 + 4*theta_N - pi2 - phi_N - 4*ot)
-        - 72.0    * s3 * sin(6*alpha0 - 4*beta0 - 2*phi_N + 6*ot)
-        + 84.0    * s3 * sin(6*alpha0 - 4*beta0 - 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        - 48.0    * s3 * sin(6*alpha0 - 4*beta0 + 2*theta_N - pi2 - 2*phi_N + 6*ot)
-        + 84.0    * s3 * sin(6*alpha0 - 4*beta0 + 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        - 8.0     * s3 * sin(7*a0t - 4*beta0 - 4*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 16.0    * s3 * sin(7*a0t - 4*beta0 - 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        - 16.0    * s3 * sin(7*a0t - 4*beta0 + 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 8.0     * s3 * sin(7*a0t - 4*beta0 + 4*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 4.0     * s3 * sin(8*alpha0 - 4*beta0 - 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        + 4.0     * s3 * sin(8*alpha0 - 4*beta0 + 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        - 1.0     * s3 * sin(8*alpha0 - 4*beta0 + 4*theta_N - pi2 - 4*phi_N + 8*ot)
-        - 48.0    * s3 * sin(6*alpha0 - 2*(2*beta0 + theta_N - pi2 + phi_N - 3*ot))
-        - 6.0     * s3 * sin(8*alpha0 - 4*(beta0 + phi_N - 2*ot))
-        - 1.0     * s3 * sin(8*alpha0 - 4*(beta0 + theta_N - pi2 + phi_N - 2*ot))
-    )) / 524288.0;
-
-    return result;
+    double a = alpha0 + OMEGA_LISA * delta_t;
+    double b = beta0, th = theta_N, ph = phi_N;
+    double r = 0.0;
+    r += (-9363.0 / 16384.0);
+    r += (345.0 / 4096.0) * cos(2*th);
+    r += (111.0 / 16384.0) * cos(4*th);
+    r += (243.0 / 65536.0) * cos(4*b - 4*th - 4*ph);
+    r += SQRT3_GAL * (243.0 / 65536.0) * sin(4*b - 4*th - 4*ph);
+    r += (-243.0 / 16384.0) * cos(4*b - 2*th - 4*ph);
+    r += SQRT3_GAL * (-243.0 / 16384.0) * sin(4*b - 2*th - 4*ph);
+    r += (729.0 / 32768.0) * cos(4*b - 4*ph);
+    r += SQRT3_GAL * (729.0 / 32768.0) * sin(4*b - 4*ph);
+    r += (-243.0 / 16384.0) * cos(4*b + 2*th - 4*ph);
+    r += SQRT3_GAL * (-243.0 / 16384.0) * sin(4*b + 2*th - 4*ph);
+    r += (243.0 / 65536.0) * cos(4*b + 4*th - 4*ph);
+    r += SQRT3_GAL * (243.0 / 65536.0) * sin(4*b + 4*th - 4*ph);
+    r += (243.0 / 8192.0) * cos(a - 4*b - 4*th + 3*ph);
+    r += SQRT3_GAL * (81.0 / 8192.0) * sin(a - 4*b - 4*th + 3*ph);
+    r += (-243.0 / 4096.0) * cos(a - 4*b - 2*th + 3*ph);
+    r += SQRT3_GAL * (-81.0 / 4096.0) * sin(a - 4*b - 2*th + 3*ph);
+    r += (243.0 / 4096.0) * cos(a - 4*b + 2*th + 3*ph);
+    r += SQRT3_GAL * (81.0 / 4096.0) * sin(a - 4*b + 2*th + 3*ph);
+    r += (-243.0 / 8192.0) * cos(a - 4*b + 4*th + 3*ph);
+    r += SQRT3_GAL * (-81.0 / 8192.0) * sin(a - 4*b + 4*th + 3*ph);
+    r += SQRT3_GAL * (15.0 / 4096.0) * sin(a - 4*th - ph);
+    r += SQRT3_GAL * (-327.0 / 2048.0) * sin(a - 2*th - ph);
+    r += SQRT3_GAL * (327.0 / 2048.0) * sin(a + 2*th - ph);
+    r += SQRT3_GAL * (-15.0 / 4096.0) * sin(a + 4*th - ph);
+    r += (-567.0 / 16384.0) * cos(2*a - 4*b - 4*th + 2*ph);
+    r += SQRT3_GAL * (567.0 / 16384.0) * sin(2*a - 4*b - 4*th + 2*ph);
+    r += (81.0 / 4096.0) * cos(2*a - 4*b - 2*th + 2*ph);
+    r += SQRT3_GAL * (-81.0 / 4096.0) * sin(2*a - 4*b - 2*th + 2*ph);
+    r += (243.0 / 8192.0) * cos(2*a - 4*b + 2*ph);
+    r += SQRT3_GAL * (-243.0 / 8192.0) * sin(2*a - 4*b + 2*ph);
+    r += (81.0 / 4096.0) * cos(2*a - 4*b + 2*th + 2*ph);
+    r += SQRT3_GAL * (-81.0 / 4096.0) * sin(2*a - 4*b + 2*th + 2*ph);
+    r += (-567.0 / 16384.0) * cos(2*a - 4*b + 4*th + 2*ph);
+    r += SQRT3_GAL * (567.0 / 16384.0) * sin(2*a - 4*b + 4*th + 2*ph);
+    r += (27.0 / 8192.0) * cos(2*a - 4*th - 2*ph);
+    r += (243.0 / 2048.0) * cos(2*a - 2*th - 2*ph);
+    r += (-999.0 / 4096.0) * cos(2*a - 2*ph);
+    r += (243.0 / 2048.0) * cos(2*a + 2*th - 2*ph);
+    r += (27.0 / 8192.0) * cos(2*a + 4*th - 2*ph);
+    r += (-567.0 / 8192.0) * cos(3*a - 4*b - 4*th + ph);
+    r += SQRT3_GAL * (-189.0 / 8192.0) * sin(3*a - 4*b - 4*th + ph);
+    r += (-81.0 / 4096.0) * cos(3*a - 4*b - 2*th + ph);
+    r += SQRT3_GAL * (-27.0 / 4096.0) * sin(3*a - 4*b - 2*th + ph);
+    r += (81.0 / 4096.0) * cos(3*a - 4*b + 2*th + ph);
+    r += SQRT3_GAL * (27.0 / 4096.0) * sin(3*a - 4*b + 2*th + ph);
+    r += (567.0 / 8192.0) * cos(3*a - 4*b + 4*th + ph);
+    r += SQRT3_GAL * (189.0 / 8192.0) * sin(3*a - 4*b + 4*th + ph);
+    r += SQRT3_GAL * (9.0 / 4096.0) * sin(3*a - 4*th - 3*ph);
+    r += SQRT3_GAL * (-9.0 / 2048.0) * sin(3*a - 2*th - 3*ph);
+    r += SQRT3_GAL * (9.0 / 2048.0) * sin(3*a + 2*th - 3*ph);
+    r += SQRT3_GAL * (-9.0 / 4096.0) * sin(3*a + 4*th - 3*ph);
+    r += (945.0 / 32768.0) * cos(4*a - 4*b - 4*th);
+    r += SQRT3_GAL * (-945.0 / 32768.0) * sin(4*a - 4*b - 4*th);
+    r += (135.0 / 8192.0) * cos(4*a - 4*b - 2*th);
+    r += SQRT3_GAL * (-135.0 / 8192.0) * sin(4*a - 4*b - 2*th);
+    r += (243.0 / 16384.0) * cos(4*a - 4*b);
+    r += SQRT3_GAL * (-243.0 / 16384.0) * sin(4*a - 4*b);
+    r += (135.0 / 8192.0) * cos(4*a - 4*b + 2*th);
+    r += SQRT3_GAL * (-135.0 / 8192.0) * sin(4*a - 4*b + 2*th);
+    r += (945.0 / 32768.0) * cos(4*a - 4*b + 4*th);
+    r += SQRT3_GAL * (-945.0 / 32768.0) * sin(4*a - 4*b + 4*th);
+    r += (-27.0 / 32768.0) * cos(4*a - 4*th - 4*ph);
+    r += (27.0 / 8192.0) * cos(4*a - 2*th - 4*ph);
+    r += (-81.0 / 16384.0) * cos(4*a - 4*ph);
+    r += (27.0 / 8192.0) * cos(4*a + 2*th - 4*ph);
+    r += (-27.0 / 32768.0) * cos(4*a + 4*th - 4*ph);
+    r += (189.0 / 8192.0) * cos(5*a - 4*b - 4*th - ph);
+    r += SQRT3_GAL * (63.0 / 8192.0) * sin(5*a - 4*b - 4*th - ph);
+    r += (27.0 / 4096.0) * cos(5*a - 4*b - 2*th - ph);
+    r += SQRT3_GAL * (9.0 / 4096.0) * sin(5*a - 4*b - 2*th - ph);
+    r += (-27.0 / 4096.0) * cos(5*a - 4*b + 2*th - ph);
+    r += SQRT3_GAL * (-9.0 / 4096.0) * sin(5*a - 4*b + 2*th - ph);
+    r += (-189.0 / 8192.0) * cos(5*a - 4*b + 4*th - ph);
+    r += SQRT3_GAL * (-63.0 / 8192.0) * sin(5*a - 4*b + 4*th - ph);
+    r += (-63.0 / 16384.0) * cos(6*a - 4*b - 4*th - 2*ph);
+    r += SQRT3_GAL * (63.0 / 16384.0) * sin(6*a - 4*b - 4*th - 2*ph);
+    r += (9.0 / 4096.0) * cos(6*a - 4*b - 2*th - 2*ph);
+    r += SQRT3_GAL * (-9.0 / 4096.0) * sin(6*a - 4*b - 2*th - 2*ph);
+    r += (27.0 / 8192.0) * cos(6*a - 4*b - 2*ph);
+    r += SQRT3_GAL * (-27.0 / 8192.0) * sin(6*a - 4*b - 2*ph);
+    r += (9.0 / 4096.0) * cos(6*a - 4*b + 2*th - 2*ph);
+    r += SQRT3_GAL * (-9.0 / 4096.0) * sin(6*a - 4*b + 2*th - 2*ph);
+    r += (-63.0 / 16384.0) * cos(6*a - 4*b + 4*th - 2*ph);
+    r += SQRT3_GAL * (63.0 / 16384.0) * sin(6*a - 4*b + 4*th - 2*ph);
+    r += (-9.0 / 8192.0) * cos(7*a - 4*b - 4*th - 3*ph);
+    r += SQRT3_GAL * (-3.0 / 8192.0) * sin(7*a - 4*b - 4*th - 3*ph);
+    r += (9.0 / 4096.0) * cos(7*a - 4*b - 2*th - 3*ph);
+    r += SQRT3_GAL * (3.0 / 4096.0) * sin(7*a - 4*b - 2*th - 3*ph);
+    r += (-9.0 / 4096.0) * cos(7*a - 4*b + 2*th - 3*ph);
+    r += SQRT3_GAL * (-3.0 / 4096.0) * sin(7*a - 4*b + 2*th - 3*ph);
+    r += (9.0 / 8192.0) * cos(7*a - 4*b + 4*th - 3*ph);
+    r += SQRT3_GAL * (3.0 / 8192.0) * sin(7*a - 4*b + 4*th - 3*ph);
+    r += (3.0 / 65536.0) * cos(8*a - 4*b - 4*th - 4*ph);
+    r += SQRT3_GAL * (-3.0 / 65536.0) * sin(8*a - 4*b - 4*th - 4*ph);
+    r += (-3.0 / 16384.0) * cos(8*a - 4*b - 2*th - 4*ph);
+    r += SQRT3_GAL * (3.0 / 16384.0) * sin(8*a - 4*b - 2*th - 4*ph);
+    r += (9.0 / 32768.0) * cos(8*a - 4*b - 4*ph);
+    r += SQRT3_GAL * (-9.0 / 32768.0) * sin(8*a - 4*b - 4*ph);
+    r += (-3.0 / 16384.0) * cos(8*a - 4*b + 2*th - 4*ph);
+    r += SQRT3_GAL * (3.0 / 16384.0) * sin(8*a - 4*b + 2*th - 4*ph);
+    r += (3.0 / 65536.0) * cos(8*a - 4*b + 4*th - 4*ph);
+    r += SQRT3_GAL * (-3.0 / 65536.0) * sin(8*a - 4*b + 4*th - 4*ph);
+    return GAL_RESPONSE_K * r;
 }
 
-// ----------------------------------------------------------------------------
+CUDA_DEVICE
+double galaxy_YY(double alpha0, double beta0, double theta_N, double phi_N, double delta_t)
+{
+    double a = alpha0 + OMEGA_LISA * delta_t;
+    double b = beta0, th = theta_N, ph = phi_N;
+    double r = 0.0;
+    r += (9363.0 / 8192.0);
+    r += (-345.0 / 2048.0) * cos(2*th);
+    r += (-111.0 / 8192.0) * cos(4*th);
+    r += (243.0 / 65536.0) * cos(4*b - 4*th - 4*ph);
+    r += SQRT3_GAL * (243.0 / 65536.0) * sin(4*b - 4*th - 4*ph);
+    r += (-243.0 / 16384.0) * cos(4*b - 2*th - 4*ph);
+    r += SQRT3_GAL * (-243.0 / 16384.0) * sin(4*b - 2*th - 4*ph);
+    r += (729.0 / 32768.0) * cos(4*b - 4*ph);
+    r += SQRT3_GAL * (729.0 / 32768.0) * sin(4*b - 4*ph);
+    r += (-243.0 / 16384.0) * cos(4*b + 2*th - 4*ph);
+    r += SQRT3_GAL * (-243.0 / 16384.0) * sin(4*b + 2*th - 4*ph);
+    r += (243.0 / 65536.0) * cos(4*b + 4*th - 4*ph);
+    r += SQRT3_GAL * (243.0 / 65536.0) * sin(4*b + 4*th - 4*ph);
+    r += (243.0 / 8192.0) * cos(a - 4*b - 4*th + 3*ph);
+    r += SQRT3_GAL * (81.0 / 8192.0) * sin(a - 4*b - 4*th + 3*ph);
+    r += (-243.0 / 4096.0) * cos(a - 4*b - 2*th + 3*ph);
+    r += SQRT3_GAL * (-81.0 / 4096.0) * sin(a - 4*b - 2*th + 3*ph);
+    r += (243.0 / 4096.0) * cos(a - 4*b + 2*th + 3*ph);
+    r += SQRT3_GAL * (81.0 / 4096.0) * sin(a - 4*b + 2*th + 3*ph);
+    r += (-243.0 / 8192.0) * cos(a - 4*b + 4*th + 3*ph);
+    r += SQRT3_GAL * (-81.0 / 8192.0) * sin(a - 4*b + 4*th + 3*ph);
+    r += SQRT3_GAL * (-15.0 / 2048.0) * sin(a - 4*th - ph);
+    r += SQRT3_GAL * (327.0 / 1024.0) * sin(a - 2*th - ph);
+    r += SQRT3_GAL * (-327.0 / 1024.0) * sin(a + 2*th - ph);
+    r += SQRT3_GAL * (15.0 / 2048.0) * sin(a + 4*th - ph);
+    r += (-567.0 / 16384.0) * cos(2*a - 4*b - 4*th + 2*ph);
+    r += SQRT3_GAL * (567.0 / 16384.0) * sin(2*a - 4*b - 4*th + 2*ph);
+    r += (81.0 / 4096.0) * cos(2*a - 4*b - 2*th + 2*ph);
+    r += SQRT3_GAL * (-81.0 / 4096.0) * sin(2*a - 4*b - 2*th + 2*ph);
+    r += (243.0 / 8192.0) * cos(2*a - 4*b + 2*ph);
+    r += SQRT3_GAL * (-243.0 / 8192.0) * sin(2*a - 4*b + 2*ph);
+    r += (81.0 / 4096.0) * cos(2*a - 4*b + 2*th + 2*ph);
+    r += SQRT3_GAL * (-81.0 / 4096.0) * sin(2*a - 4*b + 2*th + 2*ph);
+    r += (-567.0 / 16384.0) * cos(2*a - 4*b + 4*th + 2*ph);
+    r += SQRT3_GAL * (567.0 / 16384.0) * sin(2*a - 4*b + 4*th + 2*ph);
+    r += (-27.0 / 4096.0) * cos(2*a - 4*th - 2*ph);
+    r += (-243.0 / 1024.0) * cos(2*a - 2*th - 2*ph);
+    r += (999.0 / 2048.0) * cos(2*a - 2*ph);
+    r += (-243.0 / 1024.0) * cos(2*a + 2*th - 2*ph);
+    r += (-27.0 / 4096.0) * cos(2*a + 4*th - 2*ph);
+    r += (-567.0 / 8192.0) * cos(3*a - 4*b - 4*th + ph);
+    r += SQRT3_GAL * (-189.0 / 8192.0) * sin(3*a - 4*b - 4*th + ph);
+    r += (-81.0 / 4096.0) * cos(3*a - 4*b - 2*th + ph);
+    r += SQRT3_GAL * (-27.0 / 4096.0) * sin(3*a - 4*b - 2*th + ph);
+    r += (81.0 / 4096.0) * cos(3*a - 4*b + 2*th + ph);
+    r += SQRT3_GAL * (27.0 / 4096.0) * sin(3*a - 4*b + 2*th + ph);
+    r += (567.0 / 8192.0) * cos(3*a - 4*b + 4*th + ph);
+    r += SQRT3_GAL * (189.0 / 8192.0) * sin(3*a - 4*b + 4*th + ph);
+    r += SQRT3_GAL * (-9.0 / 2048.0) * sin(3*a - 4*th - 3*ph);
+    r += SQRT3_GAL * (9.0 / 1024.0) * sin(3*a - 2*th - 3*ph);
+    r += SQRT3_GAL * (-9.0 / 1024.0) * sin(3*a + 2*th - 3*ph);
+    r += SQRT3_GAL * (9.0 / 2048.0) * sin(3*a + 4*th - 3*ph);
+    r += (945.0 / 32768.0) * cos(4*a - 4*b - 4*th);
+    r += SQRT3_GAL * (-945.0 / 32768.0) * sin(4*a - 4*b - 4*th);
+    r += (135.0 / 8192.0) * cos(4*a - 4*b - 2*th);
+    r += SQRT3_GAL * (-135.0 / 8192.0) * sin(4*a - 4*b - 2*th);
+    r += (243.0 / 16384.0) * cos(4*a - 4*b);
+    r += SQRT3_GAL * (-243.0 / 16384.0) * sin(4*a - 4*b);
+    r += (135.0 / 8192.0) * cos(4*a - 4*b + 2*th);
+    r += SQRT3_GAL * (-135.0 / 8192.0) * sin(4*a - 4*b + 2*th);
+    r += (945.0 / 32768.0) * cos(4*a - 4*b + 4*th);
+    r += SQRT3_GAL * (-945.0 / 32768.0) * sin(4*a - 4*b + 4*th);
+    r += (27.0 / 16384.0) * cos(4*a - 4*th - 4*ph);
+    r += (-27.0 / 4096.0) * cos(4*a - 2*th - 4*ph);
+    r += (81.0 / 8192.0) * cos(4*a - 4*ph);
+    r += (-27.0 / 4096.0) * cos(4*a + 2*th - 4*ph);
+    r += (27.0 / 16384.0) * cos(4*a + 4*th - 4*ph);
+    r += (189.0 / 8192.0) * cos(5*a - 4*b - 4*th - ph);
+    r += SQRT3_GAL * (63.0 / 8192.0) * sin(5*a - 4*b - 4*th - ph);
+    r += (27.0 / 4096.0) * cos(5*a - 4*b - 2*th - ph);
+    r += SQRT3_GAL * (9.0 / 4096.0) * sin(5*a - 4*b - 2*th - ph);
+    r += (-27.0 / 4096.0) * cos(5*a - 4*b + 2*th - ph);
+    r += SQRT3_GAL * (-9.0 / 4096.0) * sin(5*a - 4*b + 2*th - ph);
+    r += (-189.0 / 8192.0) * cos(5*a - 4*b + 4*th - ph);
+    r += SQRT3_GAL * (-63.0 / 8192.0) * sin(5*a - 4*b + 4*th - ph);
+    r += (-63.0 / 16384.0) * cos(6*a - 4*b - 4*th - 2*ph);
+    r += SQRT3_GAL * (63.0 / 16384.0) * sin(6*a - 4*b - 4*th - 2*ph);
+    r += (9.0 / 4096.0) * cos(6*a - 4*b - 2*th - 2*ph);
+    r += SQRT3_GAL * (-9.0 / 4096.0) * sin(6*a - 4*b - 2*th - 2*ph);
+    r += (27.0 / 8192.0) * cos(6*a - 4*b - 2*ph);
+    r += SQRT3_GAL * (-27.0 / 8192.0) * sin(6*a - 4*b - 2*ph);
+    r += (9.0 / 4096.0) * cos(6*a - 4*b + 2*th - 2*ph);
+    r += SQRT3_GAL * (-9.0 / 4096.0) * sin(6*a - 4*b + 2*th - 2*ph);
+    r += (-63.0 / 16384.0) * cos(6*a - 4*b + 4*th - 2*ph);
+    r += SQRT3_GAL * (63.0 / 16384.0) * sin(6*a - 4*b + 4*th - 2*ph);
+    r += (-9.0 / 8192.0) * cos(7*a - 4*b - 4*th - 3*ph);
+    r += SQRT3_GAL * (-3.0 / 8192.0) * sin(7*a - 4*b - 4*th - 3*ph);
+    r += (9.0 / 4096.0) * cos(7*a - 4*b - 2*th - 3*ph);
+    r += SQRT3_GAL * (3.0 / 4096.0) * sin(7*a - 4*b - 2*th - 3*ph);
+    r += (-9.0 / 4096.0) * cos(7*a - 4*b + 2*th - 3*ph);
+    r += SQRT3_GAL * (-3.0 / 4096.0) * sin(7*a - 4*b + 2*th - 3*ph);
+    r += (9.0 / 8192.0) * cos(7*a - 4*b + 4*th - 3*ph);
+    r += SQRT3_GAL * (3.0 / 8192.0) * sin(7*a - 4*b + 4*th - 3*ph);
+    r += (3.0 / 65536.0) * cos(8*a - 4*b - 4*th - 4*ph);
+    r += SQRT3_GAL * (-3.0 / 65536.0) * sin(8*a - 4*b - 4*th - 4*ph);
+    r += (-3.0 / 16384.0) * cos(8*a - 4*b - 2*th - 4*ph);
+    r += SQRT3_GAL * (3.0 / 16384.0) * sin(8*a - 4*b - 2*th - 4*ph);
+    r += (9.0 / 32768.0) * cos(8*a - 4*b - 4*ph);
+    r += SQRT3_GAL * (-9.0 / 32768.0) * sin(8*a - 4*b - 4*ph);
+    r += (-3.0 / 16384.0) * cos(8*a - 4*b + 2*th - 4*ph);
+    r += SQRT3_GAL * (3.0 / 16384.0) * sin(8*a - 4*b + 2*th - 4*ph);
+    r += (3.0 / 65536.0) * cos(8*a - 4*b + 4*th - 4*ph);
+    r += SQRT3_GAL * (-3.0 / 65536.0) * sin(8*a - 4*b + 4*th - 4*ph);
+    return GAL_RESPONSE_K * r;
+}
 
 CUDA_DEVICE
 double galaxy_YZ(double alpha0, double beta0, double theta_N, double phi_N, double delta_t)
 {
-    double ot  = OMEGA_LISA * delta_t;
-    double a0t = alpha0 + ot; // alpha0 + omega*(t - t0)
-    double pi2 = PI2_GAL;
-    double s3  = SQRT3_GAL;
-
-    double result = (-105.0 * (
-        6242.0
-        - 920.0   * cos(2*theta_N - pi2)
-        - 74.0    * cos(4*theta_N - pi2)
-        + 486.0   * cos(4*beta0 - 4*phi_N)
-        + 81.0    * cos(4*beta0 - 4*theta_N - pi2 - 4*phi_N)
-        - 324.0   * cos(4*beta0 - 2*theta_N - pi2 - 4*phi_N)
-        - 324.0   * cos(4*beta0 + 2*theta_N - pi2 - 4*phi_N)
-        + 81.0    * cos(4*(beta0 + theta_N - pi2 - phi_N))
-        + 324.0   * cos(4*(a0t - beta0))
-        + 630.0   * cos(4*(a0t - beta0 - theta_N - pi2))
-        + 630.0   * cos(4*(a0t - beta0 + theta_N - pi2))
-        + 2664.0  * cos(2*(a0t - phi_N))
-        + 54.0    * cos(4*(a0t - phi_N))
-        - 36.0    * cos(2*(a0t - 2*theta_N - pi2 - phi_N))
-        - 1296.0  * cos(2*(a0t - theta_N - pi2 - phi_N))
-        + 9.0     * cos(4*(a0t - theta_N - pi2 - phi_N))
-        - 1296.0  * cos(2*(a0t + theta_N - pi2 - phi_N))
-        + 9.0     * cos(4*(a0t + theta_N - pi2 - phi_N))
-        - 36.0    * cos(2*(a0t + 2*theta_N - pi2 - phi_N))
-        + 648.0   * cos(2*(a0t - 2*beta0 + phi_N))
-        - 756.0   * cos(2*(a0t - 2*beta0 - 2*theta_N - pi2 + phi_N))
-        + 432.0   * cos(2*(a0t - 2*beta0 - theta_N - pi2 + phi_N))
-        + 432.0   * cos(2*(a0t - 2*beta0 + theta_N - pi2 + phi_N))
-        - 756.0   * cos(2*(a0t - 2*beta0 + 2*theta_N - pi2 + phi_N))
-        + 360.0   * cos(4*alpha0 - 4*beta0 - 2*theta_N - pi2 + 4*ot)
-        + 360.0   * cos(4*alpha0 - 4*beta0 + 2*theta_N - pi2 + 4*ot)
-        - 36.0    * cos(4*alpha0 - 2*theta_N - pi2 - 4*phi_N + 4*ot)
-        - 36.0    * cos(4*alpha0 + 2*theta_N - pi2 - 4*phi_N + 4*ot)
-        + 72.0    * cos(6*alpha0 - 4*beta0 - 2*phi_N + 6*ot)
-        - 84.0    * cos(6*alpha0 - 4*beta0 - 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        + 48.0    * cos(6*alpha0 - 4*beta0 + 2*theta_N - pi2 - 2*phi_N + 6*ot)
-        - 84.0    * cos(6*alpha0 - 4*beta0 + 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        - 4.0     * cos(8*alpha0 - 4*beta0 - 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        - 4.0     * cos(8*alpha0 - 4*beta0 + 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        + 1.0     * cos(8*alpha0 - 4*beta0 + 4*theta_N - pi2 - 4*phi_N + 8*ot)
-        + 48.0    * cos(6*alpha0 - 2*(2*beta0 + theta_N - pi2 + phi_N - 3*ot))
-        + 6.0     * cos(8*alpha0 - 4*(beta0 + phi_N - 2*ot))
-        + 1.0     * cos(8*alpha0 - 4*(beta0 + theta_N - pi2 + phi_N - 2*ot))
-        - 40.0    * s3 * sin(a0t - 4*theta_N - pi2 - phi_N)
-        + 1744.0  * s3 * sin(a0t - 2*theta_N - pi2 - phi_N)
-        - 1744.0  * s3 * sin(a0t + 2*theta_N - pi2 - phi_N)
-        + 40.0    * s3 * sin(a0t + 4*theta_N - pi2 - phi_N)
-        + 216.0   * s3 * sin(a0t - 4*beta0 - 4*theta_N - pi2 + 3*phi_N)
-        - 432.0   * s3 * sin(a0t - 4*beta0 - 2*theta_N - pi2 + 3*phi_N)
-        + 432.0   * s3 * sin(a0t - 4*beta0 + 2*theta_N - pi2 + 3*phi_N)
-        - 216.0   * s3 * sin(a0t - 4*beta0 + 4*theta_N - pi2 + 3*phi_N)
-        - 24.0    * s3 * sin(3*a0t - 4*theta_N - pi2 - 3*phi_N - 2*ot)
-        + 48.0    * s3 * sin(3*a0t - 2*theta_N - pi2 - 3*phi_N - 2*ot)
-        - 48.0    * s3 * sin(3*a0t + 2*theta_N - pi2 - 3*phi_N - 2*ot)
-        + 24.0    * s3 * sin(3*a0t + 4*theta_N - pi2 - 3*phi_N - 2*ot)
-        - 504.0   * s3 * sin(3*a0t - 4*beta0 - 4*theta_N - pi2 + phi_N - 2*ot)
-        - 144.0   * s3 * sin(3*a0t - 4*beta0 - 2*theta_N - pi2 + phi_N - 2*ot)
-        + 144.0   * s3 * sin(3*a0t - 4*beta0 + 2*theta_N - pi2 + phi_N - 2*ot)
-        + 504.0   * s3 * sin(3*a0t - 4*beta0 + 4*theta_N - pi2 + phi_N - 2*ot)
-        + 168.0   * s3 * sin(5*a0t - 4*beta0 - 4*theta_N - pi2 - phi_N - 4*ot)
-        + 48.0    * s3 * sin(5*a0t - 4*beta0 - 2*theta_N - pi2 - phi_N - 4*ot)
-        - 48.0    * s3 * sin(5*a0t - 4*beta0 + 2*theta_N - pi2 - phi_N - 4*ot)
-        - 168.0   * s3 * sin(5*a0t - 4*beta0 + 4*theta_N - pi2 - phi_N - 4*ot)
-        - 8.0     * s3 * sin(7*a0t - 4*beta0 - 4*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 16.0    * s3 * sin(7*a0t - 4*beta0 - 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        - 16.0    * s3 * sin(7*a0t - 4*beta0 + 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 8.0     * s3 * sin(7*a0t - 4*beta0 + 4*theta_N - pi2 - 3*phi_N - 6*ot)
-    )) / 262144.0;
-
-    return result;
+    double a = alpha0 + OMEGA_LISA * delta_t;
+    double b = beta0, th = theta_N, ph = phi_N;
+    double r = 0.0;
+    r += (-9363.0 / 16384.0);
+    r += (345.0 / 4096.0) * cos(2*th);
+    r += (111.0 / 16384.0) * cos(4*th);
+    r += (-243.0 / 32768.0) * cos(4*b - 4*th - 4*ph);
+    r += (243.0 / 8192.0) * cos(4*b - 2*th - 4*ph);
+    r += (-729.0 / 16384.0) * cos(4*b - 4*ph);
+    r += (243.0 / 8192.0) * cos(4*b + 2*th - 4*ph);
+    r += (-243.0 / 32768.0) * cos(4*b + 4*th - 4*ph);
+    r += SQRT3_GAL * (-81.0 / 4096.0) * sin(a - 4*b - 4*th + 3*ph);
+    r += SQRT3_GAL * (81.0 / 2048.0) * sin(a - 4*b - 2*th + 3*ph);
+    r += SQRT3_GAL * (-81.0 / 2048.0) * sin(a - 4*b + 2*th + 3*ph);
+    r += SQRT3_GAL * (81.0 / 4096.0) * sin(a - 4*b + 4*th + 3*ph);
+    r += SQRT3_GAL * (15.0 / 4096.0) * sin(a - 4*th - ph);
+    r += SQRT3_GAL * (-327.0 / 2048.0) * sin(a - 2*th - ph);
+    r += SQRT3_GAL * (327.0 / 2048.0) * sin(a + 2*th - ph);
+    r += SQRT3_GAL * (-15.0 / 4096.0) * sin(a + 4*th - ph);
+    r += (567.0 / 8192.0) * cos(2*a - 4*b - 4*th + 2*ph);
+    r += (-81.0 / 2048.0) * cos(2*a - 4*b - 2*th + 2*ph);
+    r += (-243.0 / 4096.0) * cos(2*a - 4*b + 2*ph);
+    r += (-81.0 / 2048.0) * cos(2*a - 4*b + 2*th + 2*ph);
+    r += (567.0 / 8192.0) * cos(2*a - 4*b + 4*th + 2*ph);
+    r += (27.0 / 8192.0) * cos(2*a - 4*th - 2*ph);
+    r += (243.0 / 2048.0) * cos(2*a - 2*th - 2*ph);
+    r += (-999.0 / 4096.0) * cos(2*a - 2*ph);
+    r += (243.0 / 2048.0) * cos(2*a + 2*th - 2*ph);
+    r += (27.0 / 8192.0) * cos(2*a + 4*th - 2*ph);
+    r += SQRT3_GAL * (189.0 / 4096.0) * sin(3*a - 4*b - 4*th + ph);
+    r += SQRT3_GAL * (27.0 / 2048.0) * sin(3*a - 4*b - 2*th + ph);
+    r += SQRT3_GAL * (-27.0 / 2048.0) * sin(3*a - 4*b + 2*th + ph);
+    r += SQRT3_GAL * (-189.0 / 4096.0) * sin(3*a - 4*b + 4*th + ph);
+    r += SQRT3_GAL * (9.0 / 4096.0) * sin(3*a - 4*th - 3*ph);
+    r += SQRT3_GAL * (-9.0 / 2048.0) * sin(3*a - 2*th - 3*ph);
+    r += SQRT3_GAL * (9.0 / 2048.0) * sin(3*a + 2*th - 3*ph);
+    r += SQRT3_GAL * (-9.0 / 4096.0) * sin(3*a + 4*th - 3*ph);
+    r += (-945.0 / 16384.0) * cos(4*a - 4*b - 4*th);
+    r += (-135.0 / 4096.0) * cos(4*a - 4*b - 2*th);
+    r += (-243.0 / 8192.0) * cos(4*a - 4*b);
+    r += (-135.0 / 4096.0) * cos(4*a - 4*b + 2*th);
+    r += (-945.0 / 16384.0) * cos(4*a - 4*b + 4*th);
+    r += (-27.0 / 32768.0) * cos(4*a - 4*th - 4*ph);
+    r += (27.0 / 8192.0) * cos(4*a - 2*th - 4*ph);
+    r += (-81.0 / 16384.0) * cos(4*a - 4*ph);
+    r += (27.0 / 8192.0) * cos(4*a + 2*th - 4*ph);
+    r += (-27.0 / 32768.0) * cos(4*a + 4*th - 4*ph);
+    r += SQRT3_GAL * (-63.0 / 4096.0) * sin(5*a - 4*b - 4*th - ph);
+    r += SQRT3_GAL * (-9.0 / 2048.0) * sin(5*a - 4*b - 2*th - ph);
+    r += SQRT3_GAL * (9.0 / 2048.0) * sin(5*a - 4*b + 2*th - ph);
+    r += SQRT3_GAL * (63.0 / 4096.0) * sin(5*a - 4*b + 4*th - ph);
+    r += (63.0 / 8192.0) * cos(6*a - 4*b - 4*th - 2*ph);
+    r += (-9.0 / 2048.0) * cos(6*a - 4*b - 2*th - 2*ph);
+    r += (-27.0 / 4096.0) * cos(6*a - 4*b - 2*ph);
+    r += (-9.0 / 2048.0) * cos(6*a - 4*b + 2*th - 2*ph);
+    r += (63.0 / 8192.0) * cos(6*a - 4*b + 4*th - 2*ph);
+    r += SQRT3_GAL * (3.0 / 4096.0) * sin(7*a - 4*b - 4*th - 3*ph);
+    r += SQRT3_GAL * (-3.0 / 2048.0) * sin(7*a - 4*b - 2*th - 3*ph);
+    r += SQRT3_GAL * (3.0 / 2048.0) * sin(7*a - 4*b + 2*th - 3*ph);
+    r += SQRT3_GAL * (-3.0 / 4096.0) * sin(7*a - 4*b + 4*th - 3*ph);
+    r += (-3.0 / 32768.0) * cos(8*a - 4*b - 4*th - 4*ph);
+    r += (3.0 / 8192.0) * cos(8*a - 4*b - 2*th - 4*ph);
+    r += (-9.0 / 16384.0) * cos(8*a - 4*b - 4*ph);
+    r += (3.0 / 8192.0) * cos(8*a - 4*b + 2*th - 4*ph);
+    r += (-3.0 / 32768.0) * cos(8*a - 4*b + 4*th - 4*ph);
+    return GAL_RESPONSE_K * r;
 }
-
-// ----------------------------------------------------------------------------
 
 CUDA_DEVICE
 double galaxy_ZZ(double alpha0, double beta0, double theta_N, double phi_N, double delta_t)
 {
-    double ot  = OMEGA_LISA * delta_t;
-    double a0t = alpha0 + ot; // alpha0 + omega*(t - t0)
-    double pi2 = PI2_GAL;
-    double s3  = SQRT3_GAL;
-
-    double result = (-105.0 * (
-        -24968.0
-        + 3680.0  * cos(2*theta_N - pi2)
-        + 296.0   * cos(4*theta_N - pi2)
-        - 486.0   * cos(4*beta0 - 4*phi_N)
-        - 81.0    * cos(4*beta0 - 4*theta_N - pi2 - 4*phi_N)
-        + 324.0   * cos(4*beta0 - 2*theta_N - pi2 - 4*phi_N)
-        + 324.0   * cos(4*beta0 + 2*theta_N - pi2 - 4*phi_N)
-        - 81.0    * cos(4*(beta0 + theta_N - pi2 - phi_N))
-        - 324.0   * cos(4*(a0t - beta0))
-        - 630.0   * cos(4*(a0t - beta0 - theta_N - pi2))
-        - 630.0   * cos(4*(a0t - beta0 + theta_N - pi2))
-        - 10656.0 * cos(2*(a0t - phi_N))
-        - 216.0   * cos(4*(a0t - phi_N))
-        + 144.0   * cos(2*(a0t - 2*theta_N - pi2 - phi_N))
-        + 5184.0  * cos(2*(a0t - theta_N - pi2 - phi_N))
-        - 36.0    * cos(4*(a0t - theta_N - pi2 - phi_N))
-        + 5184.0  * cos(2*(a0t + theta_N - pi2 - phi_N))
-        - 36.0    * cos(4*(a0t + theta_N - pi2 - phi_N))
-        + 144.0   * cos(2*(a0t + 2*theta_N - pi2 - phi_N))
-        - 648.0   * cos(2*(a0t - 2*beta0 + phi_N))
-        + 756.0   * cos(2*(a0t - 2*beta0 - 2*theta_N - pi2 + phi_N))
-        - 432.0   * cos(2*(a0t - 2*beta0 - theta_N - pi2 + phi_N))
-        - 432.0   * cos(2*(a0t - 2*beta0 + theta_N - pi2 + phi_N))
-        + 756.0   * cos(2*(a0t - 2*beta0 + 2*theta_N - pi2 + phi_N))
-        + 648.0   * cos(a0t - 4*beta0 - 4*theta_N - pi2 + 3*phi_N)
-        - 1296.0  * cos(a0t - 4*beta0 - 2*theta_N - pi2 + 3*phi_N)
-        + 1296.0  * cos(a0t - 4*beta0 + 2*theta_N - pi2 + 3*phi_N)
-        - 648.0   * cos(a0t - 4*beta0 + 4*theta_N - pi2 + 3*phi_N)
-        - 1512.0  * cos(3*a0t - 4*beta0 - 4*theta_N - pi2 + phi_N - 2*ot)
-        - 432.0   * cos(3*a0t - 4*beta0 - 2*theta_N - pi2 + phi_N - 2*ot)
-        + 432.0   * cos(3*a0t - 4*beta0 + 2*theta_N - pi2 + phi_N - 2*ot)
-        + 1512.0  * cos(3*a0t - 4*beta0 + 4*theta_N - pi2 + phi_N - 2*ot)
-        - 360.0   * cos(4*alpha0 - 4*beta0 - 2*theta_N - pi2 + 4*ot)
-        - 360.0   * cos(4*alpha0 - 4*beta0 + 2*theta_N - pi2 + 4*ot)
-        + 144.0   * cos(4*alpha0 - 2*theta_N - pi2 - 4*phi_N + 4*ot)
-        + 144.0   * cos(4*alpha0 + 2*theta_N - pi2 - 4*phi_N + 4*ot)
-        + 504.0   * cos(5*a0t - 4*beta0 - 4*theta_N - pi2 - phi_N - 4*ot)
-        + 144.0   * cos(5*a0t - 4*beta0 - 2*theta_N - pi2 - phi_N - 4*ot)
-        - 144.0   * cos(5*a0t - 4*beta0 + 2*theta_N - pi2 - phi_N - 4*ot)
-        - 504.0   * cos(5*a0t - 4*beta0 + 4*theta_N - pi2 - phi_N - 4*ot)
-        - 72.0    * cos(6*alpha0 - 4*beta0 - 2*phi_N + 6*ot)
-        + 84.0    * cos(6*alpha0 - 4*beta0 - 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        - 48.0    * cos(6*alpha0 - 4*beta0 + 2*theta_N - pi2 - 2*phi_N + 6*ot)
-        + 84.0    * cos(6*alpha0 - 4*beta0 + 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        - 24.0    * cos(7*a0t - 4*beta0 - 4*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 48.0    * cos(7*a0t - 4*beta0 - 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        - 48.0    * cos(7*a0t - 4*beta0 + 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 24.0    * cos(7*a0t - 4*beta0 + 4*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 4.0     * cos(8*alpha0 - 4*beta0 - 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        + 4.0     * cos(8*alpha0 - 4*beta0 + 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        - 1.0     * cos(8*alpha0 - 4*beta0 + 4*theta_N - pi2 - 4*phi_N + 8*ot)
-        - 48.0    * cos(6*alpha0 - 2*(2*beta0 + theta_N - pi2 + phi_N - 3*ot))
-        - 6.0     * cos(8*alpha0 - 4*(beta0 + phi_N - 2*ot))
-        - 1.0     * cos(8*alpha0 - 4*(beta0 + theta_N - pi2 + phi_N - 2*ot))
-        + 486.0   * s3 * sin(4*beta0 - 4*phi_N)
-        + 81.0    * s3 * sin(4*beta0 - 4*theta_N - pi2 - 4*phi_N)
-        - 324.0   * s3 * sin(4*beta0 - 2*theta_N - pi2 - 4*phi_N)
-        - 324.0   * s3 * sin(4*beta0 + 2*theta_N - pi2 - 4*phi_N)
-        + 81.0    * s3 * sin(4*(beta0 + theta_N - pi2 - phi_N))
-        - 324.0   * s3 * sin(4*(a0t - beta0))
-        - 630.0   * s3 * sin(4*(a0t - beta0 - theta_N - pi2))
-        - 630.0   * s3 * sin(4*(a0t - beta0 + theta_N - pi2))
-        + 160.0   * s3 * sin(a0t - 4*theta_N - pi2 - phi_N)
-        - 6976.0  * s3 * sin(a0t - 2*theta_N - pi2 - phi_N)
-        + 6976.0  * s3 * sin(a0t + 2*theta_N - pi2 - phi_N)
-        - 160.0   * s3 * sin(a0t + 4*theta_N - pi2 - phi_N)
-        - 648.0   * s3 * sin(2*(a0t - 2*beta0 + phi_N))
-        + 756.0   * s3 * sin(2*(a0t - 2*beta0 - 2*theta_N - pi2 + phi_N))
-        - 432.0   * s3 * sin(2*(a0t - 2*beta0 - theta_N - pi2 + phi_N))
-        - 432.0   * s3 * sin(2*(a0t - 2*beta0 + theta_N - pi2 + phi_N))
-        + 756.0   * s3 * sin(2*(a0t - 2*beta0 + 2*theta_N - pi2 + phi_N))
-        - 216.0   * s3 * sin(a0t - 4*beta0 - 4*theta_N - pi2 + 3*phi_N)
-        + 432.0   * s3 * sin(a0t - 4*beta0 - 2*theta_N - pi2 + 3*phi_N)
-        - 432.0   * s3 * sin(a0t - 4*beta0 + 2*theta_N - pi2 + 3*phi_N)
-        + 216.0   * s3 * sin(a0t - 4*beta0 + 4*theta_N - pi2 + 3*phi_N)
-        + 96.0    * s3 * sin(3*a0t - 4*theta_N - pi2 - 3*phi_N - 2*ot)
-        - 192.0   * s3 * sin(3*a0t - 2*theta_N - pi2 - 3*phi_N - 2*ot)
-        + 192.0   * s3 * sin(3*a0t + 2*theta_N - pi2 - 3*phi_N - 2*ot)
-        - 96.0    * s3 * sin(3*a0t + 4*theta_N - pi2 - 3*phi_N - 2*ot)
-        + 504.0   * s3 * sin(3*a0t - 4*beta0 - 4*theta_N - pi2 + phi_N - 2*ot)
-        + 144.0   * s3 * sin(3*a0t - 4*beta0 - 2*theta_N - pi2 + phi_N - 2*ot)
-        - 144.0   * s3 * sin(3*a0t - 4*beta0 + 2*theta_N - pi2 + phi_N - 2*ot)
-        - 504.0   * s3 * sin(3*a0t - 4*beta0 + 4*theta_N - pi2 + phi_N - 2*ot)
-        - 360.0   * s3 * sin(4*alpha0 - 4*beta0 - 2*theta_N - pi2 + 4*ot)
-        - 360.0   * s3 * sin(4*alpha0 - 4*beta0 + 2*theta_N - pi2 + 4*ot)
-        - 168.0   * s3 * sin(5*a0t - 4*beta0 - 4*theta_N - pi2 - phi_N - 4*ot)
-        - 48.0    * s3 * sin(5*a0t - 4*beta0 - 2*theta_N - pi2 - phi_N - 4*ot)
-        + 48.0    * s3 * sin(5*a0t - 4*beta0 + 2*theta_N - pi2 - phi_N - 4*ot)
-        + 168.0   * s3 * sin(5*a0t - 4*beta0 + 4*theta_N - pi2 - phi_N - 4*ot)
-        - 72.0    * s3 * sin(6*alpha0 - 4*beta0 - 2*phi_N + 6*ot)
-        + 84.0    * s3 * sin(6*alpha0 - 4*beta0 - 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        - 48.0    * s3 * sin(6*alpha0 - 4*beta0 + 2*theta_N - pi2 - 2*phi_N + 6*ot)
-        + 84.0    * s3 * sin(6*alpha0 - 4*beta0 + 4*theta_N - pi2 - 2*phi_N + 6*ot)
-        + 8.0     * s3 * sin(7*a0t - 4*beta0 - 4*theta_N - pi2 - 3*phi_N - 6*ot)
-        - 16.0    * s3 * sin(7*a0t - 4*beta0 - 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 16.0    * s3 * sin(7*a0t - 4*beta0 + 2*theta_N - pi2 - 3*phi_N - 6*ot)
-        - 8.0     * s3 * sin(7*a0t - 4*beta0 + 4*theta_N - pi2 - 3*phi_N - 6*ot)
-        + 4.0     * s3 * sin(8*alpha0 - 4*beta0 - 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        + 4.0     * s3 * sin(8*alpha0 - 4*beta0 + 2*theta_N - pi2 - 4*phi_N + 8*ot)
-        - 1.0     * s3 * sin(8*alpha0 - 4*beta0 + 4*theta_N - pi2 - 4*phi_N + 8*ot)
-        - 48.0    * s3 * sin(6*alpha0 - 2*(2*beta0 + theta_N - pi2 + phi_N - 3*ot))
-        - 6.0     * s3 * sin(8*alpha0 - 4*(beta0 + phi_N - 2*ot))
-        - 1.0     * s3 * sin(8*alpha0 - 4*(beta0 + theta_N - pi2 + phi_N - 2*ot))
-    )) / 524288.0;
-
-    return result;
+    double a = alpha0 + OMEGA_LISA * delta_t;
+    double b = beta0, th = theta_N, ph = phi_N;
+    double r = 0.0;
+    r += (9363.0 / 8192.0);
+    r += (-345.0 / 2048.0) * cos(2*th);
+    r += (-111.0 / 8192.0) * cos(4*th);
+    r += (243.0 / 65536.0) * cos(4*b - 4*th - 4*ph);
+    r += SQRT3_GAL * (-243.0 / 65536.0) * sin(4*b - 4*th - 4*ph);
+    r += (-243.0 / 16384.0) * cos(4*b - 2*th - 4*ph);
+    r += SQRT3_GAL * (243.0 / 16384.0) * sin(4*b - 2*th - 4*ph);
+    r += (729.0 / 32768.0) * cos(4*b - 4*ph);
+    r += SQRT3_GAL * (-729.0 / 32768.0) * sin(4*b - 4*ph);
+    r += (-243.0 / 16384.0) * cos(4*b + 2*th - 4*ph);
+    r += SQRT3_GAL * (243.0 / 16384.0) * sin(4*b + 2*th - 4*ph);
+    r += (243.0 / 65536.0) * cos(4*b + 4*th - 4*ph);
+    r += SQRT3_GAL * (-243.0 / 65536.0) * sin(4*b + 4*th - 4*ph);
+    r += (-243.0 / 8192.0) * cos(a - 4*b - 4*th + 3*ph);
+    r += SQRT3_GAL * (81.0 / 8192.0) * sin(a - 4*b - 4*th + 3*ph);
+    r += (243.0 / 4096.0) * cos(a - 4*b - 2*th + 3*ph);
+    r += SQRT3_GAL * (-81.0 / 4096.0) * sin(a - 4*b - 2*th + 3*ph);
+    r += (-243.0 / 4096.0) * cos(a - 4*b + 2*th + 3*ph);
+    r += SQRT3_GAL * (81.0 / 4096.0) * sin(a - 4*b + 2*th + 3*ph);
+    r += (243.0 / 8192.0) * cos(a - 4*b + 4*th + 3*ph);
+    r += SQRT3_GAL * (-81.0 / 8192.0) * sin(a - 4*b + 4*th + 3*ph);
+    r += SQRT3_GAL * (-15.0 / 2048.0) * sin(a - 4*th - ph);
+    r += SQRT3_GAL * (327.0 / 1024.0) * sin(a - 2*th - ph);
+    r += SQRT3_GAL * (-327.0 / 1024.0) * sin(a + 2*th - ph);
+    r += SQRT3_GAL * (15.0 / 2048.0) * sin(a + 4*th - ph);
+    r += (-567.0 / 16384.0) * cos(2*a - 4*b - 4*th + 2*ph);
+    r += SQRT3_GAL * (-567.0 / 16384.0) * sin(2*a - 4*b - 4*th + 2*ph);
+    r += (81.0 / 4096.0) * cos(2*a - 4*b - 2*th + 2*ph);
+    r += SQRT3_GAL * (81.0 / 4096.0) * sin(2*a - 4*b - 2*th + 2*ph);
+    r += (243.0 / 8192.0) * cos(2*a - 4*b + 2*ph);
+    r += SQRT3_GAL * (243.0 / 8192.0) * sin(2*a - 4*b + 2*ph);
+    r += (81.0 / 4096.0) * cos(2*a - 4*b + 2*th + 2*ph);
+    r += SQRT3_GAL * (81.0 / 4096.0) * sin(2*a - 4*b + 2*th + 2*ph);
+    r += (-567.0 / 16384.0) * cos(2*a - 4*b + 4*th + 2*ph);
+    r += SQRT3_GAL * (-567.0 / 16384.0) * sin(2*a - 4*b + 4*th + 2*ph);
+    r += (-27.0 / 4096.0) * cos(2*a - 4*th - 2*ph);
+    r += (-243.0 / 1024.0) * cos(2*a - 2*th - 2*ph);
+    r += (999.0 / 2048.0) * cos(2*a - 2*ph);
+    r += (-243.0 / 1024.0) * cos(2*a + 2*th - 2*ph);
+    r += (-27.0 / 4096.0) * cos(2*a + 4*th - 2*ph);
+    r += (567.0 / 8192.0) * cos(3*a - 4*b - 4*th + ph);
+    r += SQRT3_GAL * (-189.0 / 8192.0) * sin(3*a - 4*b - 4*th + ph);
+    r += (81.0 / 4096.0) * cos(3*a - 4*b - 2*th + ph);
+    r += SQRT3_GAL * (-27.0 / 4096.0) * sin(3*a - 4*b - 2*th + ph);
+    r += (-81.0 / 4096.0) * cos(3*a - 4*b + 2*th + ph);
+    r += SQRT3_GAL * (27.0 / 4096.0) * sin(3*a - 4*b + 2*th + ph);
+    r += (-567.0 / 8192.0) * cos(3*a - 4*b + 4*th + ph);
+    r += SQRT3_GAL * (189.0 / 8192.0) * sin(3*a - 4*b + 4*th + ph);
+    r += SQRT3_GAL * (-9.0 / 2048.0) * sin(3*a - 4*th - 3*ph);
+    r += SQRT3_GAL * (9.0 / 1024.0) * sin(3*a - 2*th - 3*ph);
+    r += SQRT3_GAL * (-9.0 / 1024.0) * sin(3*a + 2*th - 3*ph);
+    r += SQRT3_GAL * (9.0 / 2048.0) * sin(3*a + 4*th - 3*ph);
+    r += (945.0 / 32768.0) * cos(4*a - 4*b - 4*th);
+    r += SQRT3_GAL * (945.0 / 32768.0) * sin(4*a - 4*b - 4*th);
+    r += (135.0 / 8192.0) * cos(4*a - 4*b - 2*th);
+    r += SQRT3_GAL * (135.0 / 8192.0) * sin(4*a - 4*b - 2*th);
+    r += (243.0 / 16384.0) * cos(4*a - 4*b);
+    r += SQRT3_GAL * (243.0 / 16384.0) * sin(4*a - 4*b);
+    r += (135.0 / 8192.0) * cos(4*a - 4*b + 2*th);
+    r += SQRT3_GAL * (135.0 / 8192.0) * sin(4*a - 4*b + 2*th);
+    r += (945.0 / 32768.0) * cos(4*a - 4*b + 4*th);
+    r += SQRT3_GAL * (945.0 / 32768.0) * sin(4*a - 4*b + 4*th);
+    r += (27.0 / 16384.0) * cos(4*a - 4*th - 4*ph);
+    r += (-27.0 / 4096.0) * cos(4*a - 2*th - 4*ph);
+    r += (81.0 / 8192.0) * cos(4*a - 4*ph);
+    r += (-27.0 / 4096.0) * cos(4*a + 2*th - 4*ph);
+    r += (27.0 / 16384.0) * cos(4*a + 4*th - 4*ph);
+    r += (-189.0 / 8192.0) * cos(5*a - 4*b - 4*th - ph);
+    r += SQRT3_GAL * (63.0 / 8192.0) * sin(5*a - 4*b - 4*th - ph);
+    r += (-27.0 / 4096.0) * cos(5*a - 4*b - 2*th - ph);
+    r += SQRT3_GAL * (9.0 / 4096.0) * sin(5*a - 4*b - 2*th - ph);
+    r += (27.0 / 4096.0) * cos(5*a - 4*b + 2*th - ph);
+    r += SQRT3_GAL * (-9.0 / 4096.0) * sin(5*a - 4*b + 2*th - ph);
+    r += (189.0 / 8192.0) * cos(5*a - 4*b + 4*th - ph);
+    r += SQRT3_GAL * (-63.0 / 8192.0) * sin(5*a - 4*b + 4*th - ph);
+    r += (-63.0 / 16384.0) * cos(6*a - 4*b - 4*th - 2*ph);
+    r += SQRT3_GAL * (-63.0 / 16384.0) * sin(6*a - 4*b - 4*th - 2*ph);
+    r += (9.0 / 4096.0) * cos(6*a - 4*b - 2*th - 2*ph);
+    r += SQRT3_GAL * (9.0 / 4096.0) * sin(6*a - 4*b - 2*th - 2*ph);
+    r += (27.0 / 8192.0) * cos(6*a - 4*b - 2*ph);
+    r += SQRT3_GAL * (27.0 / 8192.0) * sin(6*a - 4*b - 2*ph);
+    r += (9.0 / 4096.0) * cos(6*a - 4*b + 2*th - 2*ph);
+    r += SQRT3_GAL * (9.0 / 4096.0) * sin(6*a - 4*b + 2*th - 2*ph);
+    r += (-63.0 / 16384.0) * cos(6*a - 4*b + 4*th - 2*ph);
+    r += SQRT3_GAL * (-63.0 / 16384.0) * sin(6*a - 4*b + 4*th - 2*ph);
+    r += (9.0 / 8192.0) * cos(7*a - 4*b - 4*th - 3*ph);
+    r += SQRT3_GAL * (-3.0 / 8192.0) * sin(7*a - 4*b - 4*th - 3*ph);
+    r += (-9.0 / 4096.0) * cos(7*a - 4*b - 2*th - 3*ph);
+    r += SQRT3_GAL * (3.0 / 4096.0) * sin(7*a - 4*b - 2*th - 3*ph);
+    r += (9.0 / 4096.0) * cos(7*a - 4*b + 2*th - 3*ph);
+    r += SQRT3_GAL * (-3.0 / 4096.0) * sin(7*a - 4*b + 2*th - 3*ph);
+    r += (-9.0 / 8192.0) * cos(7*a - 4*b + 4*th - 3*ph);
+    r += SQRT3_GAL * (3.0 / 8192.0) * sin(7*a - 4*b + 4*th - 3*ph);
+    r += (3.0 / 65536.0) * cos(8*a - 4*b - 4*th - 4*ph);
+    r += SQRT3_GAL * (3.0 / 65536.0) * sin(8*a - 4*b - 4*th - 4*ph);
+    r += (-3.0 / 16384.0) * cos(8*a - 4*b - 2*th - 4*ph);
+    r += SQRT3_GAL * (-3.0 / 16384.0) * sin(8*a - 4*b - 2*th - 4*ph);
+    r += (9.0 / 32768.0) * cos(8*a - 4*b - 4*ph);
+    r += SQRT3_GAL * (9.0 / 32768.0) * sin(8*a - 4*b - 4*ph);
+    r += (-3.0 / 16384.0) * cos(8*a - 4*b + 2*th - 4*ph);
+    r += SQRT3_GAL * (-3.0 / 16384.0) * sin(8*a - 4*b + 2*th - 4*ph);
+    r += (3.0 / 65536.0) * cos(8*a - 4*b + 4*th - 4*ph);
+    r += SQRT3_GAL * (3.0 / 65536.0) * sin(8*a - 4*b + 4*th - 4*ph);
+    return GAL_RESPONSE_K * r;
 }
 
 // ============================================================================
@@ -895,7 +854,7 @@ void normalize_weights_kernel(double *weights, double inv_total, int N_sky)
 // For a source in direction n (ecliptic lam, beta) and orthonormal p, q ⊥ n:
 //   A+(u) = (u.p)^2 - (u.q)^2,  Ax(u) = 2 (u.p)(u.q)
 //   F_X = A(u12) - A(u13),  F_Y = A(u23) - A(u12),  F_Z = A(u13) - A(u23)
-//   R_IJ = NORM * (F+_I F+_J + Fx_I Fx_J)   (polarization/inclination average)
+//   R_IJ = K * (F+_I F+_J + Fx_I Fx_J)   (polarization/inclination average, same K as the closed forms)
 // Output order k: XX, XY, XZ, YY, YZ, ZZ.
 // ============================================================================
 
@@ -924,12 +883,12 @@ void orbit_response(double lam, double beta, const double *arms_t, double *out)
     double FpY = Ap[2] - Ap[0], FxY = Ax[2] - Ax[0];
     double FpZ = Ap[1] - Ap[2], FxZ = Ax[1] - Ax[2];
 
-    out[0] = GAL_ORBIT_RESPONSE_NORM * (FpX * FpX + FxX * FxX);
-    out[1] = GAL_ORBIT_RESPONSE_NORM * (FpX * FpY + FxX * FxY);
-    out[2] = GAL_ORBIT_RESPONSE_NORM * (FpX * FpZ + FxX * FxZ);
-    out[3] = GAL_ORBIT_RESPONSE_NORM * (FpY * FpY + FxY * FxY);
-    out[4] = GAL_ORBIT_RESPONSE_NORM * (FpY * FpZ + FxY * FxZ);
-    out[5] = GAL_ORBIT_RESPONSE_NORM * (FpZ * FpZ + FxZ * FxZ);
+    out[0] = GAL_RESPONSE_K * (FpX * FpX + FxX * FxX);
+    out[1] = GAL_RESPONSE_K * (FpX * FpY + FxX * FxY);
+    out[2] = GAL_RESPONSE_K * (FpX * FpZ + FxX * FxZ);
+    out[3] = GAL_RESPONSE_K * (FpY * FpY + FxY * FxY);
+    out[4] = GAL_RESPONSE_K * (FpY * FpZ + FxY * FxZ);
+    out[5] = GAL_RESPONSE_K * (FpZ * FpZ + FxZ * FxZ);
 }
 
 CUDA_KERNEL
@@ -1018,15 +977,15 @@ void sky_average_response_kernel(
     for (int i = blockIdx.x * blockDim.x + tid; i < N_sky; i += gridDim.x * blockDim.x)
     {
         double lam  = lam_ecl[i];
-        double beta = beta_ecl[i];
+        double th   = 0.5 * M_PI - beta_ecl[i];   // polar angle from the ecliptic pole
         double w    = weights[i];
 
-        acc[0] += w * galaxy_XX(alpha0, beta0, beta, lam, delta_t);
-        acc[1] += w * galaxy_XY(alpha0, beta0, beta, lam, delta_t);
-        acc[2] += w * galaxy_XZ(alpha0, beta0, beta, lam, delta_t);
-        acc[3] += w * galaxy_YY(alpha0, beta0, beta, lam, delta_t);
-        acc[4] += w * galaxy_YZ(alpha0, beta0, beta, lam, delta_t);
-        acc[5] += w * galaxy_ZZ(alpha0, beta0, beta, lam, delta_t);
+        acc[0] += w * galaxy_XX(alpha0, beta0, th, lam, delta_t);
+        acc[1] += w * galaxy_XY(alpha0, beta0, th, lam, delta_t);
+        acc[2] += w * galaxy_XZ(alpha0, beta0, th, lam, delta_t);
+        acc[3] += w * galaxy_YY(alpha0, beta0, th, lam, delta_t);
+        acc[4] += w * galaxy_YZ(alpha0, beta0, th, lam, delta_t);
+        acc[5] += w * galaxy_ZZ(alpha0, beta0, th, lam, delta_t);
     }
 
     for (int k = 0; k < 6; k++) s[k][tid] = acc[k];
@@ -1051,14 +1010,14 @@ void sky_average_response_kernel(
         for (int i = 0; i < N_sky; i++)
         {
             double lam  = lam_ecl[i];
-            double beta = beta_ecl[i];
+            double th   = 0.5 * M_PI - beta_ecl[i];   // polar angle from the ecliptic pole
             double w    = weights[i];
-            acc[0] += w * galaxy_XX(alpha0, beta0, beta, lam, delta_t);
-            acc[1] += w * galaxy_XY(alpha0, beta0, beta, lam, delta_t);
-            acc[2] += w * galaxy_XZ(alpha0, beta0, beta, lam, delta_t);
-            acc[3] += w * galaxy_YY(alpha0, beta0, beta, lam, delta_t);
-            acc[4] += w * galaxy_YZ(alpha0, beta0, beta, lam, delta_t);
-            acc[5] += w * galaxy_ZZ(alpha0, beta0, beta, lam, delta_t);
+            acc[0] += w * galaxy_XX(alpha0, beta0, th, lam, delta_t);
+            acc[1] += w * galaxy_XY(alpha0, beta0, th, lam, delta_t);
+            acc[2] += w * galaxy_XZ(alpha0, beta0, th, lam, delta_t);
+            acc[3] += w * galaxy_YY(alpha0, beta0, th, lam, delta_t);
+            acc[4] += w * galaxy_YZ(alpha0, beta0, th, lam, delta_t);
+            acc[5] += w * galaxy_ZZ(alpha0, beta0, th, lam, delta_t);
         }
         for (int k = 0; k < 6; k++)
             R_avg_out[t_idx * 6 + k] = acc[k];

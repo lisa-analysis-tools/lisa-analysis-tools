@@ -24,9 +24,10 @@
 #define SQRT3_GAL  1.7320508075688772935
 #define PI2_GAL    (M_PI / 2.0)
 #define OMEGA_LISA (2.0 * M_PI / 3.154e7)   // rad/s — matches galaxy_transfer.py
-// Scale of the detector-tensor (orbit) response: its isotropic average of XX is 6/5,
-// the analytic galaxy_XX formula averages to 5 -> 25/6 keeps the meaning of Amp.
-#define GAL_ORBIT_RESPONSE_NORM (25.0 / 6.0)
+// Population constant of the galaxy response R_ab = K [F+^a F+^b + Fx^a Fx^b]:
+//   K = <(1 + cos^2 i)^2> + 4 <cos^2 i> = 16/5 for inclinations uniform in cos(i).
+// Shared by the closed-form (analytic) and the orbit-based responses. Isotropic sky average of R_XX: K * 6/5.
+#define GAL_RESPONSE_K (16.0 / 5.0)
 
 
 // ============================================================================
@@ -155,8 +156,8 @@ struct GalacticGrid {
      * D_X = u12 u12 - u13 u13, D_Y = u23 u23 - u12 u12, D_Z = u13 u13 - u23 u23 and
      * F+_I = D_I : (pp - qq), Fx_I = D_I : (pq + qp), the polarization- and
      * inclination-averaged response is R_IJ ∝ F+_I F+_J + Fx_I Fx_J (low-frequency limit).
-     * It is scaled by GAL_ORBIT_RESPONSE_NORM so that its isotropic sky average equals
-     * the one of the analytic formulas (5 for XX): the meaning of Amp is unchanged.
+     * It is scaled by GAL_RESPONSE_K, like the closed-form response: the two agree for
+     * rigid cartwheel orbits.
      *
      * @param arms_in  (N_times_in, 3, 3) arm unit vectors u12, u13, u23 in the ecliptic frame,
      *                 at the same times as passed to initialize(). Copied.
