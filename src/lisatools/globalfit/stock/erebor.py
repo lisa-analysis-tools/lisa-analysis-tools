@@ -67,6 +67,7 @@ class GBSettings(Settings):
     num_repeat_proposals: int = 100
     search_kwargs: Optional[dict] = None
     stretch_probability: float = 0.5
+    num_stationary_fim_steps: int = 1
     group_proposal_kwargs: Optional[dict] = None
     start_freq_ind: Optional[int] = 0  # goes into GPU for start of data stream
     t0: Optional[float] = 0.0

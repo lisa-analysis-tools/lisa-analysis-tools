@@ -1705,6 +1705,11 @@ def build_gb_moves(
             )
 
     def _create_move(name: str) -> GBSpecialBase:
+        # * the search moves recompute each source's Fisher matrix at every block, since a source
+        # * climbing onto its signal needs one at its current position
+        fim_interval = (
+            1 if name.endswith("_search") else int(getattr(gb_info, "num_stationary_fim_steps", 1))
+        )
         if name == "rj_prior_search":
             move = GBSpecialRJPriorMove(
                 *gb_move_args,
@@ -1714,6 +1719,7 @@ def build_gb_moves(
                 phase_maximize=False,
                 ranks_needed=0,
                 run_swaps=True,
+                num_stationary_fim_steps=fim_interval,
                 **gb_move_kwargs,
             )
         elif name == "rj_fstat_mcmc_search":
@@ -1725,6 +1731,7 @@ def build_gb_moves(
                 name="rj_fstat_mcmc_search",
                 phase_maximize=False,
                 ranks_needed=0,
+                num_stationary_fim_steps=fim_interval,
                 **{**gb_move_kwargs, "leaf_cap_update": False},
             )
         elif name == "rj_refit_search":
@@ -1737,6 +1744,7 @@ def build_gb_moves(
                 fp=_refit_fp,
                 phase_maximize=False,
                 ranks_needed=0,
+                num_stationary_fim_steps=fim_interval,
                 **{**gb_move_kwargs, "leaf_cap_update": False},
             )
         elif name == "rj_prior":
@@ -1748,6 +1756,7 @@ def build_gb_moves(
                 phase_maximize=False,
                 ranks_needed=0,
                 run_swaps=True,
+                num_stationary_fim_steps=fim_interval,
                 **gb_move_kwargs,
             )
         elif name == "rj_fstat_mcmc":
@@ -1758,6 +1767,7 @@ def build_gb_moves(
                 name="rj_fstat_mcmc",
                 phase_maximize=False,
                 ranks_needed=0,
+                num_stationary_fim_steps=fim_interval,
                 **{**gb_move_kwargs, "leaf_cap_update": False},
             )
         elif name == "rj_refit":
@@ -1769,6 +1779,7 @@ def build_gb_moves(
                 fp=_refit_fp,
                 phase_maximize=False,
                 ranks_needed=0,
+                num_stationary_fim_steps=fim_interval,
                 **{**gb_move_kwargs, "leaf_cap_update": False},
             )
         else:

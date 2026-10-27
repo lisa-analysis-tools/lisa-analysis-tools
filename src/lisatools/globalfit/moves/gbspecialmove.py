@@ -214,6 +214,10 @@ PRIOR_PRECISION_FACTOR = 12.0
 JACOBIAN_STEP_RELATIVE = 1e-6
 JACOBIAN_STEP_FLOOR = 1e-3
 
+# * Cached Fisher Information matrices in the gb branch supplemental, per leaf slot:
+# * FIM in the sampling basis, the prior widths, the blocks served, and whether the slot holds one.
+_FIM_STORE_KEYS = ("fim_matrix", "fim_widths", "fim_age", "fim_valid")
+
 
 def fisher_proposal_factor(info_sampling, prior_widths, beta, xp=np):
     """Factor L with L L^T = (beta F + P)^-1 per source, P = diag(12 / w^2), in correlation form.
@@ -359,6 +363,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         gb_stft_comp: Optional :class:`gbgpu.gbcomps.STFTGBComputations`
             instance. Required when ``mgh.settings`` is an
             :class:`~lisatools.domains.STFTSettings`; ignored otherwise.
+        num_stationary_fim_steps: Blocks of in-model repeats a source's Fisher
+            matrix serves before it is recomputed at the source's position. 1
+            recomputes it at every block.
     """
 
     @property
@@ -402,6 +409,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         stretch_probability=0.5,
         band_units=2,
         gamma_base=0.84, # = 2.38 / sqrt(D) where D=8
+        num_stationary_fim_steps: int = 1,
         debug_settings: Optional[GBDebugSettings] = None,
         sighet_settings: Optional[GBSigHetSettings] = None,
         leaf_cap_settings: Optional[GBLeafCapSettings] = None,
@@ -516,6 +524,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self.band_units = max(1, int(band_units))
         self.jump_scales = float(gamma_base) * self.xp.array([0.2, 1.0, 2.5])
         self.jump_scales_probs = self.xp.array([0.2, 0.6, 0.2])
+        fim_interval = num_stationary_fim_steps
+        if int(fim_interval) != fim_interval or fim_interval < 1:
+            raise ValueError(
+                f"num_stationary_fim_steps must be a positive integer, got {fim_interval}"
+            )
+        self.num_stationary_fim_steps = int(num_stationary_fim_steps)
+        self._held_fim_rows = None
 
         # Parent binding: config-only FD comp + move-level engine. A user-
         # supplied gb_fd_comp is honored as-is; otherwise one is built from
@@ -1459,6 +1474,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         if bool(accept.any()):
             acc_ids = ids[accept]
             band_sorter.inds[acc_ids] = ~band_sorter.inds[acc_ids]
+
+            # a born source has no Fisher matrix yet and a dead one loses its own
+            rows = getattr(self, "_held_fim_rows", None)
+            if rows is not None:
+                row_ids = asnumpy(acc_ids)
+                rows["fim_valid"][row_ids] = False
+                rows["fim_age"][row_ids] = 0
+
             # Phase-maximised births carry the rotated phi0 forward.
             band_sorter.coords[acc_ids] = self.periodic.wrap(
                 {"gb": params[accept][:, None, :]}, xp=xp
@@ -1644,34 +1667,103 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         info_sampling = info_phys * jacobian[:, :, None] * jacobian[:, None, :]
         return info_sampling, upper - lower, clipped
 
-    def _compute_proposal_cholesky(self, model, band_sorter, ids, beta, cell_f0_lims):
-        """Factor of the proposal covariance (beta F + P)^-1 for the sources ``ids``.
+    def _ensure_fim_store(self, branch):
+        """The held Fisher matrices of the gb ``branch``, created empty when missing.
 
-        F and the widths of P come from _compute_fisher_sampling. ``beta`` (scalar or per source) is
-        the inverse temperature of each source's cell; it is constant over the block, so the
-        proposal stays symmetric. The factor is fisher_proposal_factor.
+        Four host arrays over the leaf slots (ntemps, nwalkers, nleaves_max) in the branch
+        supplemental: the matrix in the sampling basis (..., ndim, ndim), the prior widths
+        (..., ndim), the blocks served and a flag for a held matrix. The HDF5 backends do not save
+        branch supplementals, so after a restart the store starts empty and every source gets a
+        matrix at its next block. A supplemental with other keys gets the four keys added.
+        """
+        ntemps, nwalkers, nleaves_max, ndim = branch.shape
+        base_shape = (ntemps, nwalkers, nleaves_max)
+        supplemental = branch.branch_supplemental
+        if supplemental is not None and all(key in supplemental for key in _FIM_STORE_KEYS):
+            return supplemental
+        empty = {
+            "fim_matrix": np.zeros(base_shape + (ndim, ndim)),
+            "fim_widths": np.zeros(base_shape + (ndim,)),
+            "fim_age": np.zeros(base_shape, dtype=np.int64),
+            "fim_valid": np.zeros(base_shape, dtype=bool),
+        }
+        if supplemental is None:
+            branch.branch_supplemental = BranchSupplemental(empty, base_shape=base_shape)
+        else:
+            supplemental.add_objects(
+                {key: value for key, value in empty.items() if key not in supplemental}
+            )
+        return branch.branch_supplemental
+
+    def _load_fim_rows(self, branch, band_sorter):
+        """Held Fisher matrices of the sorter rows, copied from the rows' slots at the start.
+
+        Accepted tempering swaps exchange the (temperature, walker) labels of the rows, so the
+        per-row copy follows them; _write_back_state puts the rows back at their new slots.
+        """
+        store = self._ensure_fim_store(branch)
+        start_slots = (
+            band_sorter.orig_temp_inds, band_sorter.orig_walker_inds, band_sorter.orig_leaf_inds
+        )
+        slots = tuple(asnumpy(index) for index in start_slots)
+        rows = {key: store.holder[key][slots] for key in _FIM_STORE_KEYS}
+        # a dead slot holds no matrix, so a birth always starts without one
+        rows["fim_valid"] &= asnumpy(band_sorter.inds)
+        return rows
+
+    def _compute_proposal_cholesky(self, model, band_sorter, ids, beta, cell_f0_lims):
+        """Factor of the proposal covariance (beta F + P)^-1 for the sources ``ids`` (sorter rows).
+
+        Each source holds its Fisher matrix in the sampling basis and its prior widths for
+        ``num_stationary_fim_steps`` blocks: a source without a held pair, or whose pair has served
+        that many blocks, gets a new pair from _compute_fisher_sampling at its current position.
+        The factor is rebuilt every block from the held pair with the cell's current ``beta``, so a
+        source that changed temperature keeps its matrix and takes the new beta. Between refreshes
+        the factor does not depend on the current position, so the proposal is symmetric.
         """
         xp = self.xp
-        n_src = len(ids)
-        info_sampling, prior_widths, clipped = self._compute_fisher_sampling(
-            model, band_sorter, ids, cell_f0_lims
+        rows = self._held_fim_rows
+        if rows is None:
+            raise RuntimeError("the held Fisher matrices are loaded by propose (_load_fim_rows)")
+        row_ids = asnumpy(ids)
+        due = ~rows["fim_valid"][row_ids] | (
+            rows["fim_age"][row_ids] >= self.num_stationary_fim_steps
         )
+        clipped_count = 0
+        if due.any():
+            due_device = xp.asarray(due)
+            info_sampling, prior_widths, clipped = self._compute_fisher_sampling(
+                model, band_sorter, ids[due_device],
+                (cell_f0_lims[0][due_device], cell_f0_lims[1][due_device]),
+            )
+            due_rows = row_ids[due]
+            rows["fim_matrix"][due_rows] = asnumpy(info_sampling)
+            rows["fim_widths"][due_rows] = asnumpy(prior_widths)
+            rows["fim_age"][due_rows] = 0
+            rows["fim_valid"][due_rows] = True
+            clipped_count = int(clipped.sum())
         timer = getattr(self, "_prop_timer", None)
         with _tspan(timer, "fisher_eigh"):
-            chol, diagnostics = fisher_proposal_factor(info_sampling, prior_widths, beta, xp=xp)
+            chol, diagnostics = fisher_proposal_factor(
+                xp.asarray(rows["fim_matrix"][row_ids]), xp.asarray(rows["fim_widths"][row_ids]),
+                beta, xp=xp,
+            )
+        rows["fim_age"][row_ids] += 1
 
         if logger.isEnabledFor(logging.DEBUG):
+            n_src = len(row_ids)
             condition = diagnostics["condition"]
             largest = (
                 float(xp.max(xp.where(xp.isfinite(condition), condition, 0.0)))
                 if n_src else float("nan")
             )
             logger.debug(
-                "%s: Fisher factor of %d sources: %d with a prior-dominated direction, largest "
-                "condition number of C %.3e, %d evaluated at a clipped point, %d given the prior "
-                "factor.",
-                self.name, n_src, int(diagnostics["prior_dominated"].sum()),
-                largest, int(clipped.sum()), int(diagnostics["fallback"].sum()),
+                "%s: Fisher factor of %d sources (%d new matrices, %d at a clipped point): %d with "
+                "a prior-dominated direction, largest condition number of C %.3e, %d given the "
+                "prior factor.",
+                self.name, n_src, int(due.sum()), clipped_count,
+                int(diagnostics["prior_dominated"].sum()), largest,
+                int(diagnostics["fallback"].sum()),
             )
         return chol
 
@@ -2435,8 +2527,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         (all ``False``, then ``True`` at the repacked leaves), so RJ
         births/deaths and tempering walker reassignments all land here.
 
-        TODO: NEED TO PROPERLY MOVE SUPPLEMENTAL INFO BASED ON OLD LEAVES
-        (``inds_old`` below is the source-side index for that move).
+        The held Fisher matrices of the live rows (``_held_fim_rows``) move to
+        the same new slots of the gb branch supplemental; every other slot ends
+        without one.
         """
         alive = band_sorter.inds
         special_indices_finish = (
@@ -2474,7 +2567,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         new_state.branches["gb"].inds[:] = False
         # turn on all the ones that are there
         new_state.branches["gb"].inds[inds_new] = True
-        # new_state.branches["gb"].branch_supplemental[inds_new] = state.branches["gb"].branch_supplemental[inds_old]
+        # * held Fisher matrices: an empty store, then the live rows at their new slots
+        rows = getattr(self, "_held_fim_rows", None)
+        if rows is not None:
+            store = self._ensure_fim_store(new_state.branches["gb"]).holder
+            alive_rows = asnumpy(alive)
+            for key in _FIM_STORE_KEYS:
+                store[key][...] = 0
+                store[key][inds_new] = rows[key][alive_rows]
+            self._held_fim_rows = None
 
     def _band_residual_lls(self, acs):
         """Per-band cold-walker residual ll ``-1/2 <r|r>`` from the parent ACA.
@@ -2758,6 +2859,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 stft_store_windows=self.stft_store_windows,
                 verify_buffer=self.debug_settings.verify_buffer,
             )
+        # * held Fisher matrices of the sorter rows, read at each row's start-of-propose slot
+        self._held_fim_rows = self._load_fim_rows(new_state.branches["gb"], band_sorter)
 
         # Cold-chain friend table for the group-stretch half of the in-model
         # mix (rebuilt every proposal; cheap sort of the cold-chain f0s).
