@@ -38,7 +38,7 @@ except (ModuleNotFoundError, ImportError):
 from cudakima import AkimaInterpolant1D
 
 from . import detector as lisa_models
-from .detector import L1Orbits, Orbits
+from .detector import L1Orbits, Orbits, icrs_to_ecliptic
 from .domains import DomainSettingsBase, WDMSettings
 from .stochastic import (
     FittedHyperbolicTangentGalacticForeground,
@@ -2828,6 +2828,13 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
                 - t0: Reference time at which to compute the initial LISA orbital phase and rotation angle.
                 - N_lambda: Number of ecliptic longitude points for quadrature (optional, default 90)
                 - N_beta: Number of ecliptic latitude points for quadrature (optional, default 60)
+                - f_b: Fraction of sources in the bulge, in [0, 1] (optional, default 0 = disk only)
+                - r_b: Bulge scale radius [kpc] (optional, default 0.5)
+                - los_center_half_width: Half width [kpc] of the refined line-of-sight interval around
+                  R_sun (optional; default 5 r_b when f_b > 0, else 0 = single 16-node rule)
+                - los_center_sub: Number of pieces of the refined interval (optional, default 4)
+                - response: ``"orbits"`` (default) for the detector-tensor response built from the
+                  orbit arms, or ``"analytic"`` for the legacy closed-form galaxy_XX..ZZ formulas
                 - galactic_grid: Optional pre-computed galactic grid object (e.g., from another instance) to reuse
         """
         required_keys = ["R_d", "z_d", "t0"]
@@ -2837,7 +2844,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             if not isinstance(kwargs[key], (int, float)):
                 raise ValueError(f"Galactic grid parameter {key} must be a number (int or float).")
 
-        optional_keys = ["N_lambda", "N_beta", "galactic_grid"]
+        optional_keys = ["N_lambda", "N_beta", "los_center_sub", "galactic_grid"]
         for key in optional_keys:
             if key in kwargs and key == "galactic_grid":
                 # galactic_grid can be any object, so we won't check its type here
@@ -2846,6 +2853,16 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
                 if not isinstance(kwargs[key], int):
                     raise ValueError(f"Galactic grid parameter {key} must be an integer.")
 
+        for key in ["f_b", "r_b", "los_center_half_width"]:
+            if key in kwargs and kwargs[key] is not None and not isinstance(kwargs[key], (int, float)):
+                raise ValueError(f"Galactic grid parameter {key} must be a number (int or float).")
+        if not 0.0 <= kwargs.get("f_b", 0.0) <= 1.0:
+            raise ValueError(f"Galactic grid parameter f_b must be in [0, 1], got {kwargs['f_b']}.")
+        if kwargs.get("f_b", 0.0) > 0.0 and kwargs.get("r_b", 0.5) <= 0.0:
+            raise ValueError(f"Galactic grid parameter r_b must be > 0, got {kwargs['r_b']}.")
+        if kwargs.get("response", "orbits") not in ("orbits", "analytic"):
+            raise ValueError(f"Galactic grid parameter response must be 'orbits' or 'analytic', got {kwargs['response']!r}.")
+
     def _setup_galactic_grid(
             self,
             R_d: float,
@@ -2853,7 +2870,12 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             t0: float,
             N_lambda: Optional[int] = 90,
             N_beta: Optional[int] = 60,
-            galactic_grid: Optional[Any] = None
+            galactic_grid: Optional[Any] = None,
+            f_b: float = 0.0,
+            r_b: float = 0.5,
+            los_center_half_width: Optional[float] = None,
+            los_center_sub: int = 4,
+            response: str = "orbits",
         ) -> None:
         """
         Compute the fixed galactic sky geometry if not provided, and attach it to the sensitivity backend.
@@ -2870,7 +2892,25 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             N_lambda: Number of ecliptic longitude points for quadrature (default 90)
             N_beta: Number of ecliptic latitude points for quadrature (default 60)
             galactic_grid: Optional pre-computed galactic grid object (e.g., from another instance) to reuse
+            f_b: Fraction of sources in a spherical Gaussian bulge ``exp(-r^2/r_b^2)``; the rest is in
+                the exponential disk (mass-normalized mixture). ``0`` (default) is the disk-only model.
+            r_b: Bulge scale radius [kpc] (default 0.5)
+            los_center_half_width: Half width [kpc] of the refined line-of-sight interval around
+                R_sun. ``None`` (default) uses ``5 r_b`` when ``f_b > 0`` and the legacy single
+                16-node rule otherwise. The bulge is not resolved by the legacy rule.
+            los_center_sub: Number of 16-node pieces of the refined interval (default 4)
+            response: ``"orbits"`` (default): low-frequency detector-tensor response built from the
+                orbit arm unit vectors at each segment time, ``R_IJ ∝ F+_I F+_J + Fx_I Fx_J``
+                averaged over polarization and inclination. ``"analytic"``: the legacy closed-form
+                ``galaxy_XX..ZZ`` formulas for a rigid constellation started at
+                ``get_constellation_angles(t0)``. Both are normalized to the same isotropic sky
+                average, so ``Amp`` has the same meaning. The analytic formulas do not reproduce
+                the detector response away from the ecliptic plane (and their isotropic average
+                varies by ~5% over the year), so ``"orbits"`` is recommended.
         """
+        if los_center_half_width is None:
+            los_center_half_width = 5.0 * r_b if f_b > 0.0 else 0.0
+
         if galactic_grid is not None:
             self._galactic_grid = galactic_grid
 
@@ -2889,6 +2929,8 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             setup.compute(
                 N_lambda=N_lambda,
                 N_beta=N_beta,
+                los_center_half_width=float(los_center_half_width),
+                los_center_sub=int(los_center_sub),
             )
             
             # logger.debug(f"Galactic sky grid: N_sky={setup.N_sky}, N_quad={setup.N_quad}")
@@ -2916,7 +2958,10 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
                 N_sky=setup.N_sky,
                 alpha0=float(alpha0),
                 beta0=float(beta0),
-                t0=float(t0)
+                t0=float(t0),
+                f_b=float(f_b),
+                r_b=float(r_b),
+                arms=self._orbit_arms(_t_arr) if response == "orbits" else None,
             )
 
             # logger.info("Galactic grid initialized.")
@@ -2939,7 +2984,10 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         N_sky: int,
         alpha0: float,
         beta0: float,
-        t0: float
+        t0: float,
+        f_b: float = 0.0,
+        r_b: float = 0.5,
+        arms: Optional[np.ndarray] = None,
     ) -> None:
         """
         Build the GalacticGridWrap, compute fixed sky weights and R_avg, and
@@ -2957,11 +3005,16 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             cos_beta_ecl: (N_sky,) cos(beta) for solid-angle weighting
             lam_ecl:      (N_sky,) ecliptic longitudes
             beta_ecl:     (N_sky,) ecliptic latitudes
-            N_quad:       Number of quadrature nodes (16)
+            N_quad:       Number of line-of-sight quadrature nodes
             N_sky:        Number of sky pixels
             alpha0:       LISA orbit initial phase (rad)
             beta0:        LISA orbit inclination (rad)
             t0:           Reference time for constellation angles (s)
+            f_b:          Fraction of sources in the bulge (0 = disk only)
+            r_b:          Bulge scale radius [kpc]
+            arms:         Optional (N_times, 3, 3) arm unit vectors u12, u13, u23 (ecliptic) at
+                          ``times``; if given, the detector-tensor response is used
+                          (see :meth:`_orbit_arms`), otherwise the analytic formulas.
         """
         GalWrap = self.backend.GalacticGridWrap
 
@@ -2981,12 +3034,35 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             self.num_freqs,
         )
 
+        if arms is not None:
+            self._galactic_grid.set_detector_arms_wrap(
+                self.xp.ascontiguousarray(self.xp.asarray(arms, dtype=self.xp.float64).ravel()), len(times)
+            )
+
         self._galactic_grid.initialize_wrap(
             self.xp.asarray(times),
             R_d,
             z_d,
             len(times),
+            f_b,
+            r_b,
         )
+
+    def _orbit_arms(self, times: np.ndarray) -> np.ndarray:
+        """Arm unit vectors u12, u13, u23 from the orbits at ``times``, in the ecliptic frame.
+
+        Args:
+            times: (N_times,) times [s].
+
+        Returns:
+            (N_times, 3, 3) array (time, arm, xyz), on the host.
+        """
+        t = self.orbits.xp.asarray(np.asarray(asnumpy(times), dtype=np.float64))
+        pos = np.stack([asnumpy(self.orbits.get_pos(t, sc=sc)) for sc in (1, 2, 3)], axis=1)  # (N, sc, xyz)
+        if getattr(self.orbits, "frame", "ecliptic") == "icrs":
+            pos = icrs_to_ecliptic(pos)
+        unit = lambda v: v / np.linalg.norm(v, axis=-1, keepdims=True)
+        return np.stack([unit(pos[:, 1] - pos[:, 0]), unit(pos[:, 2] - pos[:, 0]), unit(pos[:, 2] - pos[:, 1])], axis=1)
 
     def disable_galactic_grid(self) -> None:
         """Detach the galactic foreground from all subsequent likelihood evaluations.

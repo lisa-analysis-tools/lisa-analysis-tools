@@ -589,7 +589,10 @@ void detector_part(nb::module_ &m) {
     nb::class_<GalacticGridSetup>(m, "GalacticGridSetup")
     .def(nb::init<>())
     .def("compute", &GalacticGridSetup::compute,
-         nb::arg("N_lambda") = 90, nb::arg("N_beta") = 60)
+         nb::arg("N_lambda") = 90, nb::arg("N_beta") = 60,
+         nb::arg("los_center_half_width") = 0.0, nb::arg("los_center_sub") = 1,
+         "Build the sky grid and line-of-sight quadrature. With los_center_half_width > 0\n"
+         "the line of sight is split around R_sun (finer sampling, needed for the bulge).")
     .def("print_summary", &GalacticGridSetup::print_summary)
     .def_ro("N_lambda", &GalacticGridSetup::N_lambda)
     .def_ro("N_beta",   &GalacticGridSetup::N_beta)
@@ -637,8 +640,13 @@ void detector_part(nb::module_ &m) {
          "Call initialize_wrap() once before inference starts.")
     .def("initialize_wrap", &GalacticGridWrap::initialize_wrap,
          nb::arg("times"), nb::arg("R_d"), nb::arg("z_d"), nb::arg("N_times"),
-         "Compute fixed sky weights and R_avg from disk parameters and orbit times.\n"
+         nb::arg("f_b") = 0.0, nb::arg("r_b") = 0.5,
+         "Compute fixed sky weights and R_avg from disk (+ bulge) parameters and orbit times.\n"
          "Must be called once before passing this object to set_galactic_grid().")
+    .def("set_detector_arms_wrap", &GalacticGridWrap::set_detector_arms_wrap,
+         nb::arg("arms"), nb::arg("N_times"),
+         "Use the detector-tensor response from the orbit arms (N_times, 3, 3: u12, u13, u23,\n"
+         "ecliptic) instead of the analytic formulas. Call before initialize_wrap().")
     .def("compute_gal_covariance_wrap", &GalacticGridWrap::compute_gal_covariance_wrap,
          nb::arg("freqs"),
          nb::arg("Amp"), nb::arg("alpha"),
