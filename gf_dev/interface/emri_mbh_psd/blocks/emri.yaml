@@ -1,0 +1,28 @@
+type: emri
+priors: {class: mojitolight.EMRIPrior}
+waveform:
+  class: EMRITDIWaveform
+  kwargs:
+    waveform_kwargs:
+      sum_kwargs: {pad_output: true}
+      inspiral_kwargs: {DENSE_STEPPING: 0, buffer_length: 100, err: 1e-8}
+      amplitude_kwargs: {}
+    tdi_generation: 2nd generation
+    tdi_channels: XYZ
+    order: 30
+    buffer_time: 15000
+    fft_batch_size: 1
+    run_async: true
+  runtime_kwargs: {mode_selection_threshold: 1e-4}
+num_prop_repeats: 50
+tempering: {ntemps: 1}
+inner_moves:
+  - {class: StretchMove, weight: 0.4}
+  - {class: DEMove, weight: 0.4}
+  # ConditionalFlowMove (weight 0.2) comes with WP-D
+search:
+  search_type: catalog
+  spread: 1e-6
+# pe_move: default EMRISpecialMove {permute_every: 25, pad_out_of_prior, run_async, run_threaded, randomize_split, batch_size_per_gpu: 5}
+links:
+  waveform_model_code_link: https://github.com/Erebor-L2D/LISAanalysistools/blob/9d63bb1e63e7b8f640d3780551d9421df5245992/src/lisatools/sources/emri/waveform.py#L130

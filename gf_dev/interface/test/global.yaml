@@ -1,0 +1,47 @@
+schema_version: 1
+run:
+  name: test_run
+  output_dir: out
+  submission_dir: out_sub
+
+sampler:
+  nwalkers: 4
+  ntemps: 10
+
+compute:
+  head_rank: 1
+  main_rank: 0
+  backend: cpu
+
+data:
+  loader: mojito_l1
+  path: /Volumes/as_storage/mojito/mojito_light_2p5s/
+  source_types: ["NOISE"]
+  orbits: 
+    type: l1
+    frame: icrs
+    armlength: 2.5e9
+  Tobs: 1 yr
+  dt: 5 s
+  highpass: {cutoff: 1e-5, order: 2, zero_phase: true}
+  lowpass: {cutoff: 1e-1, order: 2, zero_phase: true}
+  downsample: {window: ["kaiser", 5]}
+  trim: {duration: 200 h, trimming_type: "from_each_end"}
+    
+domain:
+  type: stft
+  min_freq: 1e-4
+  max_freq: 1e-1
+  segment_duration: 1 day
+
+metadata:
+  codename: erebor
+
+window:
+  type: tukey
+  taper_duration: auto
+  normalize: true
+
+sensitivity:
+  class: XYZSensitivityBackend
+  kwargs: {tdi_generation: 2, mask_percentage: 0.02}

@@ -1,0 +1,62 @@
+# Port of mojito_input/emri_mbh_psd_settings.py (flow proposals left out until WP-D).
+schema_version: 1
+run:
+  name: test_flow_joint_sources_stft
+  output_dir: /data/asantini/globalfit/erebor_org_setup/mojito_runs/
+  seed: 103209
+  num_iterations: 500
+  backup_iter: 5
+
+sampler:
+  nwalkers: 24
+  ntemps: 4
+
+compute:
+  gpus: [5, 6]
+  backend: cuda12x
+  head_rank: 1
+  main_rank: 0
+
+data:
+  loader: mojito_l1
+  path: /data/asantini/globalfit/MOJITO_DATA/mojito_light_2p5s/
+  source_types: [noise, mbhb, emri]
+  source_ids:
+    emri: [0, 3]
+    mbhb: [18, 5, 16, 7, 2, 12]
+  orbits: {type: l1, frame: icrs}
+  reference_time: 97729089.327664  # MOJITO_REFERENCE_TIME
+  Tobs: 1 yr
+  dt: 5 s
+  highpass: {cutoff: 1e-5, order: 2, zero_phase: true}
+  lowpass: {cutoff: 1e-1, order: 2, zero_phase: true}
+  downsample: {window: [kaiser, 31.0]}
+  trim: {duration: 200 h, trimming_type: from_each_end}
+
+domain:
+  type: stft
+  min_freq: 1e-4
+  max_freq: 2.9e-2
+  segment_duration: 1 day
+
+window:
+  type: tukey
+  taper_duration: auto  # 1 / domain.min_freq
+  normalize: true
+
+sensitivity:
+  class: XYZSensitivityBackend
+  kwargs: {tdi_generation: 2, mask_percentage: 0.02, average_transfer_functions: true}
+
+metadata:
+  codename: erebor
+  version: CDL1run0_v0
+  contact: ereborl2d@googlegroups.com
+  code_link: https://github.com/Erebor-L2D/LISAanalysistools/releases/tag/cdl1-run_0
+  input_data_link: ""
+  input_reference: mojito light
+  noise_model: parametric
+  noise_model_code_link: https://github.com/Erebor-L2D/LISAanalysistools/blob/9d63bb1e63e7b8f640d3780551d9421df5245992/src/lisatools/sensitivity.py#L1797
+  comment: ""
+
+# recipe: absent -> StockRecipe (psd search, then joint PE), as the settings file's setup_recipe
