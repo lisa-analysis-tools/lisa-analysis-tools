@@ -68,7 +68,7 @@ public:
     int     n_links;
     int     left_mosas[3];
     int     generation;
-    double window_factor;
+    double *noise_normalization;
 
     NoiseLevels noise_levels;
 
@@ -86,10 +86,34 @@ public:
     double *tm_xx_avg  = nullptr, *tm_yy_avg  = nullptr, *tm_zz_avg  = nullptr;
     gcmplx::complex<double> *tm_xy_avg  = nullptr, *tm_xz_avg  = nullptr, *tm_yz_avg  = nullptr;
 
+    // --- unequal (per-MOSA) noise amplitudes ---
+    // n_noise_par = 1: one OMS and one TM amplitude shared by all MOSAs (symmetric).
+    // n_noise_par = 6: one amplitude per MOSA, ordered as the links 12,23,31,13,32,21.
+    // The amplitude arrays are then laid out [psd_i * n_noise_par + mosa].
+    int n_noise_par = 1;
+    // FD time-averaged per-MOSA basis TFs (non-owned). Layout [k * nf_avg + f_idx]:
+    //   auto  k = ch * 8 + q * 2 + type   (q indexes mosa_channel_link(ch, q) in PSD.cu, type 0 = OMS, 1 = TM)
+    //   cross k = p * 4 + q * 2 + type    (p = XY, XZ, YZ; q indexes mosa_cross_link(p, q))
+    bool   use_averaged_mosa_tfs = false;
+    double *mosa_auto_avg = nullptr;
+    gcmplx::complex<double> *mosa_cross_avg = nullptr;
+
+    // --- downsampling aliasing (non-owned) ---
+    // Decimating by D folds the residual power at the D - 1 alias frequencies of f
+    // (k fs' +- f, below the pre-decimation Nyquist) back onto f. With n_alias > 0,
+    // get_noise_covariance adds those terms. Grid index g = a * n_grid + f_idx (a = 0
+    // is f itself, a >= 1 the alias grids) addresses noise_normalization and the
+    // averaged TFs, which are then laid out on that extended grid of
+    // (1 + n_alias) * n_grid points. alias_freqs[(a - 1) * n_grid + f_idx] is signed:
+    // a negative value folds from a negative frequency, so its cross terms are conjugated.
+    int    n_alias = 0;
+    int    n_grid = 0;
+    double *alias_freqs = nullptr;
+
     // ---- constructor ----
     XYZSensitivityMatrix(double *averaged_ltts_arr_, double *delta_ltts_arr_,
                          int n_times_, double armlength_,
-                         int generation_, bool spline_noise_, double window_factor_)
+                         int generation_, bool spline_noise_, double *noise_normalization_)
         : noise_levels(true, spline_noise_, .4e-3, 8e-3, 2.0e-3)
     {
         averaged_ltts_arr = averaged_ltts_arr_;
@@ -101,7 +125,7 @@ public:
         left_mosas[0]     = 12;
         left_mosas[1]     = 23;
         left_mosas[2]     = 31;
-        window_factor     = window_factor_;
+        noise_normalization = noise_normalization_;
         // galactic foreground disabled by default
         gal_R_avg    = nullptr;
         use_galactic = false;
@@ -117,6 +141,14 @@ public:
                           double* tm_xx,  gcmplx::complex<double>* tm_xy,  gcmplx::complex<double>* tm_xz,
                           double* tm_yy,  gcmplx::complex<double>* tm_yz,  double* tm_zz, int nf);
     void disable_averaged_tfs();
+
+    // ---- unequal-noise switch and per-MOSA averaged TFs (host-only, defined in PSD.cu) ----
+    void set_noise_symmetry(bool asymmetric);
+    void set_averaged_mosa_tfs(double* mosa_auto, gcmplx::complex<double>* mosa_cross, int nf);
+
+    // ---- downsampling aliasing (host-only, defined in PSD.cu) ----
+    void set_aliasing(double* alias_freqs_, int n_alias_, int n_grid_);
+    void disable_aliasing();
 
     // ---- device: noise transfer functions ----
     CUDA_DEVICE int get_adjacent_mosa(int mosa);
@@ -135,10 +167,27 @@ public:
         double *tm_yy,  gcmplx::complex<double> *tm_yz,  double *tm_zz,
         int time_index);
 
+    // per-MOSA basis TFs: 24 auto (double) + 12 cross (complex), layout as the *_avg arrays
+    CUDA_DEVICE void get_noise_tfs_mosa(
+        double f, double *mosa_auto, gcmplx::complex<double> *mosa_cross, int time_index);
+
     // ---- device: noise covariance ----
+    // Covariance at one frequency; grid_idx addresses noise_normalization and the
+    // averaged TFs (see the aliasing note above).
+    CUDA_DEVICE void get_noise_covariance_single(
+        double f, int time_index, int grid_idx,
+        const double *Soms_d_in, const double *Sa_a_in,
+        double Amp, double alpha, double f_1, double f_knee, double f_2,
+        double spline_in_isi_oms, double spline_in_testmass,
+        double *c00, gcmplx::complex<double> *c01, gcmplx::complex<double> *c02,
+        double *c11, gcmplx::complex<double> *c12, double *c22);
+
+    // Covariance of the (possibly decimated) data at grid frequency f_idx: the direct
+    // term plus, when aliasing is set, the folded alias terms.
+    // Soms_d_in / Sa_a_in point to n_noise_par amplitudes for this PSD.
     CUDA_DEVICE void get_noise_covariance(
         double f, int time_index, int f_idx,
-        double Soms_d_in, double Sa_a_in,
+        const double *Soms_d_in, const double *Sa_a_in,
         double Amp, double alpha, double f_1, double f_knee, double f_2,
         double spline_in_isi_oms, double spline_in_testmass,
         double *c00, gcmplx::complex<double> *c01, gcmplx::complex<double> *c02,
@@ -154,6 +203,12 @@ public:
         int num_freqs, int num_times,
         int *time_indices);
 
+    // out layout [(t_idx * 24 + k) * num_freqs + f_idx] (auto) and
+    //            [(t_idx * 12 + k) * num_freqs + f_idx] (cross)
+    void get_noise_tfs_mosa_arr(
+        double *freqs, double *mosa_auto, gcmplx::complex<double> *mosa_cross,
+        int num_freqs, int num_times, int *time_indices);
+
     void psd_likelihood_wrap(
         double *like_contrib_final, double *f_arr, gcmplx::complex<double> *data,
         int *data_index_all, int *time_index_all,
@@ -161,16 +216,18 @@ public:
         double *Amp_all, double *alpha_all, double *f_1_all, double *f_knee_all, double *f_2_all,
         double *spline_in_isi_oms_all, double *spline_in_testmass_all,
         double differential_component, int num_freqs, int num_times,
-        bool *dips_mask, int num_psds, bool run_async = false);
+        bool *dips_mask, int num_psds, 
+        double *c00_all, double *c11_all, double *c22_all, cmplx *c01_all, cmplx *c02_all, cmplx *c12_all,
+        bool use_external_matrix = false, bool run_async = false);
 
     void get_noise_covariance_arr(
         double *freqs, int *time_indices,
-        double Soms_d_in, double Sa_a_in,
-        double Amp, double alpha, double f_1, double f_knee, double f_2,
+        double *Soms_d_in_all, double *Sa_a_in_all,
+        double *Amp_all, double *alpha_all, double *f_1_all, double *f_knee_all, double *f_2_all,
         double *spline_in_isi_oms_all, double *spline_in_testmass_all,
         double *c00_arr, gcmplx::complex<double> *c01_arr, gcmplx::complex<double> *c02_arr,
         double *c11_arr, gcmplx::complex<double> *c12_arr, double *c22_arr,
-        int num_freqs, int num_times);
+        int num_freqs, int num_times, int num_psds, bool run_async = false);
 
     void get_inverse_det_arr(
         double *c00_arr, gcmplx::complex<double> *c01_arr, gcmplx::complex<double> *c02_arr,

@@ -169,57 +169,93 @@ void XYZSensitivityMatrixWrap::psd_likelihood_wrap(
     array_type<double> f_1_all, array_type<double> f_knee_all, array_type<double> f_2_all,
     array_type<double> spline_in_isi_oms_all, array_type<double> spline_in_testmass_all,
     double differential_component, int num_freqs, int num_times,
-    array_type<bool> dips_mask, int num_psds, bool run_async)
+    array_type<bool> dips_mask, int num_psds,
+    array_type<double> c00_all, array_type<double> c11_all, array_type<double> c22_all,
+    array_type<std::complex<double>> c01_all, array_type<std::complex<double>> c02_all,
+    array_type<std::complex<double>> c12_all,
+    bool use_external_matrix, bool run_async)
 {
     int total_tf_pairs = num_times * num_freqs;
+
+    // External covariance entries, layout [psd_i * total_tf_pairs + t_idx * num_freqs + f_idx].
+    // Only read by the kernel when use_external_matrix; otherwise callers may pass empty arrays.
+    // Conversely, the spline weights are only read on the in-kernel path, so with an
+    // external matrix they may be empty.
+    double *_c00 = nullptr, *_c11 = nullptr, *_c22 = nullptr;
+    gcmplx::complex<double> *_c01 = nullptr, *_c02 = nullptr, *_c12 = nullptr;
+    double *_spline_in_isi_oms = nullptr, *_spline_in_testmass = nullptr;
+    if (!use_external_matrix)
+    {
+        _spline_in_isi_oms  = return_pointer_and_check_length(spline_in_isi_oms_all,  "spline_in_isi_oms_all",  num_psds * num_freqs, 1);
+        _spline_in_testmass = return_pointer_and_check_length(spline_in_testmass_all, "spline_in_testmass_all", num_psds * num_freqs, 1);
+    }
+    else
+    {
+        int total_size = num_psds * total_tf_pairs;
+        _c00 = return_pointer_and_check_length(c00_all, "c00_all", total_size, 1);
+        _c11 = return_pointer_and_check_length(c11_all, "c11_all", total_size, 1);
+        _c22 = return_pointer_and_check_length(c22_all, "c22_all", total_size, 1);
+        _c01 = reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c01_all, "c01_all", total_size, 1));
+        _c02 = reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c02_all, "c02_all", total_size, 1));
+        _c12 = reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c12_all, "c12_all", total_size, 1));
+    }
+
     sensitivity_matrix->psd_likelihood_wrap(
         return_pointer_and_check_length(like_contrib_final, "like_contrib_final", num_psds,                  1),
         return_pointer_and_check_length(f_arr,              "f_arr",              num_freqs,                 1),
         reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(data, "data", num_psds * 3 * total_tf_pairs, 1)),
         return_pointer_and_check_length(data_index_all,     "data_index_all",     num_psds,                  1),
         return_pointer_and_check_length(time_index_all,     "time_index_all",     num_times,                 1),
-        return_pointer_and_check_length(Soms_d_in_all,      "Soms_d_in_all",      num_psds,                  1),
-        return_pointer_and_check_length(Sa_a_in_all,        "Sa_a_in_all",        num_psds,                  1),
+        return_pointer_and_check_length(Soms_d_in_all,      "Soms_d_in_all",      num_psds * sensitivity_matrix->n_noise_par, 1),
+        return_pointer_and_check_length(Sa_a_in_all,        "Sa_a_in_all",        num_psds * sensitivity_matrix->n_noise_par, 1),
         return_pointer_and_check_length(Amp_all,            "Amp_all",            num_psds,                  1),
         return_pointer_and_check_length(alpha_all,          "alpha_all",          num_psds,                  1),
         return_pointer_and_check_length(f_1_all,            "f_1_all",            num_psds,                  1),
         return_pointer_and_check_length(f_knee_all,         "f_knee_all",         num_psds,                  1),
         return_pointer_and_check_length(f_2_all,            "f_2_all",            num_psds,                  1),
-        return_pointer_and_check_length(spline_in_isi_oms_all,  "spline_in_isi_oms_all",  num_psds * num_freqs, 1),
-        return_pointer_and_check_length(spline_in_testmass_all, "spline_in_testmass_all", num_psds * num_freqs, 1),
+        _spline_in_isi_oms,
+        _spline_in_testmass,
         differential_component,
         num_freqs,
         num_times,
         return_pointer_and_check_length(dips_mask, "dips_mask", num_times * num_freqs, 1),
         num_psds,
+        _c00, _c11, _c22, _c01, _c02, _c12,
+        use_external_matrix,
         run_async
     );
 }
 
 void XYZSensitivityMatrixWrap::get_noise_covariance_wrap(
     array_type<double> freqs, array_type<int> time_indices,
-    double Soms_d_in, double Sa_a_in,
-    double Amp, double alpha, double f_1, double f_knee, double f_2,
-    array_type<double> spline_in_isi_oms_arr, array_type<double> spline_in_testmass_arr,
+    array_type<double> Soms_d_in_all, array_type<double> Sa_a_in_all,
+    array_type<double> Amp_all, array_type<double> alpha_all,
+    array_type<double> f_1_all, array_type<double> f_knee_all, array_type<double> f_2_all,
+    array_type<double> spline_in_isi_oms_all, array_type<double> spline_in_testmass_all,
     array_type<double> c00_arr, array_type<std::complex<double>> c01_arr, array_type<std::complex<double>> c02_arr,
     array_type<double> c11_arr, array_type<std::complex<double>> c12_arr, array_type<double> c22_arr,
-    int num_freqs, int num_times)
+    int num_freqs, int num_times, int num_psds, bool run_async)
 {
-    int total_size = num_freqs * num_times;
+    int total_size = num_psds * num_freqs * num_times;
     sensitivity_matrix->get_noise_covariance_arr(
         return_pointer_and_check_length(freqs,        "freqs",        num_freqs, 1),
         return_pointer_and_check_length(time_indices, "time_indices", num_times, 1),
-        Soms_d_in, Sa_a_in,
-        Amp, alpha, f_1, f_knee, f_2,
-        return_pointer_and_check_length(spline_in_isi_oms_arr,  "spline_in_isi_oms_arr",  num_freqs, 1),
-        return_pointer_and_check_length(spline_in_testmass_arr, "spline_in_testmass_arr", num_freqs, 1),
+        return_pointer_and_check_length(Soms_d_in_all, "Soms_d_in_all", num_psds * sensitivity_matrix->n_noise_par, 1),
+        return_pointer_and_check_length(Sa_a_in_all,   "Sa_a_in_all",   num_psds * sensitivity_matrix->n_noise_par, 1),
+        return_pointer_and_check_length(Amp_all,       "Amp_all",       num_psds, 1),
+        return_pointer_and_check_length(alpha_all,     "alpha_all",     num_psds, 1),
+        return_pointer_and_check_length(f_1_all,       "f_1_all",       num_psds, 1),
+        return_pointer_and_check_length(f_knee_all,    "f_knee_all",    num_psds, 1),
+        return_pointer_and_check_length(f_2_all,       "f_2_all",       num_psds, 1),
+        return_pointer_and_check_length(spline_in_isi_oms_all,  "spline_in_isi_oms_all",  num_psds * num_freqs, 1),
+        return_pointer_and_check_length(spline_in_testmass_all, "spline_in_testmass_all", num_psds * num_freqs, 1),
         return_pointer_and_check_length(c00_arr, "c00_arr", total_size, 1),
         reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c01_arr, "c01_arr", total_size, 1)),
         reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c02_arr, "c02_arr", total_size, 1)),
         return_pointer_and_check_length(c11_arr, "c11_arr", total_size, 1),
         reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c12_arr, "c12_arr", total_size, 1)),
         return_pointer_and_check_length(c22_arr, "c22_arr", total_size, 1),
-        num_freqs, num_times
+        num_freqs, num_times, num_psds, run_async
     );
 }
 
@@ -246,6 +282,35 @@ void XYZSensitivityMatrixWrap::set_averaged_tfs_wrap(
 }
 
 void XYZSensitivityMatrixWrap::disable_averaged_tfs_wrap() { sensitivity_matrix->disable_averaged_tfs(); }
+
+void XYZSensitivityMatrixWrap::get_noise_tfs_mosa_wrap(
+    array_type<double> freqs, array_type<double> mosa_auto,
+    array_type<std::complex<double>> mosa_cross,
+    int num_freqs, int num_times, array_type<int> time_indices)
+{
+    sensitivity_matrix->get_noise_tfs_mosa_arr(
+        return_pointer_and_check_length(freqs, "freqs", num_freqs, 1),
+        return_pointer_and_check_length(mosa_auto, "mosa_auto", 24 * num_freqs * num_times, 1),
+        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(mosa_cross, "mosa_cross", 12 * num_freqs * num_times, 1)),
+        num_freqs, num_times,
+        return_pointer_and_check_length(time_indices, "time_indices", num_times, 1));
+}
+
+void XYZSensitivityMatrixWrap::set_averaged_mosa_tfs_wrap(
+    array_type<double> mosa_auto, array_type<std::complex<double>> mosa_cross, int nf)
+{
+    sensitivity_matrix->set_averaged_mosa_tfs(
+        return_pointer_and_check_length(mosa_auto, "mosa_auto_avg", 24 * nf, 1),
+        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(mosa_cross, "mosa_cross_avg", 12 * nf, 1)),
+        nf);
+}
+
+void XYZSensitivityMatrixWrap::set_aliasing_wrap(array_type<double> alias_freqs, int n_alias, int n_grid)
+{
+    sensitivity_matrix->set_aliasing(
+        return_pointer_and_check_length(alias_freqs, "alias_freqs", n_alias * n_grid, 1),
+        n_alias, n_grid);
+}
 
 void XYZSensitivityMatrixWrap::get_inverse_det_wrap(
     array_type<double> c00_arr, array_type<std::complex<double>> c01_arr, array_type<std::complex<double>> c02_arr,
@@ -519,9 +584,9 @@ void detector_part(nb::module_ &m) {
 #else
     nb::class_<XYZSensitivityMatrixWrap>(m, "XYZSensitivityMatrixWrapCPU")
 #endif
-    .def(nb::init<array_type<double>, array_type<double>, int, double, int, bool, double>(),
+    .def(nb::init<array_type<double>, array_type<double>, int, double, int, bool, array_type<double>>(),
          nb::arg("averaged_ltts_arr"), nb::arg("delta_ltts_arr"),
-         nb::arg("n_times"), nb::arg("armlength"), nb::arg("generation"), nb::arg("spline_noise"), nb::arg("window_factor"))
+         nb::arg("n_times"), nb::arg("armlength"), nb::arg("generation"), nb::arg("spline_noise"), nb::arg("noise_normalization"))
     .def("set_galactic_grid", &XYZSensitivityMatrixWrap::set_galactic_grid,
          nb::arg("gal_wrap").none(),
          "Attach a GalacticGridWrap (already initialized) to include the galactic\n"
@@ -538,13 +603,46 @@ void detector_part(nb::module_ &m) {
          nb::arg("spline_in_isi_oms_all"), nb::arg("spline_in_testmass_all"),
          nb::arg("differential_component"), nb::arg("num_freqs"), nb::arg("num_times"),
          nb::arg("dips_mask"), nb::arg("num_psds"),
+         nb::arg("c00_all"), nb::arg("c11_all"), nb::arg("c22_all"),
+         nb::arg("c01_all"), nb::arg("c02_all"), nb::arg("c12_all"),
+         nb::arg("use_external_matrix") = false,
          nb::arg("run_async") = false,
          nb::call_guard<nb::gil_scoped_release>(),
-         "Compute PSD likelihood.")
+         "Compute PSD likelihood. With use_external_matrix, the covariance entries are read from "
+         "c*_all (num_psds * num_times * num_freqs each) instead of being computed in-kernel, and "
+         "the spline weights may be empty; otherwise c*_all may be empty.")
     .def("get_noise_covariance_wrap", &XYZSensitivityMatrixWrap::get_noise_covariance_wrap,
-         nb::call_guard<nb::gil_scoped_release>(), "Compute noise covariance matrix.")
+         nb::arg("freqs"), nb::arg("time_indices"),
+         nb::arg("Soms_d_in_all"), nb::arg("Sa_a_in_all"),
+         nb::arg("Amp_all"), nb::arg("alpha_all"), nb::arg("f_1_all"), nb::arg("f_knee_all"), nb::arg("f_2_all"),
+         nb::arg("spline_in_isi_oms_all"), nb::arg("spline_in_testmass_all"),
+         nb::arg("c00_arr"), nb::arg("c01_arr"), nb::arg("c02_arr"),
+         nb::arg("c11_arr"), nb::arg("c12_arr"), nb::arg("c22_arr"),
+         nb::arg("num_freqs"), nb::arg("num_times"), nb::arg("num_psds"),
+         nb::arg("run_async") = false,
+         nb::call_guard<nb::gil_scoped_release>(),
+         "Compute noise covariance matrices for num_psds noise-parameter sets.")
     .def("set_averaged_tfs_wrap",     &XYZSensitivityMatrixWrap::set_averaged_tfs_wrap, "Attach FD time-averaged transfer functions.")
     .def("disable_averaged_tfs_wrap", &XYZSensitivityMatrixWrap::disable_averaged_tfs_wrap, "Detach FD time-averaged transfer functions.")
+    .def("set_noise_symmetry_wrap", &XYZSensitivityMatrixWrap::set_noise_symmetry_wrap, nb::arg("asymmetric"),
+         "False: one OMS and one TM amplitude for all MOSAs. True: one amplitude per MOSA\n"
+         "(links 12, 23, 31, 13, 32, 21); noise-amplitude arrays become (num_psds, 6).")
+    .def_prop_ro("n_noise_par", &XYZSensitivityMatrixWrap::get_n_noise_par)
+    .def("get_noise_tfs_mosa_wrap", &XYZSensitivityMatrixWrap::get_noise_tfs_mosa_wrap,
+         nb::arg("freqs"), nb::arg("mosa_auto"), nb::arg("mosa_cross"),
+         nb::arg("num_freqs"), nb::arg("num_times"), nb::arg("time_indices"),
+         nb::call_guard<nb::gil_scoped_release>(),
+         "Per-MOSA basis TFs: mosa_auto (num_times, 24, num_freqs), mosa_cross (num_times, 12, num_freqs).")
+    .def("set_averaged_mosa_tfs_wrap", &XYZSensitivityMatrixWrap::set_averaged_mosa_tfs_wrap,
+         nb::arg("mosa_auto"), nb::arg("mosa_cross"), nb::arg("nf"),
+         "Attach FD time-averaged per-MOSA TFs, layouts (24, nf) and (12, nf).")
+    .def("set_aliasing_wrap", &XYZSensitivityMatrixWrap::set_aliasing_wrap,
+         nb::arg("alias_freqs"), nb::arg("n_alias"), nb::arg("n_grid"),
+         "Add the downsampling alias terms to the covariance. alias_freqs (n_alias, n_grid) are\n"
+         "signed (negative: folded from a negative frequency, cross terms conjugated);\n"
+         "noise_normalization and averaged TFs must cover the extended (1 + n_alias) * n_grid grid.")
+    .def("disable_aliasing_wrap", &XYZSensitivityMatrixWrap::disable_aliasing_wrap, "Drop the alias terms.")
+    .def_prop_ro("n_alias", &XYZSensitivityMatrixWrap::get_n_alias)
     .def("get_inverse_det_wrap",      &XYZSensitivityMatrixWrap::get_inverse_det_wrap,
          nb::call_guard<nb::gil_scoped_release>(), "Batch invert 3x3 Hermitian matrices and compute determinants.")
     .def_rw("sensitivity_matrix", &XYZSensitivityMatrixWrap::sensitivity_matrix)
@@ -561,8 +659,8 @@ void detector_part(nb::module_ &m) {
 #else
     nb::class_<XYZSensitivityMatrix>(m, "XYZSensitivityMatrixCPU")
 #endif
-    .def(nb::init<double *, double *, int, double, int, bool, double>(),
-            nb::arg("averaged_ltts_arr"), nb::arg("delta_ltts_arr"), nb::arg("n_times"), nb::arg("armlength"), nb::arg("generation"), nb::arg("spline_noise"), nb::arg("window_factor") = 1.0)
+    .def(nb::init<double *, double *, int, double, int, bool, double *>(),
+            nb::arg("averaged_ltts_arr"), nb::arg("delta_ltts_arr"), nb::arg("n_times"), nb::arg("armlength"), nb::arg("generation"), nb::arg("spline_noise"), nb::arg("noise_normalization"))
     ;
 
     m.def("psd_likelihood_legacy_wrap", &psd_likelihood_legacy_wrap,

@@ -871,9 +871,11 @@ class GlobalFit:
                                 "gpus": move.gpus,
                             }
 
-            # stop unneeded processes
+            # stop unneeded processes. The head rank has no role here and
+            # waits in ``comm.recv`` like any idle rank, so it must be told
+            # to stop too (otherwise it blocks forever after the run ends).
             for rank in self.all_ranks:
-                if rank in self.used_ranks:
+                if rank in (self.main_rank, self.results_rank) or rank in rank_instructions:
                     continue
                 self.comm.send("stop", dest=rank)
 
