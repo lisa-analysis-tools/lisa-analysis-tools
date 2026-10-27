@@ -1646,8 +1646,6 @@ def build_gb_moves(
         stft_store_windows=gb_info.stft_store_windows,
     )
 
-    _rj_phase_max = bool(int(os.environ.get("GB_RJ_PHASE_MAXIMIZE", "0")))
-
     # Check aliases in kwargs if any
     if "pe_search_names" in kwargs and pe_move_names is None:
         pe_move_names = kwargs.pop("pe_search_names")
@@ -1713,7 +1711,7 @@ def build_gb_moves(
                 rj_proposal_distribution=gpu_priors,
                 name="rj_prior_search",
                 use_prior_removal=True,
-                phase_maximize=_rj_phase_max,
+                phase_maximize=False,
                 ranks_needed=0,
                 run_swaps=True,
                 **gb_move_kwargs,
@@ -1725,7 +1723,7 @@ def build_gb_moves(
                 is_rj_prop=True,
                 run_swaps=False,
                 name="rj_fstat_mcmc_search",
-                phase_maximize=True,
+                phase_maximize=False,
                 ranks_needed=0,
                 **{**gb_move_kwargs, "leaf_cap_update": False},
             )
@@ -1737,7 +1735,7 @@ def build_gb_moves(
                 run_swaps=False,
                 name="rj_refit_search",
                 fp=_refit_fp,
-                phase_maximize=True,
+                phase_maximize=False,
                 ranks_needed=0,
                 **{**gb_move_kwargs, "leaf_cap_update": False},
             )
@@ -1747,7 +1745,7 @@ def build_gb_moves(
                 rj_proposal_distribution=gpu_priors,
                 name="rj_prior",
                 use_prior_removal=False,
-                phase_maximize=_rj_phase_max,
+                phase_maximize=False,
                 ranks_needed=0,
                 run_swaps=True,
                 **gb_move_kwargs,

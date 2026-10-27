@@ -1,14 +1,19 @@
+from __future__ import annotations
+
 from typing import Any, Callable, Dict, List, Tuple, Optional
 import numpy as np
+from numpy.typing import ArrayLike
 
 from eryn.prior import ProbDistContainer
+from eryn.priors.joint import JointPrior
 from eryn.utils.transform import TransformContainer
 
+from ...utils.typing import NDArrayLike
 from .gfpriors import BaseSourcePrior
 
 
 class GalacticBinaryPrior(BaseSourcePrior):
-    """Galactic Binary specific prior infrastructure.
+    r"""Galactic Binary specific prior infrastructure.
     
     If left as None, the initialisation defaults to a standard 8-parameter 
     sampling basis mapped to a 9-parameter physical basis (injecting \ddot{f} = 0).
@@ -99,3 +104,79 @@ def get_fdot_mojito(f, sign="+"):
     return fdot
 
 
+def f_mHz_to_Hz_and_fdot(f0_mHz: NDArrayLike, fdot: NDArrayLike) -> Tuple[NDArrayLike, NDArrayLike]:
+    """Map f0 from mHz to Hz; fdot is already in Hz/s and passes through."""
+    f0_Hz = f0_mHz * 1e-3
+    return f0_Hz, fdot
+
+
+class MojitoF0mHzFdotPrior(JointPrior):
+    """Joint prior for f0 in mHz and fdot in Hz/s.
+
+    f0 is uniform between ``f0_min_mHz`` and ``f0_max_mHz``. fdot is uniform between the
+    mojito bounds at that f0 (``get_fdot_mojito``), so its density depends on f0.
+    """
+
+    def __init__(
+        self,
+        f0_min_mHz: float = 0.1,
+        f0_max_mHz: float = 21.0,
+        use_cupy: bool = False,
+        return_gpu: bool = False,
+        **kwargs
+    ):
+        super().__init__(
+            names=("f0", "fdot"),
+            names_phys=("f0", "fdot"), # Maps to the physical Hz basis
+            latex_labels=(r"f_0", r"\dot{f}"),
+            units=("mHz", "Hz/s"),
+            use_cupy=use_cupy,
+            return_gpu=return_gpu,
+            inverse_transform_nd=f_mHz_to_Hz_and_fdot,
+            **kwargs
+        )
+        self.f0_min = f0_min_mHz
+        self.f0_max = f0_max_mHz
+
+    def _get_fdot_bounds(self, f0_mHz: NDArrayLike) -> tuple[NDArrayLike, NDArrayLike]:
+        """fdot bounds at f0: the mojito power laws take f0 in Hz."""
+        f0_Hz = f0_mHz * 1e-3
+        return get_fdot_mojito(f0_Hz, sign="-"), get_fdot_mojito(f0_Hz, sign="+")
+
+    def rvs(self, size: int | tuple[int, ...] = (1,), **kwargs) -> NDArrayLike:
+        if isinstance(size, int):
+            size = (size,)
+
+        # 1. Sample f0 in mHz
+        f0_mHz_samples = self.xp.random.uniform(self.f0_min, self.f0_max, size=size)
+
+        # 2. Get bounds and sample fdot
+        fdot_min, fdot_max = self._get_fdot_bounds(f0_mHz_samples)
+        fdot_samples = self.xp.random.uniform(fdot_min, fdot_max, size=size)
+
+        samples = self.xp.stack([f0_mHz_samples, fdot_samples], axis=-1)
+        return self._to_device(samples)
+
+    def logpdf(self, x: ArrayLike, **kwargs) -> NDArrayLike:
+        x_arr = self.xp.asarray(x)
+
+        if x_arr.shape[-1] != 2:
+            raise ValueError("Expected last dimension of x to be 2.")
+
+        f0_mHz = x_arr[..., 0]
+        fdot = x_arr[..., 1]
+
+        out = self.xp.full_like(f0_mHz, -self.xp.inf, dtype=self.xp.float64)
+
+        mask_f0 = (f0_mHz >= self.f0_min) & (f0_mHz <= self.f0_max)
+        fdot_min, fdot_max = self._get_fdot_bounds(f0_mHz)
+        mask_fdot = (fdot >= fdot_min) & (fdot <= fdot_max)
+
+        valid = mask_f0 & mask_fdot
+        valid_fdot_diff = self.xp.where(valid, fdot_max - fdot_min, 1.0)
+
+        # p(f0, fdot) = p(f0) * p(fdot|f0)
+        f0_log_norm = -self.xp.log(self.f0_max - self.f0_min)
+        out[valid] = f0_log_norm - self.xp.log(valid_fdot_diff[valid])
+
+        return self._to_device(out)

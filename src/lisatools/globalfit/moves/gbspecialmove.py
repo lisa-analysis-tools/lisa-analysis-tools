@@ -3647,9 +3647,15 @@ class GBSpecialRJSerialSearchMCMC(GBSpecialBase):
         fdot_max = get_fdot_mojito(f0_max, sign="+")
         fdot_min = get_fdot_mojito(f0_max, sign="-")
 
-        priors_in = deepcopy(priors_global)["gb"].priors_in
-        priors_in["f0"] = uniform_dist(0.0, 1.0, use_cupy=self.backend.uses_cupy)
-        priors_in["fdot"] = uniform_dist(0.0, 1.0, use_cupy=self.backend.uses_cupy)
+        # * The search samples f0 and fdot on the unit cube. The run prior may hold them as one
+        # * joint entry, so the dictionary is rebuilt in order rather than updated in place.
+        priors_in = {}
+        for prior_key, prior_here in deepcopy(priors_global)["gb"].priors_in.items():
+            if prior_key in ("f0", ("f0", "fdot")):
+                priors_in["f0"] = uniform_dist(0.0, 1.0, use_cupy=self.backend.uses_cupy)
+                priors_in["fdot"] = uniform_dist(0.0, 1.0, use_cupy=self.backend.uses_cupy)
+            elif prior_key != "fdot":
+                priors_in[prior_key] = prior_here
         priors = {
             "gb": ProbDistContainer(priors_in, return_gpu=True, use_cupy=self.backend.uses_cupy)
         }

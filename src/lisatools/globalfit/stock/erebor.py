@@ -34,7 +34,7 @@ from ...domains import DomainSettingsBase, FDSettings, WDMSettings, STFTSettings
 from ..engine import Settings, Setup, GeneralSetup
 from ..moves.gbbandstructure import stft_band_structure
 from ..loginfo import init_logger
-from ..priors.gbpriors import get_fdot_mojito
+from ..priors.gbpriors import get_fdot_mojito, MojitoF0mHzFdotPrior
 
 if typing.TYPE_CHECKING:
     from ..moves.gbdebug import GBDebugSettings
@@ -241,8 +241,12 @@ class GBSetup(Setup, GBSettings):
         if self.priors is None:
             priors_gb = {
                 input_basis[0]: uniform_dist(*(np.log(np.asarray(self.A_lims)))),
-                input_basis[1]: uniform_dist(*(np.asarray(self.f0_lims) * 1e3)),  # AmplitudeFrequencySNRPrior(rho_star, frequency_prior, L, Tobs, fd=fd),  # use sangria as a default
-                input_basis[2]: uniform_dist(self.fdot_lims[0], self.fdot_lims[1]),
+                # * f0 (mHz) and fdot share one prior: fdot is uniform between the mojito bounds at
+                # * the source's f0, so its density depends on f0. fdot_lims stays the global envelope.
+                (input_basis[1], input_basis[2]): MojitoF0mHzFdotPrior(
+                    f0_min_mHz=float(self.f0_lims[0]) * 1e3,
+                    f0_max_mHz=float(self.f0_lims[1]) * 1e3,
+                ),
                 input_basis[3]: uniform_dist(self.phi0_lims[0], self.phi0_lims[1]),
                 input_basis[4]: uniform_dist(*np.sort(np.cos(self.iota_lims))),
                 input_basis[5]: uniform_dist(self.psi_lims[0], self.psi_lims[1]),
