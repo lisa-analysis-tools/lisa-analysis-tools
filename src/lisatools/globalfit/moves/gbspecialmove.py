@@ -206,6 +206,65 @@ def _tspan(tm, name: str):
     return tm.span(name) if tm is not None else nullcontext()
 
 
+# * Currently only using uniform priors for which the variance is w^2 / 12 for width w
+PRIOR_PRECISION_FACTOR = 12.0
+
+# * Step of the numerical Jacobian of the transform container: 1e-6 of |x| with a floor of 1e-3 in
+# * |x|. It is exact for the linear f0 and fdot transforms, also for fdot sampled as fdot x Tobs^2.
+JACOBIAN_STEP_RELATIVE = 1e-6
+JACOBIAN_STEP_FLOOR = 1e-3
+
+
+def fisher_proposal_factor(info_sampling, prior_widths, beta, xp=np):
+    """Factor L with L L^T = (beta F + P)^-1 per source, P = diag(12 / w^2), in correlation form.
+
+    ``info_sampling`` (n_src, ndim, ndim) is the Fisher matrix F in the sampling basis,
+    ``prior_widths`` (n_src, ndim) or (ndim,) the widths w of the uniform prior box in the same
+    units and ``beta`` a scalar or (n_src,) inverse temperatures. The sum is whitened by its own
+    diagonal d: C = (beta F + P) / (d d^T) = V diag(lam) V^T and L = V diag(lam^-1/2) / d. No
+    eigenvalue floor is needed, since P holds every direction the data leave open. A source whose
+    matrix is not finite or not positive definite gets the prior factor diag(w / sqrt(12)).
+
+    Returns ``(factor, diagnostics)``. ``diagnostics`` holds per source ``fallback`` (the prior
+    factor was used), ``condition`` (largest over smallest eigenvalue of C, NaN for a fallback) and
+    ``prior_dominated`` (an eigenvector of C whose eigenvalue is more than half prior).
+    """
+    info = xp.asarray(info_sampling, dtype=xp.float64)
+    n_src, ndim = info.shape[0], info.shape[-1]
+    widths = xp.broadcast_to(xp.asarray(prior_widths, dtype=xp.float64), (n_src, ndim))
+    betas = xp.broadcast_to(xp.asarray(beta, dtype=xp.float64).reshape(-1), (n_src,))
+    precision = PRIOR_PRECISION_FACTOR / widths ** 2
+    identity = xp.eye(ndim)
+    with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+        total = betas[:, None, None] * info + precision[:, :, None] * identity[None]
+        scale = xp.sqrt(xp.diagonal(total, axis1=1, axis2=2))
+        finite = xp.all(xp.isfinite(total), axis=(1, 2)) & xp.all(scale > 0.0, axis=1)
+        safe_scale = xp.where(finite[:, None], scale, 1.0)
+        # ! one non-finite matrix would make the batched eigh fail (numpy) or return NaN (cupy) for
+        # ! the whole batch, so it is replaced by the identity here and gets the prior factor below
+        corr = xp.where(
+            finite[:, None, None],
+            total / safe_scale[:, :, None] / safe_scale[:, None, :],
+            identity[None],
+        )
+        evals, evecs = xp.linalg.eigh(corr)
+        usable = finite & xp.all(evals > 0.0, axis=1)
+        safe_evals = xp.where(usable[:, None], evals, 1.0)
+        factor = evecs / xp.sqrt(safe_evals)[:, None, :] / safe_scale[:, :, None]
+        prior_factor = (widths / np.sqrt(PRIOR_PRECISION_FACTOR))[:, :, None] * identity[None]
+        factor = xp.where(usable[:, None, None], factor, prior_factor)
+        # * prior share of eigenvector v: v^T (d^-1 P d^-1) v / lam, between 0 and 1
+        prior_share = xp.einsum("nik,ni->nk", evecs ** 2, precision / safe_scale ** 2) / safe_evals
+        diagnostics = {
+            "fallback": ~usable,
+            "condition": xp.where(usable, safe_evals.max(axis=1) / safe_evals.min(axis=1), xp.nan),
+            # more than half of the eigenvalue from the prior
+            "prior_dominated": usable & xp.any(prior_share > 0.5, axis=1),
+        }
+
+    return factor, diagnostics
+
+
 
 @dataclass
 class GBSigHetSettings:
@@ -457,7 +516,6 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self.band_units = max(1, int(band_units))
         self.jump_scales = float(gamma_base) * self.xp.array([0.2, 1.0, 2.5])
         self.jump_scales_probs = self.xp.array([0.2, 0.6, 0.2])
-        self._fdot_scale = 1e-16
 
         # Parent binding: config-only FD comp + move-level engine. A user-
         # supplied gb_fd_comp is honored as-is; otherwise one is built from
@@ -979,6 +1037,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         prop_counts = self.xp.zeros((2, self.ntemps, self.nwalkers, self.num_bands), dtype=int)
         acc_counts = self.xp.zeros_like(prop_counts)
 
+        self._jump_scale_counts = self.xp.zeros((2, len(self.jump_scales), self.ntemps), dtype=int)
+
         # * Alive sources per (temp, walker) for the k prior term; _run_rj_step keeps it current
         # * (it is the only step that flips ``inds`` in this pass).
         if self.is_rj_prop:
@@ -1422,101 +1482,197 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     N_vals[death_acc] if N_vals is not None else None,
                 )
 
-    def _compute_proposal_cholesky(self, model, band_sorter, ids):
-        """Batched Cholesky of the inverse Fisher matrix for ``ids``.
+    def _prior_box(self, coords, cell_f0_lims):
+        """Uniform prior box (lower, upper) of every source, sampling basis, each (n_src, ndim).
 
-        Domain-symmetric through the fast computation objects:
-        FD -> :meth:`GBFDComputations.information_matrix`,
-        WDM -> :meth:`GBWDMComputations.information_matrix`,
-        STFT -> :meth:`STFTGBComputations.information_matrix` (all against
-        the parent inverse-covariance rows keyed by walker; the legacy
-        SharedMemory ``gb.information_matrix`` path is retired).
+        A one-column prior gives its ``minimum`` and ``maximum``. A joint (f0, fdot) prior gives f0
+        its ``f0_min`` and ``f0_max`` and fdot its bounds at each source's f0 (``fdot_bounds``).
+        f0 is narrowed to the cell's frequency range, which the in-model gate enforces:
+        ``cell_f0_lims`` holds the physical limits per source, mapped into the sampling basis
+        through the transform container. Periodic columns span their period, [0, period), the
+        range the periodic container wraps into.
+        """
+        xp = self.xp
+        coords = xp.asarray(coords)
+        n_src, ndim = coords.shape
+        lower = xp.full((n_src, ndim), xp.nan)
+        upper = xp.full((n_src, ndim), xp.nan)
+        prior_entries = getattr(self.gpu_priors["gb"], "priors", None)
+        if not isinstance(prior_entries, list):
+            raise TypeError(
+                "the prior box needs a ProbDistContainer, whose priors are "
+                "[columns, distribution] pairs"
+            )
+        for columns, dist in prior_entries:
+            columns = [int(column) for column in np.asarray(columns).reshape(-1)]
+            if len(columns) == 1 and hasattr(dist, "minimum") and hasattr(dist, "maximum"):
+                minimum, maximum = float(dist.minimum), float(dist.maximum)
+                if not (np.isfinite(minimum) and np.isfinite(maximum) and maximum > minimum):
+                    raise ValueError(
+                        f"the prior of column {columns[0]} ({type(dist).__name__}) has the range "
+                        f"[{minimum}, {maximum}]; the prior box needs finite bounds")
+                lower[:, columns[0]], upper[:, columns[0]] = minimum, maximum
+            elif len(columns) == 2 and hasattr(dist, "fdot_bounds"):
+                # * joint (f0, fdot) prior: f0 uniform, fdot uniform between f0-dependent bounds
+                f0_column, fdot_column = columns
+                lower[:, f0_column], upper[:, f0_column] = float(dist.f0_min), float(dist.f0_max)
+                fdot_low, fdot_high = dist.fdot_bounds(coords[:, f0_column])
+                lower[:, fdot_column] = xp.asarray(fdot_low)
+                upper[:, fdot_column] = xp.asarray(fdot_high)
+            else:
+                raise TypeError(
+                    f"the prior box cannot read {type(dist).__name__} over columns {columns}: "
+                    "it needs a one-column prior with minimum and maximum, or a joint (f0, fdot) "
+                    "prior with f0_min, f0_max and fdot_bounds(f0)")
 
-        The Fisher comes back in PHYSICAL parameter space; it is mapped to
-        the sampling basis with the (numerical, per-source diagonal)
-        Jacobian of the transform container, conditioned by the fdot
-        rescale, inverted, and factorized.
+        # * f0: the cell's physical limits mapped through the local slope of the transform
+        input_basis = list(getattr(self.transform_fn, "input_basis", []))
+        if "f0" not in input_basis:
+            raise ValueError("the prior box needs a sampling column named 'f0' for the cell limits")
+        f0_column = input_basis.index("f0")
+        f0_output = int(np.asarray(self.parameter_transforms.fill_dict["test_inds"])[f0_column])
+        step = JACOBIAN_STEP_RELATIVE * xp.maximum(
+            xp.abs(coords[:, f0_column]), JACOBIAN_STEP_FLOOR
+        )
+        shifted_up, shifted_down = coords.copy(), coords.copy()
+        shifted_up[:, f0_column] += step
+        shifted_down[:, f0_column] -= step
+        f0_here = self.transform_fn.both_transforms(coords, xp=xp)[:, f0_output]
+        f0_up = self.transform_fn.both_transforms(shifted_up, xp=xp)[:, f0_output]
+        f0_down = self.transform_fn.both_transforms(shifted_down, xp=xp)[:, f0_output]
+        slope = (f0_up - f0_down) / (2.0 * step)
+        cell_low = coords[:, f0_column] + (xp.asarray(cell_f0_lims[0]) - f0_here) / slope
+        cell_high = coords[:, f0_column] + (xp.asarray(cell_f0_lims[1]) - f0_here) / slope
+        lower[:, f0_column] = xp.maximum(lower[:, f0_column], xp.minimum(cell_low, cell_high))
+        upper[:, f0_column] = xp.minimum(upper[:, f0_column], xp.maximum(cell_low, cell_high))
 
-        TODO(known GBs): the fdot conditioning column (sampling index 2) and
-        the 8->9 test_inds layout are still GB-specific; revisit with the
-        known-GB branch.
+        periodic = getattr(self, "periodic", None)
+        if periodic is not None and "gb" in periodic.inds_periodic:
+            for column, period in zip(periodic.inds_periodic["gb"], periodic.periods["gb"]):
+                lower[:, int(column)] = 0.0
+                upper[:, int(column)] = float(period)
+        return lower, upper
+
+    def _sampling_jacobian(self, coords, lower, upper):
+        """Diagonal Jacobian d phys_i / d x_i of the transform container, and where it is taken.
+
+        Central differences with steps h = 1e-6 max(|x|, 1e-3). Within 2h of a prior edge the step
+        could leave the domain of arccos or arcsin (cos iota and sin delta reach +-1 in doubles),
+        so each column is clipped into [lower + 2h, upper - 2h] where the box is wider than 4h;
+        periodic columns are not clipped. The Fisher matrix is evaluated at the same point: a
+        Fisher matrix at the edge and a Jacobian 2h inside it would not belong together, since
+        dh/diota vanishes at iota = 0 while diota/dcos(iota) diverges there.
+
+        Returns ``(jacobian, point, clipped)``, clipped (n_src,) bool.
+        """
+        xp = self.xp
+        coords = xp.asarray(coords)
+        n_src, ndim = coords.shape
+        test_inds = np.asarray(self.parameter_transforms.fill_dict["test_inds"])
+        steps = JACOBIAN_STEP_RELATIVE * xp.maximum(xp.abs(coords), JACOBIAN_STEP_FLOOR)
+        inner_low, inner_high = lower + 2.0 * steps, upper - 2.0 * steps
+        clip_columns = inner_low < inner_high
+        periodic = getattr(self, "periodic", None)
+        if periodic is not None and "gb" in periodic.inds_periodic:
+            clip_columns[:, xp.asarray(periodic.inds_periodic["gb"])] = False
+        point = xp.where(clip_columns, xp.clip(coords, inner_low, inner_high), coords)
+        clipped = xp.any(point != coords, axis=1)
+
+        steps = JACOBIAN_STEP_RELATIVE * xp.maximum(xp.abs(point), JACOBIAN_STEP_FLOOR)
+        jacobian = xp.zeros((n_src, ndim))
+        for column in range(ndim):
+            shifted_up, shifted_down = point.copy(), point.copy()
+            shifted_up[:, column] += steps[:, column]
+            shifted_down[:, column] -= steps[:, column]
+            output = int(test_inds[column])
+            phys_up = self.transform_fn.both_transforms(shifted_up, xp=xp)[:, output]
+            phys_down = self.transform_fn.both_transforms(shifted_down, xp=xp)[:, output]
+            jacobian[:, column] = (phys_up - phys_down) / (2.0 * steps[:, column])
+        return jacobian, point, clipped
+
+    def _information_matrix_phys(self, model, params_phys, walker_inds):
+        """Fisher matrix (n_src, ndim, ndim) in the physical basis from the domain's computation.
+
+        FD -> GBFDComputations, WDM -> GBWDMComputations, STFT -> STFTGBComputations, against the
+        parent inverse-covariance rows keyed by walker. The parent container is sharded across GPUs
+        on a multi-GPU run while every information_matrix is single-shard, so
+        route_information_matrix partitions the sources by the shard of their walker.
+        """
+        xp = self.xp
+        if isinstance(self._basis_settings, STFTSettings):
+            info_comp = self.gb_stft_comp
+        elif isinstance(self._basis_settings, FDSettings):
+            info_comp = self.gb_fd_comp
+        else:
+            info_comp = self.gb_wdm_comp
+        test_inds = np.asarray(self.parameter_transforms.fill_dict["test_inds"])
+        return _RoutedBandEngine.route_information_matrix(
+            info_comp, model.analysis_container_arr, params_phys,
+            inds=test_inds, noise_index=xp.asarray(walker_inds).astype(xp.int32),
+        )
+
+    def _compute_fisher_sampling(self, model, band_sorter, ids, cell_f0_lims):
+        """Fisher matrix in the sampling basis and the prior widths for the sources ``ids``.
+
+        F is the Fisher matrix of the domain's computation object at the point of
+        _sampling_jacobian, mapped to the sampling basis with that Jacobian. The widths are those of
+        each source's prior box (_prior_box, with the cell limits ``cell_f0_lims``). Both are
+        independent of the cell's temperature, so a held pair can be turned into a factor at any
+        beta with fisher_proposal_factor.
+
+        Returns ``(info_sampling, prior_widths, clipped)``: (n_src, ndim, ndim), (n_src, ndim) and
+        (n_src,) bool for sources evaluated at a clipped point.
         """
         xp = self.xp
         coords = band_sorter.coords[ids]
-        n_src, ndim = coords.shape
-        params_phys = self.transform_fn.both_transforms(coords, xp=self.xp)
-        _test_inds = np.asarray(self.parameter_transforms.fill_dict["test_inds"])
-        walker_inds = band_sorter.walker_inds[ids].astype(xp.int32)
+        n_src = coords.shape[0]
+        timer = getattr(self, "_prop_timer", None)
+        if timer is not None:
+            timer.count("fisher_sources", int(n_src))
 
-        # Routed per shard: this runs against the PARENT residual ACA, which
-        # is sharded across GPUs on a multi-GPU run (``run.py`` builds it with
-        # ``gpus=``), while every ``information_matrix`` implementation is
-        # single-shard by contract -- the FD binding and
-        # ``STFTGBComputations._resolve_info_group`` both raise on a
-        # multi-split holder, and the WDM one would read shard 0's rows with
-        # global indices. ``route_information_matrix`` partitions the sources
-        # by the owning shard of their walker (each source's Fisher depends
-        # only on its walker's PSD), runs each group inside its owning device
-        # context against a device-local comp replica, and reassembles the
-        # ``(num_bin, nd, nd)`` stack. Single-shard holders pass straight
-        # through, byte-identical.
-        if isinstance(self._basis_settings, STFTSettings):
-            _info_comp = self.gb_stft_comp
-        elif isinstance(self._basis_settings, FDSettings):
-            _info_comp = self.gb_fd_comp
-        else:
-            _info_comp = self.gb_wdm_comp
-
-        _timer = getattr(self, "_prop_timer", None)
-        if _timer is not None:
-            _timer.count("fisher_sources", int(n_src))
-
-        with _tspan(_timer, "fisher_matrix"):
-            info_phys = _RoutedBandEngine.route_information_matrix(
-                _info_comp, model.analysis_container_arr, params_phys,
-                inds=_test_inds, noise_index=walker_inds,
+        with _tspan(timer, "fisher_jacobian"):
+            lower, upper = self._prior_box(coords, cell_f0_lims)
+            jacobian, point, clipped = self._sampling_jacobian(coords, lower, upper)
+        with _tspan(timer, "fisher_matrix"):
+            info_phys = self._information_matrix_phys(
+                model,
+                self.transform_fn.both_transforms(point, xp=xp),
+                band_sorter.walker_inds[ids],
             )
-
-        # Conditioning scales for the sampling basis (fdot spans ~1e-13 in
-        # sampled units; without the rescale the Fisher inversion is
-        # ill-conditioned). The proposal draws in the rescaled coordinates
-        # y = x / s and maps back with * s (see in_model_proposal).
-        s = xp.ones(ndim)
-        s[2] = self._fdot_scale
-        self._proposal_param_scales = s
-
-        # Numerical diagonal Jacobian d(phys[test_inds[i]]) / d(y_i) through
-        # the transform container -- generic in the container's transforms.
-        with _tspan(_timer, "fisher_jacobian"):
-            J = xp.zeros((n_src, ndim))
-            for i in range(ndim):
-                h = 1e-6 * xp.maximum(xp.abs(coords[:, i]), 1e-3)
-                up = coords.copy()
-                dn = coords.copy()
-                up[:, i] += h
-                dn[:, i] -= h
-                dphys = (
-                    self.transform_fn.both_transforms(up, xp=self.xp)[:, _test_inds[i]]
-                    - self.transform_fn.both_transforms(dn, xp=self.xp)[:, _test_inds[i]]
-                )
-                J[:, i] = dphys / (2.0 * h) * s[i]
-
-            info_y = info_phys * J[:, :, None] * J[:, None, :]
-
-        with _tspan(_timer, "fisher_mempool"):
+        with _tspan(timer, "fisher_mempool"):
             self.mempool.free_all_blocks()
-        # Robust inverse-Fisher factor: near-zero-SNR (prior-drawn) sources
-        # give (numerically) singular Fishers. Eigendecompose and clamp the
-        # spectrum to a relative floor; B = V diag(lambda^-1/2) satisfies
-        # B B^T = inv(info) and is all the Gaussian proposal needs (the
-        # proposal shape only -- M-H corrects).
-        with _tspan(_timer, "fisher_eigh"):
-            evals, evecs = xp.linalg.eigh(info_y)
-            floor = 1e-10 * xp.maximum(
-                xp.abs(evals).max(axis=-1, keepdims=True), 1e-300
+        info_sampling = info_phys * jacobian[:, :, None] * jacobian[:, None, :]
+        return info_sampling, upper - lower, clipped
+
+    def _compute_proposal_cholesky(self, model, band_sorter, ids, beta, cell_f0_lims):
+        """Factor of the proposal covariance (beta F + P)^-1 for the sources ``ids``.
+
+        F and the widths of P come from _compute_fisher_sampling. ``beta`` (scalar or per source) is
+        the inverse temperature of each source's cell; it is constant over the block, so the
+        proposal stays symmetric. The factor is fisher_proposal_factor.
+        """
+        xp = self.xp
+        n_src = len(ids)
+        info_sampling, prior_widths, clipped = self._compute_fisher_sampling(
+            model, band_sorter, ids, cell_f0_lims
+        )
+        timer = getattr(self, "_prop_timer", None)
+        with _tspan(timer, "fisher_eigh"):
+            chol, diagnostics = fisher_proposal_factor(info_sampling, prior_widths, beta, xp=xp)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            condition = diagnostics["condition"]
+            largest = (
+                float(xp.max(xp.where(xp.isfinite(condition), condition, 0.0)))
+                if n_src else float("nan")
             )
-            evals = xp.maximum(xp.abs(evals), floor)
-            chol = evecs / xp.sqrt(evals)[:, None, :]
+            logger.debug(
+                "%s: Fisher factor of %d sources: %d with a prior-dominated direction, largest "
+                "condition number of C %.3e, %d evaluated at a clipped point, %d given the prior "
+                "factor.",
+                self.name, n_src, int(diagnostics["prior_dominated"].sum()),
+                largest, int(clipped.sum()), int(diagnostics["fallback"].sum()),
+            )
         return chol
 
     def in_model_proposal(self, coords, chol, band_sorter, source_ids, model):
@@ -1550,15 +1706,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             )
             new_coords = q["gb"][0, :, 0, :]
             factors = factors.reshape(-1)
-        else:                      
-            # Draw jump_factor per batch/walker at proposal time:
-            jump_factor = xp.random.choice(self.jump_scales, p=self.jump_scales_probs, size=1)
-            
-            # Gaussian jump through the Fisher Cholesky (drawn in the
-            # conditioned coordinates y = x / s; mapped back with * s).
+        else:
+            scale_inds = xp.random.choice(
+                len(self.jump_scales), size=coords.shape[0], p=self.jump_scales_probs
+            )
+            self._last_jump_scale_inds = scale_inds
             _rand = xp.random.randn(*coords.shape)
-            dy = xp.einsum("...ij,...j->...i", chol, _rand)
-            new_coords = coords + jump_factor * dy * self._proposal_param_scales[None, :]
+            dx = xp.einsum("...ij,...j->...i", chol, _rand)
+            new_coords = coords + self.jump_scales[scale_inds][:, None] * dx
             factors = xp.zeros(coords.shape[0])   # symmetric draw
 
         return new_coords, factors
@@ -1689,7 +1844,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 buffer_obj, seq["slot"])
 
         with _tspan(getattr(self, "_prop_timer", None), "inmodel_fisher"):
-            chol = self._compute_proposal_cholesky(model, band_sorter, ids)
+            # * the cell's beta and f0 range enter the proposal factor
+            chol = self._compute_proposal_cholesky(
+                model, band_sorter, ids, beta,
+                (buffer_obj.frequency_lims[0][slots], buffer_obj.frequency_lims[1][slots]),
+            )
         # Per-source likelihood setup for the repeat block (same stage as
         # the proposal cholesky / friend table). Chunked-het / FD engines
         # no-op; a sig-het computation builds its heterodyne reference
@@ -1750,6 +1909,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             hi_bin = (buffer_obj.frequency_lims[1][slots] / self.df).astype(int)
 
         for move_i in range(self.num_repeat_proposals):
+            # * a Fisher jump records its scale indices here; a stretch jump leaves None
+            self._last_jump_scale_inds = None
             new, factors = self.in_model_proposal(curr, chol, band_sorter, ids, model)
             new[:] = self.periodic.wrap({"gb": new[:, None, :]}, xp=xp)["gb"][:, 0]
 
@@ -1826,6 +1987,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 curr_prior[accept] = new_logp[accept]
                 ll_change_log[t_i[accept], w_i[accept], b_i[accept]] += delta_ll[accept]
                 acc_counts[1][t_i[accept], w_i[accept], b_i[accept]] += 1
+
+            # * To log Fisher jumps proposed and accepted per (scale, temperature)
+            scale_inds = getattr(self, "_last_jump_scale_inds", None)
+            scale_counts = getattr(self, "_jump_scale_counts", None)
+            if scale_inds is not None and scale_counts is not None:
+                n_temps = scale_counts.shape[2]
+                cells = scale_inds * n_temps + t_i
+                scale_counts[0] += xp.bincount(
+                    cells, minlength=scale_counts[0].size
+                ).reshape(scale_counts[0].shape)
+                # weights instead of cells[accept]: older CuPy raises on an empty bincount input
+                scale_counts[1] += xp.bincount(
+                    cells, weights=accept.astype(xp.float64), minlength=scale_counts[1].size
+                ).astype(scale_counts.dtype).reshape(scale_counts[1].shape)
 
             self._debug_verify_in_model(
                 buffer_obj, curr, new, slots, N_vals, delta_ll, keep,
@@ -2836,6 +3011,21 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 "[GB_ACCEPT %s] rj cold %.4f (n=%.0f) all %.4f (n=%.0f) | "
                 "in-model cold %.4f (n=%.0f) all %.4f (n=%.0f)",
                 self.name, rj_c, rj_cn, rj_a, rj_an, im_c, im_cn, im_a, im_an,
+            )
+            # * acceptance of the Fisher jumps per jump scale, cold chain and all temperatures
+            scale_counts = asnumpy(self._jump_scale_counts)
+            scale_parts = []
+            for scale_index, scale in enumerate(asnumpy(self.jump_scales)):
+                proposed = scale_counts[0, scale_index]
+                accepted_jumps = scale_counts[1, scale_index]
+                cold = accepted_jumps[0] / proposed[0] if proposed[0] else float("nan")
+                total = accepted_jumps.sum() / proposed.sum() if proposed.sum() else float("nan")
+                scale_parts.append(
+                    f"{scale:.3f}: cold {cold:.4f} (n={proposed[0]}) "
+                    f"all {total:.4f} (n={proposed.sum()})"
+                )
+            logger.info(
+                "[GB_ACCEPT_SCALES %s] Fisher jump scale %s", self.name, "; ".join(scale_parts)
             )
         except Exception as exc:  # never break a propose for a log line
             logger.debug("[GB_ACCEPT %s] skipped: %r", self.name, exc)
