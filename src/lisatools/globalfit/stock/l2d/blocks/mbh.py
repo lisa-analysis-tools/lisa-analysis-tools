@@ -4,8 +4,12 @@ from __future__ import annotations
 from typing import Any, ClassVar, Literal
 
 import numpy as np
+from pydantic import Field
 
-from .base import BuildContext, SourceBlock
+from .base import (
+    GENERIC_MOVES, GENERIC_SOURCE_MOVE_FILLED, RESIDUAL_MOVE, SPECIAL_MOVES, SPECIAL_SOURCE_MOVE_FILLED,
+    BuildContext, ClassSpec, PEMove, SourceBlock,
+)
 
 
 def sky_ind_map(basis: list[str], names: dict[str, str]) -> dict[str, int]:
@@ -61,6 +65,17 @@ class MBHBlock(SourceBlock):
     SETTINGS_NAME: ClassVar[str] = "MBHSettings"
     SETUP_NAME: ClassVar[str] = "MBHSetup"
     SEARCH_INTERFACE: ClassVar[str] = "MBHBSearchInterface"
+    PE_MOVES: ClassVar[dict[str, PEMove]] = {
+        "TDMBHSpecialMove": PEMove(SPECIAL_MOVES, SPECIAL_SOURCE_MOVE_FILLED),
+        "MBHMoveBuilder": PEMove(GENERIC_MOVES, GENERIC_SOURCE_MOVE_FILLED, forwards_to=RESIDUAL_MOVE),
+    }
+
+    pe_move: ClassSpec = Field(default_factory=lambda: ClassSpec.model_validate({
+        "class": "TDMBHSpecialMove",
+        "kwargs": dict(
+            permute_every=100, pad_out_of_prior=True, run_async=True, run_threaded=True, randomize_split=True,
+        ),
+    }))
 
     # SkyMove ind_map names -> names in the prior's input basis (SkyMove still calls the
     # coalescence-time column "t_ref")

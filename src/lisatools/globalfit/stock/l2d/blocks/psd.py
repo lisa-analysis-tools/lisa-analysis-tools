@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from typing import ClassVar, Literal
 
-from .base import BlockBase, BlockBuild, BuildContext, make_betas, make_search_interface
+from pydantic import Field
+
+from .base import (
+    GENERIC_MOVES, GENERIC_PSD_MOVE_FILLED, SPECIAL_MOVES, SPECIAL_PSD_MOVE_FILLED,
+    BlockBase, BlockBuild, BuildContext, ClassSpec, PEMove, make_betas, make_search_interface,
+)
+
+REFERENCE_TMAX = 1e6  # top of the reference psd ladder (mojito_input/emri_mbh_psd_settings.py)
 
 
 class PSDBlock(BlockBase):
@@ -11,6 +18,26 @@ class PSDBlock(BlockBase):
     type: Literal["psd"]
     SEARCH_INTERFACE: ClassVar[str] = "NoiseSearchInterface"
     SEARCH_TYPES: ClassVar[tuple[str, ...]] = ("prior", "samples", "point_estimate")  # no catalogue of noise
+    FULL_LADDER: ClassVar[bool] = True  # the psd moves run on every temperature
+    PE_MOVES: ClassVar[dict[str, PEMove]] = {
+        "MultiGPUPSDMove": PEMove(SPECIAL_MOVES, SPECIAL_PSD_MOVE_FILLED),
+        "PSDMoveBuilder": PEMove(GENERIC_MOVES, GENERIC_PSD_MOVE_FILLED),
+    }
+
+    # builds both the search (max_logl_mode) and the PE move
+    pe_move: ClassSpec = Field(default_factory=lambda: ClassSpec.model_validate({
+        "class": "MultiGPUPSDMove",
+        "kwargs": dict(permute_every=100, live_dangerously=True, run_async=True, run_threaded=True),
+    }))
+
+
+def psd_betas(block: PSDBlock, ndim: int, ntemps: int):
+    """The psd ladder: the block's tempering, else the reference ``make_ladder(ndim, ntemps, Tmax=1e6)``."""
+    from eryn.moves.tempering import make_ladder
+
+    if block.tempering is not None:
+        return make_betas(block.tempering, ntemps)
+    return make_ladder(ndim, ntemps=ntemps, Tmax=REFERENCE_TMAX)
 
 
 def build(block: PSDBlock, ctx: BuildContext) -> BlockBuild:
@@ -32,7 +59,8 @@ def build(block: PSDBlock, ctx: BuildContext) -> BlockBuild:
         priors=priors, ndim=ndim, transform=transform_fn,
         injection=injection,
         num_prop_repeats=block.num_prop_repeats,
-        betas=make_betas(block.tempering, ctx.cfg.sampler.ntemps),
+        # one ladder for seeding and both psd moves (the Setup's own default is 24 rungs)
+        betas=psd_betas(block, ndim, ctx.cfg.sampler.ntemps),
         search_interface=make_search_interface(block, info),
     )
 

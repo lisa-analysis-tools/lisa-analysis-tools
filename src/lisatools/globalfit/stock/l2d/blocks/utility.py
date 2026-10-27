@@ -27,6 +27,10 @@ def accepted_kwargs(target: type) -> set[str] | None:
         init = klass.__dict__.get("__init__")
         if init is None:
             continue
+        if klass is object:
+            # **kwargs passed all the way down: object takes none, and a base that swallows them
+            # (eryn's Move) would silently ignore a misspelled name
+            return names - {"self"}
         params = inspect.signature(init).parameters
         names |= {n for n, p in params.items() if p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)}
         if not any(p.kind is p.VAR_KEYWORD for p in params.values()):

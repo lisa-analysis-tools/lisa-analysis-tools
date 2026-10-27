@@ -13,7 +13,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict,PositiveInt, PositiveFloat, Field, field_validator, model_validator
 
 from typing import Annotated
-from pydantic import BeforeValidator, AfterValidator, ValidationInfo
+from pydantic import BeforeValidator, AfterValidator, ValidationInfo, Discriminator, Tag
 
 from lisatools.utils.constants import YRSID_SI
 
@@ -268,6 +268,48 @@ class MetadataSection(_Section):
     comment: str | None = None
 
 
+#--- Recipe section ---#
+
+class StockRecipeSpec(_Section):
+    """A recipe from ``build_recipe.STOCK_RECIPES`` and its kwargs."""
+
+    class_name: str = Field(default="StockRecipe", alias="class")
+    kwargs: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _known_recipe(self):
+        from .build_recipe import make_stock_recipe  # local: build_recipe is the runtime side
+
+        make_stock_recipe(self.class_name, self.kwargs)
+        return self
+
+
+class RecipeFile(_Section):
+    """A Python file whose ``function`` adds the recipe steps once the library has seeded the state."""
+
+    file: RunPath
+    function: str = "setup_recipe"
+
+    @model_validator(mode="after")
+    def _function_fits(self):
+        from .build_recipe import load_recipe_function
+
+        load_recipe_function(self.file, self.function)
+        return self
+
+
+def _recipe_kind(v):
+    if isinstance(v, dict):
+        return "file" if "file" in v else "class"
+    return "file" if isinstance(v, RecipeFile) else "class"
+
+
+RecipeRef = Annotated[
+    Annotated[StockRecipeSpec, Tag("class")] | Annotated[RecipeFile, Tag("file")],
+    Discriminator(_recipe_kind),
+]
+
+
 class RunConfig(_Section):
     schema_version: int
     run: RunSection
@@ -279,6 +321,7 @@ class RunConfig(_Section):
     metadata: MetadataSection = Field(default_factory=MetadataSection)
     window: WindowSection = Field(default_factory=WindowSection)
     sensitivity: SensitivitySection
+    recipe: RecipeRef = Field(default_factory=StockRecipeSpec)  # absent -> the stock recipe, no kwargs
 
     @field_validator("schema_version")
     @classmethod
@@ -312,6 +355,11 @@ class RunConfig(_Section):
             if ntemps is not None and ntemps > self.sampler.ntemps:
                 raise ValueError(
                     f"block {name!r}: tempering.ntemps ({ntemps}) is above sampler.ntemps ({self.sampler.ntemps})."
+                )
+            if ntemps is not None and block.FULL_LADDER and ntemps != self.sampler.ntemps:
+                raise ValueError(
+                    f"block {name!r}: its ladder spans every temperature; tempering.ntemps ({ntemps}) "
+                    f"must equal sampler.ntemps ({self.sampler.ntemps}) or be left out."
                 )
             if block.NEEDS_REFERENCE_TIME and data.reference_time is None:
                 raise ValueError(f"block {name!r} needs data.reference_time (absolute SSB time, in seconds).")

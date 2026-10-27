@@ -113,14 +113,17 @@ class PSDSchemaTest(_Blocks):
         self.assertEqual(block.search.search_type, "prior")
         self.assertEqual(block.search.spread, [1e-4, 1e-3])
 
-    def test_ladder_may_be_a_subset_but_not_longer_than_the_sampler(self):
+    def test_ladder_spans_every_temperature(self):
+        # the psd moves run on every temperature: no subset ladder (unlike source blocks), never a longer one
         sampler_ntemps = self.config(priors=NOISE_PRIOR).sampler.ntemps
-        for ntemps in (1, 2, sampler_ntemps):
+        self.psd(priors=NOISE_PRIOR, tempering={"ntemps": sampler_ntemps})
+        self.psd(priors=NOISE_PRIOR, tempering={"ratio": 1.5})  # ntemps defaults to sampler.ntemps
+        for ntemps, msg in ((1, "must equal sampler.ntemps"), (sampler_ntemps - 1, "must equal sampler.ntemps"),
+                            (sampler_ntemps + 1, "is above sampler.ntemps")):
             with self.subTest(ntemps=ntemps):
-                self.psd(priors=NOISE_PRIOR, tempering={"ntemps": ntemps})
-        with self.assertRaises(ValidationError) as ctx:
-            self.config(priors=NOISE_PRIOR, tempering={"ntemps": sampler_ntemps + 1})
-        self.assertTrue(any("is above sampler.ntemps" in e["msg"] for e in ctx.exception.errors()))
+                with self.assertRaises(ValidationError) as ctx:
+                    self.config(priors=NOISE_PRIOR, tempering={"ntemps": ntemps})
+                self.assertTrue(any(msg in e["msg"] for e in ctx.exception.errors()), error_keys(ctx.exception))
 
     def test_unknown_field(self):
         self.assertBlockError("extra_forbidden", "tempring", tempring={})
@@ -212,6 +215,10 @@ class _Built(_Blocks):
     def setUp(self):  # the shared run folder, not a per-test one
         pass
 
+    def config_only(self, **psd):
+        raw = cpu_raw({"psd": {"type": "psd", "priors": NOISE_PRIOR, **psd}})
+        return RunConfig.model_validate(raw, context={"run_dir": self.run_dir})
+
     def build(self, **psd):
         raw = cpu_raw({"psd": {"type": "psd", **psd}})
         cfg = RunConfig.model_validate(raw, context={"run_dir": self.run_dir})
@@ -259,13 +266,16 @@ class PSDBuildTest(_Built):
         np.testing.assert_allclose(built["psd"].setup.betas, 1.5 ** -np.arange(ntemps, dtype=float))
 
     def test_explicit_tempering_ntemps(self):
-        _, built = self.build(priors=NOISE_PRIOR, tempering={"ntemps": 3, "ratio": 2.0})
-        np.testing.assert_allclose(built["psd"].setup.betas, [1.0, 0.5, 0.25])
+        cfg = self.config_only()
+        _, built = self.build(priors=NOISE_PRIOR, tempering={"ntemps": cfg.sampler.ntemps, "ratio": 2.0})
+        np.testing.assert_allclose(built["psd"].setup.betas, 0.5 ** np.arange(cfg.sampler.ntemps, dtype=float))
 
-    def test_no_tempering_keeps_the_setup_default_ladder(self):
-        _, built = self.build(priors=NOISE_PRIOR)
-        betas = built["psd"].setup.betas
-        self.assertEqual(len(betas), 24)  # PSDSetup's own make_ladder(ndim * 10, ntemps=24)
+    def test_no_tempering_is_the_reference_ladder(self):
+        # not PSDSetup's own 24-rung default: the ladder the reference psd moves ran with
+        from eryn.moves.tempering import make_ladder
+
+        cfg, built = self.build(priors=NOISE_PRIOR)
+        np.testing.assert_array_equal(built["psd"].setup.betas, make_ladder(2, ntemps=cfg.sampler.ntemps, Tmax=1e6))
 
     def test_metadata(self):
         _, built = self.build(priors=NOISE_PRIOR)
@@ -478,13 +488,18 @@ class ReferenceEquivalenceTest(_Built):
         return built["psd"]
 
     def test_sampler_side_matches(self):
+        from eryn.moves.tempering import make_ladder
+
         ref, _ = self.reference()
         got = self.block().setup
         self.assertEqual(got.ndim, ref.ndim)
         self.assertEqual(got.num_prop_repeats, ref.num_prop_repeats)
         self.assertEqual((got.Tobs, got.dt), (ref.Tobs, ref.dt))
         np.testing.assert_array_equal(got.injection, ref.injection)
-        np.testing.assert_array_equal(got.betas, ref.betas)
+        # the reference Setup kept its unused 24-rung default; its psd moves ran on
+        # TemperatureControl(ndim, nwalkers, ntemps=sampler.ntemps, Tmax=1e6), which is the l2d ladder
+        ntemps = self.config_only().sampler.ntemps
+        np.testing.assert_array_equal(got.betas, make_ladder(ref.ndim, ntemps=ntemps, Tmax=1e6))
         self.assertEqual(got.nleaves_max, ref.nleaves_max)
         self.assertEqual(got.nleaves_min, ref.nleaves_min)
 

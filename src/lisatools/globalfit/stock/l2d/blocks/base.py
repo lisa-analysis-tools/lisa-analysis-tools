@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import warnings
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, ClassVar, Literal, NamedTuple, Annotated, TYPE_CHECKING, List
@@ -25,6 +26,37 @@ MOVE_MODULES = ("eryn.moves", "lisatools.sampling.moves.skymodehop")
 # filled by the block builder (e.g. MBHBlock.filled_move_kwargs); the YAML gives only `which` and the weight
 ENGINE_MOVE_KWARGS = {"SkyMove": frozenset({"ind_map", "coord_frame", "to_lisa_frame", "from_lisa_frame"})}
 ENGINE_PRIOR_KWARGS = frozenset({"observation_time",})  # filled from GeneralSetup
+
+# PE move arguments the recipe fills (build_recipe.py); the YAML gives only the knobs.
+SPECIAL_SOURCE_MOVE_FILLED = frozenset({
+    "dcga", "acs", "waveform_gen", "branch_name", "coords_shape", "waveform_gen_method", "waveform_gen_kwargs",
+    "waveform_like_method", "waveform_like_kwargs", "num_repeats", "transform_fn", "priors", "inner_moves",
+    "betas_all", "temperature_control", "Tmax", "periodic", "name", "flow_buffer_thin",
+})
+GENERIC_SOURCE_MOVE_FILLED = frozenset({
+    "branch_name", "wave_gen", "waveform_gen_kwargs", "waveform_like_kwargs", "num_repeats", "inner_moves",
+    "transform", "betas", "Tmax", "move_name",
+    # passed on to ResidualAddOneRemoveOneMove by the builder itself
+    "coords_shape", "waveform_gen", "acs", "transform_fn", "priors", "betas_all", "name",
+})
+SPECIAL_PSD_MOVE_FILLED = frozenset({
+    "dcga", "acs", "priors", "max_logl_mode", "name", "num_repeats", "psd_transform_fn", "galfor_transform_fn",
+    "sensitivity_backend", "temperature_control", "periodic", "use_gpu",
+})
+GENERIC_PSD_MOVE_FILLED = frozenset({"branch_name", "num_repeats", "Tmax", "betas"})
+
+
+class PEMove(NamedTuple):
+    """A class a block may name in ``pe_move``: where it lives and which arguments the recipe fills."""
+
+    module: str
+    filled: frozenset[str]
+    forwards_to: str | None = None  # "<module>.<Class>" that receives the class's **kwargs
+
+
+SPECIAL_MOVES = "lisatools.globalfit.moves"
+GENERIC_MOVES = "lisatools.globalfit.recipe"
+RESIDUAL_MOVE = "lisatools.globalfit.moves.addremovemove.ResidualAddOneRemoveOneMove"
 
 class _Spec(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -122,8 +154,12 @@ class BlockBase(_Spec):
     SEARCH_INTERFACE: ClassVar[str]  # class in lisatools.globalfit.searches that seeds this branch
     # "distribution" is not implemented by the interface yet
     SEARCH_TYPES: ClassVar[tuple[str, ...]] = ("prior", "samples", "point_estimate", "catalog")
+    PE_MOVES: ClassVar[dict[str, PEMove]]  # classes this block may name in pe_move
+    FULL_LADDER: ClassVar[bool] = False  # True -> tempering.ntemps must equal sampler.ntemps
 
     type: str  # block type == file stem == branch name (source_info / priors / recipe key)
+    # the branch's PE move (special or generic family) and its knobs; each block type sets the reference default
+    pe_move: ClassSpec
     priors: PriorRef
     enabled: bool = True
     tempering: TemperingSpec | None = None
@@ -141,6 +177,11 @@ class BlockBase(_Spec):
                 f"search_type {self.search.search_type!r} is not available for the {self.type!r} block; "
                 f"use one of {list(self.SEARCH_TYPES)}."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _pe_move_is_available(self):
+        check_pe_move(self.pe_move, self.PE_MOVES)
         return self
 
     def parse_prior_information(self, g: GeneralSetup) -> dict[str, Any]:
@@ -187,6 +228,23 @@ def resolve_class(name: str, modules: tuple[str, ...]) -> type:
         raise ValueError(f"cannot import {list(modules)} to look up {name!r}: {err}") from err
 
 
+def check_pe_move(spec: ClassSpec, allowed: dict[str, PEMove]) -> type:
+    """Check a ``pe_move`` against the block's allowed classes; return the class."""
+    rule = allowed.get(spec.class_name)
+    if rule is None:
+        raise ValueError(f"pe_move class {spec.class_name!r} is not available here; use one of {sorted(allowed)}.")
+    cls = resolve_class(spec.class_name, (rule.module,))
+    if rule.forwards_to is None:
+        check_kwargs(spec.kwargs, cls, rule.filled)
+        return cls
+    # the class's own arguments, plus what its **kwargs hand on to forwards_to
+    module, _, name = rule.forwards_to.rpartition(".")
+    own = accepted_kwargs(cls) or set()
+    rest = {k: v for k, v in spec.kwargs.items() if k not in own or k in rule.filled}
+    check_kwargs(rest, resolve_class(name, (module,)), rule.filled)
+    return cls
+
+
 class SourceBlock(BlockBase):
     """A source branch (mbh, emri, ...): leaves, waveform, sampler knobs, simple inner moves.
 
@@ -201,6 +259,9 @@ class SourceBlock(BlockBase):
     SETTINGS_NAME: ClassVar[str]      # Settings / Setup classes in lisatools.globalfit.stock.erebor
     SETUP_NAME: ClassVar[str]
     NEEDS_REFERENCE_TIME: ClassVar[bool] = True
+    # waveform methods the special PE move must be told about (TDMBHSpecialMove sets its own)
+    WAVEFORM_METHODS: ClassVar[dict[str, str]] = {}
+    LIKE_KWARGS_FROM_WAVEFORM_KWARGS: ClassVar[bool] = False  # the likelihood call takes the waveform kwargs too
 
     nleaves: Literal["auto"] | PositiveInt = "auto"
     waveform: WaveformSpec
@@ -218,6 +279,15 @@ class SourceBlock(BlockBase):
             if cls.__name__ == "ConditionalFlowMove":
                 raise ValueError("flow moves are not supported yet (they come with the recipe step).")
             check_kwargs(move.kwargs, cls, ENGINE_MOVE_KWARGS.get(cls.__name__, frozenset()))
+        return self
+
+    @model_validator(mode="after")
+    def _warn_without_search(self):
+        if self.enabled and self.search is None:
+            warnings.warn(
+                f"block {self.type!r} has no search: the branch starts empty and gets no moves.",
+                UserWarning, stacklevel=2,
+            )
         return self
 
     def resolve_nleaves(self, cfg) -> int:

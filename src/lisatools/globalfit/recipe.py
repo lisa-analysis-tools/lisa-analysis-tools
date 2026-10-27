@@ -1105,6 +1105,7 @@ def build_psd_moves(
     num_repeats: int = 60,
     permute_every: int = 50,
     Tmax: float = 1e6,
+    betas: typing.Optional[np.ndarray] = None,
 ) -> tuple[PSDMove, PSDMove]:
     """Build PSD search and PE moves.
 
@@ -1126,6 +1127,8 @@ def build_psd_moves(
         Number of internal PSD move repeats. Default 60.
     Tmax : float, optional
         Maximum temperature for ``TemperatureControl``. Default 1e6.
+    betas : np.ndarray, optional
+        Explicit ladder for ``TemperatureControl``; overrides ``Tmax``.
 
     Returns
     -------
@@ -1140,7 +1143,7 @@ def build_psd_moves(
 
     effective_ndim = engine_info.ndims["psd"] if galfor_info is None else engine_info.ndims["galfor"] + engine_info.ndims["psd"] 
     temperature_control = TemperatureControl(
-        effective_ndim, nwalkers, ntemps=ntemps, Tmax=Tmax, permute=False
+        effective_ndim, nwalkers, ntemps=ntemps, betas=betas, Tmax=Tmax, permute=False
     )
 
     psd_move_kwargs = dict(
@@ -1873,10 +1876,13 @@ class SingleSourcePEBuilder(SourceMoveBuilder):
         # ladder on the source info and the tiled ladder on the sub-state.
         info.betas = betas
         betas_all = np.tile(betas, (info.nleaves_max, 1))
-        state.sub_states[self.branch_name].betas_all = betas_all
+        # the state (and its backend) keeps every temperature: pad a subset ladder with its last rung
+        padded = np.concatenate([betas, np.full(ntemps - len(betas), betas[-1])])
+        state.sub_states[self.branch_name].betas_all = np.tile(padded, (info.nleaves_max, 1))
         logger.debug(f"{self.branch_name} betas: {betas}")
 
-        coords_shape = (ntemps, nwalkers, info.nleaves_max, info.ndim)
+        # the move may run on a subset ladder (the first len(betas) temperatures)
+        coords_shape = (len(betas), nwalkers, info.nleaves_max, info.ndim)
 
         wf_gen_kw = (
             self.waveform_gen_kwargs
@@ -1984,11 +1990,15 @@ class PSDMoveBuilder(SourceMoveBuilder):
 
     branch_name = "psd"
 
-    def __init__(self, *, num_repeats: int = 60, permute_every: int = 50, Tmax: float = 1e6):
+    def __init__(
+        self, *, num_repeats: int = 60, permute_every: int = 50, Tmax: float = 1e6,
+        betas: typing.Optional[np.ndarray] = None,
+    ):
         super().__init__(branch_name="psd")
         self.num_repeats = num_repeats
         self.permute_every = permute_every
         self.Tmax = Tmax
+        self.betas = betas
 
     def build(self, engine_info, curr, acs, priors, state):
         search_move, pe_move = build_psd_moves(
@@ -1999,5 +2009,6 @@ class PSDMoveBuilder(SourceMoveBuilder):
             num_repeats=self.num_repeats,
             permute_every=self.permute_every,
             Tmax=self.Tmax,
+            betas=self.betas,
         )
         return [search_move], [pe_move]
