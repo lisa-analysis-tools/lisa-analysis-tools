@@ -2,4 +2,6 @@ type: psd
 priors: {class: mojitolight.NoisePrior, kwargs: {model_type: parametric-symmetric}}
 num_prop_repeats: 500
 injection: {S_oms: 15e-12, S_tm: 3e-15}
-# pe_move: default MultiGPUPSDMove {permute_every: 100, live_dangerously, run_async, run_threaded}
+pe_move: 
+  class: MultiGPUPSDMove
+  kwargs: {permute_every: 100, live_dangerously: true, run_async: true, run_threaded: true}

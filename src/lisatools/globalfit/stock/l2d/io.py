@@ -162,6 +162,7 @@ class DataSection(_Section):
     lowpass: FilterSpec | None = None
     downsample: DownsampleSpec | None = None
     trim: TrimSpec | None = None
+    alias_correction: bool = True  # whether to apply the alias correction to the data (default: True)
 
     @model_validator(mode="after")
     def _orbits_match_loader(self):

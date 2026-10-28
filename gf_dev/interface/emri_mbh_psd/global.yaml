@@ -1,7 +1,7 @@
 # Port of mojito_input/emri_mbh_psd_settings.py.
 schema_version: 1
 run:
-  name: test_flow_joint_sources_stft
+  name: test_config
   output_dir: /data/asantini/globalfit/erebor_org_setup/mojito_runs/
   seed: 103209
   num_iterations: 500
@@ -12,11 +12,11 @@ sampler:
   ntemps: 4
 
 compute:
-  gpus: [5, 6]
+  gpus: [1]
   backend: cuda12x
   head_rank: 1
   main_rank: 0
-  flow_gpu: 4  # the mbh and emri flow trainers
+  flow_gpu: 5  # the mbh and emri flow trainers
 
 data:
   loader: mojito_l1
@@ -33,6 +33,7 @@ data:
   lowpass: {cutoff: 1e-1, order: 2, zero_phase: true}
   downsample: {window: [kaiser, 31.0]}
   trim: {duration: 200 h, trimming_type: from_each_end}
+  alias_correction: true 
 
 domain:
   type: stft
@@ -47,7 +48,7 @@ window:
 
 sensitivity:
   class: XYZSensitivityBackend
-  kwargs: {tdi_generation: 2, mask_percentage: 0.02, average_transfer_functions: true}
+  kwargs: {tdi_generation: 2, mask_percentage: 0.0, smoothing_sigma: 0.0, average_transfer_functions: true, convolve_window: true}
 
 metadata:
   codename: erebor
