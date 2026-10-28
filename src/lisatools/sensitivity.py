@@ -2250,8 +2250,13 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             from window-convolved bases built once, galactic foreground from one real
             convolution per walker; no per-walker covariance arrays. Equal to the full
             convolution up to FFT round-off. With splines there is no exact
-            factorization and the full per-walker convolution is used. ``"legacy"``:
-            always the full per-walker convolution of every entry.
+            factorization and the full per-walker convolution is used.
+            ``"factorized"``: as ``"exact"``, but with splines the per-walker spline
+            factor is applied after the convolution, ``conv(10^spl T) ~= 10^spl conv(T)``
+            -- an approximation, accurate for long observations (2 yr: |delta log L|
+            <~ 0.5 above 1 mHz) but not for segments of a few days; see
+            ``scripts/window_conv/agent5_error_budget.md``. ``"legacy"``: always the
+            full per-walker convolution of every entry.
         galaxy_fmax: Frequency [Hz] above which the galactic foreground is treated as
             zero in the exact window convolution (checked per call against a rigorous
             bound; falls back to the full band with a warning). ``None`` (default):
@@ -3289,7 +3294,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         convolve = self.convolve_window if convolve_window is None else convolve_window
         if convolve and self._fast_window_convolution():
             c00, c11, c22, c01, c02, c12 = self._window_matrix_elements(
-                Soms_d_in, Sa_a_in, Amp, alpha, f_1, kn, f_2
+                Soms_d_in, Sa_a_in, Amp, alpha, f_1, kn, f_2, knots_position_all, knots_amplitude_all
             )
         else:
             c00, c11, c22, c01, c02, c12 = self._compute_matrix_elements(
@@ -3646,7 +3651,15 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         (exact factorization: instrument bases + galaxy rows) instead of the full
         per-walker convolution. Splines multiply the transfer functions per walker and
         do not factorize exactly."""
-        return self.window_convolution_mode == "exact" and not self.use_splines
+        mode = self.window_convolution_mode
+        return mode == "factorized" or (mode == "exact" and not self.use_splines)
+
+    def _window_spline_weights(self, knots_position, knots_amplitude):
+        """Factorized-mode spline weights ``10^spl`` ``(num_psds, 2, num_freqs)``, or
+        ``None`` without splines."""
+        if not self.use_splines:
+            return None
+        return sensitivity_window.factorized_spline_weights(self, knots_position, knots_amplitude)
 
     def _window_galaxy_rows(self, Amp, alpha, f_1, kn, f_2):
         """Exactly convolved galaxy rows ``(gal_conv, gal_ratios)``, or ``(None, None)``
@@ -3655,7 +3668,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             return None, None
         return sensitivity_window.galaxy_convolved_rows(self, Amp, alpha, f_1, kn, f_2)
 
-    def _window_matrix_elements(self, Soms, Sa, Amp, alpha, f_1, kn, f_2):
+    def _window_matrix_elements(self, Soms, Sa, Amp, alpha, f_1, kn, f_2, knots_position=None, knots_amplitude=None):
         """The 6 window-convolved entries ``(num_psds, total_terms)`` from the
         instrument bases and galaxy rows; same values as
         ``_compute_matrix_elements(..., convolve_window=True)`` up to FFT round-off."""
@@ -3671,7 +3684,16 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         galfor = [xp.broadcast_to(p, (num_psds,)) for p in galfor]
 
         bases = sensitivity_window.get_instrument_bases(self)
-        entries = [coeffs.astype(B.dtype) @ B for B in bases]
+        w = self._window_spline_weights(knots_position, knots_amplitude)
+        if w is None:
+            entries = [coeffs.astype(B.dtype) @ B for B in bases]
+        else:
+            # per-basis, per-frequency weights 10^spl of the basis' noise type
+            wb = w[:, xp.arange(coeffs.shape[1]) // n_par, :] * coeffs[:, :, None]  # (P, n_basis, nf)
+            entries = []
+            for B in bases:
+                Bt = B.reshape(B.shape[0], self.num_times, -1)
+                entries.append(xp.einsum("pbf,btf->ptf", wb.astype(B.dtype), Bt).reshape(num_psds, -1))
         gal_conv, gal_ratios = self._window_galaxy_rows(*galfor)
         if gal_conv is not None:
             gal_conv = gal_conv.reshape(num_psds, self.num_times, -1)
@@ -3710,7 +3732,8 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             )
             gal_conv, gal_ratios = self._window_galaxy_rows(Amp, alpha, f_1, kn, f_2)
             log_like_out[:] = sensitivity_window.fused_log_like(
-                self, data, data_index, coeffs, gal_conv=gal_conv, gal_ratios=gal_ratios
+                self, data, data_index, coeffs, gal_conv=gal_conv, gal_ratios=gal_ratios,
+                spline_weights=self._window_spline_weights(knots_position, knots_amplitude),
             )
             return
 

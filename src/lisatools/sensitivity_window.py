@@ -31,7 +31,7 @@ from typing import Optional
 
 import numpy as np
 
-WINDOW_CONVOLUTION_MODES = ("exact", "legacy")
+WINDOW_CONVOLUTION_MODES = ("exact", "factorized", "legacy")
 
 
 # --- instrument bases + fused likelihood (agent 2) ---------------------------------
@@ -1258,7 +1258,10 @@ def factorized_instrument_moment_bases(backend, order: int = 2):
         C_k(f) ~= sum_b c_b [ sum_j W_j(b, f) Bj[j][k][b, f]
                               + w_b(f_lo) lo_vals[k][b] P_lo(f) + w_b(f_hi) hi_vals[k][b] P_hi(f) ]
 
-    (the edge terms are exact). Cached on ``backend`` (``_wconv_fact_inst_moments``).
+    (edge terms exact for real entries; for the complex cross terms the imaginary part of
+    the edge padding is odd under the legacy Hermitian extension, which ``P_lo`` / ``P_hi``
+    -- built from even indicators -- approximate: measured <= 1e-12 band-normalised).
+    Cached on ``backend`` (``_wconv_fact_inst_moments``).
     """
     cache = backend.__dict__.setdefault("_wconv_fact_inst_moments", {})
     raw = get_instrument_bases(backend, convolve_window=False)

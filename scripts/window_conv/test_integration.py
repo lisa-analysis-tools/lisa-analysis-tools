@@ -56,6 +56,23 @@ def run(config, backend):
 
     if spl:
         check(np.array_equal(ll_ex, ll_leg), "splines: exact mode falls back to legacy (bitwise)")
+        # factorized (approximate) splines: report the error vs legacy, and check that the
+        # matrix path and the fused-likelihood path implement the same covariance
+        sm.window_convolution_mode = "factorized"
+        S_f = sm.compute_sensitivity_matrix(**smk, convolve_window=True)
+        ll_f = asnumpy(sm.compute_log_like(**llk, convolve_window=True))
+        r, _ = band_reldiff(S_f, S_leg)
+        print(f"  info factorized vs legacy: sens band reldiff {r:.2e}, |d ll| {np.max(np.abs(ll_f - ll_leg)):.3g}")
+        sm.window_convolution_mode = "legacy"
+        win = sm._window_matrix_elements
+        k = llk
+        sm._log_like_matrix_elements = lambda Soms, Sa, Amp, alpha, f_1, kn, f_2, kp, ka, run_async: win(
+            Soms, Sa, Amp, alpha, f_1, kn, f_2, kp, ka)
+        ll_kf = asnumpy(sm.compute_log_like(**llk, convolve_window=True))
+        del sm._log_like_matrix_elements
+        d = float(np.max(np.abs(ll_kf - ll_f)))
+        check(d <= max(2 * legacy_spread(config), 1e-6),
+              f"factorized: fused ll vs compiled kernel on the factorized matrix |d| {d:.3g}")
         return
 
     r, _ = band_reldiff(S_ex, S_leg)
