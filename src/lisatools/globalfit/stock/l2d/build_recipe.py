@@ -16,7 +16,8 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 
-from .blocks.base import GENERIC_MOVES, SourceBlock
+from .blocks.base import GENERIC_MOVES, MoveBlock, SourceBlock
+from .blocks.psd import STOCHASTIC
 from .blocks.utility import check_kwargs, find_class
 
 if TYPE_CHECKING:
@@ -120,7 +121,7 @@ def pad_ladder(betas, ntemps: int) -> np.ndarray:
 
 
 def psd_needs_search(block) -> bool:
-    """The max-likelihood psd search runs unless the psd is seeded from samples or a point estimate."""
+    """The max-likelihood psd search runs unless psd (and galfor) are seeded from samples or a point estimate."""
     return block.search is None or block.search.search_type == "prior"
 
 
@@ -191,16 +192,21 @@ def is_generic(block) -> bool:
 
 
 def build_block_moves(ctx: RecipeContext, engine_info, curr, acs, priors, state) -> dict[str, BranchMoves]:
-    """Each block's moves from its ``pe_move``; source branches without a search get none."""
+    """Each block's moves from its ``pe_move``; source branches without a search get none, galfor none (the
+    psd move samples it)."""
+    blocks = enabled_blocks(ctx.cfg)
     moves = {}
-    for name, block in enabled_blocks(ctx.cfg).items():
+    for name, block in blocks.items():
+        if not isinstance(block, MoveBlock):
+            continue
         # checked at load (check_pe_move); here it is only looked up
         cls = find_class(block.pe_move.class_name, (block.PE_MOVES[block.pe_move.class_name].module,))
         if isinstance(block, SourceBlock):
             if block.search is not None:
                 moves[name] = source_moves(block, cls, ctx, engine_info, curr, acs, priors, state)
         else:
-            moves[name] = psd_moves(block, cls, engine_info, curr, acs, priors, state)
+            search = any(psd_needs_search(b) for n, b in blocks.items() if n in STOCHASTIC)
+            moves[name] = psd_moves(block, cls, engine_info, curr, acs, priors, state, search=search)
     return moves
 
 
@@ -238,8 +244,11 @@ def source_moves(block, cls, ctx: RecipeContext, engine_info, curr, acs, priors,
     return BranchMoves([], [move])
 
 
-def psd_moves(block, cls, engine_info, curr, acs, priors, state) -> BranchMoves:
-    """The psd search and PE moves from one ``pe_move`` (only ``max_logl_mode`` differs)."""
+def psd_moves(block, cls, engine_info, curr, acs, priors, state, search: bool = True) -> BranchMoves:
+    """The psd search and PE moves from one ``pe_move`` (only ``max_logl_mode`` differs).
+
+    They sample galfor too when it is a branch (the generic builder finds it in ``curr.source_info`` itself).
+    """
     from eryn.moves.tempering import TemperatureControl
 
     info = curr.source_info[block.type]
@@ -248,24 +257,26 @@ def psd_moves(block, cls, engine_info, curr, acs, priors, state) -> BranchMoves:
     kwargs = deepcopy(block.pe_move.kwargs)
 
     if is_generic(block):
-        search, pe = cls(num_repeats=info.num_prop_repeats, betas=betas, **kwargs).build(
+        search_moves, pe = cls(num_repeats=info.num_prop_repeats, betas=betas, **kwargs).build(
             engine_info, curr, acs, priors, state
         )
     else:
+        galfor = curr.source_info.get("galfor")
         common = dict(
             num_repeats=info.num_prop_repeats,
             psd_transform_fn=info.transform,
+            galfor_transform_fn=None if galfor is None else galfor.transform,
             temperature_control=TemperatureControl(
                 engine_info.ndims[block.type], g.nwalkers, ntemps=len(betas), betas=betas, permute=False
             ),
             use_gpu=on_gpu(g),
             **kwargs,
         )
-        search = [cls(acs, priors, max_logl_mode=True, name="psd search move", **common)]
+        search_moves = [cls(acs, priors, max_logl_mode=True, name="psd search move", **common)]
         pe = [cls(acs, priors, max_logl_mode=False, name="psd pe move", **common)]
-        for move in search + pe:
+        for move in search_moves + pe:
             move.accepted = np.zeros((g.ntemps, g.nwalkers))
-    return BranchMoves(search if psd_needs_search(block) else [], pe)
+    return BranchMoves(search_moves if search else [], pe)
 
 
 # --- the engine's setup_function --- #

@@ -142,9 +142,9 @@ def dry_run_report(cfg, curr_info, snapshot):
             params = len(flow.parameters) if flow.parameters else setup.ndim
             complement = f" + {flow.complement.class_name}" if flow.complement else ""
             search += f", flow {flow.model.class_name} on {params} params{complement}"
+        move = f"pe_move {block.pe_move.class_name}" if hasattr(block, "pe_move") else "sampled by the psd move"
         lines.append(
-            f"  {name}: {setup.nleaves_max} leaves x {setup.ndim} params, ladder {len(setup.betas)}, "
-            f"{search}, pe_move {block.pe_move.class_name}"
+            f"  {name}: {setup.nleaves_max} leaves x {setup.ndim} params, ladder {len(setup.betas)}, {search}, {move}"
         )
     recipe = cfg.recipe
     lines.append(

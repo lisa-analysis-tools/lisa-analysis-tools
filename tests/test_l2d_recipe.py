@@ -468,6 +468,7 @@ class MoveBuildTest(_Runtime):
         for key in ("max_logl_mode", "name", "temperature_control"):
             pe.kwargs.pop(key)
         self.assertIs(pe.kwargs.pop("psd_transform_fn"), info.transform)
+        self.assertIsNone(pe.kwargs.pop("galfor_transform_fn"))  # no galfor branch
         self.assertEqual(pe.kwargs, dict(
             num_repeats=7, use_gpu=False,  # CPU backend
             permute_every=100, live_dangerously=True, run_async=True, run_threaded=True,
