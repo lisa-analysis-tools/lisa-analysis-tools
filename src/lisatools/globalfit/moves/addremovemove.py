@@ -30,9 +30,13 @@ try:
 except ImportError:
     flow_move_available = False
 
-from eryn.moves import Move, StretchMove, TemperatureControl, RedBlueMove
+from eryn.moves import CombineMove, Move, StretchMove, TemperatureControl, RedBlueMove
 from eryn.prior import ProbDistContainer
 from eryn.utils.transform import TransformContainer
+
+
+def _is_flow(move) -> bool:
+    return flow_move_available and isinstance(move, ConditionalFlowMove)
 
 from tqdm import tqdm
 
@@ -68,6 +72,14 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         transform_fn: transform container that contains the transforms to be applied to the coordinates before generating waveforms and computing likelihoods.
         priors: prior distribution container that contains the prior distributions for the sources in the branch.
         inner_moves: list of moves and their corresponding weights to be used for proposing new sources for the leaf.
+            Each repeat draws one entry by weight. A :class:`eryn.moves.CombineMove` entry runs its sub-moves in
+            order, each with its own accept/reject (deterministic-scan Gibbs within the repeat).
+            A move's ``gibbs_sampling_setup`` restricts it to a subset of the parameters: one
+            ``(branch_name, mask)`` split with a boolean ``mask`` of shape ``(nleaves_max, ndim)``; the leaf's
+            row is used. Stretch-type moves propose on the full vector with ``gibbs_ndim`` = the number of
+            masked columns and the other columns are put back; a flow move only ever sees the masked columns
+            (its flow has ``dims`` = that number, and it is trained on those columns only). Other moves
+            cannot be masked.
         Tmax: maximum temperature for the temperature control.
         betas_all: array of betas for all leaves and temperatures. Shape is (nleaves_max, ntemps). If None, betas will be initialized as in TemperatureControl.
         permute_every: gate for the walker-permuting (fancy) temperature swap: ``> 0`` enables it -- it fires exactly ONCE per leaf visit, on the final in-model repeat -- and ``<= 0`` disables it entirely (``{BRANCH}_PERMUTE_EVERY`` env override). The numeric value is no longer a cadence.
@@ -80,6 +92,10 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             and killing the flow-move acceptance. Thinning to roughly the walker decorrelation
             scale (~5 repeats) keeps the submitted rows semi-independent. 1 restores the old
             append-every-repeat behaviour.
+        flow_burnin: number of sampler iterations (calls to ``propose``) before flow proposals are used. Until
+            then, inner moves that are or contain a flow move are left out of the draw (the other weights are
+            renormalised), while the flow trainer is already fed, so the flow is trained when it is switched on.
+            At least one inner move without a flow is required when ``flow_burnin > 0``.
         **kwargs: additional keyword arguments for the Move class.
     """
 
@@ -100,6 +116,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         permute_every: int = 20,
         pad_out_of_prior: bool = False,
         flow_buffer_thin: int = 5,
+        flow_burnin: int = 20,
         **kwargs,
     ):
 
@@ -126,9 +143,10 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         # through `get_proposal` directly -- so nothing else initialises their
         # acceptance counters. Do it here so `sub_moves` can promise that
         # `acceptance_fraction` is valid on every child.
-        for inner_move in self.moves:
+        for inner_move in self._proposing_moves:
             inner_move.accepted = np.zeros((self.ntemps, self.nwalkers))
             inner_move.num_proposals = 0
+            self._column_mask(inner_move)  # validate the Gibbs setups now, not mid-run
 
         self.temperature_controls = [None for _ in range(self.nleaves_max)]
         for i in range(self.nleaves_max):
@@ -174,7 +192,13 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         if 'periodic' in kwargs:
             self.periodic = kwargs['periodic']
 
-        self.flow_wait = 20 # do not use flow move until at least N proposals have been made. This is to make sure that the flow move has enough data to train on.
+        self.flow_burnin = int(flow_burnin)
+        self._iterations = 0  # calls to propose, for flow_burnin
+        self._has_flow = np.array([self._contains_flow(move) for move in self.moves])
+        if self.flow_burnin > 0 and self._has_flow.all():
+            raise ValueError(
+                f"flow_burnin = {self.flow_burnin} needs an inner move without a flow to use until then."
+            )
 
     @property
     def periodic(self):
@@ -185,9 +209,58 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
     def periodic(self, periodic):
         self._periodic = periodic
         if periodic is not None:
-            for tmp_move in self.moves:
+            for tmp_move in self._proposing_moves:
                 if tmp_move.periodic is None:
                     tmp_move.periodic = periodic
+
+    @property
+    def _proposing_moves(self):
+        """The inner moves that propose: each ``CombineMove`` is replaced by its sub-moves."""
+        out = []
+        for move in self.moves:
+            out.extend(move.sub_moves if isinstance(move, CombineMove) else [move])
+        return out
+
+    @staticmethod
+    def _contains_flow(move) -> bool:
+        """Whether ``move`` is a flow move or a ``CombineMove`` with one inside."""
+        if isinstance(move, CombineMove):
+            return any(_is_flow(sub) for sub in move.sub_moves)
+        return _is_flow(move)
+
+    def _draw_weights(self) -> np.ndarray:
+        """Inner-move weights for this iteration: during ``flow_burnin``, the moves without a flow, renormalised."""
+        if self._iterations >= self.flow_burnin or not self._has_flow.any():
+            return self.move_weights
+        weights = np.where(self._has_flow, 0.0, self.move_weights)
+        return weights / weights.sum()
+
+    def _column_mask(self, move) -> np.ndarray | None:
+        """``move``'s parameter mask, shape ``(nleaves_max, ndim)``, from its ``gibbs_sampling_setup``; None: all."""
+        setup = getattr(move, "gibbs_sampling_setup", None)
+        if setup is None:
+            return None
+        name = type(move).__name__
+        # eryn normalises the setup to a list of splits: a branch name, a (branch, mask) tuple, or a list of
+        # such tuples (from a dict)
+        if len(setup) != 1 or (isinstance(setup[0], list) and len(setup[0]) != 1):
+            raise ValueError(f"{name}: an inner move takes a single gibbs_sampling_setup split, got {setup}.")
+        split = setup[0][0] if isinstance(setup[0], list) else setup[0]
+        branch, mask = (split, None) if isinstance(split, str) else split
+        if branch != self.branch_name:
+            raise ValueError(f"{name}: gibbs_sampling_setup names branch {branch!r}, this move is {self.branch_name!r}.")
+        if mask is None:
+            return None
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != (self.nleaves_max, self.ndim):
+            raise ValueError(f"{name}: gibbs mask shape {mask.shape}, expected {(self.nleaves_max, self.ndim)}.")
+        if _is_flow(move):
+            dims = getattr(move.flow, "dims", None)
+            if dims is not None and np.any(mask.sum(axis=1) != dims):
+                raise ValueError(f"{name}: every gibbs mask row must select flow.dims = {dims} columns.")
+        elif not isinstance(move, RedBlueMove):
+            raise ValueError(f"{name}: only stretch-type (RedBlueMove) and flow moves can take a gibbs mask here.")
+        return mask
 
     def _validate_prior(self, prior: ProbDistContainer | list[ProbDistContainer]):
         """Check that the prior is compatible with the branch's coordinates.
@@ -515,11 +588,11 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         """Per-iteration setup hook."""
         
         # run the inner moves setup if they have a setup method
-        for move in self.moves:
+        for move in self._proposing_moves:
             if hasattr(move, "setup"):
                 move.setup(state.branches_coords)
 
-            if isinstance(move, ConditionalFlowMove):
+            if _is_flow(move):
                 logger.info(f"Flow move version: {move._loaded_version}")
 
 
@@ -567,6 +640,171 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
 
         return inds
 
+    def _propose_step(
+        self, move, model, new_state, leaf, prior_here, temperature_control_here,
+        prev_logl, prev_logp, prev_logP, temp_inds_base, walker_inds_base, ntemps_full,
+    ):
+        """One inner move over every walker split of ``leaf``: propose, score, accept.
+
+        The leaf's coords in ``new_state`` and ``prev_logl`` / ``prev_logp`` / ``prev_logP`` are updated in
+        place for the accepted walkers. Returns the accepted walkers, shape ``(ntemps_full, nwalkers)``.
+        """
+        ndim = new_state.branches[self.branch_name].coords.shape[-1]
+        move_name = move.__class__.__name__
+        accepted = np.zeros((ntemps_full, self.nwalkers), dtype=bool)
+
+        mask = self._column_mask(move)
+        cols = None if mask is None else mask[leaf]
+        if cols is not None and not cols.any():
+            return accepted  # nothing for this move to propose on this leaf
+
+        if _is_flow(move):
+            move.active_condition = leaf
+            # Temperature-scaled base (see ConditionalFlowMove.active_betas):
+            # refresh every repeat from this leaf's live beta ladder, the
+            # same object the acceptance step below reads via
+            # temperature_control_here.betas.
+            move.active_betas = temperature_control_here.betas
+
+        # Split the ensemble in half and iterate over these two halves.
+        inds = self.get_split_inds()
+
+        for split in range(self.nsplits):
+            # get split information
+            S1 = inds == split
+            num_total_here = np.sum(inds == split)
+            nwalkers_here = np.sum(S1[0])
+
+            temp_inds_here = temp_inds_base[inds == split]
+            walker_inds_here = walker_inds_base[inds == split]
+
+            # prepare the sets for each model
+            # goes into the proposal as (ntemps * (nwalkers / subset size), nleaves_max, ndim)
+            sets = [
+                new_state.branches[self.branch_name]
+                .coords[: self.ntemps][inds == j][:, leaf]
+                .reshape(self.ntemps, -1, 1, ndim)
+                for j in range(self.nsplits)
+            ]
+
+            old_points = sets[split].reshape((self.ntemps, nwalkers_here, ndim))
+
+            # setup s and c based on splits
+            s = {self.branch_name: sets[split]}
+            c = {self.branch_name: sets[:split] + sets[split + 1 :]}
+
+            # Get the move-specific proposal. A masked stretch-type move proposes on the full vector with the
+            # Gibbs dimension; a masked flow only sees its own columns. Either way, only the masked columns
+            # change.
+            if isinstance(move, RedBlueMove):
+                gibbs = {} if cols is None else {"gibbs_ndim": int(cols.sum())}
+                # StretchMove's periodic lift ratio counts only the columns in its Gibbs split (``_inds_run``,
+                # normally set by its own Gibbs iterator, which never runs here); ``s`` holds one leaf
+                masked_lift = cols is not None and hasattr(move, "_inds_run")
+                if masked_lift:
+                    move._inds_run = {self.branch_name: cols[None, :]}
+                try:
+                    q, factors = move.get_proposal(s, c, model.random, **gibbs)
+                finally:
+                    if masked_lift:
+                        move._inds_run = {}
+
+            elif cols is not None:
+                q, factors = move.get_proposal({self.branch_name: s[self.branch_name][..., cols]}, model.random)
+
+            else:
+                q, factors = move.get_proposal(s, model.random)
+
+            new_points = q[self.branch_name].reshape((self.ntemps, nwalkers_here, -1))
+            if cols is not None:
+                proposed = new_points[..., cols] if isinstance(move, RedBlueMove) else new_points
+                new_points = old_points.copy()
+                new_points[..., cols] = proposed
+
+            # Compute prior of the proposed position
+            # new_inds_prior is adjusted if product-space is used
+            logp = prior_here.logpdf(new_points.reshape(-1, ndim))
+            in_prior = ~np.isinf(logp)
+            logl = np.full_like(logp, -1e300)
+
+            if np.any(in_prior):
+                if self.pad_out_of_prior and np.any(~in_prior):
+                    padded = new_points.reshape(-1, ndim).copy()
+                    padded[~in_prior] = new_points.reshape(-1, ndim)[in_prior][0]
+                    new_points_in = self.transform_fn.both_transforms(padded)
+
+                    data_index = np.asarray(walker_inds_here.astype(np.int32))
+
+                    all_logl = self.compute_like(new_points_in, data_index=data_index)
+                    logl = np.where(in_prior, all_logl, -1e300)
+
+                else:
+                    new_points_in = self.transform_fn.both_transforms(
+                        new_points.reshape(-1, ndim)[in_prior]
+                    )
+
+                    # Compute the lnprobs of the proposed position.
+                    data_index = np.asarray(walker_inds_here[in_prior].astype(np.int32))
+        
+                    logl[in_prior] = self.compute_like(
+                            new_points_in,
+                            data_index=data_index,
+                        )
+
+            if DEBUG_MODE:
+                logger.debug(f"average proposed logl: {logl[in_prior].mean()}.")
+
+            if np.any(logl[in_prior] < -1e10) or np.any(logl[in_prior] > 1e30):
+                logger.warning(f"Suspicious likelihood encountered in propose: min = {logl[~np.isinf(logp)].min()}, max = {logl[~np.isinf(logp)].max()}. This could be a sign of numerical issues.")
+                if DEBUG_MODE:
+                    breakpoint()
+            # print(f"new logl: {logl}. elapsed: {time.time() - tic}")
+
+            logl = logl.reshape(self.ntemps, nwalkers_here)
+
+            logp = logp.reshape(self.ntemps, nwalkers_here)
+            prev_logp_here = prev_logp[inds == split].reshape(self.ntemps, nwalkers_here)
+
+            prev_logl_here = prev_logl[inds == split].reshape(self.ntemps, nwalkers_here)
+
+            prev_logP_here = temperature_control_here.compute_log_posterior_tempered(
+                prev_logl_here, prev_logp_here
+            )
+            logP = temperature_control_here.compute_log_posterior_tempered(logl, logp)
+
+            lnpdiff = factors + logP - prev_logP_here
+
+            keep = lnpdiff > np.log(model.random.rand(self.ntemps, nwalkers_here))
+
+            temp_inds_update = temp_inds_here[keep.flatten()]
+            walker_inds_update = walker_inds_here[keep.flatten()]
+
+            accepted[: self.ntemps][(temp_inds_update, walker_inds_update)] = True
+
+            # update state information
+            new_state.branches[self.branch_name].coords[
+                (
+                    temp_inds_update,
+                    walker_inds_update,
+                    np.full_like(walker_inds_update, leaf),
+                )
+            ] = new_points[keep].reshape(len(temp_inds_update), ndim)
+
+            prev_logl[(temp_inds_update, walker_inds_update)] = logl[keep].flatten()
+            prev_logp[(temp_inds_update, walker_inds_update)] = logp[keep].flatten()
+            prev_logP[(temp_inds_update, walker_inds_update)] = logP[keep].flatten()
+
+            if _is_flow(move):
+                # log debug information for flow move
+                logger.debug(f"Flow move {move_name} accepted {np.sum(keep)} out of {len(keep.flatten())} proposals for leaf {leaf}.")
+
+                logger.debug(f"MH factors: {factors.flatten()}")
+                logger.debug(f"prev_logP: {prev_logP_here.flatten()}")
+                logger.debug(f"logP: {logP.flatten()}")
+                logger.debug(f"lnpdiff: {lnpdiff.flatten()}")
+
+        return accepted
+
     def propose(self, model, state):
         """Generate proposals by removing, updating, and re-adding each leaf.
 
@@ -584,6 +822,8 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         self.setup(model, state)
         tic = time.time()
         self._dbg_step += 1
+        draw_weights = self._draw_weights()  # flow moves are left out during flow_burnin
+        self._iterations += 1
 
         if not np.any(state.branches[self.branch_name].inds):
             ntemps, nwalkers = state.branches[self.branch_name].shape[:2]
@@ -711,150 +951,25 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             _free_pool()
             for repeat in tqdm(range(self.num_repeats), desc=f"{self.branch_name} update, leaf {leaf}"):
 
-                # pick move
+                # pick move; a CombineMove runs its sub-moves in order, each with its own accept/reject
                 move_here = self.moves[
-                    model.random.choice(np.arange(len(self.moves)), p=self.move_weights)
+                    model.random.choice(np.arange(len(self.moves)), p=draw_weights)
                 ]
+                steps = move_here.sub_moves if isinstance(move_here, CombineMove) else [move_here]
 
-                move_name = move_here.__class__.__name__
-
-                # logger.debug(f"move here: {move_here.__class__.__name__}")
-                if flow_move_available:
-                    if isinstance(move_here, ConditionalFlowMove):
-                        move_here.active_condition = leaf
-                        # Temperature-scaled base (see ConditionalFlowMove.active_betas):
-                        # refresh every repeat from this leaf's live beta ladder, the
-                        # same object the acceptance step below reads via
-                        # temperature_control_here.betas.
-                        move_here.active_betas = temperature_control_here.betas
-
-                # Split the ensemble in half and iterate over these two halves.
                 accepted = np.zeros((ntemps_full, self.nwalkers), dtype=bool)
-                inds = self.get_split_inds()
-
-                # prepare accepted fraction
-                # accepted_here = np.zeros((self.ntemps, self.nwalkers), dtype=bool)
-                for split in range(self.nsplits):
-                    # get split information
-                    S1 = inds == split
-                    num_total_here = np.sum(inds == split)
-                    nwalkers_here = np.sum(S1[0])
-
-                    temp_inds_here = temp_inds_base[inds == split]
-                    walker_inds_here = walker_inds_base[inds == split]
-
-                    # prepare the sets for each model
-                    # goes into the proposal as (ntemps * (nwalkers / subset size), nleaves_max, ndim)
-                    sets = [
-                        new_state.branches[self.branch_name]
-                        .coords[: self.ntemps][inds == j][:, leaf]
-                        .reshape(self.ntemps, -1, 1, ndim)
-                        for j in range(self.nsplits)
-                    ]
-
-                    old_points = sets[split].reshape((self.ntemps, nwalkers_here, ndim))
-
-                    # setup s and c based on splits
-                    s = {self.branch_name: sets[split]}
-                    c = {self.branch_name: sets[:split] + sets[split + 1 :]}
-
-                    # Get the move-specific proposal.
-                    if isinstance(move_here, RedBlueMove):
-                        q, factors = move_here.get_proposal(s, c, model.random)
-
-                    else:
-                        q, factors = move_here.get_proposal(s, model.random)
-
-                    new_points = q[self.branch_name].reshape((self.ntemps, nwalkers_here, ndim))
-
-                    # Compute prior of the proposed position
-                    # new_inds_prior is adjusted if product-space is used
-                    logp = prior_here.logpdf(new_points.reshape(-1, ndim))
-                    in_prior = ~np.isinf(logp)
-                    logl = np.full_like(logp, -1e300)
-
-                    if np.any(in_prior):
-                        if self.pad_out_of_prior and np.any(~in_prior):
-                            padded = new_points.reshape(-1, ndim).copy()
-                            padded[~in_prior] = new_points.reshape(-1, ndim)[in_prior][0]
-                            new_points_in = self.transform_fn.both_transforms(padded)
-
-                            data_index = np.asarray(walker_inds_here.astype(np.int32))
-
-                            all_logl = self.compute_like(new_points_in, data_index=data_index)
-                            logl = np.where(in_prior, all_logl, -1e300)
-
-                        else:
-                            new_points_in = self.transform_fn.both_transforms(
-                                new_points.reshape(-1, ndim)[in_prior]
-                            )
-
-                            # Compute the lnprobs of the proposed position.
-                            data_index = np.asarray(walker_inds_here[in_prior].astype(np.int32))
-                
-                            logl[in_prior] = self.compute_like(
-                                    new_points_in,
-                                    data_index=data_index,
-                                )
-
-                    if DEBUG_MODE:
-                        logger.debug(f"average proposed logl: {logl[in_prior].mean()}.")
-
-                    if np.any(logl[in_prior] < -1e10) or np.any(logl[in_prior] > 1e30):
-                        logger.warning(f"Suspicious likelihood encountered in propose: min = {logl[~np.isinf(logp)].min()}, max = {logl[~np.isinf(logp)].max()}. This could be a sign of numerical issues.")
-                        if DEBUG_MODE:
-                            breakpoint()
-                    # print(f"new logl: {logl}. elapsed: {time.time() - tic}")
-
-                    logl = logl.reshape(self.ntemps, nwalkers_here)
-
-                    logp = logp.reshape(self.ntemps, nwalkers_here)
-                    prev_logp_here = prev_logp[inds == split].reshape(self.ntemps, nwalkers_here)
-
-                    prev_logl_here = prev_logl[inds == split].reshape(self.ntemps, nwalkers_here)
-
-                    prev_logP_here = temperature_control_here.compute_log_posterior_tempered(
-                        prev_logl_here, prev_logp_here
+                for step in steps:
+                    step_accepted = self._propose_step(
+                        step, model, new_state, leaf, prior_here, temperature_control_here,
+                        prev_logl, prev_logp, prev_logP, temp_inds_base, walker_inds_base, ntemps_full,
                     )
-                    logP = temperature_control_here.compute_log_posterior_tempered(logl, logp)
+                    self._record_inner_acceptance(step, step_accepted)
+                    accepted |= step_accepted
 
-                    lnpdiff = factors + logP - prev_logP_here
-
-                    keep = lnpdiff > np.log(model.random.rand(self.ntemps, nwalkers_here))
-
-                    temp_inds_update = temp_inds_here[keep.flatten()]
-                    walker_inds_update = walker_inds_here[keep.flatten()]
-
-                    accepted[: self.ntemps][(temp_inds_update, walker_inds_update)] = True
-
-                    # update state information
-                    new_state.branches[self.branch_name].coords[
-                        (
-                            temp_inds_update,
-                            walker_inds_update,
-                            np.full_like(walker_inds_update, leaf),
-                        )
-                    ] = new_points[keep].reshape(len(temp_inds_update), ndim)
-
-                    prev_logl[(temp_inds_update, walker_inds_update)] = logl[keep].flatten()
-                    prev_logp[(temp_inds_update, walker_inds_update)] = logp[keep].flatten()
-                    prev_logP[(temp_inds_update, walker_inds_update)] = logP[keep].flatten()
-
-                    if isinstance(move_here, ConditionalFlowMove):
-                        # log debug information for flow move
-                        logger.debug(f"Flow move {move_name} accepted {np.sum(keep)} out of {len(keep.flatten())} proposals for leaf {leaf}.")
-
-                        logger.debug(f"MH factors: {factors.flatten()}")
-                        logger.debug(f"prev_logP: {prev_logP_here.flatten()}")
-                        logger.debug(f"logP: {logP.flatten()}")
-                        logger.debug(f"lnpdiff: {lnpdiff.flatten()}")
-
-                # acceptance tracking
+                # acceptance tracking (a combined repeat counts as accepted if any of its steps was)
                 self.accepted += accepted
                 # print(self.accepted[0])
                 self.num_proposals += 1
-
-                self._record_inner_acceptance(move_here, accepted)
 
                 # TODO: include PSD likelihood in swaps?
                 # temperature swaps
@@ -937,11 +1052,16 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         # udpate at the end
         logger.info(f"{self.branch_name} proposal complete - all leaves processed ({time.time() - tic:.1f}s total)")
 
-        if flow_move_available and int(self.num_proposals / self.num_repeats) > self.flow_wait: # only submit to flow move after 10 proposals have been made
-            #todo make customizable
-            for move in self.moves:
-                if isinstance(move, ConditionalFlowMove):
-                    move.submit_by_leaf(ring_buffer)
+        # the trainer is fed from the first iteration, so the flow is trained by the end of flow_burnin
+        if flow_move_available:
+            for move in self._proposing_moves:
+                if _is_flow(move):
+                    # a masked flow is trained on its own columns only
+                    mask = self._column_mask(move)
+                    batch = ring_buffer if mask is None else {
+                        leaf: rows[:, mask[leaf]] for leaf, rows in ring_buffer.items()
+                    }
+                    move.submit_by_leaf(batch)
                     logger.info("Current repeats submitted to flow move")
         # new_state.log_like[(temp_inds_update, walker_inds_update)] = logl.flatten()
         # new_state.log_prior[(temp_inds_update, walker_inds_update)] = logp.flatten()
@@ -993,7 +1113,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
 
         logger.debug(
             "inner moves acceptance fractions: "
-            f"{ {m.__class__.__name__: (float(np.mean(m.acceptance_fraction[0])) if m.num_proposals else -1.0) for m in self.moves} }. "
+            f"{ {m.__class__.__name__: (float(np.mean(m.acceptance_fraction[0])) if m.num_proposals else -1.0) for m in self._proposing_moves} }. "
             f"elapsed: {time.time() - tic}"
         )
         logger.debug(f"mean accepted fraction: {np.mean(self.accepted[0] / self.num_proposals)}. elapsed: {time.time() - tic}")

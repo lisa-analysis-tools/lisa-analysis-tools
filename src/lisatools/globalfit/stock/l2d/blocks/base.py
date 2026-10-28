@@ -28,6 +28,14 @@ MOVE_MODULES = ("eryn.moves", "lisatools.sampling.moves.skymodehop")
 ENGINE_MOVE_KWARGS = {"SkyMove": frozenset({"ind_map", "coord_frame", "to_lisa_frame", "from_lisa_frame"})}
 ENGINE_PRIOR_KWARGS = frozenset({"observation_time",})  # filled from GeneralSetup
 
+# flow: classes and the arguments the builder fills (make_flow_move); eryn.flows imports torch only for
+# the torch classes, on lookup
+FLOW_MODULES = ("eryn.flows",)
+FLOW_MODEL_FILLED = frozenset({"dims", "device", "conditioning", "data_transform", "seed"})
+FLOW_TRANSFORM_FILLED = frozenset({"ndim", "periodic"})
+FLOW_TRAINER_FILLED = frozenset({"flow", "worker_device", "seed", "save_path", "diagnostics_dir"})
+FLOW_COMPLEMENT_FILLED = frozenset({"gibbs_sampling_setup"})
+
 # PE move arguments the recipe fills (build_recipe.py); the YAML gives only the knobs.
 SPECIAL_SOURCE_MOVE_FILLED = frozenset({
     "dcga", "acs", "waveform_gen", "branch_name", "coords_shape", "waveform_gen_method", "waveform_gen_kwargs",
@@ -78,6 +86,54 @@ class MoveSpec(ClassSpec):
 class TemperingSpec(_Spec):
     ntemps: PositiveInt | None = None  # None -> sampler.ntemps
     ratio: float = Field(default=1.2, gt=1.0)  # geometric ladder: betas = ratio ** -arange(ntemps)
+
+class FlowSpec(_Spec):
+    """A normalizing-flow proposal (``ConditionalFlowMove``) trained online by a ``ProcessExecutor``.
+
+    With ``parameters`` the flow covers only those columns of the prior's input basis; ``complement`` then
+    moves the other columns, and the two run as one ``CombineMove`` inner move (each step its own
+    accept/reject). The builder fills the flow's dimensions, leaf conditioning, periodic map, seed, trainer
+    device (``compute.flow_gpu``) and output paths; the trainer is started by the setup function.
+    """
+
+    weight: PositiveFloat  # among the block's inner moves
+    parameters: list[str] | None = None  # names in the prior's input basis; None -> every column
+    complement: ClassSpec | None = None  # a stretch-type move on the columns outside parameters
+    model: ClassSpec  # a Flow from eryn.flows, e.g. ZukoFlow
+    data_transform: ClassSpec | None = None  # a DataTransform from eryn.flows; None -> the flow's default
+    trainer: dict[str, Any] = Field(default_factory=dict)  # ProcessExecutor kwargs (incl. fit_kwargs)
+
+    @model_validator(mode="after")
+    def _classes_and_kwargs(self):
+        from eryn.flows import DataTransform, Flow, ProcessExecutor
+        from eryn.moves import RedBlueMove
+
+        if self.parameters is not None and (not self.parameters or len(set(self.parameters)) != len(self.parameters)):
+            raise ValueError("flow.parameters must be distinct names, at least one.")
+        if self.complement is not None and self.parameters is None:
+            raise ValueError("flow.complement moves the columns outside flow.parameters; give parameters too.")
+
+        model = resolve_class(self.model.class_name, FLOW_MODULES)
+        if not issubclass(model, Flow):
+            raise ValueError(f"flow.model {self.model.class_name!r} is not a Flow.")
+        # only the filled names: a flow hands the rest to its backend (e.g. ZukoFlow -> zuko), which checks them
+        if set(self.model.kwargs) & FLOW_MODEL_FILLED:
+            raise ValueError(f"{sorted(set(self.model.kwargs) & FLOW_MODEL_FILLED)} are filled in by the builder; remove them.")
+        if self.data_transform is not None:
+            transform = resolve_class(self.data_transform.class_name, FLOW_MODULES)
+            if not issubclass(transform, DataTransform):
+                raise ValueError(f"flow.data_transform {self.data_transform.class_name!r} is not a DataTransform.")
+            check_kwargs(self.data_transform.kwargs, transform, FLOW_TRANSFORM_FILLED)
+        check_kwargs(self.trainer, ProcessExecutor, FLOW_TRAINER_FILLED)
+        if self.complement is not None:
+            move = resolve_class(self.complement.class_name, MOVE_MODULES)
+            if not issubclass(move, RedBlueMove):
+                raise ValueError(
+                    f"flow.complement must be a stretch-type move (an eryn RedBlueMove), not {self.complement.class_name!r}."
+                )
+            check_kwargs(self.complement.kwargs, move, FLOW_COMPLEMENT_FILLED)
+        return self
+
 
 class SearchSpec(_Spec):
     """How a block's walkers are seeded: the arguments of the branch's search interface.
@@ -270,6 +326,25 @@ class SourceBlock(BlockBase):
     # Always a ladder (default: ratio 1.2 over sampler.ntemps, as the reference settings pass). Not None: the Setup's
     # own default is 24 rungs, which cannot seed a state with fewer temperatures.
     tempering: TemperingSpec = Field(default_factory=TemperingSpec)
+    flow: FlowSpec | None = None  # added to the inner moves at flow.weight
+
+    @model_validator(mode="after")
+    def _flow_fits_the_moves(self):
+        if self.flow is None:
+            return self
+        rule = self.PE_MOVES[self.pe_move.class_name]
+        if rule.module != SPECIAL_MOVES:
+            special = sorted(n for n, r in self.PE_MOVES.items() if r.module == SPECIAL_MOVES)
+            raise ValueError(f"flow: needs a special pe_move ({special}); {self.pe_move.class_name} cannot feed a flow.")
+        # during flow_burnin the PE move draws only inner moves without a flow
+        module, _, name = RESIDUAL_MOVE.rpartition(".")
+        default = inspect.signature(resolve_class(name, (module,))).parameters["flow_burnin"].default
+        if self.pe_move.kwargs.get("flow_burnin", default) > 0 and self.inner_moves == []:
+            raise ValueError(
+                "with flow: and no other inner moves, set pe_move kwargs flow_burnin: 0, or give inner_moves "
+                "(or leave them out for the default) for the PE move to use during the burn-in."
+            )
+        return self
 
     @model_validator(mode="after")
     def _classes_and_kwargs(self):
@@ -328,6 +403,9 @@ class SourceBlock(BlockBase):
             search_interface=make_search_interface(self, info),
         )
         setup = getattr(erebor, self.SETUP_NAME)(settings)
+        if self.flow is not None:
+            # after the Setup, so a block without inner_moves keeps the Setup's default next to the flow
+            setup.inner_moves = [*setup.inner_moves, (make_flow_move(self, ctx, info, nleaves), self.flow.weight)]
         waveform_class = find_class(self.waveform.class_name, self.WAVEFORM_MODULES)
         return BlockBuild(setup, source_metadata(self, init_kwargs, g), waveform_class)
 
@@ -408,6 +486,64 @@ def make_inner_moves(block: BlockBase, filled: dict[str, dict]) -> list[tuple[An
         cls = find_class(spec.class_name, MOVE_MODULES)
         moves.append((cls(**deepcopy(spec.kwargs), **filled.get(cls.__name__, {})), spec.weight))
     return moves
+
+def make_flow_move(block: SourceBlock, ctx: BuildContext, info: dict[str, Any], nleaves: int):
+    """The inner move for ``block.flow``: a ``ConditionalFlowMove``, or ``CombineMove([flow, complement])``.
+
+    The flow's columns are the ``parameters`` in prior-basis order; the trainer's arguments are kept on the
+    move (``executor_init_kwargs``) and the trainer is started by the setup function
+    (``build_recipe.attach_flow_trainers``): a live trainer does not survive ``CurrentInfoGlobalFit``'s deepcopy.
+    """
+    import eryn.flows
+    from eryn.moves import CombineMove, ConditionalFlowMove
+
+    spec, branch, basis = block.flow, block.type, info["basis"]
+    unknown = sorted(set(spec.parameters or ()) - set(basis))
+    if unknown:
+        raise ValueError(f"flow.parameters {unknown} are not in the prior basis {basis}.")
+    names = [n for n in basis if spec.parameters is None or n in spec.parameters]
+    if spec.complement is not None and len(names) == len(basis):
+        raise ValueError("flow.complement has no columns left: flow.parameters covers the whole prior basis.")
+    columns = np.tile(np.isin(basis, names), (nleaves, 1))
+    seed = {} if ctx.cfg.run.seed is None else {"seed": ctx.cfg.run.seed}
+
+    transform = None
+    if spec.data_transform is not None:
+        cls = find_class(spec.data_transform.class_name, FLOW_MODULES)
+        periodic = (info["periodic"] or {}).get(branch, {})
+        filled = dict(ndim=len(names), periodic={names.index(n): (0.0, p) for n, p in periodic.items() if n in names})
+        accepted = accepted_kwargs(cls)
+        transform = cls(
+            **deepcopy(spec.data_transform.kwargs),
+            **{k: v for k, v in filled.items() if accepted is None or k in accepted},
+        )
+    flow = find_class(spec.model.class_name, FLOW_MODULES)(
+        dims=len(names),
+        device="cpu",  # the proposal side; the trainer runs on compute.flow_gpu
+        conditioning=eryn.flows.OneHotLeafConditioning(nleaves_max=nleaves),
+        data_transform=transform,
+        **seed,
+        **deepcopy(spec.model.kwargs),
+    )
+    gibbs = {} if spec.parameters is None else {"gibbs_sampling_setup": (branch, columns)}
+    # fed by the PE move (one batch per leaf per iteration), not by harvesting
+    flow_move = ConditionalFlowMove(flow, branch, executor=None, harvest_every=None, **gibbs)
+    flow_gpu = ctx.cfg.compute.flow_gpu
+    out_dir = os.path.join(ctx.general.artifacts_file_dir, f"{branch}_flow")
+    flow_move.executor_init_kwargs = dict(
+        deepcopy(spec.trainer),
+        worker_device="cpu" if flow_gpu is None else f"cuda:{flow_gpu}",
+        save_path=os.path.join(out_dir, f"{branch}_flow_latest.h5"),
+        diagnostics_dir=out_dir,
+        **seed,
+    )
+    if spec.complement is None:
+        return flow_move
+    complement = find_class(spec.complement.class_name, MOVE_MODULES)(
+        **deepcopy(spec.complement.kwargs), gibbs_sampling_setup=(branch, ~columns)
+    )
+    return CombineMove([flow_move, complement])
+
 
 def make_priors(block: BlockBase, general) -> GFBasePrior:
     """``{name: prior}`` for the block's priors, with builder-filled kwargs (e.g. observation_time)."""

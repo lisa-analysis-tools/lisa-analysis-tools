@@ -26,7 +26,26 @@ inner_moves:
   - {class: SkyMove, weight: 0.05, kwargs: {which: lat}}
   - {class: SkyMove, weight: 0.05, kwargs: {which: long}}
   - {class: SkyMove, weight: 0.05, kwargs: {which: both}}
-  # ConditionalFlowMove (weight 0.2) comes with WP-D
+flow:
+  weight: 0.2
+  # the flow on the unimodal parameters only, a stretch on the degenerate ones (one CombineMove):
+  # parameters: [logM, logq, s1z, s2z, d_L, phi_ref, t_c]
+  # complement: {class: StretchMove}
+  model:
+    class: ZukoFlow
+    kwargs: {flow_class: NSF, transforms: 8, hidden_features: [128, 128, 128], bins: 8}
+  data_transform:
+    class: WhiteningTransform
+    kwargs: {shared: false, periodic_in_cholesky: true}
+  trainer:
+    epochs_per_round: 150
+    min_train_samples: 1500
+    max_buffer_samples: 6000
+    refit_transform_every: 1
+    torch_num_threads: 2
+    plot_corner: true
+    fit_kwargs: {batch_size: 1024, lr: 1e-3, lr_annealing: true, optimizer: adamw, patience: 30,
+                 validation_fraction: 0.15, val_split: temporal, train_noise: 0.0}
 search:
   search_type: catalog
   spread: [1e-4, 1e-3, 1e-3, 1e-3, 1e-3, 1e-1, 1e-1, 1e-1, 1e-2, 1e-2, 1]

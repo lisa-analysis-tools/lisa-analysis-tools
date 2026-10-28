@@ -64,7 +64,7 @@ MAPPED = {
     },
 }
 # YAML fields of those sections that deliberately don't go into GeneralSettings.
-NOT_GENERAL_SETTINGS = {"compute": {"head_rank", "main_rank"}}  # -> RankInfo
+NOT_GENERAL_SETTINGS = {"compute": {"head_rank", "main_rank", "flow_gpu"}}  # -> RankInfo; the flow trainers
 # Values that are converted on the way (checked by dedicated tests below).
 CONVERTED = {("run", "output_dir"), ("run", "submission_dir"), ("window", "taper_duration")}
 

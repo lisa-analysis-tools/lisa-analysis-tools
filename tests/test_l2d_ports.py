@@ -31,6 +31,7 @@ import warnings
 from pathlib import Path
 from unittest import mock
 
+import eryn.flows.torch  # noqa: F401 -- before any sys.modules patch: torch cannot be imported twice
 import numpy as np
 import yaml
 from eryn.moves.tempering import make_ladder
@@ -75,11 +76,22 @@ REFERENCE_PE_MOVES = {
         batch_size_per_gpu=5,
     )),
 }
-# the flow moves (weight 0.2 in both branches) are left out until WP-D
 REFERENCE_INNER_MOVES = {
-    "mbh": [("StretchMove", 0.35), ("DEMove", 0.3), ("SkyMove", 0.05), ("SkyMove", 0.05), ("SkyMove", 0.05)],
-    "emri": [("StretchMove", 0.4), ("DEMove", 0.4)],
+    "mbh": [
+        ("StretchMove", 0.35), ("DEMove", 0.3), ("SkyMove", 0.05), ("SkyMove", 0.05), ("SkyMove", 0.05),
+        ("ConditionalFlowMove", 0.2),
+    ],
+    "emri": [("StretchMove", 0.4), ("DEMove", 0.4), ("ConditionalFlowMove", 0.2)],
 }
+REFERENCE_FLOW_TRAINER = dict(  # flow_move.executor_init_kwargs, less the paths and the device
+    epochs_per_round=150, min_train_samples=1500, refit_transform_every=1, torch_num_threads=2, plot_corner=True,
+    fit_kwargs=dict(
+        batch_size=1024, lr=1e-3, lr_annealing=True, optimizer="adamw", patience=30, validation_fraction=0.15,
+        val_split="temporal", train_noise=0.0,
+    ),
+    seed=103209,
+)
+REFERENCE_MAX_BUFFER_SAMPLES = {"mbh": 6000, "emri": 4000}
 
 
 def on_cpu(folder: Path, root: Path) -> Path:
@@ -117,7 +129,7 @@ class EmriMbhPsdTest(_Port):
             cfg = load_run(EMRI_MBH_PSD)
         self.assertEqual(sorted(cfg.blocks), ["emri", "mbh", "psd"])
         self.assertEqual((cfg.sampler.nwalkers, cfg.sampler.ntemps), (24, 4))
-        self.assertEqual(cfg.compute.gpus, [5, 6])
+        self.assertEqual((cfg.compute.gpus, cfg.compute.flow_gpu), ([5, 6], 4))
         self.assertEqual(cfg.data.source_ids, {"emri": [0, 3], "mbhb": [18, 5, 16, 7, 2, 12]})
         self.assertEqual(cfg.data.Tobs, YRSID_SI)
         self.assertEqual(cfg.recipe.class_name, "StockRecipe")
@@ -131,8 +143,8 @@ class EmriMbhPsdTest(_Port):
         out = stdout.getvalue()
         for line in (
             "dry run: test_flow_joint_sources_stft built, nothing sampled",
-            "emri: 2 leaves x 12 params, ladder 1, search catalog, pe_move EMRISpecialMove",
-            "mbh: 6 leaves x 11 params, ladder 4, search catalog, pe_move TDMBHSpecialMove",
+            "emri: 2 leaves x 12 params, ladder 1, search catalog, flow ZukoFlow on 12 params, pe_move EMRISpecialMove",
+            "mbh: 6 leaves x 11 params, ladder 4, search catalog, flow ZukoFlow on 11 params, pe_move TDMBHSpecialMove",
             "psd: 1 leaves x 2 params, ladder 4, no search, pe_move MultiGPUPSDMove",
             "recipe: StockRecipe",
         ):
@@ -163,7 +175,25 @@ class EmriMbhPsdTest(_Port):
         for name, reference in REFERENCE_INNER_MOVES.items():
             with self.subTest(inner_moves=name):
                 self.assertEqual([(type(m).__name__, w) for m, w in info[name].inner_moves], reference)
-        self.assertEqual([m.which for m, _ in info["mbh"].inner_moves[2:]], ["lat", "long", "both"])
+        self.assertEqual([m.which for m, _ in info["mbh"].inner_moves[2:5]], ["lat", "long", "both"])
+
+        for name, nleaves, ndim in (("mbh", 6, 11), ("emri", 2, 12)):
+            with self.subTest(flow=name):
+                flow_move = info[name].inner_moves[-1][0]
+                flow = flow_move.flow
+                self.assertEqual((flow.dims, flow.conditioning.nleaves_max, flow.seed), (ndim, nleaves, 103209))
+                self.assertEqual(
+                    (flow.flow_class, flow.periodic_aliases), ("NSF", 1)
+                )
+                self.assertTrue(flow.data_transform.periodic_in_cholesky)
+                self.assertFalse(flow.data_transform.shared)
+                periodic = {n: p for n, p in info[name].periodic[name].items()}
+                basis = info[name].priors[name].get_input_basis()
+                self.assertEqual(flow.data_transform.periodic, {basis.index(n): (0.0, p) for n, p in periodic.items()})
+                trainer = {k: v for k, v in flow_move.executor_init_kwargs.items()
+                           if k not in ("save_path", "diagnostics_dir", "worker_device", "max_buffer_samples")}
+                self.assertEqual(trainer, REFERENCE_FLOW_TRAINER)
+                self.assertEqual(flow_move.executor_init_kwargs["max_buffer_samples"], REFERENCE_MAX_BUFFER_SAMPLES[name])
 
         for name, (class_name, kwargs) in REFERENCE_PE_MOVES.items():
             with self.subTest(pe_move=name):

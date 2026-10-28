@@ -2,8 +2,8 @@
 
 ``make_setup_function`` returns the engine's ``setup_function`` (called by ``run_global_fit`` with
 ``(recipe, engine_info, curr, acs, priors, state)``). The library always seeds first (source inds off,
-search interfaces, initial-signal subtraction); then a stock recipe, or the run's own recipe file, adds
-the steps. Heavy imports stay inside functions: ``io.py`` imports this module to validate ``recipe:``.
+search interfaces, initial-signal subtraction) and starts the flow trainers; then a stock recipe, or the
+run's own recipe file, adds the steps. Heavy imports stay inside functions: ``io.py`` imports this module to validate ``recipe:``.
 """
 from __future__ import annotations
 
@@ -157,6 +157,25 @@ def seed_branches(cfg: RunConfig, waveform_classes: dict[str, type], curr, acs, 
     return wave_gens
 
 
+def attach_flow_trainers(cfg: RunConfig, curr) -> None:
+    """Start the trainer of each seeded branch's flow move (``blocks.base.make_flow_move`` keeps its arguments).
+
+    Here and not at build time: a live ``ProcessExecutor`` (queues + a spawned worker) does not survive
+    ``CurrentInfoGlobalFit``'s deepcopy, and only the process that samples should spawn trainers.
+    """
+    from eryn.moves import CombineMove
+
+    for name, block in enabled_blocks(cfg).items():
+        if getattr(block, "flow", None) is None or block.search is None:  # unseeded: no moves, no trainer
+            continue
+        for move, _weight in curr.source_info[name].inner_moves:
+            for sub in move.sub_moves if isinstance(move, CombineMove) else [move]:
+                if hasattr(sub, "executor_init_kwargs") and sub.executor is None:
+                    from eryn.flows import ProcessExecutor
+
+                    sub.executor = ProcessExecutor(sub.flow, **sub.executor_init_kwargs)
+
+
 # --- moves --- #
 
 def on_gpu(general) -> bool:
@@ -266,6 +285,7 @@ def make_setup_function(cfg: RunConfig, builds: dict[str, BlockBuild]):
     def setup_recipe(recipe, engine_info, curr, acs, priors, state):
         select_device(curr.general_info)
         ctx = RecipeContext(cfg, seed_branches(cfg, waveform_classes, curr, acs, priors, state))
+        attach_flow_trainers(cfg, curr)
         spec = cfg.recipe
         if hasattr(spec, "file"):
             fn = load_recipe_function(spec.file, spec.function)

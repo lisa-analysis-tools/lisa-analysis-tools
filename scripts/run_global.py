@@ -137,6 +137,11 @@ def dry_run_report(cfg, curr_info, snapshot):
     for name, setup in curr_info.source_info.items():
         block = cfg.blocks[name]
         search = "no search" if block.search is None else f"search {block.search.search_type}"
+        flow = getattr(block, "flow", None)
+        if flow is not None:
+            params = len(flow.parameters) if flow.parameters else setup.ndim
+            complement = f" + {flow.complement.class_name}" if flow.complement else ""
+            search += f", flow {flow.model.class_name} on {params} params{complement}"
         lines.append(
             f"  {name}: {setup.nleaves_max} leaves x {setup.ndim} params, ladder {len(setup.betas)}, "
             f"{search}, pe_move {block.pe_move.class_name}"

@@ -1,4 +1,4 @@
-# Port of mojito_input/emri_mbh_psd_settings.py (flow proposals left out until WP-D).
+# Port of mojito_input/emri_mbh_psd_settings.py.
 schema_version: 1
 run:
   name: test_flow_joint_sources_stft
@@ -16,6 +16,7 @@ compute:
   backend: cuda12x
   head_rank: 1
   main_rank: 0
+  flow_gpu: 4  # the mbh and emri flow trainers
 
 data:
   loader: mojito_l1
