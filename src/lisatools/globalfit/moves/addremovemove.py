@@ -221,6 +221,20 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             out.extend(move.sub_moves if isinstance(move, CombineMove) else [move])
         return out
 
+    @property
+    def _moves_names(self):
+        """Names of the inner moves that propose. If two moves have the same name, the first is used and the rest are suffixed with ``_1``, ``_2``, etc."""
+        out = []
+        for move in self._proposing_moves:
+            name = type(move).__name__
+            if name in out:
+                i = 1
+                while f"{name}_{i}" in out:
+                    i += 1
+                name = f"{name}_{i}"
+            out.append(name)
+        return out
+
     @staticmethod
     def _contains_flow(move) -> bool:
         """Whether ``move`` is a flow move or a ``CombineMove`` with one inside."""
@@ -1113,7 +1127,8 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
 
         logger.debug(
             "inner moves acceptance fractions: "
-            f"{ {m.__class__.__name__: (float(np.mean(m.acceptance_fraction[0])) if m.num_proposals else -1.0) for m in self._proposing_moves} }. "
+            # f"{ {m.__class__.__name__: (float(np.mean(m.acceptance_fraction[0])) if m.num_proposals else -1.0) for m in self._proposing_moves} }. "
+            f"{dict(zip(self._moves_names(), [float(np.mean(m.acceptance_fraction[0])) if m.num_proposals else -1.0 for m in self._proposing_moves]))}. "
             f"elapsed: {time.time() - tic}"
         )
         logger.debug(f"mean accepted fraction: {np.mean(self.accepted[0] / self.num_proposals)}. elapsed: {time.time() - tic}")
