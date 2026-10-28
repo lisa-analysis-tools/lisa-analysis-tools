@@ -79,6 +79,24 @@ _MBH_PARAM_INFO: Dict[str, ParameterInfo] = {
     "t_c": ParameterInfo("coalescence_time", r"$t_c\,[\mathrm{s}]$", "s"),
 }
 
+_EMRI_PARAM_INFO: Dict[str, ParameterInfo] = {
+    "m1": ParameterInfo("primary_mass_det_frame", r"$m_1\,[M_\odot]$", "solMass"),
+    "m2": ParameterInfo("secondary_mass_det_frame", r"$m_2\,[M_\odot]$", "solMass"),
+    "a": ParameterInfo("chi1", r"$a$", "dimensionless"),
+    "p0": ParameterInfo("semi_latus_rectum_tref", r"$p_0$", "dimensionless"),
+    "e0": ParameterInfo("eccentricity_tref", r"$e_0$", "dimensionless"),
+    "XI0": ParameterInfo("inclination_tref", r"$\Xi_0\,[\mathrm{rad}]$", "rad"),
+    "distance": ParameterInfo("luminosity_distance", r"$d_L\,[\mathrm{Gpc}]$", "Gpc"),
+    "qK": ParameterInfo("polar_angle_spin1", r"$\theta_K\,[\mathrm{rad}]$", "rad"),
+    "phiK": ParameterInfo("azimuthal_angle_spin1", r"$\phi_K\,[\mathrm{rad}]$", "rad"),
+    "Phi_phi0": ParameterInfo("azimuthal_orbit_phase_tref", r"$\Phi_{\phi,0}\,[\mathrm{rad}]$", "rad"),
+    "Phi_theta0": ParameterInfo("polar_orbit_phase_tref", r"$\Phi_{\theta,0}\,[\mathrm{rad}]$", "rad"),
+    "Phi_r0": ParameterInfo("mean_anomaly_tref", r"$\Phi_{r,0}\,[\mathrm{rad}]$", "rad"),
+    "ra": ParameterInfo("right_ascension", r"$\alpha\,[\mathrm{rad}]$", "rad"),
+    "dec": ParameterInfo("declination", r"$\delta\,[\mathrm{rad}]$", "rad"),
+
+}
+
 _NOISE_PARAM_INFO: Dict[str, ParameterInfo] = {
     "S_oms": ParameterInfo(
         "S_oms", r"$S_{\mathrm{oms}}\,[\mathrm{m}\mathrm{Hz}^{-1/2}]$", "m Hz^{-1/2}"
@@ -120,6 +138,7 @@ def _noise_param_info(sensitivity_backend) -> List[ParameterInfo]:
 PARAMETER_INFO_REGISTRY: Dict[str, Dict[str, ParameterInfo]] = {
     "gb": _GB_PARAM_INFO,
     "mbh": _MBH_PARAM_INFO,
+    "emri": _EMRI_PARAM_INFO,
     "psd": _NOISE_PARAM_INFO,
     "galfor": _GALFOR_PARAM_INFO,
     # add entries for other source types as needed
@@ -133,6 +152,7 @@ _STOCHASTIC_BRANCHES = ["psd", "galfor"]
 _OUTPUT_CORRECTIONS_REGISTRY: Dict[str, Dict[str, Callable]] = {
     "gb": {},
     "mbh": {"luminosity_distance": lambda x: x * 1e-3},
+    "emri": {},
     "psd": {},
     "galfor": {},
 }
@@ -140,6 +160,7 @@ _OUTPUT_CORRECTIONS_REGISTRY: Dict[str, Dict[str, Callable]] = {
 _REMOVED_PARAMS_REGISTRY: Dict[str, List[str]] = {
     "gb": ["frequency_double_dot"],
     "mbh": [],
+    "emri": [],
     "psd": [],
     "galfor": [],
 }
@@ -155,6 +176,7 @@ source_types_names = dict(
 
 # order of the mojito light mbh sources, sorted by merger time (earliest to latest), for the purpose of assigning `known_injection` labels in the metadata
 _MOJITO_LIGHT_MBH_ORDER = ["source_18", "source_5", "source_16", "source_7", "source_2", "source_12", "source_9", "source_4", "source_0", "source_15", "source_3", "source_10", "source_19", "source_13", "source_6", "source_17", "source_8", "source_1", "source_11", "source_14"] 
+_MOJITO_LIGHT_EMRI_ORDER = ["source_0", "source_1", "source_3", "source_2", "source_5", "source_4", "source_6", "source_7"]
 
 MAX_SOURCES_PER_BATCH = 500
 
@@ -1308,6 +1330,17 @@ class SubmissionWriter(BackendConsumer):
         inds = inds[:, sorted_indices]
 
         return samples, inds
+
+    def _prepare_emri_samples(self, acs: AnalysisContainerArray, original_samples: np.ndarray, samples: np.ndarray, inds: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Sort the EMRI samples according to their initial eccentricity, and cluster them if there are multiple sources in the same block."""
+
+        e0_idx = list(PARAMETER_INFO_REGISTRY["emri"].keys()).index("e0")
+        mean_initial_eccentricities = samples[:, :, e0_idx].mean(axis=0) # shape (nleaves_max,)
+        sorted_indices = np.argsort(mean_initial_eccentricities)
+        samples = samples[:, sorted_indices, :]
+        inds = inds[:, sorted_indices]
+
+        return samples, inds
     
     def _prepare_gb_samples(self, acs: AnalysisContainerArray, original_samples: np.ndarray, samples: np.ndarray, inds: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -1405,6 +1438,7 @@ class SubmissionWriter(BackendConsumer):
         return {
             "mbh": self._prepare_mbhb_samples,
             "gb": self._prepare_gb_samples,
+            "emri": self._prepare_emri_samples,
         }
 
     def _get_mbhb_label(self, leaf_samples: np.ndarray, leaf_index: int) -> str:
@@ -1429,6 +1463,18 @@ class SubmissionWriter(BackendConsumer):
         yyyyy = f"{mean_frequency_microhz}"
 
         return f"{xxxxx}_{yyyyy}"
+
+    def _get_emri_label(self, leaf_samples: np.ndarray, leaf_index: int) -> str:
+        """Get a label for an EMRI source based on its initial eccentricity."""
+        
+        e0_idx = list(PARAMETER_INFO_REGISTRY["emri"].keys()).index("e0")
+        mean_initial_eccentricity = leaf_samples[:, e0_idx].mean()
+        mean_initial_eccentricity_scaled = int(mean_initial_eccentricity * 1e3)  
+
+        xxxxx = f"{leaf_index:05d}"
+        yyyyy = f"{mean_initial_eccentricity_scaled}"
+
+        return f"{xxxxx}_{yyyyy}"
     
     @property
     def get_source_label_registry(self) -> dict[str, Callable]:
@@ -1439,6 +1485,7 @@ class SubmissionWriter(BackendConsumer):
         return {
             "mbh": self._get_mbhb_label,
             "gb": self._get_gb_label,
+            "emri": self._get_emri_label,
         }
 
     @property
@@ -1447,7 +1494,8 @@ class SubmissionWriter(BackendConsumer):
         # for Mojito light, we don't have any known injections, so we return an empty list for each source type
         return {
             'mbh': _MOJITO_LIGHT_MBH_ORDER, 
-            'gb': []
+            'gb': [],
+            'emri': _MOJITO_LIGHT_EMRI_ORDER,
             }
 
 
@@ -1648,6 +1696,7 @@ class SubmissionWriter(BackendConsumer):
             frequency_ranges=metadata_list[0].frequency_ranges,  # we assume the same frequency ranges for all stochastic branches; this can be relaxed if needed
             prior_model=" ,".join(set(m.prior_model for m in metadata_list)),
             prior_model_code_link=" ,".join(set(m.prior_model_code_link for m in metadata_list)),
+            prior_model_config_file=" ,".join(set(m.prior_model_config_file for m in metadata_list)),
             prior_model_config={branch: metadata_list[i].prior_model_config for i, branch in enumerate(branches_here)},
             comment=" ,".join(m.comment for m in metadata_list if m.comment)
         )
