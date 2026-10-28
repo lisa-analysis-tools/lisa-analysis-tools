@@ -154,6 +154,9 @@ def seed_branches(cfg: RunConfig, waveform_classes: dict[str, type], curr, acs, 
         info = curr.source_info[name]
         wave_gens[name] = waveform_classes[name](**info.initialize_kwargs)
         subtract_initial_signal(acs, state, wave_gens[name].get_signals_for_residuals, name, info)
+
+        # plot and save the residuals after the initial signals are subtracted, for debugging
+        _ = acs.acs[0].data.plot(channel=0, filename=curr.general_info.artifacts_file_dir + f"data_after_subtracting_{name}.png")
     return wave_gens
 
 

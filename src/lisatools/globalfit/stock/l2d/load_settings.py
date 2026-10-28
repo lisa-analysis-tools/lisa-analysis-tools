@@ -38,7 +38,7 @@ def _domain_factory(domain):
 def _processor_init_kwargs(cfg: RunConfig) -> dict:
     orbits = cfg.data.orbits
     orbits_kwargs = orbits.model_dump(exclude={"type"}, exclude_none=True)
-    orbits_kwargs["force_backend"] = cfg.compute.backend
+    # orbits_kwargs["force_backend"] = "cpu"
     return dict(
         L1_folder=str(cfg.data.path),
         source_types=list(cfg.data.source_types),
@@ -66,8 +66,15 @@ def _preprocess_kwargs(cfg: RunConfig) -> dict:
         alias_correction=data.alias_correction,
     )
 
+def _pre_config(cfg: RunConfig) -> None:
+    """Run any pre-configuration hooks that may be needed before building GeneralSettings."""
+    return
+
 def make_general_settings(cfg: RunConfig) -> GeneralSettings:
     """Map ``cfg`` onto :class:`GeneralSettings`. Cheap: nothing is loaded."""
+
+    _pre_config(cfg)  
+
     run, window, meta = cfg.run, cfg.window, cfg.metadata
     taper = 1.0 / cfg.domain.min_freq if window.taper_duration == "auto" else window.taper_duration
 

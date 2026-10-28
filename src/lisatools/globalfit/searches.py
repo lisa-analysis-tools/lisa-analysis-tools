@@ -177,7 +177,11 @@ class BaseSearchInterface(ABC):
             The transformed parameters in the sampling basis.
         """
         if self.transform is not None:
-            params = self.transform.both_inverse_transforms(params)
+            # Create a filled array with the same shape as the input parameters, but with the last dimension equal to the number of physical parameters, otherwise the transform will fail.
+            filled = np.ones((*params.shape[:-1], len(self.physical_parameters)))
+            filled[..., self.parameters_searched] = params
+            filled_converted = self.transform.both_inverse_transforms(filled)
+            params = filled_converted[..., self.parameters_searched]
 
         return params
 

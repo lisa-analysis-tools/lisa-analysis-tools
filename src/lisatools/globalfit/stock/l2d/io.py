@@ -96,6 +96,18 @@ class ComputeSection(_Section):
             raise ValueError(f"flow_gpu {self.flow_gpu} is a sampling GPU (gpus: {self.gpus}); use another one.")
         return self
 
+    @model_validator(mode="after")
+    def _validate_gpus(self):
+        if self.gpus is not None:
+            import jax
+            jax.config.update("jax_cuda_visible_devices", ",".join(str(gpu) for gpu in self.gpus))
+
+            if len(self.gpus) != len(jax.devices("gpu")):
+                raise ValueError(
+                    f"gpus {self.gpus} does not match the GPUs JAX sees: {jax.devices('gpu')}. "
+                    "Check CUDA_VISIBLE_DEVICES or jax_cuda_visible_devices."
+                )
+        return self
 
 class BlockConfig(BaseModel):
     """One source/noise block. Type-specific fields are validated in a later step."""
@@ -128,19 +140,21 @@ class L1OrbitsSpec(_Section):
     type: Literal["l1"]
     frame: Literal["icrs", "ecliptic"] = "icrs"
     armlength: PositiveFloat | None = None  # None -> L1Orbits' own default
+    force_backend: Literal["cpu", "cuda11x", "cuda12x", "cuda13x"] = "cpu"
 
 
 class EqualArmlengthOrbitsSpec(_Section):
     """Packaged equal-armlength orbit file (``EqualArmlengthOrbits``)."""
 
     type: Literal["equal_armlength"]
+    force_backend: Literal["cpu", "cuda11x", "cuda12x", "cuda13x"] = "cpu"
 
 
 class ESAOrbitsSpec(_Section):
     """Packaged ESA trailing orbit file (``ESAOrbits``)."""
 
     type: Literal["esa"]
-
+    force_backend: Literal["cpu", "cuda11x", "cuda12x", "cuda13x"] = "cpu"
 
 OrbitsSpec = Annotated[
     L1OrbitsSpec | EqualArmlengthOrbitsSpec | ESAOrbitsSpec, Field(discriminator="type")
