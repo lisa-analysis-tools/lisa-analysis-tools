@@ -430,9 +430,46 @@ def _fused_ll_numpy(backend, bases, coeffs, data, data_index, gal_conv, gal_rati
     return np.array([math.fsum(v) for v in partial], dtype=np.float64)
 
 
+def _has_compiled(backend, name: str) -> bool:
+    """Whether the backend's compiled sensitivity matrix exposes ``name`` (absent in
+    binaries built before the window-convolution C++ port)."""
+    return hasattr(getattr(backend, "pycpp_sensitivity_matrix", None), name)
+
+
+def _fused_ll_compiled(backend, bases, coeffs, data, data_index, gal_conv, gal_ratios, spl, num_freqs, num_times):
+    """``XYZSensitivityMatrix::psd_likelihood_basis_wrap`` (``PSD.cu``): same algebra as
+    the cupy / numpy implementations, CPU and GPU from one C++ source."""
+    xp = backend.xp
+    num_psds, n_basis = coeffs.shape
+    total = num_freqs * num_times
+    empty = xp.empty(0, dtype=xp.float64)
+    gal_args = (False, empty, empty, 0, 0, 0)
+    if gal_conv is not None:
+        es = gal_conv.itemsize
+        if gal_conv.strides[-1] != es:
+            gal_conv = xp.ascontiguousarray(gal_conv)
+        gal_args = (
+            True, gal_conv, gal_ratios, int(gal_conv.shape[-1]), gal_conv.strides[0] // es,
+            0 if gal_conv.shape[1] == 1 else gal_conv.strides[1] // es,
+        )
+    spl_args = (False, empty, 0, 0, 0)
+    if spl is not None:
+        es = spl.itemsize
+        spl_args = (True, spl, *(st // es for st in spl.strides))
+    bases = [xp.ascontiguousarray(B) for B in bases]  # no-op for get_instrument_bases
+    out = xp.empty(num_psds, dtype=xp.float64)
+    backend.pycpp_sensitivity_matrix.psd_likelihood_basis_wrap(
+        out, data, data_index, coeffs, *bases, *gal_args, *spl_args,
+        xp.ascontiguousarray(backend.dips_mask, dtype=bool).reshape(-1),
+        float(backend.basis_settings.differential_component),
+        num_freqs, num_times, num_psds, data.size // (3 * total), n_basis,
+    )
+    return out
+
+
 def fused_log_like(
     backend, data, data_index, coeffs, gal_conv=None, gal_ratios=None, spline_weights=None,
-    bases=None,
+    bases=None, compiled: Optional[bool] = None,
 ):
     """Log-likelihood per PSD from the instrument bases (+ galaxy rows, + spline weights).
 
@@ -463,6 +500,10 @@ def fused_log_like(
             ``10**spline`` (row 0 OMS, row 1 TM; any strides, no copy), applied to the
             bases of noise type ``b // n_noise_par``. Per frequency only (as the C++).
         bases: override the bases (default: :func:`get_instrument_bases`, convolved).
+        compiled: ``None`` (default) uses the compiled
+            ``psd_likelihood_basis_wrap`` (``PSD.cu``, CPU and GPU) when the backend's
+            binary has it, else the cupy ``RawKernel`` / numpy implementation below;
+            ``False`` forces the latter, ``True`` requires the former.
 
     Returns:
         ``(num_psds,)`` float64 on the backend's array module.
@@ -471,6 +512,13 @@ def fused_log_like(
      num_freqs, num_times) = _fused_prepare(
         backend, data, data_index, coeffs, gal_conv, gal_ratios, spline_weights, bases
     )
+    has = _has_compiled(backend, "psd_likelihood_basis_wrap")
+    if compiled and not has:
+        raise RuntimeError("compiled=True but the backend binary has no psd_likelihood_basis_wrap")
+    if has and compiled is not False:
+        return _fused_ll_compiled(
+            backend, bases, coeffs, data, data_index, gal_conv, gal_ratios, spl, num_freqs, num_times
+        )
     if backend.xp is np:
         return _fused_ll_numpy(
             backend, bases, coeffs, data, data_index, gal_conv, gal_ratios, spl, num_freqs, num_times
@@ -774,14 +822,28 @@ def _gal_direct_terms(backend, n):
     return terms
 
 
-def _gal_eval_direct(backend, st, n, params, R00=None):
+def _gal_eval_direct(backend, st, n, params, R00=None, compiled: Optional[bool] = None):
     """XX galactic entry at the first time index, ``(B, n)``, evaluated directly
-    (elementwise, the ``PSD.cu`` formula; ``cupy.ElementwiseKernel`` on GPU) instead of
-    the full 6-entry covariance kernel -- which spends ~all its time on the instrument
-    transfer functions that a galaxy-only call discards. Validated against the kernel
-    at setup (``st["direct_mismatch"]``)."""
+    instead of the full 6-entry covariance kernel -- which spends ~all its time on the
+    instrument transfer functions that a galaxy-only call discards. Validated against
+    the kernel at setup (``st["direct_mismatch"]``).
+
+    With ``R00=None`` and a binary that has ``get_galactic_row_wrap`` (``compiled`` not
+    False) this is the compiled ``XYZSensitivityMatrix::get_galactic_row_arr`` (the
+    ``PSD.cu`` device code itself, exact ``gal_R_avg``: bitwise the XX entry of a
+    galaxy-only covariance call). Otherwise an elementwise mirror of the ``PSD.cu``
+    formula (``cupy.ElementwiseKernel`` on GPU) times ``R00`` (default ``st["R00"]``)."""
     global _GAL_DIRECT_KERNEL
     xp = backend.xp
+    if R00 is None and compiled is not False and _has_compiled(backend, "get_galactic_row_wrap"):
+        B = int(params[0].shape[0])
+        out = xp.empty((B, n), dtype=xp.float64)
+        backend.pycpp_sensitivity_matrix.get_galactic_row_wrap(
+            out, xp.ascontiguousarray(xp.asarray(backend.f_arr, dtype=xp.float64)[:n]),
+            *[xp.ascontiguousarray(q, dtype=xp.float64) for q in params],
+            n, B, int(backend.time_indices[0]),
+        )
+        return out
     R = st["R00"] if R00 is None else R00
     L = float(backend.orbits.armlength)
     gen = int(backend.tdi_generation)
@@ -824,7 +886,10 @@ def _gal_direct_setup(backend, st):
     unit = _gal_host(_gal_eval_direct(backend, st, n, params, R00=1.0))
     ok = np.isfinite(ref) & np.isfinite(unit)
     R00 = float(np.sum(np.where(ok, ref * unit, 0.0)) / np.sum(np.where(ok, unit * unit, 0.0)))
-    mine = _gal_host(_gal_eval_direct(backend, st, n, params, R00=R00))
+    if _has_compiled(backend, "get_galactic_row_wrap"):
+        mine = _gal_host(_gal_eval_direct(backend, st, n, params))  # compiled rows (exact R00)
+    else:
+        mine = _gal_host(_gal_eval_direct(backend, st, n, params, R00=R00))
     both_nan = ~np.isfinite(ref) & ~np.isfinite(mine)
     scale = np.max(np.where(ok, np.abs(ref), 0.0), axis=-1, keepdims=True)
     with np.errstate(invalid="ignore"):

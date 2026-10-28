@@ -191,19 +191,20 @@ void XYZSensitivityMatrixWrap::psd_likelihood_wrap(
     }
     else
     {
-        int total_size = num_psds * total_tf_pairs;
-        _c00 = return_pointer_and_check_length(c00_all, "c00_all", total_size, 1);
-        _c11 = return_pointer_and_check_length(c11_all, "c11_all", total_size, 1);
-        _c22 = return_pointer_and_check_length(c22_all, "c22_all", total_size, 1);
-        _c01 = reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c01_all, "c01_all", total_size, 1));
-        _c02 = reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c02_all, "c02_all", total_size, 1));
-        _c12 = reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c12_all, "c12_all", total_size, 1));
+        // (N, multiplier) split: the product is formed as size_t (num_psds * total_tf_pairs
+        // overflows int at 2 yr)
+        _c00 = return_pointer_and_check_length(c00_all, "c00_all", total_tf_pairs, num_psds);
+        _c11 = return_pointer_and_check_length(c11_all, "c11_all", total_tf_pairs, num_psds);
+        _c22 = return_pointer_and_check_length(c22_all, "c22_all", total_tf_pairs, num_psds);
+        _c01 = reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c01_all, "c01_all", total_tf_pairs, num_psds));
+        _c02 = reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c02_all, "c02_all", total_tf_pairs, num_psds));
+        _c12 = reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c12_all, "c12_all", total_tf_pairs, num_psds));
     }
 
     sensitivity_matrix->psd_likelihood_wrap(
         return_pointer_and_check_length(like_contrib_final, "like_contrib_final", num_psds,                  1),
         return_pointer_and_check_length(f_arr,              "f_arr",              num_freqs,                 1),
-        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(data, "data", num_psds * 3 * total_tf_pairs, 1)),
+        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(data, "data", total_tf_pairs, num_psds * 3)),
         return_pointer_and_check_length(data_index_all,     "data_index_all",     num_psds,                  1),
         return_pointer_and_check_length(time_index_all,     "time_index_all",     num_times,                 1),
         return_pointer_and_check_length(Soms_d_in_all,      "Soms_d_in_all",      num_psds * sensitivity_matrix->n_noise_par, 1),
@@ -224,6 +225,72 @@ void XYZSensitivityMatrixWrap::psd_likelihood_wrap(
         use_external_matrix,
         run_async
     );
+}
+
+void XYZSensitivityMatrixWrap::psd_likelihood_basis_wrap(
+    array_type<double> like_contrib_final, array_type<std::complex<double>> data,
+    array_type<int> data_index_all, array_type<double> coeffs,
+    array_type<double> B00, array_type<double> B11, array_type<double> B22,
+    array_type<std::complex<double>> B01, array_type<std::complex<double>> B02,
+    array_type<std::complex<double>> B12,
+    bool use_galaxy, array_type<double> gal_conv, array_type<double> gal_ratios,
+    int n_gal, long long gal_psd_stride, long long gal_t_stride,
+    bool use_spline_weights, array_type<double> spline_weights,
+    long long spl_psd_stride, long long spl_noise_stride, long long spl_f_stride,
+    array_type<bool> dips_mask, double differential_component,
+    int num_freqs, int num_times, int num_psds, int num_data, int n_basis,
+    bool run_async)
+{
+    int total_tf_pairs = num_times * num_freqs;  // one block of bins; products below are size_t
+
+    // Optional inputs are only read when their flag is set; otherwise they may be empty.
+    // gal_conv is addressed through the explicit element strides (gal_t_stride = 0
+    // broadcasts one row over time), so its buffer length is not checked here.
+    double *_gal_conv = nullptr, *_gal_ratios = nullptr, *_spl = nullptr;
+    if (use_galaxy && n_gal > 0)
+    {
+        if (n_gal > num_freqs)
+            throw std::invalid_argument("psd_likelihood_basis_wrap: n_gal > num_freqs");
+        _gal_conv = return_pointer_no_check(gal_conv);
+        _gal_ratios = return_pointer_and_check_length(gal_ratios, "gal_ratios", num_times, 6);
+    }
+    if (use_spline_weights)
+        _spl = return_pointer_and_check_length(spline_weights, "spline_weights", num_freqs, 2 * num_psds);
+
+    typedef gcmplx::complex<double> gc;
+    sensitivity_matrix->psd_likelihood_basis_wrap(
+        return_pointer_and_check_length(like_contrib_final, "like_contrib_final", num_psds, 1),
+        reinterpret_cast<gc*>(return_pointer_and_check_length(data, "data", total_tf_pairs, 3 * num_data)),
+        return_pointer_and_check_length(data_index_all, "data_index_all", num_psds, 1),
+        return_pointer_and_check_length(coeffs, "coeffs", num_psds, n_basis),
+        n_basis,
+        return_pointer_and_check_length(B00, "B00", total_tf_pairs, n_basis),
+        return_pointer_and_check_length(B11, "B11", total_tf_pairs, n_basis),
+        return_pointer_and_check_length(B22, "B22", total_tf_pairs, n_basis),
+        reinterpret_cast<gc*>(return_pointer_and_check_length(B01, "B01", total_tf_pairs, n_basis)),
+        reinterpret_cast<gc*>(return_pointer_and_check_length(B02, "B02", total_tf_pairs, n_basis)),
+        reinterpret_cast<gc*>(return_pointer_and_check_length(B12, "B12", total_tf_pairs, n_basis)),
+        _gal_conv, (_gal_conv == nullptr) ? 0 : n_gal, gal_psd_stride, gal_t_stride, _gal_ratios,
+        _spl, spl_psd_stride, spl_noise_stride, spl_f_stride,
+        return_pointer_and_check_length(dips_mask, "dips_mask", total_tf_pairs, 1),
+        differential_component, num_freqs, num_times, num_psds, run_async);
+}
+
+void XYZSensitivityMatrixWrap::get_galactic_row_wrap(
+    array_type<double> out, array_type<double> freqs,
+    array_type<double> Amp_all, array_type<double> alpha_all,
+    array_type<double> f_1_all, array_type<double> f_knee_all, array_type<double> f_2_all,
+    int num_freqs, int num_psds, int time_index, bool run_async)
+{
+    sensitivity_matrix->get_galactic_row_arr(
+        return_pointer_and_check_length(out,        "out",        num_freqs, num_psds),
+        return_pointer_and_check_length(freqs,      "freqs",      num_freqs, 1),
+        return_pointer_and_check_length(Amp_all,    "Amp_all",    num_psds, 1),
+        return_pointer_and_check_length(alpha_all,  "alpha_all",  num_psds, 1),
+        return_pointer_and_check_length(f_1_all,    "f_1_all",    num_psds, 1),
+        return_pointer_and_check_length(f_knee_all, "f_knee_all", num_psds, 1),
+        return_pointer_and_check_length(f_2_all,    "f_2_all",    num_psds, 1),
+        num_freqs, num_psds, time_index, run_async);
 }
 
 void XYZSensitivityMatrixWrap::get_noise_covariance_wrap(
@@ -611,6 +678,36 @@ void detector_part(nb::module_ &m) {
          "Compute PSD likelihood. With use_external_matrix, the covariance entries are read from "
          "c*_all (num_psds * num_times * num_freqs each) instead of being computed in-kernel, and "
          "the spline weights may be empty; otherwise c*_all may be empty.")
+    .def("psd_likelihood_basis_wrap", &XYZSensitivityMatrixWrap::psd_likelihood_basis_wrap,
+         nb::arg("like_contrib_final"), nb::arg("data"), nb::arg("data_index_all"), nb::arg("coeffs"),
+         nb::arg("B00"), nb::arg("B11"), nb::arg("B22"), nb::arg("B01"), nb::arg("B02"), nb::arg("B12"),
+         nb::arg("use_galaxy"), nb::arg("gal_conv"), nb::arg("gal_ratios"),
+         nb::arg("n_gal"), nb::arg("gal_psd_stride"), nb::arg("gal_t_stride"),
+         nb::arg("use_spline_weights"), nb::arg("spline_weights"),
+         nb::arg("spl_psd_stride"), nb::arg("spl_noise_stride"), nb::arg("spl_f_stride"),
+         nb::arg("dips_mask"), nb::arg("differential_component"),
+         nb::arg("num_freqs"), nb::arg("num_times"), nb::arg("num_psds"), nb::arg("num_data"),
+         nb::arg("n_basis"),
+         nb::arg("run_async") = false,
+         nb::call_guard<nb::gil_scoped_release>(),
+         "Log-likelihood per PSD with the covariance assembled from precomputed bases:\n"
+         "c_k = sum_b coeffs[p, b] w_b(p, f) B_k[b, t * nf + f] + gal_ratios[t, k'] gal_conv[p, t, f]\n"
+         "(f < n_gal), then the psd_likelihood_wrap algebra. B* (n_basis, num_times * num_freqs)\n"
+         "contiguous, coeffs (num_psds, n_basis), data (num_data, 3, num_times * num_freqs).\n"
+         "gal_conv: element strides (psd, time; 0 = same row for all times), unit stride in f;\n"
+         "gal_ratios (num_times, 6) in the gal_R_avg order [00, 01, 02, 11, 12, 22].\n"
+         "spline_weights: (num_psds, 2, num_freqs) multiplicative weights (row b / n_noise_par)\n"
+         "addressed through the given element strides. Unused optional arrays may be empty.")
+    .def("get_galactic_row_wrap", &XYZSensitivityMatrixWrap::get_galactic_row_wrap,
+         nb::arg("out"), nb::arg("freqs"),
+         nb::arg("Amp_all"), nb::arg("alpha_all"), nb::arg("f_1_all"), nb::arg("f_knee_all"), nb::arg("f_2_all"),
+         nb::arg("num_freqs"), nb::arg("num_psds"), nb::arg("time_index"),
+         nb::arg("run_async") = false,
+         nb::call_guard<nb::gil_scoped_release>(),
+         "XX galactic entry rows out (num_psds, num_freqs): gal_R_avg[time_index * 6] * S_gal *\n"
+         "common_tdi * noise_normalization + the alias copies, bitwise the XX entry of a\n"
+         "galaxy-only get_noise_covariance_wrap call. freqs must be a prefix of the active grid.\n"
+         "time_index < 0: unit R00 (galactic shape only). f = 0 gives NaN.")
     .def("get_noise_covariance_wrap", &XYZSensitivityMatrixWrap::get_noise_covariance_wrap,
          nb::arg("freqs"), nb::arg("time_indices"),
          nb::arg("Soms_d_in_all"), nb::arg("Sa_a_in_all"),
