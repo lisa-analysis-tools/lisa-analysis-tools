@@ -1,0 +1,59 @@
+type: mbh
+priors: {class: mojitolight.MBHBPrior}
+waveform:
+  class: PhenomTHMTDIWaveform
+  kwargs:
+    waveform_kwargs:
+      higher_modes: [21, 33, 44]
+      include_negative_modes: true
+      t_low_fit: true
+      coarse_grain: false
+      atol: 1e-12
+      rtol: 1e-12
+    tdi_generation: 2nd generation
+    tdi_channels: XYZ
+    order: 30
+    Tobs: 2629845.8136287993  # 1 / 12 * YRSID_SI: waveform length only, not the data's
+    start_freq: 7e-5
+    use_reference_time: true
+    buffer_time: 15000
+    fft_batch_size: 2
+num_prop_repeats: 60
+tempering: {ratio: 1.2}  # over sampler.ntemps
+inner_moves:
+  - {class: StretchMove, weight: 0.35}
+  - {class: DEMove, weight: 0.3}
+  - {class: SkyMove, weight: 0.05, kwargs: {which: lat}}
+  - {class: SkyMove, weight: 0.05, kwargs: {which: long}}
+  - {class: SkyMove, weight: 0.05, kwargs: {which: both}}
+flow:
+  weight: 0.2
+  # the flow on the unimodal parameters only, a stretch on the degenerate ones (one CombineMove):
+  parameters: [logM, logq, s1z, s2z, d_L, phi_ref, t_c]
+  complement: {class: StretchMove}
+  model:
+    class: ZukoFlow
+    kwargs: {flow_class: NSF, transforms: 8, hidden_features: [128, 128, 128], bins: 8}
+  data_transform:
+    class: WhiteningTransform
+    kwargs: {shared: false, periodic_in_cholesky: true}
+  trainer:
+    epochs_per_round: 150
+    min_train_samples: 2000
+    max_buffer_samples: 6000
+    refit_transform_every: 1
+    torch_num_threads: 2
+    plot_corner: true
+    fit_kwargs: {batch_size: 1024, lr: 1e-3, lr_annealing: true, optimizer: adamw, patience: 30,
+                 validation_fraction: 0.2, val_split: temporal, train_noise: 0.0}
+search:
+  search_type: point_estimate
+  search_path: /data/asantini/globalfit/erebor_org_setup/search_results/mbh/point_estimates.npy
+  parameters_searched: ['logM', 'logq', 's1z', 's2z', 'cos_iota', 'psi', 'alpha', 'sin_delta', 't_c']
+  spread: [1e-4, 1e-3, 1e-3, 1e-3, 1e-3, 1e-1, 1e-2, 1e-2, 1e-1]
+pe_move: 
+  class: TDMBHSpecialMove
+  kwargs: {permute_every: 20, pad_out_of_prior: true, run_async: true, run_threaded: true, randomize_split: true}
+links:
+  waveform_model_code_link: https://github.com/Erebor-L2D/LISAanalysistools/blob/9d63bb1e63e7b8f640d3780551d9421df5245992/src/lisatools/sources/bbh/waveform.py#L130
+  prior_model_code_link: https://priors-database-f0027f.gitlab.io/mojito_light_1a.html#massive-black-hole-binaries-mbhb
