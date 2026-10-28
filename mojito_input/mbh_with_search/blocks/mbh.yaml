@@ -1,5 +1,5 @@
 type: mbh
-priors: {class: mojitolight.MBHBPrior}
+priors: {class: mojitolight.MBHBPrior, output_file: mbh_prior.yaml}
 waveform:
   class: PhenomTHMTDIWaveform
   kwargs:
