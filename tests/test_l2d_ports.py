@@ -129,7 +129,7 @@ class EmriMbhPsdTest(_Port):
             cfg = load_run(EMRI_MBH_PSD)
         self.assertEqual(sorted(cfg.blocks), ["emri", "mbh", "psd"])
         self.assertEqual((cfg.sampler.nwalkers, cfg.sampler.ntemps), (24, 4))
-        self.assertEqual((cfg.compute.gpus, cfg.compute.flow_gpu), ([5, 6], 4))
+        self.assertNotIn(cfg.compute.flow_gpu, cfg.compute.gpus)  # which GPUs is per run, not the port's
         self.assertEqual(cfg.data.source_ids, {"emri": [0, 3], "mbhb": [18, 5, 16, 7, 2, 12]})
         self.assertEqual(cfg.data.Tobs, YRSID_SI)
         self.assertEqual(cfg.recipe.class_name, "StockRecipe")
@@ -141,8 +141,9 @@ class EmriMbhPsdTest(_Port):
             code = load_script().main(["--config", str(on_cpu(EMRI_MBH_PSD, self.root)), "--dry-run"])
         self.assertEqual(code, 0)
         out = stdout.getvalue()
+        name = load_run(EMRI_MBH_PSD).run.name  # per run, not the port's
         for line in (
-            "dry run: test_flow_joint_sources_stft built, nothing sampled",
+            f"dry run: {name} built, nothing sampled",
             "emri: 2 leaves x 12 params, ladder 1, search catalog, flow ZukoFlow on 12 params, pe_move EMRISpecialMove",
             "mbh: 6 leaves x 11 params, ladder 4, search catalog, flow ZukoFlow on 11 params, pe_move TDMBHSpecialMove",
             "psd: 1 leaves x 2 params, ladder 4, no search, pe_move MultiGPUPSDMove",

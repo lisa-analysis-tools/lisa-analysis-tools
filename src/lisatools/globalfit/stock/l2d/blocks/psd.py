@@ -6,13 +6,14 @@ from pydantic import Field
 
 from .base import (
     GENERIC_MOVES, GENERIC_PSD_MOVE_FILLED, SPECIAL_MOVES, SPECIAL_PSD_MOVE_FILLED,
-    BlockBase, BlockBuild, BuildContext, ClassSpec, PEMove, make_betas, make_search_interface,
+    BlockBuild, BuildContext, ClassSpec, MoveBlock, PEMove, make_betas, make_search_interface,
 )
 
 REFERENCE_TMAX = 1e6  # top of the reference psd ladder (mojito_input/emri_mbh_psd_settings.py)
+STOCHASTIC = ("psd", "galfor")  # the branches the psd move samples (one ladder, one search)
 
 
-class PSDBlock(BlockBase):
+class PSDBlock(MoveBlock):
     """Block for PSD estimation."""
 
     type: Literal["psd"]
@@ -31,13 +32,15 @@ class PSDBlock(BlockBase):
     }))
 
 
-def psd_betas(block: PSDBlock, ndim: int, ntemps: int):
-    """The psd ladder: the block's tempering, else the reference ``make_ladder(ndim, ntemps, Tmax=1e6)``."""
+def psd_betas(block: PSDBlock, ntemps: int):
+    """The ladder of the psd move, shared by psd and galfor: the block's tempering, else the reference
+    ``make_ladder(ndim, ntemps, Tmax=1e6)``. With ``ntemps`` and a finite ``Tmax`` that is the geometric
+    ladder from 1 to 1/Tmax whatever ``ndim``, so galfor does not change it."""
     from eryn.moves.tempering import make_ladder
 
     if block.tempering is not None:
         return make_betas(block.tempering, ntemps)
-    return make_ladder(ndim, ntemps=ntemps, Tmax=REFERENCE_TMAX)
+    return make_ladder(1, ntemps=ntemps, Tmax=REFERENCE_TMAX)
 
 
 def build(block: PSDBlock, ctx: BuildContext) -> BlockBuild:
@@ -60,7 +63,7 @@ def build(block: PSDBlock, ctx: BuildContext) -> BlockBuild:
         injection=injection,
         num_prop_repeats=block.num_prop_repeats,
         # one ladder for seeding and both psd moves (the Setup's own default is 24 rungs)
-        betas=psd_betas(block, ndim, ctx.cfg.sampler.ntemps),
+        betas=psd_betas(block, ctx.cfg.sampler.ntemps),
         search_interface=make_search_interface(block, info),
     )
 

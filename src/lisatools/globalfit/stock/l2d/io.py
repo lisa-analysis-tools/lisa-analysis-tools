@@ -356,8 +356,9 @@ class RunConfig(_Section):
                 raise ValueError(f"blocks/{name} has type {block.type!r}; name the file {block.type}.yaml.")
             if not block.enabled:
                 continue
-            # a ladder may use a subset of the sampler's temperatures, never more
-            ntemps = None if block.tempering is None else block.tempering.ntemps
+            # a ladder may use a subset of the sampler's temperatures, never more (galfor has none: the psd move's)
+            tempering = getattr(block, "tempering", None)
+            ntemps = None if tempering is None else tempering.ntemps
             if ntemps is not None and ntemps > self.sampler.ntemps:
                 raise ValueError(
                     f"block {name!r}: tempering.ntemps ({ntemps}) is above sampler.ntemps ({self.sampler.ntemps})."
@@ -377,6 +378,25 @@ class RunConfig(_Section):
                     raise ValueError(f"block {name!r} needs {key!r} in data.source_types.")
                 if block.nleaves == "auto" and not data.source_ids.get(key):
                     raise ValueError(f"block {name!r}: nleaves: auto needs data.source_ids[{key!r}].")
+        return self
+
+    @model_validator(mode="after")
+    def _galfor_rides_on_psd(self):
+        """galfor is sampled by the psd move, through the sensitivity's galactic grid."""
+        galfor = self.blocks.get("galfor")
+        if galfor is None or not galfor.enabled:
+            return self
+        psd = self.blocks.get("psd")
+        if psd is None or not psd.enabled:
+            raise ValueError("the galfor block is sampled by the psd move; add an enabled psd block.")
+        accepted = _init_params(_sensitivity_class(self.sensitivity.class_name))
+        if accepted is not None and "galactic_grid_kwargs" not in accepted:
+            raise ValueError(f"the galfor block needs a sensitivity with a galactic grid; {self.sensitivity.class_name} has none.")
+        if not self.sensitivity.kwargs.get("galactic_grid_kwargs"):
+            raise ValueError(
+                "the galfor block needs sensitivity.kwargs.galactic_grid_kwargs (R_d, z_d, ...); "
+                "without the grid the sensitivity has no galaxy and galfor would sample nothing."
+            )
         return self
 
 
