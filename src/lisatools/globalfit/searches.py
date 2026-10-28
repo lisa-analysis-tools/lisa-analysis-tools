@@ -60,7 +60,7 @@ class BaseSearchInterface(ABC):
         self.spread = spread
         self.transform = transform
         self.is_eryn_backend = is_eryn_backend
-        self.parameters_searched = self.get_parameters_searched_indices(parameters_searched) if parameters_searched is not None else None
+        self.parameters_searched = self.get_parameters_searched_indices(parameters_searched) if parameters_searched is not None else np.arange(len(self.sampling_basis))
         self.periodic = self.get_periodic_indices(periodic) if periodic is not None else None
 
         self.validate_search_type()
@@ -176,7 +176,7 @@ class BaseSearchInterface(ABC):
         np.ndarray
             The transformed parameters in the sampling basis.
         """
-        if self.transform is not None:
+        if self.transform is not None:            
             # Create a filled array with the same shape as the input parameters, but with the last dimension equal to the number of physical parameters, otherwise the transform will fail.
             filled = np.ones((*params.shape[:-1], len(self.physical_parameters)))
             filled[..., self.parameters_searched] = params
@@ -209,9 +209,9 @@ class BaseSearchInterface(ABC):
         Returns the catalog values for the specific source type, in the sampling basis with periodic parameters wrapped.
         """
         catalog_entries = self.get_source_catalog(curr)
-        return self.wrap_periodic(self.transform_to_sampling_basis(
-            np.array([self.unpack_catalog_entries(entry, curr) for entry in catalog_entries])
-            )) #shape: (num_leaves, num_dim)
+        physical_params = np.array([self.unpack_catalog_entries(entry, curr) for entry in catalog_entries]) # shape: (num_leaves, num_physical_params)
+        sampling_params = self.transform_to_sampling_basis(physical_params)
+        return self.wrap_periodic(sampling_params) #shape: (num_leaves, num_dim)
 
     def read_samples_from_file(self) -> np.ndarray:
         """
