@@ -205,24 +205,16 @@ class SourceLinks(Links):
     waveform_model_code_link: str = ""
 
 class BlockBase(_Spec):
-    """Base class for all block specs: schema, class lookup, kwarg checks, build helpers."""
+    """Base class for all block specs: the branch's prior, seeding and links."""
 
     NEEDS_REFERENCE_TIME: ClassVar[bool] = False  # True -> data.reference_time is required
     SEARCH_INTERFACE: ClassVar[str]  # class in lisatools.globalfit.searches that seeds this branch
     # "distribution" is not implemented by the interface yet
     SEARCH_TYPES: ClassVar[tuple[str, ...]] = ("prior", "samples", "point_estimate", "catalog")
-    PE_MOVES: ClassVar[dict[str, PEMove]]  # classes this block may name in pe_move
-    FULL_LADDER: ClassVar[bool] = False  # True -> tempering.ntemps must equal sampler.ntemps
 
     type: str  # block type == file stem == branch name (source_info / priors / recipe key)
-    # the branch's PE move (special or generic family) and its knobs; each block type sets the reference default
-    pe_move: ClassSpec
     priors: PriorRef
     enabled: bool = True
-    tempering: TemperingSpec | None = None
-    nleaves: PositiveInt = 1  # source blocks override: "auto" -> len(data.source_ids[SOURCE_IDS_KEY])
-    num_prop_repeats: PositiveInt = 100  # how many times to repeat the proposal per walker per iteration
-    inner_moves: list[MoveSpec] | None = None  # None -> the Setup's default (StretchMove)
     links: Links = Field(default_factory=Links)
     injection: dict[str, float] | None = None  # for diagnostic plots, keyed like the prior basis
     search: SearchSpec | None = None  # None -> no search interface (see SearchSpec)
@@ -234,11 +226,6 @@ class BlockBase(_Spec):
                 f"search_type {self.search.search_type!r} is not available for the {self.type!r} block; "
                 f"use one of {list(self.SEARCH_TYPES)}."
             )
-        return self
-
-    @model_validator(mode="after")
-    def _pe_move_is_available(self):
-        check_pe_move(self.pe_move, self.PE_MOVES)
         return self
 
     def parse_prior_information(self, g: GeneralSetup) -> dict[str, Any]:
@@ -277,6 +264,26 @@ class BlockBase(_Spec):
             injection=injection,
         )
 
+
+class MoveBlock(BlockBase):
+    """A block whose branch has its own PE move: psd and the source blocks (galfor rides on the psd move)."""
+
+    PE_MOVES: ClassVar[dict[str, PEMove]]  # classes this block may name in pe_move
+    FULL_LADDER: ClassVar[bool] = False  # True -> tempering.ntemps must equal sampler.ntemps
+
+    # the branch's PE move (special or generic family) and its knobs; each block type sets the reference default
+    pe_move: ClassSpec
+    tempering: TemperingSpec | None = None
+    nleaves: PositiveInt = 1  # source blocks override: "auto" -> len(data.source_ids[SOURCE_IDS_KEY])
+    num_prop_repeats: PositiveInt = 100  # how many times to repeat the proposal per walker per iteration
+    inner_moves: list[MoveSpec] | None = None  # None -> the Setup's default (StretchMove)
+
+    @model_validator(mode="after")
+    def _pe_move_is_available(self):
+        check_pe_move(self.pe_move, self.PE_MOVES)
+        return self
+
+
 def resolve_class(name: str, modules: tuple[str, ...]) -> type:
     """``find_class`` as a validation error: pydantic only turns ValueError into one, not ImportError."""
     try:
@@ -302,7 +309,7 @@ def check_pe_move(spec: ClassSpec, allowed: dict[str, PEMove]) -> type:
     return cls
 
 
-class SourceBlock(BlockBase):
+class SourceBlock(MoveBlock):
     """A source branch (mbh, emri, ...): leaves, waveform, sampler knobs, simple inner moves.
 
     A subclass declares the class variables and, if its inner moves need builder-filled
