@@ -48,6 +48,8 @@ from .stochastic import (
 )
 from .utils.constants import *
 from .utils.parallelbase import LISAToolsParallelModule
+from . import sensitivity_window
+from .sensitivity_window import WINDOW_CONVOLUTION_MODES
 from .utils.utility import AET, get_array_module
 
 if TYPE_CHECKING:
@@ -2227,9 +2229,33 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             ordered as ``orbits.LINKS``: 12, 23, 31, 13, 32, 21) on the same
             spectral shapes. See :meth:`split_psd_params` for the parameter layout.
         fft_batch_size: Number of rows (one row = one PSD component in one time
-            segment) per FFT batch in the window convolution. Batches are padded to
-            this fixed size so a single cuFFT plan is reused. Default is ``512``.
-            If ``None``, all rows go through in one batch.
+            segment) per FFT batch in the window convolution. On a CUDA backend an
+            integer is an upper bound: the batch is ``min(fft_batch_size,
+            next_pow2(n_rows), budget)`` rows, padded, so the plan sizes stay few. ``"auto"`` (default) uses
+            ``min(next_pow2(n_rows), prev_pow2(budget))`` rows: powers of two only, so at
+            most ~log2(budget) cuFFT plans, and < 2x padding. The budget is
+            ``max(1, mem // (64 N))`` rows (``N`` = window length, ~64 B of FFT scratch
+            per sample and row), with ``mem`` half the device memory free (incl. the
+            cupy pool's free blocks) at the call. If ``None``, all rows go through in one
+            batch (one plan per distinct row count). On CPU batches are never padded and
+            ``"auto"`` means all rows at once.
+        psd_batch_size: Maximum number of PSDs (walkers) per backend call in
+            :meth:`compute_log_like`. Bounds the per-call memory of the window
+            convolution (~``num_psds`` x 6 covariance entries on the full grid);
+            PSDs are independent, so results are identical to the unchunked call.
+            ``None`` (default): all PSDs in one call.
+        window_convolution_mode: How ``convolve_window`` is evaluated in
+            :meth:`compute_log_like` and :meth:`compute_sensitivity_matrix` (see
+            :mod:`lisatools.sensitivity_window`). ``"exact"`` (default): instrument noise
+            from window-convolved bases built once, galactic foreground from one real
+            convolution per walker; no per-walker covariance arrays. Equal to the full
+            convolution up to FFT round-off. With splines there is no exact
+            factorization and the full per-walker convolution is used. ``"legacy"``:
+            always the full per-walker convolution of every entry.
+        galaxy_fmax: Frequency [Hz] above which the galactic foreground is treated as
+            zero in the exact window convolution (checked per call against a rigorous
+            bound; falls back to the full band with a warning). ``None`` (default):
+            whole band.
     """
 
     def __init__(
@@ -2248,9 +2274,12 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         average_transfer_functions: bool = False,
         smoothing_sigma: Optional[float] = 1.0,
         noise_symmetry: str = "symmetric",
-        fft_batch_size: Optional[int] = 512,
+        fft_batch_size: Optional[int | str] = "auto",
         alias_frequencies: Optional[NDArrayLike] = None,
         alias_filters_response: Optional[NDArrayLike] = None,
+        psd_batch_size: Optional[int] = None,
+        window_convolution_mode: str = "exact",
+        galaxy_fmax: Optional[float] = None,
     ):
         LISAToolsParallelModule.__init__(self, force_backend=force_backend)
         if noise_symmetry not in NOISE_SYMMETRIES:
@@ -2277,7 +2306,19 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
         self.mask_percentage = mask_percentage if mask_percentage is not None else 0.05
         self._smoothing_sigma = smoothing_sigma
+        if not (fft_batch_size is None or fft_batch_size == "auto"
+                or (isinstance(fft_batch_size, (int, np.integer)) and fft_batch_size > 0)):
+            raise ValueError(f"fft_batch_size must be a positive int, 'auto' or None; got {fft_batch_size!r}.")
         self._fft_batch_size = fft_batch_size
+        if psd_batch_size is not None and int(psd_batch_size) < 1:
+            raise ValueError(f"psd_batch_size must be a positive int or None; got {psd_batch_size!r}.")
+        self.psd_batch_size = None if psd_batch_size is None else int(psd_batch_size)
+        if window_convolution_mode not in WINDOW_CONVOLUTION_MODES:
+            raise ValueError(
+                f"window_convolution_mode must be one of {WINDOW_CONVOLUTION_MODES}, got {window_convolution_mode!r}."
+            )
+        self.window_convolution_mode = window_convolution_mode
+        self.galaxy_fmax = galaxy_fmax
 
         self.window_values = window_values
         self.convolve_window = convolve_window
@@ -2321,6 +2362,9 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             "fft_batch_size": self._fft_batch_size,
             "alias_frequencies": self.alias_frequencies,
             "alias_filters_response": self.alias_filters_response,
+            "psd_batch_size": self.psd_batch_size,
+            "window_convolution_mode": self.window_convolution_mode,
+            "galaxy_fmax": self.galaxy_fmax,
         }
 
     @property
@@ -2411,15 +2455,33 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
     @property
     def fft_batch_size(self):
-        """Rows per FFT batch in the window convolution (``None``: all rows at once)."""
+        """Rows per FFT batch in the window convolution (``None``: all rows at once;
+        ``"auto"``: from the memory budget, see the class docstring)."""
         return self._fft_batch_size
 
-    @property
-    def fft_batch_size(self):
+    def _fft_batch_rows(self, n_rows: int) -> int:
+        """Rows of the FFT buffer used to convolve ``n_rows`` rows (in batches).
+
+        GPU: the buffer size does not follow ``n_rows`` (fixed, or a power of two for
+        ``"auto"``; padded with zero rows) so cuFFT plans and their workspaces are reused
+        across walker counts, and it never exceeds the free-memory budget. CPU: no plan
+        cache to protect, never padded.
         """
-        Batch size for FFTs in the sensitivity matrix convolution.
-        """
-        return self._fft_batch_size
+        bs = self._fft_batch_size
+        if bs is None:
+            return n_rows
+        if self.xp is np:
+            return n_rows if bs == "auto" else min(int(bs), n_rows)
+        from cupy.cuda import runtime  # not `from cupy.cuda.runtime import ...`
+
+        # half the free device memory at ~64 B per sample and row (complex input,
+        # real irfft output, rfft output, cuFFT workspace)
+        free = runtime.memGetInfo()[0] + self.xp.get_default_memory_pool().free_bytes()
+        budget = max(1, int(0.5 * free) // (64 * len(self.window_values)))
+        if bs == "auto":
+            # powers of two only: at most ~log2(budget) distinct plans, < 2x padding
+            return min(1 << (max(n_rows, 1) - 1).bit_length(), 1 << (budget.bit_length() - 1))
+        return min(int(bs), 1 << (max(n_rows, 1) - 1).bit_length(), budget)
 
     @property
     def active_slice(self):
@@ -2626,10 +2688,13 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
         # Manually copy attributes
         for key, value in self.__dict__.items():
-            if key in ("_backend", "pycpp_sensitivity_matrix", "_galactic_grid", "_avg_tf_arrays", "_avg_mosa_tf_arrays", "noise_normalization", "_alias_freqs_flat"):
+            if key in ("_backend", "pycpp_sensitivity_matrix", "_galactic_grid", "_avg_tf_arrays", "_avg_mosa_tf_arrays", "noise_normalization", "_alias_freqs_flat", "_spline_zeros") or key.startswith("_wconv_"):
                 # Don't deepcopy backend objects - just reference.
                 # _avg_tf_arrays is referenced by raw pointers inside the (shared)
                 # pycpp_sensitivity_matrix, so copies MUST share these arrays.
+                # _spline_zeros is a read-only zeros buffer (see _zero_spline_weights).
+                # _wconv_* are the walker-independent window-convolution caches
+                # (lisatools.sensitivity_window), read-only and up to GBs.
                 setattr(new_obj, key, value)
             elif key == "orbits":
                 # Shallow copy orbits (share the same backend)
@@ -2995,8 +3060,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             splines_in_isi_oms = xp.ascontiguousarray(splines_out[0], dtype=xp.float64).ravel()
             spline_in_testmass = xp.ascontiguousarray(splines_out[1], dtype=xp.float64).ravel()
         else:
-            splines_in_isi_oms = xp.zeros(num_psds * num_freqs, dtype=xp.float64)
-            spline_in_testmass = xp.zeros(num_psds * num_freqs, dtype=xp.float64)
+            splines_in_isi_oms = spline_in_testmass = self._zero_spline_weights(num_psds * num_freqs)
 
         if self.pycpp_sensitivity_matrix is None:
             raise RuntimeError("XYZBackend disabled (symbol issues on Linux): get_noise_covariance unavailable.")
@@ -3025,16 +3089,39 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
         convolve = self.convolve_window if convolve_window is None else convolve_window
         if convolve:
-            c00, c11, c22, c01, c02, c12 = self._convolve_matrix_components(c00, c11, c22, c01, c02, c12, num_psds=num_psds)
+            # the entries were allocated above: convolve them in place
+            c00, c11, c22, c01, c02, c12 = self._convolve_matrix_components(
+                c00, c11, c22, c01, c02, c12, num_psds=num_psds, overwrite_input=True
+            )
 
         return c00, c11, c22, c01, c02, c12
 
-    def _convolve_matrix_components(self, c00, c11, c22, c01, c02, c12, num_psds: int = 1):
+    def _zero_spline_weights(self, size: int):
+        """Contiguous read-only zeros of length ``size`` (spline weights when splines are off).
+
+        One buffer is grown on demand and shared (also with copies) instead of allocating
+        two ``num_psds * num_freqs`` arrays per call. Never write into it.
+        """
+        buf = getattr(self, "_spline_zeros", None)
+        if buf is None or buf.size < size:
+            buf = self.xp.zeros(size, dtype=self.xp.float64)
+            self._spline_zeros = buf
+        return buf[:size]
+
+    def _convolve_matrix_components(
+        self, c00, c11, c22, c01, c02, c12, num_psds: int = 1, overwrite_input: bool = False
+    ):
         """Convolve one-sided PSD entries with the window's two-sided spectral window.
 
         ``entries`` may live on the active band only; they are embedded into the full
         one-sided grid (out-of-band PSD assumed zero), convolved on the full length-N
         circle, and sliced back. Pass the full grid whenever you can.
+
+        Returns the 6 convolved entries, shape ``(num_psds, -1)``: float64 for the
+        diagonal (c00, c11, c22), complex128 for the cross terms. With
+        ``overwrite_input=True`` (inputs contiguous, of those dtypes) the results are
+        written into the input arrays, saving one copy of every entry; otherwise the
+        inputs are left untouched.
         """
         xp = self.xp
         entries = [c00, c11, c22, c01, c02, c12]
@@ -3042,11 +3129,10 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         # one row per (psd, time segment); the convolution runs along frequency
         entries = [c.reshape(-1, nf_active) for c in entries]
 
-        #guard the first entry to avoid NaN in the convolution. This would be the case if the first frequency point is zero.
-        if not all(bool(xp.isfinite(c[:, 0]).all()) for c in entries):
-            entries = [c.copy() for c in entries]
-            for c in entries:
-                c[:, 0] = c[:, 1]
+        # guard the first entry to avoid NaN in the convolution (first frequency point
+        # zero): column 0 is replaced by column 1 in the convolution input, for all
+        # entries if any is non-finite there. The inputs themselves are not modified.
+        guard_f0 = not all(bool(xp.isfinite(c[:, 0]).all()) for c in entries)
 
         N = len(self.window_values)
         nf_full = N // 2 + 1
@@ -3054,37 +3140,48 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         sl = self.active_slice
         lo, hi = sl.start or 0, nf_full if sl.stop is None else sl.stop
         kernel_fft = self._window_kernel_fft_real
-        kernel_dc, kernel_nyq = self._window_kernel_dc, self._window_kernel_nyq
+        kernel_dc = self._window_kernel_dc[lo:hi]
+        kernel_nyq = None if self._window_kernel_nyq is None else self._window_kernel_nyq[lo:hi]
 
         # The two-sided input S(-f) = conj(S(f)) is Hermitian, so its FFT is real and
         # convolving with the real, even |W|^2 reduces to rfft(irfft(S) * FFT(|W|^2)):
         # half the memory/work of the full complex FFT and no two-sided copy. irfft
         # drops Im at DC/Nyquist, so those parts are added back exactly.
-        # Rows go through a fixed-size buffer so every call reuses one cuFFT plan:
-        # a varying batch (walkers surviving the prior cut) would otherwise cache a
-        # new plan + workspace per size and exhaust the GPU memory pool.
+        # Rows go through a buffer whose size does not follow the row count on GPU
+        # (see _fft_batch_rows): a varying batch (walkers surviving the prior cut)
+        # would otherwise cache a new plan + workspace per size and exhaust the pool.
         n_rows = entries[0].shape[0]
-        rows = n_rows if self.fft_batch_size is None else self.fft_batch_size
-        full = xp.empty((min(rows, n_rows), nf_full), dtype=xp.complex128)
+        rows = self._fft_batch_rows(n_rows)
+        full = xp.empty((rows, nf_full), dtype=xp.complex128)
         out = []
         for i, c in enumerate(entries):
-            res = xp.empty((n_rows, nf_active), dtype=xp.complex128)
+            diag = i < 3
+            if overwrite_input:
+                res = c
+            else:
+                res = xp.empty((n_rows, nf_active), dtype=xp.float64 if diag else xp.complex128)
             for s in range(0, n_rows, rows):
                 n = min(rows, n_rows - s)
                 blk = c[s : s + n]
-                # pad below / above the active band with the edge values
-                full[:n, :lo] = blk[:, 0:1]
                 full[:n, lo:hi] = blk
+                if guard_f0:
+                    full[:n, lo] = blk[:, 1]
+                # pad below / above the active band with the edge values
+                full[:n, :lo] = full[:n, lo : lo + 1]
                 full[:n, hi:] = blk[:, -1:]
-                full[n:] = 0.0
+                if n < rows:  # stale rows of the previous batch
+                    full[n:] = 0.0
                 conv = xp.fft.irfft(full, n=N, axis=-1)
                 conv *= kernel_fft
-                conv = xp.fft.rfft(conv, axis=-1)[:n]
-                conv += 1j * (full[:n, 0:1].imag * kernel_dc)
-                if kernel_nyq is not None:
-                    conv += 1j * (full[:n, N // 2 : N // 2 + 1].imag * kernel_nyq)
-                res[s : s + n] = conv[:, lo:hi]
-            out.append(xp.real(res).reshape(num_psds, -1) if i < 3 else res.reshape(num_psds, -1))
+                conv = xp.fft.rfft(conv, axis=-1)[:n, lo:hi]
+                if diag:  # real input: no Im at DC / Nyquist
+                    res[s : s + n] = conv.real
+                else:
+                    conv += 1j * (full[:n, 0:1].imag * kernel_dc)
+                    if kernel_nyq is not None:
+                        conv += 1j * (full[:n, N // 2 : N // 2 + 1].imag * kernel_nyq)
+                    res[s : s + n] = conv
+            out.append(res.reshape(num_psds, -1))
         return out
 
     def _fill_matrix(self, c00, c11, c22, c01, c02, c12, num_psds: int = 1):
@@ -3189,20 +3286,26 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             (or ``(3, 3, n_freqs)`` for FD analyses with a single time point),
             dtype ``complex128``.
         """
-        c00, c11, c22, c01, c02, c12 = self._compute_matrix_elements(
-            self.f_arr,
-            Soms_d_in,
-            Sa_a_in,
-            Amp,
-            alpha,
-            f_1,
-            kn,
-            f_2,
-            knots_position_all,
-            knots_amplitude_all,
-            run_async=False,
-            convolve_window=convolve_window
-        )
+        convolve = self.convolve_window if convolve_window is None else convolve_window
+        if convolve and self._fast_window_convolution():
+            c00, c11, c22, c01, c02, c12 = self._window_matrix_elements(
+                Soms_d_in, Sa_a_in, Amp, alpha, f_1, kn, f_2
+            )
+        else:
+            c00, c11, c22, c01, c02, c12 = self._compute_matrix_elements(
+                self.f_arr,
+                Soms_d_in,
+                Sa_a_in,
+                Amp,
+                alpha,
+                f_1,
+                kn,
+                f_2,
+                knots_position_all,
+                knots_amplitude_all,
+                run_async=False,
+                convolve_window=convolve_window
+            )
         # batched inputs return (num_psds, total_terms) elements
         num_psds = c00.shape[0] if c00.ndim == 2 else 1
         matrix = self._fill_matrix(c00, c11, c22, c01, c02, c12, num_psds=num_psds)
@@ -3445,8 +3548,9 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         Compute log-likelihood using the c++ backend.
 
         Args:
-            data_in_all: Input data array. Shape (num_psds * num_channels * num_freqs * num_times)
-            data_index_all: Data indices array to keep track of which data corresponds to which PSD. Shape (num_psds)
+            data_in_all: Input data array, ``num_data`` blocks of shape (num_channels, num_times, num_freqs),
+                flattened. The CPU binding requires ``num_data == num_psds``.
+            data_index_all: Data block used by each PSD (int32). Shape (num_psds)
             Soms_in_all: Displacement noise levels for each walker. Shape (num_psds), or
                 (num_psds, 6) per-MOSA amplitudes for ``noise_symmetry="asymmetric"``.
             Sa_in_all: Acceleration noise levels for each walker, same shape as ``Soms_in_all``.
@@ -3459,6 +3563,9 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
                 per walker (never shared). Shape (2, num_psds, num_knots), axis 0 = (ISI/OMS, test-mass).
             knots_amplitude_all: Amplitudes of spline knots for noise modeling. Shape (2, num_psds, num_knots)
             run_async: Whether to run the CUDA computation asynchronously. Default is False.
+
+        With ``psd_batch_size`` set, the PSDs are processed in chunks of at most that many
+        (one backend call each, identical results).
 
         Returns:
             log_like_out: Computed log-likelihoods for each PSD. Shape (num_psds,)
@@ -3474,98 +3581,204 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         # asymmetric noise: (num_psds, 6) amplitudes, flattened psd-major for the kernel
         Soms_in_all = _sanitize(Soms_in_all).ravel()
         Sa_in_all = _sanitize(Sa_in_all).ravel()
+        galfor = [_sanitize(p) for p in (Amp_in_all, alpha_in_all, f_1_in_all, kn_in_all, f_2_in_all)]
 
-        Amp_in_all = _sanitize(Amp_in_all)
-        alpha_in_all = _sanitize(alpha_in_all)
-        f_1_in_all = _sanitize(f_1_in_all)
-        kn_in_all = _sanitize(kn_in_all)
-        f_2_in_all = _sanitize(f_2_in_all)
-        
-        # same for splines?
-
-        num_psds = len(Soms_in_all) // self.n_noise_par
+        n_par = self.n_noise_par
+        num_psds = len(Soms_in_all) // n_par
 
         log_like_out = xp.zeros(shape=(num_psds,), dtype=xp.float64)
 
         if self.pycpp_sensitivity_matrix is None:
             raise RuntimeError("XYZBackend disabled (symbol issues on Linux): psd_likelihood unavailable.")
 
+        convolve_window = self.convolve_window if convolve_window is None else convolve_window
+
+        # data: (num_data, 3, num_times * num_freqs) walker blocks, indexed by data_index
+        data_in_all = xp.ascontiguousarray(xp.asarray(data_in_all)).ravel()
+        data_index_all = xp.ascontiguousarray(xp.asarray(data_index_all)).ravel()
+
+        bs = self.psd_batch_size
+        if bs is None or bs >= num_psds:
+            self._log_like_batch(
+                log_like_out, data_in_all, data_index_all, Soms_in_all, Sa_in_all, *galfor,
+                knots_position_all, knots_amplitude_all, convolve_window, run_async,
+            )
+            return log_like_out
+
+        # Walker chunks: PSDs are independent, so each chunk is an exact sub-problem.
+        # The CPU binding requires len(data) == k * 3 * T for a k-PSD call (the CUDA
+        # build does not check), so each chunk gets exactly k data blocks: a view of k
+        # consecutive blocks when its data indices fit in one (no copy; e.g. the
+        # identity map), else the referenced blocks gathered; indices are remapped.
+        blocks = data_in_all.reshape(-1, 3 * self.num_times * self.num_freqs)
+        num_data = blocks.shape[0]
+        index_host = np.asarray(asnumpy(data_index_all), dtype=np.int64)
+        for s in range(0, num_psds, bs):
+            e = min(s + bs, num_psds)
+            k = e - s
+            idx = index_host[s:e]
+            lo = min(int(idx.min()), num_data - k)
+            if lo >= 0 and int(idx.max()) < lo + k:
+                data_chunk, idx_chunk = blocks[lo : lo + k], idx - lo
+            else:
+                u, idx_chunk = np.unique(idx, return_inverse=True)
+                data_chunk = xp.empty((k, blocks.shape[1]), dtype=blocks.dtype)  # padding never read
+                data_chunk[: len(u)] = blocks[xp.asarray(u)]
+            knots = [
+                None if a is None else xp.ascontiguousarray(a[:, s:e])
+                for a in (knots_position_all, knots_amplitude_all)
+            ]
+            self._log_like_batch(
+                log_like_out[s:e],
+                data_chunk.ravel(),
+                xp.asarray(idx_chunk.astype(np.int32)),
+                Soms_in_all[s * n_par : e * n_par],
+                Sa_in_all[s * n_par : e * n_par],
+                *[p[s:e] for p in galfor],
+                *knots,
+                convolve_window,
+                run_async,
+            )
+        return log_like_out
+
+    def _fast_window_convolution(self) -> bool:
+        """Whether ``convolve_window`` goes through :mod:`lisatools.sensitivity_window`
+        (exact factorization: instrument bases + galaxy rows) instead of the full
+        per-walker convolution. Splines multiply the transfer functions per walker and
+        do not factorize exactly."""
+        return self.window_convolution_mode == "exact" and not self.use_splines
+
+    def _window_galaxy_rows(self, Amp, alpha, f_1, kn, f_2):
+        """Exactly convolved galaxy rows ``(gal_conv, gal_ratios)``, or ``(None, None)``
+        without a galactic grid (see :func:`sensitivity_window.galaxy_convolved_rows`)."""
+        if getattr(self, "_galactic_grid", None) is None:
+            return None, None
+        return sensitivity_window.galaxy_convolved_rows(self, Amp, alpha, f_1, kn, f_2)
+
+    def _window_matrix_elements(self, Soms, Sa, Amp, alpha, f_1, kn, f_2):
+        """The 6 window-convolved entries ``(num_psds, total_terms)`` from the
+        instrument bases and galaxy rows; same values as
+        ``_compute_matrix_elements(..., convolve_window=True)`` up to FFT round-off."""
+        xp = self.xp
+        n_par = self.n_noise_par
+        Soms, Sa = [xp.asarray(a, dtype=xp.float64) for a in (Soms, Sa)]
+        if n_par > 1:
+            Soms, Sa = Soms.reshape(-1, n_par), Sa.reshape(-1, n_par)
+        galfor = [xp.atleast_1d(xp.asarray(p, dtype=xp.float64)).ravel() for p in (Amp, alpha, f_1, kn, f_2)]
+        coeffs = sensitivity_window.basis_coeffs(self, Soms, Sa)
+        num_psds = max([coeffs.shape[0]] + [len(p) for p in galfor])
+        coeffs = xp.broadcast_to(coeffs, (num_psds, coeffs.shape[1]))
+        galfor = [xp.broadcast_to(p, (num_psds,)) for p in galfor]
+
+        bases = sensitivity_window.get_instrument_bases(self)
+        entries = [coeffs.astype(B.dtype) @ B for B in bases]
+        gal_conv, gal_ratios = self._window_galaxy_rows(*galfor)
+        if gal_conv is not None:
+            gal_conv = gal_conv.reshape(num_psds, self.num_times, -1)
+            n_gal = gal_conv.shape[-1]
+            for c, k in zip(entries, sensitivity_window._FUSED_GAL_K):
+                c.reshape(num_psds, self.num_times, -1)[..., :n_gal] += gal_ratios[None, :, k, None] * gal_conv
+        return entries
+
+    def _log_like_matrix_elements(
+        self, Soms, Sa, Amp, alpha, f_1, kn, f_2, knots_position, knots_amplitude, run_async
+    ):
+        """The 6 window-convolved covariance entries ``(num_psds, total_terms)`` consumed by
+        the likelihood kernel when ``convolve_window`` (legacy path: full-grid FFTs of every
+        entry). Single place to dispatch alternative convolution modes."""
+        # splines are interpolated (and their per-walker shape validated) in here
+        return self._compute_matrix_elements(
+            self.f_arr, Soms, Sa, Amp, alpha, f_1, kn, f_2,
+            knots_position, knots_amplitude, run_async=run_async, convolve_window=True,
+        )
+
+    def _log_like_batch(
+        self, log_like_out, data, data_index, Soms, Sa, Amp, alpha, f_1, kn, f_2,
+        knots_position, knots_amplitude, convolve_window, run_async,
+    ):
+        """One ``psd_likelihood_wrap`` call for ``len(log_like_out)`` PSDs; writes into
+        ``log_like_out`` (contiguous). Arguments are sanitized 1D arrays, see
+        :meth:`compute_log_like`."""
+        xp = self.xp
+        num_psds = len(log_like_out)
+
+        if convolve_window and self._fast_window_convolution():
+            n_par = self.n_noise_par
+            coeffs = sensitivity_window.basis_coeffs(
+                self, Soms.reshape(num_psds, n_par) if n_par > 1 else Soms,
+                Sa.reshape(num_psds, n_par) if n_par > 1 else Sa,
+            )
+            gal_conv, gal_ratios = self._window_galaxy_rows(Amp, alpha, f_1, kn, f_2)
+            log_like_out[:] = sensitivity_window.fused_log_like(
+                self, data, data_index, coeffs, gal_conv=gal_conv, gal_ratios=gal_ratios
+            )
+            return
+
         # Exactly one path consumes the splines / the external matrix; the kernel never
         # reads the other's arrays, so those are passed empty (the binding accepts it).
         empty_real = xp.empty(0, dtype=xp.float64)
         empty_cplx = xp.empty(0, dtype=xp.complex128)
 
-        convolve_window = self.convolve_window if convolve_window is None else convolve_window
         if convolve_window:
-            # splines are interpolated (and their per-walker shape validated) in here
             splines_weights_isi_oms = splines_weights_testmass = empty_real
-            c00_all, c11_all, c22_all, c01_all, c02_all, c12_all = self._compute_matrix_elements(
-                self.f_arr,
-                Soms_in_all,
-                Sa_in_all,
-                Amp_in_all,
-                alpha_in_all,
-                f_1_in_all,
-                kn_in_all,
-                f_2_in_all,
-                knots_position_all,
-                knots_amplitude_all,
-                run_async=run_async,
-                convolve_window=convolve_window
+            c_all = self._log_like_matrix_elements(
+                Soms, Sa, Amp, alpha, f_1, kn, f_2, knots_position, knots_amplitude, run_async
             )
+            c00_all, c11_all, c22_all, c01_all, c02_all, c12_all = [
+                xp.ascontiguousarray(c).ravel() for c in c_all
+            ]
+            del c_all
         else:
             c00_all = c11_all = c22_all = empty_real
             c01_all = c02_all = c12_all = empty_cplx
 
             if self.use_splines:
                 splines_weights = self.spline_interpolant(
-                    xp.log10(self.f_arr), knots_position_all, knots_amplitude_all
+                    xp.log10(self.f_arr), knots_position, knots_amplitude
                 )
                 # the CUDA binding skips length checks: guard here so a mis-shaped
                 # knot batch cannot read past the end of the spline buffer
                 if splines_weights[0].size != num_psds * self.num_freqs:
                     raise ValueError(
                         f"Spline knots must be given per walker, shape (2, num_psds={num_psds}, n_knots); "
-                        f"got knots of shape {tuple(knots_position_all.shape)}."
+                        f"got knots of shape {tuple(knots_position.shape)}."
                     )
-                splines_weights_isi_oms = splines_weights[0].flatten()
-                splines_weights_testmass = splines_weights[1].flatten()
+                splines_weights_isi_oms = xp.ascontiguousarray(splines_weights[0]).ravel()
+                splines_weights_testmass = xp.ascontiguousarray(splines_weights[1]).ravel()
             else:
-                splines_weights_isi_oms = xp.zeros(shape=(num_psds * self.num_freqs))
-                splines_weights_testmass = xp.zeros(shape=(num_psds * self.num_freqs))
+                splines_weights_isi_oms = splines_weights_testmass = self._zero_spline_weights(
+                    num_psds * self.num_freqs
+                )
 
-        
         self.pycpp_sensitivity_matrix.psd_likelihood_wrap(
             log_like_out,
             self.f_arr,
-            xp.asarray(data_in_all.flatten()),
-            xp.asarray(data_index_all.flatten()),
+            data,
+            data_index,
             xp.asarray(self.time_indices),
-            xp.asarray(Soms_in_all),
-            xp.asarray(Sa_in_all),
-            xp.asarray(Amp_in_all),
-            xp.asarray(alpha_in_all),
-            xp.asarray(f_1_in_all),
-            xp.asarray(kn_in_all),
-            xp.asarray(f_2_in_all),
-            xp.asarray(splines_weights_isi_oms),
-            xp.asarray(splines_weights_testmass),
+            Soms,
+            Sa,
+            Amp,
+            alpha,
+            f_1,
+            kn,
+            f_2,
+            splines_weights_isi_oms,
+            splines_weights_testmass,
             self.basis_settings.differential_component,
             self.num_freqs,
             self.num_times,
             self.dips_mask,
             num_psds,
-            c00_all.flatten(),
-            c11_all.flatten(),
-            c22_all.flatten(),
-            c01_all.flatten(),
-            c02_all.flatten(),
-            c12_all.flatten(),
+            c00_all,
+            c11_all,
+            c22_all,
+            c01_all,
+            c02_all,
+            c12_all,
             convolve_window,
             run_async
         )
-
-        return log_like_out
 
     def smooth_sensitivity_matrix(
         self,
