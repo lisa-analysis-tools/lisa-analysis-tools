@@ -1274,8 +1274,9 @@ void get_noise_covariance_kernel(
                 double f = frequencies[f_idx];
                 long long out_idx = base_out_idx + f_idx;
 
-                spline_in_isi_oms = spline_in_isi_oms_all[psd_i * num_freqs + f_idx];
-                spline_in_testmass = spline_in_testmass_all[psd_i * num_freqs + f_idx];
+                long long spl_idx = (long long)psd_i * num_freqs + f_idx;  // 64-bit, as base_psd_idx
+                spline_in_isi_oms = spline_in_isi_oms_all[spl_idx];
+                spline_in_testmass = spline_in_testmass_all[spl_idx];
 
                 sensitivity_matrix->get_noise_covariance(
                     f, time_index, f_idx,

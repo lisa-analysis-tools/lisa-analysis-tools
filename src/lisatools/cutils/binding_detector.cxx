@@ -186,8 +186,8 @@ void XYZSensitivityMatrixWrap::psd_likelihood_wrap(
     double *_spline_in_isi_oms = nullptr, *_spline_in_testmass = nullptr;
     if (!use_external_matrix)
     {
-        _spline_in_isi_oms  = return_pointer_and_check_length(spline_in_isi_oms_all,  "spline_in_isi_oms_all",  num_psds * num_freqs, 1);
-        _spline_in_testmass = return_pointer_and_check_length(spline_in_testmass_all, "spline_in_testmass_all", num_psds * num_freqs, 1);
+        _spline_in_isi_oms  = return_pointer_and_check_length(spline_in_isi_oms_all,  "spline_in_isi_oms_all",  num_freqs, num_psds);
+        _spline_in_testmass = return_pointer_and_check_length(spline_in_testmass_all, "spline_in_testmass_all", num_freqs, num_psds);
     }
     else
     {
@@ -303,7 +303,9 @@ void XYZSensitivityMatrixWrap::get_noise_covariance_wrap(
     array_type<double> c11_arr, array_type<std::complex<double>> c12_arr, array_type<double> c22_arr,
     int num_freqs, int num_times, int num_psds, bool run_async)
 {
-    int total_size = num_psds * num_freqs * num_times;
+    // (N, multiplier) split: num_psds * num_freqs * num_times exceeds INT_MAX at 2 yr,
+    // the helper forms the product as size_t
+    int total_tf_pairs = num_freqs * num_times;
     sensitivity_matrix->get_noise_covariance_arr(
         return_pointer_and_check_length(freqs,        "freqs",        num_freqs, 1),
         return_pointer_and_check_length(time_indices, "time_indices", num_times, 1),
@@ -314,14 +316,14 @@ void XYZSensitivityMatrixWrap::get_noise_covariance_wrap(
         return_pointer_and_check_length(f_1_all,       "f_1_all",       num_psds, 1),
         return_pointer_and_check_length(f_knee_all,    "f_knee_all",    num_psds, 1),
         return_pointer_and_check_length(f_2_all,       "f_2_all",       num_psds, 1),
-        return_pointer_and_check_length(spline_in_isi_oms_all,  "spline_in_isi_oms_all",  num_psds * num_freqs, 1),
-        return_pointer_and_check_length(spline_in_testmass_all, "spline_in_testmass_all", num_psds * num_freqs, 1),
-        return_pointer_and_check_length(c00_arr, "c00_arr", total_size, 1),
-        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c01_arr, "c01_arr", total_size, 1)),
-        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c02_arr, "c02_arr", total_size, 1)),
-        return_pointer_and_check_length(c11_arr, "c11_arr", total_size, 1),
-        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c12_arr, "c12_arr", total_size, 1)),
-        return_pointer_and_check_length(c22_arr, "c22_arr", total_size, 1),
+        return_pointer_and_check_length(spline_in_isi_oms_all,  "spline_in_isi_oms_all",  num_freqs, num_psds),
+        return_pointer_and_check_length(spline_in_testmass_all, "spline_in_testmass_all", num_freqs, num_psds),
+        return_pointer_and_check_length(c00_arr, "c00_arr", total_tf_pairs, num_psds),
+        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c01_arr, "c01_arr", total_tf_pairs, num_psds)),
+        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c02_arr, "c02_arr", total_tf_pairs, num_psds)),
+        return_pointer_and_check_length(c11_arr, "c11_arr", total_tf_pairs, num_psds),
+        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c12_arr, "c12_arr", total_tf_pairs, num_psds)),
+        return_pointer_and_check_length(c22_arr, "c22_arr", total_tf_pairs, num_psds),
         num_freqs, num_times, num_psds, run_async
     );
 }
@@ -357,8 +359,8 @@ void XYZSensitivityMatrixWrap::get_noise_tfs_mosa_wrap(
 {
     sensitivity_matrix->get_noise_tfs_mosa_arr(
         return_pointer_and_check_length(freqs, "freqs", num_freqs, 1),
-        return_pointer_and_check_length(mosa_auto, "mosa_auto", 24 * num_freqs * num_times, 1),
-        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(mosa_cross, "mosa_cross", 12 * num_freqs * num_times, 1)),
+        return_pointer_and_check_length(mosa_auto, "mosa_auto", num_freqs * num_times, 24),
+        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(mosa_cross, "mosa_cross", num_freqs * num_times, 12)),
         num_freqs, num_times,
         return_pointer_and_check_length(time_indices, "time_indices", num_times, 1));
 }
