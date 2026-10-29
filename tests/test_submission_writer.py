@@ -141,6 +141,21 @@ class SubmissionWriterDecouplingTest(unittest.TestCase):
             self.assertIn("ACT is NaN", self._metadata_json(writer, name)["comment"])
         self.assertEqual(glob.glob(os.path.join(folder, "*", "*_posteriors_*.h5")), [])
 
+    def test_unregistered_branch_does_not_block_the_others(self):
+        # 'sobh' has a source-type name but no parameter registry / source metadata entry
+        writer = _make_writer(self.parent)
+        writer.backend.branch_names = ["mbh", "gb", "psd", "sobh"]
+        writer._prepare_gb_samples = lambda acs, orig, samples, inds: (samples, inds)
+        saved = []
+        writer.save_data_and_residuals = lambda acs: saved.append(True)
+
+        with self.assertRaisesRegex(RuntimeError, "sobh: postprocessing failed"):
+            writer.write_submission(acs=None)
+
+        self.assertEqual(saved, [True])
+        for name in ["MBHB", "GB", "noise"]:
+            self.assertEqual(len(self._posterior_files(writer, name)), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

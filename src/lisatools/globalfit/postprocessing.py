@@ -1860,12 +1860,18 @@ class SubmissionWriter(BackendConsumer):
         """
         self.create_folders()
         self._write_run_metadata()
-
-        for branch in self.resolvable_branches:
-            self._write_source_metadata_skeleton(branch)
-        self._write_stochastic_metadata_skeleton()
-
         self.save_data_and_residuals(acs)
+
+        # a broken branch must not prevent the metadata of the others from being written
+        for branch in self.resolvable_branches:
+            try:
+                self._write_source_metadata_skeleton(branch)
+            except Exception:
+                logger.exception(f"Could not write the metadata for branch '{branch}'")
+        try:
+            self._write_stochastic_metadata_skeleton()
+        except Exception:
+            logger.exception("Could not write the metadata for the stochastic branch(es)")
 
     def write_posteriors(self, acs: AnalysisContainerArray):
         """
@@ -1885,12 +1891,15 @@ class SubmissionWriter(BackendConsumer):
             logger.exception(f"Post-processing failed for '{unit}'")
             msg = f"postprocessing failed: {type(exc).__name__}: {exc}"
             failures[unit] = msg
-            if unit == "stochastic":
-                self._write_stochastic_metadata_skeleton(extra_comment=msg)
-            else:
-                metadata: SourceMetadata = self.curr.source_metadata[unit]
-                metadata.comment = f"{metadata.comment} {msg}".strip()
-                self._write_source_metadata_skeleton(unit)
+            try:
+                if unit == "stochastic":
+                    self._write_stochastic_metadata_skeleton(extra_comment=msg)
+                else:
+                    metadata: SourceMetadata = self.curr.source_metadata[unit]
+                    metadata.comment = f"{metadata.comment} {msg}".strip()
+                    self._write_source_metadata_skeleton(unit)
+            except Exception:
+                logger.exception(f"Could not record the failure in the metadata of '{unit}'")
 
         try:
             # thinning is shared across branches (joint ACT), so it cannot be split per unit
@@ -1912,12 +1921,12 @@ class SubmissionWriter(BackendConsumer):
                 _record_failure(unit, exc)
 
         # only list the source types whose posteriors were actually written
-        failed_branches = {b for b in self.resolvable_branches if b in failures}
+        failed_branches = [b for b in self.resolvable_branches if b in failures]
         if "stochastic" in failures:
-            failed_branches.update(self.stochastic_branches)
-        found = {source_types_names[b] for b in self.branches if b in source_types_names and b not in failed_branches}
+            failed_branches.extend(self.stochastic_branches)
+        failed_types = {source_types_names.get(b) for b in failed_branches}
         self.run_metadata.found_source_types_list = [
-            s for s in self.run_metadata.found_source_types_list if s in found
+            s for s in self.run_metadata.found_source_types_list if s not in failed_types
         ]
         self._write_run_metadata()
 
