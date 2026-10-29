@@ -183,9 +183,9 @@ class TDMBHSpecialMove(MultiGPUResidualAddRemoveMove):
                 else:
                     num_per_gpu = self.nwalkers // len(self.acs.gpus)
                     for row in inds:
-                        for gpu in self.acs.gpus:
-                            start = gpu * num_per_gpu
-                            end = (gpu + 1) * num_per_gpu
+                        for gpu_id, gpu in enumerate(self.acs.gpus):
+                            start = gpu_id * num_per_gpu
+                            end = (gpu_id + 1) * num_per_gpu
                             np.random.shuffle(row[start:end])
             return inds
 

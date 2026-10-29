@@ -20,13 +20,15 @@ from .blocks.base import GENERIC_MOVES, MoveBlock, SourceBlock
 from .blocks.psd import STOCHASTIC
 from .blocks.utility import check_kwargs, find_class
 
+from ...loginfo import init_logger
+
 if TYPE_CHECKING:
     from .blocks.base import BlockBuild
     from .io import RunConfig
 
 SETUP_ARGS = ("recipe", "engine_info", "curr", "acs", "priors", "state")
 
-
+logger = init_logger(__name__, level="DEBUG", name="RecipeBuilder")
 class BranchMoves(NamedTuple):
     search: list  # one-shot moves run before PE (the psd max-likelihood search)
     pe: list
@@ -66,12 +68,14 @@ class StockRecipe:
 
         # step names are recorded by the backend; a restart skips the completed ones
         if search:
+            logger.info("Adding psd search")
             recipe.add_recipe_component(SearchRecipeStep(moves=search), name="psd search")
         combined = GFCombineMove(moves=pe, share_temperature_control=False)
         if self.burn_in_iterations is not None:
             recipe.add_recipe_component(
                 IterationCountRecipeStep(moves=[combined], num_iters=self.burn_in_iterations), name="burn-in"
             )
+        logger.info("Adding joint PE")
         recipe.add_recipe_component(PERecipeStep(moves=[combined]), name="pe")
 
 
@@ -147,6 +151,7 @@ def seed_branches(cfg: RunConfig, waveform_classes: dict[str, type], curr, acs, 
         if block.search is not None:
             info = curr.source_info[name]
             info.search_interface.populate_state(curr, state, pad_ladder(info.betas, ntemps), priors=priors)
+            logger.info(f"Populated state from search interface for {name}")
 
     wave_gens = {}
     for name, block in sources.items():
@@ -240,6 +245,8 @@ def source_moves(block, cls, ctx: RecipeContext, engine_info, curr, acs, priors,
         **block.WAVEFORM_METHODS,
         **kwargs,
     )
+    logger.debug(f"{name} PE move kwargs: {move.__dict__}")
+    logger.info(f"Built {name} PE move {move} with {len(move.moves)} inner moves")
     move.accepted = np.zeros((g.ntemps, g.nwalkers))
     return BranchMoves([], [move])
 
