@@ -1,21 +1,20 @@
 schema_version: 1
 run:
-  name: mbh_from_search
+  name: mbh_from_catalog
   output_dir: /data/asantini/globalfit/erebor_org_setup/mojito_runs/
   seed: 103209
   num_iterations: 500
   backup_iter: 5
 
 sampler:
-  nwalkers: 8
-  ntemps: 4
+  nwalkers: 32
+  ntemps: 6
 
 compute:
-  gpus: [7]
+  gpus: [0, 1, 2]
   backend: cuda12x
   head_rank: 1
   main_rank: 0
-  flow_gpu: 4
 
 data:
   loader: mojito_l1

@@ -18,39 +18,40 @@ waveform:
     use_reference_time: true
     buffer_time: 15000
     fft_batch_size: 2
-num_prop_repeats: 60
+num_prop_repeats: 100
 tempering: {ratio: 1.2}  # over sampler.ntemps
 inner_moves:
-  - {class: StretchMove, weight: 0.35}
+  - {class: StretchMove, weight: 0.55}
   - {class: DEMove, weight: 0.3}
   - {class: SkyMove, weight: 0.05, kwargs: {which: lat}}
   - {class: SkyMove, weight: 0.05, kwargs: {which: long}}
   - {class: SkyMove, weight: 0.05, kwargs: {which: both}}
 flow:
-  weight: 0.2
-  # the flow on the unimodal parameters only, a stretch on the degenerate ones (one CombineMove):
-  parameters: [logM, logq, s1z, s2z, d_L, phi_ref, t_c]
-  complement: {class: StretchMove}
-  model:
-    class: ZukoFlow
-    kwargs: {flow_class: NSF, transforms: 8, hidden_features: [128, 128, 128], bins: 8}
-  data_transform:
-    class: WhiteningTransform
-    kwargs: {shared: false, periodic_in_cholesky: true}
-  trainer:
-    epochs_per_round: 150
-    min_train_samples: 2000
-    max_buffer_samples: 6000
-    refit_transform_every: 1
-    torch_num_threads: 2
-    plot_corner: true
-    fit_kwargs: {batch_size: 1024, lr: 1e-3, lr_annealing: true, optimizer: adamw, patience: 30,
-                 validation_fraction: 0.2, val_split: temporal, train_noise: 0.0}
+  # weight: 0.2
+  # # the flow on the unimodal parameters only, a stretch on the degenerate ones (one CombineMove):
+  # parameters: [logM, logq, s1z, s2z, d_L, phi_ref, t_c]
+  # complement: {class: StretchMove}
+  # model:
+  #   class: ZukoFlow
+  #   kwargs: {flow_class: NSF, transforms: 8, hidden_features: [128, 128, 128], bins: 8}
+  # data_transform:
+  #   class: WhiteningTransform
+  #   kwargs: {shared: false, periodic_in_cholesky: true}
+  # trainer:
+  #   epochs_per_round: 150
+  #   min_train_samples: 2000
+  #   max_buffer_samples: 6000
+  #   refit_transform_every: 1
+  #   torch_num_threads: 2
+  #   plot_corner: true
+  #   fit_kwargs: {batch_size: 1024, lr: 1e-3, lr_annealing: true, optimizer: adamw, patience: 30,
+  #                validation_fraction: 0.2, val_split: temporal, train_noise: 0.0}
 search:
-  search_type: point_estimate
-  search_path: /data/asantini/globalfit/erebor_org_setup/search_results/mbh/point_estimates.npy
-  parameters_searched: ['logM', 'logq', 's1z', 's2z', 'cos_iota', 'psi', 'alpha', 'sin_delta', 't_c']
-  spread: [1e-4, 1e-3, 1e-3, 1e-3, 1e-3, 1e-1, 1e-2, 1e-2, 1e-1]
+  # search_type: point_estimate
+  # search_path: /data/asantini/globalfit/erebor_org_setup/search_results/mbh/point_estimates.npy
+  # parameters_searched: ['logM', 'logq', 's1z', 's2z', 'cos_iota', 'psi', 'alpha', 'sin_delta', 't_c']
+  search_type: catalog
+  spread: [1e-4, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-1, 1e-1, 1e-2, 1e-2, 1e-1]
 pe_move: 
   class: TDMBHSpecialMove
   kwargs: {permute_every: 20, pad_out_of_prior: true, run_async: true, run_threaded: true, randomize_split: true}
